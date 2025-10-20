@@ -5,8 +5,7 @@ from typing import Optional, Type, Tuple, Callable
 
 import cutlass
 import cutlass.cute as cute
-
-from cutlass import Int32, Boolean, const_expr
+from cutlass import Float32, Int32, Boolean, const_expr
 from cutlass.cute.nvgpu import cpasync
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass._mlir.dialects import llvm
@@ -26,10 +25,17 @@ def cvt_copy(
 ) -> None:
     assert isinstance(src.iterator, cute.Pointer) and src.memspace == cute.AddressSpace.rmem
     if const_expr(src.element_type != dst.element_type):
-        src_cvt = cute.make_fragment_like(src, dst.element_type)
+        src_cvt = cute.make_fragment_like(src, dst.element_type, loc=loc, ip=ip)
         src_cvt.store(src.load().to(dst.element_type))
         src = src_cvt
     cute.copy(atom, src, dst, pred=pred, loc=loc, ip=ip, **kwargs)
+
+
+@dsl_user_op
+def load_s2r(src: cute.Tensor, *, loc=None, ip=None) -> cute.Tensor:
+    dst = cute.make_fragment_like(src, src.element_type, loc=loc, ip=ip)
+    cute.autovec_copy(src, dst, loc=loc, ip=ip)
+    return dst
 
 
 @dsl_user_op
@@ -84,6 +90,43 @@ def tiled_copy_2d(
     val_layout = cute.make_layout((1, copy_elems))
     return cute.make_tiled_copy_tv(copy_atom, thr_layout, val_layout)
 
+
+@dsl_user_op
+def atomic_add_fp32x4(
+    a: Float32, b: Float32, c: Float32, d: Float32, gmem_ptr: cute.Pointer, *, loc=None, ip=None
+) -> None:
+    gmem_ptr_i64 = gmem_ptr.toint(loc=loc, ip=ip).ir_value()
+    # cache_hint = cutlass.Int64(0x12F0000000000000)
+    llvm.inline_asm(
+        None,
+        [
+            gmem_ptr_i64,
+            Float32(a).ir_value(loc=loc, ip=ip),
+            Float32(b).ir_value(loc=loc, ip=ip),
+            Float32(c).ir_value(loc=loc, ip=ip),
+            Float32(d).ir_value(loc=loc, ip=ip),
+        ],
+        # [gmem_ptr_i64, Float32(a).ir_value(loc=loc, ip=ip), cache_hint.ir_value()],
+        "{\n\t"
+        # ".reg .b128 abcd;\n\t"
+        # "mov.b128 abcd, {$1, $2, $3, $4};\n\t"
+        ".reg .v4 .f32 abcd;\n\t"
+        # "mov.b128 abcd, {$1, $2, $3, $4};\n\t"
+        "mov.f32 abcd.x, $1;\n\t"
+        "mov.f32 abcd.y, $2;\n\t"
+        "mov.f32 abcd.z, $3;\n\t"
+        "mov.f32 abcd.w, $4;\n\t"
+        "red.global.add.v4.f32 [$0], abcd;\n\t"
+        # "red.global.add.L2::cache_hint.v4.f32 [$0], abcd, 0x14F0000000000000;\n\t"
+        "}\n",
+        # "red.global.add.L2::cache_hint.f32 [$0], $1, 0x12F0000000000000;",
+        # "red.global.add.L2::cache_hint.f32 [$0], $1, $2;",
+        "l,f,f,f,f",
+        # "l,f,l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
 
 @dsl_user_op
 def cpasync_bulk_g2s(

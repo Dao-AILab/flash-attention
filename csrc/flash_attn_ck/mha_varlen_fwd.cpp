@@ -469,7 +469,11 @@ mha_varlen_fwd(at::Tensor &q,                   // total_q x num_heads x head_si
     }
 
     if (max_seqlen_k > 0) {
+#ifdef HIPIFY_V2
+        auto stream = at::cuda::getCurrentCUDAStream().stream();
+#else
         auto stream = at::cuda::getCurrentHIPStream().stream();
+#endif
         ck_tile::stream_config stream_config{stream};
 
         if (paged_KV)

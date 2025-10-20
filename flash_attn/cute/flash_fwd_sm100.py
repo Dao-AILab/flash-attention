@@ -14,7 +14,7 @@
 
 import enum
 import math
-from typing import Type, Tuple, Callable, Optional
+from typing import Type, Tuple, Callable, Optional, Literal
 from functools import partial
 
 import cuda.bindings.driver as cuda
@@ -27,7 +27,8 @@ import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
 
 import flash_attn.cute.utils as utils
-# import flash_attn.cute.pipeline as pipeline
+from flash_attn.cute import copy_utils
+import flash_attn.cute.pipeline as pipeline
 from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.softmax import SoftmaxSm100, apply_score_mod_inner
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
@@ -130,8 +131,6 @@ class FlashAttentionForwardSm100:
                 *self.empty_warp_ids,
             )
         )
-
-        self.tmem_alloc_sync_bar_id = 1
 
         self.tmem_s_offset = [0, self.n_block_size]  # e.g., 0, 128
         self.tmem_o_offset = [self.tmem_s_offset[-1] + self.n_block_size + i * self.head_dim_v_padded for i in range(self.q_stage)]  # e.g., 256, 384
@@ -398,9 +397,14 @@ class FlashAttentionForwardSm100:
             vO_layout = cute.make_layout((1, async_copy_elems))
             gmem_tiled_copy_O = cute.make_tiled_copy_tv(atom_universal_copy, tO_layout, vO_layout)
 
-        self.tma_copy_q_bytes = cute.size_in_bytes(self.q_dtype, cute.select(sQ_layout, mode=[0, 1, 2]))
-        self.tma_copy_k_bytes = cute.size_in_bytes(self.k_dtype, cute.select(sK_layout, mode=[0, 1, 2]))
-        self.tma_copy_v_bytes = cute.size_in_bytes(self.v_dtype, cute.select(sV_layout, mode=[0, 1, 2]))
+        self.tma_copy_bytes = {
+            name: cute.size_in_bytes(mX.element_type, cute.select(layout, mode=[0, 1, 2]))
+            for name, mX, layout in [
+                ("Q", mQ, sQ_layout),
+                ("K", mK, sK_layout),
+                ("V", mV, sV_layout),
+            ]
+        }
 
         if const_expr(mCuSeqlensQ is not None or mSeqUsedQ is not None):
             TileScheduler = SingleTileVarlenScheduler
@@ -645,10 +649,8 @@ class FlashAttentionForwardSm100:
         #  Generate smem tensor Q/K/V/O
         # (MMA, MMA_Q, MMA_D, PIPE)
         sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner)
-        # sQ_pi = storage.sQ.get_tensor(sQ_layout)
         # (MMA, MMA_K, MMA_D, PIPE)
         sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
-        # sK_pi = storage.sK.get_tensor(sK_layout)
         # (MMA, MMA_K, MMA_D, PIPE)
         # Strip swizzle info to reuse smem
         sV = cute.make_tensor(cute.recast_ptr(sK.iterator, sV_layout.inner), sV_layout.outer)
@@ -662,7 +664,7 @@ class FlashAttentionForwardSm100:
         thr_mma_qk = tiled_mma_qk.get_slice(0)  # default 1SM
         thr_mma_pv = tiled_mma_pv.get_slice(0)  # default 1SM
 
-        qk_acc_shape = thr_mma_qk.partition_shape_C((self.mma_tiler_qk[0], self.mma_tiler_qk[1]))
+        qk_acc_shape = thr_mma_qk.partition_shape_C(self.mma_tiler_qk[:2])
         tStS_fake = thr_mma_qk.make_fragment_C(qk_acc_shape)
         # This is a fake tensor, by right need to retrieve tmem_ptr. But we know that we always
         # request 512 columns of tmem, so we know that it starts at 0.
@@ -670,7 +672,7 @@ class FlashAttentionForwardSm100:
                                  assumed_align=16)
         tStS = cute.make_tensor(tmem_ptr, tStS_fake.layout)
 
-        pv_acc_shape = thr_mma_pv.partition_shape_C((self.mma_tiler_pv[0], self.mma_tiler_pv[1]))
+        pv_acc_shape = thr_mma_pv.partition_shape_C(self.mma_tiler_pv[:2])
         tOtO = thr_mma_pv.make_fragment_C(pv_acc_shape)
 
         tStSs = tuple(cute.make_tensor(tStS.iterator + self.tmem_s_offset[stage], tStS.layout)
@@ -757,9 +759,6 @@ class FlashAttentionForwardSm100:
                 sQ,
                 sK,
                 sV,
-                sQ_layout.inner,
-                sK_layout.inner,
-                sV_layout.inner,
                 tStSs,
                 tOtOs,
                 tOrPs,
@@ -883,17 +882,15 @@ class FlashAttentionForwardSm100:
     ):
 
         q_producer_phase = Int32(1)
-        kv_producer_state = cutlass.pipeline.make_pipeline_state(cutlass.pipeline.PipelineUserType.Producer, self.kv_stage)
+        kv_producer_state = cutlass.pipeline.make_pipeline_state(
+            cutlass.pipeline.PipelineUserType.Producer, self.kv_stage
+        )
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
-            if const_expr(not seqlen.has_cu_seqlens_q):
-                mQ_cur = mQ[None, None, head_idx, batch_idx]
-            else:
-                offset = seqlen.offset_q if const_expr(not self.pack_gqa) else (0, seqlen.offset_q)
-                mQ_cur = cute.domain_offset((offset, 0), mQ[None, None, head_idx])
+            mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, head_idx]
             gQ = cute.local_tile(mQ_cur, cute.select(self.mma_tiler_qk, mode=[0, 2]), (None, 0))
 
             head_idx_kv = head_idx // self.qhead_per_kvhead if const_expr(not self.pack_gqa) else head_idx
@@ -913,12 +910,8 @@ class FlashAttentionForwardSm100:
             tSgQ = thr_mma_qk.partition_A(gQ)
             tSgK = thr_mma_qk.partition_B(gK)
             tOgV = thr_mma_pv.partition_B(gV)
-            tQsQ, tQgQ = cpasync.tma_partition(
-                tma_atom_Q,
-                0,  # no multicast
-                cute.make_layout(1),
-                cute.group_modes(sQ, 0, 3),
-                cute.group_modes(tSgQ, 0, 3),
+            load_Q_fn, _, _ = copy_utils.tma_get_copy_fn(
+                tma_atom_Q, 0, cute.make_layout(1), tSgQ, sQ
             )
             tKsK, tKgK = cpasync.tma_partition(
                 tma_atom_K,
@@ -936,7 +929,7 @@ class FlashAttentionForwardSm100:
             )
 
             load_Q = partial(
-                self.load_Q, tma_atom_Q, tQgQ, tQsQ,
+                self.load_Q, load_Q_fn,
                 mbar_ptr + self.mbar_load_q_full_offset, mbar_ptr + self.mbar_load_q_empty_offset,
                 phase=q_producer_phase,
             )
@@ -984,9 +977,6 @@ class FlashAttentionForwardSm100:
         sQ: cute.Tensor,
         sK: cute.Tensor,
         sV: cute.Tensor,
-        sQ_swizzle: cute.Swizzle,
-        sK_swizzle: cute.Swizzle,
-        sV_swizzle: cute.Swizzle,
         tStSs: Tuple[cute.Tensor, cute.Tensor],
         tOtOs: tuple[cute.Tensor],
         tOrPs: Tuple[cute.Tensor, cute.Tensor],
@@ -1011,16 +1001,21 @@ class FlashAttentionForwardSm100:
         gemm_Si = [
             partial(
                 sm100_utils.gemm_ptx_partial,
-                qk_mma_op, self.tmem_s_offset[stage], tSrQs[stage], sA=sQ[None, None, None, stage],
-                sA_swizzle=sQ_swizzle, sB_swizzle=sK_swizzle, zero_init=True
+                qk_mma_op,
+                self.tmem_s_offset[stage],
+                tSrQs[stage],
+                sA=sQ[None, None, None, stage],
+                zero_init=True
             )
             for stage in range(2)
         ]
         gemm_Pi = [
             partial(
                 sm100_utils.gemm_ptx_partial,
-                pv_mma_op, self.tmem_o_offset[stage if self.q_stage == 2 else 0], tOrPs[stage],
-                sA=None, sA_swizzle=None, sB_swizzle=sV_swizzle
+                pv_mma_op,
+                self.tmem_o_offset[stage if self.q_stage == 2 else 0],
+                tOrPs[stage],
+                sA=None,
             )
             for stage in range(2)
         ]
@@ -1081,14 +1076,23 @@ class FlashAttentionForwardSm100:
                     # For the first iteration in this work tile, waiting for O0/O1_partial
                     # means that the correction warps has finished reading tO during
                     # the last iteration of the previous work tile has finished.
-                    cute.arch.mbarrier_wait(mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage, P_full_O_rescaled_phase)
+                    cute.arch.mbarrier_wait(
+                        mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage,
+                        P_full_O_rescaled_phase
+                    )
                     # 3. gemm
                     # sm100_utils.gemm(tiled_mma_pv, tOtO0, tOrP0, tOrVi, zero_init=True)
                     # gemm_Pi[stage](tCrB=tOrVi, sB=sV[None, None, None, Vi_index], zero_init=not O_should_accumulate)
                     sV_cur = sV[None, None, None, Vi_index]
                     if const_expr(self.uneven_kv_smem):
                         sV_cur = self.offset_kv_smem(sV_cur, Vi_index, Vi_phase)
-                    gemm_Pi[stage](tCrB=tOrVi, sB=sV_cur, zero_init=not O_should_accumulate, mbar_ptr=mbar_ptr + self.mbar_P_full_2_offset + stage, mbar_phase= P_full_O_rescaled_phase)
+                    gemm_Pi[stage](
+                        tCrB=tOrVi,
+                        sB=sV_cur,
+                        zero_init=not O_should_accumulate,
+                        mbar_ptr=mbar_ptr + self.mbar_P_full_2_offset + stage,
+                        mbar_phase=P_full_O_rescaled_phase
+                    )
                     # 4. release accumulated O0_partial / O1_partial
                     # Don't need to signal O_full to the correction warps anymore since the
                     # correction warps wait for the softmax warps anyway. By the time the softmax
@@ -1140,14 +1144,23 @@ class FlashAttentionForwardSm100:
             tOrVi = tOrV[None, None, None, Vi_index]
             for stage in cutlass.range_constexpr(2):
                 # 2. acquire corrected Oi_partial and Pi
-                cute.arch.mbarrier_wait(mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage, P_full_O_rescaled_phase)
+                cute.arch.mbarrier_wait(
+                    mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage,
+                    P_full_O_rescaled_phase
+                )
                 # 3. gemm
                 # sm100_utils.gemm(tiled_mma_pv, tOtO0, tOrP0, tOrVi, zero_init=True)
                 # gemm_Pi[stage](tCrB=tOrVi, sB=sV[None, None, None, Vi_index], zero_init=not O_should_accumulate)
                 sV_cur = sV[None, None, None, Vi_index]
                 if const_expr(self.uneven_kv_smem):
                     sV_cur = self.offset_kv_smem(sV_cur, Vi_index, Vi_phase)
-                gemm_Pi[stage](tCrB=tOrVi, sB=sV_cur, zero_init=not O_should_accumulate, mbar_ptr=mbar_ptr + self.mbar_P_full_2_offset + stage, mbar_phase=P_full_O_rescaled_phase)
+                gemm_Pi[stage](
+                    tCrB=tOrVi,
+                    sB=sV_cur,
+                    zero_init=not O_should_accumulate,
+                    mbar_ptr=mbar_ptr + self.mbar_P_full_2_offset + stage,
+                    mbar_phase=P_full_O_rescaled_phase
+                )
                 # 4. release accumulated O0_partial
                 # We do need O_full here since for the last tile, by the time the softmax warp
                 # has signaled to the correction warp, the softmax warp has just finished compute
@@ -1205,13 +1218,9 @@ class FlashAttentionForwardSm100:
             )
         )
 
-        cS_base = cute.make_identity_tensor((self.mma_tiler_qk[0], self.mma_tiler_qk[1]))
-        tScS = thr_mma_qk.partition_C(cS_base)
-
-        tStS_scale_layout = cute.composition(tStSi.layout, cute.make_layout((self.m_block_size, 1)))
-        tStScale = cute.make_tensor(tStSi.iterator, tStS_scale_layout)
-        tScS_vec_layout = cute.composition(tScS.layout, cute.make_layout((self.m_block_size, 1)))
-        tScS_vec = cute.make_tensor(tScS.iterator, tScS_vec_layout)
+        tStScale = cute.composition(tStSi, cute.make_layout((self.m_block_size, 1)))
+        tScS = thr_mma_qk.partition_C(cute.make_identity_tensor(self.mma_tiler_qk[:2]))
+        tScScale = cute.composition(tScS, cute.make_layout((self.m_block_size, 1)))
 
         tilePlikeFP32 = self.mma_tiler_qk[1] // 32 * self.v_dtype.width
         tStP_layout = cute.composition(tStSi.layout, cute.make_layout((self.m_block_size, tilePlikeFP32)))
@@ -1229,12 +1238,10 @@ class FlashAttentionForwardSm100:
         thr_tmem_store_scale = tcgen05.make_tmem_copy(tmem_store_scale_atom, tStScale).get_slice(tidx)
 
         tStScale_r2t = thr_tmem_store_scale.partition_D(tStScale)
-        tSrScale_r2t_shape = thr_tmem_store_scale.partition_S(tScS_vec).shape
         tmem_store_atom = cute.make_copy_atom(
             tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(16)), Float32,
         )
-        tiled_tmem_store = tcgen05.make_tmem_copy(tmem_store_atom, tStP)
-        thr_tmem_store = tiled_tmem_store.get_slice(tidx)
+        thr_tmem_store = tcgen05.make_tmem_copy(tmem_store_atom, tStP).get_slice(tidx)
         tStP_r2t = thr_tmem_store.partition_D(tStP)
 
         mma_si_consumer_phase = Int32(0)
@@ -1254,7 +1261,12 @@ class FlashAttentionForwardSm100:
             n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
             mask = AttentionMaskCls(seqlen.seqlen_q, seqlen.seqlen_k)
             mask_fn = partial(
-                mask.apply_mask_sm100, m_block=self.q_stage * m_block + stage, thr_mma=thr_mma_qk, thr_tmem_load=thr_tmem_load, mask_causal=self.is_causal, mask_local=self.is_local
+                mask.apply_mask_sm100,
+                m_block=self.q_stage * m_block + stage,
+                thr_mma=thr_mma_qk,
+                thr_tmem_load=thr_tmem_load,
+                mask_causal=self.is_causal,
+                mask_local=self.is_local
             )
             softmax = SoftmaxSm100.create(softmax_scale_log2, rescale_threshold=8.0 if const_expr(self.q_dtype.width == 16) else 0.0, softmax_scale=softmax_scale)
             softmax.reset()
@@ -1311,6 +1323,7 @@ class FlashAttentionForwardSm100:
                     mma_si_consumer_phase, si_corr_producer_phase, s0_s1_sequence_phase = softmax_step(mma_si_consumer_phase, si_corr_producer_phase, s0_s1_sequence_phase, n_block, mask_fn=partial(mask_fn, mask_seqlen=False))
                     # Now that we no longer already have the 1st iteration, need mask_seqlen=True here
 
+            # tSrScale_r2t_shape = thr_tmem_store_scale.partition_S(tScScale).shape
             # tSrScale_r2t = cute.make_fragment(tSrScale_r2t_shape, Float32)
             # tSrScale_r2t[0] = softmax.row_sum[0]
             # cute.copy(thr_tmem_store_scale, tSrScale_r2t, tStScale_r2t)
@@ -1391,18 +1404,13 @@ class FlashAttentionForwardSm100:
         6. Coordinating pipeline synchronization between different processing stages
         """
         tilePlikeFP32 = self.mma_tiler_qk[1] // Float32.width * self.v_dtype.width
-        tScS = thr_mma_qk.partition_C(cute.make_identity_tensor((self.mma_tiler_qk[0], self.mma_tiler_qk[1])))
-        tScS_vec_layout = cute.composition(tScS.layout, cute.make_layout((self.m_block_size, 1)))
-        tScS_vec = cute.make_tensor(tScS.iterator, tScS_vec_layout)
-
-        tScP_layout = cute.composition(tScS.layout, cute.make_layout((self.m_block_size, tilePlikeFP32)))
-        tScP = cute.make_tensor(tScS.iterator, tScP_layout)
-
-        tScS_t2r_shape = thr_tmem_load.partition_D(tScS).shape
+        tScS = thr_mma_qk.partition_C(cute.make_identity_tensor(self.mma_tiler_qk[:2]))
+        tScScale = cute.composition(tScS, cute.make_layout((self.m_block_size, 1)))
+        tScP = cute.composition(tScS, cute.make_layout((self.m_block_size, tilePlikeFP32)))
 
         # Wait for Si
         cute.arch.mbarrier_wait(mbar_ptr + self.mbar_S_full_offset + stage, mma_si_consumer_phase)
-        tSrS_t2r = cute.make_fragment(tScS_t2r_shape, self.qk_acc_dtype)
+        tSrS_t2r = cute.make_fragment(thr_tmem_load.partition_D(tScS).shape, self.qk_acc_dtype)
         cute.copy(thr_tmem_load, tStS_t2r, tSrS_t2r)
         if cutlass.const_expr(self.score_mod is not None):
             self.apply_score_mod(
@@ -1423,7 +1431,7 @@ class FlashAttentionForwardSm100:
         row_max, acc_scale = softmax.update_row_max(tSrS_t2r.load(), is_first)
 
         if const_expr(not is_first):
-            # tSrScale_r2t = cute.make_fragment(thr_tmem_store_scale.partition_S(tScS_vec).shape, Float32)
+            # tSrScale_r2t = cute.make_fragment(thr_tmem_store_scale.partition_S(tScScale).shape, Float32)
             # tSrScale_r2t[0] = acc_scale
             # cute.copy(thr_tmem_store_scale, tSrScale_r2t, tStScale_r2t)
             # cute.arch.fence_view_async_tmem_store()
@@ -1485,21 +1493,19 @@ class FlashAttentionForwardSm100:
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
     ):
-        tScS = thr_mma_qk.partition_C(cute.make_identity_tensor((self.mma_tiler_qk[0], self.mma_tiler_qk[1])))
-        tStS_scale_layout = cute.composition(tStS.layout, cute.make_layout((self.m_block_size, 1)))
-        tStScales = tuple(cute.make_tensor(tStS.iterator + self.tmem_vec_offset[stage], tStS_scale_layout)
+        tidx = cute.arch.thread_idx()[0] % (cute.arch.WARP_SIZE * len(self.correction_warp_ids))
+        tScS = thr_mma_qk.partition_C(cute.make_identity_tensor(self.mma_tiler_qk[:2]))
+        tStScale_layout = cute.composition(tStS.layout, cute.make_layout((self.m_block_size, 1)))
+        tStScales = tuple(cute.make_tensor(tStS.iterator + self.tmem_vec_offset[stage], tStScale_layout)
                           for stage in range(2))
-        tScS_vec_layout = cute.composition(tScS.layout, cute.make_layout((self.m_block_size, 1)))
-        tScS_vec = cute.make_tensor(tScS.iterator, tScS_vec_layout)
+        tScScale = cute.composition(tScS, cute.make_layout((self.m_block_size, 1)))
         tmem_load_v_atom = cute.make_copy_atom(
             tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(1)), self.qk_acc_dtype,
         )
-        tiled_tmem_load_vec = tcgen05.make_tmem_copy(tmem_load_v_atom, tStScales[0])
-        tidx = cute.arch.thread_idx()[0] % (cute.arch.WARP_SIZE * len(self.correction_warp_ids))
-        thr_tmem_load_vec = tiled_tmem_load_vec.get_slice(tidx)
+        thr_tmem_load_vec = tcgen05.make_tmem_copy(tmem_load_v_atom, tStScales[0]).get_slice(tidx)
 
         tStScales_t2r = [thr_tmem_load_vec.partition_S(tStScales[stage]) for stage in range(2)]
-        tSrScale_t2r_shape = thr_tmem_load_vec.partition_D(tScS_vec).shape
+        tSrScale_t2r_shape = thr_tmem_load_vec.partition_D(tScScale).shape
 
         # First iter: no correction is required
         cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_O_rescaled_offset + 0)
@@ -1646,7 +1652,7 @@ class FlashAttentionForwardSm100:
         self,
         thr_mma: cute.core.ThrMma,
         tOtO: cute.Tensor,
-        thread_idx: Int32,
+        tidx: Int32,
         scale: Float32,
     ):
         """Rescale intermediate attention results based on softmax normalization factor.
@@ -1661,9 +1667,7 @@ class FlashAttentionForwardSm100:
         2. Apply the scaling factor to all elements
         3. Store the rescaled results back to tensor memory
         """
-        cO = cute.make_identity_tensor((self.mma_tiler_pv[0], self.mma_tiler_pv[1]))
-        tOcO = thr_mma.partition_C(cO)
-
+        tOcO = thr_mma.partition_C(cute.make_identity_tensor(self.mma_tiler_pv[:2]))
         corr_tile_size = 16  # tuneable parameter
         tmem_load_atom = cute.make_copy_atom(
             tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(corr_tile_size)),
@@ -1673,17 +1677,10 @@ class FlashAttentionForwardSm100:
             tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(corr_tile_size)),
             self.pv_acc_dtype,
         )
-
-        tOtO_i_layout = cute.composition(tOtO.layout, cute.make_layout((self.m_block_size, corr_tile_size)))
-        tOcO_i_layout = cute.composition(tOcO.layout, cute.make_layout((self.m_block_size, corr_tile_size)))
-        tOtO_i = cute.make_tensor(tOtO.iterator, tOtO_i_layout)
-        tOcO_i = cute.make_tensor(tOcO.iterator, tOcO_i_layout)
-
-        tiled_tmem_load = tcgen05.make_tmem_copy(tmem_load_atom, tOtO_i)
-        tiled_tmem_store = tcgen05.make_tmem_copy(tmem_store_atom, tOtO_i)
-        thr_tmem_load = tiled_tmem_load.get_slice(thread_idx)
-        thr_tmem_store = tiled_tmem_store.get_slice(thread_idx)
-
+        tOtO_i = cute.composition(tOtO, cute.make_layout((self.m_block_size, corr_tile_size)))
+        tOcO_i = cute.composition(tOcO, cute.make_layout((self.m_block_size, corr_tile_size)))
+        thr_tmem_load = tcgen05.make_tmem_copy(tmem_load_atom, tOtO_i).get_slice(tidx)
+        thr_tmem_store = tcgen05.make_tmem_copy(tmem_store_atom, tOtO_i).get_slice(tidx)
         tOtO_t2r = thr_tmem_load.partition_S(tOtO_i)
         tOrO_t2r_shape = thr_tmem_load.partition_D(tOcO_i).shape
         tOtO_r2t = thr_tmem_store.partition_D(tOtO_i)
@@ -1691,17 +1688,15 @@ class FlashAttentionForwardSm100:
         frg_count = self.head_dim_v_padded // corr_tile_size
         tOrO_frg = cute.make_fragment((tOrO_t2r_shape, frg_count), self.pv_acc_dtype)
         for i in cutlass.range_constexpr(frg_count):
-            tOrO_frg_i = tOrO_frg[None, i]
-            tTMrO_i_layout = cute.composition(tOrO_frg_i.layout, cute.make_layout(tOrO_frg.shape[0]))
-            tTMrO_i = cute.make_tensor(tOrO_frg_i.iterator, tTMrO_i_layout)
+            tOrO_frg = cute.make_fragment(tOrO_t2r_shape, self.pv_acc_dtype)
             tOtO_t2r_i = cute.make_tensor(tOtO_t2r.iterator + i * corr_tile_size, tOtO_t2r.layout)
-            cute.copy(tiled_tmem_load, tOtO_t2r_i, tTMrO_i)
-            for j in cutlass.range_constexpr(0, cute.size(tTMrO_i), 2):
-                tTMrO_i[j], tTMrO_i[j + 1] = cute.arch.mul_packed_f32x2(
-                    (tTMrO_i[j], tTMrO_i[j + 1]), (scale, scale),
+            cute.copy(thr_tmem_load, tOtO_t2r_i, tOrO_frg)
+            for j in cutlass.range(0, cute.size(tOrO_frg), 2, unroll_full=True):
+                tOrO_frg[j], tOrO_frg[j + 1] = cute.arch.mul_packed_f32x2(
+                    (tOrO_frg[j], tOrO_frg[j + 1]), (scale, scale),
                 )
             tOtO_r2t_i = cute.make_tensor(tOtO_r2t.iterator + i * corr_tile_size, tOtO_r2t.layout)
-            cute.copy(tiled_tmem_store, tTMrO_i, tOtO_r2t_i)
+            cute.copy(thr_tmem_store, tOrO_frg, tOtO_r2t_i)
         cute.arch.fence_view_async_tmem_store()
 
     @cute.jit
@@ -1709,7 +1704,7 @@ class FlashAttentionForwardSm100:
         self,
         thr_mma: cute.core.ThrMma,
         tOtO: cute.Tensor,
-        thread_idx: Int32,
+        tidx: Int32,
         scale: Float32,
         sO: cute.Tensor,
     ):
@@ -1736,10 +1731,9 @@ class FlashAttentionForwardSm100:
         :type sO: cute.Tensor
         """
 
-        cO = cute.make_identity_tensor((self.mma_tiler_pv[0], self.mma_tiler_pv[1]))
         corr_tile_size = 32 * 8 // self.o_dtype.width
         tOsO = thr_mma.partition_C(sO)
-        tOcO = thr_mma.partition_C(cO)
+        tOcO = thr_mma.partition_C(cute.make_identity_tensor(self.mma_tiler_pv[:2]))
 
         tOtO_i = cute.logical_divide(tOtO, cute.make_layout((self.m_block_size, corr_tile_size)))
         tOcO_i = cute.logical_divide(tOcO, cute.make_layout((self.m_block_size, corr_tile_size)))
@@ -1754,23 +1748,16 @@ class FlashAttentionForwardSm100:
             epi_subtile,
             use_2cta_instrs=False,
         )
-
-        tiled_tmem_load = tcgen05.make_tmem_copy(tmem_copy_atom, tOtO_i[(None, None), 0])
-
-        thr_tmem_load = tiled_tmem_load.get_slice(thread_idx)
+        tiled_tmem_load = tcgen05.make_tmem_copy(tmem_copy_atom, tOtO_i[(None, None), 0]).get_slice(tidx)
+        thr_tmem_load = tiled_tmem_load.get_slice(tidx)
         smem_copy_atom = sm100_utils_basic.get_smem_store_op(
             self.o_layout, self.o_dtype, self.pv_acc_dtype, tiled_tmem_load
         )
-        tiled_smem_store = cute.make_tiled_copy(
-            smem_copy_atom,
-            layout_tv=tiled_tmem_load.layout_dst_tv_tiled,
-            tiler_mn=tiled_tmem_load.tiler_mn,
-        )
+        tiled_smem_store = cute.make_tiled_copy_D(smem_copy_atom, tiled_tmem_load)
 
         tOtO_t2r = thr_tmem_load.partition_S(tOtO_i[(None, None), None])
         tOsO_s2r = thr_tmem_load.partition_D(tOsO_i[(None, None), None])
         tOcO_t2r = thr_tmem_load.partition_D(tOcO_i[(None, None), None])
-
         for i in cutlass.range_constexpr(self.head_dim_v_padded // corr_tile_size):
             tOtO_t2r_i = tOtO_t2r[None, 0, 0, i]
             tOsO_r2s_i = tOsO_s2r[None, 0, 0, i]
@@ -1780,11 +1767,9 @@ class FlashAttentionForwardSm100:
                 tOrO_frg[j], tOrO_frg[j + 1] = cute.arch.mul_packed_f32x2(
                     (tOrO_frg[j], tOrO_frg[j + 1]), (scale, scale),
                 )
-            tSMrO = cute.make_fragment(tOrO_frg.shape, self.o_dtype)
-            o_vec = tOrO_frg.load()
-            tSMrO.store(o_vec.to(self.o_dtype))
-            cute.copy(tiled_smem_store, tSMrO, tOsO_r2s_i)
-
+            tOrO_frg_cvt = cute.make_fragment(tOrO_frg.shape, self.o_dtype)
+            tOrO_frg_cvt.store(tOrO_frg.load().to(self.o_dtype))
+            cute.copy(tiled_smem_store, tOrO_frg_cvt, tOsO_r2s_i)
         # fence view async shared
         cute.arch.fence_proxy(
             cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta,
@@ -1807,26 +1792,20 @@ class FlashAttentionForwardSm100:
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
-            if const_expr(not seqlen.has_cu_seqlens_q):
-                mO_cur = mO[None, None, head_idx, batch_idx]
-            else:
-                offset = seqlen.offset_q if const_expr(not self.pack_gqa) else (0, seqlen.offset_q)
-                mO_cur = cute.domain_offset((offset, 0), mO[None, None, head_idx])
+            mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3)[None, None, head_idx]
             gO = cute.local_tile(mO_cur, (self.m_block_size, self.head_dim_v_padded), (None, 0))
             if const_expr(self.use_tma_O):
-                tOsO, tOgO = cpasync.tma_partition(
-                    tma_atom_O,
-                    0,
-                    cute.make_layout(1),
-                    cute.group_modes(sO, 0, 2),
-                    cute.group_modes(gO, 0, 2),
+                store_O, _, _ = copy_utils.tma_get_copy_fn(
+                    tma_atom_O, 0, cute.make_layout(1), sO, gO
                 )
                 for stage in cutlass.range_constexpr(self.q_stage):
                     # wait from corr, issue tma store on smem
                     # 1. wait for O0 / O1 final
-                    cute.arch.mbarrier_wait(mbar_ptr + self.mbar_corr_epi_full_offset + stage, epi_consumer_phase)
+                    cute.arch.mbarrier_wait(
+                        mbar_ptr + self.mbar_corr_epi_full_offset + stage, epi_consumer_phase
+                    )
                     # 2. copy O0 / O1 to gmem
-                    cute.copy(tma_atom_O, tOsO[None, stage], tOgO[None, self.q_stage * m_block + stage])
+                    store_O(src_idx=stage, dst_idx=self.q_stage * m_block + stage)
                     cute.arch.cp_async_bulk_commit_group()
                 for stage in cutlass.range_constexpr(self.q_stage):
                     # Ensure O0 / O1 buffer is ready to be released
@@ -1873,9 +1852,7 @@ class FlashAttentionForwardSm100:
 
     def load_Q(
         self,
-        tma_atom: cute.CopyAtom,
-        tQgQ: cute.Tensor,
-        tQsQ: cute.Tensor,
+        load_Q_fn: Callable,
         mbar_full_ptr: cute.Pointer,
         mbar_empty_ptr: cute.Pointer,
         block: Int32,
@@ -1884,10 +1861,8 @@ class FlashAttentionForwardSm100:
     ):
         cute.arch.mbarrier_wait(mbar_empty_ptr + stage, phase)
         with cute.arch.elect_one():
-            cute.arch.mbarrier_arrive_and_expect_tx(mbar_full_ptr + stage, self.tma_copy_q_bytes)
-        cute.copy(
-            tma_atom, tQgQ[None, block], tQsQ[None, stage], tma_bar_ptr=mbar_full_ptr + stage
-        )
+            cute.arch.mbarrier_arrive_and_expect_tx(mbar_full_ptr + stage, self.tma_copy_bytes["Q"])
+        load_Q_fn(src_idx=block, dst_idx=stage, tma_bar_ptr=mbar_full_ptr + stage)
 
     @cute.jit
     def load_KV(
@@ -1899,11 +1874,10 @@ class FlashAttentionForwardSm100:
         mbar_empty_ptr: cute.Pointer,
         block: Int32,
         producer_state: cutlass.pipeline.PipelineState,
-        K_or_V: str,
+        K_or_V: Literal["K", "V"],
         page_idx: Optional[Int32] = None,
     ):
         assert K_or_V in ("K", "V")
-        tma_copy_bytes = self.tma_copy_k_bytes if const_expr(K_or_V == "K") else self.tma_copy_v_bytes
         stage, phase = producer_state.index, producer_state.phase
         cute.arch.mbarrier_wait(mbar_empty_ptr + stage, phase)
         if const_expr(K_or_V == "K" and self.uneven_kv_smem):
@@ -1912,7 +1886,7 @@ class FlashAttentionForwardSm100:
             if stage == 0:
                 cute.arch.mbarrier_wait(mbar_empty_ptr + 1, phase)
         with cute.arch.elect_one():
-            cute.arch.mbarrier_arrive_and_expect_tx(mbar_full_ptr + stage, tma_copy_bytes)
+            cute.arch.mbarrier_arrive_and_expect_tx(mbar_full_ptr + stage, self.tma_copy_bytes[K_or_V])
         tXsX_cur = tXsX[None, stage]
         if const_expr(self.uneven_kv_smem):
             # Since this is the producer_state, the phase starts at 1, so we have to invert it
@@ -1941,7 +1915,7 @@ class FlashAttentionForwardSm100:
             num_stages=self.kv_stage,
             producer_group=load_kv_producer_group,
             consumer_group=load_kv_consumer_group,
-            tx_count=self.tma_copy_k_bytes,
+            tx_count=self.tma_copy_bytes["K"],
         )
 
     # @cute.jit

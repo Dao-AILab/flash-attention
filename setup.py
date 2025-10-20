@@ -173,6 +173,18 @@ def check_if_rocm_home_none(global_option: str) -> None:
     )
 
 
+def detect_hipify_v2():
+    try:
+        from torch.utils.hipify import __version__
+        from packaging.version import Version
+        if Version(__version__) >= Version("2.0.0"):
+            return True
+    except Exception as e:
+        print("failed to detect pytorch hipify version, defaulting to version 1.0.0 behavior")
+        print(e)
+    return False
+
+
 def append_nvcc_threads(nvcc_extra_args):
     nvcc_threads = os.getenv("NVCC_THREADS") or "4"
     return nvcc_extra_args + ["--threads", nvcc_threads]
@@ -408,6 +420,12 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
             f"build/fmha_*wd*.cpp"
         )
 
+        # Check if torch is using hipify v2. Until CK is updated with HIPIFY_V2 macro,
+        # we must replace the incorrect APIs.
+        maybe_hipify_v2_flag = []
+        if detect_hipify_v2():
+            maybe_hipify_v2_flag = ["-DHIPIFY_V2"]
+
         rename_cpp_to_cu(sources)
 
         renamed_sources = ["csrc/flash_attn_ck/flash_api.cu",
@@ -450,8 +468,8 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
             cc_flag += ["-mllvm", "-amdgpu-coerce-illegal-types=1"]
 
         extra_compile_args = {
-            "cxx": ["-O3", "-std=c++17"] + generator_flag,
-            "nvcc": cc_flag + generator_flag,
+            "cxx": ["-O3", "-std=c++17"] + generator_flag + maybe_hipify_v2_flag,
+            "nvcc": cc_flag + generator_flag + maybe_hipify_v2_flag,
         }
 
         include_dirs = [
