@@ -16,6 +16,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, Boolean, const_expr
 from cutlass.cute.nvgpu import cpasync, warp, warpgroup
+from cutlass.cute.arch import ProxyKind, SharedSpace
 import cutlass.utils as utils_basic
 from cutlass.utils import LayoutEnum
 import cutlass.utils.hopper_helpers as sm90_utils_basic
@@ -347,7 +348,7 @@ class FlashAttentionForwardBase:
         # sync to make sure all smem stores are done
         if const_expr(self.use_tma_O):
             # ensure smem writes are visible to TMA
-            cute.arch.fence_proxy(cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta)
+            cute.arch.fence_proxy(ProxyKind.async_shared, space=SharedSpace.shared_cta)
             cute.arch.barrier_arrive(barrier_id=int(NamedBarrierFwd.Epilogue), number_of_threads=self.num_epilogue_threads + cute.arch.WARP_SIZE)
             gO = cute.local_tile(mO_cur, (self.tile_m, self.tile_hdimv), (m_block, 0))
             store_O, _, _ = copy_utils.tma_get_copy_fn(
@@ -1184,9 +1185,14 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         gmem_tiled_copy_Q = cpasync.CopyBulkTensorTileG2SOp()
         gmem_tiled_copy_KV = cpasync.CopyBulkTensorTileG2SOp()  # Might multicast
         gmem_tiled_copy_O = cpasync.CopyBulkTensorTileS2GOp()
-        self.tma_copy_q_bytes = cute.size_in_bytes(mQ.element_type, cute.select(self.sQ_layout, mode=[0, 1]))
-        self.tma_copy_k_bytes = cute.size_in_bytes(mK.element_type, cute.select(self.sK_layout, mode=[0, 1]))
-        self.tma_copy_v_bytes = cute.size_in_bytes(mV.element_type, cute.select(self.sV_layout, mode=[0, 1]))
+        self.tma_copy_bytes = {
+            name: cute.size_in_bytes(mX.element_type, cute.select(layout, mode=[0, 1]))
+            for name, mX, layout in [
+                ("Q", mQ, self.sQ_layout),
+                ("K", mK, self.sK_layout),
+                ("V", mV, self.sV_layout),
+            ]
+        }
         tma_atom_Q, tma_tensor_Q = None, None
         if const_expr(self.use_tma_Q):
             tma_atom_Q, tma_tensor_Q = cpasync.make_tiled_tma_atom(
@@ -1355,27 +1361,28 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             # if tidx < 2:
             #     # barrierO num threads should be self.num_mma_threads
             #     cute.arch.mbarrier_init(mbar_ptr_Q + tidx, 1 if tidx == 0 else self.num_mma_threads)
-            cute.arch.mbarrier_init(mbar_ptr_Q, 1 if const_expr(self.use_tma_Q) else self.num_Q_load_threads)
+            if const_expr(not self.use_tma_Q):
+                cute.arch.mbarrier_init(mbar_ptr_Q, self.num_Q_load_threads)
             # cute.arch.mbarrier_init(mbar_ptr_Q + 1, self.num_mma_threads)
         # We rely on pipeline_k and pipeline_v to initialize the mbarrier fence and sync
         pipeline_kv_producer_group = cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread)
         pipeline_kv_consumer_group = cutlass.pipeline.CooperativeGroup(
             cutlass.pipeline.Agent.Thread, self.num_mma_threads // self.num_threads_per_warp_group
         )
-        pipeline_k = pipeline.PipelineTmaAsyncNoCluster.create(
+        pipeline_k = pipeline.PipelineTmaAsync.create(
             barrier_storage=storage.mbar_ptr_K.data_ptr(),
             num_stages=self.num_stages,
             producer_group=pipeline_kv_producer_group,
             consumer_group=pipeline_kv_consumer_group,
-            tx_count=self.tma_copy_k_bytes,
+            tx_count=self.tma_copy_bytes["K"],
             init_wait=False,
         )
-        pipeline_v = pipeline.PipelineTmaAsyncNoCluster.create(
+        pipeline_v = pipeline.PipelineTmaAsync.create(
             barrier_storage=storage.mbar_ptr_V.data_ptr(),
             num_stages=self.num_stages,
             producer_group=pipeline_kv_producer_group,
             consumer_group=pipeline_kv_consumer_group,
-            tx_count=self.tma_copy_v_bytes,
+            tx_count=self.tma_copy_bytes["V"],
         )
 
         # ///////////////////////////////////////////////////////////////////////////////
@@ -1519,23 +1526,46 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 load_K = copy_utils.tma_producer_copy_fn(load_K, pipeline_k)
                 load_V, _, _ = copy_utils.tma_get_copy_fn(tma_atom_V, 0, cute.make_layout(1), gV, sV)
                 load_V = copy_utils.tma_producer_copy_fn(load_V, pipeline_v)
-                # load_Q
-                if const_expr(self.use_tma_Q):
-                    # TODO: wait for Q to be empty
-                    q_producer_phase ^= 1
-                    with cute.arch.elect_one():
-                        cute.arch.mbarrier_arrive_and_expect_tx(mbar_ptr_Q, self.tma_copy_q_bytes)
-                    load_Q(tma_bar_ptr=mbar_ptr_Q)
+
                 n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
                 # if cute.arch.thread_idx()[0] == 0:
                 #     cute.printf("m_block = %d, n_block_min: %d, n_block_max: %d", m_block, n_block_min, n_block_max)
-                for i in cutlass.range(n_block_max - n_block_min, unroll=2):
-                    n_block = n_block_max - i - 1
-                    pipeline_k.producer_acquire(kv_producer_state)
-                    load_K(src_idx=n_block, producer_state=kv_producer_state)
+                # First iteration: load both Q & K with the same mbarrier
+                n_block = n_block_max - 1
+                pipeline_k.producer_acquire(
+                    kv_producer_state,
+                    extra_tx_count=self.tma_copy_bytes["Q"] if const_expr(self.use_tma_Q) else 0
+                )
+                if const_expr(self.use_tma_Q):
+                    load_Q(tma_bar_ptr=pipeline_k.producer_get_barrier(kv_producer_state))
+                load_K(src_idx=n_block, producer_state=kv_producer_state)
+
+                if const_expr(not self.intra_wg_overlap):
                     pipeline_v.producer_acquire(kv_producer_state)
                     load_V(src_idx=n_block, producer_state=kv_producer_state)
                     kv_producer_state.advance()
+                    for i in cutlass.range(n_block_max - 1 - n_block_min, unroll=1):
+                        n_block = n_block_max - 1 - i - 1
+                        pipeline_k.producer_acquire(kv_producer_state)
+                        load_K(src_idx=n_block, producer_state=kv_producer_state)
+                        pipeline_v.producer_acquire(kv_producer_state)
+                        load_V(src_idx=n_block, producer_state=kv_producer_state)
+                        kv_producer_state.advance()
+                else:
+                    for i in cutlass.range(n_block_max - 1 - n_block_min, unroll=1):
+                        n_block_prev = n_block_max - i - 1
+                        n_block = n_block_prev - 1
+                        kv_producer_state_prev = kv_producer_state.clone()
+                        kv_producer_state.advance()
+                        pipeline_k.producer_acquire(kv_producer_state)
+                        load_K(src_idx=n_block, producer_state=kv_producer_state)
+                        pipeline_v.producer_acquire(kv_producer_state_prev)
+                        load_V(src_idx=n_block_prev, producer_state=kv_producer_state_prev)
+                    n_block = n_block_min
+                    pipeline_v.producer_acquire(kv_producer_state)
+                    load_V(src_idx=n_block, producer_state=kv_producer_state)
+                    kv_producer_state.advance()
+
                 tile_scheduler.prefetch_next_work()
                 tile_scheduler.advance_to_next_work()
                 work_tile = tile_scheduler.get_current_work()
@@ -1666,7 +1696,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 cute.arch.cp_async_mbarrier_arrive_noinc(mbar_ptr_Q)
 
             n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
-            cute.arch.mbarrier_wait(mbar_ptr_Q, phase=q_consumer_phase)
+            if const_expr(not self.use_tma_Q):
+                cute.arch.mbarrier_wait(mbar_ptr_Q, phase=q_consumer_phase)
             q_consumer_phase ^= 1
             # For performance reason, we separate out two kinds of iterations:
             # those that need masking on S, and those that don't.
@@ -1693,9 +1724,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     tPrP = smem_thr_copy_P.retile(tOrP_cur)
                     cute.copy(smem_thr_copy_P, tPrP, tPsP)
                     # Fence and barrier to make sure smem store is visible to WGMMA
-                    cute.arch.fence_proxy(
-                        cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
-                    )
+                    cute.arch.fence_proxy(ProxyKind.async_shared, space=SharedSpace.shared_cta)
                     cute.arch.sync_warp()  # Only need syncwarp since each warp is using its own P values for MmaPV
                 # Need to initialize tOrO in the case of RescaleOBeforeGemm where we will scale tOrO even in the 1st iter
                 # acc_O.fill(0.0)
@@ -1830,9 +1859,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         softmax.rescale_O(acc_O, row_scale)
         if const_expr(not self.mma_pv_is_rs):
             # Fence and barrier to make sure smem store is visible to WGMMA
-            cute.arch.fence_proxy(
-                cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
-            )
+            cute.arch.fence_proxy(ProxyKind.async_shared, space=SharedSpace.shared_cta)
             cute.arch.sync_warp()  # Only need syncwarp since each warp is using its own P values for MmaPV
         pipeline_v.consumer_wait(smem_pipe_read, pipeline_v.consumer_try_wait(smem_pipe_read))
         self.warp_scheduler_barrier_sync()
@@ -1894,9 +1921,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         softmax.rescale_O(acc_O, row_scale)
         if const_expr(not self.mma_pv_is_rs):
             # Fence and barrier to make sure smem store is visible to WGMMA
-            cute.arch.fence_proxy(
-                cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
-            )
+            cute.arch.fence_proxy(ProxyKind.async_shared, space=SharedSpace.shared_cta)
             cute.arch.sync_warp()  # Only need syncwarp since each warp is using its own P values for MmaPV
         return smem_pipe_read
 

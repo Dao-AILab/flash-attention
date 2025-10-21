@@ -8,8 +8,6 @@ repos:
         exclude: &cute_exclude |
           (?x)^flash_attn/cute/(
             __init__|
-            blackwell_helpers|
-            block_info|
             copy_utils|
             cute_dsl_utils|
             fast_math|
@@ -19,12 +17,7 @@ repos:
             flash_fwd_sm100|
             hopper_helpers|
             interface|
-            mask|
-            mma_sm100_desc|
-            named_barrier|
             pack_gqa|
-            pipeline|
-            seqlen_info|
             testing|
             tile_scheduler|
             utils

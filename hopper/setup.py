@@ -399,11 +399,18 @@ if not SKIP_CUDA_BUILD:
     _, bare_metal_version = get_cuda_bare_metal_version(CUDA_HOME)
     if bare_metal_version < Version("12.3"):
         raise RuntimeError("FlashAttention-3 is only supported on CUDA 12.3 and above")
+    elif bare_metal_version >= Version("13.0"):
+        # CUDA 13.0+ uses system nvcc and CCCL headers are in /usr/local/cuda/include/cccl/
+        cccl_include = os.path.join(CUDA_HOME, "include", "cccl")
+        for env_var in ["CPLUS_INCLUDE_PATH", "C_INCLUDE_PATH"]:
+            current = os.environ.get(env_var, "")
+            os.environ[env_var] = cccl_include + (":" + current if current else "")
 
     # ptxas 12.8 gives the best perf currently
     # We want to use the nvcc front end from 12.6 however, since if we use nvcc 12.8
     # Cutlass 3.8 will expect the new data types in cuda.h from CTK 12.8, which we don't have.
-    if bare_metal_version != Version("12.8"):
+    # For CUDA 13.0+, use system nvcc instead of downloading CUDA 12.x toolchain
+    if bare_metal_version >= Version("12.3") and bare_metal_version < Version("13.0") and bare_metal_version != Version("12.8"):
         download_and_copy(
             name="nvcc",
             src_func=lambda system, arch, version: f"cuda_nvcc-{system}-{arch}-{version}-archive/bin",

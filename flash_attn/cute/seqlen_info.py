@@ -10,6 +10,7 @@ the gmem reads once at the beginning of each tile, rather than having to repeat 
 to compute various things like n_block_min, n_block_max, etc.
 """
 
+
 class SeqlenInfo:
     def __init__(
         self,
@@ -60,19 +61,19 @@ class SeqlenInfoQK:
         self.has_cu_seqlens_k: int = mCuSeqlensK is not None
 
     def offset_batch_Q(self, mQ: cute.Tensor, batch_idx: Int32, dim: int) -> cute.Tensor:
-        """Seqlen must be the first dimension of mQ
-        """
+        """Seqlen must be the first dimension of mQ"""
         if const_expr(not self.has_cu_seqlens_q):
             idx = (None,) * dim + (batch_idx,) + (None,) * (cute.rank(mQ) - 1 - dim)
             return mQ[idx]
         else:
-            offset = self.offset_q if const_expr(cute.rank(mQ.shape[0]) == 1) else (0, self.offset_q)
+            offset = (
+                self.offset_q if const_expr(cute.rank(mQ.shape[0]) == 1) else (0, self.offset_q)
+            )
             idx = (offset,) + (0,) * (cute.rank(mQ) - 1)
             return cute.domain_offset(idx, mQ)
 
     def offset_batch_K(self, mK: cute.Tensor, batch_idx: Int32, dim: int) -> cute.Tensor:
-        """Seqlen must be the first dimension of mK
-        """
+        """Seqlen must be the first dimension of mK"""
         if const_expr(not self.has_cu_seqlens_k):
             idx = (None,) * dim + (batch_idx,) + (None,) * (cute.rank(mK) - 1 - dim)
             return mK[idx]

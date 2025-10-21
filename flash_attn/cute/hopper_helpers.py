@@ -100,5 +100,3 @@ def make_smem_layout(
         order=order if const_expr(stage is not None) else order[:2],
     )
     return smem_layout_staged
-
-
