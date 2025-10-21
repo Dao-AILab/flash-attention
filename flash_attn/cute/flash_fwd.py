@@ -99,7 +99,7 @@ class FlashAttentionForwardBase:
         self.score_mod = score_mod
         self.mask_mod = mask_mod
         self.qk_acc_dtype = Float32
-        if cutlass.const_expr(has_buffers):
+        if const_expr(has_buffers):
             self.vec_size: cutlass.Constexpr = 1
         else:
             self.vec_size: cutlass.Constexpr = 2
@@ -605,7 +605,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             softmax_scale = Float32(softmax_scale)
 
         fastdiv_mods = None
-        if cutlass.const_expr(buffers is not None):
+        if const_expr(buffers is not None):
             seqlen_q = cute.size(mQ.shape[0]) // (self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1)
             seqlen_k = cute.size(mK.shape[0])
             seqlen_q_divmod = FastDivmod.create(seqlen_q)
@@ -942,7 +942,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             # hook_fn=load_V_next,
             A_in_regs=self.Q_in_regs,
         )
-        if cutlass.const_expr(score_mod is not None):
+        if const_expr(score_mod is not None):
             self.apply_score_mod(
                 mma_params.thr_mma_qk,
                 batch_idx,
@@ -1274,7 +1274,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             window_size_right = Int32(window_size_right)
 
         fastdiv_mods = None
-        if cutlass.const_expr(buffers is not None):
+        if const_expr(buffers is not None):
             seqlen_q = cute.size(mQ.shape[0]) // (self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1)
             seqlen_k = cute.size(mK.shape[0])
             seqlen_q_divmod = FastDivmod.create(seqlen_q)
@@ -2375,7 +2375,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             self.qk_acc_dtype,
             buffers,
             fastdiv_mods,
-            constant_q_idx=None
+            constant_q_idx=None,
+            qhead_per_kvhead=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
         )
 
     def warp_scheduler_barrier_sync(self):
