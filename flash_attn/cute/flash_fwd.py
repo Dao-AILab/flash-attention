@@ -5,7 +5,6 @@
 # from Cutlass C++ to Cute-DSL.
 # Built on Cute-DSL example: https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/ampere/flash_attention_v2.py
 
-from ast import Call
 import math
 from types import SimpleNamespace
 from typing import Type, Callable, Optional, List
@@ -35,22 +34,6 @@ from flash_attn.cute.pack_gqa import PackGQA
 from flash_attn.cute.named_barrier import NamedBarrierFwd
 from flash_attn.cute.tile_scheduler import TileSchedulerArguments, SingleTileScheduler, SingleTileLPTScheduler, SingleTileVarlenScheduler, ParamsBase
 from flash_attn.cute.fast_math import FastDivmod
-
-
-def mma_qk(tiled_mma_qk: cute.TiledMma, shape: cute.Shape, tSrQ: cute.Tensor, tSrK: cute.Tensor, smem_idx: Int32, wg_wait: int = -1) -> cute.Tensor:
-    acc_S = cute.make_fragment(tiled_mma_qk.partition_shape_C(shape), Float32)
-    sm90_utils.gemm(
-        tiled_mma_qk, acc_S, tSrQ, tSrK[None, None, None, smem_idx], zero_init=True, wg_wait=wg_wait
-    )
-    return acc_S
-
-
-def mma_pv(tiled_mma_pv: cute.TiledMma, acc_O: cute.Tensor, tOrP: cute.Tensor, tOrVt: cute.Tensor, smem_idx: Int32, zero_init: Boolean, wg_wait: int = -1) -> None:
-    sm90_utils.gemm(
-        tiled_mma_pv, acc_O, tOrP,
-        tOrVt[None, None, None, smem_idx],
-        zero_init=zero_init, wg_wait=wg_wait
-    )
 
 
 class FlashAttentionForwardBase:
@@ -623,7 +606,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
 
         fastdiv_mods = None
         if cutlass.const_expr(buffers is not None):
-            seqlen_q = cute.size(mQ.shape[0])
+            seqlen_q = cute.size(mQ.shape[0]) // (self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1)
             seqlen_k = cute.size(mK.shape[0])
             seqlen_q_divmod = FastDivmod.create(seqlen_q)
             seqlen_k_divmod = FastDivmod.create(seqlen_k)
