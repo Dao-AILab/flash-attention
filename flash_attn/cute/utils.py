@@ -29,6 +29,11 @@ sub_packed_f32x2 = partial(
 
 def hash_callable(func: Callable) -> str:
     """Hash a callable based on the source code or bytecode and closure values."""
+    if hasattr(func, "__wrapped__"):
+        # cute.jit returns a wrapper whose repr/closure changes per compile; hash the undecorated function.
+        base_func = func.__wrapped__
+        func = base_func
+
     try:
         data = inspect.getsource(func).encode()
     except (OSError, TypeError):
@@ -40,7 +45,7 @@ def hash_callable(func: Callable) -> str:
     hasher = hashlib.sha256(data)
 
     if hasattr(func, "__closure__") and func.__closure__ is not None:
-        for cell in func.__closure__:
+        for idx, cell in enumerate(func.__closure__):
             cell_value = cell.cell_contents
             hasher.update(repr(cell_value).encode())
 
@@ -50,6 +55,7 @@ def hash_callable(func: Callable) -> str:
 def create_softcap_scoremod(softcap_val):
     inv_softcap = 1.0 / softcap_val
 
+    @cute.jit
     def scoremod_premask_fn(acc_S_SSA, batch_idx, head_idx, q_idx, kv_idx, buffers):
         scores = acc_S_SSA * inv_softcap
         return scores * cute.math.tanh(scores, fastmath=True)
