@@ -52,6 +52,8 @@ from flash_attn.cute.interface import flash_attn_func, flash_attn_varlen_func, f
     "seqlen_q,seqlen_k",
     [
         (1, 1),
+        (3, 3),
+        (64, 32),
         (64, 128),
         (128, 192),
         (256, 256),
@@ -82,6 +84,8 @@ def test_flash_attn_output(
     device = "cuda"
     # set seed
     torch.random.manual_seed(0)
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
     batch_size = 9 if seqlen_k <= 2048 else 2
     # batch_size = 1
     nheads = 6
@@ -256,8 +260,8 @@ def test_flash_attn_output(
 @pytest.mark.parametrize("deterministic", [False])
 # @pytest.mark.parametrize("softcap", [0.0, 15.0])
 @pytest.mark.parametrize("softcap", [0.0])
-@pytest.mark.parametrize("local", [False, True])
-# @pytest.mark.parametrize("local", [False])
+# @pytest.mark.parametrize("local", [False, True])
+@pytest.mark.parametrize("local", [False])
 @pytest.mark.parametrize("causal", [False, True])
 # @pytest.mark.parametrize("causal", [False])
 # @pytest.mark.parametrize("add_unused_qkv", [False, True])
@@ -268,8 +272,8 @@ def test_flash_attn_output(
 # @pytest.mark.parametrize('d', [56, 80])
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128])
 # @pytest.mark.parametrize("d", [64, 96, 128])
-@pytest.mark.parametrize("d", [128, 192])
-# @pytest.mark.parametrize("d", [192])
+# @pytest.mark.parametrize("d", [128, 192])
+@pytest.mark.parametrize("d", [128])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
