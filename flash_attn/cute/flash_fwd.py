@@ -1673,19 +1673,20 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         # ==========================================
                         
                         # Load Q with the first K block (whether mask or full)
-                        n_block_first = 0
+                        n_block_first = -1
                         if curr_mask_block_cnt > 0:
                             n_block_first = curr_mask_block_idx[curr_mask_block_cnt - 1]
                         elif curr_full_block_cnt > 0:
                             n_block_first = curr_full_block_idx[curr_full_block_cnt - 1]
                         
-                        pipeline_k.producer_acquire(
-                            kv_producer_state,
-                            extra_tx_count=self.tma_copy_bytes["Q"] if const_expr(self.use_tma_Q) else 0
-                        )
-                        if const_expr(self.use_tma_Q):
-                            load_Q(tma_bar_ptr=pipeline_k.producer_get_barrier(kv_producer_state))
-                        load_K(src_idx=n_block_first, producer_state=kv_producer_state)
+                        if n_block_first >= 0:
+                            pipeline_k.producer_acquire(
+                                kv_producer_state,
+                                extra_tx_count=self.tma_copy_bytes["Q"] if const_expr(self.use_tma_Q) else 0
+                            )
+                            if const_expr(self.use_tma_Q):
+                                load_Q(tma_bar_ptr=pipeline_k.producer_get_barrier(kv_producer_state))
+                            load_K(src_idx=n_block_first, producer_state=kv_producer_state)
                         
                         if curr_mask_block_cnt > 0:
                             # Staggered loading for remaining mask blocks
@@ -2122,8 +2123,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         O_should_accumulate = True
 
                 if curr_mask_block_cnt + curr_full_block_cnt == 0:
-                    acc_O.fill(0.0)
-                    O_should_accumulate = True
+                    softmax.reset()
+                    acc_O.fill(0.0) 
+
 
             sink_val = None
             if const_expr(learnable_sink is not None):
@@ -2139,6 +2141,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         sink_val[r] = Float32(learnable_sink[q_head_idx])
 
             # normalize acc_O by row_sum and calculate the lse
+            # if (
+            #     const_expr(not self.use_block_sparsity)
+            #     or mask_block_cnt[batch_idx, head_idx, m_block]
+            #     + full_block_cnt[batch_idx, head_idx, m_block]
+            #     != 0
+
             row_scale = softmax.finalize(sink_val=sink_val)
             softmax.rescale_O(acc_O, row_scale)
 
