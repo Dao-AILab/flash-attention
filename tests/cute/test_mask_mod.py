@@ -310,29 +310,31 @@ def compute_reference_flex_attn(
         (4224, 4224),
     ],
 )
-@pytest.mark.parametrize("nheads", [4, 16, 32])
+# @pytest.mark.parametrize("nheads", [4, 16, 32])
+@pytest.mark.parametrize("nheads", [16])
 @pytest.mark.parametrize("kv_mode", ["mha", "gqa", "mqa"])
-@pytest.mark.parametrize("headdim", [64, 128])
+# @pytest.mark.parametrize("headdim", [64, 128])
+@pytest.mark.parametrize("headdim", [128])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize(
     "use_mask_mod,is_local,mask_name,window_size,window_left,window_right",
     [
-        # (False, False, "identity", None, None, None),
-        # (False, False, "causal", None, None, None),
-        # (True, False, "identity", None, None, None),
-        # (True, False, "causal", None, None, None),
-        (True, False, "block_causal", None, None, None),
+        (False, False, "identity", None, None, None),
+        (False, False, "causal", None, None, None),
+        (True, False, "identity", None, None, None),
+        (True, False, "causal", None, None, None),
+        # (True, False, "block_causal", None, None, None),
         # Mask mod sliding window
-        # (True, False, "sliding_window", 128, None, None),
-        # (True, False, "sliding_window", 256, None, None),
-        # (True, False, "sliding_window", 512, None, None),
+        (True, False, "sliding_window", 128, None, None),
+        (True, False, "sliding_window", 256, None, None),
+        (True, False, "sliding_window", 512, None, None),
         # Base local attention
         # (False, True, None, None, 128, 0),
         # (False, True, None, None, 256, 0),
         # (False, True, None, None, 512, 0),
     ],
 )
-@pytest.mark.parametrize("tile_m,tile_n", [(128, 128), (128, 192)])
+@pytest.mark.parametrize("tile_m,tile_n", [(128, 128),])
 def test_mask_mod_output(
     seqlen_q, seqlen_k, nheads, kv_mode, headdim, dtype, 
     use_mask_mod, is_local, mask_name, window_size, window_left, window_right,

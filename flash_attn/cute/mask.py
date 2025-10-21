@@ -48,7 +48,6 @@ class AttentionMask:
     window_size_right: Optional[Int32] = None
     qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1  # only pass in if we're doing PackGQA
     swap_AB: cutlass.Constexpr[bool] = False
-    mask_mod: cutlass.Constexpr[Optional[Callable]] = None
 
     @cute.jit
     def apply_mask(
@@ -62,8 +61,8 @@ class AttentionMask:
         mask_seqlen: cutlass.Constexpr[bool],
         mask_causal: cutlass.Constexpr[bool],
         mask_local: cutlass.Constexpr[bool] = False,
-        use_mask_mod: bool = False,
-        buffers: Optional[list[cute.Tensor]] = None,
+        mask_mod: cutlass.Constexpr[Optional[Callable]] = None,
+        aux_tensors: Optional[list[cute.Tensor]] = None,
     ) -> None:
         assert not (mask_causal and mask_local), "mask_causal and mask_local cannot be both True"
         acc_S_mn = utils.make_acc_tensor_mn_view(acc_S, transpose=self.swap_AB)
@@ -79,21 +78,20 @@ class AttentionMask:
         COL = 1 if const_expr(not self.swap_AB) else 0
         thr_col_offset = tScS_mn[0][COL]
         seqlenk_col_limit = self.seqlen_k - n_block * self.tile_n - thr_col_offset
-        if cutlass.const_expr(not mask_causal and not mask_local):
-            if not use_mask_mod:
-                if cutlass.const_expr(mask_seqlen):
-                    # The compiler now choses not to use R2P
-                    r2p = const_expr(False and not self.swap_AB)
-                    if const_expr(not r2p):
-                        # traverse column index.
-                        for c in cutlass.range(cute.size(tScS_mn.shape[1]), unroll_full=True):
-                            oob = t0ScS_mn[0, c][COL] >= seqlenk_col_limit
-                            for r in cutlass.range(cute.size(tScS_mn.shape[0]), unroll_full=True):
-                                acc_S_mn[r, c] = -Float32.inf if oob else acc_S_mn[r, c]
-                    else:
-                        mask_r2p(acc_S_mn, seqlenk_col_limit, arch=90)
+        if cutlass.const_expr(not mask_causal and not mask_local and mask_mod is None):
+            if cutlass.const_expr(mask_seqlen):
+                # The compiler now choses not to use R2P
+                r2p = const_expr(False and not self.swap_AB)
+                if const_expr(not r2p):
+                    # traverse column index.
+                    for c in cutlass.range(cute.size(tScS_mn.shape[1]), unroll_full=True):
+                        oob = t0ScS_mn[0, c][COL] >= seqlenk_col_limit
+                        for r in cutlass.range(cute.size(tScS_mn.shape[0]), unroll_full=True):
+                            acc_S_mn[r, c] = -Float32.inf if oob else acc_S_mn[r, c]
+                else:
+                    mask_r2p(acc_S_mn, seqlenk_col_limit, arch=90)
                                 
-        elif use_mask_mod: # FlexAttention mask mod
+        elif cutlass.const_expr(not mask_causal and not mask_local and mask_mod is not None): # FlexAttention mask mod
             nrow = cutlass.const_expr(cute.size(tScS_mn.shape[0]))
             ncol = cutlass.const_expr(cute.size(tScS_mn.shape[1]))
             thr_col_offset = tScS_mn[0, 0][1]
@@ -107,14 +105,14 @@ class AttentionMask:
                     global_col_idx = thr_col_offset + col_idx_local + n_block * self.tile_n
                     
                     cond = cutlass.Boolean(
-                        self.mask_mod(
+                        mask_mod(
                             batch_idx,
                             head_idx,
                             tScS_mn[r, 0][0] + m_block * self.tile_m,
                             thr_col_offset + t0ScS_mn[0, col][1] + n_block * self.tile_n,
                             self.seqlen_q,
                             self.seqlen_k,
-                            buffers,
+                            aux_tensors,
                         )
                     )
                     if cutlass.const_expr(mask_seqlen):
