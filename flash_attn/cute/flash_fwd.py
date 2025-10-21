@@ -2141,12 +2141,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         sink_val[r] = Float32(learnable_sink[q_head_idx])
 
             # normalize acc_O by row_sum and calculate the lse
-            # if (
-            #     const_expr(not self.use_block_sparsity)
-            #     or mask_block_cnt[batch_idx, head_idx, m_block]
-            #     + full_block_cnt[batch_idx, head_idx, m_block]
-            #     != 0
-
             row_scale = softmax.finalize(sink_val=sink_val)
             softmax.rescale_O(acc_O, row_scale)
 
