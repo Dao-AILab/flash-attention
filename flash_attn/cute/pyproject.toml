@@ -20,7 +20,7 @@ classifiers = [
 ]
 
 dependencies = [
-    "nvidia-cutlass-dsl==4.2.1",
+    "nvidia-cutlass-dsl==4.3.0.dev0",
     "torch",
     "einops",
 ]
