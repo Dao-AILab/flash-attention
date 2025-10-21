@@ -272,7 +272,11 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
 
     if (seqlen_k > 0) {
         auto drop_seed_offset = std::make_pair(rng_state_ptr, rng_state_ptr + 1);
+#ifdef HIPIFY_V2
+        auto stream = at::cuda::getCurrentCUDAStream().stream();
+#else
         auto stream = at::cuda::getCurrentHIPStream().stream();
+#endif
         ck_tile::stream_config stream_config{stream};
 
         auto traits =

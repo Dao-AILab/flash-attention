@@ -11,12 +11,13 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync, warp
-import cutlass.utils.ampere_helpers as sm80_utils_basic
+import cutlass.utils as utils_basic
 
 from flash_attn.cute import ampere_helpers as sm80_utils
 from flash_attn.cute import utils
 from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
+from flash_attn.cute.tile_scheduler import ParamsBase, SingleTileScheduler, SingleTileVarlenScheduler, TileSchedulerArguments
 
 
 class FlashAttentionBackwardSm80:
@@ -31,6 +32,7 @@ class FlashAttentionBackwardSm80:
         num_stages_Q: int = 2,
         num_stages_dO: int = 2,
         num_threads: int = 256,
+        pack_gqa: bool = False,
         is_causal: bool = False,
         SdP_swapAB: bool = False,
         dKV_swapAB: bool = False,
@@ -69,6 +71,7 @@ class FlashAttentionBackwardSm80:
         self.m_block_size = m_block_size
         self.n_block_size = n_block_size
         self.num_threads = num_threads
+        self.pack_gqa = pack_gqa
         self.is_causal = is_causal
         self.num_stages_Q = num_stages_Q
         self.num_stages_dO = num_stages_dO
@@ -125,7 +128,7 @@ class FlashAttentionBackwardSm80:
         smem_usage_V = n_block_size * head_dim_v * 2
         smem_usage_QV = (smem_usage_Q + smem_usage_V) if not V_in_regs else max(smem_usage_Q, smem_usage_V)
         smem_usage = smem_usage_QV + smem_usage_dO + smem_usage_K
-        smem_capacity = sm80_utils_basic.SMEM_CAPACITY["sm80"]
+        smem_capacity = utils_basic.get_smem_capacity_in_bytes("sm_80")
         if smem_usage > smem_capacity:
             return False
         return True
@@ -141,6 +144,10 @@ class FlashAttentionBackwardSm80:
         mdQaccum_type: Type[cutlass.Numeric],
         mdK_type: Type[cutlass.Numeric],
         mdV_type: Type[cutlass.Numeric],
+        mCuSeqlensQ_type: Type[cutlass.Numeric] | None,
+        mCuSeqlensK_type: Type[cutlass.Numeric] | None,
+        mSeqUsedQ_type: Type[cutlass.Numeric] | None,
+        mSeqUsedK_type: Type[cutlass.Numeric] | None,
     ):
         if cutlass.const_expr(not (mQ_type == mK_type == mV_type == mdO_type)):
             raise TypeError("All tensors must have the same data type")
@@ -158,6 +165,14 @@ class FlashAttentionBackwardSm80:
             raise TypeError("dPsum tensor must be Float32")
         if cutlass.const_expr(not mdQaccum_type in [cutlass.Float32]):
             raise TypeError("dQaccum tensor must be Float32")
+        if cutlass.const_expr(mCuSeqlensQ_type not in [None, cutlass.Int32]):
+            raise TypeError("cuSeqlensQ tensor must be Int32")
+        if cutlass.const_expr(mCuSeqlensK_type not in [None, cutlass.Int32]):
+            raise TypeError("cuSeqlensK tensor must be Int32")
+        if cutlass.const_expr(mSeqUsedQ_type not in [None, cutlass.Int32]):
+            raise TypeError("SeqUsedQ tensor must be Int32")
+        if cutlass.const_expr(mSeqUsedK_type not in [None, cutlass.Int32]):
+            raise TypeError("SeqUsedK tensor must be Int32")
         assert mQ_type == self.dtype
 
     def _setup_attributes(self):
@@ -245,11 +260,22 @@ class FlashAttentionBackwardSm80:
         self.gmem_tiled_copy_dK = cute.make_tiled_copy_tv(atom_universal_copy, tQK_layout, vQKVdO_layout)
         self.gmem_tiled_copy_dV = cute.make_tiled_copy_tv(atom_universal_copy, tVdO_layout, vQKVdO_layout)
         async_copy_elems_accum = universal_copy_bits // cutlass.Float32.width
-        atom_async_copy_accum = cute.make_copy_atom(
-            cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
-            cutlass.Float32,
-            num_bits_per_copy=universal_copy_bits,
-        )
+
+        # I think we wouldn't require this with smarter padding
+        if cutlass.const_expr(not self.varlen_q):
+            async_copy_elems_accum = universal_copy_bits // cutlass.Float32.width
+            atom_async_copy_accum = cute.make_copy_atom(
+                cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
+                cutlass.Float32,
+                num_bits_per_copy=universal_copy_bits,
+            )
+        else:
+            async_copy_elems_accum = 1
+            atom_async_copy_accum = cute.make_copy_atom(
+                cute.nvgpu.CopyUniversalOp(),
+                cutlass.Float32,
+                num_bits_per_copy=cutlass.Float32.width,
+            )
         self.gmem_tiled_copy_LSE = cute.make_tiled_copy_tv(
             atom_async_copy_accum,
             cute.make_layout(self.num_threads),
@@ -343,19 +369,49 @@ class FlashAttentionBackwardSm80:
         mdV: cute.Tensor,
         softmax_scale: cutlass.Float32,
         stream: cuda.CUstream,
+        mCuSeqlensQ: Optional[cute.Tensor] = None,
+        mCuSeqlensK: Optional[cute.Tensor] = None,
+        mSeqUsedQ: Optional[cute.Tensor] = None,
+        mSeqUsedK: Optional[cute.Tensor] = None,
     ):
         # Get the data type and check if it is fp16 or bf16
         self._check_type(*(t.element_type if t is not None else None
-                           for t in (mQ, mK, mV, mdO, mLSE, mdPsum, mdQaccum, mdK, mdV)))
+                           for t in (mQ, mK, mV, mdO, mLSE, mdPsum, mdQaccum, mdK, mdV, mCuSeqlensQ, mCuSeqlensK, mSeqUsedQ, mSeqUsedK)))
+        # Assume all strides are divisible by 128 bits except the last stride
+        new_stride = lambda t: (*(cute.assume(s, divby=128 // t.element_type.width) for s in t.stride[:-1]), t.stride[-1])
+        mQ, mK, mV, mdO, mLSE, mdPsum, mdQaccum, mdK, mdV = [cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t))) if t is not None else None for t in (mQ, mK, mV, mdO, mLSE, mdPsum, mdQaccum, mdK, mdV)]
+        self.varlen_q = (mCuSeqlensQ is not None)
         self._setup_attributes()
         SharedStorage = self._get_shared_storage_cls()
         tiled_mma_sdp, tiled_mma_dkv, tiled_mma_dq = self._get_tiled_mma()
-        # grid_dim: (n_block, num_head, batch_size)
-        grid_dim = (
-            cute.ceil_div(mK.shape[1], self.n_block_size),
-            cute.size(mQ.shape[2]),
-            cute.size(mQ.shape[0]),
+
+        num_head = mQ.shape[1] if cutlass.const_expr(mCuSeqlensQ is not None) else mQ.shape[2]
+
+        if cutlass.const_expr(mCuSeqlensK is not None):
+            TileScheduler = SingleTileVarlenScheduler
+            num_batch = mCuSeqlensK.shape[0] - 1
+        else:
+            TileScheduler = SingleTileScheduler
+            num_batch = mK.shape[0]
+
+        # Uses seqlen k, etc. since main bwd kernel's blocks are over n 
+        tile_sched_args = TileSchedulerArguments(
+            num_block=cute.ceil_div(mK.shape[1], self.n_block_size),
+            num_head=num_head,
+            num_batch=num_batch,
+            seqlen_k=0,
+            headdim=mK.shape[2],
+            headdim_v=mV.shape[2],
+            total_q=mK.shape[0],
+            tile_shape_mn=(self.n_block_size, self.m_block_size),
+            qhead_per_kvhead_packgqa=self.qhead_per_kvhead if cutlass.const_expr(self.pack_gqa) else 1,
+            mCuSeqlensQ=mCuSeqlensK,
+            mSeqUsedQ=mSeqUsedK,
         )
+        
+        tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
+        grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
+
         softmax_scale_log2 = softmax_scale * math.log2(math.e)
         self.kernel(
             mQ,
@@ -367,6 +423,10 @@ class FlashAttentionBackwardSm80:
             mdQaccum,
             mdK,
             mdV,
+            mCuSeqlensQ,
+            mCuSeqlensK,
+            mSeqUsedQ,
+            mSeqUsedK,
             softmax_scale,
             softmax_scale_log2,
             self.sQ_layout,
@@ -386,6 +446,8 @@ class FlashAttentionBackwardSm80:
             tiled_mma_dkv,
             tiled_mma_dq,
             SharedStorage,
+            tile_sched_params,
+            TileScheduler,
         ).launch(
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
@@ -402,9 +464,13 @@ class FlashAttentionBackwardSm80:
         mdO: cute.Tensor,
         mLSE: cute.Tensor,
         mdPsum: cute.Tensor,
-        mdQaccu: cute.Tensor,
+        mdQaccum: cute.Tensor,
         mdK: cute.Tensor,
         mdV: cute.Tensor,
+        mCuSeqlensQ: Optional[cute.Tensor],
+        mCuSeqlensK: Optional[cute.Tensor],
+        mSeqUsedQ: Optional[cute.Tensor],
+        mSeqUsedK: Optional[cute.Tensor],
         softmax_scale: cutlass.Float32,
         softmax_scale_log2: cutlass.Float32,
         sQ_layout: cute.ComposedLayout,
@@ -424,301 +490,333 @@ class FlashAttentionBackwardSm80:
         tiled_mma_dkv: cute.TiledMma,
         tiled_mma_dq: cute.TiledMma,
         SharedStorage: cutlass.Constexpr,
+        tile_sched_params: ParamsBase,
+        TileScheduler: cutlass.Constexpr[Callable],
     ):
         # Thread index, block index
         tidx, _, _ = cute.arch.thread_idx()
-        n_block, head_idx, batch_idx = cute.arch.block_idx()
 
-        m_block_max = cute.ceil_div(mQ.shape[1], self.m_block_size)
-        m_block_min = 0
-        if cutlass.const_expr(self.is_causal):
-            m_block_min = max(
-                (n_block * self.n_block_size + mQ.shape[1] - mK.shape[1]) // self.m_block_size,
-                m_block_min,
+        tile_scheduler = TileScheduler.create(tile_sched_params)
+        work_tile = tile_scheduler.initial_work_tile_info()
+
+        n_block, head_idx, batch_idx = work_tile.tile_idx
+
+        if work_tile.is_valid_tile:
+            seqlen = SeqlenInfoQK(batch_idx, mQ.shape[1], mK.shape[1], mCuSeqlensQ=mCuSeqlensQ, mCuSeqlensK=mCuSeqlensK, mSeqUsedQ=mSeqUsedQ, mSeqUsedK=mSeqUsedK)
+
+            m_block_max = cute.ceil_div(seqlen.seqlen_q, self.m_block_size)
+            m_block_min = 0
+            if cutlass.const_expr(self.is_causal):
+                m_block_min = max(
+                    (n_block * self.n_block_size + seqlen.seqlen_q - seqlen.seqlen_k) // self.m_block_size,
+                    m_block_min,
+                )
+            # TODO: return early if m_block_max == 0
+
+            # ///////////////////////////////////////////////////////////////////////////////
+            # Get the appropriate tiles for this thread block.
+            # ///////////////////////////////////////////////////////////////////////////////
+            blkQ_shape = (self.m_block_size, self.head_dim_padded)
+            blkK_shape = (self.n_block_size, self.head_dim_padded)
+            blkV_shape = (self.n_block_size, self.head_dim_v_padded)
+            blkdO_shape = (self.m_block_size, self.head_dim_v_padded)
+
+            if cutlass.const_expr(not seqlen.has_cu_seqlens_q):
+                mQ_cur = mQ[batch_idx, None, head_idx, None]
+                mLSE_cur = mLSE[batch_idx, head_idx, None]
+                mdO_cur = mdO[batch_idx, None, head_idx, None]
+                mdPsum_cur = mdPsum[batch_idx, head_idx, None]
+                mdQaccum_cur = mdQaccum[batch_idx, head_idx, None]
+            else:
+                padded_offset_q = seqlen.offset_q + batch_idx * self.m_block_size
+                mQ_cur = cute.domain_offset((seqlen.offset_q, 0), mQ[None, head_idx, None])
+                mLSE_cur = cute.domain_offset((padded_offset_q,), mLSE[head_idx, None])
+                mdO_cur = cute.domain_offset((seqlen.offset_q, 0), mdO[None, head_idx, None])
+                mdPsum_cur = cute.domain_offset((padded_offset_q,), mdPsum[head_idx, None])
+                mdQaccum_cur = cute.domain_offset((padded_offset_q * self.head_dim_padded,), mdQaccum[head_idx, None])
+            head_idx_kv = head_idx // self.qhead_per_kvhead if cutlass.const_expr(not self.pack_gqa) else head_idx
+
+            if cutlass.const_expr(not seqlen.has_cu_seqlens_k):
+                mK_cur, mV_cur = [t[batch_idx, None, head_idx_kv, None] for t in (mK, mV)]
+            else:
+                mK_cur, mV_cur = [cute.domain_offset((seqlen.offset_k, 0), t[None, head_idx_kv, None]) for t in (mK, mV)]
+
+            # (m_block_size, head_dim, m_block)
+            gQ = cute.local_tile(mQ_cur, blkQ_shape, (None, 0))
+            # (n_block_size, head_dim)
+            gK = cute.local_tile(mK_cur, blkK_shape, (n_block, 0))
+            # (n_block_size, head_dim_v)
+            gV = cute.local_tile(mV_cur, blkV_shape, (n_block, 0))
+            # (m_block_size, head_dim_v, m_block)
+            gdO = cute.local_tile(mdO_cur, blkdO_shape, (None, 0))
+            gLSE = cute.local_tile(mLSE_cur, (self.m_block_size,), (None,))
+            gdPsum = cute.local_tile(mdPsum_cur, (self.m_block_size,), (None,))
+            gdQaccum = cute.local_tile(mdQaccum_cur, (self.m_block_size * self.head_dim_padded,), (None,))
+
+            # ///////////////////////////////////////////////////////////////////////////////
+            # Get shared memory buffer
+            # ///////////////////////////////////////////////////////////////////////////////
+            smem = cutlass.utils.SmemAllocator()
+            storage = smem.allocate(SharedStorage)
+            sQ = storage.sQ.get_tensor(sQ_layout)
+            sK = storage.sK.get_tensor(sK_layout)
+            if cutlass.const_expr(not self.share_QV_smem):
+                sV = storage.sV.get_tensor(sV_layout)
+            else:
+                sV = cute.make_tensor(cute.recast_ptr(sQ.iterator, dtype=self.dtype), sV_layout)
+            sdO = storage.sdO.get_tensor(sdO_layout)
+            sP = storage.sP.get_tensor(sPdS_layout)
+            sdS = storage.sdS.get_tensor(sPdS_layout)
+            sLSE = storage.sLSE.get_tensor(sLSE_layout)
+            sdPsum = storage.sdPsum.get_tensor(sLSE_layout)
+            sLSEMma = storage.sLSE.get_tensor(sLSEMma_layout)
+            sdPsumMma = storage.sdPsum.get_tensor(sLSEMma_layout)
+
+            # Transpose view of tensors for tiled mma
+            sQt, sdOt, sKt, sPt, sdSt = [utils.transpose_view(t) for t in (sQ, sdO, sK, sP, sdS)]
+
+            gmem_thr_copy_QK = gmem_tiled_copy_QK.get_slice(tidx)
+            gmem_thr_copy_VdO = gmem_tiled_copy_VdO.get_slice(tidx)
+            gmem_thr_copy_lse = gmem_tiled_copy_LSE.get_slice(tidx)
+            gmem_thr_copy_dQaccum = gmem_tiled_copy_dQaccum.get_slice(tidx)
+            # (CPY_Atom, CPY_M, CPY_K, m_block)
+            tQgQ = gmem_thr_copy_QK.partition_S(gQ)
+            tQsQ = gmem_thr_copy_QK.partition_D(sQ)
+            # (CPY_Atom, CPY_N, CPY_K)
+            tKgK = gmem_thr_copy_QK.partition_S(gK)
+            tKsK = gmem_thr_copy_QK.partition_D(sK)
+            # (CPY_Atom, CPY_N, CPY_K)
+            tVgV = gmem_thr_copy_VdO.partition_S(gV)
+            tVsV = gmem_thr_copy_VdO.partition_D(sV)
+            # (CPY_Atom, CPY_M, CPY_K, m_block)
+            tdOgdO = gmem_thr_copy_VdO.partition_S(gdO)
+            tdOsdO = gmem_thr_copy_VdO.partition_D(sdO)
+            tLSEgLSE = gmem_thr_copy_lse.partition_S(gLSE)
+            tLSEsLSE = gmem_thr_copy_lse.partition_D(sLSE)
+            tLSEgdPsum = gmem_thr_copy_lse.partition_S(gdPsum)
+            tLSEsdPsum = gmem_thr_copy_lse.partition_D(sdPsum)
+            tdQgdQaccum = gmem_thr_copy_dQaccum.partition_S(gdQaccum)
+
+            # ///////////////////////////////////////////////////////////////////////////////
+            # Tile MMA compute thread partitions and allocate accumulators
+            # ///////////////////////////////////////////////////////////////////////////////
+            thr_mma_sdp = tiled_mma_sdp.get_slice(tidx)
+            thr_mma_dkv = tiled_mma_dkv.get_slice(tidx)
+            thr_mma_dq = tiled_mma_dq.get_slice(tidx)
+            acc_shape_dK = thr_mma_dkv.partition_shape_C((self.n_block_size, self.head_dim_padded))
+            acc_shape_dV = thr_mma_dkv.partition_shape_C((self.n_block_size, self.head_dim_v_padded))
+            acc_dK = cute.make_fragment(acc_shape_dK, cutlass.Float32)
+            acc_dV = cute.make_fragment(acc_shape_dV, cutlass.Float32)
+            acc_dK.fill(0.0)
+            acc_dV.fill(0.0)
+
+            tSrQ = utils.mma_make_fragment_A(sQ[None, None, 0], thr_mma_sdp, swapAB=self.SdP_swapAB)
+            tSrK = utils.mma_make_fragment_B(sK, thr_mma_sdp, swapAB=self.SdP_swapAB)
+            tdPrdO = utils.mma_make_fragment_A(sdO[None, None, 0], thr_mma_sdp, swapAB=self.SdP_swapAB)
+            tdPrV = utils.mma_make_fragment_B(sV, thr_mma_sdp, swapAB=self.SdP_swapAB)
+            tdVrP = utils.mma_make_fragment_A(sPt, thr_mma_dkv, swapAB=self.dKV_swapAB)
+            tdVrdO = utils.mma_make_fragment_B(sdOt[None, None, 0], thr_mma_dkv, swapAB=self.dKV_swapAB)
+            tdKrdS = utils.mma_make_fragment_A(sdSt, thr_mma_dkv, swapAB=self.dKV_swapAB)
+            tdKrQ = utils.mma_make_fragment_B(sQt[None, None, 0], thr_mma_dkv, swapAB=self.dKV_swapAB)
+            tdQrdS = utils.mma_make_fragment_A(sdS, thr_mma_dq, swapAB=self.dQ_swapAB)
+            tdQrK = utils.mma_make_fragment_B(sKt, thr_mma_dq, swapAB=self.dQ_swapAB)
+
+            LSEslice = (None, 0, None) if cutlass.const_expr(not self.SdP_swapAB) else (0, None, None)
+            tSsLSEMma = utils.make_acc_tensor_mn_view(thr_mma_sdp.partition_C(sLSEMma))[LSEslice]
+            tSsdPsumMma = utils.make_acc_tensor_mn_view(thr_mma_sdp.partition_C(sdPsumMma))[LSEslice]
+
+            # ///////////////////////////////////////////////////////////////////////////////
+            # Smem copy atom tiling
+            # ///////////////////////////////////////////////////////////////////////////////
+            smem_copy_atom = cute.make_copy_atom(
+                warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4), self.dtype,
             )
-        # TODO: return early if m_block_max == 0
+            smem_copy_atom_transposed = cute.make_copy_atom(
+                warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=4), self.dtype,
+            )
+            smem_thr_copy_QdO = utils.make_tiled_copy_A(
+                smem_copy_atom, tiled_mma_sdp, swapAB=self.SdP_swapAB
+            ).get_slice(tidx)
+            smem_thr_copy_KV = utils.make_tiled_copy_B(
+                smem_copy_atom, tiled_mma_sdp, swapAB=self.SdP_swapAB
+            ).get_slice(tidx)
+            # TODO: should this be smem_copy_atom_transposed?
+            smem_thr_copy_PdSt = utils.make_tiled_copy_A(
+                smem_copy_atom_transposed, tiled_mma_dkv, swapAB=self.dKV_swapAB
+            ).get_slice(tidx)
+            smem_thr_copy_QdOt = utils.make_tiled_copy_B(
+                smem_copy_atom_transposed, tiled_mma_dkv, swapAB=self.dKV_swapAB
+            ).get_slice(tidx)
+            smem_thr_copy_dS = utils.make_tiled_copy_A(
+                smem_copy_atom, tiled_mma_dq, swapAB=self.dQ_swapAB
+            ).get_slice(tidx)
+            smem_thr_copy_Kt = utils.make_tiled_copy_B(
+                smem_copy_atom_transposed, tiled_mma_dq, swapAB=self.dQ_swapAB
+            ).get_slice(tidx)
+            # TODO: what's the number of bits? What if SdP_swapAB
+            r2s_thr_copy_PdS = cute.make_tiled_copy_C(
+                cute.make_copy_atom(
+                    cute.nvgpu.CopyUniversalOp(), self.dtype, num_bits_per_copy=2 * self.dtype.width
+                ),
+                tiled_mma_sdp,
+            ).get_slice(tidx)
 
-        # ///////////////////////////////////////////////////////////////////////////////
-        # Get the appropriate tiles for this thread block.
-        # ///////////////////////////////////////////////////////////////////////////////
-        blkQ_shape = (self.m_block_size, self.head_dim_padded)
-        blkK_shape = (self.n_block_size, self.head_dim_padded)
-        blkV_shape = (self.n_block_size, self.head_dim_v_padded)
-        blkdO_shape = (self.m_block_size, self.head_dim_v_padded)
-        # (m_block_size, head_dim, m_block)
-        gQ = cute.local_tile(mQ[batch_idx, None, head_idx, None], blkQ_shape, (None, 0))
-        # (n_block_size, head_dim)
-        head_idx_kv = head_idx // self.qhead_per_kvhead
-        gK = cute.local_tile(mK[batch_idx, None, head_idx_kv, None], blkK_shape, (n_block, 0))
-        # (n_block_size, head_dim_v)
-        gV = cute.local_tile(mV[batch_idx, None, head_idx_kv, None], blkV_shape, (n_block, 0))
-        # (m_block_size, head_dim_v, m_block)
-        gdO = cute.local_tile(mdO[batch_idx, None, head_idx, None], blkdO_shape, (None, 0))
-        gLSE = cute.local_tile(mLSE[batch_idx, head_idx, None], (self.m_block_size,), (None,))
-        gdPsum = cute.local_tile(mdPsum[batch_idx, head_idx, None], (self.m_block_size,), (None,))
-        gdQaccum = cute.local_tile(mdQaccu[batch_idx, head_idx, None], (self.m_block_size * self.head_dim_padded,), (None,))
+            tSsQ = smem_thr_copy_QdO.partition_S(sQ)
+            tdPsdO = smem_thr_copy_QdO.partition_S(sdO)
+            tSsK = smem_thr_copy_KV.partition_S(sK)
+            tdPsV = smem_thr_copy_KV.partition_S(sV)
+            tdVsPt = smem_thr_copy_PdSt.partition_S(sPt)
+            tdKsdSt = smem_thr_copy_PdSt.partition_S(sdSt)
+            tdVsdOt = smem_thr_copy_QdOt.partition_S(sdOt)
+            tdKsQt = smem_thr_copy_QdOt.partition_S(sQt)
+            tdQsdS = smem_thr_copy_dS.partition_S(sdS)
+            tdQsKt = smem_thr_copy_Kt.partition_S(sKt)
+            tPsP = r2s_thr_copy_PdS.partition_D(sP)
+            tdSsdS = r2s_thr_copy_PdS.partition_D(sdS)
 
-        # ///////////////////////////////////////////////////////////////////////////////
-        # Get shared memory buffer
-        # ///////////////////////////////////////////////////////////////////////////////
-        smem = cutlass.utils.SmemAllocator()
-        storage = smem.allocate(SharedStorage)
-        sQ = storage.sQ.get_tensor(sQ_layout)
-        sK = storage.sK.get_tensor(sK_layout)
-        if cutlass.const_expr(not self.share_QV_smem):
-            sV = storage.sV.get_tensor(sV_layout)
-        else:
-            sV = cute.make_tensor(cute.recast_ptr(sQ.iterator, dtype=self.dtype), sV_layout)
-        sdO = storage.sdO.get_tensor(sdO_layout)
-        sP = storage.sP.get_tensor(sPdS_layout)
-        sdS = storage.sdS.get_tensor(sPdS_layout)
-        sLSE = storage.sLSE.get_tensor(sLSE_layout)
-        sdPsum = storage.sdPsum.get_tensor(sLSE_layout)
-        sLSEMma = storage.sLSE.get_tensor(sLSEMma_layout)
-        sdPsumMma = storage.sdPsum.get_tensor(sLSEMma_layout)
+            # ///////////////////////////////////////////////////////////////////////////////
+            # Predicate: Mark indices that need to copy when problem_shape isn't a multiple
+            # of tile_shape
+            # ///////////////////////////////////////////////////////////////////////////////
+            # Construct identity layout for KV
+            cQ = cute.make_identity_tensor((self.m_block_size, self.head_dim_padded))
+            tQcQ = gmem_thr_copy_QK.partition_S(cQ)
+            t0QcQ = gmem_thr_copy_QK.get_slice(0).partition_S(cQ)
+            if cutlass.const_expr(self.head_dim_padded == self.head_dim_v_padded):
+                tdOcdO = tQcQ
+                t0dOcdO = t0QcQ
+            else:
+                cdO = cute.make_identity_tensor((self.m_block_size, self.head_dim_v_padded))
+                tdOcdO = gmem_thr_copy_VdO.partition_S(cdO)
+                t0dOcdO = gmem_thr_copy_VdO.get_slice(0).partition_S(cdO)
+            cLSE = cute.make_identity_tensor((self.m_block_size,))
+            tLSEcLSE = gmem_thr_copy_lse.partition_S(cLSE)
 
-        # Transpose view of tensors for tiled mma
-        sQt, sdOt, sKt, sPt, sdSt = [utils.transpose_view(t) for t in (sQ, sdO, sK, sP, sdS)]
+            # Allocate predicate tensors for m and n, here we only allocate the tile of k, and
+            # use "if" on the mn dimension.
+            # This is to reduce register pressure and gets 2-3% performance gain.
 
-        gmem_thr_copy_QK = gmem_tiled_copy_QK.get_slice(tidx)
-        gmem_thr_copy_VdO = gmem_tiled_copy_VdO.get_slice(tidx)
-        gmem_thr_copy_lse = gmem_tiled_copy_LSE.get_slice(tidx)
-        gmem_thr_copy_dQaccum = gmem_tiled_copy_dQaccum.get_slice(tidx)
-        # (CPY_Atom, CPY_M, CPY_K, m_block)
-        tQgQ = gmem_thr_copy_QK.partition_S(gQ)
-        tQsQ = gmem_thr_copy_QK.partition_D(sQ)
-        # (CPY_Atom, CPY_N, CPY_K)
-        tKgK = gmem_thr_copy_QK.partition_S(gK)
-        tKsK = gmem_thr_copy_QK.partition_D(sK)
-        # (CPY_Atom, CPY_N, CPY_K)
-        tVgV = gmem_thr_copy_VdO.partition_S(gV)
-        tVsV = gmem_thr_copy_VdO.partition_D(sV)
-        # (CPY_Atom, CPY_M, CPY_K, m_block)
-        tdOgdO = gmem_thr_copy_VdO.partition_S(gdO)
-        tdOsdO = gmem_thr_copy_VdO.partition_D(sdO)
-        tLSEgLSE = gmem_thr_copy_lse.partition_S(gLSE)
-        tLSEsLSE = gmem_thr_copy_lse.partition_D(sLSE)
-        tLSEgdPsum = gmem_thr_copy_lse.partition_S(gdPsum)
-        tLSEsdPsum = gmem_thr_copy_lse.partition_D(sdPsum)
-        tdQgdQaccum = gmem_thr_copy_dQaccum.partition_S(gdQaccum)
+            d_head = mQ.shape[cute.rank(mQ) - 1]
+            d_head_v = mdO.shape[cute.rank(mdO) - 1]
 
-        # ///////////////////////////////////////////////////////////////////////////////
-        # Tile MMA compute thread partitions and allocate accumulators
-        # ///////////////////////////////////////////////////////////////////////////////
-        thr_mma_sdp = tiled_mma_sdp.get_slice(tidx)
-        thr_mma_dkv = tiled_mma_dkv.get_slice(tidx)
-        thr_mma_dq = tiled_mma_dq.get_slice(tidx)
-        acc_shape_dK = thr_mma_dkv.partition_shape_C((self.n_block_size, self.head_dim_padded))
-        acc_shape_dV = thr_mma_dkv.partition_shape_C((self.n_block_size, self.head_dim_v_padded))
-        acc_dK = cute.make_fragment(acc_shape_dK, cutlass.Float32)
-        acc_dV = cute.make_fragment(acc_shape_dV, cutlass.Float32)
-        acc_dK.fill(0.0)
-        acc_dV.fill(0.0)
+            tQpQ = utils.predicate_k(tQcQ, limit=d_head)
+            if cutlass.const_expr(self.same_hdim_kv):
+                tdOpdO = tQpQ
+            else:
+                tdOpdO = utils.predicate_k(tdOcdO, limit=d_head_v)
 
-        tSrQ = utils.mma_make_fragment_A(sQ[None, None, 0], thr_mma_sdp, swapAB=self.SdP_swapAB)
-        tSrK = utils.mma_make_fragment_B(sK, thr_mma_sdp, swapAB=self.SdP_swapAB)
-        tdPrdO = utils.mma_make_fragment_A(sdO[None, None, 0], thr_mma_sdp, swapAB=self.SdP_swapAB)
-        tdPrV = utils.mma_make_fragment_B(sV, thr_mma_sdp, swapAB=self.SdP_swapAB)
-        tdVrP = utils.mma_make_fragment_A(sPt, thr_mma_dkv, swapAB=self.dKV_swapAB)
-        tdVrdO = utils.mma_make_fragment_B(sdOt[None, None, 0], thr_mma_dkv, swapAB=self.dKV_swapAB)
-        tdKrdS = utils.mma_make_fragment_A(sdSt, thr_mma_dkv, swapAB=self.dKV_swapAB)
-        tdKrQ = utils.mma_make_fragment_B(sQt[None, None, 0], thr_mma_dkv, swapAB=self.dKV_swapAB)
-        tdQrdS = utils.mma_make_fragment_A(sdS, thr_mma_dq, swapAB=self.dQ_swapAB)
-        tdQrK = utils.mma_make_fragment_B(sKt, thr_mma_dq, swapAB=self.dQ_swapAB)
+            # group parameters for compute_one_m_block
+            mma_params = SimpleNamespace(
+                thr_mma_sdp=thr_mma_sdp, thr_mma_dkv=thr_mma_dkv, thr_mma_dq=thr_mma_dq,
+                tSrQ=tSrQ, tSrK=tSrK, tdPrdO=tdPrdO, tdPrV=tdPrV,
+                tdVrP=tdVrP, tdVrdO=tdVrdO, tdKrdS=tdKrdS, tdKrQ=tdKrQ,
+                tdQrdS=tdQrdS, tdQrK=tdQrK,
+                acc_dK=acc_dK, acc_dV=acc_dV,
+            )
+            smem_copy_params = SimpleNamespace(
+                smem_thr_copy_QdO=smem_thr_copy_QdO,
+                smem_thr_copy_KV=smem_thr_copy_KV,
+                smem_thr_copy_PdSt=smem_thr_copy_PdSt,
+                smem_thr_copy_QdOt=smem_thr_copy_QdOt,
+                smem_thr_copy_dS=smem_thr_copy_dS,
+                smem_thr_copy_Kt=smem_thr_copy_Kt,
+                r2s_thr_copy_PdS=r2s_thr_copy_PdS,
+                tSsQ=tSsQ, tSsK=tSsK, tdPsdO=tdPsdO, tdPsV=tdPsV,
+                tSsLSEMma=tSsLSEMma, tSsdPsumMma=tSsdPsumMma,
+                tPsP=tPsP, tdSsdS=tdSsdS,
+                tdVsPt=tdVsPt, tdVsdOt=tdVsdOt, tdKsdSt=tdKsdSt, tdKsQt=tdKsQt,
+                tdQsdS=tdQsdS, tdQsKt=tdQsKt,
+            )
+            gmem_copy_params = SimpleNamespace(
+                gmem_thr_copy_dQaccum=gmem_thr_copy_dQaccum, tdQgdQaccum=tdQgdQaccum
+            )
+            load_Q_LSE = partial(
+                self.load_Q_LSE, gmem_tiled_copy_QK, gmem_tiled_copy_LSE,
+                tQgQ, tQsQ, tQcQ, t0QcQ, tQpQ,
+                tLSEgLSE, tLSEsLSE, tLSEcLSE, seqlen=seqlen.seqlen_q
+            )
+            load_dO_dPsum = partial(
+                self.load_dO_dPsum, gmem_tiled_copy_VdO, gmem_tiled_copy_LSE,
+                tdOgdO, tdOsdO, tdOcdO, t0dOcdO, tdOpdO,
+                tLSEgdPsum, tLSEsdPsum, tLSEcLSE, seqlen=seqlen.seqlen_q
+            )
+            compute_one_m_block = partial(
+                self.compute_one_m_block, mma_params=mma_params,
+                smem_copy_params=smem_copy_params, gmem_copy_params=gmem_copy_params,
+                load_Q_LSE=load_Q_LSE, load_dO_dPsum=load_dO_dPsum,
+                m_block_max=m_block_max,
+                softmax_scale_log2=softmax_scale_log2,
+            )
 
-        LSEslice = (None, 0, None) if cutlass.const_expr(not self.SdP_swapAB) else (0, None, None)
-        tSsLSEMma = utils.make_acc_tensor_mn_view(thr_mma_sdp.partition_C(sLSEMma))[LSEslice]
-        tSsdPsumMma = utils.make_acc_tensor_mn_view(thr_mma_sdp.partition_C(sdPsumMma))[LSEslice]
-
-        # ///////////////////////////////////////////////////////////////////////////////
-        # Smem copy atom tiling
-        # ///////////////////////////////////////////////////////////////////////////////
-        smem_copy_atom = cute.make_copy_atom(
-            warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4), self.dtype,
-        )
-        smem_copy_atom_transposed = cute.make_copy_atom(
-            warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=4), self.dtype,
-        )
-        smem_thr_copy_QdO = utils.make_tiled_copy_A(
-            smem_copy_atom, tiled_mma_sdp, swapAB=self.SdP_swapAB
-        ).get_slice(tidx)
-        smem_thr_copy_KV = utils.make_tiled_copy_B(
-            smem_copy_atom, tiled_mma_sdp, swapAB=self.SdP_swapAB
-        ).get_slice(tidx)
-        # TODO: should this be smem_copy_atom_transposed?
-        smem_thr_copy_PdSt = utils.make_tiled_copy_A(
-            smem_copy_atom_transposed, tiled_mma_dkv, swapAB=self.dKV_swapAB
-        ).get_slice(tidx)
-        smem_thr_copy_QdOt = utils.make_tiled_copy_B(
-            smem_copy_atom_transposed, tiled_mma_dkv, swapAB=self.dKV_swapAB
-        ).get_slice(tidx)
-        smem_thr_copy_dS = utils.make_tiled_copy_A(
-            smem_copy_atom, tiled_mma_dq, swapAB=self.dQ_swapAB
-        ).get_slice(tidx)
-        smem_thr_copy_Kt = utils.make_tiled_copy_B(
-            smem_copy_atom_transposed, tiled_mma_dq, swapAB=self.dQ_swapAB
-        ).get_slice(tidx)
-        # TODO: what's the number of bits? What if SdP_swapAB
-        r2s_thr_copy_PdS = cute.make_tiled_copy_C(
-            cute.make_copy_atom(
-                cute.nvgpu.CopyUniversalOp(), self.dtype, num_bits_per_copy=2 * self.dtype.width
-            ),
-            tiled_mma_sdp,
-        ).get_slice(tidx)
-
-        tSsQ = smem_thr_copy_QdO.partition_S(sQ)
-        tdPsdO = smem_thr_copy_QdO.partition_S(sdO)
-        tSsK = smem_thr_copy_KV.partition_S(sK)
-        tdPsV = smem_thr_copy_KV.partition_S(sV)
-        tdVsPt = smem_thr_copy_PdSt.partition_S(sPt)
-        tdKsdSt = smem_thr_copy_PdSt.partition_S(sdSt)
-        tdVsdOt = smem_thr_copy_QdOt.partition_S(sdOt)
-        tdKsQt = smem_thr_copy_QdOt.partition_S(sQt)
-        tdQsdS = smem_thr_copy_dS.partition_S(sdS)
-        tdQsKt = smem_thr_copy_Kt.partition_S(sKt)
-        tPsP = r2s_thr_copy_PdS.partition_D(sP)
-        tdSsdS = r2s_thr_copy_PdS.partition_D(sdS)
-
-        # ///////////////////////////////////////////////////////////////////////////////
-        # Predicate: Mark indices that need to copy when problem_shape isn't a multiple
-        # of tile_shape
-        # ///////////////////////////////////////////////////////////////////////////////
-        # Construct identity layout for KV
-        cQ = cute.make_identity_tensor((self.m_block_size, self.head_dim_padded))
-        tQcQ = gmem_thr_copy_QK.partition_S(cQ)
-        t0QcQ = gmem_thr_copy_QK.get_slice(0).partition_S(cQ)
-        if cutlass.const_expr(self.head_dim_padded == self.head_dim_v_padded):
-            tdOcdO = tQcQ
-            t0dOcdO = t0QcQ
-        else:
-            cdO = cute.make_identity_tensor((self.m_block_size, self.head_dim_v_padded))
-            tdOcdO = gmem_thr_copy_VdO.partition_S(cdO)
-            t0dOcdO = gmem_thr_copy_VdO.get_slice(0).partition_S(cdO)
-        cLSE = cute.make_identity_tensor((self.m_block_size,))
-        tLSEcLSE = gmem_thr_copy_lse.partition_S(cLSE)
-
-        # Allocate predicate tensors for m and n, here we only allocate the tile of k, and
-        # use "if" on the mn dimension.
-        # This is to reduce register pressure and gets 2-3% performance gain.
-        tQpQ = utils.predicate_k(tQcQ, limit=mQ.shape[3])
-        if cutlass.const_expr(self.same_hdim_kv):
-            tdOpdO = tQpQ
-        else:
-            tdOpdO = utils.predicate_k(tdOcdO, limit=mdO.shape[3])
-
-        # group parameters for compute_one_m_block
-        mma_params = SimpleNamespace(
-            thr_mma_sdp=thr_mma_sdp, thr_mma_dkv=thr_mma_dkv, thr_mma_dq=thr_mma_dq,
-            tSrQ=tSrQ, tSrK=tSrK, tdPrdO=tdPrdO, tdPrV=tdPrV,
-            tdVrP=tdVrP, tdVrdO=tdVrdO, tdKrdS=tdKrdS, tdKrQ=tdKrQ,
-            tdQrdS=tdQrdS, tdQrK=tdQrK,
-            acc_dK=acc_dK, acc_dV=acc_dV,
-        )
-        smem_copy_params = SimpleNamespace(
-            smem_thr_copy_QdO=smem_thr_copy_QdO,
-            smem_thr_copy_KV=smem_thr_copy_KV,
-            smem_thr_copy_PdSt=smem_thr_copy_PdSt,
-            smem_thr_copy_QdOt=smem_thr_copy_QdOt,
-            smem_thr_copy_dS=smem_thr_copy_dS,
-            smem_thr_copy_Kt=smem_thr_copy_Kt,
-            r2s_thr_copy_PdS=r2s_thr_copy_PdS,
-            tSsQ=tSsQ, tSsK=tSsK, tdPsdO=tdPsdO, tdPsV=tdPsV,
-            tSsLSEMma=tSsLSEMma, tSsdPsumMma=tSsdPsumMma,
-            tPsP=tPsP, tdSsdS=tdSsdS,
-            tdVsPt=tdVsPt, tdVsdOt=tdVsdOt, tdKsdSt=tdKsdSt, tdKsQt=tdKsQt,
-            tdQsdS=tdQsdS, tdQsKt=tdQsKt,
-        )
-        gmem_copy_params = SimpleNamespace(
-            gmem_thr_copy_dQaccum=gmem_thr_copy_dQaccum, tdQgdQaccum=tdQgdQaccum
-        )
-        seqlen = SeqlenInfoQK(batch_idx, mQ.shape[1], mK.shape[1])
-        load_Q_LSE = partial(
-            self.load_Q_LSE, gmem_tiled_copy_QK, gmem_tiled_copy_LSE,
-            tQgQ, tQsQ, tQcQ, t0QcQ, tQpQ,
-            tLSEgLSE, tLSEsLSE, tLSEcLSE, seqlen=seqlen.seqlen_q
-        )
-        load_dO_dPsum = partial(
-            self.load_dO_dPsum, gmem_tiled_copy_VdO, gmem_tiled_copy_LSE,
-            tdOgdO, tdOsdO, tdOcdO, t0dOcdO, tdOpdO,
-            tLSEgdPsum, tLSEsdPsum, tLSEcLSE, seqlen=seqlen.seqlen_q
-        )
-        compute_one_m_block = partial(
-            self.compute_one_m_block, mma_params=mma_params,
-            smem_copy_params=smem_copy_params, gmem_copy_params=gmem_copy_params,
-            load_Q_LSE=load_Q_LSE, load_dO_dPsum=load_dO_dPsum,
-            m_block_max=m_block_max,
-            softmax_scale_log2=softmax_scale_log2,
-        )
-
-        # ///////////////////////////////////////////////////////////////////////////////
-        # Prologue
-        # ///////////////////////////////////////////////////////////////////////////////
-        # Start async loads of the last mn-tile, where we take care of the mn residue
-        self.load_V(gmem_thr_copy_VdO, tVgV, tVsV, n_block, seqlen=seqlen.seqlen_k,
-                    headdim=mV.shape[3])
-        if cutlass.const_expr(self.V_in_regs):
+            # ///////////////////////////////////////////////////////////////////////////////
+            # Prologue
+            # ///////////////////////////////////////////////////////////////////////////////
+            # Start async loads of the last mn-tile, where we take care of the mn residue
+            self.load_V(gmem_thr_copy_VdO, tVgV, tVsV, n_block, seqlen=seqlen.seqlen_k,
+                        headdim=d_head_v)
+            if cutlass.const_expr(self.V_in_regs):
+                cute.arch.cp_async_commit_group()
+            self.load_K(gmem_thr_copy_QK, tKgK, tKsK, n_block, seqlen=seqlen.seqlen_k,
+                        headdim=d_head)
             cute.arch.cp_async_commit_group()
-        self.load_K(gmem_thr_copy_QK, tKgK, tKsK, n_block, seqlen=seqlen.seqlen_k,
-                    headdim=mK.shape[3])
-        cute.arch.cp_async_commit_group()
 
-        if cutlass.const_expr(self.V_in_regs):
-            cute.arch.cp_async_wait_group(1)
-            cute.arch.barrier()
-            tdPrV_copy_view = smem_thr_copy_KV.retile(tdPrV)
-            cute.copy(smem_thr_copy_KV, tdPsV, tdPrV_copy_view)
-            # Sync to avoid loading Q to smem_q, which overlaps with smem_v
-            cute.arch.barrier()
+            if cutlass.const_expr(self.V_in_regs):
+                cute.arch.cp_async_wait_group(1)
+                cute.arch.barrier()
+                tdPrV_copy_view = smem_thr_copy_KV.retile(tdPrV)
+                cute.copy(smem_thr_copy_KV, tdPsV, tdPrV_copy_view)
+                # Sync to avoid loading Q to smem_q, which overlaps with smem_v
+                cute.arch.barrier()
 
-        m_block = m_block_min
-        assert self.num_stages_Q >= self.num_stages_dO
-        for stage in cutlass.range_constexpr(self.num_stages_Q):
-            if cutlass.const_expr(self.num_stages_Q == 1 or stage < self.num_stages_Q - 1):
-                if stage == 0 or m_block + stage < m_block_max:
-                    load_Q_LSE(m_block + stage, smem_pipe_write_q=stage)
-                cute.arch.cp_async_commit_group()
-            if cutlass.const_expr(stage < self.num_stages_dO):
-                if stage == 0 or m_block + stage < m_block_max:
-                    load_dO_dPsum(m_block + stage, smem_pipe_write_q=stage)
-                cute.arch.cp_async_commit_group()
+            m_block = m_block_min
+            assert self.num_stages_Q >= self.num_stages_dO
+            for stage in cutlass.range_constexpr(self.num_stages_Q):
+                if cutlass.const_expr(self.num_stages_Q == 1 or stage < self.num_stages_Q - 1):
+                    if stage == 0 or m_block + stage < m_block_max:
+                        load_Q_LSE(m_block + stage, smem_pipe_write_q=stage)
+                    cute.arch.cp_async_commit_group()
+                if cutlass.const_expr(stage < self.num_stages_dO):
+                    if stage == 0 or m_block + stage < m_block_max:
+                        load_dO_dPsum(m_block + stage, smem_pipe_write_q=stage)
+                    cute.arch.cp_async_commit_group()
 
-        # ///////////////////////////////////////////////////////////////////////////////
-        # Mainloop
-        # ///////////////////////////////////////////////////////////////////////////////
-        # Start processing of the first n-block.
-        mask = AttentionMask(self.m_block_size, self.n_block_size, seqlen.seqlen_q, seqlen.seqlen_k)
-        mask_fn = partial(
-            mask.apply_mask, n_block=n_block, thr_mma=thr_mma_sdp,
-            mask_seqlen=True, mask_causal=self.is_causal
-        )
-        smem_pipe_read_q = cutlass.Int32(0)
-        smem_pipe_read_do = cutlass.Int32(0)
-        smem_pipe_write_q = cutlass.Int32(self.num_stages_Q - 1)
-        smem_pipe_write_do = cutlass.Int32(0)
-        for m_tile in cutlass.range(m_block_min, m_block_max, unroll=1):
-            compute_one_m_block(
-                m_tile, smem_pipe_read_q, smem_pipe_read_do, smem_pipe_write_q, smem_pipe_write_do,
-                mask_fn=mask_fn,
+            # ///////////////////////////////////////////////////////////////////////////////
+            # Mainloop
+            # ///////////////////////////////////////////////////////////////////////////////
+            # Start processing of the first n-block.
+            mask = AttentionMask(self.m_block_size, self.n_block_size, seqlen.seqlen_q, seqlen.seqlen_k)
+            mask_fn = partial(
+                mask.apply_mask, n_block=n_block, thr_mma=thr_mma_sdp,
+                mask_seqlen=True, mask_causal=self.is_causal
             )
-            smem_pipe_read_q = self.advance_pipeline(smem_pipe_read_q, self.num_stages_Q)
-            smem_pipe_read_do = self.advance_pipeline(smem_pipe_read_do, self.num_stages_dO)
-            smem_pipe_write_q = self.advance_pipeline(smem_pipe_write_q, self.num_stages_Q)
-            smem_pipe_write_do = self.advance_pipeline(smem_pipe_write_do, self.num_stages_dO)
+            smem_pipe_read_q = cutlass.Int32(0)
+            smem_pipe_read_do = cutlass.Int32(0)
+            smem_pipe_write_q = cutlass.Int32(self.num_stages_Q - 1)
+            smem_pipe_write_do = cutlass.Int32(0)
+            for m_tile in cutlass.range(m_block_min, m_block_max, unroll=1):
+                compute_one_m_block(
+                    m_tile, smem_pipe_read_q, smem_pipe_read_do, smem_pipe_write_q, smem_pipe_write_do,
+                    mask_fn=mask_fn,
+                )
+                smem_pipe_read_q = self.advance_pipeline(smem_pipe_read_q, self.num_stages_Q)
+                smem_pipe_read_do = self.advance_pipeline(smem_pipe_read_do, self.num_stages_dO)
+                smem_pipe_write_q = self.advance_pipeline(smem_pipe_write_q, self.num_stages_Q)
+                smem_pipe_write_do = self.advance_pipeline(smem_pipe_write_do, self.num_stages_dO)
 
-        # ///////////////////////////////////////////////////////////////////////////////
-        # Epilogue
-        # ///////////////////////////////////////////////////////////////////////////////
-        # If GQA, we scale dK in the postprocessing kernel instead
-        if cutlass.const_expr(self.qhead_per_kvhead == 1):
-            acc_dK.store(acc_dK.load() * softmax_scale)
-        # reuse sK and sV data iterator
-        sdK = cute.make_tensor(sK.iterator, sK_layout)
-        sdV = cute.make_tensor(sV.iterator, sV_layout)
-        self.epilogue(
-            acc_dK, acc_dV, mdK, mdV, sdK, sdV,
-            gmem_tiled_copy_dK, gmem_tiled_copy_dV, tiled_mma_dkv,
-            tidx, n_block, head_idx, batch_idx
-        )
+            # ///////////////////////////////////////////////////////////////////////////////
+            # Epilogue
+            # ///////////////////////////////////////////////////////////////////////////////
+            # If GQA, we scale dK in the postprocessing kernel instead
+            if cutlass.const_expr(self.qhead_per_kvhead == 1):
+                acc_dK.store(acc_dK.load() * softmax_scale)
+            # reuse sK and sV data iterator
+            sdK = cute.make_tensor(sK.iterator, sK_layout)
+            sdV = cute.make_tensor(sV.iterator, sV_layout)
+            self.epilogue(
+                acc_dK, acc_dV, mdK, mdV, sdK, sdV,
+                gmem_tiled_copy_dK, gmem_tiled_copy_dV, tiled_mma_dkv,
+                tidx, n_block, head_idx, batch_idx, seqlen, d_head, d_head_v
+            )
 
     @cute.jit
     def compute_one_m_block(
@@ -849,7 +947,6 @@ class FlashAttentionBackwardSm80:
             acc_dQ_atomic = gmem_copy_params.gmem_thr_copy_dQaccum.retile(acc_dQ)
             tdQgdQaccum_atomic = gmem_copy_params.tdQgdQaccum[None, None, m_block]
             assert cute.size(acc_dQ_atomic) == cute.size(tdQgdQaccum_atomic)
-            # if cute.arch.thread_idx()[0] == 0: cute.print_tensor(acc_dQ)
             for i in cutlass.range(cute.size(acc_dQ_atomic), unroll_full=True):
                 utils.atomic_add_fp32(acc_dQ_atomic[i], utils.elem_pointer(tdQgdQaccum_atomic, i))
                 # utils.atomic_add_fp32(acc_dQ[i], tdQgdQaccum_atomic.iterator + i * tdQgdQaccum_atomic.stride[1])
@@ -894,6 +991,9 @@ class FlashAttentionBackwardSm80:
         n_block: cutlass.Int32,
         num_head: cutlass.Int32,
         batch_size: cutlass.Int32,
+        seqlen: SeqlenInfoQK,
+        d_head: cutlass.Int32, 
+        d_head_v: cutlass.Int32
     ):
         rdV = cute.make_fragment_like(acc_dV, self.dtype)
         rdV.store(acc_dV.load().to(self.dtype))
@@ -901,6 +1001,9 @@ class FlashAttentionBackwardSm80:
         rdK.store(acc_dK.load().to(self.dtype))
         gmem_thr_copy_dK = gmem_tiled_copy_dK.get_slice(tidx)
         gmem_thr_copy_dV = gmem_tiled_copy_dV.get_slice(tidx)
+
+        batch_idx = batch_size
+        head_idx_kv = num_head // self.qhead_per_kvhead if cutlass.const_expr(not self.pack_gqa) else num_head
 
         if cutlass.const_expr(self.qhead_per_kvhead == 1):
             # Make sure all threads have finished reading K and V, otherwise we get racy dQ
@@ -919,10 +1022,16 @@ class FlashAttentionBackwardSm80:
             cute.copy(smem_copy_atom_dKV, taccdVrdV, taccdVsdV)
             cute.copy(smem_copy_atom_dKV, taccdKrdK, taccdKsdK)
 
+
+            if cutlass.const_expr(not seqlen.has_cu_seqlens_k):
+                mdK_cur, mdV_cur = [t[batch_idx, None, head_idx_kv, None] for t in (mdK, mdV)]
+            else:
+                mdK_cur, mdV_cur = [cute.domain_offset((seqlen.offset_k, 0), t[None, head_idx_kv, None]) for t in (mdK, mdV)]
+
             blkdK_shape = (self.n_block_size, self.head_dim_padded)
             blkdV_shape = (self.n_block_size, self.head_dim_v_padded)
-            gdK = cute.local_tile(mdK[batch_size, None, num_head, None], blkdK_shape, (n_block, 0))
-            gdV = cute.local_tile(mdV[batch_size, None, num_head, None], blkdV_shape, (n_block, 0))
+            gdK = cute.local_tile(mdK_cur, blkdK_shape, (n_block, 0))
+            gdV = cute.local_tile(mdV_cur, blkdV_shape, (n_block, 0))
             tdKsdK = gmem_thr_copy_dK.partition_S(sdK)
             tdKgdK = gmem_thr_copy_dK.partition_D(gdK)
             tdVsdV = gmem_thr_copy_dV.partition_S(sdV)
@@ -947,14 +1056,14 @@ class FlashAttentionBackwardSm80:
                 cdV = cute.make_identity_tensor((self.n_block_size, self.head_dim_v_padded))
                 tdVcdV = gmem_thr_copy_dV.partition_S(cdV)
                 t0dVcdV = gmem_tiled_copy_dV.get_slice(0).partition_S(cdV)
-            tdKpdK = utils.predicate_k(tdKcdK, limit=mdK.shape[3])
+            tdKpdK = utils.predicate_k(tdKcdK, limit=d_head)
             if cutlass.const_expr(self.same_hdim_kv):
                 tdVpdV = tdKpdK
             else:
-                tdVpdV = utils.predicate_k(tdVcdV, limit=mdV.shape[3])
+                tdVpdV = utils.predicate_k(tdVcdV, limit=d_head_v)
             # copy acc dK and acc_dV from rmem to gmem
             for rest_m in cutlass.range_constexpr(cute.size(tdKrdK.shape[1])):
-                if t0dKcdK[0, rest_m, 0][0] < mdK.shape[1] - n_block * self.n_block_size - tdKcdK[0][0]:
+                if t0dKcdK[0, rest_m, 0][0] < seqlen.seqlen_k - n_block * self.n_block_size - tdKcdK[0][0]:
                     cute.copy(
                         gmem_tiled_copy_dK,
                         tdKrdK[None, rest_m, None],
@@ -962,7 +1071,7 @@ class FlashAttentionBackwardSm80:
                         pred=tdKpdK[None, rest_m, None] if cutlass.const_expr(self.check_hdim_oob) else None,
                     )
             for rest_m in cutlass.range_constexpr(cute.size(tdVrdV.shape[1])):
-                if t0dVcdV[0, rest_m, 0][0] < mdV.shape[1] - n_block * self.n_block_size - tdVcdV[0][0]:
+                if t0dVcdV[0, rest_m, 0][0] < seqlen.seqlen_k - n_block * self.n_block_size - tdVcdV[0][0]:
                     cute.copy(
                         gmem_tiled_copy_dV,
                         tdVrdV[None, rest_m, None],
@@ -973,9 +1082,17 @@ class FlashAttentionBackwardSm80:
         else:  # qhead_per_kvhead > 1, do atomic add
             # For Sm90, we need to sync to avoid racy writes to smem_q
             # For Sm80, we don't need to sync since we're not touching smem
-            num_head_kv = num_head // self.qhead_per_kvhead
-            gdV = cute.local_tile(mdV[batch_size, num_head_kv, None], (self.n_block_size * self.head_dim_v_padded,), (n_block,))
-            gdK = cute.local_tile(mdK[batch_size, num_head_kv, None], (self.n_block_size * self.head_dim_padded,), (n_block,))
+            head_idx_kv = num_head // self.qhead_per_kvhead if cutlass.const_expr(not self.pack_gqa) else num_head
+
+            if cutlass.const_expr(not seqlen.has_cu_seqlens_k):
+                mdK_cur, mdV_cur = [t[batch_idx, head_idx_kv, None] for t in (mdK, mdV)]
+            else:
+                padded_offset_k = seqlen.offset_k + batch_idx * self.n_block_size
+                mdK_cur = cute.domain_offset((padded_offset_k * self.head_dim_padded,), mdK[head_idx_kv, None])
+                mdV_cur = cute.domain_offset((padded_offset_k * self.head_dim_v_padded,), mdV[head_idx_kv, None])
+
+            gdV = cute.local_tile(mdV_cur, (self.n_block_size * self.head_dim_v_padded,), (n_block,))
+            gdK = cute.local_tile(mdK_cur, (self.n_block_size * self.head_dim_padded,), (n_block,))
             tdVgdVaccum = gmem_thr_copy_dV.partition_S(gdV)
             tdKgdKaccum = gmem_thr_copy_dK.partition_S(gdK)
             acc_dV_atomic = gmem_thr_copy_dV.retile(acc_dV)

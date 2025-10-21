@@ -138,9 +138,10 @@ def make_instr_desc(
     if N < 8 or N > 256 or (N & 7):
         raise ValueError("N must be a multiple of 8 in the range 8…256")
 
-    m_dim = M >> 4            # 5-bit field
-    n_dim = N >> 3            # 6-bit field
+    m_dim = M >> 4  # 5-bit field
+    n_dim = N >> 3  # 6-bit field
 
+    # fmt: off
     # --- pack the bit-fields -----------------------------------------------------
     desc = 0
     desc |= (0                 & 0x3) << 0        # sparse_id2 (always 0 here)
@@ -156,6 +157,7 @@ def make_instr_desc(
     desc |= (n_dim             & 0x3F) << 17      # n_dim (6 bits)
     desc |= (m_dim             & 0x1F) << 24      # m_dim (5 bits)
     desc |= (int(max_shift)    & 0x3) << 30       # max_shift (2 bits)
+    # fmt: on
 
     return desc & 0xFFFF_FFFF  # ensure 32-bit result
 

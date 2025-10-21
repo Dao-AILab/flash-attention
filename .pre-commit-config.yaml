@@ -1,0 +1,27 @@
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.11.13
+    hooks:
+      - id: ruff-check
+        args: [--fix, --exit-non-zero-on-fix]
+        files: ^flash_attn/cute/.*\.py$
+        exclude: &cute_exclude |
+          (?x)^flash_attn/cute/(
+            __init__|
+            copy_utils|
+            cute_dsl_utils|
+            fast_math|
+            flash_bwd|
+            flash_fwd|
+            flash_fwd_combine|
+            flash_fwd_sm100|
+            hopper_helpers|
+            interface|
+            pack_gqa|
+            testing|
+            tile_scheduler|
+            utils
+          )\.py$
+      - id: ruff-format
+        files: ^flash_attn/cute/.*\.py$
+        exclude: *cute_exclude
