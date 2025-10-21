@@ -712,8 +712,9 @@ class FlashAttentionBackwardSm100:
         )
 
         # AsyncThread producers and UMMA consumers
+        # Only 1 thread per warp will signal
         pipeline_PdS_producer_group = cutlass.pipeline.CooperativeGroup(
-            cutlass.pipeline.Agent.Thread, cute.arch.WARP_SIZE * len(self.compute_warp_ids)
+            cutlass.pipeline.Agent.Thread, len(self.compute_warp_ids)
         )  # Compute
         pipeline_PdS_consumer_group = cutlass.pipeline.CooperativeGroup(
             cutlass.pipeline.Agent.Thread, len([self.mma_warp_id])
@@ -1695,7 +1696,9 @@ class FlashAttentionBackwardSm100:
                 cute.arch.fence_proxy(
                     cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
                 )
-                pipeline_dS.producer_commit(producer_state_dS)
+                cute.arch.sync_warp()
+                with cute.arch.elect_one():
+                    pipeline_dS.producer_commit(producer_state_dS)
                 producer_state_dS.advance()
 
             if const_expr(not self.use_tma_store):
@@ -1773,6 +1776,7 @@ class FlashAttentionBackwardSm100:
         num_reduce_threads = cute.arch.WARP_SIZE * len(self.reduce_warp_ids)
         tidx = cute.arch.thread_idx()[0] % num_reduce_threads
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx() % len(self.reduce_warp_ids))
+        is_tma_warp = warp_idx == 0
         # TMEM -> RMEM
         tmem_load_atom = cute.make_copy_atom(
             tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), Float32
@@ -1835,26 +1839,40 @@ class FlashAttentionBackwardSm100:
                     barrier.wait_eq(mdQ_semaphore_cur[(m_block, None)].iterator, tidx, 0, n_block)
                     dQacc_reduce_barrier.arrive_and_wait()
 
-                for stage in cutlass.range_constexpr(cute.size(tdQrdQ_t2r, mode=[1])):  # 4
-                    tdQsdQ_r2s = tdQsdQ[None, None, reduce_phase]
-                    tdQrdQ_r2s = cute.make_tensor(
-                        tdQrdQ_t2r[None, stage, None, None].iterator, tdQsdQ_r2s.shape
-                    )
-                    cute.copy(thr_copy_dQaccum_r2s, tdQrdQ_r2s, tdQsdQ_r2s)
+                # We could delay the TMA store by 1 epi tile to better overlap the non-TMA ops
+                delay_tma_store = False
+
+                def tma_store_fn(src_idx, dst_idx):
+                    # Fence and barrier to make sure shared memory store is visible to TMA store
                     cute.arch.fence_proxy(
                         cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
                     )
                     dQacc_reduce_barrier.arrive_and_wait()
-                    if warp_idx == 0:
+                    # Copy from shared memory to global memory
+                    if is_tma_warp:
                         with cute.arch.elect_one():
                             copy_utils.cpasync_reduce_bulk_add_f32(
-                                sdQaccum[None, reduce_phase].iterator,
-                                gdQaccum[None, stage, m_block].iterator,
+                                sdQaccum[None, src_idx].iterator,
+                                gdQaccum[None, dst_idx, m_block].iterator,
                                 self.tma_copy_bytes["dQ"],
                             )
                         cute.arch.cp_async_bulk_commit_group()
                         cute.arch.cp_async_bulk_wait_group(1, read=read_flag)
                     dQacc_reduce_barrier.arrive_and_wait()
+
+                reduce_phase_prev, stage_prev = None, -1
+                for stage in cutlass.range_constexpr(cute.size(tdQrdQ_t2r, mode=[1])):  # 4
+                    tdQsdQ_r2s = tdQsdQ[None, None, reduce_phase]
+                    tdQrdQ_r2s = cute.make_tensor(
+                        tdQrdQ_t2r[None, stage, None, None].iterator, tdQsdQ_r2s.shape
+                    )
+                    if const_expr(delay_tma_store):
+                        if const_expr(stage > 0):
+                            tma_store_fn(src_idx=reduce_phase_prev, dst_idx=stage_prev)
+                        reduce_phase_prev, stage_prev = reduce_phase, stage
+                    cute.copy(thr_copy_dQaccum_r2s, tdQrdQ_r2s, tdQsdQ_r2s)
+                    if const_expr(not delay_tma_store):
+                        tma_store_fn(reduce_phase, stage)
                     reduce_phase ^= 1
                     # Directly add to gmem, much slower
                     # tdQgdQ = thr_copy_dQaccum_r2s.partition_D(gdQaccum[None, stage, m_block])
@@ -1867,6 +1885,8 @@ class FlashAttentionBackwardSm100:
                     #         tdQrdQ_r2s[4 * i + 3],
                     #         utils.elem_pointer(tdQgdQ, 4 * i),
                     #     )
+                if const_expr(delay_tma_store):
+                    tma_store_fn(src_idx=reduce_phase_prev, dst_idx=stage_prev)
 
                 # semaphore release
                 # NOTE: arrive_inc calls red_release which issues membar
