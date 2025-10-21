@@ -2182,7 +2182,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         softmax: Softmax,
         mask_fn: Callable = None,
         score_mod_fn: Optional[Callable] = None,
-        use_mask_mod: bool = False,
         is_first_block: bool = False,
     ):
         """Processes the first half block when using intra-warpgroup-overlap"""
