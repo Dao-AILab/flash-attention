@@ -72,7 +72,10 @@ class PipelineStateSimple:
     def index(self) -> Int32:
         # return self._phase_index & 0xFFFF
         # return self._phase_index & ((1 << self._log_stages) - 1)
-        return self._phase_index % self._stages
+        if const_expr(self._stages == 1):
+            return Int32(0)
+        else:
+            return self._phase_index % self._stages
 
     @property
     def phase(self) -> Int32:
@@ -81,10 +84,16 @@ class PipelineStateSimple:
         # take modulo 2. But in practice just passing the phase in without modulo works fine.
         # return (self._phase_index >> self._log_stages) % 2
         # return self._phase_index >> self._log_stages
-        return self._phase_index // self._stages
+        if const_expr(self._stages == 1):
+            return self._phase_index
+        else:
+            return self._phase_index // self._stages
 
     def advance(self):
-        self._phase_index += 1
+        if const_expr(self._stages == 1):
+            self._phase_index ^= 1
+        else:
+            self._phase_index += 1
 
         # def then_body(phase_index):
         #     # XOR the phase bit and set the index to 0
