@@ -1,6 +1,7 @@
 # Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
 # [2025-07-04] Version in Cute-DSL, for Hopper and Blackwell. You'll need install nvidia-cutlass-dsl==4.2.0.
 # [2025-07-04] Version in Cute-DSL, for Hopper and Blackwell. You'll need install nvidia-cutlass-dsl==4.2.0.
+# [2025-07-04] Version in Cute-DSL, for Hopper and Blackwell. You'll need install nvidia-cutlass-dsl==4.2.0.
 
 # Supported features:
 # - BF16 & FP16 dtype
@@ -323,7 +324,7 @@ def _flash_attn_fwd(
             page_table_tensor,
             window_size_left, window_size_right, learnable_sink_tensor,
             full_block_cnt_tensor, full_block_idx_tensor, mask_block_cnt_tensor, mask_block_idx_tensor,
-            cute_buffers,
+            buffers=cute_buffers,
         )
     _flash_attn_fwd.compile_cache[compile_key](
         q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, softmax_scale, current_stream,
@@ -331,7 +332,7 @@ def _flash_attn_fwd(
         page_table_tensor,
         window_size_left, window_size_right, learnable_sink_tensor,
         full_block_cnt_tensor, full_block_idx_tensor, mask_block_cnt_tensor, mask_block_idx_tensor,
-        cute_buffers,
+        buffers=cute_buffers,
     )
     return out, lse
 
@@ -691,7 +692,7 @@ class FlashAttnFunc(torch.autograd.Function):
             ctx.causal,
             ctx.softcap,
         )
-        return dq, dk, dv, *((None,) * 10)  # Extra Nones is fine
+        return dq, dk, dv, *((None,) * 20)  # Extra Nones is fine
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -759,7 +760,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             seqused_k=seqused_k,
         )
 
-        return dq, dk, dv, *((None,) * 11)
+        return dq, dk, dv, *((None,) * 20)
 
 
 def flash_attn_func(
