@@ -92,7 +92,7 @@ def flex_document_mask(b, h, q_idx, kv_idx, doc_id: torch.Tensor):
 @cute.jit
 def cute_identity_mask(
     batch: cutlass.Int32, head: cutlass.Int32, m_idx: cutlass.Int32, n_idx: cutlass.Int32,
-    seqlen_q: cutlass.Int32, seqlen_k: cutlass.Int32, buffers: None,
+    seqlen_q: cutlass.Int32, seqlen_k: cutlass.Int32, aux_tensors: None,
 ) -> cutlass.Boolean:
     return cutlass.Boolean(True)
 
@@ -100,7 +100,7 @@ def cute_identity_mask(
 @cute.jit
 def cute_identity_partial_mask(
     batch: cutlass.Int32, head: cutlass.Int32, m_idx: cutlass.Int32, n_idx: cutlass.Int32,
-    seqlen_q: cutlass.Int32, seqlen_k: cutlass.Int32, buffers: None,
+    seqlen_q: cutlass.Int32, seqlen_k: cutlass.Int32, aux_tensors: None,
 ) -> cutlass.Boolean:
     return cutlass.Boolean(True)
 
@@ -108,7 +108,7 @@ def cute_identity_partial_mask(
 @cute.jit
 def cute_causal_mask(
     batch: cutlass.Int32, head: cutlass.Int32, m_idx: cutlass.Int32, n_idx: cutlass.Int32,
-    seqlen_q: cutlass.Int32, seqlen_k: cutlass.Int32, buffers: None,
+    seqlen_q: cutlass.Int32, seqlen_k: cutlass.Int32, aux_tensors: None,
 ) -> cutlass.Boolean:
     # Right-aligned causal masking
     offset = seqlen_k - seqlen_q
@@ -118,7 +118,7 @@ def cute_causal_mask(
 @cute.jit
 def cute_block_causal_mask(
     batch: cutlass.Int32, head: cutlass.Int32, m_idx: cutlass.Int32, n_idx: cutlass.Int32,
-    seqlen_q: cutlass.Int32, seqlen_k: cutlass.Int32, buffers: None,
+    seqlen_q: cutlass.Int32, seqlen_k: cutlass.Int32, aux_tensors: None,
 ) -> cutlass.Boolean:
     # Right-aligned causal masking
     offset = seqlen_k - seqlen_q
@@ -130,7 +130,7 @@ def create_cute_sliding_window_mask(window_size=1024):
     @cute.jit
     def cute_sliding_window_mask(
         batch: cutlass.Int32, head: cutlass.Int32, m_idx: cutlass.Int32, n_idx: cutlass.Int32,
-        seqlen_q: cutlass.Int32, seqlen_k: cutlass.Int32, buffers
+        seqlen_q: cutlass.Int32, seqlen_k: cutlass.Int32, aux_tensors
     ) -> cutlass.Boolean:
         offset = seqlen_k - seqlen_q
 
@@ -142,7 +142,7 @@ def create_cute_sliding_window_mask(window_size=1024):
 @cute.jit
 def cute_sliding_window_mask(
     batch: cutlass.Int32, head: cutlass.Int32, m_idx: cutlass.Int32, n_idx: cutlass.Int32,
-    seqlen_q: cutlass.Int32, seqlen_k: cutlass.Int32, buffers
+    seqlen_q: cutlass.Int32, seqlen_k: cutlass.Int32, aux_tensors
 ) -> cutlass.Boolean:
     window_size = 1024
     # offset = seqlen_k - seqlen_q
@@ -152,16 +152,16 @@ def cute_sliding_window_mask(
 
 @cute.jit
 def cute_document_mask(
-    batch: cutlass.Int32, head: cutlass.Int32, m_idx: cutlass.Int32, n_idx: cutlass.Int32, seqlen_q: cutlass.Int32, seqlen_k: cutlass.Int32, buffers: list,
+    batch: cutlass.Int32, head: cutlass.Int32, m_idx: cutlass.Int32, n_idx: cutlass.Int32, seqlen_q: cutlass.Int32, seqlen_k: cutlass.Int32, aux_tensors: list,
 ):
-    doc_id = buffers[0]
+    doc_id = aux_tensors[0]
     return cutlass.Boolean(doc_id[batch, head, m_idx] == doc_id[batch, head, n_idx])
     
 
 @cute.jit
 def cute_block_diagonal_mask(
     batch: cutlass.Int32, head: cutlass.Int32, m_idx: cutlass.Int32, n_idx: cutlass.Int32,
-    seqlen_q: cutlass.Int32, seqlen_k: cutlass.Int32, buffers
+    seqlen_q: cutlass.Int32, seqlen_k: cutlass.Int32, aux_tensors
 ) -> cutlass.Boolean:
     return cutlass.Boolean((m_idx // 64) == (n_idx // 64))
 
@@ -169,7 +169,7 @@ def cute_block_diagonal_mask(
 @cute.jit
 def cute_mini_causal_mask(
     batch: cutlass.Int32, head: cutlass.Int32, m_idx: cutlass.Int32, n_idx: cutlass.Int32,
-    seqlen_q: cutlass.Int32, seqlen_k: cutlass.Int32, buffers
+    seqlen_q: cutlass.Int32, seqlen_k: cutlass.Int32, aux_tensors
 ) -> cutlass.Boolean:
     """Each tile is locally causal-masked"""
     m_mod = m_idx % 128

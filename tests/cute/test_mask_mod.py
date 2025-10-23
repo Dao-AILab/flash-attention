@@ -95,7 +95,7 @@ def compile_and_run_kernel(
         intra_wg_overlap=True,
         mma_pv_is_rs=True,
         mask_mod=mask_mod_cute,
-        has_buffers=False,
+        has_aux_tensors=False,
         Q_in_regs=False,
     )
 
@@ -168,7 +168,7 @@ def compile_and_run_kernel(
         full_block_idx_cute,
         mask_block_cnt_cute,
         mask_block_idx_cute,
-        None,  # buffers
+        None,  # aux_tensors
     )
 
     compiled(
@@ -191,7 +191,7 @@ def compile_and_run_kernel(
         full_block_idx_cute,
         mask_block_cnt_cute,
         mask_block_idx_cute,
-        None,  # buffers
+        None,  # aux_tensors
     )
 
     torch.cuda.synchronize()

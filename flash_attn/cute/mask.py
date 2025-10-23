@@ -62,7 +62,7 @@ class AttentionMask:
         mask_causal: cutlass.Constexpr[bool],
         mask_local: cutlass.Constexpr[bool] = False,
         mask_mod: cutlass.Constexpr[Optional[Callable]] = None,
-        buffers: Optional[list[cute.Tensor]] = None,
+        aux_tensors: Optional[list] = None,
     ) -> None:
         assert not (mask_causal and mask_local), "mask_causal and mask_local cannot be both True"
         acc_S_mn = utils.make_acc_tensor_mn_view(acc_S, transpose=self.swap_AB)
@@ -112,7 +112,7 @@ class AttentionMask:
                             thr_col_offset + t0ScS_mn[0, col][1] + n_block * self.tile_n,
                             self.seqlen_q,
                             self.seqlen_k,
-                            buffers,
+                            aux_tensors,
                         )
                     )
                     if const_expr(mask_seqlen):

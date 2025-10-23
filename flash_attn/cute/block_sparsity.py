@@ -20,7 +20,7 @@ def compute_block_sparsity(
     device: str,
     cu_seqlens_q: Optional[torch.Tensor] = None,
     cu_seqlens_k: Optional[torch.Tensor] = None,
-    buffers: Optional[List[torch.Tensor]] = None,
+    aux_tensors: Optional[List[torch.Tensor]] = None,
 ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
     """
     Computes block sparsity tensors from a given masking function.
@@ -35,7 +35,7 @@ def compute_block_sparsity(
         device: The device to create tensors on (e.g., 'cuda').
         cu_seqlens_q: Cumulative sequence lengths for Q (for varlen).
         cu_seqlens_k: Cumulative sequence lengths for K (for varlen).
-        buffers: A list of auxiliary tensors, e.g., for document masking.
+        aux_tensors: A list of auxiliary tensors, e.g., for document masking.
 
     Returns:
         A tuple of four tensors:
@@ -53,14 +53,14 @@ def compute_block_sparsity(
         return _compute_varlen_sparsity(config, mask_mod_flex, device, cu_seqlens_q, cu_seqlens_k)
     else:
         # Handle fixed-length sequences
-        return _compute_sparsity(config, device, buffers)
+        return _compute_sparsity(config, device, aux_tensors)
 
 ## ---------------------------------------------------------------------------
 ## Fixed-Length Sequence Kernels
 ## ---------------------------------------------------------------------------
 
 def _compute_sparsity(
-    config: Config, device: str, buffers: Optional[List[torch.Tensor]]
+    config: Config, device: str, aux_tensors: Optional[List[torch.Tensor]]
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Computes block sparsity for fixed-length sequences."""
     n_blocks_q = (config.seqlen_q + config.tile_m - 1) // config.tile_m

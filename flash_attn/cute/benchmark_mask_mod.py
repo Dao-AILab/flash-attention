@@ -51,7 +51,7 @@ class BenchmarkConfig:
     # Mask parameters
     use_mask_mod: bool = True
     mask_mod_name: str = "causal"
-    has_buffers: bool = mask_mod_name == "document"
+    has_aux_tensors: bool = mask_mod_name == "document"
 
     # Sliding window parameter (used when mask_mod_name == "sliding_window")
     window_size: int = 128
@@ -256,14 +256,14 @@ class FlashAttentionBenchmark:
                 doc_id = random_doc_id_tensor(
                     config.batch_size, config.nheads, config.seqlen_q, device=device
                 )
-                tensors["buffers"] = [doc_id.contiguous()]
+                tensors["aux_tensors"] = [doc_id.contiguous()]
             full_cnt, full_idx, mask_cnt, mask_idx = compute_block_sparsity(
                 config=self.config,
                 mask_mod_flex=self.mask_mod_flex,
                 device=device,
                 cu_seqlens_q=tensors.get("cu_seqlens_q"),
                 cu_seqlens_k=tensors.get("cu_seqlens_k"),
-                buffers=tensors.get("buffers"),
+                aux_tensors=tensors.get("aux_tensors"),
             )
 
             if all(t is not None for t in [full_cnt, full_idx, mask_cnt, mask_idx]):
@@ -329,7 +329,7 @@ class FlashAttentionBenchmark:
             mma_pv_is_rs=config.mma_pv_is_rs,
             mask_mod=self.mask_mod_cute,
             Q_in_regs=False,
-            has_buffers=config.has_buffers,
+            has_aux_tensors=config.has_aux_tensors,
         )
 
         softmax_scale = 1.0 / math.sqrt(config.headdim)
@@ -405,14 +405,14 @@ class FlashAttentionBenchmark:
             else None
         )
 
-        if "buffers" in tensors:
-            buffers_cute = []
-            for i in range(len(tensors["buffers"])):
-                buf = from_dlpack(tensors["buffers"][i].detach(), assumed_align=4)
-                buffers_cute.append(buf.mark_layout_dynamic(leading_dim=2))
+        if "aux_tensors" in tensors:
+            aux_tensors_cute = []
+            for i in range(len(tensors["aux_tensors"])):
+                buf = from_dlpack(tensors["aux_tensors"][i].detach(), assumed_align=4)
+                aux_tensors_cute.append(buf.mark_layout_dynamic(leading_dim=2))
 
         else:
-            buffers_cute = None
+            aux_tensors_cute = None
 
         # Window parameters for is_local
         window_left_cute = (
@@ -443,7 +443,7 @@ class FlashAttentionBenchmark:
             full_block_idx_cute,
             mask_block_cnt_cute,
             mask_block_idx_cute,
-            buffers_cute,
+            aux_tensors_cute,
             # None,
         )
 
@@ -467,7 +467,7 @@ class FlashAttentionBenchmark:
             full_block_idx_cute,
             mask_block_cnt_cute,
             mask_block_idx_cute,
-            buffers_cute,
+            aux_tensors_cute,
             # None,
         )
 
@@ -496,7 +496,7 @@ class FlashAttentionBenchmark:
                 num_blocks = (config.seqlen_k + block_size - 1) // block_size
                 sparsity_ratio = 1.0 / num_blocks if num_blocks > 1 else 1.0
             elif config.mask_mod_name == "document":
-                vals = tensors["buffers"][0]
+                vals = tensors["aux_tensors"][0]
                 val_mask = torch.ones_like(vals, dtype=torch.bool)
                 val_mask[..., 1:] = vals[..., 1:] != vals[..., :-1]
                 total = torch.where(val_mask, vals.square(), 0).sum()
@@ -683,7 +683,7 @@ if __name__ == "__main__":
         # seqlen_k=192,
         use_varlen=False,
         use_mask_mod=True,
-        mask_mod_name="identity",
+        mask_mod_name="causal",
         window_size=128,  # Configurable window size for mask_mod
         use_learnable_sink=False,
         causal=False,

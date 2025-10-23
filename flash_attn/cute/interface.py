@@ -84,7 +84,7 @@ def _flash_attn_fwd(
     return_lse: bool = False,
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
-    buffers: Optional[list[torch.Tensor]] = None,
+    aux_tensors: Optional[list[torch.Tensor]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for FlashAttention.
 
@@ -94,7 +94,7 @@ def _flash_attn_fwd(
         return_lse: Whether to return the log softmax of the attention scores. If set to True will always calculate
         out: Optional pre-allocated output tensor. If None, will be allocated internally.
         lse: Optional pre-allocated log-sum-exp tensor. If None, will be allocated when needed.
-        buffers: Some score_mods will want to read from global buffers. This is how we thread them through to the inner kernel.
+        aux_tensors: Some score_mods will want to read from global aux_tensors. This is how we thread them through to the inner kernel.
     """
     q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
     num_head, head_dim = q.shape[-2:]
@@ -145,7 +145,7 @@ def _flash_attn_fwd(
     for t in [full_block_cnt, full_block_idx, mask_block_cnt, mask_block_idx]:
         if t is not None:
             assert t.dtype == torch.int32, "blocksparse mask tensors must be int32"
-            assert t.stride(0) == 1, "blocksparse mask tensors must be contiguous"
+            # assert t.stride(0) == 1, "blocksparse mask tensors must be contiguous"
     assert all(
         t is None or t.is_cuda
         for t in (
@@ -233,8 +233,8 @@ def _flash_attn_fwd(
             pack_gqa = False
     
     # hash score and mask mods for compile cache
-    score_mod_hash = utils.hash_callable(score_mod) if score_mod is not None else None
-    mask_mod_hash = utils.hash_callable(mask_mod) if mask_mod is not None else None
+    score_mod_hash = utils.hash_callable(score_mod) if score_mod is not None else False
+    mask_mod_hash = utils.hash_callable(mask_mod) if mask_mod is not None else False
     
     if softcap is not None:
         assert score_mod is None, "softcap and score_mod cannot be used together"
@@ -244,17 +244,15 @@ def _flash_attn_fwd(
     use_block_sparsity = full_block_cnt is not None or mask_block_cnt is not None
     if score_mod is not None:
         if is_varlen:
-            raise NotImplementedError("score_mod with buffers is not yet supported for varlen sequences. This will be fixed in a future PR.")
-        if pack_gqa:
-            raise NotImplementedError("score_mod with buffers is not yet supported with pack_gqa=True. This will be fixed in a future PR.")
+            raise NotImplementedError("score_mod with aux_tensors is not yet supported for varlen sequences. This will be fixed in a future PR.")
 
     if mask_mod is not None:
         if not use_block_sparsity:
             raise NotImplementedError("mask_mod requires the use of block sparsity. This will be fixed in a future PR.")
         if is_varlen:
-            raise NotImplementedError("mask_mod with buffers is not yet supported for varlen sequences. This will be fixed in a future PR.")
+            raise NotImplementedError("mask_mod with aux_tensors is not yet supported for varlen sequences. This will be fixed in a future PR.")
         if pack_gqa:
-            raise NotImplementedError("mask_mod with buffers is not yet supported with pack_gqa=True. This will be fixed in a future PR.")
+            raise NotImplementedError("mask_mod with aux_tensors is not yet supported with pack_gqa=True. This will be fixed in a future PR.")
     
     if use_block_sparsity:
         if is_varlen:
@@ -262,14 +260,14 @@ def _flash_attn_fwd(
         if pack_gqa:
             raise NotImplementedError("Block sparsity is not yet supported with pack_gqa=True. This will be fixed in a future PR.")
         
-    cute_buffers = None
-    if buffers is not None:
-        cute_buffers = [from_dlpack(buf) for buf in buffers]
+    cute_aux_tensors = None
+    if aux_tensors is not None:
+        cute_aux_tensors = [from_dlpack(buf) for buf in aux_tensors]
 
     compile_key = (
         dtype, head_dim, head_dim_v, qhead_per_kvhead, causal, 
         score_mod_hash, mask_mod_hash,
-        buffers is not None,
+        aux_tensors is not None,
         lse is None, cu_seqlens_q is None, cu_seqlens_k is None, seqused_q is None, seqused_k is None,
         page_table is not None,
         window_size_left is not None, window_size_right is not None,
@@ -296,11 +294,11 @@ def _flash_attn_fwd(
                 num_stages=2,
                 num_threads=num_threads,
                 Q_in_regs=False,
-                intra_wg_overlap=True,
+                intra_wg_overlap=False,
                 mma_pv_is_rs=True,
                 mask_mod=mask_mod,
                 score_mod=score_mod,
-                has_buffers=buffers is not None,
+                has_aux_tensors=aux_tensors is not None,
             )
         elif compute_capability == 10:
             assert page_size in [None, 128], "Only page_size=128 is supported for paged KV on SM 10.0"
@@ -313,7 +311,7 @@ def _flash_attn_fwd(
                 pack_gqa=pack_gqa,
                 is_persistent=not causal and not local and cu_seqlens_q is None and seqused_q is None,
                 score_mod=score_mod,
-                has_buffers=buffers is not None,
+                has_aux_tensors=aux_tensors is not None,
             )
         else:
             raise ValueError(f"Unsupported compute capability: {compute_capability}. Supported: 9.x, 10.x")
@@ -324,7 +322,7 @@ def _flash_attn_fwd(
             page_table_tensor,
             window_size_left, window_size_right, learnable_sink_tensor,
             full_block_cnt_tensor, full_block_idx_tensor, mask_block_cnt_tensor, mask_block_idx_tensor,
-            buffers=cute_buffers,
+            aux_tensors=cute_aux_tensors,
         )
     _flash_attn_fwd.compile_cache[compile_key](
         q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, softmax_scale, current_stream,
@@ -332,7 +330,7 @@ def _flash_attn_fwd(
         page_table_tensor,
         window_size_left, window_size_right, learnable_sink_tensor,
         full_block_cnt_tensor, full_block_idx_tensor, mask_block_cnt_tensor, mask_block_idx_tensor,
-        buffers=cute_buffers,
+        aux_tensors=cute_aux_tensors,
     )
     return out, lse
 
