@@ -210,22 +210,26 @@ def _flash_attn_fwd(
     full_block_idx_tensor = from_dlpack(full_block_idx.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=3) if full_block_idx is not None else None
     mask_block_cnt_tensor = from_dlpack(mask_block_cnt.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=2) if mask_block_cnt is not None else None
     mask_block_idx_tensor = from_dlpack(mask_block_idx.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=3) if mask_block_idx is not None else None
-
+    use_block_sparsity = full_block_cnt is not None or mask_block_cnt is not None
     
-    if causal:
-        window_size_right = 0
-    local = window_size_left is not None or window_size_right is not None
-    if window_size_left is not None or window_size_right is not None:
-        if window_size_left is None and window_size_right == 0:
-            causal, local = True, False
-        else:
-            causal, local = False, True
+    if mask_mod is None:
+        if causal:
+            window_size_right = 0
+        local = window_size_left is not None or window_size_right is not None
+        if window_size_left is not None or window_size_right is not None:
+            if window_size_left is None and window_size_right == 0:
+                causal, local = True, False
+            else:
+                causal, local = False, True
+    else:
+        causal, local = False, False
+    
     compute_capability = torch.cuda.get_device_capability()[0] if _compute_capability is None else _compute_capability
     assert compute_capability in [9, 10], "Unsupported compute capability. Supported: 9.x, 10.x"
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
-    if compute_capability == 9:  # TODO: tune block size according to hdim
-        if head_dim == head_dim_v == 128 and not causal and not local:
+    if compute_capability == 9:  # TODO: tune block size according to hdim.
+        if head_dim == head_dim_v == 128 and not causal and not local and not use_block_sparsity:
             n_block_size = 192
     if compute_capability == 10:
         # TODO: fix the varlen case
@@ -236,12 +240,13 @@ def _flash_attn_fwd(
     score_mod_hash = utils.hash_callable(score_mod) if score_mod is not None else False
     mask_mod_hash = utils.hash_callable(mask_mod) if mask_mod is not None else False
     
+    print(mask_mod_hash)
+    
     if softcap is not None:
         assert score_mod is None, "softcap and score_mod cannot be used together"
         score_mod = utils.create_softcap_scoremod(softcap)
 
     is_varlen = cu_seqlens_q is not None or cu_seqlens_k is not None or seqused_q is not None or seqused_k is not None
-    use_block_sparsity = full_block_cnt is not None or mask_block_cnt is not None
     if score_mod is not None:
         if is_varlen:
             raise NotImplementedError("score_mod with aux_tensors is not yet supported for varlen sequences. This will be fixed in a future PR.")
@@ -266,7 +271,7 @@ def _flash_attn_fwd(
 
     compile_key = (
         dtype, head_dim, head_dim_v, qhead_per_kvhead, causal, 
-        score_mod_hash, mask_mod_hash,
+        score_mod_hash, mask_mod_hash, use_block_sparsity,
         aux_tensors is not None,
         lse is None, cu_seqlens_q is None, cu_seqlens_k is None, seqused_q is None, seqused_k is None,
         page_table is not None,
@@ -294,7 +299,7 @@ def _flash_attn_fwd(
                 num_stages=2,
                 num_threads=num_threads,
                 Q_in_regs=False,
-                intra_wg_overlap=False,
+                intra_wg_overlap=True,
                 mma_pv_is_rs=True,
                 mask_mod=mask_mod,
                 score_mod=score_mod,
@@ -322,7 +327,7 @@ def _flash_attn_fwd(
             page_table_tensor,
             window_size_left, window_size_right, learnable_sink_tensor,
             full_block_cnt_tensor, full_block_idx_tensor, mask_block_cnt_tensor, mask_block_idx_tensor,
-            aux_tensors=cute_aux_tensors,
+            cute_aux_tensors,
         )
     _flash_attn_fwd.compile_cache[compile_key](
         q_tensor, k_tensor, v_tensor, o_tensor, lse_tensor, softmax_scale, current_stream,
@@ -330,7 +335,7 @@ def _flash_attn_fwd(
         page_table_tensor,
         window_size_left, window_size_right, learnable_sink_tensor,
         full_block_cnt_tensor, full_block_idx_tensor, mask_block_cnt_tensor, mask_block_idx_tensor,
-        aux_tensors=cute_aux_tensors,
+        cute_aux_tensors,
     )
     return out, lse
 
