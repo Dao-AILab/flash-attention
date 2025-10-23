@@ -16,6 +16,10 @@
 #include <torch/csrc/stable/library.h>
 #include <torch/csrc/stable/ops.h>
 #include <torch/csrc/stable/accelerator.h>
+#include <torch/csrc/inductor/aoti_torch/c/shim.h>
+
+// Declare the CUDA stream function that's behind #ifdef USE_CUDA in shim.h
+extern "C" AOTITorchError aoti_torch_get_current_cuda_stream(int32_t device_index, void** ret_stream);
 
 #include <torch/headeronly/core/ScalarType.h>
 #include <torch/headeronly/util/Exception.h>
@@ -717,7 +721,9 @@ mha_fwd_get_scheduler_metadata(
         int const kBlockM = params.arch >= 90 ? std::get<0>(kBlockMN_kernel_args_sm90) : std::get<0>(kBlockMN_kernel_args_sm8x);
         int const kBlockN = params.arch >= 90 ? std::get<1>(kBlockMN_kernel_args_sm90) : std::get<1>(kBlockMN_kernel_args_sm8x);
         auto device_idx = torch::stable::accelerator::getCurrentDeviceIndex();
-        auto stream = (cudaStream_t)torch::stable::accelerator::getCurrentStream(device_idx).id();
+        void* stream_ptr = nullptr;
+        TORCH_ERROR_CODE_CHECK(aoti_torch_get_current_cuda_stream(device_idx, &stream_ptr));
+        cudaStream_t stream = static_cast<cudaStream_t>(stream_ptr);
         prepare_varlen_num_blocks(params, stream, params.pack_gqa, kBlockM, kBlockN, false /*enable_pdl*/);
         CHECK_CUDA_KERNEL_LAUNCH();
     }
@@ -1227,7 +1233,9 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
 
     if (total_q > 0 && (total_k + params.total_knew) > 0 && num_heads_k > 0) {
         auto device_idx = torch::stable::accelerator::getCurrentDeviceIndex();
-        auto stream = (cudaStream_t)torch::stable::accelerator::getCurrentStream(device_idx).id();
+        void* stream_ptr = nullptr;
+        TORCH_ERROR_CODE_CHECK(aoti_torch_get_current_cuda_stream(device_idx, &stream_ptr));
+        cudaStream_t stream = static_cast<cudaStream_t>(stream_ptr);
         run_mha_fwd(params, stream);
         if (params.num_splits > 1) {
             if (out_type == torch::headeronly::ScalarType::BFloat16) {
@@ -1619,7 +1627,9 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor> mha_b
 
     if (total_q > 0 && total_k > 0 && num_heads_k > 0) {
         auto device_idx = torch::stable::accelerator::getCurrentDeviceIndex();
-        auto stream = (cudaStream_t)torch::stable::accelerator::getCurrentStream(device_idx).id();
+        void* stream_ptr = nullptr;
+        TORCH_ERROR_CODE_CHECK(aoti_torch_get_current_cuda_stream(device_idx, &stream_ptr));
+        cudaStream_t stream = static_cast<cudaStream_t>(stream_ptr);
         run_mha_bwd(params, stream);
     } else if (total_k > 0 && num_heads_k > 0) {
         // If seqlen_q == 0, then we have an empty tensor. We need to set the output to 0.
@@ -1726,7 +1736,9 @@ mha_combine(Tensor out_partial,         // num_splits x batch_size x seqlen x nu
 
     if (seqlen > 0 && batch_size > 0) {
         auto device_idx = torch::stable::accelerator::getCurrentDeviceIndex();
-        auto stream = (cudaStream_t)torch::stable::accelerator::getCurrentStream(device_idx).id();
+        void* stream_ptr = nullptr;
+        TORCH_ERROR_CODE_CHECK(aoti_torch_get_current_cuda_stream(device_idx, &stream_ptr));
+        cudaStream_t stream = static_cast<cudaStream_t>(stream_ptr);
         run_mha_fwd_combine(params, stream, false /*enable_pdl*/);
     }
 
