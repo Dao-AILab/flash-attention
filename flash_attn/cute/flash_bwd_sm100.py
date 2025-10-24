@@ -146,7 +146,7 @@ class FlashAttentionBackwardSm100:
 
         self.num_regs_reduce = 160
         self.num_regs_compute = 128
-        self.num_regs_other = 96
+        self.num_regs_other = 80
         self.num_regs_empty = 24
         assert self.num_regs_reduce + self.num_regs_compute * 2 + self.num_regs_other <= 512
 
@@ -1195,16 +1195,24 @@ class FlashAttentionBackwardSm100:
         tdVrdO = tiled_mma_dV.make_fragment_B(sdO)
         tdVrP = tiled_mma_dV.make_fragment_A(tP)[None, None, None, 0]
 
-        mma_qk_fn = partial(gemm_w_idx, tiled_mma_SdP, tStS, tSrK, tSrQ, A_idx=0, zero_init=True)
-        # mma_qk_fn = partial(
-        #     gemm_ptx_w_idx, tiled_mma_SdP, tStS, tSrK, tSrQ, sA=sK, sB=sQ, A_idx=0, zero_init=True
-        # )
-        mma_dov_fn = partial(
-            gemm_w_idx, tiled_mma_SdP, tdPtdP, tdPrV, tdPrdOt, A_idx=0, zero_init=True
+        # mma_qk_fn = partial(gemm_w_idx, tiled_mma_SdP, tStS, tSrK, tSrQ, A_idx=0, zero_init=True)
+        mma_qk_fn = partial(
+            gemm_ptx_w_idx, tiled_mma_SdP, tStS, tSrK, tSrQ, sA=sK, sB=sQ, A_idx=0, zero_init=True
         )
         # mma_dov_fn = partial(
-        #     gemm_ptx_w_idx, tiled_mma_SdP, tdPtdP, tdPrV, tdPrdOt, sA=sV, sB=sdOt, A_idx=0, zero_init=True
+        # gemm_w_idx, tiled_mma_SdP, tdPtdP, tdPrV, tdPrdOt, A_idx=0, zero_init=True
         # )
+        mma_dov_fn = partial(
+            gemm_ptx_w_idx,
+            tiled_mma_SdP,
+            tdPtdP,
+            tdPrV,
+            tdPrdOt,
+            sA=sV,
+            sB=sdOt,
+            A_idx=0,
+            zero_init=True,
+        )
         mma_pdo_fn = partial(gemm_w_idx, tiled_mma_dV, tdVtdV, tdVrP, tdVrdO, A_idx=None)
         # mma_pdo_fn = partial(
         #     gemm_ptx_w_idx, tiled_mma_dV, tdVtdV, tdVrP, tdVrdO, sA=None, sB=sdO, A_idx=None
@@ -1832,6 +1840,8 @@ class FlashAttentionBackwardSm100:
                     barrier.wait_eq(mdQ_semaphore_cur[(m_block, None)].iterator, tidx, 0, n_block)
                     self.reduce_sync_barrier.arrive_and_wait()
 
+                gdQaccum_cur = gdQaccum[None, None, m_block]
+
                 # We could delay the TMA store by 1 epi tile to better overlap the non-TMA ops
                 delay_tma_store = False
 
@@ -1846,8 +1856,8 @@ class FlashAttentionBackwardSm100:
                         with cute.arch.elect_one():
                             copy_utils.cpasync_reduce_bulk_add_f32(
                                 sdQaccum[None, src_idx].iterator,
-                                gdQaccum[None, dst_idx, m_block].iterator,
                                 self.tma_copy_bytes["dQ"] // 1,
+                                gdQaccum_cur[None, dst_idx].iterator,
                             )
                         cute.arch.cp_async_bulk_commit_group()
                         cute.arch.cp_async_bulk_wait_group(self.sdQaccum_stage - 1, read=read_flag)

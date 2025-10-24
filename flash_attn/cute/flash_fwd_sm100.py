@@ -160,7 +160,8 @@ class FlashAttentionForwardSm100:
             self.num_regs_correction = 64
             self.num_regs_other = 48
         else:
-            self.num_regs_softmax = 192 if self.is_causal or self.is_local else 184
+            # self.num_regs_softmax = 192 if self.is_causal or self.is_local else 184
+            self.num_regs_softmax = 200
             # self.num_regs_softmax = 176
             # self.num_regs_correction = 96
             # self.num_regs_correction = 80
@@ -169,9 +170,9 @@ class FlashAttentionForwardSm100:
             # self.num_regs_other = 32
             # self.num_regs_other = 64
             # self.num_regs_other = 80
-            # self.num_regs_other = 48
+            self.num_regs_other = 48
             # self.num_regs_other = 96 if self.is_causal or self.is_local else 80
-            self.num_regs_other = 64 if self.is_causal or self.is_local else 80
+            # self.num_regs_other = 64 if self.is_causal or self.is_local else 80
         self.num_regs_empty = 24
 
         self.buffer_align_bytes = 1024
@@ -1173,11 +1174,9 @@ class FlashAttentionForwardSm100:
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
     ):
-        thr_mma_qk = tiled_mma_qk.get_slice(0)  # default 1SM
-        thr_mma_pv = tiled_mma_pv.get_slice(0)  # default 1SM
-        tSrQ = thr_mma_qk.make_fragment_A(sQ)
-        tSrK = thr_mma_qk.make_fragment_B(sK)
-        tOrV = thr_mma_pv.make_fragment_B(sV)
+        tSrQ = tiled_mma_qk.make_fragment_A(sQ)
+        tSrK = tiled_mma_qk.make_fragment_B(sK)
+        tOrV = tiled_mma_pv.make_fragment_B(sV)
         if const_expr(self.q_stage == 2):
             tSrQs = (tSrQ[None, None, None, 0], tSrQ[None, None, None, 1])
         else:
