@@ -9,6 +9,7 @@ from cutlass import Float32, Int32, const_expr
 
 import flash_attn.cute.utils as utils
 
+
 @cute.jit
 def mask_r2p(X: cute.Tensor, col_limit: Int32, arch: int = 90, rank1: bool = False) -> None:
     # Bit manipulation, compiles down to the R2P instruction
@@ -38,6 +39,7 @@ def mask_r2p(X: cute.Tensor, col_limit: Int32, arch: int = 90, rank1: bool = Fal
                 for r in cutlass.range_constexpr(cute.size(X.shape[0])):
                     X[r, c] = X[r, c] if in_bound else -Float32.inf
 
+
 @dataclass(frozen=True)
 class AttentionMask:
     tile_m: cutlass.Constexpr[int]
@@ -62,7 +64,7 @@ class AttentionMask:
         mask_causal: cutlass.Constexpr[bool],
         mask_local: cutlass.Constexpr[bool] = False,
         mask_mod: cutlass.Constexpr[Optional[Callable]] = None,
-        buffers: Optional[list[cute.Tensor]] = None,
+        aux_tensors: Optional[list] = None,
     ) -> None:
         assert not (mask_causal and mask_local), "mask_causal and mask_local cannot be both True"
         acc_S_mn = utils.make_acc_tensor_mn_view(acc_S, transpose=self.swap_AB)
@@ -90,20 +92,22 @@ class AttentionMask:
                             acc_S_mn[r, c] = -Float32.inf if oob else acc_S_mn[r, c]
                 else:
                     mask_r2p(acc_S_mn, seqlenk_col_limit, arch=90)
-                                
-        elif const_expr(not mask_causal and not mask_local and mask_mod is not None): # FlexAttention mask mod
+
+        elif const_expr(
+            not mask_causal and not mask_local and mask_mod is not None
+        ):  # FlexAttention mask mod
             nrow = const_expr(cute.size(tScS_mn.shape[0]))
             ncol = const_expr(cute.size(tScS_mn.shape[1]))
             thr_col_offset = tScS_mn[0, 0][1]
-            
+
             for r in cutlass.range_constexpr(nrow):
                 global_row_idx = tScS_mn[r, 0][0] + m_block * self.tile_m
-                
+
                 for col in cutlass.range_constexpr(ncol):
                     col_idx_local = t0ScS_mn[0, col][1]
                     # Convert to absolute column index
                     global_col_idx = thr_col_offset + col_idx_local + n_block * self.tile_n
-                    
+
                     cond = cutlass.Boolean(
                         mask_mod(
                             batch_idx,
@@ -112,7 +116,7 @@ class AttentionMask:
                             thr_col_offset + t0ScS_mn[0, col][1] + n_block * self.tile_n,
                             self.seqlen_q,
                             self.seqlen_k,
-                            buffers,
+                            aux_tensors,
                         )
                     )
                     if const_expr(mask_seqlen):
@@ -125,7 +129,6 @@ class AttentionMask:
                             acc_S_mn[r, col] = acc_S_mn[r, col] if cond else -cutlass.Float32.inf
                     else:
                         acc_S_mn[r, col] = acc_S_mn[r, col] if cond else -cutlass.Float32.inf
-
 
         else:  # Causal or local
             if const_expr(not self.swap_AB):
@@ -321,12 +324,11 @@ class AttentionMask:
                         else acc_S[i]
                     )
 
-
     @cute.jit
     def apply_mask_sm100_transposed(
         self,
         acc_S: cute.Tensor,
-        tScS_t2r : cute.Tensor,
+        tScS_t2r: cute.Tensor,
         m_block: cutlass.Int32,
         n_block: cutlass.Int32,
         wg_idx: cutlass.Int32,
@@ -335,9 +337,9 @@ class AttentionMask:
         mask_causal: cutlass.Constexpr,
         mask_local: cutlass.Constexpr,
     ) -> None:
-        '''
+        """
         Backward pass: mask S = K @ Q.T where n_block tiles seqlen_k and m_block tiles seqlen_q.
-        '''
+        """
         assert not (mask_causal and mask_local), "mask_causal and mask_local cannot be both True"
 
         tidx = cute.arch.thread_idx()[0] % 128
@@ -352,7 +354,7 @@ class AttentionMask:
         else:  # Causal or local
             causal_row_offset = (self.seqlen_q - self.seqlen_k - 1) - m_block * self.tile_m
             row_idx = tScS_t2r[0][0] + n_block * self.tile_n
-            
+
             if const_expr(mask_causal):
                 col_limit_left = row_idx + causal_row_offset
                 ncol = const_expr(cute.size(tScS_t2r.shape))

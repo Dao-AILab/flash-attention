@@ -337,7 +337,7 @@ def apply_score_mod_inner(
     softmax_scale,
     vec_size: cutlass.Constexpr,
     qk_acc_dtype: cutlass.Constexpr,
-    buffers,
+    aux_tensors,
     fastdiv_mods,
     constant_q_idx: cutlass.Constexpr,
     qhead_per_kvhead: cutlass.Constexpr[int] = 1,
@@ -353,7 +353,7 @@ def apply_score_mod_inner(
         softmax_scale: Scale to apply
         vec_size: Vector size for processing elements
         qk_acc_dtype: Data type for accumulator
-        buffers: Optional buffers for FlexAttention
+        aux_tensors: Optional aux_tensors for FlexAttention
         fastdiv_mods: Tuple of (seqlen_q_divmod, seqlen_k_divmod) for wrapping
         constant_q_idx: If provided, use this constant for all q_idx values
                        If None, compute q_idx per-element
@@ -388,7 +388,7 @@ def apply_score_mod_inner(
                 head_idx_vec[j] = head_idx * qhead_per_kvhead + head_offset
 
             # If we will do loads we mod, in order to not read OOB
-            if cutlass.const_expr(buffers is not None and fastdiv_mods is not None):
+            if cutlass.const_expr(aux_tensors is not None and fastdiv_mods is not None):
                 if cutlass.const_expr(constant_q_idx is None):
                     seqlen_q_divmod, seqlen_k_divmod = fastdiv_mods
                     q_idx_floored = floor_if_packed(index_tensor[i + j][0], qhead_per_kvhead)
@@ -421,9 +421,9 @@ def apply_score_mod_inner(
         else:
             head_idx_ssa = utils.scalar_to_ssa(head_idx, cutlass.Int32).broadcast_to((vec_size,))
 
-        buffer_args = []
-        if cutlass.const_expr(buffers is not None):
-            buffer_args = buffers
+        aux_args = []
+        if cutlass.const_expr(aux_tensors is not None):
+            aux_args = aux_tensors
 
         post_mod_scores = score_mod(
             score_ssa,
@@ -431,7 +431,7 @@ def apply_score_mod_inner(
             head_idx_ssa,
             q_idx=q_idx_ssa,
             kv_idx=kv_idx_ssa,
-            buffers=buffer_args,
+            aux_tensors=aux_args,
         )
 
         # Write back modified scores
