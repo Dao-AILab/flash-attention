@@ -248,7 +248,9 @@ def create_tensors(
     return q, k, v
 
 
-def run_cute_flash(q, k, v, cute_score_mod, aux_tensors=None, pack_gqa=False) -> torch.Tensor:
+def run_cute_flash(
+    q, k, v, cute_score_mod, aux_tensors=None, pack_gqa=False
+) -> torch.Tensor:
     q_transposed, k_transposed, v_transposed = map(
         lambda x: x.transpose(1, 2), (q, k, v)
     )
@@ -270,7 +272,9 @@ def run_cute_flash(q, k, v, cute_score_mod, aux_tensors=None, pack_gqa=False) ->
 def run_flex_reference(q, k, v, eager_score_mod, dtype=None) -> torch.Tensor:
     if dtype is not None:
         q, k, v = q.to(dtype), k.to(dtype), v.to(dtype)
-    return flex_attention(q, k, v, score_mod=eager_score_mod, enable_gqa=q.shape[1] != k.shape[1])
+    return flex_attention(
+        q, k, v, score_mod=eager_score_mod, enable_gqa=q.shape[1] != k.shape[1]
+    )
 
 
 @pytest.mark.parametrize(
@@ -301,7 +305,9 @@ def run_flex_reference(q, k, v, eager_score_mod, dtype=None) -> torch.Tensor:
 @pytest.mark.parametrize("qhead_per_kvhead,num_kv_heads", [(1, 2), (4, 2)])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("score_mod_pair", TEST_PAIRS)
-def test_cute_vs_flex_attention(seqlen_q, seqlen_kv, qhead_per_kvhead, num_kv_heads, dtype, score_mod_pair):
+def test_cute_vs_flex_attention(
+    seqlen_q, seqlen_kv, qhead_per_kvhead, num_kv_heads, dtype, score_mod_pair
+):
     torch.random.manual_seed(42)
     cute_score_mod, eager_score_mod = score_mod_pair
 
@@ -412,7 +418,9 @@ def test_cute_vs_flex_attention_with_aux_tensors(
     out_ref_fp32 = run_flex_reference(q, k, v, eager_score_mod, dtype=torch.float32)
 
     out_pt = run_flex_reference(q, k, v, eager_score_mod)
-    out_cute = run_cute_flash(q, k, v, cute_score_mod, aux_tensors=aux_tensors, pack_gqa=pack_gqa)
+    out_cute = run_cute_flash(
+        q, k, v, cute_score_mod, aux_tensors=aux_tensors, pack_gqa=pack_gqa
+    )
 
     # Basic shape and NaN checks
     assert out_cute.shape == out_ref_fp32.shape == out_pt.shape
@@ -443,7 +451,9 @@ def test_cute_vs_flex_attention_with_aux_tensors(
     )
 
 
-@pytest.mark.xfail(raises=NotImplementedError, reason="Varlen with score_mod not yet supported")
+@pytest.mark.xfail(
+    raises=NotImplementedError, reason="Varlen with score_mod not yet supported"
+)
 def test_varlen_with_score_mod():
     """Test that varlen (variable length sequences) works with score_mod.
 
@@ -458,7 +468,11 @@ def test_varlen_with_score_mod():
     num_heads = 4
     dtype = torch.bfloat16
 
-    cu_seqlens = torch.tensor([0] + list(torch.tensor(seqlens).cumsum(0).tolist()), device="cuda", dtype=torch.int32)
+    cu_seqlens = torch.tensor(
+        [0] + list(torch.tensor(seqlens).cumsum(0).tolist()),
+        device="cuda",
+        dtype=torch.int32,
+    )
     q = torch.randn(total_seq, num_heads, 128, device="cuda", dtype=dtype)
     k = torch.randn(total_seq, num_heads, 128, device="cuda", dtype=dtype)
     v = torch.randn(total_seq, num_heads, 128, device="cuda", dtype=dtype)

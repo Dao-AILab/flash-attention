@@ -5,7 +5,6 @@ mask mod support and varlen sequences.
 
 from dataclasses import dataclass
 import math
-from pickle import FALSE
 from typing import Any, Dict, Optional, Tuple
 
 import cuda.bindings.driver as cuda
@@ -235,7 +234,6 @@ class FlashAttentionBenchmark:
                 dtype=torch.float32,
                 device=device,
             )
-            
 
             tensors = {
                 "q": q.contiguous(),
@@ -244,10 +242,10 @@ class FlashAttentionBenchmark:
                 "out": out.contiguous(),
                 "lse": lse.contiguous(),
             }
-        
+
         if config.use_learnable_sink:
             learnable_sink = torch.rand(config.nheads, dtype=torch.bfloat16, device=device)
-            
+
             tensors["learnable_sink"] = learnable_sink.contiguous()
 
         # Compute block sparsity when using mask_mod
@@ -573,7 +571,7 @@ class FlashAttentionBenchmark:
             torch.cuda.synchronize()
 
             times.append(start.elapsed_time(end))
-        
+
         times_tensor = torch.tensor(times)
         mean_time = times_tensor.mean().item()
         std_time = times_tensor.std().item() if len(times) > 1 else 0.0
