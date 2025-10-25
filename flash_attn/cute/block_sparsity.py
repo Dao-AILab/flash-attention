@@ -8,11 +8,135 @@ which are skipped entirely. This is a temporary solution intended to be replaced
 by a more robust preprocessing kernel in the future.
 """
 
-from typing import Tuple, Optional, Callable, List
+from dataclasses import dataclass
+from typing import Tuple, Optional, Callable, List, NamedTuple
 import torch
+import cutlass.cute as cute
+from cutlass.cute.runtime import from_dlpack
 
 # placeholder
 Config = type("Config", (), {})
+
+
+class BlockSparseTensors(NamedTuple):
+    full_block_cnt: Optional[cute.Tensor]
+    full_block_idx: Optional[cute.Tensor]
+    mask_block_cnt: cute.Tensor
+    mask_block_idx: cute.Tensor
+
+    def __new_from_mlir_values__(self, values):
+        """Reconstruct BlockSparseTensors from MLIR values for CUTLASS DSL."""
+        return BlockSparseTensors(*values)
+
+    # def enabled(self) -> bool:
+    #     return any(t is not None for t in (self.full_block_cnt, self.mask_block_cnt))
+
+
+@dataclass
+class BlockSparseMask:
+    """Block sparse metadata wrapper"""
+
+    full_block_cnt: Optional[torch.Tensor] = None
+    full_block_idx: Optional[torch.Tensor] = None
+    mask_block_cnt: Optional[torch.Tensor] = None
+    mask_block_idx: Optional[torch.Tensor] = None
+
+    def __post_init__(self):
+        for name, cnt, idx in (
+            ("full", self.full_block_cnt, self.full_block_idx),
+            ("mask", self.mask_block_cnt, self.mask_block_idx),
+        ):
+            if (cnt is None) != (idx is None):
+                raise ValueError(
+                    f"{name}_block_cnt and {name}_block_idx must both be provided or both be None"
+                )
+            if cnt is None:
+                continue
+            if cnt.dtype != torch.int32 or idx.dtype != torch.int32:
+                raise ValueError(f"{name}_block tensors must have dtype torch.int32")
+            if cnt.device != idx.device:
+                raise ValueError(
+                    f"{name}_block_cnt and {name}_block_idx must be on the same device"
+                )
+            if not cnt.is_cuda or not idx.is_cuda:
+                raise ValueError(f"{name}_block tensors must live on CUDA")
+
+        if self.full_block_cnt is not None and self.mask_block_cnt is not None:
+            if self.full_block_cnt.device != self.mask_block_cnt.device:
+                raise ValueError("All block sparse tensors must be on the same device")
+
+    def enabled(self) -> bool:
+        return any(t is not None for t in (self.full_block_cnt, self.mask_block_cnt))
+
+    def tile(self, batch_idx: int, head_idx: int, m_block: int) -> dict:
+        if not self.enabled():
+            raise ValueError("Block sparsity is disabled; no tile information available")
+
+        result = {}
+        if self.full_block_cnt is not None and self.full_block_idx is not None:
+            result["full_cnt"] = self.full_block_cnt[batch_idx, head_idx, m_block]
+            result["full_idx"] = self.full_block_idx[batch_idx, head_idx, m_block]
+        if self.mask_block_cnt is not None and self.mask_block_idx is not None:
+            result["mask_cnt"] = self.mask_block_cnt[batch_idx, head_idx, m_block]
+            result["mask_idx"] = self.mask_block_idx[batch_idx, head_idx, m_block]
+        return result
+
+    def as_tuple(
+        self,
+    ) -> Tuple[
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+    ]:
+        return (
+            self.full_block_cnt,
+            self.full_block_idx,
+            self.mask_block_cnt,
+            self.mask_block_idx,
+        )
+
+    def as_cute_tuple(self) -> Optional[BlockSparseTensors]:
+        """Convert tensors to CUTLASS cute tensors, or return None when disabled."""
+        if not self.enabled():
+            return None
+
+        full_block_cnt_tensor = (
+            from_dlpack(self.full_block_cnt.detach(), assumed_align=4).mark_layout_dynamic(
+                leading_dim=2
+            )
+            if self.full_block_cnt is not None
+            else None
+        )
+        full_block_idx_tensor = (
+            from_dlpack(self.full_block_idx.detach(), assumed_align=4).mark_layout_dynamic(
+                leading_dim=3
+            )
+            if self.full_block_idx is not None
+            else None
+        )
+
+        mask_block_cnt_tensor = (
+            from_dlpack(self.mask_block_cnt.detach(), assumed_align=4).mark_layout_dynamic(
+                leading_dim=2
+            )
+            if self.mask_block_cnt is not None
+            else None
+        )
+        mask_block_idx_tensor = (
+            from_dlpack(self.mask_block_idx.detach(), assumed_align=4).mark_layout_dynamic(
+                leading_dim=3
+            )
+            if self.mask_block_idx is not None
+            else None
+        )
+
+        return BlockSparseTensors(
+            full_block_cnt_tensor,
+            full_block_idx_tensor,
+            mask_block_cnt_tensor,
+            mask_block_idx_tensor,
+        )
 
 
 def compute_block_sparsity(
