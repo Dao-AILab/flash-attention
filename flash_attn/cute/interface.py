@@ -38,6 +38,7 @@ from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
 from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
 from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
 from flash_attn.cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
+from flash_attn.cute.flash_bwd_sm100 import FlashAttentionBackwardSm100
 from flash_attn.cute.flash_bwd_postprocess import FlashAttentionBackwardPostprocess
 from flash_attn.cute.flash_fwd_combine import FlashAttentionForwardCombine
 
@@ -513,17 +514,26 @@ def _flash_attn_bwd(
     seqused_q: Optional[torch.Tensor] = None,
     seqused_k: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    m_block_size = 80 if not causal else 64
-    n_block_size = 128
-    num_stages_Q = 2
-    num_stages_dO = 2
-    num_stages_PdS = 2
-    SdP_swapAB = True
-    dKV_swapAB = False
-    dQ_swapAB = not causal
-    AtomLayoutMSdP = 1
-    AtomLayoutNdKV = 2
-    AtomLayoutMdQ = 1
+    compute_capability = torch.cuda.get_device_capability()[0]
+    assert compute_capability in [9, 10], "Unsupported compute capability. Supported: 9.x, 10.x"
+
+    if compute_capability == 9:
+        m_block_size = 80 if not causal else 64
+        n_block_size = 128
+        num_stages_Q = 2
+        num_stages_dO = 2
+        num_stages_PdS = 2
+        SdP_swapAB = True
+        dKV_swapAB = False
+        dQ_swapAB = not causal
+        AtomLayoutMSdP = 1
+        AtomLayoutNdKV = 2
+        AtomLayoutMdQ = 1
+    else:
+        m_block_size = 128
+        n_block_size = 128
+        dQ_swapAB = False
+        AtomLayoutMdQ = 1
     q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = [
         maybe_contiguous(t)
         for t in (q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
@@ -723,27 +733,43 @@ def _flash_attn_bwd(
     )
 
     # Backward kernel: compute dk, dv, dq_accum.
-    compile_key = (
-        dtype,
-        head_dim,
-        head_dim_v,
-        qhead_per_kvhead,
-        causal,
-        softcap != 0.0,
-        m_block_size,
-        n_block_size,
-        num_threads,
-        pack_gqa,
-        num_stages_Q,
-        num_stages_dO,
-        SdP_swapAB,
-        dKV_swapAB,
-        dQ_swapAB,
-        AtomLayoutMSdP,
-        AtomLayoutNdKV,
-        AtomLayoutMdQ,
-        V_in_regs,
-    )
+    if compute_capability == 9:
+        compile_key = (
+            compute_capability,
+            dtype,
+            head_dim,
+            head_dim_v,
+            qhead_per_kvhead,
+            causal,
+            softcap != 0.0,
+            m_block_size,
+            n_block_size,
+            num_threads,
+            pack_gqa,
+            num_stages_Q,
+            num_stages_dO,
+            SdP_swapAB,
+            dKV_swapAB,
+            dQ_swapAB,
+            AtomLayoutMSdP,
+            AtomLayoutNdKV,
+            AtomLayoutMdQ,
+            V_in_regs,
+        )
+    else:
+        compile_key = (
+            compute_capability,
+            dtype,
+            head_dim,
+            head_dim_v,
+            qhead_per_kvhead,
+            causal,
+            softcap != 0.0,
+            m_block_size,
+            n_block_size,
+            num_threads,
+            pack_gqa,
+        )
     num_threads = 384
     if compile_key not in _flash_attn_bwd.compile_cache:
         fa_bwd_sm80 = FlashAttentionBackwardSm80(
@@ -766,30 +792,39 @@ def _flash_attn_bwd(
             AtomLayoutMdQ,
             V_in_regs=V_in_regs,
         )
-        fa_bwd_sm90 = FlashAttentionBackwardSm90(
-            dtype,
-            head_dim,
-            head_dim_v,
-            qhead_per_kvhead,
-            causal,
-            m_block_size,
-            n_block_size,
-            num_stages_Q,
-            num_stages_dO,
-            num_stages_PdS,
-            SdP_swapAB,
-            dKV_swapAB,
-            dQ_swapAB,
-            AtomLayoutMSdP,
-            AtomLayoutNdKV,
-            AtomLayoutMdQ,
-            num_threads,
-            V_in_regs=V_in_regs,
-        )
+        if compute_capability == 9:
+            fa_bwd_obj = FlashAttentionBackwardSm90(
+                dtype,
+                head_dim,
+                head_dim_v,
+                qhead_per_kvhead,
+                causal,
+                m_block_size,
+                n_block_size,
+                num_stages_Q,
+                num_stages_dO,
+                num_stages_PdS,
+                SdP_swapAB,
+                dKV_swapAB,
+                dQ_swapAB,
+                AtomLayoutMSdP,
+                AtomLayoutNdKV,
+                AtomLayoutMdQ,
+                num_threads,
+                V_in_regs=V_in_regs,
+            )
+        else:
+            fa_bwd_obj = FlashAttentionBackwardSm100(
+                head_dim,
+                head_dim_v,
+                is_causal=causal,
+                qhead_per_kvhead=qhead_per_kvhead,
+                # tile_m=m_block_size,
+                # tile_n=n_block_size,
+            )
         # TODO: check @can_implement
         _flash_attn_bwd.compile_cache[compile_key] = cute.compile(
-            # fa_bwd_sm80,
-            fa_bwd_sm90,
+            fa_bwd_obj,
             q_tensor,
             k_tensor,
             v_tensor,
@@ -824,11 +859,11 @@ def _flash_attn_bwd(
         seqused_k_tensor,
     )
 
-    num_threads -= 128
+    num_threads = 256 if compute_capability == 9 else 128
     # Postprocess kernel: convert dq_accum from float32 to dq in bf16/fp16
     compile_key_post = (dtype, head_dim, m_block_size, num_threads, AtomLayoutMdQ, dQ_swapAB)
     if compile_key_post not in _flash_attn_bwd.compile_cache_post:
-        arch = 90
+        arch = compute_capability * 10
         fa_bwd_post = FlashAttentionBackwardPostprocess(
             dtype, head_dim, arch, m_block_size, num_threads, AtomLayoutMdQ, dQ_swapAB
         )

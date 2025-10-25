@@ -45,6 +45,7 @@ class FlashAttentionBackwardSm100:
         is_persistent: bool = False,
         deterministic: bool = False,
     ):
+        assert qhead_per_kvhead == 1, "GQA is not supported yet in FlashAttentionBackwardSm100"
         # padding head_dim to a multiple of 16 as k_block_size
         hdim_multiple_of = 16
         self.tile_hdim = int(math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of)
@@ -308,10 +309,20 @@ class FlashAttentionBackwardSm100:
         mdV: cute.Tensor,
         softmax_scale: Float32,
         stream: cuda.CUstream,
+        mCuSeqlensQ: Optional[cute.Tensor] = None,
+        mCuSeqlensK: Optional[cute.Tensor] = None,
+        mSeqUsedQ: Optional[cute.Tensor] = None,
+        mSeqUsedK: Optional[cute.Tensor] = None,
+        softcap: Float32 | float | None = None,
+        window_size_left: Int32 | int | None = None,
+        window_size_right: Int32 | int | None = None,
         mdQ_semaphore: Optional[cute.Tensor] = None,
         mdK_semaphore: Optional[cute.Tensor] = None,
         mdV_semaphore: Optional[cute.Tensor] = None,
     ):
+        assert all(x is None for x in (mCuSeqlensQ, mCuSeqlensK, mSeqUsedQ, mSeqUsedK)), (
+            "Variable sequence length is not supported yet in FlashAttentionBackwardSm100"
+        )
         self.q_dtype = mQ.element_type
         self.k_dtype = mK.element_type
         self.v_dtype = mV.element_type
@@ -409,13 +420,13 @@ class FlashAttentionBackwardSm100:
         val_layout_r2s_dKV = cute.make_ordered_layout(
             (1, 128 // self.dk_dtype.width), order=(1, 0)
         )  # 4 or 8 vals for 16 byte store
-        r2s_copy_atom_r2s_dKV = cute.make_copy_atom(
+        copy_atom_r2s_dKV = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(),
             self.dk_dtype,
             num_bits_per_copy=128,
         )
         tiled_copy_r2s_dKV = cute.make_tiled_copy_tv(
-            r2s_copy_atom_r2s_dKV, thr_layout_r2s_dKV, val_layout_r2s_dKV
+            copy_atom_r2s_dKV, thr_layout_r2s_dKV, val_layout_r2s_dKV
         )
 
         tma_load_op = cpasync.CopyBulkTensorTileG2SOp(cta_group)
@@ -1856,8 +1867,8 @@ class FlashAttentionBackwardSm100:
                         with cute.arch.elect_one():
                             copy_utils.cpasync_reduce_bulk_add_f32(
                                 sdQaccum[None, src_idx].iterator,
-                                self.tma_copy_bytes["dQ"] // 1,
                                 gdQaccum_cur[None, dst_idx].iterator,
+                                self.tma_copy_bytes["dQ"] // 1,
                             )
                         cute.arch.cp_async_bulk_commit_group()
                         cute.arch.cp_async_bulk_wait_group(self.sdQaccum_stage - 1, read=read_flag)
