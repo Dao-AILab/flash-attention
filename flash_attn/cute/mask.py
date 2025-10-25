@@ -260,16 +260,16 @@ class AttentionMask:
         mask_local: cutlass.Constexpr[bool] = False,
     ) -> None:
         assert not (mask_causal and mask_local), "mask_causal and mask_local cannot be both True"
-        cS = cute.make_identity_tensor((self.tile_m, self.tile_n))
+        acc_shape = (self.tile_m, self.tile_n)
+        cS = cute.make_identity_tensor(acc_shape if not self.swap_AB else acc_shape[::-1])
         tScS = thr_mma.partition_C(cS)
         tScS_t2r = thr_tmem_load.partition_D(tScS)
         seqlenk_col_limit = self.seqlen_k - n_block * self.tile_n
         r2p = True
         if const_expr(not mask_causal and not mask_local):
             if const_expr(mask_seqlen):
-                ncol = const_expr(cute.size(tScS_t2r.shape))
                 if const_expr(not r2p):
-                    for i in cutlass.range(ncol, unroll_full=True):
+                    for i in cutlass.range(cute.size(tScS_t2r.shape), unroll_full=True):
                         # if tScS_t2r[i][1] >= seqlenk_col_limit:
                         #     acc_S[i] = -Float32.inf
                         # For some reason the 2 lines above generate really bad SASS
@@ -331,8 +331,6 @@ class AttentionMask:
         tScS_t2r: cute.Tensor,
         m_block: cutlass.Int32,
         n_block: cutlass.Int32,
-        wg_idx: cutlass.Int32,
-        num_wg: cutlass.Constexpr[cutlass.Int32],
         mask_seqlen: cutlass.Constexpr,
         mask_causal: cutlass.Constexpr,
         mask_local: cutlass.Constexpr,
@@ -358,7 +356,7 @@ class AttentionMask:
             if const_expr(mask_causal):
                 col_limit_left = row_idx + causal_row_offset
                 ncol = const_expr(cute.size(tScS_t2r.shape))
-                # if tidx == 32 and wg_idx == 1:
+                # if tidx == 32:
                 #     cute.printf("row idx = {}, causal_row_offset = {}, col_limit_left = {}, first column = {}, last column = {} ", row_idx, causal_row_offset, col_limit_left, tScS_t2r[0][1], tScS_t2r[ncol - 1][1])
                 if const_expr(mask_seqlen):
                     if tScS_t2r[0][0] >= seqlenk_row_limit:

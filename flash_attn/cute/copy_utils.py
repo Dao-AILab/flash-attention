@@ -7,6 +7,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, Boolean, const_expr
 from cutlass.cute.nvgpu import cpasync
+import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass._mlir.dialects import llvm
 import cutlass.pipeline
@@ -45,6 +46,22 @@ def get_copy_atom(
     num_copy_bits = const_expr(min(128, num_copy_elems * dtype.width))
     copy_op = cpasync.CopyG2SOp() if is_async else cute.nvgpu.CopyUniversalOp()
     return cute.make_copy_atom(copy_op, dtype, num_bits_per_copy=num_copy_bits)
+
+
+@dsl_user_op
+def make_tmem_copy(
+    tmem_copy_atom: cute.CopyAtom, num_wg: int = 1, *, loc=None, ip=None
+) -> cute.CopyAtom:
+    num_dp, num_bits, num_rep, _ = sm100_utils.get_tmem_copy_properties(tmem_copy_atom)
+    assert num_dp == 32
+    assert num_bits == 32
+    tiler_mn = (cute.make_layout((128 * num_rep * num_wg // 32, 32), stride=(32, 1)),)
+    layout_tv = cute.make_layout(
+        ((32, 4, num_wg), (num_rep, 32)),
+        stride=((0, 1, 4 * num_rep), (4, 4 * num_rep * num_wg))
+    )
+    return cute.make_tiled_copy(tmem_copy_atom, layout_tv, tiler_mn)
+
 
 
 @dsl_user_op
