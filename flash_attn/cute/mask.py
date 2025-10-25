@@ -40,6 +40,33 @@ def mask_r2p(X: cute.Tensor, col_limit: Int32, arch: int = 90, rank1: bool = Fal
                     X[r, c] = X[r, c] if in_bound else -Float32.inf
 
 
+@cute.jit
+def mask_r2p_transposed(X: cute.Tensor, row_limit_top: Int32, num_rep: int) -> None:
+    # Bit manipulation, compiles down to the R2P instruction
+    # For sm100: we know that tScS_t2r[i][0] has the form 0, 1, ..., 31, 64, ..., 127
+    # or 0, 1, ..., 15, 32, ..., 47, 64, ...
+    # We compare a transformed version of limit to 0, 1, 2, 3, 4, 5, ...
+    # Here we hardcode for the case of 2 warp groups.
+    num_wg = 2
+    row_limit_top_transformed = row_limit_top // (num_rep * num_wg) * num_rep + min(
+        row_limit_top % (num_rep * num_wg), num_rep
+    )
+    ncol = cute.size(X.shape)
+    # Ideally we'd move by 32 instead of 24, but mask >> i isn't correct for i == 31
+    for s in cutlass.range_constexpr(cute.ceil_div(ncol, 24)):
+        row_limit_top_s = max(row_limit_top_transformed - s * 24, 0)
+        # 0 -> 0b00...00, 1 -> 0b00...01, ..., 31 -> 0b01...11, 32 -> 0b11...11
+        mask = (1 << row_limit_top_s) - 1
+        # This needs to be range_constexpr, o/w the compiler can't generate the R2P instruction
+        for i in cutlass.range_constexpr(min(24, ncol - s * 24)):
+            out_bound = cutlass.Boolean(mask & (1 << i))
+            c = s * 24 + i
+            X[c] = -Float32.inf if out_bound else X[c]
+            # tidx = cute.arch.thread_idx()[0] % 256
+            # if tidx == 128:
+            #     cute.printf("tidx = {}, s = {}, i = {}, row_limit_top = {}, row_limit_top_s = {}, mask = {}, out_bound = {}", tidx, s, i, row_limit_top, row_limit_top_s, mask, out_bound)
+
+
 @dataclass(frozen=True)
 class AttentionMask:
     tile_m: cutlass.Constexpr[int]
@@ -219,7 +246,9 @@ class AttentionMask:
                         # If col0 is beyond the column limit, we want to mask out the entire
                         # column, by setting row limit to be self.tile_m.
                         row_limit_top = (
-                            self.tile_m if col0 >= seqlenk_col_limit else col0 - causal_row_offset
+                            self.tile_m
+                            if col0 >= seqlenk_col_limit and mask_seqlen
+                            else col0 - causal_row_offset
                         )
                         for r in cutlass.range(cute.size(tScS_mn.shape[0]), unroll_full=True):
                             acc_S_mn[r, c] = (
@@ -329,6 +358,7 @@ class AttentionMask:
         self,
         acc_S: cute.Tensor,
         tScS_t2r: cute.Tensor,
+        t0ScS_t2r: cute.Tensor,
         m_block: cutlass.Int32,
         n_block: cutlass.Int32,
         mask_seqlen: cutlass.Constexpr,
@@ -339,30 +369,39 @@ class AttentionMask:
         Backward pass: mask S = K @ Q.T where n_block tiles seqlen_k and m_block tiles seqlen_q.
         """
         assert not (mask_causal and mask_local), "mask_causal and mask_local cannot be both True"
-
-        tidx = cute.arch.thread_idx()[0] % 128
-
-        seqlenk_row_limit = self.seqlen_k - n_block * self.tile_n
+        ROW = 0 if const_expr(not self.swap_AB) else 1
+        COL = 1 if const_expr(not self.swap_AB) else 0
+        thr_col_offset = tScS_t2r[0][COL]
+        seqlenk_col_limit = self.seqlen_k - n_block * self.tile_n - thr_col_offset
         if const_expr(not mask_causal and not mask_local):
             if const_expr(mask_seqlen):
-                ncol = const_expr(cute.size(tScS_t2r.shape))
-                if tScS_t2r[0][0] >= seqlenk_row_limit:
-                    for i in cutlass.range(ncol, unroll_full=True):
+                if t0ScS_t2r[0][COL] >= seqlenk_col_limit:
+                    for i in cutlass.range(cute.size(acc_S.shape), unroll_full=True):
                         acc_S[i] = -cutlass.Float32.inf
         else:  # Causal or local
-            causal_row_offset = (self.seqlen_q - self.seqlen_k - 1) - m_block * self.tile_m
-            row_idx = tScS_t2r[0][0] + n_block * self.tile_n
-
+            thr_row_offset = tScS_t2r[0][ROW]
+            causal_row_offset = (
+                seqlenk_col_limit - self.seqlen_q + m_block * self.tile_m + thr_row_offset
+            )
             if const_expr(mask_causal):
-                col_limit_left = row_idx + causal_row_offset
-                ncol = const_expr(cute.size(tScS_t2r.shape))
-                # if tidx == 32:
-                #     cute.printf("row idx = {}, causal_row_offset = {}, col_limit_left = {}, first column = {}, last column = {} ", row_idx, causal_row_offset, col_limit_left, tScS_t2r[0][1], tScS_t2r[ncol - 1][1])
+                col0 = t0ScS_t2r[0][COL]
+                row_limit_top = col0 - causal_row_offset
+                # tidx = cute.arch.thread_idx()[0] % 256
+                # if tidx < 32:
+                #     cute.printf("tidx = {}, {} {}, {} {}, col0 = {}", tidx, tScS_t2r[0][0], tScS_t2r[0][1], tScS_t2r[1][0], tScS_t2r[1][1], col0)
                 if const_expr(mask_seqlen):
-                    if tScS_t2r[0][0] >= seqlenk_row_limit:
-                        col_limit_left = self.tile_m
-                for i in cutlass.range(ncol, unroll_full=True):
-                    acc_S[i] = (
-                        -cutlass.Float32.inf if tScS_t2r[i][1] <= col_limit_left else acc_S[i]
-                    )
-            # TODO: local
+                    # If col is beyond the column limit, we want to mask out the entire
+                    # column, by setting row limit to be self.tile_m.
+                    if t0ScS_t2r[0][COL] >= seqlenk_col_limit:
+                        row_limit_top = self.tile_m
+                r2p = True
+                if const_expr(not r2p):
+                    for i in cutlass.range(cute.size(acc_S.shape), unroll_full=True):
+                        acc_S[i] = (
+                            -cutlass.Float32.inf if t0ScS_t2r[i][ROW] < row_limit_top else acc_S[i]
+                        )
+                else:
+                    num_rep = cute.size(tScS_t2r, mode=[0])  # 16 or 32
+                    mask_r2p_transposed(acc_S, row_limit_top, num_rep)
+            else:
+                assert False, "Local masking isn't supported yet"

@@ -147,7 +147,7 @@ class FlashAttentionBackwardSm100:
 
         self.num_regs_reduce = 160
         self.num_regs_compute = 128
-        self.num_regs_other = 80
+        self.num_regs_other = 96
         self.num_regs_empty = 24
         assert self.num_regs_reduce + self.num_regs_compute * 2 + self.num_regs_other <= 512
 
@@ -846,6 +846,7 @@ class FlashAttentionBackwardSm100:
             AttentionMask,
             self.tile_m,
             self.tile_n,
+            swap_AB=True,
         )
 
         cute.arch.sync_threads()
@@ -960,7 +961,6 @@ class FlashAttentionBackwardSm100:
                 tdKtdK,
                 mdV,
                 mdK,
-                sdSt,
                 sdS,
                 tdPtdP,
                 LSE_full_mbar_ptr,
@@ -1466,7 +1466,6 @@ class FlashAttentionBackwardSm100:
         tdKtdK: cute.Tensor,
         mdV: cute.Tensor,
         mdK: cute.Tensor,
-        sdSt: cute.Tensor,
         sdS: cute.Tensor,
         tdPtdP: cute.Tensor,
         LSE_full_mbar_ptr: cute.Pointer,
@@ -1539,6 +1538,7 @@ class FlashAttentionBackwardSm100:
         tStS_t2r = thr_copy_t2r.partition_S(tStS)  # (((32, 32), 1), 2, 1, 1)
         tdPtdP_t2r = thr_copy_t2r.partition_S(tdPtdP)
         tScS_t2r = thr_copy_t2r.partition_D(tScS)  # ((32, 1), 2, 1, 1)
+        t0ScS_t2r = thr_copy_t2r.get_slice(0).partition_D(tScS)  # ((32, 1), 2, 1, 1)
         # ((32, 1), 2, 1, 1, STAGE)
         tSsLSE = thr_copy_t2r.partition_D(thr_mma_SdP.partition_C(sLSE_2D))
         tSsdPsum = thr_copy_t2r.partition_D(thr_mma_SdP.partition_C(sdPsum_2D))
@@ -1585,6 +1585,8 @@ class FlashAttentionBackwardSm100:
             # TODO: condition mask_seqlen
             mask_fn = partial(
                 mask.apply_mask_sm100_transposed,
+                tScS_t2r=tScS_t2r,
+                t0ScS_t2r=t0ScS_t2r,
                 n_block=n_block,
                 mask_seqlen=True,
                 mask_causal=self.is_causal,
@@ -1602,7 +1604,7 @@ class FlashAttentionBackwardSm100:
                 consumer_phase_LSE ^= 1
 
                 #### APPLY MASK
-                mask_fn(tSrS_t2r, tScS_t2r, m_block=m_block)
+                mask_fn(tSrS_t2r, m_block=m_block)
 
                 # ---------------------------------------------
                 #### P = exp(S - LSE)

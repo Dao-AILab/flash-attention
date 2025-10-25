@@ -183,6 +183,7 @@ def cudnn_spda_bwd_setup(q, k, v, o, g, lse, causal=False, window_size_left=None
         # use_causal_mask_bottom_right=causal or window_size_left is not None,
         use_causal_mask=causal or window_size_left is not None,
         sliding_window_length=window_size_left if window_size_left is not None and not causal else None,
+        use_deterministic_algorithm=False,
     )
 
     dq.set_output(True).set_dim(dq_gpu.shape).set_stride(dq_gpu.stride())
