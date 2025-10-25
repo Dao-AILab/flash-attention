@@ -21,7 +21,11 @@ from mask_definitions import (
     create_cute_sliding_window_mask,
     create_flex_sliding_window_mask,
 )
-from block_sparsity import compute_block_sparsity
+from flash_attn.cute.block_sparsity import (
+    compute_block_sparsity,
+    BlockSparseTensorsTorch,
+    to_cute_block_sparse_tensors,
+)
 
 
 @dataclass
@@ -265,10 +269,12 @@ class FlashAttentionBenchmark:
             )
 
             if all(t is not None for t in [full_cnt, full_idx, mask_cnt, mask_idx]):
-                tensors["full_block_cnt"] = full_cnt.contiguous()
-                tensors["full_block_idx"] = full_idx.contiguous()
-                tensors["mask_block_cnt"] = mask_cnt.contiguous()
-                tensors["mask_block_idx"] = mask_idx.contiguous()
+                tensors["block_sparse_tensors"] = BlockSparseTensorsTorch(
+                    mask_block_cnt=mask_cnt.contiguous(),
+                    mask_block_idx=mask_idx.contiguous(),
+                    full_block_cnt=full_cnt.contiguous(),
+                    full_block_idx=full_idx.contiguous(),
+                )
 
                 if config.verbose:
                     total_full = full_cnt.sum().item()
@@ -373,33 +379,9 @@ class FlashAttentionBenchmark:
             else None
         )
 
-        # Block sparsity tensors
-        full_block_cnt_cute = (
-            from_dlpack(tensors["full_block_cnt"].detach(), assumed_align=4).mark_layout_dynamic(
-                leading_dim=2
-            )
-            if "full_block_cnt" in tensors
-            else None
-        )
-        full_block_idx_cute = (
-            from_dlpack(tensors["full_block_idx"].detach(), assumed_align=4).mark_layout_dynamic(
-                leading_dim=3
-            )
-            if "full_block_idx" in tensors
-            else None
-        )
-        mask_block_cnt_cute = (
-            from_dlpack(tensors["mask_block_cnt"].detach(), assumed_align=4).mark_layout_dynamic(
-                leading_dim=2
-            )
-            if "mask_block_cnt" in tensors
-            else None
-        )
-        mask_block_idx_cute = (
-            from_dlpack(tensors["mask_block_idx"].detach(), assumed_align=4).mark_layout_dynamic(
-                leading_dim=3
-            )
-            if "mask_block_idx" in tensors
+        blocksparse_tensors_cute = (
+            to_cute_block_sparse_tensors(tensors["block_sparse_tensors"])
+            if "block_sparse_tensors" in tensors
             else None
         )
 
@@ -436,11 +418,8 @@ class FlashAttentionBenchmark:
             None,  # page_table
             window_left_cute,
             window_right_cute,
-            learnable_sink_cute,  # learnable_sink
-            full_block_cnt_cute,
-            full_block_idx_cute,
-            mask_block_cnt_cute,
-            mask_block_idx_cute,
+            learnable_sink_cute,
+            blocksparse_tensors_cute,
             aux_tensors_cute,
             # None,
         )
@@ -461,10 +440,7 @@ class FlashAttentionBenchmark:
             window_left_cute,
             window_right_cute,
             learnable_sink_cute,
-            full_block_cnt_cute,
-            full_block_idx_cute,
-            mask_block_cnt_cute,
-            mask_block_idx_cute,
+            blocksparse_tensors_cute,
             aux_tensors_cute,
             # None,
         )

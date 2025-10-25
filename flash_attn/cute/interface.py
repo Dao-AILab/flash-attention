@@ -41,6 +41,8 @@ from flash_attn.cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
 from flash_attn.cute.flash_bwd_postprocess import FlashAttentionBackwardPostprocess
 from flash_attn.cute.flash_fwd_combine import FlashAttentionForwardCombine
 
+from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch, to_cute_block_sparse_tensors
+
 
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
@@ -78,10 +80,7 @@ def _flash_attn_fwd(
     _compute_capability: Optional[int] = None,
     score_mod: Optional[Callable] = None,
     mask_mod: Optional[Callable] = None,
-    full_block_cnt: Optional[torch.Tensor] = None,
-    full_block_idx: Optional[torch.Tensor] = None,
-    mask_block_cnt: Optional[torch.Tensor] = None,
-    mask_block_idx: Optional[torch.Tensor] = None,
+    block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     return_lse: bool = False,
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
@@ -155,10 +154,7 @@ def _flash_attn_fwd(
     if learnable_sink is not None:
         assert learnable_sink.shape == (num_head,)
         assert learnable_sink.dtype == torch.bfloat16, "learnable_sink must be bfloat16"
-    for t in [full_block_cnt, full_block_idx, mask_block_cnt, mask_block_idx]:
-        if t is not None:
-            assert t.dtype == torch.int32, "blocksparse mask tensors must be int32"
-            # assert t.stride(0) == 1, "blocksparse mask tensors must be contiguous"
+
     assert all(
         t is None or t.is_cuda
         for t in (
@@ -171,10 +167,6 @@ def _flash_attn_fwd(
             seqused_k,
             page_table,
             learnable_sink,
-            full_block_cnt,
-            full_block_idx,
-            mask_block_cnt,
-            mask_block_idx,
         )
     ), "inputs must be on CUDA device"
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
@@ -258,28 +250,13 @@ def _flash_attn_fwd(
         if page_table is not None
         else None
     )
+    sparse_tensors = (
+        to_cute_block_sparse_tensors(block_sparse_tensors)
+        if block_sparse_tensors is not None
+        else None
+    )
 
-    full_block_cnt_tensor = (
-        from_dlpack(full_block_cnt.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=2)
-        if full_block_cnt is not None
-        else None
-    )
-    full_block_idx_tensor = (
-        from_dlpack(full_block_idx.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=3)
-        if full_block_idx is not None
-        else None
-    )
-    mask_block_cnt_tensor = (
-        from_dlpack(mask_block_cnt.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=2)
-        if mask_block_cnt is not None
-        else None
-    )
-    mask_block_idx_tensor = (
-        from_dlpack(mask_block_idx.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=3)
-        if mask_block_idx is not None
-        else None
-    )
-    use_block_sparsity = full_block_cnt is not None or mask_block_cnt is not None
+    use_block_sparsity = sparse_tensors is not None
 
     if mask_mod is None:
         if causal:
@@ -415,6 +392,8 @@ def _flash_attn_fwd(
             assert page_size in [None, 128], (
                 "Only page_size=128 is supported for paged KV on SM 10.0"
             )
+            if sparse_tensors is not None:
+                raise NotImplementedError("BlockSparsity not yet supported on SM 10.0")
             fa_fwd = FlashAttentionForwardSm100(
                 head_dim,
                 head_dim_v,
@@ -451,10 +430,7 @@ def _flash_attn_fwd(
             window_size_left,
             window_size_right,
             learnable_sink_tensor,
-            full_block_cnt_tensor,
-            full_block_idx_tensor,
-            mask_block_cnt_tensor,
-            mask_block_idx_tensor,
+            sparse_tensors,
             cute_aux_tensors,
         )
     _flash_attn_fwd.compile_cache[compile_key](
@@ -473,10 +449,7 @@ def _flash_attn_fwd(
         window_size_left,
         window_size_right,
         learnable_sink_tensor,
-        full_block_cnt_tensor,
-        full_block_idx_tensor,
-        mask_block_cnt_tensor,
-        mask_block_idx_tensor,
+        sparse_tensors,
         cute_aux_tensors,
     )
     return out, lse
