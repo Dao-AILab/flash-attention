@@ -1247,21 +1247,10 @@ class FlashAttentionBackwardSm100:
         consumer_state_dO = cutlass.pipeline.make_pipeline_state(
             cutlass.pipeline.PipelineUserType.Consumer, self.dO_stage
         )
-        # producer_state_S_P = cutlass.pipeline.make_pipeline_state(
-        #     cutlass.pipeline.PipelineUserType.Producer, 1
-        # )
-        producer_phase_S_P = Int32(1)
-        # producer_state_dP = cutlass.pipeline.make_pipeline_state(
-        #     cutlass.pipeline.PipelineUserType.Producer, 1
-        # )
-        producer_phase_dP = Int32(1)
+        producer_phase_acc = Int32(1)  # For S & P, dP, dQ
         consumer_state_dS = cutlass.pipeline.make_pipeline_state(
             cutlass.pipeline.PipelineUserType.Consumer, 1
         )
-        # producer_state_dQ = cutlass.pipeline.make_pipeline_state(
-        #     cutlass.pipeline.PipelineUserType.Producer, 1
-        # )
-        producer_phase_dQ = Int32(1)
         # producer_state_dKV = cutlass.pipeline.make_pipeline_state(
         #     cutlass.pipeline.PipelineUserType.Producer, 2
         # )
@@ -1285,32 +1274,24 @@ class FlashAttentionBackwardSm100:
 
             # 1) S  = Q0 @ K.T
             handle_Q = pipeline_Q_consumer.wait_and_advance()
-            # pipeline_S_P.producer_acquire(producer_state_S_P)
-            pipeline_S_P.sync_object_empty.wait(0, producer_phase_S_P)
+            pipeline_S_P.sync_object_empty.wait(0, producer_phase_acc)
             mma_qk_fn(B_idx=handle_Q.index)
             # Don't release Q yet
-            # pipeline_S_P.producer_commit(producer_state_S_P)
             pipeline_S_P.sync_object_full.arrive(0, pipeline_S_P.producer_mask, cta_group)
-            # producer_state_S_P.advance()
-            producer_phase_S_P ^= 1
 
             # 2) dP = V @ dO.T
             pipeline_dO.consumer_wait(consumer_state_dO)
-            # pipeline_dP.producer_acquire(producer_state_dP)
-            pipeline_dP.sync_object_empty.wait(0, producer_phase_dP)
-            # pipeline_dQ.producer_acquire(producer_state_dQ)  # dQ uses the same tmem as dP
-            pipeline_dQ.sync_object_empty.wait(0, producer_phase_dQ)
+            pipeline_dP.sync_object_empty.wait(0, producer_phase_acc)
+            # dQ uses the same tmem as dP
+            pipeline_dQ.sync_object_empty.wait(0, producer_phase_acc)
             mma_dov_fn(B_idx=consumer_state_dO.index)
             # Don't release dO yet
-            # pipeline_dP.producer_commit(producer_state_dP)
             pipeline_dP.sync_object_full.arrive(0, pipeline_dP.producer_mask, cta_group)
-            # producer_state_dP.advance()
-            producer_phase_dP ^= 1
 
+            producer_phase_acc ^= 1
             # 3) dV = P.T @ dO
             # wait for P to be ready, which uses the same tmem as S
-            # pipeline_S_P.producer_acquire(producer_state_S_P)
-            pipeline_S_P.sync_object_empty.wait(0, producer_phase_S_P)
+            pipeline_S_P.sync_object_empty.wait(0, producer_phase_acc)
             mma_pdo_fn(B_idx=consumer_state_dO.index, zero_init=True)
             pipeline_dO.consumer_release(consumer_state_dO)
             consumer_state_dO.advance()
@@ -1328,20 +1309,15 @@ class FlashAttentionBackwardSm100:
                 handle_Q_next = pipeline_Q_consumer.wait_and_advance()
                 # Don't need to wait for S, as P must have been ready ealier, i.e., S is ready
                 mma_qk_fn(B_idx=handle_Q_next.index)
-                # pipeline_S_P.producer_commit(producer_state_S_P)
                 pipeline_S_P.sync_object_full.arrive(0, pipeline_S_P.producer_mask, cta_group)
-                # producer_state_S_P.advance()
-                producer_phase_S_P ^= 1
 
                 # 2) dQ = dS @ K
                 pipeline_dS.consumer_wait(consumer_state_dS)
-                # pipeline_dP.producer_acquire(producer_state_dP)  # dP uses the same tmem as dQ
-                pipeline_dP.sync_object_empty.wait(0, producer_phase_dP)
+                # dP uses the same tmem as dQ
+                # However, if dS is ready, then dP must have been ready, so we don't need to wait
+                # pipeline_dP.sync_object_empty.wait(0, producer_phase_acc)
                 mma_dsk_fn()
-                # pipeline_dQ.producer_commit(producer_state_dQ)
                 pipeline_dQ.sync_object_full.arrive(0, pipeline_dQ.producer_mask, cta_group)
-                # producer_state_dQ.advance()
-                producer_phase_dQ ^= 1
 
                 # 3) dK = dS.T @ Q
                 mma_dsq_fn(B_idx=handle_Q.index, zero_init=not accumulate_dK)
@@ -1352,28 +1328,22 @@ class FlashAttentionBackwardSm100:
 
                 # 4) dP = V @ dO.T
                 pipeline_dO.consumer_wait(consumer_state_dO)
-                # pipeline_dQ.producer_acquire(producer_state_dQ)  # dQ uses the same tmem as dP
-                pipeline_dQ.sync_object_empty.wait(0, producer_phase_dQ)
+                # dQ uses the same tmem as dP
+                pipeline_dQ.sync_object_empty.wait(0, producer_phase_acc)
                 mma_dov_fn(B_idx=consumer_state_dO.index)
-                # pipeline_dP.producer_commit(producer_state_dP)
                 pipeline_dP.sync_object_full.arrive(0, pipeline_dP.producer_mask, cta_group)
-                # producer_state_dP.advance()
-                producer_phase_dP ^= 1
 
+                producer_phase_acc ^= 1
                 # 5) dV += P @ dO
                 # wait for P to be ready, which uses the same tmem as S
-                # pipeline_S_P.producer_acquire(producer_state_S_P)
-                pipeline_S_P.sync_object_empty.wait(0, producer_phase_S_P)
+                pipeline_S_P.sync_object_empty.wait(0, producer_phase_acc)
                 mma_pdo_fn(B_idx=consumer_state_dO.index, zero_init=False)
                 pipeline_dO.consumer_release(consumer_state_dO)
                 consumer_state_dO.advance()
 
                 handle_Q = handle_Q_next
 
-            # pipeline_S_P.producer_commit(producer_state_S_P)
             pipeline_S_P.sync_object_full.arrive(0, pipeline_S_P.producer_mask, cta_group)
-            # producer_state_S_P.advance()
-            producer_phase_S_P ^= 1
 
             # signal to the epilogue that dV is ready
             # pipeline_dKV.producer_acquire(producer_state_dKV)
@@ -1397,15 +1367,15 @@ class FlashAttentionBackwardSm100:
             producer_phase_dKV ^= 1
 
             # 2) dQ = dS @ K
+            # dS is done, so dP must have been ready, we don't need to wait
             mma_dsk_fn()
-            # pipeline_dQ.producer_commit(producer_state_dQ)
             pipeline_dQ.sync_object_full.arrive(0, pipeline_dQ.producer_mask, cta_group)
-            # producer_state_dQ.advance()
-            producer_phase_dQ ^= 1
             # Wait until dQ is done before releasing Q, since K and Q0 uses the same mbarrier
             handle_Q.release()
             pipeline_dS.consumer_release(consumer_state_dS)
             consumer_state_dS.advance()
+
+            producer_phase_acc ^= 1
 
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
@@ -1669,6 +1639,8 @@ class FlashAttentionBackwardSm100:
 
                 pipeline_dP.consumer_wait(consumer_state_S_P_dP)
                 # pipeline_dP.sync_object_full.wait(0, consumer_phase_S_P_dP)
+                consumer_state_S_P_dP.advance()
+                # consumer_phase_S_P_dP ^= 1
 
                 ##### dS.T = P.T * (dP.T - Psum)
                 for stage in cutlass.range_constexpr(cute.size(tSrS_t2r, mode=[1]), unroll=1):
@@ -1706,11 +1678,9 @@ class FlashAttentionBackwardSm100:
 
                 cute.arch.sync_warp()
                 with cute.arch.elect_one():
-                    # pipeline_dP.consumer_release(consumer_state_dP)
-                    pipeline_dP.sync_object_empty.arrive(0, pipeline_dP.consumer_mask)
+                    # The mma warp no longer waits for dP (it waits for dS), so we don't have to arrive
+                    # pipeline_dP.sync_object_empty.arrive(0, pipeline_dP.consumer_mask)
                     cute.arch.mbarrier_arrive(dPsum_empty_mbar_ptr)
-                consumer_state_S_P_dP.advance()
-                # consumer_phase_S_P_dP ^= 1
 
                 cute.arch.fence_proxy(
                     cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
