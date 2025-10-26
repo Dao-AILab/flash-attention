@@ -11,6 +11,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync, warp
+from cutlass import Float32, Int32
 import cutlass.utils as utils_basic
 
 from flash_attn.cute import ampere_helpers as sm80_utils
@@ -373,7 +374,12 @@ class FlashAttentionBackwardSm80:
         mCuSeqlensK: Optional[cute.Tensor] = None,
         mSeqUsedQ: Optional[cute.Tensor] = None,
         mSeqUsedK: Optional[cute.Tensor] = None,
+        softcap: Float32 | float | None = None,
+        window_size_left: Int32 | int | None = None,
+        window_size_right: Int32 | int | None = None,
+        mdQ_semaphore: Optional[cute.Tensor] = None,
     ):
+        assert mdQ_semaphore is None, "semaphore not supported yet"
         # Get the data type and check if it is fp16 or bf16
         self._check_type(*(t.element_type if t is not None else None
                            for t in (mQ, mK, mV, mdO, mLSE, mdPsum, mdQaccum, mdK, mdV, mCuSeqlensQ, mCuSeqlensK, mSeqUsedQ, mSeqUsedK)))

@@ -699,7 +699,7 @@ def _flash_attn_bwd(
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     # Preprocess kernel: compute (o * dout).sum(dim=-1), lse * log2_e, and zero out dq_accum.
-    compile_key_pre = (dtype, head_dim_v, m_block_size, num_threads)
+    compile_key_pre = (compute_capability, dtype, head_dim_v, m_block_size, num_threads)
     if compile_key_pre not in _flash_attn_bwd.compile_cache_pre:
         fa_bwd_pre = FlashAttentionBackwardPreprocess(
             dtype,
@@ -821,6 +821,7 @@ def _flash_attn_bwd(
                 qhead_per_kvhead=qhead_per_kvhead,
                 # tile_m=m_block_size,
                 # tile_n=n_block_size,
+                cluster_size=2 if not causal else 2,
             )
         # TODO: check @can_implement
         _flash_attn_bwd.compile_cache[compile_key] = cute.compile(

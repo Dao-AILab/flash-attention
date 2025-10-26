@@ -44,6 +44,7 @@ class FlashAttentionBackwardSm100:
         tile_n: int = 128,
         is_persistent: bool = False,
         deterministic: bool = False,
+        cluster_size: int = 1,
     ):
         assert qhead_per_kvhead == 1, "GQA is not supported yet in FlashAttentionBackwardSm100"
         # padding head_dim to a multiple of 16 as k_block_size
@@ -79,7 +80,8 @@ class FlashAttentionBackwardSm100:
             self.dsk_acc_dtype
         ) = Float32
 
-        self.cluster_shape_mn = (1, 1)
+        assert cluster_size in (1, 2), "Only cluster_size=1 or 2 is supported"
+        self.cluster_shape_mn = (cluster_size, 1)
         self.is_persistent = is_persistent
         self.is_causal = is_causal
         self.is_local = False
@@ -342,6 +344,18 @@ class FlashAttentionBackwardSm100:
             assert self.dk_dtype.width == 32, "Must accumulate dK in float precision for GQA"
             assert self.dv_dtype.width == 32, "Must accumulate dV in float precision for GQA"
 
+        # Assume all strides are divisible by 128 bits except the last stride
+        new_stride = lambda t: (
+            *(cute.assume(s, divby=128 // t.element_type.width) for s in t.stride[:-1]),
+            t.stride[-1],
+        )
+        (mdQaccum,) = [
+            cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t)))
+            if t is not None
+            else None
+            for t in (mdQaccum,)
+        ]
+
         layout_transpose = [1, 3, 2, 0]  # (b, s, n, h) --> (s, h, n, b)
         mQ, mK, mV, mdO, mdK, mdV = [
             utils.select(t, mode=layout_transpose) for t in (mQ, mK, mV, mdO, mdK, mdV)
@@ -354,7 +368,6 @@ class FlashAttentionBackwardSm100:
         mdO = utils.select(mdO, mode=dO_transpose)
 
         semaphore_transpose = [2, 3, 1, 0]  # (b, n, block, stage) -> (block, stage, n, b)
-        mdQ_semaphore = None
         if const_expr(self.deterministic):
             assert mdQ_semaphore is not None
             mdQ_semaphore = utils.select(mdQ_semaphore.layout, mode=semaphore_transpose)
@@ -383,6 +396,8 @@ class FlashAttentionBackwardSm100:
             cute.make_layout(self.cluster_shape_mnk),
             (self.tiled_mma_SdP.thr_id.shape,),
         )
+        self.num_mcast_ctas_b = cute.size(self.cluster_layout_vmnk.shape[1])
+        self.is_q_do_mcast = self.num_mcast_ctas_b > 1
 
         self.mdK_layout_enum = LayoutEnum.from_tensor(mdK)
         self.mdV_layout_enum = LayoutEnum.from_tensor(mdV)
@@ -445,8 +460,12 @@ class FlashAttentionBackwardSm100:
             self.tiled_mma_SdP,
             self.cluster_layout_vmnk.shape,
         )
+        Q_tma_op = sm100_utils_basic.cluster_shape_to_tma_atom_B(
+            self.cluster_shape_mnk, self.tiled_mma_SdP.thr_id
+        )
         tma_atom_Q, tma_tensor_Q = cute.nvgpu.make_tiled_tma_atom_B(
-            tma_load_op if const_expr(self.cluster_shape_mnk[1] == 1) else tma_load_op_multicast,
+            # tma_load_op if const_expr(self.cluster_shape_mnk[0] == 1) else tma_load_op_multicast,
+            Q_tma_op,
             mQ,
             cute.select(self.sQ_layout, mode=[0, 1, 2]),
             self.mma_tiler_kq,
@@ -462,12 +481,16 @@ class FlashAttentionBackwardSm100:
             self.tiled_mma_SdP,
             self.cluster_layout_vmnk.shape,
         )
+        dO_tma_op = sm100_utils_basic.cluster_shape_to_tma_atom_B(
+            self.cluster_shape_mnk, self.tiled_mma_SdP.thr_id
+        )
         tma_atom_dO, tma_tensor_dO = cute.nvgpu.make_tiled_tma_atom_B(
-            tma_load_op if const_expr(self.cluster_shape_mnk[1] == 1) else tma_load_op_multicast,
+            # tma_load_op if const_expr(self.cluster_shape_mnk[0] == 1) else tma_load_op_multicast,
+            dO_tma_op,
             mdO,
             cute.select(self.sdO_layout, mode=[0, 1, 2]),
-            self.mma_tiler_pdo,
-            self.tiled_mma_dV,
+            self.mma_tiler_vdo,
+            self.tiled_mma_SdP,
             self.cluster_layout_vmnk.shape,
         )
 
@@ -495,6 +518,7 @@ class FlashAttentionBackwardSm100:
             mV.shape[1],
             total_q=cute.size(mQ.shape[0]),
             tile_shape_mn=self.cta_tiler[:2],
+            cluster_shape_mn=self.cluster_shape_mnk[:2],
             mCuSeqlensQ=None,
             mSeqUsedQ=None,
             qhead_per_kvhead_packgqa=1,
@@ -674,6 +698,11 @@ class FlashAttentionBackwardSm100:
                 if const_expr(tma_atom_dK is not None):
                     cpasync.prefetch_descriptor(tma_atom_dK)
 
+        cluster_layout_vmnk = cute.tiled_divide(
+            cute.make_layout(self.cluster_shape_mnk),
+            (tiled_mma_SdP.thr_id.shape,),
+        )
+
         # Alloc
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
@@ -698,8 +727,9 @@ class FlashAttentionBackwardSm100:
         pipeline_producer_group = cutlass.pipeline.CooperativeGroup(
             cutlass.pipeline.Agent.Thread, len([self.load_warp_id])
         )
+        # The arrive count is the number of mcast size
         pipeline_consumer_group = cutlass.pipeline.CooperativeGroup(
-            cutlass.pipeline.Agent.Thread, len([self.mma_warp_id])
+            cutlass.pipeline.Agent.Thread, len([self.mma_warp_id]) * self.num_mcast_ctas_b
         )
         pipeline_Q = pipeline.PipelineTmaUmma.create(
             barrier_storage=storage.Q_mbar_ptr.data_ptr(),
@@ -707,6 +737,7 @@ class FlashAttentionBackwardSm100:
             producer_group=pipeline_producer_group,
             consumer_group=pipeline_consumer_group,
             tx_count=self.tma_copy_bytes["Q"],
+            cta_layout_vmnk=cluster_layout_vmnk,
             init_wait=False,
         )
         pipeline_dO = pipeline.PipelineTmaUmma.create(
@@ -715,6 +746,7 @@ class FlashAttentionBackwardSm100:
             producer_group=pipeline_producer_group,
             consumer_group=pipeline_consumer_group,
             tx_count=self.tma_copy_bytes["dO"],
+            cta_layout_vmnk=cluster_layout_vmnk,
             init_wait=False,
         )
 
@@ -830,7 +862,8 @@ class FlashAttentionBackwardSm100:
 
         block_info = BlockInfo(
             self.tile_m,
-            self.tile_n,
+            # self.tile_n,
+            self.tile_n * self.cluster_shape_mnk[0],  # careful, this case is not very well-tested
             self.is_causal,
             self.is_local,
             None,
@@ -873,7 +906,6 @@ class FlashAttentionBackwardSm100:
             cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
             self.load(
                 thr_mma_SdP,
-                thr_mma_dV,
                 mQ,
                 mK,
                 mV,
@@ -896,6 +928,7 @@ class FlashAttentionBackwardSm100:
                 dPsum_empty_mbar_ptr,
                 pipeline_Q,
                 pipeline_dO,
+                cluster_layout_vmnk,
                 block_info,
                 SeqlenInfoCls,
                 TileSchedulerCls,
@@ -1016,7 +1049,6 @@ class FlashAttentionBackwardSm100:
     def load(
         self,
         thr_mma_SdP: cute.core.ThrMma,
-        thr_mma_dV: cute.core.ThrMma,
         mQ: cute.Tensor,
         mK: cute.Tensor,
         mV: cute.Tensor,
@@ -1039,6 +1071,7 @@ class FlashAttentionBackwardSm100:
         dPsum_empty_mbar_ptr: cute.Pointer,
         pipeline_Q: PipelineAsync,
         pipeline_dO: PipelineAsync,
+        cluster_layout_vmnk: cute.Layout,
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
@@ -1050,12 +1083,23 @@ class FlashAttentionBackwardSm100:
             cutlass.pipeline.PipelineUserType.Producer, self.dO_stage
         )
 
+        # Compute multicast mask for Q & dO buffer full
+        cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+        block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(cta_rank_in_cluster)
+        q_do_mcast_mask = None
+        if const_expr(self.is_q_do_mcast):
+            q_do_mcast_mask = cpasync.create_tma_multicast_mask(
+                cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=1
+            )
+
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             n_block, head_idx, batch_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
-            m_block_min, m_block_max = block_info.get_m_block_min_max(seqlen, n_block)
+            m_block_min, m_block_max = block_info.get_m_block_min_max(
+                seqlen, n_block // self.cluster_shape_mnk[0]
+            )
             head_idx_kv = head_idx // self.qhead_per_kvhead
             mQ_cur = mQ[None, None, head_idx, batch_idx]
             mK_cur = mK[None, None, head_idx_kv, batch_idx]
@@ -1073,7 +1117,7 @@ class FlashAttentionBackwardSm100:
             gLSE = cute.local_tile(mLSE_cur, (self.tile_n,), (None,))
             gdPsum = cute.local_tile(mPsum_cur, (self.tile_n,), (None,))
             gdO = cute.local_tile(mdO_cur, cute.select(self.mma_tiler_pdo, mode=[1, 2]), (0, None))
-            tdVgdO = thr_mma_dV.partition_B(gdO)
+            tdPgdO = thr_mma_SdP.partition_B(gdO)
 
             load_K, _, _ = copy_utils.tma_get_copy_fn(
                 tma_atom_K, 0, cute.make_layout(1), tSgK, sK[None, None, None, 0], single_stage=True
@@ -1086,10 +1130,23 @@ class FlashAttentionBackwardSm100:
                 sV[None, None, None, 0],
                 single_stage=True,
             )
-            load_Q, _, _ = copy_utils.tma_get_copy_fn(tma_atom_Q, 0, cute.make_layout(1), tSgQ, sQ)
+            b_cta_layout = cute.make_layout(cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape)
+            load_Q, _, _ = copy_utils.tma_get_copy_fn(
+                tma_atom_Q,
+                cta_coord=block_in_cluster_coord_vmnk[1],
+                cta_layout=b_cta_layout,
+                src_tensor=tSgQ,
+                dst_tensor=sQ,
+                mcast_mask=q_do_mcast_mask,
+            )
             load_Q = copy_utils.tma_producer_copy_fn(load_Q, pipeline_Q)
             load_dO, _, _ = copy_utils.tma_get_copy_fn(
-                tma_atom_dO, 0, cute.make_layout(1), tdVgdO, sdO
+                tma_atom_dO,
+                cta_coord=block_in_cluster_coord_vmnk[1],
+                cta_layout=b_cta_layout,
+                src_tensor=tdPgdO,
+                dst_tensor=sdO,
+                mcast_mask=q_do_mcast_mask,
             )
             load_dO = copy_utils.tma_producer_copy_fn(load_dO, pipeline_dO)
             copy_atom_stats = cute.make_copy_atom(cpasync.CopyBulkG2SOp(), Float32)
@@ -1261,7 +1318,9 @@ class FlashAttentionBackwardSm100:
         while work_tile.is_valid_tile:
             n_block, head_idx, batch_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)  # must be seqlen_k
-            m_block_min, m_block_max = block_info.get_m_block_min_max(seqlen, n_block)
+            m_block_min, m_block_max = block_info.get_m_block_min_max(
+                seqlen, n_block // self.cluster_shape_mnk[0]
+            )
 
             accumulate_dK = False
             # -----------------------------------------------------------
@@ -1554,7 +1613,9 @@ class FlashAttentionBackwardSm100:
         while work_tile.is_valid_tile:
             n_block, head_idx, batch_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
-            m_block_min, m_block_max = block_info.get_m_block_min_max(seqlen, n_block)
+            m_block_min, m_block_max = block_info.get_m_block_min_max(
+                seqlen, n_block // self.cluster_shape_mnk[0]
+            )
             mask = AttentionMaskCls(seqlen.seqlen_q, seqlen.seqlen_k)
             # TODO: condition mask_seqlen
             mask_fn = partial(
@@ -1795,7 +1856,9 @@ class FlashAttentionBackwardSm100:
         while work_tile.is_valid_tile:
             n_block, head_idx, batch_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
-            m_block_min, m_block_max = block_info.get_m_block_min_max(seqlen, n_block)
+            m_block_min, m_block_max = block_info.get_m_block_min_max(
+                seqlen, n_block // self.cluster_shape_mnk[0]
+            )
             mdQaccum_cur = mdQaccum[None, head_idx, batch_idx]
             gdQaccum_ = cute.local_tile(mdQaccum_cur, (self.tile_m * self.tile_hdim,), (None,))
             # (M * K / STAGE, STAGE, _)

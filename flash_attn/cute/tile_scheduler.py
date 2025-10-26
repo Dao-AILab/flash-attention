@@ -45,6 +45,7 @@ class TileSchedulerArguments(ParamsBase):
     headdim_v: Int32
     total_q: Int32
     tile_shape_mn: cutlass.Constexpr[Tuple[int, int]]
+    cluster_shape_mn: cutlass.Constexpr[Tuple[int, int]] = (1, 1)
     mCuSeqlensQ: Optional[cute.Tensor] = None
     mSeqUsedQ: Optional[cute.Tensor] = None
     qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1
@@ -59,12 +60,13 @@ class SingleTileScheduler:
         num_block: Int32
         num_head: Int32
         num_batch: Int32
+        cluster_shape_mn: cutlass.Constexpr[Tuple[int, int]] = (1, 1)
 
         @staticmethod
         def create(
             args: TileSchedulerArguments, *, loc=None, ip=None
         ) -> "SingleTileScheduler.Params":
-            return SingleTileScheduler.Params(args.num_block, args.num_head, args.num_batch)
+            return SingleTileScheduler.Params(args.num_block, args.num_head, args.num_batch, args.cluster_shape_mn)
 
     def __init__(self, blk_coord: cute.Coord, *, loc=None, ip=None):
         self._blk_coord = blk_coord
@@ -89,7 +91,9 @@ class SingleTileScheduler:
         loc=None,
         ip=None,
     ) -> Tuple[Int32, Int32, Int32]:
-        return params.num_block, params.num_head, params.num_batch
+        # TODO: this hard-codes the fact that we only use cluster = (1, 1) or (2, 1)
+        assert params.cluster_shape_mn[1] == 1, "Only cluster_shape_mn[1] == 1 is supported"
+        return cute.round_up(params.num_block, params.cluster_shape_mn[0]), params.num_head, params.num_batch
 
     def get_current_work(self, *, loc=None, ip=None) -> cutlass.utils.WorkTileInfo:
         return cutlass.utils.WorkTileInfo(self._blk_coord, self._is_first_block)
