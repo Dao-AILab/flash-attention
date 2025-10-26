@@ -797,33 +797,36 @@ class FlashAttentionBackwardSm100:
         sdQaccum = storage.sdQaccum.get_tensor(sdQaccum_layout)
 
         # TMEM
+        # This is a fake tensor, by right need to retrieve tmem_ptr. But we know that we always
+        # request 512 columns of tmem, so we know that it starts at 0.
+        tmem_ptr = cute.make_ptr(Float32, 0, mem_space=cute.AddressSpace.tmem, assumed_align=16)
         # S
         thr_mma_SdP = tiled_mma_SdP.get_slice(0)
         Sacc_shape = thr_mma_SdP.partition_shape_C(self.mma_tiler_kq[:2])  # (M, N)
         tStS = thr_mma_SdP.make_fragment_C(Sacc_shape)
         # (MMA, MMA_M, MMA_N)
-        tStS = cute.make_tensor(tStS.iterator + self.tmem_S_offset, tStS.layout)
+        tStS = cute.make_tensor(tmem_ptr + self.tmem_S_offset, tStS.layout)
         # dP
         dPacc_shape = thr_mma_SdP.partition_shape_C(self.mma_tiler_vdo[:2])
         tdPtdP = thr_mma_SdP.make_fragment_C(dPacc_shape)
-        tdPtdP = cute.make_tensor(tdPtdP.iterator + self.tmem_dP_offset, tdPtdP.layout)
+        tdPtdP = cute.make_tensor(tmem_ptr + self.tmem_dP_offset, tdPtdP.layout)
         # dV
         thr_mma_dV = tiled_mma_dV.get_slice(0)
         dvacc_shape = thr_mma_dV.partition_shape_C(self.mma_tiler_pdo[:2])
         tdVtdV = thr_mma_dV.make_fragment_C(dvacc_shape)
-        tdVtdV = cute.make_tensor(tdVtdV.iterator + self.tmem_dV_offset, tdVtdV.layout)
+        tdVtdV = cute.make_tensor(tmem_ptr + self.tmem_dV_offset, tdVtdV.layout)
         tP_ptr = cute.make_ptr(self.do_dtype, self.tmem_P_offset, cute.AddressSpace.tmem)
         tP = cute.make_tensor(tP_ptr, tP_layout.outer)
         # dK
         thr_mma_dK = tiled_mma_dK.get_slice(0)
         dkacc_shape = thr_mma_dK.partition_shape_C(self.mma_tiler_dsq[:2])
         tdKtdK = thr_mma_dK.make_fragment_C(dkacc_shape)
-        tdKtdK = cute.make_tensor(tdKtdK.iterator + self.tmem_dK_offset, tdKtdK.layout)
+        tdKtdK = cute.make_tensor(tmem_ptr + self.tmem_dK_offset, tdKtdK.layout)
         # dQ
         thr_mma_dQ = tiled_mma_dQ.get_slice(0)
         dQacc_shape = thr_mma_dQ.partition_shape_C(self.mma_tiler_dsk[:2])
         tdQtdQ = thr_mma_dQ.make_fragment_C(dQacc_shape)
-        tdQtdQ = cute.make_tensor(tdQtdQ.iterator + self.tmem_dQ_offset, tdQtdQ.layout)
+        tdQtdQ = cute.make_tensor(tmem_ptr + self.tmem_dQ_offset, tdQtdQ.layout)
 
         block_info = BlockInfo(
             self.tile_m,

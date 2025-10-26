@@ -358,7 +358,7 @@ def gemm_ptx_loop(
 @cute.jit
 def gemm_ptx_partial(
     op: cute.nvgpu.tcgen05.mma.MmaOp,
-    acc_tmem_addr: cutlass.Constexpr[int],
+    acc_tmem_addr: Int32,
     tCrA: cute.Tensor,
     tCrB: cute.Tensor,
     sA: Optional[cute.Tensor],
@@ -433,6 +433,7 @@ def gemm_ptx_partial(
                 Int32(cute.arch.make_warp_uniform(smem_desc_start_a_lo)).ir_value(),
                 Int32(cute.arch.make_warp_uniform(smem_desc_start_b_lo)).ir_value(),
                 Int32(not zero_init).ir_value(),
+                Int32(cute.arch.make_warp_uniform(acc_tmem_addr)).ir_value(),
             ],
             "{\n\t"
             ".reg .pred leader_thread;\n\t"
@@ -445,7 +446,8 @@ def gemm_ptx_partial(
             ".reg .b64 smem_desc_a, smem_desc_b;\n\t"
             "elect.sync _|leader_thread, -1;\n\t"
             f"mov.b32 idesc, {hex(idesc)};\n\t"
-            f"mov.b32 tmem_acc, {hex(acc_tmem_addr)};\n\t"
+            # f"mov.b32 tmem_acc, {hex(acc_tmem_addr)};\n\t"
+            f"mov.b32 tmem_acc, $3;\n\t"
             "mov.b32 smem_desc_a_lo_start, $0;\n\t"
             "mov.b32 smem_desc_b_lo_start, $1;\n\t"
             f"mov.b32 smem_desc_a_hi, {hex(smem_desc_a_hi)};\n\t"
@@ -467,7 +469,8 @@ def gemm_ptx_partial(
                 for k in range(1, cute.size(tCrA.shape[2]))
             )
             + "}\n",
-            "r,r,r",
+            # "r,r,r",
+            "r,r,r,r",
             has_side_effects=True,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
@@ -477,6 +480,7 @@ def gemm_ptx_partial(
             Int32(cute.arch.make_warp_uniform(tCrA[None, None, 0].iterator.toint())).ir_value(),
             Int32(cute.arch.make_warp_uniform(smem_desc_start_b_lo)).ir_value(),
             Int32(not zero_init).ir_value(),
+            Int32(cute.arch.make_warp_uniform(acc_tmem_addr)).ir_value(),
         ]
         if const_expr(mbar_ptr is not None):
             assert mbar_phase is not None, "mbar_phase must be provided when mbar_ptr is not None"
@@ -485,7 +489,7 @@ def gemm_ptx_partial(
             mbar_wait_str = (
                 ".reg .pred P1; \n\t"
                 "LAB_WAIT: \n\t"
-                "mbarrier.try_wait.parity.shared::cta.b64 P1, [$3], $4, 10000000; \n\t"
+                "mbarrier.try_wait.parity.shared::cta.b64 P1, [$4], $5, 10000000; \n\t"
                 "@P1 bra DONE; \n\t"
                 "bra     LAB_WAIT; \n\t"
                 "DONE: \n\t"
@@ -513,7 +517,8 @@ def gemm_ptx_partial(
             ".reg .b64 smem_desc_b;\n\t"
             "elect.sync _|leader_thread, -1;\n\t"
             f"mov.b32 idesc, {hex(idesc)};\n\t"
-            f"mov.b32 tmem_acc, {hex(acc_tmem_addr)};\n\t"
+            # f"mov.b32 tmem_acc, {hex(acc_tmem_addr)};\n\t"
+            f"mov.b32 tmem_acc, $3;\n\t"
             f"mov.b32 tmem_a, $0;\n\t"
             f"mov.b32 smem_desc_b_lo_start, $1;\n\t"
             f"mov.b32 smem_desc_b_hi, {hex(smem_desc_b_hi)};\n\t"
@@ -550,7 +555,7 @@ def gemm_ptx_partial(
                 else ""
             )
             + "}\n",
-            "r,r,r" if const_expr(mbar_ptr is None) else "r,r,r,r,r",
+            "r,r,r,r" if const_expr(mbar_ptr is None) else "r,r,r,r,r,r",
             has_side_effects=True,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
