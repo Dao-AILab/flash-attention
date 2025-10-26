@@ -145,9 +145,13 @@ class FlashAttentionBackwardSm100:
         self.tmem_dQ_offset = self.tmem_dP_offset  # overlap with dP
         self.tmem_dK_offset = self.tmem_dP_offset + self.tile_m
 
-        self.num_regs_reduce = 160
-        self.num_regs_compute = 128
-        self.num_regs_other = 96
+        if not is_causal and not is_local:
+            self.num_regs_reduce = 152
+            self.num_regs_compute = 136
+        else:
+            self.num_regs_reduce = 136
+            self.num_regs_compute = 144
+        self.num_regs_other = 96 - 8
         self.num_regs_empty = 24
         assert self.num_regs_reduce + self.num_regs_compute * 2 + self.num_regs_other <= 512
 
@@ -849,8 +853,6 @@ class FlashAttentionBackwardSm100:
             swap_AB=True,
         )
 
-        cute.arch.sync_threads()
-
         #  EMPTY
         # (15)
         if warp_idx == self.empty_warp_id:
@@ -949,7 +951,7 @@ class FlashAttentionBackwardSm100:
         # Compute
         # (4, 5, 6, 7, 8, 9, 10, 11) --> 8 warps
         if warp_idx >= self.compute_warp_ids[0] and warp_idx <= self.compute_warp_ids[-1]:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_compute)  # 8 warps
+            cute.arch.warpgroup_reg_alloc(self.num_regs_compute)  # 8 warps
             self.compute_loop(
                 thr_mma_SdP,
                 thr_mma_dV,
@@ -1664,7 +1666,6 @@ class FlashAttentionBackwardSm100:
 
                 pipeline_dP.consumer_wait(consumer_state_S_P_dP)
                 # pipeline_dP.sync_object_full.wait(0, consumer_phase_S_P_dP)
-                pipeline_dS.producer_acquire(producer_state_dS)
 
                 ##### dS.T = P.T * (dP.T - Psum)
                 for stage in cutlass.range_constexpr(cute.size(tSrS_t2r, mode=[1]), unroll=1):
@@ -1696,6 +1697,8 @@ class FlashAttentionBackwardSm100:
                         )
                     tdPrdP_cvt = cute.make_fragment_like(tdPrdP_cur, self.ds_dtype)
                     utils.cvt_f16(tdPrdP_cur, tdPrdP_cvt)
+                    if const_expr(stage == 0):
+                        pipeline_dS.producer_acquire(producer_state_dS)
                     cute.autovec_copy(tdPrdP_cvt, tRS_sdS[None, stage])
 
                 cute.arch.sync_warp()
