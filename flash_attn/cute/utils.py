@@ -228,10 +228,10 @@ def select(a: cute.Tensor, mode: list[int]) -> cute.Tensor:
 def transpose_view(a: cute.Tensor) -> cute.Tensor:
     """Transpose the first two dimensions of a tensor on smem."""
     shape = (a.shape[1], a.shape[0], *a.shape[2:])
-    # order = (1, 0, *range(2, cute.rank(a)))
-    # return cute.composition(a, cute.make_ordered_layout(shape, order=order))
-    stride = (a.layout.stride[1], a.layout.stride[0], *a.layout.stride[2:])
-    return cute.make_tensor(a.iterator, cute.make_layout(shape, stride=stride))
+    order = (1, 0, *range(2, cute.rank(a)))
+    return cute.composition(a, cute.make_ordered_layout(shape, order=order))
+    # stride = (a.layout.stride[1], a.layout.stride[0], *a.layout.stride[2:])
+    # return cute.make_tensor(a.iterator, cute.make_layout(shape, stride=stride))
 
 
 def parse_swizzle_from_pointer(ptr: cute.Pointer) -> cute.Swizzle:
