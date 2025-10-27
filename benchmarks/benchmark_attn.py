@@ -21,7 +21,7 @@ Timing = NamedTuple('timing', [('mean', float)])
 from einops import rearrange, repeat
 
 # from flash_attn.utils.benchmark import benchmark_forward, benchmark_backward, benchmark_combined, benchmark_all, benchmark_fwd_bwd, pytorch_profiler
-from flash_attn.utils.benchmark import benchmark_forward, benchmark_backward, benchmark_combined, benchmark_all, benchmark_fwd_bwd, pytorch_profiler
+from flash_attn.cute.benchmark import benchmark_forward, benchmark_backward, benchmark_combined, benchmark_all, benchmark_fwd_bwd, pytorch_profiler
 from flash_attn.flash_attn_interface import flash_attn_func, flash_attn_varlen_func
 from flash_attn.cute.interface import flash_attn_func as flash_attn_func_python
 from flash_attn.cute.interface import flash_attn_varlen_func as flash_attn_varlen_func_python
@@ -409,4 +409,4 @@ for headdim in [128]:
             if flash_attn_func_python is not None:
                 print(f'FA Python fwd: {m1_py.mean * 1e3:.3f}ms, {(nFLOPS / m1_py.mean * 1e-12):.1f} TFLOPS')
                 if dtype != torch.float8_e4m3fn and headdim == headdim_v and has_backward:
-                    print(f'FAv2 Python bwd: {m1b_py.mean * 1e3:.3f}ms, {(2.5 * nFLOPS / m1b_py.mean * 1e-12):.1f} TFLOPS')
+                    print(f'FA Python bwd: {m1b_py.mean * 1e3:.3f}ms, {(2.5 * nFLOPS / m1b_py.mean * 1e-12):.1f} TFLOPS')
