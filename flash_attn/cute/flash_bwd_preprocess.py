@@ -344,10 +344,10 @@ class FlashAttentionBackwardPreprocess:
                 blkdQaccum_shape = (self.m_block_size * self.head_dim_padded,)
                 gdQaccum = cute.local_tile(mdQaccum_cur, blkdQaccum_shape, (m_block,))
                 gmem_thr_copy_dQaccum = gmem_tiled_copy_dQaccum.get_slice(tidx)
-                tQgQaccum = gmem_thr_copy_dQaccum.partition_S(gdQaccum)
-                zero = cute.make_fragment_like(tQgQaccum)
+                tdQgdQaccum = gmem_thr_copy_dQaccum.partition_S(gdQaccum)
+                zero = cute.make_fragment_like(tdQgdQaccum)
                 zero.fill(0.0)
-                cute.copy(gmem_tiled_copy_dQaccum, zero, tQgQaccum)
+                cute.copy(gmem_tiled_copy_dQaccum, zero, tdQgdQaccum)
 
             if cutlass.const_expr(mLSE is not None):
                 if cutlass.const_expr(not seqlen.has_cu_seqlens_q):

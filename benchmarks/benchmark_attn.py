@@ -183,6 +183,7 @@ def cudnn_spda_bwd_setup(q, k, v, o, g, lse, causal=False, window_size_left=None
         # use_causal_mask_bottom_right=causal or window_size_left is not None,
         use_causal_mask=causal or window_size_left is not None,
         sliding_window_length=window_size_left if window_size_left is not None and not causal else None,
+        use_deterministic_algorithm=False,
     )
 
     dq.set_output(True).set_dim(dq_gpu.shape).set_stride(dq_gpu.stride())
@@ -226,7 +227,7 @@ dtype_gen = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
 device = 'cuda'
 verbose = True
 varlen = False
-has_backward = False
+has_backward = True
 page_size = None
 # page_size = 128
 softcap = 0.0
@@ -243,10 +244,10 @@ dim = 2048
 headdim = 256
 # for headdim in [64, 128, 256]:
 # bs_seqlen_vals = [(32, 512), (16, 1024), (8, 2048), (4, 4096), (2, 8192), (1, 16384)]
-bs_seqlen_vals = [(32, 1024), (16, 2048), (8, 4096), (4, 8192), (2, 16384), (1, 32768)]
+# bs_seqlen_vals = [(32, 1024), (16, 2048), (8, 4096), (4, 8192), (2, 16384), (1, 32768)]
 # bs_seqlen_vals = [(32, 512), (16, 1024)]
 # bs_seqlen_vals = [(2, 64 * 132)]
-# bs_seqlen_vals = [(4, 8192)]
+bs_seqlen_vals = [(4, 8192)]
 # bs_seqlen_vals = [(1, 16 * 1024)]
 time_f = {}
 time_b = {}
@@ -266,8 +267,8 @@ for headdim in [128]:
     # seqlen = 512
     # nheads = 8
     # headdim = 128
-    # nheads_kv = nheads
-    nheads_kv = nheads // 8
+    nheads_kv = nheads
+    # nheads_kv = nheads // 8
     # nheads_kv = 1
     # headdim_v = headdim
     headdim_v = 128 if headdim == 192 else headdim
@@ -382,7 +383,7 @@ for headdim in [128]:
                     _, m1b = benchmark_backward(flash_attn_varlen_func_v3, q_unpad, k_unpad, v_unpad, cu_seqlens_q, cu_seqlens_k, seqlen_q, seqlen, causal=causal, window_size=window_size, softcap=softcap, deterministic=deterministic,
                                                 repeats=repeats, verbose=False, desc='Fav3')
                 time_b[(causal, headdim, batch_size, seqlen), "Flash3"] = m1b.mean
-                # time.sleep(1)
+                time.sleep(1)
                 # if not varlen:
                 #     pytorch_profiler(flash_attn_func_v3, q, k, v, causal=causal, deterministic=deterministic, backward=True)
                 # else:

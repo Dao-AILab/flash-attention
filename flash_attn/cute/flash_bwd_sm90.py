@@ -937,6 +937,8 @@ class FlashAttentionBackwardSm90:
             mask = AttentionMaskCls(seqlen.seqlen_q, seqlen.seqlen_k)
             mask_fn = partial(
                 mask.apply_mask,
+                batch_idx=None,
+                head_idx=None,
                 n_block=n_block,
                 thr_mma=thr_mma_SdP,
                 mask_seqlen=True,

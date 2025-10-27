@@ -9,14 +9,14 @@ from flash_attn.cute.interface import _flash_attn_fwd
 
 
 @cute.jit
-def score_mod_1(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, buffers):
+def score_mod_1(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
     tmp0 = tSrS_ssa
     tSrS_ssa = tmp0
     return tSrS_ssa
 
 
 @cute.jit
-def score_mod_2(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, buffers):
+def score_mod_2(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
     tmp0 = q_idx
     tmp1 = kv_idx
     tmp2 = operator.ge(tmp0, tmp1)
@@ -27,7 +27,7 @@ def score_mod_2(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, buffers):
 
 
 @cute.jit
-def score_mod_3(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, buffers):
+def score_mod_3(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
     tmp0 = tSrS_ssa
     tmp1 = q_idx
     tmp2 = kv_idx
@@ -40,7 +40,7 @@ def score_mod_3(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, buffers):
 
 
 @cute.jit
-def score_mod_4(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, buffers):
+def score_mod_4(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
     tmp0 = tSrS_ssa
     tmp1 = q_idx
     tmp2 = kv_idx
@@ -54,7 +54,7 @@ def score_mod_4(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, buffers):
 
 
 @cute.jit
-def score_mod_5(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, buffers):
+def score_mod_5(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
     tmp0 = tSrS_ssa
     tmp1 = tmp0 * cute.full_like(tmp0, 2)
     tSrS_ssa = tmp1
@@ -62,7 +62,7 @@ def score_mod_5(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, buffers):
 
 
 @cute.jit
-def score_mod_6(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, buffers):
+def score_mod_6(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
     tmp0 = tSrS_ssa
     tmp1 = tmp0.to(cutlass.Float32)
     tmp2 = h_idx
@@ -84,7 +84,7 @@ def score_mod_6(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, buffers):
 
 
 @cute.jit
-def score_mod_7(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, buffers):
+def score_mod_7(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
     tmp0 = q_idx
     tmp1 = kv_idx
     tmp2 = tmp0 - tmp1
@@ -97,7 +97,7 @@ def score_mod_7(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, buffers):
 
 
 @cute.jit
-def score_mod_8(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, buffers):
+def score_mod_8(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
     tmp0 = q_idx
     tmp1 = kv_idx
     tmp2 = tSrS_ssa
@@ -109,7 +109,7 @@ def score_mod_8(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, buffers):
 
 
 @cute.jit
-def score_mod_9(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, buffers):
+def score_mod_9(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
     tmp0 = q_idx
     tmp1 = kv_idx
     tmp2 = tmp0 - tmp1
@@ -121,8 +121,8 @@ def score_mod_9(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, buffers):
 
 
 @cute.jit
-def score_mod_10(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, buffers):
-    batch_bias = buffers[0]
+def score_mod_10(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
+    batch_bias = aux_tensors[0]
 
     # Detect dtype from buffer element type
     dtype = batch_bias.element_type
@@ -137,9 +137,9 @@ def score_mod_10(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, buffers):
 
 
 @cute.jit
-def score_mod_11(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, buffers):
-    head_bias = buffers[0]
-    pos_bias = buffers[1]
+def score_mod_11(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
+    head_bias = aux_tensors[0]
+    pos_bias = aux_tensors[1]
 
     # Detect dtype from buffer element type
     dtype = head_bias.element_type
@@ -232,8 +232,8 @@ TEST_PAIRS = [
     (score_mod_9, causal_mask_v2_eager),
 ]
 
-# Test pairs with buffers: (cute_jit_function, eager_reference_function_factory)
-TEST_PAIRS_WITH_BUFFERS = [
+# Test pairs with aux_tensors: (cute_jit_function, eager_reference_function_factory)
+TEST_PAIRS_WITH_AUX_TENSORS = [
     (score_mod_10, batch_bias),
     (score_mod_11, dual_buffer_bias),
 ]
@@ -248,7 +248,9 @@ def create_tensors(
     return q, k, v
 
 
-def run_cute_flash(q, k, v, cute_score_mod, buffers=None, pack_gqa=False) -> torch.Tensor:
+def run_cute_flash(
+    q, k, v, cute_score_mod, aux_tensors=None, pack_gqa=False
+) -> torch.Tensor:
     q_transposed, k_transposed, v_transposed = map(
         lambda x: x.transpose(1, 2), (q, k, v)
     )
@@ -261,7 +263,7 @@ def run_cute_flash(q, k, v, cute_score_mod, buffers=None, pack_gqa=False) -> tor
         score_mod=cute_score_mod,
         out=out,
         lse=None,
-        buffers=buffers,
+        aux_tensors=aux_tensors,
         pack_gqa=pack_gqa,
     )
     return out.transpose(1, 2)
@@ -270,7 +272,9 @@ def run_cute_flash(q, k, v, cute_score_mod, buffers=None, pack_gqa=False) -> tor
 def run_flex_reference(q, k, v, eager_score_mod, dtype=None) -> torch.Tensor:
     if dtype is not None:
         q, k, v = q.to(dtype), k.to(dtype), v.to(dtype)
-    return flex_attention(q, k, v, score_mod=eager_score_mod, enable_gqa=q.shape[1] != k.shape[1])
+    return flex_attention(
+        q, k, v, score_mod=eager_score_mod, enable_gqa=q.shape[1] != k.shape[1]
+    )
 
 
 @pytest.mark.parametrize(
@@ -301,7 +305,9 @@ def run_flex_reference(q, k, v, eager_score_mod, dtype=None) -> torch.Tensor:
 @pytest.mark.parametrize("qhead_per_kvhead,num_kv_heads", [(1, 2), (4, 2)])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("score_mod_pair", TEST_PAIRS)
-def test_cute_vs_flex_attention(seqlen_q, seqlen_kv, qhead_per_kvhead, num_kv_heads, dtype, score_mod_pair):
+def test_cute_vs_flex_attention(
+    seqlen_q, seqlen_kv, qhead_per_kvhead, num_kv_heads, dtype, score_mod_pair
+):
     torch.random.manual_seed(42)
     cute_score_mod, eager_score_mod = score_mod_pair
 
@@ -375,8 +381,8 @@ def test_cute_vs_flex_attention(seqlen_q, seqlen_kv, qhead_per_kvhead, num_kv_he
 )
 @pytest.mark.parametrize("qhead_per_kvhead,num_kv_heads", [(1, 1), (4, 2)])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("score_mod_pair", TEST_PAIRS_WITH_BUFFERS)
-def test_cute_vs_flex_attention_with_buffers(
+@pytest.mark.parametrize("score_mod_pair", TEST_PAIRS_WITH_AUX_TENSORS)
+def test_cute_vs_flex_attention_with_aux_tensors(
     seqlen_q, seqlen_kv, qhead_per_kvhead, num_kv_heads, dtype, score_mod_pair
 ):
     torch.random.manual_seed(42)
@@ -398,13 +404,13 @@ def test_cute_vs_flex_attention_with_buffers(
 
     if cute_score_mod == score_mod_10:
         buffer = torch.randn(batch_size, device="cuda", dtype=dtype) * 0.1
-        buffers = [buffer]
+        aux_tensors = [buffer]
         eager_score_mod = eager_score_mod_factory(buffer)
         assert buffer.shape == (batch_size,)
     elif cute_score_mod == score_mod_11:
         head_bias = torch.randn(num_q_heads, device="cuda", dtype=dtype) * 0.2
         pos_scale = torch.arange(seqlen_q, device="cuda", dtype=dtype) * 0.01
-        buffers = [head_bias, pos_scale]
+        aux_tensors = [head_bias, pos_scale]
         eager_score_mod = eager_score_mod_factory(head_bias, pos_scale)
         assert head_bias.shape == (num_q_heads,)
         assert pos_scale.shape == (seqlen_q,)
@@ -412,7 +418,9 @@ def test_cute_vs_flex_attention_with_buffers(
     out_ref_fp32 = run_flex_reference(q, k, v, eager_score_mod, dtype=torch.float32)
 
     out_pt = run_flex_reference(q, k, v, eager_score_mod)
-    out_cute = run_cute_flash(q, k, v, cute_score_mod, buffers=buffers, pack_gqa=pack_gqa)
+    out_cute = run_cute_flash(
+        q, k, v, cute_score_mod, aux_tensors=aux_tensors, pack_gqa=pack_gqa
+    )
 
     # Basic shape and NaN checks
     assert out_cute.shape == out_ref_fp32.shape == out_pt.shape
@@ -443,7 +451,9 @@ def test_cute_vs_flex_attention_with_buffers(
     )
 
 
-@pytest.mark.xfail(raises=NotImplementedError, reason="Varlen with score_mod not yet supported")
+@pytest.mark.xfail(
+    raises=NotImplementedError, reason="Varlen with score_mod not yet supported"
+)
 def test_varlen_with_score_mod():
     """Test that varlen (variable length sequences) works with score_mod.
 
@@ -458,7 +468,11 @@ def test_varlen_with_score_mod():
     num_heads = 4
     dtype = torch.bfloat16
 
-    cu_seqlens = torch.tensor([0] + list(torch.tensor(seqlens).cumsum(0).tolist()), device="cuda", dtype=torch.int32)
+    cu_seqlens = torch.tensor(
+        [0] + list(torch.tensor(seqlens).cumsum(0).tolist()),
+        device="cuda",
+        dtype=torch.int32,
+    )
     q = torch.randn(total_seq, num_heads, 128, device="cuda", dtype=dtype)
     k = torch.randn(total_seq, num_heads, 128, device="cuda", dtype=dtype)
     v = torch.randn(total_seq, num_heads, 128, device="cuda", dtype=dtype)

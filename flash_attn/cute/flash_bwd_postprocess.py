@@ -33,7 +33,7 @@ class FlashAttentionBackwardPostprocess:
         self,
         dtype: Type[cutlass.Numeric],
         head_dim: int,
-        arch: Literal[80, 90],
+        arch: Literal[80, 90, 100],
         tile_m: int = 128,
         num_threads: int = 256,
         AtomLayoutMdQ: int = 1,
@@ -47,7 +47,9 @@ class FlashAttentionBackwardPostprocess:
         """
         self.dtype = dtype
         self.tile_m = tile_m
-        assert arch in [80, 90], "Only Ampere (80) and Hopper (90) are supported"
+        assert arch in [80, 90, 100], (
+            "Only Ampere (80), Hopper (90), and Blackwell (100) are supported"
+        )
         self.arch = arch
         # padding head_dim to a multiple of 32 as k_block_size
         hdim_multiple_of = 32
@@ -92,7 +94,7 @@ class FlashAttentionBackwardPostprocess:
                 atom_layout_dQ,
                 permutation_mnk=(atom_layout_dQ[0] * 16, atom_layout_dQ[1] * 16, 16),
             )
-        else:
+        elif const_expr(self.arch == 90):
             num_mma_warp_groups = self.num_threads // 128
             atom_layout_dQ = (self.AtomLayoutMdQ, num_mma_warp_groups // self.AtomLayoutMdQ)
             tiler_mn_dQ = (self.tile_m // atom_layout_dQ[0], self.tile_hdim // atom_layout_dQ[1])
@@ -106,7 +108,18 @@ class FlashAttentionBackwardPostprocess:
                 + (1,),
                 tiler_mn=tiler_mn_dQ if not self.dQ_swapAB else tiler_mn_dQ[::-1],
             )
-        assert self.num_threads == tiled_mma.size
+        else:
+            cta_group = tcgen05.CtaGroup.ONE
+            tiled_mma = sm100_utils_basic.make_trivial_tiled_mma(
+                self.dtype,
+                tcgen05.OperandMajorMode.MN,  # dS_major_mode
+                tcgen05.OperandMajorMode.MN,  # Kt_major_mode
+                Float32,
+                cta_group,
+                (self.tile_m, self.tile_hdim),
+            )
+        if const_expr(self.arch in [80, 90]):
+            assert self.num_threads == tiled_mma.size
         return tiled_mma
 
     def _setup_attributes(self):
@@ -133,7 +146,8 @@ class FlashAttentionBackwardPostprocess:
             self.s2r_tiled_copy_dQaccum = copy_utils.tiled_copy_1d(
                 Float32, self.num_threads, num_s2r_copy_elems
             )
-        else:
+            self.sdQaccum_layout = cute.make_layout(self.tile_m * self.tile_hdim)
+        elif const_expr(self.arch == 90):
             num_threads_per_warp_group = 128
             num_mma_warp_groups = self.num_threads // 128
             self.s2r_tiled_copy_dQaccum = cute.make_tiled_copy_tv(
@@ -141,20 +155,26 @@ class FlashAttentionBackwardPostprocess:
                 cute.make_layout((num_threads_per_warp_group, num_mma_warp_groups)),  # thr_layout
                 cute.make_layout(128 // Float32.width),  # val_layout
             )
+            self.sdQaccum_layout = cute.make_layout(
+                (self.tile_m * self.tile_hdim // num_mma_warp_groups, num_mma_warp_groups)
+            )
+        else:
+            self.dQ_reduce_ncol = 32
+            dQaccum_reduce_stage = self.tile_hdim // self.dQ_reduce_ncol
+            assert self.num_threads == 128  # TODO: currently hard-coded
+            self.s2r_tiled_copy_dQaccum = copy_utils.tiled_copy_1d(
+                Float32, self.num_threads, num_s2r_copy_elems
+            )
+            self.sdQaccum_layout = cute.make_layout(
+                (self.tile_m * self.tile_hdim // dQaccum_reduce_stage, dQaccum_reduce_stage)
+            )
 
         self.gmem_tiled_copy_dQ = copy_utils.tiled_copy_2d(
             self.dtype, self.tile_hdim, self.num_threads
         )
         # ///////////////////////////////////////////////////////////////////////////////
-        # Shared memory layout: dQaccum / dQ
+        # Shared memory layout: dQ
         # ///////////////////////////////////////////////////////////////////////////////
-        if const_expr(self.arch == 80):
-            self.sdQaccum_layout = cute.make_layout(self.tile_m * self.tile_hdim)
-        else:
-            num_mma_warp_groups = self.num_threads // 128
-            self.sdQaccum_layout = cute.make_layout(
-                (self.tile_m * self.tile_hdim // num_mma_warp_groups, num_mma_warp_groups)
-            )
         # We can't just use kHeadDim here. E.g. if MMA shape is 64 x 96 but split across 2 WGs,
         # then setting kBlockKSmem to 32 will cause "Static shape_div failure".
         # We want to treat it as 64 x 48, so kBlockKSmem should be 16.
@@ -164,9 +184,14 @@ class FlashAttentionBackwardPostprocess:
             self.sdQ_layout = cute.tile_to_shape(
                 sdQ_layout_atom, (self.tile_m, self.tile_hdim), (0, 1)
             )
-        else:
+        elif const_expr(self.arch == 90):
             self.sdQ_layout = sm90_utils.make_smem_layout(
                 self.dtype, LayoutEnum.ROW_MAJOR, (self.tile_m, self.tile_hdim)
+            )
+        else:
+            # TODO: this is hard-coded for hdim 128
+            self.sdQ_layout = sm100_utils_basic.make_smem_layout_epi(
+                self.dtype, LayoutEnum.ROW_MAJOR, (self.tile_m, self.tile_hdim), 1
             )
 
     @cute.jit
@@ -247,7 +272,7 @@ class FlashAttentionBackwardPostprocess:
             TileScheduler,
         ).launch(
             grid=grid_dim,
-            block=[self.tiled_mma.size, 1, 1],
+            block=[self.num_threads, 1, 1],
             smem=smem_size,
             stream=stream,
         )
@@ -276,7 +301,14 @@ class FlashAttentionBackwardPostprocess:
         smem = cutlass.utils.SmemAllocator()
         sdQaccum = smem.allocate_tensor(cutlass.Float32, sdQaccum_layout, byte_alignment=1024)
         sdQaccum_flat = cute.make_tensor(sdQaccum.iterator, cute.make_layout(cute.size(sdQaccum)))
-        sdQ = cute.make_tensor(cute.recast_ptr(sdQaccum.iterator, dtype=self.dtype), sdQ_layout)
+        if const_expr(self.arch in [80, 90]):
+            sdQ = cute.make_tensor(cute.recast_ptr(sdQaccum.iterator, dtype=self.dtype), sdQ_layout)
+        else:
+            # extra stage dimension
+            sdQ = cute.make_tensor(
+                cute.recast_ptr(sdQaccum.iterator, sdQ_layout.inner, dtype=self.dtype),
+                sdQ_layout.outer,
+            )[None, None, 0]
         sdQt = utils.transpose_view(sdQ)
 
         # Thread index, block index
@@ -344,11 +376,28 @@ class FlashAttentionBackwardPostprocess:
             s2r_thr_copy_dQaccum = s2r_tiled_copy_dQaccum.get_slice(tidx)
             tdQsdQaccum = s2r_thr_copy_dQaccum.partition_S(sdQaccum)
             tile_shape = (self.tile_m, self.tile_hdim)
-            acc_shape = tiled_mma.partition_shape_C(
-                tile_shape if const_expr(not dQ_swapAB) else tile_shape[::-1]
-            )
-            acc = cute.make_fragment(acc_shape, cutlass.Float32)
-            assert cute.size(acc) == cute.size(tdQsdQaccum)
+            acc = None
+            tiled_copy_t2r = None
+            if const_expr(self.arch in [80, 90]):
+                acc_shape = tiled_mma.partition_shape_C(
+                    tile_shape if const_expr(not dQ_swapAB) else tile_shape[::-1]
+                )
+                acc = cute.make_fragment(acc_shape, cutlass.Float32)
+                assert cute.size(acc) == cute.size(tdQsdQaccum)
+            else:
+                thr_mma = tiled_mma.get_slice(0)  # 1-CTA
+                dQacc_shape = tiled_mma.partition_shape_C((self.tile_m, self.tile_hdim))
+                tdQtdQ = tiled_mma.make_fragment_C(dQacc_shape)
+                tdQcdQ = thr_mma.partition_C(
+                    cute.make_identity_tensor((self.tile_m, self.tile_hdim))
+                )
+                tmem_load_atom = cute.make_copy_atom(
+                    tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(self.dQ_reduce_ncol)), Float32
+                )
+                tiled_copy_t2r = tcgen05.make_tmem_copy(tmem_load_atom, tdQtdQ)
+                thr_copy_t2r = tiled_copy_t2r.get_slice(tidx)
+                tdQrdQ_t2r_shape = thr_copy_t2r.partition_D(tdQcdQ).shape
+                acc = cute.make_fragment(tdQrdQ_t2r_shape, Float32)
             tdQrdQaccum = cute.make_tensor(acc.iterator, cute.make_layout(tdQsdQaccum.shape))
             cute.autovec_copy(tdQsdQaccum, tdQrdQaccum)
             # Convert tdQrdQaccum from fp32 to fp16/bf16
@@ -357,27 +406,46 @@ class FlashAttentionBackwardPostprocess:
 
             # Step 3: Copy dQ from register to smem
             cute.arch.barrier()  # make sure all threads have finished loading dQaccum
-            smem_copy_atom_dQ = utils.get_smem_store_atom(
-                self.arch, self.dtype, transpose=self.dQ_swapAB
-            )
-            smem_thr_copy_dQ = cute.make_tiled_copy_C(smem_copy_atom_dQ, tiled_mma).get_slice(tidx)
-            taccdQrdQ = smem_thr_copy_dQ.retile(rdQ)
-            taccdQsdQ = smem_thr_copy_dQ.partition_D(
-                sdQ if const_expr(not self.dQ_swapAB) else sdQt
-            )
-            cute.copy(smem_copy_atom_dQ, taccdQrdQ, taccdQsdQ)
+            if const_expr(self.arch in [80, 90]):
+                copy_atom_r2s_dQ = utils.get_smem_store_atom(
+                    self.arch, self.dtype, transpose=self.dQ_swapAB
+                )
+                tiled_copy_r2s_dQ = cute.make_tiled_copy_C(copy_atom_r2s_dQ, tiled_mma)
+            else:
+                # copy_atom_r2s_dQ = sm100_utils_basic.get_smem_store_op(
+                #     LayoutEnum.ROW_MAJOR, self.dtype, Float32, tiled_copy_t2r,
+                # )
+                # tiled_copy_r2s_dQ = cute.make_tiled_copy_D(copy_atom_r2s_dQ, tiled_copy_t2r)
+                thr_layout_r2s_dQ = cute.make_layout((self.num_threads, 1))  # 128 threads
+                val_layout_r2s_dQ = cute.make_layout((1, 128 // self.dtype.width))
+                copy_atom_r2s_dQ = cute.make_copy_atom(
+                    cute.nvgpu.CopyUniversalOp(),
+                    self.dtype,
+                    num_bits_per_copy=128,
+                )
+                tiled_copy_r2s_dQ = cute.make_tiled_copy_tv(
+                    copy_atom_r2s_dQ, thr_layout_r2s_dQ, val_layout_r2s_dQ
+                )
+            thr_copy_r2s_dQ = tiled_copy_r2s_dQ.get_slice(tidx)
+            cdQ = cute.make_identity_tensor((self.tile_m, self.tile_hdim))
+            if const_expr(self.arch in [80, 90]):
+                taccdQrdQ = thr_copy_r2s_dQ.retile(rdQ)
+            else:
+                taccdQcdQ_shape = thr_copy_r2s_dQ.partition_S(cdQ).shape
+                taccdQrdQ = cute.make_tensor(rdQ.iterator, taccdQcdQ_shape)
+            taccdQsdQ = thr_copy_r2s_dQ.partition_D(sdQ if const_expr(not self.dQ_swapAB) else sdQt)
+            cute.copy(thr_copy_r2s_dQ, taccdQrdQ, taccdQsdQ)
 
             # Step 4: Copy dQ from smem to register to prepare for coalesced write to gmem
+            cute.arch.barrier()  # make sure all smem stores are done
             gmem_thr_copy_dQ = gmem_tiled_copy_dQ.get_slice(tidx)
             tdQgdQ = gmem_thr_copy_dQ.partition_S(gdQ)
             tdQsdQ = gmem_thr_copy_dQ.partition_D(sdQ)
             tdQrdQ = cute.make_fragment_like(tdQsdQ, self.dtype)
-            cute.arch.barrier()  # make sure all smem stores are done
             # TODO: check OOB when reading from smem if kBlockM isn't evenly tiled
             cute.autovec_copy(tdQsdQ, tdQrdQ)
 
             # Step 5: Copy dQ from register to gmem
-            cdQ = cute.make_identity_tensor((self.tile_m, self.tile_hdim))
             tdQcdQ = gmem_thr_copy_dQ.partition_S(cdQ)
             tdQpdQ = utils.predicate_k(tdQcdQ, limit=head_dim)
             for rest_m in cutlass.range(cute.size(tdQrdQ.shape[1]), unroll_full=True):
