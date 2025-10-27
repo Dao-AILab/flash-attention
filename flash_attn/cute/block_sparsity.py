@@ -24,6 +24,8 @@ class BlockSparseTensors(NamedTuple):
     full_block_idx: Optional[cute.Tensor]
 
     def __new_from_mlir_values__(self, values):
+        if len(values) == 2:
+            values = (*values, None, None)
         return BlockSparseTensors(*values)
 
 
@@ -34,7 +36,12 @@ class BlockSparseTensorsTorch(NamedTuple):
     full_block_idx: Optional[torch.Tensor] = None
 
 
-def validate_block_sparse_tensors(tensors: BlockSparseTensorsTorch) -> None:
+def validate_block_sparse_tensors(
+    tensors: BlockSparseTensorsTorch,
+    *,
+    expected_count_shape: Tuple[int, int, int],
+    expected_index_shape: Tuple[int, int, int, int],
+) -> None:
     for name, cnt, idx in (
         ("mask", tensors.mask_block_cnt, tensors.mask_block_idx),
         ("full", tensors.full_block_cnt, tensors.full_block_idx),
@@ -51,6 +58,14 @@ def validate_block_sparse_tensors(tensors: BlockSparseTensorsTorch) -> None:
             raise ValueError(f"{name}_block_cnt and {name}_block_idx must be on the same device")
         if not cnt.is_cuda or not idx.is_cuda:
             raise ValueError(f"{name}_block tensors must live on CUDA")
+        if cnt.shape != expected_count_shape:
+            raise ValueError(
+                f"{name}_block_cnt has shape {tuple(cnt.shape)}, expected {expected_count_shape}"
+            )
+        if idx.shape != expected_index_shape:
+            raise ValueError(
+                f"{name}_block_idx has shape {tuple(idx.shape)}, expected {expected_index_shape}"
+            )
 
     if tensors.full_block_cnt is not None and tensors.mask_block_cnt is not None:
         if tensors.full_block_cnt.device != tensors.mask_block_cnt.device:
