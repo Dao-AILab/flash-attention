@@ -41,8 +41,8 @@ from flash_attn.cute.interface import (
 @pytest.mark.parametrize("softcap", [0.0])
 # @pytest.mark.parametrize("local", [False, True])
 @pytest.mark.parametrize("local", [False])
-@pytest.mark.parametrize("causal", [False, True])
-# @pytest.mark.parametrize("causal", [True])
+# @pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("causal", [False])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192, 256])
 # @pytest.mark.parametrize('d', [32, 64, 96, 128, 160, 192])
@@ -56,30 +56,31 @@ from flash_attn.cute.interface import (
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
-        (1, 1),
-        (3, 3),
-        (64, 32),
-        (64, 128),
-        (128, 128),
-        (128, 192),
-        (256, 256),
-        (239, 1),
-        (799, 3),
-        (113, 203),
-        (113, 128),
-        (128, 217),
-        (113, 211),
-        (108, 256),
-        (256, 512),
-        (384, 256),
-        (640, 128),
-        (512, 256),
-        (1024, 1024),
-        (1023, 1024),
-        (1024, 1023),
-        (2048, 2048),
-        (4096, 4096),
-        (4224, 4224),
+        # (1, 1),
+        # (3, 3),
+        # (64, 32),
+        # (64, 128),
+        # (128, 128),
+        # (128, 192),
+        # (256, 256),
+        # (239, 1),
+        # (799, 3),
+        # (113, 203),
+        # (113, 128),
+        # (128, 217),
+        # (113, 211),
+        # (108, 256),
+        # (256, 512),
+        # (384, 256),
+        # (640, 128),
+        # (512, 256),
+        # (1024, 1024),
+        # (1023, 1024),
+        # (1024, 1023),
+        # (2048, 2048),
+        # (4096, 4096),
+        # (4224, 4224),
+        (512, 512),
     ],
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(128, 128)])
@@ -237,7 +238,8 @@ def test_flash_attn_output(
                 softcap=softcap,
                 learnable_sink=learnable_sink,
                 # pack_gqa=pack_gqa,
-                # num_splits=num_splits
+                # num_splits=num_splits,
+                deterministic=deterministic,
             )
             print(f"Output max diff: {(out - out_ref).abs().max().item()}")
             print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")

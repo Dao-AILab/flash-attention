@@ -62,6 +62,7 @@ class FlashAttentionBackwardSm90:
         AtomLayoutMdQ: int = 1,
         num_threads: int = 384,
         V_in_regs: bool = False,
+
     ):
         self.dtype = dtype
         # padding head_dim to a multiple of 16 as k_block_size
@@ -295,6 +296,9 @@ class FlashAttentionBackwardSm90:
         softcap: Float32 | float | None = None,
         window_size_left: Int32 | int | None = None,
         window_size_right: Int32 | int | None = None,
+        mdQ_semaphore: Optional[cute.Tensor] = None,
+        mdK_semaphore: Optional[cute.Tensor] = None,
+        mdV_semaphore: Optional[cute.Tensor] = None,
     ):
         self._check_type(
             *(

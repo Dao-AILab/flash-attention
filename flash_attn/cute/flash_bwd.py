@@ -378,6 +378,8 @@ class FlashAttentionBackwardSm80:
         window_size_left: Int32 | int | None = None,
         window_size_right: Int32 | int | None = None,
         mdQ_semaphore: Optional[cute.Tensor] = None,
+        mdK_semaphore: Optional[cute.Tensor] = None,
+        mdV_semaphore: Optional[cute.Tensor] = None,
     ):
         assert mdQ_semaphore is None, "semaphore not supported yet"
         # Get the data type and check if it is fp16 or bf16

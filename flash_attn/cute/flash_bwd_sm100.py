@@ -377,6 +377,8 @@ class FlashAttentionBackwardSm100:
         if const_expr(self.deterministic):
             assert mdQ_semaphore is not None
             mdQ_semaphore = utils.select(mdQ_semaphore.layout, mode=semaphore_transpose)
+        else:
+            mdQ_semaphore = None
 
         if const_expr(self.deterministic and self.qhead_per_kvhead > 1):
             assert mdK_semaphore is not None
@@ -1910,9 +1912,12 @@ class FlashAttentionBackwardSm100:
             gdQaccum = cute.flat_divide(
                 gdQaccum_, (self.tile_m * self.tile_hdim // self.dQaccum_reduce_stage,)
             )
-            mdQ_semaphore_cur = None
+            
             if const_expr(self.deterministic):
                 mdQ_semaphore_cur = mdQ_semaphore[None, None, head_idx, batch_idx]
+
+            # delay_semaphore_release = self.is_causal
+            delay_semaphore_release = False
 
             for m_block in cutlass.range(m_block_min, m_block_max, unroll=1):
                 pipeline_dQ.consumer_wait(dQ_consumer_state)
@@ -1926,9 +1931,9 @@ class FlashAttentionBackwardSm100:
                 dQ_consumer_state.advance()
 
                 # semaphore acquire
-                if const_expr(self.deterministic):
-                    barrier.wait_eq(mdQ_semaphore_cur[m_block, None].iterator, tidx, 0, n_block)
-                    self.reduce_sync_barrier.arrive_and_wait()
+                # if const_expr(self.deterministic):
+                #     barrier.wait_eq(mdQ_semaphore_cur[m_block, None].iterator, tidx, 0, n_block)
+                #     self.reduce_sync_barrier.arrive_and_wait()
 
                 gdQaccum_cur = gdQaccum[None, None, m_block]
 
@@ -1943,6 +1948,14 @@ class FlashAttentionBackwardSm100:
                     cute.arch.fence_proxy(
                         cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
                     )
+                    # semaphore acquire
+                    if const_expr(self.deterministic and stage == 0):
+                        # TODO: causal for non-square tile sizes, local
+                        if const_expr(self.is_causal):
+                            lock_value = m_block - n_block
+                        else:
+                            lock_value = n_block
+                        barrier.wait_eq(mdQ_semaphore_cur[(m_block, None)].iterator, tidx, 0, lock_value)
                     self.reduce_sync_barrier.arrive_and_wait()
                     # Copy from shared memory to global memory
                     if is_tma_warp:
@@ -1967,6 +1980,10 @@ class FlashAttentionBackwardSm100:
                     #         tdQrdQ_r2s[4 * i + 3],
                     #         utils.elem_pointer(tdQgdQ, 4 * i),
                     #     )
+                    # semaphore release for prior m_block
+                    if const_expr(self.deterministic and stage == 0 and delay_semaphore_release):
+                        if m_block > m_block_min:
+                            barrier.arrive_inc(mdQ_semaphore_cur[(m_block - 1, None)].iterator, tidx, 0, 1)
 
                 # semaphore release
                 # NOTE: arrive_inc calls red_release which issues membar
@@ -1978,6 +1995,10 @@ class FlashAttentionBackwardSm100:
 
             if warp_idx == 0:
                 cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
+
+            # final semaphore release
+            if const_expr(self.deterministic and delay_semaphore_release):
+                barrier.arrive_inc(mdQ_semaphore_cur[(m_block_max - 1, None)].iterator, tidx, 0, 1)
 
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
