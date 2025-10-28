@@ -214,12 +214,13 @@ class FlashAttentionBackwardSm100:
 
     def _setup_smem_layout(self):
         # S = K @ Q.T
-        self.sK_layout = sm100_utils_basic.make_smem_layout_a(
+        sK_layout = sm100_utils_basic.make_smem_layout_a(
             self.tiled_mma_SdP,
             self.mma_tiler_kq,
             self.k_dtype,
             1,
         )
+        self.sK_layout = cute.slice_(sK_layout, (None, None, None, 0))
         self.sQ_layout = sm100_utils_basic.make_smem_layout_b(
             self.tiled_mma_SdP,
             self.mma_tiler_kq,
@@ -227,12 +228,13 @@ class FlashAttentionBackwardSm100:
             self.Q_stage,
         )
         # dP = V @ dO.T
-        self.sV_layout = sm100_utils_basic.make_smem_layout_a(
+        sV_layout = sm100_utils_basic.make_smem_layout_a(
             self.tiled_mma_SdP,
             self.mma_tiler_vdo,
             self.v_dtype,
             1,
         )
+        self.sV_layout = cute.slice_(sV_layout, (None, None, None, 0))
         self.sdOt_layout = sm100_utils_basic.make_smem_layout_b(
             self.tiled_mma_SdP,
             self.mma_tiler_vdo,
@@ -240,12 +242,13 @@ class FlashAttentionBackwardSm100:
             self.dO_stage,
         )
         # dV += P @ dO
-        self.tP_layout = sm100_utils_basic.make_smem_layout_a(
+        tP_layout = sm100_utils_basic.make_smem_layout_a(
             self.tiled_mma_dV,
             self.mma_tiler_pdo,
             self.do_dtype,
             1,
         )
+        self.tP_layout = cute.slice_(tP_layout, (None, None, None, 0))
         self.sdO_layout = sm100_utils_basic.make_smem_layout_b(
             self.tiled_mma_dV,
             self.mma_tiler_pdo,
@@ -253,12 +256,13 @@ class FlashAttentionBackwardSm100:
             self.dO_stage,
         )
         # dK += dS.T @ Q
-        self.sdSt_layout = sm100_utils_basic.make_smem_layout_a(
+        sdSt_layout = sm100_utils_basic.make_smem_layout_a(
             self.tiled_mma_dK,
             self.mma_tiler_dsq,
             self.ds_dtype,
             1,
         )
+        self.sdSt_layout = cute.slice_(sdSt_layout, (None, None, None, 0))
         self.sQt_layout = sm100_utils_basic.make_smem_layout_b(
             self.tiled_mma_dK,
             self.mma_tiler_dsq,
@@ -266,18 +270,20 @@ class FlashAttentionBackwardSm100:
             self.Q_stage,
         )
         # dQ = dS @ K
-        self.sdS_layout = sm100_utils_basic.make_smem_layout_a(
+        sdS_layout = sm100_utils_basic.make_smem_layout_a(
             self.tiled_mma_dQ,
             self.mma_tiler_dsk,
             self.ds_dtype,
             1,
         )
-        self.sKt_layout = sm100_utils_basic.make_smem_layout_b(
+        self.sdS_layout = cute.slice_(sdS_layout, (None, None, None, 0))
+        sKt_layout = sm100_utils_basic.make_smem_layout_b(
             self.tiled_mma_dQ,
             self.mma_tiler_dsk,
             self.k_dtype,
             1,
         )
+        self.sKt_layout = cute.slice_(sKt_layout, (None, None, None, 0))
         self.sdQaccum_layout = cute.make_layout(
             (self.tile_m * self.dQ_reduce_ncol, self.sdQaccum_stage)
         )
@@ -1138,14 +1144,14 @@ class FlashAttentionBackwardSm100:
             tdPgdO = thr_mma_SdP.partition_B(gdO)
 
             load_K, _, _ = copy_utils.tma_get_copy_fn(
-                tma_atom_K, 0, cute.make_layout(1), tSgK, sK[None, None, None, 0], single_stage=True
+                tma_atom_K, 0, cute.make_layout(1), tSgK, sK, single_stage=True
             )
             load_V, _, _ = copy_utils.tma_get_copy_fn(
                 tma_atom_V,
                 0,
                 cute.make_layout(1),
                 tdPgV,
-                sV[None, None, None, 0],
+                sV,
                 single_stage=True,
             )
             b_cta_layout = cute.make_layout(cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape)
@@ -1297,14 +1303,14 @@ class FlashAttentionBackwardSm100:
         tdQrK = tiled_mma_dQ.make_fragment_B(sKt)
         # dV = P @ dO.T
         tdVrdO = tiled_mma_dV.make_fragment_B(sdO)
-        tdVrP = tiled_mma_dV.make_fragment_A(tP)[None, None, None, 0]
+        tdVrP = tiled_mma_dV.make_fragment_A(tP)
 
-        # mma_qk_fn = partial(gemm_w_idx, tiled_mma_SdP, tStS, tSrK, tSrQ, A_idx=0, zero_init=True)
+        # mma_qk_fn = partial(gemm_w_idx, tiled_mma_SdP, tStS, tSrK, tSrQ, zero_init=True)
         mma_qk_fn = partial(
-            gemm_ptx_w_idx, tiled_mma_SdP, tStS, tSrK, tSrQ, sA=sK, sB=sQ, A_idx=0, zero_init=True
+            gemm_ptx_w_idx, tiled_mma_SdP, tStS, tSrK, tSrQ, sA=sK, sB=sQ, zero_init=True
         )
         # mma_dov_fn = partial(
-        #     gemm_w_idx, tiled_mma_SdP, tdPtdP, tdPrV, tdPrdOt, A_idx=0, zero_init=True
+        #     gemm_w_idx, tiled_mma_SdP, tdPtdP, tdPrV, tdPrdOt, zero_init=True
         # )
         mma_dov_fn = partial(
             gemm_ptx_w_idx,
@@ -1314,23 +1320,16 @@ class FlashAttentionBackwardSm100:
             tdPrdOt,
             sA=sV,
             sB=sdOt,
-            A_idx=0,
             zero_init=True,
         )
-        mma_pdo_fn = partial(gemm_w_idx, tiled_mma_dV, tdVtdV, tdVrP, tdVrdO, A_idx=None)
-        # mma_pdo_fn = partial(
-        #     gemm_ptx_w_idx, tiled_mma_dV, tdVtdV, tdVrP, tdVrdO, sA=None, sB=sdO, A_idx=None
-        # )
-        mma_dsk_fn = partial(
-            gemm_w_idx, tiled_mma_dQ, tdQtdQ, tdQrdS, tdQrK, A_idx=0, B_idx=0, zero_init=True
-        )
+        mma_pdo_fn = partial(gemm_w_idx, tiled_mma_dV, tdVtdV, tdVrP, tdVrdO)
+        # mma_pdo_fn = partial(gemm_ptx_w_idx, tiled_mma_dV, tdVtdV, tdVrP, tdVrdO, sA=None, sB=sdO)
+        mma_dsk_fn = partial(gemm_w_idx, tiled_mma_dQ, tdQtdQ, tdQrdS, tdQrK, zero_init=True)
         # mma_dsk_fn = partial(
-        #     gemm_ptx_w_idx, tiled_mma_dQ, tdQtdQ, tdQrdS, tdQrK, sA=sdS, sB=sKt, A_idx=0, B_idx=0, zero_init=True
+        #     gemm_ptx_w_idx, tiled_mma_dQ, tdQtdQ, tdQrdS, tdQrK, sA=sdS, sB=sKt, zero_init=True
         # )
-        mma_dsq_fn = partial(gemm_w_idx, tiled_mma_dK, tdKtdK, tdKrdS, tdKrQ, A_idx=0)
-        # mma_dsq_fn = partial(
-        #     gemm_ptx_w_idx, tiled_mma_dK, tdKtdK, tdKrdS, tdKrQ, sA=sdSt, sB=sQt, A_idx=0
-        # )
+        mma_dsq_fn = partial(gemm_w_idx, tiled_mma_dK, tdKtdK, tdKrdS, tdKrQ)
+        # mma_dsq_fn = partial(gemm_ptx_w_idx, tiled_mma_dK, tdKtdK, tdKrdS, tdKrQ, sA=sdSt, sB=sQt)
 
         consumer_state_dO = cutlass.pipeline.make_pipeline_state(
             cutlass.pipeline.PipelineUserType.Consumer, self.dO_stage
