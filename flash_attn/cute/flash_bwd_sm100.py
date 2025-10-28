@@ -162,14 +162,14 @@ class FlashAttentionBackwardSm100:
     def _setup_attributes(self):
         self.Q_stage = 2
         self.dO_stage = 1
-        self.LSE_stage = 1
-        self.dPsum_stage = 1
+        # LSE_stage = Q_stage and dPsum_stage = dO_stage
         self.sdKVaccum_stage = 2
         # number of tma reduce adds per dQacc mma
         self.dQ_reduce_ncol = 32
         self.sdQaccum_stage = 64 // self.dQ_reduce_ncol
         assert self.tile_hdim % self.dQ_reduce_ncol == 0
         self.dQaccum_reduce_stage = self.tile_hdim // self.dQ_reduce_ncol
+        self.cluster_reduce_dQ = False and cute.size(self.cluster_shape_mn) > 1
 
     def _get_tiled_mma(self):
         cta_group = tcgen05.CtaGroup.ONE
@@ -282,11 +282,11 @@ class FlashAttentionBackwardSm100:
             (self.tile_m * self.dQ_reduce_ncol, self.sdQaccum_stage)
         )
         self.sLSE_layout = cute.make_layout(
-            shape=(self.tile_m, self.LSE_stage),
+            shape=(self.tile_m, self.Q_stage),
             stride=(1, cute.round_up(self.tile_m, 64)),
         )
         self.sdPsum_layout = cute.make_layout(
-            shape=(self.tile_m, self.dPsum_stage),
+            shape=(self.tile_m, self.dO_stage),
             stride=(1, cute.round_up(self.tile_m, 64)),
         )
         self.sdKV_epi_tile = (
@@ -536,15 +536,19 @@ class FlashAttentionBackwardSm100:
         class SharedStorage:
             Q_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.Q_stage]
             dO_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.dO_stage]
-            LSE_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.LSE_stage]
-            LSE_empty_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.LSE_stage]
-            dPsum_full_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.dPsum_stage]
-            dPsum_empty_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.dPsum_stage]
+            LSE_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.Q_stage]
+            dPsum_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.dO_stage]
             S_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * 1]
             dP_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * 1]
             dS_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * 1]
             dKV_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * 2]
             dQ_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
+            dQ_cluster_full_mbar_ptr: cute.struct.MemRange[
+                cutlass.Int64, self.dQaccum_reduce_stage // 2
+            ]
+            dQ_cluster_empty_mbar_ptr: cute.struct.MemRange[
+                cutlass.Int64, self.dQaccum_reduce_stage // 2
+            ]
             tmem_holding_buf: Int32
             tmem_dealloc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 1]
 
@@ -708,47 +712,18 @@ class FlashAttentionBackwardSm100:
         storage = smem.allocate(self.shared_storage)
 
         tmem_dealloc_mbar_ptr = storage.tmem_dealloc_mbar_ptr.data_ptr()
-        LSE_full_mbar_ptr = storage.LSE_full_mbar_ptr.data_ptr()
-        LSE_empty_mbar_ptr = storage.LSE_empty_mbar_ptr.data_ptr()
-        dPsum_full_mbar_ptr = storage.dPsum_full_mbar_ptr.data_ptr()
-        dPsum_empty_mbar_ptr = storage.dPsum_empty_mbar_ptr.data_ptr()
+        dQ_cluster_full_mbar_ptr = storage.dQ_cluster_full_mbar_ptr.data_ptr()
+        dQ_cluster_empty_mbar_ptr = storage.dQ_cluster_empty_mbar_ptr.data_ptr()
 
         if warp_idx == 1:
             cute.arch.mbarrier_init(
                 tmem_dealloc_mbar_ptr, cute.arch.WARP_SIZE * len(self.compute_warp_ids)
             )
-        if warp_idx == 2:
-            cute.arch.mbarrier_init(LSE_full_mbar_ptr, 1)
-            cute.arch.mbarrier_init(LSE_empty_mbar_ptr, len(self.compute_warp_ids))
-        if warp_idx == 3:
-            cute.arch.mbarrier_init(dPsum_full_mbar_ptr, 1)
-            cute.arch.mbarrier_init(dPsum_empty_mbar_ptr, len(self.compute_warp_ids))
-
-        pipeline_producer_group = cutlass.pipeline.CooperativeGroup(
-            cutlass.pipeline.Agent.Thread, len([self.load_warp_id])
-        )
-        # The arrive count is the number of mcast size
-        pipeline_consumer_group = cutlass.pipeline.CooperativeGroup(
-            cutlass.pipeline.Agent.Thread, len([self.mma_warp_id]) * self.num_mcast_ctas_b
-        )
-        pipeline_Q = pipeline.PipelineTmaUmma.create(
-            barrier_storage=storage.Q_mbar_ptr.data_ptr(),
-            num_stages=self.Q_stage,
-            producer_group=pipeline_producer_group,
-            consumer_group=pipeline_consumer_group,
-            tx_count=self.tma_copy_bytes["Q"],
-            cta_layout_vmnk=cluster_layout_vmnk,
-            init_wait=False,
-        )
-        pipeline_dO = pipeline.PipelineTmaUmma.create(
-            barrier_storage=storage.dO_mbar_ptr.data_ptr(),
-            num_stages=self.dO_stage,
-            producer_group=pipeline_producer_group,
-            consumer_group=pipeline_consumer_group,
-            tx_count=self.tma_copy_bytes["dO"],
-            cta_layout_vmnk=cluster_layout_vmnk,
-            init_wait=False,
-        )
+        if const_expr(self.cluster_reduce_dQ):
+            if warp_idx == 4:
+                for i in range(self.dQaccum_reduce_stage // 2):
+                    cute.arch.mbarrier_init(dQ_cluster_full_mbar_ptr + i, 1)
+                    cute.arch.mbarrier_init(dQ_cluster_empty_mbar_ptr + i, 1)
 
         # UMMA producers and AsyncThread consumers
         pipeline_producer_group_MMA_AsyncThread = cutlass.pipeline.CooperativeGroup(
@@ -795,12 +770,61 @@ class FlashAttentionBackwardSm100:
         pipeline_PdS_consumer_group = cutlass.pipeline.CooperativeGroup(
             cutlass.pipeline.Agent.Thread, len([self.mma_warp_id])
         )  # MMA
-
         pipeline_dS = cutlass.pipeline.PipelineAsyncUmma.create(
             num_stages=1,
             producer_group=pipeline_PdS_producer_group,
             consumer_group=pipeline_PdS_consumer_group,
             barrier_storage=storage.dS_mbar_ptr.data_ptr(),
+        )
+
+        # TMA producer and UMMA consumers
+        pipeline_producer_group = cutlass.pipeline.CooperativeGroup(
+            cutlass.pipeline.Agent.Thread, len([self.load_warp_id])
+        )
+        # The arrive count is the number of mcast size
+        pipeline_consumer_group = cutlass.pipeline.CooperativeGroup(
+            cutlass.pipeline.Agent.Thread, len([self.mma_warp_id]) * self.num_mcast_ctas_b
+        )
+        pipeline_consumer_group_compute = cutlass.pipeline.CooperativeGroup(
+            # cutlass.pipeline.Agent.Thread, len(self.compute_warp_ids) * self.num_mcast_ctas_b
+            cutlass.pipeline.Agent.Thread,
+            len(self.compute_warp_ids) * 1,
+        )
+        pipeline_LSE = cutlass.pipeline.PipelineTmaAsync.create(
+            barrier_storage=storage.LSE_mbar_ptr.data_ptr(),
+            num_stages=self.Q_stage,
+            producer_group=pipeline_producer_group,
+            consumer_group=pipeline_consumer_group_compute,
+            tx_count=self.tma_copy_bytes["LSE"],
+            # cta_layout_vmnk=cluster_layout_vmnk,
+            # init_wait=False,
+        )
+        pipeline_dPsum = cutlass.pipeline.PipelineTmaAsync.create(
+            barrier_storage=storage.dPsum_mbar_ptr.data_ptr(),
+            num_stages=self.dO_stage,
+            producer_group=pipeline_producer_group,
+            consumer_group=pipeline_consumer_group_compute,
+            tx_count=self.tma_copy_bytes["dPsum"],
+            # cta_layout_vmnk=cluster_layout_vmnk,
+            # init_wait=False,
+        )
+        pipeline_Q = pipeline.PipelineTmaUmma.create(
+            barrier_storage=storage.Q_mbar_ptr.data_ptr(),
+            num_stages=self.Q_stage,
+            producer_group=pipeline_producer_group,
+            consumer_group=pipeline_consumer_group,
+            tx_count=self.tma_copy_bytes["Q"],
+            cta_layout_vmnk=cluster_layout_vmnk,
+            init_wait=False,
+        )
+        pipeline_dO = pipeline.PipelineTmaUmma.create(
+            barrier_storage=storage.dO_mbar_ptr.data_ptr(),
+            num_stages=self.dO_stage,
+            producer_group=pipeline_producer_group,
+            consumer_group=pipeline_consumer_group,
+            tx_count=self.tma_copy_bytes["dO"],
+            cta_layout_vmnk=cluster_layout_vmnk,
+            init_wait=True,
         )
 
         sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner)
@@ -922,12 +946,10 @@ class FlashAttentionBackwardSm100:
                 tma_atom_K,
                 tma_atom_V,
                 tma_atom_dO,
-                LSE_full_mbar_ptr,
-                LSE_empty_mbar_ptr,
-                dPsum_full_mbar_ptr,
-                dPsum_empty_mbar_ptr,
                 pipeline_Q,
                 pipeline_dO,
+                pipeline_LSE,
+                pipeline_dPsum,
                 cluster_layout_vmnk,
                 block_info,
                 SeqlenInfoCls,
@@ -1001,10 +1023,8 @@ class FlashAttentionBackwardSm100:
                 mdK,
                 sdS,
                 tdPtdP,
-                LSE_full_mbar_ptr,
-                LSE_empty_mbar_ptr,
-                dPsum_full_mbar_ptr,
-                dPsum_empty_mbar_ptr,
+                pipeline_LSE,
+                pipeline_dPsum,
                 pipeline_S_P,
                 pipeline_dS,
                 pipeline_dKV,
@@ -1065,21 +1085,19 @@ class FlashAttentionBackwardSm100:
         tma_atom_K: cute.CopyAtom,
         tma_atom_V: cute.CopyAtom,
         tma_atom_dO: cute.CopyAtom,
-        LSE_full_mbar_ptr: cute.Pointer,
-        LSE_empty_mbar_ptr: cute.Pointer,
-        dPsum_full_mbar_ptr: cute.Pointer,
-        dPsum_empty_mbar_ptr: cute.Pointer,
         pipeline_Q: PipelineAsync,
         pipeline_dO: PipelineAsync,
+        pipeline_LSE: PipelineAsync,
+        pipeline_dPsum: PipelineAsync,
         cluster_layout_vmnk: cute.Layout,
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
     ):
-        producer_state_Q = cutlass.pipeline.make_pipeline_state(
+        producer_state_Q_LSE = cutlass.pipeline.make_pipeline_state(
             cutlass.pipeline.PipelineUserType.Producer, self.Q_stage
         )
-        producer_state_dO = cutlass.pipeline.make_pipeline_state(
+        producer_state_dO_dPsum = cutlass.pipeline.make_pipeline_state(
             cutlass.pipeline.PipelineUserType.Producer, self.dO_stage
         )
 
@@ -1151,65 +1169,79 @@ class FlashAttentionBackwardSm100:
             load_dO = copy_utils.tma_producer_copy_fn(load_dO, pipeline_dO)
             copy_atom_stats = cute.make_copy_atom(cpasync.CopyBulkG2SOp(), Float32)
             copy_stats = partial(cute.copy, copy_atom_stats)
+            # copy_atom_stats = cute.make_copy_atom(cpasync.CopyBulkG2SMulticastOp(), Float32)
+            # sLSE = cute.logical_divide(sLSE, (64,))[(None, block_in_cluster_coord_vmnk[1]), None]
+            # gLSE = cute.logical_divide(gLSE, (64,))[(None, block_in_cluster_coord_vmnk[1]), None]
+            # sdPsum = cute.logical_divide(sdPsum, (64,))[(None, block_in_cluster_coord_vmnk[1]), None]
+            # gdPsum = cute.logical_divide(gdPsum, (64,))[(None, block_in_cluster_coord_vmnk[1]), None]
+            # copy_stats = partial(cute.copy, copy_atom_stats, mcast_mask=q_do_mcast_mask)
 
             # First iteration: load K together w Q & LSE, then V together w dO & dPsum
             # K & Q
-            pipeline_Q.producer_acquire(producer_state_Q, extra_tx_count=self.tma_copy_bytes["K"])
-            load_K(tma_bar_ptr=pipeline_Q.producer_get_barrier(producer_state_Q))
-            load_Q(m_block_min, producer_state=producer_state_Q)
-            pipeline_Q.producer_commit(producer_state_Q)
-            producer_state_Q.advance()
+            pipeline_Q.producer_acquire(
+                producer_state_Q_LSE, extra_tx_count=self.tma_copy_bytes["K"]
+            )
+            load_K(tma_bar_ptr=pipeline_Q.producer_get_barrier(producer_state_Q_LSE))
+            load_Q(m_block_min, producer_state=producer_state_Q_LSE)
+            pipeline_Q.producer_commit(producer_state_Q_LSE)
             # LSE
+            pipeline_LSE.producer_acquire(producer_state_Q_LSE)
             with cute.arch.elect_one():
-                cute.arch.mbarrier_arrive_and_expect_tx(
-                    LSE_full_mbar_ptr, self.tma_copy_bytes["LSE"]
+                copy_stats(
+                    gLSE[None, m_block_min],
+                    sLSE[None, producer_state_Q_LSE.index],
+                    mbar_ptr=pipeline_LSE.producer_get_barrier(producer_state_Q_LSE),
                 )
-                copy_stats(gLSE[None, m_block_min], sLSE[None, 0], mbar_ptr=LSE_full_mbar_ptr)
+            producer_state_Q_LSE.advance()
             # V & dO
-            pipeline_dO.producer_acquire(producer_state_dO, extra_tx_count=self.tma_copy_bytes["V"])
-            load_V(tma_bar_ptr=pipeline_dO.producer_get_barrier(producer_state_dO))
-            load_dO(m_block_min, producer_state=producer_state_dO)
-            pipeline_dO.producer_commit(producer_state_dO)
-            producer_state_dO.advance()
+            pipeline_dO.producer_acquire(
+                producer_state_dO_dPsum, extra_tx_count=self.tma_copy_bytes["V"]
+            )
+            load_V(tma_bar_ptr=pipeline_dO.producer_get_barrier(producer_state_dO_dPsum))
+            load_dO(m_block_min, producer_state=producer_state_dO_dPsum)
+            pipeline_dO.producer_commit(producer_state_dO_dPsum)
             # dPsum
+            pipeline_dPsum.producer_acquire(producer_state_dO_dPsum)
             with cute.arch.elect_one():
-                cute.arch.mbarrier_arrive_and_expect_tx(
-                    dPsum_full_mbar_ptr, self.tma_copy_bytes["dPsum"]
+                copy_stats(
+                    gdPsum[None, m_block_min],
+                    sdPsum[None, producer_state_dO_dPsum.index],
+                    mbar_ptr=pipeline_dPsum.producer_get_barrier(producer_state_dO_dPsum),
                 )
-                copy_stats(gdPsum[None, m_block_min], sdPsum[None, 0], mbar_ptr=dPsum_full_mbar_ptr)
+            producer_state_dO_dPsum.advance()
 
-            lse_empty_consumer_phase = cute.Int32(0)
-            dpsum_empty_consumer_phase = cute.Int32(0)
             for m_block in cutlass.range(m_block_min + 1, m_block_max, unroll=1):
                 # Q
-                pipeline_Q.producer_acquire(producer_state_Q)
-                load_Q(m_block, producer_state=producer_state_Q)
-                pipeline_Q.producer_commit(producer_state_Q)
-                producer_state_Q.advance()
+                pipeline_Q.producer_acquire(producer_state_Q_LSE)
+                load_Q(m_block, producer_state=producer_state_Q_LSE)
+                pipeline_Q.producer_commit(producer_state_Q_LSE)
                 # LSE
-                cute.arch.mbarrier_wait(LSE_empty_mbar_ptr, lse_empty_consumer_phase)
-                lse_empty_consumer_phase ^= 1
+                pipeline_LSE.producer_acquire(producer_state_Q_LSE)
                 with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive_and_expect_tx(
-                        LSE_full_mbar_ptr, self.tma_copy_bytes["LSE"]
+                    copy_stats(
+                        gLSE[None, m_block_min],
+                        sLSE[None, producer_state_Q_LSE.index],
+                        mbar_ptr=pipeline_LSE.producer_get_barrier(producer_state_Q_LSE),
                     )
-                    copy_stats(gLSE[None, m_block], sLSE[None, 0], mbar_ptr=LSE_full_mbar_ptr)
+                producer_state_Q_LSE.advance()
                 # dO
-                pipeline_dO.producer_acquire(producer_state_dO)
-                load_dO(m_block, producer_state=producer_state_dO)
-                pipeline_dO.producer_commit(producer_state_dO)
-                producer_state_dO.advance()
+                pipeline_dO.producer_acquire(producer_state_dO_dPsum)
+                load_dO(m_block, producer_state=producer_state_dO_dPsum)
+                pipeline_dO.producer_commit(producer_state_dO_dPsum)
                 # dPsum
-                cute.arch.mbarrier_wait(dPsum_empty_mbar_ptr, dpsum_empty_consumer_phase)
-                dpsum_empty_consumer_phase ^= 1
+                pipeline_dPsum.producer_acquire(producer_state_dO_dPsum)
                 with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive_and_expect_tx(
-                        dPsum_full_mbar_ptr, self.tma_copy_bytes["dPsum"]
+                    copy_stats(
+                        gdPsum[None, m_block_min],
+                        sdPsum[None, producer_state_dO_dPsum.index],
+                        mbar_ptr=pipeline_dPsum.producer_get_barrier(producer_state_dO_dPsum),
                     )
-                    copy_stats(gdPsum[None, m_block], sdPsum[None, 0], mbar_ptr=dPsum_full_mbar_ptr)
+                producer_state_dO_dPsum.advance()
 
-            pipeline_Q.producer_tail(producer_state_Q)
-            pipeline_dO.producer_tail(producer_state_dO)
+            pipeline_Q.producer_tail(producer_state_Q_LSE.clone())  # will hand if we don't clone
+            pipeline_dO.producer_tail(producer_state_dO_dPsum.clone())
+            pipeline_LSE.producer_tail(producer_state_Q_LSE)
+            pipeline_dPsum.producer_tail(producer_state_dO_dPsum)
 
             tile_scheduler.prefetch_next_work()
             tile_scheduler.advance_to_next_work()
@@ -1501,10 +1533,8 @@ class FlashAttentionBackwardSm100:
         mdK: cute.Tensor,
         sdS: cute.Tensor,
         tdPtdP: cute.Tensor,
-        LSE_full_mbar_ptr: cute.Pointer,
-        LSE_empty_mbar_ptr: cute.Pointer,
-        dPsum_full_mbar_ptr: cute.Pointer,
-        dPsum_empty_mbar_ptr: cute.Pointer,
+        pipeline_LSE: PipelineAsync,
+        pipeline_dPsum: PipelineAsync,
         pipeline_S_P: PipelineAsync,
         pipeline_dS: PipelineAsync,
         pipeline_dKV: PipelineAsync,
@@ -1528,14 +1558,14 @@ class FlashAttentionBackwardSm100:
         sLSE_2D = cute.make_tensor(
             sLSE.iterator,
             cute.make_layout(
-                (self.tile_m, self.tile_n, self.LSE_stage),
+                (self.tile_m, self.tile_n, self.Q_stage),
                 stride=(1, 0, cute.round_up(self.tile_m, 64)),
             ),
         )
         sdPsum_2D = cute.make_tensor(
             sdPsum.iterator,
             cute.make_layout(
-                (self.tile_m, self.tile_n, self.dPsum_stage),
+                (self.tile_m, self.tile_n, self.dO_stage),
                 stride=(1, 0, cute.round_up(self.tile_m, 64)),
             ),
         )
@@ -1605,8 +1635,13 @@ class FlashAttentionBackwardSm100:
         consumer_state_dKV = cutlass.pipeline.make_pipeline_state(
             cutlass.pipeline.PipelineUserType.Consumer, 2
         )
-
-        consumer_phase_LSE = consumer_phase_dPsum = cute.Int32(0)
+        consumer_state_LSE = cutlass.pipeline.make_pipeline_state(
+            cutlass.pipeline.PipelineUserType.Consumer, self.Q_stage
+        )
+        # consumer_state_dPsum = cutlass.pipeline.make_pipeline_state(
+        consumer_state_dPsum = pipeline.make_pipeline_state(
+            cutlass.pipeline.PipelineUserType.Consumer, self.dO_stage
+        )
 
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
@@ -1628,18 +1663,27 @@ class FlashAttentionBackwardSm100:
                 mask_local=self.is_local,
             )
 
+            # prefetch_LSE = not self.is_causal
+            prefetch_LSE = False
+
             # Mainloop
             for m_block in cutlass.range(m_block_min, m_block_max, unroll=1):
+                # Prefetch 1 stage of LSE
+                pipeline_LSE.consumer_wait(consumer_state_LSE)
+                tSrLSE_s2r = cute.make_fragment(tScS_t2r[None, 0, 0, 0].shape, Float32)
+                if const_expr(prefetch_LSE and not self.shuffle_LSE):
+                    cute.autovec_copy(tSsLSE[None, 0, 0, 0, consumer_state_LSE.index], tSrLSE_s2r)
+
                 pipeline_S_P.consumer_wait(consumer_state_S_P_dP)
                 # pipeline_S_P.sync_object_full.wait(0, consumer_phase_S_P_dP)
                 #### TMEM->RMEM (Load S from TMEM)
                 tSrS_t2r = cute.make_fragment(tScS_t2r.shape, Float32)
                 cute.copy(thr_copy_t2r, tStS_t2r, tSrS_t2r)
-                cute.arch.mbarrier_wait(LSE_full_mbar_ptr, consumer_phase_LSE)
-                consumer_phase_LSE ^= 1
 
                 #### APPLY MASK
                 mask_fn(tSrS_t2r, m_block=m_block)
+
+                num_stages = cute.size(tScS_t2r, mode=[1])
 
                 # ---------------------------------------------
                 #### P = exp(S - LSE)
@@ -1649,10 +1693,11 @@ class FlashAttentionBackwardSm100:
                 tSrP_r2t = cute.recast_tensor(tSrP_r2t_f32, self.q_dtype)
                 for stage in cutlass.range_constexpr(cute.size(tSrS_t2r, mode=[1]), unroll=1):
                     tSrS_cur = tSrS_t2r[None, stage, 0, 0]
-                    tSsLSE_cur = tSsLSE[None, stage, 0, 0, 0]  # TODO: have stages
+                    tSsLSE_cur = tSsLSE[None, stage, 0, 0, consumer_state_LSE.index]
                     if const_expr(not self.shuffle_LSE):
-                        tSrLSE = cute.make_fragment_like(tSsLSE_cur, Float32)
-                        cute.autovec_copy(tSsLSE_cur, tSrLSE)
+                        if const_expr(stage > 0 or not prefetch_LSE):
+                            cute.autovec_copy(tSsLSE_cur, tSrLSE_s2r)
+                        tSrLSE = tSrLSE_s2r
                     else:
                         tSrLSE = tSsLSE_cur[lane_idx]
                     for v in cutlass.range_constexpr(cute.size(tSrS_t2r, mode=[0]) // 2):
@@ -1688,14 +1733,14 @@ class FlashAttentionBackwardSm100:
                 with cute.arch.elect_one():
                     pipeline_S_P.consumer_release(consumer_state_S_P_dP)
                     # pipeline_S_P.sync_object_empty.arrive(0, pipeline_S_P.consumer_mask)
-                    cute.arch.mbarrier_arrive(LSE_empty_mbar_ptr)
+                pipeline_LSE.consumer_release(consumer_state_LSE)
                 # consumer_state_S_P_dP.advance()
+                consumer_state_LSE.advance()
 
                 # ---------------------------------------------
                 # dS.T = P.T * (dP.T - D)
                 # ---------------------------------------------
-                cute.arch.mbarrier_wait(dPsum_full_mbar_ptr, consumer_phase_dPsum)
-                consumer_phase_dPsum ^= 1
+                pipeline_dPsum.consumer_wait(consumer_state_dPsum)
 
                 pipeline_dP.consumer_wait(consumer_state_S_P_dP)
                 # pipeline_dP.sync_object_full.wait(0, consumer_phase_S_P_dP)
@@ -1709,7 +1754,7 @@ class FlashAttentionBackwardSm100:
                     cute.arch.fence_view_async_tmem_load()
                     tdPrdP_cur = tdPrdP_t2r[None, 0, 0]
                     tSrS_cur = tSrS_t2r[None, stage, 0, 0]
-                    tSsdPsum_cur = tSsdPsum[None, stage, 0, 0, 0]  # TODO: have stages
+                    tSsdPsum_cur = tSsdPsum[None, stage, 0, 0, consumer_state_dPsum.index]
                     if const_expr(not self.shuffle_dPsum):
                         tSrdPsum = cute.make_fragment_like(tSsdPsum_cur, Float32)
                         cute.autovec_copy(tSsdPsum_cur, tSrdPsum)
@@ -1737,10 +1782,11 @@ class FlashAttentionBackwardSm100:
                     cute.autovec_copy(tdPrdP_cvt, tRS_sdS[None, stage])
 
                 cute.arch.sync_warp()
-                with cute.arch.elect_one():
-                    # The mma warp no longer waits for dP (it waits for dS), so we don't have to arrive
-                    # pipeline_dP.sync_object_empty.arrive(0, pipeline_dP.consumer_mask)
-                    cute.arch.mbarrier_arrive(dPsum_empty_mbar_ptr)
+                # with cute.arch.elect_one():
+                # The mma warp no longer waits for dP (it waits for dS), so we don't have to arrive
+                # pipeline_dP.sync_object_empty.arrive(0, pipeline_dP.consumer_mask)
+                pipeline_dPsum.consumer_release(consumer_state_dPsum)
+                consumer_state_dPsum.advance()
 
                 cute.arch.fence_proxy(
                     cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
