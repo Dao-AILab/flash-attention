@@ -33,6 +33,7 @@ from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.softmax import SoftmaxSm100, apply_score_mod_inner
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
+from flash_attn.cute.block_sparsity import BlockSparseTensors
 from flash_attn.cute.pack_gqa import PackGQA
 from flash_attn.cute import mma_sm100_desc as sm100_desc
 from flash_attn.cute import blackwell_helpers as sm100_utils
@@ -224,10 +225,7 @@ class FlashAttentionForwardSm100:
         window_size_left: Int32 | int | None = None,
         window_size_right: Int32 | int | None = None,
         learnable_sink: Optional[cute.Tensor] = None,
-        full_block_cnt: Optional[cute.Tensor] = None,  # (b, h, m_block)
-        full_block_idx: Optional[cute.Tensor] = None,  # (b, h, m_block, n_block)
-        mask_block_cnt: Optional[cute.Tensor] = None,  # (b, h, m_block)
-        mask_block_idx: Optional[cute.Tensor] = None,  # (b, h, m_block, n_block)
+        blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors: Optional[list] = None,
     ):
         """Execute the Fused Multi-Head Attention operation on the provided tensors.
@@ -243,7 +241,6 @@ class FlashAttentionForwardSm100:
         5. Grid and work scheduling computation
         6. Kernel launch with appropriate parameters
         """
-
         # setup static attributes before smem/grid/tma computation
         self.q_dtype = mQ.element_type
         self.k_dtype = mK.element_type
