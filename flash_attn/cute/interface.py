@@ -955,10 +955,12 @@ class FlashAttnFunc(torch.autograd.Function):
             softcap=softcap,
             pack_gqa=pack_gqa,
             mask_mod=mask_mod,
-            full_block_cnt=full_block_cnt,
-            full_block_idx=full_block_idx,
-            mask_block_cnt=mask_block_cnt,
-            mask_block_idx=mask_block_idx,
+            block_sparse_tensors=BlockSparseTensorsTorch(
+                full_block_cnt=full_block_cnt,
+                full_block_idx=full_block_idx,
+                mask_block_cnt=mask_block_cnt,
+                mask_block_idx=mask_block_idx,
+            )
         )
         ctx.save_for_backward(q, k, v, out, lse)
         ctx.softmax_scale = softmax_scale
