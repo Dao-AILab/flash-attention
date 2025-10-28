@@ -842,7 +842,8 @@ def _flash_attn_bwd(
                 qhead_per_kvhead=qhead_per_kvhead,
                 # tile_m=m_block_size,
                 # tile_n=n_block_size,
-                cluster_size=2 if not causal else 2,
+                # cluster_size=2 if not causal else 2,
+                cluster_size=1 if deterministic or causal else 2,
                 deterministic=deterministic,
             )
         # TODO: check @can_implement
@@ -863,9 +864,9 @@ def _flash_attn_bwd(
             cu_seqlens_k_tensor,
             seqused_q_tensor,
             seqused_k_tensor,
-            # mdQ_semaphore=dQ_semaphore_tensor,
-            # mdK_semaphore=dK_semaphore_tensor,
-            # mdV_semaphore=dV_semaphore_tensor,
+            mdQ_semaphore=dQ_semaphore_tensor,
+            mdK_semaphore=dK_semaphore_tensor,
+            mdV_semaphore=dV_semaphore_tensor,
         )
     _flash_attn_bwd.compile_cache[compile_key](
         q_tensor,
@@ -883,9 +884,9 @@ def _flash_attn_bwd(
         cu_seqlens_k_tensor,
         seqused_q_tensor,
         seqused_k_tensor,
-        # mdQ_semaphore=dQ_semaphore_tensor,
-        # mdK_semaphore=dK_semaphore_tensor,
-        # mdV_semaphore=dV_semaphore_tensor,
+        mdQ_semaphore=dQ_semaphore_tensor,
+        mdK_semaphore=dK_semaphore_tensor,
+        mdV_semaphore=dV_semaphore_tensor,
     )
 
     num_threads = 256 if compute_capability == 9 else 128

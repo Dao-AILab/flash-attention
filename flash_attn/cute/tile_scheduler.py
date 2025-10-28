@@ -52,6 +52,7 @@ class TileSchedulerArguments(ParamsBase):
     element_size: cutlass.Constexpr[int] = 2
     is_persistent: cutlass.Constexpr[bool] = False
     lpt: cutlass.Constexpr[bool] = False
+    transposed: cutlass.Constexpr[bool] = False
 
 
 class SingleTileScheduler:
@@ -212,6 +213,8 @@ class SingleTileLPTScheduler:
         l2_major_divmod: FastDivmod
         l2_minor_residual_divmod: FastDivmod
         num_hb_quotient: Int32
+        lpt: cutlass.Constexpr[bool] = True
+        transposed: cutlass.Constexpr[bool] = False
 
         @staticmethod
         @cute.jit
@@ -219,16 +222,29 @@ class SingleTileLPTScheduler:
             args: TileSchedulerArguments, *, loc=None, ip=None
         ) -> "SingleTileLPTScheduler.Params":
             # cute.printf(args.num_block, args.num_head, args.num_batch, args.seqlen_k, args.headdim, args.headdim_v, args.total_q, args.tile_shape_mn, args.qhead_per_kvhead_packgqa, args.element_size)
-            size_one_kv_head = args.seqlen_k * (args.headdim + args.headdim_v) * args.element_size
-            size_one_head = size_one_kv_head
             size_l2 = 50 * 1024 * 1024  # 40 MB for K & V
+            if cutlass.const_expr(args.transposed):
+            # if cutlass.const_expr(False):
+                size_one_qdo_head = args.seqlen_k * (args.headdim + args.headdim_v) * args.element_size
+                # size_one_dqaccum_head = args.seqlen_k * (args.headdim) * 4
+                size_one_dqaccum_head = 0
+                size_one_head = size_one_qdo_head + size_one_dqaccum_head
+                # size_one_kv_head = args.seqlen_k * (args.headdim + args.headdim_v) * args.element_size
+                # size_one_head = size_one_kv_head
+            else:
+                size_one_kv_head = args.seqlen_k * (args.headdim + args.headdim_v) * args.element_size
+                size_one_head = size_one_kv_head
             # Swizzle is the size of each "section". Round swizzle to a power of 2
             # Need to be careful about the case where only one head will fit
             # swizzle is how many heads can fit in L2
             # swizzle = 1 if size_l2 < size_one_head else (size_l2 // size_one_head)
             # Seems faster if swizzle if a power of 2
             log2_floor = lambda n: 31 - clz(n)
-            swizzle = 1 if size_l2 < size_one_head else (1 << log2_floor(size_l2 // size_one_head))
+            # if cutlass.const_expr(args.transposed):
+            if cutlass.const_expr(False):
+                swizzle = args.num_head
+            else:
+                swizzle = 1 if size_l2 < size_one_head else (1 << log2_floor(size_l2 // size_one_head))
             # swizzle = 1 if size_l2 < size_one_head else (size_l2 // size_one_head)
             # If we're in the last section (called residual), we don't want to divide by
             # swizzle. Instead we want to divide by the remainder.
@@ -244,6 +260,8 @@ class SingleTileLPTScheduler:
                     max(num_hb_remainder, 1)
                 ),  # don't divide by 0
                 num_hb_quotient=Int32(num_hb_quotient),
+                lpt=args.lpt,
+                transposed=args.transposed,
             )
 
     def __init__(self, params: Params, tile_idx: Int32, *, loc=None, ip=None):
@@ -287,7 +305,8 @@ class SingleTileLPTScheduler:
         bidhb_actual = bidhb * params.l2_minor_divmod.divisor + bidhb_residual
         batch_idx, head_idx = params.num_head_divmod.divmod(bidhb_actual)
         # Longest-processing-time-first
-        block = params.num_block_divmod.divisor - 1 - block
+        if cutlass.const_expr(params.lpt):
+            block = params.num_block_divmod.divisor - 1 - block
         is_valid = self._tile_idx < params.total_blocks
         return cutlass.utils.WorkTileInfo(
             (Int32(block), Int32(head_idx), Int32(batch_idx)), is_valid

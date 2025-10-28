@@ -23,6 +23,7 @@ from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute.tile_scheduler import (
     TileSchedulerArguments,
     SingleTileScheduler,
+    SingleTileLPTScheduler,
     ParamsBase,
 )
 
@@ -147,13 +148,17 @@ class FlashAttentionBackwardSm100:
         self.tmem_dQ_offset = self.tmem_dP_offset  # overlap with dP
         self.tmem_dK_offset = self.tmem_dP_offset + self.tile_m
 
-        if not is_causal and not is_local:
-            self.num_regs_reduce = 152
-            self.num_regs_compute = 136
+        if (not is_causal and not is_local) or deterministic:
+            self.num_regs_reduce = 144
+            self.num_regs_compute = 144
+            self.num_regs_other = 96 - 16
+            # self.num_regs_reduce = 152
+            # self.num_regs_compute = 136
+            # self.num_regs_other = 96 - 8
         else:
             self.num_regs_reduce = 136
             self.num_regs_compute = 144
-        self.num_regs_other = 96 - 8
+            self.num_regs_other = 96 - 8
         self.num_regs_empty = 24
         assert self.num_regs_reduce + self.num_regs_compute * 2 + self.num_regs_other <= 512
 
@@ -376,7 +381,7 @@ class FlashAttentionBackwardSm100:
         semaphore_transpose = [2, 3, 1, 0]  # (b, n, block, stage) -> (block, stage, n, b)
         if const_expr(self.deterministic):
             assert mdQ_semaphore is not None
-            mdQ_semaphore = utils.select(mdQ_semaphore.layout, mode=semaphore_transpose)
+            mdQ_semaphore = utils.select(mdQ_semaphore, mode=semaphore_transpose)
         else:
             mdQ_semaphore = None
 
@@ -384,7 +389,7 @@ class FlashAttentionBackwardSm100:
             assert mdK_semaphore is not None
             assert mdV_semaphore is not None
             mdK_semaphore, mdV_semaphore = [
-                utils.select(t.layout, mode=semaphore_transpose)
+                utils.select(t, mode=semaphore_transpose)
                 for t in (mdK_semaphore, mdV_semaphore)
             ]
         else:
@@ -515,13 +520,18 @@ class FlashAttentionBackwardSm100:
         self.tma_copy_bytes["dPsum"] = self.tile_m * Float32.width // 8
         self.tma_copy_bytes["dQ"] = self.tile_m * self.dQ_reduce_ncol * Float32.width // 8
 
-        TileScheduler = SingleTileScheduler
-        # TODO -- optimizer scheduler for causal
+        if const_expr(self.is_causal or self.deterministic):
+        # if const_expr(self.is_causal):
+        # if const_expr(False):
+            TileScheduler = SingleTileLPTScheduler
+        else:
+            TileScheduler = SingleTileScheduler
+        lpt = self.is_causal and self.deterministic # SPT
         tile_sched_args = TileSchedulerArguments(
             cute.ceil_div(cute.size(mK.shape[0]), self.cta_tiler[0]),
             cute.size(mQ.shape[2]),  # num_heads = num_query_heads
-            cute.size(mK.shape[3]),
-            cute.size(mK.shape[0]),
+            cute.size(mQ.shape[3]),
+            cute.size(mQ.shape[0]), # pass seqlen_q for seqlen_k
             mQ.shape[1],
             mV.shape[1],
             total_q=cute.size(mQ.shape[0]),
@@ -532,7 +542,8 @@ class FlashAttentionBackwardSm100:
             qhead_per_kvhead_packgqa=1,
             element_size=self.k_dtype.width // 8,
             is_persistent=self.is_persistent,
-            lpt=False,
+            lpt=lpt,
+            transposed=True,
         )
 
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
@@ -1916,8 +1927,7 @@ class FlashAttentionBackwardSm100:
             if const_expr(self.deterministic):
                 mdQ_semaphore_cur = mdQ_semaphore[None, None, head_idx, batch_idx]
 
-            # delay_semaphore_release = self.is_causal
-            delay_semaphore_release = False
+            delay_semaphore_release = self.is_causal
 
             for m_block in cutlass.range(m_block_min, m_block_max, unroll=1):
                 pipeline_dQ.consumer_wait(dQ_consumer_state)
@@ -1987,7 +1997,7 @@ class FlashAttentionBackwardSm100:
 
                 # semaphore release
                 # NOTE: arrive_inc calls red_release which issues membar
-                if const_expr(self.deterministic):
+                if const_expr(self.deterministic and not delay_semaphore_release):
                     if tidx == 0:
                         cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
                     self.reduce_sync_barrier.arrive_and_wait()
@@ -2201,7 +2211,7 @@ class FlashAttentionBackwardSm100:
         pipeline_dKV.consumer_wait(consumer_state_dKV)
 
         # semaphore acquire
-        if const_expr(self.deterministic):
+        if const_expr(self.deterministic and self.qhead_per_kvhead > 1):
             barrier.wait_eq(
                 mdKV_semaphore_cur.iterator, tidx, wg_idx, head_idx % self.qhead_per_kvhead
             )
@@ -2288,7 +2298,7 @@ class FlashAttentionBackwardSm100:
 
         # semaphore release
         # NOTE: arrive_inc calls red_release which issues membar
-        if const_expr(self.deterministic):
+        if const_expr(self.deterministic and self.qhead_per_kvhead > 1):
             if leader_warp:
                 cute.arch.cp_async_bulk_commit_group()
                 cute.arch.cp_async_bulk_wait_group(0, read=read_flag)

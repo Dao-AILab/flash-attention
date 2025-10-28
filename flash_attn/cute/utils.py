@@ -71,6 +71,13 @@ def convert_from_dlpack(x, leading_dim, alignment=16, divisibility=1) -> cute.Te
         )
     )
 
+def convert_from_dlpack_leading_static(x, leading_dim, alignment=16, static_modes=None, stride_order=None) -> cute.Tensor:
+    x_ = from_dlpack(x, assumed_align=alignment)
+    for i in range(x.ndim):
+        if i != leading_dim and (static_modes is None or i not in static_modes):
+            # x_ = x_.mark_compact_shape_dynamic(mode=i, stride_order=x.dim_order())
+            x_ = x_.mark_compact_shape_dynamic(mode=i, stride_order=stride_order)
+    return x_
 
 def make_tiled_copy_A(
     copy_atom: cute.CopyAtom, tiled_mma: cute.TiledMma, swapAB: cutlass.Constexpr[bool] = False
