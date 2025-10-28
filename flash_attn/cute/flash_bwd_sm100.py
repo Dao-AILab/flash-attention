@@ -146,6 +146,7 @@ class FlashAttentionBackwardSm100:
         self.tmem_dP_offset = self.tmem_dV_offset + self.tile_hdimv
         self.tmem_dQ_offset = self.tmem_dP_offset  # overlap with dP
         self.tmem_dK_offset = self.tmem_dP_offset + self.tile_m
+        self.tmem_dS_offset = self.tmem_dP_offset  # overlap with dP
 
         if not is_causal and not is_local:
             self.num_regs_reduce = 152
@@ -200,6 +201,7 @@ class FlashAttentionBackwardSm100:
             self.pdo_acc_dtype,
             cta_group,
             self.mma_tiler_dsq[:2],
+            a_source=tcgen05.OperandSource.TMEM,
         )
         # dQ = dS @ K
         tiled_mma_dQ = sm100_utils_basic.make_trivial_tiled_mma(
@@ -263,6 +265,13 @@ class FlashAttentionBackwardSm100:
             1,
         )
         self.sdSt_layout = cute.slice_(sdSt_layout, (None, None, None, 0))
+        tdS_layout = sm100_utils_basic.make_smem_layout_a(
+            self.tiled_mma_dK,
+            self.mma_tiler_dsq,
+            self.ds_dtype,
+            1,
+        )
+        self.tdS_layout = cute.slice_(tdS_layout, (None, None, None, 0))
         self.sQt_layout = sm100_utils_basic.make_smem_layout_b(
             self.tiled_mma_dK,
             self.mma_tiler_dsq,
@@ -631,6 +640,7 @@ class FlashAttentionBackwardSm100:
             self.sdQaccum_layout,
             self.sdKV_layout,
             self.tP_layout,
+            self.tdS_layout,
             self.tiled_mma_SdP,
             self.tiled_mma_dV,
             self.tiled_mma_dK,
@@ -685,6 +695,7 @@ class FlashAttentionBackwardSm100:
         sdQaccum_layout: cute.Layout,
         sdKV_layout: cute.ComposedLayout,
         tP_layout: cute.ComposedLayout,
+        tdS_layout: cute.ComposedLayout,
         tiled_mma_SdP: cute.TiledMma,
         tiled_mma_dV: cute.TiledMma,
         tiled_mma_dK: cute.TiledMma,
@@ -877,13 +888,17 @@ class FlashAttentionBackwardSm100:
         dvacc_shape = thr_mma_dV.partition_shape_C(self.mma_tiler_pdo[:2])
         tdVtdV = thr_mma_dV.make_fragment_C(dvacc_shape)
         tdVtdV = cute.make_tensor(tmem_ptr + self.tmem_dV_offset, tdVtdV.layout)
-        tP_ptr = cute.make_ptr(self.do_dtype, self.tmem_P_offset, cute.AddressSpace.tmem)
-        tP = cute.make_tensor(tP_ptr, tP_layout.outer)
+        tP = cute.make_tensor(
+            cute.recast_ptr(tmem_ptr + self.tmem_P_offset, dtype=self.do_dtype), tP_layout.outer
+        )
         # dK
         thr_mma_dK = tiled_mma_dK.get_slice(0)
         dkacc_shape = thr_mma_dK.partition_shape_C(self.mma_tiler_dsq[:2])
         tdKtdK = thr_mma_dK.make_fragment_C(dkacc_shape)
         tdKtdK = cute.make_tensor(tmem_ptr + self.tmem_dK_offset, tdKtdK.layout)
+        tdS = cute.make_tensor(
+            cute.recast_ptr(tmem_ptr + self.tmem_dS_offset, dtype=self.ds_dtype), tdS_layout.outer
+        )
         # dQ
         thr_mma_dQ = tiled_mma_dQ.get_slice(0)
         dQacc_shape = thr_mma_dQ.partition_shape_C(self.mma_tiler_dsk[:2])
@@ -987,6 +1002,7 @@ class FlashAttentionBackwardSm100:
                 sdS,
                 sKt,
                 tP,
+                tdS,
                 tStS,
                 tdPtdP,
                 tdVtdV,
@@ -1270,6 +1286,7 @@ class FlashAttentionBackwardSm100:
         sdS: cute.Tensor,
         sKt: cute.Tensor,
         tP: cute.Tensor,
+        tdS: cute.Tensor,
         tStS: cute.Tensor,
         tdPtdP: cute.Tensor,
         tdVtdV: cute.Tensor,
@@ -1296,7 +1313,8 @@ class FlashAttentionBackwardSm100:
         tdPrV = tiled_mma_SdP.make_fragment_A(sV)
         tdPrdOt = tiled_mma_SdP.make_fragment_B(sdOt)
         # dK = dS.T @ Q
-        tdKrdS = tiled_mma_dK.make_fragment_A(sdSt)
+        # tdKrdS = tiled_mma_dK.make_fragment_A(sdSt)
+        tdKrdS = tiled_mma_dK.make_fragment_A(tdS)
         tdKrQ = tiled_mma_dK.make_fragment_B(sQt)
         # dQ = dS @ K
         tdQrdS = tiled_mma_dQ.make_fragment_A(sdS)
@@ -1309,9 +1327,7 @@ class FlashAttentionBackwardSm100:
         mma_qk_fn = partial(
             gemm_ptx_w_idx, tiled_mma_SdP, tStS, tSrK, tSrQ, sA=sK, sB=sQ, zero_init=True
         )
-        # mma_dov_fn = partial(
-        #     gemm_w_idx, tiled_mma_SdP, tdPtdP, tdPrV, tdPrdOt, zero_init=True
-        # )
+        # mma_dov_fn = partial(gemm_w_idx, tiled_mma_SdP, tdPtdP, tdPrV, tdPrdOt, zero_init=True)
         mma_dov_fn = partial(
             gemm_ptx_w_idx,
             tiled_mma_SdP,
@@ -1322,14 +1338,33 @@ class FlashAttentionBackwardSm100:
             sB=sdOt,
             zero_init=True,
         )
-        mma_pdo_fn = partial(gemm_w_idx, tiled_mma_dV, tdVtdV, tdVrP, tdVrdO)
-        # mma_pdo_fn = partial(gemm_ptx_w_idx, tiled_mma_dV, tdVtdV, tdVrP, tdVrdO, sA=None, sB=sdO)
+        # mma_pdo_fn = partial(gemm_w_idx, tiled_mma_dV, tdVtdV, tdVrP, tdVrdO)
+        mma_pdo_fn = partial(
+            gemm_ptx_w_idx,
+            tiled_mma_dV,
+            tdVtdV,
+            tdVrP,
+            tdVrdO,
+            sA=None,
+            sB=sdO,
+            tA_addr=self.tmem_P_offset,
+        )
         mma_dsk_fn = partial(gemm_w_idx, tiled_mma_dQ, tdQtdQ, tdQrdS, tdQrK, zero_init=True)
         # mma_dsk_fn = partial(
         #     gemm_ptx_w_idx, tiled_mma_dQ, tdQtdQ, tdQrdS, tdQrK, sA=sdS, sB=sKt, zero_init=True
         # )
-        mma_dsq_fn = partial(gemm_w_idx, tiled_mma_dK, tdKtdK, tdKrdS, tdKrQ)
-        # mma_dsq_fn = partial(gemm_ptx_w_idx, tiled_mma_dK, tdKtdK, tdKrdS, tdKrQ, sA=sdSt, sB=sQt)
+        # mma_dsq_fn = partial(gemm_w_idx, tiled_mma_dK, tdKtdK, tdKrdS, tdKrQ)
+        # Need to explicitly pass in tA_addr for correctness
+        mma_dsq_fn = partial(
+            gemm_ptx_w_idx,
+            tiled_mma_dK,
+            tdKtdK,
+            tdKrdS,
+            tdKrQ,
+            sA=None,
+            sB=sQt,
+            tA_addr=self.tmem_dS_offset,
+        )
 
         consumer_state_dO = cutlass.pipeline.make_pipeline_state(
             cutlass.pipeline.PipelineUserType.Consumer, self.dO_stage
@@ -1400,18 +1435,18 @@ class FlashAttentionBackwardSm100:
                 mma_qk_fn(B_idx=handle_Q_next.index)
                 pipeline_S_P.sync_object_full.arrive(0, pipeline_S_P.producer_mask, cta_group)
 
-                # 2) dQ = dS @ K
+                # 2) dK = dS.T @ Q
                 pipeline_dS.consumer_wait(consumer_state_dS)
+                mma_dsq_fn(B_idx=handle_Q.index, zero_init=not accumulate_dK)
+                accumulate_dK = True
+                handle_Q.release()
+
+                # 3) dQ = dS @ K
                 # dP uses the same tmem as dQ
                 # However, if dS is ready, then dP must have been ready, so we don't need to wait
                 # pipeline_dP.sync_object_empty.wait(0, producer_phase_acc)
                 mma_dsk_fn()
                 pipeline_dQ.sync_object_full.arrive(0, pipeline_dQ.producer_mask, cta_group)
-
-                # 3) dK = dS.T @ Q
-                mma_dsq_fn(B_idx=handle_Q.index, zero_init=not accumulate_dK)
-                accumulate_dK = True
-                handle_Q.release()
                 pipeline_dS.consumer_release(consumer_state_dS)
                 consumer_state_dS.advance()
 
@@ -1576,6 +1611,7 @@ class FlashAttentionBackwardSm100:
         # tix: [128...384]  8 warps
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())  # 4-11
         tidx = cute.arch.thread_idx()[0] % (cute.arch.WARP_SIZE * len(self.compute_warp_ids))
+        # tidx = cute.arch.thread_idx()[0] - (cute.arch.WARP_SIZE * self.compute_warp_ids[0])
         dp_idx = tidx % 128
         num_wg = len(self.compute_warp_ids) // 4  # 2
         # wg_idx:
@@ -1584,9 +1620,15 @@ class FlashAttentionBackwardSm100:
 
         tileP_f32_like = self.mma_tiler_kq[0] // 32 * self.v_dtype.width  # (128, 64)
         # tStS has shape ((128, 128), 1, 1), tStP has shape ((128, 64), 1, 1)
+        # tP overlap with tS
         tStP = cute.composition(tStS, (cute.make_layout((self.tile_n, tileP_f32_like)), 1, 1))
+        tStP = cute.make_tensor(tStS.iterator, tStP.layout)  # Otherwise the tmem address is wrong
         tScS = thr_mma_SdP.partition_C(cute.make_identity_tensor(self.mma_tiler_kq[:2]))
         tScP = cute.composition(tScS, (cute.make_layout((self.tile_n, tileP_f32_like)), 1, 1))
+        # tdS overlap with tdP
+        tdPtdS = cute.composition(tdPtdP, (cute.make_layout((self.tile_n, tileP_f32_like)), 1, 1))
+        tdPcdP = tScS
+        tdPcdS = cute.composition(tdPcdP, (cute.make_layout((self.tile_n, tileP_f32_like)), 1, 1))
 
         tmem_load_atom = cute.make_copy_atom(
             tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), Float32
@@ -1608,6 +1650,8 @@ class FlashAttentionBackwardSm100:
         thr_copy_r2t = copy_utils.make_tmem_copy(tmem_store_atom, num_wg).get_slice(tidx)
         tScP_r2t = thr_copy_r2t.partition_S(tScP)
         tStP_r2t = thr_copy_r2t.partition_D(tStP)
+        tdPcdS_r2t = thr_copy_r2t.partition_S(tdPcdS)
+        tdPtdS_r2t = thr_copy_r2t.partition_D(tdPtdS)
         # rmem -> smem
         # This part is a bit iffy, we might be making a lot of assumptions here
         copy_atom_r2s = sm100_utils_basic.get_smem_store_op(
@@ -1774,11 +1818,15 @@ class FlashAttentionBackwardSm100:
                             (tSrS_cur[2 * v], tSrS_cur[2 * v + 1]),
                             (tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1]),
                         )
-                    tdPrdP_cvt = cute.make_fragment_like(tdPrdP_cur, self.ds_dtype)
-                    utils.cvt_f16(tdPrdP_cur, tdPrdP_cvt)
+                    tdPrdS_cvt = cute.make_fragment_like(tdPrdP_cur, self.ds_dtype)
+                    utils.cvt_f16(tdPrdP_cur, tdPrdS_cvt)
                     if const_expr(stage == 0):
                         pipeline_dS.producer_acquire(producer_state_dS)
-                    cute.autovec_copy(tdPrdP_cvt, tRS_sdS[None, stage])
+                    cute.autovec_copy(tdPrdS_cvt, tRS_sdS[None, stage])
+                    tdPrdS_r2t_f32 = cute.recast_tensor(tdPrdS_cvt, Float32)
+                    cute.copy(thr_copy_r2t, tdPrdS_r2t_f32, tdPtdS_r2t[None, stage, 0, 0])
+
+                cute.arch.fence_view_async_tmem_store()
 
                 cute.arch.sync_warp()
                 # with cute.arch.elect_one():
