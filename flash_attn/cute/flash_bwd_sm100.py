@@ -1225,7 +1225,7 @@ class FlashAttentionBackwardSm100:
                 pipeline_LSE.producer_acquire(producer_state_Q_LSE)
                 with cute.arch.elect_one():
                     copy_stats(
-                        gLSE[None, m_block_min],
+                        gLSE[None, m_block],
                         sLSE[None, producer_state_Q_LSE.index],
                         mbar_ptr=pipeline_LSE.producer_get_barrier(producer_state_Q_LSE),
                     )
@@ -1238,7 +1238,7 @@ class FlashAttentionBackwardSm100:
                 pipeline_dPsum.producer_acquire(producer_state_dO_dPsum)
                 with cute.arch.elect_one():
                     copy_stats(
-                        gdPsum[None, m_block_min],
+                        gdPsum[None, m_block],
                         sdPsum[None, producer_state_dO_dPsum.index],
                         mbar_ptr=pipeline_dPsum.producer_get_barrier(producer_state_dO_dPsum),
                     )
