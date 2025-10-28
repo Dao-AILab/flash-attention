@@ -45,7 +45,7 @@ from flash_attn.cute.flash_fwd_combine import FlashAttentionForwardCombine
 from flash_attn.cute.block_sparsity import (
     BlockSparseTensorsTorch,
     to_cute_block_sparse_tensors,
-    validate_block_sparse_tensors,
+    normalize_block_sparse_tensors,
 )
 
 
@@ -261,7 +261,7 @@ def _flash_attn_fwd(
             raise ValueError("Block sparsity requires fixed-length sequences (seqlen_q must be known).")
         expected_m_blocks = (seqlen_q + m_block_size - 1) // m_block_size
         expected_n_blocks = (seqlen_k + n_block_size - 1) // n_block_size
-        validate_block_sparse_tensors(
+        block_sparse_tensors = normalize_block_sparse_tensors(
             block_sparse_tensors,
             expected_count_shape=(batch_size, num_head, expected_m_blocks),
             expected_index_shape=(batch_size, num_head, expected_m_blocks, expected_n_blocks),
