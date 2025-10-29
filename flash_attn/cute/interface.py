@@ -794,7 +794,8 @@ def _flash_attn_bwd(
                 qhead_per_kvhead=qhead_per_kvhead,
                 # tile_m=m_block_size,
                 # tile_n=n_block_size,
-                cluster_size=2 if not causal else 2,
+                cluster_size=2,
+                # cluster_size=1,
             )
         # TODO: check @can_implement
         _flash_attn_bwd.compile_cache[compile_key] = cute.compile(
