@@ -23,6 +23,7 @@ from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute.tile_scheduler import (
     TileSchedulerArguments,
     SingleTileScheduler,
+    SingleTileLPTBwdScheduler,  # noqa
     ParamsBase,
 )
 
@@ -533,6 +534,7 @@ class FlashAttentionBackwardSm100:
         self.tma_copy_bytes["dPsum"] = self.tile_m * Float32.width // 8
         self.tma_copy_bytes["dQ"] = self.tile_m * self.dQ_reduce_ncol * Float32.width // 8
 
+        # TileScheduler = SingleTileScheduler if not self.is_causal else SingleTileLPTBwdScheduler
         TileScheduler = SingleTileScheduler
         # TODO -- optimizer scheduler for causal
         tile_sched_args = TileSchedulerArguments(

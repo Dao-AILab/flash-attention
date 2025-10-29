@@ -316,7 +316,115 @@ class SingleTileLPTScheduler:
         for obj, n_items in zip([self.params, self._tile_idx], self._values_pos):
             obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
             values = values[n_items:]
-        return SingleTileLPTScheduler(*(tuple(obj_list)), loc=self._loc)
+        return self.__class__(*(tuple(obj_list)), loc=self._loc)
+
+
+class SingleTileLPTBwdScheduler:
+    @dataclass
+    class Params(ParamsBase):
+        total_blocks: Int32
+        num_head_divmod: FastDivmod
+        l2_minor_divmod: FastDivmod
+        l2_major_divmod: FastDivmod
+        l2_minor_residual_divmod: FastDivmod
+        num_hb_quotient: Int32
+        cluster_shape_mn: cutlass.Constexpr[Tuple[int, int]] = (1, 1)
+
+        @staticmethod
+        @cute.jit
+        def create(
+            args: TileSchedulerArguments, *, loc=None, ip=None
+        ) -> "SingleTileLPTBwdScheduler.Params":
+            swizzle = 8
+            # If we're in the last section (called residual), we don't want to divide by
+            # swizzle. Instead we want to divide by the remainder.
+            num_hb_quotient = (args.num_head * args.num_batch) // swizzle
+            num_hb_remainder = (args.num_head * args.num_batch) % swizzle
+            num_block = cute.ceil_div(args.num_block, args.cluster_shape_mn[0])
+            return SingleTileLPTBwdScheduler.Params(
+                total_blocks=(num_block * args.cluster_shape_mn[0]) * args.num_head * args.num_batch,
+                num_head_divmod=FastDivmod.create(args.num_head),
+                l2_minor_divmod=FastDivmod.create(swizzle),
+                l2_major_divmod=FastDivmod.create(swizzle * num_block),
+                l2_minor_residual_divmod=FastDivmod.create(
+                    max(num_hb_remainder, 1)
+                ),  # don't divide by 0
+                num_hb_quotient=Int32(num_hb_quotient),
+                cluster_shape_mn=args.cluster_shape_mn,
+            )
+
+    def __init__(self, params: Params, tile_idx: Int32, *, loc=None, ip=None):
+        self.params = params
+        self._tile_idx = tile_idx
+        self._loc = loc
+        self._ip = ip
+
+    @staticmethod
+    def to_underlying_arguments(args: TileSchedulerArguments, *, loc=None, ip=None) -> Params:
+        return SingleTileLPTBwdScheduler.Params.create(args, loc=loc, ip=ip)
+
+    @staticmethod
+    @cute.jit
+    def create(params: Params, *, loc=None, ip=None) -> "SingleTileLPTBwdScheduler":
+        tile_idx = cute.arch.block_idx()[0]
+        return SingleTileLPTBwdScheduler(params, tile_idx, loc=loc, ip=ip)
+
+    # called by host
+    @staticmethod
+    def get_grid_shape(
+        params: Params,
+        *,
+        loc=None,
+        ip=None,
+    ) -> Tuple[Int32, Int32, Int32]:
+        return (params.total_blocks, Int32(1), Int32(1))
+
+    @cute.jit
+    def get_current_work(self, *, loc=None, ip=None) -> cutlass.utils.WorkTileInfo:
+        cluster_idx = self._tile_idx // self.params.cluster_shape_mn[0]
+        params = self.params
+        # Implement LPT scheduling coordinate calculation
+        bidhb, l2_mod = params.l2_major_divmod.divmod(cluster_idx)
+        # If we're in the last section (called residual), we don't want to divide by
+        # swizzle. Instead we want to divide by the remainder.
+        block, bidhb_residual = 0, 0
+        if bidhb < params.num_hb_quotient:
+            block, bidhb_residual = params.l2_minor_divmod.divmod(l2_mod)
+        else:
+            block, bidhb_residual = params.l2_minor_residual_divmod.divmod(l2_mod)
+        bidhb_actual = bidhb * params.l2_minor_divmod.divisor + bidhb_residual
+        batch_idx, head_idx = params.num_head_divmod.divmod(bidhb_actual)
+        is_valid = self._tile_idx < params.total_blocks
+        bidx_in_cluster = cute.arch.block_in_cluster_idx()
+        block = block * params.cluster_shape_mn[0] + bidx_in_cluster[0]
+        return cutlass.utils.WorkTileInfo(
+            (Int32(block), Int32(head_idx), Int32(batch_idx)), is_valid
+        )
+
+    def initial_work_tile_info(self, *, loc=None, ip=None):
+        return self.get_current_work(loc=loc, ip=ip)
+
+    def prefetch_next_work(self, *, loc=None, ip=None):
+        pass
+
+    def advance_to_next_work(self, *, loc=None, ip=None):
+        # Single tile scheduler - set to invalid tile_idx to indicate no more work
+        self._tile_idx = self.params.total_blocks
+
+    def __extract_mlir_values__(self):
+        values, self._values_pos = [], []
+        for obj in [self.params, self._tile_idx]:
+            obj_values = cutlass.extract_mlir_values(obj)
+            values += obj_values
+            self._values_pos.append(len(obj_values))
+        return values
+
+    def __new_from_mlir_values__(self, values):
+        obj_list = []
+        for obj, n_items in zip([self.params, self._tile_idx], self._values_pos):
+            obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
+            values = values[n_items:]
+        return self.__class__(*(tuple(obj_list)), loc=self._loc)
 
 
 class SingleTileVarlenScheduler:
