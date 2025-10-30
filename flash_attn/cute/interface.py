@@ -75,6 +75,7 @@ def _flash_attn_fwd(
     m_block_size: int = 128,
     n_block_size: int = 128,
     num_threads: int = 384,
+    num_splits: int = 1,
     pack_gqa: Optional[bool] = None,
     _compute_capability: Optional[int] = None,
     score_mod: Optional[Callable] = None,
@@ -188,6 +189,8 @@ def _flash_attn_fwd(
     if softcap == 0.0:
         softcap = None
     qhead_per_kvhead = num_head // num_head_kv
+    assert num_splits > 0, "num_splits must be greater than 0"
+    is_split_kv = num_splits > 1
     if pack_gqa is None:
         pack_gqa = qhead_per_kvhead > 1
 
@@ -232,16 +235,22 @@ def _flash_attn_fwd(
         )
         assert lse.is_cuda, "lse tensor must be on CUDA device"
 
+    if is_split_kv:
+        out_partial = torch.empty(num_splits, *q_batch_seqlen_shape, num_head, head_dim_v, dtype=torch.float32, device=device)
+        lse_partial = torch.empty(num_splits, *lse_shape, dtype=torch.float32, device=device)
+
     dtype = torch2cute_dtype_map[q.dtype]
     q_tensor, k_tensor, v_tensor, o_tensor = [
         from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=t.ndim - 1)
-        for t in (q, k, v, out)
+        for t in (q, k, v, out if not is_split_kv else out_partial)
     ]
-    lse_tensor = (
-        from_dlpack(lse.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=lse.ndim - 1)
-        if lse is not None
-        else None
-    )
+    if is_split_kv:
+        lse_tensor = from_dlpack(lse_partial.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=lse_partial.ndim - 1)
+       
+    elif lse is not None:
+        lse_tensor = from_dlpack(lse.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=lse.ndim - 1)
+    else:
+        lse_tensor = None 
     (
         cu_seqlens_q_tensor,
         cu_seqlens_k_tensor,
@@ -384,6 +393,7 @@ def _flash_attn_fwd(
         m_block_size,
         n_block_size,
         num_threads,
+        is_split_kv,
         pack_gqa,
         compute_capability,
     )
@@ -399,6 +409,7 @@ def _flash_attn_fwd(
                 qhead_per_kvhead,
                 is_causal=causal,
                 is_local=local,
+                is_split_kv=is_split_kv,
                 pack_gqa=pack_gqa,
                 tile_m=m_block_size,
                 tile_n=n_block_size,
@@ -422,11 +433,13 @@ def _flash_attn_fwd(
                 qhead_per_kvhead=qhead_per_kvhead,
                 is_causal=causal,
                 is_local=local,
+                is_split_kv=is_split_kv,
                 pack_gqa=pack_gqa,
                 is_persistent=not causal
                 and not local
                 and cu_seqlens_q is None
-                and seqused_q is None,
+                and seqused_q is None
+                and not is_split_kv,
                 score_mod=score_mod,
                 has_aux_tensors=aux_tensors is not None,
             )
@@ -480,6 +493,15 @@ def _flash_attn_fwd(
         mask_block_idx_tensor,
         cute_aux_tensors,
     )
+    if is_split_kv:
+        _flash_attn_fwd_combine(
+            out_partial,
+            lse_partial.transpose(-1, -2),
+            out,
+            lse.transpose(-1, -2) if lse is not None else None,
+            cu_seqlens_q,
+            seqused_q,
+        )
     return out, lse
 
 
@@ -962,6 +984,7 @@ class FlashAttnFunc(torch.autograd.Function):
         window_size: Tuple[Optional[int], Optional[int]] = (None, None),
         learnable_sink: Optional[torch.Tensor] = None,
         softcap: float = 0.0,
+        num_splits: int = 1,
         pack_gqa: Optional[bool] = None,
         mask_mod: Optional[Callable] = None,
         full_block_cnt: Optional[torch.Tensor] = None,
@@ -979,6 +1002,7 @@ class FlashAttnFunc(torch.autograd.Function):
             window_size_right=window_size[1],
             learnable_sink=learnable_sink,
             softcap=softcap,
+            num_splits=num_splits,
             pack_gqa=pack_gqa,
             mask_mod=mask_mod,
             full_block_cnt=full_block_cnt,
@@ -1027,6 +1051,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         window_size: Tuple[Optional[int], Optional[int]] = (None, None),
         learnable_sink: Optional[torch.Tensor] = None,
         softcap: float = 0.0,
+        num_splits: int = 1,
         pack_gqa: Optional[bool] = None,
     ):
         out, lse = _flash_attn_fwd(
@@ -1044,6 +1069,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             window_size_right=window_size[1],
             learnable_sink=learnable_sink,
             softcap=softcap,
+            num_splits=num_splits,
             pack_gqa=pack_gqa,
         )
         ctx.save_for_backward(q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
@@ -1086,6 +1112,7 @@ def flash_attn_func(
     window_size: Tuple[Optional[int], Optional[int]] = (None, None),
     learnable_sink: Optional[torch.Tensor] = None,
     softcap: float = 0.0,
+    num_splits: int = 1,
     pack_gqa: Optional[bool] = None,
     mask_mod: Optional[Callable] = None,
     full_block_cnt: Optional[torch.Tensor] = None,
@@ -1102,6 +1129,7 @@ def flash_attn_func(
         window_size,
         learnable_sink,
         softcap,
+        num_splits,
         pack_gqa,
         mask_mod,
         full_block_cnt,
@@ -1125,6 +1153,7 @@ def flash_attn_varlen_func(
     window_size: Tuple[Optional[int], Optional[int]] = (None, None),
     learnable_sink: Optional[torch.Tensor] = None,
     softcap: float = 0.0,
+    num_splits: int = 1,
     pack_gqa: Optional[bool] = None,
 ):
     return FlashAttnVarlenFunc.apply(
@@ -1141,6 +1170,7 @@ def flash_attn_varlen_func(
         window_size,
         learnable_sink,
         softcap,
+        num_splits,
         pack_gqa,
     )
 
@@ -1225,12 +1255,12 @@ def _flash_attn_fwd_combine(
 
     # Convert to cute tensors (using kernel-formatted tensors)
     out_partial_tensor = from_dlpack(out_partial.detach(), assumed_align=16).mark_layout_dynamic(
-        leading_dim=4
+        leading_dim=4 if not is_varlen else 3
     )
     lse_partial_tensor = from_dlpack(lse_partial.detach(), assumed_align=4).mark_layout_dynamic(
         leading_dim=lse_partial.ndim - 2
     )
-    out_tensor = from_dlpack(out.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=3)
+    out_tensor = from_dlpack(out.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=3 if not is_varlen else 2)
     lse_tensor = (
         from_dlpack(lse.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=lse.ndim - 2)
         if lse is not None
@@ -1286,7 +1316,7 @@ def _flash_attn_fwd_combine(
             num_threads=256,
         ):
             raise RuntimeError(
-                f"FlashAttention combine kernel cannot be implemented with given parameters"
+                "FlashAttention combine kernel cannot be implemented with given parameters"
             )
 
         _flash_attn_fwd_combine.compile_cache[compile_key] = cute.compile(
@@ -1323,6 +1353,8 @@ def flash_attn_combine(
     lse_partial: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
+    cu_seqlens: Optional[torch.Tensor] = None,
+    seqused: Optional[torch.Tensor] = None,
     return_lse: bool = True,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Flash Attention combine function for split attention computation.
@@ -1340,6 +1372,8 @@ def flash_attn_combine(
             - (num_splits, total_q, num_heads) for variable length input
         out: Optional output tensor. If None, will be created automatically.
         out_dtype: Optional output dtype. If None, will use fp16/bf16 based on input.
+        cu_seqlens: Cumulative sequence lengths for variable length sequences
+        seqused: Used sequence lengths for each batch
         return_lse: Whether to return the combined LSE tensor. Default is True.
 
     Returns:
@@ -1405,5 +1439,12 @@ def flash_attn_combine(
     else:
         lse = None
 
-    _flash_attn_fwd_combine(out_partial, lse_partial, out, lse)
+    _flash_attn_fwd_combine(
+        out_partial,
+        lse_partial,
+        out,
+        lse,
+        cu_seqlens,
+        seqused,
+    )
     return out, lse

@@ -160,6 +160,7 @@ class FlashAttentionBackwardPreprocess:
             num_block=cute.ceil_div(mO.shape[1], self.m_block_size),
             num_head=num_head,
             num_batch=num_batch,
+            num_splits=1,
             seqlen_k=0,
             headdim=0,
             headdim_v=mO.shape[2],
@@ -212,13 +213,13 @@ class FlashAttentionBackwardPreprocess:
 
         tile_scheduler = TileScheduler.create(tile_sched_params)
         work_tile = tile_scheduler.initial_work_tile_info()
-        m_block, num_head, batch_size = work_tile.tile_idx
+        m_block, num_head, batch_size, _ = work_tile.tile_idx
 
         if work_tile.is_valid_tile:
             # ///////////////////////////////////////////////////////////////////////////////
             # Get the appropriate tiles for this thread block.
             # ///////////////////////////////////////////////////////////////////////////////
-            seqlen = SeqlenInfoQK(
+            seqlen = SeqlenInfoQK.create(
                 batch_size,
                 mO.shape[1],
                 0,
