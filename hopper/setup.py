@@ -695,6 +695,8 @@ setup(
     install_requires=[
         "torch",
         "einops",
+    ],
+    setup_requires=[
         "packaging",
         "ninja",
     ],
