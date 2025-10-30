@@ -29,6 +29,7 @@ from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.softmax import Softmax, apply_score_mod_inner
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
+from flash_attn.cute.block_sparsity import BlockSparseTensors
 from flash_attn.cute import pipeline
 from flash_attn.cute.pack_gqa import PackGQA
 from flash_attn.cute.named_barrier import NamedBarrierFwd
@@ -1271,10 +1272,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         window_size_left: Int32 | int | None = None,
         window_size_right: Int32 | int | None = None,
         learnable_sink: Optional[cute.Tensor] = None,
-        full_block_cnt: Optional[cute.Tensor] = None,  # (b, h, m_block)
-        full_block_idx: Optional[cute.Tensor] = None,  # (b, h, m_block, n_block)
-        mask_block_cnt: Optional[cute.Tensor] = None,  # (b, h, m_block)
-        mask_block_idx: Optional[cute.Tensor] = None,  # (b, h, m_block, n_block)
+        blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors: Optional[list] = None,
     ):
         """Configures and launches the flash attention kernel.
@@ -1289,6 +1287,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 for t in (mQ, mK, mV, mO, mLSE, mCuSeqlensQ, mCuSeqlensK, mSeqUsedQ, mSeqUsedK)
             )
         )
+
 
         # Assume all strides are divisible by 128 bits except the last stride
         new_stride = lambda t: (
@@ -1325,9 +1324,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         )
         # self.num_mma_regs = 232
         # self.num_producer_regs = 40
-        self.use_block_sparsity = const_expr(
-            mask_block_cnt is not None and full_block_cnt is not None
-        )
+        self.use_block_sparsity = cutlass.const_expr(blocksparse_tensors is not None)
+
         self.use_scheduler_barrier = (
             (self.num_mma_warp_groups >= 2 and self.tile_hdim <= 128)
             if const_expr(self.intra_wg_overlap)
@@ -1521,10 +1519,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             window_size_left,
             window_size_right,
             learnable_sink,
-            full_block_cnt,
-            full_block_idx,
-            mask_block_cnt,
-            mask_block_idx,
+            blocksparse_tensors,
             self.sQ_layout,
             self.sK_layout,
             self.sV_layout,
@@ -1571,10 +1566,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         window_size_left: Optional[Int32],
         window_size_right: Optional[Int32],
         learnable_sink: Optional[cute.Tensor],
-        full_block_cnt: Optional[cute.Tensor],
-        full_block_idx: Optional[cute.Tensor],
-        mask_block_cnt: Optional[cute.Tensor],
-        mask_block_idx: Optional[cute.Tensor],
+        blocksparse_tensors: Optional[BlockSparseTensors],
         sQ_layout: cute.ComposedLayout,
         sK_layout: cute.ComposedLayout,
         sV_layout: cute.ComposedLayout,
@@ -1698,10 +1690,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 pipeline_k,
                 pipeline_v,
                 mbar_ptr_Q,
-                full_block_cnt,
-                full_block_idx,
-                mask_block_cnt,
-                mask_block_idx,
+                blocksparse_tensors,
                 block_info,
                 SeqlenInfoCls,
                 TileSchedulerCls,
@@ -1740,10 +1729,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 SeqlenInfoCls,
                 AttentionMaskCls,
                 TileSchedulerCls,
-                full_block_cnt,
-                full_block_idx,
-                mask_block_cnt,
-                mask_block_idx,
+                blocksparse_tensors,
                 aux_tensors,
                 fastdiv_mods,
             )
@@ -1763,10 +1749,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         pipeline_k: cutlass.pipeline.PipelineAsync,
         pipeline_v: cutlass.pipeline.PipelineAsync,
         mbar_ptr_Q: cutlass.Pointer,
-        full_block_cnt: Optional[cute.Tensor],
-        full_block_idx: Optional[cute.Tensor],
-        mask_block_cnt: Optional[cute.Tensor],
-        mask_block_idx: Optional[cute.Tensor],
+        blocksparse_tensors: Optional[BlockSparseTensors],
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
@@ -1852,6 +1835,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     # ==========================================
                     # Flex Attention blocksparsity
                     # ==========================================
+                    mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx = blocksparse_tensors
                     curr_mask_block_cnt = mask_block_cnt[batch_idx, head_idx, m_block]
                     curr_full_block_idx = full_block_idx[batch_idx, head_idx, m_block, None]
                     curr_full_block_cnt = full_block_cnt[batch_idx, head_idx, m_block]
@@ -2033,10 +2017,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         SeqlenInfoCls: Callable,
         AttentionMaskCls: Callable,
         TileSchedulerCls: Callable,
-        full_block_cnt: Optional[cute.Tensor],
-        full_block_idx: Optional[cute.Tensor],
-        mask_block_cnt: Optional[cute.Tensor],
-        mask_block_idx: Optional[cute.Tensor],
+        blocksparse_tensors: Optional[BlockSparseTensors],
         aux_tensors: Optional[list],
         fastdiv_mods=None,
     ):
@@ -2263,6 +2244,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 # ==========================================
                 # Block sparsity
                 # ==========================================
+                mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx = blocksparse_tensors
                 curr_mask_block_cnt = mask_block_cnt[batch_idx, head_idx, m_block]
                 curr_mask_block_idx = mask_block_idx[batch_idx, head_idx, m_block, None]
                 curr_full_block_cnt = full_block_cnt[batch_idx, head_idx, m_block]

@@ -10,7 +10,7 @@ from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 import torch.nn.functional as F
 
 from flash_attn.cute.interface import _flash_attn_fwd
-from flash_attn.cute.block_sparsity import compute_block_sparsity
+from flash_attn.cute.block_sparsity import compute_block_sparsity, BlockSparseTensorsTorch
 from flash_attn.cute.mask_definitions import (
     MASK_FUNCTIONS,
     flex_causal_mask,
@@ -304,6 +304,14 @@ def test_mask_mod_output(
     #         print(f"  First Q block - full indices: {full_idx[0,0,0,:full_cnt[0,0,0].item()]}")
     #     if mask_cnt[0,0,0] > 0:
     #         print(f"  First Q block - mask indices: {mask_idx[0,0,0,:mask_cnt[0,0,0].item()]}")
+    block_sparse_mask = None
+    if use_mask_mod:
+        block_sparse_mask = BlockSparseTensorsTorch(
+            mask_block_cnt=mask_cnt,
+            mask_block_idx=mask_idx,
+            full_block_cnt=full_cnt,
+            full_block_idx=full_idx,
+        )
 
     out_tuple = _flash_attn_fwd(
         q=tensors["q"],
@@ -329,10 +337,7 @@ def test_mask_mod_output(
         _compute_capability=None,
         score_mod=None,
         mask_mod=mask_mod_cute,
-        full_block_cnt=full_cnt,
-        full_block_idx=full_idx,
-        mask_block_cnt=mask_cnt,
-        mask_block_idx=mask_idx,
+        block_sparse_tensors=block_sparse_mask,
         return_lse=True,
         aux_tensors=None,
     )
