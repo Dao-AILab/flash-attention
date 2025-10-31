@@ -24,6 +24,8 @@ class BlockSparseTensors(NamedTuple):
     full_block_idx: Optional[cute.Tensor]
 
     def __new_from_mlir_values__(self, values):
+        if len(values) == 2:
+            values = (*values, None, None)
         return BlockSparseTensors(*values)
 
 
@@ -34,27 +36,82 @@ class BlockSparseTensorsTorch(NamedTuple):
     full_block_idx: Optional[torch.Tensor] = None
 
 
-def validate_block_sparse_tensors(tensors: BlockSparseTensorsTorch) -> None:
-    for name, cnt, idx in (
-        ("mask", tensors.mask_block_cnt, tensors.mask_block_idx),
-        ("full", tensors.full_block_cnt, tensors.full_block_idx),
-    ):
-        if (cnt is None) != (idx is None):
-            raise ValueError(
-                f"{name}_block_cnt and {name}_block_idx must both be provided or both be None"
-            )
-        if cnt is None:
-            continue
-        if cnt.dtype != torch.int32 or idx.dtype != torch.int32:
-            raise ValueError(f"{name}_block tensors must have dtype torch.int32")
-        if cnt.device != idx.device:
-            raise ValueError(f"{name}_block_cnt and {name}_block_idx must be on the same device")
-        if not cnt.is_cuda or not idx.is_cuda:
-            raise ValueError(f"{name}_block tensors must live on CUDA")
+def _expand_sparsity_tensor(
+    tensor: torch.Tensor,
+    expected_shape: Tuple[int, ...],
+    tensor_name: str,
+) -> torch.Tensor:
+    """Check if we need to expand the tensor to expected shape, and do so if possible."""
+    needs_expand = tensor.shape != expected_shape
+    if not needs_expand:
+        return tensor
+    can_expand = all(map(lambda cur, tgt: cur == tgt or cur == 1, tensor.shape, expected_shape))
+    if not can_expand:
+        raise ValueError(
+            f"{tensor_name} with shape {tensor.shape} cannot be expanded to expected shape {expected_shape}."
+        )
+    return tensor.expand(*expected_shape).contiguous()
 
-    if tensors.full_block_cnt is not None and tensors.mask_block_cnt is not None:
-        if tensors.full_block_cnt.device != tensors.mask_block_cnt.device:
-            raise ValueError("All block sparse tensors must be on the same device")
+
+def _check_and_expand_block(
+    name: str,
+    cnt: Optional[torch.Tensor],
+    idx: Optional[torch.Tensor],
+    expected_count_shape: Tuple[int, int, int],
+    expected_index_shape: Tuple[int, int, int, int],
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    if (cnt is None) != (idx is None):
+        raise ValueError(
+            f"{name}_block_cnt and {name}_block_idx must both be provided or both be None"
+        )
+    if cnt is None or idx is None:
+        return None, None
+    if cnt.dtype != torch.int32 or idx.dtype != torch.int32:
+        raise ValueError(f"{name}_block tensors must have dtype torch.int32")
+    if cnt.device != idx.device:
+        raise ValueError(f"{name}_block_cnt and {name}_block_idx must be on the same device")
+    if not cnt.is_cuda or not idx.is_cuda:
+        raise ValueError(f"{name}_block tensors must live on CUDA")
+    expanded_cnt = _expand_sparsity_tensor(cnt, expected_count_shape, f"{name}_block_cnt")
+    expanded_idx = _expand_sparsity_tensor(idx, expected_index_shape, f"{name}_block_idx")
+    return expanded_cnt, expanded_idx
+
+
+def normalize_block_sparse_tensors(
+    tensors: BlockSparseTensorsTorch,
+    *,
+    expected_count_shape: Tuple[int, int, int],
+    expected_index_shape: Tuple[int, int, int, int],
+) -> BlockSparseTensorsTorch:
+    if tensors.mask_block_cnt is None or tensors.mask_block_idx is None:
+        raise ValueError("mask_block_cnt and mask_block_idx must be provided for block sparsity.")
+
+    mask_cnt, mask_idx = _check_and_expand_block(
+        "mask",
+        tensors.mask_block_cnt,
+        tensors.mask_block_idx,
+        expected_count_shape,
+        expected_index_shape,
+    )
+    if mask_cnt is None or mask_idx is None:
+        raise ValueError("mask_block_cnt and mask_block_idx must be provided for block sparsity.")
+
+    full_cnt, full_idx = _check_and_expand_block(
+        "full",
+        tensors.full_block_cnt,
+        tensors.full_block_idx,
+        expected_count_shape,
+        expected_index_shape,
+    )
+    if full_cnt is not None and mask_cnt.device != full_cnt.device:
+        raise ValueError("All block sparse tensors must be on the same device")
+
+    return BlockSparseTensorsTorch(
+        mask_block_cnt=mask_cnt,
+        mask_block_idx=mask_idx,
+        full_block_cnt=full_cnt,
+        full_block_idx=full_idx,
+    )
 
 
 def is_block_sparsity_enabled(tensors: BlockSparseTensorsTorch) -> bool:

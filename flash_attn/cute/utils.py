@@ -781,3 +781,8 @@ def scalar_to_ssa(a: cute.Numeric, dtype) -> cute.TensorSSA:
     vec = cute.make_fragment(1, dtype)
     vec[0] = a
     return vec.load()
+
+
+def ssa_to_scalar(val):
+    """ Could inline but nice for reflecting the above api """
+    return val[0]

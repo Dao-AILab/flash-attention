@@ -135,17 +135,23 @@ class AttentionMask:
                     # Convert to absolute column index
                     global_col_idx = thr_col_offset + col_idx_local + n_block * self.tile_n
 
-                    cond = cutlass.Boolean(
-                        mask_mod(
-                            batch_idx,
-                            head_idx,
-                            tScS_mn[r, 0][0] + m_block * self.tile_m,
-                            thr_col_offset + t0ScS_mn[0, col][1] + n_block * self.tile_n,
-                            self.seqlen_q,
-                            self.seqlen_k,
-                            aux_tensors,
-                        )
+                    batch_idx_ssa = utils.scalar_to_ssa(batch_idx, cutlass.Int32)
+                    head_idx_ssa = utils.scalar_to_ssa(head_idx, cutlass.Int32)
+                    q_idx_ssa = utils.scalar_to_ssa(
+                        tScS_mn[r, 0][0] + m_block * self.tile_m, cutlass.Int32
                     )
+                    kv_idx_ssa = utils.scalar_to_ssa(
+                        thr_col_offset + t0ScS_mn[0, col][1] + n_block * self.tile_n,
+                        cutlass.Int32,
+                    )
+                    mask_value = mask_mod(
+                        batch_idx_ssa,
+                        head_idx_ssa,
+                        q_idx_ssa,
+                        kv_idx_ssa,
+                        aux_tensors,
+                    )
+                    cond = cutlass.Boolean(utils.ssa_to_scalar(mask_value))
                     if const_expr(mask_seqlen):
                         out_of_bounds = (global_row_idx >= self.seqlen_q) or (
                             global_col_idx >= self.seqlen_k
