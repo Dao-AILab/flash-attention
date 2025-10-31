@@ -19,9 +19,14 @@ image = (
     timeout=3600,
     image=image.add_local_file("bench.py", remote_path="/root/bench.py"),
 )
-def run():
+def run(page_size: int = 128):
+    import os
+    os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+    os.environ["TORCH_USE_CUDA_DSA"] = "1"
+
     command = [
         sys.executable, "bench.py",
+        "--page_size", str(page_size),
     ]
 
     print("Command:", " ".join(command))

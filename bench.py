@@ -21,6 +21,7 @@ def benchmark(num_kv_entries, page_size, batch_size, seqlen_q, seqlen_k, nhead, 
     k_cache = torch.randn(num_pages, page_size, nhead, head_dim, device="cuda", dtype=torch.bfloat16)
     v_cache = torch.randn(num_pages, page_size, nhead, head_dim, device="cuda", dtype=torch.bfloat16)
 
+    # page_table = torch.arange(0, batch_size * pages_per_seq, device="cuda", dtype=torch.int32).reshape(batch_size, pages_per_seq)
     page_table = torch.randint(0, num_pages, (batch_size, pages_per_seq), device="cuda", dtype=torch.int32)
 
     def fn():
@@ -38,7 +39,7 @@ def benchmark(num_kv_entries, page_size, batch_size, seqlen_q, seqlen_k, nhead, 
     o_ref = attention_ref(q, k, v)[0]
     o_pytorch = attention_ref(q, k, v, upcast=True)[0]
 
-    correctness = (o - o_ref).abs().max().item() <= 2 * (o - o_pytorch).abs().max().item() + 1e-3
+    correctness = (o - o_ref).abs().max().item() <= 2 * (o_ref - o_pytorch).abs().max().item() + 1e-3
 
     if output_format == "text":
         print("Flash Attention Benchmark:")
@@ -75,7 +76,7 @@ def main():
     args.add_argument("--page_size", type=int, nargs="+", default=[128])
     args.add_argument("--batch_size", type=int, nargs="+", default=[1])
     args.add_argument("--seqlen_q", type=int, nargs="+", default=[1])
-    args.add_argument("--seqlen_k", type=int, nargs="+", default=[16384])
+    args.add_argument("--seqlen_k", type=int, nargs="+", default=[4096])
     args.add_argument("--nhead", type=int, nargs="+", default=[32])
     args.add_argument("--head_dim", type=int, nargs="+", default=[128])
     args = args.parse_args()
