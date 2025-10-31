@@ -42,8 +42,11 @@ from flash_attn.cute.flash_bwd_sm100 import FlashAttentionBackwardSm100
 from flash_attn.cute.flash_bwd_postprocess import FlashAttentionBackwardPostprocess
 from flash_attn.cute.flash_fwd_combine import FlashAttentionForwardCombine
 
-from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch, to_cute_block_sparse_tensors
-
+from flash_attn.cute.block_sparsity import (
+    BlockSparseTensorsTorch,
+    to_cute_block_sparse_tensors,
+    normalize_block_sparse_tensors,
+)
 
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
@@ -132,6 +135,7 @@ def _flash_attn_fwd(
         assert cu_seqlens_k.shape == (batch_size + 1,), (
             "cu_seqlens_k must have shape (batch_size + 1,)"
         )
+
     if cu_seqlens_q is not None:
         assert cu_seqlens_q.shape == (batch_size + 1,), (
             "cu_seqlens_q must have shape (batch_size + 1,)"
@@ -251,11 +255,18 @@ def _flash_attn_fwd(
         if page_table is not None
         else None
     )
-    sparse_tensors = (
-        to_cute_block_sparse_tensors(block_sparse_tensors)
-        if block_sparse_tensors is not None
-        else None
-    )
+    sparse_tensors = None
+    if block_sparse_tensors is not None:
+        if seqlen_q is None:
+            raise ValueError("Block sparsity requires fixed-length sequences (seqlen_q must be known).")
+        expected_m_blocks = (seqlen_q + m_block_size - 1) // m_block_size
+        expected_n_blocks = (seqlen_k + n_block_size - 1) // n_block_size
+        block_sparse_tensors = normalize_block_sparse_tensors(
+            block_sparse_tensors,
+            expected_count_shape=(batch_size, num_head, expected_m_blocks),
+            expected_index_shape=(batch_size, num_head, expected_m_blocks, expected_n_blocks),
+        )
+        sparse_tensors = to_cute_block_sparse_tensors(block_sparse_tensors)
 
     use_block_sparsity = sparse_tensors is not None
 
@@ -337,7 +348,7 @@ def _flash_attn_fwd(
 
     cute_aux_tensors = None
     if aux_tensors is not None:
-        cute_aux_tensors = [from_dlpack(buf) for buf in aux_tensors]
+        cute_aux_tensors = [from_dlpack(buf).mark_layout_dynamic() for buf in aux_tensors]
 
     compile_key = (
         dtype,
@@ -348,7 +359,7 @@ def _flash_attn_fwd(
         score_mod_hash,
         mask_mod_hash,
         use_block_sparsity,
-        aux_tensors is not None,
+        len(aux_tensors) if aux_tensors is not None else 0,
         lse is None,
         cu_seqlens_q is None,
         cu_seqlens_k is None,

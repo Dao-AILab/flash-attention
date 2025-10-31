@@ -16,10 +16,8 @@ import torch
 
 from flash_fwd import FlashAttentionForwardSm90
 from mask_definitions import (
-    MASK_FUNCTIONS,
+    get_mask_pair,
     random_doc_id_tensor,
-    create_cute_sliding_window_mask,
-    create_flex_sliding_window_mask,
 )
 from flash_attn.cute.block_sparsity import (
     compute_block_sparsity,
@@ -99,12 +97,12 @@ class FlashAttentionBenchmark:
             config.use_mask_mod = False
 
         if config.use_mask_mod:
-            if config.mask_mod_name == "sliding_window":
-                # Use factory function for custom window size
-                self.mask_mod_cute = create_cute_sliding_window_mask(config.window_size)
-                self.mask_mod_flex = create_flex_sliding_window_mask(config.window_size)
-            else:
-                self.mask_mod_cute, self.mask_mod_flex = MASK_FUNCTIONS[config.mask_mod_name]
+            self.mask_mod_cute, self.mask_mod_flex = get_mask_pair(
+                config.mask_mod_name,
+                seqlen_q=config.seqlen_q,
+                seqlen_k=config.seqlen_k,
+                window_size=config.window_size,
+            )
         else:
             self.mask_mod_cute = None
             self.mask_mod_flex = None
