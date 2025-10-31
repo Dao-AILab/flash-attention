@@ -54,7 +54,7 @@ class PagedKVManager(ParamsBase):
         dtype: Type[cutlass.Numeric],
     ):
         universal_copy_bits = 128
-        gmem_threads_per_row = 1
+        gmem_threads_per_row = 8
         copy_elems = universal_copy_bits // dtype.width
         atom_universal_copy = cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(),
@@ -114,7 +114,7 @@ class PagedKVManager(ParamsBase):
     @cute.jit
     def load_page_table(self, n_block: Int32):
         for i in cutlass.range(self.page_entry_per_thread, unroll=1):
-            row = i * self.num_threads + self.thread_idx
+            row = (i * self.num_threads + self.thread_idx) // self.gmem_threads_per_row
             row_idx = n_block * self.n_block_size + row
 
             page_idx, page_offset = self.page_size_divmod.divmod(row_idx + self.leftpad_k)
@@ -148,9 +148,6 @@ class PagedKVManager(ParamsBase):
         cX = cute.make_identity_tensor((self.n_block_size, head_dim))
         tXsX = self.gmem_thr_copy_KV.partition_D(sX_pi)
         tXcX = self.gmem_thr_copy_KV.partition_S(cX)
-
-        print("sX_pi: ", sX_pi)
-        print("tXsX: ", tXsX)
 
         seqlenk_row_limit = self.seqlen_k - n_block * self.n_block_size
         for m in cutlass.range(cute.size(tXsX, mode=[1]), unroll=1):
