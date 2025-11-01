@@ -3,6 +3,7 @@ from dataclasses import dataclass
 
 import cutlass
 import cutlass.cute as cute
+from cutlass.cute.nvgpu import cpasync
 from cutlass import Int32, const_expr
 
 from flash_attn.cute import utils
@@ -27,7 +28,7 @@ class PagedKVManager(ParamsBase):
 
     gmem_threads_per_row: cutlass.Constexpr[Int32]
     page_entry_per_thread: Int32
-    copy_elems: Int32
+    async_copy_elems: Int32
 
     gmem_tiled_copy_KV: cute.TiledCopy
     gmem_thr_copy_KV: cute.TiledCopy
@@ -54,10 +55,10 @@ class PagedKVManager(ParamsBase):
         dtype: Type[cutlass.Numeric],
     ):
         universal_copy_bits = 128
-        gmem_threads_per_row = 8
-        copy_elems = universal_copy_bits // dtype.width
-        atom_universal_copy = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(),
+        gmem_threads_per_row = 8  # 8 threads loading 128 bits = 128 bytes = 1 cache line
+        async_copy_elems = universal_copy_bits // dtype.width
+        atom_async_copy = cute.make_copy_atom(
+            cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
             dtype,
             num_bits_per_copy=universal_copy_bits,
         )
@@ -65,8 +66,8 @@ class PagedKVManager(ParamsBase):
             (num_threads // gmem_threads_per_row, gmem_threads_per_row),
             order=(1, 0),
         )
-        val_layout = cute.make_layout((1, copy_elems))
-        gmem_tiled_copy_KV = cute.make_tiled_copy_tv(atom_universal_copy, thr_layout, val_layout)
+        val_layout = cute.make_layout((1, async_copy_elems))
+        gmem_tiled_copy_KV = cute.make_tiled_copy_tv(atom_async_copy, thr_layout, val_layout)
         gmem_thr_copy_KV = gmem_tiled_copy_KV.get_slice(thread_idx)
         page_entry_per_thread = n_block_size * gmem_threads_per_row // num_threads
 
@@ -102,7 +103,7 @@ class PagedKVManager(ParamsBase):
             head_dim_v_padded,
             gmem_threads_per_row,
             page_entry_per_thread,
-            copy_elems,
+            async_copy_elems,
             gmem_tiled_copy_KV,
             gmem_thr_copy_KV,
             tPrPage,
@@ -160,11 +161,11 @@ class PagedKVManager(ParamsBase):
                 if const_expr(K_or_V == "K")
                 else self.mV_paged[None, page_offset, page]
             )
-            mX_paged_cur_copy = cute.tiled_divide(mX_paged_cur, (self.copy_elems,))
+            mX_paged_cur_copy = cute.tiled_divide(mX_paged_cur, (self.async_copy_elems,))
 
             if should_load:
                 for k in cutlass.range(cute.size(tXsX, mode=[2]), unroll=1):
-                    ki = tXcX[0, 0, k][1] // self.copy_elems
+                    ki = tXcX[0, 0, k][1] // self.async_copy_elems
                     cute.copy(
                         self.gmem_tiled_copy_KV,
                         mX_paged_cur_copy[None, ki],

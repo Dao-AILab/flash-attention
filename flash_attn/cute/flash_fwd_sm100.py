@@ -378,9 +378,6 @@ class FlashAttentionForwardSm100:
             self.epi_tile,
             self.epi_stage,
         )
-        print("sK_layout: ", sK_layout)
-        print("sV_layout: ", sV_layout)
-        print("sO_layout: ", sO_layout)
         if const_expr(not self.same_hdim_kv_padded):
             # sK and sV are using the same physical smem so we need to adjust the stride so that they line up
             stride_sK = const_expr(
@@ -2324,7 +2321,8 @@ class FlashAttentionForwardSm100:
         else:
             assert paged_kv_manager is not None
             paged_kv_manager.load_KV(block, sX[None, None, None, stage], K_or_V)
-            cute.arch.mbarrier_arrive(mbar_full_ptr + stage)
+            cute.arch.cp_async_commit_group()
+            cute.arch.cp_async_mbarrier_arrive_noinc(mbar_full_ptr + stage)
 
     @cute.jit
     def offset_kv_smem(self, sX: cute.Tensor, stage: Int32, phase: Int32):
