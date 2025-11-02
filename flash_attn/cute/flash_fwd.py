@@ -32,6 +32,7 @@ from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute.block_sparsity import (
     BlockSparseTensors,
     process_sparse_block_lists_for_tile,
+    consume_sparse_block_lists_for_tile,
 )
 from flash_attn.cute import pipeline
 from flash_attn.cute.pack_gqa import PackGQA
@@ -2113,143 +2114,30 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 # ==========================================
                 # Block sparsity
                 # ==========================================
-                mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx = blocksparse_tensors
-                curr_mask_block_cnt = mask_block_cnt[batch_idx, head_idx, m_block]
-                curr_mask_block_idx = mask_block_idx[batch_idx, head_idx, m_block, None]
-                curr_full_block_cnt = full_block_cnt[batch_idx, head_idx, m_block]
-                curr_full_block_idx = full_block_idx[batch_idx, head_idx, m_block, None]
+                (
+                    kv_consumer_state,
+                    O_should_accumulate,
+                    processed_any_blocks,
+                ) = consume_sparse_block_lists_for_tile(
+                    blocksparse_tensors,
+                    batch_idx,
+                    head_idx,
+                    m_block,
+                    kv_consumer_state,
+                    mma_pv_fn,
+                    mma_one_n_block,
+                    process_first_half_block,
+                    process_last_half_block,
+                    mask_fn,
+                    score_mod_fn,
+                    O_should_accumulate,
+                    self.mask_mod,
+                    self.intra_wg_overlap,
+                    self.warp_scheduler_barrier_sync,
+                    self.warp_scheduler_barrier_arrive,
+                )
 
-                # first masked and full blocks
-                mask_n_block = 0
-                full_n_block = 0
-                if curr_mask_block_cnt > 0:
-                    mask_n_block = curr_mask_block_idx[curr_mask_block_cnt - 1]
-                if curr_full_block_cnt > 0:
-                    full_n_block = curr_full_block_idx[curr_full_block_cnt - 1]
-
-                if const_expr(not self.intra_wg_overlap):
-                    # ==========================================
-                    # Non-overlap path
-                    # ==========================================
-                    if curr_mask_block_cnt > 0:
-                        self.warp_scheduler_barrier_sync()
-                        kv_consumer_state = mma_one_n_block(
-                            kv_consumer_state,
-                            n_block=mask_n_block,
-                            mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
-                            mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=True),
-                            is_first_n_block=True,
-                        )
-                        O_should_accumulate = True
-                        for i in cutlass.range(1, curr_mask_block_cnt):
-                            mask_n_block = curr_mask_block_idx[curr_mask_block_cnt - 1 - i]
-                            kv_consumer_state = mma_one_n_block(
-                                kv_consumer_state,
-                                n_block=mask_n_block,
-                                mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
-                                mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=False),
-                                is_first_n_block=False,
-                            )
-                        if curr_full_block_cnt == 0:
-                            self.warp_scheduler_barrier_arrive()
-
-                    if curr_full_block_cnt > 0:
-                        if curr_mask_block_cnt == 0:
-                            self.warp_scheduler_barrier_sync()
-                            kv_consumer_state = mma_one_n_block(
-                                kv_consumer_state,
-                                n_block=full_n_block,
-                                mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
-                                mask_fn=partial(mask_fn, mask_seqlen=True),
-                                is_first_n_block=True,
-                            )
-                            O_should_accumulate = True
-                        else:
-                            kv_consumer_state = mma_one_n_block(
-                                kv_consumer_state,
-                                n_block=full_n_block,
-                                mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
-                                mask_fn=partial(mask_fn, mask_seqlen=True),
-                                is_first_n_block=False,
-                            )
-                            O_should_accumulate = True
-                        for i in cutlass.range(1, curr_full_block_cnt):
-                            full_n_block = curr_full_block_idx[curr_full_block_cnt - 1 - i]
-                            kv_consumer_state = mma_one_n_block(
-                                kv_consumer_state,
-                                n_block=full_n_block,
-                                mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
-                                mask_fn=partial(mask_fn, mask_seqlen=False),
-                                is_first_n_block=False,
-                            )
-                        self.warp_scheduler_barrier_arrive()
-                else:
-                    # ==========================================
-                    # Overlap path
-                    # ==========================================
-
-                    # Process first block
-                    if curr_mask_block_cnt > 0:
-                        kv_consumer_state = process_first_half_block(
-                            n_block=mask_n_block,
-                            kv_consumer_state=kv_consumer_state,
-                            mask_fn=partial(mask_fn, mask_mod=self.mask_mod),
-                            score_mod_fn=score_mod_fn,
-                            is_first_block=True,
-                        )
-
-                        # Process remaining mask blocks
-                        for i in cutlass.range(1, curr_mask_block_cnt):
-                            mask_n_block = curr_mask_block_idx[curr_mask_block_cnt - 1 - i]
-                            kv_consumer_state = mma_one_n_block(
-                                kv_consumer_state,
-                                n_block=mask_n_block,
-                                mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
-                                mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=False),
-                            )
-                            O_should_accumulate = True
-
-                    # Process full blocks
-                    if curr_full_block_cnt > 0:
-                        # If no mask blocks, first full block is the overall first
-                        if curr_mask_block_cnt == 0:
-                            kv_consumer_state = process_first_half_block(
-                                n_block=full_n_block,
-                                kv_consumer_state=kv_consumer_state,
-                                mask_fn=partial(mask_fn, mask_mod=None),
-                                score_mod_fn=score_mod_fn,
-                                is_first_block=True,
-                            )
-
-                        else:
-                            kv_consumer_state = mma_one_n_block(
-                                kv_consumer_state,
-                                n_block=full_n_block,
-                                mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
-                                mask_fn=partial(mask_fn, mask_mod=None, mask_seqlen=True),
-                            )
-                            O_should_accumulate = True
-
-                        # Process remaining full blocks
-                        for i in cutlass.range(1, curr_full_block_cnt):
-                            full_n_block = curr_full_block_idx[curr_full_block_cnt - 1 - i]
-                            kv_consumer_state = mma_one_n_block(
-                                kv_consumer_state,
-                                n_block=full_n_block,
-                                mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
-                                mask_fn=partial(mask_fn, mask_mod=None, mask_seqlen=False),
-                            )
-                            O_should_accumulate = True
-
-                    # Final PV gemm for last block
-                    if curr_mask_block_cnt > 0 or curr_full_block_cnt > 0:
-                        kv_consumer_state = process_last_half_block(
-                            kv_consumer_state=kv_consumer_state,
-                            zero_init=not O_should_accumulate,
-                        )
-                        O_should_accumulate = True
-
-                if curr_mask_block_cnt + curr_full_block_cnt == 0:
+                if not processed_any_blocks:
                     softmax.reset()
                     acc_O.fill(0.0)
 
