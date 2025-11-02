@@ -1,1 +1,0 @@
-# Dummy file to make `modal run -m main` work
