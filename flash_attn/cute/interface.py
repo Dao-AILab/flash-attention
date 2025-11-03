@@ -955,6 +955,15 @@ class FlashAttnFunc(torch.autograd.Function):
         mask_block_cnt: Optional[torch.Tensor] = None,
         mask_block_idx: Optional[torch.Tensor] = None,
     ):
+        # Only create block sparse tensors if at least one block sparse parameter is provided
+        block_sparse_tensors = None
+        if any(t is not None for t in [full_block_cnt, full_block_idx, mask_block_cnt, mask_block_idx]):
+            block_sparse_tensors = BlockSparseTensorsTorch(
+                full_block_cnt=full_block_cnt,
+                full_block_idx=full_block_idx,
+                mask_block_cnt=mask_block_cnt,
+                mask_block_idx=mask_block_idx,
+            )
         out, lse = _flash_attn_fwd(
             q,
             k,
@@ -967,12 +976,7 @@ class FlashAttnFunc(torch.autograd.Function):
             softcap=softcap,
             pack_gqa=pack_gqa,
             mask_mod=mask_mod,
-            block_sparse_tensors=BlockSparseTensorsTorch(
-                full_block_cnt=full_block_cnt,
-                full_block_idx=full_block_idx,
-                mask_block_cnt=mask_block_cnt,
-                mask_block_idx=mask_block_idx,
-            )
+            block_sparse_tensors=block_sparse_tensors
         )
         ctx.save_for_backward(q, k, v, out, lse)
         ctx.softmax_scale = softmax_scale
