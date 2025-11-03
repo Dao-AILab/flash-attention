@@ -255,11 +255,25 @@ def _flash_attn_fwd(
         if page_table is not None
         else None
     )
+    compute_capability = (
+        torch.cuda.get_device_capability()[0]
+        if _compute_capability is None
+        else _compute_capability
+    )
+
+    assert compute_capability in [9, 10], "Unsupported compute capability. Supported: 9.x, 10.x"
+
+
     sparse_tensors = None
     if block_sparse_tensors is not None:
         if seqlen_q is None:
             raise ValueError("Block sparsity requires fixed-length sequences (seqlen_q must be known).")
-        expected_m_blocks = (seqlen_q + m_block_size - 1) // m_block_size
+        m_block_size_block = m_block_size
+        if compute_capability == 10:
+            # TODO: This multiplier shoudl really be q_stage, wire up in later PR
+            # 1 cta handles 2*tile_m row
+            m_block_size_block = 2 * m_block_size
+        expected_m_blocks = (seqlen_q + m_block_size_block - 1) // m_block_size_block
         expected_n_blocks = (seqlen_k + n_block_size - 1) // n_block_size
         block_sparse_tensors = normalize_block_sparse_tensors(
             block_sparse_tensors,
@@ -282,12 +296,6 @@ def _flash_attn_fwd(
     else:
         causal, local = False, False
 
-    compute_capability = (
-        torch.cuda.get_device_capability()[0]
-        if _compute_capability is None
-        else _compute_capability
-    )
-    assert compute_capability in [9, 10], "Unsupported compute capability. Supported: 9.x, 10.x"
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     if compute_capability == 9:  # TODO: tune block size according to hdim.
@@ -375,7 +383,6 @@ def _flash_attn_fwd(
         pack_gqa,
         compute_capability,
     )
-
     if compile_key not in _flash_attn_fwd.compile_cache:
         if compute_capability == 9:
             assert page_table is None, "paged KV not supported on SM 9.0"
@@ -411,6 +418,8 @@ def _flash_attn_fwd(
                 is_causal=causal,
                 is_local=local,
                 pack_gqa=pack_gqa,
+                m_block_size=m_block_size,
+                n_block_size=n_block_size,
                 is_persistent=not causal
                 and not local
                 and cu_seqlens_q is None

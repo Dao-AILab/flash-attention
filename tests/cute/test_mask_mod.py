@@ -28,7 +28,19 @@ from flash_attn.cute.mask_definitions import (
     random_doc_id_tensor,
 )
 from flash_attn.cute.testing import attention_ref
+COMPUTE_CAPABILITY = torch.cuda.get_device_capability()[0]
 
+
+@pytest.fixture(autouse=True)
+def reset_torch_state():
+    """Reset torch dynamo/compile state between tests to avoid state pollution."""
+    torch._dynamo.reset()
+    torch.cuda.empty_cache()
+
+    yield
+
+    torch._dynamo.reset()
+    torch.cuda.empty_cache()
 
 def create_tensors(
     batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, headdim, headdim_v, dtype
@@ -142,6 +154,7 @@ SEQLEN_PAIRS_SMOKE = [
     (256, 256),
     (113, 203),
     (1024, 1024),
+    (128, 8192)
 ]
 
 
@@ -208,6 +221,11 @@ def _run_mask_test(
     )
 
     # Compute block sparsity for mask_mod
+    if COMPUTE_CAPABILITY == 10:
+        sparse_tile_m = 2 * tile_m
+    else:
+        sparse_tile_m = tile_m
+
     bm = create_block_mask(
         mask_mod_flex,
         batch_size,
@@ -215,7 +233,7 @@ def _run_mask_test(
         seqlen_q,
         seqlen_k,
         device="cuda",
-        BLOCK_SIZE=(tile_m, tile_n),
+        BLOCK_SIZE=(sparse_tile_m, tile_n),
     )
     _, _, mask_cnt, mask_idx, full_cnt, full_idx, *_ = bm.as_tuple()
 
@@ -348,6 +366,9 @@ def test_static_masks(
     - block_diagonal: Masks by 64-element diagonal blocks
     - mini_causal: Local causal within 128-element tiles
     """
+    if COMPUTE_CAPABILITY == 10 and (tile_m, tile_n) != (128, 128):
+        pytest.skip("TODO: Non-128x128 tiles currently not supported on SM 10.0. due to TMEM")
+
     _run_mask_test(
         seqlen_q=seqlen_q,
         seqlen_k=seqlen_k,
@@ -393,6 +414,9 @@ def test_parameterized_masks(
     - sliding_window: Requires window size and offset parameters
     - document: Slower to check
     """
+    if COMPUTE_CAPABILITY == 10 and (tile_m, tile_n) != (128, 128):
+        pytest.skip("TODO: Non-128x128 tiles currently not supported on SM 10.0. due to TMEM")
+
     _run_mask_test(
         seqlen_q=seqlen_q,
         seqlen_k=seqlen_k,
