@@ -13,7 +13,7 @@ from functools import partial
 import torch
 import cutlass
 import cutlass.cute as cute
-from cutlass import const_expr
+from cutlass import Int32, const_expr
 from cutlass.cute.runtime import from_dlpack
 
 # placeholder
@@ -396,6 +396,231 @@ def process_sparse_block_lists_for_tile(
                     tma_q_bytes=tma_q_bytes,
                     intra_wg_overlap=intra_wg_overlap,
                 )
+
+    return kv_producer_state
+
+
+# SM100-specific helpers (no extra_tx_count support in PipelineTmaUmma)
+@cute.jit
+def process_block_list_sm100(
+    block_indices: cute.Tensor,
+    block_count,
+    load_q_with_first: cutlass.Constexpr,
+    m_block,
+    q_stage: cutlass.Constexpr,
+    kv_producer_state,
+    load_Q,
+    load_K,
+    load_V,
+    pipeline_kv,
+):
+    """SM100 version of process_block_list (no intra_wg_overlap, no extra_tx_count)."""
+    if block_count > 0:
+        # First iteration: load Q alongside K if requested
+        n_block_first = block_indices[block_count - 1]
+
+        if const_expr(load_q_with_first):
+            # SM100 loads Q0 and optionally Q1
+            load_Q(block=q_stage * m_block + 0, stage=0)
+            if const_expr(q_stage == 2):
+                load_Q(block=q_stage * m_block + 1, stage=1)
+
+        # SM100 doesn't use producer_acquire for pipeline_kv in load path
+        # The pipeline barriers are handled inside load_KV
+        load_K(block=n_block_first, producer_state=kv_producer_state, page_idx=None)
+        kv_producer_state.advance()
+        load_V(block=n_block_first, producer_state=kv_producer_state, page_idx=None)
+        kv_producer_state.advance()
+
+        # Remaining blocks
+        for offset in cutlass.range(1, block_count):
+            n_block = block_indices[block_count - 1 - offset]
+            load_K(block=n_block, producer_state=kv_producer_state, page_idx=None)
+            kv_producer_state.advance()
+            load_V(block=n_block, producer_state=kv_producer_state, page_idx=None)
+            kv_producer_state.advance()
+
+    return kv_producer_state
+
+
+@cute.jit
+def softmax_loop_sparse_sm100(
+    blocksparse_tensors: BlockSparseTensors,
+    batch_idx,
+    head_idx,
+    m_block,
+    softmax_step: Callable,
+    mask_fn: Callable,
+    mask_fn_none: Callable,
+    mma_si_consumer_phase: Int32,
+    si_corr_producer_phase: Int32,
+    s0_s1_sequence_phase: Int32,
+):
+    mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx = blocksparse_tensors
+
+    curr_mask_block_cnt = mask_block_cnt[batch_idx, head_idx, m_block]
+    curr_mask_block_idx = mask_block_idx[batch_idx, head_idx, m_block, None]
+
+    if const_expr(full_block_cnt is not None):
+        curr_full_block_cnt = full_block_cnt[batch_idx, head_idx, m_block]
+        curr_full_block_idx = full_block_idx[batch_idx, head_idx, m_block, None]
+    else:
+        curr_full_block_cnt = Int32(0)
+        curr_full_block_idx = None
+
+    if curr_mask_block_cnt > 0:
+        mask_n_block = curr_mask_block_idx[curr_mask_block_cnt - 1]
+        (
+            mma_si_consumer_phase,
+            si_corr_producer_phase,
+            s0_s1_sequence_phase,
+        ) = softmax_step(
+            mma_si_consumer_phase,
+            si_corr_producer_phase,
+            s0_s1_sequence_phase,
+            mask_n_block,
+            is_first=True,
+            mask_fn=partial(mask_fn, mask_seqlen=True),  # last block could oob
+        )
+        for i in cutlass.range(1, curr_mask_block_cnt):
+            mask_n_block = curr_mask_block_idx[curr_mask_block_cnt - 1 - i]
+            (
+                mma_si_consumer_phase,
+                si_corr_producer_phase,
+                s0_s1_sequence_phase,
+            ) = softmax_step(
+                mma_si_consumer_phase,
+                si_corr_producer_phase,
+                s0_s1_sequence_phase,
+                mask_n_block,
+                mask_fn=partial(mask_fn, mask_seqlen=False),
+            )
+
+    if curr_full_block_cnt > 0:
+        full_n_block = curr_full_block_idx[curr_full_block_cnt - 1]
+        if curr_mask_block_cnt == 0:
+            (
+                mma_si_consumer_phase,
+                si_corr_producer_phase,
+                s0_s1_sequence_phase,
+            ) = softmax_step(
+                mma_si_consumer_phase,
+                si_corr_producer_phase,
+                s0_s1_sequence_phase,
+                full_n_block,
+                is_first=True,
+                mask_fn=partial(mask_fn_none, mask_seqlen=True),
+            )
+        else:
+            (
+                mma_si_consumer_phase,
+                si_corr_producer_phase,
+                s0_s1_sequence_phase,
+            ) = softmax_step(
+                mma_si_consumer_phase,
+                si_corr_producer_phase,
+                s0_s1_sequence_phase,
+                full_n_block,
+                is_first=False,
+                mask_fn=partial(mask_fn_none, mask_seqlen=False),
+            )
+        for i in cutlass.range(1, curr_full_block_cnt):
+            full_n_block = curr_full_block_idx[curr_full_block_cnt - 1 - i]
+            (
+                mma_si_consumer_phase,
+                si_corr_producer_phase,
+                s0_s1_sequence_phase,
+            ) = softmax_step(
+                mma_si_consumer_phase,
+                si_corr_producer_phase,
+                s0_s1_sequence_phase,
+                full_n_block,
+                mask_fn=partial(mask_fn_none, mask_seqlen=False),
+            )
+
+    return mma_si_consumer_phase, si_corr_producer_phase, s0_s1_sequence_phase
+
+
+# SM100-specific tile processor using SM100 helpers
+@cute.jit
+def process_sparse_block_lists_for_tile_sm100(
+    blocksparse_tensors: BlockSparseTensors,
+    batch_idx,
+    head_idx,
+    m_block,
+    kv_producer_state,
+    load_Q,
+    load_K,
+    load_V,
+    pipeline_kv,
+    q_stage: cutlass.Constexpr,
+    q_producer_phase: Int32,
+):
+    """SM100 entry point for sparse block iteration.
+
+    SM100 uses PipelineTmaUmma which doesn't support extra_tx_count, so we use
+    simplified block processing that just calls producer_acquire without extras.
+    """
+    mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx = blocksparse_tensors
+
+    curr_mask_block_cnt = mask_block_cnt[batch_idx, head_idx, m_block]
+    curr_mask_block_idx = mask_block_idx[batch_idx, head_idx, m_block, None]
+    curr_full_block_cnt = full_block_cnt[batch_idx, head_idx, m_block]
+    curr_full_block_idx = full_block_idx[batch_idx, head_idx, m_block, None]
+
+    mask_empty = curr_mask_block_cnt == 0
+    full_empty = curr_full_block_cnt == 0
+
+    q_phase_flipped = False
+
+    if mask_empty:
+        # No masked blocks: process full list with Q loading
+        kv_producer_state = process_block_list_sm100(
+            curr_full_block_idx,
+            curr_full_block_cnt,
+            load_q_with_first=True,
+            m_block=m_block,
+            q_stage=q_stage,
+            kv_producer_state=kv_producer_state,
+            load_Q=load_Q,
+            load_K=load_K,
+            load_V=load_V,
+            pipeline_kv=pipeline_kv,
+        )
+        q_phase_flipped = not full_empty
+    else:
+        # Process masked blocks with Q loading
+        kv_producer_state = process_block_list_sm100(
+            curr_mask_block_idx,
+            curr_mask_block_cnt,
+            load_q_with_first=True,
+            m_block=m_block,
+            q_stage=q_stage,
+            kv_producer_state=kv_producer_state,
+            load_Q=load_Q,
+            load_K=load_K,
+            load_V=load_V,
+            pipeline_kv=pipeline_kv,
+        )
+        q_phase_flipped = True
+
+        if not full_empty:
+            # Process full blocks without Q loading
+            kv_producer_state = process_block_list_sm100(
+                curr_full_block_idx,
+                curr_full_block_cnt,
+                load_q_with_first=False,
+                m_block=m_block,
+                q_stage=q_stage,
+                kv_producer_state=kv_producer_state,
+                load_Q=load_Q,
+                load_K=load_K,
+                load_V=load_V,
+                pipeline_kv=pipeline_kv,
+            )
+
+    if q_phase_flipped:
+        q_producer_phase ^= 1
 
     return kv_producer_state
 
