@@ -404,8 +404,6 @@ def _flash_attn_fwd(
             assert page_size in [None, 128], (
                 "Only page_size=128 is supported for paged KV on SM 10.0"
             )
-            if sparse_tensors is not None:
-                raise NotImplementedError("BlockSparsity not yet supported on SM 10.0")
             fa_fwd = FlashAttentionForwardSm100(
                 head_dim,
                 head_dim_v,
@@ -418,6 +416,7 @@ def _flash_attn_fwd(
                 and cu_seqlens_q is None
                 and seqused_q is None,
                 score_mod=score_mod,
+                mask_mod=mask_mod,
                 has_aux_tensors=aux_tensors is not None,
             )
         else:

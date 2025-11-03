@@ -73,6 +73,7 @@ class FlashAttentionForwardSm100:
         n_block_size: int = 128,
         is_persistent: bool = True,
         score_mod: cutlass.Constexpr | None = None,
+        mask_mod: cutlass.Constexpr | None = None,
         has_aux_tensors: cutlass.Constexpr = False,
     ):
         # self.dtype = dtype
@@ -107,6 +108,7 @@ class FlashAttentionForwardSm100:
                 "For PackGQA, m_block_size must be divisible by qhead_per_kvhead"
             )
         self.score_mod = score_mod
+        self.mask_mod = mask_mod
         if cutlass.const_expr(has_aux_tensors):
             self.vec_size: cutlass.Constexpr = 1
         else:
@@ -1459,6 +1461,10 @@ class FlashAttentionForwardSm100:
                 thr_tmem_load=thr_tmem_load,
                 mask_causal=self.is_causal,
                 mask_local=self.is_local,
+                mask_mod=self.mask_mod,
+                batch_idx=batch_idx,
+                head_idx=head_idx,
+                aux_tensors=aux_tensors,
             )
             softmax = SoftmaxSm100.create(
                 softmax_scale_log2,
@@ -1487,6 +1493,7 @@ class FlashAttentionForwardSm100:
                 seqlen=seqlen,
                 aux_tensors=aux_tensors,
                 fastdiv_mods=fastdiv_mods,
+                mask_fn=partial(mask_fn, mask_seqlen=False),
             )
 
             cute.arch.mbarrier_wait(
@@ -1528,7 +1535,7 @@ class FlashAttentionForwardSm100:
             for n_tile in cutlass.range(n_block_max - n_block_min_before_local_mask, unroll=1):
                 n_block = n_block_max - n_tile - 1
                 mma_si_consumer_phase, si_corr_producer_phase, s0_s1_sequence_phase = softmax_step(
-                    mma_si_consumer_phase, si_corr_producer_phase, s0_s1_sequence_phase, n_block
+                    mma_si_consumer_phase, si_corr_producer_phase, s0_s1_sequence_phase, n_block, mask_fn=partial(mask_fn, mask_seqlen=False),
                 )
             # Separate iterations with local masking on the left
             if const_expr(self.is_local and block_info.window_size_left is not None):
