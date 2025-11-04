@@ -14,6 +14,14 @@ from utils import hash_callable
 
 
 class BlockSparsityKernel:
+    """Block sparsity kernel for FlexAttention.
+
+    This kernel computes `mask_mod` for every token of each block
+    to determine if an n block is full, masked, or neither.
+
+    Writes block counts and indices to a BlockSparseTensors object.
+    """
+
     def __init__(
         self,
         mask_mod: Callable,
@@ -39,7 +47,6 @@ class BlockSparsityKernel:
                 "full block tensors must be provided when computing full blocks"
             )
 
-        # TODO: static checks for size of blocksparse tensors
         batch_size, num_heads, num_m_blocks, num_n_blocks = list(self.mask_idx.shape)
         grid = [num_m_blocks, num_heads, batch_size]
 
@@ -116,14 +123,13 @@ class BlockSparsityKernel:
                         thread_has_masked = Boolean(True)
 
             # Block-level reduction to combine results across all threads
-            # Use ballot to collect which threads found masked/unmasked elements
             warp_has_unmasked_mask = cute.arch.vote_any_sync(thread_has_unmasked)
             warp_has_masked_mask = cute.arch.vote_any_sync(thread_has_masked)
 
-            # Each warp's first thread (lane 0) writes the ballot mask to shared memory
+            # lane 0 writes the ballot mask to shared memory
             lane_id = tidx % 32
             if lane_id == 0:
-                # Store as Int8 (1 if true, 0 if false)
+                # Store as Int8
                 reduction_buffer[warp_idx, 0] = Int8(1) if warp_has_unmasked_mask else Int8(0)
                 reduction_buffer[warp_idx, 1] = Int8(1) if warp_has_masked_mask else Int8(0)
 
@@ -156,6 +162,133 @@ class BlockSparsityKernel:
                     num_full_blocks += 1
 
         # Only thread 0 writes back the counts
+        if tidx == 0:
+            mask_cnt[batch_idx, head_idx, m_block] = num_mask_blocks
+            if const_expr(self.compute_full_blocks):
+                full_cnt[batch_idx, head_idx, m_block] = num_full_blocks
+
+
+class BlockSparsityKernelFast:
+    """Fast block sparsity kernel using 5-point sampling (4 corners + center).
+
+    This kernel is much faster than the full kernel but only samples 5 points per block.
+    It's suitable for masks where checking corners and center is sufficient to determine
+    block sparsity (e.g., causal, sliding window, etc.).
+    """
+
+    def __init__(
+        self,
+        mask_mod: Callable,
+        tile_mn: Tuple[int, int],
+        compute_full_blocks: bool = True,
+        use_aux_tensors: bool = False,
+    ):
+        self.mask_mod = mask_mod
+        self.tile_mn = tile_mn
+        self.compute_full_blocks = compute_full_blocks
+        self.use_aux_tensors = use_aux_tensors
+
+    @cute.jit
+    def __call__(
+        self,
+        blocksparse_tensors: BlockSparseTensors,
+        aux_tensors: Optional[list] = None,
+    ):
+        self.mask_cnt, self.mask_idx, self.full_cnt, self.full_idx = blocksparse_tensors
+
+        if const_expr(self.compute_full_blocks):
+            assert self.full_cnt is not None and self.full_idx is not None, (
+                "full block tensors must be provided when computing full blocks"
+            )
+
+        batch_size, num_heads, num_m_blocks, num_n_blocks = list(self.mask_idx.shape)
+        grid = [num_m_blocks, num_heads, batch_size]
+
+        # Only need 5 threads for 5-point sampling
+        num_threads = 5
+        self.kernel(
+            self.mask_cnt,
+            self.mask_idx,
+            self.full_cnt,
+            self.full_idx,
+            num_n_blocks,
+            aux_tensors,
+        ).launch(grid=grid, block=[num_threads, 1, 1])
+
+    @cute.kernel
+    def kernel(
+        self,
+        mask_cnt: cute.Tensor,
+        mask_idx: cute.Tensor,
+        full_cnt: cute.Tensor,
+        full_idx: cute.Tensor,
+        num_n_blocks: Int32,
+        aux_tensors: Optional[list] = None,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        m_block, head_idx, batch_idx = cute.arch.block_idx()
+
+        num_mask_blocks = Int32(0)
+        num_full_blocks = Int32(0)
+
+        # Each thread checks one of the 5 sample points per block
+        for n_block in cutlass.range(num_n_blocks):
+            m_base = m_block * self.tile_mn[0]
+            n_base = n_block * self.tile_mn[1]
+
+            # 5 sample points: 4 corners + center
+            # Thread 0: top-left
+            # Thread 1: top-right
+            # Thread 2: bottom-left
+            # Thread 3: bottom-right
+            # Thread 4: center
+
+            thread_result = Boolean(False)
+
+            if tidx == 0:
+                # Top-left corner
+                q_idx = m_base
+                kv_idx = n_base
+                thread_result = self.mask_mod(batch_idx, head_idx, q_idx, kv_idx, aux_tensors)
+            elif tidx == 1:
+                # Top-right corner
+                q_idx = m_base
+                kv_idx = n_base + self.tile_mn[1] - 1
+                thread_result = self.mask_mod(batch_idx, head_idx, q_idx, kv_idx, aux_tensors)
+            elif tidx == 2:
+                # Bottom-left corner
+                q_idx = m_base + self.tile_mn[0] - 1
+                kv_idx = n_base
+                thread_result = self.mask_mod(batch_idx, head_idx, q_idx, kv_idx, aux_tensors)
+            elif tidx == 3:
+                # Bottom-right corner
+                q_idx = m_base + self.tile_mn[0] - 1
+                kv_idx = n_base + self.tile_mn[1] - 1
+                thread_result = self.mask_mod(batch_idx, head_idx, q_idx, kv_idx, aux_tensors)
+            elif tidx == 4:
+                # Center point
+                q_idx = m_base + self.tile_mn[0] // 2
+                kv_idx = n_base + self.tile_mn[1] // 2
+                thread_result = self.mask_mod(batch_idx, head_idx, q_idx, kv_idx, aux_tensors)
+
+            # Use vote_any_sync to see if any thread found unmasked or masked
+            has_unmasked = cute.arch.vote_any_sync(thread_result)
+            has_masked = cute.arch.vote_any_sync(Boolean(not thread_result))
+
+            # Thread 0 writes output
+            if tidx == 0:
+                # Determine block type from the 5 samples
+                is_partial = Boolean(has_unmasked and has_masked)
+                is_full = Boolean(has_unmasked and (not has_masked))
+
+                if is_partial:
+                    mask_idx[batch_idx, head_idx, m_block, num_mask_blocks] = n_block
+                    num_mask_blocks += 1
+                elif is_full and const_expr(self.compute_full_blocks):
+                    full_idx[batch_idx, head_idx, m_block, num_full_blocks] = n_block
+                    num_full_blocks += 1
+
+        # Thread 0 writes back the counts
         if tidx == 0:
             mask_cnt[batch_idx, head_idx, m_block] = num_mask_blocks
             if const_expr(self.compute_full_blocks):
@@ -409,7 +542,7 @@ def benchmark():
         return q_idx >= kv_idx
 
     # Create kernel
-    kernel = BlockSparsityKernel(
+    kernel = BlockSparsityKernelFast(
         mask_mod=causal_mask,
         tile_mn=(tile_m, tile_n),
         compute_full_blocks=True,
@@ -543,7 +676,7 @@ def benchmark_with_aux_tensors():
         return q_doc_id == kv_doc_id
 
     # Create kernel
-    kernel = BlockSparsityKernel(
+    kernel = BlockSparsityKernelFast(
         mask_mod=document_mask,
         tile_mn=(tile_m, tile_n),
         compute_full_blocks=True,
