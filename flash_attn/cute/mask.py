@@ -298,6 +298,10 @@ class AttentionMask:
         mask_seqlen: cutlass.Constexpr[bool],
         mask_causal: cutlass.Constexpr[bool],
         mask_local: cutlass.Constexpr[bool] = False,
+        mask_mod: cutlass.Constexpr[Optional[Callable]] = None,
+        batch_idx: Int32 = None,
+        head_idx: Int32 = None,
+        aux_tensors: Optional[list] = None,
     ) -> None:
         assert not (mask_causal and mask_local), "mask_causal and mask_local cannot be both True"
         acc_shape = (self.tile_m, self.tile_n)
@@ -311,7 +315,7 @@ class AttentionMask:
             n_block = 0
         seqlenk_col_limit = self.seqlen_k - n_block * self.tile_n
         r2p = True
-        if const_expr(not mask_causal and not mask_local):
+        if const_expr(not mask_causal and not mask_local and mask_mod is None):
             if const_expr(mask_seqlen):
                 if const_expr(not r2p):
                     for i in cutlass.range(cute.size(tScS_t2r.shape), unroll_full=True):
@@ -321,6 +325,36 @@ class AttentionMask:
                         acc_S[i] = -Float32.inf if tScS_t2r[i][1] >= seqlenk_col_limit else acc_S[i]
                 else:
                     mask_r2p(acc_S, seqlenk_col_limit, arch=100, rank1=True)
+
+        elif const_expr(not mask_causal and not mask_local and mask_mod is not None):
+            # Block sparse case w/ mask_mod
+            batch_idx_ssa = utils.scalar_to_ssa(batch_idx, cutlass.Int32)
+            head_idx_ssa = utils.scalar_to_ssa(head_idx, cutlass.Int32)
+            row_coord_first = tScS_t2r[0][0]
+            global_row = row_coord_first + m_block * self.tile_m
+            if const_expr(self.qhead_per_kvhead_packgqa != 1):
+                mask_row = global_row // self.qhead_per_kvhead_packgqa
+            else:
+                mask_row = global_row
+            mask_row_ssa = utils.scalar_to_ssa(mask_row, cutlass.Int32)
+
+            ncol = const_expr(cute.size(tScS_t2r.shape))
+            for i in cutlass.range_constexpr(ncol):
+                col_coord = tScS_t2r[i][1] if not self.swap_AB else tScS_t2r[i][0]
+                global_col = col_coord + n_block * self.tile_n
+                mask_value = mask_mod(
+                    batch_idx_ssa,
+                    head_idx_ssa,
+                    mask_row_ssa,
+                    utils.scalar_to_ssa(global_col, cutlass.Int32),
+                    aux_tensors,
+                )
+                cond = cutlass.Boolean(utils.ssa_to_scalar(mask_value))
+                acc_S[i] = acc_S[i] if cond else -Float32.inf
+                if const_expr(mask_seqlen):
+                    out_of_bounds = (global_row >= self.seqlen_q) or (global_col >= self.seqlen_k)
+                    acc_S[i] = -Float32.inf if out_of_bounds else acc_S[i]
+
         else:  # Causal or local
             causal_row_offset = 1 + self.seqlen_k - n_block * self.tile_n - self.seqlen_q
             row_idx = tScS_t2r[0][0] + m_block * self.tile_m

@@ -1,11 +1,8 @@
 from functools import partial
-import math
-import operator
-from typing import Callable, Optional, Tuple, Type
+from typing import Callable, Optional, Tuple
 
-import cuda.bindings.driver as cuda
 import cutlass
-from cutlass import Boolean, Constexpr, Float32, Int32, Int8, const_expr
+from cutlass import Boolean, Int32, Int8, const_expr
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 import torch
@@ -276,11 +273,11 @@ def compute_block_sparsity(
         batch_size: The batch size.
         num_heads: The number of heads.
         seqlen_q: The sequence length for the query.
-        seqlen_k: The sequence length for the key.  
+        seqlen_k: The sequence length for the key.
         mask_mod: The `mask_mod` callable to use.
         aux_tensors: A list of auxiliary tensors.
         device: The device to use.
-        compute_full_blocks: Whether to compute full blocks. If False, only partially-masked blocks are computed. 
+        compute_full_blocks: Whether to compute full blocks. If False, only partially-masked blocks are computed.
         use_fast_sampling: Whether to use 5-point sampling (4 corners + center). This is much faster, but only suitable for masks where this check is sufficient.
 
     Returns:
