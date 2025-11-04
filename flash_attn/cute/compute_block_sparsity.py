@@ -1,7 +1,7 @@
 import math
 import operator
 from typing import Callable, Optional, Tuple, Type
-
+from functools import partial
 import cuda.bindings.driver as cuda
 import cutlass
 from cutlass import Boolean, Constexpr, Float32, Int32, const_expr, Int8
@@ -10,7 +10,7 @@ from cutlass.cute.runtime import from_dlpack
 import torch
 
 from block_sparsity import BlockSparseTensors
-from utils import hash_callable
+from utils import hash_callable, scalar_to_ssa, ssa_to_scalar
 
 
 class BlockSparsityKernel:
@@ -86,6 +86,8 @@ class BlockSparsityKernel:
         warp_idx = cute.arch.warp_idx()
         m_block, head_idx, batch_idx = cute.arch.block_idx()
 
+        ssa = partial(scalar_to_ssa, dtype=Int32)
+
         @cute.struct
         class SharedStorage:
             reduction_buffer_smem: cute.struct.Align[
@@ -116,29 +118,49 @@ class BlockSparsityKernel:
 
                 if tidx == 0:
                     # Top-left corner
-                    q_idx = m_base
-                    kv_idx = n_base
-                    thread_result = self.mask_mod(batch_idx, head_idx, q_idx, kv_idx, aux_tensors)
+                    q_idx_ssa = ssa(m_base)
+                    kv_idx_ssa = ssa(n_base)
+                    thread_result = ssa_to_scalar(
+                        self.mask_mod(
+                            ssa(batch_idx), ssa(head_idx), q_idx_ssa, kv_idx_ssa, aux_tensors
+                        )
+                    )
                 elif tidx == 1:
                     # Top-right corner
-                    q_idx = m_base
-                    kv_idx = n_base + self.tile_mn[1] - 1
-                    thread_result = self.mask_mod(batch_idx, head_idx, q_idx, kv_idx, aux_tensors)
+                    q_idx_ssa = ssa(m_base)
+                    kv_idx_ssa = ssa(n_base + self.tile_mn[1] - 1)
+                    thread_result = ssa_to_scalar(
+                        self.mask_mod(
+                            ssa(batch_idx), ssa(head_idx), q_idx_ssa, kv_idx_ssa, aux_tensors
+                        )
+                    )
                 elif tidx == 2:
                     # Bottom-left corner
-                    q_idx = m_base + self.tile_mn[0] - 1
-                    kv_idx = n_base
-                    thread_result = self.mask_mod(batch_idx, head_idx, q_idx, kv_idx, aux_tensors)
+                    q_idx_ssa = ssa(m_base + self.tile_mn[0] - 1)
+                    kv_idx_ssa = ssa(n_base)
+                    thread_result = ssa_to_scalar(
+                        self.mask_mod(
+                            ssa(batch_idx), ssa(head_idx), q_idx_ssa, kv_idx_ssa, aux_tensors
+                        )
+                    )
                 elif tidx == 3:
                     # Bottom-right corner
-                    q_idx = m_base + self.tile_mn[0] - 1
-                    kv_idx = n_base + self.tile_mn[1] - 1
-                    thread_result = self.mask_mod(batch_idx, head_idx, q_idx, kv_idx, aux_tensors)
+                    q_idx_ssa = ssa(m_base + self.tile_mn[0] - 1)
+                    kv_idx_ssa = ssa(n_base + self.tile_mn[1] - 1)
+                    thread_result = ssa_to_scalar(
+                        self.mask_mod(
+                            ssa(batch_idx), ssa(head_idx), q_idx_ssa, kv_idx_ssa, aux_tensors
+                        )
+                    )
                 elif tidx == 4:
                     # Center point
-                    q_idx = m_base + self.tile_mn[0] // 2
-                    kv_idx = n_base + self.tile_mn[1] // 2
-                    thread_result = self.mask_mod(batch_idx, head_idx, q_idx, kv_idx, aux_tensors)
+                    q_idx_ssa = ssa(m_base + self.tile_mn[0] // 2)
+                    kv_idx_ssa = ssa(n_base + self.tile_mn[1] // 2)
+                    thread_result = ssa_to_scalar(
+                        self.mask_mod(
+                            ssa(batch_idx), ssa(head_idx), q_idx_ssa, kv_idx_ssa, aux_tensors
+                        )
+                    )
 
                 # Use vote_any_sync to see if any thread found unmasked or masked
                 has_unmasked = cute.arch.vote_any_sync(thread_result)
@@ -152,14 +174,18 @@ class BlockSparsityKernel:
 
                 # Each thread handles 1 row
                 if tidx < self.tile_mn[0]:
-                    q_idx = m_base + tidx
+                    q_idx_ssa = ssa(m_base + tidx)
 
                     # Loop over all columns in this row
                     for c in cutlass.range_constexpr(self.tile_mn[1]):
-                        kv_idx = n_base + c
+                        kv_idx_ssa = ssa(n_base + c)
 
                         # Direct scalar call
-                        mask_val = self.mask_mod(batch_idx, head_idx, q_idx, kv_idx, aux_tensors)
+                        mask_val = ssa_to_scalar(
+                            self.mask_mod(
+                                ssa(batch_idx), ssa(head_idx), q_idx_ssa, kv_idx_ssa, aux_tensors
+                            )
+                        )
 
                         # Update tracking flags
                         if mask_val:
@@ -221,7 +247,7 @@ def compute_block_sparsity(
     seqlen_q,
     seqlen_k,
     mask_mod: Callable,
-    aux_tensors: Optional[list],
+    aux_tensors: Optional[list],  # list[cute.Tensor]
     device,
     compute_full_blocks: bool = True,
 ) -> BlockSparseTensors:
@@ -547,7 +573,7 @@ def benchmark_with_aux_tensors():
     # Create document ID tensor for document masking with random lengths
     # Document lengths vary randomly between 64 and 1024 tokens
     # Each batch has different document boundaries
-    doc_ids = torch.zeros((batch_size, seqlen_q), device=device, dtype=torch.int32)
+    doc_ids = torch.zeros((batch_size, num_heads, seqlen_q), device=device, dtype=torch.int32)
 
     print("\nGenerating random document boundaries per batch...")
     for b in range(batch_size):
@@ -557,7 +583,7 @@ def benchmark_with_aux_tensors():
             # Random document length between 64 and 1024
             doc_len = torch.randint(64, 1025, (1,)).item()
             end_pos = min(pos + doc_len, seqlen_q)
-            doc_ids[b, pos:end_pos] = doc_id
+            doc_ids[b, :, pos:end_pos] = doc_id
             pos = end_pos
             doc_id += 1
         print(f"  Batch {b}: {doc_id} documents (varying lengths 64-1024 tokens)")
@@ -575,7 +601,7 @@ def benchmark_with_aux_tensors():
     full_idx_cute = from_dlpack(full_block_idx.detach(), assumed_align=4).mark_layout_dynamic(
         leading_dim=3
     )
-    doc_ids_cute = from_dlpack(doc_ids.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=1)
+    doc_ids_cute = from_dlpack(doc_ids.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=2)
 
     blocksparse_tensors = BlockSparseTensors(
         mask_block_cnt=mask_cnt_cute,
@@ -588,11 +614,13 @@ def benchmark_with_aux_tensors():
     @cute.jit
     def document_mask(batch_idx, head_idx, q_idx, kv_idx, aux_tensors):
         """Document mask: only attend within the same document."""
-        doc_ids = aux_tensors[0]
-        # Direct scalar indexing
-        q_doc_id = doc_ids[batch_idx, q_idx]
-        kv_doc_id = doc_ids[batch_idx, kv_idx]
-        return q_doc_id == kv_doc_id
+        doc_ids0 = aux_tensors[0]
+        doc_ids1 = aux_tensors[0]
+        doc_id_q = doc_ids0[batch_idx[0], head_idx[0], q_idx[0]]
+        doc_id_kv = doc_ids1[batch_idx[0], head_idx[0], kv_idx[0]]
+        q_doc = scalar_to_ssa(doc_id_q, cutlass.Int32)
+        kv_doc = scalar_to_ssa(doc_id_kv, cutlass.Int32)
+        return q_doc == kv_doc
 
     # Create kernel with fast sampling
     kernel = BlockSparsityKernel(
