@@ -759,6 +759,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             self.tile_n,
             self.is_causal,
             self.is_local,
+            False,  # is_split_kv
             window_size_left,
             window_size_right,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
@@ -1653,6 +1654,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             self.tile_n,
             self.is_causal,
             self.is_local,
+            False,  # is_split_kv
             window_size_left,
             window_size_right,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,

@@ -552,6 +552,7 @@ class FlashAttentionBackwardSm90:
             self.tile_n,
             self.is_causal,
             self.is_local,
+            False,  # is_split_kv
             None,
             None,
             qhead_per_kvhead_packgqa=1,

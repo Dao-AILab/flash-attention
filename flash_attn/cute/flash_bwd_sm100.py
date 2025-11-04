@@ -928,6 +928,7 @@ class FlashAttentionBackwardSm100:
             self.tile_n * self.cluster_shape_mnk[0],  # careful, this case is not very well-tested
             self.is_causal,
             self.is_local,
+            False,  # is_split_kv
             None,
             None,
             qhead_per_kvhead_packgqa=1,
