@@ -84,6 +84,7 @@ def benchmark_config(
     aux_tensors,
     tile_m=128,
     tile_n=128,
+    use_fast_kernel=False,
 ):
     """Benchmark a single configuration and return timing in microseconds."""
     device = "cuda"
@@ -130,8 +131,14 @@ def benchmark_config(
     # Create and compile kernel
     # Set use_aux_tensors=True if aux_tensors is not None
     use_aux = aux_tensors is not None and len(aux_tensors) > 0
+
+    # Create kernel with fast sampling option
     kernel = BlockSparsityKernel(
-        mask_mod=mask_fn, tile_mn=(tile_m, tile_n), compute_full_blocks=True, use_aux_tensors=use_aux
+        mask_mod=mask_fn,
+        tile_mn=(tile_m, tile_n),
+        compute_full_blocks=True,
+        use_aux_tensors=use_aux,
+        use_fast_sampling=use_fast_kernel,
     )
     compiled_kernel = cute.compile(
         kernel,
@@ -184,9 +191,10 @@ def run_comprehensive_benchmark():
 
     # Count total configurations
     mask_mods = create_mask_mods()
+    # Each standard mask is run with both full and fast kernels (2x), plus doc_mask with only full kernel (1x)
     total_configs = (
-        len(batch_sizes) * len(num_heads_list) * len(seqlens) * (len(mask_mods) + 1)
-    )  # +1 for doc_mask
+        len(batch_sizes) * len(num_heads_list) * len(seqlens) * (len(mask_mods) * 2 + 1)
+    )  # *2 for fast/full, +1 for doc_mask
 
     print(f"Running {total_configs} benchmark configurations...")
 
@@ -202,25 +210,30 @@ def run_comprehensive_benchmark():
 
                 # Benchmark standard masks
                 for mask_name, (mask_fn, aux_tensors) in mask_mods.items():
-                    exec_time_us, mask_size_gib, max_memory_gib = benchmark_config(
-                        batch_size, num_heads, seqlen, seqlen, mask_name, mask_fn, aux_tensors
-                    )
-
-                    if exec_time_us is not None:
-                        results.append(
-                            {
-                                "B": batch_size,
-                                "H": num_heads,
-                                "M": seqlen,
-                                "N": seqlen,
-                                "Mask Mod": mask_name,
-                                "Creation Time (ms)": exec_time_us / 1000.0,  # Convert us to ms
-                                "Mask Size Memory (GiB)": mask_size_gib,
-                                "Max Construction Memory (GiB)": max_memory_gib,
-                            }
+                    # Benchmark both full and fast kernels
+                    for use_fast in [False, True]:
+                        kernel_type = "Fast" if use_fast else "Full"
+                        exec_time_us, mask_size_gib, max_memory_gib = benchmark_config(
+                            batch_size, num_heads, seqlen, seqlen, mask_name, mask_fn, aux_tensors,
+                            use_fast_kernel=use_fast
                         )
 
-                    pbar.update(1)
+                        if exec_time_us is not None:
+                            results.append(
+                                {
+                                    "B": batch_size,
+                                    "H": num_heads,
+                                    "M": seqlen,
+                                    "N": seqlen,
+                                    "Mask Mod": mask_name,
+                                    "Kernel Type": kernel_type,
+                                    "Creation Time (ms)": exec_time_us / 1000.0,  # Convert us to ms
+                                    "Mask Size Memory (GiB)": mask_size_gib,
+                                    "Max Construction Memory (GiB)": max_memory_gib,
+                                }
+                            )
+
+                        pbar.update(1)
 
                 # Benchmark document mask (with aux tensors)
                 doc_mask_fn, doc_aux_tensors = create_doc_mask_mod(batch_size, seqlen, device)
@@ -265,15 +278,16 @@ def print_results_table(results):
         return
 
     # Print header
-    header = "|   B |   H |    M |    N | Mask Mod               |   Creation Time (ms) |   Mask Size Memory (GiB) |   Max Construction Memory (GiB) |"
-    separator = "|-----|-----|------|------|------------------------|----------------------|--------------------------|---------------------------------|"
+    header = "|   B |   H |    M |    N | Mask Mod               | Kernel |   Creation Time (ms) |   Mask Size Memory (GiB) |   Max Construction Memory (GiB) |"
+    separator = "|-----|-----|------|------|------------------------|--------|----------------------|--------------------------|---------------------------------|"
 
     print(header)
     print(separator)
 
     # Print each row
     for result in results:
-        row = f"|{result['B']:4d} |{result['H']:4d} |{result['M']:5d} |{result['N']:5d} | {result['Mask Mod']:<22s} |"
+        kernel_type = result.get('Kernel Type', 'Full')  # Default to Full for doc_mask
+        row = f"|{result['B']:4d} |{result['H']:4d} |{result['M']:5d} |{result['N']:5d} | {result['Mask Mod']:<22s} | {kernel_type:<6s} |"
         row += f"{result['Creation Time (ms)']:21.4f} |"
         row += f"{result['Mask Size Memory (GiB)']:25.4f} |"
         row += f"{result['Max Construction Memory (GiB)']:32.4f} |"
