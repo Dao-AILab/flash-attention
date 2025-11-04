@@ -28,7 +28,19 @@ from flash_attn.cute.mask_definitions import (
     random_doc_id_tensor,
 )
 from flash_attn.cute.testing import attention_ref
+COMPUTE_CAPABILITY = torch.cuda.get_device_capability()[0]
 
+
+@pytest.fixture(autouse=True)
+def reset_torch_state():
+    """Reset torch dynamo/compile state between tests to avoid state pollution."""
+    torch._dynamo.reset()
+    torch.cuda.empty_cache()
+
+    yield
+
+    torch._dynamo.reset()
+    torch.cuda.empty_cache()
 
 def create_tensors(
     batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, headdim, headdim_v, dtype
@@ -142,6 +154,7 @@ SEQLEN_PAIRS_SMOKE = [
     (256, 256),
     (113, 203),
     (1024, 1024),
+    (128, 8192)
 ]
 
 
@@ -208,6 +221,11 @@ def _run_mask_test(
     )
 
     # Compute block sparsity for mask_mod
+    if COMPUTE_CAPABILITY == 10:
+        sparse_tile_m = 2 * tile_m
+    else:
+        sparse_tile_m = tile_m
+
     bm = create_block_mask(
         mask_mod_flex,
         batch_size,
@@ -215,7 +233,7 @@ def _run_mask_test(
         seqlen_q,
         seqlen_k,
         device="cuda",
-        BLOCK_SIZE=(tile_m, tile_n),
+        BLOCK_SIZE=(sparse_tile_m, tile_n),
     )
     _, _, mask_cnt, mask_idx, full_cnt, full_idx, *_ = bm.as_tuple()
 
@@ -348,6 +366,9 @@ def test_static_masks(
     - block_diagonal: Masks by 64-element diagonal blocks
     - mini_causal: Local causal within 128-element tiles
     """
+    if COMPUTE_CAPABILITY == 10 and (tile_m, tile_n) != (128, 128):
+        pytest.skip("TODO: Non-128x128 tiles currently not supported on SM 10.0. due to TMEM")
+
     _run_mask_test(
         seqlen_q=seqlen_q,
         seqlen_k=seqlen_k,
@@ -393,6 +414,9 @@ def test_parameterized_masks(
     - sliding_window: Requires window size and offset parameters
     - document: Slower to check
     """
+    if COMPUTE_CAPABILITY == 10 and (tile_m, tile_n) != (128, 128):
+        pytest.skip("TODO: Non-128x128 tiles currently not supported on SM 10.0. due to TMEM")
+
     _run_mask_test(
         seqlen_q=seqlen_q,
         seqlen_k=seqlen_k,
@@ -407,6 +431,51 @@ def test_parameterized_masks(
         tile_m=tile_m,
         tile_n=tile_n,
     )
+
+
+def test_sm100_block_sparse_sink_all_masked():
+    """Block-sparse regression for the sink path"""
+    if torch.cuda.get_device_capability()[0] != 10:
+        pytest.skip("SM100-only test")
+    device = "cuda"
+    dtype = torch.bfloat16
+    batch_size = 1
+    seqlen_q = 256
+    seqlen_k = 128
+    nheads = 8
+    headdim = 128
+    q = torch.randn(batch_size, seqlen_q, nheads, headdim, dtype=dtype, device=device)
+    k = torch.randn(batch_size, seqlen_k, nheads, headdim, dtype=dtype, device=device)
+    v = torch.randn(batch_size, seqlen_k, nheads, headdim, dtype=dtype, device=device)
+    learnable_sink = torch.full((nheads,), 0.5, dtype=torch.bfloat16, device=device)
+    zero_cnt = torch.zeros((batch_size, nheads, 1), dtype=torch.int32, device=device)
+    zero_idx = torch.zeros((batch_size, nheads, 1, 1), dtype=torch.int32, device=device)
+    sparse = BlockSparseTensorsTorch(
+        mask_block_cnt=zero_cnt,
+        mask_block_idx=zero_idx,
+        full_block_cnt=zero_cnt,
+        full_block_idx=zero_idx,
+    )
+    softmax_scale = 1.0 / math.sqrt(headdim)
+    _, lse = _flash_attn_fwd(
+        q=q,
+        k=k,
+        v=v,
+        softmax_scale=softmax_scale,
+        causal=False,
+        window_size_left=None,
+        window_size_right=None,
+        learnable_sink=learnable_sink,
+        m_block_size=128,
+        n_block_size=128,
+        num_threads=384,
+        pack_gqa=False,
+        block_sparse_tensors=sparse,
+        return_lse=True,
+    )
+    # Fully masked tile ⇒ probability mass sits entirely on the sink, so LSE equals sink logit.
+    expected = learnable_sink.float()[None, :, None].expand_as(lse)
+    assert torch.allclose(lse, expected, atol=0.0, rtol=0.0)
 
 
 if __name__ == "__main__":
