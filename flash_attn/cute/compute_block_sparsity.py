@@ -89,7 +89,7 @@ class BlockSparsityKernel:
 
         # Each thread handles rows of the tile
         # Use runtime loop for variable sequence lengths
-        for n_block in cutlass.range(num_n_blocks):
+        for n_block in cutlass.range(num_n_blocks, unroll_full=True):
             # Each thread checks its assigned row(s) across all columns
             m_base = m_block * self.tile_mn[0]
             n_base = n_block * self.tile_mn[1]
@@ -103,7 +103,7 @@ class BlockSparsityKernel:
                 q_idx = m_base + tidx
 
                 # Loop over all columns in this row
-                for c in cutlass.range(self.tile_mn[1]):
+                for c in cutlass.range_constexpr(self.tile_mn[1]):
                     kv_idx = n_base + c
 
                     # Direct scalar call
