@@ -396,5 +396,254 @@ def run():
         print(f"Kernel execution failed: {e}")
 
 
+def benchmark():
+    """Benchmark the BlockSparsityKernel."""
+    from cutlass.cute.testing import benchmark as cute_benchmark
+
+    print("=" * 60)
+    print("Benchmarking BlockSparsityKernel")
+    print("=" * 60)
+
+    # Configuration
+    batch_size = 2
+    num_heads = 8
+    seqlen_q = 4096
+    seqlen_k = 4096
+    tile_m, tile_n = 128, 128
+
+    # Calculate number of blocks
+    n_blocks_q = (seqlen_q + tile_m - 1) // tile_m
+    n_blocks_k = (seqlen_k + tile_n - 1) // tile_n
+
+    print(f"\nConfiguration:")
+    print(f"  Batch size: {batch_size}, Num heads: {num_heads}")
+    print(f"  Sequence length Q: {seqlen_q}, K: {seqlen_k}")
+    print(f"  Tile size: {tile_m} x {tile_n}")
+    print(f"  Number of blocks Q: {n_blocks_q}, K: {n_blocks_k}")
+    print(f"  Total blocks to check: {batch_size * num_heads * n_blocks_q * n_blocks_k}")
+
+    # Create output tensors on CUDA
+    device = "cuda"
+    mask_block_cnt = torch.zeros(
+        (batch_size, num_heads, n_blocks_q), device=device, dtype=torch.int32
+    )
+    mask_block_idx = torch.zeros(
+        (batch_size, num_heads, n_blocks_q, n_blocks_k), device=device, dtype=torch.int32
+    )
+    full_block_cnt = torch.zeros(
+        (batch_size, num_heads, n_blocks_q), device=device, dtype=torch.int32
+    )
+    full_block_idx = torch.zeros(
+        (batch_size, num_heads, n_blocks_q, n_blocks_k), device=device, dtype=torch.int32
+    )
+
+    # Convert to cute tensors
+    mask_cnt_cute = from_dlpack(mask_block_cnt.detach(), assumed_align=4).mark_layout_dynamic(
+        leading_dim=2
+    )
+    mask_idx_cute = from_dlpack(mask_block_idx.detach(), assumed_align=4).mark_layout_dynamic(
+        leading_dim=3
+    )
+    full_cnt_cute = from_dlpack(full_block_cnt.detach(), assumed_align=4).mark_layout_dynamic(
+        leading_dim=2
+    )
+    full_idx_cute = from_dlpack(full_block_idx.detach(), assumed_align=4).mark_layout_dynamic(
+        leading_dim=3
+    )
+
+    blocksparse_tensors = BlockSparseTensors(
+        mask_block_cnt=mask_cnt_cute,
+        mask_block_idx=mask_idx_cute,
+        full_block_cnt=full_cnt_cute,
+        full_block_idx=full_idx_cute,
+    )
+
+    # Define a simple causal mask function
+    @cute.jit
+    def causal_mask(batch_idx, head_idx, q_idx, kv_idx, aux_tensors):
+        """Simple causal mask: only attend to positions <= current position."""
+        return q_idx >= kv_idx
+
+    # Create kernel
+    kernel = BlockSparsityKernel(
+        mask_mod=causal_mask,
+        tile_mn=(tile_m, tile_n),
+        compute_full_blocks=True,
+    )
+
+    # Compile kernel
+    compiled_kernel = cute.compile(
+        kernel,
+        blocksparse_tensors,
+        seqlen_q,
+        seqlen_k,
+        None,
+    )
+
+    # Generator function for benchmark - creates fresh tensors for each iteration
+    def generate_tensors():
+        from cutlass.cute.testing import JitArguments
+
+        # Return fresh tensors for each benchmark iteration
+        return JitArguments(blocksparse_tensors, seqlen_q, seqlen_k, None)
+
+    # Run benchmark
+    print("\nBenchmarking...")
+    exec_time = cute_benchmark(
+        compiled_kernel,
+        workspace_generator=generate_tensors,
+        warmup_iterations=10,
+        iterations=100,
+    )
+
+    print(f"\nBenchmark Results:")
+    print(f"  Execution time: {exec_time:.4f} us")
+    print(f"  Execution time: {exec_time / 1000:.4f} ms")
+
+    # Calculate throughput
+    total_elements = batch_size * num_heads * n_blocks_q * n_blocks_k * tile_m * tile_n
+    throughput = total_elements / (exec_time * 1e-6) / 1e9  # Billion elements per second
+    print(f"\nThroughput: {throughput:.2f} billion elements/second")
+    print("=" * 60)
+
+
+def benchmark_with_aux_tensors():
+    """Benchmark the BlockSparsityKernel with a document mask using aux_tensors."""
+    from cutlass.cute.testing import benchmark as cute_benchmark
+
+    print("=" * 60)
+    print("Benchmarking BlockSparsityKernel with Document Mask")
+    print("=" * 60)
+
+    # Configuration
+    batch_size = 2
+    num_heads = 8
+    seqlen_q = 4096
+    seqlen_k = 4096
+    tile_m, tile_n = 128, 128
+
+    # Calculate number of blocks
+    n_blocks_q = (seqlen_q + tile_m - 1) // tile_m
+    n_blocks_k = (seqlen_k + tile_n - 1) // tile_n
+
+    print(f"\nConfiguration:")
+    print(f"  Batch size: {batch_size}, Num heads: {num_heads}")
+    print(f"  Sequence length Q: {seqlen_q}, K: {seqlen_k}")
+    print(f"  Tile size: {tile_m} x {tile_n}")
+    print(f"  Number of blocks Q: {n_blocks_q}, K: {n_blocks_k}")
+    print(f"  Total blocks to check: {batch_size * num_heads * n_blocks_q * n_blocks_k}")
+
+    # Create output tensors on CUDA
+    device = "cuda"
+    mask_block_cnt = torch.zeros(
+        (batch_size, num_heads, n_blocks_q), device=device, dtype=torch.int32
+    )
+    mask_block_idx = torch.zeros(
+        (batch_size, num_heads, n_blocks_q, n_blocks_k), device=device, dtype=torch.int32
+    )
+    full_block_cnt = torch.zeros(
+        (batch_size, num_heads, n_blocks_q), device=device, dtype=torch.int32
+    )
+    full_block_idx = torch.zeros(
+        (batch_size, num_heads, n_blocks_q, n_blocks_k), device=device, dtype=torch.int32
+    )
+
+    # Create document ID tensor for document masking with random lengths
+    # Document lengths vary randomly between 64 and 1024 tokens
+    # Each batch has different document boundaries
+    doc_ids = torch.zeros((batch_size, seqlen_q), device=device, dtype=torch.int32)
+
+    print("\nGenerating random document boundaries per batch...")
+    for b in range(batch_size):
+        pos = 0
+        doc_id = 0
+        while pos < seqlen_q:
+            # Random document length between 64 and 1024
+            doc_len = torch.randint(64, 1025, (1,)).item()
+            end_pos = min(pos + doc_len, seqlen_q)
+            doc_ids[b, pos:end_pos] = doc_id
+            pos = end_pos
+            doc_id += 1
+        print(f"  Batch {b}: {doc_id} documents (varying lengths 64-1024 tokens)")
+
+    # Convert to cute tensors
+    mask_cnt_cute = from_dlpack(mask_block_cnt.detach(), assumed_align=4).mark_layout_dynamic(
+        leading_dim=2
+    )
+    mask_idx_cute = from_dlpack(mask_block_idx.detach(), assumed_align=4).mark_layout_dynamic(
+        leading_dim=3
+    )
+    full_cnt_cute = from_dlpack(full_block_cnt.detach(), assumed_align=4).mark_layout_dynamic(
+        leading_dim=2
+    )
+    full_idx_cute = from_dlpack(full_block_idx.detach(), assumed_align=4).mark_layout_dynamic(
+        leading_dim=3
+    )
+    doc_ids_cute = from_dlpack(doc_ids.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=1)
+
+    blocksparse_tensors = BlockSparseTensors(
+        mask_block_cnt=mask_cnt_cute,
+        mask_block_idx=mask_idx_cute,
+        full_block_cnt=full_cnt_cute,
+        full_block_idx=full_idx_cute,
+    )
+
+    # Define document mask function with aux_tensor access
+    @cute.jit
+    def document_mask(batch_idx, head_idx, q_idx, kv_idx, aux_tensors):
+        """Document mask: only attend within the same document."""
+        doc_ids = aux_tensors[0]
+        # Direct scalar indexing
+        q_doc_id = doc_ids[batch_idx, q_idx]
+        kv_doc_id = doc_ids[batch_idx, kv_idx]
+        return q_doc_id == kv_doc_id
+
+    # Create kernel
+    kernel = BlockSparsityKernel(
+        mask_mod=document_mask,
+        tile_mn=(tile_m, tile_n),
+        compute_full_blocks=True,
+    )
+
+    # Compile kernel
+    compiled_kernel = cute.compile(
+        kernel,
+        blocksparse_tensors,
+        seqlen_q,
+        seqlen_k,
+        [doc_ids_cute],
+    )
+
+    # Generator function for benchmark - creates fresh tensors for each iteration
+    def generate_tensors():
+        from cutlass.cute.testing import JitArguments
+
+        # Return fresh tensors for each benchmark iteration
+        return JitArguments(blocksparse_tensors, seqlen_q, seqlen_k, [doc_ids_cute])
+
+    # Run benchmark
+    print("\nBenchmarking with document mask (uses aux_tensors)...")
+    exec_time = cute_benchmark(
+        compiled_kernel,
+        workspace_generator=generate_tensors,
+        warmup_iterations=10,
+        iterations=100,
+    )
+
+    print(f"\nBenchmark Results:")
+    print(f"  Execution time: {exec_time:.4f} us")
+    print(f"  Execution time: {exec_time / 1000:.4f} ms")
+
+    # Calculate throughput
+    total_elements = batch_size * num_heads * n_blocks_q * n_blocks_k * tile_m * tile_n
+    throughput = total_elements / (exec_time * 1e-6) / 1e9  # Billion elements per second
+    print(f"\nThroughput: {throughput:.2f} billion elements/second")
+    print("=" * 60)
+
+
 if __name__ == "__main__":
     run()
+    print("\n")
+    benchmark()
+    print("\n")
+    benchmark_with_aux_tensors()
