@@ -153,6 +153,54 @@ def cute_mini_causal_mask(
     return m_mod >= n_mod
 
 
+@cute.jit
+def cute_prefix_lm_mask(
+    batch: cute.TensorSSA,
+    head: cute.TensorSSA,
+    m_idx: cute.TensorSSA,
+    n_idx: cute.TensorSSA,
+    aux_tensors,
+) -> cute.TensorSSA:
+    """Prefix LM mask: first 512 tokens attend bidirectionally, rest use causal masking."""
+    prefix_size_ssa = utils.scalar_to_ssa(512, cutlass.Int32)
+    both_in_prefix = (m_idx < prefix_size_ssa) & (n_idx < prefix_size_ssa)
+    causal_part = m_idx >= n_idx
+    return both_in_prefix | causal_part
+
+
+def flex_prefix_lm_mask(b, h, q_idx, kv_idx):
+    """Prefix LM mask: first 512 tokens attend bidirectionally, rest use causal masking."""
+    prefix_size = 512
+    both_in_prefix = (q_idx < prefix_size) & (kv_idx < prefix_size)
+    causal_part = q_idx >= kv_idx
+    return both_in_prefix | causal_part
+
+
+@cute.jit
+def cute_dilated_sliding_window_mask(
+    batch: cute.TensorSSA,
+    head: cute.TensorSSA,
+    m_idx: cute.TensorSSA,
+    n_idx: cute.TensorSSA,
+    aux_tensors,
+) -> cute.TensorSSA:
+    """Dilated sliding window: every other position in a 256-position window."""
+    window_size_ssa = utils.scalar_to_ssa(256, cutlass.Int32)
+    dilation_ssa = utils.scalar_to_ssa(2, cutlass.Int32)
+    in_window = (m_idx >= n_idx) & (m_idx - n_idx < window_size_ssa)
+    dilated = ((m_idx - n_idx) % dilation_ssa) == utils.scalar_to_ssa(0, cutlass.Int32)
+    return in_window & dilated
+
+
+def flex_dilated_sliding_window_mask(b, h, q_idx, kv_idx):
+    """Dilated sliding window: every other position in a 256-position window."""
+    window_size = 256
+    dilation = 2
+    in_window = (q_idx >= kv_idx) & (q_idx - kv_idx < window_size)
+    dilated = ((q_idx - kv_idx) % dilation) == 0
+    return in_window & dilated
+
+
 def random_doc_id_tensor(nheads, batch, seqlen_q, device="cpu"):
     doc_ids_tensor = torch.zeros(batch, nheads, seqlen_q, dtype=torch.int32, device=device)
     for b in range(batch):
@@ -175,6 +223,8 @@ def random_doc_id_tensor(nheads, batch, seqlen_q, device="cpu"):
 STATIC_MASKS = {
     "block_diagonal": (cute_block_diagonal_mask, flex_block_diagonal_mask),
     "mini_causal": (cute_mini_causal_mask, flex_mini_causal_mask),
+    "prefix_lm": (cute_prefix_lm_mask, flex_prefix_lm_mask),
+    "dilated_sliding_window": (cute_dilated_sliding_window_mask, flex_dilated_sliding_window_mask),
     "document": (cute_document_mask, flex_document_mask),
 }
 

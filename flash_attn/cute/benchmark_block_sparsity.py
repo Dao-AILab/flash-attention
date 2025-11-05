@@ -352,10 +352,16 @@ def main():
     for config in tqdm(configs, desc="Benchmarking"):
         try:
             # Get mask pair from mask_definitions
+            # sliding_window is the only parameterized mask that needs window_size
+            mask_kwargs = {}
+            if config.mask_name == "sliding_window":
+                mask_kwargs["window_size"] = 128  # Default window size
+
             cute_mask_fn, pytorch_mask_fn = get_mask_pair(
                 config.mask_name,
                 seqlen_q=config.seqlen_q,
                 seqlen_k=config.seqlen_k,
+                **mask_kwargs,
             )
 
             # For document masking, create wrapper that captures doc_ids
