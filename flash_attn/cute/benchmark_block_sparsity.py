@@ -10,7 +10,6 @@ from tqdm import tqdm
 import itertools
 import importlib
 import sys
-import time
 
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.testing import benchmark as cute_benchmark
@@ -35,6 +34,9 @@ if not has_nuggies:
     sys.exit(1)
 
 from transformer_nuggets.utils import benchmark_cuda_function_in_microseconds_triton
+
+# Configure torch.compile cache to prevent memory buildup
+torch._dynamo.config.cache_size_limit = 1000
 
 
 @dataclass(frozen=True)
@@ -67,14 +69,18 @@ def benchmark_pytorch_block_sparsity(
     mask_fn: Callable,
 ) -> Optional[float]:
     """
-    Benchmark PyTorch block mask creation (uncompiled).
+    Benchmark PyTorch block mask creation (compiled).
     Returns: creation_time_ms
     """
     device = "cuda"
 
     try:
+        # Compile the function once
+        cbm = torch.compile(create_block_mask)
+
+        # Warmup to ensure compilation is complete
         for _ in range(10):
-            result = create_block_mask(
+            result = cbm(
                 mask_fn,
                 config.batch_size,
                 config.num_heads,
@@ -85,13 +91,11 @@ def benchmark_pytorch_block_sparsity(
             del result
 
         torch.cuda.synchronize(device)
-        torch.cuda.empty_cache()
-        time.sleep(0.1) 
 
         # Benchmark creation time using transformer_nuggets
         # This utility handles warmup and timing properly
         creation_time_us = benchmark_cuda_function_in_microseconds_triton(
-            lambda: create_block_mask(
+            lambda: cbm(
                 mask_fn,
                 config.batch_size,
                 config.num_heads,
@@ -102,14 +106,14 @@ def benchmark_pytorch_block_sparsity(
         )
 
         torch.cuda.synchronize(device)
-        torch.cuda.empty_cache()
-        time.sleep(0.1)  # Allow GPU to settle
         creation_time_ms = creation_time_us / 1000.0  # Convert to ms
 
         return creation_time_ms
 
     except Exception as e:
-        print(f"PyTorch benchmark failed: {e}")
+        print(f"PyTorch benchmark failed ({config.mask_name}): {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
 
@@ -200,8 +204,6 @@ def benchmark_cute_block_sparsity(
         )
 
         torch.cuda.synchronize(device)
-        torch.cuda.empty_cache()
-        time.sleep(0.1)
         creation_time_ms = creation_time_us / 1000.0  # Convert to ms
 
         return creation_time_ms
@@ -305,7 +307,6 @@ def main():
     seqlens = [1024, 2048, 4096, 8192]
     mask_names = [
         "causal",
-        "causal_fast",
         "sliding_window",
         "prefix_lm",
         "dilated_sliding_window",
@@ -324,25 +325,10 @@ def main():
     # Generate base configurations
     base_configs = generate_configs(batch_sizes, num_heads, seqlens, mask_names)
 
-    # Update configs with fast sampling and aux tensors
+    # Update configs with aux tensors for document masking
     configs = []
     for config in base_configs:
-        if config.mask_name == "causal_fast":
-            # Use fast sampling for causal_fast
-            configs.append(
-                BenchmarkConfig(
-                    batch_size=config.batch_size,
-                    num_heads=config.num_heads,
-                    seqlen_q=config.seqlen_q,
-                    seqlen_k=config.seqlen_k,
-                    mask_name=config.mask_name,
-                    tile_m=config.tile_m,
-                    tile_n=config.tile_n,
-                    use_fast_sampling=True,
-                    aux_tensors_cute=None,
-                )
-            )
-        elif config.mask_name == "document":
+        if config.mask_name == "document":
             # Add aux tensors for document masking
             configs.append(
                 BenchmarkConfig(
@@ -395,7 +381,8 @@ def main():
         finally:
             # Clean up GPU memory between runs to avoid fragmentation
             torch.cuda.empty_cache()
-            time.sleep(0.2)  # Allow GPU to fully settle between configs
+            # Clear torch.compile cache to prevent memory accumulation
+            torch._dynamo.reset()
 
     # Print results
     print_results(results)
