@@ -112,18 +112,14 @@ class BlockSparsityKernel:
         reduction_buffer = storage.reduction_buffer_smem.get_tensor(
             cute.make_layout((self.num_warps, 2))
         )
-        # if tidx == 0:
-        #     print(reduction_buffer)
 
         num_mask_blocks = Int32(0)
         num_full_blocks = Int32(0)
 
-        # Use runtime loop for variable sequence lengths
         for n_block in cutlass.range(num_n_blocks, unroll_full=True):
             m_base = m_block * self.tile_mn[0]
             n_base = n_block * self.tile_mn[1]
 
-            # Branch at compile time between fast and full sampling
             if const_expr(self.use_fast_sampling):
                 # Fast path: 5-point sampling (4 corners + center)
                 # Out-of-bounds indices are treated as masked (False)
@@ -343,7 +339,6 @@ def compute_block_sparsity(
     )
 
     # Return both the BlockSparseTensors (cute) and the underlying torch tensors
-    # The torch tensors have been updated via shared memory
     return blocksparse_tensors, (full_block_cnt, full_block_idx, mask_block_cnt, mask_block_idx)
 
 
@@ -362,73 +357,27 @@ def run():
     seqlen_k = 16384
     tile_m, tile_n = 128, 128  # Use very small tiles for initial testing
 
-    # Calculate number of blocks
-    n_blocks_q = (seqlen_q + tile_m - 1) // tile_m
-    n_blocks_k = (seqlen_k + tile_n - 1) // tile_n
-
-    print(f"Batch size: {batch_size}, Num heads: {num_heads}")
-    print(f"Sequence length Q: {seqlen_q}, K: {seqlen_k}")
-    print(f"Tile size: {tile_m} x {tile_n}")
-    print(f"Number of blocks Q: {n_blocks_q}, K: {n_blocks_k}")
-
-    # Create output tensors on CUDA
-    device = "cuda"
-    mask_block_cnt = torch.zeros(
-        (batch_size, num_heads, n_blocks_q), device=device, dtype=torch.int32
-    )
-    mask_block_idx = torch.zeros(
-        (batch_size, num_heads, n_blocks_q, n_blocks_k), device=device, dtype=torch.int32
-    )
-    full_block_cnt = torch.zeros(
-        (batch_size, num_heads, n_blocks_q), device=device, dtype=torch.int32
-    )
-    full_block_idx = torch.zeros(
-        (batch_size, num_heads, n_blocks_q, n_blocks_k), device=device, dtype=torch.int32
-    )
-
-    # Convert to cute tensors
-    mask_cnt_cute = from_dlpack(mask_block_cnt.detach(), assumed_align=4).mark_layout_dynamic(
-        leading_dim=2
-    )
-    mask_idx_cute = from_dlpack(mask_block_idx.detach(), assumed_align=4).mark_layout_dynamic(
-        leading_dim=3
-    )
-    full_cnt_cute = from_dlpack(full_block_cnt.detach(), assumed_align=4).mark_layout_dynamic(
-        leading_dim=2
-    )
-    full_idx_cute = from_dlpack(full_block_idx.detach(), assumed_align=4).mark_layout_dynamic(
-        leading_dim=3
-    )
-
-    blocksparse_tensors = BlockSparseTensors(
-        mask_block_cnt=mask_cnt_cute,
-        mask_block_idx=mask_idx_cute,
-        full_block_cnt=full_cnt_cute,
-        full_block_idx=full_idx_cute,
-    )
-
     # Define a simple causal mask function
     @cute.jit
     def causal_mask(batch_idx, head_idx, q_idx, kv_idx, aux_tensors):
         """Simple causal mask: only attend to positions <= current position."""
         return q_idx >= kv_idx
 
-    # Create and run the kernel
-    kernel = BlockSparsityKernel(
-        mask_mod=causal_mask,
-        tile_mn=(tile_m, tile_n),
-        compute_full_blocks=True,
-    )
-
-    print("\nRunning kernel...")
-    kernel(
-        blocksparse_tensors=blocksparse_tensors,
-        seqlen_q=seqlen_q,
-        seqlen_k=seqlen_k,
-        aux_tensors=None,
-    )
-
-    print("Kernel execution completed!")
+    try:
+        compute_block_sparsity(
+            tile_m,
+            tile_n,
+            batch_size,
+            num_heads,
+            seqlen_q,
+            seqlen_k,
+            causal_mask,
+            None,
+            device="cuda",
+        )
+        print("Kernel execution completed!")
+    except Exception as e:
+        print(f"Kernel execution failed: {e}")
 
 
 if __name__ == "__main__":

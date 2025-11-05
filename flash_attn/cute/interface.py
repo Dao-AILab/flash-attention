@@ -106,6 +106,8 @@ def _flash_attn_fwd(
     Args:
         ...
         score_mod: A callable that takes the attention scores and applies a modification.
+        mask_mod: A callable that takes token position information and selectively masks
+        block_sparse_tensors: A tuple of tensors used for block sparsity. 
         return_lse: Whether to return the log softmax of the attention scores. If set to True will always calculate
         out: Optional pre-allocated output tensor. If None, will be allocated internally.
         lse: Optional pre-allocated log-sum-exp tensor. If None, will be allocated when needed.

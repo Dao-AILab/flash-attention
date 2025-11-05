@@ -74,8 +74,8 @@ class BenchmarkConfig:
     mma_pv_is_rs: bool = True
 
     # Benchmark parameters
-    warmup_iters: int = 5
-    benchmark_iters: int = 20
+    warmup_iters: int = 10
+    benchmark_iters: int = 25
     verbose: bool = False
     seed: int = 42
 
@@ -649,9 +649,9 @@ if __name__ == "__main__":
         dtype=torch.bfloat16,
         batch_size=B,
         # batch_size=1,
-        seqlen_q=16384 // B,
+        seqlen_q=8192,
         # seqlen_q=128,
-        seqlen_k=16384 // B,
+        seqlen_k=8192,
         # seqlen_k=192,
         use_varlen=False,
         use_mask_mod=True,
