@@ -10,6 +10,7 @@ from tqdm import tqdm
 import itertools
 import importlib
 import sys
+import time
 
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.testing import benchmark as cute_benchmark
@@ -66,18 +67,14 @@ def benchmark_pytorch_block_sparsity(
     mask_fn: Callable,
 ) -> Optional[float]:
     """
-    Benchmark PyTorch block mask creation.
+    Benchmark PyTorch block mask creation (uncompiled).
     Returns: creation_time_ms
     """
     device = "cuda"
 
     try:
-        # Compile the function
-        cbm = torch.compile(create_block_mask)
-
-        # Warmup
         for _ in range(10):
-            result = cbm(
+            result = create_block_mask(
                 mask_fn,
                 config.batch_size,
                 config.num_heads,
@@ -88,10 +85,13 @@ def benchmark_pytorch_block_sparsity(
             del result
 
         torch.cuda.synchronize(device)
+        torch.cuda.empty_cache()
+        time.sleep(0.1) 
 
         # Benchmark creation time using transformer_nuggets
+        # This utility handles warmup and timing properly
         creation_time_us = benchmark_cuda_function_in_microseconds_triton(
-            lambda: cbm(
+            lambda: create_block_mask(
                 mask_fn,
                 config.batch_size,
                 config.num_heads,
@@ -102,6 +102,8 @@ def benchmark_pytorch_block_sparsity(
         )
 
         torch.cuda.synchronize(device)
+        torch.cuda.empty_cache()
+        time.sleep(0.1)  # Allow GPU to settle
         creation_time_ms = creation_time_us / 1000.0  # Convert to ms
 
         return creation_time_ms
@@ -198,6 +200,8 @@ def benchmark_cute_block_sparsity(
         )
 
         torch.cuda.synchronize(device)
+        torch.cuda.empty_cache()
+        time.sleep(0.1)
         creation_time_ms = creation_time_us / 1000.0  # Convert to ms
 
         return creation_time_ms
@@ -295,7 +299,7 @@ def print_results(results: List[BenchmarkResult]):
 def main():
     """Run the comparative benchmark."""
 
-    # Configuration
+    # Configurationx``
     batch_sizes = [1, 4, 8]
     num_heads = [8, 16]
     seqlens = [1024, 2048, 4096, 8192]
@@ -391,6 +395,7 @@ def main():
         finally:
             # Clean up GPU memory between runs to avoid fragmentation
             torch.cuda.empty_cache()
+            time.sleep(0.2)  # Allow GPU to fully settle between configs
 
     # Print results
     print_results(results)
