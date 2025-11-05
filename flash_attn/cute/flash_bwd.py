@@ -405,6 +405,7 @@ class FlashAttentionBackwardSm80:
             num_block=cute.ceil_div(mK.shape[1], self.n_block_size),
             num_head=num_head,
             num_batch=num_batch,
+            num_splits=1,
             seqlen_k=0,
             headdim=mK.shape[2],
             headdim_v=mV.shape[2],
@@ -505,10 +506,10 @@ class FlashAttentionBackwardSm80:
         tile_scheduler = TileScheduler.create(tile_sched_params)
         work_tile = tile_scheduler.initial_work_tile_info()
 
-        n_block, head_idx, batch_idx = work_tile.tile_idx
+        n_block, head_idx, batch_idx, _ = work_tile.tile_idx
 
         if work_tile.is_valid_tile:
-            seqlen = SeqlenInfoQK(batch_idx, mQ.shape[1], mK.shape[1], mCuSeqlensQ=mCuSeqlensQ, mCuSeqlensK=mCuSeqlensK, mSeqUsedQ=mSeqUsedQ, mSeqUsedK=mSeqUsedK)
+            seqlen = SeqlenInfoQK.create(batch_idx, mQ.shape[1], mK.shape[1], mCuSeqlensQ=mCuSeqlensQ, mCuSeqlensK=mCuSeqlensK, mSeqUsedQ=mSeqUsedQ, mSeqUsedK=mSeqUsedK)
 
             m_block_max = cute.ceil_div(seqlen.seqlen_q, self.m_block_size)
             m_block_min = 0

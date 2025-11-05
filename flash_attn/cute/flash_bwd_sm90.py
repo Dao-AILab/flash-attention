@@ -397,6 +397,7 @@ class FlashAttentionBackwardSm90:
             cute.ceil_div(cute.size(mK.shape[0]), self.tile_n),
             cute.size(mK.shape[2]),
             cute.size(mK.shape[3]),
+            1,  # num_splits
             cute.size(mK.shape[0]),
             mQ.shape[1],
             mV.shape[1],
@@ -551,12 +552,13 @@ class FlashAttentionBackwardSm90:
             self.tile_n,
             self.is_causal,
             self.is_local,
+            False,  # is_split_kv
             None,
             None,
             qhead_per_kvhead_packgqa=1,
         )
         SeqlenInfoCls = partial(
-            SeqlenInfoQK,
+            SeqlenInfoQK.create,
             seqlen_q_static=mQ.shape[0],
             seqlen_k_static=mK.shape[0],
             mCuSeqlensQ=None,
@@ -678,7 +680,7 @@ class FlashAttentionBackwardSm90:
             tile_scheduler = TileSchedulerCls()
             work_tile = tile_scheduler.initial_work_tile_info()
             while work_tile.is_valid_tile:
-                n_block, head_idx, batch_idx = work_tile.tile_idx
+                n_block, head_idx, batch_idx, _ = work_tile.tile_idx
                 seqlen = SeqlenInfoCls(batch_idx)
                 mK_cur = mK[None, None, head_idx, batch_idx]
                 gK = cute.local_tile(mK_cur, (self.tile_n, self.tile_hdim), (n_block, 0))
@@ -932,7 +934,7 @@ class FlashAttentionBackwardSm90:
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
-            n_block, head_idx, batch_idx = work_tile.tile_idx
+            n_block, head_idx, batch_idx, _ = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
             mask = AttentionMaskCls(seqlen.seqlen_q, seqlen.seqlen_k)
             mask_fn = partial(
@@ -1208,7 +1210,7 @@ class FlashAttentionBackwardSm90:
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
-            n_block, head_idx, batch_idx = work_tile.tile_idx
+            n_block, head_idx, batch_idx, _ = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
             mdQaccum_cur = mdQaccum[None, head_idx, batch_idx]
             gdQaccum_ = cute.local_tile(mdQaccum_cur, (self.tile_m * self.tile_hdim,), (None,))
