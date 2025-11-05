@@ -8,6 +8,7 @@
 name: Build wheels and deploy
 
 on:
+  workflow_dispatch:
   create:
     tags:
       - v*
