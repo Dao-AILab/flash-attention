@@ -235,6 +235,21 @@ auto mma_partition_fragment_AB(Mma const& mma, Tensor0 const& tensor0) {
 template <bool zero_init=false, int wg_wait=0, bool SwapAB=false, int M_slice=-1,
         typename Tensor0, typename Tensor1, typename Tensor2, typename TiledMma>
 CUTLASS_DEVICE void gemm(TiledMma& tiled_mma, Tensor0 const& tCrA, Tensor1 const& tCrB, Tensor2& tCrC) {
+#ifndef FLASHATTENTION_DISABLE_FP8_TWO_LEVEL_ACCUMULATION
+    static constexpr bool Is_FP8 = cute::is_same_v<typename Tensor0::value_type, cutlass::float_e4m3_t> 
+        || cute::is_same_v<typename Tensor0::value_type, cutlass::float_e5m2_t>;
+    static constexpr bool Use_Two_Level = Is_FP8 && !zero_init;
+    
+    auto tCrC_original = cute::make_fragment_like(tCrC);
+    if constexpr (Use_Two_Level) {
+        // Copy original values to backup
+        #pragma unroll
+        for (int i = 0; i < cute::size(tCrC); ++i) {
+            tCrC_original(i) = tCrC(i);
+        }
+        cute::clear(tCrC);
+    }
+#endif
     if constexpr (M_slice >= 0) {
         static constexpr int MMA_M = decltype(size<1>(tCrC))::value;
         static_assert(M_slice < MMA_M);
@@ -301,6 +316,15 @@ CUTLASS_DEVICE void gemm(TiledMma& tiled_mma, Tensor0 const& tCrA, Tensor1 const
             }
         }
     }
+
+#ifndef FLASHATTENTION_DISABLE_FP8_TWO_LEVEL_ACCUMULATION
+    if constexpr (Use_Two_Level) {
+        #pragma unroll
+        for (int i = 0; i < cute::size(tCrC); ++i) {
+            tCrC(i) = tCrC_original(i) + tCrC(i);  // Add temp results to original
+        }
+    }
+#endif
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
