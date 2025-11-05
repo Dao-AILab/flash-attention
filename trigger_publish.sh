@@ -9,9 +9,9 @@ then
 fi
 
 # Get the repository name from the git remote
-REPO=$(gh repo view --json name --jq .name)
+REPO=gueraf/flash-attention
 # Get the current branch name
-BRANCH=$(git rev-parse --abbrev-ref HEAD)
+BRANCH=main
 
 echo "Triggering publish workflow on $REPO for branch $BRANCH"
 
