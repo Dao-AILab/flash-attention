@@ -785,8 +785,6 @@ def test_flash_attn_kvcache(
     mha_type,
     dtype,
 ):
-    # if page_size is not None and seqlen_k % page_size != 0:
-    #     pytest.skip()
     if seqlen_q > seqlen_k and new_kv:
         pytest.skip()
     if not new_kv and rotary_fraction > 0.0:
@@ -937,7 +935,7 @@ def test_flash_attn_kvcache(
                 dtype_ref,
             )
         cache_seqlens = torch.randint(
-            0 if new_kv else 1,
+            max(0 if new_kv else 1, seqlen_q),
             # If we don't use seqlen_q in the case of causal and rotary, cos/sin won't be long enough
             (
                 (
@@ -1236,10 +1234,6 @@ def test_flash_attn_kvcache(
                                 k_cache_select, k_cache_ref, rtol=1e-1, atol=1e-1
                             )
                 mult = 4 if dtype == torch.float8_e4m3fn else 2
-
-                # if (out - out_ref).abs().max().item() > mult * (out_pt - out_ref).abs().max().item() + 1e-5:
-                #     import pdb; pdb.set_trace()
-
                 assert (out - out_ref).abs().max().item() <= mult * (
                     out_pt - out_ref
                 ).abs().max().item() + 1e-5

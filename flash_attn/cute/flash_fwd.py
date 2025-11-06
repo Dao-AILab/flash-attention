@@ -1880,7 +1880,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 work_tile = tile_scheduler.get_current_work()
                 # End of persistent scheduler loop
 
-    # How to inline?
     @cute.jit
     def get_n_block(
         self,
