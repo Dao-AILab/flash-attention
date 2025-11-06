@@ -732,7 +732,7 @@ def test_flash_attn_varlen_output(
 # @pytest.mark.parametrize("rotary_fraction", [0.0, 0.5, 1.0])
 @pytest.mark.parametrize("rotary_fraction", [0.0])
 # @pytest.mark.parametrize("page_size", [None] + ([1, 4, 128]))
-@pytest.mark.parametrize("page_size", [None, 128])
+@pytest.mark.parametrize("page_size", [None, 128, 256])
 # @pytest.mark.parametrize("page_size", [128])
 # @pytest.mark.parametrize("has_leftpad", [False, True])
 @pytest.mark.parametrize("has_leftpad", [False])
@@ -745,7 +745,7 @@ def test_flash_attn_varlen_output(
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192])
 # @pytest.mark.parametrize('d', [56, 80])
 # @pytest.mark.parametrize("d", [128])
-@pytest.mark.parametrize("d", [64])
+@pytest.mark.parametrize("d", [64, 128])
 # @pytest.mark.parametrize("d", [192])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
@@ -785,8 +785,8 @@ def test_flash_attn_kvcache(
     mha_type,
     dtype,
 ):
-    if page_size is not None and seqlen_k % page_size != 0:
-        pytest.skip()
+    # if page_size is not None and seqlen_k % page_size != 0:
+    #     pytest.skip()
     if seqlen_q > seqlen_k and new_kv:
         pytest.skip()
     if not new_kv and rotary_fraction > 0.0:
@@ -1236,6 +1236,10 @@ def test_flash_attn_kvcache(
                                 k_cache_select, k_cache_ref, rtol=1e-1, atol=1e-1
                             )
                 mult = 4 if dtype == torch.float8_e4m3fn else 2
+
+                # if (out - out_ref).abs().max().item() > mult * (out_pt - out_ref).abs().max().item() + 1e-5:
+                #     import pdb; pdb.set_trace()
+
                 assert (out - out_ref).abs().max().item() <= mult * (
                     out_pt - out_ref
                 ).abs().max().item() + 1e-5
