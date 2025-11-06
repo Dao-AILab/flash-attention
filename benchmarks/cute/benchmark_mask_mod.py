@@ -14,8 +14,8 @@ from cutlass.cute.runtime import from_dlpack
 import numpy as np
 import torch
 
-from flash_fwd import FlashAttentionForwardSm90
-from mask_definitions import (
+from flash_attn.cute.flash_fwd import FlashAttentionForwardSm90
+from flash_attn.cute.mask_definitions import (
     get_mask_pair,
     random_doc_id_tensor,
 )
@@ -654,11 +654,11 @@ if __name__ == "__main__":
         seqlen_k=8192,
         # seqlen_k=192,
         use_varlen=False,
-        use_mask_mod=True,
+        use_mask_mod=False,
         mask_mod_name="causal",
         window_size=128,  # Configurable window size for mask_mod
         use_learnable_sink=False,
-        causal=False,
+        causal=True,
         is_local=False,
         verbose=True,
     )
