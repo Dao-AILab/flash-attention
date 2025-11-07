@@ -255,7 +255,7 @@ class FlashAttentionForwardCombine:
         # Grid dimensions: (ceil_div(seqlen, m_block), ceil_div(head_dim, k_block), num_head * batch)
         seqlen = mO_partial.shape[0]
         num_head = mO_partial.shape[3]
-        batch_size = mO_partial.shape[4]
+        batch_size = mO_partial.shape[4] if const_expr(cu_seqlens is None) else Int32(cu_seqlens.shape[0] - 1)
 
         # Create FastDivmod objects for efficient division
         seqlen_divmod = FastDivmod.create(seqlen)
@@ -341,7 +341,7 @@ class FlashAttentionForwardCombine:
             else mLSE_partial.shape[1]
         )
         # Handle variable length sequences using SeqlenInfo
-        seqlen_info = SeqlenInfo(
+        seqlen_info = SeqlenInfo.create(
             batch_idx=batch_idx,
             seqlen_static=mO_partial.shape[0],
             cu_seqlens=cu_seqlens,
