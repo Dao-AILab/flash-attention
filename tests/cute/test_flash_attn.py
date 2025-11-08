@@ -2,6 +2,7 @@
 
 import math
 import itertools
+import os
 
 import pytest
 import torch
@@ -27,20 +28,23 @@ from flash_attn.cute.interface import (
 )
 
 
+DISABLE_SPLIT = os.getenv("FLASH_ATTENTION_DISABLE_SPLIT", "FALSE") == "TRUE"
+
+
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-# @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
-@pytest.mark.parametrize("mha_type", ["mha"])
-# @pytest.mark.parametrize("has_learnable_sink", [False, True])
-@pytest.mark.parametrize("has_learnable_sink", [False])
+@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
+# @pytest.mark.parametrize("mha_type", ["mha"])
+@pytest.mark.parametrize("has_learnable_sink", [False, True])
+# @pytest.mark.parametrize("has_learnable_sink", [False])
 # @pytest.mark.parametrize("has_qv", [False, True])
 @pytest.mark.parametrize("has_qv", [False])
 # @pytest.mark.parametrize("deterministic", [False, True])
 @pytest.mark.parametrize("deterministic", [False])
 # @pytest.mark.parametrize("softcap", [0.0, 15.0])
 @pytest.mark.parametrize("softcap", [0.0])
-# @pytest.mark.parametrize("local", [False, True])
-@pytest.mark.parametrize("local", [False])
+@pytest.mark.parametrize("local", [False, True])
+# @pytest.mark.parametrize("local", [False])
 @pytest.mark.parametrize("causal", [False, True])
 # @pytest.mark.parametrize("causal", [True])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
@@ -222,8 +226,9 @@ def test_flash_attn_output(
         print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
         # num_splits_vals = [1, 3]
         # pack_gqa_vals = [False, True, None]
+        # SplitKV is not supported for hdim >= 192
         pack_gqa_vals = [False]
-        num_splits_vals = [1]
+        num_splits_vals = [1] # [1, 3] if d < 192 and not DISABLE_SPLIT else [1]
         for pack_gqa, num_splits in itertools.product(pack_gqa_vals, num_splits_vals):
             out, lse = flash_attn_func(
                 q,
@@ -237,7 +242,7 @@ def test_flash_attn_output(
                 softcap=softcap,
                 learnable_sink=learnable_sink,
                 # pack_gqa=pack_gqa,
-                # num_splits=num_splits
+                num_splits=num_splits,
             )
             print(f"Output max diff: {(out - out_ref).abs().max().item()}")
             print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
@@ -260,6 +265,7 @@ def test_flash_attn_output(
             and not local
             and dv == d
             and learnable_sink is None
+            and mha_type == "mha"
             # and False
         ):
             g = torch.randn_like(out)
@@ -568,7 +574,8 @@ def test_flash_attn_varlen_output(
 
         pack_gqa_vals = [False, True, None]
         # num_splits_vals = [1, 3]
-        num_splits_vals = [1]
+        # SplitKV is not supported for hdim >= 192
+        num_splits_vals = [1, 3] if d < 192 and not DISABLE_SPLIT else [1]
         for pack_gqa, num_splits in itertools.product(pack_gqa_vals, num_splits_vals):
             out_unpad, lse = flash_attn_varlen_func(
                 q_unpad,
@@ -587,6 +594,7 @@ def test_flash_attn_varlen_output(
                 # attention_chunk=attention_chunk,
                 learnable_sink=learnable_sink,
                 softcap=softcap,
+                num_splits=num_splits,
                 pack_gqa=pack_gqa,
             )
             out = output_pad_fn(out_unpad)
@@ -1097,7 +1105,7 @@ def test_flash_attn_kvcache(
         k_cache_saved = k_cache.clone() if page_size is None else k_cache_paged.clone()
         v_cache_saved = v_cache.clone() if page_size is None else v_cache_paged.clone()
         # num_splits_vals = [1, 0]
-        num_splits_vals = [1]
+        num_splits_vals = [1, 3] if d < 192 and not DISABLE_SPLIT else [1]
         # precompute_metadata_vals = [False, True]
         precompute_metadata_vals = [False]
         for num_splits, precompute_metadata in itertools.product(
