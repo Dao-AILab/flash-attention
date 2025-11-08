@@ -548,7 +548,7 @@ def _flash_attn_bwd(
     seqused_k: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     compute_capability = torch.cuda.get_device_capability()[0]
-    assert compute_capability in [9,10], "Unsupported compute capability. Supported: 9.x, 10.x"
+    assert compute_capability in [9, 10], "Unsupported compute capability. Supported: 9.x, 10.x"
 
     if compute_capability == 9:
         m_block_size = 80 if not causal else 64
