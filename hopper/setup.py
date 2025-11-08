@@ -568,6 +568,7 @@ if not SKIP_CUDA_BUILD:
         "-DCUTLASS_DEBUG_TRACE_LEVEL=0",  # Can toggle for debugging
         "-DNDEBUG",  # Important, otherwise performance is severely impacted
     ]
+    cxx_flags = ["-O3", "-std=c++17", "-DPy_LIMITED_API=0x03090000"]
     if get_platform() == "win_amd64":
         nvcc_flags.extend(
             [
@@ -575,6 +576,7 @@ if not SKIP_CUDA_BUILD:
                 "-Xcompiler=/Zc:__cplusplus",  # sets __cplusplus correctly, CUTLASS_CONSTEXPR_IF_CXX17 needed for cutlass::gcd
             ]
         )
+        cxx_flags.extend(["/O2", "/std:c++17", "/Zc:__cplusplus"])
     include_dirs = [
         Path(this_dir),
         cutlass_dir / "include",
@@ -585,7 +587,7 @@ if not SKIP_CUDA_BUILD:
             name=f"{PACKAGE_NAME}._C",
             sources=sources,
             extra_compile_args={
-                "cxx": ["-O3", "-std=c++17", "-DPy_LIMITED_API=0x03090000"] + stable_args + feature_args,
+                "cxx": cxx_flags + stable_args + feature_args,
                 "nvcc": nvcc_threads_args() + nvcc_flags + cc_flag + feature_args,
             },
             include_dirs=include_dirs,
