@@ -287,7 +287,10 @@ def _flash_attn_fwd(
         if _compute_capability is None
         else _compute_capability
     )
-    assert compute_capability in [9, 10], "Unsupported compute capability. Supported: 9.x, 10.x"
+    # Map SM120 (compute capability 12) to SM100 kernels since they're both Blackwell variants
+    if compute_capability == 12:
+        compute_capability = 10
+    assert compute_capability in [9, 10], "Unsupported compute capability. Supported: 9.x, 10.x, 12.x (uses SM100 kernels)"
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     if compute_capability == 9:  # TODO: tune block size according to hdim.
@@ -499,7 +502,10 @@ def _flash_attn_bwd(
     seqused_k: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     compute_capability = torch.cuda.get_device_capability()[0]
-    assert compute_capability in [9, 10], "Unsupported compute capability. Supported: 9.x, 10.x"
+    # Map SM120 (compute capability 12) to SM100 kernels since they're both Blackwell variants
+    if compute_capability == 12:
+        compute_capability = 10
+    assert compute_capability in [9, 10], "Unsupported compute capability. Supported: 9.x, 10.x, 12.x (uses SM100 kernels)"
 
     if compute_capability == 9:
         m_block_size = 80 if not causal else 64
