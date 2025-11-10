@@ -1,20 +1,15 @@
 # A reimplementation of https://github.com/Dao-AILab/flash-attention/blob/main/hopper/flash_prepare_scheduler.cu
 # from Cutlass C++ to Cute-DSL.
 
-import math
-from typing import Optional
+from typing import Optional, Tuple
 
 import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, const_expr, Constexpr
+from cutlass import Boolean, Int32, const_expr, Constexpr
 
 from flash_attn.cute.fast_math import FastDivmod
-
-# @cute.jit 
-def ceil_div(a, b):
-    return (a + b - 1) // b
 
 
 class FlashPrepareScheduler:
@@ -22,38 +17,19 @@ class FlashPrepareScheduler:
         self,
         sort: bool = False,
     ):
-        """
-        Initialize the FlashPrepareScheduler with compile-time parameters.
-
-        Args:
-            sort: Whether to sort batches (compile-time parameter, corresponds to Sort template parameter)
-        """
         self.sort = sort
         self.num_threads_per_warp = 32
-        self.k_num_batch_per_warp = self.num_threads_per_warp - 1
-        
-    def _setup_attributes(self):
-        self.qhead_per_khead = 1
-        # if self.nheads_kv > 0:
-        #     self.qhead_per_khead = ceil_div(self.nheads, self.nheads_kv)
-        self.num_warps = ceil_div(self.num_batch, 31)  # max 31 batches per warp
-        self.num_ctas = ceil_div(self.num_batch, 31 * 32)  # max 32 warps per CTA
-        
-        # Compute L2 cache size and max KV blocks
-        self.size_l2_divisor = (
-            1
-            if self.qhead_per_khead == 1
-            else (
-                2
-                if self.qhead_per_khead <= 2
-                else (4 if self.qhead_per_khead <= 4 else (8 if self.qhead_per_khead <= 8 else 16))
-            )
-        )
-        self.size_l2 = (32 * 1024 * 1024) / self.size_l2_divisor  # experimental
-        element_size = 1 if self.is_e4m3 else 2
-        self.size_one_kvblock = self.tile_n * (self.d + self.dv) * element_size
-        self.max_kvblocks_in_l2 = ceil_div(self.size_l2, self.size_one_kvblock)
-        
+        self.k_num_batch_per_warp = 31
+
+    def get_grid_and_block_shape(
+        self,
+        num_batch: int,
+    ) -> Tuple[Tuple[int, int, int], Tuple[int, int, int]]:
+        num_warps = (num_batch + 30) // 31
+        num_ctas = (num_batch + (31 * 32 - 1)) // (31 * 32)
+        if num_ctas > 1:
+            num_warps = 32
+        return ((num_ctas, 1, 1), (32 * num_warps, 1, 1))
 
     @cute.jit
     def __call__(
@@ -61,13 +37,13 @@ class FlashPrepareScheduler:
         seqlen_q_static: int,
         seqlen_k_static: int,
         seqlen_k_new_static: int,
-        cu_seqlens_q: Optional[cute.Tensor],
-        cu_seqlens_k: Optional[cute.Tensor],
-        cu_seqlens_k_new: Optional[cute.Tensor],
-        seqused_q: Optional[cute.Tensor],
-        seqused_k: Optional[cute.Tensor],
-        leftpad_k: Optional[cute.Tensor],
-        num_batch: int,
+        mCuSeqlensQ: Optional[cute.Tensor],
+        mCuSeqlensK: Optional[cute.Tensor],
+        mCuSeqlensKNew: Optional[cute.Tensor],
+        mSeqUsedQ: Optional[cute.Tensor],
+        mSeqUsedK: Optional[cute.Tensor],
+        mLeftPadK: Optional[cute.Tensor],
+        num_batch: Constexpr[int],
         nheads: int,
         nheads_kv: int,
         num_sm: int,
@@ -75,13 +51,13 @@ class FlashPrepareScheduler:
         tile_m: int,
         tile_n: int,
         tile_count_semaphore: Optional[cute.Tensor],
-        prepare_seqlen_q_ptr: cute.Tensor,
-        num_splits_dynamic_ptr: Optional[cute.Tensor],
-        varlen_batch_idx_ptr: Optional[cute.Tensor],
-        num_nheads_in_l2_ptr: Optional[cute.Tensor],
+        mPrepareSeqlenQ: Optional[cute.Tensor],
+        mNumSplitsDynamic: Optional[cute.Tensor],
+        mVarlenBatchIdx: Optional[cute.Tensor],
+        mNumNheadsInL2: Optional[cute.Tensor],
         enable_pdl: bool,
         is_causal: bool,
-        packgqa: bool,
+        packgqa: Constexpr[bool],
         is_e4m3: Constexpr[bool],
         d: int,
         dv: int,
@@ -89,13 +65,11 @@ class FlashPrepareScheduler:
     ):
         """
         Execute the prepare scheduler kernel.
-
-        This corresponds to the C++ prepare_varlen_num_blocks function.
-        All parameters are runtime parameters extracted from Flash_fwd_params.
         """
+        # Store as Python ints for grid calculation
         self.nheads = nheads
         self.nheads_kv = nheads_kv
-        self.num_batch = num_batch
+        self.num_batch = num_batch  # Python int
         self.tile_m = tile_m
         self.tile_n = tile_n
         self.d = d
@@ -105,58 +79,76 @@ class FlashPrepareScheduler:
         self.is_causal = is_causal
         self.packgqa = packgqa
         self.num_splits_static = num_splits_static
-        
-        self._setup_attributes()
+        self.qhead_per_khead = (nheads + nheads_kv - 1) // nheads_kv
+        self.num_warps = (num_batch + 30) // 31
+        self.num_ctas = (num_batch + (31 * 32 - 1)) // (31 * 32)
 
-        
+        # L2 cache calculations
+        qhead_per_khead = self.qhead_per_khead
+        self.size_l2_divisor = (
+            1
+            if qhead_per_khead == 1
+            else (
+                2
+                if qhead_per_khead <= 2
+                else (4 if qhead_per_khead <= 4 else (8 if qhead_per_khead <= 8 else 16))
+            )
+        )
+        self.size_l2 = (32 * 1024 * 1024) // self.size_l2_divisor
+        element_size = 1 if self.is_e4m3 else 2
+        self.size_one_kvblock = self.tile_n * (self.d + self.dv) * element_size
+        self.max_kvblocks_in_l2 = (
+            self.size_l2 + self.size_one_kvblock - 1
+        ) // self.size_one_kvblock
 
+        self.num_head_computed = self.nheads if not self.packgqa else self.nheads_kv
+
+        # Create FastDivmod objects
+        tile_m_divmod = FastDivmod.create(Int32(tile_m))
+        tile_n_divmod = FastDivmod.create(Int32(tile_n))
+
+        qhead_per_khead_int32 = Int32(self.qhead_per_khead)
+
+        grid, block = self.get_grid_and_block_shape(num_batch)
+
+        # shared memory for total block updates
         self.k_smem_size = 1
 
         @cute.struct
         class SharedStorage:
             total_blocks_smem: cute.struct.MemRange[Int32, self.k_smem_size]
-            # TODO: SMEM for sort operations (BlockMergeSort temp storage)
 
         self.shared_storage = SharedStorage
 
-        self.num_head_computed = self.nheads if not self.packgqa else self.nheads_kv
-
-        # Create FastDivmod objects for efficient division
-        tile_m_divmod = FastDivmod.create(Int32(tile_m))
-        tile_n_divmod = FastDivmod.create(Int32(tile_n))
-
-        # Convert Python integers to Int32 for kernel
-        qhead_per_khead_int32 = Int32(self.qhead_per_khead)
-        breakpoint()
         self.kernel(
-            Int32(seqlen_q_static),
+            seqlen_q_static,
             Int32(seqlen_k_static),
             Int32(seqlen_k_new_static),
-            cu_seqlens_q,
-            cu_seqlens_k,
-            cu_seqlens_k_new,
-            seqused_q,
-            seqused_k,
-            leftpad_k,
-            Int32(self.num_batch),
+            mCuSeqlensQ,
+            mCuSeqlensK,
+            mCuSeqlensKNew,
+            mSeqUsedQ,
+            mSeqUsedK,
+            mLeftPadK,
+            Int32(num_batch),
             Int32(self.num_head_computed),
-            Int32(self.qhead_per_khead),
+            qhead_per_khead_int32,
             Int32(num_sm),
-            Int32(self.num_splits_static),
+            Int32(num_splits_static),
             tile_m_divmod,
             tile_n_divmod,
             tile_count_semaphore,
-            prepare_seqlen_q_ptr,
-            num_splits_dynamic_ptr,
-            varlen_batch_idx_ptr,
-            num_nheads_in_l2_ptr,
+            mPrepareSeqlenQ,
+            mNumSplitsDynamic,
+            mVarlenBatchIdx,
+            mNumNheadsInL2,
             enable_pdl,
             is_causal,
             packgqa,
-            self.max_kvblocks_in_l2,
+            Int32(self.max_kvblocks_in_l2),
         ).launch(
-            grid=[self.num_ctas, 1, 1],
-            block=[32 * self.num_warps, 1, 1],
+            grid=grid,
+            block=block,
             stream=stream,
             smem=self.shared_storage.size_in_bytes(),
         )
@@ -167,13 +159,13 @@ class FlashPrepareScheduler:
         seqlen_q_static: Int32,
         seqlen_k_static: Int32,
         seqlen_k_new_static: Int32,
-        cu_seqlens_q: cute.Tensor,
-        cu_seqlens_k: cute.Tensor,
-        cu_seqlens_k_new: cute.Tensor,
-        seqused_q: cute.Tensor,
-        seqused_k: cute.Tensor,
-        leftpad_k_ptr: cute.Pointer,
-        num_batch: Int32,
+        mCuSeqlensQ: Optional[cute.Tensor],
+        mCuSeqlensK: Optional[cute.Tensor],
+        mCuSeqlensKNew: Optional[cute.Tensor],
+        mSeqUsedQ: Optional[cute.Tensor],
+        mSeqUsedK: Optional[cute.Tensor],
+        mLeftPadK: Optional[cute.Tensor],
+        num_batch: Int32,  # Int32 in kernel
         num_head: Int32,
         qhead_per_khead: Int32,
         num_sm: Int32,
@@ -181,14 +173,14 @@ class FlashPrepareScheduler:
         tile_m_divmod: FastDivmod,
         tile_n_divmod: FastDivmod,
         tile_count_semaphore: Optional[cute.Tensor],
-        prepare_seqlen_q_ptr: cute.Tensor,
-        num_splits_dynamic_ptr: cute.Tensor,
-        varlen_batch_idx_ptr: cute.Tensor,
-        num_nheads_in_l2_ptr: cute.Tensor,
-        enable_pdl: bool,
-        is_causal: bool,
-        packgqa: bool,
-        max_kvblocks_in_l2: int,
+        mPrepareSeqlenQ: Optional[cute.Tensor],
+        mNumSplitsDynamic: Optional[cute.Tensor],
+        mVarlenBatchIdx: Optional[cute.Tensor],
+        mNumNheadsInL2: Optional[cute.Tensor],
+        enable_pdl: Boolean,
+        is_causal: Boolean,
+        packgqa: Constexpr[bool],
+        max_kvblocks_in_l2: Int32,
     ):
         k_num_batch_per_warp = self.k_num_batch_per_warp
         bdimx, _, _ = cute.arch.block_dim()
@@ -197,18 +189,17 @@ class FlashPrepareScheduler:
         grid_dimx, _, _ = cute.arch.grid_dim()
         warp_idx = cute.arch.warp_idx()
         lane_idx = cute.arch.lane_idx()
-        items_per_thread = 1
 
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
         total_blocks_smem = storage.total_blocks_smem.get_tensor((1,))
 
         if tidx == 0:
-            total_blocks_smem[0] = 0
+            total_blocks_smem[0] = Int32(0)
         cute.arch.sync_threads()
 
         if tidx == 0 and const_expr(tile_count_semaphore is not None):
-            tile_count_semaphore[0] = 0
+            tile_count_semaphore[0] = Int32(0)
 
         batch_cta_idx_offset = bidx * 992
         bidb_start = batch_cta_idx_offset + k_num_batch_per_warp * warp_idx
@@ -217,60 +208,65 @@ class FlashPrepareScheduler:
         num_m_blocks, seqlen_q = self.get_num_m_blocks_and_seqlen(
             lane_idx,
             batch_idx,
-            k_num_batch_per_warp,
-            seqused_q,
-            cu_seqlens_q,
+            Int32(k_num_batch_per_warp),  # Convert Python int to Int32
+            mSeqUsedQ,
+            mCuSeqlensQ,
             seqlen_q_static,
             tile_m_divmod,
             num_batch,
             qhead_per_khead,
-            packgqa,
         )
 
         num_n_blocks = self.get_num_n_blocks(
             lane_idx,
             batch_idx,
-            k_num_batch_per_warp,
-            seqused_k,
-            cu_seqlens_k,
-            cu_seqlens_k_new,
+            Int32(k_num_batch_per_warp),
+            mSeqUsedK,
+            mCuSeqlensK,
+            mCuSeqlensKNew,
             seqlen_k_static,
             seqlen_k_new_static,
-            leftpad_k_ptr,
+            mLeftPadK,
             tile_n_divmod,
             num_batch,
         )
-
-        if const_expr(grid_dimx > 1 or num_splits_static == 1):
-            num_splits_dynamic = 1
+        num_splits_dynamic = Int32(0)
+        if grid_dimx > 1 or num_splits_static == 1:
+            num_splits_dynamic = Int32(1)
         else:
             total_blocks = num_m_blocks * num_n_blocks
-            # Warp sum
+            # Warp reduction
             for i in range(self.num_threads_per_warp // 2, 0, -1):
                 total_blocks += cute.arch.shuffle_sync_down(total_blocks, offset=i)
             if lane_idx == 0:
-                cute.arch.atomic_add(total_blocks_smem, total_blocks)
+                total_blocks_smem.store(total_blocks_smem.load() + total_blocks)
             cute.arch.sync_threads()
 
             total_blocks = total_blocks_smem[0]
-            blocks_per_sm = cute.ceil_div(total_blocks * 1.1 * num_head / num_sm)
-            num_splits_dynamic = max(
-                min((num_n_blocks + blocks_per_sm - 1) / blocks_per_sm, num_splits_static), 1
+            blocks_per_sm = cute.ceil_div(total_blocks * 110 // 100 * num_head, num_sm)
+            num_splits_dynamic = cutlass.max(
+                cutlass.min(cute.ceil_div(num_n_blocks, blocks_per_sm), num_splits_static), Int32(1)
             )
             num_n_blocks = cute.ceil_div(num_n_blocks, num_splits_dynamic)
 
-        # TODO: sort
         if const_expr(self.sort):
-            # Sort logic will be implemented later
-            num_n_blocks = Int32(0)
+            # TODO: Implement sort logic
+            pass
         else:
-            if batch_idx < num_batch and lane_idx < k_num_batch_per_warp:
-                prepare_seqlen_q_ptr[batch_idx] = seqlen_q * (qhead_per_khead if packgqa else 1)
-                if const_expr(num_splits_dynamic_ptr is not None):
-                    num_splits_dynamic_ptr[batch_idx] = num_splits_dynamic
-                if const_expr(num_nheads_in_l2_ptr is not None):
-                    num_nheads_in_l2_ptr[batch_idx] = self.get_num_nheads_in_l2(
-                        max(num_n_blocks, 1), num_head, max_kvblocks_in_l2, packgqa, qhead_per_khead
+            if batch_idx < num_batch and lane_idx < Int32(k_num_batch_per_warp):
+                if const_expr(mPrepareSeqlenQ is not None):
+                    if const_expr(packgqa):
+                        mPrepareSeqlenQ[batch_idx] = seqlen_q * qhead_per_khead
+                    else:
+                        mPrepareSeqlenQ[batch_idx] = seqlen_q
+                if const_expr(mNumSplitsDynamic is not None):
+                    mNumSplitsDynamic[batch_idx] = num_splits_dynamic
+                if const_expr(mNumNheadsInL2 is not None):
+                    mNumNheadsInL2[batch_idx] = self.get_num_nheads_in_l2(
+                        cutlass.max(num_n_blocks, Int32(1)),
+                        num_head,
+                        max_kvblocks_in_l2,
+                        qhead_per_khead,
                     )
 
     @cute.jit
@@ -279,26 +275,26 @@ class FlashPrepareScheduler:
         lane_idx: Int32,
         batch_idx: Int32,
         k_num_batch_per_warp: Int32,
-        seqused_q: cute.Tensor,
-        cu_seqlens_q: cute.Tensor,
+        mSeqUsedQ: Optional[cute.Tensor],
+        mCuSeqlensQ: Optional[cute.Tensor],
         seqlen_q_static: Int32,
         tile_m_divmod: FastDivmod,
         num_batch: Int32,
         qhead_per_khead: Int32,
-        packgqa: bool,
     ):
         seqlen = Int32(0)
-        if const_expr(seqused_q is not None):
-            seqlen = seqused_q[batch_idx] if batch_idx < num_batch else Int32(0)
-        elif const_expr(cu_seqlens_q is not None):
-            cur_cu_seqlen = cu_seqlens_q[batch_idx] if batch_idx <= num_batch else Int32(0)
+        if const_expr(mSeqUsedQ is not None):
+            seqlen = mSeqUsedQ[batch_idx] if batch_idx < num_batch else Int32(0)
+        elif const_expr(mCuSeqlensQ is not None):
+            cur_cu_seqlen = mCuSeqlensQ[batch_idx] if batch_idx <= num_batch else Int32(0)
             next_cu_seqlen = cute.arch.shuffle_sync_down(cur_cu_seqlen, offset=1)
             seqlen = next_cu_seqlen - cur_cu_seqlen
         else:
             seqlen = seqlen_q_static
-        # For packgqa, multiply seqlen by qhead_per_khead; otherwise use seqlen as-is
-        # This matches C++: seqlen * (packgqa ? qhead_per_khead : 1)
-        seqlen_for_blocks = seqlen * (qhead_per_khead if packgqa else 1)
+
+        seqlen_for_blocks = seqlen
+        if const_expr(self.packgqa):
+            seqlen_for_blocks = seqlen * qhead_per_khead
         num_m_blocks = (
             tile_m_divmod.div(seqlen_for_blocks + tile_m_divmod.divisor - 1)
             if batch_idx < num_batch and lane_idx < k_num_batch_per_warp
@@ -312,29 +308,33 @@ class FlashPrepareScheduler:
         lane_idx: Int32,
         batch_idx: Int32,
         k_num_batch_per_warp: Int32,
-        seqused_k: cute.Tensor,
-        cu_seqlens_k: cute.Tensor,
-        cu_seqlens_k_new: cute.Tensor,
+        mSeqUsedK: Optional[cute.Tensor],
+        mCuSeqlensK: Optional[cute.Tensor],
+        mCuSeqlensKNew: Optional[cute.Tensor],
         seqlen_k_static: Int32,
         seqlen_k_new_static: Int32,
-        leftpad_k_ptr: cute.Pointer,
+        mLeftPadK: Optional[cute.Tensor],
         tile_n_divmod: FastDivmod,
         num_batch: Int32,
     ):
-        leftpad_k = leftpad_k_ptr[batch_idx] if batch_idx < num_batch else Int32(0)
+        leftpad_k = (
+            mLeftPadK[batch_idx]
+            if const_expr(mLeftPadK is not None) and batch_idx < num_batch
+            else Int32(0)
+        )
         seqlen = Int32(0)
-        if const_expr(seqused_k is not None):
-            seqlen = seqused_k[batch_idx] if batch_idx < num_batch else Int32(0)
-        elif const_expr(cu_seqlens_k is not None):
-            cur_cu_seqlen = cu_seqlens_k[batch_idx] if batch_idx <= num_batch else Int32(0)
+        if const_expr(mSeqUsedK is not None):
+            seqlen = mSeqUsedK[batch_idx] if batch_idx < num_batch else Int32(0)
+        elif const_expr(mCuSeqlensK is not None):
+            cur_cu_seqlen = mCuSeqlensK[batch_idx] if batch_idx <= num_batch else Int32(0)
             next_cu_seqlen = cute.arch.shuffle_sync_down(cur_cu_seqlen, offset=1)
             seqlen = next_cu_seqlen - cur_cu_seqlen
         else:
             seqlen = seqlen_k_static
 
         seqlen_new = Int32(0)
-        if const_expr(cu_seqlens_k_new is not None):
-            cur_cu_seqlen_new = cu_seqlens_k_new[batch_idx] if batch_idx <= num_batch else Int32(0)
+        if const_expr(mCuSeqlensKNew is not None):
+            cur_cu_seqlen_new = mCuSeqlensKNew[batch_idx] if batch_idx <= num_batch else Int32(0)
             next_cu_seqlen_new = cute.arch.shuffle_sync_down(cur_cu_seqlen_new, offset=1)
             seqlen_new = next_cu_seqlen_new - cur_cu_seqlen_new
         else:
@@ -351,23 +351,22 @@ class FlashPrepareScheduler:
         self,
         num_n_blocks: Int32,
         num_head: Int32,
-        max_kvblocks_in_l2: int,
-        packgqa: bool,
+        max_kvblocks_in_l2: Int32,
         qhead_per_khead: Int32,
     ):
         nheads_in_l2 = (
-            16
-            if num_n_blocks * 16 <= max_kvblocks_in_l2
+            Int32(16)
+            if num_n_blocks * Int32(16) <= max_kvblocks_in_l2
             else (
-                8
-                if num_n_blocks * 8 <= max_kvblocks_in_l2
+                Int32(8)
+                if num_n_blocks * Int32(8) <= max_kvblocks_in_l2
                 else (
-                    4
-                    if num_n_blocks * 4 <= max_kvblocks_in_l2
-                    else (2 if num_n_blocks * 2 <= max_kvblocks_in_l2 else 1)
+                    Int32(4)
+                    if num_n_blocks * Int32(4) <= max_kvblocks_in_l2
+                    else (Int32(2) if num_n_blocks * Int32(2) <= max_kvblocks_in_l2 else Int32(1))
                 )
             )
         )
-        if const_expr(not packgqa):
+        if const_expr(not self.packgqa):
             nheads_in_l2 *= qhead_per_khead
-        return min(nheads_in_l2, num_head)
+        return cutlass.min(nheads_in_l2, num_head)
