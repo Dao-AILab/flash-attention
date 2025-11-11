@@ -562,11 +562,15 @@ def _flash_attn_bwd(
         AtomLayoutMSdP = 1
         AtomLayoutNdKV = 2
         AtomLayoutMdQ = 1
+        cluster_size = 1
     else:
         m_block_size = 128
         n_block_size = 128
         dQ_swapAB = False
+        dKV_swapAB = False
         AtomLayoutMdQ = 1
+        AtomLayoutNdKV = 1
+        cluster_size = 2
     q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = [
         maybe_contiguous(t)
         for t in (q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
@@ -637,6 +641,8 @@ def _flash_attn_bwd(
     qhead_per_kvhead = num_head // num_head_kv
     if pack_gqa is None:
         pack_gqa = qhead_per_kvhead > 1
+    if compute_capability == 10:
+        pack_gqa = False # override for now
 
     device = q.device
     # TODO: check if this is the right rounding
@@ -675,6 +681,9 @@ def _flash_attn_bwd(
         head_dim_v_rounded = (head_dim_v + 32 - 1) // 32 * 32
         if cu_seqlens_k is None:
             seqlen_k_rounded = (seqlen_k + n_block_size - 1) // n_block_size * n_block_size
+            num_n_blocks = seqlen_k_rounded // n_block_size
+            if cluster_size == 2 and num_n_blocks % cluster_size != 0:
+                seqlen_k_rounded = seqlen_k_rounded + n_block_size
             dk_accum = torch.zeros(
                 batch_size,
                 num_head_kv,
@@ -693,6 +702,9 @@ def _flash_attn_bwd(
             total_k_rounded_padded = (
                 (total_k + cu_seqlens_k.shape[0] * n_block_size - 1) // n_block_size * n_block_size
             )
+            num_n_blocks = total_k_rounded_padded // n_block_size
+            if cluster_size == 2 and num_n_blocks % cluster_size != 0:
+                total_k_rounded_padded = total_k_rounded_padded + n_block_size
             dk_accum = torch.zeros(
                 num_head_kv,
                 total_k_rounded_padded * head_dim_rounded,
@@ -802,6 +814,7 @@ def _flash_attn_bwd(
             n_block_size,
             num_threads,
             pack_gqa,
+            cluster_size,
         )
     num_threads = 384
     if compile_key not in _flash_attn_bwd.compile_cache:
@@ -854,7 +867,7 @@ def _flash_attn_bwd(
                 qhead_per_kvhead=qhead_per_kvhead,
                 # tile_m=m_block_size,
                 # tile_n=n_block_size,
-                cluster_size=2,
+                cluster_size=cluster_size,
                 # cluster_size=1,
             )
         # TODO: check @can_implement
