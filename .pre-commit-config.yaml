@@ -19,7 +19,6 @@ repos:
             interface|
             pack_gqa|
             testing|
-            tile_scheduler|
             utils
           )\.py$
       - id: ruff-format
