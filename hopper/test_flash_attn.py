@@ -57,6 +57,7 @@ COMPILED_HDIMS = (
 
 def should_test_backward(args, kwargs):
     v = args[2]
+    num_splits = kwargs.get("num_splits", 1)
     dtype = v.dtype
     has_qv = V_colmajor = False  # no test runs this with V_colmajor or has_qv == True
     attention_chunk = kwargs.get("attention_chunk")
@@ -70,6 +71,7 @@ def should_test_backward(args, kwargs):
         and not has_qv
         and not dv > 256
         and not attention_chunk != 0
+        and num_splits > 0  # we don't support num_split == 0 on torch.compile yet
     ):
         return True
     return False
