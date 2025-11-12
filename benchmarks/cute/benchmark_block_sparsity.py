@@ -8,8 +8,6 @@ from typing import Callable, Optional, List
 from tabulate import tabulate
 from tqdm import tqdm
 import itertools
-import importlib
-import sys
 
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.testing import benchmark as cute_benchmark
@@ -24,16 +22,7 @@ from flash_attn.cute.mask_definitions import (
 )
 
 from torch.nn.attention.flex_attention import create_block_mask
-
-has_nuggies = importlib.util.find_spec("transformer_nuggets")
-if not has_nuggies:
-    print(
-        "Need to install transformer_nuggets for PyTorch benchmarking. "
-        "Run `pip install git+https://github.com/drisspg/transformer_nuggets`"
-    )
-    sys.exit(1)
-
-from transformer_nuggets.utils import benchmark_cuda_function_in_microseconds_triton
+from triton.testing import do_bench
 
 # Configure torch.compile cache to prevent memory buildup
 torch._dynamo.config.cache_size_limit = 1000
@@ -51,7 +40,7 @@ class BenchmarkConfig:
     tile_m: int = 128
     tile_n: int = 128
     use_fast_sampling: bool = False
-    aux_tensors_cute: Optional[list] = None  # For CuTe aux tensors
+    aux_tensors_cute: Optional[list] = None
 
 
 @dataclass(frozen=True)
@@ -59,8 +48,8 @@ class BenchmarkResult:
     """Result of a single benchmark run."""
 
     config: BenchmarkConfig
-    cute_time_ms: Optional[float]  # None if CUTE failed
-    pytorch_time_ms: Optional[float]  # None if PyTorch failed
+    cute_time_ms: Optional[float]
+    pytorch_time_ms: Optional[float]
     error_message: Optional[str] = None
 
 
@@ -75,12 +64,10 @@ def benchmark_pytorch_block_sparsity(
     device = "cuda"
 
     try:
-        # Compile the function once
         cbm = torch.compile(create_block_mask)
 
-        # Warmup to ensure compilation is complete
-        for _ in range(10):
-            result = cbm(
+        def run_benchmark():
+            return cbm(
                 mask_fn,
                 config.batch_size,
                 config.num_heads,
@@ -88,25 +75,8 @@ def benchmark_pytorch_block_sparsity(
                 config.seqlen_k,
                 device=device,
             )
-            del result
 
-        torch.cuda.synchronize(device)
-
-        # Benchmark creation time using transformer_nuggets
-        # This utility handles warmup and timing properly
-        creation_time_us = benchmark_cuda_function_in_microseconds_triton(
-            lambda: cbm(
-                mask_fn,
-                config.batch_size,
-                config.num_heads,
-                config.seqlen_q,
-                config.seqlen_k,
-                device=device,
-            ),
-        )
-
-        torch.cuda.synchronize(device)
-        creation_time_ms = creation_time_us / 1000.0  # Convert to ms
+        creation_time_ms = do_bench(run_benchmark, warmup=10, rep=100)
 
         return creation_time_ms
 
@@ -128,7 +98,6 @@ def benchmark_cute_block_sparsity(
     device = "cuda"
 
     try:
-        # Create the output tensors
         num_m_blocks = (config.seqlen_q + config.tile_m - 1) // config.tile_m
         num_n_blocks = (config.seqlen_k + config.tile_n - 1) // config.tile_n
 
@@ -149,7 +118,7 @@ def benchmark_cute_block_sparsity(
             dtype=torch.int32,
         )
 
-        # Convert to cute tensors
+        # Convert to CuTe tensors
         mask_cnt_cute = from_dlpack(mask_block_cnt.detach(), assumed_align=4).mark_layout_dynamic(
             leading_dim=2
         )
@@ -204,7 +173,7 @@ def benchmark_cute_block_sparsity(
         )
 
         torch.cuda.synchronize(device)
-        creation_time_ms = creation_time_us / 1000.0  # Convert to ms
+        creation_time_ms = creation_time_us / 1000.0 
 
         return creation_time_ms
 
@@ -260,7 +229,6 @@ def generate_configs(
 
 
 def print_results(results: List[BenchmarkResult]):
-    # Filter out failed results
     successful_results = [
         r for r in results if r.cute_time_ms is not None and r.pytorch_time_ms is not None
     ]
@@ -301,7 +269,7 @@ def print_results(results: List[BenchmarkResult]):
 def main():
     """Run the comparative benchmark."""
 
-    # Configurationx``
+    # Configuration
     batch_sizes = [1, 4, 8]
     num_heads = [8, 16]
     seqlens = [1024, 2048, 4096, 8192]
@@ -352,7 +320,6 @@ def main():
     for config in tqdm(configs, desc="Benchmarking"):
         try:
             # Get mask pair from mask_definitions
-            # sliding_window is the only parameterized mask that needs window_size
             mask_kwargs = {}
             if config.mask_name == "sliding_window":
                 mask_kwargs["window_size"] = 128  # Default window size
@@ -367,7 +334,8 @@ def main():
             # For document masking, create wrapper that captures doc_ids
             if config.mask_name == "document":
                 # PyTorch wrapper
-                pytorch_mask_fn = lambda b, h, q, kv: flex_document_mask(b, h, q, kv, doc_ids)
+                def pytorch_mask_fn(b, h, q, kv):
+                    return flex_document_mask(b, h, q, kv, doc_ids)
                 # CuTe wrapper - reuse cute_document_mask with aux_tensors
                 cute_mask_fn = cute_document_mask
 
@@ -385,12 +353,9 @@ def main():
                 )
             )
         finally:
-            # Clean up GPU memory between runs to avoid fragmentation
             torch.cuda.empty_cache()
-            # Clear torch.compile cache to prevent memory accumulation
             torch._dynamo.reset()
 
-    # Print results
     print_results(results)
 
 
