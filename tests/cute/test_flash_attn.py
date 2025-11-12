@@ -265,7 +265,7 @@ def test_flash_attn_output(
             and not local
             and dv == d
             and learnable_sink is None
-            and mha_type == "mha"
+            # and mha_type == "mha"
             # and False
         ):
             g = torch.randn_like(out)
