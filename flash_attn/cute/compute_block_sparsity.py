@@ -267,6 +267,25 @@ def compute_block_sparsity(
     compute_full_blocks: bool = True,
     use_fast_sampling: bool = False,
 ) -> Tuple[BlockSparseTensors, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+    """
+    Computes block sparsity for a given `mask_mod`.
+
+    Args:
+        tile_m: The tile size for the m dimension.
+        tile_n: The tile size for the n dimension.
+        batch_size: The batch size.
+        num_heads: The number of heads.
+        seqlen_q: The sequence length for the query.
+        seqlen_k: The sequence length for the key.  
+        mask_mod: The `mask_mod` callable to use.
+        aux_tensors: A list of auxiliary tensors.
+        device: The device to use.
+        compute_full_blocks: Whether to compute full blocks. If False, only partially-masked blocks are computed. 
+        use_fast_sampling: Whether to use 5-point sampling (4 corners + center). This is much faster, but only suitable for masks where this check is sufficient.
+
+    Returns:
+        A tuple of `BlockSparseTensors` and the underlying torch tensors.
+    """
     num_m_blocks = (seqlen_q + tile_m - 1) // tile_m
     num_n_blocks = (seqlen_k + tile_n - 1) // tile_n
 
