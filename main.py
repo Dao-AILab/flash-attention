@@ -32,3 +32,11 @@ def run(page_size: int = 128):
     print("Command:", " ".join(command))
 
     subprocess.run(command)
+
+@app.function(
+    gpu="B200",
+    timeout=3600,
+    image=image.pip_install(["pytest"]).add_local_dir("tests", remote_path="/root/flash_attn/tests", copy=True),
+)
+def test():
+    subprocess.run([sys.executable, "-m", "pytest", "-k", "test_flash_attn_kvcache", "flash_attn/tests/cute/test_flash_attn.py"])

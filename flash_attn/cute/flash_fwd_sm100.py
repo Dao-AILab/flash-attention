@@ -1158,7 +1158,7 @@ class FlashAttentionForwardSm100:
                     mV,
                     FastDivmod.create(page_size),
                     batch_idx,
-                    head_idx,
+                    head_idx_kv,
                     tidx,
                     seqlen.seqlen_k,
                     0,  # leftpad_k
