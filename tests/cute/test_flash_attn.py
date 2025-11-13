@@ -732,7 +732,7 @@ def test_flash_attn_varlen_output(
 # @pytest.mark.parametrize("rotary_fraction", [0.0, 0.5, 1.0])
 @pytest.mark.parametrize("rotary_fraction", [0.0])
 # @pytest.mark.parametrize("page_size", [None] + ([1, 4, 128]))
-@pytest.mark.parametrize("page_size", [None, 128])
+@pytest.mark.parametrize("page_size", [None, 128, 256])
 # @pytest.mark.parametrize("page_size", [128])
 # @pytest.mark.parametrize("has_leftpad", [False, True])
 @pytest.mark.parametrize("has_leftpad", [False])
@@ -745,7 +745,7 @@ def test_flash_attn_varlen_output(
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192])
 # @pytest.mark.parametrize('d', [56, 80])
 # @pytest.mark.parametrize("d", [128])
-@pytest.mark.parametrize("d", [64])
+@pytest.mark.parametrize("d", [64, 128])
 # @pytest.mark.parametrize("d", [192])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
@@ -785,8 +785,6 @@ def test_flash_attn_kvcache(
     mha_type,
     dtype,
 ):
-    if page_size is not None and seqlen_k % page_size != 0:
-        pytest.skip()
     if seqlen_q > seqlen_k and new_kv:
         pytest.skip()
     if not new_kv and rotary_fraction > 0.0:
@@ -937,7 +935,7 @@ def test_flash_attn_kvcache(
                 dtype_ref,
             )
         cache_seqlens = torch.randint(
-            0 if new_kv else 1,
+            max(0 if new_kv else 1, seqlen_q),
             # If we don't use seqlen_q in the case of causal and rotary, cos/sin won't be long enough
             (
                 (
