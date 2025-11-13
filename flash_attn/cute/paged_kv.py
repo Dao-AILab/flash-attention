@@ -172,3 +172,6 @@ class PagedKVManager(ParamsBase):
                         tXsX[None, m, k],
                         # pred=self.tKpK[0, 0, k],
                     )
+            elif const_expr(K_or_V == "V"):
+                # Don't need to clear out the rest of the smem for K since we'll mask out the scores anyway.
+                tXsX[None, m, None].fill(0)
