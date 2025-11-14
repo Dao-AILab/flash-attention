@@ -106,6 +106,11 @@ class AttentionMask:
         ROW = 0 if const_expr(not self.swap_AB) else 1
         COL = 1 if const_expr(not self.swap_AB) else 0
         thr_col_offset = tScS_mn[0][COL]
+        # To handle edge cases of completely masked out rows where n_block_max = 0,
+        # we treat negative n_blocks as 0th n_block
+        # TODO: find more transparent solution
+        if n_block < 0:
+            n_block = 0
         seqlenk_col_limit = self.seqlen_k - n_block * self.tile_n - thr_col_offset
         if const_expr(not mask_causal and not mask_local and mask_mod is None):
             if const_expr(mask_seqlen):
@@ -299,6 +304,11 @@ class AttentionMask:
         cS = cute.make_identity_tensor(acc_shape if not self.swap_AB else acc_shape[::-1])
         tScS = thr_mma.partition_C(cS)
         tScS_t2r = thr_tmem_load.partition_D(tScS)
+        # To handle edge cases of completely masked out rows where n_block_max = 0,
+        # we treat negative n_blocks as 0th n_block
+        # TODO: find more transparent solution
+        if n_block < 0:
+            n_block = 0
         seqlenk_col_limit = self.seqlen_k - n_block * self.tile_n
         r2p = True
         if const_expr(not mask_causal and not mask_local):
