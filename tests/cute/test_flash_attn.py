@@ -731,8 +731,8 @@ def test_flash_attn_varlen_output(
 @pytest.mark.parametrize("rotary_interleaved", [True])
 # @pytest.mark.parametrize("rotary_fraction", [0.0, 0.5, 1.0])
 @pytest.mark.parametrize("rotary_fraction", [0.0])
-# @pytest.mark.parametrize("page_size", [None] + ([1, 4, 128]))
-@pytest.mark.parametrize("page_size", [None, 128])
+@pytest.mark.parametrize("page_size", [None] + ([1, 4, 128]))
+# @pytest.mark.parametrize("page_size", [None, 128])
 # @pytest.mark.parametrize("page_size", [128])
 # @pytest.mark.parametrize("has_leftpad", [False, True])
 @pytest.mark.parametrize("has_leftpad", [False])
@@ -1154,7 +1154,7 @@ def test_flash_attn_kvcache(
                     # attention_chunk=attention_chunk,
                     # rotary_interleaved=rotary_interleaved,
                     # scheduler_metadata=scheduler_metadata,
-                    # num_splits=num_splits,
+                    num_splits=num_splits,
                     # return_softmax_lse=True
                 )
                 if varlen_q:
