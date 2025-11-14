@@ -130,6 +130,10 @@ class FlashAttentionForwardSm100:
         if self.overlap_sO_sQ:
             self.is_persistent = False
 
+        assert self.use_tma_KV or not (self.check_hdim_oob or self.check_hdim_v_oob), (
+            "Paged KV does not support irregular head dim"
+        )
+
         self.softmax0_warp_ids = (0, 1, 2, 3)
         self.softmax1_warp_ids = (4, 5, 6, 7)
         self.correction_warp_ids = (8, 9, 10, 11)
@@ -1208,13 +1212,14 @@ class FlashAttentionForwardSm100:
             if const_expr(not self.is_split_kv) or n_block_min < n_block_max:
                 if const_expr(self.use_tma_KV) or tidx < cute.arch.WARP_SIZE:
                     load_Q(block=self.q_stage * m_block + 0, stage=0)  # Q0
+                n_block_first = n_block_max - 1 if n_block_max > 0 else 0
                 page_idx = (
-                    mPageTable[batch_idx, n_block_max - 1]
+                    mPageTable[batch_idx, n_block_first]
                     if const_expr(mPageTable is not None and self.use_tma_KV)
                     else None
                 )
                 if const_expr(not self.use_tma_KV):
-                    paged_kv_manager.load_page_table(n_block_max - 1)
+                    paged_kv_manager.load_page_table(n_block_first)
                 load_K(block=n_block_max - 1, producer_state=kv_producer_state, page_idx=page_idx)  # K0
                 kv_producer_state.advance()
                 if const_expr(self.q_stage == 2) and (const_expr(self.use_tma_KV) or tidx < cute.arch.WARP_SIZE):

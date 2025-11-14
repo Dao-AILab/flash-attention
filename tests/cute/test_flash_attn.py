@@ -1154,7 +1154,7 @@ def test_flash_attn_kvcache(
                     # attention_chunk=attention_chunk,
                     # rotary_interleaved=rotary_interleaved,
                     # scheduler_metadata=scheduler_metadata,
-                    # num_splits=num_splits,
+                    num_splits=num_splits,
                     # return_softmax_lse=True
                 )
                 if varlen_q:

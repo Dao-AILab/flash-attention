@@ -87,7 +87,7 @@ class PagedKVManager(ParamsBase):
         else:
             cV = cute.make_identity_tensor((n_block_size, head_dim_v_padded))
             tVcV = gmem_thr_copy_KV.partition_S(cV)
-            tVpV = utils.predicate_k(tVcV, limit=mV_paged.shape[1])
+            tVpV = utils.predicate_k(tVcV, limit=mV_paged.shape[0])
 
         return PagedKVManager(
             mPageTable,
@@ -170,7 +170,6 @@ class PagedKVManager(ParamsBase):
                         self.gmem_tiled_copy_KV,
                         mX_paged_cur_copy[None, ki],
                         tXsX[None, m, k],
-                        # pred=self.tKpK[0, 0, k],
                     )
             elif const_expr(K_or_V == "V"):
                 # Don't need to clear out the rest of the smem for K since we'll mask out the scores anyway.
