@@ -35,10 +35,12 @@ from cutlass.cute.runtime import from_dlpack
 from flash_attn.cute import utils
 from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80, FlashAttentionForwardSm90
 from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
+from flash_attn.cute.flash_fwd_sm120 import FlashAttentionForwardSm120
 from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
 from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
 from flash_attn.cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
 from flash_attn.cute.flash_bwd_sm100 import FlashAttentionBackwardSm100
+from flash_attn.cute.flash_bwd_sm120 import FlashAttentionBackwardSm120
 from flash_attn.cute.flash_bwd_postprocess import FlashAttentionBackwardPostprocess
 from flash_attn.cute.flash_fwd_combine import FlashAttentionForwardCombine
 
@@ -291,7 +293,7 @@ def _flash_attn_fwd(
         if _compute_capability is None
         else _compute_capability
     )
-    assert compute_capability in [9, 10], "Unsupported compute capability. Supported: 9.x, 10.x"
+    assert compute_capability in [9, 10, 12], "Unsupported compute capability. Supported: 9.x, 10.x, 12.x"
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     if compute_capability == 9:  # TODO: tune block size according to hdim.
@@ -462,9 +464,30 @@ def _flash_attn_fwd(
                 score_mod=score_mod,
                 has_aux_tensors=aux_tensors is not None,
             )
+        elif compute_capability == 12:
+            assert page_table is None, "paged KV not supported on SM 12.0"
+            assert not is_split_kv, "SplitKV not supported on SM 12.0"
+            fa_fwd = FlashAttentionForwardSm120(
+                head_dim,
+                head_dim_v,
+                qhead_per_kvhead=qhead_per_kvhead,
+                is_causal=causal,
+                is_local=local,
+                is_split_kv=is_split_kv,
+                pack_gqa=pack_gqa,
+                m_block_size=m_block_size,
+                n_block_size=n_block_size,
+                is_persistent=not causal
+                and not local
+                and cu_seqlens_q is None
+                and seqused_q is None
+                and not is_split_kv,
+                score_mod=score_mod,
+                has_aux_tensors=aux_tensors is not None,
+            )
         else:
             raise ValueError(
-                f"Unsupported compute capability: {compute_capability}. Supported: 9.x, 10.x"
+                f"Unsupported compute capability: {compute_capability}. Supported: 9.x, 10.x, 12.x"
             )
         # TODO: check @can_implement
         _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
@@ -550,9 +573,22 @@ def _flash_attn_bwd(
     seqused_k: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     compute_capability = torch.cuda.get_device_capability()[0]
-    assert compute_capability in [9, 10], "Unsupported compute capability. Supported: 9.x, 10.x"
+    assert compute_capability in [9, 10, 12], "Unsupported compute capability. Supported: 9.x, 10.x, 12.x"
 
     if compute_capability == 9:
+        m_block_size = 80 if not causal else 64
+        n_block_size = 128
+        num_stages_Q = 2
+        num_stages_dO = 2
+        num_stages_PdS = 2
+        SdP_swapAB = True
+        dKV_swapAB = False
+        dQ_swapAB = not causal
+        AtomLayoutMSdP = 1
+        AtomLayoutNdKV = 2
+        AtomLayoutMdQ = 1
+        cluster_size = 1
+    elif compute_capability == 12:
         m_block_size = 80 if not causal else 64
         n_block_size = 128
         num_stages_Q = 2
@@ -645,6 +681,8 @@ def _flash_attn_bwd(
     if pack_gqa is None:
         pack_gqa = qhead_per_kvhead > 1
     if compute_capability == 10:
+        pack_gqa = False # override for now
+    if compute_capability == 12:
         pack_gqa = False # override for now
 
     device = q.device
@@ -862,6 +900,16 @@ def _flash_attn_bwd(
                 num_threads,
                 V_in_regs=V_in_regs,
             )
+        elif compute_capability == 12:
+            fa_bwd_obj = FlashAttentionBackwardSm120(
+                head_dim,
+                head_dim_v,
+                is_causal=causal,
+                qhead_per_kvhead=qhead_per_kvhead,
+                tile_m=m_block_size,
+                tile_n=n_block_size,
+                cluster_size=cluster_size,
+            )
         else:
             fa_bwd_obj = FlashAttentionBackwardSm100(
                 head_dim,
@@ -910,7 +958,7 @@ def _flash_attn_bwd(
         seqused_k_tensor,
     )
 
-    num_threads = 256 if compute_capability == 9 else 128
+    num_threads = 256 if compute_capability in [9, 12] else 128
     # Postprocess kernel: convert dq_accum from float32 to dq in bf16/fp16
     compile_key_post = (dtype, head_dim, m_block_size, num_threads, AtomLayoutMdQ, dQ_swapAB)
     if compile_key_post not in _flash_attn_bwd.compile_cache_post:
