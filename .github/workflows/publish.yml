@@ -41,8 +41,8 @@ jobs:
         # Using ubuntu-22.04 instead of 24.04 for more compatibility (glibc). Ideally we'd use the
         # manylinux docker image, but I haven't figured out how to install CUDA on manylinux.
         os: [ubuntu-22.04, ubuntu-22.04-arm]
-        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
-        torch-version: ["2.4.0", "2.5.1", "2.6.0", "2.7.1", "2.8.0"]
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        torch-version: ["2.5.1", "2.6.0", "2.7.1", "2.8.0", "2.9.1"]
         cuda-version: ["12.9.1"]
         # We need separate wheels that either uses C++11 ABI (-D_GLIBCXX_USE_CXX11_ABI) or not.
         # Pytorch wheels currently don't use it, but nvcr images have Pytorch compiled with C++11 ABI.
@@ -50,8 +50,11 @@ jobs:
         # when building without C++11 ABI and using it on nvcr images.
         cxx11_abi: ["FALSE", "TRUE"]
         include:
-            - torch-version: "2.9.0.dev20250904"
-              cuda-version: "13.0.0"
+            - torch-version: "2.9.1"
+              cuda-version: "13.0.2"
+              python-version: "3.14" 
+            - torch-version: "2.10.0.dev20251108"
+              cuda-version: "13.0.2"
         exclude:
           # see https://github.com/pytorch/pytorch/blob/main/RELEASE.md#release-compatibility-matrix
           # Pytorch < 2.5 does not support Python 3.13
@@ -72,8 +75,8 @@ jobs:
     needs: [build_wheels]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.10"
       - name: Install dependencies
