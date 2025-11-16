@@ -184,6 +184,7 @@ class SoftmaxSm100(Softmax):
 @dataclass
 class SoftmaxSm120(Softmax):
     """SM120 (RTX 50) softmax implementation using tcgen05 instructions."""
+
     rescale_threshold: cutlass.Constexpr[float] = 0.0
 
     @staticmethod
