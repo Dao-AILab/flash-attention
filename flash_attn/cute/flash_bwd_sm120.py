@@ -1,7 +1,9 @@
 # Copyright (c) 2025, Ted Zadouri, Markus Hoehnerbach, Jay Shah, Tri Dao.
 # SM120 (RTX 50) backward implementation using tcgen05 SuperMMA instructions.
-# SM120 is a stripped-down version of SM100: it lacks the Cluster fabric (GPC-CGA), Tensor Memory, and UTCMMA instructions,
+# SM120 is a stripped-down version of SM100: it lacks Tensor Memory and UTCMMA instructions,
 # and only supports the smaller-tile "SuperMMA" operations.
+# SM120 DOES support Thread Block Clusters.
+# However, TMA multicast is NOT recommended on SM120 (not implemented in hardware, would be emulated).
 # This implementation uses shared memory for intermediate tensors (S, dP, dV, dK, dQ, P, dS) instead of Tensor Memory.
 # PTX references:
 # https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-mma-instructions-mma-sp
@@ -85,9 +87,9 @@ class FlashAttentionBackwardSm120:
 
         self.acc_dtype = Float32
 
-        # SM120: No cluster fabric support - cluster_size must be 1
-        assert cluster_size == 1, "SM120 does not support clusters - cluster_size must be 1"
-        self.cluster_shape_mn = (1, 1)  # SM120: Fixed to (1, 1) - no cluster support
+        # SM120: Supports Thread Block Clusters like SM100
+        assert cluster_size in (1, 2), "Only cluster_size=1 or 2 is supported"
+        self.cluster_shape_mn = (cluster_size, 1)
         self.is_persistent = is_persistent
         self.is_causal = is_causal
         self.is_local = False
@@ -523,7 +525,9 @@ class FlashAttentionBackwardSm120:
             )
 
         tma_load_op = cpasync.CopyBulkTensorTileG2SOp(cta_group)
-        tma_load_op_multicast = cpasync.CopyBulkTensorTileG2SMulticastOp(cta_group)
+        # SM120: TMA multicast is not recommended (not implemented in hardware, would be emulated)
+        # Always use non-multicast TMA operations even when cluster_size > 1
+        # tma_load_op_multicast = cpasync.CopyBulkTensorTileG2SMulticastOp(cta_group)  # Not used for SM120
 
         # S.T = K @ Q.T
         tma_atom_K, tma_tensor_K = cute.nvgpu.make_tiled_tma_atom_A(
@@ -534,11 +538,9 @@ class FlashAttentionBackwardSm120:
             self.tiled_mma_S,
             self.cluster_layout_vmnk.shape,
         )
-        Q_tma_op = sm100_utils_basic.cluster_shape_to_tma_atom_B(
-            self.cluster_shape_mnk, self.tiled_mma_S.thr_id
-        )
+        # SM120: Always use non-multicast TMA for Q (TMA multicast not recommended on SM120)
+        Q_tma_op = tma_load_op
         tma_atom_Q, tma_tensor_Q = cute.nvgpu.make_tiled_tma_atom_B(
-            # tma_load_op if const_expr(self.cluster_shape_mnk[0] == 1) else tma_load_op_multicast,
             Q_tma_op,
             mQ,
             cute.select(self.sQ_layout, mode=[0, 1, 2]),
@@ -555,11 +557,9 @@ class FlashAttentionBackwardSm120:
             self.tiled_mma_dP,
             self.cluster_layout_vmnk.shape,
         )
-        dO_tma_op = sm100_utils_basic.cluster_shape_to_tma_atom_B(
-            self.cluster_shape_mnk, self.tiled_mma_dP.thr_id
-        )
+        # SM120: Always use non-multicast TMA for dO (TMA multicast not recommended on SM120)
+        dO_tma_op = tma_load_op
         tma_atom_dO, tma_tensor_dO = cute.nvgpu.make_tiled_tma_atom_B(
-            # tma_load_op if const_expr(self.cluster_shape_mnk[0] == 1) else tma_load_op_multicast,
             dO_tma_op,
             mdO,
             cute.select(self.sdO_layout, mode=[0, 1, 2]),
@@ -1222,14 +1222,11 @@ class FlashAttentionBackwardSm120:
             cutlass.pipeline.PipelineUserType.Producer, self.dO_stage
         )
 
-        # Compute multicast mask for Q & dO buffer full
+        # SM120: TMA multicast is not recommended, so multicast mask is always None
+        # Even though clusters are supported, each CTA loads its own data independently
         cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(cta_rank_in_cluster)
-        q_do_mcast_mask = None
-        if const_expr(self.is_q_do_mcast):
-            q_do_mcast_mask = cpasync.create_tma_multicast_mask(
-                cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=1
-            )
+        q_do_mcast_mask = None  # SM120: Always None - no multicast TMA
 
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()

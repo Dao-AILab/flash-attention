@@ -599,6 +599,8 @@ def _flash_attn_bwd(
         AtomLayoutMSdP = 1
         AtomLayoutNdKV = 2
         AtomLayoutMdQ = 1
+        # SM120 supports Thread Block Clusters (cluster_size in (1, 2))
+        # Default to 1, but can be set to 2 for better performance
         cluster_size = 1
     else:
         m_block_size = 128

@@ -1,6 +1,8 @@
 # SM120 (RTX 50) forward implementation using tcgen05 SuperMMA instructions.
 # SM120 is a stripped-down version of SM100: it lacks Tensor Memory and UTCMMA,
 # and only supports smaller-tile "SuperMMA" operations.
+# SM120 DOES support Thread Block Clusters.
+# However, TMA multicast is NOT recommended on SM120 (not implemented in hardware, would be emulated).
 # Intermediate tensors (S, P, O) are stored in shared memory, not Tensor Memory.
 # Supported features:
 # - BF16 & FP16 dtype
@@ -459,6 +461,8 @@ class FlashAttentionForwardSm120:
                 )
 
         # TMA load for Q
+        # SM120: TMA multicast is not recommended (not implemented in hardware, would be emulated)
+        # Always use non-multicast TMA operations even when cluster_size > 1
         tma_load_op = cpasync.CopyBulkTensorTileG2SOp(cta_group)
         tma_store_op = cpasync.CopyBulkTensorTileS2GOp()
 
