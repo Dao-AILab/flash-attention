@@ -29,3 +29,11 @@ class NamedBarrierBwdSm100(enum.IntEnum):
     EpilogueWG2 = enum.auto()
     Compute = enum.auto()
     dQaccReduce = enum.auto()
+
+
+class NamedBarrierBwdSm120(enum.IntEnum):
+    """SM120 (RTX 50) backward named barriers using tcgen05 instructions."""
+    EpilogueWG1 = enum.auto()
+    EpilogueWG2 = enum.auto()
+    Compute = enum.auto()
+    dQaccReduce = enum.auto()

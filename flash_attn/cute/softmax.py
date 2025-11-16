@@ -180,6 +180,32 @@ class SoftmaxSm100(Softmax):
             rescale_threshold=rescale_threshold,
         )
 
+
+@dataclass
+class SoftmaxSm120(Softmax):
+    """SM120 (RTX 50) softmax implementation using tcgen05 instructions."""
+    rescale_threshold: cutlass.Constexpr[float] = 0.0
+
+    @staticmethod
+    def create(
+        scale_log2: Float32,
+        rescale_threshold: cutlass.Constexpr[float] = 0.0,
+        softmax_scale: Float32 | None = None,
+    ):
+        num_rows = 1
+        arch = 120
+        row_max = cute.make_fragment(num_rows, Float32)
+        row_sum = cute.make_fragment(num_rows, Float32)
+        return SoftmaxSm120(
+            scale_log2,
+            num_rows,
+            row_max,
+            row_sum,
+            arch,
+            softmax_scale,
+            rescale_threshold=rescale_threshold,
+        )
+
     @cute.jit
     def update_row_max(self, acc_S_row: cute.TensorSSA, is_first: int) -> Tuple[Float32, Float32]:
         if cutlass.const_expr(is_first):

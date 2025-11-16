@@ -35,13 +35,13 @@ import flash_attn.cute.utils as utils
 from flash_attn.cute import copy_utils
 import flash_attn.cute.pipeline as pipeline
 from flash_attn.cute.mask import AttentionMask
-from flash_attn.cute.softmax import SoftmaxSm100, apply_score_mod_inner
+from flash_attn.cute.softmax import SoftmaxSm120, apply_score_mod_inner
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute.block_sparsity import BlockSparseTensors
 from flash_attn.cute.pack_gqa import PackGQA
-from flash_attn.cute import mma_sm100_desc as sm100_desc
-from flash_attn.cute import blackwell_helpers as sm100_utils
+from flash_attn.cute import mma_sm120_desc as sm120_desc
+from flash_attn.cute import sm120_helpers as sm120_utils
 from flash_attn.cute.fast_math import FastDivmod
 from flash_attn.cute.tile_scheduler import (
     TileSchedulerArguments,
@@ -1226,7 +1226,7 @@ class FlashAttentionForwardSm120:
 
         gemm_Si = [
             partial(
-                sm100_utils.gemm_ptx_partial,
+                sm120_utils.gemm_ptx_partial,
                 qk_mma_op,
                 self.tmem_s_offset[stage],
                 tSrQs[stage],
@@ -1237,7 +1237,7 @@ class FlashAttentionForwardSm120:
         ]
         gemm_Pi = [
             partial(
-                sm100_utils.gemm_ptx_partial,
+                sm120_utils.gemm_ptx_partial,
                 pv_mma_op,
                 self.tmem_o_offset[stage if self.q_stage == 2 else 0],
                 tOrPs[stage],
@@ -1275,7 +1275,7 @@ class FlashAttentionForwardSm120:
                     # are empty. For subsequent iterations, the wait happened at the end
                     # of the while loop.
                     # 3. gemm
-                    # tiled_mma_qk = sm100_utils.gemm(tiled_mma_qk, tStSs[stage], tSrQs[stage], tSrKi, zero_init=True)
+                    # tiled_mma_qk = sm120_utils.gemm(tiled_mma_qk, tStSs[stage], tSrQs[stage], tSrKi, zero_init=True)
                     sK_cur = sK[None, None, None, mma_kv_consumer_state.index]
                     if const_expr(self.uneven_kv_smem):
                         sK_cur = self.offset_kv_smem(
@@ -1312,7 +1312,7 @@ class FlashAttentionForwardSm120:
                             P_full_O_rescaled_phase,
                         )
                         # 3. gemm
-                        # sm100_utils.gemm(tiled_mma_pv, tOtO0, tOrP0, tOrVi, zero_init=True)
+                        # sm120_utils.gemm(tiled_mma_pv, tOtO0, tOrP0, tOrVi, zero_init=True)
                         # gemm_Pi[stage](tCrB=tOrVi, sB=sV[None, None, None, Vi_index], zero_init=not O_should_accumulate)
                         sV_cur = sV[None, None, None, Vi_index]
                         if const_expr(self.uneven_kv_smem):
@@ -1347,7 +1347,7 @@ class FlashAttentionForwardSm120:
                         # Don't need to wait for the softmax warp to have finished reading the previous
                         # Si, since this gemm is scheduled after the PV gemm, which guaranteed that Si
                         # has been read and Pi has been written.
-                        # tiled_mma_qk = sm100_utils.gemm(tiled_mma_qk, tStSs[stage], tSrQs[stage], tSrK[None, None, None, Ki_index], zero_init=True)
+                        # tiled_mma_qk = sm120_utils.gemm(tiled_mma_qk, tStSs[stage], tSrQs[stage], tSrK[None, None, None, Ki_index], zero_init=True)
                         sK_cur = sK[None, None, None, Ki_index]
                         if const_expr(self.uneven_kv_smem):
                             sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
@@ -1507,7 +1507,7 @@ class FlashAttentionForwardSm120:
                     mask_causal=self.is_causal,
                     mask_local=self.is_local,
                 )
-                softmax = SoftmaxSm100.create(
+                softmax = SoftmaxSm120.create(
                     softmax_scale_log2,
                     rescale_threshold=8.0 if const_expr(self.q_dtype.width == 16) else 0.0,
                     softmax_scale=softmax_scale,
@@ -1638,7 +1638,7 @@ class FlashAttentionForwardSm120:
         si_corr_producer_phase: Int32,
         s0_s1_sequence_phase: Int32,
         n_block: Int32,
-        softmax: SoftmaxSm100,
+        softmax: SoftmaxSm120,
         mbar_ptr: cute.Pointer,
         mbar_s0_s1_sequence_offset: Int32,
         thr_mma_qk: cute.core.ThrMma,

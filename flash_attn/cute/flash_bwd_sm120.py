@@ -20,7 +20,7 @@ from cutlass.pipeline import PipelineAsync, PipelineConsumer
 from flash_attn.cute import utils
 from flash_attn.cute import copy_utils
 from flash_attn.cute import pipeline
-from flash_attn.cute.blackwell_helpers import gemm_w_idx, gemm_ptx_w_idx  # noqa
+from flash_attn.cute.sm120_helpers import gemm_w_idx, gemm_ptx_w_idx  # noqa
 from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
@@ -32,7 +32,7 @@ from flash_attn.cute.tile_scheduler import (
 )
 
 from flash_attn.cute import barrier
-from flash_attn.cute.named_barrier import NamedBarrierBwdSm100
+from flash_attn.cute.named_barrier import NamedBarrierBwdSm120
 
 
 class FlashAttentionBackwardSm120:
@@ -117,7 +117,7 @@ class FlashAttentionBackwardSm120:
 
         # NamedBarrier
         self.compute_sync_barrier = cutlass.pipeline.NamedBarrier(
-            barrier_id=int(NamedBarrierBwdSm100.Compute),
+            barrier_id=int(NamedBarrierBwdSm120.Compute),
             num_threads=len(self.compute_warp_ids) * cute.arch.WARP_SIZE,
         )
         # self.epilogue_sync_barrier = pipeline.NamedBarrier(
@@ -125,7 +125,7 @@ class FlashAttentionBackwardSm120:
         #     num_threads=self.num_compute_warps * self.threads_per_warp,
         # )
         self.reduce_sync_barrier = cutlass.pipeline.NamedBarrier(
-            barrier_id=int(NamedBarrierBwdSm100.dQaccReduce),
+            barrier_id=int(NamedBarrierBwdSm120.dQaccReduce),
             num_threads=len(self.reduce_warp_ids) * cute.arch.WARP_SIZE,
         )
 
@@ -1939,7 +1939,7 @@ class FlashAttentionBackwardSm120:
                     pipeline_dKV,
                     consumer_state_dKV,
                     None,  # Don't scale
-                    int(NamedBarrierBwdSm100.EpilogueWG1),  # barrier_id
+                    int(NamedBarrierBwdSm120.EpilogueWG1),  # barrier_id
                     mdV_semaphore,
                 )
                 #### STORE dK
@@ -1957,7 +1957,7 @@ class FlashAttentionBackwardSm120:
                     pipeline_dKV,
                     consumer_state_dKV,
                     softmax_scale if const_expr(self.qhead_per_kvhead == 1) else None,
-                    int(NamedBarrierBwdSm100.EpilogueWG1),  # barrier_id
+                    int(NamedBarrierBwdSm120.EpilogueWG1),  # barrier_id
                     mdK_semaphore,
                 )
 
