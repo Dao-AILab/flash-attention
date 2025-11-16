@@ -315,7 +315,7 @@ class FlashAttentionBackwardSm100:
         )
         self.sdKV_epi_tile = (
             self.tile_n,
-            128 // (self.dk_dtype.width // 8), # 64 or 32
+            128 // (self.dk_dtype.width // 8),  # 64 or 32
         )  # subtiles mma_tiler_dsq[:2] = mma_tiler_pdo[:2]
         self.num_epi_stages = (self.tile_hdim // 2) // self.sdKV_epi_tile[1]
         self.sdKV_flat_epi_tile = self.tile_n * (self.tile_hdim // 2) // self.num_epi_stages
@@ -326,12 +326,10 @@ class FlashAttentionBackwardSm100:
                 self.dk_dtype,
                 LayoutEnum.ROW_MAJOR,
                 self.sdKV_epi_tile,
-                2, # num compute wgs
+                2,  # num compute wgs
             )
         else:
-            self.sdKV_layout = cute.make_layout(
-                (self.tile_n * self.dK_reduce_ncol, 2)
-            )
+            self.sdKV_layout = cute.make_layout((self.tile_n * self.dK_reduce_ncol, 2))
 
     @cute.jit
     def __call__(
@@ -389,9 +387,7 @@ class FlashAttentionBackwardSm100:
         ]
 
         layout_transpose = [1, 3, 2, 0]  # (b, s, n, h) --> (s, h, n, b)
-        mQ, mK, mV, mdO = [
-            utils.select(t, mode=layout_transpose) for t in (mQ, mK, mV, mdO)
-        ]
+        mQ, mK, mV, mdO = [utils.select(t, mode=layout_transpose) for t in (mQ, mK, mV, mdO)]
         LSE_dPsum_dQaccum_transpose = [2, 1, 0]  # (b, n, s) --> (s, n, b)
         mLSE, mdPsum, mdQaccum = [
             utils.select(t, mode=LSE_dPsum_dQaccum_transpose) for t in (mLSE, mdPsum, mdQaccum)
@@ -400,10 +396,8 @@ class FlashAttentionBackwardSm100:
             layout_dKV_transpose = layout_transpose
         else:
             layout_dKV_transpose = LSE_dPsum_dQaccum_transpose
-        mdK, mdV = [
-            utils.select(t, mode=layout_dKV_transpose) for t in (mdK, mdV)
-        ]
-        dO_transpose = [1, 0, 2, 3] # (s, h, n, b) --> (h, s, n, h)
+        mdK, mdV = [utils.select(t, mode=layout_dKV_transpose) for t in (mdK, mdV)]
+        dO_transpose = [1, 0, 2, 3]  # (s, h, n, b) --> (h, s, n, h)
         mdO = utils.select(mdO, mode=dO_transpose)
 
         semaphore_transpose = [2, 3, 1, 0]  # (b, n, block, stage) -> (block, stage, n, b)
@@ -451,7 +445,7 @@ class FlashAttentionBackwardSm100:
                 raise RuntimeError("The layout of mdK is wrong")
             if const_expr(dV_major_mode != tcgen05.OperandMajorMode.K):
                 raise RuntimeError("The layout of mdV is wrong")
-            
+
         if const_expr(self.use_tma_store and self.qhead_per_kvhead == 1):
             tma_copy_op_dKV = cpasync.CopyBulkTensorTileS2GOp()
             tma_atom_dK, mdK_tma_tensor = cpasync.make_tiled_tma_atom(
@@ -2253,32 +2247,32 @@ class FlashAttentionBackwardSm100:
         if const_expr(self.qhead_per_kvhead == 1):
             sdKV = sdKV[None, None, wg_idx]  # (tile_n, 64) for bf16
         else:
-            sdKV = sdKV[None, wg_idx] # (tile_n * 32) for fp32
-        
+            sdKV = sdKV[None, wg_idx]  # (tile_n * 32) for fp32
+
         # (8, tile_n / 128, 64 / 8) = (8, 1, 8) or (4, tile_n * 32 / (128 * 4)) = (4, 8)
         tdKVsdKV_r2s = thr_copy_r2s_dKV.partition_D(sdKV)
 
         head_idx_kv = head_idx // self.qhead_per_kvhead
         if const_expr(self.qhead_per_kvhead == 1):
-            mdKV_cur = mdKV[None, None, head_idx_kv, batch_idx] # (seqlen, hdim)
+            mdKV_cur = mdKV[None, None, head_idx_kv, batch_idx]  # (seqlen, hdim)
             gdKV_p = cute.local_tile(
                 mdKV_cur, (self.tile_n, self.tile_hdim), (n_block, 0)
-            ) # (tile_n, hdim)
-            gdKV = self.split_wg(gdKV_p, wg_idx, num_wg) # (tile_n, hdim / 2)
+            )  # (tile_n, hdim)
+            gdKV = self.split_wg(gdKV_p, wg_idx, num_wg)  # (tile_n, hdim / 2)
             gdKV_epi = cute.local_tile(
                 gdKV, self.sdKV_epi_tile, (0, None)
-            ) # (tile_n, 64, epi_stage = (hdim / 2) / 64)
+            )  # (tile_n, 64, epi_stage = (hdim / 2) / 64)
         else:
-            mdKV_cur = mdKV[None, head_idx_kv, batch_idx] # (seqlen * hdim)
+            mdKV_cur = mdKV[None, head_idx_kv, batch_idx]  # (seqlen * hdim)
             gdKV_p = cute.local_tile(
-                mdKV_cur, (self.tile_n * self.tile_hdim, ), (n_block, )
-            ) # (tile_n * hdim)
-            gdKV = cute.logical_divide(
-                gdKV_p, (self.tile_n * self.tile_hdim // num_wg, )
-            )[((None, wg_idx), )] # (tile_n * hdim / 2)
+                mdKV_cur, (self.tile_n * self.tile_hdim,), (n_block,)
+            )  # (tile_n * hdim)
+            gdKV = cute.logical_divide(gdKV_p, (self.tile_n * self.tile_hdim // num_wg,))[
+                ((None, wg_idx),)
+            ]  # (tile_n * hdim / 2)
             gdKV_epi = cute.flat_divide(
-                gdKV, (self.sdKV_flat_epi_tile, )
-            ) # (tile_n * hdim / 2 / epi_stage, epi_stage)
+                gdKV, (self.sdKV_flat_epi_tile,)
+            )  # (tile_n * hdim / 2 / epi_stage, epi_stage)
 
         if const_expr(self.deterministic and self.qhead_per_kvhead > 1):
             mdKV_semaphore_cur = mdKV_semaphore[n_block, None, head_idx_kv, batch_idx]
@@ -2290,7 +2284,7 @@ class FlashAttentionBackwardSm100:
                 cute.make_layout(1),
                 cute.group_modes(sdKV, 0, 2),
                 cute.group_modes(gdKV_epi, 0, 2),
-            ) # (TMA) and (TMA, EPI_STAGE)
+            )  # (TMA) and (TMA, EPI_STAGE)
             assert len(tdKVsdKV.shape) == 1, "Wrong rank for SMEM fragment tdKVsdKV"
             assert len(tdKVgdKV.shape) == 2, "Wrong rank for GMEM fragment tdKVgdKV"
             num_epi_stages = cute.size(tdKVgdKV.shape[1])
@@ -2344,7 +2338,7 @@ class FlashAttentionBackwardSm100:
                     tdKVrdKV_t2r[2 * i], tdKVrdKV_t2r[2 * i + 1] = utils.mul_packed_f32x2(
                         (tdKVrdKV_t2r[2 * i], tdKVrdKV_t2r[2 * i + 1]), (scale, scale)
                     )
-            tdKVrdKV = cute.make_fragment(tdKVrdKV_t2r.shape, self.dv_dtype) # (32 columns)
+            tdKVrdKV = cute.make_fragment(tdKVrdKV_t2r.shape, self.dv_dtype)  # (32 columns)
             tdKVrdKV.store(tdKVrdKV_t2r.load().to(self.dv_dtype))
 
             # RMEM -> SMEM -- copy, fence and barrier
