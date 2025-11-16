@@ -1210,16 +1210,39 @@ class FlashAttentionForwardSm120:
 
         qk_mma_op, pv_mma_op = tiled_mma_qk.op, tiled_mma_pv.op
 
-        # SM120: Create shared memory tensors for S and O accumulators
+        # SM120: Create register fragments for S accumulator (tcgen05.mma accumulator is in registers)
+        thr_mma_qk = tiled_mma_qk.get_slice(0)  # Get thread-level MMA for creating fragments
+        qk_acc_shape = thr_mma_qk.partition_shape_C(self.mma_tiler_qk[:2])
+        tSrSs = tuple(
+            thr_mma_qk.make_fragment_C(qk_acc_shape) for stage in range(2)
+        )
+        # SM120: Create shared memory copy operations to store S from registers to shared memory
         sS_stages = (sS[None, None, None, 0], sS[None, None, None, 1])
+        smem_store_S_atom = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            self.qk_acc_dtype,
+            num_bits_per_copy=128,
+        )
+        tScS_stages = tuple(
+            thr_mma_qk.partition_C(sS_stages[stage]) for stage in range(2)
+        )
+        tiled_smem_store_S = cute.make_tiled_copy(smem_store_S_atom, tScS_stages[0].layout)
+        thr_smem_store_S = tiled_smem_store_S.get_slice(0)
+        tSrS_regs = tuple(
+            thr_smem_store_S.partition_S(tSrSs[stage]) for stage in range(2)
+        )
+        tSsS_stages = tuple(
+            thr_smem_store_S.partition_D(tScS_stages[stage]) for stage in range(2)
+        )
+
+        # SM120: Create shared memory tensors for P
         sP_stages = (sP[None, None, None, 0], sP[None, None, None, 1])
-        # For SM120, we need to pass shared memory addresses instead of Tensor Memory offsets
-        # The accumulator addresses are computed from the shared memory tensor iterators
+        # For SM120, accumulator is in registers, so pass register addresses to gemm_ptx_partial
         gemm_Si = [
             partial(
                 sm120_utils.gemm_ptx_partial,
                 qk_mma_op,
-                sS_stages[stage].iterator.toint(),  # SM120: Use shared memory address
+                tSrSs[stage].iterator.toint(),  # SM120: Use register accumulator address
                 tSrQs[stage],
                 sA=sQ[None, None, None, stage],
                 zero_init=True,
@@ -1230,7 +1253,7 @@ class FlashAttentionForwardSm120:
             partial(
                 sm120_utils.gemm_ptx_partial,
                 pv_mma_op,
-                tOtOs[stage].iterator.toint(),  # SM120: Use O accumulator address (in registers, not smem)
+                tOtOs[stage].iterator.toint(),  # SM120: O accumulator is in registers
                 tOrPs[stage],
                 sA=sP_stages[stage if self.q_stage == 2 else 0],  # SM120: P is in shared memory
             )
@@ -1273,6 +1296,12 @@ class FlashAttentionForwardSm120:
                             sK_cur, mma_kv_consumer_state.index, mma_kv_consumer_state.phase
                         )
                     gemm_Si[stage](tCrB=tSrKi, sB=sK_cur)
+                    # SM120: Store S accumulator from registers to shared memory
+                    cute.copy(thr_smem_store_S, tSrS_regs[stage], tSsS_stages[stage])
+                    cute.arch.fence_proxy(
+                        cute.arch.ProxyKind.async_shared,
+                        space=cute.arch.SharedSpace.shared_cta,
+                    )
                     # 4. release S0 / S1
                     with cute.arch.elect_one():
                         tcgen05.commit(mbar_ptr + self.mbar_S_full_offset + stage)
@@ -1343,6 +1372,12 @@ class FlashAttentionForwardSm120:
                         if const_expr(self.uneven_kv_smem):
                             sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
                         gemm_Si[stage](tCrB=tSrK[None, None, None, Ki_index], sB=sK_cur)
+                        # SM120: Store S accumulator from registers to shared memory
+                        cute.copy(thr_smem_store_S, tSrS_regs[stage], tSsS_stages[stage])
+                        cute.arch.fence_proxy(
+                            cute.arch.ProxyKind.async_shared,
+                            space=cute.arch.SharedSpace.shared_cta,
+                        )
                         # 3. release S0
                         with cute.arch.elect_one():
                             tcgen05.commit(mbar_ptr + self.mbar_S_full_offset + stage)
@@ -1876,8 +1911,8 @@ class FlashAttentionForwardSm120:
                         sO[None, None, stage],
                     )
                     cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_corr_epi_full_offset + stage)
-                    # Signal for the next work tile that O buffers in tmem are already read, so
-                    # mma warp can write to them
+                    # Signal for the next work tile that O buffers in smem are already read, so
+                    # mma warp can write to them (SM120: O is in shared memory, not Tensor Memory)
                     cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage)
                     # if tidx == 0: cute.printf("Correction final scale for stage %d: %f\n", stage, scale)
 
@@ -2281,7 +2316,7 @@ class FlashAttentionForwardSm120:
     def apply_score_mod(
         self,
         tSrS_t2r,
-        thr_tmem_load,
+        thr_smem_load,  # SM120: Shared memory load, not Tensor Memory
         thr_mma_qk,
         batch_idx,
         head_idx,
@@ -2291,12 +2326,12 @@ class FlashAttentionForwardSm120:
         aux_tensors=None,
         fastdiv_mods=(None, None),
     ):
-        """Apply score modification for SM100 (constant q_idx)."""
+        """Apply score modification for SM120 (constant q_idx)."""
         # Prepare index tensor with extra partition
         cS = cute.make_identity_tensor((self.m_block_size, self.n_block_size))
         cS = cute.domain_offset((m_block * self.m_block_size, n_block * self.n_block_size), cS)
         tScS = thr_mma_qk.partition_C(cS)
-        tScS_t2r = thr_tmem_load.partition_D(tScS)
+        tScS_t2r = thr_smem_load.partition_D(tScS)  # SM120: Use shared memory load
 
         # Shared q_idx for all scores
         q_idx_logical = tScS_t2r[0][0]

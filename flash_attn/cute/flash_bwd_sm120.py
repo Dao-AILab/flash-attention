@@ -1,5 +1,8 @@
 # Copyright (c) 2025, Ted Zadouri, Markus Hoehnerbach, Jay Shah, Tri Dao.
-# SM120 (RTX 50) backward implementation using tcgen05 instructions.
+# SM120 (RTX 50) backward implementation using tcgen05 SuperMMA instructions.
+# SM120 is a stripped-down version of SM100: it lacks the Cluster fabric (GPC-CGA), Tensor Memory, and UTCMMA instructions,
+# and only supports the smaller-tile "SuperMMA" operations.
+# This implementation uses shared memory for intermediate tensors (S, dP, dV, dK, dQ, P, dS) instead of Tensor Memory.
 # PTX references:
 # https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-mma-instructions-mma-sp
 # https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-instructions-tcgen05-shift
@@ -82,8 +85,9 @@ class FlashAttentionBackwardSm120:
 
         self.acc_dtype = Float32
 
-        assert cluster_size in (1, 2), "Only cluster_size=1 or 2 is supported"
-        self.cluster_shape_mn = (cluster_size, 1)
+        # SM120: No cluster fabric support - cluster_size must be 1
+        assert cluster_size == 1, "SM120 does not support clusters - cluster_size must be 1"
+        self.cluster_shape_mn = (1, 1)  # SM120: Fixed to (1, 1) - no cluster support
         self.is_persistent = is_persistent
         self.is_causal = is_causal
         self.is_local = False
@@ -130,25 +134,11 @@ class FlashAttentionBackwardSm120:
         )
 
         # TMEM setup
-        SM100_TMEM_CAPACITY_COLUMNS = 512
-        self.tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
+        # SM120: No Tensor Memory - using shared memory instead
+        # self.tmem_alloc_cols removed - not needed for SM120
 
-        # self.tmem_dK_offset = 0
-        # self.tmem_dV_offset = self.tmem_dK_offset + self.tile_hdim
-        # self.tmem_dQ_offset = self.tmem_dV_offset + self.tile_hdimv
-        # self.tmem_dP_offset = self.tmem_dQ_offset  # overlap with dQ
-        # self.tmem_S_offset = self.tmem_dQ_offset + max(self.tile_m, self.tile_hdim)
-        # self.tmem_P_offset = self.tmem_S_offset  # overlap with S
-        # self.tmem_total = self.tmem_S_offset + self.tile_n
-        # assert self.tmem_total <= self.tmem_alloc_cols
-
-        self.tmem_S_offset = 0
-        self.tmem_P_offset = 0  # overlap with S
-        self.tmem_dV_offset = self.tmem_S_offset + self.tile_n
-        self.tmem_dP_offset = self.tmem_dV_offset + self.tile_hdimv
-        self.tmem_dQ_offset = self.tmem_dP_offset  # overlap with dP
-        self.tmem_dK_offset = self.tmem_dP_offset + self.tile_m
-        self.tmem_dS_offset = self.tmem_dP_offset  # overlap with dP
+        # SM120: Tensor Memory offsets removed - using shared memory instead
+        # These offsets were used for Tensor Memory addressing, but SM120 doesn't have Tensor Memory
 
         if not is_causal and not is_local:
             self.num_regs_reduce = 152
@@ -197,6 +187,8 @@ class FlashAttentionBackwardSm120:
             self.mma_tiler_vdo[:2],
         )
         # dV += P @ dO --> (K, MN) major
+        # dV += P @ dO
+        # SM120: P is in shared memory, not Tensor Memory
         tiled_mma_dV = sm100_utils_basic.make_trivial_tiled_mma(
             self.do_dtype,
             tcgen05.OperandMajorMode.K,  # P_major_mode
@@ -204,9 +196,10 @@ class FlashAttentionBackwardSm120:
             self.acc_dtype,
             cta_group,
             self.mma_tiler_pdo[:2],
-            a_source=tcgen05.OperandSource.TMEM,
+            a_source=tcgen05.OperandSource.SMEM,  # SM120: P is in shared memory
         )
         # dK += dS.T @ Q
+        # SM120: dS is in shared memory, not Tensor Memory
         tiled_mma_dK = sm100_utils_basic.make_trivial_tiled_mma(
             self.do_dtype,
             tcgen05.OperandMajorMode.K,  # dS_major_mode
@@ -214,7 +207,7 @@ class FlashAttentionBackwardSm120:
             self.acc_dtype,
             cta_group,
             self.mma_tiler_dsq[:2],
-            a_source=tcgen05.OperandSource.TMEM,
+            a_source=tcgen05.OperandSource.SMEM,  # SM120: dS is in shared memory
         )
         # dQ = dS @ K
         tiled_mma_dQ = sm100_utils_basic.make_trivial_tiled_mma(
@@ -336,6 +329,45 @@ class FlashAttentionBackwardSm120:
             self.sdKV_layout = cute.make_layout(
                 (self.tile_n * self.dK_reduce_ncol, 2)
             )
+
+        # SM120: Create shared memory layouts for accumulators (replacing Tensor Memory)
+        # S = K @ Q.T, shape (tile_n, tile_m)
+        self.sS_layout = sm100_utils_basic.make_smem_layout_a(
+            self.tiled_mma_S,
+            self.mma_tiler_kq,
+            Float32,  # accumulator dtype
+            1,
+        )
+        # dP = V @ dO.T, shape (tile_n, tile_m)
+        self.sdP_layout = sm100_utils_basic.make_smem_layout_a(
+            self.tiled_mma_dP,
+            self.mma_tiler_vdo,
+            Float32,  # accumulator dtype
+            1,
+        )
+        # dV += P @ dO, shape (tile_n, tile_hdimv)
+        self.sdV_layout = sm100_utils_basic.make_smem_layout_a(
+            self.tiled_mma_dV,
+            self.mma_tiler_pdo,
+            Float32,  # accumulator dtype
+            1,
+        )
+        # dK += dS.T @ Q, shape (tile_n, tile_hdim)
+        self.sdK_layout = sm100_utils_basic.make_smem_layout_a(
+            self.tiled_mma_dK,
+            self.mma_tiler_dsq,
+            Float32,  # accumulator dtype
+            1,
+        )
+        # dQ = dS @ K, shape (tile_m, tile_hdim)
+        self.sdQ_layout = sm100_utils_basic.make_smem_layout_a(
+            self.tiled_mma_dQ,
+            self.mma_tiler_dsk,
+            Float32,  # accumulator dtype
+            1,
+        )
+        # P layout already exists as tP_layout
+        # dS layout already exists as tdS_layout
 
     @cute.jit
     def __call__(
@@ -600,8 +632,8 @@ class FlashAttentionBackwardSm120:
             dQ_cluster_empty_mbar_ptr: cute.struct.MemRange[
                 cutlass.Int64, self.dQaccum_reduce_stage // 2
             ]
-            tmem_holding_buf: Int32
-            tmem_dealloc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 1]
+            # SM120: Tensor Memory removed - using shared memory instead
+            # tmem_holding_buf and tmem_dealloc_mbar_ptr removed
 
             # Smem tensors
             sQ: cute.struct.Align[
@@ -634,6 +666,35 @@ class FlashAttentionBackwardSm120:
             ]
             sdQaccum: cute.struct.Align[
                 cute.struct.MemRange[self.dqaccum_dtype, cute.cosize(self.sdQaccum_layout)],
+                self.buffer_align_bytes,
+            ]
+            # SM120: Shared memory buffers for accumulators (replacing Tensor Memory)
+            sS: cute.struct.Align[
+                cute.struct.MemRange[Float32, cute.cosize(self.sS_layout)],
+                self.buffer_align_bytes,
+            ]
+            sdP: cute.struct.Align[
+                cute.struct.MemRange[Float32, cute.cosize(self.sdP_layout)],
+                self.buffer_align_bytes,
+            ]
+            sdV: cute.struct.Align[
+                cute.struct.MemRange[Float32, cute.cosize(self.sdV_layout)],
+                self.buffer_align_bytes,
+            ]
+            sdK: cute.struct.Align[
+                cute.struct.MemRange[Float32, cute.cosize(self.sdK_layout)],
+                self.buffer_align_bytes,
+            ]
+            sdQ: cute.struct.Align[
+                cute.struct.MemRange[Float32, cute.cosize(self.sdQ_layout)],
+                self.buffer_align_bytes,
+            ]
+            sP: cute.struct.Align[
+                cute.struct.MemRange[self.do_dtype, cute.cosize(self.tP_layout)],
+                self.buffer_align_bytes,
+            ]
+            sdS: cute.struct.Align[
+                cute.struct.MemRange[self.ds_dtype, cute.cosize(self.tdS_layout)],
                 self.buffer_align_bytes,
             ]
 
@@ -675,6 +736,11 @@ class FlashAttentionBackwardSm120:
             self.sKt_layout,
             self.sdQaccum_layout,
             self.sdKV_layout,
+            self.sS_layout,
+            self.sdP_layout,
+            self.sdV_layout,
+            self.sdK_layout,
+            self.sdQ_layout,
             self.tP_layout,
             self.tdS_layout,
             self.tiled_mma_S,
@@ -731,6 +797,11 @@ class FlashAttentionBackwardSm120:
         sKt_layout: cute.ComposedLayout,
         sdQaccum_layout: cute.Layout,
         sdKV_layout: cute.ComposedLayout | cute.Layout,
+        sS_layout: cute.ComposedLayout,
+        sdP_layout: cute.ComposedLayout,
+        sdV_layout: cute.ComposedLayout,
+        sdK_layout: cute.ComposedLayout,
+        sdQ_layout: cute.ComposedLayout,
         tP_layout: cute.ComposedLayout,
         tdS_layout: cute.ComposedLayout,
         tiled_mma_S: cute.TiledMma,
@@ -766,14 +837,9 @@ class FlashAttentionBackwardSm120:
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
-        tmem_dealloc_mbar_ptr = storage.tmem_dealloc_mbar_ptr.data_ptr()
+        # SM120: Tensor Memory deallocation barrier removed - not needed
         dQ_cluster_full_mbar_ptr = storage.dQ_cluster_full_mbar_ptr.data_ptr()
         dQ_cluster_empty_mbar_ptr = storage.dQ_cluster_empty_mbar_ptr.data_ptr()
-
-        if warp_idx == 1:
-            cute.arch.mbarrier_init(
-                tmem_dealloc_mbar_ptr, cute.arch.WARP_SIZE * len(self.compute_warp_ids)
-            )
         if const_expr(self.cluster_reduce_dQ):
             if warp_idx == 4:
                 for i in range(self.dQaccum_reduce_stage // 2):
@@ -911,42 +977,35 @@ class FlashAttentionBackwardSm120:
         ), "Not enough space for sdK"
         sdQaccum = storage.sdQaccum.get_tensor(sdQaccum_layout)
 
-        # TMEM
-        # This is a fake tensor, by right need to retrieve tmem_ptr. But we know that we always
-        # request 512 columns of tmem, so we know that it starts at 0.
-        tmem_ptr = cute.make_ptr(Float32, 0, mem_space=cute.AddressSpace.tmem, assumed_align=16)
-        # S
+        # SM120: Create shared memory tensors for accumulators (replacing Tensor Memory)
+        sS = storage.sS.get_tensor(sS_layout.outer, swizzle=sS_layout.inner)
+        sdP = storage.sdP.get_tensor(sdP_layout.outer, swizzle=sdP_layout.inner)
+        sdV = storage.sdV.get_tensor(sdV_layout.outer, swizzle=sdV_layout.inner)
+        sdK = storage.sdK.get_tensor(sdK_layout.outer, swizzle=sdK_layout.inner)
+        sdQ = storage.sdQ.get_tensor(sdQ_layout.outer, swizzle=sdQ_layout.inner)
+        sP = storage.sP.get_tensor(tP_layout.outer, swizzle=tP_layout.inner)
+        sdS = storage.sdS.get_tensor(tdS_layout.outer, swizzle=tdS_layout.inner)
+
+        # SM120: Create register fragments for accumulators (will be stored to shared memory after GEMM)
         thr_mma_S = tiled_mma_S.get_slice(0)
         Sacc_shape = thr_mma_S.partition_shape_C(self.mma_tiler_kq[:2])  # (M, N)
-        tStS = thr_mma_S.make_fragment_C(Sacc_shape)
-        # (MMA, MMA_M, MMA_N)
-        tStS = cute.make_tensor(tmem_ptr + self.tmem_S_offset, tStS.layout)
+        tStS = thr_mma_S.make_fragment_C(Sacc_shape)  # SM120: Register fragment, will store to smem
         # dP
         thr_mma_dP = tiled_mma_dP.get_slice(0)
         dPacc_shape = thr_mma_dP.partition_shape_C(self.mma_tiler_vdo[:2])
-        tdPtdP = thr_mma_dP.make_fragment_C(dPacc_shape)
-        tdPtdP = cute.make_tensor(tmem_ptr + self.tmem_dP_offset, tdPtdP.layout)
+        tdPtdP = thr_mma_dP.make_fragment_C(dPacc_shape)  # SM120: Register fragment
         # dV
         thr_mma_dV = tiled_mma_dV.get_slice(0)
         dvacc_shape = thr_mma_dV.partition_shape_C(self.mma_tiler_pdo[:2])
-        tdVtdV = thr_mma_dV.make_fragment_C(dvacc_shape)
-        tdVtdV = cute.make_tensor(tmem_ptr + self.tmem_dV_offset, tdVtdV.layout)
-        tP = cute.make_tensor(
-            cute.recast_ptr(tmem_ptr + self.tmem_P_offset, dtype=self.do_dtype), tP_layout.outer
-        )
+        tdVtdV = thr_mma_dV.make_fragment_C(dvacc_shape)  # SM120: Register fragment
         # dK
         thr_mma_dK = tiled_mma_dK.get_slice(0)
         dkacc_shape = thr_mma_dK.partition_shape_C(self.mma_tiler_dsq[:2])
-        tdKtdK = thr_mma_dK.make_fragment_C(dkacc_shape)
-        tdKtdK = cute.make_tensor(tmem_ptr + self.tmem_dK_offset, tdKtdK.layout)
-        tdS = cute.make_tensor(
-            cute.recast_ptr(tmem_ptr + self.tmem_dS_offset, dtype=self.ds_dtype), tdS_layout.outer
-        )
+        tdKtdK = thr_mma_dK.make_fragment_C(dkacc_shape)  # SM120: Register fragment
         # dQ
         thr_mma_dQ = tiled_mma_dQ.get_slice(0)
         dQacc_shape = thr_mma_dQ.partition_shape_C(self.mma_tiler_dsk[:2])
-        tdQtdQ = thr_mma_dQ.make_fragment_C(dQacc_shape)
-        tdQtdQ = cute.make_tensor(tmem_ptr + self.tmem_dQ_offset, tdQtdQ.layout)
+        tdQtdQ = thr_mma_dQ.make_fragment_C(dQacc_shape)  # SM120: Register fragment
 
         block_info = BlockInfo(
             self.tile_m,
@@ -1029,11 +1088,7 @@ class FlashAttentionBackwardSm120:
         if warp_idx == self.mma_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
 
-            # Alloc tmem buffer
-            tmem_alloc_cols = Int32(self.tmem_alloc_cols)
-            cute.arch.alloc_tmem(tmem_alloc_cols, storage.tmem_holding_buf)
-            cute.arch.sync_warp()
-
+            # SM120: No Tensor Memory allocation needed - using shared memory instead
             self.mma(
                 tiled_mma_S,
                 tiled_mma_dP,
@@ -1049,8 +1104,13 @@ class FlashAttentionBackwardSm120:
                 sdSt,
                 sdS,
                 sKt,
-                tP,
-                tdS,
+                sS,
+                sdP,
+                sdV,
+                sdK,
+                sdQ,
+                sP,
+                sdS,
                 tStS,
                 tdPtdP,
                 tdVtdV,
@@ -1067,14 +1127,6 @@ class FlashAttentionBackwardSm120:
                 SeqlenInfoCls,
                 TileSchedulerCls,
             )
-            cute.arch.relinquish_tmem_alloc_permit()
-            tmem_ptr = cute.arch.retrieve_tmem_ptr(
-                Float32, alignment=16, ptr_to_buffer_holding_addr=storage.tmem_holding_buf
-            )
-
-            cute.arch.mbarrier_wait(tmem_dealloc_mbar_ptr, 0)
-            tmem_alloc_cols = Int32(self.tmem_alloc_cols)
-            cute.arch.dealloc_tmem(tmem_ptr, tmem_alloc_cols, is_two_cta=False)
 
         # Compute
         # (4, 5, 6, 7, 8, 9, 10, 11) --> 8 warps
@@ -1085,15 +1137,16 @@ class FlashAttentionBackwardSm120:
                 thr_mma_dP,
                 thr_mma_dV,
                 thr_mma_dK,
-                tStS,
+                sS,  # SM120: Shared memory for S instead of register fragment
                 sLSE,
                 sdPsum,
-                tdVtdV,
-                tdKtdK,
+                sdV,  # SM120: Shared memory for dV accumulator
+                sdK,  # SM120: Shared memory for dK accumulator
                 mdV,
                 mdK,
                 sdS,
-                tdPtdP,
+                sdP,  # SM120: Shared memory for dP instead of register fragment
+                sP,  # SM120: Shared memory for P
                 pipeline_LSE,
                 pipeline_dPsum,
                 pipeline_S_P,
@@ -1116,7 +1169,7 @@ class FlashAttentionBackwardSm120:
                 mdK_semaphore,
                 mdV_semaphore,
             )
-            cute.arch.mbarrier_arrive(tmem_dealloc_mbar_ptr)
+            # SM120: Tensor Memory deallocation barrier removed - not needed
 
         # Reduce
         # (0, 1, 2, 3) - dQ
@@ -1126,7 +1179,7 @@ class FlashAttentionBackwardSm120:
                 mdQaccum,
                 sdQaccum,
                 thr_mma_dQ,
-                tdQtdQ,
+                sdQ,  # SM120: Shared memory for dQ accumulator instead of Tensor Memory
                 pipeline_dQ,
                 block_info,
                 SeqlenInfoCls,
@@ -1346,13 +1399,18 @@ class FlashAttentionBackwardSm120:
         sdSt: cute.Tensor,
         sdS: cute.Tensor,
         sKt: cute.Tensor,
-        tP: cute.Tensor,
-        tdS: cute.Tensor,
-        tStS: cute.Tensor,
-        tdPtdP: cute.Tensor,
-        tdVtdV: cute.Tensor,
-        tdKtdK: cute.Tensor,
-        tdQtdQ: cute.Tensor,
+        sS: cute.Tensor,  # SM120: Shared memory for S accumulator
+        sdP: cute.Tensor,  # SM120: Shared memory for dP accumulator
+        sdV: cute.Tensor,  # SM120: Shared memory for dV accumulator
+        sdK: cute.Tensor,  # SM120: Shared memory for dK accumulator
+        sdQ: cute.Tensor,  # SM120: Shared memory for dQ accumulator
+        sP: cute.Tensor,  # SM120: Shared memory for P
+        sdS_smem: cute.Tensor,  # SM120: Shared memory for dS
+        tStS: cute.Tensor,  # SM120: Register fragment for S accumulator
+        tdPtdP: cute.Tensor,  # SM120: Register fragment for dP accumulator
+        tdVtdV: cute.Tensor,  # SM120: Register fragment for dV accumulator
+        tdKtdK: cute.Tensor,  # SM120: Register fragment for dK accumulator
+        tdQtdQ: cute.Tensor,  # SM120: Register fragment for dQ accumulator
         pipeline_Q_consumer: PipelineConsumer,
         pipeline_dO: PipelineAsync,
         pipeline_S_P: PipelineAsync,
@@ -1366,7 +1424,7 @@ class FlashAttentionBackwardSm120:
     ):
         # [2025-10-21] For reasons I don't understand, putting these partitioning in the main
         # kernel (before warp specialization) is a lot slower tha putting them here.
-        # Partition smem / tmem tensors
+        # Partition smem tensors (SM120: no Tensor Memory)
         # S = K @ Q.T
         tSrK = tiled_mma_S.make_fragment_A(sK)
         tSrQ = tiled_mma_S.make_fragment_B(sQ)
@@ -1374,15 +1432,74 @@ class FlashAttentionBackwardSm120:
         tdPrV = tiled_mma_dP.make_fragment_A(sV)
         tdPrdOt = tiled_mma_dP.make_fragment_B(sdOt)
         # dK = dS.T @ Q
-        # tdKrdS = tiled_mma_dK.make_fragment_A(sdSt)
-        tdKrdS = tiled_mma_dK.make_fragment_A(tdS)
+        # SM120: Use shared memory for dS instead of Tensor Memory
+        tdKrdS = tiled_mma_dK.make_fragment_A(sdS_smem)
         tdKrQ = tiled_mma_dK.make_fragment_B(sQt)
         # dQ = dS @ K
-        tdQrdS = tiled_mma_dQ.make_fragment_A(sdS)
+        tdQrdS = tiled_mma_dQ.make_fragment_A(sdS_smem)
         tdQrK = tiled_mma_dQ.make_fragment_B(sKt)
         # dV = P @ dO.T
         tdVrdO = tiled_mma_dV.make_fragment_B(sdO)
-        tdVrP = tiled_mma_dV.make_fragment_A(tP)
+        # SM120: Use shared memory for P instead of Tensor Memory
+        tdVrP = tiled_mma_dV.make_fragment_A(sP)
+
+        # SM120: Create shared memory store operations for register accumulators
+        tidx = cute.arch.thread_idx()[0]
+        thr_mma_S = tiled_mma_S.get_slice(0)
+        thr_mma_dP = tiled_mma_dP.get_slice(0)
+        thr_mma_dV = tiled_mma_dV.get_slice(0)
+        thr_mma_dK = tiled_mma_dK.get_slice(0)
+        thr_mma_dQ = tiled_mma_dQ.get_slice(0)
+
+        # Store operations for S
+        smem_store_S_atom = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(), Float32, num_bits_per_copy=128
+        )
+        tScS = thr_mma_S.partition_C(sS)
+        tiled_smem_store_S = cute.make_tiled_copy(smem_store_S_atom, tScS.layout)
+        thr_smem_store_S = tiled_smem_store_S.get_slice(tidx)
+        tSrS_reg = thr_smem_store_S.partition_S(tStS)
+        tSsS = thr_smem_store_S.partition_D(tScS)
+
+        # Store operations for dP
+        smem_store_dP_atom = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(), Float32, num_bits_per_copy=128
+        )
+        tdPcdP = thr_mma_dP.partition_C(sdP)
+        tiled_smem_store_dP = cute.make_tiled_copy(smem_store_dP_atom, tdPcdP.layout)
+        thr_smem_store_dP = tiled_smem_store_dP.get_slice(tidx)
+        tdPrdP_reg = thr_smem_store_dP.partition_S(tdPtdP)
+        tdPsdP = thr_smem_store_dP.partition_D(tdPcdP)
+
+        # Store operations for dV
+        smem_store_dV_atom = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(), Float32, num_bits_per_copy=128
+        )
+        tdVcdV = thr_mma_dV.partition_C(sdV)
+        tiled_smem_store_dV = cute.make_tiled_copy(smem_store_dV_atom, tdVcdV.layout)
+        thr_smem_store_dV = tiled_smem_store_dV.get_slice(tidx)
+        tdVrdV_reg = thr_smem_store_dV.partition_S(tdVtdV)
+        tdVsdV = thr_smem_store_dV.partition_D(tdVcdV)
+
+        # Store operations for dK
+        smem_store_dK_atom = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(), Float32, num_bits_per_copy=128
+        )
+        tdKcdK = thr_mma_dK.partition_C(sdK)
+        tiled_smem_store_dK = cute.make_tiled_copy(smem_store_dK_atom, tdKcdK.layout)
+        thr_smem_store_dK = tiled_smem_store_dK.get_slice(tidx)
+        tdKrdK_reg = thr_smem_store_dK.partition_S(tdKtdK)
+        tdKsdK = thr_smem_store_dK.partition_D(tdKcdK)
+
+        # Store operations for dQ
+        smem_store_dQ_atom = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(), Float32, num_bits_per_copy=128
+        )
+        tdQcdQ = thr_mma_dQ.partition_C(sdQ)
+        tiled_smem_store_dQ = cute.make_tiled_copy(smem_store_dQ_atom, tdQcdQ.layout)
+        thr_smem_store_dQ = tiled_smem_store_dQ.get_slice(tidx)
+        tdQrdQ_reg = thr_smem_store_dQ.partition_S(tdQtdQ)
+        tdQsdQ = thr_smem_store_dQ.partition_D(tdQcdQ)
 
         # mma_qk_fn = partial(gemm_w_idx, tiled_mma_S, tStS, tSrK, tSrQ, zero_init=True)
         mma_qk_fn = partial(
@@ -1400,31 +1517,30 @@ class FlashAttentionBackwardSm120:
             zero_init=True,
         )
         # mma_pdo_fn = partial(gemm_w_idx, tiled_mma_dV, tdVtdV, tdVrP, tdVrdO)
+        # SM120: Use shared memory for P instead of Tensor Memory
         mma_pdo_fn = partial(
             gemm_ptx_w_idx,
             tiled_mma_dV,
             tdVtdV,
             tdVrP,
             tdVrdO,
-            sA=None,
+            sA=sP,  # SM120: P is in shared memory
             sB=sdO,
-            tA_addr=self.tmem_P_offset,
         )
         mma_dsk_fn = partial(gemm_w_idx, tiled_mma_dQ, tdQtdQ, tdQrdS, tdQrK, zero_init=True)
         # mma_dsk_fn = partial(
         #     gemm_ptx_w_idx, tiled_mma_dQ, tdQtdQ, tdQrdS, tdQrK, sA=sdS, sB=sKt, zero_init=True
         # )
         # mma_dsq_fn = partial(gemm_w_idx, tiled_mma_dK, tdKtdK, tdKrdS, tdKrQ)
-        # Need to explicitly pass in tA_addr for correctness
+        # SM120: Use shared memory for dS instead of Tensor Memory
         mma_dsq_fn = partial(
             gemm_ptx_w_idx,
             tiled_mma_dK,
             tdKtdK,
             tdKrdS,
             tdKrQ,
-            sA=None,
+            sA=sdS_smem,  # SM120: dS is in shared memory
             sB=sQt,
-            tA_addr=self.tmem_dS_offset,
         )
 
         consumer_state_dO = cutlass.pipeline.make_pipeline_state(
@@ -1461,23 +1577,38 @@ class FlashAttentionBackwardSm120:
             handle_Q = pipeline_Q_consumer.wait_and_advance()
             pipeline_S_P.sync_object_empty.wait(0, producer_phase_acc)
             mma_qk_fn(B_idx=handle_Q.index)
+            # SM120: Store S accumulator from registers to shared memory
+            cute.copy(thr_smem_store_S, tSrS_reg, tSsS)
+            cute.arch.fence_proxy(
+                cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
+            )
             # Don't release Q yet
             pipeline_S_P.sync_object_full.arrive(0, pipeline_S_P.producer_mask, cta_group)
 
             # 2) dP = V @ dO.T
             pipeline_dO.consumer_wait(consumer_state_dO)
             pipeline_dP.sync_object_empty.wait(0, producer_phase_acc)
-            # dQ uses the same tmem as dP
+            # dQ uses the same smem as dP (SM120: both use shared memory)
             pipeline_dQ.sync_object_empty.wait(0, producer_phase_acc)
             mma_dov_fn(B_idx=consumer_state_dO.index)
+            # SM120: Store dP accumulator from registers to shared memory
+            cute.copy(thr_smem_store_dP, tdPrdP_reg, tdPsdP)
+            cute.arch.fence_proxy(
+                cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
+            )
             # Don't release dO yet
             pipeline_dP.sync_object_full.arrive(0, pipeline_dP.producer_mask, cta_group)
 
             producer_phase_acc ^= 1
             # 3) dV = P.T @ dO
-            # wait for P to be ready, which uses the same tmem as S
+            # wait for P to be ready, which uses the same smem as S (SM120: both use shared memory)
             pipeline_S_P.sync_object_empty.wait(0, producer_phase_acc)
             mma_pdo_fn(B_idx=consumer_state_dO.index, zero_init=True)
+            # SM120: Store dV accumulator from registers to shared memory
+            cute.copy(thr_smem_store_dV, tdVrdV_reg, tdVsdV)
+            cute.arch.fence_proxy(
+                cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
+            )
             pipeline_dO.consumer_release(consumer_state_dO)
             consumer_state_dO.advance()
             # -----------------------------------------------------------
@@ -1494,35 +1625,60 @@ class FlashAttentionBackwardSm120:
                 handle_Q_next = pipeline_Q_consumer.wait_and_advance()
                 # Don't need to wait for S, as P must have been ready ealier, i.e., S is ready
                 mma_qk_fn(B_idx=handle_Q_next.index)
+                # SM120: Store S accumulator from registers to shared memory
+                cute.copy(thr_smem_store_S, tSrS_reg, tSsS)
+                cute.arch.fence_proxy(
+                    cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
+                )
                 pipeline_S_P.sync_object_full.arrive(0, pipeline_S_P.producer_mask, cta_group)
 
                 # 2) dK = dS.T @ Q
                 pipeline_dS.consumer_wait(consumer_state_dS)
                 mma_dsq_fn(B_idx=handle_Q.index, zero_init=not accumulate_dK)
+                # SM120: Store dK accumulator from registers to shared memory
+                cute.copy(thr_smem_store_dK, tdKrdK_reg, tdKsdK)
+                cute.arch.fence_proxy(
+                    cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
+                )
                 accumulate_dK = True
                 handle_Q.release()
 
                 # 3) dQ = dS @ K
-                # dP uses the same tmem as dQ
+                # dP uses the same smem as dQ (SM120: both use shared memory)
                 # However, if dS is ready, then dP must have been ready, so we don't need to wait
                 # pipeline_dP.sync_object_empty.wait(0, producer_phase_acc)
                 mma_dsk_fn()
+                # SM120: Store dQ accumulator from registers to shared memory
+                cute.copy(thr_smem_store_dQ, tdQrdQ_reg, tdQsdQ)
+                cute.arch.fence_proxy(
+                    cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
+                )
                 pipeline_dQ.sync_object_full.arrive(0, pipeline_dQ.producer_mask, cta_group)
                 pipeline_dS.consumer_release(consumer_state_dS)
                 consumer_state_dS.advance()
 
                 # 4) dP = V @ dO.T
                 pipeline_dO.consumer_wait(consumer_state_dO)
-                # dQ uses the same tmem as dP
+                # dQ uses the same smem as dP (SM120: both use shared memory)
                 pipeline_dQ.sync_object_empty.wait(0, producer_phase_acc)
                 mma_dov_fn(B_idx=consumer_state_dO.index)
+                # SM120: Store dP accumulator from registers to shared memory
+                cute.copy(thr_smem_store_dP, tdPrdP_reg, tdPsdP)
+                cute.arch.fence_proxy(
+                    cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
+                )
                 pipeline_dP.sync_object_full.arrive(0, pipeline_dP.producer_mask, cta_group)
 
                 producer_phase_acc ^= 1
                 # 5) dV += P @ dO
-                # wait for P to be ready, which uses the same tmem as S
+                # wait for P to be ready, which uses the same smem as S (SM120: both use shared memory)
                 pipeline_S_P.sync_object_empty.wait(0, producer_phase_acc)
                 mma_pdo_fn(B_idx=consumer_state_dO.index, zero_init=False)
+                # SM120: Store dV accumulator from registers to shared memory
+                cute.copy(thr_smem_store_dV, tdVrdV_reg, tdVsdV)
+                cute.arch.fence_proxy(
+                    cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
+                )
                 pipeline_dO.consumer_release(consumer_state_dO)
                 consumer_state_dO.advance()
 
@@ -1545,6 +1701,11 @@ class FlashAttentionBackwardSm120:
             # 1) dK += dS.T @ Q
             pipeline_dS.consumer_wait(consumer_state_dS)
             mma_dsq_fn(B_idx=handle_Q.index, zero_init=not accumulate_dK)
+            # SM120: Store dK accumulator from registers to shared memory
+            cute.copy(thr_smem_store_dK, tdKrdK_reg, tdKsdK)
+            cute.arch.fence_proxy(
+                cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
+            )
             # signal to the epilogue that dK is ready
             # pipeline_dKV.producer_commit(producer_state_dKV)
             pipeline_dKV.sync_object_full.arrive(1, pipeline_dKV.producer_mask, cta_group)
@@ -1554,6 +1715,11 @@ class FlashAttentionBackwardSm120:
             # 2) dQ = dS @ K
             # dS is done, so dP must have been ready, we don't need to wait
             mma_dsk_fn()
+            # SM120: Store dQ accumulator from registers to shared memory
+            cute.copy(thr_smem_store_dQ, tdQrdQ_reg, tdQsdQ)
+            cute.arch.fence_proxy(
+                cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
+            )
             pipeline_dQ.sync_object_full.arrive(0, pipeline_dQ.producer_mask, cta_group)
             # Wait until dQ is done before releasing Q, since K and Q0 uses the same mbarrier
             handle_Q.release()
@@ -1620,15 +1786,16 @@ class FlashAttentionBackwardSm120:
         thr_mma_dP: cute.core.ThrMma,
         thr_mma_dV: cute.core.ThrMma,
         thr_mma_dK: cute.core.ThrMma,
-        tStS: cute.Tensor,
+        sS: cute.Tensor,  # SM120: Shared memory for S accumulator
         sLSE: cute.Tensor,
         sdPsum: cute.Tensor,
-        tdVtdV: cute.Tensor,
-        tdKtdK: cute.Tensor,
+        sdV: cute.Tensor,  # SM120: Shared memory for dV accumulator
+        sdK: cute.Tensor,  # SM120: Shared memory for dK accumulator
         mdV: cute.Tensor,
         mdK: cute.Tensor,
         sdS: cute.Tensor,
-        tdPtdP: cute.Tensor,
+        sdP: cute.Tensor,  # SM120: Shared memory for dP accumulator
+        sP: cute.Tensor,  # SM120: Shared memory for P
         pipeline_LSE: PipelineAsync,
         pipeline_dPsum: PipelineAsync,
         pipeline_S_P: PipelineAsync,
@@ -1641,8 +1808,8 @@ class FlashAttentionBackwardSm120:
         SeqlenInfoCls: Callable,
         AttentionMaskCls: Callable,
         TileSchedulerCls: Callable,
-        sdV: Optional[cute.Tensor],
-        sdK: Optional[cute.Tensor],
+        sdV_epi: Optional[cute.Tensor],
+        sdK_epi: Optional[cute.Tensor],
         mdV_tma_tensor: Optional[cute.Tensor],
         mdK_tma_tensor: Optional[cute.Tensor],
         tma_atom_dV: Optional[cute.CopyAtom],
@@ -1681,45 +1848,45 @@ class FlashAttentionBackwardSm120:
         # 1: [128...256]
 
         tileP_f32_like = self.mma_tiler_kq[0] // 32 * self.v_dtype.width  # (128, 64)
-        # tStS has shape ((128, 128), 1, 1), tStP has shape ((128, 64), 1, 1)
-        # tP overlap with tS
-        tStP = cute.composition(tStS, (cute.make_layout((self.tile_n, tileP_f32_like)), 1, 1))
-        tStP = cute.make_tensor(tStS.iterator, tStP.layout)  # Otherwise the tmem address is wrong
-        tScS = thr_mma_S.partition_C(cute.make_identity_tensor(self.mma_tiler_kq[:2]))
-        tScP = cute.composition(tScS, (cute.make_layout((self.tile_n, tileP_f32_like)), 1, 1))
-        # tdS overlap with tdP
-        tdPtdS = cute.composition(tdPtdP, (cute.make_layout((self.tile_n, tileP_f32_like)), 1, 1))
-        tdPcdP = thr_mma_dP.partition_C(cute.make_identity_tensor(self.mma_tiler_vdo[:2]))
-        tdPcdS = cute.composition(tdPcdP, (cute.make_layout((self.tile_n, tileP_f32_like)), 1, 1))
+        # SM120: Create shared memory partitions instead of Tensor Memory
+        tScS = thr_mma_S.partition_C(sS)  # Partition shared memory S
+        tScP = thr_mma_S.partition_C(sP)  # Partition shared memory P
+        tdPcdP = thr_mma_dP.partition_C(sdP)  # Partition shared memory dP
+        tdPcdS = thr_mma_dP.partition_C(sdS)  # Partition shared memory dS (overlaps with dP)
 
-        tmem_load_atom = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), Float32
+        # SM120: Create shared memory load/store operations instead of Tensor Memory
+        smem_load_atom = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(), Float32, num_bits_per_copy=128
         )
-        tmem_store_atom = cute.make_copy_atom(
-            tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(16)), Float32
+        smem_store_atom = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(), Float32, num_bits_per_copy=128
         )
 
-        # tmem -> rmem
-        thr_copy_t2r = copy_utils.make_tmem_copy(tmem_load_atom, num_wg).get_slice(tidx)
-        tStS_t2r = thr_copy_t2r.partition_S(tStS)  # (((32, 32), 1), 2, 1, 1)
-        tdPtdP_t2r = thr_copy_t2r.partition_S(tdPtdP)
-        tScS_t2r = thr_copy_t2r.partition_D(tScS)  # ((32, 1), 2, 1, 1)
-        t0ScS_t2r = thr_copy_t2r.get_slice(0).partition_D(tScS)  # ((32, 1), 2, 1, 1)
+        # smem -> rmem
+        thr_copy_s2r = cute.make_tiled_copy(smem_load_atom, tScS.layout).get_slice(tidx)
+        tScS_s2r = thr_copy_s2r.partition_S(tScS)  # Source: shared memory S
+        tScP_s2r = thr_copy_s2r.partition_S(tScP)  # Source: shared memory P
+        tdPcdP_s2r = thr_copy_s2r.partition_S(tdPcdP)  # Source: shared memory dP
+        tdPcdS_s2r = thr_copy_s2r.partition_S(tdPcdS)  # Source: shared memory dS
+        
+        tScS_t2r = thr_copy_s2r.partition_D(tScS)  # Destination: register fragment
+        t0ScS_t2r = thr_copy_s2r.get_slice(0).partition_D(tScS)  # For masking
         # ((32, 1), 2, 1, 1, STAGE)
-        tSsLSE = thr_copy_t2r.partition_D(thr_mma_S.partition_C(sLSE_2D))
-        tSsdPsum = thr_copy_t2r.partition_D(thr_mma_dP.partition_C(sdPsum_2D))
-        # rmem -> tmem
-        thr_copy_r2t = copy_utils.make_tmem_copy(tmem_store_atom, num_wg).get_slice(tidx)
-        tScP_r2t = thr_copy_r2t.partition_S(tScP)
-        tStP_r2t = thr_copy_r2t.partition_D(tStP)
-        tdPcdS_r2t = thr_copy_r2t.partition_S(tdPcdS)
-        tdPtdS_r2t = thr_copy_r2t.partition_D(tdPtdS)
+        tSsLSE = thr_copy_s2r.partition_D(thr_mma_S.partition_C(sLSE_2D))
+        tSsdPsum = thr_copy_s2r.partition_D(thr_mma_dP.partition_C(sdPsum_2D))
+        
+        # rmem -> smem
+        thr_copy_r2s = cute.make_tiled_copy(smem_store_atom, tScP.layout).get_slice(tidx)
+        tScP_r2s = thr_copy_r2s.partition_S(tScP)  # Source: register fragment
+        tScP_r2s_dst = thr_copy_r2s.partition_D(tScP)  # Destination: shared memory P
+        tdPcdS_r2s = thr_copy_r2s.partition_S(tdPcdS)  # Source: register fragment
+        tdPcdS_r2s_dst = thr_copy_r2s.partition_D(tdPcdS)  # Destination: shared memory dS
         # rmem -> smem
         # This part is a bit iffy, we might be making a lot of assumptions here
         copy_atom_r2s = sm100_utils_basic.get_smem_store_op(
-            LayoutEnum.ROW_MAJOR, self.ds_dtype, Float32, thr_copy_t2r
+            LayoutEnum.ROW_MAJOR, self.ds_dtype, Float32, thr_copy_s2r
         )
-        thr_copy_r2s = cute.make_tiled_copy_D(copy_atom_r2s, thr_copy_t2r).get_slice(tidx)
+        thr_copy_r2s_dS = cute.make_tiled_copy_D(copy_atom_r2s, thr_copy_s2r).get_slice(tidx)
         # We assume the swizzle (i.e. layout.inner) stays the same
         sdS_layout = sm100_utils_basic.make_smem_layout_epi(
             self.ds_dtype, LayoutEnum.ROW_MAJOR, (self.tile_n, self.tile_m), 1
@@ -1728,7 +1895,7 @@ class FlashAttentionBackwardSm120:
         # Need to group into 1 mode to be compatible w thr_copy_r2s
         sdS_layout = cute.make_layout((sdS_layout.shape,), stride=(sdS_layout.stride,))
         sdS_epi = cute.make_tensor(sdS.iterator, sdS_layout)
-        tRS_sdS = thr_copy_r2s.partition_D(sdS_epi)
+        tRS_sdS = thr_copy_r2s_dS.partition_D(sdS_epi)
 
         consumer_state_S_P_dP = pipeline.make_pipeline_state(  # Our impl has shortcut for stage==1
             cutlass.pipeline.PipelineUserType.Consumer, 1
@@ -1781,9 +1948,9 @@ class FlashAttentionBackwardSm120:
 
                 pipeline_S_P.consumer_wait(consumer_state_S_P_dP)
                 # pipeline_S_P.sync_object_full.wait(0, consumer_phase_S_P_dP)
-                #### TMEM->RMEM (Load S from TMEM)
+                #### SMEM->RMEM (Load S from shared memory)
                 tSrS_t2r = cute.make_fragment(tScS_t2r.shape, Float32)
-                cute.copy(thr_copy_t2r, tStS_t2r, tSrS_t2r)
+                cute.copy(thr_copy_s2r, tScS_s2r, tSrS_t2r)
 
                 #### APPLY MASK
                 mask_fn(tSrS_t2r, m_block=m_block)
@@ -1794,8 +1961,8 @@ class FlashAttentionBackwardSm120:
                 #### P = exp(S - LSE)
                 # ---------------------------------------------
                 lane_idx = cute.arch.lane_idx()
-                tSrP_r2t_f32 = cute.make_fragment(tScP_r2t.shape, Float32)  # 64
-                tSrP_r2t = cute.recast_tensor(tSrP_r2t_f32, self.q_dtype)
+                tSrP_r2s_f32 = cute.make_fragment(tScP_r2s_dst[None, 0, 0, 0].shape, Float32)  # 64
+                tSrP_r2s = cute.recast_tensor(tSrP_r2s_f32, self.q_dtype)
                 for stage in cutlass.range_constexpr(num_stages):
                     tSrS_cur = tSrS_t2r[None, stage, 0, 0]
                     tSsLSE_cur = tSsLSE[None, stage, 0, 0, consumer_state_LSE.index]
@@ -1820,19 +1987,24 @@ class FlashAttentionBackwardSm120:
                         )
                         tSrS_cur[2 * v] = cute.math.exp2(tSrS_cur[2 * v], fastmath=True)
                         tSrS_cur[2 * v + 1] = cute.math.exp2(tSrS_cur[2 * v + 1], fastmath=True)
-                    utils.cvt_f16(tSrS_cur, tSrP_r2t[None, stage, 0, 0])
+                    utils.cvt_f16(tSrS_cur, tSrP_r2s[None, stage, 0, 0])
                     if const_expr(stage == 0):
-                        cute.arch.fence_view_async_tmem_load()
-                        # Without this barrier, we could have 1 warp writing to P in tmem while
-                        # another warp is still reading S from tmem.
+                        cute.arch.fence_proxy(
+                            cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
+                        )
+                        # Without this barrier, we could have 1 warp writing to P in smem while
+                        # another warp is still reading S from smem.
                         self.compute_sync_barrier.arrive_and_wait()
+                    # SM120: Store P to shared memory instead of Tensor Memory
                     cute.copy(
-                        thr_copy_r2t,
-                        tSrP_r2t_f32[None, stage, None, None],
-                        tStP_r2t[None, stage, None, None],
+                        thr_copy_r2s,
+                        tSrP_r2s_f32[None, stage, None, None],
+                        tScP_r2s_dst[None, stage, None, None],
                     )
 
-                cute.arch.fence_view_async_tmem_store()
+                cute.arch.fence_proxy(
+                    cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
+                )
 
                 cute.arch.sync_warp()
                 with cute.arch.elect_one():
@@ -1855,8 +2027,11 @@ class FlashAttentionBackwardSm120:
                 ##### dS.T = P.T * (dP.T - Psum)
                 for stage in cutlass.range_constexpr(num_stages):
                     tdPrdP_t2r = cute.make_fragment(tScS_t2r[None, 0, None, None].shape, Float32)
-                    cute.copy(thr_copy_t2r, tdPtdP_t2r[None, stage, None, None], tdPrdP_t2r)
-                    cute.arch.fence_view_async_tmem_load()
+                    # SM120: Load dP from shared memory instead of Tensor Memory
+                    cute.copy(thr_copy_s2r, tdPcdP_s2r[None, stage, None, None], tdPrdP_t2r)
+                    cute.arch.fence_proxy(
+                        cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
+                    )
                     tdPrdP_cur = tdPrdP_t2r[None, 0, 0]
                     tSrS_cur = tSrS_t2r[None, stage, 0, 0]
                     tSsdPsum_cur = tSsdPsum[None, stage, 0, 0, consumer_state_dPsum.index]
@@ -1885,10 +2060,17 @@ class FlashAttentionBackwardSm120:
                     if const_expr(stage == 0):
                         pipeline_dS.producer_acquire(producer_state_dS)
                     cute.autovec_copy(tdPrdS_cvt, tRS_sdS[None, stage])
-                    tdPrdS_r2t_f32 = cute.recast_tensor(tdPrdS_cvt, Float32)
-                    cute.copy(thr_copy_r2t, tdPrdS_r2t_f32, tdPtdS_r2t[None, stage, 0, 0])
+                    # SM120: Store dS to shared memory instead of Tensor Memory
+                    tdPrdS_r2s = cute.make_tensor(
+                        tdPrdS_cvt.iterator,
+                        tdPcdS_r2s_dst[None, stage, 0, 0].shape
+                    )
+                    tdPrdS_r2s_f32 = cute.recast_tensor(tdPrdS_r2s, Float32)
+                    cute.copy(thr_copy_r2s, tdPrdS_r2s_f32, tdPcdS_r2s_dst[None, stage, 0, 0])
 
-                cute.arch.fence_view_async_tmem_store()
+                cute.arch.fence_proxy(
+                    cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
+                )
 
                 cute.arch.sync_warp()
                 # with cute.arch.elect_one():
@@ -1914,8 +2096,8 @@ class FlashAttentionBackwardSm120:
                     n_block,
                     thr_mma_dV,
                     thr_mma_dK,
-                    tdVtdV,
-                    tdKtdK,
+                    sdV,  # SM120: Shared memory for dV accumulator
+                    sdK,  # SM120: Shared memory for dK accumulator
                     mdV,
                     mdK,
                     pipeline_dKV,
@@ -1931,9 +2113,9 @@ class FlashAttentionBackwardSm120:
                     head_idx,
                     n_block,
                     thr_mma_dV,
-                    tdVtdV,
+                    sdV,  # SM120: Shared memory for dV accumulator
                     mdV_tma_tensor,
-                    sdV,
+                    sdV_epi,
                     tma_atom_dV,
                     thr_copy_r2s_dKV,
                     pipeline_dKV,
@@ -1949,9 +2131,9 @@ class FlashAttentionBackwardSm120:
                     head_idx,
                     n_block,
                     thr_mma_dK,
-                    tdKtdK,
+                    sdK,  # SM120: Shared memory for dK accumulator
                     mdK_tma_tensor,
-                    sdK,
+                    sdK_epi,
                     tma_atom_dK,
                     thr_copy_r2s_dKV,
                     pipeline_dKV,
@@ -1970,7 +2152,7 @@ class FlashAttentionBackwardSm120:
         mdQaccum: cute.Tensor,
         sdQaccum: cute.Tensor,
         thr_mma_dQ: cute.core.ThrMma,
-        tdQtdQ: cute.Tensor,
+        sdQ: cute.Tensor,  # SM120: Shared memory for dQ accumulator instead of Tensor Memory
         pipeline_dQ: PipelineAsync,
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
@@ -1981,14 +2163,16 @@ class FlashAttentionBackwardSm120:
         tidx = cute.arch.thread_idx()[0] % num_reduce_threads
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx() % len(self.reduce_warp_ids))
         is_tma_warp = warp_idx == 0
-        # TMEM -> RMEM
-        tmem_load_atom = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(self.dQ_reduce_ncol)), Float32
+        # SM120: Load dQ from shared memory instead of Tensor Memory
+        smem_load_atom = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(), Float32, num_bits_per_copy=128
         )
-        thr_copy_t2r = tcgen05.make_tmem_copy(tmem_load_atom, tdQtdQ).get_slice(tidx)
-        tdQtdQ_t2r = thr_copy_t2r.partition_S(tdQtdQ)
-        tdQcdQ = thr_mma_dQ.partition_C(cute.make_identity_tensor(self.mma_tiler_dsk[:2]))
-        tdQrdQ_t2r_shape = thr_copy_t2r.partition_D(tdQcdQ).shape
+        tdQcdQ = thr_mma_dQ.partition_C(sdQ)  # SM120: Partition shared memory dQ
+        tiled_smem_ld = cute.make_tiled_copy(smem_load_atom, tdQcdQ.layout)
+        thr_copy_s2r = tiled_smem_ld.get_slice(tidx)
+        tdQcdQ_s2r = thr_copy_s2r.partition_S(tdQcdQ)
+        tdQcdQ_reg = thr_mma_dQ.partition_C(cute.make_identity_tensor(self.mma_tiler_dsk[:2]))
+        tdQrdQ_t2r_shape = thr_copy_s2r.partition_D(tdQcdQ_reg).shape
         assert cute.size(tdQrdQ_t2r_shape, mode=[1]) == self.dQaccum_reduce_stage, (
             "dQaccum reduce stage mismatch"
         )
@@ -2026,10 +2210,12 @@ class FlashAttentionBackwardSm120:
 
             for m_block in cutlass.range(m_block_min, m_block_max, unroll=1):
                 pipeline_dQ.consumer_wait(dQ_consumer_state)
-                # TMEM -> RMEM
+                # SMEM -> RMEM
                 tdQrdQ_t2r = cute.make_fragment(tdQrdQ_t2r_shape, Float32)
-                cute.copy(thr_copy_t2r, tdQtdQ_t2r, tdQrdQ_t2r)
-                cute.arch.fence_view_async_tmem_load()
+                cute.copy(thr_copy_s2r, tdQcdQ_s2r, tdQrdQ_t2r)
+                cute.arch.fence_proxy(
+                    cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
+                )
                 cute.arch.sync_warp()
                 with cute.arch.elect_one():
                     pipeline_dQ.consumer_release(dQ_consumer_state)
@@ -2102,8 +2288,8 @@ class FlashAttentionBackwardSm120:
         n_block: Int32,
         thr_mma_dV: cute.core.ThrMma,
         thr_mma_dK: cute.core.ThrMma,
-        tdVtdV: cute.Tensor,
-        tdKtdK: cute.Tensor,
+        sdV: cute.Tensor,  # SM120: Shared memory for dV accumulator
+        sdK: cute.Tensor,  # SM120: Shared memory for dK accumulator
         mdV: cute.Tensor,
         mdK: cute.Tensor,
         pipeline_dKV: PipelineAsync,
@@ -2119,29 +2305,34 @@ class FlashAttentionBackwardSm120:
         mdV_cur = mdV[None, None, head_idx, batch_idx]
         mdK_cur = mdK[None, None, head_idx, batch_idx]
 
-        tmem_load_atom = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(16)), Float32
+        # SM120: Create shared memory load operations instead of Tensor Memory
+        smem_load_atom = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(), Float32, num_bits_per_copy=128
         )
 
         # dV
         pipeline_dKV.consumer_wait(consumer_state_dKV)
 
-        tiled_tmem_ld_dV = tcgen05.make_tmem_copy(tmem_load_atom, tdVtdV)
-        thr_tmem_ld_dV = tiled_tmem_ld_dV.get_slice(tidx)
+        # SM120: Load dV from shared memory
+        tdVcdV = thr_mma_dV.partition_C(sdV)
+        tiled_smem_ld_dV = cute.make_tiled_copy(smem_load_atom, tdVcdV.layout)
+        thr_smem_ld_dV = tiled_smem_ld_dV.get_slice(tidx)
 
-        tdVtdV_t2r_p = thr_tmem_ld_dV.partition_S(tdVtdV)
-        tdVtdV_t2r = self.split_wg(tdVtdV_t2r_p, wg_idx, num_wg)
+        tdVcdV_s2r_p = thr_smem_ld_dV.partition_S(tdVcdV)
+        tdVcdV_s2r = self.split_wg(tdVcdV_s2r_p, wg_idx, num_wg)
 
         cdV = cute.make_identity_tensor((self.mma_tiler_pdo[0], self.mma_tiler_pdo[1]))
-        tdVcdV = thr_mma_dV.partition_C(cdV)
-        tdVcdV_tensor = cute.make_tensor(tdVcdV.iterator, tdVcdV.layout)
+        tdVcdV_reg = thr_mma_dV.partition_C(cdV)
+        tdVcdV_tensor = cute.make_tensor(tdVcdV_reg.iterator, tdVcdV_reg.layout)
 
-        tdVcdV_t2r_p = thr_tmem_ld_dV.partition_D(tdVcdV_tensor)
+        tdVcdV_t2r_p = thr_smem_ld_dV.partition_D(tdVcdV_tensor)
         tdVcdV_t2r = self.split_wg(tdVcdV_t2r_p, wg_idx, num_wg)
         tdVrdV_t2r = cute.make_fragment(tdVcdV_t2r.shape, Float32)
 
-        cute.copy(thr_tmem_ld_dV, tdVtdV_t2r, tdVrdV_t2r)
-        cute.arch.fence_view_async_tmem_load()
+        cute.copy(thr_smem_ld_dV, tdVcdV_s2r, tdVrdV_t2r)
+        cute.arch.fence_proxy(
+            cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
+        )
 
         universal_copy_bits = 128
         atom_universal_copy = cute.make_copy_atom(
@@ -2151,8 +2342,8 @@ class FlashAttentionBackwardSm120:
         )
         tiled_gmem_store_dV = cute.make_tiled_copy(
             atom_universal_copy,
-            layout_tv=tiled_tmem_ld_dV.layout_dst_tv_tiled,
-            tiler_mn=tiled_tmem_ld_dV.tiler_mn,
+            layout_tv=tdVcdV_reg.layout,
+            tiler_mn=(self.mma_tiler_pdo[0], self.mma_tiler_pdo[1]),
         )
 
         tdVrdV_r2s = cute.make_fragment(tdVrdV_t2r.shape, self.dv_dtype)
@@ -2164,7 +2355,7 @@ class FlashAttentionBackwardSm120:
         gdV_tile = gdV[None, None, n_block]
 
         tdVgdV = thr_mma_dV.partition_C(gdV_tile)
-        tdVgdV_r2g_p = thr_tmem_ld_dV.partition_D(tdVgdV)
+        tdVgdV_r2g_p = thr_smem_ld_dV.partition_D(tdVgdV)
         tdVgdV_r2g = self.split_wg(tdVgdV_r2g_p, wg_idx, num_wg)
 
         cute.copy(tiled_gmem_store_dV, tdVrdV_r2s, tdVgdV_r2g)
@@ -2177,22 +2368,26 @@ class FlashAttentionBackwardSm120:
         # dK
         pipeline_dKV.consumer_wait(consumer_state_dKV)
 
-        tiled_tmem_ld_dK = tcgen05.make_tmem_copy(tmem_load_atom, tdKtdK)
-        thr_tmem_ld_dK = tiled_tmem_ld_dK.get_slice(tidx)
+        # SM120: Load dK from shared memory
+        tdKcdK = thr_mma_dK.partition_C(sdK)
+        tiled_smem_ld_dK = cute.make_tiled_copy(smem_load_atom, tdKcdK.layout)
+        thr_smem_ld_dK = tiled_smem_ld_dK.get_slice(tidx)
 
-        tdKtdK_t2r_p = thr_tmem_ld_dK.partition_S(tdKtdK)
-        tdKtdK_t2r = self.split_wg(tdKtdK_t2r_p, wg_idx, num_wg)
+        tdKcdK_s2r_p = thr_smem_ld_dK.partition_S(tdKcdK)
+        tdKcdK_s2r = self.split_wg(tdKcdK_s2r_p, wg_idx, num_wg)
 
         cdK = cute.make_identity_tensor((self.mma_tiler_dsq[0], self.mma_tiler_dsq[1]))
-        tdKcdK = thr_mma_dK.partition_C(cdK)
-        tdKcdK_tensor = cute.make_tensor(tdKcdK.iterator, tdKcdK.layout)
+        tdKcdK_reg = thr_mma_dK.partition_C(cdK)
+        tdKcdK_tensor = cute.make_tensor(tdKcdK_reg.iterator, tdKcdK_reg.layout)
 
-        tdKcdK_t2r_p = thr_tmem_ld_dK.partition_D(tdKcdK_tensor)
+        tdKcdK_t2r_p = thr_smem_ld_dK.partition_D(tdKcdK_tensor)
         tdKcdK_t2r = self.split_wg(tdKcdK_t2r_p, wg_idx, num_wg)
         tdKrdK_t2r = cute.make_fragment(tdKcdK_t2r.shape, Float32)
 
-        cute.copy(tiled_tmem_ld_dK, tdKtdK_t2r, tdKrdK_t2r)
-        cute.arch.fence_view_async_tmem_load()
+        cute.copy(thr_smem_ld_dK, tdKcdK_s2r, tdKrdK_t2r)
+        cute.arch.fence_proxy(
+            cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
+        )
 
         universal_copy_bits = 128
         atom_universal_copy = cute.make_copy_atom(
@@ -2203,8 +2398,8 @@ class FlashAttentionBackwardSm120:
 
         tiled_gmem_store_dK = cute.make_tiled_copy(
             atom_universal_copy,
-            layout_tv=tiled_tmem_ld_dK.layout_dst_tv_tiled,
-            tiler_mn=tiled_tmem_ld_dK.tiler_mn,
+            layout_tv=tdKcdK_reg.layout,
+            tiler_mn=(self.mma_tiler_dsq[0], self.mma_tiler_dsq[1]),
         )
 
         tdKrdK_r2s = cute.make_fragment(tdKrdK_t2r.shape, self.dk_dtype)
@@ -2217,7 +2412,7 @@ class FlashAttentionBackwardSm120:
         gdK_tile = gdK[None, None, n_block]
 
         tdKgdK = thr_mma_dK.partition_C(gdK_tile)
-        tdKgdK_r2g_p = thr_tmem_ld_dK.partition_D(tdKgdK)
+        tdKgdK_r2g_p = thr_smem_ld_dK.partition_D(tdKgdK)
         tdKgdK_r2g = self.split_wg(tdKgdK_r2g_p, wg_idx, num_wg)
 
         cute.copy(tiled_gmem_store_dK, tdKrdK_r2s, tdKgdK_r2g)
@@ -2236,9 +2431,9 @@ class FlashAttentionBackwardSm120:
         head_idx: Int32,
         n_block: Int32,
         thr_mma: cute.core.ThrMma,
-        tdKVtdKV: cute.Tensor,
+        sdKV: cute.Tensor,  # SM120: Shared memory for dK or dV accumulator
         mdKV: cute.Tensor,
-        sdKV: cute.Tensor,
+        sdKV_epi: cute.Tensor,  # SM120: Shared memory for epilogue staging
         tma_atom_dKV: cute.CopyAtom,
         thr_copy_r2s_dKV: cute.TiledCopy,
         pipeline_dKV: PipelineAsync,
@@ -2255,12 +2450,12 @@ class FlashAttentionBackwardSm120:
         leader_warp = (cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4) == 0
 
         if const_expr(self.qhead_per_kvhead == 1):
-            sdKV = sdKV[None, None, wg_idx]  # (tile_n, 64) for bf16
+            sdKV_epi = sdKV_epi[None, None, wg_idx]  # (tile_n, 64) for bf16
         else:
-            sdKV = sdKV[None, wg_idx] # (tile_n * 32) for fp32
+            sdKV_epi = sdKV_epi[None, wg_idx] # (tile_n * 32) for fp32
         
         # (8, tile_n / 128, 64 / 8) = (8, 1, 8) or (4, tile_n * 32 / (128 * 4)) = (4, 8)
-        tdKVsdKV_r2s = thr_copy_r2s_dKV.partition_D(sdKV)
+        tdKVsdKV_r2s = thr_copy_r2s_dKV.partition_D(sdKV_epi)
 
         head_idx_kv = head_idx // self.qhead_per_kvhead
         if const_expr(self.qhead_per_kvhead == 1):
@@ -2292,7 +2487,7 @@ class FlashAttentionBackwardSm120:
                 tma_atom_dKV,
                 0,  # no multicast
                 cute.make_layout(1),
-                cute.group_modes(sdKV, 0, 2),
+                cute.group_modes(sdKV_epi, 0, 2),
                 cute.group_modes(gdKV_epi, 0, 2),
             ) # (TMA) and (TMA, EPI_STAGE)
             assert len(tdKVsdKV.shape) == 1, "Wrong rank for SMEM fragment tdKVsdKV"
@@ -2302,8 +2497,9 @@ class FlashAttentionBackwardSm120:
         else:
             num_epi_stages = self.num_epi_stages
 
-        tmem_load_atom = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), Float32
+        # SM120: Create shared memory load operations instead of Tensor Memory
+        smem_load_atom = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(), Float32, num_bits_per_copy=128
         )
 
         read_flag = const_expr(not self.deterministic)
@@ -2318,29 +2514,31 @@ class FlashAttentionBackwardSm120:
             cute.arch.barrier(barrier_id=barrier_id + wg_idx, number_of_threads=128)
 
         for epi_stage in cutlass.range_constexpr(num_epi_stages):
-            # TMEM -> RMEM -- setup
-            thr_copy_t2r = tcgen05.make_tmem_copy(tmem_load_atom, tdKVtdKV).get_slice(tidx)
-            tdKVtdKV_t2r_p = thr_copy_t2r.partition_S(tdKVtdKV)
-            tdKVtdKV_t2r = self.split_wg(tdKVtdKV_t2r_p, wg_idx, num_wg)[None, None, 0, 0]
+            # SMEM -> RMEM -- setup
+            # SM120: Load from shared memory accumulator
+            tdKVcdKV = thr_mma.partition_C(sdKV)
+            tiled_smem_ld = cute.make_tiled_copy(smem_load_atom, tdKVcdKV.layout)
+            thr_copy_s2r = tiled_smem_ld.get_slice(tidx)
+            
+            tdKVcdKV_s2r_p = thr_copy_s2r.partition_S(tdKVcdKV)
+            tdKVcdKV_s2r = self.split_wg(tdKVcdKV_s2r_p, wg_idx, num_wg)[None, None, 0, 0]
             if const_expr(num_epi_stages > 1):
-                tdKVtdKV_t2r = tdKVtdKV_t2r[None, epi_stage]
+                tdKVcdKV_s2r = tdKVcdKV_s2r[None, epi_stage]
 
             cdKV = cute.make_identity_tensor((self.tile_n, self.tile_hdim))
-            tdKVcdKV = thr_mma.partition_C(cdKV)
-            tdKVcdKV_t2r_p = thr_copy_t2r.partition_D(tdKVcdKV)
+            tdKVcdKV_reg = thr_mma.partition_C(cdKV)
+            tdKVcdKV_t2r_p = thr_copy_s2r.partition_D(tdKVcdKV_reg)
             tdKVcdKV_t2r = self.split_wg(tdKVcdKV_t2r_p, wg_idx, num_wg)[None, None, 0, 0]
             if const_expr(num_epi_stages > 1):
                 tdKVcdKV_t2r = tdKVcdKV_t2r[None, epi_stage]
 
             tdKVrdKV_t2r = cute.make_fragment(tdKVcdKV_t2r.shape, Float32)
 
-            assert cute.size(tdKVrdKV_t2r) == cute.size(tdKVtdKV_t2r) // cute.arch.WARP_SIZE, (
-                "RMEM<->TMEM fragment size mismatch"
+            # SMEM -> RMEM -- copy and fence
+            cute.copy(thr_copy_s2r, tdKVcdKV_s2r, tdKVrdKV_t2r)
+            cute.arch.fence_proxy(
+                cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
             )
-
-            # TMEM -> RMEM -- copy and fence
-            cute.copy(thr_copy_t2r, tdKVtdKV_t2r, tdKVrdKV_t2r)
-            cute.arch.fence_view_async_tmem_load()
 
             # RMEM -- scale and convert
             if const_expr(scale is not None):
@@ -2366,7 +2564,7 @@ class FlashAttentionBackwardSm120:
                 else:
                     with cute.arch.elect_one():
                         copy_utils.cpasync_reduce_bulk_add_f32(
-                            sdKV.iterator,
+                            sdKV_epi.iterator,
                             gdKV_epi[None, epi_stage].iterator,
                             self.tma_copy_bytes["dKacc"],
                         )
