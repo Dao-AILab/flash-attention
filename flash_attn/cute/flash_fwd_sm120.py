@@ -1,4 +1,7 @@
-# SM120 (RTX 50) forward implementation using tcgen05 instructions.
+# SM120 (RTX 50) forward implementation using tcgen05 SuperMMA instructions.
+# SM120 is a stripped-down version of SM100: it lacks Tensor Memory and UTCMMA,
+# and only supports smaller-tile "SuperMMA" operations.
+# Intermediate tensors (S, P, O) are stored in shared memory, not Tensor Memory.
 # Supported features:
 # - BF16 & FP16 dtype
 # - noncausal & causal attention
@@ -138,8 +141,6 @@ class FlashAttentionForwardSm120:
         self.load_warp_id = 13
         self.epilogue_warp_ids = (14,)
         self.empty_warp_ids = (15,)
-        SM100_TMEM_CAPACITY_COLUMNS = 512
-        self.tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
 
         self.threads_per_cta = cute.arch.WARP_SIZE * len(
             (
@@ -153,20 +154,11 @@ class FlashAttentionForwardSm120:
             )
         )
 
-        self.tmem_s_offset = [0, self.n_block_size]  # e.g., 0, 128
-        self.tmem_o_offset = [
-            self.tmem_s_offset[-1] + self.n_block_size + i * self.head_dim_v_padded
-            for i in range(self.q_stage)
-        ]  # e.g., 256, 384
-        self.tmem_total = self.tmem_o_offset[-1] + self.head_dim_v_padded
-        assert self.tmem_total <= SM100_TMEM_CAPACITY_COLUMNS
-        self.tmem_s_to_p_offset = self.n_block_size // 2
-        self.tmem_p_offset = [
-            self.tmem_s_offset[i] + self.tmem_s_to_p_offset for i in range(2)
-        ]  # 0, 128
-
-        # vec buffer for row_max & row_sum
-        self.tmem_vec_offset = self.tmem_s_offset
+        # SM120 uses shared memory for intermediate tensors (S, P, O), not Tensor Memory
+        # We need to allocate shared memory buffers for S and P
+        # S shape: (m_block_size, n_block_size) with q_stage stages
+        # P shape: (m_block_size, n_block_size) with q_stage stages  
+        # O shape: (m_block_size, head_dim_v_padded) with q_stage stages
 
         if self.head_dim_padded < 96:
             self.num_regs_softmax = 200
@@ -320,8 +312,8 @@ class FlashAttentionForwardSm120:
             self.e2e_freq = 32 if mCuSeqlensQ is not None or mSeqUsedQ is not None else 10
 
         cta_group = tcgen05.CtaGroup.ONE
-        # the intermediate tensor p is from tmem & mK-major
-        p_source = tcgen05.OperandSource.TMEM
+        # SM120: the intermediate tensor p is from shared memory (not Tensor Memory) & mK-major
+        p_source = tcgen05.OperandSource.SMEM
         p_major_mode = tcgen05.OperandMajorMode.K
         tiled_mma_qk = sm100_utils_basic.make_trivial_tiled_mma(
             self.q_dtype,
@@ -378,6 +370,21 @@ class FlashAttentionForwardSm120:
             self.o_layout,
             self.epi_tile,
             self.epi_stage,
+        )
+        # SM120: Create shared memory layouts for S and P (instead of Tensor Memory)
+        # S shape: (m_block_size, n_block_size) with q_stage stages
+        # P shape: (m_block_size, n_block_size) with q_stage stages (same as tP_layout but in smem)
+        sS_layout = sm100_utils_basic.make_smem_layout_a(
+            tiled_mma_qk,
+            self.mma_tiler_qk,
+            self.qk_acc_dtype,
+            self.q_stage,
+        )
+        sP_layout = sm100_utils_basic.make_smem_layout_a(
+            tiled_mma_pv,
+            self.mma_tiler_pv,
+            self.q_dtype,
+            self.acc_stage,
         )
         if const_expr(not self.same_hdim_kv_padded):
             # sK and sV are using the same physical smem so we need to adjust the stride so that they line up
@@ -579,8 +586,8 @@ class FlashAttentionForwardSm120:
         self.mbar_corr_epi_full_offset = self.mbar_softmax_corr_empty_offset + self.epi_stage
         self.mbar_corr_epi_empty_offset = self.mbar_corr_epi_full_offset + self.epi_stage
         self.mbar_s0_s1_sequence_offset = self.mbar_corr_epi_empty_offset + 2
-        self.mbar_tmem_dealloc_offset = self.mbar_s0_s1_sequence_offset + 8
-        self.mbar_P_full_2_offset = self.mbar_tmem_dealloc_offset + 1
+        # SM120: No Tensor Memory deallocation needed
+        self.mbar_P_full_2_offset = self.mbar_s0_s1_sequence_offset + 8
         self.mbar_total = self.mbar_P_full_2_offset + 2
 
         sO_size = cute.cosize(sO_layout) if const_expr(not self.overlap_sO_sQ) else 0
@@ -589,12 +596,23 @@ class FlashAttentionForwardSm120:
             cutlass.max(cute.cosize(sQ_layout), cute.cosize(sO_layout) * self.o_dtype.width // self.q_dtype.width)
         )
 
+        # SM120: Calculate sizes for shared memory buffers S and P
+        sS_size = cute.cosize(sS_layout)
+        sP_size = cute.cosize(sP_layout)
+
         @cute.struct
         class SharedStorage:
             # m_barriers for pipelines
             mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.mbar_total]
-            # Tmem holding buffer
-            tmem_holding_buf: Int32
+            # SM120: Shared memory for intermediate tensors (S, P) instead of Tensor Memory
+            sS: cute.struct.Align[
+                cute.struct.MemRange[self.qk_acc_dtype, sS_size],
+                self.buffer_align_bytes,
+            ]
+            sP: cute.struct.Align[
+                cute.struct.MemRange[self.q_dtype, sP_size],
+                self.buffer_align_bytes,
+            ]
             # Smem tensors
             # store row max and row sum
             sScale: cute.struct.MemRange[Float32, self.q_stage * self.m_block_size * 2]
@@ -663,7 +681,8 @@ class FlashAttentionForwardSm120:
             learnable_sink,
             sQ_layout,
             sK_layout,
-            tP_layout,
+            sS_layout,
+            sP_layout,
             sV_layout,
             sO_layout,
             gmem_tiled_copy_O,
@@ -707,7 +726,8 @@ class FlashAttentionForwardSm120:
         learnable_sink: Optional[cute.Tensor],
         sQ_layout: cute.ComposedLayout,
         sK_layout: cute.ComposedLayout,
-        tP_layout: cute.ComposedLayout,
+        sS_layout: cute.ComposedLayout,
+        sP_layout: cute.ComposedLayout,
         sV_layout: cute.ComposedLayout,
         sO_layout: cute.ComposedLayout,
         gmem_tiled_copy_O: Optional[cute.TiledCopy],
@@ -800,18 +820,7 @@ class FlashAttentionForwardSm120:
                     mbar_ptr + self.mbar_P_full_2_offset + i,
                     cute.arch.WARP_SIZE * len(self.softmax0_warp_ids),
                 )
-        if warp_idx == 7:
-            cute.arch.mbarrier_init(
-                mbar_ptr + self.mbar_tmem_dealloc_offset,
-                cute.arch.WARP_SIZE
-                * len(
-                    (
-                        *self.softmax0_warp_ids,
-                        *self.softmax1_warp_ids,
-                        *self.correction_warp_ids,
-                    )
-                ),
-            )
+        # SM120: No Tensor Memory deallocation barrier needed
         # Relying on pipeline_kv constructor to call mbarrier_init_fence and sync
         pipeline_kv = self.make_and_init_load_kv_pipeline(mbar_ptr + self.mbar_load_kv_full_offset)
 
@@ -830,39 +839,31 @@ class FlashAttentionForwardSm120:
 
         sScale = storage.sScale.get_tensor(cute.make_layout(self.q_stage * self.m_block_size * 2))
 
+        # SM120: Create shared memory tensors for S and P (instead of Tensor Memory)
+        sS = storage.sS.get_tensor(sS_layout.outer, swizzle=sS_layout.inner)
+        sP = storage.sP.get_tensor(sP_layout.outer, swizzle=sP_layout.inner)
+
         thr_mma_qk = tiled_mma_qk.get_slice(0)  # default 1SM
         thr_mma_pv = tiled_mma_pv.get_slice(0)  # default 1SM
 
+        # SM120: Create thread fragments for S and P from shared memory
         qk_acc_shape = thr_mma_qk.partition_shape_C(self.mma_tiler_qk[:2])
-        tStS_fake = thr_mma_qk.make_fragment_C(qk_acc_shape)
-        # This is a fake tensor, by right need to retrieve tmem_ptr. But we know that we always
-        # request 512 columns of tmem, so we know that it starts at 0.
-        tmem_ptr = cute.make_ptr(Float32, 0, mem_space=cute.AddressSpace.tmem, assumed_align=16)
-        tStS = cute.make_tensor(tmem_ptr, tStS_fake.layout)
+        tScS = thr_mma_qk.partition_C(sS)
+        tStSs = tuple(
+            tScS[None, None, None, stage] for stage in range(self.q_stage)
+        )
 
         pv_acc_shape = thr_mma_pv.partition_shape_C(self.mma_tiler_pv[:2])
-        tOtO = thr_mma_pv.make_fragment_C(pv_acc_shape)
-
-        tStSs = tuple(
-            cute.make_tensor(tStS.iterator + self.tmem_s_offset[stage], tStS.layout)
-            for stage in range(2)
-        )
+        tOcO = thr_mma_pv.partition_C(sO)
         tOtOs = tuple(
-            cute.make_tensor(tOtO.iterator + self.tmem_o_offset[stage], tOtO.layout)
-            for stage in range(self.q_stage)
+            tOcO[None, None, None, stage] for stage in range(self.q_stage)
         )
 
-        tP = cute.make_tensor(tStS.iterator, tP_layout.outer)
-        tOrP = thr_mma_pv.make_fragment_A(tP)[None, None, None, 0]
-
-        tOrPs = [
-            cute.make_tensor(
-                tOrP.iterator
-                + self.qk_acc_dtype.width // self.q_dtype.width * self.tmem_p_offset[stage],
-                tOrP.layout,
-            )
-            for stage in range(2)
-        ]
+        # SM120: Create thread fragments for P from shared memory
+        tScP = thr_mma_pv.partition_A(sP)
+        tOrPs = tuple(
+            tScP[None, None, None, stage] for stage in range(self.q_stage)
+        )
 
         block_info = BlockInfo(
             # This is cta_tiler, not mma_tiler_qk, since we move by block by (2 * mma_tiler[0], mma_tiler[1])
@@ -933,13 +934,8 @@ class FlashAttentionForwardSm120:
         #  MMA
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx == self.mma_warp_id:
-            # if warp_idx == self.mma_warp_id or warp_idx == self.empty_warp_ids:
+            # SM120: No Tensor Memory allocation needed - using shared memory
             cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
-            # Alloc tmem buffer
-            tmem_alloc_cols = Int32(self.tmem_alloc_cols)
-            if warp_idx == self.mma_warp_id:
-                cute.arch.alloc_tmem(tmem_alloc_cols, storage.tmem_holding_buf)
-                cute.arch.sync_warp()
 
             self.mma(
                 tiled_mma_qk,
@@ -947,6 +943,9 @@ class FlashAttentionForwardSm120:
                 sQ,
                 sK,
                 sV,
+                sS,
+                sP,
+                sO,
                 tStSs,
                 tOtOs,
                 tOrPs,
@@ -957,19 +956,6 @@ class FlashAttentionForwardSm120:
                 SeqlenInfoCls,
                 TileSchedulerCls,
             )
-
-            # if warp_idx == self.mma_warp_id:
-            # dealloc tmem buffer
-            cute.arch.relinquish_tmem_alloc_permit()
-            cute.arch.mbarrier_wait(mbar_ptr + self.mbar_tmem_dealloc_offset, 0)
-            tmem_alloc_cols = Int32(self.tmem_alloc_cols)
-            #  Retrieving tmem ptr and make acc
-            tmem_ptr = cute.arch.retrieve_tmem_ptr(
-                Float32,
-                alignment=16,
-                ptr_to_buffer_holding_addr=storage.tmem_holding_buf,
-            )
-            cute.arch.dealloc_tmem(tmem_ptr, tmem_alloc_cols)
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  Epilogue
@@ -1012,27 +998,25 @@ class FlashAttentionForwardSm120:
                 fastdiv_mods=fastdiv_mods,
             )
 
+            # SM120: Use shared memory tensors instead of Tensor Memory
             if const_expr(not self.s0_s1_barrier):
                 stage = Int32(0 if warp_idx < self.softmax1_warp_ids[0] else 1)
+                sS_stage = sS[None, None, None, stage]
                 softmax_loop(
                     stage=stage,
-                    tStSi=cute.make_tensor(
-                        tStS.iterator
-                        + (self.tmem_s_offset[0] if stage == 0 else self.tmem_s_offset[1]),
-                        tStS.layout,
-                    ),
+                    sS_stage=sS_stage,
+                    sP_stage=sP[None, None, None, stage],
+                    sS_layout=sS_layout,
+                    sP_layout=sP_layout,
                 )
-                cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_tmem_dealloc_offset)
             else:
                 # If there's s0_s1_barrier, it's faster to have 2 WGs having different code
                 if warp_idx < self.softmax1_warp_ids[0]:
-                    tStSi = cute.make_tensor(tStS.iterator + self.tmem_s_offset[0], tStS.layout)
-                    softmax_loop(stage=0, tStSi=tStSi)
-                    cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_tmem_dealloc_offset)
+                    sS_stage = sS[None, None, None, 0]
+                    softmax_loop(stage=0, sS_stage=sS_stage, sP_stage=sP[None, None, None, 0], sS_layout=sS_layout, sP_layout=sP_layout)
                 if warp_idx < self.correction_warp_ids[0] and warp_idx >= self.softmax1_warp_ids[0]:
-                    tStSi = cute.make_tensor(tStS.iterator + self.tmem_s_offset[1], tStS.layout)
-                    softmax_loop(stage=1, tStSi=tStSi)
-                    cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_tmem_dealloc_offset)
+                    sS_stage = sS[None, None, None, 1]
+                    softmax_loop(stage=1, sS_stage=sS_stage, sP_stage=sP[None, None, None, 1], sS_layout=sS_layout, sP_layout=sP_layout)
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  Correction
@@ -1042,12 +1026,12 @@ class FlashAttentionForwardSm120:
             self.correction_loop(
                 thr_mma_qk,
                 thr_mma_pv,
-                tStS,
+                sS,
+                sO,
                 tOtOs,
                 sScale,
                 mO,
                 mLSE,
-                sO,
                 learnable_sink,
                 tma_atom_O,
                 mbar_ptr,
@@ -1057,7 +1041,6 @@ class FlashAttentionForwardSm120:
                 SeqlenInfoCls,
                 TileSchedulerCls,
             )
-            cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_tmem_dealloc_offset)
 
         return
 
@@ -1204,6 +1187,9 @@ class FlashAttentionForwardSm120:
         sQ: cute.Tensor,
         sK: cute.Tensor,
         sV: cute.Tensor,
+        sS: cute.Tensor,
+        sP: cute.Tensor,
+        sO: cute.Tensor,
         tStSs: Tuple[cute.Tensor, cute.Tensor],
         tOtOs: tuple[cute.Tensor],
         tOrPs: Tuple[cute.Tensor, cute.Tensor],
@@ -1224,11 +1210,16 @@ class FlashAttentionForwardSm120:
 
         qk_mma_op, pv_mma_op = tiled_mma_qk.op, tiled_mma_pv.op
 
+        # SM120: Create shared memory tensors for S and O accumulators
+        sS_stages = (sS[None, None, None, 0], sS[None, None, None, 1])
+        sP_stages = (sP[None, None, None, 0], sP[None, None, None, 1])
+        # For SM120, we need to pass shared memory addresses instead of Tensor Memory offsets
+        # The accumulator addresses are computed from the shared memory tensor iterators
         gemm_Si = [
             partial(
                 sm120_utils.gemm_ptx_partial,
                 qk_mma_op,
-                self.tmem_s_offset[stage],
+                sS_stages[stage].iterator.toint(),  # SM120: Use shared memory address
                 tSrQs[stage],
                 sA=sQ[None, None, None, stage],
                 zero_init=True,
@@ -1239,9 +1230,9 @@ class FlashAttentionForwardSm120:
             partial(
                 sm120_utils.gemm_ptx_partial,
                 pv_mma_op,
-                self.tmem_o_offset[stage if self.q_stage == 2 else 0],
+                tOtOs[stage].iterator.toint(),  # SM120: Use O accumulator address (in registers, not smem)
                 tOrPs[stage],
-                sA=None,
+                sA=sP_stages[stage if self.q_stage == 2 else 0],  # SM120: P is in shared memory
             )
             for stage in range(2)
         ]
@@ -1418,7 +1409,10 @@ class FlashAttentionForwardSm120:
         softmax_scale_log2: Float32,
         softmax_scale: Float32,
         thr_mma_qk: cute.core.ThrMma,
-        tStSi: cute.Tensor,
+        sS_stage: cute.Tensor,
+        sP_stage: cute.Tensor,
+        sS_layout: cute.ComposedLayout,
+        sP_layout: cute.ComposedLayout,
         sScale: cute.Tensor,
         mLSE: Optional[cute.Tensor],
         learnable_sink: Optional[cute.Tensor],
@@ -1438,48 +1432,42 @@ class FlashAttentionForwardSm120:
         and sum values needed for stable softmax computation, applies optional masking, and
         transforms raw attention scores into probability distributions.
 
-        The implementation uses specialized memory access patterns and efficient math operations
-        for computing exp(x) using exp2 functions. It also coordinates pipeline
-        synchronization between MMA, correction, and sequence processing stages.
+        SM120: Uses shared memory instead of Tensor Memory for intermediate tensors S and P.
         """
         tidx = cute.arch.thread_idx()[0] % (
             cute.arch.WARP_SIZE
-            # * (len(self.softmax0_warp_ids) if stage == 0 else len(self.softmax1_warp_ids)
             * (len(self.softmax0_warp_ids))
         )
 
-        tStScale = cute.composition(tStSi, cute.make_layout((self.m_block_size, 1)))
-        tScS = thr_mma_qk.partition_C(cute.make_identity_tensor(self.mma_tiler_qk[:2]))
-        tScScale = cute.composition(tScS, cute.make_layout((self.m_block_size, 1)))
+        # SM120: Create thread partitions for S and P from shared memory
+        tScS = thr_mma_qk.partition_C(sS_stage)
+        # For P, we need to create a layout that matches the expected shape
+        # P has shape (m_block_size, n_block_size) but stored in q_dtype
+        tilePlikeFP32 = self.mma_tiler_qk[1] // Float32.width * self.v_dtype.width
+        tScP_layout = cute.composition(
+            sP_stage.layout, cute.make_layout((self.m_block_size, tilePlikeFP32))
+        )
+        tScP = cute.make_tensor(sP_stage.iterator, tScP_layout)
+        
+        # Create shared memory copy operations for loading S and storing P
+        # Use regular shared memory copy atoms instead of Tensor Memory operations
+        smem_load_atom = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            self.qk_acc_dtype,
+            num_bits_per_copy=128,
+        )
+        thr_smem_load = cute.make_tiled_copy(smem_load_atom, tScS.layout).get_slice(tidx)
+        tSsS = thr_smem_load.partition_S(sS_stage)
+        tSrS = thr_smem_load.partition_D(tScS)
 
-        tilePlikeFP32 = self.mma_tiler_qk[1] // 32 * self.v_dtype.width
-        tStP_layout = cute.composition(
-            tStSi.layout, cute.make_layout((self.m_block_size, tilePlikeFP32))
+        smem_store_atom = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            self.q_dtype,
+            num_bits_per_copy=128,
         )
-        tStP = cute.make_tensor(tStSi.iterator + self.tmem_s_to_p_offset, tStP_layout)
-
-        tmem_load_atom = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)),
-            Float32,
-        )
-        thr_tmem_load = tcgen05.make_tmem_copy(tmem_load_atom, tStSi).get_slice(tidx)
-        tStS_t2r = thr_tmem_load.partition_S(tStSi)
-
-        tmem_store_scale_atom = cute.make_copy_atom(
-            tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(1)),
-            Float32,
-        )
-        thr_tmem_store_scale = tcgen05.make_tmem_copy(tmem_store_scale_atom, tStScale).get_slice(
-            tidx
-        )
-
-        tStScale_r2t = thr_tmem_store_scale.partition_D(tStScale)
-        tmem_store_atom = cute.make_copy_atom(
-            tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(16)),
-            Float32,
-        )
-        thr_tmem_store = tcgen05.make_tmem_copy(tmem_store_atom, tStP).get_slice(tidx)
-        tStP_r2t = thr_tmem_store.partition_D(tStP)
+        thr_smem_store = cute.make_tiled_copy(smem_store_atom, tScP.layout).get_slice(tidx)
+        tSrP = thr_smem_store.partition_S(tScP)
+        tSsP = thr_smem_store.partition_D(sP_stage)
 
         mma_si_consumer_phase = Int32(0)
         si_corr_producer_phase = Int32(1)
@@ -1499,11 +1487,12 @@ class FlashAttentionForwardSm120:
 
             if const_expr(not self.is_split_kv) or n_block_min < n_block_max:
                 mask = AttentionMaskCls(seqlen.seqlen_q, seqlen.seqlen_k)
+                # SM120: Use shared memory load for masking instead of Tensor Memory
                 mask_fn = partial(
                     mask.apply_mask_sm100,
                     m_block=self.q_stage * m_block + stage,
                     thr_mma=thr_mma_qk,
-                    thr_tmem_load=thr_tmem_load,
+                    thr_tmem_load=thr_smem_load,  # Use smem load instead of tmem
                     mask_causal=self.is_causal,
                     mask_local=self.is_local,
                 )
@@ -1520,12 +1509,12 @@ class FlashAttentionForwardSm120:
                     mbar_ptr=mbar_ptr,
                     mbar_s0_s1_sequence_offset=mbar_s0_s1_sequence_offset,
                     thr_mma_qk=thr_mma_qk,
-                    thr_tmem_load=thr_tmem_load,
-                    thr_tmem_store=thr_tmem_store,
-                    thr_tmem_store_scale=thr_tmem_store_scale,
-                    tStS_t2r=tStS_t2r,
-                    tStScale_r2t=tStScale_r2t,
-                    tStP_r2t=tStP_r2t,
+                    thr_smem_load=thr_smem_load,
+                    thr_smem_store=thr_smem_store,
+                    tSsS=tSsS,
+                    tSrS=tSrS,
+                    tSrP=tSrP,
+                    tSsP=tSsP,
                     sScale=sScale,
                     stage=stage,
                     batch_idx=batch_idx,
@@ -1642,12 +1631,12 @@ class FlashAttentionForwardSm120:
         mbar_ptr: cute.Pointer,
         mbar_s0_s1_sequence_offset: Int32,
         thr_mma_qk: cute.core.ThrMma,
-        thr_tmem_load: cute.CopyAtom,
-        thr_tmem_store: cute.CopyAtom,
-        thr_tmem_store_scale: cute.CopyAtom,
-        tStS_t2r: cute.Tensor,
-        tStScale_r2t: cute.Tensor,
-        tStP_r2t: cute.Tensor,
+        thr_smem_load: cute.TiledCopy,
+        thr_smem_store: cute.TiledCopy,
+        tSsS: cute.Tensor,
+        tSrS: cute.Tensor,
+        tSrP: cute.Tensor,
+        tSsP: cute.Tensor,
         sScale: cute.Tensor,
         stage: int | Int32,
         batch_idx: Int32,
@@ -1661,32 +1650,18 @@ class FlashAttentionForwardSm120:
     ) -> Tuple[cute.Int32, cute.Int32, cute.Int32]:
         """Perform a single step of the softmax computation on a block of attention scores.
 
-        This method processes one block of the attention matrix, computing numerically stable
-        softmax by first finding the row maximum, subtracting it from all elements, applying
-        exponential function, and then normalizing by the sum of exponentials. It also handles
-        optional masking of attention scores.
-
-        The method involves several key operations:
-        1. Loading attention scores from tensor memory
-        2. Applying optional masking based on position
-        3. Computing row-wise maximum values for numerical stability
-        4. Transforming scores using exp2(x*scale - max*scale)
-        5. Computing row sums for normalization
-        6. Coordinating pipeline synchronization between different processing stages
+        SM120: Uses shared memory instead of Tensor Memory for loading S and storing P.
         """
-        tilePlikeFP32 = self.mma_tiler_qk[1] // Float32.width * self.v_dtype.width
-        tScS = thr_mma_qk.partition_C(cute.make_identity_tensor(self.mma_tiler_qk[:2]))
-        tScScale = cute.composition(tScS, cute.make_layout((self.m_block_size, 1)))
-        tScP = cute.composition(tScS, cute.make_layout((self.m_block_size, tilePlikeFP32)))
-
-        # Wait for Si
+        # Wait for Si to be ready in shared memory
         cute.arch.mbarrier_wait(mbar_ptr + self.mbar_S_full_offset + stage, mma_si_consumer_phase)
-        tSrS_t2r = cute.make_fragment(thr_tmem_load.partition_D(tScS).shape, self.qk_acc_dtype)
-        cute.copy(thr_tmem_load, tStS_t2r, tSrS_t2r)
+        # SM120: Load S from shared memory instead of Tensor Memory
+        tSrS_t2r = cute.make_fragment(tSrS.shape, self.qk_acc_dtype)
+        cute.copy(thr_smem_load, tSsS, tSrS_t2r)
         if cutlass.const_expr(self.score_mod is not None):
+            # SM120: Use shared memory load for score mod instead of Tensor Memory
             self.apply_score_mod(
                 tSrS_t2r,
-                thr_tmem_load,
+                thr_smem_load,
                 thr_mma_qk,
                 batch_idx,
                 head_idx,
@@ -1702,58 +1677,59 @@ class FlashAttentionForwardSm120:
         row_max, acc_scale = softmax.update_row_max(tSrS_t2r.load(), is_first)
 
         if const_expr(not is_first):
-            # tSrScale_r2t = cute.make_fragment(thr_tmem_store_scale.partition_S(tScScale).shape, Float32)
-            # tSrScale_r2t[0] = acc_scale
-            # cute.copy(thr_tmem_store_scale, tSrScale_r2t, tStScale_r2t)
-            # cute.arch.fence_view_async_tmem_store()
-            thread_idx = thr_tmem_load.thr_idx
+            # SM120: Store acc_scale in shared memory
+            thread_idx = cute.arch.thread_idx()[0] % (cute.arch.WARP_SIZE * len(self.softmax0_warp_ids))
             sScale[thread_idx + stage * self.m_block_size] = acc_scale
-            # if thread_idx == 0: cute.printf("softmax acc_scale stage %d: %f, row_max = %f\n", stage, acc_scale, row_max)
         # Notify correction wg that row_max is ready
         cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_softmax_corr_full_offset + stage)
 
-        # if thread_idx == 0 and stage == 0: cute.print_tensor(tSrS_t2r)
-        # print(tSrS_t2r)
         softmax.scale_subtract_rowmax(tSrS_t2r, row_max)
         # Sequence barrier wait
         if const_expr(self.s0_s1_barrier):
             cute.arch.mbarrier_wait(
                 mbar_ptr + mbar_s0_s1_sequence_offset + stage * 4, s0_s1_sequence_phase
             )
-        tSrP_r2t_f32 = cute.make_fragment(thr_tmem_store.partition_S(tScP).shape, Float32)
-        tSrP_r2t = cute.make_tensor(
-            cute.recast_ptr(tSrP_r2t_f32.iterator, dtype=self.q_dtype),
-            tSrS_t2r.layout,
-        )
-        # softmax.scale_apply_exp2_convert(tSrS_t2r, row_max, tSrP_r2t)
+        # SM120: Convert S to P format and prepare for storing to shared memory
+        tSrP_f32 = cute.make_fragment(tSrP.shape, Float32)
+        tSrP_qdtype = cute.make_fragment(tSrP.shape, self.q_dtype)
+        # Convert from accumulator type to output type
+        tSrP_f32.store(tSrS_t2r.load().to(Float32))
         softmax.apply_exp2_convert(
             tSrS_t2r,
-            tSrP_r2t,
+            tSrP_f32,
             e2e=mask_fn is None and self.head_dim_padded <= 128,
             e2e_freq=self.e2e_freq,
         )
+        # Convert to output dtype
+        tSrP_qdtype.store(tSrP_f32.load().to(self.q_dtype))
         # Sequence barrier arrive
         if const_expr(self.s0_s1_barrier):
             cute.arch.mbarrier_arrive(mbar_ptr + mbar_s0_s1_sequence_offset + (1 - stage) * 4)
-        # print(tSrP_r2t_f32, tStP_r2t)
-        # cute.copy(thr_tmem_store, tSrP_r2t_f32, tStP_r2t)
-        for i in cutlass.range_constexpr(cute.size(tStP_r2t.shape[2]) // 4 * 3):
-            cute.copy(thr_tmem_store, tSrP_r2t_f32[None, None, i], tStP_r2t[None, None, i])
-        cute.arch.fence_view_async_tmem_store()
+        # SM120: Store P to shared memory in chunks (similar to original but using smem)
+        # Store first 3/4 of P
+        tilePlikeFP32 = self.mma_tiler_qk[1] // Float32.width * self.v_dtype.width
+        chunk_size = tilePlikeFP32 // 4
+        for i in cutlass.range_constexpr(chunk_size * 3):
+            cute.copy(thr_smem_store, tSrP_qdtype[None, None, i], tSsP[None, None, i])
+        cute.arch.fence_proxy(
+            cute.arch.ProxyKind.async_shared,
+            space=cute.arch.SharedSpace.shared_cta,
+        )
         # Notify mma warp that P is ready
         cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage)
-        for i in cutlass.range_constexpr(
-            cute.size(tStP_r2t.shape[2]) // 4 * 3, cute.size(tStP_r2t.shape[2])
-        ):
-            cute.copy(thr_tmem_store, tSrP_r2t_f32[None, None, i], tStP_r2t[None, None, i])
-        cute.arch.fence_view_async_tmem_store()
+        # Store remaining 1/4 of P
+        for i in cutlass.range_constexpr(chunk_size * 3, tilePlikeFP32):
+            cute.copy(thr_smem_store, tSrP_qdtype[None, None, i], tSsP[None, None, i])
+        cute.arch.fence_proxy(
+            cute.arch.ProxyKind.async_shared,
+            space=cute.arch.SharedSpace.shared_cta,
+        )
         # Notify mma warp that the 2nd half of P is ready
         cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_2_offset + stage)
         cute.arch.mbarrier_wait(
             mbar_ptr + self.mbar_softmax_corr_empty_offset + stage, si_corr_producer_phase
         )
         softmax.update_row_sum(tSrS_t2r.load(), acc_scale, is_first)
-        # acc_scale = cute.arch.exp2(acc_scale_)
         return mma_si_consumer_phase ^ 1, si_corr_producer_phase ^ 1, s0_s1_sequence_phase ^ 1
 
     @cute.jit
@@ -1761,12 +1737,12 @@ class FlashAttentionForwardSm120:
         self,
         thr_mma_qk: cute.core.ThrMma,
         thr_mma_pv: cute.core.ThrMma,
-        tStS: cute.Tensor,
+        sS: cute.Tensor,
+        sO: cute.Tensor,
         tOtOs: tuple[cute.Tensor],
         sScale: cute.Tensor,
         mO: cute.Tensor,
         mLSE: cute.Tensor,
-        sO: cute.Tensor,
         learnable_sink: Optional[cute.Tensor],
         tma_atom_O: cute.CopyAtom,
         mbar_ptr: cute.Pointer,
@@ -1776,22 +1752,12 @@ class FlashAttentionForwardSm120:
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
     ):
+        """SM120: Correction loop using shared memory instead of Tensor Memory."""
         tidx = cute.arch.thread_idx()[0] % (cute.arch.WARP_SIZE * len(self.correction_warp_ids))
+        # SM120: Scale values are stored in shared memory sScale, not Tensor Memory
         tScS = thr_mma_qk.partition_C(cute.make_identity_tensor(self.mma_tiler_qk[:2]))
-        tStScale_layout = cute.composition(tStS.layout, cute.make_layout((self.m_block_size, 1)))
-        tStScales = tuple(
-            cute.make_tensor(tStS.iterator + self.tmem_vec_offset[stage], tStScale_layout)
-            for stage in range(2)
-        )
         tScScale = cute.composition(tScS, cute.make_layout((self.m_block_size, 1)))
-        tmem_load_v_atom = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(1)),
-            self.qk_acc_dtype,
-        )
-        thr_tmem_load_vec = tcgen05.make_tmem_copy(tmem_load_v_atom, tStScales[0]).get_slice(tidx)
-
-        tStScales_t2r = [thr_tmem_load_vec.partition_S(tStScales[stage]) for stage in range(2)]
-        tSrScale_t2r_shape = thr_tmem_load_vec.partition_D(tScScale).shape
+        # SM120: tSrScale_t2r_shape is not needed since we read from sScale directly
 
         # First iter: no correction is required
         cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_O_rescaled_offset + 0)
@@ -1822,7 +1788,7 @@ class FlashAttentionForwardSm120:
                 )
                 softmax_corr_consumer_phase ^= 1
 
-                tSrScale_t2r = cute.make_fragment(tSrScale_t2r_shape, Float32)
+                # SM120: Scale values are read directly from sScale shared memory
                 for i in cutlass.range(n_block_max - n_block_min - 1, unroll=1):
                     for stage in cutlass.range_constexpr(2):
                         # wait for S0 / S1
@@ -1992,48 +1958,46 @@ class FlashAttentionForwardSm120:
     ):
         """Rescale intermediate attention results based on softmax normalization factor.
 
-        This method performs a crucial correction step in the attention computation pipeline.
-        When processing attention in blocks, the softmax normalization factors may change
-        as new blocks are processed. This method rescales previously computed partial
-        output values to account for updated normalization factors.
-
-        The implementation uses efficient tensor memory operations to:
-        1. Load existing partial attention output from tensor memory
-        2. Apply the scaling factor to all elements
-        3. Store the rescaled results back to tensor memory
+        SM120: Uses shared memory instead of Tensor Memory for O accumulator.
         """
         tOcO = thr_mma.partition_C(cute.make_identity_tensor(self.mma_tiler_pv[:2]))
         corr_tile_size = 16  # tuneable parameter
-        tmem_load_atom = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(corr_tile_size)),
+        # SM120: Use shared memory copy operations instead of Tensor Memory
+        smem_load_atom = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
             self.pv_acc_dtype,
+            num_bits_per_copy=128,
         )
-        tmem_store_atom = cute.make_copy_atom(
-            tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(corr_tile_size)),
+        smem_store_atom = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
             self.pv_acc_dtype,
+            num_bits_per_copy=128,
         )
         tOtO_i = cute.composition(tOtO, cute.make_layout((self.m_block_size, corr_tile_size)))
         tOcO_i = cute.composition(tOcO, cute.make_layout((self.m_block_size, corr_tile_size)))
-        thr_tmem_load = tcgen05.make_tmem_copy(tmem_load_atom, tOtO_i).get_slice(tidx)
-        thr_tmem_store = tcgen05.make_tmem_copy(tmem_store_atom, tOtO_i).get_slice(tidx)
-        tOtO_t2r = thr_tmem_load.partition_S(tOtO_i)
-        tOrO_t2r_shape = thr_tmem_load.partition_D(tOcO_i).shape
-        tOtO_r2t = thr_tmem_store.partition_D(tOtO_i)
+        # Create tiled copies for shared memory operations
+        thr_smem_load = cute.make_tiled_copy(smem_load_atom, tOtO_i.layout).get_slice(tidx)
+        thr_smem_store = cute.make_tiled_copy(smem_store_atom, tOtO_i.layout).get_slice(tidx)
+        tOsO = thr_smem_load.partition_S(tOtO_i)
+        tOrO_shape = thr_smem_load.partition_D(tOcO_i).shape
+        tOsO_store = thr_smem_store.partition_D(tOtO_i)
 
         frg_count = self.head_dim_v_padded // corr_tile_size
-        tOrO_frg = cute.make_fragment((tOrO_t2r_shape, frg_count), self.pv_acc_dtype)
         for i in cutlass.range_constexpr(frg_count):
-            tOrO_frg = cute.make_fragment(tOrO_t2r_shape, self.pv_acc_dtype)
-            tOtO_t2r_i = cute.make_tensor(tOtO_t2r.iterator + i * corr_tile_size, tOtO_t2r.layout)
-            cute.copy(thr_tmem_load, tOtO_t2r_i, tOrO_frg)
+            tOrO_frg = cute.make_fragment(tOrO_shape, self.pv_acc_dtype)
+            tOsO_i = tOsO[None, None, None, i]
+            cute.copy(thr_smem_load, tOsO_i, tOrO_frg)
             for j in cutlass.range(0, cute.size(tOrO_frg), 2, unroll_full=True):
                 tOrO_frg[j], tOrO_frg[j + 1] = utils.mul_packed_f32x2(
                     (tOrO_frg[j], tOrO_frg[j + 1]),
                     (scale, scale),
                 )
-            tOtO_r2t_i = cute.make_tensor(tOtO_r2t.iterator + i * corr_tile_size, tOtO_r2t.layout)
-            cute.copy(thr_tmem_store, tOrO_frg, tOtO_r2t_i)
-        cute.arch.fence_view_async_tmem_store()
+            tOsO_store_i = tOsO_store[None, None, None, i]
+            cute.copy(thr_smem_store, tOrO_frg, tOsO_store_i)
+        cute.arch.fence_proxy(
+            cute.arch.ProxyKind.async_shared,
+            space=cute.arch.SharedSpace.shared_cta,
+        )
 
     @cute.jit
     def correction_epilogue(
@@ -2076,31 +2040,28 @@ class FlashAttentionForwardSm120:
         tOsO_i = cute.logical_divide(tOsO, cute.make_layout((self.m_block_size, corr_tile_size)))
 
         epi_subtile = (self.epi_tile[0], corr_tile_size)
-        tmem_copy_atom = sm100_utils_basic.get_tmem_load_op(
-            self.mma_tiler_pv,
-            self.o_layout,
-            self.o_dtype,
+        # SM120: Use shared memory copy operations instead of Tensor Memory
+        smem_load_atom = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
             self.pv_acc_dtype,
-            epi_subtile,
-            use_2cta_instrs=False,
+            num_bits_per_copy=128,
         )
-        tiled_tmem_load = tcgen05.make_tmem_copy(tmem_copy_atom, tOtO_i[(None, None), 0]).get_slice(
-            tidx
+        smem_store_atom = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            self.o_dtype,
+            num_bits_per_copy=128,
         )
-        thr_tmem_load = tiled_tmem_load.get_slice(tidx)
-        smem_copy_atom = sm100_utils_basic.get_smem_store_op(
-            self.o_layout, self.o_dtype, self.pv_acc_dtype, tiled_tmem_load
-        )
-        tiled_smem_store = cute.make_tiled_copy_D(smem_copy_atom, tiled_tmem_load)
+        tiled_smem_load = cute.make_tiled_copy(smem_load_atom, tOtO_i.layout).get_slice(tidx)
+        tiled_smem_store = cute.make_tiled_copy(smem_store_atom, tOsO_i.layout).get_slice(tidx)
 
-        tOtO_t2r = thr_tmem_load.partition_S(tOtO_i[(None, None), None])
-        tOsO_s2r = thr_tmem_load.partition_D(tOsO_i[(None, None), None])
-        tOcO_t2r = thr_tmem_load.partition_D(tOcO_i[(None, None), None])
+        tOsO_load = tiled_smem_load.partition_S(tOtO_i[(None, None), None])
+        tOsO_store = tiled_smem_store.partition_D(tOsO_i[(None, None), None])
+        tOrO_shape = tiled_smem_load.partition_D(tOcO_i[(None, None), None]).shape
         for i in cutlass.range_constexpr(self.head_dim_v_padded // corr_tile_size):
-            tOtO_t2r_i = tOtO_t2r[None, 0, 0, i]
-            tOsO_r2s_i = tOsO_s2r[None, 0, 0, i]
-            tOrO_frg = cute.make_fragment(tOcO_t2r[None, 0, 0, i].shape, self.pv_acc_dtype)
-            cute.copy(tiled_tmem_load, tOtO_t2r_i, tOrO_frg)
+            tOsO_load_i = tOsO_load[None, 0, 0, i]
+            tOsO_store_i = tOsO_store[None, 0, 0, i]
+            tOrO_frg = cute.make_fragment(tOrO_shape, self.pv_acc_dtype)
+            cute.copy(tiled_smem_load, tOsO_load_i, tOrO_frg)
             for j in cutlass.range_constexpr(0, cute.size(tOrO_frg), 2):
                 tOrO_frg[j], tOrO_frg[j + 1] = utils.mul_packed_f32x2(
                     (tOrO_frg[j], tOrO_frg[j + 1]),
@@ -2108,7 +2069,7 @@ class FlashAttentionForwardSm120:
                 )
             tOrO_frg_cvt = cute.make_fragment(tOrO_frg.shape, self.o_dtype)
             tOrO_frg_cvt.store(tOrO_frg.load().to(self.o_dtype))
-            cute.copy(tiled_smem_store, tOrO_frg_cvt, tOsO_r2s_i)
+            cute.copy(tiled_smem_store, tOrO_frg_cvt, tOsO_store_i)
         # fence view async shared
         cute.arch.fence_proxy(
             cute.arch.ProxyKind.async_shared,
