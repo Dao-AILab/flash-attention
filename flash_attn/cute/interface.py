@@ -415,6 +415,7 @@ def _flash_attn_fwd(
         is_split_kv,
         pack_gqa,
         compute_capability,
+        page_size not in [None, 128],  # paged KV non-TMA
     )
 
     if compile_key not in _flash_attn_fwd.compile_cache:
@@ -443,9 +444,6 @@ def _flash_attn_fwd(
                 has_aux_tensors=aux_tensors is not None,
             )
         elif compute_capability == 10:
-            assert page_size in [None, 128], (
-                "Only page_size=128 is supported for paged KV on SM 10.0"
-            )
             if sparse_tensors is not None:
                 raise NotImplementedError("BlockSparsity not yet supported on SM 10.0")
             fa_fwd = FlashAttentionForwardSm100(
@@ -463,6 +461,7 @@ def _flash_attn_fwd(
                 and not is_split_kv,
                 score_mod=score_mod,
                 has_aux_tensors=aux_tensors is not None,
+                paged_kv_non_tma=page_size not in [None, 128],
             )
         elif compute_capability == 12:
             assert page_table is None, "paged KV not supported on SM 12.0"
