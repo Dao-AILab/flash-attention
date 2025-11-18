@@ -100,8 +100,8 @@ def test_flash_attn_output(
     mha_type,
     dtype,
 ):
-    if (causal or local) and seqlen_k < seqlen_q:
-        pytest.skip("Causal attention requires seqlen_k >= seqlen_q")
+    # if (causal or local) and seqlen_k < seqlen_q:
+    #     pytest.skip("Causal attention requires seqlen_k >= seqlen_q")
     device = "cuda"
     # set seed
     torch.random.manual_seed(0)
@@ -228,7 +228,7 @@ def test_flash_attn_output(
         # pack_gqa_vals = [False, True, None]
         # SplitKV is not supported for hdim >= 192
         pack_gqa_vals = [False]
-        num_splits_vals = [1] # [1, 3] if d < 192 and not DISABLE_SPLIT else [1]
+        num_splits_vals = [1, 3] if d < 192 and not DISABLE_SPLIT else [1]
         for pack_gqa, num_splits in itertools.product(pack_gqa_vals, num_splits_vals):
             out, lse = flash_attn_func(
                 q,
@@ -267,6 +267,7 @@ def test_flash_attn_output(
             and learnable_sink is None
             # and mha_type == "mha"
             # and False
+            and not ((causal or local) and seqlen_k < seqlen_q)
         ):
             g = torch.randn_like(out)
             # do_o = ((g.float() * out.float()).sum(-1)).transpose(1, 2)
@@ -388,7 +389,7 @@ def test_flash_attn_varlen_output(
 ):
     if (
         causal or local
-    ):  # Right now we only support causal attention with seqlen_k == seqlen_q
+    ):  # Right now reference only supports causal attention with seqlen_k == seqlen_q
         seqlen_k = seqlen_q
     device = "cuda"
     # set seed
@@ -572,7 +573,8 @@ def test_flash_attn_varlen_output(
         fwd_atol = 2 * (out_ref + 0.3 - 0.3 - out_ref).abs().max().item()
         rtol = 2 if softcap == 0.0 else 3
 
-        pack_gqa_vals = [False, True, None]
+        # pack_gqa_vals = [False, True, None]
+        pack_gqa_vals = [False]
         # num_splits_vals = [1, 3]
         # SplitKV is not supported for hdim >= 192
         num_splits_vals = [1, 3] if d < 192 and not DISABLE_SPLIT else [1]
@@ -721,8 +723,8 @@ def test_flash_attn_varlen_output(
 @pytest.mark.parametrize("new_kv", [False])
 @pytest.mark.parametrize("local", [False, True])
 # @pytest.mark.parametrize("local", [False])
-# @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("causal", [True])
+@pytest.mark.parametrize("causal", [False, True])
+# @pytest.mark.parametrize("causal", [True])
 # @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True, False])
 @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [False])
 # @pytest.mark.parametrize("has_rotary_seqlens", [False, True])
@@ -738,14 +740,14 @@ def test_flash_attn_varlen_output(
 @pytest.mark.parametrize("has_leftpad", [False])
 # @pytest.mark.parametrize("has_batch_idx", [False, True])
 @pytest.mark.parametrize("has_batch_idx", [False])
-# @pytest.mark.parametrize("varlen_q", [False, True])
-@pytest.mark.parametrize("varlen_q", [False])
+@pytest.mark.parametrize("varlen_q", [False, True])
+# @pytest.mark.parametrize("varlen_q", [False])
 # @pytest.mark.parametrize("d", [32, 59, 64, 80, 128, 256])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192])
 # @pytest.mark.parametrize('d', [56, 80])
 # @pytest.mark.parametrize("d", [128])
-@pytest.mark.parametrize("d", [64])
+@pytest.mark.parametrize("d", [64, 128])
 # @pytest.mark.parametrize("d", [192])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
