@@ -173,6 +173,8 @@ class FlashAttentionForwardSm100:
         if self.use_correction_warps_for_epi:
             self.empty_warp_ids = self.empty_warp_ids + self.epilogue_warp_ids
             self.epilogue_warp_ids = self.correction_warp_ids
+        elif self.is_varlen_q: # fallback
+            self.epilogue_warp_ids = (13, 14)
 
         self.tmem_s_offset = [0, self.n_block_size]  # e.g., 0, 128
         self.tmem_o_offset = [
@@ -516,6 +518,7 @@ class FlashAttentionForwardSm100:
                 self.cluster_layout_vmnk.shape,
             )
         else:
+            assert self.use_correction_warps_for_epi
             tma_atom_K = None
             tma_atom_V = None
 
@@ -2087,7 +2090,7 @@ class FlashAttentionForwardSm100:
                     cute.arch.mbarrier_wait(
                         mbar_ptr + self.mbar_O_full_offset + stage, o_corr_consumer_phase
                     )
-                    if const_expr(self.use_tma_O):
+                    if const_expr(not self.use_correction_warps_for_epi):
                         cute.arch.mbarrier_wait(
                             mbar_ptr + self.mbar_corr_epi_empty_offset + stage, corr_epi_producer_phase
                         )
@@ -2104,7 +2107,7 @@ class FlashAttentionForwardSm100:
                         gO,
                         gmem_tiled_copy_O,
                     )
-                    if const_expr(self.use_tma_O):
+                    if const_expr(not self.use_correction_warps_for_epi):
                         cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_corr_epi_full_offset + stage)
                     # Signal for the next work tile that O buffers in tmem are already read, so
                     # mma warp can write to them
