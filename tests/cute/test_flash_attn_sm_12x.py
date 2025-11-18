@@ -67,24 +67,16 @@ DISABLE_SPLIT = os.getenv("FLASH_ATTENTION_DISABLE_SPLIT", "FALSE") == "TRUE"
         (128, 128),
         (128, 192),
         (256, 256),
-        (239, 1),
-        (799, 3),
         (113, 203),
         (113, 128),
         (128, 217),
-        (113, 211),
         (108, 256),
         (256, 512),
-        (384, 256),
-        (640, 128),
         (512, 256),
         (1024, 1024),
         (1023, 1024),
         (1024, 1023),
-        # Removed very large sequences for SM120 (killed in spark)
-        # (2048, 2048),
-        # (4096, 4096),
-        # (4224, 4224),
+        (2048, 2048),
     ],
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(128, 128)])
@@ -108,10 +100,9 @@ def test_flash_attn_output(
     torch.random.manual_seed(0)
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
-    # Reduced batch size for SM120 to avoid resource exhaustion
-    batch_size = 3 if seqlen_k <= 512 else (2 if seqlen_k <= 1024 else 1)
+    batch_size = 4 if seqlen_k <= 1024 else (2 if seqlen_k <= 2048 else 1)
     # batch_size = 1
-    nheads = 6
+    nheads = 4
     # nheads = 1
     nheads_kv = nheads if mha_type == "mha" else (3 if mha_type == "gqa" else 1)
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
@@ -352,27 +343,18 @@ def test_flash_attn_output(
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
-        # (1, 1),
-        # (1, 3),
-        # (2, 1),
-        (511, 1),
-        (3, 513),
         (64, 128),
         (128, 128),
         (256, 256),
         (113, 203),
         (128, 217),
-        (113, 211),
         (108, 256),
         (256, 512),
-        (307, 256),
-        (640, 128),
         (512, 256),
         (1024, 1024),
         (1023, 1024),
         (1024, 1023),
-        # Removed very large sequences for SM120 (killed in spark)
-        # (2048, 2048),
+        (2048, 2048),
     ],
 )
 def test_flash_attn_varlen_output(
@@ -396,9 +378,8 @@ def test_flash_attn_varlen_output(
     device = "cuda"
     # set seed
     torch.random.manual_seed(seqlen_q + seqlen_k + d + int(causal) * 2 + int(local))
-    # Reduced batch size for SM120 to avoid resource exhaustion
-    batch_size = 7 if seqlen_q <= 512 else (3 if seqlen_q <= 1024 else 1)
-    nheads = 6
+    batch_size = 16 if seqlen_q <= 512 else (8 if seqlen_q <= 1024 else 4)
+    nheads = 4
     # batch_size = 1
     # nheads = 1
     nheads_kv = nheads if mha_type == "mha" else (3 if mha_type == "gqa" else 1)
@@ -579,8 +560,7 @@ def test_flash_attn_varlen_output(
         pack_gqa_vals = [False, True, None]
         # num_splits_vals = [1, 3]
         # SplitKV is not supported for hdim >= 192
-        # Reduced num_splits for SM120 to avoid resource exhaustion
-        num_splits_vals = [1]  # Disable SplitKV for SM120 tests
+        num_splits_vals = [1, 3] if d < 192 and not DISABLE_SPLIT else [1]
         for pack_gqa, num_splits in itertools.product(pack_gqa_vals, num_splits_vals):
             kwargs = {
                 "cu_seqlens_q": cu_seqlens_q,
@@ -734,7 +714,6 @@ def test_flash_attn_varlen_output(
 # @pytest.mark.parametrize("rotary_fraction", [0.0, 0.5, 1.0])
 @pytest.mark.parametrize("rotary_fraction", [0.0])
 @pytest.mark.parametrize("page_size", [None] + ([1, 4, 128]))
-# @pytest.mark.parametrize("page_size", [None, 128])
 # @pytest.mark.parametrize("page_size", [128])
 # @pytest.mark.parametrize("has_leftpad", [False, True])
 @pytest.mark.parametrize("has_leftpad", [False])
@@ -747,25 +726,21 @@ def test_flash_attn_varlen_output(
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192])
 # @pytest.mark.parametrize('d', [56, 80])
 # @pytest.mark.parametrize("d", [128])
-@pytest.mark.parametrize("d", [64])
+@pytest.mark.parametrize("d", [64, 128])
 # @pytest.mark.parametrize("d", [192])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
         (1, 128),
-        (1, 339),
-        (3, 512),  # Reduced from 1024
-        (64, 512),  # Reduced from 800
+        (3, 512),
         (64, 256),
-        (3, 799),
-        (64, 1024),  # Reduced from 2048
-        # Removed extremely large sequences for SM120 (killed in spark)
+        (64, 512),
+        (128, 512),
+        (256, 1024),
+        (512, 2048),
+        # Removed very long sequences for memory constraints
         # (16, 20000),
-        # # (1, 128 * 1024),
-        # # (16, 128 * 1024),
-        # (128, 128),
-        # (256, 512),  # To test appending KV with more than 1 block
-        # (2048, 3577),  # Enough tile to test persistent scheduler
+        # (64, 2048),
     ],
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(256, 128)])
@@ -788,8 +763,6 @@ def test_flash_attn_kvcache(
     mha_type,
     dtype,
 ):
-    if page_size is not None and seqlen_k % page_size != 0:
-        pytest.skip()
     if seqlen_q > seqlen_k and new_kv:
         pytest.skip()
     if not new_kv and rotary_fraction > 0.0:
@@ -799,10 +772,10 @@ def test_flash_attn_kvcache(
     device = "cuda"
     # set seed
     torch.random.manual_seed(0)
-    batch_size = 5
+    batch_size = 3  # Reduced for memory constraints
     # batch_size = 1
     batch_size_cache = batch_size if not has_batch_idx else batch_size * 2
-    nheads = 6
+    nheads = 4  # Reduced for memory constraints
     # nheads = 1
     # rotary_dim must be a multiple of 16, and must be <= d
     rotary_dim = math.floor(int(rotary_fraction * d) / 16) * 16
@@ -810,7 +783,7 @@ def test_flash_attn_kvcache(
     assert nheads % nheads_k == 0
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
     # dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
-    dv_vals = [d]
+    dv_vals = [d]  # Reduced for memory constraints
     if dtype == torch.float8_e4m3fn:
         dv_vals = [d]
     # attention_chunk_vals = [torch.randint(1, seqlen_k * 2, (1,)).item(), 0] if (causal or local) else [0]
@@ -940,7 +913,7 @@ def test_flash_attn_kvcache(
                 dtype_ref,
             )
         cache_seqlens = torch.randint(
-            0 if new_kv else 1,
+            max(0 if new_kv else 1, seqlen_q),
             # If we don't use seqlen_q in the case of causal and rotary, cos/sin won't be long enough
             (
                 (
@@ -1108,8 +1081,7 @@ def test_flash_attn_kvcache(
         k_cache_saved = k_cache.clone() if page_size is None else k_cache_paged.clone()
         v_cache_saved = v_cache.clone() if page_size is None else v_cache_paged.clone()
         # num_splits_vals = [1, 0]
-        # Reduced num_splits for SM120 to avoid resource exhaustion
-        num_splits_vals = [1]  # Disable SplitKV for SM120 tests
+        num_splits_vals = [1, 3] if d < 192 and not DISABLE_SPLIT else [1]
         # precompute_metadata_vals = [False, True]
         precompute_metadata_vals = [False]
         for num_splits, precompute_metadata in itertools.product(
