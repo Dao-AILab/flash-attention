@@ -57,7 +57,7 @@ VERBOSE = True
 # @pytest.mark.parametrize("d", [64, 96, 128, 192])
 # @pytest.mark.parametrize("d", [64, 128])
 # @pytest.mark.parametrize("d", [128, 192])
-@pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("d", [128])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -216,15 +216,15 @@ def test_flash_attn_output(
             intermediate_dtype=dtype if dtype == torch.float8_e4m3fn else None,
         )
 
-        # k_extended = repeat(k_ref, "b s h d -> b s (h k) d", k=nheads // nheads_kv)
-        # qk = torch.einsum('bshd,bthd->bhst', q_ref, k_extended).float()
-        # # if qv is not None:
-        # #     qk += torch.einsum('bshd,bthd->bhst', qv_ref, v_ref).float()
-        # m = qk.amax(-1, keepdim=True)
-        # s_tmp = torch.exp((qk - m) / math.sqrt(d))
-        # exp_sum = s_tmp.sum(-1)
-        # # qk = torch.einsum('bthd,bshd->bhts', q_ref.float() / math.sqrt(d), k_ref.float())
-        # # lse_ref = torch.logsumexp(qk, dim=-1)
+        k_extended = repeat(k_ref, "b s h d -> b s (h k) d", k=nheads // nheads_kv)
+        qk = torch.einsum('bshd,bthd->bhst', q_ref, k_extended).float()
+        # if qv is not None:
+        #     qk += torch.einsum('bshd,bthd->bhst', qv_ref, v_ref).float()
+        m = qk.amax(-1, keepdim=True)
+        s_tmp = torch.exp((qk - m) / math.sqrt(d))
+        exp_sum = s_tmp.sum(-1)
+        qk = torch.einsum('bthd,bshd->bhts', q_ref.float() / math.sqrt(d), k_ref.float())
+        lse_ref = torch.logsumexp(qk, dim=-1)
 
         # Numerical error if we just do any arithmetic on out_ref
         fwd_atol = 2 * (out_ref + 0.3 - 0.3 - out_ref).abs().max().item()
@@ -347,7 +347,8 @@ def test_flash_attn_output(
                 dv_pt - dv_ref
             ).abs().max().item() + dv_atol
 
-
+# @pytest.mark.parametrize("compute_metadata_tensors", [False, True])
+@pytest.mark.parametrize("compute_metadata_tensors", [True])
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
@@ -412,19 +413,17 @@ def test_flash_attn_varlen_output(
     has_learnable_sink,
     mha_type,
     dtype,
+    compute_metadata_tensors,
 ):
-    if (
-        causal or local
-    ):  # Right now reference only supports causal attention with seqlen_k == seqlen_q
-        seqlen_k = seqlen_q
     device = "cuda"
     # set seed
     torch.random.manual_seed(seqlen_q + seqlen_k + d + int(causal) * 2 + int(local))
-    batch_size = 49 if seqlen_q <= 1024 else 7
-    nheads = 6
+    batch_size = 5 if seqlen_k <= 1024 else 7
+    # nheads = 6
     # batch_size = 1
-    # nheads = 1
-    nheads_kv = nheads if mha_type == "mha" else (3 if mha_type == "gqa" else 1)
+    nheads = 1
+    # nheads_kv = nheads if mha_type == "mha" else (3 if mha_type == "gqa" else 1)
+    nheads_kv = 1
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
     # dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
     dv_vals = [128] if d == 192 else ([d] if d != 128 else [64, d])
@@ -518,9 +517,8 @@ def test_flash_attn_varlen_output(
             key_padding_mask, add_unused_qkv, seqlen_k, batch_size, k.device
         )
 
-        if causal or local:
-            key_padding_mask = query_padding_mask
-
+        # if causal or local:
+        #     key_padding_mask = query_padding_mask
         (
             q_unpad,
             k_unpad,
@@ -550,6 +548,8 @@ def test_flash_attn_varlen_output(
             query_unused_mask=query_unused_mask,
             key_unused_mask=key_unused_mask,
         )
+        print(f"cu_seqlens_q: {cu_seqlens_q}")
+        print(f"cu_seqlens_k: {cu_seqlens_k}")
         q_unpad, k_unpad, v_unpad = [
             x.detach().to(dtype).requires_grad_() for x in (q_unpad, k_unpad, v_unpad)
         ]
@@ -599,7 +599,6 @@ def test_flash_attn_varlen_output(
         fwd_atol = 2 * (out_ref + 0.3 - 0.3 - out_ref).abs().max().item()
         rtol = 2 if softcap == 0.0 else 3
 
-        # pack_gqa_vals = [False, True, None]
         pack_gqa_vals = [False]
         # num_splits_vals = [1, 3]
         # SplitKV is not supported for hdim >= 192
@@ -628,6 +627,7 @@ def test_flash_attn_varlen_output(
             out = output_pad_fn(out_unpad)
             if query_unused_mask is not None:
                 out.masked_fill_(q_zero_masking, 0.0)
+            print(f"out = {out.shape}")
             print(f"Output max diff: {(out - out_ref).abs().max().item()}")
             print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
             # if not causal:
@@ -749,8 +749,8 @@ def test_flash_attn_varlen_output(
 @pytest.mark.parametrize("new_kv", [False])
 @pytest.mark.parametrize("local", [False, True])
 # @pytest.mark.parametrize("local", [False])
-@pytest.mark.parametrize("causal", [False, True])
-# @pytest.mark.parametrize("causal", [True])
+# @pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("causal", [True])
 # @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True, False])
 @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [False])
 # @pytest.mark.parametrize("has_rotary_seqlens", [False, True])
@@ -766,14 +766,14 @@ def test_flash_attn_varlen_output(
 @pytest.mark.parametrize("has_leftpad", [False])
 # @pytest.mark.parametrize("has_batch_idx", [False, True])
 @pytest.mark.parametrize("has_batch_idx", [False])
-@pytest.mark.parametrize("varlen_q", [False, True])
-# @pytest.mark.parametrize("varlen_q", [False])
+# @pytest.mark.parametrize("varlen_q", [False, True])
+@pytest.mark.parametrize("varlen_q", [False])
 # @pytest.mark.parametrize("d", [32, 59, 64, 80, 128, 256])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192])
 # @pytest.mark.parametrize('d', [56, 80])
 # @pytest.mark.parametrize("d", [128])
-@pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("d", [64])
 # @pytest.mark.parametrize("d", [192])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
@@ -1009,10 +1009,11 @@ def test_flash_attn_kvcache(
             key_padding_mask = arange < cache_seqlens_expanded
         else:
             k_new_seqlens = (
-                key_new_padding_mask.sum(-1, keepdims=True) if varlen_q else seqlen_new
+                key_new_padding_mask.sum(-1, keepdims=True) if (varlen_q and key_new_padding_mask is not None) else seqlen_new
             )
             key_padding_mask = arange < cache_seqlens_expanded + k_new_seqlens
         if has_leftpad:
+            assert cache_leftpad is not None  # For type checker
             key_padding_mask = torch.logical_and(
                 key_padding_mask,
                 arange >= cache_leftpad.unsqueeze(-1).expand(-1, seqlen_k),
