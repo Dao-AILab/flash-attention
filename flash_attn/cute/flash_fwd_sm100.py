@@ -518,7 +518,6 @@ class FlashAttentionForwardSm100:
                 self.cluster_layout_vmnk.shape,
             )
         else:
-            assert self.use_correction_warps_for_epi
             tma_atom_K = None
             tma_atom_V = None
 
@@ -551,7 +550,6 @@ class FlashAttentionForwardSm100:
             assert self.m_block_size % tO_layout.shape[0] == 0
             vO_layout = cute.make_layout((1, async_copy_elems))
             gmem_tiled_copy_O = cute.make_tiled_copy_tv(atom_universal_copy, tO_layout, vO_layout)
-            # print("gmem_tiled_copy_O: ", gmem_tiled_copy_O)
 
         if const_expr(mCuSeqlensQ is not None or mSeqUsedQ is not None):
             TileScheduler = SingleTileVarlenScheduler
@@ -2118,6 +2116,11 @@ class FlashAttentionForwardSm100:
                 softmax_corr_consumer_phase ^= 1
                 corr_epi_producer_phase ^= 1
             else:
+                # WARNING: we need some code before the const_expr, see https://github.com/NVIDIA/cutlass/issues/2781
+                if const_expr(self.use_correction_warps_for_epi):
+                    gmem_tiled_copy_O_for_empty_tile = gmem_tiled_copy_O
+                else:
+                    gmem_tiled_copy_O_for_empty_tile = None
                 if const_expr(self.use_block_sparsity):
                     (
                         softmax_corr_consumer_phase,
@@ -2154,6 +2157,9 @@ class FlashAttentionForwardSm100:
                         o_corr_consumer_phase,
                         corr_epi_producer_phase,
                         softmax_scale_log2,
+                        mO_cur,
+                        gO,
+                        gmem_tiled_copy_O_for_empty_tile,
                     )
 
             if const_expr(mLSE is not None):
@@ -2261,9 +2267,9 @@ class FlashAttentionForwardSm100:
         seqlen_q: Int32,
         scale: Float32,
         sO: cute.Tensor,
-        mO_cur: cute.Tensor,
-        gO: cute.Tensor,
-        gmem_tiled_copy_O: cute.TiledCopy,
+        mO_cur: Optional[cute.Tensor] = None,
+        gO: Optional[cute.Tensor] = None,
+        gmem_tiled_copy_O: Optional[cute.TiledCopy] = None,
     ):
         """Apply final scaling and transformation to attention output before writing to global memory.
 
@@ -2338,6 +2344,7 @@ class FlashAttentionForwardSm100:
 
         if const_expr(self.use_correction_warps_for_epi):
             assert(not self.use_tma_O)
+            assert(gmem_tiled_copy_O is not None)
             cute.arch.barrier(barrier_id=int(NamedBarrierFwd.Epilogue),
                               number_of_threads=len(self.epilogue_warp_ids) * cute.arch.WARP_SIZE)
             gmem_thr_copy_O = gmem_tiled_copy_O.get_slice(tidx)
