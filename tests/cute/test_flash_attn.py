@@ -230,19 +230,19 @@ def test_flash_attn_output(
         pack_gqa_vals = [False]
         num_splits_vals = [1] # [1, 3] if d < 192 and not DISABLE_SPLIT else [1]
         for pack_gqa, num_splits in itertools.product(pack_gqa_vals, num_splits_vals):
+            kwargs = {
+                "causal": causal,
+                "window_size": window_size,
+                "softcap": softcap,
+                "learnable_sink": learnable_sink,
+            }
+            if num_splits != 1:
+                kwargs["num_splits"] = num_splits
             out, lse = flash_attn_func(
                 q,
                 k,
                 v,
-                causal=causal,
-                # qv=qv,
-                # q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
-                window_size=window_size,
-                # attention_chunk=attention_chunk,
-                softcap=softcap,
-                learnable_sink=learnable_sink,
-                # pack_gqa=pack_gqa,
-                num_splits=num_splits,
+                **kwargs,
             )
             print(f"Output max diff: {(out - out_ref).abs().max().item()}")
             print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
@@ -577,25 +577,22 @@ def test_flash_attn_varlen_output(
         # SplitKV is not supported for hdim >= 192
         num_splits_vals = [1, 3] if d < 192 and not DISABLE_SPLIT else [1]
         for pack_gqa, num_splits in itertools.product(pack_gqa_vals, num_splits_vals):
+            kwargs = {
+                "cu_seqlens_q": cu_seqlens_q,
+                "cu_seqlens_k": cu_seqlens_k,
+                "causal": causal,
+                "window_size": window_size,
+                "learnable_sink": learnable_sink,
+                "softcap": softcap,
+                "pack_gqa": pack_gqa,
+            }
+            if num_splits != 1:
+                kwargs["num_splits"] = num_splits
             out_unpad, lse = flash_attn_varlen_func(
                 q_unpad,
                 k_unpad,
                 v_unpad,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
-                # max_seqlen_k,
-                # seqused_q=seqused_q,
-                # seqused_k=seqused_k,
-                causal=causal,
-                # qv=qv_unpad,
-                # q_descale=q_descale,
-                # k_descale=k_descale, v_descale=v_descale,
-                window_size=window_size,
-                # attention_chunk=attention_chunk,
-                learnable_sink=learnable_sink,
-                softcap=softcap,
-                num_splits=num_splits,
-                pack_gqa=pack_gqa,
+                **kwargs,
             )
             out = output_pad_fn(out_unpad)
             if query_unused_mask is not None:
@@ -1132,30 +1129,21 @@ def test_flash_attn_kvcache(
                     k_cache_paged.copy_(k_cache_saved)
                     v_cache_paged.copy_(v_cache_saved)
                 # out, lse, *rest = flash_attn_with_kvcache(
+                kwargs = {
+                    "seqused_k": cache_seqlens,
+                    "page_table": page_table,
+                    "cu_seqlens_q": cu_seqlens_q,
+                    "causal": causal,
+                    "window_size": window_size,
+                    "learnable_sink": learnable_sink,
+                }
+                if num_splits != 1:
+                    kwargs["num_splits"] = num_splits
                 out, lse, *rest = flash_attn_varlen_func(
                     q if not varlen_q else q_unpad,
                     k_cache if page_size is None else k_cache_paged,
                     v_cache if page_size is None else v_cache_paged,
-                    # k if not new_kv or not varlen_q else k_unpad,
-                    # v if not new_kv or not varlen_q else v_unpad,
-                    # qv=qv if not varlen_q else qv_unpad,
-                    # rotary_cos=cos,
-                    # rotary_sin=sin,
-                    seqused_k=cache_seqlens,
-                    # cache_batch_idx=cache_batch_idx,
-                    # cache_leftpad=cache_leftpad,
-                    page_table=page_table,
-                    cu_seqlens_q=cu_seqlens_q,
-                    # cu_seqlens_k_new=cu_seqlens_k_new,
-                    # rotary_seqlens=rotary_seqlens,
-                    causal=causal,
-                    window_size=window_size,
-                    learnable_sink=learnable_sink,
-                    # attention_chunk=attention_chunk,
-                    # rotary_interleaved=rotary_interleaved,
-                    # scheduler_metadata=scheduler_metadata,
-                    num_splits=num_splits,
-                    # return_softmax_lse=True
+                    **kwargs,
                 )
                 if varlen_q:
                     out = output_pad_fn(out)
