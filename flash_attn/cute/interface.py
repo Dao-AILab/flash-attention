@@ -409,6 +409,7 @@ def _flash_attn_fwd(
     if aux_tensors is not None:
         cute_aux_tensors = [from_dlpack(buf).mark_layout_dynamic() for buf in aux_tensors]
 
+    tiles_per_page = page_size // n_block_size if page_size is not None else None
     compile_key = (
         dtype,
         head_dim,
@@ -434,11 +435,12 @@ def _flash_attn_fwd(
         is_split_kv,
         pack_gqa,
         compute_capability,
-        page_size not in [None, 128],  # paged KV non-TMA
+        page_size,  # include actual page_size value for proper kernel caching
+        tiles_per_page,  # compile-time constant for paged KV (redundant but explicit)
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
         if compute_capability == 9:
-            assert page_table is None, "paged KV not supported on SM 9.0"
+            assert page_size == None or page_size % n_block_size == 0, f"Only page_size values that are multiples of {n_block_size} are supported for paged KV on SM 9.0"
             assert not is_split_kv, "SplitKV not supported on SM 9.0"
             # fa_fwd = FlashAttentionForwardSm80(
             fa_fwd = FlashAttentionForwardSm90(
@@ -460,6 +462,7 @@ def _flash_attn_fwd(
                 mask_mod=mask_mod,
                 score_mod=score_mod,
                 has_aux_tensors=aux_tensors is not None,
+                page_size=page_size,
             )
         elif compute_capability in [10, 11]:
             fa_fwd = FlashAttentionForwardSm100(
@@ -483,7 +486,7 @@ def _flash_attn_fwd(
                 paged_kv_non_tma=page_size not in [None, 128],
             )
         elif compute_capability == 12:
-            assert page_table is None, "paged KV not supported on SM 12.0"
+            assert page_size == None or page_size % n_block_size == 0, f"Only page_size values that are multiples of {n_block_size} are supported for paged KV on SM 12.0"
             assert not is_split_kv, "SplitKV not supported on SM 12.0"
             # TODO: fix the varlen case
             if (
@@ -511,6 +514,7 @@ def _flash_attn_fwd(
                 and not is_split_kv,
                 score_mod=score_mod,
                 has_aux_tensors=aux_tensors is not None,
+                page_size=page_size,
             )
         else:
             raise ValueError(

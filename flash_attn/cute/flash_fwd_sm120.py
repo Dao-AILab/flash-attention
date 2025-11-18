@@ -82,6 +82,7 @@ class FlashAttentionForwardSm120:
         is_persistent: bool = True,
         score_mod: cutlass.Constexpr | None = None,
         has_aux_tensors: cutlass.Constexpr = False,
+        page_size: Optional[int] = None,
     ):
         # self.dtype = dtype
         # padding head_dim to a multiple of 16 as k_block_size
@@ -119,6 +120,7 @@ class FlashAttentionForwardSm120:
             "SplitKV is not supported for hdim >= 192"
         )
         self.score_mod = score_mod
+        self.page_size = page_size
         if cutlass.const_expr(has_aux_tensors):
             self.vec_size: cutlass.Constexpr = 1
         else:
@@ -501,6 +503,11 @@ class FlashAttentionForwardSm120:
             self.epilogue_warp_ids = (14, 15)
             self.empty_warp_ids = ()
         self.num_epilogue_threads = cute.arch.WARP_SIZE * len(self.epilogue_warp_ids)
+        self.tiles_per_page = (
+            self.page_size // self.n_block_size
+            if cutlass.const_expr(self.page_size is not None)
+            else None
+        )
         if const_expr(self.use_tma_O):
             tma_atom_O, mO = cpasync.make_tiled_tma_atom(
                 tma_store_op,
@@ -1104,14 +1111,19 @@ class FlashAttentionForwardSm120:
                 gK = cute.local_tile(mK_cur, cute.select(self.mma_tiler_qk, mode=[1, 2]), (None, 0))
                 gV = cute.local_tile(mV_cur, cute.select(self.mma_tiler_pv, mode=[1, 2]), (0, None))
             else:
-                # Need to keep batch coord None since we'll index into it with page idx
+                # mK = (page_size, d, h_k, num_pages)
+                # mK_cur = (page_size, d, num_pages)
                 mK_cur, mV_cur = [t[None, None, head_idx_kv, None] for t in (mK, mV)]
+                # gK = (tile_n, tile_hdim, n_tiles per page, num_pages)
                 gK = cute.local_tile(
                     mK_cur, cute.select(self.mma_tiler_qk, mode=[1, 2]), (None, 0, None)
                 )
                 gV = cute.local_tile(
                     mV_cur, cute.select(self.mma_tiler_pv, mode=[1, 2]), (0, None, None)
                 )
+                # gK = ((tile_n, tile_hdim), (n_tiles per page, num_pages))
+                gK = cute.group_modes(gK, 2, 4)
+                gV = cute.group_modes(gV, 2, 4)
             tSgQ = thr_mma_qk.partition_A(gQ)
             tSgK = thr_mma_qk.partition_B(gK)
             tOgV = thr_mma_pv.partition_B(gV)
@@ -1167,26 +1179,23 @@ class FlashAttentionForwardSm120:
 
             if const_expr(not self.is_split_kv) or n_block_min < n_block_max:
                 load_Q(block=self.q_stage * m_block + 0, stage=0)  # Q0
+                n_block = self.get_n_block(batch_idx, n_block_max - 1, mPageTable)
                 page_idx = (
-                    mPageTable[batch_idx, n_block_max - 1]
+                    mPageTable[batch_idx, (n_block_max - 1) // self.tiles_per_page]
                     if const_expr(mPageTable is not None)
                     else None
                 )
-                load_K(
-                    block=n_block_max - 1, producer_state=kv_producer_state, page_idx=page_idx
-                )  # K0
+                load_K(block=n_block, producer_state=kv_producer_state, page_idx=page_idx)  # K0
                 kv_producer_state.advance()
                 if const_expr(self.q_stage == 2):
                     load_Q(block=self.q_stage * m_block + 1, stage=1)  # Q1
                 q_producer_phase ^= 1
-                load_V(
-                    block=n_block_max - 1, producer_state=kv_producer_state, page_idx=page_idx
-                )  # V0
+                load_V(block=n_block, producer_state=kv_producer_state, page_idx=page_idx)  # V0
                 kv_producer_state.advance()
                 for i in cutlass.range(n_block_max - 1 - n_block_min, unroll=1):
-                    n_block = n_block_max - 2 - i
+                    n_block = self.get_n_block(batch_idx, n_block_max - 2 - i, mPageTable)
                     page_idx = (
-                        mPageTable[batch_idx, n_block]
+                        mPageTable[batch_idx, (n_block_max - 2 - i) // self.tiles_per_page]
                         if const_expr(mPageTable is not None)
                         else None
                     )
@@ -1200,6 +1209,19 @@ class FlashAttentionForwardSm120:
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
             # End of persistent scheduler loop
+
+    @cute.jit
+    def get_n_block(
+        self,
+        batch_idx: int,
+        n_block: int,
+        mPageTable: Optional[cute.Tensor],
+    ):
+        if cutlass.const_expr(mPageTable is not None):
+            page_idx = mPageTable[batch_idx, n_block // self.tiles_per_page]
+            residue = n_block % self.tiles_per_page
+            n_block = page_idx * self.tiles_per_page + residue
+        return n_block
 
     @cute.jit
     def mma(
@@ -2313,8 +2335,13 @@ class FlashAttentionForwardSm120:
         if const_expr(self.uneven_kv_smem):
             # Since this is the producer_state, the phase starts at 1, so we have to invert it
             tXsX_cur = self.offset_kv_smem(tXsX_cur, stage, phase ^ 1)
-        # Currently we assume that page_size == n_block_size so we index into tXgX with block = 0
-        tXgX_cur = tXgX[None, block] if const_expr(page_idx is None) else tXgX[None, 0, page_idx]
+        if const_expr(page_idx is None):
+            tXgX_cur = tXgX[None, block]
+        else:
+            # For paged KV: block is the physical block index from get_n_block
+            # Extract tile offset within the page: block % tiles_per_page
+            tile_offset = block % self.tiles_per_page
+            tXgX_cur = tXgX[None, tile_offset, page_idx]
         cute.copy(tma_atom, tXgX_cur, tXsX_cur, tma_bar_ptr=mbar_full_ptr + stage)
 
     @cute.jit
