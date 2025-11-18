@@ -259,11 +259,25 @@ def _flash_attn_fwd(
         if page_table is not None
         else None
     )
+    compute_capability = (
+        torch.cuda.get_device_capability()[0]
+        if _compute_capability is None
+        else _compute_capability
+    )
+
+    assert compute_capability in [9, 10], "Unsupported compute capability. Supported: 9.x, 10.x"
+
+
     sparse_tensors = None
     if block_sparse_tensors is not None:
         if seqlen_q is None:
             raise ValueError("Block sparsity requires fixed-length sequences (seqlen_q must be known).")
-        expected_m_blocks = (seqlen_q + m_block_size - 1) // m_block_size
+        m_block_size_block = m_block_size
+        if compute_capability == 10:
+            # TODO: This multiplier should really be q_stage, wire up in later PR
+            # 1 cta handles 2*tile_m row
+            m_block_size_block = 2 * m_block_size
+        expected_m_blocks = (seqlen_q + m_block_size_block - 1) // m_block_size_block
         expected_n_blocks = (seqlen_k + n_block_size - 1) // n_block_size
         block_sparse_tensors = normalize_block_sparse_tensors(
             block_sparse_tensors,
@@ -286,12 +300,6 @@ def _flash_attn_fwd(
     else:
         causal, local = False, False
 
-    compute_capability = (
-        torch.cuda.get_device_capability()[0]
-        if _compute_capability is None
-        else _compute_capability
-    )
-    assert compute_capability in [9, 10], "Unsupported compute capability. Supported: 9.x, 10.x"
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     if compute_capability == 9:  # TODO: tune block size according to hdim.
@@ -383,6 +391,10 @@ def _flash_attn_fwd(
             raise NotImplementedError(
                 "Block sparsity is not yet supported with pack_gqa=True. This will be fixed in a future PR."
             )
+        if is_split_kv:
+            raise NotImplementedError(
+                "Block sparsity is not yet supported with SplitKV. TODO: partition sparse block lists per split."
+            )
 
     cute_aux_tensors = None
     if aux_tensors is not None:
@@ -415,7 +427,6 @@ def _flash_attn_fwd(
         compute_capability,
         page_size not in [None, 128],  # paged KV non-TMA
     )
-
     if compile_key not in _flash_attn_fwd.compile_cache:
         if compute_capability == 9:
             assert page_table is None, "paged KV not supported on SM 9.0"
@@ -442,8 +453,6 @@ def _flash_attn_fwd(
                 has_aux_tensors=aux_tensors is not None,
             )
         elif compute_capability == 10:
-            if sparse_tensors is not None:
-                raise NotImplementedError("BlockSparsity not yet supported on SM 10.0")
             fa_fwd = FlashAttentionForwardSm100(
                 head_dim,
                 head_dim_v,
@@ -452,12 +461,15 @@ def _flash_attn_fwd(
                 is_local=local,
                 is_split_kv=is_split_kv,
                 pack_gqa=pack_gqa,
+                m_block_size=m_block_size,
+                n_block_size=n_block_size,
                 is_persistent=not causal
                 and not local
                 and cu_seqlens_q is None
                 and seqused_q is None
                 and not is_split_kv,
                 score_mod=score_mod,
+                mask_mod=mask_mod,
                 has_aux_tensors=aux_tensors is not None,
                 paged_kv_non_tma=page_size not in [None, 128],
             )
