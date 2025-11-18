@@ -267,7 +267,7 @@ def _flash_attn_fwd(
         else _compute_capability
     )
 
-    assert compute_capability in [9, 10], "Unsupported compute capability. Supported: 9.x, 10.x"
+    assert compute_capability in [9, 10, 12], "Unsupported compute capability. Supported: 9.x, 10.x, 12.x"
 
 
     sparse_tensors = None
@@ -485,6 +485,15 @@ def _flash_attn_fwd(
         elif compute_capability == 12:
             assert page_table is None, "paged KV not supported on SM 12.0"
             assert not is_split_kv, "SplitKV not supported on SM 12.0"
+            # TODO: fix the varlen case
+            if (
+                pack_gqa
+                and ((128 % qhead_per_kvhead != 0) or (cu_seqlens_q is not None or seqused_q is not None))
+            ):
+                pack_gqa = False
+            # TODO: fix GQA + SplitKV + non-varlen
+            if pack_gqa and num_splits != 1 and cu_seqlens_q is None:
+                pack_gqa = False
             fa_fwd = FlashAttentionForwardSm120(
                 head_dim,
                 head_dim_v,
