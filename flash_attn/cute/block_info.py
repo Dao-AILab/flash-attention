@@ -30,8 +30,8 @@ class BlockInfo:
         split_idx: cutlass.Int32 = 0,
         batch_idx: Optional[int] = None,
     ) -> Tuple[Int32, Int32]:
-        # get dynamic num_splits for this batch if available
         num_splits = self.num_splits
+        # get dynamic num_splits for this batch if available
         if const_expr(self.num_splits_dynamic_ptr is not None):
             num_splits = self.num_splits_dynamic_ptr[batch_idx]
         n_block_max = cute.ceil_div(seqlen_info.seqlen_k, self.tile_n)

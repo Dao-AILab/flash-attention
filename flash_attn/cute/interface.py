@@ -22,7 +22,7 @@
 # - bwd pass optimized for Hopper/Blackwell
 
 import math
-from typing import Optional, Tuple, Callable
+from typing import Optional, Tuple, Callable, NamedTuple
 
 import torch
 
@@ -48,6 +48,15 @@ from flash_attn.cute.block_sparsity import (
     to_cute_block_sparse_tensors,
     normalize_block_sparse_tensors,
 )
+
+
+class SchedulerMetadata(NamedTuple):
+    """Class to store scheduler metadata for varlen"""
+    prepare_seqlen_q: Optional[torch.Tensor]
+    num_splits_dynamic: Optional[torch.Tensor]
+    varlen_batch_idx: Optional[torch.Tensor]
+    num_nheads_in_l2: Optional[torch.Tensor]
+    tile_count_semaphore: Optional[torch.Tensor]
 
 
 def maybe_contiguous(x):
@@ -102,7 +111,7 @@ def _flash_attn_fwd(
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
     aux_tensors: Optional[list[torch.Tensor]] = None,
-    compute_metadata_tensors: Optional[bool] = False,
+    scheduler_metadata: Optional[SchedulerMetadata] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for FlashAttention.
 
@@ -115,6 +124,7 @@ def _flash_attn_fwd(
         out: Optional pre-allocated output tensor. If None, will be allocated internally.
         lse: Optional pre-allocated log-sum-exp tensor. If None, will be allocated when needed.
         aux_tensors: Some score_mods will want to read from global aux_tensors. This is how we thread them through to the inner kernel.
+        scheduler_metadata: Optional metadata for tile scheduler with varlen sequences. 
     """
     q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
     num_head, head_dim = q.shape[-2:]
@@ -389,34 +399,23 @@ def _flash_attn_fwd(
         or seqused_q is not None
         or seqused_k is not None
     )
-    
-    if compute_metadata_tensors:
-        assert is_varlen, "compute_metadata_tensors is only for varlen"
 
-        # TODO: LPT sort to be implemented in prepare kernel
-        sort = False
-
-        # Allocate metadata tensors
-        prepare_seqlen_q = torch.empty(batch_size, dtype=torch.int32, device=device)
-        num_splits_dynamic = torch.empty(batch_size, dtype=torch.int32, device=device)
-        varlen_batch_idx = (
-            torch.empty(batch_size, dtype=torch.int32, device=device) if sort else None
-        )
-        num_nheads_in_l2 = torch.ones(batch_size, dtype=torch.int32, device=device) * num_head
-        tile_count_semaphore = torch.zeros(1, dtype=torch.int32, device=device)
-
-        # Convert to CuTe tensors
+    if scheduler_metadata is not None:
+        (
+            prepare_seqlen_q,
+            num_splits_dynamic,
+            varlen_batch_idx,
+            num_nheads_in_l2,
+            tile_count_semaphore,
+        ) = scheduler_metadata
         prepare_seqlen_q_cute = from_dlpack(
             prepare_seqlen_q.detach(), assumed_align=4
         ).mark_layout_dynamic(leading_dim=0)
         num_splits_dynamic_cute = from_dlpack(
             num_splits_dynamic.detach(), assumed_align=4
         ).mark_layout_dynamic(leading_dim=0)
-
         varlen_batch_idx_cute = (
-            from_dlpack(varlen_batch_idx.detach(), assumed_align=4).mark_layout_dynamic(
-                leading_dim=0
-            )
+            from_dlpack(varlen_batch_idx.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=0)
             if varlen_batch_idx is not None
             else None
         )
@@ -427,49 +426,6 @@ def _flash_attn_fwd(
             tile_count_semaphore.detach(), assumed_align=4
         ).mark_layout_dynamic(leading_dim=0)
 
-        enable_pdl = False  # pdl not supported
-
-        num_sm = torch.cuda.get_device_properties(device).multi_processor_count
-        seqlen_k_new = 0
-
-        # Compute seqlen_q if it's None (when cu_seqlens_q is provided)
-        if seqlen_q is None:
-            assert cu_seqlens_q is not None, "seqlen_q is None but cu_seqlens_q is also None"
-            seqlen_q = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item()
-        print("Computing num_splits_dynamic...")
-        # Call prepare kernel
-        prepare_varlen_num_blocks(
-            num_batch=batch_size,
-            seqlen_q=seqlen_q,
-            seqlen_k=seqlen_k,
-            nheads=num_head,
-            nheads_k=num_head_kv,
-            headdim=head_dim,
-            headdim_v=head_dim_v,
-            num_splits=num_splits,
-            tile_m=m_block_size,
-            tile_n=n_block_size,
-            num_sm=num_sm,
-            packgqa=pack_gqa,
-            is_causal=causal,
-            enable_pdl=enable_pdl,
-            sort=sort,
-            seqlen_k_new=seqlen_k_new,
-            stream=current_stream,
-            mCuSeqlensQ=cu_seqlens_q_tensor,
-            mCuSeqlensK=cu_seqlens_k_tensor,
-            mCuSeqlensKNew=None,  # Not implemented yet
-            mSeqUsedQ=seqused_q_tensor,
-            mSeqUsedK=seqused_k_tensor,
-            mLeftPadK=None,  # Not implemented yet
-            mPrepareSeqlenQ=prepare_seqlen_q_cute,
-            mNumSplitsDynamic=num_splits_dynamic_cute,
-            mVarlenBatchIdx=varlen_batch_idx_cute,
-            mNumNheadsInL2=num_nheads_in_l2_cute if (causal or local) else None,
-            tile_count_semaphore=tile_count_semaphore_cute,
-        )
-        print(f"[DEBUG] num_splits_dynamic: {num_splits_dynamic}")
-    
     if score_mod is not None:
         if is_varlen:
             raise NotImplementedError(
@@ -534,12 +490,13 @@ def _flash_attn_fwd(
         pack_gqa,
         compute_capability,
         page_size not in [None, 128],  # paged KV non-TMA
-        compute_metadata_tensors,
+        scheduler_metadata is not None,
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
         if compute_capability == 9:
             assert page_table is None, "paged KV not supported on SM 9.0"
             assert not is_split_kv, "SplitKV not supported on SM 9.0"
+            assert scheduler_metadata is None, "scheduler_metadata not supported on SM 9.0"
             # fa_fwd = FlashAttentionForwardSm80(
             fa_fwd = FlashAttentionForwardSm90(
                 dtype,
@@ -583,7 +540,7 @@ def _flash_attn_fwd(
                 paged_kv_non_tma=page_size not in [None, 128],
                 is_varlen_q=cu_seqlens_q is not None
                     or seqused_q is not None,
-                has_metadata_tensors=compute_metadata_tensors,
+                has_metadata_tensors=scheduler_metadata is not None,
             )
         else:
             raise ValueError(
@@ -609,10 +566,10 @@ def _flash_attn_fwd(
             learnable_sink_tensor,
             sparse_tensors,
             cute_aux_tensors,
-            num_splits_dynamic_cute if compute_metadata_tensors else None,
-            None,  # num_m_blocks_ptr - not used in sm90/sm100
-            varlen_batch_idx_cute if compute_metadata_tensors else None,
-            num_nheads_in_l2_cute if compute_metadata_tensors else None,
+            num_splits_dynamic_cute if scheduler_metadata is not None else None,
+            None,  # num_m_blocks_ptr
+            varlen_batch_idx_cute if scheduler_metadata is not None else None,
+            num_nheads_in_l2_cute if scheduler_metadata is not None else None,
         )
     _flash_attn_fwd.compile_cache[compile_key](
         q_tensor,
@@ -632,10 +589,10 @@ def _flash_attn_fwd(
         learnable_sink_tensor,
         sparse_tensors,
         cute_aux_tensors,
-        num_splits_dynamic_cute if compute_metadata_tensors else None,
-        None,  # num_m_blocks_ptr - not used in sm90/sm100
-        varlen_batch_idx_cute if compute_metadata_tensors else None,
-        num_nheads_in_l2_cute if compute_metadata_tensors else None,
+        num_splits_dynamic_cute if scheduler_metadata is not None else None,
+        None,  # num_m_blocks_ptr
+        varlen_batch_idx_cute if scheduler_metadata is not None else None,
+        num_nheads_in_l2_cute if scheduler_metadata is not None else None,
     )
     if is_split_kv:
         _flash_attn_fwd_combine(
@@ -645,8 +602,8 @@ def _flash_attn_fwd(
             lse.transpose(-1, -2) if lse is not None else None,
             cu_seqlens_q,
             seqused_q,
-            num_splits_dynamic if compute_metadata_tensors else None,
-            tile_count_semaphore if compute_metadata_tensors else None,
+            num_splits_dynamic if scheduler_metadata is not None else None,
+            tile_count_semaphore if scheduler_metadata is not None else None,
         )
     return out, lse
 
@@ -1223,7 +1180,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         softcap: float = 0.0,
         num_splits: int = 1,
         pack_gqa: Optional[bool] = None,
-        compute_metadata_tensors: bool = False,
+        scheduler_metadata: Optional[SchedulerMetadata] = None,
     ):
         out, lse = _flash_attn_fwd(
             q,
@@ -1242,7 +1199,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             softcap=softcap,
             num_splits=num_splits,
             pack_gqa=pack_gqa,
-            compute_metadata_tensors=compute_metadata_tensors,
+            scheduler_metadata=scheduler_metadata,
         )
         ctx.save_for_backward(q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
         ctx.softmax_scale = softmax_scale
@@ -1327,7 +1284,7 @@ def flash_attn_varlen_func(
     softcap: float = 0.0,
     num_splits: int = 1,
     pack_gqa: Optional[bool] = None,
-    compute_metadata_tensors: bool = False,
+    scheduler_metadata: Optional[SchedulerMetadata] = None,
 ):
     return FlashAttnVarlenFunc.apply(
         q,
@@ -1345,7 +1302,7 @@ def flash_attn_varlen_func(
         softcap,
         num_splits,
         pack_gqa,
-        compute_metadata_tensors,
+        scheduler_metadata,
     )
 
 
@@ -1626,3 +1583,154 @@ def flash_attn_combine(
         seqused,
     )
     return out, lse
+
+
+def get_scheduler_metadata(
+    num_batch: int,
+    seqlen_q: int,
+    seqlen_k: int,
+    nheads: int,
+    nheads_k: int,
+    headdim: int,
+    headdim_v: int,
+    num_splits: int,
+    tile_m: int,
+    tile_n: int,
+    num_sm: int,
+    pack_gqa: bool,
+    is_causal: bool,
+    enable_pdl: bool,
+    sort: bool,
+    seqlen_k_new: int,
+    stream: Optional[cuda.CUstream],
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k: Optional[torch.Tensor] = None,
+    cu_seqlens_k_new: Optional[torch.Tensor] = None,
+    seqused_q: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
+    leftpad_k: Optional[torch.Tensor] = None,
+) -> SchedulerMetadata:
+    """
+    Helper method to get scheduler metadata for varlen sequences.
+    """
+    # Determine device from input tensors
+    device = None
+    for t in [cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k]:
+        if t is not None:
+            device = t.device
+            break
+    if device is None:
+        raise ValueError(
+            "At least one of cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k must be provided to determine device"
+        )
+
+    # Override enable_pdl (not supported yet)
+    enable_pdl = False
+
+    # Compute seqlen_q if it's None (when cu_seqlens_q is provided)
+    if seqlen_q is None:
+        assert cu_seqlens_q is not None, "seqlen_q is None but cu_seqlens_q is also None"
+        seqlen_q = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item()
+
+    # Allocate metadata tensors (torch tensors)
+    prepare_seqlen_q = torch.empty(num_batch, dtype=torch.int32, device=device)
+    num_splits_dynamic = torch.empty(num_batch, dtype=torch.int32, device=device)
+    varlen_batch_idx = torch.empty(num_batch, dtype=torch.int32, device=device) if sort else None
+    num_nheads_in_l2 = torch.ones(num_batch, dtype=torch.int32, device=device) * nheads
+    tile_count_semaphore = torch.zeros(1, dtype=torch.int32, device=device)
+
+    # Convert to CuTe tensors
+    prepare_seqlen_q_cute = from_dlpack(
+        prepare_seqlen_q.detach(), assumed_align=4
+    ).mark_layout_dynamic(leading_dim=0)
+    num_splits_dynamic_cute = from_dlpack(
+        num_splits_dynamic.detach(), assumed_align=4
+    ).mark_layout_dynamic(leading_dim=0)
+
+    varlen_batch_idx_cute = (
+        from_dlpack(varlen_batch_idx.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=0)
+        if varlen_batch_idx is not None
+        else None
+    )
+    num_nheads_in_l2_cute = from_dlpack(
+        num_nheads_in_l2.detach(), assumed_align=4
+    ).mark_layout_dynamic(leading_dim=0)
+    tile_count_semaphore_cute = from_dlpack(
+        tile_count_semaphore.detach(), assumed_align=4
+    ).mark_layout_dynamic(leading_dim=0)
+
+    # Convert input tensors to CuTe tensors
+    cu_seqlens_q_tensor = (
+        from_dlpack(cu_seqlens_q.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=0)
+        if cu_seqlens_q is not None
+        else None
+    )
+    cu_seqlens_k_tensor = (
+        from_dlpack(cu_seqlens_k.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=0)
+        if cu_seqlens_k is not None
+        else None
+    )
+    cu_seqlens_k_new_tensor = (
+        from_dlpack(cu_seqlens_k_new.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=0)
+        if cu_seqlens_k_new is not None
+        else None
+    )
+    seqused_q_tensor = (
+        from_dlpack(seqused_q.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=0)
+        if seqused_q is not None
+        else None
+    )
+    seqused_k_tensor = (
+        from_dlpack(seqused_k.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=0)
+        if seqused_k is not None
+        else None
+    )
+    leftpad_k_tensor = (
+        from_dlpack(leftpad_k.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=0)
+        if leftpad_k is not None
+        else None
+    )
+
+    # Get or create stream
+    if stream is None:
+        stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+    # Call prepare kernel
+    prepare_varlen_num_blocks(
+        num_batch=num_batch,
+        seqlen_q=seqlen_q,
+        seqlen_k=seqlen_k,
+        nheads=nheads,
+        nheads_k=nheads_k,
+        headdim=headdim,
+        headdim_v=headdim_v,
+        num_splits=num_splits,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        num_sm=num_sm,
+        packgqa=pack_gqa,
+        is_causal=is_causal,
+        enable_pdl=enable_pdl,
+        sort=sort,
+        seqlen_k_new=seqlen_k_new,
+        stream=stream,
+        mCuSeqlensQ=cu_seqlens_q_tensor,
+        mCuSeqlensK=cu_seqlens_k_tensor,
+        mCuSeqlensKNew=cu_seqlens_k_new_tensor,
+        mSeqUsedQ=seqused_q_tensor,
+        mSeqUsedK=seqused_k_tensor,
+        mLeftPadK=leftpad_k_tensor,
+        mPrepareSeqlenQ=prepare_seqlen_q_cute,
+        mNumSplitsDynamic=num_splits_dynamic_cute,
+        mVarlenBatchIdx=varlen_batch_idx_cute,
+        mNumNheadsInL2=num_nheads_in_l2_cute if is_causal else None,
+        tile_count_semaphore=tile_count_semaphore_cute,
+    )
+
+    return SchedulerMetadata(
+        prepare_seqlen_q=prepare_seqlen_q,
+        num_splits_dynamic=num_splits_dynamic,
+        varlen_batch_idx=varlen_batch_idx,
+        num_nheads_in_l2=num_nheads_in_l2,
+        tile_count_semaphore=tile_count_semaphore,
+    )

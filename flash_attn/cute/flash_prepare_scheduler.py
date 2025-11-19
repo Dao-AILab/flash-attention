@@ -1,5 +1,5 @@
 # A reimplementation of https://github.com/Dao-AILab/flash-attention/blob/main/hopper/flash_prepare_scheduler.cu
-# from Cutlass C++ to Cute-DSL.
+# from CUTLASS C++ to Cute-DSL.
 
 from typing import Optional, Tuple
 
@@ -23,12 +23,9 @@ class FlashPrepareScheduler:
         self.sort = sort
         self.num_batch = num_batch
         self.num_threads_per_warp = 32
-        # kNumBatchPerWarp is always 31 (one less than warp size)
-        # This ensures the last lane (lane 31) doesn't process batches,
-        # making shuffle operations safe
+
         self.k_num_batch_per_warp = 31
         # Compute num_warps based on num_batch (capped at 32)
-        # This determines the block size: 32 * num_warps
         self.num_warps = min((num_batch + 30) // 31, 32)
         self.num_ctas = (num_batch + (31 * 32 - 1)) // (31 * 32)
 
@@ -67,7 +64,8 @@ class FlashPrepareScheduler:
         stream: cuda.CUstream,
     ):
         """
-        Execute the prepare scheduler kernel.
+        Entrypoint to the prepare scheduler kernel.
+        TODO: Implement batch sort for LPT.
         """
         # Store as Python ints
         self.nheads = nheads
@@ -108,8 +106,6 @@ class FlashPrepareScheduler:
         qhead_per_khead_int32 = Int32(self.qhead_per_khead)
 
         grid = self.get_grid_shape(self.num_batch)
-        # Block size is 32 * num_warps, where num_warps depends on num_batch
-        # This matches the C++ implementation: 32 * NumWarps
         block = (32 * self.num_warps, 1, 1)
 
         # shared memory for total block updates
@@ -180,7 +176,6 @@ class FlashPrepareScheduler:
         max_kvblocks_in_l2: Int32,
     ):
         k_num_batch_per_warp = self.k_num_batch_per_warp
-        bdimx, _, _ = cute.arch.block_dim()
         bidx, _, _ = cute.arch.block_idx()
         tidx, _, _ = cute.arch.thread_idx()
         grid_dimx, _, _ = cute.arch.grid_dim()
@@ -416,8 +411,8 @@ def prepare_varlen_num_blocks(
 
     Args:
         num_batch: Number of batches
-        seqlen_q: Static sequence length for Q (used if mCuSeqlensQ is None)
-        seqlen_k: Static sequence length for K (used if mCuSeqlensK is None)
+        seqlen_q: Static sequence length for Q
+        seqlen_k: Static sequence length for K
         nheads: Number of query heads
         nheads_k: Number of key/value heads
         headdim: Head dimension
@@ -426,23 +421,23 @@ def prepare_varlen_num_blocks(
         tile_m: M tile size
         tile_n: N tile size
         num_sm: Number of SMs on the device
-        packgqa: Whether to use packed GQA
+        packgqa: Whether to use packgqa
         is_causal: Whether attention is causal
-        enable_pdl: Whether to enable PDL (persistent data layout)
+        enable_pdl: Whether to enable PDL (not supported yet)
         sort: Whether to sort batches
         seqlen_k_new: Static new sequence length for K
-        mCuSeqlensQ: Cumulative sequence lengths for Q (CuTe tensor, shape: [batch_size + 1])
-        mCuSeqlensK: Cumulative sequence lengths for K (CuTe tensor, shape: [batch_size + 1])
-        mCuSeqlensKNew: Cumulative sequence lengths for new K (CuTe tensor, shape: [batch_size + 1])
-        mSeqUsedQ: Used sequence lengths for Q (CuTe tensor, shape: [batch_size])
-        mSeqUsedK: Used sequence lengths for K (CuTe tensor, shape: [batch_size])
-        mLeftPadK: Left padding for K (CuTe tensor, shape: [batch_size])
-        mPrepareSeqlenQ: Output tensor for prepared Q sequence lengths (CuTe tensor, shape: [batch_size])
-        mNumSplitsDynamic: Output tensor for dynamic number of splits (CuTe tensor, shape: [batch_size])
-        mVarlenBatchIdx: Output tensor for varlen batch indices (CuTe tensor, shape: [batch_size])
-        mNumNheadsInL2: Output tensor for number of heads in L2 (CuTe tensor, shape: [batch_size])
-        tile_count_semaphore: Semaphore for tile counting (CuTe tensor, shape: [1])
-        stream: CUDA stream to use
+        mCuSeqlensQ: Cumulative sequence lengths for Q (shape: [batch_size + 1])
+        mCuSeqlensK: Cumulative sequence lengths for K (shape: [batch_size + 1])
+        mCuSeqlensKNew: Cumulative sequence lengths for new K (shape: [batch_size + 1])
+        mSeqUsedQ: Used sequence lengths for Q (shape: [batch_size])
+        mSeqUsedK: Used sequence lengths for K (shape: [batch_size])
+        mLeftPadK: Left padding for K (shape: [batch_size])
+        mPrepareSeqlenQ: Output tensor for prepared Q sequence lengths (shape: [batch_size])
+        mNumSplitsDynamic: Output tensor for dynamic number of splits (shape: [batch_size])
+        mVarlenBatchIdx: Output tensor for varlen batch indices (shape: [batch_size])
+        mNumNheadsInL2: Output tensor for number of heads in L2 (shape: [batch_size])
+        tile_count_semaphore: Semaphore for tile counting (shape: [1])
+        stream: CUDA stream
     """
 
     # Create cache key for compilation

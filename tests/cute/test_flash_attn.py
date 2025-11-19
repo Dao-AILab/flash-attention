@@ -3,7 +3,7 @@
 import math
 import itertools
 import os
-
+from typing import Tuple, Optional
 import pytest
 import torch
 
@@ -25,6 +25,8 @@ from flash_attn.cute.interface import (
     flash_attn_func,
     flash_attn_varlen_func,
     flash_attn_combine,
+    get_scheduler_metadata,
+    SchedulerMetadata,
 )
 
 
@@ -321,8 +323,6 @@ def test_flash_attn_output(
                 dv_pt - dv_ref
             ).abs().max().item() + dv_atol
 
-@pytest.mark.parametrize("compute_metadata_tensors", [False, True])
-# @pytest.mark.parametrize("compute_metadata_tensors", [True])
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
@@ -387,7 +387,6 @@ def test_flash_attn_varlen_output(
     has_learnable_sink,
     mha_type,
     dtype,
-    compute_metadata_tensors,
 ):
     if (
         causal or local
@@ -608,7 +607,6 @@ def test_flash_attn_varlen_output(
                 softcap=softcap,
                 num_splits=num_splits,
                 pack_gqa=pack_gqa,
-                compute_metadata_tensors=compute_metadata_tensors and num_splits > 1,
             )
             out = output_pad_fn(out_unpad)
             if query_unused_mask is not None:
@@ -1124,18 +1122,32 @@ def test_flash_attn_kvcache(
         for num_splits, precompute_metadata in itertools.product(
             num_splits_vals, precompute_metadata_vals
         ):
-            # if precompute_metadata:
-            #     scheduler_metadata = get_scheduler_metadata(
-            #         batch_size, max_seqlen_q if varlen_q else seqlen_q, seqlen_k, nheads, nheads_k, d,
-            #         cache_seqlens, q.dtype, headdim_v=dv, cu_seqlens_q=cu_seqlens_q,
-            #         cu_seqlens_k_new=cu_seqlens_k_new, cache_leftpad=cache_leftpad,
-            #         max_seqlen_k_new=seqlen_new, page_size=page_size,
-            #         causal=causal, window_size=window_size, attention_chunk=attention_chunk,
-            #         num_splits=num_splits
-            #     )
-            # else:
-            #     scheduler_metadata = None
-            scheduler_metadata = None
+            scheduler_metadata: Optional[SchedulerMetadata] = None
+            if precompute_metadata:
+                scheduler_metadata = get_scheduler_metadata(
+                    num_batch=batch_size,
+                    seqlen_q=seqlen_q,
+                    seqlen_k=seqlen_k,
+                    nheads=nheads,
+                    nheads_k=nheads_k,
+                    headdim=d,
+                    headdim_v=dv,
+                    num_splits=num_splits,
+                    tile_m=128,
+                    tile_n=128,
+                    num_sm=torch.cuda.get_device_properties(device).multi_processor_count,
+                    pack_gqa=False,
+                    is_causal=causal,
+                    enable_pdl=False,
+                    sort=False,
+                    seqlen_k_new=seqlen_new,
+                    stream=None,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k=cache_seqlens,
+                    seqused_q=None,
+                    seqused_k=cache_seqlens,
+                    leftpad_k=None,
+                )
             # Repeat to test metadata reuse
             for _ in range(1 if not precompute_metadata else 2):
                 if page_size is None:
@@ -1166,10 +1178,9 @@ def test_flash_attn_kvcache(
                     learnable_sink=learnable_sink,
                     # attention_chunk=attention_chunk,
                     # rotary_interleaved=rotary_interleaved,
-                    # scheduler_metadata=scheduler_metadata,
+                    scheduler_metadata=scheduler_metadata,
                     num_splits=num_splits,
                     # return_softmax_lse=True
-                    compute_metadata_tensors=precompute_metadata,
                 )
                 if varlen_q:
                     out = output_pad_fn(out)
