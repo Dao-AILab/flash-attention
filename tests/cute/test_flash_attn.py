@@ -321,7 +321,8 @@ def test_flash_attn_output(
                 dv_pt - dv_ref
             ).abs().max().item() + dv_atol
 
-
+@pytest.mark.parametrize("compute_metadata_tensors", [False, True])
+# @pytest.mark.parametrize("compute_metadata_tensors", [True])
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
@@ -334,8 +335,8 @@ def test_flash_attn_output(
 @pytest.mark.parametrize("deterministic", [False])
 # @pytest.mark.parametrize("softcap", [0.0, 15.0])
 @pytest.mark.parametrize("softcap", [0.0])
-# @pytest.mark.parametrize("local", [False, True])
-@pytest.mark.parametrize("local", [False])
+@pytest.mark.parametrize("local", [False, True])
+# @pytest.mark.parametrize("local", [False])
 @pytest.mark.parametrize("causal", [False, True])
 # @pytest.mark.parametrize("causal", [False])
 # @pytest.mark.parametrize("add_unused_qkv", [False, True])
@@ -351,9 +352,9 @@ def test_flash_attn_output(
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
-        # (1, 1),
-        # (1, 3),
-        # (2, 1),
+        (1, 1),
+        (1, 3),
+        (2, 1),
         (511, 1),
         (3, 513),
         (64, 128),
@@ -386,6 +387,7 @@ def test_flash_attn_varlen_output(
     has_learnable_sink,
     mha_type,
     dtype,
+    compute_metadata_tensors,
 ):
     if (
         causal or local
@@ -493,7 +495,15 @@ def test_flash_attn_varlen_output(
         )
 
         if causal or local:
-            key_padding_mask = query_padding_mask
+            if seqlen_q == seqlen_k:
+                key_padding_mask = query_padding_mask
+            else:
+                # When seqlen_q < seqlen_k, extend query_padding_mask to match key length
+                # First seqlen_q positions match query, remaining positions are valid (True)
+                key_padding_mask = torch.cat([
+                    query_padding_mask,
+                    torch.ones(batch_size, seqlen_k - seqlen_q, device=device, dtype=torch.bool)
+                ], dim=1)
 
         (
             q_unpad,
@@ -598,6 +608,7 @@ def test_flash_attn_varlen_output(
                 softcap=softcap,
                 num_splits=num_splits,
                 pack_gqa=pack_gqa,
+                compute_metadata_tensors=compute_metadata_tensors and num_splits > 1,
             )
             out = output_pad_fn(out_unpad)
             if query_unused_mask is not None:
@@ -1108,8 +1119,8 @@ def test_flash_attn_kvcache(
         v_cache_saved = v_cache.clone() if page_size is None else v_cache_paged.clone()
         # num_splits_vals = [1, 0]
         num_splits_vals = [1, 3] if d < 192 and not DISABLE_SPLIT else [1]
-        # precompute_metadata_vals = [False, True]
-        precompute_metadata_vals = [False]
+        precompute_metadata_vals = [False, True]
+        # precompute_metadata_vals = [False]
         for num_splits, precompute_metadata in itertools.product(
             num_splits_vals, precompute_metadata_vals
         ):
@@ -1158,6 +1169,7 @@ def test_flash_attn_kvcache(
                     # scheduler_metadata=scheduler_metadata,
                     num_splits=num_splits,
                     # return_softmax_lse=True
+                    compute_metadata_tensors=precompute_metadata,
                 )
                 if varlen_q:
                     out = output_pad_fn(out)

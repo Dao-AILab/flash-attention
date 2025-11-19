@@ -354,7 +354,7 @@ class FlashAttentionForwardCombine:
         max_idx = seqlen * num_head
 
         # Early exit for single split if dynamic
-        if (const_expr(num_splits_dynamic_ptr is None) or num_splits > 1) and (const_expr(not varlen) or m_block * self.m_block_size < max_idx):
+        if (const_expr(num_splits_dynamic_ptr is not None) or num_splits > 1) and (const_expr(not varlen) or m_block * self.m_block_size < max_idx):
 
             # ===============================
             # Step 1: Load LSE_partial from gmem to shared memory
