@@ -1,13 +1,20 @@
 # Copyright (c) 2025, Ted Zadouri, Markus Hoehnerbach, Jay Shah, Tri Dao.
-# SM120 (RTX 50) backward implementation using tcgen05 SuperMMA instructions.
-# SM120 is a stripped-down version of SM100: it lacks Tensor Memory and UTCMMA instructions,
-# and only supports the smaller-tile "SuperMMA" operations.
-# SM120 DOES support Thread Block Clusters.
-# However, TMA multicast is NOT recommended on SM120 (not implemented in hardware, would be emulated).
-# This implementation uses shared memory for intermediate tensors (S, dP, dV, dK, dQ, P, dS) instead of Tensor Memory.
-# PTX references:
-# https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-mma-instructions-mma-sp
-# https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-instructions-tcgen05-shift
+# SM120 (RTX 50) backward implementation using Ampere-style MMA instructions (similar to SM90).
+#
+# Architecture Notes:
+# - SM120 is more similar to SM90 (Ampere) than SM100 (Blackwell).
+# - SM120 does NOT support tcgen05 instructions (tcgen05 is only available on sm_100/sm_101/sm_110).
+# - Therefore, this implementation uses SM90-style warpgroup-based MMA operations instead.
+# - SM120 DOES support Thread Block Clusters (cluster_size can be 1 or 2).
+#   Clusters allow multiple CTAs to coordinate work distribution, improving memory bandwidth.
+#   Note: TMA multicast is NOT recommended on SM120 (not implemented in hardware, would be emulated),
+#   but clusters can still be used for coordinated data loading without multicast.
+#
+# Implementation Details:
+# - Uses shared memory for intermediate tensors (S, dP, dV, dK, dQ, P, dS) instead of Tensor Memory.
+# - Uses sm90_utils_basic.make_trivial_tiled_mma() with warpgroup.OperandMajorMode enums.
+# - Uses hopper_helpers.gemm_w_idx() for GEMM operations (SM90-style).
+# https://docs.nvidia.com/cuda/parallel-thread-execution/#tensorcore-5th-generation-instructions
 import math
 from typing import Callable, Optional
 from functools import partial
@@ -18,14 +25,15 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, const_expr
 from cutlass.utils import LayoutEnum
-from cutlass.cute.nvgpu import cpasync, tcgen05
-import cutlass.utils.blackwell_helpers as sm100_utils_basic
+from cutlass.cute.nvgpu import cpasync, warpgroup
+import cutlass.utils.hopper_helpers as sm90_utils_basic
+import cutlass.utils.blackwell_helpers as sm100_utils_basic  # For layout functions
 from cutlass.pipeline import PipelineAsync, PipelineConsumer
 
 from flash_attn.cute import utils
 from flash_attn.cute import copy_utils
 from flash_attn.cute import pipeline
-from flash_attn.cute.sm120_helpers import gemm_w_idx, gemm_ptx_w_idx  # noqa
+from flash_attn.cute.hopper_helpers import gemm_w_idx
 from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
@@ -87,7 +95,10 @@ class FlashAttentionBackwardSm120:
 
         self.acc_dtype = Float32
 
-        # SM120: Supports Thread Block Clusters like SM100
+        # SM120: Supports Thread Block Clusters (similar to SM100, but using SM90-style operations)
+        # Clusters allow multiple CTAs to coordinate work, improving memory bandwidth utilization
+        # Note: TMA multicast is NOT recommended on SM120 (would be emulated), but clusters
+        # can still be used for coordinated data loading without multicast
         assert cluster_size in (1, 2), "Only cluster_size=1 or 2 is supported"
         self.cluster_shape_mn = (cluster_size, 1)
         self.is_persistent = is_persistent
@@ -120,6 +131,18 @@ class FlashAttentionBackwardSm120:
                 self.empty_warp_id,
             )
         )
+
+        # SM120: Atom layouts for MMA operations (similar to SM90)
+        # Default atom layouts - can be tuned
+        self.AtomLayoutMSdP = 1  # For S and dP operations
+        self.AtomLayoutNdKV = 1  # For dK and dV operations
+        self.AtomLayoutMdQ = 1  # For dQ operations
+        # num_mma_warp_groups: 1 MMA warp = 1 warp group (128 threads)
+        self.num_mma_warp_groups = 1
+        self.SdP_swapAB = False
+        self.dKV_swapAB = False
+        self.dQ_swapAB = False
+        self.mma_dkv_is_rs = False  # Whether dK/dV use register source
 
         # NamedBarrier
         self.compute_sync_barrier = cutlass.pipeline.NamedBarrier(
@@ -169,56 +192,77 @@ class FlashAttentionBackwardSm120:
         self.dK_reduce_ncol = 32
 
     def _get_tiled_mma(self):
-        cta_group = tcgen05.CtaGroup.ONE
-        # S = K @ Q.T
-        tiled_mma_S = sm100_utils_basic.make_trivial_tiled_mma(
+        # S = K @ Q.T (equivalent to Q @ K.T in SM90)
+        # Note: SM120 uses K @ Q.T, so we need to adapt the atom layout
+        atom_layout_S = (self.AtomLayoutMSdP, self.num_mma_warp_groups // self.AtomLayoutMSdP)
+        tiler_mn_S = (self.tile_n // atom_layout_S[0], self.tile_m // atom_layout_S[1])
+        tiled_mma_S = sm90_utils_basic.make_trivial_tiled_mma(
             self.q_dtype,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.K,
-            self.acc_dtype,
-            cta_group,
-            self.mma_tiler_kq[:2],
-        )
-        # dP = V @ dO.T
-        tiled_mma_dP = sm100_utils_basic.make_trivial_tiled_mma(
-            self.do_dtype,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.K,
-            self.acc_dtype,
-            cta_group,
-            self.mma_tiler_vdo[:2],
-        )
-        # dV += P @ dO --> (K, MN) major
-        # dV += P @ dO
-        # SM120: P is in shared memory, not Tensor Memory
-        tiled_mma_dV = sm100_utils_basic.make_trivial_tiled_mma(
-            self.do_dtype,
-            tcgen05.OperandMajorMode.K,  # P_major_mode
-            tcgen05.OperandMajorMode.MN,  # dO_major_mode
-            self.acc_dtype,
-            cta_group,
-            self.mma_tiler_pdo[:2],
-            a_source=tcgen05.OperandSource.SMEM,  # SM120: P is in shared memory
-        )
-        # dK += dS.T @ Q
-        # SM120: dS is in shared memory, not Tensor Memory
-        tiled_mma_dK = sm100_utils_basic.make_trivial_tiled_mma(
-            self.do_dtype,
-            tcgen05.OperandMajorMode.K,  # dS_major_mode
-            tcgen05.OperandMajorMode.MN,  # Q_major_mode
-            self.acc_dtype,
-            cta_group,
-            self.mma_tiler_dsq[:2],
-            a_source=tcgen05.OperandSource.SMEM,  # SM120: dS is in shared memory
-        )
-        # dQ = dS @ K
-        tiled_mma_dQ = sm100_utils_basic.make_trivial_tiled_mma(
             self.k_dtype,
-            tcgen05.OperandMajorMode.MN,  # dS_major_mode
-            tcgen05.OperandMajorMode.MN,  # Kt_major_mode
+            warpgroup.OperandMajorMode.K,
+            warpgroup.OperandMajorMode.K,
             self.acc_dtype,
-            cta_group,
-            self.mma_tiler_dsk[:2],
+            atom_layout_mnk=(atom_layout_S if not self.SdP_swapAB else atom_layout_S[::-1]) + (1,),
+            tiler_mn=tiler_mn_S if not self.SdP_swapAB else tiler_mn_S[::-1],
+        )
+
+        # dP = V @ dO.T
+        atom_layout_dP = (self.AtomLayoutMSdP, self.num_mma_warp_groups // self.AtomLayoutMSdP)
+        tiler_mn_dP = (self.tile_n // atom_layout_dP[0], self.tile_m // atom_layout_dP[1])
+        tiled_mma_dP = sm90_utils_basic.make_trivial_tiled_mma(
+            self.v_dtype,
+            self.do_dtype,
+            warpgroup.OperandMajorMode.K,
+            warpgroup.OperandMajorMode.K,
+            self.acc_dtype,
+            atom_layout_mnk=(atom_layout_dP if not self.SdP_swapAB else atom_layout_dP[::-1])
+            + (1,),
+            tiler_mn=tiler_mn_dP if not self.SdP_swapAB else tiler_mn_dP[::-1],
+        )
+
+        # dV += P @ dO
+        # SM120: P is in shared memory
+        atom_layout_dV = (self.AtomLayoutNdKV, self.num_mma_warp_groups // self.AtomLayoutNdKV)
+        tiler_mn_dV = (self.tile_n // atom_layout_dV[0], self.tile_hdimv // atom_layout_dV[1])
+        tiled_mma_dV = sm90_utils_basic.make_trivial_tiled_mma(
+            self.do_dtype,
+            self.do_dtype,
+            warpgroup.OperandMajorMode.K,  # P_major_mode
+            warpgroup.OperandMajorMode.MN,  # dO_major_mode
+            self.acc_dtype,
+            atom_layout_mnk=(atom_layout_dV if not self.dKV_swapAB else atom_layout_dV[::-1])
+            + (1,),
+            tiler_mn=tiler_mn_dV if not self.dKV_swapAB else tiler_mn_dV[::-1],
+            a_source=warpgroup.OperandSource.SMEM,  # SM120: P is in shared memory
+        )
+
+        # dK += dS.T @ Q
+        # SM120: dS is in shared memory
+        atom_layout_dK = (self.AtomLayoutNdKV, self.num_mma_warp_groups // self.AtomLayoutNdKV)
+        tiler_mn_dK = (self.tile_n // atom_layout_dK[0], self.tile_hdim // atom_layout_dK[1])
+        tiled_mma_dK = sm90_utils_basic.make_trivial_tiled_mma(
+            self.do_dtype,
+            self.q_dtype,
+            warpgroup.OperandMajorMode.K,  # dS_major_mode
+            warpgroup.OperandMajorMode.MN,  # Q_major_mode
+            self.acc_dtype,
+            atom_layout_mnk=(atom_layout_dK if not self.dKV_swapAB else atom_layout_dK[::-1])
+            + (1,),
+            tiler_mn=tiler_mn_dK if not self.dKV_swapAB else tiler_mn_dK[::-1],
+            a_source=warpgroup.OperandSource.SMEM,  # SM120: dS is in shared memory
+        )
+
+        # dQ = dS @ K
+        atom_layout_dQ = (self.AtomLayoutMdQ, self.num_mma_warp_groups // self.AtomLayoutMdQ)
+        tiler_mn_dQ = (self.tile_m // atom_layout_dQ[0], self.tile_hdim // atom_layout_dQ[1])
+        tiled_mma_dQ = sm90_utils_basic.make_trivial_tiled_mma(
+            self.k_dtype,
+            self.k_dtype,
+            warpgroup.OperandMajorMode.K if not self.dQ_swapAB else warpgroup.OperandMajorMode.MN,
+            warpgroup.OperandMajorMode.MN if not self.dQ_swapAB else warpgroup.OperandMajorMode.K,
+            self.acc_dtype,
+            atom_layout_mnk=(atom_layout_dQ if not self.dQ_swapAB else atom_layout_dQ[::-1]) + (1,),
+            tiler_mn=tiler_mn_dQ if not self.dQ_swapAB else tiler_mn_dQ[::-1],
         )
         return tiled_mma_S, tiled_mma_dP, tiled_mma_dK, tiled_mma_dV, tiled_mma_dQ
 
@@ -464,8 +508,6 @@ class FlashAttentionBackwardSm120:
         ) = self._get_tiled_mma()
         self._setup_smem_layout()
 
-        cta_group = tcgen05.CtaGroup.ONE
-
         self.cluster_shape_mnk = (*self.cluster_shape_mn, 1)
         self.cluster_layout_vmnk = cute.tiled_divide(
             cute.make_layout(self.cluster_shape_mnk),
@@ -479,9 +521,11 @@ class FlashAttentionBackwardSm120:
             self.mdV_layout_enum = LayoutEnum.from_tensor(mdV)
             dK_major_mode = self.mdK_layout_enum.mma_major_mode()
             dV_major_mode = self.mdV_layout_enum.mma_major_mode()
-            if const_expr(dK_major_mode != tcgen05.OperandMajorMode.K):
+            # SM120: Using SM90-style operations, layout checks adapted
+            # Note: These checks may need adjustment based on actual SM120 behavior
+            if const_expr(dK_major_mode != warpgroup.OperandMajorMode.K):
                 raise RuntimeError("The layout of mdK is wrong")
-            if const_expr(dV_major_mode != tcgen05.OperandMajorMode.K):
+            if const_expr(dV_major_mode != warpgroup.OperandMajorMode.K):
                 raise RuntimeError("The layout of mdV is wrong")
 
         if const_expr(self.use_tma_store and self.qhead_per_kvhead == 1):
@@ -524,7 +568,8 @@ class FlashAttentionBackwardSm120:
                 Float32, 128, num_copy_elems=128 // Float32.width
             )
 
-        tma_load_op = cpasync.CopyBulkTensorTileG2SOp(cta_group)
+        # SM120: Using SM90-style TMA operations (no cta_group needed)
+        tma_load_op = cpasync.CopyBulkTensorTileG2SOp()
         # SM120: TMA multicast is not recommended (not implemented in hardware, would be emulated)
         # Always use non-multicast TMA operations even when cluster_size > 1
         # tma_load_op_multicast = cpasync.CopyBulkTensorTileG2SMulticastOp(cta_group)  # Not used for SM120
@@ -1222,11 +1267,13 @@ class FlashAttentionBackwardSm120:
             cutlass.pipeline.PipelineUserType.Producer, self.dO_stage
         )
 
-        # SM120: TMA multicast is not recommended, so multicast mask is always None
-        # Even though clusters are supported, each CTA loads its own data independently
+        # SM120: Thread Block Clusters are supported for coordinated work distribution
+        # TMA multicast is NOT recommended (not implemented in hardware, would be emulated)
+        # However, clusters can still be used: each CTA in the cluster loads its own data
+        # independently, but they coordinate through the cluster layout for work distribution
         cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(cta_rank_in_cluster)
-        q_do_mcast_mask = None  # SM120: Always None - no multicast TMA
+        q_do_mcast_mask = None  # SM120: Always None - no multicast TMA (but clusters still work)
 
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
@@ -1492,46 +1539,32 @@ class FlashAttentionBackwardSm120:
         tdQrdQ_reg = thr_smem_store_dQ.partition_S(tdQtdQ)
         tdQsdQ = thr_smem_store_dQ.partition_D(tdQcdQ)
 
-        # mma_qk_fn = partial(gemm_w_idx, tiled_mma_S, tStS, tSrK, tSrQ, zero_init=True)
-        mma_qk_fn = partial(
-            gemm_ptx_w_idx, tiled_mma_S, tStS, tSrK, tSrQ, sA=sK, sB=sQ, zero_init=True
-        )
-        # mma_dov_fn = partial(gemm_w_idx, tiled_mma_dP, tdPtdP, tdPrV, tdPrdOt, zero_init=True)
+        # SM120: Using SM90-style GEMM helpers
+        mma_qk_fn = partial(gemm_w_idx, tiled_mma_S, tStS, tSrK, tSrQ, zero_init=True)
         mma_dov_fn = partial(
-            gemm_ptx_w_idx,
+            gemm_w_idx,
             tiled_mma_dP,
             tdPtdP,
             tdPrV,
             tdPrdOt,
-            sA=sV,
-            sB=sdOt,
             zero_init=True,
         )
-        # mma_pdo_fn = partial(gemm_w_idx, tiled_mma_dV, tdVtdV, tdVrP, tdVrdO)
         # SM120: Use shared memory for P instead of Tensor Memory
         mma_pdo_fn = partial(
-            gemm_ptx_w_idx,
+            gemm_w_idx,
             tiled_mma_dV,
             tdVtdV,
             tdVrP,
             tdVrdO,
-            sA=sP,  # SM120: P is in shared memory
-            sB=sdO,
         )
         mma_dsk_fn = partial(gemm_w_idx, tiled_mma_dQ, tdQtdQ, tdQrdS, tdQrK, zero_init=True)
-        # mma_dsk_fn = partial(
-        #     gemm_ptx_w_idx, tiled_mma_dQ, tdQtdQ, tdQrdS, tdQrK, sA=sdS, sB=sKt, zero_init=True
-        # )
-        # mma_dsq_fn = partial(gemm_w_idx, tiled_mma_dK, tdKtdK, tdKrdS, tdKrQ)
         # SM120: Use shared memory for dS instead of Tensor Memory
         mma_dsq_fn = partial(
-            gemm_ptx_w_idx,
+            gemm_w_idx,
             tiled_mma_dK,
             tdKtdK,
             tdKrdS,
             tdKrQ,
-            sA=sdS_smem,  # SM120: dS is in shared memory
-            sB=sQt,
         )
 
         consumer_state_dO = cutlass.pipeline.make_pipeline_state(

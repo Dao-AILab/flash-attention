@@ -1,9 +1,18 @@
-# SM120 (RTX 50) forward implementation using tcgen05 SuperMMA instructions.
-# SM120 is a stripped-down version of SM100: it lacks Tensor Memory and UTCMMA,
-# and only supports smaller-tile "SuperMMA" operations.
-# SM120 DOES support Thread Block Clusters.
-# However, TMA multicast is NOT recommended on SM120 (not implemented in hardware, would be emulated).
-# Intermediate tensors (S, P, O) are stored in shared memory, not Tensor Memory.
+# SM120 (RTX 50) forward implementation using Ampere-style MMA instructions (similar to SM90).
+#
+# Architecture Notes:
+# - SM120 is more similar to SM90 (Ampere) than SM100 (Blackwell).
+# - SM120 does NOT support tcgen05 instructions (tcgen05 is only available on sm_100/sm_101/sm_110).
+# - Therefore, this implementation uses SM90-style warpgroup-based MMA operations instead.
+# - SM120 DOES support Thread Block Clusters (cluster_size can be 1 or 2).
+#   Clusters allow multiple CTAs to coordinate work distribution, improving memory bandwidth.
+#   Note: TMA multicast is NOT recommended on SM120 (not implemented in hardware, would be emulated),
+#   but clusters can still be used for coordinated data loading without multicast.
+#
+# Implementation Details:
+# - Uses shared memory for intermediate tensors (S, P, O) instead of Tensor Memory.
+# - Uses sm90_utils_basic.make_trivial_tiled_mma() with warpgroup.OperandMajorMode enums.
+# https://docs.nvidia.com/cuda/parallel-thread-execution/#tensorcore-5th-generation-instructions
 # Supported features:
 # - BF16 & FP16 dtype
 # - noncausal & causal attention
@@ -15,12 +24,6 @@
 # Unsupported features that will be added later:
 # - page size != 128
 # - more hdim (192, 256)
-# Based on the cutlass example and cute-dsl example:
-# https://github.com/NVIDIA/cutlass/tree/main/examples/77_blackwell_fmha
-# https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/blackwell/fmha.py
-# PTX references:
-# https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-mma-instructions-mma-sp
-# https://docs.nvidia.com/cuda/parallel-thread-execution/#tcgen05-instructions-tcgen05-shift
 
 import math
 from typing import Tuple, Callable, Optional, Literal
@@ -30,10 +33,10 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int32, const_expr
-from cutlass.cute.nvgpu import cpasync
-import cutlass.cute.nvgpu.tcgen05 as tcgen05
-import cutlass.utils.blackwell_helpers as sm100_utils_basic
+from cutlass import Float32, Int32, Boolean, const_expr
+from cutlass.cute.nvgpu import cpasync, warpgroup
+import cutlass.utils.hopper_helpers as sm90_utils_basic
+import cutlass.utils.blackwell_helpers as sm100_utils_basic  # For layout functions
 
 import flash_attn.cute.utils as utils
 from flash_attn.cute import copy_utils
@@ -43,7 +46,7 @@ from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute.block_sparsity import BlockSparseTensors
 from flash_attn.cute.pack_gqa import PackGQA
-from flash_attn.cute import sm120_helpers as sm120_utils
+from flash_attn.cute.hopper_helpers import gemm_w_idx
 from flash_attn.cute.fast_math import FastDivmod
 from flash_attn.cute.tile_scheduler import (
     TileSchedulerArguments,
@@ -141,6 +144,13 @@ class FlashAttentionForwardSm120:
         self.load_warp_id = 13
         self.epilogue_warp_ids = (14,)
         self.empty_warp_ids = (15,)
+
+        # SM120: Atom layouts for MMA operations (similar to SM90)
+        # Default atom layouts - can be tuned
+        self.AtomLayoutMQK = 1  # For QK operations
+        self.AtomLayoutMPV = 1  # For PV operations
+        # num_mma_warp_groups: 1 MMA warp = 1 warp group (128 threads)
+        self.num_mma_warp_groups = 1
 
         self.threads_per_cta = cute.arch.WARP_SIZE * len(
             (
@@ -292,11 +302,13 @@ class FlashAttentionForwardSm120:
         self.v_major_mode = cutlass.utils.LayoutEnum.from_tensor(mV).mma_major_mode()
         self.o_layout = cutlass.utils.LayoutEnum.from_tensor(mO)
 
-        if const_expr(self.q_major_mode != tcgen05.OperandMajorMode.K):
+        # SM120: Using SM90-style operations, layout checks adapted
+        # Note: These checks may need adjustment based on actual SM120 behavior
+        if const_expr(self.q_major_mode != warpgroup.OperandMajorMode.K):
             raise RuntimeError("The layout of mQ is not supported")
-        if const_expr(self.k_major_mode != tcgen05.OperandMajorMode.K):
+        if const_expr(self.k_major_mode != warpgroup.OperandMajorMode.K):
             raise RuntimeError("The layout of mK is not supported")
-        if const_expr(self.v_major_mode != tcgen05.OperandMajorMode.MN):
+        if const_expr(self.v_major_mode != warpgroup.OperandMajorMode.MN):
             raise RuntimeError("The layout of mV is not supported")
 
         # check type consistency
@@ -313,26 +325,42 @@ class FlashAttentionForwardSm120:
         ):
             self.e2e_freq = 32 if mCuSeqlensQ is not None or mSeqUsedQ is not None else 10
 
-        cta_group = tcgen05.CtaGroup.ONE
+        # SM120: Using SM90-style MMA operations (no cta_group needed)
         # SM120: the intermediate tensor p is from shared memory (not Tensor Memory) & mK-major
-        p_source = tcgen05.OperandSource.SMEM
-        p_major_mode = tcgen05.OperandMajorMode.K
-        tiled_mma_qk = sm100_utils_basic.make_trivial_tiled_mma(
-            self.q_dtype,
-            self.q_major_mode,
-            self.k_major_mode,
-            self.qk_acc_dtype,
-            cta_group,
-            self.mma_tiler_qk[:2],
+        p_source = warpgroup.OperandSource.SMEM
+        p_major_mode = warpgroup.OperandMajorMode.K
+
+        # QK MMA: Q @ K.T
+        atom_layout_qk = (self.AtomLayoutMQK, self.num_mma_warp_groups // self.AtomLayoutMQK)
+        tiler_mn_qk = (
+            self.m_block_size // atom_layout_qk[0],
+            self.n_block_size // atom_layout_qk[1],
         )
-        tiled_mma_pv = sm100_utils_basic.make_trivial_tiled_mma(
+        tiled_mma_qk = sm90_utils_basic.make_trivial_tiled_mma(
+            self.q_dtype,
+            self.k_dtype,
+            warpgroup.OperandMajorMode.K,  # Q major mode
+            warpgroup.OperandMajorMode.K,  # K major mode
+            self.qk_acc_dtype,
+            atom_layout_mnk=atom_layout_qk + (1,),
+            tiler_mn=tiler_mn_qk,
+        )
+
+        # PV MMA: P @ V
+        atom_layout_pv = (self.AtomLayoutMPV, self.num_mma_warp_groups // self.AtomLayoutMPV)
+        tiler_mn_pv = (
+            self.m_block_size // atom_layout_pv[0],
+            self.head_dim_v_padded // atom_layout_pv[1],
+        )
+        tiled_mma_pv = sm90_utils_basic.make_trivial_tiled_mma(
             self.v_dtype,
-            p_major_mode,
-            self.v_major_mode,
+            self.v_dtype,
+            p_major_mode,  # P major mode (K)
+            warpgroup.OperandMajorMode.MN,  # V major mode
             self.pv_acc_dtype,
-            cta_group,
-            self.mma_tiler_pv[:2],
-            p_source,
+            atom_layout_mnk=atom_layout_pv + (1,),
+            tiler_mn=tiler_mn_pv,
+            a_source=p_source,  # SM120: P is in shared memory
         )
 
         self.cluster_shape_mnk = (*self.cluster_shape_mn, 1)
@@ -465,7 +493,8 @@ class FlashAttentionForwardSm120:
         # TMA load for Q
         # SM120: TMA multicast is not recommended (not implemented in hardware, would be emulated)
         # Always use non-multicast TMA operations even when cluster_size > 1
-        tma_load_op = cpasync.CopyBulkTensorTileG2SOp(cta_group)
+        # SM120: Using SM90-style TMA operations (no cta_group needed)
+        tma_load_op = cpasync.CopyBulkTensorTileG2SOp()
         tma_store_op = cpasync.CopyBulkTensorTileS2GOp()
 
         tma_atom_Q, tma_tensor_Q = cute.nvgpu.make_tiled_tma_atom_A(
@@ -1254,7 +1283,7 @@ class FlashAttentionForwardSm120:
 
         qk_mma_op, pv_mma_op = tiled_mma_qk.op, tiled_mma_pv.op
 
-        # SM120: Create register fragments for S accumulator (tcgen05.mma accumulator is in registers)
+        # SM120: Create register fragments for S accumulator (warpgroup.mma accumulator is in registers)
         thr_mma_qk = tiled_mma_qk.get_slice(0)  # Get thread-level MMA for creating fragments
         qk_acc_shape = thr_mma_qk.partition_shape_C(self.mma_tiler_qk[:2])
         tSrSs = tuple(thr_mma_qk.make_fragment_C(qk_acc_shape) for stage in range(2))
@@ -1273,28 +1302,9 @@ class FlashAttentionForwardSm120:
 
         # SM120: Create shared memory tensors for P
         sP_stages = (sP[None, None, None, 0], sP[None, None, None, 1])
-        # For SM120, accumulator is in registers, so pass register addresses to gemm_ptx_partial
-        gemm_Si = [
-            partial(
-                sm120_utils.gemm_ptx_partial,
-                qk_mma_op,
-                tSrSs[stage].iterator.toint(),  # SM120: Use register accumulator address
-                tSrQs[stage],
-                sA=sQ[None, None, None, stage],
-                zero_init=True,
-            )
-            for stage in range(2)
-        ]
-        gemm_Pi = [
-            partial(
-                sm120_utils.gemm_ptx_partial,
-                pv_mma_op,
-                tOtOs[stage].iterator.toint(),  # SM120: O accumulator is in registers
-                tOrPs[stage],
-                sA=sP_stages[stage if self.q_stage == 2 else 0],  # SM120: P is in shared memory
-            )
-            for stage in range(2)
-        ]
+        # SM120: Using SM90-style GEMM operations with register accumulators
+        # S accumulator is in registers (tSrSs), O accumulator is in registers (tOtOs)
+        # gemm_w_idx will be called directly with stage-specific accumulators and fragments
 
         mma_q_consumer_phase = Int32(0)
         mma_kv_consumer_state = cutlass.pipeline.make_pipeline_state(
@@ -1327,13 +1337,18 @@ class FlashAttentionForwardSm120:
                     # are empty. For subsequent iterations, the wait happened at the end
                     # of the while loop.
                     # 3. gemm
-                    # tiled_mma_qk = sm120_utils.gemm(tiled_mma_qk, tStSs[stage], tSrQs[stage], tSrKi, zero_init=True)
-                    sK_cur = sK[None, None, None, mma_kv_consumer_state.index]
-                    if const_expr(self.uneven_kv_smem):
-                        sK_cur = self.offset_kv_smem(
-                            sK_cur, mma_kv_consumer_state.index, mma_kv_consumer_state.phase
-                        )
-                    gemm_Si[stage](tCrB=tSrKi, sB=sK_cur)
+                    # SM120: Using SM90-style GEMM with register accumulator
+                    tSrKi = tSrK[None, None, None, mma_kv_consumer_state.index]
+                    gemm_w_idx(
+                        tiled_mma_qk,
+                        tSrSs[stage],
+                        tSrQs[stage],
+                        tSrKi,
+                        A_idx=None,
+                        B_idx=None,
+                        zero_init=True,
+                        wg_wait=-1,
+                    )
                     # SM120: Store S accumulator from registers to shared memory
                     cute.copy(thr_smem_store_S, tSrS_regs[stage], tSsS_stages[stage])
                     cute.arch.fence_proxy(
@@ -1341,8 +1356,9 @@ class FlashAttentionForwardSm120:
                         space=cute.arch.SharedSpace.shared_cta,
                     )
                     # 4. release S0 / S1
+                    # SM120: Using regular mbarrier instead of tcgen05.commit
                     with cute.arch.elect_one():
-                        tcgen05.commit(mbar_ptr + self.mbar_S_full_offset + stage)
+                        cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_S_full_offset + stage)
                 mma_q_consumer_phase ^= 1
                 # 5. release K0
                 pipeline_kv.consumer_release(mma_kv_consumer_state)
@@ -1370,17 +1386,17 @@ class FlashAttentionForwardSm120:
                             P_full_O_rescaled_phase,
                         )
                         # 3. gemm
-                        # sm120_utils.gemm(tiled_mma_pv, tOtO0, tOrP0, tOrVi, zero_init=True)
-                        # gemm_Pi[stage](tCrB=tOrVi, sB=sV[None, None, None, Vi_index], zero_init=not O_should_accumulate)
-                        sV_cur = sV[None, None, None, Vi_index]
-                        if const_expr(self.uneven_kv_smem):
-                            sV_cur = self.offset_kv_smem(sV_cur, Vi_index, Vi_phase)
-                        gemm_Pi[stage](
-                            tCrB=tOrVi,
-                            sB=sV_cur,
-                            zero_init=not O_should_accumulate,
-                            mbar_ptr=mbar_ptr + self.mbar_P_full_2_offset + stage,
-                            mbar_phase=P_full_O_rescaled_phase,
+                        # SM120: Using SM90-style GEMM with register accumulator
+                        tOrVi = tOrV[None, None, None, Vi_index]
+                        gemm_w_idx(
+                            tiled_mma_pv,
+                            tOtOs[stage],
+                            tOrPs[stage],
+                            tOrVi,
+                            A_idx=None,
+                            B_idx=None,
+                            zero_init=Boolean(not O_should_accumulate),
+                            wg_wait=-1,
                         )
                         # 4. release accumulated O0_partial / O1_partial
                         # Don't need to signal O_full to the correction warps anymore since the
@@ -1408,11 +1424,18 @@ class FlashAttentionForwardSm120:
                         # Don't need to wait for the softmax warp to have finished reading the previous
                         # Si, since this gemm is scheduled after the PV gemm, which guaranteed that Si
                         # has been read and Pi has been written.
-                        # tiled_mma_qk = sm120_utils.gemm(tiled_mma_qk, tStSs[stage], tSrQs[stage], tSrK[None, None, None, Ki_index], zero_init=True)
-                        sK_cur = sK[None, None, None, Ki_index]
-                        if const_expr(self.uneven_kv_smem):
-                            sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
-                        gemm_Si[stage](tCrB=tSrK[None, None, None, Ki_index], sB=sK_cur)
+                        # SM120: Using SM90-style GEMM with register accumulator
+                        tSrKi = tSrK[None, None, None, Ki_index]
+                        gemm_w_idx(
+                            tiled_mma_qk,
+                            tSrSs[stage],
+                            tSrQs[stage],
+                            tSrKi,
+                            A_idx=None,
+                            B_idx=None,
+                            zero_init=True,
+                            wg_wait=-1,
+                        )
                         # SM120: Store S accumulator from registers to shared memory
                         cute.copy(thr_smem_store_S, tSrS_regs[stage], tSsS_stages[stage])
                         cute.arch.fence_proxy(
@@ -1420,8 +1443,9 @@ class FlashAttentionForwardSm120:
                             space=cute.arch.SharedSpace.shared_cta,
                         )
                         # 3. release S0
+                        # SM120: Using regular mbarrier instead of tcgen05.commit
                         with cute.arch.elect_one():
-                            tcgen05.commit(mbar_ptr + self.mbar_S_full_offset + stage)
+                            cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_S_full_offset + stage)
                         # End of GEMM_QK0i (Q0 * Ki -> S0)
                     # 4. release Ki
                     pipeline_kv.consumer_release(mma_kv_consumer_state)
@@ -1431,9 +1455,10 @@ class FlashAttentionForwardSm120:
                 # End of seqlen_kv loop
 
                 # release Q0 & Q1
+                # SM120: Using regular mbarrier instead of tcgen05.commit
                 with cute.arch.elect_one():
                     for stage in cutlass.range_constexpr(self.q_stage):
-                        tcgen05.commit(mbar_ptr + self.mbar_load_q_empty_offset + stage)
+                        cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_load_q_empty_offset + stage)
 
                 # GEMM_PV00 (P0 * V0 -> O0_partial), O0 needs to be accumulated in the seqlen_kv loop
                 # 1. wait for V0
@@ -1447,25 +1472,26 @@ class FlashAttentionForwardSm120:
                         P_full_O_rescaled_phase,
                     )
                     # 3. gemm
-                    # sm100_utils.gemm(tiled_mma_pv, tOtO0, tOrP0, tOrVi, zero_init=True)
-                    # gemm_Pi[stage](tCrB=tOrVi, sB=sV[None, None, None, Vi_index], zero_init=not O_should_accumulate)
-                    sV_cur = sV[None, None, None, Vi_index]
-                    if const_expr(self.uneven_kv_smem):
-                        sV_cur = self.offset_kv_smem(sV_cur, Vi_index, Vi_phase)
-                    gemm_Pi[stage](
-                        tCrB=tOrVi,
-                        sB=sV_cur,
-                        zero_init=not O_should_accumulate,
-                        mbar_ptr=mbar_ptr + self.mbar_P_full_2_offset + stage,
-                        mbar_phase=P_full_O_rescaled_phase,
+                    # SM120: Using SM90-style GEMM with register accumulator
+                    tOrVi = tOrV[None, None, None, Vi_index]
+                    gemm_w_idx(
+                        tiled_mma_pv,
+                        tOtOs[stage],
+                        tOrPs[stage],
+                        tOrVi,
+                        A_idx=None,
+                        B_idx=None,
+                        zero_init=Boolean(not O_should_accumulate),
+                        wg_wait=-1,
                     )
                     # 4. release accumulated O0_partial
                     # We do need O_full here since for the last tile, by the time the softmax warp
                     # has signaled to the correction warp, the softmax warp has just finished compute
                     # the row sum of the current tile. It does not guarantee that the 1st tile
                     # of the next work tile has been computed yet.
+                    # SM120: Using regular mbarrier instead of tcgen05.commit
                     with cute.arch.elect_one():
-                        tcgen05.commit(mbar_ptr + self.mbar_O_full_offset + stage)
+                        cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_O_full_offset + stage)
                     # End of GEMM_PV00 (P0 * V0 -> O0_partial)
                 P_full_O_rescaled_phase ^= 1
                 # 5. release Vi_end
