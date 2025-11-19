@@ -356,7 +356,6 @@ def _run_mask_test(
     )
 
 
-@pytest.mark.skipif(COMPUTE_CAPABILITY < 10, reason="IMA mask exercises SM100-specific path")
 def test_mask_mod_ima_partial_block():
     _run_mask_test(
         seqlen_q=257,
