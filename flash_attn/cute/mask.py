@@ -302,6 +302,7 @@ class AttentionMask:
         batch_idx: Int32 = None,
         head_idx: Int32 = None,
         aux_tensors: Optional[list] = None,
+        fastdiv_mods=(None, None),
     ) -> None:
         assert not (mask_causal and mask_local), "mask_causal and mask_local cannot be both True"
         acc_shape = (self.tile_m, self.tile_n)
@@ -328,6 +329,14 @@ class AttentionMask:
 
         elif const_expr(not mask_causal and not mask_local and mask_mod is not None):
             # Block sparse case w/ mask_mod
+            has_fastdiv = const_expr(
+                fastdiv_mods is not None
+                and fastdiv_mods[0] is not None
+                and fastdiv_mods[1] is not None
+            )
+            wrap_aux_indices = const_expr(
+                has_fastdiv and mask_seqlen and const_expr(aux_tensors is not None)
+            )
             batch_idx_ssa = utils.scalar_to_ssa(batch_idx, cutlass.Int32)
             head_idx_ssa = utils.scalar_to_ssa(head_idx, cutlass.Int32)
             row_coord_first = tScS_t2r[0][0]
@@ -336,17 +345,24 @@ class AttentionMask:
                 mask_row = global_row // self.qhead_per_kvhead_packgqa
             else:
                 mask_row = global_row
-            mask_row_ssa = utils.scalar_to_ssa(mask_row, cutlass.Int32)
+            mask_row_for_mod = mask_row
+            if const_expr(wrap_aux_indices):
+                _, mask_row_for_mod = fastdiv_mods[0].divmod(mask_row)
+            mask_row_ssa = utils.scalar_to_ssa(mask_row_for_mod, cutlass.Int32)
 
             ncol = const_expr(cute.size(tScS_t2r.shape))
             for i in cutlass.range_constexpr(ncol):
                 col_coord = tScS_t2r[i][1] if not self.swap_AB else tScS_t2r[i][0]
                 global_col = col_coord + n_block * self.tile_n
+                global_col_for_mod = global_col
+                if const_expr(wrap_aux_indices):
+                    _, global_col_for_mod = fastdiv_mods[1].divmod(global_col)
+                kv_idx_ssa = utils.scalar_to_ssa(global_col_for_mod, cutlass.Int32)
                 mask_value = mask_mod(
                     batch_idx_ssa,
                     head_idx_ssa,
                     mask_row_ssa,
-                    utils.scalar_to_ssa(global_col, cutlass.Int32),
+                    kv_idx_ssa,
                     aux_tensors,
                 )
                 cond = cutlass.Boolean(utils.ssa_to_scalar(mask_value))
