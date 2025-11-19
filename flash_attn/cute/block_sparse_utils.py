@@ -5,7 +5,7 @@ This module contains runtime execution functions for block-sparse attention kern
 These utilities are used by CUTE DSL kernels to produce and consume block-sparse loads.
 """
 
-from typing import Callable
+from typing import Callable, Optional
 from functools import partial
 import math
 import cutlass
@@ -606,6 +606,9 @@ def handle_block_sparse_empty_tile_correction_sm100(
     o_corr_consumer_phase: Int32,
     corr_epi_producer_phase: Int32,
     softmax_scale_log2: Float32,
+    mO_cur: Optional[cute.Tensor] = None,
+    gO: Optional[cute.Tensor] = None,
+    gmem_tiled_copy_O: Optional[cute.TiledCopy] = None,
 ):
     """Handle the block-sparse case where a tile is fully masked:
     * zero staged results
@@ -650,18 +653,26 @@ def handle_block_sparse_empty_tile_correction_sm100(
         )
         cute.arch.mbarrier_arrive(mbar_ptr + mbar_softmax_corr_empty_offset + stage)
 
-        cute.arch.mbarrier_wait(
-            mbar_ptr + mbar_corr_epi_empty_offset + stage,
-            corr_epi_producer_phase,
-        )
+        if const_expr(gmem_tiled_copy_O is None):
+            cute.arch.mbarrier_wait(
+                mbar_ptr + mbar_corr_epi_empty_offset + stage,
+                corr_epi_producer_phase,
+            )
         correction_epilogue(
             thr_mma_pv,
             tOtOs[stage],
             tidx,
+            stage,
+            m_block,
+            seqlen.seqlen_q,
             Float32(0.0),  # zero scale ensures empty tile writes zeros into staged outputs
             sO[None, None, stage],
+            mO_cur,
+            gO,
+            gmem_tiled_copy_O,
         )
-        cute.arch.mbarrier_arrive(mbar_ptr + mbar_corr_epi_full_offset + stage)
+        if const_expr(gmem_tiled_copy_O is None):
+            cute.arch.mbarrier_arrive(mbar_ptr + mbar_corr_epi_full_offset + stage)
         cute.arch.mbarrier_arrive(mbar_ptr + mbar_P_full_O_rescaled_offset + stage)
         cute.arch.mbarrier_arrive(mbar_ptr + mbar_P_full_2_offset + stage)
 

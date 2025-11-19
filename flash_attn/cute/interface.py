@@ -476,14 +476,16 @@ def _flash_attn_fwd(
                 m_block_size=m_block_size,
                 n_block_size=n_block_size,
                 is_persistent=not causal
-                and not local
-                and cu_seqlens_q is None
-                and seqused_q is None
-                and not is_split_kv,
+                    and not local
+                    and cu_seqlens_q is None
+                    and seqused_q is None
+                    and not is_split_kv,
                 score_mod=score_mod,
                 mask_mod=mask_mod,
                 has_aux_tensors=aux_tensors is not None,
                 paged_kv_non_tma=page_size not in [None, 128],
+                is_varlen_q=cu_seqlens_q is not None
+                    or seqused_q is not None,
             )
         elif compute_capability == 12:
             assert page_size == None or page_size % n_block_size == 0, f"Only page_size values that are multiples of {n_block_size} are supported for paged KV on SM 12.0"
