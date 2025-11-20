@@ -234,11 +234,13 @@ class FlashPrepareScheduler:
             cute.arch.sync_threads()
 
             total_blocks = total_blocks_smem[0]
-            blocks_per_sm = cute.ceil_div(total_blocks * 110 // 100 * num_head, num_sm)
+            blocks_per_sm = cute.ceil_div(total_blocks * num_head, num_sm) # TODO: figure out fudge factor
             num_splits_dynamic = cutlass.max(
-                cutlass.min(cute.ceil_div(num_n_blocks, blocks_per_sm), num_splits_static), Int32(1)
+                cutlass.min(num_n_blocks // blocks_per_sm, num_splits_static), Int32(1)
             )
             num_n_blocks = cute.ceil_div(num_n_blocks, num_splits_dynamic)
+            if cute.arch.thread_idx()[0] == 0:
+                cute.printf("total_blocks: %d", total_blocks)
 
         if const_expr(self.sort):
             # TODO: Implement sort logic
@@ -463,7 +465,7 @@ def prepare_varlen_num_blocks(
     if cache_key not in prepare_varlen_num_blocks.compile_cache:
         # Create scheduler instance
         scheduler = FlashPrepareScheduler(packgqa=packgqa, sort=sort, num_batch=num_batch)
-
+        print(f"num_sm: {num_sm}")
         prepare_varlen_num_blocks.compile_cache[cache_key] = cute.compile(
             scheduler,
             seqlen_q,

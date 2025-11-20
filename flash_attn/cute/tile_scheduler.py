@@ -573,24 +573,21 @@ class SingleTileVarlenScheduler:
         return (total_blocks_max * params.num_head, params.num_splits, Int32(1))
 
     @cute.jit
-    def _get_num_splits(self, lane: Int32, bidb_start: Int32) -> Int32:
+    def _get_num_splits(self, batch_idx: Int32) -> Int32:
         params = self.params
-        batch_idx = lane + bidb_start
-        is_valid = batch_idx < params.num_batch and lane < cute.arch.WARP_SIZE - 1
-        num_splits = Int32(0)
+        is_valid = batch_idx < params.num_batch
+        num_splits = Int32(1)
 
-        if const_expr(not params.is_split_kv):
-            num_splits = Int32(1) if is_valid else Int32(0)
-        elif const_expr(params.has_metadata_tensors):
-            # Dynamic splits from batch index
-            if is_valid:
-                num_splits = params.num_splits_dynamic_ptr[batch_idx]
+        if const_expr(params.is_split_kv):
+            if const_expr(params.has_metadata_tensors):
+                # Dynamic splits from batch index
+                if is_valid:
+                    num_splits = params.num_splits_dynamic_ptr[batch_idx]
+                else:
+                    num_splits = Int32(0)
             else:
-                num_splits = Int32(0)
-        else:
-            # Static splits via divmod
-            num_splits = params.num_splits_divmod.divisor if is_valid else Int32(0)
-
+                # Static splits via divmod
+                num_splits = params.num_splits_divmod.divisor if is_valid else Int32(0)
         return num_splits
 
     @cute.jit
@@ -620,134 +617,99 @@ class SingleTileVarlenScheduler:
     def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
         params = self.params
         lane_idx = cute.arch.lane_idx()
-        # Start from batch 0
-        bidb = Int32(0)
-        group_start_tile = Int32(0)
-        next_tile_idx = self._tile_idx
-
-        # Get num_m_blocks and num_splits for batches starting from bidb
-        num_m_blocks = self._get_num_m_blocks(lane_idx, bidb_start=bidb)
-        num_splits = self._get_num_splits(lane_idx, bidb_start=bidb)
-
-        # if split, we effectively have (blocks * splits) work items per head
-        num_split_m_blocks = (
-            num_m_blocks * num_splits if const_expr(params.is_split_kv) else num_m_blocks
-        )
-
-        num_m_blocks_cumulative = utils.warp_prefix_sum(num_split_m_blocks, lane_idx)
+        num_m_blocks = self._get_num_m_blocks(lane_idx, bidb_start=0)
+        num_m_blocks_cumulative = utils.warp_prefix_sum(num_m_blocks, lane_idx)
+        # Total number of blocks for the next 31 batches
         m_blocks_in_group = cute.arch.shuffle_sync(num_m_blocks_cumulative, cute.arch.WARP_SIZE - 1)
-        group_end_tile = group_start_tile + m_blocks_in_group * params.num_head
-
-        # Find which batch group contains next_tile_idx
+        # Same for all lanes
+        group_end_tile = m_blocks_in_group * params.num_head
+        # if cute.arch.thread_idx()[0] == 128 + 31: cute.printf("SingleTileVarlenScheduler: tile_idx=%d, group_end_tile = %d, num_m_blocks=%d, num_m_blocks_cumulative = %d, m_blocks_in_group = %d", self._tile_idx, group_end_tile, num_m_blocks, num_m_blocks_cumulative, m_blocks_in_group)
+        block, head_idx, batch_idx = Int32(0), Int32(0), Int32(0)
+        next_tile_idx = self._tile_idx
         while group_end_tile <= next_tile_idx:
-            bidb += cute.arch.WARP_SIZE - 1
-            if bidb >= params.num_batch:
-                bidb = Int32(params.num_batch)
+            batch_idx += cute.arch.WARP_SIZE - 1
+            if batch_idx >= params.num_batch:
+                batch_idx = Int32(params.num_batch)
                 group_end_tile = next_tile_idx + 1
             else:
-                group_start_tile = group_end_tile
-                num_m_blocks = self._get_num_m_blocks(lane_idx, bidb_start=bidb)
-                num_splits = self._get_num_splits(lane_idx, bidb_start=bidb)
-                num_split_m_blocks = (
-                    num_m_blocks * num_splits if const_expr(params.is_split_kv) else num_m_blocks
-                )
-                num_m_blocks_cumulative = utils.warp_prefix_sum(num_split_m_blocks, lane_idx)
+                num_m_blocks = self._get_num_m_blocks(lane_idx, bidb_start=batch_idx)
+                num_m_blocks_cumulative = utils.warp_prefix_sum(num_m_blocks, lane_idx)
                 m_blocks_in_group = cute.arch.shuffle_sync(
                     num_m_blocks_cumulative, cute.arch.WARP_SIZE - 1
                 )
                 group_end_tile += m_blocks_in_group * params.num_head
-
-        block, head_idx = Int32(0), Int32(0)
-        split_idx = Int32(0)
-
-        if bidb < params.num_batch:
+        is_valid = False
+        if batch_idx >= params.num_batch:
+            block, head_idx, batch_idx = Int32(0), Int32(0), Int32(params.num_batch)
+        else:
             group_start_tile = group_end_tile - m_blocks_in_group * params.num_head
-
+            # if cute.arch.thread_idx()[0] == 128 + 31: cute.printf("SingleTileVarlenScheduler: tile_idx=%d, group_end_tile = %d, num_m_blocks=%d, batch_idx = %d", self._tile_idx, group_end_tile, num_m_blocks, batch_idx)
+            # The next problem to process is the first one that does not have ending tile position
+            # that is greater than or equal to tile index.
             batch_idx_in_group = cute.arch.popc(
                 cute.arch.vote_ballot_sync(
                     group_start_tile + num_m_blocks_cumulative * params.num_head <= next_tile_idx
                 )
             )
-            bidb += batch_idx_in_group
-
-            num_m_blocks = cute.arch.shuffle_sync(num_m_blocks, batch_idx_in_group)
-            if const_expr(params.is_split_kv):
-                num_splits = cute.arch.shuffle_sync(num_splits, batch_idx_in_group)
-
+            batch_idx += batch_idx_in_group
             num_m_blocks_prev_lane = (
-                Int32(0)
+                0
                 if batch_idx_in_group == 0
                 else cute.arch.shuffle_sync(num_m_blocks_cumulative, batch_idx_in_group - 1)
             )
-            group_start_tile += num_m_blocks_prev_lane * params.num_head
-
-            # mh_block is the remainder offset within this specific batch
-            mh_block = next_tile_idx - group_start_tile
-
+            num_m_blocks = cute.arch.shuffle_sync(num_m_blocks, batch_idx_in_group)
+            mh_block = next_tile_idx - group_start_tile - num_m_blocks_prev_lane * params.num_head
             if cutlass.const_expr(params.lpt):
-                if const_expr(not params.is_split_kv):
-                    # LPT logic for non-split
-                    nheads_in_l2 = Int32(1)
-                    if const_expr(params.qhead_per_kvhead_packgqa > 1):
-                        nheads_in_l2 = params.qhead_per_kvhead_packgqa
-
-                    num_n_blocks = (
-                        (num_m_blocks * params.tile_shape_mn[0])
-                        // params.qhead_per_kvhead_packgqa
-                        // params.tile_shape_mn[1]
+                # This is a version of the SingleTileLPTScheduler, complicated by the fact that
+                # the seqlen can vary per batch.
+                # TODO: is there any case where num_m_blocks is 0?
+                # TODO: by right we should read the seqlen_kv but we're assuming seqlen_q == seqlen_k here
+                num_n_blocks = (
+                    num_m_blocks
+                    * params.tile_shape_mn[0]
+                    // params.qhead_per_kvhead_packgqa
+                    // params.tile_shape_mn[1]
+                )
+                # nheads_in_l2 = min(max(self.max_kvblock_in_l2 // num_n_blocks, 1), self.num_head)
+                # Seems faster to have this be a power of 2
+                nheads_in_l2 = (
+                    16
+                    if num_n_blocks * 16 <= params.max_kvblock_in_l2
+                    else (
+                        8
+                        if num_n_blocks * 8 <= params.max_kvblock_in_l2
+                        else (
+                            4
+                            if num_n_blocks * 4 <= params.max_kvblock_in_l2
+                            else (2 if num_n_blocks * 2 <= params.max_kvblock_in_l2 else 1)
+                        )
                     )
-
-                    # Heuristic for nheads_in_l2
-                    nheads_in_l2 = 1
-                    if num_n_blocks * 16 <= params.max_kvblock_in_l2:
-                        nheads_in_l2 = 16
-                    elif num_n_blocks * 8 <= params.max_kvblock_in_l2:
-                        nheads_in_l2 = 8
-                    elif num_n_blocks * 4 <= params.max_kvblock_in_l2:
-                        nheads_in_l2 = 4
-                    elif num_n_blocks * 2 <= params.max_kvblock_in_l2:
-                        nheads_in_l2 = 2
-
-                    nheads_in_l2 = min(nheads_in_l2, params.num_head)
-                    mh_in_l2 = nheads_in_l2 * num_m_blocks
-                    section_idx = mh_block // mh_in_l2
-                    l2_mod = mh_block - section_idx * mh_in_l2
-
-                    nheads_remainder = params.num_head - section_idx * nheads_in_l2
-                    nheads_in_this_section = (
-                        nheads_in_l2
-                        if nheads_in_l2 * (section_idx + 1) <= params.num_head
-                        else nheads_remainder
-                    )
-
-                    block = l2_mod // nheads_in_this_section
-                    head_idx_residual = l2_mod - block * nheads_in_this_section
-                    head_idx = section_idx * nheads_in_l2 + head_idx_residual
-                    block = num_m_blocks - 1 - block
-                else:
-                    # LPT + Split
-                    head_idx = mh_block // num_m_blocks
-                    block = mh_block - head_idx * num_m_blocks
-
-                    bidh_actual = head_idx // num_splits
-                    split_idx = head_idx - bidh_actual * num_splits
-                    head_idx = bidh_actual
-
-                    block = num_m_blocks - 1 - block
-
+                )
+                nheads_in_l2 = min(nheads_in_l2, params.num_head)
+                mh_in_l2 = nheads_in_l2 * num_m_blocks
+                section_idx = mh_block // mh_in_l2
+                l2_mod = mh_block - section_idx * mh_in_l2
+                # Deal with tail section
+                nheads_in_this_section = (
+                    nheads_in_l2
+                    if nheads_in_l2 * (section_idx + 1) <= params.num_head
+                    else params.num_head - section_idx * nheads_in_l2
+                )
+                block = l2_mod // nheads_in_this_section
+                head_idx_residual = l2_mod - block * nheads_in_this_section
+                head_idx = section_idx * nheads_in_l2 + head_idx_residual
+                block = num_m_blocks - 1 - block
             else:
-                # Non-LPT
                 head_idx = mh_block // num_m_blocks
                 block = mh_block - head_idx * num_m_blocks
+            is_valid = self._is_first_block and batch_idx < params.num_batch
+        # if cute.arch.thread_idx()[0] == 128: cute.printf("SingleTileVarlenScheduler: tile_idx=%d, batch_idx=%d, head_idx=%d, block=%d, is_valid = %d", self._tile_idx, batch_idx, head_idx, block, is_valid)
 
-                if const_expr(params.is_split_kv):
-                    bidh_actual = head_idx // num_splits
-                    split_idx = head_idx - bidh_actual * num_splits
-                    head_idx = bidh_actual
-
-        is_valid = self._is_first_block and bidb < params.num_batch
-
-        return WorkTileInfo((Int32(block), Int32(head_idx), Int32(bidb), split_idx), is_valid)
+        num_splits = self._get_num_splits(batch_idx)
+        split_idx = self._split_idx if const_expr(params.is_split_kv) else Int32(0)
+        if const_expr(params.num_splits_dynamic_ptr is not None) and split_idx >= num_splits:
+            is_valid = False
+        return WorkTileInfo((Int32(block), Int32(head_idx), Int32(batch_idx), split_idx), is_valid)
 
     def initial_work_tile_info(self, *, loc=None, ip=None):
         return self.get_current_work(loc=loc, ip=ip)
