@@ -586,8 +586,8 @@ def cvt_f16(src: cute.Tensor, dst_or_dtype):
             dst_i32[i] = cvt_f16x2_f32(src[2 * i], src[2 * i + 1], dst.element_type)
 
 
-@cute.jit
 @dsl_user_op
+@cute.jit
 def evaluate_polynomial(x: Float32, poly: Tuple[Float32, ...], *, loc=None, ip=None) -> Float32:
     deg = len(poly) - 1
     out = poly[deg]
@@ -596,8 +596,8 @@ def evaluate_polynomial(x: Float32, poly: Tuple[Float32, ...], *, loc=None, ip=N
     return out
 
 
-@cute.jit
 @dsl_user_op
+@cute.jit
 def evaluate_polynomial_2(x: Float32, y: Float32, poly: Tuple[Float32, ...], *, loc=None, ip=None) -> Tuple[Float32, Float32]:
     deg = len(poly) - 1
     out = (poly[deg], poly[deg])
