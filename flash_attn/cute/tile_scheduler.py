@@ -284,11 +284,15 @@ class StaticPersistentTileScheduler:
         is_valid = self._tile_idx < self.params.total_blocks
         # if cute.arch.thread_idx()[0] == 0:
         #     cute.printf("TileScheduler: tile_idx=%d, hn_idx=%d, block_idx=%d, batch_idx=%d, head_idx=%d, is_valid=%d", self._tile_idx, hn_idx, block_idx, batch_idx, head_idx, is_valid)
+        if const_expr(self.params.is_split_kv):
+            head_idx, split_idx = self.params.num_head_divmod.divmod(head_idx)
+        else:
+            split_idx = Int32(0)
         num_splits = self._get_num_splits(batch_idx)
-        if const_expr(self.params.num_splits_dynamic_ptr is not None) and head_idx >= num_splits:
+        if const_expr(self.params.num_splits_dynamic_ptr is not None) and split_idx >= num_splits:
             is_valid = False
         return WorkTileInfo(
-            (Int32(block_idx), Int32(head_idx), Int32(batch_idx), Int32(0)), is_valid
+            (Int32(block_idx), Int32(head_idx), Int32(batch_idx), Int32(split_idx)), is_valid
         )
 
     def initial_work_tile_info(self, *, loc=None, ip=None):
@@ -401,7 +405,7 @@ class SingleTileLPTScheduler:
         ip=None,
     ) -> Tuple[Int32, Int32, Int32]:
         return (params.total_blocks, params.num_splits, Int32(1))
-    
+
     @cute.jit
     def _get_num_splits(self, batch_idx: Int32) -> Int32:
         params = self.params
@@ -797,8 +801,15 @@ class SingleTileVarlenScheduler:
                 head_idx = mh_block // num_m_blocks
                 block = mh_block - head_idx * num_m_blocks
             is_valid = self._is_first_block and batch_idx < params.num_batch
-        # if cute.arch.thread_idx()[0] == 128: 
-        #     cute.printf("SingleTileVarlenScheduler: tile_idx=%d, batch_idx=%d, head_idx=%d, block=%d, is_valid = %d", self._tile_idx, batch_idx, head_idx, block, is_valid)
+        if cute.arch.thread_idx()[0] == 128:
+            cute.printf(
+                "SingleTileVarlenScheduler: tile_idx=%d, batch_idx=%d, head_idx=%d, block=%d, is_valid = %d",
+                self._tile_idx,
+                batch_idx,
+                head_idx,
+                block,
+                is_valid,
+            )
 
         num_splits = self._get_num_splits(batch_idx)
         split_idx = self._split_idx if const_expr(params.is_split_kv) else Int32(0)
