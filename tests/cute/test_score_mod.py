@@ -221,7 +221,7 @@ def dual_buffer_bias(head_bias, pos_scale):
 
 # Test pairs: (cute_jit_function, eager_reference_function)
 TEST_PAIRS = [
-    (score_mod_1, None),
+    (score_mod_1, identity_eager),
     (score_mod_2, causal_mask_eager),
     (score_mod_3, relative_bias_eager),
     (score_mod_4, relative_bias_v2_eager),
@@ -249,8 +249,34 @@ def create_tensors(
 
 
 def run_cute_flash(
-    q, k, v, cute_score_mod, aux_tensors=None, pack_gqa=False
+    q,
+    k,
+    v,
+    cute_score_mod,
+    aux_tensors=None,
+    pack_gqa=False,
+    cu_seqlens_q=None,
+    cu_seqlens_k=None,
 ) -> torch.Tensor:
+    # Handle Varlen case where inputs are already packed
+    if cu_seqlens_q is not None:
+        out = torch.empty_like(q)
+        _flash_attn_fwd(
+            q,
+            k,
+            v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            return_lse=True,
+            score_mod=cute_score_mod,
+            out=out,
+            lse=None,
+            aux_tensors=aux_tensors,
+            pack_gqa=pack_gqa,
+        )
+        return out
+
+    # Standard Batched case
     q_transposed, k_transposed, v_transposed = map(
         lambda x: x.transpose(1, 2), (q, k, v)
     )
@@ -275,6 +301,44 @@ def run_flex_reference(q, k, v, eager_score_mod, dtype=None) -> torch.Tensor:
     return flex_attention(
         q, k, v, score_mod=eager_score_mod, enable_gqa=q.shape[1] != k.shape[1]
     )
+
+
+def run_flex_varlen_ref(
+    q, k, v, cu_seqlens_q, cu_seqlens_k, eager_score_mod, dtype=None
+) -> torch.Tensor:
+    """Simulates varlen by running flex_attention on each sequence slice individually."""
+    results = []
+    num_batches = len(cu_seqlens_q) - 1
+
+    for i in range(num_batches):
+        start_q, end_q = cu_seqlens_q[i], cu_seqlens_q[i + 1]
+        start_k, end_k = cu_seqlens_k[i], cu_seqlens_k[i + 1]
+
+        # Slice and reshape to (1, H, S, D) for FlexAttention
+        q_slice = q[start_q:end_q].unsqueeze(0).transpose(1, 2)
+        k_slice = k[start_k:end_k].unsqueeze(0).transpose(1, 2)
+        v_slice = v[start_k:end_k].unsqueeze(0).transpose(1, 2)
+
+        if dtype is not None:
+            q_slice = q_slice.to(dtype)
+            k_slice = k_slice.to(dtype)
+            v_slice = v_slice.to(dtype)
+
+        # Wrap score_mod to enforce correct batch index since Flex sees B=1 here
+        def wrapped_score_mod(score, b, h, q_idx, kv_idx):
+            return eager_score_mod(score, i, h, q_idx, kv_idx)
+
+        out_slice = flex_attention(
+            q_slice,
+            k_slice,
+            v_slice,
+            score_mod=wrapped_score_mod,
+            enable_gqa=q_slice.shape[1] != k_slice.shape[1],
+        )
+        # Reshape back to packed (S, H, D)
+        results.append(out_slice.transpose(1, 2).squeeze(0))
+
+    return torch.cat(results, dim=0)
 
 
 @pytest.mark.parametrize(
@@ -451,48 +515,91 @@ def test_cute_vs_flex_attention_with_aux_tensors(
     )
 
 
-@pytest.mark.xfail(
-    raises=NotImplementedError, reason="Varlen with score_mod not yet supported"
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "seqlens_q, seqlens_k",
+    [
+        ([64, 56, 128], [64, 56, 128]),
+        ([12, 256], [12, 256]),
+        ([100, 100], [50, 50]),  # Q != KV length
+    ],
 )
-def test_varlen_with_score_mod():
-    """Test that varlen (variable length sequences) works with score_mod.
-
-    For varlen, tokens from different sequences should not attend to each other.
-    Without proper index mapping, the causal mask will be applied to the global
-    indices instead of per-sequence logical indices.
-    """
+@pytest.mark.parametrize("score_mod_pair", TEST_PAIRS)
+def test_varlen_with_score_mod(seqlens_q, seqlens_k, dtype, score_mod_pair):
+    """Test that varlen (variable length sequences) works with score_mod."""
     torch.random.manual_seed(42)
+    cute_score_mod, eager_score_mod = score_mod_pair
 
-    seqlens = [64, 56, 128]
-    total_seq = sum(seqlens)
     num_heads = 4
-    dtype = torch.bfloat16
+    head_dim = 128
 
-    cu_seqlens = torch.tensor(
-        [0] + list(torch.tensor(seqlens).cumsum(0).tolist()),
+    # Generate packed tensors
+    total_q = sum(seqlens_q)
+    total_k = sum(seqlens_k)
+
+    cu_seqlens_q = torch.tensor(
+        [0] + list(torch.tensor(seqlens_q).cumsum(0).tolist()),
         device="cuda",
         dtype=torch.int32,
     )
-    q = torch.randn(total_seq, num_heads, 128, device="cuda", dtype=dtype)
-    k = torch.randn(total_seq, num_heads, 128, device="cuda", dtype=dtype)
-    v = torch.randn(total_seq, num_heads, 128, device="cuda", dtype=dtype)
+    cu_seqlens_k = torch.tensor(
+        [0] + list(torch.tensor(seqlens_k).cumsum(0).tolist()),
+        device="cuda",
+        dtype=torch.int32,
+    )
 
-    out_cute = torch.empty_like(q)
+    q = torch.randn(total_q, num_heads, head_dim, device="cuda", dtype=dtype)
+    k = torch.randn(total_k, num_heads, head_dim, device="cuda", dtype=dtype)
+    v = torch.randn(total_k, num_heads, head_dim, device="cuda", dtype=dtype)
 
-    _flash_attn_fwd(
+    # Reference Run (FP32)
+    out_ref_fp32 = run_flex_varlen_ref(
         q,
         k,
         v,
-        cu_seqlens_q=cu_seqlens,
-        cu_seqlens_k=cu_seqlens,
-        return_lse=True,
-        score_mod=score_mod_2,
-        out=out_cute,
-        lse=None,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        eager_score_mod,
+        dtype=torch.float32,
+    )
+
+    # Reference Run (Target Dtype)
+    out_pt = run_flex_varlen_ref(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        eager_score_mod,
+        dtype=dtype,
+    )
+
+    # CuTe Run
+    out_cute = run_cute_flash(
+        q,
+        k,
+        v,
+        cute_score_mod,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        pack_gqa=False,
     )
 
     assert not torch.isnan(out_cute).any(), "Output contains NaN values"
     assert torch.isfinite(out_cute).all(), "Output contains infinite values"
+    assert out_cute.shape == out_ref_fp32.shape
+
+    fwd_atol = 2 * (out_ref_fp32 + 0.3 - 0.3 - out_ref_fp32).abs().max().item()
+    rtol = 2
+
+    pt_error = (out_pt - out_ref_fp32).abs().max().item()
+    cute_error = (out_cute - out_ref_fp32).abs().max().item()
+
+    print(f"\nNumerical comparison for {cute_score_mod.__name__} (Varlen):")
+    print(f"  PyTorch vs FP32 ref max error: {pt_error:.2e}")
+    print(f"  CuTE vs FP32 ref max error: {cute_error:.2e}")
+
+    assert cute_error <= rtol * pt_error + fwd_atol + 1e-4
 
 
 if __name__ == "__main__":
