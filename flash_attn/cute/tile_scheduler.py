@@ -66,8 +66,6 @@ class TileSchedulerArguments(ParamsBase):
     cluster_shape_mn: cutlass.Constexpr[Tuple[int, int]] = (1, 1)
     mCuSeqlensQ: Optional[cute.Tensor] = None
     mSeqUsedQ: Optional[cute.Tensor] = None
-    mCuSeqlensK: Optional[cute.Tensor] = None
-    mSeqUsedK: Optional[cute.Tensor] = None
     qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1
     element_size: cutlass.Constexpr[int] = 2
     is_persistent: cutlass.Constexpr[bool] = False
@@ -219,7 +217,7 @@ class StaticPersistentTileScheduler:
         def create(
             args: TileSchedulerArguments, *, loc=None, ip=None
         ) -> "StaticPersistentTileScheduler.Params":
-            total_blocks = args.num_block * args.num_head * args.num_batch
+            total_blocks = args.num_block * args.num_head * args.num_batch * (args.num_splits if args.is_split_kv else 1)
             return StaticPersistentTileScheduler.Params(
                 args.num_batch,
                 args.num_splits,
@@ -285,7 +283,7 @@ class StaticPersistentTileScheduler:
         # if cute.arch.thread_idx()[0] == 0:
         #     cute.printf("TileScheduler: tile_idx=%d, hn_idx=%d, block_idx=%d, batch_idx=%d, head_idx=%d, is_valid=%d", self._tile_idx, hn_idx, block_idx, batch_idx, head_idx, is_valid)
         if const_expr(self.params.is_split_kv):
-            head_idx, split_idx = self.params.num_head_divmod.divmod(head_idx)
+            head_idx, split_idx = self.params.num_splits_divmod.divmod(head_idx)
         else:
             split_idx = Int32(0)
         num_splits = self._get_num_splits(batch_idx)
