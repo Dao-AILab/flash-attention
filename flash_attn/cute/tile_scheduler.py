@@ -592,8 +592,6 @@ class SingleTileVarlenScheduler:
         tile_shape_mn: cutlass.Constexpr[Tuple[int, int]]
         mCuSeqlensQ: Optional[cute.Tensor] = None
         mSeqUsedQ: Optional[cute.Tensor] = None
-        mCuSeqlensK: Optional[cute.Tensor] = None
-        mSeqUsedK: Optional[cute.Tensor] = None
         qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1
         lpt: cutlass.Constexpr[bool] = False
         is_split_kv: cutlass.Constexpr[bool] = False
@@ -625,8 +623,6 @@ class SingleTileVarlenScheduler:
                 tile_shape_mn=args.tile_shape_mn,
                 mCuSeqlensQ=args.mCuSeqlensQ,
                 mSeqUsedQ=args.mSeqUsedQ,
-                mCuSeqlensK=args.mCuSeqlensK,
-                mSeqUsedK=args.mSeqUsedK,
                 qhead_per_kvhead_packgqa=args.qhead_per_kvhead_packgqa,
                 lpt=args.lpt,
                 is_split_kv=args.is_split_kv,
