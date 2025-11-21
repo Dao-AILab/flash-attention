@@ -351,11 +351,11 @@ def _flash_attn_fwd(
         or seqused_q is not None
         or seqused_k is not None
     )
-    if score_mod is not None:
-        if is_varlen:
-            raise NotImplementedError(
-                "score_mod with aux_tensors is not yet supported for varlen sequences. This will be fixed in a future PR."
-            )
+    # if score_mod is not None:
+    #     if is_varlen:
+    #         raise NotImplementedError(
+    #             "score_mod with aux_tensors is not yet supported for varlen sequences. This will be fixed in a future PR."
+    #         )
 
     if mask_mod is not None:
         if is_varlen:
