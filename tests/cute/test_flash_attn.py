@@ -3,7 +3,7 @@
 import math
 import itertools
 import os
-
+from typing import Tuple, Optional
 import pytest
 import torch
 
@@ -25,6 +25,8 @@ from flash_attn.cute.interface import (
     flash_attn_func,
     flash_attn_varlen_func,
     flash_attn_combine,
+    get_scheduler_metadata,
+    SchedulerMetadata,
 )
 
 
@@ -208,15 +210,15 @@ def test_flash_attn_output(
             intermediate_dtype=dtype if dtype == torch.float8_e4m3fn else None,
         )
 
-        k_extended = repeat(k_ref, "b s h d -> b s (h k) d", k=nheads // nheads_kv)
-        qk = torch.einsum('bshd,bthd->bhst', q_ref, k_extended).float()
-        # if qv is not None:
-        #     qk += torch.einsum('bshd,bthd->bhst', qv_ref, v_ref).float()
-        m = qk.amax(-1, keepdim=True)
-        s_tmp = torch.exp((qk - m) / math.sqrt(d))
-        exp_sum = s_tmp.sum(-1)
-        qk = torch.einsum('bthd,bshd->bhts', q_ref.float() / math.sqrt(d), k_ref.float())
-        lse_ref = torch.logsumexp(qk, dim=-1)
+        # k_extended = repeat(k_ref, "b s h d -> b s (h k) d", k=nheads // nheads_kv)
+        # qk = torch.einsum('bshd,bthd->bhst', q_ref, k_extended).float()
+        # # if qv is not None:
+        # #     qk += torch.einsum('bshd,bthd->bhst', qv_ref, v_ref).float()
+        # m = qk.amax(-1, keepdim=True)
+        # s_tmp = torch.exp((qk - m) / math.sqrt(d))
+        # exp_sum = s_tmp.sum(-1)
+        # # qk = torch.einsum('bthd,bshd->bhts', q_ref.float() / math.sqrt(d), k_ref.float())
+        # # lse_ref = torch.logsumexp(qk, dim=-1)
 
         # Numerical error if we just do any arithmetic on out_ref
         fwd_atol = 2 * (out_ref + 0.3 - 0.3 - out_ref).abs().max().item()
@@ -321,8 +323,6 @@ def test_flash_attn_output(
                 dv_pt - dv_ref
             ).abs().max().item() + dv_atol
 
-# @pytest.mark.parametrize("compute_metadata_tensors", [False, True])
-@pytest.mark.parametrize("compute_metadata_tensors", [True])
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
@@ -335,8 +335,8 @@ def test_flash_attn_output(
 @pytest.mark.parametrize("deterministic", [False])
 # @pytest.mark.parametrize("softcap", [0.0, 15.0])
 @pytest.mark.parametrize("softcap", [0.0])
-# @pytest.mark.parametrize("local", [False, True])
-@pytest.mark.parametrize("local", [False])
+@pytest.mark.parametrize("local", [False, True])
+# @pytest.mark.parametrize("local", [False])
 @pytest.mark.parametrize("causal", [False, True])
 # @pytest.mark.parametrize("causal", [False])
 # @pytest.mark.parametrize("add_unused_qkv", [False, True])
@@ -352,9 +352,9 @@ def test_flash_attn_output(
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
-        # (1, 1),
-        # (1, 3),
-        # (2, 1),
+        (1, 1),
+        (1, 3),
+        (2, 1),
         (511, 1),
         (3, 513),
         (64, 128),
@@ -387,7 +387,6 @@ def test_flash_attn_varlen_output(
     has_learnable_sink,
     mha_type,
     dtype,
-    compute_metadata_tensors,
 ):
     if (
         causal or local
@@ -396,12 +395,11 @@ def test_flash_attn_varlen_output(
     device = "cuda"
     # set seed
     torch.random.manual_seed(seqlen_q + seqlen_k + d + int(causal) * 2 + int(local))
-    batch_size = 5 if seqlen_k <= 1024 else 7
-    # nheads = 6
+    batch_size = 49 if seqlen_q <= 1024 else 7
+    nheads = 6
     # batch_size = 1
-    nheads = 1
-    # nheads_kv = nheads if mha_type == "mha" else (3 if mha_type == "gqa" else 1)
-    nheads_kv = 1
+    # nheads = 1
+    nheads_kv = nheads if mha_type == "mha" else (3 if mha_type == "gqa" else 1)
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
     # dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
     dv_vals = [128] if d == 192 else ([d] if d != 128 else [64, d])
@@ -495,8 +493,17 @@ def test_flash_attn_varlen_output(
             key_padding_mask, add_unused_qkv, seqlen_k, batch_size, k.device
         )
 
-        # if causal or local:
-        #     key_padding_mask = query_padding_mask
+        if causal or local:
+            if seqlen_q == seqlen_k:
+                key_padding_mask = query_padding_mask
+            else:
+                # When seqlen_q < seqlen_k, extend query_padding_mask to match key length
+                # First seqlen_q positions match query, remaining positions are valid (True)
+                key_padding_mask = torch.cat([
+                    query_padding_mask,
+                    torch.ones(batch_size, seqlen_k - seqlen_q, device=device, dtype=torch.bool)
+                ], dim=1)
+
         (
             q_unpad,
             k_unpad,
@@ -526,8 +533,6 @@ def test_flash_attn_varlen_output(
             query_unused_mask=query_unused_mask,
             key_unused_mask=key_unused_mask,
         )
-        print(f"cu_seqlens_q: {cu_seqlens_q}")
-        print(f"cu_seqlens_k: {cu_seqlens_k}")
         q_unpad, k_unpad, v_unpad = [
             x.detach().to(dtype).requires_grad_() for x in (q_unpad, k_unpad, v_unpad)
         ]
@@ -606,7 +611,6 @@ def test_flash_attn_varlen_output(
             out = output_pad_fn(out_unpad)
             if query_unused_mask is not None:
                 out.masked_fill_(q_zero_masking, 0.0)
-            print(f"out = {out.shape}")
             print(f"Output max diff: {(out - out_ref).abs().max().item()}")
             print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
             # if not causal:
@@ -988,11 +992,10 @@ def test_flash_attn_kvcache(
             key_padding_mask = arange < cache_seqlens_expanded
         else:
             k_new_seqlens = (
-                key_new_padding_mask.sum(-1, keepdims=True) if (varlen_q and key_new_padding_mask is not None) else seqlen_new
+                key_new_padding_mask.sum(-1, keepdims=True) if varlen_q else seqlen_new
             )
             key_padding_mask = arange < cache_seqlens_expanded + k_new_seqlens
         if has_leftpad:
-            assert cache_leftpad is not None  # For type checker
             key_padding_mask = torch.logical_and(
                 key_padding_mask,
                 arange >= cache_leftpad.unsqueeze(-1).expand(-1, seqlen_k),
@@ -1114,23 +1117,37 @@ def test_flash_attn_kvcache(
         v_cache_saved = v_cache.clone() if page_size is None else v_cache_paged.clone()
         # num_splits_vals = [1, 0]
         num_splits_vals = [1, 3] if d < 192 and not DISABLE_SPLIT else [1]
-        # precompute_metadata_vals = [False, True]
-        precompute_metadata_vals = [False]
+        precompute_metadata_vals = [False, True]
+        # precompute_metadata_vals = [False]
         for num_splits, precompute_metadata in itertools.product(
             num_splits_vals, precompute_metadata_vals
         ):
-            # if precompute_metadata:
-            #     scheduler_metadata = get_scheduler_metadata(
-            #         batch_size, max_seqlen_q if varlen_q else seqlen_q, seqlen_k, nheads, nheads_k, d,
-            #         cache_seqlens, q.dtype, headdim_v=dv, cu_seqlens_q=cu_seqlens_q,
-            #         cu_seqlens_k_new=cu_seqlens_k_new, cache_leftpad=cache_leftpad,
-            #         max_seqlen_k_new=seqlen_new, page_size=page_size,
-            #         causal=causal, window_size=window_size, attention_chunk=attention_chunk,
-            #         num_splits=num_splits
-            #     )
-            # else:
-            #     scheduler_metadata = None
-            scheduler_metadata = None
+            scheduler_metadata: Optional[SchedulerMetadata] = None
+            if precompute_metadata:
+                scheduler_metadata = get_scheduler_metadata(
+                    num_batch=batch_size,
+                    seqlen_q=seqlen_q,
+                    seqlen_k=seqlen_k,
+                    nheads=nheads,
+                    nheads_k=nheads_k,
+                    headdim=d,
+                    headdim_v=dv,
+                    num_splits=num_splits,
+                    tile_m=128,
+                    tile_n=128,
+                    num_sm=torch.cuda.get_device_properties(device).multi_processor_count,
+                    pack_gqa=False,
+                    is_causal=causal,
+                    enable_pdl=False,
+                    sort=False,
+                    seqlen_k_new=seqlen_new,
+                    stream=None,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k=cache_seqlens,
+                    seqused_q=None,
+                    seqused_k=cache_seqlens,
+                    leftpad_k=None,
+                )
             # Repeat to test metadata reuse
             for _ in range(1 if not precompute_metadata else 2):
                 if page_size is None:
@@ -1161,7 +1178,7 @@ def test_flash_attn_kvcache(
                     learnable_sink=learnable_sink,
                     # attention_chunk=attention_chunk,
                     # rotary_interleaved=rotary_interleaved,
-                    # scheduler_metadata=scheduler_metadata,
+                    scheduler_metadata=scheduler_metadata,
                     num_splits=num_splits,
                     # return_softmax_lse=True
                 )

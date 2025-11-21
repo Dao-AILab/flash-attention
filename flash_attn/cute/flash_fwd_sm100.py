@@ -90,10 +90,10 @@ class FlashAttentionForwardSm100:
         is_persistent: bool = True,
         score_mod: cutlass.Constexpr | None = None,
         mask_mod: cutlass.Constexpr | None = None,
-        mask_mod: cutlass.Constexpr | None = None,
         has_aux_tensors: cutlass.Constexpr = False,
         paged_kv_non_tma: bool = False,
         is_varlen_q: bool = False,
+        has_metadata_tensors: cutlass.Constexpr = False,
     ):
         self.use_tma_KV = not paged_kv_non_tma
         self.use_tma_KV = not paged_kv_non_tma
@@ -272,6 +272,10 @@ class FlashAttentionForwardSm100:
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors: Optional[list] = None,
+        num_splits_dynamic_ptr: Optional[cute.Tensor] = None,
+        num_m_blocks_ptr: Optional[cute.Tensor] = None,
+        varlen_batch_idx_ptr: Optional[cute.Tensor] = None,
+        num_nheads_in_l2_ptr: Optional[cute.Tensor] = None,
     ):
         """Execute the Fused Multi-Head Attention operation on the provided tensors.
 
@@ -495,6 +499,12 @@ class FlashAttentionForwardSm100:
             ]
         }
 
+        # metadata tensors for varlen scheduler
+        self.num_splits_dynamic_ptr = num_splits_dynamic_ptr
+        self.num_m_blocks_ptr = num_m_blocks_ptr
+        self.varlen_batch_idx_ptr = varlen_batch_idx_ptr
+        self.num_nheads_in_l2_ptr = num_nheads_in_l2_ptr
+
         # TMA load for Q
         tma_load_op = cpasync.CopyBulkTensorTileG2SOp(cta_group)
         tma_store_op = cpasync.CopyBulkTensorTileS2GOp()
@@ -595,6 +605,11 @@ class FlashAttentionForwardSm100:
             is_persistent=self.is_persistent,
             lpt=self.is_causal or self.is_local,
             is_split_kv=self.is_split_kv,
+            has_metadata_tensors=self.has_metadata_tensors,
+            num_splits_dynamic_ptr=self.num_splits_dynamic_ptr,
+            num_m_blocks_ptr=self.num_m_blocks_ptr,
+            varlen_batch_idx_ptr=self.varlen_batch_idx_ptr,
+            num_nheads_in_l2_ptr=self.num_nheads_in_l2_ptr,
         )
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
         self.tile_scheduler_cls = TileScheduler
@@ -689,6 +704,10 @@ class FlashAttentionForwardSm100:
             mSeqUsedQ,
             mSeqUsedK,
             mPageTable,
+            num_splits_dynamic_ptr,
+            num_m_blocks_ptr,
+            varlen_batch_idx_ptr,
+            num_nheads_in_l2_ptr,
             tma_atom_Q,
             tma_atom_K,
             tma_atom_V,
@@ -734,6 +753,10 @@ class FlashAttentionForwardSm100:
         mSeqUsedQ: Optional[cute.Tensor],
         mSeqUsedK: Optional[cute.Tensor],
         mPageTable: Optional[cute.Tensor],
+        num_splits_dynamic_ptr: Optional[cute.Tensor],
+        num_m_blocks_ptr: Optional[cute.Tensor],
+        varlen_batch_idx_ptr: Optional[cute.Tensor],
+        num_nheads_in_l2_ptr: Optional[cute.Tensor],
         tma_atom_Q: cute.CopyAtom,
         tma_atom_K: Optional[cute.CopyAtom],
         tma_atom_V: Optional[cute.CopyAtom],
@@ -915,6 +938,8 @@ class FlashAttentionForwardSm100:
             window_size_left,
             window_size_right,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+            num_splits=num_splits,
+            num_splits_dynamic_ptr=num_splits_dynamic_ptr,
         )
         SeqlenInfoCls = partial(
             SeqlenInfoQK.create,
@@ -1654,6 +1679,7 @@ class FlashAttentionForwardSm100:
             mask_fn = partial(
                 mask.apply_mask_sm100,
                 mask_mod=block_mask_mod,
+                fastdiv_mods=fastdiv_mods,
                 **shared_mask_kwargs,
             )
             if const_expr(self.use_block_sparsity):
@@ -1661,6 +1687,7 @@ class FlashAttentionForwardSm100:
                 mask_fn_none = partial(
                     mask.apply_mask_sm100,
                     mask_mod=None,
+                    fastdiv_mods=fastdiv_mods,
                     **shared_mask_kwargs,
                 )
             else:
