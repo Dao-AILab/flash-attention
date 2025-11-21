@@ -50,7 +50,7 @@ def _flash_attn_forward(
     k_new: Optional[torch.Tensor] = None,
     v_new: Optional[torch.Tensor] = None,
     qv: Optional[torch.Tensor] = None,
-    out: Optional[torch.Tensor] = None,
+    out_: Optional[torch.Tensor] = None,
     cu_seqlens_q: Optional[torch.Tensor] = None,
     cu_seqlens_k: Optional[torch.Tensor] = None,
     cu_seqlens_k_new: Optional[torch.Tensor] = None,
@@ -97,7 +97,7 @@ def _flash_attn_forward(
         k_new,
         v_new,
         qv,
-        out,
+        out_,
         cu_seqlens_q,
         cu_seqlens_k,
         cu_seqlens_k_new,
@@ -144,7 +144,7 @@ def _flash_attn_forward_fake(
     k_new: Optional[torch.Tensor] = None,
     v_new: Optional[torch.Tensor] = None,
     qv: Optional[torch.Tensor] = None,
-    out: Optional[torch.Tensor] = None,
+    out_: Optional[torch.Tensor] = None,
     cu_seqlens_q: Optional[torch.Tensor] = None,
     cu_seqlens_k: Optional[torch.Tensor] = None,
     cu_seqlens_k_new: Optional[torch.Tensor] = None,
@@ -205,11 +205,14 @@ def _flash_attn_forward_fake(
         out_dtype = q_type
 
     # Create output tensor
-    if out is None:
-        if is_varlen_q:
-            out = torch.empty((total_q, num_heads, head_size_v), dtype=out_dtype, device=q.device)
-        else:
-            out = torch.empty((batch_size, seqlen_q, num_heads, head_size_v), dtype=out_dtype, device=q.device)
+    if out_ is not None:
+        # If out_ is provided, _flash_attn_forward becomes non-functional
+        raise TypeError("Tracing (torch.compile/torch.export) with pre-allocated output tensor is not supported.")
+
+    if is_varlen_q:
+        out = torch.empty((total_q, num_heads, head_size_v), dtype=out_dtype, device=q.device)
+    else:
+        out = torch.empty((batch_size, seqlen_q, num_heads, head_size_v), dtype=out_dtype, device=q.device)
 
     # Create softmax_lse tensor
     if is_varlen_q:
