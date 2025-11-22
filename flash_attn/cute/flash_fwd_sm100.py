@@ -28,7 +28,6 @@ import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
 
 from flash_attn.cute.paged_kv import PagedKVManager
-from flash_attn.cute.paged_kv import PagedKVManager
 import flash_attn.cute.utils as utils
 from flash_attn.cute import copy_utils
 import flash_attn.cute.pipeline as pipeline
@@ -37,12 +36,6 @@ from flash_attn.cute.softmax import SoftmaxSm100, apply_score_mod_inner
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute.block_sparsity import BlockSparseTensors
-from flash_attn.cute.block_sparse_utils import (
-    get_total_block_count,
-    produce_block_sparse_loads_sm100,
-    softmax_block_sparse_sm100,
-    handle_block_sparse_empty_tile_correction_sm100,
-)
 from flash_attn.cute.block_sparse_utils import (
     get_total_block_count,
     produce_block_sparse_loads_sm100,
@@ -95,7 +88,6 @@ class FlashAttentionForwardSm100:
         is_varlen_q: bool = False,
         has_metadata_tensors: cutlass.Constexpr = False,
     ):
-        self.use_tma_KV = not paged_kv_non_tma
         self.use_tma_KV = not paged_kv_non_tma
         # self.dtype = dtype
         # padding head_dim to a multiple of 16 as k_block_size
