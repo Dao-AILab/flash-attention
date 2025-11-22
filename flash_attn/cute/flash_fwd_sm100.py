@@ -1676,7 +1676,6 @@ class FlashAttentionForwardSm100:
                 seqlen=seqlen,
                 aux_tensors=aux_tensors,
                 fastdiv_mods=fastdiv_mods,
-                mask_fn=partial(mask_fn, mask_seqlen=False),
             )
 
             if has_work:
