@@ -776,6 +776,7 @@ def test_flash_attn_varlen_output(
         # (128, 128),
         # (256, 512),  # To test appending KV with more than 1 block
         # (2048, 3577),  # Enough tile to test persistent scheduler
+        (1024, 1024),
     ],
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(256, 128)])
@@ -1154,7 +1155,7 @@ def test_flash_attn_kvcache(
                 )
                 if extra_verbose:
                     (
-                        prepare_seqlen_q,
+                        num_m_blocks,
                         num_splits_dynamic,
                         varlen_batch_idx,
                         num_nheads_in_l2,
