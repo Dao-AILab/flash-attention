@@ -1808,9 +1808,9 @@ class FlashAttentionForwardSm100:
                     # Dense path always writes scale / signals
                     sScale[tidx + stage * self.m_block_size] = softmax.row_sum[0]
                     if const_expr(mLSE is not None or learnable_sink is not None):
-                        sScale[tidx + stage * self.m_block_size + self.m_block_size * 2] = (
-                            softmax.row_max[0]
-                        )
+                        sScale[
+                            tidx + stage * self.m_block_size + self.m_block_size * 2
+                        ] = softmax.row_max[0]
                     cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_softmax_corr_full_offset + stage)
 
             # # Write LSE to gmem
