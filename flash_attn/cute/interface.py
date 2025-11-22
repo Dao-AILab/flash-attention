@@ -283,9 +283,7 @@ def _flash_attn_fwd(
     sparse_tensors = None
     if block_sparse_tensors is not None:
         if seqlen_q is None:
-            raise ValueError(
-                "Block sparsity requires fixed-length sequences (seqlen_q must be known)."
-            )
+            raise ValueError("Block sparsity requires fixed-length sequences (seqlen_q must be known).")
         m_block_size_block = m_block_size
         if compute_capability == 10:
             # TODO: This multiplier should really be q_stage, wire up in later PR
@@ -332,22 +330,10 @@ def _flash_attn_fwd(
             pack_gqa = False
 
     if num_splits < 1:
-        max_seqlen_k = (
-            seqlen_k
-            if cu_seqlens_k is None
-            else (cu_seqlens_k[1:] - cu_seqlens_k[:-1]).max().item()
-        )
-        max_seqlen_q = (
-            seqlen_q
-            if cu_seqlens_q is None
-            else (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item()
-        )
+        max_seqlen_k = seqlen_k if cu_seqlens_k is None else (cu_seqlens_k[1:] - cu_seqlens_k[:-1]).max().item()
+        max_seqlen_q = seqlen_q if cu_seqlens_q is None else (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item()
         seqlen_q_packgqa = max_seqlen_q * qhead_per_kvhead
-        seqlen_k_loaded = (
-            max_seqlen_k
-            if not local
-            else max(0, min(max_seqlen_k, window_size_right + window_size_left + 1 + m_block_size))
-        )
+        seqlen_k_loaded = max_seqlen_k if not local else max(0, min(max_seqlen_k, window_size_right + window_size_left + 1 + m_block_size))
         num_n_blocks = (seqlen_k_loaded + n_block_size - 1) // n_block_size
         num_m_blocks = (seqlen_q_packgqa + m_block_size - 1) // m_block_size
         total_mblocks = batch_size * num_head_kv * num_m_blocks
@@ -360,14 +346,7 @@ def _flash_attn_fwd(
 
     is_split_kv = num_splits > 1
     if is_split_kv:
-        out_partial = torch.empty(
-            num_splits,
-            *q_batch_seqlen_shape,
-            num_head,
-            head_dim_v,
-            dtype=torch.float32,
-            device=device,
-        )
+        out_partial = torch.empty(num_splits, *q_batch_seqlen_shape, num_head, head_dim_v, dtype=torch.float32, device=device)
         lse_partial = torch.empty(num_splits, *lse_shape, dtype=torch.float32, device=device)
 
     q_tensor, k_tensor, v_tensor, o_tensor = [
@@ -375,13 +354,9 @@ def _flash_attn_fwd(
         for t in (q, k, v, out if not is_split_kv else out_partial)
     ]
     if is_split_kv:
-        lse_tensor = from_dlpack(lse_partial.detach(), assumed_align=4).mark_layout_dynamic(
-            leading_dim=lse_partial.ndim - 1
-        )
+        lse_tensor = from_dlpack(lse_partial.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=lse_partial.ndim - 1)
     elif lse is not None:
-        lse_tensor = from_dlpack(lse.detach(), assumed_align=4).mark_layout_dynamic(
-            leading_dim=lse.ndim - 1
-        )
+        lse_tensor = from_dlpack(lse.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=lse.ndim - 1)
     else:
         lse_tensor = None
 
@@ -735,7 +710,7 @@ def _flash_attn_bwd(
     if pack_gqa is None:
         pack_gqa = qhead_per_kvhead > 1
     if compute_capability == 10:
-        pack_gqa = False  # override for now
+        pack_gqa = False # override for now
 
     device = q.device
     # TODO: check if this is the right rounding
@@ -1113,9 +1088,7 @@ class FlashAttnFunc(torch.autograd.Function):
     ):
         # Only create block sparse tensors if at least one block sparse parameter is provided
         block_sparse_tensors = None
-        if any(
-            t is not None for t in [full_block_cnt, full_block_idx, mask_block_cnt, mask_block_idx]
-        ):
+        if any(t is not None for t in [full_block_cnt, full_block_idx, mask_block_cnt, mask_block_idx]):
             block_sparse_tensors = BlockSparseTensorsTorch(
                 full_block_cnt=full_block_cnt,
                 full_block_idx=full_block_idx,
@@ -1391,9 +1364,7 @@ def _flash_attn_fwd_combine(
     lse_partial_tensor = from_dlpack(lse_partial.detach(), assumed_align=4).mark_layout_dynamic(
         leading_dim=lse_partial.ndim - 2
     )
-    out_tensor = from_dlpack(out.detach(), assumed_align=16).mark_layout_dynamic(
-        leading_dim=3 if not is_varlen else 2
-    )
+    out_tensor = from_dlpack(out.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=3 if not is_varlen else 2)
     lse_tensor = (
         from_dlpack(lse.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=lse.ndim - 2)
         if lse is not None
