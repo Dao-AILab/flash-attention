@@ -795,15 +795,7 @@ class SingleTileVarlenScheduler:
                 head_idx = mh_block // num_m_blocks
                 block = mh_block - head_idx * num_m_blocks
             is_valid = self._is_first_block and batch_idx < params.num_batch
-        # if cute.arch.thread_idx()[0] == 128:
-        #     cute.printf(
-        #         "SingleTileVarlenScheduler: tile_idx=%d, batch_idx=%d, head_idx=%d, block=%d, is_valid = %d",
-        #         self._tile_idx,
-        #         batch_idx,
-        #         head_idx,
-        #         block,
-        #         is_valid,
-        #     )
+        # if cute.arch.thread_idx()[0] == 128: cute.printf("SingleTileVarlenScheduler: tile_idx=%d, batch_idx=%d, head_idx=%d, block=%d, is_valid = %d", self._tile_idx, batch_idx, head_idx, block, is_valid)
 
         num_splits = self._get_num_splits(batch_idx)
         split_idx = self._split_idx if const_expr(params.is_split_kv) else Int32(0)
@@ -818,6 +810,7 @@ class SingleTileVarlenScheduler:
         pass
 
     def advance_to_next_work(self, *, loc=None, ip=None):
+        # Single tile scheduler - set to invalid tile_idx to indicate no more work
         self._is_first_block = False
 
     def __extract_mlir_values__(self):
