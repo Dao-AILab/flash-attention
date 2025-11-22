@@ -173,4 +173,16 @@ class PagedKVManager(ParamsBase):
                     )
             elif const_expr(K_or_V == "V"):
                 # Don't need to clear out the rest of the smem for K since we'll mask out the scores anyway.
-                tXsX[None, m, None].fill(0)
+                fill_swizzled(tXsX[None, m, None], 0)
+
+
+@cutlass.dsl_user_op
+def fill_swizzled(tensor, value: cutlass.Numeric, *, loc=None, ip=None) -> None:
+    """Fill tensor with a constant value.
+
+    Fills all elements of the tensor with the specified value, assuming static size
+    and supported memory space.
+    """
+    rTmp = cute.make_rmem_tensor_like(tensor, tensor.element_type)
+    rTmp.fill(value)
+    cute.autovec_copy(rTmp, tensor)
