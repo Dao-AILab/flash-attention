@@ -239,8 +239,8 @@ class FlashPrepareScheduler:
                 cutlass.min(num_n_blocks // blocks_per_sm, num_splits_static), Int32(1)
             )
             num_n_blocks = cute.ceil_div(num_n_blocks, num_splits_dynamic)
-            if cute.arch.thread_idx()[0] == 0:
-                cute.printf("total_blocks: %d", total_blocks)
+            # if cute.arch.thread_idx()[0] == 0:
+            #     cute.printf("total_blocks: %d", total_blocks)
 
         if const_expr(self.sort):
             # TODO: Implement sort logic
@@ -465,7 +465,6 @@ def prepare_varlen_num_blocks(
     if cache_key not in prepare_varlen_num_blocks.compile_cache:
         # Create scheduler instance
         scheduler = FlashPrepareScheduler(packgqa=packgqa, sort=sort, num_batch=num_batch)
-        print(f"num_sm: {num_sm}")
         prepare_varlen_num_blocks.compile_cache[cache_key] = cute.compile(
             scheduler,
             seqlen_q,

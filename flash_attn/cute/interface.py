@@ -1592,23 +1592,23 @@ def get_scheduler_metadata(
     nheads: int,
     nheads_k: int,
     headdim: int,
-    headdim_v: int,
     num_splits: int,
     tile_m: int,
     tile_n: int,
-    num_sm: int,
-    pack_gqa: bool,
-    is_causal: bool,
-    enable_pdl: bool,
-    sort: bool,
-    seqlen_k_new: int,
-    stream: Optional[cuda.CUstream],
+    headdim_v: Optional[int] = None,
+    num_sm: Optional[int] = None,
+    pack_gqa: Optional[bool] = False,
+    causal: bool = False,
+    enable_pdl: bool = False,
+    sort: bool = False,
+    seqlen_k_new: int = 0,
     cu_seqlens_q: Optional[torch.Tensor] = None,
     cu_seqlens_k: Optional[torch.Tensor] = None,
     cu_seqlens_k_new: Optional[torch.Tensor] = None,
     seqused_q: Optional[torch.Tensor] = None,
     seqused_k: Optional[torch.Tensor] = None,
     leftpad_k: Optional[torch.Tensor] = None,
+    stream: Optional[cuda.CUstream] = None,
 ) -> SchedulerMetadata:
     """
     Helper method to get scheduler metadata for varlen sequences.
@@ -1623,6 +1623,13 @@ def get_scheduler_metadata(
         raise ValueError(
             "At least one of cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k must be provided to determine device"
         )
+    if num_sm is None:
+        num_sm = torch.cuda.get_device_properties(device).multi_processor_count
+    if headdim_v is None:
+        headdim_v = headdim
+
+    # Override pack_gqa (not supported yet)
+    pack_gqa = False
 
     # Override enable_pdl (not supported yet)
     enable_pdl = False
@@ -1636,8 +1643,8 @@ def get_scheduler_metadata(
     prepare_seqlen_q = torch.empty(num_batch, dtype=torch.int32, device=device)
     num_splits_dynamic = torch.empty(num_batch, dtype=torch.int32, device=device)
     varlen_batch_idx = torch.empty(num_batch, dtype=torch.int32, device=device) if sort else None
-    num_nheads_in_l2 = torch.ones(num_batch, dtype=torch.int32, device=device) * nheads
-    tile_count_semaphore = torch.zeros(1, dtype=torch.int32, device=device)
+    num_nheads_in_l2 = torch.empty(num_batch, dtype=torch.int32, device=device)
+    tile_count_semaphore = torch.empty(1, dtype=torch.int32, device=device)
 
     # Convert to CuTe tensors
     prepare_seqlen_q_cute = from_dlpack(
@@ -1709,7 +1716,7 @@ def get_scheduler_metadata(
         tile_n=tile_n,
         num_sm=num_sm,
         packgqa=pack_gqa,
-        is_causal=is_causal,
+        is_causal=causal,
         enable_pdl=enable_pdl,
         sort=sort,
         seqlen_k_new=seqlen_k_new,
@@ -1723,7 +1730,7 @@ def get_scheduler_metadata(
         mPrepareSeqlenQ=prepare_seqlen_q_cute,
         mNumSplitsDynamic=num_splits_dynamic_cute,
         mVarlenBatchIdx=varlen_batch_idx_cute,
-        mNumNheadsInL2=num_nheads_in_l2_cute if is_causal else None,
+        mNumNheadsInL2=num_nheads_in_l2_cute if causal else None,
         tile_count_semaphore=tile_count_semaphore_cute,
     )
 
