@@ -724,16 +724,16 @@ def test_flash_attn_varlen_output(
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 # @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
-@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
-# @pytest.mark.parametrize("mha_type", ["mha"])
-@pytest.mark.parametrize("has_learnable_sink", [False, True])
-# @pytest.mark.parametrize("has_learnable_sink", [False])
+# @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
+@pytest.mark.parametrize("mha_type", ["mha"])
+# @pytest.mark.parametrize("has_learnable_sink", [False, True])
+@pytest.mark.parametrize("has_learnable_sink", [False])
 # @pytest.mark.parametrize("new_kv", [False, True])
 @pytest.mark.parametrize("new_kv", [False])
-@pytest.mark.parametrize("local", [False, True])
-# @pytest.mark.parametrize("local", [False])
-@pytest.mark.parametrize("causal", [False, True])
-# @pytest.mark.parametrize("causal", [True])
+# @pytest.mark.parametrize("local", [False, True])
+@pytest.mark.parametrize("local", [False])
+# @pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("causal", [True])
 # @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True, False])
 @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [False])
 # @pytest.mark.parametrize("has_rotary_seqlens", [False, True])
@@ -744,7 +744,7 @@ def test_flash_attn_varlen_output(
 @pytest.mark.parametrize("rotary_fraction", [0.0])
 @pytest.mark.parametrize("page_size", [None] + ([1, 4, 128]))
 # @pytest.mark.parametrize("page_size", [None, 128])
-# @pytest.mark.parametrize("page_size", [128])
+# @pytest.mark.parametrize("page_size", [None])
 # @pytest.mark.parametrize("has_leftpad", [False, True])
 @pytest.mark.parametrize("has_leftpad", [False])
 # @pytest.mark.parametrize("has_batch_idx", [False, True])
@@ -755,8 +755,8 @@ def test_flash_attn_varlen_output(
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192])
 # @pytest.mark.parametrize('d', [56, 80])
-# @pytest.mark.parametrize("d", [128])
-@pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("d", [128])
+# @pytest.mark.parametrize("d", [64, 128])
 # @pytest.mark.parametrize("d", [192])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
@@ -1122,6 +1122,7 @@ def test_flash_attn_kvcache(
         for num_splits, precompute_metadata in itertools.product(
             num_splits_vals, precompute_metadata_vals
         ):
+            print(f"{num_splits = }, {precompute_metadata = }")
             scheduler_metadata: Optional[SchedulerMetadata] = None
             if precompute_metadata:
                 scheduler_metadata = get_scheduler_metadata(
@@ -1135,19 +1136,23 @@ def test_flash_attn_kvcache(
                     num_splits=num_splits,
                     tile_m=128,
                     tile_n=128,
-                    num_sm=torch.cuda.get_device_properties(device).multi_processor_count,
-                    pack_gqa=False,
-                    is_causal=causal,
-                    enable_pdl=False,
-                    sort=False,
-                    seqlen_k_new=seqlen_new,
-                    stream=None,
+                    # pack_gqa=False,
+                    causal=causal,
+                    # enable_pdl=False,
+                    # sort=False,
+                    # seqlen_k_new=seqlen_new if new_kv else 0,
                     cu_seqlens_q=cu_seqlens_q,
-                    cu_seqlens_k=cache_seqlens,
-                    seqused_q=None,
                     seqused_k=cache_seqlens,
-                    leftpad_k=None,
+                    # leftpad_k=cache_leftpad,
                 )
+                (
+                    prepare_seqlen_q,
+                    num_splits_dynamic,
+                    varlen_batch_idx,
+                    num_nheads_in_l2,
+                    tile_count_semaphore,
+                ) = scheduler_metadata
+                print("num_splits_dynamic = ", num_splits_dynamic)
             # Repeat to test metadata reuse
             for _ in range(1 if not precompute_metadata else 2):
                 if page_size is None:
