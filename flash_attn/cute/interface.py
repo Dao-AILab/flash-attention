@@ -536,7 +536,7 @@ def _flash_attn_fwd(
             sparse_tensors,
             cute_aux_tensors,
             num_splits_dynamic_cute if scheduler_metadata is not None else None,
-            None,  # num_m_blocks_ptr
+            num_m_blocks_cute if scheduler_metadata is not None else None,
             varlen_batch_idx_cute if scheduler_metadata is not None else None,
             num_nheads_in_l2_cute if scheduler_metadata is not None else None,
         )
@@ -559,7 +559,7 @@ def _flash_attn_fwd(
         sparse_tensors,
         cute_aux_tensors,
         num_splits_dynamic_cute if scheduler_metadata is not None else None,
-        None,  # num_m_blocks_ptr
+        num_m_blocks_cute if scheduler_metadata is not None else None,
         varlen_batch_idx_cute if scheduler_metadata is not None else None,
         num_nheads_in_l2_cute if scheduler_metadata is not None else None,
     )
