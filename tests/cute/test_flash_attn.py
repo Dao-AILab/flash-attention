@@ -29,6 +29,8 @@ from flash_attn.cute.interface import (
     SchedulerMetadata,
 )
 
+# allow for printing certain metadata tensors in tests
+extra_verbose = True
 
 DISABLE_SPLIT = os.getenv("FLASH_ATTENTION_DISABLE_SPLIT", "FALSE") == "TRUE"
 
@@ -724,16 +726,16 @@ def test_flash_attn_varlen_output(
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 # @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
-# @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
-@pytest.mark.parametrize("mha_type", ["mha"])
-# @pytest.mark.parametrize("has_learnable_sink", [False, True])
-@pytest.mark.parametrize("has_learnable_sink", [False])
+@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
+# @pytest.mark.parametrize("mha_type", ["mha"])
+@pytest.mark.parametrize("has_learnable_sink", [False, True])
+# @pytest.mark.parametrize("has_learnable_sink", [False])
 # @pytest.mark.parametrize("new_kv", [False, True])
 @pytest.mark.parametrize("new_kv", [False])
-# @pytest.mark.parametrize("local", [False, True])
-@pytest.mark.parametrize("local", [False])
-# @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("causal", [True])
+@pytest.mark.parametrize("local", [False, True])
+# @pytest.mark.parametrize("local", [False])
+@pytest.mark.parametrize("causal", [False, True])
+# @pytest.mark.parametrize("causal", [True])
 # @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True, False])
 @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [False])
 # @pytest.mark.parametrize("has_rotary_seqlens", [False, True])
@@ -755,8 +757,8 @@ def test_flash_attn_varlen_output(
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192])
 # @pytest.mark.parametrize('d', [56, 80])
-@pytest.mark.parametrize("d", [128])
-# @pytest.mark.parametrize("d", [64, 128])
+# @pytest.mark.parametrize("d", [128])
+@pytest.mark.parametrize("d", [64, 128])
 # @pytest.mark.parametrize("d", [192])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
@@ -854,6 +856,9 @@ def test_flash_attn_kvcache(
             qv_unpad = (
                 rearrange(qv, "b s ... -> (b s) ...")[indices_q] if has_qv else None
             )
+            if extra_verbose:
+                print("max_seqlen_q = ", max_seqlen_q)
+                print("cu_seqlens_q = ", cu_seqlens_q)
         else:
             query_padding_mask = None
             q_unpad = q
@@ -963,6 +968,8 @@ def test_flash_attn_kvcache(
             dtype=torch.int32,
             device=device,
         )
+        if extra_verbose:
+            print("cache_seqlens = ", cache_seqlens)
         if has_leftpad:
             cache_leftpad = torch.cat(
                 [
@@ -1145,14 +1152,15 @@ def test_flash_attn_kvcache(
                     seqused_k=cache_seqlens,
                     # leftpad_k=cache_leftpad,
                 )
-                (
-                    prepare_seqlen_q,
-                    num_splits_dynamic,
-                    varlen_batch_idx,
-                    num_nheads_in_l2,
-                    tile_count_semaphore,
-                ) = scheduler_metadata
-                print("num_splits_dynamic = ", num_splits_dynamic)
+                if extra_verbose:
+                    (
+                        prepare_seqlen_q,
+                        num_splits_dynamic,
+                        varlen_batch_idx,
+                        num_nheads_in_l2,
+                        tile_count_semaphore,
+                    ) = scheduler_metadata
+                    print("num_splits_dynamic = ", num_splits_dynamic)
             # Repeat to test metadata reuse
             for _ in range(1 if not precompute_metadata else 2):
                 if page_size is None:
