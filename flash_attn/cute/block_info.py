@@ -19,7 +19,7 @@ class BlockInfo:
     window_size_left: Optional[Int32] = None
     window_size_right: Optional[Int32] = None
     qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1
-    num_splits: cutlass.Constexpr[int] = 1
+    num_splits: Optional[Int32] = 1
     num_splits_dynamic_ptr: Optional[cute.Tensor] = None
 
     @cute.jit
@@ -28,12 +28,10 @@ class BlockInfo:
         seqlen_info: SeqlenInfoQK,
         m_block: Int32,
         split_idx: cutlass.Int32 = 0,
-        batch_idx: Optional[int] = None,
+        batch_idx: Optional[Int32] = None,
     ) -> Tuple[Int32, Int32]:
-        num_splits = self.num_splits
         # get dynamic num_splits for this batch if available
-        if const_expr(self.num_splits_dynamic_ptr is not None):
-            num_splits = self.num_splits_dynamic_ptr[batch_idx]
+        
         n_block_max = cute.ceil_div(seqlen_info.seqlen_k, self.tile_n)
         if const_expr(self.is_causal or (self.is_local and self.window_size_right is not None)):
             m_idx_max = (m_block + 1) * self.tile_m
@@ -51,6 +49,10 @@ class BlockInfo:
             n_idx_left = n_idx - self.window_size_left
             n_block_min = cutlass.max(n_idx_left // self.tile_n, 0)
         if cutlass.const_expr(self.is_split_kv):
+            if const_expr(self.num_splits_dynamic_ptr is not None):
+                num_splits = self.num_splits_dynamic_ptr[batch_idx]
+            else:
+                num_splits = self.num_splits
             num_n_blocks_per_split = (
                 cutlass.Int32(0)
                 if n_block_max <= n_block_min
