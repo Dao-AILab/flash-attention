@@ -52,7 +52,7 @@ from flash_attn.cute.block_sparsity import (
 
 class SchedulerMetadata(NamedTuple):
     """Class to store scheduler metadata for varlen"""
-    prepare_seqlen_q: Optional[torch.Tensor]
+    num_m_blocks: Optional[torch.Tensor]
     num_splits_dynamic: Optional[torch.Tensor]
     varlen_batch_idx: Optional[torch.Tensor]
     num_nheads_in_l2: Optional[torch.Tensor]
@@ -377,29 +377,23 @@ def _flash_attn_fwd(
 
     if scheduler_metadata is not None:
         (
-            prepare_seqlen_q,
+            num_m_blocks,
             num_splits_dynamic,
             varlen_batch_idx,
             num_nheads_in_l2,
             tile_count_semaphore,
         ) = scheduler_metadata
-        prepare_seqlen_q_cute = from_dlpack(
-            prepare_seqlen_q.detach(), assumed_align=4
-        ).mark_layout_dynamic(leading_dim=0)
-        num_splits_dynamic_cute = from_dlpack(
-            num_splits_dynamic.detach(), assumed_align=4
-        ).mark_layout_dynamic(leading_dim=0)
-        varlen_batch_idx_cute = (
-            from_dlpack(varlen_batch_idx.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=0)
-            if varlen_batch_idx is not None
+        num_m_blocks_cute, num_splits_dynamic_cute, varlen_batch_idx_cute, num_nheads_in_l2_cute = [
+            from_dlpack(t.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=t.ndim - 1)
+            if t is not None
+            else None
+            for t in (num_m_blocks, num_splits_dynamic, varlen_batch_idx, num_nheads_in_l2)
+        ]
+        tile_count_semaphore_cute = (
+            from_dlpack(tile_count_semaphore.detach(), assumed_align=4)
+            if tile_count_semaphore is not None
             else None
         )
-        num_nheads_in_l2_cute = from_dlpack(
-            num_nheads_in_l2.detach(), assumed_align=4
-        ).mark_layout_dynamic(leading_dim=0)
-        tile_count_semaphore_cute = from_dlpack(
-            tile_count_semaphore.detach(), assumed_align=4
-        ).mark_layout_dynamic(leading_dim=0)
 
     if score_mod is not None:
         if is_varlen:
@@ -1605,75 +1599,49 @@ def get_scheduler_metadata(
     # Override enable_pdl (not supported yet)
     enable_pdl = False
 
+    # Override sort (not supported yet)
+    sort = False
+
     # Compute seqlen_q if it's None (when cu_seqlens_q is provided)
     if seqlen_q is None:
         assert cu_seqlens_q is not None, "seqlen_q is None but cu_seqlens_q is also None"
         seqlen_q = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item()
 
     # Allocate metadata tensors (torch tensors)
-    prepare_seqlen_q = torch.empty(num_batch, dtype=torch.int32, device=device)
+    num_m_blocks = None
     num_splits_dynamic = torch.empty(num_batch, dtype=torch.int32, device=device)
-    varlen_batch_idx = torch.empty(num_batch, dtype=torch.int32, device=device) if sort else None
-    num_nheads_in_l2 = torch.empty(num_batch, dtype=torch.int32, device=device)
-    tile_count_semaphore = torch.empty(1, dtype=torch.int32, device=device)
+    varlen_batch_idx = None
+    num_nheads_in_l2 = None
+    tile_count_semaphore = None
+    # Will enable more metadata preparation in future commit
+    # num_m_blocks = torch.empty(num_batch, dtype=torch.int32, device=device)
+    # varlen_batch_idx = torch.empty(num_batch, dtype=torch.int32, device=device) if sort else None
+    # num_nheads_in_l2 = torch.empty(num_batch, dtype=torch.int32, device=device) if causal else None
+    # tile_count_semaphore = torch.empty(1, dtype=torch.int32, device=device)
 
-    # Convert to CuTe tensors
-    prepare_seqlen_q_cute = from_dlpack(
-        prepare_seqlen_q.detach(), assumed_align=4
-    ).mark_layout_dynamic(leading_dim=0)
-    num_splits_dynamic_cute = from_dlpack(
-        num_splits_dynamic.detach(), assumed_align=4
-    ).mark_layout_dynamic(leading_dim=0)
-
-    varlen_batch_idx_cute = (
-        from_dlpack(varlen_batch_idx.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=0)
-        if varlen_batch_idx is not None
+    num_m_blocks_cute, num_splits_dynamic_cute, varlen_batch_idx_cute, num_nheads_in_l2_cute = [
+        from_dlpack(t.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=t.ndim - 1)
+        if t is not None
         else None
-    )
-    num_nheads_in_l2_cute = from_dlpack(
-        num_nheads_in_l2.detach(), assumed_align=4
-    ).mark_layout_dynamic(leading_dim=0)
-    tile_count_semaphore_cute = from_dlpack(
-        tile_count_semaphore.detach(), assumed_align=4
-    ).mark_layout_dynamic(leading_dim=0)
-
-    # Convert input tensors to CuTe tensors
-    cu_seqlens_q_tensor = (
-        from_dlpack(cu_seqlens_q.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=0)
-        if cu_seqlens_q is not None
-        else None
-    )
-    cu_seqlens_k_tensor = (
-        from_dlpack(cu_seqlens_k.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=0)
-        if cu_seqlens_k is not None
-        else None
-    )
-    cu_seqlens_k_new_tensor = (
-        from_dlpack(cu_seqlens_k_new.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=0)
-        if cu_seqlens_k_new is not None
-        else None
-    )
-    seqused_q_tensor = (
-        from_dlpack(seqused_q.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=0)
-        if seqused_q is not None
-        else None
-    )
-    seqused_k_tensor = (
-        from_dlpack(seqused_k.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=0)
-        if seqused_k is not None
-        else None
-    )
-    leftpad_k_tensor = (
-        from_dlpack(leftpad_k.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=0)
-        if leftpad_k is not None
+        for t in (num_m_blocks, num_splits_dynamic, varlen_batch_idx, num_nheads_in_l2)
+    ]
+    
+    tile_count_semaphore_cute = (
+        from_dlpack(tile_count_semaphore.detach(), assumed_align=4)
+        if tile_count_semaphore is not None
         else None
     )
 
-    # Get or create stream
+    cu_seqlens_q_tensor, cu_seqlens_k_tensor, cu_seqlens_k_new_tensor, seqused_q_tensor, seqused_k_tensor, leftpad_k_tensor = [
+        from_dlpack(t.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=t.ndim - 1)
+        if t is not None
+        else None
+        for t in (cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new, seqused_q, seqused_k, leftpad_k)
+    ]
+
     if stream is None:
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
-    # Call prepare kernel
     prepare_varlen_num_blocks(
         num_batch=num_batch,
         seqlen_q=seqlen_q,
@@ -1698,7 +1666,7 @@ def get_scheduler_metadata(
         mSeqUsedQ=seqused_q_tensor,
         mSeqUsedK=seqused_k_tensor,
         mLeftPadK=leftpad_k_tensor,
-        mPrepareSeqlenQ=prepare_seqlen_q_cute,
+        mNumMBlocks=num_m_blocks_cute,
         mNumSplitsDynamic=num_splits_dynamic_cute,
         mVarlenBatchIdx=varlen_batch_idx_cute,
         mNumNheadsInL2=num_nheads_in_l2_cute if causal else None,
@@ -1706,7 +1674,7 @@ def get_scheduler_metadata(
     )
 
     return SchedulerMetadata(
-        prepare_seqlen_q=prepare_seqlen_q,
+        num_m_blocks=num_m_blocks,
         num_splits_dynamic=num_splits_dynamic,
         varlen_batch_idx=varlen_batch_idx,
         num_nheads_in_l2=num_nheads_in_l2,

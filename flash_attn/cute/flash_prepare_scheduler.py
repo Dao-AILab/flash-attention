@@ -53,7 +53,7 @@ class FlashPrepareScheduler:
         tile_m: int,
         tile_n: int,
         tile_count_semaphore: Optional[cute.Tensor],
-        mPrepareSeqlenQ: Optional[cute.Tensor],
+        mNumMBlocks: Optional[cute.Tensor],
         mNumSplitsDynamic: Optional[cute.Tensor],
         mVarlenBatchIdx: Optional[cute.Tensor],
         mNumNheadsInL2: Optional[cute.Tensor],
@@ -134,7 +134,7 @@ class FlashPrepareScheduler:
             tile_m_divmod,
             tile_n_divmod,
             tile_count_semaphore,
-            mPrepareSeqlenQ,
+            mNumMBlocks,
             mNumSplitsDynamic,
             mVarlenBatchIdx,
             mNumNheadsInL2,
@@ -167,7 +167,7 @@ class FlashPrepareScheduler:
         tile_m_divmod: FastDivmod,
         tile_n_divmod: FastDivmod,
         tile_count_semaphore: Optional[cute.Tensor],
-        mPrepareSeqlenQ: Optional[cute.Tensor],
+        mNumMBlocks: Optional[cute.Tensor],
         mNumSplitsDynamic: Optional[cute.Tensor],
         mVarlenBatchIdx: Optional[cute.Tensor],
         mNumNheadsInL2: Optional[cute.Tensor],
@@ -190,8 +190,9 @@ class FlashPrepareScheduler:
             total_blocks_smem[0] = Int32(0)
         cute.arch.sync_threads()
 
-        if tidx == 0 and const_expr(tile_count_semaphore is not None):
-            tile_count_semaphore[0] = Int32(0)
+        if const_expr(tile_count_semaphore is not None):
+            if tidx == 0:
+                tile_count_semaphore[0] = Int32(0)
 
         batch_cta_idx_offset = bidx * 992
         bidb_start = batch_cta_idx_offset + k_num_batch_per_warp * warp_idx
@@ -245,20 +246,17 @@ class FlashPrepareScheduler:
         if const_expr(self.sort):
             # TODO: Implement sort logic
             pass
-        else:
-            if batch_idx < self.num_batch and lane_idx < Int32(k_num_batch_per_warp):
-                if const_expr(mPrepareSeqlenQ is not None):
-                    if const_expr(self.packgqa):
-                        mPrepareSeqlenQ[batch_idx] = seqlen_q * qhead_per_khead
-                    else:
-                        mPrepareSeqlenQ[batch_idx] = seqlen_q
-                if const_expr(mNumSplitsDynamic is not None):
-                    mNumSplitsDynamic[batch_idx] = num_splits_dynamic
-                if const_expr(mNumNheadsInL2 is not None):
-                    nheads_in_l2 = self.get_num_nheads_in_l2(
-                        num_n_blocks, num_head, max_kvblocks_in_l2, qhead_per_khead
-                    )
-                    mNumNheadsInL2[batch_idx] = nheads_in_l2
+        
+        if batch_idx < self.num_batch and lane_idx < Int32(k_num_batch_per_warp):
+            if const_expr(mNumMBlocks is not None):
+                mNumMBlocks[batch_idx] = num_m_blocks
+            if const_expr(mNumSplitsDynamic is not None):
+                mNumSplitsDynamic[batch_idx] = num_splits_dynamic
+            if const_expr(mNumNheadsInL2 is not None):
+                nheads_in_l2 = self.get_num_nheads_in_l2(
+                    num_n_blocks, num_head, max_kvblocks_in_l2, qhead_per_khead
+                )
+                mNumNheadsInL2[batch_idx] = nheads_in_l2
 
     @cute.jit
     def get_num_m_blocks_and_seqlen(
@@ -398,7 +396,7 @@ def prepare_varlen_num_blocks(
     mSeqUsedQ: Optional[cute.Tensor] = None,
     mSeqUsedK: Optional[cute.Tensor] = None,
     mLeftPadK: Optional[cute.Tensor] = None,
-    mPrepareSeqlenQ: Optional[cute.Tensor] = None,
+    mNumMBlocks: Optional[cute.Tensor] = None,
     mNumSplitsDynamic: Optional[cute.Tensor] = None,
     mVarlenBatchIdx: Optional[cute.Tensor] = None,
     mNumNheadsInL2: Optional[cute.Tensor] = None,
@@ -434,7 +432,7 @@ def prepare_varlen_num_blocks(
         mSeqUsedQ: Used sequence lengths for Q (shape: [batch_size])
         mSeqUsedK: Used sequence lengths for K (shape: [batch_size])
         mLeftPadK: Left padding for K (shape: [batch_size])
-        mPrepareSeqlenQ: Output tensor for prepared Q sequence lengths (shape: [batch_size])
+        mNumMBlocks: Output tensor for number of m blocks (shape: [batch_size])
         mNumSplitsDynamic: Output tensor for dynamic number of splits (shape: [batch_size])
         mVarlenBatchIdx: Output tensor for varlen batch indices (shape: [batch_size])
         mNumNheadsInL2: Output tensor for number of heads in L2 (shape: [batch_size])
@@ -454,7 +452,7 @@ def prepare_varlen_num_blocks(
         mSeqUsedQ is not None,
         mSeqUsedK is not None,
         mLeftPadK is not None,
-        mPrepareSeqlenQ is not None,
+        mNumMBlocks is not None,
         mNumSplitsDynamic is not None,
         mVarlenBatchIdx is not None,
         mNumNheadsInL2 is not None,
@@ -483,7 +481,7 @@ def prepare_varlen_num_blocks(
             tile_m,
             tile_n,
             tile_count_semaphore,
-            mPrepareSeqlenQ,
+            mNumMBlocks,
             mNumSplitsDynamic,
             mVarlenBatchIdx,
             mNumNheadsInL2,
@@ -512,7 +510,7 @@ def prepare_varlen_num_blocks(
         tile_m,
         tile_n,
         tile_count_semaphore,
-        mPrepareSeqlenQ,
+        mNumMBlocks,
         mNumSplitsDynamic,
         mVarlenBatchIdx,
         mNumNheadsInL2,
