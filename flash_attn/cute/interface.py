@@ -561,6 +561,7 @@ def _flash_attn_bwd(
     cu_seqlens_k: Optional[torch.Tensor] = None,
     seqused_q: Optional[torch.Tensor] = None,
     seqused_k: Optional[torch.Tensor] = None,
+    deterministic: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     compute_capability = torch.cuda.get_device_capability()[0]
     assert compute_capability in [9, 10], "Unsupported compute capability. Supported: 9.x, 10.x"
@@ -659,6 +660,8 @@ def _flash_attn_bwd(
         pack_gqa = qhead_per_kvhead > 1
     if compute_capability == 10:
         pack_gqa = False # override for now
+    if compute_capability != 10:
+        assert deterministic is False, "bwd deterministic only supported for sm100 for now"
 
     device = q.device
     # TODO: check if this is the right rounding
@@ -757,6 +760,22 @@ def _flash_attn_bwd(
         else None
         for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
     ]
+    if deterministic:
+        dQ_semaphore = torch.zeros(batch_size, num_head, seqlen_q_rounded // m_block_size, 1, dtype=torch.int32, device="cuda")
+    else:
+        dQ_semaphore = None
+
+    if deterministic and qhead_per_kvhead > 1:
+        dK_semaphore = torch.zeros(batch_size, num_head_kv, seqlen_k_rounded // n_block_size, 2, dtype=torch.int32, device="cuda")
+        dV_semaphore = torch.zeros(batch_size, num_head_kv, seqlen_k_rounded // n_block_size, 2, dtype=torch.int32, device="cuda")
+    else:
+        dK_semaphore = None
+        dV_semaphore = None
+    dQ_semaphore_tensor, dK_semaphore_tensor, dV_semaphore_tensor = [
+        utils.convert_from_dlpack_leading_static(t.detach(), leading_dim=3, alignment=4, stride_order=t.dim_order())
+        if t is not None else None
+        for t in (dQ_semaphore, dK_semaphore, dV_semaphore)
+    ]
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     # Preprocess kernel: compute (o * dout).sum(dim=-1), lse * log2_e, and zero out dq_accum.
@@ -831,6 +850,7 @@ def _flash_attn_bwd(
             num_threads,
             pack_gqa,
             cluster_size,
+            deterministic,
         )
     num_threads = 384
     if compile_key not in _flash_attn_bwd.compile_cache:
@@ -885,6 +905,7 @@ def _flash_attn_bwd(
                 # tile_n=n_block_size,
                 cluster_size=cluster_size,
                 # cluster_size=1,
+                deterministic=deterministic,
             )
         # TODO: check @can_implement
         _flash_attn_bwd.compile_cache[compile_key] = cute.compile(
@@ -904,6 +925,9 @@ def _flash_attn_bwd(
             cu_seqlens_k_tensor,
             seqused_q_tensor,
             seqused_k_tensor,
+            mdQ_semaphore=dQ_semaphore_tensor,
+            mdK_semaphore=dK_semaphore_tensor,
+            mdV_semaphore=dV_semaphore_tensor,
         )
     _flash_attn_bwd.compile_cache[compile_key](
         q_tensor,
@@ -921,6 +945,9 @@ def _flash_attn_bwd(
         cu_seqlens_k_tensor,
         seqused_q_tensor,
         seqused_k_tensor,
+        mdQ_semaphore=dQ_semaphore_tensor,
+        mdK_semaphore=dK_semaphore_tensor,
+        mdV_semaphore=dV_semaphore_tensor,
     )
 
     num_threads = 256 if compute_capability == 9 else 128
@@ -1028,6 +1055,7 @@ class FlashAttnFunc(torch.autograd.Function):
         softcap: float = 0.0,
         num_splits: int = 1,
         pack_gqa: Optional[bool] = None,
+        deterministic: bool = False,
         mask_mod: Optional[Callable] = None,
         full_block_cnt: Optional[torch.Tensor] = None,
         full_block_idx: Optional[torch.Tensor] = None,
@@ -1063,6 +1091,7 @@ class FlashAttnFunc(torch.autograd.Function):
         ctx.causal = causal
         ctx.window_size = window_size
         ctx.softcap = softcap
+        ctx.deterministic = deterministic
         return out, lse
 
     @staticmethod
@@ -1078,6 +1107,7 @@ class FlashAttnFunc(torch.autograd.Function):
             ctx.softmax_scale,
             ctx.causal,
             ctx.softcap,
+            deterministic=ctx.deterministic,
         )
         return dq, dk, dv, *((None,) * 20)  # Extra Nones is fine
 
@@ -1101,6 +1131,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         softcap: float = 0.0,
         num_splits: int = 1,
         pack_gqa: Optional[bool] = None,
+        deterministic: bool = False,
     ):
         out, lse = _flash_attn_fwd(
             q,
@@ -1125,6 +1156,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         ctx.causal = causal
         ctx.window_size = window_size
         ctx.softcap = softcap
+        ctx.deterministic = deterministic
         return out, lse
 
     @staticmethod
@@ -1146,6 +1178,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             cu_seqlens_k=cu_seqlens_k,
             seqused_q=seqused_q,
             seqused_k=seqused_k,
+            deterministic=ctx.deterministic,
         )
 
         return dq, dk, dv, *((None,) * 20)
@@ -1162,6 +1195,7 @@ def flash_attn_func(
     softcap: float = 0.0,
     num_splits: int = 1,
     pack_gqa: Optional[bool] = None,
+    deterministic: bool = False,
     mask_mod: Optional[Callable] = None,
     full_block_cnt: Optional[torch.Tensor] = None,
     full_block_idx: Optional[torch.Tensor] = None,
@@ -1179,6 +1213,7 @@ def flash_attn_func(
         softcap,
         num_splits,
         pack_gqa,
+        deterministic,
         mask_mod,
         full_block_cnt,
         full_block_idx,
@@ -1203,6 +1238,7 @@ def flash_attn_varlen_func(
     softcap: float = 0.0,
     num_splits: int = 1,
     pack_gqa: Optional[bool] = None,
+    deterministic: bool = False,
 ):
     return FlashAttnVarlenFunc.apply(
         q,
@@ -1220,6 +1256,7 @@ def flash_attn_varlen_func(
         softcap,
         num_splits,
         pack_gqa,
+        deterministic,
     )
 
 
