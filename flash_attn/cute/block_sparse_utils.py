@@ -283,6 +283,7 @@ def consume_block_sparse_loads(
     score_mod_fn,
     O_should_accumulate,
     mask_mod,
+    fastdiv_mods,
     intra_wg_overlap: cutlass.Constexpr,
     warp_scheduler_barrier_sync: Callable,
     warp_scheduler_barrier_arrive: Callable,
@@ -309,7 +310,12 @@ def consume_block_sparse_loads(
                 kv_consumer_state,
                 n_block=mask_n_block,
                 mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
-                mask_fn=partial(mask_fn, mask_mod=mask_mod, mask_seqlen=True),
+                mask_fn=partial(
+                    mask_fn,
+                    mask_mod=mask_mod,
+                    mask_seqlen=True,
+                    fastdiv_mods=fastdiv_mods if cutlass.const_expr(mask_mod is not None) else None,
+                ),
                 is_first_n_block=True,
             )
             O_should_accumulate = True
@@ -374,7 +380,12 @@ def consume_block_sparse_loads(
             kv_consumer_state = process_first_half_block(
                 n_block=mask_n_block,
                 kv_consumer_state=kv_consumer_state,
-                mask_fn=partial(mask_fn, mask_mod=mask_mod),
+                mask_fn=partial(
+                    mask_fn,
+                    mask_mod=mask_mod,
+                    mask_seqlen=True,
+                    fastdiv_mods=fastdiv_mods if cutlass.const_expr(mask_mod is not None) else None,
+                ),
                 score_mod_fn=score_mod_fn,
                 is_first_block=True,
             )
@@ -394,7 +405,7 @@ def consume_block_sparse_loads(
                 kv_consumer_state = process_first_half_block(
                     n_block=full_n_block,
                     kv_consumer_state=kv_consumer_state,
-                    mask_fn=partial(mask_fn, mask_mod=None),
+                    mask_fn=partial(mask_fn, mask_mod=None, mask_seqlen=True),
                     score_mod_fn=score_mod_fn,
                     is_first_block=True,
                 )

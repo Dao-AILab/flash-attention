@@ -969,6 +969,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             thr_mma=thr_mma_qk,
             mask_causal=self.is_causal,
             mask_local=self.is_local,
+            fastdiv_mods=fastdiv_mods if const_expr(self.mask_mod is not None) else None,
         )
 
         # First iteration with seqlen masking
@@ -1991,6 +1992,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 mask_causal=self.is_causal,
                 mask_local=self.is_local,
                 aux_tensors=aux_tensors,
+                fastdiv_mods=fastdiv_mods,
             )
             score_mod_fn = None
             if const_expr(self.score_mod is not None):
@@ -2131,11 +2133,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     score_mod_fn,
                     O_should_accumulate,
                     self.mask_mod,
+                    fastdiv_mods,
                     self.intra_wg_overlap,
                     self.warp_scheduler_barrier_sync,
                     self.warp_scheduler_barrier_arrive,
                 )
-                
+
                 # Handle empty case (when no blocks to process)
                 if not processed_any:
                     softmax.reset()

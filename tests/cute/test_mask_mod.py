@@ -211,6 +211,15 @@ def _run_mask_test(
             return original_flex_mask(b, h, q_idx, kv_idx, doc_ids)
 
         aux_tensors_arg = [doc_ids]
+    elif mask_name == "ima":
+        bias_threshold = (seqlen_k // 4) * 3
+        bias = torch.full((seqlen_k,), bias_threshold, dtype=torch.int32, device="cuda")
+        original_flex_mask = mask_mod_flex
+
+        def mask_mod_flex(b, h, q_idx, kv_idx, bias=bias):
+            return original_flex_mask(b, h, q_idx, kv_idx, bias)
+
+        aux_tensors_arg = [bias]
     causal = False
 
     if causal and seqlen_k < seqlen_q:
@@ -344,6 +353,23 @@ def _run_mask_test(
     # Use the same assertion logic as FlashAttention tests
     assert cute_error <= rtol * pt_error + fwd_atol, (
         f"Kernel error {cute_error:.2e} exceeds {rtol}x PyTorch error {pt_error:.2e} + {fwd_atol:.2e}"
+    )
+
+
+def test_mask_mod_ima_partial_block():
+    _run_mask_test(
+        seqlen_q=257,
+        seqlen_k=257,
+        nheads=1,
+        kv_mode="mha",
+        headdim=128,
+        dtype=torch.bfloat16,
+        mask_name="ima",
+        window_size=None,
+        window_left=None,
+        window_right=None,
+        tile_m=128,
+        tile_n=128,
     )
 
 

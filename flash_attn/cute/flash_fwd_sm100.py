@@ -1628,6 +1628,7 @@ class FlashAttentionForwardSm100:
             mask_fn = partial(
                 mask.apply_mask_sm100,
                 mask_mod=block_mask_mod,
+                fastdiv_mods=fastdiv_mods,
                 **shared_mask_kwargs,
             )
             if const_expr(self.use_block_sparsity):
@@ -1635,6 +1636,7 @@ class FlashAttentionForwardSm100:
                 mask_fn_none = partial(
                     mask.apply_mask_sm100,
                     mask_mod=None,
+                    fastdiv_mods=fastdiv_mods,
                     **shared_mask_kwargs,
                 )
             else:
@@ -1674,7 +1676,6 @@ class FlashAttentionForwardSm100:
                 seqlen=seqlen,
                 aux_tensors=aux_tensors,
                 fastdiv_mods=fastdiv_mods,
-                mask_fn=partial(mask_fn, mask_seqlen=False),
             )
 
             if has_work:
