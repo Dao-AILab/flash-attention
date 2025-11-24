@@ -158,6 +158,58 @@ def score_mod_11(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
 
     return tSrS_ssa + head_val + pos_val
 
+@cute.jit
+def score_mod_global_idx_1(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors, q_idx_global, kv_idx_global):
+    """Per-token bias using global kv index into packed tensor."""
+    token_bias = aux_tensors[0]  # [total_k]
+    
+    dtype = token_bias.element_type
+    
+    kv_frag = cute.make_fragment(1, cutlass.Int32)
+    kv_frag.store(kv_idx_global)
+    bias_frag = cute.make_fragment(1, dtype)
+    bias_frag[0] = token_bias[kv_frag[0]]
+    bias_val = (bias_frag.load()).to(cutlass.Float32)
+    
+    return tSrS_ssa + bias_val
+
+
+@cute.jit
+def score_mod_global_idx_2(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors, q_idx_global, kv_idx_global):
+    """Per-token bias using global q index into packed tensor."""
+    token_bias = aux_tensors[0]  # [total_q]
+    
+    dtype = token_bias.element_type
+    
+    q_frag = cute.make_fragment(1, cutlass.Int32)
+    q_frag.store(q_idx_global)
+    bias_frag = cute.make_fragment(1, dtype)
+    bias_frag[0] = token_bias[q_frag[0]]
+    bias_val = (bias_frag.load()).to(cutlass.Float32)
+    
+    return tSrS_ssa + bias_val
+
+
+@cute.jit
+def score_mod_global_idx_3(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors, q_idx_global, kv_idx_global):
+    """Combined: relative position (logical) + per-token bias (global)."""
+    token_bias = aux_tensors[0]  # [total_k]
+    
+    dtype = token_bias.element_type
+    
+    # Relative position using logical indices
+    rel_pos = q_idx - kv_idx
+    rel_pos_abs = cute.TensorSSA(mlir_math.absi(rel_pos), rel_pos.shape, rel_pos.dtype)
+    rel_bias = rel_pos_abs.to(cutlass.Float32) * cute.full_like(tSrS_ssa, 0.1)
+    
+    # Per-token bias using global index
+    kv_frag = cute.make_fragment(1, cutlass.Int32)
+    kv_frag.store(kv_idx_global)
+    bias_frag = cute.make_fragment(1, dtype)
+    bias_frag[0] = token_bias[kv_frag[0]]
+    bias_val = (bias_frag.load()).to(cutlass.Float32)
+    
+    return tSrS_ssa + rel_bias + bias_val
 
 # Eager reference functions for comparison
 def identity_eager(score, b, h, q_idx, kv_idx):
@@ -217,6 +269,32 @@ def dual_buffer_bias(head_bias, pos_scale):
         return score + pos_component + head_component
 
     return dual_buffer_mod
+
+def packed_kv_bias(bias_tensor, cu_seqlens_k):
+    """Per-token bias indexed by global kv position."""
+    def packed_kv_bias_mod(score, b, h, q_idx, kv_idx):
+        # In eager reference, we simulate the global index
+        kv_global = cu_seqlens_k[b] + kv_idx
+        return score + bias_tensor[kv_global]
+    return packed_kv_bias_mod
+
+
+def packed_q_bias(bias_tensor, cu_seqlens_q):
+    """Per-token bias indexed by global q position."""
+    def packed_q_bias_mod(score, b, h, q_idx, kv_idx):
+        q_global = cu_seqlens_q[b] + q_idx
+        return score + bias_tensor[q_global]
+    return packed_q_bias_mod
+
+
+def packed_kv_bias_with_rel_pos(bias_tensor, cu_seqlens_k):
+    """Combined relative position + per-token bias."""
+    def combined_mod(score, b, h, q_idx, kv_idx):
+        rel_bias = torch.abs(q_idx - kv_idx).float() * 0.1
+        kv_global = cu_seqlens_k[b] + kv_idx
+        token_bias = bias_tensor[kv_global]
+        return score + rel_bias + token_bias
+    return combined_mod
 
 
 # Test pairs: (cute_jit_function, eager_reference_function)
@@ -601,6 +679,165 @@ def test_varlen_with_score_mod(seqlens_q, seqlens_k, dtype, score_mod_pair):
 
     assert cute_error <= rtol * pt_error + fwd_atol + 1e-4
 
+
+# Test pairs for global index tests (varlen only)
+TEST_PAIRS_GLOBAL_IDX = [
+    (score_mod_global_idx_1, packed_kv_bias, "kv"),
+    (score_mod_global_idx_2, packed_q_bias, "q"),
+    (score_mod_global_idx_3, packed_kv_bias_with_rel_pos, "kv"),
+]
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "seqlens_q, seqlens_k",
+    [
+        ([64, 56, 128], [64, 56, 128]),
+        ([12, 256], [12, 256]),
+        ([100, 100], [50, 50]),
+        ([32, 64, 128, 64], [32, 64, 128, 64]),
+        ([17, 33, 65], [17, 33, 65]),
+    ],
+)
+@pytest.mark.parametrize("score_mod_tuple", TEST_PAIRS_GLOBAL_IDX)
+def test_varlen_with_global_idx_score_mod(seqlens_q, seqlens_k, dtype, score_mod_tuple):
+    """Test varlen with score_mods that use q_idx_global/kv_idx_global for packed aux tensors."""
+    torch.random.manual_seed(42)
+    cute_score_mod, eager_score_mod_factory, bias_type = score_mod_tuple
+
+    num_heads = 4
+    head_dim = 128
+
+    total_q = sum(seqlens_q)
+    total_k = sum(seqlens_k)
+
+    cu_seqlens_q = torch.tensor(
+        [0] + list(torch.tensor(seqlens_q).cumsum(0).tolist()),
+        device="cuda",
+        dtype=torch.int32,
+    )
+    cu_seqlens_k = torch.tensor(
+        [0] + list(torch.tensor(seqlens_k).cumsum(0).tolist()),
+        device="cuda",
+        dtype=torch.int32,
+    )
+
+    q = torch.randn(total_q, num_heads, head_dim, device="cuda", dtype=dtype)
+    k = torch.randn(total_k, num_heads, head_dim, device="cuda", dtype=dtype)
+    v = torch.randn(total_k, num_heads, head_dim, device="cuda", dtype=dtype)
+
+    # Create packed bias tensor
+    if bias_type == "kv":
+        bias_tensor = torch.randn(total_k, device="cuda", dtype=dtype) * 0.1
+        eager_score_mod = eager_score_mod_factory(bias_tensor, cu_seqlens_k)
+    else:  # "q"
+        bias_tensor = torch.randn(total_q, device="cuda", dtype=dtype) * 0.1
+        eager_score_mod = eager_score_mod_factory(bias_tensor, cu_seqlens_q)
+
+    aux_tensors = [bias_tensor]
+
+    # Reference Run (FP32)
+    out_ref_fp32 = run_flex_varlen_ref(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        eager_score_mod,
+        dtype=torch.float32,
+    )
+
+    # Reference Run (Target Dtype)
+    out_pt = run_flex_varlen_ref(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        eager_score_mod,
+        dtype=dtype,
+    )
+
+    # CuTe Run
+    out_cute = run_cute_flash(
+        q,
+        k,
+        v,
+        cute_score_mod,
+        aux_tensors=aux_tensors,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        pack_gqa=False,
+    )
+
+    assert not torch.isnan(out_cute).any(), "Output contains NaN values"
+    assert torch.isfinite(out_cute).all(), "Output contains infinite values"
+    assert out_cute.shape == out_ref_fp32.shape
+
+    fwd_atol = 2 * (out_ref_fp32 + 0.3 - 0.3 - out_ref_fp32).abs().max().item()
+    rtol = 2
+
+    pt_error = (out_pt - out_ref_fp32).abs().max().item()
+    cute_error = (out_cute - out_ref_fp32).abs().max().item()
+
+    print(f"\nNumerical comparison for {cute_score_mod.__name__} (Varlen + Global Idx):")
+    print(f"  PyTorch vs FP32 ref max error: {pt_error:.2e}")
+    print(f"  CuTE vs FP32 ref max error: {cute_error:.2e}")
+
+    assert cute_error <= rtol * pt_error + fwd_atol + 1e-4, (
+        f"CuTE error {cute_error:.2e} exceeds tolerance"
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_kv",
+    [
+        (64, 64),
+        (128, 128),
+        (256, 256),
+    ],
+)
+def test_non_varlen_global_idx_equals_logical(seqlen_q, seqlen_kv, dtype):
+    """Test that in non-varlen mode, q_idx_global == q_idx and kv_idx_global == kv_idx."""
+    torch.random.manual_seed(42)
+
+    # This score_mod verifies global == logical by returning -inf if they differ
+    @cute.jit
+    def score_mod_verify_global_equals_logical(
+        tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors, q_idx_global, kv_idx_global
+    ):
+        # If global != logical, this would produce wrong results
+        q_match = operator.eq(q_idx, q_idx_global)
+        kv_match = operator.eq(kv_idx, kv_idx_global)
+        both_match = q_match & kv_match
+        return cute.where(both_match, tSrS_ssa, cute.full_like(tSrS_ssa, float("-inf")))
+
+    def eager_identity(score, b, h, q_idx, kv_idx):
+        return score
+
+    num_heads = 4
+    head_dim = 128
+    batch_size = 2
+
+    q, k, v = create_tensors(
+        batch_size=batch_size,
+        seqlen_q=seqlen_q,
+        seqlen_kv=seqlen_kv,
+        num_heads=num_heads,
+        dtype=dtype,
+    )
+
+    out_ref = run_flex_reference(q, k, v, eager_identity, dtype=dtype)
+    out_cute = run_cute_flash(q, k, v, score_mod_verify_global_equals_logical)
+
+    assert not torch.isnan(out_cute).any(), "Output contains NaN - global indices don't match logical!"
+    assert torch.isfinite(out_cute).all(), "Output contains inf - global indices don't match logical!"
+
+    # Should match identity since global == logical in non-varlen
+    error = (out_cute - out_ref).abs().max().item()
+    assert error < 1e-2, f"Non-varlen global idx test failed with error {error}"
+    print(f"\nNon-varlen global==logical verification passed, max error: {error:.2e}")
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

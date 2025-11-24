@@ -1865,6 +1865,8 @@ class FlashAttentionForwardSm100:
         tSrS_t2r = cute.make_fragment(thr_tmem_load.partition_D(tScS).shape, self.qk_acc_dtype)
         cute.copy(thr_tmem_load, tStS_t2r, tSrS_t2r)
         if cutlass.const_expr(self.score_mod is not None):
+            offset_q = 0 if const_expr(not seqlen.has_cu_seqlens_q) else seqlen.offset_q
+            offset_k = 0 if const_expr(not seqlen.has_cu_seqlens_k) else seqlen.offset_k
             self.apply_score_mod(
                 tSrS_t2r,
                 thr_tmem_load,
@@ -1876,6 +1878,8 @@ class FlashAttentionForwardSm100:
                 softmax,
                 aux_tensors,
                 fastdiv_mods,
+                offset_q=offset_q,
+                offset_k=offset_k,
             )
 
         if const_expr(mask_fn is not None):
@@ -2639,6 +2643,8 @@ class FlashAttentionForwardSm100:
         softmax,
         aux_tensors=None,
         fastdiv_mods=(None, None),
+        offset_q=0,
+        offset_k=0,
     ):
         """Apply score modification for SM100 (constant q_idx)."""
         # Prepare index tensor with extra partition
@@ -2675,4 +2681,6 @@ class FlashAttentionForwardSm100:
             fastdiv_mods,
             constant_q_idx=q_idx_logical,
             qhead_per_kvhead=self.qhead_per_kvhead if cutlass.const_expr(self.pack_gqa) else 1,
+            offset_q=offset_q,
+            offset_k=offset_k,
         )
