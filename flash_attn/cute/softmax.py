@@ -341,6 +341,8 @@ def apply_score_mod_inner(
     fastdiv_mods,
     constant_q_idx: cutlass.Constexpr,
     qhead_per_kvhead: cutlass.Constexpr[int] = 1,
+    offset_q: cutlass.Int32 = 0,
+    offset_k: cutlass.Int32 = 0,
 ):
     """Shared implementation for applying score modification.
 
@@ -359,6 +361,8 @@ def apply_score_mod_inner(
                        If None, compute q_idx per-element
         qhead_per_kvhead_packgqa: Pack-GQA replication factor. Divide q_idx by this
                                   when greater than 1 so score mods see logical heads.
+        offset_q: Offset for q_idx when using varlen
+        offset_k: Offset for kv_idx when using varlen
     """
     n_vals = cutlass.const_expr(cute.size(score_tensor.shape))
     score_vec = cute.make_fragment(vec_size, qk_acc_dtype)
@@ -374,6 +378,9 @@ def apply_score_mod_inner(
     # since a thread my process multiple query head indices
     if cutlass.const_expr(qhead_per_kvhead > 1 and constant_q_idx is None):
         head_idx_vec = cute.make_fragment(vec_size, cutlass.Int32)
+        
+    q_idx_global_vec = cute.make_fragment(vec_size, cutlass.Int32)
+    kv_idx_global_vec = cute.make_fragment(vec_size, cutlass.Int32)
 
     for i in cutlass.range(0, n_vals, vec_size, unroll_full=True):
         for j in cutlass.range(vec_size, unroll_full=True):
@@ -404,6 +411,11 @@ def apply_score_mod_inner(
                 if constant_q_idx is None:
                     q_idx_vec[j] = floor_if_packed(index_tensor[i + j][0], qhead_per_kvhead)
                 kv_idx_vec[j] = index_tensor[i + j][1]
+            
+            if constant_q_idx is None:
+                q_idx_unwrapped = floor_if_packed(index_tensor[i + j][0], qhead_per_kvhead)
+                q_idx_global_vec[j] = offset_q + q_idx_unwrapped
+            kv_idx_global_vec[j] = offset_k + index_tensor[i + j][1]
 
         # Convert to SSA for score_mod call
         score_ssa = score_vec.load()
@@ -424,6 +436,14 @@ def apply_score_mod_inner(
         aux_args = []
         if cutlass.const_expr(aux_tensors is not None):
             aux_args = aux_tensors
+            
+        # Global index SSA
+        if cutlass.const_expr(constant_q_idx is None):
+            q_idx_global_ssa = q_idx_global_vec.load()
+        else:
+            q_idx_global_const = offset_q + constant_q_idx
+            q_idx_global_ssa = utils.scalar_to_ssa(q_idx_global_const, cutlass.Int32).broadcast_to((vec_size,))
+        kv_idx_global_ssa = kv_idx_global_vec.load()
 
         post_mod_scores = score_mod(
             score_ssa,
@@ -432,6 +452,8 @@ def apply_score_mod_inner(
             q_idx=q_idx_ssa,
             kv_idx=kv_idx_ssa,
             aux_tensors=aux_args,
+            q_idx_global=q_idx_global_ssa,
+            kv_idx_global=kv_idx_global_ssa,
         )
 
         # Write back modified scores
