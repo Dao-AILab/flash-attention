@@ -171,6 +171,7 @@ def _run_mask_test(
     window_right,
     tile_m,
     tile_n,
+    use_block_sparsity,
 ):
     torch.manual_seed(42)
 
@@ -267,7 +268,7 @@ def _run_mask_test(
         mask_block_idx=mask_idx,
         full_block_cnt=full_cnt,
         full_block_idx=full_idx,
-    )
+    ) if use_block_sparsity else None
 
     out_tuple = _flash_attn_fwd(
         q=tensors["q"],
@@ -370,6 +371,7 @@ def test_mask_mod_ima_partial_block():
         window_right=None,
         tile_m=128,
         tile_n=128,
+        use_block_sparsity=True,
     )
 
 
@@ -378,13 +380,14 @@ def test_mask_mod_ima_partial_block():
 @pytest.mark.parametrize("kv_mode", ["mha", "gqa", "mqa"])
 @pytest.mark.parametrize("headdim", [128])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("use_block_sparsity", [True, False])
 @pytest.mark.parametrize(
     "mask_name",
     ["block_diagonal", "mini_causal"],
 )
 @pytest.mark.parametrize("tile_m,tile_n", [(128, 128), (128, 112)])
 def test_static_masks(
-    seqlen_q, seqlen_k, nheads, kv_mode, headdim, dtype, mask_name, tile_m, tile_n
+    seqlen_q, seqlen_k, nheads, kv_mode, headdim, dtype, use_block_sparsity, mask_name, tile_m, tile_n
 ):
     """Test static masks that don't require recompilation per seqlen pair.
 
@@ -408,6 +411,7 @@ def test_static_masks(
         window_right=None,
         tile_m=tile_m,
         tile_n=tile_n,
+        use_block_sparsity=use_block_sparsity,
     )
 
 
@@ -416,6 +420,7 @@ def test_static_masks(
 @pytest.mark.parametrize("kv_mode", ["mha"])
 @pytest.mark.parametrize("headdim", [128])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("use_block_sparsity", [True, False])
 @pytest.mark.parametrize(
     "mask_name,window_size",
     [
@@ -429,7 +434,7 @@ def test_static_masks(
 )
 @pytest.mark.parametrize("tile_m,tile_n", [(128, 128), (128, 112), (64, 128)])
 def test_parameterized_masks(
-    seqlen_q, seqlen_k, nheads, kv_mode, headdim, dtype, mask_name, window_size, tile_m, tile_n
+    seqlen_q, seqlen_k, nheads, kv_mode, headdim, dtype, use_block_sparsity, mask_name, window_size, tile_m, tile_n
 ):
     """Test parameterized masks that require recompilation per seqlen pair.
 
@@ -456,6 +461,7 @@ def test_parameterized_masks(
         window_right=None,
         tile_m=tile_m,
         tile_n=tile_n,
+        use_block_sparsity=use_block_sparsity,
     )
 
 
@@ -506,3 +512,4 @@ def test_sm100_block_sparse_sink_all_masked():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])
+    

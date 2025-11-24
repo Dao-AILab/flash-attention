@@ -369,10 +369,6 @@ def _flash_attn_fwd(
             )
 
     if mask_mod is not None:
-        if not use_block_sparsity:
-            raise NotImplementedError(
-                "mask_mod requires the use of block sparsity. This will be fixed in a future PR."
-            )
         if is_varlen:
             raise NotImplementedError(
                 "mask_mod with aux_tensors is not yet supported for varlen sequences. This will be fixed in a future PR."
