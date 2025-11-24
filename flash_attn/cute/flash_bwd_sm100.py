@@ -547,7 +547,7 @@ class FlashAttentionBackwardSm100:
         self.tma_copy_bytes["dKacc"] = self.tile_n * self.dK_reduce_ncol * Float32.width // 8
 
         # TileScheduler = SingleTileScheduler
-        if const_expr(self.is_causal or self.deterministic):
+        if const_expr(self.deterministic):
             TileScheduler = SingleTileLPTBwdScheduler
         else:
             TileScheduler = SingleTileScheduler
