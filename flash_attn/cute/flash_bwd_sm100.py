@@ -91,6 +91,7 @@ class FlashAttentionBackwardSm100:
         # Speed optimizations, does not affect correctness
         self.shuffle_LSE = False
         self.shuffle_dPsum = False
+        self.use_smem_dS_for_mma_dK = self.deterministic and self.is_causal
 
         self.reduce_warp_ids = (0, 1, 2, 3)
         self.compute_warp_ids = (4, 5, 6, 7, 8, 9, 10, 11)
@@ -203,6 +204,10 @@ class FlashAttentionBackwardSm100:
             a_source=tcgen05.OperandSource.TMEM,
         )
         # dK += dS.T @ Q
+        if const_expr(self.use_smem_dS_for_mma_dK):
+            mma_dK_a_src = tcgen05.OperandSource.SMEM
+        else:
+            mma_dK_a_src = tcgen05.OperandSource.TMEM
         tiled_mma_dK = sm100_utils_basic.make_trivial_tiled_mma(
             self.do_dtype,
             tcgen05.OperandMajorMode.K,  # dS_major_mode
@@ -210,7 +215,7 @@ class FlashAttentionBackwardSm100:
             self.acc_dtype,
             cta_group,
             self.mma_tiler_dsq[:2],
-            a_source=tcgen05.OperandSource.TMEM,
+            a_source=mma_dK_a_src,
         )
         # dQ = dS @ K
         tiled_mma_dQ = sm100_utils_basic.make_trivial_tiled_mma(
@@ -1367,8 +1372,10 @@ class FlashAttentionBackwardSm100:
         tdPrV = tiled_mma_dP.make_fragment_A(sV)
         tdPrdOt = tiled_mma_dP.make_fragment_B(sdOt)
         # dK = dS.T @ Q
-        # tdKrdS = tiled_mma_dK.make_fragment_A(sdSt)
-        tdKrdS = tiled_mma_dK.make_fragment_A(tdS)
+        if const_expr(self.use_smem_dS_for_mma_dK):
+            tdKrdS = tiled_mma_dK.make_fragment_A(sdSt)
+        else:
+            tdKrdS = tiled_mma_dK.make_fragment_A(tdS)
         tdKrQ = tiled_mma_dK.make_fragment_B(sQt)
         # dQ = dS @ K
         tdQrdS = tiled_mma_dQ.make_fragment_A(sdS)
@@ -1407,18 +1414,20 @@ class FlashAttentionBackwardSm100:
         # mma_dsk_fn = partial(
         #     gemm_ptx_w_idx, tiled_mma_dQ, tdQtdQ, tdQrdS, tdQrK, sA=sdS, sB=sKt, zero_init=True
         # )
-        # mma_dsq_fn = partial(gemm_w_idx, tiled_mma_dK, tdKtdK, tdKrdS, tdKrQ)
-        # Need to explicitly pass in tA_addr for correctness
-        mma_dsq_fn = partial(
-            gemm_ptx_w_idx,
-            tiled_mma_dK,
-            tdKtdK,
-            tdKrdS,
-            tdKrQ,
-            sA=None,
-            sB=sQt,
-            tA_addr=self.tmem_dS_offset,
-        )
+        if const_expr(self.use_smem_dS_for_mma_dK):
+            mma_dsq_fn = partial(gemm_w_idx, tiled_mma_dK, tdKtdK, tdKrdS, tdKrQ)
+        else:
+            # Need to explicitly pass in tA_addr for correctness
+            mma_dsq_fn = partial(
+                gemm_ptx_w_idx,
+                tiled_mma_dK,
+                tdKtdK,
+                tdKrdS,
+                tdKrQ,
+                sA=None,
+                sB=sQt,
+                tA_addr=self.tmem_dS_offset,
+            )
 
         consumer_state_dO = cutlass.pipeline.make_pipeline_state(
             cutlass.pipeline.PipelineUserType.Consumer, self.dO_stage
@@ -1489,18 +1498,29 @@ class FlashAttentionBackwardSm100:
                 mma_qk_fn(B_idx=handle_Q_next.index)
                 pipeline_S_P.sync_object_full.arrive(0, pipeline_S_P.producer_mask, cta_group)
 
-                # 2) dK = dS.T @ Q
+                # 2-3)
+                # Do dK = dS.T @ Q, then dQ = dS @ K if dS in tmem for first mma
+                # Otherwise, reverse order
                 pipeline_dS.consumer_wait(consumer_state_dS)
-                mma_dsq_fn(B_idx=handle_Q.index, zero_init=not accumulate_dK)
-                accumulate_dK = True
-                handle_Q.release()
 
-                # 3) dQ = dS @ K
+                if const_expr(self.use_smem_dS_for_mma_dK):
+                    mma_dsk_fn()
+                    pipeline_dQ.sync_object_full.arrive(0, pipeline_dQ.producer_mask, cta_group)
+                    mma_dsq_fn(B_idx=handle_Q.index, zero_init=not accumulate_dK)
+                    accumulate_dK = True
+                    handle_Q.release()
+                else:
+                    mma_dsq_fn(B_idx=handle_Q.index, zero_init=not accumulate_dK)
+                    accumulate_dK = True
+                    handle_Q.release()
+                    mma_dsk_fn()
+                    pipeline_dQ.sync_object_full.arrive(0, pipeline_dQ.producer_mask, cta_group)
+
                 # dP uses the same tmem as dQ
-                # However, if dS is ready, then dP must have been ready, so we don't need to wait
+                # However, if dS is ready, then dP must have been ready,
+                # so we don't need this wait before mma_dsk_fn()
                 # pipeline_dP.sync_object_empty.wait(0, producer_phase_acc)
-                mma_dsk_fn()
-                pipeline_dQ.sync_object_full.arrive(0, pipeline_dQ.producer_mask, cta_group)
+
                 pipeline_dS.consumer_release(consumer_state_dS)
                 consumer_state_dS.advance()
 
@@ -1826,7 +1846,6 @@ class FlashAttentionBackwardSm100:
                     )
 
                 cute.arch.fence_view_async_tmem_store()
-                cute.arch.fence_proxy(cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta)
                 self.compute_sync_barrier.arrive_and_wait()
 
                 with cute.arch.elect_one():
@@ -1880,10 +1899,12 @@ class FlashAttentionBackwardSm100:
                     if const_expr(stage == 0):
                         pipeline_dS.producer_acquire(producer_state_dS)
                     cute.autovec_copy(tdPrdS_cvt, tRS_sdS[None, stage])
-                    tdPrdS_r2t_f32 = cute.recast_tensor(tdPrdS_cvt, Float32)
-                    cute.copy(thr_copy_r2t, tdPrdS_r2t_f32, tdPtdS_r2t[None, stage, 0, 0])
+                    if const_expr(not self.use_smem_dS_for_mma_dK):
+                        tdPrdS_r2t_f32 = cute.recast_tensor(tdPrdS_cvt, Float32)
+                        cute.copy(thr_copy_r2t, tdPrdS_r2t_f32, tdPtdS_r2t[None, stage, 0, 0])
 
-                cute.arch.fence_view_async_tmem_store()
+                if const_expr(not self.use_smem_dS_for_mma_dK):
+                    cute.arch.fence_view_async_tmem_store()
                 cute.arch.fence_proxy(cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta)
                 self.compute_sync_barrier.arrive_and_wait()
 
