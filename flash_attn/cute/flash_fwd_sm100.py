@@ -86,6 +86,7 @@ class FlashAttentionForwardSm100:
         has_aux_tensors: cutlass.Constexpr = False,
         paged_kv_non_tma: bool = False,
         is_varlen_q: bool = False,
+        has_metadata_tensors: cutlass.Constexpr = False,
     ):
         self.use_tma_KV = not paged_kv_non_tma
         # self.dtype = dtype
@@ -131,6 +132,7 @@ class FlashAttentionForwardSm100:
             self.vec_size: cutlass.Constexpr = 1
         else:
             self.vec_size: cutlass.Constexpr = 2
+        self.has_metadata_tensors = has_metadata_tensors
         # Does S1 need to wait for S0 to finish
         # self.s0_s1_barrier = self.head_dim_padded in [64, 96] and (not self.is_causal and not self.is_local)
         self.s0_s1_barrier = False
@@ -262,6 +264,10 @@ class FlashAttentionForwardSm100:
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors: Optional[list] = None,
+        num_splits_dynamic_ptr: Optional[cute.Tensor] = None,
+        num_m_blocks_ptr: Optional[cute.Tensor] = None,
+        varlen_batch_idx_ptr: Optional[cute.Tensor] = None,
+        num_nheads_in_l2_ptr: Optional[cute.Tensor] = None,
     ):
         """Execute the Fused Multi-Head Attention operation on the provided tensors.
 
@@ -485,6 +491,12 @@ class FlashAttentionForwardSm100:
             ]
         }
 
+        # metadata tensors for varlen scheduler
+        self.num_splits_dynamic_ptr = num_splits_dynamic_ptr
+        self.num_m_blocks_ptr = num_m_blocks_ptr
+        self.varlen_batch_idx_ptr = varlen_batch_idx_ptr
+        self.num_nheads_in_l2_ptr = num_nheads_in_l2_ptr
+
         # TMA load for Q
         tma_load_op = cpasync.CopyBulkTensorTileG2SOp(cta_group)
         tma_store_op = cpasync.CopyBulkTensorTileS2GOp()
@@ -585,6 +597,11 @@ class FlashAttentionForwardSm100:
             is_persistent=self.is_persistent,
             lpt=self.is_causal or self.is_local,
             is_split_kv=self.is_split_kv,
+            has_metadata_tensors=self.has_metadata_tensors,
+            num_splits_dynamic_ptr=self.num_splits_dynamic_ptr,
+            num_m_blocks_ptr=self.num_m_blocks_ptr,
+            varlen_batch_idx_ptr=self.varlen_batch_idx_ptr,
+            num_nheads_in_l2_ptr=self.num_nheads_in_l2_ptr,
         )
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
         self.tile_scheduler_cls = TileScheduler
@@ -679,6 +696,10 @@ class FlashAttentionForwardSm100:
             mSeqUsedQ,
             mSeqUsedK,
             mPageTable,
+            num_splits_dynamic_ptr,
+            num_m_blocks_ptr,
+            varlen_batch_idx_ptr,
+            num_nheads_in_l2_ptr,
             tma_atom_Q,
             tma_atom_K,
             tma_atom_V,
@@ -724,6 +745,10 @@ class FlashAttentionForwardSm100:
         mSeqUsedQ: Optional[cute.Tensor],
         mSeqUsedK: Optional[cute.Tensor],
         mPageTable: Optional[cute.Tensor],
+        num_splits_dynamic_ptr: Optional[cute.Tensor],
+        num_m_blocks_ptr: Optional[cute.Tensor],
+        varlen_batch_idx_ptr: Optional[cute.Tensor],
+        num_nheads_in_l2_ptr: Optional[cute.Tensor],
         tma_atom_Q: cute.CopyAtom,
         tma_atom_K: Optional[cute.CopyAtom],
         tma_atom_V: Optional[cute.CopyAtom],
@@ -905,6 +930,8 @@ class FlashAttentionForwardSm100:
             window_size_left,
             window_size_right,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+            num_splits=num_splits,
+            num_splits_dynamic_ptr=num_splits_dynamic_ptr,
         )
         SeqlenInfoCls = partial(
             SeqlenInfoQK.create,
@@ -1239,7 +1266,7 @@ class FlashAttentionForwardSm100:
 
             if const_expr(not self.use_block_sparsity):
                 n_block_min, n_block_max = block_info.get_n_block_min_max(
-                    seqlen, m_block, split_idx, num_splits
+                    seqlen, m_block, split_idx, batch_idx=batch_idx
                 )
                 if const_expr(not self.is_split_kv) or n_block_min < n_block_max:
                     if const_expr(self.use_tma_KV) or tidx < cute.arch.WARP_SIZE:
@@ -1268,7 +1295,7 @@ class FlashAttentionForwardSm100:
                         )
                         if const_expr(not self.use_tma_KV):
                             paged_kv_manager.load_page_table(n_block)
-                    # if cute.arch.thread_idx()[0] % 32 == 0: cute.printf("n_block = {}, page_idx = {}", n_block, page_idx)
+                        # if cute.arch.thread_idx()[0] % 32 == 0: cute.printf("n_block = {}, page_idx = {}", n_block, page_idx)
                         load_K(block=n_block, producer_state=kv_producer_state, page_idx=page_idx)  # Ki
                         kv_producer_state.advance()
                         load_V(block=n_block, producer_state=kv_producer_state, page_idx=page_idx)  # Vi
@@ -1365,7 +1392,9 @@ class FlashAttentionForwardSm100:
                 block_iter_count = get_total_block_count(blocksparse_tensors, batch_idx, head_idx, m_block)
                 process_tile = block_iter_count > Int32(0)
             else:
-                n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
+                n_block_min, n_block_max = block_info.get_n_block_min_max(
+                    seqlen, m_block, split_idx, batch_idx=batch_idx
+                )
                 block_iter_count = n_block_max - n_block_min
                 if const_expr(not self.is_split_kv):
                     process_tile = True
@@ -1611,7 +1640,9 @@ class FlashAttentionForwardSm100:
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
-            n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
+            n_block_min, n_block_max = block_info.get_n_block_min_max(
+                seqlen, m_block, split_idx, batch_idx=batch_idx
+            )
 
             mask = AttentionMaskCls(seqlen.seqlen_q, seqlen.seqlen_k)
             shared_mask_kwargs = dict(
@@ -1756,8 +1787,8 @@ class FlashAttentionForwardSm100:
                     for n_tile in cutlass.range(n_block_max - n_block_min_before_local_mask, unroll=1):
                         n_block = n_block_max - n_tile - 1
                         mma_si_consumer_phase, si_corr_producer_phase, s0_s1_sequence_phase = softmax_step(
-                        mma_si_consumer_phase, si_corr_producer_phase, s0_s1_sequence_phase, n_block
-                    )
+                            mma_si_consumer_phase, si_corr_producer_phase, s0_s1_sequence_phase, n_block
+                        )
                     # Separate iterations with local masking on the left
                     if const_expr(self.is_local and block_info.window_size_left is not None):
                         n_block_max = cutlass.min(n_block_max, n_block_min_before_local_mask)
@@ -1983,7 +2014,9 @@ class FlashAttentionForwardSm100:
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
-            n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
+            n_block_min, n_block_max = block_info.get_n_block_min_max(
+                seqlen, m_block, split_idx, batch_idx=batch_idx
+            )
 
             if const_expr(self.is_split_kv):
                 mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3)[None, None, head_idx, split_idx]
@@ -2413,7 +2446,7 @@ class FlashAttentionForwardSm100:
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
-            n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
+            n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, batch_idx=batch_idx)
 
             if const_expr(not self.is_split_kv) or n_block_min < n_block_max:
                 if const_expr(self.is_split_kv):
