@@ -146,7 +146,7 @@ class FlashAttentionBackwardSm100:
         self.tmem_dK_offset = self.tmem_dP_offset + self.tile_m
         self.tmem_dS_offset = self.tmem_dP_offset  # overlap with dP
 
-        if not is_causal and not is_local:
+        if (not is_causal and not is_local) or deterministic:
             self.num_regs_reduce = 152
             self.num_regs_compute = 136
         else:
