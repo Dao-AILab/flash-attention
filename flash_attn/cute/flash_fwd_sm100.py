@@ -654,7 +654,7 @@ class FlashAttentionForwardSm100:
             window_size_right = Int32(window_size_right)
 
         fastdiv_mods = None
-        if cutlass.const_expr(aux_tensors is not None):
+        if cutlass.const_expr(aux_tensors is not None and mCuSeqlensQ is None and mCuSeqlensK is None):
             seqlen_q = cute.size(mQ.shape[0]) // (
                 self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1
             )
@@ -745,7 +745,7 @@ class FlashAttentionForwardSm100:
         tile_sched_params: ParamsBase,
         num_splits: Int32,
         aux_tensors: Optional[list] = None,
-        fastdiv_mods=(None, None),
+        fastdiv_mods: Optional[Tuple[FastDivmod, FastDivmod]] = None,
     ):
         """The device kernel implementation of the Fused Multi-Head Attention.
 
@@ -1544,7 +1544,7 @@ class FlashAttentionForwardSm100:
         AttentionMaskCls: Callable,
         TileSchedulerCls: Callable,
         aux_tensors: Optional[list] = None,
-        fastdiv_mods=(None, None),
+        fastdiv_mods: Optional[Tuple[FastDivmod, FastDivmod]] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
     ):
         """Compute softmax on attention scores from QK matrix multiplication.
@@ -1676,6 +1676,7 @@ class FlashAttentionForwardSm100:
                 seqlen=seqlen,
                 aux_tensors=aux_tensors,
                 fastdiv_mods=fastdiv_mods,
+                mask_fn=partial(mask_fn, mask_seqlen=False),
             )
 
             if has_work:
@@ -1836,7 +1837,7 @@ class FlashAttentionForwardSm100:
         m_block: Int32,
         seqlen,
         aux_tensors: Optional[list] = None,
-        fastdiv_mods=(None, None),
+        fastdiv_mods: Optional[Tuple[FastDivmod, FastDivmod]] = None,
         mask_fn: Optional[Callable] = None,
         is_first: bool = False,
     ) -> Tuple[cute.Int32, cute.Int32, cute.Int32]:
@@ -1865,8 +1866,6 @@ class FlashAttentionForwardSm100:
         tSrS_t2r = cute.make_fragment(thr_tmem_load.partition_D(tScS).shape, self.qk_acc_dtype)
         cute.copy(thr_tmem_load, tStS_t2r, tSrS_t2r)
         if cutlass.const_expr(self.score_mod is not None):
-            offset_q = 0 if const_expr(not seqlen.has_cu_seqlens_q) else seqlen.offset_q
-            offset_k = 0 if const_expr(not seqlen.has_cu_seqlens_k) else seqlen.offset_k
             self.apply_score_mod(
                 tSrS_t2r,
                 thr_tmem_load,
@@ -1877,9 +1876,8 @@ class FlashAttentionForwardSm100:
                 n_block,
                 softmax,
                 aux_tensors,
+                seqlen,
                 fastdiv_mods,
-                offset_q=offset_q,
-                offset_k=offset_k,
             )
 
         if const_expr(mask_fn is not None):
@@ -2373,7 +2371,7 @@ class FlashAttentionForwardSm100:
                 self.check_hdim_v_oob,
                 self.qhead_per_kvhead,
             )
-        
+
             # load acc O from smem to rmem for wider vectorization
             tOrO = cute.make_fragment_like(tOsO, self.o_dtype)
             cute.autovec_copy(tOsO, tOrO)
@@ -2642,9 +2640,8 @@ class FlashAttentionForwardSm100:
         n_block,
         softmax,
         aux_tensors=None,
-        fastdiv_mods=(None, None),
-        offset_q=0,
-        offset_k=0,
+        seqlen=None,
+        fastdiv_mods=None,
     ):
         """Apply score modification for SM100 (constant q_idx)."""
         # Prepare index tensor with extra partition
@@ -2664,7 +2661,34 @@ class FlashAttentionForwardSm100:
             head_offset = q_physical - q_idx_logical * self.qhead_per_kvhead
             head_idx = head_idx * self.qhead_per_kvhead + head_offset
 
-        if cutlass.const_expr(aux_tensors is not None):
+        if cutlass.const_expr(seqlen is not None):
+            need_recompute_q = cutlass.const_expr(seqlen.has_cu_seqlens_q)
+            need_recompute_k = cutlass.const_expr(seqlen.has_cu_seqlens_k)
+
+            if cutlass.const_expr(need_recompute_q or need_recompute_k):
+                if cutlass.const_expr(need_recompute_q):
+                    seqlen_q_divmod = FastDivmod.create(seqlen.seqlen_q)
+                elif cutlass.const_expr(fastdiv_mods is not None):
+                    seqlen_q_divmod, _ = fastdiv_mods
+                else:
+                    seqlen_q_divmod = FastDivmod.create(seqlen.seqlen_q)
+
+                if cutlass.const_expr(need_recompute_k):
+                    seqlen_k_divmod = FastDivmod.create(seqlen.seqlen_k)
+                elif cutlass.const_expr(fastdiv_mods is not None):
+                    _, seqlen_k_divmod = fastdiv_mods
+                else:
+                    seqlen_k_divmod = FastDivmod.create(seqlen.seqlen_k)
+
+                fastdiv_mods = (seqlen_q_divmod, seqlen_k_divmod)
+
+            elif cutlass.const_expr(fastdiv_mods is not None):
+                fastdiv_mods = fastdiv_mods
+
+        elif cutlass.const_expr(fastdiv_mods is not None):
+            fastdiv_mods = fastdiv_mods
+
+        if cutlass.const_expr(fastdiv_mods is not None):
             seqlen_q_divmod, _ = fastdiv_mods
             _, q_idx_logical = divmod(q_idx_logical, seqlen_q_divmod)
 
@@ -2681,6 +2705,4 @@ class FlashAttentionForwardSm100:
             fastdiv_mods,
             constant_q_idx=q_idx_logical,
             qhead_per_kvhead=self.qhead_per_kvhead if cutlass.const_expr(self.pack_gqa) else 1,
-            offset_q=offset_q,
-            offset_k=offset_k,
         )
