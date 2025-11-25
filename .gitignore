@@ -27,6 +27,9 @@ var/
 
 # IDE-related
 .idea/
+.vscode/
 
 # Dev
 venv
+.mypy_cache/
+.ruff_cache/
