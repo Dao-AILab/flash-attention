@@ -374,19 +374,28 @@ class SingleTileLPTBwdScheduler:
     @dataclass
     class Params(ParamsBase):
         total_blocks: Int32
+        num_block: Int32
         num_head_divmod: FastDivmod
         l2_minor_divmod: FastDivmod
         l2_major_divmod: FastDivmod
         l2_minor_residual_divmod: FastDivmod
         num_hb_quotient: Int32
         cluster_shape_mn: cutlass.Constexpr[Tuple[int, int]] = (1, 1)
+        spt: cutlass.Constexpr[bool] = True
 
         @staticmethod
         @cute.jit
         def create(
             args: TileSchedulerArguments, *, loc=None, ip=None
         ) -> "SingleTileLPTBwdScheduler.Params":
-            swizzle = 8
+            size_l2 = 50 * 1024 * 1024
+            size_one_qdo_head = args.seqlen_k * (args.headdim + args.headdim_v) * args.element_size
+            # size_one_dqaccum_head = args.seqlen_k * (args.headdim) * 4
+            size_one_dqaccum_head = 0
+            size_one_head = size_one_qdo_head + size_one_dqaccum_head
+            log2_floor = lambda n: 31 - clz(n)
+            swizzle = 1 if size_l2 < size_one_head else (1 << log2_floor(size_l2 // size_one_head))
+            # swizzle = 8
             # If we're in the last section (called residual), we don't want to divide by
             # swizzle. Instead we want to divide by the remainder.
             num_hb_quotient = (args.num_head * args.num_batch) // swizzle
@@ -396,6 +405,7 @@ class SingleTileLPTBwdScheduler:
                 total_blocks=(num_block * args.cluster_shape_mn[0])
                 * args.num_head
                 * args.num_batch,
+                num_block=num_block,
                 num_head_divmod=FastDivmod.create(args.num_head),
                 l2_minor_divmod=FastDivmod.create(swizzle),
                 l2_major_divmod=FastDivmod.create(swizzle * num_block),
@@ -404,6 +414,7 @@ class SingleTileLPTBwdScheduler:
                 ),  # don't divide by 0
                 num_hb_quotient=Int32(num_hb_quotient),
                 cluster_shape_mn=args.cluster_shape_mn,
+                spt=args.lpt,
             )
 
     def __init__(self, params: Params, tile_idx: Int32, *, loc=None, ip=None):
@@ -450,6 +461,8 @@ class SingleTileLPTBwdScheduler:
         is_valid = self._tile_idx < params.total_blocks
         bidx_in_cluster = cute.arch.block_in_cluster_idx()
         block = block * params.cluster_shape_mn[0] + bidx_in_cluster[0]
+        if cutlass.const_expr(params.spt):
+            block = params.num_block - 1 - block
         return WorkTileInfo((Int32(block), Int32(head_idx), Int32(batch_idx), Int32(0)), is_valid)
 
     def initial_work_tile_info(self, *, loc=None, ip=None):
