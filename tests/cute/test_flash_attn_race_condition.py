@@ -303,7 +303,7 @@ def test_flash_attn_output(
                 dv_pt - dv_ref
             ).abs().max().item() + dv_atol
 
-            num_iters = 10000
+            num_iters = 100_000
             for i in range(num_iters):
                 dq2, dk2, dv2, = _flash_attn_bwd(
                     q, k, v, out, g, lse,
