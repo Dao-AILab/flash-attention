@@ -44,7 +44,7 @@ from flash_attn.cute.tile_scheduler import (
     SingleTileVarlenScheduler,
     ParamsBase,
 )
-from flash_attn.cute.fast_math import FastDivmod
+from cutlass.cute import FastDivmodDivisor
 
 
 class FlashAttentionForwardBase:
@@ -692,8 +692,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                 self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1
             )
             seqlen_k = cute.size(mK.shape[0])
-            seqlen_q_divmod = FastDivmod.create(seqlen_q)
-            seqlen_k_divmod = FastDivmod.create(seqlen_k)
+            seqlen_q_divmod = FastDivmodDivisor(seqlen_q)
+            seqlen_k_divmod = FastDivmodDivisor(seqlen_k)
             fastdiv_mods = (seqlen_q_divmod, seqlen_k_divmod)
 
         self.kernel(
@@ -1503,8 +1503,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1
             )
             seqlen_k = cute.size(mK.shape[0])
-            seqlen_q_divmod = FastDivmod.create(seqlen_q)
-            seqlen_k_divmod = FastDivmod.create(seqlen_k)
+            seqlen_q_divmod = FastDivmodDivisor(seqlen_q)
+            seqlen_k_divmod = FastDivmodDivisor(seqlen_k)
             fastdiv_mods = (seqlen_q_divmod, seqlen_k_divmod)
 
         self.kernel(

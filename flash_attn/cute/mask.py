@@ -145,7 +145,7 @@ class AttentionMask:
                 global_row_idx = tScS_mn[r, 0][0] + m_block * self.tile_m
                 row_for_mod = global_row_idx
                 if const_expr(wrap_aux_indices):
-                    _, row_for_mod = fastdiv_mods[0].divmod(global_row_idx)
+                    _, row_for_mod = divmod(global_row_idx, fastdiv_mods[0])
 
                 for col in cutlass.range_constexpr(ncol):
                     col_idx_local = t0ScS_mn[0, col][1]
@@ -153,7 +153,7 @@ class AttentionMask:
                     global_col_idx = thr_col_offset + col_idx_local + n_block * self.tile_n
                     col_for_mod = global_col_idx
                     if const_expr(wrap_aux_indices):
-                        _, col_for_mod = fastdiv_mods[1].divmod(global_col_idx)
+                        _, col_for_mod = divmod(global_col_idx, fastdiv_mods[1])
 
                     batch_idx_ssa = utils.scalar_to_ssa(batch_idx, cutlass.Int32)
                     head_idx_ssa = utils.scalar_to_ssa(head_idx, cutlass.Int32)
@@ -357,7 +357,7 @@ class AttentionMask:
                 mask_row = global_row
             mask_row_for_mod = mask_row
             if const_expr(wrap_aux_indices):
-                _, mask_row_for_mod = fastdiv_mods[0].divmod(mask_row)
+                _, mask_row_for_mod = divmod(mask_row, fastdiv_mods[0])
             mask_row_ssa = utils.scalar_to_ssa(mask_row_for_mod, cutlass.Int32)
 
             ncol = const_expr(cute.size(tScS_t2r.shape))
@@ -366,7 +366,7 @@ class AttentionMask:
                 global_col = col_coord + n_block * self.tile_n
                 global_col_for_mod = global_col
                 if const_expr(wrap_aux_indices):
-                    _, global_col_for_mod = fastdiv_mods[1].divmod(global_col)
+                    _, global_col_for_mod = divmod(global_col, fastdiv_mods[1])
                 kv_idx_ssa = utils.scalar_to_ssa(global_col_for_mod, cutlass.Int32)
                 mask_value = mask_mod(
                     batch_idx_ssa,

@@ -14,7 +14,8 @@ import cutlass.cute as cute
 from cutlass import Int32, const_expr
 
 import flash_attn.cute.utils as utils
-from flash_attn.cute.fast_math import FastDivmod, clz
+from flash_attn.cute.fast_math import clz
+from cutlass.cute import FastDivmodDivisor
 
 
 class WorkTileInfo(cutlass.utils.WorkTileInfo):
@@ -80,7 +81,7 @@ class SingleTileScheduler:
         num_head: Int32
         num_batch: Int32
         num_splits: Int32
-        num_splits_divmod: FastDivmod
+        num_splits_divmod: FastDivmodDivisor
         is_split_kv: cutlass.Constexpr[bool] = False
         cluster_shape_mn: cutlass.Constexpr[Tuple[int, int]] = (1, 1)
 
@@ -93,7 +94,7 @@ class SingleTileScheduler:
                 args.num_head,
                 args.num_batch,
                 args.num_splits,
-                FastDivmod.create(args.num_splits),
+                FastDivmodDivisor(args.num_splits),
                 args.is_split_kv,
                 args.cluster_shape_mn,
             )
@@ -133,7 +134,7 @@ class SingleTileScheduler:
     def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
         block_idx, head_idx, batch_idx = self._blk_coord
         if const_expr(self.params.is_split_kv):
-            head_idx, split_idx = self.params.num_splits_divmod.divmod(head_idx)
+            head_idx, split_idx = divmod(head_idx, self.params.num_splits_divmod)
         else:
             split_idx = Int32(0)
         return WorkTileInfo(
@@ -169,8 +170,8 @@ class SingleTileScheduler:
 class StaticPersistentTileScheduler:
     @dataclass
     class Params(ParamsBase):
-        num_block_divmod: FastDivmod
-        num_head_divmod: FastDivmod
+        num_block_divmod: FastDivmodDivisor
+        num_head_divmod: FastDivmodDivisor
         total_blocks: Int32
 
         @staticmethod
@@ -179,7 +180,7 @@ class StaticPersistentTileScheduler:
         ) -> "StaticPersistentTileScheduler.Params":
             total_blocks = args.num_block * args.num_head * args.num_batch
             return StaticPersistentTileScheduler.Params(
-                FastDivmod.create(args.num_block), FastDivmod.create(args.num_head), total_blocks
+                FastDivmodDivisor(args.num_block), FastDivmodDivisor(args.num_head), total_blocks
             )
 
     def __init__(self, params: Params, tile_idx: Int32, *, loc=None, ip=None):
@@ -211,8 +212,8 @@ class StaticPersistentTileScheduler:
 
     # @cute.jit
     def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
-        hn_idx, block_idx = self.params.num_block_divmod.divmod(self._tile_idx)
-        batch_idx, head_idx = self.params.num_head_divmod.divmod(hn_idx)
+        hn_idx, block_idx = divmod(self._tile_idx, self.params.num_block_divmod)
+        batch_idx, head_idx = divmod(hn_idx, self.params.num_head_divmod)
         is_valid = self._tile_idx < self.params.total_blocks
         # if cute.arch.thread_idx()[0] == 0:
         #     cute.printf("TileScheduler: tile_idx=%d, hn_idx=%d, block_idx=%d, batch_idx=%d, head_idx=%d, is_valid=%d", self._tile_idx, hn_idx, block_idx, batch_idx, head_idx, is_valid)
@@ -253,11 +254,13 @@ class SingleTileLPTScheduler:
     class Params(ParamsBase):
         total_blocks: Int32
         num_splits: Int32
-        num_block_divmod: FastDivmod
-        num_head_divmod: FastDivmod
-        l2_minor_divmod: FastDivmod
-        l2_major_divmod: FastDivmod
-        l2_minor_residual_divmod: FastDivmod
+        num_block: Int32
+        l2_minor: Int32
+        num_block_divmod: FastDivmodDivisor
+        num_head_divmod: FastDivmodDivisor
+        l2_minor_divmod: FastDivmodDivisor
+        l2_major_divmod: FastDivmodDivisor
+        l2_minor_residual_divmod: FastDivmodDivisor
         num_hb_quotient: Int32
         is_split_kv: cutlass.Constexpr[bool] = False
 
@@ -284,11 +287,13 @@ class SingleTileLPTScheduler:
             num_hb_remainder = (args.num_head * args.num_batch) % swizzle
             return SingleTileLPTScheduler.Params(
                 total_blocks=args.num_block * args.num_head * args.num_batch,
-                num_block_divmod=FastDivmod.create(args.num_block),
-                num_head_divmod=FastDivmod.create(args.num_head),
-                l2_minor_divmod=FastDivmod.create(swizzle),
-                l2_major_divmod=FastDivmod.create(swizzle * args.num_block),
-                l2_minor_residual_divmod=FastDivmod.create(
+                num_block=args.num_block,
+                l2_minor=Int32(swizzle),
+                num_block_divmod=FastDivmodDivisor(args.num_block),
+                num_head_divmod=FastDivmodDivisor(args.num_head),
+                l2_minor_divmod=FastDivmodDivisor(swizzle),
+                l2_major_divmod=FastDivmodDivisor(swizzle * args.num_block),
+                l2_minor_residual_divmod=FastDivmodDivisor(
                     max(num_hb_remainder, 1)
                 ),  # don't divide by 0
                 num_hb_quotient=Int32(num_hb_quotient),
@@ -327,18 +332,18 @@ class SingleTileLPTScheduler:
     def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
         params = self.params
         # Implement LPT scheduling coordinate calculation
-        bidhb, l2_mod = params.l2_major_divmod.divmod(self._tile_idx)
+        bidhb, l2_mod = divmod(self._tile_idx, params.l2_major_divmod)
         # If we're in the last section (called residual), we don't want to divide by
         # swizzle. Instead we want to divide by the remainder.
         block, bidhb_residual = 0, 0
         if bidhb < params.num_hb_quotient:
-            block, bidhb_residual = params.l2_minor_divmod.divmod(l2_mod)
+            block, bidhb_residual = divmod(l2_mod, params.l2_minor_divmod)
         else:
-            block, bidhb_residual = params.l2_minor_residual_divmod.divmod(l2_mod)
-        bidhb_actual = bidhb * params.l2_minor_divmod.divisor + bidhb_residual
-        batch_idx, head_idx = params.num_head_divmod.divmod(bidhb_actual)
+            block, bidhb_residual = divmod(l2_mod, params.l2_minor_residual_divmod)
+        bidhb_actual = bidhb * params.l2_minor + bidhb_residual
+        batch_idx, head_idx = divmod(bidhb_actual, params.num_head_divmod)
         # Longest-processing-time-first
-        block = params.num_block_divmod.divisor - 1 - block
+        block = params.num_block - 1 - block
         is_valid = self._tile_idx < params.total_blocks
         return WorkTileInfo(
             (Int32(block), Int32(head_idx), Int32(batch_idx), Int32(self._split_idx)), is_valid
@@ -375,10 +380,11 @@ class SingleTileLPTBwdScheduler:
     class Params(ParamsBase):
         total_blocks: Int32
         num_block: Int32
-        num_head_divmod: FastDivmod
-        l2_minor_divmod: FastDivmod
-        l2_major_divmod: FastDivmod
-        l2_minor_residual_divmod: FastDivmod
+        l2_minor: Int32
+        num_head_divmod: FastDivmodDivisor
+        l2_minor_divmod: FastDivmodDivisor
+        l2_major_divmod: FastDivmodDivisor
+        l2_minor_residual_divmod: FastDivmodDivisor
         num_hb_quotient: Int32
         cluster_shape_mn: cutlass.Constexpr[Tuple[int, int]] = (1, 1)
         spt: cutlass.Constexpr[bool] = True
@@ -406,10 +412,11 @@ class SingleTileLPTBwdScheduler:
                 * args.num_head
                 * args.num_batch,
                 num_block=num_block,
-                num_head_divmod=FastDivmod.create(args.num_head),
-                l2_minor_divmod=FastDivmod.create(swizzle),
-                l2_major_divmod=FastDivmod.create(swizzle * num_block),
-                l2_minor_residual_divmod=FastDivmod.create(
+                l2_minor=Int32(swizzle),
+                num_head_divmod=FastDivmodDivisor(args.num_head),
+                l2_minor_divmod=FastDivmodDivisor(swizzle),
+                l2_major_divmod=FastDivmodDivisor(swizzle * num_block),
+                l2_minor_residual_divmod=FastDivmodDivisor(
                     max(num_hb_remainder, 1)
                 ),  # don't divide by 0
                 num_hb_quotient=Int32(num_hb_quotient),
@@ -448,16 +455,16 @@ class SingleTileLPTBwdScheduler:
         cluster_idx = self._tile_idx // self.params.cluster_shape_mn[0]
         params = self.params
         # Implement LPT scheduling coordinate calculation
-        bidhb, l2_mod = params.l2_major_divmod.divmod(cluster_idx)
+        bidhb, l2_mod = divmod(cluster_idx, params.l2_major_divmod)
         # If we're in the last section (called residual), we don't want to divide by
         # swizzle. Instead we want to divide by the remainder.
         block, bidhb_residual = 0, 0
         if bidhb < params.num_hb_quotient:
-            block, bidhb_residual = params.l2_minor_divmod.divmod(l2_mod)
+            block, bidhb_residual = divmod(l2_mod, params.l2_minor_divmod)
         else:
-            block, bidhb_residual = params.l2_minor_residual_divmod.divmod(l2_mod)
-        bidhb_actual = bidhb * params.l2_minor_divmod.divisor + bidhb_residual
-        batch_idx, head_idx = params.num_head_divmod.divmod(bidhb_actual)
+            block, bidhb_residual = divmod(l2_mod, params.l2_minor_residual_divmod)
+        bidhb_actual = bidhb * params.l2_minor + bidhb_residual
+        batch_idx, head_idx = divmod(bidhb_actual, params.num_head_divmod)
         is_valid = self._tile_idx < params.total_blocks
         bidx_in_cluster = cute.arch.block_in_cluster_idx()
         block = block * params.cluster_shape_mn[0] + bidx_in_cluster[0]

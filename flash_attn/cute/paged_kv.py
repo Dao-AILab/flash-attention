@@ -7,8 +7,8 @@ from cutlass.cute.nvgpu import cpasync
 from cutlass import Int32, const_expr
 
 from flash_attn.cute import utils
-from flash_attn.cute.fast_math import FastDivmod
 from flash_attn.cute.cute_dsl_utils import ParamsBase
+from cutlass.cute import FastDivmodDivisor
 
 
 @dataclass
@@ -18,7 +18,7 @@ class PagedKVManager(ParamsBase):
     mV_paged: cute.Tensor
     thread_idx: Int32
 
-    page_size_divmod: FastDivmod
+    page_size_divmod: FastDivmodDivisor
     seqlen_k: Int32
     leftpad_k: Int32
     n_block_size: Int32
@@ -42,7 +42,7 @@ class PagedKVManager(ParamsBase):
         mPageTable: cute.Tensor,
         mK_paged: cute.Tensor,
         mV_paged: cute.Tensor,
-        page_size_divmod: FastDivmod,
+        page_size_divmod: FastDivmodDivisor,
         bidb: Int32,
         bidh: Int32,
         thread_idx: Int32,
@@ -118,7 +118,7 @@ class PagedKVManager(ParamsBase):
             row = (i * self.num_threads + self.thread_idx) // self.gmem_threads_per_row
             row_idx = n_block * self.n_block_size + row
 
-            page_idx, page_offset = self.page_size_divmod.divmod(row_idx + self.leftpad_k)
+            page_idx, page_offset = divmod(row_idx + self.leftpad_k, self.page_size_divmod)
 
             is_valid = (
                 (i + 1) * self.num_threads <= self.n_block_size or row < self.n_block_size
