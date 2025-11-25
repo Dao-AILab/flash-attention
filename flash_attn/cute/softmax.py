@@ -341,8 +341,6 @@ def apply_score_mod_inner(
     fastdiv_mods,
     constant_q_idx: cutlass.Constexpr,
     qhead_per_kvhead: cutlass.Constexpr[int] = 1,
-    offset_q: cutlass.Int32 = 0,
-    offset_k: cutlass.Int32 = 0,
 ):
     """Shared implementation for applying score modification.
 
@@ -394,8 +392,8 @@ def apply_score_mod_inner(
                 head_offset = q_idx_packed - q_idx_logical * qhead_per_kvhead
                 head_idx_vec[j] = head_idx * qhead_per_kvhead + head_offset
 
-            # If we will do loads we mod, in order to not read OOB
-            if cutlass.const_expr(aux_tensors is not None and fastdiv_mods is not None):
+            # If we will do loads or are varlen we mod, in order to not read OOB
+            if cutlass.const_expr(fastdiv_mods is not None):
                 if cutlass.const_expr(constant_q_idx is None):
                     seqlen_q_divmod, seqlen_k_divmod = fastdiv_mods
                     q_idx_floored = floor_if_packed(index_tensor[i + j][0], qhead_per_kvhead)
@@ -415,7 +413,7 @@ def apply_score_mod_inner(
             # Compute global indices - store unwrapped local indices for later
             if constant_q_idx is None:
                 q_idx_unwrapped = floor_if_packed(index_tensor[i + j][0], qhead_per_kvhead)
-                q_idx_global_vec[j] = offset_q + q_idx_unwrapped
+                q_idx_global_vec[j] = q_idx_unwrapped
             kv_idx_global_vec[j] = index_tensor[i + j][1]
 
         # Convert to SSA for score_mod call
@@ -441,12 +439,10 @@ def apply_score_mod_inner(
         if cutlass.const_expr(constant_q_idx is None):
             q_idx_global_ssa = q_idx_global_vec.load()
         else:
-            # Convert both offset_q and constant_q_idx to SSA separately, then add in SSA space
-            offset_q_ssa = utils.scalar_to_ssa(offset_q, cutlass.Int32).broadcast_to((vec_size,))
             constant_q_idx_ssa = utils.scalar_to_ssa(constant_q_idx, cutlass.Int32).broadcast_to(
                 (vec_size,)
             )
-            q_idx_global_ssa = offset_q_ssa + constant_q_idx_ssa
+            q_idx_global_ssa = constant_q_idx_ssa
 
         kv_idx_global_ssa = kv_idx_global_vec.load()
 
