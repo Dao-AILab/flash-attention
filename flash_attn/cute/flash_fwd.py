@@ -2047,7 +2047,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     kv_consumer_state = process_first_half_block(
                         n_block=n_block_max - 1,
                         kv_consumer_state=kv_consumer_state,
-                        mask_fn=mask_fn,
+                        mask_fn=partial(mask_fn, mask_mod=self.mask_mod),
                         score_mod_fn=score_mod_fn,
                         is_first_block=True,
                     )
@@ -2060,7 +2060,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         n_block=n_block_max - 1,
                         mma_pv_fn=partial(mma_pv_fn, zero_init=True),
                         is_first_n_block=True,
-                        mask_fn=partial(mask_fn, mask_seqlen=True),
+                        mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=True),
                     )
                     O_should_accumulate = True
                 # if cute.arch.thread_idx()[0] == 128: cute.printf("m_block = {}, n_block_max = {}, n_block_min = {}", m_block, n_block_max, n_block_min)
@@ -2078,7 +2078,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                             kv_consumer_state,
                             n_block=n_block_max - 1 - n_tile,
                             mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
-                            mask_fn=partial(mask_fn, mask_seqlen=False),
+                            mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=False),
                         )
                         O_should_accumulate = True
                     n_block_max = cutlass.min(n_block_max, n_block_min_causal_local_mask)
@@ -2092,6 +2092,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         kv_consumer_state,
                         n_block=n_block_max - 1 - n_tile,
                         mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
+                        mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=False),
                     )
                     O_should_accumulate = True
                 # Separate iterations with local masking on the left
@@ -2102,7 +2103,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                             kv_consumer_state,
                             n_block=n_block_max - 1 - n_tile,
                             mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
-                            mask_fn=partial(mask_fn, mask_seqlen=False),
+                            mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=False),
                         )
                         O_should_accumulate = True
                 # Last "half" iteration
