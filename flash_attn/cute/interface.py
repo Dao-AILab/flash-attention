@@ -108,7 +108,7 @@ def _flash_attn_fwd(
         ...
         score_mod: A callable that takes the attention scores and applies a modification.
         mask_mod: A callable that takes token position information and selectively masks
-        block_sparse_tensors: A tuple of tensors used for block sparsity. 
+        block_sparse_tensors: A tuple of tensors used for block sparsity.
         return_lse: Whether to return the log softmax of the attention scores. If set to True will always calculate
         out: Optional pre-allocated output tensor. If None, will be allocated internally.
         lse: Optional pre-allocated log-sum-exp tensor. If None, will be allocated when needed.
@@ -347,31 +347,31 @@ def _flash_attn_fwd(
     elif lse is not None:
         lse_tensor = from_dlpack(lse.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=lse.ndim - 1)
     else:
-        lse_tensor = None 
-        
+        lse_tensor = None
+
     def maybe_wrap_score_mod(score_mod):
         """wrap score_mod to accept global indices, needed for varlen sequences"""
         if score_mod is None:
             return None
-        
+
         sig = inspect.signature(score_mod)
         num_params = len(sig.parameters)
-        
+
         if num_params == 6:
             # Old signature - wrap to accept and ignore global indices
             original = score_mod
-            
+
             @cute.jit
-            def wrapped(tSrS_ssa, batch_idx, head_idx, q_idx, kv_idx, aux_tensors, 
+            def wrapped(tSrS_ssa, batch_idx, head_idx, q_idx, kv_idx, aux_tensors,
                         q_idx_global, kv_idx_global):
                 return original(tSrS_ssa, batch_idx, head_idx, q_idx, kv_idx, aux_tensors)
-            
+
             return wrapped
         elif num_params == 8:
             return score_mod
         else:
             raise ValueError(f"score_mod must have 6 or 8 parameters, got {num_params}")
-        
+
     score_mod = maybe_wrap_score_mod(score_mod)
 
     # hash score and mask mods for compile cache
