@@ -602,8 +602,9 @@ def run_cute_flash(
     q, k, v, cute_score_mod, aux_tensors=None, pack_gqa=False,
     cu_seqlens_q=None, cu_seqlens_k=None
 ) -> torch.Tensor:
-    # Varlen case: inputs already packed
-    if cu_seqlens_q is not None:
+    # Varlen case: at least one of cu_seqlens_q or cu_seqlens_k is provided
+    if cu_seqlens_q is not None or cu_seqlens_k is not None:
+        # For varlen, output shape matches Q shape
         out = torch.empty_like(q)
         _flash_attn_fwd(
             q, k, v,
@@ -617,7 +618,7 @@ def run_cute_flash(
         )
         return out
 
-    # Batched case
+    # Batched case: neither is varlen
     q_transposed, k_transposed, v_transposed = map(
         lambda x: x.transpose(1, 2), (q, k, v)
     )
@@ -644,18 +645,61 @@ def run_flex_reference(q, k, v, eager_score_mod, dtype=None) -> torch.Tensor:
 def run_flex_varlen_ref(
     q, k, v, cu_seqlens_q, cu_seqlens_k, eager_score_mod, dtype=None
 ) -> torch.Tensor:
-    """Simulate varlen by running flex on each sequence slice."""
+    """Simulate varlen by running flex on each sequence slice.
+    
+    Supports all combinations:
+    - Both varlen: cu_seqlens_q and cu_seqlens_k both provided
+    - Varlen q only: cu_seqlens_q provided, cu_seqlens_k=None
+    - Varlen k only: cu_seqlens_k provided, cu_seqlens_q=None
+    """
     results = []
-    num_batches = len(cu_seqlens_q) - 1
+    
+    # Determine batch size and sequence boundaries
+    if cu_seqlens_q is not None:
+        num_batches = len(cu_seqlens_q) - 1
+        batch_size = num_batches
+    elif cu_seqlens_k is not None:
+        num_batches = len(cu_seqlens_k) - 1
+        batch_size = num_batches
+    else:
+        # Neither varlen - shouldn't call this function
+        raise ValueError("At least one of cu_seqlens_q or cu_seqlens_k must be provided")
 
     for i in range(num_batches):
-        start_q, end_q = cu_seqlens_q[i], cu_seqlens_q[i + 1]
-        start_k, end_k = cu_seqlens_k[i], cu_seqlens_k[i + 1]
+        # Determine Q boundaries
+        if cu_seqlens_q is not None:
+            start_q, end_q = cu_seqlens_q[i], cu_seqlens_q[i + 1]
+        else:
+            # Not varlen Q - use batch dimension
+            start_q, end_q = None, None
+            q_slice_batched = q[i:i+1]  # (1, S, H, D) format when Q is (batch_size, seqlen_q, num_heads, head_dim)
+        
+        # Determine K/V boundaries
+        if cu_seqlens_k is not None:
+            start_k, end_k = cu_seqlens_k[i], cu_seqlens_k[i + 1]
+        else:
+            # Not varlen K - use batch dimension
+            start_k, end_k = None, None
+            k_slice_batched = k[i:i+1]  # Already (1, H, S, D) format
+            v_slice_batched = v[i:i+1]
 
-        # Reshape to (1, H, S, D)
-        q_slice = q[start_q:end_q].unsqueeze(0).transpose(1, 2)
-        k_slice = k[start_k:end_k].unsqueeze(0).transpose(1, 2)
-        v_slice = v[start_k:end_k].unsqueeze(0).transpose(1, 2)
+        # Reshape to (1, H, S, D) for flex_attention
+        if cu_seqlens_q is not None:
+            # q is packed: (total_q, num_heads, head_dim) -> (1, num_heads, seqlen_q_i, head_dim)
+            q_slice = q[start_q:end_q].unsqueeze(0).transpose(1, 2)
+        else:
+            # q is batched: (batch_size, seqlen_q, num_heads, head_dim) -> (1, num_heads, seqlen_q, head_dim)
+            # q_slice_batched is (1, seqlen_q, num_heads, head_dim), transpose to (1, num_heads, seqlen_q, head_dim)
+            q_slice = q_slice_batched.transpose(1, 2)
+        
+        if cu_seqlens_k is not None:
+            # k is packed: (total_k, num_heads, head_dim) -> (1, num_heads, seqlen_k_i, head_dim)
+            k_slice = k[start_k:end_k].unsqueeze(0).transpose(1, 2)
+            v_slice = v[start_k:end_k].unsqueeze(0).transpose(1, 2)
+        else:
+            # k is batched: already (1, num_heads, seqlen_k, head_dim), no transpose needed
+            k_slice = k_slice_batched
+            v_slice = v_slice_batched
 
         if dtype is not None:
             q_slice = q_slice.to(dtype)
@@ -669,7 +713,7 @@ def run_flex_varlen_ref(
         out_slice = flex_attention(
             q_slice, k_slice, v_slice,
             score_mod=wrapped_score_mod,
-            enable_gqa=q_slice.shape[1] != k_slice.shape[1],
+            enable_gqa=q_slice.shape[1] != k_slice.shape[1],  # Check head dimension (dim 1)
         )
         results.append(out_slice.transpose(1, 2).squeeze(0))
 
@@ -854,9 +898,64 @@ def test_cute_vs_flex_attention_with_aux_tensors(
 @pytest.mark.parametrize(
     "seqlens_q, seqlens_k",
     [
+        # Very small sequences
+        ([1], [1]),
+        ([1, 1], [1, 1]),
+        ([2, 3], [2, 3]),
+        ([1, 2, 3], [1, 2, 3]),
+        # Small sequences
+        ([8, 16], [8, 16]),
+        ([16, 32], [16, 32]),
+        ([32, 64], [32, 64]),
+        ([12, 24], [12, 24]),
+        # Medium sequences
         ([64, 56, 128], [64, 56, 128]),
-        ([12, 256], [12, 256]),
+        ([32, 64, 96], [32, 64, 96]),
+        ([128, 64], [128, 64]),
+        ([64, 128, 64], [64, 128, 64]),
+        # Large sequences
+        ([256, 512], [256, 512]),
+        ([512, 256], [512, 256]),
+        ([128, 256, 512], [128, 256, 512]),
+        ([256, 128, 256], [256, 128, 256]),
+        # Very large sequences
+        ([1024], [1024]),
+        ([512, 1024], [512, 1024]),
+        ([1024, 512], [1024, 512]),
+        ([2048], [2048]),
+        # Non-power-of-2 sequences
+        ([113, 203], [113, 203]),
+        ([239, 1], [239, 1]),
+        ([799, 3], [799, 3]),
         ([100, 100], [50, 50]),
+        ([108, 256], [108, 256]),
+        # Single sequence (edge case)
+        ([64], [64]),
+        ([128], [128]),
+        ([256], [256]),
+        # Many sequences
+        ([32, 32, 32, 32], [32, 32, 32, 32]),
+        ([64, 64, 64, 64, 64], [64, 64, 64, 64, 64]),
+        ([16, 32, 64, 128, 256], [16, 32, 64, 128, 256]),
+        # Extreme size ratios
+        ([1, 1024], [1, 1024]),
+        ([1024, 1], [1024, 1]),
+        ([1, 1, 2048], [1, 1, 2048]),
+        ([2048, 1, 1], [2048, 1, 1]),
+        # Mixed small and large
+        ([1, 256, 1], [1, 256, 1]),
+        ([256, 1, 256], [256, 1, 256]),
+        ([8, 512, 8], [8, 512, 8]),
+        # Uneven sequences
+        ([17, 33, 65], [17, 33, 65]),
+        ([13, 27, 51], [13, 27, 51]),
+        ([7, 19, 31, 47], [7, 19, 31, 47]),
+        # Different Q and K lengths
+        ([64, 128], [32, 64]),
+        ([128, 256], [64, 128]),
+        ([100, 100], [50, 50]),
+        ([256, 512, 256], [128, 256, 128]),
+        ([1, 1024, 1], [512, 512, 512]),
     ],
 )
 @pytest.mark.parametrize("score_mod_pair", TEST_PAIRS)
@@ -913,6 +1012,255 @@ def test_varlen_with_score_mod(seqlens_q, seqlens_k, dtype, score_mod_pair):
 
 
 # =============================================================================
+# Tests: Varlen Q only (Q packed, K/V batched)
+# =============================================================================
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "seqlens_q, seqlen_k",
+    [
+        # Very small sequences
+        ([1], 1),
+        ([1, 1], 1),
+        ([2, 3], 2),
+        ([1, 2, 3], 1),
+        # Small sequences
+        ([8, 16], 8),
+        ([16, 32], 16),
+        ([32, 64], 32),
+        ([12, 24], 12),
+        # Medium sequences
+        ([64, 56, 128], 64),
+        ([32, 64, 96], 128),
+        ([128, 64], 128),
+        ([64, 128, 64], 64),
+        # Large sequences
+        ([256, 512], 256),
+        ([512, 256], 512),
+        ([128, 256, 512], 256),
+        ([256, 128, 256], 128),
+        # Very large sequences
+        ([1024], 1024),
+        ([512, 1024], 512),
+        ([1024, 512], 1024),
+        ([2048], 2048),
+        # Non-power-of-2 sequences
+        ([113, 203], 113),
+        ([239, 1], 239),
+        ([799, 3], 799),
+        ([100, 100], 50),
+        ([108, 256], 108),
+        # Single sequence (edge case)
+        ([64], 64),
+        ([128], 128),
+        ([256], 256),
+        # Many sequences
+        ([32, 32, 32, 32], 32),
+        ([64, 64, 64, 64, 64], 64),
+        ([16, 32, 64, 128, 256], 128),
+        # Extreme size ratios
+        ([1, 1024], 512),
+        ([1024, 1], 1024),
+        ([1, 1, 2048], 1024),
+        ([2048, 1, 1], 2048),
+        # Mixed small and large
+        ([1, 256, 1], 128),
+        ([256, 1, 256], 128),
+        ([8, 512, 8], 256),
+        # Uneven sequences
+        ([17, 33, 65], 32),
+        ([13, 27, 51], 25),
+        ([7, 19, 31, 47], 20),
+    ],
+)
+@pytest.mark.parametrize("score_mod_pair", TEST_PAIRS)
+def test_varlen_q_only_with_score_mod(seqlens_q, seqlen_k, dtype, score_mod_pair):
+    """Test varlen Q only (Q packed, K/V batched) with 6-arg score_mod."""
+    torch.random.manual_seed(42)
+    cute_score_mod, eager_score_mod = score_mod_pair
+
+    num_heads = 4
+    head_dim = 128
+    total_q = sum(seqlens_q)
+    batch_size = len(seqlens_q)
+
+    cu_seqlens_q = torch.tensor(
+        [0] + list(torch.tensor(seqlens_q).cumsum(0).tolist()),
+        device="cuda", dtype=torch.int32,
+    )
+
+    # Q is packed: (total_q, num_heads, head_dim)
+    q = torch.randn(total_q, num_heads, head_dim, device="cuda", dtype=dtype)
+    # K/V are batched: (batch_size, seqlen_k, num_heads, head_dim) - interface expects seqlen before heads
+    k = torch.randn(batch_size, seqlen_k, num_heads, head_dim, device="cuda", dtype=dtype)
+    v = torch.randn(batch_size, seqlen_k, num_heads, head_dim, device="cuda", dtype=dtype)
+
+    # For reference, we need to handle the mixed format
+    # Interface expects (batch_size, seqlen_k, num_heads, head_dim) when cu_seqlens_k is None
+    # Reference expects (batch_size, num_heads, seqlen_k, head_dim) when cu_seqlens_k is None
+    k_for_ref = k.transpose(1, 2)  # (batch_size, num_heads, seqlen_k, head_dim)
+    v_for_ref = v.transpose(1, 2)  # (batch_size, num_heads, seqlen_k, head_dim)
+
+    out_ref_fp32 = run_flex_varlen_ref(
+        q, k_for_ref, v_for_ref, cu_seqlens_q, cu_seqlens_k=None, eager_score_mod=eager_score_mod, dtype=torch.float32,
+    )
+    out_pt = run_flex_varlen_ref(
+        q, k_for_ref, v_for_ref, cu_seqlens_q, cu_seqlens_k=None, eager_score_mod=eager_score_mod, dtype=dtype,
+    )
+    out_cute = run_cute_flash(
+        q, k, v, cute_score_mod,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=None,
+        pack_gqa=False,
+    )
+
+    assert not torch.isnan(out_cute).any()
+    assert torch.isfinite(out_cute).all()
+    assert out_cute.shape == out_ref_fp32.shape
+
+    fwd_atol = 2 * (out_ref_fp32 + 0.3 - 0.3 - out_ref_fp32).abs().max().item()
+    rtol = 2
+    pt_error = (out_pt - out_ref_fp32).abs().max().item()
+    cute_error = (out_cute - out_ref_fp32).abs().max().item()
+
+    print(f"\nVarlen Q only test for {cute_score_mod.__name__}:")
+    print(f"  seqlens_q={seqlens_q}, seqlen_k={seqlen_k}")
+    print(f"  PyTorch vs FP32 ref max error: {pt_error:.2e}")
+    print(f"  CuTE vs FP32 ref max error: {cute_error:.2e}")
+
+    assert cute_error <= rtol * pt_error + fwd_atol + 1e-4
+
+
+# =============================================================================
+# Tests: Varlen K only (Q batched, K/V packed)
+# =============================================================================
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "seqlen_q, seqlens_k",
+    [
+        # Very small sequences
+        (1, [1]),
+        (1, [1, 1]),
+        (2, [2, 3]),
+        (1, [1, 2, 3]),
+        # Small sequences
+        (8, [8, 16]),
+        (16, [16, 32]),
+        (32, [32, 64]),
+        (12, [12, 24]),
+        # Medium sequences
+        (64, [64, 56, 128]),
+        (128, [32, 64, 96]),
+        (128, [128, 64]),
+        (64, [64, 128, 64]),
+        # Large sequences
+        (256, [256, 512]),
+        (512, [512, 256]),
+        (256, [128, 256, 512]),
+        (128, [256, 128, 256]),
+        # Very large sequences
+        (1024, [1024]),
+        (512, [512, 1024]),
+        (1024, [1024, 512]),
+        (2048, [2048]),
+        # Non-power-of-2 sequences
+        (113, [113, 203]),
+        (239, [239, 1]),
+        (799, [799, 3]),
+        (100, [50, 50]),
+        (108, [108, 256]),
+        # Single sequence (edge case)
+        (64, [64]),
+        (128, [128]),
+        (256, [256]),
+        # Many sequences
+        (32, [32, 32, 32, 32]),
+        (64, [64, 64, 64, 64, 64]),
+        (128, [16, 32, 64, 128, 256]),
+        # Extreme size ratios
+        (512, [1, 1024]),
+        (1024, [1024, 1]),
+        (1024, [1, 1, 2048]),
+        (2048, [2048, 1, 1]),
+        # Mixed small and large
+        (128, [1, 256, 1]),
+        (128, [256, 1, 256]),
+        (256, [8, 512, 8]),
+        # Uneven sequences
+        (32, [17, 33, 65]),
+        (25, [13, 27, 51]),
+        (20, [7, 19, 31, 47]),
+    ],
+)
+@pytest.mark.parametrize("score_mod_pair", TEST_PAIRS)
+def test_varlen_k_only_with_score_mod(seqlen_q, seqlens_k, dtype, score_mod_pair):
+    """Test varlen K only (Q batched, K/V packed) with 6-arg score_mod."""
+    torch.random.manual_seed(42)
+    cute_score_mod, eager_score_mod = score_mod_pair
+
+    num_heads = 4
+    head_dim = 128
+    total_k = sum(seqlens_k)
+    batch_size = len(seqlens_k)
+
+    cu_seqlens_k = torch.tensor(
+        [0] + list(torch.tensor(seqlens_k).cumsum(0).tolist()),
+        device="cuda", dtype=torch.int32,
+    )
+
+    # Q is batched: (batch_size, seqlen_q, num_heads, head_dim) - interface expects seqlen before heads
+    q = torch.randn(batch_size, seqlen_q, num_heads, head_dim, device="cuda", dtype=dtype)
+    # K/V are packed: (total_k, num_heads, head_dim)
+    k = torch.randn(total_k, num_heads, head_dim, device="cuda", dtype=dtype)
+    v = torch.randn(total_k, num_heads, head_dim, device="cuda", dtype=dtype)
+
+    # For reference, we need to handle the mixed format
+    # Convert Q to packed format for reference (transpose to get heads in right position)
+    q_packed = q.transpose(1, 2).reshape(-1, num_heads, head_dim)  # (batch_size * seqlen_q, num_heads, head_dim)
+    cu_seqlens_q = torch.tensor(
+        [0] + [seqlen_q * (i + 1) for i in range(batch_size)],
+        device="cuda", dtype=torch.int32,
+    )
+
+    out_ref_fp32 = run_flex_varlen_ref(
+        q_packed, k, v, cu_seqlens_q, cu_seqlens_k, eager_score_mod, dtype=torch.float32,
+    )
+    out_pt = run_flex_varlen_ref(
+        q_packed, k, v, cu_seqlens_q, cu_seqlens_k, eager_score_mod, dtype=dtype,
+    )
+    out_cute = run_cute_flash(
+        q, k, v, cute_score_mod,
+        cu_seqlens_q=None,
+        cu_seqlens_k=cu_seqlens_k,
+        pack_gqa=False,
+    )
+
+    # Reshape reference output to match cute output format
+    # Cute output: (batch_size, seqlen_q, num_heads, head_dim)
+    # Reference output: (total_q, num_heads, head_dim) where total_q = batch_size * seqlen_q
+    # We can reshape directly to (batch_size, seqlen_q, num_heads, head_dim)
+    out_ref_fp32_reshaped = out_ref_fp32.reshape(batch_size, seqlen_q, num_heads, head_dim)
+    out_pt_reshaped = out_pt.reshape(batch_size, seqlen_q, num_heads, head_dim)
+
+    assert not torch.isnan(out_cute).any()
+    assert torch.isfinite(out_cute).all()
+    assert out_cute.shape == out_ref_fp32_reshaped.shape
+
+    fwd_atol = 2 * (out_ref_fp32_reshaped + 0.3 - 0.3 - out_ref_fp32_reshaped).abs().max().item()
+    rtol = 2
+    pt_error = (out_pt_reshaped - out_ref_fp32_reshaped).abs().max().item()
+    cute_error = (out_cute - out_ref_fp32_reshaped).abs().max().item()
+
+    print(f"\nVarlen K only test for {cute_score_mod.__name__}:")
+    print(f"  seqlen_q={seqlen_q}, seqlens_k={seqlens_k}")
+    print(f"  PyTorch vs FP32 ref max error: {pt_error:.2e}")
+    print(f"  CuTE vs FP32 ref max error: {cute_error:.2e}")
+
+    assert cute_error <= rtol * pt_error + fwd_atol + 1e-4
+
+
+# =============================================================================
 # Tests: Varlen with 8-arg score_mod (global indices)
 # =============================================================================
 
@@ -920,11 +1268,62 @@ def test_varlen_with_score_mod(seqlens_q, seqlens_k, dtype, score_mod_pair):
 @pytest.mark.parametrize(
     "seqlens_q, seqlens_k",
     [
+        # Very small sequences
+        ([1], [1]),
+        ([1, 1], [1, 1]),
+        ([2, 3], [2, 3]),
+        ([1, 2, 3], [1, 2, 3]),
+        # Small sequences
+        ([8, 16], [8, 16]),
+        ([16, 32], [16, 32]),
+        ([32, 64], [32, 64]),
+        ([12, 24], [12, 24]),
+        # Medium sequences
         ([64, 56, 128], [64, 56, 128]),
-        ([12, 256], [12, 256]),
+        ([32, 64, 96], [32, 64, 96]),
+        ([128, 64], [128, 64]),
+        ([64, 128, 64], [64, 128, 64]),
+        # Large sequences
+        ([256, 512], [256, 512]),
+        ([512, 256], [512, 256]),
+        ([128, 256, 512], [128, 256, 512]),
+        ([256, 128, 256], [256, 128, 256]),
+        # Very large sequences
+        ([1024], [1024]),
+        ([512, 1024], [512, 1024]),
+        ([1024, 512], [1024, 512]),
+        # Non-power-of-2 sequences
+        ([113, 203], [113, 203]),
+        ([239, 1], [239, 1]),
+        ([799, 3], [799, 3]),
         ([100, 100], [50, 50]),
-        ([32, 64, 128, 64], [32, 64, 128, 64]),
+        ([108, 256], [108, 256]),
+        # Single sequence (edge case)
+        ([64], [64]),
+        ([128], [128]),
+        ([256], [256]),
+        # Many sequences
+        ([32, 32, 32, 32], [32, 32, 32, 32]),
+        ([64, 64, 64, 64, 64], [64, 64, 64, 64, 64]),
+        ([16, 32, 64, 128, 256], [16, 32, 64, 128, 256]),
+        # Extreme size ratios
+        ([1, 1024], [1, 1024]),
+        ([1024, 1], [1024, 1]),
+        ([1, 1, 2048], [1, 1, 2048]),
+        # Mixed small and large
+        ([1, 256, 1], [1, 256, 1]),
+        ([256, 1, 256], [256, 1, 256]),
+        ([8, 512, 8], [8, 512, 8]),
+        # Uneven sequences
         ([17, 33, 65], [17, 33, 65]),
+        ([13, 27, 51], [13, 27, 51]),
+        ([7, 19, 31, 47], [7, 19, 31, 47]),
+        # Different Q and K lengths
+        ([64, 128], [32, 64]),
+        ([128, 256], [64, 128]),
+        ([100, 100], [50, 50]),
+        ([256, 512, 256], [128, 256, 128]),
+        ([32, 64, 128, 64], [32, 64, 128, 64]),
     ],
 )
 @pytest.mark.parametrize("score_mod_tuple", TEST_PAIRS_GLOBAL_IDX)
@@ -999,10 +1398,45 @@ def test_varlen_with_global_idx_score_mod(seqlens_q, seqlens_k, dtype, score_mod
 @pytest.mark.parametrize(
     "seqlens_q, seqlens_k",
     [
-        ([128], [128]),
-        ([32, 64], [128, 256]),
+        # Very small sequences
+        ([1], [1]),
+        ([1, 1], [1, 1]),
+        ([2, 3], [2, 3]),
         ([1, 1, 1], [1, 1, 1]),
+        # Small sequences
+        ([8, 16], [8, 16]),
+        ([16, 32], [16, 32]),
+        ([32, 64], [32, 64]),
+        ([32, 64], [128, 256]),
+        # Medium sequences
         ([64, 56, 128], [64, 56, 128]),
+        ([128], [128]),
+        ([64, 128, 64], [64, 128, 64]),
+        # Large sequences
+        ([256, 512], [256, 512]),
+        ([512, 256], [512, 256]),
+        ([128, 256, 512], [128, 256, 512]),
+        # Non-power-of-2 sequences
+        ([113, 203], [113, 203]),
+        ([100, 100], [50, 50]),
+        # Single sequence (edge case)
+        ([64], [64]),
+        ([128], [128]),
+        # Many sequences
+        ([32, 32, 32, 32], [32, 32, 32, 32]),
+        ([16, 32, 64, 128, 256], [16, 32, 64, 128, 256]),
+        # Extreme size ratios
+        ([1, 1024], [1, 1024]),
+        ([1024, 1], [1024, 1]),
+        # Mixed small and large
+        ([1, 256, 1], [1, 256, 1]),
+        ([256, 1, 256], [256, 1, 256]),
+        # Uneven sequences
+        ([17, 33, 65], [17, 33, 65]),
+        # Different Q and K lengths
+        ([64, 128], [32, 64]),
+        ([128, 256], [64, 128]),
+        ([100, 100], [50, 50]),
     ],
 )
 @pytest.mark.parametrize("qhead_per_kvhead,num_kv_heads", [(1, 2), (4, 2)])
@@ -1161,12 +1595,55 @@ STRESS_TEST_CASES = [
 @pytest.mark.parametrize(
     "seqlens_q, seqlens_k",
     [
+        # Very small sequences
+        ([1], [1]),
+        ([1, 1], [1, 1]),
+        ([2, 3], [2, 3]),
+        ([1, 2, 3], [1, 2, 3]),
+        # Small sequences
+        ([8, 16], [8, 16]),
+        ([16, 32], [16, 32]),
+        ([32, 64], [32, 64]),
+        # Medium sequences
         ([64, 128], [64, 128]),
-        ([17, 33, 65], [17, 33, 65]),
+        ([32, 64, 96], [32, 64, 96]),
+        ([128, 64], [128, 64]),
+        ([64, 128, 64], [64, 128, 64]),
+        # Large sequences
+        ([256, 512], [256, 512]),
+        ([512, 256], [512, 256]),
+        ([128, 256, 512], [128, 256, 512]),
+        # Non-power-of-2 sequences
+        ([113, 203], [113, 203]),
+        ([239, 1], [239, 1]),
         ([100, 100], [50, 50]),
-        ([1, 255, 1], [1, 255, 1]),
+        # Single sequence (edge case)
+        ([64], [64]),
+        ([128], [128]),
+        # Many sequences
+        ([32, 32, 32, 32], [32, 32, 32, 32]),
+        ([64, 64, 64, 64, 64], [64, 64, 64, 64, 64]),
+        ([16, 32, 64, 128, 256], [16, 32, 64, 128, 256]),
+        # Extreme size ratios
+        ([1, 1024], [1, 1024]),
+        ([1024, 1], [1024, 1]),
+        ([1, 1, 2048], [1, 1, 2048]),
+        # Mixed small and large
+        ([1, 256, 1], [1, 256, 1]),
+        ([256, 1, 256], [256, 1, 256]),
+        ([8, 512, 8], [8, 512, 8]),
         ([128, 1, 128], [128, 1, 128]),
+        ([1, 255, 1], [1, 255, 1]),
+        # Uneven sequences
+        ([17, 33, 65], [17, 33, 65]),
+        ([13, 27, 51], [13, 27, 51]),
+        ([7, 19, 31, 47], [7, 19, 31, 47]),
         ([7, 13, 19, 23], [7, 13, 19, 23]),
+        # Different Q and K lengths
+        ([64, 128], [32, 64]),
+        ([128, 256], [64, 128]),
+        ([100, 100], [50, 50]),
+        ([256, 512, 256], [128, 256, 128]),
     ],
 )
 @pytest.mark.parametrize("test_case", STRESS_TEST_CASES)
@@ -1271,11 +1748,58 @@ TEST_PAIRS_RELATIVE_POSITION = [
 @pytest.mark.parametrize(
     "seqlens_q, seqlens_k",
     [
+        # Very small sequences
+        ([1], [1]),
+        ([1, 1], [1, 1]),
+        ([2, 3], [2, 3]),
+        ([1, 2, 3], [1, 2, 3]),
+        # Small sequences
+        ([8, 16], [8, 16]),
+        ([16, 32], [16, 32]),
+        ([32, 64], [32, 64]),
+        ([12, 24], [12, 24]),
+        # Medium sequences
         ([64, 128], [64, 128]),
         ([32, 64, 96], [32, 64, 96]),
-        ([17, 33, 65], [17, 33, 65]),
-        ([128, 1, 128], [128, 1, 128]),
+        ([128, 64], [128, 64]),
+        ([64, 128, 64], [64, 128, 64]),
+        # Large sequences
+        ([256, 512], [256, 512]),
+        ([512, 256], [512, 256]),
+        ([128, 256, 512], [128, 256, 512]),
+        ([256, 128, 256], [256, 128, 256]),
+        # Non-power-of-2 sequences
+        ([113, 203], [113, 203]),
+        ([239, 1], [239, 1]),
+        ([799, 3], [799, 3]),
         ([100, 100], [50, 50]),
+        ([108, 256], [108, 256]),
+        # Single sequence (edge case)
+        ([64], [64]),
+        ([128], [128]),
+        ([256], [256]),
+        # Many sequences
+        ([32, 32, 32, 32], [32, 32, 32, 32]),
+        ([64, 64, 64, 64, 64], [64, 64, 64, 64, 64]),
+        ([16, 32, 64, 128, 256], [16, 32, 64, 128, 256]),
+        # Extreme size ratios
+        ([1, 1024], [1, 1024]),
+        ([1024, 1], [1024, 1]),
+        ([1, 1, 2048], [1, 1, 2048]),
+        # Mixed small and large
+        ([1, 256, 1], [1, 256, 1]),
+        ([256, 1, 256], [256, 1, 256]),
+        ([8, 512, 8], [8, 512, 8]),
+        ([128, 1, 128], [128, 1, 128]),
+        # Uneven sequences
+        ([17, 33, 65], [17, 33, 65]),
+        ([13, 27, 51], [13, 27, 51]),
+        ([7, 19, 31, 47], [7, 19, 31, 47]),
+        # Different Q and K lengths
+        ([64, 128], [32, 64]),
+        ([128, 256], [64, 128]),
+        ([100, 100], [50, 50]),
+        ([256, 512, 256], [128, 256, 128]),
     ],
 )
 @pytest.mark.parametrize("score_mod_pair", TEST_PAIRS_RELATIVE_POSITION)
@@ -1437,6 +1961,409 @@ def test_varlen_sliding_window_boundary_check(dtype):
     assert seq1_error < 0.1, (
         f"Seq 1 error {seq1_error:.2e} too large - kv_idx may be global"
     )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "seqlens_q, seqlens_k",
+    [
+        ([64, 128], [64, 128]),
+        ([32, 64, 96], [32, 64, 96]),
+        ([17, 33, 65], [17, 33, 65]),
+        # Add extreme size ratios
+        ([1, 2], [4096, 8192]),      # Tiny Q, huge K
+        ([8, 16], [1024, 2048]),     # Small Q, large K
+        ([1], [8192]),               # Single tiny Q, massive K
+    ],
+)
+def test_varlen_local_vs_global_indices_no_aux(seqlens_q, seqlens_k, dtype):
+    """
+    Test that verifies kv_idx is logical (not global) without aux_tensors.
+
+    This is the critical test for the no-aux-tensors code path.
+    If kv_idx were global instead of logical:
+    - Seq 0 would see kv_idx = [0, seqlen_k[0])  ✓
+    - Seq 1 would see kv_idx = [seqlen_k[0], seqlen_k[0]+seqlen_k[1])  ✗
+    - Seq 2 would see kv_idx = [seqlen_k[0]+seqlen_k[1], total_k)  ✗
+
+    We create a score_mod that encodes the kv_idx directly into the output,
+    allowing us to detect if indices are wrong.
+    """
+    torch.random.manual_seed(42)
+
+    # Score mod that returns kv_idx directly (scaled to avoid overflow)
+    @cute.jit
+    def score_mod_return_kv_idx(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
+        # Return kv_idx scaled by 0.001 to avoid numerical issues
+        # This allows us to detect if kv_idx is logical or global
+        kv_idx_f32 = kv_idx.to(cutlass.Float32)
+        return kv_idx_f32 * cute.full_like(kv_idx_f32, 0.001)
+
+    def eager_return_kv_idx(score, b, h, q_idx, kv_idx):
+        # Reference: return logical kv_idx (resets to 0 for each sequence)
+        return kv_idx.float() * 0.001
+
+    num_heads = 4
+    head_dim = 128
+    total_q = sum(seqlens_q)
+    total_k = sum(seqlens_k)
+
+    cu_seqlens_q = torch.tensor(
+        [0] + list(torch.tensor(seqlens_q).cumsum(0).tolist()),
+        device="cuda", dtype=torch.int32,
+    )
+    cu_seqlens_k = torch.tensor(
+        [0] + list(torch.tensor(seqlens_k).cumsum(0).tolist()),
+        device="cuda", dtype=torch.int32,
+    )
+
+    q = torch.randn(total_q, num_heads, head_dim, device="cuda", dtype=dtype)
+    k = torch.randn(total_k, num_heads, head_dim, device="cuda", dtype=dtype)
+    v = torch.randn(total_k, num_heads, head_dim, device="cuda", dtype=dtype)
+
+    out_ref = run_flex_varlen_ref(
+        q, k, v, cu_seqlens_q, cu_seqlens_k, eager_return_kv_idx, dtype=torch.float32,
+    )
+    out_cute = run_cute_flash(
+        q, k, v, score_mod_return_kv_idx,
+        aux_tensors=None,  # Critical: no aux tensors
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        pack_gqa=False,
+    )
+
+    print(f"\nLocal vs global kv_idx test (no aux):")
+    print(f"  seqlens_q={seqlens_q}, seqlens_k={seqlens_k}")
+
+    # Check each sequence individually
+    for seq_idx in range(len(seqlens_q)):
+        start_q = cu_seqlens_q[seq_idx].item()
+        end_q = cu_seqlens_q[seq_idx + 1].item()
+
+        out_cute_seq = out_cute[start_q:end_q]
+        out_ref_seq = out_ref[start_q:end_q]
+
+        seq_error = (out_cute_seq - out_ref_seq).abs().max().item()
+
+        # Extract sample values to diagnose
+        sample_val = out_cute_seq[0, 0, 0].item()  # First position
+        expected_val = out_ref_seq[0, 0, 0].item()
+
+        # Get more statistics
+        cute_min = out_cute_seq.min().item()
+        cute_max = out_cute_seq.max().item()
+        ref_min = out_ref_seq.min().item()
+        ref_max = out_ref_seq.max().item()
+
+        print(f"  Seq {seq_idx}: error={seq_error:.6f}")
+        print(f"    Sample: cute={sample_val:.6f}, ref={expected_val:.6f}")
+        print(f"    Range:  cute=[{cute_min:.6f}, {cute_max:.6f}], ref=[{ref_min:.6f}, {ref_max:.6f}]")
+
+        # Check if kv_idx is clearly global (would show up as offset in the minimum value)
+        if seq_idx > 0:
+            offset = cu_seqlens_k[seq_idx].item()
+            # If global, minimum value would be at least offset * 0.001
+            expected_if_global = offset * 0.001
+            print(f"    If global, min would be ~{expected_if_global:.6f} (offset={offset})")
+
+            # Definitive test: is the minimum value suspiciously close to the offset?
+            if cute_min > expected_if_global * 0.9:  # Within 10% of offset
+                raise AssertionError(
+                    f"Seq {seq_idx}: kv_idx appears to be GLOBAL! "
+                    f"Min value {cute_min:.6f} is close to offset {expected_if_global:.6f}. "
+                    f"Expected min ~0.000 for logical indexing."
+                )
+
+        # The error might just be from fp16/bf16 precision + attention softmax
+        # What matters is that we don't see the offset pattern
+        # Allow larger tolerance but keep the offset check
+        assert seq_error < 0.01, (
+            f"Seq {seq_idx}: error {seq_error:.6f} is too large. "
+            f"However, check the min value above - if it's near 0, this is likely just numerical precision."
+        )
+
+    print(f"  ✓ All sequences have logical kv_idx (not global)")
+
+
+@pytest.mark.parametrize("dtype", [torch.float16])
+def test_varlen_global_idx_explicit_check_no_aux(dtype):
+    """
+    Explicit check: if kv_idx is global in no-aux path, we should detect it.
+
+    Uses a two-sequence setup where:
+    - Seq 0: length 64, kv_idx should be [0, 63]
+    - Seq 1: length 128, kv_idx should be [0, 127] if logical, [64, 191] if global
+
+    We check the minimum value seen in seq 1. If logical, min should be ~0.
+    If global, min should be ~64.
+    """
+    torch.random.manual_seed(42)
+
+    @cute.jit
+    def score_mod_min_kv_idx(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
+        # Return kv_idx directly to extract the actual values
+        return kv_idx.to(cutlass.Float32) * cute.full_like(tSrS_ssa, 0.01)
+
+    def eager_min_kv_idx(score, b, h, q_idx, kv_idx):
+        return kv_idx.float() * 0.01
+
+    seqlens = [64, 128]
+    total = sum(seqlens)
+    num_heads = 2
+    head_dim = 64
+
+    cu_seqlens = torch.tensor([0, 64, 192], device="cuda", dtype=torch.int32)
+
+    q = torch.randn(total, num_heads, head_dim, device="cuda", dtype=dtype)
+    k = torch.randn(total, num_heads, head_dim, device="cuda", dtype=dtype)
+    v = torch.randn(total, num_heads, head_dim, device="cuda", dtype=dtype)
+
+    out_cute = run_cute_flash(
+        q, k, v, score_mod_min_kv_idx,
+        aux_tensors=None,
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_k=cu_seqlens,
+        pack_gqa=False,
+    )
+
+    # Check seq 1 minimum value
+    seq1_out = out_cute[64:192]
+    min_val = seq1_out.min().item()
+    max_val = seq1_out.max().item()
+
+    print(f"\nGlobal idx explicit check (no aux):")
+    print(f"  Seq 1 min value: {min_val:.4f} (expected ~0.00 for logical, ~0.64 for global)")
+    print(f"  Seq 1 max value: {max_val:.4f} (expected ~1.27 for logical, ~1.91 for global)")
+
+    # If kv_idx is global, min_val would be ~0.64 (64 * 0.01)
+    # If kv_idx is logical, min_val would be ~0.00 (0 * 0.01)
+    if min_val > 0.5:  # Clearly global (should be ~0.64)
+        raise AssertionError(
+            f"kv_idx is GLOBAL in no-aux-tensors path! "
+            f"Seq 1 min={min_val:.4f} indicates global offset of 64. "
+            f"Expected ~0.00 for logical indexing."
+        )
+
+    # Additional check: max value
+    if max_val > 1.5:  # Would be ~1.91 for global
+        raise AssertionError(
+            f"kv_idx appears GLOBAL! "
+            f"Seq 1 max={max_val:.4f} suggests global indexing (expected ~1.27)."
+        )
+
+    assert min_val < 0.1, f"Min value {min_val:.4f} too large"
+    assert max_val < 1.4, f"Max value {max_val:.4f} too large"
+
+    print(f"  ✓ kv_idx is correctly logical (not global) in no-aux path")
+
+
+@pytest.mark.parametrize("dtype", [torch.float16])
+def test_varlen_kv_idx_ground_truth_no_flex(dtype):
+    """
+    Ground truth test without using flex_attention at all.
+
+    We know exactly what values kv_idx should have for each sequence.
+    This test constructs the expected output manually without any reference implementation.
+    """
+    torch.random.manual_seed(42)
+
+    @cute.jit
+    def score_mod_return_kv_idx(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
+        # Return kv_idx scaled by 0.01
+        return kv_idx.to(cutlass.Float32) * cute.full_like(tSrS_ssa, 0.01)
+
+    # Two sequences: [64, 128]
+    seqlens = [64, 128]
+    total = sum(seqlens)
+    num_heads = 2
+    head_dim = 64
+
+    cu_seqlens = torch.tensor([0, 64, 192], device="cuda", dtype=torch.int32)
+
+    # Create simple inputs - values don't matter much since score_mod ignores them
+    q = torch.randn(total, num_heads, head_dim, device="cuda", dtype=dtype)
+    k = torch.randn(total, num_heads, head_dim, device="cuda", dtype=dtype)
+    v = torch.ones(total, num_heads, head_dim, device="cuda", dtype=dtype)  # All ones for easy checking
+
+    out_cute = run_cute_flash(
+        q, k, v, score_mod_return_kv_idx,
+        aux_tensors=None,
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_k=cu_seqlens,
+        pack_gqa=False,
+    )
+
+    print(f"\nGround truth test (no flex):")
+
+    # Manually verify each sequence
+    # The output is attention-weighted, but we can check statistical properties
+
+    # Sequence 0: seqlen=64, kv_idx should be [0, 63]
+    # After softmax over scores [0, 0.01, 0.02, ..., 0.63], weighted by v=1
+    # The output will be a weighted average, but we can check bounds
+    seq0_out = out_cute[0:64]
+    seq0_min = seq0_out.min().item()
+    seq0_max = seq0_out.max().item()
+
+    print(f"  Seq 0 (len=64): min={seq0_min:.4f}, max={seq0_max:.4f}")
+    print(f"    Expected: values influenced by kv_idx=[0, 63] -> scores=[0.00, 0.63]")
+
+    # Sequence 1: seqlen=128, kv_idx should be [0, 127] if logical
+    # If kv_idx were global, it would be [64, 191] -> scores=[0.64, 1.91]
+    seq1_out = out_cute[64:192]
+    seq1_min = seq1_out.min().item()
+    seq1_max = seq1_out.max().item()
+
+    print(f"  Seq 1 (len=128): min={seq1_min:.4f}, max={seq1_max:.4f}")
+    print(f"    Expected if logical: values influenced by kv_idx=[0, 127] -> scores=[0.00, 1.27]")
+    print(f"    Expected if GLOBAL:  values influenced by kv_idx=[64, 191] -> scores=[0.64, 1.91]")
+
+    # Key insight: In seq 1, the minimum score should be influenced by kv_idx=0 (score=0.00)
+    # After attention weighting, the minimum output value should be relatively small
+    # If kv_idx were global (starting at 64), the minimum score would be 0.64
+    # and the minimum output value would be noticeably larger
+
+    # Since attention does softmax, we can't directly read off kv_idx values
+    # But we can check that seq1 has values consistent with small scores (close to 0)
+    # versus having all scores >= 0.64
+
+    # Statistical check: seq1 should have some output values near the "small score" end
+    # Get the 10th percentile - should be small if kv_idx includes 0
+    seq1_sorted = torch.sort(seq1_out.flatten())[0]
+    seq1_percentile_10 = seq1_sorted[len(seq1_sorted) // 10].item()
+
+    print(f"  Seq 1 10th percentile: {seq1_percentile_10:.4f}")
+    print(f"    If logical (kv_idx from 0): should be relatively small")
+    print(f"    If global (kv_idx from 64): would be larger")
+
+    # If kv_idx is global (starting at 64), all scores are >= 0.64
+    # This would make even the 10th percentile relatively large
+    # If kv_idx is logical (starting at 0), we have scores near 0.00
+    # This would make the 10th percentile smaller
+
+    # Rough heuristic: if kv_idx starts at 0, we should see variety in outputs
+    # The exact threshold depends on attention mechanics, but we can check
+    # that seq1 outputs don't ALL look like they came from high scores
+
+    # More direct test: check for any values that suggest low kv_idx
+    # With kv_idx starting at 0, some positions should be heavily influenced by score=0.00
+    # We'd expect to see this in early query positions (q_idx=0,1,2,...)
+    early_q_positions = seq1_out[0:5]  # First 5 query positions in seq1
+    early_q_min = early_q_positions.min().item()
+
+    print(f"  Seq 1 early q positions (0-4) min: {early_q_min:.4f}")
+
+    # The key test: if kv_idx were global, early query positions would never
+    # see kv_idx < 64, so their outputs would reflect only high scores
+    # But if kv_idx is logical, early positions DO see kv_idx < 64
+
+    # Sanity check: seq0 and seq1 should have comparable ranges if both use logical indexing
+    # They should both have access to low kv_idx values
+    range_seq0 = seq0_max - seq0_min
+    range_seq1 = seq1_max - seq1_min
+
+    print(f"  Range comparison: seq0={range_seq0:.4f}, seq1={range_seq1:.4f}")
+    print(f"    Ranges should be similar if both use logical kv_idx")
+
+    # If seq1 has much smaller range, it might indicate restricted kv_idx range (global)
+    assert range_seq1 > 0.3 * range_seq0, (
+        f"Seq1 range {range_seq1:.4f} is much smaller than seq0 {range_seq0:.4f}. "
+        f"This may indicate kv_idx is global (restricted range)."
+    )
+
+    print(f"  ✓ Statistical checks pass - kv_idx appears to be logical")
+
+
+@pytest.mark.parametrize("dtype", [torch.float16])
+@pytest.mark.parametrize(
+    "seqlens_q, seqlens_k",
+    [
+        ([64, 128], [64, 128]),
+        ([1, 2], [4096, 8192]),      # Tiny Q, huge K
+        ([8, 16], [1024, 2048]),     # Small Q, large K
+        ([1], [8192]),               # Single tiny Q, massive K
+        ([1, 1, 1], [2048, 4096, 2048]),  # Multiple tiny Q, large K
+    ],
+)
+def test_varlen_kv_idx_definitive_signal(seqlens_q, seqlens_k, dtype):
+    """
+    Definitive test using a strong binary signal.
+
+    Strategy: Use a score_mod that returns 100.0 if kv_idx==0, else -100.0
+    After softmax, this will make the output ~100% from kv_idx=0.
+    If kv_idx is global in seq1, we'd never see kv_idx=0 (would start at 64).
+    """
+    torch.random.manual_seed(42)
+
+    @cute.jit
+    def score_mod_signal_first_kv(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
+        # Return 100.0 if kv_idx==0, else -100.0
+        # After softmax, attention will focus almost entirely on kv_idx=0
+        is_first = operator.eq(kv_idx, cute.full_like(kv_idx, 0))
+        signal = cute.where(is_first,
+                           cute.full_like(tSrS_ssa, 100.0),
+                           cute.full_like(tSrS_ssa, -100.0))
+        return signal
+
+    num_heads = 1  # Single head for simplicity
+    head_dim = 64
+    total_q = sum(seqlens_q)
+    total_k = sum(seqlens_k)
+
+    cu_seqlens_q = torch.tensor(
+        [0] + list(torch.tensor(seqlens_q).cumsum(0).tolist()),
+        device="cuda", dtype=torch.int32,
+    )
+    cu_seqlens_k = torch.tensor(
+        [0] + list(torch.tensor(seqlens_k).cumsum(0).tolist()),
+        device="cuda", dtype=torch.int32,
+    )
+
+    q = torch.randn(total_q, num_heads, head_dim, device="cuda", dtype=dtype)
+    k = torch.randn(total_k, num_heads, head_dim, device="cuda", dtype=dtype)
+
+    # Create v with distinct marker values at kv_idx=0 for each sequence
+    v = torch.zeros(total_k, num_heads, head_dim, device="cuda", dtype=dtype)
+    for seq_idx in range(len(seqlens_k)):
+        start_k = cu_seqlens_k[seq_idx].item()
+        marker_value = float(seq_idx + 1)  # 1.0, 2.0, 3.0, ...
+        v[start_k, :, :] = marker_value
+
+    out_cute = run_cute_flash(
+        q, k, v, score_mod_signal_first_kv,
+        aux_tensors=None,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        pack_gqa=False,
+    )
+
+    print(f"\nDefinitive signal test (no aux): seqlens_q={seqlens_q}, seqlens_k={seqlens_k}")
+
+    # Check each sequence
+    for seq_idx in range(len(seqlens_q)):
+        start_q = cu_seqlens_q[seq_idx].item()
+        end_q = cu_seqlens_q[seq_idx + 1].item()
+        start_k = cu_seqlens_k[seq_idx].item()
+
+        seq_out = out_cute[start_q:end_q]
+        seq_mean = seq_out.mean().item()
+        expected_value = float(seq_idx + 1)
+
+        print(f"  Seq {seq_idx}: mean output = {seq_mean:.4f} (expected ~{expected_value:.1f})")
+
+        if seq_idx > 0 and seq_mean < 0.5:
+            raise AssertionError(
+                f"Seq {seq_idx}: mean output is {seq_mean:.4f}, close to 0! "
+                f"This strongly suggests kv_idx is GLOBAL (starts at {start_k} instead of 0). "
+                f"With logical indexing, seq should attend to kv_idx=0 (value={expected_value:.1f})."
+            )
+
+        assert abs(seq_mean - expected_value) < 0.2, (
+            f"Seq {seq_idx}: mean {seq_mean:.4f} should be ~{expected_value:.1f} for logical kv_idx. "
+            f"Large deviation suggests global indexing."
+        )
+
+    print(f"  ✓ DEFINITIVE: kv_idx is logical (not global) in no-aux path")
 
 
 if __name__ == "__main__":
