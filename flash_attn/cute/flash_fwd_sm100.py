@@ -45,7 +45,7 @@ from flash_attn.cute.block_sparse_utils import (
 from flash_attn.cute.pack_gqa import PackGQA
 from flash_attn.cute import mma_sm100_desc as sm100_desc
 from flash_attn.cute import blackwell_helpers as sm100_utils
-from flash_attn.cute.fast_math import FastDivmod
+from cutlass.cute import FastDivmodDivisor
 from flash_attn.cute.tile_scheduler import (
     TileSchedulerArguments,
     SingleTileScheduler,
@@ -659,8 +659,8 @@ class FlashAttentionForwardSm100:
                 self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1
             )
             seqlen_k = cute.size(mK.shape[0])
-            seqlen_q_divmod = FastDivmod.create(seqlen_q)
-            seqlen_k_divmod = FastDivmod.create(seqlen_k)
+            seqlen_q_divmod = FastDivmodDivisor(seqlen_q)
+            seqlen_k_divmod = FastDivmodDivisor(seqlen_k)
             fastdiv_mods = (seqlen_q_divmod, seqlen_k_divmod)
 
         self.use_block_sparsity = cutlass.const_expr(blocksparse_tensors is not None)
@@ -1190,7 +1190,7 @@ class FlashAttentionForwardSm100:
                     mPageTable,
                     mK,
                     mV,
-                    FastDivmod.create(page_size),
+                    FastDivmodDivisor(page_size),
                     batch_idx,
                     head_idx_kv,
                     tidx,
@@ -2660,7 +2660,7 @@ class FlashAttentionForwardSm100:
 
         if cutlass.const_expr(aux_tensors is not None):
             seqlen_q_divmod, _ = fastdiv_mods
-            _, q_idx_logical = seqlen_q_divmod.divmod(q_idx_logical)
+            _, q_idx_logical = divmod(q_idx_logical, seqlen_q_divmod)
 
         apply_score_mod_inner(
             tSrS_t2r,

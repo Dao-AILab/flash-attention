@@ -392,12 +392,12 @@ def apply_score_mod_inner(
                 if cutlass.const_expr(constant_q_idx is None):
                     seqlen_q_divmod, seqlen_k_divmod = fastdiv_mods
                     q_idx_floored = floor_if_packed(index_tensor[i + j][0], qhead_per_kvhead)
-                    _, q_idx_wrapped = seqlen_q_divmod.divmod(q_idx_floored)
+                    _, q_idx_wrapped = divmod(q_idx_floored, seqlen_q_divmod)
                     q_idx_vec[j] = q_idx_wrapped
                 else:
                     _, seqlen_k_divmod = fastdiv_mods
 
-                _, kv_idx_wrapped = seqlen_k_divmod.divmod(index_tensor[i + j][1])
+                _, kv_idx_wrapped = divmod(index_tensor[i + j][1], seqlen_k_divmod)
                 kv_idx_vec[j] = kv_idx_wrapped
             else:
                 # No bounds checking - direct indexing

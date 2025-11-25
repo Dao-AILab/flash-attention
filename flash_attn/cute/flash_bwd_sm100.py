@@ -414,8 +414,7 @@ class FlashAttentionBackwardSm100:
             assert mdK_semaphore is not None
             assert mdV_semaphore is not None
             mdK_semaphore, mdV_semaphore = [
-                utils.select(t, mode=semaphore_transpose)
-                for t in (mdK_semaphore, mdV_semaphore)
+                utils.select(t, mode=semaphore_transpose) for t in (mdK_semaphore, mdV_semaphore)
             ]
         else:
             mdK_semaphore = None
@@ -562,7 +561,7 @@ class FlashAttentionBackwardSm100:
             cute.size(mQ.shape[2]),  # num_heads = num_query_heads
             cute.size(mK.shape[3]),
             1,  # num_splits
-            cute.size(mQ.shape[0]), # pass seqlen_q for seqlen_k
+            cute.size(mQ.shape[0]),  # pass seqlen_q for seqlen_k
             mQ.shape[1],
             mV.shape[1],
             total_q=cute.size(mQ.shape[0]),
@@ -1905,7 +1904,9 @@ class FlashAttentionBackwardSm100:
 
                 if const_expr(not self.use_smem_dS_for_mma_dK):
                     cute.arch.fence_view_async_tmem_store()
-                cute.arch.fence_proxy(cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta)
+                cute.arch.fence_proxy(
+                    cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
+                )
                 self.compute_sync_barrier.arrive_and_wait()
 
                 # with cute.arch.elect_one():
@@ -2032,7 +2033,7 @@ class FlashAttentionBackwardSm100:
             gdQaccum = cute.flat_divide(
                 gdQaccum_, (self.tile_m * self.tile_hdim // self.dQaccum_reduce_stage,)
             )
-            
+
             if const_expr(self.deterministic):
                 mdQ_semaphore_cur = mdQ_semaphore[None, None, head_idx, batch_idx]
 
@@ -2068,12 +2069,17 @@ class FlashAttentionBackwardSm100:
                         if const_expr(self.spt):
                             n_block_max_for_m_block = min(
                                 n_block_global_max,
-                                cute.ceil_div((m_block + 1) * self.tile_m + seqlen.seqlen_k - seqlen.seqlen_q, self.tile_n)
+                                cute.ceil_div(
+                                    (m_block + 1) * self.tile_m + seqlen.seqlen_k - seqlen.seqlen_q,
+                                    self.tile_n,
+                                ),
                             )
                             lock_value = n_block_max_for_m_block - 1 - n_block
                         else:
                             lock_value = n_block
-                        barrier.wait_eq(mdQ_semaphore_cur[(m_block, None)].iterator, tidx, 0, lock_value)
+                        barrier.wait_eq(
+                            mdQ_semaphore_cur[(m_block, None)].iterator, tidx, 0, lock_value
+                        )
                     self.reduce_sync_barrier.arrive_and_wait()
                     # Copy from shared memory to global memory
                     if is_tma_warp:
@@ -2101,7 +2107,9 @@ class FlashAttentionBackwardSm100:
                     # semaphore release for prior m_block
                     if const_expr(self.deterministic and stage == 0 and delay_semaphore_release):
                         if m_block > m_block_min:
-                            barrier.arrive_inc(mdQ_semaphore_cur[(m_block - 1, None)].iterator, tidx, 0, 1)
+                            barrier.arrive_inc(
+                                mdQ_semaphore_cur[(m_block - 1, None)].iterator, tidx, 0, 1
+                            )
 
                 # semaphore release
                 # NOTE: arrive_inc calls red_release which issues membar
