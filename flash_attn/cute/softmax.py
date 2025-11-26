@@ -2,8 +2,8 @@
 
 import math
 import operator
-from dataclasses import dataclass
 from typing import Tuple
+from dataclasses import dataclass
 
 import cutlass
 import cutlass.cute as cute
@@ -341,6 +341,8 @@ def apply_score_mod_inner(
     fastdiv_mods,
     constant_q_idx: cutlass.Constexpr,
     qhead_per_kvhead: cutlass.Constexpr[int] = 1,
+    offset_q: cutlass.Int32 = 0,
+    offset_k: cutlass.Int32 = 0,
 ):
     """Shared implementation for applying score modification.
 
@@ -355,103 +357,115 @@ def apply_score_mod_inner(
         qk_acc_dtype: Data type for accumulator
         aux_tensors: Optional aux_tensors for FlexAttention
         fastdiv_mods: Tuple of (seqlen_q_divmod, seqlen_k_divmod) for wrapping
-        constant_q_idx: If provided, use this constant for all q_idx values
+        constant_q_idx: If provided, use this constant for all q_idx values (LOGICAL position)
                        If None, compute q_idx per-element
-        qhead_per_kvhead_packgqa: Pack-GQA replication factor. Divide q_idx by this
-                                  when greater than 1 so score mods see logical heads.
-        offset_q: Offset for q_idx when using varlen
-        offset_k: Offset for kv_idx when using varlen
+        qhead_per_kvhead: Pack-GQA replication factor. Divide q_idx by this
+                         when greater than 1 so score mods see logical heads.
+        offset_q: offset for this sequence in Q for varlen (for computing global indices)
+        offset_k: offset for this sequence in K/V for varlen (for computing global indices)
     """
     n_vals = cutlass.const_expr(cute.size(score_tensor.shape))
     score_vec = cute.make_fragment(vec_size, qk_acc_dtype)
-    kv_idx_vec = cute.make_fragment(vec_size, cutlass.Int32)
+    kv_idx_local_vec = cute.make_fragment(vec_size, cutlass.Int32)
+    kv_idx_global_vec = cute.make_fragment(vec_size, cutlass.Int32)
 
     # SSA values for batch (constant across all elements)
     batch_idx_ssa = utils.scalar_to_ssa(batch_idx, cutlass.Int32).broadcast_to((vec_size,))
 
-    # Handle q_idx based on whether it's constant
-    q_idx_vec = cute.make_fragment(vec_size, cutlass.Int32)
+    # For non-constant q_idx path
+    if cutlass.const_expr(constant_q_idx is None):
+        q_idx_local_vec = cute.make_fragment(vec_size, cutlass.Int32)
+        q_idx_global_vec = cute.make_fragment(vec_size, cutlass.Int32)
 
     # For Pack-GQA with non-constant q_idx, we need per-element head indices
-    # since a thread my process multiple query head indices
+    # since a thread may process multiple query head indices
     if cutlass.const_expr(qhead_per_kvhead > 1 and constant_q_idx is None):
         head_idx_vec = cute.make_fragment(vec_size, cutlass.Int32)
-
-    q_idx_global_vec = cute.make_fragment(vec_size, cutlass.Int32)
-    kv_idx_global_vec = cute.make_fragment(vec_size, cutlass.Int32)
 
     for i in cutlass.range(0, n_vals, vec_size, unroll_full=True):
         for j in cutlass.range(vec_size, unroll_full=True):
             score_vec[j] = score_tensor[i + j] * softmax_scale
+            
+            # Get raw coordinates from index_tensor
+            # These are logical positions within the sequence
+            q_idx_raw = index_tensor[i + j][0]
+            kv_idx_raw = index_tensor[i + j][1]
+            
+            # === KV index handling ===
+            # Local = logical position within sequence (what score_mod sees)
+            # Apply wrapping first if needed
+            kv_idx_local = kv_idx_raw
+            if cutlass.const_expr(aux_tensors is not None and fastdiv_mods is not None):
+                _, seqlen_k_divmod = fastdiv_mods
+                _, kv_idx_local = seqlen_k_divmod.divmod(kv_idx_local)
+            kv_idx_local_vec[j] = kv_idx_local
+            
+            # Global = position in packed tensor (add offset AFTER wrapping)
+            kv_idx_global_vec[j] = offset_k + kv_idx_local
 
-            # Extract head offset from packed q_idx for Pack-GQA
-            if cutlass.const_expr(qhead_per_kvhead > 1 and constant_q_idx is None):
-                q_idx_packed = index_tensor[i + j][0]
-                # Building up the logical q_head idx: final_q_head = kv_head * qhead_per_kvhead + (q_physical % qhead_per_kvhead)
-                q_idx_logical = q_idx_packed // qhead_per_kvhead
-                head_offset = q_idx_packed - q_idx_logical * qhead_per_kvhead
-                head_idx_vec[j] = head_idx * qhead_per_kvhead + head_offset
+            # === Q index handling (non-constant path) ===
+            if cutlass.const_expr(constant_q_idx is None):
+                # Local: apply Pack-GQA floor, then wrap
+                q_idx_local = q_idx_raw
+                if cutlass.const_expr(qhead_per_kvhead > 1):
+                    # Extract head offset before flooring
+                    q_idx_local_logical = q_idx_local // qhead_per_kvhead
+                    head_offset = q_idx_local - q_idx_local_logical * qhead_per_kvhead
+                    head_idx_vec[j] = head_idx * qhead_per_kvhead + head_offset
+                    q_idx_local = q_idx_local_logical
 
-            # If we will do loads or are varlen we mod, in order to not read OOB
-            if cutlass.const_expr(fastdiv_mods is not None):
-                if cutlass.const_expr(constant_q_idx is None):
-                    seqlen_q_divmod, seqlen_k_divmod = fastdiv_mods
-                    q_idx_floored = floor_if_packed(index_tensor[i + j][0], qhead_per_kvhead)
-                    _, q_idx_wrapped = divmod(q_idx_floored, seqlen_q_divmod)
-                    q_idx_vec[j] = q_idx_wrapped
-                else:
-                    _, seqlen_k_divmod = fastdiv_mods
+                # Wrap for bounds if needed
+                if cutlass.const_expr(aux_tensors is not None and fastdiv_mods is not None):
+                    seqlen_q_divmod, _ = fastdiv_mods
+                    _, q_idx_local = seqlen_q_divmod.divmod(q_idx_local)
 
-                _, kv_idx_wrapped = divmod(index_tensor[i + j][1], seqlen_k_divmod)
-                kv_idx_vec[j] = kv_idx_wrapped
-            else:
-                # No bounds checking - direct indexing
-                if constant_q_idx is None:
-                    q_idx_vec[j] = floor_if_packed(index_tensor[i + j][0], qhead_per_kvhead)
-                kv_idx_vec[j] = index_tensor[i + j][1]
+                q_idx_local_vec[j] = q_idx_local
 
-            # Compute global indices - store unwrapped local indices for later
-            if constant_q_idx is None:
-                q_idx_unwrapped = floor_if_packed(index_tensor[i + j][0], qhead_per_kvhead)
-                q_idx_global_vec[j] = q_idx_unwrapped
-            kv_idx_global_vec[j] = index_tensor[i + j][1]
+                # Global = position in packed tensor (add offset AFTER wrapping)
+                q_idx_global_vec[j] = offset_q + q_idx_local
 
         # Convert to SSA for score_mod call
         score_ssa = score_vec.load()
-        kv_idx_ssa = kv_idx_vec.load()
-        if cutlass.const_expr(constant_q_idx is None):
-            q_idx_ssa = q_idx_vec.load()
-        else:
-            # NB we do not apply Pack-GQA division here, as constant_q_idx is assumed to already be logical
-            q_idx_const = constant_q_idx
-            q_idx_ssa = utils.scalar_to_ssa(q_idx_const, cutlass.Int32).broadcast_to((vec_size,))
+        kv_idx_local_ssa = kv_idx_local_vec.load()
+        kv_idx_global_ssa = kv_idx_global_vec.load()
 
-        # Compute head_idx_ssa: per-element for Pack-GQA with non-constant q_idx, constant otherwise
-        if cutlass.const_expr(qhead_per_kvhead > 1 and constant_q_idx is None):
-            head_idx_ssa = head_idx_vec.load()
+        if cutlass.const_expr(constant_q_idx is None):
+            # Non-constant path: use per-element values
+            q_idx_local_ssa = q_idx_local_vec.load()
+            q_idx_global_ssa = q_idx_global_vec.load()
+
+            if cutlass.const_expr(qhead_per_kvhead > 1):
+                head_idx_ssa = head_idx_vec.load()
+            else:
+                head_idx_ssa = utils.scalar_to_ssa(head_idx, cutlass.Int32).broadcast_to((vec_size,))
         else:
+            # Constant path: constant_q_idx is already LOGICAL (after Pack-GQA if applicable)
+            q_idx_local = constant_q_idx
+
+            # Wrap for bounds if needed
+            if cutlass.const_expr(aux_tensors is not None and fastdiv_mods is not None):
+                seqlen_q_divmod, _ = fastdiv_mods
+                _, q_idx_local = seqlen_q_divmod.divmod(q_idx_local)
+
+            q_idx_local_ssa = utils.scalar_to_ssa(q_idx_local, cutlass.Int32).broadcast_to((vec_size,))
+
+            # Global: add offset to local (AFTER wrapping)
+            q_idx_global = offset_q + q_idx_local
+            q_idx_global_ssa = utils.scalar_to_ssa(q_idx_global, cutlass.Int32).broadcast_to((vec_size,))
+
+            # Head index already computed in outer for constant path
             head_idx_ssa = utils.scalar_to_ssa(head_idx, cutlass.Int32).broadcast_to((vec_size,))
 
         aux_args = []
         if cutlass.const_expr(aux_tensors is not None):
             aux_args = aux_tensors
 
-        if cutlass.const_expr(constant_q_idx is None):
-            q_idx_global_ssa = q_idx_global_vec.load()
-        else:
-            constant_q_idx_ssa = utils.scalar_to_ssa(constant_q_idx, cutlass.Int32).broadcast_to(
-                (vec_size,)
-            )
-            q_idx_global_ssa = constant_q_idx_ssa
-
-        kv_idx_global_ssa = kv_idx_global_vec.load()
-
         post_mod_scores = score_mod(
             score_ssa,
             batch_idx_ssa,
             head_idx_ssa,
-            q_idx=q_idx_ssa,
-            kv_idx=kv_idx_ssa,
+            q_idx=q_idx_local_ssa,
+            kv_idx=kv_idx_local_ssa,
             aux_tensors=aux_args,
             q_idx_global=q_idx_global_ssa,
             kv_idx_global=kv_idx_global_ssa,

@@ -908,7 +908,6 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             m_block=m_block,
             aux_tensors=aux_tensors,
             fastdiv_mods=fastdiv_mods,
-            seqlen=seqlen,
         )
 
         # ///////////////////////////////////////////////////////////////////////////////
@@ -1053,7 +1052,6 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         m_block: cutlass.Int32,
         aux_tensors=None,
         fastdiv_mods=None,
-        seqlen=None,
         mask_fn: Optional[Callable] = None,
         is_first_n_block: cutlass.Constexpr = False,
         check_inf: cutlass.Constexpr = True,
@@ -1110,7 +1108,6 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                 softmax_scale=softmax.softmax_scale,
                 aux_tensors=aux_tensors,
                 fastdiv_mods=fastdiv_mods,
-                seqlen=seqlen,
             )
 
         smem_pipe_write = self.advance_pipeline(smem_pipe_write)
@@ -2008,7 +2005,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     softmax_scale=softmax_scale,
                     aux_tensors=aux_tensors,
                     fastdiv_mods=fastdiv_mods,
-                    seqlen=seqlen,
                 )
             mma_one_n_block = partial(
                 mma_one_n_block_all,
@@ -2143,7 +2139,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     self.warp_scheduler_barrier_sync,
                     self.warp_scheduler_barrier_arrive,
                 )
-
+                
                 # Handle empty case (when no blocks to process)
                 if not processed_any:
                     softmax.reset()
@@ -2398,49 +2394,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         softmax_scale,
         aux_tensors: Optional[list] = None,
         fastdiv_mods=None,
-        seqlen=None,
     ):
         # Prepare index tensor
         cS = cute.make_identity_tensor((self.tile_m, self.tile_n))
         cS = cute.domain_offset((m_block * self.tile_m, n_block * self.tile_n), cS)
         tScS = thr_mma_qk.partition_C(cS)
-        tScS_t2r = thr_mma_qk.partition_C(cS)
-
-        # Extract q_idx_logical from index tensor
-        q_idx_logical = tScS_t2r[0][0]
-
-        # For Pack-GQA, compute the logical head index for this tile
-        if cutlass.const_expr(self.pack_gqa):
-            q_physical = q_idx_logical
-            q_idx_logical = q_physical // self.qhead_per_kvhead
-            head_offset = q_physical - q_idx_logical * self.qhead_per_kvhead
-            head_idx = head_idx * self.qhead_per_kvhead + head_offset
-
-        if cutlass.const_expr(seqlen is not None):
-            need_recompute_q = cutlass.const_expr(seqlen.has_cu_seqlens_q)
-            need_recompute_k = cutlass.const_expr(seqlen.has_cu_seqlens_k)
-
-            if cutlass.const_expr(need_recompute_q or need_recompute_k):
-                if cutlass.const_expr(need_recompute_q):
-                    seqlen_q_divmod = FastDivmod.create(seqlen.seqlen_q)
-                elif cutlass.const_expr(fastdiv_mods is not None):
-                    seqlen_q_divmod, _ = fastdiv_mods
-                else:
-                    seqlen_q_divmod = FastDivmod.create(seqlen.seqlen_q)
-
-                if cutlass.const_expr(need_recompute_k):
-                    seqlen_k_divmod = FastDivmod.create(seqlen.seqlen_k)
-                elif cutlass.const_expr(fastdiv_mods is not None):
-                    _, seqlen_k_divmod = fastdiv_mods
-                else:
-                    seqlen_k_divmod = FastDivmod.create(seqlen.seqlen_k)
-
-                fastdiv_mods = (seqlen_q_divmod, seqlen_k_divmod)
-
-        # Apply q_idx wrapping if we have fastdiv_mods
-        if cutlass.const_expr(fastdiv_mods is not None):
-            seqlen_q_divmod, _ = fastdiv_mods
-            _, q_idx_logical = seqlen_q_divmod.divmod(q_idx_logical)
 
         apply_score_mod_inner(
             acc_S,
@@ -2453,7 +2411,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             self.qk_acc_dtype,
             aux_tensors,
             fastdiv_mods,
-            constant_q_idx=q_idx_logical,
+            constant_q_idx=None,
             qhead_per_kvhead=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
         )
 
