@@ -654,7 +654,7 @@ class FlashAttentionForwardSm100:
             window_size_right = Int32(window_size_right)
 
         fastdiv_mods = None
-        if cutlass.const_expr(aux_tensors is not None and mCuSeqlensQ is None and mCuSeqlensK is None):
+        if cutlass.const_expr(aux_tensors is not None):
             seqlen_q = cute.size(mQ.shape[0]) // (
                 self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1
             )
@@ -745,7 +745,7 @@ class FlashAttentionForwardSm100:
         tile_sched_params: ParamsBase,
         num_splits: Int32,
         aux_tensors: Optional[list] = None,
-        fastdiv_mods: Optional[Tuple[FastDivmod, FastDivmod]] = None,
+        fastdiv_mods=(None, None),
     ):
         """The device kernel implementation of the Fused Multi-Head Attention.
 
@@ -1544,7 +1544,7 @@ class FlashAttentionForwardSm100:
         AttentionMaskCls: Callable,
         TileSchedulerCls: Callable,
         aux_tensors: Optional[list] = None,
-        fastdiv_mods: Optional[Tuple[FastDivmod, FastDivmod]] = None,
+        fastdiv_mods=(None, None),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
     ):
         """Compute softmax on attention scores from QK matrix multiplication.
@@ -1624,10 +1624,10 @@ class FlashAttentionForwardSm100:
                 head_idx=head_idx,
                 aux_tensors=aux_tensors,
             )
-            mask_mod = self.mask_mod if const_expr(self.mask_mod is not None) else None
+            block_mask_mod = self.mask_mod if const_expr(self.use_block_sparsity) else None
             mask_fn = partial(
                 mask.apply_mask_sm100,
-                mask_mod=mask_mod,
+                mask_mod=block_mask_mod,
                 fastdiv_mods=fastdiv_mods,
                 **shared_mask_kwargs,
             )
@@ -1837,7 +1837,7 @@ class FlashAttentionForwardSm100:
         m_block: Int32,
         seqlen,
         aux_tensors: Optional[list] = None,
-        fastdiv_mods: Optional[Tuple[FastDivmod, FastDivmod]] = None,
+        fastdiv_mods=(None, None),
         mask_fn: Optional[Callable] = None,
         is_first: bool = False,
     ) -> Tuple[cute.Int32, cute.Int32, cute.Int32]:
@@ -1876,8 +1876,8 @@ class FlashAttentionForwardSm100:
                 n_block,
                 softmax,
                 aux_tensors,
-                seqlen,
                 fastdiv_mods,
+                seqlen=seqlen,
             )
 
         if const_expr(mask_fn is not None):
@@ -2371,7 +2371,7 @@ class FlashAttentionForwardSm100:
                 self.check_hdim_v_oob,
                 self.qhead_per_kvhead,
             )
-
+        
             # load acc O from smem to rmem for wider vectorization
             tOrO = cute.make_fragment_like(tOsO, self.o_dtype)
             cute.autovec_copy(tOsO, tOrO)
@@ -2640,8 +2640,8 @@ class FlashAttentionForwardSm100:
         n_block,
         softmax,
         aux_tensors=None,
+        fastdiv_mods=(None, None),
         seqlen=None,
-        fastdiv_mods=None,
     ):
         """Apply score modification for SM100 (constant q_idx)."""
         # Prepare index tensor with extra partition
@@ -2649,49 +2649,23 @@ class FlashAttentionForwardSm100:
         cS = cute.domain_offset((m_block * self.m_block_size, n_block * self.n_block_size), cS)
         tScS = thr_mma_qk.partition_C(cS)
         tScS_t2r = thr_tmem_load.partition_D(tScS)
-
-        # Shared q_idx for all scores
+        
+        # Get the q_idx for this tile
         q_idx_logical = tScS_t2r[0][0]
-
-        # For Pack-GQA, compute the logical head index for this tile
+        
+        # Get offsets for varlen
+        offset_q = seqlen.offset_q
+        offset_k = seqlen.offset_k
+        
+        # For Pack-GQA, compute the logical head index and q_idx for this tile
         if cutlass.const_expr(self.pack_gqa):
-            # Building up the logical q_head idx: final_q_head = kv_head * qhead_per_kvhead + (q_physical % qhead_per_kvhead)
-            q_physical = q_idx_logical
-            q_idx_logical = q_physical // self.qhead_per_kvhead
-            head_offset = q_physical - q_idx_logical * self.qhead_per_kvhead
+            # q_idx_logical currently includes the head replication
+            # Extract the logical q position and head offset
+            q_idx_logical_adjusted = q_idx_logical // self.qhead_per_kvhead
+            head_offset = q_idx_logical - q_idx_logical_adjusted * self.qhead_per_kvhead
             head_idx = head_idx * self.qhead_per_kvhead + head_offset
-
-        if cutlass.const_expr(seqlen is not None):
-            need_recompute_q = cutlass.const_expr(seqlen.has_cu_seqlens_q)
-            need_recompute_k = cutlass.const_expr(seqlen.has_cu_seqlens_k)
-
-            if cutlass.const_expr(need_recompute_q or need_recompute_k):
-                if cutlass.const_expr(need_recompute_q):
-                    seqlen_q_divmod = FastDivmod.create(seqlen.seqlen_q)
-                elif cutlass.const_expr(fastdiv_mods is not None):
-                    seqlen_q_divmod, _ = fastdiv_mods
-                else:
-                    seqlen_q_divmod = FastDivmod.create(seqlen.seqlen_q)
-
-                if cutlass.const_expr(need_recompute_k):
-                    seqlen_k_divmod = FastDivmod.create(seqlen.seqlen_k)
-                elif cutlass.const_expr(fastdiv_mods is not None):
-                    _, seqlen_k_divmod = fastdiv_mods
-                else:
-                    seqlen_k_divmod = FastDivmod.create(seqlen.seqlen_k)
-
-                fastdiv_mods = (seqlen_q_divmod, seqlen_k_divmod)
-
-            elif cutlass.const_expr(fastdiv_mods is not None):
-                fastdiv_mods = fastdiv_mods
-
-        elif cutlass.const_expr(fastdiv_mods is not None):
-            fastdiv_mods = fastdiv_mods
-
-        if cutlass.const_expr(fastdiv_mods is not None):
-            seqlen_q_divmod, _ = fastdiv_mods
-            _, q_idx_logical = divmod(q_idx_logical, seqlen_q_divmod)
-
+            q_idx_logical = q_idx_logical_adjusted
+        
         apply_score_mod_inner(
             tSrS_t2r,
             tScS_t2r,
@@ -2705,4 +2679,7 @@ class FlashAttentionForwardSm100:
             fastdiv_mods,
             constant_q_idx=q_idx_logical,
             qhead_per_kvhead=self.qhead_per_kvhead if cutlass.const_expr(self.pack_gqa) else 1,
+            offset_q=offset_q,
+            offset_k=offset_k,
+            n_block=n_block,
         )
