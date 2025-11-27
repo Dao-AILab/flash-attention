@@ -7,8 +7,8 @@ from cutlass.cute.nvgpu import cpasync
 from cutlass import Int32, const_expr
 
 from flash_attn.cute import utils
-from flash_attn.cute.fast_math import FastDivmod
 from flash_attn.cute.cute_dsl_utils import ParamsBase
+from cutlass.cute import FastDivmodDivisor
 
 
 @dataclass
@@ -18,7 +18,7 @@ class PagedKVManager(ParamsBase):
     mV_paged: cute.Tensor
     thread_idx: Int32
 
-    page_size_divmod: FastDivmod
+    page_size_divmod: FastDivmodDivisor
     seqlen_k: Int32
     leftpad_k: Int32
     n_block_size: Int32
@@ -42,7 +42,7 @@ class PagedKVManager(ParamsBase):
         mPageTable: cute.Tensor,
         mK_paged: cute.Tensor,
         mV_paged: cute.Tensor,
-        page_size_divmod: FastDivmod,
+        page_size_divmod: FastDivmodDivisor,
         bidb: Int32,
         bidh: Int32,
         thread_idx: Int32,
@@ -118,7 +118,7 @@ class PagedKVManager(ParamsBase):
             row = (i * self.num_threads + self.thread_idx) // self.gmem_threads_per_row
             row_idx = n_block * self.n_block_size + row
 
-            page_idx, page_offset = self.page_size_divmod.divmod(row_idx + self.leftpad_k)
+            page_idx, page_offset = divmod(row_idx + self.leftpad_k, self.page_size_divmod)
 
             is_valid = (
                 (i + 1) * self.num_threads <= self.n_block_size or row < self.n_block_size
@@ -173,4 +173,16 @@ class PagedKVManager(ParamsBase):
                     )
             elif const_expr(K_or_V == "V"):
                 # Don't need to clear out the rest of the smem for K since we'll mask out the scores anyway.
-                tXsX[None, m, None].fill(0)
+                fill_swizzled(tXsX[None, m, None], 0)
+
+
+@cutlass.dsl_user_op
+def fill_swizzled(tensor, value: cutlass.Numeric, *, loc=None, ip=None) -> None:
+    """Fill tensor with a constant value.
+
+    Fills all elements of the tensor with the specified value, assuming static size
+    and supported memory space.
+    """
+    rTmp = cute.make_rmem_tensor_like(tensor, tensor.element_type)
+    rTmp.fill(value)
+    cute.autovec_copy(rTmp, tensor)

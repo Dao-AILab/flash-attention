@@ -14,8 +14,8 @@ from cutlass.cute.nvgpu import cpasync
 from cutlass import Float32, Int32, const_expr
 
 from flash_attn.cute import utils
-from flash_attn.cute.fast_math import FastDivmod
 from flash_attn.cute.seqlen_info import SeqlenInfo
+from cutlass.cute import FastDivmodDivisor
 
 
 class FlashAttentionForwardCombine:
@@ -257,9 +257,9 @@ class FlashAttentionForwardCombine:
         num_head = mO_partial.shape[3]
         batch_size = mO_partial.shape[4] if const_expr(cu_seqlens is None) else Int32(cu_seqlens.shape[0] - 1)
 
-        # Create FastDivmod objects for efficient division
-        seqlen_divmod = FastDivmod.create(seqlen)
-        head_divmod = FastDivmod.create(num_head)
+        # Create FastDivmodDivisor objects for efficient division
+        seqlen_divmod = FastDivmodDivisor(seqlen)
+        head_divmod = FastDivmodDivisor(num_head)
 
         grid_dim = (
             cute.ceil_div(seqlen * num_head, self.m_block_size),
@@ -311,8 +311,8 @@ class FlashAttentionForwardCombine:
         gmem_tiled_copy_O: cute.TiledCopy,
         gmem_tiled_copy_LSE: cute.TiledCopy,
         s2r_tiled_copy_LSE: cute.TiledCopy,
-        seqlen_divmod: FastDivmod,
-        head_divmod: FastDivmod,
+        seqlen_divmod: FastDivmodDivisor,
+        head_divmod: FastDivmodDivisor,
         varlen: cutlass.Constexpr[bool],
     ):
         # Thread and block indices
@@ -380,9 +380,9 @@ class FlashAttentionForwardCombine:
                 mi = tLSEcLSE[0, 0, m][1]  # Get m coordinate
                 idx = m_block * self.m_block_size + mi
                 if idx < max_idx:
-                    # Calculate actual sequence position and head using FastDivmod
+                    # Calculate actual sequence position and head using FastDivmodDivisor
                     if const_expr(not varlen):
-                        head_idx, m_idx = seqlen_divmod.divmod(idx)
+                        head_idx, m_idx = divmod(idx, seqlen_divmod)
                     else:
                         head_idx = idx // seqlen
                         m_idx = idx - head_idx * seqlen
@@ -420,7 +420,7 @@ class FlashAttentionForwardCombine:
                 mi = tOcO[0, m, 0][0]  # m coordinate
                 idx = m_block * self.m_block_size + mi
                 if const_expr(not varlen):
-                    tOhidx[m], tOmidx[m] = seqlen_divmod.divmod(idx)
+                    tOhidx[m], tOmidx[m] = divmod(idx, seqlen_divmod)
                 else:
                     tOhidx[m] = idx // seqlen
                     tOmidx[m] = idx - tOhidx[m] * seqlen
@@ -536,7 +536,7 @@ class FlashAttentionForwardCombine:
                             idx = m_block * self.m_block_size + mi
                             if idx < max_idx:
                                 if const_expr(not varlen):
-                                    head_idx, m_idx = seqlen_divmod.divmod(idx)
+                                    head_idx, m_idx = divmod(idx, seqlen_divmod)
                                 else:
                                     head_idx = idx // seqlen
                                     m_idx = idx - head_idx * seqlen

@@ -45,7 +45,7 @@ from flash_attn.cute.block_sparse_utils import (
 from flash_attn.cute.pack_gqa import PackGQA
 from flash_attn.cute import mma_sm100_desc as sm100_desc
 from flash_attn.cute import blackwell_helpers as sm100_utils
-from flash_attn.cute.fast_math import FastDivmod
+from cutlass.cute import FastDivmodDivisor
 from flash_attn.cute.tile_scheduler import (
     TileSchedulerArguments,
     SingleTileScheduler,
@@ -659,8 +659,8 @@ class FlashAttentionForwardSm100:
                 self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1
             )
             seqlen_k = cute.size(mK.shape[0])
-            seqlen_q_divmod = FastDivmod.create(seqlen_q)
-            seqlen_k_divmod = FastDivmod.create(seqlen_k)
+            seqlen_q_divmod = FastDivmodDivisor(seqlen_q)
+            seqlen_k_divmod = FastDivmodDivisor(seqlen_k)
             fastdiv_mods = (seqlen_q_divmod, seqlen_k_divmod)
 
         self.use_block_sparsity = cutlass.const_expr(blocksparse_tensors is not None)
@@ -1190,7 +1190,7 @@ class FlashAttentionForwardSm100:
                     mPageTable,
                     mK,
                     mV,
-                    FastDivmod.create(page_size),
+                    FastDivmodDivisor(page_size),
                     batch_idx,
                     head_idx_kv,
                     tidx,
@@ -1624,10 +1624,11 @@ class FlashAttentionForwardSm100:
                 head_idx=head_idx,
                 aux_tensors=aux_tensors,
             )
-            block_mask_mod = self.mask_mod if const_expr(self.use_block_sparsity) else None
+            mask_mod = self.mask_mod if const_expr(self.mask_mod is not None) else None
             mask_fn = partial(
                 mask.apply_mask_sm100,
-                mask_mod=block_mask_mod,
+                mask_mod=mask_mod,
+                fastdiv_mods=fastdiv_mods,
                 **shared_mask_kwargs,
             )
             if const_expr(self.use_block_sparsity):
@@ -1635,6 +1636,7 @@ class FlashAttentionForwardSm100:
                 mask_fn_none = partial(
                     mask.apply_mask_sm100,
                     mask_mod=None,
+                    fastdiv_mods=fastdiv_mods,
                     **shared_mask_kwargs,
                 )
             else:
@@ -1674,7 +1676,6 @@ class FlashAttentionForwardSm100:
                 seqlen=seqlen,
                 aux_tensors=aux_tensors,
                 fastdiv_mods=fastdiv_mods,
-                mask_fn=partial(mask_fn, mask_seqlen=False),
             )
 
             if has_work:
@@ -1748,15 +1749,21 @@ class FlashAttentionForwardSm100:
                                 )
                             )
                         n_block_max = cutlass.min(n_block_max, n_block_min_causal_local_mask)
-                    # The remaining iterations have no masking
+                    # The remaining iterations have no masking (but may still need mask_mod)
                     n_block_min_before_local_mask = block_info.get_n_block_min_before_local_mask(
                         seqlen, m_block, n_block_min
                     )
                     for n_tile in cutlass.range(n_block_max - n_block_min_before_local_mask, unroll=1):
                         n_block = n_block_max - n_tile - 1
-                        mma_si_consumer_phase, si_corr_producer_phase, s0_s1_sequence_phase = softmax_step(
-                        mma_si_consumer_phase, si_corr_producer_phase, s0_s1_sequence_phase, n_block
-                    )
+                        if const_expr(self.mask_mod is not None):
+                            mma_si_consumer_phase, si_corr_producer_phase, s0_s1_sequence_phase = softmax_step(
+                                mma_si_consumer_phase, si_corr_producer_phase, s0_s1_sequence_phase, n_block,
+                                mask_fn=partial(mask_fn, mask_seqlen=False),
+                            )
+                        else:
+                            mma_si_consumer_phase, si_corr_producer_phase, s0_s1_sequence_phase = softmax_step(
+                                mma_si_consumer_phase, si_corr_producer_phase, s0_s1_sequence_phase, n_block,
+                            )
                     # Separate iterations with local masking on the left
                     if const_expr(self.is_local and block_info.window_size_left is not None):
                         n_block_max = cutlass.min(n_block_max, n_block_min_before_local_mask)
@@ -2653,7 +2660,7 @@ class FlashAttentionForwardSm100:
 
         if cutlass.const_expr(aux_tensors is not None):
             seqlen_q_divmod, _ = fastdiv_mods
-            _, q_idx_logical = seqlen_q_divmod.divmod(q_idx_logical)
+            _, q_idx_logical = divmod(q_idx_logical, seqlen_q_divmod)
 
         apply_score_mod_inner(
             tSrS_t2r,

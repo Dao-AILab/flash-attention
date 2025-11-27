@@ -71,6 +71,14 @@ def convert_from_dlpack(x, leading_dim, alignment=16, divisibility=1) -> cute.Te
         )
     )
 
+def convert_from_dlpack_leading_static(x, leading_dim, alignment=16, static_modes=None, stride_order=None) -> cute.Tensor:
+    if stride_order is None:
+        stride_order = x.dim_order()
+    x_ = from_dlpack(x, assumed_align=alignment)
+    for i in range(x.ndim):
+        if i != leading_dim and (static_modes is None or i not in static_modes):
+            x_ = x_.mark_compact_shape_dynamic(mode=i, stride_order=stride_order)
+    return x_
 
 def make_tiled_copy_A(
     copy_atom: cute.CopyAtom, tiled_mma: cute.TiledMma, swapAB: cutlass.Constexpr[bool] = False
@@ -586,8 +594,8 @@ def cvt_f16(src: cute.Tensor, dst_or_dtype):
             dst_i32[i] = cvt_f16x2_f32(src[2 * i], src[2 * i + 1], dst.element_type)
 
 
-@cute.jit
 @dsl_user_op
+@cute.jit
 def evaluate_polynomial(x: Float32, poly: Tuple[Float32, ...], *, loc=None, ip=None) -> Float32:
     deg = len(poly) - 1
     out = poly[deg]
@@ -596,8 +604,8 @@ def evaluate_polynomial(x: Float32, poly: Tuple[Float32, ...], *, loc=None, ip=N
     return out
 
 
-@cute.jit
 @dsl_user_op
+@cute.jit
 def evaluate_polynomial_2(x: Float32, y: Float32, poly: Tuple[Float32, ...], *, loc=None, ip=None) -> Tuple[Float32, Float32]:
     deg = len(poly) - 1
     out = (poly[deg], poly[deg])
