@@ -320,11 +320,11 @@ class FlashAttentionBackwardSm100:
         )
         self.sdKV_epi_tile = (
             self.tile_n,
-            128 // (self.dk_dtype.width // 8),  # 64 or 32
+            min(128 // (self.dk_dtype.width // 8), self.tile_hdim // 2),  # 64 or 32
         )  # subtiles mma_tiler_dsq[:2] = mma_tiler_pdo[:2]
-        self.num_epi_stages = (self.tile_hdim // 2) // self.sdKV_epi_tile[1]
+        # headdim_64 gets 1 stage
+        self.num_epi_stages = max(1, (self.tile_hdim // 2) // self.sdKV_epi_tile[1])
         self.sdKV_flat_epi_tile = self.tile_n * (self.tile_hdim // 2) // self.num_epi_stages
-
         # TODO: dK and dV could have different shapes
         if const_expr(self.qhead_per_kvhead == 1):
             self.sdKV_layout = sm100_utils_basic.make_smem_layout_epi(
@@ -402,7 +402,7 @@ class FlashAttentionBackwardSm100:
         else:
             layout_dKV_transpose = LSE_dPsum_dQaccum_transpose
         mdK, mdV = [utils.select(t, mode=layout_dKV_transpose) for t in (mdK, mdV)]
-        dO_transpose = [1, 0, 2, 3]  # (s, h, n, b) --> (h, s, n, h)
+        dO_transpose = [1, 0, 2, 3]  # (s, h, n, b) --> (h, s, n, b)
         mdO = utils.select(mdO, mode=dO_transpose)
 
         semaphore_transpose = [2, 3, 1, 0]  # (b, n, block, stage) -> (block, stage, n, b)
@@ -524,15 +524,15 @@ class FlashAttentionBackwardSm100:
             self.cluster_layout_vmnk.shape,
         )
         dO_tma_op = sm100_utils_basic.cluster_shape_to_tma_atom_B(
-            self.cluster_shape_mnk, self.tiled_mma_dP.thr_id
+            self.cluster_shape_mnk, self.tiled_mma_dV.thr_id
         )
         tma_atom_dO, tma_tensor_dO = cute.nvgpu.make_tiled_tma_atom_B(
             # tma_load_op if const_expr(self.cluster_shape_mnk[0] == 1) else tma_load_op_multicast,
             dO_tma_op,
             mdO,
             cute.select(self.sdO_layout, mode=[0, 1, 2]),
-            self.mma_tiler_vdo,
-            self.tiled_mma_dP,
+            self.mma_tiler_pdo,
+            self.tiled_mma_dV,
             self.cluster_layout_vmnk.shape,
         )
 
@@ -614,7 +614,9 @@ class FlashAttentionBackwardSm100:
                 self.buffer_align_bytes,
             ]
             sdO: cute.struct.Align[
-                cute.struct.MemRange[self.do_dtype, cute.cosize(self.sdO_layout)],
+                cute.struct.MemRange[
+                    self.do_dtype, max(cute.cosize(self.sdO_layout), cute.cosize(self.sdKV_layout))
+                ],
                 self.buffer_align_bytes,
             ]
             sdS: cute.struct.Align[
@@ -900,9 +902,10 @@ class FlashAttentionBackwardSm100:
         else:
             sdV = storage.sdO.get_tensor(sdKV_layout, dtype=self.dv_dtype)
             sdK = storage.sQ.get_tensor(sdKV_layout, dtype=self.dk_dtype)
-        assert cute.size_in_bytes(self.do_dtype, sdO_layout) >= cute.size_in_bytes(
-            self.dv_dtype, sdKV_layout
-        ), "Not enough space for sdV"
+
+        # assert cute.size_in_bytes(self.do_dtype, sdO_layout) >= cute.size_in_bytes(
+        #     self.dv_dtype, sdKV_layout
+        # ), "Not enough space for sdV"
         assert cute.size_in_bytes(self.q_dtype, sQ_layout) >= cute.size_in_bytes(
             self.dk_dtype, sdKV_layout
         ), "Not enough space for sdK"
@@ -993,6 +996,7 @@ class FlashAttentionBackwardSm100:
             self.load(
                 thr_mma_S,
                 thr_mma_dP,
+                thr_mma_dV,
                 mQ,
                 mK,
                 mV,
@@ -1138,6 +1142,7 @@ class FlashAttentionBackwardSm100:
         self,
         thr_mma_S: cute.core.ThrMma,
         thr_mma_dP: cute.core.ThrMma,
+        thr_mma_dV: cute.core.ThrMma,
         mQ: cute.Tensor,
         mK: cute.Tensor,
         mV: cute.Tensor,
@@ -1206,7 +1211,7 @@ class FlashAttentionBackwardSm100:
             gLSE = cute.local_tile(mLSE_cur, (self.tile_n,), (None,))
             gdPsum = cute.local_tile(mPsum_cur, (self.tile_n,), (None,))
             gdO = cute.local_tile(mdO_cur, cute.select(self.mma_tiler_pdo, mode=[1, 2]), (0, None))
-            tdPgdO = thr_mma_dP.partition_B(gdO)
+            tdPgdO = thr_mma_dV.partition_B(gdO)
 
             load_K, _, _ = copy_utils.tma_get_copy_fn(
                 tma_atom_K, 0, cute.make_layout(1), tSgK, sK, single_stage=True

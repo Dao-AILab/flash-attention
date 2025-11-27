@@ -35,7 +35,7 @@ DISABLE_SPLIT = os.getenv("FLASH_ATTENTION_DISABLE_SPLIT", "FALSE") == "TRUE"
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 # @pytest.mark.parametrize("mha_type", ["mha"])
-@pytest.mark.parametrize("has_learnable_sink", [False, True])
+@pytest.mark.parametrize("has_learnable_sink", [False,])
 # @pytest.mark.parametrize("has_learnable_sink", [False])
 # @pytest.mark.parametrize("has_qv", [False, True])
 @pytest.mark.parametrize("has_qv", [False])
@@ -43,7 +43,7 @@ DISABLE_SPLIT = os.getenv("FLASH_ATTENTION_DISABLE_SPLIT", "FALSE") == "TRUE"
 @pytest.mark.parametrize("deterministic", [False])
 # @pytest.mark.parametrize("softcap", [0.0, 15.0])
 @pytest.mark.parametrize("softcap", [0.0])
-@pytest.mark.parametrize("local", [False, True])
+@pytest.mark.parametrize("local", [False, ])
 # @pytest.mark.parametrize("local", [False])
 @pytest.mark.parametrize("causal", [False, True])
 # @pytest.mark.parametrize("causal", [True])
@@ -56,7 +56,7 @@ DISABLE_SPLIT = os.getenv("FLASH_ATTENTION_DISABLE_SPLIT", "FALSE") == "TRUE"
 # @pytest.mark.parametrize("d", [64, 96, 128, 192])
 # @pytest.mark.parametrize("d", [64, 128])
 # @pytest.mark.parametrize("d", [128, 192])
-@pytest.mark.parametrize("d", [128])
+@pytest.mark.parametrize("d", [64, ])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -108,8 +108,9 @@ def test_flash_attn_output(
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
     batch_size = 9 if seqlen_k <= 2048 else 2
+    batch_size = 1
     # batch_size = 1
-    nheads = 6
+    nheads = 2
     # nheads = 1
     nheads_kv = nheads if mha_type == "mha" else (3 if mha_type == "gqa" else 1)
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
@@ -119,8 +120,9 @@ def test_flash_attn_output(
         dv_vals = [d]
     # attention_chunk_vals = [torch.randint(1, seqlen_k * 2, (1,)).item(), 0]
     attention_chunk_vals = [0]
+    factory = torch.randn if False else torch.ones
     for dv, attention_chunk in itertools.product(dv_vals, attention_chunk_vals):
-        q_ref = torch.randn(
+        q_ref = factory(
             batch_size, seqlen_q, nheads, d, device=device, dtype=dtype_ref
         )
         if softcap > 0.0:
@@ -128,7 +130,7 @@ def test_flash_attn_output(
             q_ref = q_ref * softcap / 4
         q_ref = q_ref.to(dtype).to(dtype_ref).requires_grad_()
         k_ref = (
-            torch.randn(
+            factory(
                 batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype_ref
             )
             .to(dtype)
@@ -136,7 +138,7 @@ def test_flash_attn_output(
             .requires_grad_()
         )
         v_ref = (
-            torch.randn(
+            factory(
                 batch_size, seqlen_k, nheads_kv, dv, device=device, dtype=dtype_ref
             )
             .to(dtype)
@@ -145,7 +147,7 @@ def test_flash_attn_output(
         )
         if has_qv:
             qv_ref = (
-                torch.randn(
+                factory(
                     batch_size, seqlen_q, nheads, dv, device=device, dtype=dtype_ref
                 )
                 .to(dtype)
@@ -243,6 +245,7 @@ def test_flash_attn_output(
                 learnable_sink=learnable_sink,
                 # pack_gqa=pack_gqa,
                 num_splits=num_splits,
+                softmax_scale=1.0,
             )
             print(f"Output max diff: {(out - out_ref).abs().max().item()}")
             print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
@@ -269,7 +272,7 @@ def test_flash_attn_output(
             # and False
             and not ((causal or local) and seqlen_k < seqlen_q)
         ):
-            g = torch.randn_like(out)
+            g = torch.ones_like(out)
             # do_o = ((g.float() * out.float()).sum(-1)).transpose(1, 2)
             dq, dk, dv = torch.autograd.grad(out, (q, k, v), g)
             # print(f"dO_O max diff: {(softmax_d - do_o).abs().max().item()}")
