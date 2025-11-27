@@ -47,8 +47,8 @@ class FlashAttentionBackwardPostprocess:
         """
         self.dtype = dtype
         self.tile_m = tile_m
-        assert arch in [80, 90, 100], (
-            "Only Ampere (80), Hopper (90), and Blackwell (100) are supported"
+        assert arch in [80, 90, 100, 110], (
+            "Only Ampere (80), Hopper (90), Blackwell Datacenter (100), and Thor (110) are supported"
         )
         self.arch = arch
         # padding head_dim to a multiple of 32 as k_block_size
