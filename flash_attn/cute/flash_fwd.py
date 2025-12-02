@@ -2004,7 +2004,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     batch_idx,
                     head_idx,
                     m_block,
-                    seqlen,
                     softmax_scale=softmax_scale,
                     aux_tensors=aux_tensors,
                     fastdiv_mods=fastdiv_mods,
@@ -2049,6 +2048,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 if const_expr(self.intra_wg_overlap):
                     kv_consumer_state = process_first_half_block(
                         n_block=n_block_max - 1,
+                        seqlen=seqlen,
                         kv_consumer_state=kv_consumer_state,
                         mask_fn=partial(mask_fn, mask_mod=self.mask_mod),
                         score_mod_fn=score_mod_fn,
@@ -2061,6 +2061,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     kv_consumer_state = mma_one_n_block(
                         kv_consumer_state,
                         n_block=n_block_max - 1,
+                        seqlen=seqlen,
                         mma_pv_fn=partial(mma_pv_fn, zero_init=True),
                         is_first_n_block=True,
                         mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=True),
@@ -2080,6 +2081,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         kv_consumer_state = mma_one_n_block(
                             kv_consumer_state,
                             n_block=n_block_max - 1 - n_tile,
+                            seqlen=seqlen,
                             mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
                             mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=False),
                         )
@@ -2094,6 +2096,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     kv_consumer_state = mma_one_n_block(
                         kv_consumer_state,
                         n_block=n_block_max - 1 - n_tile,
+                        seqlen=seqlen,
                         mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
                         mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=False),
                     )
@@ -2105,6 +2108,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         kv_consumer_state = mma_one_n_block(
                             kv_consumer_state,
                             n_block=n_block_max - 1 - n_tile,
+                            seqlen=seqlen,
                             mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
                             mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=False),
                         )
@@ -2198,6 +2202,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         tOrP: cute.Tensor,
         smem_copy_params: SimpleNamespace,
         softmax: Softmax,
+        seqlen: SeqlenInfoQK,
         mask_fn: Callable = None,
         score_mod_fn: Optional[Callable] = None,
         is_first_block: bool = False,
@@ -2210,7 +2215,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
         # Apply score modification if present
         if const_expr(score_mod_fn is not None):
-            score_mod_fn(acc_S, n_block=n_block)
+            score_mod_fn(acc_S, n_block=n_block, seqlen=seqlen)
 
         # Apply mask; mask_seqlen always True for first block
         # Caveat: if full block further right than mask block, seqlen masking is redundant;
@@ -2270,6 +2275,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         tOrP: cute.Tensor,
         smem_copy_params: SimpleNamespace,
         softmax: Softmax,
+        seqlen: SeqlenInfoQK,
         score_mod_fn: Optional[Callable] = None,
         mask_fn: Optional[Callable] = None,
         is_first_n_block: cutlass.Constexpr = False,
@@ -2284,7 +2290,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
         # handle score mods and masking
         if const_expr(score_mod_fn is not None):
-            score_mod_fn(acc_S, n_block=n_block)
+            score_mod_fn(acc_S, n_block=n_block, seqlen=seqlen)
         if const_expr(mask_fn is not None):
             mask_fn(acc_S=acc_S, n_block=n_block)
 
@@ -2329,6 +2335,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         tOrP: cute.Tensor,
         smem_copy_params: SimpleNamespace,
         softmax: Softmax,
+        seqlen: SeqlenInfoQK,
         score_mod_fn: Optional[Callable] = None,
         mask_fn: Optional[Callable] = None,
         check_inf: cutlass.Constexpr = True,
@@ -2348,7 +2355,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
         # handle score mods and masking
         if const_expr(score_mod_fn is not None):
-            score_mod_fn(acc_S, n_block=n_block)
+            score_mod_fn(acc_S, n_block=n_block, seqlen=seqlen)
         if const_expr(mask_fn is not None):
             mask_fn(acc_S=acc_S, n_block=n_block)
         # if cute.arch.thread_idx()[0] == 128: cute.print_tensor(utils.make_acc_tensor_mn_view(acc_S))
@@ -2403,6 +2410,16 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         cS = cute.make_identity_tensor((self.tile_m, self.tile_n))
         cS = cute.domain_offset((m_block * self.tile_m, n_block * self.tile_n), cS)
         tScS = thr_mma_qk.partition_C(cS)
+
+        recompute_fastdiv_mods_q = cutlass.const_expr(aux_tensors is not None and seqlen.has_cu_seqlens_q)
+        recompute_fastdiv_mods_k = cutlass.const_expr(aux_tensors is not None and seqlen.has_cu_seqlens_k)
+
+        if cutlass.const_expr(fastdiv_mods is not None):
+            seqlen_q_divmod, seqlen_k_divmod = fastdiv_mods
+            fastdiv_mods = (
+                seqlen_q_divmod if not recompute_fastdiv_mods_q else FastDivmod.create(seqlen.seqlen_q),
+                seqlen_k_divmod if not recompute_fastdiv_mods_k else FastDivmod.create(seqlen.seqlen_k)
+            )
 
         apply_score_mod_inner(
             acc_S,

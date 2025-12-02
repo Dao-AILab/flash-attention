@@ -224,8 +224,10 @@ def score_mod_stress_complex_arithmetic(
     bias = aux_tensors[0]
     dtype = bias.element_type
 
+    # Use absolute value instead of squaring to avoid overflow with large sequences
     rel_pos = q_idx - kv_idx
-    rel_pos_sq = rel_pos * rel_pos
+    rel_pos_abs = cute.TensorSSA(mlir_math.absi(rel_pos), rel_pos.shape, rel_pos.dtype)
+    rel_bias = rel_pos_abs.to(cutlass.Float32) * cute.full_like(tSrS_ssa, 0.001)
 
     q_frag = cute.make_fragment(1, cutlass.Int32)
     q_frag.store(q_idx_global)
@@ -234,11 +236,10 @@ def score_mod_stress_complex_arithmetic(
     bias_q = (bias_q_frag.load()).to(cutlass.Float32)
 
     scale = (b_idx + cute.full_like(b_idx, 1)) * (h_idx + cute.full_like(h_idx, 1))
-    scale_f32 = scale.to(cutlass.Float32) * cute.full_like(tSrS_ssa, 0.001)
+    scale_f32 = scale.to(cutlass.Float32) * 0.001
 
-    rel_bias = rel_pos_sq.to(cutlass.Float32) * cute.full_like(tSrS_ssa, 0.0001)
-
-    return tSrS_ssa + rel_bias + bias_q * scale_f32
+    result = tSrS_ssa + rel_bias + bias_q * scale_f32
+    return result
 
 
 @cute.jit
@@ -493,11 +494,12 @@ def packed_logical_rel_plus_kv_bias_factory(bias_tensor, cu_seqlens_k):
 
 def stress_complex_arithmetic_factory(bias, cu_seqlens_q):
     def mod(score, b, h, q_idx, kv_idx):
-        rel_pos_sq = (q_idx - kv_idx) ** 2
+        # Use absolute value instead of squaring to avoid overflow with large sequences
+        rel_pos_abs = torch.abs(q_idx - kv_idx)
         q_global = cu_seqlens_q[b] + q_idx
         bias_q = bias[q_global]
         scale = (b + 1) * (h + 1) * 0.001
-        rel_bias = rel_pos_sq.float() * 0.0001
+        rel_bias = rel_pos_abs * 0.001
         return score + rel_bias + bias_q * scale
 
     return mod

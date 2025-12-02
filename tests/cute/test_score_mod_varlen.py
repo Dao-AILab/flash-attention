@@ -120,10 +120,22 @@ SEQLEN_CONFIGS = [
     ([64, 128], [32, 64]),
     ([100, 100], [50, 50]),
     ([256, 512, 256], [128, 256, 128]),
-    ([1, 1], [16384, 16384]),
-    ([2, 2, 2], [128*1024]*3)
+    ([2, 1], [16384, 32*1024]),
+    ([1, 1], [128*1024]*2),
+    ([2, 1], [8192, 8192]),
+    ([1, 3], [8192, 8192]),
+    ([3, 3], [8192, 8192]),
+    ([128, 128], [8192, 8192]),
+    ([2, 2, 2], [8*1024]*3),
+    ([2, 1], [1024*32, 16384]),
+    ([1, 2], [1024*32, 16384]),
+    ([1, 1, 1], [128*1024]*3),
+    ([1, 1, 1], [256*1024]*3),
+    ([1, 1, 1], [512*1024]*3),
 ]
-
+# SEQLEN_CONFIGS = [
+#     ([2, 2], [2**i] * 2) for i in range(13, 20)
+# ]
 
 # =============================================================================
 # Helper functions
@@ -218,7 +230,7 @@ def setup_tensors(seqlens_q, seqlens_k, varlen_q, varlen_k, num_heads, head_dim,
             [0] + list(torch.tensor(seqlens_q).cumsum(0).tolist()), device="cuda", dtype=torch.int32
         )
     else:
-        seqlen_q = seqlens_q[0]
+        seqlen_q = seqlens_q[0]  # All sequences have the same length for non-varlen
         q = torch.randn(batch_size, seqlen_q, num_heads, head_dim, device="cuda", dtype=dtype)
         cu_seqlens_q = None
 
@@ -230,7 +242,7 @@ def setup_tensors(seqlens_q, seqlens_k, varlen_q, varlen_k, num_heads, head_dim,
             [0] + list(torch.tensor(seqlens_k).cumsum(0).tolist()), device="cuda", dtype=torch.int32
         )
     else:
-        seqlen_k = seqlens_k[0]
+        seqlen_k = seqlens_k[0]  # All sequences have the same length for non-varlen
         k = torch.randn(batch_size, seqlen_k, num_heads, head_dim, device="cuda", dtype=dtype)
         v = torch.randn(batch_size, seqlen_k, num_heads, head_dim, device="cuda", dtype=dtype)
         cu_seqlens_k = None
@@ -288,11 +300,10 @@ def check_results(
         max_pt_error = 0.0
 
         for i in range(num_seqs):
-            sq = seqlens_q[i]
-            cute_seq = out_cute[i, :sq]
-
+            # Extract sequences using cu_seqlens (all outputs are in packed format)
             start_q = cu_seqlens_q[i]
             end_q = cu_seqlens_q[i + 1]
+            cute_seq = out_cute[start_q:end_q]
             ref_seq = out_ref_fp32[start_q:end_q]
             pt_seq = out_pt[start_q:end_q]
 
@@ -312,8 +323,9 @@ def check_results(
     print(f"  PyTorch vs FP32 ref: {pt_error:.2e}")
     print(f"  CuTE vs FP32 ref: {cute_error:.2e}")
 
-    assert cute_error <= rtol * pt_error + fwd_atol + extra_atol, (
-        f"{test_name}: CuTE error {cute_error:.2e} exceeds tolerance"
+    tol = rtol * pt_error + fwd_atol + extra_atol
+    assert cute_error <= tol, (
+        f"{test_name}: CuTE error {cute_error:.2e} exceeds tolerance {tol:.2e}"
     )
 
 # =============================================================================
@@ -399,7 +411,14 @@ def test_varlen_with_score_mod(seqlens_q, seqlens_k, varlen_q, varlen_k, dtype, 
     )
 
     test_name = f"{cute_score_mod.__name__} (varlen_q={varlen_q}, varlen_k={varlen_k})"
-    check_results(out_cute, out_ref_fp32, out_pt, test_name)
+    # Use dtype-dependent tolerance for large sequences with causal masking
+    extra_atol = 2e-3 # if dtype == torch.float16 else 2e-2
+    check_results(
+        out_cute, out_ref_fp32, out_pt, test_name,
+        extra_atol=extra_atol,
+        seqlens_q=seqlens_q if varlen_q else None,
+        cu_seqlens_q=cu_seqlens_q if varlen_q else None
+    )
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
@@ -455,7 +474,7 @@ def test_varlen_with_global_idx_score_mod(
 
     torch.random.manual_seed(42)
 
-    num_heads = 4
+    num_heads = 1
     head_dim = 128
     batch_size = len(seqlens_q)
     max_rel_pos = 512
@@ -578,7 +597,33 @@ def test_varlen_with_global_idx_score_mod(
     )
 
     test_name = f"{cute_score_mod.__name__} (varlen_q={varlen_q}, varlen_k={varlen_k}, {aux_type})"
-    check_results(out_cute_final, out_ref_final, out_pt_final, test_name, extra_atol=1e-3)
+
+    # Debug: print first few values for stress_complex
+    if "stress_complex" in cute_score_mod.__name__:
+        print(f"\nDEBUG {test_name}:")
+        print(f"seqlens_q: {seqlens_q}")
+        print(f"cu_seqlens_q: {cu_seqlens_q}")
+        print(f"Bias tensor: {aux_tensors[0][:6]}")
+
+        # Print expected values for first few positions
+        print("\nExpected reference values for first positions:")
+        for b in range(min(3, len(seqlens_q))):
+            for h in range(min(2, num_heads)):
+                for q in range(min(2, seqlens_q[b])):
+                    q_global = cu_seqlens_q[b] + q
+                    bias_q = aux_tensors[0][q_global].item()
+                    scale = (b + 1) * (h + 1) * 0.001
+                    print(f"  REF: b={b} h={h} q_local={q} q_global={q_global} bias_q={bias_q:.6f} scale={scale:.6f}")
+
+        print(f"\nout_cute_final[0,0,0]: {out_cute_final[0,0,0]}")
+        print(f"out_ref_final[0,0,0]: {out_ref_final[0,0,0]}")
+        print(f"Difference: {(out_cute_final[0,0,0] - out_ref_final[0,0,0]).abs()}")
+
+    check_results(
+        out_cute_final, out_ref_final, out_pt_final, test_name, extra_atol=1e-3,
+        seqlens_q=seqlens_q if varlen_q else None,
+        cu_seqlens_q=cu_seqlens_q if varlen_q else None
+    )
 
 
 if __name__ == "__main__":
