@@ -6,218 +6,32 @@ from cutlass._mlir.dialects import math as mlir_math
 import operator
 from torch.nn.attention.flex_attention import flex_attention
 from flash_attn.cute.interface import _flash_attn_fwd
-
-
-@cute.jit
-def score_mod_1(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
-    tmp0 = tSrS_ssa
-    tSrS_ssa = tmp0
-    return tSrS_ssa
-
-
-@cute.jit
-def score_mod_2(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
-    tmp0 = q_idx
-    tmp1 = kv_idx
-    tmp2 = operator.ge(tmp0, tmp1)
-    tmp3 = tSrS_ssa
-    tmp4 = cute.where(tmp2, tmp3, cute.full_like(tmp3, float("-inf")))
-    tSrS_ssa = tmp4
-    return tSrS_ssa
-
-
-@cute.jit
-def score_mod_3(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
-    tmp0 = tSrS_ssa
-    tmp1 = q_idx
-    tmp2 = kv_idx
-    tmp3 = tmp1 - tmp2
-    tmp4 = cute.TensorSSA(mlir_math.absi(tmp3), tmp3.shape, tmp3.dtype)
-    tmp5 = tmp4.to(cutlass.Float32)
-    tmp6 = tmp0 + tmp5
-    tSrS_ssa = tmp6
-    return tSrS_ssa
-
-
-@cute.jit
-def score_mod_4(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
-    tmp0 = tSrS_ssa
-    tmp1 = q_idx
-    tmp2 = kv_idx
-    tmp3 = tmp1 - tmp2
-    tmp4 = cute.TensorSSA(mlir_math.absi(tmp3), tmp3.shape, tmp3.dtype)
-    tmp5 = tmp4 * cute.full_like(tmp4, 2)
-    tmp6 = tmp5.to(cutlass.Float32)
-    tmp7 = tmp0 + tmp6
-    tSrS_ssa = tmp7
-    return tSrS_ssa
-
-
-@cute.jit
-def score_mod_5(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
-    tmp0 = tSrS_ssa
-    tmp1 = tmp0 * cute.full_like(tmp0, 2)
-    tSrS_ssa = tmp1
-    return tSrS_ssa
-
-
-@cute.jit
-def score_mod_6(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
-    tmp0 = tSrS_ssa
-    tmp1 = tmp0.to(cutlass.Float32)
-    tmp2 = h_idx
-    tmp3 = tmp2 + cute.full_like(tmp2, 1)
-    tmp4 = tmp3 * cute.full_like(tmp3, -8)
-    tmp5 = tmp4.to(cutlass.Float32)
-    tmp6 = tmp5 * cute.full_like(tmp5, 0.125)
-    tmp7 = tmp6 * cute.full_like(tmp6, 0.6931471805599453)
-    tmp8 = cute.math.exp2(tmp7 * 1.4426950408889634)
-    tmp9 = q_idx
-    tmp10 = kv_idx
-    tmp11 = tmp9 - tmp10
-    tmp12 = cute.TensorSSA(mlir_math.absi(tmp11), tmp11.shape, tmp11.dtype)
-    tmp13 = tmp12.to(cutlass.Float32)
-    tmp14 = tmp8 * tmp13
-    tmp15 = tmp1 - tmp14
-    tSrS_ssa = tmp15
-    return tSrS_ssa
-
-
-@cute.jit
-def score_mod_7(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
-    tmp0 = q_idx
-    tmp1 = kv_idx
-    tmp2 = tmp0 - tmp1
-    tmp3 = cute.TensorSSA(mlir_math.absi(tmp2), tmp2.shape, tmp2.dtype)
-    tmp4 = operator.le(tmp3, cute.full_like(tmp3, 256))
-    tmp5 = tSrS_ssa
-    tmp6 = cute.where(tmp4, tmp5, cute.full_like(tmp5, float("-inf")))
-    tSrS_ssa = tmp6
-    return tSrS_ssa
-
-
-@cute.jit
-def score_mod_8(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
-    tmp0 = q_idx
-    tmp1 = kv_idx
-    tmp2 = tSrS_ssa
-    tmp3 = cute.where(
-        operator.eq(tmp0 // 64, tmp1 // 64), tmp2, cute.full_like(tmp2, float("-inf"))
-    )
-    tSrS_ssa = tmp3
-    return tSrS_ssa
-
-
-@cute.jit
-def score_mod_9(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
-    tmp0 = q_idx
-    tmp1 = kv_idx
-    tmp2 = tmp0 - tmp1
-    tmp3 = operator.ge(tmp2, cute.full_like(tmp2, 0))
-    tmp4 = tSrS_ssa
-    tmp5 = cute.where(tmp3, tmp4, cute.full_like(tmp4, float("-inf")))
-    tSrS_ssa = tmp5
-    return tSrS_ssa
-
-
-@cute.jit
-def score_mod_10(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
-    batch_bias = aux_tensors[0]
-
-    # Detect dtype from buffer element type
-    dtype = batch_bias.element_type
-
-    b_frag = cute.make_fragment(1, cutlass.Int32)
-    b_frag.store(b_idx)
-    bias_frag = cute.make_fragment(1, dtype)
-    bias_frag[0] = batch_bias[b_frag[0]]
-    bias_val = (bias_frag.load()).to(cutlass.Float32)
-
-    return tSrS_ssa + bias_val
-
-
-@cute.jit
-def score_mod_11(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
-    head_bias = aux_tensors[0]
-    pos_bias = aux_tensors[1]
-
-    # Detect dtype from buffer element type
-    dtype = head_bias.element_type
-
-    h_frag = cute.make_fragment(1, cutlass.Int32)
-    h_frag.store(h_idx)
-    head_val_frag = cute.make_fragment(1, dtype)
-    head_val_frag[0] = head_bias[h_frag[0]]
-    head_val = (head_val_frag.load()).to(cutlass.Float32)
-
-    q_frag = cute.make_fragment(1, cutlass.Int32)
-    q_frag.store(q_idx)
-    pos_val_frag = cute.make_fragment(1, dtype)
-    pos_val_frag[0] = pos_bias[q_frag[0]]
-    pos_val = (pos_val_frag.load()).to(cutlass.Float32)
-
-    return tSrS_ssa + head_val + pos_val
-
-
-# Eager reference functions for comparison
-def identity_eager(score, b, h, q_idx, kv_idx):
-    return score
-
-
-def causal_mask_eager(score, b, h, q_idx, kv_idx):
-    return torch.where(q_idx >= kv_idx, score, float("-inf"))
-
-
-def relative_bias_eager(score, b, h, q_idx, kv_idx):
-    return score + torch.abs(q_idx - kv_idx)
-
-
-def relative_bias_v2_eager(score, b, h, q_idx, kv_idx):
-    return score + 2 * torch.abs(q_idx - kv_idx)
-
-
-def times_two_eager(score, b, h, q_idx, kv_idx):
-    return score * 2
-
-
-def alibi_bias_eager(score, b, h, q_idx, kv_idx):
-    slope = 2 ** (-8 * (h + 1) / 8)
-    return score - slope * torch.abs(q_idx - kv_idx)
-
-
-def sliding_window_eager(score, b, h, q_idx, kv_idx):
-    return torch.where(torch.abs(q_idx - kv_idx) <= 256, score, float("-inf"))
-
-
-def block_diagonal_eager(score, b, h, q_idx, kv_idx):
-    q_block = q_idx // 64
-    kv_block = kv_idx // 64
-    return torch.where(q_block == kv_block, score, float("-inf"))
-
-
-def causal_mask_v2_eager(score, b, h, q_idx, kv_idx):
-    return torch.where(q_idx - kv_idx >= 0, score, float("-inf"))
-
-
-def batch_bias(bias_tensor):
-    """Per-batch bias (tests batch indexing)."""
-
-    def batch_bias_mod(score, b, h, q_idx, kv_idx):
-        return score + bias_tensor[b]
-
-    return batch_bias_mod
-
-
-def dual_buffer_bias(head_bias, pos_scale):
-    """Dual buffer loading (tests loading from 2 separate tensors)."""
-
-    def dual_buffer_mod(score, b, h, q_idx, kv_idx):
-        head_component = head_bias[h]
-        pos_component = pos_scale[q_idx]
-        return score + pos_component + head_component
-
-    return dual_buffer_mod
-
+from score_mod_definitions import (
+    # TensorSSA-based score mods
+    score_mod_identity as score_mod_1,
+    score_mod_causal as score_mod_2,
+    score_mod_rel_bias as score_mod_3,
+    score_mod_rel_bias_x2 as score_mod_4,
+    score_mod_times_two as score_mod_5,
+    score_mod_alibi as score_mod_6,
+    score_mod_sliding_window as score_mod_7,
+    score_mod_block_diagonal as score_mod_8,
+    score_mod_causal_v2 as score_mod_9,
+    score_mod_batch_bias as score_mod_10,
+    score_mod_dual_buffer as score_mod_11,
+    # Eager (torch) reference score mods
+    identity_eager,
+    causal_eager as causal_mask_eager,
+    rel_bias_eager as relative_bias_eager,
+    rel_bias_x2_eager as relative_bias_v2_eager,
+    times_two_eager,
+    alibi_eager as alibi_bias_eager,
+    sliding_window_eager,
+    block_diagonal_eager,
+    causal_v2_eager as causal_mask_v2_eager,
+    batch_bias_factory as batch_bias,
+    dual_buffer_factory as dual_buffer_bias,
+)
 
 # Test pairs: (cute_jit_function, eager_reference_function)
 TEST_PAIRS = [
