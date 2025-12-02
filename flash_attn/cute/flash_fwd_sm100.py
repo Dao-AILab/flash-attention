@@ -1865,6 +1865,7 @@ class FlashAttentionForwardSm100:
         cute.arch.mbarrier_wait(mbar_ptr + self.mbar_S_full_offset + stage, mma_si_consumer_phase)
         tSrS_t2r = cute.make_fragment(thr_tmem_load.partition_D(tScS).shape, self.qk_acc_dtype)
         cute.copy(thr_tmem_load, tStS_t2r, tSrS_t2r)
+        # cute.arch.sync_warp()
         if cutlass.const_expr(self.score_mod is not None):
             self.apply_score_mod(
                 tSrS_t2r,
@@ -1875,9 +1876,9 @@ class FlashAttentionForwardSm100:
                 m_block,
                 n_block,
                 softmax,
+                seqlen,
                 aux_tensors,
                 fastdiv_mods,
-                seqlen=seqlen,
             )
 
         if const_expr(mask_fn is not None):
@@ -2371,7 +2372,7 @@ class FlashAttentionForwardSm100:
                 self.check_hdim_v_oob,
                 self.qhead_per_kvhead,
             )
-        
+
             # load acc O from smem to rmem for wider vectorization
             tOrO = cute.make_fragment_like(tOsO, self.o_dtype)
             cute.autovec_copy(tOsO, tOrO)
@@ -2639,24 +2640,20 @@ class FlashAttentionForwardSm100:
         m_block,
         n_block,
         softmax,
+        seqlen,
         aux_tensors=None,
         fastdiv_mods=(None, None),
-        seqlen=None,
     ):
         """Apply score modification for SM100 (constant q_idx)."""
         # Prepare index tensor with extra partition
         cS = cute.make_identity_tensor((self.m_block_size, self.n_block_size))
-        cS = cute.domain_offset((m_block * self.m_block_size, n_block * self.n_block_size), cS)
+        cS = cute.domain_offset((m_block * self.m_block_size , n_block * self.n_block_size), cS)
         tScS = thr_mma_qk.partition_C(cS)
         tScS_t2r = thr_tmem_load.partition_D(tScS)
-        
+
         # Get the q_idx for this tile
         q_idx_logical = tScS_t2r[0][0]
-        
-        # Get offsets for varlen
-        offset_q = seqlen.offset_q
-        offset_k = seqlen.offset_k
-        
+
         # For Pack-GQA, compute the logical head index and q_idx for this tile
         if cutlass.const_expr(self.pack_gqa):
             # q_idx_logical currently includes the head replication
@@ -2665,7 +2662,7 @@ class FlashAttentionForwardSm100:
             head_offset = q_idx_logical - q_idx_logical_adjusted * self.qhead_per_kvhead
             head_idx = head_idx * self.qhead_per_kvhead + head_offset
             q_idx_logical = q_idx_logical_adjusted
-        
+
         apply_score_mod_inner(
             tSrS_t2r,
             tScS_t2r,
@@ -2677,9 +2674,7 @@ class FlashAttentionForwardSm100:
             self.qk_acc_dtype,
             aux_tensors,
             fastdiv_mods,
+            seqlen,
             constant_q_idx=q_idx_logical,
             qhead_per_kvhead=self.qhead_per_kvhead if cutlass.const_expr(self.pack_gqa) else 1,
-            offset_q=offset_q,
-            offset_k=offset_k,
-            n_block=n_block,
         )
