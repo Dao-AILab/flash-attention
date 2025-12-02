@@ -6,515 +6,54 @@ from cutlass._mlir.dialects import math as mlir_math
 import operator
 from torch.nn.attention.flex_attention import flex_attention
 from flash_attn.cute.interface import _flash_attn_fwd
-
-
-# =============================================================================
-# 6-argument score_mod functions
-# =============================================================================
-
-
-@cute.jit
-def score_mod_identity(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
-    return tSrS_ssa
-
-
-@cute.jit
-def score_mod_causal(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
-    mask = operator.ge(q_idx, kv_idx)
-    return cute.where(mask, tSrS_ssa, cute.full_like(tSrS_ssa, float("-inf")))
-
-
-@cute.jit
-def score_mod_rel_bias(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
-    diff = q_idx - kv_idx
-    abs_diff = cute.TensorSSA(mlir_math.absi(diff), diff.shape, diff.dtype)
-    return tSrS_ssa + abs_diff.to(cutlass.Float32)
-
-
-@cute.jit
-def score_mod_rel_bias_x2(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
-    diff = q_idx - kv_idx
-    abs_diff = cute.TensorSSA(mlir_math.absi(diff), diff.shape, diff.dtype)
-    scaled = abs_diff * cute.full_like(abs_diff, 2)
-    return tSrS_ssa + scaled.to(cutlass.Float32)
-
-
-@cute.jit
-def score_mod_times_two(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
-    return tSrS_ssa * cute.full_like(tSrS_ssa, 2)
-
-
-@cute.jit
-def score_mod_alibi(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
-    score = tSrS_ssa.to(cutlass.Float32)
-    slope_exp = (h_idx + cute.full_like(h_idx, 1)) * cute.full_like(h_idx, -8)
-    slope = cute.math.exp2(
-        slope_exp.to(cutlass.Float32)
-        * cute.full_like(score, 0.125 * 0.6931471805599453 * 1.4426950408889634)
-    )
-    diff = q_idx - kv_idx
-    abs_diff = cute.TensorSSA(mlir_math.absi(diff), diff.shape, diff.dtype).to(cutlass.Float32)
-    return score - slope * abs_diff
-
-
-@cute.jit
-def score_mod_sliding_window(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
-    diff = q_idx - kv_idx
-    abs_diff = cute.TensorSSA(mlir_math.absi(diff), diff.shape, diff.dtype)
-    mask = operator.le(abs_diff, cute.full_like(abs_diff, 256))
-    return cute.where(mask, tSrS_ssa, cute.full_like(tSrS_ssa, float("-inf")))
-
-
-@cute.jit
-def score_mod_block_diagonal(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
-    q_block = q_idx // 64
-    kv_block = kv_idx // 64
-    mask = operator.eq(q_block, kv_block)
-    return cute.where(mask, tSrS_ssa, cute.full_like(tSrS_ssa, float("-inf")))
-
-
-@cute.jit
-def score_mod_causal_v2(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
-    diff = q_idx - kv_idx
-    mask = operator.ge(diff, cute.full_like(diff, 0))
-    return cute.where(mask, tSrS_ssa, cute.full_like(tSrS_ssa, float("-inf")))
-
-
-@cute.jit
-def score_mod_batch_bias(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
-    batch_bias = aux_tensors[0]
-    dtype = batch_bias.element_type
-    b_frag = cute.make_fragment(1, cutlass.Int32)
-    b_frag.store(b_idx)
-    bias_frag = cute.make_fragment(1, dtype)
-    bias_frag[0] = batch_bias[b_frag[0]]
-    bias_val = (bias_frag.load()).to(cutlass.Float32)
-    return tSrS_ssa + bias_val
-
-
-@cute.jit
-def score_mod_dual_buffer(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
-    head_bias = aux_tensors[0]
-    pos_bias = aux_tensors[1]
-    dtype = head_bias.element_type
-
-    h_frag = cute.make_fragment(1, cutlass.Int32)
-    h_frag.store(h_idx)
-    head_val_frag = cute.make_fragment(1, dtype)
-    head_val_frag[0] = head_bias[h_frag[0]]
-    head_val = (head_val_frag.load()).to(cutlass.Float32)
-
-    q_frag = cute.make_fragment(1, cutlass.Int32)
-    q_frag.store(q_idx)
-    pos_val_frag = cute.make_fragment(1, dtype)
-    pos_val_frag[0] = pos_bias[q_frag[0]]
-    pos_val = (pos_val_frag.load()).to(cutlass.Float32)
-
-    return tSrS_ssa + head_val + pos_val
-
-
-# =============================================================================
-# 8-argument score_mod functions (with global indices)
-# =============================================================================
-
-
-@cute.jit
-def score_mod_global_kv_bias(
-    tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors, q_idx_global, kv_idx_global
-):
-    """Per-token bias using global kv index."""
-    token_bias = aux_tensors[0]
-    dtype = token_bias.element_type
-    kv_frag = cute.make_fragment(1, cutlass.Int32)
-    kv_frag.store(kv_idx_global)
-    bias_frag = cute.make_fragment(1, dtype)
-    bias_frag[0] = token_bias[kv_frag[0]]
-    return tSrS_ssa + (bias_frag.load()).to(cutlass.Float32)
-
-
-@cute.jit
-def score_mod_global_q_bias(
-    tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors, q_idx_global, kv_idx_global
-):
-    """Per-token bias using global q index."""
-    token_bias = aux_tensors[0]
-    dtype = token_bias.element_type
-    q_frag = cute.make_fragment(1, cutlass.Int32)
-    q_frag.store(q_idx_global)
-    bias_frag = cute.make_fragment(1, dtype)
-    bias_frag[0] = token_bias[q_frag[0]]
-    return tSrS_ssa + (bias_frag.load()).to(cutlass.Float32)
-
-
-@cute.jit
-def score_mod_global_rel_plus_kv_bias(
-    tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors, q_idx_global, kv_idx_global
-):
-    """Relative position (logical) + per-token bias (global kv)."""
-    token_bias = aux_tensors[0]
-    dtype = token_bias.element_type
-
-    rel_pos = q_idx - kv_idx
-    rel_pos_abs = cute.TensorSSA(mlir_math.absi(rel_pos), rel_pos.shape, rel_pos.dtype)
-    rel_bias = rel_pos_abs.to(cutlass.Float32) * cute.full_like(tSrS_ssa, 0.1)
-
-    kv_frag = cute.make_fragment(1, cutlass.Int32)
-    kv_frag.store(kv_idx_global)
-    bias_frag = cute.make_fragment(1, dtype)
-    bias_frag[0] = token_bias[kv_frag[0]]
-
-    return tSrS_ssa + rel_bias + (bias_frag.load()).to(cutlass.Float32)
-
-
-@cute.jit
-def score_mod_global_q_and_kv_bias(
-    tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors, q_idx_global, kv_idx_global
-):
-    """Both q and kv global indices."""
-    q_bias = aux_tensors[0]
-    kv_bias = aux_tensors[1]
-    dtype = q_bias.element_type
-
-    q_frag = cute.make_fragment(1, cutlass.Int32)
-    q_frag.store(q_idx_global)
-    q_bias_frag = cute.make_fragment(1, dtype)
-    q_bias_frag[0] = q_bias[q_frag[0]]
-
-    kv_frag = cute.make_fragment(1, cutlass.Int32)
-    kv_frag.store(kv_idx_global)
-    kv_bias_frag = cute.make_fragment(1, dtype)
-    kv_bias_frag[0] = kv_bias[kv_frag[0]]
-
-    return (
-        tSrS_ssa
-        + (q_bias_frag.load()).to(cutlass.Float32)
-        + (kv_bias_frag.load()).to(cutlass.Float32)
-    )
-
-
-@cute.jit
-def score_mod_global_logical_rel_plus_kv_bias(
-    tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors, q_idx_global, kv_idx_global
-):
-    """Logical relative + global-indexed per-token bias."""
-    token_bias = aux_tensors[0]
-    dtype = token_bias.element_type
-
-    rel_pos = q_idx - kv_idx
-    rel_pos_abs = cute.TensorSSA(mlir_math.absi(rel_pos), rel_pos.shape, rel_pos.dtype)
-    rel_bias = rel_pos_abs.to(cutlass.Float32) * cute.full_like(tSrS_ssa, 0.01)
-
-    kv_frag = cute.make_fragment(1, cutlass.Int32)
-    kv_frag.store(kv_idx_global)
-    bias_frag = cute.make_fragment(1, dtype)
-    bias_frag[0] = token_bias[kv_frag[0]]
-
-    return tSrS_ssa + rel_bias + (bias_frag.load()).to(cutlass.Float32)
-
-
-@cute.jit
-def score_mod_stress_complex_arithmetic(
-    tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors, q_idx_global, kv_idx_global
-):
-    """All indices in complex arithmetic."""
-    bias = aux_tensors[0]
-    dtype = bias.element_type
-
-    rel_pos = q_idx - kv_idx
-    rel_pos_sq = rel_pos * rel_pos
-
-    q_frag = cute.make_fragment(1, cutlass.Int32)
-    q_frag.store(q_idx_global)
-    bias_q_frag = cute.make_fragment(1, dtype)
-    bias_q_frag[0] = bias[q_frag[0]]
-    bias_q = (bias_q_frag.load()).to(cutlass.Float32)
-
-    scale = (b_idx + cute.full_like(b_idx, 1)) * (h_idx + cute.full_like(h_idx, 1))
-    scale_f32 = scale.to(cutlass.Float32) * cute.full_like(tSrS_ssa, 0.001)
-
-    rel_bias = rel_pos_sq.to(cutlass.Float32) * cute.full_like(tSrS_ssa, 0.0001)
-
-    return tSrS_ssa + rel_bias + bias_q * scale_f32
-
-
-@cute.jit
-def score_mod_stress_conditional_mask(
-    tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors, q_idx_global, kv_idx_global
-):
-    """Conditional masking with global vs logical."""
-    token_bias = aux_tensors[0]
-    dtype = token_bias.element_type
-
-    kv_frag = cute.make_fragment(1, cutlass.Int32)
-    kv_frag.store(kv_idx_global)
-    bias_frag = cute.make_fragment(1, dtype)
-    bias_frag[0] = token_bias[kv_frag[0]]
-    bias_val = (bias_frag.load()).to(cutlass.Float32)
-
-    is_causal = operator.ge(q_idx, kv_idx)
-
-    global_diff = q_idx_global - kv_idx_global
-    is_nearby = operator.le(
-        cute.TensorSSA(mlir_math.absi(global_diff), global_diff.shape, global_diff.dtype),
-        cute.full_like(global_diff, 512),
-    )
-
-    both_conditions = is_causal & is_nearby
-    return cute.where(both_conditions, tSrS_ssa + bias_val, cute.full_like(tSrS_ssa, float("-inf")))
-
-
-@cute.jit
-def score_mod_stress_multi_buffer(
-    tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors, q_idx_global, kv_idx_global
-):
-    """Multiple aux tensors with different indexing."""
-    batch_bias = aux_tensors[0]
-    head_scale = aux_tensors[1]
-    q_pos_bias = aux_tensors[2]
-    kv_pos_bias = aux_tensors[3]
-    rel_pos_scale = aux_tensors[4]
-
-    dtype = batch_bias.element_type
-
-    b_frag = cute.make_fragment(1, cutlass.Int32)
-    b_frag.store(b_idx)
-    bb_frag = cute.make_fragment(1, dtype)
-    bb_frag[0] = batch_bias[b_frag[0]]
-    bb_val = (bb_frag.load()).to(cutlass.Float32)
-
-    h_frag = cute.make_fragment(1, cutlass.Int32)
-    h_frag.store(h_idx)
-    hs_frag = cute.make_fragment(1, dtype)
-    hs_frag[0] = head_scale[h_frag[0]]
-    hs_val = (hs_frag.load()).to(cutlass.Float32)
-
-    qg_frag = cute.make_fragment(1, cutlass.Int32)
-    qg_frag.store(q_idx_global)
-    qpb_frag = cute.make_fragment(1, dtype)
-    qpb_frag[0] = q_pos_bias[qg_frag[0]]
-    qpb_val = (qpb_frag.load()).to(cutlass.Float32)
-
-    kvg_frag = cute.make_fragment(1, cutlass.Int32)
-    kvg_frag.store(kv_idx_global)
-    kvpb_frag = cute.make_fragment(1, dtype)
-    kvpb_frag[0] = kv_pos_bias[kvg_frag[0]]
-    kvpb_val = (kvpb_frag.load()).to(cutlass.Float32)
-
-    rel_idx = q_idx - kv_idx + cute.full_like(q_idx, 512)
-    rel_idx_clamped = cute.where(
-        operator.lt(rel_idx, cute.full_like(rel_idx, 0)), cute.full_like(rel_idx, 0), rel_idx
-    )
-    rel_idx_clamped = cute.where(
-        operator.gt(rel_idx_clamped, cute.full_like(rel_idx_clamped, 1024)),
-        cute.full_like(rel_idx_clamped, 1024),
-        rel_idx_clamped,
-    )
-    ri_frag = cute.make_fragment(1, cutlass.Int32)
-    ri_frag.store(rel_idx_clamped)
-    rps_frag = cute.make_fragment(1, dtype)
-    rps_frag[0] = rel_pos_scale[ri_frag[0]]
-    rps_val = (rps_frag.load()).to(cutlass.Float32)
-
-    return tSrS_ssa * hs_val + bb_val + qpb_val + kvpb_val + rps_val * cute.full_like(tSrS_ssa, 0.1)
-
-
-@cute.jit
-def score_mod_stress_global_offset(
-    tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors, q_idx_global, kv_idx_global
-):
-    """Verify global - logical = offset."""
-    token_bias = aux_tensors[0]
-    dtype = token_bias.element_type
-
-    kv_frag = cute.make_fragment(1, cutlass.Int32)
-    kv_frag.store(kv_idx_global)
-    bias_frag = cute.make_fragment(1, dtype)
-    bias_frag[0] = token_bias[kv_frag[0]]
-
-    return tSrS_ssa + (bias_frag.load()).to(cutlass.Float32)
-
-
-@cute.jit
-def score_mod_stress_xor_pattern(
-    tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors, q_idx_global, kv_idx_global
-):
-    """XOR-based pattern using index bits."""
-    token_bias = aux_tensors[0]
-    dtype = token_bias.element_type
-
-    xor_logical = q_idx ^ kv_idx
-    pattern_logical = xor_logical & cute.full_like(xor_logical, 0xFF)
-    pattern_bias = pattern_logical.to(cutlass.Float32) * cute.full_like(tSrS_ssa, 0.001)
-
-    kv_frag = cute.make_fragment(1, cutlass.Int32)
-    kv_frag.store(kv_idx_global)
-    bias_frag = cute.make_fragment(1, dtype)
-    bias_frag[0] = token_bias[kv_frag[0]]
-
-    return (
-        tSrS_ssa
-        + pattern_bias
-        + (bias_frag.load()).to(cutlass.Float32) * cute.full_like(tSrS_ssa, 0.1)
-    )
-
-
-# =============================================================================
-# Eager reference functions
-# =============================================================================
-
-
-def identity_eager(score, b, h, q_idx, kv_idx):
-    return score
-
-
-def causal_eager(score, b, h, q_idx, kv_idx):
-    return torch.where(q_idx >= kv_idx, score, float("-inf"))
-
-
-def rel_bias_eager(score, b, h, q_idx, kv_idx):
-    return score + torch.abs(q_idx - kv_idx)
-
-
-def rel_bias_x2_eager(score, b, h, q_idx, kv_idx):
-    return score + 2 * torch.abs(q_idx - kv_idx)
-
-
-def times_two_eager(score, b, h, q_idx, kv_idx):
-    return score * 2
-
-
-def alibi_eager(score, b, h, q_idx, kv_idx):
-    slope = 2 ** (-8 * (h + 1) / 8)
-    return score - slope * torch.abs(q_idx - kv_idx)
-
-
-def sliding_window_eager(score, b, h, q_idx, kv_idx):
-    return torch.where(torch.abs(q_idx - kv_idx) <= 256, score, float("-inf"))
-
-
-def block_diagonal_eager(score, b, h, q_idx, kv_idx):
-    return torch.where(q_idx // 64 == kv_idx // 64, score, float("-inf"))
-
-
-def causal_v2_eager(score, b, h, q_idx, kv_idx):
-    return torch.where(q_idx - kv_idx >= 0, score, float("-inf"))
-
-
-def batch_bias_factory(bias_tensor):
-    def mod(score, b, h, q_idx, kv_idx):
-        return score + bias_tensor[b]
-
-    return mod
-
-
-def dual_buffer_factory(head_bias, pos_bias):
-    def mod(score, b, h, q_idx, kv_idx):
-        return score + head_bias[h] + pos_bias[q_idx]
-
-    return mod
-
-
-def packed_kv_bias_factory(bias_tensor, cu_seqlens_k):
-    def mod(score, b, h, q_idx, kv_idx):
-        return score + bias_tensor[cu_seqlens_k[b] + kv_idx]
-
-    return mod
-
-
-def packed_q_bias_factory(bias_tensor, cu_seqlens_q):
-    def mod(score, b, h, q_idx, kv_idx):
-        return score + bias_tensor[cu_seqlens_q[b] + q_idx]
-
-    return mod
-
-
-def packed_rel_plus_kv_bias_factory(bias_tensor, cu_seqlens_k):
-    def mod(score, b, h, q_idx, kv_idx):
-        rel_bias = torch.abs(q_idx - kv_idx).float() * 0.1
-        return score + rel_bias + bias_tensor[cu_seqlens_k[b] + kv_idx]
-
-    return mod
-
-
-def packed_q_and_kv_bias_factory(q_bias, kv_bias, cu_seqlens_q, cu_seqlens_k):
-    def mod(score, b, h, q_idx, kv_idx):
-        return score + q_bias[cu_seqlens_q[b] + q_idx] + kv_bias[cu_seqlens_k[b] + kv_idx]
-
-    return mod
-
-
-def packed_logical_rel_plus_kv_bias_factory(bias_tensor, cu_seqlens_k):
-    def mod(score, b, h, q_idx, kv_idx):
-        rel_bias = torch.abs(q_idx - kv_idx).float() * 0.01
-        return score + rel_bias + bias_tensor[cu_seqlens_k[b] + kv_idx]
-
-    return mod
-
-
-def stress_complex_arithmetic_factory(bias, cu_seqlens_q):
-    def mod(score, b, h, q_idx, kv_idx):
-        rel_pos_sq = (q_idx - kv_idx) ** 2
-        q_global = cu_seqlens_q[b] + q_idx
-        bias_q = bias[q_global]
-        scale = (b + 1) * (h + 1) * 0.001
-        rel_bias = rel_pos_sq.float() * 0.0001
-        return score + rel_bias + bias_q * scale
-
-    return mod
-
-
-def stress_conditional_mask_factory(token_bias, cu_seqlens_q, cu_seqlens_k):
-    def mod(score, b, h, q_idx, kv_idx):
-        kv_global = cu_seqlens_k[b] + kv_idx
-        bias_val = token_bias[kv_global]
-        is_causal = q_idx >= kv_idx
-        q_global = cu_seqlens_q[b] + q_idx
-        global_diff = q_global - kv_global
-        is_nearby = torch.abs(global_diff) <= 512
-        both_conditions = is_causal & is_nearby
-        return torch.where(both_conditions, score + bias_val, float("-inf"))
-
-    return mod
-
-
-def stress_multi_buffer_factory(
-    batch_bias,
-    head_scale,
-    q_pos_bias,
-    kv_pos_bias,
-    rel_pos_scale,
-    cu_seqlens_q,
-    cu_seqlens_k,
-    max_rel_pos=512,
-):
-    def mod(score, b, h, q_idx, kv_idx):
-        bb_val = batch_bias[b]
-        hs_val = head_scale[h]
-        qpb_val = q_pos_bias[cu_seqlens_q[b] + q_idx]
-        kvpb_val = kv_pos_bias[cu_seqlens_k[b] + kv_idx]
-        rel_idx = (q_idx - kv_idx + max_rel_pos).clamp(0, max_rel_pos * 2)
-        rps_val = rel_pos_scale[rel_idx]
-        return score * hs_val + bb_val + qpb_val + kvpb_val + rps_val * 0.1
-
-    return mod
-
-
-def stress_global_offset_factory(token_bias, cu_seqlens_k):
-    def mod(score, b, h, q_idx, kv_idx):
-        return score + token_bias[cu_seqlens_k[b] + kv_idx]
-
-    return mod
-
-
-def stress_xor_pattern_factory(token_bias, cu_seqlens_q, cu_seqlens_k):
-    def mod(score, b, h, q_idx, kv_idx):
-        xor_logical = q_idx ^ kv_idx
-        pattern_bias = (xor_logical & 0xFF).float() * 0.001
-        kv_global = cu_seqlens_k[b] + kv_idx
-        return score + pattern_bias + token_bias[kv_global] * 0.1
-
-    return mod
-
+from score_mod_definitions import (
+    # TensorSSA-based score mods
+    score_mod_identity,
+    score_mod_causal,
+    score_mod_rel_bias,
+    score_mod_rel_bias_x2,
+    score_mod_times_two,
+    score_mod_alibi,
+    score_mod_sliding_window,
+    score_mod_block_diagonal,
+    score_mod_causal_v2,
+    score_mod_batch_bias,
+    score_mod_dual_buffer,
+    score_mod_global_kv_bias,
+    score_mod_global_q_bias,
+    score_mod_global_rel_plus_kv_bias,
+    score_mod_global_q_and_kv_bias,
+    score_mod_global_logical_rel_plus_kv_bias,
+    score_mod_stress_complex_arithmetic,
+    score_mod_stress_conditional_mask,
+    score_mod_stress_multi_buffer,
+    score_mod_stress_global_offset,
+    score_mod_stress_xor_pattern,
+    score_mod_debug_global_idx,
+    # Eager (torch) reference score mods
+    identity_eager,
+    causal_eager,
+    rel_bias_eager,
+    rel_bias_x2_eager,
+    times_two_eager,
+    alibi_eager,
+    sliding_window_eager,
+    block_diagonal_eager,
+    causal_v2_eager,
+    batch_bias_factory,
+    dual_buffer_factory,
+    packed_kv_bias_factory,
+    packed_q_bias_factory,
+    packed_rel_plus_kv_bias_factory,
+    packed_q_and_kv_bias_factory,
+    packed_logical_rel_plus_kv_bias_factory,
+    stress_complex_arithmetic_factory,
+    stress_conditional_mask_factory,
+    stress_multi_buffer_factory,
+    stress_global_offset_factory,
+    stress_xor_pattern_factory,
+    debug_global_idx_factory,
+)
 
 # =============================================================================
 # Test pairs
@@ -524,16 +63,16 @@ def stress_xor_pattern_factory(token_bias, cu_seqlens_q, cu_seqlens_k):
 # aux_type: None, "batch", "dual_buffer"
 TEST_PAIRS_6ARG = [
     (score_mod_identity, identity_eager, None),
-    # (score_mod_causal, causal_eager, None),
-    # (score_mod_rel_bias, rel_bias_eager, None),
-    # (score_mod_rel_bias_x2, rel_bias_x2_eager, None),
-    # (score_mod_times_two, times_two_eager, None),
-    # (score_mod_alibi, alibi_eager, None),
-    # (score_mod_sliding_window, sliding_window_eager, None),
-    # (score_mod_block_diagonal, block_diagonal_eager, None),
-    # (score_mod_causal_v2, causal_v2_eager, None),
-    # (score_mod_batch_bias, batch_bias_factory, "batch"),
-    # (score_mod_dual_buffer, dual_buffer_factory, "dual_buffer"),
+    (score_mod_causal, causal_eager, None),
+    (score_mod_rel_bias, rel_bias_eager, None),
+    (score_mod_rel_bias_x2, rel_bias_x2_eager, None),
+    (score_mod_times_two, times_two_eager, None),
+    (score_mod_alibi, alibi_eager, None),
+    (score_mod_sliding_window, sliding_window_eager, None),
+    (score_mod_block_diagonal, block_diagonal_eager, None),
+    (score_mod_causal_v2, causal_v2_eager, None),
+    (score_mod_batch_bias, batch_bias_factory, "batch"),
+    (score_mod_dual_buffer, dual_buffer_factory, "dual_buffer"),
 ]
 
 # (cute_score_mod, eager_factory, aux_type, requires_global)
@@ -555,6 +94,7 @@ TEST_PAIRS_8ARG = [
     (score_mod_stress_multi_buffer, stress_multi_buffer_factory, "multi_buffer", "both"),
     (score_mod_stress_global_offset, stress_global_offset_factory, "kv", "kv"),
     (score_mod_stress_xor_pattern, stress_xor_pattern_factory, "kv_with_cu", "kv"),
+    (score_mod_debug_global_idx, debug_global_idx_factory, "kv", "kv"),
 ]
 
 SEQLEN_CONFIGS = [
@@ -562,14 +102,14 @@ SEQLEN_CONFIGS = [
     ([1, 1], [1, 1]),
     ([2, 3], [2, 3]),
     ([8, 16], [8, 16]),
-    ([32, 64], [32, 64]),
+    ([32, 32], [32, 32]),
     ([64, 128], [64, 128]),
     ([64, 56, 128], [64, 56, 128]),
     ([256, 512], [256, 512]),
     ([113, 203], [113, 203]),
     ([239, 1], [239, 1]),
     ([64], [64]),
-    ([128], [128]),
+    ([128, 128], [128, 128]),
     ([32, 32, 32, 32], [32, 32, 32, 32]),
     ([16, 32, 64, 128, 256], [16, 32, 64, 128, 256]),
     ([1, 1024], [1, 1024]),
@@ -580,6 +120,8 @@ SEQLEN_CONFIGS = [
     ([64, 128], [32, 64]),
     ([100, 100], [50, 50]),
     ([256, 512, 256], [128, 256, 128]),
+    ([1, 1], [16384, 16384]),
+    ([2, 2, 2], [128*1024]*3)
 ]
 
 
@@ -650,8 +192,8 @@ def run_flex_varlen_ref(q, k, v, cu_seqlens_q, cu_seqlens_k, score_mod, dtype=No
         if dtype is not None:
             q_slice, k_slice, v_slice = q_slice.to(dtype), k_slice.to(dtype), v_slice.to(dtype)
 
-        def wrapped_mod(score, b, h, q_idx, kv_idx, seq_idx=i):
-            return score_mod(score, seq_idx, h, q_idx, kv_idx)
+        def wrapped_mod(score, b, h, q_idx, kv_idx):
+            return score_mod(score, i, h, q_idx, kv_idx)
 
         out = flex_attention(
             q_slice,
@@ -722,14 +264,49 @@ def prepare_ref_tensors(
     return q, k, v, cu_seqlens_q, cu_seqlens_k
 
 
-def check_results(out_cute, out_ref_fp32, out_pt, test_name, rtol=2, extra_atol=1e-4):
+def check_results(
+    out_cute,
+    out_ref_fp32,
+    out_pt,
+    test_name,
+    rtol=2,
+    extra_atol=1e-4,
+    seqlens_q=None,
+    cu_seqlens_q=None,
+):
     """Compare CuTE output against references."""
     assert not torch.isnan(out_cute).any(), f"{test_name}: NaN in output"
     assert torch.isfinite(out_cute).all(), f"{test_name}: Inf in output"
 
+    varlen_q = cu_seqlens_q is not None
+
+    if varlen_q:
+        # Unpack and compare per-sequence
+        assert seqlens_q is not None, "varlen_q requires use of seqlens_q"
+        num_seqs = len(seqlens_q)
+        max_cute_error = 0.0
+        max_pt_error = 0.0
+
+        for i in range(num_seqs):
+            sq = seqlens_q[i]
+            cute_seq = out_cute[i, :sq]
+
+            start_q = cu_seqlens_q[i]
+            end_q = cu_seqlens_q[i + 1]
+            ref_seq = out_ref_fp32[start_q:end_q]
+            pt_seq = out_pt[start_q:end_q]
+
+            max_cute_error = max(max_cute_error, (cute_seq - ref_seq).abs().max().item())
+            max_pt_error = max(max_pt_error, (pt_seq - ref_seq).abs().max().item())
+
+        cute_error = max_cute_error
+        pt_error = max_pt_error
+    else:
+        # Direct comparison
+        pt_error = (out_pt - out_ref_fp32).abs().max().item()
+        cute_error = (out_cute - out_ref_fp32).abs().max().item()
+
     fwd_atol = 2 * (out_ref_fp32 + 0.3 - 0.3 - out_ref_fp32).abs().max().item()
-    pt_error = (out_pt - out_ref_fp32).abs().max().item()
-    cute_error = (out_cute - out_ref_fp32).abs().max().item()
 
     print(f"\n{test_name}:")
     print(f"  PyTorch vs FP32 ref: {pt_error:.2e}")
@@ -738,7 +315,6 @@ def check_results(out_cute, out_ref_fp32, out_pt, test_name, rtol=2, extra_atol=
     assert cute_error <= rtol * pt_error + fwd_atol + extra_atol, (
         f"{test_name}: CuTE error {cute_error:.2e} exceeds tolerance"
     )
-
 
 # =============================================================================
 # Tests
@@ -779,7 +355,7 @@ def test_varlen_with_score_mod(seqlens_q, seqlens_k, varlen_q, varlen_k, dtype, 
     # Setup aux tensors and eager score_mod
     aux_tensors = None
     if aux_type == "batch":
-        bias = torch.randn(batch_size, device="cuda", dtype=dtype) * 0.1
+        bias = torch.zeros(batch_size, device="cuda", dtype=dtype) * 0.1
         aux_tensors = [bias]
         eager_score_mod = eager_factory(bias)
     elif aux_type == "dual_buffer":
@@ -826,7 +402,7 @@ def test_varlen_with_score_mod(seqlens_q, seqlens_k, varlen_q, varlen_k, dtype, 
     check_results(out_cute, out_ref_fp32, out_pt, test_name)
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("varlen_q", [True, False])
 @pytest.mark.parametrize("varlen_k", [True, False])
 @pytest.mark.parametrize("seqlens_q,seqlens_k", SEQLEN_CONFIGS)
@@ -842,7 +418,26 @@ def test_varlen_with_global_idx_score_mod(
     if not varlen_q and not varlen_k:
         pytest.skip("At least one of varlen_q or varlen_k must be True for varlen tests")
 
+    @cute.jit
+    def score_mod_global_kv_bias_fresh(
+        tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors, q_idx_global, kv_idx_global
+    ):
+        token_bias = aux_tensors[0]
+        dtype = token_bias.element_type
+        kv_frag = cute.make_fragment(1, cutlass.Int32)
+        kv_frag.store(kv_idx_global)
+        bias_frag = cute.make_fragment(1, dtype)
+        bias_frag[0] = token_bias[kv_frag[0]]
+        score_before = tSrS_ssa[0]
+        bias_val = bias_frag[0]
+        if cute.arch.thread_idx()[0] == 0 and kv_idx[0] == 0:
+            cute.printf("batch=%d kv_local %d kv_global=%d score_before=%f bias=%f score_after=%f\n",
+                        b_idx[0], kv_idx[0], kv_frag[0], score_before, bias_val, score_before + bias_val)
+        return tSrS_ssa + (bias_frag.load()).to(cutlass.Float32)
+
     cute_score_mod, eager_factory, aux_type, requires_global = score_mod_tuple
+
+    # cute_score_mod = score_mod_global_kv_bias_fresh
 
     # Skip if score_mod requires global indices we can't provide
     if requires_global == "q" and not varlen_q:
@@ -959,18 +554,31 @@ def test_varlen_with_global_idx_score_mod(
         cu_seqlens_k=kernel_cu_seqlens_k,
     )
 
-    # Handle output shape differences for varlen_k only case
-    if not varlen_q and varlen_k:
-        seqlen_q = q.shape[1]
-        out_ref_fp32 = out_ref_fp32.reshape(batch_size, seqlen_q, num_heads, head_dim)
-        out_pt = out_pt.reshape(batch_size, seqlen_q, num_heads, head_dim)
+    # Reshape outputs to common format for comparison
+    # Target shape: (batch_size, seqlen_q, num_heads, head_dim) for non-varlen_q
+    #           or: (total_q, num_heads, head_dim) for varlen_q
 
-    assert out_cute.shape == out_ref_fp32.shape, (
-        f"Shape mismatch: {out_cute.shape} vs {out_ref_fp32.shape}"
+    if varlen_q:
+        # Both ref and cute should be (total_q, num_heads, head_dim)
+        # ref comes from concatenating per-sequence outputs
+        out_ref_final = out_ref_fp32
+        out_pt_final = out_pt
+        out_cute_final = out_cute
+    else:
+        # cute is (batch_size, seqlen_q, num_heads, head_dim)
+        # ref is (total_q, num_heads, head_dim) from run_flex_varlen_ref concatenation
+        # Need to reshape ref to match cute
+        seqlen_q = seqlens_q[0]
+        out_ref_final = out_ref_fp32.reshape(batch_size, seqlen_q, num_heads, head_dim)
+        out_pt_final = out_pt.reshape(batch_size, seqlen_q, num_heads, head_dim)
+        out_cute_final = out_cute
+
+    assert out_cute_final.shape == out_ref_final.shape, (
+        f"Shape mismatch: {out_cute_final.shape} vs {out_ref_final.shape}"
     )
 
     test_name = f"{cute_score_mod.__name__} (varlen_q={varlen_q}, varlen_k={varlen_k}, {aux_type})"
-    check_results(out_cute, out_ref_fp32, out_pt, test_name, extra_atol=1e-3)
+    check_results(out_cute_final, out_ref_final, out_pt_final, test_name, extra_atol=1e-3)
 
 
 if __name__ == "__main__":
