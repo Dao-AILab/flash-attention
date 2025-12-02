@@ -320,11 +320,11 @@ class FlashAttentionBackwardSm100:
         )
         self.sdKV_epi_tile = (
             self.tile_n,
-            128 // (self.dk_dtype.width // 8),  # 64 or 32
+            min(128 // (self.dk_dtype.width // 8), self.tile_hdim // 2),  # 64 or 32
         )  # subtiles mma_tiler_dsq[:2] = mma_tiler_pdo[:2]
-        self.num_epi_stages = (self.tile_hdim // 2) // self.sdKV_epi_tile[1]
+        # headdim_64 gets 1 stage
+        self.num_epi_stages = max(1, (self.tile_hdim // 2) // self.sdKV_epi_tile[1])
         self.sdKV_flat_epi_tile = self.tile_n * (self.tile_hdim // 2) // self.num_epi_stages
-
         # TODO: dK and dV could have different shapes
         if const_expr(self.qhead_per_kvhead == 1):
             self.sdKV_layout = sm100_utils_basic.make_smem_layout_epi(
@@ -402,7 +402,7 @@ class FlashAttentionBackwardSm100:
         else:
             layout_dKV_transpose = LSE_dPsum_dQaccum_transpose
         mdK, mdV = [utils.select(t, mode=layout_dKV_transpose) for t in (mdK, mdV)]
-        dO_transpose = [1, 0, 2, 3]  # (s, h, n, b) --> (h, s, n, h)
+        dO_transpose = [1, 0, 2, 3]  # (s, h, n, b) --> (h, s, n, b)
         mdO = utils.select(mdO, mode=dO_transpose)
 
         semaphore_transpose = [2, 3, 1, 0]  # (b, n, block, stage) -> (block, stage, n, b)
@@ -524,15 +524,15 @@ class FlashAttentionBackwardSm100:
             self.cluster_layout_vmnk.shape,
         )
         dO_tma_op = sm100_utils_basic.cluster_shape_to_tma_atom_B(
-            self.cluster_shape_mnk, self.tiled_mma_dP.thr_id
+            self.cluster_shape_mnk, self.tiled_mma_dV.thr_id
         )
         tma_atom_dO, tma_tensor_dO = cute.nvgpu.make_tiled_tma_atom_B(
             # tma_load_op if const_expr(self.cluster_shape_mnk[0] == 1) else tma_load_op_multicast,
             dO_tma_op,
             mdO,
             cute.select(self.sdO_layout, mode=[0, 1, 2]),
-            self.mma_tiler_vdo,
-            self.tiled_mma_dP,
+            self.mma_tiler_pdo,
+            self.tiled_mma_dV,
             self.cluster_layout_vmnk.shape,
         )
 
@@ -580,6 +580,22 @@ class FlashAttentionBackwardSm100:
         grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
         # cute.printf("grid_dim = {}", grid_dim)
 
+        # Compute allocation sizes for shared buffers that are reused
+        # sQ is reused for sdK, sdO is reused for sdV
+        sQ_alloc_bytes = max(
+            cute.size_in_bytes(self.q_dtype, self.sQ_layout),
+            cute.size_in_bytes(self.dk_dtype, self.sdKV_layout),
+        )
+        sdO_alloc_bytes = max(
+            cute.size_in_bytes(self.dv_dtype, self.sdKV_layout),
+            cute.size_in_bytes(self.do_dtype, self.sdO_layout),
+        )
+        # Sanity check that layouts fit in allocation
+        sdV_bytes = cute.size_in_bytes(self.dv_dtype, self.sdKV_layout)
+        sdK_bytes = cute.size_in_bytes(self.dk_dtype, self.sdKV_layout)
+        assert sdV_bytes <= sdO_alloc_bytes, "sdV doesn't fit in sdO storage allocation"
+        assert sdK_bytes <= sQ_alloc_bytes, "sdK doesn't fit in sQ storage allocation"
+
         @cute.struct
         class SharedStorage:
             Q_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.Q_stage]
@@ -601,8 +617,10 @@ class FlashAttentionBackwardSm100:
             tmem_dealloc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 1]
 
             # Smem tensors
+
+            # sQ is reused for sdK which in the non-MHA case needs float32
             sQ: cute.struct.Align[
-                cute.struct.MemRange[self.q_dtype, cute.cosize(self.sQ_layout)],
+                cute.struct.MemRange[cute.Uint8, sQ_alloc_bytes],
                 self.buffer_align_bytes,
             ]
             sK: cute.struct.Align[
@@ -613,8 +631,9 @@ class FlashAttentionBackwardSm100:
                 cute.struct.MemRange[self.v_dtype, cute.cosize(self.sV_layout)],
                 self.buffer_align_bytes,
             ]
+            # sdO is reused for sdV which in the non-MHA case needs float32
             sdO: cute.struct.Align[
-                cute.struct.MemRange[self.do_dtype, cute.cosize(self.sdO_layout)],
+                cute.struct.MemRange[cute.Uint8, sdO_alloc_bytes],
                 self.buffer_align_bytes,
             ]
             sdS: cute.struct.Align[
@@ -879,15 +898,21 @@ class FlashAttentionBackwardSm100:
             init_wait=True,
         )
 
-        sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner)
-        sQt = cute.make_tensor(cute.recast_ptr(sQ.iterator, sQt_layout.inner), sQt_layout.outer)
+        sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner, dtype=self.q_dtype)
+        sQt = cute.make_tensor(
+            cute.recast_ptr(sQ.iterator, sQt_layout.inner, dtype=self.q_dtype), sQt_layout.outer
+        )
         sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
         sKt = cute.make_tensor(cute.recast_ptr(sK.iterator, sKt_layout.inner), sKt_layout.outer)
         sV = storage.sV.get_tensor(sV_layout.outer, swizzle=sV_layout.inner)
         sdSt = storage.sdS.get_tensor(sdSt_layout.outer, swizzle=sdSt_layout.inner)
         sdS = cute.make_tensor(cute.recast_ptr(sdSt.iterator, sdS_layout.inner), sdS_layout.outer)
-        sdO = storage.sdO.get_tensor(sdO_layout.outer, swizzle=sdO_layout.inner)
-        sdOt = cute.make_tensor(cute.recast_ptr(sdO.iterator, sdOt_layout.inner), sdOt_layout.outer)
+        sdO = storage.sdO.get_tensor(
+            sdO_layout.outer, swizzle=sdO_layout.inner, dtype=self.do_dtype
+        )
+        sdOt = cute.make_tensor(
+            cute.recast_ptr(sdO.iterator, sdOt_layout.inner, dtype=self.do_dtype), sdOt_layout.outer
+        )
         sLSE = storage.sLSE.get_tensor(sLSE_layout)
         sdPsum = storage.sdPsum.get_tensor(sdPsum_layout)
         if const_expr(self.qhead_per_kvhead == 1):
@@ -900,12 +925,10 @@ class FlashAttentionBackwardSm100:
         else:
             sdV = storage.sdO.get_tensor(sdKV_layout, dtype=self.dv_dtype)
             sdK = storage.sQ.get_tensor(sdKV_layout, dtype=self.dk_dtype)
-        assert cute.size_in_bytes(self.do_dtype, sdO_layout) >= cute.size_in_bytes(
-            self.dv_dtype, sdKV_layout
-        ), "Not enough space for sdV"
-        assert cute.size_in_bytes(self.q_dtype, sQ_layout) >= cute.size_in_bytes(
-            self.dk_dtype, sdKV_layout
-        ), "Not enough space for sdK"
+
+        # Buffer sizing is guaranteed by max(...) in SharedStorage declarations
+        # for both sQ (reused as sdK) and sdO (reused as sdV)
+
         sdQaccum = storage.sdQaccum.get_tensor(sdQaccum_layout)
 
         # TMEM
@@ -993,6 +1016,7 @@ class FlashAttentionBackwardSm100:
             self.load(
                 thr_mma_S,
                 thr_mma_dP,
+                thr_mma_dV,
                 mQ,
                 mK,
                 mV,
@@ -1138,6 +1162,7 @@ class FlashAttentionBackwardSm100:
         self,
         thr_mma_S: cute.core.ThrMma,
         thr_mma_dP: cute.core.ThrMma,
+        thr_mma_dV: cute.core.ThrMma,
         mQ: cute.Tensor,
         mK: cute.Tensor,
         mV: cute.Tensor,
@@ -1206,7 +1231,7 @@ class FlashAttentionBackwardSm100:
             gLSE = cute.local_tile(mLSE_cur, (self.tile_n,), (None,))
             gdPsum = cute.local_tile(mPsum_cur, (self.tile_n,), (None,))
             gdO = cute.local_tile(mdO_cur, cute.select(self.mma_tiler_pdo, mode=[1, 2]), (0, None))
-            tdPgdO = thr_mma_dP.partition_B(gdO)
+            tdPgdO = thr_mma_dV.partition_B(gdO)
 
             load_K, _, _ = copy_utils.tma_get_copy_fn(
                 tma_atom_K, 0, cute.make_layout(1), tSgK, sK, single_stage=True
