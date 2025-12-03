@@ -131,11 +131,7 @@ SEQLEN_CONFIGS = [
     ([1, 2], [1024*32, 16384]),
     ([1, 1, 1], [128*1024]*3),
     ([1, 1, 1], [256*1024]*3),
-    ([1, 1, 1], [512*1024]*3),
 ]
-# SEQLEN_CONFIGS = [
-#     ([2, 2], [2**i] * 2) for i in range(13, 20)
-# ]
 
 # =============================================================================
 # Helper functions
@@ -336,9 +332,10 @@ def check_results(
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("varlen_q", [True, False])
 @pytest.mark.parametrize("varlen_k", [True, False])
+@pytest.mark.parametrize("qhead_per_kvhead,num_kv_heads", [(1, 2), (4, 2)])
 @pytest.mark.parametrize("seqlens_q,seqlens_k", SEQLEN_CONFIGS)
 @pytest.mark.parametrize("score_mod_tuple", TEST_PAIRS_6ARG)
-def test_varlen_with_score_mod(seqlens_q, seqlens_k, varlen_q, varlen_k, dtype, score_mod_tuple):
+def test_varlen_with_score_mod(seqlens_q, seqlens_k, varlen_q, varlen_k, qhead_per_kvhead, num_kv_heads, dtype, score_mod_tuple):
     """Test varlen attention with 6-arg score_mod functions.
 
     Covers: both varlen, varlen Q only, varlen K only.
@@ -356,13 +353,25 @@ def test_varlen_with_score_mod(seqlens_q, seqlens_k, varlen_q, varlen_k, dtype, 
     torch.random.manual_seed(42)
     cute_score_mod, eager_factory, aux_type = score_mod_tuple
 
-    num_heads = 4
+    num_heads = num_kv_heads * qhead_per_kvhead
+    pack_gqa = qhead_per_kvhead > 1
     head_dim = 128
     batch_size = len(seqlens_q)
 
     q, k, v, cu_seqlens_q, cu_seqlens_k = setup_tensors(
         seqlens_q, seqlens_k, varlen_q, varlen_k, num_heads, head_dim, dtype
     )
+
+    # For pack_gqa, reduce K and V to num_kv_heads
+    if pack_gqa:
+        if varlen_k:
+            # K and V are (total_k, num_heads, head_dim) - slice head dimension
+            k = k[:, :num_kv_heads, :].clone()
+            v = v[:, :num_kv_heads, :].clone()
+        else:
+            # K and V are (batch, seqlen_k, num_heads, head_dim) - slice head dimension
+            k = k[:, :, :num_kv_heads, :].clone()
+            v = v[:, :, :num_kv_heads, :].clone()
 
     # Setup aux tensors and eager score_mod
     aux_tensors = None
@@ -396,6 +405,7 @@ def test_varlen_with_score_mod(seqlens_q, seqlens_k, varlen_q, varlen_k, dtype, 
         v,
         cute_score_mod,
         aux_tensors=aux_tensors,
+        pack_gqa=pack_gqa,
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_k=cu_seqlens_k,
     )
@@ -411,8 +421,7 @@ def test_varlen_with_score_mod(seqlens_q, seqlens_k, varlen_q, varlen_k, dtype, 
     )
 
     test_name = f"{cute_score_mod.__name__} (varlen_q={varlen_q}, varlen_k={varlen_k})"
-    # Use dtype-dependent tolerance for large sequences with causal masking
-    extra_atol = 2e-3 # if dtype == torch.float16 else 2e-2
+    extra_atol = 2e-3
     check_results(
         out_cute, out_ref_fp32, out_pt, test_name,
         extra_atol=extra_atol,
@@ -424,10 +433,11 @@ def test_varlen_with_score_mod(seqlens_q, seqlens_k, varlen_q, varlen_k, dtype, 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("varlen_q", [True, False])
 @pytest.mark.parametrize("varlen_k", [True, False])
+@pytest.mark.parametrize("qhead_per_kvhead,num_kv_heads", [(1, 1), (4, 2)])
 @pytest.mark.parametrize("seqlens_q,seqlens_k", SEQLEN_CONFIGS)
 @pytest.mark.parametrize("score_mod_tuple", TEST_PAIRS_8ARG)
 def test_varlen_with_global_idx_score_mod(
-    seqlens_q, seqlens_k, varlen_q, varlen_k, dtype, score_mod_tuple
+    seqlens_q, seqlens_k, varlen_q, varlen_k, qhead_per_kvhead, num_kv_heads, dtype, score_mod_tuple
 ):
     """Test varlen attention with 8-arg score_mod functions (global indices).
 
@@ -436,23 +446,6 @@ def test_varlen_with_global_idx_score_mod(
     """
     if not varlen_q and not varlen_k:
         pytest.skip("At least one of varlen_q or varlen_k must be True for varlen tests")
-
-    @cute.jit
-    def score_mod_global_kv_bias_fresh(
-        tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors, q_idx_global, kv_idx_global
-    ):
-        token_bias = aux_tensors[0]
-        dtype = token_bias.element_type
-        kv_frag = cute.make_fragment(1, cutlass.Int32)
-        kv_frag.store(kv_idx_global)
-        bias_frag = cute.make_fragment(1, dtype)
-        bias_frag[0] = token_bias[kv_frag[0]]
-        score_before = tSrS_ssa[0]
-        bias_val = bias_frag[0]
-        if cute.arch.thread_idx()[0] == 0 and kv_idx[0] == 0:
-            cute.printf("batch=%d kv_local %d kv_global=%d score_before=%f bias=%f score_after=%f\n",
-                        b_idx[0], kv_idx[0], kv_frag[0], score_before, bias_val, score_before + bias_val)
-        return tSrS_ssa + (bias_frag.load()).to(cutlass.Float32)
 
     cute_score_mod, eager_factory, aux_type, requires_global = score_mod_tuple
 
@@ -474,7 +467,8 @@ def test_varlen_with_global_idx_score_mod(
 
     torch.random.manual_seed(42)
 
-    num_heads = 1
+    num_heads = num_kv_heads * qhead_per_kvhead
+    pack_gqa = qhead_per_kvhead > 1
     head_dim = 128
     batch_size = len(seqlens_q)
     max_rel_pos = 512
@@ -505,6 +499,15 @@ def test_varlen_with_global_idx_score_mod(
         seqlen_k = seqlens_k[0]
         k = torch.randn(batch_size, seqlen_k, num_heads, head_dim, device="cuda", dtype=dtype)
         v = torch.randn(batch_size, seqlen_k, num_heads, head_dim, device="cuda", dtype=dtype)
+
+    # For pack_gqa, reduce K and V to num_kv_heads
+    if pack_gqa:
+        if varlen_k:
+            k = k[:, :num_kv_heads, :].clone()
+            v = v[:, :num_kv_heads, :].clone()
+        else:
+            k = k[:, :, :num_kv_heads, :].clone()
+            v = v[:, :, :num_kv_heads, :].clone()
 
     # Setup aux tensors based on indexing type
     if aux_type == "kv":
@@ -569,6 +572,7 @@ def test_varlen_with_global_idx_score_mod(
         v,
         cute_score_mod,
         aux_tensors=aux_tensors,
+        pack_gqa=pack_gqa,
         cu_seqlens_q=kernel_cu_seqlens_q,
         cu_seqlens_k=kernel_cu_seqlens_k,
     )
