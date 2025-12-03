@@ -22,10 +22,12 @@ classifiers = [
 ]
 
 dependencies = [
-    "nvidia-cutlass-dsl==4.3.0",
+    "nvidia-cutlass-dsl==4.3.1",
     "torch",
     "einops",
     "typing_extensions",
+    "apache-tvm-ffi",
+    "torch-c-dlpack-ext",
 ]
 
 [project.optional-dependencies]
