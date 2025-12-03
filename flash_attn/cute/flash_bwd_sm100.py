@@ -1292,8 +1292,8 @@ class FlashAttentionBackwardSm100:
             # gdPsum = cute.logical_divide(gdPsum, (64,))[(None, block_in_cluster_coord_vmnk[1]), None]
             # copy_stats = partial(cute.copy, copy_atom_stats, mcast_mask=q_do_mcast_mask)
 
-            # First iteration: load K together w Q & LSE, then V together w dO & dPsum
             if const_expr(not self.is_local) or m_block_min < m_block_max:
+                # First iteration: load K together w Q & LSE, then V together w dO & dPsum
                 if const_expr(should_load_Q):
                     # K & Q
                     pipeline_Q.producer_acquire(
@@ -1965,6 +1965,7 @@ class FlashAttentionBackwardSm100:
                     pipeline_dS.producer_commit(producer_state_dS)
                 producer_state_dS.advance()
 
+            # Epilogue
             if const_expr(not self.is_local) or m_block_min < m_block_max:
                 if const_expr(not self.use_tma_store):
                     consumer_state_dKV = self.epilogue_dKV(

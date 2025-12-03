@@ -295,6 +295,7 @@ def _flash_attn_fwd(
         if window_size_left is not None or window_size_right is not None:
             if window_size_left is None and window_size_right == 0:
                 causal, local = True, False
+                window_size_right = None
             else:
                 causal, local = False, True
     else:
