@@ -60,7 +60,6 @@ class PackGQA:
         threads_per_row = gmem_tiled_copy.layout_tv_tiled.shape[0][0]
         assert cute.arch.WARP_SIZE % threads_per_row == 0, "threads_per_row must divide WARP_SIZE"
         num_threads = gmem_tiled_copy.size
-
         tPrQPtr = self.compute_ptr(mQ[None, 0], tQcQ_row, tidx, block, threads_per_row, num_threads)
         for m in cutlass.range_constexpr(cute.size(tQsQ.shape[1])):
             q_ptr_i64 = utils.shuffle_sync(
