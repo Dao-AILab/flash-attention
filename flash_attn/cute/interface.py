@@ -295,14 +295,8 @@ def _flash_attn_fwd(
     if compute_capability == 9:  # TODO: tune block size according to hdim.
         if head_dim == head_dim_v == 128 and not causal and not local and not use_block_sparsity:
             n_block_size = 192
+
     if compute_capability == 10:
-        # TODO: fix the varlen case
-        if (
-            pack_gqa
-            and (128 % qhead_per_kvhead != 0)
-            or (cu_seqlens_q is not None or seqused_q is not None)
-        ):
-            pack_gqa = False
         # TODO: fix GQA + SplitKV + non-varlen
         if pack_gqa and num_splits != 1 and cu_seqlens_q is None:
             pack_gqa = False
