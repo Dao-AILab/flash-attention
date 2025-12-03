@@ -334,7 +334,7 @@ class FlashAttentionForwardSm100:
         if const_expr(self.q_dtype != self.v_dtype):
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.v_dtype}")
         self._setup_attributes()
-        self.use_tma_O = self.arch >= 90 and mCuSeqlensQ is None and mSeqUsedQ is None
+        self.use_tma_O = self.arch >= 90 and mCuSeqlensQ is None and mSeqUsedQ is None and not self.pack_gqa
         # This can be tuned
         self.e2e_freq = 16
         if const_expr(
@@ -2364,8 +2364,6 @@ class FlashAttentionForwardSm100:
             tOcO = gmem_thr_copy_O.partition_S(cO)
             t0OcO = gmem_tiled_copy_O.get_slice(0).partition_S(cO)
             tOpO = utils.predicate_k(tOcO, limit=mO_cur.shape[1])
-            # TODO: the packgqa case isn't correct rn (sometimes IMA), disabling it
-            assert not self.pack_gqa
             pack_gqa = PackGQA(
                 self.m_block_size,
                 self.head_dim_v_padded,
@@ -2458,8 +2456,6 @@ class FlashAttentionForwardSm100:
                     tOcO = gmem_thr_copy_O.partition_S(cO)
                     t0OcO = gmem_tiled_copy_O.get_slice(0).partition_S(cO)
                     tOpO = utils.predicate_k(tOcO, limit=mO.shape[1])
-                    # TODO: the packgqa case isn't correct rn (sometimes IMA), disabling it
-                    assert not self.pack_gqa
                     pack_gqa = PackGQA(
                         self.m_block_size,
                         self.head_dim_v_padded,
