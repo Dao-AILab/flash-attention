@@ -617,6 +617,7 @@ def _flash_attn_bwd(
     if local:
         if window_size_left is None and window_size_right == 0:
             causal, local = True, False
+            window_size_right = None
         else:
             causal, local = False, True
 

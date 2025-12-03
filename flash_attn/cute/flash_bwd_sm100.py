@@ -555,7 +555,8 @@ class FlashAttentionBackwardSm100:
             TileScheduler = SingleTileLPTBwdScheduler
         else:
             TileScheduler = SingleTileScheduler
-        self.spt = self.is_causal and self.deterministic
+        # reads n_blocks right-to-left
+        self.spt = (self.is_causal or self.is_local) and self.deterministic
         tile_sched_args = TileSchedulerArguments(
             cute.ceil_div(cute.size(mK.shape[0]), self.cta_tiler[0]),
             cute.size(mQ.shape[2]),  # num_heads = num_query_heads
@@ -2138,13 +2139,16 @@ class FlashAttentionBackwardSm100:
                     # semaphore acquire
                     if const_expr(self.deterministic and stage == 0):
                         if const_expr(self.spt):
-                            n_block_max_for_m_block = min(
-                                n_block_global_max,
-                                cute.ceil_div(
-                                    (m_block + 1) * self.tile_m + seqlen.seqlen_k - seqlen.seqlen_q,
-                                    self.tile_n,
-                                ),
-                            )
+                            if const_expr(self.is_causal or block_info.window_size_right is not None):
+                                n_idx_right = (m_block + 1) * self.tile_m + seqlen.seqlen_k - seqlen.seqlen_q
+                                if const_expr(block_info.window_size_right is not None):
+                                    n_idx_right += block_info.window_size_right
+                                n_block_max_for_m_block = min(
+                                    n_block_global_max,
+                                    cute.ceil_div(n_idx_right, self.tile_n),
+                                )
+                            else:
+                                n_block_max_for_m_block = n_block_global_max
                             lock_value = n_block_max_for_m_block - 1 - n_block
                         else:
                             lock_value = n_block
@@ -2197,6 +2201,11 @@ class FlashAttentionBackwardSm100:
                 # final semaphore release
                 if const_expr(self.deterministic and delay_semaphore_release):
                     barrier.arrive_inc(mdQ_semaphore_cur[(m_block_max - 1, None)].iterator, tidx, 0, 1)
+
+            if const_expr(self.deterministic and not self.spt and block_info.window_size_left is not None):
+                m_block_global_max = cute.ceil_div(seqlen.seqlen_q, self.tile_m)
+                for m_block in cutlass.range(m_block_max, m_block_global_max, unroll=1):
+                    barrier.arrive_inc(mdQ_semaphore_cur[(m_block, None)].iterator, tidx, 0, 1)
 
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
