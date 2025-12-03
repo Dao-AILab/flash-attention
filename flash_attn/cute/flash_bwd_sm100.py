@@ -1497,15 +1497,14 @@ class FlashAttentionBackwardSm100:
             m_block_min, m_block_max = block_info.get_m_block_min_max(
                 seqlen, n_block // self.cluster_shape_mnk[0]
             )
-
-            accumulate_dK = False
-            # -----------------------------------------------------------
-            ###### Prologue
-            # -----------------------------------------------------------
-            # 1. S  = Q0 @ K.T
-            # 2. dP = V @ dO.T
-            # 3. dV = P @ dO
             if const_expr(not self.is_local) or m_block_min < m_block_max:
+                accumulate_dK = False
+                # -----------------------------------------------------------
+                ###### Prologue
+                # -----------------------------------------------------------
+                # 1. S  = Q0 @ K.T
+                # 2. dP = V @ dO.T
+                # 3. dV = P @ dO
                 # 1) S  = Q0 @ K.T
                 handle_Q = pipeline_Q_consumer.wait_and_advance()
                 pipeline_S_P.sync_object_empty.wait(0, producer_phase_acc)
