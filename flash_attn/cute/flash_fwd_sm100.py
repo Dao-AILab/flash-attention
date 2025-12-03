@@ -2676,10 +2676,10 @@ class FlashAttentionForwardSm100:
             fastdiv_mods = (
                 seqlen_q_divmod
                 if not recompute_fastdiv_mods_q
-                else FastDivmod.create(seqlen.seqlen_q),
+                else FastDivmodDivisor(seqlen.seqlen_q),
                 seqlen_k_divmod
                 if not recompute_fastdiv_mods_k
-                else FastDivmod.create(seqlen.seqlen_k),
+                else FastDivmodDivisor(seqlen.seqlen_k),
             )
 
         apply_score_mod_inner(

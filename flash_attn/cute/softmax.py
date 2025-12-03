@@ -2,7 +2,7 @@
 
 import math
 import operator
-from typing import Tuple, Optional
+from typing import Tuple
 from dataclasses import dataclass
 
 import cutlass
@@ -30,8 +30,8 @@ class Softmax(ParamsBase):
         arch: cutlass.Constexpr[int] = 80,
         softmax_scale: Float32 | None = None,
     ):
-        row_max = cute.make_fragment(num_rows, Float32)
-        row_sum = cute.make_fragment(num_rows, Float32)
+        row_max = cute.make_rmem_tensor(num_rows, Float32)
+        row_sum = cute.make_rmem_tensor(num_rows, Float32)
         return Softmax(scale_log2, num_rows, row_max, row_sum, arch, softmax_scale)
 
     def reset(self) -> None:
@@ -169,8 +169,8 @@ class SoftmaxSm100(Softmax):
     ):
         num_rows = 1
         arch = 100
-        row_max = cute.make_fragment(num_rows, Float32)
-        row_sum = cute.make_fragment(num_rows, Float32)
+        row_max = cute.make_rmem_tensor(num_rows, Float32)
+        row_sum = cute.make_rmem_tensor(num_rows, Float32)
         return SoftmaxSm100(
             scale_log2,
             num_rows,
@@ -366,21 +366,21 @@ def apply_score_mod_inner(
     offset_q = seqlen.offset_q
 
     n_vals = cutlass.const_expr(cute.size(score_tensor.shape))
-    score_vec = cute.make_fragment(vec_size, qk_acc_dtype)
-    kv_idx_local_vec = cute.make_fragment(vec_size, cutlass.Int32)
-    kv_idx_global_vec = cute.make_fragment(vec_size, cutlass.Int32)
+    score_vec = cute.make_rmem_tensor(vec_size, qk_acc_dtype)
+    kv_idx_local_vec = cute.make_rmem_tensor(vec_size, cutlass.Int32)
+    kv_idx_global_vec = cute.make_rmem_tensor(vec_size, cutlass.Int32)
 
     # SSA values for batch (constant across all elements)
     batch_idx_ssa = utils.scalar_to_ssa(batch_idx, cutlass.Int32).broadcast_to((vec_size,))
 
     # For non-constant q_idx path
     if cutlass.const_expr(constant_q_idx is None):
-        q_idx_local_vec = cute.make_fragment(vec_size, cutlass.Int32)
-        q_idx_global_vec = cute.make_fragment(vec_size, cutlass.Int32)
+        q_idx_local_vec = cute.make_rmem_tensor(vec_size, cutlass.Int32)
+        q_idx_global_vec = cute.make_rmem_tensor(vec_size, cutlass.Int32)
 
     # For Pack-GQA with non-constant q_idx, we need per-element head indices
     if cutlass.const_expr(qhead_per_kvhead > 1 and constant_q_idx is None):
-        head_idx_vec = cute.make_fragment(vec_size, cutlass.Int32)
+        head_idx_vec = cute.make_rmem_tensor(vec_size, cutlass.Int32)
 
     for i in cutlass.range(0, n_vals, vec_size, unroll_full=True):
         for j in cutlass.range(vec_size, unroll_full=True):
@@ -394,7 +394,7 @@ def apply_score_mod_inner(
             kv_idx_local = kv_idx_raw
             if cutlass.const_expr(aux_tensors is not None and fastdiv_mods is not None):
                 _, seqlen_k_divmod = fastdiv_mods
-                _, kv_idx_local = seqlen_k_divmod.divmod(kv_idx_raw)
+                _, kv_idx_local = divmod(kv_idx_raw, seqlen_k_divmod)
             kv_idx_local_vec[j] = kv_idx_local
 
             # Global = position in packed tensor
@@ -415,7 +415,8 @@ def apply_score_mod_inner(
                 # Wrap both local and global when aux_tensors exist (matches KV logic)
                 if cutlass.const_expr(aux_tensors is not None and fastdiv_mods is not None):
                     seqlen_q_divmod, _ = fastdiv_mods
-                    _, wrapped_idx = seqlen_q_divmod.divmod(q_idx_local)
+                    q_idx_to_wrap = floor_if_packed(q_idx_raw, qhead_per_kvhead)
+                    _, wrapped_idx = divmod(q_idx_to_wrap, seqlen_q_divmod)
                     q_idx_local_vec[j] = wrapped_idx
                     q_idx_global_vec[j] = offset_q + wrapped_idx
                 else:
@@ -441,7 +442,8 @@ def apply_score_mod_inner(
             # Wrap both local and global when aux_tensors exist (matches KV logic)
             if cutlass.const_expr(aux_tensors is not None and fastdiv_mods is not None):
                 seqlen_q_divmod, _ = fastdiv_mods
-                _, wrapped_idx = seqlen_q_divmod.divmod(constant_q_idx)
+                q_idx_to_wrap = floor_if_packed(constant_q_idx, qhead_per_kvhead)
+                _, wrapped_idx = divmod(q_idx_to_wrap, seqlen_q_divmod)
                 q_idx_local = wrapped_idx
                 q_idx_global = offset_q + q_idx_local
             else:
@@ -468,9 +470,9 @@ def apply_score_mod_inner(
             head_idx_ssa,
             q_idx=q_idx_local_ssa,
             kv_idx=kv_idx_local_ssa,
-            aux_tensors=aux_args,
             q_idx_global=q_idx_global_ssa,
             kv_idx_global=kv_idx_global_ssa,
+            aux_tensors=aux_args,
         )
 
         # Write back modified scores
