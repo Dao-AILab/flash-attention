@@ -5,6 +5,7 @@ import cutlass.cute as cute
 import pytest
 import torch
 from cutlass._mlir.dialects import math as mlir_math
+from torch.nn.attention.flex_attention import flex_attention
 from flash_attn.cute.interface import _flash_attn_fwd
 from score_mod_definitions import (
     # TensorSSA-based score mods
@@ -495,7 +496,7 @@ def test_varlen_with_score_mod(
     )
 
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("varlen_q", [True, False])
 @pytest.mark.parametrize("varlen_k", [True, False])
 @pytest.mark.parametrize("qhead_per_kvhead,num_kv_heads", [(1, 1), (4, 2)])
@@ -664,19 +665,12 @@ def test_varlen_with_global_idx_score_mod(
     )
 
     # Reshape outputs to common format for comparison
-    # Target shape: (batch_size, seqlen_q, num_heads, head_dim) for non-varlen_q
-    #           or: (total_q, num_heads, head_dim) for varlen_q
 
     if varlen_q:
-        # Both ref and cute should be (total_q, num_heads, head_dim)
-        # ref comes from concatenating per-sequence outputs
         out_ref_final = out_ref_fp32
         out_pt_final = out_pt
         out_cute_final = out_cute
     else:
-        # cute is (batch_size, seqlen_q, num_heads, head_dim)
-        # ref is (total_q, num_heads, head_dim) from run_flex_varlen_ref concatenation
-        # Need to reshape ref to match cute
         seqlen_q = seqlens_q[0]
         out_ref_final = out_ref_fp32.reshape(batch_size, seqlen_q, num_heads, head_dim)
         out_pt_final = out_pt.reshape(batch_size, seqlen_q, num_heads, head_dim)
@@ -719,8 +713,6 @@ def test_varlen_with_global_idx_score_mod(
         extra_atol=1e-3,
         seqlens_q=seqlens_q if varlen_q else None,
         cu_seqlens_q=cu_seqlens_q if varlen_q else None,
-        seqlens_q=seqlens_q if varlen_q else None,
-        cu_seqlens_q=cu_seqlens_q if varlen_q else None
     )
 
 
