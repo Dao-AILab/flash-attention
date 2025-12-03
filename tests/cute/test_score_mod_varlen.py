@@ -1,35 +1,39 @@
-import pytest
-import torch
+import operator
+
 import cutlass
 import cutlass.cute as cute
+import pytest
+import torch
 from cutlass._mlir.dialects import math as mlir_math
-import operator
-from torch.nn.attention.flex_attention import flex_attention
 from flash_attn.cute.interface import _flash_attn_fwd
 from score_mod_definitions import (
-    # TensorSSA-based score mods
-    score_mod_identity,
-    score_mod_causal,
-    score_mod_rel_bias,
-    score_mod_rel_bias_x2,
-    score_mod_times_two,
     score_mod_alibi,
-    score_mod_sliding_window,
-    score_mod_block_diagonal,
-    score_mod_causal_v2,
     score_mod_batch_bias,
+    score_mod_block_diagonal,
+    score_mod_causal,
+    score_mod_causal_v2,
+    score_mod_debug_global_idx,
     score_mod_dual_buffer,
     score_mod_global_kv_bias,
+    score_mod_global_logical_rel_plus_kv_bias,
+    score_mod_global_q_and_kv_bias,
     score_mod_global_q_bias,
     score_mod_global_rel_plus_kv_bias,
-    score_mod_global_q_and_kv_bias,
-    score_mod_global_logical_rel_plus_kv_bias,
+    # TensorSSA-based score mods
+    score_mod_identity,
+    score_mod_rel_bias,
+    score_mod_rel_bias_x2,
+    score_mod_sliding_window,
     score_mod_stress_complex_arithmetic,
     score_mod_stress_conditional_mask,
-    score_mod_stress_multi_buffer,
     score_mod_stress_global_offset,
+    score_mod_stress_multi_buffer,
     score_mod_stress_xor_pattern,
-    score_mod_debug_global_idx,
+    score_mod_times_two,
+)
+
+# isort: split
+from score_mod_definitions import (
     # Eager (torch) reference score mods
     identity_eager,
     causal_eager,
@@ -89,9 +93,24 @@ TEST_PAIRS_8ARG = [
         "kv",
         "kv",
     ),
-    (score_mod_stress_complex_arithmetic, stress_complex_arithmetic_factory, "q_concat", "q"),
-    (score_mod_stress_conditional_mask, stress_conditional_mask_factory, "kv_with_cu", "both"),
-    (score_mod_stress_multi_buffer, stress_multi_buffer_factory, "multi_buffer", "both"),
+    (
+        score_mod_stress_complex_arithmetic,
+        stress_complex_arithmetic_factory,
+        "q_concat",
+        "q",
+    ),
+    (
+        score_mod_stress_conditional_mask,
+        stress_conditional_mask_factory,
+        "kv_with_cu",
+        "both",
+    ),
+    (
+        score_mod_stress_multi_buffer,
+        stress_multi_buffer_factory,
+        "multi_buffer",
+        "both",
+    ),
     (score_mod_stress_global_offset, stress_global_offset_factory, "kv", "kv"),
     (score_mod_stress_xor_pattern, stress_xor_pattern_factory, "kv_with_cu", "kv"),
     (score_mod_debug_global_idx, debug_global_idx_factory, "kv", "kv"),
@@ -120,17 +139,17 @@ SEQLEN_CONFIGS = [
     ([64, 128], [32, 64]),
     ([100, 100], [50, 50]),
     ([256, 512, 256], [128, 256, 128]),
-    ([2, 1], [16384, 32*1024]),
-    ([1, 1], [128*1024]*2),
+    ([2, 1], [16384, 32 * 1024]),
+    ([1, 1], [128 * 1024] * 2),
     ([2, 1], [8192, 8192]),
     ([1, 3], [8192, 8192]),
     ([3, 3], [8192, 8192]),
     ([128, 128], [8192, 8192]),
-    ([2, 2, 2], [8*1024]*3),
-    ([2, 1], [1024*32, 16384]),
-    ([1, 2], [1024*32, 16384]),
-    ([1, 1, 1], [128*1024]*3),
-    ([1, 1, 1], [256*1024]*3),
+    ([2, 2, 2], [8 * 1024] * 3),
+    ([2, 1], [1024 * 32, 16384]),
+    ([1, 2], [1024 * 32, 16384]),
+    ([1, 1, 1], [128 * 1024] * 3),
+    ([1, 1, 1], [256 * 1024] * 3),
 ]
 
 # =============================================================================
@@ -139,7 +158,14 @@ SEQLEN_CONFIGS = [
 
 
 def run_cute_flash(
-    q, k, v, score_mod, aux_tensors=None, pack_gqa=False, cu_seqlens_q=None, cu_seqlens_k=None
+    q,
+    k,
+    v,
+    score_mod,
+    aux_tensors=None,
+    pack_gqa=False,
+    cu_seqlens_q=None,
+    cu_seqlens_k=None,
 ):
     """Run CuTE flash attention."""
     if cu_seqlens_q is not None or cu_seqlens_k is not None:
@@ -185,20 +211,30 @@ def run_flex_varlen_ref(q, k, v, cu_seqlens_q, cu_seqlens_k, score_mod, dtype=No
     for i in range(num_batches):
         # Get Q slice
         if cu_seqlens_q is not None:
-            q_slice = q[cu_seqlens_q[i] : cu_seqlens_q[i + 1]].unsqueeze(0).transpose(1, 2)
+            q_slice = (
+                q[cu_seqlens_q[i] : cu_seqlens_q[i + 1]].unsqueeze(0).transpose(1, 2)
+            )
         else:
             q_slice = q[i : i + 1].transpose(1, 2)
 
         # Get K/V slices
         if cu_seqlens_k is not None:
-            k_slice = k[cu_seqlens_k[i] : cu_seqlens_k[i + 1]].unsqueeze(0).transpose(1, 2)
-            v_slice = v[cu_seqlens_k[i] : cu_seqlens_k[i + 1]].unsqueeze(0).transpose(1, 2)
+            k_slice = (
+                k[cu_seqlens_k[i] : cu_seqlens_k[i + 1]].unsqueeze(0).transpose(1, 2)
+            )
+            v_slice = (
+                v[cu_seqlens_k[i] : cu_seqlens_k[i + 1]].unsqueeze(0).transpose(1, 2)
+            )
         else:
             k_slice = k[i : i + 1].transpose(1, 2)
             v_slice = v[i : i + 1].transpose(1, 2)
 
         if dtype is not None:
-            q_slice, k_slice, v_slice = q_slice.to(dtype), k_slice.to(dtype), v_slice.to(dtype)
+            q_slice, k_slice, v_slice = (
+                q_slice.to(dtype),
+                k_slice.to(dtype),
+                v_slice.to(dtype),
+            )
 
         def wrapped_mod(score, b, h, q_idx, kv_idx):
             return score_mod(score, i, h, q_idx, kv_idx)
@@ -223,11 +259,15 @@ def setup_tensors(seqlens_q, seqlens_k, varlen_q, varlen_k, num_heads, head_dim,
         total_q = sum(seqlens_q)
         q = torch.randn(total_q, num_heads, head_dim, device="cuda", dtype=dtype)
         cu_seqlens_q = torch.tensor(
-            [0] + list(torch.tensor(seqlens_q).cumsum(0).tolist()), device="cuda", dtype=torch.int32
+            [0] + list(torch.tensor(seqlens_q).cumsum(0).tolist()),
+            device="cuda",
+            dtype=torch.int32,
         )
     else:
         seqlen_q = seqlens_q[0]  # All sequences have the same length for non-varlen
-        q = torch.randn(batch_size, seqlen_q, num_heads, head_dim, device="cuda", dtype=dtype)
+        q = torch.randn(
+            batch_size, seqlen_q, num_heads, head_dim, device="cuda", dtype=dtype
+        )
         cu_seqlens_q = None
 
     if varlen_k:
@@ -235,12 +275,18 @@ def setup_tensors(seqlens_q, seqlens_k, varlen_q, varlen_k, num_heads, head_dim,
         k = torch.randn(total_k, num_heads, head_dim, device="cuda", dtype=dtype)
         v = torch.randn(total_k, num_heads, head_dim, device="cuda", dtype=dtype)
         cu_seqlens_k = torch.tensor(
-            [0] + list(torch.tensor(seqlens_k).cumsum(0).tolist()), device="cuda", dtype=torch.int32
+            [0] + list(torch.tensor(seqlens_k).cumsum(0).tolist()),
+            device="cuda",
+            dtype=torch.int32,
         )
     else:
         seqlen_k = seqlens_k[0]  # All sequences have the same length for non-varlen
-        k = torch.randn(batch_size, seqlen_k, num_heads, head_dim, device="cuda", dtype=dtype)
-        v = torch.randn(batch_size, seqlen_k, num_heads, head_dim, device="cuda", dtype=dtype)
+        k = torch.randn(
+            batch_size, seqlen_k, num_heads, head_dim, device="cuda", dtype=dtype
+        )
+        v = torch.randn(
+            batch_size, seqlen_k, num_heads, head_dim, device="cuda", dtype=dtype
+        )
         cu_seqlens_k = None
 
     return q, k, v, cu_seqlens_q, cu_seqlens_k
@@ -258,7 +304,9 @@ def prepare_ref_tensors(
         seqlen_q = q.shape[1]
         q_packed = q.reshape(-1, num_heads, q.shape[-1])
         ref_cu_seqlens_q = torch.tensor(
-            [seqlen_q * i for i in range(batch_size + 1)], device="cuda", dtype=torch.int32
+            [seqlen_q * i for i in range(batch_size + 1)],
+            device="cuda",
+            dtype=torch.int32,
         )
         return q_packed, k, v, ref_cu_seqlens_q, cu_seqlens_k
 
@@ -303,7 +351,9 @@ def check_results(
             ref_seq = out_ref_fp32[start_q:end_q]
             pt_seq = out_pt[start_q:end_q]
 
-            max_cute_error = max(max_cute_error, (cute_seq - ref_seq).abs().max().item())
+            max_cute_error = max(
+                max_cute_error, (cute_seq - ref_seq).abs().max().item()
+            )
             max_pt_error = max(max_pt_error, (pt_seq - ref_seq).abs().max().item())
 
         cute_error = max_cute_error
@@ -324,6 +374,7 @@ def check_results(
         f"{test_name}: CuTE error {cute_error:.2e} exceeds tolerance {tol:.2e}"
     )
 
+
 # =============================================================================
 # Tests
 # =============================================================================
@@ -335,14 +386,25 @@ def check_results(
 @pytest.mark.parametrize("qhead_per_kvhead,num_kv_heads", [(1, 2), (4, 2)])
 @pytest.mark.parametrize("seqlens_q,seqlens_k", SEQLEN_CONFIGS)
 @pytest.mark.parametrize("score_mod_tuple", TEST_PAIRS_6ARG)
-def test_varlen_with_score_mod(seqlens_q, seqlens_k, varlen_q, varlen_k, qhead_per_kvhead, num_kv_heads, dtype, score_mod_tuple):
+def test_varlen_with_score_mod(
+    seqlens_q,
+    seqlens_k,
+    varlen_q,
+    varlen_k,
+    qhead_per_kvhead,
+    num_kv_heads,
+    dtype,
+    score_mod_tuple,
+):
     """Test varlen attention with 6-arg score_mod functions.
 
     Covers: both varlen, varlen Q only, varlen K only.
     Skips: neither varlen
     """
     if not varlen_q and not varlen_k:
-        pytest.skip("At least one of varlen_q or varlen_k must be True for varlen tests")
+        pytest.skip(
+            "At least one of varlen_q or varlen_k must be True for varlen tests"
+        )
 
     # For non-varlen dimension, all sequences must have same length
     if not varlen_q:
@@ -423,10 +485,13 @@ def test_varlen_with_score_mod(seqlens_q, seqlens_k, varlen_q, varlen_k, qhead_p
     test_name = f"{cute_score_mod.__name__} (varlen_q={varlen_q}, varlen_k={varlen_k})"
     extra_atol = 2e-3
     check_results(
-        out_cute, out_ref_fp32, out_pt, test_name,
+        out_cute,
+        out_ref_fp32,
+        out_pt,
+        test_name,
         extra_atol=extra_atol,
         seqlens_q=seqlens_q if varlen_q else None,
-        cu_seqlens_q=cu_seqlens_q if varlen_q else None
+        cu_seqlens_q=cu_seqlens_q if varlen_q else None,
     )
 
 
@@ -437,7 +502,14 @@ def test_varlen_with_score_mod(seqlens_q, seqlens_k, varlen_q, varlen_k, qhead_p
 @pytest.mark.parametrize("seqlens_q,seqlens_k", SEQLEN_CONFIGS)
 @pytest.mark.parametrize("score_mod_tuple", TEST_PAIRS_8ARG)
 def test_varlen_with_global_idx_score_mod(
-    seqlens_q, seqlens_k, varlen_q, varlen_k, qhead_per_kvhead, num_kv_heads, dtype, score_mod_tuple
+    seqlens_q,
+    seqlens_k,
+    varlen_q,
+    varlen_k,
+    qhead_per_kvhead,
+    num_kv_heads,
+    dtype,
+    score_mod_tuple,
 ):
     """Test varlen attention with 8-arg score_mod functions (global indices).
 
@@ -445,7 +517,9 @@ def test_varlen_with_global_idx_score_mod(
     Skips tests where required global indices aren't available.
     """
     if not varlen_q and not varlen_k:
-        pytest.skip("At least one of varlen_q or varlen_k must be True for varlen tests")
+        pytest.skip(
+            "At least one of varlen_q or varlen_k must be True for varlen tests"
+        )
 
     cute_score_mod, eager_factory, aux_type, requires_global = score_mod_tuple
 
@@ -479,10 +553,14 @@ def test_varlen_with_global_idx_score_mod(
 
     # Always create cu_seqlens for global index computation (needed by eager)
     cu_seqlens_q = torch.tensor(
-        [0] + list(torch.tensor(seqlens_q).cumsum(0).tolist()), device="cuda", dtype=torch.int32
+        [0] + list(torch.tensor(seqlens_q).cumsum(0).tolist()),
+        device="cuda",
+        dtype=torch.int32,
     )
     cu_seqlens_k = torch.tensor(
-        [0] + list(torch.tensor(seqlens_k).cumsum(0).tolist()), device="cuda", dtype=torch.int32
+        [0] + list(torch.tensor(seqlens_k).cumsum(0).tolist()),
+        device="cuda",
+        dtype=torch.int32,
     )
 
     # Create tensors - layout depends on varlen flag
@@ -490,15 +568,21 @@ def test_varlen_with_global_idx_score_mod(
         q = torch.randn(total_q, num_heads, head_dim, device="cuda", dtype=dtype)
     else:
         seqlen_q = seqlens_q[0]
-        q = torch.randn(batch_size, seqlen_q, num_heads, head_dim, device="cuda", dtype=dtype)
+        q = torch.randn(
+            batch_size, seqlen_q, num_heads, head_dim, device="cuda", dtype=dtype
+        )
 
     if varlen_k:
         k = torch.randn(total_k, num_heads, head_dim, device="cuda", dtype=dtype)
         v = torch.randn(total_k, num_heads, head_dim, device="cuda", dtype=dtype)
     else:
         seqlen_k = seqlens_k[0]
-        k = torch.randn(batch_size, seqlen_k, num_heads, head_dim, device="cuda", dtype=dtype)
-        v = torch.randn(batch_size, seqlen_k, num_heads, head_dim, device="cuda", dtype=dtype)
+        k = torch.randn(
+            batch_size, seqlen_k, num_heads, head_dim, device="cuda", dtype=dtype
+        )
+        v = torch.randn(
+            batch_size, seqlen_k, num_heads, head_dim, device="cuda", dtype=dtype
+        )
 
     # For pack_gqa, reduce K and V to num_kv_heads
     if pack_gqa:
@@ -536,7 +620,9 @@ def test_varlen_with_global_idx_score_mod(
         head_scale = torch.randn(num_heads, device="cuda", dtype=dtype) * 0.1 + 1.0
         q_pos_bias = torch.randn(total_q, device="cuda", dtype=dtype) * 0.1
         kv_pos_bias = torch.randn(total_k, device="cuda", dtype=dtype) * 0.1
-        rel_pos_scale = torch.randn(max_rel_pos * 2 + 1, device="cuda", dtype=dtype) * 0.1
+        rel_pos_scale = (
+            torch.randn(max_rel_pos * 2 + 1, device="cuda", dtype=dtype) * 0.1
+        )
         aux_tensors = [batch_bias, head_scale, q_pos_bias, kv_pos_bias, rel_pos_scale]
         eager_score_mod = eager_factory(
             batch_bias,
@@ -617,14 +703,22 @@ def test_varlen_with_global_idx_score_mod(
                     q_global = cu_seqlens_q[b] + q
                     bias_q = aux_tensors[0][q_global].item()
                     scale = (b + 1) * (h + 1) * 0.001
-                    print(f"  REF: b={b} h={h} q_local={q} q_global={q_global} bias_q={bias_q:.6f} scale={scale:.6f}")
+                    print(
+                        f"  REF: b={b} h={h} q_local={q} q_global={q_global} bias_q={bias_q:.6f} scale={scale:.6f}"
+                    )
 
-        print(f"\nout_cute_final[0,0,0]: {out_cute_final[0,0,0]}")
-        print(f"out_ref_final[0,0,0]: {out_ref_final[0,0,0]}")
-        print(f"Difference: {(out_cute_final[0,0,0] - out_ref_final[0,0,0]).abs()}")
+        print(f"\nout_cute_final[0,0,0]: {out_cute_final[0, 0, 0]}")
+        print(f"out_ref_final[0,0,0]: {out_ref_final[0, 0, 0]}")
+        print(f"Difference: {(out_cute_final[0, 0, 0] - out_ref_final[0, 0, 0]).abs()}")
 
     check_results(
-        out_cute_final, out_ref_final, out_pt_final, test_name, extra_atol=1e-3,
+        out_cute_final,
+        out_ref_final,
+        out_pt_final,
+        test_name,
+        extra_atol=1e-3,
+        seqlens_q=seqlens_q if varlen_q else None,
+        cu_seqlens_q=cu_seqlens_q if varlen_q else None,
         seqlens_q=seqlens_q if varlen_q else None,
         cu_seqlens_q=cu_seqlens_q if varlen_q else None
     )
