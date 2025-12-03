@@ -3,8 +3,6 @@
 from typing import Optional, Tuple
 from dataclasses import dataclass, fields
 
-from cutlass.cute.tuple import elem_less
-
 try:
     from typing import override
 except ImportError:  # Python < 3.12
@@ -501,16 +499,6 @@ class SingleTileLPTBwdScheduler:
 
 
 class SingleTileVarlenScheduler:
-    """
-    Single-tile varlen scheduler for FlashAttention with variable-length sequences.
-    
-    Handles:
-    - Variable-length batches with cu_seqlens or seqused arrays
-    - Causal attention masking
-    - Optional dynamic splits via metadata tensors
-    - LPT (Longest Processing Time) scheduling
-    """
-    
     @dataclass
     class Params(ParamsBase):
         num_head: Int32
@@ -523,7 +511,6 @@ class SingleTileVarlenScheduler:
         mSeqUsedQ: Optional[cute.Tensor] = None
         qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1
         lpt: cutlass.Constexpr[bool] = False
-        num_splits_divmod: FastDivmod = None
         is_split_kv: cutlass.Constexpr[bool] = False
 
         @staticmethod
@@ -549,7 +536,6 @@ class SingleTileVarlenScheduler:
                 mSeqUsedQ=args.mSeqUsedQ,
                 qhead_per_kvhead_packgqa=args.qhead_per_kvhead_packgqa,
                 lpt=args.lpt,
-                num_splits_divmod=FastDivmod.create(args.num_splits if args.is_split_kv else 1),
                 is_split_kv=args.is_split_kv,
             )
 
@@ -585,7 +571,6 @@ class SingleTileVarlenScheduler:
 
     @cute.jit
     def _get_num_m_blocks(self, lane: Int32, bidb_start: Int32) -> Int32:
-        """Get number of M blocks (tiles along Q dimension) for a batch."""
         params = self.params
         batch_idx = lane + bidb_start
         if cutlass.const_expr(params.mSeqUsedQ is not None):
@@ -609,30 +594,17 @@ class SingleTileVarlenScheduler:
 
     @cute.jit
     def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
-        """
-        Compute which tile this block should work on.
-        
-        KEY DESIGN: Grid is (tiles*heads, splits, 1). Splits are in SEPARATE dimension.
-        Don't multiply tile counts by num_splits. Split_idx comes from blockIdx.y.
-        
-        FIX #2: Bounds check BEFORE pointer accesses in else block.
-        FIX #4: Remove num_m_blocks > 0 from is_valid check (allow empty sequences).
-        """
         params = self.params
         lane_idx = cute.arch.lane_idx()
-        
-        # Get num_m_blocks for initial batch group (lanes 0-30)
         num_m_blocks = self._get_num_m_blocks(lane_idx, bidb_start=0)
         num_m_blocks_cumulative = utils.warp_prefix_sum(num_m_blocks, lane_idx)
         # Total number of blocks for the next 31 batches
         m_blocks_in_group = cute.arch.shuffle_sync(num_m_blocks_cumulative, cute.arch.WARP_SIZE - 1)
         # Same for all lanes
         group_end_tile = m_blocks_in_group * params.num_head
-        
+        # if cute.arch.thread_idx()[0] == 128 + 31: cute.printf("SingleTileVarlenScheduler: tile_idx=%d, group_end_tile = %d, num_m_blocks=%d, num_m_blocks_cumulative = %d, m_blocks_in_group = %d", self._tile_idx, group_end_tile, num_m_blocks, num_m_blocks_cumulative, m_blocks_in_group)
         block, head_idx, batch_idx = Int32(0), Int32(0), Int32(0)
         next_tile_idx = self._tile_idx
-        
-        # Find which batch group contains our tile_idx
         while group_end_tile <= next_tile_idx:
             batch_idx += cute.arch.WARP_SIZE - 1
             if batch_idx >= params.num_batch:
@@ -650,19 +622,9 @@ class SingleTileVarlenScheduler:
             block, head_idx, batch_idx = Int32(0), Int32(0), Int32(params.num_batch)
         else:
             group_start_tile = group_end_tile - m_blocks_in_group * params.num_head
-            
-            # Recompute cumulative sum for current batch group to use in ballot check
-            # Match hopper: uses num_m_blocks_cumulative from num_split_m_blocks for ballot
-            num_split_m_blocks_for_ballot = (
-                self._get_num_m_blocks(lane_idx, bidb_start=batch_idx)
-                * self._get_num_splits(lane_idx, bidb_start=batch_idx)
-                if const_expr(params.is_split_kv)
-                else self._get_num_m_blocks(lane_idx, bidb_start=batch_idx)
-            )
-            num_m_blocks_cumulative_for_ballot = utils.warp_prefix_sum(num_split_m_blocks_for_ballot, lane_idx)
-            
-            # Find which batch in the group
-            # Match hopper line 678: uses num_m_blocks_cumulative (from num_split_m_blocks)
+            # if cute.arch.thread_idx()[0] == 128 + 31: cute.printf("SingleTileVarlenScheduler: tile_idx=%d, group_end_tile = %d, num_m_blocks=%d, batch_idx = %d", self._tile_idx, group_end_tile, num_m_blocks, batch_idx)
+            # The next problem to process is the first one that does not have ending tile position
+            # that is greater than or equal to tile index.
             batch_idx_in_group = cute.arch.popc(
                 cute.arch.vote_ballot_sync(
                     group_start_tile + num_m_blocks_cumulative * params.num_head <= next_tile_idx
@@ -731,6 +693,7 @@ class SingleTileVarlenScheduler:
         pass
 
     def advance_to_next_work(self, *, loc=None, ip=None):
+        # Single tile scheduler - set to invalid tile_idx to indicate no more work
         self._is_first_block = False
 
     def __extract_mlir_values__(self):
