@@ -30,6 +30,7 @@ from flash_attn.cute.interface import (
 
 DISABLE_SPLIT = os.getenv("FLASH_ATTENTION_DISABLE_SPLIT", "FALSE") == "TRUE"
 
+VERBOSE = True
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
@@ -43,8 +44,8 @@ DISABLE_SPLIT = os.getenv("FLASH_ATTENTION_DISABLE_SPLIT", "FALSE") == "TRUE"
 @pytest.mark.parametrize("deterministic", [False])
 # @pytest.mark.parametrize("softcap", [0.0, 15.0])
 @pytest.mark.parametrize("softcap", [0.0])
-@pytest.mark.parametrize("local", [False, True])
-# @pytest.mark.parametrize("local", [False])
+@pytest.mark.parametrize("local_enum", [0, 1, 2, 3])
+# @pytest.mark.parametrize("local_enum", [1])
 @pytest.mark.parametrize("causal", [False, True])
 # @pytest.mark.parametrize("causal", [True])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
@@ -92,7 +93,7 @@ def test_flash_attn_output(
     seqlen_k,
     d,
     causal,
-    local,
+    local_enum,
     softcap,
     deterministic,
     has_qv,
@@ -100,8 +101,9 @@ def test_flash_attn_output(
     mha_type,
     dtype,
 ):
-    # if (causal or local) and seqlen_k < seqlen_q:
-    #     pytest.skip("Causal attention requires seqlen_k >= seqlen_q")
+    local = local_enum > 0
+    if local and causal:
+        pytest.skip()
     device = "cuda"
     # set seed
     torch.random.manual_seed(0)
@@ -157,6 +159,12 @@ def test_flash_attn_output(
         window_size = (
             (None, None) if not local else torch.randint(0, seqlen_k, (2,)).tolist()
         )
+        if local_enum == 2:
+            window_size = (None, -window_size[1])
+        elif local_enum == 3:
+            window_size = (-window_size[0], None)
+        if local:
+            print("window size = ", window_size)
         # window_size = (-1, -1) if not local else (16, 0)
         if has_learnable_sink:
             learnable_sink = torch.randn(nheads, dtype=torch.bfloat16, device=device)
@@ -241,7 +249,7 @@ def test_flash_attn_output(
                 # attention_chunk=attention_chunk,
                 softcap=softcap,
                 learnable_sink=learnable_sink,
-                # pack_gqa=pack_gqa,
+                pack_gqa=pack_gqa,
                 num_splits=num_splits,
             )
             print(f"Output max diff: {(out - out_ref).abs().max().item()}")
@@ -262,12 +270,9 @@ def test_flash_attn_output(
             and not dv > 256
             and not attention_chunk != 0
             and softcap == 0.0
-            and not local
             and dv == d
             and learnable_sink is None
-            # and mha_type == "mha"
             # and False
-            and not ((causal or local) and seqlen_k < seqlen_q)
         ):
             g = torch.randn_like(out)
             # do_o = ((g.float() * out.float()).sum(-1)).transpose(1, 2)
@@ -301,6 +306,26 @@ def test_flash_attn_output(
             print(f"dQ Pytorch mean diff: {(dq_pt - dq_ref).abs().mean().item()}")
             print(f"dK Pytorch mean diff: {(dk_pt - dk_ref).abs().mean().item()}")
             print(f"dV Pytorch mean diff: {(dv_pt - dv_ref).abs().mean().item()}")
+            
+            if VERBOSE:
+                diff_dq = (dq - dq_ref).abs()
+                max_idx = diff_dq.argmax()
+                coords = torch.unravel_index(max_idx, diff_dq.shape)
+                print(f"dQ max diff: {diff_dq.max().item()}")
+                print(f"  at coordinates {tuple(c.item() for c in coords)}: dQ={dq[coords].item()}, dQ_ref={dq_ref[coords].item()}")
+
+                diff_dk = (dk - dk_ref).abs()
+                max_idx = diff_dk.argmax()
+                coords = torch.unravel_index(max_idx, diff_dk.shape)
+                print(f"dK max diff: {diff_dk.max().item()}")
+                print(f"  at coordinates {tuple(c.item() for c in coords)}: dK={dk[coords].item()}, dK_ref={dk_ref[coords].item()}")
+
+                diff_dv = (dv - dv_ref).abs()
+                max_idx = diff_dv.argmax()
+                coords = torch.unravel_index(max_idx, diff_dv.shape)
+                print(f"dV max diff: {diff_dv.max().item()}")
+                print(f"  at coordinates {tuple(c.item() for c in coords)}: dV={dv[coords].item()}, dV_ref={dv_ref[coords].item()}")
+
             # breakpoint()
             dq_atol = 2 * (dq_ref + 0.3 - 0.3 - dq_ref).abs().max().item() + (
                 0 if softcap == 0 else 3e-4

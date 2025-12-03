@@ -540,6 +540,8 @@ def _flash_attn_bwd(
     softmax_scale: Optional[float] = None,
     causal: bool = False,
     softcap: float = 0.0,
+    window_size_left: Optional[int] = None,
+    window_size_right: Optional[int] = None,
     m_block_size: int = 64,
     n_block_size: int = 128,
     num_threads: int = 256,
@@ -575,6 +577,7 @@ def _flash_attn_bwd(
         AtomLayoutNdKV = 2
         AtomLayoutMdQ = 1
         cluster_size = 1
+        assert window_size_left is None and window_size_right is None, "local not supported yet on 9.x"
     else:
         m_block_size = 128
         n_block_size = 128
@@ -607,6 +610,15 @@ def _flash_attn_bwd(
 
     num_head_kv = k.shape[-2]
     head_dim_v = v.shape[-1]
+
+    if causal:
+        window_size_right = 0
+    local = window_size_left is not None or window_size_right is not None
+    if local:
+        if window_size_left is None and window_size_right == 0:
+            causal, local = True, False
+        else:
+            causal, local = False, True
 
     if cu_seqlens_k is None:
         assert k.shape == (batch_size, seqlen_k, num_head_kv, head_dim)
@@ -840,6 +852,8 @@ def _flash_attn_bwd(
             head_dim_v,
             qhead_per_kvhead,
             causal,
+            window_size_left is not None,
+            window_size_right is not None,
             softcap != 0.0,
             m_block_size,
             n_block_size,
@@ -896,6 +910,7 @@ def _flash_attn_bwd(
                 head_dim,
                 head_dim_v,
                 is_causal=causal,
+                is_local=local,
                 qhead_per_kvhead=qhead_per_kvhead,
                 # tile_m=m_block_size,
                 # tile_n=n_block_size,
@@ -921,6 +936,8 @@ def _flash_attn_bwd(
             cu_seqlens_k_tensor,
             seqused_q_tensor,
             seqused_k_tensor,
+            window_size_left=window_size_left,
+            window_size_right=window_size_right,
             mdQ_semaphore=dQ_semaphore_tensor,
             mdK_semaphore=dK_semaphore_tensor,
             mdV_semaphore=dV_semaphore_tensor,
@@ -941,6 +958,8 @@ def _flash_attn_bwd(
         cu_seqlens_k_tensor,
         seqused_q_tensor,
         seqused_k_tensor,
+        window_size_left=window_size_left,
+        window_size_right=window_size_right,
         mdQ_semaphore=dQ_semaphore_tensor,
         mdK_semaphore=dK_semaphore_tensor,
         mdV_semaphore=dV_semaphore_tensor,
@@ -1103,6 +1122,8 @@ class FlashAttnFunc(torch.autograd.Function):
             ctx.softmax_scale,
             ctx.causal,
             ctx.softcap,
+            window_size_left=ctx.window_size[0],
+            window_size_right=ctx.window_size[1],
             deterministic=ctx.deterministic,
         )
         return dq, dk, dv, *((None,) * 20)  # Extra Nones is fine
