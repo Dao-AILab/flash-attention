@@ -1983,7 +1983,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
             # shape: (atom_v_m * rest_m)
             m_block, head_idx, batch_idx, _ = work_tile.tile_idx
+            # Debug: Print which work tile is being processed
             seqlen = SeqlenInfoCls(batch_idx)
+            if const_expr(self.score_mod is not None) and cute.arch.thread_idx()[0] == 128:
+                cute.printf("KERNEL START: m_block=%d head_idx=%d batch_idx=%d offset_q=%d offset_k=%d seqlen_q=%d seqlen_k=%d\n",
+                           m_block, head_idx, batch_idx, seqlen.offset_q, seqlen.offset_k, seqlen.seqlen_q, seqlen.seqlen_k)
             mask = AttentionMaskCls(seqlen.seqlen_q, seqlen.seqlen_k)
             mask_fn = partial(
                 mask.apply_mask,

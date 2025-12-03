@@ -378,12 +378,6 @@ def _flash_attn_fwd(
         or seqused_k is not None
     )
 
-    if score_mod is not None:
-        if is_varlen and pack_gqa:
-            raise NotImplementedError(
-                "Pack GQA not yet supported in variable sequence length score_mod usage. This will be fixed in a future PR."
-            )
-
     if mask_mod is not None:
         if is_varlen:
             raise NotImplementedError(
