@@ -394,7 +394,8 @@ def apply_score_mod_inner(
             kv_idx_local = kv_idx_raw
             if cutlass.const_expr(aux_tensors is not None and fastdiv_mods is not None):
                 _, seqlen_k_divmod = fastdiv_mods
-                _, kv_idx_local = divmod(kv_idx_raw, seqlen_k_divmod)
+                if cutlass.const_expr(seqlen_k_divmod is not None):
+                    _, kv_idx_local = divmod(kv_idx_raw, seqlen_k_divmod)
             kv_idx_local_vec[j] = kv_idx_local
 
             # Global = position in packed tensor
@@ -412,13 +413,16 @@ def apply_score_mod_inner(
                     head_idx_vec[j] = head_idx * qhead_per_kvhead + head_offset
                     q_idx_local = q_idx_local_logical
 
-                # Wrap both local and global when aux_tensors exist (matches KV logic)
+                # Wrap both local and global when seqlen_q_divmod exists
                 if cutlass.const_expr(aux_tensors is not None and fastdiv_mods is not None):
                     seqlen_q_divmod, _ = fastdiv_mods
-                    q_idx_to_wrap = floor_if_packed(q_idx_raw, qhead_per_kvhead)
-                    _, wrapped_idx = divmod(q_idx_to_wrap, seqlen_q_divmod)
-                    q_idx_local_vec[j] = wrapped_idx
-                    q_idx_global_vec[j] = offset_q + wrapped_idx
+                    if cutlass.const_expr(seqlen_q_divmod is not None):
+                        _, wrapped_idx = divmod(q_idx_local, seqlen_q_divmod)
+                        q_idx_local_vec[j] = wrapped_idx
+                        q_idx_global_vec[j] = offset_q + wrapped_idx
+                    else:
+                        q_idx_local_vec[j] = q_idx_local
+                        q_idx_global_vec[j] = offset_q + q_idx_local
                 else:
                     q_idx_local_vec[j] = q_idx_local
                     q_idx_global_vec[j] = offset_q + q_idx_local
@@ -439,13 +443,16 @@ def apply_score_mod_inner(
                     (vec_size,)
                 )
         else:
-            # Wrap both local and global when aux_tensors exist (matches KV logic)
+            # Wrap both local and global when seqlen_q_divmod exists
             if cutlass.const_expr(aux_tensors is not None and fastdiv_mods is not None):
                 seqlen_q_divmod, _ = fastdiv_mods
-                q_idx_to_wrap = floor_if_packed(constant_q_idx, qhead_per_kvhead)
-                _, wrapped_idx = divmod(q_idx_to_wrap, seqlen_q_divmod)
-                q_idx_local = wrapped_idx
-                q_idx_global = offset_q + q_idx_local
+                if cutlass.const_expr(seqlen_q_divmod is not None):
+                    _, wrapped_idx = divmod(constant_q_idx, seqlen_q_divmod)
+                    q_idx_local = wrapped_idx
+                    q_idx_global = offset_q + q_idx_local
+                else:
+                    q_idx_local = constant_q_idx
+                    q_idx_global = offset_q + constant_q_idx
             else:
                 q_idx_local = constant_q_idx
                 q_idx_global = offset_q + constant_q_idx
