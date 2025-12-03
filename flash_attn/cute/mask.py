@@ -493,6 +493,4 @@ class AttentionMask:
                     local_mask = row_idx < row_limit_top
                     if const_expr(self.window_size_left is not None):
                         local_mask |= row_idx > row_limit_bot
-                    acc_S[i] = (
-                        -cutlass.Float32.inf if local_mask else acc_S[i]
-                    )
+                    acc_S[i] = -cutlass.Float32.inf if local_mask else acc_S[i]

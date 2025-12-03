@@ -384,11 +384,19 @@ class FlashAttentionBackwardSm100:
             *(cute.assume(s, divby=128 // t.element_type.width) for s in t.stride[:-1]),
             t.stride[-1],
         )
-        (mdQaccum, mdK, mdV, ) = [
+        (
+            mdQaccum,
+            mdK,
+            mdV,
+        ) = [
             cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t)))
             if t is not None
             else None
-            for t in (mdQaccum, mdK, mdV, )
+            for t in (
+                mdQaccum,
+                mdK,
+                mdV,
+            )
         ]
 
         layout_transpose = [1, 3, 2, 0]  # (b, s, n, h) --> (s, h, n, b)
@@ -1347,7 +1355,9 @@ class FlashAttentionBackwardSm100:
                             copy_stats(
                                 gdPsum[None, m_block],
                                 sdPsum[None, producer_state_dO_dPsum.index],
-                                mbar_ptr=pipeline_dPsum.producer_get_barrier(producer_state_dO_dPsum),
+                                mbar_ptr=pipeline_dPsum.producer_get_barrier(
+                                    producer_state_dO_dPsum
+                                ),
                             )
                         producer_state_dO_dPsum.advance()
 
@@ -2139,8 +2149,12 @@ class FlashAttentionBackwardSm100:
                     # semaphore acquire
                     if const_expr(self.deterministic and stage == 0):
                         if const_expr(self.spt):
-                            if const_expr(self.is_causal or block_info.window_size_right is not None):
-                                n_idx_right = (m_block + 1) * self.tile_m + seqlen.seqlen_k - seqlen.seqlen_q
+                            if const_expr(
+                                self.is_causal or block_info.window_size_right is not None
+                            ):
+                                n_idx_right = (
+                                    (m_block + 1) * self.tile_m + seqlen.seqlen_k - seqlen.seqlen_q
+                                )
                                 if const_expr(block_info.window_size_right is not None):
                                     n_idx_right += block_info.window_size_right
                                 n_block_max_for_m_block = min(
@@ -2200,9 +2214,13 @@ class FlashAttentionBackwardSm100:
                 self.reduce_sync_barrier.arrive_and_wait()
                 # final semaphore release
                 if const_expr(self.deterministic and delay_semaphore_release):
-                    barrier.arrive_inc(mdQ_semaphore_cur[(m_block_max - 1, None)].iterator, tidx, 0, 1)
+                    barrier.arrive_inc(
+                        mdQ_semaphore_cur[(m_block_max - 1, None)].iterator, tidx, 0, 1
+                    )
 
-            if const_expr(self.deterministic and not self.spt and block_info.window_size_left is not None):
+            if const_expr(
+                self.deterministic and not self.spt and block_info.window_size_left is not None
+            ):
                 m_block_global_max = cute.ceil_div(seqlen.seqlen_q, self.tile_m)
                 for m_block in cutlass.range(m_block_max, m_block_global_max, unroll=1):
                     barrier.arrive_inc(mdQ_semaphore_cur[(m_block, None)].iterator, tidx, 0, 1)
