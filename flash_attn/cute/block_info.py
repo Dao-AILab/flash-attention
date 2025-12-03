@@ -63,16 +63,11 @@ class BlockInfo:
             m_idx = n_idx_min + seqlen_info.seqlen_q - seqlen_info.seqlen_k
             m_idx_right = m_idx if const_expr(self.is_causal) else m_idx - self.window_size_right
             m_block_min = max(m_block_min, m_idx_right // self.tile_m)
-            # hack to ensure at least one mainloop iteration
-            # can eliminate once we have early exit for completely masked out work tiles
-            # m_block_min = min(m_block_min, m_block_max - 1)
         if const_expr(self.is_local and self.window_size_left is not None):
             n_idx_max = (n_block + 1) * self.tile_n
             m_idx = n_idx_max + seqlen_info.seqlen_q - seqlen_info.seqlen_k
             m_idx_left = m_idx + self.window_size_left
             m_block_max = min(m_block_max, cute.ceil_div(m_idx_left, self.tile_m))
-            # again, hack to ensure at least one mainloop iteration
-            # m_block_max = max(m_block_min + 1, m_block_max)
         return m_block_min, m_block_max
 
     @cute.jit
