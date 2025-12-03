@@ -29,7 +29,7 @@ from flash_attn.cute.interface import (
 
 
 DISABLE_SPLIT = os.getenv("FLASH_ATTENTION_DISABLE_SPLIT", "FALSE") == "TRUE"
-TEST_BWD = True
+TEST_BWD_ONLY = False
 VERBOSE = True
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
@@ -117,7 +117,7 @@ def test_flash_attn_output(
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
     # dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
     dv_vals = [128] if d == 192 else ([d] if d != 128 else [64, d])
-    if dtype == torch.float8_e4m3fn or TEST_BWD:
+    if dtype == torch.float8_e4m3fn or TEST_BWD_ONLY:
         dv_vals = [d]
     # attention_chunk_vals = [torch.randint(1, seqlen_k * 2, (1,)).item(), 0]
     attention_chunk_vals = [0]
@@ -236,7 +236,7 @@ def test_flash_attn_output(
         # pack_gqa_vals = [False, True, None]
         # SplitKV is not supported for hdim >= 192
         pack_gqa_vals = [False]
-        num_splits_vals = [1, 3] if d < 192 and not DISABLE_SPLIT and not TEST_BWD else [1]
+        num_splits_vals = [1, 3] if d < 192 and not DISABLE_SPLIT and not TEST_BWD_ONLY else [1]
         for pack_gqa, num_splits in itertools.product(pack_gqa_vals, num_splits_vals):
             out, lse = flash_attn_func(
                 q,
