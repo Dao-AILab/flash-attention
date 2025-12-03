@@ -126,11 +126,6 @@ def score_mod_global_kv_bias(
     bias_frag = cute.make_fragment(1, dtype)
     bias_frag[0] = token_bias[kv_frag[0]]
 
-    # # Print both the index and the value read
-    # if cute.arch.thread_idx()[0] == 0 and kv_idx[0] == 0:
-    #     cute.printf("idx=%d, bias_read=%f\n", kv_frag[0], bias_frag[0])
-    #     cute.printf("kv_global=%d bias=%f\n", kv_idx_global[0], token_bias[kv_idx_global[0]])
-
     return tSrS_ssa + (bias_frag.load()).to(cutlass.Float32)
 
 
