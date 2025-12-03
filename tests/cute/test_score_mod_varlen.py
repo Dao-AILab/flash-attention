@@ -7,6 +7,7 @@ import torch
 from cutlass._mlir.dialects import math as mlir_math
 from flash_attn.cute.interface import _flash_attn_fwd
 from score_mod_definitions import (
+    # TensorSSA-based score mods
     score_mod_alibi,
     score_mod_batch_bias,
     score_mod_block_diagonal,
@@ -19,7 +20,6 @@ from score_mod_definitions import (
     score_mod_global_q_and_kv_bias,
     score_mod_global_q_bias,
     score_mod_global_rel_plus_kv_bias,
-    # TensorSSA-based score mods
     score_mod_identity,
     score_mod_rel_bias,
     score_mod_rel_bias_x2,
