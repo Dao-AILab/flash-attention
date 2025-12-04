@@ -73,6 +73,7 @@ def create_softcap_scoremod(softcap_val):
 
     return scoremod_premask_fn
 
+
 def maybe_wrap_score_mod(score_mod):
     """wrap score_mod to accept global indices, needed for varlen sequences"""
     if score_mod is None:
@@ -86,8 +87,9 @@ def maybe_wrap_score_mod(score_mod):
         original = score_mod
 
         @cute.jit
-        def wrapped(tSrS_ssa, batch_idx, head_idx, q_idx, kv_idx, aux_tensors,
-                    q_idx_global, kv_idx_global):
+        def wrapped(
+            tSrS_ssa, batch_idx, head_idx, q_idx, kv_idx, aux_tensors, q_idx_global, kv_idx_global
+        ):
             return original(tSrS_ssa, batch_idx, head_idx, q_idx, kv_idx, aux_tensors)
 
         return wrapped
@@ -95,6 +97,7 @@ def maybe_wrap_score_mod(score_mod):
         return score_mod
     else:
         raise ValueError(f"score_mod must have 6 or 8 parameters, got {num_params}")
+
 
 def convert_from_dlpack(x, leading_dim, alignment=16, divisibility=1) -> cute.Tensor:
     return (
