@@ -1264,7 +1264,7 @@ void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
 // h: num_heads
 // h_k: num_heads_k
 // d: head_size
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_bwd(
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_bwd(
     at::Tensor dout,  // (b, s_q, h, dv) or (total_q, h, dv) if there is cu_seqlens_q
     at::Tensor q,     // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
     at::Tensor k,     // (b, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k
@@ -1563,7 +1563,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tenso
         softmax_d.zero_();
     }
 
-    return { dq, dk, dv, softmax_d, softmax_lse_log2, dq_accum, dk_accum, dv_accum };
+    return { softmax_d, softmax_lse_log2, dq_accum, dk_accum, dv_accum };
 }
 
 std::tuple<at::Tensor, at::Tensor>
@@ -1727,7 +1727,7 @@ TORCH_LIBRARY(flash_attn_3, m) {
         "int window_size_right = -1,"
         "float softcap = 0.0,"
         "bool deterministic = False,"
-        "int sm_margin = 0) -> (Tensor(dq!), Tensor(dk!), Tensor(dv!), Tensor, Tensor, Tensor, Tensor, Tensor)");
+        "int sm_margin = 0) -> (Tensor, Tensor, Tensor, Tensor, Tensor)");
     m.def("fwd_combine("
         "Tensor out_partial,"
         "Tensor lse_partial,"
