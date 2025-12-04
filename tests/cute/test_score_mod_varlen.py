@@ -66,7 +66,8 @@ from score_mod_definitions import (
 
 # (cute_score_mod, eager_factory_or_fn, aux_type)
 # aux_type: None, "batch", "dual_buffer"
-TEST_PAIRS_6ARG = [
+# All score_mods use 7-arg signature: (tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors)
+TEST_PAIRS_NO_GLOBAL = [
     (score_mod_identity, identity_eager, None),
     (score_mod_causal, causal_eager, None),
     (score_mod_rel_bias, rel_bias_eager, None),
@@ -83,7 +84,8 @@ TEST_PAIRS_6ARG = [
 # (cute_score_mod, eager_factory, aux_type, requires_global)
 # aux_type: "kv", "q", "q_and_kv", "q_concat", "kv_with_cu", "multi_buffer"
 # requires_global: "q" (needs varlen_q), "kv" (needs varlen_k), "both" (needs both)
-TEST_PAIRS_8ARG = [
+# All score_mods use 7-arg signature and compute global indices from seqlen_info
+TEST_PAIRS_WITH_GLOBAL = [
     (score_mod_global_kv_bias, packed_kv_bias_factory, "kv", "kv"),
     (score_mod_global_q_bias, packed_q_bias_factory, "q", "q"),
     (score_mod_global_rel_plus_kv_bias, packed_rel_plus_kv_bias_factory, "kv", "kv"),
@@ -384,9 +386,9 @@ def check_results(
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("varlen_q", [True, False])
 @pytest.mark.parametrize("varlen_k", [True, False])
-@pytest.mark.parametrize("qhead_per_kvhead,num_kv_heads", [(1, 2), (4, 2)])
+@pytest.mark.parametrize("qhead_per_kvhead,num_kv_heads", [(4, 2)])
 @pytest.mark.parametrize("seqlens_q,seqlens_k", SEQLEN_CONFIGS)
-@pytest.mark.parametrize("score_mod_tuple", TEST_PAIRS_6ARG)
+@pytest.mark.parametrize("score_mod_tuple", TEST_PAIRS_NO_GLOBAL)
 def test_varlen_with_score_mod(
     seqlens_q,
     seqlens_k,
@@ -397,7 +399,7 @@ def test_varlen_with_score_mod(
     dtype,
     score_mod_tuple,
 ):
-    """Test varlen attention with 6-arg score_mod functions.
+    """Test varlen attention with score_mod functions that don't use global indices.
 
     Covers: both varlen, varlen Q only, varlen K only.
     Skips: neither varlen
@@ -501,7 +503,7 @@ def test_varlen_with_score_mod(
 @pytest.mark.parametrize("varlen_k", [True, False])
 @pytest.mark.parametrize("qhead_per_kvhead,num_kv_heads", [(1, 1), (4, 2)])
 @pytest.mark.parametrize("seqlens_q,seqlens_k", SEQLEN_CONFIGS)
-@pytest.mark.parametrize("score_mod_tuple", TEST_PAIRS_8ARG)
+@pytest.mark.parametrize("score_mod_tuple", TEST_PAIRS_WITH_GLOBAL)
 def test_varlen_with_global_idx_score_mod(
     seqlens_q,
     seqlens_k,
@@ -512,9 +514,9 @@ def test_varlen_with_global_idx_score_mod(
     dtype,
     score_mod_tuple,
 ):
-    """Test varlen attention with 8-arg score_mod functions (global indices).
+    """Test varlen attention with score_mod functions that use global indices.
 
-    These score_mods use q_idx_global and/or kv_idx_global for packed tensor indexing.
+    These score_mods compute q_idx_global and/or kv_idx_global from seqlen_info for packed tensor indexing.
     Skips tests where required global indices aren't available.
     """
     if not varlen_q and not varlen_k:

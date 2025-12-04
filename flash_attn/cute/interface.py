@@ -332,9 +332,6 @@ def _flash_attn_fwd(
     else:
         lse_tensor = None
 
-    # extend score mod to take global indices to match expected signature
-    score_mod = utils.maybe_wrap_score_mod(score_mod)
-
     # hash score and mask mods for compile cache
     score_mod_hash = utils.hash_callable(score_mod) if score_mod is not None else False
     mask_mod_hash = utils.hash_callable(mask_mod) if mask_mod is not None else False

@@ -2441,7 +2441,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             self.qk_acc_dtype,
             aux_tensors,
             fastdiv_mods,
-            seqlen,
+            seqlen_info=seqlen,
             constant_q_idx=None,
             qhead_per_kvhead=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
         )
