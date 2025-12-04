@@ -2635,7 +2635,7 @@ class FlashAttentionForwardSm100:
         m_block,
         n_block,
         softmax,
-        seqlen,
+        seqlen: SeqlenInfoQK,
         aux_tensors=None,
         fastdiv_mods=(None, None),
     ):
@@ -2646,17 +2646,16 @@ class FlashAttentionForwardSm100:
         tScS = thr_mma_qk.partition_C(cS)
         tScS_t2r = thr_tmem_load.partition_D(tScS)
 
-        # Get the q_idx for this tile
+        # Shared q_idx for all scores
         q_idx_logical = tScS_t2r[0][0]
 
-        # For Pack-GQA, compute the logical head index and q_idx for this tile
+        # For Pack-GQA, compute the logical head index for this tile
         if cutlass.const_expr(self.pack_gqa):
-            # q_idx_logical currently includes the head replication
-            # Extract the logical q position and head offset
-            q_idx_logical_adjusted = q_idx_logical // self.qhead_per_kvhead
-            head_offset = q_idx_logical - q_idx_logical_adjusted * self.qhead_per_kvhead
+            # Building up the logical q_head idx: final_q_head = kv_head * qhead_per_kvhead + (q_physical % qhead_per_kvhead)
+            q_physical = q_idx_logical
+            q_idx_logical = q_physical // self.qhead_per_kvhead
+            head_offset = q_physical - q_idx_logical * self.qhead_per_kvhead
             head_idx = head_idx * self.qhead_per_kvhead + head_offset
-            q_idx_logical = q_idx_logical_adjusted
 
         # Recompute fastdiv_mods if necessary
         recompute_fastdiv_mods_q = cutlass.const_expr(
@@ -2676,6 +2675,7 @@ class FlashAttentionForwardSm100:
                 if not recompute_fastdiv_mods_k
                 else FastDivmodDivisor(seqlen.seqlen_k),
             )
+            _, q_idx_logical = divmod(q_idx_logical, seqlen_q_divmod)
 
         apply_score_mod_inner(
             tSrS_t2r,
@@ -2688,7 +2688,7 @@ class FlashAttentionForwardSm100:
             self.qk_acc_dtype,
             aux_tensors,
             fastdiv_mods,
-            seqlen,
+            seqlen_info=seqlen,
             constant_q_idx=q_idx_logical,
             qhead_per_kvhead=self.qhead_per_kvhead if cutlass.const_expr(self.pack_gqa) else 1,
         )

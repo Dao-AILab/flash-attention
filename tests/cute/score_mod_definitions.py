@@ -5,30 +5,31 @@ from cutlass._mlir.dialects import math as mlir_math
 import operator
 
 # =============================================================================
-# 6-argument score_mod functions
+# Score_mod functions that don't use global indices
+# All use signature: (tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors)
 # =============================================================================
 
 
 @cute.jit
-def score_mod_identity(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
+def score_mod_identity(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
     return tSrS_ssa
 
 
 @cute.jit
-def score_mod_causal(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
+def score_mod_causal(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
     mask = operator.ge(q_idx, kv_idx)
     return cute.where(mask, tSrS_ssa, cute.full_like(tSrS_ssa, float("-inf")))
 
 
 @cute.jit
-def score_mod_rel_bias(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
+def score_mod_rel_bias(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
     diff = q_idx - kv_idx
     abs_diff = cute.TensorSSA(mlir_math.absi(diff), diff.shape, diff.dtype)
     return tSrS_ssa + abs_diff.to(cutlass.Float32)
 
 
 @cute.jit
-def score_mod_rel_bias_x2(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
+def score_mod_rel_bias_x2(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
     diff = q_idx - kv_idx
     abs_diff = cute.TensorSSA(mlir_math.absi(diff), diff.shape, diff.dtype)
     scaled = abs_diff * cute.full_like(abs_diff, 2)
@@ -36,12 +37,12 @@ def score_mod_rel_bias_x2(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
 
 
 @cute.jit
-def score_mod_times_two(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
+def score_mod_times_two(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
     return tSrS_ssa * cute.full_like(tSrS_ssa, 2)
 
 
 @cute.jit
-def score_mod_alibi(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
+def score_mod_alibi(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
     score = tSrS_ssa.to(cutlass.Float32)
     slope_exp = (h_idx + cute.full_like(h_idx, 1)) * cute.full_like(h_idx, -8)
     slope = cute.math.exp2(
@@ -54,7 +55,7 @@ def score_mod_alibi(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
 
 
 @cute.jit
-def score_mod_sliding_window(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
+def score_mod_sliding_window(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
     diff = q_idx - kv_idx
     abs_diff = cute.TensorSSA(mlir_math.absi(diff), diff.shape, diff.dtype)
     mask = operator.le(abs_diff, cute.full_like(abs_diff, 256))
@@ -62,7 +63,7 @@ def score_mod_sliding_window(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors)
 
 
 @cute.jit
-def score_mod_block_diagonal(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
+def score_mod_block_diagonal(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
     q_block = q_idx // 64
     kv_block = kv_idx // 64
     mask = operator.eq(q_block, kv_block)
@@ -70,14 +71,14 @@ def score_mod_block_diagonal(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors)
 
 
 @cute.jit
-def score_mod_causal_v2(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
+def score_mod_causal_v2(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
     diff = q_idx - kv_idx
     mask = operator.ge(diff, cute.full_like(diff, 0))
     return cute.where(mask, tSrS_ssa, cute.full_like(tSrS_ssa, float("-inf")))
 
 
 @cute.jit
-def score_mod_batch_bias(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
+def score_mod_batch_bias(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
     batch_bias = aux_tensors[0]
     dtype = batch_bias.element_type
     b_frag = cute.make_fragment(1, cutlass.Int32)
@@ -89,7 +90,7 @@ def score_mod_batch_bias(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
 
 
 @cute.jit
-def score_mod_dual_buffer(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
+def score_mod_dual_buffer(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
     head_bias = aux_tensors[0]
     pos_bias = aux_tensors[1]
     dtype = head_bias.element_type
@@ -110,15 +111,19 @@ def score_mod_dual_buffer(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
 
 
 # =============================================================================
-# 8-argument score_mod functions (with global indices)
+# Score_mod functions that use global indices
+# All use signature: (tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors)
+# Global indices computed as: q_idx_global = q_idx + seqlen_info.offset_q (and similarly for kv)
 # =============================================================================
 
 
 @cute.jit
 def score_mod_global_kv_bias(
-    tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors, q_idx_global, kv_idx_global
+    tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors
 ):
     """Per-token bias using global kv index."""
+    offset_k = seqlen_info.offset_k
+    kv_idx_global = kv_idx + offset_k
     token_bias = aux_tensors[0]
     dtype = token_bias.element_type
     kv_frag = cute.make_fragment(1, cutlass.Int32)
@@ -131,9 +136,11 @@ def score_mod_global_kv_bias(
 
 @cute.jit
 def score_mod_global_q_bias(
-    tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors, q_idx_global, kv_idx_global
+    tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors
 ):
     """Per-token bias using global q index."""
+    offset_q = seqlen_info.offset_q
+    q_idx_global = q_idx + offset_q
     token_bias = aux_tensors[0]
     dtype = token_bias.element_type
     q_frag = cute.make_fragment(1, cutlass.Int32)
@@ -145,9 +152,11 @@ def score_mod_global_q_bias(
 
 @cute.jit
 def score_mod_global_rel_plus_kv_bias(
-    tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors, q_idx_global, kv_idx_global
+    tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors
 ):
     """Relative position (logical) + per-token bias (global kv)."""
+    offset_k = seqlen_info.offset_k
+    kv_idx_global = kv_idx + offset_k
     token_bias = aux_tensors[0]
     dtype = token_bias.element_type
 
@@ -165,9 +174,13 @@ def score_mod_global_rel_plus_kv_bias(
 
 @cute.jit
 def score_mod_global_q_and_kv_bias(
-    tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors, q_idx_global, kv_idx_global
+    tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors
 ):
     """Both q and kv global indices."""
+    offset_q = seqlen_info.offset_q
+    q_idx_global = q_idx + offset_q
+    offset_k = seqlen_info.offset_k
+    kv_idx_global = kv_idx + offset_k
     q_bias = aux_tensors[0]
     kv_bias = aux_tensors[1]
     dtype = q_bias.element_type
@@ -191,9 +204,11 @@ def score_mod_global_q_and_kv_bias(
 
 @cute.jit
 def score_mod_global_logical_rel_plus_kv_bias(
-    tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors, q_idx_global, kv_idx_global
+    tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors
 ):
     """Logical relative + global-indexed per-token bias."""
+    offset_k = seqlen_info.offset_k
+    kv_idx_global = kv_idx + offset_k
     token_bias = aux_tensors[0]
     dtype = token_bias.element_type
 
@@ -209,13 +224,15 @@ def score_mod_global_logical_rel_plus_kv_bias(
     return tSrS_ssa + rel_bias + (bias_frag.load()).to(cutlass.Float32)
 
 
-# "Stress tests" for 8-arg score mods
+# "Stress tests" - score_mods with complex global index usage
 
 @cute.jit
 def score_mod_stress_complex_arithmetic(
-    tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors, q_idx_global, kv_idx_global
+    tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors
 ):
     """All indices in complex arithmetic."""
+    offset_q = seqlen_info.offset_q
+    q_idx_global = q_idx + offset_q
     bias = aux_tensors[0]
     dtype = bias.element_type
 
@@ -239,9 +256,13 @@ def score_mod_stress_complex_arithmetic(
 
 @cute.jit
 def score_mod_stress_conditional_mask(
-    tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors, q_idx_global, kv_idx_global
+    tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors
 ):
     """Conditional masking with global vs logical."""
+    offset_q = seqlen_info.offset_q
+    q_idx_global = q_idx + offset_q
+    offset_k = seqlen_info.offset_k
+    kv_idx_global = kv_idx + offset_k
     token_bias = aux_tensors[0]
     dtype = token_bias.element_type
 
@@ -265,9 +286,13 @@ def score_mod_stress_conditional_mask(
 
 @cute.jit
 def score_mod_stress_multi_buffer(
-    tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors, q_idx_global, kv_idx_global
+    tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors
 ):
     """Multiple aux tensors with different indexing."""
+    offset_q = seqlen_info.offset_q
+    q_idx_global = q_idx + offset_q
+    offset_k = seqlen_info.offset_k
+    kv_idx_global = kv_idx + offset_k
     batch_bias = aux_tensors[0]
     head_scale = aux_tensors[1]
     q_pos_bias = aux_tensors[2]
@@ -320,9 +345,11 @@ def score_mod_stress_multi_buffer(
 
 @cute.jit
 def score_mod_stress_global_offset(
-    tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors, q_idx_global, kv_idx_global
+    tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors
 ):
     """Verify global - logical = offset."""
+    offset_k = seqlen_info.offset_k
+    kv_idx_global = kv_idx + offset_k
     token_bias = aux_tensors[0]
     dtype = token_bias.element_type
 
@@ -336,9 +363,11 @@ def score_mod_stress_global_offset(
 
 @cute.jit
 def score_mod_stress_xor_pattern(
-    tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors, q_idx_global, kv_idx_global
+    tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors
 ):
     """XOR-based pattern using index bits."""
+    offset_k = seqlen_info.offset_k
+    kv_idx_global = kv_idx + offset_k
     token_bias = aux_tensors[0]
     dtype = token_bias.element_type
 
@@ -360,9 +389,11 @@ def score_mod_stress_xor_pattern(
 
 @cute.jit
 def score_mod_debug_global_idx(
-    tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors, q_idx_global, kv_idx_global
+    tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors
 ):
     # Don't read from aux_tensors at all - just add the global index as bias
+    offset_k = seqlen_info.offset_k
+    kv_idx_global = kv_idx + offset_k
     bias = kv_idx_global.to(cutlass.Float32) * cute.full_like(tSrS_ssa, 0.001)
     return tSrS_ssa + bias
 

@@ -265,9 +265,6 @@ def test_cute_vs_flex_attention_with_aux_tensors(
     )
 
 
-@pytest.mark.xfail(
-    raises=NotImplementedError, reason="Varlen with score_mod not yet supported"
-)
 def test_varlen_with_score_mod():
     """Test that varlen (variable length sequences) works with score_mod.
 
