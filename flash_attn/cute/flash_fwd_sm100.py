@@ -1624,10 +1624,10 @@ class FlashAttentionForwardSm100:
                 head_idx=head_idx,
                 aux_tensors=aux_tensors,
             )
-            block_mask_mod = self.mask_mod if const_expr(self.use_block_sparsity) else None
+            mask_mod = self.mask_mod if const_expr(self.mask_mod is not None) else None
             mask_fn = partial(
                 mask.apply_mask_sm100,
-                mask_mod=block_mask_mod,
+                mask_mod=mask_mod,
                 fastdiv_mods=fastdiv_mods,
                 **shared_mask_kwargs,
             )
@@ -1676,7 +1676,6 @@ class FlashAttentionForwardSm100:
                 seqlen=seqlen,
                 aux_tensors=aux_tensors,
                 fastdiv_mods=fastdiv_mods,
-                mask_fn=partial(mask_fn, mask_seqlen=False),
             )
 
             if has_work:
@@ -1865,7 +1864,7 @@ class FlashAttentionForwardSm100:
         cute.arch.mbarrier_wait(mbar_ptr + self.mbar_S_full_offset + stage, mma_si_consumer_phase)
         tSrS_t2r = cute.make_fragment(thr_tmem_load.partition_D(tScS).shape, self.qk_acc_dtype)
         cute.copy(thr_tmem_load, tStS_t2r, tSrS_t2r)
-        # cute.arch.sync_warp()
+
         if cutlass.const_expr(self.score_mod is not None):
             self.apply_score_mod(
                 tSrS_t2r,

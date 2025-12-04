@@ -332,30 +332,8 @@ def _flash_attn_fwd(
     else:
         lse_tensor = None
 
-    def maybe_wrap_score_mod(score_mod):
-        """wrap score_mod to accept global indices, needed for varlen sequences"""
-        if score_mod is None:
-            return None
-
-        sig = inspect.signature(score_mod)
-        num_params = len(sig.parameters)
-
-        if num_params == 6:
-            # Old signature - wrap to accept and ignore global indices
-            original = score_mod
-
-            @cute.jit
-            def wrapped(tSrS_ssa, batch_idx, head_idx, q_idx, kv_idx, aux_tensors,
-                        q_idx_global, kv_idx_global):
-                return original(tSrS_ssa, batch_idx, head_idx, q_idx, kv_idx, aux_tensors)
-
-            return wrapped
-        elif num_params == 8:
-            return score_mod
-        else:
-            raise ValueError(f"score_mod must have 6 or 8 parameters, got {num_params}")
-
-    score_mod = maybe_wrap_score_mod(score_mod)
+    # extend score mod to take global indices to match expected signature
+    score_mod = utils.maybe_wrap_score_mod(score_mod)
 
     # hash score and mask mods for compile cache
     score_mod_hash = utils.hash_callable(score_mod) if score_mod is not None else False
