@@ -2363,6 +2363,8 @@ class FlashAttentionForwardSm100:
             tOcO = gmem_thr_copy_O.partition_S(cO)
             t0OcO = gmem_tiled_copy_O.get_slice(0).partition_S(cO)
             tOpO = utils.predicate_k(tOcO, limit=mO_cur.shape[1])
+            # TODO: the packgqa case isn't correct rn (sometimes IMA), disabling it
+            assert not self.pack_gqa
             pack_gqa = PackGQA(
                 self.m_block_size,
                 self.head_dim_v_padded,
@@ -2455,6 +2457,8 @@ class FlashAttentionForwardSm100:
                     tOcO = gmem_thr_copy_O.partition_S(cO)
                     t0OcO = gmem_tiled_copy_O.get_slice(0).partition_S(cO)
                     tOpO = utils.predicate_k(tOcO, limit=mO.shape[1])
+                    # TODO: the packgqa case isn't correct rn (sometimes IMA), disabling it
+                    assert not self.pack_gqa
                     pack_gqa = PackGQA(
                         self.m_block_size,
                         self.head_dim_v_padded,

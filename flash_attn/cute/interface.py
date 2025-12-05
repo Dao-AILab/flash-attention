@@ -297,6 +297,13 @@ def _flash_attn_fwd(
             n_block_size = 192
 
     if compute_capability == 10:
+        # TODO: fix the varlen case
+        if (
+            pack_gqa
+            and (128 % qhead_per_kvhead != 0)
+            or (cu_seqlens_q is not None or seqused_q is not None)
+        ):
+            pack_gqa = False
         # TODO: fix GQA + SplitKV + non-varlen
         if pack_gqa and num_splits != 1 and cu_seqlens_q is None:
             pack_gqa = False
