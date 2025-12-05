@@ -970,6 +970,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             mask_causal=self.is_causal,
             mask_local=self.is_local,
             fastdiv_mods=fastdiv_mods if const_expr(self.mask_mod is not None) else None,
+            seqlen_info=seqlen,
         )
 
         # First iteration with seqlen masking
@@ -1984,6 +1985,25 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             # shape: (atom_v_m * rest_m)
             m_block, head_idx, batch_idx, _ = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
+
+            # Recompute fastdiv_mods if necessary for varlen with aux_tensors
+            recompute_fastdiv_mods_q = cutlass.const_expr(
+                aux_tensors is not None and seqlen.has_cu_seqlens_q
+            )
+            recompute_fastdiv_mods_k = cutlass.const_expr(
+                aux_tensors is not None and seqlen.has_cu_seqlens_k
+            )
+            if cutlass.const_expr(fastdiv_mods is not None):
+                seqlen_q_divmod, seqlen_k_divmod = fastdiv_mods
+                fastdiv_mods = (
+                    seqlen_q_divmod
+                    if not recompute_fastdiv_mods_q
+                    else FastDivmodDivisor(seqlen.seqlen_q),
+                    seqlen_k_divmod
+                    if not recompute_fastdiv_mods_k
+                    else FastDivmodDivisor(seqlen.seqlen_k),
+                )
+
             mask = AttentionMaskCls(seqlen.seqlen_q, seqlen.seqlen_k)
             mask_fn = partial(
                 mask.apply_mask,
@@ -1995,6 +2015,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 mask_local=self.is_local,
                 aux_tensors=aux_tensors,
                 fastdiv_mods=fastdiv_mods,
+                seqlen_info=seqlen,
             )
             score_mod_fn = None
             if const_expr(self.score_mod is not None):
