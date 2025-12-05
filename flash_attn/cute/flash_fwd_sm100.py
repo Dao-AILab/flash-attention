@@ -334,7 +334,7 @@ class FlashAttentionForwardSm100:
         if const_expr(self.q_dtype != self.v_dtype):
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.v_dtype}")
         self._setup_attributes()
-        self.use_tma_O = self.arch >= 90 and mCuSeqlensQ is None and mSeqUsedQ is None and not self.pack_gqa
+        self.use_tma_O = self.arch >= 90 and mCuSeqlensQ is None and mSeqUsedQ is None
         # This can be tuned
         self.e2e_freq = 16
         if const_expr(
@@ -1624,6 +1624,26 @@ class FlashAttentionForwardSm100:
                 head_idx=head_idx,
                 aux_tensors=aux_tensors,
             )
+
+            # Recompute fastdiv_mods if necessary
+            recompute_fastdiv_mods_q = cutlass.const_expr(
+                aux_tensors is not None and seqlen.has_cu_seqlens_q
+            )
+            recompute_fastdiv_mods_k = cutlass.const_expr(
+                aux_tensors is not None and seqlen.has_cu_seqlens_k
+            )
+
+            if cutlass.const_expr(fastdiv_mods is not None):
+                seqlen_q_divmod, seqlen_k_divmod = fastdiv_mods
+                fastdiv_mods = (
+                    seqlen_q_divmod
+                    if not recompute_fastdiv_mods_q
+                    else FastDivmodDivisor(seqlen.seqlen_q),
+                    seqlen_k_divmod
+                    if not recompute_fastdiv_mods_k
+                    else FastDivmodDivisor(seqlen.seqlen_k),
+                )
+
             mask_mod = self.mask_mod if const_expr(self.mask_mod is not None) else None
             mask_fn = partial(
                 mask.apply_mask_sm100,
@@ -2661,24 +2681,8 @@ class FlashAttentionForwardSm100:
             head_offset = q_physical - q_idx_logical * self.qhead_per_kvhead
             head_idx = head_idx * self.qhead_per_kvhead + head_offset
 
-        # Recompute fastdiv_mods if necessary
-        recompute_fastdiv_mods_q = cutlass.const_expr(
-            aux_tensors is not None and seqlen.has_cu_seqlens_q
-        )
-        recompute_fastdiv_mods_k = cutlass.const_expr(
-            aux_tensors is not None and seqlen.has_cu_seqlens_k
-        )
-
-        if cutlass.const_expr(fastdiv_mods is not None):
-            seqlen_q_divmod, seqlen_k_divmod = fastdiv_mods
-            fastdiv_mods = (
-                seqlen_q_divmod
-                if not recompute_fastdiv_mods_q
-                else FastDivmodDivisor(seqlen.seqlen_q),
-                seqlen_k_divmod
-                if not recompute_fastdiv_mods_k
-                else FastDivmodDivisor(seqlen.seqlen_k),
-            )
+        if cutlass.const_expr(aux_tensors is not None):
+            seqlen_q_divmod, _ = fastdiv_mods
             _, q_idx_logical = divmod(q_idx_logical, seqlen_q_divmod)
 
         apply_score_mod_inner(
