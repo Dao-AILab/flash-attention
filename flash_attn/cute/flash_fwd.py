@@ -2432,25 +2432,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         cS = cute.domain_offset((m_block * self.tile_m, n_block * self.tile_n), cS)
         tScS = thr_mma_qk.partition_C(cS)
 
-        # Recompute fastdiv_mods if necessary
-        recompute_fastdiv_mods_q = cutlass.const_expr(
-            aux_tensors is not None and seqlen.has_cu_seqlens_q
-        )
-        recompute_fastdiv_mods_k = cutlass.const_expr(
-            aux_tensors is not None and seqlen.has_cu_seqlens_k
-        )
-
-        if cutlass.const_expr(fastdiv_mods is not None):
-            seqlen_q_divmod, seqlen_k_divmod = fastdiv_mods
-            fastdiv_mods = (
-                seqlen_q_divmod
-                if not recompute_fastdiv_mods_q
-                else FastDivmodDivisor(seqlen.seqlen_q),
-                seqlen_k_divmod
-                if not recompute_fastdiv_mods_k
-                else FastDivmodDivisor(seqlen.seqlen_k),
-            )
-
         apply_score_mod_inner(
             acc_S,
             tScS,
