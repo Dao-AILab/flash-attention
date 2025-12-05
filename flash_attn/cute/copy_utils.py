@@ -1,11 +1,11 @@
 # Copyright (c) 2025, Wentao Guo, Ted Zadouri, Tri Dao.
 
 import math
-from typing import Optional, Type, Tuple, Callable
+from typing import Optional, Type, Callable
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int32, Boolean, const_expr
+from cutlass import Float32, Int32, const_expr
 from cutlass.cute.nvgpu import cpasync
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cutlass_dsl import T, dsl_user_op
@@ -279,7 +279,7 @@ def cpasync_bulk_get_copy_fn(
             dst[None, dst_idx].iterator,
             size=size,
             **new_kwargs,
-            **kwargs
+            **kwargs,
         )
 
     def copy_bulk_single_stage(**new_kwargs):
