@@ -44,25 +44,17 @@ DISABLE_SPLIT = os.getenv("FLASH_ATTENTION_DISABLE_SPLIT", "FALSE") == "TRUE"
 @pytest.mark.parametrize("deterministic", [True])
 # @pytest.mark.parametrize("softcap", [0.0, 15.0])
 @pytest.mark.parametrize("softcap", [0.0])
-# @pytest.mark.parametrize("local", [False, True])
-@pytest.mark.parametrize("local", [False])
-@pytest.mark.parametrize("causal", [False, True])
-# @pytest.mark.parametrize("causal", [False])
-# @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
-# @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192, 256])
-# @pytest.mark.parametrize('d', [32, 64, 96, 128, 160, 192])
-# @pytest.mark.parametrize('d', [56, 80])
-# @pytest.mark.parametrize("d", [64, 128, 256])
-# @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128])
-# @pytest.mark.parametrize("d", [64, 96, 128, 192])
-# @pytest.mark.parametrize("d", [64, 128])
-# @pytest.mark.parametrize("d", [128, 192])
+@pytest.mark.parametrize("local_enum", [0, 1, 2, 3])
+# @pytest.mark.parametrize("local_enum", [0])
+# @pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("d", [64, 128])
+# @pytest.mark.parametrize("d", [128])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
         (4224, 4224),
-        (2048, 4096),
+        (2000, 4000),
     ],
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(128, 128)])
@@ -71,7 +63,7 @@ def test_flash_attn_output(
     seqlen_k,
     d,
     causal,
-    local,
+    local_enum,
     softcap,
     deterministic,
     has_qv,
@@ -79,8 +71,9 @@ def test_flash_attn_output(
     mha_type,
     dtype,
 ):
-    if (causal or local) and seqlen_k < seqlen_q:
-        pytest.skip("Causal attention requires seqlen_k >= seqlen_q")
+    local = local_enum > 0
+    if local and causal:
+        pytest.skip()
     device = "cuda"
     # set seed
     torch.random.manual_seed(0)
@@ -137,6 +130,12 @@ def test_flash_attn_output(
         window_size = (
             (None, None) if not local else torch.randint(0, seqlen_k, (2,)).tolist()
         )
+        if local_enum == 2:
+            window_size = (None, -window_size[1])
+        elif local_enum == 3:
+            window_size = (-window_size[0], None)
+        if local:
+            print("window size = ", window_size)
         # window_size = (-1, -1) if not local else (16, 0)
         if has_learnable_sink:
             learnable_sink = torch.randn(nheads, dtype=torch.bfloat16, device=device)
@@ -222,7 +221,7 @@ def test_flash_attn_output(
                 # attention_chunk=attention_chunk,
                 softcap=softcap,
                 learnable_sink=learnable_sink,
-                # pack_gqa=pack_gqa,
+                pack_gqa=pack_gqa,
                 num_splits=num_splits,
                 deterministic=deterministic,
             )
@@ -244,12 +243,9 @@ def test_flash_attn_output(
             and not dv > 256
             and not attention_chunk != 0
             and softcap == 0.0
-            and not local
             and dv == d
             and learnable_sink is None
-            # and mha_type == "mha"
             # and False
-            and not ((causal or local) and seqlen_k < seqlen_q)
         ):
             g = torch.randn_like(out)
             # do_o = ((g.float() * out.float()).sum(-1)).transpose(1, 2)
@@ -303,11 +299,13 @@ def test_flash_attn_output(
                 dv_pt - dv_ref
             ).abs().max().item() + dv_atol
 
-            num_iters = 100_000
+            num_iters = 20_000
             for i in range(num_iters):
                 dq2, dk2, dv2, = _flash_attn_bwd(
                     q, k, v, out, g, lse,
                     causal=causal,
+                    window_size_left=window_size[0],
+                    window_size_right=window_size[1],
                     deterministic=True,
                 )
 

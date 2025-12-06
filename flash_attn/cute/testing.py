@@ -260,8 +260,12 @@ def construct_local_mask(
         return col_idx > row_idx + sk - sq + window_size[1]
     else:
         sk = torch.full_like(col_idx, seqlen_k) if key_padding_mask is None else sk
+        if window_size[1] is None:
+            local_mask_left = col_idx > sk
+        else:
+            local_mask_left = col_idx > torch.minimum(row_idx + sk - sq + window_size[1], sk)
         return torch.logical_or(
-            col_idx > torch.minimum(row_idx + sk - sq + window_size[1], sk),
+            local_mask_left,
             torch.logical_and(
                 col_idx < row_idx + sk - sq - window_size[0], col_idx >= sink_token_length
             ),
