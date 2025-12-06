@@ -11,6 +11,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync, warp
+from cutlass import Float32, Int32
 import cutlass.utils as utils_basic
 
 from flash_attn.cute import ampere_helpers as sm80_utils
@@ -373,7 +374,12 @@ class FlashAttentionBackwardSm80:
         mCuSeqlensK: Optional[cute.Tensor] = None,
         mSeqUsedQ: Optional[cute.Tensor] = None,
         mSeqUsedK: Optional[cute.Tensor] = None,
+        softcap: Float32 | float | None = None,
+        window_size_left: Int32 | int | None = None,
+        window_size_right: Int32 | int | None = None,
+        mdQ_semaphore: Optional[cute.Tensor] = None,
     ):
+        assert mdQ_semaphore is None, "semaphore not supported yet"
         # Get the data type and check if it is fp16 or bf16
         self._check_type(*(t.element_type if t is not None else None
                            for t in (mQ, mK, mV, mdO, mLSE, mdPsum, mdQaccum, mdK, mdV, mCuSeqlensQ, mCuSeqlensK, mSeqUsedQ, mSeqUsedK)))
@@ -399,6 +405,7 @@ class FlashAttentionBackwardSm80:
             num_block=cute.ceil_div(mK.shape[1], self.n_block_size),
             num_head=num_head,
             num_batch=num_batch,
+            num_splits=1,
             seqlen_k=0,
             headdim=mK.shape[2],
             headdim_v=mV.shape[2],
@@ -499,10 +506,10 @@ class FlashAttentionBackwardSm80:
         tile_scheduler = TileScheduler.create(tile_sched_params)
         work_tile = tile_scheduler.initial_work_tile_info()
 
-        n_block, head_idx, batch_idx = work_tile.tile_idx
+        n_block, head_idx, batch_idx, _ = work_tile.tile_idx
 
         if work_tile.is_valid_tile:
-            seqlen = SeqlenInfoQK(batch_idx, mQ.shape[1], mK.shape[1], mCuSeqlensQ=mCuSeqlensQ, mCuSeqlensK=mCuSeqlensK, mSeqUsedQ=mSeqUsedQ, mSeqUsedK=mSeqUsedK)
+            seqlen = SeqlenInfoQK.create(batch_idx, mQ.shape[1], mK.shape[1], mCuSeqlensQ=mCuSeqlensQ, mCuSeqlensK=mCuSeqlensK, mSeqUsedQ=mSeqUsedQ, mSeqUsedK=mSeqUsedK)
 
             m_block_max = cute.ceil_div(seqlen.seqlen_q, self.m_block_size)
             m_block_min = 0

@@ -3,13 +3,14 @@
 import math
 import hashlib
 import inspect
-from typing import Type, Callable, Optional, Tuple
+import re
+from typing import Type, Callable, Optional, Tuple, overload
 from functools import partial
 
 import cutlass
 import cutlass.cute as cute
 
-from cutlass import Float32, Int32, const_expr
+from cutlass import Float32, const_expr
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import nvvm, llvm
 from cutlass.cute.runtime import from_dlpack
@@ -23,11 +24,17 @@ sub_packed_f32x2 = partial(
     cute.arch.calc_packed_f32x2_op,
     src_c=None,
     calc_func=nvvm.sub_packed_f32x2,
-    rnd=nvvm.RoundingModeKind.RN
+    rnd=nvvm.RoundingModeKind.RN,
 )
+
 
 def hash_callable(func: Callable) -> str:
     """Hash a callable based on the source code or bytecode and closure values."""
+    if hasattr(func, "__wrapped__"):
+        # cute.jit returns a wrapper whose repr/closure changes per compile; hash the undecorated function.
+        base_func = func.__wrapped__
+        func = base_func
+
     try:
         data = inspect.getsource(func).encode()
     except (OSError, TypeError):
@@ -39,7 +46,7 @@ def hash_callable(func: Callable) -> str:
     hasher = hashlib.sha256(data)
 
     if hasattr(func, "__closure__") and func.__closure__ is not None:
-        for cell in func.__closure__:
+        for idx, cell in enumerate(func.__closure__):
             cell_value = cell.cell_contents
             hasher.update(repr(cell_value).encode())
 
@@ -49,11 +56,13 @@ def hash_callable(func: Callable) -> str:
 def create_softcap_scoremod(softcap_val):
     inv_softcap = 1.0 / softcap_val
 
+    @cute.jit
     def scoremod_premask_fn(acc_S_SSA, batch_idx, head_idx, q_idx, kv_idx, buffers):
         scores = acc_S_SSA * inv_softcap
         return scores * cute.math.tanh(scores, fastmath=True)
 
     return scoremod_premask_fn
+
 
 def convert_from_dlpack(x, leading_dim, alignment=16, divisibility=1) -> cute.Tensor:
     return (
@@ -63,6 +72,18 @@ def convert_from_dlpack(x, leading_dim, alignment=16, divisibility=1) -> cute.Te
             mode=leading_dim, stride_order=x.dim_order(), divisibility=divisibility
         )
     )
+
+
+def convert_from_dlpack_leading_static(
+    x, leading_dim, alignment=16, static_modes=None, stride_order=None
+) -> cute.Tensor:
+    if stride_order is None:
+        stride_order = x.dim_order()
+    x_ = from_dlpack(x, assumed_align=alignment)
+    for i in range(x.ndim):
+        if i != leading_dim and (static_modes is None or i not in static_modes):
+            x_ = x_.mark_compact_shape_dynamic(mode=i, stride_order=stride_order)
+    return x_
 
 
 def make_tiled_copy_A(
@@ -210,6 +231,10 @@ def convert_layout_acc_frgA(acc_layout: cute.Layout) -> cute.Layout:
     return rA_mma_view
 
 
+def make_acc_tensor_frgA_view(acc: cute.Tensor) -> cute.Tensor:
+    return cute.make_tensor(acc.iterator, convert_layout_acc_frgA(acc.layout))
+
+
 def select(a: cute.Tensor, mode: list[int]) -> cute.Tensor:
     return cute.make_tensor(a.iterator, cute.select(a.layout, mode))
 
@@ -219,6 +244,32 @@ def transpose_view(a: cute.Tensor) -> cute.Tensor:
     shape = (a.shape[1], a.shape[0], *a.shape[2:])
     order = (1, 0, *range(2, cute.rank(a)))
     return cute.composition(a, cute.make_ordered_layout(shape, order=order))
+    # stride = (a.layout.stride[1], a.layout.stride[0], *a.layout.stride[2:])
+    # return cute.make_tensor(a.iterator, cute.make_layout(shape, stride=stride))
+
+
+def parse_swizzle_from_pointer(ptr: cute.Pointer) -> cute.Swizzle:
+    """Extract swizzle parameters from a pointer's swizzle_type.
+
+    The swizzle_type string has the form '!cute.swizzle<"S<b,m,s>">' where
+    b, m, s are the swizzle parameters (bits, base, shift).
+
+    Returns:
+        A cute.Swizzle object constructed from the extracted parameters
+
+    Raises:
+        ValueError: If the swizzle_type string cannot be parsed
+    """
+    # Ideally there should be a better API to get swizzle parameters, but we'll just parse
+    # the string here.
+    swizzle_str = str(ptr.type.swizzle_type)
+    # Extract the inner part "S<b,m,s>"
+    match = re.search(r"S<(\d+),(\d+),(\d+)>", swizzle_str)
+    if match:
+        b, m, s = int(match.group(1)), int(match.group(2)), int(match.group(3))
+        return cute.make_swizzle(b, m, s)
+    else:
+        raise ValueError(f"Could not parse swizzle_type: {swizzle_str}")
 
 
 @cute.jit
@@ -252,6 +303,7 @@ def log2f(a: float | Float32, *, loc=None, ip=None) -> Float32:
             asm_dialect=llvm.AsmDialect.AD_ATT,
         )
     )
+
 
 @dsl_user_op
 def logf(a: float | Float32, *, loc=None, ip=None) -> Float32:
@@ -305,7 +357,11 @@ def fmax_reduce(
         # We instead force the 3-input max.
         res = cute.make_fragment(x.shape, Float32)
         res.store(x)
-        local_max_0 = fmax(init_val, res[0], res[1]) if const_expr(init_val is not None) else fmax(res[0], res[1])
+        local_max_0 = (
+            fmax(init_val, res[0], res[1])
+            if const_expr(init_val is not None)
+            else fmax(res[0], res[1])
+        )
         local_max = [
             local_max_0,
             fmax(res[2], res[3]),
@@ -393,7 +449,9 @@ def elem_pointer(x: cute.Tensor, coord: cute.Coord, *, loc=None, ip=None) -> cut
 def elem_pointer_i64(x: cute.Tensor, coord: cute.Coord, *, loc=None, ip=None) -> cute.Pointer:
     flat_coord_i64 = tuple(cutlass.Int64(c) for c in cute.flatten(coord))
     flat_stride = cute.flatten_to_tuple(x.stride)
-    assert len(flat_coord_i64) == len(flat_stride), "Coordinate and stride must have the same length"
+    assert len(flat_coord_i64) == len(flat_stride), (
+        "Coordinate and stride must have the same length"
+    )
     offset = sum(c * s for c, s in zip(flat_coord_i64, flat_stride))
     # HACK: we assume that applying the offset does not change the pointer alignment
     byte_offset = offset * x.element_type.width // 8
@@ -472,7 +530,10 @@ def shr_u32(val: cutlass.Uint32, shift: cutlass.Uint32, *, loc=None, ip=None) ->
     return cutlass.Uint32(
         llvm.inline_asm(
             T.i32(),
-            [cutlass.Uint32(val).ir_value(loc=loc, ip=ip), cutlass.Uint32(shift).ir_value(loc=loc, ip=ip)],
+            [
+                cutlass.Uint32(val).ir_value(loc=loc, ip=ip),
+                cutlass.Uint32(shift).ir_value(loc=loc, ip=ip),
+            ],
             "shr.s32 $0, $1, $2;",
             "=r,r,r",
             has_side_effects=False,
@@ -498,7 +559,9 @@ def warp_prefix_sum(val: cutlass.Int32, lane: Optional[cutlass.Int32] = None) ->
 
 
 @dsl_user_op
-def cvt_f16x2_f32(a: float | Float32, b: float | Float32, to_dtype: Type, *, loc=None, ip=None) -> cutlass.Int32:
+def cvt_f16x2_f32(
+    a: float | Float32, b: float | Float32, to_dtype: Type, *, loc=None, ip=None
+) -> cutlass.Int32:
     assert to_dtype in [cutlass.BFloat16, cutlass.Float16], "to_dtype must be BFloat16 or Float16"
     return cutlass.Int32(
         llvm.inline_asm(
@@ -513,20 +576,48 @@ def cvt_f16x2_f32(a: float | Float32, b: float | Float32, to_dtype: Type, *, loc
     )
 
 
-@cute.jit
-def cvt_f16(src: cute.Tensor, dst: cute.Tensor):
-    assert cute.size(dst.shape) == cute.size(src.shape), "dst and src must have the same size"
-    assert cute.size(src.shape) % 2 == 0, "src must have an even number of elements"
-    assert dst.element_type in [cutlass.BFloat16, cutlass.Float16], "dst must be BFloat16 or Float16"
-    assert src.element_type is Float32, "src must be Float32"
-    dst_i32 = cute.recast_tensor(dst, cutlass.Int32)
-    assert cute.size(dst_i32.shape) * 2 == cute.size(src.shape)
-    for i in cutlass.range_constexpr(cute.size(dst_i32)):
-        dst_i32[i] = cvt_f16x2_f32(src[2 * i], src[2 * i + 1], dst.element_type)
+@overload
+def cvt_f16(src: cute.Tensor, dst: cute.Tensor) -> None: ...
+
+
+@overload
+def cvt_f16(src: cute.Tensor, dtype: Type[cute.Numeric]) -> cute.Tensor: ...
 
 
 @cute.jit
+def cvt_f16(src: cute.Tensor, dst_or_dtype):
+    """Convert Float32 tensor to Float16/BFloat16.
+
+    Args:
+        src: Source tensor with Float32 element type
+        dst_or_dtype: Either a destination tensor or a dtype (Float16/BFloat16)
+
+    Returns:
+        None if dst is a tensor, or a new tensor if dtype is provided
+    """
+    if const_expr(isinstance(dst_or_dtype, type)):
+        # dtype variant: create new tensor and call the tensor variant
+        dtype = dst_or_dtype
+        dst = cute.make_fragment(src.shape, dtype)
+        cvt_f16(src, dst)
+        return dst
+    else:
+        # tensor variant: write to dst
+        dst = dst_or_dtype
+        assert cute.size(dst.shape) == cute.size(src.shape), "dst and src must have the same size"
+        assert cute.size(src.shape) % 2 == 0, "src must have an even number of elements"
+        assert dst.element_type in [cutlass.BFloat16, cutlass.Float16], (
+            "dst must be BFloat16 or Float16"
+        )
+        assert src.element_type is Float32, "src must be Float32"
+        dst_i32 = cute.recast_tensor(dst, cutlass.Int32)
+        assert cute.size(dst_i32.shape) * 2 == cute.size(src.shape)
+        for i in cutlass.range_constexpr(cute.size(dst_i32)):
+            dst_i32[i] = cvt_f16x2_f32(src[2 * i], src[2 * i + 1], dst.element_type)
+
+
 @dsl_user_op
+@cute.jit
 def evaluate_polynomial(x: Float32, poly: Tuple[Float32, ...], *, loc=None, ip=None) -> Float32:
     deg = len(poly) - 1
     out = poly[deg]
@@ -535,9 +626,11 @@ def evaluate_polynomial(x: Float32, poly: Tuple[Float32, ...], *, loc=None, ip=N
     return out
 
 
-@cute.jit
 @dsl_user_op
-def evaluate_polynomial_2(x: Float32, y: Float32, poly: Tuple[Float32, ...], *, loc=None, ip=None) -> Tuple[Float32, Float32]:
+@cute.jit
+def evaluate_polynomial_2(
+    x: Float32, y: Float32, poly: Tuple[Float32, ...], *, loc=None, ip=None
+) -> Tuple[Float32, Float32]:
     deg = len(poly) - 1
     out = (poly[deg], poly[deg])
     for i in cutlass.range_constexpr(deg - 1, -1, -1):
@@ -552,7 +645,7 @@ def add_round_down(x: float | Float32, y: float | Float32, *, loc=None, ip=None)
         llvm.inline_asm(
             T.f32(),
             [Float32(x).ir_value(loc=loc, ip=ip), Float32(y).ir_value(loc=loc, ip=ip)],
-            f"add.rm.ftz.f32 $0, $1, $2;",
+            "add.rm.ftz.f32 $0, $1, $2;",
             "=f,f,f",
             has_side_effects=False,
             is_align_stack=False,
@@ -566,7 +659,10 @@ def combine_int_frac_ex2(x_rounded: Float32, frac_ex2: Float32, *, loc=None, ip=
     return cutlass.Float32(
         llvm.inline_asm(
             T.f32(),
-            [Float32(x_rounded).ir_value(loc=loc, ip=ip), Float32(frac_ex2).ir_value(loc=loc, ip=ip)],
+            [
+                Float32(x_rounded).ir_value(loc=loc, ip=ip),
+                Float32(frac_ex2).ir_value(loc=loc, ip=ip),
+            ],
             "{\n\t"
             ".reg .s32 x_rounded_i, frac_ex_i, x_rounded_e, out_i;\n\t"
             "mov.b32 x_rounded_i, $1;\n\t"
@@ -588,7 +684,12 @@ def combine_int_frac_ex2(x_rounded: Float32, frac_ex2: Float32, *, loc=None, ip=
 @dsl_user_op
 def ex2_emulation(x: Float32, *, loc=None, ip=None) -> Float32:
     # We assume x <= 127.0
-    poly_ex2_deg3 = (1.0, 0.695146143436431884765625, 0.227564394474029541015625, 0.077119089663028717041015625)
+    poly_ex2_deg3 = (
+        1.0,
+        0.695146143436431884765625,
+        0.227564394474029541015625,
+        0.077119089663028717041015625,
+    )
     fp32_round_int = float(2**23 + 2**22)
     x_clamped = cute.arch.fmax(x, -127.0)
     # We want to round down here, so that the fractional part is in [0, 1)
@@ -605,11 +706,18 @@ def ex2_emulation(x: Float32, *, loc=None, ip=None) -> Float32:
 @dsl_user_op
 def ex2_emulation_2(x: Float32, y: Float32, *, loc=None, ip=None) -> Tuple[Float32, Float32]:
     # We assume x <= 127.0 and y <= 127.0
-    poly_ex2_deg3 = (1.0, 0.695146143436431884765625, 0.227564394474029541015625, 0.077119089663028717041015625)
+    poly_ex2_deg3 = (
+        1.0,
+        0.695146143436431884765625,
+        0.227564394474029541015625,
+        0.077119089663028717041015625,
+    )
     fp32_round_int = float(2**23 + 2**22)
     xy_clamped = (cute.arch.fmax(x, -127.0), cute.arch.fmax(y, -127.0))
     # We want to round down here, so that the fractional part is in [0, 1)
-    xy_rounded = cute.arch.add_packed_f32x2(xy_clamped, (fp32_round_int, fp32_round_int), rnd=nvvm.RoundingModeKind.RM)
+    xy_rounded = cute.arch.add_packed_f32x2(
+        xy_clamped, (fp32_round_int, fp32_round_int), rnd=nvvm.RoundingModeKind.RM
+    )
     # The integer floor of x & y are now in the last 8 bits of xy_rounded
     # We want the next 2 ops to round to nearest even. The rounding mode is important.
     xy_rounded_back = sub_packed_f32x2(xy_rounded, (fp32_round_int, fp32_round_int))
@@ -665,8 +773,12 @@ def e2e_asm2(x: Float32, y: Float32, *, loc=None, ip=None) -> Tuple[Float32, Flo
     out0 = Float32(llvm.extractvalue(T.f32(), out_f32x2, [0], loc=loc, ip=ip))
     out1 = Float32(llvm.extractvalue(T.f32(), out_f32x2, [1], loc=loc, ip=ip))
     return out0, out1
+
+
 @dsl_user_op
-def domain_offset_aligned(coord: cute.Coord, tensor: cute.Tensor, *, loc=None, ip=None) -> cute.Tensor:
+def domain_offset_aligned(
+    coord: cute.Coord, tensor: cute.Tensor, *, loc=None, ip=None
+) -> cute.Tensor:
     assert isinstance(tensor.iterator, cute.Pointer)
     # We assume that applying the offset does not change the pointer alignment
     new_ptr = cute.make_ptr(
@@ -682,9 +794,9 @@ def domain_offset_aligned(coord: cute.Coord, tensor: cute.Tensor, *, loc=None, i
 def domain_offset_i64(coord: cute.Coord, tensor: cute.Tensor, *, loc=None, ip=None) -> cute.Tensor:
     flat_coord_i64 = tuple(cutlass.Int64(c) for c in cute.flatten(coord))
     flat_stride = cute.flatten_to_tuple(tensor.stride)
-    assert len(flat_coord_i64) == len(
-        flat_stride
-    ), "Coordinate and stride must have the same length"
+    assert len(flat_coord_i64) == len(flat_stride), (
+        "Coordinate and stride must have the same length"
+    )
     offset = sum(c * s for c, s in zip(flat_coord_i64, flat_stride))
     assert isinstance(tensor.iterator, cute.Pointer)
     # HACK: we assume that applying the offset does not change the pointer alignment
@@ -710,13 +822,20 @@ def coord_offset_i64(
         tensor.memspace,
         assumed_align=tensor.iterator.max_alignment,
     )
-    new_layout = cute.slice_(tensor.layout, (*[None] * dim, 0, *[None] * (cute.rank(tensor) - dim - 1)))
+    new_layout = cute.slice_(
+        tensor.layout, (*[None] * dim, 0, *[None] * (cute.rank(tensor) - dim - 1))
+    )
     return cute.make_tensor(new_ptr, new_layout)
 
 
 @cute.jit
 def scalar_to_ssa(a: cute.Numeric, dtype) -> cute.TensorSSA:
-    """ Convert a scalar to a cute TensorSSA of shape (1,) and given dtype """
+    """Convert a scalar to a cute TensorSSA of shape (1,) and given dtype"""
     vec = cute.make_fragment(1, dtype)
     vec[0] = a
     return vec.load()
+
+
+def ssa_to_scalar(val):
+    """Could inline but nice for reflecting the above api"""
+    return val[0]

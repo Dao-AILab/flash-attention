@@ -99,7 +99,9 @@ def generate_random_padding_mask(max_seqlen, batch_size, device, mode="random", 
             if i % 5 == 0:
                 lengths[i] = 0
         lengths[-1] = 0
-    padding_mask = repeat(torch.arange(max_seqlen, device=device), "s -> b s", b=batch_size) < lengths
+    padding_mask = (
+        repeat(torch.arange(max_seqlen, device=device), "s -> b s", b=batch_size) < lengths
+    )
     return padding_mask
 
 
@@ -129,7 +131,9 @@ def generate_qkv(
         q_unpad, indices_q, cu_seqlens_q, max_seqlen_q, seqused_q = unpad_input(
             q, query_padding_mask, query_unused_mask
         )
-        output_pad_fn = lambda output_unpad: pad_input(output_unpad, indices_q, batch_size, seqlen_q)
+        output_pad_fn = lambda output_unpad: pad_input(
+            output_unpad, indices_q, batch_size, seqlen_q
+        )
         qv_unpad = rearrange(qv, "b s ... -> (b s) ...")[indices_q] if qv is not None else None
     else:
         q_unpad = rearrange(q, "b s h d -> (b s) h d")
@@ -138,7 +142,9 @@ def generate_qkv(
         )
         seqused_q = None
         max_seqlen_q = seqlen_q
-        output_pad_fn = lambda output_unpad: rearrange(output_unpad, "(b s) h d -> b s h d", b=batch_size)
+        output_pad_fn = lambda output_unpad: rearrange(
+            output_unpad, "(b s) h d -> b s h d", b=batch_size
+        )
         qv_unpad = rearrange(qv, "b s ... -> (b s) ...") if qv is not None else None
 
     if key_padding_mask is not None:
@@ -254,9 +260,15 @@ def construct_local_mask(
         return col_idx > row_idx + sk - sq + window_size[1]
     else:
         sk = torch.full_like(col_idx, seqlen_k) if key_padding_mask is None else sk
+        if window_size[1] is None:
+            local_mask_left = col_idx > sk
+        else:
+            local_mask_left = col_idx > torch.minimum(row_idx + sk - sq + window_size[1], sk)
         return torch.logical_or(
-            col_idx > torch.minimum(row_idx + sk - sq + window_size[1], sk),
-            torch.logical_and(col_idx < row_idx + sk - sq - window_size[0], col_idx >= sink_token_length),
+            local_mask_left,
+            torch.logical_and(
+                col_idx < row_idx + sk - sq - window_size[0], col_idx >= sink_token_length
+            ),
         )
 
 
@@ -368,7 +380,9 @@ def attention_ref(
             key_leftpad=key_leftpad,
             device=q.device,
         )
-        local_mask = torch.logical_or(local_mask, chunk_mask) if local_mask is not None else chunk_mask
+        local_mask = (
+            torch.logical_or(local_mask, chunk_mask) if local_mask is not None else chunk_mask
+        )
     if local_mask is not None:
         scores.masked_fill_(local_mask, float("-inf"))
     if attn_bias is not None:

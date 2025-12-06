@@ -7,7 +7,7 @@ name = "flash-attn-cute"
 version = "0.1.0"
 description = "Flash Attention CUTE (CUDA Template Engine) implementation"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.10"
 license = {text = "BSD 3-Clause License"}
 authors = [
     {name = "Tri Dao"},
@@ -16,13 +16,16 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "License :: OSI Approved :: BSD License",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
 ]
 
 dependencies = [
-    "nvidia-cutlass-dsl==4.2.1",
+    "nvidia-cutlass-dsl==4.3.0",
     "torch",
     "einops",
+    "typing_extensions",
 ]
 
 [project.optional-dependencies]

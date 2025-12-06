@@ -43,7 +43,7 @@ jobs:
     name: Build wheel (${{ inputs.release-version }}-${{ inputs.python-version }}-${{ inputs.cuda-version }}-${{ inputs.torch-version }}-${{ inputs.cxx11_abi }})
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ inputs.release-version }}
           submodules: recursive
@@ -77,7 +77,7 @@ jobs:
 
       - name: Install CUDA ${{ inputs.cuda-version }}
         if: ${{ inputs.cuda-version != 'cpu' }}
-        uses: Jimver/cuda-toolkit@v0.2.27
+        uses: Jimver/cuda-toolkit@v0.2.29
         id: cuda-toolkit
         with:
           cuda: ${{ inputs.cuda-version }}
