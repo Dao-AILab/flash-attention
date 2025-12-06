@@ -22,6 +22,7 @@
 # - bwd pass optimized for Hopper/Blackwell
 
 import math
+import inspect
 from typing import Optional, Tuple, Callable
 
 import torch
@@ -107,7 +108,7 @@ def _flash_attn_fwd(
         ...
         score_mod: A callable that takes the attention scores and applies a modification.
         mask_mod: A callable that takes token position information and selectively masks
-        block_sparse_tensors: A tuple of tensors used for block sparsity. 
+        block_sparse_tensors: A tuple of tensors used for block sparsity.
         return_lse: Whether to return the log softmax of the attention scores. If set to True will always calculate
         out: Optional pre-allocated output tensor. If None, will be allocated internally.
         lse: Optional pre-allocated log-sum-exp tensor. If None, will be allocated when needed.
@@ -306,6 +307,7 @@ def _flash_attn_fwd(
     if compute_capability == 9:  # TODO: tune block size according to hdim.
         if head_dim == head_dim_v == 128 and not causal and not local and not use_block_sparsity:
             n_block_size = 192
+
     if compute_capability == 10:
         # TODO: fix the varlen case
         if (
@@ -347,7 +349,7 @@ def _flash_attn_fwd(
     elif lse is not None:
         lse_tensor = from_dlpack(lse.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=lse.ndim - 1)
     else:
-        lse_tensor = None 
+        lse_tensor = None
 
     # hash score and mask mods for compile cache
     score_mod_hash = utils.hash_callable(score_mod) if score_mod is not None else False
@@ -363,11 +365,6 @@ def _flash_attn_fwd(
         or seqused_q is not None
         or seqused_k is not None
     )
-    if score_mod is not None:
-        if is_varlen:
-            raise NotImplementedError(
-                "score_mod with aux_tensors is not yet supported for varlen sequences. This will be fixed in a future PR."
-            )
 
     if mask_mod is not None:
         if is_varlen:

@@ -1624,6 +1624,26 @@ class FlashAttentionForwardSm100:
                 head_idx=head_idx,
                 aux_tensors=aux_tensors,
             )
+
+            # Recompute fastdiv_mods if necessary
+            recompute_fastdiv_mods_q = cutlass.const_expr(
+                aux_tensors is not None and seqlen.has_cu_seqlens_q
+            )
+            recompute_fastdiv_mods_k = cutlass.const_expr(
+                aux_tensors is not None and seqlen.has_cu_seqlens_k
+            )
+
+            if cutlass.const_expr(fastdiv_mods is not None):
+                seqlen_q_divmod, seqlen_k_divmod = fastdiv_mods
+                fastdiv_mods = (
+                    seqlen_q_divmod
+                    if not recompute_fastdiv_mods_q
+                    else FastDivmodDivisor(seqlen.seqlen_q),
+                    seqlen_k_divmod
+                    if not recompute_fastdiv_mods_k
+                    else FastDivmodDivisor(seqlen.seqlen_k),
+                )
+
             mask_mod = self.mask_mod if const_expr(self.mask_mod is not None) else None
             mask_fn = partial(
                 mask.apply_mask_sm100,
@@ -1864,6 +1884,7 @@ class FlashAttentionForwardSm100:
         cute.arch.mbarrier_wait(mbar_ptr + self.mbar_S_full_offset + stage, mma_si_consumer_phase)
         tSrS_t2r = cute.make_fragment(thr_tmem_load.partition_D(tScS).shape, self.qk_acc_dtype)
         cute.copy(thr_tmem_load, tStS_t2r, tSrS_t2r)
+
         if cutlass.const_expr(self.score_mod is not None):
             self.apply_score_mod(
                 tSrS_t2r,
@@ -1874,6 +1895,7 @@ class FlashAttentionForwardSm100:
                 m_block,
                 n_block,
                 softmax,
+                seqlen,
                 aux_tensors,
                 fastdiv_mods,
             )
@@ -2369,7 +2391,7 @@ class FlashAttentionForwardSm100:
                 self.check_hdim_v_oob,
                 self.qhead_per_kvhead,
             )
-        
+
             # load acc O from smem to rmem for wider vectorization
             tOrO = cute.make_fragment_like(tOsO, self.o_dtype)
             cute.autovec_copy(tOsO, tOrO)
@@ -2637,13 +2659,14 @@ class FlashAttentionForwardSm100:
         m_block,
         n_block,
         softmax,
+        seqlen: SeqlenInfoQK,
         aux_tensors=None,
         fastdiv_mods=(None, None),
     ):
         """Apply score modification for SM100 (constant q_idx)."""
         # Prepare index tensor with extra partition
         cS = cute.make_identity_tensor((self.m_block_size, self.n_block_size))
-        cS = cute.domain_offset((m_block * self.m_block_size, n_block * self.n_block_size), cS)
+        cS = cute.domain_offset((m_block * self.m_block_size , n_block * self.n_block_size), cS)
         tScS = thr_mma_qk.partition_C(cS)
         tScS_t2r = thr_tmem_load.partition_D(tScS)
 
@@ -2673,6 +2696,7 @@ class FlashAttentionForwardSm100:
             self.qk_acc_dtype,
             aux_tensors,
             fastdiv_mods,
+            seqlen_info=seqlen,
             constant_q_idx=q_idx_logical,
             qhead_per_kvhead=self.qhead_per_kvhead if cutlass.const_expr(self.pack_gqa) else 1,
         )
