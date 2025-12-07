@@ -29,10 +29,20 @@ sub_packed_f32x2 = partial(
 
 
 def hash_callable(func: Callable) -> str:
-    """Hash a callable based on the source code or bytecode and closure values."""
+    """Hash a callable based on the source code or bytecode and closure values.
+
+    Fast-path: if the callable (or its __wrapped__ base) has a ``__cute_hash__``
+    attribute, that value is returned immediately. Code-generation backends such
+    as Inductor can set this attribute to avoid expensive runtime hashing.
+    """
+    if hasattr(func, "__cute_hash__"):
+        return func.__cute_hash__
+
+    # Unwrap decorated functions (e.g., cute.jit wrappers).
     if hasattr(func, "__wrapped__"):
-        # cute.jit returns a wrapper whose repr/closure changes per compile; hash the undecorated function.
         base_func = func.__wrapped__
+        if hasattr(base_func, "__cute_hash__"):
+            return base_func.__cute_hash__
         func = base_func
 
     try:
