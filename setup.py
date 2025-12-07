@@ -145,7 +145,7 @@ def add_cuda_gencodes(cc_flag, archs, bare_metal_version):
         cc_flag += ["-gencode", f"arch=compute_{newest},code=compute_{newest}"]
 
     return cc_flag
-    
+
 
 def get_hip_version():
     return parse(torch.version.hip.split()[-1].rstrip('-').replace('-', '+'))
@@ -436,7 +436,7 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
                         "csrc/flash_attn_ck/mha_varlen_bwd.cu",
                         "csrc/flash_attn_ck/mha_varlen_fwd.cu"] + glob.glob(f"build/fmha_*wd*.cu")
 
-        cc_flag += ["-O3","-std=c++17",
+        cc_flag += ["-O3","-std=c++20",
                     "-DCK_TILE_FMHA_FWD_FAST_EXP2=1",
                     "-fgpu-flush-denormals-to-zero",
                     "-DCK_ENABLE_BF16",
@@ -468,7 +468,7 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
             cc_flag += ["-mllvm", "-amdgpu-coerce-illegal-types=1"]
 
         extra_compile_args = {
-            "cxx": ["-O3", "-std=c++17"] + generator_flag + maybe_hipify_v2_flag,
+            "cxx": ["-O3", "-std=c++20"] + generator_flag + maybe_hipify_v2_flag,
             "nvcc": cc_flag + generator_flag + maybe_hipify_v2_flag,
         }
 
