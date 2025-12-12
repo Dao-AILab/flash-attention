@@ -658,7 +658,11 @@ class FlashAttentionForwardSm100:
             seqlen_q = cute.size(mQ.shape[0]) // (
                 self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1
             )
-            seqlen_k = cute.size(mK.shape[0])
+            seqlen_k = (
+                cute.size(mK.shape[0])
+                if const_expr(mPageTable is None)
+                else mK.shape[0] * mPageTable.shape[1]
+            )
             seqlen_q_divmod = FastDivmodDivisor(seqlen_q)
             seqlen_k_divmod = FastDivmodDivisor(seqlen_k)
             fastdiv_mods = (seqlen_q_divmod, seqlen_k_divmod)
@@ -1627,10 +1631,10 @@ class FlashAttentionForwardSm100:
 
             # Recompute fastdiv_mods if necessary
             recompute_fastdiv_mods_q = cutlass.const_expr(
-                aux_tensors is not None and seqlen.has_cu_seqlens_q
+                aux_tensors is not None and (seqlen.has_cu_seqlens_q or seqlen.has_seqused_q)
             )
             recompute_fastdiv_mods_k = cutlass.const_expr(
-                aux_tensors is not None and seqlen.has_cu_seqlens_k
+                aux_tensors is not None and (seqlen.has_cu_seqlens_k or seqlen.has_seqused_k)
             )
 
             if cutlass.const_expr(fastdiv_mods is not None):
