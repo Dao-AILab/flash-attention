@@ -42,6 +42,8 @@ class SeqlenInfoQK:
     seqlen_k: cutlass.Int32
     has_cu_seqlens_q: cutlass.Constexpr[bool]
     has_cu_seqlens_k: cutlass.Constexpr[bool]
+    has_seqused_q: cutlass.Constexpr[bool]
+    has_seqused_k: cutlass.Constexpr[bool]
 
     @staticmethod
     def create(
@@ -73,8 +75,17 @@ class SeqlenInfoQK:
             )
         has_cu_seqlens_q: int = mCuSeqlensQ is not None
         has_cu_seqlens_k: int = mCuSeqlensK is not None
+        has_seqused_q: int = mSeqUsedQ is not None
+        has_seqused_k: int = mSeqUsedK is not None
         return SeqlenInfoQK(
-            offset_q, offset_k, seqlen_q, seqlen_k, has_cu_seqlens_q, has_cu_seqlens_k
+            offset_q,
+            offset_k,
+            seqlen_q,
+            seqlen_k,
+            has_cu_seqlens_q,
+            has_cu_seqlens_k,
+            has_seqused_q,
+            has_seqused_k,
         )
 
     def offset_batch_Q(self, mQ: cute.Tensor, batch_idx: Int32, dim: int) -> cute.Tensor:
