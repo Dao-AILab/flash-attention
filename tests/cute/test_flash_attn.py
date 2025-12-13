@@ -29,7 +29,8 @@ from flash_attn.cute.interface import (
 
 
 DISABLE_SPLIT = os.getenv("FLASH_ATTENTION_DISABLE_SPLIT", "FALSE") == "TRUE"
-
+TEST_BWD_ONLY = False
+VERBOSE = True
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
@@ -43,8 +44,8 @@ DISABLE_SPLIT = os.getenv("FLASH_ATTENTION_DISABLE_SPLIT", "FALSE") == "TRUE"
 @pytest.mark.parametrize("deterministic", [False])
 # @pytest.mark.parametrize("softcap", [0.0, 15.0])
 @pytest.mark.parametrize("softcap", [0.0])
-@pytest.mark.parametrize("local", [False, True])
-# @pytest.mark.parametrize("local", [False])
+@pytest.mark.parametrize("local_enum", [0, 1, 2, 3])
+# @pytest.mark.parametrize("local_enum", [0])
 @pytest.mark.parametrize("causal", [False, True])
 # @pytest.mark.parametrize("causal", [True])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
@@ -56,7 +57,7 @@ DISABLE_SPLIT = os.getenv("FLASH_ATTENTION_DISABLE_SPLIT", "FALSE") == "TRUE"
 # @pytest.mark.parametrize("d", [64, 96, 128, 192])
 # @pytest.mark.parametrize("d", [64, 128])
 # @pytest.mark.parametrize("d", [128, 192])
-@pytest.mark.parametrize("d", [128])
+@pytest.mark.parametrize("d", [64, 128])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -92,7 +93,7 @@ def test_flash_attn_output(
     seqlen_k,
     d,
     causal,
-    local,
+    local_enum,
     softcap,
     deterministic,
     has_qv,
@@ -100,8 +101,9 @@ def test_flash_attn_output(
     mha_type,
     dtype,
 ):
-    if (causal or local) and seqlen_k < seqlen_q:
-        pytest.skip("Causal attention requires seqlen_k >= seqlen_q")
+    local = local_enum > 0
+    if local and causal:
+        pytest.skip()
     device = "cuda"
     # set seed
     torch.random.manual_seed(0)
@@ -115,7 +117,7 @@ def test_flash_attn_output(
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
     # dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
     dv_vals = [128] if d == 192 else ([d] if d != 128 else [64, d])
-    if dtype == torch.float8_e4m3fn:
+    if dtype == torch.float8_e4m3fn or TEST_BWD_ONLY:
         dv_vals = [d]
     # attention_chunk_vals = [torch.randint(1, seqlen_k * 2, (1,)).item(), 0]
     attention_chunk_vals = [0]
@@ -157,6 +159,12 @@ def test_flash_attn_output(
         window_size = (
             (None, None) if not local else torch.randint(0, seqlen_k, (2,)).tolist()
         )
+        if local_enum == 2:
+            window_size = (None, -window_size[1])
+        elif local_enum == 3:
+            window_size = (-window_size[0], None)
+        if local:
+            print("window size = ", window_size)
         # window_size = (-1, -1) if not local else (16, 0)
         if has_learnable_sink:
             learnable_sink = torch.randn(nheads, dtype=torch.bfloat16, device=device)
@@ -228,7 +236,7 @@ def test_flash_attn_output(
         # pack_gqa_vals = [False, True, None]
         # SplitKV is not supported for hdim >= 192
         pack_gqa_vals = [False]
-        num_splits_vals = [1] # [1, 3] if d < 192 and not DISABLE_SPLIT else [1]
+        num_splits_vals = [1, 3] if d < 192 and not DISABLE_SPLIT and not TEST_BWD_ONLY else [1]
         for pack_gqa, num_splits in itertools.product(pack_gqa_vals, num_splits_vals):
             out, lse = flash_attn_func(
                 q,
@@ -241,8 +249,9 @@ def test_flash_attn_output(
                 # attention_chunk=attention_chunk,
                 softcap=softcap,
                 learnable_sink=learnable_sink,
-                # pack_gqa=pack_gqa,
+                pack_gqa=pack_gqa,
                 num_splits=num_splits,
+                deterministic=deterministic,
             )
             print(f"Output max diff: {(out - out_ref).abs().max().item()}")
             print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
@@ -262,10 +271,8 @@ def test_flash_attn_output(
             and not dv > 256
             and not attention_chunk != 0
             and softcap == 0.0
-            and not local
             and dv == d
             and learnable_sink is None
-            # and mha_type == "mha"
             # and False
         ):
             g = torch.randn_like(out)
@@ -300,6 +307,26 @@ def test_flash_attn_output(
             print(f"dQ Pytorch mean diff: {(dq_pt - dq_ref).abs().mean().item()}")
             print(f"dK Pytorch mean diff: {(dk_pt - dk_ref).abs().mean().item()}")
             print(f"dV Pytorch mean diff: {(dv_pt - dv_ref).abs().mean().item()}")
+            
+            if VERBOSE:
+                diff_dq = (dq - dq_ref).abs()
+                max_idx = diff_dq.argmax()
+                coords = torch.unravel_index(max_idx, diff_dq.shape)
+                print(f"dQ max diff: {diff_dq.max().item()}")
+                print(f"  at coordinates {tuple(c.item() for c in coords)}: dQ={dq[coords].item()}, dQ_ref={dq_ref[coords].item()}")
+
+                diff_dk = (dk - dk_ref).abs()
+                max_idx = diff_dk.argmax()
+                coords = torch.unravel_index(max_idx, diff_dk.shape)
+                print(f"dK max diff: {diff_dk.max().item()}")
+                print(f"  at coordinates {tuple(c.item() for c in coords)}: dK={dk[coords].item()}, dK_ref={dk_ref[coords].item()}")
+
+                diff_dv = (dv - dv_ref).abs()
+                max_idx = diff_dv.argmax()
+                coords = torch.unravel_index(max_idx, diff_dv.shape)
+                print(f"dV max diff: {diff_dv.max().item()}")
+                print(f"  at coordinates {tuple(c.item() for c in coords)}: dV={dv[coords].item()}, dV_ref={dv_ref[coords].item()}")
+
             # breakpoint()
             dq_atol = 2 * (dq_ref + 0.3 - 0.3 - dq_ref).abs().max().item() + (
                 0 if softcap == 0 else 3e-4
@@ -388,7 +415,7 @@ def test_flash_attn_varlen_output(
 ):
     if (
         causal or local
-    ):  # Right now we only support causal attention with seqlen_k == seqlen_q
+    ):  # Right now reference only supports causal attention with seqlen_k == seqlen_q
         seqlen_k = seqlen_q
     device = "cuda"
     # set seed
@@ -572,7 +599,8 @@ def test_flash_attn_varlen_output(
         fwd_atol = 2 * (out_ref + 0.3 - 0.3 - out_ref).abs().max().item()
         rtol = 2 if softcap == 0.0 else 3
 
-        pack_gqa_vals = [False, True, None]
+        # pack_gqa_vals = [False, True, None]
+        pack_gqa_vals = [False]
         # num_splits_vals = [1, 3]
         # SplitKV is not supported for hdim >= 192
         num_splits_vals = [1, 3] if d < 192 and not DISABLE_SPLIT else [1]
@@ -721,8 +749,8 @@ def test_flash_attn_varlen_output(
 @pytest.mark.parametrize("new_kv", [False])
 @pytest.mark.parametrize("local", [False, True])
 # @pytest.mark.parametrize("local", [False])
-# @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("causal", [True])
+@pytest.mark.parametrize("causal", [False, True])
+# @pytest.mark.parametrize("causal", [True])
 # @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True, False])
 @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [False])
 # @pytest.mark.parametrize("has_rotary_seqlens", [False, True])
@@ -738,14 +766,14 @@ def test_flash_attn_varlen_output(
 @pytest.mark.parametrize("has_leftpad", [False])
 # @pytest.mark.parametrize("has_batch_idx", [False, True])
 @pytest.mark.parametrize("has_batch_idx", [False])
-# @pytest.mark.parametrize("varlen_q", [False, True])
-@pytest.mark.parametrize("varlen_q", [False])
+@pytest.mark.parametrize("varlen_q", [False, True])
+# @pytest.mark.parametrize("varlen_q", [False])
 # @pytest.mark.parametrize("d", [32, 59, 64, 80, 128, 256])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192])
 # @pytest.mark.parametrize('d', [56, 80])
 # @pytest.mark.parametrize("d", [128])
-@pytest.mark.parametrize("d", [64])
+@pytest.mark.parametrize("d", [64, 128])
 # @pytest.mark.parametrize("d", [192])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",

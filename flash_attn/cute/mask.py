@@ -92,6 +92,7 @@ class AttentionMask:
         mask_local: cutlass.Constexpr[bool] = False,
         mask_mod: cutlass.Constexpr[Optional[Callable]] = None,
         aux_tensors: Optional[list] = None,
+        fastdiv_mods=(None, None),
     ) -> None:
         assert not (mask_causal and mask_local), "mask_causal and mask_local cannot be both True"
         acc_S_mn = utils.make_acc_tensor_mn_view(acc_S, transpose=self.swap_AB)
@@ -131,24 +132,33 @@ class AttentionMask:
             nrow = const_expr(cute.size(tScS_mn.shape[0]))
             ncol = const_expr(cute.size(tScS_mn.shape[1]))
             thr_col_offset = tScS_mn[0, 0][1]
+            has_fastdiv = const_expr(
+                fastdiv_mods is not None
+                and fastdiv_mods[0] is not None
+                and fastdiv_mods[1] is not None
+            )
+            wrap_aux_indices = const_expr(
+                has_fastdiv and mask_seqlen and const_expr(aux_tensors is not None)
+            )
 
             for r in cutlass.range_constexpr(nrow):
                 global_row_idx = tScS_mn[r, 0][0] + m_block * self.tile_m
+                row_for_mod = global_row_idx
+                if const_expr(wrap_aux_indices):
+                    _, row_for_mod = divmod(global_row_idx, fastdiv_mods[0])
 
                 for col in cutlass.range_constexpr(ncol):
                     col_idx_local = t0ScS_mn[0, col][1]
                     # Convert to absolute column index
                     global_col_idx = thr_col_offset + col_idx_local + n_block * self.tile_n
+                    col_for_mod = global_col_idx
+                    if const_expr(wrap_aux_indices):
+                        _, col_for_mod = divmod(global_col_idx, fastdiv_mods[1])
 
                     batch_idx_ssa = utils.scalar_to_ssa(batch_idx, cutlass.Int32)
                     head_idx_ssa = utils.scalar_to_ssa(head_idx, cutlass.Int32)
-                    q_idx_ssa = utils.scalar_to_ssa(
-                        tScS_mn[r, 0][0] + m_block * self.tile_m, cutlass.Int32
-                    )
-                    kv_idx_ssa = utils.scalar_to_ssa(
-                        thr_col_offset + t0ScS_mn[0, col][1] + n_block * self.tile_n,
-                        cutlass.Int32,
-                    )
+                    q_idx_ssa = utils.scalar_to_ssa(row_for_mod, cutlass.Int32)
+                    kv_idx_ssa = utils.scalar_to_ssa(col_for_mod, cutlass.Int32)
                     mask_value = mask_mod(
                         batch_idx_ssa,
                         head_idx_ssa,
@@ -229,10 +239,10 @@ class AttentionMask:
                             )
                         if const_expr(self.window_size_right is not None):
                             col_limit_right = row_idx + local_row_offset_right
-                            if const_expr(mask_seqlen):
-                                col_limit_right = cutlass.min(col_limit_right, seqlenk_col_limit)
                         else:
                             col_limit_right = self.tile_n
+                        if const_expr(mask_seqlen):
+                            col_limit_right = cutlass.min(col_limit_right, seqlenk_col_limit)
                         col_limit_left = (
                             row_idx + local_row_offset_left
                             if const_expr(self.window_size_left is not None)
@@ -298,6 +308,11 @@ class AttentionMask:
         mask_seqlen: cutlass.Constexpr[bool],
         mask_causal: cutlass.Constexpr[bool],
         mask_local: cutlass.Constexpr[bool] = False,
+        mask_mod: cutlass.Constexpr[Optional[Callable]] = None,
+        batch_idx: Int32 = None,
+        head_idx: Int32 = None,
+        aux_tensors: Optional[list] = None,
+        fastdiv_mods=(None, None),
     ) -> None:
         assert not (mask_causal and mask_local), "mask_causal and mask_local cannot be both True"
         acc_shape = (self.tile_m, self.tile_n)
@@ -311,7 +326,7 @@ class AttentionMask:
             n_block = 0
         seqlenk_col_limit = self.seqlen_k - n_block * self.tile_n
         r2p = True
-        if const_expr(not mask_causal and not mask_local):
+        if const_expr(not mask_causal and not mask_local and mask_mod is None):
             if const_expr(mask_seqlen):
                 if const_expr(not r2p):
                     for i in cutlass.range(cute.size(tScS_t2r.shape), unroll_full=True):
@@ -321,6 +336,51 @@ class AttentionMask:
                         acc_S[i] = -Float32.inf if tScS_t2r[i][1] >= seqlenk_col_limit else acc_S[i]
                 else:
                     mask_r2p(acc_S, seqlenk_col_limit, arch=100, rank1=True)
+
+        elif const_expr(not mask_causal and not mask_local and mask_mod is not None):
+            # Block sparse case w/ mask_mod
+            has_fastdiv = const_expr(
+                fastdiv_mods is not None
+                and fastdiv_mods[0] is not None
+                and fastdiv_mods[1] is not None
+            )
+            wrap_aux_indices = const_expr(
+                has_fastdiv and mask_seqlen and const_expr(aux_tensors is not None)
+            )
+            batch_idx_ssa = utils.scalar_to_ssa(batch_idx, cutlass.Int32)
+            head_idx_ssa = utils.scalar_to_ssa(head_idx, cutlass.Int32)
+            row_coord_first = tScS_t2r[0][0]
+            global_row = row_coord_first + m_block * self.tile_m
+            if const_expr(self.qhead_per_kvhead_packgqa != 1):
+                mask_row = global_row // self.qhead_per_kvhead_packgqa
+            else:
+                mask_row = global_row
+            mask_row_for_mod = mask_row
+            if const_expr(wrap_aux_indices):
+                _, mask_row_for_mod = divmod(mask_row, fastdiv_mods[0])
+            mask_row_ssa = utils.scalar_to_ssa(mask_row_for_mod, cutlass.Int32)
+
+            ncol = const_expr(cute.size(tScS_t2r.shape))
+            for i in cutlass.range_constexpr(ncol):
+                col_coord = tScS_t2r[i][1] if not self.swap_AB else tScS_t2r[i][0]
+                global_col = col_coord + n_block * self.tile_n
+                global_col_for_mod = global_col
+                if const_expr(wrap_aux_indices):
+                    _, global_col_for_mod = divmod(global_col, fastdiv_mods[1])
+                kv_idx_ssa = utils.scalar_to_ssa(global_col_for_mod, cutlass.Int32)
+                mask_value = mask_mod(
+                    batch_idx_ssa,
+                    head_idx_ssa,
+                    mask_row_ssa,
+                    kv_idx_ssa,
+                    aux_tensors,
+                )
+                cond = cutlass.Boolean(utils.ssa_to_scalar(mask_value))
+                acc_S[i] = acc_S[i] if cond else -Float32.inf
+                if const_expr(mask_seqlen):
+                    out_of_bounds = (global_row >= self.seqlen_q) or (global_col >= self.seqlen_k)
+                    acc_S[i] = -Float32.inf if out_of_bounds else acc_S[i]
+
         else:  # Causal or local
             causal_row_offset = 1 + self.seqlen_k - n_block * self.tile_n - self.seqlen_q
             row_idx = tScS_t2r[0][0] + m_block * self.tile_m
@@ -351,10 +411,10 @@ class AttentionMask:
                 )
                 if const_expr(self.window_size_right is not None):
                     col_limit_right = row_idx + local_row_offset_right
-                    if const_expr(mask_seqlen):
-                        col_limit_right = cutlass.min(col_limit_right, seqlenk_col_limit)
                 else:
                     col_limit_right = self.tile_n
+                if const_expr(mask_seqlen):
+                    col_limit_right = cutlass.min(col_limit_right, seqlenk_col_limit)
                 col_limit_left = (
                     row_idx + local_row_offset_left
                     if const_expr(self.window_size_left is not None)
@@ -387,28 +447,27 @@ class AttentionMask:
         assert not (mask_causal and mask_local), "mask_causal and mask_local cannot be both True"
         ROW = 0 if const_expr(not self.swap_AB) else 1
         COL = 1 if const_expr(not self.swap_AB) else 0
+        assert t0ScS_t2r[0][COL] == 0, "col0 == 0"
         thr_col_offset = tScS_t2r[0][COL]
         seqlenk_col_limit = self.seqlen_k - n_block * self.tile_n - thr_col_offset
         if const_expr(not mask_causal and not mask_local):
             if const_expr(mask_seqlen):
-                if t0ScS_t2r[0][COL] >= seqlenk_col_limit:
+                if seqlenk_col_limit <= 0:
                     for i in cutlass.range(cute.size(acc_S.shape), unroll_full=True):
                         acc_S[i] = -cutlass.Float32.inf
         else:  # Causal or local
             thr_row_offset = tScS_t2r[0][ROW]
-            causal_row_offset = (
-                seqlenk_col_limit - self.seqlen_q + m_block * self.tile_m + thr_row_offset
-            )
+            seqlenq_row_limit = self.seqlen_q - m_block * self.tile_m - thr_row_offset
+            causal_offset = seqlenq_row_limit - seqlenk_col_limit
             if const_expr(mask_causal):
-                col0 = t0ScS_t2r[0][COL]
-                row_limit_top = col0 - causal_row_offset
                 # tidx = cute.arch.thread_idx()[0] % 256
                 # if tidx < 32:
-                #     cute.printf("tidx = {}, {} {}, {} {}, col0 = {}", tidx, tScS_t2r[0][0], tScS_t2r[0][1], tScS_t2r[1][0], tScS_t2r[1][1], col0)
+                #     cute.printf("tidx = {}, {} {}, {} {}", tidx, tScS_t2r[0][0], tScS_t2r[0][1], tScS_t2r[1][0], tScS_t2r[1][1])
+                row_limit_top = causal_offset
                 if const_expr(mask_seqlen):
                     # If col is beyond the column limit, we want to mask out the entire
                     # column, by setting row limit to be self.tile_m.
-                    if t0ScS_t2r[0][COL] >= seqlenk_col_limit:
+                    if seqlenk_col_limit <= 0:
                         row_limit_top = self.tile_m
                 r2p = True
                 if const_expr(not r2p):
@@ -420,4 +479,18 @@ class AttentionMask:
                     num_rep = cute.size(tScS_t2r, mode=[0])  # 16 or 32
                     mask_r2p_transposed(acc_S, row_limit_top, num_rep)
             else:
-                assert False, "Local masking isn't supported yet"
+                if const_expr(self.window_size_right is not None):
+                    row_limit_top = causal_offset - self.window_size_right
+                else:
+                    row_limit_top = 0
+                if const_expr(self.window_size_left is not None):
+                    row_limit_bot = causal_offset + self.window_size_left
+                if const_expr(mask_seqlen):
+                    if seqlenk_col_limit <= 0:
+                        row_limit_top = self.tile_m
+                for i in cutlass.range(cute.size(acc_S.shape), unroll_full=True):
+                    row_idx = t0ScS_t2r[i][ROW]
+                    local_mask = row_idx < row_limit_top
+                    if const_expr(self.window_size_left is not None):
+                        local_mask |= row_idx > row_limit_bot
+                    acc_S[i] = -cutlass.Float32.inf if local_mask else acc_S[i]

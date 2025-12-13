@@ -201,6 +201,23 @@ def flex_dilated_sliding_window_mask(b, h, q_idx, kv_idx):
     return in_window & dilated
 
 
+def flex_ima_mask(b, h, q_idx, kv_idx, bias):
+    return kv_idx >= bias[kv_idx]
+
+
+@cute.jit
+def cute_ima_mask(
+    batch: cute.TensorSSA,
+    head: cute.TensorSSA,
+    m_idx: cute.TensorSSA,
+    n_idx: cute.TensorSSA,
+    aux_tensors,
+) -> cute.TensorSSA:
+    bias = aux_tensors[0]
+    threshold = utils.scalar_to_ssa(bias[n_idx[0]], cutlass.Int32)
+    return n_idx >= threshold
+
+
 def random_doc_id_tensor(nheads, batch, seqlen_q, device="cpu"):
     doc_ids_tensor = torch.zeros(batch, nheads, seqlen_q, dtype=torch.int32, device=device)
     for b in range(batch):
@@ -226,6 +243,7 @@ STATIC_MASKS = {
     "prefix_lm": (cute_prefix_lm_mask, flex_prefix_lm_mask),
     "dilated_sliding_window": (cute_dilated_sliding_window_mask, flex_dilated_sliding_window_mask),
     "document": (cute_document_mask, flex_document_mask),
+    "ima": (cute_ima_mask, flex_ima_mask),
 }
 
 PARAMETERIZED_MASK_FACTORIES = {

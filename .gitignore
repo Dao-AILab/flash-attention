@@ -27,6 +27,10 @@ var/
 
 # IDE-related
 .idea/
+.vscode/
 
 # Dev
 venv
+
+# compile-time generated file
+flash_attn_config.py

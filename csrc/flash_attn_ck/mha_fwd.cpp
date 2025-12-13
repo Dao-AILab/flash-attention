@@ -24,7 +24,7 @@ fmha_fwd_traits get_ck_fmha_fwd_traits(const mask_info &mask,
                            enable_alibi ? bias_enum::alibi : bias_enum::no_bias,
                            has_lse,
                            has_dropout,
-                           false}; // do_fp8_static_quant
+                           quant_scale_enum::no_scale}; // qscale_type
 }
 
 fmha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
@@ -95,12 +95,18 @@ fmha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                          k.data_ptr(),
                          v.data_ptr(),
                          alibi_slopes_ptr, // bias
+                         nullptr, // q_descale_ptr
+                         nullptr, // k_descale_ptr
+                         nullptr, // v_descale_ptr
                          has_dropout_randval ? dropout_randval.data_ptr() : nullptr,
                          has_lse ? softmax_lse.data_ptr() : nullptr,
                          out.data_ptr(),
-                         nullptr, // seqstart_q
-                         nullptr, // seqstart_k
-                         nullptr,
+                         nullptr, // seqstart_q_ptr
+                         nullptr, // seqstart_k_ptr
+                         nullptr, // seqlen_q_ptr
+                         nullptr, // seqlen_k_ptr
+                         nullptr, // cu_seqlen_q_ptr
+                         nullptr, // cu_seqlen_k_ptr
                          seqlen_q,
                          seqlen_k,
                          b,
@@ -110,8 +116,6 @@ fmha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                          h,             // nhead
                          h_k,           // nhead_k
                          softmax_scale, // scale_s
-                         1,             // scale_p
-                         1,             // scale_o
                          0.0f,          // logits_soft_cap
                          stride_q,
                          stride_k,

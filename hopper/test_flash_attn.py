@@ -6,6 +6,11 @@ import pytest
 import torch
 import torch.nn.functional as F
 from torch._C import parse_schema
+from torch.testing._internal.optests.generate_tests import (
+    safe_fake_check,
+    safe_schema_check,
+    safe_aot_autograd_check,
+)
 
 from einops import rearrange, repeat
 try:
@@ -38,6 +43,8 @@ DISABLE_HDIM96 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM96", "FALSE") == "TRUE"
 DISABLE_HDIM128 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM128", "FALSE") == "TRUE"
 DISABLE_HDIM192 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM192", "FALSE") == "TRUE"
 DISABLE_HDIM256 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM256", "FALSE") == "TRUE"
+ENABLE_OPCHECK = os.getenv("FLASH_ATTENTION_ENABLE_OPCHECK", "FALSE") == "TRUE"
+ENABLE_AUTOGRAD_CHECK = os.getenv("FLASH_ATTENTION_ENABLE_AUTOGRAD_CHECK", "FALSE") == "TRUE"
 
 COMPILED_HDIMS = (
     []
@@ -47,6 +54,61 @@ COMPILED_HDIMS = (
     + ([192] if not DISABLE_HDIM192 else [])
     + ([256] if not DISABLE_HDIM256 else [])
 )
+
+def should_test_backward(args, kwargs):
+    v = args[2]
+    num_splits = kwargs.get("num_splits", 1)
+    dtype = v.dtype
+    has_qv = V_colmajor = False  # no test runs this with V_colmajor or has_qv == True
+    attention_chunk = kwargs.get("attention_chunk")
+    dv = v.size(-1)
+
+    if (
+        ENABLE_AUTOGRAD_CHECK
+        and not DISABLE_BACKWARD
+        and dtype != torch.float8_e4m3fn
+        and not V_colmajor
+        and not has_qv
+        and not dv > 256
+        and not attention_chunk != 0
+        and num_splits > 0  # we don't support num_split == 0 on torch.compile yet
+    ):
+        return True
+    return False
+
+
+def should_run_schema_check(args, kwargs):
+    v = args[2]
+    if v.dtype == torch.float8_e4m3fn:
+        return False
+    return True
+
+
+def should_run_fake_check(args, kwargs):
+    if 'num_splits' in kwargs:
+        return kwargs['num_splits'] > 0
+    return True
+
+
+def run_opcheck(fn):
+    def wrapper(*args, **kwargs):
+        if should_run_schema_check(args, kwargs):
+            safe_schema_check(fn, args, kwargs)
+
+        if should_run_fake_check(args, kwargs):
+            safe_fake_check(fn, args, kwargs)
+
+        if should_test_backward(args, kwargs):
+            # Expensive check
+            safe_aot_autograd_check(fn, args, kwargs, dynamic=False)
+            safe_aot_autograd_check(fn, args, kwargs, dynamic=True)
+        return fn(*args, **kwargs)
+    return wrapper
+
+
+if ENABLE_OPCHECK:
+    flash_attn_func = run_opcheck(flash_attn_func)
+    flash_attn_varlen_func = run_opcheck(flash_attn_varlen_func)
 
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
