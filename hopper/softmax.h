@@ -96,6 +96,9 @@ struct Softmax {
     TensorT row_max, row_sum;
     float const softmax_scale_log2;
 
+    bool has_sink = false;
+    TensorT row_sink;
+
     CUTLASS_DEVICE Softmax(float const softmax_scale_log2_) : softmax_scale_log2(softmax_scale_log2_) {};
 
     template<bool Is_first, bool Check_inf=false, typename Tensor0>
@@ -123,6 +126,24 @@ struct Softmax {
         return scores_scale;
     };
 
+    template<bool Is_packGQA, typename Tensor0>
+    __forceinline__ __device__ void set_row_sink(Tensor0 &sSink, int bidh, int qhead_per_khead = 0, int row_start = 0, int row_step = 0) {
+        has_sink = true;
+        if constexpr (!Is_packGQA) {
+            #pragma unroll
+            for(int mi = 0; mi < size(row_sink); ++mi) {
+                row_sink(mi) = static_cast<float>(sSink(bidh));
+            }
+        } else {
+            #pragma unroll
+            for(int mi = 0; mi < size(row_sink); ++mi) {
+                int row   = row_start + mi * row_step;
+                int head  = bidh * qhead_per_khead + row % qhead_per_khead; 
+                row_sink(mi) = static_cast<float>(sSink(head));
+            }
+        }
+    }
+
     template<bool Is_first, bool Check_inf=false, typename Tensor0>
     __forceinline__ __device__ void online_softmax(Tensor0 &acc_s) {
         // Reshape acc_s from ((2, 2, V), MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, V, MMA_N))
@@ -137,10 +158,19 @@ struct Softmax {
     __forceinline__ __device__ TensorT finalize(float const final_scale=1.f) {
         SumOp<float> sum_op;
         quad_allreduce_(row_sum, row_sum, sum_op);
+
         TensorT scores_scale;
         #pragma unroll
         for (int mi = 0; mi < size(row_sum); ++mi) {
+            if (row_max(mi) == -INFINITY) { row_max(mi) = 0.f; }
+            
             float sum = row_sum(mi);
+            if (has_sink) {
+                const float max_scaled = row_max(mi) * softmax_scale_log2 - Max_offset;
+                float const extra = exp2f(float(M_LOG2E) * row_sink(mi) - max_scaled);
+                sum += extra;
+            }
+            
             float inv_sum = (sum == 0.f || sum != sum) ? 0.f : 1.f / sum;
             scores_scale(mi) = inv_sum * final_scale;
             // For FP8, we might have scaled the output of exp by 2**8 so we need to divide sum by that amount.
