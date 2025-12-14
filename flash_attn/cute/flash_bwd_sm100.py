@@ -7,6 +7,7 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+from cutlass.cute import FastDivmodDivisor
 from cutlass import Float32, Int32, const_expr
 from cutlass.utils import LayoutEnum
 from cutlass.cute.nvgpu import cpasync, tcgen05
@@ -29,6 +30,7 @@ from flash_attn.cute.tile_scheduler import (
 
 from flash_attn.cute import barrier
 from flash_attn.cute.named_barrier import NamedBarrierBwdSm100
+from flash_attn.cute.softmax import apply_score_mod_inner, apply_score_mod_bwd_inner
 
 
 class FlashAttentionBackwardSm100:
@@ -46,6 +48,9 @@ class FlashAttentionBackwardSm100:
         is_persistent: bool = False,
         deterministic: bool = False,
         cluster_size: int = 1,
+        score_mod: cutlass.Constexpr | None = None,
+        score_mod_bwd: cutlass.Constexpr | None = None,
+        has_aux_tensors: cutlass.Constexpr = False,
     ):
         # padding head_dim to a multiple of 16 as k_block_size
         hdim_multiple_of = 16
@@ -87,6 +92,17 @@ class FlashAttentionBackwardSm100:
         self.pack_gqa = False
         self.use_tma_store = True
         self.deterministic = deterministic
+
+        # Score mod support
+        self.score_mod = score_mod
+        self.score_mod_bwd = score_mod_bwd
+        self.has_aux_tensors = has_aux_tensors
+        # For score_mod, use vec_size=1 (like forward) to handle per-element indices
+        if cutlass.const_expr(has_aux_tensors):
+            self.vec_size: cutlass.Constexpr = 1
+        else:
+            self.vec_size: cutlass.Constexpr = 4
+        self.qk_acc_dtype = Float32
 
         # Speed optimizations, does not affect correctness
         self.shuffle_LSE = False
@@ -360,6 +376,7 @@ class FlashAttentionBackwardSm100:
         mdQ_semaphore: Optional[cute.Tensor] = None,
         mdK_semaphore: Optional[cute.Tensor] = None,
         mdV_semaphore: Optional[cute.Tensor] = None,
+        aux_tensors: Optional[list] = None,
     ):
         assert all(x is None for x in (mCuSeqlensQ, mCuSeqlensK, mSeqUsedQ, mSeqUsedK)), (
             "Variable sequence length is not supported yet in FlashAttentionBackwardSm100"
@@ -665,12 +682,27 @@ class FlashAttentionBackwardSm100:
         self.shared_storage = SharedStorage
 
         LOG2_E = math.log2(math.e)
-        softmax_scale_log2 = softmax_scale * LOG2_E
+        if const_expr(self.score_mod is None):
+            # Without score_mod: bake scale into log2
+            softmax_scale_log2 = softmax_scale * LOG2_E
+        else:
+            # With score_mod: score_mod applied to S * softmax_scale, then use LOG2_E only
+            softmax_scale_log2 = LOG2_E
 
         if const_expr(window_size_left is not None):
             window_size_left = Int32(window_size_left)
         if const_expr(window_size_right is not None):
             window_size_right = Int32(window_size_right)
+
+        fastdiv_mods = None
+        if const_expr(aux_tensors is not None):
+            seqlen_q = cute.size(mQ.shape[0]) // (
+                self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1
+            )
+            seqlen_k = cute.size(mK.shape[0])
+            seqlen_q_divmod = FastDivmodDivisor(seqlen_q)
+            seqlen_k_divmod = FastDivmodDivisor(seqlen_k)
+            fastdiv_mods = (seqlen_q_divmod, seqlen_k_divmod)
 
         self.kernel(
             tma_tensor_Q,
@@ -719,6 +751,8 @@ class FlashAttentionBackwardSm100:
             window_size_left,
             window_size_right,
             tile_sched_params,
+            aux_tensors,
+            fastdiv_mods,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -777,6 +811,8 @@ class FlashAttentionBackwardSm100:
         window_size_left: Optional[Int32],
         window_size_right: Optional[Int32],
         tile_sched_params: ParamsBase,
+        aux_tensors: Optional[list] = None,
+        fastdiv_mods=(None, None),
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
@@ -1156,6 +1192,8 @@ class FlashAttentionBackwardSm100:
                 tiled_copy_r2s_dKV,
                 mdK_semaphore,
                 mdV_semaphore,
+                aux_tensors,
+                fastdiv_mods,
             )
             cute.arch.mbarrier_arrive(tmem_dealloc_mbar_ptr)
 
@@ -1673,6 +1711,77 @@ class FlashAttentionBackwardSm100:
         return t[coord]
 
     @cute.jit
+    def apply_score_mod(
+        self,
+        tSrS_t2r,
+        thr_copy_t2r,
+        thr_mma_S,
+        batch_idx,
+        head_idx,
+        m_block,
+        n_block,
+        softmax_scale,
+        seqlen_info,
+        aux_tensors=None,
+        fastdiv_mods=(None, None),
+    ):
+        """Apply forward score modification for SM100 backward pass."""
+        # In bwd, S is computed as K @ Q.T so dimensions are (tile_n, tile_m)
+        cS = cute.make_identity_tensor((self.tile_n, self.tile_m))
+        cS = cute.domain_offset((n_block * self.tile_n, m_block * self.tile_m), cS)
+        tScS = thr_mma_S.partition_C(cS)
+        tScS_idx = thr_copy_t2r.partition_D(tScS)
+
+        apply_score_mod_inner(
+            tSrS_t2r,
+            tScS_idx,
+            self.score_mod,
+            batch_idx,
+            head_idx,
+            softmax_scale,
+            self.vec_size,
+            self.qk_acc_dtype,
+            aux_tensors,
+            fastdiv_mods,
+            seqlen_info,
+            constant_q_idx=None,
+            qhead_per_kvhead=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+            transpose_indices=True,
+        )
+
+    @cute.jit
+    def apply_score_mod_bwd(
+        self,
+        grad_tensor,
+        score_tensor,
+        index_tensor,
+        batch_idx,
+        head_idx,
+        softmax_scale,
+        seqlen_info,
+        aux_tensors=None,
+        fastdiv_mods=(None, None),
+    ):
+        """Apply backward score modification (joint graph) for SM100."""
+        apply_score_mod_bwd_inner(
+            grad_tensor,
+            score_tensor,
+            index_tensor,
+            self.score_mod_bwd,
+            batch_idx,
+            head_idx,
+            softmax_scale,
+            self.vec_size,
+            self.qk_acc_dtype,
+            aux_tensors,
+            fastdiv_mods,
+            seqlen_info,
+            constant_q_idx=None,
+            qhead_per_kvhead=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+            transpose_indices=True,
+        )
+
+    @cute.jit
     def compute_loop(
         self,
         thr_mma_S: cute.core.ThrMma,
@@ -1709,6 +1818,8 @@ class FlashAttentionBackwardSm100:
         tiled_copy_r2s_dKV: Optional[cute.TiledCopy],
         mdK_semaphore: Optional[cute.Tensor],
         mdV_semaphore: Optional[cute.Tensor],
+        aux_tensors: Optional[list] = None,
+        fastdiv_mods=(None, None),
     ):
         sLSE_2D = cute.make_tensor(
             sLSE.iterator,
@@ -1844,8 +1955,28 @@ class FlashAttentionBackwardSm100:
                 tSrS_t2r = cute.make_fragment(tScS_t2r.shape, Float32)
                 cute.copy(thr_copy_t2r, tStS_t2r, tSrS_t2r)
 
+                if const_expr(self.score_mod is not None):
+                    # Preserve unscaled S for backward score_mod BEFORE masking
+                    tSrS_pre = cute.make_fragment_like(tSrS_t2r)
+                    cute.autovec_copy(tSrS_t2r, tSrS_pre)
+
                 #### APPLY MASK
                 mask_fn(tSrS_t2r, m_block=m_block)
+
+                if const_expr(self.score_mod is not None):
+                    self.apply_score_mod(
+                        tSrS_t2r,
+                        thr_copy_t2r,
+                        thr_mma_S,
+                        batch_idx,
+                        head_idx,
+                        m_block,
+                        n_block,
+                        softmax_scale,
+                        seqlen,
+                        aux_tensors,
+                        fastdiv_mods,
+                    )
 
                 num_stages = cute.size(tScS_t2r, mode=[1])
 
@@ -1940,6 +2071,32 @@ class FlashAttentionBackwardSm100:
                             (tSrS_cur[2 * v], tSrS_cur[2 * v + 1]),
                             (tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1]),
                         )
+
+                    if const_expr(self.score_mod_bwd is not None):
+                        tSrS_pre_cur = tSrS_pre[None, stage, 0, 0]
+                        cS_bwd = cute.make_identity_tensor((self.tile_n, self.tile_m))
+                        cS_bwd = cute.domain_offset(
+                            (n_block * self.tile_n, m_block * self.tile_m), cS_bwd
+                        )
+                        tScS_bwd = thr_mma_S.partition_C(cS_bwd)
+                        tScS_idx_bwd = thr_copy_t2r.partition_D(tScS_bwd)
+                        tScS_idx_cur = tScS_idx_bwd[None, stage, 0, 0]
+                        self.apply_score_mod_bwd(
+                            tdPrdP_cur,
+                            tSrS_pre_cur,
+                            tScS_idx_cur,
+                            batch_idx,
+                            head_idx,
+                            softmax_scale,
+                            seqlen,
+                            aux_tensors,
+                            fastdiv_mods,
+                        )
+                        # Zero out OOB positions (kv_idx >= seqlen_k) after score_mod_bwd
+                        for i in cutlass.range(cute.size(tdPrdP_cur), unroll_full=True):
+                            kv_idx = tScS_idx_cur[i][0]
+                            tdPrdP_cur[i] = 0.0 if kv_idx >= seqlen.seqlen_k else tdPrdP_cur[i]
+
                     tdPrdS_cvt = cute.make_fragment_like(tdPrdP_cur, self.ds_dtype)
                     utils.cvt_f16(tdPrdP_cur, tdPrdS_cvt)
                     if const_expr(stage == 0):

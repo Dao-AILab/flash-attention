@@ -573,6 +573,9 @@ def _flash_attn_bwd(
     dq: Optional[torch.Tensor] = None,
     dk: Optional[torch.Tensor] = None,
     dv: Optional[torch.Tensor] = None,
+    score_mod: Optional[Callable] = None,
+    score_mod_bwd: Optional[Callable] = None,
+    aux_tensors: Optional[list[torch.Tensor]] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     compute_capability = _get_device_capability()
     assert compute_capability in [9, 10], "Unsupported compute capability. Supported: 9.x, 10.x"
@@ -684,6 +687,14 @@ def _flash_attn_bwd(
         pack_gqa = False # override for now
     if compute_capability != 10:
         assert deterministic is False, "bwd deterministic only supported for sm100 for now"
+
+    if score_mod is not None:
+        assert score_mod_bwd is not None, "score_mod_bwd is required when score_mod is provided"
+        assert softcap == 0.0, "softcap and score_mod are mutually exclusive (different log2 scaling)"
+        assert cu_seqlens_q is None and cu_seqlens_k is None, (
+            "varlen + score_mod not supported in bwd yet"
+        )
+        assert compute_capability == 10, "score_mod in bwd only supported on SM100 for now"
 
     device = q.device
     out_torch_dtype = q.dtype
@@ -855,6 +866,14 @@ def _flash_attn_bwd(
             V_in_regs,
         )
     else:
+        # Hash callables for compile key
+        score_mod_hash = utils.hash_callable(score_mod) if score_mod else False
+        score_mod_bwd_hash = utils.hash_callable(score_mod_bwd) if score_mod_bwd else False
+        num_aux_tensors = len(aux_tensors) if aux_tensors else 0
+        # Convert aux_tensors to cute tensors
+        cute_aux_tensors = None
+        if aux_tensors is not None:
+            cute_aux_tensors = [from_dlpack(buf).mark_layout_dynamic() for buf in aux_tensors]
         compile_key = (
             compute_capability,
             dtype,
@@ -871,6 +890,9 @@ def _flash_attn_bwd(
             pack_gqa,
             cluster_size,
             deterministic,
+            score_mod_hash,
+            score_mod_bwd_hash,
+            num_aux_tensors,
         )
     num_threads = 384
     if compile_key not in _flash_attn_bwd.compile_cache:
@@ -946,6 +968,9 @@ def _flash_attn_bwd(
                 cluster_size=cluster_size,
                 # cluster_size=1,
                 deterministic=deterministic,
+                score_mod=score_mod,
+                score_mod_bwd=score_mod_bwd,
+                has_aux_tensors=aux_tensors is not None and len(aux_tensors) > 0,
             )
         # TODO: check @can_implement
         _flash_attn_bwd.compile_cache[compile_key] = cute.compile(
@@ -971,6 +996,7 @@ def _flash_attn_bwd(
             dQ_semaphore_tensor,
             dK_semaphore_tensor,
             dV_semaphore_tensor,
+            cute_aux_tensors,
             options="--enable-tvm-ffi",
         )
     _flash_attn_bwd.compile_cache[compile_key](
@@ -995,6 +1021,7 @@ def _flash_attn_bwd(
         dQ_semaphore,
         dK_semaphore,
         dV_semaphore,
+        aux_tensors,
     )
 
     num_threads = 256 if compute_capability == 9 else 128
