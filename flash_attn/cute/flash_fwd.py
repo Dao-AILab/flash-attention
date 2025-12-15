@@ -970,7 +970,6 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             mask_causal=self.is_causal,
             mask_local=self.is_local,
             fastdiv_mods=fastdiv_mods if const_expr(self.mask_mod is not None) else None,
-            seqlen_info=seqlen,
         )
 
         # First iteration with seqlen masking
@@ -2019,7 +2018,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 mask_local=self.is_local,
                 aux_tensors=aux_tensors,
                 fastdiv_mods=fastdiv_mods,
-                seqlen_info=seqlen,
             )
             score_mod_fn = None
             if const_expr(self.score_mod is not None):
