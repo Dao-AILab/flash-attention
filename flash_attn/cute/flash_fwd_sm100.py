@@ -1888,7 +1888,6 @@ class FlashAttentionForwardSm100:
         cute.arch.mbarrier_wait(mbar_ptr + self.mbar_S_full_offset + stage, mma_si_consumer_phase)
         tSrS_t2r = cute.make_fragment(thr_tmem_load.partition_D(tScS).shape, self.qk_acc_dtype)
         cute.copy(thr_tmem_load, tStS_t2r, tSrS_t2r)
-
         if cutlass.const_expr(self.score_mod is not None):
             self.apply_score_mod(
                 tSrS_t2r,
@@ -2670,7 +2669,7 @@ class FlashAttentionForwardSm100:
         """Apply score modification for SM100 (constant q_idx)."""
         # Prepare index tensor with extra partition
         cS = cute.make_identity_tensor((self.m_block_size, self.n_block_size))
-        cS = cute.domain_offset((m_block * self.m_block_size , n_block * self.n_block_size), cS)
+        cS = cute.domain_offset((m_block * self.m_block_size, n_block * self.n_block_size), cS)
         tScS = thr_mma_qk.partition_C(cS)
         tScS_t2r = thr_tmem_load.partition_D(tScS)
 

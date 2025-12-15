@@ -22,7 +22,6 @@
 # - bwd pass optimized for Hopper/Blackwell
 
 import math
-import inspect
 from typing import Optional, Tuple, Callable
 
 import torch
