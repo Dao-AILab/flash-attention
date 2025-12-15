@@ -86,6 +86,8 @@ class FlashAttentionForwardSm100:
         has_aux_tensors: cutlass.Constexpr = False,
         paged_kv_non_tma: bool = False,
         is_varlen_q: bool = False,
+        rescale_threshold: Optional[float] = None,
+        disable_e2e: bool = False,
     ):
         self.use_tma_KV = not paged_kv_non_tma
         # self.dtype = dtype
@@ -145,6 +147,8 @@ class FlashAttentionForwardSm100:
             "Paged KV does not support irregular head dim"
         )
 
+        self.rescale_threshold = rescale_threshold
+        self.disable_e2e = disable_e2e
         self.softmax0_warp_ids = (0, 1, 2, 3)
         self.softmax1_warp_ids = (4, 5, 6, 7)
         self.correction_warp_ids = (8, 9, 10, 11)
@@ -1644,7 +1648,11 @@ class FlashAttentionForwardSm100:
 
             softmax = SoftmaxSm100.create(
                 softmax_scale_log2,
-                rescale_threshold=8.0 if const_expr(self.q_dtype.width == 16) else 0.0,
+                rescale_threshold = (
+                    self.rescale_threshold 
+                    if self.rescale_threshold is not None 
+                    else (8.0 if const_expr(self.q_dtype.width == 16) else 0.0)
+                ),
                 softmax_scale=softmax_scale,
             )
             softmax.reset()
@@ -1910,7 +1918,7 @@ class FlashAttentionForwardSm100:
         softmax.apply_exp2_convert(
             tSrS_t2r,
             tSrP_r2t,
-            e2e=mask_fn is None and self.head_dim_padded <= 128,
+            e2e=mask_fn is None and self.head_dim_padded <= 128 and not (self.disable_e2e),
             e2e_freq=self.e2e_freq,
         )
         # Sequence barrier arrive
