@@ -1,12 +1,8 @@
-import operator
-
-import cutlass
-import cutlass.cute as cute
 import pytest
 import torch
-from cutlass._mlir.dialects import math as mlir_math
 from torch.nn.attention.flex_attention import flex_attention
 from flash_attn.cute.interface import _flash_attn_fwd
+from test_score_mod import _generate_block_kvcache
 from score_mod_definitions import (
     # TensorSSA-based score mods
     score_mod_alibi,
@@ -31,9 +27,7 @@ from score_mod_definitions import (
     score_mod_stress_multi_buffer,
     score_mod_stress_xor_pattern,
     score_mod_times_two,
-)
-
-# isort: split
+)  # isort: split
 from score_mod_definitions import (
     # Eager (torch) reference score mods
     identity_eager,
@@ -169,6 +163,8 @@ def run_cute_flash(
     pack_gqa=False,
     cu_seqlens_q=None,
     cu_seqlens_k=None,
+    page_table=None,
+    seqused_k=None,
 ):
     """Run CuTE flash attention."""
     if cu_seqlens_q is not None or cu_seqlens_k is not None:
@@ -179,6 +175,8 @@ def run_cute_flash(
             v,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
+            seqused_k=seqused_k,
+            page_table=page_table,
             return_lse=True,
             score_mod=score_mod,
             out=out,
@@ -193,6 +191,8 @@ def run_cute_flash(
         q,
         k,
         v,
+        seqused_k=seqused_k,
+        page_table=page_table,
         return_lse=True,
         score_mod=score_mod,
         out=out,
@@ -302,8 +302,6 @@ def prepare_ref_tensors(
     num_heads = q.shape[1] if varlen_q else q.shape[2]
 
     if not varlen_q and varlen_k:
-        # Q is batched (batch_size, seqlen_q, num_heads, head_dim)
-        # Need to convert to packed format (total_q, num_heads, head_dim) for reference
         seqlen_q = q.shape[1]
         q_packed = q.reshape(-1, num_heads, q.shape[-1])
         ref_cu_seqlens_q = torch.tensor(
@@ -314,10 +312,6 @@ def prepare_ref_tensors(
         return q_packed, k, v, ref_cu_seqlens_q, cu_seqlens_k
 
     if varlen_q and not varlen_k:
-        # K is batched (batch_size, seqlen_k, num_heads, head_dim)
-        # Need to transpose to (batch_size, num_heads, seqlen_k, head_dim) for flex_attention
-        k_ref = k.transpose(1, 2)
-        v_ref = v.transpose(1, 2)
         return q, k, v, cu_seqlens_q, None
 
     return q, k, v, cu_seqlens_q, cu_seqlens_k
@@ -427,18 +421,14 @@ def test_varlen_with_score_mod(
         seqlens_q, seqlens_k, varlen_q, varlen_k, num_heads, head_dim, dtype
     )
 
-    # For pack_gqa, reduce K and V to num_kv_heads
     if pack_gqa:
         if varlen_k:
-            # K and V are (total_k, num_heads, head_dim) - slice head dimension
             k = k[:, :num_kv_heads, :].clone()
             v = v[:, :num_kv_heads, :].clone()
         else:
-            # K and V are (batch, seqlen_k, num_heads, head_dim) - slice head dimension
             k = k[:, :, :num_kv_heads, :].clone()
             v = v[:, :, :num_kv_heads, :].clone()
 
-    # Setup aux tensors and eager score_mod
     aux_tensors = None
     if aux_type == "batch":
         bias = torch.zeros(batch_size, device="cuda", dtype=dtype) * 0.1
@@ -475,7 +465,6 @@ def test_varlen_with_score_mod(
         cu_seqlens_k=cu_seqlens_k,
     )
 
-    # Handle output shape differences for varlen_k only case
     if not varlen_q and varlen_k:
         seqlen_q = q.shape[1]
         out_ref_fp32 = out_ref_fp32.reshape(batch_size, seqlen_q, num_heads, head_dim)
@@ -526,8 +515,6 @@ def test_varlen_with_global_idx_score_mod(
 
     cute_score_mod, eager_factory, aux_type, requires_global = score_mod_tuple
 
-    # cute_score_mod = score_mod_global_kv_bias_fresh
-
     # Skip if score_mod requires global indices we can't provide
     if requires_global == "q" and not varlen_q:
         pytest.skip(f"{cute_score_mod.__name__} requires varlen_q for q_idx_global")
@@ -550,11 +537,9 @@ def test_varlen_with_global_idx_score_mod(
     batch_size = len(seqlens_q)
     max_rel_pos = 512
 
-    # Compute total sizes for aux tensors
     total_q = sum(seqlens_q)
     total_k = sum(seqlens_k)
 
-    # Always create cu_seqlens for global index computation (needed by eager)
     cu_seqlens_q = torch.tensor(
         [0] + list(torch.tensor(seqlens_q).cumsum(0).tolist()),
         device="cuda",
@@ -566,7 +551,6 @@ def test_varlen_with_global_idx_score_mod(
         dtype=torch.int32,
     )
 
-    # Create tensors - layout depends on varlen flag
     if varlen_q:
         q = torch.randn(total_q, num_heads, head_dim, device="cuda", dtype=dtype)
     else:
@@ -587,7 +571,6 @@ def test_varlen_with_global_idx_score_mod(
             batch_size, seqlen_k, num_heads, head_dim, device="cuda", dtype=dtype
         )
 
-    # For pack_gqa, reduce K and V to num_kv_heads
     if pack_gqa:
         if varlen_k:
             k = k[:, :num_kv_heads, :].clone()
@@ -652,7 +635,6 @@ def test_varlen_with_global_idx_score_mod(
         q_ref, k_ref, v_ref, ref_cu_q, ref_cu_k, eager_score_mod, dtype=dtype
     )
 
-    # For kernel: pass cu_seqlens only when actually varlen
     kernel_cu_seqlens_q = cu_seqlens_q if varlen_q else None
     kernel_cu_seqlens_k = cu_seqlens_k if varlen_k else None
     out_cute = run_cute_flash(
@@ -665,8 +647,6 @@ def test_varlen_with_global_idx_score_mod(
         cu_seqlens_q=kernel_cu_seqlens_q,
         cu_seqlens_k=kernel_cu_seqlens_k,
     )
-
-    # Reshape outputs to common format for comparison
 
     if varlen_q:
         out_ref_final = out_ref_fp32
@@ -684,29 +664,6 @@ def test_varlen_with_global_idx_score_mod(
 
     test_name = f"{cute_score_mod.__name__} (varlen_q={varlen_q}, varlen_k={varlen_k}, {aux_type})"
 
-    # Debug: print first few values for stress_complex
-    if "stress_complex" in cute_score_mod.__name__:
-        print(f"\nDEBUG {test_name}:")
-        print(f"seqlens_q: {seqlens_q}")
-        print(f"cu_seqlens_q: {cu_seqlens_q}")
-        print(f"Bias tensor: {aux_tensors[0][:6]}")
-
-        # Print expected values for first few positions
-        print("\nExpected reference values for first positions:")
-        for b in range(min(3, len(seqlens_q))):
-            for h in range(min(2, num_heads)):
-                for q in range(min(2, seqlens_q[b])):
-                    q_global = cu_seqlens_q[b] + q
-                    bias_q = aux_tensors[0][q_global].item()
-                    scale = (b + 1) * (h + 1) * 0.001
-                    print(
-                        f"  REF: b={b} h={h} q_local={q} q_global={q_global} bias_q={bias_q:.6f} scale={scale:.6f}"
-                    )
-
-        print(f"\nout_cute_final[0,0,0]: {out_cute_final[0, 0, 0]}")
-        print(f"out_ref_final[0,0,0]: {out_ref_final[0, 0, 0]}")
-        print(f"Difference: {(out_cute_final[0, 0, 0] - out_ref_final[0, 0, 0]).abs()}")
-
     check_results(
         out_cute_final,
         out_ref_final,
@@ -715,6 +672,375 @@ def test_varlen_with_global_idx_score_mod(
         extra_atol=1e-3,
         seqlens_q=seqlens_q if varlen_q else None,
         cu_seqlens_q=cu_seqlens_q if varlen_q else None,
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("page_size", [None, 128])
+@pytest.mark.parametrize("varlen_q", [True, False])
+@pytest.mark.parametrize("varlen_k", [True, False])
+@pytest.mark.parametrize("qhead_per_kvhead,num_kv_heads", [(4, 2)])
+@pytest.mark.parametrize("seqlens_q,seqlens_k", SEQLEN_CONFIGS)
+@pytest.mark.parametrize("score_mod_tuple", TEST_PAIRS_NO_GLOBAL)
+def test_varlen_score_mod_kvcache(
+    seqlens_q,
+    seqlens_k,
+    varlen_q,
+    varlen_k,
+    qhead_per_kvhead,
+    num_kv_heads,
+    page_size,
+    dtype,
+    score_mod_tuple,
+):
+    """Test varlen attention with score_mod and paged KV cache."""
+    if not varlen_q and not varlen_k:
+        pytest.skip(
+            "At least one of varlen_q or varlen_k must be True for varlen tests"
+        )
+
+    if page_size is not None and varlen_k:
+        pytest.skip("Paged KV requires batched (non-varlen) K")
+
+    if not varlen_q:
+        seqlens_q = [seqlens_q[0]] * len(seqlens_q)
+    if not varlen_k:
+        seqlens_k = [seqlens_k[0]] * len(seqlens_k)
+
+    # Skip if page_size doesn't divide seqlens evenly (for simplicity)
+    if page_size is not None and not varlen_k:
+        if seqlens_k[0] % page_size != 0:
+            pytest.skip("page_size must divide seqlen_k")
+
+    torch.random.manual_seed(42)
+    cute_score_mod, eager_factory, aux_type = score_mod_tuple
+
+    num_heads = num_kv_heads * qhead_per_kvhead
+    pack_gqa = qhead_per_kvhead > 1
+    head_dim = 128
+    batch_size = len(seqlens_q)
+    device = "cuda"
+
+    # Setup tensors
+    q, k, v, cu_seqlens_q, cu_seqlens_k = setup_tensors(
+        seqlens_q, seqlens_k, varlen_q, varlen_k, num_heads, head_dim, dtype
+    )
+
+    if pack_gqa:
+        if varlen_k:
+            k = k[:, :num_kv_heads, :].clone()
+            v = v[:, :num_kv_heads, :].clone()
+        else:
+            k = k[:, :, :num_kv_heads, :].clone()
+            v = v[:, :, :num_kv_heads, :].clone()
+
+    page_table = None
+    k_cache_paged = None
+    v_cache_paged = None
+    k_cache = k
+    v_cache = v
+
+    if page_size is not None:
+        seqlen_k = seqlens_k[0]
+        (
+            k_cache_bhsd,
+            v_cache_bhsd,
+            page_table,
+            k_cache_paged,
+            v_cache_paged,
+            num_blocks,
+        ) = _generate_block_kvcache(
+            seqlen_k, page_size, batch_size, num_kv_heads, head_dim, device, dtype
+        )
+        k_cache = k_cache_bhsd.transpose(1, 2)  # BHSD -> BSHD
+        v_cache = v_cache_bhsd.transpose(1, 2)
+        seqused_k = torch.tensor(seqlens_k, dtype=torch.int32, device=device)
+    else:
+        seqused_k = None
+
+    # Setup aux tensors and eager score_mod
+    aux_tensors = None
+    if aux_type == "batch":
+        bias = torch.zeros(batch_size, device=device, dtype=dtype) * 0.1
+        aux_tensors = [bias]
+        eager_score_mod = eager_factory(bias)
+    elif aux_type == "dual_buffer":
+        seqlen_q = seqlens_q[0] if not varlen_q else max(seqlens_q)
+        head_bias = torch.randn(num_heads, device=device, dtype=dtype) * 0.2
+        pos_bias = torch.arange(seqlen_q, device=device, dtype=dtype) * 0.01
+        aux_tensors = [head_bias, pos_bias]
+        eager_score_mod = eager_factory(head_bias, pos_bias)
+    else:
+        eager_score_mod = eager_factory
+
+    # Prepare reference tensors
+    q_ref, k_ref, v_ref, ref_cu_q, ref_cu_k = prepare_ref_tensors(
+        q,
+        k_cache,
+        v_cache,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        varlen_q,
+        varlen_k,
+        batch_size,
+        seqlens_q,
+    )
+
+    out_ref_fp32 = run_flex_varlen_ref(
+        q_ref, k_ref, v_ref, ref_cu_q, ref_cu_k, eager_score_mod, dtype=torch.float32
+    )
+    out_pt = run_flex_varlen_ref(
+        q_ref, k_ref, v_ref, ref_cu_q, ref_cu_k, eager_score_mod, dtype=dtype
+    )
+
+    k_input = k_cache_paged if page_size is not None else k_cache
+    v_input = v_cache_paged if page_size is not None else v_cache
+
+    out_cute = run_cute_flash(
+        q,
+        k_input,
+        v_input,
+        cute_score_mod,
+        aux_tensors=aux_tensors,
+        pack_gqa=pack_gqa,
+        cu_seqlens_q=cu_seqlens_q if varlen_q else None,
+        cu_seqlens_k=cu_seqlens_k if (varlen_k and page_size is None) else None,
+        page_table=page_table if page_size is not None else None,
+        seqused_k=seqused_k if page_size is not None else None,
+    )
+
+    if not varlen_q and varlen_k:
+        seqlen_q = q.shape[1]
+        out_ref_fp32 = out_ref_fp32.reshape(batch_size, seqlen_q, num_heads, head_dim)
+        out_pt = out_pt.reshape(batch_size, seqlen_q, num_heads, head_dim)
+
+    assert out_cute.shape == out_ref_fp32.shape, (
+        f"Shape mismatch: {out_cute.shape} vs {out_ref_fp32.shape}"
+    )
+
+    test_name = f"{cute_score_mod.__name__} (varlen_q={varlen_q}, varlen_k={varlen_k}, paged={page_size is not None})"
+    extra_atol = 2e-3
+    check_results(
+        out_cute,
+        out_ref_fp32,
+        out_pt,
+        test_name,
+        extra_atol=extra_atol,
+        seqlens_q=seqlens_q if varlen_q else None,
+        cu_seqlens_q=cu_seqlens_q if varlen_q else None,
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("page_size", [None, 128])
+@pytest.mark.parametrize("varlen_q", [True, False])
+@pytest.mark.parametrize("varlen_k", [True, False])
+@pytest.mark.parametrize("qhead_per_kvhead,num_kv_heads", [(1, 1), (4, 2)])
+@pytest.mark.parametrize("seqlens_q,seqlens_k", SEQLEN_CONFIGS)
+@pytest.mark.parametrize("score_mod_tuple", TEST_PAIRS_WITH_GLOBAL)
+def test_varlen_score_mod_with_paged_kvcache_global(
+    seqlens_q,
+    seqlens_k,
+    varlen_q,
+    varlen_k,
+    qhead_per_kvhead,
+    num_kv_heads,
+    page_size,
+    dtype,
+    score_mod_tuple,
+):
+    """Test varlen attention with global idx score_mod and paged KV cache."""
+    if page_size is not None and varlen_k:
+        pytest.skip("Paged KV cache requires batched (non-varlen) K")
+
+    if not varlen_q and not varlen_k:
+        pytest.skip(
+            "At least one of varlen_q or varlen_k must be True for varlen tests"
+        )
+
+    if not varlen_q:
+        seqlens_q = [seqlens_q[0]] * len(seqlens_q)
+    if not varlen_k:
+        seqlens_k = [seqlens_k[0]] * len(seqlens_k)
+
+    if page_size is not None and not varlen_k:
+        if seqlens_k[0] % page_size != 0:
+            pytest.skip("page_size must divide seqlen_k")
+
+    cute_score_mod, eager_factory, aux_type, requires_global = score_mod_tuple
+
+    if requires_global == "q" and not varlen_q:
+        pytest.skip(f"{cute_score_mod.__name__} requires varlen_q for q_idx_global")
+    if requires_global == "kv" and not varlen_k:
+        pytest.skip(f"{cute_score_mod.__name__} requires varlen_k for kv_idx_global")
+    if requires_global == "both" and (not varlen_q or not varlen_k):
+        pytest.skip(f"{cute_score_mod.__name__} requires both varlen_q and varlen_k")
+
+    torch.random.manual_seed(42)
+
+    num_heads = num_kv_heads * qhead_per_kvhead
+    pack_gqa = qhead_per_kvhead > 1
+    head_dim = 128
+    batch_size = len(seqlens_q)
+    max_rel_pos = 512
+    device = "cuda"
+
+    total_q = sum(seqlens_q)
+    total_k = sum(seqlens_k)
+
+    cu_seqlens_q = torch.tensor(
+        [0] + list(torch.tensor(seqlens_q).cumsum(0).tolist()),
+        device=device,
+        dtype=torch.int32,
+    )
+    cu_seqlens_k = torch.tensor(
+        [0] + list(torch.tensor(seqlens_k).cumsum(0).tolist()),
+        device=device,
+        dtype=torch.int32,
+    )
+    cu_seqlens_k_for_kernel = cu_seqlens_k if varlen_k else None
+
+    q = torch.randn(total_q, num_heads, head_dim, device=device, dtype=dtype)
+    if varlen_k:
+        k = torch.randn(total_k, num_heads, head_dim, device=device, dtype=dtype)
+        v = torch.randn(total_k, num_heads, head_dim, device=device, dtype=dtype)
+    else:
+        seqlen_k = seqlens_k[0]
+        k = torch.randn(
+            batch_size, seqlen_k, num_heads, head_dim, device=device, dtype=dtype
+        )
+        v = torch.randn(
+            batch_size, seqlen_k, num_heads, head_dim, device=device, dtype=dtype
+        )
+
+    if pack_gqa:
+        if varlen_k:
+            k = k[:, :num_kv_heads, :].clone()
+            v = v[:, :num_kv_heads, :].clone()
+        else:
+            k = k[:, :, :num_kv_heads, :].clone()
+            v = v[:, :, :num_kv_heads, :].clone()
+
+    page_table = None
+    k_cache_paged = None
+    v_cache_paged = None
+    k_cache = k
+    v_cache = v
+
+    if page_size is not None:
+        seqlen_k = seqlens_k[0]
+        (
+            k_cache_bhsd,
+            v_cache_bhsd,
+            page_table,
+            k_cache_paged,
+            v_cache_paged,
+            num_blocks,
+        ) = _generate_block_kvcache(
+            seqlen_k, page_size, batch_size, num_kv_heads, head_dim, device, dtype
+        )
+        k_cache = k_cache_bhsd.transpose(1, 2)  # BHSD -> BSHD
+        v_cache = v_cache_bhsd.transpose(1, 2)
+        seqused_k = torch.tensor(seqlens_k, dtype=torch.int32, device=device)
+    else:
+        seqused_k = None
+
+    if aux_type == "kv":
+        bias = torch.randn(total_k, device=device, dtype=dtype) * 0.1
+        aux_tensors = [bias]
+        eager_score_mod = eager_factory(bias, cu_seqlens_k)
+    elif aux_type == "q":
+        bias = torch.randn(total_q, device=device, dtype=dtype) * 0.1
+        aux_tensors = [bias]
+        eager_score_mod = eager_factory(bias, cu_seqlens_q)
+    elif aux_type == "q_and_kv":
+        q_bias = torch.randn(total_q, device=device, dtype=dtype) * 0.1
+        kv_bias = torch.randn(total_k, device=device, dtype=dtype) * 0.1
+        aux_tensors = [q_bias, kv_bias]
+        eager_score_mod = eager_factory(q_bias, kv_bias, cu_seqlens_q, cu_seqlens_k)
+    elif aux_type == "q_concat":
+        bias = torch.randn(total_q, device=device, dtype=dtype) * 0.1
+        aux_tensors = [bias]
+        eager_score_mod = eager_factory(bias, cu_seqlens_q)
+    elif aux_type == "kv_with_cu":
+        kv_bias = torch.randn(total_k, device=device, dtype=dtype) * 0.1
+        aux_tensors = [kv_bias]
+        eager_score_mod = eager_factory(kv_bias, cu_seqlens_q, cu_seqlens_k)
+    elif aux_type == "multi_buffer":
+        batch_bias = torch.randn(batch_size, device=device, dtype=dtype) * 0.1
+        head_scale = torch.randn(num_heads, device=device, dtype=dtype) * 0.1 + 1.0
+        q_pos_bias = torch.randn(total_q, device=device, dtype=dtype) * 0.1
+        kv_pos_bias = torch.randn(total_k, device=device, dtype=dtype) * 0.1
+        rel_pos_scale = (
+            torch.randn(max_rel_pos * 2 + 1, device=device, dtype=dtype) * 0.1
+        )
+        aux_tensors = [batch_bias, head_scale, q_pos_bias, kv_pos_bias, rel_pos_scale]
+        eager_score_mod = eager_factory(
+            batch_bias,
+            head_scale,
+            q_pos_bias,
+            kv_pos_bias,
+            rel_pos_scale,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            max_rel_pos,
+        )
+    else:
+        raise ValueError(f"Unknown aux_type: {aux_type}")
+
+    q_ref, k_ref, v_ref, ref_cu_q, ref_cu_k = prepare_ref_tensors(
+        q,
+        k_cache,
+        v_cache,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        True,
+        varlen_k,
+        batch_size,
+        seqlens_q,
+    )
+
+    out_ref_fp32 = run_flex_varlen_ref(
+        q_ref, k_ref, v_ref, ref_cu_q, ref_cu_k, eager_score_mod, dtype=torch.float32
+    )
+    out_pt = run_flex_varlen_ref(
+        q_ref, k_ref, v_ref, ref_cu_q, ref_cu_k, eager_score_mod, dtype=dtype
+    )
+
+    # Run CuTE
+    k_input = k_cache_paged if page_size is not None else k_cache
+    v_input = v_cache_paged if page_size is not None else v_cache
+
+    out_cute = torch.empty_like(q)
+    _flash_attn_fwd(
+        q,
+        k_input,
+        v_input,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k_for_kernel if page_size is None else None,
+        seqused_k=seqused_k if page_size is not None else None,
+        page_table=page_table,
+        return_lse=True,
+        score_mod=cute_score_mod,
+        out=out_cute,
+        lse=None,
+        aux_tensors=aux_tensors,
+        pack_gqa=pack_gqa,
+    )
+
+    assert out_cute.shape == out_ref_fp32.shape, (
+        f"Shape mismatch: {out_cute.shape} vs {out_ref_fp32.shape}"
+    )
+
+    test_name = f"{cute_score_mod.__name__} (paged={page_size is not None}, {aux_type})"
+    check_results(
+        out_cute,
+        out_ref_fp32,
+        out_pt,
+        test_name,
+        extra_atol=1e-3,
+        seqlens_q=seqlens_q,
+        cu_seqlens_q=cu_seqlens_q,
     )
 
 
