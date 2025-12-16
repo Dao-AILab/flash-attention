@@ -67,7 +67,7 @@ def create_softcap_scoremod(softcap_val):
     inv_softcap = 1.0 / softcap_val
 
     @cute.jit
-    def scoremod_premask_fn(acc_S_SSA, batch_idx, head_idx, q_idx, kv_idx, buffers):
+    def scoremod_premask_fn(acc_S_SSA, batch_idx, head_idx, q_idx, kv_idx, aux_tensors):
         scores = acc_S_SSA * inv_softcap
         return scores * cute.math.tanh(scores, fastmath=True)
 
