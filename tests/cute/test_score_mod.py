@@ -5,7 +5,7 @@ import cutlass.cute as cute
 from cutlass._mlir.dialects import math as mlir_math
 import operator
 from torch.nn.attention.flex_attention import flex_attention
-from flash_attn.cute.interface import _flash_attn_fwd
+from flash_attn.cute.interface import _flash_attn_fwd, _flash_attn_bwd
 from score_mod_definitions import (
     # TensorSSA-based score mods
     score_mod_identity as score_mod_1,
@@ -595,6 +595,314 @@ def test_score_mod_with_paged_kvcache_aux_tensors(
     assert cute_error <= rtol * pt_error + fwd_atol, (
         f"CuTE error {cute_error:.2e} exceeds {rtol}x PyTorch error {pt_error:.2e} + {fwd_atol:.2e}"
     )
+
+
+@cute.jit
+def score_mod_bwd_5(grad, score, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+    """Backward for score_mod_5 (times_two): d(score*2)/d(score) = 2."""
+    return grad * cute.full_like(grad, 2.0)
+
+
+@cute.jit
+def score_mod_bwd_3(grad, score, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+    """Backward for score_mod_3 (relative_bias): d(score + |q-kv|)/d(score) = 1."""
+    return grad
+
+
+@cute.jit
+def score_mod_bwd_identity(grad, score, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+    return grad
+
+
+@cute.jit
+def score_mod_squared(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+    """Forward: score ** 2."""
+    return tSrS_ssa * tSrS_ssa
+
+
+@cute.jit
+def score_mod_bwd_squared(grad, score, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+    """Backward for score**2: d(score**2)/d(score) = 2*score."""
+    return grad * cute.full_like(grad, 2.0) * score
+
+
+def score_squared_eager(score, b, h, q_idx, kv_idx):
+    return score * score
+
+
+BWD_TEST_PAIRS = [
+    (score_mod_5, score_mod_bwd_5, times_two_eager),
+    (score_mod_3, score_mod_bwd_3, relative_bias_eager),
+    (score_mod_squared, score_mod_bwd_squared, score_squared_eager),
+]
+
+BWD_TEST_PAIRS_WITH_AUX = [
+    (score_mod_10, score_mod_bwd_identity, batch_bias),
+    (score_mod_11, score_mod_bwd_identity, dual_buffer_bias),
+]
+
+BWD_TEST_PAIRS_PACK_GQA = [
+    (score_mod_5, score_mod_bwd_5, times_two_eager),
+    (score_mod_3, score_mod_bwd_3, relative_bias_eager),
+]
+
+
+def run_cute_flash_bwd(
+    q, k, v, cute_score_mod, cute_score_mod_bwd, aux_tensors=None, pack_gqa=False
+):
+    """Run flash attention forward + backward with score_mod."""
+    q_t = q.transpose(1, 2)
+    k_t = k.transpose(1, 2)
+    v_t = v.transpose(1, 2)
+
+    out, lse = _flash_attn_fwd(
+        q_t, k_t, v_t,
+        return_lse=True,
+        score_mod=cute_score_mod,
+        aux_tensors=aux_tensors,
+        pack_gqa=pack_gqa,
+    )
+
+    grad_out = torch.randn_like(out)
+
+    dq, dk, dv = _flash_attn_bwd(
+        q_t, k_t, v_t,
+        out, grad_out, lse,
+        score_mod=cute_score_mod,
+        score_mod_bwd=cute_score_mod_bwd,
+        aux_tensors=aux_tensors,
+        pack_gqa=pack_gqa,
+    )
+
+    return (
+        out.transpose(1, 2),
+        grad_out.transpose(1, 2),
+        dq.transpose(1, 2),
+        dk.transpose(1, 2),
+        dv.transpose(1, 2),
+    )
+
+
+def run_flex_reference_bwd(q, k, v, eager_score_mod, grad_out, dtype=None):
+    """Run flex_attention forward + backward for reference."""
+    if dtype is not None:
+        q = q.to(dtype).requires_grad_(True)
+        k = k.to(dtype).requires_grad_(True)
+        v = v.to(dtype).requires_grad_(True)
+        grad_out = grad_out.to(dtype)
+    else:
+        q = q.requires_grad_(True)
+        k = k.requires_grad_(True)
+        v = v.requires_grad_(True)
+
+    compiled_flex = torch.compile(flex_attention)
+    out = compiled_flex(
+        q, k, v, score_mod=eager_score_mod, enable_gqa=q.shape[1] != k.shape[1]
+    )
+    dq, dk, dv = torch.autograd.grad(out, (q, k, v), grad_out)
+
+    return out, dq, dk, dv
+
+
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_kv",
+    [
+        (64, 64),
+        (128, 128),
+        (256, 256),
+        (512, 512),
+        (799, 3),
+        (3, 799),
+        (128, 256),
+        (256, 128),
+        (113, 203),
+    ],
+)
+@pytest.mark.parametrize("dim", [64, 128])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("score_mod_triple", BWD_TEST_PAIRS)
+def test_cute_vs_flex_attention_backward(seqlen_q, seqlen_kv, dim, dtype, score_mod_triple):
+    """Test backward pass with score_mod against flex_attention reference."""
+    torch.random.manual_seed(42)
+    cute_fwd, cute_bwd, eager_ref = score_mod_triple
+
+    q, k, v = create_tensors(
+        seqlen_q=seqlen_q, seqlen_kv=seqlen_kv, num_heads=4, dim=dim, dtype=dtype
+    )
+
+    out_cute, grad_out, dq_cute, dk_cute, dv_cute = run_cute_flash_bwd(
+        q, k, v, cute_fwd, cute_bwd
+    )
+    out_ref_fp32, dq_ref_fp32, dk_ref_fp32, dv_ref_fp32 = run_flex_reference_bwd(
+        q, k, v, eager_ref, grad_out, dtype=torch.float32
+    )
+    out_pt, dq_pt, dk_pt, dv_pt = run_flex_reference_bwd(
+        q, k, v, eager_ref, grad_out
+    )
+
+    assert not torch.isnan(dq_cute).any(), "dQ contains NaN"
+    assert not torch.isnan(dk_cute).any(), "dK contains NaN"
+    assert not torch.isnan(dv_cute).any(), "dV contains NaN"
+
+    rtol = 2
+    dq_atol = 2 * (dq_ref_fp32 + 0.3 - 0.3 - dq_ref_fp32).abs().max().item()
+    dk_atol = 2 * (dk_ref_fp32 + 0.3 - 0.3 - dk_ref_fp32).abs().max().item()
+    dv_atol = 2 * (dv_ref_fp32 + 0.3 - 0.3 - dv_ref_fp32).abs().max().item()
+
+    dq_ref = dq_ref_fp32.to(dtype)
+    dk_ref = dk_ref_fp32.to(dtype)
+    dv_ref = dv_ref_fp32.to(dtype)
+
+    pt_dq_err = (dq_pt - dq_ref).abs().max().item()
+    pt_dk_err = (dk_pt - dk_ref).abs().max().item()
+    pt_dv_err = (dv_pt - dv_ref).abs().max().item()
+
+    cute_dq_err = (dq_cute - dq_ref).abs().max().item()
+    cute_dk_err = (dk_cute - dk_ref).abs().max().item()
+    cute_dv_err = (dv_cute - dv_ref).abs().max().item()
+
+    print(f"\nBackward comparison for {cute_fwd.__name__}:")
+    print(f"  dQ: PT err={pt_dq_err:.2e}, CuTE err={cute_dq_err:.2e}, atol={dq_atol:.2e}")
+    print(f"  dK: PT err={pt_dk_err:.2e}, CuTE err={cute_dk_err:.2e}, atol={dk_atol:.2e}")
+    print(f"  dV: PT err={pt_dv_err:.2e}, CuTE err={cute_dv_err:.2e}, atol={dv_atol:.2e}")
+
+    assert cute_dq_err <= rtol * pt_dq_err + dq_atol, f"dQ error too large: {cute_dq_err:.2e}"
+    assert cute_dk_err <= rtol * pt_dk_err + dk_atol, f"dK error too large: {cute_dk_err:.2e}"
+    assert cute_dv_err <= rtol * pt_dv_err + dv_atol, f"dV error too large: {cute_dv_err:.2e}"
+
+
+def make_aux_tensors_for_bwd(cute_score_mod, eager_factory, seqlen_q, num_heads, batch_size, dtype):
+    if cute_score_mod == score_mod_10:
+        buffer = torch.randn(batch_size, device="cuda", dtype=dtype) * 0.1
+        return [buffer], eager_factory(buffer)
+    head_bias = torch.randn(num_heads, device="cuda", dtype=dtype) * 0.2
+    pos_scale = torch.arange(seqlen_q, device="cuda", dtype=dtype) * 0.01
+    return [head_bias, pos_scale], eager_factory(head_bias, pos_scale)
+
+
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_kv",
+    [
+        (64, 64),
+        (128, 128),
+        (256, 128),
+    ],
+)
+@pytest.mark.parametrize("dim", [64])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("score_mod_triple", BWD_TEST_PAIRS_WITH_AUX)
+def test_cute_vs_flex_attention_backward_with_aux(
+    seqlen_q, seqlen_kv, dim, dtype, score_mod_triple
+):
+    torch.random.manual_seed(42)
+    cute_fwd, cute_bwd, eager_factory = score_mod_triple
+
+    q, k, v = create_tensors(
+        seqlen_q=seqlen_q, seqlen_kv=seqlen_kv, num_heads=4, dim=dim, dtype=dtype
+    )
+
+    aux_tensors, eager_ref = make_aux_tensors_for_bwd(
+        cute_fwd, eager_factory, seqlen_q, q.shape[1], q.shape[0], dtype
+    )
+
+    out_cute, grad_out, dq_cute, dk_cute, dv_cute = run_cute_flash_bwd(
+        q, k, v, cute_fwd, cute_bwd, aux_tensors=aux_tensors
+    )
+    out_ref_fp32, dq_ref_fp32, dk_ref_fp32, dv_ref_fp32 = run_flex_reference_bwd(
+        q, k, v, eager_ref, grad_out, dtype=torch.float32
+    )
+    out_pt, dq_pt, dk_pt, dv_pt = run_flex_reference_bwd(
+        q, k, v, eager_ref, grad_out
+    )
+
+    assert not torch.isnan(dq_cute).any()
+    assert not torch.isnan(dk_cute).any()
+    assert not torch.isnan(dv_cute).any()
+
+    rtol = 3
+    dq_atol = 2 * (dq_ref_fp32 + 0.3 - 0.3 - dq_ref_fp32).abs().max().item()
+    dk_atol = 2 * (dk_ref_fp32 + 0.3 - 0.3 - dk_ref_fp32).abs().max().item()
+    dv_atol = 2 * (dv_ref_fp32 + 0.3 - 0.3 - dv_ref_fp32).abs().max().item()
+
+    dq_ref = dq_ref_fp32.to(dtype)
+    dk_ref = dk_ref_fp32.to(dtype)
+    dv_ref = dv_ref_fp32.to(dtype)
+
+    pt_dq_err = (dq_pt - dq_ref).abs().max().item()
+    pt_dk_err = (dk_pt - dk_ref).abs().max().item()
+    pt_dv_err = (dv_pt - dv_ref).abs().max().item()
+
+    cute_dq_err = (dq_cute - dq_ref).abs().max().item()
+    cute_dk_err = (dk_cute - dk_ref).abs().max().item()
+    cute_dv_err = (dv_cute - dv_ref).abs().max().item()
+
+    print(f"\nBackward comparison with aux for {cute_fwd.__name__}:")
+    print(f"  dQ: PT err={pt_dq_err:.2e}, CuTE err={cute_dq_err:.2e}, atol={dq_atol:.2e}")
+    print(f"  dK: PT err={pt_dk_err:.2e}, CuTE err={cute_dk_err:.2e}, atol={dk_atol:.2e}")
+    print(f"  dV: PT err={pt_dv_err:.2e}, CuTE err={cute_dv_err:.2e}, atol={dv_atol:.2e}")
+
+    assert cute_dq_err <= rtol * pt_dq_err + dq_atol, f"dQ error too large: {cute_dq_err:.2e}"
+    assert cute_dk_err <= rtol * pt_dk_err + dk_atol, f"dK error too large: {cute_dk_err:.2e}"
+    assert cute_dv_err <= rtol * pt_dv_err + dv_atol, f"dV error too large: {cute_dv_err:.2e}"
+
+
+@pytest.mark.parametrize("seqlen_q,seqlen_kv", [(128, 128), (128, 256)])
+@pytest.mark.parametrize("dim", [64])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("qhead_per_kvhead,num_kv_heads", [(4, 2)])
+@pytest.mark.parametrize("score_mod_triple", BWD_TEST_PAIRS_PACK_GQA)
+def test_cute_vs_flex_attention_backward_pack_gqa(
+    seqlen_q, seqlen_kv, dim, dtype, qhead_per_kvhead, num_kv_heads, score_mod_triple
+):
+    torch.random.manual_seed(42)
+    cute_fwd, cute_bwd, eager_ref = score_mod_triple
+
+    num_q_heads = num_kv_heads * qhead_per_kvhead
+    q, k, v = create_tensors(
+        seqlen_q=seqlen_q, seqlen_kv=seqlen_kv, num_heads=num_q_heads, dim=dim, dtype=dtype
+    )
+    k = k[:, :num_kv_heads, :, :].clone()
+    v = v[:, :num_kv_heads, :, :].clone()
+
+    out_cute, grad_out, dq_cute, dk_cute, dv_cute = run_cute_flash_bwd(
+        q, k, v, cute_fwd, cute_bwd, pack_gqa=True
+    )
+    out_ref_fp32, dq_ref_fp32, dk_ref_fp32, dv_ref_fp32 = run_flex_reference_bwd(
+        q, k, v, eager_ref, grad_out, dtype=torch.float32
+    )
+    out_pt, dq_pt, dk_pt, dv_pt = run_flex_reference_bwd(
+        q, k, v, eager_ref, grad_out
+    )
+
+    assert not torch.isnan(dq_cute).any()
+    assert not torch.isnan(dk_cute).any()
+    assert not torch.isnan(dv_cute).any()
+
+    rtol = 3
+    dq_atol = 2 * (dq_ref_fp32 + 0.3 - 0.3 - dq_ref_fp32).abs().max().item()
+    dk_atol = 2 * (dk_ref_fp32 + 0.3 - 0.3 - dk_ref_fp32).abs().max().item()
+    dv_atol = 2 * (dv_ref_fp32 + 0.3 - 0.3 - dv_ref_fp32).abs().max().item()
+
+    dq_ref = dq_ref_fp32.to(dtype)
+    dk_ref = dk_ref_fp32.to(dtype)
+    dv_ref = dv_ref_fp32.to(dtype)
+
+    pt_dq_err = (dq_pt - dq_ref).abs().max().item()
+    pt_dk_err = (dk_pt - dk_ref).abs().max().item()
+    pt_dv_err = (dv_pt - dv_ref).abs().max().item()
+
+    cute_dq_err = (dq_cute - dq_ref).abs().max().item()
+    cute_dk_err = (dk_cute - dk_ref).abs().max().item()
+    cute_dv_err = (dv_cute - dv_ref).abs().max().item()
+
+    print(f"\nBackward Pack-GQA comparison for {cute_fwd.__name__}:")
+    print(f"  dQ: PT err={pt_dq_err:.2e}, CuTE err={cute_dq_err:.2e}, atol={dq_atol:.2e}")
+    print(f"  dK: PT err={pt_dk_err:.2e}, CuTE err={cute_dk_err:.2e}, atol={dk_atol:.2e}")
+    print(f"  dV: PT err={pt_dv_err:.2e}, CuTE err={cute_dv_err:.2e}, atol={dv_atol:.2e}")
+
+    assert cute_dq_err <= rtol * pt_dq_err + dq_atol, f"dQ error too large: {cute_dq_err:.2e}"
+    assert cute_dk_err <= rtol * pt_dk_err + dk_atol, f"dK error too large: {cute_dk_err:.2e}"
+    assert cute_dv_err <= rtol * pt_dv_err + dv_atol, f"dV error too large: {cute_dv_err:.2e}"
 
 
 if __name__ == "__main__":
