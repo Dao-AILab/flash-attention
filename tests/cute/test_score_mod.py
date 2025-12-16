@@ -615,6 +615,16 @@ def score_mod_bwd_identity(grad, score, b_idx, h_idx, q_idx, kv_idx, seqlen_info
 
 
 @cute.jit
+def score_mod_bwd_causal(grad, score, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+    """Backward for causal masking: d(where(mask, score, -inf))/d(score) = where(mask, 1, 0).
+    
+    At unmasked positions (q_idx >= kv_idx), grad passes through.
+    At masked positions (q_idx < kv_idx), the kernel already zeros grad because P=0.
+    """
+    return grad
+
+
+@cute.jit
 def score_mod_squared(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
     """Forward: score ** 2."""
     return tSrS_ssa * tSrS_ssa
@@ -634,6 +644,7 @@ BWD_TEST_PAIRS = [
     (score_mod_5, score_mod_bwd_5, times_two_eager),
     (score_mod_3, score_mod_bwd_3, relative_bias_eager),
     (score_mod_squared, score_mod_bwd_squared, score_squared_eager),
+    (score_mod_2, score_mod_bwd_causal, causal_mask_eager),
 ]
 
 BWD_TEST_PAIRS_WITH_AUX = [

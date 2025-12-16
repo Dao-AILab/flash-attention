@@ -440,9 +440,24 @@ class AttentionMask:
         mask_seqlen: cutlass.Constexpr,
         mask_causal: cutlass.Constexpr,
         mask_local: cutlass.Constexpr,
+        mask_mod: cutlass.Constexpr[Optional[Callable]] = None,
+        batch_idx: Int32 = None,
+        head_idx: Int32 = None,
+        aux_tensors: Optional[list] = None,
+        fastdiv_mods=(None, None),
+        is_full_block: bool = False,
+        check_m_boundary: bool = True,
     ) -> None:
         """
         Backward pass: mask S = K @ Q.T where n_block tiles seqlen_k and m_block tiles seqlen_q.
+
+        Coordinate conventio:
+        - ROW corresponds to Q (m_block)
+        - COL corresponds to KV (n_block)
+
+        is_full_block: If True, skip mask_mod (all elements valid). Only apply seqlen masking.
+        check_m_boundary: If False, skip seqlen_q boundary check (optimization for non-boundary m_blocks).
+                          When iterating m_blocks in forward order, only the last m_block may be partial.
         """
         assert not (mask_causal and mask_local), "mask_causal and mask_local cannot be both True"
         ROW = 0 if const_expr(not self.swap_AB) else 1
@@ -450,7 +465,81 @@ class AttentionMask:
         assert t0ScS_t2r[0][COL] == 0, "col0 == 0"
         thr_col_offset = tScS_t2r[0][COL]
         seqlenk_col_limit = self.seqlen_k - n_block * self.tile_n - thr_col_offset
-        if const_expr(not mask_causal and not mask_local):
+
+        if const_expr(not mask_causal and not mask_local and mask_mod is not None):
+            # Block sparse case with mask_mod (backward)
+            #
+            # Coordinate convention: ROW → Q (m_block), COL → KV (n_block).
+            # These already account for swap_AB.
+            #
+            # FULL blocks: mask_mod returns True for all elements, so skip it.
+            #   Still need seqlen bounds check (elements may be OOB on last m_block).
+            # PARTIAL blocks: apply mask_mod element-wise, then seqlen bounds.
+            if is_full_block:
+                if const_expr(mask_seqlen):
+                    if seqlenk_col_limit <= 0:
+                        # Entire tile is OOB for K
+                        for i in cutlass.range(cute.size(acc_S.shape), unroll_full=True):
+                            acc_S[i] = -cutlass.Float32.inf
+                    elif check_m_boundary:
+                        # Last m_block: check Q and K boundaries
+                        ncol = const_expr(cute.size(tScS_t2r.shape))
+                        for i in cutlass.range_constexpr(ncol):
+                            row_coord = tScS_t2r[i][ROW]
+                            col_coord = tScS_t2r[i][COL]
+                            global_q = row_coord + m_block * self.tile_m
+                            global_kv = col_coord + n_block * self.tile_n
+                            q_out_of_bounds = global_q >= self.seqlen_q
+                            kv_out_of_bounds = global_kv >= self.seqlen_k
+                            out_of_bounds = q_out_of_bounds or kv_out_of_bounds
+                            acc_S[i] = -cutlass.Float32.inf if out_of_bounds else acc_S[i]
+            else:
+                # Partial block
+                has_fastdiv = const_expr(
+                    fastdiv_mods is not None
+                    and fastdiv_mods[0] is not None
+                    and fastdiv_mods[1] is not None
+                )
+                wrap_aux_indices = const_expr(
+                    has_fastdiv and mask_seqlen and const_expr(aux_tensors is not None)
+                )
+                batch_idx_ssa = utils.scalar_to_ssa(batch_idx, cutlass.Int32)
+                head_idx_ssa = utils.scalar_to_ssa(head_idx, cutlass.Int32)
+
+                ncol = const_expr(cute.size(tScS_t2r.shape))
+                for i in cutlass.range_constexpr(ncol):
+                    row_coord = tScS_t2r[i][ROW]
+                    col_coord = tScS_t2r[i][COL]
+                    global_q = row_coord + m_block * self.tile_m
+                    global_kv = col_coord + n_block * self.tile_n
+
+                    q_idx_for_mod = global_q
+                    kv_idx_for_mod = global_kv
+                    if const_expr(wrap_aux_indices):
+                        _, q_idx_for_mod = divmod(global_q, fastdiv_mods[0])
+                        _, kv_idx_for_mod = divmod(global_kv, fastdiv_mods[1])
+
+                    q_idx_ssa = utils.scalar_to_ssa(q_idx_for_mod, cutlass.Int32)
+                    kv_idx_ssa = utils.scalar_to_ssa(kv_idx_for_mod, cutlass.Int32)
+
+                    mask_value = mask_mod(
+                        batch_idx_ssa,
+                        head_idx_ssa,
+                        q_idx_ssa,
+                        kv_idx_ssa,
+                        aux_tensors,
+                    )
+                    cond = cutlass.Boolean(utils.ssa_to_scalar(mask_value))
+                    acc_S[i] = acc_S[i] if cond else -cutlass.Float32.inf
+
+                    if const_expr(mask_seqlen):
+                        # check_m_boundary=False skips q check for non-boundary m_blocks
+                        q_out_of_bounds = check_m_boundary and (global_q >= self.seqlen_q)
+                        kv_out_of_bounds = global_kv >= self.seqlen_k
+                        out_of_bounds = q_out_of_bounds or kv_out_of_bounds
+                        acc_S[i] = -cutlass.Float32.inf if out_of_bounds else acc_S[i]
+
+        elif const_expr(not mask_causal and not mask_local):
             if const_expr(mask_seqlen):
                 if seqlenk_col_limit <= 0:
                     for i in cutlass.range(cute.size(acc_S.shape), unroll_full=True):
