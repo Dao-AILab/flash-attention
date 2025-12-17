@@ -658,11 +658,11 @@ class GPTLMHeadModel(GPTPreTrainedModel, GenerationMixin):
             lm_logits = self.lm_head(hidden_states)
         else:
             lm_head_weight = F.normalize(self.lm_head.weight)
-            if isinstance(self.lm_head, ColumnParallelLinear) and self.lm_head.sequence_parallel:
+            if ColumnParallelLinear is not None and isinstance(self.lm_head, ColumnParallelLinear) and self.lm_head.sequence_parallel:
                 hidden_states = all_gather(hidden_states, self.lm_head.process_group)
             lm_logits = F.linear(hidden_states, lm_head_weight, bias=self.lm_head.bias)
         # During inference, we want the full logit for sampling
-        if isinstance(self.lm_head, ColumnParallelLinear) and inference_params is not None:
+        if ColumnParallelLinear is not None and isinstance(self.lm_head, ColumnParallelLinear) and inference_params is not None:
             lm_logits, _ = all_gather_raw(lm_logits, self.lm_head.process_group)
             lm_logits = rearrange(lm_logits, "(n b) ... d -> b ... (n d)", b=b)
         CausalLMOutput = namedtuple("CausalLMOutput", ["logits"])
