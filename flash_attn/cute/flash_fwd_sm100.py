@@ -658,7 +658,11 @@ class FlashAttentionForwardSm100:
             seqlen_q = cute.size(mQ.shape[0]) // (
                 self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1
             )
-            seqlen_k = cute.size(mK.shape[0])
+            seqlen_k = (
+                cute.size(mK.shape[0])
+                if const_expr(mPageTable is None)
+                else mK.shape[0] * mPageTable.shape[1]
+            )
             seqlen_q_divmod = FastDivmodDivisor(seqlen_q)
             seqlen_k_divmod = FastDivmodDivisor(seqlen_k)
             fastdiv_mods = (seqlen_q_divmod, seqlen_k_divmod)
@@ -1624,6 +1628,26 @@ class FlashAttentionForwardSm100:
                 head_idx=head_idx,
                 aux_tensors=aux_tensors,
             )
+
+            # Recompute fastdiv_mods if necessary
+            recompute_fastdiv_mods_q = cutlass.const_expr(
+                aux_tensors is not None and (seqlen.has_cu_seqlens_q or seqlen.has_seqused_q)
+            )
+            recompute_fastdiv_mods_k = cutlass.const_expr(
+                aux_tensors is not None and (seqlen.has_cu_seqlens_k or seqlen.has_seqused_k)
+            )
+
+            if cutlass.const_expr(fastdiv_mods is not None):
+                seqlen_q_divmod, seqlen_k_divmod = fastdiv_mods
+                fastdiv_mods = (
+                    seqlen_q_divmod
+                    if not recompute_fastdiv_mods_q
+                    else FastDivmodDivisor(seqlen.seqlen_q),
+                    seqlen_k_divmod
+                    if not recompute_fastdiv_mods_k
+                    else FastDivmodDivisor(seqlen.seqlen_k),
+                )
+
             mask_mod = self.mask_mod if const_expr(self.mask_mod is not None) else None
             mask_fn = partial(
                 mask.apply_mask_sm100,
@@ -1874,6 +1898,7 @@ class FlashAttentionForwardSm100:
                 m_block,
                 n_block,
                 softmax,
+                seqlen,
                 aux_tensors,
                 fastdiv_mods,
             )
@@ -2369,7 +2394,7 @@ class FlashAttentionForwardSm100:
                 self.check_hdim_v_oob,
                 self.qhead_per_kvhead,
             )
-        
+
             # load acc O from smem to rmem for wider vectorization
             tOrO = cute.make_fragment_like(tOsO, self.o_dtype)
             cute.autovec_copy(tOsO, tOrO)
@@ -2637,6 +2662,7 @@ class FlashAttentionForwardSm100:
         m_block,
         n_block,
         softmax,
+        seqlen: SeqlenInfoQK,
         aux_tensors=None,
         fastdiv_mods=(None, None),
     ):
@@ -2673,6 +2699,7 @@ class FlashAttentionForwardSm100:
             self.qk_acc_dtype,
             aux_tensors,
             fastdiv_mods,
+            seqlen_info=seqlen,
             constant_q_idx=q_idx_logical,
             qhead_per_kvhead=self.qhead_per_kvhead if cutlass.const_expr(self.pack_gqa) else 1,
         )

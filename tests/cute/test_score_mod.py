@@ -5,219 +5,35 @@ import cutlass.cute as cute
 from cutlass._mlir.dialects import math as mlir_math
 import operator
 from torch.nn.attention.flex_attention import flex_attention
-from flash_attn.cute.interface import _flash_attn_fwd
-
-
-@cute.jit
-def score_mod_1(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
-    tmp0 = tSrS_ssa
-    tSrS_ssa = tmp0
-    return tSrS_ssa
-
-
-@cute.jit
-def score_mod_2(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
-    tmp0 = q_idx
-    tmp1 = kv_idx
-    tmp2 = operator.ge(tmp0, tmp1)
-    tmp3 = tSrS_ssa
-    tmp4 = cute.where(tmp2, tmp3, cute.full_like(tmp3, float("-inf")))
-    tSrS_ssa = tmp4
-    return tSrS_ssa
-
-
-@cute.jit
-def score_mod_3(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
-    tmp0 = tSrS_ssa
-    tmp1 = q_idx
-    tmp2 = kv_idx
-    tmp3 = tmp1 - tmp2
-    tmp4 = cute.TensorSSA(mlir_math.absi(tmp3), tmp3.shape, tmp3.dtype)
-    tmp5 = tmp4.to(cutlass.Float32)
-    tmp6 = tmp0 + tmp5
-    tSrS_ssa = tmp6
-    return tSrS_ssa
-
-
-@cute.jit
-def score_mod_4(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
-    tmp0 = tSrS_ssa
-    tmp1 = q_idx
-    tmp2 = kv_idx
-    tmp3 = tmp1 - tmp2
-    tmp4 = cute.TensorSSA(mlir_math.absi(tmp3), tmp3.shape, tmp3.dtype)
-    tmp5 = tmp4 * cute.full_like(tmp4, 2)
-    tmp6 = tmp5.to(cutlass.Float32)
-    tmp7 = tmp0 + tmp6
-    tSrS_ssa = tmp7
-    return tSrS_ssa
-
-
-@cute.jit
-def score_mod_5(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
-    tmp0 = tSrS_ssa
-    tmp1 = tmp0 * cute.full_like(tmp0, 2)
-    tSrS_ssa = tmp1
-    return tSrS_ssa
-
-
-@cute.jit
-def score_mod_6(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
-    tmp0 = tSrS_ssa
-    tmp1 = tmp0.to(cutlass.Float32)
-    tmp2 = h_idx
-    tmp3 = tmp2 + cute.full_like(tmp2, 1)
-    tmp4 = tmp3 * cute.full_like(tmp3, -8)
-    tmp5 = tmp4.to(cutlass.Float32)
-    tmp6 = tmp5 * cute.full_like(tmp5, 0.125)
-    tmp7 = tmp6 * cute.full_like(tmp6, 0.6931471805599453)
-    tmp8 = cute.math.exp2(tmp7 * 1.4426950408889634)
-    tmp9 = q_idx
-    tmp10 = kv_idx
-    tmp11 = tmp9 - tmp10
-    tmp12 = cute.TensorSSA(mlir_math.absi(tmp11), tmp11.shape, tmp11.dtype)
-    tmp13 = tmp12.to(cutlass.Float32)
-    tmp14 = tmp8 * tmp13
-    tmp15 = tmp1 - tmp14
-    tSrS_ssa = tmp15
-    return tSrS_ssa
-
-
-@cute.jit
-def score_mod_7(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
-    tmp0 = q_idx
-    tmp1 = kv_idx
-    tmp2 = tmp0 - tmp1
-    tmp3 = cute.TensorSSA(mlir_math.absi(tmp2), tmp2.shape, tmp2.dtype)
-    tmp4 = operator.le(tmp3, cute.full_like(tmp3, 256))
-    tmp5 = tSrS_ssa
-    tmp6 = cute.where(tmp4, tmp5, cute.full_like(tmp5, float("-inf")))
-    tSrS_ssa = tmp6
-    return tSrS_ssa
-
-
-@cute.jit
-def score_mod_8(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
-    tmp0 = q_idx
-    tmp1 = kv_idx
-    tmp2 = tSrS_ssa
-    tmp3 = cute.where(
-        operator.eq(tmp0 // 64, tmp1 // 64), tmp2, cute.full_like(tmp2, float("-inf"))
-    )
-    tSrS_ssa = tmp3
-    return tSrS_ssa
-
-
-@cute.jit
-def score_mod_9(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
-    tmp0 = q_idx
-    tmp1 = kv_idx
-    tmp2 = tmp0 - tmp1
-    tmp3 = operator.ge(tmp2, cute.full_like(tmp2, 0))
-    tmp4 = tSrS_ssa
-    tmp5 = cute.where(tmp3, tmp4, cute.full_like(tmp4, float("-inf")))
-    tSrS_ssa = tmp5
-    return tSrS_ssa
-
-
-@cute.jit
-def score_mod_10(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
-    batch_bias = aux_tensors[0]
-
-    # Detect dtype from buffer element type
-    dtype = batch_bias.element_type
-
-    b_frag = cute.make_fragment(1, cutlass.Int32)
-    b_frag.store(b_idx)
-    bias_frag = cute.make_fragment(1, dtype)
-    bias_frag[0] = batch_bias[b_frag[0]]
-    bias_val = (bias_frag.load()).to(cutlass.Float32)
-
-    return tSrS_ssa + bias_val
-
-
-@cute.jit
-def score_mod_11(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, aux_tensors):
-    head_bias = aux_tensors[0]
-    pos_bias = aux_tensors[1]
-
-    # Detect dtype from buffer element type
-    dtype = head_bias.element_type
-
-    h_frag = cute.make_fragment(1, cutlass.Int32)
-    h_frag.store(h_idx)
-    head_val_frag = cute.make_fragment(1, dtype)
-    head_val_frag[0] = head_bias[h_frag[0]]
-    head_val = (head_val_frag.load()).to(cutlass.Float32)
-
-    q_frag = cute.make_fragment(1, cutlass.Int32)
-    q_frag.store(q_idx)
-    pos_val_frag = cute.make_fragment(1, dtype)
-    pos_val_frag[0] = pos_bias[q_frag[0]]
-    pos_val = (pos_val_frag.load()).to(cutlass.Float32)
-
-    return tSrS_ssa + head_val + pos_val
-
-
-# Eager reference functions for comparison
-def identity_eager(score, b, h, q_idx, kv_idx):
-    return score
-
-
-def causal_mask_eager(score, b, h, q_idx, kv_idx):
-    return torch.where(q_idx >= kv_idx, score, float("-inf"))
-
-
-def relative_bias_eager(score, b, h, q_idx, kv_idx):
-    return score + torch.abs(q_idx - kv_idx)
-
-
-def relative_bias_v2_eager(score, b, h, q_idx, kv_idx):
-    return score + 2 * torch.abs(q_idx - kv_idx)
-
-
-def times_two_eager(score, b, h, q_idx, kv_idx):
-    return score * 2
-
-
-def alibi_bias_eager(score, b, h, q_idx, kv_idx):
-    slope = 2 ** (-8 * (h + 1) / 8)
-    return score - slope * torch.abs(q_idx - kv_idx)
-
-
-def sliding_window_eager(score, b, h, q_idx, kv_idx):
-    return torch.where(torch.abs(q_idx - kv_idx) <= 256, score, float("-inf"))
-
-
-def block_diagonal_eager(score, b, h, q_idx, kv_idx):
-    q_block = q_idx // 64
-    kv_block = kv_idx // 64
-    return torch.where(q_block == kv_block, score, float("-inf"))
-
-
-def causal_mask_v2_eager(score, b, h, q_idx, kv_idx):
-    return torch.where(q_idx - kv_idx >= 0, score, float("-inf"))
-
-
-def batch_bias(bias_tensor):
-    """Per-batch bias (tests batch indexing)."""
-
-    def batch_bias_mod(score, b, h, q_idx, kv_idx):
-        return score + bias_tensor[b]
-
-    return batch_bias_mod
-
-
-def dual_buffer_bias(head_bias, pos_scale):
-    """Dual buffer loading (tests loading from 2 separate tensors)."""
-
-    def dual_buffer_mod(score, b, h, q_idx, kv_idx):
-        head_component = head_bias[h]
-        pos_component = pos_scale[q_idx]
-        return score + pos_component + head_component
-
-    return dual_buffer_mod
-
+from flash_attn.cute.interface import _flash_attn_fwd, _flash_attn_bwd
+from score_mod_definitions import (
+    # TensorSSA-based score mods
+    score_mod_identity as score_mod_1,
+    score_mod_causal as score_mod_2,
+    score_mod_rel_bias as score_mod_3,
+    score_mod_rel_bias_x2 as score_mod_4,
+    score_mod_times_two as score_mod_5,
+    score_mod_alibi as score_mod_6,
+    score_mod_sliding_window as score_mod_7,
+    score_mod_block_diagonal as score_mod_8,
+    score_mod_causal_v2 as score_mod_9,
+    score_mod_batch_bias as score_mod_10,
+    score_mod_dual_buffer as score_mod_11,
+)  # isort: split
+from score_mod_definitions import (
+    # Eager (torch) reference score mods
+    identity_eager,
+    causal_eager as causal_mask_eager,
+    rel_bias_eager as relative_bias_eager,
+    rel_bias_x2_eager as relative_bias_v2_eager,
+    times_two_eager,
+    alibi_eager as alibi_bias_eager,
+    sliding_window_eager,
+    block_diagonal_eager,
+    causal_v2_eager as causal_mask_v2_eager,
+    batch_bias_factory as batch_bias,
+    dual_buffer_factory as dual_buffer_bias,
+)
 
 # Test pairs: (cute_jit_function, eager_reference_function)
 TEST_PAIRS = [
@@ -236,6 +52,29 @@ TEST_PAIRS = [
 TEST_PAIRS_WITH_AUX_TENSORS = [
     (score_mod_10, batch_bias),
     (score_mod_11, dual_buffer_bias),
+]
+
+SEQLEN_CONFIGS = [
+    (1, 1),
+    (64, 128),
+    (128, 192),
+    (256, 256),
+    (239, 1),
+    (799, 3),
+    (113, 203),
+    (113, 128),
+    (128, 217),
+    (113, 211),
+    (108, 256),
+    (256, 512),
+    (384, 256),
+    (640, 128),
+    (512, 256),
+    (1024, 1024),
+    (1023, 1024),
+    (1024, 1023),
+    (4096, 4096),
+    (4224, 4224),
 ]
 
 
@@ -277,31 +116,7 @@ def run_flex_reference(q, k, v, eager_score_mod, dtype=None) -> torch.Tensor:
     )
 
 
-@pytest.mark.parametrize(
-    "seqlen_q,seqlen_kv",
-    [
-        (1, 1),
-        (64, 128),
-        (128, 192),
-        (256, 256),
-        (239, 1),
-        (799, 3),
-        (113, 203),
-        (113, 128),
-        (128, 217),
-        (113, 211),
-        (108, 256),
-        (256, 512),
-        (384, 256),
-        (640, 128),
-        (512, 256),
-        (1024, 1024),
-        (1023, 1024),
-        (1024, 1023),
-        (4096, 4096),
-        (4224, 4224),
-    ],
-)
+@pytest.mark.parametrize("seqlen_q,seqlen_kv", SEQLEN_CONFIGS)
 @pytest.mark.parametrize("qhead_per_kvhead,num_kv_heads", [(1, 2), (4, 2)])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("score_mod_pair", TEST_PAIRS)
@@ -354,31 +169,7 @@ def test_cute_vs_flex_attention(
     )
 
 
-@pytest.mark.parametrize(
-    "seqlen_q,seqlen_kv",
-    [
-        (1, 1),
-        (64, 128),
-        (128, 192),
-        (256, 256),
-        (239, 1),
-        (799, 3),
-        (113, 203),
-        (113, 128),
-        (128, 217),
-        (113, 211),
-        (108, 256),
-        (256, 512),
-        (384, 256),
-        (640, 128),
-        (512, 256),
-        (1024, 1024),
-        (1023, 1024),
-        (1024, 1023),
-        (4096, 4096),
-        (4224, 4224),
-    ],
-)
+@pytest.mark.parametrize("seqlen_q,seqlen_kv", SEQLEN_CONFIGS)
 @pytest.mark.parametrize("qhead_per_kvhead,num_kv_heads", [(1, 1), (4, 2)])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("score_mod_pair", TEST_PAIRS_WITH_AUX_TENSORS)
@@ -451,48 +242,667 @@ def test_cute_vs_flex_attention_with_aux_tensors(
     )
 
 
-@pytest.mark.xfail(
-    raises=NotImplementedError, reason="Varlen with score_mod not yet supported"
+def _generate_block_kvcache(
+    seqlen_k, page_size, batch_size, nheads_k, d, device, dtype
+):
+    import math
+    from einops import rearrange
+
+    num_blocks = math.ceil(seqlen_k / page_size) * batch_size * 3
+    k_cache_paged = torch.randn(
+        num_blocks, page_size, nheads_k, d, device=device, dtype=dtype
+    )
+    v_cache_paged = torch.randn(
+        num_blocks, page_size, nheads_k, d, device=device, dtype=dtype
+    )
+    page_table = rearrange(
+        torch.randperm(num_blocks, dtype=torch.int32, device=device),
+        "(b nblocks) -> b nblocks",
+        b=batch_size,
+    )
+    k_cache_bshd = rearrange(
+        k_cache_paged[page_table.flatten()],
+        "(b nblocks) block_size ... -> b (nblocks block_size) ...",
+        b=batch_size,
+    )[:, :seqlen_k]
+    v_cache_bshd = rearrange(
+        v_cache_paged[page_table.flatten()],
+        "(b nblocks) block_size ... -> b (nblocks block_size) ...",
+        b=batch_size,
+    )[:, :seqlen_k]
+    k_cache = k_cache_bshd.transpose(1, 2)
+    v_cache = v_cache_bshd.transpose(1, 2)
+    return k_cache, v_cache, page_table, k_cache_paged, v_cache_paged, num_blocks
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("page_size", [None, 1, 4, 128])
+@pytest.mark.parametrize("qhead_per_kvhead,num_kv_heads", [(1, 2), (4, 2)])
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_kv",
+    [
+        (1, 128),
+        (64, 256),
+        (64, 800),
+        (256, 256),
+        (113, 203),
+    ],
 )
-def test_varlen_with_score_mod():
-    """Test that varlen (variable length sequences) works with score_mod.
+@pytest.mark.parametrize("score_mod_pair", TEST_PAIRS)
+def test_score_mod_with_paged_kvcache(
+    seqlen_q,
+    seqlen_kv,
+    qhead_per_kvhead,
+    num_kv_heads,
+    page_size,
+    dtype,
+    score_mod_pair,
+):
+    if page_size is not None and seqlen_kv % page_size != 0:
+        pytest.skip()
 
-    For varlen, tokens from different sequences should not attend to each other.
-    Without proper index mapping, the causal mask will be applied to the global
-    indices instead of per-sequence logical indices.
-    """
     torch.random.manual_seed(42)
+    cute_score_mod, eager_score_mod = score_mod_pair
 
-    seqlens = [64, 56, 128]
-    total_seq = sum(seqlens)
-    num_heads = 4
-    dtype = torch.bfloat16
+    batch_size = 2
+    num_q_heads = num_kv_heads * qhead_per_kvhead
+    pack_gqa = qhead_per_kvhead > 1
+    dim = 128
+    device = "cuda"
 
-    cu_seqlens = torch.tensor(
-        [0] + list(torch.tensor(seqlens).cumsum(0).tolist()),
-        device="cuda",
-        dtype=torch.int32,
+    q = torch.randn(batch_size, num_q_heads, seqlen_q, dim, device=device, dtype=dtype)
+
+    if page_size is None:
+        k_cache = torch.randn(
+            batch_size, num_kv_heads, seqlen_kv, dim, device=device, dtype=dtype
+        )
+        v_cache = torch.randn(
+            batch_size, num_kv_heads, seqlen_kv, dim, device=device, dtype=dtype
+        )
+        page_table = None
+        k_cache_paged = None
+        v_cache_paged = None
+    else:
+        (
+            k_cache,
+            v_cache,
+            page_table,
+            k_cache_paged,
+            v_cache_paged,
+            num_blocks,
+        ) = _generate_block_kvcache(
+            seqlen_kv, page_size, batch_size, num_kv_heads, dim, device, dtype
+        )
+
+    cache_seqlens = torch.randint(
+        1, seqlen_kv + 1, (batch_size,), dtype=torch.int32, device=device
     )
-    q = torch.randn(total_seq, num_heads, 128, device="cuda", dtype=dtype)
-    k = torch.randn(total_seq, num_heads, 128, device="cuda", dtype=dtype)
-    v = torch.randn(total_seq, num_heads, 128, device="cuda", dtype=dtype)
 
-    out_cute = torch.empty_like(q)
+    from einops import rearrange
 
-    _flash_attn_fwd(
-        q,
-        k,
-        v,
-        cu_seqlens_q=cu_seqlens,
-        cu_seqlens_k=cu_seqlens,
+    arange = rearrange(torch.arange(seqlen_kv, device=device), "s -> 1 s")
+    cache_seqlens_expanded = rearrange(cache_seqlens, "b -> b 1")
+    key_padding_mask = arange < cache_seqlens_expanded
+
+    if pack_gqa:
+        k_cache_rep = k_cache.repeat_interleave(qhead_per_kvhead, dim=1)
+        v_cache_rep = v_cache.repeat_interleave(qhead_per_kvhead, dim=1)
+    else:
+        k_cache_rep = k_cache
+        v_cache_rep = v_cache
+
+    def make_masked_score_mod(base_score_mod, seqused_k_tensor):
+        seqused_k_dev = seqused_k_tensor
+
+        def masked_score_mod(score, b, h, q_idx, kv_idx):
+            if base_score_mod is not None:
+                score = base_score_mod(score, b, h, q_idx, kv_idx)
+            seqlen_limit = torch.gather(seqused_k_dev, 0, b.long())
+            valid_mask = kv_idx < seqlen_limit
+            return torch.where(valid_mask, score, torch.full_like(score, float("-inf")))
+
+        return masked_score_mod
+
+    masked_score_mod_fp32 = make_masked_score_mod(eager_score_mod, cache_seqlens)
+    masked_score_mod = make_masked_score_mod(eager_score_mod, cache_seqlens)
+
+    out_ref_fp32 = run_flex_reference(
+        q, k_cache_rep, v_cache_rep, masked_score_mod_fp32, dtype=torch.float32
+    )
+    out_pt = run_flex_reference(q, k_cache_rep, v_cache_rep, masked_score_mod)
+
+    q_bshd = q.transpose(1, 2)
+    out_cute = torch.empty_like(q_bshd)
+
+    if page_size is None:
+        k_bshd = k_cache.transpose(1, 2)
+        v_bshd = v_cache.transpose(1, 2)
+        _flash_attn_fwd(
+            q_bshd,
+            k_bshd,
+            v_bshd,
+            seqused_k=cache_seqlens,
+            return_lse=True,
+            score_mod=cute_score_mod,
+            out=out_cute,
+            lse=None,
+            pack_gqa=pack_gqa,
+        )
+    else:
+        _flash_attn_fwd(
+            q_bshd,
+            k_cache_paged,
+            v_cache_paged,
+            seqused_k=cache_seqlens,
+            page_table=page_table,
+            return_lse=True,
+            score_mod=cute_score_mod,
+            out=out_cute,
+            lse=None,
+            pack_gqa=pack_gqa,
+        )
+
+    out_cute = out_cute.transpose(1, 2)
+
+    assert out_cute.shape == out_ref_fp32.shape == out_pt.shape
+    assert not torch.isnan(out_cute).any()
+    assert not torch.isnan(out_ref_fp32).any()
+    assert not torch.isnan(out_pt).any()
+    assert torch.isfinite(out_cute).all()
+    assert torch.isfinite(out_ref_fp32).all()
+    assert torch.isfinite(out_pt).all()
+
+    fwd_atol = 2 * (out_ref_fp32 + 0.3 - 0.3 - out_ref_fp32).abs().max().item()
+    rtol = 2
+
+    pt_error = (out_pt - out_ref_fp32).abs().max().item()
+    cute_error = (out_cute - out_ref_fp32).abs().max().item()
+
+    print(
+        f"\nNumerical comparison for {cute_score_mod.__name__} (paged={page_size is not None}):"
+    )
+    print(f"  PyTorch vs FP32 ref max error: {pt_error:.2e}")
+    print(f"  CuTE vs FP32 ref max error: {cute_error:.2e}")
+    print(f"  Dynamic absolute tolerance: {fwd_atol:.2e}")
+    print(f"  Error ratio (CuTE/PyTorch): {cute_error / max(pt_error, 1e-10):.2f}")
+
+    assert cute_error <= rtol * pt_error + fwd_atol, (
+        f"CuTE error {cute_error:.2e} exceeds {rtol}x PyTorch error {pt_error:.2e} + {fwd_atol:.2e}"
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("page_size", [None, 128])
+@pytest.mark.parametrize("qhead_per_kvhead,num_kv_heads", [(1, 1), (4, 2)])
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_kv",
+    [
+        (64, 128),
+        (128, 256),
+        (256, 256),
+    ],
+)
+@pytest.mark.parametrize("score_mod_pair", TEST_PAIRS_WITH_AUX_TENSORS)
+def test_score_mod_with_paged_kvcache_aux_tensors(
+    seqlen_q,
+    seqlen_kv,
+    qhead_per_kvhead,
+    num_kv_heads,
+    page_size,
+    dtype,
+    score_mod_pair,
+):
+    if page_size is not None and seqlen_kv % page_size != 0:
+        pytest.skip()
+
+    torch.random.manual_seed(42)
+    cute_score_mod, eager_score_mod_factory = score_mod_pair
+
+    batch_size = 2
+    num_q_heads = num_kv_heads * qhead_per_kvhead
+    pack_gqa = qhead_per_kvhead > 1
+    dim = 128
+    device = "cuda"
+
+    q = torch.randn(batch_size, num_q_heads, seqlen_q, dim, device=device, dtype=dtype)
+
+    if page_size is None:
+        k_cache = torch.randn(
+            batch_size, num_kv_heads, seqlen_kv, dim, device=device, dtype=dtype
+        )
+        v_cache = torch.randn(
+            batch_size, num_kv_heads, seqlen_kv, dim, device=device, dtype=dtype
+        )
+        page_table = None
+        k_cache_paged = None
+        v_cache_paged = None
+    else:
+        (
+            k_cache,
+            v_cache,
+            page_table,
+            k_cache_paged,
+            v_cache_paged,
+            num_blocks,
+        ) = _generate_block_kvcache(
+            seqlen_kv, page_size, batch_size, num_kv_heads, dim, device, dtype
+        )
+
+    cache_seqlens = torch.randint(
+        1, seqlen_kv + 1, (batch_size,), dtype=torch.int32, device=device
+    )
+
+    if cute_score_mod == score_mod_10:
+        buffer = torch.randn(batch_size, device=device, dtype=dtype) * 0.1
+        aux_tensors = [buffer]
+        eager_score_mod = eager_score_mod_factory(buffer)
+    elif cute_score_mod == score_mod_11:
+        head_bias = torch.randn(num_q_heads, device=device, dtype=dtype) * 0.2
+        pos_scale = torch.arange(seqlen_q, device=device, dtype=dtype) * 0.01
+        aux_tensors = [head_bias, pos_scale]
+        eager_score_mod = eager_score_mod_factory(head_bias, pos_scale)
+
+    from einops import rearrange
+
+    arange = rearrange(torch.arange(seqlen_kv, device=device), "s -> 1 s")
+    cache_seqlens_expanded = rearrange(cache_seqlens, "b -> b 1")
+    key_padding_mask = arange < cache_seqlens_expanded
+
+    if pack_gqa:
+        k_cache_rep = k_cache.repeat_interleave(qhead_per_kvhead, dim=1)
+        v_cache_rep = v_cache.repeat_interleave(qhead_per_kvhead, dim=1)
+    else:
+        k_cache_rep = k_cache
+        v_cache_rep = v_cache
+
+    def make_masked_score_mod(base_score_mod, seqused_k_tensor):
+        seqused_k_dev = seqused_k_tensor
+
+        def masked_score_mod(score, b, h, q_idx, kv_idx):
+            if base_score_mod is not None:
+                score = base_score_mod(score, b, h, q_idx, kv_idx)
+            seqlen_limit = torch.gather(seqused_k_dev, 0, b.long())
+            valid_mask = kv_idx < seqlen_limit
+            return torch.where(valid_mask, score, torch.full_like(score, float("-inf")))
+
+        return masked_score_mod
+
+    masked_score_mod_fp32 = make_masked_score_mod(eager_score_mod, cache_seqlens)
+    masked_score_mod = make_masked_score_mod(eager_score_mod, cache_seqlens)
+
+    out_ref_fp32 = run_flex_reference(
+        q, k_cache_rep, v_cache_rep, masked_score_mod_fp32, dtype=torch.float32
+    )
+    out_pt = run_flex_reference(q, k_cache_rep, v_cache_rep, masked_score_mod)
+
+    q_bshd = q.transpose(1, 2)
+    out_cute = torch.empty_like(q_bshd)
+
+    if page_size is None:
+        k_bshd = k_cache.transpose(1, 2)
+        v_bshd = v_cache.transpose(1, 2)
+        _flash_attn_fwd(
+            q_bshd,
+            k_bshd,
+            v_bshd,
+            seqused_k=cache_seqlens,
+            return_lse=True,
+            score_mod=cute_score_mod,
+            out=out_cute,
+            lse=None,
+            aux_tensors=aux_tensors,
+            pack_gqa=pack_gqa,
+        )
+    else:
+        _flash_attn_fwd(
+            q_bshd,
+            k_cache_paged,
+            v_cache_paged,
+            seqused_k=cache_seqlens,
+            page_table=page_table,
+            return_lse=True,
+            score_mod=cute_score_mod,
+            out=out_cute,
+            lse=None,
+            aux_tensors=aux_tensors,
+            pack_gqa=pack_gqa,
+        )
+
+    out_cute = out_cute.transpose(1, 2)
+
+    assert out_cute.shape == out_ref_fp32.shape == out_pt.shape
+    assert not torch.isnan(out_cute).any()
+    assert not torch.isnan(out_ref_fp32).any()
+    assert not torch.isnan(out_pt).any()
+    assert torch.isfinite(out_cute).all()
+    assert torch.isfinite(out_ref_fp32).all()
+    assert torch.isfinite(out_pt).all()
+
+    fwd_atol = 2 * (out_ref_fp32 + 0.3 - 0.3 - out_ref_fp32).abs().max().item()
+    rtol = 2
+
+    pt_error = (out_pt - out_ref_fp32).abs().max().item()
+    cute_error = (out_cute - out_ref_fp32).abs().max().item()
+
+    print(
+        f"\nNumerical comparison for {cute_score_mod.__name__} (paged={page_size is not None}):"
+    )
+    print(f"  PyTorch vs FP32 ref max error: {pt_error:.2e}")
+    print(f"  CuTE vs FP32 ref max error: {cute_error:.2e}")
+    print(f"  Dynamic absolute tolerance: {fwd_atol:.2e}")
+    print(f"  Error ratio (CuTE/PyTorch): {cute_error / max(pt_error, 1e-10):.2f}")
+
+    assert cute_error <= rtol * pt_error + fwd_atol, (
+        f"CuTE error {cute_error:.2e} exceeds {rtol}x PyTorch error {pt_error:.2e} + {fwd_atol:.2e}"
+    )
+
+
+@cute.jit
+def score_mod_bwd_5(grad, score, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+    """Backward for score_mod_5 (times_two): d(score*2)/d(score) = 2."""
+    return grad * cute.full_like(grad, 2.0)
+
+
+@cute.jit
+def score_mod_bwd_3(grad, score, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+    """Backward for score_mod_3 (relative_bias): d(score + |q-kv|)/d(score) = 1."""
+    return grad
+
+
+@cute.jit
+def score_mod_bwd_identity(grad, score, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+    return grad
+
+
+@cute.jit
+def score_mod_squared(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+    """Forward: score ** 2."""
+    return tSrS_ssa * tSrS_ssa
+
+
+@cute.jit
+def score_mod_bwd_squared(grad, score, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+    """Backward for score**2: d(score**2)/d(score) = 2*score."""
+    return grad * cute.full_like(grad, 2.0) * score
+
+
+def score_squared_eager(score, b, h, q_idx, kv_idx):
+    return score * score
+
+
+BWD_TEST_PAIRS = [
+    (score_mod_5, score_mod_bwd_5, times_two_eager),
+    (score_mod_3, score_mod_bwd_3, relative_bias_eager),
+    (score_mod_squared, score_mod_bwd_squared, score_squared_eager),
+]
+
+BWD_TEST_PAIRS_WITH_AUX = [
+    (score_mod_10, score_mod_bwd_identity, batch_bias),
+    (score_mod_11, score_mod_bwd_identity, dual_buffer_bias),
+]
+
+BWD_TEST_PAIRS_PACK_GQA = [
+    (score_mod_5, score_mod_bwd_5, times_two_eager),
+    (score_mod_3, score_mod_bwd_3, relative_bias_eager),
+]
+
+
+def run_cute_flash_bwd(
+    q, k, v, cute_score_mod, cute_score_mod_bwd, aux_tensors=None, pack_gqa=False
+):
+    """Run flash attention forward + backward with score_mod."""
+    q_t = q.transpose(1, 2)
+    k_t = k.transpose(1, 2)
+    v_t = v.transpose(1, 2)
+
+    out, lse = _flash_attn_fwd(
+        q_t, k_t, v_t,
         return_lse=True,
-        score_mod=score_mod_2,
-        out=out_cute,
-        lse=None,
+        score_mod=cute_score_mod,
+        aux_tensors=aux_tensors,
+        pack_gqa=pack_gqa,
     )
 
-    assert not torch.isnan(out_cute).any(), "Output contains NaN values"
-    assert torch.isfinite(out_cute).all(), "Output contains infinite values"
+    grad_out = torch.randn_like(out)
+
+    dq, dk, dv = _flash_attn_bwd(
+        q_t, k_t, v_t,
+        out, grad_out, lse,
+        score_mod=cute_score_mod,
+        score_mod_bwd=cute_score_mod_bwd,
+        aux_tensors=aux_tensors,
+        pack_gqa=pack_gqa,
+    )
+
+    return (
+        out.transpose(1, 2),
+        grad_out.transpose(1, 2),
+        dq.transpose(1, 2),
+        dk.transpose(1, 2),
+        dv.transpose(1, 2),
+    )
+
+
+def run_flex_reference_bwd(q, k, v, eager_score_mod, grad_out, dtype=None):
+    """Run flex_attention forward + backward for reference."""
+    if dtype is not None:
+        q = q.to(dtype).requires_grad_(True)
+        k = k.to(dtype).requires_grad_(True)
+        v = v.to(dtype).requires_grad_(True)
+        grad_out = grad_out.to(dtype)
+    else:
+        q = q.requires_grad_(True)
+        k = k.requires_grad_(True)
+        v = v.requires_grad_(True)
+
+    compiled_flex = torch.compile(flex_attention)
+    out = compiled_flex(
+        q, k, v, score_mod=eager_score_mod, enable_gqa=q.shape[1] != k.shape[1]
+    )
+    dq, dk, dv = torch.autograd.grad(out, (q, k, v), grad_out)
+
+    return out, dq, dk, dv
+
+
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_kv",
+    [
+        (64, 64),
+        (128, 128),
+        (256, 256),
+        (512, 512),
+        (799, 3),
+        (3, 799),
+        (128, 256),
+        (256, 128),
+        (113, 203),
+    ],
+)
+@pytest.mark.parametrize("dim", [64, 128])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("score_mod_triple", BWD_TEST_PAIRS)
+def test_cute_vs_flex_attention_backward(seqlen_q, seqlen_kv, dim, dtype, score_mod_triple):
+    """Test backward pass with score_mod against flex_attention reference."""
+    torch.random.manual_seed(42)
+    cute_fwd, cute_bwd, eager_ref = score_mod_triple
+
+    q, k, v = create_tensors(
+        seqlen_q=seqlen_q, seqlen_kv=seqlen_kv, num_heads=4, dim=dim, dtype=dtype
+    )
+
+    out_cute, grad_out, dq_cute, dk_cute, dv_cute = run_cute_flash_bwd(
+        q, k, v, cute_fwd, cute_bwd
+    )
+    out_ref_fp32, dq_ref_fp32, dk_ref_fp32, dv_ref_fp32 = run_flex_reference_bwd(
+        q, k, v, eager_ref, grad_out, dtype=torch.float32
+    )
+    out_pt, dq_pt, dk_pt, dv_pt = run_flex_reference_bwd(
+        q, k, v, eager_ref, grad_out
+    )
+
+    assert not torch.isnan(dq_cute).any(), "dQ contains NaN"
+    assert not torch.isnan(dk_cute).any(), "dK contains NaN"
+    assert not torch.isnan(dv_cute).any(), "dV contains NaN"
+
+    rtol = 2
+    dq_atol = 2 * (dq_ref_fp32 + 0.3 - 0.3 - dq_ref_fp32).abs().max().item()
+    dk_atol = 2 * (dk_ref_fp32 + 0.3 - 0.3 - dk_ref_fp32).abs().max().item()
+    dv_atol = 2 * (dv_ref_fp32 + 0.3 - 0.3 - dv_ref_fp32).abs().max().item()
+
+    dq_ref = dq_ref_fp32.to(dtype)
+    dk_ref = dk_ref_fp32.to(dtype)
+    dv_ref = dv_ref_fp32.to(dtype)
+
+    pt_dq_err = (dq_pt - dq_ref).abs().max().item()
+    pt_dk_err = (dk_pt - dk_ref).abs().max().item()
+    pt_dv_err = (dv_pt - dv_ref).abs().max().item()
+
+    cute_dq_err = (dq_cute - dq_ref).abs().max().item()
+    cute_dk_err = (dk_cute - dk_ref).abs().max().item()
+    cute_dv_err = (dv_cute - dv_ref).abs().max().item()
+
+    print(f"\nBackward comparison for {cute_fwd.__name__}:")
+    print(f"  dQ: PT err={pt_dq_err:.2e}, CuTE err={cute_dq_err:.2e}, atol={dq_atol:.2e}")
+    print(f"  dK: PT err={pt_dk_err:.2e}, CuTE err={cute_dk_err:.2e}, atol={dk_atol:.2e}")
+    print(f"  dV: PT err={pt_dv_err:.2e}, CuTE err={cute_dv_err:.2e}, atol={dv_atol:.2e}")
+
+    assert cute_dq_err <= rtol * pt_dq_err + dq_atol, f"dQ error too large: {cute_dq_err:.2e}"
+    assert cute_dk_err <= rtol * pt_dk_err + dk_atol, f"dK error too large: {cute_dk_err:.2e}"
+    assert cute_dv_err <= rtol * pt_dv_err + dv_atol, f"dV error too large: {cute_dv_err:.2e}"
+
+
+def make_aux_tensors_for_bwd(cute_score_mod, eager_factory, seqlen_q, num_heads, batch_size, dtype):
+    if cute_score_mod == score_mod_10:
+        buffer = torch.randn(batch_size, device="cuda", dtype=dtype) * 0.1
+        return [buffer], eager_factory(buffer)
+    head_bias = torch.randn(num_heads, device="cuda", dtype=dtype) * 0.2
+    pos_scale = torch.arange(seqlen_q, device="cuda", dtype=dtype) * 0.01
+    return [head_bias, pos_scale], eager_factory(head_bias, pos_scale)
+
+
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_kv",
+    [
+        (64, 64),
+        (128, 128),
+        (256, 128),
+    ],
+)
+@pytest.mark.parametrize("dim", [64])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("score_mod_triple", BWD_TEST_PAIRS_WITH_AUX)
+def test_cute_vs_flex_attention_backward_with_aux(
+    seqlen_q, seqlen_kv, dim, dtype, score_mod_triple
+):
+    torch.random.manual_seed(42)
+    cute_fwd, cute_bwd, eager_factory = score_mod_triple
+
+    q, k, v = create_tensors(
+        seqlen_q=seqlen_q, seqlen_kv=seqlen_kv, num_heads=4, dim=dim, dtype=dtype
+    )
+
+    aux_tensors, eager_ref = make_aux_tensors_for_bwd(
+        cute_fwd, eager_factory, seqlen_q, q.shape[1], q.shape[0], dtype
+    )
+
+    out_cute, grad_out, dq_cute, dk_cute, dv_cute = run_cute_flash_bwd(
+        q, k, v, cute_fwd, cute_bwd, aux_tensors=aux_tensors
+    )
+    out_ref_fp32, dq_ref_fp32, dk_ref_fp32, dv_ref_fp32 = run_flex_reference_bwd(
+        q, k, v, eager_ref, grad_out, dtype=torch.float32
+    )
+    out_pt, dq_pt, dk_pt, dv_pt = run_flex_reference_bwd(
+        q, k, v, eager_ref, grad_out
+    )
+
+    assert not torch.isnan(dq_cute).any()
+    assert not torch.isnan(dk_cute).any()
+    assert not torch.isnan(dv_cute).any()
+
+    rtol = 3
+    dq_atol = 2 * (dq_ref_fp32 + 0.3 - 0.3 - dq_ref_fp32).abs().max().item()
+    dk_atol = 2 * (dk_ref_fp32 + 0.3 - 0.3 - dk_ref_fp32).abs().max().item()
+    dv_atol = 2 * (dv_ref_fp32 + 0.3 - 0.3 - dv_ref_fp32).abs().max().item()
+
+    dq_ref = dq_ref_fp32.to(dtype)
+    dk_ref = dk_ref_fp32.to(dtype)
+    dv_ref = dv_ref_fp32.to(dtype)
+
+    pt_dq_err = (dq_pt - dq_ref).abs().max().item()
+    pt_dk_err = (dk_pt - dk_ref).abs().max().item()
+    pt_dv_err = (dv_pt - dv_ref).abs().max().item()
+
+    cute_dq_err = (dq_cute - dq_ref).abs().max().item()
+    cute_dk_err = (dk_cute - dk_ref).abs().max().item()
+    cute_dv_err = (dv_cute - dv_ref).abs().max().item()
+
+    print(f"\nBackward comparison with aux for {cute_fwd.__name__}:")
+    print(f"  dQ: PT err={pt_dq_err:.2e}, CuTE err={cute_dq_err:.2e}, atol={dq_atol:.2e}")
+    print(f"  dK: PT err={pt_dk_err:.2e}, CuTE err={cute_dk_err:.2e}, atol={dk_atol:.2e}")
+    print(f"  dV: PT err={pt_dv_err:.2e}, CuTE err={cute_dv_err:.2e}, atol={dv_atol:.2e}")
+
+    assert cute_dq_err <= rtol * pt_dq_err + dq_atol, f"dQ error too large: {cute_dq_err:.2e}"
+    assert cute_dk_err <= rtol * pt_dk_err + dk_atol, f"dK error too large: {cute_dk_err:.2e}"
+    assert cute_dv_err <= rtol * pt_dv_err + dv_atol, f"dV error too large: {cute_dv_err:.2e}"
+
+
+@pytest.mark.parametrize("seqlen_q,seqlen_kv", [(128, 128), (128, 256)])
+@pytest.mark.parametrize("dim", [64])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("qhead_per_kvhead,num_kv_heads", [(4, 2)])
+@pytest.mark.parametrize("score_mod_triple", BWD_TEST_PAIRS_PACK_GQA)
+def test_cute_vs_flex_attention_backward_pack_gqa(
+    seqlen_q, seqlen_kv, dim, dtype, qhead_per_kvhead, num_kv_heads, score_mod_triple
+):
+    torch.random.manual_seed(42)
+    cute_fwd, cute_bwd, eager_ref = score_mod_triple
+
+    num_q_heads = num_kv_heads * qhead_per_kvhead
+    q, k, v = create_tensors(
+        seqlen_q=seqlen_q, seqlen_kv=seqlen_kv, num_heads=num_q_heads, dim=dim, dtype=dtype
+    )
+    k = k[:, :num_kv_heads, :, :].clone()
+    v = v[:, :num_kv_heads, :, :].clone()
+
+    out_cute, grad_out, dq_cute, dk_cute, dv_cute = run_cute_flash_bwd(
+        q, k, v, cute_fwd, cute_bwd, pack_gqa=True
+    )
+    out_ref_fp32, dq_ref_fp32, dk_ref_fp32, dv_ref_fp32 = run_flex_reference_bwd(
+        q, k, v, eager_ref, grad_out, dtype=torch.float32
+    )
+    out_pt, dq_pt, dk_pt, dv_pt = run_flex_reference_bwd(
+        q, k, v, eager_ref, grad_out
+    )
+
+    assert not torch.isnan(dq_cute).any()
+    assert not torch.isnan(dk_cute).any()
+    assert not torch.isnan(dv_cute).any()
+
+    rtol = 3
+    dq_atol = 2 * (dq_ref_fp32 + 0.3 - 0.3 - dq_ref_fp32).abs().max().item()
+    dk_atol = 2 * (dk_ref_fp32 + 0.3 - 0.3 - dk_ref_fp32).abs().max().item()
+    dv_atol = 2 * (dv_ref_fp32 + 0.3 - 0.3 - dv_ref_fp32).abs().max().item()
+
+    dq_ref = dq_ref_fp32.to(dtype)
+    dk_ref = dk_ref_fp32.to(dtype)
+    dv_ref = dv_ref_fp32.to(dtype)
+
+    pt_dq_err = (dq_pt - dq_ref).abs().max().item()
+    pt_dk_err = (dk_pt - dk_ref).abs().max().item()
+    pt_dv_err = (dv_pt - dv_ref).abs().max().item()
+
+    cute_dq_err = (dq_cute - dq_ref).abs().max().item()
+    cute_dk_err = (dk_cute - dk_ref).abs().max().item()
+    cute_dv_err = (dv_cute - dv_ref).abs().max().item()
+
+    print(f"\nBackward Pack-GQA comparison for {cute_fwd.__name__}:")
+    print(f"  dQ: PT err={pt_dq_err:.2e}, CuTE err={cute_dq_err:.2e}, atol={dq_atol:.2e}")
+    print(f"  dK: PT err={pt_dk_err:.2e}, CuTE err={cute_dk_err:.2e}, atol={dk_atol:.2e}")
+    print(f"  dV: PT err={pt_dv_err:.2e}, CuTE err={cute_dv_err:.2e}, atol={dv_atol:.2e}")
+
+    assert cute_dq_err <= rtol * pt_dq_err + dq_atol, f"dQ error too large: {cute_dq_err:.2e}"
+    assert cute_dk_err <= rtol * pt_dk_err + dk_atol, f"dK error too large: {cute_dk_err:.2e}"
+    assert cute_dv_err <= rtol * pt_dv_err + dv_atol, f"dV error too large: {cute_dv_err:.2e}"
 
 
 if __name__ == "__main__":
