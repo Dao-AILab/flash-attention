@@ -73,6 +73,11 @@ class TileSchedulerArguments(ParamsBase):
     lpt: cutlass.Constexpr[bool] = False
     is_split_kv: cutlass.Constexpr[bool] = False
     head_swizzle: cutlass.Constexpr[bool] = False
+    num_splits_dynamic_ptr: Optional[cute.Tensor] = None
+    num_m_blocks_ptr: Optional[cute.Tensor] = None
+    varlen_batch_idx_ptr: Optional[cute.Tensor] = None
+    num_nheads_in_l2_ptr: Optional[cute.Tensor] = None
+    tile_count_semaphore: Optional[cute.Tensor] = None
 
 
 class SingleTileScheduler:
@@ -85,6 +90,7 @@ class SingleTileScheduler:
         num_splits_divmod: FastDivmodDivisor
         is_split_kv: cutlass.Constexpr[bool] = False
         cluster_shape_mn: cutlass.Constexpr[Tuple[int, int]] = (1, 1)
+        num_splits_dynamic_ptr: Optional[cute.Tensor] = None
 
         @staticmethod
         def create(
@@ -98,6 +104,7 @@ class SingleTileScheduler:
                 FastDivmodDivisor(args.num_splits),
                 args.is_split_kv,
                 args.cluster_shape_mn,
+                args.num_splits_dynamic_ptr,
             )
 
     def __init__(self, params: Params, blk_coord: cute.Coord, *, loc=None, ip=None):
@@ -134,13 +141,17 @@ class SingleTileScheduler:
 
     def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
         block_idx, head_idx, batch_idx = self._blk_coord
+        is_valid = self._is_first_block
         if const_expr(self.params.is_split_kv):
             head_idx, split_idx = divmod(head_idx, self.params.num_splits_divmod)
         else:
             split_idx = Int32(0)
+        if const_expr(self.params.num_splits_dynamic_ptr is not None):
+            num_splits = self.params.num_splits_dynamic_ptr[batch_idx] if is_valid else 0
+            is_valid = split_idx < num_splits
         return WorkTileInfo(
             (block_idx, head_idx, batch_idx, split_idx),
-            self._is_first_block,
+            is_valid,
         )
 
     def initial_work_tile_info(self, *, loc=None, ip=None):
@@ -264,6 +275,7 @@ class SingleTileLPTScheduler:
         l2_minor_residual_divmod: FastDivmodDivisor
         num_hb_quotient: Int32
         is_split_kv: cutlass.Constexpr[bool] = False
+        num_splits_dynamic_ptr: Optional[cute.Tensor] = None
 
         @staticmethod
         @cute.jit
@@ -300,6 +312,7 @@ class SingleTileLPTScheduler:
                 num_hb_quotient=Int32(num_hb_quotient),
                 num_splits=args.num_splits,
                 is_split_kv=args.is_split_kv,
+                num_splits_dynamic_ptr=args.num_splits_dynamic_ptr,
             )
 
     def __init__(self, params: Params, tile_idx: Int32, split_idx: Int32, *, loc=None, ip=None):
@@ -346,6 +359,9 @@ class SingleTileLPTScheduler:
         # Longest-processing-time-first
         block = params.num_block - 1 - block
         is_valid = self._tile_idx < params.total_blocks
+        if const_expr(params.num_splits_dynamic_ptr is not None):
+            num_splits = params.num_splits_dynamic_ptr[batch_idx] if is_valid else 0
+            is_valid = self._split_idx < num_splits
         return WorkTileInfo(
             (Int32(block), Int32(head_idx), Int32(batch_idx), Int32(self._split_idx)), is_valid
         )
@@ -514,6 +530,7 @@ class SingleTileVarlenScheduler:
         lpt: cutlass.Constexpr[bool] = False
         is_split_kv: cutlass.Constexpr[bool] = False
         head_swizzle: cutlass.Constexpr[bool] = False
+        num_splits_dynamic_ptr: Optional[cute.Tensor] = None
 
         @staticmethod
         @cute.jit
@@ -540,6 +557,7 @@ class SingleTileVarlenScheduler:
                 lpt=args.lpt,
                 is_split_kv=args.is_split_kv,
                 head_swizzle=args.head_swizzle,
+                num_splits_dynamic_ptr=args.num_splits_dynamic_ptr,
             )
 
     def __init__(self, params: Params, tile_idx: Int32, split_idx: Int32, *, loc=None, ip=None):
@@ -688,6 +706,9 @@ class SingleTileVarlenScheduler:
             is_valid = self._is_first_block and batch_idx < params.num_batch
         # if cute.arch.thread_idx()[0] == 128: cute.printf("SingleTileVarlenScheduler: tile_idx=%d, batch_idx=%d, head_idx=%d, block=%d, is_valid = %d", self._tile_idx, batch_idx, head_idx, block, is_valid)
         split_idx = self._split_idx if const_expr(params.is_split_kv) else Int32(0)
+        if const_expr(params.num_splits_dynamic_ptr is not None):
+            num_splits = params.num_splits_dynamic_ptr[batch_idx] if is_valid else 0
+            is_valid = self._split_idx < num_splits
         return WorkTileInfo((Int32(block), Int32(head_idx), Int32(batch_idx), split_idx), is_valid)
 
     def initial_work_tile_info(self, *, loc=None, ip=None):

@@ -641,6 +641,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         window_size_right: Optional[Int32] = None,
         learnable_sink: Optional[cute.Tensor] = None,
         aux_tensors=None,
+        num_splits_dynamic_ptr: Optional[cute.Tensor] = None,
     ):
         """Configures and launches the flash attention kernel.
 
@@ -1289,6 +1290,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors: Optional[list] = None,
+        num_splits_dynamic_ptr: Optional[cute.Tensor] = None,
     ):
         """Configures and launches the flash attention kernel.
 

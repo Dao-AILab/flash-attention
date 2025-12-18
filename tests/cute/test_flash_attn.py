@@ -25,8 +25,10 @@ from flash_attn.cute.interface import (
     flash_attn_func,
     flash_attn_varlen_func,
     flash_attn_combine,
+    get_scheduler_metadata,
     _get_device_capability,
 )
+from flash_attn.cute.prepare_scheduler import SchedulerMetadataTensorsTorch
 
 
 DISABLE_SPLIT = os.getenv("FLASH_ATTENTION_DISABLE_SPLIT", "FALSE") == "TRUE"
@@ -834,12 +836,12 @@ def test_flash_attn_varlen_output(
 # @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 # @pytest.mark.parametrize("mha_type", ["mha"])
-@pytest.mark.parametrize("has_learnable_sink", [False, True])
-# @pytest.mark.parametrize("has_learnable_sink", [False])
+# @pytest.mark.parametrize("has_learnable_sink", [False, True])
+@pytest.mark.parametrize("has_learnable_sink", [False])
 # @pytest.mark.parametrize("new_kv", [False, True])
 @pytest.mark.parametrize("new_kv", [False])
-@pytest.mark.parametrize("local", [False, True])
-# @pytest.mark.parametrize("local", [False])
+# @pytest.mark.parametrize("local", [False, True])
+@pytest.mark.parametrize("local", [False])
 @pytest.mark.parametrize("causal", [False, True])
 # @pytest.mark.parametrize("causal", [True])
 # @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True, False])
@@ -852,19 +854,19 @@ def test_flash_attn_varlen_output(
 @pytest.mark.parametrize("rotary_fraction", [0.0])
 @pytest.mark.parametrize("page_size", [None] + ([1, 4, 128]))
 # @pytest.mark.parametrize("page_size", [None, 128])
-# @pytest.mark.parametrize("page_size", [128])
+# @pytest.mark.parametrize("page_size", [None])
 # @pytest.mark.parametrize("has_leftpad", [False, True])
 @pytest.mark.parametrize("has_leftpad", [False])
 # @pytest.mark.parametrize("has_batch_idx", [False, True])
 @pytest.mark.parametrize("has_batch_idx", [False])
-@pytest.mark.parametrize("varlen_q", [False, True])
-# @pytest.mark.parametrize("varlen_q", [False])
+# @pytest.mark.parametrize("varlen_q", [False, True])
+@pytest.mark.parametrize("varlen_q", [True])
 # @pytest.mark.parametrize("d", [32, 59, 64, 80, 128, 256])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192])
 # @pytest.mark.parametrize('d', [56, 80])
-# @pytest.mark.parametrize("d", [128])
-@pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("d", [128])
+# @pytest.mark.parametrize("d", [64, 128])
 # @pytest.mark.parametrize("d", [192])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
@@ -877,11 +879,11 @@ def test_flash_attn_varlen_output(
         (3, 799),
         (64, 2048),
         (16, 20000),
-        # # (1, 128 * 1024),
-        # # (16, 128 * 1024),
-        # (128, 128),
-        # (256, 512),  # To test appending KV with more than 1 block
-        # (2048, 3577),  # Enough tile to test persistent scheduler
+        (1, 128 * 1024),
+        (16, 128 * 1024),
+        (128, 128),
+        (256, 512),  # To test appending KV with more than 1 block
+        (2048, 3577),  # Enough tile to test persistent scheduler
     ],
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(256, 128)])
@@ -1225,29 +1227,48 @@ def test_flash_attn_kvcache(
         sin = sin.to(dtype) if sin is not None else None
         k_cache_saved = k_cache.clone() if page_size is None else k_cache_paged.clone()
         v_cache_saved = v_cache.clone() if page_size is None else v_cache_paged.clone()
+        print("cache_seqlens = ", cache_seqlens)
+        print("cu_seqlens_q = ", cu_seqlens_q)
+        print("max seqlen_q and max seqlen_k = ", seqlen_q, seqlen_k)
         # num_splits_vals = [1, 0]
         # SplitKV is not supported for hdim >= 192
-        num_splits_vals = [1, 3] if d < 192 and not DISABLE_SPLIT else [1]
-        # precompute_metadata_vals = [False, True]
-        precompute_metadata_vals = [False]
+        # num_splits_vals = [1, 3] if d < 192 and not DISABLE_SPLIT else [1]
+        num_splits_vals = [1, 32] if d < 192 and not DISABLE_SPLIT else [1]
+        precompute_metadata_vals = [False, True]
+        # precompute_metadata_vals = [True]
         for num_splits, precompute_metadata in itertools.product(
             num_splits_vals, precompute_metadata_vals
         ):
             # SplitKV not supported on SM90 - skip this iteration
             if IS_SM90 and num_splits > 1:
                 continue
-            # if precompute_metadata:
-            #     scheduler_metadata = get_scheduler_metadata(
-            #         batch_size, max_seqlen_q if varlen_q else seqlen_q, seqlen_k, nheads, nheads_k, d,
-            #         cache_seqlens, q.dtype, headdim_v=dv, cu_seqlens_q=cu_seqlens_q,
-            #         cu_seqlens_k_new=cu_seqlens_k_new, cache_leftpad=cache_leftpad,
-            #         max_seqlen_k_new=seqlen_new, page_size=page_size,
-            #         causal=causal, window_size=window_size, attention_chunk=attention_chunk,
-            #         num_splits=num_splits
-            #     )
-            # else:
-            #     scheduler_metadata = None
-            scheduler_metadata = None
+            print(f"{num_splits = }, {precompute_metadata = }")
+            
+            if precompute_metadata:
+                scheduler_metadata = get_scheduler_metadata(
+                    num_batch=batch_size,
+                    max_seqlen_q=seqlen_q,
+                    max_seqlen_k=seqlen_k,
+                    nheads=nheads,
+                    nheads_k=nheads_k,
+                    headdim=d,
+                    headdim_v=dv,
+                    num_splits=num_splits,
+                    tile_m=128,
+                    tile_n=128,
+                    # pack_gqa=False,
+                    causal=causal,
+                    # enable_pdl=False,
+                    # sort=False,
+                    # seqlen_k_new=seqlen_new if new_kv else 0,
+                    cu_seqlens_q=cu_seqlens_q,
+                    seqused_k=cache_seqlens,
+                    # leftpad_k=cache_leftpad,
+                )
+                num_splits_dynamic = scheduler_metadata.num_splits_dynamic_ptr
+                print("num_splits_dynamic = ", num_splits_dynamic)
+            else:
+                scheduler_metadata = None
             # Repeat to test metadata reuse
             for _ in range(1 if not precompute_metadata else 2):
                 if page_size is None:
@@ -1278,7 +1299,7 @@ def test_flash_attn_kvcache(
                     learnable_sink=learnable_sink,
                     # attention_chunk=attention_chunk,
                     # rotary_interleaved=rotary_interleaved,
-                    # scheduler_metadata=scheduler_metadata,
+                    scheduler_metadata=scheduler_metadata,
                     num_splits=num_splits,
                     # return_softmax_lse=True
                 )
