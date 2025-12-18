@@ -102,6 +102,29 @@ def get_block_sparse_expected_shapes(
     return expected_count_shape, expected_index_shape
 
 
+def get_block_sparse_expected_shapes_bwd(
+    batch_size: int,
+    num_head: int,
+    seqlen_q: int,
+    seqlen_k: int,
+    m_block_size: int,
+    n_block_size: int,
+    subtile_factor: int,
+) -> Tuple[Tuple[int, int, int], Tuple[int, int, int, int]]:
+    """Return (expected_count_shape, expected_index_shape) for backward block sparse normalization.
+
+    Backward uses Q-direction indexing (transposed from forward), where shapes are
+    indexed by N-blocks first, then M-blocks. The sparse_block_size_q is determined
+    by subtile_factor * m_block_size.
+    """
+    sparse_block_size_q = subtile_factor * m_block_size
+    expected_m_blocks = ceildiv(seqlen_q, sparse_block_size_q)
+    expected_n_blocks = ceildiv(seqlen_k, n_block_size)
+    expected_count_shape = (batch_size, num_head, expected_n_blocks)
+    expected_index_shape = (batch_size, num_head, expected_n_blocks, expected_m_blocks)
+    return expected_count_shape, expected_index_shape
+
+
 def normalize_block_sparse_tensors(
     tensors: BlockSparseTensorsTorch,
     *,
