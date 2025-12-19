@@ -1711,6 +1711,13 @@ class FlashAttentionForwardSm100:
 
             # Block sparse or dense iteration
             if const_expr(self.use_block_sparsity):
+                # When aux_tensors exist, Q indices beyond seqlen_q must be wrapped to avoid
+                # OOB aux_tensor access. Only edge tiles (where m_tile_end > seqlen_q) need this.
+                if const_expr(aux_tensors is not None):
+                    m_tile_end = (self.q_stage * m_block + stage + 1) * self.m_block_size
+                    check_m_boundary = m_tile_end > seqlen.seqlen_q
+                else:
+                    check_m_boundary = False
                 (
                     mma_si_consumer_phase,
                     si_corr_producer_phase,
@@ -1734,6 +1741,7 @@ class FlashAttentionForwardSm100:
                     self.mbar_P_full_2_offset,
                     self.q_stage,
                     Int32(stage),
+                    check_m_boundary,
                 )
                 if not empty_tile:
                     sScale[tidx + stage * self.m_block_size] = softmax.row_sum[0]

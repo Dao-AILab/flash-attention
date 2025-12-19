@@ -717,6 +717,7 @@ def softmax_block_sparse_sm100(
     mbar_P_full_2_offset: Int32,
     q_stage: cutlass.Constexpr,
     stage_idx: Int32,
+    check_m_boundary: bool = False,
 ):
     mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx = blocksparse_tensors
 
@@ -750,7 +751,7 @@ def softmax_block_sparse_sm100(
                 s0_s1_sequence_phase,
                 mask_n_block,
                 is_first=True,
-                mask_fn=partial(mask_fn, mask_seqlen=True),  # last block could oob
+                mask_fn=partial(mask_fn, mask_seqlen=True, check_q_boundary=check_m_boundary),
             )
             for i in cutlass.range(1, curr_mask_block_cnt):
                 mask_n_block = curr_mask_block_idx[curr_mask_block_cnt - 1 - i]
@@ -763,7 +764,7 @@ def softmax_block_sparse_sm100(
                     si_corr_producer_phase,
                     s0_s1_sequence_phase,
                     mask_n_block,
-                    mask_fn=partial(mask_fn, mask_seqlen=False),
+                    mask_fn=partial(mask_fn, mask_seqlen=False, check_q_boundary=check_m_boundary),
                 )
 
         if curr_full_block_cnt > 0:
@@ -779,7 +780,9 @@ def softmax_block_sparse_sm100(
                     s0_s1_sequence_phase,
                     full_n_block,
                     is_first=True,
-                    mask_fn=partial(mask_fn_none, mask_seqlen=True),
+                    mask_fn=partial(
+                        mask_fn_none, mask_seqlen=True, check_q_boundary=check_m_boundary
+                    ),
                 )
             else:
                 (
@@ -792,7 +795,9 @@ def softmax_block_sparse_sm100(
                     s0_s1_sequence_phase,
                     full_n_block,
                     is_first=False,
-                    mask_fn=partial(mask_fn_none, mask_seqlen=False),
+                    mask_fn=partial(
+                        mask_fn_none, mask_seqlen=False, check_q_boundary=check_m_boundary
+                    ),
                 )
             for i in cutlass.range(1, curr_full_block_cnt):
                 full_n_block = curr_full_block_idx[curr_full_block_cnt - 1 - i]
@@ -805,7 +810,9 @@ def softmax_block_sparse_sm100(
                     si_corr_producer_phase,
                     s0_s1_sequence_phase,
                     full_n_block,
-                    mask_fn=partial(mask_fn_none, mask_seqlen=False),
+                    mask_fn=partial(
+                        mask_fn_none, mask_seqlen=False, check_q_boundary=check_m_boundary
+                    ),
                 )
 
     return (
