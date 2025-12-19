@@ -22,7 +22,7 @@ import torch.nn.functional as F
 
 from flash_attn.cute.interface import _flash_attn_fwd, _flash_attn_bwd
 from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch
-from flash_attn.cute.mask_definitions import get_mask_pair, random_doc_id_tensor
+from flash_attn.cute.mask_definitions import get_mask_pair
 COMPUTE_CAPABILITY = torch.cuda.get_device_capability()[0]
 
 
@@ -178,9 +178,11 @@ def _run_mask_test(
     )
     if mask_name == "document":
         doc_len = max(seqlen_q, seqlen_k)
-        doc_ids = random_doc_id_tensor(nheads, batch_size, doc_len, device="cuda").to(
-            dtype=torch.int32, device="cuda"
-        )
+        # Use deterministic chunked pattern instead of random for reproducible testing
+        # Tokens 0-63 = doc 0, 64-127 = doc 1, etc.
+        chunk_size = 64
+        doc_ids_1d = torch.arange(doc_len, device="cuda") // chunk_size
+        doc_ids = doc_ids_1d.unsqueeze(0).unsqueeze(0).expand(batch_size, nheads, -1).contiguous().to(torch.int32)
         original_flex_mask = mask_mod_flex
 
         def mask_mod_flex(b, h, q_idx, kv_idx, doc_ids=doc_ids):
@@ -427,6 +429,7 @@ Q_BOUNDARY_SEQLEN_PAIRS = [
     (500, 512),    # Q boundary only (K aligned)
     (512, 500),    # K boundary only (Q aligned)
     (333, 444),    # Both non-aligned
+    (444, 333),    # seqlen_q > seqlen_k: catches backward aux_tensor OOB (Q indices up to 511 > doc_ids size 444)
 ]
 
 
@@ -434,15 +437,15 @@ Q_BOUNDARY_SEQLEN_PAIRS = [
 @pytest.mark.parametrize("mask_name", ["block_diagonal", "document"])
 def test_q_boundary_masking_block_sparse_bwd(seqlen_q, seqlen_k, mask_name):
     """Test Q boundary masking for block-sparse backward pass.
-    
+
     This test specifically exercises the fix for the bug where Q rows beyond seqlen_q
     were not masked in backward pass for is_full_block=True tiles.
-    
+
     The bug occurred because:
     - In forward, apply_mask_sm100 always checks both Q and K bounds
     - In backward, apply_mask_sm100_transposed with is_full_block=True only checked K bounds
     - Result: partial last m_blocks had unmasked garbage Q rows contributing to gradients
-    
+
     Key conditions:
     - seqlen_q NOT a multiple of tile_m (128): creates partial last m_block
     - Block-sparse with mask_mod: exercises is_full_block=True path
@@ -450,7 +453,7 @@ def test_q_boundary_masking_block_sparse_bwd(seqlen_q, seqlen_k, mask_name):
     """
     if COMPUTE_CAPABILITY != 10:
         pytest.skip("SM100-only backward test")
-    
+
     _run_mask_test(
         seqlen_q=seqlen_q,
         seqlen_k=seqlen_k,

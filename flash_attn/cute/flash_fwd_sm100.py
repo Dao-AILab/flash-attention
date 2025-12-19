@@ -86,6 +86,8 @@ class FlashAttentionForwardSm100:
         has_aux_tensors: cutlass.Constexpr = False,
         paged_kv_non_tma: bool = False,
         is_varlen_q: bool = False,
+        q_divisible: cutlass.Constexpr[bool] = False,
+        k_divisible: cutlass.Constexpr[bool] = False,
     ):
         self.use_tma_KV = not paged_kv_non_tma
         # self.dtype = dtype
@@ -127,6 +129,8 @@ class FlashAttentionForwardSm100:
         )
         self.score_mod = score_mod
         self.mask_mod = mask_mod
+        self.q_divisible = q_divisible
+        self.k_divisible = k_divisible
         if cutlass.const_expr(has_aux_tensors):
             self.vec_size: cutlass.Constexpr = 1
         else:
@@ -705,6 +709,8 @@ class FlashAttentionForwardSm100:
             num_splits,
             aux_tensors,
             fastdiv_mods,
+            self.q_divisible,
+            self.k_divisible,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -750,6 +756,8 @@ class FlashAttentionForwardSm100:
         num_splits: Int32,
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
+        q_divisible: cutlass.Constexpr[bool] = False,
+        k_divisible: cutlass.Constexpr[bool] = False,
     ):
         """The device kernel implementation of the Fused Multi-Head Attention.
 
@@ -1055,6 +1063,8 @@ class FlashAttentionForwardSm100:
                 aux_tensors=aux_tensors,
                 fastdiv_mods=fastdiv_mods,
                 blocksparse_tensors=blocksparse_tensors,
+                q_divisible=q_divisible,
+                k_divisible=k_divisible,
             )
 
             if const_expr(not self.s0_s1_barrier):
@@ -1550,6 +1560,8 @@ class FlashAttentionForwardSm100:
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        q_divisible: cutlass.Constexpr[bool] = False,
+        k_divisible: cutlass.Constexpr[bool] = False,
     ):
         """Compute softmax on attention scores from QK matrix multiplication.
 
@@ -1618,8 +1630,10 @@ class FlashAttentionForwardSm100:
             n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
 
             mask = AttentionMaskCls(seqlen.seqlen_q, seqlen.seqlen_k)
+            actual_m_block = self.q_stage * m_block + stage
+            check_m_boundary = (actual_m_block + 1) * self.m_block_size > seqlen.seqlen_q
             shared_mask_kwargs = dict(
-                m_block=self.q_stage * m_block + stage,
+                m_block=actual_m_block,
                 thr_mma=thr_mma_qk,
                 thr_tmem_load=thr_tmem_load,
                 mask_causal=self.is_causal,
@@ -1627,6 +1641,9 @@ class FlashAttentionForwardSm100:
                 batch_idx=batch_idx,
                 head_idx=head_idx,
                 aux_tensors=aux_tensors,
+                check_m_boundary=check_m_boundary,
+                q_divisible=q_divisible,
+                k_divisible=k_divisible,
             )
 
             # Recompute fastdiv_mods if necessary

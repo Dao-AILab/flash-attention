@@ -60,6 +60,8 @@ class FlashAttentionBackwardSm100:
         mask_mod: cutlass.Constexpr | None = None,
         has_aux_tensors: cutlass.Constexpr = False,
         subtile_factor: cutlass.Constexpr[int] = 1,
+        q_divisible: cutlass.Constexpr[bool] = False,
+        k_divisible: cutlass.Constexpr[bool] = False,
     ):
         # padding head_dim to a multiple of 16 as k_block_size
         hdim_multiple_of = 16
@@ -108,6 +110,8 @@ class FlashAttentionBackwardSm100:
         self.mask_mod = mask_mod
         self.has_aux_tensors = has_aux_tensors
         self.subtile_factor = subtile_factor
+        self.q_divisible = q_divisible
+        self.k_divisible = k_divisible
         # For score_mod, use vec_size=1 (like forward) to handle per-element indices
         if cutlass.const_expr(has_aux_tensors):
             self.vec_size: cutlass.Constexpr = 1
@@ -768,6 +772,8 @@ class FlashAttentionBackwardSm100:
             aux_tensors,
             fastdiv_mods,
             blocksparse_tensors,
+            self.q_divisible,
+            self.k_divisible,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -829,6 +835,8 @@ class FlashAttentionBackwardSm100:
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        q_divisible: cutlass.Constexpr[bool] = False,
+        k_divisible: cutlass.Constexpr[bool] = False,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
@@ -1213,6 +1221,8 @@ class FlashAttentionBackwardSm100:
                 aux_tensors,
                 fastdiv_mods,
                 blocksparse_tensors,
+                q_divisible,
+                k_divisible,
             )
             cute.arch.mbarrier_arrive(tmem_dealloc_mbar_ptr)
 
@@ -1911,6 +1921,8 @@ class FlashAttentionBackwardSm100:
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        q_divisible: cutlass.Constexpr[bool] = False,
+        k_divisible: cutlass.Constexpr[bool] = False,
     ):
         sLSE_2D = cute.make_tensor(
             sLSE.iterator,
@@ -2018,7 +2030,7 @@ class FlashAttentionBackwardSm100:
                 seqlen, n_block // self.cluster_shape_mnk[0]
             )
             mask = AttentionMaskCls(seqlen.seqlen_q, seqlen.seqlen_k)
-            # TODO: condition mask_seqlen
+            check_k_boundary = (n_block + 1) * self.tile_n > seqlen.seqlen_k
             mask_fn = partial(
                 mask.apply_mask_sm100_transposed,
                 tScS_t2r=tScS_t2r,
@@ -2032,6 +2044,9 @@ class FlashAttentionBackwardSm100:
                 head_idx=head_idx,
                 aux_tensors=aux_tensors,
                 fastdiv_mods=fastdiv_mods,
+                check_k_boundary=check_k_boundary,
+                q_divisible=q_divisible,
+                k_divisible=k_divisible,
             )
 
             # prefetch_LSE = not self.is_causal

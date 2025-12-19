@@ -332,6 +332,9 @@ def _flash_attn_fwd(
                 "mask_mod with aux_tensors is not yet supported with pack_gqa=True. This will be fixed in a future PR."
             )
 
+    q_divisible = seqlen_q % m_block_size == 0 if seqlen_q is not None else False
+    k_divisible = seqlen_k % n_block_size == 0 if seqlen_k is not None else False
+
     if use_block_sparsity:
         if is_varlen:
             raise NotImplementedError(
@@ -372,6 +375,8 @@ def _flash_attn_fwd(
         pack_gqa,
         compute_capability,
         page_size not in [None, 128],  # paged KV non-TMA
+        q_divisible if aux_tensors is not None else True,
+        k_divisible if aux_tensors is not None else True,
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
         (
@@ -466,6 +471,8 @@ def _flash_attn_fwd(
                 paged_kv_non_tma=page_size not in [None, 128],
                 is_varlen_q=cu_seqlens_q is not None
                     or seqused_q is not None,
+                q_divisible=q_divisible if aux_tensors is not None else True,
+                k_divisible=k_divisible if aux_tensors is not None else True,
             )
         else:
             raise ValueError(
@@ -641,6 +648,9 @@ def _flash_attn_bwd(
             causal, local = False, True
 
     use_block_sparsity = block_sparse_tensors is not None
+
+    q_divisible_bwd = seqlen_q % m_block_size == 0 if seqlen_q is not None else False
+    k_divisible_bwd = seqlen_k % n_block_size == 0 if seqlen_k is not None else False
 
     if cu_seqlens_k is None:
         assert k.shape == (batch_size, seqlen_k, num_head_kv, head_dim)
@@ -904,6 +914,8 @@ def _flash_attn_bwd(
             mask_mod_hash,
             num_aux_tensors,
             use_block_sparsity,
+            q_divisible_bwd if num_aux_tensors > 0 else True,
+            k_divisible_bwd if num_aux_tensors > 0 else True,
         )
     num_threads = 384
     if compile_key not in _flash_attn_bwd.compile_cache:
@@ -984,6 +996,8 @@ def _flash_attn_bwd(
                 mask_mod=mask_mod,
                 has_aux_tensors=aux_tensors is not None and len(aux_tensors) > 0,
                 subtile_factor=subtile_factor,
+                q_divisible=q_divisible_bwd if num_aux_tensors > 0 else True,
+                k_divisible=k_divisible_bwd if num_aux_tensors > 0 else True,
             )
 
         # Block sparse tensors for backward use Q-direction indexing (transposed from forward).
