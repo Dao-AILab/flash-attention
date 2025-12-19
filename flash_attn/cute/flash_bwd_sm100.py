@@ -2070,9 +2070,12 @@ class FlashAttentionBackwardSm100:
                         curr_full_cnt,
                         curr_full_idx,
                         subtile_factor=self.subtile_factor,
+                        m_block_max=m_block_max,
                     )
+                    m_block_oob = m_block >= m_block_max
                 else:
                     m_block = m_block_min + iter_idx
+                    m_block_oob = False
                     is_full_block = False
                 # Prefetch 1 stage of LSE
                 pipeline_LSE.consumer_wait(consumer_state_LSE)
@@ -2085,12 +2088,11 @@ class FlashAttentionBackwardSm100:
                 #### TMEM->RMEM (Load S from TMEM)
                 tSrS_t2r = cute.make_fragment(tScS_t2r.shape, Float32)
                 cute.copy(thr_copy_t2r, tStS_t2r, tSrS_t2r)
-
-                if const_expr(self.score_mod is not None):
-                    # Preserve unscaled S for backward score_mod BEFORE any modification
+                if const_expr(self.score_mod_bwd is not None):
                     tSrS_pre = cute.make_fragment_like(tSrS_t2r)
                     cute.autovec_copy(tSrS_t2r, tSrS_pre)
 
+                if const_expr(self.score_mod is not None):
                     # Apply score_mod FIRST -> matches forward
                     self.apply_score_mod(
                         tSrS_t2r,
@@ -2459,7 +2461,10 @@ class FlashAttentionBackwardSm100:
                         curr_full_cnt,
                         curr_full_idx,
                         subtile_factor=self.subtile_factor,
+                        m_block_max=m_block_max,
                     )
+                    if m_block_max > 0:
+                        m_block = cutlass.min(m_block, m_block_max - 1)
                 else:
                     m_block = m_block_min + iter_idx
                 pipeline_dQ.consumer_wait(dQ_consumer_state)
