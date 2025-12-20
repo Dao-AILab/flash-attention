@@ -434,15 +434,15 @@ Q_BOUNDARY_SEQLEN_PAIRS = [
 @pytest.mark.parametrize("mask_name", ["block_diagonal", "document"])
 def test_q_boundary_masking_block_sparse_bwd(seqlen_q, seqlen_k, mask_name):
     """Test Q boundary masking for block-sparse backward pass.
-    
+
     This test specifically exercises the fix for the bug where Q rows beyond seqlen_q
     were not masked in backward pass for is_full_block=True tiles.
-    
+
     The bug occurred because:
     - In forward, apply_mask_sm100 always checks both Q and K bounds
     - In backward, apply_mask_sm100_transposed with is_full_block=True only checked K bounds
     - Result: partial last m_blocks had unmasked garbage Q rows contributing to gradients
-    
+
     Key conditions:
     - seqlen_q NOT a multiple of tile_m (128): creates partial last m_block
     - Block-sparse with mask_mod: exercises is_full_block=True path
@@ -450,7 +450,7 @@ def test_q_boundary_masking_block_sparse_bwd(seqlen_q, seqlen_k, mask_name):
     """
     if COMPUTE_CAPABILITY != 10:
         pytest.skip("SM100-only backward test")
-    
+
     _run_mask_test(
         seqlen_q=seqlen_q,
         seqlen_k=seqlen_k,
@@ -467,6 +467,120 @@ def test_q_boundary_masking_block_sparse_bwd(seqlen_q, seqlen_k, mask_name):
         use_block_sparsity=True,
         needs_backward=True,
     )
+
+
+def test_single_doc_bwd_minimal():
+    """Minimal test to isolate single-document backward pass bug.
+
+    This test uses batch=1, nheads=1, and a single document (all same doc_id)
+    to make debugging easier. The bug manifests as large numerical errors
+    in dQ, dK, dV when blocks are classified as "full blocks" due to
+    the mask returning True for all positions.
+
+    Run with: pytest tests/cute/test_mask_mod.py::test_single_doc_bwd_minimal -v -s
+    """
+    if COMPUTE_CAPABILITY != 10:
+        pytest.skip("SM100-only test")
+
+    import random
+    random.seed(42)
+    torch.manual_seed(42)
+
+    seqlen_q = 384
+    seqlen_k = 300
+    batch_size = 1
+    nheads = 1
+    headdim = 128
+    tile_m = 128
+    tile_n = 128
+    dtype = torch.bfloat16
+
+    # Create single-document doc_ids (all same doc_id = 0)
+    doc_ids = torch.zeros(batch_size, nheads, max(seqlen_q, seqlen_k), dtype=torch.int32, device="cuda")
+
+    from flash_attn.cute.mask_definitions import get_mask_pair
+    mask_mod_cute, mask_mod_flex = get_mask_pair("document", seqlen_q=seqlen_q, seqlen_k=seqlen_k)
+
+    original_flex_mask = mask_mod_flex
+    def mask_mod_flex(b, h, q_idx, kv_idx, doc_ids=doc_ids):
+        return original_flex_mask(b, h, q_idx, kv_idx, doc_ids)
+
+    aux_tensors_arg = [doc_ids]
+
+    # Create tensors
+    q = torch.randn(batch_size, seqlen_q, nheads, headdim, device="cuda", dtype=dtype)
+    k = torch.randn(batch_size, seqlen_k, nheads, headdim, device="cuda", dtype=dtype)
+    v = torch.randn(batch_size, seqlen_k, nheads, headdim, device="cuda", dtype=dtype)
+    out = torch.empty(batch_size, seqlen_q, nheads, headdim, device="cuda", dtype=dtype)
+    lse = torch.empty(batch_size, nheads, seqlen_q, device="cuda", dtype=torch.float32)
+
+    sparse_tile_m = 2 * tile_m
+    bm = create_block_mask(
+        mask_mod_flex, batch_size, nheads, seqlen_q, seqlen_k,
+        device="cuda", BLOCK_SIZE=(sparse_tile_m, tile_n),
+    )
+    (
+        _seq_q, _seq_k,
+        kv_mask_cnt, kv_mask_idx, full_kv_cnt, full_kv_idx,
+        q_mask_cnt, q_mask_idx, full_q_cnt, full_q_idx, *_,
+    ) = bm.as_tuple()
+
+    block_sparse_mask_fwd = BlockSparseTensorsTorch(
+        mask_block_cnt=kv_mask_cnt, mask_block_idx=kv_mask_idx,
+        full_block_cnt=full_kv_cnt, full_block_idx=full_kv_idx,
+    )
+    block_sparse_mask_bwd = BlockSparseTensorsTorch(
+        mask_block_cnt=q_mask_cnt, mask_block_idx=q_mask_idx,
+        full_block_cnt=full_q_cnt, full_block_idx=full_q_idx,
+    )
+
+
+    out_tuple = _flash_attn_fwd(
+        q=q, k=k, v=v, out=out, lse=lse,
+        cu_seqlens_q=None, cu_seqlens_k=None,
+        seqused_q=None, seqused_k=None, page_table=None,
+        causal=False, softcap=None,
+        window_size_left=-1, window_size_right=-1,
+        m_block_size=tile_m, n_block_size=tile_n, pack_gqa=False,
+        _compute_capability=None, score_mod=None,
+        mask_mod=mask_mod_cute,
+        block_sparse_tensors=block_sparse_mask_fwd,
+        return_lse=True, aux_tensors=aux_tensors_arg,
+    )
+    out_cute = out_tuple[0]
+    lse_cute = out_tuple[1]
+
+    # Backward pass
+    grad_out = torch.randn_like(out_cute)
+
+    dq_cute, dk_cute, dv_cute = run_cute_mask_bwd(
+        q, k, v, out_cute, lse_cute, grad_out, mask_mod_cute,
+        block_sparse_mask_bwd=block_sparse_mask_bwd,
+        tile_m=tile_m, tile_n=tile_n,
+        aux_tensors=aux_tensors_arg,
+    )
+
+    flex_block_mask = create_block_mask(
+        mask_mod_flex, batch_size, nheads, seqlen_q, seqlen_k,
+        device="cuda", BLOCK_SIZE=(tile_m, tile_n),
+    )
+    out_ref, dq_ref, dk_ref, dv_ref = run_flex_reference_bwd(
+        q, k, v, flex_block_mask, grad_out, dtype=torch.float32
+    )
+
+    # Compare
+    dq_err = (dq_cute - dq_ref.to(dtype)).abs().max().item()
+    dk_err = (dk_cute - dk_ref.to(dtype)).abs().max().item()
+    dv_err = (dv_cute - dv_ref.to(dtype)).abs().max().item()
+
+    print(f"dQ error: {dq_err:.2e}")
+    print(f"dK error: {dk_err:.2e}")
+    print(f"dV error: {dv_err:.2e}")
+
+    # Assert gradients are correct (this will fail, demonstrating the bug)
+    assert dq_err < 0.05, f"dQ error too large: {dq_err:.2e}"
+    assert dk_err < 0.05, f"dK error too large: {dk_err:.2e}"
+    assert dv_err < 0.05, f"dV error too large: {dv_err:.2e}"
 
 
 @pytest.mark.parametrize("seqlen_q,seqlen_k", SEQLEN_PAIRS_COMPREHENSIVE)
