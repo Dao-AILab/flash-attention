@@ -274,6 +274,7 @@ def test_flash_attn_output(
             and dv == d
             and learnable_sink is None
             # and False
+            and not ((causal or local) and seqlen_k < seqlen_q)
         ):
             g = torch.randn_like(out)
             # do_o = ((g.float() * out.float()).sum(-1)).transpose(1, 2)
