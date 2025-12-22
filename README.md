@@ -149,34 +149,34 @@ We are working on the following things
 4) Performance Improvements
 
 ##### Getting Started
-To get started with the triton backend for AMD, follow the steps below.
+To get started with the Triton backend for AMD, follow the steps below.
 
 First install the recommended Triton version 
 
-```
+```sh
 pip install triton==3.2.0
 ```
 Then install Flash Attention with the flag `FLASH_ATTENTION_TRITON_AMD_ENABLE` set to `"TRUE"`.
 
-```
+```sh
 cd flash-attention
 git checkout main_perf
 FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" python setup.py install
 ```
 
 To test that things are working, you can run our tests. These tests take hours so you don't need to run the full thing.
-```
+```sh
 FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" pytest tests/test_flash_attn_triton_amd.py
 ```
 
 You can use autotune for better performance by using this flag `FLASH_ATTENTION_TRITON_AMD_AUTOTUNE="TRUE"`
-```
+```sh
 FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" FLASH_ATTENTION_TRITON_AMD_AUTOTUNE="TRUE" python $PATH_TO_CODE
 ```
 
 ###### Docker
 You can also use the Dockerfile below which does the above steps on top of the latest rocm/pytorch image.
-```
+```dockerfile
 FROM rocm/pytorch:latest
 
 WORKDIR /workspace
@@ -196,13 +196,13 @@ RUN git clone https://github.com/ROCm/flash-attention.git &&\
 WORKDIR /workspace/flash-attention
 ```
 
-To build the docker file
-```
+To build the Docker file
+```sh
 docker build -t fa_triton .
 ```
 
-To run the docker image
-```
+To run the Docker image
+```sh
 docker run -it --network=host --user root --group-add video --cap-add=SYS_PTRACE --security-opt seccomp=unconfined --ipc=host --shm-size 16G --device=/dev/kfd --device=/dev/dri fa_triton
 ```
 
@@ -513,7 +513,7 @@ As Triton is a higher-level language than CUDA, it might be easier to understand
 and experiment with. The notations in the Triton implementation are also closer
 to what's used in our paper.
 
-We also have an experimental implementation in Triton that support attention
+We also have an experimental implementation in Triton that supports attention
 bias (e.g. ALiBi):
 https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/flash_attn_triton.py
 
@@ -544,7 +544,7 @@ pytest tests/test_flash_attn_ck.py
 
 ## Citation
 If you use this codebase, or otherwise found our work valuable, please cite:
-```
+```bibtex
 @inproceedings{dao2022flashattention,
   title={Flash{A}ttention: Fast and Memory-Efficient Exact Attention with {IO}-Awareness},
   author={Dao, Tri and Fu, Daniel Y. and Ermon, Stefano and Rudra, Atri and R{\'e}, Christopher},
