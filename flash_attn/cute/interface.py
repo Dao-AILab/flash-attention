@@ -108,6 +108,8 @@ def _flash_attn_fwd(
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
     aux_tensors: Optional[list[torch.Tensor]] = None,
+    max_seqlen_q: Optional[int] = None,
+    max_seqlen_k: Optional[int] = None,
     scheduler_metadata: Optional[SchedulerMetadataTensorsTorch] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for FlashAttention.
@@ -130,7 +132,7 @@ def _flash_attn_fwd(
         total_q = batch_size * seqlen_q
     else:
         batch_size = cu_seqlens_q.shape[0] - 1
-        seqlen_q = None
+        seqlen_q = max_seqlen_q
         total_q = q.shape[0]
     if page_table is not None:
         assert cu_seqlens_k is None, "page_table is not supported with cu_seqlens_k"
@@ -142,7 +144,7 @@ def _flash_attn_fwd(
         seqlen_k = num_pages * page_size
     else:
         num_pages, page_size = None, None
-        seqlen_k = k.shape[-3]
+        seqlen_k = k.shape[-3] if cu_seqlens_k is None else max_seqlen_k
     num_head_kv = k.shape[-2]
     head_dim_v = v.shape[-1]
     if cu_seqlens_k is None:
@@ -153,8 +155,9 @@ def _flash_attn_fwd(
             assert k.shape == (num_pages, page_size, num_head_kv, head_dim)
             assert v.shape == (num_pages, page_size, num_head_kv, head_dim_v)
     else:
-        assert k.shape == (seqlen_k, num_head_kv, head_dim)
-        assert v.shape == (seqlen_k, num_head_kv, head_dim_v)
+        total_k = k.shape[-3]
+        assert k.shape == (total_k, num_head_kv, head_dim)
+        assert v.shape == (total_k, num_head_kv, head_dim_v)
         assert cu_seqlens_k.shape == (batch_size + 1,), (
             "cu_seqlens_k must have shape (batch_size + 1,)"
         )
@@ -263,6 +266,8 @@ def _flash_attn_fwd(
     if block_sparse_tensors is not None:
         if seqlen_q is None:
             raise ValueError("Block sparsity requires fixed-length sequences (seqlen_q must be known).")
+        if seqlen_k is None:
+            raise ValueError("Block sparsity requires fixed-length sequences (seqlen_k must be known).")
         m_block_size_block = m_block_size
         if compute_capability == 10:
             # TODO: This multiplier should really be q_stage, wire up in later PR
@@ -311,24 +316,56 @@ def _flash_attn_fwd(
             pack_gqa = False
 
     if num_splits < 1:
-        max_seqlen_k = seqlen_k if cu_seqlens_k is None else (cu_seqlens_k[1:] - cu_seqlens_k[:-1]).max().item()
-        max_seqlen_q = seqlen_q if cu_seqlens_q is None else (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item()
-        seqlen_q_packgqa = max_seqlen_q * qhead_per_kvhead
-        seqlen_k_loaded = max_seqlen_k if not local else max(0, min(max_seqlen_k, window_size_right + window_size_left + 1 + m_block_size))
+        if seqlen_k is None:
+            seqlen_k = (cu_seqlens_k[1:] - cu_seqlens_k[:-1]).max().item()
+        if seqlen_q is None:
+            seqlen_q = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item()
+        if pack_gqa:
+            seqlen_q = seqlen_q * qhead_per_kvhead
+        seqlen_k_loaded = seqlen_k if not local else max(0, min(seqlen_k, window_size_right + window_size_left + 1 + m_block_size))
         num_n_blocks = (seqlen_k_loaded + n_block_size - 1) // n_block_size
-        num_m_blocks = (seqlen_q_packgqa + m_block_size - 1) // m_block_size
-        total_mblocks = batch_size * num_head_kv * num_m_blocks
+        num_m_blocks = (seqlen_q + m_block_size - 1) // m_block_size
+        total_mblocks = batch_size * (num_head_kv if pack_gqa else num_head) * num_m_blocks
         num_splits = num_splits_heuristic(
             total_mblocks,
             torch.cuda.get_device_properties(device).multi_processor_count,
             num_n_blocks,
             128,
         )
+        # print(f"num splits by heuristic = {num_splits} for {seqlen_q = }, {seqlen_k = }, {total_mblocks =}, {num_n_blocks =},")
 
+    is_varlen = (
+        cu_seqlens_q is not None
+        or cu_seqlens_k is not None
+        or seqused_q is not None
+        or seqused_k is not None
+    )
     is_split_kv = num_splits > 1
+    
     if is_split_kv:
         out_partial = torch.empty(num_splits, *q_batch_seqlen_shape, num_head, head_dim_v, dtype=torch.float32, device=device)
         lse_partial = torch.empty(num_splits, *lse_shape, dtype=torch.float32, device=device)
+
+        if scheduler_metadata is None and is_varlen:
+            scheduler_metadata = get_scheduler_metadata(
+                num_batch=batch_size,
+                max_seqlen_q=seqlen_q,
+                max_seqlen_k=seqlen_k,
+                nheads=num_head,
+                nheads_k=num_head_kv,
+                headdim=head_dim,
+                headdim_v=head_dim_v,
+                num_splits=num_splits,
+                tile_m=m_block_size,
+                tile_n=n_block_size,
+                pack_gqa=pack_gqa,
+                causal=causal,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                seqused_q=seqused_q,
+                seqused_k=seqused_k,
+                current_stream=current_stream,
+            )
 
     q_tensor, k_tensor, v_tensor, o_tensor = [
         from_dlpack(t.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=t.ndim - 1)
@@ -348,13 +385,6 @@ def _flash_attn_fwd(
     if softcap is not None:
         assert score_mod is None, "softcap and score_mod cannot be used together"
         score_mod = utils.create_softcap_scoremod(softcap)
-
-    is_varlen = (
-        cu_seqlens_q is not None
-        or cu_seqlens_k is not None
-        or seqused_q is not None
-        or seqused_k is not None
-    )
 
     if mask_mod is not None:
         if is_varlen:
@@ -393,6 +423,28 @@ def _flash_attn_fwd(
             num_nheads_in_l2,
             tile_count_semaphore,
         ) = scheduler_metadata
+        assert all(
+            t is None or t.is_cuda
+            for t in (
+                num_m_blocks,
+                num_splits_dynamic,
+                varlen_batch_idx,
+                num_nheads_in_l2,
+                tile_count_semaphore,
+            )
+        ), "scheduler metadata must be on CUDA device"
+        assert all(
+            t is None or t.shape == (batch_size, )
+            for t in (
+                num_m_blocks,
+                num_splits_dynamic,
+                varlen_batch_idx,
+                num_nheads_in_l2,
+            )
+        ), "these scheduler metadata tensors must have shape (batch_size, )"
+        if tile_count_semaphore is not None:
+            assert tile_count_semaphore.shape == (1, ), "semaphore has size 1"
+        # print("num_splits_dynamic = ", num_splits_dynamic)
         num_m_blocks_cute, num_splits_dynamic_cute, varlen_batch_idx_cute, num_nheads_in_l2_cute = [
             from_dlpack(t.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=t.ndim - 1)
             if t is not None
@@ -545,6 +597,8 @@ def _flash_attn_fwd(
             seqused_q,
             num_splits_dynamic if has_scheduler_metadata else None,
             tile_count_semaphore if has_scheduler_metadata else None,
+            max_seqlen_q,
+            current_stream,
         )
     return out, lse
 
@@ -1191,6 +1245,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         deterministic: bool = False,
         score_mod: Optional[Callable] = None,
         aux_tensors: Optional[list] = None,
+        max_seqlen_q: Optional[int] = None,
+        max_seqlen_k: Optional[int] = None,
         scheduler_metadata: Optional[SchedulerMetadataTensorsTorch] = None,
     ):
         out, lse = _flash_attn_fwd(
@@ -1212,6 +1268,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             pack_gqa=pack_gqa,
             score_mod=score_mod,
             aux_tensors=aux_tensors,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
             scheduler_metadata=scheduler_metadata,
         )
         ctx.save_for_backward(q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
@@ -1304,6 +1362,8 @@ def flash_attn_varlen_func(
     deterministic: bool = False,
     score_mod: Optional[Callable] = None,
     aux_tensors: Optional[list] = None,
+    max_seqlen_q: Optional[int] = None,
+    max_seqlen_k: Optional[int] = None,
     scheduler_metadata: Optional[SchedulerMetadataTensorsTorch] = None,
 ):
     return FlashAttnVarlenFunc.apply(
@@ -1325,6 +1385,8 @@ def flash_attn_varlen_func(
         deterministic,
         score_mod,
         aux_tensors,
+        max_seqlen_q,
+        max_seqlen_k,
         scheduler_metadata,
     )
 
@@ -1338,6 +1400,8 @@ def _flash_attn_fwd_combine(
     seqused: Optional[torch.Tensor] = None,
     num_splits_dynamic_ptr: Optional[torch.Tensor] = None,
     semaphore_to_reset: Optional[torch.Tensor] = None,
+    max_seqlen_q: Optional[int] = None,
+    current_stream: Optional[cuda.CUstream] = None,
 ) -> None:
     """Forward combine kernel for split attention computation.
 
@@ -1355,7 +1419,7 @@ def _flash_attn_fwd_combine(
         seqused: Used sequence lengths for each batch
         num_splits_dynamic_ptr: Dynamic number of splits per batch
         semaphore_to_reset: Semaphore for synchronization
-        k_block_size: Block size for head dimension
+        max_seqlen_q: Maximum seqlen_q for any batch, used if there's cu_seqlens.
 
     Returns:
         None
@@ -1431,7 +1495,8 @@ def _flash_attn_fwd_combine(
         optional_tensors
     )
 
-    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if current_stream is None:
+        current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     # Create combine kernel configuration
     dtype = torch2cute_dtype_map[out.dtype]
@@ -1449,6 +1514,7 @@ def _flash_attn_fwd_combine(
         lse is not None,
         num_splits_dynamic_ptr is not None,
         semaphore_to_reset is not None,
+        max_seqlen_q is not None,
     )
 
     if compile_key not in _flash_attn_fwd_combine.compile_cache:
@@ -1485,6 +1551,7 @@ def _flash_attn_fwd_combine(
             seqused_tensor,
             num_splits_dynamic_tensor,
             semaphore_tensor,
+            max_seqlen_q,
             current_stream,
         )
 
@@ -1497,6 +1564,7 @@ def _flash_attn_fwd_combine(
         seqused_tensor,
         num_splits_dynamic_tensor,
         semaphore_tensor,
+        max_seqlen_q,
         current_stream,
     )
 
@@ -1512,6 +1580,7 @@ def flash_attn_combine(
     cu_seqlens: Optional[torch.Tensor] = None,
     seqused: Optional[torch.Tensor] = None,
     return_lse: bool = True,
+    max_seqlen_q: Optional[int] = None,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Flash Attention combine function for split attention computation.
 
@@ -1531,6 +1600,7 @@ def flash_attn_combine(
         cu_seqlens: Cumulative sequence lengths for variable length sequences
         seqused: Used sequence lengths for each batch
         return_lse: Whether to return the combined LSE tensor. Default is True.
+        max_seqlen_q: Maximum seqlen_q for any batch, used if there's cu_seqlens.
 
     Returns:
         Tuple of (out, lse) where:
@@ -1602,13 +1672,14 @@ def flash_attn_combine(
         lse,
         cu_seqlens,
         seqused,
+        max_seqlen_q=max_seqlen_q,
     )
     return out, lse
 
 def get_scheduler_metadata(
     num_batch: int,
-    max_seqlen_q: int,
-    max_seqlen_k: int,
+    max_seqlen_q: Optional[int],
+    max_seqlen_k: Optional[int],
     nheads: int,
     nheads_k: int,
     headdim: int,
@@ -1628,7 +1699,7 @@ def get_scheduler_metadata(
     seqused_q: Optional[torch.Tensor] = None,
     seqused_k: Optional[torch.Tensor] = None,
     leftpad_k: Optional[torch.Tensor] = None,
-    stream: Optional[cuda.CUstream] = None,
+    current_stream: Optional[cuda.CUstream] = None,
 ) -> SchedulerMetadataTensorsTorch:
     """
     Helper method to get scheduler metadata for varlen sequences.
@@ -1654,10 +1725,11 @@ def get_scheduler_metadata(
     # Override sort (not supported yet)
     sort = False
 
-    # Compute seqlen_q if it's None (when cu_seqlens_q is provided)
     if max_seqlen_q is None:
-        assert cu_seqlens_q is not None, "seqlen_q is None but cu_seqlens_q is also None"
-        max_seqlen_q = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item()
+        assert cu_seqlens_q is not None, "if max_seqlen_q is None, must have cu_seqlens_q"
+        # max_seqlen_q = (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item() # don't need this for now
+    if max_seqlen_k is None:
+        assert cu_seqlens_k is not None, "if max_seqlen_k is None, must have cu_seqlens_k"
 
     # Allocate metadata tensors (torch tensors)
     num_m_blocks = None
@@ -1691,8 +1763,8 @@ def get_scheduler_metadata(
         for t in (cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new, seqused_q, seqused_k, leftpad_k)
     ]
 
-    if stream is None:
-        stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    if current_stream is None:
+        current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     prepare_varlen_num_blocks(
         num_batch=num_batch,
@@ -1711,7 +1783,7 @@ def get_scheduler_metadata(
         enable_pdl=enable_pdl,
         sort=sort,
         seqlen_k_new=seqlen_k_new,
-        stream=stream,
+        stream=current_stream,
         mCuSeqlensQ=cu_seqlens_q_tensor,
         mCuSeqlensK=cu_seqlens_k_tensor,
         mCuSeqlensKNew=cu_seqlens_k_new_tensor,
