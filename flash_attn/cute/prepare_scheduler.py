@@ -77,8 +77,8 @@ class FlashPrepareScheduler:
     @cute.jit
     def __call__(
         self,
-        seqlen_q_static: int,
-        seqlen_k_static: int,
+        seqlen_q_static: Optional[int],
+        seqlen_k_static: Optional[int],
         seqlen_k_new_static: int,
         mCuSeqlensQ: Optional[cute.Tensor],
         mCuSeqlensK: Optional[cute.Tensor],
@@ -138,8 +138,8 @@ class FlashPrepareScheduler:
     @cute.kernel
     def kernel(
         self,
-        seqlen_q_static: Int32,
-        seqlen_k_static: Int32,
+        seqlen_q_static: Optional[Int32],
+        seqlen_k_static: Optional[Int32],
         seqlen_k_new_static: Int32,
         mCuSeqlensQ: Optional[cute.Tensor],
         mCuSeqlensK: Optional[cute.Tensor],
@@ -245,7 +245,7 @@ class FlashPrepareScheduler:
         batch_idx: Int32,
         mSeqUsedQ: Optional[cute.Tensor],
         mCuSeqlensQ: Optional[cute.Tensor],
-        seqlen_q_static: Int32,
+        seqlen_q_static: Optional[Int32],
         tile_m_divmod: FastDivmodDivisor,
         num_batch: Int32
     ):
@@ -262,6 +262,7 @@ class FlashPrepareScheduler:
             next_cu_seqlen = cute.arch.shuffle_sync_down(cur_cu_seqlen, offset=1)
             seqlen = next_cu_seqlen - cur_cu_seqlen
         else:
+            assert seqlen_q_static is not None
             seqlen = seqlen_q_static
 
         seqlen_for_blocks = seqlen
@@ -282,7 +283,7 @@ class FlashPrepareScheduler:
         mSeqUsedK: Optional[cute.Tensor],
         mCuSeqlensK: Optional[cute.Tensor],
         mCuSeqlensKNew: Optional[cute.Tensor],
-        seqlen_k_static: Int32,
+        seqlen_k_static: Optional[Int32],
         seqlen_k_new_static: Int32,
         mLeftPadK: Optional[cute.Tensor],
         tile_n_divmod: FastDivmodDivisor,
@@ -306,6 +307,7 @@ class FlashPrepareScheduler:
             next_cu_seqlen = cute.arch.shuffle_sync_down(cur_cu_seqlen, offset=1)
             seqlen = next_cu_seqlen - cur_cu_seqlen
         else:
+            assert seqlen_k_static is not None
             seqlen = seqlen_k_static
 
         seqlen_new = Int32(0)
@@ -353,8 +355,8 @@ class FlashPrepareScheduler:
 
 def prepare_varlen_num_blocks(
     num_batch: int,
-    seqlen_q_static: int,
-    seqlen_k_static: int,
+    seqlen_q_static: Optional[int],
+    seqlen_k_static: Optional[int],
     nheads: int,
     nheads_k: int,
     headdim: int,
@@ -446,6 +448,8 @@ def prepare_varlen_num_blocks(
         varlen_batch_idx_ptr is not None,
         num_nheads_in_l2_ptr is not None,
         tile_count_semaphore is not None,
+        seqlen_q_static is not None,
+        seqlen_k_static is not None,
     )
 
     if cache_key not in prepare_varlen_num_blocks.compile_cache:

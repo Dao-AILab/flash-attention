@@ -835,7 +835,7 @@ def test_flash_attn_varlen_output(
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 # @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
-# @pytest.mark.parametrize("mha_type", ["mha"])
+# @pytest.mark.parametrize("mha_type", ["gqa"])
 # @pytest.mark.parametrize("has_learnable_sink", [False, True])
 @pytest.mark.parametrize("has_learnable_sink", [False])
 # @pytest.mark.parametrize("new_kv", [False, True])
@@ -859,8 +859,8 @@ def test_flash_attn_varlen_output(
 @pytest.mark.parametrize("has_leftpad", [False])
 # @pytest.mark.parametrize("has_batch_idx", [False, True])
 @pytest.mark.parametrize("has_batch_idx", [False])
-# @pytest.mark.parametrize("varlen_q", [False, True])
-@pytest.mark.parametrize("varlen_q", [True])
+@pytest.mark.parametrize("varlen_q", [False, True])
+# @pytest.mark.parametrize("varlen_q", [True])
 # @pytest.mark.parametrize("d", [32, 59, 64, 80, 128, 256])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192])
@@ -1227,13 +1227,13 @@ def test_flash_attn_kvcache(
         sin = sin.to(dtype) if sin is not None else None
         k_cache_saved = k_cache.clone() if page_size is None else k_cache_paged.clone()
         v_cache_saved = v_cache.clone() if page_size is None else v_cache_paged.clone()
+        print(f"max seqlen_q = {seqlen_q} and max seqlen_k = {seqlen_k}")
         print("cache_seqlens = ", cache_seqlens)
         print("cu_seqlens_q = ", cu_seqlens_q)
-        print("max seqlen_q and max seqlen_k = ", seqlen_q, seqlen_k)
         # num_splits_vals = [1, 0]
         # SplitKV is not supported for hdim >= 192
         # num_splits_vals = [1, 3] if d < 192 and not DISABLE_SPLIT else [1]
-        num_splits_vals = [1, 32] if d < 192 and not DISABLE_SPLIT else [1]
+        num_splits_vals = [0, 1, 3, 32] if d < 192 and not DISABLE_SPLIT else [1]
         precompute_metadata_vals = [False, True]
         # precompute_metadata_vals = [True]
         for num_splits, precompute_metadata in itertools.product(
@@ -1242,8 +1242,9 @@ def test_flash_attn_kvcache(
             # SplitKV not supported on SM90 - skip this iteration
             if IS_SM90 and num_splits > 1:
                 continue
+            if num_splits == 0 and precompute_metadata:
+                continue
             print(f"{num_splits = }, {precompute_metadata = }")
-            
             if precompute_metadata:
                 scheduler_metadata = get_scheduler_metadata(
                     num_batch=batch_size,
@@ -1301,7 +1302,8 @@ def test_flash_attn_kvcache(
                     # rotary_interleaved=rotary_interleaved,
                     scheduler_metadata=scheduler_metadata,
                     num_splits=num_splits,
-                    # return_softmax_lse=True
+                    # return_softmax_lse=True,
+                    max_seqlen_q=seqlen_q,
                 )
                 if varlen_q:
                     out = output_pad_fn(out)

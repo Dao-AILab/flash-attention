@@ -202,6 +202,7 @@ class FlashAttentionForwardCombine:
         seqused: Optional[cute.Tensor] = None,
         num_splits_dynamic_ptr: Optional[cute.Tensor] = None,
         semaphore_to_reset: Optional[cute.Tensor] = None,
+        seqlen_q: Optional[int] = None,
         stream: cuda.CUstream = None,
     ):
         # Type checking
@@ -285,7 +286,10 @@ class FlashAttentionForwardCombine:
         smem_size = SharedStorage.size_in_bytes()
 
         # Grid dimensions: (ceil_div(seqlen, m_block), ceil_div(head_dim, k_block), num_head * batch)
+        # warning: for varlen, we may use total_q to determine grid dims if seqlen_q is not provided
         seqlen = mO_partial.shape[0]
+        if cu_seqlens is not None and seqlen_q is not None:
+            seqlen = Int32(seqlen_q)
         num_head = mO_partial.shape[3]
         batch_size = (
             mO_partial.shape[4]
