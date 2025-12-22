@@ -223,10 +223,7 @@ class FlashAttentionForwardSm100:
         - Configures pipeline stages for softmax, correction, and epilogue operations
         """
 
-        # NOTE: FP8 currently uses the same KV staging as FP16/BF16. Increasing KV stages for
-        # FP8 is a tuning knob, but it must preserve correct load/consume ordering.
-        # self.kv_stage = 4 if self.q_dtype.width == 8 else 3
-        self.kv_stage = 3
+        self.kv_stage = 4 if self.q_dtype.width == 8 else 3
         self.acc_stage = 1
         self.epi_stage = 2
         # For hdim 192,128, we don't have enough smem to store all 3 stages of KV:
