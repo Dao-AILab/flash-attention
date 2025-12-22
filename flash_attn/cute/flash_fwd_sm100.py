@@ -1621,7 +1621,9 @@ class FlashAttentionForwardSm100:
 
         tStScale_r2t = thr_tmem_store_scale.partition_D(tStScale)
         tmem_store_atom = cute.make_copy_atom(
-            tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(16)),
+            tcgen05.copy.St32x32bOp(
+                tcgen05.copy.Repetition(8 if const_expr(self.q_dtype.width == 8) else 16)
+            ),
             Float32,
         )
         thr_tmem_store = tcgen05.make_tmem_copy(tmem_store_atom, tStP).get_slice(tidx)
@@ -1987,32 +1989,18 @@ class FlashAttentionForwardSm100:
             cute.arch.mbarrier_arrive(mbar_ptr + mbar_s0_s1_sequence_offset + (1 - stage) * 4)
         # print(tSrP_r2t_f32, tStP_r2t)
         # cute.copy(thr_tmem_store, tSrP_r2t_f32, tStP_r2t)
-        if const_expr(self.q_dtype.width == 8):
-            # NOTE: FP8: avoid overlapped P producer signaling while we validate correctness.
-            # A conservative store+signal ordering prevents MMA from consuming partially
-            # written TMEM data (suspected source of NaNs).
-            for i in cutlass.range_constexpr(cute.size(tStP_r2t.shape[2])):
-                cute.copy(thr_tmem_store, tSrP_r2t_f32[None, None, i], tStP_r2t[None, None, i])
-            cute.arch.fence_view_async_tmem_store()
-            cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage)
-            cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_2_offset + stage)
-        else:
-            for i in cutlass.range_constexpr(cute.size(tStP_r2t.shape[2]) // 4 * 3):
-                cute.copy(
-                    thr_tmem_store, tSrP_r2t_f32[None, None, i], tStP_r2t[None, None, i]
-                )
-            cute.arch.fence_view_async_tmem_store()
-            # Notify mma warp that P is ready
-            cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage)
-            for i in cutlass.range_constexpr(
-                cute.size(tStP_r2t.shape[2]) // 4 * 3, cute.size(tStP_r2t.shape[2])
-            ):
-                cute.copy(
-                    thr_tmem_store, tSrP_r2t_f32[None, None, i], tStP_r2t[None, None, i]
-                )
-            cute.arch.fence_view_async_tmem_store()
-            # Notify mma warp that the 2nd half of P is ready
-            cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_2_offset + stage)
+        for i in cutlass.range_constexpr(cute.size(tStP_r2t.shape[2]) // 4 * 3):
+            cute.copy(thr_tmem_store, tSrP_r2t_f32[None, None, i], tStP_r2t[None, None, i])
+        cute.arch.fence_view_async_tmem_store()
+        # Notify mma warp that P is ready
+        cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage)
+        for i in cutlass.range_constexpr(
+            cute.size(tStP_r2t.shape[2]) // 4 * 3, cute.size(tStP_r2t.shape[2])
+        ):
+            cute.copy(thr_tmem_store, tSrP_r2t_f32[None, None, i], tStP_r2t[None, None, i])
+        cute.arch.fence_view_async_tmem_store()
+        # Notify mma warp that the 2nd half of P is ready
+        cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_P_full_2_offset + stage)
         cute.arch.mbarrier_wait(
             mbar_ptr + self.mbar_softmax_corr_empty_offset + stage, si_corr_producer_phase
         )

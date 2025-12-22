@@ -582,7 +582,9 @@ def gemm_ptx_partial(
                         f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
                         f"@leader_thread tcgen05.mma.cta_group::1.kind::{kind} [tmem_acc], [tmem_a + {hex(offset_a[k])}], smem_desc_b, idesc, 1;\n\t"
                     )
-                    for k in range(cute.size(tCrA.shape[2]) // 4 * 3, cute.size(tCrA.shape[2]))
+                    for k in range(
+                        cute.size(tCrA.shape[2]) // 4 * 3, cute.size(tCrA.shape[2])
+                    )
                 )
                 if const_expr(mbar_ptr is not None)
                 else ""
