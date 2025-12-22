@@ -617,6 +617,8 @@ def handle_block_sparse_empty_tile_correction_sm100(
     o_corr_consumer_phase: Int32,
     corr_epi_producer_phase: Int32,
     softmax_scale_log2: Float32,
+    max_offset: Float32,
+    max_offset_scale: Float32,
     mO_cur: Optional[cute.Tensor] = None,
     gO: Optional[cute.Tensor] = None,
     gmem_tiled_copy_O: Optional[cute.TiledCopy] = None,
@@ -645,10 +647,10 @@ def handle_block_sparse_empty_tile_correction_sm100(
             if sink_val != -Float32.inf and (const_expr(not is_split_kv) or split_idx == 0):
                 if row_max_value == -Float32.inf:
                     row_max_value = sink_val * (LOG2_E / softmax_scale_log2)
-                    row_sum_value = Float32(1.0)
+                    row_sum_value = max_offset_scale
                 else:
                     row_sum_value = row_sum_value + utils.exp2f(
-                        sink_val * LOG2_E - row_max_value * softmax_scale_log2
+                        sink_val * LOG2_E - row_max_value * softmax_scale_log2 + max_offset
                     )
         if tidx < m_block_size:
             scale_row_idx = tidx + stage * m_block_size

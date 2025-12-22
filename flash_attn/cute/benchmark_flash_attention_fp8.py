@@ -5,7 +5,8 @@
 #
 # Notes:
 # - This is intended to be used while bringing up FP8 support for SM100.
-# - It is expected to fail today because CuTe FP8 support is not wired up yet.
+# - FP8 correctness depends on descales + max-offset scaling being implemented in the SM100 kernel.
+#   This script optionally checks output vs a BF16 PyTorch baseline on dequantized FP8 inputs.
 #
 # Adapted from: `hopper/benchmark_flash_attention_fp8.py`
 
@@ -322,12 +323,12 @@ def main(argv: Iterable[str] | None = None) -> int:
                     # Treat as fatal: BF16 kernel should be usable for basic sanity checking.
                     raise RuntimeError("FA4-CuTe BF16 baseline failed") from e
 
-                # FA4 / CuTe FP8 (expected to fail today)
+                # FA4 / CuTe FP8
                 q_fp8 = q_bf16.to(fp8_dtype)
                 k_fp8 = k_bf16.to(fp8_dtype)
                 v_fp8 = v_bf16.to(fp8_dtype)
 
-                # Placeholder descales (FA3-style: per-(batch, kv_head)). Not yet plumbed in FA4.
+                # Placeholder descales (FA3-style: per-(batch, kv_head)).
                 q_descale = torch.ones(batch, nheads, device=device, dtype=torch.float32)
                 k_descale = torch.ones(batch, nheads, device=device, dtype=torch.float32)
                 v_descale = torch.ones(batch, nheads, device=device, dtype=torch.float32)
@@ -337,9 +338,17 @@ def main(argv: Iterable[str] | None = None) -> int:
                     # FP8 reference: run the BF16 PyTorch baseline on dequantized FP8 inputs.
                     # This is future-proof when descales are plumbed: Q_real = Q_fp8 * q_descale, etc.
                     try:
-                        q_ref_fp8 = q_fp8.to(torch.bfloat16) * q_descale[:, None, :, None]
-                        k_ref_fp8 = k_fp8.to(torch.bfloat16) * k_descale[:, None, :, None]
-                        v_ref_fp8 = v_fp8.to(torch.bfloat16) * v_descale[:, None, :, None]
+                        # Keep the reference in BF16 (match FA4 FP8 output dtype). Note that
+                        # BF16 * FP32 promotes to FP32 in PyTorch, so we cast back explicitly.
+                        q_ref_fp8 = (q_fp8.to(torch.bfloat16) * q_descale[:, None, :, None]).to(
+                            torch.bfloat16
+                        )
+                        k_ref_fp8 = (k_fp8.to(torch.bfloat16) * k_descale[:, None, :, None]).to(
+                            torch.bfloat16
+                        )
+                        v_ref_fp8 = (v_fp8.to(torch.bfloat16) * v_descale[:, None, :, None]).to(
+                            torch.bfloat16
+                        )
                         qkv_ref_fp8 = torch.stack([q_ref_fp8, k_ref_fp8, v_ref_fp8], dim=2)
                         out_ref_fp8 = attention_pytorch(qkv_ref_fp8, causal=causal)
                     except RuntimeError as e:
@@ -397,7 +406,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                     else:
                         print(f"{method} fwd: {speeds[method]:.2f} TFLOPs/s, {t * 1e3:.3f} ms")
                 if math.isnan(times.get("FA4-CuTe-FP8", float("nan"))):
-                    print("FA4-CuTe-FP8 status: FAILED (expected until FP8 support is implemented)")
+                    print("FA4-CuTe-FP8 status: FAILED")
 
     if fp8_failures:
         print(f"\nFP8 failures: {len(fp8_failures)} (showing first 5)")
