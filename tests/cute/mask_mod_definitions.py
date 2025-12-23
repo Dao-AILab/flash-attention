@@ -8,23 +8,17 @@ import cutlass.cute as cute
 import torch
 
 from flash_attn.cute import utils
+from flash_attn.cute.block_sparsity import fast_sampling
 
+# =============================================================================
+# MASK_MOD DEFINITIONS
+# All use signature (tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors)
+# =============================================================================
 
-MaskModCallable = Optional[
-    Callable[
-        [
-            "cute.TensorSSA",
-            "cute.TensorSSA",
-            "cute.TensorSSA",
-            "cute.TensorSSA",
-            "Optional[list]",
-        ],
-        "cute.TensorSSA",
-    ]
-]
+# =============================================================================
+# mask_mod functions that don't use global indices
+# =============================================================================
 
-
-# Flex Attention mask functions (PyTorch signatures for reference implementation)
 def get_flex_causal_mask(offset: int):
     def _flex_causal_mask(b, h, q_idx, kv_idx):
         return kv_idx <= q_idx + offset
@@ -50,7 +44,7 @@ def get_flex_sliding_window_mask(window_left: int, window_right: int, offset: in
 
 
 def flex_block_diagonal_mask(b, h, q_idx, kv_idx):
-    block_size = 64
+    block_size = 128
     return (q_idx // block_size) == (kv_idx // block_size)
 
 
@@ -64,6 +58,7 @@ def flex_document_mask(b, h, q_idx, kv_idx, doc_id):
 
 # CuTe versions for kernel compilation
 def get_cute_causal_mask(offset: int):
+    @fast_sampling
     @cute.jit
     def _cute_causal_mask(
         batch: cute.TensorSSA,
@@ -79,6 +74,7 @@ def get_cute_causal_mask(offset: int):
 
 
 def get_cute_block_causal_mask(offset: int):
+    @fast_sampling
     @cute.jit
     def _cute_block_causal_mask(
         batch: cute.TensorSSA,
@@ -94,6 +90,7 @@ def get_cute_block_causal_mask(offset: int):
 
 
 def get_cute_sliding_window_mask(window_left: int, window_right: int, offset: int):
+    @fast_sampling
     @cute.jit
     def _cute_sliding_window_mask(
         batch: cute.TensorSSA,
@@ -112,7 +109,7 @@ def get_cute_sliding_window_mask(window_left: int, window_right: int, offset: in
 
     return _cute_sliding_window_mask
 
-
+@fast_sampling
 @cute.jit
 def cute_document_mask(
     batch: cute.TensorSSA,
@@ -126,7 +123,7 @@ def cute_document_mask(
     n_doc = utils.scalar_to_ssa(doc_id[batch[0], head[0], n_idx[0]], cutlass.Int32)
     return m_doc == n_doc
 
-
+@fast_sampling
 @cute.jit
 def cute_block_diagonal_mask(
     batch: cute.TensorSSA,
@@ -135,10 +132,10 @@ def cute_block_diagonal_mask(
     n_idx: cute.TensorSSA,
     aux_tensors,
 ) -> cute.TensorSSA:
-    block_size_ssa = utils.scalar_to_ssa(64, cutlass.Int32)
+    block_size_ssa = utils.scalar_to_ssa(128, cutlass.Int32)
     return (m_idx // block_size_ssa) == (n_idx // block_size_ssa)
 
-
+# NOT fast sampling if tile_size_ssa != block size
 @cute.jit
 def cute_mini_causal_mask(
     batch: cute.TensorSSA,
@@ -237,6 +234,10 @@ def random_doc_id_tensor(nheads, batch, seqlen_q, device="cpu"):
             doc_ids_tensor[b, h, :] = base_doc_ids
     return doc_ids_tensor
 
+
+# =============================================================================
+# mask_mod functions that use global indices (variable sequence length)
+# =============================================================================
 
 STATIC_MASKS = {
     "block_diagonal": (cute_block_diagonal_mask, flex_block_diagonal_mask),

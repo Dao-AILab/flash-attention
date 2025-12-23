@@ -4,7 +4,7 @@ import pytest
 import torch
 from torch.nn.attention.flex_attention import create_block_mask
 
-from flash_attn.cute.mask_definitions import get_mask_pair
+from mask_mod_definitions import get_mask_pair
 from flash_attn.cute.compute_block_sparsity import compute_block_sparsity
 
 
