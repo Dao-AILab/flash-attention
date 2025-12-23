@@ -2,12 +2,14 @@
 # from CUTLASS C++ to Cute-DSL.
 
 from typing import Tuple, Optional, Callable, List, NamedTuple
+import operator
 import torch
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
-from cutlass import Boolean, Int32, const_expr, Constexpr
+from cutlass import Boolean, Int32, const_expr, Constexpr, Float32
 from cutlass.cute import FastDivmodDivisor
+import flash_attn.cute.utils as utils
 
 
 class SchedulerMetadataTensorsTorch(NamedTuple):
@@ -208,21 +210,30 @@ class FlashPrepareScheduler:
             num_splits_dynamic = Int32(1)
         else:
             total_blocks = num_m_blocks * num_n_blocks
-            # Warp reduction
-            for i in range(self.num_threads_per_warp // 2, 0, -1):
-                total_blocks += cute.arch.shuffle_sync_down(total_blocks, offset=i)
+            total_blocks = utils.warp_reduce(total_blocks, operator.add)
             if lane_idx == 0:
-                total_blocks_smem.store(total_blocks_smem.load() + total_blocks)
+                utils.atomic_add_i32(total_blocks, total_blocks_smem.iterator)
+                
             cute.arch.sync_threads()
 
             total_blocks = total_blocks_smem[0]
-            blocks_per_sm = cute.ceil_div(total_blocks * self.nheads_computed, num_sm) # TODO: figure out fudge factor
+            
+            # example with 10% margin
+            blocks_per_sm = Int32((Float32(total_blocks) * 1.1 * Float32(self.nheads_computed) / Float32(num_sm)))
+            # blocks_per_sm = cute.ceil_div(total_blocks * self.nheads_computed, num_sm)
             num_splits_dynamic = cutlass.max(
-                cutlass.min(num_n_blocks // blocks_per_sm, num_splits_static), Int32(1)
+                cutlass.min(cute.ceil_div(num_n_blocks, blocks_per_sm), num_splits_static), Int32(1)
             )
+            # if tidx == 0:
+            #     cute.printf("num_batch = {}", num_batch)
+            #     cute.printf("num_m_blocks = {}", num_m_blocks)
+            #     cute.printf("num_n_blocks = {}", num_n_blocks)
+            #     cute.printf("total_blocks = {}", total_blocks)
+            #     cute.printf("numerator = {}", total_blocks * self.nheads_computed)
+            #     cute.printf("denominator num_sm = {}", num_sm)
+            #     cute.printf("blocks_per_sm = {}", blocks_per_sm)
+            #     cute.printf("num_splits_dynamic = {}", num_splits_dynamic)
             num_n_blocks = cute.ceil_div(num_n_blocks, num_splits_dynamic)
-            # if cute.arch.thread_idx()[0] == 0:
-            #     cute.printf("total_blocks: %d", total_blocks)
 
         if const_expr(self.sort):
             # TODO: Implement sort logic

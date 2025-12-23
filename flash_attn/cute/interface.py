@@ -128,6 +128,7 @@ def _flash_attn_fwd(
     max_seqlen_q: Optional[int] = None,
     max_seqlen_k: Optional[int] = None,
     scheduler_metadata: Optional[SchedulerMetadataTensorsTorch] = None,
+    disable_scheduler_metadata: bool = False
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for FlashAttention.
 
@@ -338,7 +339,7 @@ def _flash_attn_fwd(
             num_n_blocks,
             128,
         )
-        # print(f"num splits by heuristic = {num_splits} for {seqlen_q = }, {seqlen_k = }, {total_mblocks =}, {num_n_blocks =},")
+        # print(f"num splits by heuristic = {num_splits} for {seqlen_q = }, {seqlen_k = }, {total_mblocks =}, {num_m_blocks = }, {num_n_blocks =},")
 
     is_varlen = (
         cu_seqlens_q is not None
@@ -352,7 +353,7 @@ def _flash_attn_fwd(
         out_partial = torch.empty(num_splits, *q_batch_seqlen_shape, num_head, head_dim_v, dtype=torch.float32, device=device)
         lse_partial = torch.empty(num_splits, *lse_shape, dtype=torch.float32, device=device)
 
-        if scheduler_metadata is None and is_varlen:
+        if scheduler_metadata is None and is_varlen and not disable_scheduler_metadata:
             scheduler_metadata = get_scheduler_metadata(
                 num_batch=batch_size,
                 max_seqlen_q=seqlen_q,
@@ -1460,6 +1461,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         max_seqlen_q: Optional[int] = None,
         max_seqlen_k: Optional[int] = None,
         scheduler_metadata: Optional[SchedulerMetadataTensorsTorch] = None,
+        disable_scheduler_metadata: bool = False
     ):
         out, lse = _flash_attn_fwd(
             q,
@@ -1485,6 +1487,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
             scheduler_metadata=scheduler_metadata,
+            disable_scheduler_metadata=disable_scheduler_metadata,
         )
         ctx.save_for_backward(q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
         ctx.softmax_scale = softmax_scale
@@ -1588,6 +1591,7 @@ def flash_attn_varlen_func(
     max_seqlen_q: Optional[int] = None,
     max_seqlen_k: Optional[int] = None,
     scheduler_metadata: Optional[SchedulerMetadataTensorsTorch] = None,
+    disable_scheduler_metadata: bool = False
 ):
     return FlashAttnVarlenFunc.apply(
         q,
@@ -1613,6 +1617,7 @@ def flash_attn_varlen_func(
         max_seqlen_q,
         max_seqlen_k,
         scheduler_metadata,
+        disable_scheduler_metadata,
     )
 
 
