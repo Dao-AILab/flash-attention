@@ -287,9 +287,10 @@ class FlashAttentionForwardCombine:
 
         # Grid dimensions: (ceil_div(seqlen, m_block), ceil_div(head_dim, k_block), num_head * batch)
         # warning: for varlen, we may use total_q to determine grid dims if seqlen_q is not provided
-        seqlen = mO_partial.shape[0]
-        if cu_seqlens is not None and seqlen_q is not None:
+        if const_expr(cu_seqlens is not None and seqlen_q is not None):
             seqlen = Int32(seqlen_q)
+        else:
+            seqlen = mO_partial.shape[0]
         num_head = mO_partial.shape[3]
         batch_size = (
             mO_partial.shape[4]
