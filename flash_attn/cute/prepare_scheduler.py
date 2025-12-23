@@ -218,8 +218,8 @@ class FlashPrepareScheduler:
 
             total_blocks = total_blocks_smem[0]
             
-            # example with 10% margin
-            blocks_per_sm = Int32((Float32(total_blocks) * 1.1 * Float32(self.nheads_computed) / Float32(num_sm)))
+            sm_margin = max(Float32(num_sm) / 128 + .001, 1.1) # e.g. 148/128 = 1.15625
+            blocks_per_sm = Int32((Float32(total_blocks) * sm_margin * Float32(self.nheads_computed) / Float32(num_sm)))
             # blocks_per_sm = cute.ceil_div(total_blocks * self.nheads_computed, num_sm)
             num_splits_dynamic = cutlass.max(
                 cutlass.min(cute.ceil_div(num_n_blocks, blocks_per_sm), num_splits_static), Int32(1)
@@ -232,6 +232,7 @@ class FlashPrepareScheduler:
             #     cute.printf("numerator = {}", total_blocks * self.nheads_computed)
             #     cute.printf("denominator num_sm = {}", num_sm)
             #     cute.printf("blocks_per_sm = {}", blocks_per_sm)
+            #     cute.printf("sm margin = {}", sm_margin)
             #     cute.printf("num_splits_dynamic = {}", num_splits_dynamic)
             num_n_blocks = cute.ceil_div(num_n_blocks, num_splits_dynamic)
 
@@ -464,6 +465,7 @@ def prepare_varlen_num_blocks(
     )
 
     if cache_key not in prepare_varlen_num_blocks.compile_cache:
+        # print("Compiling for cache key", cache_key)
         scheduler = FlashPrepareScheduler(
             num_warps,
             tile_m,
