@@ -2382,6 +2382,7 @@ class FlashAttentionForwardSm100:
             tOrO_frg_cvt.store(tOrO_frg.load().to(self.o_dtype))
             cute.copy(tiled_smem_store, tOrO_frg_cvt, tOsO_r2s_i)
         # fence view async shared
+        cute.arch.fence_view_async_tmem_load()
         cute.arch.fence_proxy(
             cute.arch.ProxyKind.async_shared,
             space=cute.arch.SharedSpace.shared_cta,
@@ -2400,7 +2401,7 @@ class FlashAttentionForwardSm100:
             t0OcO = gmem_tiled_copy_O.get_slice(0).partition_S(cO)
             tOpO = utils.predicate_k(tOcO, limit=mO_cur.shape[1])
             # TODO: the packgqa case isn't correct rn (sometimes IMA), disabling it
-            assert not self.pack_gqa
+            # assert not self.pack_gqa
             pack_gqa = PackGQA(
                 self.m_block_size,
                 self.head_dim_v_padded,
@@ -2496,7 +2497,7 @@ class FlashAttentionForwardSm100:
                     t0OcO = gmem_tiled_copy_O.get_slice(0).partition_S(cO)
                     tOpO = utils.predicate_k(tOcO, limit=mO.shape[1])
                     # TODO: the packgqa case isn't correct rn (sometimes IMA), disabling it
-                    assert not self.pack_gqa
+                    # assert not self.pack_gqa
                     pack_gqa = PackGQA(
                         self.m_block_size,
                         self.head_dim_v_padded,
