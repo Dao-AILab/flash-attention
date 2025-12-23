@@ -2,7 +2,7 @@
 # [2025-07-04] Version in Cute-DSL, for Hopper and Blackwell. You'll need install nvidia-cutlass-dsl==4.2.0.
 
 # Supported features:
-# - BF16 & FP16 & FP8 E4M3 dtype
+# - BF16 & FP16 & FP8 (E4M3, E5M2) dtype
 # - noncausal & causal attention
 # - MHA, GQA, MQA
 # - hdim 64, 96, 128.
@@ -16,7 +16,6 @@
 # - tuned block sizes
 # - paged KV
 # - append KV to existing KV cache
-# - FP8 E5M2
 # - bwd pass optimized for Hopper/Blackwell
 
 import math
@@ -70,13 +69,15 @@ def to_cute_tensor(t, assumed_align=16, leading_dim=-1, fully_dynamic=False):
     # NOTE: torch 2.9.1 doesn't support fp8 via DLPack but 2.11.0 nightly does
     # currently export raw bytes as uint8 and tell cutlass correct type
     # can directly export as fp8 when torch supports it
-    if t.dtype == torch.float8_e4m3fn:
+    if t.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
         tensor = from_dlpack(
             t.view(torch.uint8).detach(),
             assumed_align=assumed_align,
             enable_tvm_ffi=True,
         )
-        tensor.element_type = cutlass.Float8E4M3FN
+        tensor.element_type = (
+            cutlass.Float8E4M3FN if t.dtype == torch.float8_e4m3fn else cutlass.Float8E5M2
+        )
     else:
         tensor = from_dlpack(t.detach(), assumed_align=assumed_align, enable_tvm_ffi=True)
     if fully_dynamic:
@@ -91,6 +92,7 @@ torch2cute_dtype_map = {
     torch.bfloat16: cutlass.BFloat16,
     torch.float32: cutlass.Float32,
     torch.float8_e4m3fn: cutlass.Float8E4M3FN,
+    torch.float8_e5m2: cutlass.Float8E5M2,
 }
 
 
@@ -198,7 +200,9 @@ def _flash_attn_fwd(
     assert seqused_k is None or seqused_k.shape == (batch_size,), (
         "seqused_k must have shape (batch_size,)"
     )
-    assert q.dtype in [torch.float16, torch.bfloat16, torch.float8_e4m3fn], "inputs must be float16, bfloat16, or fp8 e4m3"
+    assert q.dtype in [torch.float16, torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2], (
+        "inputs must be float16, bfloat16, fp8 e4m3fn, or fp8 e5m2"
+    )
     assert q.dtype == k.dtype == v.dtype, "inputs must have the same dtype"
     for t in [cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k]:
         if t is not None:
@@ -242,7 +246,7 @@ def _flash_attn_fwd(
     if pack_gqa is None:
         pack_gqa = qhead_per_kvhead > 1
 
-    is_fp8 = q.dtype == torch.float8_e4m3fn
+    is_fp8 = q.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
     if is_fp8 and (q.requires_grad or k.requires_grad or v.requires_grad):
         raise NotImplementedError("FA4 CuTe FP8 backward is not supported yet (forward-only).")
     out_torch_dtype = torch.bfloat16 if is_fp8 else q.dtype
