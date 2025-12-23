@@ -8,7 +8,7 @@ from cutlass.cute import FastDivmodDivisor
 from cutlass.cute.runtime import from_dlpack
 import torch
 
-from flash_attn.cute.block_sparsity import BlockSparseTensors, BlockSparseTensorsTorch
+from flash_attn.cute.block_sparsity import BlockSparseTensors, BlockSparseTensorsTorch, to_cute_block_sparse_tensors
 from flash_attn.cute.utils import hash_callable, scalar_to_ssa, ssa_to_scalar
 
 
@@ -22,9 +22,9 @@ class BlockSparsityKernel:
 
     When use_fast_sampling=True, uses 5-point sampling (4 corners + center)
     which is much faster but only suitable for masks where this is sufficient.
-    """
 
-    # TODO: better mask application handling (fastdiv_mods)
+    TODO: really optimize
+    """
 
     def __init__(
         self,
@@ -60,8 +60,12 @@ class BlockSparsityKernel:
         # launch 1 CTA per m block
         grid = [num_m_blocks, num_heads, batch_size]
 
-        num_threads = self.tile_mn[0]
-        self.num_warps = (num_threads + 32 - 1) // 32
+        if const_expr(self.use_fast_sampling):
+            num_threads = 32
+            self.num_warps = 1
+        else:
+            num_threads = self.tile_mn[0]
+            self.num_warps = (num_threads + 32 - 1) // 32
 
         fastdiv_mods = None
         if const_expr(aux_tensors is not None):
@@ -155,9 +159,11 @@ class BlockSparsityKernel:
                     # Center point
                     q_idx = m_base + (cutlass.min(seqlen_q - m_base, self.tile_mn[0])) // 2
                     kv_idx = n_base + (cutlass.min(seqlen_k - n_base, self.tile_mn[1])) // 2
+                else:
+                    thread_is_valid = Boolean(False)
 
                 # Check bounds and determine if this thread has a valid index pair
-                if q_idx < seqlen_q and kv_idx < seqlen_k:
+                if tidx < 5 and q_idx < seqlen_q and kv_idx < seqlen_k:
                     thread_is_valid = Boolean(True)
                     q_idx_ssa = ssa(q_idx)
                     kv_idx_ssa = ssa(kv_idx)
@@ -369,6 +375,9 @@ def compute_block_sparsity(
     Returns:
         A tuple of `BlockSparseTensors` and the underlying torch tensors.
     """
+    # Check if mask_mod is marked as suitable for 5-point fast sampling
+    use_fast_sampling |= getattr(mask_mod, 'use_fast_sampling', False)
+
     num_m_blocks = (seqlen_q + tile_m - 1) // tile_m
     num_n_blocks = (seqlen_k + tile_n - 1) // tile_n
 
@@ -398,28 +407,8 @@ def compute_block_sparsity(
         full_block_idx=full_block_idx,
     )
 
-    # Convert to cute tensors
-    mask_cnt_cute = from_dlpack(mask_block_cnt.detach(), assumed_align=4).mark_layout_dynamic(
-        leading_dim=2
-    )
-    mask_idx_cute = from_dlpack(mask_block_idx.detach(), assumed_align=4).mark_layout_dynamic(
-        leading_dim=3
-    )
-    full_cnt_cute = from_dlpack(full_block_cnt.detach(), assumed_align=4).mark_layout_dynamic(
-        leading_dim=2
-    )
-    full_idx_cute = from_dlpack(full_block_idx.detach(), assumed_align=4).mark_layout_dynamic(
-        leading_dim=3
-    )
-
-    blocksparse_tensors = BlockSparseTensors(
-        mask_block_cnt=mask_cnt_cute,
-        mask_block_idx=mask_idx_cute,
-        full_block_cnt=full_cnt_cute,
-        full_block_idx=full_idx_cute,
-    )
-
     mask_mod_hash = hash_callable(mask_mod)
+    blocksparse_tensors = to_cute_block_sparse_tensors(blocksparse_tensors_torch, enable_tvm_ffi=True)
 
     compile_key = (
         tile_m,
@@ -433,7 +422,7 @@ def compute_block_sparsity(
         kernel = BlockSparsityKernel(
             mask_mod,
             tile_mn=(tile_m, tile_n),
-            compute_full_blocks=True,
+            compute_full_blocks=compute_full_blocks,
             use_aux_tensors=aux_tensors is not None,
             use_fast_sampling=use_fast_sampling,
         )
@@ -444,10 +433,11 @@ def compute_block_sparsity(
             seqlen_q,
             seqlen_k,
             aux_tensors,
+            options="--enable-tvm-ffi"
         )
 
     compute_block_sparsity.compile_cache[compile_key](
-        blocksparse_tensors,
+        blocksparse_tensors_torch,
         seqlen_q,
         seqlen_k,
         aux_tensors,
