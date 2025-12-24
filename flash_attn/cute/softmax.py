@@ -83,7 +83,7 @@ class Softmax(ParamsBase):
 
             row_max_cur = utils.warp_reduce(row_max_cur, cute.arch.fmax, width=4)
             if cutlass.const_expr(check_inf):
-                row_max_cur = 0.0 if row_max_cur == -Float32.inf else row_max_cur
+                row_max_cur = -1e8 if row_max_cur == -Float32.inf else row_max_cur
 
             if cutlass.const_expr(is_first):
                 row_max_cur_scaled = row_max_cur * scale_log2
