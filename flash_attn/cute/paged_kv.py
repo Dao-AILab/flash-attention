@@ -151,8 +151,10 @@ class PagedKVManager(ParamsBase):
         tXcX = self.gmem_thr_copy_KV.partition_S(cX)
 
         seqlenk_row_limit = self.seqlen_k - n_block * self.n_block_size if n_block >= 0 else 0
-        for m in cutlass.range(cute.size(tXsX, mode=[1]), unroll=1):
-            should_load = tXcX[0, m, 0][0] < seqlenk_row_limit
+        for m in cutlass.range_constexpr(cute.size(tXsX, mode=[1])):
+            row_valid = tXcX[0, m, 0][0] < seqlenk_row_limit
+            should_load = cute.make_fragment_like(tXsX[None, m, 0], cute.Boolean)
+            should_load.fill(row_valid)
 
             page = self.tPrPage[m]
             page_offset = self.tPrPageOffset[m]
@@ -163,26 +165,11 @@ class PagedKVManager(ParamsBase):
             )
             mX_paged_cur_copy = cute.tiled_divide(mX_paged_cur, (self.async_copy_elems,))
 
-            if should_load:
-                for k in cutlass.range(cute.size(tXsX, mode=[2]), unroll=1):
-                    ki = tXcX[0, 0, k][1] // self.async_copy_elems
-                    cute.copy(
-                        self.gmem_tiled_copy_KV,
-                        mX_paged_cur_copy[None, ki],
-                        tXsX[None, m, k],
-                    )
-            elif const_expr(K_or_V == "V"):
-                # Don't need to clear out the rest of the smem for K since we'll mask out the scores anyway.
-                fill_swizzled(tXsX[None, m, None], 0)
-
-
-@cutlass.dsl_user_op
-def fill_swizzled(tensor, value: cutlass.Numeric, *, loc=None, ip=None) -> None:
-    """Fill tensor with a constant value.
-
-    Fills all elements of the tensor with the specified value, assuming static size
-    and supported memory space.
-    """
-    rTmp = cute.make_rmem_tensor_like(tensor, tensor.element_type)
-    rTmp.fill(value)
-    cute.autovec_copy(rTmp, tensor)
+            for k in cutlass.range_constexpr(cute.size(tXsX, mode=[2])):
+                ki = tXcX[0, 0, k][1] // self.async_copy_elems
+                cute.copy(
+                    self.gmem_tiled_copy_KV,
+                    mX_paged_cur_copy[None, ki],
+                    tXsX[None, m, k],
+                    pred=should_load,
+                )
