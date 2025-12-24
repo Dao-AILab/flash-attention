@@ -96,6 +96,7 @@ class FlashPrepareScheduler:
         num_splits_dynamic_ptr: Optional[cute.Tensor],
         varlen_batch_idx_ptr: Optional[cute.Tensor],
         num_nheads_in_l2_ptr: Optional[cute.Tensor],
+        n_blocks_per_split: Optional[int], # overrides heuristic
         stream: cuda.CUstream,
     ):
         tile_m_divmod = FastDivmodDivisor(self.tile_m)
@@ -130,6 +131,7 @@ class FlashPrepareScheduler:
             num_splits_dynamic_ptr,
             varlen_batch_idx_ptr,
             num_nheads_in_l2_ptr,
+            n_blocks_per_split,
         ).launch(
             grid=grid,
             block=block,
@@ -159,6 +161,7 @@ class FlashPrepareScheduler:
         num_splits_dynamic_ptr: Optional[cute.Tensor],
         varlen_batch_idx_ptr: Optional[cute.Tensor],
         num_nheads_in_l2_ptr: Optional[cute.Tensor],
+        n_blocks_per_split: Optional[Int32],
     ):
         bidx, _, _ = cute.arch.block_idx()
         tidx, _, _ = cute.arch.thread_idx()
@@ -206,35 +209,45 @@ class FlashPrepareScheduler:
         )
 
         num_splits_dynamic = Int32(0)
-        if grid_dimx > 1 or num_splits_static == 1:
-            num_splits_dynamic = Int32(1)
-        else:
-            total_blocks = num_m_blocks * num_n_blocks
-            total_blocks = utils.warp_reduce(total_blocks, operator.add)
-            if lane_idx == 0:
-                utils.atomic_add_i32(total_blocks, total_blocks_smem.iterator)
-                
-            cute.arch.sync_threads()
-
-            total_blocks = total_blocks_smem[0]
-            
-            sm_margin = max(Float32(num_sm) / 128 + .001, 1.1) # e.g. 148/128 = 1.15625
-            blocks_per_sm = Int32((Float32(total_blocks) * sm_margin * Float32(self.nheads_computed) / Float32(num_sm)))
-            # blocks_per_sm = cute.ceil_div(total_blocks * self.nheads_computed, num_sm)
+        if const_expr(n_blocks_per_split is not None):
+            # print("n_blocks_per_splits = ", n_blocks_per_split)
             num_splits_dynamic = cutlass.max(
-                cutlass.min(cute.ceil_div(num_n_blocks, blocks_per_sm), num_splits_static), Int32(1)
+                cutlass.min(cute.ceil_div(num_n_blocks, n_blocks_per_split), num_splits_static), Int32(1)
             )
-            # if tidx == 0:
-            #     cute.printf("num_batch = {}", num_batch)
-            #     cute.printf("num_m_blocks = {}", num_m_blocks)
-            #     cute.printf("num_n_blocks = {}", num_n_blocks)
-            #     cute.printf("total_blocks = {}", total_blocks)
-            #     cute.printf("numerator = {}", total_blocks * self.nheads_computed)
-            #     cute.printf("denominator num_sm = {}", num_sm)
-            #     cute.printf("blocks_per_sm = {}", blocks_per_sm)
-            #     cute.printf("sm margin = {}", sm_margin)
-            #     cute.printf("num_splits_dynamic = {}", num_splits_dynamic)
             num_n_blocks = cute.ceil_div(num_n_blocks, num_splits_dynamic)
+        else:
+            if grid_dimx > 1 or num_splits_static == 1:
+                num_splits_dynamic = Int32(1)
+            else:
+                total_blocks = num_m_blocks * num_n_blocks
+                total_blocks = utils.warp_reduce(total_blocks, operator.add)
+                if lane_idx == 0:
+                    utils.atomic_add_i32(total_blocks, total_blocks_smem.iterator)
+                    
+                cute.arch.sync_threads()
+
+                total_blocks = total_blocks_smem[0]
+                
+                sm_margin = max(Float32(num_sm) / 128 + .001, 1.1) # e.g. 148/128 = 1.15625
+                blocks_per_sm = cutlass.max(
+                    Int32((Float32(total_blocks) * sm_margin * Float32(self.nheads_computed) / Float32(num_sm))),
+                    Int32(1)
+                )
+                # blocks_per_sm = cute.ceil_div(total_blocks * self.nheads_computed, num_sm)
+                num_splits_dynamic = cutlass.max(
+                    cutlass.min(cute.ceil_div(num_n_blocks, blocks_per_sm), num_splits_static), Int32(1)
+                )
+                # if tidx == 0:
+                #     cute.printf("num_batch = {}", num_batch)
+                #     cute.printf("num_m_blocks = {}", num_m_blocks)
+                #     cute.printf("num_n_blocks = {}", num_n_blocks)
+                #     cute.printf("total_blocks = {}", total_blocks)
+                #     cute.printf("numerator = {}", total_blocks * self.nheads_computed)
+                #     cute.printf("denominator num_sm = {}", num_sm)
+                #     cute.printf("blocks_per_sm = {}", blocks_per_sm)
+                #     cute.printf("sm margin = {}", sm_margin)
+                #     cute.printf("num_splits_dynamic = {}", num_splits_dynamic)
+                num_n_blocks = cute.ceil_div(num_n_blocks, num_splits_dynamic)
 
         if const_expr(self.sort):
             # TODO: Implement sort logic
@@ -394,6 +407,7 @@ def prepare_varlen_num_blocks(
     varlen_batch_idx_ptr: Optional[cute.Tensor] = None,
     num_nheads_in_l2_ptr: Optional[cute.Tensor] = None,
     tile_count_semaphore: Optional[cute.Tensor] = None,
+    seqlen_k_per_split: Optional[int] = None,
 ):
     """
     Prepare scheduler metadata for varlen sequences with dynamic num splits.
@@ -438,6 +452,12 @@ def prepare_varlen_num_blocks(
     # Round up to nearest power of 2
     num_warps = 1 << (num_warps - 1).bit_length()
 
+    if seqlen_k_per_split is not None:
+        assert seqlen_k_per_split % tile_n == 0, "seqlen per split must be divisible by tile_n"
+        n_blocks_per_split = seqlen_k_per_split // tile_n
+    else:
+        n_blocks_per_split = None
+
     cache_key = (
         num_warps,
         tile_m,
@@ -462,6 +482,7 @@ def prepare_varlen_num_blocks(
         tile_count_semaphore is not None,
         seqlen_q_static is not None,
         seqlen_k_static is not None,
+        n_blocks_per_split is not None
     )
 
     if cache_key not in prepare_varlen_num_blocks.compile_cache:
@@ -497,6 +518,7 @@ def prepare_varlen_num_blocks(
             num_splits_dynamic_ptr,
             varlen_batch_idx_ptr,
             num_nheads_in_l2_ptr,
+            n_blocks_per_split,
             stream,
         )
 
@@ -518,6 +540,7 @@ def prepare_varlen_num_blocks(
         num_splits_dynamic_ptr,
         varlen_batch_idx_ptr,
         num_nheads_in_l2_ptr,
+        n_blocks_per_split,
         stream,
     )
 
