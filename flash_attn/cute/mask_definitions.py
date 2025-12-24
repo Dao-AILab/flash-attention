@@ -219,21 +219,22 @@ def cute_ima_mask(
 
 
 def random_doc_id_tensor(nheads, batch, seqlen_q, device="cpu"):
+    """Generate synthetic document ids shared across heads."""
     doc_ids_tensor = torch.zeros(batch, nheads, seqlen_q, dtype=torch.int32, device=device)
     for b in range(batch):
+        N = seqlen_q
+        max_segments = max(1, math.ceil(math.sqrt(max(N // 4, 1))))
+        n = random.randint(1, max_segments)
+        n = min(n, N)
+        cuts = sorted(random.sample(range(1, N), n - 1))
+        lengths = [b - a for a, b in zip((0, *cuts), (*cuts, N))]
+        base_doc_ids = torch.repeat_interleave(
+            torch.arange(len(lengths), device=device, dtype=torch.int32),
+            torch.tensor(lengths, device=device, dtype=torch.int32),
+        )
+
         for h in range(nheads):
-            N = seqlen_q
-            max_segments = max(1, math.ceil(math.sqrt(max(N // 4, 1))))
-            n = random.randint(1, max_segments)
-            n = min(n, N)
-            cuts = sorted(random.sample(range(1, N), n - 1))
-            lengths = [b - a for a, b in zip((0, *cuts), (*cuts, N))]
-
-            doc_ids = []
-            for i, length in enumerate(lengths):
-                doc_ids += [i for _ in range(length)]
-
-            doc_ids_tensor[b, h, :] = torch.tensor(doc_ids, dtype=torch.int32, device=device)
+            doc_ids_tensor[b, h, :] = base_doc_ids
     return doc_ids_tensor
 
 

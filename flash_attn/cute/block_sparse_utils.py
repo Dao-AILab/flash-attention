@@ -493,20 +493,31 @@ def produce_block_sparse_loads_sm100(
     pipeline_kv,
     q_stage: cutlass.Constexpr,
     q_producer_phase: Int32,
+    qhead_per_kvhead: cutlass.Constexpr,
 ):
     """SM100 entry point for sparse block iteration.
 
     SM100 uses PipelineTmaUmma which doesn't support extra_tx_count, so we use
     simplified block processing that just calls producer_acquire without extras.
+
+    Args:
+        m_block: which tile of m we are processing
+        qhead_per_kvhead: Constexpr pack factor
     """
+    # NB: Compute unpacked index for sparse tensor access
+    if const_expr(qhead_per_kvhead != 1):
+        m_block_sparse = m_block // qhead_per_kvhead
+    else:
+        m_block_sparse = m_block
+
     mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx = blocksparse_tensors
 
-    curr_mask_block_cnt = mask_block_cnt[batch_idx, head_idx, m_block]
-    curr_mask_block_idx = mask_block_idx[batch_idx, head_idx, m_block, None]
+    curr_mask_block_cnt = mask_block_cnt[batch_idx, head_idx, m_block_sparse]
+    curr_mask_block_idx = mask_block_idx[batch_idx, head_idx, m_block_sparse, None]
 
     if const_expr(full_block_cnt is not None):
-        curr_full_block_cnt = full_block_cnt[batch_idx, head_idx, m_block]
-        curr_full_block_idx = full_block_idx[batch_idx, head_idx, m_block, None]
+        curr_full_block_cnt = full_block_cnt[batch_idx, head_idx, m_block_sparse]
+        curr_full_block_idx = full_block_idx[batch_idx, head_idx, m_block_sparse, None]
     else:
         curr_full_block_cnt = Int32(0)
         curr_full_block_idx = None
@@ -574,15 +585,22 @@ def get_total_block_count(
     batch_idx,
     head_idx,
     m_block,
+    qhead_per_kvhead: cutlass.Constexpr,
 ):
+    # NB: Convert packed m_block to unpacked for sparse tensor indexing
+    if const_expr(qhead_per_kvhead != 1):
+        m_block_sparse = m_block // qhead_per_kvhead
+    else:
+        m_block_sparse = m_block
+
     mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx = blocksparse_tensors
     if const_expr(full_block_cnt is not None):
         return (
-            mask_block_cnt[batch_idx, head_idx, m_block]
-            + full_block_cnt[batch_idx, head_idx, m_block]
+            mask_block_cnt[batch_idx, head_idx, m_block_sparse]
+            + full_block_cnt[batch_idx, head_idx, m_block_sparse]
         )
     else:
-        return mask_block_cnt[batch_idx, head_idx, m_block]
+        return mask_block_cnt[batch_idx, head_idx, m_block_sparse]
 
 
 @cute.jit
@@ -717,16 +735,23 @@ def softmax_block_sparse_sm100(
     mbar_P_full_2_offset: Int32,
     q_stage: cutlass.Constexpr,
     stage_idx: Int32,
-    check_m_boundary: bool = False,
+    check_m_boundary: bool,
+    qhead_per_kvhead: cutlass.Constexpr,
 ):
+    # Convert packed m_block to unpacked for sparse tensor indexing
+    if const_expr(qhead_per_kvhead != 1):
+        m_block_sparse = m_block // qhead_per_kvhead
+    else:
+        m_block_sparse = m_block
+
     mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx = blocksparse_tensors
 
-    curr_mask_block_cnt = mask_block_cnt[batch_idx, head_idx, m_block]
-    curr_mask_block_idx = mask_block_idx[batch_idx, head_idx, m_block, None]
+    curr_mask_block_cnt = mask_block_cnt[batch_idx, head_idx, m_block_sparse]
+    curr_mask_block_idx = mask_block_idx[batch_idx, head_idx, m_block_sparse, None]
 
     if const_expr(full_block_cnt is not None):
-        curr_full_block_cnt = full_block_cnt[batch_idx, head_idx, m_block]
-        curr_full_block_idx = full_block_idx[batch_idx, head_idx, m_block, None]
+        curr_full_block_cnt = full_block_cnt[batch_idx, head_idx, m_block_sparse]
+        curr_full_block_idx = full_block_idx[batch_idx, head_idx, m_block_sparse, None]
     else:
         curr_full_block_cnt = Int32(0)
         curr_full_block_idx = None
