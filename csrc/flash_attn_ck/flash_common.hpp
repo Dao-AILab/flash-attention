@@ -9,6 +9,10 @@
 #include <torch/nn/functional.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <string>
+#ifdef USE_ROCM
+#include <hip/hip_runtime.h>
+#endif
 
 #ifdef OLD_GENERATOR_PATH
 #include <ATen/CUDAGeneratorImpl.h>
@@ -72,5 +76,22 @@ inline int num_splits_heuristic_ck(int batch_nheads_mblocks, int num_SMs, int nu
 }
 
 int override_num_splits_if_necessary(int batch, int nhead, int max_seqlen_q, int hdim_v, float p_drop, int num_splits);
+
+inline bool is_gfx12_arch() {
+#ifdef USE_ROCM
+    int dev = 0;
+    if (hipGetDevice(&dev) != hipSuccess) {
+        return false;
+    }
+    hipDeviceProp_t prop{};
+    if (hipGetDeviceProperties(&prop, dev) != hipSuccess) {
+        return false;
+    }
+    std::string arch = prop.gcnArchName;
+    return !arch.empty() && arch.rfind("gfx12", 0) == 0;
+#else
+    return false;
+#endif
+}
 
 } // namespace flash
