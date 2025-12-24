@@ -1291,6 +1291,7 @@ class FlashAttentionForwardSm100:
                     pipeline_kv,
                     self.q_stage,
                     q_producer_phase,
+                    self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
                 )
 
 
@@ -1366,7 +1367,7 @@ class FlashAttentionForwardSm100:
             process_tile = False
 
             if const_expr(self.use_block_sparsity):
-                block_iter_count = get_total_block_count(blocksparse_tensors, batch_idx, head_idx, m_block)
+                block_iter_count = get_total_block_count(blocksparse_tensors, batch_idx, head_idx, m_block, self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1)
                 process_tile = block_iter_count > Int32(0)
             else:
                 n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
@@ -1674,7 +1675,7 @@ class FlashAttentionForwardSm100:
             softmax.reset()
 
             if const_expr(self.use_block_sparsity):
-                tile_block_count = get_total_block_count(blocksparse_tensors, batch_idx, head_idx, m_block)
+                tile_block_count = get_total_block_count(blocksparse_tensors, batch_idx, head_idx, m_block, self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1)
                 has_work = tile_block_count > Int32(0)
             else:
                 tile_block_count = n_block_max - n_block_min
@@ -1742,6 +1743,7 @@ class FlashAttentionForwardSm100:
                     self.q_stage,
                     Int32(stage),
                     check_m_boundary,
+                    self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
                 )
                 if not empty_tile:
                     sScale[tidx + stage * self.m_block_size] = softmax.row_sum[0]
@@ -2034,7 +2036,7 @@ class FlashAttentionForwardSm100:
             stats = [(0.0, -Float32.inf if const_expr(mLSE is not None or learnable_sink is not None) else None, True)] * self.q_stage
 
             if const_expr(self.use_block_sparsity):
-                total_block_count = get_total_block_count(blocksparse_tensors, batch_idx, head_idx, m_block)
+                total_block_count = get_total_block_count(blocksparse_tensors, batch_idx, head_idx, m_block, self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1)
                 has_work = total_block_count > Int32(0)
             else:
                 total_block_count = n_block_max - n_block_min

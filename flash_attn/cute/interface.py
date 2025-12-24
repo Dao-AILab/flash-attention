@@ -26,11 +26,6 @@ from typing import Optional, Tuple, Callable
 import torch
 
 
-@lru_cache(maxsize=None)
-def _get_device_capability():
-    """Cached device capability check."""
-    return torch.cuda.get_device_capability()[0]
-
 import cuda.bindings.driver as cuda
 
 import cutlass
@@ -54,6 +49,11 @@ from flash_attn.cute.block_sparsity import (
     get_block_sparse_expected_shapes,
     get_block_sparse_expected_shapes_bwd,
 )
+
+@lru_cache(maxsize=None)
+def _get_device_capability():
+    """Cached device capability check."""
+    return torch.cuda.get_device_capability()[0]
 
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
@@ -327,20 +327,18 @@ def _flash_attn_fwd(
             raise NotImplementedError(
                 "mask_mod with aux_tensors is not yet supported for varlen sequences. This will be fixed in a future PR."
             )
-        if pack_gqa:
-            raise NotImplementedError(
-                "mask_mod with aux_tensors is not yet supported with pack_gqa=True. This will be fixed in a future PR."
-            )
 
     if use_block_sparsity:
         if is_varlen:
             raise NotImplementedError(
                 "Block sparsity is not yet supported for varlen sequences. This will be fixed in a future PR."
             )
-        if pack_gqa:
-            raise NotImplementedError(
-                "Block sparsity is not yet supported with pack_gqa=True. This will be fixed in a future PR."
-            )
+        # NB: pack_gqa requires block sparse head dim == 1 (broadcasted)
+        if pack_gqa and block_sparse_tensors.mask_block_cnt.shape[1] != 1:
+            pack_gqa = False
+        # SM90 doesn't support pack_gqa + block_sparsity yet
+        if pack_gqa and compute_capability == 9:
+            pack_gqa = False
         if is_split_kv:
             raise NotImplementedError(
                 "Block sparsity is not yet supported with SplitKV. TODO: partition sparse block lists per split."
@@ -506,7 +504,6 @@ def _flash_attn_fwd(
             expected_count_shape=expected_count_shape,
             expected_index_shape=expected_index_shape,
         )
-
     _flash_attn_fwd.compile_cache[compile_key](
         q,
         k,
