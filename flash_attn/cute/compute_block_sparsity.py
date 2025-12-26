@@ -2,14 +2,19 @@ from functools import partial
 from typing import Callable, Optional, Tuple
 
 import cutlass
-from cutlass import Boolean, Int32, Int8, Uint32, const_expr
 import cutlass.cute as cute
+import torch
+from cutlass import Boolean, Int8, Int32, Uint32, const_expr
 from cutlass.cute import FastDivmodDivisor
 from cutlass.cute.runtime import from_dlpack
-import torch
 
-from flash_attn.cute.block_sparsity import BlockSparseTensors, BlockSparseTensorsTorch, to_cute_block_sparse_tensors
+from flash_attn.cute.block_sparsity import (
+    BlockSparseTensors,
+    BlockSparseTensorsTorch,
+    to_cute_block_sparse_tensors,
+)
 from flash_attn.cute.utils import hash_callable, scalar_to_ssa, ssa_to_scalar
+from flash_attn.cute.seqlen_info import SeqlenInfoQK
 
 
 class BlockSparsityKernel:
@@ -23,7 +28,15 @@ class BlockSparsityKernel:
     When use_fast_sampling=True, uses 5-point sampling (4 corners + center)
     which is much faster but only suitable for masks where this is sufficient.
 
-    TODO: really optimize
+    The kernel consists of two phases:
+        1. Evaluate mask_mod to determine if each block has masked values and if each block has unmasked values
+        2. Compact the resulting Int8 tensors to
+            a. count the number of masked and full blocks and
+            b. find indices of those blocks
+
+    TODO:
+        - optimize mask_mod evaluation
+        - varlen support
     """
 
     def __init__(
@@ -105,6 +118,16 @@ class BlockSparsityKernel:
 
         ssa = partial(scalar_to_ssa, dtype=Int32)
 
+        seqlen = SeqlenInfoQK.create(
+            batch_idx,
+            seqlen_q,
+            seqlen_k,
+            mCuSeqlensQ=None,
+            mCuSeqlensK=None,
+            mSeqUsedQ=None,
+            mSeqUsedK=None,
+        )
+
         @cute.struct
         class SharedStorage:
             reduction_buffer_smem: cute.struct.Align[
@@ -169,7 +192,12 @@ class BlockSparsityKernel:
                     kv_idx_ssa = ssa(kv_idx)
                     thread_result = ssa_to_scalar(
                         self.mask_mod(
-                            ssa(batch_idx), ssa(head_idx), q_idx_ssa, kv_idx_ssa, aux_tensors
+                            ssa(batch_idx),
+                            ssa(head_idx),
+                            q_idx_ssa,
+                            kv_idx_ssa,
+                            seqlen,
+                            aux_tensors,
                         )
                     )
                 else:
@@ -208,6 +236,7 @@ class BlockSparsityKernel:
                                     ssa(head_idx),
                                     q_idx_ssa,
                                     kv_idx_ssa,
+                                    seqlen,
                                     aux_tensors,
                                 )
                             )
@@ -244,7 +273,6 @@ class BlockSparsityKernel:
                         if reduction_buffer[w, 1]:
                             has_masked = Boolean(True)
 
-            # Only thread 0 updates booleans to smem
             if tidx == 0:
                 is_partial = Boolean(has_masked and has_unmasked)
                 is_full = Boolean(has_unmasked and (not has_masked))
@@ -284,7 +312,6 @@ class BlockSparsityKernel:
                 full_mask = cute.arch.vote_ballot_sync(is_full_val)
                 full_count += cute.arch.popc(full_mask)
 
-        # Lane 0 of each warp writes its count
         if lane_id == 0:
             warp_counts[warp_idx, 0] = partial_count
             if const_expr(self.compute_full_blocks):
@@ -373,10 +400,10 @@ def compute_block_sparsity(
         use_fast_sampling: Whether to use 5-point sampling (4 corners + center). This is much faster, but only suitable for masks where this check is sufficient.
 
     Returns:
-        A tuple of `BlockSparseTensors` and the underlying torch tensors.
+        A tuple of `BlockSparseTensors` and `BlockSparseTensorsTorch`.
     """
     # Check if mask_mod is marked as suitable for 5-point fast sampling
-    use_fast_sampling |= getattr(mask_mod, 'use_fast_sampling', False)
+    use_fast_sampling = getattr(mask_mod, "use_fast_sampling", False)
 
     num_m_blocks = (seqlen_q + tile_m - 1) // tile_m
     num_n_blocks = (seqlen_k + tile_n - 1) // tile_n
@@ -408,7 +435,9 @@ def compute_block_sparsity(
     )
 
     mask_mod_hash = hash_callable(mask_mod)
-    blocksparse_tensors = to_cute_block_sparse_tensors(blocksparse_tensors_torch, enable_tvm_ffi=True)
+    blocksparse_tensors = to_cute_block_sparse_tensors(
+        blocksparse_tensors_torch, enable_tvm_ffi=True
+    )
 
     compile_key = (
         tile_m,
@@ -428,12 +457,7 @@ def compute_block_sparsity(
         )
 
         compute_block_sparsity.compile_cache[compile_key] = cute.compile(
-            kernel,
-            blocksparse_tensors,
-            seqlen_q,
-            seqlen_k,
-            aux_tensors,
-            options="--enable-tvm-ffi"
+            kernel, blocksparse_tensors, seqlen_q, seqlen_k, aux_tensors, options="--enable-tvm-ffi"
         )
 
     compute_block_sparsity.compile_cache[compile_key](
@@ -443,47 +467,7 @@ def compute_block_sparsity(
         aux_tensors,
     )
 
-    # Return both the BlockSparseTensors (cute) BlockSparseTensorsTorch
     return blocksparse_tensors, blocksparse_tensors_torch
 
 
 compute_block_sparsity.compile_cache = {}
-
-
-def run():
-    """Test the BlockSparsityKernel with a simple causal mask."""
-
-    print("Testing BlockSparsityKernel...")
-
-    # Configuration
-    batch_size = 2
-    num_heads = 2
-    seqlen_q = 16384
-    seqlen_k = 16384
-    tile_m, tile_n = 128, 128  # Use very small tiles for initial testing
-
-    # Define a simple causal mask function
-    @cute.jit
-    def causal_mask(batch_idx, head_idx, q_idx, kv_idx, aux_tensors):
-        """Simple causal mask: only attend to positions <= current position."""
-        return q_idx >= kv_idx
-
-    try:
-        compute_block_sparsity(
-            tile_m,
-            tile_n,
-            batch_size,
-            num_heads,
-            seqlen_q,
-            seqlen_k,
-            causal_mask,
-            None,
-            device="cuda",
-        )
-        print("Kernel execution completed!")
-    except Exception as e:
-        print(f"Kernel execution failed: {e}")
-
-
-if __name__ == "__main__":
-    run()

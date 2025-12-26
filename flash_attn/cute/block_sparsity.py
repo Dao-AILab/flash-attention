@@ -2,10 +2,10 @@
 Block-sparsity utilities for FlexAttention
 """
 
-from typing import Tuple, Optional, Callable, List, NamedTuple
-import torch
+from typing import NamedTuple, Optional, Tuple
+
 import cutlass.cute as cute
-from cutlass.cute.runtime import from_dlpack
+import torch
 
 from flash_attn.cute.cute_dsl_utils import to_cute_tensor
 
@@ -159,7 +159,7 @@ def is_block_sparsity_enabled(tensors: BlockSparseTensorsTorch) -> bool:
 
 
 def to_cute_block_sparse_tensors(
-    tensors: BlockSparseTensorsTorch, enable_tvm_ffi: Optional[bool] = True
+    tensors: BlockSparseTensorsTorch, enable_tvm_ffi: bool = True
 ) -> Optional[BlockSparseTensors]:
     """Convert torch block sparsity tensors to CuTe tensors, optionally for tvm ffi"""
     if not is_block_sparsity_enabled(tensors):
