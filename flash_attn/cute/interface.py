@@ -569,6 +569,8 @@ def _flash_attn_bwd(
     cu_seqlens_k: Optional[torch.Tensor] = None,
     seqused_q: Optional[torch.Tensor] = None,
     seqused_k: Optional[torch.Tensor] = None,
+    max_seqlen_q: Optional[int] = None,
+    max_seqlen_k: Optional[int] = None,
     deterministic: bool = False,
     dq: Optional[torch.Tensor] = None,
     dk: Optional[torch.Tensor] = None,
@@ -615,7 +617,7 @@ def _flash_attn_bwd(
         total_q = batch_size * seqlen_q
     else:
         batch_size = cu_seqlens_q.shape[0] - 1
-        seqlen_q = None
+        seqlen_q = max_seqlen_q
         total_q = q.shape[0]
 
     if cu_seqlens_k is None:
@@ -623,7 +625,7 @@ def _flash_attn_bwd(
         total_k = batch_size * seqlen_k
     else:
         batch_size = cu_seqlens_k.shape[0] - 1
-        seqlen_k = None
+        seqlen_k = max_seqlen_k
         total_k = k.shape[0]
 
     num_head_kv = k.shape[-2]
@@ -797,11 +799,15 @@ def _flash_attn_bwd(
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     if deterministic:
+        assert seqlen_q is not None, "seqlen_q not provided"
+        seqlen_q_rounded = (seqlen_q + m_block_size - 1) // m_block_size * m_block_size
         dQ_semaphore = torch.zeros(batch_size, num_head, seqlen_q_rounded // m_block_size, 1, dtype=torch.int32, device="cuda")
     else:
         dQ_semaphore = None
 
     if deterministic and qhead_per_kvhead > 1:
+        assert seqlen_k is not None, "seqlen_k not provided"
+        seqlen_k_rounded = (seqlen_k + n_block_size - 1) // n_block_size * n_block_size
         dK_semaphore = torch.zeros(batch_size, num_head_kv, seqlen_k_rounded // n_block_size, 2, dtype=torch.int32, device="cuda")
         dV_semaphore = torch.zeros(batch_size, num_head_kv, seqlen_k_rounded // n_block_size, 2, dtype=torch.int32, device="cuda")
     else:
@@ -1314,6 +1320,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         cu_seqlens_k: Optional[torch.Tensor],
         seqused_q: Optional[torch.Tensor] = None,
         seqused_k: Optional[torch.Tensor] = None,
+        max_seqlen_q: Optional[int] = None,
+        max_seqlen_k: Optional[int] = None,
         page_table: Optional[torch.Tensor] = None,
         softmax_scale: Optional[float] = None,
         causal: bool = False,
@@ -1356,6 +1364,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         ctx.window_size = window_size
         ctx.softcap = softcap
         ctx.deterministic = deterministic
+        ctx.max_seqlen_q = max_seqlen_q
+        ctx.max_seqlen_k = max_seqlen_k
         return out, lse
 
     @staticmethod
@@ -1379,6 +1389,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             cu_seqlens_k=cu_seqlens_k,
             seqused_q=seqused_q,
             seqused_k=seqused_k,
+            max_seqlen_q=ctx.max_seqlen_q,
+            max_seqlen_k=ctx.max_seqlen_k,
             deterministic=ctx.deterministic,
         )
 
@@ -1431,6 +1443,8 @@ def flash_attn_varlen_func(
     cu_seqlens_k: Optional[torch.Tensor] = None,
     seqused_q: Optional[torch.Tensor] = None,
     seqused_k: Optional[torch.Tensor] = None,
+    max_seqlen_q: Optional[int] = None,
+    max_seqlen_k: Optional[int] = None,
     page_table: Optional[torch.Tensor] = None,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
@@ -1453,6 +1467,8 @@ def flash_attn_varlen_func(
         cu_seqlens_k,
         seqused_q,
         seqused_k,
+        max_seqlen_q,
+        max_seqlen_k,
         page_table,
         softmax_scale,
         causal,

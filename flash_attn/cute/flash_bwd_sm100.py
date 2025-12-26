@@ -454,8 +454,8 @@ class FlashAttentionBackwardSm100:
         dO_transpose = [1, 0, 2, 3] if const_expr(mCuSeqlensQ is None) else [1, 0, 2]
         mdO = utils.select(mdO, mode=dO_transpose)
 
-        # (b, n, block, stage) -> (block, stage, n, b) or (n, block, stage) -> (block, stage, n)
-        semaphore_transpose = [2, 3, 1, 0] if const_expr(mCuSeqlensQ is None) else [1, 2, 0]
+        # (b, n, block, stage) -> (block, stage, n, b)
+        semaphore_transpose = [2, 3, 1, 0]
         if const_expr(self.deterministic):
             assert mdQ_semaphore is not None
             mdQ_semaphore = utils.select(mdQ_semaphore, mode=semaphore_transpose)
@@ -608,7 +608,12 @@ class FlashAttentionBackwardSm100:
         else:
             TileScheduler = SingleTileScheduler
         # reads n_blocks right-to-left
-        self.spt = (self.is_causal or self.is_local) and self.deterministic
+        self.spt = (
+            (self.is_causal or self.is_local)
+            and self.deterministic
+            and mCuSeqlensK is None
+            and mSeqUsedK is None
+        )
         tile_sched_args = TileSchedulerArguments(
             cute.ceil_div(cute.size(mK.shape[0]), self.cta_tiler[0]),  # num_blocks
             cute.size(mQ.shape[2]),  # num_heads = num_query_heads
