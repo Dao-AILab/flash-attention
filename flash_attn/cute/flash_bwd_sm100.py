@@ -1347,8 +1347,8 @@ class FlashAttentionBackwardSm100:
                 mLSE_cur = mLSE[None, head_idx, batch_idx]
                 mdPsum_cur = mdPsum[None, head_idx, batch_idx]
             else:
-                padded_offset_q = cute.round_up(
-                    seqlen.offset_q + batch_idx * self.tile_m, self.tile_m
+                padded_offset_q = (
+                    (seqlen.offset_q + batch_idx * self.tile_m) // self.tile_m * self.tile_m
                 )
                 mLSE_cur = cute.domain_offset((padded_offset_q,), mLSE[None, head_idx])
                 mdPsum_cur = cute.domain_offset((padded_offset_q,), mdPsum[None, head_idx])
@@ -2472,8 +2472,8 @@ class FlashAttentionBackwardSm100:
             if const_expr(not seqlen.has_cu_seqlens_q):
                 mdQaccum_cur = mdQaccum[None, head_idx, batch_idx]
             else:
-                padded_offset_q = cute.round_up(
-                    seqlen.offset_q + batch_idx * self.tile_m, self.tile_m
+                padded_offset_q = (
+                    (seqlen.offset_q + batch_idx * self.tile_m) // self.tile_m * self.tile_m
                 )
                 mdQaccum_cur = cute.domain_offset(
                     (padded_offset_q * self.tile_hdim,), mdQaccum[None, head_idx]
@@ -2819,8 +2819,8 @@ class FlashAttentionBackwardSm100:
             if const_expr(not seqlen_info.has_cu_seqlens_k):
                 mdKV_cur = mdKV[None, head_idx_kv, batch_idx]  # (seqlen * hdim)
             else:
-                padded_offset_k = cute.round_up(
-                    seqlen_info.offset_k + batch_idx * self.tile_n, self.tile_n
+                padded_offset_k = (
+                    (seqlen_info.offset_k + batch_idx * self.tile_n) // self.tile_n * self.tile_n
                 )
                 mdKV_cur = cute.domain_offset(
                     (padded_offset_k * self.tile_hdim,), mdKV[None, head_idx_kv]

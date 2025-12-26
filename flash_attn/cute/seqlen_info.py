@@ -109,7 +109,7 @@ class SeqlenInfoQK:
             offset_q = (
                 self.offset_q
                 if const_expr(not padded)
-                else cute.round_up(self.offset_q + batch_idx * self.tile_m, self.tile_m)
+                else (self.offset_q + batch_idx * self.tile_m) // self.tile_m * self.tile_m
             )
             offset = offset_q if const_expr(cute.rank(mQ.shape[0]) == 1) else (0, offset_q)
             idx = (offset,) + (0,) * (cute.rank(mQ) - 1)
@@ -130,7 +130,7 @@ class SeqlenInfoQK:
             offset_k = (
                 self.offset_k
                 if const_expr(not padded)
-                else cute.round_up(self.offset_k + batch_idx * self.tile_n, self.tile_n)
+                else (self.offset_k + batch_idx * self.tile_n) // self.tile_n * self.tile_n
             )
             idx = (offset_k,) + (0,) * (cute.rank(mK) - 1)
             return cute.domain_offset(idx, mK)
