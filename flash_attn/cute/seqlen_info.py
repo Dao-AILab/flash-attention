@@ -44,6 +44,8 @@ class SeqlenInfoQK:
     has_cu_seqlens_k: cutlass.Constexpr[bool]
     has_seqused_q: cutlass.Constexpr[bool]
     has_seqused_k: cutlass.Constexpr[bool]
+    tile_m: cutlass.Constexpr[cutlass.Int32]
+    tile_n: cutlass.Constexpr[cutlass.Int32]
 
     @staticmethod
     def create(
@@ -54,6 +56,8 @@ class SeqlenInfoQK:
         mCuSeqlensK: Optional[cute.Tensor] = None,
         mSeqUsedQ: Optional[cute.Tensor] = None,
         mSeqUsedK: Optional[cute.Tensor] = None,
+        tile_m: cutlass.Constexpr[cutlass.Int32] = 128,
+        tile_n: cutlass.Constexpr[cutlass.Int32] = 128,
     ):
         offset_q = 0 if const_expr(mCuSeqlensQ is None) else mCuSeqlensQ[batch_idx]
         offset_k = 0 if const_expr(mCuSeqlensK is None) else mCuSeqlensK[batch_idx]
@@ -86,25 +90,47 @@ class SeqlenInfoQK:
             has_cu_seqlens_k,
             has_seqused_q,
             has_seqused_k,
+            tile_m,
+            tile_n,
         )
 
-    def offset_batch_Q(self, mQ: cute.Tensor, batch_idx: Int32, dim: int) -> cute.Tensor:
+    def offset_batch_Q(
+        self,
+        mQ: cute.Tensor,
+        batch_idx: Int32,
+        dim: int,
+        padded: cutlass.Constexpr[bool] = False,
+    ) -> cute.Tensor:
         """Seqlen must be the first dimension of mQ"""
         if const_expr(not self.has_cu_seqlens_q):
             idx = (None,) * dim + (batch_idx,) + (None,) * (cute.rank(mQ) - 1 - dim)
             return mQ[idx]
         else:
-            offset = (
-                self.offset_q if const_expr(cute.rank(mQ.shape[0]) == 1) else (0, self.offset_q)
+            offset_q = (
+                self.offset_q
+                if const_expr(not padded)
+                else cute.round_up(self.offset_q + batch_idx * self.tile_m, self.tile_m)
             )
+            offset = offset_q if const_expr(cute.rank(mQ.shape[0]) == 1) else (0, offset_q)
             idx = (offset,) + (0,) * (cute.rank(mQ) - 1)
             return cute.domain_offset(idx, mQ)
 
-    def offset_batch_K(self, mK: cute.Tensor, batch_idx: Int32, dim: int) -> cute.Tensor:
+    def offset_batch_K(
+        self,
+        mK: cute.Tensor,
+        batch_idx: Int32,
+        dim: int,
+        padded: cutlass.Constexpr[bool] = False,
+    ) -> cute.Tensor:
         """Seqlen must be the first dimension of mK"""
         if const_expr(not self.has_cu_seqlens_k):
             idx = (None,) * dim + (batch_idx,) + (None,) * (cute.rank(mK) - 1 - dim)
             return mK[idx]
         else:
-            idx = (self.offset_k,) + (0,) * (cute.rank(mK) - 1)
+            offset_k = (
+                self.offset_k
+                if const_expr(not padded)
+                else cute.round_up(self.offset_k + batch_idx * self.tile_n, self.tile_n)
+            )
+            idx = (offset_k,) + (0,) * (cute.rank(mK) - 1)
             return cute.domain_offset(idx, mK)

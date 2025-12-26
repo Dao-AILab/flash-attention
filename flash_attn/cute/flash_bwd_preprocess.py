@@ -238,7 +238,9 @@ class FlashAttentionBackwardPreprocess:
                 mO_cur = cute.domain_offset((seqlen.offset_q, 0), mO[None, num_head, None])
                 mdO_cur = cute.domain_offset((seqlen.offset_q, 0), mdO[None, num_head, None])
 
-                padded_offset_q = seqlen.offset_q + batch_size * self.m_block_size
+                padded_offset_q = cute.round_up(
+                    seqlen.offset_q + batch_size * self.m_block_size, self.m_block_size
+                )
                 mdPsum_cur = cute.domain_offset((padded_offset_q,), mdPsum[num_head, None])
                 headdim_v = mO.shape[2]
 
@@ -325,7 +327,9 @@ class FlashAttentionBackwardPreprocess:
                 if cutlass.const_expr(not seqlen.has_cu_seqlens_q):
                     mdQaccum_cur = mdQaccum[batch_size, num_head, None]
                 else:
-                    padded_offset_q = seqlen.offset_q + batch_size * self.m_block_size
+                    padded_offset_q = cute.round_up(
+                        seqlen.offset_q + batch_size * self.m_block_size, self.m_block_size
+                    )
                     mdQaccum_cur = cute.domain_offset(
                         (padded_offset_q * self.head_dim_padded,), mdQaccum[num_head, None]
                     )
@@ -354,7 +358,9 @@ class FlashAttentionBackwardPreprocess:
                 if cutlass.const_expr(not seqlen.has_cu_seqlens_q):
                     mLSElog2_cur = mLSElog2[batch_size, num_head, None]
                 else:
-                    padded_offset_q = seqlen.offset_q + batch_size * self.m_block_size
+                    padded_offset_q = cute.round_up(
+                        seqlen.offset_q + batch_size * self.m_block_size, self.m_block_size
+                    )
                     mLSElog2_cur = cute.domain_offset((padded_offset_q,), mLSElog2[num_head, None])
 
                 gLSElog2 = cute.local_tile(mLSElog2_cur, (self.m_block_size,), (m_block,))

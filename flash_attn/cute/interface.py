@@ -742,13 +742,15 @@ def _flash_attn_bwd(
         total_q_rounded_padded = (
             (total_q + cu_seqlens_q.shape[0] * m_block_size - 1) // m_block_size * m_block_size
         )
+        # print("total_q_rounded_padded = ", total_q_rounded_padded)
         dq_accum = torch.empty(
             num_head, total_q_rounded_padded * head_dim_rounded, dtype=torch.float32, device=device
         )
         dpsum = torch.empty(num_head, total_q_rounded_padded, dtype=torch.float32, device=device)
         lse_log2 = torch.empty(num_head, total_q_rounded_padded, dtype=torch.float32, device=device)
 
-    if qhead_per_kvhead > 1:
+    # todo: allow for mha with cu_seqlens_k to skip dK/dV postprocess
+    if qhead_per_kvhead > 1 or cu_seqlens_k is not None:
         head_dim_v_rounded = (head_dim_v + 32 - 1) // 32 * 32
         if cu_seqlens_k is None:
             seqlen_k_rounded = (seqlen_k + n_block_size - 1) // n_block_size * n_block_size
@@ -773,6 +775,7 @@ def _flash_attn_bwd(
             total_k_rounded_padded = (
                 (total_k + cu_seqlens_k.shape[0] * n_block_size - 1) // n_block_size * n_block_size
             )
+            # print("total_k_rounded_padded = ", total_k_rounded_padded)
             num_n_blocks = total_k_rounded_padded // n_block_size
             if cluster_size == 2 and num_n_blocks % cluster_size != 0:
                 total_k_rounded_padded = total_k_rounded_padded + n_block_size
@@ -805,7 +808,15 @@ def _flash_attn_bwd(
         dV_semaphore = None
 
     # Preprocess kernel: compute (o * dout).sum(dim=-1), lse * log2_e, and zero out dq_accum.
-    compile_key_pre = (compute_capability, dtype, head_dim_v, m_block_size, num_threads)
+    compile_key_pre = (
+        compute_capability,
+        dtype,
+        head_dim_v,
+        m_block_size,
+        num_threads,
+        cu_seqlens_q is None,
+        seqused_q is None,
+    )
     if compile_key_pre not in _flash_attn_bwd.compile_cache_pre:
         o_tensor, do_tensor = [to_cute_tensor(t) for t in (out, dout)]
         dq_accum_tensor, dpsum_tensor, lse_log2_tensor = [
@@ -871,6 +882,10 @@ def _flash_attn_bwd(
             AtomLayoutNdKV,
             AtomLayoutMdQ,
             V_in_regs,
+            cu_seqlens_q is None,
+            cu_seqlens_k is None,
+            seqused_q is None,
+            seqused_k is None,
         )
         cute_aux_tensors = None
     else:
@@ -904,6 +919,10 @@ def _flash_attn_bwd(
             mask_mod_hash,
             num_aux_tensors,
             use_block_sparsity,
+            cu_seqlens_q is None,
+            cu_seqlens_k is None,
+            seqused_q is None,
+            seqused_k is None,  
         )
     num_threads = 384
     if compile_key not in _flash_attn_bwd.compile_cache:
@@ -1069,7 +1088,19 @@ def _flash_attn_bwd(
 
     num_threads = 256 if compute_capability == 9 else 128
     # Postprocess kernel: convert dq_accum from float32 to dq in bf16/fp16
-    compile_key_post = (dtype, head_dim, m_block_size, num_threads, AtomLayoutMdQ, dQ_swapAB)
+    compile_key_post = (
+        compute_capability,
+        dtype,
+        head_dim,
+        m_block_size,
+        num_threads,
+        AtomLayoutMdQ,
+        dQ_swapAB,
+        cu_seqlens_q is None,
+        cu_seqlens_k is None,
+        seqused_q is None,
+        seqused_k is None,
+    )
     if compile_key_post not in _flash_attn_bwd.compile_cache_post:
         dq_accum_tensor = to_cute_tensor(dq_accum)
         dq_tensor = to_cute_tensor(dq)
@@ -1101,9 +1132,21 @@ def _flash_attn_bwd(
         current_stream,
     )
 
-    if qhead_per_kvhead > 1:
+    if qhead_per_kvhead > 1 or cu_seqlens_k is not None:
         # Postprocess kernel: convert dk_accum & dv_accum from float32 to bf16/fp16
-        compile_key_post = (dtype, head_dim, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB)
+        compile_key_post = (
+            compute_capability,
+            dtype,
+            head_dim,
+            n_block_size,
+            num_threads,
+            AtomLayoutNdKV,
+            dKV_swapAB,
+            cu_seqlens_q is None,
+            cu_seqlens_k is None,
+            seqused_q is None,
+            seqused_k is None,
+        )
         if compile_key_post not in _flash_attn_bwd.compile_cache_post:
             dk_accum_tensor = to_cute_tensor(dk_accum)
             dk_tensor = to_cute_tensor(dk)
@@ -1111,8 +1154,9 @@ def _flash_attn_bwd(
                 to_cute_tensor(t, assumed_align=4) if t is not None else None
                 for t in (cu_seqlens_k, seqused_k)
             ]
+            arch = compute_capability * 10
             fa_bwd_post = FlashAttentionBackwardPostprocess(
-                dtype, head_dim, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB
+                dtype, head_dim, arch, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB
             )
             # TODO: check @can_implement
             _flash_attn_bwd.compile_cache_post[compile_key_post] = cute.compile(
@@ -1134,12 +1178,17 @@ def _flash_attn_bwd(
             current_stream,
         )
         compile_key_post = (
+            compute_capability,
             dtype,
             head_dim_v,
             n_block_size,
             num_threads,
             AtomLayoutNdKV,
             dKV_swapAB,
+            cu_seqlens_q is None,
+            cu_seqlens_k is None,
+            seqused_q is None,
+            seqused_k is None,
         )
         if compile_key_post not in _flash_attn_bwd.compile_cache_post:
             dv_accum_tensor = to_cute_tensor(dv_accum)
@@ -1148,8 +1197,9 @@ def _flash_attn_bwd(
                 to_cute_tensor(t, assumed_align=4) if t is not None else None
                 for t in (cu_seqlens_k, seqused_k)
             ]
+            arch = compute_capability * 10
             fa_bwd_post = FlashAttentionBackwardPostprocess(
-                dtype, head_dim_v, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB
+                dtype, head_dim_v, arch, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB
             )
             # TODO: check @can_implement
             _flash_attn_bwd.compile_cache_post[compile_key_post] = cute.compile(
@@ -1322,6 +1372,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             ctx.softmax_scale,
             ctx.causal,
             ctx.softcap,
+            window_size_left=ctx.window_size[0],
+            window_size_right=ctx.window_size[1],
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
             seqused_q=seqused_q,
