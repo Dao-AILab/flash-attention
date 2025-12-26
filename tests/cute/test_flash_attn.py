@@ -236,7 +236,7 @@ def test_flash_attn_output(
         print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
         print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
         # num_splits_vals = [1, 3]
-        pack_gqa_vals = [False, True, None]
+        pack_gqa_vals = [False, True, None] if not TEST_BWD_ONLY else [False]
         # SplitKV is not supported for hdim >= 192
         # pack_gqa_vals = [False]
         num_splits_vals = [1, 3] if d < 192 and not DISABLE_SPLIT and not TEST_BWD_ONLY else [1]
@@ -371,9 +371,9 @@ def test_flash_attn_output(
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
-# @pytest.mark.parametrize("mha_type", ["mqa"])
-@pytest.mark.parametrize("has_learnable_sink", [False, True])
-# @pytest.mark.parametrize("has_learnable_sink", [False])
+# @pytest.mark.parametrize("mha_type", ["mha"])
+# @pytest.mark.parametrize("has_learnable_sink", [False, True])
+@pytest.mark.parametrize("has_learnable_sink", [False])
 # @pytest.mark.parametrize("has_qv", [False, True])
 @pytest.mark.parametrize("has_qv", [False])
 # @pytest.mark.parametrize("deterministic", [False, True])
@@ -383,7 +383,7 @@ def test_flash_attn_output(
 # @pytest.mark.parametrize("local", [False, True])
 @pytest.mark.parametrize("local", [False])
 @pytest.mark.parametrize("causal", [False, True])
-# @pytest.mark.parametrize("causal", [False])
+# @pytest.mark.parametrize("causal", [True])
 # @pytest.mark.parametrize("add_unused_qkv", [False, True])
 @pytest.mark.parametrize("add_unused_qkv", [False])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
@@ -419,6 +419,7 @@ def test_flash_attn_output(
         (2048, 2048),
     ],
 )
+@pytest.mark.parametrize("varlen_mode", ["random", "third", "full"])
 def test_flash_attn_varlen_output(
     seqlen_q,
     seqlen_k,
@@ -432,6 +433,7 @@ def test_flash_attn_varlen_output(
     has_learnable_sink,
     mha_type,
     dtype,
+    varlen_mode,
 ):
     if (
         causal or local
@@ -442,13 +444,12 @@ def test_flash_attn_varlen_output(
     torch.random.manual_seed(seqlen_q + seqlen_k + d + int(causal) * 2 + int(local))
     batch_size = 49 if seqlen_q <= 1024 else 7
     nheads = 6
-    # batch_size = 1
     # nheads = 1
     nheads_kv = nheads if mha_type == "mha" else (3 if mha_type == "gqa" else 1)
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
     # dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
     dv_vals = [128] if d == 192 else ([d] if d != 128 else [64, d])
-    if dtype == torch.float8_e4m3fn:
+    if dtype == torch.float8_e4m3fn or TEST_BWD_ONLY:
         dv_vals = [d]
     # attention_chunk_vals = [torch.randint(1, seqlen_k * 2, (1,)).item(), 0] if seqlen_q <= seqlen_k else [0]
     attention_chunk_vals = [0]
@@ -505,7 +506,11 @@ def test_flash_attn_varlen_output(
         q, k, v = [x.detach().requires_grad_() for x in (q_ref, k_ref, v_ref)]
         qv = qv_ref.detach() if has_qv else None
         query_padding_mask = generate_random_padding_mask(
-            seqlen_q, batch_size, device, mode="random", zero_lengths=False
+            seqlen_q,
+            batch_size,
+            device,
+            mode=varlen_mode,
+            zero_lengths=False
         )
         # TODO: test zero_lengths
         key_padding_mask = generate_random_padding_mask(
@@ -513,7 +518,7 @@ def test_flash_attn_varlen_output(
             seqlen_k,
             batch_size,
             device,
-            mode="random",
+            mode=varlen_mode,
             zero_lengths=False,
         )
 
@@ -570,6 +575,8 @@ def test_flash_attn_varlen_output(
             query_unused_mask=query_unused_mask,
             key_unused_mask=key_unused_mask,
         )
+        print("cu_seqlens_q = ", cu_seqlens_q)
+        print("cu_seqlens_k = ", cu_seqlens_k)
         q_unpad, k_unpad, v_unpad = [
             x.detach().to(dtype).requires_grad_() for x in (q_unpad, k_unpad, v_unpad)
         ]
@@ -619,11 +626,11 @@ def test_flash_attn_varlen_output(
         fwd_atol = 2 * (out_ref + 0.3 - 0.3 - out_ref).abs().max().item()
         rtol = 2 if softcap == 0.0 else 3
 
-        pack_gqa_vals = [False, True, None]
+        pack_gqa_vals = [False, True, None] if not TEST_BWD_ONLY else [False]
         # pack_gqa_vals = [False]
         # num_splits_vals = [1, 3]
         # SplitKV is not supported for hdim >= 192
-        num_splits_vals = [1, 3] if d < 192 and not DISABLE_SPLIT else [1]
+        num_splits_vals = [1, 3] if d < 192 and not DISABLE_SPLIT and not TEST_BWD_ONLY else [1]
         for pack_gqa, num_splits in itertools.product(pack_gqa_vals, num_splits_vals):
             # SplitKV not supported on SM90 - skip this iteration
             if IS_SM90 and num_splits > 1:
@@ -670,7 +677,7 @@ def test_flash_attn_varlen_output(
             and not attention_chunk != 0
             and dv == d
             and not has_learnable_sink
-            and False
+            # and False
         ):
             g_unpad = torch.randn_like(out_unpad)
             do_o = ((g_unpad.float() * out_unpad.float()).sum(-1)).transpose(-1, -2)
