@@ -749,7 +749,8 @@ def _flash_attn_bwd(
         lse_log2 = torch.empty(num_head, total_q_rounded_padded, dtype=torch.float32, device=device)
 
     # todo: allow for mha with cu_seqlens_k to skip dK/dV postprocess
-    if qhead_per_kvhead > 1 or cu_seqlens_k is not None:
+    dKV_postprocess = qhead_per_kvhead > 1 or cu_seqlens_k is not None
+    if dKV_postprocess:
         head_dim_v_rounded = (head_dim_v + 32 - 1) // 32 * 32
         if cu_seqlens_k is None:
             seqlen_k_rounded = (seqlen_k + n_block_size - 1) // n_block_size * n_block_size
@@ -930,7 +931,7 @@ def _flash_attn_bwd(
         dq_accum_tensor, dpsum_tensor, lse_log2_tensor = [
             to_cute_tensor(t) for t in (dq_accum, dpsum, lse_log2)
         ]
-        if qhead_per_kvhead > 1:
+        if dKV_postprocess:
             dk_accum_tensor, dv_accum_tensor = [
                 to_cute_tensor(t) for t in (dk_accum, dv_accum)
             ]
@@ -1028,8 +1029,8 @@ def _flash_attn_bwd(
             lse_log2_tensor,
             dpsum_tensor,
             dq_accum_tensor,
-            dk_tensor if qhead_per_kvhead == 1 else dk_accum_tensor,
-            dv_tensor if qhead_per_kvhead == 1 else dv_accum_tensor,
+            dk_tensor if not dKV_postprocess else dk_accum_tensor,
+            dv_tensor if not dKV_postprocess else dv_accum_tensor,
             softmax_scale,
             current_stream,
             cu_seqlens_q_tensor,
@@ -1066,8 +1067,8 @@ def _flash_attn_bwd(
         lse_log2,
         dpsum,
         dq_accum,
-        dk if qhead_per_kvhead == 1 else dk_accum,
-        dv if qhead_per_kvhead == 1 else dv_accum,
+        dk if not dKV_postprocess else dk_accum,
+        dv if not dKV_postprocess else dv_accum,
         softmax_scale,
         current_stream,
         cu_seqlens_q,
@@ -1130,7 +1131,7 @@ def _flash_attn_bwd(
         current_stream,
     )
 
-    if qhead_per_kvhead > 1 or cu_seqlens_k is not None:
+    if dKV_postprocess:
         # Postprocess kernel: convert dk_accum & dv_accum from float32 to bf16/fp16
         compile_key_post = (
             compute_capability,

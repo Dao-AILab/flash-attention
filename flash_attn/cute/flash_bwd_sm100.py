@@ -354,7 +354,7 @@ class FlashAttentionBackwardSm100:
         self.num_epi_stages = max(1, (self.tile_hdim // 2) // self.sdKV_epi_tile[1])
         self.sdKV_flat_epi_tile = self.tile_n * (self.tile_hdim // 2) // self.num_epi_stages
         # TODO: dK and dV could have different shapes
-        if const_expr(self.qhead_per_kvhead == 1):
+        if const_expr(not self.dKV_postprocess):
             self.sdKV_layout = sm100_utils_basic.make_smem_layout_epi(
                 self.dk_dtype,
                 LayoutEnum.ROW_MAJOR,
