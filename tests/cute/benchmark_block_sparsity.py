@@ -14,7 +14,7 @@ from cutlass.cute.testing import benchmark as cute_benchmark
 import cutlass.cute as cute
 from flash_attn.cute.compute_block_sparsity import BlockSparsityKernel
 from flash_attn.cute.block_sparsity import BlockSparseTensors
-from flash_attn.cute.mask_definitions import (
+from mask_mod_definitions import (
     get_mask_pair,
     random_doc_id_tensor,
     flex_document_mask,
@@ -83,6 +83,7 @@ def benchmark_pytorch_block_sparsity(
     except Exception as e:
         print(f"PyTorch benchmark failed ({config.mask_name}): {e}")
         import traceback
+
         traceback.print_exc()
         return None
 
@@ -102,7 +103,9 @@ def benchmark_cute_block_sparsity(
         num_n_blocks = (config.seqlen_k + config.tile_n - 1) // config.tile_n
 
         mask_block_cnt = torch.zeros(
-            (config.batch_size, config.num_heads, num_m_blocks), device=device, dtype=torch.int32
+            (config.batch_size, config.num_heads, num_m_blocks),
+            device=device,
+            dtype=torch.int32,
         )
         mask_block_idx = torch.zeros(
             (config.batch_size, config.num_heads, num_m_blocks, num_n_blocks),
@@ -110,7 +113,9 @@ def benchmark_cute_block_sparsity(
             dtype=torch.int32,
         )
         full_block_cnt = torch.zeros(
-            (config.batch_size, config.num_heads, num_m_blocks), device=device, dtype=torch.int32
+            (config.batch_size, config.num_heads, num_m_blocks),
+            device=device,
+            dtype=torch.int32,
         )
         full_block_idx = torch.zeros(
             (config.batch_size, config.num_heads, num_m_blocks, num_n_blocks),
@@ -119,18 +124,18 @@ def benchmark_cute_block_sparsity(
         )
 
         # Convert to CuTe tensors
-        mask_cnt_cute = from_dlpack(mask_block_cnt.detach(), assumed_align=4).mark_layout_dynamic(
-            leading_dim=2
-        )
-        mask_idx_cute = from_dlpack(mask_block_idx.detach(), assumed_align=4).mark_layout_dynamic(
-            leading_dim=3
-        )
-        full_cnt_cute = from_dlpack(full_block_cnt.detach(), assumed_align=4).mark_layout_dynamic(
-            leading_dim=2
-        )
-        full_idx_cute = from_dlpack(full_block_idx.detach(), assumed_align=4).mark_layout_dynamic(
-            leading_dim=3
-        )
+        mask_cnt_cute = from_dlpack(
+            mask_block_cnt.detach(), assumed_align=4
+        ).mark_layout_dynamic(leading_dim=2)
+        mask_idx_cute = from_dlpack(
+            mask_block_idx.detach(), assumed_align=4
+        ).mark_layout_dynamic(leading_dim=3)
+        full_cnt_cute = from_dlpack(
+            full_block_cnt.detach(), assumed_align=4
+        ).mark_layout_dynamic(leading_dim=2)
+        full_idx_cute = from_dlpack(
+            full_block_idx.detach(), assumed_align=4
+        ).mark_layout_dynamic(leading_dim=3)
 
         blocksparse_tensors = BlockSparseTensors(
             mask_block_cnt=mask_cnt_cute,
@@ -140,7 +145,9 @@ def benchmark_cute_block_sparsity(
         )
 
         # Create kernel
-        use_aux = config.aux_tensors_cute is not None and len(config.aux_tensors_cute) > 0
+        use_aux = (
+            config.aux_tensors_cute is not None and len(config.aux_tensors_cute) > 0
+        )
         kernel = BlockSparsityKernel(
             mask_mod=mask_fn,
             tile_mn=(config.tile_m, config.tile_n),
@@ -162,7 +169,10 @@ def benchmark_cute_block_sparsity(
             from cutlass.cute.testing import JitArguments
 
             return JitArguments(
-                blocksparse_tensors, config.seqlen_q, config.seqlen_k, config.aux_tensors_cute
+                blocksparse_tensors,
+                config.seqlen_q,
+                config.seqlen_k,
+                config.aux_tensors_cute,
             )
 
         creation_time_us = cute_benchmark(
@@ -173,7 +183,7 @@ def benchmark_cute_block_sparsity(
         )
 
         torch.cuda.synchronize(device)
-        creation_time_ms = creation_time_us / 1000.0 
+        creation_time_ms = creation_time_us / 1000.0
 
         return creation_time_ms
 
@@ -215,7 +225,9 @@ def generate_configs(
 ) -> List[BenchmarkConfig]:
     """Generate all benchmark configurations."""
     configs = []
-    for B, H, S, mask_name in itertools.product(batch_sizes, num_heads, seqlens, mask_names):
+    for B, H, S, mask_name in itertools.product(
+        batch_sizes, num_heads, seqlens, mask_names
+    ):
         configs.append(
             BenchmarkConfig(
                 batch_size=B,
@@ -230,18 +242,33 @@ def generate_configs(
 
 def print_results(results: List[BenchmarkResult]):
     successful_results = [
-        r for r in results if r.cute_time_ms is not None and r.pytorch_time_ms is not None
+        r
+        for r in results
+        if r.cute_time_ms is not None and r.pytorch_time_ms is not None
     ]
 
     if not successful_results:
         print("No successful benchmark results to display")
         return
 
-    headers = ["B", "H", "M", "N", "Mask Type", "CuTe Time (ms)", "PyTorch Time (ms)", "Speedup"]
+    headers = [
+        "B",
+        "H",
+        "M",
+        "N",
+        "Mask Type",
+        "CuTe Time (ms)",
+        "PyTorch Time (ms)",
+        "Speedup",
+    ]
 
     rows = []
     for result in successful_results:
-        speedup = result.pytorch_time_ms / result.cute_time_ms if result.cute_time_ms > 0 else 0
+        speedup = (
+            result.pytorch_time_ms / result.cute_time_ms
+            if result.cute_time_ms > 0
+            else 0
+        )
 
         rows.append(
             [
@@ -288,7 +315,9 @@ def main():
 
     # Create document IDs using the helper from mask_definitions
     doc_ids = random_doc_id_tensor(max_heads, max_batch, max_seqlen, device=device)
-    doc_ids_cute = from_dlpack(doc_ids.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=2)
+    doc_ids_cute = from_dlpack(doc_ids.detach(), assumed_align=4).mark_layout_dynamic(
+        leading_dim=2
+    )
 
     # Generate base configurations
     base_configs = generate_configs(batch_sizes, num_heads, seqlens, mask_names)
@@ -336,6 +365,7 @@ def main():
                 # PyTorch wrapper
                 def pytorch_mask_fn(b, h, q, kv):
                     return flex_document_mask(b, h, q, kv, doc_ids)
+
                 # CuTe wrapper - reuse cute_document_mask with aux_tensors
                 cute_mask_fn = cute_document_mask
 
