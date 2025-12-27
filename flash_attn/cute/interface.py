@@ -1228,6 +1228,9 @@ class FlashAttnFunc(torch.autograd.Function):
         ctx.window_size = window_size
         ctx.softcap = softcap
         ctx.deterministic = deterministic
+        ctx.pack_gqa = pack_gqa
+        ctx.mask_mod = mask_mod
+        ctx.block_sparse_tensors = block_sparse_tensors
         return out, lse
 
     @staticmethod
@@ -1246,6 +1249,9 @@ class FlashAttnFunc(torch.autograd.Function):
             window_size_left=ctx.window_size[0],
             window_size_right=ctx.window_size[1],
             deterministic=ctx.deterministic,
+            pack_gqa=ctx.pack_gqa,
+            mask_mod=ctx.mask_mod,
+            block_sparse_tensors=ctx.block_sparse_tensors,
         )
         return dq, dk, dv, *((None,) * 20)  # Extra Nones is fine
 
