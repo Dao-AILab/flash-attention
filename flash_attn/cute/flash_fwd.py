@@ -864,10 +864,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             window_size_right,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
         )
-        # For varlen, shape[0] is already an Int32 (total_q/total_k)
-        # For non-varlen with pack_gqa, shape[0] is (batch, seqlen) tuple
-        # For non-varlen without pack_gqa, shape[0] is seqlen
-        is_varlen = const_expr(mCuSeqlensQ is not None or mCuSeqlensK is not None)
+
         seqlen_q_static = mQ.shape[0] if const_expr(not self.pack_gqa) else mQ.shape[0][1]
         seqlen_k_static = mK.shape[0]
         SeqlenInfoCls = partial(
@@ -889,11 +886,9 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         )
         TileSchedulerCls = partial(TileScheduler.create, tile_sched_params)
 
-        # Use tile scheduler to get work
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
 
-        # Persistent tile scheduler loop - process all work tiles assigned to this block
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, _ = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx=batch_idx)
@@ -914,7 +909,6 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                 blkK_shape = (self.tile_n, self.tile_hdim)
                 blkV_shape = (self.tile_n, self.tile_hdimv)
 
-                # Get the tensor slice for this batch/head, handling varlen with domain_offset
                 if const_expr(self.pack_gqa):
                     head_idx_kv = head_idx
                 else:
@@ -923,18 +917,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                 mK_cur = seqlen.offset_batch_K(mK, batch_idx, dim=3)[None, None, head_idx_kv]
                 mV_cur = seqlen.offset_batch_K(mV, batch_idx, dim=3)[None, None, head_idx_kv]
 
-                if const_expr(self.pack_gqa):
-                    # pack_gqa = PackGQA(
-                    #     self.tile_m, self.tile_hdim, self.check_hdim_oob, self.qhead_per_kvhead
-                    # )
-                    # We don't need gQ here if we use pack_gqa.load_Q
-                    gQ = cute.make_tensor(
-                        cute.make_ptr(
-                            mQ.element_type, 0, cute.AddressSpace.gmem, assumed_align=16
-                        ),
-                        (self.tile_m, self.tile_hdim),
-                    )
-                else:
+                if const_expr(not self.pack_gqa):
                     gQ = cute.local_tile(mQ_cur, blkQ_shape, (m_block, 0))
                 gK = cute.local_tile(mK_cur, blkK_shape, (None, 0))
                 gV = cute.local_tile(mV_cur, blkV_shape, (None, 0))
@@ -1139,9 +1122,9 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                 )
                 smem_pipe_read = self.advance_pipeline(smem_pipe_read)
                 smem_pipe_write = self.advance_pipeline(smem_pipe_write)
+
                 # Next couple of iterations with causal masking
                 n_block_max_cur = n_block_max - 1  # After first iteration
-                # Next couple of iterations with causal masking
                 if const_expr(self.is_causal or self.is_local):
                     n_block_min_causal_local_mask = block_info.get_n_block_min_causal_local_mask(
                         seqlen, m_block, n_block_min
@@ -1157,6 +1140,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                         smem_pipe_read = self.advance_pipeline(smem_pipe_read)
                         smem_pipe_write = self.advance_pipeline(smem_pipe_write)
                     n_block_max_cur = cutlass.min(n_block_max_cur, n_block_min_causal_local_mask)
+
                 # The remaining iterations have no masking
                 n_block_min_before_local_mask = block_info.get_n_block_min_before_local_mask(
                     seqlen, m_block, n_block_min
@@ -1167,6 +1151,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                     )
                     smem_pipe_read = self.advance_pipeline(smem_pipe_read)
                     smem_pipe_write = self.advance_pipeline(smem_pipe_write)
+                    
                 # Separate masking iterations on the left for local attention
                 if const_expr(self.is_local):
                     n_block_max_cur = cutlass.min(n_block_max_cur, n_block_min_before_local_mask)
