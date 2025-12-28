@@ -69,7 +69,7 @@ class PagedKVManager(ParamsBase):
         val_layout = cute.make_layout((1, async_copy_elems))
         gmem_tiled_copy_KV = cute.make_tiled_copy_tv(atom_async_copy, thr_layout, val_layout)
         gmem_thr_copy_KV = gmem_tiled_copy_KV.get_slice(thread_idx)
-        page_entry_per_thread = n_block_size * gmem_threads_per_row // num_threads
+        page_entry_per_thread = n_block_size // num_threads
 
         tPrPage = cute.make_rmem_tensor((page_entry_per_thread,), Int32)
         tPrPageOffset = cute.make_rmem_tensor((page_entry_per_thread,), Int32)
@@ -115,7 +115,12 @@ class PagedKVManager(ParamsBase):
     @cute.jit
     def load_page_table(self, n_block: Int32):
         for i in cutlass.range(self.page_entry_per_thread, unroll=1):
-            row = (i * self.num_threads + self.thread_idx) // self.gmem_threads_per_row
+            row = (
+                i * self.num_threads
+                + (self.thread_idx % self.gmem_threads_per_row)
+                * (self.num_threads // self.gmem_threads_per_row)
+                + (self.thread_idx // self.gmem_threads_per_row)
+            )
             row_idx = n_block * self.n_block_size + row
 
             page_idx, page_offset = divmod(row_idx + self.leftpad_k, self.page_size_divmod)
@@ -129,8 +134,22 @@ class PagedKVManager(ParamsBase):
             self.tPrPageOffset[i] = page_offset
 
     @cute.jit
+    def compute_X_ptr(self, K_or_V: str):
+        tPrXPtr = cute.make_rmem_tensor((self.page_entry_per_thread,), cutlass.Int64)
+        for i in cutlass.range(self.page_entry_per_thread, unroll=1):
+            page = self.tPrPage[i]
+            page_offset = self.tPrPageOffset[i]
+            if const_expr(K_or_V == "K"):
+                tPrXPtr[i] = utils.elem_pointer(self.mK_paged, (page_offset, 0, page)).toint()
+            else:
+                tPrXPtr[i] = utils.elem_pointer(self.mV_paged, (0, page_offset, page)).toint()
+        return tPrXPtr
+
+    @cute.jit
     def load_KV(self, n_block: Int32, sX: cute.Tensor, K_or_V: str):
         assert K_or_V in ("K", "V")
+
+        tPrXPtr = self.compute_X_ptr(K_or_V)
 
         # Finesse sX layout to be (M, N).
         sX_pi = cute.make_tensor(
@@ -154,13 +173,15 @@ class PagedKVManager(ParamsBase):
         for m in cutlass.range(cute.size(tXsX, mode=[1]), unroll=1):
             should_load = tXcX[0, m, 0][0] < seqlenk_row_limit
 
-            page = self.tPrPage[m]
-            page_offset = self.tPrPageOffset[m]
-            mX_paged_cur = (
-                self.mK_paged[page_offset, None, page]
-                if const_expr(K_or_V == "K")
-                else self.mV_paged[None, page_offset, page]
+            x_ptr_i64 = utils.shuffle_sync(
+                tPrXPtr[m // self.gmem_threads_per_row],
+                m % self.gmem_threads_per_row,
+                width=self.gmem_threads_per_row,
             )
+            x_gmem_ptr = cute.make_ptr(
+                self.mK_paged.element_type, x_ptr_i64, cute.AddressSpace.gmem, assumed_align=16
+            )
+            mX_paged_cur = cute.make_tensor(x_gmem_ptr, cute.make_layout((head_dim,)))
             mX_paged_cur_copy = cute.tiled_divide(mX_paged_cur, (self.async_copy_elems,))
 
             if should_load:
