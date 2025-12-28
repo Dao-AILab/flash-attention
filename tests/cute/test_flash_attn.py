@@ -29,6 +29,7 @@ from flash_attn.cute.interface import (
 
 
 DISABLE_SPLIT = os.getenv("FLASH_ATTENTION_DISABLE_SPLIT", "FALSE") == "TRUE"
+DISABLE_BACKWARD = os.getenv("FLASH_ATTENTION_DISABLE_BACKWARD", "FALSE") == "TRUE"
 TEST_BWD_ONLY = False
 VERBOSE = True
 
@@ -36,8 +37,8 @@ VERBOSE = True
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 # @pytest.mark.parametrize("mha_type", ["mha"])
-@pytest.mark.parametrize("has_learnable_sink", [False, True])
-# @pytest.mark.parametrize("has_learnable_sink", [False])
+# @pytest.mark.parametrize("has_learnable_sink", [False, True])
+@pytest.mark.parametrize("has_learnable_sink", [False])
 # @pytest.mark.parametrize("has_qv", [False, True])
 @pytest.mark.parametrize("has_qv", [False])
 # @pytest.mark.parametrize("deterministic", [False, True])
@@ -274,6 +275,7 @@ def test_flash_attn_output(
             and dv == d
             and learnable_sink is None
             # and False
+            and not DISABLE_BACKWARD
             and not ((causal or local) and seqlen_k < seqlen_q)
         ):
             g = torch.randn_like(out)

@@ -252,7 +252,7 @@ def _flash_attn_fwd(
         else _compute_capability
     )
 
-    assert compute_capability in [9, 10, 11], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x"
+    assert compute_capability in [8, 9, 10, 11], "Unsupported compute capability. Supported: 8.x, 9.x, 10.x, 11.x"
 
     use_block_sparsity = block_sparse_tensors is not None
 
@@ -270,6 +270,10 @@ def _flash_attn_fwd(
         causal, local = False, False
 
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+    if compute_capability == 8:  # TODO: tune block size according to hdim.
+        n_block_size = 64
+        num_threads = 128
 
     if compute_capability == 9:  # TODO: tune block size according to hdim.
         if head_dim == head_dim_v == 128 and not causal and not local and not use_block_sparsity:
@@ -418,7 +422,27 @@ def _flash_attn_fwd(
         if aux_tensors is not None:
             cute_aux_tensors = [to_cute_tensor(buf, assumed_align=None, fully_dynamic=True) for buf in aux_tensors]
 
-        if compute_capability == 9:
+        if compute_capability == 8:
+            assert page_table is None, "paged KV not supported on SM 8.0"
+            assert not is_split_kv, "SplitKV not supported on SM 8.0"
+            fa_fwd = FlashAttentionForwardSm80(
+                dtype,
+                head_dim,
+                head_dim_v,
+                qhead_per_kvhead,
+                is_causal=causal,
+                is_local=local,
+                pack_gqa=pack_gqa,
+                tile_m=m_block_size,
+                tile_n=n_block_size,
+                num_stages=2,
+                num_threads=num_threads,
+                Q_in_regs=False,
+                mask_mod=mask_mod,
+                score_mod=score_mod,
+                has_aux_tensors=aux_tensors is not None,
+            )
+        elif compute_capability == 9:
             assert page_table is None, "paged KV not supported on SM 9.0"
             assert not is_split_kv, "SplitKV not supported on SM 9.0"
             # fa_fwd = FlashAttentionForwardSm80(
@@ -467,7 +491,7 @@ def _flash_attn_fwd(
             )
         else:
             raise ValueError(
-                f"Unsupported compute capability: {compute_capability}. Supported: 9.x, 10.x, 11.x"
+                f"Unsupported compute capability: {compute_capability}. Supported: 8.x, 9.x, 10.x, 11.x"
             )
         # TODO: check @can_implement
         _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
