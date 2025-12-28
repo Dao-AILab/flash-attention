@@ -651,7 +651,6 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         # SM 8.0 does not support some advanced features
         assert mPageTable is None, "Paged KV cache not supported on SM 8.0"
         assert blocksparse_tensors is None, "Block sparsity not supported on SM 8.0"
-        assert learnable_sink is None, "Learnable sink is not supported in this kernel"
         self._check_type(
             *(t.element_type if t is not None else None for t in (mQ, mK, mV, mO, mLSE, mCuSeqlensQ, mCuSeqlensK, mSeqUsedQ, mSeqUsedK))
         )
@@ -810,6 +809,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             SharedStorage,
             aux_tensors,
             fastdiv_mods,
+            learnable_sink,
         ).launch(
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
@@ -849,6 +849,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         SharedStorage: cutlass.Constexpr,
         aux_tensors=None,
         fastdiv_mods=None,
+        learnable_sink=None,
     ):
         # Thread index
         tidx, _, _ = cute.arch.thread_idx()
@@ -1177,8 +1178,20 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                         smem_pipe_read = self.advance_pipeline(smem_pipe_read)
                         smem_pipe_write = self.advance_pipeline(smem_pipe_write)
 
-                # normalize acc_O by row_sum and calculate the lse
-                row_scale = softmax.finalize()
+                sink_val = None
+                if const_expr(learnable_sink is not None):
+                    if const_expr(not self.pack_gqa):
+                        sink_val = Float32(learnable_sink[head_idx])
+                    else:  # Each thread might have a different sink value due to different q_head
+                        sink_val = cute.make_fragment_like(softmax.row_max, Float32)
+                        cS = cute.make_identity_tensor((self.tile_m, self.tile_n))
+                        tScS_mn = utils.make_acc_tensor_mn_view(thr_mma_qk.partition_C(cS))
+                        for r in cutlass.range(cute.size(sink_val), unroll_full=True):
+                            row = m_block * self.tile_m + tScS_mn[r][0]
+                            q_head_idx = row % self.qhead_per_kvhead + head_idx * self.qhead_per_kvhead
+                            sink_val[r] = Float32(learnable_sink[q_head_idx])
+
+                row_scale = softmax.finalize(sink_val=sink_val)
                 softmax.rescale_O(acc_O, row_scale)
 
                 # ///////////////////////////////////////////////////////////////////////////////
