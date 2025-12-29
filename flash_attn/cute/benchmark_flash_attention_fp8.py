@@ -48,16 +48,6 @@ def _parse_int_list(csv: str) -> list[int]:
     return out
 
 
-def _iter_bs_seqlens(preset: str) -> list[tuple[int, int]]:
-    if preset == "sm100":
-        return [(32, 512), (16, 1024), (8, 2048), (4, 4096), (2, 8192)]
-    if preset == "sm100-long":
-        return [(32, 512), (16, 1024), (8, 2048), (4, 4096), (2, 8192), (1, 16384)]
-    if preset == "sm100-short":
-        return [(8, 512), (4, 1024), (2, 2048)]
-    raise ValueError(f"Unknown preset: {preset}")
-
-
 def attention_pytorch(qkv: torch.Tensor, causal: bool) -> torch.Tensor:
     """
     qkv: (batch, seqlen, 3, nheads, headdim)
@@ -224,18 +214,21 @@ def _maybe_pass_descales(callable_, **kwargs):
 
 def main(argv: Iterable[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--preset", default="sm100", choices=["sm100", "sm100-long", "sm100-short"])
     parser.add_argument("--repeats", type=int, default=30)
     parser.add_argument("--dim", type=int, default=2048)
     parser.add_argument("--headdims", default="64,128")
     parser.add_argument("--dtype", default="fp8_e4m3fn")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--max-pytorch-seqlen", type=int, default=4096)
     parser.add_argument(
         "--check",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Enable correctness checks vs BF16 PyTorch baseline (only when baseline runs).",
+        help="Enable correctness checks vs BF16 PyTorch baseline.",
+    )
+    parser.add_argument(
+        "--check-quantization-only",
+        action="store_true",
+        help="Check FP8 kernel vs dequantized-FP8 baseline (quantization error only).",
     )
     parser.add_argument("--atol-bf16", type=float, default=0.10)
     parser.add_argument("--rtol-bf16", type=float, default=0.10)
@@ -256,7 +249,7 @@ def main(argv: Iterable[str] | None = None) -> int:
     device = "cuda"
     fp8_dtype = _torch_float8_dtype(args.dtype)
     headdim_vals = _parse_int_list(args.headdims)
-    bs_seqlen_vals = _iter_bs_seqlens(args.preset)
+    bs_seqlen_vals = [(32, 512), (16, 1024), (8, 2048), (4, 4096), (2, 8192), (1, 16384)]
 
     methods = (
         ["Pytorch", "FA4-CuTe-BF16", "FA4-CuTe-FP8"]
@@ -265,8 +258,8 @@ def main(argv: Iterable[str] | None = None) -> int:
 
     fp8_failures = []
 
-    for causal in (False, True):
-        for headdim in headdim_vals:
+    for headdim in headdim_vals:
+        for causal in (False, True):
             for batch, seqlen in bs_seqlen_vals:
                 torch.cuda.empty_cache()
                 nheads = args.dim // headdim
@@ -282,21 +275,18 @@ def main(argv: Iterable[str] | None = None) -> int:
                 speeds = {}
 
                 out_ref_bf16 = None
-                if seqlen <= args.max_pytorch_seqlen:
-                    try:
-                        out_ref_bf16 = attention_pytorch(qkv_bf16, causal=causal)  # warmup / reference
-                        t = time_fwd(attention_pytorch, qkv_bf16, causal=causal, repeats=args.repeats)
-                        times["Pytorch"] = t
-                    except RuntimeError as e:
-                        if "out of memory" in str(e).lower():
-                            times["Pytorch"] = float("nan")
-                            out_ref_bf16 = None
-                        else:
-                            raise
-                else:
-                    times["Pytorch"] = float("nan")
+                try:
+                    out_ref_bf16 = attention_pytorch(qkv_bf16, causal=causal)  # warmup / reference
+                    t = time_fwd(attention_pytorch, qkv_bf16, causal=causal, repeats=args.repeats)
+                    times["Pytorch"] = t
+                except RuntimeError as e:
+                    if "out of memory" in str(e).lower():
+                        times["Pytorch"] = float("nan")
+                        out_ref_bf16 = None
+                    else:
+                        raise
 
-                # FA4 / CuTe BF16 baseline (should work today)
+                # FA4 / CuTe BF16 baseline
                 try:
                     softmax_scale = headdim**-0.5
                     out_fa4_bf16, _ = flash_attn_cute_fwd(
@@ -333,22 +323,14 @@ def main(argv: Iterable[str] | None = None) -> int:
                 k_descale = torch.ones(batch, nheads, device=device, dtype=torch.float32)
                 v_descale = torch.ones(batch, nheads, device=device, dtype=torch.float32)
 
+                # Optional: FP8 reference baseline (dequantized FP8 -> PyTorch) for quantization-error-only checks
                 out_ref_fp8 = None
-                if args.check and seqlen <= args.max_pytorch_seqlen:
-                    # FP8 reference: run the BF16 PyTorch baseline on dequantized FP8 inputs.
-                    # This is future-proof when descales are plumbed: Q_real = Q_fp8 * q_descale, etc.
+                if args.check and args.check_quantization_only:
                     try:
-                        # Keep the reference in BF16 (match FA4 FP8 output dtype). Note that
-                        # BF16 * FP32 promotes to FP32 in PyTorch, so we cast back explicitly.
-                        q_ref_fp8 = (q_fp8.to(torch.bfloat16) * q_descale[:, None, :, None]).to(
-                            torch.bfloat16
-                        )
-                        k_ref_fp8 = (k_fp8.to(torch.bfloat16) * k_descale[:, None, :, None]).to(
-                            torch.bfloat16
-                        )
-                        v_ref_fp8 = (v_fp8.to(torch.bfloat16) * v_descale[:, None, :, None]).to(
-                            torch.bfloat16
-                        )
+                        # Dequantize FP8 inputs back to BF16 (applying descales)
+                        q_ref_fp8 = (q_fp8.to(torch.bfloat16) * q_descale[:, None, :, None]).to(torch.bfloat16)
+                        k_ref_fp8 = (k_fp8.to(torch.bfloat16) * k_descale[:, None, :, None]).to(torch.bfloat16)
+                        v_ref_fp8 = (v_fp8.to(torch.bfloat16) * v_descale[:, None, :, None]).to(torch.bfloat16)
                         qkv_ref_fp8 = torch.stack([q_ref_fp8, k_ref_fp8, v_ref_fp8], dim=2)
                         out_ref_fp8 = attention_pytorch(qkv_ref_fp8, causal=causal)
                     except RuntimeError as e:
@@ -379,13 +361,20 @@ def main(argv: Iterable[str] | None = None) -> int:
                         **fa4_kwargs,
                     )
                     times["FA4-CuTe-FP8"] = t
-                    if args.check and out_ref_fp8 is not None:
-                        torch.testing.assert_close(
-                            out_fa4_fp8,
-                            out_ref_fp8,
-                            atol=args.atol_fp8,
-                            rtol=args.rtol_fp8,
-                        )
+                    if args.check:
+                        # Choose baseline: quantization-only (dequantized FP8) or full (BF16)
+                        if args.check_quantization_only:
+                            ref_baseline = out_ref_fp8
+                        else:
+                            ref_baseline = out_ref_bf16
+
+                        if ref_baseline is not None:
+                            torch.testing.assert_close(
+                                out_fa4_fp8,
+                                ref_baseline,
+                                atol=args.atol_fp8,
+                                rtol=args.rtol_fp8,
+                            )
                 except Exception as e:
                     fp8_failures.append((causal, headdim, batch, seqlen, repr(e)))
                     times["FA4-CuTe-FP8"] = float("nan")
