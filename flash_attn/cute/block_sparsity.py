@@ -89,12 +89,10 @@ def get_block_sparse_expected_shapes(
     seqlen_k: int,
     m_block_size: int,
     n_block_size: int,
-    compute_capability: int,
+    q_stage: int,
 ) -> Tuple[Tuple[int, int, int], Tuple[int, int, int, int]]:
     """Return (expected_count_shape, expected_index_shape) for block sparse normalization."""
-    # TODO: This multiplier should really be q_stage, wire up in later PR
-    # 1 cta handles 2*tile_m rows on SM100
-    m_block_size_effective = 2 * m_block_size if compute_capability == 10 else m_block_size
+    m_block_size_effective = q_stage * m_block_size
     expected_m_blocks = ceildiv(seqlen_q, m_block_size_effective)
     expected_n_blocks = ceildiv(seqlen_k, n_block_size)
     expected_count_shape = (batch_size, num_head, expected_m_blocks)

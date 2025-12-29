@@ -80,6 +80,7 @@ class FlashAttentionForwardSm100:
         pack_gqa: bool = False,
         m_block_size: int = 128,
         n_block_size: int = 128,
+        q_stage: cutlass.Constexpr[int] = 2,
         is_persistent: bool = True,
         score_mod: cutlass.Constexpr | None = None,
         mask_mod: cutlass.Constexpr | None = None,
@@ -100,7 +101,7 @@ class FlashAttentionForwardSm100:
         self.check_hdim_v_oob = head_dim_v != self.head_dim_v_padded
         self.m_block_size = m_block_size
         self.n_block_size = n_block_size
-        self.q_stage = 2 if not is_split_kv else 1
+        self.q_stage = q_stage
         assert self.q_stage in [1, 2]
 
         # 2 Q tile per CTA

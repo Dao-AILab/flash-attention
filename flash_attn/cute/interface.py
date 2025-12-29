@@ -123,6 +123,8 @@ def _flash_attn_fwd(
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
     aux_tensors: Optional[list[torch.Tensor]] = None,
+    max_seqlen_q: Optional[int] = None,
+    max_seqlen_k: Optional[int] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for FlashAttention.
 
@@ -285,13 +287,21 @@ def _flash_attn_fwd(
         if pack_gqa and num_splits != 1 and cu_seqlens_q is None:
             pack_gqa = False
 
+    if max_seqlen_q is None:
+        max_seqlen_q = seqlen_q if cu_seqlens_q is None else total_q
+    if max_seqlen_k is None:
+        max_seqlen_k = seqlen_k
+    seqlen_q_packgqa = max_seqlen_q * qhead_per_kvhead
+    if compute_capability == 10:
+        q_stage = 2 if seqlen_q_packgqa > m_block_size else 1
+    else:
+        q_stage = 1
+
     if num_splits < 1:
-        max_seqlen_k = seqlen_k if cu_seqlens_k is None else (cu_seqlens_k[1:] - cu_seqlens_k[:-1]).max().item()
-        max_seqlen_q = seqlen_q if cu_seqlens_q is None else (cu_seqlens_q[1:] - cu_seqlens_q[:-1]).max().item()
-        seqlen_q_packgqa = max_seqlen_q * qhead_per_kvhead
+        m_block_size_effective = q_stage * m_block_size
         seqlen_k_loaded = max_seqlen_k if not local else max(0, min(max_seqlen_k, window_size_right + window_size_left + 1 + m_block_size))
         num_n_blocks = (seqlen_k_loaded + n_block_size - 1) // n_block_size
-        num_m_blocks = (seqlen_q_packgqa + m_block_size - 1) // m_block_size
+        num_m_blocks = (seqlen_q_packgqa + m_block_size_effective - 1) // m_block_size_effective
         total_mblocks = batch_size * num_head_kv * num_m_blocks
         num_splits = num_splits_heuristic(
             total_mblocks,
@@ -365,6 +375,7 @@ def _flash_attn_fwd(
         learnable_sink is not None,
         m_block_size,
         n_block_size,
+        q_stage,
         num_threads,
         is_split_kv,
         pack_gqa,
@@ -405,7 +416,7 @@ def _flash_attn_fwd(
                 raise ValueError("Block sparsity requires fixed-length sequences (seqlen_q must be known).")
             expected_count_shape, expected_index_shape = get_block_sparse_expected_shapes(
                 batch_size, num_head, seqlen_q, seqlen_k,
-                m_block_size, n_block_size, compute_capability,
+                m_block_size, n_block_size, q_stage,
             )
             compile_time_normalized = normalize_block_sparse_tensors(
                 block_sparse_tensors,
@@ -453,6 +464,7 @@ def _flash_attn_fwd(
                 pack_gqa=pack_gqa,
                 m_block_size=m_block_size,
                 n_block_size=n_block_size,
+                q_stage=q_stage,
                 is_persistent=not causal
                     and not local
                     and cu_seqlens_q is None
@@ -497,7 +509,7 @@ def _flash_attn_fwd(
     if block_sparse_tensors is not None:
         expected_count_shape, expected_index_shape = get_block_sparse_expected_shapes(
             batch_size, num_head, seqlen_q, seqlen_k,
-            m_block_size, n_block_size, compute_capability,
+            m_block_size, n_block_size, q_stage,
         )
         normalized_block_sparse_tensors = normalize_block_sparse_tensors(
             block_sparse_tensors,
@@ -1272,6 +1284,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         deterministic: bool = False,
         score_mod: Optional[Callable] = None,
         aux_tensors: Optional[list] = None,
+        max_seqlen_q: Optional[int] = None,
+        max_seqlen_k: Optional[int] = None,
     ):
         out, lse = _flash_attn_fwd(
             q,
@@ -1292,6 +1306,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             pack_gqa=pack_gqa,
             score_mod=score_mod,
             aux_tensors=aux_tensors,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
         )
         ctx.save_for_backward(q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
         ctx.softmax_scale = softmax_scale
@@ -1383,6 +1399,8 @@ def flash_attn_varlen_func(
     deterministic: bool = False,
     score_mod: Optional[Callable] = None,
     aux_tensors: Optional[list] = None,
+    max_seqlen_q: Optional[int] = None,
+    max_seqlen_k: Optional[int] = None,
 ):
     return FlashAttnVarlenFunc.apply(
         q,
@@ -1403,6 +1421,8 @@ def flash_attn_varlen_func(
         deterministic,
         score_mod,
         aux_tensors,
+        max_seqlen_q,
+        max_seqlen_k,
     )
 
 
