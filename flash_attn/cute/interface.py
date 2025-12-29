@@ -40,10 +40,12 @@ from cutlass.cute.runtime import from_dlpack
 from flash_attn.cute import utils
 from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80, FlashAttentionForwardSm90
 from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
+from flash_attn.cute.flash_fwd_sm120 import FlashAttentionForwardSm120
 from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
 from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
 from flash_attn.cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
 from flash_attn.cute.flash_bwd_sm100 import FlashAttentionBackwardSm100
+from flash_attn.cute.flash_bwd_sm120 import FlashAttentionBackwardSm120
 from flash_attn.cute.flash_bwd_postprocess import FlashAttentionBackwardPostprocess
 from flash_attn.cute.flash_fwd_combine import FlashAttentionForwardCombine
 
@@ -252,7 +254,7 @@ def _flash_attn_fwd(
         else _compute_capability
     )
 
-    assert compute_capability in [9, 10, 11], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x"
+    assert compute_capability in [9, 10, 11, 12], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x, 12.x"
 
     use_block_sparsity = block_sparse_tensors is not None
 
@@ -275,7 +277,7 @@ def _flash_attn_fwd(
         if head_dim == head_dim_v == 128 and not causal and not local and not use_block_sparsity:
             n_block_size = 192
 
-    if compute_capability in [10, 11]:
+    if compute_capability in [10, 11, 12]:
         if (
             pack_gqa
             and (128 % qhead_per_kvhead != 0)
@@ -465,9 +467,31 @@ def _flash_attn_fwd(
                 is_varlen_q=cu_seqlens_q is not None
                     or seqused_q is not None,
             )
+        elif compute_capability == 12:
+            # SM12.0 and SM12.1 (RTX 50 series) use SM120-style tensor cores (similar to SM89/90)
+            # but without Tensor Memory (TMEM). Route to SM120 implementation.
+            fa_fwd = FlashAttentionForwardSm120(
+                head_dim,
+                head_dim_v,
+                qhead_per_kvhead=qhead_per_kvhead,
+                is_causal=causal,
+                is_local=local,
+                is_split_kv=is_split_kv,
+                pack_gqa=pack_gqa,
+                m_block_size=m_block_size,
+                n_block_size=n_block_size,
+                is_persistent=not causal
+                    and not local
+                    and cu_seqlens_q is None
+                    and seqused_q is None
+                    and not is_split_kv,
+                score_mod=score_mod,
+                has_aux_tensors=aux_tensors is not None,
+                page_size=page_size,
+            )
         else:
             raise ValueError(
-                f"Unsupported compute capability: {compute_capability}. Supported: 9.x, 10.x, 11.x"
+                f"Unsupported compute capability: {compute_capability}. Supported: 9.x, 10.x, 11.x, 12.x"
             )
         # TODO: check @can_implement
         _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
@@ -579,7 +603,7 @@ def _flash_attn_bwd(
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     compute_capability = _get_device_capability()
-    assert compute_capability in [9, 10, 11], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x"
+    assert compute_capability in [9, 10, 11, 12], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x, 12.x"
 
     if compute_capability == 9:
         m_block_size = 80 if not causal else 64
@@ -595,6 +619,16 @@ def _flash_attn_bwd(
         AtomLayoutMdQ = 1
         cluster_size = 1
         assert window_size_left is None and window_size_right is None, "local not supported yet on 9.x"
+    elif compute_capability == 12:
+        # SM12.0 and SM12.1 (RTX 50 series) use SM120-style tensor cores
+        m_block_size = 128
+        n_block_size = 128
+        dQ_swapAB = False
+        dKV_swapAB = False
+        AtomLayoutMdQ = 1
+        AtomLayoutNdKV = 1
+        # SM120 supports cluster_size 1 or 2, but TMA multicast is not recommended
+        cluster_size = 1
     else:
         m_block_size = 128
         n_block_size = 128
@@ -688,8 +722,10 @@ def _flash_attn_bwd(
         pack_gqa = qhead_per_kvhead > 1
     if compute_capability in [10, 11]:
         pack_gqa = False # override for now
-    if compute_capability not in [10, 11]:
-        assert deterministic is False, "bwd deterministic only supported for sm100/sm110 for now"
+    if compute_capability == 12:
+        pack_gqa = False # override for now (SM120 similar to SM100)
+    if compute_capability not in [10, 11, 12]:
+        assert deterministic is False, "bwd deterministic only supported for sm100/sm110/sm120 for now"
 
     if score_mod is not None:
         assert score_mod_bwd is not None, "score_mod_bwd is required when score_mod is provided"
@@ -697,7 +733,7 @@ def _flash_attn_bwd(
         assert cu_seqlens_q is None and cu_seqlens_k is None, (
             "varlen + score_mod not supported in bwd yet"
         )
-        assert compute_capability in [10, 11], "score_mod in bwd only supported on SM100/SM110 for now"
+        assert compute_capability in [10, 11, 12], "score_mod in bwd only supported on SM100/SM110/SM120 for now"
 
     device = q.device
     out_torch_dtype = q.dtype
@@ -965,6 +1001,21 @@ def _flash_attn_bwd(
                 num_threads,
                 V_in_regs=V_in_regs,
             )
+        elif compute_capability == 12:
+            # SM12.0 and SM12.1 (RTX 50 series) use SM120-style tensor cores (similar to SM89/90)
+            # but without Tensor Memory (TMEM). Route to SM120 implementation.
+            fa_bwd_obj = FlashAttentionBackwardSm120(
+                head_dim,
+                head_dim_v,
+                is_causal=causal,
+                is_local=local,
+                qhead_per_kvhead=qhead_per_kvhead,
+                tile_m=m_block_size,
+                tile_n=n_block_size,
+                is_persistent=not causal and not local,
+                deterministic=deterministic,
+                cluster_size=cluster_size,
+            )
         else:
             fa_bwd_obj = FlashAttentionBackwardSm100(
                 head_dim,
@@ -987,7 +1038,7 @@ def _flash_attn_bwd(
         # Block sparse tensors for backward use Q-direction indexing (transposed from forward).
         # sparse_block_size_q = 2*tile_m matches forward's q_stage=2 pipelining.
         sparse_tensors_compile = None
-        if block_sparse_tensors is not None and compute_capability in [10, 11]:
+        if block_sparse_tensors is not None and compute_capability in [10, 11, 12]:
             expected_count_shape, expected_index_shape = get_block_sparse_expected_shapes_bwd(
                 batch_size, num_head, seqlen_q, seqlen_k,
                 m_block_size, n_block_size, subtile_factor,
@@ -1028,7 +1079,7 @@ def _flash_attn_bwd(
             options="--enable-tvm-ffi",
         )
     normalized_block_sparse_tensors = None
-    if block_sparse_tensors is not None and compute_capability in [10, 11]:
+    if block_sparse_tensors is not None and compute_capability in [10, 11, 12]:
         expected_count_shape, expected_index_shape = get_block_sparse_expected_shapes_bwd(
             batch_size, num_head, seqlen_q, seqlen_k,
             m_block_size, n_block_size, subtile_factor,
