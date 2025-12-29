@@ -41,7 +41,7 @@ import cutlass.utils.blackwell_helpers as sm100_utils_basic  # For layout functi
 import flash_attn.cute.utils as utils
 from flash_attn.cute import copy_utils
 from flash_attn.cute.mask import AttentionMask
-from flash_attn.cute.softmax import SoftmaxSm120, apply_score_mod_inner
+from flash_attn.cute.softmax import SoftmaxSm100, apply_score_mod_inner
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute.block_sparsity import BlockSparseTensors
@@ -53,7 +53,6 @@ from flash_attn.cute.block_sparse_utils import (
 )
 from flash_attn.cute.pack_gqa import PackGQA
 from flash_attn.cute.hopper_helpers import gemm_w_idx
-from flash_attn.cute.fast_math import FastDivmod
 from cutlass.cute import FastDivmodDivisor
 from flash_attn.cute.tile_scheduler import (
     TileSchedulerArguments,
@@ -981,6 +980,7 @@ class FlashAttentionForwardSm120:
                 num_splits,
                 SeqlenInfoCls,
                 TileSchedulerCls,
+                blocksparse_tensors,
             )
 
         # ///////////////////////////////////////////////////////////////////////////////
@@ -1131,6 +1131,7 @@ class FlashAttentionForwardSm120:
         num_splits: Int32,
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
+        blocksparse_tensors: Optional[BlockSparseTensors] = None,
     ):
         q_producer_phase = Int32(1)
         kv_producer_state = cutlass.pipeline.make_pipeline_state(
@@ -1348,11 +1349,27 @@ class FlashAttentionForwardSm120:
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
-            n_block_min, n_block_max = block_info.get_n_block_min_max(
-                seqlen, m_block, split_idx, num_splits
-            )
 
-            if const_expr(not self.is_split_kv) or n_block_min < n_block_max:
+            block_iter_count = Int32(0)
+            process_tile = False
+
+            if const_expr(self.use_block_sparsity):
+                block_iter_count = get_total_block_count(blocksparse_tensors, batch_idx, head_idx, m_block)
+                process_tile = block_iter_count > Int32(0)
+            else:
+                n_block_min, n_block_max = block_info.get_n_block_min_max(
+                    seqlen, m_block, split_idx, num_splits
+                )
+                block_iter_count = n_block_max - n_block_min
+                if const_expr(not self.is_split_kv):
+                    process_tile = True
+                else:
+                    process_tile = n_block_min < n_block_max
+
+            if process_tile:
+                n_block_min, n_block_max = block_info.get_n_block_min_max(
+                    seqlen, m_block, split_idx, num_splits
+                )
                 for stage in cutlass.range_constexpr(self.q_stage):
                     # GEMM_QK00 (Q0 * K0 -> S0) or GEMM_QK01 (Q1 * K0 -> S1)
                     # 1. wait for Q0 / Q1
@@ -1665,7 +1682,7 @@ class FlashAttentionForwardSm120:
                 )
             else:
                 mask_fn_none = None
-                softmax = SoftmaxSm120.create(
+                softmax = SoftmaxSm100.create(
                     softmax_scale_log2,
                     rescale_threshold=8.0 if const_expr(self.q_dtype.width == 16) else 0.0,
                     softmax_scale=softmax_scale,
@@ -1847,7 +1864,7 @@ class FlashAttentionForwardSm120:
         si_corr_producer_phase: Int32,
         s0_s1_sequence_phase: Int32,
         n_block: Int32,
-        softmax: SoftmaxSm120,
+        softmax: SoftmaxSm100,
         mbar_ptr: cute.Pointer,
         mbar_s0_s1_sequence_offset: Int32,
         thr_mma_qk: cute.core.ThrMma,
@@ -1888,6 +1905,7 @@ class FlashAttentionForwardSm120:
                 m_block,
                 n_block,
                 softmax,
+                seqlen,
                 aux_tensors,
                 fastdiv_mods,
             )
@@ -2588,6 +2606,7 @@ class FlashAttentionForwardSm120:
         m_block,
         n_block,
         softmax,
+        seqlen: SeqlenInfoQK,
         aux_tensors=None,
         fastdiv_mods=(None, None),
     ):
@@ -2624,6 +2643,7 @@ class FlashAttentionForwardSm120:
             self.qk_acc_dtype,
             aux_tensors,
             fastdiv_mods,
+            seqlen_info=seqlen,
             constant_q_idx=q_idx_logical,
             qhead_per_kvhead=self.qhead_per_kvhead if cutlass.const_expr(self.pack_gqa) else 1,
         )
