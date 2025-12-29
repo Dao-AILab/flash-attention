@@ -486,6 +486,7 @@ def _flash_attn_fwd(
                     and seqused_q is None
                     and not is_split_kv,
                 score_mod=score_mod,
+                mask_mod=mask_mod,
                 has_aux_tensors=aux_tensors is not None,
                 page_size=page_size,
             )
@@ -1015,6 +1016,11 @@ def _flash_attn_bwd(
                 is_persistent=not causal and not local,
                 deterministic=deterministic,
                 cluster_size=cluster_size,
+                score_mod=score_mod,
+                score_mod_bwd=score_mod_bwd,
+                mask_mod=mask_mod,
+                has_aux_tensors=aux_tensors is not None and len(aux_tensors) > 0,
+                subtile_factor=subtile_factor,
             )
         else:
             fa_bwd_obj = FlashAttentionBackwardSm100(
