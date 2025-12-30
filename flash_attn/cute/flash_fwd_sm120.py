@@ -1370,13 +1370,21 @@ class FlashAttentionForwardSm120:
                 n_block_min, n_block_max = block_info.get_n_block_min_max(
                     seqlen, m_block, split_idx, num_splits
                 )
+                
+                # ========================================================================
+                # Phase 1: Warm-up - Initial Q*K^T computation (Bmm1)
+                # ========================================================================
+                # This phase computes the first attention scores (S = Q*K^T) for both Q stages.
+                # This warm-up phase primes the
+                # pipeline by starting the computation early, allowing subsequent phases to
+                # overlap DMA loads with math operations.
                 for stage in cutlass.range_constexpr(self.q_stage):
                     # GEMM_QK00 (Q0 * K0 -> S0) or GEMM_QK01 (Q1 * K0 -> S1)
-                    # 1. wait for Q0 / Q1
+                    # 1. wait for Q0 / Q1 (DMA pipeline coordination)
                     cute.arch.mbarrier_wait(
                         mbar_ptr + self.mbar_load_q_full_offset + stage, mma_q_consumer_phase
                     )
-                    # 2. wait for K0
+                    # 2. wait for K0 (DMA pipeline coordination)
                     if const_expr(stage == 0):
                         pipeline_kv.consumer_wait(mma_kv_consumer_state)
                     tSrKi = tSrK[None, None, None, mma_kv_consumer_state.index]
@@ -1384,8 +1392,9 @@ class FlashAttentionForwardSm120:
                     # For the first iteration, we don't need to wait as we're guaranteed S0 / S1
                     # are empty. For subsequent iterations, the wait happened at the end
                     # of the while loop.
-                    # 3. gemm
+                    # 3. gemm: Compute Q*K^T -> S (attention scores)
                     # SM120: Using SM90-style GEMM with register accumulator
+                    # This keeps the accumulator in registers for maximum performance
                     tSrKi = tSrK[None, None, None, mma_kv_consumer_state.index]
                     gemm_w_idx(
                         tiled_mma_qk,
@@ -1398,35 +1407,54 @@ class FlashAttentionForwardSm120:
                         wg_wait=-1,
                     )
                     # SM120: Store S accumulator from registers to shared memory
+                    # This allows softmax warps to read S while MMA warp continues computation
                     cute.copy(thr_smem_store_S, tSrS_regs[stage], tSsS_stages[stage])
                     cute.arch.fence_proxy(
                         cute.arch.ProxyKind.async_shared,
                         space=cute.arch.SharedSpace.shared_cta,
                     )
-                    # 4. release S0 / S1
+                    # 4. release S0 / S1 (signal softmax pipeline that data is ready)
                     # SM120: Using regular mbarrier instead of tcgen05.commit
                     with cute.arch.elect_one():
                         cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_S_full_offset + stage)
                 mma_q_consumer_phase ^= 1
-                # 5. release K0
+                # 5. release K0 (allow DMA pipeline to load next K tile)
                 pipeline_kv.consumer_release(mma_kv_consumer_state)
                 mma_kv_consumer_state.advance()
                 # End of GEMM (Q1 * K0 -> S1)
                 # Note: Q0 & Q1 are still needed in the seqlen_kv loop
                 # so we need to release them after the seqlen_kv loop
 
+                # ========================================================================
+                # Phase 2: Steady State - Aggregated workload processing (iterations 1 to Tc-1)
+                # ========================================================================
+                # This phase processes the bulk of the attention computation with optimized
+                # - Overlaps Bmm1 (Q*K^T) and Bmm2 (P*V) computations
+                # - Aggregates workloads to minimize pipeline bubbles
+                # - Coordinates DMA, Math, and Softmax pipelines efficiently
+
                 # O hasn't been accumulated yet, its first MMA calculation doesn't need to accumulate
                 block_loop_count = block_iter_count - 1
                 O_should_accumulate = False
+                
+                # Steady state loop: Process iterations 1 to Tc-1 with aggregated workloads
+                # - Overlaps Bmm2 (P*V) and Bmm1 (Q*K^T) computations
+                # - Aggregates memory operations to minimize pipeline stalls
+                # - Coordinates between DMA, Math, Softmax, and Correction pipelines
                 for i in cutlass.range(block_loop_count, unroll=1):
-                    # GEMM_PV00 (P0 * V0 -> O0_partial), O0 needs to be accumulated in the seqlen_kv loop
-                    # 1. wait for V0
+                    # ====================================================================
+                    # Sub-phase 2a: Bmm2 computation (P * V -> O accumulation)
+                    # ====================================================================
+                    # Compute P*V to accumulate into output O. This happens in parallel
+                    # with the next iteration's Q*K^T computation for maximum pipeline utilization.
+                    # 1. wait for V0 (DMA pipeline coordination)
                     pipeline_kv.consumer_wait(mma_kv_consumer_state)
                     mma_kv_release_state = mma_kv_consumer_state.clone()
                     Vi_index, Vi_phase = mma_kv_consumer_state.index, mma_kv_consumer_state.phase
                     tOrVi = tOrV[None, None, None, Vi_index]
                     for stage in cutlass.range_constexpr(2):
                         # 2. acquire corrected O0/O1_partial and P0 / P1
+                        # Wait for correction pipeline to finish rescaling previous O
                         # For the first iteration in this work tile, waiting for O0/O1_partial
                         # means that the correction warps has finished reading tO during
                         # the last iteration of the previous work tile has finished.
@@ -1434,8 +1462,9 @@ class FlashAttentionForwardSm120:
                             mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage,
                             P_full_O_rescaled_phase,
                         )
-                        # 3. gemm
+                        # 3. gemm: Compute P*V -> O (accumulate into output)
                         # SM120: Using SM90-style GEMM with register accumulator
+                        # O accumulator stays in registers for efficient accumulation
                         tOrVi = tOrV[None, None, None, Vi_index]
                         gemm_w_idx(
                             tiled_mma_pv,
@@ -1454,14 +1483,18 @@ class FlashAttentionForwardSm120:
                         # must have been done as well.
                         # with cute.arch.elect_one():
                         #     tcgen05.commit(mbar_ptr + self.mbar_O_full_offset + stage)
-                        # 5. release V(i-1)
+                        # 5. release V(i-1) (allow DMA pipeline to load next V tile)
                         if const_expr(stage == 1):
                             pipeline_kv.consumer_release(mma_kv_release_state)
                             mma_kv_release_state.advance()
                         # End of GEMM_PV00 (P0 * V0 -> O0_partial)
 
-                        # GEMM_QK0i (Q0 * Ki -> S0)
-                        # 1. wait for Ki
+                        # ====================================================================
+                        # Sub-phase 2b: Bmm1 computation (Q * K -> S) for next iteration
+                        # ====================================================================
+                        # Compute Q*K^T for the next iteration. This overlaps with the
+                        # current iteration's P*V computation, maximizing pipeline utilization.
+                        # 1. wait for Ki (DMA pipeline coordination)
                         if const_expr(stage == 0):
                             mma_kv_consumer_state.advance()
                             pipeline_kv.consumer_wait(mma_kv_consumer_state)
@@ -1469,7 +1502,7 @@ class FlashAttentionForwardSm120:
                             mma_kv_consumer_state.index,
                             mma_kv_consumer_state.phase,
                         )
-                        # 2. gemm
+                        # 2. gemm: Compute Q*K^T -> S (attention scores for next iteration)
                         # Don't need to wait for the softmax warp to have finished reading the previous
                         # Si, since this gemm is scheduled after the PV gemm, which guaranteed that Si
                         # has been read and Pi has been written.
@@ -1486,41 +1519,47 @@ class FlashAttentionForwardSm120:
                             wg_wait=-1,
                         )
                         # SM120: Store S accumulator from registers to shared memory
+                        # This allows softmax warps to start processing while MMA continues
                         cute.copy(thr_smem_store_S, tSrS_regs[stage], tSsS_stages[stage])
                         cute.arch.fence_proxy(
                             cute.arch.ProxyKind.async_shared,
                             space=cute.arch.SharedSpace.shared_cta,
                         )
-                        # 3. release S0
+                        # 3. release S0 (signal softmax pipeline that data is ready)
                         # SM120: Using regular mbarrier instead of tcgen05.commit
                         with cute.arch.elect_one():
                             cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_S_full_offset + stage)
                         # End of GEMM_QK0i (Q0 * Ki -> S0)
-                    # 4. release Ki
+                    # 4. release Ki (allow DMA pipeline to load next K tile)
                     pipeline_kv.consumer_release(mma_kv_consumer_state)
                     mma_kv_consumer_state.advance()
                     P_full_O_rescaled_phase ^= 1
                     O_should_accumulate = True
-                # End of seqlen_kv loop
+                # End of steady state loop (iterations 1 to Tc-1)
 
-                # release Q0 & Q1
+                # Release Q0 & Q1 (allow DMA pipeline to load next Q tiles for next work tile)
                 # SM120: Using regular mbarrier instead of tcgen05.commit
                 with cute.arch.elect_one():
                     for stage in cutlass.range_constexpr(self.q_stage):
                         cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_load_q_empty_offset + stage)
 
+                # ========================================================================
+                # Phase 3: Final iteration (Tc) - Complete computation and prepare for epilogue
+                # ========================================================================
+                # This phase completes the final attention computation and signals that
+                # the output O is ready for the epilogue pipeline to store to global memory.
                 # GEMM_PV00 (P0 * V0 -> O0_partial), O0 needs to be accumulated in the seqlen_kv loop
-                # 1. wait for V0
+                # 1. wait for V0 (final V tile)
                 pipeline_kv.consumer_wait(mma_kv_consumer_state)
                 Vi_index, Vi_phase = mma_kv_consumer_state.index, mma_kv_consumer_state.phase
                 tOrVi = tOrV[None, None, None, Vi_index]
                 for stage in cutlass.range_constexpr(2):
-                    # 2. acquire corrected Oi_partial and Pi
+                    # 2. acquire corrected Oi_partial and Pi (wait for correction pipeline)
                     cute.arch.mbarrier_wait(
                         mbar_ptr + self.mbar_P_full_O_rescaled_offset + stage,
                         P_full_O_rescaled_phase,
                     )
-                    # 3. gemm
+                    # 3. gemm: Final P*V computation (complete O accumulation)
                     # SM120: Using SM90-style GEMM with register accumulator
                     tOrVi = tOrV[None, None, None, Vi_index]
                     gemm_w_idx(
@@ -1533,7 +1572,7 @@ class FlashAttentionForwardSm120:
                         zero_init=Boolean(not O_should_accumulate),
                         wg_wait=-1,
                     )
-                    # 4. release accumulated O0_partial
+                    # 4. release accumulated O0_partial (signal epilogue pipeline)
                     # We do need O_full here since for the last tile, by the time the softmax warp
                     # has signaled to the correction warp, the softmax warp has just finished compute
                     # the row sum of the current tile. It does not guarantee that the 1st tile
@@ -1543,7 +1582,7 @@ class FlashAttentionForwardSm120:
                         cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_O_full_offset + stage)
                     # End of GEMM_PV00 (P0 * V0 -> O0_partial)
                 P_full_O_rescaled_phase ^= 1
-                # 5. release Vi_end
+                # 5. release Vi_end (final V tile, allow DMA pipeline to proceed)
                 pipeline_kv.consumer_release(mma_kv_consumer_state)
                 mma_kv_consumer_state.advance()
                 # End of GEMM_PV1(i_end) (P1 * Vi_end -> O1)
