@@ -5,8 +5,6 @@ import cutlass
 import cutlass.cute as cute
 import torch
 from cutlass import Boolean, Int8, Int32, Uint32, const_expr
-from cutlass.cute import FastDivmodDivisor
-from cutlass.cute.runtime import from_dlpack
 
 from flash_attn.cute.block_sparsity import (
     BlockSparseTensors,
