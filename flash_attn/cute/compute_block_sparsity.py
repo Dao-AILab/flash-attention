@@ -37,6 +37,7 @@ class BlockSparsityKernel:
     TODO:
         - optimize mask_mod evaluation
         - varlen support
+        - transposed tensors for bwd pass
     """
 
     def __init__(
@@ -80,12 +81,6 @@ class BlockSparsityKernel:
             num_threads = self.tile_mn[0]
             self.num_warps = (num_threads + 32 - 1) // 32
 
-        fastdiv_mods = None
-        if const_expr(aux_tensors is not None):
-            seqlen_q_divmod = FastDivmodDivisor(seqlen_q)
-            seqlen_k_divmod = FastDivmodDivisor(seqlen_k)
-            fastdiv_mods = (seqlen_q_divmod, seqlen_k_divmod)
-
         self.kernel(
             self.mask_cnt,
             self.mask_idx,
@@ -95,7 +90,6 @@ class BlockSparsityKernel:
             seqlen_q,
             seqlen_k,
             aux_tensors,
-            fastdiv_mods,
         ).launch(grid=grid, block=[num_threads, 1, 1])
 
     @cute.kernel
@@ -109,7 +103,6 @@ class BlockSparsityKernel:
         seqlen_q: Int32,
         seqlen_k: Int32,
         aux_tensors: Optional[list] = None,
-        fastdiv_mods=None,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         warp_idx = cute.arch.warp_idx()
