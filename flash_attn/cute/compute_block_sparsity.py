@@ -26,12 +26,6 @@ class BlockSparsityKernel:
     When use_fast_sampling=True, uses 5-point sampling (4 corners + center)
     which is much faster but only suitable for masks where this is sufficient.
 
-    The kernel consists of two phases:
-        1. Evaluate mask_mod to determine if each block has masked values and if each block has unmasked values
-        2. Compact the resulting Int8 tensors to
-            a. count the number of masked and full blocks and
-            b. find indices of those blocks
-
     TODO:
         - optimize mask_mod evaluation
         - varlen support
@@ -51,7 +45,6 @@ class BlockSparsityKernel:
         self.compute_full_blocks = compute_full_blocks
         self.use_aux_tensors = use_aux_tensors
         self.use_fast_sampling = use_fast_sampling
-        self.MAX_N_BLOCKS = 1024
 
     @cute.jit
     def __call__(
@@ -61,19 +54,19 @@ class BlockSparsityKernel:
         seqlen_k: Int32,
         aux_tensors: Optional[list] = None,
     ):
-        (self.mask_cnt, self.mask_idx, self.full_cnt, self.full_idx) = blocksparse_tensors
+        self.mask_cnt, self.mask_idx, self.full_cnt, self.full_idx = blocksparse_tensors
 
         if const_expr(self.compute_full_blocks):
             assert self.full_cnt is not None and self.full_idx is not None, (
                 "full block tensors must be provided when computing full blocks"
             )
 
-        batch_size, num_heads, num_m_blocks, num_n_blocks = list(self.mask_idx.shape)
+        batch_size, num_heads, num_m_blocks, num_n_blocks = self.mask_idx.shape
         # launch 1 CTA per m block
         grid = [num_m_blocks, num_heads, batch_size]
 
         if const_expr(self.use_fast_sampling):
-            num_threads = 32
+            num_threads = 5
             self.num_warps = 1
         else:
             num_threads = self.tile_mn[0]
@@ -124,11 +117,6 @@ class BlockSparsityKernel:
             reduction_buffer_smem: cute.struct.Align[
                 cute.struct.MemRange[cutlass.Int8, 2 * self.num_warps], 1024
             ]
-            # Boolean arrays for classification results
-            is_partial_smem: cute.struct.MemRange[cutlass.Int8, self.MAX_N_BLOCKS]
-            is_full_smem: cute.struct.MemRange[cutlass.Int8, self.MAX_N_BLOCKS]
-            # Per-warp counts for prefix sum (1 partial + 1 full)
-            warp_counts: cute.struct.MemRange[cutlass.Int32, cute.arch.WARP_SIZE * 2]
 
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(SharedStorage, 16)
@@ -136,11 +124,10 @@ class BlockSparsityKernel:
         reduction_buffer = storage.reduction_buffer_smem.get_tensor(
             cute.make_layout((self.num_warps, 2))
         )
-        is_partial_smem = storage.is_partial_smem.get_tensor(cute.make_layout(num_n_blocks))
-        is_full_smem = storage.is_full_smem.get_tensor(cute.make_layout(num_n_blocks))
-        warp_counts = storage.warp_counts.get_tensor(cute.make_layout((32, 2)))
 
-        # -------- PHASE 1: classification ---------
+        num_mask_blocks = Int32(0)
+        num_full_blocks = Int32(0)
+
         for n_block in cutlass.range(num_n_blocks, unroll_full=True):
             m_base = m_block * self.tile_mn[0]
             n_base = n_block * self.tile_mn[1]
@@ -264,101 +251,27 @@ class BlockSparsityKernel:
                         if reduction_buffer[w, 1]:
                             has_masked = Boolean(True)
 
+            # Only thread 0 updates the output arrays (common to both paths)
             if tidx == 0:
+                # Block classification based on what we found:
+                # - If has_masked and has_unmasked: partial block (needs masking)
+                # - If only has_unmasked: full block (no masking needed)
+                # - If only has_masked: skip this block entirely
                 is_partial = Boolean(has_masked and has_unmasked)
                 is_full = Boolean(has_unmasked and (not has_masked))
-                is_partial_smem[n_block] = Int8(1) if is_partial else Int8(0)
-                if const_expr(self.compute_full_blocks):
-                    is_full_smem[n_block] = Int8(1) if is_full else Int8(0)
 
-        cute.arch.sync_threads()
+                if is_partial:
+                    mask_idx[batch_idx, head_idx, m_block, num_mask_blocks] = n_block
+                    num_mask_blocks += 1
+                elif is_full and const_expr(self.compute_full_blocks):
+                    full_idx[batch_idx, head_idx, m_block, num_full_blocks] = n_block
+                    num_full_blocks += 1
 
-        # -------- PHASE 2: parallel compaction ---------
-
-        # Process in chunks of 32
-        # Each warp handles every Nth chunk, where N = num_warps
-        num_chunks = (num_n_blocks + 31) // 32
-
-        # First pass: count per-warp totals
-        partial_count = Int32(0)
-        full_count = Int32(0)
-
-        for chunk_base in cutlass.range(
-            (num_chunks + self.num_warps - 1) // self.num_warps, unroll_full=True
-        ):
-            chunk_idx = chunk_base * self.num_warps + warp_idx
-            elem_idx = chunk_idx * 32 + lane_id
-
-            is_partial_val = Boolean(False)
-            is_full_val = Boolean(False)
-            if elem_idx < num_n_blocks:
-                is_partial_val = is_partial_smem[elem_idx] != Int8(0)
-                if const_expr(self.compute_full_blocks):
-                    is_full_val = is_full_smem[elem_idx] != Int8(0)
-
-            partial_mask = cute.arch.vote_ballot_sync(is_partial_val)
-            partial_count += cute.arch.popc(partial_mask)
-
-            if const_expr(self.compute_full_blocks):
-                full_mask = cute.arch.vote_ballot_sync(is_full_val)
-                full_count += cute.arch.popc(full_mask)
-
-        if lane_id == 0:
-            warp_counts[warp_idx, 0] = partial_count
-            if const_expr(self.compute_full_blocks):
-                warp_counts[warp_idx, 1] = full_count
-
-        cute.arch.sync_threads()
-
-        # Compute prefix sum of warp counts
+        # Only thread 0 writes back the counts
         if tidx == 0:
-            running_partial = Int32(0)
-            running_full = Int32(0)
-            for warp in cutlass.range(self.num_warps):
-                temp_partial = warp_counts[warp, 0]
-                warp_counts[warp, 0] = running_partial
-                running_partial += temp_partial
-                if const_expr(self.compute_full_blocks):
-                    temp_full = warp_counts[warp, 1]
-                    warp_counts[warp, 1] = running_full
-                    running_full += temp_full
-            # Write final counts
-            mask_cnt[batch_idx, head_idx, m_block] = running_partial
+            mask_cnt[batch_idx, head_idx, m_block] = num_mask_blocks
             if const_expr(self.compute_full_blocks):
-                full_cnt[batch_idx, head_idx, m_block] = running_full
-        cute.arch.sync_threads()
-
-        # Second pass: write indices using prefix sums
-        partial_offset = warp_counts[warp_idx, 0]
-        full_offset = warp_counts[warp_idx, 1] if const_expr(self.compute_full_blocks) else Int32(0)
-        for chunk_base in cutlass.range(
-            (num_chunks + self.num_warps - 1) // self.num_warps, unroll_full=True
-        ):
-            chunk_idx = chunk_base * self.num_warps + warp_idx
-            elem_idx = chunk_idx * 32 + lane_id
-
-            is_partial_val = Boolean(False)
-            is_full_val = Boolean(False)
-            # Clamp
-            if elem_idx < num_n_blocks:
-                is_partial_val = is_partial_smem[elem_idx] != Int8(0)
-                if const_expr(self.compute_full_blocks):
-                    is_full_val = is_full_smem[elem_idx] != Int8(0)
-
-            # Partial blocks
-            partial_mask = cute.arch.vote_ballot_sync(is_partial_val)
-            if is_partial_val:
-                lane_offset = cute.arch.popc(partial_mask & ((Uint32(1) << lane_id) - 1))
-                mask_idx[batch_idx, head_idx, m_block, partial_offset + lane_offset] = elem_idx
-            partial_offset += cute.arch.popc(partial_mask)
-
-            # Full blocks
-            if const_expr(self.compute_full_blocks):
-                full_mask = cute.arch.vote_ballot_sync(is_full_val)
-                if is_full_val:
-                    lane_offset = cute.arch.popc(full_mask & ((Uint32(1) << lane_id) - 1))
-                    full_idx[batch_idx, head_idx, m_block, full_offset + lane_offset] = elem_idx
-                full_offset += cute.arch.popc(full_mask)
+                full_cnt[batch_idx, head_idx, m_block] = num_full_blocks
 
 
 def compute_block_sparsity(
@@ -394,7 +307,7 @@ def compute_block_sparsity(
         A tuple of `BlockSparseTensors` and `BlockSparseTensorsTorch`.
     """
     # Check if mask_mod is marked as suitable for 5-point fast sampling
-    use_fast_sampling = getattr(mask_mod, "use_fast_sampling", False)
+    use_fast_sampling = getattr(mask_mod, "use_fast_sampling", use_fast_sampling)
 
     num_m_blocks = (seqlen_q + tile_m - 1) // tile_m
     num_n_blocks = (seqlen_k + tile_n - 1) // tile_n

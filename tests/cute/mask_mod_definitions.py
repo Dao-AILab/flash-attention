@@ -35,8 +35,10 @@ def cute_causal_mask(
     offset_ssa = utils.scalar_to_ssa(offset, cutlass.Int32)
     return n_idx <= (m_idx + offset_ssa)
 
+
 def get_cute_causal_mask(offset: int):
     return cute_causal_mask
+
 
 def get_cute_block_causal_mask(offset: int):
     @fast_sampling
@@ -122,6 +124,7 @@ def cute_prefix_lm_mask(
     both_in_prefix = (m_idx < prefix_size_ssa) & (n_idx < prefix_size_ssa)
     causal_part = m_idx >= n_idx
     return both_in_prefix | causal_part
+
 
 @cute.jit
 def cute_dilated_sliding_window_mask(

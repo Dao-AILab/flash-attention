@@ -24,7 +24,7 @@ def _call_compute_block_sparsity(
     cute_mask, _ = get_mask_pair(
         mask_name, seqlen_q=seqlen_q, seqlen_k=seqlen_k, window_size=window_size
     )
-    blocksparse_tensors, torch_tensors = compute_block_sparsity(
+    _, torch_tensors = compute_block_sparsity(
         tile_m=tile_m,
         tile_n=tile_n,
         batch_size=batch_size,
@@ -121,16 +121,24 @@ def _compare_block_sparsity(
                     )
 
                 # Check non-boundary blocks match exactly
-                non_boundary_cute_full = {n for n in cute_full_set if not is_boundary_affected(n)}
-                non_boundary_ref_full = {n for n in ref_full_set if not is_boundary_affected(n)}
+                non_boundary_cute_full = {
+                    n for n in cute_full_set if not is_boundary_affected(n)
+                }
+                non_boundary_ref_full = {
+                    n for n in ref_full_set if not is_boundary_affected(n)
+                }
                 if non_boundary_cute_full != non_boundary_ref_full:
                     return False, (
                         f"Non-boundary full block mismatch at [{b},{h},{m}]: "
                         f"CuTe={sorted(non_boundary_cute_full)}, ref={sorted(non_boundary_ref_full)}"
                     )
 
-                non_boundary_cute_mask = {n for n in cute_mask_set if not is_boundary_affected(n)}
-                non_boundary_ref_mask = {n for n in ref_mask_set if not is_boundary_affected(n)}
+                non_boundary_cute_mask = {
+                    n for n in cute_mask_set if not is_boundary_affected(n)
+                }
+                non_boundary_ref_mask = {
+                    n for n in ref_mask_set if not is_boundary_affected(n)
+                }
                 if non_boundary_cute_mask != non_boundary_ref_mask:
                     return False, (
                         f"Non-boundary partial block mismatch at [{b},{h},{m}]: "
@@ -156,6 +164,7 @@ SEQLEN_PAIRS = [
     (1024, 1024),
     (2048, 2048),
     (4096, 4096),
+    (8192, 8192),
     # Large unaligned
     (1000, 1000),
     (2000, 2000),
@@ -177,22 +186,22 @@ TILE_SIZES = [
     (64, 64),
     (128, 128),
     (256, 256),
-    # # Rectangular
-    # (32, 64),
-    # (64, 32),
-    # (64, 128),
-    # (128, 64),
-    # (128, 256),
-    # (256, 128),
-    # # Unusual sizes
-    # (40, 40),
-    # (48, 48),
-    # (96, 96),
-    # (112, 112),
-    # (32, 128),
-    # (128, 32),
-    # (40, 96),
-    # (96, 40),
+    # Rectangular
+    (32, 64),
+    (64, 32),
+    (64, 128),
+    (128, 64),
+    (128, 256),
+    (256, 128),
+    # Unusual sizes
+    (40, 40),
+    (48, 48),
+    (96, 96),
+    (112, 112),
+    (32, 128),
+    (128, 32),
+    (40, 96),
+    (96, 40),
 ]
 
 
@@ -267,9 +276,6 @@ def test_fixed_length_masks(
         tile_m,
         tile_n,
     )
-
-    # if seqlen_unaligned and not all_match:
-    #     pytest.skip(f"Skipping at seqlen extreme: {error_msg}")
     assert all_match, f"Mismatch: {error_msg}"
 
 
@@ -289,8 +295,6 @@ def test_parameterized_masks(
     """Test parameterized masks."""
     if mask_name == "sliding_window" and seqlen_q > seqlen_k:
         pytest.skip("Sliding window not supported for seqlen_q > seqlen_k")
-
-    seqlen_unaligned = (seqlen_q % tile_m != 0) or (seqlen_k % tile_n != 0)
 
     mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx = (
         _call_compute_block_sparsity(
@@ -343,6 +347,7 @@ def test_parameterized_masks(
         tile_m,
         tile_n,
     )
+
     assert all_match, f"Mismatch: {error_msg}"
 
 
@@ -409,9 +414,6 @@ def test_edge_cases(seqlen_q, seqlen_k, tile_m, tile_n):
         tile_m,
         tile_n,
     )
-
-    # if seqlen_unaligned and not all_match:
-    #     pytest.skip(f"Skipping at seqlen extreme: {error_msg}")
     assert all_match, f"Mismatch: {error_msg}"
 
 
@@ -476,56 +478,8 @@ def test_fast_sampling(seqlen_q, seqlen_k, tile_m, tile_n, nheads, mask_name):
         tile_n,
     )
 
-    # if seqlen_unaligned and not all_match:
-    #     pytest.skip(f"Skipping at seqlen extreme: {error_msg}")
     assert all_match, f"Mismatch: {error_msg}"
 
 
-def main(
-    seqlen_q, seqlen_k, tile_m, tile_n, nheads, mask_name
-):
-    batch_size = 1
-    seqlen_unaligned = (seqlen_q % tile_m != 0) or (seqlen_k % tile_n != 0)
-
-    mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx = (
-        _call_compute_block_sparsity(
-            batch_size,
-            nheads,
-            seqlen_q,
-            seqlen_k,
-            tile_m,
-            tile_n,
-            mask_name,
-            use_fast_sampling=False,
-        )
-    )
-
-    _, mask_mod_flex = get_mask_pair(mask_name, seqlen_q=seqlen_q, seqlen_k=seqlen_k)
-    block_mask = create_block_mask(
-        mask_mod_flex,
-        B=batch_size,
-        H=nheads,
-        Q_LEN=seqlen_q,
-        KV_LEN=seqlen_k,
-        device="cuda",
-        BLOCK_SIZE=(tile_m, tile_n),
-    )
-    (
-        _,
-        _,
-        mask_block_cnt_ref,
-        mask_block_idx_ref,
-        full_block_cnt_ref,
-        full_block_idx_ref,
-        *_,
-    ) = block_mask.as_tuple()
-
-if __name__=="__main__":
-    main(
-        seqlen_q=128,
-        seqlen_k=512,
-        tile_m=64,
-        tile_n=64,
-        nheads=1,
-        mask_name="mini_causal",
-    )
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])
