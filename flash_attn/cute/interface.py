@@ -686,8 +686,8 @@ def _flash_attn_bwd(
     qhead_per_kvhead = num_head // num_head_kv
     if pack_gqa is None:
         pack_gqa = qhead_per_kvhead > 1
-    if compute_capability == 10:
-        pack_gqa = False # override for now
+    # pack_gqa backward not yet supported on SM90 or SM100
+    pack_gqa = False
     if compute_capability != 10:
         assert deterministic is False, "bwd deterministic only supported for sm100 for now"
 
@@ -697,7 +697,6 @@ def _flash_attn_bwd(
         assert cu_seqlens_q is None and cu_seqlens_k is None, (
             "varlen + score_mod not supported in bwd yet"
         )
-        assert compute_capability == 10, "score_mod in bwd only supported on SM100 for now"
 
     device = q.device
     out_torch_dtype = q.dtype
@@ -848,6 +847,14 @@ def _flash_attn_bwd(
     )
 
     # Backward kernel: compute dk, dv, dq_accum.
+    score_mod_hash = utils.hash_callable(score_mod) if score_mod else False
+    score_mod_bwd_hash = utils.hash_callable(score_mod_bwd) if score_mod_bwd else False
+    mask_mod_hash = utils.hash_callable(mask_mod) if mask_mod else False
+    num_aux_tensors = len(aux_tensors) if aux_tensors else 0
+    cute_aux_tensors = None
+    if aux_tensors is not None:
+        cute_aux_tensors = [from_dlpack(buf).mark_layout_dynamic() for buf in aux_tensors]
+
     if compute_capability == 9:
         compile_key = (
             compute_capability,
@@ -870,18 +877,13 @@ def _flash_attn_bwd(
             AtomLayoutNdKV,
             AtomLayoutMdQ,
             V_in_regs,
+            score_mod_hash,
+            score_mod_bwd_hash,
+            mask_mod_hash,
+            num_aux_tensors,
             use_block_sparsity,
         )
     else:
-        # Hash callables for compile key
-        score_mod_hash = utils.hash_callable(score_mod) if score_mod else False
-        score_mod_bwd_hash = utils.hash_callable(score_mod_bwd) if score_mod_bwd else False
-        mask_mod_hash = utils.hash_callable(mask_mod) if mask_mod else False
-        num_aux_tensors = len(aux_tensors) if aux_tensors else 0
-        # Convert aux_tensors to cute tensors
-        cute_aux_tensors = None
-        if aux_tensors is not None:
-            cute_aux_tensors = [from_dlpack(buf).mark_layout_dynamic() for buf in aux_tensors]
         compile_key = (
             compute_capability,
             dtype,
@@ -965,6 +967,10 @@ def _flash_attn_bwd(
                 AtomLayoutMdQ,
                 num_threads,
                 V_in_regs=V_in_regs,
+                score_mod=score_mod,
+                score_mod_bwd=score_mod_bwd,
+                mask_mod=mask_mod,
+                has_aux_tensors=aux_tensors is not None and len(aux_tensors) > 0,
                 subtile_factor=1,
             )
         else:
@@ -1031,11 +1037,10 @@ def _flash_attn_bwd(
             options="--enable-tvm-ffi",
         )
     normalized_block_sparse_tensors = None
-    if block_sparse_tensors is not None:
-        bwd_subtile_factor = subtile_factor if compute_capability == 10 else 1
+    if block_sparse_tensors is not None and compute_capability == 10:
         expected_count_shape, expected_index_shape = get_block_sparse_expected_shapes_bwd(
             batch_size, num_head, seqlen_q, seqlen_k,
-            m_block_size, n_block_size, bwd_subtile_factor,
+            m_block_size, n_block_size, subtile_factor,
         )
         normalized_block_sparse_tensors = normalize_block_sparse_tensors(
             block_sparse_tensors,
@@ -1070,8 +1075,9 @@ def _flash_attn_bwd(
     )
 
     num_threads = 256 if compute_capability == 9 else 128
+    arch = compute_capability * 10
     # Postprocess kernel: convert dq_accum from float32 to dq in bf16/fp16
-    compile_key_post = (dtype, head_dim, m_block_size, num_threads, AtomLayoutMdQ, dQ_swapAB)
+    compile_key_post = (dtype, head_dim, arch, m_block_size, num_threads, AtomLayoutMdQ, dQ_swapAB)
     if compile_key_post not in _flash_attn_bwd.compile_cache_post:
         dq_accum_tensor = to_cute_tensor(dq_accum)
         dq_tensor = to_cute_tensor(dq)
@@ -1079,7 +1085,6 @@ def _flash_attn_bwd(
             to_cute_tensor(t, assumed_align=4) if t is not None else None
             for t in (cu_seqlens_q, seqused_q)
         ]
-        arch = compute_capability * 10
         fa_bwd_post = FlashAttentionBackwardPostprocess(
             dtype, head_dim, arch, m_block_size, num_threads, AtomLayoutMdQ, dQ_swapAB
         )
@@ -1105,7 +1110,7 @@ def _flash_attn_bwd(
 
     if qhead_per_kvhead > 1:
         # Postprocess kernel: convert dk_accum & dv_accum from float32 to bf16/fp16
-        compile_key_post = (dtype, head_dim, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB)
+        compile_key_post = (dtype, head_dim, arch, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB)
         if compile_key_post not in _flash_attn_bwd.compile_cache_post:
             dk_accum_tensor = to_cute_tensor(dk_accum)
             dk_tensor = to_cute_tensor(dk)
@@ -1114,7 +1119,7 @@ def _flash_attn_bwd(
                 for t in (cu_seqlens_k, seqused_k)
             ]
             fa_bwd_post = FlashAttentionBackwardPostprocess(
-                dtype, head_dim, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB
+                dtype, head_dim, arch, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB
             )
             # TODO: check @can_implement
             _flash_attn_bwd.compile_cache_post[compile_key_post] = cute.compile(
@@ -1138,6 +1143,7 @@ def _flash_attn_bwd(
         compile_key_post = (
             dtype,
             head_dim_v,
+            arch,
             n_block_size,
             num_threads,
             AtomLayoutNdKV,
@@ -1151,7 +1157,7 @@ def _flash_attn_bwd(
                 for t in (cu_seqlens_k, seqused_k)
             ]
             fa_bwd_post = FlashAttentionBackwardPostprocess(
-                dtype, head_dim_v, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB
+                dtype, head_dim_v, arch, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB
             )
             # TODO: check @can_implement
             _flash_attn_bwd.compile_cache_post[compile_key_post] = cute.compile(

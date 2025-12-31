@@ -528,7 +528,7 @@ def shuffle_sync(
     clamp = cute.arch.WARP_SIZE - 1
     mask_and_clamp = mask << 8 | clamp
     # important: need stride 1 and not 0 for recast_tensor to work
-    val = cute.make_rmem_tensor(cute.make_layout((1, ), stride=(1, )), type(value))
+    val = cute.make_rmem_tensor(cute.make_layout((1,), stride=(1,)), type(value))
     val[0] = value
     val_i32 = cute.recast_tensor(val, cutlass.Int32)
     for i in cutlass.range_constexpr(cute.size(val_i32)):
