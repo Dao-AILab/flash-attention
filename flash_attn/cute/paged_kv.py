@@ -168,10 +168,13 @@ class PagedKVManager(ParamsBase):
         cX = cute.make_identity_tensor((self.n_block_size, head_dim))
         tXsX = self.gmem_thr_copy_KV.partition_D(sX_pi)
         tXcX = self.gmem_thr_copy_KV.partition_S(cX)
+        tXc0X = self.gmem_thr_copy_KV.get_slice(0).partition_S(cX)
 
-        seqlenk_row_limit = self.seqlen_k - n_block * self.n_block_size if n_block >= 0 else 0
+        seqlenk_row_limit = (
+            self.seqlen_k - n_block * self.n_block_size - tXcX[0][0] if n_block >= 0 else 0
+        )
         for m in cutlass.range(cute.size(tXsX, mode=[1]), unroll=1):
-            should_load = tXcX[0, m, 0][0] < seqlenk_row_limit
+            should_load = tXc0X[0, m, 0][0] < seqlenk_row_limit
 
             x_ptr_i64 = utils.shuffle_sync(
                 tPrXPtr[m // self.gmem_threads_per_row],
