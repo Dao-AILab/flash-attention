@@ -2502,6 +2502,19 @@ class FlashAttentionForwardSm120(FlashAttentionForwardSm90):
 
         return tiled_mma_qk, tiled_mma_pv, tiled_mma_pv
 
+    def _get_smem_layout_atom(self):
+        # SM120 doesn't support warpgroup, so use SM80-style smem layout atoms
+        # SM120 uses warp-level MMA similar to SM80, so we can use the same layout atom creation
+        sQ_layout_atom = sm80_utils.get_smem_layout_atom(self.dtype, self.tile_hdim)
+        sK_layout_atom = sQ_layout_atom
+        sV_layout_atom = sm80_utils.get_smem_layout_atom(self.dtype, self.tile_hdimv)
+        sO_layout_atom = sV_layout_atom
+        if not self.mma_pv_is_rs:
+            sP_layout_atom = sm80_utils.get_smem_layout_atom(self.dtype, self.tile_n)
+        else:
+            sP_layout_atom = None
+        return sQ_layout_atom, sK_layout_atom, sV_layout_atom, sO_layout_atom, sP_layout_atom
+
     def _setup_attributes(self):
         super()._setup_attributes()
 
@@ -2558,6 +2571,122 @@ class FlashAttentionForwardSm120(FlashAttentionForwardSm90):
 
         for k in cutlass.range_constexpr(cute.size(rA.shape[2])):
             cute.gemm(tiled_mma, acc, rA[None, None, k], rB[None, None, k], acc)
+
+    @cute.jit
+    def mma_one_n_block(
+            self,
+            smem_pipe_read: cutlass.pipeline.PipelineState | pipeline.PipelineStateSimple,
+            n_block: Int32,
+            mma_qk_fn: Callable,
+            mma_pv_fn: Callable,
+            tiled_mma_pv_rs: cute.TiledMma,
+            pipeline_k: cutlass.pipeline.PipelineAsync,
+            pipeline_v: cutlass.pipeline.PipelineAsync,
+            acc_O: cute.Tensor,
+            tOrP: cute.Tensor,
+            smem_copy_params: SimpleNamespace,
+            softmax: Softmax,
+            seqlen: SeqlenInfoQK,
+            score_mod_fn: Optional[Callable] = None,
+            mask_fn: Optional[Callable] = None,
+            is_first_n_block: cutlass.Constexpr = False,
+            check_inf: cutlass.Constexpr = True,
+    ):
+        """Override to remove warpgroup.wait_group() calls for SM120."""
+        pipeline_k.consumer_wait(smem_pipe_read, pipeline_k.consumer_try_wait(smem_pipe_read))
+        # S = Q @ K.T
+        acc_S = mma_qk_fn(B_idx=smem_pipe_read.index, wg_wait=-1)
+        self.warp_scheduler_barrier_arrive()
+        # SM120 doesn't support warpgroup, so use sync_warp instead
+        cute.arch.sync_warp()
+        pipeline_k.consumer_release(smem_pipe_read)
+
+        # handle score mods and masking
+        if const_expr(score_mod_fn is not None):
+            score_mod_fn(acc_S, n_block=n_block, seqlen=seqlen)
+        if const_expr(mask_fn is not None):
+            mask_fn(acc_S=acc_S, n_block=n_block)
+
+        row_scale = softmax.online_softmax(acc_S, is_first=is_first_n_block, check_inf=check_inf)
+        tOrP_acc = cute.make_tensor(acc_S.iterator, utils.convert_layout_acc_frgA(acc_S.layout))
+        tOrP_cur = (
+            tOrP if const_expr(self.mma_pv_is_rs) else cute.make_fragment_like(tOrP_acc, self.dtype)
+        )
+        utils.cvt_f16(tOrP_acc, tOrP_cur)
+        if const_expr(not self.mma_pv_is_rs):
+            tPrP = smem_copy_params.smem_thr_copy_P.retile(tOrP_cur)
+            cute.copy(smem_copy_params.smem_thr_copy_P, tPrP, smem_copy_params.tPsP)
+        softmax.rescale_O(acc_O, row_scale)
+        if const_expr(not self.mma_pv_is_rs):
+            # Fence and barrier to make sure smem store is visible
+            cute.arch.fence_proxy(ProxyKind.async_shared, space=SharedSpace.shared_cta)
+            cute.arch.sync_warp()
+        pipeline_v.consumer_wait(smem_pipe_read, pipeline_v.consumer_try_wait(smem_pipe_read))
+        self.warp_scheduler_barrier_sync()
+        # O += P @ V
+        mma_pv_fn(B_idx=smem_pipe_read.index, wg_wait=0)
+        pipeline_v.consumer_release(smem_pipe_read)
+        smem_pipe_read.advance()
+        return smem_pipe_read
+
+    @cute.jit
+    def mma_one_n_block_intrawg_overlap(
+            self,
+            smem_pipe_read: cutlass.pipeline.PipelineState | pipeline.PipelineStateSimple,
+            n_block: Int32,
+            mma_qk_fn: Callable,
+            mma_pv_fn: Callable,
+            tiled_mma_pv_rs: cute.TiledMma,
+            pipeline_k: cutlass.pipeline.PipelineAsync,
+            pipeline_v: cutlass.pipeline.PipelineAsync,
+            acc_O: cute.Tensor,
+            tOrP: cute.Tensor,
+            smem_copy_params: SimpleNamespace,
+            softmax: Softmax,
+            seqlen: SeqlenInfoQK,
+            score_mod_fn: Optional[Callable] = None,
+            mask_fn: Optional[Callable] = None,
+            check_inf: cutlass.Constexpr = True,
+    ):
+        """Override to remove warpgroup.wait_group() calls for SM120."""
+        smem_pipe_read_v = smem_pipe_read.clone()
+        smem_pipe_read.advance()
+        pipeline_k.consumer_wait(smem_pipe_read, pipeline_k.consumer_try_wait(smem_pipe_read))
+        self.warp_scheduler_barrier_sync()
+        # S = Q @ K.T
+        acc_S = mma_qk_fn(B_idx=smem_pipe_read.index, wg_wait=-1)
+        pipeline_v.consumer_wait(smem_pipe_read_v, pipeline_v.consumer_try_wait(smem_pipe_read_v))
+        # O += P @ V
+        mma_pv_fn(B_idx=smem_pipe_read_v.index, wg_wait=-1)
+        self.warp_scheduler_barrier_arrive()
+        # SM120 doesn't support warpgroup, so use sync_warp instead
+        cute.arch.sync_warp()
+        pipeline_k.consumer_release(smem_pipe_read)
+
+        # handle score mods and masking
+        if const_expr(score_mod_fn is not None):
+            score_mod_fn(acc_S, n_block=n_block, seqlen=seqlen)
+        if const_expr(mask_fn is not None):
+            mask_fn(acc_S=acc_S, n_block=n_block)
+
+        row_scale = softmax.online_softmax(acc_S, check_inf=check_inf)
+        # SM120 doesn't support warpgroup, so use sync_warp instead
+        cute.arch.sync_warp()
+        pipeline_v.consumer_release(smem_pipe_read_v)
+        tOrP_acc = cute.make_tensor(acc_S.iterator, utils.convert_layout_acc_frgA(acc_S.layout))
+        tOrP_cur = (
+            tOrP if const_expr(self.mma_pv_is_rs) else cute.make_fragment_like(tOrP_acc, self.dtype)
+        )
+        utils.cvt_f16(tOrP_acc, tOrP_cur)
+        if const_expr(not self.mma_pv_is_rs):
+            tPrP = smem_copy_params.smem_thr_copy_P.retile(tOrP_cur)
+            cute.copy(smem_copy_params.smem_thr_copy_P, tPrP, smem_copy_params.tPsP)
+        softmax.rescale_O(acc_O, row_scale)
+        if const_expr(not self.mma_pv_is_rs):
+            # Fence and barrier to make sure smem store is visible
+            cute.arch.fence_proxy(ProxyKind.async_shared, space=SharedSpace.shared_cta)
+            cute.arch.sync_warp()
+        return smem_pipe_read
 
     @cute.jit
     def mma(
