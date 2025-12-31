@@ -625,6 +625,7 @@ if not SKIP_CUDA_BUILD:
                 "cxx": ["-O3", "-std=c++17", "-DPy_LIMITED_API=0x03090000"] + stable_args + feature_args,
                 "nvcc": nvcc_threads_args() + nvcc_flags + cc_flag + feature_args,
             },
+            extra_link_args=["-lcuda"],
             include_dirs=include_dirs,
             py_limited_api=True,
         )
