@@ -6,6 +6,9 @@ from cutlass._mlir.dialects import math as mlir_math
 import operator
 from torch.nn.attention.flex_attention import flex_attention
 from flash_attn.cute.interface import _flash_attn_fwd, _flash_attn_bwd
+
+COMPUTE_CAPABILITY = torch.cuda.get_device_capability()[0]
+
 from score_mod_definitions import (
     # TensorSSA-based score mods
     score_mod_identity as score_mod_1,
@@ -289,6 +292,7 @@ def _generate_block_kvcache(
     ],
 )
 @pytest.mark.parametrize("score_mod_pair", TEST_PAIRS)
+@pytest.mark.skipif(COMPUTE_CAPABILITY != 10, reason="Paged KV cache only supported on SM100")
 def test_score_mod_with_paged_kvcache(
     seqlen_q,
     seqlen_kv,
@@ -445,6 +449,7 @@ def test_score_mod_with_paged_kvcache(
     ],
 )
 @pytest.mark.parametrize("score_mod_pair", TEST_PAIRS_WITH_AUX_TENSORS)
+@pytest.mark.skipif(COMPUTE_CAPABILITY != 10, reason="Paged KV cache only supported on SM100")
 def test_score_mod_with_paged_kvcache_aux_tensors(
     seqlen_q,
     seqlen_kv,
@@ -738,6 +743,9 @@ def run_flex_reference_bwd(q, k, v, eager_score_mod, grad_out, dtype=None):
 @pytest.mark.parametrize("score_mod_triple", BWD_TEST_PAIRS)
 def test_cute_vs_flex_attention_backward(seqlen_q, seqlen_kv, dim, dtype, score_mod_triple):
     """Test backward pass with score_mod against flex_attention reference."""
+    if COMPUTE_CAPABILITY == 9 and dim == 64:
+        pytest.skip("head_dim=64 not supported on SM90 for backward")
+
     torch.random.manual_seed(42)
     cute_fwd, cute_bwd, eager_ref = score_mod_triple
 
@@ -809,6 +817,9 @@ def make_aux_tensors_for_bwd(cute_score_mod, eager_factory, seqlen_q, num_heads,
 def test_cute_vs_flex_attention_backward_with_aux(
     seqlen_q, seqlen_kv, dim, dtype, score_mod_triple
 ):
+    if COMPUTE_CAPABILITY == 9 and dim == 64:
+        pytest.skip("head_dim=64 not supported on SM90 for backward")
+
     torch.random.manual_seed(42)
     cute_fwd, cute_bwd, eager_factory = score_mod_triple
 
@@ -862,14 +873,16 @@ def test_cute_vs_flex_attention_backward_with_aux(
 
 
 @pytest.mark.parametrize("seqlen_q,seqlen_kv", [(128, 128), (128, 256)])
-@pytest.mark.parametrize("dim", [64])
+@pytest.mark.parametrize("dim", [64, 128])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("qhead_per_kvhead,num_kv_heads", [(4, 2)])
 @pytest.mark.parametrize("score_mod_triple", BWD_TEST_PAIRS_PACK_GQA)
 def test_cute_vs_flex_attention_backward_pack_gqa(
     seqlen_q, seqlen_kv, dim, dtype, qhead_per_kvhead, num_kv_heads, score_mod_triple
 ):
-    pytest.skip("pack_gqa backward not yet implemented")
+    if COMPUTE_CAPABILITY == 9:
+        pytest.xfail("pack_gqa backward not yet implemented on SM90")
+
     torch.random.manual_seed(42)
     cute_fwd, cute_bwd, eager_ref = score_mod_triple
 
