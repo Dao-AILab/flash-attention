@@ -339,7 +339,7 @@ class AttentionMask:
                     mask_r2p(acc_S, seqlenk_col_limit, arch=100, rank1=True)
 
         elif const_expr(not mask_causal and not mask_local and mask_mod is not None):
-            # Block sparse w/ mask_mod
+            # Block sparse case w/ mask_mod
             has_fastdiv = const_expr(
                 fastdiv_mods is not None
                 and fastdiv_mods[0] is not None

@@ -448,9 +448,6 @@ def test_q_boundary_masking_block_sparse_bwd(seqlen_q, seqlen_k, mask_name):
     - Block-sparse with mask_mod: exercises is_full_block=True path
     - Backward pass: where the bug manifested
     """
-    if COMPUTE_CAPABILITY != 10:
-        pytest.skip("SM100-only backward test")
-
     _run_mask_test(
         seqlen_q=seqlen_q,
         seqlen_k=seqlen_k,
@@ -469,6 +466,7 @@ def test_q_boundary_masking_block_sparse_bwd(seqlen_q, seqlen_k, mask_name):
     )
 
 
+@pytest.mark.skipif(COMPUTE_CAPABILITY != 10, reason="Test uses SM100 block mask conventions (2*tile_m)")
 def test_single_doc_bwd_minimal():
     """Minimal test to isolate single-document backward pass bug.
 
@@ -479,9 +477,6 @@ def test_single_doc_bwd_minimal():
 
     Run with: pytest tests/cute/test_mask_mod.py::test_single_doc_bwd_minimal -v -s
     """
-    if COMPUTE_CAPABILITY != 10:
-        pytest.skip("SM100-only test")
-
     import random
     random.seed(42)
     torch.manual_seed(42)

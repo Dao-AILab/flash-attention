@@ -287,6 +287,7 @@ def consume_block_sparse_loads(
     intra_wg_overlap: cutlass.Constexpr,
     warp_scheduler_barrier_sync: Callable,
     warp_scheduler_barrier_arrive: Callable,
+    seqlen=None,
 ):
     """Consume the mask and full block lists for a single tile on the consumer side.
 
@@ -379,6 +380,7 @@ def consume_block_sparse_loads(
             mask_n_block = curr_mask_block_idx[curr_mask_block_cnt - 1]
             kv_consumer_state = process_first_half_block(
                 n_block=mask_n_block,
+                seqlen=seqlen,
                 kv_consumer_state=kv_consumer_state,
                 mask_fn=partial(
                     mask_fn,
@@ -394,6 +396,7 @@ def consume_block_sparse_loads(
                 kv_consumer_state = mma_one_n_block(
                     kv_consumer_state,
                     n_block=mask_n_block,
+                    seqlen=seqlen,
                     mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
                     mask_fn=partial(mask_fn, mask_mod=mask_mod, mask_seqlen=False),
                 )
@@ -404,6 +407,7 @@ def consume_block_sparse_loads(
             if curr_mask_block_cnt == 0:
                 kv_consumer_state = process_first_half_block(
                     n_block=full_n_block,
+                    seqlen=seqlen,
                     kv_consumer_state=kv_consumer_state,
                     mask_fn=partial(mask_fn, mask_mod=None, mask_seqlen=True),
                     score_mod_fn=score_mod_fn,
@@ -413,6 +417,7 @@ def consume_block_sparse_loads(
                 kv_consumer_state = mma_one_n_block(
                     kv_consumer_state,
                     n_block=full_n_block,
+                    seqlen=seqlen,
                     mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
                     mask_fn=partial(mask_fn, mask_mod=None, mask_seqlen=True),
                 )
@@ -422,6 +427,7 @@ def consume_block_sparse_loads(
                 kv_consumer_state = mma_one_n_block(
                     kv_consumer_state,
                     n_block=full_n_block,
+                    seqlen=seqlen,
                     mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
                     mask_fn=partial(mask_fn, mask_mod=None, mask_seqlen=False),
                 )
