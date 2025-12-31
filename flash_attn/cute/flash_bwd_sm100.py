@@ -1844,15 +1844,25 @@ class FlashAttentionBackwardSm100:
         self,
         grad_tensor,
         score_tensor,
-        index_tensor,
+        thr_copy_t2r,
+        thr_mma_S,
         batch_idx,
         head_idx,
+        m_block,
+        n_block,
+        stage,
         softmax_scale,
         seqlen_info,
         aux_tensors=None,
         fastdiv_mods=(None, None),
     ):
         """Apply backward score modification (joint graph) for SM100."""
+        cS_bwd = cute.make_identity_tensor((self.tile_n, self.tile_m))
+        cS_bwd = cute.domain_offset((n_block * self.tile_n, m_block * self.tile_m), cS_bwd)
+        tScS_bwd = thr_mma_S.partition_C(cS_bwd)
+        tScS_idx_bwd = thr_copy_t2r.partition_D(tScS_bwd)
+        index_tensor = tScS_idx_bwd[None, stage, 0, 0]
+
         apply_score_mod_bwd_inner(
             grad_tensor,
             score_tensor,
@@ -1870,6 +1880,10 @@ class FlashAttentionBackwardSm100:
             qhead_per_kvhead=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
             transpose_indices=True,
         )
+
+        for i in cutlass.range(cute.size(grad_tensor), unroll_full=True):
+            kv_idx = index_tensor[i][0]
+            grad_tensor[i] = 0.0 if kv_idx >= seqlen_info.seqlen_k else grad_tensor[i]
 
     @cute.jit
     def compute_loop(
@@ -2213,28 +2227,21 @@ class FlashAttentionBackwardSm100:
 
                     if const_expr(self.score_mod_bwd is not None):
                         tSrS_pre_cur = tSrS_pre[None, stage, 0, 0]
-                        cS_bwd = cute.make_identity_tensor((self.tile_n, self.tile_m))
-                        cS_bwd = cute.domain_offset(
-                            (n_block * self.tile_n, m_block * self.tile_m), cS_bwd
-                        )
-                        tScS_bwd = thr_mma_S.partition_C(cS_bwd)
-                        tScS_idx_bwd = thr_copy_t2r.partition_D(tScS_bwd)
-                        tScS_idx_cur = tScS_idx_bwd[None, stage, 0, 0]
                         self.apply_score_mod_bwd(
                             tdPrdP_cur,
                             tSrS_pre_cur,
-                            tScS_idx_cur,
+                            thr_copy_t2r,
+                            thr_mma_S,
                             batch_idx,
                             head_idx,
+                            m_block,
+                            n_block,
+                            stage,
                             softmax_scale,
                             seqlen,
                             aux_tensors,
                             fastdiv_mods,
                         )
-                        # Zero out OOB positions (kv_idx >= seqlen_k) after score_mod_bwd
-                        for i in cutlass.range(cute.size(tdPrdP_cur), unroll_full=True):
-                            kv_idx = tScS_idx_cur[i][0]
-                            tdPrdP_cur[i] = 0.0 if kv_idx >= seqlen.seqlen_k else tdPrdP_cur[i]
 
                     tdPrdS_cvt = cute.make_fragment_like(tdPrdP_cur, self.ds_dtype)
                     utils.cvt_f16(tdPrdP_cur, tdPrdS_cvt)
