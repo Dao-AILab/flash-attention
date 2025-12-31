@@ -870,6 +870,7 @@ def _flash_attn_bwd(
             AtomLayoutNdKV,
             AtomLayoutMdQ,
             V_in_regs,
+            use_block_sparsity,
         )
     else:
         # Hash callables for compile key
@@ -964,6 +965,7 @@ def _flash_attn_bwd(
                 AtomLayoutMdQ,
                 num_threads,
                 V_in_regs=V_in_regs,
+                subtile_factor=1,
             )
         else:
             fa_bwd_obj = FlashAttentionBackwardSm100(
@@ -987,10 +989,11 @@ def _flash_attn_bwd(
         # Block sparse tensors for backward use Q-direction indexing (transposed from forward).
         # sparse_block_size_q = 2*tile_m matches forward's q_stage=2 pipelining.
         sparse_tensors_compile = None
-        if block_sparse_tensors is not None and compute_capability == 10:
+        if block_sparse_tensors is not None:
+            bwd_subtile_factor = subtile_factor if compute_capability == 10 else 1
             expected_count_shape, expected_index_shape = get_block_sparse_expected_shapes_bwd(
                 batch_size, num_head, seqlen_q, seqlen_k,
-                m_block_size, n_block_size, subtile_factor,
+                m_block_size, n_block_size, bwd_subtile_factor,
             )
             compile_time_normalized = normalize_block_sparse_tensors(
                 block_sparse_tensors,
@@ -1028,10 +1031,11 @@ def _flash_attn_bwd(
             options="--enable-tvm-ffi",
         )
     normalized_block_sparse_tensors = None
-    if block_sparse_tensors is not None and compute_capability == 10:
+    if block_sparse_tensors is not None:
+        bwd_subtile_factor = subtile_factor if compute_capability == 10 else 1
         expected_count_shape, expected_index_shape = get_block_sparse_expected_shapes_bwd(
             batch_size, num_head, seqlen_q, seqlen_k,
-            m_block_size, n_block_size, subtile_factor,
+            m_block_size, n_block_size, bwd_subtile_factor,
         )
         normalized_block_sparse_tensors = normalize_block_sparse_tensors(
             block_sparse_tensors,
