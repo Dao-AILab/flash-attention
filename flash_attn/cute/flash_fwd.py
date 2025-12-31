@@ -4987,7 +4987,7 @@ class FlashAttentionForwardSm120(FlashAttentionForwardSm90):
             intra_wg_overlap: bool = False,
             **kwargs,
     ):
-        super().__init__(*args, intra_wg_overlap=intra_wg_overlap, mma_pv_is_rs=True, **kwargs)
+        super().__init__(*args, intra_wg_overlap=intra_wg_overlap, **kwargs)
         self.use_tma_Q = use_tma
         self.use_tma_O = False
         self.multicast_size = 1
