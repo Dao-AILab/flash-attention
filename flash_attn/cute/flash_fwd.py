@@ -2168,6 +2168,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     self.intra_wg_overlap,
                     self.warp_scheduler_barrier_sync,
                     self.warp_scheduler_barrier_arrive,
+                    seqlen,
                 )
 
                 # Handle empty case (when no blocks to process)
