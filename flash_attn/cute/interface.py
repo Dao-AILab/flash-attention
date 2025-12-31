@@ -38,14 +38,12 @@ import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
 from flash_attn.cute import utils
-from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80, FlashAttentionForwardSm90
+from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80, FlashAttentionForwardSm90, FlashAttentionForwardSm120
 from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
-from flash_attn.cute.flash_fwd_sm120 import FlashAttentionForwardSm120
 from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
 from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
 from flash_attn.cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
 from flash_attn.cute.flash_bwd_sm100 import FlashAttentionBackwardSm100
-from flash_attn.cute.flash_bwd_sm120 import FlashAttentionBackwardSm120
 from flash_attn.cute.flash_bwd_postprocess import FlashAttentionBackwardPostprocess
 from flash_attn.cute.flash_fwd_combine import FlashAttentionForwardCombine
 
@@ -470,25 +468,26 @@ def _flash_attn_fwd(
         elif compute_capability == 12:
             # SM12.0 and SM12.1 (RTX 50 series) use SM120-style tensor cores (similar to SM89/90)
             # but without Tensor Memory (TMEM). Route to SM120 implementation.
+            assert page_table is None, "paged KV not supported on SM 12.0"
+            assert not is_split_kv, "SplitKV not supported on SM 12.0"
             fa_fwd = FlashAttentionForwardSm120(
+                dtype,
                 head_dim,
                 head_dim_v,
-                qhead_per_kvhead=qhead_per_kvhead,
+                qhead_per_kvhead,
                 is_causal=causal,
                 is_local=local,
-                is_split_kv=is_split_kv,
                 pack_gqa=pack_gqa,
-                m_block_size=m_block_size,
-                n_block_size=n_block_size,
-                is_persistent=not causal
-                    and not local
-                    and cu_seqlens_q is None
-                    and seqused_q is None
-                    and not is_split_kv,
-                score_mod=score_mod,
+                tile_m=m_block_size,
+                tile_n=n_block_size,
+                num_stages=2,
+                num_threads=num_threads,
+                Q_in_regs=False,
+                intra_wg_overlap=True,
+                mma_pv_is_rs=True,
                 mask_mod=mask_mod,
+                score_mod=score_mod,
                 has_aux_tensors=aux_tensors is not None,
-                page_size=page_size,
             )
         else:
             raise ValueError(
