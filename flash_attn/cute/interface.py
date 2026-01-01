@@ -871,6 +871,7 @@ def _flash_attn_bwd(
             AtomLayoutMdQ,
             V_in_regs,
         )
+        cute_aux_tensors = None
     else:
         # Hash callables for compile key
         score_mod_hash = utils.hash_callable(score_mod) if score_mod else False
