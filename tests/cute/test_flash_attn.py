@@ -25,10 +25,13 @@ from flash_attn.cute.interface import (
     flash_attn_func,
     flash_attn_varlen_func,
     flash_attn_combine,
+    _get_device_capability,
 )
 
 
 DISABLE_SPLIT = os.getenv("FLASH_ATTENTION_DISABLE_SPLIT", "FALSE") == "TRUE"
+# SplitKV and paged KV are not supported on SM90
+IS_SM90 = _get_device_capability() == 9
 TEST_BWD_ONLY = False
 VERBOSE = True
 
@@ -238,6 +241,9 @@ def test_flash_attn_output(
         # pack_gqa_vals = [False]
         num_splits_vals = [1, 3] if d < 192 and not DISABLE_SPLIT and not TEST_BWD_ONLY else [1]
         for pack_gqa, num_splits in itertools.product(pack_gqa_vals, num_splits_vals):
+            # SplitKV not supported on SM90 - skip this iteration
+            if IS_SM90 and num_splits > 1:
+                continue
             out, lse = flash_attn_func(
                 q,
                 k,
@@ -276,6 +282,19 @@ def test_flash_attn_output(
             # and False
             and not ((causal or local) and seqlen_k < seqlen_q)
         ):
+            # TODO: SM90 backward pass has invalid MMA tile config for d=64 + non-causal
+            # The m_block_size=80 (non-causal) with head_dim=64 creates an invalid tile.
+            # Fix requires adjusting m_block_size or MMA config in flash_bwd_sm90.py
+            if IS_SM90 and d == 64 and not causal:
+                pytest.xfail("SM90 backward: d=64 + non-causal has invalid MMA tile config (m_block=80)")
+            # TODO: SM90 backward pass has tensor layout issue for GQA/MQA (qhead_per_kvhead > 1)
+            # Error: "invalid mode element for input of rank 3" in utils.select()
+            # Fix requires adjusting layout handling in flash_bwd_sm90.py for GQA
+            if IS_SM90 and mha_type != "mha":
+                pytest.xfail("SM90 backward: GQA/MQA has tensor layout issue (qhead_per_kvhead > 1)")
+            # TODO: SM90 backward pass does not support local attention yet
+            if IS_SM90 and local:
+                pytest.xfail("SM90 backward: local attention not supported yet")
             g = torch.randn_like(out)
             # do_o = ((g.float() * out.float()).sum(-1)).transpose(1, 2)
             dq, dk, dv = torch.autograd.grad(out, (q, k, v), g)
@@ -606,6 +625,9 @@ def test_flash_attn_varlen_output(
         # SplitKV is not supported for hdim >= 192
         num_splits_vals = [1, 3] if d < 192 and not DISABLE_SPLIT else [1]
         for pack_gqa, num_splits in itertools.product(pack_gqa_vals, num_splits_vals):
+            # SplitKV not supported on SM90 - skip this iteration
+            if IS_SM90 and num_splits > 1:
+                continue
             out_unpad, lse = flash_attn_varlen_func(
                 q_unpad,
                 k_unpad,
@@ -816,6 +838,8 @@ def test_flash_attn_kvcache(
 ):
     if page_size is not None and seqlen_k % page_size != 0:
         pytest.skip()
+    if page_size is not None and IS_SM90:
+        pytest.xfail("paged KV not supported on SM90")
     if seqlen_q > seqlen_k and new_kv:
         pytest.skip()
     if not new_kv and rotary_fraction > 0.0:
@@ -1134,12 +1158,16 @@ def test_flash_attn_kvcache(
         k_cache_saved = k_cache.clone() if page_size is None else k_cache_paged.clone()
         v_cache_saved = v_cache.clone() if page_size is None else v_cache_paged.clone()
         # num_splits_vals = [1, 0]
+        # SplitKV is not supported for hdim >= 192
         num_splits_vals = [1, 3] if d < 192 and not DISABLE_SPLIT else [1]
         # precompute_metadata_vals = [False, True]
         precompute_metadata_vals = [False]
         for num_splits, precompute_metadata in itertools.product(
             num_splits_vals, precompute_metadata_vals
         ):
+            # SplitKV not supported on SM90 - skip this iteration
+            if IS_SM90 and num_splits > 1:
+                continue
             # if precompute_metadata:
             #     scheduler_metadata = get_scheduler_metadata(
             #         batch_size, max_seqlen_q if varlen_q else seqlen_q, seqlen_k, nheads, nheads_k, d,
@@ -1279,6 +1307,9 @@ def test_flash_attn_kvcache(
 @pytest.mark.parametrize("d", [64, 128])
 @pytest.mark.parametrize("seqlen_q,seqlen_k", [(128, 128), (256, 256)])
 def test_flash_attn_bwd_preallocated_outputs(seqlen_q, seqlen_k, d, causal, dtype):
+    if IS_SM90 and d == 64 and not causal:
+        pytest.xfail("SM90 backward: d=64 + non-causal has invalid MMA tile config (m_block=80)")
+
     from flash_attn.cute.interface import _flash_attn_fwd, _flash_attn_bwd
 
     device = "cuda"

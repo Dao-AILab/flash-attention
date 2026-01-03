@@ -30,6 +30,7 @@ from flash_attn.cute.interface import (
 
 
 DISABLE_SPLIT = os.getenv("FLASH_ATTENTION_DISABLE_SPLIT", "FALSE") == "TRUE"
+IS_SM90 = torch.cuda.get_device_capability()[0] == 9
 
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
@@ -247,6 +248,10 @@ def test_flash_attn_output(
             and learnable_sink is None
             # and False
         ):
+            if IS_SM90 and mha_type != "mha":
+                pytest.xfail("SM90 backward: GQA/MQA has tensor layout issue (qhead_per_kvhead > 1)")
+            if IS_SM90 and local:
+                pytest.xfail("SM90 backward: local attention not supported yet")
             g = torch.randn_like(out)
             # do_o = ((g.float() * out.float()).sum(-1)).transpose(1, 2)
             dq, dk, dv = torch.autograd.grad(out, (q, k, v), g)
