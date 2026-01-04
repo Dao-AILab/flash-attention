@@ -10,6 +10,8 @@ from flash_attn.cute import utils
 from flash_attn.cute.cute_dsl_utils import ParamsBase
 from cutlass.cute import FastDivmodDivisor
 
+import math
+
 
 @dataclass
 class PagedKVManager(ParamsBase):
@@ -55,8 +57,8 @@ class PagedKVManager(ParamsBase):
         dtype: Type[cutlass.Numeric],
     ):
         universal_copy_bits = 128
-        gmem_threads_per_row = 8  # 8 threads loading 128 bits = 128 bytes = 1 cache line
         async_copy_elems = universal_copy_bits // dtype.width
+        gmem_threads_per_row = math.gcd(head_dim_padded, head_dim_v_padded) // async_copy_elems
         atom_async_copy = cute.make_copy_atom(
             cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
             dtype,
