@@ -168,9 +168,17 @@ class FlashAttentionForwardSm100:
             )
         )
 
-        if not self.use_tma_KV:
+        if self.q_stage == 1:
+            if not self.use_tma_KV:
+                self.empty_warp_ids = self.empty_warp_ids + self.load_warp_ids
+                self.load_warp_ids = self.softmax1_warp_ids
+            else:
+                self.empty_warp_ids = self.empty_warp_ids + self.softmax1_warp_ids
+            self.softmax1_warp_ids = ()
+        elif not self.use_tma_KV:
             self.load_warp_ids = (14, 15)
             self.empty_warp_ids = ()
+
         if self.use_correction_warps_for_epi:
             self.empty_warp_ids = self.empty_warp_ids + self.epilogue_warp_ids
             self.epilogue_warp_ids = self.correction_warp_ids
@@ -934,15 +942,9 @@ class FlashAttentionForwardSm100:
         # ///////////////////////////////////////////////////////////////////////////////
         #  EMPTY
         # ///////////////////////////////////////////////////////////////////////////////
-        if const_expr(len(self.empty_warp_ids) > 0):
-            if warp_idx == self.empty_warp_ids[0]:
+        for i in cutlass.range_constexpr(len(self.empty_warp_ids)):
+            if warp_idx == self.empty_warp_ids[i]:
                 cute.arch.warpgroup_reg_dealloc(self.num_regs_empty)
-
-        if const_expr(len(self.empty_warp_ids) > 1):
-            if warp_idx == self.empty_warp_ids[1]:
-                cute.arch.warpgroup_reg_dealloc(self.num_regs_empty)
-
-        assert len(self.empty_warp_ids) <= 2
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  LOAD
@@ -1035,7 +1037,10 @@ class FlashAttentionForwardSm100:
         # ///////////////////////////////////////////////////////////////////////////////
         #  Softmax
         # ///////////////////////////////////////////////////////////////////////////////
-        if warp_idx < self.correction_warp_ids[0]:
+        if (
+            (const_expr(self.q_stage == 2) and warp_idx <= self.softmax1_warp_ids[-1]) or
+            (const_expr(self.q_stage == 1) and warp_idx <= self.softmax0_warp_ids[-1])
+        ):
             # increase register after decreasing
             cute.arch.warpgroup_reg_alloc(self.num_regs_softmax)
             softmax_loop = partial(
@@ -1058,7 +1063,7 @@ class FlashAttentionForwardSm100:
             )
 
             if const_expr(not self.s0_s1_barrier):
-                stage = Int32(0 if warp_idx < self.softmax1_warp_ids[0] else 1)
+                stage = Int32(0 if const_expr(self.q_stage == 1) or warp_idx < self.softmax1_warp_ids[0] else 1)
                 if const_expr(self.q_stage == 2) or stage == 0:
                     softmax_loop(
                         stage=stage,
