@@ -38,6 +38,8 @@ class SeqlenInfo:
 class SeqlenInfoQK:
     offset_q: cutlass.Int32
     offset_k: cutlass.Int32
+    offset_q_padded: cutlass.Int32
+    offset_k_padded: cutlass.Int32
     seqlen_q: cutlass.Int32
     seqlen_k: cutlass.Int32
     has_cu_seqlens_q: cutlass.Constexpr[bool]
@@ -54,9 +56,13 @@ class SeqlenInfoQK:
         mCuSeqlensK: Optional[cute.Tensor] = None,
         mSeqUsedQ: Optional[cute.Tensor] = None,
         mSeqUsedK: Optional[cute.Tensor] = None,
+        tile_m: Optional[cutlass.Int32] = None,
+        tile_n: Optional[cutlass.Int32] = None,
     ):
         offset_q = 0 if const_expr(mCuSeqlensQ is None) else mCuSeqlensQ[batch_idx]
         offset_k = 0 if const_expr(mCuSeqlensK is None) else mCuSeqlensK[batch_idx]
+        offset_q_padded = 0 if const_expr(mCuSeqlensQ is None) else (offset_q + batch_idx * tile_m) // tile_m * tile_m
+        offset_k_padded = 0 if const_expr(mCuSeqlensK is None) else (offset_k + batch_idx * tile_n) // tile_n * tile_n
         if const_expr(mSeqUsedQ is not None):
             seqlen_q = mSeqUsedQ[batch_idx]
         else:
@@ -80,6 +86,8 @@ class SeqlenInfoQK:
         return SeqlenInfoQK(
             offset_q,
             offset_k,
+            offset_q_padded,
+            offset_k_padded,
             seqlen_q,
             seqlen_k,
             has_cu_seqlens_q,

@@ -920,6 +920,8 @@ class FlashAttentionForwardSm100:
             mCuSeqlensK=mCuSeqlensK,
             mSeqUsedQ=mSeqUsedQ,
             mSeqUsedK=mSeqUsedK,
+            tile_m=self.m_block_size,
+            tile_n=self.n_block_size,
         )
         AttentionMaskCls = partial(
             AttentionMask,

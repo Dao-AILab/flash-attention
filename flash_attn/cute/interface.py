@@ -543,6 +543,7 @@ def _flash_attn_bwd(
     out: torch.Tensor,
     dout: torch.Tensor,
     lse: torch.Tensor,
+    max_seqlen_k: Optional[int] = None,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
     softcap: float = 0.0,
@@ -967,8 +968,10 @@ def _flash_attn_bwd(
             fa_bwd_obj = FlashAttentionBackwardSm100(
                 head_dim,
                 head_dim_v,
+                max_seqlen_k=max_seqlen_k,
                 is_causal=causal,
                 is_local=local,
+                is_varlen_kv = (cu_seqlens_k is not None),
                 qhead_per_kvhead=qhead_per_kvhead,
                 # tile_m=m_block_size,
                 # tile_n=n_block_size,
@@ -1099,6 +1102,7 @@ def _flash_attn_bwd(
 
     if qhead_per_kvhead > 1:
         # Postprocess kernel: convert dk_accum & dv_accum from float32 to bf16/fp16
+        arch = compute_capability * 10
         compile_key_post = (dtype, head_dim, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB)
         if compile_key_post not in _flash_attn_bwd.compile_cache_post:
             dk_accum_tensor = to_cute_tensor(dk_accum)
@@ -1108,7 +1112,7 @@ def _flash_attn_bwd(
                 for t in (cu_seqlens_k, seqused_k)
             ]
             fa_bwd_post = FlashAttentionBackwardPostprocess(
-                dtype, head_dim, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB
+                dtype, head_dim, arch, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB
             )
             # TODO: check @can_implement
             _flash_attn_bwd.compile_cache_post[compile_key_post] = cute.compile(
@@ -1145,7 +1149,7 @@ def _flash_attn_bwd(
                 for t in (cu_seqlens_k, seqused_k)
             ]
             fa_bwd_post = FlashAttentionBackwardPostprocess(
-                dtype, head_dim_v, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB
+                dtype, head_dim_v, arch, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB
             )
             # TODO: check @can_implement
             _flash_attn_bwd.compile_cache_post[compile_key_post] = cute.compile(
@@ -1257,6 +1261,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         v: torch.Tensor,
         cu_seqlens_q: Optional[torch.Tensor],
         cu_seqlens_k: Optional[torch.Tensor],
+        max_seqlen_k: Optional[int] = None,
         seqused_q: Optional[torch.Tensor] = None,
         seqused_k: Optional[torch.Tensor] = None,
         page_table: Optional[torch.Tensor] = None,
@@ -1297,6 +1302,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         ctx.window_size = window_size
         ctx.softcap = softcap
         ctx.deterministic = deterministic
+        ctx.max_seqlen_k = max_seqlen_k
         return out, lse
 
     @staticmethod
@@ -1311,6 +1317,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             out,
             dout,
             lse,
+            ctx.max_seqlen_k,
             ctx.softmax_scale,
             ctx.causal,
             ctx.softcap,
@@ -1321,7 +1328,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             deterministic=ctx.deterministic,
         )
 
-        return dq, dk, dv, *((None,) * 20)
+        return dq, dk, dv, *((None,) * 21)
 
 
 def flash_attn_func(
@@ -1368,6 +1375,7 @@ def flash_attn_varlen_func(
     v: torch.Tensor,
     cu_seqlens_q: Optional[torch.Tensor] = None,
     cu_seqlens_k: Optional[torch.Tensor] = None,
+    max_seqlen_k: Optional[int] = None,
     seqused_q: Optional[torch.Tensor] = None,
     seqused_k: Optional[torch.Tensor] = None,
     page_table: Optional[torch.Tensor] = None,
@@ -1388,6 +1396,7 @@ def flash_attn_varlen_func(
         v,
         cu_seqlens_q,
         cu_seqlens_k,
+        max_seqlen_k,
         seqused_q,
         seqused_k,
         page_table,
