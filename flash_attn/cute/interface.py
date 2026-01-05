@@ -710,7 +710,6 @@ def _flash_attn_bwd(
         assert cu_seqlens_q is None and cu_seqlens_k is None, (
             "varlen + score_mod not supported in bwd yet"
         )
-        assert compute_capability == 10, "score_mod in bwd only supported on SM100 for now"
 
     device = q.device
     out_torch_dtype = q.dtype
@@ -981,6 +980,10 @@ def _flash_attn_bwd(
                 AtomLayoutMdQ,
                 num_threads,
                 V_in_regs=V_in_regs,
+                score_mod=score_mod,
+                score_mod_bwd=score_mod_bwd,
+                mask_mod=mask_mod,
+                has_aux_tensors=aux_tensors is not None and len(aux_tensors) > 0,
                 subtile_factor=bwd_subtile_factor,
             )
         else:
