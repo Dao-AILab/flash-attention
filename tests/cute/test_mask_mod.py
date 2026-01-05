@@ -165,7 +165,7 @@ def _run_mask_test(
         pack_gqa = False
     elif kv_mode == "gqa":
         if COMPUTE_CAPABILITY != 10:
-            pytest.skip("pack_gqa requires SM100")
+            pytest.xfail("pack_gqa requires SM100")
         nheads_kv = nheads // 4
         pack_gqa = True
     elif kv_mode == "mqa":
