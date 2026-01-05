@@ -131,7 +131,6 @@ class AttentionMask:
         ):  # FlexAttention mask mod
             nrow = const_expr(cute.size(tScS_mn.shape[0]))
             ncol = const_expr(cute.size(tScS_mn.shape[1]))
-            thr_col_offset = tScS_mn[0, 0][1]
             has_fastdiv = const_expr(
                 fastdiv_mods is not None
                 and fastdiv_mods[0] is not None
@@ -142,13 +141,15 @@ class AttentionMask:
             )
 
             for r in cutlass.range_constexpr(nrow):
-                global_row_idx = tScS_mn[r, 0][0] + m_block * self.tile_m
+                # Respect swap_AB: ROW/COL determine which coordinate component corresponds to Q/KV.
+                local_row = tScS_mn[r, 0][ROW]
+                global_row_idx = local_row + m_block * self.tile_m
                 row_for_mod = global_row_idx
                 if const_expr(wrap_aux_indices):
                     _, row_for_mod = divmod(global_row_idx, fastdiv_mods[0])
 
                 for col in cutlass.range_constexpr(ncol):
-                    col_idx_local = t0ScS_mn[0, col][1]
+                    col_idx_local = t0ScS_mn[0, col][COL]
                     # Convert to absolute column index
                     global_col_idx = thr_col_offset + col_idx_local + n_block * self.tile_n
                     col_for_mod = global_col_idx
@@ -339,7 +340,7 @@ class AttentionMask:
                     mask_r2p(acc_S, seqlenk_col_limit, arch=100, rank1=True)
 
         elif const_expr(not mask_causal and not mask_local and mask_mod is not None):
-            # Block sparse w/ mask_mod
+            # Block sparse case w/ mask_mod
             has_fastdiv = const_expr(
                 fastdiv_mods is not None
                 and fastdiv_mods[0] is not None

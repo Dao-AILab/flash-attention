@@ -234,6 +234,31 @@ def _run_mask_test(
         *_,
     ) = bm.as_tuple()
 
+    # SM90 block-sparse backward expects BlockMask granularity (128, 128) regardless of fwd tiling.
+    if COMPUTE_CAPABILITY == 9 and use_block_sparsity:
+        bm_bwd = create_block_mask(
+            mask_mod_flex,
+            batch_size,
+            nheads,
+            seqlen_q,
+            seqlen_k,
+            device="cuda",
+            BLOCK_SIZE=(128, 128),
+        )
+        (
+            _seq_q,
+            _seq_k,
+            _kv_mask_cnt,
+            _kv_mask_idx,
+            _full_kv_cnt,
+            _full_kv_idx,
+            q_mask_cnt,
+            q_mask_idx,
+            full_q_cnt,
+            full_q_idx,
+            *_,
+        ) = bm_bwd.as_tuple()
+
     softmax_scale = 1.0 / math.sqrt(headdim)
 
     block_sparse_mask_fwd = BlockSparseTensorsTorch(
@@ -338,8 +363,7 @@ def _run_mask_test(
         f"Kernel error {cute_error:.2e} exceeds {rtol}x PyTorch error {pt_error:.2e} + {fwd_atol:.2e}"
     )
 
-    # Backward pass (SM100 only)
-    if needs_backward and COMPUTE_CAPABILITY == 10 and kv_mode == "mha":
+    if needs_backward and kv_mode == "mha":
         q = tensors["q"]
         k = tensors["k"]
         v = tensors["v"]
@@ -448,9 +472,6 @@ def test_q_boundary_masking_block_sparse_bwd(seqlen_q, seqlen_k, mask_name):
     - Block-sparse with mask_mod: exercises is_full_block=True path
     - Backward pass: where the bug manifested
     """
-    if COMPUTE_CAPABILITY != 10:
-        pytest.skip("SM100-only backward test")
-
     _run_mask_test(
         seqlen_q=seqlen_q,
         seqlen_k=seqlen_k,
@@ -469,6 +490,7 @@ def test_q_boundary_masking_block_sparse_bwd(seqlen_q, seqlen_k, mask_name):
     )
 
 
+@pytest.mark.skipif(COMPUTE_CAPABILITY != 10, reason="Test uses SM100 block mask conventions (2*tile_m)")
 def test_single_doc_bwd_minimal():
     """Minimal test to isolate single-document backward pass bug.
 
@@ -479,9 +501,6 @@ def test_single_doc_bwd_minimal():
 
     Run with: pytest tests/cute/test_mask_mod.py::test_single_doc_bwd_minimal -v -s
     """
-    if COMPUTE_CAPABILITY != 10:
-        pytest.skip("SM100-only test")
-
     import random
     random.seed(42)
     torch.manual_seed(42)
