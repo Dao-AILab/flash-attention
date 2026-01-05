@@ -24,6 +24,7 @@ from functools import lru_cache
 from typing import Optional, Tuple, Callable
 
 import torch
+from torch.nn.attention.flex_attention import BlockMask
 
 
 @lru_cache(maxsize=None)
@@ -1193,20 +1194,40 @@ class FlashAttnFunc(torch.autograd.Function):
         num_splits: int = 1,
         pack_gqa: Optional[bool] = None,
         deterministic: bool = False,
+        score_mod: Optional[Callable] = None,
+        score_mod_bwd: Optional[Callable] = None,
         mask_mod: Optional[Callable] = None,
-        full_block_cnt: Optional[torch.Tensor] = None,
-        full_block_idx: Optional[torch.Tensor] = None,
-        mask_block_cnt: Optional[torch.Tensor] = None,
-        mask_block_idx: Optional[torch.Tensor] = None,
+        aux_tensors: Optional[list[torch.Tensor]] = None,
+        block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
+        block_sparse_tensors_bwd: Optional[BlockSparseTensorsTorch] = None,
+        block_mask: Optional[BlockMask] = None,
     ):
-        # Only create block sparse tensors if at least one block sparse parameter is provided
-        block_sparse_tensors = None
-        if any(t is not None for t in [full_block_cnt, full_block_idx, mask_block_cnt, mask_block_idx]):
+        if block_mask is not None:
+            (
+                _, _,
+                # fwd blocksparse tensors
+                kv_mask_cnt,
+                kv_mask_idx,
+                full_kv_cnt,
+                full_kv_idx,
+                # bwd blocksparse tensors
+                q_mask_cnt,
+                q_mask_idx,
+                full_q_cnt,
+                full_q_idx,
+                *_,
+            ) = block_mask.as_tuple()
             block_sparse_tensors = BlockSparseTensorsTorch(
-                full_block_cnt=full_block_cnt,
-                full_block_idx=full_block_idx,
-                mask_block_cnt=mask_block_cnt,
-                mask_block_idx=mask_block_idx,
+                mask_block_cnt=kv_mask_cnt,
+                mask_block_idx=kv_mask_idx,
+                full_block_cnt=full_kv_cnt,
+                full_block_idx=full_kv_idx,
+            )
+            block_sparse_tensors_bwd = BlockSparseTensorsTorch(
+                mask_block_cnt=q_mask_cnt,
+                mask_block_idx=q_mask_idx,
+                full_block_cnt=full_q_cnt,
+                full_block_idx=full_q_idx,
             )
         out, lse = _flash_attn_fwd(
             q,
@@ -1220,7 +1241,9 @@ class FlashAttnFunc(torch.autograd.Function):
             softcap=softcap,
             num_splits=num_splits,
             pack_gqa=pack_gqa,
+            score_mod=score_mod,
             mask_mod=mask_mod,
+            aux_tensors=aux_tensors,
             block_sparse_tensors=block_sparse_tensors
         )
         ctx.save_for_backward(q, k, v, out, lse)
@@ -1229,6 +1252,12 @@ class FlashAttnFunc(torch.autograd.Function):
         ctx.window_size = window_size
         ctx.softcap = softcap
         ctx.deterministic = deterministic
+        ctx.pack_gqa = pack_gqa
+        ctx.score_mod = score_mod
+        ctx.score_mod_bwd = score_mod_bwd
+        ctx.mask_mod = mask_mod
+        ctx.aux_tensors = aux_tensors
+        ctx.block_sparse_tensors_bwd = block_sparse_tensors_bwd
         return out, lse
 
     @staticmethod
@@ -1247,6 +1276,12 @@ class FlashAttnFunc(torch.autograd.Function):
             window_size_left=ctx.window_size[0],
             window_size_right=ctx.window_size[1],
             deterministic=ctx.deterministic,
+            pack_gqa=ctx.pack_gqa,
+            score_mod=ctx.score_mod,
+            score_mod_bwd=ctx.score_mod_bwd,
+            mask_mod=ctx.mask_mod,
+            aux_tensors=ctx.aux_tensors,
+            block_sparse_tensors=ctx.block_sparse_tensors_bwd,
         )
         return dq, dk, dv, *((None,) * 20)  # Extra Nones is fine
 
@@ -1272,7 +1307,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         pack_gqa: Optional[bool] = None,
         deterministic: bool = False,
         score_mod: Optional[Callable] = None,
-        aux_tensors: Optional[list] = None,
+        score_mod_bwd: Optional[Callable] = None,
+        aux_tensors: Optional[list[torch.Tensor]] = None,
     ):
         out, lse = _flash_attn_fwd(
             q,
@@ -1300,6 +1336,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         ctx.window_size = window_size
         ctx.softcap = softcap
         ctx.deterministic = deterministic
+        ctx.score_mod = score_mod
+        ctx.score_mod_bwd = score_mod_bwd
+        ctx.aux_tensors = aux_tensors
         return out, lse
 
     @staticmethod
@@ -1322,6 +1361,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             seqused_q=seqused_q,
             seqused_k=seqused_k,
             deterministic=ctx.deterministic,
+            score_mod=ctx.score_mod,
+            score_mod_bwd=ctx.score_mod_bwd,
+            aux_tensors=ctx.aux_tensors,
         )
 
         return dq, dk, dv, *((None,) * 20)
@@ -1339,11 +1381,13 @@ def flash_attn_func(
     num_splits: int = 1,
     pack_gqa: Optional[bool] = None,
     deterministic: bool = False,
+    score_mod: Optional[Callable] = None,
+    score_mod_bwd: Optional[Callable] = None,
     mask_mod: Optional[Callable] = None,
-    full_block_cnt: Optional[torch.Tensor] = None,
-    full_block_idx: Optional[torch.Tensor] = None,
-    mask_block_cnt: Optional[torch.Tensor] = None,
-    mask_block_idx: Optional[torch.Tensor] = None,
+    aux_tensors: Optional[list[torch.Tensor]] = None,
+    block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
+    block_sparse_tensors_bwd: Optional[BlockSparseTensorsTorch] = None,
+    block_mask: Optional[BlockMask] = None, # PyTorch BlockMask overrides BlockSparseTensorsTorch if both are provided
 ):
     return FlashAttnFunc.apply(
         q,
@@ -1357,11 +1401,13 @@ def flash_attn_func(
         num_splits,
         pack_gqa,
         deterministic,
+        score_mod,
+        score_mod_bwd,
         mask_mod,
-        full_block_cnt,
-        full_block_idx,
-        mask_block_cnt,
-        mask_block_idx,
+        aux_tensors,
+        block_sparse_tensors,
+        block_sparse_tensors_bwd,
+        block_mask,
     )
 
 
@@ -1383,7 +1429,8 @@ def flash_attn_varlen_func(
     pack_gqa: Optional[bool] = None,
     deterministic: bool = False,
     score_mod: Optional[Callable] = None,
-    aux_tensors: Optional[list] = None,
+    score_mod_bwd: Optional[Callable] = None,
+    aux_tensors: Optional[list[torch.Tensor]] = None,
 ):
     return FlashAttnVarlenFunc.apply(
         q,
@@ -1403,6 +1450,7 @@ def flash_attn_varlen_func(
         pack_gqa,
         deterministic,
         score_mod,
+        score_mod_bwd,
         aux_tensors,
     )
 
