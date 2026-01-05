@@ -713,7 +713,6 @@ def _flash_attn_bwd(
         assert cu_seqlens_q is None and cu_seqlens_k is None, (
             "varlen + score_mod not supported in bwd yet"
         )
-        assert compute_capability in [10, 11], "score_mod in bwd only supported on SM100/SM110 for now"
 
     device = q.device
     out_torch_dtype = q.dtype
@@ -910,7 +909,6 @@ def _flash_attn_bwd(
             num_aux_tensors,
             use_block_sparsity,
         )
-        cute_aux_tensors = None
     else:
         compile_key = (
             compute_capability,
@@ -999,6 +997,8 @@ def _flash_attn_bwd(
                 AtomLayoutMdQ,
                 num_threads,
                 V_in_regs=V_in_regs,
+                score_mod=score_mod,
+                score_mod_bwd=score_mod_bwd,
                 mask_mod=mask_mod,
                 has_aux_tensors=aux_tensors is not None,
                 subtile_factor=subtile_factor,
@@ -1034,6 +1034,12 @@ def _flash_attn_bwd(
                 block_sparse_tensors,
                 expected_count_shape=expected_count_shape,
                 expected_index_shape=expected_index_shape,
+                context="_flash_attn_bwd",
+                hint=lambda: (
+                    f"Backward expects Q-direction block-sparse tensors (q_mask_cnt/q_mask_idx, and optionally full_q_cnt/full_q_idx). "
+                    f"Regenerate the backward BlockMask with BLOCK_SIZE=({sparse_block_size_q}, {n_block_size}) "
+                    f"(sparse_block_size_q={sparse_block_size_q})."
+                ),
             )
             sparse_tensors_compile = to_cute_block_sparse_tensors(compile_time_normalized)
 
@@ -1076,6 +1082,12 @@ def _flash_attn_bwd(
             block_sparse_tensors,
             expected_count_shape=expected_count_shape,
             expected_index_shape=expected_index_shape,
+            context="_flash_attn_bwd",
+            hint=lambda: (
+                f"Backward expects Q-direction block-sparse tensors (q_mask_cnt/q_mask_idx, and optionally full_q_cnt/full_q_idx). "
+                f"Regenerate the backward BlockMask with BLOCK_SIZE=({sparse_block_size_q}, {n_block_size}) "
+                f"(sparse_block_size_q={sparse_block_size_q})."
+            ),
         )
 
     _flash_attn_bwd.compile_cache[compile_key](
