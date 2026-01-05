@@ -134,93 +134,16 @@ def make_pipeline_state(type: PipelineUserType, stages: int):
 @dataclass(frozen=True)
 class PipelineTmaAsync(PipelineTmaAsyncOg):
     """
-    If size(ClusterShape) == 1, PipelineTmaAsync has all threads
-    signaling the barrier during consumer_release. This causes a perf regression in FA3
-    forward pass (especially hdim 128 causal). We instead implement a version of
-    PipelineTmaAsync where only 1 out of 128 threads signals the barrier.
-
-    Assumptions:
-    (1) num_consumers % NumThreadsPerWarpGroup == 0
-    (2) all 128 threads in the warp group are sync'ed right before calling consumer_release
+    Override producer_acquire to take in extra_tx_count parameter.
     """
 
     @staticmethod
-    def create(
-        *,
-        num_stages: int,
-        producer_group: CooperativeGroup,
-        consumer_group: CooperativeGroup,
-        tx_count: int,
-        barrier_storage: cute.Pointer = None,
-        cta_layout_vmnk: Optional[cute.Layout] = None,
-        tidx: Optional[Int32] = None,
-        mcast_mode_mn: tuple[int, int] = (1, 1),
-        init_wait: cutlass.Constexpr[bool] = True,
-    ):
-        """
-        This helper function computes any necessary attributes and returns an instance of PipelineTmaAsync.
-        :param barrier_storage: Pointer to the smem address for this pipeline's mbarriers
-        :type barrier_storage: cute.Pointer
-        :param num_stages: Number of buffer stages for this pipeline
-        :type num_stages: Int32
-        :param producer_group: `CooperativeGroup` for the producer agent
-        :type producer_group: CooperativeGroup
-        :param consumer_group: `CooperativeGroup` for the consumer agent
-        :type consumer_group: CooperativeGroup
-        :param tx_count: Number of bytes expected to be written to the transaction barrier for one stage
-        :type tx_count: int
-        :param cta_layout_vmnk: Layout of the cluster shape
-        :type cta_layout_vmnk: cute.Layout | None
-        :param tidx: thread index to consumer async threads
-        :type tidx: Int32 | None
-        :param mcast_mode_mn: Tuple of two integers, specifying whether mcast is enabled for the m and n modes. At least one of the two integers must be 1.
-        :type mcast_mode_mn: tuple[int, int]
-        """
-        if not isinstance(barrier_storage, cute.Pointer):
-            raise ValueError(
-                f"Expected barrier_storage to be a cute.Pointer, but got {type(barrier_storage)}"
-            )
-
-        producer_type = PipelineOp.TmaLoad
-        consumer_type = PipelineOp.AsyncThread
-
-        producer = (producer_type, producer_group)
-        consumer = (consumer_type, consumer_group)
-
-        sync_object_full = PipelineAsync._make_sync_object(
-            barrier_storage.align(min_align=8), num_stages, producer, tx_count
-        )
-        sync_object_empty = PipelineAsync._make_sync_object(
-            barrier_storage.align(min_align=8) + num_stages, num_stages, consumer
-        )
-        if tidx is None:
-            tidx, _, _ = cute.arch.thread_idx()
-        if cta_layout_vmnk is None:
-            cta_layout_vmnk = cute.make_layout((1, 1, 1, 1))
-        if const_expr(cta_layout_vmnk is None or cute.size(cta_layout_vmnk) == 1):
-            dst_rank = None
-            is_signalling_thread = tidx % 128 == 0
-        else:
-            (
-                dst_rank,
-                is_signalling_thread,
-            ) = PipelineTmaAsync.init_empty_barrier_arrive_signal(
-                cta_layout_vmnk, tidx, mcast_mode_mn
-            )
-
-        producer_mask = None
-
-        if const_expr(init_wait):
-            pipeline_init_wait()
-
-        return PipelineTmaAsync(
-            sync_object_full,
-            sync_object_empty,
-            num_stages,
-            producer_mask,
-            dst_rank,
-            is_signalling_thread,
-        )
+    def create(*args, **kwargs):
+        obj = PipelineTmaAsyncOg.create(*args, **kwargs)
+        # Can't assign to __class__ directly since the dataclass is frozen
+        # obj.__class__ = PipelineTmaAsync
+        object.__setattr__(obj, "__class__", PipelineTmaAsync)
+        return obj
 
     def producer_acquire(
         self,
@@ -240,22 +163,6 @@ class PipelineTmaAsync(PipelineTmaAsyncOg):
         else:
             tx_count = self.sync_object_full.tx_count + extra_tx_count
             self.sync_object_full.arrive_and_expect_tx(state.index, tx_count)
-
-    def consumer_release(self, state: PipelineState):
-        """
-        TMA consumer release conditionally signals the empty buffer to the producer.
-        """
-        # Only 1 thread per warp group signals the empty buffer.
-        if self.consumer_mask is None:  # No cluster, 1 thread per warp group to signal
-            if_generate(
-                cute.arch.thread_idx()[0] % 128 == 0,
-                lambda: self.sync_object_empty.arrive(state.index, self.consumer_mask),
-            )
-        else:
-            if_generate(
-                self.is_signalling_thread,
-                lambda: self.sync_object_empty.arrive(state.index, self.consumer_mask),
-            )
 
 
 @dataclass(frozen=True)
