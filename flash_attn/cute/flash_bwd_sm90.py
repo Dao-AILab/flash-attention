@@ -943,7 +943,7 @@ class FlashAttentionBackwardSm90:
         while work_tile.is_valid_tile:
             n_block, head_idx, batch_idx, _ = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
-            mask = AttentionMaskCls(seqlen.seqlen_q, seqlen.seqlen_k)
+            mask = AttentionMaskCls(seqlen)
             mask_fn = partial(
                 mask.apply_mask,
                 batch_idx=None,

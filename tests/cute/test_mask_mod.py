@@ -22,7 +22,7 @@ import torch.nn.functional as F
 
 from flash_attn.cute.interface import _flash_attn_fwd, _flash_attn_bwd
 from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch
-from flash_attn.cute.mask_definitions import get_mask_pair, random_doc_id_tensor
+from mask_mod_definitions import get_mask_pair, random_doc_id_tensor
 COMPUTE_CAPABILITY = torch.cuda.get_device_capability()[0]
 
 
@@ -503,7 +503,7 @@ def test_single_doc_bwd_minimal():
     # Create single-document doc_ids (all same doc_id = 0)
     doc_ids = torch.zeros(batch_size, nheads, max(seqlen_q, seqlen_k), dtype=torch.int32, device="cuda")
 
-    from flash_attn.cute.mask_definitions import get_mask_pair
+    from mask_mod_definitions import get_mask_pair
     mask_mod_cute, mask_mod_flex = get_mask_pair("document", seqlen_q=seqlen_q, seqlen_k=seqlen_k)
 
     original_flex_mask = mask_mod_flex
