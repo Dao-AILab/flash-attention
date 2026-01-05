@@ -43,6 +43,7 @@ FORCE_BUILD = os.getenv("FLASH_ATTENTION_FORCE_BUILD", "FALSE") == "TRUE"
 SKIP_CUDA_BUILD = os.getenv("FLASH_ATTENTION_SKIP_CUDA_BUILD", "FALSE") == "TRUE"
 # For CI, we want the option to build with C++11 ABI since the nvcr images use C++11 ABI
 FORCE_CXX11_ABI = os.getenv("FLASH_ATTENTION_FORCE_CXX11_ABI", "FALSE") == "TRUE"
+FORCE_NON_STABLE_API = os.getenv("FLASH_ATTENTION_FORCE_NON_STABLE_API", "FALSE") == "TRUE"
 
 DISABLE_BACKWARD = os.getenv("FLASH_ATTENTION_DISABLE_BACKWARD", "FALSE") == "TRUE"
 DISABLE_SPLIT = os.getenv("FLASH_ATTENTION_DISABLE_SPLIT", "FALSE") == "TRUE"
@@ -576,7 +577,7 @@ if not SKIP_CUDA_BUILD:
     target_version = parse("2.9.0.dev20250830")
     stable_args = []
       
-    if torch_version >= target_version:
+    if torch_version >= target_version and not FORCE_NON_STABLE_API:
         flash_api_source = "flash_api_stable.cpp"
         stable_args = ["-DTORCH_STABLE_ONLY"]  # Checks against including unstable Tensor APIs
     else:
