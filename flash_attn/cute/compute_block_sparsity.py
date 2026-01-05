@@ -4,7 +4,7 @@ from typing import Callable, Optional, Tuple
 import cutlass
 import cutlass.cute as cute
 import torch
-from cutlass import Boolean, Int8, Int32, Uint32, const_expr
+from cutlass import Boolean, Int8, Int32, const_expr
 
 from flash_attn.cute.block_sparsity import (
     BlockSparseTensors,
