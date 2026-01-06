@@ -8,6 +8,7 @@ import cutlass.cute as cute
 from cutlass import Float32, Int32, const_expr
 
 import flash_attn.cute.utils as utils
+from flash_attn.cute.seqlen_info import SeqlenInfoQK
 
 
 @cute.jit
@@ -71,12 +72,19 @@ def mask_r2p_transposed(X: cute.Tensor, row_limit_top: Int32, num_rep: int) -> N
 class AttentionMask:
     tile_m: cutlass.Constexpr[int]
     tile_n: cutlass.Constexpr[int]
-    seqlen_q: Int32
-    seqlen_k: Int32
+    seqlen_info: SeqlenInfoQK
     window_size_left: Optional[Int32] = None
     window_size_right: Optional[Int32] = None
     qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1  # only pass in if we're doing PackGQA
     swap_AB: cutlass.Constexpr[bool] = False
+    
+    @property
+    def seqlen_q(self) -> Int32:
+        return self.seqlen_info.seqlen_q
+        
+    @property
+    def seqlen_k(self) -> Int32:
+        return self.seqlen_info.seqlen_k
 
     @cute.jit
     def apply_mask(
@@ -170,6 +178,7 @@ class AttentionMask:
                         head_idx_ssa,
                         q_idx_ssa,
                         kv_idx_ssa,
+                        self.seqlen_info,
                         aux_tensors,
                     )
                     cond = cutlass.Boolean(utils.ssa_to_scalar(mask_value))
@@ -384,6 +393,7 @@ class AttentionMask:
                     head_idx_ssa,
                     mask_row_ssa,
                     kv_idx_ssa,
+                    self.seqlen_info,
                     aux_tensors,
                 )
                 cond = cutlass.Boolean(utils.ssa_to_scalar(mask_value))

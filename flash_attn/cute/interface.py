@@ -33,6 +33,7 @@ import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
 from flash_attn.cute import utils
+from flash_attn.cute.cute_dsl_utils import to_cute_tensor
 from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80, FlashAttentionForwardSm90
 from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
 from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
@@ -64,15 +65,6 @@ def _validate_tensor(t, name, expected_shape, expected_dtype, expected_device):
     assert t.dtype == expected_dtype, f"{name} dtype {t.dtype} != expected {expected_dtype}"
     assert t.device == expected_device, f"{name} device {t.device} != expected {expected_device}"
     assert t.is_cuda, f"{name} must be on CUDA"
-
-def to_cute_tensor(t, assumed_align=16, leading_dim=-1, fully_dynamic=False):
-    """Convert torch tensor to cute tensor for TVM FFI. leading_dim=-1 defaults to t.ndim-1."""
-    tensor = from_dlpack(t.detach(), assumed_align=assumed_align, enable_tvm_ffi=True)
-    if fully_dynamic:
-        return tensor.mark_layout_dynamic()
-    if leading_dim == -1:
-        leading_dim = t.ndim - 1
-    return tensor.mark_layout_dynamic(leading_dim=leading_dim)
 
 
 torch2cute_dtype_map = {
