@@ -43,8 +43,8 @@ def test_varlen(
         dtype=dtype
     )
 
-    # SM90/SM100 backward pass doesn't support varlen yet
-    skip_backward = IS_SM90 or torch.cuda.get_device_capability()[0] == 10
+    # SM90 backward pass doesn't support varlen yet
+    skip_backward = IS_SM90
 
     ok = check_varlen_vs_torch_flash(
         q, k, v,
@@ -92,14 +92,18 @@ def check_varlen_vs_torch_flash(
     if cu_seqlens_k is not None:
         cu_seqlens_k_fa = cu_seqlens_k.clone()
         cu_seqlens_k_t = cu_seqlens_k.clone()
+        batch_size = cu_seqlens_k.shape[0] - 1
+        max_seqlen_k = (cu_seqlens_k[1:batch_size + 1] - cu_seqlens_k[:batch_size]).max().item()
     else:
         cu_seqlens_k_fa = None
         cu_seqlens_k_t = None
+        max_seqlen_k = None
 
     out_fa, lse_fa = flash_attn_varlen_func(
         q_fa, k_fa, v_fa,
         cu_seqlens_q=cu_seqlens_q_fa,
         cu_seqlens_k=cu_seqlens_k_fa,
+        max_seqlen_k=max_seqlen_k,
         seqused_q=seqused_q,
         seqused_k=seqused_k,
         softmax_scale=(1.0 / q.shape[-1]**0.5) if softmax_scale is None else softmax_scale,
