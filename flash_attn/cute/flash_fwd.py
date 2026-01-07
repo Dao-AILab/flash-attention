@@ -1857,6 +1857,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         self.use_tma_Q,
                         self.tma_copy_bytes["Q"],
                         self.intra_wg_overlap,
+                        self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
                     )
 
                 tile_scheduler.prefetch_next_work()
@@ -2167,6 +2168,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     self.intra_wg_overlap,
                     self.warp_scheduler_barrier_sync,
                     self.warp_scheduler_barrier_arrive,
+                    self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
                 )
 
                 # Handle empty case (when no blocks to process)

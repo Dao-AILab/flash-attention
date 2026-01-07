@@ -163,8 +163,8 @@ def _run_mask_test(
         nheads_kv = nheads
         pack_gqa = False
     elif kv_mode == "gqa":
-        if COMPUTE_CAPABILITY != 10:
-            pytest.xfail("pack_gqa requires SM100")
+        if COMPUTE_CAPABILITY < 9:
+            pytest.xfail("pack_gqa requires SM90+")
         nheads_kv = nheads // 4
         pack_gqa = True
     elif kv_mode == "mqa":
@@ -240,7 +240,7 @@ def _run_mask_test(
     ) = bm.as_tuple()
 
     # SM90 block-sparse backward expects BlockMask granularity (128, 128) regardless of fwd tiling.
-    if COMPUTE_CAPABILITY == 9 and use_block_sparsity:
+    if COMPUTE_CAPABILITY == 9 and use_block_sparsity and (sparse_tile_m, tile_n) != (128, 128):
         bm_bwd = create_block_mask(
             mask_mod_flex,
             batch_size,
@@ -367,7 +367,7 @@ def _run_mask_test(
         f"Kernel error {cute_error:.2e} exceeds {rtol}x PyTorch error {pt_error:.2e} + {fwd_atol:.2e}"
     )
 
-    if needs_backward and kv_mode == "mha":
+    if needs_backward:
         q = tensors["q"]
         k = tensors["k"]
         v = tensors["v"]
