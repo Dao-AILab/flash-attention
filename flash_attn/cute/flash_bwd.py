@@ -612,8 +612,8 @@ class FlashAttentionBackwardSm80:
             thr_mma_dq = tiled_mma_dq.get_slice(tidx)
             acc_shape_dK = thr_mma_dkv.partition_shape_C((self.n_block_size, self.head_dim_padded))
             acc_shape_dV = thr_mma_dkv.partition_shape_C((self.n_block_size, self.head_dim_v_padded))
-            acc_dK = cute.make_fragment(acc_shape_dK, cutlass.Float32)
-            acc_dV = cute.make_fragment(acc_shape_dV, cutlass.Float32)
+            acc_dK = cute.make_rmem_tensor(acc_shape_dK, cutlass.Float32)
+            acc_dV = cute.make_rmem_tensor(acc_shape_dV, cutlass.Float32)
             acc_dK.fill(0.0)
             acc_dV.fill(0.0)
 
@@ -857,7 +857,7 @@ class FlashAttentionBackwardSm80:
         acc_shape_SdP = mma_params.thr_mma_sdp.partition_shape_C(
             (self.m_block_size, self.n_block_size) if cutlass.const_expr(not self.SdP_swapAB) else (self.n_block_size, self.m_block_size)
         )
-        acc_S = cute.make_fragment(acc_shape_SdP, cutlass.Float32)
+        acc_S = cute.make_rmem_tensor(acc_shape_SdP, cutlass.Float32)
         acc_S.fill(0.0)
         cute.arch.cp_async_wait_group(1 if cutlass.const_expr(self.num_stages_Q > 1) else 0)
         cute.arch.barrier()
@@ -868,7 +868,7 @@ class FlashAttentionBackwardSm80:
             smem_copy_params.smem_thr_copy_QdO, smem_copy_params.smem_thr_copy_KV,
             swap_AB=self.SdP_swapAB,
         )
-        tLSErLSE = cute.make_fragment_like(smem_copy_params.tSsLSEMma[None, 0])
+        tLSErLSE = cute.make_rmem_tensor_like(smem_copy_params.tSsLSEMma[None, 0])
         cute.autovec_copy(
             smem_copy_params.tSsLSEMma[None, smem_pipe_read_q if cutlass.const_expr(self.num_stages_Q > 1) else 0], tLSErLSE
         )
@@ -884,7 +884,7 @@ class FlashAttentionBackwardSm80:
         # if cute.arch.thread_idx()[0] == 0 and cute.arch.block_idx()[0] == bidx: cute.print_tensor(acc_S_mn)
 
         # MMA dP
-        acc_dP = cute.make_fragment(acc_shape_SdP, cutlass.Float32)
+        acc_dP = cute.make_rmem_tensor(acc_shape_SdP, cutlass.Float32)
         acc_dP.fill(0.0)
         cute.arch.cp_async_wait_group(1 if cutlass.const_expr(self.num_stages_dO > 1) else 0)
         cute.arch.barrier()
@@ -896,7 +896,7 @@ class FlashAttentionBackwardSm80:
             hook_fn=load_Q_next if cutlass.const_expr(self.num_stages_Q > 1) else None,
             swap_AB=self.SdP_swapAB,
         )
-        tLSErdPsum = cute.make_fragment_like(smem_copy_params.tSsdPsumMma[None, 0])
+        tLSErdPsum = cute.make_rmem_tensor_like(smem_copy_params.tSsdPsumMma[None, 0])
         cute.autovec_copy(
             smem_copy_params.tSsdPsumMma[None, smem_pipe_read_do if cutlass.const_expr(self.num_stages_dO > 1) else 0], tLSErdPsum
         )
@@ -906,12 +906,12 @@ class FlashAttentionBackwardSm80:
         for r in cutlass.range(cute.size(acc_dP_mn, mode=[0]), unroll_full=True):
             acc_dP_mn[r, None].store(acc_S_mn[r, None].load() * (acc_dP_mn[r, None].load() - tLSErdPsum[r]))
         # if cute.arch.thread_idx()[0] == 0 and cute.arch.block_idx()[0] == bidx: cute.print_tensor(acc_dP_mn)
-        rP = cute.make_fragment_like(acc_S, self.dtype)
+        rP = cute.make_rmem_tensor_like(acc_S, self.dtype)
         rP.store(acc_S.load().to(self.dtype))
         if cutlass.const_expr(not self.Mma_dKV_is_RS):
             tPrP = smem_copy_params.r2s_thr_copy_PdS.retile(rP)  # ((Atom,AtomNum), MMA_N, MMA_N)
             cute.copy(smem_copy_params.r2s_thr_copy_PdS, tPrP, smem_copy_params.tPsP)
-        rdS = cute.make_fragment_like(acc_dP, self.dtype)
+        rdS = cute.make_rmem_tensor_like(acc_dP, self.dtype)
         rdS.store(acc_dP.load().to(self.dtype))
         if cutlass.const_expr(not self.Mma_dKV_is_RS):
             cute.arch.barrier()  # Make sure P is written
@@ -941,7 +941,7 @@ class FlashAttentionBackwardSm80:
             acc_shape_dQ = mma_params.thr_mma_dq.partition_shape_C(
                 (self.m_block_size, self.head_dim_padded) if cutlass.const_expr(not self.dQ_swapAB) else (self.head_dim_padded, self.m_block_size)
             )
-            acc_dQ = cute.make_fragment(acc_shape_dQ, cutlass.Float32)
+            acc_dQ = cute.make_rmem_tensor(acc_shape_dQ, cutlass.Float32)
             acc_dQ.fill(0.0)
             sm80_utils.gemm(
                 mma_params.thr_mma_dq, acc_dQ, mma_params.tdQrdS, mma_params.tdQrK,
@@ -1002,9 +1002,9 @@ class FlashAttentionBackwardSm80:
         d_head: cutlass.Int32, 
         d_head_v: cutlass.Int32
     ):
-        rdV = cute.make_fragment_like(acc_dV, self.dtype)
+        rdV = cute.make_rmem_tensor_like(acc_dV, self.dtype)
         rdV.store(acc_dV.load().to(self.dtype))
-        rdK = cute.make_fragment_like(acc_dK, self.dtype)
+        rdK = cute.make_rmem_tensor_like(acc_dK, self.dtype)
         rdK.store(acc_dK.load().to(self.dtype))
         gmem_thr_copy_dK = gmem_tiled_copy_dK.get_slice(tidx)
         gmem_thr_copy_dV = gmem_tiled_copy_dV.get_slice(tidx)
@@ -1043,8 +1043,8 @@ class FlashAttentionBackwardSm80:
             tdKgdK = gmem_thr_copy_dK.partition_D(gdK)
             tdVsdV = gmem_thr_copy_dV.partition_S(sdV)
             tdVgdV = gmem_thr_copy_dV.partition_D(gdV)
-            tdKrdK = cute.make_fragment_like(tdKgdK, self.dtype)
-            tdVrdV = cute.make_fragment_like(tdVgdV, self.dtype)
+            tdKrdK = cute.make_rmem_tensor_like(tdKgdK, self.dtype)
+            tdVrdV = cute.make_rmem_tensor_like(tdVgdV, self.dtype)
             # sync before all smem stores are done.
             cute.arch.barrier()
             # load acc dK and dV from smem to rmem for wider vectorization
@@ -1135,7 +1135,7 @@ class FlashAttentionBackwardSm80:
                 # Instead of using tKcK, we using t0KcK and subtract the offset from the limit
                 # (seqlen - block * kBlockN). This is because the entries of t0KcK are known at compile time.
                 predicate_n = t0KcK[0, n, 0][0] < seqlen - block * self.n_block_size - tKcK[0][0]
-                predicate = cute.make_fragment_like(tKpK[None, 0, None])
+                predicate = cute.make_rmem_tensor_like(tKpK[None, 0, None])
                 for k in cutlass.range_constexpr(cute.size(predicate.shape[1])):
                     for i in cutlass.range_constexpr(cute.size(predicate.shape[0])):
                         predicate[i, k] = (tKpK[i, n, k] if cutlass.const_expr(self.check_hdim_oob) else True) and predicate_n
@@ -1164,7 +1164,7 @@ class FlashAttentionBackwardSm80:
                 # Instead of using tVcV, we using t0VcV and subtract the offset from the limit
                 # (seqlen - block * kBlockN). This is because the entries of t0VcV are known at compile time.
                 predicate_n = t0VcV[0, n, 0][0] < seqlen - block * self.n_block_size - tVcV[0][0]
-                predicate = cute.make_fragment_like(tVpV[None, 0, None])
+                predicate = cute.make_rmem_tensor_like(tVpV[None, 0, None])
                 for k in cutlass.range_constexpr(cute.size(predicate.shape[1])):
                     for i in cutlass.range_constexpr(cute.size(predicate.shape[0])):
                         predicate[i, k] = (tVpV[i, n, k] if cutlass.const_expr(self.check_hdim_oob) else True) and predicate_n
@@ -1195,7 +1195,7 @@ class FlashAttentionBackwardSm80:
                 # Instead of using tQcQ, we using t0QcQ and subtract the offset from the limit
                 # (seqlen - block * kBlockM). This is because the entries of t0QcQ are known at compile time.
                 predicate_m = t0QcQ[0, m, 0][0] < seqlen - block * self.m_block_size - tQcQ[0][0]
-                predicate = cute.make_fragment_like(tQpQ[None, 0, None])
+                predicate = cute.make_rmem_tensor_like(tQpQ[None, 0, None])
                 for k in cutlass.range_constexpr(cute.size(predicate.shape[1])):
                     for i in cutlass.range_constexpr(cute.size(predicate.shape[0])):
                         predicate[i, k] = (tQpQ[i, m, k] if cutlass.const_expr(self.check_hdim_oob) else True) and predicate_m
@@ -1239,7 +1239,7 @@ class FlashAttentionBackwardSm80:
                 # Instead of using tdOcdO, we using t0dOcdO and subtract the offset from the limit
                 # (seqlen - block * kBlockM). This is because the entries of t0dOcdO are known at compile time.
                 predicate_m = t0dOcdO[0, m, 0][0] < seqlen - block * self.m_block_size - tdOcdO[0][0]
-                predicate = cute.make_fragment_like(tdOpdO[None, 0, None])
+                predicate = cute.make_rmem_tensor_like(tdOpdO[None, 0, None])
                 for k in cutlass.range_constexpr(cute.size(predicate.shape[1])):
                     for i in cutlass.range_constexpr(cute.size(predicate.shape[0])):
                         predicate[i, k] = (tdOpdO[i, m, k] if cutlass.const_expr(self.check_hdim_oob) else True) and predicate_m

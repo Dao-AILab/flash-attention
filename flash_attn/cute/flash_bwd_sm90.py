@@ -1093,12 +1093,12 @@ class FlashAttentionBackwardSm90:
         tdQsdQaccum = smem_thr_copy_dQaccum.partition_D(sdQaccum)
 
         dV_shape = (self.tile_n, self.tile_hdimv)
-        acc_dV = cute.make_fragment(
+        acc_dV = cute.make_rmem_tensor(
             tiled_mma_dV.partition_shape_C(dV_shape if not self.dKV_swapAB else dV_shape[::-1]),
             Float32,
         )
         dK_shape = (self.tile_n, self.tile_hdim)
-        acc_dK = cute.make_fragment(
+        acc_dK = cute.make_rmem_tensor(
             tiled_mma_dK.partition_shape_C(dK_shape if not self.dKV_swapAB else dK_shape[::-1]),
             Float32,
         )

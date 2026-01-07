@@ -81,9 +81,9 @@ def score_mod_causal_v2(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_
 def score_mod_batch_bias(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
     batch_bias = aux_tensors[0]
     dtype = batch_bias.element_type
-    b_frag = cute.make_fragment(1, cutlass.Int32)
+    b_frag = cute.make_rmem_tensor(1, cutlass.Int32)
     b_frag.store(b_idx)
-    bias_frag = cute.make_fragment(1, dtype)
+    bias_frag = cute.make_rmem_tensor(1, dtype)
     bias_frag[0] = batch_bias[b_frag[0]]
     bias_val = (bias_frag.load()).to(cutlass.Float32)
     return tSrS_ssa + bias_val
@@ -95,15 +95,15 @@ def score_mod_dual_buffer(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, au
     pos_bias = aux_tensors[1]
     dtype = head_bias.element_type
 
-    h_frag = cute.make_fragment(1, cutlass.Int32)
+    h_frag = cute.make_rmem_tensor(1, cutlass.Int32)
     h_frag.store(h_idx)
-    head_val_frag = cute.make_fragment(1, dtype)
+    head_val_frag = cute.make_rmem_tensor(1, dtype)
     head_val_frag[0] = head_bias[h_frag[0]]
     head_val = (head_val_frag.load()).to(cutlass.Float32)
 
-    q_frag = cute.make_fragment(1, cutlass.Int32)
+    q_frag = cute.make_rmem_tensor(1, cutlass.Int32)
     q_frag.store(q_idx)
-    pos_val_frag = cute.make_fragment(1, dtype)
+    pos_val_frag = cute.make_rmem_tensor(1, dtype)
     pos_val_frag[0] = pos_bias[q_frag[0]]
     pos_val = (pos_val_frag.load()).to(cutlass.Float32)
 
@@ -126,9 +126,9 @@ def score_mod_global_kv_bias(
     kv_idx_global = kv_idx + offset_k
     token_bias = aux_tensors[0]
     dtype = token_bias.element_type
-    kv_frag = cute.make_fragment(1, cutlass.Int32)
+    kv_frag = cute.make_rmem_tensor(1, cutlass.Int32)
     kv_frag.store(kv_idx_global)
-    bias_frag = cute.make_fragment(1, dtype)
+    bias_frag = cute.make_rmem_tensor(1, dtype)
     bias_frag[0] = token_bias[kv_frag[0]]
 
     return tSrS_ssa + (bias_frag.load()).to(cutlass.Float32)
@@ -143,9 +143,9 @@ def score_mod_global_q_bias(
     q_idx_global = q_idx + offset_q
     token_bias = aux_tensors[0]
     dtype = token_bias.element_type
-    q_frag = cute.make_fragment(1, cutlass.Int32)
+    q_frag = cute.make_rmem_tensor(1, cutlass.Int32)
     q_frag.store(q_idx_global)
-    bias_frag = cute.make_fragment(1, dtype)
+    bias_frag = cute.make_rmem_tensor(1, dtype)
     bias_frag[0] = token_bias[q_frag[0]]
     return tSrS_ssa + (bias_frag.load()).to(cutlass.Float32)
 
@@ -164,9 +164,9 @@ def score_mod_global_rel_plus_kv_bias(
     rel_pos_abs = cute.TensorSSA(mlir_math.absi(rel_pos), rel_pos.shape, rel_pos.dtype)
     rel_bias = rel_pos_abs.to(cutlass.Float32) * cute.full_like(tSrS_ssa, 0.1)
 
-    kv_frag = cute.make_fragment(1, cutlass.Int32)
+    kv_frag = cute.make_rmem_tensor(1, cutlass.Int32)
     kv_frag.store(kv_idx_global)
-    bias_frag = cute.make_fragment(1, dtype)
+    bias_frag = cute.make_rmem_tensor(1, dtype)
     bias_frag[0] = token_bias[kv_frag[0]]
 
     return tSrS_ssa + rel_bias + (bias_frag.load()).to(cutlass.Float32)
@@ -185,14 +185,14 @@ def score_mod_global_q_and_kv_bias(
     kv_bias = aux_tensors[1]
     dtype = q_bias.element_type
 
-    q_frag = cute.make_fragment(1, cutlass.Int32)
+    q_frag = cute.make_rmem_tensor(1, cutlass.Int32)
     q_frag.store(q_idx_global)
-    q_bias_frag = cute.make_fragment(1, dtype)
+    q_bias_frag = cute.make_rmem_tensor(1, dtype)
     q_bias_frag[0] = q_bias[q_frag[0]]
 
-    kv_frag = cute.make_fragment(1, cutlass.Int32)
+    kv_frag = cute.make_rmem_tensor(1, cutlass.Int32)
     kv_frag.store(kv_idx_global)
-    kv_bias_frag = cute.make_fragment(1, dtype)
+    kv_bias_frag = cute.make_rmem_tensor(1, dtype)
     kv_bias_frag[0] = kv_bias[kv_frag[0]]
 
     return (
@@ -216,9 +216,9 @@ def score_mod_global_logical_rel_plus_kv_bias(
     rel_pos_abs = cute.TensorSSA(mlir_math.absi(rel_pos), rel_pos.shape, rel_pos.dtype)
     rel_bias = rel_pos_abs.to(cutlass.Float32) * cute.full_like(tSrS_ssa, 0.01)
 
-    kv_frag = cute.make_fragment(1, cutlass.Int32)
+    kv_frag = cute.make_rmem_tensor(1, cutlass.Int32)
     kv_frag.store(kv_idx_global)
-    bias_frag = cute.make_fragment(1, dtype)
+    bias_frag = cute.make_rmem_tensor(1, dtype)
     bias_frag[0] = token_bias[kv_frag[0]]
 
     return tSrS_ssa + rel_bias + (bias_frag.load()).to(cutlass.Float32)
@@ -241,9 +241,9 @@ def score_mod_stress_complex_arithmetic(
     rel_pos_abs = cute.TensorSSA(mlir_math.absi(rel_pos), rel_pos.shape, rel_pos.dtype)
     rel_bias = rel_pos_abs.to(cutlass.Float32) * cute.full_like(tSrS_ssa, 0.001)
 
-    q_frag = cute.make_fragment(1, cutlass.Int32)
+    q_frag = cute.make_rmem_tensor(1, cutlass.Int32)
     q_frag.store(q_idx_global)
-    bias_q_frag = cute.make_fragment(1, dtype)
+    bias_q_frag = cute.make_rmem_tensor(1, dtype)
     bias_q_frag[0] = bias[q_frag[0]]
     bias_q = (bias_q_frag.load()).to(cutlass.Float32)
 
@@ -266,9 +266,9 @@ def score_mod_stress_conditional_mask(
     token_bias = aux_tensors[0]
     dtype = token_bias.element_type
 
-    kv_frag = cute.make_fragment(1, cutlass.Int32)
+    kv_frag = cute.make_rmem_tensor(1, cutlass.Int32)
     kv_frag.store(kv_idx_global)
-    bias_frag = cute.make_fragment(1, dtype)
+    bias_frag = cute.make_rmem_tensor(1, dtype)
     bias_frag[0] = token_bias[kv_frag[0]]
     bias_val = (bias_frag.load()).to(cutlass.Float32)
 
@@ -301,27 +301,27 @@ def score_mod_stress_multi_buffer(
 
     dtype = batch_bias.element_type
 
-    b_frag = cute.make_fragment(1, cutlass.Int32)
+    b_frag = cute.make_rmem_tensor(1, cutlass.Int32)
     b_frag.store(b_idx)
-    bb_frag = cute.make_fragment(1, dtype)
+    bb_frag = cute.make_rmem_tensor(1, dtype)
     bb_frag[0] = batch_bias[b_frag[0]]
     bb_val = (bb_frag.load()).to(cutlass.Float32)
 
-    h_frag = cute.make_fragment(1, cutlass.Int32)
+    h_frag = cute.make_rmem_tensor(1, cutlass.Int32)
     h_frag.store(h_idx)
-    hs_frag = cute.make_fragment(1, dtype)
+    hs_frag = cute.make_rmem_tensor(1, dtype)
     hs_frag[0] = head_scale[h_frag[0]]
     hs_val = (hs_frag.load()).to(cutlass.Float32)
 
-    qg_frag = cute.make_fragment(1, cutlass.Int32)
+    qg_frag = cute.make_rmem_tensor(1, cutlass.Int32)
     qg_frag.store(q_idx_global)
-    qpb_frag = cute.make_fragment(1, dtype)
+    qpb_frag = cute.make_rmem_tensor(1, dtype)
     qpb_frag[0] = q_pos_bias[qg_frag[0]]
     qpb_val = (qpb_frag.load()).to(cutlass.Float32)
 
-    kvg_frag = cute.make_fragment(1, cutlass.Int32)
+    kvg_frag = cute.make_rmem_tensor(1, cutlass.Int32)
     kvg_frag.store(kv_idx_global)
-    kvpb_frag = cute.make_fragment(1, dtype)
+    kvpb_frag = cute.make_rmem_tensor(1, dtype)
     kvpb_frag[0] = kv_pos_bias[kvg_frag[0]]
     kvpb_val = (kvpb_frag.load()).to(cutlass.Float32)
 
@@ -334,9 +334,9 @@ def score_mod_stress_multi_buffer(
         cute.full_like(rel_idx_clamped, 1024),
         rel_idx_clamped,
     )
-    ri_frag = cute.make_fragment(1, cutlass.Int32)
+    ri_frag = cute.make_rmem_tensor(1, cutlass.Int32)
     ri_frag.store(rel_idx_clamped)
-    rps_frag = cute.make_fragment(1, dtype)
+    rps_frag = cute.make_rmem_tensor(1, dtype)
     rps_frag[0] = rel_pos_scale[ri_frag[0]]
     rps_val = (rps_frag.load()).to(cutlass.Float32)
 
@@ -353,9 +353,9 @@ def score_mod_stress_global_offset(
     token_bias = aux_tensors[0]
     dtype = token_bias.element_type
 
-    kv_frag = cute.make_fragment(1, cutlass.Int32)
+    kv_frag = cute.make_rmem_tensor(1, cutlass.Int32)
     kv_frag.store(kv_idx_global)
-    bias_frag = cute.make_fragment(1, dtype)
+    bias_frag = cute.make_rmem_tensor(1, dtype)
     bias_frag[0] = token_bias[kv_frag[0]]
 
     return tSrS_ssa + (bias_frag.load()).to(cutlass.Float32)
@@ -375,9 +375,9 @@ def score_mod_stress_xor_pattern(
     pattern_logical = xor_logical & cute.full_like(xor_logical, 0xFF)
     pattern_bias = pattern_logical.to(cutlass.Float32) * cute.full_like(tSrS_ssa, 0.001)
 
-    kv_frag = cute.make_fragment(1, cutlass.Int32)
+    kv_frag = cute.make_rmem_tensor(1, cutlass.Int32)
     kv_frag.store(kv_idx_global)
-    bias_frag = cute.make_fragment(1, dtype)
+    bias_frag = cute.make_rmem_tensor(1, dtype)
     bias_frag[0] = token_bias[kv_frag[0]]
 
     return (

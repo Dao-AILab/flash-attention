@@ -64,7 +64,7 @@ class Softmax(ParamsBase):
         """
         # Change acc_S to M,N layout view.
         acc_S_mn = utils.make_acc_tensor_mn_view(acc_S)
-        row_scale = cute.make_fragment_like(self.row_max, Float32)
+        row_scale = cute.make_rmem_tensor_like(self.row_max, Float32)
 
         row_max = self.row_max
         row_sum = self.row_sum
@@ -123,7 +123,7 @@ class Softmax(ParamsBase):
 
         # quad reduction for row_sum as we didn't do it during each iteration of online softmax
         row_sum.store(utils.warp_reduce(row_sum.load(), operator.add, width=4))
-        row_scale = cute.make_fragment_like(row_max, Float32)
+        row_scale = cute.make_rmem_tensor_like(row_max, Float32)
 
         for r in cutlass.range(cute.size(row_sum), unroll_full=True):
             if cutlass.const_expr(sink_val is not None):
@@ -251,14 +251,14 @@ class SoftmaxSm100(Softmax):
                 # acc_S_row_frg[k, j] = utils.exp2f(acc_S_row_frg[k, j])
                 # acc_S_row_frg[k + 1, j] = utils.exp2f(acc_S_row_frg[k + 1, j])
                 if cutlass.const_expr(not e2e):
-                    acc_S_row_frg[k, j] = cute.arch.exp2(acc_S_row_frg[k, j])
-                    acc_S_row_frg[k + 1, j] = cute.arch.exp2(acc_S_row_frg[k + 1, j])
+                    acc_S_row_frg[k, j] = cute.math.exp2(acc_S_row_frg[k, j], fastmath=True)
+                    acc_S_row_frg[k + 1, j] = cute.math.exp2(acc_S_row_frg[k + 1, j], fastmath=True)
                 else:
                     if cutlass.const_expr(
                         k % e2e_freq < e2e_freq - e2e_res or j >= frg_cnt - e2e_frg_limit
                     ):
-                        acc_S_row_frg[k, j] = cute.arch.exp2(acc_S_row_frg[k, j])
-                        acc_S_row_frg[k + 1, j] = cute.arch.exp2(acc_S_row_frg[k + 1, j])
+                        acc_S_row_frg[k, j] = cute.math.exp2(acc_S_row_frg[k, j], fastmath=True)
+                        acc_S_row_frg[k + 1, j] = cute.math.exp2(acc_S_row_frg[k + 1, j], fastmath=True)
                     else:
                         # acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = utils.e2e_asm2(acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j])
                         acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = utils.ex2_emulation_2(
@@ -312,8 +312,8 @@ class SoftmaxSm100(Softmax):
                 # )
                 # acc_S_row_frg[k, j] = utils.exp2f(acc_S_row_frg[k, j])
                 # acc_S_row_frg[k + 1, j] = utils.exp2f(acc_S_row_frg[k + 1, j])
-                acc_S_row_frg[k, j] = cute.arch.exp2(acc_S_row_frg[k, j])
-                acc_S_row_frg[k + 1, j] = cute.arch.exp2(acc_S_row_frg[k + 1, j])
+                acc_S_row_frg[k, j] = cute.math.exp2(acc_S_row_frg[k, j], fastmath=True)
+                acc_S_row_frg[k + 1, j] = cute.math.exp2(acc_S_row_frg[k + 1, j], fastmath=True)
             acc_S_row_converted_frg[None, j].store(
                 acc_S_row_frg[None, j].load().to(acc_S_row_converted.element_type)
             )
@@ -507,15 +507,15 @@ def apply_score_mod_bwd_inner(
         q_idx_pos = cutlass.const_expr(0)
         kv_idx_pos = cutlass.const_expr(1)
     n_vals = cutlass.const_expr(cute.size(grad_tensor.shape))
-    grad_vec = cute.make_fragment(vec_size, qk_acc_dtype)
-    score_vec = cute.make_fragment(vec_size, qk_acc_dtype)
-    kv_idx_vec = cute.make_fragment(vec_size, cutlass.Int32)
+    grad_vec = cute.make_rmem_tensor(vec_size, qk_acc_dtype)
+    score_vec = cute.make_rmem_tensor(vec_size, qk_acc_dtype)
+    kv_idx_vec = cute.make_rmem_tensor(vec_size, cutlass.Int32)
     batch_idx_ssa = utils.scalar_to_ssa(batch_idx, cutlass.Int32).broadcast_to((vec_size,))
-    q_idx_vec = cute.make_fragment(vec_size, cutlass.Int32)
+    q_idx_vec = cute.make_rmem_tensor(vec_size, cutlass.Int32)
 
     # For Pack-GQA with non-constant q_idx, we need per-element head indices
     if cutlass.const_expr(qhead_per_kvhead > 1 and constant_q_idx is None):
-        head_idx_vec = cute.make_fragment(vec_size, cutlass.Int32)
+        head_idx_vec = cute.make_rmem_tensor(vec_size, cutlass.Int32)
 
     for i in cutlass.range(0, n_vals, vec_size, unroll_full=True):
         for j in cutlass.range(vec_size, unroll_full=True):
