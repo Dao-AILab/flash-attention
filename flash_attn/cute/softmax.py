@@ -258,7 +258,9 @@ class SoftmaxSm100(Softmax):
                         k % e2e_freq < e2e_freq - e2e_res or j >= frg_cnt - e2e_frg_limit
                     ):
                         acc_S_row_frg[k, j] = cute.math.exp2(acc_S_row_frg[k, j], fastmath=True)
-                        acc_S_row_frg[k + 1, j] = cute.math.exp2(acc_S_row_frg[k + 1, j], fastmath=True)
+                        acc_S_row_frg[k + 1, j] = cute.math.exp2(
+                            acc_S_row_frg[k + 1, j], fastmath=True
+                        )
                     else:
                         # acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = utils.e2e_asm2(acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j])
                         acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = utils.ex2_emulation_2(
