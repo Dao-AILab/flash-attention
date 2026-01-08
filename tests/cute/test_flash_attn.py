@@ -112,8 +112,8 @@ def test_flash_attn_output(
     torch.random.manual_seed(0)
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
-    # batch_size = 9 if seqlen_k <= 2048 else 2
-    batch_size = 2
+    batch_size = 9 if seqlen_k <= 2048 else 2
+    # batch_size = 2
     nheads = 6
     # nheads = 1
     nheads_kv = nheads if mha_type == "mha" else (3 if mha_type == "gqa" else 1)
