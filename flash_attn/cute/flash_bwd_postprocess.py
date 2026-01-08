@@ -383,7 +383,7 @@ class FlashAttentionBackwardPostprocess:
                 acc_shape = tiled_mma.partition_shape_C(
                     tile_shape if const_expr(not dQ_swapAB) else tile_shape[::-1]
                 )
-                acc = cute.make_fragment(acc_shape, cutlass.Float32)
+                acc = cute.make_rmem_tensor(acc_shape, cutlass.Float32)
                 assert cute.size(acc) == cute.size(tdQsdQaccum)
             else:
                 thr_mma = tiled_mma.get_slice(0)  # 1-CTA
@@ -398,11 +398,11 @@ class FlashAttentionBackwardPostprocess:
                 tiled_copy_t2r = tcgen05.make_tmem_copy(tmem_load_atom, tdQtdQ)
                 thr_copy_t2r = tiled_copy_t2r.get_slice(tidx)
                 tdQrdQ_t2r_shape = thr_copy_t2r.partition_D(tdQcdQ).shape
-                acc = cute.make_fragment(tdQrdQ_t2r_shape, Float32)
+                acc = cute.make_rmem_tensor(tdQrdQ_t2r_shape, Float32)
             tdQrdQaccum = cute.make_tensor(acc.iterator, cute.make_layout(tdQsdQaccum.shape))
             cute.autovec_copy(tdQsdQaccum, tdQrdQaccum)
             # Convert tdQrdQaccum from fp32 to fp16/bf16
-            rdQ = cute.make_fragment_like(acc, self.dtype)
+            rdQ = cute.make_rmem_tensor_like(acc, self.dtype)
             rdQ.store((acc.load() * scale).to(self.dtype))
 
             # Step 3: Copy dQ from register to smem
@@ -442,7 +442,7 @@ class FlashAttentionBackwardPostprocess:
             gmem_thr_copy_dQ = gmem_tiled_copy_dQ.get_slice(tidx)
             tdQgdQ = gmem_thr_copy_dQ.partition_S(gdQ)
             tdQsdQ = gmem_thr_copy_dQ.partition_D(sdQ)
-            tdQrdQ = cute.make_fragment_like(tdQsdQ, self.dtype)
+            tdQrdQ = cute.make_rmem_tensor_like(tdQsdQ, self.dtype)
             # TODO: check OOB when reading from smem if kBlockM isn't evenly tiled
             cute.autovec_copy(tdQsdQ, tdQrdQ)
 
@@ -639,7 +639,7 @@ class FlashAttentionBackwardPostprocess_sm100(FlashAttentionBackwardPostprocess)
         smem_thr_copy_g2s = G2S_tiled_copy_dQaccum.get_slice(tidx)
 
         # S->R
-        tdQrdQ_t2r = cute.make_fragment(tdQrdQ.shape, cutlass.Float32)
+        tdQrdQ_t2r = cute.make_rmem_tensor(tdQrdQ.shape, cutlass.Float32)
         tiled_smem_store_s2r = cute.make_tiled_copy(
             atom_universal_copy, layout_tv=layout_tv, tiler_mn=tiler_mn
         )
@@ -658,7 +658,7 @@ class FlashAttentionBackwardPostprocess_sm100(FlashAttentionBackwardPostprocess)
             tiler_mn=tiled_tmem_ld.tiler_mn,
         )
         tdQsdQ_r2s = thr_tmem_ld.partition_D(thr_mma_dsk.partition_C(sdQ))
-        tdQrdQ_r2s = cute.make_fragment(tdQsdQ_r2s.shape, self.dtype)
+        tdQrdQ_r2s = cute.make_rmem_tensor(tdQsdQ_r2s.shape, self.dtype)
 
         num_stages = cute.size(tdQrdQ_t2r, mode=[1])
         for stage in cutlass.range_constexpr(num_stages):

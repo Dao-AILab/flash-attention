@@ -1901,7 +1901,7 @@ class FlashAttentionForwardSm100:
 
         # Wait for Si
         cute.arch.mbarrier_wait(mbar_ptr + self.mbar_S_full_offset + stage, mma_si_consumer_phase)
-        tSrS_t2r = cute.make_fragment(thr_tmem_load.partition_D(tScS).shape, self.qk_acc_dtype)
+        tSrS_t2r = cute.make_rmem_tensor(thr_tmem_load.partition_D(tScS).shape, self.qk_acc_dtype)
         cute.copy(thr_tmem_load, tStS_t2r, tSrS_t2r)
         if cutlass.const_expr(self.score_mod is not None):
             self.apply_score_mod(
@@ -1923,7 +1923,7 @@ class FlashAttentionForwardSm100:
         row_max, acc_scale = softmax.update_row_max(tSrS_t2r.load(), is_first)
 
         if const_expr(not is_first):
-            # tSrScale_r2t = cute.make_fragment(thr_tmem_store_scale.partition_S(tScScale).shape, Float32)
+            # tSrScale_r2t = cute.make_rmem_tensor(thr_tmem_store_scale.partition_S(tScScale).shape, Float32)
             # tSrScale_r2t[0] = acc_scale
             # cute.copy(thr_tmem_store_scale, tSrScale_r2t, tStScale_r2t)
             # cute.arch.fence_view_async_tmem_store()
@@ -1941,7 +1941,7 @@ class FlashAttentionForwardSm100:
             cute.arch.mbarrier_wait(
                 mbar_ptr + mbar_s0_s1_sequence_offset + stage * 4, s0_s1_sequence_phase
             )
-        tSrP_r2t_f32 = cute.make_fragment(thr_tmem_store.partition_S(tScP).shape, Float32)
+        tSrP_r2t_f32 = cute.make_rmem_tensor(thr_tmem_store.partition_S(tScP).shape, Float32)
         tSrP_r2t = cute.make_tensor(
             cute.recast_ptr(tSrP_r2t_f32.iterator, dtype=self.q_dtype),
             tSrS_t2r.layout,
@@ -2059,7 +2059,7 @@ class FlashAttentionForwardSm100:
                     )
                 softmax_corr_consumer_phase ^= 1
 
-                tSrScale_t2r = cute.make_fragment(tSrScale_t2r_shape, Float32)
+                tSrScale_t2r = cute.make_rmem_tensor(tSrScale_t2r_shape, Float32)
                 for i in cutlass.range(total_block_count - 1, unroll=1):
                     for stage in cutlass.range_constexpr(self.q_stage):
                         # wait for S0 / S1
@@ -2296,9 +2296,9 @@ class FlashAttentionForwardSm100:
         tOtO_r2t = thr_tmem_store.partition_D(tOtO_i)
 
         frg_count = self.head_dim_v_padded // corr_tile_size
-        tOrO_frg = cute.make_fragment((tOrO_t2r_shape, frg_count), self.pv_acc_dtype)
+        tOrO_frg = cute.make_rmem_tensor((tOrO_t2r_shape, frg_count), self.pv_acc_dtype)
         for i in cutlass.range_constexpr(frg_count):
-            tOrO_frg = cute.make_fragment(tOrO_t2r_shape, self.pv_acc_dtype)
+            tOrO_frg = cute.make_rmem_tensor(tOrO_t2r_shape, self.pv_acc_dtype)
             tOtO_t2r_i = cute.make_tensor(tOtO_t2r.iterator + i * corr_tile_size, tOtO_t2r.layout)
             cute.copy(thr_tmem_load, tOtO_t2r_i, tOrO_frg)
             for j in cutlass.range(0, cute.size(tOrO_frg), 2, unroll_full=True):
@@ -2380,14 +2380,14 @@ class FlashAttentionForwardSm100:
         for i in cutlass.range_constexpr(self.head_dim_v_padded // corr_tile_size):
             tOtO_t2r_i = tOtO_t2r[None, 0, 0, i]
             tOsO_r2s_i = tOsO_s2r[None, 0, 0, i]
-            tOrO_frg = cute.make_fragment(tOcO_t2r[None, 0, 0, i].shape, self.pv_acc_dtype)
+            tOrO_frg = cute.make_rmem_tensor(tOcO_t2r[None, 0, 0, i].shape, self.pv_acc_dtype)
             cute.copy(tiled_tmem_load, tOtO_t2r_i, tOrO_frg)
             for j in cutlass.range_constexpr(0, cute.size(tOrO_frg), 2):
                 tOrO_frg[j], tOrO_frg[j + 1] = utils.mul_packed_f32x2(
                     (tOrO_frg[j], tOrO_frg[j + 1]),
                     (scale, scale),
                 )
-            tOrO_frg_cvt = cute.make_fragment(tOrO_frg.shape, self.o_dtype)
+            tOrO_frg_cvt = cute.make_rmem_tensor(tOrO_frg.shape, self.o_dtype)
             tOrO_frg_cvt.store(tOrO_frg.load().to(self.o_dtype))
             cute.copy(tiled_smem_store, tOrO_frg_cvt, tOsO_r2s_i)
         # fence view async shared
@@ -2416,7 +2416,7 @@ class FlashAttentionForwardSm100:
             )
 
             # load acc O from smem to rmem for wider vectorization
-            tOrO = cute.make_fragment_like(tOsO, self.o_dtype)
+            tOrO = cute.make_rmem_tensor_like(tOsO, self.o_dtype)
             cute.autovec_copy(tOsO, tOrO)
             # copy acc O from rmem to gmem
             if const_expr(not self.pack_gqa):
@@ -2517,7 +2517,7 @@ class FlashAttentionForwardSm100:
                         )
                         # 2. copy O0 / O1 to gmem
                         # load acc O from smem to rmem for wider vectorization
-                        tOrO = cute.make_fragment_like(tOsO[None, None, None, 0], self.o_dtype)
+                        tOrO = cute.make_rmem_tensor_like(tOsO[None, None, None, 0], self.o_dtype)
                         cute.autovec_copy(tOsO[None, None, None, stage], tOrO)
                         # copy acc O from rmem to gmem
                         if const_expr(not self.pack_gqa):

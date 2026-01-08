@@ -123,6 +123,7 @@ def cute_compile_patched(*args, **kwargs):
             pathlib.Path(cubin_path).with_suffix(".annotated.sass").write_text(sass)
     return output
 
+
 def to_cute_tensor(t, assumed_align=16, leading_dim=-1, fully_dynamic=False, enable_tvm_ffi=True):
     """Convert torch tensor to cute tensor for TVM FFI. leading_dim=-1 defaults to t.ndim-1."""
     tensor = from_dlpack(t.detach(), assumed_align=assumed_align, enable_tvm_ffi=enable_tvm_ffi)
