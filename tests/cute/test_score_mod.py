@@ -76,6 +76,7 @@ SEQLEN_CONFIGS = [
     (4096, 4096),
     (4224, 4224),
 ]
+COMPUTE_CAPABILITY = torch.cuda.get_device_capability()[0]
 
 
 def create_tensors(

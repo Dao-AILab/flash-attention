@@ -549,6 +549,7 @@ class AttentionMask:
                         head_idx_ssa,
                         q_idx_ssa,
                         kv_idx_ssa,
+                        self.seqlen_info,
                         aux_tensors,
                     )
                     cond = cutlass.Boolean(utils.ssa_to_scalar(mask_value))
