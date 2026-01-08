@@ -35,6 +35,8 @@ from score_mod_definitions import (
     dual_buffer_factory as dual_buffer_bias,
 )
 
+COMPUTE_CAPABILITY = torch.cuda.get_device_capability()[0]
+
 # Test pairs: (cute_jit_function, eager_reference_function)
 TEST_PAIRS = [
     (score_mod_1, None),

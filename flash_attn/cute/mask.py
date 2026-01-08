@@ -77,11 +77,11 @@ class AttentionMask:
     window_size_right: Optional[Int32] = None
     qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1  # only pass in if we're doing PackGQA
     swap_AB: cutlass.Constexpr[bool] = False
-    
+
     @property
     def seqlen_q(self) -> Int32:
         return self.seqlen_info.seqlen_q
-        
+
     @property
     def seqlen_k(self) -> Int32:
         return self.seqlen_info.seqlen_k
@@ -549,6 +549,7 @@ class AttentionMask:
                         head_idx_ssa,
                         q_idx_ssa,
                         kv_idx_ssa,
+                        self.seqlen_info,
                         aux_tensors,
                     )
                     cond = cutlass.Boolean(utils.ssa_to_scalar(mask_value))
