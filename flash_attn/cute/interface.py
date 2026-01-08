@@ -829,9 +829,11 @@ def _flash_attn_bwd(
             to_cute_tensor(t, assumed_align=4) if t is not None else None
             for t in (cu_seqlens_q, seqused_q)
         ]
+        arch = compute_capability * 10
         fa_bwd_pre = FlashAttentionBackwardPreprocess(
             dtype,
             head_dim_v,
+            arch,
             m_block_size,
             num_threads=num_threads,
         )
