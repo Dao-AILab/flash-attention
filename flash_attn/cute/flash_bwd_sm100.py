@@ -607,7 +607,7 @@ class FlashAttentionBackwardSm100:
         else:
             TileScheduler = SingleTileScheduler
         # reads n_blocks right-to-left
-        self.spt = (self.is_causal or self.is_local) and self.deterministic and not self.is_varlen_k
+        self.spt = (self.is_causal or self.is_local) and self.deterministic
         tile_sched_args = TileSchedulerArguments(
             cute.ceil_div(cute.size(mK.shape[0]), self.cta_tiler[0]),  # num_blocks
             cute.size(mQ.shape[2]),  # num_heads = num_query_heads
@@ -627,6 +627,7 @@ class FlashAttentionBackwardSm100:
             element_size=self.k_dtype.width // 8,
             is_persistent=self.is_persistent,  # persistent mode not tested
             lpt=self.spt,
+            head_swizzle=self.deterministic,
         )
 
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)

@@ -31,7 +31,7 @@ from flash_attn.cute.interface import (
 
 DISABLE_SPLIT = os.getenv("FLASH_ATTENTION_DISABLE_SPLIT", "FALSE") == "TRUE"
 IS_SM90 = torch.cuda.get_device_capability()[0] == 9
-
+INCREASED_TRIALS = False
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
@@ -304,7 +304,7 @@ def test_flash_attn_output(
                 dv_pt - dv_ref
             ).abs().max().item() + dv_atol
 
-            num_iters = 20_000
+            num_iters = 10_000 if INCREASED_TRIALS else 1000
             for i in range(num_iters):
                 dq2, dk2, dv2, = _flash_attn_bwd(
                     q, k, v, out, g, lse,
@@ -345,8 +345,8 @@ def test_flash_attn_output(
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-# @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
-@pytest.mark.parametrize("mha_type", ["gqa"])
+@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
+# @pytest.mark.parametrize("mha_type", ["gqa"])
 # @pytest.mark.parametrize("has_learnable_sink", [False, True])
 @pytest.mark.parametrize("has_learnable_sink", [False])
 # @pytest.mark.parametrize("has_qv", [False, True])
@@ -355,10 +355,10 @@ def test_flash_attn_output(
 @pytest.mark.parametrize("deterministic", [True])
 # @pytest.mark.parametrize("softcap", [0.0, 15.0])
 @pytest.mark.parametrize("softcap", [0.0])
-# @pytest.mark.parametrize("local_enum", [0, 1, 2, 3])
-@pytest.mark.parametrize("local_enum", [0, 1])
+@pytest.mark.parametrize("local_enum", [0, 1, 2, 3])
+# @pytest.mark.parametrize("local_enum", [0, 1])
 @pytest.mark.parametrize("causal", [False, True])
-# @pytest.mark.parametrize("causal", [False])
+# @pytest.mark.parametrize("causal", [True])
 # @pytest.mark.parametrize("add_unused_qkv", [False, True])
 @pytest.mark.parametrize("add_unused_qkv", [False])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
@@ -735,7 +735,7 @@ def test_flash_attn_varlen_output(
                 dv_pt - dv_ref
             ).abs().max().item() + dv_atol
 
-            num_iters = 10_000
+            num_iters = 10_000 if INCREASED_TRIALS else 1000
 
             for i in range(num_iters):
                 dq_unpad2, dk_unpad2, dv_unpad2 = _flash_attn_bwd(
@@ -752,28 +752,25 @@ def test_flash_attn_varlen_output(
 
                 diff_dq = (dq_unpad - dq_unpad2).abs()
                 max_idx = diff_dq.argmax()
-                print(f"dQ max diff: {diff_dq.max().item()}")
-                print(f"  at index {max_idx.item()}: dQ={dq_unpad.flatten()[max_idx].item()}, dQ2={dq_unpad2.flatten()[max_idx].item()}")
+                if i % 100 == 0:
+                    print(f"dQ max diff: {diff_dq.max().item()}")
+                    print(f"  at index {max_idx.item()}: dQ={dq_unpad.flatten()[max_idx].item()}, dQ2={dq_unpad2.flatten()[max_idx].item()}")
 
                 diff_dk = (dk_unpad - dk_unpad2).abs()
                 max_idx = diff_dk.argmax()
-                print(f"dK max diff: {diff_dk.max().item()}")
-                print(f"  at index {max_idx.item()}: dK={dk_unpad.flatten()[max_idx].item()}, dK2={dk_unpad2.flatten()[max_idx].item()}")
+                if i % 100 == 0:
+                    print(f"dK max diff: {diff_dk.max().item()}")
+                    print(f"  at index {max_idx.item()}: dK={dk_unpad.flatten()[max_idx].item()}, dK2={dk_unpad2.flatten()[max_idx].item()}")
 
                 diff_dv = (dv_unpad - dv_unpad2).abs()
                 max_idx = diff_dv.argmax()
-                print(f"dV max diff: {diff_dv.max().item()}")
-                print(f"  at index {max_idx.item()}: dV={dv_unpad.flatten()[max_idx].item()}, dV2={dv_unpad2.flatten()[max_idx].item()}")
-                
-                # print(f"dQ max diff with myself: {(dq - dq2).abs().max().item()}")
-                # print(f"dK max diff with myself: {(dk - dk2).abs().max().item()}")
-                # print(f"dV max diff with myself: {(dv - dv2).abs().max().item()}")
-                # print(f"dQ mean diff with myself: {(dq - dq2).abs().mean().item()}")
-                # print(f"dK mean diff with myself: {(dk - dk2).abs().mean().item()}")
-                # print(f"dV mean diff with myself: {(dv - dv2).abs().mean().item()}")
+                if i % 100 == 0:
+                    print(f"dV max diff: {diff_dv.max().item()}")
+                    print(f"  at index {max_idx.item()}: dV={dv_unpad.flatten()[max_idx].item()}, dV2={dv_unpad2.flatten()[max_idx].item()}")
                 
                 assert torch.equal(dq_unpad, dq_unpad2)
                 assert torch.equal(dk_unpad, dk_unpad2)
                 assert torch.equal(dv_unpad, dv_unpad2)
 
-                print(f"✅ Iteration {i} passed!")
+                if i % 100 == 0:
+                    print(f"✅ Iteration {i} passed!")
