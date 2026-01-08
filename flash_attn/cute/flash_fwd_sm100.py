@@ -232,7 +232,7 @@ class FlashAttentionForwardSm100:
         - Configures pipeline stages for softmax, correction, and epilogue operations
         """
 
-        self.kv_stage = 4 if self.q_dtype.width == 8 else 3
+        self.kv_stage = 4 if self.q_dtype.width == 8 or self.q_stage == 1 else 3
         self.acc_stage = 1
         # For hdim 192,128, we don't have enough smem to store all 3 stages of KV:
         # 128 x 192 x 2 bytes x 3 stages = 144KB, and we need 96KB for Q.
@@ -1064,15 +1064,14 @@ class FlashAttentionForwardSm100:
 
             if const_expr(not self.s0_s1_barrier):
                 stage = Int32(0 if const_expr(self.q_stage == 1) or warp_idx < self.softmax1_warp_ids[0] else 1)
-                if const_expr(self.q_stage == 2) or stage == 0:
-                    softmax_loop(
-                        stage=stage,
-                        tStSi=cute.make_tensor(
-                            tStS.iterator
-                            + (self.tmem_s_offset[0] if stage == 0 else self.tmem_s_offset[1]),
-                            tStS.layout,
-                        ),
-                    )
+                softmax_loop(
+                    stage=stage,
+                    tStSi=cute.make_tensor(
+                        tStS.iterator
+                        + (self.tmem_s_offset[0] if stage == 0 else self.tmem_s_offset[1]),
+                        tStS.layout,
+                    ),
+                )
                 cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_tmem_dealloc_offset)
             else:
                 # If there's s0_s1_barrier, it's faster to have 2 WGs having different code
@@ -2059,7 +2058,7 @@ class FlashAttentionForwardSm100:
                 softmax_corr_consumer_phase ^= 1
 
                 tSrScale_t2r = cute.make_fragment(tSrScale_t2r_shape, Float32)
-                for i in cutlass.range(n_block_max - n_block_min - 1, unroll=1):
+                for i in cutlass.range(total_block_count - 1, unroll=1):
                     for stage in cutlass.range_constexpr(self.q_stage):
                         # wait for S0 / S1
                         cute.arch.mbarrier_wait(
