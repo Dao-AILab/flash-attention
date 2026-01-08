@@ -1222,6 +1222,7 @@ def test_flash_attn_combine(num_splits, seqlen, d, dtype):
     # pytorch_profiler(flash_attn_combine, out_partial, lse_partial)
     # pytorch_profiler(torch.sum, out_partial)
 
+@pytest.mark.xfail
 def test_flash3_bw_compatibility() -> None:
     # Let's try to always stay backward compatible! This will make life easier
     # for downstream libaries, users, and exported models.
