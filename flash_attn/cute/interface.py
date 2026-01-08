@@ -617,16 +617,16 @@ def _flash_attn_bwd(
         total_q = batch_size * seqlen_q
     else:
         batch_size = cu_seqlens_q.shape[0] - 1
-        seqlen_q = max_seqlen_q
         total_q = q.shape[0]
+        seqlen_q = max_seqlen_q if max_seqlen_q is not None else total_q
 
     if cu_seqlens_k is None:
         batch_size, seqlen_k = k.shape[:2]
         total_k = batch_size * seqlen_k
     else:
         batch_size = cu_seqlens_k.shape[0] - 1
-        seqlen_k = max_seqlen_k
         total_k = k.shape[0]
+        seqlen_k = max_seqlen_k if max_seqlen_k is not None else total_k
 
     num_head_kv = k.shape[-2]
     head_dim_v = v.shape[-1]
@@ -744,15 +744,13 @@ def _flash_attn_bwd(
         total_q_rounded_padded = (
             (total_q + cu_seqlens_q.shape[0] * m_block_size - 1) // m_block_size * m_block_size
         )
-        # print("total_q_rounded_padded = ", total_q_rounded_padded)
         dq_accum = torch.empty(
             num_head, total_q_rounded_padded * head_dim_rounded, dtype=torch.float32, device=device
         )
         dpsum = torch.empty(num_head, total_q_rounded_padded, dtype=torch.float32, device=device)
         lse_log2 = torch.empty(num_head, total_q_rounded_padded, dtype=torch.float32, device=device)
 
-    # todo: allow for mha with cu_seqlens_k to skip dK/dV postprocess
-    dKV_postprocess = qhead_per_kvhead > 1 or cu_seqlens_k is not None
+    dKV_postprocess = qhead_per_kvhead > 1
     if dKV_postprocess:
         head_dim_v_rounded = (head_dim_v + 32 - 1) // 32 * 32
         if cu_seqlens_k is None:
@@ -778,7 +776,6 @@ def _flash_attn_bwd(
             total_k_rounded_padded = (
                 (total_k + cu_seqlens_k.shape[0] * n_block_size - 1) // n_block_size * n_block_size
             )
-            # print("total_k_rounded_padded = ", total_k_rounded_padded)
             num_n_blocks = total_k_rounded_padded // n_block_size
             if cluster_size == 2 and num_n_blocks % cluster_size != 0:
                 total_k_rounded_padded = total_k_rounded_padded + n_block_size
@@ -799,14 +796,12 @@ def _flash_attn_bwd(
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     if deterministic:
-        assert seqlen_q is not None, "seqlen_q not provided"
         seqlen_q_rounded = (seqlen_q + m_block_size - 1) // m_block_size * m_block_size
         dQ_semaphore = torch.zeros(batch_size, num_head, seqlen_q_rounded // m_block_size, 1, dtype=torch.int32, device="cuda")
     else:
         dQ_semaphore = None
 
     if deterministic and qhead_per_kvhead > 1:
-        assert seqlen_k is not None, "seqlen_k not provided"
         seqlen_k_rounded = (seqlen_k + n_block_size - 1) // n_block_size * n_block_size
         dK_semaphore = torch.zeros(batch_size, num_head_kv, seqlen_k_rounded // n_block_size, 2, dtype=torch.int32, device="cuda")
         dV_semaphore = torch.zeros(batch_size, num_head_kv, seqlen_k_rounded // n_block_size, 2, dtype=torch.int32, device="cuda")

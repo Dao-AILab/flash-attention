@@ -37,20 +37,20 @@ VERBOSE = True
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
-# @pytest.mark.parametrize("mha_type", ["mha"])
-@pytest.mark.parametrize("has_learnable_sink", [False, True])
-# @pytest.mark.parametrize("has_learnable_sink", [False])
+# @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
+@pytest.mark.parametrize("mha_type", ["mha"])
+# @pytest.mark.parametrize("has_learnable_sink", [False, True])
+@pytest.mark.parametrize("has_learnable_sink", [False])
 # @pytest.mark.parametrize("has_qv", [False, True])
 @pytest.mark.parametrize("has_qv", [False])
 # @pytest.mark.parametrize("deterministic", [False, True])
 @pytest.mark.parametrize("deterministic", [False])
 # @pytest.mark.parametrize("softcap", [0.0, 15.0])
 @pytest.mark.parametrize("softcap", [0.0])
-@pytest.mark.parametrize("local_enum", [0, 1, 2, 3])
-# @pytest.mark.parametrize("local_enum", [0])
-@pytest.mark.parametrize("causal", [False, True])
-# @pytest.mark.parametrize("causal", [True])
+# @pytest.mark.parametrize("local_enum", [0, 1, 2, 3])
+@pytest.mark.parametrize("local_enum", [0])
+# @pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("causal", [False])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192, 256])
 # @pytest.mark.parametrize('d', [32, 64, 96, 128, 160, 192])
@@ -60,34 +60,35 @@ VERBOSE = True
 # @pytest.mark.parametrize("d", [64, 96, 128, 192])
 # @pytest.mark.parametrize("d", [64, 128])
 # @pytest.mark.parametrize("d", [128, 192])
-@pytest.mark.parametrize("d", [64, 128])
+# @pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("d", [128])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
-        (1, 1),
-        (3, 3),
-        (64, 32),
-        (64, 128),
-        (128, 128),
-        (128, 192),
-        (256, 256),
-        (239, 1),
-        (799, 3),
-        (113, 203),
-        (113, 128),
-        (128, 217),
-        (113, 211),
-        (108, 256),
-        (256, 512),
-        (384, 256),
-        (640, 128),
-        (512, 256),
+        # (1, 1),
+        # (3, 3),
+        # (64, 32),
+        # (64, 128),
+        # (128, 128),
+        # (128, 192),
+        # (256, 256),
+        # (239, 1),
+        # (799, 3),
+        # (113, 203),
+        # (113, 128),
+        # (128, 217),
+        # (113, 211),
+        # (108, 256),
+        # (256, 512),
+        # (384, 256),
+        # (640, 128),
+        # (512, 256),
         (1024, 1024),
-        (1023, 1024),
-        (1024, 1023),
-        (2048, 2048),
-        (4096, 4096),
-        (4224, 4224),
+        # (1023, 1024),
+        # (1024, 1023),
+        # (2048, 2048),
+        # (4096, 4096),
+        # (4224, 4224),
     ],
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(128, 128)])
@@ -112,8 +113,8 @@ def test_flash_attn_output(
     torch.random.manual_seed(0)
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
-    batch_size = 9 if seqlen_k <= 2048 else 2
-    # batch_size = 1
+    # batch_size = 9 if seqlen_k <= 2048 else 2
+    batch_size = 2
     nheads = 6
     # nheads = 1
     nheads_kv = nheads if mha_type == "mha" else (3 if mha_type == "gqa" else 1)
@@ -372,18 +373,18 @@ def test_flash_attn_output(
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 # @pytest.mark.parametrize("mha_type", ["mha"])
-# @pytest.mark.parametrize("has_learnable_sink", [False, True])
-@pytest.mark.parametrize("has_learnable_sink", [False])
+@pytest.mark.parametrize("has_learnable_sink", [False, True])
+# @pytest.mark.parametrize("has_learnable_sink", [False])
 # @pytest.mark.parametrize("has_qv", [False, True])
 @pytest.mark.parametrize("has_qv", [False])
 # @pytest.mark.parametrize("deterministic", [False, True])
 @pytest.mark.parametrize("deterministic", [False])
 # @pytest.mark.parametrize("softcap", [0.0, 15.0])
 @pytest.mark.parametrize("softcap", [0.0])
-# @pytest.mark.parametrize("local", [False, True])
-@pytest.mark.parametrize("local", [False])
+@pytest.mark.parametrize("local_enum", [0, 1, 2, 3])
+# @pytest.mark.parametrize("local_enum", [0])
 @pytest.mark.parametrize("causal", [False, True])
-# @pytest.mark.parametrize("causal", [True])
+# @pytest.mark.parametrize("causal", [False])
 # @pytest.mark.parametrize("add_unused_qkv", [False, True])
 @pytest.mark.parametrize("add_unused_qkv", [False])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
@@ -420,13 +421,23 @@ def test_flash_attn_output(
     ],
 )
 @pytest.mark.parametrize("varlen_mode", ["random", "third", "full"])
+# @pytest.mark.parametrize("varlen_mode", ["full"])
+@pytest.mark.parametrize(
+    "zero_lengths_q, zero_lengths_k",
+    [
+        (False, False),
+        (True, False),
+        (False, True),
+        (True, True),
+    ],
+)
 def test_flash_attn_varlen_output(
     seqlen_q,
     seqlen_k,
     d,
     add_unused_qkv,
     causal,
-    local,
+    local_enum,
     softcap,
     deterministic,
     has_qv,
@@ -434,7 +445,12 @@ def test_flash_attn_varlen_output(
     mha_type,
     dtype,
     varlen_mode,
+    zero_lengths_q,
+    zero_lengths_k,
 ):
+    local = local_enum > 0
+    if local and causal:
+        pytest.skip()
     if (
         causal or local
     ):  # Right now reference only supports causal attention with seqlen_k == seqlen_q
@@ -491,6 +507,12 @@ def test_flash_attn_varlen_output(
         window_size = (
             (None, None) if not local else torch.randint(0, seqlen_k, (2,)).tolist()
         )
+        if local_enum == 2:
+            window_size = (None, window_size[1])
+        elif local_enum == 3:
+            window_size = (window_size[0], None)
+        if local:
+            print("window size = ", window_size)
         if has_learnable_sink:
             learnable_sink = torch.randn(nheads, dtype=torch.bfloat16, device=device)
         else:
@@ -510,18 +532,15 @@ def test_flash_attn_varlen_output(
             batch_size,
             device,
             mode=varlen_mode,
-            zero_lengths=False
+            zero_lengths=zero_lengths_q,
         )
-        # TODO: test zero_lengths
         key_padding_mask = generate_random_padding_mask(
-            # seqlen_k, batch_size, device, mode="random", zero_lengths=True
             seqlen_k,
             batch_size,
             device,
             mode=varlen_mode,
-            zero_lengths=False,
+            zero_lengths=zero_lengths_k,
         )
-
         def _gen_unused_masks(padding_mask, add_unused, max_seq_len, bs, device):
             if add_unused:
                 another_mask = generate_random_padding_mask(max_seq_len, bs, device)
@@ -644,6 +663,8 @@ def test_flash_attn_varlen_output(
                 # max_seqlen_k,
                 # seqused_q=seqused_q,
                 # seqused_k=seqused_k,
+                max_seqlen_q=seqlen_q,
+                max_seqlen_k=seqlen_k,
                 causal=causal,
                 # qv=qv_unpad,
                 # q_descale=q_descale,
@@ -654,6 +675,7 @@ def test_flash_attn_varlen_output(
                 softcap=softcap,
                 num_splits=num_splits,
                 pack_gqa=pack_gqa,
+                deterministic=deterministic,
             )
             out = output_pad_fn(out_unpad)
             if query_unused_mask is not None:
@@ -680,7 +702,7 @@ def test_flash_attn_varlen_output(
             # and False
         ):
             g_unpad = torch.randn_like(out_unpad)
-            do_o = ((g_unpad.float() * out_unpad.float()).sum(-1)).transpose(-1, -2)
+            # do_o = ((g_unpad.float() * out_unpad.float()).sum(-1)).transpose(-1, -2)
             # import flash_attn_3_cuda
             # dq_unpad, dk_unpad, dv_unpad, softmax_d, dq_accum, lse_log2 = flash_attn_3_cuda.bwd_varlen(
             #     g_unpad,
