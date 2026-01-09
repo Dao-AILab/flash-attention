@@ -94,8 +94,10 @@ def check_varlen_vs_torch_flash(
         cu_seqlens_k_fa = None
         cu_seqlens_k_t = None
 
-    out_fa, lse_fa = flash_attn_varlen_func(
-        q_fa, k_fa, v_fa,
+    out_fa = flash_attn_varlen_func(
+        q_fa,
+        k_fa,
+        v_fa,
         cu_seqlens_q=cu_seqlens_q_fa,
         cu_seqlens_k=cu_seqlens_k_fa,
         seqused_q=seqused_q,
@@ -103,7 +105,7 @@ def check_varlen_vs_torch_flash(
         softmax_scale=(1.0 / q.shape[-1]**0.5) if softmax_scale is None else softmax_scale,
         causal=causal,
         window_size=(None, None),
-        learnable_sink=None,
+        # learnable_sink=None,
         softcap=softcap,
         pack_gqa=None,
     )

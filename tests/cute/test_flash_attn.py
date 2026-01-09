@@ -606,7 +606,7 @@ def test_flash_attn_varlen_output(
         # SplitKV is not supported for hdim >= 192
         num_splits_vals = [1, 3] if d < 192 and not DISABLE_SPLIT else [1]
         for pack_gqa, num_splits in itertools.product(pack_gqa_vals, num_splits_vals):
-            out_unpad, lse = flash_attn_varlen_func(
+            out_unpad = flash_attn_varlen_func(
                 q_unpad,
                 k_unpad,
                 v_unpad,
@@ -621,7 +621,7 @@ def test_flash_attn_varlen_output(
                 # k_descale=k_descale, v_descale=v_descale,
                 window_size=window_size,
                 # attention_chunk=attention_chunk,
-                learnable_sink=learnable_sink,
+                # learnable_sink=learnable_sink,
                 softcap=softcap,
                 num_splits=num_splits,
                 pack_gqa=pack_gqa,
@@ -1161,7 +1161,7 @@ def test_flash_attn_kvcache(
                     k_cache_paged.copy_(k_cache_saved)
                     v_cache_paged.copy_(v_cache_saved)
                 # out, lse, *rest = flash_attn_with_kvcache(
-                out, lse, *rest = flash_attn_varlen_func(
+                out = flash_attn_varlen_func(
                     q if not varlen_q else q_unpad,
                     k_cache if page_size is None else k_cache_paged,
                     v_cache if page_size is None else v_cache_paged,
@@ -1179,7 +1179,7 @@ def test_flash_attn_kvcache(
                     # rotary_seqlens=rotary_seqlens,
                     causal=causal,
                     window_size=window_size,
-                    learnable_sink=learnable_sink,
+                    # learnable_sink=learnable_sink,
                     # attention_chunk=attention_chunk,
                     # rotary_interleaved=rotary_interleaved,
                     # scheduler_metadata=scheduler_metadata,
