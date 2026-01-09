@@ -1907,12 +1907,59 @@ def _flash_attn_fwd_combine(
 
 _flash_attn_fwd_combine.compile_cache = {}
 
+@torch.library.custom_op("flash_attn_cute::flash_attn_fwd_combine", mutates_args=())
+def flash_attn_fwd_combine(
+    out_partial: torch.Tensor,
+    lse_partial: torch.Tensor,
+    out_dtype: torch.dtype,
+    cu_seqlens: Optional[torch.Tensor] = None,
+    seqused: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Returns (out, lse). Must return lse to be torch.compile compatible."""
+    # to avoid mutating args, allocate out and lse and put them into lower level function
+    is_varlen = out_partial.dim() == 4
+    device = out_partial.device
+    if is_varlen:
+        _, total_q, num_heads, head_size = out_partial.shape
+        out = torch.empty(total_q, num_heads, head_size, dtype=out_dtype, device=device)
+        lse = torch.empty(num_heads, total_q, dtype=torch.float32, device=device).transpose(0, 1)
+    else:
+        _, batch_size, seqlen, num_heads, head_size = out_partial.shape
+        out = torch.empty(batch_size, seqlen, num_heads, head_size, dtype=out_dtype, device=device)
+        lse = torch.empty(
+            batch_size, num_heads, seqlen, dtype=torch.float32, device=device
+        ).transpose(1, 2)
+    _flash_attn_fwd_combine(out_partial, lse_partial, out, lse, cu_seqlens, seqused)
+    return out, lse
+
+
+@flash_attn_fwd_combine.register_fake
+def flash_attn_fwd_combine_fake(
+    out_partial: torch.Tensor,
+    lse_partial: torch.Tensor,
+    out_dtype: Optional[torch.dtype] = None,
+    cu_seqlens: Optional[torch.Tensor] = None,
+    seqused: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    is_varlen = out_partial.dim() == 4
+    if is_varlen:
+        _, total_q, num_heads, head_size = out_partial.shape
+        out = out_partial.new_empty(total_q, num_heads, head_size, dtype=out_dtype)
+        lse = out_partial.new_empty(num_heads, total_q, dtype=torch.float32).transpose(0, 1)
+    else:
+        _, batch_size, seqlen, num_heads, head_size = out_partial.shape
+        out = out_partial.new_empty(batch_size, seqlen, num_heads, head_size, dtype=out_dtype)
+        lse = out_partial.new_empty(batch_size, num_heads, seqlen, dtype=torch.float32).transpose(
+            1, 2
+        )
+
+    return out, lse
+
 
 def flash_attn_combine(
     out_partial: torch.Tensor,
     lse_partial: torch.Tensor,
-    out: Optional[torch.Tensor] = None,
-    out_dtype: Optional[torch.dtype] = None,
+    out_dtype: torch.dtype,
     cu_seqlens: Optional[torch.Tensor] = None,
     seqused: Optional[torch.Tensor] = None,
     return_lse: bool = True,
@@ -1930,8 +1977,7 @@ def flash_attn_combine(
         lse_partial: Partial LSE tensor with shape:
             - (num_splits, batch_size, seqlen, num_heads) for regular batched input
             - (num_splits, total_q, num_heads) for variable length input
-        out: Optional output tensor. If None, will be created automatically.
-        out_dtype: Optional output dtype. If None, will use fp16/bf16 based on input.
+        out_dtype: Output dtype.
         cu_seqlens: Cumulative sequence lengths for variable length sequences
         seqused: Used sequence lengths for each batch
         return_lse: Whether to return the combined LSE tensor. Default is True.
@@ -1972,39 +2018,5 @@ def flash_attn_combine(
             "lse_partial shape mismatch"
         )
 
-    # Determine output dtype
-    if out_dtype is None:
-        out_dtype = out_partial.dtype
-
-    # Create output if not provided
-    device = out_partial.device
-    if out is None:
-        if is_varlen:
-            out = torch.empty(total_q, num_heads, head_size, dtype=out_dtype, device=device)
-        else:
-            out = torch.empty(
-                batch_size, seqlen, num_heads, head_size, dtype=out_dtype, device=device
-            )
-
-    # Create lse output only if requested
-    if return_lse:
-        if is_varlen:
-            lse = torch.empty(num_heads, total_q, dtype=torch.float32, device=device).transpose(
-                0, 1
-            )
-        else:
-            lse = torch.empty(
-                batch_size, num_heads, seqlen, dtype=torch.float32, device=device
-            ).transpose(1, 2)
-    else:
-        lse = None
-
-    _flash_attn_fwd_combine(
-        out_partial,
-        lse_partial,
-        out,
-        lse,
-        cu_seqlens,
-        seqused,
-    )
-    return out, lse
+    out, lse = flash_attn_fwd_combine(out_partial, lse_partial, out_dtype, cu_seqlens, seqused)
+    return (out, lse if return_lse else None)
