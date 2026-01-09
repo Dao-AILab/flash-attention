@@ -46,8 +46,6 @@ class SeqlenInfoQK:
     has_cu_seqlens_k: cutlass.Constexpr[bool]
     has_seqused_q: cutlass.Constexpr[bool]
     has_seqused_k: cutlass.Constexpr[bool]
-    tile_m: cutlass.Constexpr[cutlass.Int32]
-    tile_n: cutlass.Constexpr[cutlass.Int32]
 
     @staticmethod
     def create(
@@ -104,8 +102,6 @@ class SeqlenInfoQK:
             has_cu_seqlens_k,
             has_seqused_q,
             has_seqused_k,
-            tile_m,
-            tile_n,
         )
 
     def offset_batch_Q(
