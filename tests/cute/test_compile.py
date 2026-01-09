@@ -181,6 +181,7 @@ def test_integration_backward():
         ("window", {"window_size": (64, 64)}),
         ("gqa", {"pack_gqa": True}),
         ("deterministic", {"deterministic": True}),
+        ("softcap", {"softcap": 15.0}),
     ],
 )
 def test_compile_with_parameters(test_case):

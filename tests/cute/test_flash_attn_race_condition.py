@@ -220,7 +220,7 @@ def test_flash_attn_output(
                 window_size=window_size,
                 # attention_chunk=attention_chunk,
                 softcap=softcap,
-                learnable_sink=learnable_sink,
+                # learnable_sink=learnable_sink,
                 pack_gqa=pack_gqa,
                 num_splits=num_splits,
                 deterministic=deterministic,

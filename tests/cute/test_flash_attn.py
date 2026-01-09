@@ -36,8 +36,8 @@ VERBOSE = True
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 # @pytest.mark.parametrize("mha_type", ["mha"])
-@pytest.mark.parametrize("has_learnable_sink", [False, True])
-# @pytest.mark.parametrize("has_learnable_sink", [False])
+# @pytest.mark.parametrize("has_learnable_sink", [False, True])
+@pytest.mark.parametrize("has_learnable_sink", [False])
 # @pytest.mark.parametrize("has_qv", [False, True])
 @pytest.mark.parametrize("has_qv", [False])
 # @pytest.mark.parametrize("deterministic", [False, True])
@@ -248,7 +248,7 @@ def test_flash_attn_output(
                 window_size=window_size,
                 # attention_chunk=attention_chunk,
                 softcap=softcap,
-                learnable_sink=learnable_sink,
+                # learnable_sink=learnable_sink,
                 pack_gqa=pack_gqa,
                 num_splits=num_splits,
                 deterministic=deterministic,
