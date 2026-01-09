@@ -2020,3 +2020,56 @@ def flash_attn_combine(
 
     out, lse = flash_attn_fwd_combine(out_partial, lse_partial, out_dtype, cu_seqlens, seqused)
     return (out, lse if return_lse else None)
+
+def flash_attn_blocksparse_func(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    softcap: float = 0.0,
+    window_size: Tuple[Optional[int], Optional[int]] = (None, None),
+    num_splits: int = 1,
+    pack_gqa: Optional[bool] = None,
+    score_mod: Optional[Callable] = None,
+    aux_tensors: Optional[list[torch.Tensor]] = None,
+    mask_mod: Optional[Callable] = None,
+    block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
+    return_lse: bool = False,
+    deterministic: bool = False,  # TODO figure out where to edit
+):
+    """Eager-only; delegates to compilable path if no callables/block sparsity."""
+    if (
+        block_sparse_tensors is None
+        and score_mod is None
+        and mask_mod is None
+        and aux_tensors is None
+    ):
+        return flash_attn_func(
+            q,
+            k,
+            v,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            softcap=softcap,
+            window_size=window_size,
+            num_splits=num_splits,
+            pack_gqa=pack_gqa,
+            return_lse=return_lse,
+            deterministic=deterministic,
+        )
+    # Eager path
+    return _flash_attn_fwd(
+        q,
+        k,
+        v,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        softcap=softcap,
+        window_size_left=window_size[0],
+        window_size_right=window_size[1],
+        num_splits=num_splits,
+        pack_gqa=pack_gqa,
+        return_lse=return_lse,
+        deterministic=deterministic,
+    )
