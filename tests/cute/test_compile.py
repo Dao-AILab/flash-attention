@@ -1,4 +1,5 @@
 # Test torch.compile compatibility for Flash Attention 4 (FA4).
+# Only checks that compilation is successful and matches eager output; does not evaluate against PT reference.
 
 import pytest
 import torch
