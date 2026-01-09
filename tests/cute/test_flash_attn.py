@@ -238,7 +238,7 @@ def test_flash_attn_output(
         # pack_gqa_vals = [False]
         num_splits_vals = [1, 3] if d < 192 and not DISABLE_SPLIT and not TEST_BWD_ONLY else [1]
         for pack_gqa, num_splits in itertools.product(pack_gqa_vals, num_splits_vals):
-            out, lse = flash_attn_func(
+            out = flash_attn_func(
                 q,
                 k,
                 v,

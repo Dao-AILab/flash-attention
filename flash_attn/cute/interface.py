@@ -1308,7 +1308,7 @@ def setup_context(ctx, inputs, output):
     ctx.deterministic = inputs[10]
 
 
-def _flash_attn_bwd_backward(ctx, dout, dlse):
+def _backward(ctx, dout, dlse):
     """Backward pass for flash_attn_fwd custom op."""
     q, k, v, out, lse = ctx.saved_tensors
     dq, dk, dv = flash_attn_bwd(
@@ -1329,7 +1329,7 @@ def _flash_attn_bwd_backward(ctx, dout, dlse):
     return dq, dk, dv, *((None,) * 8)
 
 
-flash_attn_fwd.register_autograd(_flash_attn_bwd_backward, setup_context=setup_context)
+flash_attn_fwd.register_autograd(_backward, setup_context=setup_context)
 
 
 class FlashAttnFunc(torch.autograd.Function):
