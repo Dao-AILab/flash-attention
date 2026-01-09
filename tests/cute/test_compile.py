@@ -7,7 +7,7 @@ from torch import nn
 from torch.library import opcheck
 
 
-from flash_attn.cute import flash_attn_func, flash_attn_varlen_func
+from flash_attn.cute import flash_attn_func, flash_attn_varlen_func, flash_attn_combine
 
 
 class SimpleAttention(nn.Module):
@@ -147,43 +147,48 @@ def test_integration_compile(backend):
     )
 
 
-@pytest.mark.parametrize("backend", ["aot_eager", "inductor"])
-def test_varlen_integration_compile(backend):
-    """Integration test: full varlen attention module"""
+@pytest.mark.parametrize(
+    "test_case",
+    [
+        ("causal", {"causal": True}),
+        ("window", {"window_size": (64, 64)}),
+        ("gqa", {"pack_gqa": True}),
+        ("deterministic", {"deterministic": True}),
+        ("softcap", {"softcap": 15.0}),
+    ],
+)
+def test_compile_with_parameters(test_case):
+    """Test compilation with different flash_attn_func parameters."""
+    test_name, kwargs = test_case
 
-    # Create model and input
-    seqlens = [128, 256, 192]
-    embed_dim = 512
+    batch_size = 2
+    seqlen = 512
     num_heads = 8
-    model = SimpleVarlenAttention(embed_dim, num_heads).cuda().bfloat16()
+    head_dim = 64
 
-    # Create cu_seqlens
-    cu_seqlens_q = torch.tensor(
-        [0] + list(torch.cumsum(torch.tensor(seqlens), 0)),
-        dtype=torch.int32,
-        device="cuda",
+    q = torch.randn(
+        batch_size, seqlen, num_heads, head_dim, device="cuda", dtype=torch.bfloat16
     )
-    cu_seqlens_k = cu_seqlens_q.clone()
-    total_seqlen = cu_seqlens_q[-1].item()
-
-    input_tensor = torch.randn(
-        total_seqlen, embed_dim, device="cuda", dtype=torch.bfloat16
+    k = torch.randn(
+        batch_size, seqlen, num_heads, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    v = torch.randn(
+        batch_size, seqlen, num_heads, head_dim, device="cuda", dtype=torch.bfloat16
     )
 
-    # Run without compilation
-    output_eager = model(input_tensor, cu_seqlens_q, cu_seqlens_k)
+    # Eager execution
+    out_eager = flash_attn_func(q, k, v, **kwargs)
 
-    # Compile and run
-    compiled_model = torch.compile(
-        model,
-        backend=backend,
+    # Compiled execution
+    compiled_fn = torch.compile(
+        lambda q, k, v: flash_attn_func(q, k, v, **kwargs),
         fullgraph=True,
     )
-    output_compiled = compiled_model(input_tensor, cu_seqlens_q, cu_seqlens_k)
+    out_compiled = compiled_fn(q, k, v)
 
     # Verify outputs match
-    assert torch.allclose(output_eager, output_compiled, rtol=1e-3, atol=1e-3), (
-        f"Varlen outputs differ between eager and compiled with {backend} backend"
+    assert torch.allclose(out_eager, out_compiled, rtol=1e-3, atol=1e-3), (
+        f"{test_name}: outputs differ between eager and compiled"
     )
 
 
@@ -240,6 +245,91 @@ def test_integration_backward():
     assert torch.allclose(
         model_eager.out_proj.weight.grad, model_compiled.out_proj.weight.grad
     ), "out_proj.weight.grad does not match between eager and compiled"
+
+
+def test_export():
+    """Test torch.export functionality."""
+
+    model = SimpleAttention(512, 8).cuda().bfloat16()
+    input_tensor = torch.randn(2, 128, 512, device="cuda", dtype=torch.bfloat16)
+
+    # Get baseline output
+    expected = model(input_tensor)
+
+    # Export the model
+    exported = torch.export.export(model, (input_tensor,))
+
+    # Run exported model
+    output = exported.module()(input_tensor)
+
+    # Verify outputs match
+    assert torch.allclose(expected, output, rtol=1e-3, atol=1e-3), (
+        "Exported model output differs from expected"
+    )
+
+
+def test_opcheck_varlen():
+    # Define sample inputs for flash_attn_varlen_fwd
+    seqlens = [64, 92]
+    num_heads = 6
+    head_dim = 32
+    cu_seqlens = torch.tensor(
+        [0] + list(torch.cumsum(torch.tensor(seqlens), 0)),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    total = cu_seqlens[-1].item()
+    q = torch.randn(total, num_heads, head_dim, device="cuda", dtype=torch.float16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    sample_args_fwd = (q, k, v, cu_seqlens, cu_seqlens)
+    opcheck(torch.ops.flash_attn_cute.flash_attn_varlen_fwd, sample_args_fwd)
+
+    # Prepare inputs for flash_attn_varlen_bwd (simulate a forward pass to produce 'out' and 'lse')
+    out, lse = torch.ops.flash_attn_cute.flash_attn_varlen_fwd(*sample_args_fwd)
+    dout = torch.randn_like(out)
+    sample_args_bwd = (q, k, v, out, dout, lse, cu_seqlens, cu_seqlens, None, None)
+    opcheck(torch.ops.flash_attn_cute.flash_attn_varlen_bwd, sample_args_bwd)
+
+
+@pytest.mark.parametrize("backend", ["aot_eager", "inductor"])
+def test_varlen_integration_compile(backend):
+    """Integration test: full varlen attention module"""
+
+    # Create model and input
+    seqlens = [128, 256, 192]
+    embed_dim = 512
+    num_heads = 8
+    model = SimpleVarlenAttention(embed_dim, num_heads).cuda().bfloat16()
+
+    # Create cu_seqlens
+    cu_seqlens_q = torch.tensor(
+        [0] + list(torch.cumsum(torch.tensor(seqlens), 0)),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    cu_seqlens_k = cu_seqlens_q.clone()
+    total_seqlen = cu_seqlens_q[-1].item()
+
+    input_tensor = torch.randn(
+        total_seqlen, embed_dim, device="cuda", dtype=torch.bfloat16
+    )
+
+    # Run without compilation
+    output_eager = model(input_tensor, cu_seqlens_q, cu_seqlens_k)
+
+    # Compile and run
+    compiled_model = torch.compile(
+        model,
+        backend=backend,
+        fullgraph=True,
+    )
+    output_compiled = compiled_model(input_tensor, cu_seqlens_q, cu_seqlens_k)
+
+    # Verify outputs match
+    assert torch.allclose(output_eager, output_compiled, rtol=1e-3, atol=1e-3), (
+        f"Varlen outputs differ between eager and compiled with {backend} backend"
+    )
 
 
 def test_varlen_integration_backward():
@@ -307,132 +397,6 @@ def test_varlen_integration_backward():
         rtol=1e-3,
         atol=1e-3,
     ), "out_proj.weight.grad does not match between eager and compiled"
-
-
-@pytest.mark.parametrize(
-    "test_case",
-    [
-        ("causal", {"causal": True}),
-        ("window", {"window_size": (64, 64)}),
-        ("gqa", {"pack_gqa": True}),
-        ("deterministic", {"deterministic": True}),
-        ("softcap", {"softcap": 15.0}),
-    ],
-)
-def test_compile_with_parameters(test_case):
-    """Test compilation with different flash_attn_func parameters."""
-    test_name, kwargs = test_case
-
-    batch_size = 2
-    seqlen = 512
-    num_heads = 8
-    head_dim = 64
-
-    q = torch.randn(
-        batch_size, seqlen, num_heads, head_dim, device="cuda", dtype=torch.bfloat16
-    )
-    k = torch.randn(
-        batch_size, seqlen, num_heads, head_dim, device="cuda", dtype=torch.bfloat16
-    )
-    v = torch.randn(
-        batch_size, seqlen, num_heads, head_dim, device="cuda", dtype=torch.bfloat16
-    )
-
-    # Eager execution
-    out_eager = flash_attn_func(q, k, v, **kwargs)
-
-    # Compiled execution
-    compiled_fn = torch.compile(
-        lambda q, k, v: flash_attn_func(q, k, v, **kwargs),
-        fullgraph=True,
-    )
-    out_compiled = compiled_fn(q, k, v)
-
-    # Verify outputs match
-    assert torch.allclose(out_eager, out_compiled, rtol=1e-3, atol=1e-3), (
-        f"{test_name}: outputs differ between eager and compiled"
-    )
-
-
-def test_export():
-    """Test torch.export functionality."""
-
-    model = SimpleAttention(512, 8).cuda().bfloat16()
-    input_tensor = torch.randn(2, 128, 512, device="cuda", dtype=torch.bfloat16)
-
-    # Get baseline output
-    expected = model(input_tensor)
-
-    # Export the model
-    exported = torch.export.export(model, (input_tensor,))
-
-    # Run exported model
-    output = exported.module()(input_tensor)
-
-    # Verify outputs match
-    assert torch.allclose(expected, output, rtol=1e-3, atol=1e-3), (
-        "Exported model output differs from expected"
-    )
-
-
-def test_varlen_export():
-    """Test torch.export functionality for varlen."""
-
-    seqlens = [64, 128]
-    embed_dim = 512
-    num_heads = 8
-    model = SimpleVarlenAttention(embed_dim, num_heads).cuda().bfloat16()
-
-    # Create cu_seqlens
-    cu_seqlens_q = torch.tensor(
-        [0] + list(torch.cumsum(torch.tensor(seqlens), 0)),
-        dtype=torch.int32,
-        device="cuda",
-    )
-    cu_seqlens_k = cu_seqlens_q.clone()
-    total_seqlen = cu_seqlens_q[-1].item()
-
-    input_tensor = torch.randn(
-        total_seqlen, embed_dim, device="cuda", dtype=torch.bfloat16
-    )
-
-    # Get baseline output
-    expected = model(input_tensor, cu_seqlens_q, cu_seqlens_k)
-
-    # Export the model
-    exported = torch.export.export(model, (input_tensor, cu_seqlens_q, cu_seqlens_k))
-
-    # Run exported model
-    output = exported.module()(input_tensor, cu_seqlens_q, cu_seqlens_k)
-
-    # Verify outputs match
-    assert torch.allclose(expected, output, rtol=1e-3, atol=1e-3), (
-        "Exported varlen model output differs from expected"
-    )
-
-
-def test_opcheck_varlen():
-    # Define sample inputs for flash_attn_varlen_fwd
-    seqlens = [64, 92]
-    num_heads = 6
-    head_dim = 32
-    cu_seqlens = torch.tensor(
-        [0] + list(torch.cumsum(torch.tensor(seqlens), 0)),
-        dtype=torch.int32,
-        device="cuda",
-    )
-    total = cu_seqlens[-1].item()
-    q = torch.randn(total, num_heads, head_dim, device="cuda", dtype=torch.float16)
-    k = torch.randn_like(q)
-    v = torch.randn_like(q)
-    sample_args_fwd = (q, k, v, cu_seqlens, cu_seqlens)
-    opcheck(torch.ops.flash_attn_cute.flash_attn_varlen_fwd, sample_args_fwd)
-
-    # Prepare inputs for flash_attn_varlen_bwd (simulate a forward pass to produce 'out' and 'lse')
-    out, lse = torch.ops.flash_attn_cute.flash_attn_varlen_fwd(*sample_args_fwd)
-    dout = torch.randn_like(out)
-    sample_args_bwd = (q, k, v, out, dout, lse, cu_seqlens, cu_seqlens, None, None)
-    opcheck(torch.ops.flash_attn_cute.flash_attn_varlen_bwd, sample_args_bwd)
 
 
 @pytest.mark.parametrize("backend", ["aot_eager", "inductor"])
@@ -602,4 +566,196 @@ def test_varlen_backward():
     )
     assert torch.allclose(v_eager.grad, v_compiled.grad, rtol=1e-3, atol=1e-3), (
         "v.grad does not match between eager and compiled"
+    )
+
+
+def test_varlen_export():
+    """Test torch.export functionality for varlen."""
+
+    seqlens = [64, 128]
+    embed_dim = 512
+    num_heads = 8
+    model = SimpleVarlenAttention(embed_dim, num_heads).cuda().bfloat16()
+
+    # Create cu_seqlens
+    cu_seqlens_q = torch.tensor(
+        [0] + list(torch.cumsum(torch.tensor(seqlens), 0)),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    cu_seqlens_k = cu_seqlens_q.clone()
+    total_seqlen = cu_seqlens_q[-1].item()
+
+    input_tensor = torch.randn(
+        total_seqlen, embed_dim, device="cuda", dtype=torch.bfloat16
+    )
+
+    # Get baseline output
+    expected = model(input_tensor, cu_seqlens_q, cu_seqlens_k)
+
+    # Export the model
+    exported = torch.export.export(model, (input_tensor, cu_seqlens_q, cu_seqlens_k))
+
+    # Run exported model
+    output = exported.module()(input_tensor, cu_seqlens_q, cu_seqlens_k)
+
+    # Verify outputs match
+    assert torch.allclose(expected, output, rtol=1e-3, atol=1e-3), (
+        "Exported varlen model output differs from expected"
+    )
+
+
+def test_opcheck_combine():
+    """Test opcheck for flash_attn_fwd_combine."""
+    # Create sample inputs for combine operation
+    num_splits = 4
+    batch_size = 2
+    seqlen = 128
+    num_heads = 8
+    head_dim = 64
+
+    # Regular batched inputs - must be contiguous
+    out_partial = torch.randn(
+        num_splits,
+        batch_size,
+        seqlen,
+        num_heads,
+        head_dim,
+        device="cuda",
+        dtype=torch.float32,
+    ).contiguous()
+    lse_partial = torch.randn(
+        num_splits, batch_size, num_heads, seqlen, device="cuda", dtype=torch.float32
+    ).transpose(-1, -2)
+
+    sample_args = (out_partial, lse_partial, torch.float16)
+    opcheck(torch.ops.flash_attn_cute.flash_attn_fwd_combine, sample_args)
+
+
+def test_opcheck_combine_varlen():
+    """Test opcheck for flash_attn_fwd_combine with varlen inputs."""
+    # Create sample inputs for varlen combine operation
+    num_splits = 4
+    total_q = 256
+    num_heads = 8
+    head_dim = 64
+
+    # Varlen inputs (4D for out_partial, 3D for lse_partial) - must be contiguous
+    out_partial = torch.randn(
+        num_splits, total_q, num_heads, head_dim, device="cuda", dtype=torch.float32
+    ).contiguous()
+    lse_partial = torch.randn(
+        num_splits, num_heads, total_q, device="cuda", dtype=torch.float32
+    ).transpose(-1, -2)
+
+    # Create cu_seqlens for varlen
+    seqlens = [64, 128, 64]
+    cu_seqlens = torch.tensor(
+        [0] + list(torch.cumsum(torch.tensor(seqlens), 0)),
+        dtype=torch.int32,
+        device="cuda",
+    )
+
+    sample_args = (out_partial, lse_partial, torch.float16, cu_seqlens, None)
+    opcheck(torch.ops.flash_attn_cute.flash_attn_fwd_combine, sample_args)
+
+
+@pytest.mark.parametrize("backend", ["aot_eager", "inductor"])
+@pytest.mark.parametrize("return_lse", [True, False])
+def test_combine_compile(backend, return_lse):
+    """Test compilation of flash_attn_combine."""
+    num_splits = 4
+    batch_size = 2
+    seqlen = 128
+    num_heads = 8
+    head_dim = 64
+
+    # Create split outputs (fp32 accumulation buffers) - must be contiguous
+    out_partial = torch.randn(
+        num_splits,
+        batch_size,
+        seqlen,
+        num_heads,
+        head_dim,
+        device="cuda",
+        dtype=torch.float32,
+    ).contiguous()
+    lse_partial = torch.randn(
+        num_splits, batch_size, num_heads, seqlen, device="cuda", dtype=torch.float32
+    ).transpose(-1, -2)
+
+    # Eager execution
+    out_eager, lse_eager = flash_attn_combine(
+        out_partial, lse_partial, torch.bfloat16, return_lse=return_lse
+    )
+
+    # Compiled execution
+    compiled_fn = torch.compile(
+        lambda out_p, lse_p: flash_attn_combine(
+            out_p, lse_p, torch.bfloat16, return_lse=return_lse
+        ),
+        backend=backend,
+        fullgraph=True,
+    )
+    out_compiled, lse_compiled = compiled_fn(out_partial, lse_partial)
+
+    # Verify outputs match
+    assert torch.allclose(out_eager, out_compiled, rtol=1e-3, atol=1e-3), (
+        f"out differs between eager and compiled with {backend} backend"
+    )
+
+    if return_lse:
+        assert lse_eager is not None and lse_compiled is not None
+        assert torch.allclose(lse_eager, lse_compiled, rtol=1e-3, atol=1e-3), (
+            f"lse differs between eager and compiled with {backend} backend"
+        )
+    else:
+        assert lse_eager is None and lse_compiled is None
+
+
+@pytest.mark.parametrize("backend", ["aot_eager", "inductor"])
+def test_combine_varlen_compile(backend):
+    """Test compilation of flash_attn_combine with varlen inputs."""
+    num_splits = 4
+    seqlens = [64, 128, 64]
+    num_heads = 8
+    head_dim = 64
+
+    # Create cu_seqlens
+    cu_seqlens = torch.tensor(
+        [0] + list(torch.cumsum(torch.tensor(seqlens), 0)),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    total_q = cu_seqlens[-1].item()
+
+    # Create varlen split outputs (4D for out_partial, 3D for lse_partial) - must be contiguous
+    out_partial = torch.randn(
+        num_splits, total_q, num_heads, head_dim, device="cuda", dtype=torch.float32
+    ).contiguous()
+    lse_partial = torch.randn(
+        num_splits, num_heads, total_q, device="cuda", dtype=torch.float32
+    ).transpose(-1, -2)
+
+    # Eager execution
+    out_eager, lse_eager = flash_attn_combine(
+        out_partial, lse_partial, torch.bfloat16, cu_seqlens=cu_seqlens
+    )
+
+    # Compiled execution
+    compiled_fn = torch.compile(
+        lambda out_p, lse_p, cu_seq: flash_attn_combine(
+            out_p, lse_p, torch.bfloat16, cu_seqlens=cu_seq
+        ),
+        backend=backend,
+        fullgraph=True,
+    )
+    out_compiled, lse_compiled = compiled_fn(out_partial, lse_partial, cu_seqlens)
+
+    # Verify outputs match
+    assert torch.allclose(out_eager, out_compiled, rtol=1e-3, atol=1e-3), (
+        f"Varlen out differs between eager and compiled with {backend} backend"
+    )
+    assert torch.allclose(lse_eager, lse_compiled, rtol=1e-3, atol=1e-3), (
+        f"Varlen lse differs between eager and compiled with {backend} backend"
     )
