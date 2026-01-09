@@ -50,7 +50,7 @@ VERBOSE = True
 @pytest.mark.parametrize("local_enum", [0, 1, 2, 3])
 # @pytest.mark.parametrize("local_enum", [0])
 @pytest.mark.parametrize("causal", [False, True])
-# @pytest.mark.parametrize("causal", [True])
+# @pytest.mark.parametrize("causal", [False])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192, 256])
 # @pytest.mark.parametrize('d', [32, 64, 96, 128, 160, 192])
@@ -58,9 +58,9 @@ VERBOSE = True
 # @pytest.mark.parametrize("d", [64, 128, 256])
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128])
 # @pytest.mark.parametrize("d", [64, 96, 128, 192])
-# @pytest.mark.parametrize("d", [64, 128])
 # @pytest.mark.parametrize("d", [128, 192])
 @pytest.mark.parametrize("d", [64, 128])
+# @pytest.mark.parametrize("d", [128])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -113,7 +113,7 @@ def test_flash_attn_output(
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
     batch_size = 9 if seqlen_k <= 2048 else 2
-    # batch_size = 1
+    # batch_size = 2
     nheads = 6
     # nheads = 1
     nheads_kv = nheads if mha_type == "mha" else (3 if mha_type == "gqa" else 1)
@@ -236,7 +236,7 @@ def test_flash_attn_output(
         print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
         print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
         # num_splits_vals = [1, 3]
-        pack_gqa_vals = [False, True, None]
+        pack_gqa_vals = [False, True, None] if not TEST_BWD_ONLY else [False]
         # SplitKV is not supported for hdim >= 192
         # pack_gqa_vals = [False]
         num_splits_vals = [1, 3] if d < 192 and not DISABLE_SPLIT and not TEST_BWD_ONLY else [1]
@@ -371,17 +371,17 @@ def test_flash_attn_output(
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
-# @pytest.mark.parametrize("mha_type", ["mqa"])
-@pytest.mark.parametrize("has_learnable_sink", [False, True])
-# @pytest.mark.parametrize("has_learnable_sink", [False])
+# @pytest.mark.parametrize("mha_type", ["mha"])
+# @pytest.mark.parametrize("has_learnable_sink", [False, True])
+@pytest.mark.parametrize("has_learnable_sink", [False])
 # @pytest.mark.parametrize("has_qv", [False, True])
 @pytest.mark.parametrize("has_qv", [False])
 # @pytest.mark.parametrize("deterministic", [False, True])
 @pytest.mark.parametrize("deterministic", [False])
 # @pytest.mark.parametrize("softcap", [0.0, 15.0])
 @pytest.mark.parametrize("softcap", [0.0])
-# @pytest.mark.parametrize("local", [False, True])
-@pytest.mark.parametrize("local", [False])
+@pytest.mark.parametrize("local_enum", [0, 1, 2, 3])
+# @pytest.mark.parametrize("local_enum", [0])
 @pytest.mark.parametrize("causal", [False, True])
 # @pytest.mark.parametrize("causal", [False])
 # @pytest.mark.parametrize("add_unused_qkv", [False, True])
@@ -393,7 +393,7 @@ def test_flash_attn_output(
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128])
 # @pytest.mark.parametrize("d", [64, 96, 128])
 # @pytest.mark.parametrize("d", [128, 192])
-@pytest.mark.parametrize("d", [128])
+@pytest.mark.parametrize("d", [64, 128])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -419,20 +419,37 @@ def test_flash_attn_output(
         (2048, 2048),
     ],
 )
+@pytest.mark.parametrize("varlen_mode", ["random", "third", "full"])
+# @pytest.mark.parametrize("varlen_mode", ["full"])
+@pytest.mark.parametrize(
+    "zero_lengths_q, zero_lengths_k",
+    [
+        (False, False),
+        (True, False),
+        (False, True),
+        (True, True),
+    ],
+)
 def test_flash_attn_varlen_output(
     seqlen_q,
     seqlen_k,
     d,
     add_unused_qkv,
     causal,
-    local,
+    local_enum,
     softcap,
     deterministic,
     has_qv,
     has_learnable_sink,
     mha_type,
     dtype,
+    varlen_mode,
+    zero_lengths_q,
+    zero_lengths_k,
 ):
+    local = local_enum > 0
+    if local and causal:
+        pytest.skip()
     if (
         causal or local
     ):  # Right now reference only supports causal attention with seqlen_k == seqlen_q
@@ -442,13 +459,12 @@ def test_flash_attn_varlen_output(
     torch.random.manual_seed(seqlen_q + seqlen_k + d + int(causal) * 2 + int(local))
     batch_size = 49 if seqlen_q <= 1024 else 7
     nheads = 6
-    # batch_size = 1
     # nheads = 1
     nheads_kv = nheads if mha_type == "mha" else (3 if mha_type == "gqa" else 1)
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
     # dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
     dv_vals = [128] if d == 192 else ([d] if d != 128 else [64, d])
-    if dtype == torch.float8_e4m3fn:
+    if dtype == torch.float8_e4m3fn or TEST_BWD_ONLY:
         dv_vals = [d]
     # attention_chunk_vals = [torch.randint(1, seqlen_k * 2, (1,)).item(), 0] if seqlen_q <= seqlen_k else [0]
     attention_chunk_vals = [0]
@@ -490,6 +506,12 @@ def test_flash_attn_varlen_output(
         window_size = (
             (None, None) if not local else torch.randint(0, seqlen_k, (2,)).tolist()
         )
+        if local_enum == 2:
+            window_size = (None, window_size[1])
+        elif local_enum == 3:
+            window_size = (window_size[0], None)
+        if local:
+            print("window size = ", window_size)
         if has_learnable_sink:
             learnable_sink = torch.randn(nheads, dtype=torch.bfloat16, device=device)
         else:
@@ -505,18 +527,19 @@ def test_flash_attn_varlen_output(
         q, k, v = [x.detach().requires_grad_() for x in (q_ref, k_ref, v_ref)]
         qv = qv_ref.detach() if has_qv else None
         query_padding_mask = generate_random_padding_mask(
-            seqlen_q, batch_size, device, mode="random", zero_lengths=False
+            seqlen_q,
+            batch_size,
+            device,
+            mode=varlen_mode,
+            zero_lengths=zero_lengths_q,
         )
-        # TODO: test zero_lengths
         key_padding_mask = generate_random_padding_mask(
-            # seqlen_k, batch_size, device, mode="random", zero_lengths=True
             seqlen_k,
             batch_size,
             device,
-            mode="random",
-            zero_lengths=False,
+            mode=varlen_mode,
+            zero_lengths=zero_lengths_k,
         )
-
         def _gen_unused_masks(padding_mask, add_unused, max_seq_len, bs, device):
             if add_unused:
                 another_mask = generate_random_padding_mask(max_seq_len, bs, device)
@@ -570,6 +593,8 @@ def test_flash_attn_varlen_output(
             query_unused_mask=query_unused_mask,
             key_unused_mask=key_unused_mask,
         )
+        print("cu_seqlens_q = ", cu_seqlens_q)
+        print("cu_seqlens_k = ", cu_seqlens_k)
         q_unpad, k_unpad, v_unpad = [
             x.detach().to(dtype).requires_grad_() for x in (q_unpad, k_unpad, v_unpad)
         ]
@@ -619,11 +644,11 @@ def test_flash_attn_varlen_output(
         fwd_atol = 2 * (out_ref + 0.3 - 0.3 - out_ref).abs().max().item()
         rtol = 2 if softcap == 0.0 else 3
 
-        pack_gqa_vals = [False, True, None]
+        pack_gqa_vals = [False, True, None] if not TEST_BWD_ONLY else [False]
         # pack_gqa_vals = [False]
         # num_splits_vals = [1, 3]
         # SplitKV is not supported for hdim >= 192
-        num_splits_vals = [1, 3] if d < 192 and not DISABLE_SPLIT else [1]
+        num_splits_vals = [1, 3] if d < 192 and not DISABLE_SPLIT and not TEST_BWD_ONLY else [1]
         for pack_gqa, num_splits in itertools.product(pack_gqa_vals, num_splits_vals):
             # SplitKV not supported on SM90 - skip this iteration
             if IS_SM90 and num_splits > 1:
@@ -634,7 +659,8 @@ def test_flash_attn_varlen_output(
                 v_unpad,
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_k=cu_seqlens_k,
-                # max_seqlen_k,
+                max_seqlen_q=seqlen_q,
+                max_seqlen_k=seqlen_k,
                 # seqused_q=seqused_q,
                 # seqused_k=seqused_k,
                 causal=causal,
@@ -647,6 +673,7 @@ def test_flash_attn_varlen_output(
                 softcap=softcap,
                 num_splits=num_splits,
                 pack_gqa=pack_gqa,
+                deterministic=deterministic,
             )
             out = output_pad_fn(out_unpad)
             if query_unused_mask is not None:
@@ -670,10 +697,10 @@ def test_flash_attn_varlen_output(
             and not attention_chunk != 0
             and dv == d
             and not has_learnable_sink
-            and False
+            # and False
         ):
             g_unpad = torch.randn_like(out_unpad)
-            do_o = ((g_unpad.float() * out_unpad.float()).sum(-1)).transpose(-1, -2)
+            # do_o = ((g_unpad.float() * out_unpad.float()).sum(-1)).transpose(-1, -2)
             # import flash_attn_3_cuda
             # dq_unpad, dk_unpad, dv_unpad, softmax_d, dq_accum, lse_log2 = flash_attn_3_cuda.bwd_varlen(
             #     g_unpad,

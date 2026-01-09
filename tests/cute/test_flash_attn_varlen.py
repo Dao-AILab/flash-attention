@@ -43,8 +43,8 @@ def test_varlen(
         dtype=dtype
     )
 
-    # SM90/SM100 backward pass doesn't support varlen yet
-    skip_backward = IS_SM90 or torch.cuda.get_device_capability()[0] == 10
+    # SM90 backward pass doesn't support varlen yet
+    skip_backward = IS_SM90
 
     ok = check_varlen_vs_torch_flash(
         q, k, v,
@@ -128,7 +128,7 @@ def check_varlen_vs_torch_flash(
     if not ok_fwd:
         return False
 
-    # Skip backward if not supported (e.g., SM100 varlen)
+    # Skip backward if not supported (e.g., SM90 varlen)
     if skip_backward:
         return True
 
