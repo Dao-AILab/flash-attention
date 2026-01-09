@@ -513,7 +513,7 @@ class FlashAttentionBackwardSm90:
 
         pipeline_producer_group = cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread)
         pipeline_consumer_group = cutlass.pipeline.CooperativeGroup(
-            cutlass.pipeline.Agent.Thread, self.num_mma_threads // self.num_threads_per_warp_group
+            cutlass.pipeline.Agent.Thread, self.num_mma_threads // cute.arch.WARP_SIZE
         )
         pipeline_Q = pipeline.PipelineTmaAsync.create(
             barrier_storage=storage.mbar_ptr_Q.data_ptr(),
@@ -521,7 +521,7 @@ class FlashAttentionBackwardSm90:
             producer_group=pipeline_producer_group,
             consumer_group=pipeline_consumer_group,
             tx_count=self.tma_copy_bytes["Q"] + self.tma_copy_bytes["LSE"],
-            init_wait=False,
+            defer_sync=True,
         )
         pipeline_dO = pipeline.PipelineTmaAsync.create(
             barrier_storage=storage.mbar_ptr_dO.data_ptr(),
@@ -529,7 +529,7 @@ class FlashAttentionBackwardSm90:
             producer_group=pipeline_producer_group,
             consumer_group=pipeline_consumer_group,
             tx_count=self.tma_copy_bytes["dO"] + self.tma_copy_bytes["dPsum"],
-            init_wait=True,
+            defer_sync=False,
         )
 
         sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner)
@@ -943,7 +943,7 @@ class FlashAttentionBackwardSm90:
         while work_tile.is_valid_tile:
             n_block, head_idx, batch_idx, _ = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
-            mask = AttentionMaskCls(seqlen.seqlen_q, seqlen.seqlen_k)
+            mask = AttentionMaskCls(seqlen)
             mask_fn = partial(
                 mask.apply_mask,
                 batch_idx=None,

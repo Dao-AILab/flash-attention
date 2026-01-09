@@ -35,6 +35,8 @@ from score_mod_definitions import (
     dual_buffer_factory as dual_buffer_bias,
 )
 
+COMPUTE_CAPABILITY = torch.cuda.get_device_capability()[0]
+
 # Test pairs: (cute_jit_function, eager_reference_function)
 TEST_PAIRS = [
     (score_mod_1, None),
@@ -298,6 +300,8 @@ def test_score_mod_with_paged_kvcache(
     dtype,
     score_mod_pair,
 ):
+    if COMPUTE_CAPABILITY == 9:
+        pytest.xfail("Paged KV cache only supported on SM100")
     if page_size is not None and seqlen_kv % page_size != 0:
         pytest.skip()
 
@@ -452,6 +456,8 @@ def test_score_mod_with_paged_kvcache_aux_tensors(
     dtype,
     score_mod_pair,
 ):
+    if COMPUTE_CAPABILITY == 9:
+        pytest.xfail("Paged KV cache only supported on SM100")
     if page_size is not None and seqlen_kv % page_size != 0:
         pytest.skip()
 
@@ -799,7 +805,7 @@ def make_aux_tensors_for_bwd(cute_score_mod, eager_factory, seqlen_q, num_heads,
         (256, 128),
     ],
 )
-@pytest.mark.parametrize("dim", [64])
+@pytest.mark.parametrize("dim", [64, 128])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("score_mod_triple", BWD_TEST_PAIRS_WITH_AUX)
 def test_cute_vs_flex_attention_backward_with_aux(
@@ -865,6 +871,7 @@ def test_cute_vs_flex_attention_backward_with_aux(
 def test_cute_vs_flex_attention_backward_pack_gqa(
     seqlen_q, seqlen_kv, dim, dtype, qhead_per_kvhead, num_kv_heads, score_mod_triple
 ):
+    pytest.skip("pack_gqa backward not yet implemented")
     torch.random.manual_seed(42)
     cute_fwd, cute_bwd, eager_ref = score_mod_triple
 

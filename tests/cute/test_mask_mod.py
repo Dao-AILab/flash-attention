@@ -22,7 +22,7 @@ import torch.nn.functional as F
 
 from flash_attn.cute.interface import _flash_attn_fwd, _flash_attn_bwd
 from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch
-from flash_attn.cute.mask_definitions import get_mask_pair, random_doc_id_tensor
+from mask_mod_definitions import get_mask_pair, random_doc_id_tensor
 COMPUTE_CAPABILITY = torch.cuda.get_device_capability()[0]
 
 
@@ -162,10 +162,15 @@ def _run_mask_test(
     # Determine nheads_kv based on mode
     if kv_mode == "mha":
         nheads_kv = nheads
+        pack_gqa = False
     elif kv_mode == "gqa":
-        nheads_kv = nheads // 2
+        if COMPUTE_CAPABILITY != 10:
+            pytest.xfail("pack_gqa requires SM100")
+        nheads_kv = nheads // 4
+        pack_gqa = True
     elif kv_mode == "mqa":
         nheads_kv = 1
+        pack_gqa = False
     else:
         raise ValueError(f"Unknown kv_mode: {kv_mode}")
 
@@ -211,10 +216,11 @@ def _run_mask_test(
     else:
         sparse_tile_m = tile_m
 
+    block_mask_nheads = 1 if pack_gqa else nheads
     bm = create_block_mask(
         mask_mod_flex,
         batch_size,
-        nheads,
+        block_mask_nheads,
         seqlen_q,
         seqlen_k,
         device="cuda",
@@ -270,8 +276,7 @@ def _run_mask_test(
         learnable_sink=None,
         m_block_size=tile_m,
         n_block_size=tile_n,
-        num_threads=384,
-        pack_gqa=False,
+        pack_gqa=pack_gqa,
         _compute_capability=None,
         score_mod=None,
         mask_mod=mask_mod_cute,
@@ -498,7 +503,7 @@ def test_single_doc_bwd_minimal():
     # Create single-document doc_ids (all same doc_id = 0)
     doc_ids = torch.zeros(batch_size, nheads, max(seqlen_q, seqlen_k), dtype=torch.int32, device="cuda")
 
-    from flash_attn.cute.mask_definitions import get_mask_pair
+    from mask_mod_definitions import get_mask_pair
     mask_mod_cute, mask_mod_flex = get_mask_pair("document", seqlen_q=seqlen_q, seqlen_k=seqlen_k)
 
     original_flex_mask = mask_mod_flex
@@ -626,7 +631,7 @@ def test_static_masks(
 
 @pytest.mark.parametrize("seqlen_q,seqlen_k", SEQLEN_PAIRS_SMOKE)
 @pytest.mark.parametrize("nheads", [16])
-@pytest.mark.parametrize("kv_mode", ["mha"])
+@pytest.mark.parametrize("kv_mode", ["mha", "gqa"])
 @pytest.mark.parametrize("headdim", [128])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("use_block_sparsity", [True, False])

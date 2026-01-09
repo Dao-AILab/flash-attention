@@ -15,7 +15,7 @@ import numpy as np
 import torch
 
 from flash_attn.cute.flash_fwd import FlashAttentionForwardSm90
-from flash_attn.cute.mask_definitions import (
+from mask_mod_definitions import (
     get_mask_pair,
     random_doc_id_tensor,
 )
