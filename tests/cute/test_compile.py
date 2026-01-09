@@ -178,8 +178,9 @@ def test_integration_backward():
     "test_case",
     [
         ("causal", {"causal": True}),
-        ("softcap", {"softcap": 30.0}),
-        ("causal_softcap", {"causal": True, "softcap": 30.0}),
+        ("window", {"window_size": (64, 64)}),
+        ("gqa", {"pack_gqa": True}),
+        ("deterministic", {"deterministic": True}),
     ],
 )
 def test_compile_with_parameters(test_case):
