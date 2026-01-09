@@ -628,6 +628,9 @@ def _flash_attn_bwd(
         total_k = k.shape[0]
         seqlen_k = max_seqlen_k if max_seqlen_k is not None else total_k
 
+    seqlen_q_rounded = (seqlen_q + m_block_size - 1) // m_block_size * m_block_size
+    seqlen_k_rounded = (seqlen_k + n_block_size - 1) // n_block_size * n_block_size
+
     num_head_kv = k.shape[-2]
     head_dim_v = v.shape[-1]
 
@@ -726,7 +729,6 @@ def _flash_attn_bwd(
     head_dim_rounded = (head_dim + 32 - 1) // 32 * 32
 
     if cu_seqlens_q is None:
-        seqlen_q_rounded = (seqlen_q + m_block_size - 1) // m_block_size * m_block_size
         dq_accum = torch.empty(
             batch_size,
             num_head,
@@ -754,7 +756,6 @@ def _flash_attn_bwd(
     if dKV_postprocess:
         head_dim_v_rounded = (head_dim_v + 32 - 1) // 32 * 32
         if cu_seqlens_k is None:
-            seqlen_k_rounded = (seqlen_k + n_block_size - 1) // n_block_size * n_block_size
             num_n_blocks = seqlen_k_rounded // n_block_size
             if cluster_size == 2 and num_n_blocks % cluster_size != 0:
                 seqlen_k_rounded = seqlen_k_rounded + n_block_size
@@ -796,13 +797,11 @@ def _flash_attn_bwd(
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     if deterministic:
-        seqlen_q_rounded = (seqlen_q + m_block_size - 1) // m_block_size * m_block_size
         dQ_semaphore = torch.zeros(batch_size, num_head, seqlen_q_rounded // m_block_size, 1, dtype=torch.int32, device="cuda")
     else:
         dQ_semaphore = None
 
     if deterministic and qhead_per_kvhead > 1:
-        seqlen_k_rounded = (seqlen_k + n_block_size - 1) // n_block_size * n_block_size
         dK_semaphore = torch.zeros(batch_size, num_head_kv, seqlen_k_rounded // n_block_size, 2, dtype=torch.int32, device="cuda")
         dV_semaphore = torch.zeros(batch_size, num_head_kv, seqlen_k_rounded // n_block_size, 2, dtype=torch.int32, device="cuda")
     else:

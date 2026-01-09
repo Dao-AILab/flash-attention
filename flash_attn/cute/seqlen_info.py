@@ -38,6 +38,8 @@ class SeqlenInfo:
 class SeqlenInfoQK:
     offset_q: cutlass.Int32
     offset_k: cutlass.Int32
+    padded_offset_q: cutlass.Int32
+    padded_offset_k: cutlass.Int32
     seqlen_q: cutlass.Int32
     seqlen_k: cutlass.Int32
     has_cu_seqlens_q: cutlass.Constexpr[bool]
@@ -61,6 +63,16 @@ class SeqlenInfoQK:
     ):
         offset_q = 0 if const_expr(mCuSeqlensQ is None) else mCuSeqlensQ[batch_idx]
         offset_k = 0 if const_expr(mCuSeqlensK is None) else mCuSeqlensK[batch_idx]
+        padded_offset_q = (
+            0
+            if const_expr(mCuSeqlensQ is None)
+            else (offset_q + batch_idx * tile_m) // tile_m * tile_m
+        )
+        padded_offset_k = (
+            0
+            if const_expr(mCuSeqlensK is None)
+            else (offset_k + batch_idx * tile_n) // tile_n * tile_n
+        )
         if const_expr(mSeqUsedQ is not None):
             seqlen_q = mSeqUsedQ[batch_idx]
         else:
@@ -84,6 +96,8 @@ class SeqlenInfoQK:
         return SeqlenInfoQK(
             offset_q,
             offset_k,
+            padded_offset_q,
+            padded_offset_k,
             seqlen_q,
             seqlen_k,
             has_cu_seqlens_q,
@@ -106,11 +120,7 @@ class SeqlenInfoQK:
             idx = (None,) * dim + (batch_idx,) + (None,) * (cute.rank(mQ) - 1 - dim)
             return mQ[idx]
         else:
-            offset_q = (
-                self.offset_q
-                if const_expr(not padded)
-                else (self.offset_q + batch_idx * self.tile_m) // self.tile_m * self.tile_m
-            )
+            offset_q = self.offset_q if const_expr(not padded) else self.padded_offset_q
             offset = offset_q if const_expr(cute.rank(mQ.shape[0]) == 1) else (0, offset_q)
             idx = (offset,) + (0,) * (cute.rank(mQ) - 1)
             return cute.domain_offset(idx, mQ)
@@ -127,10 +137,6 @@ class SeqlenInfoQK:
             idx = (None,) * dim + (batch_idx,) + (None,) * (cute.rank(mK) - 1 - dim)
             return mK[idx]
         else:
-            offset_k = (
-                self.offset_k
-                if const_expr(not padded)
-                else (self.offset_k + batch_idx * self.tile_n) // self.tile_n * self.tile_n
-            )
+            offset_k = self.offset_k if const_expr(not padded) else self.padded_offset_k
             idx = (offset_k,) + (0,) * (cute.rank(mK) - 1)
             return cute.domain_offset(idx, mK)

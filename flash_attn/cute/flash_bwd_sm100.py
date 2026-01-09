@@ -404,7 +404,7 @@ class FlashAttentionBackwardSm100:
 
         self.is_varlen_k = mCuSeqlensK is not None or mSeqUsedK is not None
         self.is_varlen_q = mCuSeqlensQ is not None or mSeqUsedQ is not None
-        self.use_tma_store = not (self.qhead_per_kvhead == 1 and self.is_varlen_k)
+        self.use_tma_store = not (self.qhead_per_kvhead == 1 and mCuSeqlensK is not None)
         self.dKV_postprocess = self.qhead_per_kvhead > 1
 
         if const_expr(self.dKV_postprocess):
@@ -618,7 +618,9 @@ class FlashAttentionBackwardSm100:
             cute.size(mQ.shape[0]),  # pass seqlen_q or total_q for seqlen_k
             mQ.shape[1],  # headdim
             mV.shape[1],  # headdim_v
-            total_q=cute.size(mK.shape[0]),  # pass total_k for total_q
+            total_q=cute.size(mK.shape[0])  # pass total_k for total_q
+            if const_expr(mCuSeqlensK is not None)
+            else cute.size(mK.shape[0]) * cute.size(mK.shape[3]),
             tile_shape_mn=self.cta_tiler[:2],  # (tile_n, tile_m)
             cluster_shape_mn=self.cluster_shape_mnk[:2],
             mCuSeqlensQ=mCuSeqlensK,
@@ -738,17 +740,6 @@ class FlashAttentionBackwardSm100:
             assert all(x is None for x in (mCuSeqlensQ, mCuSeqlensK, mSeqUsedQ, mSeqUsedK)), (
                 "Variable sequence length is not supported yet for blocksparse or aux tensors in bwd"
             )
-
-        # cute.printf("mQ = {}", tma_tensor_Q.layout)
-        # cute.printf("mK = {}", tma_tensor_K.layout)
-        # cute.printf("mV = {}", tma_tensor_V.layout)
-        # cute.printf("mLSE = {}", mLSE.layout)
-        # cute.printf("mdPsum = {}", mdPsum.layout)
-        # cute.printf("tma_tensor_dO = {}", tma_tensor_dO.layout)
-        # cute.printf("mdV = {}", mdV.layout)
-        # cute.printf("mdK = {}", mdK.layout)
-        # cute.printf("mdQaccum = {}", mdQaccum.layout)
-        # cute.printf("grid_dim = {}", grid_dim)
 
         self.kernel(
             tma_tensor_Q,
@@ -1343,15 +1334,10 @@ class FlashAttentionBackwardSm100:
                 mdO_cur = mdO[None, None, head_idx, batch_idx]
             else:
                 mdO_cur = cute.domain_offset((0, seqlen.offset_q), mdO[None, None, head_idx])
-            if const_expr(not seqlen.has_cu_seqlens_q):
-                mLSE_cur = mLSE[None, head_idx, batch_idx]
-                mdPsum_cur = mdPsum[None, head_idx, batch_idx]
-            else:
-                padded_offset_q = (
-                    (seqlen.offset_q + batch_idx * self.tile_m) // self.tile_m * self.tile_m
-                )
-                mLSE_cur = cute.domain_offset((padded_offset_q,), mLSE[None, head_idx])
-                mdPsum_cur = cute.domain_offset((padded_offset_q,), mdPsum[None, head_idx])
+            mLSE_cur = seqlen.offset_batch_Q(mLSE, batch_idx, dim=2, padded=True)[None, head_idx]
+            mdPsum_cur = seqlen.offset_batch_Q(mdPsum, batch_idx, dim=2, padded=True)[
+                None, head_idx
+            ]
 
             gK = cute.local_tile(mK_cur, cute.select(self.mma_tiler_kq, mode=[0, 2]), (n_block, 0))
             tSgK = thr_mma_S.partition_A(gK)
@@ -2482,11 +2468,8 @@ class FlashAttentionBackwardSm100:
             if const_expr(not seqlen.has_cu_seqlens_q):
                 mdQaccum_cur = mdQaccum[None, head_idx, batch_idx]
             else:
-                padded_offset_q = (
-                    (seqlen.offset_q + batch_idx * self.tile_m) // self.tile_m * self.tile_m
-                )
                 mdQaccum_cur = cute.domain_offset(
-                    (padded_offset_q * self.tile_hdim,), mdQaccum[None, head_idx]
+                    (seqlen.padded_offset_q * self.tile_hdim,), mdQaccum[None, head_idx]
                 )
             gdQaccum_ = cute.local_tile(mdQaccum_cur, (self.tile_m * self.tile_hdim,), (None,))
             # (M * K / STAGE, STAGE, _)
@@ -2836,11 +2819,8 @@ class FlashAttentionBackwardSm100:
             if const_expr(not seqlen.has_cu_seqlens_k):
                 mdKV_cur = mdKV[None, head_idx_kv, batch_idx]  # (seqlen * hdim)
             else:
-                padded_offset_k = (
-                    (seqlen.offset_k + batch_idx * self.tile_n) // self.tile_n * self.tile_n
-                )
                 mdKV_cur = cute.domain_offset(
-                    (padded_offset_k * self.tile_hdim,), mdKV[None, head_idx_kv]
+                    (seqlen.padded_offset_k * self.tile_hdim,), mdKV[None, head_idx_kv]
                 )
             gdKV_p = cute.local_tile(
                 mdKV_cur, (self.tile_n * self.tile_hdim,), (n_block,)
