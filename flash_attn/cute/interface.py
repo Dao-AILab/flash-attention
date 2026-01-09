@@ -1303,7 +1303,6 @@ def setup_context(ctx, inputs, output):
     ctx.softcap = inputs[5]
     ctx.window_size_left = inputs[6]
     ctx.window_size_right = inputs[7]
-    # ctx.num_splits = inputs[8]
     ctx.pack_gqa = inputs[9]
     ctx.deterministic = inputs[10]
 
@@ -1409,6 +1408,186 @@ class FlashAttnFunc(torch.autograd.Function):
         return dq, dk, dv, *((None,) * 8)  # Extra Nones is fine
 
 
+@torch.library.custom_op("flash_attn_cute::flash_attn_varlen_fwd", mutates_args=())
+def flash_attn_varlen_fwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: Optional[torch.Tensor],
+    cu_seqlens_k: Optional[torch.Tensor],
+    seqused_q: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
+    page_table: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    softcap: float = 0.0,
+    window_size_left: Optional[int] = None,
+    window_size_right: Optional[int] = None,
+    num_splits: int = 1,
+    pack_gqa: Optional[bool] = None,
+    deterministic: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Returns (out, lse)"""
+    return _flash_attn_fwd(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        seqused_q=seqused_q,
+        seqused_k=seqused_k,
+        page_table=page_table,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        softcap=softcap,
+        window_size_left=window_size_left,
+        window_size_right=window_size_right,
+        num_splits=num_splits,
+        pack_gqa=pack_gqa,
+        return_lse=True,
+        deterministic=deterministic,
+    )
+
+
+@flash_attn_varlen_fwd.register_fake
+def flash_attn_varlen_fwd_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    cu_seqlens_q: Optional[torch.Tensor],
+    cu_seqlens_k: Optional[torch.Tensor],
+    seqused_q: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
+    page_table: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    softcap: float = 0.0,
+    window_size_left: Optional[int] = None,
+    window_size_right: Optional[int] = None,
+    num_splits: int = 1,
+    pack_gqa: Optional[bool] = None,
+    deterministic: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    total_q, num_head, _ = q.shape
+    head_dim_v = v.shape[-1]
+    out = q.new_empty(total_q, num_head, head_dim_v)
+    lse = q.new_empty(num_head, total_q, dtype=torch.float32)
+    return out, lse
+
+
+@torch.library.custom_op("flash_attn_cute::flash_attn_varlen_bwd", mutates_args=())
+def flash_attn_varlen_bwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    dout: torch.Tensor,
+    lse: torch.Tensor,
+    cu_seqlens_q: Optional[torch.Tensor],
+    cu_seqlens_k: Optional[torch.Tensor],
+    seqused_q: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
+    # page_table: Optional[torch.Tensor] = None,  # Not supported yet
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    softcap: float = 0.0,
+    window_size_left: Optional[int] = None,
+    window_size_right: Optional[int] = None,
+    pack_gqa: Optional[bool] = None,
+    deterministic: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Returns (dq, dk, dv)"""
+    return _flash_attn_bwd(
+        q,
+        k,
+        v,
+        out,
+        dout,
+        lse,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        seqused_q=seqused_q,
+        seqused_k=seqused_k,
+        # page_table=page_table,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        softcap=softcap,
+        window_size_left=window_size_left,
+        window_size_right=window_size_right,
+        pack_gqa=pack_gqa,
+        deterministic=deterministic,
+    )
+
+
+@flash_attn_varlen_bwd.register_fake
+def flash_attn_varlen_bwd_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    dout: torch.Tensor,
+    lse: torch.Tensor,
+    cu_seqlens_q: Optional[torch.Tensor],
+    cu_seqlens_k: Optional[torch.Tensor],
+    seqused_q: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
+    # page_table: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    softcap: float = 0.0,
+    window_size_left: Optional[int] = None,
+    window_size_right: Optional[int] = None,
+    pack_gqa: Optional[bool] = None,
+    deterministic: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return (
+        torch.empty_like(q),
+        torch.empty_like(k),
+        torch.empty_like(v),
+    )
+
+
+def setup_context_varlen(ctx, inputs, output):
+    q, k, v, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = inputs[:7]
+    out, lse = output
+    ctx.save_for_backward(q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
+    ctx.softmax_scale = inputs[8]
+    ctx.causal = inputs[9]
+    ctx.softcap = inputs[10]
+    ctx.window_size_left = inputs[11]
+    ctx.window_size_right = inputs[12]
+    ctx.pack_gqa = inputs[14]
+    ctx.deterministic = inputs[15]
+
+
+def _backward_varlen(ctx, dout, dlse):
+    q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = ctx.saved_tensors
+    dq, dk, dv = flash_attn_varlen_bwd(
+        q,
+        k,
+        v,
+        out,
+        dout,
+        lse,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        seqused_q,
+        seqused_k,
+        # page_table,
+        softmax_scale=ctx.softmax_scale,
+        causal=ctx.causal,
+        softcap=ctx.softcap,
+        window_size_left=ctx.window_size_left,
+        window_size_right=ctx.window_size_right,
+        pack_gqa=ctx.pack_gqa,
+        deterministic=ctx.deterministic,
+    )
+    return dq, dk, dv, *((None,) * 13)
+
+
+flash_attn_varlen_bwd.register_autograd(_backward_varlen, setup_context=setup_context_varlen)
+
+
 class FlashAttnVarlenFunc(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -1423,16 +1602,15 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         page_table: Optional[torch.Tensor] = None,
         softmax_scale: Optional[float] = None,
         causal: bool = False,
-        window_size: Tuple[Optional[int], Optional[int]] = (None, None),
-        learnable_sink: Optional[torch.Tensor] = None,
         softcap: float = 0.0,
+        window_size: Tuple[Optional[int], Optional[int]] = (None, None),
+        # learnable_sink: Optional[torch.Tensor] = None,
         num_splits: int = 1,
         pack_gqa: Optional[bool] = None,
+        return_lse: bool = False,
         deterministic: bool = False,
-        score_mod: Optional[Callable] = None,
-        aux_tensors: Optional[list] = None,
     ):
-        out, lse = _flash_attn_fwd(
+        out, lse = torch.ops.flash_attn_cute.flash_attn_varlen_fwd(
             q,
             k,
             v,
@@ -1443,46 +1621,48 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             page_table=page_table,
             softmax_scale=softmax_scale,
             causal=causal,
+            softcap=softcap,
             window_size_left=window_size[0],
             window_size_right=window_size[1],
-            learnable_sink=learnable_sink,
-            softcap=softcap,
             num_splits=num_splits,
             pack_gqa=pack_gqa,
-            score_mod=score_mod,
-            aux_tensors=aux_tensors,
+            deterministic=deterministic,
         )
         ctx.save_for_backward(q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
-        ctx.window_size = window_size
         ctx.softcap = softcap
+        ctx.window_size = window_size
+        ctx.pack_gqa = pack_gqa
         ctx.deterministic = deterministic
-        return out, lse
+        return (out, lse) if return_lse else out
 
     @staticmethod
     def backward(ctx, dout, *args):
         q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = ctx.saved_tensors
         assert seqused_q == seqused_k == None
         assert ctx.softcap == 0.0
-        dq, dk, dv = _flash_attn_bwd(
+        dq, dk, dv = torch.ops.flash_attn_cute.flash_attn_varlen_bwd(
             q,
             k,
             v,
             out,
             dout,
             lse,
-            ctx.softmax_scale,
-            ctx.causal,
-            ctx.softcap,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            seqused_q=seqused_q,
-            seqused_k=seqused_k,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            seqused_q,
+            seqused_k,
+            softmax_scale=ctx.softmax_scale,
+            causal=ctx.causal,
+            softcap=ctx.softcap,
+            window_size_left=ctx.window_size[0],
+            window_size_right=ctx.window_size[1],
+            pack_gqa=ctx.pack_gqa,
             deterministic=ctx.deterministic,
         )
 
-        return dq, dk, dv, *((None,) * 20)
+        return dq, dk, dv, *((None,) * 13)
 
 
 def flash_attn_func(
@@ -1526,14 +1706,15 @@ def flash_attn_varlen_func(
     page_table: Optional[torch.Tensor] = None,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
-    window_size: Tuple[Optional[int], Optional[int]] = (None, None),
-    learnable_sink: Optional[torch.Tensor] = None,
     softcap: float = 0.0,
+    window_size: Tuple[Optional[int], Optional[int]] = (None, None),
+    # learnable_sink: Optional[torch.Tensor] = None,
     num_splits: int = 1,
     pack_gqa: Optional[bool] = None,
+    return_lse: bool = False,
     deterministic: bool = False,
-    score_mod: Optional[Callable] = None,
-    aux_tensors: Optional[list] = None,
+    # score_mod: Optional[Callable] = None,
+    # aux_tensors: Optional[list] = None,
 ):
     return FlashAttnVarlenFunc.apply(
         q,
@@ -1546,14 +1727,13 @@ def flash_attn_varlen_func(
         page_table,
         softmax_scale,
         causal,
-        window_size,
-        learnable_sink,
         softcap,
+        window_size,
+        # learnable_sink,
         num_splits,
         pack_gqa,
+        return_lse,
         deterministic,
-        score_mod,
-        aux_tensors,
     )
 
 
