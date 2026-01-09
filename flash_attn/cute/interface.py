@@ -103,13 +103,10 @@ def _flash_attn_fwd(
     page_table: Optional[torch.Tensor] = None,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
-    softcap: Optional[float] = None,
+    softcap: float = 0.0,
     window_size_left: Optional[int] = None,
     window_size_right: Optional[int] = None,
     learnable_sink: Optional[torch.Tensor] = None,
-    # m_block_size: int = 128,
-    # n_block_size: int = 64,
-    # num_threads: int = 128,
     m_block_size: int = 128,
     n_block_size: int = 128,
     num_threads: int = 384,
@@ -120,6 +117,7 @@ def _flash_attn_fwd(
     mask_mod: Optional[Callable] = None,
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     return_lse: bool = False,
+    deterministic: bool = False,  # TODO figure out where to edit
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
     aux_tensors: Optional[list[torch.Tensor]] = None,
@@ -533,6 +531,11 @@ def _flash_attn_fwd(
             cu_seqlens_q,
             seqused_q,
         )
+
+    # Need to return empty lse tensor for torch.compile compatibility
+    if lse is None:
+        lse = torch.tensor([], device=out.device)
+
     return out, lse
 
 
@@ -554,7 +557,7 @@ def _flash_attn_bwd(
     m_block_size: int = 64,
     n_block_size: int = 128,
     num_threads: int = 256,
-    pack_gqa: bool = False,
+    pack_gqa: Optional[bool] = None,
     num_stages_Q: int = 2,
     num_stages_dO: int = 2,
     SdP_swapAB: bool = False,
@@ -1176,6 +1179,158 @@ _flash_attn_bwd.compile_cache_pre = {}
 _flash_attn_bwd.compile_cache = {}
 _flash_attn_bwd.compile_cache_post = {}
 
+@torch.library.custom_op("flash_attn_cute::flash_attn_fwd", mutates_args=())
+def flash_attn_fwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    softcap: float = 0.0,
+    window_size_left: Optional[int] = None,
+    window_size_right: Optional[int] = None,
+    # learnable_sink: Optional[torch.Tensor] = None, # Not yet supported for bwd
+    num_splits: int = 1,
+    pack_gqa: Optional[bool] = None,
+    # return_lse: bool = False,  # Always return LSE, for torch.compile compatibility
+    deterministic: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Returns (out, lse)"""
+    return _flash_attn_fwd(
+        q,
+        k,
+        v,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size_left=window_size_left,
+        window_size_right=window_size_right,
+        softcap=softcap,
+        # learnable_sink=learnable_sink,
+        num_splits=num_splits,
+        pack_gqa=pack_gqa,
+        return_lse=True,
+        deterministic=deterministic,
+    )
+
+
+@flash_attn_fwd.register_fake
+def flash_attn_fwd_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    softcap: float = 0.0,
+    window_size_left: Optional[int] = None,
+    window_size_right: Optional[int] = None,
+    # learnable_sink: Optional[torch.Tensor] = None,
+    num_splits: int = 1,
+    pack_gqa: Optional[bool] = None,
+    # return_lse: bool = False,
+    deterministic: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    batch_size, seqlen_q, nheads, hdim = q.shape
+    hdim_v = v.shape[-1]
+    requires_grad = q.requires_grad or k.requires_grad or v.requires_grad
+    out = q.new_empty(batch_size, seqlen_q, nheads, hdim_v)
+    lse = q.new_empty(batch_size, nheads, seqlen_q, dtype=torch.float32)
+    return out, lse
+
+
+@torch.library.custom_op("flash_attn_cute::flash_attn_bwd", mutates_args=())
+def flash_attn_bwd(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    dout: torch.Tensor,
+    lse: torch.Tensor,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    softcap: float = 0.0,
+    window_size_left: Optional[int] = None,
+    window_size_right: Optional[int] = None,
+    pack_gqa: Optional[bool] = None,
+    deterministic: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Returns (dq, dk, dv)"""
+    return _flash_attn_bwd(
+        q,
+        k,
+        v,
+        out,
+        dout,
+        lse,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        softcap=softcap,
+        window_size_left=window_size_left,
+        window_size_right=window_size_right,
+        pack_gqa=pack_gqa,
+        deterministic=deterministic,
+    )
+
+
+@flash_attn_bwd.register_fake
+def flash_attn_bwd_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out: torch.Tensor,
+    dout: torch.Tensor,
+    lse: torch.Tensor,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    softcap: float = 0.0,
+    window_size_left: Optional[int] = None,
+    window_size_right: Optional[int] = None,
+    pack_gqa: Optional[bool] = None,
+    deterministic: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    return (
+        torch.empty_like(q),
+        torch.empty_like(k),
+        torch.empty_like(v),
+    )
+
+
+def setup_context(ctx, inputs, output):
+    q, k, v = inputs[:3]
+    out, lse = output
+    ctx.save_for_backward(q, k, v, out, lse)
+    ctx.softmax_scale = inputs[3]
+    ctx.causal = inputs[4]
+    ctx.softcap = inputs[5]
+    ctx.window_size_left = inputs[6]
+    ctx.window_size_right = inputs[7]
+    # ctx.num_splits = inputs[8]
+    ctx.pack_gqa = inputs[9]
+    ctx.deterministic = inputs[10]
+
+
+def _flash_attn_bwd_backward(ctx, dout, dlse):
+    """Backward pass for flash_attn_fwd custom op."""
+    q, k, v, out, lse = ctx.saved_tensors
+    dq, dk, dv = flash_attn_bwd(
+        q,
+        k,
+        v,
+        out,
+        dout,
+        lse,
+        softmax_scale=ctx.softmax_scale,
+        causal=ctx.causal,
+        softcap=ctx.softcap,
+        window_size_left=ctx.window_size_left,
+        window_size_right=ctx.window_size_right,
+        pack_gqa=ctx.pack_gqa,
+        deterministic=ctx.deterministic,
+    )
+    return dq, dk, dv, *((None,) * 8)
+
+
+flash_attn_fwd.register_autograd(_flash_attn_bwd_backward, setup_context=setup_context)
+
 
 class FlashAttnFunc(torch.autograd.Function):
     @staticmethod
@@ -1186,68 +1341,72 @@ class FlashAttnFunc(torch.autograd.Function):
         v: torch.Tensor,
         softmax_scale: Optional[float] = None,
         causal: bool = False,
-        window_size: Tuple[Optional[int], Optional[int]] = (None, None),
-        learnable_sink: Optional[torch.Tensor] = None,
         softcap: float = 0.0,
+        window_size: Tuple[Optional[int], Optional[int]] = (None, None),
+        # learnable_sink: Optional[torch.Tensor] = None,
         num_splits: int = 1,
         pack_gqa: Optional[bool] = None,
+        return_lse: bool = False,
         deterministic: bool = False,
-        mask_mod: Optional[Callable] = None,
-        full_block_cnt: Optional[torch.Tensor] = None,
-        full_block_idx: Optional[torch.Tensor] = None,
-        mask_block_cnt: Optional[torch.Tensor] = None,
-        mask_block_idx: Optional[torch.Tensor] = None,
+        # mask_mod: Optional[Callable] = None,
+        # full_block_cnt: Optional[torch.Tensor] = None,
+        # full_block_idx: Optional[torch.Tensor] = None,
+        # mask_block_cnt: Optional[torch.Tensor] = None,
+        # mask_block_idx: Optional[torch.Tensor] = None,
     ):
         # Only create block sparse tensors if at least one block sparse parameter is provided
-        block_sparse_tensors = None
-        if any(t is not None for t in [full_block_cnt, full_block_idx, mask_block_cnt, mask_block_idx]):
-            block_sparse_tensors = BlockSparseTensorsTorch(
-                full_block_cnt=full_block_cnt,
-                full_block_idx=full_block_idx,
-                mask_block_cnt=mask_block_cnt,
-                mask_block_idx=mask_block_idx,
-            )
-        out, lse = _flash_attn_fwd(
+        # block_sparse_tensors = None
+        # if any(t is not None for t in [full_block_cnt, full_block_idx, mask_block_cnt, mask_block_idx]):
+        #     block_sparse_tensors = BlockSparseTensorsTorch(
+        #         full_block_cnt=full_block_cnt,
+        #         full_block_idx=full_block_idx,
+        #         mask_block_cnt=mask_block_cnt,
+        #         mask_block_idx=mask_block_idx,
+        #     )
+        out, lse = torch.ops.flash_attn_cute.flash_attn_fwd(
             q,
             k,
             v,
             softmax_scale=softmax_scale,
             causal=causal,
+            softcap=softcap,
             window_size_left=window_size[0],
             window_size_right=window_size[1],
-            learnable_sink=learnable_sink,
-            softcap=softcap,
+            # learnable_sink=learnable_sink,
             num_splits=num_splits,
             pack_gqa=pack_gqa,
-            mask_mod=mask_mod,
-            block_sparse_tensors=block_sparse_tensors
+            # return_lse=True,  # need to always compute LSE for torch.compile compatibility
+            deterministic=deterministic,
         )
         ctx.save_for_backward(q, k, v, out, lse)
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
-        ctx.window_size = window_size
         ctx.softcap = softcap
+        ctx.window_size = window_size
+        ctx.pack_gqa = pack_gqa
         ctx.deterministic = deterministic
-        return out, lse
+        # num_splits, return_lse: fwd pass only
+        return (out, lse) if return_lse else out
 
     @staticmethod
     def backward(ctx, dout, *args):
         q, k, v, out, lse = ctx.saved_tensors
-        dq, dk, dv = _flash_attn_bwd(
+        dq, dk, dv = torch.ops.flash_attn_cute.flash_attn_bwd(
             q,
             k,
             v,
             out,
             dout,
             lse,
-            ctx.softmax_scale,
-            ctx.causal,
-            ctx.softcap,
+            softmax_scale=ctx.softmax_scale,
+            causal=ctx.causal,
+            softcap=ctx.softcap,
             window_size_left=ctx.window_size[0],
             window_size_right=ctx.window_size[1],
+            pack_gqa=ctx.pack_gqa,
             deterministic=ctx.deterministic,
         )
-        return dq, dk, dv, *((None,) * 20)  # Extra Nones is fine
+        return dq, dk, dv, *((None,) * 8)  # Extra Nones is fine
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -1332,17 +1491,13 @@ def flash_attn_func(
     v: torch.Tensor,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
-    window_size: Tuple[Optional[int], Optional[int]] = (None, None),
-    learnable_sink: Optional[torch.Tensor] = None,
     softcap: float = 0.0,
+    window_size: Tuple[Optional[int], Optional[int]] = (None, None),
+    # learnable_sink: Optional[torch.Tensor] = None, # Not yet supported for bwd
     num_splits: int = 1,
     pack_gqa: Optional[bool] = None,
-    deterministic: bool = False,
-    mask_mod: Optional[Callable] = None,
-    full_block_cnt: Optional[torch.Tensor] = None,
-    full_block_idx: Optional[torch.Tensor] = None,
-    mask_block_cnt: Optional[torch.Tensor] = None,
-    mask_block_idx: Optional[torch.Tensor] = None,
+    return_lse: bool = False,
+    deterministic: bool = False,  # TODO figure out
 ):
     return FlashAttnFunc.apply(
         q,
@@ -1350,17 +1505,13 @@ def flash_attn_func(
         v,
         softmax_scale,
         causal,
-        window_size,
-        learnable_sink,
         softcap,
+        window_size,
+        # learnable_sink,
         num_splits,
         pack_gqa,
+        return_lse,
         deterministic,
-        mask_mod,
-        full_block_cnt,
-        full_block_idx,
-        mask_block_cnt,
-        mask_block_idx,
     )
 
 
