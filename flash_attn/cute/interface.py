@@ -1130,9 +1130,7 @@ def _flash_attn_bwd(
         AtomLayoutMdQ,
         dQ_swapAB,
         cu_seqlens_q is None,
-        cu_seqlens_k is None,
         seqused_q is None,
-        seqused_k is None,
     )
     if compile_key_post not in _flash_attn_bwd.compile_cache_post:
         dq_accum_tensor = to_cute_tensor(dq_accum)
@@ -1174,9 +1172,7 @@ def _flash_attn_bwd(
             num_threads,
             AtomLayoutNdKV,
             dKV_swapAB,
-            cu_seqlens_q is None,
             cu_seqlens_k is None,
-            seqused_q is None,
             seqused_k is None,
         )
         if compile_key_post not in _flash_attn_bwd.compile_cache_post:
@@ -1217,9 +1213,7 @@ def _flash_attn_bwd(
             num_threads,
             AtomLayoutNdKV,
             dKV_swapAB,
-            cu_seqlens_q is None,
             cu_seqlens_k is None,
-            seqused_q is None,
             seqused_k is None,
         )
         if compile_key_post not in _flash_attn_bwd.compile_cache_post:
