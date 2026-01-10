@@ -54,6 +54,8 @@ from score_mod_definitions import (
     debug_global_idx_factory,
 )
 
+IS_SM90 = torch.cuda.get_device_capability()[0] == 9
+
 # =============================================================================
 # Test pairs
 # =============================================================================
@@ -694,6 +696,9 @@ def test_varlen_score_mod_kvcache(
     score_mod_tuple,
 ):
     """Test varlen attention with score_mod and paged KV cache."""
+    if IS_SM90 and page_size is not None:
+        pytest.xfail("paged KV not supported on SM90")
+
     if not varlen_q and not varlen_k:
         pytest.skip(
             "At least one of varlen_q or varlen_k must be True for varlen tests"
@@ -850,6 +855,9 @@ def test_varlen_score_mod_with_paged_kvcache_global(
     score_mod_tuple,
 ):
     """Test varlen attention with global idx score_mod and paged KV cache."""
+    if IS_SM90 and page_size is not None:
+        pytest.xfail("paged KV not supported on SM90")
+
     if page_size is not None and varlen_k:
         pytest.skip("Paged KV cache requires batched (non-varlen) K")
 

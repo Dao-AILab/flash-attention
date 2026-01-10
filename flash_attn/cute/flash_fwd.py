@@ -21,6 +21,8 @@ import cutlass.utils as utils_basic
 from cutlass.utils import LayoutEnum
 import cutlass.utils.hopper_helpers as sm90_utils_basic
 
+from quack import copy_utils as quack_copy_utils
+
 from flash_attn.cute import ampere_helpers as sm80_utils
 from flash_attn.cute import hopper_helpers as sm90_utils
 from flash_attn.cute import utils
@@ -352,6 +354,7 @@ class FlashAttentionForwardBase:
         smem_thr_copy_O = cute.make_tiled_copy_C(smem_copy_atom_O, tiled_mma).get_slice(tidx)
         taccOrO = smem_thr_copy_O.retile(rO)
         taccOsO = smem_thr_copy_O.partition_D(sO)
+        # taccOsO = quack_copy_utils.partition_D_position_independent(smem_thr_copy_O, sO)
         # copy acc O from rmem to smem with the smem copy atom
         cute.copy(smem_copy_atom_O, taccOrO, taccOsO)
 
@@ -1161,6 +1164,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         super().__init__(*args, **kwargs)
         self.intra_wg_overlap = intra_wg_overlap
         self.mma_pv_is_rs = mma_pv_is_rs
+        self.buffer_align_bytes = 1024
 
     def _get_smem_layout_atom(self):
         sQ_layout_atom = warpgroup.make_smem_layout_atom(
@@ -1222,15 +1226,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
     def _get_shared_storage_cls(self):
         # If we use cp.async to load Q, we want sQ to align to 1024 bytes
-        sQ_alignment = 128 if const_expr(self.use_tma_Q) else 1024
-        sK_alignment = 128
-        sV_alignment = 128
         sQ_struct, sK_struct, sV_struct = [
-            cute.struct.Align[cute.struct.MemRange[self.dtype, cute.cosize(layout)], alignment]
-            for layout, alignment in zip(
-                (self.sQ_layout, self.sK_layout, self.sV_layout),
-                (sQ_alignment, sK_alignment, sV_alignment),
-            )
+            cute.struct.Align[cute.struct.MemRange[self.dtype, cute.cosize(layout)], self.buffer_align_bytes]
+            for layout in (self.sQ_layout, self.sK_layout, self.sV_layout)
+
         ]
         cosize_sQV = max(cute.cosize(self.sQ_layout), cute.cosize(self.sV_layout))
         sQV_struct = cute.struct.Align[cute.struct.MemRange[self.dtype, cosize_sQV], 1024]
@@ -1295,7 +1294,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 for t in (mQ, mK, mV, mO, mLSE, mCuSeqlensQ, mCuSeqlensK, mSeqUsedQ, mSeqUsedK)
             )
         )
-
 
         # Assume all strides are divisible by 128 bits except the last stride
         new_stride = lambda t: (
@@ -1553,7 +1551,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         ).launch(
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
-            smem=SharedStorage.size_in_bytes(),
             stream=stream,
             min_blocks_per_mp=1,
         )
@@ -1622,7 +1619,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             cutlass.pipeline.Agent.Thread
         )
         pipeline_kv_consumer_group = cutlass.pipeline.CooperativeGroup(
-            cutlass.pipeline.Agent.Thread, self.num_mma_threads // self.num_threads_per_warp_group
+            cutlass.pipeline.Agent.Thread, self.num_mma_threads // cute.arch.WARP_SIZE
         )
         pipeline_k = pipeline.PipelineTmaAsync.create(
             barrier_storage=storage.mbar_ptr_K.data_ptr(),
@@ -1630,7 +1627,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             producer_group=pipeline_kv_producer_group,
             consumer_group=pipeline_kv_consumer_group,
             tx_count=self.tma_copy_bytes["K"],
-            init_wait=False,
+            defer_sync=True,
         )
         pipeline_v = pipeline.PipelineTmaAsync.create(
             barrier_storage=storage.mbar_ptr_V.data_ptr(),
@@ -1638,12 +1635,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             producer_group=pipeline_kv_producer_group,
             consumer_group=pipeline_kv_consumer_group,
             tx_count=self.tma_copy_bytes["V"],
+            defer_sync=False
         )
 
         # ///////////////////////////////////////////////////////////////////////////////
         # Get shared memory buffer
         # ///////////////////////////////////////////////////////////////////////////////
-        # TODO: how to get sQ_pi for cp.async if pack_gqa?
         sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner)
         sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
         if const_expr(not self.Q_in_regs):
@@ -1860,6 +1857,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         self.use_tma_Q,
                         self.tma_copy_bytes["Q"],
                         self.intra_wg_overlap,
+                        self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
                     )
 
                 tile_scheduler.prefetch_next_work()
@@ -2007,7 +2005,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     else FastDivmodDivisor(seqlen.seqlen_k),
                 )
 
-            mask = AttentionMaskCls(seqlen.seqlen_q, seqlen.seqlen_k)
+            mask = AttentionMaskCls(seqlen)
             mask_fn = partial(
                 mask.apply_mask,
                 batch_idx=batch_idx,
@@ -2033,6 +2031,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 )
             mma_one_n_block = partial(
                 mma_one_n_block_all,
+                seqlen=seqlen,
                 softmax=softmax,
                 score_mod_fn=score_mod_fn,
             )
@@ -2155,6 +2154,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     batch_idx,
                     head_idx,
                     m_block,
+                    seqlen,
                     kv_consumer_state,
                     mma_pv_fn,
                     mma_one_n_block,
@@ -2168,6 +2168,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     self.intra_wg_overlap,
                     self.warp_scheduler_barrier_sync,
                     self.warp_scheduler_barrier_arrive,
+                    self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
                 )
 
                 # Handle empty case (when no blocks to process)
@@ -2278,10 +2279,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         pipeline_v.consumer_wait(kv_consumer_state, pipeline_v.consumer_try_wait(kv_consumer_state))
         mma_pv_fn(B_idx=kv_consumer_state.index, zero_init=zero_init, wg_wait=0)
         pipeline_v.consumer_release(kv_consumer_state)
-
-        # Advance state for next iteration
         kv_consumer_state.advance()
-
         return kv_consumer_state
 
     @cute.jit
