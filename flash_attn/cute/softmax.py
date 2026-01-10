@@ -343,6 +343,7 @@ def apply_score_mod_inner(
     seqlen_info: SeqlenInfoQK,
     constant_q_idx: cutlass.Constexpr,
     qhead_per_kvhead: cutlass.Constexpr[int] = 1,
+    transpose_indices: cutlass.Constexpr[bool] = False,
 ):
     """Shared implementation for applying score modification.
 
@@ -362,7 +363,18 @@ def apply_score_mod_inner(
                         If None, compute q_idx per-element
         qhead_per_kvhead_packgqa: Pack-GQA replication factor. Divide q_idx by this
                                   when greater than 1 so score mods see logical heads.
+        transpose_indices: If True, swap q_idx/kv_idx in index_tensor (for bwd kernel where S is transposed)
     """
+    # Index positions in the index_tensor tuple
+    # Forward: index_tensor[...][0] = q_idx, index_tensor[...][1] = kv_idx
+    # Backward (transposed): index_tensor[...][0] = kv_idx, index_tensor[...][1] = q_idx
+    if cutlass.const_expr(transpose_indices):
+        q_idx_pos = cutlass.const_expr(1)
+        kv_idx_pos = cutlass.const_expr(0)
+    else:
+        q_idx_pos = cutlass.const_expr(0)
+        kv_idx_pos = cutlass.const_expr(1)
+
     n_vals = cutlass.const_expr(cute.size(score_tensor.shape))
     score_vec = cute.make_rmem_tensor(vec_size, qk_acc_dtype)
     kv_idx_vec = cute.make_rmem_tensor(vec_size, cutlass.Int32)
@@ -384,7 +396,7 @@ def apply_score_mod_inner(
 
             # Extract head offset from packed q_idx for Pack-GQA
             if cutlass.const_expr(qhead_per_kvhead > 1 and constant_q_idx is None):
-                q_idx_packed = index_tensor[i + j][0]
+                q_idx_packed = index_tensor[i + j][q_idx_pos]
                 # Building up the logical q_head idx: final_q_head = kv_head * qhead_per_kvhead + (q_physical % qhead_per_kvhead)
                 q_idx_logical = q_idx_packed // qhead_per_kvhead
                 head_offset = q_idx_packed - q_idx_logical * qhead_per_kvhead
@@ -394,19 +406,21 @@ def apply_score_mod_inner(
             if cutlass.const_expr(aux_tensors is not None and fastdiv_mods is not None):
                 if cutlass.const_expr(constant_q_idx is None):
                     seqlen_q_divmod, seqlen_k_divmod = fastdiv_mods
-                    q_idx_floored = floor_if_packed(index_tensor[i + j][0], qhead_per_kvhead)
+                    q_idx_floored = floor_if_packed(
+                        index_tensor[i + j][q_idx_pos], qhead_per_kvhead
+                    )
                     _, q_idx_wrapped = divmod(q_idx_floored, seqlen_q_divmod)
                     q_idx_vec[j] = q_idx_wrapped
                 else:
                     _, seqlen_k_divmod = fastdiv_mods
 
-                _, kv_idx_wrapped = divmod(index_tensor[i + j][1], seqlen_k_divmod)
+                _, kv_idx_wrapped = divmod(index_tensor[i + j][kv_idx_pos], seqlen_k_divmod)
                 kv_idx_vec[j] = kv_idx_wrapped
             else:
                 # No bounds checking - direct indexing
                 if constant_q_idx is None:
-                    q_idx_vec[j] = floor_if_packed(index_tensor[i + j][0], qhead_per_kvhead)
-                kv_idx_vec[j] = index_tensor[i + j][1]
+                    q_idx_vec[j] = floor_if_packed(index_tensor[i + j][q_idx_pos], qhead_per_kvhead)
+                kv_idx_vec[j] = index_tensor[i + j][kv_idx_pos]
 
         # Convert to SSA for score_mod call
         score_ssa = score_vec.load()
@@ -442,3 +456,125 @@ def apply_score_mod_inner(
         score_vec.store(post_mod_scores)
         for j in cutlass.range(vec_size, unroll_full=True):
             score_tensor[i + j] = score_vec[j]
+
+
+@cute.jit
+def apply_score_mod_bwd_inner(
+    grad_tensor,
+    score_tensor,
+    index_tensor,
+    score_mod_bwd: cutlass.Constexpr,
+    batch_idx,
+    head_idx,
+    softmax_scale,
+    vec_size: cutlass.Constexpr,
+    qk_acc_dtype: cutlass.Constexpr,
+    aux_tensors,
+    fastdiv_mods,
+    seqlen_info,
+    constant_q_idx: cutlass.Constexpr,
+    qhead_per_kvhead: cutlass.Constexpr[int] = 1,
+    transpose_indices: cutlass.Constexpr[bool] = False,
+):
+    """Apply backward score modification (joint graph).
+
+    Args:
+        grad_tensor: in/out: dlogits rewritten in-place with d(scaled_scores)
+        score_tensor: pre-mod scores (unscaled QK tile), scaled by softmax_scale internally
+        index_tensor: Index positions (same as forward)
+        score_mod_bwd: The backward score modification function (joint graph)
+        batch_idx: Batch index
+        head_idx: Head index
+        softmax_scale: Scale to apply to score_tensor
+        vec_size: Vector size for processing elements
+        qk_acc_dtype: Data type for accumulator
+        aux_tensors: Optional aux_tensors for FlexAttention
+        fastdiv_mods: Tuple of (seqlen_q_divmod, seqlen_k_divmod) for wrapping
+        seqlen_info: Sequence length info
+        constant_q_idx: If provided, use this constant for all q_idx values
+        qhead_per_kvhead: Pack-GQA replication factor
+        transpose_indices: If True, swap q_idx/kv_idx in index_tensor
+    """
+    # Index positions in the index_tensor tuple
+    # Forward: index_tensor[...][0] = q_idx, index_tensor[...][1] = kv_idx
+    # Backward (transposed): index_tensor[...][0] = kv_idx, index_tensor[...][1] = q_idx
+    if cutlass.const_expr(transpose_indices):
+        q_idx_pos = cutlass.const_expr(1)
+        kv_idx_pos = cutlass.const_expr(0)
+    else:
+        q_idx_pos = cutlass.const_expr(0)
+        kv_idx_pos = cutlass.const_expr(1)
+    n_vals = cutlass.const_expr(cute.size(grad_tensor.shape))
+    grad_vec = cute.make_fragment(vec_size, qk_acc_dtype)
+    score_vec = cute.make_fragment(vec_size, qk_acc_dtype)
+    kv_idx_vec = cute.make_fragment(vec_size, cutlass.Int32)
+    batch_idx_ssa = utils.scalar_to_ssa(batch_idx, cutlass.Int32).broadcast_to((vec_size,))
+    q_idx_vec = cute.make_fragment(vec_size, cutlass.Int32)
+
+    # For Pack-GQA with non-constant q_idx, we need per-element head indices
+    if cutlass.const_expr(qhead_per_kvhead > 1 and constant_q_idx is None):
+        head_idx_vec = cute.make_fragment(vec_size, cutlass.Int32)
+
+    for i in cutlass.range(0, n_vals, vec_size, unroll_full=True):
+        for j in cutlass.range(vec_size, unroll_full=True):
+            grad_vec[j] = grad_tensor[i + j]
+            # Scale score so joint graph sees same value as forward score_mod
+            score_vec[j] = score_tensor[i + j] * softmax_scale
+
+            if cutlass.const_expr(qhead_per_kvhead > 1 and constant_q_idx is None):
+                q_idx_packed = index_tensor[i + j][q_idx_pos]
+                q_idx_logical = q_idx_packed // qhead_per_kvhead
+                head_offset = q_idx_packed - q_idx_logical * qhead_per_kvhead
+                head_idx_vec[j] = head_idx * qhead_per_kvhead + head_offset
+
+            if cutlass.const_expr(aux_tensors is not None and fastdiv_mods is not None):
+                if cutlass.const_expr(constant_q_idx is None):
+                    seqlen_q_divmod, seqlen_k_divmod = fastdiv_mods
+                    q_idx_floored = floor_if_packed(
+                        index_tensor[i + j][q_idx_pos], qhead_per_kvhead
+                    )
+                    _, q_idx_wrapped = divmod(q_idx_floored, seqlen_q_divmod)
+                    q_idx_vec[j] = q_idx_wrapped
+                else:
+                    _, seqlen_k_divmod = fastdiv_mods
+
+                _, kv_idx_wrapped = divmod(index_tensor[i + j][kv_idx_pos], seqlen_k_divmod)
+                kv_idx_vec[j] = kv_idx_wrapped
+            else:
+                # No bounds checking - direct indexing
+                if constant_q_idx is None:
+                    q_idx_vec[j] = floor_if_packed(index_tensor[i + j][q_idx_pos], qhead_per_kvhead)
+                kv_idx_vec[j] = index_tensor[i + j][kv_idx_pos]
+
+        grad_ssa = grad_vec.load()
+        score_ssa = score_vec.load()
+        kv_idx_ssa = kv_idx_vec.load()
+
+        if cutlass.const_expr(constant_q_idx is None):
+            q_idx_ssa = q_idx_vec.load()
+        else:
+            q_idx_ssa = utils.scalar_to_ssa(constant_q_idx, cutlass.Int32).broadcast_to((vec_size,))
+
+        if cutlass.const_expr(qhead_per_kvhead > 1 and constant_q_idx is None):
+            head_idx_ssa = head_idx_vec.load()
+        else:
+            head_idx_ssa = utils.scalar_to_ssa(head_idx, cutlass.Int32).broadcast_to((vec_size,))
+
+        aux_args = []
+        if cutlass.const_expr(aux_tensors is not None):
+            aux_args = aux_tensors
+
+        grad_out_ssa = score_mod_bwd(
+            grad_ssa,
+            score_ssa,
+            batch_idx_ssa,
+            head_idx_ssa,
+            q_idx=q_idx_ssa,
+            kv_idx=kv_idx_ssa,
+            seqlen_info=seqlen_info,
+            aux_tensors=aux_args,
+        )
+
+        grad_vec.store(grad_out_ssa)
+        for j in cutlass.range(vec_size, unroll_full=True):
+            grad_tensor[i + j] = grad_vec[j]
