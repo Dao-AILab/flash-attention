@@ -130,16 +130,24 @@ struct Softmax {
 
     using TensorT = decltype(make_tensor<float>(Shape<Int<kNRows>>{}));
     TensorT row_max, row_sum;
+    float sink_val;
 
-    __forceinline__ __device__ Softmax() {};
+    __forceinline__ __device__ Softmax(const float sink_val = -INFINITY) : sink_val(sink_val) {};
 
-    template<bool Is_first, bool Check_inf=false, typename Tensor0, typename Tensor1>
-    __forceinline__ __device__ void softmax_rescale_o(Tensor0 &acc_s, Tensor1 &acc_o, float softmax_scale_log2) {
+    template<bool Is_first, bool Check_inf=false, bool Has_sink=false, typename Tensor0, typename Tensor1>
+    __forceinline__ __device__ void softmax_rescale_o(Tensor0 &acc_s, Tensor1 &acc_o, float softmax_scale_log2, float softmax_scale=1.0) {
         // Reshape acc_s from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
         Tensor scores = make_tensor(acc_s.data(), FLASH_NAMESPACE::convert_layout_acc_rowcol(acc_s.layout()));
         static_assert(decltype(size<0>(scores))::value == kNRows);
         if (Is_first) {
-            FLASH_NAMESPACE::template reduce_max</*zero_init=*/true>(scores, row_max);
+            if constexpr (Has_sink) {
+                const float sink_scaled = sink_val / softmax_scale;
+                #pragma unroll
+                for (int mi = 0; mi < size(row_max); ++mi) { row_max(mi) = sink_scaled; }
+                FLASH_NAMESPACE::template reduce_max</*zero_init=*/false>(scores, row_max);
+            } else {
+                FLASH_NAMESPACE::template reduce_max</*zero_init=*/true>(scores, row_max);
+            }
             FLASH_NAMESPACE::scale_apply_exp2(scores, row_max, softmax_scale_log2);
             FLASH_NAMESPACE::reduce_sum</*zero_init=*/true>(scores, row_sum);
         } else {
@@ -166,7 +174,7 @@ struct Softmax {
         }
     };
 
-    template<bool Is_dropout=false, bool Split=false, typename Tensor0>
+    template<bool Is_dropout=false, bool Split=false, bool Has_sink=false, typename Tensor0>
     __forceinline__ __device__ TensorT normalize_softmax_lse(Tensor0 &acc_o, float softmax_scale, float rp_dropout=1.0) {
         SumOp<float> sum_op;
         quad_allreduce_(row_sum, row_sum, sum_op);
@@ -176,6 +184,10 @@ struct Softmax {
         #pragma unroll
         for (int mi = 0; mi < size<0>(acc_o_rowcol); ++mi) {
             float sum = row_sum(mi);
+            if (Has_sink) {
+                const float max_scaled = row_max(mi) == -INFINITY ? 0.f : row_max(mi) * softmax_scale;
+                sum += exp2f((sink_val - max_scaled) * float(M_LOG2E));
+            }
             float inv_sum = (sum == 0.f || sum != sum) ? 1.f : 1.f / sum;
             lse(mi) = (sum == 0.f || sum != sum) ? (Split ? -INFINITY : INFINITY) : row_max(mi) * softmax_scale + __logf(sum);
             float scale = !Is_dropout ? inv_sum : inv_sum * rp_dropout;
