@@ -447,7 +447,7 @@ class FlashAttentionBackwardSm100:
         if const_expr(not self.dKV_postprocess):
             layout_dKV_transpose = KV_layout_transpose
         else:
-            layout_dKV_transpose = LSE_dPsum_dQaccum_transpose
+            layout_dKV_transpose = [2, 1, 0] if const_expr(mCuSeqlensK is None) else [1, 0]
         mdK, mdV = [utils.select(t, mode=layout_dKV_transpose) for t in (mdK, mdV)]
         # (s, h, n, b) --> (h, s, n, b) or (t, h, n) -> (h, t, b)
         dO_transpose = [1, 0, 2, 3] if const_expr(mCuSeqlensQ is None) else [1, 0, 2]
