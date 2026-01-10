@@ -287,11 +287,6 @@ def test_flash_attn_output(
             # Fix requires adjusting m_block_size or MMA config in flash_bwd_sm90.py
             if IS_SM90 and d == 64 and not causal:
                 pytest.xfail("SM90 backward: d=64 + non-causal has invalid MMA tile config (m_block=80)")
-            # TODO: SM90 backward pass has tensor layout issue for GQA/MQA (qhead_per_kvhead > 1)
-            # Error: "invalid mode element for input of rank 3" in utils.select()
-            # Fix requires adjusting layout handling in flash_bwd_sm90.py for GQA
-            if IS_SM90 and mha_type != "mha":
-                pytest.xfail("SM90 backward: GQA/MQA has tensor layout issue (qhead_per_kvhead > 1)")
             # TODO: SM90 backward pass does not support local attention yet
             if IS_SM90 and local:
                 pytest.xfail("SM90 backward: local attention not supported yet")
@@ -327,7 +322,7 @@ def test_flash_attn_output(
             print(f"dQ Pytorch mean diff: {(dq_pt - dq_ref).abs().mean().item()}")
             print(f"dK Pytorch mean diff: {(dk_pt - dk_ref).abs().mean().item()}")
             print(f"dV Pytorch mean diff: {(dv_pt - dv_ref).abs().mean().item()}")
-            
+
             if VERBOSE:
                 diff_dq = (dq - dq_ref).abs()
                 max_idx = diff_dq.argmax()
