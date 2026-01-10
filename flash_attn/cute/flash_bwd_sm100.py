@@ -2373,7 +2373,7 @@ class FlashAttentionBackwardSm100:
             # When total_m_block_cnt == 0 for block sparsity, no Q tiles contribute to this KV tile
             if const_expr(not self.dKV_postprocess):
                 should_zero_dKV = False
-                if const_expr(self.is_local or seqlen.has_cu_seqlens_q):
+                if const_expr(self.is_local or self.is_varlen_q):
                     should_zero_dKV = m_block_min >= m_block_max
                 if const_expr(self.use_block_sparsity):
                     # For block sparsity, zero when no m_blocks contribute to this n_block
