@@ -207,7 +207,7 @@ struct Rotary {
                 }
             }
         }
-        return cute::make_tuple(tRrCos, tRrSin);;
+        return cute::make_tuple(tRrCos, tRrSin);
     }
 
     template <bool kInterleaved=true>
