@@ -116,6 +116,17 @@ def finish_overlap_v_load(
 
 
 @cute.jit
+def sparse_tensor_m_block(
+    m_block,
+    qhead_per_kvhead: cutlass.Constexpr[int],
+):
+    """Map packed m_block indices to block-sparse tensor indices."""
+    if const_expr(qhead_per_kvhead != 1):
+        return m_block // qhead_per_kvhead
+    return m_block
+
+
+@cute.jit
 def produce_block_sparse_loads(
     blocksparse_tensors: BlockSparseTensors,
     batch_idx,
@@ -130,6 +141,7 @@ def produce_block_sparse_loads(
     use_tma_q: cutlass.Constexpr,
     tma_q_bytes: cutlass.Constexpr,
     intra_wg_overlap: cutlass.Constexpr,
+    qhead_per_kvhead: cutlass.Constexpr[int] = 1,
 ):
     """Iterate over the mask and full block lists for a single tile.
 
@@ -141,16 +153,21 @@ def produce_block_sparse_loads(
     while we advance the producer state to start the next full K. Either the full list
     overlaps that pending V load, or, if no full blocks exist, we explicitly drain it.
 
+    Args:
+        qhead_per_kvhead: Pack-GQA factor. When > 1, m_block is in packed space and
+            must be converted to unpacked for sparse tensor indexing.
     """
 
     mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx = blocksparse_tensors
 
-    curr_mask_block_cnt = mask_block_cnt[batch_idx, head_idx, m_block]
-    curr_mask_block_idx = mask_block_idx[batch_idx, head_idx, m_block, None]
+    m_block_sparse = sparse_tensor_m_block(m_block, qhead_per_kvhead)
+
+    curr_mask_block_cnt = mask_block_cnt[batch_idx, head_idx, m_block_sparse]
+    curr_mask_block_idx = mask_block_idx[batch_idx, head_idx, m_block_sparse, None]
 
     if const_expr(full_block_cnt is not None):
-        curr_full_block_cnt = full_block_cnt[batch_idx, head_idx, m_block]
-        curr_full_block_idx = full_block_idx[batch_idx, head_idx, m_block, None]
+        curr_full_block_cnt = full_block_cnt[batch_idx, head_idx, m_block_sparse]
+        curr_full_block_idx = full_block_idx[batch_idx, head_idx, m_block_sparse, None]
     else:
         curr_full_block_cnt = Int32(0)
         curr_full_block_idx = None
@@ -290,18 +307,26 @@ def consume_block_sparse_loads(
     intra_wg_overlap: cutlass.Constexpr,
     warp_scheduler_barrier_sync: Callable,
     warp_scheduler_barrier_arrive: Callable,
+    qhead_per_kvhead: cutlass.Constexpr[int] = 1,
 ):
     """Consume the mask and full block lists for a single tile on the consumer side.
 
-    Mirrors `produce_block_sparse_loads` so that the consumer pipeline
+    Mirrors `produce_block_sparse_loads` so that the consumer pipeline uses
+    the same sparse tensor indexing.
+
+    Args:
+        qhead_per_kvhead: Pack-GQA factor. When > 1, m_block is in packed space and
+            must be converted to unpacked for sparse tensor indexing.
     """
 
     mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx = blocksparse_tensors
 
-    curr_mask_block_cnt = mask_block_cnt[batch_idx, head_idx, m_block]
-    curr_mask_block_idx = mask_block_idx[batch_idx, head_idx, m_block, None]
-    curr_full_block_cnt = full_block_cnt[batch_idx, head_idx, m_block]
-    curr_full_block_idx = full_block_idx[batch_idx, head_idx, m_block, None]
+    m_block_sparse = sparse_tensor_m_block(m_block, qhead_per_kvhead)
+
+    curr_mask_block_cnt = mask_block_cnt[batch_idx, head_idx, m_block_sparse]
+    curr_mask_block_idx = mask_block_idx[batch_idx, head_idx, m_block_sparse, None]
+    curr_full_block_cnt = full_block_cnt[batch_idx, head_idx, m_block_sparse]
+    curr_full_block_idx = full_block_idx[batch_idx, head_idx, m_block_sparse, None]
 
     processed_any = curr_mask_block_cnt + curr_full_block_cnt > 0
 
