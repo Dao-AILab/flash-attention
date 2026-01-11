@@ -268,6 +268,9 @@ class FlashAttentionForwardSm100:
         window_size_left: Int32 | int | None = None,
         window_size_right: Int32 | int | None = None,
         learnable_sink: Optional[cute.Tensor] = None,
+        mQDescale: Optional[cute.Tensor] = None,
+        mKDescale: Optional[cute.Tensor] = None,
+        mVDescale: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors: Optional[list] = None,
     ):
@@ -700,6 +703,9 @@ class FlashAttentionForwardSm100:
             window_size_left,
             window_size_right,
             learnable_sink,
+            mQDescale,
+            mKDescale,
+            mVDescale,
             blocksparse_tensors,
             sQ_layout,
             sK_layout,
@@ -745,6 +751,9 @@ class FlashAttentionForwardSm100:
         window_size_left: Optional[Int32],
         window_size_right: Optional[Int32],
         learnable_sink: Optional[cute.Tensor],
+        mQDescale: Optional[cute.Tensor],
+        mKDescale: Optional[cute.Tensor],
+        mVDescale: Optional[cute.Tensor],
         blocksparse_tensors: Optional[BlockSparseTensors],
         sQ_layout: cute.ComposedLayout,
         sK_layout: cute.ComposedLayout,
@@ -1047,6 +1056,8 @@ class FlashAttentionForwardSm100:
                 self.softmax_loop,
                 softmax_scale_log2=softmax_scale_log2,
                 softmax_scale=softmax_scale,
+                mQDescale=mQDescale,
+                mKDescale=mKDescale,
                 thr_mma_qk=thr_mma_qk,
                 sScale=sScale,
                 mLSE=mLSE,
@@ -1099,6 +1110,9 @@ class FlashAttentionForwardSm100:
                 mLSE,
                 sO,
                 learnable_sink,
+                mQDescale,
+                mKDescale,
+                mVDescale,
                 gmem_tiled_copy_O,
                 tma_atom_O,
                 mbar_ptr,
@@ -1537,11 +1551,20 @@ class FlashAttentionForwardSm100:
 
     # for both softmax0 and softmax1 warp group
     @cute.jit
+    def _kv_head_idx(self, head_idx: Int32) -> Int32:
+        """Map query-head tile index -> KV-head index (FA3 descale semantics)."""
+        if cutlass.const_expr(self.pack_gqa):
+            return head_idx
+        return head_idx // self.qhead_per_kvhead
+
+    @cute.jit
     def softmax_loop(
         self,
         stage: int | Int32,
         softmax_scale_log2: Float32,
-        softmax_scale: Float32,
+        softmax_scale: Float32 | None,
+        mQDescale: Optional[cute.Tensor],
+        mKDescale: Optional[cute.Tensor],
         thr_mma_qk: cute.core.ThrMma,
         tStSi: cute.Tensor,
         sScale: cute.Tensor,
@@ -1601,7 +1624,9 @@ class FlashAttentionForwardSm100:
 
         tStScale_r2t = thr_tmem_store_scale.partition_D(tStScale)
         tmem_store_atom = cute.make_copy_atom(
-            tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(16)),
+            tcgen05.copy.St32x32bOp(
+                tcgen05.copy.Repetition(8 if const_expr(self.q_dtype.width == 8) else 16)
+            ),
             Float32,
         )
         thr_tmem_store = tcgen05.make_tmem_copy(tmem_store_atom, tStP).get_slice(tidx)
@@ -1620,6 +1645,7 @@ class FlashAttentionForwardSm100:
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
+            kv_head_idx = self._kv_head_idx(head_idx)
             seqlen = SeqlenInfoCls(batch_idx)
             n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
 
@@ -1672,10 +1698,27 @@ class FlashAttentionForwardSm100:
             else:
                 mask_fn_none = None
 
+            q_descale = Float32(1.0)
+            k_descale = Float32(1.0)
+            if cutlass.const_expr(mQDescale is not None):
+                q_descale = Float32(mQDescale[batch_idx, kv_head_idx])
+            if cutlass.const_expr(mKDescale is not None):
+                k_descale = Float32(mKDescale[batch_idx, kv_head_idx])
+            qk_descale = q_descale * k_descale
+
+            max_offset = 8 if cutlass.const_expr(self.q_dtype.width == 8) else 0
+            if const_expr(self.score_mod is None):
+                softmax_scale_log2_eff = softmax_scale_log2 * qk_descale
+                softmax_scale_eff = None
+            else:
+                softmax_scale_log2_eff = softmax_scale_log2
+                softmax_scale_eff = softmax_scale * qk_descale
+
             softmax = SoftmaxSm100.create(
-                softmax_scale_log2,
+                softmax_scale_log2_eff,
                 rescale_threshold=8.0 if const_expr(self.q_dtype.width == 16) else 0.0,
-                softmax_scale=softmax_scale,
+                softmax_scale=softmax_scale_eff,
+                max_offset=max_offset,
             )
             softmax.reset()
 
@@ -1950,7 +1993,7 @@ class FlashAttentionForwardSm100:
         softmax.apply_exp2_convert(
             tSrS_t2r,
             tSrP_r2t,
-            e2e=mask_fn is None and self.head_dim_padded <= 128,
+            e2e=mask_fn is None and self.head_dim_padded <= 128 and self.q_dtype.width != 8,
             e2e_freq=self.e2e_freq,
         )
         # Sequence barrier arrive
@@ -1989,6 +2032,9 @@ class FlashAttentionForwardSm100:
         mLSE: cute.Tensor,
         sO: cute.Tensor,
         learnable_sink: Optional[cute.Tensor],
+        mQDescale: Optional[cute.Tensor],
+        mKDescale: Optional[cute.Tensor],
+        mVDescale: Optional[cute.Tensor],
         gmem_tiled_copy_O: cute.TiledCopy,
         tma_atom_O: cute.CopyAtom,
         mbar_ptr: cute.Pointer,
@@ -2028,6 +2074,26 @@ class FlashAttentionForwardSm100:
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
+            kv_head_idx = self._kv_head_idx(head_idx)
+            if const_expr(self.score_mod is None):
+                q_descale = Float32(1.0)
+                k_descale = Float32(1.0)
+                if cutlass.const_expr(mQDescale is not None):
+                    q_descale = Float32(mQDescale[batch_idx, kv_head_idx])
+                if cutlass.const_expr(mKDescale is not None):
+                    k_descale = Float32(mKDescale[batch_idx, kv_head_idx])
+                softmax_scale_log2_eff = softmax_scale_log2 * (q_descale * k_descale)
+            else:
+                softmax_scale_log2_eff = softmax_scale_log2
+
+            v_descale = Float32(1.0)
+            if cutlass.const_expr(mVDescale is not None):
+                v_descale = Float32(mVDescale[batch_idx, kv_head_idx])
+
+            max_offset = Float32(8.0) if cutlass.const_expr(self.q_dtype.width == 8) else Float32(0.0)
+            max_offset_scale = (
+                Float32(256.0) if cutlass.const_expr(self.q_dtype.width == 8) else Float32(1.0)
+            )
             seqlen = SeqlenInfoCls(batch_idx)
             n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
 
@@ -2130,15 +2196,16 @@ class FlashAttentionForwardSm100:
                         if const_expr(not self.is_split_kv) or split_idx == 0:
                             if row_max == -Float32.inf:
                                 # It's possible to have an empty row with splitKV.
-                                row_max = sink_val * (LOG2_E / softmax_scale_log2)
-                                row_sum = Float32(1.0)
+                                row_max = sink_val * (LOG2_E / softmax_scale_log2_eff)
+                                row_sum = max_offset_scale
                             else:
                                 row_sum += utils.exp2f(
-                                    sink_val * LOG2_E - row_max * softmax_scale_log2
+                                    sink_val * LOG2_E - row_max * softmax_scale_log2_eff + max_offset
                                 )
                     acc_O_mn_row_is_zero_or_nan = row_sum == 0.0 or row_sum != row_sum
                     stats[stage] = (row_sum, row_max, acc_O_mn_row_is_zero_or_nan)
                     scale = cute.arch.rcp_approx(row_sum if not acc_O_mn_row_is_zero_or_nan else 1.0)
+                    scale = scale * v_descale
                     cute.arch.mbarrier_wait(
                         mbar_ptr + self.mbar_O_full_offset + stage, o_corr_consumer_phase
                     )
@@ -2210,7 +2277,9 @@ class FlashAttentionForwardSm100:
                         softmax_corr_consumer_phase,
                         o_corr_consumer_phase,
                         corr_epi_producer_phase,
-                        softmax_scale_log2,
+                        softmax_scale_log2_eff,
+                        max_offset,
+                        max_offset_scale,
                         mO_cur,
                         gO,
                         gmem_tiled_copy_O_for_empty_tile,
@@ -2239,7 +2308,7 @@ class FlashAttentionForwardSm100:
                     #     cute.printf("row_sum = {}, row_max = {}, acc_O_mn_row_is_zero_or_nan = {}\n", row_sum, row_max, acc_O_mn_row_is_zero_or_nan)
                     LN2 = math.log(2.0)
                     lse = (
-                        (row_max * softmax_scale_log2 + utils.log2f(row_sum)) * LN2
+                        (row_max * softmax_scale_log2_eff + (utils.log2f(row_sum) - max_offset)) * LN2
                         if not acc_O_mn_row_is_zero_or_nan
                         else -Float32.inf
                     )
