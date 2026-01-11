@@ -72,6 +72,7 @@ class TileSchedulerArguments(ParamsBase):
     is_persistent: cutlass.Constexpr[bool] = False
     lpt: cutlass.Constexpr[bool] = False
     is_split_kv: cutlass.Constexpr[bool] = False
+    head_swizzle: cutlass.Constexpr[bool] = False
 
 
 class SingleTileScheduler:
@@ -512,6 +513,7 @@ class SingleTileVarlenScheduler:
         qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1
         lpt: cutlass.Constexpr[bool] = False
         is_split_kv: cutlass.Constexpr[bool] = False
+        head_swizzle: cutlass.Constexpr[bool] = False
 
         @staticmethod
         @cute.jit
@@ -537,6 +539,7 @@ class SingleTileVarlenScheduler:
                 qhead_per_kvhead_packgqa=args.qhead_per_kvhead_packgqa,
                 lpt=args.lpt,
                 is_split_kv=args.is_split_kv,
+                head_swizzle=args.head_swizzle,
             )
 
     def __init__(self, params: Params, tile_idx: Int32, split_idx: Int32, *, loc=None, ip=None):
@@ -638,7 +641,7 @@ class SingleTileVarlenScheduler:
             )
             num_m_blocks = cute.arch.shuffle_sync(num_m_blocks, batch_idx_in_group)
             mh_block = next_tile_idx - group_start_tile - num_m_blocks_prev_lane * params.num_head
-            if cutlass.const_expr(params.lpt):
+            if cutlass.const_expr(params.lpt or params.head_swizzle):
                 # This is a version of the SingleTileLPTScheduler, complicated by the fact that
                 # the seqlen can vary per batch.
                 # TODO: is there any case where num_m_blocks is 0?
@@ -677,7 +680,8 @@ class SingleTileVarlenScheduler:
                 block = l2_mod // nheads_in_this_section
                 head_idx_residual = l2_mod - block * nheads_in_this_section
                 head_idx = section_idx * nheads_in_l2 + head_idx_residual
-                block = num_m_blocks - 1 - block
+                if cutlass.const_expr(params.lpt):
+                    block = num_m_blocks - 1 - block
             else:
                 head_idx = mh_block // num_m_blocks
                 block = mh_block - head_idx * num_m_blocks
