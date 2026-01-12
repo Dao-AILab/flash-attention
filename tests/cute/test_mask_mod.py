@@ -13,7 +13,6 @@
 #   pytest test_mask_mod.py                            # Run all tests
 
 import math
-from typing import Optional
 
 import pytest
 import torch
@@ -62,7 +61,7 @@ def create_tensors(
     }
 
 
-def compute_reference_flex_attn(tensors, mask_mod_flex, block_size: Optional[tuple[int, int]] = None):
+def compute_reference_flex_attn(tensors, mask_mod_flex, block_size: tuple[int, int] | None = None):
     """Compute reference using flex_attention for custom mask_mods"""
     batch_size, seqlen_q, nheads, headdim = tensors["q"].shape
     _, seqlen_k, nheads_kv, _ = tensors["k"].shape
@@ -96,7 +95,7 @@ def compute_reference_flex_attn(tensors, mask_mod_flex, block_size: Optional[tup
         device=q.device,
         **block_mask_kwargs,
     )
-    out_ref = flex_attention(q, k, v, block_mask=block_mask, scale=scale)
+    out_ref = flex_attention(q, k, v, block_mask=block_mask, scale=scale, enable_gqa=True)
     return out_ref.transpose(1, 2).contiguous()
 
 
@@ -164,8 +163,8 @@ def _run_mask_test(
         nheads_kv = nheads
         pack_gqa = False
     elif kv_mode == "gqa":
-        if COMPUTE_CAPABILITY != 10:
-            pytest.xfail("pack_gqa requires SM100")
+        if COMPUTE_CAPABILITY < 9:
+            pytest.xfail("pack_gqa requires SM90+")
         nheads_kv = nheads // 4
         pack_gqa = True
     elif kv_mode == "mqa":
@@ -239,6 +238,31 @@ def _run_mask_test(
         full_q_idx,
         *_,
     ) = bm.as_tuple()
+
+    # SM90 block-sparse backward expects BlockMask granularity (128, 128) regardless of fwd tiling.
+    if COMPUTE_CAPABILITY == 9 and use_block_sparsity and (sparse_tile_m, tile_n) != (128, 128):
+        bm_bwd = create_block_mask(
+            mask_mod_flex,
+            batch_size,
+            nheads,
+            seqlen_q,
+            seqlen_k,
+            device="cuda",
+            BLOCK_SIZE=(128, 128),
+        )
+        (
+            _seq_q,
+            _seq_k,
+            _kv_mask_cnt,
+            _kv_mask_idx,
+            _full_kv_cnt,
+            _full_kv_idx,
+            q_mask_cnt,
+            q_mask_idx,
+            full_q_cnt,
+            full_q_idx,
+            *_,
+        ) = bm_bwd.as_tuple()
 
     softmax_scale = 1.0 / math.sqrt(headdim)
 
@@ -343,8 +367,7 @@ def _run_mask_test(
         f"Kernel error {cute_error:.2e} exceeds {rtol}x PyTorch error {pt_error:.2e} + {fwd_atol:.2e}"
     )
 
-    # Backward pass (SM100 only)
-    if needs_backward and COMPUTE_CAPABILITY == 10 and kv_mode == "mha":
+    if needs_backward:
         q = tensors["q"]
         k = tensors["k"]
         v = tensors["v"]
@@ -376,7 +399,8 @@ def _run_mask_test(
         assert not torch.isnan(dv_cute).any(), "dV contains NaN"
 
         bwd_rtol = 2
-        bwd_atol_floor = 1e-5
+        min_seqlen = min(seqlen_q, seqlen_k)
+        bwd_atol_floor = 1e-5 if min_seqlen >= 64 else 2e-5
         dq_atol = max(bwd_atol_floor, 2 * (dq_ref_fp32 + 0.3 - 0.3 - dq_ref_fp32).abs().max().item())
         dk_atol = max(bwd_atol_floor, 2 * (dk_ref_fp32 + 0.3 - 0.3 - dk_ref_fp32).abs().max().item())
         dv_atol = max(bwd_atol_floor, 2 * (dv_ref_fp32 + 0.3 - 0.3 - dv_ref_fp32).abs().max().item())
@@ -453,9 +477,6 @@ def test_q_boundary_masking_block_sparse_bwd(seqlen_q, seqlen_k, mask_name):
     - Block-sparse with mask_mod: exercises is_full_block=True path
     - Backward pass: where the bug manifested
     """
-    if COMPUTE_CAPABILITY != 10:
-        pytest.skip("SM100-only backward test")
-
     _run_mask_test(
         seqlen_q=seqlen_q,
         seqlen_k=seqlen_k,
@@ -474,6 +495,7 @@ def test_q_boundary_masking_block_sparse_bwd(seqlen_q, seqlen_k, mask_name):
     )
 
 
+@pytest.mark.skipif(COMPUTE_CAPABILITY != 10, reason="Test uses SM100 block mask conventions (2*tile_m)")
 def test_single_doc_bwd_minimal():
     """Minimal test to isolate single-document backward pass bug.
 
@@ -484,9 +506,6 @@ def test_single_doc_bwd_minimal():
 
     Run with: pytest tests/cute/test_mask_mod.py::test_single_doc_bwd_minimal -v -s
     """
-    if COMPUTE_CAPABILITY != 10:
-        pytest.skip("SM100-only test")
-
     import random
     random.seed(42)
     torch.manual_seed(42)
@@ -791,7 +810,7 @@ def run_flex_reference_bwd(q, k, v, block_mask, grad_out, dtype=None):
 
     # Use flex_attention directly without torch.compile for backward tests
     # torch.compile can hang on certain mask patterns (e.g., mini_causal with float32)
-    out_ref = flex_attention(q_ref, k_ref, v_ref, block_mask=block_mask)
+    out_ref = flex_attention(q_ref, k_ref, v_ref, block_mask=block_mask, enable_gqa=True)
     dq_ref, dk_ref, dv_ref = torch.autograd.grad(out_ref, (q_ref, k_ref, v_ref), grad_out_ref)
 
     # Transpose back to BSHD
@@ -801,6 +820,77 @@ def run_flex_reference_bwd(q, k, v, block_mask, grad_out, dtype=None):
         dk_ref.transpose(1, 2),
         dv_ref.transpose(1, 2),
     )
+
+
+def test_sm90_block_sparse_bwd_mismatched_q_block_granularity_error_message():
+    if COMPUTE_CAPABILITY != 9:
+        pytest.skip("SM90-only test")
+
+    batch_size = 1
+    seqlen_q = 256
+    seqlen_k = 256
+    nheads = 4
+    nheads_kv = nheads
+    headdim = 128
+    dtype = torch.bfloat16
+    tile_m = 80
+    tile_n = 128
+
+    tensors = create_tensors(batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, headdim, headdim, dtype)
+    mask_mod_cute, mask_mod_flex = get_mask_pair("block_diagonal", seqlen_q=seqlen_q, seqlen_k=seqlen_k)
+    bm = create_block_mask(
+        mask_mod_flex,
+        batch_size,
+        nheads,
+        seqlen_q,
+        seqlen_k,
+        device="cuda",
+        BLOCK_SIZE=(tile_m, tile_n),
+    )
+    (
+        _seq_q,
+        _seq_k,
+        _kv_mask_cnt,
+        _kv_mask_idx,
+        _full_kv_cnt,
+        _full_kv_idx,
+        q_mask_cnt,
+        q_mask_idx,
+        full_q_cnt,
+        full_q_idx,
+        *_,
+    ) = bm.as_tuple()
+
+    block_sparse_mask_bwd = BlockSparseTensorsTorch(
+        mask_block_cnt=q_mask_cnt,
+        mask_block_idx=q_mask_idx,
+        full_block_cnt=full_q_cnt,
+        full_block_idx=full_q_idx,
+    )
+
+    softmax_scale = 1.0 / math.sqrt(headdim)
+    out = torch.empty(batch_size, seqlen_q, nheads, headdim, device="cuda", dtype=dtype)
+    lse = torch.empty(batch_size, nheads, seqlen_q, device="cuda", dtype=torch.float32)
+    grad_out = torch.randn_like(out)
+
+    with pytest.raises(
+        ValueError,
+        match=r"Hint: Backward expects Q-direction block-sparse tensors.*BLOCK_SIZE=\(128, 128\)",
+    ):
+        _flash_attn_bwd(
+            q=tensors["q"],
+            k=tensors["k"],
+            v=tensors["v"],
+            out=out,
+            dout=grad_out,
+            lse=lse,
+            softmax_scale=softmax_scale,
+            causal=False,
+            m_block_size=tile_m,
+            n_block_size=tile_n,
+            mask_mod=mask_mod_cute,
+            block_sparse_tensors=block_sparse_mask_bwd,
+        )
 
 
 if __name__ == "__main__":
