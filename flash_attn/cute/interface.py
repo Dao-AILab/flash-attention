@@ -110,7 +110,7 @@ def _flash_attn_fwd(
     mask_mod: Optional[Callable] = None,
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     return_lse: bool = False,
-    deterministic: bool = False,  # TODO figure out where to edit
+    deterministic: bool = False,
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
     aux_tensors: Optional[list[torch.Tensor]] = None,
@@ -292,6 +292,7 @@ def _flash_attn_fwd(
         num_n_blocks = (seqlen_k_loaded + n_block_size - 1) // n_block_size
         num_m_blocks = (seqlen_q_packgqa + m_block_size_effective - 1) // m_block_size_effective
         total_mblocks = batch_size * num_head_kv * num_m_blocks
+        # TODO: this way of choosing num_splits is not batch-invariant. Fix for deterministic=True
         num_splits = num_splits_heuristic(
             total_mblocks,
             torch.cuda.get_device_properties(device).multi_processor_count,
@@ -1704,7 +1705,7 @@ def flash_attn_func(
     num_splits: int = 1,
     pack_gqa: Optional[bool] = None,
     return_lse: bool = False,
-    deterministic: bool = False,  # TODO figure out
+    deterministic: bool = False,
 ):
     return FlashAttnFunc.apply(
         q,
@@ -2067,7 +2068,7 @@ def flash_attn_blocksparse_func(
     mask_mod: Optional[Callable] = None,
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     return_lse: bool = False,
-    deterministic: bool = False,  # TODO figure out where to edit
+    deterministic: bool = False,
 ):
     """Eager-only; delegates to compilable path if no callables/block sparsity."""
     if (
