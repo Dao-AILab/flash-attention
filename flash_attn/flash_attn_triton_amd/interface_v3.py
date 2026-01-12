@@ -51,7 +51,7 @@ def fwd(
     num_splits: int = 1,
     pack_gqa=None,
     sm_margin: int = 0,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """
     Flash Attention v3 forward pass compatible interface for AMD Triton implementation.
 
@@ -456,8 +456,9 @@ def fwd(
     ), f"[fwd_v3] softmax_lse shape {softmax_lse.shape} != {expected_lse_shape}"
 
     # Return format compatible with v3
-    # V3 returns (out, softmax_lse, *rest) where rest can be empty or contain additional outputs
-    return out, softmax_lse
+    # V3 returns (out, softmax_lse, out_accum, softmax_lse_accum)
+    # out_accum and softmax_lse_accum are None for Triton AMD (no split-k accumulation)
+    return out, softmax_lse, None, None
 
 
 def bwd(
