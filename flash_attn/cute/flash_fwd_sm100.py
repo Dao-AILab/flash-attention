@@ -52,6 +52,7 @@ from flash_attn.cute.tile_scheduler import (
     StaticPersistentTileScheduler,
     SingleTileLPTScheduler,
     SingleTileVarlenScheduler,
+    DynamicPersistentVarlenScheduler,
     ParamsBase,
 )
 
@@ -189,6 +190,23 @@ class FlashAttentionForwardSm100:
         elif self.is_varlen_q: # fallback
             self.epilogue_warp_ids = (13, 14)
 
+        self.leader_load_warp = 14
+
+        non_empty_warps_ids = set(
+            (
+            *self.softmax0_warp_ids,
+            *self.softmax1_warp_ids,
+            *self.correction_warp_ids,
+            self.mma_warp_id,
+            *self.load_warp_ids,
+            *self.epilogue_warp_ids,
+            )
+        )
+        # print("non_empty_warps_ids = ", non_empty_warps_ids)
+
+        self.num_consumer_scheduler_warps = len(non_empty_warps_ids) - 1
+        # print("Num consumer scheduler warps = ", self.num_consumer_scheduler_warps)
+
         self.tmem_s_offset = [0, self.n_block_size]  # e.g., 0, 128
         self.tmem_o_offset = [
             self.tmem_s_offset[-1] + self.n_block_size + i * self.head_dim_v_padded
@@ -275,6 +293,7 @@ class FlashAttentionForwardSm100:
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors: Optional[list] = None,
         num_splits_dynamic_ptr: Optional[cute.Tensor] = None,
+        tile_count_semaphore: Optional[cute.Tensor] = None,
     ):
         """Execute the Fused Multi-Head Attention operation on the provided tensors.
 
@@ -289,6 +308,9 @@ class FlashAttentionForwardSm100:
         5. Grid and work scheduling computation
         6. Kernel launch with appropriate parameters
         """
+        self.dynamic_persistent = tile_count_semaphore is not None
+        # self.dynamic_persistent = False
+        print("Dynamic persistent is ", self.dynamic_persistent)
         # setup static attributes before smem/grid/tma computation
         self.q_dtype = mQ.element_type
         self.k_dtype = mK.element_type
@@ -566,7 +588,10 @@ class FlashAttentionForwardSm100:
             gmem_tiled_copy_O = cute.make_tiled_copy_tv(atom_universal_copy, tO_layout, vO_layout)
 
         if const_expr(mCuSeqlensQ is not None or mSeqUsedQ is not None):
-            TileScheduler = SingleTileVarlenScheduler
+            if const_expr(self.dynamic_persistent):
+                TileScheduler = DynamicPersistentVarlenScheduler
+            else:
+                TileScheduler = SingleTileVarlenScheduler
         else:
             if const_expr(self.is_causal or self.is_local):
                 TileScheduler = SingleTileLPTScheduler
@@ -599,6 +624,8 @@ class FlashAttentionForwardSm100:
             is_persistent=self.is_persistent,
             lpt=self.is_causal or self.is_local,
             is_split_kv=self.is_split_kv,
+            num_splits_dynamic_ptr=num_splits_dynamic_ptr,
+            tile_count_semaphore=tile_count_semaphore.iterator,
         )
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
         self.tile_scheduler_cls = TileScheduler
@@ -630,6 +657,8 @@ class FlashAttentionForwardSm100:
         class SharedStorage:
             # m_barriers for pipelines
             mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.mbar_total]
+            sched_pipeline_array_ptr: cute.struct.MemRange[cutlass.Int64, 2]
+            work_info: cute.struct.MemRange[Int32, 4]
             # Tmem holding buffer
             tmem_holding_buf: Int32
             # Smem tensors
@@ -722,6 +751,7 @@ class FlashAttentionForwardSm100:
             tile_sched_params,
             num_splits,
             num_splits_dynamic_ptr,
+            tile_count_semaphore,
             aux_tensors,
             fastdiv_mods,
             head_divmod,
@@ -769,6 +799,7 @@ class FlashAttentionForwardSm100:
         tile_sched_params: ParamsBase,
         num_splits: Int32,
         num_splits_dynamic_ptr: Optional[cute.Tensor] = None,
+        tile_count_semaphore: Optional[cute.Tensor] = None,
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
         head_divmod=None,
@@ -869,6 +900,23 @@ class FlashAttentionForwardSm100:
                     )
                 ),
             )
+
+        if const_expr(self.dynamic_persistent):
+            assert tile_count_semaphore is not None
+            sched_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
+            sched_pipeline_consumer_group = pipeline.CooperativeGroup(
+                pipeline.Agent.Thread, self.num_consumer_scheduler_warps
+            )
+            sched_pipeline = pipeline.PipelineAsync.create(
+                barrier_storage=storage.sched_pipeline_array_ptr.data_ptr(),
+                num_stages=1,
+                producer_group=sched_pipeline_producer_group,
+                consumer_group=sched_pipeline_consumer_group,
+            )
+            work_info = storage.work_info.get_tensor((4, ))
+        else:
+            sched_pipeline = None
+            work_info = None
         # Relying on pipeline_kv constructor to call mbarrier_init_fence and sync
         pipeline_kv = self.make_and_init_load_kv_pipeline(mbar_ptr + self.mbar_load_kv_full_offset)
 
@@ -953,7 +1001,7 @@ class FlashAttentionForwardSm100:
             window_size_right=window_size_right,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
         )
-        TileSchedulerCls = partial(self.tile_scheduler_cls.create, tile_sched_params)
+        TileSchedulerCls = partial(self.tile_scheduler_cls.create, tile_sched_params, work_info, sched_pipeline)
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  EMPTY
@@ -1159,7 +1207,8 @@ class FlashAttentionForwardSm100:
         kv_producer_state = cutlass.pipeline.make_pipeline_state(
             cutlass.pipeline.PipelineUserType.Producer, self.kv_stage
         )
-        tile_scheduler = TileSchedulerCls()
+        # is_scheduler_warp = cute.arch.warp_idx() == self.leader_load_warp
+        tile_scheduler = TileSchedulerCls(is_scheduler_warp=True)
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
@@ -1319,8 +1368,8 @@ class FlashAttentionForwardSm100:
 
 
             tile_scheduler.prefetch_next_work()
-            tile_scheduler.advance_to_next_work()
-            work_tile = tile_scheduler.get_current_work()
+            work_tile = tile_scheduler.advance_to_next_work(batch_idx)
+            # work_tile = tile_scheduler.get_current_work()
             # End of persistent scheduler loop
 
     @cute.jit
@@ -1557,8 +1606,8 @@ class FlashAttentionForwardSm100:
                 # End of GEMM_PV1(i_end) (P1 * Vi_end -> O1)
 
             # Advance to next tile
-            tile_scheduler.advance_to_next_work()
-            work_tile = tile_scheduler.get_current_work()
+            work_tile = tile_scheduler.advance_to_next_work()
+            # work_tile = tile_scheduler.get_current_work()
         # End of persistent scheduler loop
 
 
@@ -1888,8 +1937,8 @@ class FlashAttentionForwardSm100:
             #         gLSE[tidx] = lse
 
             # Advance to next tile
-            tile_scheduler.advance_to_next_work()
-            work_tile = tile_scheduler.get_current_work()
+            work_tile = tile_scheduler.advance_to_next_work()
+            # work_tile = tile_scheduler.get_current_work()
         # End of persistent scheduler loop
 
     @cute.jit
@@ -2305,8 +2354,8 @@ class FlashAttentionForwardSm100:
                         gLSE[tidx] = lse
 
             # Advance to next tile
-            tile_scheduler.advance_to_next_work()
-            work_tile = tile_scheduler.get_current_work()
+            work_tile = tile_scheduler.advance_to_next_work()
+            # work_tile = tile_scheduler.get_current_work()
         # End of persistent scheduler loop
 
     @cute.jit
@@ -2605,8 +2654,8 @@ class FlashAttentionForwardSm100:
                 epi_consumer_phase ^= 1
 
             # Advance to next tile
-            tile_scheduler.advance_to_next_work()
-            work_tile = tile_scheduler.get_current_work()
+            work_tile = tile_scheduler.advance_to_next_work()
+            # work_tile = tile_scheduler.get_current_work()
 
     def load_Q(
         self,

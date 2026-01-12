@@ -11,7 +11,7 @@ except ImportError:  # Python < 3.12
 import cutlass
 from cutlass._mlir import ir
 import cutlass.cute as cute
-from cutlass import Int32, const_expr
+from cutlass import Int32, Boolean, const_expr, Constexpr
 
 import flash_attn.cute.utils as utils
 from flash_attn.cute.fast_math import clz
@@ -77,7 +77,7 @@ class TileSchedulerArguments(ParamsBase):
     num_m_blocks_ptr: Optional[cute.Tensor] = None
     varlen_batch_idx_ptr: Optional[cute.Tensor] = None
     num_nheads_in_l2_ptr: Optional[cute.Tensor] = None
-    tile_count_semaphore: Optional[cute.Tensor] = None
+    tile_count_semaphore: Optional[cute.Pointer] = None
 
 
 class SingleTileScheduler:
@@ -119,7 +119,15 @@ class SingleTileScheduler:
         return SingleTileScheduler.Params.create(args, loc=loc, ip=ip)
 
     @staticmethod
-    def create(params: Params, *, loc=None, ip=None) -> "SingleTileScheduler":
+    def create(
+        params: Params,
+        work_info: Optional[cute.Tensor] = None,
+        scheduler_pipeline: Optional[cutlass.pipeline.PipelineAsync] = None,
+        is_scheduler_warp: Constexpr[Boolean] = False,
+        *,
+        loc=None,
+        ip=None,
+    ) -> "SingleTileScheduler":
         blk_coord = cute.arch.block_idx()
         return SingleTileScheduler(params, blk_coord, loc=loc, ip=ip)
 
@@ -160,8 +168,15 @@ class SingleTileScheduler:
     def prefetch_next_work(self, *, loc=None, ip=None):
         pass
 
-    def advance_to_next_work(self, *, loc=None, ip=None):
+    def advance_to_next_work(
+        self,
+        batch_idx: Int32 = 0,
+        *,
+        loc=None,
+        ip=None,
+    ):
         self._is_first_block = False
+        return WorkTileInfo((Int32(0), Int32(0), Int32(0), Int32(0)), False)
 
     def __extract_mlir_values__(self):
         values, self._values_pos = [], []
@@ -206,7 +221,15 @@ class StaticPersistentTileScheduler:
         return StaticPersistentTileScheduler.Params.create(args, loc=loc, ip=ip)
 
     @staticmethod
-    def create(params: Params, *, loc=None, ip=None) -> "StaticPersistentTileScheduler":
+    def create(
+        params: Params,
+        work_info: Optional[cute.Tensor] = None,
+        scheduler_pipeline: Optional[cutlass.pipeline.PipelineAsync] = None,
+        is_scheduler_warp: Constexpr[Boolean] = False,
+        *,
+        loc=None,
+        ip=None,
+    ) -> "StaticPersistentTileScheduler":
         tile_idx = cute.arch.block_idx()[0]
         return StaticPersistentTileScheduler(params, tile_idx, loc=loc, ip=ip)
 
@@ -239,8 +262,15 @@ class StaticPersistentTileScheduler:
     def prefetch_next_work(self, *, loc=None, ip=None):
         pass
 
-    def advance_to_next_work(self, *, loc=None, ip=None):
+    def advance_to_next_work(
+        self,
+        batch_idx: Int32 = 0,
+        *,
+        loc=None,
+        ip=None,
+    ):
         self._tile_idx += cute.arch.grid_dim()[0]
+        return self.get_current_work()
 
     def __extract_mlir_values__(self):
         values, self._values_pos = [], []
@@ -328,7 +358,15 @@ class SingleTileLPTScheduler:
 
     @staticmethod
     @cute.jit
-    def create(params: Params, *, loc=None, ip=None) -> "SingleTileLPTScheduler":
+    def create(
+        params: Params,
+        work_info: Optional[cute.Tensor] = None,
+        scheduler_pipeline: Optional[cutlass.pipeline.PipelineAsync] = None,
+        is_scheduler_warp: Constexpr[Boolean] = False,
+        *,
+        loc=None,
+        ip=None,
+    ) -> "SingleTileLPTScheduler":
         tile_idx, split_idx, _ = cute.arch.block_idx()
         return SingleTileLPTScheduler(params, tile_idx, split_idx, loc=loc, ip=ip)
 
@@ -372,9 +410,16 @@ class SingleTileLPTScheduler:
     def prefetch_next_work(self, *, loc=None, ip=None):
         pass
 
-    def advance_to_next_work(self, *, loc=None, ip=None):
+    def advance_to_next_work(
+        self,
+        batch_idx: Int32 = 0,
+        *,
+        loc=None,
+        ip=None,
+    ):
         # Single tile scheduler - set to invalid tile_idx to indicate no more work
         self._tile_idx = self.params.total_blocks
+        return WorkTileInfo((Int32(0), Int32(0), Int32(0), Int32(0)), False)
 
     def __extract_mlir_values__(self):
         values, self._values_pos = [], []
@@ -453,7 +498,15 @@ class SingleTileLPTBwdScheduler:
 
     @staticmethod
     @cute.jit
-    def create(params: Params, *, loc=None, ip=None) -> "SingleTileLPTBwdScheduler":
+    def create(
+        params: Params,
+        work_info: Optional[cute.Tensor] = None,
+        scheduler_pipeline: Optional[cutlass.pipeline.PipelineAsync] = None,
+        is_scheduler_warp: Constexpr[Boolean] = False,
+        *,
+        loc=None,
+        ip=None
+    ) -> "SingleTileLPTBwdScheduler":
         tile_idx = cute.arch.block_idx()[0]
         return SingleTileLPTBwdScheduler(params, tile_idx, loc=loc, ip=ip)
 
@@ -495,9 +548,16 @@ class SingleTileLPTBwdScheduler:
     def prefetch_next_work(self, *, loc=None, ip=None):
         pass
 
-    def advance_to_next_work(self, *, loc=None, ip=None):
+    def advance_to_next_work(
+        self,
+        batch_idx: Int32 = 0,
+        *,
+        loc=None,
+        ip=None,
+    ):
         # Single tile scheduler - set to invalid tile_idx to indicate no more work
         self._tile_idx = self.params.total_blocks
+        return WorkTileInfo((Int32(0), Int32(0), Int32(0), Int32(0)), False)
 
     def __extract_mlir_values__(self):
         values, self._values_pos = [], []
@@ -573,7 +633,15 @@ class SingleTileVarlenScheduler:
         return SingleTileVarlenScheduler.Params.create(args, loc=loc, ip=ip)
 
     @staticmethod
-    def create(params: Params, *, loc=None, ip=None) -> "SingleTileVarlenScheduler":
+    def create(
+        params: Params,
+        work_info: Optional[cute.Tensor] = None,
+        scheduler_pipeline: Optional[cutlass.pipeline.PipelineAsync] = None,
+        is_scheduler_warp: Constexpr[Boolean] = False,
+        *,
+        loc=None,
+        ip=None,
+    ) -> "SingleTileVarlenScheduler":
         tile_idx, split_idx, _ = cute.arch.block_idx()
         return SingleTileVarlenScheduler(params, tile_idx, split_idx, loc=loc, ip=ip)
 
@@ -717,9 +785,16 @@ class SingleTileVarlenScheduler:
     def prefetch_next_work(self, *, loc=None, ip=None):
         pass
 
-    def advance_to_next_work(self, *, loc=None, ip=None):
+    def advance_to_next_work(
+        self,
+        batch_idx: Int32 = 0,
+        *,
+        loc=None,
+        ip=None,
+    ):
         # Single tile scheduler - set to invalid tile_idx to indicate no more work
         self._is_first_block = False
+        return WorkTileInfo((Int32(0), Int32(0), Int32(self.params.num_batch), Int32(0)), False)
 
     def __extract_mlir_values__(self):
         values, self._values_pos = [], []
@@ -738,3 +813,351 @@ class SingleTileVarlenScheduler:
             obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
             values = values[n_items:]
         return SingleTileVarlenScheduler(*(tuple(obj_list)), loc=self._loc)
+
+
+class DynamicPersistentVarlenScheduler:
+    @dataclass
+    class Params(ParamsBase):
+        num_head: Int32
+        num_batch: Int32
+        total_q: Int32
+        num_splits: Int32
+        max_kvblock_in_l2: Int32
+        tile_shape_mn: cutlass.Constexpr[Tuple[int, int]]
+        mCuSeqlensQ: Optional[cute.Tensor] = None
+        mSeqUsedQ: Optional[cute.Tensor] = None
+        qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1
+        lpt: cutlass.Constexpr[bool] = False
+        is_split_kv: cutlass.Constexpr[bool] = False
+        num_splits_dynamic_ptr: Optional[cute.Tensor] = None
+        tile_count_semaphore: Optional[cute.Pointer] = None
+
+        @staticmethod
+        @cute.jit
+        def create(
+            args: TileSchedulerArguments, *, loc=None, ip=None
+        ) -> "DynamicPersistentVarlenScheduler.Params":
+            size_l2 = 50 * 1024 * 1024  # 50 MB for K & V
+            max_kvblock_in_l2 = size_l2 // (
+                (args.headdim + args.headdim_v) * args.element_size * args.tile_shape_mn[1]
+            )
+            assert args.mCuSeqlensQ is not None or args.mSeqUsedQ is not None, (
+                "At least one of mCuSeqlensQ or mSeqUsedQ must be provided"
+            )
+            return DynamicPersistentVarlenScheduler.Params(
+                num_head=args.num_head,
+                num_batch=args.num_batch,
+                total_q=args.total_q,
+                num_splits=args.num_splits,
+                max_kvblock_in_l2=max_kvblock_in_l2,
+                tile_shape_mn=args.tile_shape_mn,
+                mCuSeqlensQ=args.mCuSeqlensQ,
+                mSeqUsedQ=args.mSeqUsedQ,
+                qhead_per_kvhead_packgqa=args.qhead_per_kvhead_packgqa,
+                lpt=args.lpt,
+                is_split_kv=args.is_split_kv,
+                num_splits_dynamic_ptr=args.num_splits_dynamic_ptr,
+                tile_count_semaphore=args.tile_count_semaphore,
+            )
+
+    def __init__(
+        self,
+        params: Params,
+        tile_idx: Int32,
+        work_info: Optional[cute.Tensor] = None,
+        scheduler_pipeline: Optional[cutlass.pipeline.PipelineAsync] = None,
+        pipeline_state: Optional[cutlass.pipeline.PipelineState] = None,
+        is_scheduler_warp: Constexpr[Boolean] = False,
+        *,
+        loc=None,
+        ip=None
+    ):
+        self.params = params
+        self._tile_idx = tile_idx
+        self._work_info = work_info
+        self._scheduler_pipeline = scheduler_pipeline
+        self._pipeline_state = pipeline_state
+        self._is_scheduler_warp = is_scheduler_warp
+        self._loc = loc
+        self._ip = ip
+
+    @staticmethod
+    def to_underlying_arguments(args: TileSchedulerArguments, *, loc=None, ip=None) -> Params:
+        return DynamicPersistentVarlenScheduler.Params.create(args, loc=loc, ip=ip)
+
+    @staticmethod
+    def create(
+        params: Params,
+        work_info: Optional[cute.Tensor] = None,
+        scheduler_pipeline: Optional[cutlass.pipeline.PipelineAsync] = None,
+        is_scheduler_warp: Constexpr[Boolean] = False,
+        *,
+        loc=None,
+        ip=None,
+    ) -> "DynamicPersistentVarlenScheduler":
+        tile_idx, _, _ = cute.arch.block_idx()
+        if const_expr(is_scheduler_warp):
+            pipeline_state = cutlass.pipeline.make_pipeline_state(
+                cutlass.pipeline.PipelineUserType.Producer, 1,
+            )
+        else:
+            pipeline_state = cutlass.pipeline.make_pipeline_state(
+                cutlass.pipeline.PipelineUserType.Consumer, 1,
+            )
+
+        return DynamicPersistentVarlenScheduler(
+            params,
+            tile_idx,
+            work_info,
+            scheduler_pipeline,
+            pipeline_state,
+            is_scheduler_warp,
+            loc=loc,
+            ip=ip,
+        )
+
+    # called by host
+    @staticmethod
+    def get_grid_shape(
+        params: Params,
+        *,
+        loc=None,
+        ip=None,
+    ) -> Tuple[Int32, Int32, Int32]:
+        total_blocks_max = (
+            params.total_q + params.num_batch * (params.tile_shape_mn[0] - 1)
+        ) // params.tile_shape_mn[0]
+        total_blocks = total_blocks_max * params.num_head * params.num_splits
+        hardware_info = cutlass.utils.HardwareInfo()
+        sm_count = hardware_info.get_device_multiprocessor_count()
+        # cute.printf("total_blocks = {}, sm_count = {}", total_blocks, sm_count)
+        # for persistent kernel
+        return (cutlass.min(sm_count, total_blocks), Int32(1), Int32(1))
+
+    @cute.jit
+    def _get_num_m_blocks(self, lane: Int32, bidb_start: Int32) -> Int32:
+        params = self.params
+        batch_idx = lane + bidb_start
+        if cutlass.const_expr(params.mSeqUsedQ is not None):
+            seqlen = Int32(0)
+            if batch_idx < params.num_batch:
+                seqlen = params.mSeqUsedQ[batch_idx]
+        else:
+            assert params.mCuSeqlensQ is not None
+            cur_cu_seqlen = Int32(0)
+            if batch_idx <= params.num_batch:
+                cur_cu_seqlen = params.mCuSeqlensQ[batch_idx]
+            next_cu_seqlen = cute.arch.shuffle_sync_down(cur_cu_seqlen, offset=1)
+            seqlen = next_cu_seqlen - cur_cu_seqlen
+        if cutlass.const_expr(params.qhead_per_kvhead_packgqa > 1):
+            seqlen *= params.qhead_per_kvhead_packgqa
+        return (
+            cute.ceil_div(seqlen, params.tile_shape_mn[0])
+            if batch_idx < params.num_batch and lane < cute.arch.WARP_SIZE - 1
+            else Int32(0)
+        )
+
+    @cute.jit
+    def _get_num_splits(self, lane: Int32, bidb_start: Int32) -> Int32:
+        params = self.params
+        batch_idx = lane + bidb_start
+        is_valid = batch_idx < params.num_batch and lane < cute.arch.WARP_SIZE - 1
+        if cutlass.const_expr(not params.is_split_kv):
+            return 1
+        elif cutlass.const_expr(params.num_splits_dynamic_ptr is not None):
+            return 1 if not is_valid else params.num_splits_dynamic_ptr[batch_idx]
+        else:
+            return 1 if not is_valid else params.num_splits
+
+    @cute.jit
+    def get_current_work(
+        self,
+        next_tile_idx: Int32,
+        bidb_start: Int32,
+        group_start_tile: Int32,
+        *,
+        loc=None,
+        ip=None,
+    ) -> WorkTileInfo:
+        params = self.params
+        lane_idx = cute.arch.lane_idx()
+        num_m_blocks = self._get_num_m_blocks(lane_idx, bidb_start=bidb_start)
+        num_splits = self._get_num_splits(lane_idx, bidb_start=bidb_start)
+        num_splits_m_blocks = num_m_blocks * num_splits if const_expr(params.is_split_kv) else num_m_blocks
+        num_m_blocks_cumulative = utils.warp_prefix_sum(num_splits_m_blocks, lane_idx)
+        # Total number of blocks for the next 31 batches
+        m_blocks_in_group = cute.arch.shuffle_sync(num_m_blocks_cumulative, cute.arch.WARP_SIZE - 1)
+        # Same for all lanes
+        group_end_tile = m_blocks_in_group * params.num_head + group_start_tile
+        # if cute.arch.thread_idx()[0] == 128 + 31: cute.printf("DynamicPersistentVarlenScheduler: tile_idx=%d, group_end_tile = %d, num_m_blocks=%d, num_m_blocks_cumulative = %d, m_blocks_in_group = %d", self._tile_idx, group_end_tile, num_m_blocks, num_m_blocks_cumulative, m_blocks_in_group)
+        block, head_idx, batch_idx, split_idx = Int32(0), Int32(0), bidb_start, Int32(0)
+        while group_end_tile <= next_tile_idx:
+            batch_idx += cute.arch.WARP_SIZE - 1
+            if batch_idx >= params.num_batch:
+                batch_idx = Int32(params.num_batch)
+                group_end_tile = next_tile_idx + 1
+            else:
+                num_m_blocks = self._get_num_m_blocks(lane_idx, bidb_start=batch_idx)
+                num_splits = self._get_num_splits(lane_idx, bidb_start=batch_idx)
+                num_splits_m_blocks = num_m_blocks * num_splits if const_expr(params.is_split_kv) else num_m_blocks
+                num_m_blocks_cumulative = utils.warp_prefix_sum(num_splits_m_blocks, lane_idx)
+                m_blocks_in_group = cute.arch.shuffle_sync(
+                    num_m_blocks_cumulative, cute.arch.WARP_SIZE - 1
+                )
+                group_end_tile += m_blocks_in_group * params.num_head
+        is_valid = batch_idx < params.num_batch
+        if is_valid:
+            group_start_tile = group_end_tile - m_blocks_in_group * params.num_head
+            # if cute.arch.thread_idx()[0] == 128 + 31: cute.printf("DynamicPersistentVarlenScheduler: tile_idx=%d, group_end_tile = %d, num_m_blocks=%d, batch_idx = %d", self._tile_idx, group_end_tile, num_m_blocks, batch_idx)
+            # The next problem to process is the first one that does not have ending tile position
+            # that is greater than or equal to tile index.
+            batch_idx_in_group = cute.arch.popc(
+                cute.arch.vote_ballot_sync(
+                    group_start_tile + num_m_blocks_cumulative * params.num_head <= next_tile_idx
+                )
+            )
+            batch_idx += batch_idx_in_group
+            num_m_blocks_prev_lane = (
+                0
+                if batch_idx_in_group == 0
+                else cute.arch.shuffle_sync(num_m_blocks_cumulative, batch_idx_in_group - 1)
+            )
+            group_start_tile += num_m_blocks_prev_lane * params.num_head
+            num_m_blocks = cute.arch.shuffle_sync(num_m_blocks, batch_idx_in_group)
+            if const_expr(params.is_split_kv):
+                num_splits = cute.arch.shuffle_sync(num_splits, batch_idx_in_group)
+            mh_block = next_tile_idx - group_start_tile
+            if cutlass.const_expr(params.lpt):
+                if const_expr(not params.is_split_kv) or num_splits == 1:
+                    # This is a version of the SingleTileLPTScheduler, complicated by the fact that
+                    # the seqlen can vary per batch.
+                    # TODO: is there any case where num_m_blocks is 0?
+                    # TODO: by right we should read the seqlen_kv but we're assuming seqlen_q == seqlen_k here
+                    num_n_blocks = (
+                        num_m_blocks
+                        * params.tile_shape_mn[0]
+                        // params.qhead_per_kvhead_packgqa
+                        // params.tile_shape_mn[1]
+                    )
+                    # nheads_in_l2 = min(max(self.max_kvblock_in_l2 // num_n_blocks, 1), self.num_head)
+                    # Seems faster to have this be a power of 2
+                    nheads_in_l2 = (
+                        16
+                        if num_n_blocks * 16 <= params.max_kvblock_in_l2
+                        else (
+                            8
+                            if num_n_blocks * 8 <= params.max_kvblock_in_l2
+                            else (
+                                4
+                                if num_n_blocks * 4 <= params.max_kvblock_in_l2
+                                else (2 if num_n_blocks * 2 <= params.max_kvblock_in_l2 else 1)
+                            )
+                        )
+                    )
+                    nheads_in_l2 = min(nheads_in_l2, params.num_head)
+                    mh_in_l2 = nheads_in_l2 * num_m_blocks
+                    section_idx = mh_block // mh_in_l2
+                    l2_mod = mh_block - section_idx * mh_in_l2
+                    # Deal with tail section
+                    nheads_in_this_section = (
+                        nheads_in_l2
+                        if nheads_in_l2 * (section_idx + 1) <= params.num_head
+                        else params.num_head - section_idx * nheads_in_l2
+                    )
+                    block = l2_mod // nheads_in_this_section
+                    head_idx_residual = l2_mod - block * nheads_in_this_section
+                    head_idx = section_idx * nheads_in_l2 + head_idx_residual
+                else:
+                    head_split_idx = mh_block // num_m_blocks
+                    block = mh_block - head_split_idx * num_m_blocks
+                    if const_expr(params.is_split_kv):
+                        head_idx = head_split_idx // num_splits
+                        split_idx = head_split_idx - head_idx * num_splits
+                    else:
+                        head_idx = head_split_idx
+
+                block = num_m_blocks - 1 - block
+            else:
+                head_split_idx = mh_block // num_m_blocks
+                block = mh_block - head_split_idx * num_m_blocks
+                if const_expr(params.is_split_kv):
+                    head_idx = head_split_idx // num_splits
+                    split_idx = head_split_idx - head_idx * num_splits
+                else:
+                    head_idx = head_split_idx
+        self._tile_idx = group_start_tile
+        return WorkTileInfo((Int32(block), Int32(head_idx), Int32(batch_idx), Int32(split_idx)), is_valid)
+
+    @cute.jit
+    def initial_work_tile_info(self, *, loc=None, ip=None):
+        return self.get_current_work(self._tile_idx, 0, 0, loc=loc, ip=ip)
+
+    @cute.jit
+    def prefetch_next_work(
+        self,
+        *,
+        loc=None,
+        ip=None
+    ):
+        params = self.params
+        tile_idx = self._tile_idx
+        if const_expr(self._is_scheduler_warp) and cute.arch.lane_idx() == 0:
+            tile_idx = cute.arch.grid_dim()[0] + utils.atomic_add_i32(
+                1, params.tile_count_semaphore,
+            )
+        self._tile_idx = tile_idx
+
+    @cute.jit
+    def advance_to_next_work(
+        self,
+        batch_idx: Int32 = 0,
+        *,
+        loc=None,
+        ip=None
+    ) -> WorkTileInfo:
+        params = self.params
+        if const_expr(self._is_scheduler_warp):
+            next_tile_idx = cute.arch.shuffle_sync(self._tile_idx, 0)
+            group_start_tile = cute.arch.shuffle_sync(self._tile_idx, 1)
+            # if cute.arch.block_idx()[0] == 0 and cute.arch.lane_idx() == 0:
+            #     cute.printf("group_start_tile = {}, next_tile_idx = {}", group_start_tile, next_tile_idx)
+            work_info = self.get_current_work(next_tile_idx, batch_idx, group_start_tile)
+            self._scheduler_pipeline.producer_acquire(self._pipeline_state)
+            with cute.arch.elect_one():
+                block, head_idx, batch_idx, split_idx = work_info.tile_idx
+                self._work_info[0] = block
+                self._work_info[1] = head_idx
+                self._work_info[2] = batch_idx
+                self._work_info[3] = split_idx
+                self._scheduler_pipeline.producer_commit(self._pipeline_state)
+        else:
+            self._scheduler_pipeline.consumer_wait(self._pipeline_state)
+            block = self._work_info[0]
+            head_idx = self._work_info[1]
+            batch_idx = self._work_info[2]
+            split_idx = self._work_info[3]
+            is_valid = batch_idx < params.num_batch
+            work_info = WorkTileInfo((block, head_idx, batch_idx, split_idx), is_valid)
+            cute.arch.sync_warp()
+            with cute.arch.elect_one():
+                self._scheduler_pipeline.consumer_release(self._pipeline_state)
+        self._pipeline_state.advance()
+        return work_info
+
+    def __extract_mlir_values__(self):
+        values, self._values_pos = [], []
+        for obj in [self.params, self._tile_idx, self._work_info, self._scheduler_pipeline, self._pipeline_state, self._is_scheduler_warp]:
+            obj_values = cutlass.extract_mlir_values(obj)
+            values += obj_values
+            self._values_pos.append(len(obj_values))
+        return values
+
+    def __new_from_mlir_values__(self, values):
+        obj_list = []
+        for obj, n_items in zip(
+            [self.params, self._tile_idx, self._work_info, self._scheduler_pipeline, self._pipeline_state, self._is_scheduler_warp],
+            self._values_pos,
+        ):
+            obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
+            values = values[n_items:]
+        return DynamicPersistentVarlenScheduler(*(tuple(obj_list)), loc=self._loc)
