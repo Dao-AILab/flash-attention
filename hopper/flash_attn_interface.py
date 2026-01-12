@@ -101,7 +101,7 @@ def _flash_attn_forward(
     ]
     rotary_cos, rotary_sin = [maybe_contiguous(x) for x in (rotary_cos, rotary_sin)]
     seqlens_rotary = maybe_contiguous(seqlens_rotary)
-    out, softmax_lse, *rest = flash_attn_3_gpu.fwd(
+    out, softmax_lse, out_accum, softmax_lse_accum = flash_attn_3_gpu.fwd(
         q,
         k,
         v,
@@ -279,7 +279,7 @@ def _flash_attn_backward(
 ) -> torch.Tensor:
     # dq, dk, dv are allocated by us so they should already be contiguous
     dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
-    dq, dk, dv, softmax_d, *rest = flash_attn_3_gpu.bwd(
+    softmax_d, *rest = flash_attn_3_gpu.bwd(
         dout,
         q,
         k,
