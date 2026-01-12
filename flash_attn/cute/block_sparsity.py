@@ -53,7 +53,7 @@ def _expand_sparsity_tensor(
             f"{tensor_name}{context_clause} with shape {tensor.shape} cannot be expanded to expected shape {expected_shape}."
             f"{hint_clause}"
         )
-    return tensor.expand(*expected_shape).contiguous()
+    return tensor.expand(*expected_shape)
 
 
 def _check_and_expand_block(

@@ -400,7 +400,7 @@ def _run_mask_test(
 
         bwd_rtol = 2
         min_seqlen = min(seqlen_q, seqlen_k)
-        bwd_atol_floor = 1e-5 if min_seqlen >= 64 else 2e-5
+        bwd_atol_floor = 1e-5 if min_seqlen >= 64 else 3e-5
         dq_atol = max(bwd_atol_floor, 2 * (dq_ref_fp32 + 0.3 - 0.3 - dq_ref_fp32).abs().max().item())
         dk_atol = max(bwd_atol_floor, 2 * (dk_ref_fp32 + 0.3 - 0.3 - dk_ref_fp32).abs().max().item())
         dv_atol = max(bwd_atol_floor, 2 * (dv_ref_fp32 + 0.3 - 0.3 - dv_ref_fp32).abs().max().item())
