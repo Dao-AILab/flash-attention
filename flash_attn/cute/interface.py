@@ -529,9 +529,11 @@ def _flash_attn_fwd(
             seqused_q,
         )
 
-    # Need to return empty lse tensor for torch.compile compatibility
+    # If we didn't calculate LSE, still return a properly shaped tensor for torch.compile compatibility
+    # This ensures shape metadata is preserved even when LSE isn't actually computed
+    # Use zeros instead of empty to ensure deterministic behavior for testing
     if lse is None:
-        lse = torch.tensor([], device=out.device)
+        lse = torch.zeros(lse_shape, dtype=torch.float32, device=device)
 
     return out, lse
 
@@ -1270,7 +1272,7 @@ def flash_attn_fwd(
     # learnable_sink: Optional[torch.Tensor] = None, # Not yet supported for bwd
     num_splits: int = 1,
     pack_gqa: Optional[bool] = None,
-    # return_lse: bool = False,  # Always return LSE, for torch.compile compatibility
+    return_lse: bool = False,
     deterministic: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Returns (out, lse)"""
@@ -1286,7 +1288,7 @@ def flash_attn_fwd(
         # learnable_sink=learnable_sink,
         num_splits=num_splits,
         pack_gqa=pack_gqa,
-        return_lse=True,
+        return_lse=return_lse,
         deterministic=deterministic,
     )
 
@@ -1304,12 +1306,11 @@ def flash_attn_fwd_fake(
     # learnable_sink: Optional[torch.Tensor] = None,
     num_splits: int = 1,
     pack_gqa: Optional[bool] = None,
-    # return_lse: bool = False,
+    return_lse: bool = False,
     deterministic: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     batch_size, seqlen_q, nheads, hdim = q.shape
     hdim_v = v.shape[-1]
-    requires_grad = q.requires_grad or k.requires_grad or v.requires_grad
     out = q.new_empty(batch_size, seqlen_q, nheads, hdim_v)
     lse = q.new_empty(batch_size, nheads, seqlen_q, dtype=torch.float32)
     return out, lse
@@ -1403,6 +1404,9 @@ class FlashAttnFunc(torch.autograd.Function):
         #         mask_block_cnt=mask_block_cnt,
         #         mask_block_idx=mask_block_idx,
         #     )
+
+        # Always compute LSE when gradients are needed, even if not requested; this is required for the backward pass
+        requires_grad = q.requires_grad or k.requires_grad or v.requires_grad
         out, lse = torch.ops.flash_attn_cute.flash_attn_fwd(
             q,
             k,
@@ -1415,7 +1419,7 @@ class FlashAttnFunc(torch.autograd.Function):
             # learnable_sink=learnable_sink,
             num_splits=num_splits,
             pack_gqa=pack_gqa,
-            # return_lse=True,  # need to always compute LSE for torch.compile compatibility
+            return_lse=return_lse or requires_grad,
             deterministic=deterministic,
         )
         ctx.save_for_backward(q, k, v, out, lse)
@@ -1468,6 +1472,7 @@ def flash_attn_varlen_fwd(
     window_size_right: Optional[int] = None,
     num_splits: int = 1,
     pack_gqa: Optional[bool] = None,
+    return_lse: bool = False,
     deterministic: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Returns (out, lse)"""
@@ -1489,7 +1494,7 @@ def flash_attn_varlen_fwd(
         window_size_right=window_size_right,
         num_splits=num_splits,
         pack_gqa=pack_gqa,
-        return_lse=True,
+        return_lse=return_lse,
         deterministic=deterministic,
     )
 
@@ -1513,6 +1518,7 @@ def flash_attn_varlen_fwd_fake(
     window_size_right: Optional[int] = None,
     num_splits: int = 1,
     pack_gqa: Optional[bool] = None,
+    return_lse: bool = False,
     deterministic: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     total_q, num_head, _ = q.shape
@@ -1624,6 +1630,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         return_lse: bool = False,
         deterministic: bool = False,
     ):
+        requires_grad = q.requires_grad or k.requires_grad or v.requires_grad
         out, lse = torch.ops.flash_attn_cute.flash_attn_varlen_fwd(
             q,
             k,
@@ -1642,6 +1649,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             window_size_right=window_size[1],
             num_splits=num_splits,
             pack_gqa=pack_gqa,
+            return_lse=return_lse or requires_grad,
             deterministic=deterministic,
         )
         ctx.save_for_backward(q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)

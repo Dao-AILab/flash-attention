@@ -74,7 +74,9 @@ def test_opcheck():
     opcheck(torch.ops.flash_attn_cute.flash_attn_fwd, sample_args_fwd)
 
     # Prepare inputs for flash_attn_bwd (simulate a forward pass to produce 'out' and 'lse')
-    out, lse = torch.ops.flash_attn_cute.flash_attn_fwd(*sample_args_fwd)
+    out, lse = torch.ops.flash_attn_cute.flash_attn_fwd(
+        *sample_args_fwd, return_lse=True
+    )
     dout = torch.randn_like(out)
 
     sample_args_bwd = (q, k, v, out, dout, lse)
@@ -286,7 +288,9 @@ def test_opcheck_varlen():
     opcheck(torch.ops.flash_attn_cute.flash_attn_varlen_fwd, sample_args_fwd)
 
     # Prepare inputs for flash_attn_varlen_bwd (simulate a forward pass to produce 'out' and 'lse')
-    out, lse = torch.ops.flash_attn_cute.flash_attn_varlen_fwd(*sample_args_fwd)
+    out, lse = torch.ops.flash_attn_cute.flash_attn_varlen_fwd(
+        *sample_args_fwd, return_lse=True
+    )
     dout = torch.randn_like(out)
     sample_args_bwd = (q, k, v, out, dout, lse, cu_seqlens, cu_seqlens, None, None)
     opcheck(torch.ops.flash_attn_cute.flash_attn_varlen_bwd, sample_args_bwd)
