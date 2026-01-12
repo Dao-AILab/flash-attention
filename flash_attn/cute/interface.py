@@ -1390,22 +1390,7 @@ class FlashAttnFunc(torch.autograd.Function):
         pack_gqa: Optional[bool] = None,
         return_lse: bool = False,
         deterministic: bool = False,
-        # mask_mod: Optional[Callable] = None,
-        # full_block_cnt: Optional[torch.Tensor] = None,
-        # full_block_idx: Optional[torch.Tensor] = None,
-        # mask_block_cnt: Optional[torch.Tensor] = None,
-        # mask_block_idx: Optional[torch.Tensor] = None,
     ):
-        # Only create block sparse tensors if at least one block sparse parameter is provided
-        # block_sparse_tensors = None
-        # if any(t is not None for t in [full_block_cnt, full_block_idx, mask_block_cnt, mask_block_idx]):
-        #     block_sparse_tensors = BlockSparseTensorsTorch(
-        #         full_block_cnt=full_block_cnt,
-        #         full_block_idx=full_block_idx,
-        #         mask_block_cnt=mask_block_cnt,
-        #         mask_block_idx=mask_block_idx,
-        #     )
-
         # Always compute LSE when gradients are needed, even if not requested; this is required for the backward pass
         requires_grad = q.requires_grad or k.requires_grad or v.requires_grad
         out, lse = torch.ops.flash_attn_cute.flash_attn_fwd(
