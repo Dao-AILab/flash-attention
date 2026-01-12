@@ -1495,6 +1495,8 @@ def flash_attn_varlen_fwd(
     cu_seqlens_k: Optional[torch.Tensor],
     seqused_q: Optional[torch.Tensor] = None,
     seqused_k: Optional[torch.Tensor] = None,
+    max_seqlen_q: Optional[int] = None,
+    max_seqlen_k: Optional[int] = None,
     page_table: Optional[torch.Tensor] = None,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
@@ -1514,6 +1516,8 @@ def flash_attn_varlen_fwd(
         cu_seqlens_k=cu_seqlens_k,
         seqused_q=seqused_q,
         seqused_k=seqused_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
         page_table=page_table,
         softmax_scale=softmax_scale,
         causal=causal,
@@ -1536,6 +1540,8 @@ def flash_attn_varlen_fwd_fake(
     cu_seqlens_k: Optional[torch.Tensor],
     seqused_q: Optional[torch.Tensor] = None,
     seqused_k: Optional[torch.Tensor] = None,
+    max_seqlen_q: Optional[int] = None,
+    max_seqlen_k: Optional[int] = None,
     page_table: Optional[torch.Tensor] = None,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
@@ -1565,6 +1571,8 @@ def flash_attn_varlen_bwd(
     cu_seqlens_k: Optional[torch.Tensor],
     seqused_q: Optional[torch.Tensor] = None,
     seqused_k: Optional[torch.Tensor] = None,
+    max_seqlen_q: Optional[int] = None,
+    max_seqlen_k: Optional[int] = None,
     # page_table: Optional[torch.Tensor] = None,  # Not supported yet
     softmax_scale: Optional[float] = None,
     causal: bool = False,
@@ -1586,6 +1594,8 @@ def flash_attn_varlen_bwd(
         cu_seqlens_k=cu_seqlens_k,
         seqused_q=seqused_q,
         seqused_k=seqused_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
         # page_table=page_table,
         softmax_scale=softmax_scale,
         causal=causal,
@@ -1609,6 +1619,8 @@ def flash_attn_varlen_bwd_fake(
     cu_seqlens_k: Optional[torch.Tensor],
     seqused_q: Optional[torch.Tensor] = None,
     seqused_k: Optional[torch.Tensor] = None,
+    max_seqlen_q: Optional[int] = None,
+    max_seqlen_k: Optional[int] = None,
     # page_table: Optional[torch.Tensor] = None,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
@@ -1629,13 +1641,17 @@ def setup_context_varlen(ctx, inputs, output):
     q, k, v, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = inputs[:7]
     out, lse = output
     ctx.save_for_backward(q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
-    ctx.softmax_scale = inputs[8]
-    ctx.causal = inputs[9]
-    ctx.softcap = inputs[10]
-    ctx.window_size_left = inputs[11]
-    ctx.window_size_right = inputs[12]
-    ctx.pack_gqa = inputs[14]
-    ctx.deterministic = inputs[15]
+    ctx.max_seqlen_q = inputs[7]
+    ctx.max_seqlen_k = inputs[8]
+    # page_table
+    ctx.softmax_scale = inputs[10]
+    ctx.causal = inputs[11]
+    ctx.softcap = inputs[12]
+    ctx.window_size_left = inputs[13]
+    ctx.window_size_right = inputs[14]
+    # num_splits
+    ctx.pack_gqa = inputs[16]
+    ctx.deterministic = inputs[17]
 
 
 def _backward_varlen(ctx, dout, dlse):
@@ -1651,6 +1667,8 @@ def _backward_varlen(ctx, dout, dlse):
         cu_seqlens_k,
         seqused_q,
         seqused_k,
+        max_seqlen_q=ctx.max_seqlen_q,
+        max_seqlen_k=ctx.max_seqlen_k,
         # page_table,
         softmax_scale=ctx.softmax_scale,
         causal=ctx.causal,
@@ -1660,7 +1678,7 @@ def _backward_varlen(ctx, dout, dlse):
         pack_gqa=ctx.pack_gqa,
         deterministic=ctx.deterministic,
     )
-    return dq, dk, dv, *((None,) * 13)
+    return dq, dk, dv, *((None,) * 15)
 
 
 flash_attn_varlen_bwd.register_autograd(_backward_varlen, setup_context=setup_context_varlen)
@@ -1747,7 +1765,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             deterministic=ctx.deterministic,
         )
 
-        return dq, dk, dv, *((None,) * 13)
+        return dq, dk, dv, *((None,) * 15)
 
 
 def flash_attn_func(
