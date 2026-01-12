@@ -16,6 +16,15 @@ from cutlass import Float32, Int32, const_expr
 from flash_attn.cute import utils
 from flash_attn.cute.seqlen_info import SeqlenInfo
 from cutlass.cute import FastDivmodDivisor
+import flash_attn.cute.pipeline as pipeline
+
+from flash_attn.cute.tile_scheduler import (
+    TileSchedulerArguments,
+    SingleTileScheduler,
+    SingleTileVarlenScheduler,
+    DynamicPersistentVarlenScheduler,
+    ParamsBase,
+)
 
 
 class FlashAttentionForwardCombine:
@@ -24,6 +33,7 @@ class FlashAttentionForwardCombine:
         dtype: Type[cutlass.Numeric],
         dtype_partial: Type[cutlass.Numeric],
         head_dim: int,
+        num_head: int,
         m_block_size: int = 8,
         k_block_size: int = 64,
         log_max_splits: int = 4,
@@ -46,10 +56,12 @@ class FlashAttentionForwardCombine:
         self.dtype = dtype
         self.dtype_partial = dtype_partial
         self.head_dim = head_dim
+        self.num_head = num_head
         self.m_block_size = m_block_size
         self.k_block_size = k_block_size
         self.max_splits = 1 << log_max_splits
         self.num_threads = num_threads
+        self.num_warps = num_threads//cute.arch.WARP_SIZE
         self.is_even_k = head_dim % k_block_size == 0
         self.stages = stages
 
@@ -203,6 +215,7 @@ class FlashAttentionForwardCombine:
         num_splits_dynamic_ptr: Optional[cute.Tensor] = None,
         semaphore_to_reset: Optional[cute.Tensor] = None,
         seqlen_q: Optional[int] = None,
+        combine_semaphore: Optional[cute.Tensor] = None,
         stream: cuda.CUstream = None,
     ):
         # Type checking
@@ -282,6 +295,8 @@ class FlashAttentionForwardCombine:
             sO: cute.struct.Align[
                 cute.struct.MemRange[self.dtype_partial, cute.cosize(self.smem_layout_o)], 128
             ]
+            sched_pipeline_array_ptr: cute.struct.MemRange[cutlass.Int64, 2]
+            tile_idx: cute.struct.MemRange[Int32, 1]
 
         smem_size = SharedStorage.size_in_bytes()
 
@@ -302,11 +317,41 @@ class FlashAttentionForwardCombine:
         seqlen_divmod = FastDivmodDivisor(seqlen)
         head_divmod = FastDivmodDivisor(num_head)
 
-        grid_dim = (
+        if const_expr(cu_seqlens is not None or seqused is not None):
+            if const_expr(combine_semaphore is not None):
+                self.dynamic_persistent = True
+                TileScheduler = DynamicPersistentVarlenScheduler
+            else:
+                self.dynamic_persistent = False
+                TileScheduler = SingleTileVarlenScheduler
+        else:
+            self.dynamic_persistent = False
+            TileScheduler = SingleTileScheduler
+        semaphore_ptr = combine_semaphore.iterator if combine_semaphore is not None else None
+        tile_sched_args = TileSchedulerArguments(
             cute.ceil_div(seqlen * num_head, self.m_block_size),
             cute.ceil_div(self.head_dim, self.k_block_size),
             batch_size,
+            1, 1, 1, 1,
+            total_q=mO_partial.shape[0] * num_head,
+            tile_shape_mn=(self.m_block_size, self.m_block_size),
+            mCuSeqlensQ=cu_seqlens,
+            mSeqUsedQ=seqused,
+            qhead_per_kvhead_packgqa=self.num_head,
+            tile_count_semaphore=semaphore_ptr,
+            persistent_cta_multiplier=8,
         )
+        tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
+        self.tile_scheduler_cls = TileScheduler
+        grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
+
+        # old_grid_dim = (
+        #     cute.ceil_div(seqlen * num_head, self.m_block_size),
+        #     cute.ceil_div(self.head_dim, self.k_block_size),
+        #     batch_size,
+        # )
+        # cute.printf("combine grid dim = {}", grid_dim)
+        # cute.printf("old grid dim = {}", old_grid_dim)
 
         self.kernel(
             mO_partial,
@@ -327,6 +372,7 @@ class FlashAttentionForwardCombine:
             seqlen_divmod,
             head_divmod,
             varlen,
+            tile_sched_params,
         ).launch(
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
@@ -355,10 +401,12 @@ class FlashAttentionForwardCombine:
         seqlen_divmod: FastDivmodDivisor,
         head_divmod: FastDivmodDivisor,
         varlen: cutlass.Constexpr[bool],
+        tile_sched_params: ParamsBase,
     ):
         # Thread and block indices
         tidx, _, _ = cute.arch.thread_idx()
-        m_block, k_block, batch_idx = cute.arch.block_idx()
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        # m_block, k_block, batch_idx = cute.arch.block_idx()
 
         # ///////////////////////////////////////////////////////////////////////////////
         # Get shared memory buffer
@@ -369,311 +417,359 @@ class FlashAttentionForwardCombine:
         sMaxValidSplit = storage.sMaxValidSplit.get_tensor((self.m_block_size,))
         sO = storage.sO.get_tensor(smem_layout_o)
 
-        # Handle semaphore reset
-        if const_expr(semaphore_to_reset is not None):
-            if (
-                tidx == 0
-                and m_block == cute.arch.grid_dim()[0] - 1
-                and k_block == cute.arch.grid_dim()[1] - 1
-                and batch_idx == cute.arch.grid_dim()[2] - 1
-            ):
-                semaphore_to_reset[0] = 0
-
-        # Get number of splits
-        num_splits = (
-            num_splits_dynamic_ptr[batch_idx]
-            if const_expr(num_splits_dynamic_ptr is not None)
-            else mLSE_partial.shape[1]
-        )
-        # Handle variable length sequences using SeqlenInfo
-        seqlen_info = SeqlenInfo.create(
-            batch_idx=batch_idx,
-            seqlen_static=mO_partial.shape[0],
-            cu_seqlens=cu_seqlens,
-            seqused=seqused,
-        )
-        seqlen, offset = seqlen_info.seqlen, seqlen_info.offset
-
-        # Extract number of heads (head index will be determined dynamically)
-        num_head = mO_partial.shape[3]
-        max_idx = seqlen * num_head
-
-        # TODO: Early exit for single split if dynamic
-        # if (const_expr(num_splits_dynamic_ptr is None) or num_splits > 1) and (
-        #     const_expr(not varlen) or m_block * self.m_block_size < max_idx
-        # ):
-        if (const_expr(not varlen) or m_block * self.m_block_size < max_idx):
-            # ===============================
-            # Step 1: Load LSE_partial from gmem to shared memory
-            # ===============================
-
-            if const_expr(cu_seqlens is None):
-                # mLSE_partial_cur = mLSE_partial[None, None, None, batch_idx]
-                mLSE_partial_cur = utils.coord_offset_i64(mLSE_partial, batch_idx, dim=3)
-            else:
-                # mLSE_partial_cur = cute.domain_offset((offset, 0, 0), mLSE_partial)
-                mLSE_partial_cur = utils.domain_offset_i64((offset, 0, 0), mLSE_partial)
-            mLSE_partial_copy = cute.tiled_divide(mLSE_partial_cur, (1,))
-
-            gmem_thr_copy_LSE = gmem_tiled_copy_LSE.get_slice(tidx)
-            tLSEsLSE = gmem_thr_copy_LSE.partition_D(sLSE)
-
-            # Create identity tensor for coordinate tracking
-            cLSE = cute.make_identity_tensor((self.max_splits, self.m_block_size))
-            tLSEcLSE = gmem_thr_copy_LSE.partition_S(cLSE)
-
-            # Load LSE partial values
-            for m in cutlass.range(cute.size(tLSEcLSE, mode=[2]), unroll_full=True):
-                mi = tLSEcLSE[0, 0, m][1]  # Get m coordinate
-                idx = m_block * self.m_block_size + mi
-                if idx < max_idx:
-                    # Calculate actual sequence position and head using FastDivmodDivisor
-                    if const_expr(not varlen):
-                        head_idx, m_idx = divmod(idx, seqlen_divmod)
-                    else:
-                        head_idx = idx // seqlen
-                        m_idx = idx - head_idx * seqlen
-                    mLSE_partial_cur_copy = mLSE_partial_copy[None, m_idx, None, head_idx]
-                    for s in cutlass.range(cute.size(tLSEcLSE, mode=[1]), unroll_full=True):
-                        si = tLSEcLSE[0, s, 0][0]  # Get split coordinate
-                        if si < num_splits:
-                            cute.copy(
-                                gmem_thr_copy_LSE,
-                                mLSE_partial_cur_copy[None, si],
-                                tLSEsLSE[None, s, m],
-                            )
-                        else:
-                            tLSEsLSE[None, s, m].fill(-Float32.inf)
-                # Don't need to zero out the rest of the LSEs, as we will not write the output to gmem
-            cute.arch.cp_async_commit_group()
-
-            # ===============================
-            # Step 2: Load O_partial for pipeline stages
-            # ===============================
-
-            gmem_thr_copy_O_partial = gmem_tiled_copy_O_partial.get_slice(tidx)
-            cO = cute.make_identity_tensor((self.m_block_size, self.k_block_size))
-            tOcO = gmem_thr_copy_O_partial.partition_D(cO)
-            tOsO_partial = gmem_thr_copy_O_partial.partition_D(sO)
-            if const_expr(cu_seqlens is None):
-                # mO_partial_cur = mO_partial[None, None, None, None, batch_idx]
-                mO_partial_cur = utils.coord_offset_i64(mO_partial, batch_idx, dim=4)
-            else:
-                # mO_partial_cur = cute.domain_offset((offset, 0, 0, 0), mO_partial)
-                mO_partial_cur = utils.domain_offset_i64((offset, 0, 0, 0), mO_partial)
-
-            # Precompute these values to avoid recomputing them in the loop
-            num_rows = const_expr(cute.size(tOcO, mode=[1]))
-            tOmidx = cute.make_fragment(num_rows, cutlass.Int32)
-            tOhidx = cute.make_fragment(num_rows, cutlass.Int32)
-            tOrOptr = cute.make_fragment(num_rows, cutlass.Int64)
-            for m in cutlass.range(num_rows, unroll_full=True):
-                mi = tOcO[0, m, 0][0]  # m coordinate
-                idx = m_block * self.m_block_size + mi
-                if const_expr(not varlen):
-                    tOhidx[m], tOmidx[m] = divmod(idx, seqlen_divmod)
-                else:
-                    tOhidx[m] = idx // seqlen
-                    tOmidx[m] = idx - tOhidx[m] * seqlen
-                tOrOptr[m] = utils.elem_pointer_i64(
-                    mO_partial_cur, (tOmidx[m], k_block * self.k_block_size, 0, tOhidx[m])
-                ).toint()
-                if idx >= max_idx:
-                    tOhidx[m] = -1
-
-            tOpO = cute.make_fragment(cute.size(tOcO, [2]), cutlass.Boolean)
-            if const_expr(not self.is_even_k):
-                for k in cutlass.range(cute.size(tOpO), unroll_full=True):
-                    tOpO[k] = tOcO[0, 0, k][1] < mO_partial.shape[1] - k_block * self.k_block_size
-            # if cute.arch.thread_idx()[0] == 0 and k_block == 1: cute.print_tensor(tOpO)
-
-            load_O_partial = partial(
-                self.load_O_partial,
-                gmem_tiled_copy_O_partial,
-                tOrOptr,
-                tOsO_partial,
-                tOhidx,
-                tOpO,
-                tOcO,
-                mO_partial_cur.layout,
+        if const_expr(self.dynamic_persistent):
+            tile_idx = storage.tile_idx.get_tensor((1, ))
+            sched_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
+            sched_pipeline_consumer_group = pipeline.CooperativeGroup(
+                pipeline.Agent.Thread, self.num_warps
             )
+            sched_pipeline = pipeline.PipelineAsync.create(
+                barrier_storage=storage.sched_pipeline_array_ptr.data_ptr(),
+                num_stages=1,
+                producer_group=sched_pipeline_producer_group,
+                consumer_group=sched_pipeline_consumer_group,
+            )
+        else:
+            tile_idx = None
+            sched_pipeline = None
+        producer_scheduler_state = cutlass.pipeline.make_pipeline_state(
+            cutlass.pipeline.PipelineUserType.Producer, 1
+        )
+        consumer_scheduler_state = cutlass.pipeline.make_pipeline_state(
+            cutlass.pipeline.PipelineUserType.Consumer, 1
+        )
+        TileSchedulerCls = partial(self.tile_scheduler_cls.create, tile_sched_params, tile_idx, sched_pipeline)
+        # tile_scheduler = TileSchedulerCls(init_pipeline_state=False)
+        tile_scheduler = TileSchedulerCls()
 
-            # Load first few stages of O_partial
-            for stage in cutlass.range(self.stages - 1, unroll_full=True):
-                if stage < num_splits:
-                    load_O_partial(stage, stage)
-                cute.arch.cp_async_commit_group()
+        work_tile = tile_scheduler.initial_work_tile_info()
+        while work_tile.is_valid_tile:
+            m_block, k_block, batch_idx, _ = work_tile.tile_idx
 
-            # ===============================
-            # Step 3: Load and transpose LSE from smem to registers
-            # ===============================
+            # Handle semaphore reset
+            if const_expr(semaphore_to_reset is not None):
+                if (
+                    tidx == 0
+                    and m_block == 0
+                    and k_block == 0
+                    and batch_idx == 0
+                ):
+                    semaphore_to_reset[0] = 0
 
-            # Wait for LSE and initial O partial stages to complete
-            cute.arch.cp_async_wait_group(self.stages - 1)
-            cute.arch.sync_threads()
-            # if cute.arch.thread_idx()[0] == 0:
-            #     # cute.print_tensor(sLSE)
-            #     for i in range(64):
-            #         cute.printf("sLSE[%d, 0] = %f", i, sLSE[i, 0])
-            # cute.arch.sync_threads()
+            # Get number of splits
+            num_splits = (
+                num_splits_dynamic_ptr[batch_idx]
+                if const_expr(num_splits_dynamic_ptr is not None)
+                else mLSE_partial.shape[1]
+            )
+            # Handle variable length sequences using SeqlenInfo
+            seqlen_info = SeqlenInfo.create(
+                batch_idx=batch_idx,
+                seqlen_static=mO_partial.shape[0],
+                cu_seqlens=cu_seqlens,
+                seqused=seqused,
+            )
+            seqlen, offset = seqlen_info.seqlen, seqlen_info.offset
 
-            s2r_thr_copy_LSE = s2r_tiled_copy_LSE.get_slice(tidx)
-            ts2rsLSE = s2r_thr_copy_LSE.partition_S(sLSE)
-            ts2rrLSE = cute.make_fragment_like(ts2rsLSE)
-            cute.copy(s2r_tiled_copy_LSE, ts2rsLSE, ts2rrLSE)
+            # Extract number of heads (head index will be determined dynamically)
+            num_head = mO_partial.shape[3]
+            max_idx = seqlen * num_head
 
-            # ===============================
-            # Step 4: Compute final LSE along split dimension
-            # ===============================
+            # TODO: Early exit for single split if dynamic
+            if (const_expr(num_splits_dynamic_ptr is None) or num_splits > 0) and (
+                const_expr(not varlen) or m_block * self.m_block_size < max_idx
+            ):
+            # if (const_expr(not varlen) or m_block * self.m_block_size < max_idx):
+                # ===============================
+                # Step 1: Load LSE_partial from gmem to shared memory
+                # ===============================
 
-            lse_sum = cute.make_fragment(cute.size(ts2rrLSE, mode=[2]), Float32)
-            ts2rcLSE = s2r_thr_copy_LSE.partition_D(cLSE)
-            # We compute the max valid split for each row to short-circuit the computation later
-            max_valid_split = cute.make_fragment(cute.size(ts2rrLSE, mode=[2]), Int32)
-            assert cute.size(ts2rrLSE, mode=[0]) == 1
-            # Compute max, scales, and final LSE for each row
-            for m in cutlass.range(cute.size(ts2rrLSE, mode=[2]), unroll_full=True):
-                # Find max LSE value across splits
-                threads_per_col = const_expr(self.smem_threads_per_col_lse)
-                lse_max = utils.warp_reduce(
-                    ts2rrLSE[None, None, m]
-                    .load()
-                    .reduce(cute.ReductionOp.MAX, init_val=-Float32.inf, reduction_profile=0),
-                    op=cute.arch.fmax,
-                    width=threads_per_col,
-                )
-                # if cute.arch.thread_idx()[0] == 0: cute.printf(lse_max)
-                # Find max valid split index
-                max_valid_idx = -1
-                for s in cutlass.range(cute.size(ts2rrLSE, mode=[1]), unroll_full=True):
-                    if ts2rrLSE[0, s, m] != -Float32.inf:
-                        max_valid_idx = ts2rcLSE[0, s, 0][0]  # Get split coordinate
-                # if cute.arch.thread_idx()[0] < 32: cute.printf(max_valid_idx)
-                max_valid_split[m] = utils.warp_reduce(max_valid_idx, max, width=threads_per_col)
-                # Compute exp scales and sum
-                lse_max_cur = (
-                    0.0 if lse_max == -Float32.inf else lse_max
-                )  # In case all local LSEs are -inf
-                LOG2_E = math.log2(math.e)
-                lse_sum_cur = 0.0
-                for s in cutlass.range(cute.size(ts2rrLSE, mode=[1]), unroll_full=True):
-                    scale = utils.exp2f(ts2rrLSE[0, s, m] * LOG2_E - (lse_max_cur * LOG2_E))
-                    lse_sum_cur += scale
-                    ts2rrLSE[0, s, m] = scale  # Store scale for later use
-                lse_sum_cur = utils.warp_reduce(lse_sum_cur, operator.add, width=threads_per_col)
-                lse_sum[m] = utils.logf(lse_sum_cur) + lse_max
-                # Normalize scales
-                inv_sum = (
-                    0.0 if (lse_sum_cur == 0.0 or lse_sum_cur != lse_sum_cur) else 1.0 / lse_sum_cur
-                )
-                ts2rrLSE[None, None, m].store(ts2rrLSE[None, None, m].load() * inv_sum)
-            # Store the scales exp(lse - lse_logsum) back to smem
-            cute.copy(s2r_tiled_copy_LSE, ts2rrLSE, ts2rsLSE)
-
-            # Store max valid split to smem
-            for m in cutlass.range(cute.size(ts2rrLSE, mode=[2]), unroll_full=True):
-                if ts2rcLSE[0, 0, m][0] == 0:  # Only thread responsible for s=0 writes
-                    mi = ts2rcLSE[0, 0, m][1]
-                    if mi < self.m_block_size:
-                        sMaxValidSplit[mi] = max_valid_split[m]
-
-            # ===============================
-            # Step 5: Store final LSE to gmem
-            # ===============================
-
-            if const_expr(mLSE is not None):
                 if const_expr(cu_seqlens is None):
-                    # mLSE_cur = mLSE[None, None, batch_idx]
-                    mLSE_cur = utils.coord_offset_i64(mLSE, batch_idx, dim=2)
+                    # mLSE_partial_cur = mLSE_partial[None, None, None, batch_idx]
+                    mLSE_partial_cur = utils.coord_offset_i64(mLSE_partial, batch_idx, dim=3)
                 else:
-                    # mLSE_cur = cute.domain_offset((offset, 0), mLSE)
-                    mLSE_cur = utils.domain_offset_i64((offset, 0), mLSE)
-                if k_block == 0:  # Only first k_block writes LSE when mLSE is provided
-                    for m in cutlass.range(cute.size(ts2rrLSE, mode=[2]), unroll_full=True):
-                        if ts2rcLSE[0, 0, m][0] == 0:  # Only thread responsible for s=0 writes
-                            mi = ts2rcLSE[0, 0, m][1]
-                            idx = m_block * self.m_block_size + mi
-                            if idx < max_idx:
-                                if const_expr(not varlen):
-                                    head_idx, m_idx = divmod(idx, seqlen_divmod)
-                                else:
-                                    head_idx = idx // seqlen
-                                    m_idx = idx - head_idx * seqlen
-                                mLSE_cur[m_idx, head_idx] = lse_sum[m]
+                    # mLSE_partial_cur = cute.domain_offset((offset, 0, 0), mLSE_partial)
+                    mLSE_partial_cur = utils.domain_offset_i64((offset, 0, 0), mLSE_partial)
+                mLSE_partial_copy = cute.tiled_divide(mLSE_partial_cur, (1,))
 
-            # ===============================
-            # Step 6: Read O_partial and accumulate final O
-            # ===============================
+                gmem_thr_copy_LSE = gmem_tiled_copy_LSE.get_slice(tidx)
+                tLSEsLSE = gmem_thr_copy_LSE.partition_D(sLSE)
+
+                # Create identity tensor for coordinate tracking
+                cLSE = cute.make_identity_tensor((self.max_splits, self.m_block_size))
+                tLSEcLSE = gmem_thr_copy_LSE.partition_S(cLSE)
+
+                # Load LSE partial values
+                for m in cutlass.range(cute.size(tLSEcLSE, mode=[2]), unroll_full=True):
+                    mi = tLSEcLSE[0, 0, m][1]  # Get m coordinate
+                    idx = m_block * self.m_block_size + mi
+                    if idx < max_idx:
+                        # Calculate actual sequence position and head using FastDivmodDivisor
+                        if const_expr(not varlen):
+                            head_idx, m_idx = divmod(idx, seqlen_divmod)
+                        else:
+                            head_idx = idx // seqlen
+                            m_idx = idx - head_idx * seqlen
+                        mLSE_partial_cur_copy = mLSE_partial_copy[None, m_idx, None, head_idx]
+                        for s in cutlass.range(cute.size(tLSEcLSE, mode=[1]), unroll_full=True):
+                            si = tLSEcLSE[0, s, 0][0]  # Get split coordinate
+                            if si < num_splits:
+                                cute.copy(
+                                    gmem_thr_copy_LSE,
+                                    mLSE_partial_cur_copy[None, si],
+                                    tLSEsLSE[None, s, m],
+                                )
+                            else:
+                                tLSEsLSE[None, s, m].fill(-Float32.inf)
+                    # Don't need to zero out the rest of the LSEs, as we will not write the output to gmem
+                cute.arch.cp_async_commit_group()
+
+                # ===============================
+                # Step 2: Load O_partial for pipeline stages
+                # ===============================
+
+                gmem_thr_copy_O_partial = gmem_tiled_copy_O_partial.get_slice(tidx)
+                cO = cute.make_identity_tensor((self.m_block_size, self.k_block_size))
+                tOcO = gmem_thr_copy_O_partial.partition_D(cO)
+                tOsO_partial = gmem_thr_copy_O_partial.partition_D(sO)
+                if const_expr(cu_seqlens is None):
+                    # mO_partial_cur = mO_partial[None, None, None, None, batch_idx]
+                    mO_partial_cur = utils.coord_offset_i64(mO_partial, batch_idx, dim=4)
+                else:
+                    # mO_partial_cur = cute.domain_offset((offset, 0, 0, 0), mO_partial)
+                    mO_partial_cur = utils.domain_offset_i64((offset, 0, 0, 0), mO_partial)
+
+                # Precompute these values to avoid recomputing them in the loop
+                num_rows = const_expr(cute.size(tOcO, mode=[1]))
+                tOmidx = cute.make_fragment(num_rows, cutlass.Int32)
+                tOhidx = cute.make_fragment(num_rows, cutlass.Int32)
+                tOrOptr = cute.make_fragment(num_rows, cutlass.Int64)
+                for m in cutlass.range(num_rows, unroll_full=True):
+                    mi = tOcO[0, m, 0][0]  # m coordinate
+                    idx = m_block * self.m_block_size + mi
+                    if const_expr(not varlen):
+                        tOhidx[m], tOmidx[m] = divmod(idx, seqlen_divmod)
+                    else:
+                        tOhidx[m] = idx // seqlen
+                        tOmidx[m] = idx - tOhidx[m] * seqlen
+                    tOrOptr[m] = utils.elem_pointer_i64(
+                        mO_partial_cur, (tOmidx[m], k_block * self.k_block_size, 0, tOhidx[m])
+                    ).toint()
+                    if idx >= max_idx:
+                        tOhidx[m] = -1
+
+                tOpO = cute.make_fragment(cute.size(tOcO, [2]), cutlass.Boolean)
+                if const_expr(not self.is_even_k):
+                    for k in cutlass.range(cute.size(tOpO), unroll_full=True):
+                        tOpO[k] = tOcO[0, 0, k][1] < mO_partial.shape[1] - k_block * self.k_block_size
+                # if cute.arch.thread_idx()[0] == 0 and k_block == 1: cute.print_tensor(tOpO)
+
+                load_O_partial = partial(
+                    self.load_O_partial,
+                    gmem_tiled_copy_O_partial,
+                    tOrOptr,
+                    tOsO_partial,
+                    tOhidx,
+                    tOpO,
+                    tOcO,
+                    mO_partial_cur.layout,
+                )
+
+                # Load first few stages of O_partial
+                for stage in cutlass.range(self.stages - 1, unroll_full=True):
+                    if stage < num_splits:
+                        load_O_partial(stage, stage)
+                    cute.arch.cp_async_commit_group()
+
+                # ===============================
+                # Step 3: Load and transpose LSE from smem to registers
+                # ===============================
+
+                # Wait for LSE and initial O partial stages to complete
+                cute.arch.cp_async_wait_group(self.stages - 1)
+                cute.arch.sync_threads()
+                # if cute.arch.thread_idx()[0] == 0:
+                #     # cute.print_tensor(sLSE)
+                #     for i in range(64):
+                #         cute.printf("sLSE[%d, 0] = %f", i, sLSE[i, 0])
+                # cute.arch.sync_threads()
+
+                s2r_thr_copy_LSE = s2r_tiled_copy_LSE.get_slice(tidx)
+                ts2rsLSE = s2r_thr_copy_LSE.partition_S(sLSE)
+                ts2rrLSE = cute.make_fragment_like(ts2rsLSE)
+                cute.copy(s2r_tiled_copy_LSE, ts2rsLSE, ts2rrLSE)
+
+                # ===============================
+                # Step 4: Compute final LSE along split dimension
+                # ===============================
+
+                lse_sum = cute.make_fragment(cute.size(ts2rrLSE, mode=[2]), Float32)
+                ts2rcLSE = s2r_thr_copy_LSE.partition_D(cLSE)
+                # We compute the max valid split for each row to short-circuit the computation later
+                max_valid_split = cute.make_fragment(cute.size(ts2rrLSE, mode=[2]), Int32)
+                assert cute.size(ts2rrLSE, mode=[0]) == 1
+                # Compute max, scales, and final LSE for each row
+                for m in cutlass.range(cute.size(ts2rrLSE, mode=[2]), unroll_full=True):
+                    # Find max LSE value across splits
+                    threads_per_col = const_expr(self.smem_threads_per_col_lse)
+                    lse_max = utils.warp_reduce(
+                        ts2rrLSE[None, None, m]
+                        .load()
+                        .reduce(cute.ReductionOp.MAX, init_val=-Float32.inf, reduction_profile=0),
+                        op=cute.arch.fmax,
+                        width=threads_per_col,
+                    )
+                    # if cute.arch.thread_idx()[0] == 0: cute.printf(lse_max)
+                    # Find max valid split index
+                    max_valid_idx = -1
+                    for s in cutlass.range(cute.size(ts2rrLSE, mode=[1]), unroll_full=True):
+                        if ts2rrLSE[0, s, m] != -Float32.inf:
+                            max_valid_idx = ts2rcLSE[0, s, 0][0]  # Get split coordinate
+                    # if cute.arch.thread_idx()[0] < 32: cute.printf(max_valid_idx)
+                    max_valid_split[m] = utils.warp_reduce(max_valid_idx, max, width=threads_per_col)
+                    # Compute exp scales and sum
+                    lse_max_cur = (
+                        0.0 if lse_max == -Float32.inf else lse_max
+                    )  # In case all local LSEs are -inf
+                    LOG2_E = math.log2(math.e)
+                    lse_sum_cur = 0.0
+                    for s in cutlass.range(cute.size(ts2rrLSE, mode=[1]), unroll_full=True):
+                        scale = utils.exp2f(ts2rrLSE[0, s, m] * LOG2_E - (lse_max_cur * LOG2_E))
+                        lse_sum_cur += scale
+                        ts2rrLSE[0, s, m] = scale  # Store scale for later use
+                    lse_sum_cur = utils.warp_reduce(lse_sum_cur, operator.add, width=threads_per_col)
+                    lse_sum[m] = utils.logf(lse_sum_cur) + lse_max
+                    # Normalize scales
+                    inv_sum = (
+                        0.0 if (lse_sum_cur == 0.0 or lse_sum_cur != lse_sum_cur) else 1.0 / lse_sum_cur
+                    )
+                    ts2rrLSE[None, None, m].store(ts2rrLSE[None, None, m].load() * inv_sum)
+                # Store the scales exp(lse - lse_logsum) back to smem
+                cute.copy(s2r_tiled_copy_LSE, ts2rrLSE, ts2rsLSE)
+
+                # Store max valid split to smem
+                for m in cutlass.range(cute.size(ts2rrLSE, mode=[2]), unroll_full=True):
+                    if ts2rcLSE[0, 0, m][0] == 0:  # Only thread responsible for s=0 writes
+                        mi = ts2rcLSE[0, 0, m][1]
+                        if mi < self.m_block_size:
+                            sMaxValidSplit[mi] = max_valid_split[m]
+
+                # ===============================
+                # Step 5: Store final LSE to gmem
+                # ===============================
+
+                if const_expr(mLSE is not None):
+                    if const_expr(cu_seqlens is None):
+                        # mLSE_cur = mLSE[None, None, batch_idx]
+                        mLSE_cur = utils.coord_offset_i64(mLSE, batch_idx, dim=2)
+                    else:
+                        # mLSE_cur = cute.domain_offset((offset, 0), mLSE)
+                        mLSE_cur = utils.domain_offset_i64((offset, 0), mLSE)
+                    if k_block == 0:  # Only first k_block writes LSE when mLSE is provided
+                        for m in cutlass.range(cute.size(ts2rrLSE, mode=[2]), unroll_full=True):
+                            if ts2rcLSE[0, 0, m][0] == 0:  # Only thread responsible for s=0 writes
+                                mi = ts2rcLSE[0, 0, m][1]
+                                idx = m_block * self.m_block_size + mi
+                                if idx < max_idx:
+                                    if const_expr(not varlen):
+                                        head_idx, m_idx = divmod(idx, seqlen_divmod)
+                                    else:
+                                        head_idx = idx // seqlen
+                                        m_idx = idx - head_idx * seqlen
+                                    mLSE_cur[m_idx, head_idx] = lse_sum[m]
+
+                # ===============================
+                # Step 6: Read O_partial and accumulate final O
+                # ===============================
+
+                cute.arch.sync_threads()
+
+                # Get max valid split for this thread
+                thr_max_valid_split = sMaxValidSplit[tOcO[0, 0, 0][0]]
+                for m in cutlass.range(1, cute.size(tOcO, mode=[1])):
+                    thr_max_valid_split = max(thr_max_valid_split, sMaxValidSplit[tOcO[0, m, 0][0]])
+
+                tOrO_partial = cute.make_fragment_like(tOsO_partial[None, None, None, 0])
+                tOrO = cute.make_fragment_like(tOrO_partial, Float32)
+                tOrO.fill(0.0)
+
+                stage_load = self.stages - 1
+                stage_compute = 0
+
+                # Main accumulation loop
+                for s in cutlass.range(thr_max_valid_split + 1, unroll=4):
+                    # Get scales for this split
+                    scale = cute.make_fragment(num_rows, Float32)
+                    for m in cutlass.range(num_rows, unroll_full=True):
+                        scale[m] = sLSE[s, tOcO[0, m, 0][0]]  # Get scale from smem
+
+                    # Load next stage if needed
+                    split_to_load = s + self.stages - 1
+                    if split_to_load <= thr_max_valid_split:
+                        load_O_partial(split_to_load, stage_load)
+                    cute.arch.cp_async_commit_group()
+                    stage_load = 0 if stage_load == self.stages - 1 else stage_load + 1
+
+                    # Wait for the current stage to be ready
+                    cute.arch.cp_async_wait_group(self.stages - 1)
+                    # We don't need __syncthreads() because each thread is just reading its own data from smem
+                    # Copy from smem to registers
+                    cute.autovec_copy(tOsO_partial[None, None, None, stage_compute], tOrO_partial)
+                    stage_compute = 0 if stage_compute == self.stages - 1 else stage_compute + 1
+
+                    # Accumulate scaled partial results
+                    for m in cutlass.range(num_rows, unroll_full=True):
+                        if tOhidx[m] >= 0 and scale[m] > 0.0:
+                            tOrO[None, m, None].store(
+                                tOrO[None, m, None].load()
+                                + scale[m] * tOrO_partial[None, m, None].load().to(Float32)
+                            )
+
+                # ===============================
+                # Step 7: Write final O to gmem
+                # ===============================
+
+                rO = cute.make_fragment_like(tOrO, self.dtype)
+                rO.store(tOrO.load().to(self.dtype))
+                if const_expr(cu_seqlens is None):
+                    # mO_cur = mO[None, None, None, batch_idx]
+                    mO_cur = utils.coord_offset_i64(mO, batch_idx, dim=3)
+                else:
+                    # mO_cur = cute.domain_offset((offset, 0, 0), mO)
+                    mO_cur = utils.domain_offset_i64((offset, 0, 0), mO)
+                mO_cur = utils.domain_offset_aligned((0, k_block * self.k_block_size, 0), mO_cur)
+                elems_per_store = const_expr(cute.size(gmem_tiled_copy_O.layout_tv_tiled[1]))
+                # mO_cur_copy = cute.tiled_divide(mO_cur, (1, elems_per_store,))
+                gmem_thr_copy_O = gmem_tiled_copy_O.get_slice(tidx)
+                # Write final results
+                for m in cutlass.range(num_rows, unroll_full=True):
+                    if tOhidx[m] >= 0:
+                        mO_cur_copy = cute.tiled_divide(
+                            mO_cur[tOmidx[m], None, tOhidx[m]], (elems_per_store,)
+                        )
+                        for k in cutlass.range(cute.size(tOcO, mode=[2]), unroll_full=True):
+                            k_idx = tOcO[0, 0, k][1] // elems_per_store
+                            if const_expr(self.is_even_k) or tOpO[k]:
+                                cute.copy(gmem_thr_copy_O, rO[None, m, k], mO_cur_copy[None, k_idx])
 
             cute.arch.sync_threads()
-
-            # Get max valid split for this thread
-            thr_max_valid_split = sMaxValidSplit[tOcO[0, 0, 0][0]]
-            for m in cutlass.range(1, cute.size(tOcO, mode=[1])):
-                thr_max_valid_split = max(thr_max_valid_split, sMaxValidSplit[tOcO[0, m, 0][0]])
-
-            tOrO_partial = cute.make_fragment_like(tOsO_partial[None, None, None, 0])
-            tOrO = cute.make_fragment_like(tOrO_partial, Float32)
-            tOrO.fill(0.0)
-
-            stage_load = self.stages - 1
-            stage_compute = 0
-
-            # Main accumulation loop
-            for s in cutlass.range(thr_max_valid_split + 1, unroll=4):
-                # Get scales for this split
-                scale = cute.make_fragment(num_rows, Float32)
-                for m in cutlass.range(num_rows, unroll_full=True):
-                    scale[m] = sLSE[s, tOcO[0, m, 0][0]]  # Get scale from smem
-
-                # Load next stage if needed
-                split_to_load = s + self.stages - 1
-                if split_to_load <= thr_max_valid_split:
-                    load_O_partial(split_to_load, stage_load)
-                cute.arch.cp_async_commit_group()
-                stage_load = 0 if stage_load == self.stages - 1 else stage_load + 1
-
-                # Wait for the current stage to be ready
-                cute.arch.cp_async_wait_group(self.stages - 1)
-                # We don't need __syncthreads() because each thread is just reading its own data from smem
-                # Copy from smem to registers
-                cute.autovec_copy(tOsO_partial[None, None, None, stage_compute], tOrO_partial)
-                stage_compute = 0 if stage_compute == self.stages - 1 else stage_compute + 1
-
-                # Accumulate scaled partial results
-                for m in cutlass.range(num_rows, unroll_full=True):
-                    if tOhidx[m] >= 0 and scale[m] > 0.0:
-                        tOrO[None, m, None].store(
-                            tOrO[None, m, None].load()
-                            + scale[m] * tOrO_partial[None, m, None].load().to(Float32)
-                        )
-
-            # ===============================
-            # Step 7: Write final O to gmem
-            # ===============================
-
-            rO = cute.make_fragment_like(tOrO, self.dtype)
-            rO.store(tOrO.load().to(self.dtype))
-            if const_expr(cu_seqlens is None):
-                # mO_cur = mO[None, None, None, batch_idx]
-                mO_cur = utils.coord_offset_i64(mO, batch_idx, dim=3)
-            else:
-                # mO_cur = cute.domain_offset((offset, 0, 0), mO)
-                mO_cur = utils.domain_offset_i64((offset, 0, 0), mO)
-            mO_cur = utils.domain_offset_aligned((0, k_block * self.k_block_size, 0), mO_cur)
-            elems_per_store = const_expr(cute.size(gmem_tiled_copy_O.layout_tv_tiled[1]))
-            # mO_cur_copy = cute.tiled_divide(mO_cur, (1, elems_per_store,))
-            gmem_thr_copy_O = gmem_tiled_copy_O.get_slice(tidx)
-            # Write final results
-            for m in cutlass.range(num_rows, unroll_full=True):
-                if tOhidx[m] >= 0:
-                    mO_cur_copy = cute.tiled_divide(
-                        mO_cur[tOmidx[m], None, tOhidx[m]], (elems_per_store,)
+            if const_expr(self.dynamic_persistent):
+                if warp_idx == 0:
+                    # producer_scheduler_state = tile_scheduler.prefetch_next_work_dynamic(producer_scheduler_state)
+                    producer_scheduler_state = tile_scheduler.prefetch_next_work(
+                        dynamic=True, producer_state=producer_scheduler_state,
                     )
-                    for k in cutlass.range(cute.size(tOcO, mode=[2]), unroll_full=True):
-                        k_idx = tOcO[0, 0, k][1] // elems_per_store
-                        if const_expr(self.is_even_k) or tOpO[k]:
-                            cute.copy(gmem_thr_copy_O, rO[None, m, k], mO_cur_copy[None, k_idx])
+            if const_expr(self.dynamic_persistent):
+                # work_tile, consumer_scheduler_state = tile_scheduler.advance_to_next_work_dynamic(batch_idx, consumer_scheduler_state)
+                work_tile, consumer_scheduler_state = tile_scheduler.advance_to_next_work(
+                    batch_idx,
+                    dynamic=True,
+                    consumer_state=consumer_scheduler_state,
+                )
+            else:
+                work_tile = tile_scheduler.advance_to_next_work(batch_idx)
+            # End of persistent scheduler loop
+
 
     @cute.jit
     def load_O_partial(
