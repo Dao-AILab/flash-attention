@@ -484,7 +484,7 @@ def bwd(
     softcap: float,
     deterministic: bool,
     sm_margin: int = 0,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor]:
     """
     Flash Attention v3 backward pass compatible interface for AMD Triton implementation.
 
@@ -677,9 +677,9 @@ def bwd(
         delta.shape == expected_delta_shape
     ), f"[bwd_v3] delta shape {delta.shape} != {expected_delta_shape}"
 
-    # V3 expects (dq, dk, dv, softmax_d, *rest)
+    # V3 expects (softmax_d, *rest)
     # delta is the softmax_d in this case
-    return dq, dk, dv, delta
+    return delta
 
 
 def fwd_combine(
