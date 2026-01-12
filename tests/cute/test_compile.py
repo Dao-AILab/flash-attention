@@ -7,7 +7,15 @@ from torch import nn
 from torch.library import opcheck
 
 
-from flash_attn.cute import flash_attn_func, flash_attn_varlen_func, flash_attn_combine
+from flash_attn.cute import (
+    flash_attn_func,
+    flash_attn_varlen_func,
+)
+
+# TODO move this import up once publicly exposed in __init__.py
+from flash_attn.cute.interface import (
+    flash_attn_combine,
+)
 
 
 class SimpleAttention(nn.Module):
