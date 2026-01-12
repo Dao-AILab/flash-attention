@@ -1,18 +1,20 @@
 # Copyright (c) 2025, Tri Dao.
 
+import math
 import hashlib
 import inspect
-import math
 import re
+from typing import Type, Callable, Optional, Tuple, overload
 from functools import partial
-from typing import Callable, Optional, Tuple, Type, overload
 
 import cutlass
 import cutlass.cute as cute
+
 from cutlass import Float32, const_expr
-from cutlass._mlir.dialects import llvm, nvvm
-from cutlass.cute.runtime import from_dlpack
 from cutlass.cutlass_dsl import T, dsl_user_op
+from cutlass._mlir.dialects import nvvm, llvm
+from cutlass.cute.runtime import from_dlpack
+
 
 # cute.arch.{fma,mul,add}_packed_f32x2 uses RZ rounding mode by default
 fma_packed_f32x2 = partial(cute.arch.fma_packed_f32x2, rnd=nvvm.RoundingModeKind.RN)
@@ -26,14 +28,12 @@ sub_packed_f32x2 = partial(
 )
 
 
-def hash_callable(func: Callable, set_cute_hash=True) -> str:
+def hash_callable(func: Callable) -> str:
     """Hash a callable based on the source code or bytecode and closure values.
 
     Fast-path: if the callable (or its __wrapped__ base) has a ``__cute_hash__``
     attribute, that value is returned immediately. Code-generation backends such
     as Inductor can set this attribute to avoid expensive runtime hashing.
-
-    set_cute_hash: whether or not to set func.__cute_hash__ if not present
     """
     if hasattr(func, "__cute_hash__"):
         return func.__cute_hash__
@@ -60,12 +60,7 @@ def hash_callable(func: Callable, set_cute_hash=True) -> str:
             cell_value = cell.cell_contents
             hasher.update(repr(cell_value).encode())
 
-    hash = hasher.hexdigest()
-
-    if set_cute_hash:
-        func.__cute_hash__ = hash
-
-    return hash
+    return hasher.hexdigest()
 
 
 def create_softcap_scoremod(softcap_val):
