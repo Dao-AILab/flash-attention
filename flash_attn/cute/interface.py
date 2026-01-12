@@ -1372,43 +1372,6 @@ def flash_attn_bwd_fake(
     )
 
 
-def setup_context(ctx, inputs, output):
-    q, k, v = inputs[:3]
-    out, lse = output
-    ctx.save_for_backward(q, k, v, out, lse)
-    ctx.softmax_scale = inputs[3]
-    ctx.causal = inputs[4]
-    ctx.softcap = inputs[5]
-    ctx.window_size_left = inputs[6]
-    ctx.window_size_right = inputs[7]
-    ctx.pack_gqa = inputs[9]
-    ctx.deterministic = inputs[10]
-
-
-def _backward(ctx, dout, dlse):
-    """Backward pass for flash_attn_fwd custom op."""
-    q, k, v, out, lse = ctx.saved_tensors
-    dq, dk, dv = flash_attn_bwd(
-        q,
-        k,
-        v,
-        out,
-        dout,
-        lse,
-        softmax_scale=ctx.softmax_scale,
-        causal=ctx.causal,
-        softcap=ctx.softcap,
-        window_size_left=ctx.window_size_left,
-        window_size_right=ctx.window_size_right,
-        pack_gqa=ctx.pack_gqa,
-        deterministic=ctx.deterministic,
-    )
-    return dq, dk, dv, *((None,) * 8)
-
-
-flash_attn_fwd.register_autograd(_backward, setup_context=setup_context)
-
-
 class FlashAttnFunc(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -1635,53 +1598,6 @@ def flash_attn_varlen_bwd_fake(
         torch.empty_like(k),
         torch.empty_like(v),
     )
-
-
-def setup_context_varlen(ctx, inputs, output):
-    q, k, v, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = inputs[:7]
-    out, lse = output
-    ctx.save_for_backward(q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
-    ctx.max_seqlen_q = inputs[7]
-    ctx.max_seqlen_k = inputs[8]
-    # page_table
-    ctx.softmax_scale = inputs[10]
-    ctx.causal = inputs[11]
-    ctx.softcap = inputs[12]
-    ctx.window_size_left = inputs[13]
-    ctx.window_size_right = inputs[14]
-    # num_splits
-    ctx.pack_gqa = inputs[16]
-    ctx.deterministic = inputs[17]
-
-
-def _backward_varlen(ctx, dout, dlse):
-    q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = ctx.saved_tensors
-    dq, dk, dv = flash_attn_varlen_bwd(
-        q,
-        k,
-        v,
-        out,
-        dout,
-        lse,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        seqused_q,
-        seqused_k,
-        max_seqlen_q=ctx.max_seqlen_q,
-        max_seqlen_k=ctx.max_seqlen_k,
-        # page_table,
-        softmax_scale=ctx.softmax_scale,
-        causal=ctx.causal,
-        softcap=ctx.softcap,
-        window_size_left=ctx.window_size_left,
-        window_size_right=ctx.window_size_right,
-        pack_gqa=ctx.pack_gqa,
-        deterministic=ctx.deterministic,
-    )
-    return dq, dk, dv, *((None,) * 15)
-
-
-flash_attn_varlen_bwd.register_autograd(_backward_varlen, setup_context=setup_context_varlen)
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
