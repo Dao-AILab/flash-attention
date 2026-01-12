@@ -166,12 +166,18 @@ class SingleTileScheduler:
     def initial_work_tile_info(self, *, loc=None, ip=None):
         return self.get_current_work(loc=loc, ip=ip)
 
-    def prefetch_next_work(self, *, loc=None, ip=None):
-        pass
+    def prefetch_next_work(
+        self,
+        batch_idx: Int32 = 0,
+        producer_state: Optional[cutlass.pipeline.PipelineState] = None,
+        *,
+        loc=None,
+        ip=None,
+    ):
+        return producer_state
 
     def advance_to_next_work(
         self,
-        batch_idx: Int32 = 0,
         *,
         loc=None,
         ip=None,
@@ -260,12 +266,18 @@ class StaticPersistentTileScheduler:
     def initial_work_tile_info(self, *, loc=None, ip=None):
         return self.get_current_work(loc=loc, ip=ip)
 
-    def prefetch_next_work(self, *, loc=None, ip=None):
-        pass
+    def prefetch_next_work(
+        self,
+        batch_idx: Int32 = 0,
+        producer_state: Optional[cutlass.pipeline.PipelineState] = None,
+        *,
+        loc=None,
+        ip=None,
+    ):
+        return producer_state
 
     def advance_to_next_work(
         self,
-        batch_idx: Int32 = 0,
         *,
         loc=None,
         ip=None,
@@ -408,12 +420,18 @@ class SingleTileLPTScheduler:
     def initial_work_tile_info(self, *, loc=None, ip=None):
         return self.get_current_work(loc=loc, ip=ip)
 
-    def prefetch_next_work(self, *, loc=None, ip=None):
-        pass
+    def prefetch_next_work(
+        self,
+        batch_idx: Int32 = 0,
+        producer_state: Optional[cutlass.pipeline.PipelineState] = None,
+        *,
+        loc=None,
+        ip=None,
+    ):
+        return producer_state
 
     def advance_to_next_work(
         self,
-        batch_idx: Int32 = 0,
         *,
         loc=None,
         ip=None,
@@ -546,12 +564,18 @@ class SingleTileLPTBwdScheduler:
     def initial_work_tile_info(self, *, loc=None, ip=None):
         return self.get_current_work(loc=loc, ip=ip)
 
-    def prefetch_next_work(self, *, loc=None, ip=None):
-        pass
+    def prefetch_next_work(
+        self,
+        batch_idx: Int32 = 0,
+        producer_state: Optional[cutlass.pipeline.PipelineState] = None,
+        *,
+        loc=None,
+        ip=None,
+    ):
+        return producer_state
 
     def advance_to_next_work(
         self,
-        batch_idx: Int32 = 0,
         *,
         loc=None,
         ip=None,
@@ -783,12 +807,18 @@ class SingleTileVarlenScheduler:
     def initial_work_tile_info(self, *, loc=None, ip=None):
         return self.get_current_work(loc=loc, ip=ip)
 
-    def prefetch_next_work(self, *, loc=None, ip=None):
-        pass
+    def prefetch_next_work(
+        self,
+        batch_idx: Int32 = 0,
+        producer_state: Optional[cutlass.pipeline.PipelineState] = None,
+        *,
+        loc=None,
+        ip=None,
+    ):
+        return producer_state
 
     def advance_to_next_work(
         self,
-        batch_idx: Int32 = 0,
         *,
         loc=None,
         ip=None,
@@ -869,8 +899,7 @@ class DynamicPersistentVarlenScheduler:
         tile_idx: Int32,
         work_info: cute.Tensor,
         scheduler_pipeline: cutlass.pipeline.PipelineAsync,
-        pipeline_state: Optional[cutlass.pipeline.PipelineState] = None,
-        is_scheduler_warp: Constexpr[Boolean] = False,
+        pipeline_state: cutlass.pipeline.PipelineState,
         *,
         loc=None,
         ip=None
@@ -880,7 +909,6 @@ class DynamicPersistentVarlenScheduler:
         self._work_info = work_info
         self._scheduler_pipeline = scheduler_pipeline
         self._pipeline_state = pipeline_state
-        self._is_scheduler_warp = is_scheduler_warp
         self._loc = loc
         self._ip = ip
 
@@ -893,25 +921,15 @@ class DynamicPersistentVarlenScheduler:
         params: Params,
         work_info: cute.Tensor,
         scheduler_pipeline: cutlass.pipeline.PipelineAsync,
-        is_scheduler_warp: Constexpr[Boolean] = False,
-        init_pipeline_state: Constexpr[Boolean] = True,
         *,
         loc=None,
         ip=None,
     ) -> "DynamicPersistentVarlenScheduler":
         tile_idx, _, _ = cute.arch.block_idx()
         
-        if const_expr(init_pipeline_state):
-            pipeline_user_type = (
-                cutlass.pipeline.PipelineUserType.Producer
-                if const_expr(is_scheduler_warp) else 
-                cutlass.pipeline.PipelineUserType.Consumer
-            )
-            pipeline_state = cutlass.pipeline.make_pipeline_state(
-                pipeline_user_type, 1,
-            )
-        else:
-            pipeline_state = None
+        pipeline_state = cutlass.pipeline.make_pipeline_state(
+            cutlass.pipeline.PipelineUserType.Consumer, 1,
+        )
 
         return DynamicPersistentVarlenScheduler(
             params,
@@ -919,7 +937,6 @@ class DynamicPersistentVarlenScheduler:
             work_info,
             scheduler_pipeline,
             pipeline_state,
-            is_scheduler_warp,
             loc=loc,
             ip=ip,
         )
@@ -1103,49 +1120,27 @@ class DynamicPersistentVarlenScheduler:
     @cute.jit
     def prefetch_next_work(
         self,
-        dynamic: cutlass.Constexpr[Boolean] = False,
-        producer_state: Optional[cutlass.pipeline.PipelineState] = None,
-        *,
-        loc=None,
-        ip=None
-    ):
-        params = self.params
-        if const_expr(dynamic):
-            # assumed to be called from leader warp
-            assert producer_state is not None
-            if cute.arch.lane_idx() == 0:
-                tile_idx = cute.arch.grid_dim()[0] + utils.atomic_add_i32(
-                    1, params.tile_count_semaphore,
-                )
-                self._scheduler_pipeline.producer_acquire(producer_state)
-                self._work_info[0] = tile_idx
-                self._scheduler_pipeline.producer_commit(producer_state)
-            producer_state.advance()
-            return producer_state
-        else:
-            tile_idx = self._tile_idx
-            if const_expr(self._is_scheduler_warp) and cute.arch.lane_idx() == 0:
-                tile_idx = cute.arch.grid_dim()[0] + utils.atomic_add_i32(
-                    1, params.tile_count_semaphore,
-                )
-            self._tile_idx = tile_idx
-
-    # assumed to be called from leader warp
-    @cute.jit
-    def prefetch_next_work_dynamic(
-        self,
+        batch_idx,
         producer_state: cutlass.pipeline.PipelineState,
         *,
         loc=None,
-        ip=None
+        ip=None,
     ):
         params = self.params
+        next_tile_idx = 0
         if cute.arch.lane_idx() == 0:
-            tile_idx = cute.arch.grid_dim()[0] + utils.atomic_add_i32(
+            next_tile_idx = cute.arch.grid_dim()[0] + utils.atomic_add_i32(
                 1, params.tile_count_semaphore,
             )
-            self._scheduler_pipeline.producer_acquire(producer_state)
-            self._work_info[0] = tile_idx
+        next_tile_idx = cute.arch.shuffle_sync(next_tile_idx, 0)
+        work_info = self.get_current_work(next_tile_idx, batch_idx, self._tile_idx)
+        self._scheduler_pipeline.producer_acquire(producer_state)
+        with cute.arch.elect_one():
+            block, head_idx, batch_idx, split_idx = work_info.tile_idx
+            self._work_info[0] = block
+            self._work_info[1] = head_idx
+            self._work_info[2] = batch_idx
+            self._work_info[3] = split_idx
             self._scheduler_pipeline.producer_commit(producer_state)
         producer_state.advance()
         return producer_state
@@ -1153,74 +1148,27 @@ class DynamicPersistentVarlenScheduler:
     @cute.jit
     def advance_to_next_work(
         self,
-        batch_idx: Int32 = 0,
-        dynamic: cutlass.Constexpr[Boolean] = False,
-        consumer_state: Optional[cutlass.pipeline.PipelineState] = None,
         *,
         loc=None,
-        ip=None
+        ip=None,
     ) -> WorkTileInfo:
         params = self.params
-        if const_expr(dynamic):
-            assert consumer_state is not None
-            self._scheduler_pipeline.consumer_wait(consumer_state)
-            next_tile_idx = self._work_info[0]
-            work_tile = self.get_current_work(next_tile_idx, batch_idx, self._tile_idx)
-            cute.arch.sync_warp()
-            with cute.arch.elect_one():
-                self._scheduler_pipeline.consumer_release(consumer_state)
-            consumer_state.advance()
-            return work_tile, consumer_state
-        else:
-            if const_expr(self._is_scheduler_warp):
-                next_tile_idx = cute.arch.shuffle_sync(self._tile_idx, 0)
-                group_start_tile = cute.arch.shuffle_sync(self._tile_idx, 1)
-                # if cute.arch.block_idx()[0] == 0 and cute.arch.lane_idx() == 0:
-                #     cute.printf("group_start_tile = {}, next_tile_idx = {}", group_start_tile, next_tile_idx)
-                work_info = self.get_current_work(next_tile_idx, batch_idx, group_start_tile)
-                self._scheduler_pipeline.producer_acquire(self._pipeline_state)
-                with cute.arch.elect_one():
-                    block, head_idx, batch_idx, split_idx = work_info.tile_idx
-                    self._work_info[0] = block
-                    self._work_info[1] = head_idx
-                    self._work_info[2] = batch_idx
-                    self._work_info[3] = split_idx
-                    self._scheduler_pipeline.producer_commit(self._pipeline_state)
-            else:
-                self._scheduler_pipeline.consumer_wait(self._pipeline_state)
-                block = self._work_info[0]
-                head_idx = self._work_info[1]
-                batch_idx = self._work_info[2]
-                split_idx = self._work_info[3]
-                is_valid = batch_idx < params.num_batch
-                work_info = WorkTileInfo((block, head_idx, batch_idx, split_idx), is_valid)
-                cute.arch.sync_warp()
-                with cute.arch.elect_one():
-                    self._scheduler_pipeline.consumer_release(self._pipeline_state)
-            self._pipeline_state.advance()
-            return work_info
-    
-    @cute.jit
-    def advance_to_next_work_dynamic(
-        self,
-        batch_idx: Int32,
-        consumer_state: cutlass.pipeline.PipelineState,
-        *,
-        loc=None,
-        ip=None
-    ) -> WorkTileInfo:
-        self._scheduler_pipeline.consumer_wait(consumer_state)
-        next_tile_idx = self._work_info[0]
-        work_tile = self.get_current_work(next_tile_idx, batch_idx, self._tile_idx)
+        self._scheduler_pipeline.consumer_wait(self._pipeline_state)
+        block = self._work_info[0]
+        head_idx = self._work_info[1]
+        batch_idx = self._work_info[2]
+        split_idx = self._work_info[3]
+        is_valid = batch_idx < params.num_batch
+        work_info = WorkTileInfo((block, head_idx, batch_idx, split_idx), is_valid)
         cute.arch.sync_warp()
         with cute.arch.elect_one():
-            self._scheduler_pipeline.consumer_release(consumer_state)
-        consumer_state.advance()
-        return work_tile, consumer_state
+            self._scheduler_pipeline.consumer_release(self._pipeline_state)
+        self._pipeline_state.advance()
+        return work_info
 
     def __extract_mlir_values__(self):
         values, self._values_pos = [], []
-        for obj in [self.params, self._tile_idx, self._work_info, self._scheduler_pipeline, self._pipeline_state, self._is_scheduler_warp]:
+        for obj in [self.params, self._tile_idx, self._work_info, self._scheduler_pipeline, self._pipeline_state]:
             obj_values = cutlass.extract_mlir_values(obj)
             values += obj_values
             self._values_pos.append(len(obj_values))
@@ -1229,7 +1177,7 @@ class DynamicPersistentVarlenScheduler:
     def __new_from_mlir_values__(self, values):
         obj_list = []
         for obj, n_items in zip(
-            [self.params, self._tile_idx, self._work_info, self._scheduler_pipeline, self._pipeline_state, self._is_scheduler_warp],
+            [self.params, self._tile_idx, self._work_info, self._scheduler_pipeline, self._pipeline_state],
             self._values_pos,
         ):
             obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))

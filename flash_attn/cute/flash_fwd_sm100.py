@@ -190,7 +190,7 @@ class FlashAttentionForwardSm100:
         elif self.is_varlen_q: # fallback
             self.epilogue_warp_ids = (13, 14)
 
-        self.leader_load_warp = 14
+        self.scheduler_warp = 14
 
         non_empty_warps_ids = set(
             (
@@ -203,11 +203,7 @@ class FlashAttentionForwardSm100:
             )
         )
         # print("non_empty_warps_ids = ", non_empty_warps_ids)
-
-        self.num_consumer_scheduler_warps = len(non_empty_warps_ids) - 1
-        # print("Num consumer scheduler warps = ", self.num_consumer_scheduler_warps)
-        # print("epilogue_warp_ids = ", self.epilogue_warp_ids)
-        # print("load_warp_ids = ", self.load_warp_ids)
+        self.num_non_empty_warps = len(non_empty_warps_ids)
 
         self.tmem_s_offset = [0, self.n_block_size]  # e.g., 0, 128
         self.tmem_o_offset = [
@@ -311,10 +307,10 @@ class FlashAttentionForwardSm100:
         6. Kernel launch with appropriate parameters
         """
         self.dynamic_persistent = tile_count_semaphore is not None
+        # self.dynamic_persistent = False
         if const_expr(self.dynamic_persistent):
             self.is_persistent = True
-        # self.dynamic_persistent = False
-        print("Dynamic persistent is ", self.dynamic_persistent)
+        # print("Dynamic persistent is ", self.dynamic_persistent)
         # setup static attributes before smem/grid/tma computation
         self.q_dtype = mQ.element_type
         self.k_dtype = mK.element_type
@@ -922,7 +918,7 @@ class FlashAttentionForwardSm100:
             work_info = storage.work_info.get_tensor((4, ))
             sched_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
             sched_pipeline_consumer_group = pipeline.CooperativeGroup(
-                pipeline.Agent.Thread, self.num_consumer_scheduler_warps
+                pipeline.Agent.Thread, self.num_non_empty_warps
             )
             sched_pipeline = pipeline.PipelineAsync.create(
                 barrier_storage=storage.sched_pipeline_array_ptr.data_ptr(),
@@ -1219,13 +1215,16 @@ class FlashAttentionForwardSm100:
     ):
         num_load_threads = len(self.load_warp_ids) * cute.arch.WARP_SIZE
         tidx = cute.arch.thread_idx()[0] % num_load_threads
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         q_producer_phase = Int32(1)
         kv_producer_state = cutlass.pipeline.make_pipeline_state(
             cutlass.pipeline.PipelineUserType.Producer, self.kv_stage
         )
         load_epi_consumer_phase = Int32(0)
-        # is_scheduler_warp = cute.arch.warp_idx() == self.leader_load_warp
-        tile_scheduler = TileSchedulerCls(is_scheduler_warp=True)
+        producer_scheduler_state = cutlass.pipeline.make_pipeline_state(
+            cutlass.pipeline.PipelineUserType.Producer, 1
+        )
+        tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
@@ -1383,9 +1382,9 @@ class FlashAttentionForwardSm100:
                     self.q_subtile_factor if self.q_subtile_factor is not None else 1,
                 )
 
-
-            tile_scheduler.prefetch_next_work()
-            work_tile = tile_scheduler.advance_to_next_work(batch_idx)
+            if warp_idx == self.scheduler_warp:
+                producer_scheduler_state = tile_scheduler.prefetch_next_work(batch_idx, producer_scheduler_state)
+            work_tile = tile_scheduler.advance_to_next_work()
             # work_tile = tile_scheduler.get_current_work()
             if const_expr(self.overlap_sO_sQ and self.is_persistent):
                 cute.arch.mbarrier_wait(

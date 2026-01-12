@@ -435,9 +435,6 @@ class FlashAttentionForwardCombine:
         producer_scheduler_state = cutlass.pipeline.make_pipeline_state(
             cutlass.pipeline.PipelineUserType.Producer, 1
         )
-        consumer_scheduler_state = cutlass.pipeline.make_pipeline_state(
-            cutlass.pipeline.PipelineUserType.Consumer, 1
-        )
         TileSchedulerCls = partial(self.tile_scheduler_cls.create, tile_sched_params, tile_idx, sched_pipeline)
         # tile_scheduler = TileSchedulerCls(init_pipeline_state=False)
         tile_scheduler = TileSchedulerCls()
@@ -753,21 +750,12 @@ class FlashAttentionForwardCombine:
                                 cute.copy(gmem_thr_copy_O, rO[None, m, k], mO_cur_copy[None, k_idx])
 
             cute.arch.sync_threads()
-            if const_expr(self.dynamic_persistent):
-                if warp_idx == 0:
-                    # producer_scheduler_state = tile_scheduler.prefetch_next_work_dynamic(producer_scheduler_state)
-                    producer_scheduler_state = tile_scheduler.prefetch_next_work(
-                        dynamic=True, producer_state=producer_scheduler_state,
-                    )
-            if const_expr(self.dynamic_persistent):
-                # work_tile, consumer_scheduler_state = tile_scheduler.advance_to_next_work_dynamic(batch_idx, consumer_scheduler_state)
-                work_tile, consumer_scheduler_state = tile_scheduler.advance_to_next_work(
-                    batch_idx,
-                    dynamic=True,
-                    consumer_state=consumer_scheduler_state,
+            
+            if warp_idx == 0:
+                producer_scheduler_state = tile_scheduler.prefetch_next_work(
+                    batch_idx, producer_scheduler_state,
                 )
-            else:
-                work_tile = tile_scheduler.advance_to_next_work(batch_idx)
+            work_tile = tile_scheduler.advance_to_next_work()
             # End of persistent scheduler loop
 
 
