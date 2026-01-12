@@ -2102,6 +2102,10 @@ def flash_attn_blocksparse_func(
         window_size_right=window_size[1],
         num_splits=num_splits,
         pack_gqa=pack_gqa,
+        score_mod=score_mod,
+        mask_mod=mask_mod,
+        block_sparse_tensors=block_sparse_tensors,
+        aux_tensors=aux_tensors,
         return_lse=return_lse,
         deterministic=deterministic,
     )
