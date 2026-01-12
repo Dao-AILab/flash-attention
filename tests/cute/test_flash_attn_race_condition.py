@@ -224,6 +224,7 @@ def test_flash_attn_output(
                 # learnable_sink=learnable_sink,
                 pack_gqa=pack_gqa,
                 num_splits=num_splits,
+                return_lse=True,
                 deterministic=deterministic,
             )
             print(f"Output max diff: {(out - out_ref).abs().max().item()}")
@@ -621,6 +622,7 @@ def test_flash_attn_varlen_output(
             softcap=softcap,
             num_splits=1,
             pack_gqa=False,
+            return_lse=True,
             deterministic=deterministic,
         )
         out = output_pad_fn(out_unpad)
