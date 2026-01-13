@@ -38,8 +38,6 @@ DEBUG_TRITON_DETAIL = (
     os.environ.get("DEBUG_TRITON_DETAIL", "0").lower() in ("1", "true", "yes")
     and USE_TRITON_INTERPRET
 )
-if USE_TRITON_ROCM:  # TODO remove this
-    random.seed(42)
 BWD_MODE: Literal["fused", "fused_atomic", "split"] = "fused"
 USE_EXP2 = True
 PHILOX_SEED = 0x1BF58
