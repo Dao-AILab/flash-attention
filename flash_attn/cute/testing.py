@@ -92,7 +92,12 @@ def generate_random_padding_mask(max_seqlen, batch_size, device, mode="random", 
             device=device,
         )
     else:
-        lengths = torch.randint(max_seqlen // 3, max_seqlen + 1, (batch_size, 1), device=device)
+        lengths = torch.randint(
+            max(0 if zero_lengths else 1, max_seqlen // 3),
+            max_seqlen + 1,
+            (batch_size, 1),
+            device=device,
+        )
 
     if zero_lengths:
         for i in range(batch_size):

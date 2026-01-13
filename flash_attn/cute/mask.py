@@ -77,11 +77,11 @@ class AttentionMask:
     window_size_right: Optional[Int32] = None
     qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1  # only pass in if we're doing PackGQA
     swap_AB: cutlass.Constexpr[bool] = False
-    
+
     @property
     def seqlen_q(self) -> Int32:
         return self.seqlen_info.seqlen_q
-        
+
     @property
     def seqlen_k(self) -> Int32:
         return self.seqlen_info.seqlen_k
@@ -139,7 +139,6 @@ class AttentionMask:
         ):  # FlexAttention mask mod
             nrow = const_expr(cute.size(tScS_mn.shape[0]))
             ncol = const_expr(cute.size(tScS_mn.shape[1]))
-            thr_col_offset = tScS_mn[0, 0][1]
             has_fastdiv = const_expr(
                 fastdiv_mods is not None
                 and fastdiv_mods[0] is not None
@@ -150,7 +149,9 @@ class AttentionMask:
             )
 
             for r in cutlass.range_constexpr(nrow):
-                global_row_idx = tScS_mn[r, 0][0] + m_block * self.tile_m
+                # Respect swap_AB: ROW/COL determine which coordinate component corresponds to Q/KV.
+                local_row = tScS_mn[r, 0][ROW]
+                global_row_idx = local_row + m_block * self.tile_m
                 row_for_mod = global_row_idx
                 head_idx_for_mod = head_idx
                 if const_expr(self.qhead_per_kvhead_packgqa != 1):
@@ -162,7 +163,7 @@ class AttentionMask:
                     _, row_for_mod = divmod(row_for_mod, fastdiv_mods[0])
 
                 for col in cutlass.range_constexpr(ncol):
-                    col_idx_local = t0ScS_mn[0, col][1]
+                    col_idx_local = t0ScS_mn[0, col][COL]
                     # Convert to absolute column index
                     global_col_idx = thr_col_offset + col_idx_local + n_block * self.tile_n
                     col_for_mod = global_col_idx
@@ -354,7 +355,7 @@ class AttentionMask:
                     mask_r2p(acc_S, seqlenk_col_limit, arch=100, rank1=True)
 
         elif const_expr(not mask_causal and not mask_local and mask_mod is not None):
-            # Block sparse w/ mask_mod
+            # Block sparse case w/ mask_mod
             has_fastdiv = const_expr(
                 fastdiv_mods is not None
                 and fastdiv_mods[0] is not None
@@ -549,6 +550,7 @@ class AttentionMask:
                         head_idx_ssa,
                         q_idx_ssa,
                         kv_idx_ssa,
+                        self.seqlen_info,
                         aux_tensors,
                     )
                     cond = cutlass.Boolean(utils.ssa_to_scalar(mask_value))

@@ -2,7 +2,7 @@
 Block-sparsity utilities for FlexAttention
 """
 
-from typing import NamedTuple, Optional, Tuple
+from typing import Callable, NamedTuple, Tuple
 
 import cutlass.cute as cute
 import torch
@@ -17,8 +17,8 @@ def ceildiv(a: int, b: int) -> int:
 class BlockSparseTensors(NamedTuple):
     mask_block_cnt: cute.Tensor
     mask_block_idx: cute.Tensor
-    full_block_cnt: Optional[cute.Tensor]
-    full_block_idx: Optional[cute.Tensor]
+    full_block_cnt: cute.Tensor | None
+    full_block_idx: cute.Tensor | None
 
     def __new_from_mlir_values__(self, values):
         if len(values) == 2:
@@ -29,14 +29,16 @@ class BlockSparseTensors(NamedTuple):
 class BlockSparseTensorsTorch(NamedTuple):
     mask_block_cnt: torch.Tensor
     mask_block_idx: torch.Tensor
-    full_block_cnt: Optional[torch.Tensor] = None
-    full_block_idx: Optional[torch.Tensor] = None
+    full_block_cnt: torch.Tensor | None = None
+    full_block_idx: torch.Tensor | None = None
 
 
 def _expand_sparsity_tensor(
     tensor: torch.Tensor,
     expected_shape: Tuple[int, ...],
     tensor_name: str,
+    context: str | None,
+    hint: str | Callable[[], str] | None,
 ) -> torch.Tensor:
     """Check if we need to expand the tensor to expected shape, and do so if possible."""
     needs_expand = tensor.shape != expected_shape
@@ -44,19 +46,25 @@ def _expand_sparsity_tensor(
         return tensor
     can_expand = all(map(lambda cur, tgt: cur == tgt or cur == 1, tensor.shape, expected_shape))
     if not can_expand:
+        context_clause = f" ({context})" if context else ""
+        resolved_hint = hint() if callable(hint) else hint
+        hint_clause = f" Hint: {resolved_hint}" if resolved_hint else ""
         raise ValueError(
-            f"{tensor_name} with shape {tensor.shape} cannot be expanded to expected shape {expected_shape}."
+            f"{tensor_name}{context_clause} with shape {tensor.shape} cannot be expanded to expected shape {expected_shape}."
+            f"{hint_clause}"
         )
-    return tensor.expand(*expected_shape).contiguous()
+    return tensor.expand(*expected_shape)
 
 
 def _check_and_expand_block(
     name: str,
-    cnt: Optional[torch.Tensor],
-    idx: Optional[torch.Tensor],
+    cnt: torch.Tensor | None,
+    idx: torch.Tensor | None,
     expected_count_shape: Tuple[int, int, int],
     expected_index_shape: Tuple[int, int, int, int],
-) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    context: str | None,
+    hint: str | Callable[[], str] | None,
+) -> Tuple[torch.Tensor | None, torch.Tensor | None]:
     if (cnt is None) != (idx is None):
         raise ValueError(
             f"{name}_block_cnt and {name}_block_idx must both be provided or both be None"
@@ -69,8 +77,12 @@ def _check_and_expand_block(
         raise ValueError(f"{name}_block_cnt and {name}_block_idx must be on the same device")
     if not cnt.is_cuda or not idx.is_cuda:
         raise ValueError(f"{name}_block tensors must live on CUDA")
-    expanded_cnt = _expand_sparsity_tensor(cnt, expected_count_shape, f"{name}_block_cnt")
-    expanded_idx = _expand_sparsity_tensor(idx, expected_index_shape, f"{name}_block_idx")
+    expanded_cnt = _expand_sparsity_tensor(
+        cnt, expected_count_shape, f"{name}_block_cnt", context, hint
+    )
+    expanded_idx = _expand_sparsity_tensor(
+        idx, expected_index_shape, f"{name}_block_idx", context, hint
+    )
     return expanded_cnt, expanded_idx
 
 
@@ -81,12 +93,10 @@ def get_block_sparse_expected_shapes(
     seqlen_k: int,
     m_block_size: int,
     n_block_size: int,
-    compute_capability: int,
+    q_stage: int,
 ) -> Tuple[Tuple[int, int, int], Tuple[int, int, int, int]]:
     """Return (expected_count_shape, expected_index_shape) for block sparse normalization."""
-    # TODO: This multiplier should really be q_stage, wire up in later PR
-    # 1 cta handles 2*tile_m rows on SM100
-    m_block_size_effective = 2 * m_block_size if compute_capability == 10 else m_block_size
+    m_block_size_effective = q_stage * m_block_size
     expected_m_blocks = ceildiv(seqlen_q, m_block_size_effective)
     expected_n_blocks = ceildiv(seqlen_k, n_block_size)
     expected_count_shape = (batch_size, num_head, expected_m_blocks)
@@ -122,6 +132,8 @@ def normalize_block_sparse_tensors(
     *,
     expected_count_shape: Tuple[int, int, int],
     expected_index_shape: Tuple[int, int, int, int],
+    context: str | None = None,
+    hint: str | Callable[[], str] | None = None,
 ) -> BlockSparseTensorsTorch:
     if tensors.mask_block_cnt is None or tensors.mask_block_idx is None:
         raise ValueError("mask_block_cnt and mask_block_idx must be provided for block sparsity.")
@@ -132,6 +144,8 @@ def normalize_block_sparse_tensors(
         tensors.mask_block_idx,
         expected_count_shape,
         expected_index_shape,
+        context,
+        hint,
     )
     if mask_cnt is None or mask_idx is None:
         raise ValueError("mask_block_cnt and mask_block_idx must be provided for block sparsity.")
@@ -142,6 +156,8 @@ def normalize_block_sparse_tensors(
         tensors.full_block_idx,
         expected_count_shape,
         expected_index_shape,
+        context,
+        hint,
     )
     if full_cnt is not None and mask_cnt.device != full_cnt.device:
         raise ValueError("All block sparse tensors must be on the same device")
@@ -160,7 +176,7 @@ def is_block_sparsity_enabled(tensors: BlockSparseTensorsTorch) -> bool:
 
 def to_cute_block_sparse_tensors(
     tensors: BlockSparseTensorsTorch, enable_tvm_ffi: bool = True
-) -> Optional[BlockSparseTensors]:
+) -> BlockSparseTensors | None:
     """Convert torch block sparsity tensors to CuTe tensors, optionally for tvm ffi"""
     if not is_block_sparsity_enabled(tensors):
         return None
