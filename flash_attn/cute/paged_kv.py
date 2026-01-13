@@ -58,7 +58,15 @@ class PagedKVManager(ParamsBase):
     ):
         universal_copy_bits = 128
         async_copy_elems = universal_copy_bits // dtype.width
-        gmem_threads_per_row = math.gcd(head_dim_padded, head_dim_v_padded) // async_copy_elems
+        dtype_bytes = dtype.width // 8
+        gmem_k_block_size = math.gcd(
+            head_dim_padded,
+            head_dim_v_padded,
+            128 // dtype_bytes,
+        )
+        assert gmem_k_block_size % async_copy_elems == 0
+        gmem_threads_per_row = gmem_k_block_size // async_copy_elems
+        assert cute.arch.WARP_SIZE % gmem_threads_per_row == 0
         atom_async_copy = cute.make_copy_atom(
             cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
             dtype,
