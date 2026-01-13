@@ -82,6 +82,9 @@ class Softmax(ParamsBase):
             )
 
             row_max_cur = utils.warp_reduce(row_max_cur, cute.arch.fmax, width=4)
+            # Update row_max before changing row_max_cur to safe value for -inf
+            row_max[r] = row_max_cur
+
             if cutlass.const_expr(check_inf):
                 row_max_cur = 0.0 if row_max_cur == -Float32.inf else row_max_cur
 
@@ -102,7 +105,6 @@ class Softmax(ParamsBase):
                     acc_S_row_exp, init_val=row_sum[r] * row_scale[r], arch=arch
                 )
 
-            row_max[r] = row_max_cur
             row_sum[r] = acc_S_row_sum
             acc_S_mn[r, None].store(acc_S_row_exp)
 
