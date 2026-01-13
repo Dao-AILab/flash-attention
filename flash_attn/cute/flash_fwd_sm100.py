@@ -306,11 +306,6 @@ class FlashAttentionForwardSm100:
         5. Grid and work scheduling computation
         6. Kernel launch with appropriate parameters
         """
-        self.dynamic_persistent = tile_count_semaphore is not None
-        # self.dynamic_persistent = False
-        if const_expr(self.dynamic_persistent):
-            self.is_persistent = True
-        # print("Dynamic persistent is ", self.dynamic_persistent)
         # setup static attributes before smem/grid/tma computation
         self.q_dtype = mQ.element_type
         self.k_dtype = mK.element_type
@@ -587,6 +582,14 @@ class FlashAttentionForwardSm100:
             vO_layout = cute.make_layout((1, async_copy_elems))
             gmem_tiled_copy_O = cute.make_tiled_copy_tv(atom_universal_copy, tO_layout, vO_layout)
 
+        self.dynamic_persistent = const_expr(
+            tile_count_semaphore is not None and
+            (mCuSeqlensQ is not None or mSeqUsedQ is not None)
+        )
+        # self.dynamic_persistent = False
+        if const_expr(self.dynamic_persistent):
+            self.is_persistent = True
+        # print("Dynamic persistent is ", self.dynamic_persistent)
         if const_expr(mCuSeqlensQ is not None or mSeqUsedQ is not None):
             if const_expr(self.dynamic_persistent):
                 TileScheduler = DynamicPersistentVarlenScheduler

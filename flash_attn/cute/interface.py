@@ -431,8 +431,6 @@ def _flash_attn_fwd(
             num_nheads_in_l2,
             tile_count_semaphore,
         ) = scheduler_metadata
-        # just create it again for testing
-        tile_count_semaphore = torch.zeros(1, dtype=torch.int32, device="cuda")
         assert all(
             t is None or t.is_cuda
             for t in (
@@ -2012,12 +2010,11 @@ def get_scheduler_metadata(
     num_splits_dynamic = torch.empty(num_batch, dtype=torch.int32, device=device)
     varlen_batch_idx = None
     num_nheads_in_l2 = None
-    tile_count_semaphore = None
+    tile_count_semaphore = torch.empty(1, dtype=torch.int32, device=device)
     # Will enable more metadata preparation in future commit
     # num_m_blocks = torch.empty(num_batch, dtype=torch.int32, device=device)
     # varlen_batch_idx = torch.empty(num_batch, dtype=torch.int32, device=device) if sort else None
     # num_nheads_in_l2 = torch.empty(num_batch, dtype=torch.int32, device=device) if causal else None
-    # tile_count_semaphore = torch.empty(1, dtype=torch.int32, device=device)
 
     num_m_blocks_cute, num_splits_dynamic_cute, varlen_batch_idx_cute, num_nheads_in_l2_cute = [
         from_dlpack(t.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=t.ndim - 1)
