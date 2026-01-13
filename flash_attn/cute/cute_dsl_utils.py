@@ -132,3 +132,13 @@ def to_cute_tensor(t, assumed_align=16, leading_dim=-1, fully_dynamic=False, ena
     if leading_dim == -1:
         leading_dim = t.ndim - 1
     return tensor.mark_layout_dynamic(leading_dim=leading_dim)
+
+
+def get_broadcast_dims(tensor: torch.Tensor) -> Tuple[bool, ...]:
+    """Return tuple of bools indicating which dims have stride=0 (broadcast).
+
+    This is useful for compile keys since CuTe's mark_layout_dynamic() keeps
+    stride=0 as static, meaning kernels compiled with different broadcast
+    patterns are not interchangeable.
+    """
+    return tuple(s == 0 for s in tensor.stride())

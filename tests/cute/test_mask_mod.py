@@ -893,5 +893,101 @@ def test_sm90_block_sparse_bwd_mismatched_q_block_granularity_error_message():
         )
 
 
+def test_gqa_block_sparse_broadcast_pattern_recompilation():
+    """Test that different block sparse broadcast patterns trigger recompilation.
+
+    This is a regression test for a bug where:
+    1. First call with block_mask H=1 (broadcasts across all query heads)
+    2. Second call with block_mask H=nheads (no broadcast)
+    3. Second call incorrectly reused cached kernel from first call
+
+    The fix adds block_sparse_broadcast_pattern to the compile key so that
+    kernels are recompiled when broadcast patterns change. CuTe's
+    mark_layout_dynamic() keeps stride=0 as static, so different broadcast
+    patterns require different compiled kernels.
+    """
+    torch.manual_seed(42)
+
+    batch_size = 2
+    nheads = 8
+    nheads_kv = 2
+    seqlen = 257
+    headdim = 64
+    dtype = torch.bfloat16
+    tile_m = 128
+    tile_n = 128
+
+    sparse_tile_m = 2 * tile_m if COMPUTE_CAPABILITY == 10 else tile_m
+
+    def causal_mask(b, h, q, kv):
+        return q >= kv
+
+    mask_mod_cute, _ = get_mask_pair("causal", seqlen_q=seqlen, seqlen_k=seqlen)
+
+    tensors = create_tensors(batch_size, seqlen, seqlen, nheads, nheads_kv, headdim, headdim, dtype)
+    q, k, v = tensors["q"], tensors["k"], tensors["v"]
+    grad_out = torch.randn_like(tensors["out"])
+    softmax_scale = 1.0 / math.sqrt(headdim)
+
+    def run_with_block_mask_nheads(block_mask_nheads: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        bm = create_block_mask(
+            causal_mask, batch_size, block_mask_nheads, seqlen, seqlen,
+            device="cuda", BLOCK_SIZE=(sparse_tile_m, tile_n),
+        )
+        (
+            _seq_q, _seq_k,
+            kv_mask_cnt, kv_mask_idx, full_kv_cnt, full_kv_idx,
+            q_mask_cnt, q_mask_idx, full_q_cnt, full_q_idx, *_,
+        ) = bm.as_tuple()
+
+        block_sparse_fwd = BlockSparseTensorsTorch(
+            mask_block_cnt=kv_mask_cnt, mask_block_idx=kv_mask_idx,
+            full_block_cnt=full_kv_cnt, full_block_idx=full_kv_idx,
+        )
+        block_sparse_bwd = BlockSparseTensorsTorch(
+            mask_block_cnt=q_mask_cnt, mask_block_idx=q_mask_idx,
+            full_block_cnt=full_q_cnt, full_block_idx=full_q_idx,
+        )
+
+        out = torch.empty_like(tensors["out"])
+        lse = torch.empty_like(tensors["lse"])
+
+        out_tuple = _flash_attn_fwd(
+            q=q, k=k, v=v, out=out, lse=lse,
+            softmax_scale=softmax_scale, causal=False,
+            window_size_left=-1, window_size_right=-1,
+            m_block_size=tile_m, n_block_size=tile_n, pack_gqa=False,
+            mask_mod=mask_mod_cute, block_sparse_tensors=block_sparse_fwd,
+            return_lse=True,
+        )
+        out_cute, lse_cute = out_tuple[0], out_tuple[1]
+
+        dq, dk, dv = run_cute_mask_bwd(
+            q, k, v, out_cute, lse_cute, grad_out, mask_mod_cute,
+            block_sparse_mask_bwd=block_sparse_bwd, tile_m=tile_m, tile_n=tile_n,
+        )
+        return dq, dk, dv
+
+    flex_block_mask = create_block_mask(
+        causal_mask, batch_size, nheads, seqlen, seqlen,
+        device="cuda", BLOCK_SIZE=(tile_m, tile_n),
+    )
+    _, dq_ref, dk_ref, dv_ref = run_flex_reference_bwd(q, k, v, flex_block_mask, grad_out, dtype=torch.float32)
+    dq_ref, dk_ref, dv_ref = dq_ref.to(dtype), dk_ref.to(dtype), dv_ref.to(dtype)
+
+    dq_broadcast, dk_broadcast, dv_broadcast = run_with_block_mask_nheads(1)
+    dq_no_broadcast, dk_no_broadcast, dv_no_broadcast = run_with_block_mask_nheads(nheads)
+
+    err_broadcast_dq = (dq_broadcast - dq_ref).abs().max().item()
+    err_no_broadcast_dq = (dq_no_broadcast - dq_ref).abs().max().item()
+
+    print(f"\nGQA block sparse broadcast pattern test:")
+    print(f"  dQ error (H=1 broadcast): {err_broadcast_dq:.2e}")
+    print(f"  dQ error (H={nheads} no broadcast): {err_no_broadcast_dq:.2e}")
+
+    assert err_broadcast_dq < 0.1, f"Broadcast dQ error too large: {err_broadcast_dq:.2e}"
+    assert err_no_broadcast_dq < 0.1, f"No-broadcast dQ error too large: {err_no_broadcast_dq:.2e}"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])
