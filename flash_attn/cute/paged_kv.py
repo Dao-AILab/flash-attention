@@ -177,7 +177,7 @@ class PagedKVManager(ParamsBase):
         )
         for m in cutlass.range_constexpr(cute.size(tXsX, mode=[1])):
             row_valid = tXc0X[0, m, 0][0] < seqlenk_row_limit
-            should_load = cute.make_fragment_like(tXsX[None, m, 0], cute.Boolean)
+            should_load = cute.make_fragment_like(tXsX[(0, None), m, 0], cute.Boolean)
             should_load.fill(row_valid)
 
             x_ptr_i64 = utils.shuffle_sync(
@@ -193,9 +193,14 @@ class PagedKVManager(ParamsBase):
 
             for k in cutlass.range_constexpr(cute.size(tXsX, mode=[2])):
                 ki = tXcX[0, 0, k][1] // self.async_copy_elems
+                mX_paged_cur_copy_ki = mX_paged_cur_copy[None, ki]
+                tXsX_k = tXsX[None, m, k]
+                mX_paged_cur_copy_ki = cute.make_tensor(
+                    mX_paged_cur_copy_ki.iterator, tXsX_k.layout
+                )
                 cute.copy(
                     self.gmem_tiled_copy_KV,
-                    mX_paged_cur_copy[None, ki],
-                    tXsX[None, m, k],
+                    mX_paged_cur_copy_ki,
+                    tXsX_k,
                     pred=should_load,
                 )
