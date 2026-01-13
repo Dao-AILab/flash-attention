@@ -625,7 +625,7 @@ class FlashAttentionForwardSm100:
             lpt=self.is_causal or self.is_local,
             is_split_kv=self.is_split_kv,
             num_splits_dynamic_ptr=num_splits_dynamic_ptr,
-            tile_count_semaphore=tile_count_semaphore.iterator,
+            tile_count_semaphore=tile_count_semaphore.iterator if tile_count_semaphore is not None else None,
         )
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
         self.tile_scheduler_cls = TileScheduler

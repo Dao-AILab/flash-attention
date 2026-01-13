@@ -927,6 +927,12 @@ class DynamicPersistentVarlenScheduler:
     ) -> "DynamicPersistentVarlenScheduler":
         tile_idx, _, _ = cute.arch.block_idx()
         
+        assert cute.size(work_info) == 4, "smem work info has wrong size"
+        assert work_info.element_type == Int32, "smem work info has wrong dtype"
+        
+        # We create consumer pipeline state internal to the class.
+        # The producer pipeline state is expected to be created
+        # externally and localized to the scheduler warp.
         pipeline_state = cutlass.pipeline.make_pipeline_state(
             cutlass.pipeline.PipelineUserType.Consumer, 1,
         )

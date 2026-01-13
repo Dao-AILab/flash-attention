@@ -296,7 +296,7 @@ class FlashAttentionForwardCombine:
                 cute.struct.MemRange[self.dtype_partial, cute.cosize(self.smem_layout_o)], 128
             ]
             sched_pipeline_array_ptr: cute.struct.MemRange[cutlass.Int64, 2]
-            tile_idx: cute.struct.MemRange[Int32, 1]
+            tile_idx: cute.struct.MemRange[Int32, 4]
 
         smem_size = SharedStorage.size_in_bytes()
 
@@ -418,7 +418,7 @@ class FlashAttentionForwardCombine:
         sO = storage.sO.get_tensor(smem_layout_o)
 
         if const_expr(self.dynamic_persistent):
-            tile_idx = storage.tile_idx.get_tensor((1, ))
+            tile_idx = storage.tile_idx.get_tensor((4, ))
             sched_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
             sched_pipeline_consumer_group = pipeline.CooperativeGroup(
                 pipeline.Agent.Thread, self.num_warps
@@ -436,7 +436,6 @@ class FlashAttentionForwardCombine:
             cutlass.pipeline.PipelineUserType.Producer, 1
         )
         TileSchedulerCls = partial(self.tile_scheduler_cls.create, tile_sched_params, tile_idx, sched_pipeline)
-        # tile_scheduler = TileSchedulerCls(init_pipeline_state=False)
         tile_scheduler = TileSchedulerCls()
 
         work_tile = tile_scheduler.initial_work_tile_info()
