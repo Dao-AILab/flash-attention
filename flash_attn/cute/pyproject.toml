@@ -22,11 +22,7 @@ classifiers = [
 ]
 
 dependencies = [
-<<<<<<< HEAD
     "nvidia-cutlass-dsl>=4.3.5,<4.4.0",
-=======
-    "nvidia-cutlass-dsl==4.3.3",
->>>>>>> 8691ea6 (fix const expr)
     "torch",
     "einops",
     "typing_extensions",
