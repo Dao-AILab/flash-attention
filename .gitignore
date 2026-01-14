@@ -32,26 +32,5 @@ var/
 # Dev
 venv
 
-# AMD
-scripts
-csrc/flash_attn_ck
-.eggs
-log
-*.rocprof*
-*.log
-core.*
-gpucore.*
-*.csv
-*.png
-*.html
-*.json
-*.txt
-*.pth
-*.md
-*.crt
-training/logs
-training/data
-# ck modules
-csrc/composable_kernel
-csrc/cutlass
-.amd
+# compile-time generated file
+flash_attn_config.py

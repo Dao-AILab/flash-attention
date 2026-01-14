@@ -154,7 +154,7 @@ To get started with the triton backend for AMD, follow the steps below.
 First install the torch for ROCm from https://pytorch.org/get-started/locally/ if it is not installed. The torch and triton will be installed.   
 
 ```
-pip install triton==3.3.0
+pip install triton==3.4.0
 ```
 Then install Flash Attention with the flag `FLASH_ATTENTION_TRITON_AMD_ENABLE` set to `"TRUE"`.
 
@@ -181,7 +181,7 @@ FROM rocm/pytorch:latest
 WORKDIR /workspace
 
 # install triton
-RUN pip install triton==3.3.0
+RUN pip install triton==3.4.0
 
 # build flash attention with triton backend
 RUN git clone https://github.com/Dao-AILab/flash-attention &&\ 
