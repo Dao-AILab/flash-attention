@@ -1222,7 +1222,6 @@ def test_flash_attn_combine(num_splits, seqlen, d, dtype):
     # pytorch_profiler(flash_attn_combine, out_partial, lse_partial)
     # pytorch_profiler(torch.sum, out_partial)
 
-@pytest.mark.xfail
 def test_flash3_bw_compatibility() -> None:
     # Let's try to always stay backward compatible! This will make life easier
     # for downstream libaries, users, and exported models.
@@ -1247,7 +1246,7 @@ def test_flash3_bw_compatibility() -> None:
         "Tensor? cu_seqlens_k=None, Tensor? seqused_q=None, Tensor? seqused_k=None, int? max_seqlen_q=None, "
         "int? max_seqlen_k=None, float? softmax_scale=None, bool is_causal=False, int window_size_left=-1, "
         "int window_size_right=-1, float softcap=0., bool deterministic=False, int sm_margin=0) "
-        "-> (Tensor(dq!), Tensor(dk!), Tensor(dv!), Tensor, Tensor, Tensor, Tensor, Tensor)"
+        "-> (Tensor, Tensor, Tensor, Tensor, Tensor)"
     ))
     assert torch.ops.flash_attn_3.fwd_combine.default._schema.is_backward_compatible_with(parse_schema(
         "flash_attn_3::fwd_combine(Tensor out_partial, Tensor lse_partial, Tensor(out!)? out=None, "
