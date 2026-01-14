@@ -141,12 +141,12 @@ These features are supported in Fwd and Bwd
 6) Dropout
 7) Rotary embeddings
 8) ALiBi
+9) Paged Attention
+10) FP8
 
 We are working on the following things
-1) Paged Attention 
-2) Sliding Window
-3) FP8
-4) Performance Improvements
+1) Sliding Window
+2) Performance Improvements
 
 ##### Getting Started
 To get started with the triton backend for AMD, follow the steps below.
@@ -154,7 +154,7 @@ To get started with the triton backend for AMD, follow the steps below.
 First install the torch for ROCm from https://pytorch.org/get-started/locally/ if it is not installed. The torch and triton will be installed.   
 
 ```
-pip install triton==3.4.0
+pip install triton==3.5.1
 ```
 Then install Flash Attention with the flag `FLASH_ATTENTION_TRITON_AMD_ENABLE` set to `"TRUE"`.
 
@@ -181,7 +181,7 @@ FROM rocm/pytorch:latest
 WORKDIR /workspace
 
 # install triton
-RUN pip install triton==3.4.0
+RUN pip install triton==3.5.1
 
 # build flash attention with triton backend
 RUN git clone https://github.com/Dao-AILab/flash-attention &&\ 
