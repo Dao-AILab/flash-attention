@@ -12,6 +12,7 @@ from .utils import (
     PHILOX_OFFSET,
     SHAPE_EXPECTATIONS,
     round_multiple,
+    tensor_stats,
 )
 
 
@@ -46,11 +47,11 @@ def fwd(
     if DEBUG:
         print()
         print("flash_attn_triton_amd.py::fwd inputs")
-        print("q:", q.shape)
-        print("k:", k.shape)
-        print("v:", v.shape)
-        print("out:", out.shape if out is not None else None)
-        print("alibi_slopes:", alibi_slopes)
+        print(tensor_stats("q", q))
+        print(tensor_stats("k", k))
+        print(tensor_stats("v", v))
+        print(tensor_stats("out", out))
+        print(tensor_stats("alibi_slopes", alibi_slopes))
         print("dropout_p:", dropout_p)
         print("softmax_scale:", softmax_scale)
         print("causal:", causal)
@@ -161,9 +162,9 @@ def fwd(
 
     if DEBUG:
         print("flash_attn_triton_amd.py::fwd outputs")
-        print("o:", out.shape if out is not None else None)
-        print("softmax_lse:", softmax_lse.shape if softmax_lse is not None else None)
-        print("sd_mask:", sd_mask.shape if sd_mask is not None else None)
+        print(tensor_stats("out", out))
+        print(tensor_stats("softmax_lse", softmax_lse))
+        print(tensor_stats("sd_mask", sd_mask))
         print("rng_state:", rng_state)
 
     # --- Assertions (shape + dtype contracts) ---
@@ -235,24 +236,22 @@ def bwd(
     if DEBUG:
         print()
         print("flash_attn_triton_amd.py::bwd inputs")
-        print("dout:", dout, dout.shape)
-        print("q:", q.shape)
-        print("k:", k.shape)
-        print("v:", v.shape)
-        print("out:", out.shape)
-        print("softmax_lse:", softmax_lse.shape)
-        print("dq:", dq.shape if dq is not None else None)
-        print("dk:", dk.shape if dk is not None else None)
-        print("dv:", dv.shape if dv is not None else None)
-        print("alibi_slopes:", alibi_slopes)
+        print(tensor_stats("dout", dout))
+        print(tensor_stats("q", q))
+        print(tensor_stats("k", k))
+        print(tensor_stats("v", v))
+        print(tensor_stats("out", out))
+        print(tensor_stats("softmax_lse", softmax_lse))
+        print(tensor_stats("dq", dq))
+        print(tensor_stats("dk", dk))
+        print(tensor_stats("dv", dv))
+        print(tensor_stats("alibi_slopes", alibi_slopes))
         print("dropout_p:", dropout_p)
-        print("out:", out)
         print("softmax_scale:", softmax_scale)
         print("causal:", causal)
         print("window_size_left:", window_size_left)
         print("window_size_right:", window_size_right)
         print("deterministic:", deterministic)
-        print("gen_:", gen_)
         print("rng_state:", rng_state)
 
     dq = torch.zeros_like(q) if dq is None else dq.zero_()
@@ -322,9 +321,9 @@ def bwd(
 
     if DEBUG:
         print("flash_attn_triton_amd.py::bwd outputs")
-        print("dv:", dv, dv.shape)
-        print("dk:", dk, dk.shape)
-        print("dq:", dq, dq.shape)
+        print(tensor_stats("dq", dq))
+        print(tensor_stats("dk", dk))
+        print(tensor_stats("dv", dv))
     # --- Assertions ---
     assert dq.shape == q.shape, f"[bwd] dq shape {dq.shape} != q shape {q.shape}"
     assert dk.shape == k.shape, f"[bwd] dk shape {dk.shape} != k shape {k.shape}"

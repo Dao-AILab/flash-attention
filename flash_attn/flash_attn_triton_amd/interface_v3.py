@@ -13,6 +13,7 @@ from .utils import (
     PHILOX_OFFSET,
     is_fp8,
     get_recommended_fp8_dtype,
+    tensor_stats,
 )
 
 
@@ -61,95 +62,29 @@ def fwd(
     if DEBUG:
         print()
         print("interface_fa_v3.py::fwd inputs")
-        print("q:", q.dtype if q is not None else None, q.shape)
-        print("k:", k.dtype if k is not None else None, k.shape)
-        print("v:", v.dtype if v is not None else None, v.shape)
-        print(
-            "k_new:",
-            k_new.dtype if k_new is not None else None,
-            k_new.shape if k_new is not None else None,
-        )
-        print(
-            "v_new:",
-            v_new.dtype if v_new is not None else None,
-            v_new.shape if v_new is not None else None,
-        )
-        print(
-            "qv:",
-            qv.dtype if qv is not None else None,
-            qv.shape if qv is not None else None,
-        )
-        print(
-            "out:",
-            out.dtype if out is not None else None,
-            out.shape if out is not None else None,
-        )
-        print(
-            "cu_seqlens_q:",
-            cu_seqlens_q,
-            cu_seqlens_q.shape if cu_seqlens_q is not None else None,
-        )
-        print(
-            "cu_seqlens_k:",
-            cu_seqlens_k,
-            cu_seqlens_k.shape if cu_seqlens_k is not None else None,
-        )
-        print(
-            "cu_seqlens_k_new:",
-            cu_seqlens_k_new,
-            cu_seqlens_k_new.shape if cu_seqlens_k_new is not None else None,
-        )
-        print(
-            "seqused_q:", seqused_q, seqused_q.shape if seqused_q is not None else None
-        )
-        print(
-            "seqused_k:", seqused_k, seqused_k.shape if seqused_k is not None else None
-        )
+        print(tensor_stats("q", q))
+        print(tensor_stats("k", k))
+        print(tensor_stats("v", v))
+        print(tensor_stats("k_new", k_new))
+        print(tensor_stats("v_new", v_new))
+        print(tensor_stats("qv", qv))
+        print(tensor_stats("out", out))
+        print(tensor_stats("cu_seqlens_q", cu_seqlens_q))
+        print(tensor_stats("cu_seqlens_k", cu_seqlens_k))
+        print(tensor_stats("cu_seqlens_k_new", cu_seqlens_k_new))
+        print(tensor_stats("seqused_q", seqused_q))
+        print(tensor_stats("seqused_k", seqused_k))
         print("max_seqlen_q:", max_seqlen_q)
         print("max_seqlen_k:", max_seqlen_k)
-        print(
-            "page_table:",
-            page_table,
-            page_table.shape if page_table is not None else None,
-        )
-        print(
-            "kv_batch_idx:",
-            kv_batch_idx,
-            kv_batch_idx.shape if kv_batch_idx is not None else None,
-        )
-        print(
-            "leftpad_k:", leftpad_k, leftpad_k.shape if leftpad_k is not None else None
-        )
-        print(
-            "rotary_cos:",
-            rotary_cos,
-            rotary_cos.shape if rotary_cos is not None else None,
-        )
-        print(
-            "rotary_sin:",
-            rotary_sin,
-            rotary_sin.shape if rotary_sin is not None else None,
-        )
-        print(
-            "seqlens_rotary:",
-            seqlens_rotary,
-            seqlens_rotary.shape if seqlens_rotary is not None else None,
-        )
-        print(
-            "q_descale:",
-            q_descale.dtype if q_descale is not None else None,
-            q_descale.shape if q_descale is not None else None,
-        )
-        print(
-            "k_descale:",
-            k_descale.dtype if k_descale is not None else None,
-            k_descale.shape if k_descale is not None else None,
-        )
-        print(
-            "v_descale:",
-            v_descale.dtype if v_descale is not None else None,
-            v_descale.shape if v_descale is not None else None,
-        )
+        print(tensor_stats("page_table", page_table))
+        print(tensor_stats("kv_batch_idx", kv_batch_idx))
+        print(tensor_stats("leftpad_k", leftpad_k))
+        print(tensor_stats("rotary_cos", rotary_cos))
+        print(tensor_stats("rotary_sin", rotary_sin))
+        print(tensor_stats("seqlens_rotary", seqlens_rotary))
+        print(tensor_stats("q_descale", q_descale))
+        print(tensor_stats("k_descale", k_descale))
+        print(tensor_stats("v_descale", v_descale))
         print("softmax_scale:", softmax_scale)
         print("causal:", causal)
         print("window_size_left:", window_size_left)
@@ -401,16 +336,8 @@ def fwd(
 
     if DEBUG:
         print("interface_fa_v3.py::fwd outputs")
-        print(
-            "out:",
-            out.dtype if out is not None else None,
-            out.shape if out is not None else None,
-        )
-        print(
-            "softmax_lse:",
-            softmax_lse.dtype if softmax_lse is not None else None,
-            softmax_lse.shape if softmax_lse is not None else None,
-        )
+        print(tensor_stats("out", out))
+        print(tensor_stats("softmax_lse", softmax_lse))
 
     # --- Assertions (FA3 always expects exact shapes) ---
     # out: same shape as q except last dim is v's head_dim
@@ -494,61 +421,19 @@ def bwd(
     if DEBUG:
         print()
         print("interface_fa_v3.py::bwd inputs")
-        print(
-            "dout:",
-            dout.dtype if dout is not None else None,
-            dout.shape if dout is not None else None,
-        )
-        print(
-            "q:", q.dtype if q is not None else None, q.shape if q is not None else None
-        )
-        print(
-            "k:", k.dtype if k is not None else None, k.shape if k is not None else None
-        )
-        print(
-            "v:", v.dtype if v is not None else None, v.shape if v is not None else None
-        )
-        print(
-            "out:",
-            out.dtype if out is not None else None,
-            out.shape if out is not None else None,
-        )
-        print(
-            "softmax_lse:",
-            softmax_lse.dtype if softmax_lse is not None else None,
-            softmax_lse.shape if softmax_lse is not None else None,
-        )
-        print(
-            "dq:",
-            dq.dtype if dq is not None else None,
-            dq.shape if dq is not None else None,
-        )
-        print(
-            "dk:",
-            dk.dtype if dk is not None else None,
-            dk.shape if dk is not None else None,
-        )
-        print(
-            "dv:",
-            dv.dtype if dv is not None else None,
-            dv.shape if dv is not None else None,
-        )
-        print(
-            "cu_seqlens_q:",
-            cu_seqlens_q,
-            cu_seqlens_q.shape if cu_seqlens_q is not None else None,
-        )
-        print(
-            "cu_seqlens_k:",
-            cu_seqlens_k,
-            cu_seqlens_k.shape if cu_seqlens_k is not None else None,
-        )
-        print(
-            "seqused_q:", seqused_q, seqused_q.shape if seqused_q is not None else None
-        )
-        print(
-            "seqused_k:", seqused_k, seqused_k.shape if seqused_k is not None else None
-        )
+        print(tensor_stats("dout", dout))
+        print(tensor_stats("q", q))
+        print(tensor_stats("k", k))
+        print(tensor_stats("v", v))
+        print(tensor_stats("out", out))
+        print(tensor_stats("softmax_lse", softmax_lse))
+        print(tensor_stats("dq", dq))
+        print(tensor_stats("dk", dk))
+        print(tensor_stats("dv", dv))
+        print(tensor_stats("cu_seqlens_q", cu_seqlens_q))
+        print(tensor_stats("cu_seqlens_k", cu_seqlens_k))
+        print(tensor_stats("seqused_q", seqused_q))
+        print(tensor_stats("seqused_k", seqused_k))
         print("max_seqlen_q:", max_seqlen_q)
         print("max_seqlen_k:", max_seqlen_k)
         print("softmax_scale:", softmax_scale)
@@ -637,26 +522,10 @@ def bwd(
 
     if DEBUG:
         print("interface_fa_v3.py::bwd outputs")
-        print(
-            "dq:",
-            dq.dtype if dq is not None else None,
-            dq.shape if dq is not None else None,
-        )
-        print(
-            "dk:",
-            dk.dtype if dk is not None else None,
-            dk.shape if dk is not None else None,
-        )
-        print(
-            "dv:",
-            dv.dtype if dv is not None else None,
-            dv.shape if dv is not None else None,
-        )
-        print(
-            "delta:",
-            delta.dtype if delta is not None else None,
-            delta.shape if delta is not None else None,
-        )
+        print(tensor_stats("dq", dq))
+        print(tensor_stats("dk", dk))
+        print(tensor_stats("dv", dv))
+        print(tensor_stats("delta", delta))
 
     # --- Assertions (FA3 always expects exact shapes) ---
     # Gradients should match input shapes

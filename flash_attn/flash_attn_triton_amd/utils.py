@@ -45,6 +45,19 @@ PHILOX_OFFSET = 0x1D4B49
 SHAPE_EXPECTATIONS: Literal["exact", "rounded"] = "exact"
 
 
+def tensor_stats(name: str, t: torch.Tensor) -> str:
+    """Return a string with tensor shape, dtype, and distribution stats for debugging."""
+    if t is None:
+        return f"{name}: None"
+    flat = t.float().flatten()
+    return (
+        f"{name}: shape={tuple(t.shape)}, dtype={t.dtype}, "
+        f"min={flat.min().item():.6g}, max={flat.max().item():.6g}, "
+        f"mean={flat.mean().item():.6g}, median={flat.median().item():.6g}, "
+        f"std={flat.std().item():.6g}"
+    )
+
+
 # -------------------------------
 # Input Helper
 # -------------------------------
