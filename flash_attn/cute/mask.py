@@ -329,6 +329,7 @@ class AttentionMask:
         head_idx: Int32 = None,
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
+        head_divmod=None,
         check_q_boundary: bool = False,
     ) -> None:
         assert not (mask_causal and mask_local), "mask_causal and mask_local cannot be both True"
@@ -371,9 +372,9 @@ class AttentionMask:
                 global_col = col_coord + n_block * self.tile_n
 
                 if const_expr(self.qhead_per_kvhead_packgqa != 1):
-                    head_offset = global_row % self.qhead_per_kvhead_packgqa
+                    assert head_divmod is not None
+                    mask_row, head_offset = divmod(global_row, head_divmod)
                     head_idx_for_mod = head_idx * self.qhead_per_kvhead_packgqa + head_offset
-                    mask_row = global_row // self.qhead_per_kvhead_packgqa
                 else:
                     head_idx_for_mod = head_idx
                     mask_row = global_row
