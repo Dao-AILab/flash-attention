@@ -317,7 +317,7 @@ class FlashAttentionForwardCombine:
         seqlen_divmod = FastDivmodDivisor(seqlen)
         head_divmod = FastDivmodDivisor(num_head)
 
-        if const_expr(cu_seqlens is not None or seqused is not None):
+        if const_expr(varlen):
             if const_expr(combine_semaphore is not None):
                 self.dynamic_persistent = True
                 TileScheduler = DynamicPersistentVarlenScheduler
@@ -333,7 +333,9 @@ class FlashAttentionForwardCombine:
             cute.ceil_div(self.head_dim, self.k_block_size),
             batch_size,
             1, 1, 1, 1,
-            total_q=mO_partial.shape[0] * num_head,
+            total_q=mO_partial.shape[0] * num_head
+            if const_expr(cu_seqlens is not None)
+            else seqlen * batch_size * num_head,
             tile_shape_mn=(self.m_block_size, self.m_block_size),
             mCuSeqlensQ=cu_seqlens,
             mSeqUsedQ=seqused,

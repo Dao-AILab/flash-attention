@@ -189,8 +189,10 @@ class FlashAttentionForwardSm100:
             self.epilogue_warp_ids = self.correction_warp_ids
         elif self.is_varlen_q: # fallback
             self.epilogue_warp_ids = (13, 14)
+            self.load_warp_ids = (15, )
 
-        self.scheduler_warp = 14
+        self.scheduler_warp = self.load_warp_ids[0]
+        # print("Scheduler warp = ", self.scheduler_warp)
 
         non_empty_warps_ids = set(
             (
@@ -202,8 +204,9 @@ class FlashAttentionForwardSm100:
             *self.epilogue_warp_ids,
             )
         )
-        # print("non_empty_warps_ids = ", non_empty_warps_ids)
         self.num_non_empty_warps = len(non_empty_warps_ids)
+        # print("non_empty_warps_ids = ", non_empty_warps_ids)
+        # print("num non_empty warps = ", self.num_non_empty_warps)
 
         self.tmem_s_offset = [0, self.n_block_size]  # e.g., 0, 128
         self.tmem_o_offset = [
@@ -724,6 +727,7 @@ class FlashAttentionForwardSm100:
         if cutlass.const_expr(self.use_block_sparsity and mPageTable is not None):
             raise NotImplementedError("Block sparsity + paged KV not supported on SM100")
 
+        # print("smem size = ", self.shared_storage.size_in_bytes())
         # Launch the kernel synchronously
         self.kernel(
             mQ,

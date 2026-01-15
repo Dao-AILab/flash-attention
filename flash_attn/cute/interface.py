@@ -31,6 +31,7 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+from cutlass.cute.runtime import from_dlpack
 
 
 if os.environ.get("CUTE_DSL_PTXAS_PATH", None) is not None:
@@ -125,8 +126,6 @@ def _flash_attn_fwd(
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
     aux_tensors: Optional[list[torch.Tensor]] = None,
-    max_seqlen_q: Optional[int] = None,
-    max_seqlen_k: Optional[int] = None,
     scheduler_metadata: Optional[SchedulerMetadataTensorsTorch] = None,
     disable_scheduler_metadata: bool = False
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -356,8 +355,8 @@ def _flash_attn_fwd(
         if scheduler_metadata is None and is_varlen and not disable_scheduler_metadata:
             scheduler_metadata = get_scheduler_metadata(
                 num_batch=batch_size,
-                max_seqlen_q=seqlen_q,
-                max_seqlen_k=seqlen_k,
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_k=max_seqlen_k,
                 nheads=num_head,
                 nheads_k=num_head_kv,
                 headdim=head_dim,
@@ -422,7 +421,7 @@ def _flash_attn_fwd(
             q_stage=q_stage,
         )
 
-    has_scheduler_metadata=scheduler_metadata is not None
+    has_scheduler_metadata=scheduler_metadata is not None and not disable_scheduler_metadata
     if has_scheduler_metadata:
         (
             num_m_blocks,
@@ -452,30 +451,14 @@ def _flash_attn_fwd(
         ), "these scheduler metadata tensors must have shape (batch_size, )"
         if tile_count_semaphore is not None:
             assert tile_count_semaphore.shape == (1, ), "semaphore has size 1"
-        # print("num_splits_dynamic = ", num_splits_dynamic)
-        num_m_blocks_cute, num_splits_dynamic_cute, varlen_batch_idx_cute, num_nheads_in_l2_cute = [
-            from_dlpack(t.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=t.ndim - 1)
-            if t is not None
-            else None
-            for t in (num_m_blocks, num_splits_dynamic, varlen_batch_idx, num_nheads_in_l2)
-        ]
-        tile_count_semaphore_cute = (
-            from_dlpack(tile_count_semaphore.detach(), assumed_align=4)
-            if tile_count_semaphore is not None
-            else None
-        )
+        # print("In interface: num_splits_dynamic = ", num_splits_dynamic)
+        
     else:
         num_m_blocks = None
         num_splits_dynamic = None
         varlen_batch_idx = None
         num_nheads_in_l2 = None
         tile_count_semaphore = None
-        num_m_blocks_cute = None
-        num_splits_dynamic_cute = None
-        varlen_batch_idx_cute = None
-        num_nheads_in_l2_cute = None
-        tile_count_semaphore_cute = None
-
 
     compile_key = (
         dtype,
@@ -536,6 +519,13 @@ def _flash_attn_fwd(
             lse_tensor = to_cute_tensor(lse, assumed_align=4)
         else:
             lse_tensor = None
+
+        if has_scheduler_metadata:
+            num_splits_dynamic_cute = to_cute_tensor(num_splits_dynamic, assumed_align=4)
+            tile_count_semaphore_cute = to_cute_tensor(tile_count_semaphore, assumed_align=4)
+        else:
+            num_splits_dynamic_cute = None
+            tile_count_semaphore_cute = None
 
         sparse_tensors = None
         if normalized_block_sparse_tensors is not None:
@@ -643,8 +633,8 @@ def _flash_attn_fwd(
         learnable_sink,
         normalized_block_sparse_tensors[:4] if normalized_block_sparse_tensors is not None else None,
         aux_tensors,
-        num_splits_dynamic_cute,
-        tile_count_semaphore_cute,
+        num_splits_dynamic,
+        tile_count_semaphore,
     )
     if is_split_kv:
         _flash_attn_fwd_combine(
@@ -1466,8 +1456,6 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         deterministic: bool = False,
         score_mod: Optional[Callable] = None,
         aux_tensors: Optional[list] = None,
-        max_seqlen_q: Optional[int] = None,
-        max_seqlen_k: Optional[int] = None,
         scheduler_metadata: Optional[SchedulerMetadataTensorsTorch] = None,
         disable_scheduler_metadata: bool = False
     ):
@@ -1492,8 +1480,6 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             pack_gqa=pack_gqa,
             score_mod=score_mod,
             aux_tensors=aux_tensors,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
             scheduler_metadata=scheduler_metadata,
             disable_scheduler_metadata=disable_scheduler_metadata,
         )
@@ -1596,8 +1582,6 @@ def flash_attn_varlen_func(
     deterministic: bool = False,
     score_mod: Optional[Callable] = None,
     aux_tensors: Optional[list] = None,
-    max_seqlen_q: Optional[int] = None,
-    max_seqlen_k: Optional[int] = None,
     scheduler_metadata: Optional[SchedulerMetadataTensorsTorch] = None,
     disable_scheduler_metadata: bool = False
 ):
@@ -1622,8 +1606,6 @@ def flash_attn_varlen_func(
         deterministic,
         score_mod,
         aux_tensors,
-        max_seqlen_q,
-        max_seqlen_k,
         scheduler_metadata,
         disable_scheduler_metadata,
     )
@@ -1636,7 +1618,7 @@ def _flash_attn_fwd_combine(
     lse: Optional[torch.Tensor] = None,
     cu_seqlens: Optional[torch.Tensor] = None,
     seqused: Optional[torch.Tensor] = None,
-    num_splits_dynamic_ptr: Optional[torch.Tensor] = None,
+    num_splits_dynamic: Optional[torch.Tensor] = None,
     semaphore_to_reset: Optional[torch.Tensor] = None,
     max_seqlen_q: Optional[int] = None,
     use_combine_semaphore: bool = False,
@@ -1656,7 +1638,7 @@ def _flash_attn_fwd_combine(
         lse: Output LSE tensor (batch, seqlen, nheads) or (total_q, nheads) if there's cu_seqlens.
         cu_seqlens: Cumulative sequence lengths for variable length sequences
         seqused: Used sequence lengths for each batch
-        num_splits_dynamic_ptr: Dynamic number of splits per batch
+        num_splits_dynamic: Dynamic number of splits per batch
         semaphore_to_reset: Semaphore for synchronization
         max_seqlen_q: Maximum seqlen_q for any batch, used if there's cu_seqlens.
 
@@ -1688,7 +1670,7 @@ def _flash_attn_fwd_combine(
     for t, name in [
         (cu_seqlens, "cu_seqlens"),
         (seqused, "seqused"),
-        (num_splits_dynamic_ptr, "num_splits_dynamic_ptr"),
+        (num_splits_dynamic, "num_splits_dynamic"),
     ]:
         if t is not None:
             assert t.dtype == torch.int32, f"{name} must be int32"
@@ -1711,36 +1693,10 @@ def _flash_attn_fwd_combine(
         # TODO: we can deal w this by using 128 threads instead
         log_max_splits = max(log_max_splits, 5)
 
-    # Convert to cute tensors (using kernel-formatted tensors)
-    out_partial_tensor = from_dlpack(out_partial.detach(), assumed_align=16).mark_layout_dynamic(
-        leading_dim=4 if not is_varlen else 3
-    )
-    lse_partial_tensor = from_dlpack(lse_partial.detach(), assumed_align=4).mark_layout_dynamic(
-        leading_dim=lse_partial.ndim - 2
-    )
-    out_tensor = from_dlpack(out.detach(), assumed_align=16).mark_layout_dynamic(leading_dim=3 if not is_varlen else 2)
-    lse_tensor = (
-        from_dlpack(lse.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=lse.ndim - 2)
-        if lse is not None
-        else None
-    )
-
-    optional_tensors = [
-        from_dlpack(t.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=0)
-        if t is not None
-        else None
-        for t in (cu_seqlens, seqused, num_splits_dynamic_ptr, semaphore_to_reset)
-    ]
-    cu_seqlens_tensor, seqused_tensor, num_splits_dynamic_tensor, semaphore_tensor = (
-        optional_tensors
-    )
-
     if use_combine_semaphore:
         combine_semaphore = torch.zeros(1, dtype=torch.int32, device="cuda")
-        combine_semaphore_tensor = from_dlpack(combine_semaphore.detach(), assumed_align=4).mark_layout_dynamic(leading_dim=0)
     else:
         combine_semaphore = None
-        combine_semaphore_tensor = None
 
     if current_stream is None:
         current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
@@ -1760,7 +1716,7 @@ def _flash_attn_fwd_combine(
         cu_seqlens is not None,
         seqused is not None,
         lse is not None,
-        num_splits_dynamic_ptr is not None,
+        num_splits_dynamic is not None,
         semaphore_to_reset is not None,
         max_seqlen_q is not None,
         combine_semaphore is not None,
@@ -1784,9 +1740,9 @@ def _flash_attn_fwd_combine(
             to_cute_tensor(t, assumed_align=4, leading_dim=0)
             if t is not None
             else None
-            for t in (cu_seqlens, seqused, num_splits_dynamic_ptr, semaphore_to_reset)
+            for t in (cu_seqlens, seqused, num_splits_dynamic, semaphore_to_reset, combine_semaphore)
         ]
-        cu_seqlens_tensor, seqused_tensor, num_splits_dynamic_tensor, semaphore_tensor = (
+        cu_seqlens_tensor, seqused_tensor, num_splits_dynamic_tensor, semaphore_tensor, combine_semaphore_tensor = (
             optional_tensors
         )
         fa_combine = FlashAttentionForwardCombine(
@@ -1835,10 +1791,10 @@ def _flash_attn_fwd_combine(
         lse,
         cu_seqlens,
         seqused,
-        num_splits_dynamic_ptr,
+        num_splits_dynamic,
         semaphore_to_reset,
         max_seqlen_q,
-        combine_semaphore_tensor,
+        combine_semaphore,
         current_stream,
     )
 
