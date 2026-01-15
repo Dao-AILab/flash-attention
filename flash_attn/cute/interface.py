@@ -48,6 +48,7 @@ from flash_attn.cute.block_sparsity import (
     normalize_block_sparse_tensors,
     get_block_sparse_expected_shapes,
     get_block_sparse_expected_shapes_bwd,
+    get_block_sparse_broadcast_pattern,
 )
 
 @lru_cache(maxsize=None)
@@ -340,6 +341,25 @@ def _flash_attn_fwd(
                 "Block sparsity is not yet supported with SplitKV. TODO: partition sparse block lists per split."
             )
 
+    # See get_broadcast_dims for why this is needed in compile key
+    block_sparse_broadcast_pattern = None
+    normalized_block_sparse_tensors = None
+    if block_sparse_tensors is not None:
+        if seqlen_q is None:
+            raise ValueError("Block sparsity requires fixed-length sequences (seqlen_q must be known).")
+        expected_count_shape, expected_index_shape = get_block_sparse_expected_shapes(
+            batch_size, num_head, seqlen_q, seqlen_k,
+            m_block_size, n_block_size, q_stage,
+        )
+        normalized_block_sparse_tensors = normalize_block_sparse_tensors(
+            block_sparse_tensors,
+            expected_count_shape=expected_count_shape,
+            expected_index_shape=expected_index_shape,
+        )
+        block_sparse_broadcast_pattern = get_block_sparse_broadcast_pattern(
+            normalized_block_sparse_tensors
+        )
+
     compile_key = (
         dtype,
         head_dim,
@@ -349,6 +369,7 @@ def _flash_attn_fwd(
         score_mod_hash,
         mask_mod_hash,
         use_block_sparsity,
+        block_sparse_broadcast_pattern,
         len(aux_tensors) if aux_tensors is not None else 0,
         lse is None,
         cu_seqlens_q is None,
@@ -397,19 +418,8 @@ def _flash_attn_fwd(
             lse_tensor = None
 
         sparse_tensors = None
-        if block_sparse_tensors is not None:
-            if seqlen_q is None:
-                raise ValueError("Block sparsity requires fixed-length sequences (seqlen_q must be known).")
-            expected_count_shape, expected_index_shape = get_block_sparse_expected_shapes(
-                batch_size, num_head, seqlen_q, seqlen_k,
-                m_block_size, n_block_size, q_stage,
-            )
-            compile_time_normalized = normalize_block_sparse_tensors(
-                block_sparse_tensors,
-                expected_count_shape=expected_count_shape,
-                expected_index_shape=expected_index_shape,
-            )
-            sparse_tensors = to_cute_block_sparse_tensors(compile_time_normalized)
+        if normalized_block_sparse_tensors is not None:
+            sparse_tensors = to_cute_block_sparse_tensors(normalized_block_sparse_tensors)
 
         cute_aux_tensors = None
         if aux_tensors is not None:
@@ -490,18 +500,6 @@ def _flash_attn_fwd(
             options="--enable-tvm-ffi",
         )
 
-    # Expand block sparse tensors to match actual head count (may be broadcast from 1)
-    normalized_block_sparse_tensors = None
-    if block_sparse_tensors is not None:
-        expected_count_shape, expected_index_shape = get_block_sparse_expected_shapes(
-            batch_size, num_head, seqlen_q, seqlen_k,
-            m_block_size, n_block_size, q_stage,
-        )
-        normalized_block_sparse_tensors = normalize_block_sparse_tensors(
-            block_sparse_tensors,
-            expected_count_shape=expected_count_shape,
-            expected_index_shape=expected_index_shape,
-        )
     _flash_attn_fwd.compile_cache[compile_key](
         q,
         k,
@@ -880,6 +878,28 @@ def _flash_attn_bwd(
     if aux_tensors is not None:
         cute_aux_tensors = [to_cute_tensor(buf, assumed_align=None, fully_dynamic=True) for buf in aux_tensors]
 
+    block_sparse_broadcast_pattern = None
+    normalized_block_sparse_tensors = None
+    if block_sparse_tensors is not None:
+        expected_count_shape, expected_index_shape = get_block_sparse_expected_shapes_bwd(
+            batch_size, num_head, seqlen_q, seqlen_k,
+            m_block_size, n_block_size, subtile_factor,
+        )
+        normalized_block_sparse_tensors = normalize_block_sparse_tensors(
+            block_sparse_tensors,
+            expected_count_shape=expected_count_shape,
+            expected_index_shape=expected_index_shape,
+            context="_flash_attn_bwd",
+            hint=lambda: (
+                f"Backward expects Q-direction block-sparse tensors (q_mask_cnt/q_mask_idx, and optionally full_q_cnt/full_q_idx). "
+                f"Regenerate the backward BlockMask with BLOCK_SIZE=({sparse_block_size_q}, {n_block_size}) "
+                f"(sparse_block_size_q={sparse_block_size_q})."
+            ),
+        )
+        block_sparse_broadcast_pattern = get_block_sparse_broadcast_pattern(
+            normalized_block_sparse_tensors
+        )
+
     if compute_capability == 9:
         compile_key = (
             compute_capability,
@@ -911,6 +931,7 @@ def _flash_attn_bwd(
             mask_mod_hash,
             num_aux_tensors,
             use_block_sparsity,
+            block_sparse_broadcast_pattern,
         )
     else:
         compile_key = (
@@ -934,10 +955,11 @@ def _flash_attn_bwd(
             mask_mod_hash,
             num_aux_tensors,
             use_block_sparsity,
+            block_sparse_broadcast_pattern,
             cu_seqlens_q is None,
             cu_seqlens_k is None,
             seqused_q is None,
-            seqused_k is None,  
+            seqused_k is None,
         )
     if compile_key not in _flash_attn_bwd.compile_cache:
         q_tensor, k_tensor, v_tensor, do_tensor, dq_tensor, dk_tensor, dv_tensor = [
@@ -1027,23 +1049,8 @@ def _flash_attn_bwd(
         # Block sparse tensors for backward use Q-direction indexing (transposed from forward).
         # sparse_block_size_q = subtile_factor * tile_m matches BlockMask granularity.
         sparse_tensors_compile = None
-        if block_sparse_tensors is not None:
-            expected_count_shape, expected_index_shape = get_block_sparse_expected_shapes_bwd(
-                batch_size, num_head, seqlen_q, seqlen_k,
-                m_block_size, n_block_size, subtile_factor,
-            )
-            compile_time_normalized = normalize_block_sparse_tensors(
-                block_sparse_tensors,
-                expected_count_shape=expected_count_shape,
-                expected_index_shape=expected_index_shape,
-                context="_flash_attn_bwd",
-                hint=lambda: (
-                    f"Backward expects Q-direction block-sparse tensors (q_mask_cnt/q_mask_idx, and optionally full_q_cnt/full_q_idx). "
-                    f"Regenerate the backward BlockMask with BLOCK_SIZE=({sparse_block_size_q}, {n_block_size}) "
-                    f"(sparse_block_size_q={sparse_block_size_q})."
-                ),
-            )
-            sparse_tensors_compile = to_cute_block_sparse_tensors(compile_time_normalized)
+        if normalized_block_sparse_tensors is not None:
+            sparse_tensors_compile = to_cute_block_sparse_tensors(normalized_block_sparse_tensors)
 
         # TODO: check @can_implement
         _flash_attn_bwd.compile_cache[compile_key] = cute.compile(
@@ -1073,25 +1080,6 @@ def _flash_attn_bwd(
             sparse_tensors_compile,
             options="--enable-tvm-ffi",
         )
-    # Runtime normalization of block sparse tensors for both SM90 and SM100
-    normalized_block_sparse_tensors = None
-    if block_sparse_tensors is not None:
-        expected_count_shape, expected_index_shape = get_block_sparse_expected_shapes_bwd(
-            batch_size, num_head, seqlen_q, seqlen_k,
-            m_block_size, n_block_size, subtile_factor,
-        )
-        normalized_block_sparse_tensors = normalize_block_sparse_tensors(
-            block_sparse_tensors,
-            expected_count_shape=expected_count_shape,
-            expected_index_shape=expected_index_shape,
-            context="_flash_attn_bwd",
-            hint=lambda: (
-                f"Backward expects Q-direction block-sparse tensors (q_mask_cnt/q_mask_idx, and optionally full_q_cnt/full_q_idx). "
-                f"Regenerate the backward BlockMask with BLOCK_SIZE=({sparse_block_size_q}, {n_block_size}) "
-                f"(sparse_block_size_q={sparse_block_size_q})."
-            ),
-        )
-
     _flash_attn_bwd.compile_cache[compile_key](
         q,
         k,

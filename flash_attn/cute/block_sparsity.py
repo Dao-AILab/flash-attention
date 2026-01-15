@@ -7,7 +7,7 @@ from typing import Callable, NamedTuple, Tuple
 import cutlass.cute as cute
 import torch
 
-from flash_attn.cute.cute_dsl_utils import to_cute_tensor
+from flash_attn.cute.cute_dsl_utils import get_broadcast_dims, to_cute_tensor
 
 
 def ceildiv(a: int, b: int) -> int:
@@ -172,6 +172,38 @@ def normalize_block_sparse_tensors(
 
 def is_block_sparsity_enabled(tensors: BlockSparseTensorsTorch) -> bool:
     return any(t is not None for t in (tensors.full_block_cnt, tensors.mask_block_cnt))
+
+
+def get_block_sparse_broadcast_pattern(
+    tensors: BlockSparseTensorsTorch,
+) -> Tuple[Tuple[bool, ...], ...] | None:
+    """Return broadcast pattern for block sparse tensors by checking actual strides.
+
+    Returns a tuple of broadcast patterns (one per tensor) where each pattern
+    is a tuple of bools indicating which dims have stride=0.
+    This is used in compile keys to ensure kernels are recompiled when
+    broadcast patterns change, since CuTe's mark_layout_dynamic() keeps
+    stride=0 as static.
+
+    The tensors should already be expanded/normalized before calling this function.
+
+    Returns None if block sparsity is not enabled.
+    """
+    if not is_block_sparsity_enabled(tensors):
+        return None
+
+    patterns = []
+    for tensor in (
+        tensors.mask_block_cnt,
+        tensors.mask_block_idx,
+        tensors.full_block_cnt,
+        tensors.full_block_idx,
+    ):
+        if tensor is not None:
+            patterns.append(get_broadcast_dims(tensor))
+        else:
+            patterns.append(None)
+    return tuple(patterns)
 
 
 def to_cute_block_sparse_tensors(
