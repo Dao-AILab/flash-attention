@@ -1,0 +1,23 @@
+### headdim = 128, causal = False, seqlen = 8192, batch_size = 4, nheads = 16, nheads_kv = 16, window=symmetric(512,512), varlen = False, deterministic = False ###
+FA Python fwd: 0.283ms, 941.6 TFLOPS
+
+### headdim = 128, causal = False, seqlen = 8192, batch_size = 4, nheads = 16, nheads_kv = 16, window=symmetric(1024,1024), varlen = False, deterministic = False ###
+FA Python fwd: 0.428ms, 1204.3 TFLOPS
+
+### headdim = 128, causal = False, seqlen = 8192, batch_size = 4, nheads = 16, nheads_kv = 16, window=symmetric(2048,2048), varlen = False, deterministic = False ###
+FA Python fwd: 0.711ms, 1354.1 TFLOPS
+
+### headdim = 128, causal = False, seqlen = 8192, batch_size = 4, nheads = 16, nheads_kv = 16, window=symmetric(4096,4096), varlen = False, deterministic = False ###
+FA Python fwd: 1.133ms, 1455.6 TFLOPS
+
+### headdim = 128, causal = False, seqlen = 8192, batch_size = 4, nheads = 16, nheads_kv = 16, window=left(512,0), varlen = False, deterministic = False ###
+FA Python fwd: 0.208ms, 642.5 TFLOPS
+
+### headdim = 128, causal = False, seqlen = 8192, batch_size = 4, nheads = 16, nheads_kv = 16, window=left(1024,0), varlen = False, deterministic = False ###
+FA Python fwd: 0.277ms, 932.9 TFLOPS
+
+### headdim = 128, causal = False, seqlen = 8192, batch_size = 4, nheads = 16, nheads_kv = 16, window=left(2048,0), varlen = False, deterministic = False ###
+FA Python fwd: 0.403ms, 1195.5 TFLOPS
+
+### headdim = 128, causal = False, seqlen = 8192, batch_size = 4, nheads = 16, nheads_kv = 16, window=left(4096,0), varlen = False, deterministic = False ###
+FA Python fwd: 0.621ms, 1327.8 TFLOPS
