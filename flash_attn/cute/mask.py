@@ -71,7 +71,7 @@ def mask_r2p_transposed(X: cute.Tensor, row_limit_top: Int32, num_rep: int) -> N
 @cute.jit
 def mask_r2p_dual_bound(
     X: cute.Tensor,
-    col_limit_left: Int32,   # Inclusive lower bound
+    col_limit_left: Int32,  # Inclusive lower bound
     col_limit_right: Int32,  # Exclusive upper bound
 ) -> None:
     """
