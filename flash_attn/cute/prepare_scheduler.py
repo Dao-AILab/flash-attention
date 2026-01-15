@@ -79,8 +79,8 @@ class FlashPrepareScheduler:
     @cute.jit
     def __call__(
         self,
-        seqlen_q_static: Optional[int],
-        seqlen_k_static: Optional[int],
+        seqlen_q_static: int,
+        seqlen_k_static: int,
         seqlen_k_new_static: int,
         mCuSeqlensQ: Optional[cute.Tensor],
         mCuSeqlensK: Optional[cute.Tensor],
@@ -89,7 +89,6 @@ class FlashPrepareScheduler:
         mSeqUsedK: Optional[cute.Tensor],
         mLeftPadK: Optional[cute.Tensor],
         num_batch: int,
-        num_sm: int,
         num_splits_static: int,
         tile_count_semaphore: Optional[cute.Tensor],
         num_m_blocks_ptr: Optional[cute.Tensor],
@@ -110,6 +109,9 @@ class FlashPrepareScheduler:
 
         block = (32 * self.num_warps, 1, 1)
         grid = self.get_grid_shape(num_batch)
+
+        hardware_info = cutlass.utils.HardwareInfo()
+        num_sm = hardware_info.get_device_multiprocessor_count()
 
         self.kernel(
             seqlen_q_static,
@@ -142,8 +144,8 @@ class FlashPrepareScheduler:
     @cute.kernel
     def kernel(
         self,
-        seqlen_q_static: Optional[Int32],
-        seqlen_k_static: Optional[Int32],
+        seqlen_q_static: Int32,
+        seqlen_k_static: Int32,
         seqlen_k_new_static: Int32,
         mCuSeqlensQ: Optional[cute.Tensor],
         mCuSeqlensK: Optional[cute.Tensor],
@@ -270,7 +272,7 @@ class FlashPrepareScheduler:
         batch_idx: Int32,
         mSeqUsedQ: Optional[cute.Tensor],
         mCuSeqlensQ: Optional[cute.Tensor],
-        seqlen_q_static: Optional[Int32],
+        seqlen_q_static: Int32,
         tile_m_divmod: FastDivmodDivisor,
         num_batch: Int32
     ):
@@ -287,7 +289,6 @@ class FlashPrepareScheduler:
             next_cu_seqlen = cute.arch.shuffle_sync_down(cur_cu_seqlen, offset=1)
             seqlen = next_cu_seqlen - cur_cu_seqlen
         else:
-            assert seqlen_q_static is not None
             seqlen = seqlen_q_static
 
         seqlen_for_blocks = seqlen
@@ -308,7 +309,7 @@ class FlashPrepareScheduler:
         mSeqUsedK: Optional[cute.Tensor],
         mCuSeqlensK: Optional[cute.Tensor],
         mCuSeqlensKNew: Optional[cute.Tensor],
-        seqlen_k_static: Optional[Int32],
+        seqlen_k_static: Int32,
         seqlen_k_new_static: Int32,
         mLeftPadK: Optional[cute.Tensor],
         tile_n_divmod: FastDivmodDivisor,
@@ -332,7 +333,6 @@ class FlashPrepareScheduler:
             next_cu_seqlen = cute.arch.shuffle_sync_down(cur_cu_seqlen, offset=1)
             seqlen = next_cu_seqlen - cur_cu_seqlen
         else:
-            assert seqlen_k_static is not None
             seqlen = seqlen_k_static
 
         seqlen_new = Int32(0)
@@ -376,173 +376,3 @@ class FlashPrepareScheduler:
         if const_expr(not self.packgqa):
             nheads_in_l2 *= qhead_per_khead
         return cutlass.min(nheads_in_l2, self.nheads_computed)
-
-
-def prepare_varlen_num_blocks(
-    num_batch: int,
-    seqlen_q_static: Optional[int],
-    seqlen_k_static: Optional[int],
-    nheads: int,
-    nheads_k: int,
-    headdim: int,
-    headdim_v: int,
-    num_splits: int,
-    tile_m: int,
-    tile_n: int,
-    num_sm: int,
-    packgqa: bool,
-    is_causal: bool,
-    enable_pdl: bool,
-    sort: bool,
-    seqlen_k_new: int,
-    stream: cuda.CUstream,
-    mCuSeqlensQ: Optional[cute.Tensor] = None,
-    mCuSeqlensK: Optional[cute.Tensor] = None,
-    mCuSeqlensKNew: Optional[cute.Tensor] = None,
-    mSeqUsedQ: Optional[cute.Tensor] = None,
-    mSeqUsedK: Optional[cute.Tensor] = None,
-    mLeftPadK: Optional[cute.Tensor] = None,
-    num_m_blocks_ptr: Optional[cute.Tensor] = None,
-    num_splits_dynamic_ptr: Optional[cute.Tensor] = None,
-    varlen_batch_idx_ptr: Optional[cute.Tensor] = None,
-    num_nheads_in_l2_ptr: Optional[cute.Tensor] = None,
-    tile_count_semaphore: Optional[cute.Tensor] = None,
-    seqlen_k_per_split: Optional[int] = None,
-):
-    """
-    Prepare scheduler metadata for varlen sequences with dynamic num splits.
-
-    This function computes metadata needed for variable-length sequence scheduling,
-    including dynamic number of splits per batch, prepared sequence lengths, and
-    number of heads that fit in L2 cache.
-
-    Args:
-        num_batch: Number of batches
-        seqlen_q_static: Static sequence length for Q
-        seqlen_k_static: Static sequence length for K
-        nheads: Number of query heads
-        nheads_k: Number of key/value heads
-        headdim: Head dimension
-        headdim_v: Value head dimension
-        num_splits: Static maximum number of splits
-        tile_m: M tile size
-        tile_n: N tile size
-        num_sm: Number of SMs on the device
-        packgqa: Whether to use packgqa
-        is_causal: Whether attention is causal
-        enable_pdl: Whether to enable PDL (not supported yet)
-        sort: Whether to sort batches
-        seqlen_k_new: Static new sequence length for K
-        mCuSeqlensQ: Cumulative sequence lengths for Q (shape: [batch_size + 1])
-        mCuSeqlensK: Cumulative sequence lengths for K (shape: [batch_size + 1])
-        mCuSeqlensKNew: Cumulative sequence lengths for new K (shape: [batch_size + 1])
-        mSeqUsedQ: Used sequence lengths for Q (shape: [batch_size])
-        mSeqUsedK: Used sequence lengths for K (shape: [batch_size])
-        mLeftPadK: Left padding for K (shape: [batch_size])
-        num_m_blocks_ptr: Output tensor for number of m blocks (shape: [batch_size])
-        num_splits_dynamic_ptr: Output tensor for dynamic number of splits (shape: [batch_size])
-        varlen_batch_idx_ptr: Output tensor for varlen batch indices (shape: [batch_size])
-        num_nheads_in_l2_ptr: Output tensor for number of heads in L2 (shape: [batch_size])
-        tile_count_semaphore: Semaphore for tile counting (shape: [1])
-        stream: CUDA stream
-    """
-
-    # Compute num_warps based on num_batch (capped at 32)
-    num_warps = min((num_batch + 30) // 31, 32)
-    # Round up to nearest power of 2
-    num_warps = 1 << (num_warps - 1).bit_length()
-
-    if seqlen_k_per_split is not None:
-        assert seqlen_k_per_split % tile_n == 0, "seqlen per split must be divisible by tile_n"
-        n_blocks_per_split = seqlen_k_per_split // tile_n
-    else:
-        n_blocks_per_split = None
-
-    cache_key = (
-        num_warps,
-        tile_m,
-        tile_n,
-        nheads,
-        nheads_k,
-        headdim,
-        headdim_v,
-        is_causal,
-        packgqa,
-        sort,
-        mCuSeqlensQ is not None,
-        mCuSeqlensK is not None,
-        mCuSeqlensKNew is not None,
-        mSeqUsedQ is not None,
-        mSeqUsedK is not None,
-        mLeftPadK is not None,
-        num_m_blocks_ptr is not None,
-        num_splits_dynamic_ptr is not None,
-        varlen_batch_idx_ptr is not None,
-        num_nheads_in_l2_ptr is not None,
-        tile_count_semaphore is not None,
-        seqlen_q_static is not None,
-        seqlen_k_static is not None,
-        n_blocks_per_split is not None
-    )
-
-    if cache_key not in prepare_varlen_num_blocks.compile_cache:
-        # print("Compiling for cache key", cache_key)
-        scheduler = FlashPrepareScheduler(
-            num_warps,
-            tile_m,
-            tile_n,
-            nheads,
-            nheads_k,
-            headdim,
-            headdim_v,
-            is_causal,
-            packgqa=packgqa,
-            sort=sort,
-        )
-        prepare_varlen_num_blocks.compile_cache[cache_key] = cute.compile(
-            scheduler,
-            seqlen_q_static,
-            seqlen_k_static,
-            seqlen_k_new,
-            mCuSeqlensQ,
-            mCuSeqlensK,
-            mCuSeqlensKNew,
-            mSeqUsedQ,
-            mSeqUsedK,
-            mLeftPadK,
-            num_batch,
-            num_sm,
-            num_splits,
-            tile_count_semaphore,
-            num_m_blocks_ptr,
-            num_splits_dynamic_ptr,
-            varlen_batch_idx_ptr,
-            num_nheads_in_l2_ptr,
-            n_blocks_per_split,
-            stream,
-        )
-
-    prepare_varlen_num_blocks.compile_cache[cache_key](
-        seqlen_q_static,
-        seqlen_k_static,
-        seqlen_k_new,
-        mCuSeqlensQ,
-        mCuSeqlensK,
-        mCuSeqlensKNew,
-        mSeqUsedQ,
-        mSeqUsedK,
-        mLeftPadK,
-        num_batch,
-        num_sm,
-        num_splits,
-        tile_count_semaphore,
-        num_m_blocks_ptr,
-        num_splits_dynamic_ptr,
-        varlen_batch_idx_ptr,
-        num_nheads_in_l2_ptr,
-        n_blocks_per_split,
-        stream,
-    )
-
-
-prepare_varlen_num_blocks.compile_cache = {}
