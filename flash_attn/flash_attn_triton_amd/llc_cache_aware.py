@@ -26,10 +26,15 @@ import torch
 # Note: This is the L3/Infinity Cache, NOT the L2 cache
 # RDNA3: L2=6MB, Infinity Cache (LLC)=96MB
 AMD_LLC_CACHE_SIZES: Dict[str, int] = {
+    # RDNA2
+    "gfx1030": 128 * 1024 * 1024,  # RX 6900 XT - 128 MB Infinity Cache
     # RDNA3 consumer
     "gfx1100": 96 * 1024 * 1024,   # RX 7900 XTX/XT - 96 MB Infinity Cache
     "gfx1101": 64 * 1024 * 1024,   # RX 7800 XT - 64 MB Infinity Cache
     "gfx1102": 32 * 1024 * 1024,   # RX 7600 - 32 MB Infinity Cache
+    # RDNA4
+    "gfx1200": 64 * 1024 * 1024,   # RX 9070 XT - 64 MB Infinity Cache
+    "gfx1201": 32 * 1024 * 1024,   # RX 9070 - 32 MB Infinity Cache
 }
 
 # Legacy alias for backwards compatibility
@@ -77,9 +82,15 @@ def get_num_cus(device_index: int = 0) -> int:
     
     # Known CU counts for common GPUs
     known_cus = {
+        # RDNA2
+        "gfx1030": 80,   # RX 6900 XT
+        # RDNA3
         "gfx1100": 96,   # RX 7900 XTX
         "gfx1101": 60,   # RX 7800 XT  
         "gfx1102": 32,   # RX 7600
+        # RDNA4
+        "gfx1200": 56,   # RX 9070 XT
+        "gfx1201": 42,   # RX 9070
     }
     
     if arch in known_cus:
