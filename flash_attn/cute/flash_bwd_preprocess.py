@@ -281,8 +281,8 @@ class FlashAttentionBackwardPreprocess:
                 if tidx < seqlen_q - m_block * self.m_block_size:
                     lse = gLSE[tidx]
 
-            tOrO = cute.make_fragment_like(tOgO)
-            tOrdO = cute.make_fragment_like(tOgdO)
+            tOrO = cute.make_rmem_tensor_like(tOgO)
+            tOrdO = cute.make_rmem_tensor_like(tOgdO)
             assert cute.size(tOgO, mode=[0]) == cute.size(tOgdO, mode=[0])
             assert cute.size(tOgO, mode=[1]) == cute.size(tOgdO, mode=[1])
             assert cute.size(tOgO, mode=[2]) == cute.size(tOgdO, mode=[2])
@@ -313,7 +313,7 @@ class FlashAttentionBackwardPreprocess:
             threads_per_row = gmem_tiled_copy_O.layout_src_tv_tiled[0].shape[0]
             assert cute.arch.WARP_SIZE % threads_per_row == 0
             dpsum = utils.warp_reduce(dpsum, operator.add, width=threads_per_row)
-            dP_sum = cute.make_fragment(cute.size(tOrO, mode=[1]), Float32)
+            dP_sum = cute.make_rmem_tensor(cute.size(tOrO, mode=[1]), Float32)
             dP_sum.store(dpsum)
 
             # Write dPsum from rmem -> gmem
@@ -349,7 +349,7 @@ class FlashAttentionBackwardPreprocess:
                 gdQaccum = cute.local_tile(mdQaccum_cur, blkdQaccum_shape, (m_block,))
                 gmem_thr_copy_dQaccum = gmem_tiled_copy_dQaccum.get_slice(tidx)
                 tdQgdQaccum = gmem_thr_copy_dQaccum.partition_S(gdQaccum)
-                zero = cute.make_fragment_like(tdQgdQaccum)
+                zero = cute.make_rmem_tensor_like(tdQgdQaccum)
                 zero.fill(0.0)
                 cute.copy(gmem_tiled_copy_dQaccum, zero, tdQgdQaccum)
 

@@ -153,7 +153,7 @@ class PagedKVManager(ParamsBase):
         seqlenk_row_limit = self.seqlen_k - n_block * self.n_block_size if n_block >= 0 else 0
         for m in cutlass.range_constexpr(cute.size(tXsX, mode=[1])):
             row_valid = tXcX[0, m, 0][0] < seqlenk_row_limit
-            should_load = cute.make_fragment_like(tXsX[None, m, 0], cute.Boolean)
+            should_load = cute.make_rmem_tensor_like(tXsX[None, m, 0], cute.Boolean)
             should_load.fill(row_valid)
 
             page = self.tPrPage[m]

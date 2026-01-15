@@ -1093,12 +1093,12 @@ class FlashAttentionBackwardSm90:
         tdQsdQaccum = smem_thr_copy_dQaccum.partition_D(sdQaccum)
 
         dV_shape = (self.tile_n, self.tile_hdimv)
-        acc_dV = cute.make_fragment(
+        acc_dV = cute.make_rmem_tensor(
             tiled_mma_dV.partition_shape_C(dV_shape if not self.dKV_swapAB else dV_shape[::-1]),
             Float32,
         )
         dK_shape = (self.tile_n, self.tile_hdim)
-        acc_dK = cute.make_fragment(
+        acc_dK = cute.make_rmem_tensor(
             tiled_mma_dK.partition_shape_C(dK_shape if not self.dKV_swapAB else dK_shape[::-1]),
             Float32,
         )
@@ -1344,7 +1344,7 @@ class FlashAttentionBackwardSm90:
         acc_dP = mma_dov_fn(A_idx=smem_idx_Q, wg_wait=1)
 
         if const_expr(self.score_mod_bwd is not None):
-            acc_S_pre = cute.make_fragment_like(acc_S)
+            acc_S_pre = cute.make_rmem_tensor_like(acc_S)
             cute.autovec_copy(acc_S, acc_S_pre)
 
         if const_expr(self.score_mod is not None):
@@ -1498,7 +1498,7 @@ class FlashAttentionBackwardSm90:
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
         if const_expr(self.qhead_per_kvhead == 1):
-            rdV = cute.make_fragment_like(acc_dV, self.dtype)
+            rdV = cute.make_rmem_tensor_like(acc_dV, self.dtype)
             rdV.store(acc_dV.load().to(self.dtype))
             rdK = utils.cvt_f16(acc_dK, self.dtype)
 

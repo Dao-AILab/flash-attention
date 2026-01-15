@@ -344,7 +344,7 @@ class FlashAttentionForwardBase:
         batch_idx: Int32,
     ):
         # store acc_O
-        rO = cute.make_fragment_like(acc_O, self.dtype)
+        rO = cute.make_rmem_tensor_like(acc_O, self.dtype)
         rO.store(acc_O.load().to(self.dtype))
         # Make sure all threads have finished reading V
         cute.arch.barrier(
@@ -428,7 +428,7 @@ class FlashAttentionForwardBase:
             )
             gmem_thr_copy_O = gmem_tiled_copy_O.get_slice(tidx)
             tOsO = gmem_thr_copy_O.partition_S(sO)
-            tOrO = cute.make_fragment_like(tOsO, self.dtype)
+            tOrO = cute.make_rmem_tensor_like(tOsO, self.dtype)
             # load acc O from smem to rmem for wider vectorization
             cute.autovec_copy(tOsO, tOrO)
             if const_expr(not self.pack_gqa):
@@ -559,7 +559,7 @@ class FlashAttentionForwardBase:
                     if const_expr(need_predicates):
                         seqlen_limit = seqlen - block * self.tile_n - tVcV[0][0]
                         predicate_n = t0VcV[0, n, 0][0] < seqlen_limit
-                        predicate = cute.make_fragment_like(tVpV[None, 0, None])
+                        predicate = cute.make_rmem_tensor_like(tVpV[None, 0, None])
                         for k in cutlass.range_constexpr(cute.size(predicate.shape[1])):
                             for i in cutlass.range_constexpr(cute.size(predicate.shape[0])):
                                 predicate[i, k] = (
@@ -820,7 +820,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         tSrK = thr_mma_qk.make_fragment_B(thr_mma_qk.partition_B(sK[None, None, 0]))
         tOrVt = thr_mma_pv.make_fragment_B(thr_mma_pv.partition_B(sVt[None, None, 0]))
         acc_shape_O = thr_mma_pv.partition_shape_C((self.tile_m, self.tile_hdimv))
-        acc_O = cute.make_fragment(acc_shape_O, Float32)
+        acc_O = cute.make_rmem_tensor(acc_shape_O, Float32)
         acc_O.fill(0.0)
 
         # ///////////////////////////////////////////////////////////////////////////////
@@ -1071,7 +1071,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             cute.arch.barrier()
 
         acc_shape_S = mma_params.thr_mma_qk.partition_shape_C((self.tile_m, self.tile_n))
-        acc_S = cute.make_fragment(acc_shape_S, Float32)
+        acc_S = cute.make_rmem_tensor(acc_shape_S, Float32)
         acc_S.fill(0.0)
         # wait for smem tile QK before mma calculation for S
         sync()
@@ -1130,7 +1130,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             mask_fn(acc_S, n_block=n_block)
         row_scale = softmax.online_softmax(acc_S, is_first=is_first_n_block, check_inf=check_inf)
         softmax.rescale_O(mma_params.acc_O, row_scale)
-        rP = cute.make_fragment_like(acc_S, self.dtype)
+        rP = cute.make_rmem_tensor_like(acc_S, self.dtype)
         rP.store(acc_S.load().to(self.dtype))
         tOrP = cute.make_tensor(rP.iterator, utils.convert_layout_acc_frgA(rP.layout))
         if const_expr(self.num_stages > 1):
@@ -1910,7 +1910,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         tSrK = tiled_mma_qk.make_fragment_B(wg_mma_qk.partition_B(sK))
         if const_expr(self.mma_pv_is_rs):
             acc_S_shape = tiled_mma_qk.partition_shape_C((self.tile_m, self.tile_n))
-            tOrP = cute.make_fragment(
+            tOrP = cute.make_rmem_tensor(
                 utils.convert_layout_acc_frgA(cute.make_layout(acc_S_shape)), self.dtype
             )
         else:
@@ -1932,7 +1932,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         self.mma_init()
 
         acc_shape_O = tiled_mma_pv.partition_shape_C((self.tile_m, self.tile_hdimv))
-        acc_O = cute.make_fragment(acc_shape_O, Float32)
+        acc_O = cute.make_rmem_tensor(acc_shape_O, Float32)
         smem_copy_params = SimpleNamespace(smem_thr_copy_P=smem_thr_copy_P, tPsP=tPsP)
 
         mma_qk_fn = partial(
@@ -2181,7 +2181,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 if const_expr(not self.pack_gqa):
                     sink_val = Float32(learnable_sink[head_idx])
                 else:  # Each thread might have a different sink value due to different q_head
-                    sink_val = cute.make_fragment_like(softmax.row_max, Float32)
+                    sink_val = cute.make_rmem_tensor_like(softmax.row_max, Float32)
                     cS = cute.make_identity_tensor((self.tile_m, self.tile_n))
                     tScS_mn = utils.make_acc_tensor_mn_view(thr_mma_qk.partition_C(cS))
                     for r in cutlass.range(cute.size(sink_val), unroll_full=True):
@@ -2250,7 +2250,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
         tOrP_acc = cute.make_tensor(acc_S.iterator, utils.convert_layout_acc_frgA(acc_S.layout))
         tOrP_cur = (
-            tOrP if const_expr(self.mma_pv_is_rs) else cute.make_fragment_like(tOrP_acc, self.dtype)
+            tOrP if const_expr(self.mma_pv_is_rs) else cute.make_rmem_tensor_like(tOrP_acc, self.dtype)
         )
         tOrP_cur.store(tOrP_acc.load().to(self.dtype))
 
@@ -2319,7 +2319,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         # if cute.arch.thread_idx()[0] == 0: cute.print_tensor(utils.make_acc_tensor_mn_view(acc_S))
         tOrP_acc = cute.make_tensor(acc_S.iterator, utils.convert_layout_acc_frgA(acc_S.layout))
         tOrP_cur = (
-            tOrP if const_expr(self.mma_pv_is_rs) else cute.make_fragment_like(tOrP_acc, self.dtype)
+            tOrP if const_expr(self.mma_pv_is_rs) else cute.make_rmem_tensor_like(tOrP_acc, self.dtype)
         )
         # tOrP.store(tOrP_acc.load().to(self.dtype))
         # the "to(self.dtype)" conversion fails to vectorize for block sizes other
@@ -2386,7 +2386,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         pipeline_v.consumer_release(smem_pipe_read_v)
         tOrP_acc = cute.make_tensor(acc_S.iterator, utils.convert_layout_acc_frgA(acc_S.layout))
         tOrP_cur = (
-            tOrP if const_expr(self.mma_pv_is_rs) else cute.make_fragment_like(tOrP_acc, self.dtype)
+            tOrP if const_expr(self.mma_pv_is_rs) else cute.make_rmem_tensor_like(tOrP_acc, self.dtype)
         )
         # tOrP_cur.store(tOrP_acc.load().to(self.dtype))
         # the "to(self.dtype)" conversion fails to vectorize for block sizes other

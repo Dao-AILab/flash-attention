@@ -51,7 +51,7 @@ def gemm_zero_init(
             tiled_mma, shape[::-1], tCrB, tCrA, B_idx, A_idx, wg_wait, swap_AB=False
         )
     else:
-        acc = cute.make_fragment(tiled_mma.partition_shape_C(shape), Float32)
+        acc = cute.make_rmem_tensor(tiled_mma.partition_shape_C(shape), Float32)
         rA = tCrA if const_expr(A_idx is None) else tCrA[None, None, None, A_idx]
         rB = tCrB if const_expr(B_idx is None) else tCrB[None, None, None, B_idx]
         gemm(tiled_mma, acc, rA, rB, zero_init=True, wg_wait=wg_wait)

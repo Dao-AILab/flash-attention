@@ -387,7 +387,7 @@ class FlashAttentionBackwardPostprocess:
                 acc_shape = tiled_mma.partition_shape_C(
                     tile_shape if const_expr(not dQ_swapAB) else tile_shape[::-1]
                 )
-                acc = cute.make_fragment(acc_shape, cutlass.Float32)
+                acc = cute.make_rmem_tensor(acc_shape, cutlass.Float32)
                 assert cute.size(acc) == cute.size(tdQsdQaccum)
             else:
                 thr_mma = tiled_mma.get_slice(0)  # 1-CTA
@@ -402,11 +402,11 @@ class FlashAttentionBackwardPostprocess:
                 tiled_copy_t2r = tcgen05.make_tmem_copy(tmem_load_atom, tdQtdQ)
                 thr_copy_t2r = tiled_copy_t2r.get_slice(tidx)
                 tdQrdQ_t2r_shape = thr_copy_t2r.partition_D(tdQcdQ).shape
-                acc = cute.make_fragment(tdQrdQ_t2r_shape, Float32)
+                acc = cute.make_rmem_tensor(tdQrdQ_t2r_shape, Float32)
             tdQrdQaccum = cute.make_tensor(acc.iterator, cute.make_layout(tdQsdQaccum.shape))
             cute.autovec_copy(tdQsdQaccum, tdQrdQaccum)
             # Convert tdQrdQaccum from fp32 to fp16/bf16
-            rdQ = cute.make_fragment_like(acc, self.dtype)
+            rdQ = cute.make_rmem_tensor_like(acc, self.dtype)
             rdQ.store((acc.load() * scale).to(self.dtype))
 
             # Step 3: Copy dQ from register to smem
@@ -446,7 +446,7 @@ class FlashAttentionBackwardPostprocess:
             gmem_thr_copy_dQ = gmem_tiled_copy_dQ.get_slice(tidx)
             tdQgdQ = gmem_thr_copy_dQ.partition_S(gdQ)
             tdQsdQ = gmem_thr_copy_dQ.partition_D(sdQ)
-            tdQrdQ = cute.make_fragment_like(tdQsdQ, self.dtype)
+            tdQrdQ = cute.make_rmem_tensor_like(tdQsdQ, self.dtype)
             # TODO: check OOB when reading from smem if kBlockM isn't evenly tiled
             cute.autovec_copy(tdQsdQ, tdQrdQ)
 
