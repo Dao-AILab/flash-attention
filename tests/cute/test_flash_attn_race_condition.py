@@ -7,6 +7,8 @@ import os
 import pytest
 import torch
 
+pytestmark = pytest.mark.slow
+
 from einops import rearrange, repeat
 
 try:
