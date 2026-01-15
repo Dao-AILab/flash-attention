@@ -13,6 +13,10 @@ from .utils import (
     SHAPE_EXPECTATIONS,
     round_multiple,
 )
+from .llc_cache_aware import is_head_grouping_beneficial, print_head_grouping_info
+
+# Environment variable to enable LLC-aware head grouping debug output
+LLC_HEAD_GROUPING_DEBUG = os.environ.get('FLASH_ATTN_LLC_DEBUG', '0') == '1'
 
 
 def fwd(
@@ -124,10 +128,78 @@ def fwd(
         else:
             sd_mask = None
 
-    # call implementation
-    if DEBUG:
-        print("Using Triton implementation")
-    attention_forward_prefill_triton_impl(
+    # Check if LLC-aware head grouping is beneficial (for RDNA3 with long sequences)
+    head_dim = q.shape[-1]
+    should_group, group_size = is_head_grouping_beneficial(
+        nheads_q, max_seqlen_k, head_dim, q.dtype, q.device.index or 0
+    )
+    
+    if LLC_HEAD_GROUPING_DEBUG:
+        print_head_grouping_info(nheads_q, max_seqlen_k, head_dim, q.dtype, q.device.index or 0)
+    
+    # Use head grouping if beneficial (and no return_softmax which requires full attention matrix)
+    if should_group and group_size < nheads_q and not return_softmax:
+        if LLC_HEAD_GROUPING_DEBUG:
+            print(f"[LLC Head Grouping] Processing {nheads_q} heads in groups of {group_size}")
+        
+        # Process heads in groups for LLC cache efficiency
+        gqa_ratio = nheads_q // nheads_k
+        n_groups = (nheads_q + group_size - 1) // group_size
+        softmax_lse_list = []
+        
+        for g in range(n_groups):
+            start_h = g * group_size
+            end_h = min((g + 1) * group_size, nheads_q)
+            actual_heads = end_h - start_h
+            
+            # For GQA, compute corresponding K,V head range
+            start_h_k = start_h // gqa_ratio
+            end_h_k = (end_h + gqa_ratio - 1) // gqa_ratio
+            
+            # Slice heads: bshd layout -> select heads on dim 2
+            q_group = q[:, :, start_h:end_h, :].contiguous()
+            k_group = k[:, :, start_h_k:end_h_k, :].contiguous()
+            v_group = v[:, :, start_h_k:end_h_k, :].contiguous()
+            out_group = torch.zeros_like(q_group)
+            
+            # Handle alibi slopes if present
+            alibi_group = None
+            if alibi_slopes is not None:
+                alibi_group = alibi_slopes[:, start_h:end_h] if alibi_slopes.dim() == 2 else alibi_slopes[start_h:end_h]
+            
+            # Create softmax_lse for this group
+            if SHAPE_EXPECTATIONS == "rounded":
+                softmax_lse_group = torch.zeros(
+                    (batch, actual_heads, round_multiple(max_seqlen_q, 128)),
+                    device=q.device, dtype=torch.float32,
+                )
+            else:
+                softmax_lse_group = torch.zeros(
+                    (batch, actual_heads, max_seqlen_q),
+                    device=q.device, dtype=torch.float32,
+                )
+            
+            # Call implementation for this group
+            attention_forward_prefill_triton_impl(
+                q_group, k_group, v_group, out_group, softmax_lse_group, None,
+                softmax_scale, alibi_group, causal,
+                window_size_left, window_size_right, None, layout, None, None,
+                max_seqlen_q, max_seqlen_k, dropout_p, philox_seed, philox_offset,
+                False, USE_EXP2, None, None, None, None, None, None, None,
+            )
+            
+            # Copy output back
+            out[:, :, start_h:end_h, :] = out_group
+            softmax_lse_list.append(softmax_lse_group)
+        
+        # Concatenate softmax_lse across heads
+        softmax_lse = torch.cat(softmax_lse_list, dim=1)
+        sd_mask = None  # Not supported with head grouping
+    else:
+        # call implementation (no head grouping)
+        if DEBUG:
+            print("Using Triton implementation")
+        attention_forward_prefill_triton_impl(
         q,
         k,
         v,
