@@ -89,6 +89,7 @@ def mask_r2p_dual_bound(
         right_s = max(col_limit_right - s * 24, 0)
         left_s = max(col_limit_left - s * 24, 0)
 
+        # otherwise cute dsl complains about python int too large to convert into c long
         right_s = min(right_s, 24)
         left_s = min(left_s, 24)
 
