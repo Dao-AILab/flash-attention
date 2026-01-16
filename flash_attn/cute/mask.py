@@ -100,9 +100,9 @@ def mask_r2p_dual_bound(
 
         # This needs to be range_constexpr, o/w the compiler can't generate the R2P instruction
         for i in cutlass.range_constexpr(min(24, ncol - s * 24)):
-            in_bound = cutlass.Boolean(mask_range & (1 << i))
+            out_bound = cutlass.Boolean(mask_range & (1 << i))
             c = s * 24 + i
-            X[c] = X[c] if in_bound else -Float32.inf
+            X[c] = -Float32.inf if not out_bound else X[c]
 
 
 @dataclass(frozen=True)
