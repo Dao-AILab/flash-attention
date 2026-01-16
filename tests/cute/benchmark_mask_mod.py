@@ -272,6 +272,7 @@ class FlashAttentionBenchmark:
                     mask_block_idx=mask_idx.contiguous(),
                     full_block_cnt=full_cnt.contiguous(),
                     full_block_idx=full_idx.contiguous(),
+                    block_size=(config.tile_m, config.tile_n),
                 )
 
                 if config.verbose:
