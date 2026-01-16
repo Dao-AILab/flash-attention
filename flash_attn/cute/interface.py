@@ -126,6 +126,7 @@ def _flash_attn_fwd(
     lse: Optional[torch.Tensor] = None,
     aux_tensors: Optional[list[torch.Tensor]] = None,
     scheduler_metadata: Optional[SchedulerMetadataTensorsTorch] = None,
+    seqlen_k_per_split: Optional[int] = None,
     disable_scheduler_metadata: bool = False
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for FlashAttention.
@@ -369,6 +370,7 @@ def _flash_attn_fwd(
                 cu_seqlens_k=cu_seqlens_k,
                 seqused_q=seqused_q,
                 seqused_k=seqused_k,
+                seqlen_k_per_split=seqlen_k_per_split,
                 current_stream=current_stream,
             )
 
@@ -1456,6 +1458,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         score_mod: Optional[Callable] = None,
         aux_tensors: Optional[list] = None,
         scheduler_metadata: Optional[SchedulerMetadataTensorsTorch] = None,
+        seqlen_k_per_split: Optional[int] = None,
         disable_scheduler_metadata: bool = False
     ):
         out, lse = _flash_attn_fwd(
@@ -1480,6 +1483,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             score_mod=score_mod,
             aux_tensors=aux_tensors,
             scheduler_metadata=scheduler_metadata,
+            seqlen_k_per_split=seqlen_k_per_split,
             disable_scheduler_metadata=disable_scheduler_metadata,
         )
         ctx.save_for_backward(q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
@@ -1582,6 +1586,7 @@ def flash_attn_varlen_func(
     score_mod: Optional[Callable] = None,
     aux_tensors: Optional[list] = None,
     scheduler_metadata: Optional[SchedulerMetadataTensorsTorch] = None,
+    seqlen_k_per_split: Optional[int] = None,
     disable_scheduler_metadata: bool = False
 ):
     return FlashAttnVarlenFunc.apply(
@@ -1606,6 +1611,7 @@ def flash_attn_varlen_func(
         score_mod,
         aux_tensors,
         scheduler_metadata,
+        seqlen_k_per_split,
         disable_scheduler_metadata,
     )
 
