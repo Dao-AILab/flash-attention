@@ -75,13 +75,13 @@ def mask_r2p_dual_bound(
     col_limit_right: Int32,  # Exclusive upper bound
 ) -> None:
     """
-    Dual-bound masking using XOR of two bitmasks for SM100, following mask_r2p.
+    Dual-bound masking using two bitmasks for SM100, following mask_r2p.
     Masks elements where: NOT (col_limit_left <= col < col_limit_right)
 
-    Uses XOR to create a range mask:
-        mask_right = (1 << right) - 1  -> bits 0..(right-1) are 1
-        mask_left  = (1 << left) - 1   -> bits 0..(left-1) are 1
-        mask_range = mask_right XOR mask_left -> bits left..(right-1) are 1
+    Uses bit manipulation to create a range mask:
+        mask_right = (1 << right) - 1  -> bits (right-1)..0 are 1
+        mask_left  = (1 << left) - 1   -> bits (left-1)..0 are 1
+        mask_range = mask_range = mask_right & ~ mask_left -> bits (right-1)..left are 1
     """
     ncol = const_expr(cute.size(X.shape))
 
@@ -96,7 +96,7 @@ def mask_r2p_dual_bound(
         # XOR creates range mask: bits left_s..(right_s-1) are 1
         mask_right = (1 << right_s) - 1 if right_s > 0 else 0
         mask_left = (1 << left_s) - 1 if left_s > 0 else 0
-        mask_range = mask_right ^ mask_left
+        mask_range = mask_right & ~ mask_left
 
         # This needs to be range_constexpr, o/w the compiler can't generate the R2P instruction
         for i in cutlass.range_constexpr(min(24, ncol - s * 24)):
