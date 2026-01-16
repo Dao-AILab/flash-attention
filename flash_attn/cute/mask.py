@@ -86,9 +86,11 @@ def mask_r2p_dual_bound(
     ncol = const_expr(cute.size(X.shape))
 
     for s in cutlass.range_constexpr(cute.ceil_div(ncol, 24)):
-        # Don't need to clamp to 32 since the shr.u32 instruction does that already
         right_s = max(col_limit_right - s * 24, 0)
         left_s = max(col_limit_left - s * 24, 0)
+
+        right_s = min(right_s, 24)
+        left_s = min(left_s, 24)
 
         # bits (right-1)..left are 1
         mask_right = (1 << right_s) - 1
