@@ -94,8 +94,8 @@ def mask_r2p_dual_bound(
         left_s = min(left_s, 24)
 
         # XOR creates range mask: bits left_s..(right_s-1) are 1
-        mask_right = (1 << right_s) - 1 if right_s > 0 else 0
-        mask_left = (1 << left_s) - 1 if left_s > 0 else 0
+        mask_right = (1 << right_s) - 1
+        mask_left = (1 << left_s) - 1
         mask_range = mask_right & ~ mask_left
 
         # This needs to be range_constexpr, o/w the compiler can't generate the R2P instruction
