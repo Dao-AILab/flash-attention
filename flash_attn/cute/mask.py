@@ -90,7 +90,7 @@ def mask_r2p_dual_bound(
         right_s = max(col_limit_right - s * 24, 0)
         left_s = max(col_limit_left - s * 24, 0)
 
-        # XOR creates range mask: bits left_s..(right_s-1) are 1
+        # bits (right-1)..left are 1
         mask_right = (1 << right_s) - 1
         mask_left = (1 << left_s) - 1
         mask_range = mask_right & ~ mask_left
