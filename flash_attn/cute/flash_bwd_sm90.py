@@ -351,8 +351,12 @@ class FlashAttentionBackwardSm90:
         )
 
         # Assume all strides are divisible by 128 bits except the last stride
+        # Skip cute.assume() for stride=0 (broadcast dims from expand() are Python ints)
         new_stride = lambda t: (
-            *(cute.assume(s, divby=128 // t.element_type.width) for s in t.stride[:-1]),
+            *(
+                cute.assume(s, divby=128 // t.element_type.width) if s != 0 else s
+                for s in t.stride[:-1]
+            ),
             t.stride[-1],
         )
         mQ, mK, mV, mdO, mLSE, mdPsum, mdQaccum, mdK, mdV = [
