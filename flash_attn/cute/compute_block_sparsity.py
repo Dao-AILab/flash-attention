@@ -336,6 +336,7 @@ def compute_block_sparsity(
         mask_block_idx=mask_block_idx,
         full_block_cnt=full_block_cnt,
         full_block_idx=full_block_idx,
+        block_size=(tile_m, tile_n),
     )
 
     mask_mod_hash = hash_callable(mask_mod)
@@ -365,7 +366,7 @@ def compute_block_sparsity(
         )
 
     compute_block_sparsity.compile_cache[compile_key](
-        blocksparse_tensors_torch,
+        blocksparse_tensors_torch[:4],
         seqlen_q,
         seqlen_k,
         aux_tensors,
