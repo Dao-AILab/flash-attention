@@ -93,7 +93,7 @@ def mask_r2p_dual_bound(
         # bits (right-1)..left are 1
         mask_right = (1 << right_s) - 1
         mask_left = (1 << left_s) - 1
-        mask_range = mask_right & ~ mask_left
+        mask_range = mask_right & ~mask_left
 
         # This needs to be range_constexpr, o/w the compiler can't generate the R2P instruction
         for i in cutlass.range_constexpr(min(24, ncol - s * 24)):
