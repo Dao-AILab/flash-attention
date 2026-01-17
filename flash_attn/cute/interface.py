@@ -269,16 +269,6 @@ def _flash_attn_fwd(
         if head_dim == head_dim_v == 128 and not causal and not local and not use_block_sparsity:
             n_block_size = 192
 
-    if compute_capability in [10, 11]:
-        if (
-            pack_gqa
-            and (128 % qhead_per_kvhead != 0)
-        ):
-            pack_gqa = False
-        # TODO: fix GQA + SplitKV + non-varlen
-        if pack_gqa and num_splits != 1 and cu_seqlens_q is None:
-            pack_gqa = False
-
     if max_seqlen_q is None:
         max_seqlen_q = seqlen_q if cu_seqlens_q is None else total_q
     if max_seqlen_k is None:
