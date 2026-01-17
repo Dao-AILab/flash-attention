@@ -119,11 +119,15 @@ def finish_overlap_v_load(
 def sparse_tensor_m_block(
     m_block,
     qhead_per_kvhead: cutlass.Constexpr[int],
+    q_subtile_factor: cutlass.Constexpr[int],
 ):
     """Map packed m_block indices to block-sparse tensor indices."""
+    block = m_block
     if const_expr(qhead_per_kvhead != 1):
-        return m_block // qhead_per_kvhead
-    return m_block
+        block = block // qhead_per_kvhead
+    if const_expr(q_subtile_factor != 1):
+        block = block // q_subtile_factor
+    return block
 
 
 @cute.jit
@@ -142,6 +146,7 @@ def produce_block_sparse_loads(
     tma_q_bytes: cutlass.Constexpr,
     intra_wg_overlap: cutlass.Constexpr,
     qhead_per_kvhead: cutlass.Constexpr[int] = 1,
+    q_subtile_factor: cutlass.Constexpr[int] = 1,
 ):
     """Iterate over the mask and full block lists for a single tile.
 
@@ -160,7 +165,7 @@ def produce_block_sparse_loads(
 
     mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx = blocksparse_tensors
 
-    m_block_sparse = sparse_tensor_m_block(m_block, qhead_per_kvhead)
+    m_block_sparse = sparse_tensor_m_block(m_block, qhead_per_kvhead, q_subtile_factor)
 
     curr_mask_block_cnt = mask_block_cnt[batch_idx, head_idx, m_block_sparse]
     curr_mask_block_idx = mask_block_idx[batch_idx, head_idx, m_block_sparse, None]
@@ -308,6 +313,7 @@ def consume_block_sparse_loads(
     warp_scheduler_barrier_sync: Callable,
     warp_scheduler_barrier_arrive: Callable,
     qhead_per_kvhead: cutlass.Constexpr[int] = 1,
+    q_subtile_factor: cutlass.Constexpr[int] = 1,
 ):
     """Consume the mask and full block lists for a single tile on the consumer side.
 
@@ -321,7 +327,7 @@ def consume_block_sparse_loads(
 
     mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx = blocksparse_tensors
 
-    m_block_sparse = sparse_tensor_m_block(m_block, qhead_per_kvhead)
+    m_block_sparse = sparse_tensor_m_block(m_block, qhead_per_kvhead, q_subtile_factor)
 
     curr_mask_block_cnt = mask_block_cnt[batch_idx, head_idx, m_block_sparse]
     curr_mask_block_idx = mask_block_idx[batch_idx, head_idx, m_block_sparse, None]
@@ -527,6 +533,7 @@ def produce_block_sparse_loads_sm100(
     q_stage: cutlass.Constexpr,
     q_producer_phase: Int32,
     qhead_per_kvhead: cutlass.Constexpr,
+    q_subtile_factor: cutlass.Constexpr,
 ):
     """SM100 entry point for sparse block iteration.
 
@@ -537,11 +544,7 @@ def produce_block_sparse_loads_sm100(
         m_block: which tile of m we are processing
         qhead_per_kvhead: Constexpr pack factor
     """
-    # NB: Compute unpacked index for sparse tensor access
-    if const_expr(qhead_per_kvhead != 1):
-        m_block_sparse = m_block // qhead_per_kvhead
-    else:
-        m_block_sparse = m_block
+    m_block_sparse = sparse_tensor_m_block(m_block, qhead_per_kvhead, q_subtile_factor)
 
     mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx = blocksparse_tensors
 
@@ -619,12 +622,9 @@ def get_total_block_count(
     head_idx,
     m_block,
     qhead_per_kvhead: cutlass.Constexpr,
+    q_subtile_factor: cutlass.Constexpr,
 ):
-    # NB: Convert packed m_block to unpacked for sparse tensor indexing
-    if const_expr(qhead_per_kvhead != 1):
-        m_block_sparse = m_block // qhead_per_kvhead
-    else:
-        m_block_sparse = m_block
+    m_block_sparse = sparse_tensor_m_block(m_block, qhead_per_kvhead, q_subtile_factor)
 
     mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx = blocksparse_tensors
     if const_expr(full_block_cnt is not None):
@@ -770,12 +770,9 @@ def softmax_block_sparse_sm100(
     stage_idx: Int32,
     check_m_boundary: bool,
     qhead_per_kvhead: cutlass.Constexpr,
+    q_subtile_factor: cutlass.Constexpr[int] = 1,
 ):
-    # Convert packed m_block to unpacked for sparse tensor indexing
-    if const_expr(qhead_per_kvhead != 1):
-        m_block_sparse = m_block // qhead_per_kvhead
-    else:
-        m_block_sparse = m_block
+    m_block_sparse = sparse_tensor_m_block(m_block, qhead_per_kvhead, q_subtile_factor)
 
     mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx = blocksparse_tensors
 

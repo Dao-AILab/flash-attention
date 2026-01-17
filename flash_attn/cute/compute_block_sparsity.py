@@ -336,6 +336,7 @@ def compute_block_sparsity(
         mask_block_idx=mask_block_idx,
         full_block_cnt=full_block_cnt,
         full_block_idx=full_block_idx,
+        block_size=(tile_m, tile_n),
     )
 
     mask_mod_hash = hash_callable(mask_mod)
