@@ -119,9 +119,10 @@ def _attn_fwd_inner(acc, l_i, m_i, q, k_ptrs, v_ptrs, bias_ptrs, stride_kn, stri
                 if tl_DROPOUT_DUMP:
                     tl.store(dropout_mask_ptrs, dropout_mask, mask=p_mask)
 
-            # return scores with negative values for dropped vals
-            sd_mask = tl.where(dropout_mask, p, -p)
-            tl.store(sd_mask_ptrs, sd_mask, mask=p_mask)
+            if RETURN_SCORES:
+                # return scores with negative values for dropped vals
+                sd_mask = tl.where(dropout_mask, p, -p)
+                tl.store(sd_mask_ptrs, sd_mask, mask=p_mask)
 
             # apply dropout mask in place
             p = tl.where(dropout_mask, p, 0.0)
