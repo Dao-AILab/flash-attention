@@ -1263,6 +1263,11 @@ class FlashAttnFunc(torch.autograd.Function):
         full_block_idx: Optional[torch.Tensor] = None,
         mask_block_cnt: Optional[torch.Tensor] = None,
         mask_block_idx: Optional[torch.Tensor] = None,
+        q_full_block_cnt: Optional[torch.Tensor] = None,
+        q_full_block_idx: Optional[torch.Tensor] = None,
+        q_mask_block_cnt: Optional[torch.Tensor] = None,
+        q_mask_block_idx: Optional[torch.Tensor] = None,
+        aux_tensors: Optional[list] = None,
     ):
         # Only create block sparse tensors if at least one block sparse parameter is provided
         block_sparse_tensors = None
@@ -1286,9 +1291,22 @@ class FlashAttnFunc(torch.autograd.Function):
             num_splits=num_splits,
             pack_gqa=pack_gqa,
             mask_mod=mask_mod,
-            block_sparse_tensors=block_sparse_tensors
+            block_sparse_tensors=block_sparse_tensors,
+            aux_tensors=aux_tensors,
         )
-        ctx.save_for_backward(q, k, v, out, lse)
+        ctx.save_for_backward(
+            q, 
+            k, 
+            v, 
+            out, 
+            lse,
+            q_full_block_cnt if q_full_block_cnt is not None else torch.empty(0),
+            q_full_block_idx if q_full_block_idx is not None else torch.empty(0),
+            q_mask_block_cnt if q_mask_block_cnt is not None else torch.empty(0),
+            q_mask_block_idx if q_mask_block_idx is not None else torch.empty(0),
+            *aux_tensors if aux_tensors is not None else torch.empty(0),
+        )
+
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size = window_size
@@ -1296,12 +1314,33 @@ class FlashAttnFunc(torch.autograd.Function):
         ctx.deterministic = deterministic
         ctx.pack_gqa = pack_gqa
         ctx.mask_mod = mask_mod
-        ctx.block_sparse_tensors = block_sparse_tensors
+        ctx.has_q_full_block_cnt = q_full_block_cnt is not None
+        ctx.has_q_full_block_idx = q_full_block_idx is not None
+        ctx.has_q_mask_block_cnt = q_mask_block_cnt is not None
+        ctx.has_q_mask_block_idx = q_mask_block_idx is not None
+        ctx.has_aux_tensors = aux_tensors is not None
         return out, lse
 
     @staticmethod
     def backward(ctx, dout, *args):
-        q, k, v, out, lse = ctx.saved_tensors
+        # When using gradient checkpointing, it's only one chance to get ctx.saved_tensors
+        saved_tensors = ctx.saved_tensors
+        q, k, v, out, lse, q_full_block_cnt, q_full_block_idx, q_mask_block_cnt, q_mask_block_idx = saved_tensors[:9]
+        q_full_block_cnt = q_full_block_cnt if ctx.has_q_full_block_cnt else None
+        q_full_block_idx = q_full_block_idx if ctx.has_q_full_block_idx else None
+        q_mask_block_cnt = q_mask_block_cnt if ctx.has_q_mask_block_cnt else None
+        q_mask_block_idx = q_mask_block_idx if ctx.has_q_mask_block_idx else None
+        aux_tensors = list(saved_tensors[9:]) if ctx.has_aux_tensors else None
+
+        # Only create block sparse tensors if at least one block sparse parameter is provided
+        block_sparse_tensors_bwd = None
+        if any(t is not None for t in [q_full_block_cnt, q_full_block_idx, q_mask_block_cnt, q_mask_block_idx]):
+            block_sparse_tensors_bwd = BlockSparseTensorsTorch(
+                full_block_cnt=q_full_block_cnt,
+                full_block_idx=q_full_block_idx,
+                mask_block_cnt=q_mask_block_cnt,
+                mask_block_idx=q_mask_block_idx,
+            )
         dq, dk, dv = _flash_attn_bwd(
             q,
             k,
@@ -1317,7 +1356,8 @@ class FlashAttnFunc(torch.autograd.Function):
             deterministic=ctx.deterministic,
             pack_gqa=ctx.pack_gqa,
             mask_mod=ctx.mask_mod,
-            block_sparse_tensors=ctx.block_sparse_tensors,
+            block_sparse_tensors=block_sparse_tensors_bwd,
+            aux_tensors=aux_tensors,
         )
         return dq, dk, dv, *((None,) * 20)  # Extra Nones is fine
 
@@ -1424,6 +1464,7 @@ def flash_attn_func(
     full_block_idx: Optional[torch.Tensor] = None,
     mask_block_cnt: Optional[torch.Tensor] = None,
     mask_block_idx: Optional[torch.Tensor] = None,
+    aux_tensors: Optional[list] = None,
 ):
     return FlashAttnFunc.apply(
         q,
@@ -1442,6 +1483,7 @@ def flash_attn_func(
         full_block_idx,
         mask_block_cnt,
         mask_block_idx,
+        aux_tensors,
     )
 
 
