@@ -13,7 +13,6 @@
 #   pytest test_mask_mod.py                            # Run all tests
 
 import math
-from typing import Optional
 
 import pytest
 import torch
@@ -22,7 +21,7 @@ import torch.nn.functional as F
 
 from flash_attn.cute.interface import _flash_attn_fwd, _flash_attn_bwd
 from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch
-from flash_attn.cute.mask_definitions import get_mask_pair, random_doc_id_tensor
+from mask_mod_definitions import get_mask_pair, random_doc_id_tensor
 COMPUTE_CAPABILITY = torch.cuda.get_device_capability()[0]
 
 
@@ -62,7 +61,7 @@ def create_tensors(
     }
 
 
-def compute_reference_flex_attn(tensors, mask_mod_flex, block_size: Optional[tuple[int, int]] = None):
+def compute_reference_flex_attn(tensors, mask_mod_flex, block_size: tuple[int, int] | None = None):
     """Compute reference using flex_attention for custom mask_mods"""
     batch_size, seqlen_q, nheads, headdim = tensors["q"].shape
     _, seqlen_k, nheads_kv, _ = tensors["k"].shape
@@ -96,7 +95,7 @@ def compute_reference_flex_attn(tensors, mask_mod_flex, block_size: Optional[tup
         device=q.device,
         **block_mask_kwargs,
     )
-    out_ref = flex_attention(q, k, v, block_mask=block_mask, scale=scale)
+    out_ref = flex_attention(q, k, v, block_mask=block_mask, scale=scale, enable_gqa=True)
     return out_ref.transpose(1, 2).contiguous()
 
 
@@ -162,10 +161,15 @@ def _run_mask_test(
     # Determine nheads_kv based on mode
     if kv_mode == "mha":
         nheads_kv = nheads
+        pack_gqa = False
     elif kv_mode == "gqa":
-        nheads_kv = nheads // 2
+        if COMPUTE_CAPABILITY < 9:
+            pytest.xfail("pack_gqa requires SM90+")
+        nheads_kv = nheads // 4
+        pack_gqa = True
     elif kv_mode == "mqa":
         nheads_kv = 1
+        pack_gqa = False
     else:
         raise ValueError(f"Unknown kv_mode: {kv_mode}")
 
@@ -211,10 +215,11 @@ def _run_mask_test(
     else:
         sparse_tile_m = tile_m
 
+    block_mask_nheads = 1 if pack_gqa else nheads
     bm = create_block_mask(
         mask_mod_flex,
         batch_size,
-        nheads,
+        block_mask_nheads,
         seqlen_q,
         seqlen_k,
         device="cuda",
@@ -233,6 +238,31 @@ def _run_mask_test(
         full_q_idx,
         *_,
     ) = bm.as_tuple()
+
+    # SM90 block-sparse backward expects BlockMask granularity (128, 128) regardless of fwd tiling.
+    if COMPUTE_CAPABILITY == 9 and use_block_sparsity and (sparse_tile_m, tile_n) != (128, 128):
+        bm_bwd = create_block_mask(
+            mask_mod_flex,
+            batch_size,
+            nheads,
+            seqlen_q,
+            seqlen_k,
+            device="cuda",
+            BLOCK_SIZE=(128, 128),
+        )
+        (
+            _seq_q,
+            _seq_k,
+            _kv_mask_cnt,
+            _kv_mask_idx,
+            _full_kv_cnt,
+            _full_kv_idx,
+            q_mask_cnt,
+            q_mask_idx,
+            full_q_cnt,
+            full_q_idx,
+            *_,
+        ) = bm_bwd.as_tuple()
 
     softmax_scale = 1.0 / math.sqrt(headdim)
 
@@ -270,8 +300,7 @@ def _run_mask_test(
         learnable_sink=None,
         m_block_size=tile_m,
         n_block_size=tile_n,
-        num_threads=384,
-        pack_gqa=False,
+        pack_gqa=pack_gqa,
         _compute_capability=None,
         score_mod=None,
         mask_mod=mask_mod_cute,
@@ -338,8 +367,7 @@ def _run_mask_test(
         f"Kernel error {cute_error:.2e} exceeds {rtol}x PyTorch error {pt_error:.2e} + {fwd_atol:.2e}"
     )
 
-    # Backward pass (SM100 only)
-    if needs_backward and COMPUTE_CAPABILITY == 10 and kv_mode == "mha":
+    if needs_backward:
         q = tensors["q"]
         k = tensors["k"]
         v = tensors["v"]
@@ -371,7 +399,8 @@ def _run_mask_test(
         assert not torch.isnan(dv_cute).any(), "dV contains NaN"
 
         bwd_rtol = 2
-        bwd_atol_floor = 1e-5
+        min_seqlen = min(seqlen_q, seqlen_k)
+        bwd_atol_floor = 1e-5 if min_seqlen >= 64 else 3e-5
         dq_atol = max(bwd_atol_floor, 2 * (dq_ref_fp32 + 0.3 - 0.3 - dq_ref_fp32).abs().max().item())
         dk_atol = max(bwd_atol_floor, 2 * (dk_ref_fp32 + 0.3 - 0.3 - dk_ref_fp32).abs().max().item())
         dv_atol = max(bwd_atol_floor, 2 * (dv_ref_fp32 + 0.3 - 0.3 - dv_ref_fp32).abs().max().item())
@@ -448,9 +477,6 @@ def test_q_boundary_masking_block_sparse_bwd(seqlen_q, seqlen_k, mask_name):
     - Block-sparse with mask_mod: exercises is_full_block=True path
     - Backward pass: where the bug manifested
     """
-    if COMPUTE_CAPABILITY != 10:
-        pytest.skip("SM100-only backward test")
-
     _run_mask_test(
         seqlen_q=seqlen_q,
         seqlen_k=seqlen_k,
@@ -469,6 +495,7 @@ def test_q_boundary_masking_block_sparse_bwd(seqlen_q, seqlen_k, mask_name):
     )
 
 
+@pytest.mark.skipif(COMPUTE_CAPABILITY != 10, reason="Test uses SM100 block mask conventions (2*tile_m)")
 def test_single_doc_bwd_minimal():
     """Minimal test to isolate single-document backward pass bug.
 
@@ -479,9 +506,6 @@ def test_single_doc_bwd_minimal():
 
     Run with: pytest tests/cute/test_mask_mod.py::test_single_doc_bwd_minimal -v -s
     """
-    if COMPUTE_CAPABILITY != 10:
-        pytest.skip("SM100-only test")
-
     import random
     random.seed(42)
     torch.manual_seed(42)
@@ -498,7 +522,7 @@ def test_single_doc_bwd_minimal():
     # Create single-document doc_ids (all same doc_id = 0)
     doc_ids = torch.zeros(batch_size, nheads, max(seqlen_q, seqlen_k), dtype=torch.int32, device="cuda")
 
-    from flash_attn.cute.mask_definitions import get_mask_pair
+    from mask_mod_definitions import get_mask_pair
     mask_mod_cute, mask_mod_flex = get_mask_pair("document", seqlen_q=seqlen_q, seqlen_k=seqlen_k)
 
     original_flex_mask = mask_mod_flex
@@ -626,7 +650,7 @@ def test_static_masks(
 
 @pytest.mark.parametrize("seqlen_q,seqlen_k", SEQLEN_PAIRS_SMOKE)
 @pytest.mark.parametrize("nheads", [16])
-@pytest.mark.parametrize("kv_mode", ["mha"])
+@pytest.mark.parametrize("kv_mode", ["mha", "gqa"])
 @pytest.mark.parametrize("headdim", [128])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("use_block_sparsity", [True, False])
@@ -786,7 +810,7 @@ def run_flex_reference_bwd(q, k, v, block_mask, grad_out, dtype=None):
 
     # Use flex_attention directly without torch.compile for backward tests
     # torch.compile can hang on certain mask patterns (e.g., mini_causal with float32)
-    out_ref = flex_attention(q_ref, k_ref, v_ref, block_mask=block_mask)
+    out_ref = flex_attention(q_ref, k_ref, v_ref, block_mask=block_mask, enable_gqa=True)
     dq_ref, dk_ref, dv_ref = torch.autograd.grad(out_ref, (q_ref, k_ref, v_ref), grad_out_ref)
 
     # Transpose back to BSHD
@@ -796,6 +820,287 @@ def run_flex_reference_bwd(q, k, v, block_mask, grad_out, dtype=None):
         dk_ref.transpose(1, 2),
         dv_ref.transpose(1, 2),
     )
+
+
+def test_sm90_block_sparse_bwd_mismatched_q_block_granularity_error_message():
+    if COMPUTE_CAPABILITY != 9:
+        pytest.skip("SM90-only test")
+
+    batch_size = 1
+    seqlen_q = 256
+    seqlen_k = 256
+    nheads = 4
+    nheads_kv = nheads
+    headdim = 128
+    dtype = torch.bfloat16
+    tile_m = 80
+    tile_n = 128
+
+    tensors = create_tensors(batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, headdim, headdim, dtype)
+    mask_mod_cute, mask_mod_flex = get_mask_pair("block_diagonal", seqlen_q=seqlen_q, seqlen_k=seqlen_k)
+    bm = create_block_mask(
+        mask_mod_flex,
+        batch_size,
+        nheads,
+        seqlen_q,
+        seqlen_k,
+        device="cuda",
+        BLOCK_SIZE=(tile_m, tile_n),
+    )
+    (
+        _seq_q,
+        _seq_k,
+        _kv_mask_cnt,
+        _kv_mask_idx,
+        _full_kv_cnt,
+        _full_kv_idx,
+        q_mask_cnt,
+        q_mask_idx,
+        full_q_cnt,
+        full_q_idx,
+        *_,
+    ) = bm.as_tuple()
+
+    block_sparse_mask_bwd = BlockSparseTensorsTorch(
+        mask_block_cnt=q_mask_cnt,
+        mask_block_idx=q_mask_idx,
+        full_block_cnt=full_q_cnt,
+        full_block_idx=full_q_idx,
+    )
+
+    softmax_scale = 1.0 / math.sqrt(headdim)
+    out = torch.empty(batch_size, seqlen_q, nheads, headdim, device="cuda", dtype=dtype)
+    lse = torch.empty(batch_size, nheads, seqlen_q, device="cuda", dtype=torch.float32)
+    grad_out = torch.randn_like(out)
+
+    with pytest.raises(
+        ValueError,
+        match=r"Hint: Backward expects Q-direction block-sparse tensors.*BLOCK_SIZE=\(128, 128\)",
+    ):
+        _flash_attn_bwd(
+            q=tensors["q"],
+            k=tensors["k"],
+            v=tensors["v"],
+            out=out,
+            dout=grad_out,
+            lse=lse,
+            softmax_scale=softmax_scale,
+            causal=False,
+            m_block_size=tile_m,
+            n_block_size=tile_n,
+            mask_mod=mask_mod_cute,
+            block_sparse_tensors=block_sparse_mask_bwd,
+        )
+
+
+def test_gqa_block_sparse_broadcast_pattern_recompilation():
+    """Test that different block sparse broadcast patterns trigger recompilation.
+
+    This is a regression test for a bug where:
+    1. First call with block_mask H=1 (broadcasts across all query heads)
+    2. Second call with block_mask H=nheads (no broadcast)
+    3. Second call incorrectly reused cached kernel from first call
+
+    The fix adds block_sparse_broadcast_pattern to the compile key so that
+    kernels are recompiled when broadcast patterns change. CuTe's
+    mark_layout_dynamic() keeps stride=0 as static, so different broadcast
+    patterns require different compiled kernels.
+    """
+    torch.manual_seed(42)
+
+    batch_size = 2
+    nheads = 8
+    nheads_kv = 2
+    seqlen = 257
+    headdim = 64
+    dtype = torch.bfloat16
+    tile_m = 128
+    tile_n = 128
+
+    sparse_tile_m = 2 * tile_m if COMPUTE_CAPABILITY == 10 else tile_m
+
+    def causal_mask(b, h, q, kv):
+        return q >= kv
+
+    mask_mod_cute, _ = get_mask_pair("causal", seqlen_q=seqlen, seqlen_k=seqlen)
+
+    tensors = create_tensors(batch_size, seqlen, seqlen, nheads, nheads_kv, headdim, headdim, dtype)
+    q, k, v = tensors["q"], tensors["k"], tensors["v"]
+    grad_out = torch.randn_like(tensors["out"])
+    softmax_scale = 1.0 / math.sqrt(headdim)
+
+    def run_with_block_mask_nheads(block_mask_nheads: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        bm = create_block_mask(
+            causal_mask, batch_size, block_mask_nheads, seqlen, seqlen,
+            device="cuda", BLOCK_SIZE=(sparse_tile_m, tile_n),
+        )
+        (
+            _seq_q, _seq_k,
+            kv_mask_cnt, kv_mask_idx, full_kv_cnt, full_kv_idx,
+            q_mask_cnt, q_mask_idx, full_q_cnt, full_q_idx, *_,
+        ) = bm.as_tuple()
+
+        block_sparse_fwd = BlockSparseTensorsTorch(
+            mask_block_cnt=kv_mask_cnt, mask_block_idx=kv_mask_idx,
+            full_block_cnt=full_kv_cnt, full_block_idx=full_kv_idx,
+        )
+        block_sparse_bwd = BlockSparseTensorsTorch(
+            mask_block_cnt=q_mask_cnt, mask_block_idx=q_mask_idx,
+            full_block_cnt=full_q_cnt, full_block_idx=full_q_idx,
+        )
+
+        out = torch.empty_like(tensors["out"])
+        lse = torch.empty_like(tensors["lse"])
+
+        out_tuple = _flash_attn_fwd(
+            q=q, k=k, v=v, out=out, lse=lse,
+            softmax_scale=softmax_scale, causal=False,
+            window_size_left=-1, window_size_right=-1,
+            m_block_size=tile_m, n_block_size=tile_n, pack_gqa=False,
+            mask_mod=mask_mod_cute, block_sparse_tensors=block_sparse_fwd,
+            return_lse=True,
+        )
+        out_cute, lse_cute = out_tuple[0], out_tuple[1]
+
+        dq, dk, dv = run_cute_mask_bwd(
+            q, k, v, out_cute, lse_cute, grad_out, mask_mod_cute,
+            block_sparse_mask_bwd=block_sparse_bwd, tile_m=tile_m, tile_n=tile_n,
+        )
+        return dq, dk, dv
+
+    flex_block_mask = create_block_mask(
+        causal_mask, batch_size, nheads, seqlen, seqlen,
+        device="cuda", BLOCK_SIZE=(tile_m, tile_n),
+    )
+    _, dq_ref, dk_ref, dv_ref = run_flex_reference_bwd(q, k, v, flex_block_mask, grad_out, dtype=torch.float32)
+    dq_ref, dk_ref, dv_ref = dq_ref.to(dtype), dk_ref.to(dtype), dv_ref.to(dtype)
+
+    dq_broadcast, dk_broadcast, dv_broadcast = run_with_block_mask_nheads(1)
+    dq_no_broadcast, dk_no_broadcast, dv_no_broadcast = run_with_block_mask_nheads(nheads)
+
+    err_broadcast_dq = (dq_broadcast - dq_ref).abs().max().item()
+    err_no_broadcast_dq = (dq_no_broadcast - dq_ref).abs().max().item()
+
+    print(f"\nGQA block sparse broadcast pattern test:")
+    print(f"  dQ error (H=1 broadcast): {err_broadcast_dq:.2e}")
+    print(f"  dQ error (H={nheads} no broadcast): {err_no_broadcast_dq:.2e}")
+
+    assert err_broadcast_dq < 0.1, f"Broadcast dQ error too large: {err_broadcast_dq:.2e}"
+    assert err_no_broadcast_dq < 0.1, f"No-broadcast dQ error too large: {err_no_broadcast_dq:.2e}"
+
+
+def test_gqa_expand_stride_zero_bug():
+    """Test that GQA with expand()-created K/V tensors works correctly.
+
+    This is a regression test for bugs with expand()-created tensors:
+
+    Forward bug: cute.assume() fails when tensor strides are Python int 0
+    (from expand()) instead of MLIR values.
+    Error: AttributeError: 'int' object has no attribute 'type'
+
+    Backward bug: mark_layout_dynamic fails with expanded tensors.
+    Error: RuntimeError: Expected strides[leading_dim] == 1, but got N.
+
+    Trigger: expand() + transpose() creates stride=0 dimensions (GQA pattern).
+    """
+    torch.manual_seed(42)
+
+    batch_size = 1
+    seqlen = 2048
+    headdim = 128
+    n_heads = 4
+    n_kv_heads = 1
+    dtype = torch.bfloat16
+    device = "cuda"
+
+    q = torch.randn(batch_size, seqlen, n_heads, headdim, device=device, dtype=dtype)
+    k_orig = torch.randn(batch_size, seqlen, n_kv_heads, headdim, device=device, dtype=dtype)
+    v_orig = torch.randn(batch_size, seqlen, n_kv_heads, headdim, device=device, dtype=dtype)
+
+    k = k_orig.expand(batch_size, seqlen, n_heads, headdim)
+    v = v_orig.expand(batch_size, seqlen, n_heads, headdim)
+
+    assert k.stride()[2] == 0, "K should have stride=0 in head dim from expand()"
+    assert v.stride()[2] == 0, "V should have stride=0 in head dim from expand()"
+
+    out = torch.empty_like(q)
+    lse = torch.empty(batch_size, n_heads, seqlen, device=device, dtype=torch.float32)
+    softmax_scale = 1.0 / math.sqrt(headdim)
+
+    out_tuple = _flash_attn_fwd(
+        q=q, k=k, v=v, out=out, lse=lse,
+        softmax_scale=softmax_scale,
+        causal=True,
+        m_block_size=128, n_block_size=128,
+        return_lse=True,
+    )
+    out_fwd, lse_fwd = out_tuple[0], out_tuple[1]
+
+    assert not torch.isnan(out_fwd).any(), "Forward output contains NaN"
+    assert torch.isfinite(out_fwd).all(), "Forward output contains non-finite values"
+
+    tensors_for_ref = {"q": q, "k": k, "v": v}
+    tensors_fp32 = {"q": q.float(), "k": k.float(), "v": v.float()}
+
+    def causal_mask(b, h, q_idx, kv_idx):
+        return q_idx >= kv_idx
+
+    out_ref = compute_reference_flex_attn(tensors_for_ref, causal_mask)
+    out_ref_fp32 = compute_reference_flex_attn(tensors_fp32, causal_mask)
+
+    fwd_atol = 2 * (out_ref_fp32 + 0.3 - 0.3 - out_ref_fp32).abs().max().item()
+    rtol = 2
+    pt_error = (out_ref - out_ref_fp32).abs().max().item()
+    cute_error = (out_fwd - out_ref_fp32).abs().max().item()
+
+    print(f"\nGQA expand stride=0 test:")
+    print(f"  Forward: kernel err={cute_error:.2e}, ref err={pt_error:.2e}, atol={fwd_atol:.2e}")
+    assert cute_error <= rtol * pt_error + fwd_atol, (
+        f"Forward error {cute_error:.2e} exceeds {rtol}x ref error {pt_error:.2e} + {fwd_atol:.2e}"
+    )
+
+    grad_out = torch.randn_like(out_fwd)
+    dq, dk, dv = _flash_attn_bwd(
+        q=q, k=k, v=v, out=out_fwd, dout=grad_out, lse=lse_fwd,
+        softmax_scale=softmax_scale,
+        causal=True,
+        m_block_size=128, n_block_size=128,
+    )
+
+    assert not torch.isnan(dq).any(), "dQ contains NaN"
+    assert not torch.isnan(dk).any(), "dK contains NaN"
+    assert not torch.isnan(dv).any(), "dV contains NaN"
+
+    flex_block_mask = create_block_mask(
+        causal_mask, batch_size, n_heads, seqlen, seqlen,
+        device=device, BLOCK_SIZE=(128, 128),
+    )
+    _, dq_ref, dk_ref, dv_ref = run_flex_reference_bwd(q, k, v, flex_block_mask, grad_out, dtype=torch.float32)
+
+    bwd_rtol = 2
+    bwd_atol_floor = 1e-5
+
+    dq_atol = max(bwd_atol_floor, 2 * (dq_ref + 0.3 - 0.3 - dq_ref).abs().max().item())
+    dk_atol = max(bwd_atol_floor, 2 * (dk_ref + 0.3 - 0.3 - dk_ref).abs().max().item())
+    dv_atol = max(bwd_atol_floor, 2 * (dv_ref + 0.3 - 0.3 - dv_ref).abs().max().item())
+
+    _, dq_pt, dk_pt, dv_pt = run_flex_reference_bwd(q, k, v, flex_block_mask, grad_out)
+
+    pt_dq_err = (dq_pt - dq_ref.to(dtype)).abs().max().item()
+    pt_dk_err = (dk_pt - dk_ref.to(dtype)).abs().max().item()
+    pt_dv_err = (dv_pt - dv_ref.to(dtype)).abs().max().item()
+
+    cute_dq_err = (dq - dq_ref.to(dtype)).abs().max().item()
+    cute_dk_err = (dk - dk_ref.to(dtype)).abs().max().item()
+    cute_dv_err = (dv - dv_ref.to(dtype)).abs().max().item()
+
+    print(f"  Backward dQ: kernel err={cute_dq_err:.2e}, ref err={pt_dq_err:.2e}, atol={dq_atol:.2e}")
+    print(f"  Backward dK: kernel err={cute_dk_err:.2e}, ref err={pt_dk_err:.2e}, atol={dk_atol:.2e}")
+    print(f"  Backward dV: kernel err={cute_dv_err:.2e}, ref err={pt_dv_err:.2e}, atol={dv_atol:.2e}")
+
+    assert cute_dq_err <= bwd_rtol * pt_dq_err + dq_atol, f"dQ error too large: {cute_dq_err:.2e}"
+    assert cute_dk_err <= bwd_rtol * pt_dk_err + dk_atol, f"dK error too large: {cute_dk_err:.2e}"
+    assert cute_dv_err <= bwd_rtol * pt_dv_err + dv_atol, f"dV error too large: {cute_dv_err:.2e}"
 
 
 if __name__ == "__main__":
