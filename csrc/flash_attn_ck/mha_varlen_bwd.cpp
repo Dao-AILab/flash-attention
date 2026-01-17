@@ -333,10 +333,12 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
     at::cuda::CUDAGuard device_guard{q.device()};
 
     auto opts = q.options();
+    // gfx12 deterministic bwd is unstable; always fall back to nondeterministic there.
+    bool deterministic_safe = deterministic && !flash::is_gfx12_arch();
     auto softmax_d = torch::empty({batch_size, num_heads, max_seqlen_q}, opts.dtype(at::kFloat));
     at::Tensor dq_accum;
 
-    if (!deterministic) {
+    if (!deterministic_safe) {
         dq_accum = torch::zeros({1, total_q, num_heads, head_size}, opts.dtype(at::kFloat));
     } else {
         const ck_tile::index_t kN0 = head_size <= 128 ? 128 : 64;

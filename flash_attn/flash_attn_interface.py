@@ -19,6 +19,19 @@ else:
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
+def is_gfx12(device="cuda"):
+    if not torch.cuda.is_available():
+        return False
+    props = torch.cuda.get_device_properties(device)
+    name = getattr(props, "gcnArchName", "") or getattr(props, "name", "")
+    return "gfx12" in name.lower()
+
+def _disable_gfx12_deterministic(deterministic, device):
+    # CK deterministic backward is unstable on gfx12; force nondeterministic there.
+    if deterministic and torch.version.hip and is_gfx12(device):
+        return False
+    return deterministic
+
 
 def _get_block_size_n(device, head_dim, is_dropout, is_causal):
     # This should match the block sizes in the CUDA kernel
@@ -462,6 +475,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
         return_softmax,
         is_grad_enabled,
     ):
+        deterministic = _disable_gfx12_deterministic(deterministic, qkv.device)
         is_grad = is_grad_enabled and qkv.requires_grad
         if softmax_scale is None:
             softmax_scale = qkv.shape[-1] ** (-0.5)
@@ -1127,6 +1141,7 @@ def flash_attn_kvpacked_func(
             The output of softmax (possibly with different scaling). It also encodes the dropout
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
+    deterministic = _disable_gfx12_deterministic(deterministic, q.device)
     return FlashAttnKVPackedFunc.apply(
         q,
         kv,
@@ -1203,6 +1218,7 @@ def flash_attn_func(
             The output of softmax (possibly with different scaling). It also encodes the dropout
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
+    deterministic = _disable_gfx12_deterministic(deterministic, q.device)
     return FlashAttnFunc.apply(
         q,
         k,
@@ -1269,6 +1285,7 @@ def flash_attn_varlen_qkvpacked_func(
             The output of softmax (possibly with different scaling). It also encodes the dropout
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
+    deterministic = _disable_gfx12_deterministic(deterministic, qkv.device)
     return FlashAttnVarlenQKVPackedFunc.apply(
         qkv,
         cu_seqlens,
@@ -1358,6 +1375,7 @@ def flash_attn_varlen_kvpacked_func(
             The output of softmax (possibly with different scaling). It also encodes the dropout
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
+    deterministic = _disable_gfx12_deterministic(deterministic, q.device)
     return FlashAttnVarlenKVPackedFunc.apply(
         q,
         kv,
@@ -1450,6 +1468,7 @@ def flash_attn_varlen_func(
             The output of softmax (possibly with different scaling). It also encodes the dropout
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
+    deterministic = _disable_gfx12_deterministic(deterministic, q.device)
     return FlashAttnVarlenFunc.apply(
         q,
         k,
