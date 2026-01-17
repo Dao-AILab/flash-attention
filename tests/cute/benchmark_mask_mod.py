@@ -20,10 +20,10 @@ from mask_mod_definitions import (
     random_doc_id_tensor,
 )
 from flash_attn.cute.block_sparsity import (
-    compute_block_sparsity,
     BlockSparseTensorsTorch,
     to_cute_block_sparse_tensors,
 )
+from flash_attn.cute.compute_block_sparsity import compute_block_sparsity
 
 
 @dataclass
