@@ -22,6 +22,7 @@ import torch.nn.functional as F
 from flash_attn.cute.interface import _flash_attn_fwd, _flash_attn_bwd
 from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch
 from mask_mod_definitions import get_mask_pair, random_doc_id_tensor
+from test_params import FAST_TEST_MODE, SMOKE_TEST_MODE
 COMPUTE_CAPABILITY = torch.cuda.get_device_capability()[0]
 
 
@@ -99,7 +100,7 @@ def compute_reference_flex_attn(tensors, mask_mod_flex, block_size: tuple[int, i
     return out_ref.transpose(1, 2).contiguous()
 
 
-SEQLEN_PAIRS_COMPREHENSIVE = [
+SEQLEN_PAIRS_COMPREHENSIVE_FULL = [
     (1, 1),
     (64, 128),
     (128, 192),
@@ -122,6 +123,25 @@ SEQLEN_PAIRS_COMPREHENSIVE = [
     (4224, 4224),
 ]
 
+SEQLEN_PAIRS_COMPREHENSIVE_MINIMAL = [
+    (128, 128),
+    (113, 203),
+]
+
+SEQLEN_PAIRS_COMPREHENSIVE_SMOKE = [
+    (64, 128),
+    (256, 256),
+    (113, 203),
+    (512, 256),
+]
+
+if SMOKE_TEST_MODE:
+    SEQLEN_PAIRS_COMPREHENSIVE = SEQLEN_PAIRS_COMPREHENSIVE_MINIMAL
+elif FAST_TEST_MODE:
+    SEQLEN_PAIRS_COMPREHENSIVE = SEQLEN_PAIRS_COMPREHENSIVE_SMOKE
+else:
+    SEQLEN_PAIRS_COMPREHENSIVE = SEQLEN_PAIRS_COMPREHENSIVE_FULL
+
 SEQLEN_PAIRS_SMOKE = [
     (128, 128),
     (256, 256),
@@ -129,6 +149,31 @@ SEQLEN_PAIRS_SMOKE = [
     (1024, 1024),
     (128, 8192)
 ]
+
+STATIC_SEQLEN_PAIRS = (
+    SEQLEN_PAIRS_COMPREHENSIVE_MINIMAL if FAST_TEST_MODE else SEQLEN_PAIRS_COMPREHENSIVE
+)
+STATIC_KV_MODES = ["mha"] if FAST_TEST_MODE else ["mha", "gqa", "mqa"]
+STATIC_TILE_SIZES = [(128, 128)] if FAST_TEST_MODE else [(128, 128), (128, 112)]
+STATIC_MASK_NAMES = ["block_diagonal"] if FAST_TEST_MODE else ["block_diagonal", "mini_causal"]
+STATIC_BLOCK_SPARSITY = [True] if FAST_TEST_MODE else [True, False]
+
+PARAM_SEQLEN_PAIRS = SEQLEN_PAIRS_COMPREHENSIVE_MINIMAL if FAST_TEST_MODE else SEQLEN_PAIRS_SMOKE
+PARAM_KV_MODES = ["mha"] if FAST_TEST_MODE else ["mha", "gqa"]
+PARAM_TILE_SIZES = [(128, 128)] if FAST_TEST_MODE else [(128, 128), (128, 112), (64, 128)]
+PARAM_BLOCK_SPARSITY = [True] if FAST_TEST_MODE else [True, False]
+PARAM_MASKS = (
+    [("causal", None), ("sliding_window", 128)]
+    if FAST_TEST_MODE
+    else [
+        ("causal", None),
+        ("block_causal", None),
+        ("sliding_window", 128),
+        ("sliding_window", 256),
+        ("sliding_window", 512),
+        ("document", None),
+    ]
+)
 
 
 def _run_mask_test(
@@ -607,17 +652,17 @@ def test_single_doc_bwd_minimal():
     assert dv_err < 0.05, f"dV error too large: {dv_err:.2e}"
 
 
-@pytest.mark.parametrize("seqlen_q,seqlen_k", SEQLEN_PAIRS_COMPREHENSIVE)
+@pytest.mark.parametrize("seqlen_q,seqlen_k", STATIC_SEQLEN_PAIRS)
 @pytest.mark.parametrize("nheads", [16])
-@pytest.mark.parametrize("kv_mode", ["mha", "gqa", "mqa"])
+@pytest.mark.parametrize("kv_mode", STATIC_KV_MODES)
 @pytest.mark.parametrize("headdim", [128])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("use_block_sparsity", [True, False])
+@pytest.mark.parametrize("use_block_sparsity", STATIC_BLOCK_SPARSITY)
 @pytest.mark.parametrize(
     "mask_name",
-    ["block_diagonal", "mini_causal"],
+    STATIC_MASK_NAMES,
 )
-@pytest.mark.parametrize("tile_m,tile_n", [(128, 128), (128, 112)])
+@pytest.mark.parametrize("tile_m,tile_n", STATIC_TILE_SIZES)
 def test_static_masks(
     seqlen_q, seqlen_k, nheads, kv_mode, headdim, dtype, use_block_sparsity, mask_name, tile_m, tile_n
 ):
@@ -648,24 +693,17 @@ def test_static_masks(
     )
 
 
-@pytest.mark.parametrize("seqlen_q,seqlen_k", SEQLEN_PAIRS_SMOKE)
+@pytest.mark.parametrize("seqlen_q,seqlen_k", PARAM_SEQLEN_PAIRS)
 @pytest.mark.parametrize("nheads", [16])
-@pytest.mark.parametrize("kv_mode", ["mha", "gqa"])
+@pytest.mark.parametrize("kv_mode", PARAM_KV_MODES)
 @pytest.mark.parametrize("headdim", [128])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("use_block_sparsity", [True, False])
+@pytest.mark.parametrize("use_block_sparsity", PARAM_BLOCK_SPARSITY)
 @pytest.mark.parametrize(
     "mask_name,window_size",
-    [
-        ("causal", None),
-        ("block_causal", None),
-        ("sliding_window", 128),
-        ("sliding_window", 256),
-        ("sliding_window", 512),
-        ("document", None),
-    ],
+    PARAM_MASKS,
 )
-@pytest.mark.parametrize("tile_m,tile_n", [(128, 128), (128, 112), (64, 128)])
+@pytest.mark.parametrize("tile_m,tile_n", PARAM_TILE_SIZES)
 def test_parameterized_masks(
     seqlen_q, seqlen_k, nheads, kv_mode, headdim, dtype, use_block_sparsity, mask_name, window_size, tile_m, tile_n
 ):

@@ -7,18 +7,28 @@ import torch
 import torch.nn.functional as F
 from flash_attn.cute import flash_attn_varlen_func
 
+from test_params import (
+    BATCH_SIZES,
+    NUM_HEADS,
+    HEAD_DIMS,
+    VARLEN_MIN_SEQ,
+    VARLEN_MAX_SEQ,
+    DTYPES,
+    MHA_TYPES,
+)
+
 IS_SM90 = torch.cuda.get_device_capability()[0] == 9
 
 
-@pytest.mark.parametrize("B", [1, 7, 20])
-@pytest.mark.parametrize("H", [1, 4, 6])
-@pytest.mark.parametrize("D", [64, 128])
-@pytest.mark.parametrize("min_seq_len", [1, 32, 128])
-@pytest.mark.parametrize("max_seq_len", [8, 64, 2048])
+@pytest.mark.parametrize("B", BATCH_SIZES)
+@pytest.mark.parametrize("H", NUM_HEADS)
+@pytest.mark.parametrize("D", HEAD_DIMS)
+@pytest.mark.parametrize("min_seq_len", VARLEN_MIN_SEQ)
+@pytest.mark.parametrize("max_seq_len", VARLEN_MAX_SEQ)
 @pytest.mark.parametrize("causal", [True, False])
 @pytest.mark.parametrize("softmax_scale", [None, 0.1])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("mha_type", MHA_TYPES)
 def test_varlen(
     B,
     H,

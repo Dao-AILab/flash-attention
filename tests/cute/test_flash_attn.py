@@ -28,6 +28,19 @@ from flash_attn.cute.interface import (
     _get_device_capability,
 )
 
+from test_params import (
+    SEQLENS,
+    DTYPES,
+    MHA_TYPES,
+    LOCAL_ENUM,
+    VARLEN_MODE,
+    ZERO_LENGTHS,
+    UNPAD,
+    CAUSAL,
+    LEARNABLE_SINK,
+    FAST_TEST_MODE,
+)
+
 
 DISABLE_SPLIT = os.getenv("FLASH_ATTENTION_DISABLE_SPLIT", "FALSE") == "TRUE"
 # SplitKV and paged KV are not supported on SM90
@@ -35,62 +48,16 @@ IS_SM90 = _get_device_capability() == 9
 TEST_BWD_ONLY = False
 VERBOSE = True
 
-# @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
-# @pytest.mark.parametrize("mha_type", ["mha"])
-@pytest.mark.parametrize("has_learnable_sink", [False, True])
-# @pytest.mark.parametrize("has_learnable_sink", [False])
-# @pytest.mark.parametrize("has_qv", [False, True])
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("mha_type", MHA_TYPES)
+@pytest.mark.parametrize("has_learnable_sink", LEARNABLE_SINK)
 @pytest.mark.parametrize("has_qv", [False])
-# @pytest.mark.parametrize("deterministic", [False, True])
 @pytest.mark.parametrize("deterministic", [False])
-# @pytest.mark.parametrize("softcap", [0.0, 15.0])
 @pytest.mark.parametrize("softcap", [0.0])
-@pytest.mark.parametrize("local_enum", [0, 1, 2, 3])
-# @pytest.mark.parametrize("local_enum", [0])
-@pytest.mark.parametrize("causal", [False, True])
-# @pytest.mark.parametrize("causal", [False])
-# @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
-# @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192, 256])
-# @pytest.mark.parametrize('d', [32, 64, 96, 128, 160, 192])
-# @pytest.mark.parametrize('d', [56, 80])
-# @pytest.mark.parametrize("d", [64, 128, 256])
-# @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128])
-# @pytest.mark.parametrize("d", [64, 96, 128, 192])
-# @pytest.mark.parametrize("d", [128, 192])
+@pytest.mark.parametrize("local_enum", LOCAL_ENUM)
+@pytest.mark.parametrize("causal", CAUSAL)
 @pytest.mark.parametrize("d", [64, 128])
-# @pytest.mark.parametrize("d", [128])
-@pytest.mark.parametrize(
-    "seqlen_q,seqlen_k",
-    [
-        (1, 1),
-        (3, 3),
-        (64, 32),
-        (64, 128),
-        (128, 128),
-        (128, 192),
-        (256, 256),
-        (239, 1),
-        (799, 3),
-        (113, 203),
-        (113, 128),
-        (128, 217),
-        (113, 211),
-        (108, 256),
-        (256, 512),
-        (384, 256),
-        (640, 128),
-        (512, 256),
-        (1024, 1024),
-        (1023, 1024),
-        (1024, 1023),
-        (2048, 2048),
-        (4096, 4096),
-        (4224, 4224),
-    ],
-)
-# @pytest.mark.parametrize('seqlen_q,seqlen_k', [(128, 128)])
+@pytest.mark.parametrize("seqlen_q,seqlen_k", SEQLENS)
 def test_flash_attn_output(
     seqlen_q,
     seqlen_k,
@@ -363,77 +330,21 @@ def test_flash_attn_output(
             ).abs().max().item() + dv_atol
 
 
-# @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
-# @pytest.mark.parametrize("mha_type", ["mha"])
-# @pytest.mark.parametrize("has_learnable_sink", [False, True])
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("mha_type", MHA_TYPES)
 @pytest.mark.parametrize("has_learnable_sink", [False])
-# @pytest.mark.parametrize("has_qv", [False, True])
 @pytest.mark.parametrize("has_qv", [False])
-# @pytest.mark.parametrize("deterministic", [False, True])
 @pytest.mark.parametrize("deterministic", [False])
-# @pytest.mark.parametrize("softcap", [0.0, 15.0])
 @pytest.mark.parametrize("softcap", [0.0])
-@pytest.mark.parametrize("local_enum", [0, 1, 2, 3])
-# @pytest.mark.parametrize("local_enum", [0])
-@pytest.mark.parametrize("causal", [False, True])
-# @pytest.mark.parametrize("causal", [False])
-# @pytest.mark.parametrize("add_unused_qkv", [False, True])
+@pytest.mark.parametrize("local_enum", LOCAL_ENUM)
+@pytest.mark.parametrize("causal", CAUSAL)
 @pytest.mark.parametrize("add_unused_qkv", [False])
-# @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
-# @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192, 256])
-# @pytest.mark.parametrize('d', [32, 64, 96, 128, 160, 192])
-# @pytest.mark.parametrize('d', [56, 80])
-# @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128])
-# @pytest.mark.parametrize("d", [64, 96, 128])
-# @pytest.mark.parametrize("d", [128, 192])
 @pytest.mark.parametrize("d", [64, 128])
-@pytest.mark.parametrize(
-    "seqlen_q,seqlen_k",
-    [
-        # (1, 1),
-        # (1, 3),
-        # (2, 1),
-        (511, 1),
-        (3, 513),
-        (64, 128),
-        (128, 128),
-        (256, 256),
-        (113, 203),
-        (128, 217),
-        (113, 211),
-        (108, 256),
-        (256, 512),
-        (307, 256),
-        (640, 128),
-        (512, 256),
-        (1024, 1024),
-        (1023, 1024),
-        (1024, 1023),
-        (2048, 2048),
-    ],
-)
-@pytest.mark.parametrize("varlen_mode", ["random", "third", "full"])
-# @pytest.mark.parametrize("varlen_mode", ["full"])
-@pytest.mark.parametrize(
-    "zero_lengths_q, zero_lengths_k",
-    [
-        (False, False),
-        (True, False),
-        (False, True),
-        (True, True),
-    ],
-)
-@pytest.mark.parametrize(
-    "unpad_q, unpad_kv",
-    [
-        (True, True),
-        (False, False),
-        (True, False),
-        (False, True),
-    ],
-)
+@pytest.mark.parametrize("seqlen_q,seqlen_k", SEQLENS)
+@pytest.mark.parametrize("varlen_mode", VARLEN_MODE)
+@pytest.mark.parametrize("zero_lengths_q, zero_lengths_k", ZERO_LENGTHS)
+@pytest.mark.parametrize("unpad_q, unpad_kv", UNPAD)
+@pytest.mark.slow
 def test_flash_attn_varlen_output(
     seqlen_q,
     seqlen_k,
@@ -829,18 +740,63 @@ def test_flash_attn_varlen_output(
             ).abs().max().item() + dv_atol
 
 
+@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
+def test_flash_attn_varlen_output_fast(mha_type):
+    test_flash_attn_varlen_output(
+        seqlen_q=128,
+        seqlen_k=128,
+        d=64,
+        add_unused_qkv=False,
+        causal=False,
+        local_enum=0,
+        softcap=0.0,
+        deterministic=False,
+        has_qv=False,
+        has_learnable_sink=False,
+        mha_type=mha_type,
+        dtype=torch.bfloat16,
+        varlen_mode="random",
+        zero_lengths_q=False,
+        zero_lengths_k=False,
+        unpad_q=True,
+        unpad_kv=True,
+    )
+
+KVCACHE_HAS_LEARNABLE_SINK = [False] if FAST_TEST_MODE else [False, True]
+KVCACHE_LOCAL = [False] if FAST_TEST_MODE else [False, True]
+KVCACHE_CAUSAL = [True] if FAST_TEST_MODE else [False, True]
+KVCACHE_PAGE_SIZE = [None] if FAST_TEST_MODE else [None, 1, 4, 128]
+KVCACHE_VARLEN_Q = [False] if FAST_TEST_MODE else [False, True]
+KVCACHE_D = [64] if FAST_TEST_MODE else [64, 128]
+KVCACHE_MHA_TYPES = ["mha"] if FAST_TEST_MODE else MHA_TYPES
+KVCACHE_SEQLEN_QK = (
+    [(1, 128), (64, 256)]
+    if FAST_TEST_MODE
+    else [
+        (1, 128),
+        (1, 339),
+        (3, 1024),
+        (64, 800),
+        (64, 256),
+        (3, 799),
+        (64, 2048),
+        (16, 20000),
+    ]
+)
+
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 # @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
-@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
+@pytest.mark.parametrize("mha_type", KVCACHE_MHA_TYPES)
 # @pytest.mark.parametrize("mha_type", ["mha"])
-@pytest.mark.parametrize("has_learnable_sink", [False, True])
+
+@pytest.mark.parametrize("has_learnable_sink", KVCACHE_HAS_LEARNABLE_SINK)
 # @pytest.mark.parametrize("has_learnable_sink", [False])
 # @pytest.mark.parametrize("new_kv", [False, True])
 @pytest.mark.parametrize("new_kv", [False])
-@pytest.mark.parametrize("local", [False, True])
+@pytest.mark.parametrize("local", KVCACHE_LOCAL)
 # @pytest.mark.parametrize("local", [False])
-@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("causal", KVCACHE_CAUSAL)
 # @pytest.mark.parametrize("causal", [True])
 # @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True, False])
 @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [False])
@@ -850,40 +806,23 @@ def test_flash_attn_varlen_output(
 @pytest.mark.parametrize("rotary_interleaved", [True])
 # @pytest.mark.parametrize("rotary_fraction", [0.0, 0.5, 1.0])
 @pytest.mark.parametrize("rotary_fraction", [0.0])
-@pytest.mark.parametrize("page_size", [None] + ([1, 4, 128]))
+@pytest.mark.parametrize("page_size", KVCACHE_PAGE_SIZE)
 # @pytest.mark.parametrize("page_size", [None, 128])
 # @pytest.mark.parametrize("page_size", [128])
 # @pytest.mark.parametrize("has_leftpad", [False, True])
 @pytest.mark.parametrize("has_leftpad", [False])
 # @pytest.mark.parametrize("has_batch_idx", [False, True])
 @pytest.mark.parametrize("has_batch_idx", [False])
-@pytest.mark.parametrize("varlen_q", [False, True])
+@pytest.mark.parametrize("varlen_q", KVCACHE_VARLEN_Q)
 # @pytest.mark.parametrize("varlen_q", [False])
 # @pytest.mark.parametrize("d", [32, 59, 64, 80, 128, 256])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192])
 # @pytest.mark.parametrize('d', [56, 80])
 # @pytest.mark.parametrize("d", [128])
-@pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("d", KVCACHE_D)
 # @pytest.mark.parametrize("d", [192])
-@pytest.mark.parametrize(
-    "seqlen_q,seqlen_k",
-    [
-        (1, 128),
-        (1, 339),
-        (3, 1024),
-        (64, 800),
-        (64, 256),
-        (3, 799),
-        (64, 2048),
-        (16, 20000),
-        # # (1, 128 * 1024),
-        # # (16, 128 * 1024),
-        # (128, 128),
-        # (256, 512),  # To test appending KV with more than 1 block
-        # (2048, 3577),  # Enough tile to test persistent scheduler
-    ],
-)
+@pytest.mark.parametrize("seqlen_q,seqlen_k", KVCACHE_SEQLEN_QK)
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(256, 128)])
 def test_flash_attn_kvcache(
     seqlen_q,
@@ -1455,6 +1394,7 @@ def attention_combine_ref(out_partial, lse_partial):
     return out, lse
 
 
+@pytest.mark.slow
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 # @pytest.mark.parametrize("dtype", [torch.float32])
 # @pytest.mark.parametrize("d", [32, 40, 59, 64, 80, 96, 111, 128, 160, 192, 224, 256])
@@ -1520,3 +1460,11 @@ def test_flash_attn_combine(num_splits, seqlen, d, dtype):
     assert torch.allclose(out_no_lse, out, atol=1e-5, rtol=1e-5), (
         "Output should be the same regardless of return_lse"
     )
+
+
+@pytest.mark.parametrize("num_splits", [1, 5])
+@pytest.mark.parametrize("seqlen", [32, 128])
+@pytest.mark.parametrize("d", [64])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_flash_attn_combine_fast(num_splits, seqlen, d, dtype):
+    test_flash_attn_combine(num_splits=num_splits, seqlen=seqlen, d=d, dtype=dtype)

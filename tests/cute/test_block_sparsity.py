@@ -6,7 +6,7 @@ from torch.nn.attention.flex_attention import create_block_mask
 
 from mask_mod_definitions import get_mask_pair
 from flash_attn.cute.compute_block_sparsity import compute_block_sparsity
-
+from test_params import FAST_TEST_MODE, SMOKE_TEST_MODE
 
 def _call_compute_block_sparsity(
     batch_size,
@@ -149,27 +149,22 @@ def _compare_block_sparsity(
 
 
 # Test configurations
-SEQLEN_PAIRS = [
-    # Small aligned
+SEQLEN_PAIRS_FULL = [
     (64, 64),
     (128, 128),
     (256, 256),
     (512, 512),
-    # Rectangular
     (128, 256),
     (256, 128),
     (512, 256),
     (256, 512),
-    # Large aligned
     (1024, 1024),
     (2048, 2048),
     (4096, 4096),
     (8192, 8192),
-    # Large unaligned
     (1000, 1000),
     (2000, 2000),
     (4000, 4000),
-    # Edge cases with unaligned seqlens
     (113, 203),
     (127, 127),
     (129, 129),
@@ -180,20 +175,29 @@ SEQLEN_PAIRS = [
     (2047, 2047),
     (2049, 2049),
 ]
-TILE_SIZES = [
-    # Standard powers of 2
+SEQLEN_PAIRS_MINIMAL = [
+    (128, 128),
+    (113, 203),
+]
+SEQLEN_PAIRS_SMOKE = [
+    (64, 64),
+    (256, 256),
+    (128, 256),
+    (256, 128),
+    (113, 203),
+]
+
+TILE_SIZES_FULL = [
     (32, 32),
     (64, 64),
     (128, 128),
     (256, 256),
-    # Rectangular
     (32, 64),
     (64, 32),
     (64, 128),
     (128, 64),
     (128, 256),
     (256, 128),
-    # Unusual sizes
     (40, 40),
     (48, 48),
     (96, 96),
@@ -203,12 +207,40 @@ TILE_SIZES = [
     (40, 96),
     (96, 40),
 ]
+TILE_SIZES_MINIMAL = [
+    (64, 64),
+    (128, 128),
+]
+TILE_SIZES_SMOKE = [
+    (32, 32),
+    (64, 64),
+    (128, 128),
+    (64, 128),
+]
+
+if SMOKE_TEST_MODE:
+    SEQLEN_PAIRS = SEQLEN_PAIRS_MINIMAL
+    TILE_SIZES = TILE_SIZES_MINIMAL
+elif FAST_TEST_MODE:
+    SEQLEN_PAIRS = SEQLEN_PAIRS_SMOKE
+    TILE_SIZES = TILE_SIZES_SMOKE
+else:
+    SEQLEN_PAIRS = SEQLEN_PAIRS_FULL
+    TILE_SIZES = TILE_SIZES_FULL
+
+BATCH_SIZES_SMOKE = [1]
+BATCH_SIZES_FULL = [1, 2]
+BATCH_SIZES = BATCH_SIZES_SMOKE if FAST_TEST_MODE else BATCH_SIZES_FULL
+
+NHEADS_SMOKE = [1]
+NHEADS_FULL = [1, 4]
+NHEADS = NHEADS_SMOKE if FAST_TEST_MODE else NHEADS_FULL
 
 
 @pytest.mark.parametrize("seqlen_q,seqlen_k", SEQLEN_PAIRS)
 @pytest.mark.parametrize("tile_m,tile_n", TILE_SIZES)
-@pytest.mark.parametrize("batch_size", [1, 2])
-@pytest.mark.parametrize("nheads", [1, 4])
+@pytest.mark.parametrize("batch_size", BATCH_SIZES)
+@pytest.mark.parametrize("nheads", NHEADS)
 @pytest.mark.parametrize("mask_name", ["block_diagonal", "mini_causal"])
 def test_fixed_length_masks(
     seqlen_q, seqlen_k, tile_m, tile_n, batch_size, nheads, mask_name

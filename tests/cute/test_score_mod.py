@@ -7,6 +7,8 @@ import operator
 from torch.nn.attention.flex_attention import flex_attention
 from flash_attn.cute.interface import _flash_attn_fwd, _flash_attn_bwd
 
+from test_params import SEQLENS, DTYPES, FAST_TEST_MODE
+
 COMPUTE_CAPABILITY = torch.cuda.get_device_capability()[0]
 
 from score_mod_definitions import (
@@ -42,45 +44,66 @@ COMPUTE_CAPABILITY = torch.cuda.get_device_capability()[0]
 
 # Test pairs: (cute_jit_function, eager_reference_function)
 TEST_PAIRS = [
-    (score_mod_1, None),
-    (score_mod_2, causal_mask_eager),
-    (score_mod_3, relative_bias_eager),
-    (score_mod_4, relative_bias_v2_eager),
-    (score_mod_5, times_two_eager),
-    (score_mod_6, alibi_bias_eager),
-    (score_mod_7, sliding_window_eager),
-    (score_mod_8, block_diagonal_eager),
-    (score_mod_9, causal_mask_v2_eager),
+    pytest.param((score_mod_1, None), id="identity"),
+    pytest.param((score_mod_2, causal_mask_eager), id="causal"),
+    pytest.param((score_mod_3, relative_bias_eager), id="rel_bias"),
+    pytest.param((score_mod_4, relative_bias_v2_eager), id="rel_bias_x2"),
+    pytest.param((score_mod_5, times_two_eager), id="times_two"),
+    pytest.param((score_mod_6, alibi_bias_eager), id="alibi"),
+    pytest.param((score_mod_7, sliding_window_eager), id="sliding_window"),
+    pytest.param((score_mod_8, block_diagonal_eager), id="block_diagonal"),
+    pytest.param((score_mod_9, causal_mask_v2_eager), id="causal_v2"),
 ]
+
+TEST_PAIRS_ACTIVE = (
+    [
+        pytest.param((score_mod_1, None), id="identity"),
+        pytest.param((score_mod_2, causal_mask_eager), id="causal"),
+        pytest.param((score_mod_7, sliding_window_eager), id="sliding_window"),
+        pytest.param((score_mod_8, block_diagonal_eager), id="block_diagonal"),
+    ]
+    if FAST_TEST_MODE
+    else TEST_PAIRS
+)
 
 # Test pairs with aux_tensors: (cute_jit_function, eager_reference_function_factory)
 TEST_PAIRS_WITH_AUX_TENSORS = [
-    (score_mod_10, batch_bias),
-    (score_mod_11, dual_buffer_bias),
+    pytest.param((score_mod_10, batch_bias), id="batch_bias"),
+    pytest.param((score_mod_11, dual_buffer_bias), id="dual_buffer"),
 ]
 
-SEQLEN_CONFIGS = [
-    (1, 1),
-    (64, 128),
-    (128, 192),
-    (256, 256),
-    (239, 1),
-    (799, 3),
-    (113, 203),
-    (113, 128),
-    (128, 217),
-    (113, 211),
-    (108, 256),
-    (256, 512),
-    (384, 256),
-    (640, 128),
-    (512, 256),
-    (1024, 1024),
-    (1023, 1024),
-    (1024, 1023),
-    (4096, 4096),
-    (4224, 4224),
-]
+TEST_PAIRS_WITH_AUX_TENSORS_ACTIVE = (
+    [pytest.param((score_mod_10, batch_bias), id="batch_bias")]
+    if FAST_TEST_MODE
+    else TEST_PAIRS_WITH_AUX_TENSORS
+)
+
+SEQLEN_CONFIGS = SEQLENS
+
+SCORE_MOD_DTYPES = [torch.bfloat16] if FAST_TEST_MODE else [torch.float16, torch.bfloat16]
+SCORE_MOD_QHEAD_CONFIGS = [(1, 2)] if FAST_TEST_MODE else [(1, 2), (4, 2)]
+SCORE_MOD_AUX_QHEAD_CONFIGS = [(1, 1)] if FAST_TEST_MODE else [(1, 1), (4, 2)]
+SCORE_MOD_PAGED_PAGE_SIZES = [None] if FAST_TEST_MODE else [None, 1, 4, 128]
+SCORE_MOD_PAGED_SEQLENS = (
+    [(1, 128), (64, 256)]
+    if FAST_TEST_MODE
+    else [
+        (1, 128),
+        (64, 256),
+        (64, 800),
+        (256, 256),
+        (113, 203),
+    ]
+)
+SCORE_MOD_PAGED_AUX_SEQLENS = (
+    [(64, 128)]
+    if FAST_TEST_MODE
+    else [
+        (64, 128),
+        (128, 256),
+        (256, 256),
+    ]
+)
 
 
 def create_tensors(
@@ -122,9 +145,9 @@ def run_flex_reference(q, k, v, eager_score_mod, dtype=None) -> torch.Tensor:
 
 
 @pytest.mark.parametrize("seqlen_q,seqlen_kv", SEQLEN_CONFIGS)
-@pytest.mark.parametrize("qhead_per_kvhead,num_kv_heads", [(1, 2), (4, 2)])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("score_mod_pair", TEST_PAIRS)
+@pytest.mark.parametrize("qhead_per_kvhead,num_kv_heads", SCORE_MOD_QHEAD_CONFIGS)
+@pytest.mark.parametrize("dtype", SCORE_MOD_DTYPES)
+@pytest.mark.parametrize("score_mod_pair", TEST_PAIRS_ACTIVE)
 def test_cute_vs_flex_attention(
     seqlen_q, seqlen_kv, qhead_per_kvhead, num_kv_heads, dtype, score_mod_pair
 ):
@@ -175,9 +198,9 @@ def test_cute_vs_flex_attention(
 
 
 @pytest.mark.parametrize("seqlen_q,seqlen_kv", SEQLEN_CONFIGS)
-@pytest.mark.parametrize("qhead_per_kvhead,num_kv_heads", [(1, 1), (4, 2)])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("score_mod_pair", TEST_PAIRS_WITH_AUX_TENSORS)
+@pytest.mark.parametrize("qhead_per_kvhead,num_kv_heads", SCORE_MOD_AUX_QHEAD_CONFIGS)
+@pytest.mark.parametrize("dtype", SCORE_MOD_DTYPES)
+@pytest.mark.parametrize("score_mod_pair", TEST_PAIRS_WITH_AUX_TENSORS_ACTIVE)
 def test_cute_vs_flex_attention_with_aux_tensors(
     seqlen_q, seqlen_kv, qhead_per_kvhead, num_kv_heads, dtype, score_mod_pair
 ):
@@ -280,20 +303,11 @@ def _generate_block_kvcache(
     return k_cache, v_cache, page_table, k_cache_paged, v_cache_paged, num_blocks
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("page_size", [None, 1, 4, 128])
-@pytest.mark.parametrize("qhead_per_kvhead,num_kv_heads", [(1, 2), (4, 2)])
-@pytest.mark.parametrize(
-    "seqlen_q,seqlen_kv",
-    [
-        (1, 128),
-        (64, 256),
-        (64, 800),
-        (256, 256),
-        (113, 203),
-    ],
-)
-@pytest.mark.parametrize("score_mod_pair", TEST_PAIRS)
+@pytest.mark.parametrize("dtype", SCORE_MOD_DTYPES)
+@pytest.mark.parametrize("page_size", SCORE_MOD_PAGED_PAGE_SIZES)
+@pytest.mark.parametrize("qhead_per_kvhead,num_kv_heads", SCORE_MOD_QHEAD_CONFIGS)
+@pytest.mark.parametrize("seqlen_q,seqlen_kv", SCORE_MOD_PAGED_SEQLENS)
+@pytest.mark.parametrize("score_mod_pair", TEST_PAIRS_ACTIVE)
 @pytest.mark.skipif(COMPUTE_CAPABILITY != 10, reason="Paged KV cache only supported on SM100")
 def test_score_mod_with_paged_kvcache(
     seqlen_q,
@@ -439,18 +453,11 @@ def test_score_mod_with_paged_kvcache(
     )
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("page_size", [None, 128])
-@pytest.mark.parametrize("qhead_per_kvhead,num_kv_heads", [(1, 1), (4, 2)])
-@pytest.mark.parametrize(
-    "seqlen_q,seqlen_kv",
-    [
-        (64, 128),
-        (128, 256),
-        (256, 256),
-    ],
-)
-@pytest.mark.parametrize("score_mod_pair", TEST_PAIRS_WITH_AUX_TENSORS)
+@pytest.mark.parametrize("dtype", SCORE_MOD_DTYPES)
+@pytest.mark.parametrize("page_size", SCORE_MOD_PAGED_PAGE_SIZES)
+@pytest.mark.parametrize("qhead_per_kvhead,num_kv_heads", SCORE_MOD_AUX_QHEAD_CONFIGS)
+@pytest.mark.parametrize("seqlen_q,seqlen_kv", SCORE_MOD_PAGED_AUX_SEQLENS)
+@pytest.mark.parametrize("score_mod_pair", TEST_PAIRS_WITH_AUX_TENSORS_ACTIVE)
 @pytest.mark.skipif(COMPUTE_CAPABILITY != 10, reason="Paged KV cache only supported on SM100")
 def test_score_mod_with_paged_kvcache_aux_tensors(
     seqlen_q,
@@ -668,6 +675,36 @@ BWD_TEST_PAIRS_PACK_GQA = [
     (score_mod_3, score_mod_bwd_3, relative_bias_eager),
 ]
 
+BWD_TEST_PAIRS_ACTIVE = (
+    [(score_mod_5, score_mod_bwd_5, times_two_eager)]
+    if FAST_TEST_MODE
+    else BWD_TEST_PAIRS
+)
+BWD_TEST_PAIRS_WITH_AUX_ACTIVE = (
+    [(score_mod_10, score_mod_bwd_identity, batch_bias)]
+    if FAST_TEST_MODE
+    else BWD_TEST_PAIRS_WITH_AUX
+)
+BWD_TEST_PAIRS_PACK_GQA_ACTIVE = (
+    [(score_mod_5, score_mod_bwd_5, times_two_eager)]
+    if FAST_TEST_MODE
+    else BWD_TEST_PAIRS_PACK_GQA
+)
+
+BWD_SEQLEN_QK = (
+    [(64, 64)]
+    if FAST_TEST_MODE
+    else [
+        (64, 64),
+        (128, 128),
+        (256, 128),
+        (113, 203),
+    ]
+)
+BWD_DIMS = [64] if FAST_TEST_MODE else [64, 128]
+BWD_DTYPES = [torch.bfloat16] if FAST_TEST_MODE else [torch.bfloat16, torch.float16]
+
+
 
 def run_cute_flash_bwd(
     q, k, v, cute_score_mod, cute_score_mod_bwd, aux_tensors=None, pack_gqa=False
@@ -726,23 +763,10 @@ def run_flex_reference_bwd(q, k, v, eager_score_mod, grad_out, dtype=None):
     return out, dq, dk, dv
 
 
-@pytest.mark.parametrize(
-    "seqlen_q,seqlen_kv",
-    [
-        (64, 64),
-        (128, 128),
-        (256, 256),
-        (512, 512),
-        (799, 3),
-        (3, 799),
-        (128, 256),
-        (256, 128),
-        (113, 203),
-    ],
-)
-@pytest.mark.parametrize("dim", [64, 128])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("score_mod_triple", BWD_TEST_PAIRS)
+@pytest.mark.parametrize("seqlen_q,seqlen_kv", BWD_SEQLEN_QK)
+@pytest.mark.parametrize("dim", BWD_DIMS)
+@pytest.mark.parametrize("dtype", BWD_DTYPES)
+@pytest.mark.parametrize("score_mod_triple", BWD_TEST_PAIRS_ACTIVE)
 def test_cute_vs_flex_attention_backward(seqlen_q, seqlen_kv, dim, dtype, score_mod_triple):
     """Test backward pass with score_mod against flex_attention reference."""
     if COMPUTE_CAPABILITY == 9 and dim == 64:
@@ -805,17 +829,10 @@ def make_aux_tensors_for_bwd(cute_score_mod, eager_factory, seqlen_q, num_heads,
     return [head_bias, pos_scale], eager_factory(head_bias, pos_scale)
 
 
-@pytest.mark.parametrize(
-    "seqlen_q,seqlen_kv",
-    [
-        (64, 64),
-        (128, 128),
-        (256, 128),
-    ],
-)
-@pytest.mark.parametrize("dim", [64, 128])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("score_mod_triple", BWD_TEST_PAIRS_WITH_AUX)
+@pytest.mark.parametrize("seqlen_q,seqlen_kv", BWD_SEQLEN_QK)
+@pytest.mark.parametrize("dim", BWD_DIMS)
+@pytest.mark.parametrize("dtype", BWD_DTYPES)
+@pytest.mark.parametrize("score_mod_triple", BWD_TEST_PAIRS_WITH_AUX_ACTIVE)
 def test_cute_vs_flex_attention_backward_with_aux(
     seqlen_q, seqlen_kv, dim, dtype, score_mod_triple
 ):
@@ -874,11 +891,11 @@ def test_cute_vs_flex_attention_backward_with_aux(
     assert cute_dv_err <= rtol * pt_dv_err + dv_atol, f"dV error too large: {cute_dv_err:.2e}"
 
 
-@pytest.mark.parametrize("seqlen_q,seqlen_kv", [(128, 128), (128, 256)])
-@pytest.mark.parametrize("dim", [64, 128])
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("seqlen_q,seqlen_kv", [(128, 128)] if FAST_TEST_MODE else [(128, 128), (128, 256)])
+@pytest.mark.parametrize("dim", BWD_DIMS)
+@pytest.mark.parametrize("dtype", BWD_DTYPES)
 @pytest.mark.parametrize("qhead_per_kvhead,num_kv_heads", [(4, 2)])
-@pytest.mark.parametrize("score_mod_triple", BWD_TEST_PAIRS_PACK_GQA)
+@pytest.mark.parametrize("score_mod_triple", BWD_TEST_PAIRS_PACK_GQA_ACTIVE)
 def test_cute_vs_flex_attention_backward_pack_gqa(
     seqlen_q, seqlen_kv, dim, dtype, qhead_per_kvhead, num_kv_heads, score_mod_triple
 ):
