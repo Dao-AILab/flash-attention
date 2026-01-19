@@ -9,38 +9,38 @@ from .utils import (
     AUTOTUNE,
     compute_fp8_scaling_factors,
     get_cu_count,
-    is_cdna,
     is_fp8,
     get_arch,
 )
 
+PREPROCESS_AUTOTUNE_KEYS = [
+    "max_seqlen_q",
+    "ACTUAL_HEAD_DIM",
+    "IS_VARLEN",
+]
+
+CAUSAL_AUTOTUNE_KEYS = [
+    "dropout_p",
+    "max_seqlen_q",
+    "max_seqlen_k",
+    "ACTUAL_HEAD_DIM",
+    "IS_VARLEN",
+    "HQ",
+    "HK",
+]
+
+NONCAUSAL_AUTOTUNE_KEYS = [
+    "dropout_p",
+    "max_seqlen_q",
+    "max_seqlen_k",
+    "ACTUAL_HEAD_DIM",
+    "IS_VARLEN",
+    "HQ",
+    "HK",
+]
+
+
 def get_bwd_configs(autotune: bool):
-    # keys
-    preprocess_autotune_keys = [
-        "max_seqlen_q",
-        "ACTUAL_HEAD_DIM",
-        "IS_VARLEN",
-    ]
-
-    causal_autotune_keys = [
-        "dropout_p",
-        "max_seqlen_q",
-        "max_seqlen_k",
-        "ACTUAL_HEAD_DIM",
-        "IS_VARLEN",
-        "HQ",
-        "HK",
-    ]
-
-    noncausal_autotune_keys = [
-        "dropout_p",
-        "max_seqlen_q",
-        "max_seqlen_k",
-        "ACTUAL_HEAD_DIM",
-        "IS_VARLEN",
-        "HQ",
-        "HK",
-    ]
 
     # default config
     if not autotune:
@@ -320,6 +320,47 @@ def get_bwd_configs(autotune: bool):
                     num_warps=4,
                 ),
             ]
+        elif arch in (
+            "gfx1030",
+            "gfx1100",
+            "gfx1101",
+            "gfx1102",
+            "gfx1200",
+            "gfx1201",
+        ):  # RDNA architectures
+            preprocess_autotune_configs = [
+                triton.Config(
+                    {"PRE_BLOCK": 128, "waves_per_eu": 1}, num_stages=1, num_warps=4
+                ),
+            ]
+            noncausal_autotune_configs = [
+                triton.Config(
+                    {
+                        "BLOCK_M1": 32,
+                        "BLOCK_N1": 128,
+                        "BLOCK_M2": 128,
+                        "BLOCK_N2": 32,
+                        "BLK_SLICE_FACTOR": 2,
+                        "waves_per_eu": 1,
+                    },
+                    num_stages=1,
+                    num_warps=4,
+                ),
+            ]
+            causal_autotune_configs = [
+                triton.Config(
+                    {
+                        "BLOCK_M1": 32,
+                        "BLOCK_N1": 128,
+                        "BLOCK_M2": 128,
+                        "BLOCK_N2": 32,
+                        "BLK_SLICE_FACTOR": 2,
+                        "waves_per_eu": 1,
+                    },
+                    num_stages=1,
+                    num_warps=4,
+                ),
+            ]
         else:
             preprocess_autotune_configs = [
                 triton.Config(
@@ -369,9 +410,9 @@ def get_bwd_configs(autotune: bool):
             ), f"BLOCK_N1 ({causal_cfg.all_kwargs()['BLOCK_N1']}) must equal BLOCK_M2 ({causal_cfg.all_kwargs()['BLOCK_M2']})"
 
         return (
-            (preprocess_autotune_configs, preprocess_autotune_keys),
-            (causal_autotune_configs, causal_autotune_keys),
-            (noncausal_autotune_configs, noncausal_autotune_keys),
+            preprocess_autotune_configs,
+            causal_autotune_configs,
+            noncausal_autotune_configs,
         )
 
     # param options
@@ -485,16 +526,16 @@ def get_bwd_configs(autotune: bool):
                                     )
 
     return (
-        (preprocess_autotune_configs, preprocess_autotune_keys),
-        (causal_autotune_configs, causal_autotune_keys),
-        (noncausal_autotune_configs, noncausal_autotune_keys),
+        preprocess_autotune_configs,
+        causal_autotune_configs,
+        noncausal_autotune_configs,
     )
 
 # os.environ["TRITON_PRINT_AUTOTUNING"] = "1"
 (
-    (preprocess_autotune_configs, preprocess_autotune_keys),
-    (causal_autotune_configs, causal_autotune_keys),
-    (noncausal_autotune_configs, noncausal_autotune_keys),
+    preprocess_autotune_configs,
+    causal_autotune_configs,
+    noncausal_autotune_configs,
 ) = get_bwd_configs(AUTOTUNE)
 
 
@@ -2476,7 +2517,7 @@ def _bwd_kernel_split_dq_noncausal(
 # Delta: (batch, nheads_q, max_seqlens_q)
 @triton.autotune(
     configs=preprocess_autotune_configs,
-    key=preprocess_autotune_keys,
+    key=PREPROCESS_AUTOTUNE_KEYS,
     use_cuda_graph=True,
 )
 @triton.jit
@@ -2888,7 +2929,7 @@ def _bwd_dq_inner(
 
 @triton.autotune(
     configs=causal_autotune_configs,
-    key=causal_autotune_keys,
+    key=CAUSAL_AUTOTUNE_KEYS,
     use_cuda_graph=True,
 )
 @triton.jit
@@ -3467,7 +3508,7 @@ def bwd_kernel_fused_causal(  # grid = (nheads_k, tl.cdiv(max_seqlen_q // BLOCK_
 
 @triton.autotune(
     configs=noncausal_autotune_configs,
-    key=noncausal_autotune_keys,
+    key=NONCAUSAL_AUTOTUNE_KEYS,
     use_cuda_graph=True,
 )
 @triton.jit

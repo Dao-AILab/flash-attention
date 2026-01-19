@@ -11,7 +11,6 @@ from .utils import (
     compute_fp8_scaling_factors,
     get_arch,
     get_cu_count,
-    is_cdna,
     is_fp8,
     is_rdna,
     apply_rotary,
@@ -20,19 +19,21 @@ from .utils import (
 
 
 
-def get_fwd_configs(autotune: bool):
+FWD_PREFILL_AUTOTUNE_KEYS = [
+    "IS_CAUSAL",
+    "dropout_p",
+    "MAX_SEQLENS_Q",
+    "MAX_SEQLENS_K",
+    "ACTUAL_BLOCK_DMODEL_QK",
+    "ACTUAL_BLOCK_DMODEL_V",
+    "IS_VARLEN",
+    "HQ",
+    "HK",
+]
+
+
+def get_fwd_prefill_configs(autotune: bool):
     configs = []
-    keys = [
-        "IS_CAUSAL",
-        "dropout_p",
-        "MAX_SEQLENS_Q",
-        "MAX_SEQLENS_K",
-        "ACTUAL_BLOCK_DMODEL_QK",
-        "ACTUAL_BLOCK_DMODEL_V",
-        "IS_VARLEN",
-        "HQ",
-        "HK",
-    ]
 
     # get best config for the architecture
     if not autotune:
@@ -99,17 +100,19 @@ def get_fwd_configs(autotune: bool):
             "gfx1200",
             "gfx1201",
         ):  # RDNA architectures
-            configs.append(
-                triton.Config(
-                    {
-                        "BLOCK_M": 32,
-                        "BLOCK_N": 32,
-                        "waves_per_eu": 2,
-                        "PRE_LOAD_V": False,
-                    },
-                    num_stages=1,
-                    num_warps=2,
-                )
+            configs.extend(
+                [
+                    triton.Config(
+                        {"BLOCK_M": 32, "BLOCK_N": 32, "waves_per_eu": 2, "PRE_LOAD_V": False},
+                        num_stages=1,
+                        num_warps=2,
+                    ),
+                    triton.Config(
+                        {"BLOCK_M": 16, "BLOCK_N": 16, "waves_per_eu": 2, "PRE_LOAD_V": False},
+                        num_stages=1,
+                        num_warps=2,
+                    ),
+                ]
             )
         else:
             configs.append(
@@ -125,11 +128,11 @@ def get_fwd_configs(autotune: bool):
                 )
             )
 
-        return configs, keys
+        return configs
 
     # ===================== Autotune Sweep =====================
-    BLOCK_M_OPTIONS = [128, 64, 32]
-    BLOCK_N_OPTIONS = [128, 64, 32]
+    BLOCK_M_OPTIONS = [128, 64, 32, 16]
+    BLOCK_N_OPTIONS = [128, 64, 32, 16]
     NUM_WARPS_OPTIONS = [2, 4, 8]
     NUM_STAGES_OPTIONS = [1, 2]
     WAVES_PER_EU_OPTIONS = [4, 2, 1]
@@ -153,10 +156,10 @@ def get_fwd_configs(autotune: bool):
                                 )
                             )
 
-    return configs, keys
+    return configs
 
 
-fwd_prefill_autotune_configs, fwd_prefill_autotune_keys = get_fwd_configs(AUTOTUNE)
+fwd_prefill_autotune_configs = get_fwd_prefill_configs(AUTOTUNE)
 
 
 @triton.jit
@@ -986,7 +989,7 @@ def compute_block_masking(
 
 @triton.autotune(
     configs=fwd_prefill_autotune_configs,
-    key=fwd_prefill_autotune_keys,
+    key=FWD_PREFILL_AUTOTUNE_KEYS,
     use_cuda_graph=True,
 )
 @triton.jit
