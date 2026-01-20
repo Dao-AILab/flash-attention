@@ -663,7 +663,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         new_stride = lambda t: (
             *(
                 cute.assume(s, divby=128 // t.element_type.width)
-                if s != 0
+                if not isinstance(s, int) or s != 0
                 else s
                 for s in t.stride[:-1]
             ),
@@ -1306,7 +1306,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         new_stride = lambda t: (
             *(
                 cute.assume(s, divby=128 // t.element_type.width)
-                if s != 0
+                if not isinstance(s, int) or s != 0
                 else s
                 for s in t.stride[:-1]
             ),
@@ -2482,4 +2482,3 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 barrier_id=int(NamedBarrierFwd.WarpSchedulerWG1) + next_wg,
                 number_of_threads=2 * self.num_threads_per_warp_group,
             )
-
