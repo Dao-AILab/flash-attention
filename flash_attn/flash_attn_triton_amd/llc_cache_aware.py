@@ -159,7 +159,7 @@ def calculate_optimal_head_group_size(
     head_dim: int,
     dtype: torch.dtype,
     device_index: int = 0,
-    llc_utilization: float = 1.5  # Use 150% of LLC - optimal for long sequences
+    llc_utilization: float = 1.0  # Use 100% of LLC - optimal for long sequences
 ) -> int:
     """
     Calculate the optimal number of heads to process together to fit K,V in LLC.

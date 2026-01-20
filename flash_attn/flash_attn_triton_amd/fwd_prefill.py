@@ -82,12 +82,12 @@ def get_fwd_prefill_configs(autotune: bool):
                         "BLOCK_M": 64,
                         "BLOCK_N": 64,
                         "waves_per_eu": 1,
-                        "PRE_LOAD_V": True,
+                        "PRE_LOAD_V": False,
                     },
                     num_stages=1,
                     num_warps=4,
                 )
-            )
+            ]
         else:
             return [
                 triton.Config(
