@@ -319,12 +319,15 @@ mha_bwd(const at::Tensor &dout,                   // batch_size x seqlen_q x num
     at::cuda::CUDAGuard device_guard{q.device()};
 
     auto opts = q.options();
-    // gfx12 deterministic bwd is unstable; always fall back to nondeterministic there.
-    bool deterministic_safe = deterministic && !flash::is_gfx12_arch();
+    if (deterministic && flash::is_gfx12_arch()) {
+        TORCH_CHECK(false,
+                    "Deterministic CK backward is unstable on gfx12 GPUs. "
+                    "Please rerun with deterministic=False.");
+    }
     auto softmax_d = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
     at::Tensor dq_accum;
 
-    if (!deterministic_safe) {
+    if (!deterministic) {
         dq_accum = torch::zeros({1, batch_size, seqlen_q, num_heads, head_size}, opts.dtype(at::kFloat));
     } else {
         const ck_tile::index_t kN0 = head_size <= 128 ? 128 : 64;
@@ -365,7 +368,7 @@ mha_bwd(const at::Tensor &dout,                   // batch_size x seqlen_q x num
         ck_tile::stream_config stream_config{stream};
 
         auto traits =
-            get_ck_fmha_bwd_traits(mask, q_dtype_str, head_size, is_dropout, alibi_slopes_.has_value(), deterministic_safe);
+            get_ck_fmha_bwd_traits(mask, q_dtype_str, head_size, is_dropout, alibi_slopes_.has_value(), deterministic);
 
         auto args =
             get_ck_fmha_bwd_args(

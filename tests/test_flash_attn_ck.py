@@ -35,6 +35,9 @@ def skip_deterministic_bwd(deterministic: bool) -> bool:
 def is_bwd_hdim_supported(d):
     return d <= 256
 
+def is_bwd_supported(d, deterministic):
+    return is_bwd_hdim_supported(d) and not skip_deterministic_bwd(deterministic)
+
 
 def ck_randval_to_dropout_mask(randval, p):
     # If p = 0.3, randval in 255 * (0.7, 1.0] will be dropout
@@ -148,7 +151,7 @@ def test_flash_attn_qkvpacked(seqlen, d, dropout_p, causal, local, alibi, determ
     assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item()
 
     g = torch.randn_like(out)
-    if is_bwd_hdim_supported(d) and not skip_deterministic_bwd(deterministic):
+    if is_bwd_supported(d, deterministic):
         (dqkv,) = torch.autograd.grad(out, qkv, g)
         (dqkv_ref,) = torch.autograd.grad(out_ref, qkv, g)
         (dqkv_pt,) = torch.autograd.grad(out_pt, qkv, g)
@@ -265,7 +268,7 @@ def test_flash_attn_varlen_qkvpacked(seqlen, d, dropout_p, causal, local, alibi,
     assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item()
 
     g = torch.randn_like(out)
-    if is_bwd_hdim_supported(d) and not skip_deterministic_bwd(deterministic):
+    if is_bwd_supported(d, deterministic):
         (dqkv_unpad,) = torch.autograd.grad(out, qkv_unpad, g)
         dqkv = dqkv_pad_fn(dqkv_unpad)
         (dqkv_ref,) = torch.autograd.grad(out_ref, qkv, g)
@@ -447,7 +450,7 @@ def test_flash_attn_output(
     assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item()
 
     g = torch.randn_like(out)
-    if is_bwd_hdim_supported(d) and not skip_deterministic_bwd(deterministic):
+    if is_bwd_supported(d, deterministic):
         if kvpacked:
             (
                 dq,
@@ -708,7 +711,7 @@ def test_flash_attn_varlen_output(
     assert (out - out_ref).abs().max().item() <= 4 * (out_pt - out_ref).abs().max().item()
 
     g = torch.randn_like(out)
-    if is_bwd_hdim_supported(d) and not skip_deterministic_bwd(deterministic):
+    if is_bwd_supported(d, deterministic):
         if kvpacked:
             (
                 dq_unpad,
