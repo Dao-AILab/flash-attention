@@ -201,12 +201,12 @@ class FlashAttentionForwardSm100:
         self.tmem_vec_offset = self.tmem_s_offset
 
         if self.head_dim_padded < 96:
-            self.num_regs_softmax = 200
+            self.num_regs_softmax = 200 if not paged_kv_non_tma else 184
             self.num_regs_correction = 64
-            self.num_regs_other = 48
+            self.num_regs_other = 48 if not paged_kv_non_tma else 80
         else:
             # self.num_regs_softmax = 192 if self.is_causal or self.is_local else 184
-            self.num_regs_softmax = 200
+            self.num_regs_softmax = 200 if not paged_kv_non_tma else 184
             # self.num_regs_softmax = 176
             # self.num_regs_correction = 96
             # self.num_regs_correction = 80
@@ -215,7 +215,7 @@ class FlashAttentionForwardSm100:
             # self.num_regs_other = 32
             # self.num_regs_other = 64
             # self.num_regs_other = 80
-            self.num_regs_other = 48
+            self.num_regs_other = 48 if not paged_kv_non_tma else 80
             # self.num_regs_other = 96 if self.is_causal or self.is_local else 80
             # self.num_regs_other = 64 if self.is_causal or self.is_local else 80
         self.num_regs_empty = 24
@@ -675,6 +675,10 @@ class FlashAttentionForwardSm100:
             seqlen_k_divmod = FastDivmodDivisor(seqlen_k)
             fastdiv_mods = (seqlen_q_divmod, seqlen_k_divmod)
 
+        head_divmod = None
+        if cutlass.const_expr(self.pack_gqa):
+            head_divmod = FastDivmodDivisor(self.qhead_per_kvhead)
+
         self.use_block_sparsity = cutlass.const_expr(blocksparse_tensors is not None)
         if cutlass.const_expr(self.use_block_sparsity and mPageTable is not None):
             raise NotImplementedError("Block sparsity + paged KV not supported on SM100")
@@ -713,6 +717,7 @@ class FlashAttentionForwardSm100:
             num_splits,
             aux_tensors,
             fastdiv_mods,
+            head_divmod,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -758,6 +763,7 @@ class FlashAttentionForwardSm100:
         num_splits: Int32,
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
+        head_divmod=None,
     ):
         """The device kernel implementation of the Fused Multi-Head Attention.
 
@@ -1059,6 +1065,7 @@ class FlashAttentionForwardSm100:
                 TileSchedulerCls=TileSchedulerCls,
                 aux_tensors=aux_tensors,
                 fastdiv_mods=fastdiv_mods,
+                head_divmod=head_divmod,
                 blocksparse_tensors=blocksparse_tensors,
             )
 
@@ -1555,6 +1562,7 @@ class FlashAttentionForwardSm100:
         TileSchedulerCls: Callable,
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
+        head_divmod=None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
     ):
         """Compute softmax on attention scores from QK matrix multiplication.
@@ -1659,6 +1667,7 @@ class FlashAttentionForwardSm100:
                 mask.apply_mask_sm100,
                 mask_mod=mask_mod,
                 fastdiv_mods=fastdiv_mods,
+                head_divmod=head_divmod,
                 **shared_mask_kwargs,
             )
             if const_expr(self.use_block_sparsity):
@@ -1667,6 +1676,7 @@ class FlashAttentionForwardSm100:
                     mask.apply_mask_sm100,
                     mask_mod=None,
                     fastdiv_mods=fastdiv_mods,
+                    head_divmod=head_divmod,
                     **shared_mask_kwargs,
                 )
             else:
@@ -1706,6 +1716,7 @@ class FlashAttentionForwardSm100:
                 seqlen=seqlen,
                 aux_tensors=aux_tensors,
                 fastdiv_mods=fastdiv_mods,
+                head_divmod=head_divmod,
             )
 
             if has_work:
@@ -1876,6 +1887,7 @@ class FlashAttentionForwardSm100:
         seqlen,
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
+        head_divmod=None,
         mask_fn: Optional[Callable] = None,
         is_first: bool = False,
     ) -> Tuple[cute.Int32, cute.Int32, cute.Int32]:
@@ -1916,6 +1928,7 @@ class FlashAttentionForwardSm100:
                 seqlen,
                 aux_tensors,
                 fastdiv_mods,
+                head_divmod,
             )
 
         if const_expr(mask_fn is not None):
@@ -2686,6 +2699,7 @@ class FlashAttentionForwardSm100:
         seqlen: SeqlenInfoQK,
         aux_tensors=None,
         fastdiv_mods=(None, None),
+        head_divmod=None,
     ):
         """Apply score modification for SM100 (constant q_idx)."""
         # Prepare index tensor with extra partition
@@ -2699,10 +2713,10 @@ class FlashAttentionForwardSm100:
 
         # For Pack-GQA, compute the logical head index for this tile
         if cutlass.const_expr(self.pack_gqa):
+            assert head_divmod is not None
             # Building up the logical q_head idx: final_q_head = kv_head * qhead_per_kvhead + (q_physical % qhead_per_kvhead)
             q_physical = q_idx_logical
-            q_idx_logical = q_physical // self.qhead_per_kvhead
-            head_offset = q_physical - q_idx_logical * self.qhead_per_kvhead
+            q_idx_logical, head_offset = divmod(q_physical, head_divmod)
             head_idx = head_idx * self.qhead_per_kvhead + head_offset
 
         if cutlass.const_expr(aux_tensors is not None):

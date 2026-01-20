@@ -893,5 +893,215 @@ def test_sm90_block_sparse_bwd_mismatched_q_block_granularity_error_message():
         )
 
 
+def test_gqa_block_sparse_broadcast_pattern_recompilation():
+    """Test that different block sparse broadcast patterns trigger recompilation.
+
+    This is a regression test for a bug where:
+    1. First call with block_mask H=1 (broadcasts across all query heads)
+    2. Second call with block_mask H=nheads (no broadcast)
+    3. Second call incorrectly reused cached kernel from first call
+
+    The fix adds block_sparse_broadcast_pattern to the compile key so that
+    kernels are recompiled when broadcast patterns change. CuTe's
+    mark_layout_dynamic() keeps stride=0 as static, so different broadcast
+    patterns require different compiled kernels.
+    """
+    torch.manual_seed(42)
+
+    batch_size = 2
+    nheads = 8
+    nheads_kv = 2
+    seqlen = 257
+    headdim = 64
+    dtype = torch.bfloat16
+    tile_m = 128
+    tile_n = 128
+
+    sparse_tile_m = 2 * tile_m if COMPUTE_CAPABILITY == 10 else tile_m
+
+    def causal_mask(b, h, q, kv):
+        return q >= kv
+
+    mask_mod_cute, _ = get_mask_pair("causal", seqlen_q=seqlen, seqlen_k=seqlen)
+
+    tensors = create_tensors(batch_size, seqlen, seqlen, nheads, nheads_kv, headdim, headdim, dtype)
+    q, k, v = tensors["q"], tensors["k"], tensors["v"]
+    grad_out = torch.randn_like(tensors["out"])
+    softmax_scale = 1.0 / math.sqrt(headdim)
+
+    def run_with_block_mask_nheads(block_mask_nheads: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        bm = create_block_mask(
+            causal_mask, batch_size, block_mask_nheads, seqlen, seqlen,
+            device="cuda", BLOCK_SIZE=(sparse_tile_m, tile_n),
+        )
+        (
+            _seq_q, _seq_k,
+            kv_mask_cnt, kv_mask_idx, full_kv_cnt, full_kv_idx,
+            q_mask_cnt, q_mask_idx, full_q_cnt, full_q_idx, *_,
+        ) = bm.as_tuple()
+
+        block_sparse_fwd = BlockSparseTensorsTorch(
+            mask_block_cnt=kv_mask_cnt, mask_block_idx=kv_mask_idx,
+            full_block_cnt=full_kv_cnt, full_block_idx=full_kv_idx,
+        )
+        block_sparse_bwd = BlockSparseTensorsTorch(
+            mask_block_cnt=q_mask_cnt, mask_block_idx=q_mask_idx,
+            full_block_cnt=full_q_cnt, full_block_idx=full_q_idx,
+        )
+
+        out = torch.empty_like(tensors["out"])
+        lse = torch.empty_like(tensors["lse"])
+
+        out_tuple = _flash_attn_fwd(
+            q=q, k=k, v=v, out=out, lse=lse,
+            softmax_scale=softmax_scale, causal=False,
+            window_size_left=-1, window_size_right=-1,
+            m_block_size=tile_m, n_block_size=tile_n, pack_gqa=False,
+            mask_mod=mask_mod_cute, block_sparse_tensors=block_sparse_fwd,
+            return_lse=True,
+        )
+        out_cute, lse_cute = out_tuple[0], out_tuple[1]
+
+        dq, dk, dv = run_cute_mask_bwd(
+            q, k, v, out_cute, lse_cute, grad_out, mask_mod_cute,
+            block_sparse_mask_bwd=block_sparse_bwd, tile_m=tile_m, tile_n=tile_n,
+        )
+        return dq, dk, dv
+
+    flex_block_mask = create_block_mask(
+        causal_mask, batch_size, nheads, seqlen, seqlen,
+        device="cuda", BLOCK_SIZE=(tile_m, tile_n),
+    )
+    _, dq_ref, dk_ref, dv_ref = run_flex_reference_bwd(q, k, v, flex_block_mask, grad_out, dtype=torch.float32)
+    dq_ref, dk_ref, dv_ref = dq_ref.to(dtype), dk_ref.to(dtype), dv_ref.to(dtype)
+
+    dq_broadcast, dk_broadcast, dv_broadcast = run_with_block_mask_nheads(1)
+    dq_no_broadcast, dk_no_broadcast, dv_no_broadcast = run_with_block_mask_nheads(nheads)
+
+    err_broadcast_dq = (dq_broadcast - dq_ref).abs().max().item()
+    err_no_broadcast_dq = (dq_no_broadcast - dq_ref).abs().max().item()
+
+    print(f"\nGQA block sparse broadcast pattern test:")
+    print(f"  dQ error (H=1 broadcast): {err_broadcast_dq:.2e}")
+    print(f"  dQ error (H={nheads} no broadcast): {err_no_broadcast_dq:.2e}")
+
+    assert err_broadcast_dq < 0.1, f"Broadcast dQ error too large: {err_broadcast_dq:.2e}"
+    assert err_no_broadcast_dq < 0.1, f"No-broadcast dQ error too large: {err_no_broadcast_dq:.2e}"
+
+
+def test_gqa_expand_stride_zero_bug():
+    """Test that GQA with expand()-created K/V tensors works correctly.
+
+    This is a regression test for bugs with expand()-created tensors:
+
+    Forward bug: cute.assume() fails when tensor strides are Python int 0
+    (from expand()) instead of MLIR values.
+    Error: AttributeError: 'int' object has no attribute 'type'
+
+    Backward bug: mark_layout_dynamic fails with expanded tensors.
+    Error: RuntimeError: Expected strides[leading_dim] == 1, but got N.
+
+    Trigger: expand() + transpose() creates stride=0 dimensions (GQA pattern).
+    """
+    torch.manual_seed(42)
+
+    batch_size = 1
+    seqlen = 2048
+    headdim = 128
+    n_heads = 4
+    n_kv_heads = 1
+    dtype = torch.bfloat16
+    device = "cuda"
+
+    q = torch.randn(batch_size, seqlen, n_heads, headdim, device=device, dtype=dtype)
+    k_orig = torch.randn(batch_size, seqlen, n_kv_heads, headdim, device=device, dtype=dtype)
+    v_orig = torch.randn(batch_size, seqlen, n_kv_heads, headdim, device=device, dtype=dtype)
+
+    k = k_orig.expand(batch_size, seqlen, n_heads, headdim)
+    v = v_orig.expand(batch_size, seqlen, n_heads, headdim)
+
+    assert k.stride()[2] == 0, "K should have stride=0 in head dim from expand()"
+    assert v.stride()[2] == 0, "V should have stride=0 in head dim from expand()"
+
+    out = torch.empty_like(q)
+    lse = torch.empty(batch_size, n_heads, seqlen, device=device, dtype=torch.float32)
+    softmax_scale = 1.0 / math.sqrt(headdim)
+
+    out_tuple = _flash_attn_fwd(
+        q=q, k=k, v=v, out=out, lse=lse,
+        softmax_scale=softmax_scale,
+        causal=True,
+        m_block_size=128, n_block_size=128,
+        return_lse=True,
+    )
+    out_fwd, lse_fwd = out_tuple[0], out_tuple[1]
+
+    assert not torch.isnan(out_fwd).any(), "Forward output contains NaN"
+    assert torch.isfinite(out_fwd).all(), "Forward output contains non-finite values"
+
+    tensors_for_ref = {"q": q, "k": k, "v": v}
+    tensors_fp32 = {"q": q.float(), "k": k.float(), "v": v.float()}
+
+    def causal_mask(b, h, q_idx, kv_idx):
+        return q_idx >= kv_idx
+
+    out_ref = compute_reference_flex_attn(tensors_for_ref, causal_mask)
+    out_ref_fp32 = compute_reference_flex_attn(tensors_fp32, causal_mask)
+
+    fwd_atol = 2 * (out_ref_fp32 + 0.3 - 0.3 - out_ref_fp32).abs().max().item()
+    rtol = 2
+    pt_error = (out_ref - out_ref_fp32).abs().max().item()
+    cute_error = (out_fwd - out_ref_fp32).abs().max().item()
+
+    print(f"\nGQA expand stride=0 test:")
+    print(f"  Forward: kernel err={cute_error:.2e}, ref err={pt_error:.2e}, atol={fwd_atol:.2e}")
+    assert cute_error <= rtol * pt_error + fwd_atol, (
+        f"Forward error {cute_error:.2e} exceeds {rtol}x ref error {pt_error:.2e} + {fwd_atol:.2e}"
+    )
+
+    grad_out = torch.randn_like(out_fwd)
+    dq, dk, dv = _flash_attn_bwd(
+        q=q, k=k, v=v, out=out_fwd, dout=grad_out, lse=lse_fwd,
+        softmax_scale=softmax_scale,
+        causal=True,
+        m_block_size=128, n_block_size=128,
+    )
+
+    assert not torch.isnan(dq).any(), "dQ contains NaN"
+    assert not torch.isnan(dk).any(), "dK contains NaN"
+    assert not torch.isnan(dv).any(), "dV contains NaN"
+
+    flex_block_mask = create_block_mask(
+        causal_mask, batch_size, n_heads, seqlen, seqlen,
+        device=device, BLOCK_SIZE=(128, 128),
+    )
+    _, dq_ref, dk_ref, dv_ref = run_flex_reference_bwd(q, k, v, flex_block_mask, grad_out, dtype=torch.float32)
+
+    bwd_rtol = 2
+    bwd_atol_floor = 1e-5
+
+    dq_atol = max(bwd_atol_floor, 2 * (dq_ref + 0.3 - 0.3 - dq_ref).abs().max().item())
+    dk_atol = max(bwd_atol_floor, 2 * (dk_ref + 0.3 - 0.3 - dk_ref).abs().max().item())
+    dv_atol = max(bwd_atol_floor, 2 * (dv_ref + 0.3 - 0.3 - dv_ref).abs().max().item())
+
+    _, dq_pt, dk_pt, dv_pt = run_flex_reference_bwd(q, k, v, flex_block_mask, grad_out)
+
+    pt_dq_err = (dq_pt - dq_ref.to(dtype)).abs().max().item()
+    pt_dk_err = (dk_pt - dk_ref.to(dtype)).abs().max().item()
+    pt_dv_err = (dv_pt - dv_ref.to(dtype)).abs().max().item()
+
+    cute_dq_err = (dq - dq_ref.to(dtype)).abs().max().item()
+    cute_dk_err = (dk - dk_ref.to(dtype)).abs().max().item()
+    cute_dv_err = (dv - dv_ref.to(dtype)).abs().max().item()
+
+    print(f"  Backward dQ: kernel err={cute_dq_err:.2e}, ref err={pt_dq_err:.2e}, atol={dq_atol:.2e}")
+    print(f"  Backward dK: kernel err={cute_dk_err:.2e}, ref err={pt_dk_err:.2e}, atol={dk_atol:.2e}")
+    print(f"  Backward dV: kernel err={cute_dv_err:.2e}, ref err={pt_dv_err:.2e}, atol={dv_atol:.2e}")
+
+    assert cute_dq_err <= bwd_rtol * pt_dq_err + dq_atol, f"dQ error too large: {cute_dq_err:.2e}"
+    assert cute_dk_err <= bwd_rtol * pt_dk_err + dk_atol, f"dK error too large: {cute_dk_err:.2e}"
+    assert cute_dv_err <= bwd_rtol * pt_dv_err + dv_atol, f"dV error too large: {cute_dv_err:.2e}"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])
