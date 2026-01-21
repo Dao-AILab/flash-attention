@@ -3,6 +3,7 @@ import torch
 from torch.nn.attention.flex_attention import flex_attention
 from flash_attn.cute.interface import _flash_attn_fwd
 from test_score_mod import _generate_block_kvcache
+from test_params import FAST_TEST_MODE, SMOKE_TEST_MODE
 from score_mod_definitions import (
     # TensorSSA-based score mods
     score_mod_alibi,
@@ -64,58 +65,71 @@ IS_SM90 = torch.cuda.get_device_capability()[0] == 9
 # aux_type: None, "batch", "dual_buffer"
 # All score_mods use 7-arg signature: (tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors)
 TEST_PAIRS_NO_GLOBAL = [
-    (score_mod_identity, identity_eager, None),
-    (score_mod_causal, causal_eager, None),
-    (score_mod_rel_bias, rel_bias_eager, None),
-    (score_mod_rel_bias_x2, rel_bias_x2_eager, None),
-    (score_mod_times_two, times_two_eager, None),
-    (score_mod_alibi, alibi_eager, None),
-    (score_mod_sliding_window, sliding_window_eager, None),
-    (score_mod_block_diagonal, block_diagonal_eager, None),
-    (score_mod_causal_v2, causal_v2_eager, None),
-    (score_mod_batch_bias, batch_bias_factory, "batch"),
-    (score_mod_dual_buffer, dual_buffer_factory, "dual_buffer"),
+    pytest.param((score_mod_identity, identity_eager, None), id="identity"),
+    pytest.param((score_mod_causal, causal_eager, None), id="causal"),
+    pytest.param((score_mod_rel_bias, rel_bias_eager, None), id="rel_bias"),
+    pytest.param((score_mod_rel_bias_x2, rel_bias_x2_eager, None), id="rel_bias_x2"),
+    pytest.param((score_mod_times_two, times_two_eager, None), id="times_two"),
+    pytest.param((score_mod_alibi, alibi_eager, None), id="alibi"),
+    pytest.param((score_mod_sliding_window, sliding_window_eager, None), id="sliding_window"),
+    pytest.param((score_mod_block_diagonal, block_diagonal_eager, None), id="block_diagonal"),
+    pytest.param((score_mod_causal_v2, causal_v2_eager, None), id="causal_v2"),
+    pytest.param((score_mod_batch_bias, batch_bias_factory, "batch"), id="batch_bias"),
+    pytest.param((score_mod_dual_buffer, dual_buffer_factory, "dual_buffer"), id="dual_buffer"),
 ]
+
+TEST_PAIRS_NO_GLOBAL_ACTIVE = (
+    [
+        pytest.param((score_mod_identity, identity_eager, None), id="identity"),
+        pytest.param((score_mod_causal, causal_eager, None), id="causal"),
+        pytest.param((score_mod_sliding_window, sliding_window_eager, None), id="sliding_window"),
+        pytest.param((score_mod_block_diagonal, block_diagonal_eager, None), id="block_diagonal"),
+    ]
+    if FAST_TEST_MODE
+    else TEST_PAIRS_NO_GLOBAL
+)
 
 # (cute_score_mod, eager_factory, aux_type, requires_global)
 # aux_type: "kv", "q", "q_and_kv", "q_concat", "kv_with_cu", "multi_buffer"
 # requires_global: "q" (needs varlen_q), "kv" (needs varlen_k), "both" (needs both)
 # All score_mods use 7-arg signature and compute global indices from seqlen_info
 TEST_PAIRS_WITH_GLOBAL = [
-    (score_mod_global_kv_bias, packed_kv_bias_factory, "kv", "kv"),
-    (score_mod_global_q_bias, packed_q_bias_factory, "q", "q"),
-    (score_mod_global_rel_plus_kv_bias, packed_rel_plus_kv_bias_factory, "kv", "kv"),
-    (score_mod_global_q_and_kv_bias, packed_q_and_kv_bias_factory, "q_and_kv", "both"),
-    (
-        score_mod_global_logical_rel_plus_kv_bias,
-        packed_logical_rel_plus_kv_bias_factory,
-        "kv",
-        "kv",
-    ),
-    (
-        score_mod_stress_complex_arithmetic,
-        stress_complex_arithmetic_factory,
-        "q_concat",
-        "q",
-    ),
-    (
-        score_mod_stress_conditional_mask,
-        stress_conditional_mask_factory,
-        "kv_with_cu",
-        "both",
-    ),
-    (
-        score_mod_stress_multi_buffer,
-        stress_multi_buffer_factory,
-        "multi_buffer",
-        "both",
-    ),
-    (score_mod_stress_global_offset, stress_global_offset_factory, "kv", "kv"),
-    (score_mod_stress_xor_pattern, stress_xor_pattern_factory, "kv_with_cu", "kv"),
-    (score_mod_debug_global_idx, debug_global_idx_factory, "kv", "kv"),
+    pytest.param((score_mod_global_kv_bias, packed_kv_bias_factory, "kv", "kv"), id="global_kv_bias"),
+    pytest.param((score_mod_global_q_bias, packed_q_bias_factory, "q", "q"), id="global_q_bias"),
+    pytest.param((score_mod_global_rel_plus_kv_bias, packed_rel_plus_kv_bias_factory, "kv", "kv"), id="global_rel_plus_kv_bias"),
+    pytest.param((score_mod_global_q_and_kv_bias, packed_q_and_kv_bias_factory, "q_and_kv", "both"), id="global_q_and_kv_bias"),
+    pytest.param((score_mod_global_logical_rel_plus_kv_bias, packed_logical_rel_plus_kv_bias_factory, "kv", "kv"), id="global_logical_rel_plus_kv_bias"),
+    pytest.param((score_mod_stress_complex_arithmetic, stress_complex_arithmetic_factory, "q_concat", "q"), id="stress_complex_arithmetic"),
+    pytest.param((score_mod_stress_conditional_mask, stress_conditional_mask_factory, "kv_with_cu", "both"), id="stress_conditional_mask"),
+    pytest.param((score_mod_stress_multi_buffer, stress_multi_buffer_factory, "multi_buffer", "both"), id="stress_multi_buffer"),
+    pytest.param((score_mod_stress_global_offset, stress_global_offset_factory, "kv", "kv"), id="stress_global_offset"),
+    pytest.param((score_mod_stress_xor_pattern, stress_xor_pattern_factory, "kv_with_cu", "kv"), id="stress_xor_pattern"),
+    pytest.param((score_mod_debug_global_idx, debug_global_idx_factory, "kv", "kv"), id="debug_global_idx"),
 ]
 
-SEQLEN_CONFIGS = [
+TEST_PAIRS_WITH_GLOBAL_ACTIVE = (
+    [
+        pytest.param((score_mod_global_kv_bias, packed_kv_bias_factory, "kv", "kv"), id="global_kv_bias"),
+        pytest.param((score_mod_global_q_bias, packed_q_bias_factory, "q", "q"), id="global_q_bias"),
+    ]
+    if FAST_TEST_MODE
+    else TEST_PAIRS_WITH_GLOBAL
+)
+
+SEQLEN_CONFIGS_MINIMAL = [
+    ([64, 128], [64, 128]),
+    ([113, 203], [113, 203]),
+]
+
+SEQLEN_CONFIGS_SMOKE = [
+    ([1], [1]),
+    ([64, 128], [64, 128]),
+    ([113, 203], [113, 203]),
+    ([256, 512], [256, 512]),
+    ([64, 128], [32, 64]),
+]
+
+SEQLEN_CONFIGS_FULL = [
     ([1], [1]),
     ([1, 1], [1, 1]),
     ([2, 3], [2, 3]),
@@ -150,6 +164,15 @@ SEQLEN_CONFIGS = [
     ([1, 1, 1], [128 * 1024] * 3),
     ([1, 1, 1], [256 * 1024] * 3),
 ]
+
+if SMOKE_TEST_MODE:
+    SEQLEN_CONFIGS = SEQLEN_CONFIGS_MINIMAL
+elif FAST_TEST_MODE:
+    SEQLEN_CONFIGS = SEQLEN_CONFIGS_SMOKE
+else:
+    SEQLEN_CONFIGS = SEQLEN_CONFIGS_FULL
+
+SCORE_MOD_DTYPES = [torch.bfloat16] if FAST_TEST_MODE else [torch.float16, torch.bfloat16]
 
 # =============================================================================
 # Helper functions
@@ -379,12 +402,12 @@ def check_results(
 # =============================================================================
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dtype", SCORE_MOD_DTYPES)
 @pytest.mark.parametrize("varlen_q", [True, False])
 @pytest.mark.parametrize("varlen_k", [True, False])
 @pytest.mark.parametrize("qhead_per_kvhead,num_kv_heads", [(4, 2)])
 @pytest.mark.parametrize("seqlens_q,seqlens_k", SEQLEN_CONFIGS)
-@pytest.mark.parametrize("score_mod_tuple", TEST_PAIRS_NO_GLOBAL)
+@pytest.mark.parametrize("score_mod_tuple", TEST_PAIRS_NO_GLOBAL_ACTIVE)
 def test_varlen_with_score_mod(
     seqlens_q,
     seqlens_k,
@@ -489,12 +512,12 @@ def test_varlen_with_score_mod(
     )
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dtype", SCORE_MOD_DTYPES)
 @pytest.mark.parametrize("varlen_q", [True, False])
 @pytest.mark.parametrize("varlen_k", [True, False])
 @pytest.mark.parametrize("qhead_per_kvhead,num_kv_heads", [(1, 1), (4, 2)])
 @pytest.mark.parametrize("seqlens_q,seqlens_k", SEQLEN_CONFIGS)
-@pytest.mark.parametrize("score_mod_tuple", TEST_PAIRS_WITH_GLOBAL)
+@pytest.mark.parametrize("score_mod_tuple", TEST_PAIRS_WITH_GLOBAL_ACTIVE)
 def test_varlen_with_global_idx_score_mod(
     seqlens_q,
     seqlens_k,
@@ -677,13 +700,13 @@ def test_varlen_with_global_idx_score_mod(
     )
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dtype", SCORE_MOD_DTYPES)
 @pytest.mark.parametrize("page_size", [None, 128])
 @pytest.mark.parametrize("varlen_q", [True, False])
 @pytest.mark.parametrize("varlen_k", [True, False])
 @pytest.mark.parametrize("qhead_per_kvhead,num_kv_heads", [(4, 2)])
 @pytest.mark.parametrize("seqlens_q,seqlens_k", SEQLEN_CONFIGS)
-@pytest.mark.parametrize("score_mod_tuple", TEST_PAIRS_NO_GLOBAL)
+@pytest.mark.parametrize("score_mod_tuple", TEST_PAIRS_NO_GLOBAL_ACTIVE)
 def test_varlen_score_mod_kvcache(
     seqlens_q,
     seqlens_k,
@@ -836,13 +859,13 @@ def test_varlen_score_mod_kvcache(
     )
 
 
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dtype", SCORE_MOD_DTYPES)
 @pytest.mark.parametrize("page_size", [None, 128])
 @pytest.mark.parametrize("varlen_q", [True, False])
 @pytest.mark.parametrize("varlen_k", [True, False])
 @pytest.mark.parametrize("qhead_per_kvhead,num_kv_heads", [(1, 1), (4, 2)])
 @pytest.mark.parametrize("seqlens_q,seqlens_k", SEQLEN_CONFIGS)
-@pytest.mark.parametrize("score_mod_tuple", TEST_PAIRS_WITH_GLOBAL)
+@pytest.mark.parametrize("score_mod_tuple", TEST_PAIRS_WITH_GLOBAL_ACTIVE)
 def test_varlen_score_mod_with_paged_kvcache_global(
     seqlens_q,
     seqlens_k,

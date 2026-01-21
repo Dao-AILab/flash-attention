@@ -1,9 +1,131 @@
 import math
+import os
 from typing import Optional
 
 import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
+
+FAST_TEST_MODE = os.getenv("FLASH_ATTN_FAST_TESTS", "0") == "1"
+SMOKE_TEST_MODE = os.getenv("FLASH_ATTN_SMOKE_TESTS", "0") == "1"
+
+if SMOKE_TEST_MODE:
+    FAST_TEST_MODE = True
+
+SEQLENS_MINIMAL = [
+    (128, 128),
+    (113, 203),
+]
+
+SEQLENS_SMOKE = [
+    (64, 128),
+    (256, 256),
+    (113, 203),
+    (512, 256),
+    (1, 239),
+]
+
+SEQLENS_FULL = SEQLENS_SMOKE + [
+    (1, 1),
+    (3, 3),
+    (64, 32),
+    (128, 128),
+    (128, 192),
+    (239, 1),
+    (799, 3),
+    (113, 128),
+    (128, 217),
+    (113, 211),
+    (108, 256),
+    (256, 512),
+    (384, 256),
+    (640, 128),
+    (1024, 1024),
+    (1023, 1024),
+    (1024, 1023),
+    (2048, 2048),
+    (4096, 4096),
+    (4224, 4224),
+]
+
+if SMOKE_TEST_MODE:
+    SEQLENS = SEQLENS_MINIMAL
+elif FAST_TEST_MODE:
+    SEQLENS = SEQLENS_SMOKE
+else:
+    SEQLENS = SEQLENS_FULL
+
+MHA_TYPES_MINIMAL = ["mha", "mqa", "gqa"]
+MHA_TYPES_FULL = ["mha", "mqa", "gqa"]
+MHA_TYPES = MHA_TYPES_MINIMAL if SMOKE_TEST_MODE else MHA_TYPES_FULL
+
+DTYPES_SMOKE = [torch.bfloat16]
+DTYPES_FULL = [torch.float16, torch.bfloat16]
+DTYPES = DTYPES_SMOKE if FAST_TEST_MODE else DTYPES_FULL
+
+VARLEN_MIN_SEQ_SMOKE = [1, 32]
+VARLEN_MIN_SEQ_FULL = [1, 32, 128]
+VARLEN_MIN_SEQ = VARLEN_MIN_SEQ_SMOKE if FAST_TEST_MODE else VARLEN_MIN_SEQ_FULL
+
+VARLEN_MAX_SEQ_SMOKE = [64, 256]
+VARLEN_MAX_SEQ_FULL = [8, 64, 2048]
+VARLEN_MAX_SEQ = VARLEN_MAX_SEQ_SMOKE if FAST_TEST_MODE else VARLEN_MAX_SEQ_FULL
+
+BATCH_SIZES_SMOKE = [1, 7]
+BATCH_SIZES_FULL = [1, 7, 20]
+BATCH_SIZES = BATCH_SIZES_SMOKE if FAST_TEST_MODE else BATCH_SIZES_FULL
+
+NUM_HEADS_SMOKE = [1, 4]
+NUM_HEADS_FULL = [1, 4, 6]
+NUM_HEADS = NUM_HEADS_SMOKE if FAST_TEST_MODE else NUM_HEADS_FULL
+
+HEAD_DIMS = [64, 128]
+
+SCORE_MOD_INDICES_SMOKE = [0, 2, 5]
+SCORE_MOD_INDICES_FULL = list(range(9))
+SCORE_MOD_INDICES = SCORE_MOD_INDICES_SMOKE if FAST_TEST_MODE else SCORE_MOD_INDICES_FULL
+
+LOCAL_ENUM_MINIMAL = [0]
+LOCAL_ENUM_SMOKE = [0, 1]
+LOCAL_ENUM_FULL = [0, 1, 2, 3]
+if SMOKE_TEST_MODE:
+    LOCAL_ENUM = LOCAL_ENUM_MINIMAL
+elif FAST_TEST_MODE:
+    LOCAL_ENUM = LOCAL_ENUM_SMOKE
+else:
+    LOCAL_ENUM = LOCAL_ENUM_FULL
+
+VARLEN_MODE_SMOKE = ["random"]
+VARLEN_MODE_FULL = ["random", "third", "full"]
+VARLEN_MODE = VARLEN_MODE_SMOKE if FAST_TEST_MODE else VARLEN_MODE_FULL
+
+ZERO_LENGTHS_MINIMAL = [(False, False)]
+ZERO_LENGTHS_SMOKE = [(False, False), (True, True)]
+ZERO_LENGTHS_FULL = [(False, False), (True, False), (False, True), (True, True)]
+if SMOKE_TEST_MODE:
+    ZERO_LENGTHS = ZERO_LENGTHS_MINIMAL
+elif FAST_TEST_MODE:
+    ZERO_LENGTHS = ZERO_LENGTHS_SMOKE
+else:
+    ZERO_LENGTHS = ZERO_LENGTHS_FULL
+
+UNPAD_MINIMAL = [(True, True)]
+UNPAD_SMOKE = [(True, True), (False, False)]
+UNPAD_FULL = [(True, True), (False, False), (True, False), (False, True)]
+if SMOKE_TEST_MODE:
+    UNPAD = UNPAD_MINIMAL
+elif FAST_TEST_MODE:
+    UNPAD = UNPAD_SMOKE
+else:
+    UNPAD = UNPAD_FULL
+
+CAUSAL_SMOKE = [True]
+CAUSAL_FULL = [False, True]
+CAUSAL = CAUSAL_SMOKE if FAST_TEST_MODE else CAUSAL_FULL
+
+LEARNABLE_SINK_SMOKE = [False]
+LEARNABLE_SINK_FULL = [False, True]
+LEARNABLE_SINK = LEARNABLE_SINK_SMOKE if FAST_TEST_MODE else LEARNABLE_SINK_FULL
 
 
 class IndexFirstAxis(torch.autograd.Function):
