@@ -32,13 +32,14 @@ fmha_fwd_splitkv_traits get_ck_fmha_fwd_splitkv_traits(const mask_info &mask,
     return fmha_fwd_splitkv_traits{head_size,
                                    head_size,
                                    dtype,
-                                   false, // is_group_mode
-                                   true,  // is_v_rowmajor
-                                   false, // has_logits_soft_cap
+                                   false,  // is_group_mode
+                                   true,   // is_v_rowmajor
+                                   false,  // has_logits_soft_cap
                                    mask.type,
                                    enable_alibi ? bias_enum::alibi : bias_enum::no_bias,
                                    has_lse,
-                                   false}; // do_fp8_static_quant
+                                   false,  // do_fp8_static_quant
+                                   false}; // has_sink
 }
 
 fmha_fwd_appendkv_args get_ck_fmha_fwd_appendkv_args(const int b,

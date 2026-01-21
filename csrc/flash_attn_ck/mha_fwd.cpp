@@ -107,6 +107,7 @@ fmha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                          nullptr, // seqlen_k_ptr
                          nullptr, // cu_seqlen_q_ptr
                          nullptr, // cu_seqlen_k_ptr
+                         nullptr, // sink_ptr
                          seqlen_q,
                          seqlen_k,
                          b,
@@ -139,6 +140,7 @@ fmha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                          batch_stride_o,
                          mask.left,
                          mask.right,
+                         0, // sink_size
                          static_cast<ck_tile::index_t>(mask.type),
                          0, // min_seqlen_q
                          p_dropout,

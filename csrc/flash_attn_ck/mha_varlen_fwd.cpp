@@ -42,7 +42,8 @@ fmha_fwd_splitkv_traits get_ck_fmha_varlen_fwd_splitkv_traits(const mask_info &m
                                    mask.type,
                                    enable_alibi ? bias_enum::alibi : bias_enum::no_bias,
                                    has_lse,
-                                   false}; // do_fp8_static_quant
+                                   false,  // do_fp8_static_quant
+                                   false}; // has_sink
 }
 
 fmha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
@@ -128,6 +129,7 @@ fmha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
                          nullptr,              // seqlen_k_ptr
                          nullptr,              // cu_seqlen_q_ptr
                          nullptr,              // cu_seqlen_kv_ptr
+                         nullptr,              // sink_ptr
                          total_q,
                          total_k,
                          b,
@@ -160,6 +162,7 @@ fmha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
                          batch_stride_o,
                          mask.left,
                          mask.right,
+                         0, // sink_size
                          static_cast<ck_tile::index_t>(mask.type),
                          0, // min_seqlen_q
                          p_dropout,
