@@ -33,13 +33,11 @@ FWD_PREFILL_AUTOTUNE_KEYS = [
 
 
 def get_fwd_prefill_configs(autotune: bool):
-    configs = []
-
     # get best config for the architecture
     if not autotune:
         arch = get_arch()
         if arch == "gfx950":
-            configs.append(
+            return [
                 triton.Config(
                     {
                         "BLOCK_M": 128,
@@ -50,37 +48,35 @@ def get_fwd_prefill_configs(autotune: bool):
                     num_stages=1,
                     num_warps=4,
                 )
-            )
+            ]
         elif arch == "gfx942":
             if get_cu_count() < 304:
-                configs.extend(
-                    [
-                        # best fp8 config
-                        triton.Config(
-                            {
-                                "BLOCK_M": 128,
-                                "BLOCK_N": 64,
-                                "waves_per_eu": 2,
-                                "PRE_LOAD_V": False,
-                            },
-                            num_stages=1,
-                            num_warps=4,
-                        ),
-                        # best f16 config
-                        triton.Config(
-                            {
-                                "BLOCK_M": 128,
-                                "BLOCK_N": 32,
-                                "waves_per_eu": 2,
-                                "PRE_LOAD_V": False,
-                            },
-                            num_stages=2,
-                            num_warps=4,
-                        ),
-                    ]
-                )
+                return [
+                    # best fp8 config
+                    triton.Config(
+                        {
+                            "BLOCK_M": 128,
+                            "BLOCK_N": 64,
+                            "waves_per_eu": 2,
+                            "PRE_LOAD_V": False,
+                        },
+                        num_stages=1,
+                        num_warps=4,
+                    ),
+                    # best f16 config
+                    triton.Config(
+                        {
+                            "BLOCK_M": 128,
+                            "BLOCK_N": 32,
+                            "waves_per_eu": 2,
+                            "PRE_LOAD_V": False,
+                        },
+                        num_stages=2,
+                        num_warps=4,
+                    ),
+                ]
             else:
-                configs.append(
+                return [
                     triton.Config(
                         {
                             "BLOCK_M": 128,
@@ -91,7 +87,7 @@ def get_fwd_prefill_configs(autotune: bool):
                         num_stages=1,
                         num_warps=4,
                     )
-                )
+                ]
         elif arch in (
             "gfx1030",
             "gfx1100",
@@ -100,22 +96,15 @@ def get_fwd_prefill_configs(autotune: bool):
             "gfx1200",
             "gfx1201",
         ):  # RDNA architectures
-            configs.extend(
-                [
-                    triton.Config(
-                        {"BLOCK_M": 32, "BLOCK_N": 32, "waves_per_eu": 2, "PRE_LOAD_V": False},
-                        num_stages=1,
-                        num_warps=2,
-                    ),
-                    triton.Config(
-                        {"BLOCK_M": 16, "BLOCK_N": 16, "waves_per_eu": 2, "PRE_LOAD_V": False},
-                        num_stages=1,
-                        num_warps=2,
-                    ),
-                ]
-            )
+            return [
+                triton.Config(
+                    {"BLOCK_M": 32, "BLOCK_N": 32, "PRE_LOAD_V": False},
+                    num_stages=1,
+                    num_warps=4,
+                ),
+            ]
         else:
-            configs.append(
+            return [
                 triton.Config(
                     {
                         "BLOCK_M": 64,
@@ -126,11 +115,10 @@ def get_fwd_prefill_configs(autotune: bool):
                     num_stages=1,
                     num_warps=4,
                 )
-            )
-
-        return configs
+            ]
 
     # ===================== Autotune Sweep =====================
+    configs = []
     BLOCK_M_OPTIONS = [128, 64, 32, 16]
     BLOCK_N_OPTIONS = [128, 64, 32, 16]
     NUM_WARPS_OPTIONS = [2, 4, 8]
@@ -441,12 +429,8 @@ def _attn_fwd_mask(
 
         # We start from end of seqlen_k so only the first iteration would need
         # to be checked for padding if it is not a multiple of block_n
-        # TODO: This can be optimized to only be true for the padded block.
-        # If this is the last block / iteration, we want to
-        # mask if the sequence length is not a multiple of block size
-        # a solution is to always do BLOCK_M // BLOCK_N + 1 steps if not is_modulo_mn.
-        # last step might get wasted but that is okay. check if this masking works For
-        # that case.
+        # If this is the last block / iteration, we want to mask if the
+        # sequence length is not a multiple of block size.
         if (n_extra_tokens != 0) and (start_n + BLOCK_N == block_max):
             boundary_m = tl.full([BLOCK_M], seqlen_k, dtype=tl.int32)
             size_n = start_n + offs_n[None, :]
@@ -942,13 +926,9 @@ def compute_block_masking(
             #    – the back side can require several masked blocks:
             #         • intersection of the causal diagonal with K-grid
             #           (at most  ⌈BLOCK_M / BLOCK_N⌉ blocks)
-            #         • plus one extra block if this Q-block stops in the
-            #           middle of a K-block or the last K-block is padded
+            #         • plus one for partial K blocks at the causal boundary
             # ------------------------------------------------------------
-            padded_last_k = n_extra_tokens != 0
-            is_modulo_mn = (not padded_last_k) & (seqlen_q % BLOCK_M == 0)
-
-            n_back_masked_blocks = BLOCK_M // BLOCK_N + tl.where(is_modulo_mn, 0, 1)
+            n_back_masked_blocks = BLOCK_M // BLOCK_N + 1
             n_back_masked_blocks = tl.minimum(n_back_masked_blocks, n_visible_k_blocks)
 
             n_front_skip_blocks = 0  # causal never skips the left side

@@ -43,36 +43,40 @@ def get_fwd_decode_configs(autotune: bool):
         
         if arch in ("gfx1030", "gfx1100", "gfx1101", "gfx1102", "gfx1200", "gfx1201"):
             # RDNA architectures
-            splitk_configs = [
-                triton.Config(
-                    {"BLOCK_M": 32, "BLOCK_N": 32, "waves_per_eu": 2},
-                    num_stages=1,
-                    num_warps=2,
-                ),
-            ]
-            reduce_configs = [triton.Config({}, num_stages=1, num_warps=2)]
+            return (
+                [
+                    triton.Config(
+                        {"BLOCK_M": 32, "BLOCK_N": 32},
+                        num_stages=1,
+                        num_warps=4,
+                    ),
+                ],
+                [triton.Config({}, num_stages=1, num_warps=4)],
+            )
         elif arch in ("gfx940", "gfx941", "gfx942", "gfx950"):
             # CDNA architectures
-            splitk_configs = [
-                triton.Config(
-                    {"BLOCK_M": 64, "BLOCK_N": 64, "waves_per_eu": 1},
-                    num_stages=1,
-                    num_warps=4,
-                ),
-            ]
-            reduce_configs = [triton.Config({}, num_stages=1, num_warps=4)]
+            return (
+                [
+                    triton.Config(
+                        {"BLOCK_M": 64, "BLOCK_N": 64, "waves_per_eu": 1},
+                        num_stages=1,
+                        num_warps=4,
+                    ),
+                ],
+                [triton.Config({}, num_stages=1, num_warps=4)],
+            )
         else:
             # Default / fallback
-            splitk_configs = [
-                triton.Config(
-                    {"BLOCK_M": 64, "BLOCK_N": 64, "waves_per_eu": 1},
-                    num_stages=1,
-                    num_warps=4,
-                ),
-            ]
-            reduce_configs = [triton.Config({}, num_stages=1, num_warps=4)]
-
-        return splitk_configs, reduce_configs
+            return (
+                [
+                    triton.Config(
+                        {"BLOCK_M": 64, "BLOCK_N": 64, "waves_per_eu": 1},
+                        num_stages=1,
+                        num_warps=4,
+                    ),
+                ],
+                [triton.Config({}, num_stages=1, num_warps=4)],
+            )
 
     # ===================== Autotune Sweep =====================
     arch = get_arch()

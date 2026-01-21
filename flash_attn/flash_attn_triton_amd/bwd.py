@@ -45,10 +45,11 @@ def get_bwd_configs(autotune: bool):
     # default config
     if not autotune:
         arch = get_arch()
+        
         # configs for the kernels
         if arch == "gfx942":
             if get_cu_count() < 304:
-                preprocess_autotune_configs = [
+                preprocess_configs = [
                     triton.Config(
                         {"PRE_BLOCK": 64, "waves_per_eu": 1}, num_stages=1, num_warps=8
                     ),
@@ -59,7 +60,7 @@ def get_bwd_configs(autotune: bool):
                         {"PRE_BLOCK": 128, "waves_per_eu": 2}, num_stages=1, num_warps=4
                     ),
                 ]
-                noncausal_autotune_configs = [
+                noncausal_configs = [
                     triton.Config(
                         {
                             "BLOCK_M1": 32,
@@ -113,7 +114,7 @@ def get_bwd_configs(autotune: bool):
                         num_warps=8,
                     ),
                 ]
-                causal_autotune_configs = [
+                causal_configs = [
                     triton.Config(
                         {
                             "BLOCK_M1": 32,
@@ -155,7 +156,7 @@ def get_bwd_configs(autotune: bool):
                     ),
                 ]
             else:
-                preprocess_autotune_configs = [
+                preprocess_configs = [
                     triton.Config(
                         {"PRE_BLOCK": 64, "waves_per_eu": 2}, num_stages=2, num_warps=8
                     ),
@@ -163,7 +164,7 @@ def get_bwd_configs(autotune: bool):
                         {"PRE_BLOCK": 64, "waves_per_eu": 1}, num_stages=1, num_warps=4
                     ),
                 ]
-                noncausal_autotune_configs = [
+                noncausal_configs = [
                     triton.Config(
                         {
                             "BLOCK_M1": 32,
@@ -204,7 +205,7 @@ def get_bwd_configs(autotune: bool):
                         num_warps=4,
                     ),
                 ]
-                causal_autotune_configs = [
+                causal_configs = [
                     triton.Config(
                         {
                             "BLOCK_M1": 32,
@@ -233,7 +234,7 @@ def get_bwd_configs(autotune: bool):
                     ),
                 ]
         elif arch == "gfx950":
-            preprocess_autotune_configs = [
+            preprocess_configs = [
                 triton.Config(
                     {"PRE_BLOCK": 64, "waves_per_eu": 2}, num_stages=2, num_warps=8
                 ),
@@ -244,7 +245,7 @@ def get_bwd_configs(autotune: bool):
                     {"PRE_BLOCK": 64, "waves_per_eu": 2}, num_stages=2, num_warps=4
                 ),
             ]
-            noncausal_autotune_configs = [
+            noncausal_configs = [
                 triton.Config(
                     {
                         "BLOCK_M1": 64,
@@ -294,7 +295,7 @@ def get_bwd_configs(autotune: bool):
                     num_warps=4,
                 ),
             ]
-            causal_autotune_configs = [
+            causal_configs = [
                 triton.Config(
                     {
                         "BLOCK_M1": 32,
@@ -328,46 +329,44 @@ def get_bwd_configs(autotune: bool):
             "gfx1200",
             "gfx1201",
         ):  # RDNA architectures
-            preprocess_autotune_configs = [
+            preprocess_configs = [
                 triton.Config(
-                    {"PRE_BLOCK": 128, "waves_per_eu": 1}, num_stages=1, num_warps=4
+                    {"PRE_BLOCK": 32}, num_stages=1, num_warps=4
                 ),
             ]
-            noncausal_autotune_configs = [
+            noncausal_configs = [
                 triton.Config(
                     {
                         "BLOCK_M1": 32,
-                        "BLOCK_N1": 128,
-                        "BLOCK_M2": 128,
+                        "BLOCK_N1": 32,
+                        "BLOCK_M2": 32,
                         "BLOCK_N2": 32,
                         "BLK_SLICE_FACTOR": 2,
-                        "waves_per_eu": 1,
                     },
                     num_stages=1,
                     num_warps=4,
                 ),
             ]
-            causal_autotune_configs = [
+            causal_configs = [
                 triton.Config(
                     {
                         "BLOCK_M1": 32,
-                        "BLOCK_N1": 128,
-                        "BLOCK_M2": 128,
+                        "BLOCK_N1": 32,
+                        "BLOCK_M2": 32,
                         "BLOCK_N2": 32,
                         "BLK_SLICE_FACTOR": 2,
-                        "waves_per_eu": 1,
                     },
                     num_stages=1,
                     num_warps=4,
                 ),
             ]
         else:
-            preprocess_autotune_configs = [
+            preprocess_configs = [
                 triton.Config(
                     {"PRE_BLOCK": 64, "waves_per_eu": 2}, num_stages=2, num_warps=8
                 ),
             ]
-            noncausal_autotune_configs = [
+            noncausal_configs = [
                 triton.Config(
                     {
                         "BLOCK_M1": 32,
@@ -381,7 +380,7 @@ def get_bwd_configs(autotune: bool):
                     num_warps=4,
                 ),
             ]
-            causal_autotune_configs = [
+            causal_configs = [
                 triton.Config(
                     {
                         "BLOCK_M1": 32,
@@ -397,9 +396,7 @@ def get_bwd_configs(autotune: bool):
             ]
 
         # assert constraints
-        for noncausal_cfg, causal_cfg in zip(
-            noncausal_autotune_configs, causal_autotune_configs
-        ):
+        for noncausal_cfg, causal_cfg in zip(noncausal_configs, causal_configs):
             assert (
                 noncausal_cfg.all_kwargs()["BLOCK_N1"]
                 == noncausal_cfg.all_kwargs()["BLOCK_M2"]
@@ -409,12 +406,9 @@ def get_bwd_configs(autotune: bool):
                 == causal_cfg.all_kwargs()["BLOCK_M2"]
             ), f"BLOCK_N1 ({causal_cfg.all_kwargs()['BLOCK_N1']}) must equal BLOCK_M2 ({causal_cfg.all_kwargs()['BLOCK_M2']})"
 
-        return (
-            preprocess_autotune_configs,
-            causal_autotune_configs,
-            noncausal_autotune_configs,
-        )
+        return (preprocess_configs, causal_configs, noncausal_configs)
 
+    # ===================== Autotune Sweep =====================
     # param options
     PRE_BLOCK_OPTIONS = [64, 128]  # og: 128
     PRE_WAVES_PER_EU_OPTIONS = [1, 2]
