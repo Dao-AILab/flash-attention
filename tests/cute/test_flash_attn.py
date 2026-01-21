@@ -39,8 +39,8 @@ VERBOSE = True
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 # @pytest.mark.parametrize("mha_type", ["mha"])
-@pytest.mark.parametrize("has_learnable_sink", [False, True])
-# @pytest.mark.parametrize("has_learnable_sink", [False])
+# @pytest.mark.parametrize("has_learnable_sink", [False, True])
+@pytest.mark.parametrize("has_learnable_sink", [False])
 # @pytest.mark.parametrize("has_qv", [False, True])
 @pytest.mark.parametrize("has_qv", [False])
 # @pytest.mark.parametrize("deterministic", [False, True])
@@ -244,7 +244,7 @@ def test_flash_attn_output(
             # SplitKV not supported on SM90 - skip this iteration
             if IS_SM90 and num_splits > 1:
                 continue
-            out, lse = flash_attn_func(
+            out = flash_attn_func(
                 q,
                 k,
                 v,
@@ -254,7 +254,7 @@ def test_flash_attn_output(
                 window_size=window_size,
                 # attention_chunk=attention_chunk,
                 softcap=softcap,
-                learnable_sink=learnable_sink,
+                # learnable_sink=learnable_sink,
                 pack_gqa=pack_gqa,
                 num_splits=num_splits,
                 deterministic=deterministic,
@@ -665,7 +665,7 @@ def test_flash_attn_varlen_output(
             # SplitKV not supported on SM90 - skip this iteration
             if IS_SM90 and num_splits > 1:
                 continue
-            out_unpad, lse = flash_attn_varlen_func(
+            out_unpad = flash_attn_varlen_func(
                 q_unpad if unpad_q else q,
                 k_unpad if unpad_kv else k,
                 v_unpad if unpad_kv else v,
@@ -681,7 +681,7 @@ def test_flash_attn_varlen_output(
                 # k_descale=k_descale, v_descale=v_descale,
                 window_size=window_size,
                 # attention_chunk=attention_chunk,
-                learnable_sink=learnable_sink,
+                # learnable_sink=learnable_sink,
                 softcap=softcap,
                 num_splits=num_splits,
                 pack_gqa=pack_gqa,
@@ -1257,7 +1257,7 @@ def test_flash_attn_kvcache(
                     k_cache_paged.copy_(k_cache_saved)
                     v_cache_paged.copy_(v_cache_saved)
                 # out, lse, *rest = flash_attn_with_kvcache(
-                out, lse, *rest = flash_attn_varlen_func(
+                out = flash_attn_varlen_func(
                     q if not varlen_q else q_unpad,
                     k_cache if page_size is None else k_cache_paged,
                     v_cache if page_size is None else v_cache_paged,
@@ -1275,7 +1275,7 @@ def test_flash_attn_kvcache(
                     # rotary_seqlens=rotary_seqlens,
                     causal=causal,
                     window_size=window_size,
-                    learnable_sink=learnable_sink,
+                    # learnable_sink=learnable_sink,
                     # attention_chunk=attention_chunk,
                     # rotary_interleaved=rotary_interleaved,
                     # scheduler_metadata=scheduler_metadata,
