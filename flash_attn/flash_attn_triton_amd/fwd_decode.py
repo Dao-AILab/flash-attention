@@ -41,8 +41,7 @@ def get_fwd_decode_configs(autotune: bool):
     if not autotune:
         arch = get_arch()
         
-        if arch in ("gfx1030", "gfx1100", "gfx1101", "gfx1102", "gfx1200", "gfx1201"):
-            # RDNA architectures
+        if arch.is_rdna:
             return (
                 [
                     triton.Config(
@@ -53,8 +52,7 @@ def get_fwd_decode_configs(autotune: bool):
                 ],
                 [triton.Config({}, num_stages=1, num_warps=4)],
             )
-        elif arch in ("gfx940", "gfx941", "gfx942", "gfx950"):
-            # CDNA architectures
+        elif arch.is_cdna:
             return (
                 [
                     triton.Config(

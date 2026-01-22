@@ -7,7 +7,32 @@ import functools
 import triton
 import triton.language as tl
 import numpy as np
+from dataclasses import dataclass
 from typing import Literal, Optional, Union, Tuple
+
+
+# -------------------------------
+# GPU Architecture
+# -------------------------------
+ArchFamily = Literal["cdna", "rdna"]
+
+CDNA_ARCHS = frozenset({"gfx908", "gfx90a", "gfx940", "gfx941", "gfx942", "gfx950"})
+RDNA_ARCHS = frozenset({"gfx1030", "gfx1100", "gfx1101", "gfx1102", "gfx1200", "gfx1201"})
+
+
+@dataclass(frozen=True)
+class GpuArch:
+    """GPU architecture information."""
+    name: str  # e.g., "gfx942", "gfx1100"
+    family: Optional[ArchFamily] = None
+
+    @property
+    def is_cdna(self) -> bool:
+        return self.family == "cdna"
+
+    @property
+    def is_rdna(self) -> bool:
+        return self.family == "rdna"
 
 # -------------------------------
 # Gloabl Variables
@@ -1487,8 +1512,15 @@ def is_hip():
 
 
 @functools.cache
-def get_arch():
-    return triton.runtime.driver.active.get_current_target().arch
+def get_arch() -> GpuArch:
+    """Get the current GPU architecture."""
+    name = triton.runtime.driver.active.get_current_target().arch
+    if name in CDNA_ARCHS:
+        return GpuArch(name=name, family="cdna")
+    elif name in RDNA_ARCHS:
+        return GpuArch(name=name, family="rdna")
+    else:
+        return GpuArch(name=name)
 
 
 @functools.cache
@@ -1496,27 +1528,3 @@ def get_cu_count():
     return torch.cuda.get_device_properties(
         torch.cuda.current_device()
     ).multi_processor_count
-
-
-@functools.cache
-def is_cdna():
-    return is_hip() and get_arch() in (
-        "gfx908",
-        "gfx90a",
-        "gfx940",
-        "gfx941",
-        "gfx942",
-        "gfx950",
-    )
-
-
-@functools.cache
-def is_rdna():
-    return is_hip() and get_arch() in (
-        "gfx1030",
-        "gfx1100",
-        "gfx1101",
-        "gfx1102",
-        "gfx1200",
-        "gfx1201",
-    )

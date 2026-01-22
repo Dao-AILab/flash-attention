@@ -47,7 +47,7 @@ def get_bwd_configs(autotune: bool):
         arch = get_arch()
         
         # configs for the kernels
-        if arch == "gfx942":
+        if arch.name == "gfx942":
             if get_cu_count() < 304:
                 preprocess_configs = [
                     triton.Config(
@@ -321,14 +321,7 @@ def get_bwd_configs(autotune: bool):
                     num_warps=4,
                 ),
             ]
-        elif arch in (
-            "gfx1030",
-            "gfx1100",
-            "gfx1101",
-            "gfx1102",
-            "gfx1200",
-            "gfx1201",
-        ):  # RDNA architectures
+        elif arch.is_rdna:
             preprocess_configs = [
                 triton.Config(
                     {"PRE_BLOCK": 32}, num_stages=1, num_warps=4

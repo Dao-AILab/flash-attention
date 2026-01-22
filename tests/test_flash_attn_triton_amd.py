@@ -16,7 +16,19 @@ from flash_attn import (
 from flash_attn.bert_padding import pad_input, unpad_input
 from flash_attn.flash_attn_interface import _get_block_size_n
 from flash_attn.layers.rotary import apply_rotary_emb
-from flash_attn.flash_attn_triton_amd.utils import USE_TRITON_ROCM, is_hip, is_rdna
+from flash_attn.flash_attn_triton_amd.utils import USE_TRITON_ROCM, is_hip, get_arch
+
+
+def _get_block_size_n_triton(device, head_dim, is_dropout, is_causal):
+    """Get block size for Triton AMD kernel."""
+    arch = get_arch()
+    if arch.is_rdna:
+        return 32
+    elif arch.is_cdna:
+        return 64
+    # Fall back to CUDA kernel block sizes
+    return _get_block_size_n(device, head_dim, is_dropout, is_causal)
+
 
 MAX_HEADDIM_SM8x = 192
 
@@ -507,7 +519,7 @@ def normalize_flash_attn_S(
         scores.masked_fill_(local_mask, float("-inf"))
     if attn_bias is not None:
         scores = scores + attn_bias.to(dtype=scores.dtype)
-    block_size_n = _get_block_size_n(scores.device, head_dim, is_dropout, causal)
+    block_size_n = _get_block_size_n_triton(scores.device, head_dim, is_dropout, causal)
     scores_block = scores.split(block_size_n, dim=-1)
     lse_block = torch.stack([torch.logsumexp(s, dim=-1) for s in scores_block], dim=-1)
     lse = torch.logsumexp(lse_block, dim=-1)
@@ -1491,7 +1503,7 @@ def test_flash_attn_varlen_output(
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(256, 128)])
 def test_flash_attn_causal(seqlen_q, seqlen_k, swap_sq_sk, d, local, dtype):
     if USE_TRITON_ROCM:
-        if is_rdna():
+        if get_arch().is_rdna:
             if seqlen_q == 1 and seqlen_k == 239 and d == 256:
                 pytest.skip("This config doesnot work on RDNA Devices.")
     if (
