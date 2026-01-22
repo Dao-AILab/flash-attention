@@ -4,15 +4,15 @@ import torch
 import triton
 import triton.language as tl
 from typing import Literal, Optional
+from .common import apply_rotary
 from .utils import (
     DEBUG,
     AUTOTUNE,
     get_arch,
     get_padded_headsize,
-    get_shape_and_strides_from_layout,
-    apply_rotary,
+    get_shape_from_layout,
+    get_stride_from_layout,
     is_fp8,
-    get_recommended_fp8_dtype,
 )
 
 
@@ -878,6 +878,10 @@ def attention_forward_decode_triton_impl(
     rotary_interleaved: bool = False,
     seqlens_rotary: Optional[torch.Tensor] = None,
 ):
+    # Validate layout at entry
+    if layout != "bshd":
+        raise ValueError(f"{layout} layout is not supported, only 'bshd' is supported")
+
     # apply rotary embedding
     if rotary_cos is not None and rotary_sin is not None:
         # Prefer explicitly provided rotary sequence start offsets if given; fall back to cache_seqlens.
@@ -968,16 +972,11 @@ def attention_forward_decode_triton_impl(
     use_cache_seqlens = cache_seqlens is not None
     use_sliding_window = window_size_left != -1 or window_size_right != -1
     use_block_table = block_table is not None
-    SPLIT_K = None
     NUM_QUANT_GROUPS = 1
 
     # get shapes and strides
-    (batch_size, seqlen_q, nheads_q, dim_q), (
-        stride_qz,
-        stride_qh,
-        stride_qm,
-        stride_qd,
-    ) = get_shape_and_strides_from_layout(q, layout)
+    batch_size, seqlen_q, nheads_q, dim_q = get_shape_from_layout(q, layout)
+    stride_qz, stride_qh, stride_qm, stride_qd = get_stride_from_layout(q, layout)
 
     # Handle paged KV cache layout
     if use_block_table:
@@ -989,6 +988,7 @@ def attention_forward_decode_triton_impl(
             seqlen_kc = int(cache_seqlens.max().item())
         else:
             # Infer from block_table shape [batch_size, num_blocks_per_seq]
+            assert block_table is not None
             num_blocks_per_seq = block_table.shape[1]
             seqlen_kc = num_blocks_per_seq * block_size_k
         seqlen_vc = seqlen_kc
@@ -1004,66 +1004,38 @@ def attention_forward_decode_triton_impl(
         stride_vc_h = v_cache.stride(2)
         stride_vc_d = v_cache.stride(3)
     else:
-        (_, seqlen_kc, nheads_kc, dim_kc), (
-            stride_kc_z,
-            stride_kc_h,
-            stride_kc_n,
-            stride_kc_d,
-        ) = get_shape_and_strides_from_layout(k_cache, layout)
-        (_, seqlen_vc, nheads_vc, dim_vc), (
-            stride_vc_z,
-            stride_vc_h,
-            stride_vc_n,
-            stride_vc_d,
-        ) = get_shape_and_strides_from_layout(v_cache, layout)
+        _, seqlen_kc, nheads_kc, dim_kc = get_shape_from_layout(k_cache, layout)
+        stride_kc_z, stride_kc_h, stride_kc_n, stride_kc_d = get_stride_from_layout(k_cache, layout)
+        _, seqlen_vc, nheads_vc, dim_vc = get_shape_from_layout(v_cache, layout)
+        stride_vc_z, stride_vc_h, stride_vc_n, stride_vc_d = get_stride_from_layout(v_cache, layout)
         block_size_k = 0  # Not used
     if is_new_kv:
-        (_, seqlen_kn, nheads_kn, dim_kn), (
-            stride_kn_z,
-            stride_kn_h,
-            stride_kn_n,
-            stride_kn_d,
-        ) = get_shape_and_strides_from_layout(k_new, layout)
-        (_, seqlen_vn, nheads_vn, dim_vn), (
-            stride_vn_z,
-            stride_vn_h,
-            stride_vn_n,
-            stride_vn_d,
-        ) = get_shape_and_strides_from_layout(v_new, layout)
+        _, seqlen_kn, nheads_kn, dim_kn = get_shape_from_layout(k_new, layout)
+        stride_kn_z, stride_kn_h, stride_kn_n, stride_kn_d = get_stride_from_layout(k_new, layout)
+        _, seqlen_vn, nheads_vn, dim_vn = get_shape_from_layout(v_new, layout)
+        stride_vn_z, stride_vn_h, stride_vn_n, stride_vn_d = get_stride_from_layout(v_new, layout)
     else:
-        (_, seqlen_kn, nheads_kn, dim_kn), (
-            stride_kn_z,
-            stride_kn_h,
-            stride_kn_n,
-            stride_kn_d,
-        ) = (None, None, None, None,), (None, None, None, None)
-        (_, seqlen_vn, nheads_vn, dim_vn), (
-            stride_vn_z,
-            stride_vn_h,
-            stride_vn_n,
-            stride_vn_d,
-        ) = (None, None, None, None,), (None, None, None, None)
-    (_, seqlen_o, nheads_o, dim_o), (stride_oz, stride_oh, stride_om, stride_od) = (
-        get_shape_and_strides_from_layout(out, layout)
-    )
+        _, seqlen_kn, nheads_kn, dim_kn = None, None, None, None
+        stride_kn_z, stride_kn_h, stride_kn_n, stride_kn_d = None, None, None, None
+        _, seqlen_vn, nheads_vn, dim_vn = None, None, None, None
+        stride_vn_z, stride_vn_h, stride_vn_n, stride_vn_d = None, None, None, None
+    _, seqlen_o, nheads_o, dim_o = get_shape_from_layout(out, layout)
+    stride_oz, stride_oh, stride_om, stride_od = get_stride_from_layout(out, layout)
     assert (
         dim_q == dim_kc == dim_vc
     ), f"Dimensions must match: {dim_q}, {dim_kc}, {dim_vc}"
 
     # add extra information needed by the kernels
-    if layout == "bshd":
-        (n_group_q, heads_per_group_q), stride_qg = (1, nheads_q), stride_qm
-        (n_group_k, heads_per_group_k), stride_kc_g = (1, nheads_kc), stride_kc_n
-        (n_group_v, heads_per_group_v), stride_vc_g = (1, nheads_vc), stride_vc_n
-        if is_new_kv:
-            (n_group_kn, heads_per_group_kn), stride_kn_g = (1, nheads_kn), stride_kn_n
-            (n_group_vn, heads_per_group_vn), stride_vn_g = (1, nheads_vn), stride_vn_n
-        else:
-            (n_group_kn, heads_per_group_kn), stride_kn_g = (None, None), None
-            (n_group_vn, heads_per_group_vn), stride_vn_g = (None, None), None
-        (n_group_o, heads_per_group_o), stride_og = (1, nheads_o), stride_om
+    (n_group_q, heads_per_group_q), stride_qg = (1, nheads_q), stride_qm
+    (n_group_k, heads_per_group_k), stride_kc_g = (1, nheads_kc), stride_kc_n
+    (n_group_v, heads_per_group_v), stride_vc_g = (1, nheads_vc), stride_vc_n
+    if is_new_kv:
+        (n_group_kn, heads_per_group_kn), stride_kn_g = (1, nheads_kn), stride_kn_n
+        (n_group_vn, heads_per_group_vn), stride_vn_g = (1, nheads_vn), stride_vn_n
     else:
-        raise ValueError(f"{layout} layout is not supported")
+        (n_group_kn, heads_per_group_kn), stride_kn_g = (None, None), None
+        (n_group_vn, heads_per_group_vn), stride_vn_g = (None, None), None
+    (n_group_o, heads_per_group_o), stride_og = (1, nheads_o), stride_om
 
     # get padded size
     dim_padded = get_padded_headsize(dim_kc)
@@ -1076,20 +1048,17 @@ def attention_forward_decode_triton_impl(
     else:
         is_gqa = False
 
-    if SPLIT_K is not None:
-        split_k = SPLIT_K
+    # Use heuristics for split_k
+    if use_block_table:
+        # For paged attention, use the actual sequence length from cache_seqlens
+        max_seqlen = (
+            int(cache_seqlens.max().item())
+            if cache_seqlens is not None
+            else block_size_k
+        )
+        split_k = get_split_k(batch_size, n_group_q, heads_per_group_q, max_seqlen)
     else:
-        # Use heuristics
-        if use_block_table:
-            # For paged attention, use the actual sequence length from cache_seqlens
-            max_seqlen = (
-                int(cache_seqlens.max().item())
-                if cache_seqlens is not None
-                else block_size_k
-            )
-            split_k = get_split_k(batch_size, n_group_q, heads_per_group_q, max_seqlen)
-        else:
-            split_k = get_split_k(batch_size, n_group_q, heads_per_group_q, seqlen_kc)
+        split_k = get_split_k(batch_size, n_group_q, heads_per_group_q, seqlen_kc)
     split_size = (seqlen_kc + split_k - 1) // split_k
 
     # setup grid - use lambda to get BLOCK_M from autotune
@@ -1141,6 +1110,7 @@ def attention_forward_decode_triton_impl(
 
     # Block table strides
     if use_block_table:
+        assert block_table is not None
         stride_bt_b, stride_bt_s = block_table.stride()
     else:
         stride_bt_b, stride_bt_s = 0, 0
@@ -1148,13 +1118,17 @@ def attention_forward_decode_triton_impl(
     # FP8 support
     IS_FP8 = is_fp8([q, k_cache, v_cache])
     if IS_FP8:
-        rec_dtype = get_recommended_fp8_dtype(q)
+        arch = get_arch()
+        if not arch.supports_fp8:
+            raise RuntimeError(
+                f"{arch.name} does not support FP8"
+            )
+        rec_dtype = arch.recommended_fp8_dtype(q.dtype)
         if (
             q.dtype != rec_dtype
             or k_cache.dtype != rec_dtype
             or v_cache.dtype != rec_dtype
         ):
-            arch = get_arch()
             warnings.warn(
                 f"Use {rec_dtype} data type on {arch}. Got q: {q.dtype}, k: {k_cache.dtype}, v: {v_cache.dtype}",
                 UserWarning,
@@ -1360,15 +1334,15 @@ def attention_forward_decode_triton_impl(
         k_block_num = 2
     assert dim_padded % k_block_num == 0
     k_block_size = dim_padded // k_block_num
-    grid = (batch_size * n_group_q * heads_per_group_q, seqlen_q, k_block_num)
+    reduce_grid = (batch_size * n_group_q * heads_per_group_q, seqlen_q, k_block_num)
 
     if DEBUG:
         print("splitK_pow2:", splitK_pow2)
         print("k_block_num:", k_block_num)
         print("k_block_size:", k_block_size)
-        print("grid:", grid)
+        print("grid:", reduce_grid)
 
-    _splitK_reduce[grid](
+    _splitK_reduce[reduce_grid](
         out_splitk,
         metadata,
         out,

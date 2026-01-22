@@ -1,7 +1,7 @@
 import os
 import warnings
 import torch
-from typing import Optional, Union, Tuple
+from typing import Literal, Optional, Union, Tuple
 from .fwd_prefill import attention_forward_prefill_triton_impl
 from .fwd_decode import attention_forward_decode_triton_impl
 from .bwd import attention_backward_triton_impl
@@ -12,8 +12,6 @@ from .utils import (
     PHILOX_SEED,
     PHILOX_OFFSET,
     is_fp8,
-    get_recommended_fp8_dtype,
-    tensor_stats,
 )
 
 
@@ -48,9 +46,9 @@ def fwd(
     attention_chunk: int,
     softcap: float,
     rotary_interleaved: bool,
-    scheduler_metadata=None,
+    scheduler_metadata: None = None,
     num_splits: int = 1,
-    pack_gqa=None,
+    pack_gqa: Optional[bool] = None,
     sm_margin: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """
@@ -62,29 +60,29 @@ def fwd(
     if DEBUG:
         print()
         print("interface_fa_v3.py::fwd inputs")
-        print(tensor_stats("q", q))
-        print(tensor_stats("k", k))
-        print(tensor_stats("v", v))
-        print(tensor_stats("k_new", k_new))
-        print(tensor_stats("v_new", v_new))
-        print(tensor_stats("qv", qv))
-        print(tensor_stats("out", out))
-        print(tensor_stats("cu_seqlens_q", cu_seqlens_q))
-        print(tensor_stats("cu_seqlens_k", cu_seqlens_k))
-        print(tensor_stats("cu_seqlens_k_new", cu_seqlens_k_new))
-        print(tensor_stats("seqused_q", seqused_q))
-        print(tensor_stats("seqused_k", seqused_k))
+        print("q:", q.shape)
+        print("k:", k.shape)
+        print("v:", v.shape)
+        print("k_new:", k_new.shape if k_new is not None else None)
+        print("v_new:", v_new.shape if v_new is not None else None)
+        print("qv:", qv.shape if qv is not None else None)
+        print("out:", out.shape if out is not None else None)
+        print("cu_seqlens_q:", cu_seqlens_q.shape if cu_seqlens_q is not None else None)
+        print("cu_seqlens_k:", cu_seqlens_k.shape if cu_seqlens_k is not None else None)
+        print("cu_seqlens_k_new:", cu_seqlens_k_new.shape if cu_seqlens_k_new is not None else None)
+        print("seqused_q:", seqused_q.shape if seqused_q is not None else None)
+        print("seqused_k:", seqused_k.shape if seqused_k is not None else None)
         print("max_seqlen_q:", max_seqlen_q)
         print("max_seqlen_k:", max_seqlen_k)
-        print(tensor_stats("page_table", page_table))
-        print(tensor_stats("kv_batch_idx", kv_batch_idx))
-        print(tensor_stats("leftpad_k", leftpad_k))
-        print(tensor_stats("rotary_cos", rotary_cos))
-        print(tensor_stats("rotary_sin", rotary_sin))
-        print(tensor_stats("seqlens_rotary", seqlens_rotary))
-        print(tensor_stats("q_descale", q_descale))
-        print(tensor_stats("k_descale", k_descale))
-        print(tensor_stats("v_descale", v_descale))
+        print("page_table:", page_table.shape if page_table is not None else None)
+        print("kv_batch_idx:", kv_batch_idx.shape if kv_batch_idx is not None else None)
+        print("leftpad_k:", leftpad_k.shape if leftpad_k is not None else None)
+        print("rotary_cos:", rotary_cos.shape if rotary_cos is not None else None)
+        print("rotary_sin:", rotary_sin.shape if rotary_sin is not None else None)
+        print("seqlens_rotary:", seqlens_rotary.shape if seqlens_rotary is not None else None)
+        print("q_descale:", q_descale.shape if q_descale is not None else None)
+        print("k_descale:", k_descale.shape if k_descale is not None else None)
+        print("v_descale:", v_descale.shape if v_descale is not None else None)
         print("softmax_scale:", softmax_scale)
         print("causal:", causal)
         print("window_size_left:", window_size_left)
@@ -157,15 +155,21 @@ def fwd(
             raise ValueError(
                 f"cu_seqlens_q provided but q has shape {q.shape}, expected 3D tensor for varlen"
             )
-        layout = "thd"
+        layout: Literal["bshd", "thd"] = "thd"
         cu_seqlens_q_local = cu_seqlens_q
+        assert max_seqlen_q is not None, "max_seqlen_q required for varlen mode"
         max_seqlens_q_local = max_seqlen_q
         if cu_seqlens_k is not None:
             cu_seqlens_k_local = cu_seqlens_k
+            assert max_seqlen_k is not None, "max_seqlen_k required when cu_seqlens_k provided"
             max_seqlens_k_local = max_seqlen_k
         else:
             cu_seqlens_k_local = None
-            max_seqlens_k_local = k.shape[1] if len(k.shape) == 4 else max_seqlen_k
+            if len(k.shape) == 4:
+                max_seqlens_k_local = k.shape[1]
+            else:
+                assert max_seqlen_k is not None, "max_seqlen_k required for varlen mode"
+                max_seqlens_k_local = max_seqlen_k
     else:
         layout = "bshd"
         cu_seqlens_q_local = None
@@ -254,6 +258,8 @@ def fwd(
             (batch, nheads_q, seqlen_q), device=q.device, dtype=torch.float32
         )
 
+        # Decode only supports bshd layout
+        assert layout == "bshd", f"decode requires bshd layout, got {layout}"
         attention_forward_decode_triton_impl(
             q,
             k,
@@ -336,8 +342,8 @@ def fwd(
 
     if DEBUG:
         print("interface_fa_v3.py::fwd outputs")
-        print(tensor_stats("out", out))
-        print(tensor_stats("softmax_lse", softmax_lse))
+        print("out:", out.shape)
+        print("softmax_lse:", softmax_lse.shape)
 
     # --- Assertions (FA3 always expects exact shapes) ---
     # out: same shape as q except last dim is v's head_dim
@@ -372,6 +378,7 @@ def fwd(
         softmax_lse.dtype == torch.float32
     ), f"[fwd_v3] softmax_lse dtype {softmax_lse.dtype} != torch.float32"
     # softmax_lse shape depends on layout
+    expected_lse_shape: tuple[int, ...]
     if layout == "thd":
         # varlen: (Hq, Total_Q)
         expected_lse_shape = (q.shape[1], q.shape[0])
@@ -421,19 +428,19 @@ def bwd(
     if DEBUG:
         print()
         print("interface_fa_v3.py::bwd inputs")
-        print(tensor_stats("dout", dout))
-        print(tensor_stats("q", q))
-        print(tensor_stats("k", k))
-        print(tensor_stats("v", v))
-        print(tensor_stats("out", out))
-        print(tensor_stats("softmax_lse", softmax_lse))
-        print(tensor_stats("dq", dq))
-        print(tensor_stats("dk", dk))
-        print(tensor_stats("dv", dv))
-        print(tensor_stats("cu_seqlens_q", cu_seqlens_q))
-        print(tensor_stats("cu_seqlens_k", cu_seqlens_k))
-        print(tensor_stats("seqused_q", seqused_q))
-        print(tensor_stats("seqused_k", seqused_k))
+        print("dout:", dout.shape)
+        print("q:", q.shape)
+        print("k:", k.shape)
+        print("v:", v.shape)
+        print("out:", out.shape)
+        print("softmax_lse:", softmax_lse.shape)
+        print("dq:", dq.shape if dq is not None else None)
+        print("dk:", dk.shape if dk is not None else None)
+        print("dv:", dv.shape if dv is not None else None)
+        print("cu_seqlens_q:", cu_seqlens_q.shape if cu_seqlens_q is not None else None)
+        print("cu_seqlens_k:", cu_seqlens_k.shape if cu_seqlens_k is not None else None)
+        print("seqused_q:", seqused_q.shape if seqused_q is not None else None)
+        print("seqused_k:", seqused_k.shape if seqused_k is not None else None)
         print("max_seqlen_q:", max_seqlen_q)
         print("max_seqlen_k:", max_seqlen_k)
         print("softmax_scale:", softmax_scale)
@@ -475,6 +482,7 @@ def bwd(
     dv = torch.zeros_like(v, dtype=grad_dtype) if dv is None else dv.zero_()
 
     # Determine layout based on cu_seqlens
+    layout: Literal["bshd", "bhsd", "thd"]
     if cu_seqlens_q is not None and cu_seqlens_k is not None:
         # Variable length sequence mode
         layout = "thd"
@@ -531,10 +539,10 @@ def bwd(
 
     if DEBUG:
         print("interface_fa_v3.py::bwd outputs")
-        print(tensor_stats("dq", dq))
-        print(tensor_stats("dk", dk))
-        print(tensor_stats("dv", dv))
-        print(tensor_stats("delta", delta))
+        print("dq:", dq.shape)
+        print("dk:", dk.shape)
+        print("dv:", dv.shape)
+        print("delta:", delta.shape)
 
     # --- Assertions (FA3 always expects exact shapes) ---
     # Gradients should match input shapes
@@ -545,6 +553,7 @@ def bwd(
     assert (
         delta.dtype == torch.float32
     ), f"[bwd_v3] delta dtype {delta.dtype} != torch.float32"
+    expected_delta_shape: tuple[int, ...]
     if layout == "thd":
         # varlen: (Hq, Total_Q)
         expected_delta_shape = (q.shape[1], q.shape[0])
@@ -557,7 +566,7 @@ def bwd(
 
     # V3 expects (softmax_d, *rest)
     # delta is the softmax_d in this case
-    return delta
+    return (delta,)
 
 
 def fwd_combine(
@@ -565,7 +574,7 @@ def fwd_combine(
     lse_partial: torch.Tensor,
     out: Optional[torch.Tensor] = None,
     out_dtype: Optional[torch.dtype] = None,
-) -> torch.Tensor:
+) -> "torch.Tensor":
     """
     Combine partial outputs from split attention computation.
 
@@ -610,7 +619,7 @@ def get_scheduler_metadata(
     num_splits: int = 0,
     pack_gqa: Optional[bool] = None,
     sm_margin: int = 0,
-):
+) -> None:
     """
     Get scheduler metadata for optimized kernel selection.
 

@@ -4,16 +4,12 @@ import torch
 import triton
 import triton.language as tl
 from typing import Literal, Optional
+from .common import compute_alibi_block, compute_fp8_scaling_factors, apply_rotary
 from .utils import (
     DEBUG,
     AUTOTUNE,
-    compute_alibi_block,
-    compute_fp8_scaling_factors,
     get_arch,
-    get_cu_count,
     is_fp8,
-    apply_rotary,
-    get_recommended_fp8_dtype,
 )
 
 
@@ -53,7 +49,7 @@ def get_fwd_prefill_configs(autotune: bool):
                 )
             ]
         elif arch.name == "gfx942":
-            if get_cu_count() < 304:
+            if arch.cu_count < 304:
                 return [
                     triton.Config(
                         {
@@ -1534,10 +1530,14 @@ def attention_forward_prefill_triton_impl(
     # fp8 setup and assertions
     IS_FP8 = is_fp8([q, k, v])
     if IS_FP8:
+        arch = get_arch()
+        if not arch.supports_fp8:
+            raise RuntimeError(
+                f"{arch.name} does not support FP8"
+            )
         FP8_MAX = torch.finfo(q.dtype).max
-        rec_dtype = get_recommended_fp8_dtype(q)
+        rec_dtype = arch.recommended_fp8_dtype(q.dtype)
         if q.dtype != rec_dtype or k.dtype != rec_dtype or v.dtype != rec_dtype:
-            arch = get_arch()
             warnings.warn(
                 f"Use {rec_dtype} data type on {arch}. Got q: {q.dtype}, k: {k.dtype}, v: {v.dtype}",
                 UserWarning,

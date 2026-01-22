@@ -1,14 +1,13 @@
 import os
 import torch
-import triton  # type: ignore
-import triton.language as tl  # type: ignore
+import triton
+import triton.language as tl
 import warnings
 from typing import Literal, Optional
+from .common import compute_fp8_scaling_factors
 from .utils import (
     DEBUG,
     AUTOTUNE,
-    compute_fp8_scaling_factors,
-    get_cu_count,
     is_fp8,
     get_arch,
 )
@@ -48,7 +47,7 @@ def get_bwd_configs(autotune: bool):
         
         # configs for the kernels
         if arch.name == "gfx942":
-            if get_cu_count() < 304:
+            if arch.cu_count < 304:
                 preprocess_configs = [
                     triton.Config(
                         {"PRE_BLOCK": 64, "waves_per_eu": 1}, num_stages=1, num_warps=8
@@ -233,7 +232,7 @@ def get_bwd_configs(autotune: bool):
                         num_warps=4,
                     ),
                 ]
-        elif arch == "gfx950":
+        elif arch.name == "gfx950":
             preprocess_configs = [
                 triton.Config(
                     {"PRE_BLOCK": 64, "waves_per_eu": 2}, num_stages=2, num_warps=8
@@ -3891,8 +3890,12 @@ def is_contiguous(x, name):
         return x.contiguous()
 
 
-DEBUG_TRITON: bool = False
-DEBUG_TRITON_DETAIL: bool = False
+# Triton kernel debug flags derived from DEBUG level.
+# Level 1: basic kernel debug prints (iteration info)
+# Level 2: detailed kernel debug prints (tensor values)
+# Requires TRITON_INTERPRET=1 to actually print inside kernels.
+DEBUG_TRITON: bool = DEBUG >= 1
+DEBUG_TRITON_DETAIL: bool = DEBUG >= 2
 
 
 def attention_backward_triton_impl(
@@ -4131,6 +4134,11 @@ def attention_backward_triton_impl(
     # fp8
     IS_FP8 = is_fp8([q, k, v])
     if IS_FP8:
+        arch = get_arch()
+        if not arch.supports_fp8:
+            raise RuntimeError(
+                f"{arch.name} does not support FP8"
+            )
         FP8_MAX = torch.finfo(q.dtype).max
 
         warnings.warn(
@@ -4233,7 +4241,7 @@ def attention_backward_triton_impl(
         IS_FP8=IS_FP8,
     )
 
-    if False:
+    if DEBUG:
         print("delta:", delta, delta.shape)
 
     # dropout mask tensor for debugging. We dump the dropout mask created in
