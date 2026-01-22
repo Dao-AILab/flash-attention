@@ -36,7 +36,7 @@ def _call_compute_block_sparsity(
         device="cuda",
         use_fast_sampling=use_fast_sampling,
     )
-    mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx = torch_tensors
+    mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx, *_ = torch_tensors
     return mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx
 
 
