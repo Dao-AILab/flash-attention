@@ -11,6 +11,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync, warp
+from cutlass import Float32, Int32
 import cutlass.utils as utils_basic
 
 from flash_attn.cute import ampere_helpers as sm80_utils
@@ -373,12 +374,18 @@ class FlashAttentionBackwardSm80:
         mCuSeqlensK: Optional[cute.Tensor] = None,
         mSeqUsedQ: Optional[cute.Tensor] = None,
         mSeqUsedK: Optional[cute.Tensor] = None,
+        softcap: Float32 | float | None = None,
+        window_size_left: Int32 | int | None = None,
+        window_size_right: Int32 | int | None = None,
+        mdQ_semaphore: Optional[cute.Tensor] = None,
     ):
+        assert mdQ_semaphore is None, "semaphore not supported yet"
         # Get the data type and check if it is fp16 or bf16
         self._check_type(*(t.element_type if t is not None else None
                            for t in (mQ, mK, mV, mdO, mLSE, mdPsum, mdQaccum, mdK, mdV, mCuSeqlensQ, mCuSeqlensK, mSeqUsedQ, mSeqUsedK)))
         # Assume all strides are divisible by 128 bits except the last stride
-        new_stride = lambda t: (*(cute.assume(s, divby=128 // t.element_type.width) for s in t.stride[:-1]), t.stride[-1])
+        # Skip cute.assume() for stride=0 (broadcast dims from expand() are Python ints)
+        new_stride = lambda t: (*(cute.assume(s, divby=128 // t.element_type.width) if not isinstance(s, int) or s != 0 else s for s in t.stride[:-1]), t.stride[-1])
         mQ, mK, mV, mdO, mLSE, mdPsum, mdQaccum, mdK, mdV = [cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t))) if t is not None else None for t in (mQ, mK, mV, mdO, mLSE, mdPsum, mdQaccum, mdK, mdV)]
         self.varlen_q = (mCuSeqlensQ is not None)
         self._setup_attributes()
@@ -394,11 +401,12 @@ class FlashAttentionBackwardSm80:
             TileScheduler = SingleTileScheduler
             num_batch = mK.shape[0]
 
-        # Uses seqlen k, etc. since main bwd kernel's blocks are over n 
+        # Uses seqlen k, etc. since main bwd kernel's blocks are over n
         tile_sched_args = TileSchedulerArguments(
             num_block=cute.ceil_div(mK.shape[1], self.n_block_size),
             num_head=num_head,
             num_batch=num_batch,
+            num_splits=1,
             seqlen_k=0,
             headdim=mK.shape[2],
             headdim_v=mV.shape[2],
@@ -408,7 +416,7 @@ class FlashAttentionBackwardSm80:
             mCuSeqlensQ=mCuSeqlensK,
             mSeqUsedQ=mSeqUsedK,
         )
-        
+
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
         grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
 
@@ -499,10 +507,10 @@ class FlashAttentionBackwardSm80:
         tile_scheduler = TileScheduler.create(tile_sched_params)
         work_tile = tile_scheduler.initial_work_tile_info()
 
-        n_block, head_idx, batch_idx = work_tile.tile_idx
+        n_block, head_idx, batch_idx, _ = work_tile.tile_idx
 
         if work_tile.is_valid_tile:
-            seqlen = SeqlenInfoQK(batch_idx, mQ.shape[1], mK.shape[1], mCuSeqlensQ=mCuSeqlensQ, mCuSeqlensK=mCuSeqlensK, mSeqUsedQ=mSeqUsedQ, mSeqUsedK=mSeqUsedK)
+            seqlen = SeqlenInfoQK.create(batch_idx, mQ.shape[1], mK.shape[1], mCuSeqlensQ=mCuSeqlensQ, mCuSeqlensK=mCuSeqlensK, mSeqUsedQ=mSeqUsedQ, mSeqUsedK=mSeqUsedK)
 
             m_block_max = cute.ceil_div(seqlen.seqlen_q, self.m_block_size)
             m_block_min = 0
@@ -992,7 +1000,7 @@ class FlashAttentionBackwardSm80:
         num_head: cutlass.Int32,
         batch_size: cutlass.Int32,
         seqlen: SeqlenInfoQK,
-        d_head: cutlass.Int32, 
+        d_head: cutlass.Int32,
         d_head_v: cutlass.Int32
     ):
         rdV = cute.make_fragment_like(acc_dV, self.dtype)

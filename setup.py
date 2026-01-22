@@ -64,6 +64,7 @@ SKIP_CUDA_BUILD = os.getenv("FLASH_ATTENTION_SKIP_CUDA_BUILD", "FALSE") == "TRUE
 FORCE_CXX11_ABI = os.getenv("FLASH_ATTENTION_FORCE_CXX11_ABI", "FALSE") == "TRUE"
 USE_TRITON_ROCM = os.getenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", "FALSE") == "TRUE"
 SKIP_CK_BUILD = os.getenv("FLASH_ATTENTION_SKIP_CK_BUILD", "TRUE") == "TRUE" if USE_TRITON_ROCM else False
+NVCC_THREADS = os.getenv("NVCC_THREADS") or "4"
 
 @functools.lru_cache(maxsize=None)
 def cuda_archs() -> str:
@@ -145,7 +146,7 @@ def add_cuda_gencodes(cc_flag, archs, bare_metal_version):
         cc_flag += ["-gencode", f"arch=compute_{newest},code=compute_{newest}"]
 
     return cc_flag
-    
+
 
 def get_hip_version():
     return parse(torch.version.hip.split()[-1].rstrip('-').replace('-', '+'))
@@ -186,8 +187,7 @@ def detect_hipify_v2():
 
 
 def append_nvcc_threads(nvcc_extra_args):
-    nvcc_threads = os.getenv("NVCC_THREADS") or "4"
-    return nvcc_extra_args + ["--threads", nvcc_threads]
+    return nvcc_extra_args + ["--threads", NVCC_THREADS]
 
 
 def rename_cpp_to_cu(cpp_files):
@@ -436,7 +436,7 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
                         "csrc/flash_attn_ck/mha_varlen_bwd.cu",
                         "csrc/flash_attn_ck/mha_varlen_fwd.cu"] + glob.glob(f"build/fmha_*wd*.cu")
 
-        cc_flag += ["-O3","-std=c++17",
+        cc_flag += ["-O3","-std=c++20",
                     "-DCK_TILE_FMHA_FWD_FAST_EXP2=1",
                     "-fgpu-flush-denormals-to-zero",
                     "-DCK_ENABLE_BF16",
@@ -468,7 +468,7 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
             cc_flag += ["-mllvm", "-amdgpu-coerce-illegal-types=1"]
 
         extra_compile_args = {
-            "cxx": ["-O3", "-std=c++17"] + generator_flag + maybe_hipify_v2_flag,
+            "cxx": ["-O3", "-std=c++20"] + generator_flag + maybe_hipify_v2_flag,
             "nvcc": cc_flag + generator_flag + maybe_hipify_v2_flag,
         }
 
@@ -571,15 +571,23 @@ class NinjaBuildExtension(BuildExtension):
         if not os.environ.get("MAX_JOBS"):
             import psutil
 
+            nvcc_threads = max(1, int(NVCC_THREADS))
+
             # calculate the maximum allowed NUM_JOBS based on cores
             max_num_jobs_cores = max(1, os.cpu_count() // 2)
 
             # calculate the maximum allowed NUM_JOBS based on free memory
             free_memory_gb = psutil.virtual_memory().available / (1024 ** 3)  # free memory in GB
-            max_num_jobs_memory = int(free_memory_gb / 9)  # each JOB peak memory cost is ~8-9GB when threads = 4
+            # Assume worst-case peak observed memory usage of ~5GB per NVCC thread.
+            # Limit: peak_threads = max_jobs * nvcc_threads and peak_threads * 5GB <= free_memory.
+            max_num_jobs_memory = max(1, int(free_memory_gb / (5 * nvcc_threads)))
 
             # pick lower value of jobs based on cores vs memory metric to minimize oom and swap usage during compilation
             max_jobs = max(1, min(max_num_jobs_cores, max_num_jobs_memory))
+            print(
+                f"Auto set MAX_JOBS to `{max_jobs}`, NVCC_THREADS to `{nvcc_threads}`. "
+                "If you see memory pressure, please use a lower `MAX_JOBS=N` or `NVCC_THREADS=N` value."
+            )
             os.environ["MAX_JOBS"] = str(max_jobs)
 
         super().__init__(*args, **kwargs)

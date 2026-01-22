@@ -7,20 +7,10 @@ repos:
         files: ^flash_attn/cute/.*\.py$
         exclude: &cute_exclude |
           (?x)^flash_attn/cute/(
-            __init__|
-            copy_utils|
-            cute_dsl_utils|
-            fast_math|
             flash_bwd|
             flash_fwd|
-            flash_fwd_combine|
             flash_fwd_sm100|
-            hopper_helpers|
             interface|
-            pack_gqa|
-            testing|
-            tile_scheduler|
-            utils
           )\.py$
       - id: ruff-format
         files: ^flash_attn/cute/.*\.py$
