@@ -354,7 +354,9 @@ class FlashAttentionBackwardSm90:
         # Skip cute.assume() for stride=0 (broadcast dims from expand() are Python ints)
         new_stride = lambda t: (
             *(
-                cute.assume(s, divby=128 // t.element_type.width) if s != 0 else s
+                cute.assume(s, divby=128 // t.element_type.width)
+                if not isinstance(s, int) or s != 0
+                else s
                 for s in t.stride[:-1]
             ),
             t.stride[-1],

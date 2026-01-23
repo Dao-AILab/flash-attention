@@ -69,6 +69,7 @@ class FlashAttentionForwardBase:
         score_mod: Optional[cutlass.Constexpr] = None,
         mask_mod: Optional[cutlass.Constexpr] = None,
         has_aux_tensors: bool = False,
+        q_subtile_factor: int | None = None,
     ):
         """Initializes the configuration for a flash attention kernel.
 
@@ -107,6 +108,7 @@ class FlashAttentionForwardBase:
         self.tile_n = tile_n
         self.num_threads = num_threads
         self.num_stages = num_stages
+        self.q_subtile_factor = q_subtile_factor
         self.Q_in_regs = Q_in_regs
         self.score_mod = score_mod
         self.mask_mod = mask_mod
@@ -663,7 +665,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         new_stride = lambda t: (
             *(
                 cute.assume(s, divby=128 // t.element_type.width)
-                if s != 0
+                if not isinstance(s, int) or s != 0
                 else s
                 for s in t.stride[:-1]
             ),
@@ -1306,7 +1308,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         new_stride = lambda t: (
             *(
                 cute.assume(s, divby=128 // t.element_type.width)
-                if s != 0
+                if not isinstance(s, int) or s != 0
                 else s
                 for s in t.stride[:-1]
             ),
@@ -1870,6 +1872,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         self.tma_copy_bytes["Q"],
                         self.intra_wg_overlap,
                         self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+                        self.q_subtile_factor if self.q_subtile_factor is not None else 1,
                     )
 
                 tile_scheduler.prefetch_next_work()
@@ -2181,6 +2184,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     self.warp_scheduler_barrier_sync,
                     self.warp_scheduler_barrier_arrive,
                     self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+                    self.q_subtile_factor if self.q_subtile_factor is not None else 1,
                 )
 
                 # Handle empty case (when no blocks to process)
@@ -2482,4 +2486,3 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 barrier_id=int(NamedBarrierFwd.WarpSchedulerWG1) + next_wg,
                 number_of_threads=2 * self.num_threads_per_warp_group,
             )
-
