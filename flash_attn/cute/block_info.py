@@ -106,3 +106,19 @@ class BlockInfo:
             n_idx = m_idx_max + seqlen_info.seqlen_k - seqlen_info.seqlen_q
             n_idx_left = n_idx - self.window_size_left
             return cutlass.max(n_block_min, cute.ceil_div(n_idx_left, self.tile_n))
+
+    @cute.jit
+    def get_n_block_max_for_m_block(
+        self,
+        seqlen_info: SeqlenInfoQK,
+        m_block: Int32,
+        n_block_global_max: Int32,
+    ) -> Int32:
+        """Compute n_block_max for a given m_block, used for deterministic dQ accumulation in bwd."""
+        if const_expr(self.is_causal or self.window_size_right is not None):
+            n_idx_right = (m_block + 1) * self.tile_m + seqlen_info.seqlen_k - seqlen_info.seqlen_q
+            if const_expr(self.window_size_right is not None):
+                n_idx_right += self.window_size_right
+            return min(n_block_global_max, cute.ceil_div(n_idx_right, self.tile_n))
+        else:
+            return n_block_global_max

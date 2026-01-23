@@ -2551,20 +2551,9 @@ class FlashAttentionBackwardSm100:
                     # semaphore acquire
                     if const_expr(self.deterministic and stage == 0):
                         if const_expr(self.spt):
-                            if const_expr(
-                                self.is_causal or block_info.window_size_right is not None
-                            ):
-                                n_idx_right = (
-                                    (m_block + 1) * self.tile_m + seqlen.seqlen_k - seqlen.seqlen_q
-                                )
-                                if const_expr(block_info.window_size_right is not None):
-                                    n_idx_right += block_info.window_size_right
-                                n_block_max_for_m_block = min(
-                                    n_block_global_max,
-                                    cute.ceil_div(n_idx_right, self.tile_n),
-                                )
-                            else:
-                                n_block_max_for_m_block = n_block_global_max
+                            n_block_max_for_m_block = block_info.get_n_block_max_for_m_block(
+                                seqlen, m_block, n_block_global_max
+                            )
                             lock_value = n_block_max_for_m_block - 1 - n_block
                         else:
                             lock_value = n_block
