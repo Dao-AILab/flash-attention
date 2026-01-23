@@ -290,8 +290,9 @@ class FlashAttentionForwardSm100:
         self.v_dtype = mV.element_type
         self.o_dtype = mO.element_type
         # Assume all strides are divisible by 128 bits except the last stride
+        # Skip assume for Python ints (e.g., stride=0 from GQA expand)
         new_stride = lambda t: (
-            *(cute.assume(s, divby=128 // t.element_type.width) for s in t.stride[:-1]),
+            *(s if isinstance(s, int) else cute.assume(s, divby=128 // t.element_type.width) for s in t.stride[:-1]),
             t.stride[-1],
         )
         mQ, mK, mV, mO = [
