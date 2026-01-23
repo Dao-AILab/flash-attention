@@ -32,10 +32,12 @@ def gemm_w_idx(
         rB = tCrB if const_expr(B_idx is None) else tCrB[None, None, None, B_idx]
 
         mma_atom = cute.make_mma_atom(tiled_mma.op)
-        for k in cutlass.range(cute.size(tCrA.shape[2]), unroll=cute.size(tCrA.shape[2]) // num_unroll_groups): 
+        for k in cutlass.range(
+            cute.size(tCrA.shape[2]), unroll=cute.size(tCrA.shape[2]) // num_unroll_groups
+        ):
             mma_atom.set(tcgen05.Field.ACCUMULATE, not zero_init or k != 0)
             cute.gemm(mma_atom, acc, rA[None, None, k], rB[None, None, k], acc)
-        
+
 
 @cute.jit
 def gemm_ptx_w_idx(
@@ -60,7 +62,15 @@ def gemm_ptx_w_idx(
     mma_atom = cute.make_mma_atom(tiled_mma.op)
     acc_tmem_addr = acc.iterator.toint()
     gemm_ptx_partial(
-        mma_atom.op, acc_tmem_addr, rA, rB, sA_cur, sB_cur, zero_init=zero_init, cta_group=cta_group, **kwargs
+        mma_atom.op,
+        acc_tmem_addr,
+        rA,
+        rB,
+        sA_cur,
+        sB_cur,
+        zero_init=zero_init,
+        cta_group=cta_group,
+        **kwargs,
     )
 
 

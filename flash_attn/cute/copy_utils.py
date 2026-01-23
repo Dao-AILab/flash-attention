@@ -206,6 +206,7 @@ def store_shared_remote_fp32x4(
         asm_dialect=llvm.AsmDialect.AD_ATT,
     )
 
+
 @dsl_user_op
 def cpasync_bulk_s2cluster(
     smem_src_ptr: cute.Pointer,
@@ -218,8 +219,10 @@ def cpasync_bulk_s2cluster(
     ip=None,
 ):
     smem_src_ptr_i32 = smem_src_ptr.toint(loc=loc, ip=ip).ir_value()
-    smem_dst_ptr_i32 = set_block_rank(smem_dst_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip).ir_value()
-    mbar_ptr_i32     = set_block_rank(mbar_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip).ir_value()
+    smem_dst_ptr_i32 = set_block_rank(
+        smem_dst_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip
+    ).ir_value()
+    mbar_ptr_i32 = set_block_rank(mbar_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip).ir_value()
     llvm.inline_asm(
         None,
         [
@@ -234,6 +237,7 @@ def cpasync_bulk_s2cluster(
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
     )
+
 
 @dsl_user_op
 def cpasync_bulk_g2s(

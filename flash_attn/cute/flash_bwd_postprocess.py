@@ -416,7 +416,8 @@ class FlashAttentionBackwardPostprocess:
                 threads_per_row_group = num_reduce_threads // row_groups
                 stage_loads = tuple((row_group, row_group) for row_group in range(row_groups))
                 stage_iters = tuple(
-                    (row_group, row_group * threads_per_row_group) for row_group in range(row_groups)
+                    (row_group, row_group * threads_per_row_group)
+                    for row_group in range(row_groups)
                 )
                 s2r_lane = tidx % threads_per_row_group
                 s2r_buf = tidx // threads_per_row_group
@@ -523,7 +524,8 @@ class FlashAttentionBackwardPostprocess:
                         cute.make_identity_tensor((self.tile_m, self.tile_hdim))
                     )
                     tmem_load_atom = cute.make_copy_atom(
-                        tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(self.dQ_reduce_ncol)), Float32
+                        tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(self.dQ_reduce_ncol)),
+                        Float32,
                     )
                     tiled_copy_t2r = tcgen05.make_tmem_copy(tmem_load_atom, tdQtdQ)
                     thr_copy_t2r = tiled_copy_t2r.get_slice(tidx)
@@ -564,7 +566,9 @@ class FlashAttentionBackwardPostprocess:
                 else:
                     taccdQcdQ_shape = thr_copy_r2s_dQ.partition_S(cdQ).shape
                     taccdQrdQ = cute.make_tensor(rdQ.iterator, taccdQcdQ_shape)
-                taccdQsdQ = thr_copy_r2s_dQ.partition_D(sdQ if const_expr(not self.dQ_swapAB) else sdQt)
+                taccdQsdQ = thr_copy_r2s_dQ.partition_D(
+                    sdQ if const_expr(not self.dQ_swapAB) else sdQt
+                )
                 cute.copy(thr_copy_r2s_dQ, taccdQrdQ, taccdQsdQ)
 
             # Step 4: Copy dQ from smem to register to prepare for coalesced write to gmem
