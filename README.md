@@ -67,6 +67,7 @@ flash_attn_interface.flash_attn_func()
 - CUDA toolkit or ROCm toolkit
 - PyTorch 2.2 and above.
 - `packaging` Python package (`pip install packaging`)
+- `psutil` Python package (`pip install psutil`)
 - `ninja` Python package (`pip install ninja`) *
 - Linux. Might work for Windows starting v2.3.2 (we've seen a few positive [reports](https://github.com/Dao-AILab/flash-attention/issues/595)) but Windows compilation still requires more testing. If you have ideas on how to set up prebuilt CUDA wheels for Windows, please reach out via Github issue.
 
