@@ -1243,7 +1243,7 @@ def attention_prefill_backward_triton_split_impl(
             FP8_OUTPUT=FP8_OUTPUT,
             num_warps=NUM_WARPS,
             num_stages=NUM_STAGES,
-            waves_per_eu = WAVES_PER_EU,
+            # waves_per_eu = WAVES_PER_EU,
             DEBUG_TRITON=DEBUG_TRITON,
             DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
         )
@@ -1278,7 +1278,7 @@ def attention_prefill_backward_triton_split_impl(
             FP8_OUTPUT=FP8_OUTPUT,
             num_warps=NUM_WARPS,
             num_stages=NUM_STAGES,
-            waves_per_eu = WAVES_PER_EU,
+            # waves_per_eu = WAVES_PER_EU,
             DEBUG_TRITON=DEBUG_TRITON,
             DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
         )
@@ -1312,7 +1312,7 @@ def attention_prefill_backward_triton_split_impl(
             FP8_OUTPUT=FP8_OUTPUT,
             num_warps=NUM_WARPS,
             num_stages=NUM_STAGES,
-            waves_per_eu = WAVES_PER_EU,
+            # waves_per_eu = WAVES_PER_EU,
             DEBUG_TRITON=DEBUG_TRITON,
             DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
         )
@@ -1346,7 +1346,7 @@ def attention_prefill_backward_triton_split_impl(
             FP8_OUTPUT=FP8_OUTPUT,
             num_warps=NUM_WARPS,
             num_stages=NUM_STAGES,
-            waves_per_eu = WAVES_PER_EU,
+            # waves_per_eu = WAVES_PER_EU,
             DEBUG_TRITON=DEBUG_TRITON,
             DEBUG_TRITON_DETAIL=DEBUG_TRITON_DETAIL,
         )
