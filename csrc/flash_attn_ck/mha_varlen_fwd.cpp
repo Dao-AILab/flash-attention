@@ -129,6 +129,8 @@ fmha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
                          nullptr,              // seqlen_k_ptr
                          nullptr,              // cu_seqlen_q_ptr
                          nullptr,              // cu_seqlen_kv_ptr
+                         nullptr,              // block_scale_seqstart_q_ptr
+                         nullptr,              // block_scale_seqstart_q_ptr
                          nullptr,              // sink_ptr
                          total_q,
                          total_k,
@@ -153,6 +155,9 @@ fmha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
                          nhead_stride_randval,
                          nhead_stride_lse,
                          nhead_stride_o,
+                         0, // nhead_stride_q_descale
+                         0, // nhead_stride_k_descale
+                         0, // nhead_stride_v_descale
                          batch_stride_q,
                          batch_stride_k,
                          batch_stride_v,
@@ -160,6 +165,9 @@ fmha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
                          batch_stride_randval,
                          batch_stride_lse,
                          batch_stride_o,
+                         0, // batch_stride_q_descale
+                         0, // batch_stride_k_descale
+                         0, // batch_stride_v_descale
                          mask.left,
                          mask.right,
                          0, // sink_size
@@ -167,7 +175,9 @@ fmha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
                          0, // min_seqlen_q
                          p_dropout,
                          has_dropout_randval,
-                         drop_seed_offset};
+                         drop_seed_offset,
+                         0,     // block_scale_size_q
+                         0};    // block_scale_size_kv
 }
 
 fmha_fwd_splitkv_args get_ck_fmha_varlen_fwd_splitkv_args(bool has_lse,
