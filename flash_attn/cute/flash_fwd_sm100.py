@@ -134,12 +134,6 @@ class FlashAttentionForwardSm100:
         self.vec_size: cutlass.Constexpr = getattr(
             score_mod, "__vec_size__", 1 if cutlass.const_expr(has_aux_tensors) else 2
         )
-        # if hasattr(score_mod, "__vec_size__"):
-        #     self.vec_size: cutlass.Constexpr = score_mod.__vec_size__
-        # elif cutlass.const_expr(has_aux_tensors):
-        #     self.vec_size: cutlass.Constexpr = 1
-        # else:
-        #     self.vec_size: cutlass.Constexpr = 2
         # Does S1 need to wait for S0 to finish
         # self.s0_s1_barrier = self.head_dim_padded in [64, 96] and (not self.is_causal and not self.is_local)
         self.s0_s1_barrier = False
