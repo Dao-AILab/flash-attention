@@ -7,7 +7,7 @@ from dataclasses import dataclass
 import cutlass
 import cutlass.cute as cute
 from cutlass import Boolean, Int32, const_expr
-from cutlass.cutlass_dsl import if_generate
+from cutlass.cutlass_dsl import if_generate, dsl_user_op
 from cutlass.pipeline import PipelineAsync, PipelineState, Agent, CooperativeGroup
 from cutlass.pipeline import PipelineUserType, PipelineOp
 from cutlass.pipeline import PipelineTmaAsync as PipelineTmaAsyncOg
@@ -15,31 +15,33 @@ from cutlass.pipeline import PipelineTmaUmma as PipelineTmaUmmaOg
 
 
 # We deviate from cute-dsl implementation to use cute.arch.cluster_arrive_relaxed
-def pipeline_init_wait(cta_layout_vmnk: Optional[cute.Layout] = None):
+@dsl_user_op
+def pipeline_init_wait(cta_layout_vmnk: Optional[cute.Layout] = None, *, loc=None, ip=None):
     """
     Fences the mbarrier init and syncs the threadblock or cluster
     """
-    cute.arch.mbarrier_init_fence()
+    cute.arch.mbarrier_init_fence(loc=loc, ip=ip)
 
     if cta_layout_vmnk is None or cute.size(cta_layout_vmnk) == 1:
         # If not using clusters, sync the threadblock
-        _sync(Agent.ThreadBlock)
+        _sync(Agent.ThreadBlock, loc=loc, ip=ip)
     else:
         # If using clusters, sync the cluster
-        _sync(Agent.ThreadBlockCluster)
+        _sync(Agent.ThreadBlockCluster, loc=loc, ip=ip)
 
 
-def _sync(group: Agent):
+@dsl_user_op
+def _sync(group: Agent, *, loc=None, ip=None):
     """
     Syncs all threads within an agent.
     """
     if group is Agent.Thread:
         raise NotImplementedError("Error: Not supported.")
     elif group is Agent.ThreadBlock:
-        cute.arch.sync_threads()
+        cute.arch.sync_threads(loc=loc, ip=ip)
     elif group is Agent.ThreadBlockCluster:
-        cute.arch.cluster_arrive_relaxed()
-        cute.arch.cluster_wait()
+        cute.arch.cluster_arrive_relaxed(loc=loc, ip=ip)
+        cute.arch.cluster_wait(loc=loc, ip=ip)
     else:
         assert False, (
             "Error: No explicit sync instruction exists. Please use barriers (named / mbarrier) instead."
@@ -145,24 +147,28 @@ class PipelineTmaAsync(PipelineTmaAsyncOg):
         object.__setattr__(obj, "__class__", PipelineTmaAsync)
         return obj
 
+    @dsl_user_op
     def producer_acquire(
         self,
         state: PipelineState,
         try_acquire_token: Optional[Boolean] = None,
         extra_tx_count: int = 0,
+        *,
+        loc=None,
+        ip=None,
     ):
         """
         TMA producer commit conditionally waits on buffer empty and sets the transaction barrier for leader threadblocks.
         """
         if_generate(
             try_acquire_token is None or try_acquire_token == 0,
-            lambda: self.sync_object_empty.wait(state.index, state.phase),
+            lambda: self.sync_object_empty.wait(state.index, state.phase, loc=loc, ip=ip),
         )
         if const_expr(extra_tx_count == 0):
-            self.sync_object_full.arrive(state.index, self.producer_mask)
+            self.sync_object_full.arrive(state.index, self.producer_mask, loc=loc, ip=ip)
         else:
             tx_count = self.sync_object_full.tx_count + extra_tx_count
-            self.sync_object_full.arrive_and_expect_tx(state.index, tx_count)
+            self.sync_object_full.arrive_and_expect_tx(state.index, tx_count, loc=loc, ip=ip)
 
 
 @dataclass(frozen=True)
@@ -210,7 +216,7 @@ class PipelineTmaUmma(PipelineTmaUmmaOg):
         sync_object_full = PipelineAsync._make_sync_object(
             barrier_storage.align(min_align=8), num_stages, producer, tx_count
         )
-        sync_object_empty = PipelineAsync._make_sync_object(
+        sync_object_empty = PipelineTmaUmma._make_sync_object(
             barrier_storage.align(min_align=8) + num_stages, num_stages, consumer
         )
 
@@ -246,27 +252,31 @@ class PipelineTmaUmma(PipelineTmaUmmaOg):
             cta_group,
         )
 
+    @dsl_user_op
     def producer_acquire(
         self,
         state: PipelineState,
         try_acquire_token: Optional[Boolean] = None,
         extra_tx_count: int = 0,
+        *,
+        loc=None,
+        ip=None,
     ):
         """
         TMA producer commit conditionally waits on buffer empty and sets the transaction barrier for leader threadblocks.
         """
         if_generate(
             try_acquire_token is None or try_acquire_token == 0,
-            lambda: self.sync_object_empty.wait(state.index, state.phase),
+            lambda: self.sync_object_empty.wait(state.index, state.phase, loc=loc, ip=ip),
         )
         if const_expr(extra_tx_count == 0):
             if_generate(
                 self.is_leader_cta,
-                lambda: self.sync_object_full.arrive(state.index, self.producer_mask),
+                lambda: self.sync_object_full.arrive(state.index, self.producer_mask, loc=loc, ip=ip),
             )
         else:
             tx_count = self.sync_object_full.tx_count + extra_tx_count
             if_generate(
                 self.is_leader_cta,
-                lambda: self.sync_object_full.arrive_and_expect_tx(state.index, tx_count),
+                lambda: self.sync_object_full.arrive_and_expect_tx(state.index, tx_count, loc=loc, ip=ip),
             )
