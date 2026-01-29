@@ -14,6 +14,7 @@ from cutlass import Float32, Int32, Boolean, const_expr
 from cutlass.utils import LayoutEnum
 
 from flash_attn.cute import hopper_helpers as sm90_utils
+from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import utils
 from flash_attn.cute import copy_utils
 from flash_attn.cute.hopper_helpers import gemm_zero_init, gemm_w_idx
@@ -350,22 +351,8 @@ class FlashAttentionBackwardSm90:
             )
         )
 
-        # Assume all strides are divisible by 128 bits except the last stride
-        # Skip cute.assume() for stride=0 (broadcast dims from expand() are Python ints)
-        new_stride = lambda t: (
-            *(
-                cute.assume(s, divby=128 // t.element_type.width)
-                if not isinstance(s, int) or s != 0
-                else s
-                for s in t.stride[:-1]
-            ),
-            t.stride[-1],
-        )
         mQ, mK, mV, mdO, mLSE, mdPsum, mdQaccum, mdK, mdV = [
-            cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t)))
-            if t is not None
-            else None
-            for t in (mQ, mK, mV, mdO, mLSE, mdPsum, mdQaccum, mdK, mdV)
+            assume_tensor_aligned(t) for t in (mQ, mK, mV, mdO, mLSE, mdPsum, mdQaccum, mdK, mdV)
         ]
 
         layout_transpose = [1, 3, 2, 0]  # (b, s, n, h) --> (s, h, n, b)

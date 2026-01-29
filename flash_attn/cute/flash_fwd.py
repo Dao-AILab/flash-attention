@@ -24,6 +24,7 @@ import cutlass.utils.hopper_helpers as sm90_utils_basic
 from quack import copy_utils as quack_copy_utils
 
 from flash_attn.cute import ampere_helpers as sm80_utils
+from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import hopper_helpers as sm90_utils
 from flash_attn.cute import utils
 from flash_attn.cute import copy_utils
@@ -660,21 +661,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         self.use_tma_O = self.arch >= 90
         self._setup_attributes()
         SharedStorage = self._get_shared_storage_cls()
-        # Assume all strides are divisible by 128 bits except the last stride
-        # Skip cute.assume() for stride=0 (broadcast dims from expand() are Python ints)
-        new_stride = lambda t: (
-            *(
-                cute.assume(s, divby=128 // t.element_type.width)
-                if not isinstance(s, int) or s != 0
-                else s
-                for s in t.stride[:-1]
-            ),
-            t.stride[-1],
-        )
-        mQ, mK, mV, mO = [
-            cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t)))
-            for t in (mQ, mK, mV, mO)
-        ]
+        mQ, mK, mV, mO = [assume_tensor_aligned(t) for t in (mQ, mK, mV, mO)]
         mQ, mK, mV, mO = [
             cute.make_tensor(t.iterator, cute.select(t.layout, mode=[1, 3, 2, 0]))
             for t in (mQ, mK, mV, mO)
@@ -1303,22 +1290,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             )
         )
 
-        # Assume all strides are divisible by 128 bits except the last stride
-        # Skip cute.assume() for stride=0 (broadcast dims from expand() are Python ints)
-        new_stride = lambda t: (
-            *(
-                cute.assume(s, divby=128 // t.element_type.width)
-                if not isinstance(s, int) or s != 0
-                else s
-                for s in t.stride[:-1]
-            ),
-            t.stride[-1],
-        )
-
-        mQ, mK, mV, mO = [
-            cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t)))
-            for t in (mQ, mK, mV, mO)
-        ]
+        mQ, mK, mV, mO = [assume_tensor_aligned(t) for t in (mQ, mK, mV, mO)]
         QO_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
         mQ, mO = [utils.select(t, QO_layout_transpose) for t in (mQ, mO)]
         KV_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensK is None) else [0, 2, 1]

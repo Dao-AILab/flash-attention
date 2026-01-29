@@ -15,6 +15,7 @@ from cutlass import Float32, const_expr
 from cutlass.utils import LayoutEnum
 
 from flash_attn.cute import utils
+from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import copy_utils
 from flash_attn.cute import ampere_helpers as sm80_utils
 from flash_attn.cute import hopper_helpers as sm90_utils
@@ -211,15 +212,7 @@ class FlashAttentionBackwardPostprocess:
             if const_expr(mdQaccum.element_type not in [cutlass.Float32]):
                 raise TypeError("dQaccum tensor must be Float32")
 
-        # Assume all strides are divisible by 128 bits except the last stride
-        new_stride = lambda t: (
-            *(cute.assume(s, divby=128 // t.element_type.width) for s in t.stride[:-1]),
-            t.stride[-1],
-        )
-        mdQaccum, mdQ = [
-            cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t)))
-            for t in (mdQaccum, mdQ)
-        ]
+        mdQaccum, mdQ = [assume_tensor_aligned(t) for t in (mdQaccum, mdQ)]
 
         self.tiled_mma = self._get_tiled_mma()
         self._setup_attributes()
