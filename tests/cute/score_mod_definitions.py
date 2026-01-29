@@ -50,7 +50,7 @@ def score_mod_rel_bias_vectorized(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_
     kv_idx0 = kv_idx[0]
     diff0 = q_idx0 - kv_idx0
     abs_diff = cute.make_rmem_tensor(kv_idx.shape, dtype=diff0.dtype)
-    for i in cutlass.rante_constexpr(cute.size(kv_idx.shape)):
+    for i in cutlass.range_constexpr(cute.size(kv_idx.shape)):
         diffi = diff0 - i
         abs_diff[i] = mlir_math.absi(diffi)
     return tSrS_ssa + abs_diff.load().to(cutlass.Float32)
