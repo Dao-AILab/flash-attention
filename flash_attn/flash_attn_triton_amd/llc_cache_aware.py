@@ -29,12 +29,12 @@ AMD_LLC_CACHE_SIZES: Dict[str, int] = {
     # RDNA2
     "gfx1030": 128 * 1024 * 1024,  # RX 6900 XT - 128 MB Infinity Cache
     # RDNA3 consumer
-    "gfx1100": 96 * 1024 * 1024,   # RX 7900 XTX/XT - 96 MB Infinity Cache
+    "gfx1100": 96 * 1024 * 1024,   # RX 7900 XTX - 96 MB Infinity Cache
     "gfx1101": 64 * 1024 * 1024,   # RX 7800 XT - 64 MB Infinity Cache
     "gfx1102": 32 * 1024 * 1024,   # RX 7600 - 32 MB Infinity Cache
     # RDNA4
-    "gfx1200": 64 * 1024 * 1024,   # RX 9070 XT - 64 MB Infinity Cache
-    "gfx1201": 32 * 1024 * 1024,   # RX 9070 - 32 MB Infinity Cache
+    "gfx1200": 32 * 1024 * 1024,   # RX 9060/XT - 32 MB Infinity Cache
+    "gfx1201": 64 * 1024 * 1024,   # RX 9070/XT - 64 MB Infinity Cache
 }
 
 # Legacy alias for backwards compatibility
@@ -89,8 +89,8 @@ def get_num_cus(device_index: int = 0) -> int:
         "gfx1101": 60,   # RX 7800 XT  
         "gfx1102": 32,   # RX 7600
         # RDNA4
-        "gfx1200": 56,   # RX 9070 XT
-        "gfx1201": 42,   # RX 9070
+        "gfx1200": 32,   # RX 9060/XT
+        "gfx1201": 64,   # RX 9070XT
     }
     
     if arch in known_cus:
