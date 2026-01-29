@@ -78,22 +78,27 @@ def get_fwd_prefill_configs(autotune: bool):
         elif arch.is_rdna:
             return [
                 triton.Config(
-                    {"BLOCK_M": 32, "BLOCK_N": 32, "PRE_LOAD_V": False},
+                    {
+                        "BLOCK_M": 64,
+                        "BLOCK_N": 64,
+                        "waves_per_eu": 1,
+                        "PRE_LOAD_V": False,
+                    },
                     num_stages=1,
                     num_warps=4,
-                ),
+                )
             ]
         else:
             return [
                 triton.Config(
                     {
-                        "BLOCK_M": 64,
-                        "BLOCK_N": 64,
+                        "BLOCK_M": 32,
+                        "BLOCK_N": 32,
                         "waves_per_eu": 2,
                         "PRE_LOAD_V": False,
                     },
                     num_stages=1,
-                    num_warps=4,
+                    num_warps=2,
                 )
             ]
 
@@ -104,7 +109,7 @@ def get_fwd_prefill_configs(autotune: bool):
     NUM_WARPS_OPTIONS = [2, 4, 8]
     NUM_STAGES_OPTIONS = [1, 2]
     WAVES_PER_EU_OPTIONS = [4, 2, 1]
-    PRE_LOAD_V_OPTIONS = [False]
+    PRE_LOAD_V_OPTIONS = [False, True]
     for bm in BLOCK_M_OPTIONS:
         for bn in BLOCK_N_OPTIONS:
             for waves in WAVES_PER_EU_OPTIONS:
