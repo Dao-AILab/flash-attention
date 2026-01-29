@@ -127,7 +127,8 @@ def _flash_attn_fwd(
     aux_tensors: Optional[list[torch.Tensor]] = None,
     scheduler_metadata: Optional[SchedulerMetadataTensorsTorch] = None,
     seqlen_k_per_split: Optional[int] = None,
-    disable_scheduler_metadata: bool = False
+    disable_scheduler_metadata: bool = False,
+    zfill_padded_output: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for FlashAttention.
 
@@ -259,30 +260,6 @@ def _flash_attn_fwd(
         else _compute_capability
     )
 
-    assert compute_capability in [9, 10], "Unsupported compute capability. Supported: 9.x, 10.x"
-
-
-    sparse_tensors = None
-    if block_sparse_tensors is not None:
-        if seqlen_q is None:
-            raise ValueError("Block sparsity requires fixed-length sequences (seqlen_q must be known).")
-        if seqlen_k is None:
-            raise ValueError("Block sparsity requires fixed-length sequences (seqlen_k must be known).")
-        m_block_size_block = m_block_size
-        if compute_capability == 10:
-            # TODO: This multiplier should really be q_stage, wire up in later PR
-            # 1 cta handles 2*tile_m row
-            m_block_size_block = 2 * m_block_size
-        expected_m_blocks = (seqlen_q + m_block_size_block - 1) // m_block_size_block
-        expected_n_blocks = (seqlen_k + n_block_size - 1) // n_block_size
-        block_sparse_tensors = normalize_block_sparse_tensors(
-            block_sparse_tensors,
-            expected_count_shape=(batch_size, num_head, expected_m_blocks),
-            expected_index_shape=(batch_size, num_head, expected_m_blocks, expected_n_blocks),
-        )
-        sparse_tensors = to_cute_block_sparse_tensors(block_sparse_tensors)
-
-    use_block_sparsity = sparse_tensors is not None
     assert compute_capability in [9, 10, 11], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x"
 
     use_block_sparsity = block_sparse_tensors is not None
@@ -339,40 +316,11 @@ def _flash_attn_fwd(
             128,
         )
         # print(f"num splits by heuristic = {num_splits} for {seqlen_q = }, {seqlen_k = }, {total_mblocks =}, {num_m_blocks = }, {num_n_blocks =},")
-
-    is_varlen = (
-        cu_seqlens_q is not None
-        or cu_seqlens_k is not None
-        or seqused_q is not None
-        or seqused_k is not None
-    )
-    is_split_kv = num_splits > 1
     
+    is_split_kv = num_splits > 1
     if is_split_kv:
         out_partial = torch.empty(num_splits, *q_batch_seqlen_shape, num_head, head_dim_v, dtype=torch.float32, device=device)
         lse_partial = torch.empty(num_splits, *lse_shape, dtype=torch.float32, device=device)
-
-        if scheduler_metadata is None and is_varlen and not disable_scheduler_metadata:
-            scheduler_metadata = get_scheduler_metadata(
-                num_batch=batch_size,
-                max_seqlen_q=max_seqlen_q,
-                max_seqlen_k=max_seqlen_k,
-                nheads=num_head,
-                nheads_k=num_head_kv,
-                headdim=head_dim,
-                headdim_v=head_dim_v,
-                num_splits=num_splits,
-                tile_m=m_block_size,
-                tile_n=n_block_size,
-                pack_gqa=pack_gqa,
-                causal=causal,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
-                seqused_q=seqused_q,
-                seqused_k=seqused_k,
-                seqlen_k_per_split=seqlen_k_per_split,
-                current_stream=current_stream,
-            )
 
     # hash score and mask mods for compile cache
     score_mod_hash = utils.hash_callable(score_mod) if score_mod is not None else False
@@ -381,6 +329,13 @@ def _flash_attn_fwd(
     if softcap is not None:
         assert score_mod is None, "softcap and score_mod cannot be used together"
         score_mod = utils.create_softcap_scoremod(softcap)
+
+    is_varlen = (
+        cu_seqlens_q is not None
+        or cu_seqlens_k is not None
+        or seqused_q is not None
+        or seqused_k is not None
+    )
 
     if mask_mod is not None:
         if is_varlen:
@@ -422,6 +377,30 @@ def _flash_attn_fwd(
             q_stage=q_stage,
         )
 
+    reuse_scheduler_metadata = scheduler_metadata is not None
+    if is_split_kv and scheduler_metadata is None and is_varlen and not disable_scheduler_metadata:
+        scheduler_metadata = get_scheduler_metadata(
+            num_batch=batch_size,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            nheads=num_head,
+            nheads_k=num_head_kv,
+            headdim=head_dim,
+            headdim_v=head_dim_v,
+            num_splits=num_splits,
+            tile_m=m_block_size,
+            tile_n=n_block_size,
+            pack_gqa=pack_gqa,
+            causal=causal,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            seqused_q=seqused_q,
+            seqused_k=seqused_k,
+            seqlen_k_per_split=seqlen_k_per_split,
+            zfill_padded_output=zfill_padded_output,
+            current_stream=current_stream,
+        )
+
     has_scheduler_metadata=scheduler_metadata is not None and not disable_scheduler_metadata
     if has_scheduler_metadata:
         (
@@ -453,7 +432,6 @@ def _flash_attn_fwd(
         if tile_count_semaphore is not None:
             assert tile_count_semaphore.shape == (1, ), "semaphore has size 1"
         # print("In interface: num_splits_dynamic = ", num_splits_dynamic)
-        
     else:
         num_m_blocks = None
         num_splits_dynamic = None
@@ -650,6 +628,8 @@ def _flash_attn_fwd(
             max_seqlen_q,
             current_stream=current_stream,
         )
+    elif reuse_scheduler_metadata and tile_count_semaphore is not None:
+        tile_count_semaphore.zero_()
     return out, lse
 
 
@@ -1457,7 +1437,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         aux_tensors: Optional[list] = None,
         scheduler_metadata: Optional[SchedulerMetadataTensorsTorch] = None,
         seqlen_k_per_split: Optional[int] = None,
-        disable_scheduler_metadata: bool = False
+        disable_scheduler_metadata: bool = False,
+        zfill_padded_output: bool = False,
     ):
         out, lse = _flash_attn_fwd(
             q,
@@ -1483,6 +1464,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             scheduler_metadata=scheduler_metadata,
             seqlen_k_per_split=seqlen_k_per_split,
             disable_scheduler_metadata=disable_scheduler_metadata,
+            zfill_padded_output=zfill_padded_output,
         )
         ctx.save_for_backward(q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
         ctx.softmax_scale = softmax_scale
@@ -1519,7 +1501,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             deterministic=ctx.deterministic,
         )
 
-        return dq, dk, dv, *((None,) * 20)
+        return dq, dk, dv, *((None,) * 21)
 
 
 def flash_attn_func(
@@ -1585,7 +1567,8 @@ def flash_attn_varlen_func(
     aux_tensors: Optional[list] = None,
     scheduler_metadata: Optional[SchedulerMetadataTensorsTorch] = None,
     seqlen_k_per_split: Optional[int] = None,
-    disable_scheduler_metadata: bool = False
+    disable_scheduler_metadata: bool = False,
+    zfill_padded_output: bool = False,
 ):
     return FlashAttnVarlenFunc.apply(
         q,
@@ -1611,6 +1594,7 @@ def flash_attn_varlen_func(
         scheduler_metadata,
         seqlen_k_per_split,
         disable_scheduler_metadata,
+        zfill_padded_output,
     )
 
 
@@ -1932,6 +1916,7 @@ def get_scheduler_metadata(
     seqused_k: Optional[torch.Tensor] = None,
     leftpad_k: Optional[torch.Tensor] = None,
     seqlen_k_per_split: Optional[int] = None,
+    zfill_padded_output: bool = False,
     current_stream: Optional[cuda.CUstream] = None,
 ) -> SchedulerMetadataTensorsTorch:
     """
@@ -2004,6 +1989,7 @@ def get_scheduler_metadata(
         num_nheads_in_l2 is not None,
         tile_count_semaphore is not None,
         n_blocks_per_split is not None,
+        zfill_padded_output,
     )
 
     if cache_key not in get_scheduler_metadata.compile_cache:
@@ -2048,6 +2034,7 @@ def get_scheduler_metadata(
             causal,
             packgqa=pack_gqa,
             sort=sort,
+            zfill_padded_output=zfill_padded_output,
         )
         get_scheduler_metadata.compile_cache[cache_key] = cute.compile(
             scheduler,

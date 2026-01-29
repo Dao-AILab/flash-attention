@@ -738,7 +738,7 @@ class SingleTileVarlenScheduler:
             group_start_tile = group_end_tile - m_blocks_in_group * params.num_head
             # if cute.arch.thread_idx()[0] == 128 + 31: cute.printf("SingleTileVarlenScheduler: tile_idx=%d, group_end_tile = %d, num_m_blocks=%d, batch_idx = %d", self._tile_idx, group_end_tile, num_m_blocks, batch_idx)
             # The next problem to process is the first one that does not have ending tile position
-            # that is greater than or equal to tile index.
+            # that is less than or equal to tile index.
             batch_idx_in_group = cute.arch.popc(
                 cute.arch.vote_ballot_sync(
                     group_start_tile + num_m_blocks_cumulative * params.num_head <= next_tile_idx
@@ -994,11 +994,11 @@ class DynamicPersistentVarlenScheduler:
         batch_idx = lane + bidb_start
         is_valid = batch_idx < params.num_batch and lane < cute.arch.WARP_SIZE - 1
         if cutlass.const_expr(not params.is_split_kv):
-            return 1
+            return Int32(1)
         elif cutlass.const_expr(params.num_splits_dynamic_ptr is not None):
-            return 1 if not is_valid else params.num_splits_dynamic_ptr[batch_idx]
+            return Int32(0) if not is_valid else params.num_splits_dynamic_ptr[batch_idx]
         else:
-            return 1 if not is_valid else params.num_splits
+            return Int32(0) if not is_valid else params.num_splits
 
     @cute.jit
     def get_current_work(
@@ -1041,7 +1041,7 @@ class DynamicPersistentVarlenScheduler:
             group_start_tile = group_end_tile - m_blocks_in_group * params.num_head
             # if cute.arch.thread_idx()[0] == 128 + 31: cute.printf("DynamicPersistentVarlenScheduler: tile_idx=%d, group_end_tile = %d, num_m_blocks=%d, batch_idx = %d", self._tile_idx, group_end_tile, num_m_blocks, batch_idx)
             # The next problem to process is the first one that does not have ending tile position
-            # that is greater than or equal to tile index.
+            # that is less than or equal to tile index.
             batch_idx_in_group = cute.arch.popc(
                 cute.arch.vote_ballot_sync(
                     group_start_tile + num_m_blocks_cumulative * params.num_head <= next_tile_idx

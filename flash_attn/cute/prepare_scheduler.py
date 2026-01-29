@@ -36,6 +36,7 @@ class FlashPrepareScheduler:
         is_causal: bool = False,
         packgqa: bool = False,
         sort: bool = False,
+        zfill_padded_output: bool = False,
     ):
         self.num_warps = num_warps
         self.is_causal = is_causal
@@ -49,6 +50,7 @@ class FlashPrepareScheduler:
         self.dv = headdim_v if headdim_v is not None else headdim
         self.k_num_batch_per_warp = 31
         self.k_smem_size = 1
+        self.zfill_padded_output = zfill_padded_output
 
         # for pack gqa, query heads per kv head is combined with seqlen_q
         self.nheads_computed = nheads if not self.packgqa else nheads_kv
@@ -210,13 +212,14 @@ class FlashPrepareScheduler:
             num_batch,
         )
 
-        num_splits_dynamic = Int32(0)
+        num_splits_dynamic = Int32(1)
         if const_expr(n_blocks_per_split is not None):
             # print("n_blocks_per_splits = ", n_blocks_per_split)
-            num_splits_dynamic = cutlass.max(
-                cutlass.min(cute.ceil_div(num_n_blocks, n_blocks_per_split), num_splits_static), Int32(1)
-            )
-            num_n_blocks = cute.ceil_div(num_n_blocks, num_splits_dynamic)
+            num_splits_dynamic = cutlass.min(cute.ceil_div(num_n_blocks, n_blocks_per_split), num_splits_static)
+            if const_expr(self.zfill_padded_output):
+                num_splits_dynamic = cutlass.max(num_splits_dynamic, Int32(1))
+            if (num_splits_dynamic > 0):
+                num_n_blocks = cute.ceil_div(num_n_blocks, num_splits_dynamic)
         else:
             if grid_dimx > 1 or num_splits_static == 1:
                 num_splits_dynamic = Int32(1)
@@ -236,9 +239,11 @@ class FlashPrepareScheduler:
                     Int32(1)
                 )
                 # blocks_per_sm = cute.ceil_div(total_blocks * self.nheads_computed, num_sm)
-                num_splits_dynamic = cutlass.max(
-                    cutlass.min(cute.ceil_div(num_n_blocks, blocks_per_sm), num_splits_static), Int32(1)
-                )
+                num_splits_dynamic = cutlass.min(cute.ceil_div(num_n_blocks, blocks_per_sm), num_splits_static)
+                if const_expr(self.zfill_padded_output):
+                    num_splits_dynamic = cutlass.max(num_splits_dynamic, Int32(1))
+                if num_splits_dynamic > 0:
+                    num_n_blocks = cute.ceil_div(num_n_blocks, num_splits_dynamic)
                 # if tidx == 0:
                 #     cute.printf("num_batch = {}", num_batch)
                 #     cute.printf("num_m_blocks = {}", num_m_blocks)
@@ -249,7 +254,6 @@ class FlashPrepareScheduler:
                 #     cute.printf("blocks_per_sm = {}", blocks_per_sm)
                 #     cute.printf("sm margin = {}", sm_margin)
                 #     cute.printf("num_splits_dynamic = {}", num_splits_dynamic)
-                num_n_blocks = cute.ceil_div(num_n_blocks, num_splits_dynamic)
 
         if const_expr(self.sort):
             # TODO: Implement sort logic
