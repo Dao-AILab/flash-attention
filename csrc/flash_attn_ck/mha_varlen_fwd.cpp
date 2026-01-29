@@ -129,6 +129,7 @@ fmha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
                          nullptr,              // seqlen_k_ptr
                          nullptr,              // cu_seqlen_q_ptr
                          nullptr,              // cu_seqlen_kv_ptr
+                         nullptr,              // sink_ptr
                          total_q,
                          total_k,
                          b,
