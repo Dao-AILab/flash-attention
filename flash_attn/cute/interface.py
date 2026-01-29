@@ -41,7 +41,7 @@ if os.environ.get("CUTE_DSL_PTXAS_PATH", None) is not None:
 
 
 from flash_attn.cute import utils
-from flash_attn.cute.cute_dsl_utils import to_cute_tensor
+from flash_attn.cute.cute_dsl_utils import to_cute_tensor, to_cute_aux_tensor
 from flash_attn.cute.flash_fwd import FlashAttentionForwardSm90
 from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
 from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
@@ -433,7 +433,7 @@ def _flash_attn_fwd(
 
         cute_aux_tensors = None
         if aux_tensors is not None:
-            cute_aux_tensors = [to_cute_tensor(buf, assumed_align=None, fully_dynamic=True) for buf in aux_tensors]
+            cute_aux_tensors = [to_cute_aux_tensor(buf) for buf in aux_tensors]
 
         if compute_capability == 9:
             assert page_table is None, "paged KV not supported on SM 9.0"
