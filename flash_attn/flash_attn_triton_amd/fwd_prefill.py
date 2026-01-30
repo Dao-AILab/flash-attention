@@ -1833,6 +1833,22 @@ def attention_forward_prefill_triton_impl(
     
     gqa_ratio = nheads_q // nheads_k
     n_groups = (nheads_q + group_size - 1) // group_size
+    
+    # Calculate K,V heads per group (for GQA)
+    group_size_k = (group_size + gqa_ratio - 1) // gqa_ratio
+    
+    # Pre-allocate K,V buffers to avoid repeated allocations in loop
+    # This reuses memory across iterations instead of calling .contiguous() each time
+    if IS_VARLEN:
+        # thd layout: (total_tokens, nheads_k_group, head_dim)
+        k_buffer = torch.empty((total_q, group_size_k, head_dim), device=k.device, dtype=k.dtype)
+        v_buffer = torch.empty((total_q, group_size_k, head_dim), device=v.device, dtype=v.dtype)
+    else:
+        # bshd layout: (batch, seqlen_k, nheads_k_group, head_dim)
+        seqlen_k = k.shape[1]
+        k_buffer = torch.empty((batch, seqlen_k, group_size_k, head_dim), device=k.device, dtype=k.dtype)
+        v_buffer = torch.empty((batch, seqlen_k, group_size_k, head_dim), device=v.device, dtype=v.dtype)
+    
     softmax_lse_list = []
     
     for g in range(n_groups):
@@ -1843,13 +1859,18 @@ def attention_forward_prefill_triton_impl(
         # For GQA, compute corresponding K,V head range
         start_h_k = start_h // gqa_ratio
         end_h_k = (end_h + gqa_ratio - 1) // gqa_ratio
+        actual_heads_k = end_h_k - start_h_k
         
         if IS_VARLEN:
             # thd layout: (total_tokens, nheads, head_dim)
             q_group = q[:, start_h:end_h, :]  # strided view
-            k_group = k[:, start_h_k:end_h_k, :].contiguous()  # copy for LLC
-            v_group = v[:, start_h_k:end_h_k, :].contiguous()  # copy for LLC
             o_group = o[:, start_h:end_h, :]  # strided view, write directly
+            
+            # Copy K,V into pre-allocated buffers
+            k_group = k_buffer[:, :actual_heads_k, :]
+            v_group = v_buffer[:, :actual_heads_k, :]
+            k_group.copy_(k[:, start_h_k:end_h_k, :])
+            v_group.copy_(v[:, start_h_k:end_h_k, :])
             
             # softmax_lse for varlen: (Hq, Total_Q)
             softmax_lse_group = torch.zeros(
@@ -1858,9 +1879,13 @@ def attention_forward_prefill_triton_impl(
         else:
             # bshd layout: (batch, seqlen, nheads, head_dim)
             q_group = q[:, :, start_h:end_h, :]  # strided view
-            k_group = k[:, :, start_h_k:end_h_k, :].contiguous()  # copy for LLC
-            v_group = v[:, :, start_h_k:end_h_k, :].contiguous()  # copy for LLC
             o_group = o[:, :, start_h:end_h, :]  # strided view, write directly
+            
+            # Copy K,V into pre-allocated buffers 
+            k_group = k_buffer[:, :, :actual_heads_k, :]
+            v_group = v_buffer[:, :, :actual_heads_k, :]
+            k_group.copy_(k[:, :, start_h_k:end_h_k, :])
+            v_group.copy_(v[:, :, start_h_k:end_h_k, :])
             
             # softmax_lse for bshd: (B, Hq, Sq)
             softmax_lse_group = torch.zeros(
