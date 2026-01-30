@@ -455,6 +455,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
         softmax_scale,
         causal,
         q_descale=None, k_descale=None, v_descale=None,
+        original_q=None, original_k=None, original_v=None,
         window_size=(-1, -1),
         attention_chunk=0,
         softcap=0.0,
@@ -496,7 +497,14 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             sm_margin=sm_margin,
         )
         # ctx.save_for_backward(q, k, v, out_padded, softmax_lse)
-        ctx.save_for_backward(q, k, v, out, softmax_lse)
+        # ctx.save_for_backward(q, k, v, out, softmax_lse)
+        # ensure q k v is bf16 and fp16, original_q, original_k, original_v save bf16 or fp16 qkv for backward
+        if original_q is not None:
+            q = original_q
+        if original_k is not None:
+            k = original_k
+        if original_v is not None:
+            v = original_v
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size = window_size
@@ -558,6 +566,7 @@ class FlashAttnFunc(torch.autograd.Function):
         causal,
         qv=None,
         q_descale=None, k_descale=None, v_descale=None,
+        original_q=None, original_k=None, original_v=None,
         window_size=(-1, -1),
         attention_chunk=0,
         softcap=0.0,
@@ -570,6 +579,7 @@ class FlashAttnFunc(torch.autograd.Function):
         if softmax_scale is None:
             softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (-0.5)
         # out, q, k, v, out_padded, softmax_lse = _flash_attn_forward(
+        
         out, softmax_lse, *rest = _flash_attn_forward(
             q,
             k,
@@ -594,6 +604,13 @@ class FlashAttnFunc(torch.autograd.Function):
             sm_margin=sm_margin,
         )
         # ctx.save_for_backward(q, k, v, out_padded, softmax_lse)
+        # ensure q k v is bf16 and fp16, original_q, original_k, original_v save bf16 or fp16 qkv for backward
+        if original_q is not None:
+            q = original_q
+        if original_k is not None:
+            k = original_k
+        if original_v is not None:
+            v = original_v
         ctx.save_for_backward(q, k, v, out, softmax_lse)
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
@@ -633,7 +650,8 @@ class FlashAttnFunc(torch.autograd.Function):
         dq = dq[..., : q.shape[-1]]  # We could have padded the head dimension
         dk = dk[..., : k.shape[-1]]
         dv = dv[..., : v.shape[-1]]
-        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None
+        # return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None
+        return dq, dk, dv, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None, None
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -654,6 +672,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         causal,
         qv=None,
         q_descale=None, k_descale=None, v_descale=None,
+        original_q=None, original_k=None, original_v=None,
         window_size=(-1, -1),
         attention_chunk=0,
         softcap=0.0,
@@ -694,6 +713,13 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             sm_margin=sm_margin,
         )
         # ctx.save_for_backward(q, k, v, out_padded, softmax_lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
+        # ensure q k v is bf16 and fp16, original_q, original_k, original_v save bf16 or fp16 qkv for backward
+        if original_q is not None:
+            q = original_q
+        if original_k is not None:
+            k = original_k
+        if original_v is not None:
+            v = original_v
         ctx.save_for_backward(q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
         ctx.max_seqlen_q = max_seqlen_q
         ctx.max_seqlen_k = max_seqlen_k
@@ -746,6 +772,7 @@ def flash_attn_qkvpacked_func(
     softmax_scale=None,
     causal=False,
     q_descale=None, k_descale=None, v_descale=None,
+    original_q=None, original_k=None, original_v=None,
     window_size=(-1, -1),
     attention_chunk=0,
     softcap=0.0,
@@ -793,6 +820,7 @@ def flash_attn_qkvpacked_func(
         softmax_scale,
         causal,
         q_descale, k_descale, v_descale,
+        original_q, original_k, original_v,
         window_size,
         attention_chunk,
         softcap,
@@ -811,6 +839,7 @@ def flash_attn_func(
     causal=False,
     qv=None,
     q_descale=None, k_descale=None, v_descale=None,
+    original_q=None, original_k=None, original_v=None,
     window_size=(-1, -1),
     attention_chunk=0,
     softcap=0.0,
@@ -865,6 +894,7 @@ def flash_attn_func(
             logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
             normalization factor).
     """
+
     return FlashAttnFunc.apply(
         q,
         k,
@@ -873,6 +903,7 @@ def flash_attn_func(
         causal,
         qv,
         q_descale, k_descale, v_descale,
+        original_q, original_k, original_v,
         window_size,
         attention_chunk,
         softcap,
@@ -898,6 +929,7 @@ def flash_attn_varlen_func(
     causal=False,
     qv=None,
     q_descale=None, k_descale=None, v_descale=None,
+    original_q=None, original_k=None, original_v=None,
     window_size=(-1, -1),
     attention_chunk=0,
     softcap=0.0,
@@ -921,6 +953,7 @@ def flash_attn_varlen_func(
         causal,
         qv,
         q_descale, k_descale, v_descale,
+        original_q, original_k, original_v,
         window_size,
         attention_chunk,
         softcap,
