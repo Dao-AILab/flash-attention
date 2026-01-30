@@ -11,6 +11,7 @@ from .utils import (
     get_arch,
     is_fp8,
 )
+from .llc_cache_aware import is_head_grouping_beneficial
 
 
 
@@ -1270,7 +1271,7 @@ def attn_fwd(
     tl.store(o_ptrs, acc.to(Out.dtype.element_ty), mask=o_ptrs_mask)
 
 
-def attention_forward_prefill_triton_impl(
+def _attention_forward_prefill_triton_impl_core(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
@@ -1746,3 +1747,159 @@ def attention_forward_prefill_triton_impl(
         USE_SEQUSED=(seqused_q is not None or seqused_k is not None),
         FORCE_MASKING=force_masking,
     )
+
+
+# Environment variable to enable LLC-aware head grouping debug output
+LLC_HEAD_GROUPING_DEBUG = os.environ.get('FLASH_ATTN_HEAD_GROUPING_DEBUG', '0') == '1'
+
+
+def attention_forward_prefill_triton_impl(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    o: torch.Tensor,
+    softmax_lse: torch.Tensor,
+    sd_mask: Optional[torch.Tensor],
+    sm_scale: float,
+    alibi_slopes: Optional[torch.Tensor],
+    causal: bool,
+    window_size_left: int,
+    window_size_right: int,
+    bias: Optional[torch.Tensor],
+    layout: Literal["bshd", "bhsd", "thd"],
+    # varlen
+    cu_seqlens_q: Optional[torch.Tensor],
+    cu_seqlens_k: Optional[torch.Tensor],
+    max_seqlens_q: int,
+    max_seqlens_k: int,
+    # dropout
+    dropout_p: float,
+    philox_seed: Optional[int],
+    philox_offset: Optional[int],
+    # misc
+    return_scores: bool,
+    use_exp2: bool,
+    # fp8
+    q_descale: Optional[torch.Tensor],
+    k_descale: Optional[torch.Tensor],
+    v_descale: Optional[torch.Tensor],
+    # seqused for FA v3
+    seqused_q: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
+    # rotary (optional)
+    rotary_cos: Optional[torch.Tensor] = None,
+    rotary_sin: Optional[torch.Tensor] = None,
+    rotary_interleaved: bool = False,
+    seqlens_rotary: Optional[torch.Tensor] = None,
+):
+    """
+    Wrapper for attention forward with LLC-aware head grouping optimization.
+    
+    For long sequences on GPUs with large LLC (e.g., RDNA3 with 96 MB Infinity Cache),
+    processing heads in groups that fit K,V in cache can significantly improve performance.
+    """
+    IS_VARLEN = layout == "thd"
+    
+    # Get head dimensions
+    if IS_VARLEN:
+        total_q, nheads_q, head_dim = q.shape
+        nheads_k = k.shape[1]
+    else:
+        batch, seqlen_q, nheads_q, head_dim = q.shape
+        nheads_k = k.shape[2]
+    
+    # Check if head grouping is beneficial
+    should_group, group_size = is_head_grouping_beneficial(
+        nheads_k, max_seqlens_k, head_dim, q.dtype, q.device.index or 0
+    )
+    
+    # Disable head grouping if return_scores is requested (need full attention matrix)
+    # or if sd_mask is provided
+    if return_scores or sd_mask is not None:
+        should_group = False
+    
+    if not should_group or group_size >= nheads_q:
+        # No grouping needed - call core implementation directly
+        return _attention_forward_prefill_triton_impl_core(
+            q, k, v, o, softmax_lse, sd_mask,
+            sm_scale, alibi_slopes, causal,
+            window_size_left, window_size_right, bias, layout,
+            cu_seqlens_q, cu_seqlens_k, max_seqlens_q, max_seqlens_k,
+            dropout_p, philox_seed, philox_offset,
+            return_scores, use_exp2,
+            q_descale, k_descale, v_descale,
+            seqused_q, seqused_k,
+            rotary_cos, rotary_sin, rotary_interleaved, seqlens_rotary,
+        )
+    
+    # Head grouping path
+    if LLC_HEAD_GROUPING_DEBUG:
+        print(f"[LLC Head Grouping fwd_prefill] Processing {nheads_q} heads in groups of {group_size}")
+    
+    gqa_ratio = nheads_q // nheads_k
+    n_groups = (nheads_q + group_size - 1) // group_size
+    softmax_lse_list = []
+    
+    for g in range(n_groups):
+        start_h = g * group_size
+        end_h = min((g + 1) * group_size, nheads_q)
+        actual_heads = end_h - start_h
+        
+        # For GQA, compute corresponding K,V head range
+        start_h_k = start_h // gqa_ratio
+        end_h_k = (end_h + gqa_ratio - 1) // gqa_ratio
+        
+        if IS_VARLEN:
+            # thd layout: (total_tokens, nheads, head_dim)
+            q_group = q[:, start_h:end_h, :]  # strided view
+            k_group = k[:, start_h_k:end_h_k, :].contiguous()  # copy for LLC
+            v_group = v[:, start_h_k:end_h_k, :].contiguous()  # copy for LLC
+            o_group = o[:, start_h:end_h, :]  # strided view, write directly
+            
+            # softmax_lse for varlen: (Hq, Total_Q)
+            softmax_lse_group = torch.zeros(
+                (actual_heads, total_q), device=q.device, dtype=torch.float32
+            )
+        else:
+            # bshd layout: (batch, seqlen, nheads, head_dim)
+            q_group = q[:, :, start_h:end_h, :]  # strided view
+            k_group = k[:, :, start_h_k:end_h_k, :].contiguous()  # copy for LLC
+            v_group = v[:, :, start_h_k:end_h_k, :].contiguous()  # copy for LLC
+            o_group = o[:, :, start_h:end_h, :]  # strided view, write directly
+            
+            # softmax_lse for bshd: (B, Hq, Sq)
+            softmax_lse_group = torch.zeros(
+                (batch, actual_heads, softmax_lse.shape[-1]),
+                device=q.device, dtype=torch.float32,
+            )
+        
+        # Handle alibi slopes if present
+        alibi_group = None
+        if alibi_slopes is not None:
+            alibi_group = alibi_slopes[:, start_h:end_h] if alibi_slopes.dim() == 2 else alibi_slopes[start_h:end_h]
+        
+        # Call core implementation for this group
+        _attention_forward_prefill_triton_impl_core(
+            q_group, k_group, v_group, o_group, softmax_lse_group, None,
+            sm_scale, alibi_group, causal,
+            window_size_left, window_size_right, bias, layout,
+            cu_seqlens_q, cu_seqlens_k, max_seqlens_q, max_seqlens_k,
+            dropout_p, philox_seed, philox_offset,
+            False, use_exp2,
+            q_descale, k_descale, v_descale,
+            seqused_q, seqused_k,
+            rotary_cos, rotary_sin, rotary_interleaved, seqlens_rotary,
+        )
+        
+        softmax_lse_list.append(softmax_lse_group)
+    
+    # Concatenate softmax_lse across heads
+    if IS_VARLEN:
+        # varlen: (Hq, Total_Q) - concat on dim 0
+        final_lse = torch.cat(softmax_lse_list, dim=0)
+    else:
+        # bshd: (B, Hq, Sq) - concat on dim 1
+        final_lse = torch.cat(softmax_lse_list, dim=1)
+    
+    # Copy back to caller's softmax_lse tensor
+    softmax_lse.copy_(final_lse)
