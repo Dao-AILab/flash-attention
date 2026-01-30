@@ -18,9 +18,10 @@ Example: gfx1100 with 96MB Infinity Cache, 40 heads, seqlen=17160, head_dim=128
 """
 
 import os
-import functools
-from typing import Optional, Tuple, Dict
+from typing import Tuple, Dict
 import torch
+
+from .utils import get_arch
 
 # Infinity Cache (LLC) sizes for AMD GPUs in bytes
 # Note: This is the L3/Infinity Cache, NOT the L2 cache
@@ -51,59 +52,6 @@ DISABLE_HEAD_GROUPING_ENV = "FLASH_ATTN_DISABLE_HEAD_GROUPING"
 _llc_cache_size_cache: Dict[int, int] = {}
 
 
-@functools.lru_cache(maxsize=None)
-def get_gcn_arch_name(device_index: int = 0) -> str:
-    """Get the GCN architecture name for an AMD GPU."""
-    try:
-        props = torch.cuda.get_device_properties(device_index)
-        if hasattr(props, 'gcnArchName'):
-            return props.gcnArchName
-        # Fallback: try to get from name
-        name = props.name.lower()
-        if 'gfx' in name:
-            # Extract gfxXXXX from name
-            import re
-            match = re.search(r'gfx\d+', name)
-            if match:
-                return match.group()
-    except Exception:
-        pass
-    return "unknown"
-
-
-def get_num_cus(device_index: int = 0) -> int:
-    """
-    Get the number of Compute Units for an AMD GPU.
-    
-    Note: PyTorch's multi_processor_count may be incorrect for some AMD GPUs.
-    We use known values for common architectures.
-    """
-    arch = get_gcn_arch_name(device_index)
-    
-    # Known CU counts for common GPUs
-    known_cus = {
-        # RDNA2
-        "gfx1030": 80,   # RX 6900 XT
-        # RDNA3
-        "gfx1100": 96,   # RX 7900 XTX
-        "gfx1101": 60,   # RX 7800 XT  
-        "gfx1102": 32,   # RX 7600
-        # RDNA4
-        "gfx1200": 32,   # RX 9060/XT
-        "gfx1201": 64,   # RX 9070XT
-    }
-    
-    if arch in known_cus:
-        return known_cus[arch]
-    
-    # Fallback to PyTorch (may be incorrect)
-    try:
-        props = torch.cuda.get_device_properties(device_index)
-        return props.multi_processor_count
-    except Exception:
-        return 96  # Default
-
-
 def get_llc_cache_size(device_index: int = 0) -> int:
     """
     Get Infinity Cache (LLC) size for the specified GPU device.
@@ -129,8 +77,8 @@ def get_llc_cache_size(device_index: int = 0) -> int:
             except ValueError:
                 pass
     
-    # Get architecture and look up cache size
-    arch = get_gcn_arch_name(device_index)
+    # Get architecture using utils.get_arch()
+    arch = get_arch().name
     
     # Check exact match first
     if arch in AMD_LLC_CACHE_SIZES:
@@ -250,8 +198,7 @@ def print_head_grouping_info(
 ):
     """Print diagnostic information about head grouping."""
     llc_size = get_llc_cache_size(device_index)
-    arch = get_gcn_arch_name(device_index)
-    num_cus = get_num_cus(device_index)
+    arch = get_arch()
     
     if dtype in (torch.float16, torch.bfloat16):
         elem_size = 2
@@ -268,7 +215,7 @@ def print_head_grouping_info(
     )
     
     print(f"\n=== Infinity Cache (LLC) Aware Head Grouping ===")
-    print(f"GPU: {arch} ({num_cus} CUs)")
+    print(f"GPU: {arch.name}")
     print(f"Infinity Cache (LLC): {llc_size / (1024*1024):.1f} MB")
     print(f"Heads: {nheads}, SeqLen: {seqlen_k}, HeadDim: {head_dim}")
     print(f"Total K,V Memory: {total_kv / (1024*1024):.1f} MB")
