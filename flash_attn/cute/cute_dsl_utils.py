@@ -170,6 +170,17 @@ def to_cute_aux_tensor(t, enable_tvm_ffi=True):
     )
 
 
+def get_aux_tensor_metadata(aux_tensors):
+    return tuple(
+        (
+            getattr(t, "__assumed_align__", 0),
+            getattr(t, "__leading_dim__", -1),
+            hasattr(t, "__leading_dim__"),
+        )
+        for t in aux_tensors
+    )
+
+
 def get_broadcast_dims(tensor: torch.Tensor) -> Tuple[bool, ...]:
     """Return tuple of bools indicating which dims have stride=0 (broadcast).
 
