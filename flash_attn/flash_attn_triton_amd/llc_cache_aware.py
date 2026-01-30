@@ -149,9 +149,17 @@ def is_head_grouping_beneficial(
 ) -> Tuple[bool, int]:
     """
     Determine if head grouping would be beneficial and return optimal group size.
+    
+    Head grouping is only beneficial for RDNA GPUs with Infinity Cache (LLC).
+    CDNA GPUs (MI250, MI300, etc.) have different cache architectures.
     """
     # Check if disabled via environment
     if os.environ.get(DISABLE_HEAD_GROUPING_ENV, "0") == "1":
+        return False, nheads
+    
+    # Only apply head grouping to RDNA GPUs (which have Infinity Cache)
+    arch = get_arch()
+    if not arch.is_rdna:
         return False, nheads
     
     llc_size = get_llc_cache_size(device_index)

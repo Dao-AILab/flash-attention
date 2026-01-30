@@ -1748,11 +1748,6 @@ def _attention_forward_prefill_triton_impl_core(
         FORCE_MASKING=force_masking,
     )
 
-
-# Environment variable to enable LLC-aware head grouping debug output
-LLC_HEAD_GROUPING_DEBUG = os.environ.get('FLASH_ATTN_HEAD_GROUPING_DEBUG', '0') == '1'
-
-
 def attention_forward_prefill_triton_impl(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1833,7 +1828,7 @@ def attention_forward_prefill_triton_impl(
         )
     
     # Head grouping path
-    if LLC_HEAD_GROUPING_DEBUG:
+    if DEBUG:
         print(f"[LLC Head Grouping fwd_prefill] Processing {nheads_q} heads in groups of {group_size}")
     
     gqa_ratio = nheads_q // nheads_k
