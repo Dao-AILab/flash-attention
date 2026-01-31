@@ -3,6 +3,7 @@
 import math
 import hashlib
 import inspect
+import os
 import re
 from typing import Type, Callable, Optional, Tuple, overload
 from functools import partial
@@ -10,7 +11,8 @@ from functools import partial
 import cutlass
 import cutlass.cute as cute
 
-from cutlass import Float32, const_expr
+from cutlass import Float32, Int32, const_expr
+
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import nvvm, llvm
 from cutlass.cute.runtime import from_dlpack
@@ -26,6 +28,21 @@ sub_packed_f32x2 = partial(
     calc_func=nvvm.sub_packed_f32x2,
     rnd=nvvm.RoundingModeKind.RN,
 )
+
+_fa4_debug_enabled: bool = os.environ.get("FA4_DEBUG", "0") == "1"
+FA4_DEBUG: bool = _fa4_debug_enabled
+
+_fa4_clc_enabled: bool = os.environ.get("FA4_CLC", "0") == "1"
+
+
+def _get_use_clc_scheduler_default() -> bool:
+    return _fa4_clc_enabled
+
+
+def debug_printf(fmt, *args):
+    """Device-side printf enabled by `FA4_DEBUG=1`."""
+    if const_expr(_fa4_debug_enabled):
+        cute.printf(fmt, *args)
 
 
 def hash_callable(func: Callable, set_cute_hash=True) -> str:
@@ -315,6 +332,21 @@ def log2f(a: float | Float32, *, loc=None, ip=None) -> Float32:
             [Float32(a).ir_value(loc=loc, ip=ip)],
             "lg2.approx.ftz.f32 $0, $1;",
             "=f,f",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def smid(*, loc=None, ip=None) -> Int32:
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [],
+            "mov.u32 $0, %smid;",
+            "=r",
             has_side_effects=False,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
