@@ -3,19 +3,36 @@
 import math
 import hashlib
 import inspect
+import os
 import re
 from typing import Type, Callable, Optional, Tuple, overload
 
 import cutlass
 import cutlass.cute as cute
 
-from cutlass import Float32, const_expr
+from cutlass import Float32, Int32, const_expr
+
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import nvvm, llvm
 from cutlass.cute.runtime import from_dlpack
 
 
 import quack.activation
+
+_fa4_debug_enabled: bool = os.environ.get("FA4_DEBUG", "0") == "1"
+FA4_DEBUG: bool = _fa4_debug_enabled
+
+_fa4_clc_enabled: bool = os.environ.get("FA4_CLC", "0") == "1"
+
+
+def _get_use_clc_scheduler_default() -> bool:
+    return _fa4_clc_enabled
+
+
+def debug_printf(fmt, *args):
+    """Device-side printf enabled by `FA4_DEBUG=1`."""
+    if const_expr(_fa4_debug_enabled):
+        cute.printf(fmt, *args)
 
 
 def hash_callable(func: Callable, set_cute_hash=True) -> str:
