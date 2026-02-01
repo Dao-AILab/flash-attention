@@ -131,11 +131,19 @@ FlashAttention-2 ROCm CK backend currently supports:
 #### Triton Backend
 The Triton implementation of [Flash Attention](https://tridao.me/publications/flash2/flash2.pdf) supports AMD's CDNA (MI200, MI300) and RDNA GPUs using fp16, bf16, and fp32 datatypes. It provides forward and backward passes with causal masking, variable sequence lengths, arbitrary Q/KV sequence lengths and head sizes, MQA/GQA, dropout, rotary embeddings, ALiBi, paged attention, and FP8 (via the Flash Attention v3 interface). Sliding window attention is currently a work in progress.
 
-To install, first get PyTorch for ROCm from https://pytorch.org/get-started/locally/, then install Triton and Flash Attention:
+The Triton backend kernels are provided by the [aiter](https://github.com/ROCm/aiter) package, which is automatically installed as a dependency.
+
+To install, first get PyTorch for ROCm from https://pytorch.org/get-started/locally/, then install Flash Attention:
 ```sh
-pip install triton==3.5.1
 cd flash-attention
-FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" python setup.py install
+FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" pip install --no-build-isolation .
+```
+
+To use a specific aiter commit (e.g., for testing or development):
+```sh
+FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" \
+FLASH_ATTENTION_ROCM_AITER_COMMIT="<commit-sha>" \
+pip install --no-build-isolation .
 ```
 
 To run the tests (note: full suite takes hours):
@@ -143,7 +151,7 @@ To run the tests (note: full suite takes hours):
 FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" pytest tests/test_flash_attn_triton_amd.py
 ```
 
-For better performance, enable autotune with `FLASH_ATTENTION_TRITON_AMD_AUTOTUNE="TRUE"`.
+The Triton backend uses a default kernel configuration optimized for determinism and reasonable performance across workloads. For peak throughput, enable `FLASH_ATTENTION_TRITON_AMD_AUTOTUNE="TRUE"` to search for optimal settings, which incurs a one-time warmup cost.
 
 Alternativly, if _not_ autotuning, `FLASH_ATTENTION_FWD_TRITON_AMD_CONFIG_JSON` may be used to set a single triton config overriding the hardcoded defaults for `attn_fwd`. E.g.
 ```sh
@@ -156,13 +164,10 @@ FROM rocm/pytorch:latest
 
 WORKDIR /workspace
 
-# install triton
-RUN pip install triton==3.5.1
-
 # build flash attention with triton backend
 RUN git clone https://github.com/Dao-AILab/flash-attention &&\ 
     cd flash-attention &&\
-    FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" python setup.py install
+    FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" pip install --no-build-isolation .
 
 # set working dir
 WORKDIR /workspace/flash-attention
