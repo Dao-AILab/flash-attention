@@ -66,6 +66,14 @@ USE_TRITON_ROCM = os.getenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", "FALSE") == "TR
 SKIP_CK_BUILD = os.getenv("FLASH_ATTENTION_SKIP_CK_BUILD", "TRUE") == "TRUE" if USE_TRITON_ROCM else False
 NVCC_THREADS = os.getenv("NVCC_THREADS") or "4"
 
+# ROCM AITER commit
+_DEFAULT_AITER_COMMIT = "7ece69b2b6c4d7bd0532d7b4cc30589c1986648c"
+AITER_COMMIT = os.getenv("FLASH_ATTENTION_ROCM_AITER_COMMIT", _DEFAULT_AITER_COMMIT)
+if AITER_COMMIT != _DEFAULT_AITER_COMMIT:
+    warnings.warn(
+        f"Using FLASH_ATTENTION_ROCM_AITER_COMMIT override: {AITER_COMMIT[:8]}"
+    )
+
 @functools.lru_cache(maxsize=None)
 def cuda_archs() -> str:
     return os.getenv("FLASH_ATTN_CUDA_ARCHS", "80;90;100;110;120").split(";")
@@ -593,6 +601,20 @@ class NinjaBuildExtension(BuildExtension):
         super().__init__(*args, **kwargs)
 
 
+# Build install_requires based on platform
+if IS_ROCM and USE_TRITON_ROCM:
+    # Note: torch is excluded because pip resolves it to CUDA PyTorch from PyPI, overwriting any pre-installed ROCm PyTorch. Users must have torch installed.
+    install_requires = [
+        "einops",
+        "triton==3.5.1",
+        f"amd-aiter @ git+https://github.com/ROCm/aiter.git@{AITER_COMMIT}",
+    ]
+else:
+    install_requires = [
+        "torch",
+        "einops",
+    ]
+
 setup(
     name=PACKAGE_NAME,
     version=get_package_version(),
@@ -626,10 +648,7 @@ setup(
         "bdist_wheel": CachedWheelsCommand,
     },
     python_requires=">=3.9",
-    install_requires=[
-        "torch",
-        "einops",
-    ],
+    install_requires=install_requires,
     setup_requires=[
         "packaging",
         "psutil",
