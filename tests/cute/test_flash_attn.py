@@ -32,6 +32,7 @@ from flash_attn.cute.interface import (
 DISABLE_SPLIT = os.getenv("FLASH_ATTENTION_DISABLE_SPLIT", "FALSE") == "TRUE"
 # SplitKV and paged KV are not supported on SM90
 IS_SM90 = _get_device_capability() == 9
+IS_SM120 = _get_device_capability() == 12
 TEST_BWD_ONLY = False
 VERBOSE = True
 
@@ -908,6 +909,11 @@ def test_flash_attn_kvcache(
         pytest.skip()
     if page_size is not None and IS_SM90:
         pytest.xfail("paged KV not supported on SM90")
+    # SM12x (Blackwell GeForce) uses a fallback implementation that doesn't support paged KV cache.
+    # The fallback expects KV tensors in (batch, seqlen, heads, dim) format but paged cache
+    # uses (num_pages, page_size, heads, dim) format, causing shape mismatches.
+    if page_size is not None and IS_SM120:
+        pytest.skip("paged KV not supported on SM12x fallback")
     if seqlen_q > seqlen_k and new_kv:
         pytest.skip()
     if not new_kv and rotary_fraction > 0.0:
