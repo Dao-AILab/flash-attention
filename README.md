@@ -123,7 +123,7 @@ container from ROCm, which has all the required tools to install FlashAttention.
 
 #### Composable Kernel Backend
 FlashAttention-2 ROCm CK backend currently supports:
-1. MI200 or MI300 GPUs.
+1. MI200, MI300, or RDNA4 GPUs.
 2. Datatype fp16 and bf16
 3. Both forward's and backward's head dimensions up to 256.
 
