@@ -28,12 +28,14 @@ sub_packed_f32x2 = partial(
 )
 
 
-def hash_callable(func: Callable) -> str:
+def hash_callable(func: Callable, set_cute_hash=True) -> str:
     """Hash a callable based on the source code or bytecode and closure values.
 
     Fast-path: if the callable (or its __wrapped__ base) has a ``__cute_hash__``
     attribute, that value is returned immediately. Code-generation backends such
     as Inductor can set this attribute to avoid expensive runtime hashing.
+
+    set_cute_hash: whether or not to set func.__cute_hash__ if not present
     """
     if hasattr(func, "__cute_hash__"):
         return func.__cute_hash__
@@ -60,14 +62,19 @@ def hash_callable(func: Callable) -> str:
             cell_value = cell.cell_contents
             hasher.update(repr(cell_value).encode())
 
-    return hasher.hexdigest()
+    hash = hasher.hexdigest()
+
+    if set_cute_hash:
+        func.__cute_hash__ = hash
+
+    return hash
 
 
 def create_softcap_scoremod(softcap_val):
     inv_softcap = 1.0 / softcap_val
 
     @cute.jit
-    def scoremod_premask_fn(acc_S_SSA, batch_idx, head_idx, q_idx, kv_idx, buffers):
+    def scoremod_premask_fn(acc_S_SSA, batch_idx, head_idx, q_idx, kv_idx, aux_tensors):
         scores = acc_S_SSA * inv_softcap
         return scores * cute.math.tanh(scores, fastmath=True)
 
@@ -527,7 +534,8 @@ def shuffle_sync(
     mask = cute.arch.WARP_SIZE - width
     clamp = cute.arch.WARP_SIZE - 1
     mask_and_clamp = mask << 8 | clamp
-    val = cute.make_fragment(1, type(value))
+    # important: need stride 1 and not 0 for recast_tensor to work
+    val = cute.make_rmem_tensor(cute.make_layout((1,), stride=(1,)), type(value))
     val[0] = value
     val_i32 = cute.recast_tensor(val, cutlass.Int32)
     for i in cutlass.range_constexpr(cute.size(val_i32)):

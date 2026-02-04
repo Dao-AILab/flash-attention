@@ -7,6 +7,9 @@ import torch
 import torch.nn.functional as F
 from flash_attn.cute import flash_attn_varlen_func
 
+IS_SM90 = torch.cuda.get_device_capability()[0] == 9
+
+
 @pytest.mark.parametrize("B", [1, 7, 20])
 @pytest.mark.parametrize("H", [1, 4, 6])
 @pytest.mark.parametrize("D", [64, 128])
@@ -40,9 +43,8 @@ def test_varlen(
         dtype=dtype
     )
 
-    # SM100 (Blackwell) backward pass doesn't support varlen yet
-    compute_capability = torch.cuda.get_device_capability()[0]
-    skip_backward = (compute_capability == 10)
+    # SM90 backward pass doesn't support varlen yet
+    skip_backward = IS_SM90
 
     ok = check_varlen_vs_torch_flash(
         q, k, v,
@@ -126,7 +128,7 @@ def check_varlen_vs_torch_flash(
     if not ok_fwd:
         return False
 
-    # Skip backward if not supported (e.g., SM100 varlen)
+    # Skip backward if not supported (e.g., SM90 varlen)
     if skip_backward:
         return True
 
