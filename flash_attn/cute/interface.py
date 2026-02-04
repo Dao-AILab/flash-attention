@@ -63,6 +63,17 @@ def _get_device_capability():
     """Cached device capability check."""
     return torch.cuda.get_device_capability()[0]
 
+
+def _validate_head_dims(head_dim: int, head_dim_v: int, compute_capability: int) -> None:
+    is_standard_range = 8 <= head_dim <= 128 and 8 <= head_dim_v <= 128
+    is_extended_qk = 128 < head_dim <= 192 and 8 <= head_dim_v <= 128
+
+    assert is_standard_range or is_extended_qk, (
+        f"(head_dim, head_dim_v)=({head_dim}, {head_dim_v}) is not supported on SM{compute_capability * 10}. "
+        f"head_dim must be between 8 and 192, head_dim_v must be between 8 and 128."
+    )
+
+
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
@@ -211,11 +222,17 @@ def _flash_attn_fwd(
             learnable_sink,
         )
     ), "inputs must be on CUDA device"
+    compute_capability = (
+        _get_device_capability()
+        if _compute_capability is None
+        else _compute_capability
+    )
+    assert compute_capability in [9, 10, 11], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x"
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
-    assert head_dim <= 256, "head_dim must be less than or equal to 256"
     alignment = 16 // q.element_size()
     assert head_dim % alignment == 0, f"head_dim must be divisible by {alignment}"
     assert head_dim_v % alignment == 0, f"head_dim_v must be divisible by {alignment}"
+    _validate_head_dims(head_dim, head_dim_v, compute_capability)
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
     if softcap == 0.0:
@@ -247,14 +264,6 @@ def _flash_attn_fwd(
         _validate_tensor(lse, "lse", lse_shape, torch.float32, device)
 
     dtype = torch2cute_dtype_map[q.dtype]
-    compute_capability = (
-        _get_device_capability()
-        if _compute_capability is None
-        else _compute_capability
-    )
-
-    assert compute_capability in [9, 10, 11], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x"
-
     use_block_sparsity = block_sparse_tensors is not None
 
     if mask_mod is None:
@@ -705,10 +714,10 @@ def _flash_attn_bwd(
         t is None or t.is_cuda for t in (q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k)
     ), "inputs must be on CUDA device"
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
-    assert head_dim <= 256, "head_dim must be less than or equal to 256"
     alignment = 16 // q.element_size()
     assert head_dim % alignment == 0, f"head_dim must be divisible by {alignment}"
     assert head_dim_v % alignment == 0, f"head_dim_v must be divisible by {alignment}"
+    _validate_head_dims(head_dim, head_dim_v, compute_capability)
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
     qhead_per_kvhead = num_head // num_head_kv
