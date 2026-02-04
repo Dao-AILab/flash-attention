@@ -1520,3 +1520,18 @@ def test_flash_attn_combine(num_splits, seqlen, d, dtype):
     assert torch.allclose(out_no_lse, out, atol=1e-5, rtol=1e-5), (
         "Output should be the same regardless of return_lse"
     )
+
+
+@pytest.mark.parametrize("head_dim", [4, 144, 256])
+def test_flash_attn_invalid_head_dim(head_dim):
+    """Verify that invalid head dimensions raise AssertionError."""
+    device = "cuda"
+    dtype = torch.bfloat16
+    batch_size, seqlen, nheads = 1, 64, 4
+
+    q = torch.randn(batch_size, seqlen, nheads, head_dim, device=device, dtype=dtype)
+    k = torch.randn(batch_size, seqlen, nheads, head_dim, device=device, dtype=dtype)
+    v = torch.randn(batch_size, seqlen, nheads, head_dim, device=device, dtype=dtype)
+
+    with pytest.raises(AssertionError):
+        flash_attn_func(q, k, v)
