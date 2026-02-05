@@ -142,9 +142,8 @@ class FlashAttentionForwardSm100:
             (self.head_dim_padded == 192 and self.head_dim_v_padded >= 64) or
             (self.head_dim_v_padded >= 128 and self.is_split_kv)
         )
-        # if self.overlap_sO_sQ:
-        #     self.is_persistent = False
-        print("overlap sO and sQ = ", self.overlap_sO_sQ)
+        if self.overlap_sO_sQ:
+            self.is_persistent = False
 
         assert self.use_tma_KV or not (self.check_hdim_oob or self.check_hdim_v_oob), (
             "Paged KV does not support irregular head dim"
@@ -657,7 +656,7 @@ class FlashAttentionForwardSm100:
         class SharedStorage:
             # m_barriers for pipelines
             mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.mbar_total]
-            sched_pipeline_array_ptr: cute.struct.MemRange[cutlass.Int64, 2 * 2]
+            sched_pipeline_array_ptr: cute.struct.MemRange[cutlass.Int64, 2]
             work_info: cute.struct.MemRange[Int32, 4]
             # Tmem holding buffer
             tmem_holding_buf: Int32
@@ -1216,9 +1215,6 @@ class FlashAttentionForwardSm100:
             cutlass.pipeline.PipelineUserType.Producer, self.kv_stage
         )
         load_epi_consumer_phase = Int32(0)
-        producer_scheduler_state = cutlass.pipeline.make_pipeline_state(
-            cutlass.pipeline.PipelineUserType.Producer, 1
-        )
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
@@ -1378,10 +1374,8 @@ class FlashAttentionForwardSm100:
                 )
 
             if warp_idx == self.scheduler_warp:
-                producer_scheduler_state = tile_scheduler.prefetch_next_work(producer_scheduler_state)
-
-            tile_scheduler.advance_to_next_work()
-            work_tile = tile_scheduler.get_current_work()
+                tile_scheduler.prefetch_next_work()
+            work_tile = tile_scheduler.advance_to_next_work()
             if const_expr(self.overlap_sO_sQ and self.is_persistent):
                 cute.arch.mbarrier_wait(
                     mbar_ptr + self.mbar_load_epi_empty_offset, load_epi_consumer_phase
@@ -1623,8 +1617,7 @@ class FlashAttentionForwardSm100:
                 # End of GEMM_PV1(i_end) (P1 * Vi_end -> O1)
 
             # Advance to next tile
-            tile_scheduler.advance_to_next_work()
-            work_tile = tile_scheduler.get_current_work()
+            work_tile = tile_scheduler.advance_to_next_work()
         # End of persistent scheduler loop
 
 
@@ -1952,8 +1945,7 @@ class FlashAttentionForwardSm100:
             #         gLSE[tidx] = lse
 
             # Advance to next tile
-            tile_scheduler.advance_to_next_work()
-            work_tile = tile_scheduler.get_current_work()
+            work_tile = tile_scheduler.advance_to_next_work()
         # End of persistent scheduler loop
 
     @cute.jit
@@ -2377,8 +2369,7 @@ class FlashAttentionForwardSm100:
                         gLSE[tidx] = lse
 
             # Advance to next tile
-            tile_scheduler.advance_to_next_work()
-            work_tile = tile_scheduler.get_current_work()
+            work_tile = tile_scheduler.advance_to_next_work()
         # End of persistent scheduler loop
 
     @cute.jit
@@ -2684,8 +2675,7 @@ class FlashAttentionForwardSm100:
                 load_epi_producer_phase ^= 1
 
             # Advance to next tile
-            tile_scheduler.advance_to_next_work()
-            work_tile = tile_scheduler.get_current_work()
+            work_tile = tile_scheduler.advance_to_next_work()
 
     def load_Q(
         self,
