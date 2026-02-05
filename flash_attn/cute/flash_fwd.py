@@ -113,10 +113,9 @@ class FlashAttentionForwardBase:
         self.score_mod = score_mod
         self.mask_mod = mask_mod
         self.qk_acc_dtype = Float32
-        if const_expr(has_aux_tensors):
-            self.vec_size: cutlass.Constexpr = 1
-        else:
-            self.vec_size: cutlass.Constexpr = 2
+        self.vec_size: cutlass.Constexpr = getattr(
+            score_mod, "__vec_size__", 1 if cutlass.const_expr(has_aux_tensors) else 2
+        )
 
     @staticmethod
     def can_implement(
