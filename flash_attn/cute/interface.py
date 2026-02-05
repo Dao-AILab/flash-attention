@@ -33,7 +33,8 @@ import cutlass
 import cutlass.cute as cute
 
 
-if os.environ.get("CUTE_DSL_PTXAS_PATH", None) is not None:
+# if os.environ.get("CUTE_DSL_PTXAS_PATH", None) is not None:
+if False:
     from flash_attn.cute import cute_dsl_ptxas  # noqa: F401
 
     # Patch to dump ptx and then use system ptxas to compile to cubin
@@ -369,6 +370,20 @@ def _flash_attn_fwd(
             q_stage=q_stage,
         )
 
+    
+    is_persistent = (
+        # not causal and
+        not local and
+        cu_seqlens_q is None and
+        seqused_q is None and
+        not is_split_kv
+    )
+    if is_persistent:
+        tile_count_semaphore = torch.zeros((1, ), dtype=torch.int32, device=device)
+    else:
+        tile_count_semaphore = None
+    # tile_count_semaphore = None
+
     compile_key = (
         dtype,
         head_dim,
@@ -398,6 +413,7 @@ def _flash_attn_fwd(
         compute_capability,
         page_size not in [None, 128],  # paged KV non-TMA
         q_subtile_factor,
+        tile_count_semaphore is None,
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
         (
@@ -426,6 +442,11 @@ def _flash_attn_fwd(
             lse_tensor = to_cute_tensor(lse, assumed_align=4)
         else:
             lse_tensor = None
+
+        if tile_count_semaphore is not None:
+            tile_count_semaphore_cute = to_cute_tensor(tile_count_semaphore, assumed_align=4)
+        else:
+            tile_count_semaphore_cute = None
 
         sparse_tensors = None
         if normalized_block_sparse_tensors is not None:
@@ -472,11 +493,7 @@ def _flash_attn_fwd(
                 m_block_size=m_block_size,
                 n_block_size=n_block_size,
                 q_stage=q_stage,
-                is_persistent=not causal
-                    and not local
-                    and cu_seqlens_q is None
-                    and seqused_q is None
-                    and not is_split_kv,
+                is_persistent=is_persistent,
                 score_mod=score_mod,
                 mask_mod=mask_mod,
                 has_aux_tensors=aux_tensors is not None,
@@ -509,6 +526,7 @@ def _flash_attn_fwd(
             learnable_sink_tensor,
             sparse_tensors,
             cute_aux_tensors,
+            tile_count_semaphore_cute,
             options="--enable-tvm-ffi",
         )
 
@@ -530,6 +548,7 @@ def _flash_attn_fwd(
         learnable_sink,
         normalized_block_sparse_tensors[:4] if normalized_block_sparse_tensors is not None else None,
         aux_tensors,
+        tile_count_semaphore,
     )
     if is_split_kv:
         _flash_attn_fwd_combine(

@@ -50,6 +50,7 @@ from flash_attn.cute.tile_scheduler import (
     TileSchedulerArguments,
     SingleTileScheduler,
     StaticPersistentTileScheduler,
+    DynamicPersistentTileScheduler,
     SingleTileLPTScheduler,
     SingleTileVarlenScheduler,
     ParamsBase,
@@ -141,8 +142,9 @@ class FlashAttentionForwardSm100:
             (self.head_dim_padded == 192 and self.head_dim_v_padded >= 64) or
             (self.head_dim_v_padded >= 128 and self.is_split_kv)
         )
-        if self.overlap_sO_sQ:
-            self.is_persistent = False
+        # if self.overlap_sO_sQ:
+        #     self.is_persistent = False
+        print("overlap sO and sQ = ", self.overlap_sO_sQ)
 
         assert self.use_tma_KV or not (self.check_hdim_oob or self.check_hdim_v_oob), (
             "Paged KV does not support irregular head dim"
@@ -187,6 +189,20 @@ class FlashAttentionForwardSm100:
         elif self.is_varlen_q: # fallback
             self.epilogue_warp_ids = (13, 14)
 
+        self.scheduler_warp = self.load_warp_ids[0]
+
+        non_empty_warps_ids = set(
+            (
+            *self.softmax0_warp_ids,
+            *self.softmax1_warp_ids,
+            *self.correction_warp_ids,
+            self.mma_warp_id,
+            *self.load_warp_ids,
+            *self.epilogue_warp_ids,
+            )
+        )
+        self.num_non_empty_warps = len(non_empty_warps_ids)
+
         self.tmem_s_offset = [0, self.n_block_size]  # e.g., 0, 128
         self.tmem_o_offset = [
             self.tmem_s_offset[-1] + self.n_block_size + i * self.head_dim_v_padded
@@ -209,7 +225,7 @@ class FlashAttentionForwardSm100:
         else:
             # self.num_regs_softmax = 192 if self.is_causal or self.is_local else 184
             self.num_regs_softmax = 200 if not paged_kv_non_tma else 184
-            # self.num_regs_softmax = 176
+            # self.num_regs_softmax = 184
             # self.num_regs_correction = 96
             # self.num_regs_correction = 80
             # self.num_regs_correction = 64 if self.is_causal or self.is_local else 80
@@ -272,6 +288,7 @@ class FlashAttentionForwardSm100:
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors: Optional[list] = None,
+        tile_count_semaphore: Optional[cute.Tensor] = None,
     ):
         """Execute the Fused Multi-Head Attention operation on the provided tensors.
 
@@ -562,9 +579,16 @@ class FlashAttentionForwardSm100:
             vO_layout = cute.make_layout((1, async_copy_elems))
             gmem_tiled_copy_O = cute.make_tiled_copy_tv(atom_universal_copy, tO_layout, vO_layout)
 
+        self.dynamic_persistent = const_expr(
+            self.is_persistent and
+            tile_count_semaphore is not None and
+            mCuSeqlensQ is None and
+            mSeqUsedQ is None
+        )
+        print("Dynamic persistent is ", self.dynamic_persistent)
         if const_expr(mCuSeqlensQ is not None or mSeqUsedQ is not None):
             TileScheduler = SingleTileVarlenScheduler
-        else:
+        elif const_expr(not self.dynamic_persistent):
             if const_expr(self.is_causal or self.is_local):
                 TileScheduler = SingleTileLPTScheduler
             else:
@@ -573,6 +597,9 @@ class FlashAttentionForwardSm100:
                     if const_expr(not self.is_persistent)
                     else StaticPersistentTileScheduler
                 )
+        else:
+            TileScheduler = DynamicPersistentTileScheduler
+
         tile_sched_args = TileSchedulerArguments(
             cute.ceil_div(cute.size(mQ.shape[0]), self.cta_tiler[0]),
             cute.size(mQ.shape[2]),
@@ -596,6 +623,7 @@ class FlashAttentionForwardSm100:
             is_persistent=self.is_persistent,
             lpt=self.is_causal or self.is_local,
             is_split_kv=self.is_split_kv,
+            tile_count_semaphore=tile_count_semaphore.iterator if tile_count_semaphore is not None else None,
         )
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
         self.tile_scheduler_cls = TileScheduler
@@ -612,7 +640,9 @@ class FlashAttentionForwardSm100:
         self.mbar_softmax_corr_empty_offset = self.mbar_softmax_corr_full_offset + self.q_stage
         self.mbar_corr_epi_full_offset = self.mbar_softmax_corr_empty_offset + self.q_stage
         self.mbar_corr_epi_empty_offset = self.mbar_corr_epi_full_offset + self.q_stage
-        self.mbar_s0_s1_sequence_offset = self.mbar_corr_epi_empty_offset + self.q_stage
+        self.mbar_load_epi_full_offset = self.mbar_corr_epi_empty_offset + self.q_stage
+        self.mbar_load_epi_empty_offset = self.mbar_load_epi_full_offset + 1
+        self.mbar_s0_s1_sequence_offset = self.mbar_load_epi_empty_offset + 1
         self.mbar_tmem_dealloc_offset = self.mbar_s0_s1_sequence_offset + 8
         self.mbar_P_full_2_offset = self.mbar_tmem_dealloc_offset + 1
         self.mbar_total = self.mbar_P_full_2_offset + self.q_stage
@@ -627,6 +657,8 @@ class FlashAttentionForwardSm100:
         class SharedStorage:
             # m_barriers for pipelines
             mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.mbar_total]
+            sched_pipeline_array_ptr: cute.struct.MemRange[cutlass.Int64, 2 * 2]
+            work_info: cute.struct.MemRange[Int32, 4]
             # Tmem holding buffer
             tmem_holding_buf: Int32
             # Smem tensors
@@ -686,6 +718,7 @@ class FlashAttentionForwardSm100:
         if cutlass.const_expr(self.use_block_sparsity and mPageTable is not None):
             raise NotImplementedError("Block sparsity + paged KV not supported on SM100")
 
+        print("smem = ", self.shared_storage.size_in_bytes())
         # Launch the kernel synchronously
         self.kernel(
             mQ,
@@ -718,6 +751,7 @@ class FlashAttentionForwardSm100:
             tiled_mma_pv,
             tile_sched_params,
             num_splits,
+            tile_count_semaphore,
             aux_tensors,
             fastdiv_mods,
             head_divmod,
@@ -764,6 +798,7 @@ class FlashAttentionForwardSm100:
         tiled_mma_pv: cute.TiledMma,
         tile_sched_params: ParamsBase,
         num_splits: Int32,
+        tile_count_semaphore: Optional[cute.Tensor] = None,
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
         head_divmod=None,
@@ -864,6 +899,33 @@ class FlashAttentionForwardSm100:
                     )
                 ),
             )
+        if const_expr(self.overlap_sO_sQ and self.is_persistent) and warp_idx == 8:
+            cute.arch.mbarrier_init(
+                mbar_ptr + self.mbar_load_epi_full_offset,
+                len(self.load_warp_ids),
+            )
+            cute.arch.mbarrier_init(
+                mbar_ptr + self.mbar_load_epi_empty_offset,
+                len(self.epilogue_warp_ids),
+            )
+        if const_expr(self.dynamic_persistent):
+            assert tile_count_semaphore is not None
+            work_info = storage.work_info.get_tensor((4, ))
+            sched_pipeline_producer_group = pipeline.CooperativeGroup(
+                pipeline.Agent.Thread, 32
+            )
+            sched_pipeline_consumer_group = pipeline.CooperativeGroup(
+                pipeline.Agent.Thread, 32 * self.num_non_empty_warps
+            )
+            sched_pipeline = pipeline.PipelineAsync.create(
+                barrier_storage=storage.sched_pipeline_array_ptr.data_ptr(),
+                num_stages=1,
+                producer_group=sched_pipeline_producer_group,
+                consumer_group=sched_pipeline_consumer_group,
+            )
+        else:
+            work_info = None
+            sched_pipeline = None
         # Relying on pipeline_kv constructor to call mbarrier_init_fence and sync
         pipeline_kv = self.make_and_init_load_kv_pipeline(mbar_ptr + self.mbar_load_kv_full_offset)
 
@@ -946,7 +1008,7 @@ class FlashAttentionForwardSm100:
             window_size_right=window_size_right,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
         )
-        TileSchedulerCls = partial(self.tile_scheduler_cls.create, tile_sched_params)
+        TileSchedulerCls = partial(self.tile_scheduler_cls.create, tile_sched_params, work_info, sched_pipeline)
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  EMPTY
@@ -1148,9 +1210,14 @@ class FlashAttentionForwardSm100:
     ):
         num_load_threads = len(self.load_warp_ids) * cute.arch.WARP_SIZE
         tidx = cute.arch.thread_idx()[0] % num_load_threads
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         q_producer_phase = Int32(1)
         kv_producer_state = cutlass.pipeline.make_pipeline_state(
             cutlass.pipeline.PipelineUserType.Producer, self.kv_stage
+        )
+        load_epi_consumer_phase = Int32(0)
+        producer_scheduler_state = cutlass.pipeline.make_pipeline_state(
+            cutlass.pipeline.PipelineUserType.Producer, 1
         )
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
@@ -1310,10 +1377,18 @@ class FlashAttentionForwardSm100:
                     self.q_subtile_factor if self.q_subtile_factor is not None else 1,
                 )
 
+            if warp_idx == self.scheduler_warp:
+                producer_scheduler_state = tile_scheduler.prefetch_next_work(producer_scheduler_state)
 
-            tile_scheduler.prefetch_next_work()
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
+            if const_expr(self.overlap_sO_sQ and self.is_persistent):
+                cute.arch.mbarrier_wait(
+                    mbar_ptr + self.mbar_load_epi_empty_offset, load_epi_consumer_phase
+                )
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_load_epi_full_offset)
+                load_epi_consumer_phase ^= 1
             # End of persistent scheduler loop
 
     @cute.jit
@@ -2055,6 +2130,7 @@ class FlashAttentionForwardSm100:
         softmax_corr_consumer_phase = Int32(0)
         o_corr_consumer_phase = Int32(0)
         corr_epi_producer_phase = Int32(1)
+        load_epi_producer_phase = Int32(1)
 
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
@@ -2254,6 +2330,15 @@ class FlashAttentionForwardSm100:
                         gO,
                         gmem_tiled_copy_O_for_empty_tile,
                     )
+            
+            # signal smem is free for next load in persistent work loop
+            if const_expr(self.overlap_sO_sQ and self.is_persistent and self.use_correction_warps_for_epi):
+                cute.arch.mbarrier_wait(
+                    mbar_ptr + self.mbar_load_epi_full_offset, load_epi_producer_phase
+                )
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_load_epi_empty_offset)
+                load_epi_producer_phase ^= 1
 
             if const_expr(mLSE is not None):
                 if const_expr(not seqlen.has_cu_seqlens_q):
@@ -2498,6 +2583,7 @@ class FlashAttentionForwardSm100:
         TileSchedulerCls: Callable,
     ):
         epi_consumer_phase = Int32(0)
+        load_epi_producer_phase = Int32(1)
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
@@ -2587,6 +2673,15 @@ class FlashAttentionForwardSm100:
                         cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_corr_epi_empty_offset + stage)
 
                 epi_consumer_phase ^= 1
+
+            # signal smem is free for next load in persistent work loop
+            if const_expr(self.overlap_sO_sQ and self.is_persistent and not self.use_correction_warps_for_epi):
+                cute.arch.mbarrier_wait(
+                    mbar_ptr + self.mbar_load_epi_full_offset, load_epi_producer_phase
+                )
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_load_epi_empty_offset)
+                load_epi_producer_phase ^= 1
 
             # Advance to next tile
             tile_scheduler.advance_to_next_work()
