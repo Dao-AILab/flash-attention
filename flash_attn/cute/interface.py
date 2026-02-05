@@ -125,6 +125,7 @@ def _flash_attn_fwd(
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
     aux_tensors: Optional[list[torch.Tensor]] = None,
+    use_dynamic_persistent: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for FlashAttention.
 
@@ -372,17 +373,16 @@ def _flash_attn_fwd(
 
     
     is_persistent = (
-        # not causal and
+        (not causal or use_dynamic_persistent) and
         not local and
         cu_seqlens_q is None and
         seqused_q is None and
         not is_split_kv
     )
-    if is_persistent:
+    if use_dynamic_persistent and causal:
         tile_count_semaphore = torch.zeros((1, ), dtype=torch.int32, device=device)
     else:
         tile_count_semaphore = None
-    # tile_count_semaphore = None
 
     compile_key = (
         dtype,
@@ -1286,6 +1286,7 @@ class FlashAttnFunc(torch.autograd.Function):
         mask_block_cnt: Optional[torch.Tensor] = None,
         mask_block_idx: Optional[torch.Tensor] = None,
         block_size: Optional[Tuple[int, int]] = None,
+        use_dynamic_persistent: bool = True,
     ):
         # Only create block sparse tensors if at least one block sparse parameter is provided
         block_sparse_tensors = None
@@ -1310,7 +1311,8 @@ class FlashAttnFunc(torch.autograd.Function):
             num_splits=num_splits,
             pack_gqa=pack_gqa,
             mask_mod=mask_mod,
-            block_sparse_tensors=block_sparse_tensors
+            block_sparse_tensors=block_sparse_tensors,
+            use_dynamic_persistent=use_dynamic_persistent,
         )
         ctx.save_for_backward(q, k, v, out, lse)
         ctx.softmax_scale = softmax_scale
@@ -1443,6 +1445,7 @@ def flash_attn_func(
     mask_block_cnt: Optional[torch.Tensor] = None,
     mask_block_idx: Optional[torch.Tensor] = None,
     block_size: Optional[Tuple[int, int]] = None,
+    use_dynamic_persistent: bool = True,
 ):
     return FlashAttnFunc.apply(
         q,
@@ -1462,6 +1465,7 @@ def flash_attn_func(
         mask_block_cnt,
         mask_block_idx,
         block_size,
+        use_dynamic_persistent,
     )
 
 
