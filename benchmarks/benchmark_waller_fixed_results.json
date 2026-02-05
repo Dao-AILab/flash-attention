@@ -1,0 +1,260 @@
+{
+  "timestamp": "2026-02-05T00:49:40.633190",
+  "gpu": {
+    "name": "NVIDIA H100 80GB HBM3",
+    "total_memory_gb": 79.1888427734375
+  },
+  "methodology": "FlashAttention v2 official (extended to 524k, FIXED Waller timing)",
+  "results": [
+    {
+      "batch_size": 32,
+      "seq_len": 512,
+      "head_dim": 64,
+      "num_heads": 32,
+      "causal": true,
+      "pytorch": {
+        "status": "ok",
+        "time_ms": 2.17,
+        "memory_gb": 2.2815,
+        "tflops": 15.84
+      },
+      "flash2": {
+        "status": "ok",
+        "time_ms": 0.19,
+        "memory_gb": 0.3457,
+        "tflops": 180.13
+      },
+      "waller": {
+        "status": "N/A",
+        "time_ms": null,
+        "memory_gb": null,
+        "tflops": 0.0
+      }
+    },
+    {
+      "batch_size": 16,
+      "seq_len": 1024,
+      "head_dim": 64,
+      "num_heads": 32,
+      "causal": true,
+      "pytorch": {
+        "status": "ok",
+        "time_ms": 4.24,
+        "memory_gb": 4.2822,
+        "tflops": 16.2
+      },
+      "flash2": {
+        "status": "ok",
+        "time_ms": 0.3,
+        "memory_gb": 0.3457,
+        "tflops": 230.85
+      },
+      "waller": {
+        "status": "N/A",
+        "time_ms": null,
+        "memory_gb": null,
+        "tflops": 0.0
+      }
+    },
+    {
+      "batch_size": 8,
+      "seq_len": 2048,
+      "head_dim": 64,
+      "num_heads": 32,
+      "causal": true,
+      "pytorch": {
+        "status": "ok",
+        "time_ms": 9.07,
+        "memory_gb": 8.2852,
+        "tflops": 15.16
+      },
+      "flash2": {
+        "status": "ok",
+        "time_ms": 0.52,
+        "memory_gb": 0.3457,
+        "tflops": 265.71
+      },
+      "waller": {
+        "status": "N/A",
+        "time_ms": null,
+        "memory_gb": null,
+        "tflops": 0.0
+      }
+    },
+    {
+      "batch_size": 4,
+      "seq_len": 4096,
+      "head_dim": 64,
+      "num_heads": 32,
+      "causal": true,
+      "pytorch": {
+        "status": "ok",
+        "time_ms": 20.37,
+        "memory_gb": 16.2969,
+        "tflops": 13.5
+      },
+      "flash2": {
+        "status": "ok",
+        "time_ms": 0.95,
+        "memory_gb": 0.3457,
+        "tflops": 289.74
+      },
+      "waller": {
+        "status": "N/A",
+        "time_ms": null,
+        "memory_gb": null,
+        "tflops": 0.0
+      }
+    },
+    {
+      "batch_size": 2,
+      "seq_len": 8192,
+      "head_dim": 64,
+      "num_heads": 32,
+      "causal": true,
+      "pytorch": {
+        "status": "ok",
+        "time_ms": 44.26,
+        "memory_gb": 32.3438,
+        "tflops": 12.42
+      },
+      "flash2": {
+        "status": "ok",
+        "time_ms": 1.83,
+        "memory_gb": 0.3457,
+        "tflops": 300.93
+      },
+      "waller": {
+        "status": "N/A",
+        "time_ms": null,
+        "memory_gb": null,
+        "tflops": 0.0
+      }
+    },
+    {
+      "batch_size": 1,
+      "seq_len": 16384,
+      "head_dim": 64,
+      "num_heads": 32,
+      "causal": true,
+      "pytorch": {
+        "status": "OOM",
+        "time_ms": null,
+        "memory_gb": null,
+        "tflops": 0.0
+      },
+      "flash2": {
+        "status": "ok",
+        "time_ms": 3.65,
+        "memory_gb": 0.3457,
+        "tflops": 300.86
+      },
+      "waller": {
+        "status": "N/A",
+        "time_ms": null,
+        "memory_gb": null,
+        "tflops": 0.0
+      }
+    },
+    {
+      "batch_size": 1,
+      "seq_len": 65536,
+      "head_dim": 64,
+      "num_heads": 1,
+      "causal": true,
+      "pytorch": {
+        "status": "skip",
+        "time_ms": null,
+        "memory_gb": null,
+        "tflops": 0.0
+      },
+      "flash2": {
+        "status": "ok",
+        "time_ms": 58.94,
+        "memory_gb": 1.2891,
+        "tflops": 298.47
+      },
+      "waller": {
+        "status": "ok",
+        "time_ms": 14.35,
+        "memory_gb": "O(N log N)",
+        "tflops": 38.3
+      }
+    },
+    {
+      "batch_size": 1,
+      "seq_len": 131072,
+      "head_dim": 64,
+      "num_heads": 1,
+      "causal": true,
+      "pytorch": {
+        "status": "skip",
+        "time_ms": null,
+        "memory_gb": null,
+        "tflops": 0.0
+      },
+      "flash2": {
+        "status": "ok",
+        "time_ms": 239.39,
+        "memory_gb": 2.5469,
+        "tflops": 293.95
+      },
+      "waller": {
+        "status": "ok",
+        "time_ms": 14.35,
+        "memory_gb": "O(N log N)",
+        "tflops": 153.23
+      }
+    },
+    {
+      "batch_size": 1,
+      "seq_len": 262144,
+      "head_dim": 64,
+      "num_heads": 1,
+      "causal": true,
+      "pytorch": {
+        "status": "skip",
+        "time_ms": null,
+        "memory_gb": null,
+        "tflops": 0.0
+      },
+      "flash2": {
+        "status": "ok",
+        "time_ms": 996.63,
+        "memory_gb": 5.0625,
+        "tflops": 282.43
+      },
+      "waller": {
+        "status": "ok",
+        "time_ms": 14.45,
+        "memory_gb": "O(N log N)",
+        "tflops": 608.81
+      }
+    },
+    {
+      "batch_size": 1,
+      "seq_len": 524288,
+      "head_dim": 64,
+      "num_heads": 1,
+      "causal": true,
+      "pytorch": {
+        "status": "skip",
+        "time_ms": null,
+        "memory_gb": null,
+        "tflops": 0.0
+      },
+      "flash2": {
+        "status": "ok",
+        "time_ms": 4116.64,
+        "memory_gb": 10.0938,
+        "tflops": 273.5
+      },
+      "waller": {
+        "status": "ok",
+        "time_ms": 14.31,
+        "memory_gb": "O(N log N)",
+        "tflops": 2459.24
+      }
+    }
+  ]
+}
