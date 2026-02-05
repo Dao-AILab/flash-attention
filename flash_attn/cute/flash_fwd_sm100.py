@@ -584,7 +584,6 @@ class FlashAttentionForwardSm100:
             mCuSeqlensQ is None and
             mSeqUsedQ is None
         )
-        print("Dynamic persistent is ", self.dynamic_persistent)
         if const_expr(mCuSeqlensQ is not None or mSeqUsedQ is not None):
             TileScheduler = SingleTileVarlenScheduler
         elif const_expr(not self.dynamic_persistent):
@@ -717,7 +716,6 @@ class FlashAttentionForwardSm100:
         if cutlass.const_expr(self.use_block_sparsity and mPageTable is not None):
             raise NotImplementedError("Block sparsity + paged KV not supported on SM100")
 
-        print("smem = ", self.shared_storage.size_in_bytes())
         # Launch the kernel synchronously
         self.kernel(
             mQ,
@@ -911,7 +909,7 @@ class FlashAttentionForwardSm100:
             assert tile_count_semaphore is not None
             work_info = storage.work_info.get_tensor((4, ))
             sched_pipeline_producer_group = pipeline.CooperativeGroup(
-                pipeline.Agent.Thread, 32
+                pipeline.Agent.Thread, 1
             )
             sched_pipeline_consumer_group = pipeline.CooperativeGroup(
                 pipeline.Agent.Thread, 32 * self.num_non_empty_warps

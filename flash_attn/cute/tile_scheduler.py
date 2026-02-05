@@ -418,23 +418,20 @@ class DynamicPersistentTileScheduler:
     @cute.jit
     def prefetch_next_work(self, *, loc=None, ip=None):
         params = self.params
-        next_tile_idx = 0
-        if cute.arch.lane_idx() == 0:
-            next_tile_idx = cute.arch.grid_dim()[0] + utils.atomic_add_i32(
-                1, params.tile_count_semaphore,
-            )
-        next_tile_idx = cute.arch.shuffle_sync(next_tile_idx, 0)
-        work_info = self.get_current_work(next_tile_idx)
         self._scheduler_pipeline.producer_acquire(
             self._producer_pipeline_state,
             self._scheduler_pipeline.producer_try_acquire(self._producer_pipeline_state),
         )
-        block, head_idx, batch_idx, _ = work_info.tile_idx
         if cute.arch.lane_idx() == 0:
+            next_tile_idx = cute.arch.grid_dim()[0] + utils.atomic_add_i32(
+                1, params.tile_count_semaphore,
+            )
+            work_info = self.get_current_work(next_tile_idx)
+            block, head_idx, batch_idx, _ = work_info.tile_idx
             self._work_info[0] = block
             self._work_info[1] = head_idx
             self._work_info[2] = batch_idx
-        self._scheduler_pipeline.producer_commit(self._producer_pipeline_state)
+            self._scheduler_pipeline.producer_commit(self._producer_pipeline_state)
         self._producer_pipeline_state.advance()
 
     @cute.jit
