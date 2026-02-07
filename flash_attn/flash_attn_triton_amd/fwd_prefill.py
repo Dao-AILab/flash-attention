@@ -7,8 +7,8 @@ from typing import Literal, Optional
 from .common import compute_alibi_block, compute_fp8_scaling_factors, apply_rotary
 from .utils import (
     AUTOTUNE,
-    CONF_OVERRIDE,
     DEBUG,
+    FWD_CONF_OVERRIDE,
     get_arch,
     is_fp8,
 )
@@ -35,8 +35,8 @@ def get_fwd_prefill_configs(autotune: bool):
     #   - RDNA: BLOCK_N=32
     # See _get_block_size_n_triton() in test_flash_attn_triton_amd.py
     if not autotune:
-        if CONF_OVERRIDE:
-            return [CONF_OVERRIDE]
+        if FWD_CONF_OVERRIDE:
+            return [FWD_CONF_OVERRIDE]
 
         arch = get_arch()
         if arch.name == "gfx950":
