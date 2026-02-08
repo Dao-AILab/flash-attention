@@ -2428,10 +2428,7 @@ class FlashAttentionForwardSm100:
             tOrO_frg_cvt.store(tOrO_frg.load().to(self.o_dtype))
             cute.copy(tiled_smem_store, tOrO_frg_cvt, tOsO_r2s_i)
         # fence view async shared
-        cute.arch.fence_proxy(
-            cute.arch.ProxyKind.async_shared,
-            space=cute.arch.SharedSpace.shared_cta,
-        )
+        cute.arch.fence_view_async_shared()
 
         if const_expr(self.use_correction_warps_for_epi):
             assert(not self.use_tma_O)

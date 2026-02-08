@@ -2277,9 +2277,7 @@ class FlashAttentionBackwardSm100:
 
                 if const_expr(not self.use_smem_dS_for_mma_dK):
                     cute.arch.fence_view_async_tmem_store()
-                cute.arch.fence_proxy(
-                    cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
-                )
+                cute.arch.fence_view_async_shared()
                 self.compute_sync_barrier.arrive_and_wait()
 
                 # with cute.arch.elect_one():
@@ -2528,9 +2526,7 @@ class FlashAttentionBackwardSm100:
                     )
                     cute.copy(thr_copy_dQaccum_r2s, tdQrdQ_r2s, tdQsdQ_r2s)
                     # Fence and barrier to make sure shared memory store is visible to TMA store
-                    cute.arch.fence_proxy(
-                        cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
-                    )
+                    cute.arch.fence_view_async_shared()
                     # semaphore acquire
                     if const_expr(self.deterministic and stage == 0):
                         if const_expr(self.spt):
@@ -2886,9 +2882,7 @@ class FlashAttentionBackwardSm100:
             # RMEM -> SMEM -- copy, fence and barrier
             tdKVrdKV_r2s = cute.make_tensor(tdKVrdKV.iterator, tdKVsdKV_r2s.shape)
             cute.copy(thr_copy_r2s_dKV, tdKVrdKV_r2s, tdKVsdKV_r2s)
-            cute.arch.fence_proxy(
-                cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
-            )
+            cute.arch.fence_view_async_shared()
             cute.arch.barrier(barrier_id=barrier_id + wg_idx, number_of_threads=128)
 
             # SMEM -> GMEM
@@ -2910,9 +2904,7 @@ class FlashAttentionBackwardSm100:
                 )
 
             # Barrier since all warps need to wait for SMEM to be freed
-            cute.arch.fence_proxy(
-                cute.arch.ProxyKind.async_shared, space=cute.arch.SharedSpace.shared_cta
-            )
+            cute.arch.fence_view_async_shared()
             cute.arch.barrier(
                 barrier_id=barrier_id + wg_idx, number_of_threads=128 + cute.arch.WARP_SIZE
             )
