@@ -12,11 +12,12 @@ from cutlass.cute import FastDivmodDivisor
 from cutlass import Float32, Int32, Boolean, const_expr
 from cutlass.utils import LayoutEnum
 
-from flash_attn.cute import hopper_helpers as sm90_utils
+import quack.sm90_utils as sm90_utils
+from quack.sm90_utils import gemm_zero_init, gemm_w_idx
+
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import utils
 from flash_attn.cute import copy_utils
-from flash_attn.cute.hopper_helpers import gemm_zero_init, gemm_w_idx
 from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
@@ -31,21 +32,6 @@ from flash_attn.cute.block_sparse_utils import (
     consume_block_sparse_mma_bwd_sm90,
     dQaccum_store_block_sparse_bwd_sm90,
 )
-
-
-def mma_partition_fragment_AB(
-    thr_mma: cute.core.ThrMma, sA: Optional[cute.Tensor], sB: Optional[cute.Tensor], swap_AB: bool
-):
-    if const_expr(not swap_AB):
-        return (
-            thr_mma.make_fragment_A(thr_mma.partition_A(sA)) if sA is not None else None,
-            thr_mma.make_fragment_B(thr_mma.partition_B(sB)) if sB is not None else None,
-        )
-    else:
-        return (
-            thr_mma.make_fragment_B(thr_mma.partition_B(sA)) if sA is not None else None,
-            thr_mma.make_fragment_A(thr_mma.partition_A(sB)) if sB is not None else None,
-        )
 
 
 class FlashAttentionBackwardSm90:
@@ -1033,20 +1019,56 @@ class FlashAttentionBackwardSm90:
         wg_mma_dV = tiled_mma_dV.get_slice(warp_group_thread_layout(warp_group_idx))
         wg_mma_dQ = tiled_mma_dQ.get_slice(warp_group_thread_layout(warp_group_idx))
         # S = Q @ K.T
-        tSrQ, tSrK = mma_partition_fragment_AB(wg_mma_SdP, sQ, sK, self.SdP_swapAB)
+        shape_mnk_S = (self.tile_m, self.tile_n, self.tile_hdim)
+        _, tSrQ, tSrK = sm90_utils.partition_fragment_ABC(
+            wg_mma_SdP, shape_mnk_S, sQ, sK, swap_AB=self.SdP_swapAB
+        )
+        mma_qk_fn = partial(
+            gemm_zero_init, tiled_mma_SdP, shape_mnk_S[:2], tSrQ, tSrK, swap_AB=self.SdP_swapAB
+        )
         # dP = dO @ V.T
-        tdPrdO, tdPrV = mma_partition_fragment_AB(wg_mma_SdP, sdO, sV, self.SdP_swapAB)
+        shape_mnk_dP = (self.tile_m, self.tile_n, self.tile_hdimv)
+        _, tdPrdO, tdPrV = sm90_utils.partition_fragment_ABC(
+            wg_mma_SdP, shape_mnk_dP, sdO, sV, swap_AB=self.SdP_swapAB
+        )
+        mma_dov_fn = partial(
+            gemm_zero_init, tiled_mma_SdP, shape_mnk_dP[:2], tdPrdO, tdPrV, swap_AB=self.SdP_swapAB
+        )
         # dV += P.T @ dO
         sPt = utils.transpose_view(sP) if sP is not None else None
         sdOt = utils.transpose_view(sdO)
-        tdVrPt, tdVrdOt = mma_partition_fragment_AB(wg_mma_dV, sPt, sdOt, self.dKV_swapAB)
+        shape_mnk_dV = (self.tile_n, self.tile_hdimv, self.tile_m)
+        acc_dV, tdVrPt, tdVrdOt = sm90_utils.partition_fragment_ABC(
+            wg_mma_dV, shape_mnk_dV, sPt, sdOt, swap_AB=self.dKV_swapAB
+        )
+        if const_expr(not self.mma_dkv_is_rs):
+            mma_pdo_fn = partial(
+                gemm_w_idx, tiled_mma_dV, acc_dV, tdVrPt, tdVrdOt, swap_AB=self.dKV_swapAB
+            )
+        else:
+            mma_pdo_fn = partial(gemm_w_idx, tiled_mma_dV, acc_dV, tCrB=tdVrdOt)
         # dK += dS.T @ Q
         sdSt = utils.transpose_view(sdS)
         sQt = utils.transpose_view(sQ)
-        tdKrdSt, tdKrQt = mma_partition_fragment_AB(wg_mma_dK, sdSt, sQt, self.dKV_swapAB)
+        shape_mnk_dK = (self.tile_n, self.tile_hdim, self.tile_m)
+        acc_dK, tdKrdSt, tdKrQt = sm90_utils.partition_fragment_ABC(
+            wg_mma_dK, shape_mnk_dK, sdSt, sQt, swap_AB=self.dKV_swapAB
+        )
+        if const_expr(not self.mma_dkv_is_rs):
+            mma_dsq_fn = partial(
+                gemm_w_idx, tiled_mma_dK, acc_dK, tdKrdSt, tdKrQt, swap_AB=self.dKV_swapAB
+            )
+        else:
+            mma_dsq_fn = partial(gemm_w_idx, tiled_mma_dK, acc_dK, tCrB=tdKrQt)
         # dQ = dS @ K
         sKt = utils.transpose_view(sK)
-        tdQrdS, tdQrKt = mma_partition_fragment_AB(wg_mma_dQ, sdS, sKt, self.dQ_swapAB)
+        shape_mnk_dQ = (self.tile_m, self.tile_hdim, self.tile_n)
+        _, tdQrdS, tdQrKt = sm90_utils.partition_fragment_ABC(
+            wg_mma_dQ, shape_mnk_dQ, sdS, sKt, swap_AB=self.dQ_swapAB
+        )
+        mma_dsk_fn = partial(
+            gemm_zero_init, tiled_mma_dQ, shape_mnk_dQ[:2], tdQrdS, tdQrKt, swap_AB=self.dQ_swapAB
+        )
 
         # Smem copy atom tiling
         smem_copy_atom_PdS = utils.get_smem_store_atom(
@@ -1083,53 +1105,6 @@ class FlashAttentionBackwardSm90:
 
         smem_thr_copy_dQaccum = r2s_tiled_copy_dQaccum.get_slice(tidx)
         tdQsdQaccum = smem_thr_copy_dQaccum.partition_D(sdQaccum)
-
-        dV_shape = (self.tile_n, self.tile_hdimv)
-        acc_dV = cute.make_fragment(
-            tiled_mma_dV.partition_shape_C(dV_shape if not self.dKV_swapAB else dV_shape[::-1]),
-            Float32,
-        )
-        dK_shape = (self.tile_n, self.tile_hdim)
-        acc_dK = cute.make_fragment(
-            tiled_mma_dK.partition_shape_C(dK_shape if not self.dKV_swapAB else dK_shape[::-1]),
-            Float32,
-        )
-
-        mma_qk_fn = partial(
-            gemm_zero_init,
-            tiled_mma_SdP,
-            (self.tile_m, self.tile_n),
-            tSrQ,
-            tSrK,
-            swap_AB=self.SdP_swapAB,
-        )
-        mma_dov_fn = partial(
-            gemm_zero_init,
-            tiled_mma_SdP,
-            (self.tile_m, self.tile_n),
-            tdPrdO,
-            tdPrV,
-            swap_AB=self.SdP_swapAB,
-        )
-        if const_expr(not self.mma_dkv_is_rs):
-            mma_pdo_fn = partial(
-                gemm_w_idx, tiled_mma_dV, acc_dV, tdVrPt, tdVrdOt, swap_AB=self.dKV_swapAB
-            )
-            mma_dsq_fn = partial(
-                gemm_w_idx, tiled_mma_dK, acc_dK, tdKrdSt, tdKrQt, swap_AB=self.dKV_swapAB
-            )
-        else:
-            assert not self.dKV_swapAB
-            mma_pdo_fn = partial(gemm_w_idx, tiled_mma_dV, acc_dV, tCrB=tdVrdOt)
-            mma_dsq_fn = partial(gemm_w_idx, tiled_mma_dK, acc_dK, tCrB=tdKrQt)
-        mma_dsk_fn = partial(
-            gemm_zero_init,
-            tiled_mma_dQ,
-            (self.tile_m, self.tile_hdim),
-            tdQrdS,
-            tdQrKt,
-            swap_AB=self.dQ_swapAB,
-        )
 
         mma_one_m_block_all = partial(
             self.mma_one_m_block,
