@@ -1,6 +1,6 @@
 # Copyright (c) 2025, Tri Dao.
 
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Protocol, runtime_checkable
 from dataclasses import dataclass, fields
 
 try:
@@ -15,6 +15,7 @@ from cutlass import Int32, const_expr
 
 import flash_attn.cute.utils as utils
 from flash_attn.cute.fast_math import clz
+from flash_attn.cute.utils import debug_printf
 from cutlass.cute import FastDivmodDivisor
 
 
@@ -51,6 +52,41 @@ class ParamsBase:
             non_constexpr_fields[name] = cutlass.new_from_mlir_values(field, values[:n_items])
             values = values[n_items:]
         return self.__class__(**non_constexpr_fields, **constexpr_fields)
+
+
+@runtime_checkable
+class TileSchedulerProtocol(Protocol):
+    """Protocol defining the interface all tile schedulers must implement.
+
+    Schedulers are responsible for:
+    1. Coordinate mapping: linear tile index -> (m_block, head, batch, split)
+    2. Work distribution: how to get the next tile (static grid-stride vs CLC dynamic)
+
+    The `mbarrier_addr` parameter in `advance_to_next_work` enables CLC support:
+    - Static schedulers: assert mbarrier_addr is None, use grid-stride iteration
+    - CLC schedulers: assert mbarrier_addr is not None, issue async CLC query
+    """
+
+    def get_current_work(self) -> WorkTileInfo:
+        """Get the current work tile coordinates."""
+        ...
+
+    def initial_work_tile_info(self) -> WorkTileInfo:
+        """Get the initial work tile for this CTA."""
+        ...
+
+    def advance_to_next_work(self, *, mbarrier_addr=None) -> None:
+        """Advance to the next work tile.
+
+        Args:
+            mbarrier_addr: For CLC schedulers, the mbarrier address for async query.
+                          Static schedulers should assert this is None.
+        """
+        ...
+
+    def prefetch_next_work(self) -> None:
+        """Prefetch next work tile info (optional, may be no-op)."""
+        ...
 
 
 @dataclass
@@ -149,7 +185,8 @@ class SingleTileScheduler:
     def prefetch_next_work(self, *, loc=None, ip=None):
         pass
 
-    def advance_to_next_work(self, *, loc=None, ip=None):
+    def advance_to_next_work(self, *, loc=None, ip=None, mbarrier_addr=None):
+        assert mbarrier_addr is None
         self._is_first_block = False
 
     def __extract_mlir_values__(self):
@@ -228,7 +265,8 @@ class StaticPersistentTileScheduler:
     def prefetch_next_work(self, *, loc=None, ip=None):
         pass
 
-    def advance_to_next_work(self, *, loc=None, ip=None):
+    def advance_to_next_work(self, *, loc=None, ip=None, mbarrier_addr=None):
+        assert mbarrier_addr is None
         self._tile_idx += cute.arch.grid_dim()[0]
 
     def __extract_mlir_values__(self):
@@ -356,8 +394,8 @@ class SingleTileLPTScheduler:
     def prefetch_next_work(self, *, loc=None, ip=None):
         pass
 
-    def advance_to_next_work(self, *, loc=None, ip=None):
-        # Single tile scheduler - set to invalid tile_idx to indicate no more work
+    def advance_to_next_work(self, *, loc=None, ip=None, mbarrier_addr=None):
+        assert mbarrier_addr is None
         self._tile_idx = self.params.total_blocks
 
     def __extract_mlir_values__(self):
@@ -479,8 +517,8 @@ class SingleTileLPTBwdScheduler:
     def prefetch_next_work(self, *, loc=None, ip=None):
         pass
 
-    def advance_to_next_work(self, *, loc=None, ip=None):
-        # Single tile scheduler - set to invalid tile_idx to indicate no more work
+    def advance_to_next_work(self, *, loc=None, ip=None, mbarrier_addr=None):
+        assert mbarrier_addr is None
         self._tile_idx = self.params.total_blocks
 
     def __extract_mlir_values__(self):
@@ -696,8 +734,8 @@ class SingleTileVarlenScheduler:
     def prefetch_next_work(self, *, loc=None, ip=None):
         pass
 
-    def advance_to_next_work(self, *, loc=None, ip=None):
-        # Single tile scheduler - set to invalid tile_idx to indicate no more work
+    def advance_to_next_work(self, *, loc=None, ip=None, mbarrier_addr=None):
+        assert mbarrier_addr is None
         self._is_first_block = False
 
     def __extract_mlir_values__(self):
@@ -717,3 +755,191 @@ class SingleTileVarlenScheduler:
             obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
             values = values[n_items:]
         return SingleTileVarlenScheduler(*(tuple(obj_list)), loc=self._loc)
+
+
+class CLCDynamicTileScheduler:
+    """Dynamic tile scheduler using CLC (Cooperative Launch Control) for load balancing.
+
+    This scheduler wraps the native CuTeDSL CLC support for dynamic work distribution.
+    SMs can "pull" work as they finish, naturally balancing load across the GPU.
+    Particularly beneficial for flex-attention workloads with variable computation per tile.
+
+    Architecture (following CUTLASS pattern):
+    - Scheduler warp (producer): Issues CLC queries via advance_to_next_work(mbarrier_addr=...)
+    - All other warps (consumers): Read work tiles via get_current_work()
+
+    Requires use_tma_KV=True (warp 15 must be empty to drive CLC queries).
+    """
+
+    @dataclass
+    class Params(ParamsBase):
+        num_block_divmod: FastDivmodDivisor
+        num_head_divmod: FastDivmodDivisor
+        num_splits_divmod: FastDivmodDivisor
+        total_tiles: Int32
+        cluster_shape_mn: cutlass.Constexpr[Tuple[int, int]] = (1, 1)
+        is_split_kv: cutlass.Constexpr[bool] = False
+        clc_stages: cutlass.Constexpr[int] = 1
+
+        @staticmethod
+        def create(
+            args: TileSchedulerArguments,
+            clc_stages: int = 1,
+            *,
+            loc=None,
+            ip=None,
+        ) -> "CLCDynamicTileScheduler.Params":
+            total_tiles = args.num_block * args.num_head * args.num_batch
+            if const_expr(args.is_split_kv):
+                total_tiles = total_tiles * args.num_splits
+            return CLCDynamicTileScheduler.Params(
+                num_block_divmod=FastDivmodDivisor(args.num_block),
+                num_head_divmod=FastDivmodDivisor(args.num_head),
+                num_splits_divmod=FastDivmodDivisor(args.num_splits),
+                total_tiles=total_tiles,
+                cluster_shape_mn=args.cluster_shape_mn,
+                is_split_kv=args.is_split_kv,
+                clc_stages=clc_stages,
+            )
+
+    def __init__(
+        self,
+        params: Params,
+        cutlass_scheduler,
+        tile_idx: Int32,
+        *,
+        loc=None,
+        ip=None,
+    ):
+        self.params = params
+        self._scheduler = cutlass_scheduler
+        self._tile_idx = tile_idx
+        self._loc = loc
+        self._ip = ip
+
+    @staticmethod
+    def to_underlying_arguments(
+        args: TileSchedulerArguments,
+        clc_stages: int = 1,
+        *,
+        loc=None,
+        ip=None,
+    ) -> Params:
+        return CLCDynamicTileScheduler.Params.create(args, clc_stages, loc=loc, ip=ip)
+
+    @staticmethod
+    @cute.jit
+    def create(
+        params: Params,
+        clc_response_ptr: cute.Pointer,
+        *,
+        loc=None,
+        ip=None,
+    ) -> "CLCDynamicTileScheduler":
+        from cutlass.utils import (
+            ClcDynamicPersistentTileScheduler,
+            ClcDynamicPersistentTileSchedulerParams,
+        )
+
+        cutlass_params = ClcDynamicPersistentTileSchedulerParams(
+            problem_shape_ntile_mnl=(params.total_tiles, Int32(1), Int32(1)),
+            cluster_shape_mnk=(*params.cluster_shape_mn, 1),
+        )
+        block_idx = cute.arch.block_idx()
+        grid_dim = cute.arch.grid_dim()
+        cutlass_scheduler = ClcDynamicPersistentTileScheduler.create(
+            cutlass_params,
+            block_idx,
+            grid_dim,
+            clc_response_ptr,
+        )
+        tile_idx = block_idx[0]
+        return CLCDynamicTileScheduler(params, cutlass_scheduler, tile_idx, loc=loc, ip=ip)
+
+    @staticmethod
+    def get_grid_shape(
+        params: Params,
+        *,
+        loc=None,
+        ip=None,
+    ) -> Tuple[Int32, Int32, Int32]:
+        # CLC uses `clusterlaunchcontrol.try_cancel*` under the hood, i.e. it can only
+        # "steal" work from CTAs that are already launched but not yet started.
+        # Therefore, we must launch the full problem grid so there is backlog to cancel.
+        return (params.total_tiles, Int32(1), Int32(1))
+
+    @cute.jit
+    def _linear_to_coords(self, linear_idx: Int32, is_valid) -> WorkTileInfo:
+        """Convert linear tile index to WorkTileInfo with coordinates."""
+        bh_idx, block_idx = divmod(linear_idx, self.params.num_block_divmod)
+        batch_idx, head_idx = divmod(bh_idx, self.params.num_head_divmod)
+        split_idx = Int32(0)
+        if const_expr(self.params.is_split_kv):
+            batch_idx, split_idx = divmod(batch_idx, self.params.num_splits_divmod)
+        return WorkTileInfo(
+            (Int32(block_idx), Int32(head_idx), Int32(batch_idx), Int32(split_idx)),
+            is_valid,
+        )
+
+    @cute.jit
+    def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
+        """CLC consumer: Read current work tile from CLC response."""
+        work = self._scheduler.get_current_work()
+        self._tile_idx = work.tile_idx[0]
+        result = self._linear_to_coords(self._tile_idx, work.is_valid_tile)
+        if cute.arch.thread_idx()[0] == 0:
+            self._debug_print("pull", self._tile_idx, *result.tile_idx, work.is_valid_tile)
+        return result
+
+    @cute.jit
+    def initial_work_tile_info(self, *, loc=None, ip=None) -> WorkTileInfo:
+        work = self._scheduler.initial_work_tile_info()
+        self._tile_idx = work.tile_idx[0]
+        is_valid = self._tile_idx < self.params.total_tiles
+        result = self._linear_to_coords(self._tile_idx, is_valid)
+        if cute.arch.thread_idx()[0] == 0:
+            self._debug_print("map", self._tile_idx, *result.tile_idx, is_valid)
+        return result
+
+    def prefetch_next_work(self, *, loc=None, ip=None):
+        pass
+
+    @cute.jit
+    def advance_to_next_work(self, *, loc=None, ip=None, mbarrier_addr=None):
+        """CLC producer: Issue async CLC query for next tile."""
+        assert mbarrier_addr is not None
+        self._scheduler.advance_to_next_work(mbarrier_addr)
+
+    def __extract_mlir_values__(self):
+        values, self._values_pos = [], []
+        for obj in [self.params, self._scheduler, self._tile_idx]:
+            obj_values = cutlass.extract_mlir_values(obj)
+            values += obj_values
+            self._values_pos.append(len(obj_values))
+        return values
+
+    def __new_from_mlir_values__(self, values):
+        obj_list = []
+        for obj, n_items in zip(
+            [self.params, self._scheduler, self._tile_idx],
+            self._values_pos,
+        ):
+            obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
+            values = values[n_items:]
+        return CLCDynamicTileScheduler(*(tuple(obj_list)), loc=self._loc)
+
+    def _debug_print(
+        self, phase: str, linear_idx, block_idx, head_idx, batch_idx, split_idx, is_valid
+    ):
+        debug_printf(
+            f"[CLC] {phase} sm={{}} cta={{}} linear={{}}/{{}} (m_blk={{}},h={{}},b={{}},s={{}}) valid={{}}\n",
+            utils.smid(),
+            cute.arch.block_idx()[0],
+            linear_idx,
+            self.params.total_tiles,
+            block_idx,
+            head_idx,
+            batch_idx,
+            split_idx,
+            is_valid,
+        )
