@@ -2,7 +2,6 @@
 # A reimplementation of https://github.com/Dao-AILab/flash-attention/blob/main/hopper/flash_fwd_combine_kernel.h
 # from Cutlass C++ to Cute-DSL.
 import math
-import operator
 from typing import Type, Optional
 from functools import partial
 
@@ -518,12 +517,11 @@ class FlashAttentionForwardCombine:
             for m in cutlass.range(cute.size(ts2rrLSE, mode=[2]), unroll_full=True):
                 # Find max LSE value across splits
                 threads_per_col = const_expr(self.smem_threads_per_col_lse)
-                lse_max = utils.warp_reduce(
+                lse_max = cute.arch.warp_reduction_max(
                     ts2rrLSE[None, None, m]
                     .load()
                     .reduce(cute.ReductionOp.MAX, init_val=-Float32.inf, reduction_profile=0),
-                    op=cute.arch.fmax,
-                    width=threads_per_col,
+                    threads_in_group=threads_per_col,
                 )
                 # if cute.arch.thread_idx()[0] == 0: cute.printf(lse_max)
                 # Find max valid split index
@@ -532,7 +530,9 @@ class FlashAttentionForwardCombine:
                     if ts2rrLSE[0, s, m] != -Float32.inf:
                         max_valid_idx = ts2rcLSE[0, s, 0][0]  # Get split coordinate
                 # if cute.arch.thread_idx()[0] < 32: cute.printf(max_valid_idx)
-                max_valid_split[m] = utils.warp_reduce(max_valid_idx, max, width=threads_per_col)
+                max_valid_split[m] = cute.arch.warp_reduction_max(
+                    max_valid_idx, threads_in_group=threads_per_col
+                )
                 # Compute exp scales and sum
                 lse_max_cur = (
                     0.0 if lse_max == -Float32.inf else lse_max
@@ -543,7 +543,9 @@ class FlashAttentionForwardCombine:
                     scale = utils.exp2f(ts2rrLSE[0, s, m] * LOG2_E - (lse_max_cur * LOG2_E))
                     lse_sum_cur += scale
                     ts2rrLSE[0, s, m] = scale  # Store scale for later use
-                lse_sum_cur = utils.warp_reduce(lse_sum_cur, operator.add, width=threads_per_col)
+                lse_sum_cur = cute.arch.warp_reduction_sum(
+                    lse_sum_cur, threads_in_group=threads_per_col
+                )
                 lse_sum[m] = utils.logf(lse_sum_cur) + lse_max
                 # Normalize scales
                 inv_sum = (

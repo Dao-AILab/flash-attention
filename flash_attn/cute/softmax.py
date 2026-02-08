@@ -81,7 +81,7 @@ class Softmax(ParamsBase):
                 arch=arch,
             )
 
-            row_max_cur = utils.warp_reduce(row_max_cur, cute.arch.fmax, width=4)
+            row_max_cur = cute.arch.warp_reduction_max(row_max_cur, threads_in_group=4)
             # Update row_max before changing row_max_cur to safe value for -inf
             row_max_prev = row_max[r]
             row_max[r] = row_max_cur
