@@ -1122,8 +1122,7 @@ def _load_q_do_block_sm90(
     else:
         pipeline_Q.producer_acquire(producer_state_Q)
     load_Q(m_block, producer_state=producer_state_Q)
-    with cute.arch.elect_one():
-        load_LSE(m_block, producer_state=producer_state_Q)
+    load_LSE(m_block, producer_state=producer_state_Q)
 
     producer_state_dO_cur = (
         producer_state_dO if const_expr(not Q_stage_eq_dO_stage) else producer_state_Q
@@ -1134,8 +1133,7 @@ def _load_q_do_block_sm90(
     else:
         pipeline_dO.producer_acquire(producer_state_dO_cur)
     load_dO(m_block, producer_state=producer_state_dO_cur)
-    with cute.arch.elect_one():
-        load_dPsum(m_block, producer_state=producer_state_dO_cur)
+    load_dPsum(m_block, producer_state=producer_state_dO_cur)
 
     producer_state_Q.advance()
     producer_state_dO.advance()

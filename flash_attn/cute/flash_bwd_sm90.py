@@ -12,13 +12,13 @@ from cutlass.cute import FastDivmodDivisor
 from cutlass import Float32, Int32, Boolean, const_expr
 from cutlass.utils import LayoutEnum
 
+from quack import copy_utils
 from quack import layout_utils
 from quack import sm90_utils
 from quack.sm90_utils import gemm_zero_init, gemm_w_idx
 
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import utils
-from flash_attn.cute import copy_utils
 from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
@@ -825,8 +825,7 @@ class FlashAttentionBackwardSm90:
                         )
                         load_K(tma_bar_ptr=pipeline_Q.producer_get_barrier(producer_state_Q))
                         load_Q(first_m_block, producer_state=producer_state_Q)
-                        with cute.arch.elect_one():
-                            load_LSE(first_m_block, producer_state=producer_state_Q)
+                        load_LSE(first_m_block, producer_state=producer_state_Q)
                         producer_state_dO_cur = (
                             producer_state_dO
                             if const_expr(self.Q_stage != self.dO_stage)
@@ -837,16 +836,14 @@ class FlashAttentionBackwardSm90:
                         )
                         load_V(tma_bar_ptr=pipeline_dO.producer_get_barrier(producer_state_dO_cur))
                         load_dO(first_m_block, producer_state=producer_state_dO_cur)
-                        with cute.arch.elect_one():
-                            load_dPsum(first_m_block, producer_state=producer_state_dO_cur)
+                        load_dPsum(first_m_block, producer_state=producer_state_dO_cur)
                         producer_state_Q.advance()
                         producer_state_dO.advance()
 
                         for m_block in cutlass.range(m_block_min + 1, m_block_max, unroll=1):
                             pipeline_Q.producer_acquire(producer_state_Q)
                             load_Q(m_block, producer_state=producer_state_Q)
-                            with cute.arch.elect_one():
-                                load_LSE(m_block, producer_state=producer_state_Q)
+                            load_LSE(m_block, producer_state=producer_state_Q)
                             producer_state_dO_cur = (
                                 producer_state_dO
                                 if const_expr(self.Q_stage != self.dO_stage)
@@ -854,8 +851,7 @@ class FlashAttentionBackwardSm90:
                             )
                             pipeline_dO.producer_acquire(producer_state_dO_cur)
                             load_dO(m_block, producer_state=producer_state_dO_cur)
-                            with cute.arch.elect_one():
-                                load_dPsum(m_block, producer_state=producer_state_dO_cur)
+                            load_dPsum(m_block, producer_state=producer_state_dO_cur)
                             producer_state_Q.advance()
                             producer_state_dO.advance()
                     else:
