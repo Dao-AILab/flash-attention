@@ -28,7 +28,7 @@ dependencies = [
     "typing_extensions",
     "apache-tvm-ffi>=0.1.5,<0.2",
     "torch-c-dlpack-ext",
-    "quack-kernels>=0.2.7",
+    "quack-kernels>=0.2.8",
 ]
 
 [project.optional-dependencies]

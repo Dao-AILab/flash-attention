@@ -7,6 +7,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, const_expr
 
+from quack import layout_utils
 import flash_attn.cute.utils as utils
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 
@@ -140,13 +141,13 @@ class AttentionMask:
         fastdiv_mods=(None, None),
     ) -> None:
         assert not (mask_causal and mask_local), "mask_causal and mask_local cannot be both True"
-        acc_S_mn = utils.make_acc_tensor_mn_view(acc_S, transpose=self.swap_AB)
+        acc_S_mn = layout_utils.reshape_acc_to_mn(acc_S, transpose=self.swap_AB)
         acc_shape = (self.tile_m, self.tile_n)
         cS = cute.make_identity_tensor(acc_shape if not self.swap_AB else acc_shape[::-1])
-        tScS_mn = utils.make_acc_tensor_mn_view(thr_mma.partition_C(cS), transpose=self.swap_AB)
+        tScS_mn = layout_utils.reshape_acc_to_mn(thr_mma.partition_C(cS), transpose=self.swap_AB)
         # We use t0ScS as these indices are known at compile time. We then must subtract the
         # column limit by the thread column offset.
-        t0ScS_mn = utils.make_acc_tensor_mn_view(
+        t0ScS_mn = layout_utils.reshape_acc_to_mn(
             thr_mma.get_slice(0).partition_C(cS), transpose=self.swap_AB
         )
         ROW = 0 if const_expr(not self.swap_AB) else 1

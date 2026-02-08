@@ -14,6 +14,7 @@ from cutlass.cute.nvgpu import cpasync, warp
 from cutlass import Float32, Int32
 import cutlass.utils as utils_basic
 
+from quack import layout_utils
 from flash_attn.cute import ampere_helpers as sm80_utils
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import utils
@@ -630,8 +631,8 @@ class FlashAttentionBackwardSm80:
             tdQrK = utils.mma_make_fragment_B(sKt, thr_mma_dq, swapAB=self.dQ_swapAB)
 
             LSEslice = (None, 0, None) if cutlass.const_expr(not self.SdP_swapAB) else (0, None, None)
-            tSsLSEMma = utils.make_acc_tensor_mn_view(thr_mma_sdp.partition_C(sLSEMma))[LSEslice]
-            tSsdPsumMma = utils.make_acc_tensor_mn_view(thr_mma_sdp.partition_C(sdPsumMma))[LSEslice]
+            tSsLSEMma = layout_utils.reshape_acc_to_mn(thr_mma_sdp.partition_C(sLSEMma))[LSEslice]
+            tSsdPsumMma = layout_utils.reshape_acc_to_mn(thr_mma_sdp.partition_C(sdPsumMma))[LSEslice]
 
             # ///////////////////////////////////////////////////////////////////////////////
             # Smem copy atom tiling
@@ -875,7 +876,7 @@ class FlashAttentionBackwardSm80:
         )
         if cutlass.const_expr(mask_fn is not None):
             mask_fn(acc_S, m_block=m_block)
-        acc_S_mn = utils.make_acc_tensor_mn_view(acc_S)
+        acc_S_mn = layout_utils.reshape_acc_to_mn(acc_S)
         bidx = 0
         # if cute.arch.thread_idx()[0] == 0 and cute.arch.block_idx()[0] == bidx: cute.print_tensor(acc_S_mn)
         # if cute.arch.thread_idx()[0] == 0 and cute.arch.block_idx()[0] == 1: cute.print_tensor(tLSErLSE)
@@ -901,7 +902,7 @@ class FlashAttentionBackwardSm80:
         cute.autovec_copy(
             smem_copy_params.tSsdPsumMma[None, smem_pipe_read_do if cutlass.const_expr(self.num_stages_dO > 1) else 0], tLSErdPsum
         )
-        acc_dP_mn = utils.make_acc_tensor_mn_view(acc_dP)
+        acc_dP_mn = layout_utils.reshape_acc_to_mn(acc_dP)
         # if cute.arch.thread_idx()[0] == 0 and cute.arch.block_idx()[0] == bidx: cute.print_tensor(acc_dP_mn)
         assert cute.size(acc_dP_mn, mode=[0]) == cute.size(tLSErdPsum)
         for r in cutlass.range(cute.size(acc_dP_mn, mode=[0]), unroll_full=True):
@@ -921,7 +922,7 @@ class FlashAttentionBackwardSm80:
             tdSrdS = smem_copy_params.r2s_thr_copy_PdS.retile(rdS)
             cute.copy(smem_copy_params.r2s_thr_copy_PdS, tdSrdS, smem_copy_params.tdSsdS)
         if cutlass.const_expr(self.Mma_dKV_is_RS):
-            tdVrP = cute.make_tensor(rP.iterator, utils.convert_layout_acc_frgA(rP.layout))
+            tdVrP = layout_utils.reshape_acc_to_frgA(rP)
         else:
             tdVrP = mma_params.tdVrP
 
@@ -966,7 +967,7 @@ class FlashAttentionBackwardSm80:
 
         # MMA dK
         if cutlass.const_expr(self.Mma_dKV_is_RS):
-            tdKrdS = cute.make_tensor(rdS.iterator, utils.convert_layout_acc_frgA(rdS.layout))
+            tdVrP = layout_utils.reshape_acc_to_frgA(rdS)
         else:
             tdKrdS = mma_params.tdKrdS
         sm80_utils.gemm(

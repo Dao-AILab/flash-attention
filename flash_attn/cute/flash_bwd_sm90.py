@@ -12,7 +12,8 @@ from cutlass.cute import FastDivmodDivisor
 from cutlass import Float32, Int32, Boolean, const_expr
 from cutlass.utils import LayoutEnum
 
-import quack.sm90_utils as sm90_utils
+from quack import layout_utils
+from quack import sm90_utils
 from quack.sm90_utils import gemm_zero_init, gemm_w_idx
 
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
@@ -1100,8 +1101,8 @@ class FlashAttentionBackwardSm90:
             sLSE_mma = utils.transpose_view(sLSE_mma)
             sdPsum_mma = utils.transpose_view(sdPsum_mma)
         LSEslice = (None, 0, None) if const_expr(not self.SdP_swapAB) else (0, None, None)
-        tLSEsLSE = utils.make_acc_tensor_mn_view(thr_mma_SdP.partition_C(sLSE_mma))[LSEslice]
-        tLSEsdPsum = utils.make_acc_tensor_mn_view(thr_mma_SdP.partition_C(sdPsum_mma))[LSEslice]
+        tLSEsLSE = layout_utils.reshape_acc_to_mn(thr_mma_SdP.partition_C(sLSE_mma))[LSEslice]
+        tLSEsdPsum = layout_utils.reshape_acc_to_mn(thr_mma_SdP.partition_C(sdPsum_mma))[LSEslice]
 
         smem_thr_copy_dQaccum = r2s_tiled_copy_dQaccum.get_slice(tidx)
         tdQsdQaccum = smem_thr_copy_dQaccum.partition_D(sdQaccum)
@@ -1331,7 +1332,7 @@ class FlashAttentionBackwardSm90:
         # (3) [Pointwise 1] P = exp(S - LSE)
         if cutlass.const_expr(mask_fn is not None):
             mask_fn(acc_S, m_block=m_block)
-        acc_S_mn = utils.make_acc_tensor_mn_view(acc_S, transpose=self.SdP_swapAB)
+        acc_S_mn = layout_utils.reshape_acc_to_mn(acc_S, transpose=self.SdP_swapAB)
         for r in cutlass.range_constexpr(cute.size(acc_S_mn, mode=[0])):
             for c in cutlass.range(cute.size(acc_S_mn, mode=[1]), unroll_full=True):
                 acc_S_mn[r, c] = cute.math.exp2(
@@ -1340,7 +1341,7 @@ class FlashAttentionBackwardSm90:
         tLSErdPsum = copy_utils.load_s2r(tLSEsdPsum[None, smem_idx_dO])
 
         # Convert P from f32 -> f16
-        tdVrP = utils.cvt_f16(utils.make_acc_tensor_frgA_view(acc_S), self.dtype)
+        tdVrP = utils.cvt_f16(layout_utils.reshape_acc_to_frgA(acc_S), self.dtype)
         # R2S for P
         if const_expr(not self.mma_dkv_is_rs):
             # sync to ensure P has already been used in the previous iteration before overwriting
@@ -1353,7 +1354,7 @@ class FlashAttentionBackwardSm90:
 
         # (4) [Pointwise 2] dS = P*(dP-dPsum)
         warpgroup.wait_group(0)
-        acc_dP_mn = utils.make_acc_tensor_mn_view(acc_dP, transpose=self.SdP_swapAB)
+        acc_dP_mn = layout_utils.reshape_acc_to_mn(acc_dP, transpose=self.SdP_swapAB)
         for r in cutlass.range_constexpr(cute.size(acc_dP_mn, mode=[0])):
             for c in cutlass.range(cute.size(acc_dP_mn, mode=[1]), unroll_full=True):
                 acc_dP_mn[r, c] = acc_S_mn[r, c] * (acc_dP_mn[r, c] - tLSErdPsum[r])
@@ -1374,7 +1375,7 @@ class FlashAttentionBackwardSm90:
             )
 
         # Convert dS from f32 -> f16
-        tdKrdS = utils.cvt_f16(utils.make_acc_tensor_frgA_view(acc_dP), self.dtype)
+        tdKrdS = utils.cvt_f16(layout_utils.reshape_acc_to_frgA(acc_dP), self.dtype)
 
         # If there's double buffering on dS, we don't need to sync here.
         # Otherwise we might have WG1 writing to dS before WG2 is done reading from it during MmadQ.
