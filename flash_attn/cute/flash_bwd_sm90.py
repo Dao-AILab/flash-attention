@@ -1068,7 +1068,7 @@ class FlashAttentionBackwardSm90:
         )
 
         # Smem copy atom tiling
-        smem_copy_atom_PdS = utils.get_smem_store_atom(
+        smem_copy_atom_PdS = copy_utils.get_smem_store_atom(
             self.arch, self.dtype, transpose=self.SdP_swapAB
         )
         smem_thr_copy_PdS = cute.make_tiled_copy_C(smem_copy_atom_PdS, tiled_mma_SdP).get_slice(

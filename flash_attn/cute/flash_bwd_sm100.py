@@ -957,7 +957,7 @@ class FlashAttentionBackwardSm100:
             consumer_group=pipeline_consumer_group_compute,
             tx_count=self.tma_copy_bytes["LSE"],
             # cta_layout_vmnk=cluster_layout_vmnk,
-            # init_wait=False,
+            defer_sync=True,
         )
         pipeline_dPsum = cutlass.pipeline.PipelineTmaAsync.create(
             barrier_storage=storage.dPsum_mbar_ptr.data_ptr(),
@@ -966,7 +966,7 @@ class FlashAttentionBackwardSm100:
             consumer_group=pipeline_consumer_group_compute,
             tx_count=self.tma_copy_bytes["dPsum"],
             # cta_layout_vmnk=cluster_layout_vmnk,
-            # init_wait=False,
+            defer_sync=True,
         )
         pipeline_Q = pipeline.PipelineTmaUmma.create(
             barrier_storage=storage.Q_mbar_ptr.data_ptr(),
@@ -975,7 +975,7 @@ class FlashAttentionBackwardSm100:
             consumer_group=pipeline_consumer_group,
             tx_count=self.tma_copy_bytes["Q"],
             cta_layout_vmnk=cluster_layout_vmnk,
-            init_wait=False,
+            defer_sync=True,
         )
         pipeline_dO = pipeline.PipelineTmaUmma.create(
             barrier_storage=storage.dO_mbar_ptr.data_ptr(),
@@ -984,7 +984,7 @@ class FlashAttentionBackwardSm100:
             consumer_group=pipeline_consumer_group,
             tx_count=self.tma_copy_bytes["dO"],
             cta_layout_vmnk=cluster_layout_vmnk,
-            init_wait=True,
+            defer_sync=False,
         )
 
         sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner, dtype=self.q_dtype)
