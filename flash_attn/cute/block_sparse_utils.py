@@ -1250,10 +1250,10 @@ def consume_block_sparse_mma_bwd_sm90(
     is_causal: cutlass.Constexpr,
     is_local: cutlass.Constexpr,
     thr_mma_SdP,
-    softmax_scale,
-    seqlen,
-    subtile_factor: cutlass.Constexpr,
-    m_block_max: int,
+    score_mod_fn=None,
+    score_mod_bwd_fn=None,
+    subtile_factor: cutlass.Constexpr = 1,
+    m_block_max: int = 0,
     aux_tensors=None,
     fastdiv_mods=(None, None),
 ):
@@ -1315,15 +1315,9 @@ def consume_block_sparse_mma_bwd_sm90(
                 consumer_state_Q,
                 consumer_state_dO,
                 mask_fn=mask_fn_partial,
+                score_mod_fn=score_mod_fn,
+                score_mod_bwd_fn=score_mod_bwd_fn,
                 dKV_accumulate=dKV_accumulate,
-                thr_mma_SdP=thr_mma_SdP,
-                batch_idx=batch_idx,
-                head_idx=head_idx,
-                n_block=n_block,
-                softmax_scale=softmax_scale,
-                seqlen=seqlen,
-                aux_tensors=aux_tensors,
-                fastdiv_mods=fastdiv_mods,
             )
             dKV_accumulate = True
 
@@ -1339,15 +1333,9 @@ def consume_block_sparse_mma_bwd_sm90(
                     consumer_state_Q,
                     consumer_state_dO,
                     mask_fn=mask_fn_full,
+                    score_mod_fn=score_mod_fn,
+                    score_mod_bwd_fn=score_mod_bwd_fn,
                     dKV_accumulate=dKV_accumulate,
-                    thr_mma_SdP=thr_mma_SdP,
-                    batch_idx=batch_idx,
-                    head_idx=head_idx,
-                    n_block=n_block,
-                    softmax_scale=softmax_scale,
-                    seqlen=seqlen,
-                    aux_tensors=aux_tensors,
-                    fastdiv_mods=fastdiv_mods,
                 )
                 dKV_accumulate = True
 
