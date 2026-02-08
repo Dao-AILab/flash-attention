@@ -342,15 +342,15 @@ class FlashAttentionBackwardSm90:
         ]
 
         layout_transpose = [1, 3, 2, 0]  # (b, s, n, h) --> (s, h, n, b)
-        mQ, mK, mV, mdO = [utils.select(t, layout_transpose) for t in (mQ, mK, mV, mdO)]
+        mQ, mK, mV, mdO = [layout_utils.select(t, layout_transpose) for t in (mQ, mK, mV, mdO)]
         if const_expr(self.qhead_per_kvhead == 1):
-            mdK, mdV = [utils.select(t, layout_transpose) for t in (mdK, mdV)]
+            mdK, mdV = [layout_utils.select(t, layout_transpose) for t in (mdK, mdV)]
         else:
             accum_transpose = [2, 1, 0]  # (b, n, s*h) -> (s*h, n, b)
-            mdK, mdV = [utils.select(t, accum_transpose) for t in (mdK, mdV)]
+            mdK, mdV = [layout_utils.select(t, accum_transpose) for t in (mdK, mdV)]
         LSE_dPsum_dQaccum_transpose = [2, 1, 0]  # (b, n, s) -> (s, n, b)
         mLSE, mdPsum, mdQaccum = [
-            utils.select(t, LSE_dPsum_dQaccum_transpose) for t in (mLSE, mdPsum, mdQaccum)
+            layout_utils.select(t, LSE_dPsum_dQaccum_transpose) for t in (mLSE, mdPsum, mdQaccum)
         ]
 
         tiled_mma_SdP, tiled_mma_dK, tiled_mma_dV, tiled_mma_dQ = self._get_tiled_mma()
@@ -1036,8 +1036,8 @@ class FlashAttentionBackwardSm90:
             gemm_zero_init, tiled_mma_SdP, shape_mnk_dP[:2], tdPrdO, tdPrV, swap_AB=self.SdP_swapAB
         )
         # dV += P.T @ dO
-        sPt = utils.transpose_view(sP) if sP is not None else None
-        sdOt = utils.transpose_view(sdO)
+        sPt = layout_utils.transpose_view(sP) if sP is not None else None
+        sdOt = layout_utils.transpose_view(sdO)
         shape_mnk_dV = (self.tile_n, self.tile_hdimv, self.tile_m)
         acc_dV, tdVrPt, tdVrdOt = sm90_utils.partition_fragment_ABC(
             wg_mma_dV, shape_mnk_dV, sPt, sdOt, swap_AB=self.dKV_swapAB
@@ -1049,8 +1049,8 @@ class FlashAttentionBackwardSm90:
         else:
             mma_pdo_fn = partial(gemm_w_idx, tiled_mma_dV, acc_dV, tCrB=tdVrdOt)
         # dK += dS.T @ Q
-        sdSt = utils.transpose_view(sdS)
-        sQt = utils.transpose_view(sQ)
+        sdSt = layout_utils.transpose_view(sdS)
+        sQt = layout_utils.transpose_view(sQ)
         shape_mnk_dK = (self.tile_n, self.tile_hdim, self.tile_m)
         acc_dK, tdKrdSt, tdKrQt = sm90_utils.partition_fragment_ABC(
             wg_mma_dK, shape_mnk_dK, sdSt, sQt, swap_AB=self.dKV_swapAB
@@ -1062,7 +1062,7 @@ class FlashAttentionBackwardSm90:
         else:
             mma_dsq_fn = partial(gemm_w_idx, tiled_mma_dK, acc_dK, tCrB=tdKrQt)
         # dQ = dS @ K
-        sKt = utils.transpose_view(sK)
+        sKt = layout_utils.transpose_view(sK)
         shape_mnk_dQ = (self.tile_m, self.tile_hdim, self.tile_n)
         _, tdQrdS, tdQrKt = sm90_utils.partition_fragment_ABC(
             wg_mma_dQ, shape_mnk_dQ, sdS, sKt, swap_AB=self.dQ_swapAB
@@ -1482,7 +1482,7 @@ class FlashAttentionBackwardSm90:
             )
 
             taccdVrdV = smem_thr_copy_dV.retile(rdV)
-            sdV = sV if const_expr(not self.dKV_swapAB) else utils.transpose_view(sV)
+            sdV = sV if const_expr(not self.dKV_swapAB) else layout_utils.transpose_view(sV)
             taccdVsdV = smem_thr_copy_dV.partition_D(sdV)
             cute.copy(smem_copy_atom_dKV, taccdVrdV, taccdVsdV)
             cute.arch.fence_view_async_shared()
@@ -1492,7 +1492,7 @@ class FlashAttentionBackwardSm90:
             if warp_idx == 4:
                 store_dV()
             taccdKrdK = smem_thr_copy_dK.retile(rdK)
-            sdK = sK if const_expr(not self.dKV_swapAB) else utils.transpose_view(sK)
+            sdK = sK if const_expr(not self.dKV_swapAB) else layout_utils.transpose_view(sK)
             taccdKsdK = smem_thr_copy_dK.partition_D(sdK)
             cute.copy(smem_copy_atom_dKV, taccdKrdK, taccdKsdK)
             cute.arch.fence_view_async_shared()

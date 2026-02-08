@@ -582,7 +582,7 @@ class FlashAttentionBackwardSm80:
             sdPsumMma = storage.sdPsum.get_tensor(sLSEMma_layout)
 
             # Transpose view of tensors for tiled mma
-            sQt, sdOt, sKt, sPt, sdSt = [utils.transpose_view(t) for t in (sQ, sdO, sK, sP, sdS)]
+            sQt, sdOt, sKt, sPt, sdSt = [layout_utils.transpose_view(t) for t in (sQ, sdO, sK, sP, sdS)]
 
             gmem_thr_copy_QK = gmem_tiled_copy_QK.get_slice(tidx)
             gmem_thr_copy_VdO = gmem_tiled_copy_VdO.get_slice(tidx)

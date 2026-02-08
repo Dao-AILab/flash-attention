@@ -14,6 +14,7 @@ from cutlass.cute.nvgpu import cpasync, warp, warpgroup
 from cutlass import Float32, const_expr
 from cutlass.utils import LayoutEnum
 
+from quack import layout_utils
 from quack import sm90_utils
 
 from flash_attn.cute import utils
@@ -306,7 +307,7 @@ class FlashAttentionBackwardPostprocess:
                 cute.recast_ptr(sdQaccum.iterator, sdQ_layout.inner, dtype=self.dtype),
                 sdQ_layout.outer,
             )[None, None, 0]
-        sdQt = utils.transpose_view(sdQ)
+        sdQt = layout_utils.transpose_view(sdQ)
 
         # Thread index, block index
         tidx, _, _ = cute.arch.thread_idx()

@@ -796,7 +796,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         else:
             sV = cute.make_tensor(cute.recast_ptr(sQ.iterator, dtype=self.dtype), sV_layout)
         # Transpose view of V to tensor with layout (head_dim_v, tile_n) for tiled mma
-        sVt = utils.transpose_view(sV)
+        sVt = layout_utils.transpose_view(sV)
 
         gmem_thr_copy_K = gmem_tiled_copy_K.get_slice(tidx)
         gmem_thr_copy_V = gmem_tiled_copy_V.get_slice(tidx)
@@ -1280,11 +1280,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
         mQ, mK, mV, mO = [assume_tensor_aligned(t) for t in (mQ, mK, mV, mO)]
         QO_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
-        mQ, mO = [utils.select(t, QO_layout_transpose) for t in (mQ, mO)]
+        mQ, mO = [layout_utils.select(t, QO_layout_transpose) for t in (mQ, mO)]
         KV_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensK is None) else [0, 2, 1]
-        mK, mV = [utils.select(t, KV_layout_transpose) for t in (mK, mV)]
+        mK, mV = [layout_utils.select(t, KV_layout_transpose) for t in (mK, mV)]
         LSE_layout_transpose = [2, 1, 0] if const_expr(mCuSeqlensQ is None) else [1, 0]
-        mLSE = utils.select(mLSE, LSE_layout_transpose) if const_expr(mLSE is not None) else None
+        mLSE = layout_utils.select(mLSE, LSE_layout_transpose) if const_expr(mLSE is not None) else None
 
         tiled_mma_qk, tiled_mma_pv = self._get_tiled_mma()
         self.num_mma_threads = tiled_mma_qk.size
@@ -1622,7 +1622,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 sV_layout.outer, swizzle=sV_layout.inner, dtype=mV.element_type
             )
         # Transpose view of V to tensor with layout (head_dim_v, tile_n) for tiled mma
-        sVt = utils.transpose_view(sV)
+        sVt = layout_utils.transpose_view(sV)
         sP = None
         if const_expr(sP_layout is not None):
             sP = storage.sP.get_tensor(sP_layout.outer, swizzle=sP_layout.inner)
