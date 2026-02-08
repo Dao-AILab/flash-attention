@@ -452,24 +452,6 @@ def elem_pointer(x: cute.Tensor, coord: cute.Coord, *, loc=None, ip=None) -> cut
     return x.iterator + cute.crd2idx(coord, x.layout, loc=loc, ip=ip)
 
 
-@dsl_user_op
-def elem_pointer_i64(x: cute.Tensor, coord: cute.Coord, *, loc=None, ip=None) -> cute.Pointer:
-    flat_coord_i64 = tuple(cutlass.Int64(c) for c in cute.flatten(coord))
-    flat_stride = cute.flatten_to_tuple(x.stride)
-    assert len(flat_coord_i64) == len(flat_stride), (
-        "Coordinate and stride must have the same length"
-    )
-    offset = sum(c * s for c, s in zip(flat_coord_i64, flat_stride))
-    # HACK: we assume that applying the offset does not change the pointer alignment
-    byte_offset = offset * x.element_type.width // 8
-    return cute.make_ptr(
-        x.element_type,
-        x.iterator.toint() + byte_offset,
-        x.memspace,
-        assumed_align=x.iterator.alignment,
-    )
-
-
 @cute.jit
 def predicate_k(tAcA: cute.Tensor, limit: cutlass.Int32) -> cute.Tensor:
     # Only compute predicates for the "k" dimension. For the mn dimension, we will use "if"
@@ -796,44 +778,6 @@ def domain_offset_aligned(
         assumed_align=tensor.iterator.alignment,
     )
     return cute.make_tensor(new_ptr, tensor.layout)
-
-
-@dsl_user_op
-def domain_offset_i64(coord: cute.Coord, tensor: cute.Tensor, *, loc=None, ip=None) -> cute.Tensor:
-    flat_coord_i64 = tuple(cutlass.Int64(c) for c in cute.flatten(coord))
-    flat_stride = cute.flatten_to_tuple(tensor.stride)
-    assert len(flat_coord_i64) == len(flat_stride), (
-        "Coordinate and stride must have the same length"
-    )
-    offset = sum(c * s for c, s in zip(flat_coord_i64, flat_stride))
-    assert isinstance(tensor.iterator, cute.Pointer)
-    # HACK: we assume that applying the offset does not change the pointer alignment
-    new_ptr = cute.make_ptr(
-        tensor.element_type,
-        tensor.iterator.toint() + offset * tensor.element_type.width // 8,
-        tensor.memspace,
-        assumed_align=tensor.iterator.max_alignment,
-    )
-    return cute.make_tensor(new_ptr, tensor.layout)
-
-
-@dsl_user_op
-def coord_offset_i64(
-    tensor: cute.Tensor, idx: cute.typing.Int, dim: int, *, loc=None, ip=None
-) -> cute.Tensor:
-    offset = cutlass.Int64(idx) * cute.size(tensor.stride[dim])
-    assert isinstance(tensor.iterator, cute.Pointer)
-    # HACK: we assume that applying the offset does not change the pointer alignment
-    new_ptr = cute.make_ptr(
-        tensor.element_type,
-        tensor.iterator.toint() + offset * tensor.element_type.width // 8,
-        tensor.memspace,
-        assumed_align=tensor.iterator.max_alignment,
-    )
-    new_layout = cute.slice_(
-        tensor.layout, (*[None] * dim, 0, *[None] * (cute.rank(tensor) - dim - 1))
-    )
-    return cute.make_tensor(new_ptr, new_layout)
 
 
 @cute.jit

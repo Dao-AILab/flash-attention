@@ -395,11 +395,9 @@ class FlashAttentionForwardCombine:
             # ===============================
 
             if const_expr(cu_seqlens is None):
-                # mLSE_partial_cur = mLSE_partial[None, None, None, batch_idx]
-                mLSE_partial_cur = utils.coord_offset_i64(mLSE_partial, batch_idx, dim=3)
+                mLSE_partial_cur = mLSE_partial[None, None, None, batch_idx]
             else:
-                # mLSE_partial_cur = cute.domain_offset((offset, 0, 0), mLSE_partial)
-                mLSE_partial_cur = utils.domain_offset_i64((offset, 0, 0), mLSE_partial)
+                mLSE_partial_cur = cute.domain_offset((offset, 0, 0), mLSE_partial)
             mLSE_partial_copy = cute.tiled_divide(mLSE_partial_cur, (1,))
 
             gmem_thr_copy_LSE = gmem_tiled_copy_LSE.get_slice(tidx)
@@ -443,11 +441,9 @@ class FlashAttentionForwardCombine:
             tOcO = gmem_thr_copy_O_partial.partition_D(cO)
             tOsO_partial = gmem_thr_copy_O_partial.partition_D(sO)
             if const_expr(cu_seqlens is None):
-                # mO_partial_cur = mO_partial[None, None, None, None, batch_idx]
-                mO_partial_cur = utils.coord_offset_i64(mO_partial, batch_idx, dim=4)
+                mO_partial_cur = mO_partial[None, None, None, None, batch_idx]
             else:
-                # mO_partial_cur = cute.domain_offset((offset, 0, 0, 0), mO_partial)
-                mO_partial_cur = utils.domain_offset_i64((offset, 0, 0, 0), mO_partial)
+                mO_partial_cur = cute.domain_offset((offset, 0, 0, 0), mO_partial)
 
             # Precompute these values to avoid recomputing them in the loop
             num_rows = const_expr(cute.size(tOcO, mode=[1]))
@@ -462,7 +458,7 @@ class FlashAttentionForwardCombine:
                 else:
                     tOhidx[m] = idx // seqlen
                     tOmidx[m] = idx - tOhidx[m] * seqlen
-                tOrOptr[m] = utils.elem_pointer_i64(
+                tOrOptr[m] = utils.elem_pointer(
                     mO_partial_cur, (tOmidx[m], k_block * self.k_block_size, 0, tOhidx[m])
                 ).toint()
                 if idx >= max_idx:
@@ -570,11 +566,9 @@ class FlashAttentionForwardCombine:
 
             if const_expr(mLSE is not None):
                 if const_expr(cu_seqlens is None):
-                    # mLSE_cur = mLSE[None, None, batch_idx]
-                    mLSE_cur = utils.coord_offset_i64(mLSE, batch_idx, dim=2)
+                    mLSE_cur = mLSE[None, None, batch_idx]
                 else:
-                    # mLSE_cur = cute.domain_offset((offset, 0), mLSE)
-                    mLSE_cur = utils.domain_offset_i64((offset, 0), mLSE)
+                    mLSE_cur = cute.domain_offset((offset, 0), mLSE)
                 if k_block == 0:  # Only first k_block writes LSE when mLSE is provided
                     for m in cutlass.range(cute.size(ts2rrLSE, mode=[2]), unroll_full=True):
                         if ts2rcLSE[0, 0, m][0] == 0:  # Only thread responsible for s=0 writes
@@ -642,11 +636,9 @@ class FlashAttentionForwardCombine:
             rO = cute.make_fragment_like(tOrO, self.dtype)
             rO.store(tOrO.load().to(self.dtype))
             if const_expr(cu_seqlens is None):
-                # mO_cur = mO[None, None, None, batch_idx]
-                mO_cur = utils.coord_offset_i64(mO, batch_idx, dim=3)
+                mO_cur = mO[None, None, None, batch_idx]
             else:
-                # mO_cur = cute.domain_offset((offset, 0, 0), mO)
-                mO_cur = utils.domain_offset_i64((offset, 0, 0), mO)
+                mO_cur = cute.domain_offset((offset, 0, 0), mO)
             mO_cur = utils.domain_offset_aligned((0, k_block * self.k_block_size, 0), mO_cur)
             elems_per_store = const_expr(cute.size(gmem_tiled_copy_O.layout_tv_tiled[1]))
             # mO_cur_copy = cute.tiled_divide(mO_cur, (1, elems_per_store,))
@@ -691,7 +683,6 @@ class FlashAttentionForwardCombine:
                     if const_expr(self.is_even_k) or tOpO[k]:
                         cute.copy(
                             gmem_tiled_copy_O_partial,
-                            # mO_partial_cur_copy[None, k_idx, split],
-                            utils.coord_offset_i64(mO_partial_cur_copy, split, dim=2)[None, k_idx],
+                            mO_partial_cur_copy[None, k_idx, split],
                             tOsO_partial_cur[None, m, k],
                         )
