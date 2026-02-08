@@ -277,6 +277,7 @@ def _run_mask_test(
 
     # SM90 block-sparse backward expects BlockMask granularity (128, 128) regardless of fwd tiling.
     sparse_tile_m_bwd = sparse_tile_m
+    tile_n_bwd = tile_n
     if COMPUTE_CAPABILITY == 9 and use_block_sparsity and (sparse_tile_m, tile_n) != (128, 128):
         bm_bwd = create_block_mask(
             mask_mod_flex,
@@ -301,6 +302,7 @@ def _run_mask_test(
             *_,
         ) = bm_bwd.as_tuple()
         sparse_tile_m_bwd = 128
+        tile_n_bwd = 128
 
     softmax_scale = 1.0 / math.sqrt(headdim)
 
@@ -323,7 +325,7 @@ def _run_mask_test(
             mask_block_idx=q_mask_idx,
             full_block_cnt=full_q_cnt,
             full_block_idx=full_q_idx,
-            block_size=(sparse_tile_m_bwd, tile_n),
+            block_size=(sparse_tile_m_bwd, tile_n_bwd),
         )
         if use_block_sparsity
         else None

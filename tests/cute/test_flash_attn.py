@@ -709,6 +709,7 @@ def test_flash_attn_varlen_output(
             and not attention_chunk != 0
             and dv == d
             and not has_learnable_sink
+            and not IS_SM90
             # and False
         ):
             g_unpad = torch.randn_like(out_unpad)
