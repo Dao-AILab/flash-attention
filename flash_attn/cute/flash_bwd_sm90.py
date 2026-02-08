@@ -1083,26 +1083,12 @@ class FlashAttentionBackwardSm90:
             tPsP = smem_thr_copy_PdS.partition_D(sP if const_expr(not self.SdP_swapAB) else sPt)
         tdSsdS = smem_thr_copy_PdS.partition_D(sdS if const_expr(not self.SdP_swapAB) else sdSt)
 
-        sLSE_mma = cute.make_tensor(
-            sLSE.iterator,
-            cute.make_layout(
-                (self.tile_m, self.tile_n, self.Q_stage),
-                stride=(1, 0, cute.round_up(self.tile_m, 64)),
-            ),
+        tLSEsLSE = layout_utils.mma_partition_C_vec(
+            sLSE, thr_mma_SdP, expand_shape=self.tile_n, is_colvec=not self.SdP_swapAB
         )
-        sdPsum_mma = cute.make_tensor(
-            sdPsum.iterator,
-            cute.make_layout(
-                (self.tile_m, self.tile_n, self.dO_stage),
-                stride=(1, 0, cute.round_up(self.tile_m, 64)),
-            ),
+        tLSEsdPsum = layout_utils.mma_partition_C_vec(
+            sdPsum, thr_mma_SdP, expand_shape=self.tile_n, is_colvec=not self.SdP_swapAB
         )
-        if const_expr(self.SdP_swapAB):
-            sLSE_mma = utils.transpose_view(sLSE_mma)
-            sdPsum_mma = utils.transpose_view(sdPsum_mma)
-        LSEslice = (None, 0, None) if const_expr(not self.SdP_swapAB) else (0, None, None)
-        tLSEsLSE = layout_utils.reshape_acc_to_mn(thr_mma_SdP.partition_C(sLSE_mma))[LSEslice]
-        tLSEsdPsum = layout_utils.reshape_acc_to_mn(thr_mma_SdP.partition_C(sdPsum_mma))[LSEslice]
 
         smem_thr_copy_dQaccum = r2s_tiled_copy_dQaccum.get_slice(tidx)
         tdQsdQaccum = smem_thr_copy_dQaccum.partition_D(sdQaccum)
