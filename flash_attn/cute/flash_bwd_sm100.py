@@ -1093,18 +1093,18 @@ class FlashAttentionBackwardSm100:
         #  EMPTY
         # (15)
         if warp_idx == self.empty_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_empty)
+            cute.arch.setmaxregister_decrease(self.num_regs_empty)
 
         #  EPI
         # (14)
         if warp_idx == self.epi_warp_id:
             # currently no-op, could use for tma store/reduce
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_empty)
+            cute.arch.setmaxregister_decrease(self.num_regs_empty)
 
         #  LOAD
         # (13)
         if warp_idx == self.load_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
+            cute.arch.setmaxregister_decrease(self.num_regs_other)
             self.load(
                 thr_mma_S,
                 thr_mma_dP,
@@ -1141,7 +1141,7 @@ class FlashAttentionBackwardSm100:
         #  MMA
         # (12)
         if warp_idx == self.mma_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
+            cute.arch.setmaxregister_decrease(self.num_regs_other)
 
             # Alloc tmem buffer
             tmem_alloc_cols = Int32(self.tmem_alloc_cols)
@@ -1194,7 +1194,7 @@ class FlashAttentionBackwardSm100:
         # Compute
         # (4, 5, 6, 7, 8, 9, 10, 11) --> 8 warps
         if warp_idx >= self.compute_warp_ids[0] and warp_idx <= self.compute_warp_ids[-1]:
-            cute.arch.warpgroup_reg_alloc(self.num_regs_compute)  # 8 warps
+            cute.arch.setmaxregister_increase(self.num_regs_compute)  # 8 warps
             self.compute_loop(
                 thr_mma_S,
                 thr_mma_dP,
@@ -1239,7 +1239,7 @@ class FlashAttentionBackwardSm100:
         # Reduce
         # (0, 1, 2, 3) - dQ
         if warp_idx >= self.reduce_warp_ids[0] and warp_idx <= self.reduce_warp_ids[-1]:
-            cute.arch.warpgroup_reg_alloc(self.num_regs_reduce)
+            cute.arch.setmaxregister_increase(self.num_regs_reduce)
             self.dQacc_reduce(
                 mdQaccum,
                 sdQaccum,

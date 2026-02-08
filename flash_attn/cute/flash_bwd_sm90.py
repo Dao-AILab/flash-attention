@@ -640,7 +640,7 @@ class FlashAttentionBackwardSm90:
         TileSchedulerCls = partial(TileScheduler.create, tile_sched_params)
 
         if warp_idx < 4:
-            cute.arch.warpgroup_reg_dealloc(self.num_producer_regs)
+            cute.arch.setmaxregister_decrease(self.num_producer_regs)
             if warp_idx == 0:
                 self.load(
                     mQ,
@@ -682,7 +682,7 @@ class FlashAttentionBackwardSm90:
                     blocksparse_tensors,
                 )
         else:
-            cute.arch.warpgroup_reg_alloc(self.num_mma_regs)
+            cute.arch.setmaxregister_increase(self.num_mma_regs)
             tidx, _, _ = cute.arch.thread_idx()
             tidx = tidx - 128
             self.mma(
