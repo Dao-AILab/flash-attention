@@ -30,12 +30,22 @@ def hash_callable(func: Callable, set_cute_hash=True) -> str:
     if hasattr(func, "__cute_hash__"):
         return func.__cute_hash__
 
+    # __vec_size__ is attr of @cute.jitted mod
+    if hasattr(func, "__vec_size__"):
+        vec_size = func.__vec_size__
+    else:
+        vec_size = None
+
     # Unwrap decorated functions (e.g., cute.jit wrappers).
     if hasattr(func, "__wrapped__"):
         base_func = func.__wrapped__
         if hasattr(base_func, "__cute_hash__"):
             return base_func.__cute_hash__
         func = base_func
+
+    # if base func has __vec_size__, overwrite
+    if hasattr(func, "__vec_size__"):
+        vec_size = func.__vec_size__
 
     try:
         data = inspect.getsource(func).encode()
@@ -51,6 +61,8 @@ def hash_callable(func: Callable, set_cute_hash=True) -> str:
         for idx, cell in enumerate(func.__closure__):
             cell_value = cell.cell_contents
             hasher.update(repr(cell_value).encode())
+
+    hasher.update(str(vec_size).encode())
 
     hash = hasher.hexdigest()
 
