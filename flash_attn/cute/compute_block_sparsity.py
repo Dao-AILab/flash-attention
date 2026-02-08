@@ -54,7 +54,7 @@ class BlockSparsityKernel:
         seqlen_k: Int32,
         aux_tensors: Optional[list] = None,
     ):
-        self.mask_cnt, self.mask_idx, self.full_cnt, self.full_idx = blocksparse_tensors
+        self.mask_cnt, self.mask_idx, self.full_cnt, self.full_idx, *_ = blocksparse_tensors
 
         if const_expr(self.compute_full_blocks):
             assert self.full_cnt is not None and self.full_idx is not None, (
@@ -366,7 +366,14 @@ def compute_block_sparsity(
         )
 
     compute_block_sparsity.compile_cache[compile_key](
-        blocksparse_tensors_torch[:4],
+        (
+            blocksparse_tensors_torch.mask_block_cnt,
+            blocksparse_tensors_torch.mask_block_idx,
+            blocksparse_tensors_torch.full_block_cnt,
+            blocksparse_tensors_torch.full_block_idx,
+            blocksparse_tensors_torch.dq_write_order,
+            blocksparse_tensors_torch.dq_write_order_full,
+        ),
         seqlen_q,
         seqlen_k,
         aux_tensors,

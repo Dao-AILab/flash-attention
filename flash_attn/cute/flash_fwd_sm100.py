@@ -2036,7 +2036,6 @@ class FlashAttentionForwardSm100:
             )
 
             if const_expr(self.use_block_sparsity) or has_work:
-                # See block_sparse_utils.py NOTE [SM100 block-sparse empty tiles: mbarrier contract].
                 pipeline_sm_stats.producer_acquire_w_index_phase(stage, sm_stats_producer_phase)
                 sm_stats_producer_phase ^= 1
 
