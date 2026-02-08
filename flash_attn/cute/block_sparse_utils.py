@@ -14,7 +14,6 @@ from cutlass import Float32, Int32, const_expr
 
 # Import data structures from block_sparsity
 from flash_attn.cute.block_sparsity import BlockSparseTensors
-from flash_attn.cute import utils
 from flash_attn.cute import copy_utils
 from flash_attn.cute.named_barrier import NamedBarrierBwd
 
@@ -698,8 +697,8 @@ def handle_block_sparse_empty_tile_correction_sm100(
                     row_max_value = sink_val * (LOG2_E / softmax_scale_log2)
                     row_sum_value = Float32(1.0)
                 else:
-                    row_sum_value = row_sum_value + utils.exp2f(
-                        sink_val * LOG2_E - row_max_value * softmax_scale_log2
+                    row_sum_value = row_sum_value + cute.math.exp2(
+                        sink_val * LOG2_E - row_max_value * softmax_scale_log2, fastmath=True
                     )
         if tidx < m_block_size:
             scale_row_idx = tidx + stage * m_block_size

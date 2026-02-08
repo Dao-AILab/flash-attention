@@ -540,13 +540,15 @@ class FlashAttentionForwardCombine:
                 LOG2_E = math.log2(math.e)
                 lse_sum_cur = 0.0
                 for s in cutlass.range(cute.size(ts2rrLSE, mode=[1]), unroll_full=True):
-                    scale = utils.exp2f(ts2rrLSE[0, s, m] * LOG2_E - (lse_max_cur * LOG2_E))
+                    scale = cute.math.exp2(
+                        ts2rrLSE[0, s, m] * LOG2_E - (lse_max_cur * LOG2_E), fastmath=True
+                    )
                     lse_sum_cur += scale
                     ts2rrLSE[0, s, m] = scale  # Store scale for later use
                 lse_sum_cur = cute.arch.warp_reduction_sum(
                     lse_sum_cur, threads_in_group=threads_per_col
                 )
-                lse_sum[m] = utils.logf(lse_sum_cur) + lse_max
+                lse_sum[m] = cute.math.log(lse_sum_cur, fastmath=True) + lse_max
                 # Normalize scales
                 inv_sum = (
                     0.0 if (lse_sum_cur == 0.0 or lse_sum_cur != lse_sum_cur) else 1.0 / lse_sum_cur
