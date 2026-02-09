@@ -5,7 +5,6 @@ import hashlib
 import inspect
 import re
 from typing import Type, Callable, Optional, Tuple, overload
-from functools import partial
 
 import cutlass
 import cutlass.cute as cute
@@ -16,16 +15,7 @@ from cutlass._mlir.dialects import nvvm, llvm
 from cutlass.cute.runtime import from_dlpack
 
 
-# cute.arch.{fma,mul,add}_packed_f32x2 uses RZ rounding mode by default
-fma_packed_f32x2 = partial(cute.arch.fma_packed_f32x2, rnd=nvvm.RoundingModeKind.RN)
-mul_packed_f32x2 = partial(cute.arch.mul_packed_f32x2, rnd=nvvm.RoundingModeKind.RN)
-add_packed_f32x2 = partial(cute.arch.add_packed_f32x2, rnd=nvvm.RoundingModeKind.RN)
-sub_packed_f32x2 = partial(
-    cute.arch.calc_packed_f32x2_op,
-    src_c=None,
-    calc_func=nvvm.sub_packed_f32x2,
-    rnd=nvvm.RoundingModeKind.RN,
-)
+import quack.activation
 
 
 def hash_callable(func: Callable, set_cute_hash=True) -> str:
@@ -173,98 +163,6 @@ def warp_reduce(
     return val
 
 
-def convert_layout_acc_mn(acc_layout: cute.Layout, transpose: bool = False) -> cute.Layout:
-    """
-    For Sm80, convert ((2, 2), MMA_M, MMA_N, ...) to ((2, MMA_M), (2, MMA_N), ...).
-    For Sm90, convert ((2, 2, V), MMA_M, MMA_N, ...) to ((2, MMA_M), (2, V, MMA_N), ...).
-    """
-    acc_layout_col_major = cute.make_layout(acc_layout.shape)
-    shape = (
-        (acc_layout_col_major.shape[0][1], acc_layout_col_major.shape[1]),  # MMA_M
-        (
-            acc_layout_col_major.shape[0][0],
-            *acc_layout_col_major.shape[0][2:],
-            acc_layout_col_major.shape[2],
-        ),  # MMA_N
-        *acc_layout_col_major.shape[3:],
-    )
-    stride = (
-        (acc_layout_col_major.stride[0][1], acc_layout_col_major.stride[1]),  # MMA_M
-        (
-            acc_layout_col_major.stride[0][0],
-            *acc_layout_col_major.stride[0][2:],
-            acc_layout_col_major.stride[2],
-        ),  # MMA_N
-        *acc_layout_col_major.stride[3:],
-    )
-    if const_expr(transpose):
-        shape = (shape[1], shape[0], *shape[2:])
-        stride = (stride[1], stride[0], *stride[2:])
-    acc_layout_mn = cute.make_layout(shape, stride=stride)
-    return cute.composition(acc_layout, acc_layout_mn)
-
-
-def make_acc_tensor_mn_view(acc: cute.Tensor, transpose: bool = False) -> cute.Tensor:
-    return cute.make_tensor(acc.iterator, convert_layout_acc_mn(acc.layout, transpose=transpose))
-
-
-@cute.jit
-def convert_layout_acc_frgA(acc_layout: cute.Layout) -> cute.Layout:
-    # For back to back gemm, convert layout of acc0 to gemm 1 accept layout.
-    # For Sm80, as the mma instruction shape is 16x8x16, we need to convert from (4, MMA_M, MMA_N) to ((4, 2), MMA_M, MMA_N / 2)
-    # For Sm90, FP16/BF16, convert acc_layout from ((2, 2, N / 8), MMA_M, MMA_N) to ((2, 2, 2), MMA_M, (N / 16, MMA_N))
-    # TODO: Sm90 FP8
-    if const_expr(cute.rank(acc_layout.shape[0]) == 3):  # Sm90
-        l = cute.logical_divide(
-            acc_layout, ((None, None, 2), None, None)
-        )  # ((2, 2, (2, N / 16)), MMA_M, MMA_N)
-        rA_mma_view = cute.make_layout(
-            (
-                (l.shape[0][0], l.shape[0][1], l.shape[0][2][0]),
-                l.shape[1],
-                (l.shape[0][2][1], l.shape[2]),
-            ),
-            stride=(
-                (l.stride[0][0], l.stride[0][1], l.stride[0][2][0]),
-                l.stride[1],
-                (l.stride[0][2][1], l.stride[2]),
-            ),
-        )
-    else:  # Sm80
-        # (4, MMA_M, MMA_N) -> (4, MMA_M, (2, MMA_N / 2))
-        l = cute.logical_divide(acc_layout, (None, None, 2))
-        rA_mma_view = cute.make_layout(
-            (
-                (l.shape[0], l.shape[2][0]),
-                l.shape[1],
-                l.shape[2][1],
-            ),
-            stride=(
-                (l.stride[0], l.stride[2][0]),
-                l.stride[1],
-                l.stride[2][1],
-            ),
-        )
-    return rA_mma_view
-
-
-def make_acc_tensor_frgA_view(acc: cute.Tensor) -> cute.Tensor:
-    return cute.make_tensor(acc.iterator, convert_layout_acc_frgA(acc.layout))
-
-
-def select(a: cute.Tensor, mode: list[int]) -> cute.Tensor:
-    return cute.make_tensor(a.iterator, cute.select(a.layout, mode))
-
-
-def transpose_view(a: cute.Tensor) -> cute.Tensor:
-    """Transpose the first two dimensions of a tensor on smem."""
-    shape = (a.shape[1], a.shape[0], *a.shape[2:])
-    order = (1, 0, *range(2, cute.rank(a)))
-    return cute.composition(a, cute.make_ordered_layout(shape, order=order))
-    # stride = (a.layout.stride[1], a.layout.stride[0], *a.layout.stride[2:])
-    # return cute.make_tensor(a.iterator, cute.make_layout(shape, stride=stride))
-
-
 def parse_swizzle_from_pointer(ptr: cute.Pointer) -> cute.Swizzle:
     """Extract swizzle parameters from a pointer's swizzle_type.
 
@@ -287,44 +185,6 @@ def parse_swizzle_from_pointer(ptr: cute.Pointer) -> cute.Swizzle:
         return cute.make_swizzle(b, m, s)
     else:
         raise ValueError(f"Could not parse swizzle_type: {swizzle_str}")
-
-
-@cute.jit
-def exp2f(x: cute.TensorSSA | Float32) -> cute.TensorSSA | Float32:
-    """exp2f calculation for both vector and scalar.
-    :param x: input value
-    :type x: cute.TensorSSA or Float32
-    :return: exp2 value
-    :rtype: cute.TensorSSA or Float32
-    """
-    if const_expr(isinstance(x, cute.TensorSSA)):
-        res = cute.make_fragment(x.shape, Float32)
-        res.store(x)
-        for i in cutlass.range_constexpr(cute.size(x.shape)):
-            res[i] = cute.arch.exp2(res[i])
-        return res.load()
-    else:
-        return cute.arch.exp2(x)
-
-
-@dsl_user_op
-def log2f(a: float | Float32, *, loc=None, ip=None) -> Float32:
-    return Float32(
-        llvm.inline_asm(
-            T.f32(),
-            [Float32(a).ir_value(loc=loc, ip=ip)],
-            "lg2.approx.ftz.f32 $0, $1;",
-            "=f,f",
-            has_side_effects=False,
-            is_align_stack=False,
-            asm_dialect=llvm.AsmDialect.AD_ATT,
-        )
-    )
-
-
-@dsl_user_op
-def logf(a: float | Float32, *, loc=None, ip=None) -> Float32:
-    return log2f(a, loc=loc, ip=ip) * math.log(2.0)
 
 
 @dsl_user_op
@@ -418,20 +278,20 @@ def fadd_reduce(
         res = cute.make_fragment(x.shape, Float32)
         res.store(x)
         local_sum_0 = (
-            add_packed_f32x2((init_val, 0.0), (res[0], res[1]))
-            # add_packed_f32x2((init_val / 2, init_val / 2), (res[0], res[1]))
+            cute.arch.add_packed_f32x2((init_val, 0.0), (res[0], res[1]))
+            # cute.arch.add_packed_f32x2((init_val / 2, init_val / 2), (res[0], res[1]))
             if const_expr(init_val is not None)
             else (res[0], res[1])
         )
         local_sum = [local_sum_0, (res[2], res[3]), (res[4], res[5]), (res[6], res[7])]
         for i in cutlass.range_constexpr(8, cute.size(x.shape), 8):
-            local_sum[0] = add_packed_f32x2(local_sum[0], (res[i + 0], res[i + 1]))
-            local_sum[1] = add_packed_f32x2(local_sum[1], (res[i + 2], res[i + 3]))
-            local_sum[2] = add_packed_f32x2(local_sum[2], (res[i + 4], res[i + 5]))
-            local_sum[3] = add_packed_f32x2(local_sum[3], (res[i + 6], res[i + 7]))
-        local_sum[0] = add_packed_f32x2(local_sum[0], local_sum[1])
-        local_sum[2] = add_packed_f32x2(local_sum[2], local_sum[3])
-        local_sum[0] = add_packed_f32x2(local_sum[0], local_sum[2])
+            local_sum[0] = cute.arch.add_packed_f32x2(local_sum[0], (res[i + 0], res[i + 1]))
+            local_sum[1] = cute.arch.add_packed_f32x2(local_sum[1], (res[i + 2], res[i + 3]))
+            local_sum[2] = cute.arch.add_packed_f32x2(local_sum[2], (res[i + 4], res[i + 5]))
+            local_sum[3] = cute.arch.add_packed_f32x2(local_sum[3], (res[i + 6], res[i + 7]))
+        local_sum[0] = cute.arch.add_packed_f32x2(local_sum[0], local_sum[1])
+        local_sum[2] = cute.arch.add_packed_f32x2(local_sum[2], local_sum[3])
+        local_sum[0] = cute.arch.add_packed_f32x2(local_sum[0], local_sum[2])
         return local_sum[0][0] + local_sum[0][1]
 
 
@@ -460,24 +320,6 @@ def atomic_add_fp32(a: float | Float32, gmem_ptr: cute.Pointer, *, loc=None, ip=
 @dsl_user_op
 def elem_pointer(x: cute.Tensor, coord: cute.Coord, *, loc=None, ip=None) -> cute.Pointer:
     return x.iterator + cute.crd2idx(coord, x.layout, loc=loc, ip=ip)
-
-
-@dsl_user_op
-def elem_pointer_i64(x: cute.Tensor, coord: cute.Coord, *, loc=None, ip=None) -> cute.Pointer:
-    flat_coord_i64 = tuple(cutlass.Int64(c) for c in cute.flatten(coord))
-    flat_stride = cute.flatten_to_tuple(x.stride)
-    assert len(flat_coord_i64) == len(flat_stride), (
-        "Coordinate and stride must have the same length"
-    )
-    offset = sum(c * s for c, s in zip(flat_coord_i64, flat_stride))
-    # HACK: we assume that applying the offset does not change the pointer alignment
-    byte_offset = offset * x.element_type.width // 8
-    return cute.make_ptr(
-        x.element_type,
-        x.iterator.toint() + byte_offset,
-        x.memspace,
-        assumed_align=x.iterator.alignment,
-    )
 
 
 @cute.jit
@@ -652,7 +494,7 @@ def evaluate_polynomial_2(
     deg = len(poly) - 1
     out = (poly[deg], poly[deg])
     for i in cutlass.range_constexpr(deg - 1, -1, -1):
-        out = fma_packed_f32x2(out, (x, y), (poly[i], poly[i]))
+        out = cute.arch.fma_packed_f32x2(out, (x, y), (poly[i], poly[i]))
     return out
 
 
@@ -733,13 +575,13 @@ def ex2_emulation_2(x: Float32, y: Float32, *, loc=None, ip=None) -> Tuple[Float
     fp32_round_int = float(2**23 + 2**22)
     xy_clamped = (cute.arch.fmax(x, -127.0), cute.arch.fmax(y, -127.0))
     # We want to round down here, so that the fractional part is in [0, 1)
-    xy_rounded = cute.arch.add_packed_f32x2(
-        xy_clamped, (fp32_round_int, fp32_round_int), rnd=nvvm.RoundingModeKind.RM
-    )
+    xy_rounded = cute.arch.add_packed_f32x2(xy_clamped, (fp32_round_int, fp32_round_int), rnd="rm")
     # The integer floor of x & y are now in the last 8 bits of xy_rounded
     # We want the next 2 ops to round to nearest even. The rounding mode is important.
-    xy_rounded_back = sub_packed_f32x2(xy_rounded, (fp32_round_int, fp32_round_int))
-    xy_frac = sub_packed_f32x2(xy_clamped, xy_rounded_back)
+    xy_rounded_back = quack.activation.sub_packed_f32x2(
+        xy_rounded, (fp32_round_int, fp32_round_int)
+    )
+    xy_frac = quack.activation.sub_packed_f32x2(xy_clamped, xy_rounded_back)
     xy_frac_ex2 = evaluate_polynomial_2(*xy_frac, poly_ex2_deg3, loc=loc, ip=ip)
     x_out = combine_int_frac_ex2(xy_rounded[0], xy_frac_ex2[0], loc=loc, ip=ip)
     y_out = combine_int_frac_ex2(xy_rounded[1], xy_frac_ex2[1], loc=loc, ip=ip)
@@ -806,44 +648,6 @@ def domain_offset_aligned(
         assumed_align=tensor.iterator.alignment,
     )
     return cute.make_tensor(new_ptr, tensor.layout)
-
-
-@dsl_user_op
-def domain_offset_i64(coord: cute.Coord, tensor: cute.Tensor, *, loc=None, ip=None) -> cute.Tensor:
-    flat_coord_i64 = tuple(cutlass.Int64(c) for c in cute.flatten(coord))
-    flat_stride = cute.flatten_to_tuple(tensor.stride)
-    assert len(flat_coord_i64) == len(flat_stride), (
-        "Coordinate and stride must have the same length"
-    )
-    offset = sum(c * s for c, s in zip(flat_coord_i64, flat_stride))
-    assert isinstance(tensor.iterator, cute.Pointer)
-    # HACK: we assume that applying the offset does not change the pointer alignment
-    new_ptr = cute.make_ptr(
-        tensor.element_type,
-        tensor.iterator.toint() + offset * tensor.element_type.width // 8,
-        tensor.memspace,
-        assumed_align=tensor.iterator.max_alignment,
-    )
-    return cute.make_tensor(new_ptr, tensor.layout)
-
-
-@dsl_user_op
-def coord_offset_i64(
-    tensor: cute.Tensor, idx: cute.typing.Int, dim: int, *, loc=None, ip=None
-) -> cute.Tensor:
-    offset = cutlass.Int64(idx) * cute.size(tensor.stride[dim])
-    assert isinstance(tensor.iterator, cute.Pointer)
-    # HACK: we assume that applying the offset does not change the pointer alignment
-    new_ptr = cute.make_ptr(
-        tensor.element_type,
-        tensor.iterator.toint() + offset * tensor.element_type.width // 8,
-        tensor.memspace,
-        assumed_align=tensor.iterator.max_alignment,
-    )
-    new_layout = cute.slice_(
-        tensor.layout, (*[None] * dim, 0, *[None] * (cute.rank(tensor) - dim - 1))
-    )
-    return cute.make_tensor(new_ptr, new_layout)
 
 
 @cute.jit

@@ -12,6 +12,7 @@ import cutlass.cute as cute
 from cutlass import Float32
 
 from flash_attn.cute import utils
+from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import copy_utils
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.tile_scheduler import (
@@ -135,17 +136,7 @@ class FlashAttentionBackwardPreprocess:
             if cutlass.const_expr(mLSElog2.element_type not in [Float32]):
                 raise TypeError("LSElog2 tensor must be Float32")
 
-        # Assume all strides are divisible by 128 bits except the last stride
-        new_stride = lambda t: (
-            *(cute.assume(s, divby=128 // t.element_type.width) for s in t.stride[:-1]),
-            t.stride[-1],
-        )
-        mO, mdO, mdQaccum = [
-            cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t)))
-            if t is not None
-            else None
-            for t in (mO, mdO, mdQaccum)
-        ]
+        mO, mdO, mdQaccum = [assume_tensor_aligned(t) for t in (mO, mdO, mdQaccum)]
 
         self._setup_attributes()
 
