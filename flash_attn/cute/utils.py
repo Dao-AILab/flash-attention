@@ -29,14 +29,19 @@ def _compute_base_hash(func: Callable) -> str:
             data = func.__code__.co_code
         else:
             data = repr(func).encode()
+
     hasher = hashlib.sha256(data)
+
     if hasattr(func, "__closure__") and func.__closure__ is not None:
         for cell in func.__closure__:
             hasher.update(repr(cell.cell_contents).encode())
+
     return hasher.hexdigest()
 
 
-def hash_callable(func: Callable, mixer_attrs=_MIXER_ATTRS, set_cute_hash=True) -> str:
+def hash_callable(
+    func: Callable, mixer_attrs: Tuple[str] = _MIXER_ATTRS, set_cute_hash: bool = True
+) -> str:
     """Hash a callable based on the source code or bytecode and closure values.
     Fast-path: if the callable (or its __wrapped__ base) has a ``__cute_hash__``
     attribute, that value is returned immediately as the base hash, then
@@ -49,20 +54,26 @@ def hash_callable(func: Callable, mixer_attrs=_MIXER_ATTRS, set_cute_hash=True) 
     else:
         # Unwrap decorated functions (e.g., cute.jit wrappers).
         base_func = getattr(func, "__wrapped__", func)
+
         if hasattr(base_func, "__cute_hash__"):
             base_hash = base_func.__cute_hash__
         else:
             base_hash = _compute_base_hash(base_func)
+
             if set_cute_hash:
                 base_func.__cute_hash__ = base_hash
 
     # Mix in mutable metadata dunders
     mixer_values = tuple(getattr(func, attr, None) for attr in mixer_attrs)
+
     if all(v is None for v in mixer_values):
         return base_hash
+
     hasher = hashlib.sha256(base_hash.encode())
+
     for attr, val in zip(_MIXER_ATTRS, mixer_values):
         hasher.update(f"{attr}={val!r}".encode())
+
     return hasher.hexdigest()
 
 
