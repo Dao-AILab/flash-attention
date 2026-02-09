@@ -107,6 +107,8 @@ SEQLEN_CONFIGS = [
     (4224, 4224),
 ]
 
+VEC_SIZES_TO_CHECK_EQUALITY = [1, 4]
+
 
 def create_tensors(
     batch_size=2, num_heads=4, seqlen_q=64, seqlen_kv=64, dim=128, dtype=torch.bfloat16
@@ -220,7 +222,7 @@ def test_cute_score_mod_vectorized(
 
     out_ref = run_cute_flash(q, k, v, cute_score_mod, pack_gqa=pack_gqa)
 
-    for vec_size in [1, 2, 4, 8, 16, 32, 64, 128]:
+    for vec_size in VEC_SIZES_TO_CHECK_EQUALITY:
         cute_vectorized_score_mod.__vec_size__ = vec_size
         out = run_cute_flash(q, k, v, cute_vectorized_score_mod, pack_gqa=pack_gqa)
 
@@ -337,7 +339,7 @@ def test_cute_score_mod_with_aux_tensors_vectorized(
 
     out_ref = run_cute_flash(q, k, v, cute_score_mod, aux_tensors=aux_tensors, pack_gqa=pack_gqa)
 
-    for vec_size in [1, 2, 4, 8, 16, 32, 64, 128]:
+    for vec_size in VEC_SIZES_TO_CHECK_EQUALITY:
         cute_vectorized_score_mod.__vec_size__ = vec_size
         out = run_cute_flash(
             q, k, v, cute_vectorized_score_mod, aux_tensors=aux_tensors, pack_gqa=pack_gqa

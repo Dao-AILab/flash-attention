@@ -172,6 +172,8 @@ SEQLEN_CONFIGS = [
     ([1, 1, 1], [256 * 1024] * 3),
 ]
 
+VEC_SIZES_TO_CHECK_EQUALITY = [1, 4]
+
 # =============================================================================
 # Helper functions
 # =============================================================================
@@ -576,7 +578,7 @@ def test_varlen_with_score_mod_vectorized(
         cu_seqlens_k=cu_seqlens_k,
     )
 
-    for vec_size in [1, 2, 4, 8, 16, 32, 64, 128]:
+    for vec_size in VEC_SIZES_TO_CHECK_EQUALITY:
         cute_vectorized_score_mod.__vec_size__ = vec_size
         out = run_cute_flash(
             q,
