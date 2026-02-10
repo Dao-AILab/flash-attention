@@ -8,7 +8,7 @@
 #include "catlass/epilogue/tile/tile_copy.hpp"
 #include "catlass/gemm_coord.hpp"
 #include "catlass/matrix_coord.hpp"
-#include "fai_block.h"
+#include "fa_block.h"
  
 namespace Catlass::Epilogue::Block {
 

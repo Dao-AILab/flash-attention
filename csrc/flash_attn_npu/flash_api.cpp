@@ -1,8 +1,8 @@
 #include <pybind11/pybind11.h>
 #include <torch/extension.h>
 
-#include "fai_kernel.cpp"
-#include "fai_tilingdata.h"
+#include "mha_fwd_kvcache.cpp"
+#include "tilingdata.h"
 #include "torch_npu/csrc/core/npu/NPUStream.h"
 #include "acl/acl.h"
 #include "runtime/rt_ffts.h"
