@@ -17,26 +17,11 @@ from cutlass.cute.runtime import from_dlpack
 
 import quack.activation
 
+_MIXER_ATTRS = ("__vec_size__",)
 
-def hash_callable(func: Callable, set_cute_hash=True) -> str:
-    """Hash a callable based on the source code or bytecode and closure values.
 
-    Fast-path: if the callable (or its __wrapped__ base) has a ``__cute_hash__``
-    attribute, that value is returned immediately. Code-generation backends such
-    as Inductor can set this attribute to avoid expensive runtime hashing.
-
-    set_cute_hash: whether or not to set func.__cute_hash__ if not present
-    """
-    if hasattr(func, "__cute_hash__"):
-        return func.__cute_hash__
-
-    # Unwrap decorated functions (e.g., cute.jit wrappers).
-    if hasattr(func, "__wrapped__"):
-        base_func = func.__wrapped__
-        if hasattr(base_func, "__cute_hash__"):
-            return base_func.__cute_hash__
-        func = base_func
-
+def _compute_base_hash(func: Callable) -> str:
+    """Compute hash from source code or bytecode and closure values."""
     try:
         data = inspect.getsource(func).encode()
     except (OSError, TypeError):
@@ -48,16 +33,48 @@ def hash_callable(func: Callable, set_cute_hash=True) -> str:
     hasher = hashlib.sha256(data)
 
     if hasattr(func, "__closure__") and func.__closure__ is not None:
-        for idx, cell in enumerate(func.__closure__):
-            cell_value = cell.cell_contents
-            hasher.update(repr(cell_value).encode())
+        for cell in func.__closure__:
+            hasher.update(repr(cell.cell_contents).encode())
 
-    hash = hasher.hexdigest()
+    return hasher.hexdigest()
 
-    if set_cute_hash:
-        func.__cute_hash__ = hash
 
-    return hash
+def hash_callable(
+    func: Callable, mixer_attrs: Tuple[str] = _MIXER_ATTRS, set_cute_hash: bool = True
+) -> str:
+    """Hash a callable based on the source code or bytecode and closure values.
+    Fast-path: if the callable (or its __wrapped__ base) has a ``__cute_hash__``
+    attribute, that value is returned immediately as the base hash, then
+    metadata dunders are mixed in to produce the final dict-key hash.
+    set_cute_hash: whether or not to set func.__cute_hash__
+    """
+    # Resolve base hash
+    if hasattr(func, "__cute_hash__"):
+        base_hash = func.__cute_hash__
+    else:
+        # Unwrap decorated functions (e.g., cute.jit wrappers).
+        base_func = getattr(func, "__wrapped__", func)
+
+        if hasattr(base_func, "__cute_hash__"):
+            base_hash = base_func.__cute_hash__
+        else:
+            base_hash = _compute_base_hash(base_func)
+
+            if set_cute_hash:
+                base_func.__cute_hash__ = base_hash
+
+    # Mix in mutable metadata dunders
+    mixer_values = tuple(getattr(func, attr, None) for attr in mixer_attrs)
+
+    if all(v is None for v in mixer_values):
+        return base_hash
+
+    hasher = hashlib.sha256(base_hash.encode())
+
+    for attr, val in zip(_MIXER_ATTRS, mixer_values):
+        hasher.update(f"{attr}={val!r}".encode())
+
+    return hasher.hexdigest()
 
 
 def create_softcap_scoremod(softcap_val):
