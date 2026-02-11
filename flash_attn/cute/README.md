@@ -5,7 +5,7 @@
 1. Clone the repository (if you haven't already):
    ```bash
    git clone https://github.com/Dao-AILab/flash-attention.git
-   cd flash-attention/cute
+   cd flash_attn/cute
    ```
 
 2. Install in editable mode with dev dependencies:
