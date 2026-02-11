@@ -220,11 +220,6 @@ def _flash_attn_fwd(
         softmax_scale = 1.0 / math.sqrt(head_dim)
     if softcap == 0.0:
         softcap = None
-    # Normalize -1 (standard "no window" convention) to None (cute path convention)
-    if window_size_left is not None and window_size_left < 0:
-        window_size_left = None
-    if window_size_right is not None and window_size_right < 0:
-        window_size_right = None
     qhead_per_kvhead = num_head // num_head_kv
     if pack_gqa is None:
         pack_gqa = qhead_per_kvhead > 1
@@ -265,6 +260,11 @@ def _flash_attn_fwd(
     if mask_mod is None:
         if causal:
             window_size_right = 0
+        # Normalize -1 (standard "no window" convention) to None (cute path convention)
+        if window_size_left is not None and window_size_left < 0:
+            window_size_left = None
+        if window_size_right is not None and window_size_right < 0:
+            window_size_right = None
         local = window_size_left is not None or window_size_right is not None
         if window_size_left is not None or window_size_right is not None:
             if window_size_left is None and window_size_right == 0:
@@ -654,13 +654,13 @@ def _flash_attn_bwd(
     num_head_kv = k.shape[-2]
     head_dim_v = v.shape[-1]
 
+    if causal:
+        window_size_right = 0
     # Normalize -1 (standard "no window" convention) to None (cute path convention)
     if window_size_left is not None and window_size_left < 0:
         window_size_left = None
     if window_size_right is not None and window_size_right < 0:
         window_size_right = None
-    if causal:
-        window_size_right = 0
     local = window_size_left is not None or window_size_right is not None
     if local:
         if window_size_left is None and window_size_right == 0:

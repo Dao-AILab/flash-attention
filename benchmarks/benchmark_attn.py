@@ -325,24 +325,10 @@ for headdim in [128]:
         else:
             page_table = None
 
-        # for causal in [False, True]:
+        for causal in [False, True]:
         # for causal in [True]:
-        for mode in ["non_causal", "causal", "local"]:
-            if mode == "non_causal":
-                causal = False
-                window_size = (None, None)
-                window_size_fa = (-1, -1)
-            elif mode == "causal":
-                causal = True
-                window_size = (None, None)
-                window_size_fa = (-1, -1)
-            else:  # local
-                causal = False
-                window_size = (seqlen // 2 - 1, 0)
-                window_size_fa = (seqlen // 2 - 1, 0)
-            print(f"\n### {headdim = }, {mode = }, {causal = }, {window_size = }, {seqlen = }, {batch_size = }, {nheads = }, {nheads_kv = }, {varlen = }, {deterministic = } ###")
-            # For local attention, use causal=False in flops calculation since it's window-based, not causal
-            nFLOPS = flops(batch_size, nheads, seqlen_q, seqlen, headdim if not has_qv else headdim + headdim_v, headdim_v, causal=False if mode == "local" else causal, window_size=window_size)
+            print(f"\n### {headdim = }, {causal = }, {seqlen = }, {batch_size = }, {nheads = }, {nheads_kv = }, {varlen = }, {deterministic = } ###")
+            nFLOPS = flops(batch_size, nheads, seqlen_q, seqlen, headdim if not has_qv else headdim + headdim_v, headdim_v, causal=causal, window_size=window_size)
             if cudnn is not None:
             # if False:
                 if headdim <= 256 and dtype != torch.float8_e4m3fn:
