@@ -46,8 +46,8 @@ INCREASED_TRIALS = False
 @pytest.mark.parametrize("deterministic", [True])
 # @pytest.mark.parametrize("softcap", [0.0, 15.0])
 @pytest.mark.parametrize("softcap", [0.0])
-@pytest.mark.parametrize("local", [False, True])
-# @pytest.mark.parametrize("local", [False])
+@pytest.mark.parametrize("local_enum", [0, 1, 2, 3])
+# @pytest.mark.parametrize("local_enum", [0])
 # @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("d", [64, 128])
@@ -65,7 +65,7 @@ def test_flash_attn_output(
     seqlen_k,
     d,
     causal,
-    local,
+    local_enum,
     softcap,
     deterministic,
     has_qv,
@@ -73,6 +73,7 @@ def test_flash_attn_output(
     mha_type,
     dtype,
 ):
+    local = local_enum > 0
     if local and causal:
         pytest.skip()
     device = "cuda"
@@ -131,6 +132,10 @@ def test_flash_attn_output(
         window_size = (
             (None, None) if not local else torch.randint(0, seqlen_k, (2,)).tolist()
         )
+        if local_enum == 2:
+            window_size = (None, -window_size[1])
+        elif local_enum == 3:
+            window_size = (-window_size[0], None)
         if local:
             print("window size = ", window_size)
         if has_learnable_sink:
