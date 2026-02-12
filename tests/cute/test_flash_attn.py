@@ -47,8 +47,8 @@ VERBOSE = True
 @pytest.mark.parametrize("deterministic", [False])
 # @pytest.mark.parametrize("softcap", [0.0, 15.0])
 @pytest.mark.parametrize("softcap", [0.0])
-@pytest.mark.parametrize("local_enum", [0, 1, 2, 3])
-# @pytest.mark.parametrize("local_enum", [0])
+@pytest.mark.parametrize("local", [False, True])
+# @pytest.mark.parametrize("local", [False])
 @pytest.mark.parametrize("causal", [False, True])
 # @pytest.mark.parametrize("causal", [False])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
@@ -96,7 +96,7 @@ def test_flash_attn_output(
     seqlen_k,
     d,
     causal,
-    local_enum,
+    local,
     softcap,
     deterministic,
     has_qv,
@@ -104,7 +104,6 @@ def test_flash_attn_output(
     mha_type,
     dtype,
 ):
-    local = local_enum > 0
     if local and causal:
         pytest.skip()
     device = "cuda"
@@ -162,13 +161,8 @@ def test_flash_attn_output(
         window_size = (
             (None, None) if not local else torch.randint(0, seqlen_k, (2,)).tolist()
         )
-        if local_enum == 2:
-            window_size = (None, -window_size[1])
-        elif local_enum == 3:
-            window_size = (-window_size[0], None)
         if local:
             print("window size = ", window_size)
-        # window_size = (-1, -1) if not local else (16, 0)
         if has_learnable_sink:
             learnable_sink = torch.randn(nheads, dtype=torch.bfloat16, device=device)
         else:
