@@ -620,7 +620,7 @@ def test_single_doc_bwd_minimal():
         cu_seqlens_q=None, cu_seqlens_k=None,
         seqused_q=None, seqused_k=None, page_table=None,
         causal=False, softcap=None,
-        window_size_left=None, window_size_right=None,
+        window_size_left=-1, window_size_right=-1,
         m_block_size=tile_m, n_block_size=tile_n, pack_gqa=False,
         _compute_capability=None, score_mod=None,
         mask_mod=mask_mod_cute,
@@ -1267,7 +1267,7 @@ def test_gqa_block_sparse_broadcast_pattern_recompilation():
         out_tuple = _flash_attn_fwd(
             q=q, k=k, v=v, out=out, lse=lse,
             softmax_scale=softmax_scale, causal=False,
-            window_size_left=None, window_size_right=None,
+            window_size_left=-1, window_size_right=-1,
             m_block_size=tile_m, n_block_size=tile_n, pack_gqa=False,
             mask_mod=mask_mod_cute, block_sparse_tensors=block_sparse_fwd,
             return_lse=True,

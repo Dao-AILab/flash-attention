@@ -168,6 +168,7 @@ def test_flash_attn_output(
             window_size = (-window_size[0], None)
         if local:
             print("window size = ", window_size)
+        # window_size = (-1, -1) if not local else (16, 0)
         if has_learnable_sink:
             learnable_sink = torch.randn(nheads, dtype=torch.bfloat16, device=device)
         else:
