@@ -39,6 +39,10 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 
+print(f"\n[FlashAttention Build] PyTorch version: {torch.__version__}")
+print(f"[FlashAttention Build] CUDA version: {torch.version.cuda}")
+print(f"[FlashAttention Build] CXX11 ABI: {torch._C._GLIBCXX_USE_CXX11_ABI}\n")
+
 if BUILD_TARGET == "auto":
     if IS_HIP_EXTENSION:
         IS_ROCM = True
