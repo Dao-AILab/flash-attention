@@ -33,7 +33,7 @@ import cutlass.cute as cute
 from flash_attn.cute import utils
 from flash_attn.cute.cute_dsl_utils import to_cute_tensor
 from flash_attn.cute.flash_fwd import FlashAttentionForwardSm90
-from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
+from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100, DescaleTensors
 from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
 from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
 from flash_attn.cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
@@ -437,6 +437,17 @@ def _flash_attn_fwd(
             if v_descale is not None
             else None
         )
+        descale_tensors_tensor = (
+            DescaleTensors(
+                q_descale=q_descale_tensor,
+                k_descale=k_descale_tensor,
+                v_descale=v_descale_tensor,
+            )
+            if q_descale_tensor is not None
+            or k_descale_tensor is not None
+            or v_descale_tensor is not None
+            else None
+        )
 
         sparse_tensors = None
         if block_sparse_tensors is not None:
@@ -529,7 +540,7 @@ def _flash_attn_fwd(
             learnable_sink_tensor,
         ]
         if compute_capability == 10:
-            compile_args.extend([q_descale_tensor, k_descale_tensor, v_descale_tensor])
+            compile_args.append(descale_tensors_tensor)
         compile_args.extend([sparse_tensors, cute_aux_tensors])
         _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
             *compile_args,
@@ -555,6 +566,11 @@ def _flash_attn_fwd(
         q_call = q.view(torch.uint8)
         k_call = k.view(torch.uint8)
         v_call = v.view(torch.uint8)
+    descale_tensors = (
+        DescaleTensors(q_descale=q_descale, k_descale=k_descale, v_descale=v_descale)
+        if q_descale is not None or k_descale is not None or v_descale is not None
+        else None
+    )
 
     call_args = [
         q_call,
@@ -574,7 +590,7 @@ def _flash_attn_fwd(
         learnable_sink,
     ]
     if compute_capability == 10:
-        call_args.extend([q_descale, k_descale, v_descale])
+        call_args.append(descale_tensors)
     call_args.extend([normalized_block_sparse_tensors, aux_tensors])
     _flash_attn_fwd.compile_cache[compile_key](*call_args)
     if is_split_kv:

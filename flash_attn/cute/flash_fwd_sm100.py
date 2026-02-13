@@ -15,7 +15,7 @@
 
 import enum
 import math
-from typing import Type, Tuple, Callable, Optional, Literal
+from typing import Type, Tuple, Callable, Optional, Literal, NamedTuple
 from functools import partial
 
 import cuda.bindings.driver as cuda
@@ -63,6 +63,15 @@ class NamedBarrierFwd(enum.IntEnum):
 #     WarpSchedulerWG3 = enum.auto()
 #     PFull = enum.auto()
 #     PEmpty = enum.auto()
+
+
+class DescaleTensors(NamedTuple):
+    q_descale: Optional[cute.Tensor] = None
+    k_descale: Optional[cute.Tensor] = None
+    v_descale: Optional[cute.Tensor] = None
+
+    def __new_from_mlir_values__(self, values):
+        return DescaleTensors(*((*values, None, None, None)[:3]))
 
 
 class FlashAttentionForwardSm100:
@@ -268,9 +277,7 @@ class FlashAttentionForwardSm100:
         window_size_left: Int32 | int | None = None,
         window_size_right: Int32 | int | None = None,
         learnable_sink: Optional[cute.Tensor] = None,
-        mQDescale: Optional[cute.Tensor] = None,
-        mKDescale: Optional[cute.Tensor] = None,
-        mVDescale: Optional[cute.Tensor] = None,
+        descale_tensors: Optional[DescaleTensors] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors: Optional[list] = None,
     ):
@@ -703,9 +710,7 @@ class FlashAttentionForwardSm100:
             window_size_left,
             window_size_right,
             learnable_sink,
-            mQDescale,
-            mKDescale,
-            mVDescale,
+            descale_tensors,
             blocksparse_tensors,
             sQ_layout,
             sK_layout,
@@ -751,9 +756,7 @@ class FlashAttentionForwardSm100:
         window_size_left: Optional[Int32],
         window_size_right: Optional[Int32],
         learnable_sink: Optional[cute.Tensor],
-        mQDescale: Optional[cute.Tensor],
-        mKDescale: Optional[cute.Tensor],
-        mVDescale: Optional[cute.Tensor],
+        descale_tensors: Optional[DescaleTensors],
         blocksparse_tensors: Optional[BlockSparseTensors],
         sQ_layout: cute.ComposedLayout,
         sK_layout: cute.ComposedLayout,
@@ -1056,8 +1059,7 @@ class FlashAttentionForwardSm100:
                 self.softmax_loop,
                 softmax_scale_log2=softmax_scale_log2,
                 softmax_scale=softmax_scale,
-                mQDescale=mQDescale,
-                mKDescale=mKDescale,
+                descale_tensors=descale_tensors,
                 thr_mma_qk=thr_mma_qk,
                 sScale=sScale,
                 mLSE=mLSE,
@@ -1110,9 +1112,7 @@ class FlashAttentionForwardSm100:
                 mLSE,
                 sO,
                 learnable_sink,
-                mQDescale,
-                mKDescale,
-                mVDescale,
+                descale_tensors,
                 gmem_tiled_copy_O,
                 tma_atom_O,
                 mbar_ptr,
@@ -1563,8 +1563,7 @@ class FlashAttentionForwardSm100:
         stage: int | Int32,
         softmax_scale_log2: Float32,
         softmax_scale: Float32 | None,
-        mQDescale: Optional[cute.Tensor],
-        mKDescale: Optional[cute.Tensor],
+        descale_tensors: Optional[DescaleTensors],
         thr_mma_qk: cute.core.ThrMma,
         tStSi: cute.Tensor,
         sScale: cute.Tensor,
@@ -1698,12 +1697,18 @@ class FlashAttentionForwardSm100:
             else:
                 mask_fn_none = None
 
+            q_descale_tensor = (
+                descale_tensors.q_descale if cutlass.const_expr(descale_tensors is not None) else None
+            )
+            k_descale_tensor = (
+                descale_tensors.k_descale if cutlass.const_expr(descale_tensors is not None) else None
+            )
             q_descale = Float32(1.0)
             k_descale = Float32(1.0)
-            if cutlass.const_expr(mQDescale is not None):
-                q_descale = Float32(mQDescale[batch_idx, kv_head_idx])
-            if cutlass.const_expr(mKDescale is not None):
-                k_descale = Float32(mKDescale[batch_idx, kv_head_idx])
+            if cutlass.const_expr(q_descale_tensor is not None):
+                q_descale = Float32(q_descale_tensor[batch_idx, kv_head_idx])
+            if cutlass.const_expr(k_descale_tensor is not None):
+                k_descale = Float32(k_descale_tensor[batch_idx, kv_head_idx])
             qk_descale = q_descale * k_descale
 
             max_offset = 8 if cutlass.const_expr(self.q_dtype.width == 8) else 0
@@ -2032,9 +2037,7 @@ class FlashAttentionForwardSm100:
         mLSE: cute.Tensor,
         sO: cute.Tensor,
         learnable_sink: Optional[cute.Tensor],
-        mQDescale: Optional[cute.Tensor],
-        mKDescale: Optional[cute.Tensor],
-        mVDescale: Optional[cute.Tensor],
+        descale_tensors: Optional[DescaleTensors],
         gmem_tiled_copy_O: cute.TiledCopy,
         tma_atom_O: cute.CopyAtom,
         mbar_ptr: cute.Pointer,
@@ -2075,20 +2078,29 @@ class FlashAttentionForwardSm100:
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             kv_head_idx = self._kv_head_idx(head_idx)
+            q_descale_tensor = (
+                descale_tensors.q_descale if cutlass.const_expr(descale_tensors is not None) else None
+            )
+            k_descale_tensor = (
+                descale_tensors.k_descale if cutlass.const_expr(descale_tensors is not None) else None
+            )
+            v_descale_tensor = (
+                descale_tensors.v_descale if cutlass.const_expr(descale_tensors is not None) else None
+            )
             if const_expr(self.score_mod is None):
                 q_descale = Float32(1.0)
                 k_descale = Float32(1.0)
-                if cutlass.const_expr(mQDescale is not None):
-                    q_descale = Float32(mQDescale[batch_idx, kv_head_idx])
-                if cutlass.const_expr(mKDescale is not None):
-                    k_descale = Float32(mKDescale[batch_idx, kv_head_idx])
+                if cutlass.const_expr(q_descale_tensor is not None):
+                    q_descale = Float32(q_descale_tensor[batch_idx, kv_head_idx])
+                if cutlass.const_expr(k_descale_tensor is not None):
+                    k_descale = Float32(k_descale_tensor[batch_idx, kv_head_idx])
                 softmax_scale_log2_eff = softmax_scale_log2 * (q_descale * k_descale)
             else:
                 softmax_scale_log2_eff = softmax_scale_log2
 
             v_descale = Float32(1.0)
-            if cutlass.const_expr(mVDescale is not None):
-                v_descale = Float32(mVDescale[batch_idx, kv_head_idx])
+            if cutlass.const_expr(v_descale_tensor is not None):
+                v_descale = Float32(v_descale_tensor[batch_idx, kv_head_idx])
 
             max_offset = Float32(8.0) if cutlass.const_expr(self.q_dtype.width == 8) else Float32(0.0)
             max_offset_scale = (
