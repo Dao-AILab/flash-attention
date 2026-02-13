@@ -668,11 +668,6 @@ class FlashAttentionBackwardSm90:
                     qhead_per_kvhead_divmod,
                 )
             if warp_idx == 1:
-                for warp_group_idx in cutlass.range(self.num_mma_warp_groups):
-                    cute.arch.barrier_arrive(
-                        barrier_id=int(NamedBarrierBwd.dQEmptyWG0) + warp_group_idx,
-                        number_of_threads=self.num_threads_per_warp_group + cute.arch.WARP_SIZE,
-                    )
                 self.dQaccum_store(
                     mdQaccum,
                     sdQaccum,
@@ -1606,6 +1601,16 @@ class FlashAttentionBackwardSm90:
                         m_block_safe = m_block
 
                         for warp_group_idx in cutlass.range_constexpr(self.num_mma_warp_groups):
+                            cute.arch.cp_async_bulk_wait_group(
+                                self.num_mma_warp_groups - 1 - warp_group_idx, read=True
+                            )
+                            cute.arch.barrier_arrive(
+                                barrier_id=int(NamedBarrierBwd.dQEmptyWG0) + warp_group_idx,
+                                number_of_threads=self.num_threads_per_warp_group
+                                + cute.arch.WARP_SIZE,
+                            )
+
+                        for warp_group_idx in cutlass.range_constexpr(self.num_mma_warp_groups):
                             cute.arch.barrier(
                                 barrier_id=int(NamedBarrierBwd.dQFullWG0) + warp_group_idx,
                                 number_of_threads=self.num_threads_per_warp_group
@@ -1618,15 +1623,6 @@ class FlashAttentionBackwardSm90:
                                     self.tma_copy_bytes["dQ"],
                                 )
                             cute.arch.cp_async_bulk_commit_group()
-                        for warp_group_idx in cutlass.range_constexpr(self.num_mma_warp_groups):
-                            cute.arch.cp_async_bulk_wait_group(
-                                self.num_mma_warp_groups - 1 - warp_group_idx, read=True
-                            )
-                            cute.arch.barrier_arrive(
-                                barrier_id=int(NamedBarrierBwd.dQEmptyWG0) + warp_group_idx,
-                                number_of_threads=self.num_threads_per_warp_group
-                                + cute.arch.WARP_SIZE,
-                            )
                 else:
                     dQaccum_store_block_sparse_bwd_sm90(
                         blocksparse_tensors,
@@ -1643,3 +1639,5 @@ class FlashAttentionBackwardSm90:
                     )
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
+
+        cute.arch.cp_async_bulk_wait_group(0, read=True)
