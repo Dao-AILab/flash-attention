@@ -58,9 +58,7 @@ def attention_pytorch(qkv: torch.Tensor, causal: bool) -> torch.Tensor:
     q = rearrange(q, "b t h d -> (b h) t d")
     k = rearrange(k, "b s h d -> (b h) d s")
     softmax_scale = 1.0 / math.sqrt(d)
-    scores = torch.empty(
-        batch_size * nheads, seqlen, seqlen, dtype=qkv.dtype, device=qkv.device
-    )
+    scores = torch.empty(batch_size * nheads, seqlen, seqlen, dtype=qkv.dtype, device=qkv.device)
     scores = rearrange(
         torch.baddbmm(scores, q, k, beta=0, alpha=softmax_scale), "(b h) t s -> b h t s", h=nheads
     )
@@ -130,7 +128,12 @@ def cudnn_sdpa_fp8_setup(qkv: torch.Tensor, seqlen_q: int, seqlen_k: int, causal
         [seqlen_q * nheads * headdim * 3, headdim, headdim * nheads * 3, 1],
         storage_offset=0,
     )
-    q = graph.tensor(name="Q", dim=list(new_q.shape), stride=list(new_q.stride()), data_type=convert_to_cudnn_type(qkv.dtype))
+    q = graph.tensor(
+        name="Q",
+        dim=list(new_q.shape),
+        stride=list(new_q.stride()),
+        data_type=convert_to_cudnn_type(qkv.dtype),
+    )
 
     new_k = torch.as_strided(
         qkv,
@@ -138,7 +141,12 @@ def cudnn_sdpa_fp8_setup(qkv: torch.Tensor, seqlen_q: int, seqlen_k: int, causal
         [seqlen_k * nheads * headdim * 3, headdim, headdim * nheads * 3, 1],
         storage_offset=nheads * headdim,
     )
-    k = graph.tensor(name="K", dim=list(new_k.shape), stride=list(new_k.stride()), data_type=convert_to_cudnn_type(qkv.dtype))
+    k = graph.tensor(
+        name="K",
+        dim=list(new_k.shape),
+        stride=list(new_k.stride()),
+        data_type=convert_to_cudnn_type(qkv.dtype),
+    )
 
     new_v = torch.as_strided(
         qkv,
@@ -146,7 +154,12 @@ def cudnn_sdpa_fp8_setup(qkv: torch.Tensor, seqlen_q: int, seqlen_k: int, causal
         [seqlen_k * nheads * headdim * 3, headdim, headdim * nheads * 3, 1],
         storage_offset=nheads * headdim * 2,
     )
-    v = graph.tensor(name="V", dim=list(new_v.shape), stride=list(new_v.stride()), data_type=convert_to_cudnn_type(qkv.dtype))
+    v = graph.tensor(
+        name="V",
+        dim=list(new_v.shape),
+        stride=list(new_v.stride()),
+        data_type=convert_to_cudnn_type(qkv.dtype),
+    )
 
     def _scale_tensor():
         return graph.tensor(dim=[1, 1, 1, 1], stride=[1, 1, 1, 1], data_type=cudnn.data_type.FLOAT)
@@ -251,9 +264,8 @@ def main(argv: Iterable[str] | None = None) -> int:
     headdim_vals = _parse_int_list(args.headdims)
     bs_seqlen_vals = [(32, 512), (16, 1024), (8, 2048), (4, 4096), (2, 8192), (1, 16384)]
 
-    methods = (
-        ["Pytorch", "FA4-CuTe-BF16", "FA4-CuTe-FP8"]
-        + (["cuDNN-FP8"] if args.run_cudnn and cudnn is not None else [])
+    methods = ["Pytorch", "FA4-CuTe-BF16", "FA4-CuTe-FP8"] + (
+        ["cuDNN-FP8"] if args.run_cudnn and cudnn is not None else []
     )
 
     fp8_failures = []
@@ -266,9 +278,15 @@ def main(argv: Iterable[str] | None = None) -> int:
                 if args.dim % headdim != 0:
                     raise ValueError(f"--dim must be divisible by headdim ({args.dim=} {headdim=})")
 
-                q_bf16 = torch.randn(batch, seqlen, nheads, headdim, device=device, dtype=torch.bfloat16)
-                k_bf16 = torch.randn(batch, seqlen, nheads, headdim, device=device, dtype=torch.bfloat16)
-                v_bf16 = torch.randn(batch, seqlen, nheads, headdim, device=device, dtype=torch.bfloat16)
+                q_bf16 = torch.randn(
+                    batch, seqlen, nheads, headdim, device=device, dtype=torch.bfloat16
+                )
+                k_bf16 = torch.randn(
+                    batch, seqlen, nheads, headdim, device=device, dtype=torch.bfloat16
+                )
+                v_bf16 = torch.randn(
+                    batch, seqlen, nheads, headdim, device=device, dtype=torch.bfloat16
+                )
                 qkv_bf16 = torch.stack([q_bf16, k_bf16, v_bf16], dim=2)
 
                 times = {}
@@ -328,9 +346,15 @@ def main(argv: Iterable[str] | None = None) -> int:
                 if args.check and args.check_quantization_only:
                     try:
                         # Dequantize FP8 inputs back to BF16 (applying descales)
-                        q_ref_fp8 = (q_fp8.to(torch.bfloat16) * q_descale[:, None, :, None]).to(torch.bfloat16)
-                        k_ref_fp8 = (k_fp8.to(torch.bfloat16) * k_descale[:, None, :, None]).to(torch.bfloat16)
-                        v_ref_fp8 = (v_fp8.to(torch.bfloat16) * v_descale[:, None, :, None]).to(torch.bfloat16)
+                        q_ref_fp8 = (q_fp8.to(torch.bfloat16) * q_descale[:, None, :, None]).to(
+                            torch.bfloat16
+                        )
+                        k_ref_fp8 = (k_fp8.to(torch.bfloat16) * k_descale[:, None, :, None]).to(
+                            torch.bfloat16
+                        )
+                        v_ref_fp8 = (v_fp8.to(torch.bfloat16) * v_descale[:, None, :, None]).to(
+                            torch.bfloat16
+                        )
                         qkv_ref_fp8 = torch.stack([q_ref_fp8, k_ref_fp8, v_ref_fp8], dim=2)
                         out_ref_fp8 = attention_pytorch(qkv_ref_fp8, causal=causal)
                     except RuntimeError as e:
