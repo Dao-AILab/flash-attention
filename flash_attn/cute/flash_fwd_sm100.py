@@ -1703,21 +1703,29 @@ class FlashAttentionForwardSm100:
             k_descale_tensor = (
                 descale_tensors.k_descale if cutlass.const_expr(descale_tensors is not None) else None
             )
-            q_descale = Float32(1.0)
-            k_descale = Float32(1.0)
-            if cutlass.const_expr(q_descale_tensor is not None):
-                q_descale = Float32(q_descale_tensor[batch_idx, kv_head_idx])
-            if cutlass.const_expr(k_descale_tensor is not None):
-                k_descale = Float32(k_descale_tensor[batch_idx, kv_head_idx])
-            qk_descale = q_descale * k_descale
+            has_qk_descale = q_descale_tensor is not None or k_descale_tensor is not None
+            if cutlass.const_expr(has_qk_descale):
+                q_descale = Float32(1.0)
+                k_descale = Float32(1.0)
+                if cutlass.const_expr(q_descale_tensor is not None):
+                    q_descale = Float32(q_descale_tensor[batch_idx, kv_head_idx])
+                if cutlass.const_expr(k_descale_tensor is not None):
+                    k_descale = Float32(k_descale_tensor[batch_idx, kv_head_idx])
+                qk_descale = q_descale * k_descale
 
             max_offset = 8 if cutlass.const_expr(self.q_dtype.width == 8) else 0
             if const_expr(self.score_mod is None):
-                softmax_scale_log2_eff = softmax_scale_log2 * qk_descale
+                if cutlass.const_expr(has_qk_descale):
+                    softmax_scale_log2_eff = softmax_scale_log2 * qk_descale
+                else:
+                    softmax_scale_log2_eff = softmax_scale_log2
                 softmax_scale_eff = None
             else:
                 softmax_scale_log2_eff = softmax_scale_log2
-                softmax_scale_eff = softmax_scale * qk_descale
+                if cutlass.const_expr(has_qk_descale):
+                    softmax_scale_eff = softmax_scale * qk_descale
+                else:
+                    softmax_scale_eff = softmax_scale
 
             softmax = SoftmaxSm100.create(
                 softmax_scale_log2_eff,
@@ -2087,19 +2095,23 @@ class FlashAttentionForwardSm100:
             v_descale_tensor = (
                 descale_tensors.v_descale if cutlass.const_expr(descale_tensors is not None) else None
             )
+            has_qk_descale = q_descale_tensor is not None or k_descale_tensor is not None
             if const_expr(self.score_mod is None):
-                q_descale = Float32(1.0)
-                k_descale = Float32(1.0)
-                if cutlass.const_expr(q_descale_tensor is not None):
-                    q_descale = Float32(q_descale_tensor[batch_idx, kv_head_idx])
-                if cutlass.const_expr(k_descale_tensor is not None):
-                    k_descale = Float32(k_descale_tensor[batch_idx, kv_head_idx])
-                softmax_scale_log2_eff = softmax_scale_log2 * (q_descale * k_descale)
+                if cutlass.const_expr(has_qk_descale):
+                    q_descale = Float32(1.0)
+                    k_descale = Float32(1.0)
+                    if cutlass.const_expr(q_descale_tensor is not None):
+                        q_descale = Float32(q_descale_tensor[batch_idx, kv_head_idx])
+                    if cutlass.const_expr(k_descale_tensor is not None):
+                        k_descale = Float32(k_descale_tensor[batch_idx, kv_head_idx])
+                    softmax_scale_log2_eff = softmax_scale_log2 * (q_descale * k_descale)
+                else:
+                    softmax_scale_log2_eff = softmax_scale_log2
             else:
                 softmax_scale_log2_eff = softmax_scale_log2
 
-            v_descale = Float32(1.0)
-            if cutlass.const_expr(v_descale_tensor is not None):
+            has_v_descale = v_descale_tensor is not None
+            if cutlass.const_expr(has_v_descale):
                 v_descale = Float32(v_descale_tensor[batch_idx, kv_head_idx])
 
             max_offset = Float32(8.0) if cutlass.const_expr(self.q_dtype.width == 8) else Float32(0.0)
@@ -2217,7 +2229,8 @@ class FlashAttentionForwardSm100:
                     acc_O_mn_row_is_zero_or_nan = row_sum == 0.0 or row_sum != row_sum
                     stats[stage] = (row_sum, row_max, acc_O_mn_row_is_zero_or_nan)
                     scale = cute.arch.rcp_approx(row_sum if not acc_O_mn_row_is_zero_or_nan else 1.0)
-                    scale = scale * v_descale
+                    if cutlass.const_expr(has_v_descale):
+                        scale = scale * v_descale
                     cute.arch.mbarrier_wait(
                         mbar_ptr + self.mbar_O_full_offset + stage, o_corr_consumer_phase
                     )
