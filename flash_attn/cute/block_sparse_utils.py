@@ -700,7 +700,8 @@ def handle_block_sparse_empty_tile_correction_sm100(
                     row_sum_value = max_offset_scale
                 else:
                     row_sum_value = row_sum_value + cute.math.exp2(
-                        sink_val * LOG2_E - row_max_value * softmax_scale_log2 + max_offset, fastmath=True
+                        sink_val * LOG2_E - row_max_value * softmax_scale_log2 + max_offset,
+                        fastmath=True,
                     )
         if tidx < m_block_size:
             scale_row_idx = tidx + stage * m_block_size
