@@ -24,12 +24,12 @@ from flash_attn.cute.blackwell_helpers import gemm_w_idx, gemm_ptx_w_idx  # noqa
 from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
+from quack.cute_dsl_utils import ParamsBase
 from flash_attn.cute.tile_scheduler import (
     TileSchedulerArguments,
     SingleTileScheduler,
     SingleTileLPTBwdScheduler,  # noqa
     SingleTileVarlenScheduler,
-    ParamsBase,
 )
 
 from flash_attn.cute import barrier

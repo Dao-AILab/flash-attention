@@ -16,8 +16,8 @@ from quack import copy_utils
 from flash_attn.cute import utils
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
+from quack.cute_dsl_utils import ParamsBase
 from flash_attn.cute.tile_scheduler import (
-    ParamsBase,
     SingleTileScheduler,
     SingleTileVarlenScheduler,
     TileSchedulerArguments,

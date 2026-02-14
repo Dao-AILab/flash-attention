@@ -23,8 +23,8 @@ from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import ampere_helpers as sm80_utils
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
+from quack.cute_dsl_utils import ParamsBase
 from flash_attn.cute.tile_scheduler import (
-    ParamsBase,
     SingleTileScheduler,
     SingleTileVarlenScheduler,
     TileSchedulerArguments,

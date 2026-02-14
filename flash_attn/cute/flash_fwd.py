@@ -39,12 +39,12 @@ from flash_attn.cute.block_sparse_utils import (
 from flash_attn.cute import pipeline
 from flash_attn.cute.pack_gqa import PackGQA
 from flash_attn.cute.named_barrier import NamedBarrierFwd
+from quack.cute_dsl_utils import ParamsBase
 from flash_attn.cute.tile_scheduler import (
     TileSchedulerArguments,
     SingleTileScheduler,
     SingleTileLPTScheduler,
     SingleTileVarlenScheduler,
-    ParamsBase,
 )
 from cutlass.cute import FastDivmodDivisor
 

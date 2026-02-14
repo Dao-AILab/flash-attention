@@ -23,7 +23,8 @@ from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute import pipeline
-from flash_attn.cute.tile_scheduler import TileSchedulerArguments, SingleTileScheduler, ParamsBase
+from quack.cute_dsl_utils import ParamsBase
+from flash_attn.cute.tile_scheduler import TileSchedulerArguments, SingleTileScheduler
 from flash_attn.cute.named_barrier import NamedBarrierBwd
 from flash_attn.cute.softmax import apply_score_mod_inner, apply_score_mod_bwd_inner
 from flash_attn.cute.block_sparsity import BlockSparseTensors
