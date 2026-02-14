@@ -14,12 +14,12 @@ from cutlass.cute.nvgpu import cpasync, warp, warpgroup
 from cutlass import Float32, const_expr
 from cutlass.utils import LayoutEnum
 
+from quack import copy_utils
 from quack import layout_utils
 from quack import sm90_utils
 
 from flash_attn.cute import utils
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
-from flash_attn.cute import copy_utils
 from flash_attn.cute import ampere_helpers as sm80_utils
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
@@ -172,8 +172,10 @@ class FlashAttentionBackwardPostprocess:
                 (self.tile_m * self.tile_hdim // dQaccum_reduce_stage, dQaccum_reduce_stage)
             )
 
+        num_copy_elems = 128 // self.dtype.width
+        threads_per_row = self.tile_hdim // num_copy_elems
         self.gmem_tiled_copy_dQ = copy_utils.tiled_copy_2d(
-            self.dtype, self.tile_hdim, self.num_threads
+            self.dtype, threads_per_row, self.num_threads, num_copy_elems
         )
         # ///////////////////////////////////////////////////////////////////////////////
         # Shared memory layout: dQ

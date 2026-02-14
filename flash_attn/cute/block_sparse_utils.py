@@ -12,9 +12,10 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, const_expr
 
+from quack import copy_utils
+
 # Import data structures from block_sparsity
 from flash_attn.cute.block_sparsity import BlockSparseTensors
-from flash_attn.cute import copy_utils
 from flash_attn.cute.named_barrier import NamedBarrierBwd
 
 
