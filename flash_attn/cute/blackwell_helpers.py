@@ -12,7 +12,7 @@ from flash_attn.cute.utils import parse_swizzle_from_pointer
 
 
 def _tcgen05_mma_kind(op: cute.nvgpu.tcgen05.mma.MmaOp) -> str:
-    if isinstance(op, (tcgen05.mma.MmaF16BF16Op, tcgen05.mma.MmaF16BF16SparseOp)):
+    if isinstance(op, tcgen05.mma.MmaF16BF16Op):
         return "f16"
     if isinstance(op, tcgen05.mma.MmaTF32Op):
         return "tf32"

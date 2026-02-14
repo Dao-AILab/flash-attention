@@ -14,7 +14,6 @@ from cutlass import Float32, Int32, const_expr
 
 # Import data structures from block_sparsity
 from flash_attn.cute.block_sparsity import BlockSparseTensors
-from flash_attn.cute import utils
 from flash_attn.cute import copy_utils
 from flash_attn.cute.named_barrier import NamedBarrierBwd
 
@@ -119,11 +118,15 @@ def finish_overlap_v_load(
 def sparse_tensor_m_block(
     m_block,
     qhead_per_kvhead: cutlass.Constexpr[int],
+    q_subtile_factor: cutlass.Constexpr[int],
 ):
     """Map packed m_block indices to block-sparse tensor indices."""
+    block = m_block
     if const_expr(qhead_per_kvhead != 1):
-        return m_block // qhead_per_kvhead
-    return m_block
+        block = block // qhead_per_kvhead
+    if const_expr(q_subtile_factor != 1):
+        block = block // q_subtile_factor
+    return block
 
 
 @cute.jit
@@ -142,6 +145,7 @@ def produce_block_sparse_loads(
     tma_q_bytes: cutlass.Constexpr,
     intra_wg_overlap: cutlass.Constexpr,
     qhead_per_kvhead: cutlass.Constexpr[int] = 1,
+    q_subtile_factor: cutlass.Constexpr[int] = 1,
 ):
     """Iterate over the mask and full block lists for a single tile.
 
@@ -160,7 +164,7 @@ def produce_block_sparse_loads(
 
     mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx = blocksparse_tensors
 
-    m_block_sparse = sparse_tensor_m_block(m_block, qhead_per_kvhead)
+    m_block_sparse = sparse_tensor_m_block(m_block, qhead_per_kvhead, q_subtile_factor)
 
     curr_mask_block_cnt = mask_block_cnt[batch_idx, head_idx, m_block_sparse]
     curr_mask_block_idx = mask_block_idx[batch_idx, head_idx, m_block_sparse, None]
@@ -308,6 +312,7 @@ def consume_block_sparse_loads(
     warp_scheduler_barrier_sync: Callable,
     warp_scheduler_barrier_arrive: Callable,
     qhead_per_kvhead: cutlass.Constexpr[int] = 1,
+    q_subtile_factor: cutlass.Constexpr[int] = 1,
 ):
     """Consume the mask and full block lists for a single tile on the consumer side.
 
@@ -321,7 +326,7 @@ def consume_block_sparse_loads(
 
     mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx = blocksparse_tensors
 
-    m_block_sparse = sparse_tensor_m_block(m_block, qhead_per_kvhead)
+    m_block_sparse = sparse_tensor_m_block(m_block, qhead_per_kvhead, q_subtile_factor)
 
     curr_mask_block_cnt = mask_block_cnt[batch_idx, head_idx, m_block_sparse]
     curr_mask_block_idx = mask_block_idx[batch_idx, head_idx, m_block_sparse, None]
@@ -527,6 +532,7 @@ def produce_block_sparse_loads_sm100(
     q_stage: cutlass.Constexpr,
     q_producer_phase: Int32,
     qhead_per_kvhead: cutlass.Constexpr,
+    q_subtile_factor: cutlass.Constexpr,
 ):
     """SM100 entry point for sparse block iteration.
 
@@ -537,11 +543,7 @@ def produce_block_sparse_loads_sm100(
         m_block: which tile of m we are processing
         qhead_per_kvhead: Constexpr pack factor
     """
-    # NB: Compute unpacked index for sparse tensor access
-    if const_expr(qhead_per_kvhead != 1):
-        m_block_sparse = m_block // qhead_per_kvhead
-    else:
-        m_block_sparse = m_block
+    m_block_sparse = sparse_tensor_m_block(m_block, qhead_per_kvhead, q_subtile_factor)
 
     mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx = blocksparse_tensors
 
@@ -619,12 +621,9 @@ def get_total_block_count(
     head_idx,
     m_block,
     qhead_per_kvhead: cutlass.Constexpr,
+    q_subtile_factor: cutlass.Constexpr,
 ):
-    # NB: Convert packed m_block to unpacked for sparse tensor indexing
-    if const_expr(qhead_per_kvhead != 1):
-        m_block_sparse = m_block // qhead_per_kvhead
-    else:
-        m_block_sparse = m_block
+    m_block_sparse = sparse_tensor_m_block(m_block, qhead_per_kvhead, q_subtile_factor)
 
     mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx = blocksparse_tensors
     if const_expr(full_block_cnt is not None):
@@ -700,14 +699,14 @@ def handle_block_sparse_empty_tile_correction_sm100(
                     row_max_value = sink_val * (LOG2_E / softmax_scale_log2)
                     row_sum_value = max_offset_scale
                 else:
-                    row_sum_value = row_sum_value + utils.exp2f(
-                        sink_val * LOG2_E - row_max_value * softmax_scale_log2 + max_offset
+                    row_sum_value = row_sum_value + cute.math.exp2(
+                        sink_val * LOG2_E - row_max_value * softmax_scale_log2 + max_offset, fastmath=True
                     )
         if tidx < m_block_size:
             scale_row_idx = tidx + stage * m_block_size
             sScale[scale_row_idx] = row_sum_value
             if const_expr(mLSE is not None or learnable_sink is not None):
-                sScale[scale_row_idx + m_block_size * 2] = row_max_value
+                sScale[scale_row_idx + q_stage * m_block_size] = row_max_value
         acc_flag = row_sum_value == Float32(0.0) or row_sum_value != row_sum_value
         stats[stage] = (row_sum_value, row_max_value, acc_flag)
 
@@ -772,12 +771,9 @@ def softmax_block_sparse_sm100(
     stage_idx: Int32,
     check_m_boundary: bool,
     qhead_per_kvhead: cutlass.Constexpr,
+    q_subtile_factor: cutlass.Constexpr[int] = 1,
 ):
-    # Convert packed m_block to unpacked for sparse tensor indexing
-    if const_expr(qhead_per_kvhead != 1):
-        m_block_sparse = m_block // qhead_per_kvhead
-    else:
-        m_block_sparse = m_block
+    m_block_sparse = sparse_tensor_m_block(m_block, qhead_per_kvhead, q_subtile_factor)
 
     mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx = blocksparse_tensors
 
@@ -1128,8 +1124,7 @@ def _load_q_do_block_sm90(
     else:
         pipeline_Q.producer_acquire(producer_state_Q)
     load_Q(m_block, producer_state=producer_state_Q)
-    with cute.arch.elect_one():
-        load_LSE(m_block, producer_state=producer_state_Q)
+    load_LSE(m_block, producer_state=producer_state_Q)
 
     producer_state_dO_cur = (
         producer_state_dO if const_expr(not Q_stage_eq_dO_stage) else producer_state_Q
@@ -1140,8 +1135,7 @@ def _load_q_do_block_sm90(
     else:
         pipeline_dO.producer_acquire(producer_state_dO_cur)
     load_dO(m_block, producer_state=producer_state_dO_cur)
-    with cute.arch.elect_one():
-        load_dPsum(m_block, producer_state=producer_state_dO_cur)
+    load_dPsum(m_block, producer_state=producer_state_dO_cur)
 
     producer_state_Q.advance()
     producer_state_dO.advance()
@@ -1258,10 +1252,10 @@ def consume_block_sparse_mma_bwd_sm90(
     is_causal: cutlass.Constexpr,
     is_local: cutlass.Constexpr,
     thr_mma_SdP,
-    softmax_scale,
-    seqlen,
-    subtile_factor: cutlass.Constexpr,
-    m_block_max: int,
+    score_mod_fn=None,
+    score_mod_bwd_fn=None,
+    subtile_factor: cutlass.Constexpr = 1,
+    m_block_max: int = 0,
     aux_tensors=None,
     fastdiv_mods=(None, None),
 ):
@@ -1323,15 +1317,9 @@ def consume_block_sparse_mma_bwd_sm90(
                 consumer_state_Q,
                 consumer_state_dO,
                 mask_fn=mask_fn_partial,
+                score_mod_fn=score_mod_fn,
+                score_mod_bwd_fn=score_mod_bwd_fn,
                 dKV_accumulate=dKV_accumulate,
-                thr_mma_SdP=thr_mma_SdP,
-                batch_idx=batch_idx,
-                head_idx=head_idx,
-                n_block=n_block,
-                softmax_scale=softmax_scale,
-                seqlen=seqlen,
-                aux_tensors=aux_tensors,
-                fastdiv_mods=fastdiv_mods,
             )
             dKV_accumulate = True
 
@@ -1347,15 +1335,9 @@ def consume_block_sparse_mma_bwd_sm90(
                     consumer_state_Q,
                     consumer_state_dO,
                     mask_fn=mask_fn_full,
+                    score_mod_fn=score_mod_fn,
+                    score_mod_bwd_fn=score_mod_bwd_fn,
                     dKV_accumulate=dKV_accumulate,
-                    thr_mma_SdP=thr_mma_SdP,
-                    batch_idx=batch_idx,
-                    head_idx=head_idx,
-                    n_block=n_block,
-                    softmax_scale=softmax_scale,
-                    seqlen=seqlen,
-                    aux_tensors=aux_tensors,
-                    fastdiv_mods=fastdiv_mods,
                 )
                 dKV_accumulate = True
 
@@ -1373,6 +1355,12 @@ def _store_one_dQaccum_sm90(
 ):
     """Store dQaccum for a single m_block."""
     for warp_group_idx in cutlass.range_constexpr(num_mma_warp_groups):
+        cute.arch.cp_async_bulk_wait_group(num_mma_warp_groups - 1 - warp_group_idx, read=True)
+        cute.arch.barrier_arrive(
+            barrier_id=int(NamedBarrierBwd.dQEmptyWG0) + warp_group_idx,
+            number_of_threads=num_threads_per_warp_group + cute.arch.WARP_SIZE,
+        )
+    for warp_group_idx in cutlass.range_constexpr(num_mma_warp_groups):
         cute.arch.barrier(
             barrier_id=int(NamedBarrierBwd.dQFullWG0) + warp_group_idx,
             number_of_threads=num_threads_per_warp_group + cute.arch.WARP_SIZE,
@@ -1384,12 +1372,6 @@ def _store_one_dQaccum_sm90(
                 tma_copy_bytes_dQ,
             )
         cute.arch.cp_async_bulk_commit_group()
-    for warp_group_idx in cutlass.range_constexpr(num_mma_warp_groups):
-        cute.arch.cp_async_bulk_wait_group(num_mma_warp_groups - 1 - warp_group_idx, read=True)
-        cute.arch.barrier_arrive(
-            barrier_id=int(NamedBarrierBwd.dQEmptyWG0) + warp_group_idx,
-            number_of_threads=num_threads_per_warp_group + cute.arch.WARP_SIZE,
-        )
 
 
 @cute.jit
