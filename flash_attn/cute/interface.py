@@ -42,10 +42,10 @@ if os.environ.get("CUTE_DSL_PTXAS_PATH", None) is not None:
 
 from flash_attn.cute import utils
 from flash_attn.cute.cute_dsl_utils import to_cute_tensor, to_cute_aux_tensor, get_aux_tensor_metadata
-from flash_attn.cute.flash_fwd import FlashAttentionForwardSm90
+from flash_attn.cute.flash_fwd import FlashAttentionForwardSm90, FlashAttentionForwardSm120
 from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
 from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
-from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
+from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80, FlashAttentionBackwardSm120
 from flash_attn.cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
 from flash_attn.cute.flash_bwd_sm100 import FlashAttentionBackwardSm100
 from flash_attn.cute.flash_bwd_postprocess import FlashAttentionBackwardPostprocess
@@ -491,8 +491,8 @@ def _flash_attn_fwd(
                 q_subtile_factor=q_subtile_factor,
             )
         elif compute_capability == 12:
-            # SM120 uses SM80's implementation (cp.async + warp-level MMA)
-            # Features not supported on SM120 (inherited from SM80):
+            # SM120 uses TMA (cp.async.bulk) + warp-level MMA with warp specialization
+            # Features not supported on SM120:
             assert page_table is None, "paged KV not supported on SM 12.0"
             assert not is_split_kv, "SplitKV not supported on SM 12.0"
             assert cu_seqlens_q is None, "varlen not supported on SM 12.0"
@@ -500,10 +500,10 @@ def _flash_attn_fwd(
             assert seqused_q is None, "seqused not supported on SM 12.0"
             assert seqused_k is None, "seqused not supported on SM 12.0"
             assert block_sparse_tensors is None, "block sparsity not supported on SM 12.0"
-            # SM120 uses SM80's implementation with warp-level MMA
-            # Thread count must satisfy: tile_m % (num_threads // 8) == 0
-            # With tile_m=128, valid num_threads are 64, 128 (not 256 or 384)
-            sm120_num_threads = 128
+            # SM120 TMA: 1 DMA warp + 4 MMA warps = 160 threads
+            # num_threads passed to __init__ is for base class; actual thread count
+            # is overridden in __call__ based on warp specialization
+            sm120_num_threads = 160
             fa_fwd = FlashAttentionForwardSm120(
                 dtype,
                 head_dim,
@@ -521,8 +521,7 @@ def _flash_attn_fwd(
                 score_mod=score_mod,
                 has_aux_tensors=aux_tensors is not None,
             )
-            # SM120 uses SM80's simpler interface, compile and call separately
-            # Convert softmax_scale to Float32 as required by SM80's __call__
+            # SM120 uses the same interface as SM80, compile and call separately
             from cutlass import Float32
             softmax_scale_f32 = Float32(softmax_scale) if softmax_scale is not None else None
             _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
@@ -1107,6 +1106,28 @@ def _flash_attn_bwd(
                 has_aux_tensors=aux_tensors is not None,
                 subtile_factor=subtile_factor,
             )
+        elif compute_capability == 12:
+            # SM120 uses warp-level MMA (same as SM80), no tcgen05
+            fa_bwd_obj = FlashAttentionBackwardSm120(
+                dtype,
+                head_dim,
+                head_dim_v,
+                qhead_per_kvhead,
+                m_block_size,
+                n_block_size,
+                num_stages_Q,
+                num_stages_dO,
+                num_threads,
+                pack_gqa,
+                causal,
+                SdP_swapAB,
+                dKV_swapAB,
+                dQ_swapAB,
+                AtomLayoutMSdP,
+                AtomLayoutNdKV,
+                AtomLayoutMdQ,
+                V_in_regs=V_in_regs,
+            )
         else:
             fa_bwd_obj = FlashAttentionBackwardSm100(
                 head_dim,
@@ -1185,7 +1206,7 @@ def _flash_attn_bwd(
         normalized_block_sparse_tensors[:4] if normalized_block_sparse_tensors is not None else None,
     )
 
-    num_threads = 256 if compute_capability == 9 else (384 if compute_capability == 12 else 128)
+    num_threads = 256 if compute_capability in [9, 12] else 128
     arch = compute_capability * 10
     # Postprocess kernel: convert dq_accum from float32 to dq in bf16/fp16
     compile_key_post = (
