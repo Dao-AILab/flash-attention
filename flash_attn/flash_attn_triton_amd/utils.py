@@ -9,12 +9,16 @@ This module contains essential runtime utilities:
 """
 import functools
 import os
+import json
+import logging
 from dataclasses import dataclass
 from typing import Literal, Optional, Union
 
 import torch
 import triton
 
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     # Runtime info
@@ -103,6 +107,23 @@ AUTOTUNE = os.environ.get("FLASH_ATTENTION_TRITON_AMD_AUTOTUNE", "0").lower() in
     "true",
     "yes",
 )
+
+# User override config json.
+# Note: Ignored if FLASH_ATTENTION_TRITON_AMD_AUTOTUNE is enabled.
+#
+# e.g. FLASH_ATTENTION_FWD_TRITON_AMD_CONFIG_JSON='{"BLOCK_M":32,"BLOCK_N":32,"waves_per_eu":1,"PRE_LOAD_V":false,"num_stages":1,"num_warps":4}'
+FWD_CONF_OVERRIDE = None
+try:
+    conf_json = os.getenv("FLASH_ATTENTION_FWD_TRITON_AMD_CONFIG_JSON")
+    if conf_json:
+        conf = json.loads(conf_json)
+        FWD_CONF_OVERRIDE = triton.Config(
+            conf,
+            num_stages=conf.pop("num_stages", 1),
+            num_warps=conf.pop("num_warps", 4),
+        )
+except Exception as e:
+    logger.warning(f'FLASH_ATTENTION_FWD_TRITON_AMD_CONFIG_JSON parse error: {e}')
 
 # Unified debug level:
 #   0 = off (default)

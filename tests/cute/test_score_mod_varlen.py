@@ -29,6 +29,16 @@ from score_mod_definitions import (
     score_mod_times_two,
 )  # isort: split
 from score_mod_definitions import (
+    score_mod_identity_vectorized,
+    score_mod_causal_vectorized,
+    score_mod_rel_bias as score_mod_rel_bias_vectorized,
+    score_mod_rel_bias_x2_vectorized,
+    score_mod_times_two_vectorized,
+    score_mod_alibi_vectorized,
+    score_mod_batch_bias_vectorized,
+    score_mod_dual_buffer_vectorized,
+)  # isort: split
+from score_mod_definitions import (
     # Eager (torch) reference score mods
     identity_eager,
     causal_eager,
@@ -77,6 +87,17 @@ TEST_PAIRS_NO_GLOBAL = [
     (score_mod_dual_buffer, dual_buffer_factory, "dual_buffer"),
 ]
 
+# Test pairs to compare vectorized score_mods: (cute_jit_function, cute_jit_function_vectorized)
+TEST_PAIRS_VECTORIZED_NO_GLOBAL = [
+    (score_mod_identity, score_mod_identity_vectorized, None),
+    (score_mod_causal, score_mod_causal_vectorized, None),
+    (score_mod_rel_bias, score_mod_rel_bias_vectorized, None),
+    (score_mod_rel_bias_x2, score_mod_rel_bias_x2_vectorized, None),
+    (score_mod_times_two, score_mod_times_two_vectorized, None),
+    (score_mod_alibi, score_mod_alibi_vectorized, None),
+    (score_mod_batch_bias, score_mod_batch_bias_vectorized, "batch"),
+    (score_mod_dual_buffer, score_mod_dual_buffer_vectorized, "dual_buffer"),
+]
 # (cute_score_mod, eager_factory, aux_type, requires_global)
 # aux_type: "kv", "q", "q_and_kv", "q_concat", "kv_with_cu", "multi_buffer"
 # requires_global: "q" (needs varlen_q), "kv" (needs varlen_k), "both" (needs both)
@@ -150,6 +171,8 @@ SEQLEN_CONFIGS = [
     ([1, 1, 1], [128 * 1024] * 3),
     ([1, 1, 1], [256 * 1024] * 3),
 ]
+
+VEC_SIZES_TO_CHECK_EQUALITY = [1, 4]
 
 # =============================================================================
 # Helper functions
@@ -488,6 +511,87 @@ def test_varlen_with_score_mod(
         cu_seqlens_q=cu_seqlens_q if varlen_q else None,
     )
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("varlen_q", [True, False])
+@pytest.mark.parametrize("varlen_k", [True, False])
+@pytest.mark.parametrize("qhead_per_kvhead,num_kv_heads", [(4, 2)])
+@pytest.mark.parametrize("seqlens_q,seqlens_k", SEQLEN_CONFIGS)
+@pytest.mark.parametrize("score_mod_vec_tuple", TEST_PAIRS_VECTORIZED_NO_GLOBAL)
+def test_varlen_with_score_mod_vectorized(
+    seqlens_q,
+    seqlens_k,
+    varlen_q,
+    varlen_k,
+    qhead_per_kvhead,
+    num_kv_heads,
+    dtype,
+    score_mod_vec_tuple,
+):
+    """Tests equality between original and vectorized versions of score mods"""
+    if not varlen_q and not varlen_k:
+        pytest.skip(
+            "At least one of varlen_q or varlen_k must be True for varlen tests"
+        )
+
+    # For non-varlen dimension, all sequences must have same length
+    if not varlen_q:
+        seqlens_q = [seqlens_q[0]] * len(seqlens_q)
+    if not varlen_k:
+        seqlens_k = [seqlens_k[0]] * len(seqlens_k)
+    torch.random.manual_seed(42)
+    cute_score_mod, cute_vectorized_score_mod, aux_type = score_mod_vec_tuple
+
+    num_heads = num_kv_heads * qhead_per_kvhead
+    pack_gqa = qhead_per_kvhead > 1
+    head_dim = 128
+    batch_size = len(seqlens_q)
+
+    q, k, v, cu_seqlens_q, cu_seqlens_k = setup_tensors(
+        seqlens_q, seqlens_k, varlen_q, varlen_k, num_heads, head_dim, dtype
+    )
+    aux_tensors = None
+    if aux_type == "batch":
+        bias = torch.zeros(batch_size, device="cuda", dtype=dtype) * 0.1
+        aux_tensors = [bias]
+    elif aux_type == "dual_buffer":
+        seqlen_q = seqlens_q[0] if not varlen_q else max(seqlens_q)
+        head_bias = torch.randn(num_heads, device="cuda", dtype=dtype) * 0.2
+        pos_bias = torch.arange(seqlen_q, device="cuda", dtype=dtype) * 0.01
+        aux_tensors = [head_bias, pos_bias]
+
+    if pack_gqa:
+        if varlen_k:
+            k = k[:, :num_kv_heads, :].clone()
+            v = v[:, :num_kv_heads, :].clone()
+        else:
+            k = k[:, :, :num_kv_heads, :].clone()
+            v = v[:, :, :num_kv_heads, :].clone()
+
+    out_ref = run_cute_flash(
+        q,
+        k,
+        v,
+        cute_score_mod,
+        aux_tensors=aux_tensors,
+        pack_gqa=pack_gqa,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+    )
+
+    for vec_size in VEC_SIZES_TO_CHECK_EQUALITY:
+        cute_vectorized_score_mod.__vec_size__ = vec_size
+        out = run_cute_flash(
+            q,
+            k,
+            v,
+            cute_vectorized_score_mod,
+            aux_tensors=aux_tensors,
+            pack_gqa=pack_gqa,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+        )
+
+        assert torch.equal(out, out_ref)
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("varlen_q", [True, False])

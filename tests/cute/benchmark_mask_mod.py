@@ -20,10 +20,10 @@ from mask_mod_definitions import (
     random_doc_id_tensor,
 )
 from flash_attn.cute.block_sparsity import (
-    compute_block_sparsity,
     BlockSparseTensorsTorch,
     to_cute_block_sparse_tensors,
 )
+from flash_attn.cute.compute_block_sparsity import compute_block_sparsity
 
 
 @dataclass
@@ -257,27 +257,26 @@ class FlashAttentionBenchmark:
                     config.batch_size, config.nheads, config.seqlen_q, device=device
                 )
                 tensors["aux_tensors"] = [doc_id.contiguous()]
-            full_cnt, full_idx, mask_cnt, mask_idx = compute_block_sparsity(
-                config=self.config,
-                mask_mod_flex=self.mask_mod_flex,
+
+            _, blocksparse_torch_tensors = compute_block_sparsity(
+                tile_m=self.config.tile_m,
+                tile_n=self.config.tile_n,
+                batch_size=self.config.batch_size,
+                num_heads=self.config.nheads,
+                seqlen_q=self.config.seqlen_q,
+                seqlen_k=self.config.seqlen_k,
+                mask_mod=self.mask_mod_cute,
                 device=device,
                 cu_seqlens_q=tensors.get("cu_seqlens_q"),
                 cu_seqlens_k=tensors.get("cu_seqlens_k"),
                 aux_tensors=tensors.get("aux_tensors"),
             )
-
-            if all(t is not None for t in [full_cnt, full_idx, mask_cnt, mask_idx]):
-                tensors["block_sparse_tensors"] = BlockSparseTensorsTorch(
-                    mask_block_cnt=mask_cnt.contiguous(),
-                    mask_block_idx=mask_idx.contiguous(),
-                    full_block_cnt=full_cnt.contiguous(),
-                    full_block_idx=full_idx.contiguous(),
-                    block_size=(config.tile_m, config.tile_n),
-                )
+            if blocksparse_torch_tensors is not None:
+                tensors["block_sparse_tensors"] = blocksparse_torch_tensors
 
                 if config.verbose:
-                    total_full = full_cnt.sum().item()
-                    total_partial = mask_cnt.sum().item()
+                    total_full = blocksparse_torch_tensors.full_block_cnt.sum().item()
+                    total_partial = blocksparse_torch_tensors.mask_block_cnt.sum().item()
 
                     if config.use_varlen:
                         # Compute max possible blocks across all sequences

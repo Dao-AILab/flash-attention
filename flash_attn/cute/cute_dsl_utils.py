@@ -44,30 +44,6 @@ def get_device_capacity(device: torch.device = None) -> Tuple[int, int]:
 
 
 @dataclass
-class ParamsBase:
-    def __extract_mlir_values__(self):
-        all_fields = [getattr(self, field.name) for field in fields(self)]
-        non_constexpr_fields = [f for f in all_fields if not isinstance(f, StaticTypes)]
-        values, self._values_pos = [], []
-        for obj in non_constexpr_fields:
-            obj_values = cutlass.extract_mlir_values(obj)
-            values += obj_values
-            self._values_pos.append(len(obj_values))
-        return values
-
-    def __new_from_mlir_values__(self, values):
-        all_fields = {field.name: getattr(self, field.name) for field in fields(self)}
-        constexpr_fields = {n: f for n, f in all_fields.items() if isinstance(f, StaticTypes)}
-        non_constexpr_fields = {
-            n: f for n, f in all_fields.items() if not isinstance(f, StaticTypes)
-        }
-        for (name, field), n_items in zip(non_constexpr_fields.items(), self._values_pos):
-            non_constexpr_fields[name] = cutlass.new_from_mlir_values(field, values[:n_items])
-            values = values[n_items:]
-        return self.__class__(**non_constexpr_fields, **constexpr_fields)
-
-
-@dataclass
 class ArgumentsBase(JitArgument):
     def __c_pointers__(self):
         all_fields = [getattr(self, field.name) for field in fields(self)]
@@ -124,6 +100,24 @@ def cute_compile_patched(*args, **kwargs):
     return output
 
 
+def assume_strides_aligned(t):
+    """Assume all strides except the last are divisible by 128 bits.
+
+    Python int strides (e.g., stride=0 from GQA expand) are kept as-is
+    since they're static and don't need alignment assumptions.
+    """
+    divby = 128 // t.element_type.width
+    strides = tuple(s if isinstance(s, int) else cute.assume(s, divby=divby) for s in t.stride[:-1])
+    return (*strides, t.stride[-1])
+
+
+def assume_tensor_aligned(t):
+    """Rebuild a tensor with 128-bit aligned stride assumptions. Passes through None."""
+    if t is None:
+        return None
+    return cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=assume_strides_aligned(t)))
+
+
 def to_cute_tensor(t, assumed_align=16, leading_dim=-1, fully_dynamic=False, enable_tvm_ffi=True):
     """Convert torch tensor to cute tensor for TVM FFI. leading_dim=-1 defaults to t.ndim-1."""
     tensor = from_dlpack(t.detach(), assumed_align=assumed_align, enable_tvm_ffi=enable_tvm_ffi)
@@ -132,6 +126,35 @@ def to_cute_tensor(t, assumed_align=16, leading_dim=-1, fully_dynamic=False, ena
     if leading_dim == -1:
         leading_dim = t.ndim - 1
     return tensor.mark_layout_dynamic(leading_dim=leading_dim)
+
+
+def to_cute_aux_tensor(t, enable_tvm_ffi=True):
+    """Convert torch tensor to cute tensor for TVM FFI, tailored to FlexAttention aux tensors.
+    This allows the user to specify alignment and leading dimension for aux tensors used in
+    custom score_mod callables.
+    """
+    assumed_align: int = getattr(t, "__assumed_align__", None)
+    leading_dim: int = getattr(t, "__leading_dim__", None)
+    fully_dynamic: bool = leading_dim is None
+
+    return to_cute_tensor(
+        t,
+        assumed_align=assumed_align,
+        leading_dim=leading_dim,
+        fully_dynamic=fully_dynamic,
+        enable_tvm_ffi=enable_tvm_ffi,
+    )
+
+
+def get_aux_tensor_metadata(aux_tensors):
+    return tuple(
+        (
+            getattr(t, "__assumed_align__", 0),
+            getattr(t, "__leading_dim__", -1),
+            hasattr(t, "__leading_dim__"),
+        )
+        for t in aux_tensors
+    )
 
 
 def get_broadcast_dims(tensor: torch.Tensor) -> Tuple[bool, ...]:

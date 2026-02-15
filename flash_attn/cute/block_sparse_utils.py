@@ -12,10 +12,10 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, const_expr
 
+from quack import copy_utils
+
 # Import data structures from block_sparsity
 from flash_attn.cute.block_sparsity import BlockSparseTensors
-from flash_attn.cute import utils
-from flash_attn.cute import copy_utils
 from flash_attn.cute.named_barrier import NamedBarrierBwd
 
 
@@ -698,14 +698,14 @@ def handle_block_sparse_empty_tile_correction_sm100(
                     row_max_value = sink_val * (LOG2_E / softmax_scale_log2)
                     row_sum_value = Float32(1.0)
                 else:
-                    row_sum_value = row_sum_value + utils.exp2f(
-                        sink_val * LOG2_E - row_max_value * softmax_scale_log2
+                    row_sum_value = row_sum_value + cute.math.exp2(
+                        sink_val * LOG2_E - row_max_value * softmax_scale_log2, fastmath=True
                     )
         if tidx < m_block_size:
             scale_row_idx = tidx + stage * m_block_size
             sScale[scale_row_idx] = row_sum_value
             if const_expr(mLSE is not None or learnable_sink is not None):
-                sScale[scale_row_idx + m_block_size * 2] = row_max_value
+                sScale[scale_row_idx + q_stage * m_block_size] = row_max_value
         acc_flag = row_sum_value == Float32(0.0) or row_sum_value != row_sum_value
         stats[stage] = (row_sum_value, row_max_value, acc_flag)
 
@@ -1123,8 +1123,7 @@ def _load_q_do_block_sm90(
     else:
         pipeline_Q.producer_acquire(producer_state_Q)
     load_Q(m_block, producer_state=producer_state_Q)
-    with cute.arch.elect_one():
-        load_LSE(m_block, producer_state=producer_state_Q)
+    load_LSE(m_block, producer_state=producer_state_Q)
 
     producer_state_dO_cur = (
         producer_state_dO if const_expr(not Q_stage_eq_dO_stage) else producer_state_Q
@@ -1135,8 +1134,7 @@ def _load_q_do_block_sm90(
     else:
         pipeline_dO.producer_acquire(producer_state_dO_cur)
     load_dO(m_block, producer_state=producer_state_dO_cur)
-    with cute.arch.elect_one():
-        load_dPsum(m_block, producer_state=producer_state_dO_cur)
+    load_dPsum(m_block, producer_state=producer_state_dO_cur)
 
     producer_state_Q.advance()
     producer_state_dO.advance()
@@ -1253,10 +1251,10 @@ def consume_block_sparse_mma_bwd_sm90(
     is_causal: cutlass.Constexpr,
     is_local: cutlass.Constexpr,
     thr_mma_SdP,
-    softmax_scale,
-    seqlen,
-    subtile_factor: cutlass.Constexpr,
-    m_block_max: int,
+    score_mod_fn=None,
+    score_mod_bwd_fn=None,
+    subtile_factor: cutlass.Constexpr = 1,
+    m_block_max: int = 0,
     aux_tensors=None,
     fastdiv_mods=(None, None),
 ):
@@ -1318,15 +1316,9 @@ def consume_block_sparse_mma_bwd_sm90(
                 consumer_state_Q,
                 consumer_state_dO,
                 mask_fn=mask_fn_partial,
+                score_mod_fn=score_mod_fn,
+                score_mod_bwd_fn=score_mod_bwd_fn,
                 dKV_accumulate=dKV_accumulate,
-                thr_mma_SdP=thr_mma_SdP,
-                batch_idx=batch_idx,
-                head_idx=head_idx,
-                n_block=n_block,
-                softmax_scale=softmax_scale,
-                seqlen=seqlen,
-                aux_tensors=aux_tensors,
-                fastdiv_mods=fastdiv_mods,
             )
             dKV_accumulate = True
 
@@ -1342,15 +1334,9 @@ def consume_block_sparse_mma_bwd_sm90(
                     consumer_state_Q,
                     consumer_state_dO,
                     mask_fn=mask_fn_full,
+                    score_mod_fn=score_mod_fn,
+                    score_mod_bwd_fn=score_mod_bwd_fn,
                     dKV_accumulate=dKV_accumulate,
-                    thr_mma_SdP=thr_mma_SdP,
-                    batch_idx=batch_idx,
-                    head_idx=head_idx,
-                    n_block=n_block,
-                    softmax_scale=softmax_scale,
-                    seqlen=seqlen,
-                    aux_tensors=aux_tensors,
-                    fastdiv_mods=fastdiv_mods,
                 )
                 dKV_accumulate = True
 
@@ -1368,6 +1354,12 @@ def _store_one_dQaccum_sm90(
 ):
     """Store dQaccum for a single m_block."""
     for warp_group_idx in cutlass.range_constexpr(num_mma_warp_groups):
+        cute.arch.cp_async_bulk_wait_group(num_mma_warp_groups - 1 - warp_group_idx, read=True)
+        cute.arch.barrier_arrive(
+            barrier_id=int(NamedBarrierBwd.dQEmptyWG0) + warp_group_idx,
+            number_of_threads=num_threads_per_warp_group + cute.arch.WARP_SIZE,
+        )
+    for warp_group_idx in cutlass.range_constexpr(num_mma_warp_groups):
         cute.arch.barrier(
             barrier_id=int(NamedBarrierBwd.dQFullWG0) + warp_group_idx,
             number_of_threads=num_threads_per_warp_group + cute.arch.WARP_SIZE,
@@ -1379,12 +1371,6 @@ def _store_one_dQaccum_sm90(
                 tma_copy_bytes_dQ,
             )
         cute.arch.cp_async_bulk_commit_group()
-    for warp_group_idx in cutlass.range_constexpr(num_mma_warp_groups):
-        cute.arch.cp_async_bulk_wait_group(num_mma_warp_groups - 1 - warp_group_idx, read=True)
-        cute.arch.barrier_arrive(
-            barrier_id=int(NamedBarrierBwd.dQEmptyWG0) + warp_group_idx,
-            number_of_threads=num_threads_per_warp_group + cute.arch.WARP_SIZE,
-        )
 
 
 @cute.jit

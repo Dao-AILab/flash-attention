@@ -41,8 +41,8 @@ if os.environ.get("CUTE_DSL_PTXAS_PATH", None) is not None:
 
 
 from flash_attn.cute import utils
-from flash_attn.cute.cute_dsl_utils import to_cute_tensor
-from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80, FlashAttentionForwardSm90, FlashAttentionForwardSm120
+from flash_attn.cute.cute_dsl_utils import to_cute_tensor, to_cute_aux_tensor, get_aux_tensor_metadata
+from flash_attn.cute.flash_fwd import FlashAttentionForwardSm90
 from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
 from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
 from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
@@ -62,189 +62,6 @@ from flash_attn.cute.block_sparsity import (
 def _get_device_capability():
     """Cached device capability check."""
     return torch.cuda.get_device_capability()[0]
-
-
-def _build_padding_mask(lengths, max_seqlen, device):
-    if lengths is None:
-        return None
-    if isinstance(lengths, torch.Tensor):
-        lengths_tensor = lengths.to(device=device, dtype=torch.int64)
-    else:
-        lengths_tensor = torch.tensor(lengths, device=device, dtype=torch.int64)
-    if max_seqlen is None:
-        max_seqlen = int(lengths_tensor.max().item()) if lengths_tensor.numel() > 0 else 0
-    if max_seqlen == 0:
-        return torch.empty((lengths_tensor.numel(), 0), device=device, dtype=torch.bool)
-    idx = torch.arange(max_seqlen, device=device)[None, :]
-    return idx < lengths_tensor[:, None]
-
-
-def _pad_from_cu_seqlens(x, cu_seqlens, max_seqlen):
-    batch = int(cu_seqlens.numel() - 1)
-    lengths = (cu_seqlens[1:] - cu_seqlens[:-1]).tolist()
-    max_len = max_seqlen if max_seqlen is not None else (max(lengths) if lengths else 0)
-    padded = torch.zeros((batch, max_len, x.shape[1], x.shape[2]), device=x.device, dtype=x.dtype)
-    for b in range(batch):
-        start = int(cu_seqlens[b].item())
-        end = int(cu_seqlens[b + 1].item())
-        padded[b, : end - start] = x[start:end]
-    return padded, lengths, max_len, batch
-
-
-def _pad_from_padded(x, seqused, max_seqlen):
-    batch = x.shape[0]
-    max_len = max_seqlen if max_seqlen is not None else x.shape[1]
-    lengths = seqused.tolist() if seqused is not None else [x.shape[1]] * batch
-    if x.shape[1] == max_len:
-        padded = x
-    else:
-        padded = torch.zeros((batch, max_len, x.shape[2], x.shape[3]), device=x.device, dtype=x.dtype)
-        padded[:, : x.shape[1]] = x
-    return padded, lengths, max_len, batch
-
-
-def _unpad_to_cu_seqlens(x_padded, cu_seqlens):
-    total = int(cu_seqlens[-1].item())
-    out = torch.empty((total, x_padded.shape[2], x_padded.shape[3]), device=x_padded.device, dtype=x_padded.dtype)
-    for b in range(cu_seqlens.numel() - 1):
-        start = int(cu_seqlens[b].item())
-        end = int(cu_seqlens[b + 1].item())
-        out[start:end] = x_padded[b, : end - start]
-    return out
-
-
-def _flash_attn_fwd_sm120_fallback(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    cu_seqlens_q: Optional[torch.Tensor],
-    cu_seqlens_k: Optional[torch.Tensor],
-    seqused_q: Optional[torch.Tensor],
-    seqused_k: Optional[torch.Tensor],
-    max_seqlen_q: Optional[int],
-    max_seqlen_k: Optional[int],
-    softmax_scale: Optional[float],
-    causal: bool,
-    softcap: Optional[float],
-    window_size_left: Optional[int],
-    window_size_right: Optional[int],
-    learnable_sink: Optional[torch.Tensor],
-    return_lse: bool,
-    out: Optional[torch.Tensor],
-    lse: Optional[torch.Tensor],
-):
-    from flash_attn.cute.testing import attention_ref
-
-    if softmax_scale is not None:
-        scale = softmax_scale * math.sqrt(q.shape[-1])
-        q = q * scale
-
-    if cu_seqlens_q is not None:
-        q_padded, q_lengths, max_len_q, batch = _pad_from_cu_seqlens(q, cu_seqlens_q, max_seqlen_q)
-    else:
-        q_padded, q_lengths, max_len_q, batch = _pad_from_padded(q, seqused_q, max_seqlen_q)
-    if cu_seqlens_k is not None:
-        k_padded, k_lengths, max_len_k, _ = _pad_from_cu_seqlens(k, cu_seqlens_k, max_seqlen_k)
-        v_padded, _, _, _ = _pad_from_cu_seqlens(v, cu_seqlens_k, max_seqlen_k)
-    else:
-        k_padded, k_lengths, max_len_k, _ = _pad_from_padded(k, seqused_k, max_seqlen_k)
-        v_padded, _, _, _ = _pad_from_padded(v, seqused_k, max_seqlen_k)
-
-    query_padding_mask = _build_padding_mask(q_lengths, max_len_q, q.device)
-    key_padding_mask = _build_padding_mask(k_lengths, max_len_k, q.device)
-
-    out_padded, _ = attention_ref(
-        q_padded,
-        k_padded,
-        v_padded,
-        query_padding_mask,
-        key_padding_mask,
-        causal=causal,
-        window_size=(window_size_left, window_size_right),
-        learnable_sink=learnable_sink,
-        softcap=softcap if softcap is not None else 0.0,
-    )
-
-    if cu_seqlens_q is not None:
-        out_val = _unpad_to_cu_seqlens(out_padded, cu_seqlens_q)
-        lse_shape = (out_val.shape[0], out_val.shape[1])
-    else:
-        out_val = out_padded
-        lse_shape = (batch, max_len_q, out_val.shape[2])
-
-    if out is not None:
-        out.copy_(out_val)
-        out_val = out
-
-    lse_val = None
-    needs_lse = return_lse or q.requires_grad or k.requires_grad or v.requires_grad
-    if needs_lse:
-        lse_val = torch.zeros(lse_shape, device=out_val.device, dtype=torch.float32)
-        if lse is not None:
-            lse.copy_(lse_val)
-            lse_val = lse
-
-    return out_val, lse_val
-
-
-def _flash_attn_bwd_sm120_fallback(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    dout: torch.Tensor,
-    cu_seqlens_q: Optional[torch.Tensor],
-    cu_seqlens_k: Optional[torch.Tensor],
-    seqused_q: Optional[torch.Tensor],
-    seqused_k: Optional[torch.Tensor],
-    max_seqlen_q: Optional[int],
-    max_seqlen_k: Optional[int],
-    softmax_scale: Optional[float],
-    causal: bool,
-    softcap: float,
-    window_size_left: Optional[int],
-    window_size_right: Optional[int],
-    dq: Optional[torch.Tensor],
-    dk: Optional[torch.Tensor],
-    dv: Optional[torch.Tensor],
-):
-    with torch.enable_grad():
-        q_req = q.detach().requires_grad_(True)
-        k_req = k.detach().requires_grad_(True)
-        v_req = v.detach().requires_grad_(True)
-        out_ref, _ = _flash_attn_fwd_sm120_fallback(
-            q=q_req,
-            k=k_req,
-            v=v_req,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            seqused_q=seqused_q,
-            seqused_k=seqused_k,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            softcap=softcap,
-            window_size_left=window_size_left,
-            window_size_right=window_size_right,
-            learnable_sink=None,
-            return_lse=False,
-            out=None,
-            lse=None,
-        )
-        dq_ref, dk_ref, dv_ref = torch.autograd.grad(
-            out_ref, (q_req, k_req, v_req), dout, retain_graph=False, allow_unused=False
-        )
-
-    if dq is not None:
-        dq.copy_(dq_ref)
-        dq_ref = dq
-    if dk is not None:
-        dk.copy_(dk_ref)
-        dk_ref = dk
-    if dv is not None:
-        dv.copy_(dv_ref)
-        dv_ref = dv
-    return dq_ref, dk_ref, dv_ref
 
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
@@ -320,30 +137,6 @@ def _flash_attn_fwd(
         lse: Optional pre-allocated log-sum-exp tensor. If None, will be allocated when needed.
         aux_tensors: Some score_mods will want to read from global aux_tensors. This is how we thread them through to the inner kernel.
     """
-    compute_capability = _compute_capability or _get_device_capability()
-    if compute_capability == 12:
-        if score_mod is not None or mask_mod is not None or block_sparse_tensors is not None:
-            raise NotImplementedError("SM120 fallback does not support score_mod/mask_mod/block sparsity.")
-        return _flash_attn_fwd_sm120_fallback(
-            q=q,
-            k=k,
-            v=v,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            seqused_q=seqused_q,
-            seqused_k=seqused_k,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            softcap=softcap,
-            window_size_left=window_size_left,
-            window_size_right=window_size_right,
-            learnable_sink=learnable_sink,
-            return_lse=return_lse,
-            out=out,
-            lse=lse,
-        )
     q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
     num_head, head_dim = q.shape[-2:]
     if cu_seqlens_q is None:
@@ -575,6 +368,10 @@ def _flash_attn_fwd(
             block_size=(m_block_size, n_block_size),
             q_stage=q_stage,
         )
+    if aux_tensors is not None:
+        aux_tensor_metadata = get_aux_tensor_metadata(aux_tensors)
+    else:
+        aux_tensor_metadata = None
 
     compile_key = (
         dtype,
@@ -586,7 +383,7 @@ def _flash_attn_fwd(
         mask_mod_hash,
         use_block_sparsity,
         block_sparse_broadcast_pattern,
-        len(aux_tensors) if aux_tensors is not None else 0,
+        aux_tensor_metadata,
         lse is None,
         cu_seqlens_q is None,
         cu_seqlens_k is None,
@@ -639,8 +436,9 @@ def _flash_attn_fwd(
             sparse_tensors = to_cute_block_sparse_tensors(normalized_block_sparse_tensors)
 
         cute_aux_tensors = None
+        aux_tensor_metadata = None
         if aux_tensors is not None:
-            cute_aux_tensors = [to_cute_tensor(buf, assumed_align=None, fully_dynamic=True) for buf in aux_tensors]
+            cute_aux_tensors = [to_cute_aux_tensor(buf) for buf in aux_tensors]
 
         if compute_capability == 9:
             assert page_table is None, "paged KV not supported on SM 9.0"
@@ -859,29 +657,7 @@ def _flash_attn_bwd(
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     compute_capability = _get_device_capability()
-    if compute_capability == 12:
-        return _flash_attn_bwd_sm120_fallback(
-            q=q,
-            k=k,
-            v=v,
-            dout=dout,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            seqused_q=seqused_q,
-            seqused_k=seqused_k,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            softcap=softcap,
-            window_size_left=window_size_left,
-            window_size_right=window_size_right,
-            dq=dq,
-            dk=dk,
-            dv=dv,
-        )
-    compute_capability = _get_device_capability()
-    assert compute_capability in [9, 10, 11, 12], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x, 12.x"
+    assert compute_capability in [9, 10, 11, 12], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x"
 
     if compute_capability == 9:
         m_block_size = 80 if not causal else 64
@@ -897,6 +673,13 @@ def _flash_attn_bwd(
         AtomLayoutMdQ = 1
         cluster_size = 1
         assert window_size_left is None and window_size_right is None, "local not supported yet on 9.x"
+        is_varlen = (
+            cu_seqlens_q is not None
+            or cu_seqlens_k is not None
+            or seqused_q is not None
+            or seqused_k is not None
+        )
+        assert not is_varlen, "varlen backward is not yet supported on sm90"
     else:
         m_block_size = 128
         n_block_size = 128
