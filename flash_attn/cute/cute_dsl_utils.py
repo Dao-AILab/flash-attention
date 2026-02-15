@@ -30,6 +30,8 @@ torch2cute_dtype_map = {
     torch.float16: cutlass.Float16,
     torch.bfloat16: cutlass.BFloat16,
     torch.float32: cutlass.Float32,
+    torch.float8_e4m3fn: cutlass.Float8E4M3FN,
+    torch.float8_e5m2: cutlass.Float8E5M2,
 }
 
 
@@ -120,7 +122,20 @@ def assume_tensor_aligned(t):
 
 def to_cute_tensor(t, assumed_align=16, leading_dim=-1, fully_dynamic=False, enable_tvm_ffi=True):
     """Convert torch tensor to cute tensor for TVM FFI. leading_dim=-1 defaults to t.ndim-1."""
-    tensor = from_dlpack(t.detach(), assumed_align=assumed_align, enable_tvm_ffi=enable_tvm_ffi)
+    # NOTE: torch 2.9.1 doesn't support fp8 via DLPack but 2.11.0 nightly does
+    # currently export raw bytes as uint8 and tell cutlass correct type
+    # can directly export as fp8 when torch supports it
+    if t.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        tensor = from_dlpack(
+            t.view(torch.uint8).detach(),
+            assumed_align=assumed_align,
+            enable_tvm_ffi=enable_tvm_ffi,
+        )
+        tensor.element_type = (
+            cutlass.Float8E4M3FN if t.dtype == torch.float8_e4m3fn else cutlass.Float8E5M2
+        )
+    else:
+        tensor = from_dlpack(t.detach(), assumed_align=assumed_align, enable_tvm_ffi=enable_tvm_ffi)
     if fully_dynamic:
         return tensor.mark_layout_dynamic()
     if leading_dim == -1:
