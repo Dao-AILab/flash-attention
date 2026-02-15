@@ -31,13 +31,20 @@ def get_curr_blocksparse_tensors(
     mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx = blocksparse_tensors
     if const_expr(len(mask_block_cnt.shape) == 2):
         # In the case where we are varlen_q, blocksparse tensors have shape
-        # [nheads, total_m_block] and [nheads, total_m_block, max_n_block]
-        curr_m_block = seqlen_info.block_offset + m_block
+        # [nheads, total_m_block] and [nheads, total_n_block]
+        m_block_offset = seqlen_info.m_block_offset
+        n_block_offset = seqlen_info.n_block_offset
+        curr_m_block = m_block_offset + m_block
+        curr_n_block_offset = n_block_offset + m_block * seqlen_info.num_n_blocks
         curr_mask_block_cnt = mask_block_cnt[head_idx, curr_m_block]
-        curr_mask_block_idx = mask_block_idx[head_idx, curr_m_block, None]
+        curr_mask_block_idx = cute.domain_offset(
+            curr_n_block_offset, mask_block_idx[head_idx, None]
+        )
         if const_expr(full_block_cnt is not None):
             curr_full_block_cnt = full_block_cnt[head_idx, curr_m_block]
-            curr_full_block_idx = full_block_idx[head_idx, curr_m_block, None]
+            curr_full_block_idx = cute.domain_offset(
+                curr_n_block_offset, full_block_idx[head_idx, None]
+            )
         else:
             curr_full_block_cnt = Int32(0)
             curr_full_block_idx = None
