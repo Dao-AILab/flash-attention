@@ -77,7 +77,7 @@ headdim_vals = [64, 128]
 dim = 2048
 dropout_p = 0.0
 
-methods = (["Flash2", "Pytorch"]
+methods = (["Flash2", "Pytorch", "Flash2Sink"]
            + (["Triton"] if attention_triton is not None else [])
            + (["xformers.c"] if xops is not None else [])
            + (["xformers.f"] if xops is not None else []))
@@ -105,6 +105,17 @@ for causal in causal_vals:
                 )
                 time_f[config, "Flash2"] = f
                 time_b[config, "Flash2"] = b
+
+            # FlashAttention 2 with sink
+            if "Flash2Sink" in methods:
+                qkv = torch.randn(batch_size, seqlen, 3, nheads, headdim,
+                                  device=device, dtype=dtype, requires_grad=True)
+                sink = torch.randn((nheads,), dtype=torch.float32, device=device, requires_grad=True)
+                f, b = time_fwd_bwd(
+                    flash_attn_qkvpacked_func, qkv, dropout_p, causal=causal, learnable_sink=sink, repeats=repeats, verbose=False
+                )
+                time_f[config, "Flash2Sink"] = f
+                time_b[config, "Flash2Sink"] = b
 
             # PyTorch baseline
             if "Pytorch" in methods:

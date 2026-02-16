@@ -287,7 +287,7 @@ struct Flash_bwd_kernel_traits : public Base {
     static constexpr int kSmemSize1colblock = kSmemQdOSize
         + (!Is_V_in_regs
            ? kSmemKVSize + kSmemdSSize + kSmemPSize
-           : std::max(kSmemKVSize, kSmemKVSize / 2 + kSmemdSSize + kSmemPSize));
+           : std::max(kSmemKVSize, kSmemKVSize / 2 + kSmemdSSize + kSmemPSize)) + sizeof(float); // + sizeof(float) for dsink
 
     static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(Element);
     static_assert(kHeadDim % kGmemElemsPerLoad == 0, "kHeadDim must be a multiple of kGmemElemsPerLoad");
