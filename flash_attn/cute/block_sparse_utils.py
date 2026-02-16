@@ -19,6 +19,55 @@ from flash_attn.cute.block_sparsity import BlockSparseTensors
 from flash_attn.cute.named_barrier import NamedBarrierBwd
 
 
+# NOTE [SM100 block-sparse empty tiles: mbarrier contract]
+#
+# For block-sparse SM100 forward, a given (m_block, stage) Q tile can have zero active
+# KV blocks (total_block_cnt == 0). In that case there is no seqlen_kv iteration, so
+# the softmax warp-group has no row stats to publish.
+#
+# The correction warp-group seeds fully-masked-row stats and runs the usual correction
+# epilogue so output/LSE have well-defined values. Both warp-groups must still perform
+# the softmax<->correction mbarrier handshake so phases advance correctly across
+# empty->empty and empty->non-empty tile sequences.
+#
+# In the no-sink case, this corresponds to the usual fully-masked-row convention:
+# output is zero and LSE is -inf.
+#
+# Barrier contract (each is `mbar_ptr + <offset> + stage`):
+#
+# Producer/consumer pairs:
+# - `mbar_softmax_corr_full`    : softmax arrive        -> correction wait
+# - `mbar_softmax_corr_empty`   : correction arrive     -> softmax wait
+# - `mbar_P_full_O_rescaled`    : softmax arrive (+ correction arrive) -> MMA wait
+# - `mbar_P_full_2`             : softmax arrive        -> MMA wait
+# - `mbar_corr_epi_full_/empty` : correction <-> epilogue (only when epilogue is separate)
+#
+# Empty tile (`total_block_cnt == 0`):
+# - Softmax: skips the seqlen_kv softmax path entirely (no P stores, no `mbar_P_full_*`).
+#   It only arrives `mbar_softmax_corr_full` once per stage as a synthetic "no work" signal.
+#   At the `softmax_loop` level, softmax unconditionally waits `mbar_softmax_corr_empty`
+#   before each tile (when block-sparse) to drain a prior correction arrival and keep
+#   phases aligned across non-empty -> empty transitions.
+# - Correction: waits `mbar_softmax_corr_full`, seeds stats + runs `correction_epilogue(scale=0)`,
+#   and arrives `mbar_softmax_corr_empty` (and `mbar_corr_epi_full_/empty` when applicable).
+# - No `mbar_P_full_*` barriers are arrived (no P, no MMA O); only the softmax<->correction
+#   (and correction<->epilogue) handshakes advance phases.
+#
+# Non-empty tile:
+# - Softmax: runs `softmax_step` (produces P) and uses `mbar_softmax_corr_full/empty` to
+#   publish row_max (during seqlen_kv) and final row stats (once per tile), and to advance phases;
+#   arrives `mbar_P_full_*` when P is stored.
+# - Correction: waits `mbar_softmax_corr_full`, may rescale/release O, arrives `mbar_softmax_corr_empty`
+#   to ack/advance, and arrives `mbar_P_full_O_rescaled` when MMA can proceed.
+#
+# Backward (SM100):
+# - Empty KV tile: for a given `n_block`, `total_m_block_cnt == 0` means no Q tiles contribute.
+# - Both the load and compute loops guard all pipeline work on `process_tile`, so empty tiles
+#   skip producer/consumer operations entirely (no per-tile mbarrier phase handshake like forward).
+# - In the `not dKV_postprocess` path, dK/dV for empty KV tiles are explicitly written as zeros
+#   even when `process_tile == False` (see `flash_bwd_sm100.py` `should_zero_dKV`).
+
+
 @cute.jit
 def load_block_list(
     block_indices: cute.Tensor,
@@ -672,10 +721,20 @@ def handle_block_sparse_empty_tile_correction_sm100(
     gO: Optional[cute.Tensor] = None,
     gmem_tiled_copy_O: Optional[cute.TiledCopy] = None,
 ):
-    """Handle the block-sparse case where a tile is fully masked:
-    * zero staged results
-    * seed stats
-    * satisfy the usual barrier protocol so downstream warps continue to make progress.
+    """Handle SM100 forward block-sparse tiles with no active KV blocks.
+
+    This path is taken when `total_block_cnt == 0`. The softmax warp-group still
+    arrives `mbar_softmax_corr_full` (synthetic "no work") so the correction
+    warp-group can:
+
+    - seed fully-masked-row stats (row_sum=1; row_max=-inf when tracked) for LSE
+    - run `correction_epilogue` with `scale=0` so the output tile is written as zeros
+      (independent of any prior tmem contents)
+    - wait on `mbar_softmax_corr_full` and arrive `mbar_softmax_corr_empty`
+      (and `mbar_corr_epi_*` when applicable) so phases stay aligned across tiles
+
+    This helper intentionally does not touch `mbar_P_full_*` since no P is produced.
+    See NOTE [SM100 block-sparse empty tiles: mbarrier contract].
     """
     LOG2_E = Float32(math.log2(math.e))
 
@@ -709,6 +768,7 @@ def handle_block_sparse_empty_tile_correction_sm100(
         acc_flag = row_sum_value == Float32(0.0) or row_sum_value != row_sum_value
         stats[stage] = (row_sum_value, row_max_value, acc_flag)
 
+        # See NOTE [SM100 block-sparse empty tiles: mbarrier contract].
         cute.arch.mbarrier_wait(
             mbar_ptr + mbar_softmax_corr_full_offset + stage,
             softmax_corr_consumer_phase,
@@ -735,11 +795,8 @@ def handle_block_sparse_empty_tile_correction_sm100(
         )
         if const_expr(gmem_tiled_copy_O is None):
             cute.arch.mbarrier_arrive(mbar_ptr + mbar_corr_epi_full_offset + stage)
-        cute.arch.mbarrier_arrive(mbar_ptr + mbar_P_full_O_rescaled_offset + stage)
-        cute.arch.mbarrier_arrive(mbar_ptr + mbar_P_full_2_offset + stage)
 
     softmax_corr_consumer_phase ^= 1
-    o_corr_consumer_phase ^= 1
     corr_epi_producer_phase ^= 1
 
     return (
@@ -789,10 +846,8 @@ def softmax_block_sparse_sm100(
     total_block_cnt = curr_mask_block_cnt + curr_full_block_cnt
 
     if total_block_cnt == 0:
+        # See NOTE [SM100 block-sparse empty tiles: mbarrier contract].
         cute.arch.mbarrier_arrive(mbar_ptr + mbar_softmax_corr_full_offset + stage_idx)
-        cute.arch.mbarrier_arrive(mbar_ptr + mbar_P_full_O_rescaled_offset + stage_idx)
-        cute.arch.mbarrier_arrive(mbar_ptr + mbar_P_full_2_offset + stage_idx)
-        cute.arch.mbarrier_arrive(mbar_ptr + mbar_softmax_corr_empty_offset + stage_idx)
     else:
         if curr_mask_block_cnt > 0:
             mask_n_block = curr_mask_block_idx[curr_mask_block_cnt - 1]
