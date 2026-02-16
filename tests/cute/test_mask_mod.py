@@ -1415,5 +1415,61 @@ def test_gqa_expand_stride_zero_bug():
     assert cute_dv_err <= bwd_rtol * pt_dv_err + dv_atol, f"dV error too large: {cute_dv_err:.2e}"
 
 
+@pytest.mark.skipif(COMPUTE_CAPABILITY not in (10, 11), reason="SM100/SM110 persistent forward only")
+def test_persistent_blocksparse_empty_tiles():
+    """Regression test for persistent forward deadlock with highly-sparse block masks.
+
+    When most Q-tiles are empty (no active KV blocks), the persistent kernel
+    deadlocked due to barrier phase desync in the empty-tile paths of both the
+    softmax and correction warp groups.
+    """
+    torch.manual_seed(5)
+    batch_size, nheads_q, nheads_kv = 2, 16, 1
+    seqlen_q, seqlen_k, headdim = 8192, 128, 128
+    tile_m, tile_n = 128, 128
+    dtype = torch.bfloat16
+
+    sparse_tile_m = 2 * tile_m if COMPUTE_CAPABILITY == 10 else tile_m
+    window_size = 64
+    mask_mod_cute, mask_mod_flex = get_mask_pair(
+        "sliding_window", seqlen_q=seqlen_q, seqlen_k=seqlen_k, window_size=window_size,
+    )
+
+    bm = create_block_mask(
+        mask_mod_flex, batch_size, nheads_q, seqlen_q, seqlen_k,
+        device="cuda", BLOCK_SIZE=(sparse_tile_m, tile_n),
+    )
+    (_, _, kv_mask_cnt, kv_mask_idx, full_kv_cnt, full_kv_idx, *_) = bm.as_tuple()
+    block_sparse_mask_fwd = BlockSparseTensorsTorch(
+        mask_block_cnt=kv_mask_cnt, mask_block_idx=kv_mask_idx,
+        full_block_cnt=full_kv_cnt, full_block_idx=full_kv_idx,
+        block_size=(sparse_tile_m, tile_n),
+    )
+
+    q = torch.randn(batch_size, seqlen_q, nheads_q, headdim, device="cuda", dtype=dtype)
+    k = torch.randn(batch_size, seqlen_k, nheads_kv, headdim, device="cuda", dtype=dtype)
+    v = torch.randn(batch_size, seqlen_k, nheads_kv, headdim, device="cuda", dtype=dtype)
+
+    out, lse = _flash_attn_fwd(
+        q=q, k=k, v=v,
+        out=torch.empty(batch_size, seqlen_q, nheads_q, headdim, device="cuda", dtype=dtype),
+        lse=torch.empty(batch_size, nheads_q, seqlen_q, device="cuda", dtype=torch.float32),
+        cu_seqlens_q=None, cu_seqlens_k=None, seqused_q=None, seqused_k=None,
+        page_table=None, softmax_scale=1.0 / math.sqrt(headdim),
+        causal=False, softcap=None,
+        window_size_left=None, window_size_right=None,
+        learnable_sink=None,
+        m_block_size=tile_m, n_block_size=tile_n,
+        pack_gqa=False, _compute_capability=None,
+        score_mod=None, mask_mod=mask_mod_cute,
+        block_sparse_tensors=block_sparse_mask_fwd,
+        return_lse=True, aux_tensors=None,
+    )
+    torch.cuda.synchronize()
+    assert out.shape == (batch_size, seqlen_q, nheads_q, headdim)
+    assert not out.isnan().any()
+
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])

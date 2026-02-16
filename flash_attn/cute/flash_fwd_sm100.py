@@ -1735,8 +1735,8 @@ class FlashAttentionForwardSm100:
                 head_divmod=head_divmod,
             )
 
-            if has_work:
-                # Softmax acts as the producer: wait until correction signals the stage is empty
+            if const_expr(self.use_block_sparsity) or has_work:
+                # See block_sparse_utils.py NOTE [SM100 block-sparse empty tiles: mbarrier contract].
                 cute.arch.mbarrier_wait(
                     mbar_ptr + self.mbar_softmax_corr_empty_offset + stage, si_corr_producer_phase
                 )
@@ -1786,6 +1786,7 @@ class FlashAttentionForwardSm100:
                         ] = softmax.row_max[0]
                     # if tidx == 0:
                     #     cute.printf("softmax row sum stage %d: %f, row_max = %f\n", stage, softmax.row_sum[0], softmax.row_max[0])
+                    # See block_sparse_utils.py NOTE [SM100 block-sparse empty tiles: mbarrier contract].
                     cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_softmax_corr_full_offset + stage)
                     # if tidx == 0: cute.printf("softmax row sum stage %d: %f\n", stage, softmax.row_sum[0])
             else:
