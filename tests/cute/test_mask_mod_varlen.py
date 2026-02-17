@@ -1,0 +1,476 @@
+# mask_mod varlen test script
+# Forward-only, no block sparsity (block sparsity will be added later)
+#
+# Since flex_attention doesn't support varlen natively, we compare
+# results sequence-by-sequence: run the kernel with cu_seqlens (packed),
+# then run flex_attention per-sequence and compare.
+#
+# Usage:
+#   pytest test_mask_mod_varlen.py -v -s
+
+import math
+import random
+
+import pytest
+import torch
+import torch.nn.functional as F
+import cutlass
+import cutlass.cute as cute
+from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+
+from flash_attn.cute.interface import _flash_attn_fwd
+from flash_attn.cute import utils
+from mask_mod_definitions import (
+    get_mask_pair,
+    random_doc_id_tensor,
+    STATIC_MASKS,
+    PARAMETERIZED_MASK_FACTORIES,
+)
+
+COMPUTE_CAPABILITY = torch.cuda.get_device_capability()[0]
+
+
+@pytest.fixture(autouse=True)
+def reset_torch_state():
+    """Reset torch dynamo/compile state between tests to avoid state pollution."""
+    torch._dynamo.reset()
+    torch.cuda.empty_cache()
+    yield
+    torch._dynamo.reset()
+    torch.cuda.empty_cache()
+
+
+# =============================================================================
+# Seqlen configs for varlen (list of per-sequence lengths)
+# =============================================================================
+
+SEQLEN_CONFIGS = [
+    # Simple cases
+    ([1], [1]),
+    ([64], [64]),
+    ([128], [128]),
+    # Multiple sequences, same length
+    ([128, 128], [128, 128]),
+    ([64, 64, 64], [64, 64, 64]),
+    # Multiple sequences, varying lengths
+    ([64, 128], [64, 128]),
+    ([32, 64, 128], [32, 64, 128]),
+    ([113, 203], [113, 203]),
+    ([256, 512], [256, 512]),
+    # Asymmetric Q/K lengths
+    ([64, 128], [32, 64]),
+    ([100, 100], [50, 50]),
+    # Edge cases
+    ([1, 1], [1, 1]),
+    ([1, 256], [1, 256]),
+    ([256, 1], [256, 1]),
+    ([17, 33, 65], [17, 33, 65]),
+    # Larger sequences
+    ([1024, 1024], [1024, 1024]),
+    ([256, 512, 256], [128, 256, 128]),
+]
+
+SEQLEN_CONFIGS_SMOKE = [
+    ([128, 128], [128, 128]),
+    ([64, 128], [64, 128]),
+    ([113, 203], [113, 203]),
+    ([256, 512], [256, 512]),
+    ([64, 128], [32, 64]),
+]
+
+
+# =============================================================================
+# Helper functions
+# =============================================================================
+
+
+def setup_varlen_tensors(
+    seqlens_q, seqlens_k, num_heads, num_kv_heads, head_dim, dtype
+):
+    """Create packed Q, K, V tensors and cu_seqlens for varlen."""
+    device = "cuda"
+    batch_size = len(seqlens_q)
+    total_q = sum(seqlens_q)
+    total_k = sum(seqlens_k)
+
+    q = torch.randn(total_q, num_heads, head_dim, device=device, dtype=dtype)
+    k = torch.randn(total_k, num_kv_heads, head_dim, device=device, dtype=dtype)
+    v = torch.randn(total_k, num_kv_heads, head_dim, device=device, dtype=dtype)
+
+    cu_seqlens_q = torch.tensor(
+        [0] + list(torch.tensor(seqlens_q).cumsum(0).tolist()),
+        device=device,
+        dtype=torch.int32,
+    )
+    cu_seqlens_k = torch.tensor(
+        [0] + list(torch.tensor(seqlens_k).cumsum(0).tolist()),
+        device=device,
+        dtype=torch.int32,
+    )
+
+    return q, k, v, cu_seqlens_q, cu_seqlens_k
+
+
+def run_flex_per_sequence(
+    q,
+    k,
+    v,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    mask_mod_flex_factory,
+    seqlens_q,
+    seqlens_k,
+    num_heads,
+    num_kv_heads,
+    head_dim,
+    dtype=None,
+):
+    """Run flex_attention per-sequence as reference for varlen.
+
+    mask_mod_flex_factory(seq_idx, seqlen_q_i, seqlen_k_i) -> mask_mod function
+    that takes (b, h, q_idx, kv_idx) for that sequence.
+    """
+    batch_size = len(seqlens_q)
+    results = []
+
+    for i in range(batch_size):
+        sq = seqlens_q[i]
+        sk = seqlens_k[i]
+
+        # Extract packed slices
+        q_slice = q[cu_seqlens_q[i] : cu_seqlens_q[i + 1]].unsqueeze(0)  # (1, sq, H, D)
+        k_slice = k[cu_seqlens_k[i] : cu_seqlens_k[i + 1]].unsqueeze(
+            0
+        )  # (1, sk, Hkv, D)
+        v_slice = v[cu_seqlens_k[i] : cu_seqlens_k[i + 1]].unsqueeze(0)
+
+        if dtype is not None:
+            q_slice = q_slice.to(dtype)
+            k_slice = k_slice.to(dtype)
+            v_slice = v_slice.to(dtype)
+
+        # Transpose to (B, H, S, D) for flex_attention
+        q_t = q_slice.transpose(1, 2)
+        k_t = k_slice.transpose(1, 2)
+        v_t = v_slice.transpose(1, 2)
+
+        # Expand KV heads for GQA
+        if num_heads != num_kv_heads:
+            repeat_factor = num_heads // num_kv_heads
+            k_t = k_t.repeat_interleave(repeat_factor, dim=1)
+            v_t = v_t.repeat_interleave(repeat_factor, dim=1)
+
+        scale = 1.0 / math.sqrt(head_dim)
+
+        mask_mod = mask_mod_flex_factory(i, sq, sk)
+
+        if mask_mod is None:
+            out = F.scaled_dot_product_attention(q_t, k_t, v_t, scale=scale)
+        else:
+            block_mask = create_block_mask(
+                mask_mod,
+                B=1,
+                H=num_heads,
+                Q_LEN=sq,
+                KV_LEN=sk,
+                device=q.device,
+            )
+            out = flex_attention(
+                q_t, k_t, v_t, block_mask=block_mask, scale=scale, enable_gqa=True
+            )
+
+        results.append(out.transpose(1, 2).squeeze(0))  # back to (sq, H, D)
+
+    return torch.cat(results, dim=0)
+
+
+def check_varlen_results(
+    out_cute,
+    out_ref_fp32,
+    out_pt,
+    seqlens_q,
+    cu_seqlens_q,
+    test_name,
+    rtol=2,
+    extra_atol=2e-3,
+):
+    """Compare CuTE output against per-sequence flex references."""
+    assert not torch.isnan(out_cute).any(), f"{test_name}: NaN in output"
+    assert torch.isfinite(out_cute).all(), f"{test_name}: Inf in output"
+    assert out_cute.shape == out_ref_fp32.shape, (
+        f"{test_name}: Shape mismatch: {out_cute.shape} vs {out_ref_fp32.shape}"
+    )
+
+    num_seqs = len(seqlens_q)
+    max_cute_error = 0.0
+    max_pt_error = 0.0
+
+    for i in range(num_seqs):
+        start = cu_seqlens_q[i]
+        end = cu_seqlens_q[i + 1]
+        cute_seq = out_cute[start:end]
+        ref_seq = out_ref_fp32[start:end]
+        pt_seq = out_pt[start:end]
+
+        max_cute_error = max(max_cute_error, (cute_seq - ref_seq).abs().max().item())
+        max_pt_error = max(max_pt_error, (pt_seq - ref_seq).abs().max().item())
+
+    fwd_atol = 2 * (out_ref_fp32 + 0.3 - 0.3 - out_ref_fp32).abs().max().item()
+
+    print(f"\n{test_name}:")
+    print(f"  PyTorch vs FP32 ref: {max_pt_error:.2e}")
+    print(f"  CuTE vs FP32 ref: {max_cute_error:.2e}")
+
+    tol = rtol * max_pt_error + fwd_atol + extra_atol
+    assert max_cute_error <= tol, (
+        f"{test_name}: CuTE error {max_cute_error:.2e} exceeds tolerance {tol:.2e} "
+        f"(rtol={rtol} * pt_err={max_pt_error:.2e} + fwd_atol={fwd_atol:.2e} + extra={extra_atol:.2e})"
+    )
+
+
+# =============================================================================
+# Core test runner
+# =============================================================================
+
+
+def _run_varlen_mask_test(
+    seqlens_q,
+    seqlens_k,
+    num_heads,
+    num_kv_heads,
+    head_dim,
+    dtype,
+    mask_name,
+    window_size=None,
+):
+    """Run a varlen mask_mod test: kernel with cu_seqlens vs per-sequence flex_attention."""
+    torch.manual_seed(42)
+    random.seed(42)
+
+    batch_size = len(seqlens_q)
+    pack_gqa = num_heads != num_kv_heads
+
+    if mask_name == "sliding_window":
+        # Skip configs where any seqlen_q > seqlen_k
+        for sq, sk in zip(seqlens_q, seqlens_k):
+            if sq > sk:
+                pytest.skip(
+                    "sliding_window requires seqlen_q <= seqlen_k for each sequence"
+                )
+
+    q, k, v, cu_seqlens_q, cu_seqlens_k = setup_varlen_tensors(
+        seqlens_q, seqlens_k, num_heads, num_kv_heads, head_dim, dtype
+    )
+
+    if mask_name == "block_causal":
+        offsets = [sk - sq for sq, sk in zip(seqlens_q, seqlens_k)]
+        if len(set(offsets)) > 1:
+            pytest.skip(
+                "block_causal captures offset as compile-time constant; "
+                "varlen with different per-sequence offsets not supported"
+            )
+
+    aux_tensors_arg = None
+
+    if mask_name == "document":
+        max_seqlen = max(max(seqlens_q), max(seqlens_k))
+        max_doc_len = max(max(seqlens_q), max(seqlens_k))
+        doc_ids = random_doc_id_tensor(
+            num_heads, batch_size, max_doc_len, device="cuda"
+        ).to(dtype=torch.int32, device="cuda")
+        aux_tensors_arg = [doc_ids]
+
+        from mask_mod_definitions import flex_document_mask
+
+        cute_mask_mod = get_mask_pair("document")[0]
+
+        def flex_factory(seq_idx, sq, sk, doc_ids=doc_ids):
+            def _mask(b, h, q_idx, kv_idx):
+                return flex_document_mask(seq_idx, h, q_idx, kv_idx, doc_ids)
+
+            return _mask
+
+    elif mask_name == "ima":
+        total_k = sum(seqlens_k)
+        pytest.skip(
+            "IMA mask requires global index handling for varlen - not yet implemented"
+        )
+
+    else:
+        if mask_name in STATIC_MASKS:
+            cute_mask_mod = get_mask_pair(mask_name)[0]
+
+            def flex_factory(seq_idx, sq, sk):
+                return get_mask_pair(mask_name)[1]
+
+        elif mask_name in PARAMETERIZED_MASK_FACTORIES:
+            cute_mask_mod = get_mask_pair(
+                mask_name,
+                seqlen_q=seqlens_q[0],
+                seqlen_k=seqlens_k[0],
+                window_size=window_size,
+            )[0]
+
+            def flex_factory(seq_idx, sq, sk):
+                _, flex_mask = get_mask_pair(
+                    mask_name,
+                    seqlen_q=sq,
+                    seqlen_k=sk,
+                    window_size=window_size,
+                )
+                return flex_mask
+
+        else:
+            raise ValueError(f"Unknown mask: {mask_name}")
+
+    # Run the kernel with varlen (packed format)
+    out = torch.empty_like(q)
+    softmax_scale = 1.0 / math.sqrt(head_dim)
+
+    out_tuple = _flash_attn_fwd(
+        q=q,
+        k=k,
+        v=v,
+        out=out,
+        lse=None,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        seqused_q=None,
+        seqused_k=None,
+        page_table=None,
+        softmax_scale=softmax_scale,
+        causal=False,
+        softcap=None,
+        window_size_left=-1,
+        window_size_right=-1,
+        learnable_sink=None,
+        m_block_size=128,
+        n_block_size=128,
+        pack_gqa=pack_gqa,
+        _compute_capability=None,
+        score_mod=None,
+        mask_mod=cute_mask_mod,
+        block_sparse_tensors=None,
+        return_lse=True,
+        aux_tensors=aux_tensors_arg,
+    )
+    out_cute = out_tuple[0]
+
+    # Run per-sequence flex_attention references
+    out_ref_fp32 = run_flex_per_sequence(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        flex_factory,
+        seqlens_q,
+        seqlens_k,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        dtype=torch.float32,
+    )
+    out_pt = run_flex_per_sequence(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        flex_factory,
+        seqlens_q,
+        seqlens_k,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        dtype=dtype,
+    )
+
+    # Check results
+    mask_desc = f"mask_mod={mask_name}"
+    if window_size is not None:
+        mask_desc += f"(w={window_size})"
+    test_name = (
+        f"{mask_desc} varlen seqs_q={seqlens_q}, seqs_k={seqlens_k}, "
+        f"H={num_heads}/{num_kv_heads}, D={head_dim}"
+    )
+    check_varlen_results(
+        out_cute, out_ref_fp32, out_pt, seqlens_q, cu_seqlens_q, test_name
+    )
+
+
+# =============================================================================
+# Test cases
+# =============================================================================
+
+# Masks that don't need recompilation per seqlen (fast)
+STATIC_MASK_NAMES = ["block_diagonal", "mini_causal"]
+
+# Masks that need per-seqlen compilation (slower)
+PARAMETERIZED_MASK_CONFIGS = [
+    ("causal", None),
+    ("block_causal", None),
+    ("sliding_window", 128),
+    ("sliding_window", 256),
+    ("document", None),
+]
+
+
+@pytest.mark.parametrize("seqlens_q,seqlens_k", SEQLEN_CONFIGS)
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("kv_mode", ["mha", "gqa"])
+@pytest.mark.parametrize("mask_name", STATIC_MASK_NAMES)
+def test_varlen_static_masks(seqlens_q, seqlens_k, dtype, kv_mode, mask_name):
+    """Test static mask_mods with varlen (packed) attention."""
+    num_heads = 8
+    if kv_mode == "gqa":
+        if COMPUTE_CAPABILITY < 9:
+            pytest.xfail("pack_gqa requires SM90+")
+        num_kv_heads = 2
+    else:
+        num_kv_heads = num_heads
+
+    _run_varlen_mask_test(
+        seqlens_q=seqlens_q,
+        seqlens_k=seqlens_k,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=128,
+        dtype=dtype,
+        mask_name=mask_name,
+    )
+
+
+@pytest.mark.parametrize("seqlens_q,seqlens_k", SEQLEN_CONFIGS_SMOKE)
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("kv_mode", ["mha", "gqa"])
+@pytest.mark.parametrize("mask_name,window_size", PARAMETERIZED_MASK_CONFIGS)
+def test_varlen_parameterized_masks(
+    seqlens_q, seqlens_k, dtype, kv_mode, mask_name, window_size
+):
+    """Test parameterized mask_mods with varlen (packed) attention.
+
+    Uses fewer seqlen configs since these require recompilation per seqlen.
+    """
+    num_heads = 8
+    if kv_mode == "gqa":
+        if COMPUTE_CAPABILITY < 9:
+            pytest.xfail("pack_gqa requires SM90+")
+        num_kv_heads = 2
+    else:
+        num_kv_heads = num_heads
+
+    _run_varlen_mask_test(
+        seqlens_q=seqlens_q,
+        seqlens_k=seqlens_k,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        head_dim=128,
+        dtype=dtype,
+        mask_name=mask_name,
+        window_size=window_size,
+    )
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v", "-s"])
