@@ -533,7 +533,16 @@ def _flash_attn_fwd(
         window_size_left,
         window_size_right,
         learnable_sink,
-        normalized_block_sparse_tensors[:4] if normalized_block_sparse_tensors is not None else None,
+        (
+            normalized_block_sparse_tensors.mask_block_cnt,
+            normalized_block_sparse_tensors.mask_block_idx,
+            normalized_block_sparse_tensors.full_block_cnt,
+            normalized_block_sparse_tensors.full_block_idx,
+            normalized_block_sparse_tensors.dq_write_order,
+            normalized_block_sparse_tensors.dq_write_order_full,
+        )
+        if normalized_block_sparse_tensors is not None
+        else None,
         aux_tensors,
     )
     if is_split_kv:
@@ -915,6 +924,30 @@ def _flash_attn_bwd(
             block_size=(m_block_size, n_block_size),
             subtile_factor=subtile_factor,
         )
+        if deterministic:
+            if normalized_block_sparse_tensors.dq_write_order is None:
+                raise ValueError(
+                    "deterministic block-sparse backward requires dq_write_order in block_sparse_tensors"
+                )
+            if (
+                normalized_block_sparse_tensors.full_block_cnt is not None
+                and normalized_block_sparse_tensors.dq_write_order_full is None
+            ):
+                raise ValueError(
+                    "deterministic block-sparse backward requires dq_write_order_full when full blocks are present"
+                )
+            if normalized_block_sparse_tensors.spt is None:
+                raise ValueError(
+                    "deterministic block-sparse backward requires block_sparse_tensors.spt "
+                    "to match dq_write_order direction"
+                )
+    if (
+        normalized_block_sparse_tensors is not None
+        and normalized_block_sparse_tensors.spt is not None
+    ):
+        spt = normalized_block_sparse_tensors.spt and deterministic
+    else:
+        spt = (causal or local) and deterministic
 
     if compute_capability == 9:
         compile_key = (
@@ -966,6 +999,7 @@ def _flash_attn_bwd(
             pack_gqa,
             cluster_size,
             deterministic,
+            spt,
             score_mod_hash,
             score_mod_bwd_hash,
             mask_mod_hash,
@@ -1055,6 +1089,7 @@ def _flash_attn_bwd(
                 cluster_size=cluster_size,
                 # cluster_size=1,
                 deterministic=deterministic,
+                spt=spt,
                 score_mod=score_mod,
                 score_mod_bwd=score_mod_bwd,
                 mask_mod=mask_mod,
@@ -1118,7 +1153,16 @@ def _flash_attn_bwd(
         dK_semaphore,
         dV_semaphore,
         aux_tensors,
-        normalized_block_sparse_tensors[:4] if normalized_block_sparse_tensors is not None else None,
+        (
+            normalized_block_sparse_tensors.mask_block_cnt,
+            normalized_block_sparse_tensors.mask_block_idx,
+            normalized_block_sparse_tensors.full_block_cnt,
+            normalized_block_sparse_tensors.full_block_idx,
+            normalized_block_sparse_tensors.dq_write_order,
+            normalized_block_sparse_tensors.dq_write_order_full,
+        )
+        if normalized_block_sparse_tensors is not None
+        else None,
     )
 
     num_threads = 256 if compute_capability == 9 else 128
