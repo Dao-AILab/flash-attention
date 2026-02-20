@@ -571,6 +571,9 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     if (cc_major < 8) {
         TORCH_CHECK(q.dtype() == torch::kFloat16,
             "FlashAttention on Volta (V100) only supports FP16, not BF16.");
+        TORCH_CHECK(!(is_causal && q.size(-1) > 192),
+            "FlashAttention on Volta (V100) does not support causal mode with head_dim > 192. "
+            "Use non-causal mode or reduce head_dim to 192 or less.");
     }
 
     auto q_dtype = q.dtype();
@@ -832,6 +835,8 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multipl
     if (cc_major < 8) {
         TORCH_CHECK(q.dtype() == torch::kFloat16,
             "FlashAttention backward on Volta (V100) only supports FP16, not BF16.");
+        TORCH_CHECK(!alibi_slopes_.has_value(),
+            "FlashAttention backward on Volta (V100) does not support ALiBi.");
     }
 
     bool is_dropout = p_dropout > 0.0;
@@ -1047,6 +1052,8 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     if (cc_major < 8) {
         TORCH_CHECK(q.dtype() == torch::kFloat16,
             "FlashAttention backward on Volta (V100) only supports FP16, not BF16.");
+        TORCH_CHECK(!alibi_slopes_.has_value(),
+            "FlashAttention backward on Volta (V100) does not support ALiBi.");
     }
 
     bool is_dropout = p_dropout > 0.0;
