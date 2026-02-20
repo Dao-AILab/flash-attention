@@ -607,8 +607,7 @@ struct CollectiveMainloopBwdSm90 {
             seqlen_info, n_block, bidb, params.window_size_left,
             params.window_size_right, 0 /*sink_token_length*/);
         // It's possible to have m_block_max <= m_block_min. Exit early
-        // Though if local and deterministic, still need to increment dq semaphore
-        if constexpr ((Is_causal || Is_local || Varlen) && !(Is_local && Deterministic)) {
+        if constexpr (Is_causal || Is_local || Varlen) {
             if (m_block_max <= m_block_min) { return; }
         }
 
@@ -637,7 +636,11 @@ struct CollectiveMainloopBwdSm90 {
                     int n_block_max_for_m_block = std::min(n_block_global_max, cute::ceil_div((m_block + 1) * kBlockM + seqlen_info.seqlen_k - seqlen_info.seqlen_q, kBlockN));
                     Barrier::wait_eq(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_block * num_batch * num_head, n_block_max_for_m_block - 1 - n_block);
                 } else {
-                    Barrier::wait_eq(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_block * num_batch * num_head, n_block);
+                    int n_block_min = 0;
+                    if constexpr(Is_local) {
+                        n_block_min = std::max(n_block_min, (m_block * kBlockM + seqlen_info.seqlen_k - seqlen_info.seqlen_q - params.window_size_left) / kBlockN);
+                    }
+                    Barrier::wait_eq(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_block * num_batch * num_head, n_block - n_block_min);
                 }
             }
             #pragma unroll
@@ -654,13 +657,6 @@ struct CollectiveMainloopBwdSm90 {
                 cutlass::arch::NamedBarrier::arrive(cutlass::NumThreadsPerWarpGroup + cutlass::NumThreadsPerWarp, static_cast<uint32_t>(BwdNamedBarriers::dQEmptyWG1) + warpgroup_idx /*id*/);  // sdQ empty, ready to be written to
             });
             if constexpr (Deterministic) {
-                Barrier::arrive_inc(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_block * num_batch * num_head);
-            }
-        }
-        if constexpr (Is_local && Deterministic) {
-            int const m_block_global_max = cute::ceil_div(seqlen_info.seqlen_q, kBlockM);
-            #pragma unroll 2
-            for (; m_block < m_block_global_max; ++m_block) {
                 Barrier::arrive_inc(lock_ptr, threadIdx.x % cutlass::NumThreadsPerWarp, m_block * num_batch * num_head);
             }
         }
