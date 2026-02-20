@@ -648,7 +648,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         """
         assert learnable_sink is None, "Learnable sink is not supported in this kernel"
         self._check_type(
-            *(t.element_type if t is not None else None for t in (mQ, mK, mV, mO, mLSE))
+            *(t.element_type if t is not None else None for t in (mQ, mK, mV, mO, mLSE)),
+            None, None, None, None,  # SM80 kernel does not support varlen
         )
         tiled_mma_qk, tiled_mma_pv = self._get_tiled_mma()
         self.num_mma_threads = tiled_mma_pv.size
@@ -764,7 +765,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             window_size_right,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
         )
-        seqlen = SeqlenInfoQK.create(seqlen_q_static=mQ.shape[0], seqlen_k_static=mK.shape[0])
+        seqlen = SeqlenInfoQK.create(batch_size, seqlen_q_static=mQ.shape[0], seqlen_k_static=mK.shape[0])
         n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
         # TODO: return early if n_block_max == 0
         # if self.is_causal:
@@ -902,6 +903,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             batch_idx=batch_size,
             head_idx=num_head,
             m_block=m_block,
+            seqlen=seqlen,
             aux_tensors=aux_tensors,
             fastdiv_mods=fastdiv_mods,
         )
@@ -953,14 +955,15 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         mask = AttentionMask(
             self.tile_m,
             self.tile_n,
-            seqlen.seqlen_q,
-            seqlen.seqlen_k,
+            seqlen,
             window_size_left,
             window_size_right,
             self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
         )
         mask_fn = partial(
             mask.apply_mask,
+            batch_idx=batch_size,
+            head_idx=num_head,
             m_block=m_block,
             thr_mma=thr_mma_qk,
             mask_causal=self.is_causal,

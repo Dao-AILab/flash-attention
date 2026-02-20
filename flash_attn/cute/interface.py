@@ -44,6 +44,7 @@ from flash_attn.cute import utils
 from flash_attn.cute.cute_dsl_utils import to_cute_tensor, to_cute_aux_tensor, get_aux_tensor_metadata
 from flash_attn.cute.flash_fwd import FlashAttentionForwardSm90
 from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
+from flash_attn.cute.flash_fwd_sm120 import FlashAttentionForwardSm120
 from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
 from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
 from flash_attn.cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
@@ -253,7 +254,7 @@ def _flash_attn_fwd(
         else _compute_capability
     )
 
-    assert compute_capability in [9, 10, 11], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x"
+    assert compute_capability in [9, 10, 11, 12], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x, 12.x"
 
     use_block_sparsity = block_sparse_tensors is not None
 
@@ -271,6 +272,17 @@ def _flash_attn_fwd(
         causal, local = False, False
 
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+
+    if compute_capability == 12:
+        # SM120: uses SM80 MMA with 99 KB SMEM.
+        # SMEM = (tile_m * hdim + 2 * tile_n * hdim) * 2 bytes must fit in 99 KB.
+        # D<=64:  m=128,n=128 → 48 KB (good occupancy, higher throughput)
+        # D>64:   m=128,n=64  → 64 KB (n=128 would use 96 KB, killing occupancy)
+        if head_dim <= 64:
+            m_block_size, n_block_size = 128, 128
+        else:
+            m_block_size, n_block_size = 128, 64
+        num_threads = 128  # SM80-style CpAsync, all threads do load + compute
 
     if compute_capability == 9:  # TODO: tune block size according to hdim.
         if head_dim == head_dim_v == 128 and not causal and not local and not use_block_sparsity:
@@ -490,52 +502,120 @@ def _flash_attn_fwd(
                     or seqused_q is not None,
                 q_subtile_factor=q_subtile_factor,
             )
+        elif compute_capability == 12:
+            # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
+            assert page_table is None, "paged KV not supported on SM 12.0"
+            assert not is_split_kv, "SplitKV not supported on SM 12.0"
+            assert not use_block_sparsity, "Block sparsity not supported on SM 12.0"
+            assert cu_seqlens_q is None and cu_seqlens_k is None, "Varlen not yet supported on SM 12.0"
+            assert seqused_q is None and seqused_k is None, "seqused not yet supported on SM 12.0"
+            # SM80 kernel always writes LSE, so ensure it's allocated
+            if lse is None:
+                lse = torch.empty(lse_shape, dtype=torch.float32, device=device)
+            fa_fwd = FlashAttentionForwardSm120(
+                dtype,
+                head_dim,
+                head_dim_v,
+                qhead_per_kvhead,
+                is_causal=causal,
+                is_local=local,
+                pack_gqa=pack_gqa,
+                tile_m=m_block_size,
+                tile_n=n_block_size,
+                num_stages=1,
+                num_threads=num_threads,
+                Q_in_regs=False,
+                score_mod=score_mod,
+                mask_mod=mask_mod,
+                has_aux_tensors=aux_tensors is not None,
+            )
         else:
             raise ValueError(
-                f"Unsupported compute capability: {compute_capability}. Supported: 9.x, 10.x, 11.x"
+                f"Unsupported compute capability: {compute_capability}. Supported: 9.x, 10.x, 11.x, 12.x"
             )
         # TODO: check @can_implement
-        _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
-            fa_fwd,
-            q_tensor,
-            k_tensor,
-            v_tensor,
-            o_tensor,
-            lse_tensor,
+        if compute_capability == 12:
+            # SM120 uses SM80's __call__ signature: (mQ, mK, mV, mO, mLSE, stream, scale, ...)
+            # SM80 __call__ has Optional[Float32] / Optional[Int32] annotations which
+            # require explicit CUTLASS type wrappers (auto-conversion only works for
+            # non-optional scalar params).
+            lse_tensor = to_cute_tensor(lse, assumed_align=4)
+            _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
+                fa_fwd,
+                q_tensor,
+                k_tensor,
+                v_tensor,
+                o_tensor,
+                lse_tensor,
+                current_stream,
+                cutlass.Float32(softmax_scale),
+                cutlass.Int32(window_size_left) if window_size_left is not None else None,
+                cutlass.Int32(window_size_right) if window_size_right is not None else None,
+                learnable_sink_tensor,
+                cute_aux_tensors,
+                options="--enable-tvm-ffi",
+            )
+        else:
+            _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
+                fa_fwd,
+                q_tensor,
+                k_tensor,
+                v_tensor,
+                o_tensor,
+                lse_tensor,
+                softmax_scale,
+                current_stream,
+                cu_seqlens_q_tensor,
+                cu_seqlens_k_tensor,
+                seqused_q_tensor,
+                seqused_k_tensor,
+                page_table_tensor,
+                window_size_left,
+                window_size_right,
+                learnable_sink_tensor,
+                sparse_tensors,
+                cute_aux_tensors,
+                options="--enable-tvm-ffi",
+            )
+
+    # SM120: SM80 kernel always writes LSE, ensure it's allocated even on cache hits
+    if compute_capability == 12 and lse is None:
+        lse = torch.empty(lse_shape, dtype=torch.float32, device=device)
+
+    if compute_capability == 12:
+        _flash_attn_fwd.compile_cache[compile_key](
+            q.detach(),
+            k.detach(),
+            v.detach(),
+            out.detach(),
+            lse,
+            current_stream,
+            cutlass.Float32(softmax_scale),
+            cutlass.Int32(window_size_left) if window_size_left is not None else None,
+            cutlass.Int32(window_size_right) if window_size_right is not None else None,
+            learnable_sink,
+            aux_tensors,
+        )
+    else:
+        _flash_attn_fwd.compile_cache[compile_key](
+            q.detach(),
+            k.detach(),
+            v.detach(),
+            out.detach() if not is_split_kv else out_partial,
+            lse_partial if is_split_kv else lse,
             softmax_scale,
             current_stream,
-            cu_seqlens_q_tensor,
-            cu_seqlens_k_tensor,
-            seqused_q_tensor,
-            seqused_k_tensor,
-            page_table_tensor,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            seqused_q,
+            seqused_k,
+            page_table,
             window_size_left,
             window_size_right,
-            learnable_sink_tensor,
-            sparse_tensors,
-            cute_aux_tensors,
-            options="--enable-tvm-ffi",
+            learnable_sink,
+            normalized_block_sparse_tensors[:4] if normalized_block_sparse_tensors is not None else None,
+            aux_tensors,
         )
-
-    _flash_attn_fwd.compile_cache[compile_key](
-        q.detach(),
-        k.detach(),
-        v.detach(),
-        out.detach() if not is_split_kv else out_partial,
-        lse_partial if is_split_kv else lse,
-        softmax_scale,
-        current_stream,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        seqused_q,
-        seqused_k,
-        page_table,
-        window_size_left,
-        window_size_right,
-        learnable_sink,
-        normalized_block_sparse_tensors[:4] if normalized_block_sparse_tensors is not None else None,
-        aux_tensors,
-    )
     if is_split_kv:
         _flash_attn_fwd_combine(
             out_partial,
@@ -593,7 +673,8 @@ def _flash_attn_bwd(
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     compute_capability = _get_device_capability()
-    assert compute_capability in [9, 10, 11], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x"
+    assert compute_capability in [9, 10, 11, 12], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x, 12.x"
+    assert compute_capability != 12, "Backward pass not yet supported on SM 12.0 (forward only)"
 
     if compute_capability == 9:
         m_block_size = 80 if not causal else 64
