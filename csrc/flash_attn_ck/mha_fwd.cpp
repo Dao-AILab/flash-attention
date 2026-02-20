@@ -157,7 +157,7 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
         bool is_causal,
         int window_size_left,
         int window_size_right,
-        const float /*softcap*/,
+        /*const float softcap*/,
         const bool return_dropout_randval,
         std::optional<at::Generator> gen_)
 {
