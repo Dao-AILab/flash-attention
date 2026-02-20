@@ -14,14 +14,17 @@ from cutlass.cute.nvgpu import cpasync, warp, warpgroup
 from cutlass import Float32, const_expr
 from cutlass.utils import LayoutEnum
 
+from quack import copy_utils
+from quack import layout_utils
+from quack import sm90_utils
+
 from flash_attn.cute import utils
-from flash_attn.cute import copy_utils
+from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import ampere_helpers as sm80_utils
-from flash_attn.cute import hopper_helpers as sm90_utils
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
+from quack.cute_dsl_utils import ParamsBase
 from flash_attn.cute.tile_scheduler import (
-    ParamsBase,
     SingleTileScheduler,
     SingleTileVarlenScheduler,
     TileSchedulerArguments,
@@ -171,8 +174,10 @@ class FlashAttentionBackwardPostprocess:
                 (self.tile_m * self.tile_hdim // dQaccum_reduce_stage, dQaccum_reduce_stage)
             )
 
+        num_copy_elems = 128 // self.dtype.width
+        threads_per_row = self.tile_hdim // num_copy_elems
         self.gmem_tiled_copy_dQ = copy_utils.tiled_copy_2d(
-            self.dtype, self.tile_hdim, self.num_threads
+            self.dtype, threads_per_row, self.num_threads, num_copy_elems
         )
         # ///////////////////////////////////////////////////////////////////////////////
         # Shared memory layout: dQ
@@ -213,15 +218,7 @@ class FlashAttentionBackwardPostprocess:
             if const_expr(mdQaccum.element_type not in [cutlass.Float32]):
                 raise TypeError("dQaccum tensor must be Float32")
 
-        # Assume all strides are divisible by 128 bits except the last stride
-        new_stride = lambda t: (
-            *(cute.assume(s, divby=128 // t.element_type.width) for s in t.stride[:-1]),
-            t.stride[-1],
-        )
-        mdQaccum, mdQ = [
-            cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t)))
-            for t in (mdQaccum, mdQ)
-        ]
+        mdQaccum, mdQ = [assume_tensor_aligned(t) for t in (mdQaccum, mdQ)]
 
         self.tiled_mma = self._get_tiled_mma()
         self._setup_attributes()
@@ -314,7 +311,7 @@ class FlashAttentionBackwardPostprocess:
                 cute.recast_ptr(sdQaccum.iterator, sdQ_layout.inner, dtype=self.dtype),
                 sdQ_layout.outer,
             )[None, None, 0]
-        sdQt = utils.transpose_view(sdQ)
+        sdQt = layout_utils.transpose_view(sdQ)
 
         # Thread index, block index
         tidx, _, _ = cute.arch.thread_idx()

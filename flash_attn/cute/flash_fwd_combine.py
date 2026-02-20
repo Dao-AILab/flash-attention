@@ -2,7 +2,6 @@
 # A reimplementation of https://github.com/Dao-AILab/flash-attention/blob/main/hopper/flash_fwd_combine_kernel.h
 # from Cutlass C++ to Cute-DSL.
 import math
-import operator
 from typing import Type, Optional
 from functools import partial
 
@@ -14,6 +13,7 @@ from cutlass.cute.nvgpu import cpasync
 from cutlass import Float32, Int32, const_expr
 
 from flash_attn.cute import utils
+from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute.seqlen_info import SeqlenInfo
 from cutlass.cute import FastDivmodDivisor
 
@@ -232,15 +232,7 @@ class FlashAttentionForwardCombine:
                 "LSE tensor must have 2 or 3 dimensions: (batch, seqlen, nheads) or (total_q, nheads)"
             )
 
-        # Assume all strides are divisible by 128 bits except the last stride
-        new_stride = lambda t: (
-            *(cute.assume(s, divby=128 // t.element_type.width) for s in t.stride[:-1]),
-            t.stride[-1],
-        )
-        mO_partial, mO = [
-            cute.make_tensor(t.iterator, cute.make_layout(t.shape, stride=new_stride(t)))
-            for t in (mO_partial, mO)
-        ]
+        mO_partial, mO = [assume_tensor_aligned(t) for t in (mO_partial, mO)]
         # (num_splits, b, seqlen, h, d) -> (seqlen, d, num_splits, h, b)
         # or (num_splits, total_q, h, d) -> (total_q, d, num_splits, h)
         O_partial_layout_transpose = (
@@ -402,11 +394,9 @@ class FlashAttentionForwardCombine:
             # ===============================
 
             if const_expr(cu_seqlens is None):
-                # mLSE_partial_cur = mLSE_partial[None, None, None, batch_idx]
-                mLSE_partial_cur = utils.coord_offset_i64(mLSE_partial, batch_idx, dim=3)
+                mLSE_partial_cur = mLSE_partial[None, None, None, batch_idx]
             else:
-                # mLSE_partial_cur = cute.domain_offset((offset, 0, 0), mLSE_partial)
-                mLSE_partial_cur = utils.domain_offset_i64((offset, 0, 0), mLSE_partial)
+                mLSE_partial_cur = cute.domain_offset((offset, 0, 0), mLSE_partial)
             mLSE_partial_copy = cute.tiled_divide(mLSE_partial_cur, (1,))
 
             gmem_thr_copy_LSE = gmem_tiled_copy_LSE.get_slice(tidx)
@@ -450,11 +440,9 @@ class FlashAttentionForwardCombine:
             tOcO = gmem_thr_copy_O_partial.partition_D(cO)
             tOsO_partial = gmem_thr_copy_O_partial.partition_D(sO)
             if const_expr(cu_seqlens is None):
-                # mO_partial_cur = mO_partial[None, None, None, None, batch_idx]
-                mO_partial_cur = utils.coord_offset_i64(mO_partial, batch_idx, dim=4)
+                mO_partial_cur = mO_partial[None, None, None, None, batch_idx]
             else:
-                # mO_partial_cur = cute.domain_offset((offset, 0, 0, 0), mO_partial)
-                mO_partial_cur = utils.domain_offset_i64((offset, 0, 0, 0), mO_partial)
+                mO_partial_cur = cute.domain_offset((offset, 0, 0, 0), mO_partial)
 
             # Precompute these values to avoid recomputing them in the loop
             num_rows = const_expr(cute.size(tOcO, mode=[1]))
@@ -469,7 +457,7 @@ class FlashAttentionForwardCombine:
                 else:
                     tOhidx[m] = idx // seqlen
                     tOmidx[m] = idx - tOhidx[m] * seqlen
-                tOrOptr[m] = utils.elem_pointer_i64(
+                tOrOptr[m] = utils.elem_pointer(
                     mO_partial_cur, (tOmidx[m], k_block * self.k_block_size, 0, tOhidx[m])
                 ).toint()
                 if idx >= max_idx:
@@ -529,12 +517,11 @@ class FlashAttentionForwardCombine:
             for m in cutlass.range(cute.size(ts2rrLSE, mode=[2]), unroll_full=True):
                 # Find max LSE value across splits
                 threads_per_col = const_expr(self.smem_threads_per_col_lse)
-                lse_max = utils.warp_reduce(
+                lse_max = cute.arch.warp_reduction_max(
                     ts2rrLSE[None, None, m]
                     .load()
                     .reduce(cute.ReductionOp.MAX, init_val=-Float32.inf, reduction_profile=0),
-                    op=cute.arch.fmax,
-                    width=threads_per_col,
+                    threads_in_group=threads_per_col,
                 )
                 # if cute.arch.thread_idx()[0] == 0: cute.printf(lse_max)
                 # Find max valid split index
@@ -543,7 +530,9 @@ class FlashAttentionForwardCombine:
                     if ts2rrLSE[0, s, m] != -Float32.inf:
                         max_valid_idx = ts2rcLSE[0, s, 0][0]  # Get split coordinate
                 # if cute.arch.thread_idx()[0] < 32: cute.printf(max_valid_idx)
-                max_valid_split[m] = utils.warp_reduce(max_valid_idx, max, width=threads_per_col)
+                max_valid_split[m] = cute.arch.warp_reduction_max(
+                    max_valid_idx, threads_in_group=threads_per_col
+                )
                 # Compute exp scales and sum
                 lse_max_cur = (
                     0.0 if lse_max == -Float32.inf else lse_max
@@ -551,11 +540,15 @@ class FlashAttentionForwardCombine:
                 LOG2_E = math.log2(math.e)
                 lse_sum_cur = 0.0
                 for s in cutlass.range(cute.size(ts2rrLSE, mode=[1]), unroll_full=True):
-                    scale = utils.exp2f(ts2rrLSE[0, s, m] * LOG2_E - (lse_max_cur * LOG2_E))
+                    scale = cute.math.exp2(
+                        ts2rrLSE[0, s, m] * LOG2_E - (lse_max_cur * LOG2_E), fastmath=True
+                    )
                     lse_sum_cur += scale
                     ts2rrLSE[0, s, m] = scale  # Store scale for later use
-                lse_sum_cur = utils.warp_reduce(lse_sum_cur, operator.add, width=threads_per_col)
-                lse_sum[m] = utils.logf(lse_sum_cur) + lse_max
+                lse_sum_cur = cute.arch.warp_reduction_sum(
+                    lse_sum_cur, threads_in_group=threads_per_col
+                )
+                lse_sum[m] = cute.math.log(lse_sum_cur, fastmath=True) + lse_max
                 # Normalize scales
                 inv_sum = (
                     0.0 if (lse_sum_cur == 0.0 or lse_sum_cur != lse_sum_cur) else 1.0 / lse_sum_cur
@@ -577,11 +570,9 @@ class FlashAttentionForwardCombine:
 
             if const_expr(mLSE is not None):
                 if const_expr(cu_seqlens is None):
-                    # mLSE_cur = mLSE[None, None, batch_idx]
-                    mLSE_cur = utils.coord_offset_i64(mLSE, batch_idx, dim=2)
+                    mLSE_cur = mLSE[None, None, batch_idx]
                 else:
-                    # mLSE_cur = cute.domain_offset((offset, 0), mLSE)
-                    mLSE_cur = utils.domain_offset_i64((offset, 0), mLSE)
+                    mLSE_cur = cute.domain_offset((offset, 0), mLSE)
                 if k_block == 0:  # Only first k_block writes LSE when mLSE is provided
                     for m in cutlass.range(cute.size(ts2rrLSE, mode=[2]), unroll_full=True):
                         if ts2rcLSE[0, 0, m][0] == 0:  # Only thread responsible for s=0 writes
@@ -649,11 +640,9 @@ class FlashAttentionForwardCombine:
             rO = cute.make_fragment_like(tOrO, self.dtype)
             rO.store(tOrO.load().to(self.dtype))
             if const_expr(cu_seqlens is None):
-                # mO_cur = mO[None, None, None, batch_idx]
-                mO_cur = utils.coord_offset_i64(mO, batch_idx, dim=3)
+                mO_cur = mO[None, None, None, batch_idx]
             else:
-                # mO_cur = cute.domain_offset((offset, 0, 0), mO)
-                mO_cur = utils.domain_offset_i64((offset, 0, 0), mO)
+                mO_cur = cute.domain_offset((offset, 0, 0), mO)
             mO_cur = utils.domain_offset_aligned((0, k_block * self.k_block_size, 0), mO_cur)
             elems_per_store = const_expr(cute.size(gmem_tiled_copy_O.layout_tv_tiled[1]))
             # mO_cur_copy = cute.tiled_divide(mO_cur, (1, elems_per_store,))
@@ -698,7 +687,6 @@ class FlashAttentionForwardCombine:
                     if const_expr(self.is_even_k) or tOpO[k]:
                         cute.copy(
                             gmem_tiled_copy_O_partial,
-                            # mO_partial_cur_copy[None, k_idx, split],
-                            utils.coord_offset_i64(mO_partial_cur_copy, split, dim=2)[None, k_idx],
+                            mO_partial_cur_copy[None, k_idx, split],
                             tOsO_partial_cur[None, m, k],
                         )

@@ -19,6 +19,7 @@
 # - FP8
 # - bwd pass optimized for Hopper/Blackwell
 
+import os
 import math
 from functools import lru_cache
 from typing import Optional, Tuple, Callable
@@ -31,8 +32,16 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 
+
+if os.environ.get("CUTE_DSL_PTXAS_PATH", None) is not None:
+    from flash_attn.cute import cute_dsl_ptxas  # noqa: F401
+
+    # Patch to dump ptx and then use system ptxas to compile to cubin
+    cute_dsl_ptxas.patch()
+
+
 from flash_attn.cute import utils
-from flash_attn.cute.cute_dsl_utils import to_cute_tensor
+from flash_attn.cute.cute_dsl_utils import to_cute_tensor, to_cute_aux_tensor, get_aux_tensor_metadata
 from flash_attn.cute.flash_fwd import FlashAttentionForwardSm90
 from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
 from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
@@ -359,7 +368,11 @@ def _flash_attn_fwd(
             block_size=(m_block_size, n_block_size),
             q_stage=q_stage,
         )
-
+    if aux_tensors is not None:    
+        aux_tensor_metadata = get_aux_tensor_metadata(aux_tensors)
+    else:
+        aux_tensor_metadata = None
+    
     compile_key = (
         dtype,
         head_dim,
@@ -370,7 +383,7 @@ def _flash_attn_fwd(
         mask_mod_hash,
         use_block_sparsity,
         block_sparse_broadcast_pattern,
-        len(aux_tensors) if aux_tensors is not None else 0,
+        aux_tensor_metadata,
         lse is None,
         cu_seqlens_q is None,
         cu_seqlens_k is None,
@@ -423,8 +436,9 @@ def _flash_attn_fwd(
             sparse_tensors = to_cute_block_sparse_tensors(normalized_block_sparse_tensors)
 
         cute_aux_tensors = None
+        aux_tensor_metadata = None
         if aux_tensors is not None:
-            cute_aux_tensors = [to_cute_tensor(buf, assumed_align=None, fully_dynamic=True) for buf in aux_tensors]
+            cute_aux_tensors = [to_cute_aux_tensor(buf) for buf in aux_tensors]
 
         if compute_capability == 9:
             assert page_table is None, "paged KV not supported on SM 9.0"
@@ -504,10 +518,10 @@ def _flash_attn_fwd(
         )
 
     _flash_attn_fwd.compile_cache[compile_key](
-        q,
-        k,
-        v,
-        out if not is_split_kv else out_partial,
+        q.detach(),
+        k.detach(),
+        v.detach(),
+        out.detach() if not is_split_kv else out_partial,
         lse_partial if is_split_kv else lse,
         softmax_scale,
         current_stream,
@@ -595,6 +609,13 @@ def _flash_attn_bwd(
         AtomLayoutMdQ = 1
         cluster_size = 1
         assert window_size_left is None and window_size_right is None, "local not supported yet on 9.x"
+        is_varlen = (
+            cu_seqlens_q is not None
+            or cu_seqlens_k is not None
+            or seqused_q is not None
+            or seqused_k is not None
+        )
+        assert not is_varlen, "varlen backward is not yet supported on sm90"
     else:
         m_block_size = 128
         n_block_size = 128
@@ -1075,9 +1096,9 @@ def _flash_attn_bwd(
             options="--enable-tvm-ffi",
         )
     _flash_attn_bwd.compile_cache[compile_key](
-        q,
-        k,
-        v,
+        q.detach(),
+        k.detach(),
+        v.detach(),
         dout,
         lse_log2,
         dpsum,

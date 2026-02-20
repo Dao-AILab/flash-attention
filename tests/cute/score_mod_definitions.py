@@ -16,9 +16,25 @@ def score_mod_identity(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_t
 
 
 @cute.jit
+def score_mod_identity_vectorized(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+    return tSrS_ssa
+
+
+@cute.jit
 def score_mod_causal(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
     mask = operator.ge(q_idx, kv_idx)
     return cute.where(mask, tSrS_ssa, cute.full_like(tSrS_ssa, float("-inf")))
+
+
+@cute.jit
+def score_mod_causal_vectorized(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+    mask = cute.make_rmem_tensor(kv_idx.shape, dtype=cutlass.Boolean)
+    kv_idx0 = kv_idx[0]
+    q_idx0 = q_idx[0]
+    for i in cutlass.range_constexpr(cute.size(mask.shape)):
+        mask[i] = q_idx0 >= kv_idx0 + i
+    mask_ssa = mask.load()
+    return cute.where(mask_ssa, tSrS_ssa, cute.full_like(tSrS_ssa, float("-inf")))
 
 
 @cute.jit
@@ -26,6 +42,18 @@ def score_mod_rel_bias(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_t
     diff = q_idx - kv_idx
     abs_diff = cute.TensorSSA(mlir_math.absi(diff), diff.shape, diff.dtype)
     return tSrS_ssa + abs_diff.to(cutlass.Float32)
+
+
+@cute.jit
+def score_mod_rel_bias_vectorized(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+    q_idx0 = q_idx[0]
+    kv_idx0 = kv_idx[0]
+    diff0 = q_idx0 - kv_idx0
+    abs_diff = cute.make_rmem_tensor(kv_idx.shape, dtype=diff0.dtype)
+    for i in cutlass.range_constexpr(cute.size(kv_idx.shape)):
+        diffi = diff0 - i
+        abs_diff[i] = mlir_math.absi(diffi)
+    return tSrS_ssa + abs_diff.load().to(cutlass.Float32)
 
 
 @cute.jit
@@ -37,9 +65,24 @@ def score_mod_rel_bias_x2(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, au
 
 
 @cute.jit
+def score_mod_rel_bias_x2_vectorized(
+    tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors
+):
+    q_idx0 = q_idx[0]
+    kv_idx0 = kv_idx[0]
+    diff0 = q_idx0 - kv_idx0
+    abs_diff_x2 = cute.make_rmem_tensor(kv_idx.shape, dtype=diff0.dtype)
+    for i in cutlass.range_constexpr(cute.size(kv_idx.shape)):
+        diffi = diff0 - i
+        abs_diff_x2[i] = mlir_math.absi(diffi) * 2
+    return tSrS_ssa + abs_diff_x2.load().to(cutlass.Float32)
+
+
+@cute.jit
 def score_mod_times_two(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
     return tSrS_ssa * cute.full_like(tSrS_ssa, 2)
 
+score_mod_times_two_vectorized = score_mod_times_two
 
 @cute.jit
 def score_mod_alibi(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
@@ -52,6 +95,21 @@ def score_mod_alibi(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tens
     diff = q_idx - kv_idx
     abs_diff = cute.TensorSSA(mlir_math.absi(diff), diff.shape, diff.dtype).to(cutlass.Float32)
     return score - slope * abs_diff
+
+@cute.jit
+def score_mod_alibi_vectorized(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+    score = tSrS_ssa.to(cutlass.Float32)
+    slope_exp = (h_idx + cute.full_like(h_idx, 1)) * cute.full_like(h_idx, -8)
+    slope = cute.math.exp2(
+        slope_exp.to(cutlass.Float32)
+        * cute.full_like(score, 0.125 * 0.6931471805599453 * 1.4426950408889634)
+    )
+    diff0 = q_idx[0] - kv_idx[0]
+    abs_diff = cute.make_rmem_tensor(kv_idx.shape, diff0.dtype)
+    for i in cutlass.range_constexpr(cute.size(abs_diff.shape)):
+        diffi = diff0 - i
+        abs_diff[i] = mlir_math.absi(diffi)
+    return score - slope * abs_diff.load().to(cutlass.Float32)
 
 
 @cute.jit
@@ -88,6 +146,16 @@ def score_mod_batch_bias(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux
     bias_val = (bias_frag.load()).to(cutlass.Float32)
     return tSrS_ssa + bias_val
 
+@cute.jit
+def score_mod_batch_bias_vectorized(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+    batch_bias = aux_tensors[0]
+    dtype = batch_bias.element_type
+    b_idx0 = b_idx[0]
+    bias_frag = cute.make_rmem_tensor(1, dtype)
+    bias_frag[0] = batch_bias[b_idx0]
+    bias_val = (bias_frag.load()).to(cutlass.Float32)
+    return tSrS_ssa + bias_val
+
 
 @cute.jit
 def score_mod_dual_buffer(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
@@ -105,6 +173,22 @@ def score_mod_dual_buffer(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, au
     q_frag.store(q_idx)
     pos_val_frag = cute.make_fragment(1, dtype)
     pos_val_frag[0] = pos_bias[q_frag[0]]
+    pos_val = (pos_val_frag.load()).to(cutlass.Float32)
+
+    return tSrS_ssa + head_val + pos_val
+
+@cute.jit
+def score_mod_dual_buffer_vectorized(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+    head_bias = aux_tensors[0]
+    pos_bias = aux_tensors[1]
+    dtype = head_bias.element_type
+
+    head_val_frag = cute.make_fragment(1, dtype)
+    head_val_frag[0] = head_bias[h_idx[0]]
+    head_val = (head_val_frag.load()).to(cutlass.Float32)
+
+    pos_val_frag = cute.make_fragment(1, dtype)
+    pos_val_frag[0] = pos_bias[q_idx[0]]
     pos_val = (pos_val_frag.load()).to(cutlass.Float32)
 
     return tSrS_ssa + head_val + pos_val
