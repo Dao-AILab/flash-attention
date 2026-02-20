@@ -59,9 +59,10 @@ from flash_attn.cute.block_sparsity import (
 )
 
 @lru_cache(maxsize=None)
-def _get_device_capability():
-    """Cached device capability check."""
-    return torch.cuda.get_device_capability()[0]
+def _get_device_arch():
+    """Cached device arch check."""
+    major, minor = torch.cuda.get_device_capability()
+    return major * 10 + minor
 
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
@@ -116,7 +117,7 @@ def _flash_attn_fwd(
     num_threads: int = 384,
     num_splits: int = 1,
     pack_gqa: Optional[bool] = None,
-    _compute_capability: Optional[int] = None,
+    _arch: Optional[int] = None,
     score_mod: Optional[Callable] = None,
     mask_mod: Optional[Callable] = None,
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
@@ -247,13 +248,9 @@ def _flash_attn_fwd(
         _validate_tensor(lse, "lse", lse_shape, torch.float32, device)
 
     dtype = torch2cute_dtype_map[q.dtype]
-    compute_capability = (
-        _get_device_capability()
-        if _compute_capability is None
-        else _compute_capability
-    )
+    arch = _get_device_arch() if _arch is None else _arch
 
-    assert compute_capability in [9, 10, 11], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x"
+    assert arch // 10 in [9, 10, 11], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x"
 
     use_block_sparsity = block_sparse_tensors is not None
 
@@ -272,11 +269,11 @@ def _flash_attn_fwd(
 
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
-    if compute_capability == 9:  # TODO: tune block size according to hdim.
+    if arch // 10 == 9:  # TODO: tune block size according to hdim.
         if head_dim == head_dim_v == 128 and not causal and not local and not use_block_sparsity:
             n_block_size = 192
 
-    if compute_capability in [10, 11]:
+    if arch // 10 in [10, 11]:
         if (
             pack_gqa
             and (128 % qhead_per_kvhead != 0)
@@ -291,7 +288,7 @@ def _flash_attn_fwd(
     if max_seqlen_k is None:
         max_seqlen_k = seqlen_k
     seqlen_q_packgqa = max_seqlen_q * qhead_per_kvhead
-    if compute_capability == 10:
+    if arch // 10 == 10:
         q_stage = 2 if seqlen_q_packgqa > m_block_size else 1
     else:
         q_stage = 1
@@ -399,7 +396,7 @@ def _flash_attn_fwd(
         num_threads,
         is_split_kv,
         pack_gqa,
-        compute_capability,
+        arch,
         page_size not in [None, 128],  # paged KV non-TMA
         q_subtile_factor,
     )
@@ -440,7 +437,7 @@ def _flash_attn_fwd(
         if aux_tensors is not None:
             cute_aux_tensors = [to_cute_aux_tensor(buf) for buf in aux_tensors]
 
-        if compute_capability == 9:
+        if arch // 10 == 9:
             assert page_table is None, "paged KV not supported on SM 9.0"
             assert not is_split_kv, "SplitKV not supported on SM 9.0"
             # fa_fwd = FlashAttentionForwardSm80(
@@ -465,7 +462,7 @@ def _flash_attn_fwd(
                 has_aux_tensors=aux_tensors is not None,
                 q_subtile_factor=q_subtile_factor,
             )
-        elif compute_capability in [10, 11]:
+        elif arch // 10 in [10, 11]:
             fa_fwd = FlashAttentionForwardSm100(
                 head_dim,
                 head_dim_v,
@@ -489,10 +486,11 @@ def _flash_attn_fwd(
                 is_varlen_q=cu_seqlens_q is not None
                     or seqused_q is not None,
                 q_subtile_factor=q_subtile_factor,
+                arch=arch,
             )
         else:
             raise ValueError(
-                f"Unsupported compute capability: {compute_capability}. Supported: 9.x, 10.x, 11.x"
+                f"Unsupported compute capability: {arch}. Supported: 9.x, 10.x, 11.x"
             )
         # TODO: check @can_implement
         _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
@@ -592,10 +590,10 @@ def _flash_attn_bwd(
     aux_tensors: Optional[list[torch.Tensor]] = None,
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    compute_capability = _get_device_capability()
-    assert compute_capability in [9, 10, 11], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x"
+    arch = _get_device_arch()
+    assert arch // 10 in [9, 10, 11], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x"
 
-    if compute_capability == 9:
+    if arch // 10 == 9:
         m_block_size = 80 if not causal else 64
         n_block_size = 128
         num_stages_Q = 2
@@ -663,7 +661,7 @@ def _flash_attn_bwd(
 
     # SM90 block-sparse backward: tile_m=64 is the GCD between a m_block_size that fits,
     # the base block_m of 128 from forward, and block-sparse size for subtiling.
-    if compute_capability == 9 and use_block_sparsity:
+    if arch // 10 == 9 and use_block_sparsity:
         m_block_size = 64
         # dQ_swapAB tuning: use False when m_block_size=64 (same as causal case)
         dQ_swapAB = False
@@ -721,7 +719,7 @@ def _flash_attn_bwd(
         pack_gqa = qhead_per_kvhead > 1
     # pack_gqa backward not yet supported in bwd
     pack_gqa = False
-    if compute_capability not in [10, 11]:
+    if arch // 10 not in [10, 11]:
         assert deterministic is False, "bwd deterministic only supported for sm100/sm110 for now"
 
     if score_mod is not None:
@@ -833,7 +831,7 @@ def _flash_attn_bwd(
 
     # Preprocess kernel: compute (o * dout).sum(dim=-1), lse * log2_e, and zero out dq_accum.
     compile_key_pre = (
-        compute_capability,
+        arch,
         dtype,
         head_dim_v,
         m_block_size,
@@ -851,7 +849,6 @@ def _flash_attn_bwd(
             to_cute_tensor(t, assumed_align=4) if t is not None else None
             for t in (cu_seqlens_q, seqused_q)
         ]
-        arch = compute_capability * 10
         fa_bwd_pre = FlashAttentionBackwardPreprocess(
             dtype,
             head_dim_v,
@@ -916,9 +913,9 @@ def _flash_attn_bwd(
             subtile_factor=subtile_factor,
         )
 
-    if compute_capability == 9:
+    if arch // 10 == 9:
         compile_key = (
-            compute_capability,
+            arch,
             dtype,
             head_dim,
             head_dim_v,
@@ -951,7 +948,7 @@ def _flash_attn_bwd(
         )
     else:
         compile_key = (
-            compute_capability,
+            arch,
             dtype,
             head_dim,
             head_dim_v,
@@ -1017,7 +1014,7 @@ def _flash_attn_bwd(
             AtomLayoutMdQ,
             V_in_regs=V_in_regs,
         )
-        if compute_capability == 9:
+        if arch // 10 == 9:
             fa_bwd_obj = FlashAttentionBackwardSm90(
                 dtype,
                 head_dim,
@@ -1121,11 +1118,10 @@ def _flash_attn_bwd(
         normalized_block_sparse_tensors[:4] if normalized_block_sparse_tensors is not None else None,
     )
 
-    num_threads = 256 if compute_capability == 9 else 128
-    arch = compute_capability * 10
+    num_threads = 256 if arch // 10 == 9 else 128
     # Postprocess kernel: convert dq_accum from float32 to dq in bf16/fp16
     compile_key_post = (
-        compute_capability,
+        arch,
         dtype,
         head_dim,
         m_block_size,
@@ -1168,7 +1164,7 @@ def _flash_attn_bwd(
     if dKV_postprocess:
         # Postprocess kernel: convert dk_accum & dv_accum from float32 to bf16/fp16
         compile_key_post = (
-            compute_capability,
+            arch,
             dtype,
             head_dim,
             n_block_size,
@@ -1185,7 +1181,6 @@ def _flash_attn_bwd(
                 to_cute_tensor(t, assumed_align=4) if t is not None else None
                 for t in (cu_seqlens_k, seqused_k)
             ]
-            arch = compute_capability * 10
             fa_bwd_post = FlashAttentionBackwardPostprocess(
                 dtype, head_dim, arch, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB
             )
@@ -1209,7 +1204,7 @@ def _flash_attn_bwd(
             current_stream,
         )
         compile_key_post = (
-            compute_capability,
+            arch,
             dtype,
             head_dim_v,
             n_block_size,
@@ -1226,7 +1221,6 @@ def _flash_attn_bwd(
                 to_cute_tensor(t, assumed_align=4) if t is not None else None
                 for t in (cu_seqlens_k, seqused_k)
             ]
-            arch = compute_capability * 10
             fa_bwd_post = FlashAttentionBackwardPostprocess(
                 dtype, head_dim_v, arch, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB
             )

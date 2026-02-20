@@ -90,6 +90,7 @@ class FlashAttentionForwardSm100:
         has_aux_tensors: cutlass.Constexpr = False,
         paged_kv_non_tma: bool = False,
         is_varlen_q: bool = False,
+        arch: int = 100,
     ):
         self.use_tma_KV = not paged_kv_non_tma
         # self.dtype = dtype
@@ -106,6 +107,8 @@ class FlashAttentionForwardSm100:
         self.n_block_size = n_block_size
         self.q_stage = q_stage
         assert self.q_stage in [1, 2]
+        self.arch = arch
+        assert arch // 10 in [10, 11], "Only SM 10.x and 11.x are supported"
 
         # 2 Q tile per CTA
         self.cta_tiler = (self.q_stage * m_block_size, n_block_size, self.head_dim_padded)
