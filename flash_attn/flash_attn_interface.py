@@ -1471,27 +1471,110 @@ def flash_attn_varlen_func(
     )
 
 
+@_torch_custom_op_wrapper("flash_attn::_mha_fwd_kvcache", mutates_args=("k_cache", "v_cache", "out"), device_types="cuda")
+def _mha_fwd_kvcache(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    k: Optional[torch.Tensor] = None,
+    v: Optional[torch.Tensor] = None,
+    cache_seqlens: Optional[Union[(int, torch.Tensor)]] = None,
+    rotary_cos: Optional[torch.Tensor] = None,
+    rotary_sin: Optional[torch.Tensor] = None,
+    cache_batch_idx: Optional[torch.Tensor] = None,
+    cache_leftpad: Optional[torch.Tensor] = None,
+    block_table: Optional[torch.Tensor] = None,
+    alibi_slopes: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    window_size_left: int = -1,
+    window_size_right: int = -1, 
+    softcap: float = 0.0, # 0.0 means deactivated
+    rotary_interleaved: bool = True,
+    num_splits: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return flash_attn_gpu.fwd_kvcache(
+        q,
+        k_cache,
+        v_cache,
+        k,
+        v,
+        cache_seqlens,
+        rotary_cos,
+        rotary_sin,
+        cache_batch_idx,
+        cache_leftpad,
+        block_table,
+        alibi_slopes,
+        out,
+        softmax_scale,
+        causal,
+        window_size_left,
+        window_size_right,
+        softcap,
+        rotary_interleaved,
+        num_splits,
+    )
+
+
+@_torch_register_fake_wrapper("flash_attn::_mha_fwd_kvcache")
+def _mha_fwd_kvcache_fake(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    k: Optional[torch.Tensor] = None,
+    v: Optional[torch.Tensor] = None,
+    cache_seqlens: Optional[Union[(int, torch.Tensor)]] = None,
+    rotary_cos: Optional[torch.Tensor] = None,
+    rotary_sin: Optional[torch.Tensor] = None,
+    cache_batch_idx: Optional[torch.Tensor] = None,
+    cache_leftpad: Optional[torch.Tensor] = None,
+    block_table: Optional[torch.Tensor] = None,
+    alibi_slopes: Optional[torch.Tensor] = None,
+    out: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    window_size_left: int = -1,
+    window_size_right: int = -1, 
+    softcap: float = 0.0, # 0.0 means deactivated
+    rotary_interleaved: bool = True,
+    num_splits: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    batch_size, seqlen_q, num_heads, head_size = q.size()
+    out_ = torch.empty_like(q)
+    softmax_lse = q.new_empty((batch_size, num_heads, seqlen_q), dtype=torch.float32)
+
+    return out_, softmax_lse
+
+
+if torch.__version__ >= "2.4.0":
+    _wrapped_flash_attn_mha_fwd_kvcache = torch.ops.flash_attn._mha_fwd_kvcache
+else:
+    _wrapped_flash_attn_mha_fwd_kvcache = _mha_fwd_kvcache
+
+
 def flash_attn_with_kvcache(
-    q,
-    k_cache,
-    v_cache,
-    k=None,
-    v=None,
-    rotary_cos=None,
-    rotary_sin=None,
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    k: Optional[torch.Tensor] = None,
+    v: Optional[torch.Tensor] = None,
+    rotary_cos: Optional[torch.Tensor] = None,
+    rotary_sin: Optional[torch.Tensor] = None,
     cache_seqlens: Optional[Union[(int, torch.Tensor)]] = None,
     cache_batch_idx: Optional[torch.Tensor] = None,
     cache_leftpad: Optional[torch.Tensor] = None,
     block_table: Optional[torch.Tensor] = None,
-    softmax_scale=None,
-    causal=False,
-    window_size=(-1, -1),  # -1 means infinite context window
-    softcap=0.0, # 0.0 means deactivated
-    rotary_interleaved=True,
-    alibi_slopes=None,
-    num_splits=0,
-    return_softmax_lse=False,
-):
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    window_size: tuple[int, int] = (-1, -1),  # -1 means infinite context window
+    softcap: float = 0.0, # 0.0 means deactivated
+    rotary_interleaved: bool = True,
+    alibi_slopes: Optional[torch.Tensor] = None,
+    num_splits: int = 0,
+    return_softmax_lse: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     If k and v are not None, k_cache and v_cache will be updated *inplace* with the new values from
     k and v. This is useful for incremental decoding: you can pass in the cached keys/values from
@@ -1591,7 +1674,7 @@ def flash_attn_with_kvcache(
         cache_seqlens = maybe_contiguous(cache_seqlens)
     cache_batch_idx = maybe_contiguous(cache_batch_idx)
     block_table = maybe_contiguous(block_table)
-    out, softmax_lse = flash_attn_gpu.fwd_kvcache(
+    out, softmax_lse = _wrapped_flash_attn_mha_fwd_kvcache(
         q,
         k_cache,
         v_cache,
