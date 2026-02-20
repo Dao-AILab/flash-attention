@@ -208,6 +208,38 @@ def store_shared_remote_fp32x4(
 
 
 @dsl_user_op
+def cpasync_bulk_s2cluster(
+    smem_src_ptr: cute.Pointer,
+    smem_dst_ptr: cute.Pointer,
+    mbar_ptr: cute.Pointer,
+    size: int | Int32,
+    peer_cta_rank_in_cluster: Int32,
+    *,
+    loc=None,
+    ip=None,
+):
+    smem_src_ptr_i32 = smem_src_ptr.toint(loc=loc, ip=ip).ir_value()
+    smem_dst_ptr_i32 = set_block_rank(
+        smem_dst_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip
+    ).ir_value()
+    mbar_ptr_i32 = set_block_rank(mbar_ptr, peer_cta_rank_in_cluster, loc=loc, ip=ip).ir_value()
+    llvm.inline_asm(
+        None,
+        [
+            smem_dst_ptr_i32,
+            smem_src_ptr_i32,
+            mbar_ptr_i32,
+            Int32(size).ir_value(loc=loc, ip=ip),
+        ],
+        "cp.async.bulk.shared::cluster.shared::cta.mbarrier::complete_tx::bytes [$0], [$1], $3, [$2];",
+        "r,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
 def cpasync_bulk_g2s(
     gmem_ptr: cute.Pointer,
     smem_ptr: cute.Pointer,

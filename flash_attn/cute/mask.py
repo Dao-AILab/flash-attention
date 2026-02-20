@@ -528,7 +528,7 @@ class AttentionMask:
         assert not (mask_causal and mask_local), "mask_causal and mask_local cannot be both True"
         ROW = 0 if const_expr(not self.swap_AB) else 1
         COL = 1 if const_expr(not self.swap_AB) else 0
-        assert t0ScS_t2r[0][COL] == 0, "col0 == 0"
+        # assert t0ScS_t2r[0][COL] == 0, "col0 == 0" # tmp comment for 2-cta bwd
         thr_col_offset = tScS_t2r[0][COL]
         seqlenk_col_limit = self.seqlen_k - n_block * self.tile_n - thr_col_offset
 

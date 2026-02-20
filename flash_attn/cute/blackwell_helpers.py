@@ -21,6 +21,7 @@ def gemm_w_idx(
     B_idx: Optional[Int32] = None,
     zero_init: bool | Boolean = False,
     swap_AB: bool = False,
+    num_unroll_groups: int = 1,
 ) -> None:
     if const_expr(swap_AB):
         return gemm_w_idx(
@@ -29,8 +30,11 @@ def gemm_w_idx(
     else:
         rA = tCrA if const_expr(A_idx is None) else tCrA[None, None, None, A_idx]
         rB = tCrB if const_expr(B_idx is None) else tCrB[None, None, None, B_idx]
+
         mma_atom = cute.make_mma_atom(tiled_mma.op)
-        for k in cutlass.range_constexpr(cute.size(tCrA.shape[2])):
+        for k in cutlass.range(
+            cute.size(tCrA.shape[2]), unroll=cute.size(tCrA.shape[2]) // num_unroll_groups
+        ):
             mma_atom.set(tcgen05.Field.ACCUMULATE, not zero_init or k != 0)
             cute.gemm(mma_atom, acc, rA[None, None, k], rB[None, None, k], acc)
 
@@ -46,6 +50,7 @@ def gemm_ptx_w_idx(
     A_idx: Optional[Int32] = None,
     B_idx: Optional[Int32] = None,
     zero_init: bool | Boolean = False,
+    cta_group: int = 1,
     **kwargs,
 ) -> None:
     rA = tCrA if const_expr(A_idx is None) else tCrA[None, None, None, A_idx]
@@ -57,7 +62,15 @@ def gemm_ptx_w_idx(
     mma_atom = cute.make_mma_atom(tiled_mma.op)
     acc_tmem_addr = acc.iterator.toint()
     gemm_ptx_partial(
-        mma_atom.op, acc_tmem_addr, rA, rB, sA_cur, sB_cur, zero_init=zero_init, **kwargs
+        mma_atom.op,
+        acc_tmem_addr,
+        rA,
+        rB,
+        sA_cur,
+        sB_cur,
+        zero_init=zero_init,
+        cta_group=cta_group,
+        **kwargs,
     )
 
 
@@ -372,6 +385,7 @@ def gemm_ptx_partial(
     # sA_offset: Int32 = 0,
     # acc_offset: Int32 = 0,
     tA_addr: Optional[Int32] = None,
+    cta_group: int = 1,
 ) -> None:
     # acc_tmem_addr += acc_offset
     is_ts = op.a_src == cute.nvgpu.tcgen05.OperandSource.TMEM
@@ -463,7 +477,7 @@ def gemm_ptx_partial(
             f"mov.b64 smem_desc_a, {{smem_desc_a_lo_start, smem_desc_a_hi}};\n\t"
             f"mov.b64 smem_desc_b, {{smem_desc_b_lo_start, smem_desc_b_hi}};\n\t"
             "setp.ne.b32 p, $2, 0;\n\t"
-            f"@leader_thread tcgen05.mma.cta_group::1.kind::f16 [tmem_acc], smem_desc_a, smem_desc_b, idesc, {pred_str};\n\t"
+            f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::f16 [tmem_acc], smem_desc_a, smem_desc_b, idesc, {pred_str};\n\t"
             + "".join(
                 (
                     # f"add.u32 smem_desc_a_lo, smem_desc_a_lo, {hex(offset_a_diff[k - 1])};\n\t"
@@ -472,7 +486,7 @@ def gemm_ptx_partial(
                     f"add.u32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[k])};\n\t"
                     f"mov.b64 smem_desc_a, {{smem_desc_a_lo, smem_desc_a_hi}};\n\t"
                     f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
-                    f"@leader_thread tcgen05.mma.cta_group::1.kind::f16 [tmem_acc], smem_desc_a, smem_desc_b, idesc, 1;\n\t"
+                    f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::f16 [tmem_acc], smem_desc_a, smem_desc_b, idesc, 1;\n\t"
                 )
                 for k in range(1, cute.size(tCrA.shape[2]))
             )
@@ -536,7 +550,7 @@ def gemm_ptx_partial(
             f"mov.b32 smem_desc_b_hi, {hex(smem_desc_b_hi)};\n\t"
             f"mov.b64 smem_desc_b, {{smem_desc_b_lo_start, smem_desc_b_hi}};\n\t"
             "setp.ne.b32 p, $2, 0;\n\t"
-            f"@leader_thread tcgen05.mma.cta_group::1.kind::f16 [tmem_acc], [tmem_a], smem_desc_b, idesc, {pred_str};\n\t"
+            f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::f16 [tmem_acc], [tmem_a], smem_desc_b, idesc, {pred_str};\n\t"
             + "".join(
                 (
                     # f"add.u32 tmem_a, tmem_a, {hex(offset_a_diff[k - 1])};\n\t"
@@ -544,7 +558,7 @@ def gemm_ptx_partial(
                     f"add.u32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[k])};\n\t"
                     f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
                     # f"@leader_thread tcgen05.mma.cta_group::1.kind::f16 [tmem_acc], [tmem_a], smem_desc_b, idesc, 1;\n\t"
-                    f"@leader_thread tcgen05.mma.cta_group::1.kind::f16 [tmem_acc], [tmem_a + {hex(offset_a[k])}], smem_desc_b, idesc, 1;\n\t"
+                    f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::f16 [tmem_acc], [tmem_a + {hex(offset_a[k])}], smem_desc_b, idesc, 1;\n\t"
                 )
                 for k in range(
                     1,
@@ -559,7 +573,7 @@ def gemm_ptx_partial(
                     (
                         f"add.u32 smem_desc_b_lo, smem_desc_b_lo, {hex(offset_b_diff[k - 1])};\n\t"
                         f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
-                        f"@leader_thread tcgen05.mma.cta_group::1.kind::f16 [tmem_acc], [tmem_a + {hex(offset_a[k])}], smem_desc_b, idesc, 1;\n\t"
+                        f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::f16 [tmem_acc], [tmem_a + {hex(offset_a[k])}], smem_desc_b, idesc, 1;\n\t"
                     )
                     for k in range(cute.size(tCrA.shape[2]) // 4 * 3, cute.size(tCrA.shape[2]))
                 )
