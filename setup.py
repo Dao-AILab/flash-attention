@@ -29,6 +29,12 @@ from torch.utils.cpp_extension import (
     IS_HIP_EXTENSION,
 )
 
+try:
+    import ninja  # noqa: F401
+    _HAS_NINJA = True
+except Exception:
+    _HAS_NINJA = False
+
 
 with open("README.md", "r", encoding="utf-8") as fh:
     long_description = fh.read()
@@ -567,6 +573,11 @@ class CachedWheelsCommand(_bdist_wheel):
 
 class NinjaBuildExtension(BuildExtension):
     def __init__(self, *args, **kwargs) -> None:
+        if not _HAS_NINJA:
+            warnings.warn(
+                "ninja is not installed; build will fall back to the slower default "
+                "backend. Install it with `pip install ninja` for faster builds."
+            )
         # do not override env MAX_JOBS if already exists
         if not os.environ.get("MAX_JOBS"):
             import psutil
