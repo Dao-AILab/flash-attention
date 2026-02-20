@@ -938,6 +938,7 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multipl
 
     // We use a custom RNG that increases the offset by batch_size * nheads * 32.
     int64_t counter_offset = params.b * params.h * 32;
+    at::Tensor tmp_rng_state;
 
     if ( rng_state.has_value() ) {
         params.rng_state = reinterpret_cast<uint64_t*>(rng_state.value().data_ptr());
@@ -946,6 +947,8 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multipl
         std::lock_guard<std::mutex> lock(gen->mutex_);
         params.philox_args = gen->philox_cuda_state(counter_offset);
         auto seeds = at::cuda::philox::unpack(params.philox_args);
+        tmp_rng_state = torch::empty({2}, opts.dtype(torch::kInt64));
+        params.rng_state = reinterpret_cast<uint64_t*>(tmp_rng_state.data_ptr());
         params.rng_state[0] = std::get<0>(seeds);
         params.rng_state[1] = std::get<1>(seeds);
     }
@@ -1167,6 +1170,7 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
 
     // We use a custom RNG that increases the offset by batch_size * nheads * 32.
     int64_t counter_offset = params.b * params.h * 32;
+    at::Tensor tmp_rng_state;
 
     if ( rng_state.has_value() ) {
         params.rng_state = reinterpret_cast<uint64_t*>(rng_state.value().data_ptr());
@@ -1175,6 +1179,8 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
         std::lock_guard<std::mutex> lock(gen->mutex_);
         params.philox_args = gen->philox_cuda_state(counter_offset);
         auto seeds = at::cuda::philox::unpack(params.philox_args);
+        tmp_rng_state = torch::empty({2}, opts.dtype(torch::kInt64));
+        params.rng_state = reinterpret_cast<uint64_t*>(tmp_rng_state.data_ptr());
         params.rng_state[0] = std::get<0>(seeds);
         params.rng_state[1] = std::get<1>(seeds);
     }
