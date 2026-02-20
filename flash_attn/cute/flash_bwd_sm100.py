@@ -1357,7 +1357,7 @@ class FlashAttentionBackwardSm100:
         #  LOAD
         # (13)
         if warp_idx == self.load_warp_id:
-            cute.arch.setmaxregister_decrease(self.num_regs_other)
+            cute.arch.setmaxregister_decrease(self.num_regs_load)
             self.load(
                 thr_mma_S,
                 thr_mma_dP,
