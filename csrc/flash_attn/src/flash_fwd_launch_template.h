@@ -49,8 +49,7 @@ DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_kernel, bool Is_dropout, bool Is_causal, b
 }
 
 DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_splitkv_kernel, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Split, bool Append_KV) {
-    // SplitKV requires SM80+ (cp.async, proper MMA atoms). Skip heavy compilation for SM70.
-    #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    #ifdef ARCH_SUPPORTS_FLASH
         FLASH_NAMESPACE::compute_attn_splitkv<Kernel_traits, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Split, Append_KV>(params);
     #else
         FLASH_UNSUPPORTED_ARCH

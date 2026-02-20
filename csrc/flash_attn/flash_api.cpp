@@ -608,6 +608,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     const int num_heads_k = paged_KV ? k.size(2) : k.size(1);
 
     if (softcap > 0.f) { TORCH_CHECK(p_dropout == 0.f, "Softcapping does not support dropout for now"); }
+    if (cc_major < 8) { TORCH_CHECK(p_dropout == 0.f, "FlashAttention on Volta (V100) does not support dropout"); }
 
     const int max_num_blocks_per_seq = !paged_KV ? 0 : block_table.size(1);
     const int num_blocks = !paged_KV ? 0 : k.size(0);
