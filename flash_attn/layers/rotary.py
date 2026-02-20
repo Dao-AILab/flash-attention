@@ -362,7 +362,7 @@ class RotaryEmbedding(torch.nn.Module):
         self.dim = dim
         self.base = float(base)
         # Generate and save the inverse frequency buffer (non trainable)
-        inv_freq = self._compute_inv_freq(device)
+        inv_freq = self._compute_inv_freq('cuda' if device == 'meta' else device)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self.interleaved = interleaved
         self.scale_base = scale_base
