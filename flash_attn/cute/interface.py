@@ -274,10 +274,12 @@ def _flash_attn_fwd(
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     if compute_capability == 12:
-        # SM120: uses SM80 MMA with 99 KB SMEM — reduce tile sizes accordingly.
+        # SM120: uses SM80 MMA with 99 KB SMEM.
         # SMEM = (tile_m * hdim + 2 * tile_n * hdim) * 2 bytes must fit in 99 KB.
+        # D<=64:  m=128,n=128 → 48 KB (good occupancy, higher throughput)
+        # D>64:   m=128,n=64  → 64 KB (n=128 would use 96 KB, killing occupancy)
         if head_dim <= 64:
-            m_block_size, n_block_size = 64, 64
+            m_block_size, n_block_size = 128, 128
         else:
             m_block_size, n_block_size = 128, 64
         num_threads = 128  # SM80-style CpAsync, all threads do load + compute
@@ -575,6 +577,10 @@ def _flash_attn_fwd(
                 cute_aux_tensors,
                 options="--enable-tvm-ffi",
             )
+
+    # SM120: SM80 kernel always writes LSE, ensure it's allocated even on cache hits
+    if compute_capability == 12 and lse is None:
+        lse = torch.empty(lse_shape, dtype=torch.float32, device=device)
 
     if compute_capability == 12:
         _flash_attn_fwd.compile_cache[compile_key](
