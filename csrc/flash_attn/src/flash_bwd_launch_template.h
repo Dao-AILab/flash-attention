@@ -16,20 +16,29 @@
 namespace FLASH_NAMESPACE {
 
 // Determine if the architecture supports FLASH and define a macro to handle parameter modifiers
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
 #define ARCH_SUPPORTS_FLASH
+#endif
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
 #define KERNEL_PARAM_MODIFIER __grid_constant__
 #else
 #define KERNEL_PARAM_MODIFIER
 #endif
 
 // Define a macro for unsupported architecture handling to centralize the error message
-#define FLASH_UNSUPPORTED_ARCH printf("FATAL: FlashAttention requires building with sm version sm80-sm90, but was built for < 8.0!");
+#define FLASH_UNSUPPORTED_ARCH printf("FATAL: FlashAttention requires sm70+, but was built for < 7.0!");
+
+// SM70: allow maximum registers per thread to avoid register spilling issues
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
+#define FLASH_BWD_LAUNCH_BOUNDS __launch_bounds__(256, 1)
+#else
+#define FLASH_BWD_LAUNCH_BOUNDS
+#endif
 
 // Use a macro to clean up kernel definitions
 #define DEFINE_FLASH_BACKWARD_KERNEL(kernelName, ...) \
 template<typename Kernel_traits, __VA_ARGS__> \
-__global__ void kernelName(KERNEL_PARAM_MODIFIER const Flash_bwd_params params)
+__global__ FLASH_BWD_LAUNCH_BOUNDS void kernelName(KERNEL_PARAM_MODIFIER const Flash_bwd_params params)
 
 DEFINE_FLASH_BACKWARD_KERNEL(flash_bwd_dq_dk_dv_loop_kernel, bool Is_dropout, bool Is_causal, bool Has_alibi, bool Is_even_M, bool Is_even_K) {
     #if defined(ARCH_SUPPORTS_FLASH)

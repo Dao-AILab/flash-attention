@@ -65,13 +65,11 @@ make_tiled_copy_C_warpcontiguousN(Copy_Atom<Args...> const& copy_atom,
     constexpr int TileShape_N = decltype(tiled_mma.template tile_size_mnk<1>())::value;
     using AtomShape_MNK = typename TiledMMA::AtomShape_MNK;
     constexpr int AtomShape_N = decltype(size<1>(AtomShape_MNK{}))::value;
-    // Divide by 2 because right now we always use 2 for the ValLayout
     constexpr int kNWarpsN = TileShape_N / AtomShape_N / 2;
     constexpr int MMAStride_N = MMA_N * AtomShape_N * 2;
     auto t = make_tile(make_layout(Int<TileShape_M>{}),
-                       Layout<Shape<Int<AtomShape_N>, Int<kNWarpsN>, _2>,   // (8, 2, 2) or (8, 4, 2)
-                              Stride<_1, Int<MMAStride_N>, _8> >{});       // (1, 64, 8) or (1, 32, 8)
-    // if (cute::thread0()) {printf("make_tiled_copy_C_warpcontiguousN "); print(t); printf("\n");  }
+                       Layout<Shape<Int<AtomShape_N>, Int<kNWarpsN>, _2>,
+                              Stride<_1, Int<MMAStride_N>, _8> >{});
     return make_tiled_copy_impl(copy_atom, tiled_mma.get_layoutC_TV(), t);
 }
 
@@ -89,6 +87,8 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
 
     // The thread index.
     const int tidx = threadIdx.x;
+
+
 
     constexpr int kBlockM = Kernel_traits::kBlockM;
     constexpr int kBlockN = Kernel_traits::kBlockN;
@@ -242,8 +242,13 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     Tensor tSsQ = smem_thr_copy_QdO.partition_S(sQ);
     Tensor tdPsdO = smem_thr_copy_QdO.partition_S(sdO);
 
-    // auto smem_thr_copy_KV = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtom{}, tiled_mma_sdp).get_thread_slice(tidx);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
     auto smem_tiled_copy_KV = make_tiled_copy_B_warpcontiguousN<MMA_N_SdP>(typename Kernel_traits::SmemCopyAtom{}, tiled_mma_sdp);
+#else
+    // SM70: make_tiled_copy_B_warpcontiguousN produces MMAStride_N that exceeds tile width,
+    // causing OOB smem reads. Use standard make_tiled_copy_B (same as forward pass).
+    auto smem_tiled_copy_KV = make_tiled_copy_B(typename Kernel_traits::SmemCopyAtom{}, tiled_mma_sdp);
+#endif
     auto smem_thr_copy_KV = smem_tiled_copy_KV.get_thread_slice(tidx);
     Tensor tSsK = smem_thr_copy_KV.partition_S(sK);
     // if (cute::thread(0, 0) && n_block == 0) { printf("sK layout: "); print(sK.layout()); printf("\n"); }
@@ -252,15 +257,9 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
 
     // Partition sP and sdS to match the accumulator partitioning
     // This has to be tiled_mma_sdp, not tiled_mma_dkv
-    // auto smem_thr_copy_PdS = make_tiled_copy_C(typename Kernel_traits::SmemCopyAtomPdS{}, tiled_mma_sdp).get_thread_slice(tidx);
     auto smem_tiled_copy_PdS = make_tiled_copy_C_warpcontiguousN<MMA_N_SdP>(typename Kernel_traits::SmemCopyAtomPdS{}, tiled_mma_sdp);
     auto smem_thr_copy_PdS = smem_tiled_copy_PdS.get_thread_slice(tidx);
     Tensor tPsP = smem_thr_copy_PdS.partition_D(sP);      // ((Atom,AtomNum),PIPE_M,PIPE_N)
-    // if (cute::thread(0, 0) && n_block == 0) { printf("sP layout: "); print(sP.layout()); printf("\n"); }
-    // if (cute::thread(0, 0) && n_block == 0) { print(tPsP.layout()); printf("\n"); }
-    // if (n_block == 0 && blockIdx.x == 0 && blockIdx.y == 0 && tidx < 64) {
-    //     printf("tidx=%d, tPsP = 0x%p\n", tidx, tPsP.data());
-    // }
     Tensor tdSsdS = smem_thr_copy_PdS.partition_D(sdS);   // ((Atom,AtomNum),PIPE_M,PIPE_N)
 
     auto smem_tiled_copy_PdSt = make_tiled_copy_A(typename Kernel_traits::SmemCopyAtomTransposed{}, tiled_mma_dkv);
@@ -399,15 +398,35 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
 
     Tensor caccS = make_identity_tensor(Shape<Int<kBlockM>, Int<kBlockN>>{});    // (BLK_M,BLK_N) -> (blk_m,blk_n)
     Tensor taccScS = thr_mma_sdp.partition_C(caccS);                           // (MMA,MMA_N,MMA_N)
-    static_assert(decltype(size<0>(taccScS))::value == 4);
-    // Convert to ((2, 2), MMA_N, MMA_N) then take only the row indices.
+    static_assert(decltype(size<0>(taccScS))::value == 4 || decltype(size<0>(taccScS))::value == 8);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
+    // SM75+/SM80: 4 values/thread → 2 rows per MMA_M, 2 cols per MMA_N.
+    // logical_divide by _2 gives ((2_col, 2_row), MMA_M, MMA_N); select col=0 to get rows.
     Tensor taccScS_row = logical_divide(taccScS, Shape<_2>{})(make_coord(0, _), _, 0);
-    Tensor lse = make_tensor<ElementAccum>(Shape<Int<decltype(size(taccScS_row))::value>>{});
+    constexpr int kNRows = decltype(size(taccScS_row))::value;
+    Tensor lse = make_tensor<ElementAccum>(Shape<Int<kNRows>>{});
+    int sm_row_idx[kNRows];
     #pragma unroll
-    for (int mi = 0; mi < size(lse); ++mi) {
-        const int row = get<0>(taccScS_row(mi));
-        lse(mi) = Is_even_MN || row < binfo.actual_seqlen_q - m_block * kBlockM ? gLSE(row) : INFINITY;
+    for (int mi = 0; mi < kNRows; ++mi) {
+        sm_row_idx[mi] = get<0>(taccScS_row(mi));
+        lse(mi) = Is_even_MN || sm_row_idx[mi] < binfo.actual_seqlen_q - m_block * kBlockM ? gLSE(sm_row_idx[mi]) : INFINITY;
     }
+#else
+    // SM70: 8 values/thread → 2 rows per MMA_M, 4 cols per MMA_N.
+    // v=0→(row0,col0) v=2→(row1,col0) — select v=0,v=2 to get the 2 distinct rows.
+    constexpr int kNRows = 2 * decltype(size<1>(taccScS))::value;
+    Tensor lse = make_tensor<ElementAccum>(Shape<Int<kNRows>>{});
+    int sm_row_idx[kNRows];
+    #pragma unroll
+    for (int mi = 0; mi < size<1>(taccScS); ++mi) {
+        sm_row_idx[2 * mi + 0] = get<0>(taccScS(0, mi, 0));
+        sm_row_idx[2 * mi + 1] = get<0>(taccScS(2, mi, 0));
+    }
+    #pragma unroll
+    for (int mi = 0; mi < kNRows; ++mi) {
+        lse(mi) = Is_even_MN || sm_row_idx[mi] < binfo.actual_seqlen_q - m_block * kBlockM ? gLSE(sm_row_idx[mi]) : INFINITY;
+    }
+#endif
     // We want LSE = inf if the row is OOB. In that case Q would be zero, K would be zero,
     // and scores would be zero. With LSE = 0, probs will be all 1's, and when we multiply
     // with V (which would be zero), we're fine. However, with ALiBi, we might modify these
@@ -460,7 +479,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
 
         Tensor dP_sum = make_fragment_like(lse);
         #pragma unroll
-        for (int mi = 0; mi < size(lse); ++mi) { dP_sum(mi) = gdPsum(get<0>(taccScS_row(mi))); }
+        for (int mi = 0; mi < size(lse); ++mi) { dP_sum(mi) = gdPsum(sm_row_idx[mi]); }
 
         // if (cute::thread0()) { print(sK); }
         // Tensor tSrK_copy_view = smem_thr_copy_KV.retile_D(tSrK);
@@ -488,33 +507,88 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
 
         // Alibi
         if (Has_alibi) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
+            // SM70: TODO alibi with correct column offsets for backward TiledMmaSdP
             alibi.apply_alibi(scores, n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
-                              m_block * kBlockM + get<0>(taccScS_row(0)), AtomLayoutMS * 16);
+                              m_block * kBlockM + sm_row_idx[0], AtomLayoutMS * 16);
+#else
+            alibi.apply_alibi(scores, n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
+                              m_block * kBlockM + sm_row_idx[0], AtomLayoutMS * 16);
+#endif
         }
 
-        // TD [2023-07-29]: I was thinking that we don't need to mask out the elements beyond
-        // actual_seqlen_k, because acc_s would be some finite value for those indices.
-        // In the end when we multiply with K to get dQ, the corresponding values of K would be 0,
-        // so the result would still be correct.
-        // However, it's possible that the values in acc_s are so large that they overflow
-        // when we multiply with dP and convert to fp16, resulting in Inf in dS and NaNs in dQ.
-        // So we need to mask out the elements beyond actual_seqlen_k.
+        // Mask out elements beyond actual_seqlen_k and apply causal/local masking.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
+        // SM70 backward: Use identity tensor partition for exact row/col indices.
+        // The mask.h column formulas assume the forward TiledMMA layout and are wrong
+        // for the backward TiledMmaSdP. Instead, extract indices directly from taccScS.
+        {
+            // scores shape: ((2_row, MMA_M), ((2_col_low, 2_col_high), MMA_N))
+            // taccScS shape: (MMA=8, MMA_M, MMA_N) — identity values give (M,N) coords
+            // SM70 value decomposition: v = col_low + 2*row + 4*col_high
+            // For row=0 (i=0): v for j=0..3 is {0, 1, 4, 5}
+            // For row=1 (i=1): v for j=0..3 is {2, 3, 6, 7}
+            static constexpr int sm70_vcol[4] = {0, 1, 4, 5};
+            const bool need_causal_mask = Is_causal &&
+                (m_block * kBlockM < (n_block + 1) * kBlockN + binfo.actual_seqlen_q - binfo.actual_seqlen_k
+                 || (!Is_even_MN && (n_block + 1) * kBlockN >= binfo.actual_seqlen_k));
+            const bool need_local_mask = Is_local &&
+                (m_block * kBlockM < (n_block + 1) * kBlockN + binfo.actual_seqlen_q - binfo.actual_seqlen_k - params.window_size_right
+                 || (m_block + 1) * kBlockM >= n_block * kBlockN + binfo.actual_seqlen_q - binfo.actual_seqlen_k + params.window_size_left
+                 || (!Is_even_MN && (n_block + 1) * kBlockN >= binfo.actual_seqlen_k));
+            const bool need_oob_mask = !Is_causal && !Is_local && !Is_even_MN
+                && (n_block + 1) * kBlockN >= binfo.actual_seqlen_k;
+            if (need_causal_mask || need_local_mask || need_oob_mask) {
+                #pragma unroll
+                for (int mi = 0; mi < size<0, 1>(scores); ++mi) {
+                    #pragma unroll
+                    for (int i = 0; i < size<0, 0>(scores); ++i) {
+                        // Global row: block offset + block-local row from identity tensor
+                        const int row_idx = m_block * kBlockM + get<0>(taccScS(2 * i, mi, 0));
+                        #pragma unroll
+                        for (int nj = 0; nj < size<1, 1>(scores); ++nj) {
+                            #pragma unroll
+                            for (int j = 0; j < size<1, 0>(scores); ++j) {
+                                // Global col: block offset + block-local col from identity tensor
+                                const int col_idx = n_block * kBlockN + get<1>(taccScS(sm70_vcol[j], mi, nj));
+                                bool mask_out = false;
+                                if (col_idx >= binfo.actual_seqlen_k) {
+                                    mask_out = true;
+                                } else if constexpr (Is_causal) {
+                                    const int col_limit = row_idx + 1 + binfo.actual_seqlen_k - binfo.actual_seqlen_q;
+                                    if (col_idx >= col_limit) {
+                                        mask_out = true;
+                                    }
+                                } else if constexpr (Is_local) {
+                                    const int col_limit_right = std::min(binfo.actual_seqlen_k,
+                                        row_idx + 1 + binfo.actual_seqlen_k - binfo.actual_seqlen_q + params.window_size_right);
+                                    const int col_limit_left = std::max(0,
+                                        row_idx + binfo.actual_seqlen_k - binfo.actual_seqlen_q - params.window_size_left);
+                                    if (col_idx >= col_limit_right || col_idx < col_limit_left) {
+                                        mask_out = true;
+                                    }
+                                }
+                                if (mask_out) {
+                                    scores(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+#else
         if (!Is_causal && !Is_local) {
             if (!Is_even_MN && (n_block + 1) * kBlockN >= binfo.actual_seqlen_k) {
                 FLASH_NAMESPACE::apply_mask(scores, binfo.actual_seqlen_k,
                                   n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16);
             }
         } else if (Is_causal) {
-            // Putting this causal masking right after acc_s is *much* slower for some reason.
-            // TD [2023-08-16]: We need the 2nd condition because if seqlen_q is long and seqlen_k is short
-            // (e.g., 256 and 2), the 2nd block of seqlen_q (from 128 to 255), we're not doing causal masking.
-            // But we still want to mask out elements beyond actual_seqlen_k.
             if (m_block * kBlockM < (n_block + 1) * kBlockN + binfo.actual_seqlen_q - binfo.actual_seqlen_k
                 || (!Is_even_MN && (n_block + 1) * kBlockN >= binfo.actual_seqlen_k)) {
                 FLASH_NAMESPACE::apply_mask_causal(scores, n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
-                                         binfo.actual_seqlen_k, m_block * kBlockM + get<0>(taccScS_row(0)),
+                                         binfo.actual_seqlen_k, m_block * kBlockM + sm_row_idx[0],
                                          binfo.actual_seqlen_q,
-                                         // binfo.actual_seqlen_k, m_block * kBlockM + (tidx / 32) % AtomLayoutMS * 16 + (tidx % 32) / 4,
                                          AtomLayoutMS * 16);
             }
         } else if (Is_local) {
@@ -522,14 +596,15 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
                 || (m_block + 1) * kBlockM >= n_block * kBlockN + binfo.actual_seqlen_q - binfo.actual_seqlen_k + params.window_size_left
                 || (!Is_even_MN && (n_block + 1) * kBlockN >= binfo.actual_seqlen_k)) {
                 FLASH_NAMESPACE::apply_mask_local(scores, n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
-                                        binfo.actual_seqlen_k, m_block * kBlockM + get<0>(taccScS_row(0)),
+                                        binfo.actual_seqlen_k, m_block * kBlockM + sm_row_idx[0],
                                         binfo.actual_seqlen_q, AtomLayoutMS * 16,
                                         params.window_size_left, params.window_size_right);
             }
-
         }
+#endif
 
         // if (cute::thread(32, 0)) { print(scores); }
+
         // Compute the exponential value.
         FLASH_NAMESPACE::scale_apply_exp2</*scale_max=*/false>(scores, lse, params.scale_softmax_log2);
         if constexpr (Is_dropout) {
@@ -542,7 +617,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
                 acc_s, block_row_idx, block_col_idx, AtomLayoutMS
             );
         }
-        // Convert scores from fp32 to fp16/bf16
+
         Tensor rP = !Is_dropout
             ? FLASH_NAMESPACE::convert_type<Element>(acc_s)
             : FLASH_NAMESPACE::convert_type_relu<Element>(acc_s);
@@ -550,10 +625,20 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         // if using m16n8k16 or (4, MMA_N, MMA_N) if using m16n8k8.
         Tensor tPrP = make_tensor(rP.data(), FLASH_NAMESPACE::convert_layout_acc_Aregs<Kernel_traits::TiledMmaSdP>(rP.layout()));
         Tensor tPaP = smem_thr_copy_PdS.retile_S(tPrP);     // ((Atom,AtomNum), MMA_N, MMA_N)
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
+        // SM70: Use make_tiled_copy_C (standard) instead of make_tiled_copy_C_warpcontiguousN.
+        // warpcontiguousN produces MMAStride_N that exceeds tile width on SM70's 8x8x4 atom,
+        // causing OOB smem writes. make_tiled_copy_C matches the forward pass approach.
+        {
+            auto smem_tiled_copy_PdS_C = make_tiled_copy_C(typename Kernel_traits::SmemCopyAtomPdS{}, tiled_mma_sdp);
+            auto smem_thr_copy_PdS_C = smem_tiled_copy_PdS_C.get_thread_slice(tidx);
+            cute::copy(smem_tiled_copy_PdS_C, smem_thr_copy_PdS_C.retile_S(rP),
+                       smem_thr_copy_PdS_C.partition_D(sP));
+        }
+#else
         cute::copy(smem_tiled_copy_PdS, tPaP, tPsP);
-        // if (cute::thread0()) { print(tPaP); }
-        // __syncthreads();
-        // if (cute::thread0()) { print(sP); }
+#endif
 
         Tensor acc_dp = partition_fragment_C(tiled_mma_sdp, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_N, MMA_N)
         CUTE_STATIC_ASSERT_V(size<0>(acc_dp) == size<0>(acc_s));                     // MMA
@@ -618,11 +703,22 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         }
 
         Tensor dS_reshaped = make_tensor(dS.data(), acc_dp.layout());
-        // Convert dS from fp32 to fp16
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
+        // SM70: Use make_tiled_copy_C (standard) for dS write (same reason as P write above).
+        {
+            Tensor tdSrdS = FLASH_NAMESPACE::convert_type<Element>(dS_reshaped);
+            auto smem_tiled_copy_PdS_C = make_tiled_copy_C(typename Kernel_traits::SmemCopyAtomPdS{}, tiled_mma_sdp);
+            auto smem_thr_copy_PdS_C = smem_tiled_copy_PdS_C.get_thread_slice(tidx);
+            cute::copy(smem_tiled_copy_PdS_C, smem_thr_copy_PdS_C.retile_S(tdSrdS),
+                       smem_thr_copy_PdS_C.partition_D(sdS));
+        }
+#else
+        // Convert dS from fp32 to fp16.
         Tensor tdSrdS = FLASH_NAMESPACE::convert_type<Element>(dS_reshaped);
         // if (cute::thread0()) { print(tPrP); }
         Tensor tdSadS = smem_thr_copy_PdS.retile_S(tdSrdS);                                          // ((Atom,AtomNum), MMA_N, MMA_N)
         cute::copy(smem_tiled_copy_PdS, tdSadS, tdSsdS);
+#endif
         __syncthreads();
 
         // Layout p_l = tPrP.layout();
@@ -657,7 +753,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         if (m_block > m_block_min) {
             gLSE.data() = gLSE.data() + (-int(kBlockM));
             #pragma unroll
-            for (int mi = 0; mi < size(lse); ++mi) { lse(mi) = gLSE(get<0>(taccScS_row(mi))); }
+            for (int mi = 0; mi < size(lse); ++mi) { lse(mi) = gLSE(sm_row_idx[mi]); }
             gdPsum.data() = gdPsum.data() + (-int(kBlockM));
         }
 

@@ -302,7 +302,17 @@ std::tuple<at::Tensor, at::Tensor> set_params_splitkv(Flash_fwd_params &params, 
     const int num_splits, const int num_sm, struct c10::TensorOptions opts) {
 
     // This needs to match with run_mha_fwd_splitkv_dispatch
-    const int block_n = head_size <= 64 ? 256 : (head_size <= 128 ? 128 : 64);
+    int block_n = head_size <= 64 ? 256 : (head_size <= 128 ? 128 : 64);
+    // V100 (96KB smem): For hdim=256, kBlockN=64 + SM70 PV buffer exceeds 96KB.
+    if (head_size > 128 && block_n > 32) {
+        int device;
+        cudaGetDevice(&device);
+        int max_smem;
+        cudaDeviceGetAttribute(&max_smem, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+        if (max_smem <= 2 * head_size * (64 + 2 * 64)) {
+            block_n = 32;
+        }
+    }
     const int num_n_blocks = (max_seqlen_k + block_n - 1) / block_n;
     // Technically kBlockM = 64 only for the splitKV kernels, not the standard kernel.
     // In any case we don't expect seqlen_q to be larger than 64 for inference.
@@ -315,6 +325,16 @@ std::tuple<at::Tensor, at::Tensor> set_params_splitkv(Flash_fwd_params &params, 
         if (num_splits < 1) {
             // We multiply number of SMs by 2 to hard-code the fact that we're using 128 threads per block.
             params.num_splits = num_splits_heuristic(batch_size * num_heads * num_m_blocks, num_sm * 2, num_n_blocks, 128);
+        }
+        // V100 (SM70): splitkv kernel not yet validated on SM70; force single split
+        if (params.num_splits > 1) {
+            int dev;
+            cudaGetDevice(&dev);
+            int cc_major;
+            cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor, dev);
+            if (cc_major < 8) {
+                params.num_splits = 1;
+            }
         }
         if (params.num_splits > 1) {
             softmax_lse_accum = torch::empty({params.num_splits, batch_size, num_heads, max_seqlen_q}, opts.dtype(at::kFloat));
@@ -366,8 +386,15 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
     at::cuda::CUDAGuard device_guard{q.device()};
 
     auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
-    bool is_sm8x_min = cc_major >= 8;
-    TORCH_CHECK(is_sm8x_min, "FlashAttention only supports Ampere GPUs or newer.");
+    bool is_sm7x_min = cc_major >= 7;
+    TORCH_CHECK(is_sm7x_min, "FlashAttention only supports Volta GPUs or newer.");
+    if (cc_major < 8) {
+        TORCH_CHECK(q.dtype() == torch::kFloat16,
+            "FlashAttention on Volta (V100) only supports FP16, not BF16.");
+        TORCH_CHECK(!(is_causal && q.size(-1) > 192),
+            "FlashAttention on Volta (V100) does not support causal mode with head_dim > 192. "
+            "Use non-causal mode or reduce head_dim to 192 or less.");
+    }
 
     auto q_dtype = q.dtype();
     TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
@@ -395,6 +422,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
 
     if (softcap > 0.f) { TORCH_CHECK(p_dropout == 0.f, "Softcapping does not support dropout for now"); }
+    if (cc_major < 8) { TORCH_CHECK(p_dropout == 0.f, "FlashAttention on Volta (V100) does not support dropout"); }
 
     if (window_size_left >= seqlen_k) { window_size_left = -1; }
     if (window_size_right >= seqlen_k) { window_size_right = -1; }
@@ -538,8 +566,12 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     at::cuda::CUDAGuard device_guard{q.device()};
 
     auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
-    bool is_sm8x_min = cc_major >= 8;
-    TORCH_CHECK(is_sm8x_min, "FlashAttention only supports Ampere GPUs or newer.");
+    bool is_sm7x_min = cc_major >= 7;
+    TORCH_CHECK(is_sm7x_min, "FlashAttention only supports Volta GPUs or newer.");
+    if (cc_major < 8) {
+        TORCH_CHECK(q.dtype() == torch::kFloat16,
+            "FlashAttention on Volta (V100) only supports FP16, not BF16.");
+    }
 
     auto q_dtype = q.dtype();
     TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
@@ -794,8 +826,12 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multipl
     at::cuda::CUDAGuard device_guard{q.device()};
 
     auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
-    bool is_sm8x_min = cc_major >= 8;
-    TORCH_CHECK(is_sm8x_min, "FlashAttention only supports Ampere GPUs or newer.");
+    bool is_sm7x_min = cc_major >= 7;
+    TORCH_CHECK(is_sm7x_min, "FlashAttention only supports Volta GPUs or newer.");
+    if (cc_major < 8) {
+        TORCH_CHECK(q.dtype() == torch::kFloat16,
+            "FlashAttention backward on Volta (V100) only supports FP16, not BF16.");
+    }
 
     bool is_dropout = p_dropout > 0.0;
     auto stream = at::cuda::getCurrentCUDAStream().stream();
@@ -1005,8 +1041,12 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     at::cuda::CUDAGuard device_guard{q.device()};
 
     auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
-    bool is_sm8x_min = cc_major >= 8;
-    TORCH_CHECK(is_sm8x_min, "FlashAttention only supports Ampere GPUs or newer.");
+    bool is_sm7x_min = cc_major >= 7;
+    TORCH_CHECK(is_sm7x_min, "FlashAttention only supports Volta GPUs or newer.");
+    if (cc_major < 8) {
+        TORCH_CHECK(q.dtype() == torch::kFloat16,
+            "FlashAttention backward on Volta (V100) only supports FP16, not BF16.");
+    }
 
     bool is_dropout = p_dropout > 0.0;
     auto stream = at::cuda::getCurrentCUDAStream().stream();
@@ -1226,8 +1266,12 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     at::cuda::CUDAGuard device_guard{q.device()};
 
     auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
-    bool is_sm8x_min = cc_major >= 8;
-    TORCH_CHECK(is_sm8x_min, "FlashAttention only supports Ampere GPUs or newer.");
+    bool is_sm7x_min = cc_major >= 7;
+    TORCH_CHECK(is_sm7x_min, "FlashAttention only supports Volta GPUs or newer.");
+    if (cc_major < 8) {
+        TORCH_CHECK(q.dtype() == torch::kFloat16,
+            "FlashAttention on Volta (V100) only supports FP16, not BF16.");
+    }
 
     auto q_dtype = q.dtype();
     TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,

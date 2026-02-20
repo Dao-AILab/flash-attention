@@ -68,7 +68,7 @@ NVCC_THREADS = os.getenv("NVCC_THREADS") or "4"
 
 @functools.lru_cache(maxsize=None)
 def cuda_archs() -> str:
-    return os.getenv("FLASH_ATTN_CUDA_ARCHS", "80;90;100;110;120").split(";")
+    return os.getenv("FLASH_ATTN_CUDA_ARCHS", "70;80;90;100;110;120").split(";")
 
 
 def get_platform():
@@ -104,6 +104,10 @@ def add_cuda_gencodes(cc_flag, archs, bare_metal_version):
       - Map requested 110 -> 101 if CUDA < 13.0 (Thor rename)
       - Embed PTX for newest arch for forward compatibility
     """
+    # Volta 7.0
+    if "70" in archs:
+        cc_flag += ["-gencode", "arch=compute_70,code=sm_70"]
+
     # Always-regular 80
     if "80" in archs:
         cc_flag += ["-gencode", "arch=compute_80,code=sm_80"]

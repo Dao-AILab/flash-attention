@@ -14,20 +14,30 @@
 namespace FLASH_NAMESPACE {
 
 // Determine if the architecture supports FLASH and define a macro to handle parameter modifiers
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 700
 #define ARCH_SUPPORTS_FLASH
+#endif
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
 #define KERNEL_PARAM_MODIFIER __grid_constant__
 #else
 #define KERNEL_PARAM_MODIFIER
 #endif
 
 // Define a macro for unsupported architecture handling to centralize the error message
-#define FLASH_UNSUPPORTED_ARCH printf("FATAL: FlashAttention requires building with sm version sm80-sm90, but was built for < 8.0!");
+#define FLASH_UNSUPPORTED_ARCH printf("FATAL: FlashAttention requires sm70+, but was built for < 7.0!");
+
+// SM70 needs maximum register allocation (1 block/SM) to avoid register spilling
+// that corrupts pointer registers in larger head dimensions with causal masking.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
+#define FLASH_LAUNCH_BOUNDS __launch_bounds__(128, 1)
+#else
+#define FLASH_LAUNCH_BOUNDS
+#endif
 
 // Use a macro to clean up kernel definitions
 #define DEFINE_FLASH_FORWARD_KERNEL(kernelName, ...) \
 template<typename Kernel_traits, __VA_ARGS__> \
-__global__ void kernelName(KERNEL_PARAM_MODIFIER const Flash_fwd_params params)
+__global__ FLASH_LAUNCH_BOUNDS void kernelName(KERNEL_PARAM_MODIFIER const Flash_fwd_params params)
 
 DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_kernel, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax) {
     #if defined(ARCH_SUPPORTS_FLASH)
@@ -39,7 +49,8 @@ DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_kernel, bool Is_dropout, bool Is_causal, b
 }
 
 DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_splitkv_kernel, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Split, bool Append_KV) {
-    #if defined(ARCH_SUPPORTS_FLASH)
+    // SplitKV requires SM80+ (cp.async, proper MMA atoms). Skip heavy compilation for SM70.
+    #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
         FLASH_NAMESPACE::compute_attn_splitkv<Kernel_traits, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Split, Append_KV>(params);
     #else
         FLASH_UNSUPPORTED_ARCH
@@ -166,22 +177,50 @@ void run_mha_fwd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t stream)
     // TD [2023-08-28]: nvcc segfaults for headdim 96 with block size 64 x 256,
     // and for headdim 192 with block size 64 x 128.
     constexpr static int kBlockN = Headdim <= 64 ? 256 : (Headdim <= 128 ? 128 : 64);
-    run_flash_splitkv_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, 4, false, false, T>, Is_causal>(params, stream);
+    // Check at compile time if kBlockN=64 + PV buffer (for SM70) exceeds V100's 96KB.
+    // PV buffer = kBlockM * kBlockN * sizeof(half) = kBlockM * kBlockN * 2.
+    constexpr int smem_with_pvbuf = 2 * Headdim * (kBlockM + 2 * kBlockN) + kBlockM * kBlockN * 2;
+    if constexpr (smem_with_pvbuf > 98304) {
+        // Only hdim=256 enters here (smem = 104KB with PV buffer).
+        // V100 needs kBlockN=32 to fit in 96KB.
+        int device;
+        cudaGetDevice(&device);
+        int max_smem_per_block;
+        cudaDeviceGetAttribute(&max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+        constexpr int smem_no_pvbuf = 2 * Headdim * (kBlockM + 2 * kBlockN);
+        if (max_smem_per_block <= smem_no_pvbuf) {
+            run_flash_splitkv_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, 32, 4, false, false, T>, Is_causal>(params, stream);
+        } else {
+            run_flash_splitkv_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, 4, false, false, T>, Is_causal>(params, stream);
+        }
+    } else {
+        run_flash_splitkv_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, 4, false, false, T>, Is_causal>(params, stream);
+    }
 }
 
 template<typename T, bool Is_causal>
 void run_mha_fwd_hdim32(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 32;
+    auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
     DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
-        run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 128, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+        if (cc_major < 8) {
+            // SM70: kBlockN=128 causes PV GEMM issues via shared memory path; use 64
+            run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+        } else {
+            run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 128, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+        }
     });
 }
 
 template<typename T, bool Is_causal>
 void run_mha_fwd_hdim64(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 64;
+    auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
     DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
-        if constexpr(!Is_dropout) {
+        if (cc_major < 8) {
+            // SM70: kBlockN=128 causes PV GEMM issues via shared memory path; use 64
+            run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+        } else if constexpr(!Is_dropout) {
             // Using 8 warps is 18% slower for seqlen=2k, 2 warps is 5% slower
             // Using block size (64 x 256) is 27% slower for seqlen=2k
             // Using block size (256 x 64) is 85% slower for seqlen=2k, because of register spilling
@@ -202,9 +241,18 @@ void run_mha_fwd_hdim96(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 96;
     auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
     bool is_sm8x = cc_major == 8 && cc_minor > 0;
+    bool is_sm70 = cc_major == 7;
     DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
+        // V100 (SM70): causal uses 64x64 to reduce register pressure from SM70's 8x8x4 MMA atom.
+        // Non-causal uses 128x64 (works without causal masking overhead).
+        if (is_sm70) {
+            if constexpr(Is_causal) {
+                run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+            } else {
+                run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+            }
         // For sm86 or sm89, 64 x 64 is the fastest for causal (because it's square),
-        if (is_sm8x) {
+        } else if (is_sm8x) {
             if constexpr(!Is_causal) {
                 run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
             } else {
@@ -226,11 +274,20 @@ void run_mha_fwd_hdim128(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 128;
     auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
     bool is_sm8x = cc_major == 8 && cc_minor > 0;
+    bool is_sm70 = cc_major == 7;
     DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
         if constexpr(!Is_dropout) {
+            // V100 (SM70): causal uses 64x64 to reduce register pressure from SM70's 8x8x4 MMA atom.
+            // Non-causal uses 128x64 (works without causal masking overhead).
+            if (is_sm70) {
+                if constexpr(Is_causal) {
+                    run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+                } else {
+                    run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+                }
             // For sm86 or sm89, 64 x 64 is the fastest for causal (because it's square),
             // and 128 x 32 (48 KB smem) is the fastest for non-causal since we get 2 CTAs per SM.
-            if (is_sm8x) {
+            } else if (is_sm8x) {
                 if constexpr(!Is_causal) {
                     run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 32, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
                 } else {
@@ -259,8 +316,27 @@ void run_mha_fwd_hdim128(Flash_fwd_params &params, cudaStream_t stream) {
 template<typename T, bool Is_causal>
 void run_mha_fwd_hdim192(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 192;
+    int device;
+    cudaGetDevice(&device);
+    int max_smem_per_block;
+    cudaError status_ = cudaDeviceGetAttribute(
+        &max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
+    if (status_ != cudaSuccess) {
+      C10_CUDA_CHECK(status_);
+    }
     DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
-        if constexpr(!Is_dropout) {
+        // The large config (128x64x8) needs smem for Q(128*192*2) + K+V(64*192*2*2) + P_buf(128*64*2) = 115KB.
+        // V100 only has 96KB, so use kBlockM=64 instead (~82KB).
+        constexpr int smem_large = 2 * Headdim * (128 + 2 * 64) + 128 * 64 * 2;
+        if (max_smem_per_block < smem_large) {
+            if constexpr(Is_causal) {
+                // V100 causal: kBlockN=32 to reduce register pressure from SM70's 8x8x4 MMA atom.
+                // kBlockN=64 crashes on SM70 for causal due to excessive register usage.
+                run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 32, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+            } else {
+                run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+            }
+        } else if constexpr(!Is_dropout) {
             run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 8, false, false, T>, Is_dropout, Is_causal>(params, stream);
         } else {
             run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
@@ -290,7 +366,15 @@ void run_mha_fwd_hdim256(Flash_fwd_params &params, cudaStream_t stream) {
     DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
         // For A100, we want to run with 128 x 64 (128KB smem).
         // For H100 we want to run with 64 x 64 (96KB smem) since then we can get 2 CTAs per SM.
-        if (max_smem_per_block >= 2 * Headdim * (128 + 2 * 64) && max_smem_per_sm < 4 * Headdim * (64 + 2 * 64)) {
+        // V100 (96KB): 64x64 needs Q(32KB)+K+V(64KB)+P_buf(8KB) = 104KB on SM70, exceeds 96KB.
+        // Use 64x32 instead: Q(32KB) + K+V(32KB) + P_buf(4KB) = 68KB, fits comfortably.
+        // The 64x64 config WITHOUT PV buffer needs exactly 96KB = max_smem on V100,
+        // but SM70 adds a PV buffer, pushing it over. Use <= to catch this edge case.
+        constexpr int smem_64x64_no_pbuf = 2 * Headdim * (64 + 2 * 64);
+        if (max_smem_per_block <= smem_64x64_no_pbuf) {
+            // V100: use kBlockN=32 to fit in 96KB with SM70 PV buffer
+            run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 32, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+        } else if (max_smem_per_block >= 2 * Headdim * (128 + 2 * 64) && max_smem_per_sm < 4 * Headdim * (64 + 2 * 64)) {
             run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 64, 8, false, false, T>, Is_dropout, Is_causal>(params, stream);
         } else {
             run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 64, 64, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);

@@ -40,7 +40,15 @@ __device__ __forceinline__ void quad_allreduce_(Tensor<Engine0, Layout0> &dst, T
     CUTE_STATIC_ASSERT_V(size(dst) == size(src));
     #pragma unroll
     for (int i = 0; i < size(dst); i++){
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
         dst(i) = Allreduce<4>::run(src(i), op);
+#else
+        // SM70 N-major: 4 threads share a row, XOR masks {2, 4}
+        auto x = src(i);
+        x = op(x, __shfl_xor_sync(uint32_t(-1), x, 2));
+        x = op(x, __shfl_xor_sync(uint32_t(-1), x, 4));
+        dst(i) = x;
+#endif
     }
 }
 
@@ -105,7 +113,11 @@ __forceinline__ __device__ void max_scale_exp2_sum(Tensor<Engine0, Layout0> &ten
         for (int ni = 1; ni < size<1>(tensor); ni++) {
             max(mi) = max_op(max(mi), tensor(mi, ni));
         }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
         max(mi) = Allreduce<4>::run(max(mi), max_op);
+#else
+        { auto tmp = max(mi); tmp = max_op(tmp, __shfl_xor_sync(uint32_t(-1), tmp, 2)); tmp = max_op(tmp, __shfl_xor_sync(uint32_t(-1), tmp, 4)); max(mi) = tmp; }
+#endif
         // If max is -inf, then all elements must have been -inf (possibly due to masking).
         // We don't want (-inf - (-inf)) since that would give NaN.
         const float max_scaled = max(mi) == -INFINITY ? 0.f : max(mi) * scale;
@@ -119,7 +131,11 @@ __forceinline__ __device__ void max_scale_exp2_sum(Tensor<Engine0, Layout0> &ten
             sum(mi) += tensor(mi, ni);
         }
         SumOp<float> sum_op;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
         sum(mi) = Allreduce<4>::run(sum(mi), sum_op);
+#else
+        { auto tmp = sum(mi); tmp = sum_op(tmp, __shfl_xor_sync(uint32_t(-1), tmp, 2)); tmp = sum_op(tmp, __shfl_xor_sync(uint32_t(-1), tmp, 4)); sum(mi) = tmp; }
+#endif
     }
 }
 

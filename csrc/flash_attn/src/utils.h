@@ -147,15 +147,24 @@ __forceinline__ __device__ void gemm(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tCrB,
     CUTE_STATIC_ASSERT_V(size<1>(tCsA) == size<1>(tCrA_copy_view));            // M
     Tensor tCrB_copy_view = smem_thr_copy_B.retile_D(tCrB);
     CUTE_STATIC_ASSERT_V(size<1>(tCsB) == size<1>(tCrB_copy_view));            // N
+    // On SM70, MMA atom K (4) < copy tile K (16), so size<2>(tCrA) > size<2>(tCrA_copy_view).
+    // Each copy tile fills multiple MMA atoms. On SM80+, these are equal and the inner loop runs once.
+    constexpr int k_copy = decltype(size<2>(tCrA_copy_view))::value;
+    constexpr int k_mma = decltype(size<2>(tCrA))::value;
+    static_assert(k_mma % k_copy == 0);
+    constexpr int atoms_per_tile = k_mma / k_copy;
     if (!A_in_regs) { cute::copy(smem_tiled_copy_A, tCsA(_, _, _0{}), tCrA_copy_view(_, _, _0{})); }
     if (!B_in_regs) { cute::copy(smem_tiled_copy_B, tCsB(_, _, _0{}), tCrB_copy_view(_, _, _0{})); }
     #pragma unroll
-    for (int i = 0; i < size<2>(tCrA); ++i) {
-        if (i < size<2>(tCrA) - 1) {
-            if (!A_in_regs) { cute::copy(smem_tiled_copy_A, tCsA(_, _, i + 1), tCrA_copy_view(_, _, i + 1)); }
-            if (!B_in_regs) { cute::copy(smem_tiled_copy_B, tCsB(_, _, i + 1), tCrB_copy_view(_, _, i + 1)); }
+    for (int k_tile = 0; k_tile < k_copy; ++k_tile) {
+        if (k_tile + 1 < k_copy) {
+            if (!A_in_regs) { cute::copy(smem_tiled_copy_A, tCsA(_, _, k_tile + 1), tCrA_copy_view(_, _, k_tile + 1)); }
+            if (!B_in_regs) { cute::copy(smem_tiled_copy_B, tCsB(_, _, k_tile + 1), tCrB_copy_view(_, _, k_tile + 1)); }
         }
-        cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
+        #pragma unroll
+        for (int k_atom = 0; k_atom < atoms_per_tile; ++k_atom) {
+            cute::gemm(tiled_mma, tCrA(_, _, k_tile * atoms_per_tile + k_atom), tCrB(_, _, k_tile * atoms_per_tile + k_atom), acc);
+        }
     }
 }
 
@@ -171,41 +180,96 @@ __forceinline__ __device__ void gemm_rs(Tensor0 &acc, Tensor1 &tCrA, Tensor2 &tC
     CUTE_STATIC_ASSERT_V(size<2>(tCrA) == size<2>(tCrB));                     // MMA_K
     Tensor tCrB_copy_view = smem_thr_copy_B.retile_D(tCrB);
     CUTE_STATIC_ASSERT_V(size<1>(tCsB) == size<1>(tCrB_copy_view));            // N
+    constexpr int k_copy_B = decltype(size<2>(tCrB_copy_view))::value;
+    constexpr int k_mma_B = decltype(size<2>(tCrA))::value;
+    static_assert(k_mma_B % k_copy_B == 0);
+    constexpr int atoms_per_tile_B = k_mma_B / k_copy_B;
     cute::copy(smem_tiled_copy_B, tCsB(_, _, _0{}), tCrB_copy_view(_, _, _0{}));
     #pragma unroll
-    for (int i = 0; i < size<2>(tCrA); ++i) {
-        if (i < size<2>(tCrA) - 1) {
-            cute::copy(smem_tiled_copy_B, tCsB(_, _, i + 1), tCrB_copy_view(_, _, i + 1));
+    for (int k_tile = 0; k_tile < k_copy_B; ++k_tile) {
+        if (k_tile + 1 < k_copy_B) {
+            cute::copy(smem_tiled_copy_B, tCsB(_, _, k_tile + 1), tCrB_copy_view(_, _, k_tile + 1));
         }
-        cute::gemm(tiled_mma, tCrA(_, _, i), tCrB(_, _, i), acc);
+        #pragma unroll
+        for (int k_atom = 0; k_atom < atoms_per_tile_B; ++k_atom) {
+            cute::gemm(tiled_mma, tCrA(_, _, k_tile * atoms_per_tile_B + k_atom), tCrB(_, _, k_tile * atoms_per_tile_B + k_atom), acc);
+        }
     }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// SM70: PV GEMM via shared memory. The 8x8x4 MMA atom has incompatible C and A register
+// layouts, so P must be written to shared memory and reloaded as an A operand.
+template<typename SmemCopyAtomC, typename SmemCopyAtomA,
+         typename Tensor0, typename Tensor1, typename Tensor2, typename Tensor3,
+         typename Tensor4, typename TiledMma, typename TiledCopy, typename ThrCopy>
+__forceinline__ __device__ void gemm_smem_pv(
+    Tensor0 &acc, Tensor1 &rP, Tensor2 &tCrB, Tensor3 const& tCsB,
+    Tensor4 &sP, TiledMma tiled_mma, TiledCopy smem_tiled_copy_B,
+    ThrCopy smem_thr_copy_B, const int tidx)
+{
+    // Step 1: Write P from C-layout registers to shared memory
+    auto smem_tiled_copy_PtoSmem = make_tiled_copy_C(SmemCopyAtomC{}, tiled_mma);
+    auto smem_thr_copy_PtoSmem = smem_tiled_copy_PtoSmem.get_thread_slice(tidx);
+    cute::copy(smem_tiled_copy_PtoSmem, smem_thr_copy_PtoSmem.retile_S(rP),
+               smem_thr_copy_PtoSmem.partition_D(sP));
+    __syncthreads();
+
+    // Step 2: Read P from shared memory as A operand and multiply with V
+    auto smem_tiled_copy_PfromSmem = make_tiled_copy_A(SmemCopyAtomA{}, tiled_mma);
+    auto smem_thr_copy_PfromSmem = smem_tiled_copy_PfromSmem.get_thread_slice(tidx);
+    Tensor tSsP = smem_thr_copy_PfromSmem.partition_S(sP);
+    auto thr_mma = tiled_mma.get_thread_slice(tidx);
+    Tensor tSrP = thr_mma.partition_fragment_A(sP);
+
+    gemm</*A_in_regs=*/false>(acc, tSrP, tCrB, tSsP, tCsB, tiled_mma,
+                              smem_tiled_copy_PfromSmem, smem_tiled_copy_B,
+                              smem_thr_copy_PfromSmem, smem_thr_copy_B);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 // Convert acc_layout from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
+// For SM70: (MMA=8, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(4, MMA_N))
 template<typename Layout>
 __forceinline__ __device__ auto convert_layout_acc_rowcol(Layout acc_layout) {
-    static_assert(decltype(size<0>(acc_layout))::value == 4);
     static_assert(decltype(rank(acc_layout))::value == 3);
-    auto l = logical_divide(acc_layout, Shape<_2>{});  // ((2, 2), MMA_M, MMA_N)
-    return make_layout(make_layout(get<0, 1>(l), get<1>(l)), make_layout(get<0, 0>(l), get<2>(l)));
+    if constexpr (decltype(size<0>(acc_layout))::value == 4) {
+        // SM75+: 4 values per thread per atom
+        auto l = logical_divide(acc_layout, Shape<_2>{});  // ((2, 2), MMA_M, MMA_N)
+        return make_layout(make_layout(get<0, 1>(l), get<1>(l)), make_layout(get<0, 0>(l), get<2>(l)));
+    } else {
+        // SM70: 8 values per thread per atom
+        // Value layout: v = col_low + 2*row + 4*col_high
+        // logical_divide by 2: inner=col_low(2), outer=4 with stride 2
+        static_assert(decltype(size<0>(acc_layout))::value == 8);
+        auto l = logical_divide(acc_layout, Shape<_2>{});  // ((2, 4), MMA_M, MMA_N)
+        // Divide the outer 4 by 2: inner=row(2,stride2), outer=col_high(2,stride4)
+        // l2 is rank-1 with hierarchical shape: ((2_row, 2_col_high))
+        auto l2 = logical_divide(get<0, 1>(l), Shape<_2>{});
+        // row: (2_row, MMA_M), col: ((2_col_low, 2_col_high), MMA_N)
+        return make_layout(make_layout(get<0, 0>(l2), get<1>(l)),
+                           make_layout(make_layout(get<0, 0>(l), get<0, 1>(l2)), get<2>(l)));
+    }
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Convert acc_layout from (MMA=4, MMA_M, MMA_N) to ((4, 2), MMA_M, MMA_N / 2)
 // if using m16n8k16, or to (4, MMA_M, MMA_N) if using m16n8k8.
+// For SM70 (MMA=8): (8, MMA_M, MMA_N) unchanged (K=4, no grouping needed).
 template<typename MMA_traits, typename Layout>
 __forceinline__ __device__ auto convert_layout_acc_Aregs(Layout acc_layout) {
     using X = Underscore;
-    static_assert(decltype(size<0>(acc_layout))::value == 4);
     static_assert(decltype(rank(acc_layout))::value == 3);
     constexpr int mma_shape_K = get<2>(typename MMA_traits::Shape_MNK{});
-    static_assert(mma_shape_K == 8 || mma_shape_K == 16);
-    if constexpr (mma_shape_K == 8) {
+    static_assert(mma_shape_K == 4 || mma_shape_K == 8 || mma_shape_K == 16);
+    if constexpr (mma_shape_K == 4 || mma_shape_K == 8) {
+        // SM70 (K=4) or SM75 (K=8): no regrouping needed
         return acc_layout;
     } else {
+        static_assert(decltype(size<0>(acc_layout))::value == 4);
         auto l = logical_divide(acc_layout, Shape<X, X, _2>{});  // (4, MMA_M, (2, MMA_N / 2)))
         return make_layout(make_layout(get<0>(l), get<2, 0>(l)), get<1>(l), get<2, 1>(l));
     }
@@ -214,12 +278,12 @@ __forceinline__ __device__ auto convert_layout_acc_Aregs(Layout acc_layout) {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Convert acc_layout from (MMA=4, MMA_M, MMA_N) to ((4, 2), MMA_M, MMA_N / 2)
+// For SM70 (MMA=8): (8, MMA_M, MMA_N) to ((8, 2), MMA_M, MMA_N / 2)
 template<typename Layout>
 __forceinline__ __device__ auto convert_layout_acc_dropout(Layout acc_layout) {
     using X = Underscore;
-    static_assert(decltype(size<0>(acc_layout))::value == 4);
     static_assert(decltype(rank(acc_layout))::value == 3);
-    auto l = logical_divide(acc_layout, Shape<X, X, _2>{});  // (4, MMA_M, (2, MMA_N / 2)))
+    auto l = logical_divide(acc_layout, Shape<X, X, _2>{});
     return make_layout(make_layout(get<0>(l), get<2, 0>(l)), get<1>(l), get<2, 1>(l));
 };
 

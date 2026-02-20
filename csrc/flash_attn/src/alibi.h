@@ -32,17 +32,31 @@ struct Alibi {
                                       const int col_idx_offset_,
                                       const int row_idx_offset,
                                       const int warp_row_stride) {
-        // tensor has shape (nrow=(2, MMA_M), ncol=(2, MMA_N))
+        // tensor has shape (nrow=(2, MMA_M), ncol=(2, MMA_N)) for SM75+
+        // or (nrow=(2, MMA_M), ncol=(4, MMA_N)) for SM70
         static_assert(Layout::rank == 2, "Only support 2D Tensor");
         const int lane_id = threadIdx.x % 32;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
         const int col_idx_offset = col_idx_offset_ + (lane_id % 4) * 2;
+        static constexpr int kRowInnerStride = 8;
+        static constexpr int kMmaNStride = 8;
+#else
+        const int col_idx_offset = col_idx_offset_ + ((lane_id >> 1) & 1) * 2 + ((lane_id >> 2) & 1) * 8;
+        static constexpr int kRowInnerStride = 2;
+        static constexpr int kMmaNStride = 16;
+        static constexpr int sm70_col_offsets[] = {0, 1, 4, 5};
+#endif
         if constexpr (Is_causal) {  // Simpler, we add the same bias vector to all rows
             #pragma unroll
             for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
-                const int col_idx_base = col_idx_offset + nj * 8;
+                const int col_idx_base = col_idx_offset + nj * kMmaNStride;
                 #pragma unroll
                 for (int j = 0; j < size<1, 0>(tensor); ++j) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
                     const int col_idx = col_idx_base + j;
+#else
+                    const int col_idx = col_idx_base + sm70_col_offsets[j];
+#endif
                     #pragma unroll
                     for (int mi = 0; mi < size<0>(tensor); ++mi) {
                         tensor(mi, make_coord(j, nj)) += alibi_slope * col_idx;
@@ -55,13 +69,17 @@ struct Alibi {
                 const int row_idx_base = row_idx_offset + mi * warp_row_stride;
                 #pragma unroll
                 for (int i = 0; i < size<0, 0>(tensor); ++i) {
-                    const int row_idx = row_idx_base + i * 8;
+                    const int row_idx = row_idx_base + i * kRowInnerStride;
                     #pragma unroll
                     for (int nj = 0; nj < size<1, 1>(tensor); ++nj) {
-                        const int col_idx_base = col_idx_offset + nj * 8;
+                        const int col_idx_base = col_idx_offset + nj * kMmaNStride;
                         #pragma unroll
                         for (int j = 0; j < size<1, 0>(tensor); ++j) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
                             const int col_idx = col_idx_base + j;
+#else
+                            const int col_idx = col_idx_base + sm70_col_offsets[j];
+#endif
                             tensor(make_coord(i, mi), make_coord(j, nj)) -= alibi_slope * abs(row_idx + max_seqlen_k - max_seqlen_q - col_idx);
                         }
                     }

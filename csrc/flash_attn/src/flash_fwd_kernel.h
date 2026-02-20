@@ -66,6 +66,16 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     constexpr int kHeadDim = Kernel_traits::kHeadDim;
     constexpr int kNWarps = Kernel_traits::kNWarps;
 
+    // Per-thread row offset within the warp's 16-row sub-tile.
+    // SM80 (16x8 atom): lane/4 gives 0-7.
+    // SM70 (8x8 atom, 2x2 tiled to 16x16): different mapping based on QuadPair layout.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
+    const int row_offset_in_warp = (tidx % 32) / 4;
+#else
+    const int lane_id_fwd = tidx % 32;
+    const int row_offset_in_warp = ((lane_id_fwd >> 4) & 1) * 4 + ((lane_id_fwd >> 3) & 1) * 8 + (lane_id_fwd & 1);
+#endif
+
     auto seed_offset = at::cuda::philox::unpack(params.philox_args);
     FLASH_NAMESPACE::Dropout dropout(std::get<0>(seed_offset), std::get<1>(seed_offset), params.p_dropout_in_uint8_t,
                            bidb, bidh, tidx, params.h);
@@ -165,6 +175,11 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     Tensor sV = make_tensor(sK.data() + size(sK), typename Kernel_traits::SmemLayoutKV{});
     Tensor sVt = make_tensor(sV.data(), typename Kernel_traits::SmemLayoutVtransposed{});
     Tensor sVtNoSwizzle = make_tensor(sV.data().get(), typename Kernel_traits::SmemLayoutVtransposedNoSwizzle{});
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ < 750
+    // SM70: P buffer in shared memory for PV GEMM (placed after Q+K+V)
+    Tensor sP = make_tensor(make_smem_ptr(reinterpret_cast<Element *>(smem_ + Kernel_traits::kSmemSizeBase)),
+                            typename Kernel_traits::SmemLayoutP{});
+#endif
 
     typename Kernel_traits::GmemTiledCopyQKV gmem_tiled_copy_QKV;
     auto gmem_thr_copy_QKV = gmem_tiled_copy_QKV.get_thread_slice(tidx);
@@ -326,7 +341,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         }
 
         mask.template apply_mask<Is_causal, Is_even_MN>(
-            acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16
+            acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + row_offset_in_warp, kNWarps * 16
         );
 
         FLASH_NAMESPACE::cp_async_wait<0>();
@@ -360,12 +375,16 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             dropout.apply_dropout(rP, block_row_idx, block_col_idx, kNWarps);
         }
 
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
         // Reshape rP from (MMA=4, MMA_M, MMA_N) to ((4, 2), MMA_M, MMA_N / 2)
         // if using m16n8k16 or (4, MMA_M, MMA_N) if using m16n8k8.
         Tensor tOrP = make_tensor(rP.data(), FLASH_NAMESPACE::convert_layout_acc_Aregs<typename Kernel_traits::TiledMma>(rP.layout()));
-        // if (cute::thread0()) { print(tOrP); }
         FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
-        // if (cute::thread0()) { print(scores); }
+#else
+        // SM70: write P to shared memory, reload as A operand for PV GEMM
+        FLASH_NAMESPACE::gemm_smem_pv<typename Kernel_traits::SmemCopyAtomP, typename Kernel_traits::SmemCopyAtom>(
+            acc_o, rP, tOrVt, tOsVt, sP, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V, tidx);
+#endif
 
         // This check is at the end of the loop since we always have at least 1 iteration
         if (n_masking_steps > 1 && n_block <= n_block_min) {
@@ -375,6 +394,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     }
 
     // These are the iterations where we don't need masking on S
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 750
     for (; n_block >= n_block_min; --n_block) {
         Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_M, MMA_N)
         clear(acc_s);
@@ -401,7 +421,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         }
 
         mask.template apply_mask</*Causal_mask=*/false>(
-            acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16
+            acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + row_offset_in_warp, kNWarps * 16
         );
 
         softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_local>(acc_s, acc_o, params.scale_softmax_log2);
@@ -427,6 +447,63 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         Tensor tOrP = make_tensor(rP.data(), FLASH_NAMESPACE::convert_layout_acc_Aregs<typename Kernel_traits::TiledMma>(rP.layout()));
         FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
     }
+#else
+    // SM70: Use masking code path for all remaining iterations.
+    // This avoids an SM70 nvcc code generation issue where having two separate loop bodies
+    // (masking + non-masking) at high register pressure causes corrupted pointer registers.
+    // For below-diagonal blocks, the causal mask is all-true (no effect), so this is
+    // functionally identical to the non-masking loop with negligible overhead.
+    for (; n_block >= n_block_min; --n_block) {
+        Tensor acc_s = partition_fragment_C(tiled_mma, Shape<Int<kBlockM>, Int<kBlockN>>{});
+        clear(acc_s);
+        FLASH_NAMESPACE::cp_async_wait<0>();
+        __syncthreads();
+        FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tVgV(_, _, _, n_block), tVsV, tKVcKV, tKVpKV);
+        cute::cp_async_fence();
+
+        FLASH_NAMESPACE::gemm</*A_in_regs=*/Kernel_traits::Is_Q_in_regs>(
+            acc_s, tSrQ, tSrK, tSsQ, tSsK, tiled_mma, smem_tiled_copy_Q, smem_tiled_copy_K,
+            smem_thr_copy_Q, smem_thr_copy_K
+        );
+        if constexpr (Is_softcap){
+            FLASH_NAMESPACE::apply_softcap(acc_s, params.softcap);
+        }
+
+        // Apply causal mask even for non-masking blocks on SM70.
+        // For blocks fully below the diagonal, the mask is all-true (no-op).
+        mask.template apply_mask<Is_causal, Is_even_MN>(
+            acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + row_offset_in_warp, kNWarps * 16
+        );
+
+        FLASH_NAMESPACE::cp_async_wait<0>();
+        __syncthreads();
+        if (n_block > n_block_min) {
+            FLASH_NAMESPACE::copy</*Is_even_MN=*/true, Is_even_K>(gmem_tiled_copy_QKV, tKgK(_, _, _, n_block - 1), tKsK, tKVcKV, tKVpKV);
+            cute::cp_async_fence();
+        }
+
+        softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_causal || Is_local>(acc_s, acc_o, params.scale_softmax_log2);
+
+        Tensor rP = FLASH_NAMESPACE::convert_type<Element>(acc_s);
+        int block_row_idx = m_block * (kBlockM / 16) + tidx / 32;
+        int block_col_idx = n_block * (kBlockN / 32);
+        if (Return_softmax) {
+            Tensor rP_drop = make_fragment_like(rP);
+            cute::copy(rP, rP_drop);
+            dropout.template apply_dropout</*encode_dropout_in_sign_bit=*/true>(
+                rP_drop, block_row_idx, block_col_idx, kNWarps
+            );
+            cute::copy(rP_drop, tSgS);
+            tSgS.data() = tSgS.data() + (-kBlockN);
+        }
+        if (Is_dropout) {
+            dropout.apply_dropout(rP, block_row_idx, block_col_idx, kNWarps);
+        }
+
+        FLASH_NAMESPACE::gemm_smem_pv<typename Kernel_traits::SmemCopyAtomP, typename Kernel_traits::SmemCopyAtom>(
+            acc_o, rP, tOrVt, tOsVt, sP, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V, tidx);
+    }
+#endif
 
     // Epilogue
 
@@ -466,7 +543,8 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
     Tensor caccO = make_identity_tensor(Shape<Int<kBlockM>, Int<kHeadDim>>{});    // (BLK_M,BLK_K) -> (blk_m,blk_k)
     Tensor taccOcO = thr_mma.partition_C(caccO);                           // (MMA,MMA_M,MMA_K)
-    static_assert(decltype(size<0>(taccOcO))::value == 4);
+    static_assert(decltype(size<0>(taccOcO))::value == 4 || decltype(size<0>(taccOcO))::value == 8);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
     // Convert to ((2, 2), MMA_M, MMA_K) then take only the row indices.
     Tensor taccOcO_row = logical_divide(taccOcO, Shape<_2>{})(make_coord(0, _), _, 0);
     CUTE_STATIC_ASSERT_V(size(lse) == size(taccOcO_row));                     // MMA_M
@@ -477,6 +555,22 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
             if (row < binfo.actual_seqlen_q - m_block * kBlockM) { gLSE(row) = lse(mi); }
         }
     }
+#else
+    // SM70: Each thread has 2 rows per MMA_M atom. v=0 gives row 0, v=2 gives row 1.
+    if (get<1>(taccOcO(0, 0, 0)) == 0) {
+        #pragma unroll
+        for (int mi = 0; mi < size<1>(taccOcO); ++mi) {
+            {
+                const int row = get<0>(taccOcO(0, mi, 0));
+                if (row < binfo.actual_seqlen_q - m_block * kBlockM) { gLSE(row) = lse(2 * mi + 0); }
+            }
+            {
+                const int row = get<0>(taccOcO(2, mi, 0));
+                if (row < binfo.actual_seqlen_q - m_block * kBlockM) { gLSE(row) = lse(2 * mi + 1); }
+            }
+        }
+    }
+#endif
 
     // Construct identity layout for sO
     Tensor cO = make_identity_tensor(make_shape(size<0>(sO), size<1>(sO)));    // (BLK_M,BLK_K) -> (blk_m,blk_k)
@@ -512,6 +606,14 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     constexpr int kBlockN = Kernel_traits::kBlockN;
     constexpr int kHeadDim = Kernel_traits::kHeadDim;
     constexpr int kNWarps = Kernel_traits::kNWarps;
+
+    // Per-thread row offset within the warp's 16-row sub-tile.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
+    const int row_offset_in_warp = (tidx % 32) / 4;
+#else
+    const int lane_id_fwd = tidx % 32;
+    const int row_offset_in_warp = ((lane_id_fwd >> 4) & 1) * 4 + ((lane_id_fwd >> 3) & 1) * 8 + (lane_id_fwd & 1);
+#endif
 
     using GmemTiledCopyO = std::conditional_t<
         !Split,
@@ -612,6 +714,11 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
     Tensor sV = make_tensor(sK.data() + size(sK), typename Kernel_traits::SmemLayoutKV{});
     Tensor sVt = make_tensor(sV.data(), typename Kernel_traits::SmemLayoutVtransposed{});
     Tensor sVtNoSwizzle = make_tensor(sV.data().get(), typename Kernel_traits::SmemLayoutVtransposedNoSwizzle{});
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ < 750
+    // SM70: P buffer in shared memory for PV GEMM (placed after Q+K+V)
+    Tensor sP = make_tensor(make_smem_ptr(reinterpret_cast<Element *>(smem_ + Kernel_traits::kSmemSizeBase)),
+                            typename Kernel_traits::SmemLayoutP{});
+#endif
 
     typename Kernel_traits::GmemTiledCopyQKV gmem_tiled_copy_QKV;
     auto gmem_thr_copy_QKV = gmem_tiled_copy_QKV.get_thread_slice(tidx);
@@ -887,7 +994,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
 
         mask.template apply_mask<Is_causal, Is_even_MN>(
-            acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16
+            acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + row_offset_in_warp, kNWarps * 16
         );
 
         FLASH_NAMESPACE::cp_async_wait<0>();
@@ -920,11 +1027,16 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
         // Convert acc_s from fp32 to fp16/bf16
         Tensor rP = FLASH_NAMESPACE::convert_type<Element>(acc_s);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
         // Reshape rP from (MMA=4, MMA_M, MMA_N) to ((4, 2), MMA_M, MMA_N / 2)
         // if using m16n8k16 or (4, MMA_M, MMA_N) if using m16n8k8.
         Tensor tOrP = make_tensor(rP.data(), FLASH_NAMESPACE::convert_layout_acc_Aregs<typename Kernel_traits::TiledMma>(rP.layout()));
-
         FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+#else
+        // SM70: write P to shared memory, reload as A operand for PV GEMM
+        FLASH_NAMESPACE::gemm_smem_pv<typename Kernel_traits::SmemCopyAtomP, typename Kernel_traits::SmemCopyAtom>(
+            acc_o, rP, tOrVt, tOsVt, sP, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V, tidx);
+#endif
 
         // This check is at the end of the loop since we always have at least 1 iteration
         if (n_masking_steps > 1 && n_block <= n_block_min) {
@@ -980,16 +1092,21 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
         }
 
         mask.template apply_mask</*Causal_mask=*/false>(
-            acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + (tidx % 32) / 4, kNWarps * 16
+            acc_s, n_block * kBlockN, m_block * kBlockM + (tidx / 32) * 16 + row_offset_in_warp, kNWarps * 16
         );
         softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_local>(acc_s, acc_o, params.scale_softmax_log2);
 
         Tensor rP = FLASH_NAMESPACE::convert_type<Element>(acc_s);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
         // Reshape rP from (MMA=4, MMA_M, MMA_N) to ((4, 2), MMA_M, MMA_N / 2)
         // if using m16n8k16 or (4, MMA_M, MMA_N) if using m16n8k8.
         Tensor tOrP = make_tensor(rP.data(), FLASH_NAMESPACE::convert_layout_acc_Aregs<typename Kernel_traits::TiledMma>(rP.layout()));
-
         FLASH_NAMESPACE::gemm_rs(acc_o, tOrP, tOrVt, tOsVt, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V);
+#else
+        // SM70: write P to shared memory, reload as A operand for PV GEMM
+        FLASH_NAMESPACE::gemm_smem_pv<typename Kernel_traits::SmemCopyAtomP, typename Kernel_traits::SmemCopyAtom>(
+            acc_o, rP, tOrVt, tOsVt, sP, tiled_mma, smem_tiled_copy_V, smem_thr_copy_V, tidx);
+#endif
     }
 
     // Epilogue
@@ -1043,7 +1160,8 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
     Tensor caccO = make_identity_tensor(Shape<Int<kBlockM>, Int<kHeadDim>>{});    // (BLK_M,BLK_K) -> (blk_m,blk_k)
     Tensor taccOcO = thr_mma.partition_C(caccO);                           // (MMA,MMA_M,MMA_K)
-    static_assert(decltype(size<0>(taccOcO))::value == 4);
+    static_assert(decltype(size<0>(taccOcO))::value == 4 || decltype(size<0>(taccOcO))::value == 8);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 750
     // Convert to ((2, 2), MMA_M, MMA_K) then take only the row indices.
     Tensor taccOcO_row = logical_divide(taccOcO, Shape<_2>{})(make_coord(0, _), _, 0);
     CUTE_STATIC_ASSERT_V(size(lse) == size(taccOcO_row));                     // MMA_M
@@ -1054,6 +1172,22 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
             if (row < binfo.actual_seqlen_q - m_block * kBlockM) { gLSEaccum(row) = lse(mi); }
         }
     }
+#else
+    // SM70: Each thread has 2 rows per MMA_M atom. v=0 gives row 0, v=2 gives row 1.
+    if (get<1>(taccOcO(0, 0, 0)) == 0) {
+        #pragma unroll
+        for (int mi = 0; mi < size<1>(taccOcO); ++mi) {
+            {
+                const int row = get<0>(taccOcO(0, mi, 0));
+                if (row < binfo.actual_seqlen_q - m_block * kBlockM) { gLSEaccum(row) = lse(2 * mi + 0); }
+            }
+            {
+                const int row = get<0>(taccOcO(2, mi, 0));
+                if (row < binfo.actual_seqlen_q - m_block * kBlockM) { gLSEaccum(row) = lse(2 * mi + 1); }
+            }
+        }
+    }
+#endif
 
     // Construct identity layout for sO
     Tensor cO = make_identity_tensor(make_shape(size<0>(sOaccum), size<1>(sOaccum)));    // (BLK_M,BLK_K) -> (blk_m,blk_k)

@@ -29,10 +29,12 @@ struct Dropout {
         // convert shape from (4, MMA_M, MMA_N) to (8, MMA_M, MMA_N / 2)
         Tensor tensor = make_tensor(tensor_.data(), FLASH_NAMESPACE::convert_layout_acc_dropout(tensor_.layout()));
         using T = typename Engine::value_type;
+        // SM70 backward configs may have MMA_N < 4, giving odd size<2> after halving.
+        // Dropout is disabled at runtime for SM70, but the template is still instantiated.
+        if constexpr (decltype(size<2>(tensor))::value % 2 != 0) { return; }
         auto encode_dropout = [](bool keep, T val) {
             return keep ? val : (encode_dropout_in_sign_bit ? -val : T(0));
         };
-        static_assert(decltype(size<2>(tensor))::value % 2 == 0);
         const uint16_t p_dropout_8bit_in_uint16_t = uint16_t(p_dropout_in_uint8_t);
         const uint32_t p_dropout_8bit_in_uint32_t = (uint32_t(p_dropout_8bit_in_uint16_t) << 16) | uint32_t(p_dropout_8bit_in_uint16_t);
         // if (cute::thread0()) { printf("threshold2 = 0x%x\n", p_dropout_8bit_in_uint32_t); }
