@@ -483,10 +483,8 @@ def _flash_attn_fwd(
                 mask_mod=mask_mod,
                 has_aux_tensors=aux_tensors is not None,
                 paged_kv_non_tma=page_size not in [None, 128],
-                is_varlen_q=cu_seqlens_q is not None
-                    or seqused_q is not None,
+                is_varlen_q=cu_seqlens_q is not None or seqused_q is not None,
                 q_subtile_factor=q_subtile_factor,
-                arch=arch,
             )
         else:
             raise ValueError(

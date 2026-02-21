@@ -26,6 +26,8 @@ from cutlass import Float32, Int32, const_expr
 from cutlass.cute.nvgpu import cpasync
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
+from cutlass.base_dsl.arch import Arch
+from cutlass.cutlass_dsl import BaseDSL
 
 from quack import copy_utils
 
@@ -68,7 +70,6 @@ class NamedBarrierFwd(enum.IntEnum):
 
 
 class FlashAttentionForwardSm100:
-    arch = 100
 
     def __init__(
         self,
@@ -90,7 +91,6 @@ class FlashAttentionForwardSm100:
         has_aux_tensors: cutlass.Constexpr = False,
         paged_kv_non_tma: bool = False,
         is_varlen_q: bool = False,
-        arch: int = 100,
     ):
         self.use_tma_KV = not paged_kv_non_tma
         # self.dtype = dtype
@@ -107,8 +107,8 @@ class FlashAttentionForwardSm100:
         self.n_block_size = n_block_size
         self.q_stage = q_stage
         assert self.q_stage in [1, 2]
-        self.arch = arch
-        assert arch // 10 in [10, 11], "Only SM 10.x and 11.x are supported"
+        self.arch = BaseDSL._get_dsl().get_arch_enum()
+        assert self.arch >= Arch.sm_100 and self.arch <= Arch.sm_110f, "Only SM 10.x and 11.x are supported"
 
         # 2 Q tile per CTA
         self.cta_tiler = (self.q_stage * m_block_size, n_block_size, self.head_dim_padded)
@@ -140,7 +140,7 @@ class FlashAttentionForwardSm100:
         )
         # Does S1 need to wait for S0 to finish
         # self.s0_s1_barrier = self.head_dim_padded in [64, 96] and (not self.is_causal and not self.is_local)
-        self.enable_e2e = self.head_dim_padded <= 128 and self.arch not in [103]
+        self.enable_e2e = self.head_dim_padded <= 128 and not (self.arch >= Arch.sm_103 and self.arch <= Arch.sm_103f)
         self.s0_s1_barrier = False
         self.overlap_sO_sQ = (
             (self.head_dim_padded == 192 and self.head_dim_v_padded >= 64) or
@@ -347,7 +347,7 @@ class FlashAttentionForwardSm100:
         if const_expr(self.q_dtype != self.v_dtype):
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.v_dtype}")
         self._setup_attributes()
-        self.use_tma_O = self.arch >= 90 and mCuSeqlensQ is None and mSeqUsedQ is None
+        self.use_tma_O = self.arch >= Arch.sm_90 and mCuSeqlensQ is None and mSeqUsedQ is None
         # This can be tuned
         self.e2e_freq = 16
         if const_expr(
