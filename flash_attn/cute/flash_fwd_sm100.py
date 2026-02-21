@@ -140,6 +140,7 @@ class FlashAttentionForwardSm100:
         )
         # Does S1 need to wait for S0 to finish
         # self.s0_s1_barrier = self.head_dim_padded in [64, 96] and (not self.is_causal and not self.is_local)
+        self.enable_e2e = self.head_dim_padded <= 128 and self.arch not in [103]
         self.s0_s1_barrier = False
         self.overlap_sO_sQ = (
             (self.head_dim_padded == 192 and self.head_dim_v_padded >= 64) or
@@ -1984,7 +1985,7 @@ class FlashAttentionForwardSm100:
         softmax.apply_exp2_convert(
             tSrS_t2r,
             tSrP_r2t,
-            e2e=mask_fn is None and self.head_dim_padded <= 128,
+            e2e=mask_fn is None and self.enable_e2e,
             e2e_freq=self.e2e_freq,
         )
         # Sequence barrier arrive
