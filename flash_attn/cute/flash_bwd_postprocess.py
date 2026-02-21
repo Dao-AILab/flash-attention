@@ -51,8 +51,8 @@ class FlashAttentionBackwardPostprocess:
         """
         self.dtype = dtype
         self.tile_m = tile_m
-        assert arch in [80, 90, 100], (
-            "Only Ampere (80), Hopper (90), and Blackwell (100) are supported"
+        assert arch // 10 in [8, 9, 10, 11], (
+            "Only Ampere (8.x), Hopper (9.x), and Blackwell (10.x, 11.x) are supported"
         )
         self.arch = arch
         # padding head_dim to a multiple of 32 as k_block_size
@@ -444,10 +444,7 @@ class FlashAttentionBackwardPostprocess:
                             sdQaccum_g2s[None, None, smem_buf],
                         )
 
-                    cute.arch.fence_proxy(
-                        cute.arch.ProxyKind.async_shared,
-                        space=cute.arch.SharedSpace.shared_cta,
-                    )
+                    cute.arch.fence_view_async_shared()
                     cute.arch.barrier(barrier_id=6, number_of_threads=num_reduce_threads)
 
                     # S -> R
@@ -462,10 +459,7 @@ class FlashAttentionBackwardPostprocess:
                             tdQrdQ_s2r_cpy.iterator, cute.make_layout(sdQaccum_src.shape)
                         )
                         cute.copy(s2r_thr_copy, sdQaccum_src, tdQrdQ_r2s_cpy)
-                        cute.arch.fence_proxy(
-                            cute.arch.ProxyKind.async_shared,
-                            space=cute.arch.SharedSpace.shared_cta,
-                        )
+                        cute.arch.fence_view_async_shared()
                         cute.arch.barrier(barrier_id=7, number_of_threads=num_reduce_threads)
 
                         # R -> S
@@ -486,10 +480,7 @@ class FlashAttentionBackwardPostprocess:
                     tdQrdQ_r2s[None, None, None, 0],
                     tdQsdQ_r2s[None, None, None, 0],
                 )
-                cute.arch.fence_proxy(
-                    cute.arch.ProxyKind.async_shared,
-                    space=cute.arch.SharedSpace.shared_cta,
-                )
+                cute.arch.fence_view_async_shared()
                 cute.arch.barrier(barrier_id=8, number_of_threads=num_reduce_threads)
             else:
                 # Step 1: load dQaccum from gmem to smem
