@@ -202,7 +202,7 @@ class FlashAttentionForwardSm100:
         self.tmem_s_to_p_offset = self.n_block_size // 2
         self.tmem_p_offset = [
             self.tmem_s_offset[i] + self.tmem_s_to_p_offset for i in range(2)
-        ]  # 0, 128
+        ]  # e.g., 64, 192
 
         # vec buffer for row_max & row_sum
         self.tmem_vec_offset = self.tmem_s_offset
