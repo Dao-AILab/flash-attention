@@ -11,6 +11,8 @@ from flash_attn.cute.block_sparsity import (
     BlockSparseTensorsTorch,
     to_cute_block_sparse_tensors,
 )
+from flash_attn.cute.block_sparse_utils import get_curr_blocksparse_tensors
+from flash_attn.cute.cute_dsl_utils import to_cute_tensor, get_aux_tensor_metadata
 from flash_attn.cute.utils import hash_callable, scalar_to_ssa, ssa_to_scalar
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 
@@ -28,7 +30,6 @@ class BlockSparsityKernel:
 
     TODO:
         - optimize mask_mod evaluation
-        - varlen support
         - transposed tensors for bwd pass
     """
 
@@ -52,18 +53,33 @@ class BlockSparsityKernel:
         blocksparse_tensors: BlockSparseTensors,
         seqlen_q: Int32,
         seqlen_k: Int32,
+        mCuSeqlensQ: Optional[cute.Tensor] = None,
+        mCuSeqlensK: Optional[cute.Tensor] = None,
+        mCuTotalMBlocks: Optional[cute.Tensor] = None,
+        mCuTotalNBlocks: Optional[cute.Tensor] = None,
         aux_tensors: Optional[list] = None,
     ):
-        self.mask_cnt, self.mask_idx, self.full_cnt, self.full_idx = blocksparse_tensors
+        mask_cnt, mask_idx, full_cnt, full_idx = blocksparse_tensors
+
+        self.is_varlen_q = const_expr(mCuSeqlensQ is not None)
+        self.is_varlen_k = const_expr(mCuSeqlensK is not None)
 
         if const_expr(self.compute_full_blocks):
-            assert self.full_cnt is not None and self.full_idx is not None, (
+            assert full_cnt is not None and full_idx is not None, (
                 "full block tensors must be provided when computing full blocks"
             )
-
-        batch_size, num_heads, num_m_blocks, num_n_blocks = self.mask_idx.shape
-        # launch 1 CTA per m block
-        grid = [num_m_blocks, num_heads, batch_size]
+        if const_expr(not self.is_varlen_q):
+            batch_size, num_heads, num_m_blocks, _ = mask_idx.shape
+            total_m_blocks = batch_size * num_m_blocks
+        else:
+            assert const_expr(mCuSeqlensQ is not None), (
+                "mCuSeqlensQ or mSeqUsedQ must be provided when varlen q"
+            )
+            assert const_expr(mCuTotalMBlocks is not None), (
+                "mCuTotalMBlocks must be provided when varlen q"
+            )
+            num_heads, total_m_blocks = mask_cnt.shape  # num_m_blocks is total_m_blocks
+            batch_size = mCuSeqlensQ.shape[0] - 1
 
         if const_expr(self.use_fast_sampling):
             num_threads = 5
@@ -72,45 +88,41 @@ class BlockSparsityKernel:
             num_threads = self.tile_mn[0]
             self.num_warps = (num_threads + 32 - 1) // 32
 
+        if const_expr(not self.is_varlen_q):
+            grid = [num_m_blocks, num_heads, batch_size]
+        else:
+            grid = [total_m_blocks, num_heads, 1]
+
         self.kernel(
-            self.mask_cnt,
-            self.mask_idx,
-            self.full_cnt,
-            self.full_idx,
-            num_n_blocks,
+            blocksparse_tensors,
             seqlen_q,
             seqlen_k,
+            batch_size,
+            mCuSeqlensQ,
+            mCuSeqlensK,
+            mCuTotalMBlocks,
+            mCuTotalNBlocks,
             aux_tensors,
         ).launch(grid=grid, block=[num_threads, 1, 1])
 
     @cute.kernel
     def kernel(
         self,
-        mask_cnt: cute.Tensor,
-        mask_idx: cute.Tensor,
-        full_cnt: cute.Tensor,
-        full_idx: cute.Tensor,
-        num_n_blocks: Int32,
+        blocksparse_tensors: BlockSparseTensors,
         seqlen_q: Int32,
         seqlen_k: Int32,
+        batch_size: Int32,
+        mCuSeqlensQ: Optional[cute.Tensor] = None,
+        mCuSeqlensK: Optional[cute.Tensor] = None,
+        mCuTotalMBlocks: Optional[cute.Tensor] = None,
+        mCuTotalNBlocks: Optional[cute.Tensor] = None,
         aux_tensors: Optional[list] = None,
     ):
         tidx, _, _ = cute.arch.thread_idx()
         warp_idx = cute.arch.warp_idx()
         lane_id = cute.arch.lane_idx()
-        m_block, head_idx, batch_idx = cute.arch.block_idx()
 
         ssa = partial(scalar_to_ssa, dtype=Int32)
-
-        seqlen = SeqlenInfoQK.create(
-            batch_idx,
-            seqlen_q,
-            seqlen_k,
-            mCuSeqlensQ=None,
-            mCuSeqlensK=None,
-            mSeqUsedQ=None,
-            mSeqUsedK=None,
-        )
 
         @cute.struct
         class SharedStorage:
@@ -124,11 +136,51 @@ class BlockSparsityKernel:
         reduction_buffer = storage.reduction_buffer_smem.get_tensor(
             cute.make_layout((self.num_warps, 2))
         )
+        SeqlenInfoCls = partial(
+            SeqlenInfoQK.create,
+            seqlen_q_static=seqlen_q,
+            seqlen_k_static=seqlen_k,
+            mCuSeqlensQ=mCuSeqlensQ,
+            mCuSeqlensK=mCuSeqlensK,
+            mSeqUsedQ=None,
+            mSeqUsedK=None,
+            mCuTotalMBlocks=mCuTotalMBlocks,
+            mCuTotalNBlocks=mCuTotalNBlocks,
+            tile_m=self.tile_mn[0],
+            tile_n=self.tile_mn[1],
+        )
+
+        if const_expr(not self.is_varlen_q):
+            m_block, head_idx, batch_idx = cute.arch.block_idx()
+        else:
+            global_m_block, head_idx, _ = cute.arch.block_idx()
+            # Binary search over cu_total_m_blocks to find batch_idx
+            lo = Int32(0)
+            hi = batch_size
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if mCuTotalMBlocks[mid + 1] <= global_m_block:
+                    lo = mid + 1
+                else:
+                    hi = mid
+            batch_idx = lo
+            m_block = global_m_block - mCuTotalMBlocks[batch_idx]
+
+        seqlen = SeqlenInfoCls(batch_idx)
+        seqlen_q = seqlen.seqlen_q
+        seqlen_k = seqlen.seqlen_k
+        global_m_block = seqlen.m_block_offset + m_block
+
+        num_n_blocks = (seqlen_k + self.tile_mn[1] - 1) // self.tile_mn[1]
+
+        _, curr_mask_idx, _, curr_full_idx = get_curr_blocksparse_tensors(
+            batch_idx, head_idx, m_block, blocksparse_tensors, seqlen
+        )
 
         num_mask_blocks = Int32(0)
         num_full_blocks = Int32(0)
 
-        for n_block in cutlass.range(num_n_blocks, unroll_full=True):
+        for n_block in cutlass.range(num_n_blocks):
             m_base = m_block * self.tile_mn[0]
             n_base = n_block * self.tile_mn[1]
 
@@ -261,17 +313,24 @@ class BlockSparsityKernel:
                 is_full = Boolean(has_unmasked and (not has_masked))
 
                 if is_partial:
-                    mask_idx[batch_idx, head_idx, m_block, num_mask_blocks] = n_block
+                    curr_mask_idx[num_mask_blocks] = n_block
                     num_mask_blocks += 1
                 elif is_full and const_expr(self.compute_full_blocks):
-                    full_idx[batch_idx, head_idx, m_block, num_full_blocks] = n_block
+                    curr_full_idx[num_full_blocks] = n_block
                     num_full_blocks += 1
 
         # Only thread 0 writes back the counts
         if tidx == 0:
-            mask_cnt[batch_idx, head_idx, m_block] = num_mask_blocks
-            if const_expr(self.compute_full_blocks):
-                full_cnt[batch_idx, head_idx, m_block] = num_full_blocks
+            mask_cnt, _, full_cnt, _ = blocksparse_tensors
+            if const_expr(self.is_varlen_q):
+                global_m_block = seqlen.m_block_offset + m_block
+                mask_cnt[head_idx, global_m_block] = num_mask_blocks
+                if const_expr(self.compute_full_blocks):
+                    full_cnt[head_idx, global_m_block] = num_full_blocks
+            else:
+                mask_cnt[batch_idx, head_idx, m_block] = num_mask_blocks
+                if const_expr(self.compute_full_blocks):
+                    full_cnt[batch_idx, head_idx, m_block] = num_full_blocks
 
 
 def compute_block_sparsity(
@@ -282,8 +341,12 @@ def compute_block_sparsity(
     seqlen_q,
     seqlen_k,
     mask_mod: Callable,
-    aux_tensors: Optional[list],  # list[cute.Tensor]
+    aux_tensors: Optional[list],
     device,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k: Optional[torch.Tensor] = None,
+    cu_total_m_blocks: Optional[torch.Tensor] = None,
+    cu_total_n_blocks: Optional[torch.Tensor] = None,
     compute_full_blocks: bool = True,
     use_fast_sampling: bool = False,
 ) -> Tuple[BlockSparseTensors, BlockSparseTensorsTorch]:
@@ -300,36 +363,70 @@ def compute_block_sparsity(
         mask_mod: The `mask_mod` callable to use.
         aux_tensors: A list of auxiliary tensors.
         device: The device to use.
+        cu_seqlens_q: Cumulative q sequence lengths for varlen
+        cu_seqlens_k: Cumulative k sequence lengths for varlen
+        cu_total_m_blocks: Cumulative total m blocks tensor for varlen q
+        cu_total_n_blocks: Cumulative total n blocks tensor for varlen k
         compute_full_blocks: Whether to compute full blocks. If False, only partially-masked blocks are computed.
         use_fast_sampling: Whether to use 5-point sampling (4 corners + center). This is much faster, but only suitable for masks where this check is sufficient.
 
     Returns:
         A tuple of `BlockSparseTensors` and `BlockSparseTensorsTorch`.
     """
-    # Check if mask_mod is marked as suitable for 5-point fast sampling
+    # Check if mask_mod is marked as suitable for 5-point sampling
     use_fast_sampling = getattr(mask_mod, "use_fast_sampling", use_fast_sampling)
 
     num_m_blocks = (seqlen_q + tile_m - 1) // tile_m
     num_n_blocks = (seqlen_k + tile_n - 1) // tile_n
 
-    mask_block_cnt = torch.zeros(
-        (batch_size, num_heads, num_m_blocks), device=device, dtype=torch.int32
-    )
-    mask_block_idx = torch.zeros(
-        (batch_size, num_heads, num_m_blocks, num_n_blocks), device=device, dtype=torch.int32
-    )
-    full_block_cnt = (
-        torch.zeros((batch_size, num_heads, num_m_blocks), device=device, dtype=torch.int32)
-        if compute_full_blocks
-        else None
-    )
-    full_block_idx = (
-        torch.zeros(
+    is_varlen_q = cu_seqlens_q is not None
+
+    if is_varlen_q:
+        assert cu_total_m_blocks is not None, "total m blocks must be provided when varlen q"
+        total_m_blocks = cu_total_m_blocks[-1].item()
+        if cu_seqlens_k is not None:
+            assert cu_total_n_blocks is not None, "total n blocks must be provided when varlen k"
+            total_n_blocks = cu_total_n_blocks[-1].item()
+        else:
+            total_n_blocks = total_m_blocks * num_n_blocks
+    else:
+        total_m_blocks = batch_size * num_m_blocks
+        total_n_blocks = batch_size * num_m_blocks * num_n_blocks
+
+    if not is_varlen_q:
+        mask_block_cnt = torch.zeros(
+            (batch_size, num_heads, num_m_blocks), device=device, dtype=torch.int32
+        )
+        mask_block_idx = torch.zeros(
             (batch_size, num_heads, num_m_blocks, num_n_blocks), device=device, dtype=torch.int32
         )
-        if compute_full_blocks
-        else None
-    )
+        full_block_cnt = (
+            torch.zeros((batch_size, num_heads, num_m_blocks), device=device, dtype=torch.int32)
+            if compute_full_blocks
+            else None
+        )
+        full_block_idx = (
+            torch.zeros(
+                (batch_size, num_heads, num_m_blocks, num_n_blocks),
+                device=device,
+                dtype=torch.int32,
+            )
+            if compute_full_blocks
+            else None
+        )
+    else:
+        mask_block_cnt = torch.zeros((num_heads, total_m_blocks), device=device, dtype=torch.int32)
+        mask_block_idx = torch.zeros((num_heads, total_n_blocks), device=device, dtype=torch.int32)
+        full_block_cnt = (
+            torch.zeros((num_heads, total_m_blocks), device=device, dtype=torch.int32)
+            if compute_full_blocks
+            else None
+        )
+        full_block_idx = (
+            torch.zeros((num_heads, total_n_blocks), device=device, dtype=torch.int32)
+            if compute_full_blocks
+            else None
+        )
 
     blocksparse_tensors_torch = BlockSparseTensorsTorch(
         mask_block_cnt=mask_block_cnt,
@@ -340,19 +437,35 @@ def compute_block_sparsity(
     )
 
     mask_mod_hash = hash_callable(mask_mod)
-    blocksparse_tensors = to_cute_block_sparse_tensors(
-        blocksparse_tensors_torch, enable_tvm_ffi=True
-    )
+    if aux_tensors is not None:
+        aux_tensor_metadata = get_aux_tensor_metadata(aux_tensors)
+    else:
+        aux_tensor_metadata = None
 
     compile_key = (
         tile_m,
         tile_n,
         mask_mod_hash,
+        aux_tensor_metadata,
         compute_full_blocks,
+        is_varlen_q,
+        cu_seqlens_k is not None,
         aux_tensors is not None,
         use_fast_sampling,
     )
     if compile_key not in compute_block_sparsity.compile_cache:
+        (
+            cu_seqlens_q_tensor,
+            cu_seqlens_k_tensor,
+            cu_total_m_blocks_tensor,
+            cu_total_n_blocks_tensor,
+        ) = [
+            to_cute_tensor(t, assumed_align=4, leading_dim=0) if t is not None else None
+            for t in (cu_seqlens_q, cu_seqlens_k, cu_total_m_blocks, cu_total_n_blocks)
+        ]
+        blocksparse_tensors = to_cute_block_sparse_tensors(
+            blocksparse_tensors_torch, enable_tvm_ffi=True
+        )
         kernel = BlockSparsityKernel(
             mask_mod,
             tile_mn=(tile_m, tile_n),
@@ -362,17 +475,30 @@ def compute_block_sparsity(
         )
 
         compute_block_sparsity.compile_cache[compile_key] = cute.compile(
-            kernel, blocksparse_tensors, seqlen_q, seqlen_k, aux_tensors, options="--enable-tvm-ffi"
+            kernel,
+            blocksparse_tensors,
+            seqlen_q,
+            seqlen_k,
+            cu_seqlens_q_tensor,
+            cu_seqlens_k_tensor,
+            cu_total_m_blocks_tensor,
+            cu_total_n_blocks_tensor,
+            aux_tensors,
+            options="--enable-tvm-ffi",
         )
 
     compute_block_sparsity.compile_cache[compile_key](
         blocksparse_tensors_torch[:4],
         seqlen_q,
         seqlen_k,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        cu_total_m_blocks,
+        cu_total_n_blocks,
         aux_tensors,
     )
 
-    return blocksparse_tensors, blocksparse_tensors_torch
+    return blocksparse_tensors_torch
 
 
 compute_block_sparsity.compile_cache = {}
