@@ -704,8 +704,9 @@ class FlashAttentionBackwardSm100:
         # 2-CTA: sdV reuses sV, sdK reuses sK
         sV_bytes = cute.size_in_bytes(self.v_dtype, self.sV_layout)
         sK_bytes = cute.size_in_bytes(self.k_dtype, self.sK_layout)
-        assert sdV_bytes <= sV_bytes, "sdV doesn't fit in sV storage allocation (2-CTA)"
-        assert sdK_bytes <= sK_bytes, "sdK doesn't fit in sK storage allocation (2-CTA)"
+        if const_expr(self.use_2cta_instrs):
+            assert sdV_bytes <= sV_bytes, "sdV doesn't fit in sV storage allocation (2-CTA)"
+            assert sdK_bytes <= sK_bytes, "sdK doesn't fit in sK storage allocation (2-CTA)"
 
         if const_expr(self.use_2cta_instrs):
 
@@ -870,7 +871,7 @@ class FlashAttentionBackwardSm100:
             fastdiv_mods = (seqlen_q_divmod, seqlen_k_divmod)
         self.use_block_sparsity = cutlass.const_expr(blocksparse_tensors is not None)
 
-        if self.use_2cta_instrs:
+        if const_expr(self.use_2cta_instrs):
             assert blocksparse_tensors is None, (
                 "2-CTA mode does not support block sparsity. "
                 "Please create kernel with use_2cta_instrs=False for block sparse attention."
