@@ -2380,49 +2380,61 @@ class FlashAttentionForwardSm100:
             assert(gmem_tiled_copy_O is not None)
             cute.arch.barrier(barrier_id=int(NamedBarrierFwd.Epilogue),
                               number_of_threads=len(self.epilogue_warp_ids) * cute.arch.WARP_SIZE)
-            gmem_thr_copy_O = gmem_tiled_copy_O.get_slice(tidx)
-            tOsO = gmem_thr_copy_O.partition_S(sO)
-            cO = cute.make_identity_tensor((self.m_block_size, self.head_dim_v_padded))
-            tOgO = gmem_thr_copy_O.partition_D(gO)
-            tOcO = gmem_thr_copy_O.partition_S(cO)
-            t0OcO = gmem_tiled_copy_O.get_slice(0).partition_S(cO)
-            tOpO = utils.predicate_k(tOcO, limit=mO_cur.shape[1])
-            pack_gqa = PackGQA(
-                self.m_block_size,
-                self.head_dim_v_padded,
-                self.check_hdim_v_oob,
-                self.qhead_per_kvhead,
+            self._store_O_to_gmem(
+                sO, gO, mO_cur, gmem_tiled_copy_O, tidx, m_block, stage, seqlen_q
             )
 
-            # load acc O from smem to rmem for wider vectorization
-            tOrO = cute.make_fragment_like(tOsO, self.o_dtype)
-            cute.autovec_copy(tOsO, tOrO)
-            # copy acc O from rmem to gmem
-            if const_expr(not self.pack_gqa):
-                for rest_m in cutlass.range_constexpr(cute.size(tOrO.shape[1])):
-                    if (
-                        t0OcO[0, rest_m, 0][0]
-                        < seqlen_q
-                        - (self.q_stage * m_block + stage) * self.m_block_size
-                        - tOcO[0][0]
-                    ):
-                        cute.copy(
-                            gmem_tiled_copy_O,
-                            tOrO[None, rest_m, None],
-                            tOgO[None, rest_m, None, self.q_stage * m_block + stage],
-                            pred=tOpO[None, rest_m, None]
-                            if const_expr(self.check_hdim_v_oob)
-                            else None,
-                        )
-            else:
-                pack_gqa.store_O(
-                    mO_cur,
-                    tOrO,
-                    gmem_tiled_copy_O,
-                    tidx,
-                    self.q_stage * m_block + stage,
-                    seqlen_q,
-                )
+    @cute.jit
+    def _store_O_to_gmem(
+        self,
+        sO_stage: cute.Tensor,
+        gO: cute.Tensor,
+        mO_cur: cute.Tensor,
+        gmem_tiled_copy_O: cute.TiledCopy,
+        tidx: Int32,
+        m_block: Int32,
+        stage: int | Int32,
+        seqlen_q: Int32,
+    ):
+        """Copy a single stage of O from smem to gmem via registers."""
+        gmem_thr_copy_O = gmem_tiled_copy_O.get_slice(tidx)
+        tOsO = gmem_thr_copy_O.partition_S(sO_stage)
+        cO = cute.make_identity_tensor((self.m_block_size, self.head_dim_v_padded))
+        tOgO = gmem_thr_copy_O.partition_D(gO)
+        tOcO = gmem_thr_copy_O.partition_S(cO)
+        t0OcO = gmem_tiled_copy_O.get_slice(0).partition_S(cO)
+        tOpO = utils.predicate_k(tOcO, limit=mO_cur.shape[1])
+        pack_gqa = PackGQA(
+            self.m_block_size,
+            self.head_dim_v_padded,
+            self.check_hdim_v_oob,
+            self.qhead_per_kvhead,
+        )
+
+        # load acc O from smem to rmem for wider vectorization
+        tOrO = cute.make_fragment_like(tOsO, self.o_dtype)
+        cute.autovec_copy(tOsO, tOrO)
+        # copy acc O from rmem to gmem
+        if const_expr(not self.pack_gqa):
+            for rest_m in cutlass.range_constexpr(cute.size(tOrO.shape[1])):
+                if (
+                    t0OcO[0, rest_m, 0][0]
+                    < seqlen_q
+                    - (self.q_stage * m_block + stage) * self.m_block_size
+                    - tOcO[0][0]
+                ):
+                    cute.copy(
+                        gmem_tiled_copy_O,
+                        tOrO[None, rest_m, None],
+                        tOgO[None, rest_m, None, self.q_stage * m_block + stage],
+                        pred=tOpO[None, rest_m, None]
+                        if const_expr(self.check_hdim_v_oob)
+                        else None,
+                    )
+        else:
+            pack_gqa.store_O(
+                mO_cur, tOrO, gmem_tiled_copy_O, tidx, self.q_stage * m_block + stage, seqlen_q
+            )
 
     @cute.jit
     def epilogue_s2g(
@@ -2472,19 +2484,6 @@ class FlashAttentionForwardSm100:
                     tidx = cute.arch.thread_idx()[0] % (
                         cute.arch.WARP_SIZE * len(self.epilogue_warp_ids)
                     )
-                    gmem_thr_copy_O = gmem_tiled_copy_O.get_slice(tidx)
-                    tOsO = gmem_thr_copy_O.partition_S(sO)
-                    cO = cute.make_identity_tensor((self.m_block_size, self.head_dim_v_padded))
-                    tOgO = gmem_thr_copy_O.partition_D(gO)
-                    tOcO = gmem_thr_copy_O.partition_S(cO)
-                    t0OcO = gmem_tiled_copy_O.get_slice(0).partition_S(cO)
-                    tOpO = utils.predicate_k(tOcO, limit=mO.shape[1])
-                    pack_gqa = PackGQA(
-                        self.m_block_size,
-                        self.head_dim_v_padded,
-                        self.check_hdim_v_oob,
-                        self.qhead_per_kvhead,
-                    )
                     for stage in cutlass.range_constexpr(self.q_stage):
                         # wait from corr, issue tma store on smem
                         # 1. wait for O0 / O1 final
@@ -2492,35 +2491,10 @@ class FlashAttentionForwardSm100:
                             mbar_ptr + self.mbar_corr_epi_full_offset + stage, epi_consumer_phase
                         )
                         # 2. copy O0 / O1 to gmem
-                        # load acc O from smem to rmem for wider vectorization
-                        tOrO = cute.make_fragment_like(tOsO[None, None, None, 0], self.o_dtype)
-                        cute.autovec_copy(tOsO[None, None, None, stage], tOrO)
-                        # copy acc O from rmem to gmem
-                        if const_expr(not self.pack_gqa):
-                            for rest_m in cutlass.range_constexpr(cute.size(tOrO.shape[1])):
-                                if (
-                                    t0OcO[0, rest_m, 0][0]
-                                    < seqlen.seqlen_q
-                                    - (self.q_stage * m_block + stage) * self.m_block_size
-                                    - tOcO[0][0]
-                                ):
-                                    cute.copy(
-                                        gmem_tiled_copy_O,
-                                        tOrO[None, rest_m, None],
-                                        tOgO[None, rest_m, None, self.q_stage * m_block + stage],
-                                        pred=tOpO[None, rest_m, None]
-                                        if const_expr(self.check_hdim_v_oob)
-                                        else None,
-                                    )
-                        else:
-                            pack_gqa.store_O(
-                                mO_cur,
-                                tOrO,
-                                gmem_tiled_copy_O,
-                                tidx,
-                                self.q_stage * m_block + stage,
-                                seqlen.seqlen_q,
-                            )
+                        self._store_O_to_gmem(
+                            sO[None, None, stage], gO, mO_cur, gmem_tiled_copy_O, tidx,
+                            m_block, stage, seqlen.seqlen_q
+                        )
                         cute.arch.mbarrier_arrive(mbar_ptr + self.mbar_corr_epi_empty_offset + stage)
 
                 epi_consumer_phase ^= 1
