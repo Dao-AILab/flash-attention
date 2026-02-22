@@ -284,7 +284,7 @@ def _flash_attn_fwd(
             pack_gqa = False
 
     if max_seqlen_q is None:
-        max_seqlen_q = seqlen_q if cu_seqlens_q is None else total_q
+        max_seqlen_q = seqlen_q if cu_seqlens_q is None else cu_seqlens_q.diff().max().item()
     if max_seqlen_k is None:
         max_seqlen_k = seqlen_k
     seqlen_q_packgqa = max_seqlen_q * qhead_per_kvhead
