@@ -319,6 +319,11 @@ mha_bwd(const at::Tensor &dout,                   // batch_size x seqlen_q x num
     at::cuda::CUDAGuard device_guard{q.device()};
 
     auto opts = q.options();
+    if (deterministic && flash::is_gfx12_arch()) {
+        TORCH_CHECK(false,
+                    "Deterministic CK backward is unstable on gfx12 GPUs. "
+                    "Please rerun with deterministic=False.");
+    }
     auto softmax_d = torch::empty({batch_size, num_heads, seqlen_q}, opts.dtype(at::kFloat));
     at::Tensor dq_accum;
 

@@ -19,6 +19,13 @@ else:
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
+def is_gfx12(device="cuda"):
+    if not torch.cuda.is_available():
+        return False
+    props = torch.cuda.get_device_properties(device)
+    name = getattr(props, "gcnArchName", "") or getattr(props, "name", "")
+    return "gfx12" in name.lower()
+
 
 def _get_block_size_n(device, head_dim, is_dropout, is_causal):
     # This should match the block sizes in the CUDA kernel
