@@ -48,7 +48,7 @@ __forceinline__ __device__ auto get_lse_tile(const Params &params, const int bid
 }
 
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, typename Params>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Has_sink, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, typename Params>
 inline __device__ void compute_attn_1rowblock(const Params &params, const int bidb, const int bidh, const int m_block) {
 
     using Element = typename Kernel_traits::Element;
@@ -89,6 +89,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         //     printf("m_block = %d, n_block_max = %d\n", m_block, n_block_max);
         // }
     }
+    const float sink_val = !Has_sink || params.learnable_sink_ptr == nullptr ? -INFINITY : reinterpret_cast<float *>(params.learnable_sink_ptr)[bidh];
     // We exit early and write 0 to gO and gLSE. This also covers the case where actual_seqlen_k == 0.
     // Otherwise we might read OOB elements from gK and gV.
     if ((Is_causal || Is_local || !Is_even_MN) && n_block_max <= n_block_min) {
@@ -122,7 +123,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
         #pragma unroll
         for (int m = 0; m < size<1>(tOgO); ++m) {
             const int row = get<0>(tOcO(0, m, 0));
-            if (row < binfo.actual_seqlen_q - m_block * kBlockM && get<1>(tOcO(0, m, 0)) == 0) { gLSE(row) = INFINITY; }
+            if (row < binfo.actual_seqlen_q - m_block * kBlockM && get<1>(tOcO(0, m, 0)) == 0) { gLSE(row) = Has_sink ? sink_val : INFINITY; }
         }
         return;
     }
@@ -282,7 +283,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
     clear(acc_o);
 
-    FLASH_NAMESPACE::Softmax<2 * size<1>(acc_o)> softmax;
+    FLASH_NAMESPACE::Softmax<2 * size<1>(acc_o)> softmax(sink_val);
 
     const float alibi_slope = !Has_alibi || params.alibi_slopes_ptr == nullptr ? 0.0f : reinterpret_cast<float *>(params.alibi_slopes_ptr)[bidb * params.alibi_slopes_batch_stride + bidh] / params.scale_softmax;
     FLASH_NAMESPACE::Mask<Is_causal, Is_local, Has_alibi> mask(binfo.actual_seqlen_k, binfo.actual_seqlen_q, params.window_size_left, params.window_size_right, alibi_slope);
@@ -340,7 +341,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
         // TODO: when we have key_padding_mask we'll need to Check_inf
         masking_step == 0
-            ? softmax.template softmax_rescale_o</*Is_first=*/true,  /*Check_inf=*/Is_causal || Is_local>(acc_s, acc_o, params.scale_softmax_log2)
+            ? softmax.template softmax_rescale_o</*Is_first=*/true,  /*Check_inf=*/Is_causal || Is_local, Has_sink>(acc_s, acc_o, params.scale_softmax_log2, params.scale_softmax)
             : softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_causal || Is_local>(acc_s, acc_o, params.scale_softmax_log2);
 
         // Convert acc_s from fp32 to fp16/bf16
@@ -430,7 +431,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
     // Epilogue
 
-    Tensor lse = softmax.template normalize_softmax_lse<Is_dropout>(acc_o, params.scale_softmax, params.rp_dropout);
+    Tensor lse = softmax.template normalize_softmax_lse<Is_dropout, /*Split=*/false, Has_sink>(acc_o, params.scale_softmax, params.rp_dropout);
 
     // Convert acc_o from fp32 to fp16/bf16
     Tensor rO = FLASH_NAMESPACE::convert_type<Element>(acc_o);
@@ -495,7 +496,7 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Split, bool Append_KV, typename Params>
+template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, bool Has_sink, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Split, bool Append_KV, typename Params>
 inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, const int bidb, const int bidh, const int m_block, const int n_split_idx, const int num_n_splits) {
 
     using Element = typename Kernel_traits::Element;
@@ -833,7 +834,8 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
     clear(acc_o);
 
-    FLASH_NAMESPACE::Softmax<2 * size<1>(acc_o)> softmax;
+    const float sink_val = !Has_sink || params.learnable_sink_ptr == nullptr ? -INFINITY : reinterpret_cast<float *>(params.learnable_sink_ptr)[bidh];
+    FLASH_NAMESPACE::Softmax<2 * size<1>(acc_o)> softmax(sink_val);
 
     const float alibi_slope = !Has_alibi ? 0.0f : reinterpret_cast<float *>(params.alibi_slopes_ptr)[bidb * params.alibi_slopes_batch_stride + bidh] / params.scale_softmax;
     FLASH_NAMESPACE::Mask<Is_causal, Is_local, Has_alibi> mask(binfo.actual_seqlen_k, binfo.actual_seqlen_q, params.window_size_left, params.window_size_right, alibi_slope);
@@ -914,7 +916,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
         // We have key_padding_mask so we'll need to Check_inf
         masking_step == 0
-            ? softmax.template softmax_rescale_o</*Is_first=*/true,  /*Check_inf=*/Is_causal || Is_local || !Is_even_MN>(acc_s, acc_o, params.scale_softmax_log2)
+            ? softmax.template softmax_rescale_o</*Is_first=*/true,  /*Check_inf=*/Is_causal || Is_local || !Is_even_MN, Has_sink>(acc_s, acc_o, params.scale_softmax_log2, params.scale_softmax)
             : softmax.template softmax_rescale_o</*Is_first=*/false, /*Check_inf=*/Is_causal || Is_local || !Is_even_MN>(acc_s, acc_o, params.scale_softmax_log2);
         // if (cute::thread0()) { print(scores_max); print(scores_sum); print(scores); }
 
@@ -994,7 +996,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
     // Epilogue
 
-    Tensor lse = softmax.template normalize_softmax_lse</*Is_dropout=*/false, Split>(acc_o, params.scale_softmax);
+    Tensor lse = softmax.template normalize_softmax_lse</*Is_dropout=*/false, Split, Has_sink>(acc_o, params.scale_softmax);
     // if (cute::thread0()) { print(lse); }
 
     Tensor sOaccum = make_tensor(make_smem_ptr(reinterpret_cast<ElementO *>(smem_)), typename Kernel_traits::SmemLayoutO{}); // (SMEM_M,SMEM_N)
@@ -1072,7 +1074,7 @@ inline __device__ void compute_attn_1rowblock_splitkv(const Params &params, cons
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, typename Params>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Has_sink, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Return_softmax, typename Params>
 inline __device__ void compute_attn(const Params &params) {
     const int m_block = blockIdx.x;
     // The block index for the batch.
@@ -1088,12 +1090,12 @@ inline __device__ void compute_attn(const Params &params) {
     // the attention matrix. This way, as long as we have the batch, head, and the location of
     // the 16 x 32 block within the attention matrix, we can generate the exact same dropout pattern.
 
-    FLASH_NAMESPACE::compute_attn_1rowblock<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Return_softmax>(params, bidb, bidh, m_block);
+    FLASH_NAMESPACE::compute_attn_1rowblock<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Has_sink, Is_even_MN, Is_even_K, Is_softcap, Return_softmax>(params, bidb, bidh, m_block);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Split, bool Append_KV, typename Params>
+template<typename Kernel_traits, bool Is_causal, bool Is_local, bool Has_alibi, bool Has_sink, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Split, bool Append_KV, typename Params>
 inline __device__ void compute_attn_splitkv(const Params &params) {
     const int m_block = blockIdx.x;
     // The block index for the batch.
@@ -1102,12 +1104,12 @@ inline __device__ void compute_attn_splitkv(const Params &params) {
     const int bidh = Split ? blockIdx.z - bidb * params.h : blockIdx.z;
     const int n_split_idx = Split ? blockIdx.y : 0;
     const int num_n_splits = Split ? gridDim.y : 1;
-    FLASH_NAMESPACE::compute_attn_1rowblock_splitkv<Kernel_traits, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, Split, Append_KV>(params, bidb, bidh, m_block, n_split_idx, num_n_splits);
+    FLASH_NAMESPACE::compute_attn_1rowblock_splitkv<Kernel_traits, Is_causal, Is_local, Has_alibi, Has_sink, Is_even_MN, Is_even_K, Is_softcap, Split, Append_KV>(params, bidb, bidh, m_block, n_split_idx, num_n_splits);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, int kBlockM, int Log_max_splits, bool Is_even_K, typename Params>
+template<typename Kernel_traits, int kBlockM, int Log_max_splits, bool Is_even_K, bool Has_sink, typename Params>
 inline __device__ void combine_attn_seqk_parallel(const Params &params) {
     using Element = typename Kernel_traits::Element;
     using ElementAccum = typename Kernel_traits::ElementAccum;
@@ -1192,6 +1194,26 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
     for (int l = 1; l < kNLsePerThread; ++l) { lse_sum += expf(lse_accum(l) - lse_max); }
     SumOp<float> sum_op;
     lse_sum = Allreduce<kRowsPerLoadTranspose>::run(lse_sum, sum_op);
+    
+    if constexpr(Has_sink) {
+        const int row = tidx % kRowsPerLoadTranspose;
+        const int col = tidx / kRowsPerLoadTranspose;
+        if (row < params.num_splits && col < kBlockM) {
+            const index_t lse_offset = row_offset_lse + col;
+            if (params.unpadded_lse) {
+                // LSE is written as (h, seqlen_q, b) or (h, b, seqlen_q).
+                const int head_idx = lse_offset / (params.b * params.seqlen_q);
+                const float sink_val_exp = params.learnable_sink_ptr == nullptr ? 0.f : __expf(reinterpret_cast<float *>(params.learnable_sink_ptr)[head_idx] - lse_max);
+                lse_sum += sink_val_exp;
+            } else {
+                // LSE is written as (b, h, seqlen_q).
+                const int head_idx = (lse_offset % (params.h * params.seqlen_q)) / params.seqlen_q;
+                const float sink_val_exp = params.learnable_sink_ptr == nullptr ? 0.f : __expf(reinterpret_cast<float *>(params.learnable_sink_ptr)[head_idx] - lse_max);
+                lse_sum += sink_val_exp;
+            }
+        }
+    }
+
     // For the case where all local lse == -INFINITY, we want to set lse_logsum to INFINITY. Otherwise
     // lse_logsum is log(0.0) = -INFINITY and we get NaN when we do lse_accum(l) - lse_logsum.
     ElementAccum lse_logsum = (lse_sum == 0.f || lse_sum != lse_sum) ? INFINITY : logf(lse_sum) + lse_max;
