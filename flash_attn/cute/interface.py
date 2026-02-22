@@ -257,6 +257,9 @@ def _flash_attn_fwd(
     if mask_mod is None:
         if causal:
             window_size_right = 0
+        if window_size_left is not None and window_size_right is not None and window_size_left + window_size_right < 0:
+            window_size_left = None
+            window_size_right = None
         local = window_size_left is not None or window_size_right is not None
         if window_size_left is not None or window_size_right is not None:
             if window_size_left is None and window_size_right == 0:
@@ -647,6 +650,9 @@ def _flash_attn_bwd(
 
     if causal:
         window_size_right = 0
+    if window_size_left is not None and window_size_right is not None and window_size_left + window_size_right < 0:
+        window_size_left = None
+        window_size_right = None
     local = window_size_left is not None or window_size_right is not None
     if local:
         if window_size_left is None and window_size_right == 0:
