@@ -106,6 +106,33 @@ def mask_r2p_dual_bound(
             X[c] = X[c] if in_bound else -Float32.inf
 
 
+@cute.jit
+def mask_mod_r2p(
+    X: cute.Tensor,
+    mask: cute.Tensor,
+) -> None:
+    """
+    Applies masks resulting from mask_mod callables to compile 
+    down to the r2p instruction. 
+    Args:
+        X: cute.Tensor, tensor to be masked 
+        mask: cute.Tensor, vector of Uint32 dtypes wide enough to cover 
+            width of X. 
+    
+    The mask is treated as bit-packed where low bits correspond to low 
+    kv indices (i.e. further left in the scores matrix).
+    """
+    ncol = const_expr(cute.size(X.shape))
+    width = 32
+
+    for s in cutlass.range_constexpr(cute.ceil_div(ncol, width)):
+        val = mask[s] 
+        for i in cutlass.range_constexpr(min(width, ncol - s * width)):
+            cond = cutlass.Boolean(val & (1 << i))
+            col = s * width + i 
+            X[col] = X[col] if cond else -Float32.inf
+
+
 @dataclass(frozen=True)
 class AttentionMask:
     tile_m: cutlass.Constexpr[int]
@@ -368,6 +395,7 @@ class AttentionMask:
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
         head_divmod=None,
+        vec_size: cutlass.Constexpr[int] = 1,
         check_q_boundary: bool = False,
     ) -> None:
         assert not (mask_causal and mask_local), "mask_causal and mask_local cannot be both True"
@@ -403,7 +431,16 @@ class AttentionMask:
             batch_idx_ssa = utils.scalar_to_ssa(batch_idx, cutlass.Int32)
 
             ncol = const_expr(cute.size(tScS_t2r.shape))
-            for i in cutlass.range_constexpr(ncol):
+            # vectorized mask_mod application happens in two stages:
+            #   1: evaluation, where a Uint32 fragment bitmask is populated 
+            #   2: application, where it is applied to compile down to r2p 
+            #
+            # evaluation
+            num_mask_vals = (ncol + 32 - 1) // 32 
+            mask = cute.make_rmem_tensor(num_mask_vals, dtype=cutlass.Uint32)
+            mask.fill(cutlass.Uint32(0))
+            for s in cutlass.range_constexpr(cute.ceil_div(ncol, vec_size)):
+                i = s * vec_size
                 row_coord = tScS_t2r[i][0] if not self.swap_AB else tScS_t2r[i][1]
                 col_coord = tScS_t2r[i][1] if not self.swap_AB else tScS_t2r[i][0]
                 global_row = row_coord + m_block * self.tile_m
@@ -436,12 +473,23 @@ class AttentionMask:
                     self.seqlen_info,
                     aux_tensors,
                 )
-                cond = cutlass.Boolean(utils.ssa_to_scalar(mask_value))
-                acc_S[i] = acc_S[i] if cond else -Float32.inf
-                if const_expr(mask_seqlen):
-                    acc_S[i] = -Float32.inf if global_col >= self.seqlen_k else acc_S[i]
-                if check_q_boundary:
-                    acc_S[i] = -Float32.inf if mask_row >= self.seqlen_q else acc_S[i]
+                for j in cutlass.range_constexpr(min(vec_size, ncol - i)):
+                    idx = j // 32 
+                    cond = cutlass.Boolean(mask_value[idx] & (cutlass.Uint32(1) << j))
+                    col = i + j
+                    if const_expr(mask_seqlen):
+                        cond = cond & cutlass.Boolean(global_col < self.seqlen_k)
+                    if check_q_boundary:
+                        cond = cond & cutlass.Boolean(mask_row < self.seqlen_q)
+
+                    # set bit i if cond 
+                    val = col // 32 
+                    bit = col % 32 
+                    if cond: 
+                        mask[val] = mask[val] | (cutlass.Uint32(1) << bit)
+
+            # mask application 
+            mask_mod_r2p(acc_S, mask)
 
         else:  # Causal or local
             causal_row_offset = 1 + self.seqlen_k - n_block * self.tile_n - self.seqlen_q
