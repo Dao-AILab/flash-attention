@@ -492,6 +492,7 @@ class SingleTileVarlenScheduler:
         lpt: cutlass.Constexpr[bool] = False
         is_split_kv: cutlass.Constexpr[bool] = False
         head_swizzle: cutlass.Constexpr[bool] = False
+        cluster_shape_m: cutlass.Constexpr[int] = 1
 
         @staticmethod
         @cute.jit
@@ -505,6 +506,7 @@ class SingleTileVarlenScheduler:
             assert args.mCuSeqlensQ is not None or args.mSeqUsedQ is not None, (
                 "At least one of mCuSeqlensQ or mSeqUsedQ must be provided"
             )
+            assert args.cluster_shape_mn[1] == 1, "Only cluster_shape_mn[1] == 1 is supported"
             return SingleTileVarlenScheduler.Params(
                 num_head=args.num_head,
                 num_batch=args.num_batch,
@@ -518,6 +520,7 @@ class SingleTileVarlenScheduler:
                 lpt=args.lpt,
                 is_split_kv=args.is_split_kv,
                 head_swizzle=args.head_swizzle,
+                cluster_shape_m=args.cluster_shape_mn[0],
             )
 
     def __init__(self, params: Params, tile_idx: Int32, split_idx: Int32, *, loc=None, ip=None):
@@ -545,9 +548,13 @@ class SingleTileVarlenScheduler:
         loc=None,
         ip=None,
     ) -> Tuple[Int32, Int32, Int32]:
+        print("cluster_shape_m = ", params.cluster_shape_m)
         total_blocks_max = (
-            params.total_q + params.num_batch * (params.tile_shape_mn[0] - 1)
+            params.total_q
+            + params.num_batch * (params.cluster_shape_m * params.tile_shape_mn[0] - 1)
         ) // params.tile_shape_mn[0]
+        # round down to nearest multiple of cluster since odd excess is always padding
+        total_blocks_max = total_blocks_max // params.cluster_shape_m * params.cluster_shape_m
         return (total_blocks_max * params.num_head, params.num_splits, Int32(1))
 
     @cute.jit
@@ -568,7 +575,7 @@ class SingleTileVarlenScheduler:
         if cutlass.const_expr(params.qhead_per_kvhead_packgqa > 1):
             seqlen *= params.qhead_per_kvhead_packgqa
         return (
-            cute.ceil_div(seqlen, params.tile_shape_mn[0])
+            cute.round_up(cute.ceil_div(seqlen, params.tile_shape_mn[0]), params.cluster_shape_m)
             if batch_idx < params.num_batch and lane < cute.arch.WARP_SIZE - 1
             else Int32(0)
         )
@@ -598,6 +605,9 @@ class SingleTileVarlenScheduler:
                     num_m_blocks_cumulative, cute.arch.WARP_SIZE - 1
                 )
                 group_end_tile += m_blocks_in_group * params.num_head
+        # if const_expr(params.cluster_shape_m == 2):
+        #     if cute.arch.lane_idx() == 0:
+        #         cute.printf("num_m_blocks = {} for next_tile_idx = {}", num_m_blocks, next_tile_idx)
         is_valid = False
         if batch_idx >= params.num_batch:
             block, head_idx, batch_idx = Int32(0), Int32(0), Int32(params.num_batch)
@@ -666,6 +676,9 @@ class SingleTileVarlenScheduler:
             is_valid = self._is_first_block and batch_idx < params.num_batch
         # if cute.arch.thread_idx()[0] == 128: cute.printf("SingleTileVarlenScheduler: tile_idx=%d, batch_idx=%d, head_idx=%d, block=%d, is_valid = %d", self._tile_idx, batch_idx, head_idx, block, is_valid)
         split_idx = self._split_idx if const_expr(params.is_split_kv) else Int32(0)
+        # if const_expr(params.cluster_shape_m == 2):
+        #     if cute.arch.lane_idx() == 0:
+        #         cute.printf("block, head, batch = {},{},{} for next_tile_idx = {}", block, head_idx, batch_idx, next_tile_idx)
         return WorkTileInfo((Int32(block), Int32(head_idx), Int32(batch_idx), split_idx), is_valid)
 
     def initial_work_tile_info(self, *, loc=None, ip=None):

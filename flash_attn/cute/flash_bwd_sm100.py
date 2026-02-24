@@ -688,6 +688,7 @@ class FlashAttentionBackwardSm100:
 
         # TileScheduler = SingleTileScheduler
         if const_expr(self.is_varlen_k):
+            print("Using varlen scheduler")
             TileScheduler = SingleTileVarlenScheduler
         elif const_expr(self.deterministic):
             TileScheduler = SingleTileLPTBwdScheduler
@@ -924,12 +925,13 @@ class FlashAttentionBackwardSm100:
                 "Please create kernel with use_2cta_instrs=False for window attention."
             )
         # 2-CTA: 231424 and 1-CTA: 232448
-        # cute.printf("SMEM: {}", self.shared_storage.size_in_bytes())
+        cute.printf("SMEM: {}", self.shared_storage.size_in_bytes())
         if const_expr(self.use_block_sparsity or aux_tensors is not None):
             assert all(x is None for x in (mCuSeqlensQ, mCuSeqlensK, mSeqUsedQ, mSeqUsedK)), (
                 "Variable sequence length is not supported yet for blocksparse or aux tensors in bwd"
             )
 
+        cute.printf("grid = {}", grid_dim)
         self.kernel(
             tma_tensor_Q,
             tma_tensor_Qt,
@@ -1398,7 +1400,7 @@ class FlashAttentionBackwardSm100:
             mSeqUsedQ=mSeqUsedQ,
             mSeqUsedK=mSeqUsedK,
             tile_m=self.tile_m,
-            tile_n=self.tile_n,
+            tile_n=self.tile_n * self.cluster_shape_mnk[0],
         )
         TileSchedulerCls = partial(self.tile_scheduler_cls.create, tile_sched_params)
 
@@ -3784,14 +3786,14 @@ class FlashAttentionBackwardSm100:
                     (seqlen.padded_offset_k * tile_hdim,), mdKV[None, head_idx_kv]
                 )
             gdKV_p = cute.local_tile(
-                mdKV_cur, (cta_group_tile_n * tile_hdim,), (n_block,)
-            )  # (cta_group_tile_n * hdim)
-            gdKV = cute.logical_divide(gdKV_p, (cta_group_tile_n * tile_hdim // num_wg,))[
+                mdKV_cur, (self.tile_n * tile_hdim,), (n_block,)
+            )  # (tile_n * hdim)
+            gdKV = cute.logical_divide(gdKV_p, (self.tile_n * tile_hdim // num_wg,))[
                 ((None, wg_idx),)
-            ]  # (cta_group_tile_n * hdim / 2)
+            ]  # (tile_n * hdim / 2)
             gdKV_epi = cute.flat_divide(
                 gdKV, (flat_epi_tile,)
-            )  # (cta_group_tile_n * hdim / 2 / epi_stage, epi_stage)
+            )  # (tile_n * hdim / 2 / epi_stage, epi_stage)
 
         deterministic_KV = self.deterministic and self.qhead_per_kvhead > 1
         if const_expr(deterministic_KV):

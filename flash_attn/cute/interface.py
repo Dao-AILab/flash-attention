@@ -800,12 +800,10 @@ def _flash_attn_bwd(
                 device=device,
             )
         else:
+            cluster_tile_n = cluster_size * n_block_size
             total_k_rounded_padded = (
-                (total_k + cu_seqlens_k.shape[0] * n_block_size - 1) // n_block_size * n_block_size
+                (total_k + cu_seqlens_k.shape[0] * cluster_tile_n - 1) // cluster_tile_n * cluster_tile_n
             )
-            num_n_blocks = total_k_rounded_padded // n_block_size
-            if cluster_size == 2 and num_n_blocks % cluster_size != 0:
-                total_k_rounded_padded = total_k_rounded_padded + n_block_size
             dk_accum = torch.zeros(
                 num_head_kv,
                 total_k_rounded_padded * head_dim_rounded,
