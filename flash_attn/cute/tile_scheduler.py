@@ -548,7 +548,6 @@ class SingleTileVarlenScheduler:
         loc=None,
         ip=None,
     ) -> Tuple[Int32, Int32, Int32]:
-        print("cluster_shape_m = ", params.cluster_shape_m)
         total_blocks_max = (
             params.total_q
             + params.num_batch * (params.cluster_shape_m * params.tile_shape_mn[0] - 1)

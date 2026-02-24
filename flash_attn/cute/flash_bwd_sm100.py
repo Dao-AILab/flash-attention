@@ -688,7 +688,6 @@ class FlashAttentionBackwardSm100:
 
         # TileScheduler = SingleTileScheduler
         if const_expr(self.is_varlen_k):
-            print("Using varlen scheduler")
             TileScheduler = SingleTileVarlenScheduler
         elif const_expr(self.deterministic):
             TileScheduler = SingleTileLPTBwdScheduler
@@ -925,13 +924,12 @@ class FlashAttentionBackwardSm100:
                 "Please create kernel with use_2cta_instrs=False for window attention."
             )
         # 2-CTA: 231424 and 1-CTA: 232448
-        cute.printf("SMEM: {}", self.shared_storage.size_in_bytes())
+        # cute.printf("SMEM: {}", self.shared_storage.size_in_bytes())
         if const_expr(self.use_block_sparsity or aux_tensors is not None):
             assert all(x is None for x in (mCuSeqlensQ, mCuSeqlensK, mSeqUsedQ, mSeqUsedK)), (
                 "Variable sequence length is not supported yet for blocksparse or aux tensors in bwd"
             )
 
-        cute.printf("grid = {}", grid_dim)
         self.kernel(
             tma_tensor_Q,
             tma_tensor_Qt,
