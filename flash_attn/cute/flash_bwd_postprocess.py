@@ -175,7 +175,7 @@ class FlashAttentionBackwardPostprocess:
             )
 
         num_copy_elems = 128 // self.dtype.width
-        threads_per_row = self.tile_hdim // num_copy_elems
+        threads_per_row = math.gcd(128, self.tile_hdim) // num_copy_elems
         self.gmem_tiled_copy_dQ = copy_utils.tiled_copy_2d(
             self.dtype, threads_per_row, self.num_threads, num_copy_elems
         )

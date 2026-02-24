@@ -594,6 +594,8 @@ def _flash_attn_bwd(
     arch = _get_device_arch()
     assert arch // 10 in [9, 10, 11], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x"
 
+    num_head, head_dim = q.shape[-2:]
+
     if arch // 10 == 9:
         m_block_size = 80 if not causal else 64
         n_block_size = 128
@@ -623,12 +625,11 @@ def _flash_attn_bwd(
         AtomLayoutMdQ = 1
         AtomLayoutNdKV = 1
         # TODO: support cluster size 2
-        cluster_size = 1
+        cluster_size = 2 if head_dim == 192 else 1
     q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = [
         maybe_contiguous(t)
         for t in (q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
     ]
-    num_head, head_dim = q.shape[-2:]
     if cu_seqlens_q is None:
         batch_size, seqlen_q = q.shape[:2]
         total_q = batch_size * seqlen_q
@@ -855,6 +856,7 @@ def _flash_attn_bwd(
         ]
         fa_bwd_pre = FlashAttentionBackwardPreprocess(
             dtype,
+            head_dim,
             head_dim_v,
             arch,
             m_block_size,
@@ -1051,9 +1053,10 @@ def _flash_attn_bwd(
                 is_causal=causal,
                 is_local=local,
                 qhead_per_kvhead=qhead_per_kvhead,
-                # tile_m=m_block_size,
-                # tile_n=n_block_size,
+                tile_m=m_block_size,
+                tile_n=n_block_size,
                 cluster_size=cluster_size,
+                use_2cta_instrs=cluster_size==2,
                 # cluster_size=1,
                 deterministic=deterministic,
                 score_mod=score_mod,
@@ -1134,6 +1137,7 @@ def _flash_attn_bwd(
         dQ_swapAB,
         cu_seqlens_q is None,
         seqused_q is None,
+        cluster_size,
     )
     if compile_key_post not in _flash_attn_bwd.compile_cache_post:
         dq_accum_tensor = to_cute_tensor(dq_accum)
@@ -1143,7 +1147,8 @@ def _flash_attn_bwd(
             for t in (cu_seqlens_q, seqused_q)
         ]
         fa_bwd_post = FlashAttentionBackwardPostprocess(
-            dtype, head_dim, arch, m_block_size, num_threads, AtomLayoutMdQ, dQ_swapAB
+            dtype, head_dim, arch, m_block_size, num_threads, AtomLayoutMdQ, dQ_swapAB,
+            use_2cta_instrs=cluster_size==2,
         )
         # TODO: check @can_implement
         _flash_attn_bwd.compile_cache_post[compile_key_post] = cute.compile(
