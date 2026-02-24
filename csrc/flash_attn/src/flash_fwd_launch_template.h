@@ -63,7 +63,12 @@ DEFINE_FLASH_FORWARD_KERNEL(flash_fwd_splitkv_combine_kernel, int kBlockM, int L
 
 template<typename Kernel_traits, bool Is_dropout, bool Is_causal>
 void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
-    constexpr size_t smem_size = Kernel_traits::kSmemSize;
+    // SM70 needs extra shared memory for the P buffer (PV GEMM via smem).
+    // kSmemPBufSize is not included in kSmemSize to avoid inflating the host-side
+    // value for SM80+ (where __CUDA_ARCH__ is undefined during host compilation).
+    auto [cc_major_fwd, cc_minor_fwd] = get_compute_capability(get_current_device());
+    const size_t smem_size = Kernel_traits::kSmemSize
+        + (cc_major_fwd < 8 ? Kernel_traits::kSmemPBufSize : 0);
     // printf("smem_size = %d\n", smem_size);
 
     // Work-around for gcc 7. It doesn't like nested BOOL_SWITCH.
@@ -112,7 +117,9 @@ template<typename Kernel_traits, bool Is_causal>
 void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     static_assert(!Kernel_traits::Is_Q_in_regs, "SplitKV implementation does not support Is_Q_in_regs");
     static_assert(!Kernel_traits::Share_Q_K_smem, "SplitKV implementation does not support Share_Q_K_smem");
-    constexpr size_t smem_size = Kernel_traits::kSmemSize;
+    auto [cc_major_skv, cc_minor_skv] = get_compute_capability(get_current_device());
+    const size_t smem_size = Kernel_traits::kSmemSize
+        + (cc_major_skv < 8 ? Kernel_traits::kSmemPBufSize : 0);
     const int num_m_block = (params.seqlen_q + Kernel_traits::kBlockM - 1) / Kernel_traits::kBlockM;
     dim3 grid(num_m_block, params.num_splits > 1 ? params.num_splits : params.b, params.num_splits > 1 ? params.b * params.h : params.h);
     const bool is_even_MN = params.cu_seqlens_q == nullptr && params.cu_seqlens_k == nullptr && params.seqlen_k % Kernel_traits::kBlockN == 0 && params.seqlen_q % Kernel_traits::kBlockM == 0;
@@ -323,11 +330,15 @@ void run_mha_fwd_hdim192(Flash_fwd_params &params, cudaStream_t stream) {
     if (status_ != cudaSuccess) {
       C10_CUDA_CHECK(status_);
     }
+    auto [cc_major_192, cc_minor_192] = get_compute_capability(get_current_device());
     DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
-        // The large config (128x64x8) needs smem for Q(128*192*2) + K+V(64*192*2*2) + P_buf(128*64*2) = 115KB.
-        // V100 only has 96KB, so use kBlockM=64 instead (~82KB).
-        constexpr int smem_large = 2 * Headdim * (128 + 2 * 64) + 128 * 64 * 2;
-        if (max_smem_per_block < smem_large) {
+        // The large config (128x64x8) base smem: Q(128*192*2) + K+V(64*192*2*2) = 96KB.
+        // V100 (SM70) also needs a P buffer (128*64*2 = 16KB) for PV GEMM via smem,
+        // pushing total to 112KB which exceeds V100's 96KB limit.
+        // Use cc_major check so SM86/SM89 (~99KB) can still use the large config
+        // (they don't need the P buffer).
+        constexpr int smem_large_base = 2 * Headdim * (128 + 2 * 64);
+        if (cc_major_192 < 8 || max_smem_per_block < smem_large_base) {
             if constexpr(Is_causal) {
                 // V100 causal: kBlockN=32 to reduce register pressure from SM70's 8x8x4 MMA atom.
                 // kBlockN=64 crashes on SM70 for causal due to excessive register usage.

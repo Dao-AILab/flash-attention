@@ -1279,6 +1279,9 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     if (cc_major < 8) {
         TORCH_CHECK(q.dtype() == torch::kFloat16,
             "FlashAttention on Volta (V100) only supports FP16, not BF16.");
+        TORCH_CHECK(!(is_causal && q.size(-1) > 192),
+            "FlashAttention on Volta (V100) does not support causal mode with head_dim > 192. "
+            "Use non-causal mode or reduce head_dim to 192 or less.");
     }
 
     auto q_dtype = q.dtype();

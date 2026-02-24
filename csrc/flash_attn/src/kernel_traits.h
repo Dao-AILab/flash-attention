@@ -143,9 +143,12 @@ struct Flash_fwd_kernel_traits : public Base {
     static constexpr int kSmemQSize = size(SmemLayoutQ{}) * sizeof(Element);
     static constexpr int kSmemKVSize = size(SmemLayoutKV{}) * 2 * sizeof(Element);
     static constexpr int kSmemSizeBase = Share_Q_K_smem ? std::max(kSmemQSize, kSmemKVSize) : kSmemQSize + kSmemKVSize;
-    // Add P buffer for SM70 (Has_cp_async is false on both SM70 device and host-side compilation)
-    static constexpr int kSmemPSize = Has_cp_async ? 0 : int(size(SmemLayoutP{}) * sizeof(Element));
-    static constexpr int kSmemSize = kSmemSizeBase + kSmemPSize;
+    // P buffer size for SM70: PV GEMM requires P in shared memory.
+    // This is NOT included in kSmemSize to avoid inflating host-side smem allocation
+    // for SM80+ (where Has_cp_async is false on host but P buffer is unused on device).
+    // Launch code adds kSmemPBufSize at runtime only for SM70.
+    static constexpr int kSmemPBufSize = int(size(SmemLayoutP{}) * sizeof(Element));
+    static constexpr int kSmemSize = kSmemSizeBase;
 
     static constexpr int kGmemElemsPerLoad = sizeof(cute::uint128_t) / sizeof(Element);
     static_assert(kHeadDim % kGmemElemsPerLoad == 0, "kHeadDim must be a multiple of kGmemElemsPerLoad");

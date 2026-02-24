@@ -172,6 +172,37 @@ def test_varlen_fwd_bwd():
 
 
 # ============================================================
+# 6. KV-cache forward causal hdim>192 guard
+# ============================================================
+def test_kvcache_fwd_causal_hdim256_blocked():
+    """PR comment #6: KV-cache forward causal + hdim>192 should be blocked on Volta."""
+    if not is_volta():
+        print("  kvcache causal hdim>192 guard: SKIP (not Volta)")
+        return
+
+    from flash_attn import flash_attn_with_kvcache
+
+    B, S_q, S_kv, H, D = 1, 4, 32, 2, 256
+    dtype = torch.float16
+    device = "cuda"
+
+    q = torch.randn(B, S_q, H, D, device=device, dtype=dtype)
+    k_cache = torch.randn(B, S_kv, H, D, device=device, dtype=dtype)
+    v_cache = torch.randn(B, S_kv, H, D, device=device, dtype=dtype)
+
+    try:
+        flash_attn_with_kvcache(q, k_cache, v_cache, causal=True)
+        print("  kvcache causal hdim>192 guard: FAIL (no error raised)")
+        assert False, "Should have raised error"
+    except RuntimeError as e:
+        if "head_dim" in str(e).lower() or "192" in str(e):
+            print(f"  kvcache causal hdim>192 guard: OK (correctly blocked: {e})")
+        else:
+            print(f"  kvcache causal hdim>192 guard: FAIL (wrong error: {e})")
+            raise
+
+
+# ============================================================
 # Run all
 # ============================================================
 if __name__ == "__main__":
@@ -196,6 +227,10 @@ if __name__ == "__main__":
 
     print("[5] varlen forward+backward (positive test)")
     test_varlen_fwd_bwd()
+    print()
+
+    print("[6] KV-cache forward causal hdim>192 guard")
+    test_kvcache_fwd_causal_hdim256_blocked()
     print()
 
     print("=== All PR review tests passed ===")
