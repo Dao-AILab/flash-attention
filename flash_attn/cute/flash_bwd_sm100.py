@@ -87,7 +87,6 @@ class FlashAttentionBackwardSm100:
             and mask_mod is None
         )
         self.cta_group_size = 2 if self.use_2cta_instrs else 1
-        print("use_2cta_instrs = ", self.use_2cta_instrs)
 
         # CTA tiler
         self.cta_tiler = (tile_n, tile_m, self.tile_hdim)
@@ -211,9 +210,14 @@ class FlashAttentionBackwardSm100:
         self.num_regs_empty = 24
 
         if const_expr(self.tile_hdim == 192):
-            self.num_regs_reduce = 128 + 8
-            self.num_regs_compute = 128 + 8
-            self.num_regs_other = 128 - 16 - 8
+            if (not is_causal and not is_local) or deterministic:
+                self.num_regs_reduce = 128 + 16
+                self.num_regs_compute = 128 + 8
+                self.num_regs_other = 128 - 32
+            else:
+                self.num_regs_reduce = 128 + 8
+                self.num_regs_compute = 128 + 8
+                self.num_regs_other = 128 - 32
 
         assert (
             self.num_regs_reduce
@@ -232,13 +236,16 @@ class FlashAttentionBackwardSm100:
         # number of tma reduce adds per dQacc mma
         # todo: try 32/1 or 48/2 for 2cta d=192 dv=128
         if self.use_2cta_instrs and self.tile_hdim == 192:
-            self.dQ_reduce_ncol = 32
-            self.sdQaccum_stage = 1
+            self.dQ_reduce_ncol_t2r = 32
+            self.dQ_reduce_ncol = 24 if not self.is_causal else 32
+            self.sdQaccum_stage = 2 if not self.is_causal else 1
         else:
             self.dQ_reduce_ncol = 8 if self.use_2cta_instrs else 32
             self.sdQaccum_stage = 4 if self.use_2cta_instrs else 64 // self.dQ_reduce_ncol
-        assert self.tile_hdim % self.dQ_reduce_ncol == 0
+            self.dQ_reduce_ncol_t2r = 32
+        assert (self.tile_hdim // self.cta_group_size) % self.dQ_reduce_ncol == 0
         self.dQaccum_reduce_stage = self.tile_hdim // self.dQ_reduce_ncol
+        self.dQaccum_reduce_stage_t2r = self.tile_hdim // self.dQ_reduce_ncol_t2r
         self.cluster_reduce_dQ = False and cute.size(self.cluster_shape_mn) > 1
         # number of tma reduce adds for dKacc and dVacc epilogue
         self.dK_reduce_ncol = 32
@@ -914,7 +921,7 @@ class FlashAttentionBackwardSm100:
                 "Please create kernel with use_2cta_instrs=False for window attention."
             )
         # 2-CTA: 231424 and 1-CTA: 232448
-        cute.printf("SMEM: {}", self.shared_storage.size_in_bytes())
+        # cute.printf("SMEM: {}", self.shared_storage.size_in_bytes())
         if const_expr(self.use_block_sparsity or aux_tensors is not None):
             assert all(x is None for x in (mCuSeqlensQ, mCuSeqlensK, mSeqUsedQ, mSeqUsedK)), (
                 "Variable sequence length is not supported yet for blocksparse or aux tensors in bwd"
@@ -2988,6 +2995,7 @@ class FlashAttentionBackwardSm100:
 
                 # For hdim 192, we use pipeline S_P to signal S tmem read instead
                 if const_expr(self.tile_hdim == 192):
+                    cute.arch.fence_view_async_tmem_load()
                     with cute.arch.elect_one():
                         pipeline_S_P.consumer_release(consumer_state_S_P_dP)
 
@@ -3353,17 +3361,18 @@ class FlashAttentionBackwardSm100:
         cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         # TMEM -> RMEM
         tmem_load_atom = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(self.dQ_reduce_ncol)), Float32
+            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(self.dQ_reduce_ncol_t2r)), Float32
         )
         thr_copy_t2r = tcgen05.make_tmem_copy(tmem_load_atom, tdQtdQ).get_slice(tidx)
         tdQtdQ_t2r = thr_copy_t2r.partition_S(tdQtdQ)
         tdQcdQ = thr_mma_dQ.partition_C(cute.make_identity_tensor(self.mma_tiler_dsk[:2]))
         tdQrdQ_t2r_shape = thr_copy_t2r.partition_D(tdQcdQ).shape
-        # For 2-CTA: reduce_stage = dQaccum_reduce_stage / cta_group_size
-        expected_reduce_stages = self.dQaccum_reduce_stage // self.cta_group_size
-        assert cute.size(tdQrdQ_t2r_shape, mode=[1]) == expected_reduce_stages, (
-            "dQaccum reduce stage mismatch"
+        # For 2-CTA: reduce_stage = dQaccum_reduce_stage_t2r / cta_group_size
+        expected_reduce_stages_t2r = self.dQaccum_reduce_stage_t2r // self.cta_group_size
+        assert cute.size(tdQrdQ_t2r_shape, mode=[1]) == expected_reduce_stages_t2r, (
+            "dQaccum t2r reduce stage mismatch"
         )
+        expected_reduce_stages = self.dQaccum_reduce_stage // self.cta_group_size
         # 2-CTA: CTA 0 -> (M/2, D) (stage 0, 1) & CTA 1 -> (M/2, D) (stage 2, 3)
         stage_offset = (
             expected_reduce_stages * cta_rank_in_cluster if const_expr(self.use_2cta_instrs) else 0
@@ -3461,12 +3470,15 @@ class FlashAttentionBackwardSm100:
                 dQ_consumer_state.advance()
 
                 gdQaccum_cur = gdQaccum[None, None, m_block]
+                
+                tdQrdQ_shape = (self.dQ_reduce_ncol, self.tile_hdim // self.cta_group_size // self.dQ_reduce_ncol)
+                tdQrdQ = cute.make_tensor(tdQrdQ_t2r.iterator, tdQrdQ_shape)
 
-                for stage in cutlass.range_constexpr(cute.size(tdQrdQ_t2r, mode=[1])):  # 4
+                for stage in cutlass.range_constexpr(cute.size(tdQrdQ, mode=[1])):
                     smem_idx = dQ_tma_store_producer_state.index
                     tdQsdQ_r2s = tdQsdQ[None, None, smem_idx]
                     tdQrdQ_r2s = cute.make_tensor(
-                        tdQrdQ_t2r[None, stage, None, None].iterator, tdQsdQ_r2s.shape
+                        tdQrdQ[None, stage].iterator, tdQsdQ_r2s.shape
                     )
                     cute.copy(thr_copy_dQaccum_r2s, tdQrdQ_r2s, tdQsdQ_r2s)
                     # Fence and barrier to make sure shared memory store is visible to TMA store
