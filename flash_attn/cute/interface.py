@@ -624,8 +624,8 @@ def _flash_attn_bwd(
         dKV_swapAB = False
         AtomLayoutMdQ = 1
         AtomLayoutNdKV = 1
-        # TODO: support cluster size 2
         cluster_size = 2 if head_dim == 192 else 1
+        use_2cta_instrs = cluster_size==2
     q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = [
         maybe_contiguous(t)
         for t in (q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
@@ -966,6 +966,7 @@ def _flash_attn_bwd(
             num_threads,
             pack_gqa,
             cluster_size,
+            use_2cta_instrs,
             deterministic,
             score_mod_hash,
             score_mod_bwd_hash,
@@ -1054,8 +1055,7 @@ def _flash_attn_bwd(
                 tile_m=m_block_size,
                 tile_n=n_block_size,
                 cluster_size=cluster_size,
-                use_2cta_instrs=cluster_size==2,
-                # cluster_size=1,
+                use_2cta_instrs=use_2cta_instrs,
                 deterministic=deterministic,
                 score_mod=score_mod,
                 score_mod_bwd=score_mod_bwd,
@@ -1135,7 +1135,8 @@ def _flash_attn_bwd(
         dQ_swapAB,
         cu_seqlens_q is None,
         seqused_q is None,
-        cluster_size,
+        use_2cta_instrs,
+        1, # no cluster for tile_m 
     )
     if compile_key_post not in _flash_attn_bwd.compile_cache_post:
         dq_accum_tensor = to_cute_tensor(dq_accum)
@@ -1146,7 +1147,7 @@ def _flash_attn_bwd(
         ]
         fa_bwd_post = FlashAttentionBackwardPostprocess(
             dtype, head_dim, arch, m_block_size, num_threads, AtomLayoutMdQ, dQ_swapAB,
-            use_2cta_instrs=cluster_size==2,
+            use_2cta_instrs=use_2cta_instrs,
         )
         # TODO: check @can_implement
         _flash_attn_bwd.compile_cache_post[compile_key_post] = cute.compile(
@@ -1180,6 +1181,8 @@ def _flash_attn_bwd(
             dKV_swapAB,
             cu_seqlens_k is None,
             seqused_k is None,
+            False, # even for 2cta, is split along hdim, so always False
+            cluster_size, # cluster is for tile_n 
         )
         if compile_key_post not in _flash_attn_bwd.compile_cache_post:
             dk_accum_tensor = to_cute_tensor(dk_accum)
@@ -1189,7 +1192,8 @@ def _flash_attn_bwd(
                 for t in (cu_seqlens_k, seqused_k)
             ]
             fa_bwd_post = FlashAttentionBackwardPostprocess(
-                dtype, head_dim, arch, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB
+                dtype, head_dim, arch, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB,
+                cluster_size=cluster_size,
             )
             # TODO: check @can_implement
             _flash_attn_bwd.compile_cache_post[compile_key_post] = cute.compile(
@@ -1220,6 +1224,8 @@ def _flash_attn_bwd(
             dKV_swapAB,
             cu_seqlens_k is None,
             seqused_k is None,
+            False,
+            cluster_size,
         )
         if compile_key_post not in _flash_attn_bwd.compile_cache_post:
             dv_accum_tensor = to_cute_tensor(dv_accum)
@@ -1229,7 +1235,8 @@ def _flash_attn_bwd(
                 for t in (cu_seqlens_k, seqused_k)
             ]
             fa_bwd_post = FlashAttentionBackwardPostprocess(
-                dtype, head_dim_v, arch, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB
+                dtype, head_dim_v, arch, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB,
+                cluster_size=cluster_size,
             )
             # TODO: check @can_implement
             _flash_attn_bwd.compile_cache_post[compile_key_post] = cute.compile(

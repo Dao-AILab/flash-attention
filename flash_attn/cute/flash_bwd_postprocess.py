@@ -42,6 +42,7 @@ class FlashAttentionBackwardPostprocess:
         AtomLayoutMdQ: int = 1,
         dQ_swapAB: bool = False,
         use_2cta_instrs: bool = False,
+        cluster_size: int = 1,  # for varlen offsets
     ):
         """
         :param head_dim: head dimension
@@ -63,6 +64,7 @@ class FlashAttentionBackwardPostprocess:
         self.AtomLayoutMdQ = AtomLayoutMdQ
         self.dQ_swapAB = dQ_swapAB
         self.use_2cta_instrs = use_2cta_instrs and arch == 100 and head_dim != 64
+        self.cluster_size = cluster_size
 
     @staticmethod
     def can_implement(dtype, head_dim, tile_m, num_threads) -> bool:
@@ -334,15 +336,17 @@ class FlashAttentionBackwardPostprocess:
                 mCuSeqlensK=None,
                 mSeqUsedQ=mSeqUsedQ,
                 mSeqUsedK=None,
+                tile_m=self.tile_m * self.cluster_size,
             )
             if const_expr(not seqlen.has_cu_seqlens_q):
                 mdQ_cur = mdQ[batch_idx, None, head_idx, None]
                 mdQaccum_cur = mdQaccum[batch_idx, head_idx, None]
                 head_dim = mdQ.shape[3]
             else:
-                padded_offset_q = seqlen.offset_q + batch_idx * self.tile_m
                 if cutlass.const_expr(self.arch >= 90):
-                    padded_offset_q = padded_offset_q // self.tile_m * self.tile_m
+                    padded_offset_q = seqlen.padded_offset_q
+                else:
+                    padded_offset_q = seqlen.offset_q + batch_idx * self.tile_m
                 mdQ_cur = cute.domain_offset((seqlen.offset_q, 0), mdQ[None, head_idx, None])
                 mdQaccum_cur = cute.domain_offset(
                     (padded_offset_q * self.tile_hdim,), mdQaccum[head_idx, None]
