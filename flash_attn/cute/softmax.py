@@ -11,7 +11,7 @@ from cutlass import Float32
 
 from quack import layout_utils
 import flash_attn.cute.utils as utils
-from flash_attn.cute.cute_dsl_utils import ParamsBase
+from quack.cute_dsl_utils import ParamsBase
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 
 

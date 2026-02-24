@@ -11,12 +11,13 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32
 
+from quack import copy_utils
+
 from flash_attn.cute import utils
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
-from flash_attn.cute import copy_utils
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
+from quack.cute_dsl_utils import ParamsBase
 from flash_attn.cute.tile_scheduler import (
-    ParamsBase,
     SingleTileScheduler,
     SingleTileVarlenScheduler,
     TileSchedulerArguments,
@@ -94,8 +95,10 @@ class FlashAttentionBackwardPreprocess:
                 else (32 if self.head_dim_padded % 32 == 0 else 16)
             )
         )
+        num_copy_elems = 128 // self.dtype.width
+        threads_per_row = gmem_k_block_size // num_copy_elems
         self.gmem_tiled_copy_O = copy_utils.tiled_copy_2d(
-            self.dtype, gmem_k_block_size, self.num_threads
+            self.dtype, threads_per_row, self.num_threads, num_copy_elems
         )
         universal_copy_bits = 128
         num_copy_elems_dQaccum = universal_copy_bits // Float32.width

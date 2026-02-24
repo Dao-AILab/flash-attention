@@ -3,7 +3,6 @@
 import math
 import hashlib
 import inspect
-import re
 from typing import Type, Callable, Optional, Tuple, overload
 
 import cutlass
@@ -178,30 +177,6 @@ def warp_reduce(
         for i in cutlass.range_constexpr(int(math.log2(width))):
             val = op(val, cute.arch.shuffle_sync_bfly(val, offset=1 << i))
     return val
-
-
-def parse_swizzle_from_pointer(ptr: cute.Pointer) -> cute.Swizzle:
-    """Extract swizzle parameters from a pointer's swizzle_type.
-
-    The swizzle_type string has the form '!cute.swizzle<"S<b,m,s>">' where
-    b, m, s are the swizzle parameters (bits, base, shift).
-
-    Returns:
-        A cute.Swizzle object constructed from the extracted parameters
-
-    Raises:
-        ValueError: If the swizzle_type string cannot be parsed
-    """
-    # Ideally there should be a better API to get swizzle parameters, but we'll just parse
-    # the string here.
-    swizzle_str = str(ptr.type.swizzle_type)
-    # Extract the inner part "S<b,m,s>"
-    match = re.search(r"S<(\d+),(\d+),(\d+)>", swizzle_str)
-    if match:
-        b, m, s = int(match.group(1)), int(match.group(2)), int(match.group(3))
-        return cute.make_swizzle(b, m, s)
-    else:
-        raise ValueError(f"Could not parse swizzle_type: {swizzle_str}")
 
 
 @dsl_user_op

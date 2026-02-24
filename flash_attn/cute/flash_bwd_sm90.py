@@ -23,8 +23,9 @@ from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute import pipeline
-from flash_attn.cute.tile_scheduler import TileSchedulerArguments, SingleTileScheduler, ParamsBase
-from flash_attn.cute.named_barrier import NamedBarrierFwd, NamedBarrierBwd
+from quack.cute_dsl_utils import ParamsBase
+from flash_attn.cute.tile_scheduler import TileSchedulerArguments, SingleTileScheduler
+from flash_attn.cute.named_barrier import NamedBarrierBwd
 from flash_attn.cute.softmax import apply_score_mod_inner, apply_score_mod_bwd_inner
 from flash_attn.cute.block_sparsity import BlockSparseTensors
 from flash_attn.cute.block_sparse_utils import (
@@ -110,6 +111,8 @@ class FlashAttentionBackwardSm90:
         # TODO: impl these for hdim 64
         self.shuffle_LSE = self.SdP_swapAB and self.tile_hdim <= 64
         self.shuffle_dPsum = self.SdP_swapAB and self.tile_hdim <= 64
+
+        self.buffer_align_bytes = 1024
 
         self.score_mod = score_mod
         self.score_mod_bwd = score_mod_bwd
@@ -200,15 +203,7 @@ class FlashAttentionBackwardSm90:
             cute.make_layout(128 // Float32.width),  # val_layout
         )
         # dKVaccum for GQA epilogue - reuses sV+sK memory recast as f32
-        self.sdKVaccum_layout = cute.make_layout(
-            (self.tile_n * self.tile_hdim // self.num_mma_warp_groups, self.num_mma_warp_groups)
-        )
-        # dKVaccum R->S (same pattern as dQaccum but sized for tile_n)
-        self.r2s_tiled_copy_dKVaccum = cute.make_tiled_copy_tv(
-            cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), Float32, num_bits_per_copy=128),
-            cute.make_layout((self.num_threads_per_warp_group, self.num_mma_warp_groups)),
-            cute.make_layout(128 // Float32.width),
-        )
+        # TODO: assert that sVaccum and sKaccum don't overflow smem
 
     def _get_tiled_mma(self):
         # S = Q @ K.T, dP = dO @ V.T
@@ -261,16 +256,14 @@ class FlashAttentionBackwardSm90:
         return tiled_mma_SdP, tiled_mma_dK, tiled_mma_dV, tiled_mma_dQ
 
     def _get_shared_storage_cls(self):
-        sQ_alignment = sK_alignment = sV_alighment = sdQaccum_alignment = sdO_alignment = 1024
-
         sQ_struct, sK_struct, sV_struct, sdO_struct, sdQaccum_struct = [
-            cute.struct.Align[cute.struct.MemRange[type, cute.cosize(layout)], alignment]
-            for (layout, type, alignment) in [
-                (self.sQ_layout, self.dtype, sQ_alignment),
-                (self.sK_layout, self.dtype, sK_alignment),
-                (self.sV_layout, self.dtype, sV_alighment),
-                (self.sdO_layout, self.dtype, sdO_alignment),
-                (self.sdQaccum_layout, Float32, sdQaccum_alignment),
+            cute.struct.Align[cute.struct.MemRange[t, cute.cosize(layout)], self.buffer_align_bytes]
+            for (layout, t) in [
+                (self.sQ_layout, self.dtype),
+                (self.sK_layout, self.dtype),
+                (self.sV_layout, self.dtype),
+                (self.sdO_layout, self.dtype),
+                (self.sdQaccum_layout, Float32),
             ]
         ]
 
@@ -490,9 +483,7 @@ class FlashAttentionBackwardSm90:
             self.sPdS_layout,
             self.sdO_layout,
             self.sdQaccum_layout,
-            self.sdKVaccum_layout,
             self.r2s_tiled_copy_dQaccum,
-            self.r2s_tiled_copy_dKVaccum,
             tiled_mma_SdP,
             tiled_mma_dK,
             tiled_mma_dV,
@@ -509,7 +500,6 @@ class FlashAttentionBackwardSm90:
         ).launch(
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
-            smem=SharedStorage.size_in_bytes(),
             stream=stream,
             min_blocks_per_mp=1,
         )
@@ -538,9 +528,7 @@ class FlashAttentionBackwardSm90:
         sPdS_layout: cute.ComposedLayout,
         sdO_layout: cute.ComposedLayout,
         sdQaccum_layout: cute.Layout,
-        sdKVaccum_layout: cute.Layout,
         r2s_tiled_copy_dQaccum: cute.TiledCopy,
-        r2s_tiled_copy_dKVaccum: cute.TiledCopy,
         tiled_mma_SdP: cute.TiledMma,
         tiled_mma_dK: cute.TiledMma,
         tiled_mma_dV: cute.TiledMma,
@@ -703,8 +691,6 @@ class FlashAttentionBackwardSm90:
                 tma_atom_dK,
                 tma_atom_dV,
                 r2s_tiled_copy_dQaccum,
-                r2s_tiled_copy_dKVaccum,
-                sdKVaccum_layout,
                 softmax_scale_log2,
                 softmax_scale,
                 block_info,
@@ -988,8 +974,6 @@ class FlashAttentionBackwardSm90:
         tma_atom_dK: cute.CopyAtom,
         tma_atom_dV: cute.CopyAtom,
         r2s_tiled_copy_dQaccum: cute.TiledCopy,
-        r2s_tiled_copy_dKVaccum: cute.TiledCopy,
-        sdKVaccum_layout: cute.Layout,
         softmax_scale_log2: Float32,
         softmax_scale: Float32,
         block_info: BlockInfo,
@@ -1063,16 +1047,16 @@ class FlashAttentionBackwardSm90:
         )
 
         # Smem copy atom tiling
-        smem_copy_atom_PdS = copy_utils.get_smem_store_atom(
-            self.arch, self.dtype, transpose=self.SdP_swapAB
-        )
-        smem_thr_copy_PdS = cute.make_tiled_copy_C(smem_copy_atom_PdS, tiled_mma_SdP).get_slice(
-            tidx
-        )
-        tPsP = None
+        copy_P_r2s = None
         if const_expr(sP is not None):
-            tPsP = smem_thr_copy_PdS.partition_D(sP if const_expr(not self.SdP_swapAB) else sPt)
-        tdSsdS = smem_thr_copy_PdS.partition_D(sdS if const_expr(not self.SdP_swapAB) else sdSt)
+            sP_cpy = sP if const_expr(not self.SdP_swapAB) else sPt
+            copy_P_r2s, _, _ = copy_utils.get_smem_store_C(
+                tiled_mma_SdP, sP_cpy, tidx, self.arch, transpose=self.SdP_swapAB
+            )
+        sdS_cpy = sdS if const_expr(not self.SdP_swapAB) else sdSt
+        copy_dS_r2s, _, _ = copy_utils.get_smem_store_C(
+            tiled_mma_SdP, sdS_cpy, tidx, self.arch, transpose=self.SdP_swapAB
+        )
 
         tLSEsLSE = layout_utils.mma_partition_C_vec(
             sLSE, thr_mma_SdP, expand_shape=self.tile_n, is_colvec=not self.SdP_swapAB
@@ -1110,15 +1094,13 @@ class FlashAttentionBackwardSm90:
             mma_pdo_fn=mma_pdo_fn,
             mma_dsq_fn=mma_dsq_fn,
             mma_dsk_fn=mma_dsk_fn,
+            copy_P_r2s=copy_P_r2s,
+            copy_dS_r2s=copy_dS_r2s,
             pipeline_Q=pipeline_Q,
             pipeline_dO=pipeline_dO,
             tLSEsLSE=tLSEsLSE,
             tLSEsdPsum=tLSEsdPsum,
-            tPsP=tPsP,
-            tdSsdS=tdSsdS,
             tdQsdQaccum=tdQsdQaccum,
-            smem_thr_copy_PdS=smem_thr_copy_PdS,
-            smem_thr_copy_dQaccum=smem_thr_copy_dQaccum,
             softmax_scale_log2=softmax_scale_log2,
             PdS_barrier=PdS_barrier,
             # acc_dV=acc_dV,
@@ -1229,8 +1211,6 @@ class FlashAttentionBackwardSm90:
                     tma_atom_dV,
                     tiled_mma_dK,
                     tiled_mma_dV,
-                    r2s_tiled_copy_dKVaccum,
-                    sdKVaccum_layout,
                     tidx,
                     n_block,
                     head_idx,
@@ -1254,8 +1234,6 @@ class FlashAttentionBackwardSm90:
                         tma_atom_dV,
                         tiled_mma_dK,
                         tiled_mma_dV,
-                        r2s_tiled_copy_dKVaccum,
-                        sdKVaccum_layout,
                         tidx,
                         n_block,
                         head_idx,
@@ -1265,6 +1243,10 @@ class FlashAttentionBackwardSm90:
 
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
+
+        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        if warp_idx == 4:
+            cute.arch.cp_async_bulk_wait_group(0, read=True)
 
     @cute.jit
     def mma_one_m_block(
@@ -1278,15 +1260,13 @@ class FlashAttentionBackwardSm90:
         mma_pdo_fn: Callable,
         mma_dsq_fn: Callable,
         mma_dsk_fn: Callable,
+        copy_P_r2s: Optional[Callable],
+        copy_dS_r2s: Callable,
         pipeline_Q: cutlass.pipeline.PipelineAsync,
         pipeline_dO: cutlass.pipeline.PipelineAsync,
         tLSEsLSE: cute.Tensor,
         tLSEsdPsum: cute.Tensor,
-        tPsP: Optional[cute.Tensor],
-        tdSsdS: Optional[cute.Tensor],
         tdQsdQaccum: cute.Tensor,
-        smem_thr_copy_PdS: cute.TiledCopy,
-        smem_thr_copy_dQaccum: cute.TiledCopy,
         softmax_scale_log2: Float32,
         PdS_barrier: cutlass.pipeline.NamedBarrier,
         mask_fn: Optional[Callable] = None,
@@ -1335,8 +1315,7 @@ class FlashAttentionBackwardSm90:
             # sync to ensure P has already been used in the previous iteration before overwriting
             if const_expr(self.PdS_stage == 1):
                 PdS_barrier.arrive_and_wait()
-            tPrP = smem_thr_copy_PdS.retile(tdVrP)
-            cute.copy(smem_thr_copy_PdS, tPrP, tPsP[None, None, None, smem_idx_PdS])
+            copy_P_r2s(tdVrP, dst_idx=smem_idx_PdS)
 
         # (4) [Pointwise 2] dS = P*(dP-dPsum)
         warpgroup.wait_group(0)
@@ -1362,8 +1341,7 @@ class FlashAttentionBackwardSm90:
             PdS_barrier.arrive_and_wait()
 
         # R2S for dS
-        tdSrdS = smem_thr_copy_PdS.retile(tdKrdS)
-        cute.copy(smem_thr_copy_PdS, tdSrdS, tdSsdS[None, None, None, smem_idx_PdS])
+        copy_dS_r2s(tdKrdS, dst_idx=smem_idx_PdS)
 
         # (5) [GEMM 3] dV += P.T @ dO
         if const_expr(not self.mma_dkv_is_rs):
@@ -1425,35 +1403,18 @@ class FlashAttentionBackwardSm90:
         tma_atom_dV: cute.CopyAtom,
         tiled_mma_dK: cute.TiledMma,
         tiled_mma_dV: cute.TiledMma,
-        r2s_tiled_copy_dKVaccum: cute.TiledCopy,
-        sdKVaccum_layout: cute.Layout,
         tidx: Int32,
         n_block: Int32,
         head_idx: Int32,
         batch_idx: Int32,
         qhead_per_kvhead_divmod: Optional[FastDivmodDivisor] = None,
     ):
+        epi_barrier = cutlass.pipeline.NamedBarrier(
+            barrier_id=int(NamedBarrierBwd.Epilogue), num_threads=self.num_mma_threads
+        )
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
         if const_expr(self.qhead_per_kvhead == 1):
-            rdV = cute.make_fragment_like(acc_dV, self.dtype)
-            rdV.store(acc_dV.load().to(self.dtype))
-            rdK = utils.cvt_f16(acc_dK, self.dtype)
-
-            cute.arch.barrier(
-                barrier_id=int(NamedBarrierFwd.Epilogue), number_of_threads=self.num_mma_threads
-            )
-
-            smem_copy_atom_dKV = cute.make_copy_atom(
-                cute.nvgpu.warp.StMatrix8x8x16bOp(transpose=self.dKV_swapAB, num_matrices=4),
-                self.dtype,
-            )
-            smem_thr_copy_dK = cute.make_tiled_copy_C(smem_copy_atom_dKV, tiled_mma_dK).get_slice(
-                tidx
-            )
-            smem_thr_copy_dV = cute.make_tiled_copy_C(smem_copy_atom_dKV, tiled_mma_dV).get_slice(
-                tidx
-            )
             mdV_cur = mdV[None, None, head_idx, batch_idx]
             mdK_cur = mdK[None, None, head_idx, batch_idx]
             gdK = cute.local_tile(mdK_cur, (self.tile_n, self.tile_hdim), (n_block, 0))
@@ -1464,99 +1425,86 @@ class FlashAttentionBackwardSm90:
             store_dV, _, _ = copy_utils.tma_get_copy_fn(
                 tma_atom_dV, 0, cute.make_layout(1), sV, gdV, single_stage=True
             )
-
-            taccdVrdV = smem_thr_copy_dV.retile(rdV)
             sdV = sV if const_expr(not self.dKV_swapAB) else layout_utils.transpose_view(sV)
-            taccdVsdV = smem_thr_copy_dV.partition_D(sdV)
-            cute.copy(smem_copy_atom_dKV, taccdVrdV, taccdVsdV)
-            cute.arch.fence_view_async_shared()
-            cute.arch.barrier(
-                barrier_id=int(NamedBarrierFwd.Epilogue), number_of_threads=self.num_mma_threads
+            sdK = sK if const_expr(not self.dKV_swapAB) else layout_utils.transpose_view(sK)
+            copy_dV_r2s, _, _ = copy_utils.get_smem_store_C(
+                tiled_mma_dV, sdV, tidx, self.arch, transpose=self.dKV_swapAB
             )
+            copy_dK_r2s, _, _ = copy_utils.get_smem_store_C(
+                tiled_mma_dK, sdK, tidx, self.arch, transpose=self.dKV_swapAB
+            )
+            cute.arch.cp_async_bulk_wait_group(1, read=True)
+            epi_barrier.arrive_and_wait()
+            copy_dV_r2s(acc_dV, dst_idx=None)
+            cute.arch.fence_view_async_shared()
+            epi_barrier.arrive_and_wait()
             if warp_idx == 4:
                 store_dV()
-            taccdKrdK = smem_thr_copy_dK.retile(rdK)
-            sdK = sK if const_expr(not self.dKV_swapAB) else layout_utils.transpose_view(sK)
-            taccdKsdK = smem_thr_copy_dK.partition_D(sdK)
-            cute.copy(smem_copy_atom_dKV, taccdKrdK, taccdKsdK)
+                cute.arch.cp_async_bulk_commit_group()
+            cute.arch.cp_async_bulk_wait_group(1, read=True)
+            epi_barrier.arrive_and_wait()
+            copy_dK_r2s(acc_dK, dst_idx=None)
             cute.arch.fence_view_async_shared()
-            cute.arch.barrier(
-                barrier_id=int(NamedBarrierFwd.Epilogue), number_of_threads=self.num_mma_threads
-            )
+            epi_barrier.arrive_and_wait()
             if warp_idx == 4:
                 store_dK()
                 cute.arch.cp_async_bulk_commit_group()
-                cute.arch.cp_async_bulk_wait_group(0, read=True)
         else:
+            sdKaccum_shape0 = self.tile_n * self.tile_hdim // self.num_mma_warp_groups
+            sdVaccum_shape0 = self.tile_n * self.tile_hdimv // self.num_mma_warp_groups
+            sdKaccum_layout = cute.make_layout((sdKaccum_shape0, self.num_mma_warp_groups))
+            sdVaccum_layout = cute.make_layout((sdVaccum_shape0, self.num_mma_warp_groups))
             head_idx_kv = head_idx // qhead_per_kvhead_divmod
-
             mdKaccum_cur = mdK[None, head_idx_kv, batch_idx]
             gdKaccum_ = cute.local_tile(mdKaccum_cur, (self.tile_n * self.tile_hdim,), (n_block,))
-            gdKaccum = cute.flat_divide(
-                gdKaccum_, (self.tile_n * self.tile_hdim // self.num_mma_warp_groups,)
-            )
-
+            gdKaccum = cute.flat_divide(gdKaccum_, (sdKaccum_shape0,))
             mdVaccum_cur = mdV[None, head_idx_kv, batch_idx]
             gdVaccum_ = cute.local_tile(mdVaccum_cur, (self.tile_n * self.tile_hdimv,), (n_block,))
-            gdVaccum = cute.flat_divide(
-                gdVaccum_, (self.tile_n * self.tile_hdimv // self.num_mma_warp_groups,)
+            gdVaccum = cute.flat_divide(gdVaccum_, (sdVaccum_shape0,))
+            # These two overlap each other
+            sVaccum_ptr = cute.recast_ptr(sV.iterator, dtype=Float32)
+            sdKaccum = cute.make_tensor(sVaccum_ptr, sdKaccum_layout)
+            sdVaccum = cute.make_tensor(sVaccum_ptr, sdVaccum_layout)
+            tiled_copy_dKVaccum_r2s = cute.make_tiled_copy_tv(
+                cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), Float32, num_bits_per_copy=128),
+                cute.make_layout((self.num_threads_per_warp_group, self.num_mma_warp_groups)),
+                cute.make_layout(128 // Float32.width),
             )
+            thr_copy_dKVaccum_r2s = tiled_copy_dKVaccum_r2s.get_slice(tidx)
+            tdKsdKaccum = thr_copy_dKVaccum_r2s.partition_D(sdKaccum)
+            tdVsdVaccum = thr_copy_dKVaccum_r2s.partition_D(sdVaccum)
 
-            sdKVaccum = cute.make_tensor(
-                cute.recast_ptr(sV.iterator, dtype=Float32),
-                sdKVaccum_layout,
-            )
-
-            smem_thr_copy_dKVaccum = r2s_tiled_copy_dKVaccum.get_slice(tidx)
-            tdKsdKVaccum = smem_thr_copy_dKVaccum.partition_D(sdKVaccum)
-
-            cute.arch.barrier(
-                barrier_id=int(NamedBarrierFwd.Epilogue), number_of_threads=self.num_mma_threads
-            )
-
-            tdKrdKaccum_flat = cute.make_tensor(
-                acc_dK.iterator, cute.make_layout(tdKsdKVaccum.shape)
-            )
-            cute.autovec_copy(tdKrdKaccum_flat, tdKsdKVaccum)
+            cute.arch.cp_async_bulk_wait_group(0, read=True)
+            epi_barrier.arrive_and_wait()
+            tdKrdKaccum_flat = cute.make_tensor(acc_dK.iterator, tdKsdKaccum.shape)
+            cute.autovec_copy(tdKrdKaccum_flat, tdKsdKaccum)
             cute.arch.fence_view_async_shared()
-            cute.arch.barrier(
-                barrier_id=int(NamedBarrierFwd.Epilogue), number_of_threads=self.num_mma_threads
-            )
-
+            epi_barrier.arrive_and_wait()
             if warp_idx == 4:
                 with cute.arch.elect_one():
                     for wg_idx in cutlass.range_constexpr(self.num_mma_warp_groups):
                         copy_utils.cpasync_reduce_bulk_add_f32(
-                            sdKVaccum[None, wg_idx].iterator,
+                            sdKaccum[None, wg_idx].iterator,
                             gdKaccum[None, wg_idx].iterator,
                             self.tma_copy_bytes["dKacc"] // self.num_mma_warp_groups,
                         )
                 cute.arch.cp_async_bulk_commit_group()
-                cute.arch.cp_async_bulk_wait_group(0, read=True)
 
-            cute.arch.barrier(
-                barrier_id=int(NamedBarrierFwd.Epilogue), number_of_threads=self.num_mma_threads
-            )
-
-            tdVrdVaccum_flat = cute.make_tensor(
-                acc_dV.iterator, cute.make_layout(tdKsdKVaccum.shape)
-            )
-            cute.autovec_copy(tdVrdVaccum_flat, tdKsdKVaccum)
+            cute.arch.cp_async_bulk_wait_group(0, read=True)
+            epi_barrier.arrive_and_wait()
+            tdVrdVaccum_flat = cute.make_tensor(acc_dV.iterator, tdVsdVaccum.shape)
+            cute.autovec_copy(tdVrdVaccum_flat, tdVsdVaccum)
             cute.arch.fence_view_async_shared()
-            cute.arch.barrier(
-                barrier_id=int(NamedBarrierFwd.Epilogue), number_of_threads=self.num_mma_threads
-            )
-
+            epi_barrier.arrive_and_wait()
             if warp_idx == 4:
                 with cute.arch.elect_one():
                     for wg_idx in cutlass.range_constexpr(self.num_mma_warp_groups):
                         copy_utils.cpasync_reduce_bulk_add_f32(
-                            sdKVaccum[None, wg_idx].iterator,
+                            sdVaccum[None, wg_idx].iterator,
                             gdVaccum[None, wg_idx].iterator,
                             self.tma_copy_bytes["dVacc"] // self.num_mma_warp_groups,
                         )
                 cute.arch.cp_async_bulk_commit_group()
-                cute.arch.cp_async_bulk_wait_group(0, read=True)
 
     @cute.jit
     def dQaccum_store(

@@ -5,7 +5,7 @@ from typing import Optional
 from dataclasses import dataclass
 
 from cutlass import Boolean, Int32, const_expr
-from cutlass.cutlass_dsl import if_generate
+from cutlass.cutlass_dsl import if_generate, dsl_user_op
 from cutlass.pipeline import PipelineState
 from cutlass.pipeline import PipelineUserType
 from cutlass.pipeline import PipelineTmaAsync as PipelineTmaAsyncOg
@@ -111,6 +111,7 @@ class PipelineTmaAsync(PipelineTmaAsyncOg):
         object.__setattr__(obj, "__class__", PipelineTmaAsync)
         return obj
 
+    @dsl_user_op
     def producer_acquire(
         self,
         state: PipelineState,
@@ -150,6 +151,7 @@ class PipelineTmaUmma(PipelineTmaUmmaOg):
         object.__setattr__(obj, "__class__", PipelineTmaUmma)
         return obj
 
+    @dsl_user_op
     def producer_acquire(
         self,
         state: PipelineState,
@@ -187,3 +189,53 @@ class PipelineTmaUmma(PipelineTmaUmmaOg):
                 loc=loc,
                 ip=ip,
             )
+
+    @dsl_user_op
+    def producer_acquire_w_index_phase(
+        self,
+        index: Int32,
+        phase: Int32,
+        try_acquire_token: Optional[Boolean] = None,
+        *,
+        loc=None,
+        ip=None,
+    ):
+        """
+        TMA producer commit conditionally waits on buffer empty and sets the transaction barrier for leader threadblocks.
+        """
+        if_generate(
+            try_acquire_token is None or try_acquire_token == 0,
+            lambda: self.sync_object_empty.wait(index, phase, loc=loc, ip=ip),
+            loc=loc,
+            ip=ip,
+        )
+        if_generate(
+            self.is_leader_cta,
+            lambda: self.sync_object_full.arrive(index, self.producer_mask, loc=loc, ip=ip),
+            loc=loc,
+            ip=ip,
+        )
+
+    @dsl_user_op
+    def consumer_wait_w_index_phase(
+        self,
+        index: Int32,
+        phase: Int32,
+        try_wait_token: Optional[Boolean] = None,
+        *,
+        loc=None,
+        ip=None,
+    ):
+        if_generate(
+            try_wait_token is None or try_wait_token == 0,
+            lambda: self.sync_object_full.wait(index, phase, loc=loc, ip=ip),
+            loc=loc,
+            ip=ip,
+        )
+
+    @dsl_user_op
+    def consumer_release_w_index(self, index: Int32, *, loc=None, ip=None):
+        """
+        UMMA consumer release buffer empty, cta_group needs to be provided.
+        """
+        self.sync_object_empty.arrive(index, self.consumer_mask, self.cta_group, loc=loc, ip=ip)

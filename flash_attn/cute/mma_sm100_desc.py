@@ -189,11 +189,7 @@ class LayoutType(IntEnum):  # occupies the top-3 bits [61:64)
 
 
 def _layout_type(swizzle: cute.Swizzle) -> LayoutType:
-    # No idea what the right way to get B, M, S is – so we're just parsing it from the __str__
-    # Swizzle string has the form "S<B,M,S>"
-    swz_str = str(swizzle)
-    inside = swz_str[swz_str.index("<") + 1 : swz_str.index(">")]  # '3,4,3'
-    B, M, S = [int(x) for x in inside.split(",")]  # [3, 4, 3]
+    B, M, S = swizzle.num_bits, swizzle.num_base, swizzle.num_shift
 
     if M == 4:  # Swizzle<*,4,3>
         if S != 3:
@@ -289,3 +285,12 @@ def make_smem_desc_base(layout: cute.Layout, swizzle: cute.Swizzle, major: Major
 def make_smem_desc_start_addr(start_addr: cute.Pointer) -> cutlass.Int32:
     # 14 bits, remove 4 LSB (bits 0-13 in desc)
     return (start_addr.toint() & 0x3FFFF) >> 4
+
+
+def smem_desc_base_from_tensor(sA: cute.Tensor, major: Major) -> int:
+    sA_swizzle = sA.iterator.type.swizzle_type
+    return make_smem_desc_base(
+        cute.recast_layout(128, sA.element_type.width, sA.layout[0]),
+        sA_swizzle,
+        major,
+    )

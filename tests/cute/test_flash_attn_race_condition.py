@@ -26,7 +26,6 @@ from flash_attn.cute.interface import (
     flash_attn_varlen_func,
     flash_attn_combine,
     _flash_attn_bwd,
-    _get_device_capability,
 )
 
 
@@ -408,7 +407,7 @@ def test_flash_attn_varlen_output(
     local = local_enum > 0
     if local and causal:
         pytest.skip()
-    is_sm90 = _get_device_capability() == 9
+    is_sm90 = torch.cuda.get_device_capability()[0] == 9
     if is_sm90 and local:
         pytest.xfail("bwd local attention not supported on sm90")
     if is_sm90 and deterministic:
