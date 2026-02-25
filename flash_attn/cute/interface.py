@@ -675,6 +675,9 @@ def _flash_attn_bwd(
     subtile_factor = 2
     seqlen_q_rounded = (seqlen_q + m_block_size - 1) // m_block_size * m_block_size
     seqlen_k_rounded = (seqlen_k + n_block_size - 1) // n_block_size * n_block_size
+    num_n_blocks = seqlen_k_rounded // n_block_size
+    if cluster_size == 2 and num_n_blocks % cluster_size != 0:
+        seqlen_k_rounded = seqlen_k_rounded + n_block_size
 
     if cu_seqlens_k is None:
         assert k.shape == (batch_size, seqlen_k, num_head_kv, head_dim)
@@ -782,9 +785,6 @@ def _flash_attn_bwd(
     if dKV_postprocess:
         head_dim_v_rounded = (head_dim_v + 32 - 1) // 32 * 32
         if cu_seqlens_k is None:
-            num_n_blocks = seqlen_k_rounded // n_block_size
-            if cluster_size == 2 and num_n_blocks % cluster_size != 0:
-                seqlen_k_rounded = seqlen_k_rounded + n_block_size
             dk_accum = torch.zeros(
                 batch_size,
                 num_head_kv,
