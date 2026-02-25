@@ -950,7 +950,7 @@ def softmax_block_sparse_sm100(
                     full_n_block,
                     is_first=False,
                     mask_fn=partial(
-                        mask_fn_none, mask_seqlen=False, check_q_boundary=check_m_boundary
+                        mask_fn_none, mask_seqlen=True, check_q_boundary=check_m_boundary
                     ),
                 )
             for i in cutlass.range(1, curr_full_block_cnt):
