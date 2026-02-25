@@ -10,6 +10,7 @@
 #include "cutlass/kernel_launch.h"  // For kernel_launch
 #include "cutlass/cluster_launch.hpp"  // For ClusterLauncher
 
+#include "cuda_check.h"
 #include "static_switch.h"
 #include "flash.h"
 #include "flash_bwd_preprocess_kernel.h"
@@ -71,8 +72,7 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     typename PreprocessKernel::Params preprocess_params = PreprocessKernel::to_underlying_arguments(preprocess_args);
     int num_m_block = cute::ceil_div(params.seqlen_q, kBlockM);
     dim3 grid_m(num_m_block, params.h, params.b);
-    cutlass::kernel_launch<PreprocessKernel>(grid_m, PreprocessKernel::MaxThreadsPerBlock, PreprocessKernel::SharedStorageSize, stream, preprocess_params, false /*launch_with_pdl*/);
-    CHECK_CUDA_KERNEL_LAUNCH();
+    CHECK_CUTLASS(cutlass::kernel_launch<PreprocessKernel>(grid_m, PreprocessKernel::MaxThreadsPerBlock, PreprocessKernel::SharedStorageSize, stream, preprocess_params, false /*launch_with_pdl*/));
 
     using TileShape_MNK = cute::Shape<Int<kBlockM>, Int<kBlockN>, Int<kHeadDim>>;
     using ClusterShape = cute::Shape<_1, Int<1>, _1>;  // Currently doesn't not support cluster
@@ -213,15 +213,14 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
             CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
         }
         dim3 cluster_dims(size<0>(ClusterShape{}), size<1>(ClusterShape{}), size<2>(ClusterShape{}));
-        cutlass::ClusterLauncher::launch(
-            grid_dims, cluster_dims, block_dims, smem_size, stream, kernel, kernel_params, false /*launch_with_pdl*/);
+        CHECK_CUTLASS(cutlass::ClusterLauncher::launch(
+            grid_dims, cluster_dims, block_dims, smem_size, stream, kernel, kernel_params, false /*launch_with_pdl*/));
     } else {
         if (smem_size >= 48 * 1024) {
             CHECK_CUDA(cudaFuncSetAttribute(cutlass::device_kernel<AttnKernel>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
         }
-        cutlass::kernel_launch<AttnKernel>(grid_dims, block_dims, smem_size, stream, kernel_params, false /*launch_with_pdl*/);
+        CHECK_CUTLASS(cutlass::kernel_launch<AttnKernel>(grid_dims, block_dims, smem_size, stream, kernel_params, false /*launch_with_pdl*/));
     }
-    CHECK_CUDA_KERNEL_LAUNCH();
 
     using PostprocessKernel = flash::FlashAttnBwdPostprocessConvertdQ<TileShape_MK, Element, ElementAccum, ArchTag,
         AttnKernel::CollectiveMainloop::NumMmaThreads,
@@ -246,8 +245,7 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     if (smem_size_postprocess >= 48 * 1024) {
         CHECK_CUDA(cudaFuncSetAttribute(cutlass::device_kernel<PostprocessKernel>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_postprocess));
     }
-    cutlass::kernel_launch<PostprocessKernel>(grid_m_postprocess, PostprocessKernel::MaxThreadsPerBlock, smem_size_postprocess, stream, postprocess_params, false /*launch_with_pdl*/);
-    CHECK_CUDA_KERNEL_LAUNCH();
+    CHECK_CUTLASS(cutlass::kernel_launch<PostprocessKernel>(grid_m_postprocess, PostprocessKernel::MaxThreadsPerBlock, smem_size_postprocess, stream, postprocess_params, false /*launch_with_pdl*/));
 
     if constexpr (GQA) {
         using TileShape_NK = cute::Shape<Int<kBlockN>, Int<kHeadDim>>;
@@ -286,10 +284,8 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
         if (smem_size_postprocess >= 48 * 1024) {
             CHECK_CUDA(cudaFuncSetAttribute(cutlass::device_kernel<PostprocessKerneldKV>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_postprocess));
         }
-        cutlass::kernel_launch<PostprocessKerneldKV>(grid_n_postprocess, PostprocessKerneldKV::MaxThreadsPerBlock, smem_size_postprocess, stream, postprocess_dK_params, false /*launch_with_pdl*/);
-        CHECK_CUDA_KERNEL_LAUNCH();
-        cutlass::kernel_launch<PostprocessKerneldKV>(grid_n_postprocess, PostprocessKerneldKV::MaxThreadsPerBlock, smem_size_postprocess, stream, postprocess_dV_params, false /*launch_with_pdl*/);
-        CHECK_CUDA_KERNEL_LAUNCH();
+        CHECK_CUTLASS(cutlass::kernel_launch<PostprocessKerneldKV>(grid_n_postprocess, PostprocessKerneldKV::MaxThreadsPerBlock, smem_size_postprocess, stream, postprocess_dK_params, false /*launch_with_pdl*/));
+        CHECK_CUTLASS(cutlass::kernel_launch<PostprocessKerneldKV>(grid_n_postprocess, PostprocessKerneldKV::MaxThreadsPerBlock, smem_size_postprocess, stream, postprocess_dV_params, false /*launch_with_pdl*/));
     }
 
 }
