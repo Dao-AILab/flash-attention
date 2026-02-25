@@ -213,7 +213,7 @@ class FlashAttentionBackwardSm100:
         self.num_regs_empty = 24
 
         if const_expr(self.tile_hdim == 192):
-            if (not is_causal and not is_local) or deterministic:
+            if not is_causal and not is_local:
                 self.num_regs_reduce = 128 + 16
                 self.num_regs_compute = 128 + 8
                 self.num_regs_other = 128 - 32
@@ -692,14 +692,11 @@ class FlashAttentionBackwardSm100:
         # TileScheduler = SingleTileScheduler
         if const_expr(self.is_varlen_k):
             TileScheduler = SingleTileVarlenScheduler
-        elif const_expr(self.deterministic and not self.use_2cta_instrs):
+        elif const_expr(self.deterministic):
             TileScheduler = SingleTileLPTBwdScheduler
         else:
             TileScheduler = SingleTileScheduler
-        # spt is disabled for 2-CTA temporarily
-        self.spt = (
-            (self.is_causal or self.is_local) and self.deterministic and not self.use_2cta_instrs
-        )
+        self.spt = (self.is_causal or self.is_local) and self.deterministic
         tile_sched_args = TileSchedulerArguments(
             cute.ceil_div(cute.size(mK.shape[0]), self.cta_tiler[0]),  # num_blocks
             cute.size(mQ.shape[2]),  # num_heads = num_query_heads
@@ -721,7 +718,7 @@ class FlashAttentionBackwardSm100:
             element_size=self.k_dtype.width // 8,
             is_persistent=self.is_persistent,  # persistent mode not tested
             lpt=self.spt,
-            head_swizzle=self.deterministic and not self.use_2cta_instrs,
+            head_swizzle=self.deterministic,
         )
 
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)

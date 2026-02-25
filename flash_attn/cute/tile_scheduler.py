@@ -444,11 +444,12 @@ class SingleTileLPTBwdScheduler:
             block, bidhb_residual = divmod(l2_mod, params.l2_minor_residual_divmod)
         bidhb_actual = bidhb * params.l2_minor + bidhb_residual
         batch_idx, head_idx = divmod(bidhb_actual, params.num_head_divmod)
-        is_valid = self._tile_idx < params.total_blocks
-        bidx_in_cluster = cute.arch.block_in_cluster_idx()
-        block = block * params.cluster_shape_mn[0] + bidx_in_cluster[0]
         if cutlass.const_expr(params.spt):
             block = params.num_block - 1 - block
+        if cutlass.const_expr(params.cluster_shape_mn[0] > 1):
+            bidx_in_cluster = cute.arch.block_in_cluster_idx()
+            block = block * params.cluster_shape_mn[0] + bidx_in_cluster[0]
+        is_valid = self._tile_idx < params.total_blocks
         return WorkTileInfo((Int32(block), Int32(head_idx), Int32(batch_idx), Int32(0)), is_valid)
 
     def initial_work_tile_info(self, *, loc=None, ip=None):
