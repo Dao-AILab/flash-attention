@@ -1917,7 +1917,7 @@ class FlashAttentionBackwardSm100:
                     or m_block_min < m_block_max
                 )
 
-            if const_expr(self.use_2cta_instrs) or process_tile:
+            if process_tile:
                 if const_expr(self.use_block_sparsity):
                     producer_state_Q_LSE, producer_state_dO_dPsum = (
                         produce_block_sparse_q_loads_bwd_sm100(
@@ -3227,7 +3227,7 @@ class FlashAttentionBackwardSm100:
 
             # Epilogue
             # Run epilogue if we processed any m_blocks for this n_block
-            if const_expr(self.use_2cta_instrs) or process_tile:
+            if process_tile:
                 if const_expr(not self.use_tma_store):
                     consumer_state_dKV = self.epilogue_dKV(
                         dp_idx,
@@ -3559,7 +3559,7 @@ class FlashAttentionBackwardSm100:
                         mdQ_semaphore_cur[m_block, None].iterator, tidx, cta_rank_in_cluster, 1
                     )
 
-            if const_expr(not self.is_local) or m_block_min < m_block_max:
+            if process_tile:
                 if is_tma_warp:
                     cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
                 self.reduce_sync_barrier.arrive_and_wait()
