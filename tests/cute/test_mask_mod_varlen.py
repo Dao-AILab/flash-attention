@@ -26,6 +26,15 @@ from mask_mod_definitions import (
     random_doc_id_tensor,
     STATIC_MASKS,
     PARAMETERIZED_MASK_FACTORIES,
+    cute_global_packed_doc_mask,
+    cute_global_ima_mask,
+    cute_global_causal_window_mask,
+    global_packed_doc_flex_factory,
+    global_ima_flex_factory,
+    global_causal_window_flex_factory,
+    make_packed_doc_ids,
+    make_global_thresholds,
+    make_global_windows,
 )
 
 COMPUTE_CAPABILITY = torch.cuda.get_device_capability()[0]
@@ -279,6 +288,7 @@ def _run_varlen_mask_test(
         doc_ids = random_doc_id_tensor(
             num_heads, batch_size, max_doc_len, device="cuda"
         ).to(dtype=torch.int32, device="cuda")
+        doc_ids.__leading_dim__ = 2
         aux_tensors_arg = [doc_ids]
 
         from mask_mod_definitions import flex_document_mask
@@ -286,8 +296,14 @@ def _run_varlen_mask_test(
         cute_mask_mod = get_mask_pair("document")[0]
 
         def flex_factory(seq_idx, sq, sk, doc_ids=doc_ids):
+            # Pre-slice to 1D using Python ints *outside* the vmapped closure.
+            # create_block_mask vmaps over all four args (b, h, q_idx, kv_idx);
+            # multi-dim indexing like doc_id[b, h, q_idx] with 0-dim vmap tensors
+            # triggers .item() internally. 1D tensor[0d_tensor] is a safe gather.
+            doc_row = doc_ids[seq_idx, 0]  # (max_doc_len,)
+
             def _mask(b, h, q_idx, kv_idx):
-                return flex_document_mask(seq_idx, h, q_idx, kv_idx, doc_ids)
+                return doc_row[q_idx] == doc_row[kv_idx]
 
             return _mask
 
@@ -442,7 +458,7 @@ def test_varlen_static_masks(seqlens_q, seqlens_k, dtype, kv_mode, mask_name):
     )
 
 
-@pytest.mark.parametrize("seqlens_q,seqlens_k", SEQLEN_CONFIGS_SMOKE)
+@pytest.mark.parametrize("seqlens_q,seqlens_k", SEQLEN_CONFIGS)
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("kv_mode", ["mha", "gqa"])
 @pytest.mark.parametrize("mask_name,window_size", PARAMETERIZED_MASK_CONFIGS)
@@ -474,6 +490,132 @@ def test_varlen_parameterized_masks(
 
 
 # =============================================================================
+# Global-index mask test runner
+# =============================================================================
+
+
+def _run_varlen_global_mask_test(
+    seqlens_q,
+    seqlens_k,
+    num_heads,
+    num_kv_heads,
+    head_dim,
+    dtype,
+    mask_name,
+):
+    """Run a varlen global-index mask_mod test: kernel vs per-sequence flex_attention."""
+    torch.manual_seed(42)
+    random.seed(42)
+
+    pack_gqa = num_heads != num_kv_heads
+
+    q, k, v, cu_seqlens_q, cu_seqlens_k = setup_varlen_tensors(
+        seqlens_q, seqlens_k, num_heads, num_kv_heads, head_dim, dtype
+    )
+
+    if mask_name == "global_packed_doc":
+        doc_ids_q, doc_ids_k = make_packed_doc_ids(seqlens_q, seqlens_k, device="cuda")
+        cute_mask = cute_global_packed_doc_mask
+        flex_fac = global_packed_doc_flex_factory(
+            doc_ids_q, doc_ids_k, cu_seqlens_q, cu_seqlens_k
+        )
+        aux_tensors = [doc_ids_q, doc_ids_k]
+    elif mask_name == "global_ima":
+        thresholds = make_global_thresholds(seqlens_k, device="cuda")
+        cute_mask = cute_global_ima_mask
+        flex_fac = global_ima_flex_factory(thresholds, cu_seqlens_k)
+        aux_tensors = [thresholds]
+    elif mask_name == "global_causal_window":
+        windows = make_global_windows(seqlens_q, device="cuda")
+        cute_mask = cute_global_causal_window_mask
+        flex_fac = global_causal_window_flex_factory(windows, cu_seqlens_q)
+        aux_tensors = [windows]
+    else:
+        raise ValueError(f"Unknown global mask: {mask_name}")
+
+    out = torch.empty_like(q)
+    softmax_scale = 1.0 / math.sqrt(head_dim)
+
+    out_tuple = _flash_attn_fwd(
+        q=q,
+        k=k,
+        v=v,
+        out=out,
+        lse=None,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        seqused_q=None,
+        seqused_k=None,
+        page_table=None,
+        softmax_scale=softmax_scale,
+        causal=False,
+        softcap=None,
+        window_size_left=-1,
+        window_size_right=-1,
+        learnable_sink=None,
+        m_block_size=128,
+        n_block_size=128,
+        pack_gqa=pack_gqa,
+        _compute_capability=None,
+        score_mod=None,
+        mask_mod=cute_mask,
+        block_sparse_tensors=None,
+        return_lse=True,
+        aux_tensors=aux_tensors,
+    )
+    out_cute = out_tuple[0]
+
+    out_ref_fp32 = run_flex_per_sequence(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        flex_fac,
+        seqlens_q,
+        seqlens_k,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        dtype=torch.float32,
+    )
+    out_pt = run_flex_per_sequence(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        flex_fac,
+        seqlens_q,
+        seqlens_k,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        dtype=dtype,
+    )
+
+    test_name = (
+        f"global_mask={mask_name} varlen seqs_q={seqlens_q}, seqs_k={seqlens_k}, "
+        f"H={num_heads}/{num_kv_heads}, D={head_dim}"
+    )
+    check_varlen_results(
+        out_cute, out_ref_fp32, out_pt, seqlens_q, cu_seqlens_q, test_name
+    )
+
+
+GLOBAL_MASK_NAMES = ["global_packed_doc", "global_ima", "global_causal_window"]
+
+
+@pytest.mark.parametrize("seqlens_q,seqlens_k", SEQLEN_CONFIGS)
+@pytest.mark.parametrize("mask_name", GLOBAL_MASK_NAMES)
+def test_varlen_global_masks(seqlens_q, seqlens_k, mask_name):
+    """Test global-index mask_mods (aux-tensor-driven) with varlen packed attention."""
+    _run_varlen_global_mask_test(
+        seqlens_q, seqlens_k, 8, 8, 128, torch.bfloat16, mask_name
+    )
+
+
+# =============================================================================
 # Block sparsity end-to-end tests
 # =============================================================================
 
@@ -489,6 +631,7 @@ def _make_block_sparse_tensors(
     cu_seqlens_q=None,
     cu_seqlens_k=None,
     seqused_k=None,
+    aux_tensors=None,
 ):
     """Compute block sparse tensors, returning (tensors, cu_total_m_blocks, cu_total_n_blocks)."""
     batch_size = len(seqlens_q)
@@ -528,7 +671,7 @@ def _make_block_sparse_tensors(
         seqlen_q=max_seqlen_q,
         seqlen_k=max_seqlen_k,
         mask_mod=mask_mod,
-        aux_tensors=None,
+        aux_tensors=aux_tensors,
         device=device,
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_k=cu_seqlens_k,
@@ -550,6 +693,7 @@ def _run_fwd(
     block_sparse_tensors=None,
     cu_total_m_blocks=None,
     cu_total_n_blocks=None,
+    aux_tensors=None,
 ):
     out = torch.empty_like(q)
     return _flash_attn_fwd(
@@ -579,23 +723,49 @@ def _run_fwd(
         cu_total_m_blocks=cu_total_m_blocks,
         cu_total_n_blocks=cu_total_n_blocks,
         return_lse=False,
-        aux_tensors=None,
+        aux_tensors=aux_tensors,
     )[0]
 
 
+BLOCK_SPARSE_MASK_NAMES = [
+    # "causal",
+    # "block_diagonal",
+    # "mini_causal",
+    # "prefix_lm",
+    # "sliding_window",
+    # "dilated_sliding_window",
+    # "document",
+    "ima",
+]
+
+BLOCK_SPARSE_SEQLEN_CONFIGS = [
+    ([128, 192, 256], [128, 192, 256]),
+    ([64, 128], [64, 128]),
+    ([256, 512, 256], [256, 512, 256]),
+    ([128, 192, 256], [64, 128, 192]),
+]
+
+
 # @pytest.mark.parametrize("varlen_q", [False, True])
+@pytest.mark.parametrize("seqlens", BLOCK_SPARSE_SEQLEN_CONFIGS)
+@pytest.mark.parametrize("mask_name", BLOCK_SPARSE_MASK_NAMES)
 @pytest.mark.parametrize("varlen_q", [False, True])
 @pytest.mark.parametrize("varlen_k", [False, True])
 @pytest.mark.parametrize("use_seqused_k", [False, True])
 @pytest.mark.parametrize("head_broadcast", [False, True])
-def test_varlen_block_sparse(varlen_q, varlen_k, use_seqused_k, head_broadcast):
+def test_varlen_block_sparse(
+    varlen_q, varlen_k, use_seqused_k, head_broadcast, mask_name, seqlens
+):
     """Block sparsity + mask_mod should produce identical output to mask_mod alone."""
     if varlen_k and use_seqused_k:
         pytest.skip("packed K (cu_seqlens_k) and seqused_k are mutually exclusive")
     if not varlen_q and varlen_k:
-        pytest.skip("block sparsity with padded Q + packed K requires per-batch n-block offsets; not yet supported")
+        pytest.skip(
+            "block sparsity with padded Q + packed K requires per-batch n-block offsets; not yet supported"
+        )
 
     torch.manual_seed(42)
+    random.seed(42)
     device = "cuda"
     num_heads = 4
     head_dim = 128
@@ -604,11 +774,15 @@ def test_varlen_block_sparse(varlen_q, varlen_k, use_seqused_k, head_broadcast):
     tile_m = 256 if COMPUTE_CAPABILITY >= 10 else 128
     tile_n = 128
 
-    seqlens_q = [128, 192, 256] if varlen_q else [256, 256, 256]
-    seqlens_k = [128, 192, 256] if (varlen_k or use_seqused_k) else [256, 256, 256]
-    batch_size = len(seqlens_q)
-    max_seqlen_q = max(seqlens_q)
-    max_seqlen_k = max(seqlens_k)
+    base_seqlens_q, base_seqlens_k = seqlens
+    batch_size = len(base_seqlens_q)
+    max_seqlen_q = max(base_seqlens_q)
+    max_seqlen_k = max(base_seqlens_k)
+
+    seqlens_q = base_seqlens_q if varlen_q else [max_seqlen_q] * batch_size
+    seqlens_k = (
+        base_seqlens_k if (varlen_k or use_seqused_k) else [max_seqlen_k] * batch_size
+    )
 
     def make_cu_seqlens(seqlens):
         return torch.tensor(
@@ -621,7 +795,9 @@ def test_varlen_block_sparse(varlen_q, varlen_k, use_seqused_k, head_broadcast):
         q = torch.randn(sum(seqlens_q), num_heads, head_dim, device=device, dtype=dtype)
         cu_seqlens_q = make_cu_seqlens(seqlens_q)
     else:
-        q = torch.randn(batch_size, max_seqlen_q, num_heads, head_dim, device=device, dtype=dtype)
+        q = torch.randn(
+            batch_size, max_seqlen_q, num_heads, head_dim, device=device, dtype=dtype
+        )
         cu_seqlens_q = None
 
     if varlen_k:
@@ -630,48 +806,99 @@ def test_varlen_block_sparse(varlen_q, varlen_k, use_seqused_k, head_broadcast):
         cu_seqlens_k = make_cu_seqlens(seqlens_k)
         seqused_k = None
     else:
-        k = torch.randn(batch_size, max_seqlen_k, num_heads, head_dim, device=device, dtype=dtype)
-        v = torch.randn(batch_size, max_seqlen_k, num_heads, head_dim, device=device, dtype=dtype)
+        k = torch.randn(
+            batch_size, max_seqlen_k, num_heads, head_dim, device=device, dtype=dtype
+        )
+        v = torch.randn(
+            batch_size, max_seqlen_k, num_heads, head_dim, device=device, dtype=dtype
+        )
         cu_seqlens_k = None
         seqused_k = (
-            torch.tensor(seqlens_k, dtype=torch.int32, device=device) if use_seqused_k else None
+            torch.tensor(seqlens_k, dtype=torch.int32, device=device)
+            if use_seqused_k
+            else None
         )
 
-    mask_mod, _ = get_mask_pair("causal", seqlen_q=max_seqlen_q, seqlen_k=max_seqlen_k)
+    # Build mask_mod and aux_tensors for the requested mask
+    aux_tensors = None
+    if mask_name == "causal":
+        mask_mod, _ = get_mask_pair(
+            "causal", seqlen_q=max_seqlen_q, seqlen_k=max_seqlen_k
+        )
+    elif mask_name == "sliding_window":
+        mask_mod, _ = get_mask_pair(
+            "sliding_window",
+            seqlen_q=max_seqlen_q,
+            seqlen_k=max_seqlen_k,
+            window_size=128,
+        )
+    elif mask_name == "document":
+        max_doc_len = max(max_seqlen_q, max_seqlen_k)
+        doc_ids = random_doc_id_tensor(
+            num_heads, batch_size, max_doc_len, device=device
+        )
+        doc_ids.__leading_dim__ = 2
+        aux_tensors = [doc_ids]
+        mask_mod = get_mask_pair("document")[0]
+    elif mask_name == "ima":
+        bias = torch.randint(
+            0,
+            max(1, max_seqlen_k // 2),
+            (max_seqlen_k,),
+            dtype=torch.int32,
+            device=device,
+        )
+        aux_tensors = [bias]
+        mask_mod = get_mask_pair("ima")[0]
+    else:
+        mask_mod = get_mask_pair(mask_name)[0]
 
     num_heads_sparse = 1 if head_broadcast else num_heads
-    block_sparse_tensors, cu_total_m_blocks, cu_total_n_blocks = _make_block_sparse_tensors(
-        mask_mod=mask_mod,
-        seqlens_q=seqlens_q,
-        seqlens_k=seqlens_k,
-        num_heads=num_heads_sparse,
-        tile_m=tile_m,
-        tile_n=tile_n,
-        device=device,
-        cu_seqlens_q=cu_seqlens_q,
-        cu_seqlens_k=cu_seqlens_k,
-        seqused_k=seqused_k,
+    block_sparse_tensors, cu_total_m_blocks, cu_total_n_blocks = (
+        _make_block_sparse_tensors(
+            mask_mod=mask_mod,
+            seqlens_q=seqlens_q,
+            seqlens_k=seqlens_k,
+            num_heads=num_heads_sparse,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            device=device,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            seqused_k=seqused_k,
+            aux_tensors=aux_tensors,
+        )
     )
 
     out_with_block_sparsity = _run_fwd(
-        q, k, v, mask_mod,
+        q,
+        k,
+        v,
+        mask_mod,
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_k=cu_seqlens_k,
         seqused_k=seqused_k,
         block_sparse_tensors=block_sparse_tensors,
         cu_total_m_blocks=cu_total_m_blocks,
         cu_total_n_blocks=cu_total_n_blocks,
+        aux_tensors=aux_tensors,
     )
     out_no_block_sparsity = _run_fwd(
-        q, k, v, mask_mod,
+        q,
+        k,
+        v,
+        mask_mod,
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_k=cu_seqlens_k,
         seqused_k=seqused_k,
+        aux_tensors=aux_tensors,
     )
 
     assert not torch.isnan(out_with_block_sparsity).any(), "NaN in block-sparse output"
     max_err = (out_with_block_sparsity - out_no_block_sparsity).abs().max().item()
-    assert max_err == 0.0, f"block-sparse output differs from mask-mod-only by {max_err}"
+    assert max_err == 0.0, (
+        f"block-sparse output differs from mask-mod-only by {max_err}"
+    )
 
 
 if __name__ == "__main__":

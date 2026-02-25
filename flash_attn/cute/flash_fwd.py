@@ -1262,6 +1262,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         window_size_right: Int32 | int | None = None,
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        mCuTotalMBlocks: Optional[cute.Tensor] = None,
+        mCuTotalNBlocks: Optional[cute.Tensor] = None,
         aux_tensors: Optional[list] = None,
     ):
         """Configures and launches the flash attention kernel.
@@ -1494,6 +1496,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             mCuSeqlensK,
             mSeqUsedQ,
             mSeqUsedK,
+            mCuTotalMBlocks,
+            mCuTotalNBlocks,
             tma_atom_Q,
             tma_atom_K,
             tma_atom_V,
@@ -1539,6 +1543,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mCuSeqlensK: Optional[cute.Tensor],
         mSeqUsedQ: Optional[cute.Tensor],
         mSeqUsedK: Optional[cute.Tensor],
+        mCuTotalMBlocks: Optional[cute.Tensor],
+        mCuTotalNBlocks: Optional[cute.Tensor],
         tma_atom_Q: Optional[cute.CopyAtom],
         tma_atom_K: Optional[cute.CopyAtom],
         tma_atom_V: Optional[cute.CopyAtom],
@@ -1646,6 +1652,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             mCuSeqlensK=mCuSeqlensK,
             mSeqUsedQ=mSeqUsedQ,
             mSeqUsedK=mSeqUsedK,
+            mCuTotalMBlocks=mCuTotalMBlocks,
+            mCuTotalNBlocks=mCuTotalNBlocks,
         )
         AttentionMaskCls = partial(
             AttentionMask,
