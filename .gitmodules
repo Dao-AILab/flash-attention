@@ -8,3 +8,6 @@
 [submodule "catlass"]
 	path = catlass
 	url = https://gitcode.com/cann/catlass.git
+[submodule "csrc/catlass"]
+	path = csrc/catlass
+	url = https://gitcode.com/cann/catlass.git
