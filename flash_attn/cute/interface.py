@@ -133,7 +133,8 @@ def _flash_attn_fwd(
         score_mod: A callable that takes the attention scores and applies a modification.
         mask_mod: A callable that takes token position information and selectively masks
         block_sparse_tensors: A tuple of tensors used for block sparsity.
-        return_lse: Whether to return the log softmax of the attention scores. If set to True will always calculate
+        return_lse: Whether to return the log softmax of the attention scores.
+            Note: the returned LSE currently does not support taking gradient. If set to True will always calculate
         out: Optional pre-allocated output tensor. If None, will be allocated internally.
         lse: Optional pre-allocated log-sum-exp tensor. If None, will be allocated when needed.
         aux_tensors: Some score_mods will want to read from global aux_tensors. This is how we thread them through to the inner kernel.
@@ -1311,6 +1312,9 @@ class FlashAttnFunc(torch.autograd.Function):
         ctx.window_size = window_size
         ctx.softcap = softcap
         ctx.deterministic = deterministic
+        # LSE gradient is not supported yet
+        if lse is not None:
+            ctx.mark_non_differentiable(lse)
         return out, lse
 
     @staticmethod
@@ -1330,7 +1334,7 @@ class FlashAttnFunc(torch.autograd.Function):
             window_size_right=ctx.window_size[1],
             deterministic=ctx.deterministic,
         )
-        return dq, dk, dv, *((None,) * 21)  # Extra Nones is fine
+        return dq, dk, dv, *((None,) * 20)  # Extra Nones is fine
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -1390,6 +1394,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         ctx.deterministic = deterministic
         ctx.max_seqlen_q = max_seqlen_q
         ctx.max_seqlen_k = max_seqlen_k
+        # LSE gradient is not supported yet
+        if lse is not None:
+            ctx.mark_non_differentiable(lse)
         return out, lse
 
     @staticmethod
@@ -1417,7 +1424,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             deterministic=ctx.deterministic,
         )
 
-        return dq, dk, dv, *((None,) * 21)
+        return dq, dk, dv, *((None,) * 20)
 
 
 def flash_attn_func(
