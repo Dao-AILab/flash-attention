@@ -135,7 +135,7 @@ struct Softmax {
     __forceinline__ __device__ Softmax(const float sink_val = -INFINITY) : sink_val(sink_val) {};
 
     template<bool Is_first, bool Check_inf=false, bool Has_sink=false, typename Tensor0, typename Tensor1>
-    __forceinline__ __device__ void softmax_rescale_o(Tensor0 &acc_s, Tensor1 &acc_o, float softmax_scale_log2, float softmax_scale=1.0) {
+    __forceinline__ __device__ void softmax_rescale_o(Tensor0 &acc_s, Tensor1 &acc_o, float softmax_scale_log2, float softmax_scale=1.0f) {
         // Reshape acc_s from (MMA=4, MMA_M, MMA_N) to (nrow=(2, MMA_M), ncol=(2, MMA_N))
         Tensor scores = make_tensor(acc_s.data(), FLASH_NAMESPACE::convert_layout_acc_rowcol(acc_s.layout()));
         static_assert(decltype(size<0>(scores))::value == kNRows);

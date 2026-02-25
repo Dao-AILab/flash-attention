@@ -347,32 +347,10 @@ void set_params_alibi(Flash_fwd_params &params, std::optional<at::Tensor> &alibi
 #endif
 }
 
-void set_params_sink(Flash_fwd_params &params, const std::optional<const at::Tensor> &learnable_sink_, int num_heads) {
-#ifdef FLASHATTENTION_DISABLE_SINK
-    TORCH_CHECK(!learnable_sink_.has_value(), "This flash attention build does not support learnable sink.");
-    params.learnable_sink_ptr = nullptr;
-#else
-    if (learnable_sink_.has_value()) {
-        // Make the compiler happy by forbidding Learnable sink and ALiBi to party together —
-        // mixing them causes a template explosion and very long compile times!
-        TORCH_CHECK(params.alibi_slopes_ptr == nullptr, "Learnable sink and ALiBi slopes cannot be used together");
-        auto learnable_sink = learnable_sink_.value();
-        TORCH_CHECK(learnable_sink.dtype() == torch::kFloat32, "Learnable sink must have dtype fp32");
-        CHECK_DEVICE(learnable_sink);
-        TORCH_CHECK(learnable_sink.stride(-1) == 1, "Learnable sink tensor must have contiguous last dimension");
-        CHECK_SHAPE(learnable_sink, num_heads);
-        params.learnable_sink_ptr = learnable_sink.data_ptr();
-    } else {
-        params.learnable_sink_ptr = nullptr;
-    }
-#endif
-}
-
 std::vector<at::Tensor>
 mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_multiple(head_size, 8)
         const at::Tensor &k,         // batch_size x seqlen_k x num_heads_k x round_multiple(head_size, 8)
         const at::Tensor &v,         // batch_size x seqlen_k x num_heads_k x round_multiple(head_size, 8)
-        std::optional<at::Tensor> &learnable_sink_,      // num_heads
         std::optional<at::Tensor> &out_,             // batch_size x seqlen_q x num_heads x round_multiple(head_size, 8)
         std::optional<at::Tensor> &alibi_slopes_, // num_heads or batch_size x num_heads
         const float p_dropout,
@@ -382,7 +360,8 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
         int window_size_right,
         const float softcap,
         const bool return_softmax,
-        std::optional<at::Generator> gen_) {
+        std::optional<at::Generator> gen_,
+        std::optional<const at::Tensor> learnable_sink_) {
 
     // Otherwise the kernel will be launched from cuda:0 device
     at::cuda::CUDAGuard device_guard{q.device()};
@@ -516,7 +495,18 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
     }
 
     set_params_alibi(params, alibi_slopes_, batch_size, num_heads);
-    set_params_sink(params, learnable_sink_, num_heads);
+
+    at::Tensor learnable_sink;
+    if (learnable_sink_.has_value()) {
+        learnable_sink = learnable_sink_.value().to(torch::kFloat32);
+        TORCH_CHECK(params.alibi_slopes_ptr == nullptr, "Learnable sink and ALiBi slopes cannot be used together");
+        CHECK_DEVICE(learnable_sink); CHECK_CONTIGUOUS(learnable_sink);
+        TORCH_CHECK(learnable_sink.stride(-1) == 1, "Learnable sink tensor must have contiguous last dimension");
+        CHECK_SHAPE(learnable_sink, num_heads);
+        params.learnable_sink_ptr = learnable_sink.data_ptr();
+    } else {
+        params.learnable_sink_ptr = nullptr;
+    }
 
     if (seqlen_k > 0) {
         auto stream = at::cuda::getCurrentCUDAStream().stream();
@@ -539,8 +529,7 @@ std::vector<at::Tensor>
 mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
                const at::Tensor &k,  // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i or num_blocks x page_block_size x num_heads_k x head_size if there's a block_table.
                const at::Tensor &v,  // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i or num_blocks x page_block_size x num_heads_k x head_size if there's a block_table.
-               std::optional<at::Tensor> &learnable_sink_,  // num_heads
-               std::optional<at::Tensor> &out_, // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
+               std::optional<at::Tensor> &out_, // total_q x num_heads x head_size, total_k := \sum_{i=0}^{b} s_i
                const at::Tensor &cu_seqlens_q,  // b+1
                const at::Tensor &cu_seqlens_k,  // b+1
                std::optional<at::Tensor> &seqused_k, // b. If given, only this many elements of each batch element's keys are used.
@@ -557,7 +546,8 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                int window_size_right,
                const float softcap,
                const bool return_softmax,
-               std::optional<at::Generator> gen_) {
+               std::optional<at::Generator> gen_,
+               std::optional<const at::Tensor> learnable_sink_) {
 
     // Otherwise the kernel will be launched from cuda:0 device
     at::cuda::CUDAGuard device_guard{q.device()};
@@ -758,7 +748,18 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     }
 
     set_params_alibi(params, alibi_slopes_, batch_size, num_heads);
-    set_params_sink(params, learnable_sink_, num_heads);
+
+    at::Tensor learnable_sink;
+    if (learnable_sink_.has_value()) {
+        learnable_sink = learnable_sink_.value().to(torch::kFloat32);
+        TORCH_CHECK(params.alibi_slopes_ptr == nullptr, "Learnable sink and ALiBi slopes cannot be used together");
+        CHECK_DEVICE(learnable_sink); CHECK_CONTIGUOUS(learnable_sink);
+        TORCH_CHECK(learnable_sink.stride(-1) == 1, "Learnable sink tensor must have contiguous last dimension");
+        CHECK_SHAPE(learnable_sink, num_heads);
+        params.learnable_sink_ptr = learnable_sink.data_ptr();
+    } else {
+        params.learnable_sink_ptr = nullptr;
+    }
 
     if (max_seqlen_k > 0) {
         auto stream = at::cuda::getCurrentCUDAStream().stream();
@@ -795,13 +796,11 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multipl
         const at::Tensor &q,   // batch_size x seqlen_q x num_heads x head_size
         const at::Tensor &k,   // batch_size x seqlen_k x num_heads_k x head_size
         const at::Tensor &v,   // batch_size x seqlen_k x num_heads_k x head_size
-        std::optional<const at::Tensor> &learnable_sink,   // num_heads
         const at::Tensor &out,   // batch_size x seqlen_q x num_heads x head_size
         const at::Tensor &softmax_lse,     // b x h x seqlen_q
         std::optional<at::Tensor> &dq_,   // batch_size x seqlen_q x num_heads x head_size
         std::optional<at::Tensor> &dk_,   // batch_size x seqlen_k x num_heads_k x head_size
         std::optional<at::Tensor> &dv_,   // batch_size x seqlen_k x num_heads_k x head_size
-        std::optional<at::Tensor> &dsink_,   // num_heads
         std::optional<at::Tensor> &alibi_slopes_, // num_heads or batch_size x num_heads
         const float p_dropout,         // probability to drop
         const float softmax_scale,
@@ -811,7 +810,9 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multipl
         const float softcap,
         const bool deterministic,
         std::optional<at::Generator> gen_,
-        std::optional<at::Tensor> &rng_state) {
+        std::optional<at::Tensor> &rng_state,
+        std::optional<const at::Tensor> learnable_sink_,
+        std::optional<at::Tensor> dsink_) {
 
     #ifdef FLASHATTENTION_DISABLE_BACKWARD
         TORCH_CHECK(false, "This flash attention build does not support backward.");
@@ -874,7 +875,7 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multipl
     CHECK_SHAPE(out, batch_size, seqlen_q, num_heads, head_size);
     CHECK_SHAPE(dout, batch_size, seqlen_q, num_heads, head_size);
 
-    at::Tensor dq, dk, dv, dsink;
+    at::Tensor dq, dk, dv;
     if (dq_.has_value()) {
         dq = dq_.value();
         TORCH_CHECK(dq.dtype() == q_dtype, "dq must have the same dtype as q");
@@ -901,17 +902,6 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multipl
         CHECK_SHAPE(dv, batch_size, seqlen_k, num_heads_k, head_size);
     } else {
         dv = torch::empty_like(v);
-    }
-    if (learnable_sink.has_value()) {
-        if (dsink_.has_value()) {
-            dsink = dsink_.value();
-            TORCH_CHECK(dsink.dtype() == torch::kFloat32, "dsink must have dtype fp32");
-            CHECK_DEVICE(dsink);
-            TORCH_CHECK(dsink.stride(-1) == 1, "dsink tensor must have contiguous last dimension");
-            CHECK_SHAPE(dsink, num_heads);
-        } else {
-            dsink = torch::zeros_like(v);
-        }
     }
 
     // bool loop = seqlen_k > blocksize_c;
@@ -970,7 +960,6 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multipl
                      /*unpadded_lse*/false);
     params.dq_accum_split_stride = !deterministic ? 0 : dq_accum.stride(0);
 
-
     auto launch = &run_mha_bwd;
 
     auto gen = at::get_generator_or_default<at::CUDAGeneratorImpl>(
@@ -991,8 +980,30 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multipl
     }
 
     set_params_alibi(params, alibi_slopes_, batch_size, num_heads);
-    set_params_sink(params, learnable_sink, num_heads);
-    params.dsink_ptr = learnable_sink.has_value() ? dsink.data_ptr() : nullptr;
+
+    at::Tensor dsink;
+    at::Tensor learnable_sink;
+    if (learnable_sink_.has_value()) {
+        learnable_sink = learnable_sink_.value().to(torch::kFloat32);
+        TORCH_CHECK(params.alibi_slopes_ptr == nullptr, "Learnable sink and ALiBi slopes cannot be used together");
+        CHECK_DEVICE(learnable_sink); CHECK_CONTIGUOUS(learnable_sink);
+        TORCH_CHECK(learnable_sink.stride(-1) == 1, "Learnable sink tensor must have contiguous last dimension");
+        CHECK_SHAPE(learnable_sink, num_heads);
+        if (dsink_.has_value() && dsink_.value().dtype() == torch::kFloat32) {
+            dsink = dsink_.value();
+            CHECK_DEVICE(dsink); CHECK_CONTIGUOUS(dsink);
+            TORCH_CHECK(dsink.stride(-1) == 1, "dsink tensor must have contiguous last dimension");
+            CHECK_SHAPE(dsink, num_heads);
+        } else {
+            dsink = torch::empty_like(learnable_sink);
+        }
+        dsink.zero_();
+        params.learnable_sink_ptr = learnable_sink.data_ptr();
+        params.dsink_ptr = dsink.data_ptr();
+    } else {
+        params.learnable_sink_ptr = nullptr;
+        params.dsink_ptr = nullptr;
+    }
 
     if (seqlen_q > 0) {
         launch(params, stream);
@@ -1009,22 +1020,28 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multipl
         at::sum_out(dv, at::reshape(dv_expanded, {batch_size, seqlen_k, num_heads_k, num_heads / num_heads_k, head_size}), {3});
     }
 
-    return { dq, dk, dv, dsink, softmax_d };
-}
+    if (learnable_sink_.has_value()) {
+        if (!dsink_.has_value()) {
+            dsink = dsink.to(learnable_sink_.value().dtype());
+        } else if (dsink_.value().dtype() != torch::kFloat32) {
+            dsink = dsink.to(dsink_.value().dtype());
+            dsink_.value().copy_(dsink);
+        }
+    }
 
+    return { dq, dk, dv, softmax_d, dsink };
+}
 
 std::vector<at::Tensor>
 mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
                const at::Tensor &q,   // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
                const at::Tensor &k,   // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i
                const at::Tensor &v,   // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i
-               std::optional<at::Tensor> &learnable_sink,   // num_heads
                const at::Tensor &out,   // total_q x num_heads x head_size
                const at::Tensor &softmax_lse,    // h x total_q, softmax logsumexp
                std::optional<at::Tensor> &dq_,   // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
                std::optional<at::Tensor> &dk_,   // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i
                std::optional<at::Tensor> &dv_,   // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i
-               std::optional<at::Tensor> &dsink_,   // num_heads
                const at::Tensor &cu_seqlens_q,  // b+1
                const at::Tensor &cu_seqlens_k,  // b+1
                std::optional<at::Tensor> &alibi_slopes_, // num_heads or b x num_heads
@@ -1039,7 +1056,9 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
                const float softcap,
                const bool deterministic,
                std::optional<at::Generator> gen_,
-               std::optional<at::Tensor> &rng_state) {
+               std::optional<at::Tensor> &rng_state,
+               std::optional<const at::Tensor> learnable_sink_,
+               std::optional<at::Tensor> dsink_) {
 
     #ifdef FLASHATTENTION_DISABLE_BACKWARD
         TORCH_CHECK(false, "This flash attention build does not support backward.");
@@ -1108,7 +1127,7 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     CHECK_SHAPE(cu_seqlens_q, batch_size + 1);
     CHECK_SHAPE(cu_seqlens_k, batch_size + 1);
 
-    at::Tensor dq, dk, dv, dsink;
+    at::Tensor dq, dk, dv;
     if (dq_.has_value()) {
         dq = dq_.value();
         TORCH_CHECK(dq.dtype() == q_dtype, "dq must have the same dtype as q");
@@ -1135,17 +1154,6 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
         CHECK_SHAPE(dv, total_k, num_heads_k, head_size);
     } else {
         dv = torch::empty_like(v);
-    }
-    if (learnable_sink.has_value()) {
-        if (dsink_.has_value()) {
-            dsink = dsink_.value();
-            TORCH_CHECK(dsink.dtype() == torch::kFloat32, "dsink must have dtype fp32");
-            CHECK_DEVICE(dsink);
-            TORCH_CHECK(dsink.stride(-1) == 1, "dsink tensor must have contiguous last dimension");
-            CHECK_SHAPE(dsink, num_heads);
-        } else {
-            dsink = torch::zeros_like(v);
-        }
     }
 
     // bool loop = max_seqlen_k > blocksize_c;
@@ -1236,8 +1244,30 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     }
 
     set_params_alibi(params, alibi_slopes_, batch_size, num_heads);
-    set_params_sink(params, learnable_sink, num_heads);
-    params.dsink_ptr = learnable_sink.has_value() ? dsink.data_ptr() : nullptr;
+
+    at::Tensor dsink;
+    at::Tensor learnable_sink;
+    if (learnable_sink_.has_value()) {
+        learnable_sink = learnable_sink_.value().to(torch::kFloat32);
+        TORCH_CHECK(params.alibi_slopes_ptr == nullptr, "Learnable sink and ALiBi slopes cannot be used together");
+        CHECK_DEVICE(learnable_sink); CHECK_CONTIGUOUS(learnable_sink);
+        TORCH_CHECK(learnable_sink.stride(-1) == 1, "Learnable sink tensor must have contiguous last dimension");
+        CHECK_SHAPE(learnable_sink, num_heads);
+        if (dsink_.has_value() && dsink_.value().dtype() == torch::kFloat32) {
+            dsink = dsink_.value();
+            CHECK_DEVICE(dsink); CHECK_CONTIGUOUS(dsink);
+            TORCH_CHECK(dsink.stride(-1) == 1, "dsink tensor must have contiguous last dimension");
+            CHECK_SHAPE(dsink, num_heads);
+        } else {
+            dsink = torch::empty_like(learnable_sink);
+        }
+        dsink.zero_();
+        params.learnable_sink_ptr = learnable_sink.data_ptr();
+        params.dsink_ptr = dsink.data_ptr();
+    } else {
+        params.learnable_sink_ptr = nullptr;
+        params.dsink_ptr = nullptr;
+    }
 
     if (max_seqlen_q > 0) {
         launch(params, stream);
@@ -1254,7 +1284,16 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
         at::sum_out(dv, at::reshape(dv_expanded, {total_k, num_heads_k, num_heads / num_heads_k, head_size}), {2});
     }
 
-    return { dq, dk, dv, dsink, softmax_d };
+    if (learnable_sink_.has_value()) {
+        if (!dsink_.has_value()) {
+            dsink = dsink.to(learnable_sink_.value().dtype());
+        } else if (dsink_.value().dtype() != torch::kFloat32) {
+            dsink = dsink.to(dsink_.value().dtype());
+            dsink_.value().copy_(dsink);
+        }
+    }
+
+    return { dq, dk, dv, softmax_d, dsink };
 }
 
 std::vector<at::Tensor>
@@ -1270,7 +1309,6 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
                 std::optional<const at::Tensor> &leftpad_k_, // batch_size
                 std::optional<at::Tensor> &block_table_, // batch_size x max_num_blocks_per_seq
                 std::optional<at::Tensor> &alibi_slopes_, // num_heads or batch_size x num_heads
-                std::optional<at::Tensor> &learnable_sink_,   // num_heads
                 std::optional<at::Tensor> &out_,             // batch_size x seqlen_q x num_heads x head_size
                 const float softmax_scale,
                 bool is_causal,
@@ -1278,7 +1316,8 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
                 int window_size_right,
                 const float softcap,
                 bool is_rotary_interleaved,   // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
-                int num_splits
+                int num_splits,
+                std::optional<const at::Tensor> learnable_sink_
                 ) {
 
     // Otherwise the kernel will be launched from cuda:0 device
@@ -1509,7 +1548,18 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
 
 
     set_params_alibi(params, alibi_slopes_, batch_size, num_heads);
-    set_params_sink(params, learnable_sink_, num_heads);
+
+    at::Tensor learnable_sink;
+    if (learnable_sink_.has_value()) {
+        learnable_sink = learnable_sink_.value().to(torch::kFloat32);
+        TORCH_CHECK(params.alibi_slopes_ptr == nullptr, "Learnable sink and ALiBi slopes cannot be used together");
+        CHECK_DEVICE(learnable_sink); CHECK_CONTIGUOUS(learnable_sink);
+        TORCH_CHECK(learnable_sink.stride(-1) == 1, "Learnable sink tensor must have contiguous last dimension");
+        CHECK_SHAPE(learnable_sink, num_heads);
+        params.learnable_sink_ptr = learnable_sink.data_ptr();
+    } else {
+        params.learnable_sink_ptr = nullptr;
+    }
 
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     // Only split kernel supports appending to KV cache, or indexing to the cache with cache_batch_idx,

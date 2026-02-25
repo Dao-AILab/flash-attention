@@ -110,7 +110,7 @@ for causal in causal_vals:
             if "Flash2Sink" in methods:
                 qkv = torch.randn(batch_size, seqlen, 3, nheads, headdim,
                                   device=device, dtype=dtype, requires_grad=True)
-                sink = torch.randn((nheads,), dtype=torch.float32, device=device, requires_grad=True)
+                sink = torch.randn((nheads,), dtype=dtype, device=device, requires_grad=True)
                 f, b = time_fwd_bwd(
                     flash_attn_qkvpacked_func, qkv, dropout_p, causal=causal, learnable_sink=sink, repeats=repeats, verbose=False
                 )
