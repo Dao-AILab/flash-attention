@@ -19,7 +19,7 @@
 
 #include "kernel_common.hpp"
 #include "kernel_operator.h"
-#include "fai_tilingdata.h"
+#include "tilingdata.h"
 using namespace Catlass;
 using namespace KernelCommon;
 

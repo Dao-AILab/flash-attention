@@ -9,7 +9,7 @@
 #include "catlass/gemm_coord.hpp"
 #include "catlass/gemm/tile/tile_copy.hpp"
 #include "catlass/gemm/tile/tile_mmad.hpp"
-#include "fai_block.h"
+#include "fa_block.h"
 
 namespace Catlass::Gemm::Block {
 
