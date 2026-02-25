@@ -609,6 +609,7 @@ def _flash_attn_bwd(
         AtomLayoutNdKV = 2
         AtomLayoutMdQ = 1
         cluster_size = 1
+        use_2cta_instrs = False
         assert window_size_left is None and window_size_right is None, "local not supported yet on 9.x"
         is_varlen = (
             cu_seqlens_q is not None
