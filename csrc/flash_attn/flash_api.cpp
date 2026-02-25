@@ -386,8 +386,9 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
     at::cuda::CUDAGuard device_guard{q.device()};
 
     auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
-    bool is_sm7x_min = cc_major >= 7;
-    TORCH_CHECK(is_sm7x_min, "FlashAttention only supports Volta GPUs or newer.");
+    TORCH_CHECK(cc_major >= 8 || (cc_major == 7 && cc_minor == 0),
+        "FlashAttention supports Volta (SM70) and Ampere+ (SM80+) GPUs. "
+        "Turing (SM75) is not supported.");
     if (cc_major < 8) {
         TORCH_CHECK(q.dtype() == torch::kFloat16,
             "FlashAttention on Volta (V100) only supports FP16, not BF16.");
@@ -566,8 +567,9 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     at::cuda::CUDAGuard device_guard{q.device()};
 
     auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
-    bool is_sm7x_min = cc_major >= 7;
-    TORCH_CHECK(is_sm7x_min, "FlashAttention only supports Volta GPUs or newer.");
+    TORCH_CHECK(cc_major >= 8 || (cc_major == 7 && cc_minor == 0),
+        "FlashAttention supports Volta (SM70) and Ampere+ (SM80+) GPUs. "
+        "Turing (SM75) is not supported.");
     if (cc_major < 8) {
         TORCH_CHECK(q.dtype() == torch::kFloat16,
             "FlashAttention on Volta (V100) only supports FP16, not BF16.");
@@ -830,8 +832,9 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multipl
     at::cuda::CUDAGuard device_guard{q.device()};
 
     auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
-    bool is_sm7x_min = cc_major >= 7;
-    TORCH_CHECK(is_sm7x_min, "FlashAttention only supports Volta GPUs or newer.");
+    TORCH_CHECK(cc_major >= 8 || (cc_major == 7 && cc_minor == 0),
+        "FlashAttention supports Volta (SM70) and Ampere+ (SM80+) GPUs. "
+        "Turing (SM75) is not supported.");
     if (cc_major < 8) {
         TORCH_CHECK(q.dtype() == torch::kFloat16,
             "FlashAttention backward on Volta (V100) only supports FP16, not BF16.");
@@ -1047,8 +1050,9 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     at::cuda::CUDAGuard device_guard{q.device()};
 
     auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
-    bool is_sm7x_min = cc_major >= 7;
-    TORCH_CHECK(is_sm7x_min, "FlashAttention only supports Volta GPUs or newer.");
+    TORCH_CHECK(cc_major >= 8 || (cc_major == 7 && cc_minor == 0),
+        "FlashAttention supports Volta (SM70) and Ampere+ (SM80+) GPUs. "
+        "Turing (SM75) is not supported.");
     if (cc_major < 8) {
         TORCH_CHECK(q.dtype() == torch::kFloat16,
             "FlashAttention backward on Volta (V100) only supports FP16, not BF16.");
@@ -1274,8 +1278,9 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
     at::cuda::CUDAGuard device_guard{q.device()};
 
     auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
-    bool is_sm7x_min = cc_major >= 7;
-    TORCH_CHECK(is_sm7x_min, "FlashAttention only supports Volta GPUs or newer.");
+    TORCH_CHECK(cc_major >= 8 || (cc_major == 7 && cc_minor == 0),
+        "FlashAttention supports Volta (SM70) and Ampere+ (SM80+) GPUs. "
+        "Turing (SM75) is not supported.");
     if (cc_major < 8) {
         TORCH_CHECK(q.dtype() == torch::kFloat16,
             "FlashAttention on Volta (V100) only supports FP16, not BF16.");
