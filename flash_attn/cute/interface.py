@@ -836,6 +836,7 @@ def _flash_attn_bwd(
     compile_key_pre = (
         arch,
         dtype,
+        head_dim,
         head_dim_v,
         m_block_size,
         num_threads,
