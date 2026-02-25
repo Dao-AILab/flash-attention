@@ -91,6 +91,8 @@ class FlashAttentionBackwardSm100:
         )
         self.cta_group_size = 2 if self.use_2cta_instrs else 1
 
+        assert self.tile_hdim != 192 or self.use_2cta_instrs, "Must use 2CTA for hdim 192"
+
         # CTA tiler
         self.cta_tiler = (tile_n, tile_m, self.tile_hdim)
         # S = K @ Q.T
@@ -2398,14 +2400,12 @@ class FlashAttentionBackwardSm100:
                     # pipeline_S_P.sync_object_empty.wait(0, producer_phase_acc)
                     # pipeline_dP.sync_object_empty.wait(0, producer_phase_acc)
 
-                    for iter in cutlass.range(main_loop_iters, unroll=1):
+                    for _ in cutlass.range(main_loop_iters, unroll=1):
                         # 1) S.T = K @ Q.T
                         pipeline_Q.consumer_wait(consumer_state_Q)
                         pipeline_dQ.sync_object_empty.wait(
                             0, producer_phase_acc
                         )  # dQ tmem overlaps with S
-                        # if cute.arch.lane_idx() == 0:
-                        #     cute.printf("S=QK mma for iter = {}", iter)
                         mma_qk_fn(B_idx=consumer_state_Q.index)
                         pipeline_S_P.sync_object_full.arrive(
                             0, pipeline_S_P.producer_mask, cta_group
@@ -2420,8 +2420,6 @@ class FlashAttentionBackwardSm100:
                         pipeline_S_P.sync_object_empty.wait(
                             0, producer_phase_acc
                         )  # dP tmem overlaps with S
-                        # if cute.arch.lane_idx() == 0:
-                        #     cute.printf("dP=VdO mma for iter = {}", iter)
                         mma_dov_fn(B_idx=consumer_state_dO.index)
                         pipeline_dP.sync_object_full.arrive(0, pipeline_dP.producer_mask, cta_group)
                         pipeline_dO.consumer_release(consumer_state_dO)
@@ -2430,8 +2428,6 @@ class FlashAttentionBackwardSm100:
                         # 3) dK = dS.T @ Q
                         pipeline_Q.consumer_wait(consumer_state_Q)
                         pipeline_dP.sync_object_empty.wait(0, producer_phase_acc)  # dP -> dS
-                        # if cute.arch.lane_idx() == 0:
-                        #     cute.printf("dK=dSQ mma for iter = {}", iter)
                         mma_dsq_fn(B_idx=consumer_state_Q.index, zero_init=not accumulate_dK)
                         pipeline_Q.consumer_release(consumer_state_Q)
                         consumer_state_Q.advance()
@@ -2440,8 +2436,6 @@ class FlashAttentionBackwardSm100:
                         # 4) dV = P.T @ dO
                         # Note: if dS is written to tmem, P must be written to tmem
                         pipeline_dO.consumer_wait(consumer_state_dO)
-                        # if cute.arch.lane_idx() == 0:
-                        #     cute.printf("dV=PdO mma for iter = {}", iter)
                         mma_pdo_fn(B_idx=consumer_state_dO.index, zero_init=not accumulate_dV)
                         pipeline_dO.consumer_release(consumer_state_dO)
                         consumer_state_dO.advance()
@@ -2450,8 +2444,6 @@ class FlashAttentionBackwardSm100:
                         # 5) dQ = dS @ K
                         pipeline_dS.consumer_wait(consumer_state_dS)
                         cute.arch.mbarrier_wait(dS_cluster_leader_mbar_ptr, phase=dS_cluster_phase)
-                        # if cute.arch.lane_idx() == 0:
-                        #     cute.printf("dQ=dSK mma for iter = {}", iter)
                         mma_dsk_fn()
                         pipeline_dQ.sync_object_full.arrive(0, pipeline_dQ.producer_mask, cta_group)
                         pipeline_dS.consumer_release(consumer_state_dS)
@@ -2560,8 +2552,11 @@ class FlashAttentionBackwardSm100:
                                 0, pipeline_dP.producer_mask, cta_group
                             )
                         if const_expr(self.use_2cta_instrs):
+                            # cute.arch.mbarrier_wait(
+                            #     dS_cluster_full_mbar_ptr, phase=dS_cluster_phase
+                            # )
                             cute.arch.mbarrier_wait(
-                                dS_cluster_full_mbar_ptr, phase=dS_cluster_phase
+                                dS_cluster_leader_mbar_ptr, phase=dS_cluster_phase
                             )
                             dS_cluster_phase ^= 1
                             pipeline_dQ.sync_object_empty.wait(0, producer_phase_dQ)
@@ -2569,11 +2564,11 @@ class FlashAttentionBackwardSm100:
                         pipeline_dQ.sync_object_full.arrive(0, pipeline_dQ.producer_mask, cta_group)
                         if const_expr(self.use_2cta_instrs):
                             producer_phase_dQ ^= 1
-                            with cute.arch.elect_one():
-                                cute.arch.mbarrier_arrive(dS_cluster_empty_mbar_ptr)
-                                cute.arch.mbarrier_arrive(
-                                    dS_cluster_empty_mbar_ptr, cta_rank_in_cluster ^ 1
-                                )
+                            # with cute.arch.elect_one():
+                            #     cute.arch.mbarrier_arrive(dS_cluster_empty_mbar_ptr)
+                            #     cute.arch.mbarrier_arrive(
+                            #         dS_cluster_empty_mbar_ptr, cta_rank_in_cluster ^ 1
+                            #     )
                         pipeline_dS.consumer_release(consumer_state_dS)
                         consumer_state_dS.advance()
                         if const_expr(not self.use_2cta_instrs):
