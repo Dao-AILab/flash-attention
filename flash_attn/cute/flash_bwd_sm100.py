@@ -78,6 +78,9 @@ class FlashAttentionBackwardSm100:
         self.tile_m = tile_m
         self.tile_n = tile_n
 
+        assert self.tile_hdim <= 128 or (self.tile_hdim == 192 and self.tile_hdimv == 128)
+        assert self.tile_hdimv <= 128
+
         self.use_2cta_instrs = bool(
             use_2cta_instrs
             and cluster_size == 2
@@ -689,7 +692,7 @@ class FlashAttentionBackwardSm100:
         # TileScheduler = SingleTileScheduler
         if const_expr(self.is_varlen_k):
             TileScheduler = SingleTileVarlenScheduler
-        elif const_expr(self.deterministic):
+        elif const_expr(self.deterministic and not self.use_2cta_instrs):
             TileScheduler = SingleTileLPTBwdScheduler
         else:
             TileScheduler = SingleTileScheduler
@@ -718,7 +721,7 @@ class FlashAttentionBackwardSm100:
             element_size=self.k_dtype.width // 8,
             is_persistent=self.is_persistent,  # persistent mode not tested
             lpt=self.spt,
-            head_swizzle=self.deterministic,
+            head_swizzle=self.deterministic and not self.use_2cta_instrs,
         )
 
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
@@ -1640,7 +1643,6 @@ class FlashAttentionBackwardSm100:
                 seqlen, n_block // self.cluster_shape_mnk[0]
             )
             head_idx_kv = head_idx // self.qhead_per_kvhead
-            n_block_cta_group = n_block // self.cta_group_size
 
             process_tile = (
                 const_expr(not self.is_local and not self.is_varlen_q) or m_block_min < m_block_max
@@ -3405,10 +3407,9 @@ class FlashAttentionBackwardSm100:
         )
         while work_tile.is_valid_tile:
             n_block, head_idx, batch_idx, _ = work_tile.tile_idx
+            n_block_cta_group = n_block // self.cta_group_size  # for 2cta
             seqlen = SeqlenInfoCls(batch_idx)
-            m_block_min, m_block_max = block_info.get_m_block_min_max(
-                seqlen, n_block // self.cluster_shape_mnk[0]
-            )
+            m_block_min, m_block_max = block_info.get_m_block_min_max(seqlen, n_block_cta_group)
             if const_expr(not seqlen.has_cu_seqlens_q):
                 mdQaccum_cur = mdQaccum[None, head_idx, batch_idx]
             else:
@@ -3425,7 +3426,6 @@ class FlashAttentionBackwardSm100:
                 mdQ_semaphore_cur = mdQ_semaphore[None, None, head_idx, batch_idx]
 
             delay_semaphore_release = self.is_causal and not self.use_2cta_instrs
-            n_block_global_max = cute.ceil_div(seqlen.seqlen_k, self.tile_n)
 
             # some tiles might be empty due to block sparsity
             if const_expr(self.use_block_sparsity):
@@ -3497,25 +3497,17 @@ class FlashAttentionBackwardSm100:
                     # semaphore acquire
                     if const_expr(self.deterministic and stage == 0):
                         if const_expr(self.spt):
-                            if const_expr(
-                                self.is_causal or block_info.window_size_right is not None
-                            ):
-                                n_idx_right = (
-                                    (m_block + 1) * self.tile_m + seqlen.seqlen_k - seqlen.seqlen_q
-                                )
-                                if const_expr(block_info.window_size_right is not None):
-                                    n_idx_right += block_info.window_size_right
-                                n_block_max_for_m_block = min(
-                                    n_block_global_max,
-                                    cute.ceil_div(n_idx_right, self.tile_n),
-                                )
-                            else:
-                                n_block_max_for_m_block = n_block_global_max
-                            lock_value = n_block_max_for_m_block - 1 - n_block
+                            _, n_block_max_for_m_block = block_info.get_n_block_min_max(
+                                seqlen, m_block
+                            )
+                            lock_value = n_block_max_for_m_block - 1 - n_block_cta_group
                         else:
-                            lock_value = n_block
+                            lock_value = n_block_cta_group
                         barrier.wait_eq(
-                            mdQ_semaphore_cur[(m_block, None)].iterator, tidx, 0, lock_value
+                            mdQ_semaphore_cur[(m_block, None)].iterator,
+                            tidx,
+                            cta_rank_in_cluster,
+                            lock_value,
                         )
                     self.reduce_sync_barrier.arrive_and_wait()
                     # Copy from shared memory to global memory
@@ -3545,16 +3537,11 @@ class FlashAttentionBackwardSm100:
                     if const_expr(self.deterministic and stage == 0 and delay_semaphore_release):
                         if m_block > m_block_min:
                             barrier.arrive_inc(
-                                mdQ_semaphore_cur[(m_block - 1, None)].iterator, tidx, 0, 1
+                                mdQ_semaphore_cur[(m_block - 1, None)].iterator,
+                                tidx,
+                                cta_rank_in_cluster,
+                                1,
                             )
-
-                # semaphore release
-                # NOTE: arrive_inc calls red_release which issues membar
-                if const_expr(self.deterministic and not delay_semaphore_release):
-                    if is_tma_warp:
-                        cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
-                    self.reduce_sync_barrier.arrive_and_wait()
-                    barrier.arrive_inc(mdQ_semaphore_cur[m_block, None].iterator, tidx, 0, 1)
 
                 if const_expr(self.use_2cta_instrs):
                     if const_expr(self.sdQaccum_stage > 1):
@@ -3564,6 +3551,17 @@ class FlashAttentionBackwardSm100:
                     with cute.arch.elect_one():
                         cute.arch.mbarrier_arrive(dQaccum_empty_mbar_ptr)
 
+                # semaphore release
+                # NOTE: arrive_inc calls red_release which issues membar
+                if const_expr(self.deterministic and not delay_semaphore_release):
+                    if const_expr(self.sdQaccum_stage > 1 and not self.use_2cta_instrs):
+                        if is_tma_warp:
+                            cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
+                        self.reduce_sync_barrier.arrive_and_wait()
+                    barrier.arrive_inc(
+                        mdQ_semaphore_cur[m_block, None].iterator, tidx, cta_rank_in_cluster, 1
+                    )
+
             if const_expr(not self.is_local) or m_block_min < m_block_max:
                 if is_tma_warp:
                     cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
@@ -3571,7 +3569,10 @@ class FlashAttentionBackwardSm100:
                 # final semaphore release
                 if const_expr(self.deterministic and delay_semaphore_release):
                     barrier.arrive_inc(
-                        mdQ_semaphore_cur[(m_block_max - 1, None)].iterator, tidx, 0, 1
+                        mdQ_semaphore_cur[(m_block_max - 1, None)].iterator,
+                        tidx,
+                        cta_rank_in_cluster,
+                        1,
                     )
 
             if const_expr(
@@ -3579,7 +3580,9 @@ class FlashAttentionBackwardSm100:
             ):
                 m_block_global_max = cute.ceil_div(seqlen.seqlen_q, self.tile_m)
                 for m_block in cutlass.range(m_block_max, m_block_global_max, unroll=1):
-                    barrier.arrive_inc(mdQ_semaphore_cur[(m_block, None)].iterator, tidx, 0, 1)
+                    barrier.arrive_inc(
+                        mdQ_semaphore_cur[(m_block, None)].iterator, tidx, cta_rank_in_cluster, 1
+                    )
 
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()

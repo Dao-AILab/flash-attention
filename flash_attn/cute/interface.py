@@ -821,7 +821,7 @@ def _flash_attn_bwd(
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     if deterministic:
-        dQ_semaphore = torch.zeros(batch_size, num_head, seqlen_q_rounded // m_block_size, 1, dtype=torch.int32, device="cuda")
+        dQ_semaphore = torch.zeros(batch_size, num_head, seqlen_q_rounded // m_block_size, cluster_size, dtype=torch.int32, device="cuda")
     else:
         dQ_semaphore = None
 
