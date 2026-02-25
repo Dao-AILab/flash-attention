@@ -57,12 +57,13 @@ class BlockSparsityKernel:
         mCuSeqlensK: Optional[cute.Tensor] = None,
         mCuTotalMBlocks: Optional[cute.Tensor] = None,
         mCuTotalNBlocks: Optional[cute.Tensor] = None,
+        mSeqUsedQ: Optional[cute.Tensor] = None,
+        mSeqUsedK: Optional[cute.Tensor] = None,
         aux_tensors: Optional[list] = None,
     ):
         mask_cnt, mask_idx, full_cnt, full_idx = blocksparse_tensors
 
         self.is_varlen_q = const_expr(mCuSeqlensQ is not None)
-        self.is_varlen_k = const_expr(mCuSeqlensK is not None)
 
         if const_expr(self.compute_full_blocks):
             assert full_cnt is not None and full_idx is not None, (
@@ -100,6 +101,8 @@ class BlockSparsityKernel:
             batch_size,
             mCuSeqlensQ,
             mCuSeqlensK,
+            mSeqUsedQ,
+            mSeqUsedK,
             mCuTotalMBlocks,
             mCuTotalNBlocks,
             aux_tensors,
@@ -114,6 +117,8 @@ class BlockSparsityKernel:
         batch_size: Int32,
         mCuSeqlensQ: Optional[cute.Tensor] = None,
         mCuSeqlensK: Optional[cute.Tensor] = None,
+        mSeqUsedQ: Optional[cute.Tensor] = None,
+        mSeqUsedK: Optional[cute.Tensor] = None,
         mCuTotalMBlocks: Optional[cute.Tensor] = None,
         mCuTotalNBlocks: Optional[cute.Tensor] = None,
         aux_tensors: Optional[list] = None,
@@ -142,8 +147,8 @@ class BlockSparsityKernel:
             seqlen_k_static=seqlen_k,
             mCuSeqlensQ=mCuSeqlensQ,
             mCuSeqlensK=mCuSeqlensK,
-            mSeqUsedQ=None,
-            mSeqUsedK=None,
+            mSeqUsedQ=mSeqUsedQ,
+            mSeqUsedK=mSeqUsedK,
             mCuTotalMBlocks=mCuTotalMBlocks,
             mCuTotalNBlocks=mCuTotalNBlocks,
             tile_m=self.tile_mn[0],
@@ -323,7 +328,6 @@ class BlockSparsityKernel:
         if tidx == 0:
             mask_cnt, _, full_cnt, _ = blocksparse_tensors
             if const_expr(self.is_varlen_q):
-                global_m_block = seqlen.m_block_offset + m_block
                 mask_cnt[head_idx, global_m_block] = num_mask_blocks
                 if const_expr(self.compute_full_blocks):
                     full_cnt[head_idx, global_m_block] = num_full_blocks
@@ -345,11 +349,13 @@ def compute_block_sparsity(
     device,
     cu_seqlens_q: Optional[torch.Tensor] = None,
     cu_seqlens_k: Optional[torch.Tensor] = None,
+    seqused_q: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
     cu_total_m_blocks: Optional[torch.Tensor] = None,
     cu_total_n_blocks: Optional[torch.Tensor] = None,
     compute_full_blocks: bool = True,
     use_fast_sampling: bool = False,
-) -> Tuple[BlockSparseTensors, BlockSparseTensorsTorch]:
+) -> BlockSparseTensorsTorch:
     """
     Computes block sparsity for a given `mask_mod`.
 
@@ -365,13 +371,15 @@ def compute_block_sparsity(
         device: The device to use.
         cu_seqlens_q: Cumulative q sequence lengths for varlen
         cu_seqlens_k: Cumulative k sequence lengths for varlen
+        seqused_q: Per-batch effective q sequence lengths
+        seqused_k: Per-batch effective k sequence lengths
         cu_total_m_blocks: Cumulative total m blocks tensor for varlen q
         cu_total_n_blocks: Cumulative total n blocks tensor for varlen k
         compute_full_blocks: Whether to compute full blocks. If False, only partially-masked blocks are computed.
         use_fast_sampling: Whether to use 5-point sampling (4 corners + center). This is much faster, but only suitable for masks where this check is sufficient.
 
     Returns:
-        A tuple of `BlockSparseTensors` and `BlockSparseTensorsTorch`.
+        BlockSparseTensorsTorch
     """
     # Check if mask_mod is marked as suitable for 5-point sampling
     use_fast_sampling = getattr(mask_mod, "use_fast_sampling", use_fast_sampling)
@@ -386,6 +394,22 @@ def compute_block_sparsity(
         total_m_blocks = cu_total_m_blocks[-1].item()
         if cu_seqlens_k is not None:
             assert cu_total_n_blocks is not None, "total n blocks must be provided when varlen k"
+            total_n_blocks = cu_total_n_blocks[-1].item()
+        elif seqused_k is not None and cu_total_n_blocks is None:
+            # Mode G: varlen_q + paged k (seqused_k varies per batch).
+            # Compute cu_total_n_blocks from seqused_k on the Python side.
+            cu_total_n_blocks_list = [0]
+            for batch_idx in range(batch_size):
+                batch_seqlen_q = cu_seqlens_q[batch_idx + 1].item() - cu_seqlens_q[batch_idx].item()
+                batch_seqlen_k = seqused_k[batch_idx].item()
+                num_m_blocks_batch = (batch_seqlen_q + tile_m - 1) // tile_m
+                num_n_blocks_batch = (batch_seqlen_k + tile_n - 1) // tile_n
+                cu_total_n_blocks_list.append(
+                    cu_total_n_blocks_list[-1] + num_m_blocks_batch * num_n_blocks_batch
+                )
+            cu_total_n_blocks = torch.tensor(
+                cu_total_n_blocks_list, dtype=torch.int32, device=device
+            )
             total_n_blocks = cu_total_n_blocks[-1].item()
         else:
             total_n_blocks = total_m_blocks * num_n_blocks
@@ -449,7 +473,9 @@ def compute_block_sparsity(
         aux_tensor_metadata,
         compute_full_blocks,
         is_varlen_q,
-        cu_seqlens_k is not None,
+        cu_seqlens_k is None,
+        seqused_q is None,
+        seqused_k is None,
         aux_tensors is not None,
         use_fast_sampling,
     )
@@ -459,9 +485,11 @@ def compute_block_sparsity(
             cu_seqlens_k_tensor,
             cu_total_m_blocks_tensor,
             cu_total_n_blocks_tensor,
+            seqused_q_tensor,
+            seqused_k_tensor,
         ) = [
             to_cute_tensor(t, assumed_align=4, leading_dim=0) if t is not None else None
-            for t in (cu_seqlens_q, cu_seqlens_k, cu_total_m_blocks, cu_total_n_blocks)
+            for t in (cu_seqlens_q, cu_seqlens_k, cu_total_m_blocks, cu_total_n_blocks, seqused_q, seqused_k)
         ]
         blocksparse_tensors = to_cute_block_sparse_tensors(
             blocksparse_tensors_torch, enable_tvm_ffi=True
@@ -483,6 +511,8 @@ def compute_block_sparsity(
             cu_seqlens_k_tensor,
             cu_total_m_blocks_tensor,
             cu_total_n_blocks_tensor,
+            seqused_q_tensor,
+            seqused_k_tensor,
             aux_tensors,
             options="--enable-tvm-ffi",
         )
@@ -495,6 +525,8 @@ def compute_block_sparsity(
         cu_seqlens_k,
         cu_total_m_blocks,
         cu_total_n_blocks,
+        seqused_q,
+        seqused_k,
         aux_tensors,
     )
 

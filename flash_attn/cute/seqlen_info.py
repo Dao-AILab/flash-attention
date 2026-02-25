@@ -93,8 +93,11 @@ class SeqlenInfoQK:
                 else mCuSeqlensK[batch_idx + 1] - offset_k
             )
         m_block_offset = 0 if const_expr(mCuTotalMBlocks is None) else mCuTotalMBlocks[batch_idx]
-        n_block_offset = 0 if const_expr(mCuTotalNBlocks is None) else mCuTotalNBlocks[batch_idx]
         num_n_blocks = (seqlen_k + tile_n - 1) // tile_n
+        if const_expr(mCuTotalNBlocks is not None):
+            n_block_offset = mCuTotalNBlocks[batch_idx]
+        else:
+            n_block_offset = m_block_offset * num_n_blocks
         has_cu_seqlens_q: int = mCuSeqlensQ is not None
         has_cu_seqlens_k: int = mCuSeqlensK is not None
         has_seqused_q: int = mSeqUsedQ is not None

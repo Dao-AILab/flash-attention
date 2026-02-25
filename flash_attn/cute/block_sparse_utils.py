@@ -722,17 +722,24 @@ def get_total_block_count(
     m_block,
     qhead_per_kvhead: cutlass.Constexpr,
     q_subtile_factor: cutlass.Constexpr,
+    seqlen_info: SeqlenInfoQK,
 ):
     m_block_sparse = sparse_tensor_m_block(m_block, qhead_per_kvhead, q_subtile_factor)
+    mask_block_cnt, _, full_block_cnt, _ = blocksparse_tensors
 
-    mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx = blocksparse_tensors
-    if const_expr(full_block_cnt is not None):
-        return (
-            mask_block_cnt[batch_idx, head_idx, m_block_sparse]
-            + full_block_cnt[batch_idx, head_idx, m_block_sparse]
-        )
+    if const_expr(len(mask_block_cnt.shape) == 2):
+        # varlen path: tensors are [num_heads, total_m_block]
+        curr_m = seqlen_info.m_block_offset + m_block_sparse
+        total = mask_block_cnt[head_idx, curr_m]
+        if const_expr(full_block_cnt is not None):
+            total += full_block_cnt[head_idx, curr_m]
     else:
-        return mask_block_cnt[batch_idx, head_idx, m_block_sparse]
+        # non-varlen: tensors are [batch, num_heads, m_block]
+        total = mask_block_cnt[batch_idx, head_idx, m_block_sparse]
+        if const_expr(full_block_cnt is not None):
+            total += full_block_cnt[batch_idx, head_idx, m_block_sparse]
+
+    return total
 
 
 @cute.jit

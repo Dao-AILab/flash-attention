@@ -1408,6 +1408,7 @@ class FlashAttentionForwardSm100:
                     m_block,
                     self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
                     self.q_subtile_factor if self.q_subtile_factor is not None else 1,
+                    seqlen_info=seqlen,
                 )
                 process_tile = block_iter_count > Int32(0)
             else:
@@ -1716,6 +1717,7 @@ class FlashAttentionForwardSm100:
                     m_block,
                     self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
                     self.q_subtile_factor if self.q_subtile_factor is not None else 1,
+                    seqlen_info=seqlen,
                 )
                 has_work = tile_block_count > Int32(0)
             else:
@@ -2102,6 +2104,7 @@ class FlashAttentionForwardSm100:
                     m_block,
                     self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
                     self.q_subtile_factor if self.q_subtile_factor is not None else 1,
+                    seqlen_info=seqlen,
                 )
                 has_work = total_block_count > Int32(0)
             else:

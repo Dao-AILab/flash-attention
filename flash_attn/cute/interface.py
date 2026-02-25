@@ -57,6 +57,7 @@ from flash_attn.cute.block_sparsity import (
     to_cute_block_sparse_tensors,
     normalize_block_sparse_config,
     normalize_block_sparse_config_bwd,
+    get_block_sparse_broadcast_pattern,
 )
 
 @lru_cache(maxsize=None)
@@ -341,7 +342,8 @@ def _flash_attn_fwd(
 
     if use_block_sparsity:
         # NB: pack_gqa requires block sparse head dim == 1 (broadcasted)
-        if pack_gqa and block_sparse_tensors.mask_block_cnt.shape[1] != 1:
+        head_dim_idx = 0 if block_sparse_tensors.mask_block_cnt.ndim == 2 else 1
+        if pack_gqa and block_sparse_tensors.mask_block_cnt.shape[head_dim_idx] != 1:
             pack_gqa = False
         if is_split_kv:
             raise NotImplementedError(
@@ -349,19 +351,36 @@ def _flash_attn_fwd(
             )
         if cu_seqlens_q is not None:
             assert cu_total_m_blocks is not None, "Varlen block sparsity requires cu_total_m_blocks."
-        if seqused_q is not None or seqused_k is not None:
-            raise NotImplementedError(
-                "Varlen block sparsity is not supported with seqused q or k."
-            )
 
     # See get_broadcast_dims for why this is needed in compile key
     block_sparse_broadcast_pattern = None
     normalized_block_sparse_tensors = None
     q_subtile_factor = None
     if block_sparse_tensors is not None:
-        # TODO: plumb up for varlen blocksparsity
         if cu_seqlens_q is not None:
-            normalized_block_sparse_tensors = block_sparse_tensors
+            cnt = block_sparse_tensors.mask_block_cnt
+            if cnt.ndim != 2:
+                raise ValueError("Varlen block sparse tensors must be 2D [H, total_m].")
+            if cnt.shape[0] not in (1, num_head):
+                raise ValueError(
+                    f"Varlen block sparse head dim must be 1 or {num_head}, got {cnt.shape[0]}."
+                )
+            if cnt.shape[0] == 1 and num_head > 1:
+                # Expand head-1 tensors to (num_head, ...) with stride-0 head dim so
+                # get_broadcast_dims correctly detects the broadcast.
+                def _expand_head(t):
+                    return t.expand(num_head, -1) if t is not None else None
+                normalized_block_sparse_tensors = BlockSparseTensorsTorch(
+                    mask_block_cnt=_expand_head(block_sparse_tensors.mask_block_cnt),
+                    mask_block_idx=_expand_head(block_sparse_tensors.mask_block_idx),
+                    full_block_cnt=_expand_head(block_sparse_tensors.full_block_cnt),
+                    full_block_idx=_expand_head(block_sparse_tensors.full_block_idx),
+                    block_size=block_sparse_tensors.block_size,
+                )
+            else:
+                normalized_block_sparse_tensors = block_sparse_tensors
+            q_subtile_factor = 1
+            block_sparse_broadcast_pattern = get_block_sparse_broadcast_pattern(normalized_block_sparse_tensors)
         else:
             (
                 normalized_block_sparse_tensors,
@@ -401,6 +420,8 @@ def _flash_attn_fwd(
         window_size_left is not None,
         window_size_right is not None,
         learnable_sink is not None,
+        cu_total_m_blocks is None,
+        cu_total_n_blocks is None,
         m_block_size,
         n_block_size,
         q_stage,
@@ -522,8 +543,8 @@ def _flash_attn_fwd(
             window_size_right,
             learnable_sink_tensor,
             sparse_tensors,
-            None,
-            None,
+            cu_total_m_blocks_tensor,
+            cu_total_n_blocks_tensor,
             cute_aux_tensors,
             options="--enable-tvm-ffi",
         )
@@ -545,8 +566,8 @@ def _flash_attn_fwd(
         window_size_right,
         learnable_sink,
         normalized_block_sparse_tensors[:4] if normalized_block_sparse_tensors is not None else None,
-        None,
-        None,
+        cu_total_m_blocks,
+        cu_total_n_blocks,
         aux_tensors,
     )
     if is_split_kv:
