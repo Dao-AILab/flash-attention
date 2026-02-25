@@ -24,6 +24,16 @@ from score_mod_definitions import (
     score_mod_dual_buffer as score_mod_11,
 )  # isort: split
 from score_mod_definitions import (
+    score_mod_identity_vectorized as score_mod_1_vectorized,
+    score_mod_causal_vectorized as score_mod_2_vectorized,
+    score_mod_rel_bias as score_mod_3_vectorized,
+    score_mod_rel_bias_x2_vectorized as score_mod_4_vectorized,
+    score_mod_times_two_vectorized as score_mod_5_vectorized,
+    score_mod_alibi_vectorized as score_mod_6_vectorized,
+    score_mod_batch_bias_vectorized as score_mod_10_vectorized,
+    score_mod_dual_buffer_vectorized as score_mod_11_vectorized,
+)  # isort: split
+from score_mod_definitions import (
     # Eager (torch) reference score mods
     identity_eager,
     causal_eager as causal_mask_eager,
@@ -59,6 +69,21 @@ TEST_PAIRS_WITH_AUX_TENSORS = [
     (score_mod_11, dual_buffer_bias),
 ]
 
+# Test pairs to compare vectorized score_mods: (cute_jit_function, cute_jit_function_vectorized)
+TEST_PAIRS_VECTORIZED = [
+    (score_mod_1, score_mod_1_vectorized),
+    (score_mod_2, score_mod_2_vectorized),
+    (score_mod_3, score_mod_3_vectorized),
+    (score_mod_4, score_mod_4_vectorized),
+    (score_mod_5, score_mod_5_vectorized),
+    (score_mod_6, score_mod_6_vectorized),
+]
+
+TEST_PAIRS_WITH_AUX_TENSORS_VECTORIZED = [
+    (score_mod_10, score_mod_10_vectorized),
+    (score_mod_11, score_mod_11_vectorized),
+]
+
 SEQLEN_CONFIGS = [
     (1, 1),
     (64, 128),
@@ -82,6 +107,8 @@ SEQLEN_CONFIGS = [
     (4224, 4224),
 ]
 
+VEC_SIZES_TO_CHECK_EQUALITY = [1, 4]
+
 
 def create_tensors(
     batch_size=2, num_heads=4, seqlen_q=64, seqlen_kv=64, dim=128, dtype=torch.bfloat16
@@ -92,12 +119,8 @@ def create_tensors(
     return q, k, v
 
 
-def run_cute_flash(
-    q, k, v, cute_score_mod, aux_tensors=None, pack_gqa=False
-) -> torch.Tensor:
-    q_transposed, k_transposed, v_transposed = map(
-        lambda x: x.transpose(1, 2), (q, k, v)
-    )
+def run_cute_flash(q, k, v, cute_score_mod, aux_tensors=None, pack_gqa=False) -> torch.Tensor:
+    q_transposed, k_transposed, v_transposed = map(lambda x: x.transpose(1, 2), (q, k, v))
     out = torch.empty_like(q_transposed)
     _flash_attn_fwd(
         q_transposed,
@@ -116,9 +139,7 @@ def run_cute_flash(
 def run_flex_reference(q, k, v, eager_score_mod, dtype=None) -> torch.Tensor:
     if dtype is not None:
         q, k, v = q.to(dtype), k.to(dtype), v.to(dtype)
-    return flex_attention(
-        q, k, v, score_mod=eager_score_mod, enable_gqa=q.shape[1] != k.shape[1]
-    )
+    return flex_attention(q, k, v, score_mod=eager_score_mod, enable_gqa=q.shape[1] != k.shape[1])
 
 
 @pytest.mark.parametrize("seqlen_q,seqlen_kv", SEQLEN_CONFIGS)
@@ -177,6 +198,40 @@ def test_cute_vs_flex_attention(
 @pytest.mark.parametrize("seqlen_q,seqlen_kv", SEQLEN_CONFIGS)
 @pytest.mark.parametrize("qhead_per_kvhead,num_kv_heads", [(1, 1), (4, 2)])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("score_mod_vec_pair", TEST_PAIRS_VECTORIZED)
+def test_cute_score_mod_vectorized(
+    seqlen_q,
+    seqlen_kv,
+    qhead_per_kvhead,
+    num_kv_heads,
+    dtype,
+    score_mod_vec_pair,
+):
+    """Tests equality between original and vectorized versions of score mods"""
+    torch.random.manual_seed(42)
+    cute_score_mod, cute_vectorized_score_mod = score_mod_vec_pair
+
+    num_q_heads = num_kv_heads * qhead_per_kvhead
+    pack_gqa = qhead_per_kvhead > 1
+    q, k, v = create_tensors(
+        seqlen_q=seqlen_q, seqlen_kv=seqlen_kv, num_heads=num_q_heads, dtype=dtype
+    )
+    if pack_gqa:
+        k = k[:, :num_kv_heads, :, :].clone()
+        v = v[:, :num_kv_heads, :, :].clone()
+
+    out_ref = run_cute_flash(q, k, v, cute_score_mod, pack_gqa=pack_gqa)
+
+    for vec_size in VEC_SIZES_TO_CHECK_EQUALITY:
+        cute_vectorized_score_mod.__vec_size__ = vec_size
+        out = run_cute_flash(q, k, v, cute_vectorized_score_mod, pack_gqa=pack_gqa)
+
+        assert torch.equal(out, out_ref)
+
+
+@pytest.mark.parametrize("seqlen_q,seqlen_kv", SEQLEN_CONFIGS)
+@pytest.mark.parametrize("qhead_per_kvhead,num_kv_heads", [(1, 1), (4, 2)])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("score_mod_pair", TEST_PAIRS_WITH_AUX_TENSORS)
 def test_cute_vs_flex_attention_with_aux_tensors(
     seqlen_q, seqlen_kv, qhead_per_kvhead, num_kv_heads, dtype, score_mod_pair
@@ -214,9 +269,7 @@ def test_cute_vs_flex_attention_with_aux_tensors(
     out_ref_fp32 = run_flex_reference(q, k, v, eager_score_mod, dtype=torch.float32)
 
     out_pt = run_flex_reference(q, k, v, eager_score_mod)
-    out_cute = run_cute_flash(
-        q, k, v, cute_score_mod, aux_tensors=aux_tensors, pack_gqa=pack_gqa
-    )
+    out_cute = run_cute_flash(q, k, v, cute_score_mod, aux_tensors=aux_tensors, pack_gqa=pack_gqa)
 
     # Basic shape and NaN checks
     assert out_cute.shape == out_ref_fp32.shape == out_pt.shape
@@ -247,19 +300,61 @@ def test_cute_vs_flex_attention_with_aux_tensors(
     )
 
 
-def _generate_block_kvcache(
-    seqlen_k, page_size, batch_size, nheads_k, d, device, dtype
+@pytest.mark.parametrize("seqlen_q,seqlen_kv", SEQLEN_CONFIGS)
+@pytest.mark.parametrize("qhead_per_kvhead,num_kv_heads", [(1, 1), (4, 2)])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("score_mod_vec_pair", TEST_PAIRS_WITH_AUX_TENSORS_VECTORIZED)
+def test_cute_score_mod_with_aux_tensors_vectorized(
+    seqlen_q,
+    seqlen_kv,
+    qhead_per_kvhead,
+    num_kv_heads,
+    dtype,
+    score_mod_vec_pair,
 ):
+    """Tests equality between original and vectorized versions of score mods"""
+    torch.random.manual_seed(42)
+    cute_score_mod, cute_vectorized_score_mod = score_mod_vec_pair
+    batch_size = 2
+
+    num_q_heads = num_kv_heads * qhead_per_kvhead
+    pack_gqa = qhead_per_kvhead > 1
+    q, k, v = create_tensors(
+        seqlen_q=seqlen_q, seqlen_kv=seqlen_kv, num_heads=num_q_heads, dtype=dtype
+    )
+    if pack_gqa:
+        k = k[:, :num_kv_heads, :, :].clone()
+        v = v[:, :num_kv_heads, :, :].clone()
+
+    if cute_score_mod == score_mod_10:
+        buffer = torch.randn(batch_size, device="cuda", dtype=dtype) * 0.1
+        aux_tensors = [buffer]
+        assert buffer.shape == (batch_size,)
+    elif cute_score_mod == score_mod_11:
+        head_bias = torch.randn(num_q_heads, device="cuda", dtype=dtype) * 0.2
+        pos_scale = torch.arange(seqlen_q, device="cuda", dtype=dtype) * 0.01
+        aux_tensors = [head_bias, pos_scale]
+        assert head_bias.shape == (num_q_heads,)
+        assert pos_scale.shape == (seqlen_q,)
+
+    out_ref = run_cute_flash(q, k, v, cute_score_mod, aux_tensors=aux_tensors, pack_gqa=pack_gqa)
+
+    for vec_size in VEC_SIZES_TO_CHECK_EQUALITY:
+        cute_vectorized_score_mod.__vec_size__ = vec_size
+        out = run_cute_flash(
+            q, k, v, cute_vectorized_score_mod, aux_tensors=aux_tensors, pack_gqa=pack_gqa
+        )
+
+        assert torch.equal(out, out_ref)
+
+
+def _generate_block_kvcache(seqlen_k, page_size, batch_size, nheads_k, d, device, dtype):
     import math
     from einops import rearrange
 
     num_blocks = math.ceil(seqlen_k / page_size) * batch_size * 3
-    k_cache_paged = torch.randn(
-        num_blocks, page_size, nheads_k, d, device=device, dtype=dtype
-    )
-    v_cache_paged = torch.randn(
-        num_blocks, page_size, nheads_k, d, device=device, dtype=dtype
-    )
+    k_cache_paged = torch.randn(num_blocks, page_size, nheads_k, d, device=device, dtype=dtype)
+    v_cache_paged = torch.randn(num_blocks, page_size, nheads_k, d, device=device, dtype=dtype)
     page_table = rearrange(
         torch.randperm(num_blocks, dtype=torch.int32, device=device),
         "(b nblocks) -> b nblocks",
@@ -321,12 +416,8 @@ def test_score_mod_with_paged_kvcache(
     q = torch.randn(batch_size, num_q_heads, seqlen_q, dim, device=device, dtype=dtype)
 
     if page_size is None:
-        k_cache = torch.randn(
-            batch_size, num_kv_heads, seqlen_kv, dim, device=device, dtype=dtype
-        )
-        v_cache = torch.randn(
-            batch_size, num_kv_heads, seqlen_kv, dim, device=device, dtype=dtype
-        )
+        k_cache = torch.randn(batch_size, num_kv_heads, seqlen_kv, dim, device=device, dtype=dtype)
+        v_cache = torch.randn(batch_size, num_kv_heads, seqlen_kv, dim, device=device, dtype=dtype)
         page_table = None
         k_cache_paged = None
         v_cache_paged = None
@@ -342,9 +433,7 @@ def test_score_mod_with_paged_kvcache(
             seqlen_kv, page_size, batch_size, num_kv_heads, dim, device, dtype
         )
 
-    cache_seqlens = torch.randint(
-        1, seqlen_kv + 1, (batch_size,), dtype=torch.int32, device=device
-    )
+    cache_seqlens = torch.randint(1, seqlen_kv + 1, (batch_size,), dtype=torch.int32, device=device)
 
     from einops import rearrange
 
@@ -426,9 +515,7 @@ def test_score_mod_with_paged_kvcache(
     pt_error = (out_pt - out_ref_fp32).abs().max().item()
     cute_error = (out_cute - out_ref_fp32).abs().max().item()
 
-    print(
-        f"\nNumerical comparison for {cute_score_mod.__name__} (paged={page_size is not None}):"
-    )
+    print(f"\nNumerical comparison for {cute_score_mod.__name__} (paged={page_size is not None}):")
     print(f"  PyTorch vs FP32 ref max error: {pt_error:.2e}")
     print(f"  CuTE vs FP32 ref max error: {cute_error:.2e}")
     print(f"  Dynamic absolute tolerance: {fwd_atol:.2e}")
@@ -478,12 +565,8 @@ def test_score_mod_with_paged_kvcache_aux_tensors(
     q = torch.randn(batch_size, num_q_heads, seqlen_q, dim, device=device, dtype=dtype)
 
     if page_size is None:
-        k_cache = torch.randn(
-            batch_size, num_kv_heads, seqlen_kv, dim, device=device, dtype=dtype
-        )
-        v_cache = torch.randn(
-            batch_size, num_kv_heads, seqlen_kv, dim, device=device, dtype=dtype
-        )
+        k_cache = torch.randn(batch_size, num_kv_heads, seqlen_kv, dim, device=device, dtype=dtype)
+        v_cache = torch.randn(batch_size, num_kv_heads, seqlen_kv, dim, device=device, dtype=dtype)
         page_table = None
         k_cache_paged = None
         v_cache_paged = None
@@ -499,9 +582,7 @@ def test_score_mod_with_paged_kvcache_aux_tensors(
             seqlen_kv, page_size, batch_size, num_kv_heads, dim, device, dtype
         )
 
-    cache_seqlens = torch.randint(
-        1, seqlen_kv + 1, (batch_size,), dtype=torch.int32, device=device
-    )
+    cache_seqlens = torch.randint(1, seqlen_kv + 1, (batch_size,), dtype=torch.int32, device=device)
 
     if cute_score_mod == score_mod_10:
         buffer = torch.randn(batch_size, device=device, dtype=dtype) * 0.1
@@ -595,9 +676,7 @@ def test_score_mod_with_paged_kvcache_aux_tensors(
     pt_error = (out_pt - out_ref_fp32).abs().max().item()
     cute_error = (out_cute - out_ref_fp32).abs().max().item()
 
-    print(
-        f"\nNumerical comparison for {cute_score_mod.__name__} (paged={page_size is not None}):"
-    )
+    print(f"\nNumerical comparison for {cute_score_mod.__name__} (paged={page_size is not None}):")
     print(f"  PyTorch vs FP32 ref max error: {pt_error:.2e}")
     print(f"  CuTE vs FP32 ref max error: {cute_error:.2e}")
     print(f"  Dynamic absolute tolerance: {fwd_atol:.2e}")
@@ -628,7 +707,7 @@ def score_mod_bwd_identity(grad, score, b_idx, h_idx, q_idx, kv_idx, seqlen_info
 @cute.jit
 def score_mod_bwd_causal(grad, score, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
     """Backward for causal masking: d(where(mask, score, -inf))/d(score) = where(mask, 1, 0).
-    
+
     At unmasked positions (q_idx >= kv_idx), grad passes through.
     At masked positions (q_idx < kv_idx), the kernel already zeros grad because P=0.
     """
@@ -678,7 +757,9 @@ def run_cute_flash_bwd(
     v_t = v.transpose(1, 2)
 
     out, lse = _flash_attn_fwd(
-        q_t, k_t, v_t,
+        q_t,
+        k_t,
+        v_t,
         return_lse=True,
         score_mod=cute_score_mod,
         aux_tensors=aux_tensors,
@@ -688,8 +769,12 @@ def run_cute_flash_bwd(
     grad_out = torch.randn_like(out)
 
     dq, dk, dv = _flash_attn_bwd(
-        q_t, k_t, v_t,
-        out, grad_out, lse,
+        q_t,
+        k_t,
+        v_t,
+        out,
+        grad_out,
+        lse,
         score_mod=cute_score_mod,
         score_mod_bwd=cute_score_mod_bwd,
         aux_tensors=aux_tensors,
@@ -718,9 +803,7 @@ def run_flex_reference_bwd(q, k, v, eager_score_mod, grad_out, dtype=None):
         v = v.requires_grad_(True)
 
     compiled_flex = torch.compile(flex_attention)
-    out = compiled_flex(
-        q, k, v, score_mod=eager_score_mod, enable_gqa=q.shape[1] != k.shape[1]
-    )
+    out = compiled_flex(q, k, v, score_mod=eager_score_mod, enable_gqa=q.shape[1] != k.shape[1])
     dq, dk, dv = torch.autograd.grad(out, (q, k, v), grad_out)
 
     return out, dq, dk, dv
@@ -755,15 +838,11 @@ def test_cute_vs_flex_attention_backward(seqlen_q, seqlen_kv, dim, dtype, score_
         seqlen_q=seqlen_q, seqlen_kv=seqlen_kv, num_heads=4, dim=dim, dtype=dtype
     )
 
-    out_cute, grad_out, dq_cute, dk_cute, dv_cute = run_cute_flash_bwd(
-        q, k, v, cute_fwd, cute_bwd
-    )
+    out_cute, grad_out, dq_cute, dk_cute, dv_cute = run_cute_flash_bwd(q, k, v, cute_fwd, cute_bwd)
     out_ref_fp32, dq_ref_fp32, dk_ref_fp32, dv_ref_fp32 = run_flex_reference_bwd(
         q, k, v, eager_ref, grad_out, dtype=torch.float32
     )
-    out_pt, dq_pt, dk_pt, dv_pt = run_flex_reference_bwd(
-        q, k, v, eager_ref, grad_out
-    )
+    out_pt, dq_pt, dk_pt, dv_pt = run_flex_reference_bwd(q, k, v, eager_ref, grad_out)
 
     assert not torch.isnan(dq_cute).any(), "dQ contains NaN"
     assert not torch.isnan(dk_cute).any(), "dK contains NaN"
@@ -839,9 +918,7 @@ def test_cute_vs_flex_attention_backward_with_aux(
     out_ref_fp32, dq_ref_fp32, dk_ref_fp32, dv_ref_fp32 = run_flex_reference_bwd(
         q, k, v, eager_ref, grad_out, dtype=torch.float32
     )
-    out_pt, dq_pt, dk_pt, dv_pt = run_flex_reference_bwd(
-        q, k, v, eager_ref, grad_out
-    )
+    out_pt, dq_pt, dk_pt, dv_pt = run_flex_reference_bwd(q, k, v, eager_ref, grad_out)
 
     assert not torch.isnan(dq_cute).any()
     assert not torch.isnan(dk_cute).any()
@@ -901,9 +978,7 @@ def test_cute_vs_flex_attention_backward_pack_gqa(
     out_ref_fp32, dq_ref_fp32, dk_ref_fp32, dv_ref_fp32 = run_flex_reference_bwd(
         q, k, v, eager_ref, grad_out, dtype=torch.float32
     )
-    out_pt, dq_pt, dk_pt, dv_pt = run_flex_reference_bwd(
-        q, k, v, eager_ref, grad_out
-    )
+    out_pt, dq_pt, dk_pt, dv_pt = run_flex_reference_bwd(q, k, v, eager_ref, grad_out)
 
     assert not torch.isnan(dq_cute).any()
     assert not torch.isnan(dk_cute).any()

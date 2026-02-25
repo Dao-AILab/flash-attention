@@ -4,6 +4,7 @@
 import cutlass
 import cutlass.cute as cute
 
+from quack import layout_utils
 import flash_attn.cute.utils as utils
 
 
@@ -98,7 +99,7 @@ class PackGQA:
         thr_mma = tiled_mma.get_slice(tidx)
         caccO = cute.make_identity_tensor((self.m_block_size, self.head_dim_padded))
         taccOcO = thr_mma.partition_C(caccO)
-        taccOcO_row = utils.make_acc_tensor_mn_view(taccOcO)[None, 0]
+        taccOcO_row = layout_utils.reshape_acc_to_mn(taccOcO)[None, 0]
         assert cute.size(tLSErLSE) == cute.size(taccOcO_row)
         threads_per_row = tiled_mma.tv_layout_C.shape[0][0]
         assert cute.arch.WARP_SIZE % threads_per_row == 0, "threads_per_row must divide WARP_SIZE"

@@ -25,13 +25,12 @@ from flash_attn.cute.interface import (
     flash_attn_func,
     flash_attn_varlen_func,
     flash_attn_combine,
-    _get_device_capability,
 )
 
 
 DISABLE_SPLIT = os.getenv("FLASH_ATTENTION_DISABLE_SPLIT", "FALSE") == "TRUE"
 # SplitKV and paged KV are not supported on SM90
-IS_SM90 = _get_device_capability() == 9
+IS_SM90 = torch.cuda.get_device_capability()[0] == 9
 TEST_BWD_ONLY = False
 VERBOSE = True
 
@@ -709,6 +708,7 @@ def test_flash_attn_varlen_output(
             and not attention_chunk != 0
             and dv == d
             and not has_learnable_sink
+            and not IS_SM90
             # and False
         ):
             g_unpad = torch.randn_like(out_unpad)

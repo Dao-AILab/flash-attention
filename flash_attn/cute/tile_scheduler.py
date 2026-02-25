@@ -1,7 +1,7 @@
 # Copyright (c) 2025, Tri Dao.
 
 from typing import Optional, Tuple
-from dataclasses import dataclass, fields
+from dataclasses import dataclass
 
 try:
     from typing import override
@@ -12,10 +12,12 @@ import cutlass
 from cutlass._mlir import ir
 import cutlass.cute as cute
 from cutlass import Int32, const_expr
+from cutlass.cute import FastDivmodDivisor
+
+from quack.cute_dsl_utils import ParamsBase
 
 import flash_attn.cute.utils as utils
 from flash_attn.cute.fast_math import clz
-from cutlass.cute import FastDivmodDivisor
 
 
 class WorkTileInfo(cutlass.utils.WorkTileInfo):
@@ -27,30 +29,6 @@ class WorkTileInfo(cutlass.utils.WorkTileInfo):
         new_tile_idx = cutlass.new_from_mlir_values(self._tile_idx, values[:-1])
         new_is_valid_tile = cutlass.new_from_mlir_values(self._is_valid_tile, [values[-1]])
         return WorkTileInfo(new_tile_idx, new_is_valid_tile)
-
-
-@dataclass
-class ParamsBase:
-    def __extract_mlir_values__(self):
-        all_fields = [getattr(self, field.name) for field in fields(self)]
-        non_constexpr_fields = [f for f in all_fields if not isinstance(f, cutlass.Constexpr)]
-        values, self._values_pos = [], []
-        for obj in non_constexpr_fields:
-            obj_values = cutlass.extract_mlir_values(obj)
-            values += obj_values
-            self._values_pos.append(len(obj_values))
-        return values
-
-    def __new_from_mlir_values__(self, values):
-        all_fields = {field.name: getattr(self, field.name) for field in fields(self)}
-        constexpr_fields = {n: f for n, f in all_fields.items() if isinstance(f, cutlass.Constexpr)}
-        non_constexpr_fields = {
-            n: f for n, f in all_fields.items() if not isinstance(f, cutlass.Constexpr)
-        }
-        for (name, field), n_items in zip(non_constexpr_fields.items(), self._values_pos):
-            non_constexpr_fields[name] = cutlass.new_from_mlir_values(field, values[:n_items])
-            values = values[n_items:]
-        return self.__class__(**non_constexpr_fields, **constexpr_fields)
 
 
 @dataclass

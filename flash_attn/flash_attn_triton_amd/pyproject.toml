@@ -1,0 +1,48 @@
+# mypy --config-file flash_attn/flash_attn_triton_amd/pyproject.toml
+[tool.mypy]
+files = [
+    # Core Triton AMD backend
+    "flash_attn/flash_attn_triton_amd",
+    # Tests (based on test_flash_attn.py - looser rules, but catches import errors)
+    "tests/test_flash_attn_triton_amd.py",
+    "hopper/test_flash_attn_triton_amd.py",
+]
+ignore_missing_imports = true
+follow_imports = "skip"
+python_version = "3.9"
+
+# Strict checks
+strict_equality = true
+warn_unreachable = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+check_untyped_defs = true
+warn_return_any = true
+warn_unused_configs = true
+no_implicit_optional = true
+strict_optional = true
+disallow_incomplete_defs = false  # Triton kernels can't be fully typed
+disallow_subclassing_any = false  # torch.autograd.Function has type Any
+
+# Triton kernels use untyped decorators and defs
+disallow_untyped_defs = false
+disallow_untyped_decorators = false
+disallow_untyped_calls = false
+
+# Follow imports for our module so test imports are validated
+[[tool.mypy.overrides]]
+module = ["flash_attn.flash_attn_triton_amd", "flash_attn.flash_attn_triton_amd.*"]
+follow_imports = "normal"
+
+# Stricter settings for interface and utility modules only
+[[tool.mypy.overrides]]
+module = ["flash_attn.flash_attn_triton_amd.interface_v2", "flash_attn.flash_attn_triton_amd.interface_v3", "flash_attn.flash_attn_triton_amd.utils"]
+disallow_incomplete_defs = true
+disallow_untyped_defs = true
+
+# Test files - based on test_flash_attn.py, looser rules but catches import/export errors
+[[tool.mypy.overrides]]
+module = ["test_flash_attn_triton_amd", "hopper.test_flash_attn_triton_amd"]
+strict_optional = false
+check_untyped_defs = false
+
