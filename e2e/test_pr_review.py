@@ -12,14 +12,20 @@ def is_volta():
     return major == 7
 
 
-print(f"GPU: {torch.cuda.get_device_name()}")
-print(f"Compute capability: {get_cc()}")
-print()
+if torch.cuda.is_available():
+    print(f"GPU: {torch.cuda.get_device_name()}")
+    print(f"Compute capability: {get_cc()}")
+    print()
+
+requires_cuda = pytest.mark.skipif(
+    not torch.cuda.is_available(), reason="CUDA not available"
+)
 
 
 # ============================================================
 # 1. splitkv kernel path (force via flash_attn_with_kvcache)
 # ============================================================
+@requires_cuda
 def test_splitkv_kvcache():
     """PR comment #1: splitkv kernel should work on SM70."""
     from flash_attn import flash_attn_with_kvcache
@@ -48,6 +54,7 @@ def test_splitkv_kvcache():
 # ============================================================
 # 2. varlen forward dropout guard
 # ============================================================
+@requires_cuda
 def test_varlen_fwd_dropout_blocked():
     """PR comment #2: varlen forward with dropout should be blocked on Volta."""
     if not is_volta():
@@ -80,6 +87,7 @@ def test_varlen_fwd_dropout_blocked():
 # ============================================================
 # 3. varlen forward causal hdim>192 guard
 # ============================================================
+@requires_cuda
 def test_varlen_fwd_causal_hdim256_blocked():
     """PR comment #3: varlen forward causal + hdim>192 should be blocked on Volta."""
     if not is_volta():
@@ -112,6 +120,7 @@ def test_varlen_fwd_causal_hdim256_blocked():
 # ============================================================
 # 4. ALiBi backward blocked on Volta
 # ============================================================
+@requires_cuda
 def test_alibi_bwd_blocked():
     """PR comment #4: ALiBi backward should be blocked on Volta."""
     if not is_volta():
@@ -149,6 +158,7 @@ def test_alibi_bwd_blocked():
 # ============================================================
 # 5. varlen forward+backward (positive test - should work)
 # ============================================================
+@requires_cuda
 def test_varlen_fwd_bwd():
     """Positive test: varlen forward+backward should work on SM70."""
     from flash_attn import flash_attn_varlen_func
@@ -174,6 +184,7 @@ def test_varlen_fwd_bwd():
 # ============================================================
 # 6. KV-cache forward causal hdim>192 guard
 # ============================================================
+@requires_cuda
 def test_kvcache_fwd_causal_hdim256_blocked():
     """PR comment #6: KV-cache forward causal + hdim>192 should be blocked on Volta."""
     if not is_volta():
