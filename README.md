@@ -341,6 +341,25 @@ def flash_attn_with_kvcache(
 To see how these functions are used in a multi-head attention layer (which
 includes QKV projection, output projection), see the MHA [implementation](https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/modules/mha.py).
 
+### Using with 🤗 Kernels
+
+If your hardware environment belongs to any of the above-mentioned, you can also use the [`kernels` library](https://github.com/huggingface/kernels)
+to use Flash Attention 2 and 3 right away.
+
+```py
+# pip install kernels
+
+from kernels import get_kernel
+
+# FA2
+fa_module = get_kernel("kernels-community/flash-attn2", version=1)
+flash_attn_func = fa_module.flash_attn_func
+
+# FA3
+fa3_module = get_kernel("kernels-community/flash-attn3", version=1)
+flash_attn_func = fa3_module.flash_attn_func
+```
+
 ## Changelog
 
 ### 2.0: Complete rewrite, 2x faster
