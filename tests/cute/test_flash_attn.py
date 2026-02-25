@@ -119,7 +119,7 @@ def test_flash_attn_output(
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
     # dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
     dv_vals = [128] if d == 192 else ([d] if d != 128 else [64, d])
-    if dtype == torch.float8_e4m3fn or TEST_BWD_ONLY:
+    if dtype == torch.float8_e4m3fn:
         dv_vals = [d]
     # attention_chunk_vals = [torch.randint(1, seqlen_k * 2, (1,)).item(), 0]
     attention_chunk_vals = [0]
@@ -276,7 +276,7 @@ def test_flash_attn_output(
             and not dv > 256
             and not attention_chunk != 0
             and softcap == 0.0
-            and dv == d
+            and ((dv == d and d <= 128) or (d == 192 and dv == 128))
             and learnable_sink is None
             # and False
             and not ((causal or local) and seqlen_k < seqlen_q)
@@ -289,6 +289,8 @@ def test_flash_attn_output(
             # TODO: SM90 backward pass does not support local attention yet
             if IS_SM90 and local:
                 pytest.xfail("SM90 backward: local attention not supported yet")
+            if d == 192 and local:
+                pytest.xfail("hdim 192 backward: local attention not supported yet")
             g = torch.randn_like(out)
             # do_o = ((g.float() * out.float()).sum(-1)).transpose(1, 2)
             dq, dk, dv = torch.autograd.grad(out, (q, k, v), g)
@@ -469,7 +471,7 @@ def test_flash_attn_varlen_output(
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
     # dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
     dv_vals = [128] if d == 192 else ([d] if d != 128 else [64, d])
-    if dtype == torch.float8_e4m3fn or TEST_BWD_ONLY:
+    if dtype == torch.float8_e4m3fn:
         dv_vals = [d]
     # attention_chunk_vals = [torch.randint(1, seqlen_k * 2, (1,)).item(), 0] if seqlen_q <= seqlen_k else [0]
     attention_chunk_vals = [0]
@@ -706,11 +708,13 @@ def test_flash_attn_varlen_output(
             and not has_qv
             and not dv > 256
             and not attention_chunk != 0
-            and dv == d
+            and ((dv == d and d <= 128) or (d == 192 and dv == 128))
             and not has_learnable_sink
             and not IS_SM90
             # and False
         ):
+            if d == 192 and local:
+                pytest.xfail("hdim 192 backward: local attention not supported yet")
             g_unpad = torch.randn_like(out_unpad)
             # do_o = ((g_unpad.float() * out_unpad.float()).sum(-1)).transpose(-1, -2)
             # import flash_attn_3_cuda
