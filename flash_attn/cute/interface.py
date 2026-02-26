@@ -18,8 +18,6 @@
 # - append KV to existing KV cache
 # - FP8
 # - bwd pass optimized for Hopper/Blackwell
-from fontTools.feaLib.ast import Block
-
 import os
 import math
 from functools import lru_cache
