@@ -369,11 +369,11 @@ def _flash_attn_fwd(
             block_size=(m_block_size, n_block_size),
             q_stage=q_stage,
         )
-    if aux_tensors is not None:    
+    if aux_tensors is not None:
         aux_tensor_metadata = get_aux_tensor_metadata(aux_tensors)
     else:
         aux_tensor_metadata = None
-    
+
     compile_key = (
         dtype,
         head_dim,
@@ -633,7 +633,6 @@ def _flash_attn_bwd(
             or seqused_q is not None
             or seqused_k is not None
         )
-        assert not is_varlen, "varlen backward is not yet supported on sm90"
     else:
         m_block_size = 128
         n_block_size = 128
@@ -683,7 +682,7 @@ def _flash_attn_bwd(
         dQ_swapAB = False
     # SM90 head_dim=64 varlen backward uses tile_m=64 and no dQ swap; tile_m=80
     # cannot satisfy the dQ MMA M-mode requirement for this shape family.
-    if compute_capability == 9 and head_dim <= 64:
+    if arch // 10 == 9 and head_dim <= 64:
         m_block_size = 64
         dQ_swapAB = False
 
@@ -799,7 +798,7 @@ def _flash_attn_bwd(
 
     # SM90 varlen needs dK/dV accum+postprocess even for qhead_per_kvhead==1
     # to avoid direct tile stores crossing packed sequence boundaries.
-    dKV_postprocess = qhead_per_kvhead > 1 or (compute_capability == 9 and cu_seqlens_k is not None)
+    dKV_postprocess = qhead_per_kvhead > 1 or (arch // 10 == 9 and cu_seqlens_k is not None)
     if dKV_postprocess:
         head_dim_v_rounded = (head_dim_v + 32 - 1) // 32 * 32
         if cu_seqlens_k is None:
@@ -1155,7 +1154,7 @@ def _flash_attn_bwd(
         cu_seqlens_q is None,
         seqused_q is None,
         use_2cta_instrs,
-        1, # no cluster for tile_m 
+        1, # no cluster for tile_m
     )
     if compile_key_post not in _flash_attn_bwd.compile_cache_post:
         dq_accum_tensor = to_cute_tensor(dq_accum)
@@ -1201,7 +1200,7 @@ def _flash_attn_bwd(
             cu_seqlens_k is None,
             seqused_k is None,
             False, # even for 2cta, is split along hdim, so always False
-            cluster_size, # cluster is for tile_n 
+            cluster_size, # cluster is for tile_n
         )
         if compile_key_post not in _flash_attn_bwd.compile_cache_post:
             dk_accum_tensor = to_cute_tensor(dk_accum)
