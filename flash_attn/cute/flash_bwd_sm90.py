@@ -441,14 +441,20 @@ class FlashAttentionBackwardSm90:
         num_batch = (
             sched_cu_seqlens.shape[0] - 1
             if const_expr(sched_cu_seqlens is not None)
-            else (sched_seqused.shape[0] if const_expr(sched_seqused is not None) else cute.size(mQ.shape[3]))
+            else (
+                sched_seqused.shape[0]
+                if const_expr(sched_seqused is not None)
+                else cute.size(mQ.shape[3])
+            )
         )
         total_q = (
             cute.size(mK.shape[0])
             if const_expr(is_varlen)
             else cute.size(mQ.shape[0]) * cute.size(mQ.shape[3])
         )
-        tile_shape_mn = (self.tile_n, self.tile_m) if const_expr(is_varlen) else (self.tile_m, self.tile_n)
+        tile_shape_mn = (
+            (self.tile_n, self.tile_m) if const_expr(is_varlen) else (self.tile_m, self.tile_n)
+        )
         tile_sched_args = TileSchedulerArguments(
             cute.ceil_div(cute.size(mK.shape[0]), self.tile_n),
             cute.size(mQ.shape[2]),
@@ -808,7 +814,9 @@ class FlashAttentionBackwardSm90:
                     mQ_cur = cute.domain_offset((seqlen.offset_q, 0), mQ[None, None, head_idx])
                     mLSE_cur = cute.domain_offset((seqlen.padded_offset_q,), mLSE[None, head_idx])
                     mdO_cur = cute.domain_offset((seqlen.offset_q, 0), mdO[None, None, head_idx])
-                    mdPsum_cur = cute.domain_offset((seqlen.padded_offset_q,), mdPsum[None, head_idx])
+                    mdPsum_cur = cute.domain_offset(
+                        (seqlen.padded_offset_q,), mdPsum[None, head_idx]
+                    )
                 gQ = cute.local_tile(mQ_cur, (self.tile_m, self.tile_hdim), (None, 0))
                 gdO = cute.local_tile(mdO_cur, (self.tile_m, self.tile_hdimv), (None, 0))
                 gLSE = cute.local_tile(mLSE_cur, (self.tile_m,), (None,))
