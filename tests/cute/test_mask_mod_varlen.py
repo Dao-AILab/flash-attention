@@ -364,7 +364,7 @@ def _run_varlen_mask_test(
         m_block_size=128,
         n_block_size=128,
         pack_gqa=pack_gqa,
-        _compute_capability=None,
+        _arch=None,
         score_mod=None,
         mask_mod=cute_mask_mod,
         block_sparse_tensors=None,
@@ -556,7 +556,7 @@ def _run_varlen_global_mask_test(
         m_block_size=128,
         n_block_size=128,
         pack_gqa=pack_gqa,
-        _compute_capability=None,
+        _arch=None,
         score_mod=None,
         mask_mod=cute_mask,
         block_sparse_tensors=None,
@@ -716,7 +716,7 @@ def _run_fwd(
         m_block_size=128,
         n_block_size=128,
         pack_gqa=False,
-        _compute_capability=None,
+        _arch=None,
         score_mod=None,
         mask_mod=mask_mod,
         block_sparse_tensors=block_sparse_tensors,
@@ -728,13 +728,13 @@ def _run_fwd(
 
 
 BLOCK_SPARSE_MASK_NAMES = [
-    # "causal",
-    # "block_diagonal",
-    # "mini_causal",
-    # "prefix_lm",
-    # "sliding_window",
-    # "dilated_sliding_window",
-    # "document",
+    "causal",
+    "block_diagonal",
+    "mini_causal",
+    "prefix_lm",
+    "sliding_window",
+    "dilated_sliding_window",
+    "document",
     "ima",
 ]
 
