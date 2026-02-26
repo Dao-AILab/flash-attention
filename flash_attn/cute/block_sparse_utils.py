@@ -768,7 +768,7 @@ def handle_block_sparse_empty_tile_correction_sm100(
         pipeline_sm_stats.consumer_release_w_index(stage)
 
         if const_expr(gmem_tiled_copy_O is None):
-            pipeline_o_epi.producer_acquire_w_index_phase(stage, o_corr_consumer_phase)
+            pipeline_o_epi.producer_acquire_w_index_phase(stage, corr_epi_producer_phase)
         correction_epilogue(
             thr_mma_pv,
             tOtO[None, None, None, stage],
