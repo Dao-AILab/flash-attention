@@ -838,6 +838,8 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multipl
     if (cc_major < 8) {
         TORCH_CHECK(q.dtype() == torch::kFloat16,
             "FlashAttention backward on Volta (V100) only supports FP16, not BF16.");
+        TORCH_CHECK(p_dropout == 0.f,
+            "FlashAttention backward on Volta (V100) does not support dropout.");
         TORCH_CHECK(!alibi_slopes_.has_value(),
             "FlashAttention backward on Volta (V100) does not support ALiBi.");
     }
@@ -1056,6 +1058,8 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     if (cc_major < 8) {
         TORCH_CHECK(q.dtype() == torch::kFloat16,
             "FlashAttention backward on Volta (V100) only supports FP16, not BF16.");
+        TORCH_CHECK(p_dropout == 0.f,
+            "FlashAttention backward on Volta (V100) does not support dropout.");
         TORCH_CHECK(!alibi_slopes_.has_value(),
             "FlashAttention backward on Volta (V100) does not support ALiBi.");
     }
