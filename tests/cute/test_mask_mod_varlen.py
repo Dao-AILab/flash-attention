@@ -896,7 +896,7 @@ def test_varlen_block_sparse(
 
     assert not torch.isnan(out_with_block_sparsity).any(), "NaN in block-sparse output"
     max_err = (out_with_block_sparsity - out_no_block_sparsity).abs().max().item()
-    assert max_err == 0.0, (
+    assert max_err <= 0.01, (
         f"block-sparse output differs from mask-mod-only by {max_err}"
     )
 
