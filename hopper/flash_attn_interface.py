@@ -38,6 +38,7 @@ _FLASH_ATTN_FWD_PARAMS = (
     'softmax_scale', 'causal',
     'window_size_left', 'window_size_right',
     'attention_chunk', 'softcap',
+    'dropout_p',
     'rotary_interleaved',
     'scheduler_metadata',
     'num_splits', 'pack_gqa', 'sm_margin',
@@ -48,7 +49,7 @@ _FWD_IDX = {name: i for i, name in enumerate(_FLASH_ATTN_FWD_PARAMS)}
 # register_autograd backward.  Keep in sync with _FLASH_ATTN_FWD_PARAMS.
 _FWD_NON_GRAD_PARAMS = {
     'softmax_scale', 'causal', 'window_size_left', 'window_size_right',
-    'attention_chunk', 'softcap', 'rotary_interleaved',
+    'attention_chunk', 'softcap', 'dropout_p', 'rotary_interleaved',
     'num_splits', 'pack_gqa', 'sm_margin',
 }
 
@@ -59,9 +60,9 @@ _FWD_BACKWARD_NUM_NONES = len(_FLASH_ATTN_FWD_PARAMS) - 3 - len(_FWD_NON_GRAD_PA
 
 # Number of forward() arguments (excluding ctx) for each autograd.Function.
 # Used to compute the backward return tuple size: real_grads + (None,) * (N - num_real).
-_QKVPACKED_NUM_FWD_ARGS = 13
-_ATTN_NUM_FWD_ARGS = 17
-_VARLEN_NUM_FWD_ARGS = 23
+_QKVPACKED_NUM_FWD_ARGS = 14
+_ATTN_NUM_FWD_ARGS = 18
+_VARLEN_NUM_FWD_ARGS = 24
 
 
 def maybe_contiguous(x):
@@ -124,6 +125,7 @@ def _flash_attn_forward(
     window_size_right: int = -1,
     attention_chunk: int = 0,
     softcap: float = 0.0,
+    dropout_p: float = 0.0,
     rotary_interleaved: bool = True,
     scheduler_metadata: Optional[torch.Tensor] = None,
     num_splits: int = 1,
@@ -171,6 +173,7 @@ def _flash_attn_forward(
         window_size_right,
         attention_chunk,
         softcap,
+        dropout_p,
         rotary_interleaved,
         scheduler_metadata,
         num_splits,
@@ -218,6 +221,7 @@ def _flash_attn_forward_fake(
     window_size_right: int = -1,
     attention_chunk: int = 0,
     softcap: float = 0.0,
+    dropout_p: float = 0.0,
     rotary_interleaved: bool = True,
     scheduler_metadata: Optional[torch.Tensor] = None,
     num_splits: int = 1,
@@ -499,6 +503,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
         window_size=(-1, -1),
         attention_chunk=0,
         softcap=0.0,
+        dropout_p=0.0,
         deterministic=False,
         num_heads_q=None,
         sm_margin=0,
@@ -534,6 +539,7 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             window_size_right=window_size[1],
             attention_chunk=attention_chunk,
             softcap=softcap,
+            dropout_p=dropout_p,
             sm_margin=sm_margin,
         )
         # ctx.save_for_backward(q, k, v, out_padded, softmax_lse)
@@ -602,6 +608,7 @@ class FlashAttnFunc(torch.autograd.Function):
         window_size=(-1, -1),
         attention_chunk=0,
         softcap=0.0,
+        dropout_p=0.0,
         num_splits=1,
         pack_gqa=None,
         deterministic=False,
@@ -630,6 +637,7 @@ class FlashAttnFunc(torch.autograd.Function):
             window_size_right=window_size[1],
             attention_chunk=attention_chunk,
             softcap=softcap,
+            dropout_p=dropout_p,
             num_splits=num_splits,
             pack_gqa=pack_gqa,
             sm_margin=sm_margin,
@@ -698,6 +706,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         window_size=(-1, -1),
         attention_chunk=0,
         softcap=0.0,
+        dropout_p=0.0,
         num_splits=1,
         pack_gqa=None,
         deterministic=False,
@@ -730,6 +739,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             window_size_right=window_size[1],
             attention_chunk=attention_chunk,
             softcap=softcap,
+            dropout_p=dropout_p,
             num_splits=num_splits,
             pack_gqa=pack_gqa,
             sm_margin=sm_margin,
@@ -790,6 +800,7 @@ def flash_attn_qkvpacked_func(
     window_size=(-1, -1),
     attention_chunk=0,
     softcap=0.0,
+    dropout_p=0.0,
     deterministic=False,
     num_heads_q=None,
     sm_margin=0,
@@ -837,6 +848,7 @@ def flash_attn_qkvpacked_func(
         window_size,
         attention_chunk,
         softcap,
+        dropout_p,
         deterministic,
         num_heads_q,
         sm_margin,
@@ -855,6 +867,7 @@ def flash_attn_func(
     window_size=(-1, -1),
     attention_chunk=0,
     softcap=0.0,
+    dropout_p=0.0,
     num_splits=1,
     pack_gqa=None,
     deterministic=False,
@@ -917,6 +930,7 @@ def flash_attn_func(
         window_size,
         attention_chunk,
         softcap,
+        dropout_p,
         num_splits,
         pack_gqa,
         deterministic,
@@ -942,6 +956,7 @@ def flash_attn_varlen_func(
     window_size=(-1, -1),
     attention_chunk=0,
     softcap=0.0,
+    dropout_p=0.0,
     num_splits=1,
     pack_gqa=None,
     deterministic=False,
@@ -965,6 +980,7 @@ def flash_attn_varlen_func(
         window_size,
         attention_chunk,
         softcap,
+        dropout_p,
         num_splits,
         pack_gqa,
         deterministic,
@@ -1131,6 +1147,7 @@ def flash_attn_with_kvcache(
         window_size_right=window_size[1],
         attention_chunk=attention_chunk,
         softcap=softcap,
+        dropout_p=0.0,
         rotary_interleaved=rotary_interleaved,
         scheduler_metadata=scheduler_metadata,
         num_splits=num_splits,
