@@ -10,7 +10,7 @@
 #include "cutlass/layout/layout.h"
 #include <cutlass/numeric_types.h>
 
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 750
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ < 750
 #include "cute/atom/mma_traits_sm70.hpp"
 #endif
 
