@@ -240,6 +240,7 @@ class BishengBuildExt(build_ext):
         python_lib = sysconfig.get_config_var("LIBDIR")
 
         torch_cmake_path = torch.utils.cmake_prefix_path
+        torch_package_path = os.path.dirname(torch.__file__)
         torch_include = os.path.join(torch_cmake_path, "Torch/include")
         torch_lib = os.path.join(torch_cmake_path, "Torch/lib")
 
@@ -267,17 +268,18 @@ class BishengBuildExt(build_ext):
             *[f"-I{p}" for p in asc_config["include_dirs"]],
             f"-I{dep_paths['python']['include']}",
             f"-I{dep_paths['torch_npu']['include']}",
-            *[f"-L{p}" for p in asc_config["lib_dirs"]],
-            f"-I{python_lib}/python3.10/site-packages/pybind11/include",
+            f"-I{dep_paths['torch']['include']}",
             f"-I{ascend_home}/include",
             f"-I{ascend_home}/runtime/include",
             f"-I{ascend_home}/include/experiment/runtime",
             f"-I{ascend_home}/include/experiment/msprof",
-            f"-I{python_lib}/python3.10/site-packages/torch/include",
-            f"-I{python_lib}/python3.10/site-packages/torch/include/torch/csrc/api/include",
+            f"-I{torch_package_path}/include",
+            f"-I{torch_package_path}/include/torch/csrc/api/include",
             f"-I{BASE_DIR}/csrc/catlass/include",
+            *[f"-L{p}" for p in asc_config["lib_dirs"]],
+            f"-L{dep_paths['torch']['lib']}",
             f"-L{dep_paths['torch_npu']['lib']}",
-            f"-L{python_lib}/python3.10/site-packages/torch/lib",
+            f"-L{torch_package_path}/lib",
             f"-L{ascend_home}/lib64",
             "-lascendcl",
             "-ltorch_npu",

@@ -1,4 +1,3 @@
-#include <pybind11/pybind11.h>
 #include <torch/extension.h>
 
 #include "mha_fwd_kvcache.cpp"
