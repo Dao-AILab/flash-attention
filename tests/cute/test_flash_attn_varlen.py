@@ -44,7 +44,7 @@ def test_varlen(
     )
 
     # SM90 backward pass doesn't support varlen yet
-    skip_backward = IS_SM90
+    skip_backward = False
 
     ok = check_varlen_vs_torch_flash(
         q, k, v,

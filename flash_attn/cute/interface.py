@@ -702,6 +702,11 @@ def _flash_attn_bwd(
         m_block_size = 64
         # dQ_swapAB tuning: use False when m_block_size=64 (same as causal case)
         dQ_swapAB = False
+    # SM90 head_dim=64 varlen backward uses tile_m=64 and no dQ swap; tile_m=80
+    # cannot satisfy the dQ MMA M-mode requirement for this shape family.
+    if compute_capability == 9 and head_dim <= 64:
+        m_block_size = 64
+        dQ_swapAB = False
 
     # NB: this could be derived from the block_sparse_tensors but for now we hardcode it to 2
     subtile_factor = 2
@@ -813,7 +818,9 @@ def _flash_attn_bwd(
         dpsum = torch.empty(num_head, total_q_rounded_padded, dtype=torch.float32, device=device)
         lse_log2 = torch.empty(num_head, total_q_rounded_padded, dtype=torch.float32, device=device)
 
-    dKV_postprocess = qhead_per_kvhead > 1
+    # SM90 varlen needs dK/dV accum+postprocess even for qhead_per_kvhead==1
+    # to avoid direct tile stores crossing packed sequence boundaries.
+    dKV_postprocess = qhead_per_kvhead > 1 or (compute_capability == 9 and cu_seqlens_k is not None)
     if dKV_postprocess:
         head_dim_v_rounded = (head_dim_v + 32 - 1) // 32 * 32
         if cu_seqlens_k is None:
