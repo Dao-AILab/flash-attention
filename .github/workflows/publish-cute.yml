@@ -1,0 +1,36 @@
+name: Publish flash-attn-4 to PyPI
+
+on:
+  push:
+    tags:
+      - 'fa4-v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - name: Install build dependencies
+      run: pip install build twine
+    - name: Build package
+      run: python -m build
+      working-directory: flash_attn/cute
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: flash_attn/cute/dist/*
+        generate_release_notes: true
+    - name: Publish to PyPI
+      env:
+        TWINE_USERNAME: __token__
+        TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+      run: twine upload dist/*
+      working-directory: flash_attn/cute
