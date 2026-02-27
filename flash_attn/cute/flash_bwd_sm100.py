@@ -134,9 +134,7 @@ class FlashAttentionBackwardSm100:
         # Speed optimizations, does not affect correctness
         self.shuffle_LSE = False
         self.shuffle_dPsum = False
-        self.use_smem_dS_for_mma_dK = (
-            self.deterministic and self.is_causal and not self.use_2cta_instrs
-        )
+        self.use_smem_dS_for_mma_dK = False
 
         self.reduce_warp_ids = (0, 1, 2, 3)
         self.compute_warp_ids = (4, 5, 6, 7, 8, 9, 10, 11)
@@ -2383,7 +2381,6 @@ class FlashAttentionBackwardSm100:
                 block_iter_count = m_block_max - m_block_min
                 process_tile = (
                     const_expr(not self.is_local and not self.is_varlen_q)
-                    or const_expr(self.use_2cta_instrs)
                     or m_block_min < m_block_max
                 )
 
@@ -3293,9 +3290,10 @@ class FlashAttentionBackwardSm100:
 
             # Final signal for dS smem store completion
             if const_expr(self.use_2cta_instrs and self.tile_hdim == 128):
-                with cute.arch.elect_one():
-                    pipeline_dS.producer_commit(producer_state_dS)
-                producer_state_dS.advance()
+                if process_tile:
+                    with cute.arch.elect_one():
+                        pipeline_dS.producer_commit(producer_state_dS)
+                    producer_state_dS.advance()
 
             # Epilogue
             # Run epilogue if we processed any m_blocks for this n_block
