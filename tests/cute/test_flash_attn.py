@@ -3,6 +3,8 @@
 import math
 import itertools
 import os
+import logging
+import json
 
 import pytest
 import torch
@@ -359,7 +361,6 @@ def test_flash_attn_output(
                 print(f"dV max diff: {diff_dv.max().item()}")
                 print(f"  at coordinates {tuple(c.item() for c in coords)}: dV={dv[coords].item()}, dV_ref={dv_ref[coords].item()}")
 
-            # breakpoint()
             dq_atol = 2 * (dq_ref + 0.3 - 0.3 - dq_ref).abs().max().item() + (
                 0 if softcap == 0 else 3e-4
             )
@@ -841,7 +842,6 @@ def test_flash_attn_varlen_output(
                 coords = torch.unravel_index(max_idx, diff_dv.shape)
                 print(f"dV max diff: {diff_dv.max().item()}")
                 print(f"  at coordinates {tuple(c.item() for c in coords)}: dV={dv[coords].item()}, dV_ref={dv_ref[coords].item()}")
-            # breakpoint()
             dq_atol = 2 * (dq_ref + 0.3 - 0.3 - dq_ref).abs().max().item() + (
                 0 if softcap == 0 else 3e-4
             )
