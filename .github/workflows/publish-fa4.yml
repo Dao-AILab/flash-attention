@@ -1,0 +1,65 @@
+name: Publish flash-attn-4 to PyPI
+
+on:
+  push:
+    tags:
+      - 'fa4-v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    - uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+    - name: Install build dependencies
+      run: pip install build twine
+    - name: Build package
+      run: python -m build
+      working-directory: flash_attn/cute
+    - name: Check package metadata
+      run: twine check dist/*
+      working-directory: flash_attn/cute
+    - name: Store distribution packages
+      uses: actions/upload-artifact@v4
+      with:
+        name: python-package-distributions
+        path: flash_attn/cute/dist/
+
+  github-release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+    - name: Download distribution packages
+      uses: actions/download-artifact@v4
+      with:
+        name: python-package-distributions
+        path: dist/
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: dist/*
+        generate_release_notes: true
+
+  publish-to-pypi:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/flash-attn-4
+    permissions:
+      id-token: write
+    steps:
+    - name: Download distribution packages
+      uses: actions/download-artifact@v4
+      with:
+        name: python-package-distributions
+        path: dist/
+    - name: Publish to PyPI
+      uses: pypa/gh-action-pypi-publish@release/v1
