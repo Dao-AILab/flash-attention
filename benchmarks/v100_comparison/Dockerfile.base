@@ -1,0 +1,14 @@
+FROM nvcr.io/nvidia/pytorch:24.11-py3
+
+# flash-attn SM70 build (most time-consuming, most stable)
+# Takes ~2 hours. Build once and reuse.
+WORKDIR /workspace/flash-attention
+COPY setup.py README.md ./
+COPY csrc/ csrc/
+COPY flash_attn/ flash_attn/
+RUN FLASH_ATTN_CUDA_ARCHS="70" pip install -e .
+
+RUN pip install pandas tabulate
+
+# Build:
+#   docker build -t flash_attn_v100_base -f benchmarks/v100_comparison/Dockerfile.base .
