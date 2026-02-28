@@ -31,8 +31,35 @@ RUN pip install --no-cache-dir \
     "compressed-tensors==0.8.0" "depyf==0.18.0" "gguf==0.10.0" \
     lark ray
 
-# --- vLLM v0.6.5 (no deps to preserve NGC torch + our flash-attn + xFormers) ---
-RUN pip install vllm==0.6.5 --no-deps --no-cache-dir
+# --- vLLM v0.6.5 from source (prebuilt wheel has ABI mismatch with NGC PyTorch) ---
+# Build against the NGC torch to get matching C++ ABI symbols.
+RUN pip install --no-cache-dir setuptools-scm cmake ninja
+RUN git clone --depth 1 --branch v0.6.5 \
+        https://github.com/vllm-project/vllm.git /tmp/vllm && \
+    cd /tmp/vllm && \
+    TORCH_CUDA_ARCH_LIST="7.0" \
+    VLLM_TARGET_DEVICE=cuda \
+    MAX_JOBS=4 \
+    pip install --no-deps --no-build-isolation -e . && \
+    cd / && rm -rf /tmp/vllm/.git
+
+# Patch vLLM to use our SM70-compatible flash-attn instead of its bundled copy.
+# 1. Selector: lower capability check from SM80 to SM70
+RUN sed -i 's/has_device_capability(80)/has_device_capability(70)/' \
+    /tmp/vllm/vllm/attention/selector.py && \
+    grep -q 'has_device_capability(70)' /tmp/vllm/vllm/attention/selector.py && \
+    echo "Patch 1/2: selector SM70 check OK"
+# 2. Replace vllm_flash_attn module with shim that wraps our flash_attn.
+#    vLLM's fork adds `out` parameter; our flash_attn doesn't have it.
+COPY benchmarks/v100_vllm_serving/vllm_flash_attn_shim.py /tmp/vllm/vllm/vllm_flash_attn/__init__.py
+RUN python -c "\
+from vllm.vllm_flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache; \
+print('Patch 2/3: vllm_flash_attn shim OK')"
+# 3. Allow block_size=256 for SM70 paged KV cache (default: 8,16,32 only)
+RUN sed -i "s/choices=\[8, 16, 32\]/choices=[8, 16, 32, 256]/" \
+    /tmp/vllm/vllm/engine/arg_utils.py && \
+    grep -q '256' /tmp/vllm/vllm/engine/arg_utils.py && \
+    echo "Patch 3/3: block_size=256 allowed"
 
 # Verify full environment
 RUN python -c "\

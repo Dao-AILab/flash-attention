@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
-"""vLLM Serving Benchmark for V100: FLASH_ATTN vs XFORMERS vs TORCH_SDPA
+"""vLLM Serving Benchmark for V100: FLASH_ATTN vs XFORMERS
 
 Starts a vLLM OpenAI-compatible server with each attention backend,
 sends concurrent streaming requests, and measures TTFT, TPOT, throughput.
+
+Note: TORCH_SDPA is CPU-only in vLLM v0.6.5, so only FLASH_ATTN and XFORMERS
+are supported on V100 GPU.
 
 Usage:
     python benchmark_serving.py                                   # full benchmark
@@ -19,6 +22,7 @@ import signal
 import subprocess
 import statistics
 import sys
+import tempfile
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
@@ -34,7 +38,7 @@ DEFAULT_MODEL = "NousResearch/Llama-2-7b-hf"
 DEFAULT_PORT = 8000
 SERVER_STARTUP_TIMEOUT = 600  # seconds (model download can be slow)
 
-ALL_BACKENDS = ["FLASH_ATTN", "XFORMERS", "TORCH_SDPA"]
+ALL_BACKENDS = ["FLASH_ATTN", "XFORMERS"]
 
 WORKLOADS = {
     "short":     {"input_len": 128,  "max_output_len": 128},
@@ -142,6 +146,7 @@ class VLLMServer:
         self.gpu_memory_utilization = gpu_memory_utilization
         self.process: Optional[subprocess.Popen] = None
         self.base_url = f"http://localhost:{port}"
+        self._log_file = None
 
     def start(self):
         env = os.environ.copy()
@@ -155,17 +160,43 @@ class VLLMServer:
             "--gpu-memory-utilization", str(self.gpu_memory_utilization),
             "--dtype", "half",
             "--trust-remote-code",
+            "--disable-frontend-multiprocessing",
+            "--enforce-eager",
         ]
+        # FLASH_ATTN on SM70 requires page block_size=256 for KV cache
+        if self.backend == "FLASH_ATTN":
+            cmd.extend(["--block-size", "256"])
 
         print(f"  Starting vLLM server with backend={self.backend} ...")
         print(f"  Command: {' '.join(cmd)}")
 
+        # Redirect stdout/stderr to a temp file to avoid pipe deadlock.
+        # (vLLM writes a lot of output; a 64KB pipe buffer fills up quickly.)
+        self._log_file = tempfile.NamedTemporaryFile(
+            mode="w", prefix=f"vllm_{self.backend}_", suffix=".log", delete=False,
+        )
+        print(f"  Server log: {self._log_file.name}")
+
         self.process = subprocess.Popen(
             cmd,
             env=env,
-            stdout=subprocess.PIPE,
+            stdout=self._log_file,
             stderr=subprocess.STDOUT,
         )
+
+    def _read_log_tail(self, n_chars: int = 3000) -> str:
+        """Read the last n_chars from the server log file."""
+        if self._log_file is None:
+            return ""
+        try:
+            self._log_file.flush()
+            with open(self._log_file.name, "r") as f:
+                f.seek(0, 2)  # end
+                size = f.tell()
+                f.seek(max(0, size - n_chars))
+                return f.read()
+        except Exception:
+            return ""
 
     async def wait_healthy(self, timeout: int = SERVER_STARTUP_TIMEOUT) -> bool:
         """Poll /health until the server is ready or timeout."""
@@ -175,10 +206,10 @@ class VLLMServer:
         while time.time() - start < timeout:
             # Check if process died
             if self.process and self.process.poll() is not None:
-                stdout = self.process.stdout.read().decode() if self.process.stdout else ""
+                log_tail = self._read_log_tail()
                 print(f"  Server exited with code {self.process.returncode}")
-                if stdout:
-                    print(f"  Last output:\n{stdout[-3000:]}")
+                if log_tail:
+                    print(f"  Last output:\n{log_tail}")
                 return False
 
             try:
@@ -196,6 +227,9 @@ class VLLMServer:
             await asyncio.sleep(3)
 
         print(f"  Server startup timed out after {timeout}s")
+        log_tail = self._read_log_tail()
+        if log_tail:
+            print(f"  Last output:\n{log_tail}")
         return False
 
     def stop(self):
@@ -213,6 +247,16 @@ class VLLMServer:
             self.process.wait(timeout=10)
 
         self.process = None
+
+        # Clean up log file
+        if self._log_file is not None:
+            try:
+                self._log_file.close()
+                os.unlink(self._log_file.name)
+            except Exception:
+                pass
+            self._log_file = None
+
         # Allow GPU memory to be fully released
         time.sleep(5)
 
