@@ -49,7 +49,6 @@ def gemm_ptx_w_idx(
     A_idx: Optional[Int32] = None,
     B_idx: Optional[Int32] = None,
     zero_init: bool | Boolean = False,
-    cta_group: int = 1,
     **kwargs,
 ) -> None:
     rA = tCrA if const_expr(A_idx is None) else tCrA[None, None, None, A_idx]
@@ -68,7 +67,6 @@ def gemm_ptx_w_idx(
         sA_cur,
         sB_cur,
         zero_init=zero_init,
-        cta_group=cta_group,
         **kwargs,
     )
 
@@ -385,9 +383,9 @@ def gemm_ptx_partial(
     # sA_offset: Int32 = 0,
     # acc_offset: Int32 = 0,
     tA_addr: Optional[Int32] = None,
-    cta_group: int = 1,
 ) -> None:
     # acc_tmem_addr += acc_offset
+    cta_group = 2 if op.cta_group == tcgen05.CtaGroup.TWO else 1
     is_ts = op.a_src == cute.nvgpu.tcgen05.OperandSource.TMEM
     if const_expr(not is_ts):
         assert sA is not None, "sA must be provided when a_src is not TMEM"
