@@ -1379,6 +1379,10 @@ class FlashAttentionForwardSm100:
         tSrQ = tiled_mma_qk.make_fragment_A(sQ)
         tSrK = tiled_mma_qk.make_fragment_B(sK)
         tOrV = tiled_mma_pv.make_fragment_B(sV)
+        if const_expr(self.q_stage == 2):
+            tSrQs = (tSrQ[None, None, None, 0], tSrQ[None, None, None, 1])
+        else:
+            tSrQs = (tSrQ[None, None, None, 0],)
 
         qk_mma_op, pv_mma_op = tiled_mma_qk.op, tiled_mma_pv.op
 
