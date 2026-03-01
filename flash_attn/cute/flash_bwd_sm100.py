@@ -29,6 +29,7 @@ from flash_attn.cute.tile_scheduler import (
     TileSchedulerArguments,
     SingleTileScheduler,
     SinglePersistentBWDTileScheduler,
+    CLCDynamicPersistentBWDTileScheduler,
     SingleTileLPTBwdScheduler,  # noqa
     SingleTileVarlenScheduler,
 )
@@ -58,6 +59,7 @@ class FlashAttentionBackwardSm100:
         tile_m: int = 128,
         tile_n: int = 128,
         is_persistent: bool = False,
+        is_dynamic_persistent: bool = False,
         deterministic: bool = False,
         cluster_size: int = 1,
         use_2cta_instrs: bool = False,
@@ -113,6 +115,7 @@ class FlashAttentionBackwardSm100:
         assert cluster_size in (1, 2), "Only cluster_size=1 or 2 is supported"
         self.cluster_shape_mn = (cluster_size, 1)
         self.is_persistent = is_persistent
+        self.is_dynamic_persistent = is_dynamic_persistent
         self.is_causal = is_causal
         self.is_local = is_local
         self.qhead_per_kvhead = qhead_per_kvhead
@@ -265,6 +268,7 @@ class FlashAttentionBackwardSm100:
         self.dK_reduce_ncol = 32
         # CTA group for MMA operations
         self.cta_group = tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
+        self.num_clc_stage = 1
 
     def _get_tiled_mma(self):
         # S.T = K @ Q.T
@@ -706,6 +710,8 @@ class FlashAttentionBackwardSm100:
             TileScheduler = SingleTileVarlenScheduler
         elif const_expr(self.is_persistent):
             TileScheduler = SinglePersistentBWDTileScheduler
+        elif const_expr(self.is_dynamic_persistent):
+            TileScheduler = CLCDynamicPersistentBWDTileScheduler
         elif const_expr(self.deterministic):
             TileScheduler = SingleTileLPTBwdScheduler
         else:
@@ -736,7 +742,13 @@ class FlashAttentionBackwardSm100:
             head_swizzle=self.deterministic,
         )
 
-        tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
+        if const_expr(self.is_dynamic_persistent):
+            tile_sched_params = TileScheduler.to_underlying_arguments(
+                tile_sched_args,
+                sched_stages=self.num_clc_stage,
+            )
+        else:
+            tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
         self.tile_scheduler_cls = TileScheduler
         grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
 
@@ -789,6 +801,8 @@ class FlashAttentionBackwardSm100:
                 tmem_holding_buf: Int32
                 tmem_dealloc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 1]
                 epi_load_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * 2]
+                sched_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_clc_stage * 2]
+                sched_data: cute.struct.MemRange[cutlass.Int32, self.num_clc_stage * 12]
 
                 # 2-CTA
                 Qt_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.Q_stage]
@@ -870,6 +884,8 @@ class FlashAttentionBackwardSm100:
                 tmem_holding_buf: Int32
                 tmem_dealloc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 1]
                 epi_load_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * 2]
+                sched_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.num_clc_stage * 2]
+                sched_data: cute.struct.MemRange[cutlass.Int32, self.num_clc_stage * 12]
 
                 sQ: cute.struct.Align[
                     cute.struct.MemRange[cute.Uint8, sQ_alloc_bytes],
@@ -1087,6 +1103,7 @@ class FlashAttentionBackwardSm100:
         mma_tile_coord_v = bidx % self.cta_group_size
         is_leader_cta = mma_tile_coord_v == 0
         cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+        is_first_cta_in_cluster = cta_rank_in_cluster == 0
 
         # Prefetch tma descriptor
         if warp_idx == self.load_warp_id:
@@ -1306,6 +1323,33 @@ class FlashAttentionBackwardSm100:
             defer_sync=False,
         )
 
+        sched_pipeline = None
+        sched_data = None
+        if const_expr(self.is_dynamic_persistent):
+            cluster_size = self.cluster_shape_mn[0]
+            num_sched_consumers = cluster_size * (
+                len(self.reduce_warp_ids)
+                + len(self.compute_warp_ids)
+                + 2
+                + (1 if self.use_2cta_instrs else 0)
+            )
+            sched_pipeline_producer_group = cutlass.pipeline.CooperativeGroup(
+                cutlass.pipeline.Agent.Thread
+            )
+            sched_pipeline_consumer_group = cutlass.pipeline.CooperativeGroup(
+                cutlass.pipeline.Agent.Thread,
+                num_sched_consumers,
+            )
+            sched_pipeline = cutlass.pipeline.PipelineAsync.create(
+                barrier_storage=storage.sched_mbar_ptr.data_ptr(),
+                num_stages=self.num_clc_stage,
+                producer_group=sched_pipeline_producer_group,
+                consumer_group=sched_pipeline_consumer_group,
+                consumer_mask=None if const_expr(cluster_size == 1) else 0,
+                defer_sync=True,
+            )
+            sched_data = storage.sched_data.get_tensor((12, self.num_clc_stage))
+
         sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner, dtype=self.q_dtype)
         if const_expr(self.use_2cta_instrs and self.tile_hdim <= 128):
             sQt = storage.sQt.get_tensor(
@@ -1431,7 +1475,15 @@ class FlashAttentionBackwardSm100:
             tile_m=self.tile_m,
             tile_n=self.tile_n * self.cluster_shape_mnk[0],
         )
-        TileSchedulerCls = partial(self.tile_scheduler_cls.create, tile_sched_params)
+        if const_expr(self.is_dynamic_persistent):
+            TileSchedulerCls = partial(
+                self.tile_scheduler_cls.create,
+                tile_sched_params,
+                sched_data,
+                sched_pipeline,
+            )
+        else:
+            TileSchedulerCls = partial(self.tile_scheduler_cls.create, tile_sched_params)
 
         AttentionMaskCls = partial(
             AttentionMask,
@@ -1441,10 +1493,15 @@ class FlashAttentionBackwardSm100:
             window_size_left=window_size_left,
             window_size_right=window_size_right,
         )
-        #  EMPTY
+        #  EMPTY | CLC Producer
         # (15)
         if warp_idx == self.empty_warp_id:
-            cute.arch.setmaxregister_decrease(self.num_regs_empty)
+            if const_expr(self.is_dynamic_persistent):
+                cute.arch.setmaxregister_decrease(self.num_regs_mma)
+                if is_first_cta_in_cluster:
+                    self.clc_scheduler_warp(TileSchedulerCls)
+            else:
+                cute.arch.setmaxregister_decrease(self.num_regs_empty)
 
         #  RELAY
         # (14)
@@ -1651,6 +1708,19 @@ class FlashAttentionBackwardSm100:
         return
 
     @cute.jit
+    def clc_scheduler_warp(
+        self,
+        TileSchedulerCls: Callable,
+    ):
+        tile_scheduler = TileSchedulerCls(is_scheduler_warp=True)
+        is_valid = tile_scheduler.initial_work_tile_info().is_valid_tile
+
+        while is_valid:
+            is_valid = tile_scheduler.advance_to_next_work(is_scheduler_warp=True)
+
+        tile_scheduler.producer_tail()
+
+    @cute.jit
     def relay(
         self,
         dS_cluster_full_mbar_ptr: cute.Pointer,
@@ -1777,14 +1847,14 @@ class FlashAttentionBackwardSm100:
             )
 
         tile_scheduler = TileSchedulerCls()
-        if const_expr(self.is_persistent):
+        if const_expr(self.is_persistent or self.is_dynamic_persistent):
             consumer_state_epi_load = cutlass.pipeline.make_pipeline_state(
                 cutlass.pipeline.PipelineUserType.Consumer, 2
             )
             is_first_tile = True
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
-            if const_expr(self.is_persistent):
+            if const_expr(self.is_persistent or self.is_dynamic_persistent):
                 if not is_first_tile:
                     pipeline_epi_to_load.consumer_wait(consumer_state_epi_load)
                     with cute.arch.elect_one():
@@ -2224,7 +2294,7 @@ class FlashAttentionBackwardSm100:
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
 
-        if const_expr(self.is_persistent):
+        if const_expr(self.is_persistent or self.is_dynamic_persistent):
             if not is_first_tile:
                 pipeline_epi_to_load.consumer_wait(consumer_state_epi_load)
                 with cute.arch.elect_one():
@@ -2625,7 +2695,7 @@ class FlashAttentionBackwardSm100:
                     dS_cluster_phase ^= 1
                     producer_phase_dQ ^= 1
 
-                    if const_expr(not self.is_persistent):
+                    if const_expr(not self.is_persistent and not self.is_dynamic_persistent):
                         producer_phase_acc ^= 1
             else:
                 if is_leader_cta and process_tile:
@@ -2741,7 +2811,7 @@ class FlashAttentionBackwardSm100:
                     pipeline_dS.consumer_release(consumer_state_dS)
                     consumer_state_dS.advance()
 
-                    if const_expr(not self.is_persistent):
+                    if const_expr(not self.is_persistent and not self.is_dynamic_persistent):
                         producer_phase_acc ^= 1
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
@@ -3026,7 +3096,7 @@ class FlashAttentionBackwardSm100:
         consumer_state_dPsum = pipeline.make_pipeline_state(
             cutlass.pipeline.PipelineUserType.Consumer, self.dO_stage
         )
-        if const_expr(self.is_persistent):
+        if const_expr(self.is_persistent or self.is_dynamic_persistent):
             producer_state_epi_load = cutlass.pipeline.make_pipeline_state(
                 cutlass.pipeline.PipelineUserType.Producer, 2
             )
@@ -3476,7 +3546,7 @@ class FlashAttentionBackwardSm100:
                                 for j in cutlass.range_constexpr(tdVgdV.shape[2]):
                                     cute.copy(gmem_tiled_copy_zero_dV, zero, tdVgdV[None, i, j])
 
-            if const_expr(self.is_persistent):
+            if const_expr(self.is_persistent or self.is_dynamic_persistent):
                 with cute.arch.elect_one():
                     pipeline_epi_to_load.producer_commit(producer_state_epi_load)
                 producer_state_epi_load.advance()
