@@ -383,6 +383,7 @@ def gemm_ptx_partial(
     # sA_offset: Int32 = 0,
     # acc_offset: Int32 = 0,
     tA_addr: Optional[Int32] = None,
+    cta_group: Optional[int] = 1,
 ) -> None:
     # acc_tmem_addr += acc_offset
     cta_group = 2 if op.cta_group == tcgen05.CtaGroup.TWO else 1

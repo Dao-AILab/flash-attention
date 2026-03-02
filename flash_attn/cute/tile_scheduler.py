@@ -585,6 +585,7 @@ class CLCDynamicPersistentBWDTileScheduler:
         cute.arch.fence_view_async_shared()
         self._clc_phase ^= 1
 
+
         return Int32(n_block), Int32(head_idx), Int32(batch_idx), (is_valid_i32 != 0)
 
     # producer (scheduler warp)

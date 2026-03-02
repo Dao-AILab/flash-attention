@@ -1392,15 +1392,15 @@ class FlashAttentionBackwardSm100:
         sdPsum = storage.sdPsum.get_tensor(sdPsum_layout)
         if const_expr(self.use_2cta_instrs):
             if const_expr(not self.dKV_postprocess):
-                sdV = storage.sV.get_tensor(
+                sdV = storage.sK.get_tensor(
                     sdV_layout.outer, swizzle=sdV_layout.inner, dtype=self.dv_dtype
                 )
-                sdK = storage.sK.get_tensor(
+                sdK = storage.sV.get_tensor(
                     sdK_layout.outer, swizzle=sdK_layout.inner, dtype=self.dk_dtype
                 )
             else:
-                sdV = storage.sV.get_tensor(sdV_layout, dtype=self.dv_dtype)
-                sdK = storage.sK.get_tensor(sdK_layout, dtype=self.dk_dtype)
+                sdV = storage.sK.get_tensor(sdV_layout, dtype=self.dv_dtype)
+                sdK = storage.sV.get_tensor(sdK_layout, dtype=self.dk_dtype)
         elif const_expr(not self.dKV_postprocess):
             sdV = storage.sdO.get_tensor(
                 sdV_layout.outer, swizzle=sdV_layout.inner, dtype=self.dv_dtype
@@ -1854,14 +1854,15 @@ class FlashAttentionBackwardSm100:
             is_first_tile = True
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
-            if const_expr(self.is_persistent or self.is_dynamic_persistent):
+
+            if const_expr(self.is_persistent or self.is_dynamic_persistent) and const_expr(not self.use_2cta_instrs or not self.use_tma_store):
                 if not is_first_tile:
                     pipeline_epi_to_load.consumer_wait(consumer_state_epi_load)
                     with cute.arch.elect_one():
                         pipeline_epi_to_load.consumer_release(consumer_state_epi_load)
                     consumer_state_epi_load.advance()
                 is_first_tile = False
-
+            
             n_block, head_idx, batch_idx, _ = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
             m_block_min, m_block_max = block_info.get_m_block_min_max(
@@ -2177,13 +2178,23 @@ class FlashAttentionBackwardSm100:
                         #### Prologue ####
                         if const_expr(should_load_Q):
                             # K & Q (for S)
+
+                            
                             pipeline_Q.producer_acquire(
                                 producer_state_Q_LSE, extra_tx_count=self.tma_copy_bytes["K"]
                             )
-                            load_K(
-                                tma_bar_ptr=pipeline_Q.producer_get_barrier(producer_state_Q_LSE)
-                            )
+                            
                             load_Q(first_m_block, producer_state=producer_state_Q_LSE)
+                            
+                            if const_expr(self.is_persistent or self.is_dynamic_persistent) and const_expr(self.use_2cta_instrs and self.use_tma_store):
+                                if not is_first_tile:
+                                    pipeline_epi_to_load.consumer_wait(consumer_state_epi_load)
+                                    with cute.arch.elect_one():
+                                        pipeline_epi_to_load.consumer_release(consumer_state_epi_load)
+                                    consumer_state_epi_load.advance()
+                            
+                            load_K(tma_bar_ptr=pipeline_Q.producer_get_barrier(producer_state_Q_LSE))
+                            
                             pipeline_Q.producer_commit(producer_state_Q_LSE)
 
                             # LSE
@@ -2198,6 +2209,7 @@ class FlashAttentionBackwardSm100:
                                 )
                             producer_state_Q_LSE.advance()
 
+                        
                         if const_expr(should_load_dO):
                             pipeline_dO.producer_acquire(
                                 producer_state_dO_dPsum,
@@ -2205,12 +2217,23 @@ class FlashAttentionBackwardSm100:
                                 if const_expr(tma_atom_dOt is not None)
                                 else self.tma_copy_bytes["V"],
                             )
+
+                            load_dO(first_m_block, producer_state=producer_state_dO_dPsum)
+                            
+                            if const_expr(self.is_persistent or self.is_dynamic_persistent) and const_expr(self.use_2cta_instrs and self.use_tma_store):
+                                if not is_first_tile:
+                                    pipeline_epi_to_load.consumer_wait(consumer_state_epi_load)
+                                    with cute.arch.elect_one():
+                                        pipeline_epi_to_load.consumer_release(consumer_state_epi_load)
+                                    consumer_state_epi_load.advance()
+                                is_first_tile = False
+                            
                             load_V(
                                 tma_bar_ptr=pipeline_dO.producer_get_barrier(
                                     producer_state_dO_dPsum
                                 )
                             )
-                            load_dO(first_m_block, producer_state=producer_state_dO_dPsum)
+                            
                             if const_expr(tma_atom_dOt is not None):
                                 load_dOt(first_m_block, producer_state=producer_state_dO_dPsum)
                             pipeline_dO.producer_commit(producer_state_dO_dPsum)
@@ -2300,6 +2323,7 @@ class FlashAttentionBackwardSm100:
                 with cute.arch.elect_one():
                     pipeline_epi_to_load.consumer_release(consumer_state_epi_load)
                 consumer_state_epi_load.advance()
+        
         if const_expr(self.use_2cta_instrs and self.tile_hdim == 192):
             pipeline_Q.producer_tail(producer_state_Q_Qt)
             pipeline_LSE.producer_tail(producer_state_LSE)
@@ -2582,7 +2606,7 @@ class FlashAttentionBackwardSm100:
                     # 3. dV = P @ dO
 
                     # 1) S = K @ Q
-                    pipeline_dQ.sync_object_empty.wait(0, producer_phase_dQ)
+                    #pipeline_dQ.sync_object_empty.wait(0, producer_phase_dQ)
                     pipeline_Q.consumer_wait(consumer_state_Q)
                     pipeline_S_P.sync_object_empty.wait(0, producer_phase_acc)
                     mma_qk_fn(B_idx=consumer_state_Q.index)
@@ -3469,6 +3493,12 @@ class FlashAttentionBackwardSm100:
                         mdV_semaphore,
                         "V",
                     )
+
+                    if const_expr(self.is_persistent or self.is_dynamic_persistent) and const_expr(self.use_2cta_instrs):
+                        with cute.arch.elect_one():
+                            pipeline_epi_to_load.producer_commit(producer_state_epi_load)
+                        producer_state_epi_load.advance()
+                    
                     #### STORE dK
                     consumer_state_dKV = self.epilogue_dK_or_dV_tma(
                         dp_idx,
@@ -3491,6 +3521,12 @@ class FlashAttentionBackwardSm100:
                     )
             # Zero dK/dV for empty tiles (local attention or block sparsity)
             # When total_m_block_cnt == 0 for block sparsity, no Q tiles contribute to this KV tile
+
+            if const_expr(self.is_persistent or self.is_dynamic_persistent):
+                with cute.arch.elect_one():
+                    pipeline_epi_to_load.producer_commit(producer_state_epi_load)
+                producer_state_epi_load.advance()
+            
             if const_expr(not self.dKV_postprocess):
                 should_zero_dKV = False
                 if const_expr(self.is_local or self.is_varlen_q):
@@ -3546,10 +3582,6 @@ class FlashAttentionBackwardSm100:
                                 for j in cutlass.range_constexpr(tdVgdV.shape[2]):
                                     cute.copy(gmem_tiled_copy_zero_dV, zero, tdVgdV[None, i, j])
 
-            if const_expr(self.is_persistent or self.is_dynamic_persistent):
-                with cute.arch.elect_one():
-                    pipeline_epi_to_load.producer_commit(producer_state_epi_load)
-                producer_state_epi_load.advance()
 
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
@@ -4107,11 +4139,18 @@ class FlashAttentionBackwardSm100:
 
         # semaphore release
         # NOTE: arrive_inc calls red_release which issues membar
-        if const_expr(deterministic_KV):
+        if const_expr(
+            deterministic_KV
+            or (
+                (K_or_V == "K" or K_or_V == "V")
+                and (self.is_persistent or self.is_dynamic_persistent)
+            )
+        ):
             if leader_warp:
                 cute.arch.cp_async_bulk_commit_group()
                 cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
             cute.arch.barrier(barrier_id=barrier_id + wg_idx, number_of_threads=128)
+        if const_expr(deterministic_KV):
             barrier.arrive_inc(mdKV_semaphore_cur.iterator, tidx, wg_idx, 1)
 
         cute.arch.sync_warp()
