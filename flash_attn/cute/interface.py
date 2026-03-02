@@ -31,6 +31,8 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+from flash_attn.cute.cache_utils import get_jit_cache
+from flash_attn.cute.testing import is_fake_mode
 
 
 if os.environ.get("CUTE_DSL_PTXAS_PATH", None) is not None:
@@ -519,6 +521,9 @@ def _flash_attn_fwd(
             options="--enable-tvm-ffi",
         )
 
+    if is_fake_mode():
+        return out, lse
+
     _flash_attn_fwd.compile_cache[compile_key](
         q.detach(),
         k.detach(),
@@ -550,7 +555,7 @@ def _flash_attn_fwd(
     return out, lse
 
 
-_flash_attn_fwd.compile_cache = {}
+_flash_attn_fwd.compile_cache = get_jit_cache("fwd")
 
 
 def _flash_attn_bwd(
@@ -886,17 +891,18 @@ def _flash_attn_bwd(
             current_stream,
             options="--enable-tvm-ffi",
         )
-    _flash_attn_bwd.compile_cache_pre[compile_key_pre](
-        out,
-        dout,
-        dpsum,
-        lse,
-        lse_log2,
-        dq_accum,
-        cu_seqlens_q,
-        seqused_q,
-        current_stream,
-    )
+    if not is_fake_mode():
+        _flash_attn_bwd.compile_cache_pre[compile_key_pre](
+            out,
+            dout,
+            dpsum,
+            lse,
+            lse_log2,
+            dq_accum,
+            cu_seqlens_q,
+            seqused_q,
+            current_stream,
+        )
 
     # NB num_threads application for 3 kernels
     # There are pre, main, post processing kernels, currenlty num_threads is only actually
@@ -1109,31 +1115,32 @@ def _flash_attn_bwd(
             sparse_tensors_compile,
             options="--enable-tvm-ffi",
         )
-    _flash_attn_bwd.compile_cache[compile_key](
-        q.detach(),
-        k.detach(),
-        v.detach(),
-        dout,
-        lse_log2,
-        dpsum,
-        dq_accum,
-        dk if not dKV_postprocess else dk_accum,
-        dv if not dKV_postprocess else dv_accum,
-        softmax_scale,
-        current_stream,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        seqused_q,
-        seqused_k,
-        None,  # softcap - not yet supported in backward
-        window_size_left,
-        window_size_right,
-        dQ_semaphore,
-        dK_semaphore,
-        dV_semaphore,
-        aux_tensors,
-        normalized_block_sparse_tensors[:4] if normalized_block_sparse_tensors is not None else None,
-    )
+    if not is_fake_mode():
+        _flash_attn_bwd.compile_cache[compile_key](
+            q.detach(),
+            k.detach(),
+            v.detach(),
+            dout,
+            lse_log2,
+            dpsum,
+            dq_accum,
+            dk if not dKV_postprocess else dk_accum,
+            dv if not dKV_postprocess else dv_accum,
+            softmax_scale,
+            current_stream,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            seqused_q,
+            seqused_k,
+            None,  # softcap - not yet supported in backward
+            window_size_left,
+            window_size_right,
+            dQ_semaphore,
+            dK_semaphore,
+            dV_semaphore,
+            aux_tensors,
+            normalized_block_sparse_tensors[:4] if normalized_block_sparse_tensors is not None else None,
+        )
 
     num_threads = 256 if arch // 10 == 9 else 128
     # Postprocess kernel: convert dq_accum from float32 to dq in bf16/fp16
@@ -1172,14 +1179,16 @@ def _flash_attn_bwd(
             current_stream,
             options="--enable-tvm-ffi",
         )
-    _flash_attn_bwd.compile_cache_post[compile_key_post](
-        dq_accum,
-        dq,
-        softmax_scale,
-        cu_seqlens_q,
-        seqused_q,
-        current_stream,
-    )
+
+    if not is_fake_mode():
+        _flash_attn_bwd.compile_cache_post[compile_key_post](
+            dq_accum,
+            dq,
+            softmax_scale,
+            cu_seqlens_q,
+            seqused_q,
+            current_stream,
+        )
 
     if dKV_postprocess:
         # Postprocess kernel: convert dk_accum & dv_accum from float32 to bf16/fp16
@@ -1218,14 +1227,15 @@ def _flash_attn_bwd(
                 current_stream,
                 options="--enable-tvm-ffi",
             )
-        _flash_attn_bwd.compile_cache_post[compile_key_post](
-            dk_accum,
-            dk,
-            softmax_scale,
-            cu_seqlens_k,
-            seqused_k,
-            current_stream,
-        )
+        if not is_fake_mode():
+            _flash_attn_bwd.compile_cache_post[compile_key_post](
+                dk_accum,
+                dk,
+                softmax_scale,
+                cu_seqlens_k,
+                seqused_k,
+                current_stream,
+            )
         compile_key_post = (
             arch,
             dtype,
@@ -1261,21 +1271,22 @@ def _flash_attn_bwd(
                 current_stream,
                 options="--enable-tvm-ffi",
             )
-        _flash_attn_bwd.compile_cache_post[compile_key_post](
-            dv_accum,
-            dv,
-            1.0,
-            cu_seqlens_k,
-            seqused_k,
-            current_stream,
-        )
+        if not is_fake_mode():
+            _flash_attn_bwd.compile_cache_post[compile_key_post](
+                dv_accum,
+                dv,
+                1.0,
+                cu_seqlens_k,
+                seqused_k,
+                current_stream,
+            )
 
     return dq, dk, dv
 
 
-_flash_attn_bwd.compile_cache_pre = {}
-_flash_attn_bwd.compile_cache = {}
-_flash_attn_bwd.compile_cache_post = {}
+_flash_attn_bwd.compile_cache_pre = get_jit_cache("bwd_pre")
+_flash_attn_bwd.compile_cache = get_jit_cache("bwd")
+_flash_attn_bwd.compile_cache_post = get_jit_cache("bwd_post")
 
 
 class FlashAttnFunc(torch.autograd.Function):
@@ -1693,20 +1704,21 @@ def _flash_attn_fwd_combine(
             current_stream,
             options="--enable-tvm-ffi",
         )
-    _flash_attn_fwd_combine.compile_cache[compile_key](
-        out_partial,
-        lse_partial,
-        out,
-        lse,
-        cu_seqlens,
-        seqused,
-        num_splits_dynamic_ptr,
-        semaphore_to_reset,
-        current_stream,
-    )
+    if not is_fake_mode():
+        _flash_attn_fwd_combine.compile_cache[compile_key](
+            out_partial,
+            lse_partial,
+            out,
+            lse,
+            cu_seqlens,
+            seqused,
+            num_splits_dynamic_ptr,
+            semaphore_to_reset,
+            current_stream,
+        )
 
 
-_flash_attn_fwd_combine.compile_cache = {}
+_flash_attn_fwd_combine.compile_cache = get_jit_cache("fwd_combine")
 
 
 def flash_attn_combine(
