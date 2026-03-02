@@ -518,28 +518,30 @@ def _flash_attn_fwd(
             options="--enable-tvm-ffi",
         )
 
-    if is_fake_mode():
-        return out, lse
-
-    _flash_attn_fwd.compile_cache[compile_key](
-        q.detach(),
-        k.detach(),
-        v.detach(),
-        out.detach() if not is_split_kv else out_partial,
-        lse_partial if is_split_kv else lse,
-        softmax_scale,
-        current_stream,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        seqused_q,
-        seqused_k,
-        page_table,
-        window_size_left,
-        window_size_right,
-        learnable_sink,
-        normalized_block_sparse_tensors[:4] if normalized_block_sparse_tensors is not None else None,
-        aux_tensors,
-    )
+    # In "fake mode", we will take torch fake tensors as input and the expected behaviors are:
+    # - Use those fake metadata to populate compilation cache
+    # - Return "fake" output tensors, which could be needed in follow-up fake operations
+    # Thus, we skip the actual kernel invocation here.
+    if not is_fake_mode():
+        _flash_attn_fwd.compile_cache[compile_key](
+            q.detach(),
+            k.detach(),
+            v.detach(),
+            out.detach() if not is_split_kv else out_partial,
+            lse_partial if is_split_kv else lse,
+            softmax_scale,
+            current_stream,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            seqused_q,
+            seqused_k,
+            page_table,
+            window_size_left,
+            window_size_right,
+            learnable_sink,
+            normalized_block_sparse_tensors[:4] if normalized_block_sparse_tensors is not None else None,
+            aux_tensors,
+        )
     if is_split_kv:
         _flash_attn_fwd_combine(
             out_partial,

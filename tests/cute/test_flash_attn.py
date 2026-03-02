@@ -30,6 +30,7 @@ from flash_attn.cute.interface import (
 )
 
 # torch FakeTensorMode would enable fast cutedsl kernel compilation without allocating the actual GPU memory or running the kernel
+# When operating fake tensors, we cannot perform data-dependent operations (e.g., `tensor.max()`).
 USE_FAKE_TENSOR = int(os.getenv("FLASH_ATTENTION_FAKE_TENSOR", 0)) == 1
 DISABLE_SPLIT = os.getenv("FLASH_ATTENTION_DISABLE_SPLIT", "FALSE") == "TRUE"
 # SplitKV and paged KV are not supported on SM90
@@ -191,42 +192,41 @@ def test_flash_attn_output(
             q_descale, k_descale, v_descale = None, None, None
         q, k, v = [x.detach().to(dtype).requires_grad_() for x in (q_ref, k_ref, v_ref)]
         qv = qv_ref.detach().to(dtype).requires_grad_() if has_qv else None
-        if not is_fake_mode():
-            out_ref, attn_ref = attention_ref(
-                q_ref,
-                k_ref,
-                v_ref,
-                None,
-                None,
-                causal=causal,
-                qv=qv_ref,
-                q_descale=q_descale,
-                k_descale=k_descale,
-                v_descale=v_descale,
-                window_size=window_size,
-                attention_chunk=attention_chunk,
-                learnable_sink=learnable_sink,
-                softcap=softcap,
-            )
-            out_pt, attn_pt = attention_ref(
-                q_ref,
-                k_ref,
-                v_ref,
-                None,
-                None,
-                causal=causal,
-                qv=qv_ref,
-                q_descale=q_descale,
-                k_descale=k_descale,
-                v_descale=v_descale,
-                window_size=window_size,
-                attention_chunk=attention_chunk,
-                learnable_sink=learnable_sink,
-                softcap=softcap,
-                upcast=False,
-                reorder_ops=True,
-                intermediate_dtype=dtype if dtype == torch.float8_e4m3fn else None,
-            )
+        out_ref, attn_ref = attention_ref(
+            q_ref,
+            k_ref,
+            v_ref,
+            None,
+            None,
+            causal=causal,
+            qv=qv_ref,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            window_size=window_size,
+            attention_chunk=attention_chunk,
+            learnable_sink=learnable_sink,
+            softcap=softcap,
+        )
+        out_pt, attn_pt = attention_ref(
+            q_ref,
+            k_ref,
+            v_ref,
+            None,
+            None,
+            causal=causal,
+            qv=qv_ref,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            window_size=window_size,
+            attention_chunk=attention_chunk,
+            learnable_sink=learnable_sink,
+            softcap=softcap,
+            upcast=False,
+            reorder_ops=True,
+            intermediate_dtype=dtype if dtype == torch.float8_e4m3fn else None,
+        )
 
         # k_extended = repeat(k_ref, "b s h d -> b s (h k) d", k=nheads // nheads_kv)
         # qk = torch.einsum('bshd,bthd->bhst', q_ref, k_extended).float()
@@ -270,6 +270,8 @@ def test_flash_attn_output(
                 deterministic=deterministic,
             )
             if is_fake_mode():
+                # no more flash_attn cutedsl calls for the rest of the loop
+                # skip data-dependent postprocessing
                 continue
             print(f"Output max diff: {(out - out_ref).abs().max().item()}")
             print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
@@ -294,21 +296,22 @@ def test_flash_attn_output(
             # and False
             and not ((causal or local) and seqlen_k < seqlen_q)
         ):
-            if not is_fake_mode():
-                # TODO: SM90 backward pass has invalid MMA tile config for d=64 + non-causal
-                # The m_block_size=80 (non-causal) with head_dim=64 creates an invalid tile.
-                # Fix requires adjusting m_block_size or MMA config in flash_bwd_sm90.py
-                if IS_SM90 and d == 64 and not causal:
-                    pytest.xfail("SM90 backward: d=64 + non-causal has invalid MMA tile config (m_block=80)")
-                # TODO: SM90 backward pass does not support local attention yet
-                if IS_SM90 and local:
-                    pytest.xfail("SM90 backward: local attention not supported yet")
-                if d == 192 and local:
-                    pytest.xfail("hdim 192 backward: local attention not supported yet")
+            # TODO: SM90 backward pass has invalid MMA tile config for d=64 + non-causal
+            # The m_block_size=80 (non-causal) with head_dim=64 creates an invalid tile.
+            # Fix requires adjusting m_block_size or MMA config in flash_bwd_sm90.py
+            if IS_SM90 and d == 64 and not causal:
+                pytest.xfail("SM90 backward: d=64 + non-causal has invalid MMA tile config (m_block=80)")
+            # TODO: SM90 backward pass does not support local attention yet
+            if IS_SM90 and local:
+                pytest.xfail("SM90 backward: local attention not supported yet")
+            if d == 192 and local:
+                pytest.xfail("hdim 192 backward: local attention not supported yet")
             g = torch.randn_like(out)
             # do_o = ((g.float() * out.float()).sum(-1)).transpose(1, 2)
             dq, dk, dv = torch.autograd.grad(out, (q, k, v), g)
             if is_fake_mode():
+                # no more flash_attn cutedsl calls for the rest of the loop
+                # skip data-dependent postprocessing
                 continue
             # print(f"dO_O max diff: {(softmax_d - do_o).abs().max().item()}")
             # assert (softmax_d - do_o).abs().max().item() <= 1e-5
@@ -634,47 +637,46 @@ def test_flash_attn_varlen_output(
             x.detach().to(dtype).requires_grad_() for x in (q_unpad, k_unpad, v_unpad)
         ]
 
-        if not is_fake_mode():
-            out_ref, attn_ref = attention_ref(
-                q_ref,
-                k_ref,
-                v_ref,
-                query_padding_mask,
-                key_padding_mask,
-                causal=causal,
-                qv=qv_ref,
-                q_descale=q_descale,
-                k_descale=k_descale,
-                v_descale=v_descale,
-                window_size=window_size,
-                attention_chunk=attention_chunk,
-                learnable_sink=learnable_sink,
-                softcap=softcap,
-            )
-            out_pt, attn_pt = attention_ref(
-                q_ref,
-                k_ref,
-                v_ref,
-                query_padding_mask,
-                key_padding_mask,
-                causal=causal,
-                qv=qv_ref,
-                q_descale=q_descale,
-                k_descale=k_descale,
-                v_descale=v_descale,
-                window_size=window_size,
-                attention_chunk=attention_chunk,
-                learnable_sink=learnable_sink,
-                softcap=softcap,
-                upcast=False,
-                reorder_ops=True,
-                intermediate_dtype=dtype if dtype == torch.float8_e4m3fn else None,
-            )
+        out_ref, attn_ref = attention_ref(
+            q_ref,
+            k_ref,
+            v_ref,
+            query_padding_mask,
+            key_padding_mask,
+            causal=causal,
+            qv=qv_ref,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            window_size=window_size,
+            attention_chunk=attention_chunk,
+            learnable_sink=learnable_sink,
+            softcap=softcap,
+        )
+        out_pt, attn_pt = attention_ref(
+            q_ref,
+            k_ref,
+            v_ref,
+            query_padding_mask,
+            key_padding_mask,
+            causal=causal,
+            qv=qv_ref,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            window_size=window_size,
+            attention_chunk=attention_chunk,
+            learnable_sink=learnable_sink,
+            softcap=softcap,
+            upcast=False,
+            reorder_ops=True,
+            intermediate_dtype=dtype if dtype == torch.float8_e4m3fn else None,
+        )
 
+        if not is_fake_mode():
             print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
             print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
 
-        if not is_fake_mode():
             if query_unused_mask is not None:
                 q_zero_masking = rearrange(query_unused_mask, "b s -> b s 1 1")
 
@@ -715,6 +717,8 @@ def test_flash_attn_varlen_output(
             )
             out = output_pad_fn(out_unpad) if unpad_q else out_unpad
             if is_fake_mode():
+                # no more flash_attn cutedsl calls for the rest of the loop
+                # skip data-dependent postprocessing
                 continue
             if query_unused_mask is not None:
                 out.masked_fill_(q_zero_masking, 0.0)
@@ -777,6 +781,8 @@ def test_flash_attn_varlen_output(
                 g_unpad
             )
             if is_fake_mode():
+                # no more flash_attn cutedsl calls for the rest of the loop
+                # skip data-dependent postprocessing
                 continue
             dq = dq_pad_fn(dq_unpad) if unpad_q else dq_unpad
             dk = dk_pad_fn(dk_unpad) if unpad_kv else dk_unpad
@@ -1231,42 +1237,41 @@ def test_flash_attn_kvcache(
                 v_to_update = v_to_update[indices_k]
             k_cache_ref[update_mask] = k_to_update
             v_cache_ref[update_mask] = v_to_update
-        if not is_fake_mode():
-            k_cache_rep = repeat(
-                k_cache_ref, "b s h d -> b s (h g) d", g=nheads // nheads_k
-            )
-            v_cache_rep = repeat(
-                v_cache_ref, "b s h d -> b s (h g) d", g=nheads // nheads_k
-            )
-            out_ref, _ = attention_ref(
-                q_ro,
-                k_cache_rep,
-                v_cache_rep,
-                query_padding_mask,
-                key_padding_mask,
-                causal=causal,
-                qv=qv,
-                window_size=window_size,
-                learnable_sink=learnable_sink,
-                attention_chunk=attention_chunk,
-                key_leftpad=cache_leftpad,
-            )
-            out_pt, _ = attention_ref(
-                q_ro,
-                k_cache_rep,
-                v_cache_rep,
-                query_padding_mask,
-                key_padding_mask,
-                causal=causal,
-                qv=qv,
-                window_size=window_size,
-                learnable_sink=learnable_sink,
-                attention_chunk=attention_chunk,
-                upcast=False,
-                reorder_ops=True,
-                key_leftpad=cache_leftpad,
-                intermediate_dtype=dtype if dtype == torch.float8_e4m3fn else None,
-            )
+        k_cache_rep = repeat(
+            k_cache_ref, "b s h d -> b s (h g) d", g=nheads // nheads_k
+        )
+        v_cache_rep = repeat(
+            v_cache_ref, "b s h d -> b s (h g) d", g=nheads // nheads_k
+        )
+        out_ref, _ = attention_ref(
+            q_ro,
+            k_cache_rep,
+            v_cache_rep,
+            query_padding_mask,
+            key_padding_mask,
+            causal=causal,
+            qv=qv,
+            window_size=window_size,
+            learnable_sink=learnable_sink,
+            attention_chunk=attention_chunk,
+            key_leftpad=cache_leftpad,
+        )
+        out_pt, _ = attention_ref(
+            q_ro,
+            k_cache_rep,
+            v_cache_rep,
+            query_padding_mask,
+            key_padding_mask,
+            causal=causal,
+            qv=qv,
+            window_size=window_size,
+            learnable_sink=learnable_sink,
+            attention_chunk=attention_chunk,
+            upcast=False,
+            reorder_ops=True,
+            key_leftpad=cache_leftpad,
+            intermediate_dtype=dtype if dtype == torch.float8_e4m3fn else None,
+        )
         q = q.to(dtype)
         q_unpad = q_unpad.to(dtype) if varlen_q else None
         k_cache = k_cache.to(dtype)
@@ -1343,6 +1348,8 @@ def test_flash_attn_kvcache(
                 if varlen_q:
                     out = output_pad_fn(out)
                 if is_fake_mode():
+                    # no more flash_attn cutedsl calls for the rest of the loop
+                    # skip data-dependent postprocessing
                     continue
                 # out = flash_attn_with_kvcache(
                 #     q, k_cache, v_cache, cache_seqlens=cache_seqlens, causal=causal, window_size=window_size
