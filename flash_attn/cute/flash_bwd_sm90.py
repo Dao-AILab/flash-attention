@@ -105,7 +105,6 @@ class FlashAttentionBackwardSm90:
         )
         self.V_in_regs = V_in_regs
         # May be overridden in __call__ for varlen inputs.
-        self.direct_dkv_store = qhead_per_kvhead == 1
         if qhead_per_kvhead > 1:
             assert self.same_hdim_kv, "GQA backward requires head_dim == head_dim_v"
             assert self.num_mma_warp_groups == 2, "GQA backward assumes 2 warp groups"
@@ -794,29 +793,15 @@ class FlashAttentionBackwardSm90:
                     if const_expr(self.qhead_per_kvhead == 1)
                     else head_idx // qhead_per_kvhead_divmod
                 )
-                if const_expr(not seqlen.has_cu_seqlens_k):
-                    mK_cur = mK[None, None, head_idx_kv, batch_idx]
-                else:
-                    mK_cur = cute.domain_offset((seqlen.offset_k, 0), mK[None, None, head_idx_kv])
+                mK_cur = seqlen.offset_batch_K(mK, batch_idx, dim=3)[None, None, head_idx_kv]
+                mV_cur = seqlen.offset_batch_K(mV, batch_idx, dim=3)[None, None, head_idx_kv]
                 gK = cute.local_tile(mK_cur, (self.tile_n, self.tile_hdim), (n_block, 0))
-                if const_expr(not seqlen.has_cu_seqlens_k):
-                    mV_cur = mV[None, None, head_idx_kv, batch_idx]
-                else:
-                    mV_cur = cute.domain_offset((seqlen.offset_k, 0), mV[None, None, head_idx_kv])
                 gV = cute.local_tile(mV_cur, (self.tile_n, self.tile_hdimv), (n_block, 0))
 
-                if const_expr(not seqlen.has_cu_seqlens_q):
-                    mQ_cur = mQ[None, None, head_idx, batch_idx]
-                    mLSE_cur = mLSE[None, head_idx, batch_idx]
-                    mdO_cur = mdO[None, None, head_idx, batch_idx]
-                    mdPsum_cur = mdPsum[None, head_idx, batch_idx]
-                else:
-                    mQ_cur = cute.domain_offset((seqlen.offset_q, 0), mQ[None, None, head_idx])
-                    mLSE_cur = cute.domain_offset((seqlen.padded_offset_q,), mLSE[None, head_idx])
-                    mdO_cur = cute.domain_offset((seqlen.offset_q, 0), mdO[None, None, head_idx])
-                    mdPsum_cur = cute.domain_offset(
-                        (seqlen.padded_offset_q,), mdPsum[None, head_idx]
-                    )
+                mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, head_idx]
+                mLSE_cur = seqlen.offset_batch_Q(mLSE, batch_idx, dim=2, padded=True)[None, head_idx]
+                mdO_cur = seqlen.offset_batch_Q(mdO, batch_idx, dim=3)[None, None, head_idx]
+                mdPsum_cur = seqlen.offset_batch_Q(mdPsum, batch_idx, dim=2, padded=True)[None, head_idx]
                 gQ = cute.local_tile(mQ_cur, (self.tile_m, self.tile_hdim), (None, 0))
                 gdO = cute.local_tile(mdO_cur, (self.tile_m, self.tile_hdimv), (None, 0))
                 gLSE = cute.local_tile(mLSE_cur, (self.tile_m,), (None,))
@@ -1474,12 +1459,8 @@ class FlashAttentionBackwardSm90:
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
         if const_expr(self.direct_dkv_store):
-            if const_expr(not seqlen.has_cu_seqlens_k):
-                mdV_cur = mdV[None, None, head_idx, batch_idx]
-                mdK_cur = mdK[None, None, head_idx, batch_idx]
-            else:
-                mdV_cur = cute.domain_offset((seqlen.offset_k, 0), mdV[None, None, head_idx])
-                mdK_cur = cute.domain_offset((seqlen.offset_k, 0), mdK[None, None, head_idx])
+            mdV_cur = mdV[None, None, head_idx, batch_idx]
+            mdK_cur = mdK[None, None, head_idx, batch_idx]
             gdK = cute.local_tile(mdK_cur, (self.tile_n, self.tile_hdim), (n_block, 0))
             gdV = cute.local_tile(mdV_cur, (self.tile_n, self.tile_hdimv), (n_block, 0))
             store_dK, _, _ = copy_utils.tma_get_copy_fn(
