@@ -3,6 +3,7 @@
 import math
 import itertools
 import os
+import random
 
 import pytest
 import torch
@@ -113,7 +114,9 @@ def test_flash_attn_output(
         pytest.skip()
     device = "cuda"
     # set seed
-    torch.random.manual_seed(0)
+    seed = 0
+    random.seed(seed)
+    torch.random.manual_seed(seed)
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
     batch_size = 9 if seqlen_k <= 2048 else 2
@@ -163,14 +166,9 @@ def test_flash_attn_output(
         else:
             qv_ref = None
         # Put window_size after QKV randn so that window_size changes from test to test
-        if not is_fake_mode():
-            window_size = (
-                (None, None) if not local else torch.randint(0, seqlen_k, (2,)).tolist()
-            )
-        else:
-            window_size = (
-                (None, None) if not local else (seqlen_k, seqlen_k)
-            )
+        window_size = (
+            (None, None) if not local else tuple(random.randrange(0, seqlen_k) for _ in range(2))
+        )
         if local_enum == 2:
             window_size = (None, -window_size[1])
         elif local_enum == 3:
@@ -483,7 +481,9 @@ def test_flash_attn_varlen_output(
         seqlen_k = seqlen_q
     device = "cuda"
     # set seed
-    torch.random.manual_seed(seqlen_q + seqlen_k + d + int(causal) * 2 + int(local))
+    seed = seqlen_q + seqlen_k + d + int(causal) * 2 + int(local)
+    random.seed(seed)
+    torch.random.manual_seed(seed)
     batch_size = 49 if seqlen_q <= 1024 else 7
     nheads = 6
     # nheads = 1
@@ -530,14 +530,9 @@ def test_flash_attn_varlen_output(
         else:
             qv_ref = None
         # Put window_size after QKV randn so that window_size changes from test to test
-        if not is_fake_mode():
-            window_size = (
-                (None, None) if not local else torch.randint(0, seqlen_k, (2,)).tolist()
-            )
-        else:
-            window_size = (
-                (None, None) if not local else (seqlen_k, seqlen_k)
-            )
+        window_size = (
+            (None, None) if not local else tuple(random.randrange(0, seqlen_k) for _ in range(2))
+        )
         if local_enum == 2:
             window_size = (None, window_size[1])
         elif local_enum == 3:
@@ -956,7 +951,9 @@ def test_flash_attn_kvcache(
         pytest.skip()
     device = "cuda"
     # set seed
-    torch.random.manual_seed(0)
+    seed = 0
+    random.seed(seed)
+    torch.random.manual_seed(seed)
     batch_size = 5
     # batch_size = 1
     batch_size_cache = batch_size if not has_batch_idx else batch_size * 2
@@ -1010,27 +1007,19 @@ def test_flash_attn_kvcache(
             qv_unpad = qv
             cu_seqlens_q, max_seqlen_q = None, None
         # Put window_size after QKV randn so that window_size changes from test to test
-        if not is_fake_mode():
-            window_size = (
-                (None, None) if not local else torch.randint(0, seqlen_k, (2,)).tolist()
-            )
-        else:
-            window_size = (
-                (None, None) if not local else (seqlen_k, seqlen_k)
-            )
+        window_size = (
+            (None, None) if not local else tuple(random.randrange(0, seqlen_k) for _ in range(2))
+        )
         if has_learnable_sink:
             learnable_sink = torch.randn(nheads, dtype=torch.bfloat16, device=device)
         else:
             learnable_sink = None
 
-        if not is_fake_mode():
-            seqlen_new = (
-                seqlen_q
-                if seqlen_new_eq_seqlen_q
-                else torch.randint(1, seqlen_q + 1, (1,)).item()
-            )
-        else:
-            seqlen_new = seqlen_q
+        seqlen_new = (
+            seqlen_q
+            if seqlen_new_eq_seqlen_q
+            else random.randrange(1, seqlen_q + 1)
+        )
         cu_seqlens_k_new = None
         key_new_padding_mask = None
         if new_kv:
