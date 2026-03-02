@@ -299,6 +299,8 @@ class FlashAttentionForwardSm100:
         window_size_right: Int32 | int | None = None,
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        mCuTotalMBlocks: Optional[cute.Tensor] = None,
+        mCuTotalNBlocks: Optional[cute.Tensor] = None,
         aux_tensors: Optional[list] = None,
     ):
         """Execute the Fused Multi-Head Attention operation on the provided tensors.
@@ -670,6 +672,8 @@ class FlashAttentionForwardSm100:
         self.use_block_sparsity = cutlass.const_expr(blocksparse_tensors is not None)
         if cutlass.const_expr(self.use_block_sparsity and mPageTable is not None):
             raise NotImplementedError("Block sparsity + paged KV not supported on SM100")
+        if cutlass.const_expr(self.use_block_sparsity and self.is_varlen_q):
+            assert const_expr(mCuTotalMBlocks is not None), "cu_total_m_blocks must be provided for use with varlen blocksparsity"
 
         # Launch the kernel synchronously
         self.kernel(
@@ -682,6 +686,8 @@ class FlashAttentionForwardSm100:
             mCuSeqlensK,
             mSeqUsedQ,
             mSeqUsedK,
+            mCuTotalMBlocks,
+            mCuTotalNBlocks,
             mPageTable,
             tma_atom_Q,
             tma_atom_K,
@@ -727,6 +733,8 @@ class FlashAttentionForwardSm100:
         mCuSeqlensK: Optional[cute.Tensor],
         mSeqUsedQ: Optional[cute.Tensor],
         mSeqUsedK: Optional[cute.Tensor],
+        mCuTotalMBlocks: Optional[cute.Tensor],
+        mCuTotalNBlocks: Optional[cute.Tensor],
         mPageTable: Optional[cute.Tensor],
         tma_atom_Q: cute.CopyAtom,
         tma_atom_K: Optional[cute.CopyAtom],
@@ -982,6 +990,8 @@ class FlashAttentionForwardSm100:
             mCuSeqlensK=mCuSeqlensK,
             mSeqUsedQ=mSeqUsedQ,
             mSeqUsedK=mSeqUsedK,
+            mCuTotalMBlocks=mCuTotalMBlocks,
+            mCuTotalNBlocks=mCuTotalNBlocks,
         )
         AttentionMaskCls = partial(
             AttentionMask,
@@ -1333,6 +1343,7 @@ class FlashAttentionForwardSm100:
                     batch_idx,
                     head_idx,
                     m_block,
+                    seqlen,
                     kv_producer_state,
                     load_Q,
                     load_K,
@@ -1434,6 +1445,7 @@ class FlashAttentionForwardSm100:
                     m_block,
                     self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
                     self.q_subtile_factor if self.q_subtile_factor is not None else 1,
+                    seqlen_info=seqlen,
                 )
                 process_tile = block_iter_count > Int32(0)
             else:
@@ -1746,6 +1758,7 @@ class FlashAttentionForwardSm100:
                     m_block,
                     self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
                     self.q_subtile_factor if self.q_subtile_factor is not None else 1,
+                    seqlen_info=seqlen,
                 )
                 has_work = tile_block_count > Int32(0)
             else:
@@ -1802,6 +1815,7 @@ class FlashAttentionForwardSm100:
                     batch_idx,
                     head_idx,
                     m_block,
+                    seqlen,
                     softmax_step,
                     mask_fn,
                     mask_fn_none,
@@ -2145,6 +2159,7 @@ class FlashAttentionForwardSm100:
                     m_block,
                     self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
                     self.q_subtile_factor if self.q_subtile_factor is not None else 1,
+                    seqlen_info=seqlen,
                 )
                 has_work = total_block_count > Int32(0)
             else:
