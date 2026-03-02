@@ -1,3 +1,19 @@
+/*
+ * Copyright (c) 2023, NVIDIA CORPORATION. All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 #ifndef CATLASS_EPILOGUE_BLOCK_BLOCK_EPILOGUE_ONLINE_SOFTMAX_NO_MASK_HPP_T
 #define CATLASS_EPILOGUE_BLOCK_BLOCK_EPILOGUE_ONLINE_SOFTMAX_NO_MASK_HPP_T
 
@@ -12,51 +28,69 @@
  
 namespace Catlass::Epilogue::Block {
 
+/**
+ * @brief 在线Softmax块级Epilogue实现
+ * 
+ * 为Atlas A2架构实现的在线Softmax块级Epilogue，用于FlashAttention计算中的Softmax步骤。
+ * 
+ * @tparam OutputType_ 输出类型模板参数
+ * @tparam InputType_ 输入类型模板参数
+ * @tparam MaskType_ 掩码类型模板参数
+ * @tparam LSE_MODE_ 对数和计算模式
+ */
 template <
-    class OutputType_,
-    class InputType_,
-    class MaskType_,
-    LseModeT LSE_MODE_>
+    class OutputType_,          ///< 输出类型模板参数
+    class InputType_,           ///< 输入类型模板参数
+    class MaskType_,            ///< 掩码类型模板参数
+    LseModeT LSE_MODE_>         ///< 对数和计算模式
 class BlockEpilogue<
-    EpilogueAtlasA2OnlineSoftmaxT<LSE_MODE_, float>,
+    EpilogueAtlasA2OnlineSoftmaxT<LSE_MODE_, float>,  ///< Atlas A2在线Softmax调度策略
     OutputType_,
     InputType_,
     MaskType_>
 {
 public:
-    using DispatchPolicy = EpilogueAtlasA2OnlineSoftmaxT<LSE_MODE_, float>;
-    using ArchTag = typename DispatchPolicy::ArchTag;
-    using ElementOutput = typename OutputType_::Element;
-    using ElementInput = typename InputType_::Element;
-    using ElementMask = typename MaskType_::Element;
+    using DispatchPolicy = EpilogueAtlasA2OnlineSoftmaxT<LSE_MODE_, float>;  ///< 调度策略类型
+    using ArchTag = typename DispatchPolicy::ArchTag;                        ///< 架构标签类型
+    using ElementOutput = typename OutputType_::Element;                     ///< 输出元素类型
+    using ElementInput = typename InputType_::Element;                       ///< 输入元素类型
+    using ElementMask = typename MaskType_::Element;                         ///< 掩码元素类型
 
-    using LayoutOutput = typename OutputType_::Layout;
-    using LayoutInput = typename InputType_::Layout;
-    using LayoutMask = typename MaskType_::Layout;
+    using LayoutOutput = typename OutputType_::Layout;  ///< 输出布局类型
+    using LayoutInput = typename InputType_::Layout;    ///< 输入布局类型
+    using LayoutMask = typename MaskType_::Layout;      ///< 掩码布局类型
 
-    static constexpr LseModeT LSE_MODE = DispatchPolicy::LSE_MODE;
+    static constexpr LseModeT LSE_MODE = DispatchPolicy::LSE_MODE;  ///< 对数和计算模式
 
-    static constexpr uint32_t BLOCK_SIZE_IN_BYTE = 32;
-    static constexpr uint32_t REPEAT_SIZE_IN_BYTE = 256;
-    static constexpr uint32_t FLOAT_BLOCK_SIZE = 8;
-    static constexpr uint32_t FLOAT_VECTOR_SIZE = 64;
-    static constexpr uint32_t HALF_VECTOR_SIZE = 128;
-    static constexpr uint32_t BLOCK_SIZE = 16;
-    static constexpr uint32_t UB_UINT8_VECTOR_SIZE = 1024;
-    static constexpr uint32_t UB_UINT8_BLOCK_SIZE = 16384;
-    static constexpr uint32_t VECTOR_SIZE = 128;
-    static constexpr uint32_t MAX_UB_S_ELEM_NUM = 8192;
+    // UB (Unified Buffer) 相关常量定义
+    static constexpr uint32_t BLOCK_SIZE_IN_BYTE = 32;        ///< 块大小（字节）
+    static constexpr uint32_t REPEAT_SIZE_IN_BYTE = 256;      ///< 重复大小（字节）
+    static constexpr uint32_t FLOAT_BLOCK_SIZE = 8;           ///< 浮点块大小
+    static constexpr uint32_t FLOAT_VECTOR_SIZE = 64;         ///< 浮点向量大小
+    static constexpr uint32_t HALF_VECTOR_SIZE = 128;         ///< 半精度向量大小
+    static constexpr uint32_t BLOCK_SIZE = 16;                ///< 块大小
+    static constexpr uint32_t UB_UINT8_VECTOR_SIZE = 1024;    ///< UB中uint8向量大小
+    static constexpr uint32_t UB_UINT8_BLOCK_SIZE = 16384;    ///< UB中uint8块大小
+    static constexpr uint32_t VECTOR_SIZE = 128;              ///< 向量大小
+    static constexpr uint32_t MAX_UB_S_ELEM_NUM = 8192;       ///< UB中S元素的最大数量
 
-    static constexpr uint32_t REDUCE_UB_SIZE = 1024;
-    static constexpr uint32_t ROW_OPS_SPEC_MASK_32 = 32;
-    static constexpr uint32_t ROW_OPS_SPEC_MASK_4 = 4;
-    static constexpr uint32_t MAX_ROW_NUM_SUB_CORE = 256;
-    static constexpr int64_t UB_FLOAT_LINE_SIZE = 64;
+    // 归约相关常量定义
+    static constexpr uint32_t REDUCE_UB_SIZE = 1024;          ///< 归约UB大小
+    static constexpr uint32_t ROW_OPS_SPEC_MASK_32 = 32;      ///< 行操作特定掩码(32)
+    static constexpr uint32_t ROW_OPS_SPEC_MASK_4 = 4;        ///< 行操作特定掩码(4)
+    static constexpr uint32_t MAX_ROW_NUM_SUB_CORE = 256;     ///< 子核心的最大行数
+    static constexpr int64_t UB_FLOAT_LINE_SIZE = 64;         ///< UB浮点行大小
 
+    /**
+     * @brief 构造函数
+     * 
+     * @param resource 架构资源
+     * @param scaleValue_ 缩放值
+     */
     __aicore__ inline
     BlockEpilogue(Arch::Resource<ArchTag> &resource, float scaleValue_)
     {
-        // Allocate UB space
+        // 分配UB空间的偏移量定义
         constexpr uint32_t LS_UB_TENSOR_OFFSET = 0;
         constexpr uint32_t LP_UB_TENSOR_OFFSET = 4 * UB_UINT8_BLOCK_SIZE;
         constexpr uint32_t MASK_UB_TENSOR_OFFSET = 4 * UB_UINT8_BLOCK_SIZE;
@@ -73,6 +107,7 @@ public:
 
         constexpr uint32_t MASK16_UB_TENSOR_OFFSET = 11 * UB_UINT8_BLOCK_SIZE;
 
+        // 初始化成员变量和UB缓冲区
         scaleValue = scaleValue_;
         lsUbTensor = resource.ubBuf.template GetBufferByByte<float>(LS_UB_TENSOR_OFFSET);
         lpUbTensor = resource.ubBuf.template GetBufferByByte<ElementOutput>(LP_UB_TENSOR_OFFSET);
@@ -88,15 +123,31 @@ public:
         glUbTensor = resource.ubBuf.template GetBufferByByte<float>(GL_UB_TENSOR_OFFSET);
     }
 
+    /**
+     * @brief 析构函数
+     */
     __aicore__ inline
     ~BlockEpilogue() {}
 
+    /**
+     * @brief 获取两个值中的较小值
+     * 
+     * @tparam T 数据类型
+     * @param a 第一个值
+     * @param b 第二个值
+     * @return T 较小的值
+     */
     template <typename T>
     __aicore__ inline T Min(T a, T b)
     {
         return (a > b) ? b : a;
     }
 
+    /**
+     * @brief 设置向量掩码
+     * 
+     * @param len 长度
+     */
     __aicore__ inline
     void SetVecMask(int32_t len)
     {
@@ -107,6 +158,7 @@ public:
             mask |= one << i;
         }
 
+        // 根据长度设置不同的向量掩码
         if (len == VECTOR_SIZE || len == 0) {
             AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
         } else if (len >= FLOAT_VECTOR_SIZE) {
