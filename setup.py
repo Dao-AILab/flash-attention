@@ -236,8 +236,8 @@ class BishengBuildExt(build_ext):
             "lib_dirs": asc_lib_paths
         }
         print("asc_config",asc_config)
-        python_include = sysconfig.get_config_var("INCLUDEPY")
-        python_lib = sysconfig.get_config_var("LIBDIR")
+        python_include = sysconfig.get_path('include')
+        python_lib = sysconfig.get_path("platlib")
 
         torch_cmake_path = torch.utils.cmake_prefix_path
         torch_package_path = os.path.dirname(torch.__file__)
