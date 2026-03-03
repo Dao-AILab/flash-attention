@@ -263,16 +263,21 @@ class FlashAttentionForwardSm100:
         - Configures pipeline stages for softmax, correction, and epilogue operations
         """
 
-        self.kv_stage = (
-            4
-            if (self.q_dtype.width == 8 or self.q_stage == 1)
-            and self.head_dim_padded <= 128
-            and self.head_dim_v_padded <= 128
-            else (3 if not self.use_2cta_instrs else 6)
-        )
+        smem_size_q = self.q_stage * self.m_block_size * self.head_dim_padded * self.q_dtype.width // 8
+        smem_size_o = self.q_stage * self.m_block_size * self.head_dim_v_padded * self.o_dtype.width // 8
+        smem_size_q_o = smem_size_q + smem_size_o if not self.overlap_sO_sQ else max(smem_size_q, smem_size_o)
+        smem_size_k_per_stage = self.n_block_size * self.head_dim_padded * self.k_dtype.width // 8
+        smem_size_v_per_stage = self.n_block_size * self.head_dim_v_padded * self.v_dtype.width // 8
+        smem_size_kv_per_stage = max(smem_size_k_per_stage, smem_size_v_per_stage) // self.cta_group_size
+        kv_stage = (224 * 1024 - smem_size_q_o) // smem_size_kv_per_stage
+        if self.head_dim_padded == 192 and self.head_dim_v_padded == 128 and kv_stage == 2:
+            # For hdim 192,128, we can fit 3 stages if we use uneven_kv_smem
+             kv_stage = 3
+        self.kv_stage = kv_stage
+        # print("kv_stage", self.kv_stage)
         self.s_stage = 2
         assert self.s_stage >= self.q_stage
-        # For hdim 192,128, we don't have enough smem to store all 3 stages of KV:
+        # For hdim 192,128 1CTA, we don't have enough smem to store all 3 stages of KV:
         # 128 x 192 x 2 bytes x 3 stages = 144KB, and we need 96KB for Q.
         # Instead we store smem as [smem_large, smem_small, smem_large], where smem_large is
         # 128 x 192 and smem_small is 128 x 128. We set the stride between the stages to be
