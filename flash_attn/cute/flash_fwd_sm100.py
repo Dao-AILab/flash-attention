@@ -1323,10 +1323,16 @@ class FlashAttentionForwardSm100:
                         paged_kv_manager.load_page_table(n_block_first)
                     load_K(block=n_block_max - 1, producer_state=kv_producer_state, page_idx=page_idx)  # K0
                     if const_expr(len(self.load_warp_ids) == 1) or warp_idx == self.load_warp_ids[0]:
-                        load_Q(block=0, stage=0)  # Q0
+                        # load_Q(block=0, stage=0)  # Q0
+                        pipeline_q.producer_acquire_w_index_phase(0, q_producer_phase)
+                        tma_bar_ptr = pipeline_q.sync_object_full.get_barrier(0)
+                        load_Q_fn(src_idx=0, dst_idx=0, tma_bar_ptr=tma_bar_ptr)
                     kv_producer_state.advance()
                     if const_expr(self.q_stage == 2) and (const_expr(len(self.load_warp_ids) == 1) or warp_idx == self.load_warp_ids[0]):
-                        load_Q(block=1, stage=1)  # Q1
+                        # load_Q(block=1, stage=1)  # Q1
+                        pipeline_q.producer_acquire_w_index_phase(1, q_producer_phase)
+                        tma_bar_ptr = pipeline_q.sync_object_full.get_barrier(1)
+                        load_Q_fn(src_idx=1, dst_idx=1, tma_bar_ptr=tma_bar_ptr)
                     q_producer_phase ^= 1
                     load_V(block=n_block_max - 1, producer_state=kv_producer_state, page_idx=page_idx)  # V0
                     kv_producer_state.advance()
@@ -2645,10 +2651,12 @@ class FlashAttentionForwardSm100:
         producer_state: pipeline.PipelineState,
         K_or_V: Literal["K", "V"],
         page_idx: Optional[Int32] = None,
+        extra_tx_count: Optional[Int32] = None,
     ):
         assert K_or_V in ("K", "V")
         stage, phase = producer_state.index, producer_state.phase
-        extra_tx_count = self.tma_copy_bytes[K_or_V] - self.tma_copy_bytes["K"]
+        extra_tx_count_kv = self.tma_copy_bytes[K_or_V] - self.tma_copy_bytes["K"]
+        extra_tx_count = extra_tx_count_kv + (extra_tx_count if extra_tx_count is not None else 0)
         extra_kwargs = {"extra_tx_count": extra_tx_count} if const_expr(self.use_tma_KV) else {}
         pipeline_kv.producer_acquire(producer_state, **extra_kwargs)
         if const_expr(K_or_V == "K" and self.uneven_kv_smem):
@@ -2668,6 +2676,7 @@ class FlashAttentionForwardSm100:
             cute.copy(tma_atom, tXgX_cur, tXsX_cur, tma_bar_ptr=pipeline_kv.producer_get_barrier(producer_state))
         else:
             assert paged_kv_manager is not None
+            assert extra_tx_count is None
             paged_kv_manager.load_KV(block, sX[None, None, None, stage], K_or_V)
             cute.arch.cp_async_commit_group()
             pipeline_kv.sync_object_full.arrive_cp_async_mbarrier(stage)
