@@ -1340,12 +1340,13 @@ class FlashAttentionBackwardSm100:
                 cutlass.pipeline.Agent.Thread,
                 num_sched_consumers,
             )
-            sched_pipeline = cutlass.pipeline.PipelineAsync.create(
+            sched_pipeline = cutlass.pipeline.PipelineClcFetchAsync.create(
                 barrier_storage=storage.sched_mbar_ptr.data_ptr(),
                 num_stages=self.num_clc_stage,
                 producer_group=sched_pipeline_producer_group,
                 consumer_group=sched_pipeline_consumer_group,
-                consumer_mask=None if const_expr(cluster_size == 1) else 0,
+                tx_count=16,
+                cta_layout_vmnk=cluster_layout_vmnk,
                 defer_sync=True,
             )
             sched_data = storage.sched_data.get_tensor((12, self.num_clc_stage))
@@ -1855,7 +1856,10 @@ class FlashAttentionBackwardSm100:
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
 
-            if const_expr(self.is_persistent or self.is_dynamic_persistent) and const_expr(not self.use_2cta_instrs or not self.use_tma_store):
+            if const_expr(
+                (self.is_persistent or self.is_dynamic_persistent)
+                and (not self.use_2cta_instrs or not self.use_tma_store)
+            ):
                 if not is_first_tile:
                     pipeline_epi_to_load.consumer_wait(consumer_state_epi_load)
                     with cute.arch.elect_one():
@@ -2186,7 +2190,10 @@ class FlashAttentionBackwardSm100:
                             
                             load_Q(first_m_block, producer_state=producer_state_Q_LSE)
                             
-                            if const_expr(self.is_persistent or self.is_dynamic_persistent) and const_expr(self.use_2cta_instrs and self.use_tma_store):
+                            if const_expr(
+                                (self.is_persistent or self.is_dynamic_persistent)
+                                and (self.use_2cta_instrs and self.use_tma_store)
+                            ):
                                 if not is_first_tile:
                                     pipeline_epi_to_load.consumer_wait(consumer_state_epi_load)
                                     with cute.arch.elect_one():
@@ -2220,7 +2227,10 @@ class FlashAttentionBackwardSm100:
 
                             load_dO(first_m_block, producer_state=producer_state_dO_dPsum)
                             
-                            if const_expr(self.is_persistent or self.is_dynamic_persistent) and const_expr(self.use_2cta_instrs and self.use_tma_store):
+                            if const_expr(
+                                (self.is_persistent or self.is_dynamic_persistent)
+                                and (self.use_2cta_instrs and self.use_tma_store)
+                            ):
                                 if not is_first_tile:
                                     pipeline_epi_to_load.consumer_wait(consumer_state_epi_load)
                                     with cute.arch.elect_one():
@@ -3494,7 +3504,10 @@ class FlashAttentionBackwardSm100:
                         "V",
                     )
 
-                    if const_expr(self.is_persistent or self.is_dynamic_persistent) and const_expr(self.use_2cta_instrs):
+                    if const_expr(
+                        (self.is_persistent or self.is_dynamic_persistent)
+                        and self.use_2cta_instrs
+                    ):
                         with cute.arch.elect_one():
                             pipeline_epi_to_load.producer_commit(producer_state_epi_load)
                         producer_state_epi_load.advance()

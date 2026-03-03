@@ -18,7 +18,6 @@ from quack.cute_dsl_utils import ParamsBase
 
 import flash_attn.cute.utils as utils
 from flash_attn.cute.fast_math import clz
-import quack.utils as quack_utils
 import math
 
 
@@ -465,7 +464,6 @@ class CLCDynamicPersistentBWDTileScheduler:
         params: Params,
         sched_smem: cute.Tensor,
         scheduler_pipeline,
-        clc_phase: Int32,
         sched_state,
         *,
         loc=None,
@@ -474,7 +472,6 @@ class CLCDynamicPersistentBWDTileScheduler:
         self.params = params
         self._sched_smem = sched_smem
         self._scheduler_pipeline = scheduler_pipeline
-        self._clc_phase = clc_phase
         self._sched_state = sched_state
         self._loc = loc
         self._ip = ip
@@ -515,14 +512,11 @@ class CLCDynamicPersistentBWDTileScheduler:
             else cutlass.pipeline.PipelineUserType.Consumer,
             params.sched_stages,
         )
-        if const_expr(is_scheduler_warp):
-            CLCDynamicPersistentBWDTileScheduler._init_clc_mbarrier(sched_smem, loc=loc, ip=ip)
 
         return CLCDynamicPersistentBWDTileScheduler(
             params,
             sched_smem=sched_smem,
             scheduler_pipeline=scheduler_pipeline,
-            clc_phase=Int32(0),
             sched_state=sched_state,
             loc=loc,
             ip=ip,
@@ -556,106 +550,59 @@ class CLCDynamicPersistentBWDTileScheduler:
     def prefetch_next_work(self, *, loc=None, ip=None):
         pass
 
-    @staticmethod
-    @cute.jit
-    def _init_clc_mbarrier(sched_smem: cute.Tensor, *, loc=None, ip=None) -> None:
-        assert cute.size(sched_smem, mode=[0]) >= 12
-        clc_mbar_ptr = sched_smem[None, 0].iterator + 8
-        with cute.arch.elect_one():
-            cute.arch.mbarrier_init(clc_mbar_ptr, 1)
-        cute.arch.mbarrier_init_fence()
-        cute.arch.sync_warp()
-
     # producer (scheduler warp)
     @cute.jit
     def fetch_next_work(self, *, loc=None, ip=None):
+        params = self.params
         clc_response_ptr = self._sched_smem[None, self._sched_state.index].iterator + 4
-        clc_mbar_ptr = self._sched_smem[None, 0].iterator + 8
+        clc_mbar_ptr = self._scheduler_pipeline.producer_get_barrier(self._sched_state)
+        cluster_m = params.cluster_shape_mn[0]
+        assert cluster_m in (1, 2), "CLC BWD currently supports cluster_shape_mn[0] in (1, 2)"
 
-        cute.arch.sync_warp()
-        with cute.arch.elect_one():
-            cute.arch.mbarrier_arrive_and_expect_tx(clc_mbar_ptr, 16, loc=loc, ip=ip)
-            quack_utils.issue_clc_query_nomulticast(clc_mbar_ptr, clc_response_ptr, loc=loc, ip=ip)
-        cute.arch.sync_warp()
-        cute.arch.mbarrier_wait(clc_mbar_ptr, self._clc_phase, loc=loc, ip=ip)
+        if const_expr(cluster_m == 1):
+            with cute.arch.elect_one():
+                cute.arch.issue_clc_query(
+                    clc_mbar_ptr, clc_response_ptr, multicast=False, loc=loc, ip=ip
+                )
+        else:
+            with cute.arch.elect_one():
+                cute.arch.issue_clc_query(clc_mbar_ptr, clc_response_ptr, loc=loc, ip=ip)
+        cute.arch.mbarrier_wait(clc_mbar_ptr, self._sched_state.phase ^ 1, loc=loc, ip=ip)
 
         n_block, head_idx, batch_idx, is_valid_i32 = cute.arch.clc_response(
             clc_response_ptr, loc=loc, ip=ip
         )
-        cute.arch.fence_view_async_shared()
-        self._clc_phase ^= 1
-
+        #cute.arch.fence_view_async_shared()
 
         return Int32(n_block), Int32(head_idx), Int32(batch_idx), (is_valid_i32 != 0)
 
     # producer (scheduler warp)
     @cute.jit
     def write_work_tile_to_smem(
-        self,
-        n_block: Int32,
-        head_idx: Int32,
-        batch_idx: Int32,
-        is_valid,
-        *,
-        loc=None,
-        ip=None,
+        self, *, loc=None, ip=None
     ):
-        params = self.params
         self._scheduler_pipeline.producer_acquire(self._sched_state)
-
-        pipeline_idx = self._sched_state.index
-        lane_idx = cute.arch.lane_idx()
-        cluster_m = params.cluster_shape_mn[0]
-        assert cluster_m in (1, 2), "CLC BWD currently supports cluster_shape_mn[0] in (1, 2)"
-        n_block_i32 = Int32(n_block)
-        head_idx_i32 = Int32(head_idx)
-        batch_idx_i32 = Int32(batch_idx)
-
-        if const_expr(cluster_m == 1):
-            if lane_idx == 0:
-                local_is_valid = is_valid & (n_block_i32 < params.num_block_actual)
-                self._sched_smem[0, pipeline_idx] = n_block_i32
-                self._sched_smem[1, pipeline_idx] = head_idx_i32
-                self._sched_smem[2, pipeline_idx] = batch_idx_i32
-                self._sched_smem[3, pipeline_idx] = Int32(local_is_valid)
-                self._scheduler_pipeline.producer_commit(self._sched_state)
-        elif const_expr(cluster_m == 2):
-            if lane_idx < cluster_m:
-                peer_cta_rank_in_cluster = lane_idx
-                peer_n_block = n_block_i32 + peer_cta_rank_in_cluster
-                peer_is_valid = is_valid & (peer_n_block < params.num_block_actual)
-                mbar_ptr = self._scheduler_pipeline.producer_get_barrier(self._sched_state)
-                cute.arch.mbarrier_arrive_and_expect_tx(mbar_ptr, 16, peer_cta_rank_in_cluster)
-                sched_smem_ptr = self._sched_smem[None, pipeline_idx].iterator
-                quack_utils.store_shared_remote_x4(
-                    peer_n_block,
-                    head_idx_i32,
-                    batch_idx_i32,
-                    Int32(peer_is_valid),
-                    sched_smem_ptr,
-                    mbar_ptr,
-                    peer_cta_rank_in_cluster,
-                )
-
+        _, _, _, is_valid = self.fetch_next_work(loc=loc, ip=ip)
         self._sched_state.advance()
+        return is_valid
 
     @cute.jit
     def _read_work_tile_from_smem(self, *, loc=None, ip=None) -> WorkTileInfo:
+        params = self.params
         self._scheduler_pipeline.consumer_wait(self._sched_state)
 
         pipeline_idx = self._sched_state.index
-        n_block = self._sched_smem[0, pipeline_idx]
-        head_idx = self._sched_smem[1, pipeline_idx]
-        batch_idx = self._sched_smem[2, pipeline_idx]
-        is_valid_i32 = self._sched_smem[3, pipeline_idx]
-        if const_expr(cute.size(self.params.cluster_shape_mn) > 1):
-            cute.arch.fence_view_async_shared()
-        cute.arch.sync_warp()
+        clc_response_ptr = self._sched_smem[None, pipeline_idx].iterator + 4
+        n_block_base, head_idx, batch_idx, is_valid_i32 = cute.arch.clc_response(
+            clc_response_ptr, loc=loc, ip=ip
+        )
+        n_block = Int32(n_block_base) + Int32(cute.arch.block_idx_in_cluster())
+        is_valid = (is_valid_i32 != 0) & (n_block < params.num_block_actual)
+        #cute.arch.fence_view_async_shared()
 
         with cute.arch.elect_one():
             self._scheduler_pipeline.consumer_release(self._sched_state)
         self._sched_state.advance()
-        is_valid = is_valid_i32 != 0
         return WorkTileInfo(
             (Int32(n_block), Int32(head_idx), Int32(batch_idx), Int32(0)),
             is_valid,
@@ -670,8 +617,7 @@ class CLCDynamicPersistentBWDTileScheduler:
         ip=None,
     ):
         if const_expr(is_scheduler_warp):
-            n_block, head_idx, batch_idx, is_valid = self.fetch_next_work(loc=loc, ip=ip)
-            self.write_work_tile_to_smem(n_block, head_idx, batch_idx, is_valid, loc=loc, ip=ip)
+            is_valid = self.write_work_tile_to_smem(loc=loc, ip=ip)
             return is_valid
         return True
 
@@ -689,7 +635,6 @@ class CLCDynamicPersistentBWDTileScheduler:
             self.params,
             self._sched_smem,
             self._scheduler_pipeline,
-            self._clc_phase,
             self._sched_state,
         ]:
             obj_values = cutlass.extract_mlir_values(obj)
@@ -704,7 +649,6 @@ class CLCDynamicPersistentBWDTileScheduler:
                 self.params,
                 self._sched_smem,
                 self._scheduler_pipeline,
-                self._clc_phase,
                 self._sched_state,
             ],
             self._values_pos,
