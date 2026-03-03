@@ -64,6 +64,14 @@ from flash_attn.cute.tile_scheduler import (
 class NamedBarrierFwd(enum.IntEnum):
     Epilogue = enum.auto()  # starts from 1 as barrier 0 is reserved for sync_threads()
     TmemPtr = enum.auto()
+    SoftmaxStatsW0 = enum.auto()
+    SoftmaxStatsW1 = enum.auto()
+    SoftmaxStatsW2 = enum.auto()
+    SoftmaxStatsW3 = enum.auto()
+    SoftmaxStatsW4 = enum.auto()
+    SoftmaxStatsW5 = enum.auto()
+    SoftmaxStatsW6 = enum.auto()
+    SoftmaxStatsW7 = enum.auto()
 #     WarpSchedulerWG1 = enum.auto()
 #     WarpSchedulerWG2 = enum.auto()
 
@@ -907,10 +915,13 @@ class FlashAttentionForwardSm100:
         pipeline_sm_stats = pipeline_custom.PipelineAsync.create(
             barrier_storage=storage.mbar_softmax_stats.data_ptr(),
             num_stages=self.q_stage,
-            # num_stages=self.q_stage * 4,
             producer_group=softmax_threads,
             consumer_group=correction_threads,
             defer_sync=True,
+        )
+        # Should put the NamedBarrier inside the pipeline class so we'll just have pipeline_sm_stats
+        sm_stats_barrier = pipeline_custom.NamedBarrier(
+            barrier_id=int(NamedBarrierFwd.SoftmaxStatsW0), num_threads=cute.arch.WARP_SIZE * 2
         )
         pipeline_o_epi = None
         if const_expr(not self.use_correction_warps_for_epi):
@@ -1105,6 +1116,7 @@ class FlashAttentionForwardSm100:
                 pipeline_s_p_o=pipeline_s_p_o,
                 pipeline_p_lastsplit=pipeline_p_lastsplit,
                 pipeline_sm_stats=pipeline_sm_stats,
+                sm_stats_barrier=sm_stats_barrier,
                 pipeline_s0_s1_sequence=pipeline_s0_s1_sequence,
                 learnable_sink=learnable_sink,
                 block_info=block_info,
@@ -1148,6 +1160,7 @@ class FlashAttentionForwardSm100:
                 pipeline_s_p_o,
                 pipeline_o_acc,
                 pipeline_sm_stats,
+                sm_stats_barrier,
                 pipeline_o_epi,
                 learnable_sink,
                 gmem_tiled_copy_O,
@@ -1603,6 +1616,7 @@ class FlashAttentionForwardSm100:
         pipeline_s_p_o: pipeline.PipelineAsync,
         pipeline_p_lastsplit: pipeline.PipelineAsync,
         pipeline_sm_stats: pipeline.PipelineAsync,
+        sm_stats_barrier: pipeline.NamedBarrier,
         pipeline_s0_s1_sequence: Optional[pipeline.PipelineAsync],
         learnable_sink: Optional[cute.Tensor],
         block_info: BlockInfo,
@@ -1759,6 +1773,7 @@ class FlashAttentionForwardSm100:
                 pipeline_s_p_o=pipeline_s_p_o,
                 pipeline_p_lastsplit=pipeline_p_lastsplit,
                 pipeline_sm_stats=pipeline_sm_stats,
+                sm_stats_barrier=sm_stats_barrier,
                 pipeline_s0_s1_sequence=pipeline_s0_s1_sequence,
                 thr_tmem_load=thr_tmem_load,
                 thr_tmem_store=thr_tmem_store,
@@ -1780,7 +1795,6 @@ class FlashAttentionForwardSm100:
             if const_expr(self.use_block_sparsity) or has_work:
                 # See block_sparse_utils.py NOTE [SM100 block-sparse empty tiles: mbarrier contract].
                 pipeline_sm_stats.producer_acquire_w_index_phase(stage, sm_stats_producer_phase)
-                # pipeline_sm_stats.producer_acquire_w_index_phase(stage * 4 + warp_idx, sm_stats_producer_phase)
                 sm_stats_producer_phase ^= 1
 
             # Block sparse or dense iteration
@@ -1809,6 +1823,7 @@ class FlashAttentionForwardSm100:
                     sm_stats_producer_phase,
                     s0_s1_sequence_phase,
                     pipeline_sm_stats,
+                    sm_stats_barrier,
                     self.q_stage,
                     Int32(stage),
                     check_m_boundary,
@@ -1824,8 +1839,8 @@ class FlashAttentionForwardSm100:
                     # if tidx == 0:
                     #     cute.printf("softmax row sum stage %d: %f, row_max = %f\n", stage, softmax.row_sum[0], softmax.row_max[0])
                     # See block_sparse_utils.py NOTE [SM100 block-sparse empty tiles: mbarrier contract].
-                    pipeline_sm_stats.producer_commit_w_index(stage)
-                    # pipeline_sm_stats.producer_commit_w_index(stage * 4 + warp_idx)
+                    # pipeline_sm_stats.producer_commit_w_index(stage)
+                    sm_stats_barrier.arrive_w_index(index=stage * 4 + warp_idx)
                     # if tidx == 0: cute.printf("softmax row sum stage %d: %f\n", stage, softmax.row_sum[0])
             else:
                 if const_expr(not self.is_split_kv) or tile_block_count > Int32(0):
@@ -1892,8 +1907,8 @@ class FlashAttentionForwardSm100:
                         sScale[
                             tidx + stage * self.m_block_size + self.q_stage * self.m_block_size
                         ] = softmax.row_max[0]
-                    pipeline_sm_stats.producer_commit_w_index(stage)
-                    # pipeline_sm_stats.producer_commit_w_index(stage * 4 + warp_idx)
+                    # pipeline_sm_stats.producer_commit_w_index(stage)
+                    sm_stats_barrier.arrive_w_index(index=stage * 4 + warp_idx)
 
             # # Write LSE to gmem
             # if const_expr(mLSE is not None):
@@ -1938,6 +1953,7 @@ class FlashAttentionForwardSm100:
         pipeline_s_p_o: pipeline.PipelineAsync,
         pipeline_p_lastsplit: pipeline.PipelineAsync,
         pipeline_sm_stats: pipeline.PipelineAsync,
+        sm_stats_barrier: pipeline.NamedBarrier,
         pipeline_s0_s1_sequence: Optional[pipeline.PipelineAsync],
         thr_tmem_load: cute.CopyAtom,
         thr_tmem_store: cute.CopyAtom,
@@ -2015,8 +2031,8 @@ class FlashAttentionForwardSm100:
             sScale[thread_idx + stage * self.m_block_size] = acc_scale
             # if thread_idx == 0: cute.printf("softmax acc_scale stage %d: %f, row_max = %f\n", stage, acc_scale, row_max)
         # Notify correction wg that row_max is ready
-        pipeline_sm_stats.producer_commit_w_index(stage)
-        # pipeline_sm_stats.producer_commit_w_index(stage * 4 + warp_idx)
+        # pipeline_sm_stats.producer_commit_w_index(stage)
+        sm_stats_barrier.arrive_w_index(index=stage * 4 + warp_idx)
 
         # if thread_idx == 0 and stage == 0: cute.print_tensor(tSrS_t2r)
         softmax.scale_subtract_rowmax(tSrS_t2r, row_max)
@@ -2058,7 +2074,6 @@ class FlashAttentionForwardSm100:
         else:
             pipeline_s_p_o.consumer_release_w_index(stage)
         pipeline_sm_stats.producer_acquire_w_index_phase(stage, sm_stats_producer_phase)
-        # pipeline_sm_stats.producer_acquire_w_index_phase(stage * 4 + warp_idx, sm_stats_producer_phase)
         softmax.update_row_sum(tSrS_t2r.load(), acc_scale, is_first)
         # acc_scale = cute.math.exp2(acc_scale_, fastmath=True)
         return mma_si_consumer_phase ^ 1, sm_stats_producer_phase ^ 1, s0_s1_sequence_phase ^ 1
@@ -2077,6 +2092,7 @@ class FlashAttentionForwardSm100:
         pipeline_s_p_o: pipeline.PipelineAsync,
         pipeline_o_acc: pipeline.PipelineAsync,
         pipeline_sm_stats: pipeline.PipelineAsync,
+        sm_stats_barrier: pipeline.NamedBarrier,
         pipeline_o_epi: pipeline.PipelineAsync,
         learnable_sink: Optional[cute.Tensor],
         gmem_tiled_copy_O: cute.TiledCopy,
@@ -2153,21 +2169,20 @@ class FlashAttentionForwardSm100:
 
             if has_work:
                 # Ignore first signal from softmax as no correction is required
-                pipeline_sm_stats.consumer_wait_w_index_phase(0, sm_stats_consumer_phase)
-                # pipeline_sm_stats.consumer_wait_w_index_phase(0 * 4 + warp_idx, sm_stats_consumer_phase)
+                # pipeline_sm_stats.consumer_wait_w_index_phase(0, sm_stats_consumer_phase)
+                sm_stats_barrier.arrive_and_wait_w_index(index=0 * 4 + warp_idx)
                 pipeline_sm_stats.consumer_release_w_index(0)
-                # pipeline_sm_stats.consumer_release_w_index(0 * 4 + warp_idx)
                 if const_expr(self.q_stage == 2):
-                    pipeline_sm_stats.consumer_wait_w_index_phase(1, sm_stats_consumer_phase)
-                    # pipeline_sm_stats.consumer_wait_w_index_phase(1 * 4 + warp_idx, sm_stats_consumer_phase)
+                    # pipeline_sm_stats.consumer_wait_w_index_phase(1, sm_stats_consumer_phase)
+                    sm_stats_barrier.arrive_and_wait_w_index(index=1 * 4 + warp_idx)
                 sm_stats_consumer_phase ^= 1
 
                 tSrScale_t2r = cute.make_fragment(tSrScale_t2r_shape, Float32)
                 for i in cutlass.range(total_block_count - 1, unroll=1):
                     for stage in cutlass.range_constexpr(self.q_stage):
                         # wait for S0 / S1
-                        pipeline_sm_stats.consumer_wait_w_index_phase(stage, sm_stats_consumer_phase)
-                        # pipeline_sm_stats.consumer_wait_w_index_phase(stage * 4 + warp_idx, sm_stats_consumer_phase)
+                        # pipeline_sm_stats.consumer_wait_w_index_phase(stage, sm_stats_consumer_phase)
+                        sm_stats_barrier.arrive_and_wait_w_index(index=stage * 4 + warp_idx)
                         # cute.copy(tiled_tmem_load_vec, tStScales_t2r[stage], tSrScale_t2r)
                         # cute.arch.fence_view_async_tmem_load()
                         # scale = tSrScale_t2r[0]
@@ -2183,12 +2198,10 @@ class FlashAttentionForwardSm100:
                         # Notify mma warp that O has been rescaled
                         pipeline_s_p_o.consumer_release_w_index(stage)
                         pipeline_sm_stats.consumer_release_w_index(self.q_stage - 1 - stage)
-                        # pipeline_sm_stats.consumer_release_w_index((self.q_stage - 1 - stage) * 4 + warp_idx)
                     sm_stats_consumer_phase ^= 1
                     # o_corr_consumer_phase ^= 1
                 if const_expr(self.q_stage == 2):
                     pipeline_sm_stats.consumer_release_w_index(1)
-                    # pipeline_sm_stats.consumer_release_w_index(1 * 4 + warp_idx)
                 # End of seqlen_corr_loop_steps
 
                 # Even in the case of self.overlap_sO_sQ, we can write to stage 0 of sO without
@@ -2206,8 +2219,8 @@ class FlashAttentionForwardSm100:
                             ) % self.qhead_per_kvhead + head_idx * self.qhead_per_kvhead
                             learnable_sink_val[stage] = Float32(learnable_sink[q_head_idx])
                 for stage in cutlass.range_constexpr(self.q_stage):
-                    pipeline_sm_stats.consumer_wait_w_index_phase(stage, sm_stats_consumer_phase)
-                    # pipeline_sm_stats.consumer_wait_w_index_phase(stage * 4 + warp_idx, sm_stats_consumer_phase)
+                    # pipeline_sm_stats.consumer_wait_w_index_phase(stage, sm_stats_consumer_phase)
+                    sm_stats_barrier.arrive_and_wait_w_index(index=stage * 4 + warp_idx)
                     # cute.copy(tiled_tmem_load_vec, tStScales_t2r[stage], tSrScale_t2r)
                     # cute.arch.fence_view_async_tmem_load()
                     # scale = tSrScale_t2r[0]
@@ -2217,7 +2230,6 @@ class FlashAttentionForwardSm100:
                     else:
                         row_max = None
                     pipeline_sm_stats.consumer_release_w_index(stage)
-                    # pipeline_sm_stats.consumer_release_w_index(stage * 4 + warp_idx)
                     if const_expr(learnable_sink is not None):
                         LOG2_E = math.log2(math.e)
                         sink_val = learnable_sink_val[stage]
@@ -2290,6 +2302,7 @@ class FlashAttentionForwardSm100:
                         tOtO,
                         sO,
                         pipeline_sm_stats,
+                        sm_stats_barrier,
                         pipeline_o_epi,
                         sm_stats_consumer_phase,
                         o_corr_consumer_phase,

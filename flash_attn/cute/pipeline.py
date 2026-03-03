@@ -4,10 +4,12 @@
 from typing import Optional
 from dataclasses import dataclass
 
+import cutlass.cute as cute
 from cutlass import Boolean, Int32, const_expr
 from cutlass.cutlass_dsl import if_generate, dsl_user_op
 from cutlass.pipeline import PipelineState
 from cutlass.pipeline import PipelineUserType
+from cutlass.pipeline import NamedBarrier as NamedBarrierOg
 from cutlass.pipeline import PipelineAsync as PipelineAsyncOg
 from cutlass.pipeline import PipelineTmaAsync as PipelineTmaAsyncOg
 from cutlass.pipeline import PipelineTmaUmma as PipelineTmaUmmaOg
@@ -98,6 +100,38 @@ def make_pipeline_state(type: PipelineUserType, stages: int):
         return PipelineStateSimple(stages, Int32(0))
     else:
         assert False, "Error: invalid PipelineUserType specified for make_pipeline_state."
+
+
+@dataclass(frozen=True)
+class NamedBarrier(NamedBarrierOg):
+    @staticmethod
+    def create(*args, **kwargs):
+        obj = NamedBarrierOg.create(*args, **kwargs)
+        # Can't assign to __class__ directly since the dataclass is frozen
+        object.__setattr__(obj, "__class__", NamedBarrier)
+        return obj
+
+    @dsl_user_op
+    def arrive_w_index(self, index: Int32, *, loc=None, ip=None) -> None:
+        """
+        The aligned flavor of arrive is used when all threads in the CTA will execute the
+        same instruction. See PTX documentation.
+        """
+        cute.arch.barrier_arrive(
+            barrier_id=self.barrier_id + index,
+            number_of_threads=self.num_threads,
+            loc=loc,
+            ip=ip,
+        )
+
+    @dsl_user_op
+    def arrive_and_wait_w_index(self, index: Int32, *, loc=None, ip=None) -> None:
+        cute.arch.barrier(
+            barrier_id=self.barrier_id + index,
+            number_of_threads=self.num_threads,
+            loc=loc,
+            ip=ip,
+        )
 
 
 @dataclass(frozen=True)

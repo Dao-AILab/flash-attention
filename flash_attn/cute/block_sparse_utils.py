@@ -703,6 +703,7 @@ def handle_block_sparse_empty_tile_correction_sm100(
     tOtO: cute.Tensor,
     sO: cute.Tensor,
     pipeline_sm_stats: cutlass.pipeline.PipelineAsync,
+    sm_stats_barrier: cutlass.pipeline.NamedBarrier,
     pipeline_o_epi: cutlass.pipeline.PipelineAsync,
     sm_stats_consumer_phase: Int32,
     o_corr_consumer_phase: Int32,
@@ -728,6 +729,7 @@ def handle_block_sparse_empty_tile_correction_sm100(
     See NOTE [SM100 block-sparse empty tiles: mbarrier contract].
     """
     LOG2_E = Float32(math.log2(math.e))
+    warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
 
     for stage in cutlass.range_constexpr(q_stage):
         row_sum_value = Float32(1.0)
@@ -760,7 +762,8 @@ def handle_block_sparse_empty_tile_correction_sm100(
         stats[stage] = (row_sum_value, row_max_value, acc_flag)
 
         # See NOTE [SM100 block-sparse empty tiles: mbarrier contract].
-        pipeline_sm_stats.consumer_wait_w_index_phase(stage, sm_stats_consumer_phase)
+        # pipeline_sm_stats.consumer_wait_w_index_phase(stage, sm_stats_consumer_phase)
+        sm_stats_barrier.arrive_and_wait_w_index(index=stage * 4 + warp_idx)
         pipeline_sm_stats.consumer_release_w_index(stage)
 
         if const_expr(gmem_tiled_copy_O is None):
@@ -804,12 +807,14 @@ def softmax_block_sparse_sm100(
     si_corr_producer_phase: Int32,
     s0_s1_sequence_phase: Int32,
     pipeline_sm_stats: cutlass.pipeline.PipelineAsync,
+    sm_stats_barrier: cutlass.pipeline.NamedBarrier,
     q_stage: cutlass.Constexpr,
     stage_idx: Int32,
     check_m_boundary: bool,
     qhead_per_kvhead: cutlass.Constexpr,
     q_subtile_factor: cutlass.Constexpr[int] = 1,
 ):
+    warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
     m_block_sparse = sparse_tensor_m_block(m_block, qhead_per_kvhead, q_subtile_factor)
 
     mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx = blocksparse_tensors
@@ -828,7 +833,8 @@ def softmax_block_sparse_sm100(
 
     if total_block_cnt == 0:
         # See NOTE [SM100 block-sparse empty tiles: mbarrier contract].
-        pipeline_sm_stats.producer_commit_w_index(stage_idx)
+        # pipeline_sm_stats.producer_commit_w_index(stage_idx)
+        sm_stats_barrier.arrive_w_index(index=stage_idx * 4 + warp_idx)
     else:
         if curr_mask_block_cnt > 0:
             mask_n_block = curr_mask_block_idx[curr_mask_block_cnt - 1]
