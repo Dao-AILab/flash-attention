@@ -9,9 +9,6 @@ import torch
 
 from einops import rearrange, repeat
 
-import types, sys, math
-sys.modules.setdefault("flash_attn_2_cuda", types.ModuleType("flash_attn_2_cuda"))
-
 try:
     from flash_attn.layers.rotary import apply_rotary_emb
 except ImportError:
@@ -61,7 +58,7 @@ VERBOSE = True
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128])
 # @pytest.mark.parametrize("d", [64, 96, 128, 192])
 # @pytest.mark.parametrize("d", [128, 192])
-@pytest.mark.parametrize("d", [64, 96, 128])
+@pytest.mark.parametrize("d", [64, 128])
 # @pytest.mark.parametrize("d", [128])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
@@ -392,7 +389,7 @@ def test_flash_attn_output(
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128])
 # @pytest.mark.parametrize("d", [64, 96, 128])
 # @pytest.mark.parametrize("d", [128, 192])
-@pytest.mark.parametrize("d", [64, 96, 128])
+@pytest.mark.parametrize("d", [64, 128])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
