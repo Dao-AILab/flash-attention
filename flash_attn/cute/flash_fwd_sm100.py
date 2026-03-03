@@ -242,10 +242,10 @@ class FlashAttentionForwardSm100:
             # self.num_regs_correction = 96
             # self.num_regs_correction = 64 if self.is_causal or self.is_local else 80
             if not self.enable_ex2_emu:
-                self.num_regs_correction = 80
+                self.num_regs_correction = 80 if not paged_kv_non_tma else 64
             else:
                 # self.num_regs_correction = 64
-                self.num_regs_correction = 80
+                self.num_regs_correction = 80 if not paged_kv_non_tma else 64
             # self.num_regs_other = 32
             # self.num_regs_other = 64
             # self.num_regs_other = 80
@@ -833,7 +833,8 @@ class FlashAttentionForwardSm100:
 
         ThreadCooperativeGroup = partial(pipeline.CooperativeGroup, pipeline.Agent.Thread)
         mma_warp = ThreadCooperativeGroup(len([self.mma_warp_id]))
-        tma_warp = ThreadCooperativeGroup(len(self.load_warp_ids))
+        load_warps = ThreadCooperativeGroup(len(self.load_warp_ids))
+        tma_warp = ThreadCooperativeGroup(1)
         softmax_warps = ThreadCooperativeGroup(len(self.softmax0_warp_ids))
         softmax_threads = ThreadCooperativeGroup(cute.arch.WARP_SIZE * len(self.softmax0_warp_ids))
         # softmax_threads = ThreadCooperativeGroup(cute.arch.WARP_SIZE)
@@ -1389,7 +1390,8 @@ class FlashAttentionForwardSm100:
 
         pipeline_kv.producer_tail(kv_producer_state)
         # This is equivalent to pipeline_q.producer_tail
-        pipeline_q.producer_acquire_w_index_phase(self.q_stage - 1, q_producer_phase)
+        if const_expr(len(self.load_warp_ids) == 1) or warp_idx == self.load_warp_ids[0]:
+            pipeline_q.producer_acquire_w_index_phase(self.q_stage - 1, q_producer_phase)
 
     @cute.jit
     def mma(
@@ -2724,7 +2726,10 @@ class FlashAttentionForwardSm100:
         assert K_or_V in ("K", "V")
         stage, phase = producer_state.index, producer_state.phase
         extra_tx_count_kv = self.tma_copy_bytes[K_or_V] - self.tma_copy_bytes["K"]
-        extra_tx_count = extra_tx_count_kv + (extra_tx_count if extra_tx_count is not None else 0)
+        extra_tx_count = (
+            extra_tx_count_kv + (extra_tx_count if extra_tx_count is not None else 0) if const_expr(self.use_tma_KV)
+            else None
+        )
         extra_kwargs = {"extra_tx_count": extra_tx_count} if const_expr(self.use_tma_KV) else {}
         pipeline_kv.producer_acquire(producer_state, **extra_kwargs)
         if const_expr(K_or_V == "K" and self.uneven_kv_smem):
