@@ -97,41 +97,28 @@ def mask_r2p_lambda(
                     X[r, c] = X[r, c] if in_bound else -Float32.inf
 
 
+
 @cute.jit
-def mask_r2p_dual_bound(
-    X: cute.Tensor,
-    col_limit_left: Int32,  # Inclusive lower bound
-    col_limit_right: Int32,  # Exclusive upper bound
-) -> None:
+def row_to_r2p_idx(x: Int32, num_rep: int, num_wg: int) -> Int32:
+    """Convert a row coordinate to an R2P element index in the warp-group interleaved layout.
+
+    In the SM100 backward pass, 2 warp groups share TMEM. The TMEM load atom
+    distributes rows in an interleaved pattern: elements 0..num_rep-1 map to
+    rows 0..num_rep-1 (warp group 0), elements num_rep..2*num_rep-1 map to
+    rows num_rep*num_wg..num_rep*num_wg+num_rep-1 (warp group 1), and so on.
+    Row-coordinate thresholds (causal limits, window bounds, uih_len) must be
+    converted to element indices before use with r2p_bitmask_above/below.
+
+    Rows not owned by this thread (in the gap between warp groups) are clamped
+    to the boundary element index, which is safe because R2P thresholds are
+    monotonic.
+
+    Example with num_rep=16, num_wg=2:
+        row  0 -> elem  0,  row 15 -> elem 15,
+        row 16 -> elem 16 (clamped), row 31 -> elem 16 (clamped),
+        row 32 -> elem 16, row 33 -> elem 17, row 47 -> elem 31.
     """
-    Dual-bound masking using two bitmasks for SM100, following mask_r2p.
-    Masks elements where: NOT (col_limit_left <= col < col_limit_right)
-
-    Uses bit manipulation to create a range mask:
-        mask_right = (1 << right) - 1  -> bits (right-1)..0 are 1
-        mask_left  = (1 << left) - 1   -> bits (left-1)..0 are 1
-        mask_range = mask_range = mask_right & ~ mask_left -> bits (right-1)..left are 1
-    """
-    ncol = const_expr(cute.size(X.shape))
-
-    for s in cutlass.range_constexpr(cute.ceil_div(ncol, 24)):
-        right_s = max(col_limit_right - s * 24, 0)
-        left_s = max(col_limit_left - s * 24, 0)
-
-        # otherwise cute dsl complains about python int too large to convert into c long
-        right_s = min(right_s, 24)
-        left_s = min(left_s, 24)
-
-        # bits (right-1)..left are 1
-        mask_right = (1 << right_s) - 1
-        mask_left = (1 << left_s) - 1
-        mask_range = mask_right & ~mask_left
-
-        # This needs to be range_constexpr, o/w the compiler can't generate the R2P instruction
-        for i in cutlass.range_constexpr(min(24, ncol - s * 24)):
-            in_bound = cutlass.Boolean(mask_range & (1 << i))
-            c = s * 24 + i
-            X[c] = X[c] if in_bound else -Float32.inf
+    return x // (num_rep * num_wg) * num_rep + min(x % (num_rep * num_wg), num_rep)
 
 
 @dataclass(frozen=True)
@@ -529,8 +516,15 @@ class AttentionMask:
                             else acc_S[i]
                         )
                 else:
-                    # XOR-based R2P dual bound masking
-                    mask_r2p_dual_bound(acc_S, col_limit_left, col_limit_right)
+                    # Dual-bound masking using two bitmasks for SM100, following mask_r2p.
+                    # Masks elements where: NOT (col_limit_left <= col < col_limit_right)
+
+                    def mask_gen_fn(s: int) -> Uint32:
+                        return r2p_bitmask_below(col_limit_right, s) & r2p_bitmask_above(
+                            col_limit_left, s
+                        )
+
+                    mask_r2p_lambda(acc_S, mask_gen_fn, rank1=True)
 
     @cute.jit
     def apply_mask_sm100_transposed(
@@ -669,16 +663,9 @@ class AttentionMask:
                             -cutlass.Float32.inf if t0ScS_t2r[i][ROW] < row_limit_top else acc_S[i]
                         )
                 else:
-                    # Bit manipulation, compiles down to the R2P instruction.
-                    # For sm100: tScS_t2r[i][0] has the form 0, 1, ..., 31, 64, ..., 127
-                    # or 0, 1, ..., 15, 32, ..., 47, 64, ...
-                    # We compare a transformed version of limit to 0, 1, 2, 3, 4, 5, ...
-                    # Here we hardcode for the case of 2 warp groups.
                     num_rep = cute.size(tScS_t2r, mode=[0])  # 16 or 32
                     num_wg = 2
-                    row_limit = row_limit_top // (num_rep * num_wg) * num_rep + min(
-                        row_limit_top % (num_rep * num_wg), num_rep
-                    )
+                    row_limit = row_to_r2p_idx(row_limit_top, num_rep, num_wg)
                     mask_r2p_lambda(
                         acc_S,
                         lambda s: r2p_bitmask_above(row_limit, s),
@@ -694,9 +681,33 @@ class AttentionMask:
                 if const_expr(mask_seqlen):
                     if seqlenk_col_limit <= 0:
                         row_limit_top = self.tile_m
-                for i in cutlass.range(cute.size(acc_S.shape), unroll_full=True):
-                    row_idx = t0ScS_t2r[i][ROW]
-                    local_mask = row_idx < row_limit_top
-                    if const_expr(self.window_size_left is not None):
-                        local_mask |= row_idx > row_limit_bot
-                    acc_S[i] = -cutlass.Float32.inf if local_mask else acc_S[i]
+                r2p = True
+                if const_expr(not r2p):
+                    for i in cutlass.range(cute.size(acc_S.shape), unroll_full=True):
+                        row_idx = t0ScS_t2r[i][ROW]
+                        local_mask = row_idx < row_limit_top
+                        if const_expr(self.window_size_left is not None):
+                            local_mask |= row_idx > row_limit_bot
+                        acc_S[i] = -cutlass.Float32.inf if local_mask else acc_S[i]
+                else:
+
+                    def mask_gen_fn(s: int) -> Uint32:
+                        num_rep = cute.size(tScS_t2r, mode=[0])
+                        num_wg = 2
+
+                        row_limit = row_to_r2p_idx(row_limit_top, num_rep, num_wg)
+                        mask = r2p_bitmask_above(row_limit, s)
+
+                        if const_expr(self.window_size_left is not None):
+                            row_limit_bottom = row_to_r2p_idx(
+                                row_limit_bot + 1, num_rep, num_wg
+                            )
+                            mask = mask & r2p_bitmask_below(row_limit_bottom, s)
+
+                        return mask
+
+                    mask_r2p_lambda(
+                        acc_S,
+                        mask_gen_fn,
+                        rank1=True,
+                    )
