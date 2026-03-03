@@ -1423,31 +1423,77 @@ class FlashAttentionForwardSm100:
             tSrQs = (tSrQ[None, None, None, 0],)
 
         qk_mma_op, pv_mma_op = tiled_mma_qk.op, tiled_mma_pv.op
+        qk_mma_idesc, pv_mma_idesc = sm100_desc.mma_op_to_idesc(qk_mma_op), sm100_desc.mma_op_to_idesc(pv_mma_op)
+        q_smem_base = sm100_desc.smem_desc_base_from_tensor(sQ, sm100_desc.Major.K)
+        k_smem_base = sm100_desc.smem_desc_base_from_tensor(sK, sm100_desc.Major.K)
+        v_smem_base = sm100_desc.smem_desc_base_from_tensor(sV, sm100_desc.Major.MN)
+        q_smem_start = [sm100_desc.make_smem_desc_start_addr(sQ[None, None, None, stage].iterator) for stage in range(self.q_stage)]
 
+        sm100_utils.declare_ptx_smem_desc(q_smem_start[self.q_stage - 1], q_smem_base, tSrQ[None, None, None, 0].layout, var_name_prefix="fa_fwd_q_smem_desc")
+        sm100_utils.declare_ptx_idesc(qk_mma_op, var_name="fa_fwd_qk_mma_idesc")
+        sm100_utils.declare_ptx_idesc(pv_mma_op, var_name="fa_fwd_pv_mma_idesc")
+
+        sQ_stage_stride = (sQ.layout.stride[-1] * sQ.element_type.width // 8) >> 4
+        if const_expr(self.q_stage == 1):
+            sQ_stage_stride = 0
         gemm_Si = [
             partial(
-                sm100_utils.gemm_ptx_partial,
-                qk_mma_op,
+                # sm100_utils.gemm_ptx_precomputed,
+                # self.tmem_s_offset[stage],
+                # smem_desc_start_a=q_smem_start[stage],
+                # idesc=qk_mma_idesc,
+                # smem_desc_base_a=q_smem_base,
+                # smem_desc_base_b=k_smem_base,
+                # tCrA_layout=tSrQ[None, None, None, 0].layout,
+                sm100_utils.gemm_ptx_precomputed_varname,
                 self.tmem_s_offset[stage],
-                tSrQs[stage],
-                sA=sQ[None, None, None, stage],
+                # idesc=qk_mma_idesc,
+                smem_desc_base_b=k_smem_base,
+                tCrB_layout=tSrK[None, None, None, 0].layout,
+                smem_var_name_prefix=f"fa_fwd_q_smem_desc",
+                idesc_var_name=f"fa_fwd_qk_mma_idesc",
+                smem_offset=-sQ_stage_stride if stage == 0 else sQ_stage_stride,
                 zero_init=True,
                 cta_group=self.cta_group_size,
             )
             for stage in range(self.q_stage)
         ]
+        # gemm_Si = [
+        #     partial(
+        #         sm100_utils.gemm,
+        #         tiled_mma_qk,
+        #         tStS[None, None, None, stage],
+        #         tCrA=tSrQ[None, None, None, stage],
+        #         zero_init=True,
+        #     )
+        #     for stage in range(self.q_stage)
+        # ]
         gemm_Pi = [
             partial(
+                # sm100_utils.gemm_ptx_precomputed,
                 sm100_utils.gemm_ptx_partial,
                 pv_mma_op,
                 self.tmem_o_offset[stage],
                 tOrP[None, None, None, stage],
                 sA=None,
                 split_arrive=self.split_P_arrive if self.split_P_arrive > 0 else None,
+                # smem_desc_start_a=tOrP[None, None, None, stage].iterator.toint(),
+                # smem_desc_start_a=self.tmem_p_offset[stage],
+                # idesc=pv_mma_idesc,
+                # smem_desc_base_a=None,
+                # smem_desc_base_b=v_smem_base,
+                # tCrA_layout=tOrP[None, None, None, 0].layout,
+                # tCrB_layout=tOrV[None, None, None, 0].layout
                 cta_group=self.cta_group_size,
             )
             for stage in range(self.q_stage)
         ]
+        # gemm_Pi = [
+        #     partial(
+        #         sm100_utils.gemm, tOtO[None, None, None, stage], tCrA=tOrP[None, None, None, stage]
+        #     )
+        #     for stage in range(self.q_stage)
+        # ]
 
         mma_q_consumer_phase = Int32(0)
         mma_kv_consumer_state = pipeline.make_pipeline_state(
@@ -1500,10 +1546,12 @@ class FlashAttentionForwardSm100:
                     # sm100_utils.gemm(tiled_mma_qk, tStS[None, None, None, stage], tSrQ[None, None, None, stage], tSrKi, zero_init=True)
                     sK_cur = sK[None, None, None, Ki_index]
                     if const_expr(self.uneven_kv_smem):
-                        sK_cur = self.offset_kv_smem(
-                            sK_cur, mma_kv_consumer_state.index, mma_kv_consumer_state.phase
-                        )
-                    gemm_Si[stage](tCrB=tSrKi, sB=sK_cur)
+                        sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
+                    # gemm_Si[stage](tCrB=tSrKi, sB=sK_cur)
+                    gemm_Si[stage](
+                        smem_desc_start_b=sm100_desc.make_smem_desc_start_addr(sK_cur.iterator)
+                    )
+                    # gemm_Si[stage](tCrB=tSrKi)
                     # 4. release S0 / S1
                     pipeline_s_p_o.producer_commit_w_index(stage)
                 mma_q_consumer_phase ^= 1
@@ -1539,6 +1587,7 @@ class FlashAttentionForwardSm100:
                         gemm_Pi[stage](
                             tCrB=tOrVi,
                             sB=sV_cur,
+                            # smem_desc_start_b=sm100_desc.make_smem_desc_start_addr(sV_cur.iterator),
                             zero_init=not O_should_accumulate,
                             mbar_ptr=pipeline_p_lastsplit.sync_object_full.get_barrier(stage) if self.split_P_arrive > 0 else None,
                             mbar_phase=P_full_O_rescaled_phase,
@@ -1568,7 +1617,11 @@ class FlashAttentionForwardSm100:
                         sK_cur = sK[None, None, None, Ki_index]
                         if const_expr(self.uneven_kv_smem):
                             sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
-                        gemm_Si[stage](tCrB=tSrK[None, None, None, Ki_index], sB=sK_cur)
+                        # gemm_Si[stage](tCrB=tSrK[None, None, None, Ki_index], sB=sK_cur)
+                        gemm_Si[stage](
+                            smem_desc_start_b=sm100_desc.make_smem_desc_start_addr(sK_cur.iterator)
+                        )
+                        # gemm_Si[stage](tCrB=tSrK[None, None, None, Ki_index])
                         # 3. release S0 / S1
                         pipeline_s_p_o.producer_commit_w_index(stage)
                         # End of GEMM_QK0i (Q0 * Ki -> S0)
@@ -1600,6 +1653,7 @@ class FlashAttentionForwardSm100:
                     gemm_Pi[stage](
                         tCrB=tOrVi,
                         sB=sV_cur,
+                        # smem_desc_start_b=sm100_desc.make_smem_desc_start_addr(sV_cur.iterator),
                         zero_init=not O_should_accumulate,
                         mbar_ptr=pipeline_p_lastsplit.sync_object_full.get_barrier(stage) if self.split_P_arrive > 0 else None,
                         mbar_phase=P_full_O_rescaled_phase,
