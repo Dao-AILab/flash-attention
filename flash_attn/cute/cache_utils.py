@@ -1,6 +1,7 @@
 # Manage Ahead-of-Time (AOT) compiled kernels
 import fcntl
 import hashlib
+import logging
 import os
 import pickle
 import sys
@@ -19,6 +20,10 @@ from cutlass.cutlass_dsl import JitCompiledFunction
 
 CompileKeyType: TypeAlias = tuple[Hashable, ...]
 CallableFunction: TypeAlias = JitCompiledFunction | tvm_ffi.Function
+
+logger = logging.getLogger(__name__)
+logger.addHandler(logging.StreamHandler())
+logger.setLevel(logging.WARNING)
 
 
 # Enable cache via `FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1`
@@ -210,12 +215,19 @@ class JITPersistentCache(JITCache):
                 label=sha256_hex,
             ):
                 if so_path.exists():
+                    logger.debug(
+                        "Loading compiled function from disk: %s", so_path
+                    )
                     m = cute.runtime.load_module(
                         str(so_path), enable_tvm_ffi=self.enable_tvm_ffi
                     )
                     fn = getattr(m, self.EXPORT_FUNCTION_PREFIX)
                     JITCache.__setitem__(self, key, fn)
                     return True
+                else:
+                    logger.debug(
+                        "Cache miss on disk for key hash %s", sha256_hex
+                    )
         else:
             raise NotImplementedError("non tvm_ffi path is not supported")
         return False
@@ -236,8 +248,14 @@ class JITPersistentCache(JITCache):
             so_path = self.cache_path / f"{sha256_hex}.so"
             if so_path.exists():
                 # Another process already exported.
+                logger.debug(
+                    "Skipping export, already on disk: %s", so_path
+                )
                 return
             obj_path = self.cache_path / f"{sha256_hex}.o"
+            logger.debug(
+                "Exporting compiled function to disk: %s", so_path
+            )
             fn.export_to_c(
                 object_file_path=str(obj_path),
                 function_name=self.EXPORT_FUNCTION_PREFIX,
@@ -251,6 +269,9 @@ class JITPersistentCache(JITCache):
                 [str(obj_path)], str(so_path)
             )
             obj_path.unlink()
+            logger.debug(
+                "Successfully exported compiled function to disk: %s", so_path
+            )
 
     def _key_to_hash(self, key: CompileKeyType) -> str:
         return hashlib.sha256(pickle.dumps(key)).hexdigest()
@@ -262,6 +283,9 @@ class JITPersistentCache(JITCache):
         """
         Not only clear the in-memory cache. Also purge persistent compilation cache.
         """
+        logger.debug(
+            "Clearing persistent cache at %s", self.cache_path
+        )
         super().clear()
         for child in self.cache_path.iterdir():
             child.unlink()
@@ -280,6 +304,10 @@ def get_jit_cache(name: str | None = None) -> JITCache:
         path = get_cache_path() / _compute_source_fingerprint()
         if name:
             path = path / name
+        logger.debug(
+            "Creating persistent JIT cache at %s", path
+        )
         return JITPersistentCache(path)
     else:
+        logger.debug("Persistent cache disabled, using in-memory JIT cache")
         return JITCache()
