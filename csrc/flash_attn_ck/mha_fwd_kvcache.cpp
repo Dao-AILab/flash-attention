@@ -178,6 +178,7 @@ fmha_fwd_splitkv_args get_ck_fmha_fwd_splitkv_args(bool has_lse,
     args.o_acc_ptr = out_acc.data_ptr();
     args.lse_ptr = nullptr;
     args.o_ptr = out.data_ptr();
+    args.sink_ptr = nullptr;
 
     if (block_table_.has_value())
     {
@@ -262,6 +263,7 @@ fmha_fwd_splitkv_args get_ck_fmha_fwd_splitkv_args(bool has_lse,
 
     args.window_size_left = mask.left;
     args.window_size_right = mask.right;
+    args.sink_size = 0;
     args.mask_type = static_cast<ck_tile::index_t>(mask.type);
 
     return args;
