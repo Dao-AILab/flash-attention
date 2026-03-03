@@ -62,6 +62,22 @@ import flash_attn_interface
 flash_attn_interface.flash_attn_func()
 ```
 
+## FlashAttention-4 (CuTeDSL)
+
+FlashAttention-4 is written in CuTeDSL and optimized for Hopper and Blackwell GPUs (e.g. H100, B200).
+
+To install:
+```sh
+pip install flash-attn-4
+```
+
+Once installed, you can use it as follows:
+```python
+from flash_attn.cute import flash_attn_func
+
+out = flash_attn_func(q, k, v, causal=True)
+```
+
 ## Installation and features
 **Requirements:**
 - CUDA toolkit or ROCm toolkit

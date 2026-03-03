@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools"]
+requires = ["setuptools", "setuptools-scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "flash-attn-cute"
-version = "0.1.0"
+name = "flash-attn-4"
+dynamic = ["version"]
 description = "Flash Attention CUTE (CUDA Template Engine) implementation"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -44,6 +44,12 @@ Repository = "https://github.com/Dao-AILab/flash-attention"
 [tool.setuptools]
 packages = ["flash_attn.cute"]
 package-dir = {"flash_attn.cute" = "."}
+
+[tool.setuptools_scm]
+root = "../.."
+tag_regex = "^fa4-v(?P<version>.+)$"
+git_describe_command = "git describe --dirty --tags --long --match 'fa4-v*'"
+fallback_version = "0.0.0"
 
 [tool.ruff]
 line-length = 100
