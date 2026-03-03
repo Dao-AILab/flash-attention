@@ -260,8 +260,8 @@ class FlashAttentionBackwardSm100:
         self.dQaccum_reduce_stage = self.tile_hdim // self.dQ_reduce_ncol
         self.dQaccum_reduce_stage_t2r = self.tile_hdim // self.dQ_reduce_ncol_t2r
         self.cluster_reduce_dQ = False and cute.size(self.cluster_shape_mn) > 1
-        # number of tma reduce adds for dKacc and dVacc epilogue
-        self.dK_reduce_ncol = 32
+        # number of tma reduce adds for dKacc and dVacc epilogue (must divide hdim_per_wg)
+        self.dK_reduce_ncol = math.gcd(32, self.tile_hdim // 2)
         # CTA group for MMA operations
         self.cta_group = tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
 
@@ -3890,7 +3890,7 @@ class FlashAttentionBackwardSm100:
             )
 
         tmem_load_atom = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), Float32
+            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(self.dK_reduce_ncol)), Float32
         )
 
         read_flag = const_expr(not deterministic_KV)
