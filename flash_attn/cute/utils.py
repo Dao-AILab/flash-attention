@@ -604,7 +604,7 @@ def ex2_emulation(x: Float32, *, poly_degree: int = 3, loc=None, ip=None) -> Flo
 # TODO: check that the ex2_emulation_2 produces the same SASS as the ptx version
 @dsl_user_op
 def ex2_emulation_2(
-    x: Float32, y: Float32, *, poly_degree: int = 5, loc=None, ip=None
+    x: Float32, y: Float32, *, poly_degree: int = 3, loc=None, ip=None
 ) -> Tuple[Float32, Float32]:
     # We assume x <= 127.0 and y <= 127.0
     fp32_round_int = float(2**23 + 2**22)
