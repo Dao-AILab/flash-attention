@@ -470,7 +470,9 @@ def _flash_attn_fwd(
                 q_subtile_factor=q_subtile_factor,
             )
         elif arch // 10 in [10, 11]:
-            use_2cta_instrs = not causal and not local and not is_split_kv and cu_seqlens_q is None and seqused_q is None and not use_block_sparsity and head_dim == 128 and head_dim_v == 128
+            head_dim_padded = int(math.ceil(head_dim / 16) * 16)
+            head_dim_v_padded = int(math.ceil(head_dim / 16) * 16)
+            use_2cta_instrs = not causal and not local and not is_split_kv and cu_seqlens_q is None and seqused_q is None and not use_block_sparsity and head_dim_padded == 128 and head_dim_v_padded == 128
             fa_fwd = FlashAttentionForwardSm100(
                 head_dim,
                 head_dim_v,
