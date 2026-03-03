@@ -18,6 +18,42 @@ import quack.activation
 
 _MIXER_ATTRS = ("__vec_size__",)
 
+# Obtained from sollya:
+# fpminimax(exp(x * log(2.0)), 1, [|1,24...|],[0;1],relative);
+POLY_EX2 = {
+    0: (1.0),
+    1: (
+        1.0,
+        0.922497093677520751953125,
+    ),
+    2: (
+        1.0,
+        0.6657850742340087890625,
+        0.330107033252716064453125,
+    ),
+    3: (
+        1.0,
+        0.695146143436431884765625,
+        0.227564394474029541015625,
+        0.077119089663028717041015625,
+    ),
+    4: (
+        1.0,
+        0.693042695522308349609375,
+        0.2412912547588348388671875,
+        5.2225358784198760986328125e-2,
+        1.3434938155114650726318359375e-2,
+    ),
+    5: (
+        1.0,
+        0.693151414394378662109375,
+        0.24016360938549041748046875,
+        5.5802188813686370849609375e-2,
+        9.01452265679836273193359375e-3,
+        1.86810153536498546600341796875e-3,
+    ),
+}
+
 
 def _compute_base_hash(func: Callable) -> str:
     """Compute hash from source code or bytecode and closure values."""
@@ -183,16 +219,32 @@ def warp_reduce(
 def fmax(
     a: float | Float32, b: float | Float32, c: float | Float32 | None = None, *, loc=None, ip=None
 ) -> Float32:
-    return Float32(
-        nvvm.fmax(
-            T.f32(),
-            Float32(a).ir_value(loc=loc, ip=ip),
-            Float32(b).ir_value(loc=loc, ip=ip),
-            c=Float32(c).ir_value(loc=loc, ip=ip) if c is not None else None,
-            loc=loc,
-            ip=ip,
+    from cutlass import CUDA_VERSION
+
+    # * NVVM call based on nvvm version
+    if CUDA_VERSION.major == 12 and CUDA_VERSION.minor == 9:
+        # Old API: requires explicit result type as first positional argument
+        return Float32(
+            nvvm.fmax(
+                T.f32(),
+                Float32(a).ir_value(loc=loc, ip=ip),
+                Float32(b).ir_value(loc=loc, ip=ip),
+                c=Float32(c).ir_value(loc=loc, ip=ip) if c is not None else None,
+                loc=loc,
+                ip=ip,
+            )
         )
-    )
+    else:
+        # New API: infers result type automatically
+        return Float32(
+            nvvm.fmax(
+                Float32(a).ir_value(loc=loc, ip=ip),
+                Float32(b).ir_value(loc=loc, ip=ip),
+                c=Float32(c).ir_value(loc=loc, ip=ip) if c is not None else None,
+                loc=loc,
+                ip=ip,
+            )
+        )
 
 
 @cute.jit
@@ -534,14 +586,9 @@ def combine_int_frac_ex2(x_rounded: Float32, frac_ex2: Float32, *, loc=None, ip=
 
 
 @dsl_user_op
-def ex2_emulation(x: Float32, *, loc=None, ip=None) -> Float32:
+def ex2_emulation(x: Float32, *, poly_degree: int = 3, loc=None, ip=None) -> Float32:
+    assert poly_degree in POLY_EX2, f"Polynomial degree {poly_degree} not supported"
     # We assume x <= 127.0
-    poly_ex2_deg3 = (
-        1.0,
-        0.695146143436431884765625,
-        0.227564394474029541015625,
-        0.077119089663028717041015625,
-    )
     fp32_round_int = float(2**23 + 2**22)
     x_clamped = cute.arch.fmax(x, -127.0)
     # We want to round down here, so that the fractional part is in [0, 1)
@@ -550,20 +597,16 @@ def ex2_emulation(x: Float32, *, loc=None, ip=None) -> Float32:
     # We assume the next 2 ops round to nearest even. The rounding mode is important.
     x_rounded_back = x_rounded - fp32_round_int
     x_frac = x_clamped - x_rounded_back
-    x_frac_ex2 = evaluate_polynomial(x_frac, poly_ex2_deg3, loc=loc, ip=ip)
+    x_frac_ex2 = evaluate_polynomial(x_frac, POLY_EX2[poly_degree], loc=loc, ip=ip)
     return combine_int_frac_ex2(x_rounded, x_frac_ex2, loc=loc, ip=ip)
 
 
 # TODO: check that the ex2_emulation_2 produces the same SASS as the ptx version
 @dsl_user_op
-def ex2_emulation_2(x: Float32, y: Float32, *, loc=None, ip=None) -> Tuple[Float32, Float32]:
+def ex2_emulation_2(
+    x: Float32, y: Float32, *, poly_degree: int = 5, loc=None, ip=None
+) -> Tuple[Float32, Float32]:
     # We assume x <= 127.0 and y <= 127.0
-    poly_ex2_deg3 = (
-        1.0,
-        0.695146143436431884765625,
-        0.227564394474029541015625,
-        0.077119089663028717041015625,
-    )
     fp32_round_int = float(2**23 + 2**22)
     xy_clamped = (cute.arch.fmax(x, -127.0), cute.arch.fmax(y, -127.0))
     # We want to round down here, so that the fractional part is in [0, 1)
@@ -574,7 +617,7 @@ def ex2_emulation_2(x: Float32, y: Float32, *, loc=None, ip=None) -> Tuple[Float
         xy_rounded, (fp32_round_int, fp32_round_int)
     )
     xy_frac = quack.activation.sub_packed_f32x2(xy_clamped, xy_rounded_back)
-    xy_frac_ex2 = evaluate_polynomial_2(*xy_frac, poly_ex2_deg3, loc=loc, ip=ip)
+    xy_frac_ex2 = evaluate_polynomial_2(*xy_frac, POLY_EX2[poly_degree], loc=loc, ip=ip)
     x_out = combine_int_frac_ex2(xy_rounded[0], xy_frac_ex2[0], loc=loc, ip=ip)
     y_out = combine_int_frac_ex2(xy_rounded[1], xy_frac_ex2[1], loc=loc, ip=ip)
     return x_out, y_out
