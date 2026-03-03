@@ -626,15 +626,19 @@ class AttentionMask:
                     # column, by setting row limit to be self.tile_m.
                     if seqlenk_col_limit <= 0:
                         row_limit_top = self.tile_m
-                r2p = True
-                if const_expr(not r2p):
-                    for i in cutlass.range(cute.size(acc_S.shape), unroll_full=True):
-                        acc_S[i] = (
-                            -cutlass.Float32.inf if t0ScS_t2r[i][ROW] < row_limit_top else acc_S[i]
-                        )
-                else:
-                    num_rep = cute.size(tScS_t2r, mode=[0])  # 16 or 32
-                    mask_r2p_transposed(acc_S, row_limit_top, num_rep)
+
+                if row_limit_top > 0:
+                    r2p = True
+                    if const_expr(not r2p):
+                        for i in cutlass.range(cute.size(acc_S.shape), unroll_full=True):
+                            acc_S[i] = (
+                                -cutlass.Float32.inf
+                                if t0ScS_t2r[i][ROW] < row_limit_top
+                                else acc_S[i]
+                            )
+                    else:
+                        num_rep = cute.size(tScS_t2r, mode=[0])  # 16 or 32
+                        mask_r2p_transposed(acc_S, row_limit_top, num_rep)
             else:
                 if const_expr(self.window_size_right is not None):
                     row_limit_top = causal_offset - self.window_size_right

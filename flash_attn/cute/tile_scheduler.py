@@ -18,6 +18,7 @@ from quack.cute_dsl_utils import ParamsBase
 
 import flash_attn.cute.utils as utils
 from flash_attn.cute.fast_math import clz
+import math
 
 
 class WorkTileInfo(cutlass.utils.WorkTileInfo):
@@ -48,6 +49,7 @@ class TileSchedulerArguments(ParamsBase):
     qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1
     element_size: cutlass.Constexpr[int] = 2
     is_persistent: cutlass.Constexpr[bool] = False
+    is_causal: cutlass.Constexpr[bool] = False
     lpt: cutlass.Constexpr[bool] = False
     is_split_kv: cutlass.Constexpr[bool] = False
     head_swizzle: cutlass.Constexpr[bool] = False
@@ -246,6 +248,414 @@ class StaticPersistentTileScheduler:
             obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
             values = values[n_items:]
         return StaticPersistentTileScheduler(*(tuple(obj_list)), loc=self._loc)
+
+
+class SinglePersistentBWDTileScheduler:
+    @dataclass
+    class Params(ParamsBase):
+        total_blocks: Int32
+        total_clusters: Int32
+        num_block: Int32
+        num_block_actual: Int32
+        num_head_divmod: FastDivmodDivisor
+        num_block_divmod: FastDivmodDivisor
+        num_hb_divmod: FastDivmodDivisor
+        cluster_shape_mn: cutlass.Constexpr[Tuple[int, int]] = (1, 1)
+        is_causal: cutlass.Constexpr[bool] = False
+
+        @staticmethod
+        def create(
+            args: TileSchedulerArguments, *, loc=None, ip=None
+        ) -> "SinglePersistentBWDTileScheduler.Params":
+            num_block_cluster = cute.ceil_div(args.num_block, args.cluster_shape_mn[0])
+            total_clusters = num_block_cluster * args.num_head * args.num_batch
+            total_blocks = total_clusters * args.cluster_shape_mn[0]
+            return SinglePersistentBWDTileScheduler.Params(
+                total_blocks=total_blocks,
+                total_clusters=total_clusters,
+                num_block=num_block_cluster,
+                num_block_actual=args.num_block,
+                num_head_divmod=FastDivmodDivisor(args.num_head),
+                num_block_divmod=FastDivmodDivisor(num_block_cluster),
+                num_hb_divmod=FastDivmodDivisor(num_block_cluster * args.num_head),
+                cluster_shape_mn=args.cluster_shape_mn,
+                is_causal=args.is_causal,
+            )
+
+    def __init__(
+        self,
+        params: Params,
+        wave: Int32,
+        num_persistent_clusters: Int32,
+        persistent_cluster_id: Int32,
+        *,
+        loc=None,
+        ip=None,
+    ):
+        self.params = params
+        self._wave = wave
+        self._num_persistent_clusters = num_persistent_clusters
+        self._persistent_cluster_id = persistent_cluster_id
+        self._loc = loc
+        self._ip = ip
+
+    @staticmethod
+    def to_underlying_arguments(args: TileSchedulerArguments, *, loc=None, ip=None) -> Params:
+        return SinglePersistentBWDTileScheduler.Params.create(args, loc=loc, ip=ip)
+
+    @staticmethod
+    @cute.jit
+    def create(params: Params, *, loc=None, ip=None) -> "SinglePersistentBWDTileScheduler":
+        """Initialize the scheduler, caching per-CTA constants."""
+        cluster_size = params.cluster_shape_mn[0] * params.cluster_shape_mn[1]
+        num_persistent_clusters = cute.arch.grid_dim()[0] // cluster_size
+        persistent_cluster_id = cute.arch.block_idx()[0] // cluster_size
+        return SinglePersistentBWDTileScheduler(
+            params,
+            Int32(0),
+            num_persistent_clusters,
+            persistent_cluster_id,
+            loc=loc,
+            ip=ip,
+        )
+
+    @staticmethod
+    def get_grid_shape(
+        params: Params,
+        *,
+        loc=None,
+        ip=None,
+    ) -> Tuple[Int32, Int32, Int32]:
+        """Return persistent grid shape: (num_persistent_ctas, 1, 1)."""
+        hardware_info = cutlass.utils.HardwareInfo()
+        sm_count = hardware_info.get_device_multiprocessor_count()
+        cluster_size_py = params.cluster_shape_mn[0] * params.cluster_shape_mn[1]
+        cluster_size = Int32(cluster_size_py)
+        num_persistent_ctas = cutlass.min(sm_count, params.total_blocks)
+        num_persistent_ctas = (num_persistent_ctas // cluster_size) * cluster_size
+
+        # Causal: find coprime cluster count to avoid tail imbalance
+        if bool(getattr(params, "is_causal", False)):
+            try:
+                num_persistent_ctas_int = int(num_persistent_ctas)
+                num_block_cluster_int = int(params.num_block)
+            except Exception:
+                num_persistent_ctas_int = None
+                num_block_cluster_int = None
+            if (
+                num_persistent_ctas_int is not None
+                and num_block_cluster_int is not None
+                and cluster_size_py > 0
+            ):
+                max_clusters = num_persistent_ctas_int // cluster_size_py
+                clusters = max_clusters
+                max_decrement = min(8, max_clusters - 1)
+                for _ in range(max_decrement + 1):
+                    if clusters >= 1 and math.gcd(clusters, num_block_cluster_int) == 1:
+                        num_persistent_ctas = Int32(clusters * cluster_size_py)
+                        break
+                    clusters -= 1
+
+        num_persistent_ctas = cutlass.max(num_persistent_ctas, cluster_size)
+        return (num_persistent_ctas, Int32(1), Int32(1))
+
+    @cute.jit
+    def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
+        """Compute current work tile for this CTA."""
+        params = self.params
+        num_persistent_clusters = self._num_persistent_clusters
+        persistent_cluster_id = self._persistent_cluster_id
+
+        wave = self._wave
+        wave_base = wave * num_persistent_clusters
+        cluster_in_wave = persistent_cluster_id
+
+        # Causal: reverse on odd waves for symmetric pairing (heavy + light work)
+        if cutlass.const_expr(params.is_causal):
+            remaining = params.total_clusters - wave_base
+            wave_len = cutlass.min(num_persistent_clusters, remaining)
+            if (wave & 1) == 1 and persistent_cluster_id < wave_len:
+                cluster_in_wave = wave_len - 1 - persistent_cluster_id
+
+        cluster_idx = wave_base + cluster_in_wave
+
+        # Decode: cluster_idx -> (batch, head, block)
+        batch_idx, hb_idx = divmod(cluster_idx, params.num_hb_divmod)
+        head_idx, block = divmod(hb_idx, params.num_block_divmod)
+
+        # Cluster coordination: CTAs in a cluster process adjacent blocks
+        bidx_in_cluster = cute.arch.block_in_cluster_idx()
+        block = block * params.cluster_shape_mn[0] + bidx_in_cluster[0]
+
+        is_valid = (cluster_idx < params.total_clusters) & (block < params.num_block_actual)
+
+        return WorkTileInfo((Int32(block), Int32(head_idx), Int32(batch_idx), Int32(0)), is_valid)
+
+    def initial_work_tile_info(self, *, loc=None, ip=None):
+        return self.get_current_work(loc=loc, ip=ip)
+
+    def prefetch_next_work(self, *, loc=None, ip=None):
+        pass
+
+    def advance_to_next_work(self, *, loc=None, ip=None):
+        self._wave += Int32(1)
+
+    def __extract_mlir_values__(self):
+        values, self._values_pos = [], []
+        for obj in [
+            self.params,
+            self._wave,
+            self._num_persistent_clusters,
+            self._persistent_cluster_id,
+        ]:
+            obj_values = cutlass.extract_mlir_values(obj)
+            values += obj_values
+            self._values_pos.append(len(obj_values))
+        return values
+
+    def __new_from_mlir_values__(self, values):
+        obj_list = []
+        for obj, n_items in zip(
+            [self.params, self._wave, self._num_persistent_clusters, self._persistent_cluster_id],
+            self._values_pos,
+        ):
+            obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
+            values = values[n_items:]
+        return self.__class__(*(tuple(obj_list)), loc=self._loc)
+
+
+class CLCDynamicPersistentBWDTileScheduler:
+    @dataclass
+    class Params(ParamsBase):
+        num_block_actual: Int32
+        num_head: Int32
+        num_batch: Int32
+        cluster_shape_mn: cutlass.Constexpr[Tuple[int, int]] = (1, 1)
+        sched_stages: cutlass.Constexpr[int] = 1
+
+        @staticmethod
+        def create(
+            args: TileSchedulerArguments,
+            clc_stages: Optional[int] = None,
+            sched_stages: int = 1,
+            *,
+            loc=None,
+            ip=None,
+        ) -> "CLCDynamicPersistentBWDTileScheduler.Params":
+            if clc_stages is not None:
+                assert clc_stages in (1, 2), "CLC BWD supports clc_stages in (1, 2)"
+                if sched_stages == 1:
+                    sched_stages = clc_stages
+                else:
+                    assert sched_stages == clc_stages, (
+                        "sched_stages and clc_stages must match when both are set"
+                    )
+            assert sched_stages in (1, 2), "CLC BWD supports sched_stages in (1, 2)"
+            return CLCDynamicPersistentBWDTileScheduler.Params(
+                num_block_actual=args.num_block,
+                num_head=args.num_head,
+                num_batch=args.num_batch,
+                cluster_shape_mn=args.cluster_shape_mn,
+                sched_stages=sched_stages,
+            )
+
+    def __init__(
+        self,
+        params: Params,
+        sched_smem: cute.Tensor,
+        scheduler_pipeline,
+        sched_state,
+        *,
+        loc=None,
+        ip=None,
+    ):
+        self.params = params
+        self._sched_smem = sched_smem
+        self._scheduler_pipeline = scheduler_pipeline
+        self._sched_state = sched_state
+        self._loc = loc
+        self._ip = ip
+
+    @staticmethod
+    def to_underlying_arguments(
+        args: TileSchedulerArguments,
+        clc_stages: Optional[int] = None,
+        sched_stages: int = 1,
+        *,
+        loc=None,
+        ip=None,
+    ) -> Params:
+        return CLCDynamicPersistentBWDTileScheduler.Params.create(
+            args,
+            clc_stages=clc_stages,
+            sched_stages=sched_stages,
+            loc=loc,
+            ip=ip,
+        )
+
+    @staticmethod
+    @cute.jit
+    def create(
+        params: Params,
+        sched_smem: cute.Tensor,
+        scheduler_pipeline,
+        is_scheduler_warp: bool | cutlass.Boolean = False,
+        *,
+        loc=None,
+        ip=None,
+    ) -> "CLCDynamicPersistentBWDTileScheduler":
+        assert scheduler_pipeline is not None
+        assert sched_smem is not None
+        sched_state = cutlass.pipeline.make_pipeline_state(
+            cutlass.pipeline.PipelineUserType.Producer
+            if const_expr(is_scheduler_warp)
+            else cutlass.pipeline.PipelineUserType.Consumer,
+            params.sched_stages,
+        )
+
+        return CLCDynamicPersistentBWDTileScheduler(
+            params,
+            sched_smem=sched_smem,
+            scheduler_pipeline=scheduler_pipeline,
+            sched_state=sched_state,
+            loc=loc,
+            ip=ip,
+        )
+
+    # called by host
+    @staticmethod
+    def get_grid_shape(
+        params: Params,
+        *,
+        loc=None,
+        ip=None,
+    ) -> Tuple[Int32, Int32, Int32]:
+        assert params.cluster_shape_mn[1] == 1, "Only cluster_shape_mn[1] == 1 is supported"
+        cluster_m = params.cluster_shape_mn[0]
+        assert cluster_m in (1, 2), "CLC BWD currently supports cluster_shape_mn[0] in (1, 2)"
+        return (
+            cute.round_up(params.num_block_actual, cluster_m),
+            params.num_head,
+            params.num_batch,
+        )
+
+    @cute.jit
+    def initial_work_tile_info(self, *, loc=None, ip=None) -> WorkTileInfo:
+        n_block, head_idx, batch_idx = cute.arch.block_idx()
+        return WorkTileInfo(
+            (Int32(n_block), Int32(head_idx), Int32(batch_idx), Int32(0)),
+            True,
+        )
+
+    def prefetch_next_work(self, *, loc=None, ip=None):
+        pass
+
+    # producer (scheduler warp)
+    @cute.jit
+    def fetch_next_work(self, *, loc=None, ip=None):
+        params = self.params
+        clc_response_ptr = self._sched_smem[None, self._sched_state.index].iterator + 4
+        clc_mbar_ptr = self._scheduler_pipeline.producer_get_barrier(self._sched_state)
+        cluster_m = params.cluster_shape_mn[0]
+        assert cluster_m in (1, 2), "CLC BWD currently supports cluster_shape_mn[0] in (1, 2)"
+
+        if const_expr(cluster_m == 1):
+            with cute.arch.elect_one():
+                cute.arch.issue_clc_query(
+                    clc_mbar_ptr, clc_response_ptr, multicast=False, loc=loc, ip=ip
+                )
+        else:
+            with cute.arch.elect_one():
+                cute.arch.issue_clc_query(clc_mbar_ptr, clc_response_ptr, loc=loc, ip=ip)
+        cute.arch.mbarrier_wait(clc_mbar_ptr, self._sched_state.phase ^ 1, loc=loc, ip=ip)
+
+        n_block, head_idx, batch_idx, is_valid_i32 = cute.arch.clc_response(
+            clc_response_ptr, loc=loc, ip=ip
+        )
+        #cute.arch.fence_view_async_shared()
+
+        return Int32(n_block), Int32(head_idx), Int32(batch_idx), (is_valid_i32 != 0)
+
+    # producer (scheduler warp)
+    @cute.jit
+    def write_work_tile_to_smem(
+        self, *, loc=None, ip=None
+    ):
+        self._scheduler_pipeline.producer_acquire(self._sched_state)
+        _, _, _, is_valid = self.fetch_next_work(loc=loc, ip=ip)
+        self._sched_state.advance()
+        return is_valid
+
+    @cute.jit
+    def _read_work_tile_from_smem(self, *, loc=None, ip=None) -> WorkTileInfo:
+        params = self.params
+        self._scheduler_pipeline.consumer_wait(self._sched_state)
+
+        pipeline_idx = self._sched_state.index
+        clc_response_ptr = self._sched_smem[None, pipeline_idx].iterator + 4
+        n_block_base, head_idx, batch_idx, is_valid_i32 = cute.arch.clc_response(
+            clc_response_ptr, loc=loc, ip=ip
+        )
+        n_block = Int32(n_block_base) + Int32(cute.arch.block_idx_in_cluster())
+        is_valid = (is_valid_i32 != 0) & (n_block < params.num_block_actual)
+        #cute.arch.fence_view_async_shared()
+
+        with cute.arch.elect_one():
+            self._scheduler_pipeline.consumer_release(self._sched_state)
+        self._sched_state.advance()
+        return WorkTileInfo(
+            (Int32(n_block), Int32(head_idx), Int32(batch_idx), Int32(0)),
+            is_valid,
+        )
+
+    @cute.jit
+    def advance_to_next_work(
+        self,
+        is_scheduler_warp: cutlass.Constexpr[bool] = False,
+        *,
+        loc=None,
+        ip=None,
+    ):
+        if const_expr(is_scheduler_warp):
+            is_valid = self.write_work_tile_to_smem(loc=loc, ip=ip)
+            return is_valid
+        return True
+
+    # consumer warp
+    @cute.jit
+    def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
+        return self._read_work_tile_from_smem(loc=loc, ip=ip)
+
+    def producer_tail(self):
+        self._scheduler_pipeline.producer_tail(self._sched_state)
+
+    def __extract_mlir_values__(self):
+        values, self._values_pos = [], []
+        for obj in [
+            self.params,
+            self._sched_smem,
+            self._scheduler_pipeline,
+            self._sched_state,
+        ]:
+            obj_values = cutlass.extract_mlir_values(obj)
+            values += obj_values
+            self._values_pos.append(len(obj_values))
+        return values
+
+    def __new_from_mlir_values__(self, values):
+        obj_list = []
+        for obj, n_items in zip(
+            [
+                self.params,
+                self._sched_smem,
+                self._scheduler_pipeline,
+                self._sched_state,
+            ],
+            self._values_pos,
+        ):
+            obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
+            values = values[n_items:]
+        return CLCDynamicPersistentBWDTileScheduler(*(tuple(obj_list)), loc=self._loc)
 
 
 class SingleTileLPTScheduler:
