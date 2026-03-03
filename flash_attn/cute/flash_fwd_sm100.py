@@ -159,7 +159,9 @@ class FlashAttentionForwardSm100:
         )
         # Does S1 need to wait for S0 to finish
         # self.s0_s1_barrier = self.head_dim_padded in [64, 96] and (not self.is_causal and not self.is_local)
-        self.enable_e2e = self.head_dim_padded <= 128 and not (self.arch >= Arch.sm_103 and self.arch <= Arch.sm_103f)
+        is_sm103 = self.arch >= Arch.sm_103 and self.arch <= Arch.sm_103f
+        # self.enable_ex2_emu = self.head_dim_padded <= 128 and not is_sm103
+        self.enable_ex2_emu = (self.head_dim_padded <= 128 or (self.head_dim_padded == 192 and self.use_2cta_instrs and not self.is_causal and not self.is_local)) and not is_sm103
         self.s0_s1_barrier = False
         self.overlap_sO_sQ = (
             (self.head_dim_padded == 192 and self.head_dim_v_padded >= 64) or
@@ -231,7 +233,7 @@ class FlashAttentionForwardSm100:
             self.num_regs_other = 48 if not paged_kv_non_tma else 80
         else:
             # self.num_regs_softmax = 192 if self.is_causal or self.is_local else 184
-            if not self.enable_e2e:
+            if not self.enable_ex2_emu:
                 self.num_regs_softmax = 192 if not paged_kv_non_tma else 184
             else:
                 # self.num_regs_softmax = 200 if not paged_kv_non_tma else 184
@@ -239,7 +241,7 @@ class FlashAttentionForwardSm100:
             # self.num_regs_softmax = 176
             # self.num_regs_correction = 96
             # self.num_regs_correction = 64 if self.is_causal or self.is_local else 80
-            if not self.enable_e2e:
+            if not self.enable_ex2_emu:
                 self.num_regs_correction = 80
             else:
                 # self.num_regs_correction = 64
@@ -367,11 +369,20 @@ class FlashAttentionForwardSm100:
         self._setup_attributes()
         self.use_tma_O = self.arch >= Arch.sm_90 and mCuSeqlensQ is None and mSeqUsedQ is None
         # This can be tuned
-        self.e2e_freq = 16
-        if const_expr(
-            self.head_dim_padded > 64 and not self.is_causal and not self.is_local and self.pack_gqa
-        ):
-            self.e2e_freq = 32 if mCuSeqlensQ is not None or mSeqUsedQ is not None else 10
+        # This is currently very ad-hoc, we should tune it systematically
+        self.ex2_emu_freq = 0
+        # self.ex2_emu_start_frg = 1 if self.is_causal else 0
+        self.ex2_emu_start_frg = 1
+        if const_expr(self.enable_ex2_emu):
+            self.ex2_emu_freq = 16
+            if const_expr(self.head_dim_padded == 128 and self.use_2cta_instrs):
+                self.ex2_emu_freq = 12
+            if const_expr(
+                self.pack_gqa and self.head_dim_padded > 64 and not self.is_causal and not self.is_local
+            ):
+                self.ex2_emu_freq = 32 if mCuSeqlensQ is not None or mSeqUsedQ is not None else 10
+            if const_expr(self.head_dim_padded > 64 and self.is_causal):
+                self.ex2_emu_freq = 10
 
         cta_group = tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
         q_major_mode = tcgen05.OperandMajorMode.K
@@ -1322,10 +1333,13 @@ class FlashAttentionForwardSm100:
                     if const_expr(not self.use_tma_KV):
                         paged_kv_manager.load_page_table(n_block_first)
                     load_K(block=n_block_max - 1, producer_state=kv_producer_state, page_idx=page_idx)  # K0
+                    # load_K(block=n_block_max - 1, producer_state=kv_producer_state, page_idx=page_idx, extra_tx_count=self.tma_copy_bytes["Q"])  # K0
                     if const_expr(len(self.load_warp_ids) == 1) or warp_idx == self.load_warp_ids[0]:
                         # load_Q(block=0, stage=0)  # Q0
                         pipeline_q.producer_acquire_w_index_phase(0, q_producer_phase)
+                        # pipeline_q.sync_object_empty.wait(0, q_producer_phase)
                         tma_bar_ptr = pipeline_q.sync_object_full.get_barrier(0)
+                        # tma_bar_ptr = pipeline_kv.producer_get_barrier(kv_producer_state)
                         load_Q_fn(src_idx=0, dst_idx=0, tma_bar_ptr=tma_bar_ptr)
                     kv_producer_state.advance()
                     if const_expr(self.q_stage == 2) and (const_expr(len(self.load_warp_ids) == 1) or warp_idx == self.load_warp_ids[0]):
@@ -2060,8 +2074,8 @@ class FlashAttentionForwardSm100:
         softmax.apply_exp2_convert(
             tSrS_t2r,
             tSrP_r2t,
-            e2e=mask_fn is None and self.enable_e2e,
-            e2e_freq=self.e2e_freq,
+            ex2_emu_freq=self.ex2_emu_freq if const_expr(mask_fn is None) else 0,
+            ex2_emu_start_frg=self.ex2_emu_start_frg,
         )
         # Sequence barrier arrive
         if const_expr(self.s0_s1_barrier):
