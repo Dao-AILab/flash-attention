@@ -41,7 +41,9 @@ if os.environ.get("CUTE_DSL_PTXAS_PATH", None) is not None:
 
 
 from flash_attn.cute import utils
-from flash_attn.cute.cute_dsl_utils import to_cute_tensor, to_cute_aux_tensor, get_aux_tensor_metadata
+from flash_attn.cute.cute_dsl_utils import (
+    to_cute_tensor, to_cute_aux_tensor, get_aux_tensor_metadata, get_broadcast_dims,
+)
 from flash_attn.cute.flash_fwd import FlashAttentionForwardSm90
 from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
 from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
@@ -853,6 +855,8 @@ def _flash_attn_bwd(
         num_threads,
         cu_seqlens_q is None,
         seqused_q is None,
+        get_broadcast_dims(out),
+        get_broadcast_dims(dout),
     )
     if compile_key_pre not in _flash_attn_bwd.compile_cache_pre:
         o_tensor, do_tensor = [to_cute_tensor(t) for t in (out, dout)]
@@ -961,6 +965,10 @@ def _flash_attn_bwd(
             num_aux_tensors,
             use_block_sparsity,
             block_sparse_broadcast_pattern,
+            get_broadcast_dims(q),
+            get_broadcast_dims(k),
+            get_broadcast_dims(v),
+            get_broadcast_dims(dout),
         )
     else:
         compile_key = (
@@ -990,6 +998,10 @@ def _flash_attn_bwd(
             cu_seqlens_k is None,
             seqused_q is None,
             seqused_k is None,
+            get_broadcast_dims(q),
+            get_broadcast_dims(k),
+            get_broadcast_dims(v),
+            get_broadcast_dims(dout),
         )
     if compile_key not in _flash_attn_bwd.compile_cache:
         q_tensor, k_tensor, v_tensor, do_tensor, dq_tensor, dk_tensor, dv_tensor = [
@@ -1148,7 +1160,9 @@ def _flash_attn_bwd(
         cu_seqlens_q is None,
         seqused_q is None,
         use_2cta_instrs,
-        1, # no cluster for tile_m 
+        1, # no cluster for tile_m
+        get_broadcast_dims(dq_accum),
+        get_broadcast_dims(dq),
     )
     if compile_key_post not in _flash_attn_bwd.compile_cache_post:
         dq_accum_tensor = to_cute_tensor(dq_accum)
@@ -1194,7 +1208,9 @@ def _flash_attn_bwd(
             cu_seqlens_k is None,
             seqused_k is None,
             False, # even for 2cta, is split along hdim, so always False
-            cluster_size, # cluster is for tile_n 
+            cluster_size, # cluster is for tile_n
+            get_broadcast_dims(dk_accum),
+            get_broadcast_dims(dk),
         )
         if compile_key_post not in _flash_attn_bwd.compile_cache_post:
             dk_accum_tensor = to_cute_tensor(dk_accum)
@@ -1238,6 +1254,8 @@ def _flash_attn_bwd(
             seqused_k is None,
             False,
             cluster_size,
+            get_broadcast_dims(dv_accum),
+            get_broadcast_dims(dv),
         )
         if compile_key_post not in _flash_attn_bwd.compile_cache_post:
             dv_accum_tensor = to_cute_tensor(dv_accum)
