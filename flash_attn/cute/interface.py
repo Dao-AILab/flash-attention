@@ -31,6 +31,7 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+from flash_attn.cute.cache_utils import get_jit_cache
 from flash_attn.cute.testing import is_fake_mode
 
 
@@ -570,7 +571,7 @@ def _flash_attn_fwd(
     return out, lse
 
 
-_flash_attn_fwd.compile_cache = {}
+_flash_attn_fwd.compile_cache = get_jit_cache("fwd")
 
 
 def _flash_attn_bwd(
@@ -1315,9 +1316,9 @@ def _flash_attn_bwd(
     return dq, dk, dv
 
 
-_flash_attn_bwd.compile_cache_pre = {}
-_flash_attn_bwd.compile_cache = {}
-_flash_attn_bwd.compile_cache_post = {}
+_flash_attn_bwd.compile_cache_pre = get_jit_cache("bwd_pre")
+_flash_attn_bwd.compile_cache = get_jit_cache("bwd")
+_flash_attn_bwd.compile_cache_post = get_jit_cache("bwd_post")
 
 
 class FlashAttnFunc(torch.autograd.Function):
@@ -1749,7 +1750,7 @@ def _flash_attn_fwd_combine(
         )
 
 
-_flash_attn_fwd_combine.compile_cache = {}
+_flash_attn_fwd_combine.compile_cache = get_jit_cache("fwd_combine")
 
 
 def flash_attn_combine(
