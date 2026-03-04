@@ -62,6 +62,22 @@ import flash_attn_interface
 flash_attn_interface.flash_attn_func()
 ```
 
+## FlashAttention-4 (CuTeDSL)
+
+FlashAttention-4 is written in CuTeDSL and optimized for Hopper and Blackwell GPUs (e.g. H100, B200).
+
+To install:
+```sh
+pip install flash-attn-4
+```
+
+Once installed, you can use it as follows:
+```python
+from flash_attn.cute import flash_attn_func
+
+out = flash_attn_func(q, k, v, causal=True)
+```
+
 ## Installation and features
 **Requirements:**
 - CUDA toolkit or ROCm toolkit
@@ -340,6 +356,25 @@ def flash_attn_with_kvcache(
 
 To see how these functions are used in a multi-head attention layer (which
 includes QKV projection, output projection), see the MHA [implementation](https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/modules/mha.py).
+
+### Using with 🤗 Kernels
+
+If your hardware environment belongs to any of the above-mentioned, you can also use the [`kernels` library](https://github.com/huggingface/kernels)
+to use Flash Attention 2 and 3 right away.
+
+```py
+# pip install kernels
+
+from kernels import get_kernel
+
+# FA2
+fa_module = get_kernel("kernels-community/flash-attn2", version=1)
+flash_attn_func = fa_module.flash_attn_func
+
+# FA3
+fa3_module = get_kernel("kernels-community/flash-attn3", version=1)
+flash_attn_func = fa3_module.flash_attn_func
+```
 
 ## Changelog
 

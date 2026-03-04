@@ -28,6 +28,7 @@ from flash_attn.cute.block_sparsity import (
     fast_sampling,
     normalize_block_sparse_config,
 )
+from flash_attn.cute.cache_utils import get_jit_cache
 from flash_attn.cute import utils
 from mask_mod_definitions import get_mask_pair, random_doc_id_tensor
 COMPUTE_CAPABILITY = torch.cuda.get_device_capability()[0]
@@ -351,7 +352,7 @@ def _run_mask_test(
         m_block_size=tile_m,
         n_block_size=tile_n,
         pack_gqa=pack_gqa,
-        _compute_capability=None,
+        _arch=None,
         score_mod=None,
         mask_mod=mask_mod_cute,
         block_sparse_tensors=block_sparse_mask_fwd,
@@ -622,7 +623,7 @@ def test_single_doc_bwd_minimal():
         causal=False, softcap=None,
         window_size_left=-1, window_size_right=-1,
         m_block_size=tile_m, n_block_size=tile_n, pack_gqa=False,
-        _compute_capability=None, score_mod=None,
+        _arch=None, score_mod=None,
         mask_mod=mask_mod_cute,
         block_sparse_tensors=block_sparse_mask_fwd,
         return_lse=True, aux_tensors=aux_tensors_arg,
@@ -818,8 +819,8 @@ def test_sm100_block_sparse_q_stage1():
         "__init__",
         wrapped_init,
     ):
-        compile_cache = dict(_flash_attn_fwd.compile_cache)
-        _flash_attn_fwd.compile_cache.clear()
+        compile_cache = _flash_attn_fwd.compile_cache
+        _flash_attn_fwd.compile_cache = get_jit_cache("test_mask_mod.fwd")
         try:
             _run_mask_test(
                 seqlen_q=128,
@@ -839,7 +840,7 @@ def test_sm100_block_sparse_q_stage1():
             )
         finally:
             _flash_attn_fwd.compile_cache.clear()
-            _flash_attn_fwd.compile_cache.update(compile_cache)
+            _flash_attn_fwd.compile_cache = compile_cache
     assert observed.get("q_stage") == 1
 
 
@@ -910,7 +911,7 @@ def test_sm100_block_sparse_coarse_blocks():
         m_block_size=tile_m,
         n_block_size=tile_n,
         pack_gqa=False,
-        _compute_capability=None,
+        _arch=None,
         score_mod=None,
         mask_mod=mask_mod_cute,
         block_sparse_tensors=block_sparse_mask_fwd,
@@ -1017,7 +1018,7 @@ def test_sm100_block_sparse_coarse_blocks_mismatch():
             m_block_size=tile_m,
             n_block_size=tile_n,
             pack_gqa=False,
-            _compute_capability=None,
+            _arch=None,
             score_mod=None,
             mask_mod=mask_mod_cute,
             block_sparse_tensors=block_sparse_mask_fwd,
@@ -1460,7 +1461,7 @@ def test_persistent_blocksparse_empty_tiles():
         window_size_left=None, window_size_right=None,
         learnable_sink=None,
         m_block_size=tile_m, n_block_size=tile_n,
-        pack_gqa=False, _compute_capability=None,
+        pack_gqa=False, _arch=None,
         score_mod=None, mask_mod=mask_mod_cute,
         block_sparse_tensors=block_sparse_mask_fwd,
         return_lse=True, aux_tensors=None,

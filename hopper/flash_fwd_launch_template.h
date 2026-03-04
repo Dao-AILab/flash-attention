@@ -12,6 +12,7 @@
 #include "cutlass/cluster_launch.hpp"
 #include "cutlass/kernel_launch.h"
 
+#include "cuda_check.h"
 #include "static_switch.h"
 #include "flash.h"
 #include "tile_size.h"
@@ -185,17 +186,16 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         }
         dim3 cluster_dims(size<0>(ClusterShape{}), size<1>(ClusterShape{}), size<2>(ClusterShape{}));
         cutlass::ClusterLaunchParams launch_params{grid_dims, block_dims, cluster_dims, smem_size, stream};
-        cutlass::launch_kernel_on_cluster(launch_params, kernel, kernel_params);
+        CHECK_CUTLASS(cutlass::launch_kernel_on_cluster(launch_params, kernel, kernel_params));
     } else {
         auto kernel = cutlass::device_kernel<AttnKernel>;
         if (smem_size >= 48 * 1024) {
             CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
         }
         // kernel<<<grid_dims, block_dims, smem_size, stream>>>(kernel_params);
-        cutlass::kernel_launch<AttnKernel>(grid_dims, block_dims, smem_size, stream, kernel_params,
-                                           Arch >= 90 && Varlen && !params.skip_scheduler_metadata_computation && params.prepare_varlen_pdl /*launch_with_pdl*/);
+        CHECK_CUTLASS(cutlass::kernel_launch<AttnKernel>(grid_dims, block_dims, smem_size, stream, kernel_params,
+                                           Arch >= 90 && Varlen && !params.skip_scheduler_metadata_computation && params.prepare_varlen_pdl /*launch_with_pdl*/));
     }
-    CHECK_CUDA_KERNEL_LAUNCH();
 }
 
 template<int Arch, typename T, int kHeadDim, int kHeadDimV, bool Split, bool PagedKVNonTMA, bool Has_softcap, bool PackGQA>

@@ -374,6 +374,7 @@ class AttentionMask:
         acc_shape = (self.tile_m, self.tile_n)
         cS = cute.make_identity_tensor(acc_shape if not self.swap_AB else acc_shape[::-1])
         tScS = thr_mma.partition_C(cS)
+        tScS = tScS[(None, None), 0, 0]
         tScS_t2r = thr_tmem_load.partition_D(tScS)
         # To handle edge cases of completely masked out rows where n_block_max = 0,
         # we treat negative n_blocks as 0th n_block

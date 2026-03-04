@@ -1755,6 +1755,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 mV_cur = seqlen.offset_batch_K(mV, batch_idx, dim=3)[None, None, head_idx_kv]
                 gK = cute.local_tile(mK_cur, (self.tile_n, self.tile_hdim), (None, 0))
                 gV = cute.local_tile(mV_cur, (self.tile_n, self.tile_hdimv), (None, 0))
+                load_Q = None
                 if const_expr(self.use_tma_Q):
                     gQ = cute.local_tile(mQ_cur, (self.tile_m, self.tile_hdim), (m_block, 0))
                     load_Q, _, _ = copy_utils.tma_get_copy_fn(

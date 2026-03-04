@@ -530,7 +530,6 @@ def load_block_list_sm100(
     block_indices: cute.Tensor,
     block_count,
     load_q_with_first: cutlass.Constexpr,
-    m_block,
     q_stage: cutlass.Constexpr,
     kv_producer_state,
     load_Q,
@@ -545,9 +544,9 @@ def load_block_list_sm100(
 
         if const_expr(load_q_with_first):
             # SM100 loads Q0 and optionally Q1
-            load_Q(block=q_stage * m_block + 0, stage=0)
+            load_Q(block=0, stage=0)
             if const_expr(q_stage == 2):
-                load_Q(block=q_stage * m_block + 1, stage=1)
+                load_Q(block=1, stage=1)
 
         # SM100 doesn't use producer_acquire for pipeline_kv in load path
         # The pipeline barriers are handled inside load_KV
@@ -618,7 +617,6 @@ def produce_block_sparse_loads_sm100(
             curr_full_block_idx,
             curr_full_block_cnt,
             load_q_with_first=True,
-            m_block=m_block,
             q_stage=q_stage,
             kv_producer_state=kv_producer_state,
             load_Q=load_Q,
@@ -633,7 +631,6 @@ def produce_block_sparse_loads_sm100(
             curr_mask_block_idx,
             curr_mask_block_cnt,
             load_q_with_first=True,
-            m_block=m_block,
             q_stage=q_stage,
             kv_producer_state=kv_producer_state,
             load_Q=load_Q,
@@ -649,7 +646,6 @@ def produce_block_sparse_loads_sm100(
                 curr_full_block_idx,
                 curr_full_block_cnt,
                 load_q_with_first=False,
-                m_block=m_block,
                 q_stage=q_stage,
                 kv_producer_state=kv_producer_state,
                 load_Q=load_Q,
@@ -706,14 +702,10 @@ def handle_block_sparse_empty_tile_correction_sm100(
     thr_mma_pv: cute.core.ThrMma,
     tOtO: cute.Tensor,
     sO: cute.Tensor,
-    mbar_ptr,
-    mbar_softmax_corr_full_offset: Int32,
-    mbar_softmax_corr_empty_offset: Int32,
-    mbar_P_full_O_rescaled_offset: Int32,
-    mbar_P_full_2_offset: Int32,
-    mbar_corr_epi_full_offset: Int32,
-    mbar_corr_epi_empty_offset: Int32,
-    softmax_corr_consumer_phase: Int32,
+    pipeline_sm_stats: cutlass.pipeline.PipelineAsync,
+    sm_stats_barrier: cutlass.pipeline.NamedBarrier,
+    pipeline_o_epi: cutlass.pipeline.PipelineAsync,
+    sm_stats_consumer_phase: Int32,
     o_corr_consumer_phase: Int32,
     corr_epi_producer_phase: Int32,
     softmax_scale_log2: Float32,
@@ -737,6 +729,7 @@ def handle_block_sparse_empty_tile_correction_sm100(
     See NOTE [SM100 block-sparse empty tiles: mbarrier contract].
     """
     LOG2_E = Float32(math.log2(math.e))
+    warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
 
     for stage in cutlass.range_constexpr(q_stage):
         row_sum_value = Float32(1.0)
@@ -769,17 +762,12 @@ def handle_block_sparse_empty_tile_correction_sm100(
         stats[stage] = (row_sum_value, row_max_value, acc_flag)
 
         # See NOTE [SM100 block-sparse empty tiles: mbarrier contract].
-        cute.arch.mbarrier_wait(
-            mbar_ptr + mbar_softmax_corr_full_offset + stage,
-            softmax_corr_consumer_phase,
-        )
-        cute.arch.mbarrier_arrive(mbar_ptr + mbar_softmax_corr_empty_offset + stage)
+        # pipeline_sm_stats.consumer_wait_w_index_phase(stage, sm_stats_consumer_phase)
+        sm_stats_barrier.arrive_and_wait_w_index(index=stage * 4 + warp_idx)
+        pipeline_sm_stats.consumer_release_w_index(stage)
 
         if const_expr(gmem_tiled_copy_O is None):
-            cute.arch.mbarrier_wait(
-                mbar_ptr + mbar_corr_epi_empty_offset + stage,
-                corr_epi_producer_phase,
-            )
+            pipeline_o_epi.producer_acquire_w_index_phase(stage, corr_epi_producer_phase)
         correction_epilogue(
             thr_mma_pv,
             tOtO[None, None, None, stage],
@@ -790,17 +778,17 @@ def handle_block_sparse_empty_tile_correction_sm100(
             Float32(0.0),  # zero scale ensures empty tile writes zeros into staged outputs
             sO[None, None, stage],
             mO_cur,
-            gO,
+            gO[None, None, stage],
             gmem_tiled_copy_O,
         )
         if const_expr(gmem_tiled_copy_O is None):
-            cute.arch.mbarrier_arrive(mbar_ptr + mbar_corr_epi_full_offset + stage)
+            pipeline_o_epi.producer_commit_w_index(stage)
 
-    softmax_corr_consumer_phase ^= 1
+    sm_stats_consumer_phase ^= 1
     corr_epi_producer_phase ^= 1
 
     return (
-        softmax_corr_consumer_phase,
+        sm_stats_consumer_phase,
         o_corr_consumer_phase,
         corr_epi_producer_phase,
     )
@@ -818,17 +806,15 @@ def softmax_block_sparse_sm100(
     mma_si_consumer_phase: Int32,
     si_corr_producer_phase: Int32,
     s0_s1_sequence_phase: Int32,
-    mbar_ptr,
-    mbar_softmax_corr_full_offset: Int32,
-    mbar_softmax_corr_empty_offset: Int32,
-    mbar_P_full_O_rescaled_offset: Int32,
-    mbar_P_full_2_offset: Int32,
+    pipeline_sm_stats: cutlass.pipeline.PipelineAsync,
+    sm_stats_barrier: cutlass.pipeline.NamedBarrier,
     q_stage: cutlass.Constexpr,
     stage_idx: Int32,
     check_m_boundary: bool,
     qhead_per_kvhead: cutlass.Constexpr,
     q_subtile_factor: cutlass.Constexpr[int] = 1,
 ):
+    warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
     m_block_sparse = sparse_tensor_m_block(m_block, qhead_per_kvhead, q_subtile_factor)
 
     mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx = blocksparse_tensors
@@ -847,7 +833,8 @@ def softmax_block_sparse_sm100(
 
     if total_block_cnt == 0:
         # See NOTE [SM100 block-sparse empty tiles: mbarrier contract].
-        cute.arch.mbarrier_arrive(mbar_ptr + mbar_softmax_corr_full_offset + stage_idx)
+        # pipeline_sm_stats.producer_commit_w_index(stage_idx)
+        sm_stats_barrier.arrive_w_index(index=stage_idx * 4 + warp_idx)
     else:
         if curr_mask_block_cnt > 0:
             mask_n_block = curr_mask_block_idx[curr_mask_block_cnt - 1]

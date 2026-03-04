@@ -263,6 +263,8 @@ time_b = {}
 # for headdim in [64, 96, 128]:
 # for headdim in [64, 128, 256]:
 # for headdim in [64, 96, 128, 192, 256]:
+# for headdim in [64, 128, 192]:
+# for headdim in [192]:
 for headdim in [128]:
     # nheads = dim // headdim
     nheads = 32 if headdim <= 64 else 16 if headdim <= 192 else 8
@@ -333,7 +335,7 @@ for headdim in [128]:
             # if False:
                 if headdim <= 256 and dtype != torch.float8_e4m3fn:
                     cudnn_spda = cudnn_spda_setup(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), causal=causal, window_size_left=window_size[0])
-                    if has_backward and headdim == headdim_v:
+                    if has_backward:
                         cudnn_spda_bwd = cudnn_spda_bwd_setup(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), o.transpose(1, 2), g.transpose(1, 2), stats.transpose(1, 2), causal=causal, window_size_left=window_size[0])
             if dtype != torch.float8_e4m3fn and headdim == headdim_v and flash_attn_func is not None:
             # if False:
@@ -394,7 +396,7 @@ for headdim in [128]:
                 # else:
                 #     pytorch_profiler(flash_attn_varlen_func_v3, q_unpad, k_unpad, v_unpad, cu_seqlens_q, cu_seqlens_k, seqlen_q, seqlen, causal=causal, deterministic=deterministic, backward=True)
             # benchmark_forward(torch.clone, k, repeats=repeats, verbose=verbose, desc='Memcpy')
-            if dtype != torch.float8_e4m3fn and headdim == headdim_v and flash_attn_func_python is not None and has_backward:
+            if dtype != torch.float8_e4m3fn and flash_attn_func_python is not None and has_backward:
                 if not varlen:
                     _, m1b_py = benchmark_backward(flash_attn_func_python, q, k, v, causal=causal, softcap=softcap, deterministic=deterministic, repeats=repeats, verbose=False, desc='Fav4 python')
                 else:
@@ -416,5 +418,5 @@ for headdim in [128]:
 
             if flash_attn_func_python is not None:
                 print(f'FA Python fwd: {m1_py.mean * 1e3:.3f}ms, {(nFLOPS / m1_py.mean * 1e-12):.1f} TFLOPS')
-                if dtype != torch.float8_e4m3fn and headdim == headdim_v and has_backward:
+                if dtype != torch.float8_e4m3fn and has_backward:
                     print(f'FA Python bwd: {m1b_py.mean * 1e3:.3f}ms, {(2.5 * nFLOPS / m1b_py.mean * 1e-12):.1f} TFLOPS')

@@ -29,6 +29,7 @@ class FlashAttentionBackwardPreprocess:
         self,
         dtype: Type[cutlass.Numeric],
         head_dim: int,
+        head_dim_v: int,
         arch: Literal[80, 90, 100],
         m_block_size: int = 128,
         num_threads: int = 128,
@@ -50,7 +51,8 @@ class FlashAttentionBackwardPreprocess:
         # padding head_dim to a multiple of 32 as k_block_size
         hdim_multiple_of = 32
         self.head_dim_padded = int(math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of)
-        self.check_hdim_oob = head_dim != self.head_dim_padded
+        self.head_dim_v_padded = int(math.ceil(head_dim_v / hdim_multiple_of) * hdim_multiple_of)
+        self.check_hdim_v_oob = head_dim_v != self.head_dim_v_padded
         self.num_threads = num_threads
 
     @staticmethod
@@ -88,11 +90,11 @@ class FlashAttentionBackwardPreprocess:
         # it's just between threads in the same warp
         gmem_k_block_size = (
             128
-            if self.head_dim_padded % 128 == 0
+            if self.head_dim_v_padded % 128 == 0
             else (
                 64
-                if self.head_dim_padded % 64 == 0
-                else (32 if self.head_dim_padded % 32 == 0 else 16)
+                if self.head_dim_v_padded % 64 == 0
+                else (32 if self.head_dim_v_padded % 32 == 0 else 16)
             )
         )
         num_copy_elems = 128 // self.dtype.width
@@ -240,8 +242,8 @@ class FlashAttentionBackwardPreprocess:
                 mdPsum_cur = cute.domain_offset((padded_offset_q,), mdPsum[head_idx, None])
                 headdim_v = mO.shape[2]
 
-            blkOdO_shape = (self.m_block_size, self.head_dim_padded)
-            # (m_block_size, head_dim)
+            blkOdO_shape = (self.m_block_size, self.head_dim_v_padded)
+            # (m_block_size, head_dim_v)
             gO = cute.local_tile(mO_cur, blkOdO_shape, (m_block, 0))
             gdO = cute.local_tile(mdO_cur, blkOdO_shape, (m_block, 0))
 
@@ -255,7 +257,7 @@ class FlashAttentionBackwardPreprocess:
             # of tile_shape
             # ///////////////////////////////////////////////////////////////////////////////
             # Construct identity layout for KV
-            cO = cute.make_identity_tensor((self.m_block_size, self.head_dim_padded))
+            cO = cute.make_identity_tensor((self.m_block_size, self.head_dim_v_padded))
             tOcO = gmem_thr_copy_O.partition_S(cO)
             t0OcO = gmem_thr_copy_O.get_slice(0).partition_S(cO)
             tOpO = utils.predicate_k(tOcO, limit=headdim_v)
@@ -289,7 +291,7 @@ class FlashAttentionBackwardPreprocess:
                         tOgO[None, m, None],
                         tOrO[None, m, None],
                         pred=tOpO[None, m, None]
-                        if cutlass.const_expr(self.check_hdim_oob)
+                        if cutlass.const_expr(self.check_hdim_v_oob)
                         else None,
                     )
                     cute.copy(
@@ -297,7 +299,7 @@ class FlashAttentionBackwardPreprocess:
                         tOgdO[None, m, None],
                         tOrdO[None, m, None],
                         pred=tOpdO[None, m, None]
-                        if cutlass.const_expr(self.check_hdim_oob)
+                        if cutlass.const_expr(self.check_hdim_v_oob)
                         else None,
                     )
             # Sum across the "k" dimension
