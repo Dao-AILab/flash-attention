@@ -437,6 +437,7 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
                         "csrc/flash_attn_ck/mha_varlen_fwd.cu"] + glob.glob(f"build/fmha_*wd*.cu")
 
         cc_flag += ["-O3","-std=c++20",
+                    "-Wno-unknown-warning-option",
                     "-DCK_TILE_FMHA_FWD_FAST_EXP2=1",
                     "-fgpu-flush-denormals-to-zero",
                     "-DCK_ENABLE_BF16",
