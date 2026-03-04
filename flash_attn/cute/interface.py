@@ -95,7 +95,7 @@ def num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, max_splits):
     # Sometimes, it's ideal to over-schedule splits for better efficiency.
     return min(num_SMs // total_mblocks, max_splits, num_n_blocks)
 
-
+@torch.compiler.disable
 def _flash_attn_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -573,7 +573,7 @@ def _flash_attn_fwd(
 
 _flash_attn_fwd.compile_cache = get_jit_cache("fwd")
 
-
+@torch.compiler.disable
 def _flash_attn_bwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1580,7 +1580,7 @@ def flash_attn_varlen_func(
         return_lse,
     )
 
-
+@torch.compiler.disable
 def _flash_attn_fwd_combine(
     out_partial: torch.Tensor,
     lse_partial: torch.Tensor,
