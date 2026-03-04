@@ -169,7 +169,7 @@ class JITCache:
 class JITPersistentCache(JITCache):
     """
     In-memory cache for compiled functions, which is also backed by persistent storage.
-    Use cutedsl ahead-of-time (AOT) compilation.
+    Use cutedsl ahead-of-time (AOT) compilation, only supporting enable_tvm_ffi=True
     """
 
     EXPORT_FUNCTION_PREFIX = "func"
@@ -177,10 +177,9 @@ class JITPersistentCache(JITCache):
 
     _compiler: CCompiler | None = None
 
-    def __init__(self, cache_path: Path, enable_tvm_ffi: bool = True):
+    def __init__(self, cache_path: Path):
         super().__init__()
         cache_path.mkdir(parents=True, exist_ok=True)
-        self.enable_tvm_ffi: bool = enable_tvm_ffi
         self.cache_path: Path = cache_path
 
     def __setitem__(self, key: CompileKeyType, fn: JitCompiledFunction) -> None:
@@ -206,38 +205,33 @@ class JITPersistentCache(JITCache):
         Holds a shared lock during loading to prevent concurrent writes.
         """
         sha256_hex = self._key_to_hash(key)
-        if self.enable_tvm_ffi:
-            so_path = self.cache_path / f"{sha256_hex}.so"
-            with FileLock(
-                self._lock_path(sha256_hex),
-                exclusive=False,
-                timeout=self.LOCK_TIMEOUT_SECONDS,
-                label=sha256_hex,
-            ):
-                if so_path.exists():
-                    logger.debug(
-                        "Loading compiled function from disk: %s", so_path
-                    )
-                    m = cute.runtime.load_module(
-                        str(so_path), enable_tvm_ffi=self.enable_tvm_ffi
-                    )
-                    fn = getattr(m, self.EXPORT_FUNCTION_PREFIX)
-                    JITCache.__setitem__(self, key, fn)
-                    return True
-                else:
-                    logger.debug(
-                        "Cache miss on disk for key hash %s", sha256_hex
-                    )
-        else:
-            raise NotImplementedError("non tvm_ffi path is not supported")
+        so_path = self.cache_path / f"{sha256_hex}.so"
+        with FileLock(
+            self._lock_path(sha256_hex),
+            exclusive=False,
+            timeout=self.LOCK_TIMEOUT_SECONDS,
+            label=sha256_hex,
+        ):
+            if so_path.exists():
+                logger.debug(
+                    "Loading compiled function from disk: %s", so_path
+                )
+                m = cute.runtime.load_module(
+                    str(so_path), enable_tvm_ffi=True
+                )
+                fn = getattr(m, self.EXPORT_FUNCTION_PREFIX)
+                JITCache.__setitem__(self, key, fn)
+                return True
+            else:
+                logger.debug(
+                    "Cache miss on disk for key hash %s", sha256_hex
+                )
         return False
 
     def _try_export_to_storage(
         self, key: CompileKeyType, fn: JitCompiledFunction
     ) -> None:
         """Export a compiled function to persistent storage under exclusive lock."""
-        if not self.enable_tvm_ffi:
-            raise NotImplementedError("non tvm_ffi path is not supported")
         sha256_hex = self._key_to_hash(key)
         with FileLock(
             self._lock_path(sha256_hex),
