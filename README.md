@@ -131,7 +131,7 @@ FlashAttention-2 ROCm CK backend currently supports:
 #### Triton Backend
 The Triton implementation of [Flash Attention](https://tridao.me/publications/flash2/flash2.pdf) supports AMD's CDNA (MI200, MI300) and RDNA GPUs using fp16, bf16, and fp32 datatypes. It provides forward and backward passes with causal masking, variable sequence lengths, arbitrary Q/KV sequence lengths and head sizes, MQA/GQA, dropout, rotary embeddings, ALiBi, paged attention, and FP8 (via the Flash Attention v3 interface). Sliding window attention is currently a work in progress.
 
-The Triton backend kernels are provided by the [aiter](https://github.com/ROCm/aiter) package, which is automatically installed as a dependency.
+The Triton backend kernels are provided by the [aiter](https://github.com/ROCm/aiter) package, included as a git submodule at `third_party/aiter` and automatically installed during setup.
 
 To install, first get PyTorch for ROCm from https://pytorch.org/get-started/locally/, then install Flash Attention:
 ```sh
@@ -141,9 +141,9 @@ FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" pip install --no-build-isolation .
 
 To use a specific aiter commit (e.g., for testing or development):
 ```sh
-FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" \
-FLASH_ATTENTION_ROCM_AITER_COMMIT="<commit-sha>" \
-pip install --no-build-isolation .
+cd flash-attention
+cd third_party/aiter && git fetch origin && git checkout <commit-sha> && cd ../..
+FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" pip install --no-build-isolation .
 ```
 
 To run the tests (note: full suite takes hours):
