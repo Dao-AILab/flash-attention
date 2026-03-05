@@ -29,3 +29,4 @@ class NamedBarrierBwdSm100(enum.IntEnum):
     EpilogueWG2 = enum.auto()
     Compute = enum.auto()
     dQaccReduce = enum.auto()
+    TmemPtr = enum.auto()
