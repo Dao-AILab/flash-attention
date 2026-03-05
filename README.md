@@ -68,7 +68,7 @@ FlashAttention-4 is written in CuTeDSL and optimized for Hopper and Blackwell GP
 
 To install:
 ```sh
-pip install fa4
+pip install flash-attn-4
 ```
 
 Once installed, you can use it as follows:

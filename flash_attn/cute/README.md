@@ -5,7 +5,7 @@ FlashAttention-4 is a CuTeDSL-based implementation of FlashAttention for Hopper 
 ## Installation
 
 ```sh
-pip install fa4
+pip install flash-attn-4
 ```
 
 ## Usage
