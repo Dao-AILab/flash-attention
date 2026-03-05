@@ -50,11 +50,6 @@ jobs:
   publish-to-pypi:
     needs: build
     runs-on: ubuntu-latest
-    environment:
-      name: pypi
-      url: https://pypi.org/p/flash-attn-4
-    permissions:
-      id-token: write
     steps:
     - name: Download distribution packages
       uses: actions/download-artifact@v4
@@ -62,4 +57,7 @@ jobs:
         name: python-package-distributions
         path: dist/
     - name: Publish to PyPI
-      uses: pypa/gh-action-pypi-publish@release/v1
+      env:
+        TWINE_USERNAME: "__token__"
+        TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
+      run: pip install twine && python -m twine upload dist/*
