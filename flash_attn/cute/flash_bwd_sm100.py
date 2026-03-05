@@ -3133,6 +3133,7 @@ class FlashAttentionBackwardSm100:
                     )
 
                 cute.arch.fence_view_async_tmem_store()
+                cute.arch.fence_view_async_shared()
                 self.compute_sync_barrier.arrive_and_wait()
                 if const_expr(not self.tile_hdim == 192):
                     # Signal tmem store P completion with pipeline_S_P
