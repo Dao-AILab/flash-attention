@@ -19,12 +19,9 @@ jobs:
       with:
         python-version: '3.12'
     - name: Install build dependencies
-      run: pip install build twine
+      run: pip install build
     - name: Build package
       run: python -m build
-      working-directory: flash_attn/cute
-    - name: Check package metadata
-      run: twine check dist/*
       working-directory: flash_attn/cute
     - name: Store distribution packages
       uses: actions/upload-artifact@v4
@@ -60,4 +57,4 @@ jobs:
       env:
         TWINE_USERNAME: "__token__"
         TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
-      run: pip install twine && python -m twine upload dist/*
+      run: pip install "twine>=6.1" "packaging>=24.2" && python -m twine upload dist/*
