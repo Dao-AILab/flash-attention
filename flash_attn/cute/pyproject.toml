@@ -3,7 +3,7 @@ requires = ["setuptools>=75", "setuptools-scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "flash-attn4"
+name = "fa4"
 dynamic = ["version"]
 description = "Flash Attention CUTE (CUDA Template Engine) implementation"
 readme = "README.md"

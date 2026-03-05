@@ -3,7 +3,7 @@
 from importlib.metadata import PackageNotFoundError, version
 
 try:
-    __version__ = version("flash-attn4")
+    __version__ = version("fa4")
 except PackageNotFoundError:
     __version__ = "0.0.0"
 

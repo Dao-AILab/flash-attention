@@ -1,4 +1,4 @@
-name: Publish flash-attn-4 to PyPI
+name: Publish fa4 to PyPI
 
 on:
   push:
