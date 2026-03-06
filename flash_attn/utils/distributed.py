@@ -132,13 +132,19 @@ def allreduce_sequence_parallel_grad(model: torch.nn.Module, process_group: Proc
                 buf.copy_(synced)
 
 
-def get_dim_for_local_rank(dim: int, world_size: int, local_rank: int, multiple_of: int = 1) -> int:
-    """Get the dim for the local rank derived from splitting dim on world_size processes.
-
-    The split may not be even across the world_size processes.
+def split_sequence_for_ring(tensor: Tensor, process_group: ProcessGroup, seq_dim: int = 1) -> Tensor:
     """
-    multiple = dim // multiple_of
-    div = multiple // world_size
-    mod = multiple % world_size
-    local_multiple = div + int(local_rank < mod)
-    return local_multiple * multiple_of
+    Slice ``tensor`` along ``seq_dim`` to extract the local rank's contiguous
+    chunk, suitable as input to ``ring_flash_attn_func``.
+
+    The sequence length must be divisible by ``world_size``.
+    """
+    world_size = torch.distributed.get_world_size(process_group)
+    rank = torch.distributed.get_rank(process_group)
+    assert tensor.shape[seq_dim] % world_size == 0, (
+        f"Sequence length {tensor.shape[seq_dim]} must be divisible by world_size {world_size}"
+    )
+    chunk_size = tensor.shape[seq_dim] // world_size
+    slices = [slice(None)] * tensor.dim()
+    slices[seq_dim] = slice(rank * chunk_size, (rank + 1) * chunk_size)
+    return tensor[slices].contiguous()
