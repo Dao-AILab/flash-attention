@@ -274,6 +274,19 @@ def _flash_attn_fwd(
         _validate_tensor(lse, "lse", lse_shape, torch.float32, device)
 
     dtype = torch2cute_dtype_map[q.dtype]
+
+    # SM120: gather paged K/V into contiguous tensors.
+    # The SM80 kernel's swizzled SMEM layout is incompatible with PagedKVManager's
+    # tiled copy, so we resolve the page table at the Python level.
+    if page_table is not None and arch // 10 == 12:
+        assert seqused_k is not None, "seqused_k is required for paged KV on SM 12.0"
+        max_seqlen_k_paged = max_num_pages_per_seq * page_size
+        k = k[page_table.reshape(-1)].reshape(batch_size, max_seqlen_k_paged, num_head_kv, head_dim)
+        v = v[page_table.reshape(-1)].reshape(batch_size, max_seqlen_k_paged, num_head_kv, head_dim_v)
+        seqlen_k = max_seqlen_k_paged
+        page_table = None
+        num_pages, page_size = None, None
+
     use_block_sparsity = block_sparse_tensors is not None
 
     if mask_mod is None:
@@ -344,8 +357,11 @@ def _flash_attn_fwd(
 
     is_split_kv = num_splits > 1
     if is_split_kv:
-        out_partial = torch.empty(num_splits, *q_batch_seqlen_shape, num_head, head_dim_v, dtype=torch.float32, device=device)
-        lse_partial = torch.empty(num_splits, *lse_shape, dtype=torch.float32, device=device)
+        # SM120 kernel writes BF16/FP16 output (SM80-era epilogue), convert to FP32 before combine
+        out_partial_dtype = torch.float32 if arch // 10 != 12 else q.dtype
+        # Zero-init for empty splits (causal + split-KV may produce splits with no K blocks)
+        out_partial = torch.zeros(num_splits, *q_batch_seqlen_shape, num_head, head_dim_v, dtype=out_partial_dtype, device=device)
+        lse_partial = torch.full((num_splits, *lse_shape), float('-inf'), dtype=torch.float32, device=device)
 
     use_2cta_instrs = (
         arch // 10 in [10, 11]
@@ -540,13 +556,9 @@ def _flash_attn_fwd(
             )
         elif arch // 10 == 12:
             # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
-            assert page_table is None, "paged KV not supported on SM 12.0"
-            assert not is_split_kv, "SplitKV not supported on SM 12.0"
             assert not use_block_sparsity, "Block sparsity not supported on SM 12.0"
-            # Varlen supported: SM80 kernel natively handles varlen via
-            # SingleTileVarlenScheduler + SeqlenInfoQK.
             # SM80 kernel always writes LSE, so ensure it's allocated
-            if lse is None:
+            if lse is None and not is_split_kv:
                 lse = torch.empty(lse_shape, dtype=torch.float32, device=device)
                 lse_tensor = to_cute_tensor(lse, assumed_align=4)
             fa_fwd = FlashAttentionForwardSm120(
@@ -556,6 +568,7 @@ def _flash_attn_fwd(
                 qhead_per_kvhead,
                 is_causal=causal,
                 is_local=local,
+                is_split_kv=is_split_kv,
                 pack_gqa=pack_gqa,
                 tile_m=m_block_size,
                 tile_n=n_block_size,
@@ -622,8 +635,10 @@ def _flash_attn_fwd(
             aux_tensors,
         )
     if is_split_kv:
+        # SM120 kernel writes BF16/FP16 partials; combine expects FP32
+        combine_out_partial = out_partial.float() if out_partial.dtype != torch.float32 else out_partial
         _flash_attn_fwd_combine(
-            out_partial,
+            combine_out_partial,
             lse_partial.transpose(-1, -2),
             out,
             lse.transpose(-1, -2) if lse is not None else None,
