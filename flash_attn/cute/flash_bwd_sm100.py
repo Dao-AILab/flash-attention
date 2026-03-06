@@ -782,7 +782,8 @@ class FlashAttentionBackwardSm100:
                     cutlass.Int64, self.dQaccum_reduce_stage // 2
                 ]
                 tmem_holding_buf: Int32
-                tmem_dealloc_mbar_ptr: cutlass.Int64
+                two_cta_tmem_dealloc_mbar_ptr: cutlass.Int64
+                within_cta_tmem_dealloc_mbar_ptr: cutlass.Int64
 
                 # 2-CTA
                 Qt_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.Q_stage]
@@ -861,7 +862,8 @@ class FlashAttentionBackwardSm100:
                     cutlass.Int64, self.dQaccum_reduce_stage // 2
                 ]
                 tmem_holding_buf: Int32
-                tmem_dealloc_mbar_ptr: Int64
+                two_cta_tmem_dealloc_mbar_ptr: Int64
+                within_cta_tmem_dealloc_mbar_ptr: Int64
 
                 sQ: cute.struct.Align[
                     cute.struct.MemRange[cute.Uint8, sQ_alloc_bytes],
@@ -1122,6 +1124,10 @@ class FlashAttentionBackwardSm100:
             dQaccum_empty_mbar_ptr = None
 
         # Barrier initialization
+        if warp_idx == 1:
+            cute.arch.mbarrier_init(
+                storage.within_cta_tmem_dealloc_mbar_ptr, cute.arch.WARP_SIZE * (len(self.compute_warp_ids))
+            )
         if const_expr(self.use_2cta_instrs):
             if const_expr(self.tile_hdim == 192):
                 if warp_idx == 2:
@@ -1150,7 +1156,7 @@ class FlashAttentionBackwardSm100:
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=self.mma_warp_id,
             is_two_cta=self.use_2cta_instrs,
-            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr,
+            two_cta_tmem_dealloc_mbar_ptr=storage.two_cta_tmem_dealloc_mbar_ptr,
         )
 
         # UMMA producers and AsyncThread consumers
@@ -1544,6 +1550,7 @@ class FlashAttentionBackwardSm100:
             )
             # Dealloc the tensor memory buffer
             tmem.relinquish_alloc_permit()
+            cute.arch.mbarrier_wait(storage.within_cta_tmem_dealloc_mbar_ptr, 0)
             tmem.free(tmem_ptr)
 
         # Compute
@@ -1595,6 +1602,7 @@ class FlashAttentionBackwardSm100:
                 fastdiv_mods,
                 blocksparse_tensors,
             )
+            cute.arch.mbarrier_arrive(storage.within_cta_tmem_dealloc_mbar_ptr)
 
         # Reduce
         # (0, 1, 2, 3) - dQ
