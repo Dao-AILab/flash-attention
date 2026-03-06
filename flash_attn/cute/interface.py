@@ -526,11 +526,12 @@ def _flash_attn_fwd(
             assert page_table is None, "paged KV not supported on SM 12.0"
             assert not is_split_kv, "SplitKV not supported on SM 12.0"
             assert not use_block_sparsity, "Block sparsity not supported on SM 12.0"
-            assert cu_seqlens_q is None and cu_seqlens_k is None, "Varlen not yet supported on SM 12.0"
-            assert seqused_q is None and seqused_k is None, "seqused not yet supported on SM 12.0"
+            # Varlen supported: SM80 kernel natively handles varlen via
+            # SingleTileVarlenScheduler + SeqlenInfoQK.
             # SM80 kernel always writes LSE, so ensure it's allocated
             if lse is None:
                 lse = torch.empty(lse_shape, dtype=torch.float32, device=device)
+                lse_tensor = to_cute_tensor(lse, assumed_align=4)
             fa_fwd = FlashAttentionForwardSm120(
                 dtype,
                 head_dim,
@@ -553,49 +554,27 @@ def _flash_attn_fwd(
                 f"Unsupported compute capability: {arch}. Supported: 9.x, 10.x, 11.x, 12.x"
             )
         # TODO: check @can_implement
-        if arch // 10 == 12:
-            # SM120 uses SM80's __call__ signature: (mQ, mK, mV, mO, mLSE, stream, scale, ...)
-            # SM80 __call__ has Optional[Float32] / Optional[Int32] annotations which
-            # require explicit CUTLASS type wrappers (auto-conversion only works for
-            # non-optional scalar params).
-            lse_tensor = to_cute_tensor(lse, assumed_align=4)
-            _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
-                fa_fwd,
-                q_tensor,
-                k_tensor,
-                v_tensor,
-                o_tensor,
-                lse_tensor,
-                current_stream,
-                cutlass.Float32(softmax_scale),
-                cutlass.Int32(window_size_left) if window_size_left is not None else None,
-                cutlass.Int32(window_size_right) if window_size_right is not None else None,
-                learnable_sink_tensor,
-                cute_aux_tensors,
-                options="--enable-tvm-ffi",
-            )
-        else:
-            _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
-                fa_fwd,
-                q_tensor,
-                k_tensor,
-                v_tensor,
-                o_tensor,
-                lse_tensor,
-                softmax_scale,
-                current_stream,
-                cu_seqlens_q_tensor,
-                cu_seqlens_k_tensor,
-                seqused_q_tensor,
-                seqused_k_tensor,
-                page_table_tensor,
-                window_size_left,
-                window_size_right,
-                learnable_sink_tensor,
-                sparse_tensors,
-                cute_aux_tensors,
-                options="--enable-tvm-ffi",
-            )
+        _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
+            fa_fwd,
+            q_tensor,
+            k_tensor,
+            v_tensor,
+            o_tensor,
+            lse_tensor,
+            softmax_scale,
+            current_stream,
+            cu_seqlens_q_tensor,
+            cu_seqlens_k_tensor,
+            seqused_q_tensor,
+            seqused_k_tensor,
+            page_table_tensor,
+            window_size_left,
+            window_size_right,
+            learnable_sink_tensor,
+            sparse_tensors,
+            cute_aux_tensors,
+            options="--enable-tvm-ffi",
+        )
 
     # SM120: SM80 kernel always writes LSE, ensure it's allocated even on cache hits
     if arch // 10 == 12 and lse is None:
@@ -606,40 +585,25 @@ def _flash_attn_fwd(
     # - Return "fake" output tensors, which could be needed in follow-up fake operations
     # Thus, we skip the actual kernel invocation here.
     if not is_fake_mode():
-        if arch // 10 == 12:
-            _flash_attn_fwd.compile_cache[compile_key](
-                q.detach(),
-                k.detach(),
-                v.detach(),
-                out.detach(),
-                lse,
-                current_stream,
-                cutlass.Float32(softmax_scale),
-                cutlass.Int32(window_size_left) if window_size_left is not None else None,
-                cutlass.Int32(window_size_right) if window_size_right is not None else None,
-                learnable_sink,
-                aux_tensors,
-            )
-        else:
-            _flash_attn_fwd.compile_cache[compile_key](
-                q.detach(),
-                k.detach(),
-                v.detach(),
-                out.detach() if not is_split_kv else out_partial,
-                lse_partial if is_split_kv else lse,
-                softmax_scale,
-                current_stream,
-                cu_seqlens_q,
-                cu_seqlens_k,
-                seqused_q,
-                seqused_k,
-                page_table,
-                window_size_left,
-                window_size_right,
-                learnable_sink,
-                normalized_block_sparse_tensors[:4] if normalized_block_sparse_tensors is not None else None,
-                aux_tensors,
-            )
+        _flash_attn_fwd.compile_cache[compile_key](
+            q.detach(),
+            k.detach(),
+            v.detach(),
+            out.detach() if not is_split_kv else out_partial,
+            lse_partial if is_split_kv else lse,
+            softmax_scale,
+            current_stream,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            seqused_q,
+            seqused_k,
+            page_table,
+            window_size_left,
+            window_size_right,
+            learnable_sink,
+            normalized_block_sparse_tensors[:4] if normalized_block_sparse_tensors is not None else None,
+            aux_tensors,
+        )
     if is_split_kv:
         _flash_attn_fwd_combine(
             out_partial,
@@ -739,8 +703,8 @@ def _flash_attn_bwd(
         cluster_size = 1
         use_2cta_instrs = False
         num_threads = 128
-        assert cu_seqlens_q is None and cu_seqlens_k is None, "Varlen backward not yet supported on SM 12.0"
-        assert seqused_q is None and seqused_k is None, "seqused backward not yet supported on SM 12.0"
+        # Varlen backward supported: SM80 backward __call__ natively handles
+        # mCuSeqlensQ/K, mSeqUsedQ/K via SingleTileVarlenScheduler.
         assert not (block_sparse_tensors is not None), "Block sparsity backward not supported on SM 12.0"
         assert score_mod is None and score_mod_bwd is None, "score_mod backward not supported on SM 12.0"
         assert mask_mod is None, "mask_mod backward not supported on SM 12.0"
@@ -1094,6 +1058,10 @@ def _flash_attn_bwd(
             AtomLayoutNdKV,
             AtomLayoutMdQ,
             V_in_regs,
+            cu_seqlens_q is None,
+            cu_seqlens_k is None,
+            seqused_q is None,
+            seqused_k is None,
             get_broadcast_dims(q),
             get_broadcast_dims(k),
             get_broadcast_dims(v),
@@ -1222,10 +1190,10 @@ def _flash_attn_bwd(
                 dv_tensor if not dKV_postprocess else dv_accum_tensor,
                 cutlass.Float32(softmax_scale),
                 current_stream,
-                None,  # mCuSeqlensQ
-                None,  # mCuSeqlensK
-                None,  # mSeqUsedQ
-                None,  # mSeqUsedK
+                cu_seqlens_q_tensor,
+                cu_seqlens_k_tensor,
+                seqused_q_tensor,
+                seqused_k_tensor,
                 None,  # softcap
                 cutlass.Int32(window_size_left) if window_size_left is not None else None,
                 cutlass.Int32(window_size_right) if window_size_right is not None else None,
@@ -1350,10 +1318,10 @@ def _flash_attn_bwd(
                 dv if not dKV_postprocess else dv_accum,
                 cutlass.Float32(softmax_scale),
                 current_stream,
-                None,  # mCuSeqlensQ
-                None,  # mCuSeqlensK
-                None,  # mSeqUsedQ
-                None,  # mSeqUsedK
+                cu_seqlens_q,
+                cu_seqlens_k,
+                seqused_q,
+                seqused_k,
                 None,  # softcap
                 cutlass.Int32(window_size_left) if window_size_left is not None else None,
                 cutlass.Int32(window_size_right) if window_size_right is not None else None,
