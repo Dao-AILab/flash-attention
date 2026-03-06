@@ -30,7 +30,7 @@ class FlashAttentionBackwardPreprocess:
         dtype: Type[cutlass.Numeric],
         head_dim: int,
         head_dim_v: int,
-        arch: Literal[80, 90, 100],
+        arch: Literal[80, 90, 100, 120],
         m_block_size: int = 128,
         num_threads: int = 128,
     ):
