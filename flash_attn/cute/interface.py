@@ -146,6 +146,8 @@ def _flash_attn_fwd(
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
     aux_tensors: Optional[list[torch.Tensor]] = None,
+    use_clc_scheduler: bool | None = None,
+    clc_stages: int = 1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for FlashAttention.
 
@@ -288,6 +290,9 @@ def _flash_attn_fwd(
     else:
         causal, local = False, False
 
+    if use_clc_scheduler is None:
+        use_clc_scheduler = utils._get_use_clc_scheduler_default() and not causal and not local
+
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     if arch // 10 == 9:  # TODO: tune block size according to hdim.
@@ -420,6 +425,8 @@ def _flash_attn_fwd(
         arch,
         page_size not in [None, 128],  # paged KV non-TMA
         q_subtile_factor,
+        use_clc_scheduler,
+        clc_stages,
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
         (
@@ -518,6 +525,8 @@ def _flash_attn_fwd(
                 has_aux_tensors=aux_tensors is not None,
                 paged_kv_non_tma=page_size not in [None, 128],
                 is_varlen_q=cu_seqlens_q is not None or seqused_q is not None,
+                use_clc_scheduler=use_clc_scheduler,
+                clc_stages=clc_stages,
                 q_subtile_factor=q_subtile_factor,
                 use_2cta_instrs=use_2cta_instrs,
             )
