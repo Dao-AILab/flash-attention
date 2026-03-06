@@ -36,7 +36,7 @@ class FlashAttentionBackwardPostprocess:
         self,
         dtype: Type[cutlass.Numeric],
         head_dim: int,
-        arch: Literal[80, 90, 100],
+        arch: Literal[80, 90, 100, 120],
         tile_m: int = 128,
         num_threads: int = 256,
         AtomLayoutMdQ: int = 1,
@@ -52,8 +52,8 @@ class FlashAttentionBackwardPostprocess:
         """
         self.dtype = dtype
         self.tile_m = tile_m
-        assert arch // 10 in [8, 9, 10, 11], (
-            "Only Ampere (8.x), Hopper (9.x), and Blackwell (10.x, 11.x) are supported"
+        assert arch // 10 in [8, 9, 10, 11, 12], (
+            "Only Ampere (8.x), Hopper (9.x), and Blackwell (10.x, 11.x, 12.x) are supported"
         )
         self.arch = arch
         # padding head_dim to a multiple of 32 as k_block_size
