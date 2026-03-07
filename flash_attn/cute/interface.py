@@ -173,6 +173,11 @@ def _tile_size_bwd_sm90(head_dim, causal, local):
     Configs based on C++ FA3 hopper/flash_bwd_launch_template.h,
     benchmarked on H100 SXM.
     """
+    head_dim_padded = ((head_dim + 15) // 16) * 16
+    # When dQ_swapAB=True, the dQ WGMMA's M-mode becomes (head_dim_padded // 2),
+    # which must be a multiple of 64 (the WGMMA atom M).
+    dQ_swap_valid = (head_dim_padded // 2) % 64 == 0
+    non_causal = not (causal or local)
     if head_dim <= 64:
         # C++ FA3: 128, 128, 64, ..., 2, 2, true, false, false, 2, 1, 2, 2
         return BwdConfig(
@@ -191,12 +196,13 @@ def _tile_size_bwd_sm90(head_dim, causal, local):
         )
     elif head_dim <= 128:
         # C++ FA3: causal/local: 64, 128; non-causal: 80, 128 with dQ_swapAB
+        dQ_swapAB = non_causal and dQ_swap_valid
         return BwdConfig(
-            m_block_size=80 if not (causal or local) else 64,
+            m_block_size=80 if dQ_swapAB else 64,
             n_block_size=128,
             num_stages_Q=2, num_stages_dO=2, num_stages_PdS=2,
             SdP_swapAB=True, dKV_swapAB=False,
-            dQ_swapAB=not (causal or local),
+            dQ_swapAB=dQ_swapAB,
             AtomLayoutMSdP=1, AtomLayoutNdKV=2, AtomLayoutMdQ=1,
         )
     elif head_dim <= 192:
@@ -204,7 +210,7 @@ def _tile_size_bwd_sm90(head_dim, causal, local):
         return BwdConfig(
             m_block_size=64, n_block_size=96,
             num_stages_Q=1, num_stages_dO=1, num_stages_PdS=1,
-            SdP_swapAB=False, dKV_swapAB=True, dQ_swapAB=True,
+            SdP_swapAB=False, dKV_swapAB=True, dQ_swapAB=(non_causal and dQ_swap_valid),
             AtomLayoutMSdP=1, AtomLayoutNdKV=1, AtomLayoutMdQ=1,
         )
     else:

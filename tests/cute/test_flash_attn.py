@@ -299,8 +299,8 @@ def test_flash_attn_output(
         ):
             if d == 192 and local:
                 pytest.xfail("hdim 192 backward: local attention not supported yet")
-            if d > 128 and IS_SM90:
-                pytest.xfail("hdim > 128 backward: SM90 not supported yet")
+            if d == 256 and IS_SM90:
+                pytest.xfail("hdim 256 backward: SM90 not supported yet")
             g = torch.randn_like(out)
             # do_o = ((g.float() * out.float()).sum(-1)).transpose(1, 2)
             dq, dk, dv = torch.autograd.grad(out, (q, k, v), g)
@@ -737,8 +737,8 @@ def test_flash_attn_varlen_output(
         ):
             if d == 192 and local:
                 pytest.xfail("hdim 192 backward: local attention not supported yet")
-            if d > 128 and IS_SM90:
-                pytest.xfail("hdim > 128 backward: SM90 not supported yet")
+            if d == 256 and IS_SM90:
+                pytest.xfail("hdim 256 backward: SM90 not supported yet")
             g_unpad = torch.randn_like(out_unpad)
             # do_o = ((g_unpad.float() * out_unpad.float()).sum(-1)).transpose(-1, -2)
             # import flash_attn_3_cuda
