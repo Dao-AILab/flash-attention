@@ -236,7 +236,6 @@ class FlashAttentionForwardSm100:
             if not self.enable_ex2_emu:
                 self.num_regs_softmax = 192 if not paged_kv_non_tma else 184
             else:
-                # self.num_regs_softmax = 200 if not paged_kv_non_tma else 184
                 self.num_regs_softmax = 192 if not paged_kv_non_tma else 184
             # self.num_regs_softmax = 176
             # self.num_regs_correction = 96
@@ -244,14 +243,8 @@ class FlashAttentionForwardSm100:
             if not self.enable_ex2_emu:
                 self.num_regs_correction = 80 if not paged_kv_non_tma else 64
             else:
-                # self.num_regs_correction = 64
                 self.num_regs_correction = 80 if not paged_kv_non_tma else 64
-            # self.num_regs_other = 32
-            # self.num_regs_other = 64
-            # self.num_regs_other = 80
             self.num_regs_other = 48 if not paged_kv_non_tma else 80
-            # self.num_regs_other = 96 if self.is_causal or self.is_local else 80
-            # self.num_regs_other = 64 if self.is_causal or self.is_local else 80
 
         self.buffer_align_bytes = 1024
 
@@ -372,9 +365,10 @@ class FlashAttentionForwardSm100:
         # This is currently very ad-hoc, we should tune it systematically
         self.ex2_emu_freq = 0
         # self.ex2_emu_start_frg = 1 if self.is_causal else 0
-        self.ex2_emu_start_frg = 1
+        self.ex2_emu_start_frg = 0
+        self.ex2_emu_res = 4
         if const_expr(self.enable_ex2_emu):
-            self.ex2_emu_freq = 16
+            self.ex2_emu_freq = 10
             if const_expr(self.head_dim_padded == 128 and self.use_2cta_instrs):
                 self.ex2_emu_freq = 12
             if const_expr(
@@ -2131,6 +2125,7 @@ class FlashAttentionForwardSm100:
             tSrS_t2r,
             tSrP_r2t,
             ex2_emu_freq=self.ex2_emu_freq if const_expr(mask_fn is None) else 0,
+            ex2_emu_res=self.ex2_emu_res if const_expr(mask_fn is None) else 4,
             ex2_emu_start_frg=self.ex2_emu_start_frg,
         )
         # Sequence barrier arrive
