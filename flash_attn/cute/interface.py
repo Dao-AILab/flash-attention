@@ -648,13 +648,8 @@ def _flash_attn_bwd(
         cluster_size = 1
         use_2cta_instrs = False
         assert window_size_left is None and window_size_right is None, "local not supported yet on 9.x"
-        is_varlen = (
-            cu_seqlens_q is not None
-            or cu_seqlens_k is not None
-            or seqused_q is not None
-            or seqused_k is not None
-        )
-        assert not is_varlen, "varlen backward is not yet supported on sm90"
+        has_cu_seqlens = cu_seqlens_q is not None or cu_seqlens_k is not None
+        assert not has_cu_seqlens, "cu_seqlens (varlen) backward is not yet supported on sm90"
     else:
         m_block_size = 128
         n_block_size = 128
