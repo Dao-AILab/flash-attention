@@ -3140,6 +3140,8 @@ class FlashAttentionBackwardSm100:
                     with cute.arch.elect_one():
                         pipeline_S_P.consumer_release(consumer_state_S_P_dP)
                         # pipeline_S_P.sync_object_empty.arrive(0, pipeline_S_P.consumer_mask)
+                # Normally we'd need syncwarp here since only 1 thread will signal in
+                # consumer_release, but we already have the self.compute_sync_barrier before this
                 pipeline_LSE.consumer_release(consumer_state_LSE)
                 consumer_state_LSE.advance()
                 # ---------------------------------------------
@@ -3250,6 +3252,8 @@ class FlashAttentionBackwardSm100:
 
                 cute.arch.fence_view_async_shared()
                 self.compute_sync_barrier.arrive_and_wait()
+                # Normally we'd need syncwarp here since only 1 thread will signal in
+                # consumer_release, but we already have the self.compute_sync_barrier before this
                 pipeline_dPsum.consumer_release(consumer_state_dPsum)
                 consumer_state_dPsum.advance()
                 # when 2cta hdim 128, pipeline_dS also signals S tmem load completion so is deferred
