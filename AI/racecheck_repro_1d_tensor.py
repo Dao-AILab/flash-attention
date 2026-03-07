@@ -4,7 +4,7 @@ Same pipeline as racecheck_repro_1d_bulk.py but uses make_tiled_tma_atom to
 create a TMA descriptor, which generates cp.async.bulk.tensor.1d PTX.
 
   python AI/racecheck_repro_1d_tensor.py                                    # correctness
-  compute-sanitizer --tool=racecheck python AI/racecheck_repro_1d_tensor.py # 0 hazards
+  CUTE_DSL_LINEINFO=1 compute-sanitizer --tool=racecheck python AI/racecheck_repro_1d_tensor.py # 0 hazards
 """
 import cutlass
 import cutlass.cute as cute
@@ -40,25 +40,26 @@ def kernel(g_dst: cute.Tensor, tma_atom: cute.CopyAtom, tma_tensor: cute.Tensor)
         cute.group_modes(cute.local_tile(tma_tensor, (TILE,), (None,)), 0, 1),
     )
     dst = cute.local_tile(g_dst, (TILE,), (None,))
-    ps = make_pipeline_state(cutlass.pipeline.PipelineUserType.Producer, N_STG)
-    cs = make_pipeline_state(cutlass.pipeline.PipelineUserType.Consumer, N_STG)
 
     if warp == 0:
         with cute.arch.elect_one():
             cpasync.prefetch_descriptor(tma_atom)
-    for blk in cutlass.range(N_BLKS, unroll=1):
-        if warp == 0:
+    if warp == 0:
+        ps = make_pipeline_state(cutlass.pipeline.PipelineUserType.Producer, N_STG)
+        for blk in cutlass.range(N_BLKS, unroll=1):
             pipe.producer_acquire(ps)
-            with cute.arch.elect_one():
-                cute.copy(tma_atom, tma_g[None, blk], tma_s[None, ps.index],
-                          tma_bar_ptr=pipe.producer_get_barrier(ps))
+            cute.copy(tma_atom, tma_g[None, blk], tma_s[None, ps.index],
+                      tma_bar_ptr=pipe.producer_get_barrier(ps))
             ps.advance()
-        if warp == 1:
+        pipe.producer_tail(ps)
+    if warp == 1:
+        cs = make_pipeline_state(cutlass.pipeline.PipelineUserType.Consumer, N_STG)
+        for blk in cutlass.range(N_BLKS, unroll=1):
             pipe.consumer_wait(cs)
-            cute.arch.fence_view_async_shared()
             for i in cutlass.range_constexpr(TILE // 32):
                 dst[lane + i * 32, blk] = s[lane + i * 32, cs.index]
             cute.arch.fence_view_async_shared()
+            cute.arch.sync_warp()  # Ned sync_warp as only 1 thread will signal in consumer_release
             pipe.consumer_release(cs)
             cs.advance()
 

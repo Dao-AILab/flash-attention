@@ -4,7 +4,7 @@ Warp 0 loads via cp.async.bulk, warp 1 reads from smem after mbarrier wait.
 Pipeline is correctly synchronized but racecheck reports 1 error.
 
   python AI/racecheck_repro_1d_bulk.py                                    # correctness
-  compute-sanitizer --tool=racecheck python AI/racecheck_repro_1d_bulk.py # 1 error
+  CUTE_DSL_LINEINFO=1 compute-sanitizer --tool=racecheck python AI/racecheck_repro_1d_bulk.py # 1 error
 """
 import cutlass
 import cutlass.cute as cute
@@ -36,27 +36,27 @@ def kernel(g_src: cute.Tensor, g_dst: cute.Tensor):
     )
     src = cute.local_tile(g_src, (TILE,), (None,))
     dst = cute.local_tile(g_dst, (TILE,), (None,))
-    ps = make_pipeline_state(cutlass.pipeline.PipelineUserType.Producer, N_STG)
-    cs = make_pipeline_state(cutlass.pipeline.PipelineUserType.Consumer, N_STG)
 
-    for blk in cutlass.range(N_BLKS, unroll=1):
-        if warp == 0:
+    if warp == 0:
+        ps = make_pipeline_state(cutlass.pipeline.PipelineUserType.Producer, N_STG)
+        for blk in cutlass.range(N_BLKS, unroll=1):
             pipe.producer_acquire(ps)
+            atom = cute.make_copy_atom(cpasync.CopyBulkG2SOp(), Float32)
             with cute.arch.elect_one():
-                atom = cute.make_copy_atom(cpasync.CopyBulkG2SOp(), Float32)
                 cute.copy(atom, src[None, blk], s[None, ps.index],
                           mbar_ptr=pipe.producer_get_barrier(ps))
             ps.advance()
-        if warp == 1:
+        pipe.producer_tail(ps)
+    if warp == 1:
+        cs = make_pipeline_state(cutlass.pipeline.PipelineUserType.Consumer, N_STG)
+        for blk in cutlass.range(N_BLKS, unroll=1):
             pipe.consumer_wait(cs)
-            cute.arch.fence_view_async_shared()
             for i in cutlass.range_constexpr(TILE // 32):
                 dst[lane + i * 32, blk] = s[lane + i * 32, cs.index]
             cute.arch.fence_view_async_shared()
+            cute.arch.sync_warp()  # Ned sync_warp as only 1 thread will signal in consumer_release
             pipe.consumer_release(cs)
             cs.advance()
-    if warp == 0:
-        pipe.producer_tail(ps)
 
 
 @cute.jit
