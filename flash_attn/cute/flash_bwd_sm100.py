@@ -1544,6 +1544,7 @@ class FlashAttentionBackwardSm100:
             )
             # Dealloc the tensor memory buffer
             tmem.relinquish_alloc_permit()
+            tmem_alloc_barrier.arrive_and_wait()
             tmem.free(tmem_ptr)
 
         # Compute
@@ -1595,6 +1596,7 @@ class FlashAttentionBackwardSm100:
                 fastdiv_mods,
                 blocksparse_tensors,
             )
+            tmem_alloc_barrier.arrive()
 
         # Reduce
         # (0, 1, 2, 3) - dQ
@@ -1615,6 +1617,7 @@ class FlashAttentionBackwardSm100:
                 mdQ_semaphore,
                 blocksparse_tensors,
             )
+            tmem_alloc_barrier.arrive()
 
         return
 
