@@ -294,11 +294,6 @@ def test_flash_attn_output(
             # and False
             and not ((causal or local) and seqlen_k < seqlen_q)
         ):
-            # TODO: SM90 backward pass has invalid MMA tile config for d=64 + non-causal
-            # The m_block_size=80 (non-causal) with head_dim=64 creates an invalid tile.
-            # Fix requires adjusting m_block_size or MMA config in flash_bwd_sm90.py
-            if IS_SM90 and d == 64 and not causal:
-                pytest.xfail("SM90 backward: d=64 + non-causal has invalid MMA tile config (m_block=80)")
             # TODO: SM90 backward pass does not support local attention yet
             if IS_SM90 and local:
                 pytest.xfail("SM90 backward: local attention not supported yet")

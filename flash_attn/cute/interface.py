@@ -641,7 +641,15 @@ def _flash_attn_bwd(
         num_stages_PdS = 2
         SdP_swapAB = True
         dKV_swapAB = False
-        dQ_swapAB = not causal
+        # When dQ_swapAB=True, the dQ MMA's M-mode becomes
+        # (tile_hdim_padded // 2). This value must be a multiple of 64
+        # (the WGMMA atom M). Only head_dim=128 satisfies this (128//2=64).
+        # For head_dim=64 (32), 96 (48), 192 (96) it fails.
+        head_dim_padded = ((head_dim + 15) // 16) * 16
+        dQ_swap_valid = (head_dim_padded // 2) % 64 == 0
+        dQ_swapAB = not causal and dQ_swap_valid
+        if not dQ_swap_valid and not causal:
+            m_block_size = 64
         AtomLayoutMSdP = 1
         AtomLayoutNdKV = 2
         AtomLayoutMdQ = 1
