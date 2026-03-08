@@ -30,7 +30,6 @@ from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute.pack_gqa import PackGQA
 from flash_attn.cute.named_barrier import NamedBarrierFwd
-from cutlass.cute import FastDivmodDivisor
 
 
 class FlashAttentionForwardBase:
@@ -655,26 +654,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             cute.size(mQ.shape[2]),
             cute.size(mQ.shape[3]),
         )
-        LOG2_E = math.log2(math.e)
-        if const_expr(self.score_mod is None):
-            softmax_scale_log2 = Float32(softmax_scale * LOG2_E)
-            softmax_scale = None
-        else:
-            # NB: If a user passes in a score mod, we want to apply the score-mod in the sm_scaled qk
-            # But in the original base 10. We hijack softmax_scale_log2 to just be the change of base
-            # and correctly apply the softmax_scale prior to score_mod in the softmax step
-            softmax_scale_log2 = Float32(LOG2_E)
-            softmax_scale = Float32(softmax_scale)
-
-        fastdiv_mods = None
-        if const_expr(aux_tensors is not None):
-            seqlen_q = cute.size(mQ.shape[0]) // (
-                self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1
-            )
-            seqlen_k = cute.size(mK.shape[0])
-            seqlen_q_divmod = FastDivmodDivisor(seqlen_q)
-            seqlen_k_divmod = FastDivmodDivisor(seqlen_k)
-            fastdiv_mods = (seqlen_q_divmod, seqlen_k_divmod)
+        softmax_scale_log2, softmax_scale = utils.compute_softmax_scale_log2(softmax_scale, self.score_mod)
+        fastdiv_mods = utils.compute_fastdiv_mods(mQ, mK, self.qhead_per_kvhead, self.pack_gqa, aux_tensors)
 
         self.kernel(
             mQ,

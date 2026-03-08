@@ -34,6 +34,7 @@ from quack import copy_utils, layout_utils
 
 from flash_attn.cute.paged_kv import PagedKVManager
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
+from flash_attn.cute import utils
 import flash_attn.cute.pipeline as pipeline_custom
 from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.softmax import SoftmaxSm100, apply_score_mod_inner
@@ -602,35 +603,10 @@ class FlashAttentionForwardSm100:
 
         self.shared_storage = SharedStorage
 
-        LOG2_E = math.log2(math.e)
-        if const_expr(self.score_mod is None):
-            softmax_scale_log2 = softmax_scale * LOG2_E
-            softmax_scale = None
-        else:
-            # NB: If a users passes in a score mod, we want to apply the score-mod in the sm_scaled qk
-            # But in the original base 10. We hijack softmax_scale_log2 to just be the change of base
-            # and correctly apply the softmax_scale prior to score_mod in the softmax step
-            softmax_scale_log2 = LOG2_E
-            softmax_scale = softmax_scale
-
-        if const_expr(window_size_left is not None):
-            window_size_left = Int32(window_size_left)
-        if const_expr(window_size_right is not None):
-            window_size_right = Int32(window_size_right)
-
-        fastdiv_mods = None
-        if cutlass.const_expr(aux_tensors is not None):
-            seqlen_q = cute.size(mQ.shape[0]) // (
-                self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1
-            )
-            seqlen_k = (
-                cute.size(mK.shape[0])
-                if const_expr(mPageTable is None)
-                else mK.shape[0] * mPageTable.shape[1]
-            )
-            seqlen_q_divmod = FastDivmodDivisor(seqlen_q)
-            seqlen_k_divmod = FastDivmodDivisor(seqlen_k)
-            fastdiv_mods = (seqlen_q_divmod, seqlen_k_divmod)
+        softmax_scale_log2, softmax_scale = utils.compute_softmax_scale_log2(softmax_scale, self.score_mod)
+        window_size_left = Int32(window_size_left) if window_size_left is not None else None
+        window_size_right = Int32(window_size_right) if window_size_right is not None else None
+        fastdiv_mods = utils.compute_fastdiv_mods(mQ, mK, self.qhead_per_kvhead, self.pack_gqa, aux_tensors, mPageTable)
 
         head_divmod = None
         if cutlass.const_expr(self.pack_gqa):
