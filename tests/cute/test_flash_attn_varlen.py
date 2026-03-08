@@ -5,9 +5,6 @@ import torch
 import torch.nn.functional as F
 from flash_attn.cute import flash_attn_varlen_func
 
-IS_SM90 = torch.cuda.get_device_capability()[0] == 9
-
-
 @pytest.mark.parametrize("B", [1, 7, 20])
 @pytest.mark.parametrize("H", [1, 4, 6])
 @pytest.mark.parametrize("D", [64, 128])
