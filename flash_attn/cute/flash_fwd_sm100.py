@@ -46,7 +46,7 @@ from flash_attn.cute.block_sparse_utils import (
     softmax_block_sparse_sm100,
     handle_block_sparse_empty_tile_correction_sm100,
 )
-from flash_attn.cute.pack_gqa import PackGQA
+from flash_attn.cute.pack_gqa import PackGQA, pack_gqa_layout
 from flash_attn.cute import mma_sm100_desc as sm100_desc
 from flash_attn.cute import blackwell_helpers as sm100_utils
 from flash_attn.cute.named_barrier import NamedBarrierFwdSm100
@@ -446,50 +446,11 @@ class FlashAttentionForwardSm100:
             )
 
         if const_expr(self.pack_gqa):
-            shape_Q_packed = (
-                (self.qhead_per_kvhead, mQ.shape[0]),
-                mQ.shape[1],
-                mK.shape[2],
-                *mQ.shape[3:],
-            )
-            stride_Q_packed = (
-                (mQ.stride[2], mQ.stride[0]),
-                mQ.stride[1],
-                mQ.stride[2] * self.qhead_per_kvhead,
-                *mQ.stride[3:],
-            )
-            mQ = cute.make_tensor(
-                mQ.iterator, cute.make_layout(shape_Q_packed, stride=stride_Q_packed)
-            )
-            shape_O_packed = (
-                (self.qhead_per_kvhead, mO.shape[0]),
-                mO.shape[1],
-                mK.shape[2],
-                *mO.shape[3:],
-            )
-            stride_O_packed = (
-                (mO.stride[2], mO.stride[0]),
-                mO.stride[1],
-                mO.stride[2] * self.qhead_per_kvhead,
-                *mO.stride[3:],
-            )
-            mO = cute.make_tensor(
-                mO.iterator, cute.make_layout(shape_O_packed, stride=stride_O_packed)
-            )
+            nheads_kv = mK.shape[2]
+            mQ = pack_gqa_layout(mQ, self.qhead_per_kvhead, nheads_kv, head_idx=2)
+            mO = pack_gqa_layout(mO, self.qhead_per_kvhead, nheads_kv, head_idx=2)
             if const_expr(mLSE is not None):
-                shape_LSE_packed = (
-                    (self.qhead_per_kvhead, mLSE.shape[0]),
-                    mK.shape[2],
-                    *mLSE.shape[2:],
-                )
-                stride_LSE_packed = (
-                    (mLSE.stride[1], mLSE.stride[0]),
-                    mLSE.stride[1] * self.qhead_per_kvhead,
-                    *mLSE.stride[2:],
-                )
-                mLSE = cute.make_tensor(
-                    mLSE.iterator, cute.make_layout(shape_LSE_packed, stride=stride_LSE_packed)
-                )
+                mLSE = pack_gqa_layout(mLSE, self.qhead_per_kvhead, nheads_kv, head_idx=1)
 
         self.tma_copy_bytes = {
             name: cute.size_in_bytes(mX.element_type, cute.select(layout, mode=[0, 1, 2]))
