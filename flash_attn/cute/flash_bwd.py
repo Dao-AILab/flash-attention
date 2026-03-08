@@ -794,9 +794,10 @@ class FlashAttentionBackwardSm80:
             # Mainloop
             # ///////////////////////////////////////////////////////////////////////////////
             # Start processing of the first n-block.
-            mask = AttentionMask(self.m_block_size, self.n_block_size, seqlen.seqlen_q, seqlen.seqlen_k)
+            mask = AttentionMask(self.m_block_size, self.n_block_size, seqlen)
             mask_fn = partial(
-                mask.apply_mask, n_block=n_block, thr_mma=thr_mma_sdp,
+                mask.apply_mask, batch_idx=batch_idx, head_idx=head_idx,
+                n_block=n_block, thr_mma=thr_mma_sdp,
                 mask_seqlen=True, mask_causal=self.is_causal
             )
             smem_pipe_read_q = cutlass.Int32(0)
