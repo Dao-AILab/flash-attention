@@ -68,7 +68,7 @@ NVCC_THREADS = os.getenv("NVCC_THREADS") or "4"
 
 @functools.lru_cache(maxsize=None)
 def cuda_archs() -> str:
-    return os.getenv("FLASH_ATTN_CUDA_ARCHS", "80;90;100;110;120").split(";")
+    return os.getenv("FLASH_ATTN_CUDA_ARCHS", "80;90;100;110;120;121").split(";")
 
 
 def get_platform():
@@ -98,8 +98,9 @@ def get_cuda_bare_metal_version(cuda_dir):
 def add_cuda_gencodes(cc_flag, archs, bare_metal_version):
     """
     Adds -gencode flags based on nvcc capabilities:
-      - sm_80/90 (regular)
-      - sm_100/120 on CUDA >= 12.8
+      - sm_80/90 (Ampere/Hopper)
+      - sm_100/120 on CUDA >= 12.8 (Blackwell)
+      - sm_121 on CUDA >= 13.0 (GB10/Spark)
       - Use 100f on CUDA >= 12.9 (Blackwell family-specific)
       - Map requested 110 -> 101 if CUDA < 13.0 (Thor rename)
       - Embed PTX for newest arch for forward compatibility
@@ -128,16 +129,19 @@ def add_cuda_gencodes(cc_flag, archs, bare_metal_version):
             else:
                 cc_flag += ["-gencode", "arch=compute_120,code=sm_120"]
 
+    # GB10/Spark (Blackwell 12.1) requires CUDA >= 13.0
+    # Note: sm_121 is functionally identical to sm_120 (integrated memory variant)
+    # Family-specific 121f provides compatibility within Blackwell 12.x family
+    if bare_metal_version >= Version("13.0") and "121" in archs:
+        cc_flag += ["-gencode", "arch=compute_121f,code=sm_121"]
 
-        # Thor rename: 12.9 uses sm_101; 13.0+ uses sm_110
-        if "110" in archs:
-            if bare_metal_version >= Version("13.0"):
-                cc_flag += ["-gencode", "arch=compute_110f,code=sm_110"]
-            else:
-                # Provide Thor support for CUDA 12.9 via sm_101
-                if bare_metal_version >= Version("12.8"):
-                    cc_flag += ["-gencode", "arch=compute_101,code=sm_101"]
-                # else: no Thor support in older toolkits
+    # Thor rename: 12.8-12.9 uses sm_101; 13.0+ uses sm_110
+    if bare_metal_version >= Version("12.8") and "110" in archs:
+        if bare_metal_version >= Version("13.0"):
+            cc_flag += ["-gencode", "arch=compute_110f,code=sm_110"]
+        else:
+            # Provide Thor support for CUDA 12.8-12.9 via sm_101
+            cc_flag += ["-gencode", "arch=compute_101,code=sm_101"]
 
     # PTX for newest requested arch (forward-compat)
     numeric = [a for a in archs if a.isdigit()]
