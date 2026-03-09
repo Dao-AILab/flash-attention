@@ -333,6 +333,20 @@ def _flash_attn_fwd(
         out_partial = torch.empty(num_splits, *q_batch_seqlen_shape, num_head, head_dim_v, dtype=torch.float32, device=device)
         lse_partial = torch.empty(num_splits, *lse_shape, dtype=torch.float32, device=device)
 
+    use_2cta_instrs = (
+        arch // 10 in [10, 11]
+        and not causal
+        and not local
+        and not is_split_kv
+        and cu_seqlens_q is None
+        and seqused_q is None
+        and not use_block_sparsity
+        and page_size in [None, 128]
+        and int(math.ceil(head_dim / 16) * 16) == 128
+        and int(math.ceil(head_dim_v / 16) * 16) == 128
+        and seqlen_q_packgqa > 2 * m_block_size
+    )
+
     # hash score and mask mods for compile cache
     score_mod_hash = utils.hash_callable(score_mod) if score_mod is not None else False
     mask_mod_hash = utils.hash_callable(mask_mod) if mask_mod is not None else False
@@ -420,6 +434,7 @@ def _flash_attn_fwd(
         pack_gqa,
         arch,
         page_size not in [None, 128],  # paged KV non-TMA
+        use_2cta_instrs,
         q_subtile_factor,
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
@@ -485,19 +500,6 @@ def _flash_attn_fwd(
                 q_subtile_factor=q_subtile_factor,
             )
         elif arch // 10 in [10, 11]:
-            head_dim_padded = int(math.ceil(head_dim / 16) * 16)
-            head_dim_v_padded = int(math.ceil(head_dim / 16) * 16)
-            use_2cta_instrs = (
-                not causal
-                and not local
-                and not is_split_kv
-                and cu_seqlens_q is None
-                and seqused_q is None
-                and not use_block_sparsity
-                and page_size in [None, 128]
-                and head_dim_padded == 128
-                and head_dim_v_padded == 128
-            )
             fa_fwd = FlashAttentionForwardSm100(
                 head_dim,
                 head_dim_v,
