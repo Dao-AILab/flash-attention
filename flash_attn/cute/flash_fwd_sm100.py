@@ -14,7 +14,7 @@
 # https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/blackwell/fmha.py
 
 import math
-from typing import Type, Tuple, Callable, Optional, Literal
+from typing import Tuple, Callable, Optional, Literal
 from functools import partial
 
 import cuda.bindings.driver as cuda
@@ -27,6 +27,7 @@ import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
 from cutlass import pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
+from cutlass.utils import ClcDynamicPersistentTileScheduler
 from cutlass.base_dsl.arch import Arch
 from cutlass.cutlass_dsl import BaseDSL
 
@@ -36,6 +37,7 @@ from flash_attn.cute.paged_kv import PagedKVManager
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import utils
 import flash_attn.cute.pipeline as pipeline_custom
+import cutlass.pipeline as cutlass_pipeline
 from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.softmax import SoftmaxSm100, apply_score_mod_inner
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
@@ -54,12 +56,17 @@ from flash_attn.cute.named_barrier import NamedBarrierFwdSm100
 from cutlass.cute import FastDivmodDivisor
 from quack.cute_dsl_utils import ParamsBase
 from flash_attn.cute.tile_scheduler import (
+    ClcState,
+    SchedulingMode,
     TileSchedulerArguments,
+    TileSchedulerProtocol,
     SingleTileScheduler,
     StaticPersistentTileScheduler,
     SingleTileLPTScheduler,
     SingleTileVarlenScheduler,
 )
+from flash_attn.cute.fa_logging import fa_log, fa_printf
+from flash_attn.cute.utils import smid
 
 # === TUNING KNOBS (agent-editable) ===
 # Keys: (use_2cta_instrs: bool, is_causal: bool, head_dim_padded: int, is_sm103: bool)
@@ -106,6 +113,7 @@ class FlashAttentionForwardSm100:
         paged_kv_non_tma: bool = False,
         is_varlen_q: bool = False,
         use_2cta_instrs: bool = False,
+        use_clc_scheduler: bool = False,
     ):
         self.use_tma_KV = not paged_kv_non_tma
         # self.dtype = dtype
@@ -179,6 +187,32 @@ class FlashAttentionForwardSm100:
             "Paged KV does not support irregular head dim"
         )
 
+        self.use_clc_scheduler = (
+            use_clc_scheduler
+            and self.use_tma_KV
+            and not self.overlap_sO_sQ
+        )
+        self.sched_stages = 1
+        if self.use_clc_scheduler:
+            assert self.cluster_shape_mn[1] == 1, f"CLC requires cluster N == 1: {self.cluster_shape_mn}"
+            assert self.cluster_shape_mn[0] in (1, 2), f"bad CLC cluster M: {self.cluster_shape_mn}"
+            assert self.cluster_shape_mn[0] == self.cta_group_size, (
+                f"CLC cluster M != cta_group_size: {self.cluster_shape_mn}, {self.cta_group_size}"
+            )
+
+        self.scheduling_mode = SchedulingMode.CLC if self.use_clc_scheduler else SchedulingMode.STATIC
+
+        if is_varlen_q:
+            self.TileScheduler = SingleTileVarlenScheduler
+        elif self.is_causal or self.is_local or self.use_clc_scheduler:
+            self.TileScheduler = SingleTileLPTScheduler
+        elif self.is_persistent:
+            self.TileScheduler = StaticPersistentTileScheduler
+        else:
+            self.TileScheduler = SingleTileScheduler
+
+        fa_log(1, f"TileScheduler={self.TileScheduler.__name__}, scheduling_mode={self.scheduling_mode.name}, USE_2CTA={self.use_2cta_instrs}")
+
         self.softmax0_warp_ids = (0, 1, 2, 3)
         self.softmax1_warp_ids = (4, 5, 6, 7)
         self.correction_warp_ids = (8, 9, 10, 11)
@@ -218,6 +252,8 @@ class FlashAttentionForwardSm100:
             self.epilogue_warp_ids = self.correction_warp_ids
         elif self.is_varlen_q: # fallback
             self.epilogue_warp_ids = (13, 14)
+
+        self.clc_scheduler_warp_id = self.empty_warp_ids[0] if self.use_clc_scheduler else None
 
         self.tmem_s_offset = [0, self.n_block_size]  # e.g., 0, 128
         self.tmem_o_offset = [
@@ -551,19 +587,7 @@ class FlashAttentionForwardSm100:
             vO_layout = cute.make_layout((1, async_copy_elems))
             gmem_tiled_copy_O = cute.make_tiled_copy_tv(atom_universal_copy, tO_layout, vO_layout)
 
-        if const_expr(mCuSeqlensQ is not None or mSeqUsedQ is not None):
-            TileScheduler = SingleTileVarlenScheduler
-        else:
-            if const_expr(self.is_causal or self.is_local):
-                TileScheduler = SingleTileLPTScheduler
-            else:
-                TileScheduler = (
-                    SingleTileScheduler
-                    if const_expr(not self.is_persistent)
-                    else StaticPersistentTileScheduler
-                )
-        # For non-persistent 2CTA (use_cluster_idx), each cluster covers
-        # cta_tiler[0] * cta_group_size rows, so num_block must be divided accordingly
+        TileScheduler = self.TileScheduler
         _num_block_divisor = self.cta_tiler[0] * (self.cta_group_size if not self.is_persistent and self.cta_group_size > 1 else 1)
         tile_sched_args = TileSchedulerArguments(
             cute.ceil_div(cute.size(mQ.shape[0]), _num_block_divisor),
@@ -591,7 +615,9 @@ class FlashAttentionForwardSm100:
             cluster_shape_mn=self.cluster_shape_mn,
             use_cluster_idx=not self.is_persistent and self.cta_group_size > 1,
         )
-        tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
+        tile_sched_params = TileScheduler.to_underlying_arguments(
+            tile_sched_args, scheduling_mode=self.scheduling_mode
+        )
         self.tile_scheduler_cls = TileScheduler
         grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
 
@@ -600,6 +626,9 @@ class FlashAttentionForwardSm100:
             cute.cosize(sQ_layout) if const_expr(not self.overlap_sO_sQ) else
             cutlass.max(cute.cosize(sQ_layout), cute.cosize(sO_layout) * self.o_dtype.width // self.q_dtype.width)
         )
+
+        clc_response_size = self.sched_stages * 4 if self.use_clc_scheduler else 0
+        clc_mbar_size = self.sched_stages * 2 if self.use_clc_scheduler else 0
 
         @cute.struct
         class SharedStorage:
@@ -620,6 +649,13 @@ class FlashAttentionForwardSm100:
             # Smem tensors
             # store row max and row sum
             sScale: cute.struct.MemRange[Float32, self.q_stage * self.m_block_size * 2]
+            # CLC buffers placed here to utilize padding before sO's 1024-byte alignment.
+            # This avoids adding bytes at the end when we're at the smem limit.
+            # PipelineClcFetchAsync expects 2 * sched_stages mbarriers (full + empty).
+            clc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, clc_mbar_size]
+            # CLC response storage (16 bytes per stage, stored as 4 Int32s).
+            clc_response: cute.struct.MemRange[Int32, clc_response_size]
+            # Large TMA buffers with 1024-byte alignment
             sO: cute.struct.Align[
                 cute.struct.MemRange[self.o_dtype, sO_size], self.buffer_align_bytes
             ]
@@ -980,17 +1016,69 @@ class FlashAttentionForwardSm100:
             window_size_right=window_size_right,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
         )
-        TileSchedulerCls = partial(self.tile_scheduler_cls.create, tile_sched_params)
-
         # Cluster wait before tensor memory alloc
         pipeline_init_wait(cluster_shape_mn=cta_layout_vmnk)
 
+        if const_expr(self.use_clc_scheduler):
+            clc_response_ptr = storage.clc_response.data_ptr()
+            clc_mbar_ptr = storage.clc_mbar_ptr.data_ptr()
+
+            clc_pipeline_producer_group = cutlass_pipeline.CooperativeGroup(
+                cutlass_pipeline.Agent.Thread
+            )
+            num_clc_consumer_warps_per_cta = self.threads_per_cta // cute.arch.WARP_SIZE
+            # NB on CTA0 warp15 == scheduler on CTA1 == empty but still both consume
+            num_clc_consumer_warps = num_clc_consumer_warps_per_cta * self.cta_group_size
+            clc_pipeline_consumer_group = cutlass_pipeline.CooperativeGroup(
+                cutlass_pipeline.Agent.Thread, cute.arch.WARP_SIZE * num_clc_consumer_warps
+            )
+
+            block_idx = cute.arch.block_idx()
+            clc = ClcState.create(
+                hw_scheduler=ClcDynamicPersistentTileScheduler.create(
+                    self.tile_scheduler_cls.clc_problem_shape(tile_sched_params),
+                    block_idx,
+                    cute.arch.grid_dim(),
+                    clc_response_ptr,
+                ),
+                pipeline=cutlass_pipeline.PipelineClcFetchAsync.create(
+                    barrier_storage=clc_mbar_ptr,
+                    num_stages=self.sched_stages,
+                    producer_group=clc_pipeline_producer_group,
+                    consumer_group=clc_pipeline_consumer_group,
+                    tx_count=16,
+                    cta_layout_vmnk=cta_layout_vmnk,
+                ),
+                consumer_state=cutlass_pipeline.make_pipeline_state(
+                    cutlass_pipeline.PipelineUserType.Consumer, self.sched_stages
+                ),
+                producer_state=cutlass_pipeline.make_pipeline_state(
+                    cutlass_pipeline.PipelineUserType.Producer, self.sched_stages
+                ),
+            )
+            tile_scheduler = self.tile_scheduler_cls.create(tile_sched_params, clc=clc)
+        else:
+            tile_scheduler = self.tile_scheduler_cls.create(tile_sched_params)
+        assert isinstance(tile_scheduler, TileSchedulerProtocol), f"tile_scheduler is not a TileSchedulerProtocol: {type(tile_scheduler)}"
+
         # ///////////////////////////////////////////////////////////////////////////////
-        #  EMPTY
+        #  EMPTY / CLC SCHEDULER WARP
         # ///////////////////////////////////////////////////////////////////////////////
-        for i in cutlass.range_constexpr(len(self.empty_warp_ids)):
-            if warp_idx == self.empty_warp_ids[i]:
+        if const_expr(self.use_clc_scheduler):
+            if warp_idx == self.clc_scheduler_warp_id:
                 cute.arch.setmaxregister_decrease(self.num_regs_other)
+                if is_leader_cta:
+                    self.clc_scheduler_warp(tile_scheduler)
+                else:
+                    self.empty_warp(tile_scheduler)
+            for i in cutlass.range_constexpr(len(self.empty_warp_ids)):
+                if warp_idx == self.empty_warp_ids[i] and warp_idx != self.clc_scheduler_warp_id:
+                    cute.arch.setmaxregister_decrease(self.num_regs_other)
+                    self.empty_warp(tile_scheduler)
+        else:
+            for i in cutlass.range_constexpr(len(self.empty_warp_ids)):
+                if warp_idx == self.empty_warp_ids[i]:
+                    cute.arch.setmaxregister_decrease(self.num_regs_other)
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  LOAD
@@ -1016,8 +1104,8 @@ class FlashAttentionForwardSm100:
                 block_info,
                 num_splits,
                 SeqlenInfoCls,
-                TileSchedulerCls,
                 blocksparse_tensors,
+                tile_scheduler=tile_scheduler,
             )
 
         # ///////////////////////////////////////////////////////////////////////////////
@@ -1047,8 +1135,8 @@ class FlashAttentionForwardSm100:
                 block_info,
                 num_splits,
                 SeqlenInfoCls,
-                TileSchedulerCls,
                 blocksparse_tensors,
+                tile_scheduler=tile_scheduler,
             )
             # Dealloc the tensor memory buffer
             tmem.relinquish_alloc_permit()
@@ -1070,8 +1158,8 @@ class FlashAttentionForwardSm100:
                     block_info,
                     num_splits,
                     SeqlenInfoCls,
-                    TileSchedulerCls,
                     mma_tile_coord_v,
+                    tile_scheduler=tile_scheduler,
                 )
 
         # ///////////////////////////////////////////////////////////////////////////////
@@ -1103,11 +1191,11 @@ class FlashAttentionForwardSm100:
                 num_splits=num_splits,
                 SeqlenInfoCls=SeqlenInfoCls,
                 AttentionMaskCls=AttentionMaskCls,
-                TileSchedulerCls=TileSchedulerCls,
                 aux_tensors=aux_tensors,
                 fastdiv_mods=fastdiv_mods,
                 head_divmod=head_divmod,
                 blocksparse_tensors=blocksparse_tensors,
+                tile_scheduler=tile_scheduler,
             )
 
             if const_expr(not self.s0_s1_barrier):
@@ -1151,8 +1239,8 @@ class FlashAttentionForwardSm100:
                 block_info,
                 num_splits,
                 SeqlenInfoCls,
-                TileSchedulerCls,
                 blocksparse_tensors,
+                tile_scheduler=tile_scheduler,
             )
             tmem_alloc_barrier.arrive()
 
@@ -1179,8 +1267,8 @@ class FlashAttentionForwardSm100:
         block_info: BlockInfo,
         num_splits: Int32,
         SeqlenInfoCls: Callable,
-        TileSchedulerCls: Callable,
         blocksparse_tensors: Optional[BlockSparseTensors],
+        tile_scheduler: TileSchedulerProtocol,
     ):
         num_load_threads = len(self.load_warp_ids) * cute.arch.WARP_SIZE
         tidx = cute.arch.thread_idx()[0] % num_load_threads
@@ -1197,7 +1285,6 @@ class FlashAttentionForwardSm100:
         kv_producer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Producer, self.kv_stage
         )
-        tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
@@ -1368,9 +1455,8 @@ class FlashAttentionForwardSm100:
                     self.q_subtile_factor if self.q_subtile_factor is not None else 1,
                 )
 
-            tile_scheduler.prefetch_next_work()
-            tile_scheduler.advance_to_next_work()
-            work_tile = tile_scheduler.get_current_work()
+
+            work_tile = tile_scheduler.advance_to_next_work()
             # End of persistent scheduler loop
 
         if issue_kv_for_this_warp:
@@ -1399,8 +1485,8 @@ class FlashAttentionForwardSm100:
         block_info: BlockInfo,
         num_splits: Int32,
         SeqlenInfoCls: Callable,
-        TileSchedulerCls: Callable,
         blocksparse_tensors: Optional[BlockSparseTensors],
+        tile_scheduler=None,
     ):
         tSrQ = tiled_mma_qk.make_fragment_A(sQ)
         tSrK = tiled_mma_qk.make_fragment_B(sK)
@@ -1489,7 +1575,6 @@ class FlashAttentionForwardSm100:
         )
         P_full_O_rescaled_phase = Int32(0)
 
-        tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
@@ -1660,8 +1745,7 @@ class FlashAttentionForwardSm100:
                 # End of GEMM_PV1(i_end) (P1 * Vi_end -> O1)
 
             # Advance to next tile
-            tile_scheduler.advance_to_next_work()
-            work_tile = tile_scheduler.get_current_work()
+            work_tile = tile_scheduler.advance_to_next_work()
         # End of persistent scheduler loop
 
         # We don't need pipeline_s_p_o.producer_tail() since there's no dangling mbarrier at the end
@@ -1690,11 +1774,11 @@ class FlashAttentionForwardSm100:
         num_splits: Int32,
         SeqlenInfoCls: Callable,
         AttentionMaskCls: Callable,
-        TileSchedulerCls: Callable,
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
         head_divmod=None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        tile_scheduler=None,
     ):
         """Compute softmax on attention scores from QK matrix multiplication.
 
@@ -1754,7 +1838,6 @@ class FlashAttentionForwardSm100:
 
         warp_idx_in_wg = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
 
-        tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
@@ -1997,8 +2080,7 @@ class FlashAttentionForwardSm100:
             #         gLSE[tidx] = lse
 
             # Advance to next tile
-            tile_scheduler.advance_to_next_work()
-            work_tile = tile_scheduler.get_current_work()
+            work_tile = tile_scheduler.advance_to_next_work()
         # End of persistent scheduler loop
 
         # This is equivalent to pipeline_sm_stats.producer_tail
@@ -2168,8 +2250,8 @@ class FlashAttentionForwardSm100:
         block_info: BlockInfo,
         num_splits: Int32,
         SeqlenInfoCls: Callable,
-        TileSchedulerCls: Callable,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        tile_scheduler=None,
     ):
         tidx = cute.arch.thread_idx()[0] % (cute.arch.WARP_SIZE * len(self.correction_warp_ids))
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
@@ -2199,7 +2281,6 @@ class FlashAttentionForwardSm100:
         o_corr_consumer_phase = Int32(0)
         corr_epi_producer_phase = Int32(1)
 
-        tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
@@ -2430,8 +2511,7 @@ class FlashAttentionForwardSm100:
                             cute.make_tensor(lse_gmem_ptr, (1,))[0] = lse
 
             # Advance to next tile
-            tile_scheduler.advance_to_next_work()
-            work_tile = tile_scheduler.get_current_work()
+            work_tile = tile_scheduler.advance_to_next_work()
         # End of persistent scheduler loop
 
         # This is equivalent to pipeline_o_epi.consumer_tail() for the correction warps
@@ -2638,11 +2718,10 @@ class FlashAttentionForwardSm100:
         block_info: BlockInfo,
         num_splits: int,
         SeqlenInfoCls: Callable,
-        TileSchedulerCls: Callable,
         mma_tile_coord_v: Int32 = 0,
+        tile_scheduler=None,
     ):
         epi_consumer_phase = Int32(0)
-        tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
@@ -2698,8 +2777,39 @@ class FlashAttentionForwardSm100:
                 epi_consumer_phase ^= 1
 
             # Advance to next tile
-            tile_scheduler.advance_to_next_work()
-            work_tile = tile_scheduler.get_current_work()
+            work_tile = tile_scheduler.advance_to_next_work()
+
+    @cute.jit
+    def clc_scheduler_warp(
+        self,
+        tile_scheduler: TileSchedulerProtocol,
+    ):
+        work_tile = tile_scheduler.initial_work_tile_info()
+        while work_tile.is_valid_tile:
+            tile_scheduler.prefetch_next_work()
+            work_tile = tile_scheduler.advance_to_next_work()
+            if cute.arch.thread_idx()[0] == self.clc_scheduler_warp_id * cute.arch.WARP_SIZE:
+                fa_printf(
+                    3,
+                    "[CLC] query sm={} cta={} (m_blk={},h={},b={},s={}) valid={}\n",
+                    smid(),
+                    cute.arch.block_idx()[0],
+                    work_tile.tile_idx[0],
+                    work_tile.tile_idx[1],
+                    work_tile.tile_idx[2],
+                    work_tile.tile_idx[3],
+                    work_tile.is_valid_tile,
+                )
+        tile_scheduler.producer_tail()
+
+    @cute.jit
+    def empty_warp(
+        self,
+        tile_scheduler: TileSchedulerProtocol,
+    ):
+        work_tile = tile_scheduler.initial_work_tile_info()
+        while work_tile.is_valid_tile:
+            work_tile = tile_scheduler.advance_to_next_work()
 
     def load_Q(
         self,

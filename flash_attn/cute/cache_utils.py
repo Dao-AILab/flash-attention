@@ -32,7 +32,11 @@ CallableFunction: TypeAlias = JitCompiledFunction | tvm_ffi.Function
 
 logger = logging.getLogger(__name__)
 _handler = logging.StreamHandler()
-_handler.setFormatter(logging.Formatter("%(asctime)s.%(msecs)03d %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+_handler.setFormatter(
+    logging.Formatter(
+        "%(asctime)s.%(msecs)03d %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+    )
+)
 logger.addHandler(_handler)
 logger.setLevel(logging.DEBUG)
 
