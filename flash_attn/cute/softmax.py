@@ -270,9 +270,8 @@ class SoftmaxSm100(Softmax):
                             acc_S_row_frg[k + 1, j], fastmath=True
                         )
                     else:
-                        # acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = utils.e2e_asm2(acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j])
-                        acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = utils.ex2_emulation_2(
-                            acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j], poly_degree=2
+                        acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = utils.e2e_asm2(
+                            acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j]
                         )
             acc_S_row_converted_frg[None, j].store(
                 acc_S_row_frg[None, j].load().to(acc_S_row_converted.element_type)
