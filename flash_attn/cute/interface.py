@@ -68,6 +68,24 @@ def _get_device_arch():
     major, minor = torch.cuda.get_device_capability()
     return major * 10 + minor
 
+
+def _validate_head_dims(head_dim: int, head_dim_v: int, compute_capability: int, alignment: int) -> None:
+    """Validate head dimension constraints based on compute capability."""
+    is_deepseek_shape = head_dim == 192 and head_dim_v == 128
+    is_standard_range = 8 <= head_dim <= 128 and 8 <= head_dim_v <= 128
+
+    if compute_capability == 9:
+        assert is_standard_range and head_dim % alignment == 0 and head_dim_v % alignment == 0, (
+            f"(head_dim, head_dim_v)=({head_dim}, {head_dim_v}) is not supported on SM90. "
+            f"head_dim and head_dim_v must be between 8 and 128 and divisible by {alignment}."
+        )
+    elif compute_capability in [10, 11]:
+        assert (is_standard_range or is_deepseek_shape) and head_dim % alignment == 0 and head_dim_v % alignment == 0, (
+            f"(head_dim, head_dim_v)=({head_dim}, {head_dim_v}) is not supported on SM100/SM110. "
+            f"head_dim and head_dim_v must be between 8 and 128 and divisible by {alignment}, or (192, 128) for DeepSeek."
+        )
+
+
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
@@ -217,11 +235,11 @@ def _flash_attn_fwd(
             learnable_sink,
         )
     ), "inputs must be on CUDA device"
+    arch = _get_device_arch() if _arch is None else _arch
+    assert arch // 10 in [9, 10, 11], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x"
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
-    assert head_dim <= 256, "head_dim must be less than or equal to 256"
     alignment = 16 // q.element_size()
-    assert head_dim % alignment == 0, f"head_dim must be divisible by {alignment}"
-    assert head_dim_v % alignment == 0, f"head_dim_v must be divisible by {alignment}"
+    _validate_head_dims(head_dim, head_dim_v, arch // 10, alignment)
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
     if softcap == 0.0:
@@ -253,10 +271,6 @@ def _flash_attn_fwd(
         _validate_tensor(lse, "lse", lse_shape, torch.float32, device)
 
     dtype = torch2cute_dtype_map[q.dtype]
-    arch = _get_device_arch() if _arch is None else _arch
-
-    assert arch // 10 in [9, 10, 11], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x"
-
     use_block_sparsity = block_sparse_tensors is not None
 
     if mask_mod is None:
@@ -318,6 +332,20 @@ def _flash_attn_fwd(
     if is_split_kv:
         out_partial = torch.empty(num_splits, *q_batch_seqlen_shape, num_head, head_dim_v, dtype=torch.float32, device=device)
         lse_partial = torch.empty(num_splits, *lse_shape, dtype=torch.float32, device=device)
+
+    use_2cta_instrs = (
+        arch // 10 in [10, 11]
+        and not causal
+        and not local
+        and not is_split_kv
+        and cu_seqlens_q is None
+        and seqused_q is None
+        and not use_block_sparsity
+        and page_size in [None, 128]
+        and int(math.ceil(head_dim / 16) * 16) == 128
+        and int(math.ceil(head_dim_v / 16) * 16) == 128
+        and seqlen_q_packgqa > 2 * m_block_size
+    )
 
     # hash score and mask mods for compile cache
     score_mod_hash = utils.hash_callable(score_mod) if score_mod is not None else False
@@ -406,6 +434,7 @@ def _flash_attn_fwd(
         pack_gqa,
         arch,
         page_size not in [None, 128],  # paged KV non-TMA
+        use_2cta_instrs,
         q_subtile_factor,
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
@@ -471,19 +500,6 @@ def _flash_attn_fwd(
                 q_subtile_factor=q_subtile_factor,
             )
         elif arch // 10 in [10, 11]:
-            head_dim_padded = int(math.ceil(head_dim / 16) * 16)
-            head_dim_v_padded = int(math.ceil(head_dim / 16) * 16)
-            use_2cta_instrs = (
-                not causal
-                and not local
-                and not is_split_kv
-                and cu_seqlens_q is None
-                and seqused_q is None
-                and not use_block_sparsity
-                and page_size in [None, 128]
-                and head_dim_padded == 128
-                and head_dim_v_padded == 128
-            )
             fa_fwd = FlashAttentionForwardSm100(
                 head_dim,
                 head_dim_v,
@@ -748,10 +764,8 @@ def _flash_attn_bwd(
         t is None or t.is_cuda for t in (q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k)
     ), "inputs must be on CUDA device"
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
-    assert head_dim <= 256, "head_dim must be less than or equal to 256"
     alignment = 16 // q.element_size()
-    assert head_dim % alignment == 0, f"head_dim must be divisible by {alignment}"
-    assert head_dim_v % alignment == 0, f"head_dim_v must be divisible by {alignment}"
+    _validate_head_dims(head_dim, head_dim_v, arch // 10, alignment)
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
     qhead_per_kvhead = num_head // num_head_kv
