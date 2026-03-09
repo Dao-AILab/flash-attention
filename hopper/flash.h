@@ -66,6 +66,7 @@ struct Flash_fwd_params : public Qkv_params {
     void * __restrict__ softmax_lseaccum_ptr;
 
     // For FP8 scaling
+    // 这些指针和 stride 用于 FP8 数据类型的缩放操作。在使用 FP8 数据类型时，通常需要对 Q、K 和 V 进行缩放，以确保数值稳定性和精度。
     float * __restrict__ q_descale_ptr;
     float * __restrict__ k_descale_ptr;
     float * __restrict__ v_descale_ptr;
@@ -77,6 +78,8 @@ struct Flash_fwd_params : public Qkv_params {
     index_t v_descale_head_stride;
 
     // The dimensions.
+    // 这些维度参数定义了输入和输出矩阵的形状。b 是批次大小，seqlen_q 是查询序列的长度，seqlen_k 是键序列的长度，d 是每个头部的维度。
+    // seqlen_q_rounded、seqlen_k_rounded 和 d_rounded 是对 seqlen_q、seqlen_k 和 d 进行向上取整后的值，通常是为了满足内存对齐或块大小的要求。
     int b, seqlen_q, seqlen_k, seqlen_knew, d, seqlen_q_rounded, seqlen_k_rounded, d_rounded, rotary_dim;
     int total_q, total_k, total_knew;
     int b_k;  // When having KV cache and with cache_batch_idx, K & V might have larger batch size than Q
@@ -231,9 +234,15 @@ struct Flash_bwd_params : public Flash_fwd_params {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <int Arch, typename T, int kHeadDim, int kHeadDimV, bool Split, bool PagedKVNonTMA, bool Has_softcap, bool PackGQA>
+
 void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream);
+
 void prepare_varlen_num_blocks(Flash_fwd_params &params, cudaStream_t stream, bool packgqa, int blockM, int blockN, bool enable_pdl);
+
 template <int Arch, typename T, int kHeadDim, bool Has_softcap>
+
 void run_mha_bwd_(Flash_bwd_params &params, cudaStream_t stream);
+
 template <typename T, typename Tpartial, int kBlockK>
+
 void run_mha_fwd_combine_(Flash_fwd_params &params, cudaStream_t stream, bool enable_pdl);
