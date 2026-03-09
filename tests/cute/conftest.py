@@ -59,6 +59,9 @@ def pytest_configure(config):
     os.environ["CUDA_VISIBLE_DEVICES"] = gpu_ids[worker_num % len(gpu_ids)]
 
 def pytest_collection_finish(session):
+    if not session.config.option.collectonly:
+        return
+
     # file_name -> test_name -> counter
     test_counts: dict[str, dict[str, int]] = {}
     for item in session.items:
