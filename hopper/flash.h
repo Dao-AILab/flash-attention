@@ -5,11 +5,12 @@
 #pragma once
 
 #include <cuda.h>
-#include <vector>
+#include <vector> 
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 struct Qkv_params {
+    // 将数据类型定义为 int64_t，以确保在 32 位系统上也能正确处理大于 2^31 的值。
     using index_t = int64_t;
     // The QKV matrices.
     void *__restrict__ q_ptr;
@@ -17,6 +18,9 @@ struct Qkv_params {
     void *__restrict__ v_ptr;
 
     // The stride between rows of the Q, K and V matrices.
+    // 使用 int64_t 类型的 stride 以支持更大的矩阵尺寸，避免在 32 位系统上出现溢出。
+    // 这些 stride 定义了在内存中如何访问 Q、K 和 V 矩阵的不同维度，确保算法能够正确地处理大规模数据。
+    // 具体来说，batch_stride 定义了在批次维度上访问数据的步长，row_stride 定义了在序列长度维度上访问数据的步长，head_stride 定义了在头部维度上访问数据的步长。
     index_t q_batch_stride;
     index_t k_batch_stride;
     index_t v_batch_stride;
@@ -29,15 +33,24 @@ struct Qkv_params {
     index_t v_dim_stride;
 
     // The number of heads.
+    // 这里的 h 和 h_k 分别表示 Q/K 和 V 的头部数量。在某些模型中，Q/K 和 V 的头部数量可能不同，因此需要分别定义。
     int h, h_k;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// The parameters for the flash attention forward kernel. This struct is designed to be passed
+// directly to the CUDA kernel, so it should only contain simple data types and pointers.
+// public inheritance from Qkv_params allows Flash_fwd_params to include all the parameters defined in Qkv_params, such as the pointers and strides for the Q, K, and V matrices, as well as the number of heads. 
+// This design promotes code reuse and keeps the parameter struct organized, as all the common parameters related to QKV are encapsulated in Qkv_params, while Flash_fwd_params can add additional parameters specific to the forward pass of flash attention without needing to redefine the common ones.
+// 所以public 是必须的吗？
 struct Flash_fwd_params : public Qkv_params {
     using index_t = int64_t;
 
     // The O matrix (output).
+    // o_ptr 是指向输出矩阵 O 的指针，oaccum_ptr 是指向用于累积输出的矩阵 Oaccum 的指针。
+    // 在某些实现中，Oaccum 可能用于在计算过程中暂存中间结果，特别是在处理大规模数据或分块计算时。
+    // 我很好奇这里的Oaccum究竟是如何得到的
     void * __restrict__ o_ptr;
     void * __restrict__ oaccum_ptr;
 
@@ -46,7 +59,9 @@ struct Flash_fwd_params : public Qkv_params {
     index_t o_row_stride;
     index_t o_head_stride;
 
+    // _restrict__ 是一个编译器提示，告诉编译器指针所指向的数据在函数执行期间不会被其他指针修改。这可以帮助编译器进行优化，因为它知道数据的唯一性。
     // The pointer to the softmax sum.
+    // softmax_lse_ptr 是指向 softmax 的 log-sum-exp（LSE）结果的指针，softmax_lseaccum_ptr 是指向用于累积 LSE 结果的矩阵的指针。
     void * __restrict__ softmax_lse_ptr;
     void * __restrict__ softmax_lseaccum_ptr;
 
