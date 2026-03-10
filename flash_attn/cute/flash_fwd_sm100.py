@@ -1017,6 +1017,10 @@ class FlashAttentionForwardSm100:
             )
 
             tile_scheduler = self.tile_scheduler_cls.create(tile_sched_params, clc_response_ptr)
+            clc_consumer_state = cutlass_pipeline.make_pipeline_state(
+                cutlass_pipeline.PipelineUserType.Consumer, self.sched_stages
+            )
+            tile_scheduler.set_clc_pipeline(clc_pipeline, clc_consumer_state)
         else:
             clc_pipeline = None
             tile_scheduler = self.tile_scheduler_cls.create(tile_sched_params)
@@ -1242,10 +1246,6 @@ class FlashAttentionForwardSm100:
         kv_producer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Producer, self.kv_stage
         )
-        if const_expr(self.use_clc_scheduler):
-            clc_consumer_state = cutlass_pipeline.make_pipeline_state(
-                cutlass_pipeline.PipelineUserType.Consumer, self.sched_stages
-            )
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
@@ -1407,15 +1407,8 @@ class FlashAttentionForwardSm100:
                 )
 
 
-            if const_expr(self.use_clc_scheduler):
-                clc_pipeline.consumer_wait(clc_consumer_state)
-                work_tile = tile_scheduler.get_current_work()
-                clc_pipeline.consumer_release(clc_consumer_state)
-                clc_consumer_state.advance()
-            else:
-                tile_scheduler.prefetch_next_work()
-                tile_scheduler.advance_to_next_work()
-                work_tile = tile_scheduler.get_current_work()
+            tile_scheduler.prefetch_next_work()
+            work_tile = tile_scheduler.consumer_advance()
             # End of persistent scheduler loop
 
         pipeline_kv.producer_tail(kv_producer_state)
@@ -1534,10 +1527,6 @@ class FlashAttentionForwardSm100:
         )
         P_full_O_rescaled_phase = Int32(0)
 
-        if const_expr(self.use_clc_scheduler):
-            clc_consumer_state = cutlass_pipeline.make_pipeline_state(
-                cutlass_pipeline.PipelineUserType.Consumer, self.sched_stages
-            )
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
@@ -1708,14 +1697,7 @@ class FlashAttentionForwardSm100:
                 # End of GEMM_PV1(i_end) (P1 * Vi_end -> O1)
 
             # Advance to next tile
-            if const_expr(self.use_clc_scheduler):
-                clc_pipeline.consumer_wait(clc_consumer_state)
-                work_tile = tile_scheduler.get_current_work()
-                clc_pipeline.consumer_release(clc_consumer_state)
-                clc_consumer_state.advance()
-            else:
-                tile_scheduler.advance_to_next_work()
-                work_tile = tile_scheduler.get_current_work()
+            work_tile = tile_scheduler.consumer_advance()
         # End of persistent scheduler loop
 
         # We don't need pipeline_s_p_o.producer_tail() since there's no dangling mbarrier at the end
@@ -1809,10 +1791,6 @@ class FlashAttentionForwardSm100:
 
         warp_idx_in_wg = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
 
-        if const_expr(self.use_clc_scheduler):
-            clc_consumer_state = cutlass_pipeline.make_pipeline_state(
-                cutlass_pipeline.PipelineUserType.Consumer, self.sched_stages
-            )
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
@@ -2055,14 +2033,7 @@ class FlashAttentionForwardSm100:
             #         gLSE[tidx] = lse
 
             # Advance to next tile
-            if const_expr(self.use_clc_scheduler):
-                clc_pipeline.consumer_wait(clc_consumer_state)
-                work_tile = tile_scheduler.get_current_work()
-                clc_pipeline.consumer_release(clc_consumer_state)
-                clc_consumer_state.advance()
-            else:
-                tile_scheduler.advance_to_next_work()
-                work_tile = tile_scheduler.get_current_work()
+            work_tile = tile_scheduler.consumer_advance()
         # End of persistent scheduler loop
 
         # This is equivalent to pipeline_sm_stats.producer_tail
@@ -2264,10 +2235,6 @@ class FlashAttentionForwardSm100:
         o_corr_consumer_phase = Int32(0)
         corr_epi_producer_phase = Int32(1)
 
-        if const_expr(self.use_clc_scheduler):
-            clc_consumer_state = cutlass_pipeline.make_pipeline_state(
-                cutlass_pipeline.PipelineUserType.Consumer, self.sched_stages
-            )
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
@@ -2484,14 +2451,7 @@ class FlashAttentionForwardSm100:
                         gLSE[tidx] = lse
 
             # Advance to next tile
-            if const_expr(self.use_clc_scheduler):
-                clc_pipeline.consumer_wait(clc_consumer_state)
-                work_tile = tile_scheduler.get_current_work()
-                clc_pipeline.consumer_release(clc_consumer_state)
-                clc_consumer_state.advance()
-            else:
-                tile_scheduler.advance_to_next_work()
-                work_tile = tile_scheduler.get_current_work()
+            work_tile = tile_scheduler.consumer_advance()
         # End of persistent scheduler loop
 
         # This is equivalent to pipeline_o_epi.consumer_tail() for the correction warps
@@ -2702,10 +2662,6 @@ class FlashAttentionForwardSm100:
         tile_scheduler=None,
     ):
         epi_consumer_phase = Int32(0)
-        if const_expr(self.use_clc_scheduler):
-            clc_consumer_state = cutlass_pipeline.make_pipeline_state(
-                cutlass_pipeline.PipelineUserType.Consumer, self.sched_stages
-            )
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
@@ -2758,14 +2714,7 @@ class FlashAttentionForwardSm100:
                 epi_consumer_phase ^= 1
 
             # Advance to next tile
-            if const_expr(self.use_clc_scheduler):
-                clc_pipeline.consumer_wait(clc_consumer_state)
-                work_tile = tile_scheduler.get_current_work()
-                clc_pipeline.consumer_release(clc_consumer_state)
-                clc_consumer_state.advance()
-            else:
-                tile_scheduler.advance_to_next_work()
-                work_tile = tile_scheduler.get_current_work()
+            work_tile = tile_scheduler.consumer_advance()
 
     @cute.jit
     def clc_scheduler_warp(

@@ -66,6 +66,14 @@ class TileSchedulerProtocol(Protocol):
         """Prefetch next work tile info (optional, may be no-op)."""
         ...
 
+    def consumer_advance(self) -> WorkTileInfo:
+        """Consumer-side advance: move to next tile and return it.
+
+        For static schedulers: advance + get_current_work.
+        For CLC schedulers: pipeline wait/release + get_current_work + state advance.
+        """
+        ...
+
 
 @dataclass
 class TileSchedulerArguments(ParamsBase):
@@ -173,6 +181,10 @@ class SingleTileScheduler:
         assert mbarrier_addr is None
         self._is_first_block = False
 
+    def consumer_advance(self):
+        self.advance_to_next_work()
+        return self.get_current_work()
+
     def __extract_mlir_values__(self):
         values, self._values_pos = [], []
         for obj in [self.params, self._blk_coord]:
@@ -266,6 +278,10 @@ class StaticPersistentTileScheduler:
             self._tile_idx += cute.arch.grid_dim()[0]
         else:
             self._tile_idx += cute.arch.cluster_dim()[0]
+
+    def consumer_advance(self):
+        self.advance_to_next_work()
+        return self.get_current_work()
 
     def __extract_mlir_values__(self):
         values, self._values_pos = [], []
@@ -396,6 +412,10 @@ class SingleTileLPTScheduler:
         assert mbarrier_addr is None
         self._tile_idx = self.params.total_blocks
 
+    def consumer_advance(self):
+        self.advance_to_next_work()
+        return self.get_current_work()
+
     def __extract_mlir_values__(self):
         values, self._values_pos = [], []
         for obj in [self.params, self._tile_idx, self._split_idx]:
@@ -519,6 +539,10 @@ class SingleTileLPTBwdScheduler:
     def advance_to_next_work(self, *, loc=None, ip=None, mbarrier_addr=None):
         assert mbarrier_addr is None
         self._tile_idx = self.params.total_blocks
+
+    def consumer_advance(self):
+        self.advance_to_next_work()
+        return self.get_current_work()
 
     def __extract_mlir_values__(self):
         values, self._values_pos = [], []
@@ -746,6 +770,10 @@ class SingleTileVarlenScheduler:
         assert mbarrier_addr is None
         self._is_first_block = False
 
+    def consumer_advance(self):
+        self.advance_to_next_work()
+        return self.get_current_work()
+
     def __extract_mlir_values__(self):
         values, self._values_pos = [], []
         for obj in [self.params, self._tile_idx, self._split_idx]:
@@ -820,6 +848,8 @@ class CLCDynamicTileScheduler:
         params: Params,
         cutlass_scheduler,
         tile_idx: Int32,
+        clc_pipeline=None,
+        clc_consumer_state=None,
         *,
         loc=None,
         ip=None,
@@ -827,6 +857,8 @@ class CLCDynamicTileScheduler:
         self.params = params
         self._scheduler = cutlass_scheduler
         self._tile_idx = tile_idx
+        self._clc_pipeline = clc_pipeline
+        self._clc_consumer_state = clc_consumer_state
         self._loc = loc
         self._ip = ip
 
@@ -939,9 +971,27 @@ class CLCDynamicTileScheduler:
         assert mbarrier_addr is not None
         self._scheduler.advance_to_next_work(mbarrier_addr)
 
+    @cute.jit
+    def consumer_advance(self):
+        self._clc_pipeline.consumer_wait(self._clc_consumer_state)
+        work_tile = self.get_current_work()
+        self._clc_pipeline.consumer_release(self._clc_consumer_state)
+        self._clc_consumer_state.advance()
+        return work_tile
+
+    def set_clc_pipeline(self, clc_pipeline, clc_consumer_state):
+        self._clc_pipeline = clc_pipeline
+        self._clc_consumer_state = clc_consumer_state
+
     def __extract_mlir_values__(self):
         values, self._values_pos = [], []
-        for obj in [self.params, self._scheduler, self._tile_idx]:
+        for obj in [
+            self.params,
+            self._scheduler,
+            self._tile_idx,
+            self._clc_pipeline,
+            self._clc_consumer_state,
+        ]:
             obj_values = cutlass.extract_mlir_values(obj)
             values += obj_values
             self._values_pos.append(len(obj_values))
@@ -950,12 +1000,18 @@ class CLCDynamicTileScheduler:
     def __new_from_mlir_values__(self, values):
         obj_list = []
         for obj, n_items in zip(
-            [self.params, self._scheduler, self._tile_idx],
+            [
+                self.params,
+                self._scheduler,
+                self._tile_idx,
+                self._clc_pipeline,
+                self._clc_consumer_state,
+            ],
             self._values_pos,
         ):
             obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
             values = values[n_items:]
-        return CLCDynamicTileScheduler(*(tuple(obj_list)), loc=self._loc)
+        return CLCDynamicTileScheduler(*obj_list, loc=self._loc)
 
     def _debug_print(self, phase: str, block_idx, head_idx, batch_idx, split_idx, is_valid):
         linear_idx = (
