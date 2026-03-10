@@ -28,6 +28,7 @@ from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.softmax import Softmax
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
+from flash_attn.cute.block_sparsity import BlockSparseTensors
 from flash_attn.cute.pack_gqa import PackGQA
 from flash_attn.cute.named_barrier import NamedBarrierFwd
 from quack.cute_dsl_utils import ParamsBase
