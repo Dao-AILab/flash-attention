@@ -652,8 +652,7 @@ def make_fake_bwd_tensors(dtype, has_gqa, varlen_q, varlen_k):
 
 
 def _compile_bwd_preprocess(
-    arch, dtype, head_dim, head_dim_v, m_block_size, num_threads,
-    has_cuseqlens_q, has_seqused_q,
+    dtype, head_dim, head_dim_v, m_block_size, has_cuseqlens_q, has_seqused_q,
 ):
     """Compile bwd preprocess kernel using cute fake tensors (no real GPU tensors needed)."""
     mQ, mK, mV, mO, mdO, mdQ, mdK, mdV, mLSE, mLSElog2, mPdPsum, mdQaccum, mdKaccum, mdVaccum = make_fake_bwd_tensors(
@@ -663,9 +662,7 @@ def _compile_bwd_preprocess(
     batchp1 = cute.sym_int()
     mCuSeqlensQ = fake_tensor(Int32, (batchp1,), divisibility=1) if has_cuseqlens_q else None
     mSequsedQ = fake_tensor(Int32, (batch,), divisibility=1) if has_seqused_q else None
-    fa_bwd_pre = FlashAttentionBackwardPreprocess(
-        dtype, head_dim, head_dim_v, arch, m_block_size, num_threads=num_threads,
-    )
+    fa_bwd_pre = FlashAttentionBackwardPreprocess(dtype, head_dim, head_dim_v, m_block_size)
     return cute.compile(
         fa_bwd_pre, mO, mdO, mPdPsum, mLSE, mLSElog2, mdQaccum, mCuSeqlensQ, mSequsedQ,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
@@ -676,13 +673,12 @@ def _compile_bwd_preprocess(
 def _bwd_preprocess(
     out, dout, dpsum, lse, lse_log2, dq_accum,
     cu_seqlens_q, seqused_q,
-    arch, dtype, head_dim, head_dim_v, m_block_size, num_threads,
+    dtype, head_dim, head_dim_v, m_block_size,
 ):
     """Backward preprocess: compute (o * dout).sum(dim=-1), lse * log2_e, and zero out dq_accum."""
     is_varlen = cu_seqlens_q is not None
     compile_key = (
-        arch, dtype, head_dim, head_dim_v, m_block_size, num_threads,
-        is_varlen, seqused_q is not None,
+        dtype, head_dim, head_dim_v, m_block_size, is_varlen, seqused_q is not None,
     )
     if compile_key not in _bwd_preprocess.compile_cache:
         _bwd_preprocess.compile_cache[compile_key] = _compile_bwd_preprocess(*compile_key)
@@ -982,13 +978,12 @@ def _flash_attn_bwd(
     _bwd_preprocess(
         out, dout, dpsum, lse, lse_log2, dq_accum,
         cu_seqlens_q, seqused_q,
-        arch, dtype, head_dim, head_dim_v, m_block_size, num_threads,
+        dtype, head_dim, head_dim_v, m_block_size,
     )
 
     # NB num_threads application for 3 kernels
-    # There are pre, main, post processing kernels, currenlty num_threads is only actually
-    # used for the pre proc, and then we hard code to 384 for the main and post proc, and we do
-    # before cache key gen
+    # There are pre, main, post processing kernels, currenlty we hard code to 384 for the main and
+    # post proc, and we do before cache key gen
     num_threads = 384
 
     # Backward kernel: compute dk, dv, dq_accum.

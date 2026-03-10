@@ -15,7 +15,9 @@ to compute various things like n_block_min, n_block_max, etc.
 @dataclass(frozen=True)
 class SeqlenInfo:
     offset: cutlass.Int32
+    offset_padded: cutlass.Int32
     seqlen: cutlass.Int32
+    has_cu_seqlens: cutlass.Constexpr[bool] = False
 
     @staticmethod
     def create(
@@ -23,15 +25,40 @@ class SeqlenInfo:
         seqlen_static: cutlass.Int32,
         cu_seqlens: Optional[cute.Tensor] = None,
         seqused: Optional[cute.Tensor] = None,
+        tile: cutlass.Constexpr[int] = 128,
     ):
         offset = 0 if const_expr(cu_seqlens is None) else cu_seqlens[batch_idx]
+        offset_padded = (
+            0
+            if const_expr(cu_seqlens is None)
+            # Add divby so that the compiler knows the alignment when moving by offset_padded
+            else cute.assume((offset + batch_idx * tile) // tile * tile, divby=tile)
+        )
         if const_expr(seqused is not None):
             seqlen = seqused[batch_idx]
         elif const_expr(cu_seqlens is not None):
             seqlen = cu_seqlens[batch_idx + 1] - cu_seqlens[batch_idx]
         else:
             seqlen = seqlen_static
-        return SeqlenInfo(offset, seqlen)
+        return SeqlenInfo(offset, offset_padded, seqlen, has_cu_seqlens=cu_seqlens is not None)
+
+    def offset_batch(
+        self,
+        mT: cute.Tensor,
+        batch_idx: Int32,
+        dim: int,
+        padded: cutlass.Constexpr[bool] = False,
+        multiple: int = 1,
+    ) -> cute.Tensor:
+        """Offset a tensor by batch index. Seqlen dim is at position `dim`."""
+        if const_expr(not self.has_cu_seqlens):
+            idx = (None,) * dim + (batch_idx,) + (None,) * (cute.rank(mT) - 1 - dim)
+            return mT[idx]
+        else:
+            off = multiple * (self.offset if const_expr(not padded) else self.offset_padded)
+            offset = off if const_expr(cute.rank(mT.shape[0]) == 1) else (0, off)
+            idx = (offset,) + (None,) * (cute.rank(mT) - 1)
+            return cute.domain_offset(idx, mT)
 
 
 @dataclass(frozen=True)
@@ -118,7 +145,7 @@ class SeqlenInfoQK:
         else:
             offset_q = self.offset_q if const_expr(not padded) else self.padded_offset_q
             offset = offset_q if const_expr(cute.rank(mQ.shape[0]) == 1) else (0, offset_q)
-            idx = (offset,) + (0,) * (cute.rank(mQ) - 1)
+            idx = (offset,) + (None,) * (cute.rank(mQ) - 1)
             return cute.domain_offset(idx, mQ)
 
     def offset_batch_K(
@@ -134,5 +161,5 @@ class SeqlenInfoQK:
             return mK[idx]
         else:
             offset_k = self.offset_k if const_expr(not padded) else self.padded_offset_k
-            idx = (offset_k,) + (0,) * (cute.rank(mK) - 1)
+            idx = (offset_k,) + (None,) * (cute.rank(mK) - 1)
             return cute.domain_offset(idx, mK)

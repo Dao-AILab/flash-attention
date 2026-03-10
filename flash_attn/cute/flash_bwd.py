@@ -545,7 +545,7 @@ class FlashAttentionBackwardSm80:
                 mdPsum_cur = mdPsum[batch_idx, head_idx, None]
                 mdQaccum_cur = mdQaccum[batch_idx, head_idx, None]
             else:
-                padded_offset_q = seqlen.offset_q + batch_idx * self.m_block_size
+                padded_offset_q = seqlen.padded_offset_q
                 mQ_cur = cute.domain_offset((seqlen.offset_q, 0), mQ[None, head_idx, None])
                 mLSE_cur = cute.domain_offset((padded_offset_q,), mLSE[head_idx, None])
                 mdO_cur = cute.domain_offset((seqlen.offset_q, 0), mdO[None, head_idx, None])

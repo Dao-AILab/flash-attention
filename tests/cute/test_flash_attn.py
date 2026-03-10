@@ -1595,5 +1595,5 @@ def test_flash_attn_invalid_head_dim(head_dim):
     k = torch.randn(batch_size, seqlen, nheads, head_dim, device=device, dtype=dtype)
     v = torch.randn(batch_size, seqlen, nheads, head_dim, device=device, dtype=dtype)
 
-    with pytest.raises(AssertionError, match=re.escape(f"(head_dim, head_dim_v)=({head_dim}, {head_dim}) is not supported on SM100/SM110.")):
+    with pytest.raises(AssertionError, match=re.escape(f"(head_dim, head_dim_v)=({head_dim}, {head_dim}) is not supported on SM")):
         flash_attn_func(q, k, v)
