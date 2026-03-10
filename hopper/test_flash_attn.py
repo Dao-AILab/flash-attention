@@ -285,9 +285,9 @@ def test_flash_attn_output(
             assert (out - out_ref).abs().max().item() <= rtol * (out_pt - out_ref).abs().max().item() + fwd_atol
 
         if (
-            not DISABLE_BACKWARD 
-            and dtype != torch.float8_e4m3fn 
-            and not V_colmajor 
+            not DISABLE_BACKWARD
+            and dtype != torch.float8_e4m3fn
+            and not V_colmajor
             and not has_qv
             and not dv > 256
             and not attention_chunk != 0
@@ -418,7 +418,7 @@ def test_flash_attn_varlen_output(
     # batch_size = 2
     # nheads = 1
     # nheads_kv = nheads
-    
+
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
     dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
     if dtype == torch.float8_e4m3fn:
@@ -580,8 +580,8 @@ def test_flash_attn_varlen_output(
 
 
         if (
-            not DISABLE_BACKWARD 
-            and dtype != torch.float8_e4m3fn 
+            not DISABLE_BACKWARD
+            and dtype != torch.float8_e4m3fn
             and not has_qv
             and not dv > 256
             and not attention_chunk != 0
@@ -1261,3 +1261,69 @@ def test_flash3_bw_compatibility() -> None:
         "int attention_chunk=0, bool has_softcap=False, int num_splits=0, bool? pack_gqa=None, "
         "int sm_margin=0) -> Tensor"
     ))
+
+
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability()[0] < 9,
+    reason="FA3 requires SM90+",
+)
+@pytest.mark.parametrize("use_compile", [False, True], ids=["eager", "compile"])
+def test_no_grad_forward_slice_backward_varlen(use_compile):
+    from flash_attn.flash_attn_interface import no_grad_forward_slice_backward
+
+    d_model, nhead, head_dim = 64, 4, 16
+    seq_lengths = [8, 12, 16]
+    total = sum(seq_lengths)
+    pad = 4
+    device = "cuda"
+
+    cu_seqlens = torch.tensor(
+        [0] + list(torch.tensor(seq_lengths).cumsum(0).tolist()),
+        dtype=torch.int32, device=device,
+    )
+    max_seqlen = max(seq_lengths)
+
+    linear = torch.nn.Linear(d_model, 3 * d_model, device=device, dtype=torch.float16)
+    x_padded = torch.randn(total + pad, d_model, device=device, dtype=torch.float16)
+
+    # reference, no call to no_grad_forward_slice_backward
+    linear.zero_grad()
+    qkv_ref = linear(x_padded).view(-1, nhead * 3, head_dim)
+    q_ref, k_ref, v_ref = qkv_ref.chunk(3, dim=-2)
+    out_ref = flash_attn_varlen_func(
+        q_ref, k_ref, v_ref, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen,
+    )
+    loss_ref = out_ref[:cu_seqlens[-1]].abs().sum()
+
+    # poison gpu with NaNs
+    torch.cuda.empty_cache()
+    poison_shape = (total + pad, nhead, head_dim)
+    poisons = [torch.full(poison_shape, float('nan'), device=device, dtype=torch.float16)
+               for _ in range(8)]
+    del poisons
+
+    loss_ref.backward()
+    has_nan = torch.isnan(linear.weight.grad).any() or torch.isnan(linear.bias.grad).any()
+    assert has_nan
+
+    def run(x, cu_seqlens, max_seqlen):
+        qkv = linear(x).view(-1, nhead * 3, head_dim)
+        q, k, v = qkv.chunk(3, dim=-2)
+        q = no_grad_forward_slice_backward(q, cu_seqlens[-1])
+        k = no_grad_forward_slice_backward(k, cu_seqlens[-1])
+        v = no_grad_forward_slice_backward(v, cu_seqlens[-1])
+        out = flash_attn_varlen_func(
+            q, k, v, cu_seqlens, cu_seqlens, max_seqlen, max_seqlen,
+        )
+        return out
+
+    linear.zero_grad()
+    if use_compile:
+        run = torch.compile(run)
+
+    out = run(x_padded, cu_seqlens, max_seqlen)
+    loss = out[:cu_seqlens[-1]].abs().sum()
+    loss.backward()
+    assert torch.equal(loss, loss_ref)
+    assert not torch.isnan(linear.weight.grad).any()
+    assert not torch.isnan(linear.bias.grad).any()
