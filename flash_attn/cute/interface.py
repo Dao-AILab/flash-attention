@@ -31,6 +31,8 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
+from cutlass import Int32, Float32
+from quack.compile_utils import make_fake_tensor as fake_tensor
 from flash_attn.cute.cache_utils import get_jit_cache
 from flash_attn.cute.testing import is_fake_mode
 
@@ -114,6 +116,29 @@ def num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, max_splits):
     # NOTE: We should revisit this heuristic after persistence is supported for split KV.
     # Sometimes, it's ideal to over-schedule splits for better efficiency.
     return min(num_SMs // total_mblocks, max_splits, num_n_blocks)
+
+
+def _resolve_causal_local_window(causal, window_size_left, window_size_right, mask_mod=None):
+    """Resolve causal/local/window settings into canonical form.
+
+    Returns (causal, local, window_size_left, window_size_right).
+    """
+    if mask_mod is not None:
+        return False, False, window_size_left, window_size_right
+    if causal:
+        window_size_right = 0
+    if window_size_left is not None and window_size_right is not None and window_size_left + window_size_right < 0:
+        window_size_left = None
+        window_size_right = None
+    if window_size_left is not None or window_size_right is not None:
+        if window_size_left is None and window_size_right == 0:
+            causal, local = True, False
+            window_size_right = None
+        else:
+            causal, local = False, True
+    else:
+        local = False
+    return causal, local, window_size_left, window_size_right
 
 
 def _flash_attn_fwd(
@@ -275,21 +300,9 @@ def _flash_attn_fwd(
     dtype = torch2cute_dtype_map[q.dtype]
     use_block_sparsity = block_sparse_tensors is not None
 
-    if mask_mod is None:
-        if causal:
-            window_size_right = 0
-        if window_size_left is not None and window_size_right is not None and window_size_left + window_size_right < 0:
-            window_size_left = None
-            window_size_right = None
-        local = window_size_left is not None or window_size_right is not None
-        if window_size_left is not None or window_size_right is not None:
-            if window_size_left is None and window_size_right == 0:
-                causal, local = True, False
-                window_size_right = None
-            else:
-                causal, local = False, True
-    else:
-        causal, local = False, False
+    causal, local, window_size_left, window_size_right = _resolve_causal_local_window(
+        causal, window_size_left, window_size_right, mask_mod
+    )
 
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
@@ -297,14 +310,15 @@ def _flash_attn_fwd(
         if head_dim == head_dim_v == 128 and not causal and not local and not use_block_sparsity:
             n_block_size = 192
 
+    # TODO: fix GQA + SplitKV + non-varlen
+    if pack_gqa and num_splits != 1 and cu_seqlens_q is None:
+        pack_gqa = False
+
     if arch // 10 in [10, 11]:
         if (
             pack_gqa
             and (128 % qhead_per_kvhead != 0)
         ):
-            pack_gqa = False
-        # TODO: fix GQA + SplitKV + non-varlen
-        if pack_gqa and num_splits != 1 and cu_seqlens_q is None:
             pack_gqa = False
 
     if max_seqlen_q is None:
@@ -593,6 +607,92 @@ def _flash_attn_fwd(
 _flash_attn_fwd.compile_cache = get_jit_cache("fwd")
 
 
+def make_fake_bwd_tensors(dtype, has_gqa, varlen_q, varlen_k):
+    sym = cute.sym_int
+    # divisibility in elements: assumed_align_bytes = divisibility * dtype.width // 8
+    # For 16-byte align: fp16/bf16 → divisibility=8, float32 → divisibility=4
+    div = 128 // dtype.width  # 8 for fp16/bf16
+    # Shared sym_ints for dimensions that must match across tensors
+    b, seqlen_q, seqlen_k, h_q, d, d_v = sym(), sym(), sym(), sym(), sym(), sym()
+    h_kv = h_q if not has_gqa else sym()
+    seqlen_q_rounded, seqlen_k_rounded = sym(), sym()
+    seqlen_q_d_rounded, seqlen_k_d_rounded, seqlen_k_dv_rounded = sym(), sym(), sym()
+    total_q, total_k, total_q_rounded, total_k_rounded = sym(), sym(), sym(), sym()
+    total_q_d_rounded, total_k_d_rounded, total_k_dv_rounded = sym(), sym(), sym()
+    b_seqlenq = (b, seqlen_q) if not varlen_q else (total_q,)
+    b_seqlenk = (b, seqlen_k) if not varlen_k else (total_k,)
+    mQ = fake_tensor(dtype, (*b_seqlenq, h_q, d), divisibility=div)
+    mO = fake_tensor(dtype, (*b_seqlenq, h_q, d_v), divisibility=div)
+    mdO = fake_tensor(dtype, (*b_seqlenq, h_q, d_v), divisibility=div)
+    mK = fake_tensor(dtype, (*b_seqlenk, h_kv, d), divisibility=div)
+    mV = fake_tensor(dtype, (*b_seqlenk, h_kv, d_v), divisibility=div)
+    mdQ = fake_tensor(dtype, (*b_seqlenq, h_q, d), divisibility=div)
+    mdK = fake_tensor(dtype, (*b_seqlenk, h_kv, d), divisibility=div)
+    mdV = fake_tensor(dtype, (*b_seqlenk, h_kv, d_v), divisibility=div)
+    if not varlen_q:
+        mLSE = fake_tensor(Float32, (b, h_q, seqlen_q), divisibility=1)
+        mLSElog2 = fake_tensor(Float32, (b, h_q, seqlen_q_rounded), divisibility=4)
+        mPdPsum = fake_tensor(Float32, (b, h_q, seqlen_q_rounded), divisibility=4)
+        dQaccum = fake_tensor(Float32, (b, h_q, seqlen_q_d_rounded), divisibility=4)
+    else:
+        mLSE = fake_tensor(Float32, (h_q, total_q), divisibility=1)
+        mLSElog2 = fake_tensor(Float32, (h_q, total_q_rounded), divisibility=4)
+        mPdPsum = fake_tensor(Float32, (h_q, total_q_rounded), divisibility=4)
+        dQaccum = fake_tensor(Float32, (h_q, total_q_d_rounded), divisibility=4)
+    if not has_gqa:
+        mdKaccum, mdVaccum = None, None
+    else:
+        if not varlen_k:
+            mdKaccum = fake_tensor(Float32, (b, h_kv, seqlen_k_rounded), divisibility=4)
+            mdVaccum = fake_tensor(Float32, (b, h_kv, seqlen_k_dv_rounded), divisibility=4)
+        else:
+            mdKaccum = fake_tensor(Float32, (h_kv, total_k_rounded), divisibility=4)
+            mdVaccum = fake_tensor(Float32, (h_kv, total_k_dv_rounded), divisibility=4)
+    return mQ, mK, mV, mO, mdO, mdQ, mdK, mdV, mLSE, mLSElog2, mPdPsum, dQaccum, mdKaccum, mdVaccum
+
+
+def _compile_bwd_preprocess(
+    arch, dtype, head_dim, head_dim_v, m_block_size, num_threads,
+    has_cuseqlens_q, has_seqused_q,
+):
+    """Compile bwd preprocess kernel using cute fake tensors (no real GPU tensors needed)."""
+    mQ, mK, mV, mO, mdO, mdQ, mdK, mdV, mLSE, mLSElog2, mPdPsum, mdQaccum, mdKaccum, mdVaccum = make_fake_bwd_tensors(
+        dtype, has_gqa=True, varlen_q=has_cuseqlens_q, varlen_k=False
+    )
+    batch = mQ.shape[0] if not has_cuseqlens_q else cute.sym_int()
+    batchp1 = cute.sym_int()
+    mCuSeqlensQ = fake_tensor(Int32, (batchp1,), divisibility=1) if has_cuseqlens_q else None
+    mSequsedQ = fake_tensor(Int32, (batch,), divisibility=1) if has_seqused_q else None
+    fa_bwd_pre = FlashAttentionBackwardPreprocess(
+        dtype, head_dim, head_dim_v, arch, m_block_size, num_threads=num_threads,
+    )
+    return cute.compile(
+        fa_bwd_pre, mO, mdO, mPdPsum, mLSE, mLSElog2, mdQaccum, mCuSeqlensQ, mSequsedQ,
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--enable-tvm-ffi",
+    )
+
+
+def _bwd_preprocess(
+    out, dout, dpsum, lse, lse_log2, dq_accum,
+    cu_seqlens_q, seqused_q,
+    arch, dtype, head_dim, head_dim_v, m_block_size, num_threads,
+):
+    """Backward preprocess: compute (o * dout).sum(dim=-1), lse * log2_e, and zero out dq_accum."""
+    is_varlen = cu_seqlens_q is not None
+    compile_key = (
+        arch, dtype, head_dim, head_dim_v, m_block_size, num_threads,
+        is_varlen, seqused_q is not None,
+    )
+    if compile_key not in _bwd_preprocess.compile_cache:
+        _bwd_preprocess.compile_cache[compile_key] = _compile_bwd_preprocess(*compile_key)
+    if not is_fake_mode():
+        _bwd_preprocess.compile_cache[compile_key](
+            out, dout, dpsum, lse, lse_log2, dq_accum, cu_seqlens_q, seqused_q
+        )
+
+
+_bwd_preprocess.compile_cache = get_jit_cache("bwd_pre")
 def _flash_attn_bwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -639,18 +739,9 @@ def _flash_attn_bwd(
 
     num_head, head_dim = q.shape[-2:]
 
-    if causal:
-        window_size_right = 0
-    if window_size_left is not None and window_size_right is not None and window_size_left + window_size_right < 0:
-        window_size_left = None
-        window_size_right = None
-    local = window_size_left is not None or window_size_right is not None
-    if local:
-        if window_size_left is None and window_size_right == 0:
-            causal, local = True, False
-            window_size_right = None
-        else:
-            causal, local = False, True
+    causal, local, window_size_left, window_size_right = _resolve_causal_local_window(
+        causal, window_size_left, window_size_right
+    )
 
     if arch // 10 == 9:
         m_block_size = 80 if not causal else 64
@@ -888,62 +979,11 @@ def _flash_attn_bwd(
         dV_semaphore = None
 
     # Preprocess kernel: compute (o * dout).sum(dim=-1), lse * log2_e, and zero out dq_accum.
-    compile_key_pre = (
-        arch,
-        dtype,
-        head_dim,
-        head_dim_v,
-        m_block_size,
-        num_threads,
-        cu_seqlens_q is None,
-        seqused_q is None,
-        get_broadcast_dims(out),
-        get_broadcast_dims(dout),
+    _bwd_preprocess(
+        out, dout, dpsum, lse, lse_log2, dq_accum,
+        cu_seqlens_q, seqused_q,
+        arch, dtype, head_dim, head_dim_v, m_block_size, num_threads,
     )
-    if compile_key_pre not in _flash_attn_bwd.compile_cache_pre:
-        o_tensor, do_tensor = [to_cute_tensor(t) for t in (out, dout)]
-        dq_accum_tensor, dpsum_tensor, lse_log2_tensor = [
-            to_cute_tensor(t) for t in (dq_accum, dpsum, lse_log2)
-        ]
-        lse_tensor = to_cute_tensor(lse, assumed_align=4)
-        cu_seqlens_q_tensor, seqused_q_tensor = [
-            to_cute_tensor(t, assumed_align=4) if t is not None else None
-            for t in (cu_seqlens_q, seqused_q)
-        ]
-        fa_bwd_pre = FlashAttentionBackwardPreprocess(
-            dtype,
-            head_dim,
-            head_dim_v,
-            arch,
-            m_block_size,
-            num_threads=num_threads,
-        )
-        # TODO: check @can_implement
-        _flash_attn_bwd.compile_cache_pre[compile_key_pre] = cute.compile(
-            fa_bwd_pre,
-            o_tensor,
-            do_tensor,
-            dpsum_tensor,
-            lse_tensor,
-            lse_log2_tensor,
-            dq_accum_tensor,
-            cu_seqlens_q_tensor,
-            seqused_q_tensor,
-            current_stream,
-            options="--enable-tvm-ffi",
-        )
-    if not is_fake_mode():
-        _flash_attn_bwd.compile_cache_pre[compile_key_pre](
-            out,
-            dout,
-            dpsum,
-            lse,
-            lse_log2,
-            dq_accum,
-            cu_seqlens_q,
-            seqused_q,
-            current_stream,
-        )
 
     # NB num_threads application for 3 kernels
     # There are pre, main, post processing kernels, currenlty num_threads is only actually
@@ -1339,7 +1379,6 @@ def _flash_attn_bwd(
     return dq, dk, dv
 
 
-_flash_attn_bwd.compile_cache_pre = get_jit_cache("bwd_pre")
 _flash_attn_bwd.compile_cache = get_jit_cache("bwd")
 _flash_attn_bwd.compile_cache_post = get_jit_cache("bwd_post")
 
