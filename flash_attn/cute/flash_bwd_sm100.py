@@ -3654,6 +3654,9 @@ class FlashAttentionBackwardSm100:
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
 
+        if const_expr(not self.deterministic):
+            cute.arch.cp_async_bulk_wait_group(0, read=True)
+
     @cute.jit
     def epilogue_dKV(
         self,

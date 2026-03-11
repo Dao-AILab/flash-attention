@@ -911,9 +911,6 @@ def _flash_attn_bwd(
         pack_gqa = qhead_per_kvhead > 1
     # pack_gqa backward not yet supported in bwd
     pack_gqa = False
-    if arch // 10 not in [10, 11]:
-        assert deterministic is False, "bwd deterministic only supported for sm100/sm110 for now"
-
     if score_mod is not None:
         assert score_mod_bwd is not None, "score_mod_bwd is required when score_mod is provided"
         assert softcap == 0.0, "softcap and score_mod are mutually exclusive (different log2 scaling)"
@@ -1077,6 +1074,7 @@ def _flash_attn_bwd(
             AtomLayoutNdKV,
             AtomLayoutMdQ,
             V_in_regs,
+            deterministic,
             cu_seqlens_q is None,
             cu_seqlens_k is None,
             seqused_q is None,
@@ -1172,18 +1170,19 @@ def _flash_attn_bwd(
                 head_dim_v,
                 qhead_per_kvhead,
                 causal,
-                m_block_size,
-                n_block_size,
-                num_stages_Q,
-                num_stages_dO,
-                num_stages_PdS,
-                SdP_swapAB,
-                dKV_swapAB,
-                dQ_swapAB,
-                AtomLayoutMSdP,
-                AtomLayoutNdKV,
-                AtomLayoutMdQ,
-                num_threads,
+                deterministic=deterministic,
+                tile_m=m_block_size,
+                tile_n=n_block_size,
+                Q_stage=num_stages_Q,
+                dO_stage=num_stages_dO,
+                PdS_stage=num_stages_PdS,
+                SdP_swapAB=SdP_swapAB,
+                dKV_swapAB=dKV_swapAB,
+                dQ_swapAB=dQ_swapAB,
+                AtomLayoutMSdP=AtomLayoutMSdP,
+                AtomLayoutNdKV=AtomLayoutNdKV,
+                AtomLayoutMdQ=AtomLayoutMdQ,
+                num_threads=num_threads,
                 V_in_regs=V_in_regs,
                 score_mod=score_mod,
                 score_mod_bwd=score_mod_bwd,

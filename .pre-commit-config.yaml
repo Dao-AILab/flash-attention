@@ -8,6 +8,7 @@ repos:
         exclude: &cute_exclude |
           (?x)^flash_attn/cute/(
             flash_bwd|
+            flash_bwd_sm90|
             flash_fwd|
             flash_fwd_sm100|
             interface|
