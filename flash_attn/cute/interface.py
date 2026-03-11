@@ -733,6 +733,57 @@ def _bwd_preprocess(
 
 
 _bwd_preprocess.compile_cache = get_jit_cache("bwd_pre")
+
+
+def _compile_bwd_postprocess(
+    dtype, hdim, block_size, num_threads, atom_layout, swap_ab,
+    has_cuseqlens_q, has_seqused_q,
+    use_2cta_instrs, cluster_size, arch,
+):
+    """Compile bwd postprocess kernel using cute fake tensors."""
+    mQ, mK, mV, mO, mdO, mdQ, mdK, mdV, mLSE, mLSElog2, mPdPsum, mdQaccum, mdKaccum, mdVaccum = make_fake_bwd_tensors(
+        dtype, has_gqa=True, varlen_q=has_cuseqlens_q, varlen_k=False
+    )
+    batch = mQ.shape[0] if not has_cuseqlens_q else cute.sym_int()
+    batchp1 = cute.sym_int()
+    mCuSeqlensQ = fake_tensor(Int32, (batchp1,), divisibility=1) if has_cuseqlens_q else None
+    mSeqUsedQ = fake_tensor(Int32, (batch,), divisibility=1) if has_seqused_q else None
+    fa_bwd_post = FlashAttentionBackwardPostprocess(
+        dtype, hdim, arch, block_size, num_threads, atom_layout, swap_ab,
+        use_2cta_instrs=use_2cta_instrs,
+        cluster_size=cluster_size,
+    )
+    return cute.compile(
+        fa_bwd_post, mdQaccum, mdQ, Float32(0.0), mCuSeqlensQ, mSeqUsedQ,
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--enable-tvm-ffi",
+    )
+
+
+def _bwd_postprocess_convert(
+    accum, output, scale,
+    cu_seqlens, seqused,
+    arch, dtype, hdim, block_size, num_threads,
+    atom_layout, swap_ab,
+    use_2cta_instrs=False, cluster_size=1,
+):
+    """Backward postprocess: convert float32 accumulator to bf16/fp16 output."""
+    compile_key = (
+        dtype, hdim, block_size, num_threads, atom_layout, swap_ab,
+        cu_seqlens is not None, seqused is not None,
+        use_2cta_instrs, cluster_size, arch,
+    )
+    if compile_key not in _bwd_postprocess_convert.compile_cache:
+        _bwd_postprocess_convert.compile_cache[compile_key] = _compile_bwd_postprocess(*compile_key)
+    if not is_fake_mode():
+        _bwd_postprocess_convert.compile_cache[compile_key](
+            accum, output, scale, cu_seqlens, seqused,
+        )
+
+
+_bwd_postprocess_convert.compile_cache = get_jit_cache("bwd_post")
+
+
 def _flash_attn_bwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1025,7 +1076,11 @@ def _flash_attn_bwd(
     # NB num_threads application for 3 kernels
     # There are pre, main, post processing kernels, currenlty we hard code to 384 for the main and
     # post proc, and we do before cache key gen
-    num_threads = 384
+    # hdim 192 needs 3 MMA warp groups (192/64=3), so 4 total WGs → 512 threads
+    if arch // 10 == 9 and head_dim > 128 and head_dim <= 192:
+        num_threads = 512
+    else:
+        num_threads = 384
 
     # Backward kernel: compute dk, dv, dq_accum.
     score_mod_hash = utils.hash_callable(score_mod) if score_mod else False
@@ -1269,156 +1324,43 @@ def _flash_attn_bwd(
             normalized_block_sparse_tensors[:4] if normalized_block_sparse_tensors is not None else None,
         )
 
-    num_threads = 256 if arch // 10 == 9 else 128
-    # Postprocess kernel: convert dq_accum from float32 to dq in bf16/fp16
-    compile_key_post = (
-        arch,
-        dtype,
-        head_dim,
-        m_block_size,
-        num_threads,
-        AtomLayoutMdQ,
-        dQ_swapAB,
-        cu_seqlens_q is None,
-        seqused_q is None,
-        use_2cta_instrs,
-        1, # no cluster for tile_m
-        get_broadcast_dims(dq_accum),
-        get_broadcast_dims(dq),
-    )
-    if compile_key_post not in _flash_attn_bwd.compile_cache_post:
-        dq_accum_tensor = to_cute_tensor(dq_accum)
-        dq_tensor = to_cute_tensor(dq)
-        cu_seqlens_q_tensor, seqused_q_tensor = [
-            to_cute_tensor(t, assumed_align=4) if t is not None else None
-            for t in (cu_seqlens_q, seqused_q)
-        ]
-        fa_bwd_post = FlashAttentionBackwardPostprocess(
-            dtype, head_dim, arch, m_block_size, num_threads, AtomLayoutMdQ, dQ_swapAB,
-            use_2cta_instrs=use_2cta_instrs,
-        )
-        # TODO: check @can_implement
-        _flash_attn_bwd.compile_cache_post[compile_key_post] = cute.compile(
-            fa_bwd_post,
-            dq_accum_tensor,
-            dq_tensor,
-            softmax_scale,
-            cu_seqlens_q_tensor,
-            seqused_q_tensor,
-            current_stream,
-            options="--enable-tvm-ffi",
-        )
+    # hdim 192 with swapAB needs 3 WGs (192/64=3) in postprocess too
+    if arch // 10 == 9 and head_dim > 128 and head_dim <= 192:
+        num_threads_post = 384
+    else:
+        num_threads_post = 256 if arch // 10 == 9 else 128
 
-    if not is_fake_mode():
-        _flash_attn_bwd.compile_cache_post[compile_key_post](
-            dq_accum,
-            dq,
-            softmax_scale,
-            cu_seqlens_q,
-            seqused_q,
-            current_stream,
-        )
+    # Postprocess: convert dq_accum from float32 to dq in bf16/fp16
+    _bwd_postprocess_convert(
+        dq_accum, dq, softmax_scale,
+        cu_seqlens_q, seqused_q,
+        arch, dtype, head_dim, m_block_size, num_threads_post,
+        AtomLayoutMdQ, dQ_swapAB,
+        use_2cta_instrs=use_2cta_instrs, cluster_size=1,
+    )
 
     if dKV_postprocess:
-        # Postprocess kernel: convert dk_accum & dv_accum from float32 to bf16/fp16
-        compile_key_post = (
-            arch,
-            dtype,
-            head_dim,
-            n_block_size,
-            num_threads,
-            AtomLayoutNdKV,
-            dKV_swapAB,
-            cu_seqlens_k is None,
-            seqused_k is None,
-            False, # even for 2cta, is split along hdim, so always False
-            cluster_size, # cluster is for tile_n
-            get_broadcast_dims(dk_accum),
-            get_broadcast_dims(dk),
+        # Postprocess: convert dk_accum from float32 to dk in bf16/fp16
+        _bwd_postprocess_convert(
+            dk_accum, dk, softmax_scale,
+            cu_seqlens_k, seqused_k,
+            arch, dtype, head_dim, n_block_size, num_threads_post,
+            AtomLayoutNdKV, dKV_swapAB,
+            cluster_size=cluster_size,
         )
-        if compile_key_post not in _flash_attn_bwd.compile_cache_post:
-            dk_accum_tensor = to_cute_tensor(dk_accum)
-            dk_tensor = to_cute_tensor(dk)
-            cu_seqlens_k_tensor, seqused_k_tensor = [
-                to_cute_tensor(t, assumed_align=4) if t is not None else None
-                for t in (cu_seqlens_k, seqused_k)
-            ]
-            fa_bwd_post = FlashAttentionBackwardPostprocess(
-                dtype, head_dim, arch, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB,
-                cluster_size=cluster_size,
-            )
-            # TODO: check @can_implement
-            _flash_attn_bwd.compile_cache_post[compile_key_post] = cute.compile(
-                fa_bwd_post,
-                dk_accum_tensor,
-                dk_tensor,
-                softmax_scale,
-                cu_seqlens_k_tensor,
-                seqused_k_tensor,
-                current_stream,
-                options="--enable-tvm-ffi",
-            )
-        if not is_fake_mode():
-            _flash_attn_bwd.compile_cache_post[compile_key_post](
-                dk_accum,
-                dk,
-                softmax_scale,
-                cu_seqlens_k,
-                seqused_k,
-                current_stream,
-            )
-        compile_key_post = (
-            arch,
-            dtype,
-            head_dim_v,
-            n_block_size,
-            num_threads,
-            AtomLayoutNdKV,
-            dKV_swapAB,
-            cu_seqlens_k is None,
-            seqused_k is None,
-            False,
-            cluster_size,
-            get_broadcast_dims(dv_accum),
-            get_broadcast_dims(dv),
+        # Postprocess: convert dv_accum from float32 to dv in bf16/fp16
+        _bwd_postprocess_convert(
+            dv_accum, dv, 1.0,
+            cu_seqlens_k, seqused_k,
+            arch, dtype, head_dim_v, n_block_size, num_threads_post,
+            AtomLayoutNdKV, dKV_swapAB,
+            cluster_size=cluster_size,
         )
-        if compile_key_post not in _flash_attn_bwd.compile_cache_post:
-            dv_accum_tensor = to_cute_tensor(dv_accum)
-            dv_tensor = to_cute_tensor(dv)
-            cu_seqlens_k_tensor, seqused_k_tensor = [
-                to_cute_tensor(t, assumed_align=4) if t is not None else None
-                for t in (cu_seqlens_k, seqused_k)
-            ]
-            fa_bwd_post = FlashAttentionBackwardPostprocess(
-                dtype, head_dim_v, arch, n_block_size, num_threads, AtomLayoutNdKV, dKV_swapAB,
-                cluster_size=cluster_size,
-            )
-            # TODO: check @can_implement
-            _flash_attn_bwd.compile_cache_post[compile_key_post] = cute.compile(
-                fa_bwd_post,
-                dv_accum_tensor,
-                dv_tensor,
-                cutlass.Float32(1.0),
-                cu_seqlens_k_tensor,
-                seqused_k_tensor,
-                current_stream,
-                options="--enable-tvm-ffi",
-            )
-        if not is_fake_mode():
-            _flash_attn_bwd.compile_cache_post[compile_key_post](
-                dv_accum,
-                dv,
-                1.0,
-                cu_seqlens_k,
-                seqused_k,
-                current_stream,
-            )
 
     return dq, dk, dv
 
 
 _flash_attn_bwd.compile_cache = get_jit_cache("bwd")
-_flash_attn_bwd.compile_cache_post = get_jit_cache("bwd_post")
 
 
 class FlashAttnFunc(torch.autograd.Function):
