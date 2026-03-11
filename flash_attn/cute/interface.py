@@ -1638,6 +1638,63 @@ def flash_attn_varlen_func(
     )
 
 
+def _compile_fwd_combine(
+    dtype, dtype_partial, head_dim, tile_m, k_block_size, log_max_splits,
+    has_cu_seqlens, has_seqused, has_lse, has_varlen_batch_idx,
+):
+    """Compile fwd combine kernel using cute fake tensors (no real GPU tensors needed)."""
+    sym = cute.sym_int
+    div = 128 // dtype_partial.width  # 16-byte alignment in elements
+
+    fa_combine = FlashAttentionForwardCombine(
+        dtype=dtype,
+        dtype_partial=dtype_partial,
+        head_dim=head_dim,
+        tile_m=tile_m,
+        k_block_size=k_block_size,
+        log_max_splits=log_max_splits,
+    )
+    if not fa_combine.can_implement(
+        dtype, dtype_partial, head_dim, tile_m, k_block_size, log_max_splits,
+        num_threads=256,
+    ):
+        raise RuntimeError(
+            "FlashAttention combine kernel cannot be implemented with given parameters"
+        )
+
+    if has_cu_seqlens:
+        # Varlen: (num_splits, total_q, nheads, headdim)
+        num_splits, total_q, nheads = sym(), sym(), sym()
+        mO_partial = fake_tensor(dtype_partial, (num_splits, total_q, nheads, head_dim), divisibility=div)
+        mLSE_partial = fake_tensor(Float32, (num_splits, total_q, nheads), divisibility=1, leading_dim=1)
+        mO = fake_tensor(dtype, (total_q, nheads, head_dim), divisibility=div)
+        mLSE = fake_tensor(Float32, (total_q, nheads), divisibility=1, leading_dim=0) if has_lse else None
+    else:
+        # Batched: (num_splits, batch, seqlen, nheads, headdim)
+        num_splits, batch, seqlen, nheads = sym(), sym(), sym(), sym()
+        mO_partial = fake_tensor(dtype_partial, (num_splits, batch, seqlen, nheads, head_dim), divisibility=div)
+        mLSE_partial = fake_tensor(Float32, (num_splits, batch, seqlen, nheads), divisibility=1, leading_dim=2)
+        mO = fake_tensor(dtype, (batch, seqlen, nheads, head_dim), divisibility=div)
+        mLSE = fake_tensor(Float32, (batch, seqlen, nheads), divisibility=1, leading_dim=1) if has_lse else None
+        batch = mO_partial.shape[1]
+
+    batch_for_1d = batch if not has_cu_seqlens else sym()
+    batchp1 = sym()
+    mCuSeqlens = fake_tensor(Int32, (batchp1,), divisibility=1) if has_cu_seqlens else None
+    mSeqused = fake_tensor(Int32, (batch_for_1d,), divisibility=1) if has_seqused else None
+    mNumSplitsDynamic = None  # Not parametrized in compile_key
+    mVarlenBatchIdx = fake_tensor(Int32, (batch_for_1d,), divisibility=1) if has_varlen_batch_idx else None
+    mSemaphore = None  # Not parametrized in compile_key
+
+    return cute.compile(
+        fa_combine,
+        mO_partial, mLSE_partial, mO, mLSE,
+        mCuSeqlens, mSeqused, mNumSplitsDynamic, mVarlenBatchIdx, mSemaphore,
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--enable-tvm-ffi",
+    )
+
+
 def _flash_attn_fwd_combine(
     out_partial: torch.Tensor,
     lse_partial: torch.Tensor,
@@ -1646,6 +1703,7 @@ def _flash_attn_fwd_combine(
     cu_seqlens: Optional[torch.Tensor] = None,
     seqused: Optional[torch.Tensor] = None,
     num_splits_dynamic_ptr: Optional[torch.Tensor] = None,
+    varlen_batch_idx: Optional[torch.Tensor] = None,
     semaphore_to_reset: Optional[torch.Tensor] = None,
 ) -> None:
     """Forward combine kernel for split attention computation.
@@ -1669,27 +1727,12 @@ def _flash_attn_fwd_combine(
     Returns:
         None
     """
-    # Input validation
-    assert out_partial.dim() in [4, 5], "out_partial must have 4 or 5 dimensions"
-    assert lse_partial.dim() in [3, 4], "lse_partial must have 3 or 4 dimensions"
     assert out_partial.dtype in [torch.float16, torch.bfloat16, torch.float32], (
         "out_partial must be fp16, bf16, or fp32"
     )
-    assert lse_partial.dtype == torch.float32, "lse_partial must be fp32"
     assert out_partial.is_cuda and lse_partial.is_cuda, "tensors must be on CUDA device"
-    assert out_partial.stride(-1) == 1, "out_partial must be contiguous in the last dimension"
-    assert lse_partial.stride(-2) == 1, "lse_partial must be contiguous in the seqlen dimension"
-    assert lse_partial.shape == out_partial.shape[:-1]
-
     # Determine if this is variable length based on dimensions
     is_varlen = out_partial.dim() == 4
-
-    # Validate output tensor shapes and types
-    assert out.shape == out_partial.shape[1:], "out shape mismatch"
-    if lse is not None:
-        assert lse.shape == lse_partial.shape[1:], "lse shape mismatch"
-        assert lse.dtype == torch.float32, "lse must be fp32"
-
     # Validate optional tensors
     for t, name in [
         (cu_seqlens, "cu_seqlens"),
@@ -1697,10 +1740,8 @@ def _flash_attn_fwd_combine(
         (num_splits_dynamic_ptr, "num_splits_dynamic_ptr"),
     ]:
         if t is not None:
-            assert t.dtype == torch.int32, f"{name} must be int32"
             assert t.is_cuda, f"{name} must be on CUDA device"
             assert t.is_contiguous(), f"{name} must be contiguous"
-
     head_dim = out_partial.shape[-1]
     num_splits = out_partial.shape[0]
     assert num_splits <= 256
@@ -1709,101 +1750,37 @@ def _flash_attn_fwd_combine(
     k_block_size = 64 if head_dim <= 64 else 128
     # We want kBlockM to be as small as possible to maximize parallelism.
     # E.g., if hdim is 64, we want kBlockM to be 16 so that we can use 256 threads, each reading 4 elements (floats).
-    m_block_size = 8 if k_block_size % 128 == 0 else (16 if k_block_size % 64 == 0 else 32)
+    tile_m = 8 if k_block_size % 128 == 0 else (16 if k_block_size % 64 == 0 else 32)
     log_max_splits = max(math.ceil(math.log2(num_splits)), 4)
-    if m_block_size == 8:
+    if tile_m == 8:
         # If kBlockM == 8 then the minimum number of splits is 32.
         # TODO: we can deal w this by using 128 threads instead
         log_max_splits = max(log_max_splits, 5)
 
-    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-
     # Create combine kernel configuration
     dtype = torch2cute_dtype_map[out.dtype]
     dtype_partial = torch2cute_dtype_map[out_partial.dtype]
-
     compile_key = (
         dtype,
         dtype_partial,
         head_dim,
-        m_block_size,
+        tile_m,
         k_block_size,
         log_max_splits,
         cu_seqlens is not None,
         seqused is not None,
         lse is not None,
+        varlen_batch_idx is not None,
     )
-
     if compile_key not in _flash_attn_fwd_combine.compile_cache:
-        out_partial_tensor = to_cute_tensor(
-            out_partial, leading_dim=4 if not is_varlen else 3
-        )
-        lse_partial_tensor = to_cute_tensor(
-            lse_partial, assumed_align=4, leading_dim=lse_partial.ndim - 2
-        )
-        out_tensor = to_cute_tensor(out, leading_dim=3 if not is_varlen else 2)
-        lse_tensor = (
-            to_cute_tensor(lse, assumed_align=4, leading_dim=lse.ndim - 2)
-            if lse is not None
-            else None
-        )
-
-        optional_tensors = [
-            to_cute_tensor(t, assumed_align=4, leading_dim=0)
-            if t is not None
-            else None
-            for t in (cu_seqlens, seqused, num_splits_dynamic_ptr, semaphore_to_reset)
-        ]
-        cu_seqlens_tensor, seqused_tensor, num_splits_dynamic_tensor, semaphore_tensor = (
-            optional_tensors
-        )
-        fa_combine = FlashAttentionForwardCombine(
-            dtype=dtype,
-            dtype_partial=dtype_partial,
-            head_dim=head_dim,
-            m_block_size=m_block_size,
-            k_block_size=k_block_size,
-            log_max_splits=log_max_splits,
-        )
-
-        # Check if implementation is supported
-        if not fa_combine.can_implement(
-            dtype,
-            dtype_partial,
-            head_dim,
-            m_block_size,
-            k_block_size,
-            log_max_splits,
-            num_threads=256,
-        ):
-            raise RuntimeError(
-                "FlashAttention combine kernel cannot be implemented with given parameters"
-            )
-
-        _flash_attn_fwd_combine.compile_cache[compile_key] = cute.compile(
-            fa_combine,
-            out_partial_tensor,
-            lse_partial_tensor,
-            out_tensor,
-            lse_tensor,
-            cu_seqlens_tensor,
-            seqused_tensor,
-            num_splits_dynamic_tensor,
-            semaphore_tensor,
-            current_stream,
-            options="--enable-tvm-ffi",
+        _flash_attn_fwd_combine.compile_cache[compile_key] = _compile_fwd_combine(
+            *compile_key
         )
     if not is_fake_mode():
         _flash_attn_fwd_combine.compile_cache[compile_key](
-            out_partial,
-            lse_partial,
-            out,
-            lse,
-            cu_seqlens,
-            seqused,
-            num_splits_dynamic_ptr,
+            out_partial, lse_partial, out, lse,
+            cu_seqlens, seqused, num_splits_dynamic_ptr, varlen_batch_idx,
             semaphore_to_reset,
-            current_stream,
         )
 
 
@@ -1817,6 +1794,7 @@ def flash_attn_combine(
     out_dtype: Optional[torch.dtype] = None,
     cu_seqlens: Optional[torch.Tensor] = None,
     seqused: Optional[torch.Tensor] = None,
+    varlen_batch_idx: Optional[torch.Tensor] = None,
     return_lse: bool = True,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
     """Flash Attention combine function for split attention computation.
@@ -1836,6 +1814,9 @@ def flash_attn_combine(
         out_dtype: Optional output dtype. If None, will use fp16/bf16 based on input.
         cu_seqlens: Cumulative sequence lengths for variable length sequences
         seqused: Used sequence lengths for each batch
+        varlen_batch_idx: Optional mapping from virtual batch index to real batch index
+            (int32 tensor of shape (batch_size,)). Used by persistent tile schedulers
+            that reorder batch processing for load balancing.
         return_lse: Whether to return the combined LSE tensor. Default is True.
 
     Returns:
@@ -1852,32 +1833,19 @@ def flash_attn_combine(
     """
     # Input validation
     assert out_partial.dim() in [4, 5], "out_partial must have 4 or 5 dimensions"
-    assert lse_partial.dim() in [3, 4], "lse_partial must have 3 or 4 dimensions"
-    assert out_partial.dtype == torch.float32, "out_partial must be fp32 (from accumulation)"
-    assert lse_partial.dtype == torch.float32, "lse_partial must be fp32"
-
     # Determine if this is variable length based on dimensions
     is_varlen = out_partial.dim() == 4
-
     if is_varlen:
         # Variable length: (num_splits, total_q, num_heads, head_size)
         num_splits, total_q, num_heads, head_size = out_partial.shape
-        assert lse_partial.shape == (num_splits, total_q, num_heads), (
-            "lse_partial shape mismatch for varlen"
-        )
         batch_size = 1  # Treat as single batch for varlen
         seqlen = total_q
     else:
         # Regular batched: (num_splits, batch_size, seqlen, num_heads, head_size)
         num_splits, batch_size, seqlen, num_heads, head_size = out_partial.shape
-        assert lse_partial.shape == (num_splits, batch_size, seqlen, num_heads), (
-            "lse_partial shape mismatch"
-        )
-
     # Determine output dtype
     if out_dtype is None:
         out_dtype = out_partial.dtype
-
     # Create output if not provided
     device = out_partial.device
     if out is None:
@@ -1887,20 +1855,15 @@ def flash_attn_combine(
             out = torch.empty(
                 batch_size, seqlen, num_heads, head_size, dtype=out_dtype, device=device
             )
-
     # Create lse output only if requested
     if return_lse:
         if is_varlen:
-            lse = torch.empty(num_heads, total_q, dtype=torch.float32, device=device).transpose(
-                0, 1
-            )
+            lse = torch.empty(num_heads, total_q, dtype=torch.float32, device=device)
         else:
-            lse = torch.empty(
-                batch_size, num_heads, seqlen, dtype=torch.float32, device=device
-            ).transpose(1, 2)
+            lse = torch.empty(batch_size, num_heads, seqlen, dtype=torch.float32, device=device)
+        lse = lse.transpose(-1, -2)
     else:
         lse = None
-
     _flash_attn_fwd_combine(
         out_partial,
         lse_partial,
@@ -1908,5 +1871,6 @@ def flash_attn_combine(
         lse,
         cu_seqlens,
         seqused,
+        varlen_batch_idx=varlen_batch_idx,
     )
     return out, lse
