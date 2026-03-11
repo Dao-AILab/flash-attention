@@ -630,6 +630,12 @@ def _flash_attn_fwd(
                 f"Unsupported compute capability: {arch}. Supported: 9.x, 10.x, 11.x, 12.x"
             )
         # TODO: check @can_implement
+        # SM80 kernel takes (stream, softmax_scale); SM90/SM100/SM110 take (softmax_scale, stream)
+        # SM80's softmax_scale is Optional[Float32] — explicit wrapping needed
+        if arch // 10 == 12:
+            compile_arg6, compile_arg7 = current_stream, cutlass.Float32(softmax_scale) if softmax_scale is not None else None
+        else:
+            compile_arg6, compile_arg7 = softmax_scale, current_stream
         _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
             fa_fwd,
             q_tensor,
@@ -637,8 +643,8 @@ def _flash_attn_fwd(
             v_tensor,
             o_tensor,
             lse_tensor,
-            softmax_scale,
-            current_stream,
+            compile_arg6,
+            compile_arg7,
             cu_seqlens_q_tensor,
             cu_seqlens_k_tensor,
             seqused_q_tensor,
@@ -661,14 +667,20 @@ def _flash_attn_fwd(
     # - Return "fake" output tensors, which could be needed in follow-up fake operations
     # Thus, we skip the actual kernel invocation here.
     if not is_fake_mode():
+        # SM80 kernel takes (stream, softmax_scale); SM90/SM100/SM110 take (softmax_scale, stream)
+        if arch // 10 == 12:
+            invoke_arg6, invoke_arg7 = current_stream, softmax_scale
+        else:
+            invoke_arg6, invoke_arg7 = softmax_scale, current_stream
+        # Note: invocation doesn't need Float32 wrapping — compiled kernel handles raw float
         _flash_attn_fwd.compile_cache[compile_key](
             q.detach(),
             k.detach(),
             v.detach(),
             out.detach() if not is_split_kv else out_partial,
             lse_partial if is_split_kv else lse,
-            softmax_scale,
-            current_stream,
+            invoke_arg6,
+            invoke_arg7,
             cu_seqlens_q,
             cu_seqlens_k,
             seqused_q,
