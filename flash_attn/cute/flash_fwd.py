@@ -617,11 +617,18 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         mV: cute.Tensor,
         mO: cute.Tensor,
         mLSE: Optional[cute.Tensor],
+        softmax_scale: Float32,
         stream: cuda.CUstream,
         softmax_scale: Optional[Float32] = None,
+        mCuSeqlensQ: Optional[cute.Tensor] = None,
+        mCuSeqlensK: Optional[cute.Tensor] = None,
+        mSeqUsedQ: Optional[cute.Tensor] = None,
+        mSeqUsedK: Optional[cute.Tensor] = None,
+        mPageTable: Optional[cute.Tensor] = None,
         window_size_left: Optional[Int32] = None,
         window_size_right: Optional[Int32] = None,
         learnable_sink: Optional[cute.Tensor] = None,
+        blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors=None,
     ):
         """Configures and launches the flash attention kernel.
@@ -631,7 +638,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         """
         assert learnable_sink is None, "Learnable sink is not supported in this kernel"
         self._check_type(
-            *(t.element_type if t is not None else None for t in (mQ, mK, mV, mO, mLSE))
+            *(t.element_type if t is not None else None for t in (mQ, mK, mV, mO, mLSE, mCuSeqlensQ, mCuSeqlensK, mSeqUsedQ, mSeqUsedK))
         )
         tiled_mma_qk, tiled_mma_pv = self._get_tiled_mma()
         self.num_mma_threads = tiled_mma_pv.size
@@ -729,7 +736,15 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             window_size_right,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
         )
-        seqlen = SeqlenInfoQK.create(seqlen_q_static=mQ.shape[0], seqlen_k_static=mK.shape[0])
+        seqlen = SeqlenInfoQK.create(
+            batch_idx=batch_size,
+            seqlen_q_static=mQ.shape[0],
+            seqlen_k_static=mK.shape[0],
+            mCuSeqlensQ=None,
+            mCuSeqlensK=None,
+            mSeqUsedQ=None,
+            mSeqUsedK=None,
+        )
         n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
         # TODO: return early if n_block_max == 0
         # if self.is_causal:
@@ -918,18 +933,20 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         mask = AttentionMask(
             self.tile_m,
             self.tile_n,
-            seqlen.seqlen_q,
-            seqlen.seqlen_k,
+            seqlen,
             window_size_left,
             window_size_right,
             self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
         )
         mask_fn = partial(
             mask.apply_mask,
+            batch_idx=batch_size,
+            head_idx=num_head,
             m_block=m_block,
             thr_mma=thr_mma_qk,
             mask_causal=self.is_causal,
             mask_local=self.is_local,
+            aux_tensors=aux_tensors,
             fastdiv_mods=fastdiv_mods if const_expr(self.mask_mod is not None) else None,
         )
 
@@ -941,8 +958,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             smem_pipe_read,
             smem_pipe_write,
             is_first_n_block=True,
-            check_inf=True,
-            mask_fn=partial(mask_fn, mask_seqlen=True),
+            seqlen=seqlen,
+            mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=True),
         )
         smem_pipe_read = self.advance_pipeline(smem_pipe_read)
         smem_pipe_write = self.advance_pipeline(smem_pipe_write)
@@ -957,15 +974,18 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                     n_block,
                     smem_pipe_read,
                     smem_pipe_write,
-                    check_inf=True,
-                    mask_fn=partial(mask_fn, mask_seqlen=False),
+                    is_first_n_block=True,
+                    seqlen=seqlen,
+                    mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=True),
                 )
                 smem_pipe_read = self.advance_pipeline(smem_pipe_read)
                 smem_pipe_write = self.advance_pipeline(smem_pipe_write)
         # The remaining iterations have no masking
         for n_tile in cutlass.range(n_block, unroll=1):
             compute_one_n_block(
-                n_block - n_tile - 1, smem_pipe_read, smem_pipe_write, check_inf=True
+                n_block - n_tile - 1, smem_pipe_read, smem_pipe_write,
+                seqlen=seqlen, is_first_n_block=False,
+                mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=False)
             )
             smem_pipe_read = self.advance_pipeline(smem_pipe_read)
             smem_pipe_write = self.advance_pipeline(smem_pipe_write)
