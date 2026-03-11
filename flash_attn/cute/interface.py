@@ -43,6 +43,7 @@ if os.environ.get("CUTE_DSL_PTXAS_PATH", None) is not None:
 
 
 from flash_attn.cute import utils
+from flash_attn.cute import logging as fa_logging
 from flash_attn.cute.cute_dsl_utils import (
     to_cute_tensor, to_cute_aux_tensor, get_aux_tensor_metadata, get_broadcast_dims,
 )
@@ -436,6 +437,7 @@ def _flash_attn_fwd(
         page_size not in [None, 128],  # paged KV non-TMA
         use_2cta_instrs,
         q_subtile_factor,
+        fa_logging.get_fa_log_level(),
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
         (
