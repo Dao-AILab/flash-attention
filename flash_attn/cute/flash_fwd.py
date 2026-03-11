@@ -30,6 +30,7 @@ from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute.pack_gqa import PackGQA
 from flash_attn.cute.named_barrier import NamedBarrierFwd
+from flash_attn.cute.block_sparsity import BlockSparseTensors
 
 
 class FlashAttentionForwardBase:
