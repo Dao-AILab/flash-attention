@@ -90,7 +90,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             warpgroup.OperandMajorMode.K,
             warpgroup.OperandMajorMode.K,
             Float32,
-            atom_layout_mnk=(self.tile_m // 64, 1, 1),  # Might need (1, 2, 1) for hdim 512
+            atom_layout_mnk=(self.tile_m // 64, 1, 1),
             tiler_mn=(64, self.tile_n),
         )
         tiled_mma_pv = sm90_utils_basic.make_trivial_tiled_mma(

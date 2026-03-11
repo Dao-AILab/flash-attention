@@ -21,6 +21,7 @@
 
 import os
 import math
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import Optional, Tuple, Callable
 
@@ -88,6 +89,42 @@ def _validate_head_dims(head_dim: int, head_dim_v: int, compute_capability: int,
             f"(head_dim, head_dim_v)=({head_dim}, {head_dim_v}) is not supported on SM100/SM110. "
             f"head_dim and head_dim_v must be between 8 and 128 and divisible by {alignment}, or (192, 128) for DeepSeek."
         )
+
+
+@dataclass(frozen=True)
+class FwdConfig:
+    m_block_size: int
+    n_block_size: int
+    mma_pv_is_rs: bool
+    intra_wg_overlap: bool
+
+
+def _tile_size_fwd_sm90(head_dim, head_dim_v, is_causal, is_local, use_block_sparsity):
+    """Return FwdConfig for SM90 forward.
+
+    Tile sizes and flags based on tile_size_fwd_sm90 in hopper/tile_size.h, adjusted
+    for the Python kernel's different register/smem tradeoffs (benchmarked on H100 SXM).
+    """
+    if head_dim <= 64:
+        # C++: 192×192 non-causal, 192×128 causal/local.
+        # Python: 192×128 RS+OL is consistently best across seqlens.
+        return FwdConfig(192, 128, True, True)
+    elif head_dim <= 96:
+        # C++: 192×144 noRS+OL for all cases.
+        # Python: RS is catastrophic with 192× tiles (~300 vs ~600 TFLOPS).
+        # noRS+OL is always required. Causal: 192×128 slightly better short seqlen.
+        if is_causal or is_local:
+            return FwdConfig(192, 128, False, True)
+        else:
+            return FwdConfig(192, 144, False, True)
+    elif head_dim <= 128:
+        return FwdConfig(128, 128, True, True)
+    elif head_dim <= 192:
+        tile_n = 96 if is_local else (128 if head_dim_v <= 128 else 112)
+        return FwdConfig(128, tile_n, True, True)
+    else:  # hdim 256
+        tile_n = 64 if is_local else 80
+        return FwdConfig(128, tile_n, True, True)
 
 
 def maybe_contiguous(x):
@@ -158,11 +195,9 @@ def _flash_attn_fwd(
     window_size_left: Optional[int] = None,
     window_size_right: Optional[int] = None,
     learnable_sink: Optional[torch.Tensor] = None,
-    # m_block_size: int = 128,
-    # n_block_size: int = 64,
-    # num_threads: int = 128,
-    m_block_size: int = 128,
-    n_block_size: int = 128,
+    tile_mn: Optional[Tuple[int, int]] = None,
+    mma_pv_is_rs: Optional[bool] = None,
+    intra_wg_overlap: Optional[bool] = None,
     num_threads: int = 384,
     num_splits: int = 1,
     pack_gqa: Optional[bool] = None,
@@ -306,19 +341,26 @@ def _flash_attn_fwd(
 
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
-    if arch // 10 == 9:  # TODO: tune block size according to hdim.
-        if head_dim == head_dim_v == 128 and not causal and not local and not use_block_sparsity:
-            n_block_size = 192
+    fwd_cfg = FwdConfig(128, 128, True, True)  # default
+    if tile_mn is None:
+        if arch // 10 in [8, 12]:
+            fwd_cfg = FwdConfig(128, 64, True, True)  # SM80, should tune
+        elif arch // 10 == 9:
+            fwd_cfg = _tile_size_fwd_sm90(head_dim, head_dim_v, causal, local, use_block_sparsity)
+    else:
+        fwd_cfg = FwdConfig(tile_mn[0], tile_mn[1], fwd_cfg.mma_pv_is_rs, fwd_cfg.intra_wg_overlap)
+    tile_m, tile_n = fwd_cfg.m_block_size, fwd_cfg.n_block_size
+    if mma_pv_is_rs is None:
+        mma_pv_is_rs = fwd_cfg.mma_pv_is_rs
+    if intra_wg_overlap is None:
+        intra_wg_overlap = fwd_cfg.intra_wg_overlap
 
     # TODO: fix GQA + SplitKV + non-varlen
     if pack_gqa and num_splits != 1 and cu_seqlens_q is None:
         pack_gqa = False
 
     if arch // 10 in [10, 11]:
-        if (
-            pack_gqa
-            and (128 % qhead_per_kvhead != 0)
-        ):
+        if pack_gqa and (128 % qhead_per_kvhead != 0):
             pack_gqa = False
 
     if max_seqlen_q is None:
@@ -327,14 +369,14 @@ def _flash_attn_fwd(
         max_seqlen_k = seqlen_k
     seqlen_q_packgqa = max_seqlen_q * qhead_per_kvhead
     if arch // 10 == 10:
-        q_stage = 2 if seqlen_q_packgqa > m_block_size else 1
+        q_stage = 2 if seqlen_q_packgqa > tile_m else 1
     else:
         q_stage = 1
 
     if num_splits < 1:
-        m_block_size_effective = q_stage * m_block_size
-        seqlen_k_loaded = max_seqlen_k if not local else max(0, min(max_seqlen_k, window_size_right + window_size_left + 1 + m_block_size))
-        num_n_blocks = (seqlen_k_loaded + n_block_size - 1) // n_block_size
+        m_block_size_effective = q_stage * tile_m
+        seqlen_k_loaded = max_seqlen_k if not local else max(0, min(max_seqlen_k, window_size_right + window_size_left + 1 + tile_m))
+        num_n_blocks = (seqlen_k_loaded + tile_n - 1) // tile_n
         num_m_blocks = (seqlen_q_packgqa + m_block_size_effective - 1) // m_block_size_effective
         total_mblocks = batch_size * num_head_kv * num_m_blocks
         num_splits = num_splits_heuristic(
@@ -360,7 +402,7 @@ def _flash_attn_fwd(
         and page_size in [None, 128]
         and int(math.ceil(head_dim / 16) * 16) == 128
         and int(math.ceil(head_dim_v / 16) * 16) == 128
-        and seqlen_q_packgqa > 2 * m_block_size
+        and seqlen_q_packgqa > 2 * tile_m
     )
 
     # hash score and mask mods for compile cache
@@ -414,7 +456,7 @@ def _flash_attn_fwd(
             num_head=num_head,
             seqlen_q=seqlen_q,
             seqlen_k=seqlen_k,
-            block_size=(m_block_size, n_block_size),
+            block_size=(tile_m, tile_n),
             q_stage=q_stage,
         )
     if aux_tensors is not None:
@@ -442,8 +484,8 @@ def _flash_attn_fwd(
         window_size_left is not None,
         window_size_right is not None,
         learnable_sink is not None,
-        m_block_size,
-        n_block_size,
+        tile_m,
+        tile_n,
         q_stage,
         num_threads,
         is_split_kv,
@@ -452,6 +494,8 @@ def _flash_attn_fwd(
         page_size not in [None, 128],  # paged KV non-TMA
         use_2cta_instrs,
         q_subtile_factor,
+        mma_pv_is_rs,
+        intra_wg_overlap,
         fa_logging.get_fa_log_level(),
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
@@ -503,14 +547,14 @@ def _flash_attn_fwd(
                 is_causal=causal,
                 is_local=local,
                 pack_gqa=pack_gqa,
-                tile_m=m_block_size,
-                tile_n=n_block_size,
+                tile_m=tile_m,
+                tile_n=tile_n,
                 # num_stages=1,
                 num_stages=2,
                 num_threads=num_threads,
                 Q_in_regs=False,
-                intra_wg_overlap=True,
-                mma_pv_is_rs=True,
+                intra_wg_overlap=intra_wg_overlap,
+                mma_pv_is_rs=mma_pv_is_rs,
                 mask_mod=mask_mod,
                 score_mod=score_mod,
                 has_aux_tensors=aux_tensors is not None,
@@ -525,8 +569,8 @@ def _flash_attn_fwd(
                 is_local=local,
                 is_split_kv=is_split_kv,
                 pack_gqa=pack_gqa,
-                m_block_size=m_block_size,
-                n_block_size=n_block_size,
+                tile_m=tile_m,
+                tile_n=tile_n,
                 q_stage=q_stage,
                 is_persistent=not causal
                     and not local
