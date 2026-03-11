@@ -974,7 +974,6 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                     n_block,
                     smem_pipe_read,
                     smem_pipe_write,
-                    is_first_n_block=True,
                     seqlen=seqlen,
                     mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=True),
                 )
