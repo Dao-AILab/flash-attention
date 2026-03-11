@@ -617,7 +617,6 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         mV: cute.Tensor,
         mO: cute.Tensor,
         mLSE: Optional[cute.Tensor],
-        softmax_scale: Float32,
         stream: cuda.CUstream,
         softmax_scale: Optional[Float32] = None,
         mCuSeqlensQ: Optional[cute.Tensor] = None,
