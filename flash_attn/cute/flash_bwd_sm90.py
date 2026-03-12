@@ -341,6 +341,8 @@ class FlashAttentionBackwardSm90:
             )
         )
 
+        self.is_varlen_q = mCuSeqlensQ is not None or mSeqUsedQ is not None
+
         mQ, mK, mV, mdO, mLSE, mdPsum, mdQaccum, mdK, mdV = [
             assume_tensor_aligned(t) for t in (mQ, mK, mV, mdO, mLSE, mdPsum, mdQaccum, mdK, mdV)
         ]
@@ -441,45 +443,29 @@ class FlashAttentionBackwardSm90:
         else:
             tma_atom_dK = tma_atom_dV = tma_tensor_dK = tma_tensor_dV = None
 
-        is_varlen = mCuSeqlensQ is not None or mSeqUsedQ is not None
-        if const_expr(is_varlen):
+        if const_expr(mCuSeqlensK is not None or mSeqUsedK is not None):
             TileScheduler = SingleTileVarlenScheduler
         elif const_expr(self.deterministic):
             TileScheduler = SingleTileLPTBwdScheduler
         else:
             TileScheduler = SingleTileScheduler
         self.spt = (self.is_causal or self.is_local) and self.deterministic
-        sched_cu_seqlens = mCuSeqlensK if const_expr(mCuSeqlensK is not None) else mCuSeqlensQ
-        sched_seqused = mSeqUsedK if const_expr(mSeqUsedK is not None) else mSeqUsedQ
-        num_batch = (
-            sched_cu_seqlens.shape[0] - 1
-            if const_expr(sched_cu_seqlens is not None)
-            else (
-                sched_seqused.shape[0]
-                if const_expr(sched_seqused is not None)
-                else cute.size(mQ.shape[3])
-            )
-        )
-        total_q = (
-            cute.size(mK.shape[0])
-            if const_expr(is_varlen)
-            else cute.size(mQ.shape[0]) * cute.size(mQ.shape[3])
-        )
-        tile_shape_mn = (
-            (self.tile_n, self.tile_m) if const_expr(is_varlen) else (self.tile_m, self.tile_n)
-        )
         tile_sched_args = TileSchedulerArguments(
             cute.ceil_div(cute.size(mK.shape[0]), self.tile_n),
             cute.size(mQ.shape[2]),
-            num_batch,
+            cute.size(mK.shape[3])
+            if const_expr(mCuSeqlensK is None)
+            else cute.size(mCuSeqlensK.shape[0] - 1),  # num_batch
             1,  # num_splits
-            cute.size(mK.shape[0]),
-            mQ.shape[1],
-            mV.shape[1],
-            total_q=total_q,
-            tile_shape_mn=tile_shape_mn,
-            mCuSeqlensQ=sched_cu_seqlens,
-            mSeqUsedQ=sched_seqused,
+            cute.size(mQ.shape[0]),  # pass seqlen_q or total_q for seqlen_k
+            mQ.shape[1],  # headdim
+            mV.shape[1],  # headdim_v
+            total_q=cute.size(mK.shape[0])
+            if const_expr(mCuSeqlensK is not None)
+            else cute.size(mK.shape[0]) * cute.size(mK.shape[3]),
+            tile_shape_mn=(self.tile_n, self.tile_m),  # Swapping the role of Q & K
+            mCuSeqlensQ=mCuSeqlensK,
+            mSeqUsedQ=mSeqUsedK,
             qhead_per_kvhead_packgqa=1,
             element_size=self.dtype.width // 8,
             is_persistent=False,
@@ -853,7 +839,7 @@ class FlashAttentionBackwardSm90:
                 if const_expr(not self.use_block_sparsity):
                     total_m_block_cnt = m_block_max - m_block_min
                     process_tile = (
-                        const_expr(not self.is_local and not seqlen.has_cu_seqlens_q)
+                        const_expr(not self.is_local and not self.is_varlen_q)
                         or m_block_min < m_block_max
                     )
                 else:
@@ -1206,7 +1192,7 @@ class FlashAttentionBackwardSm90:
 
             if const_expr(not self.use_block_sparsity):
                 process_tile = (
-                    const_expr(not self.is_local and not seqlen.has_cu_seqlens_q)
+                    const_expr(not self.is_local and not self.is_varlen_q)
                     or m_block_min < m_block_max
                 )
             else:
@@ -1627,7 +1613,7 @@ class FlashAttentionBackwardSm90:
             m_block_min, m_block_max = block_info.get_m_block_min_max(seqlen, n_block)
             if const_expr(not self.use_block_sparsity):
                 process_tile = (
-                    const_expr(not self.is_local and not seqlen.has_cu_seqlens_q)
+                    const_expr(not self.is_local and not self.is_varlen_q)
                     or m_block_min < m_block_max
                 )
                 loop_count = m_block_max - m_block_min
