@@ -34,10 +34,10 @@ using namespace cute;
 // reduce the size of the compiled binary.
 // Adapted from https://github.com/vllm-project/vllm/blob/4d29e91be84d27ca313d657eee92c067439a4c23/csrc/quantization/cutlass_w8a8/scaled_mm_c2x.cuh#L55
 template <typename Kernel>
-struct enable_sm90_or_later : Kernel {
+struct enable_sm90 : Kernel {
     template <typename... Args>
     CUTLASS_DEVICE void operator()(Args&&... args) {
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ == 900)
         Kernel::operator()(std::forward<Args>(args)...);
 #endif
     }
