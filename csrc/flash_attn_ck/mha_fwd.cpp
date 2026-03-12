@@ -109,6 +109,7 @@ fmha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                          nullptr, // cu_seqlen_k_ptr
                          nullptr, // block_scale_seqstart_q_ptr
                          nullptr, // block_scale_seqstart_k_ptr
+                         nullptr, // seqstart_v_scale_ptr
                          nullptr, // sink_ptr
                          seqlen_q,
                          seqlen_k,
@@ -126,6 +127,9 @@ fmha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                          stride_alibi_slopes,
                          stride_randval,
                          stride_o,
+                         0, // stride_q_descale
+                         0, // stride_k_descale
+                         0, // stride_v_descale
                          nhead_stride_q,
                          nhead_stride_k,
                          nhead_stride_v,
