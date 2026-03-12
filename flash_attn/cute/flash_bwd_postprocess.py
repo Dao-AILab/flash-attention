@@ -2,7 +2,7 @@
 # A reimplementation of https://github.com/Dao-AILab/flash-attention/blob/main/hopper/flash_bwd_postprocess_kernel.h
 # from Cutlass C++ to Cute-DSL.
 import math
-from typing import Callable, Optional, Type, Literal
+from typing import Callable, Optional, Type
 
 import cuda.bindings.driver as cuda
 

@@ -12,7 +12,6 @@ from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
 
 
 class FlashAttentionBackwardSm120(FlashAttentionBackwardSm80):
-
     @staticmethod
     def can_implement(
         dtype,

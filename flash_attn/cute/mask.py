@@ -11,6 +11,7 @@ from quack import layout_utils
 import flash_attn.cute.utils as utils
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 
+
 @cute.jit
 def mask_r2p(X: cute.Tensor, col_limit: Int32, arch: int = 90, rank1: bool = False) -> None:
     # Bit manipulation, compiles down to the R2P instruction
@@ -79,9 +80,7 @@ def mask_r2p_lambda(
         Returns a 32-bit bitmask for the chunk. Bit i set means column
         chunk_idx * chunk_size + i is KEPT; bit i clear means masked to -inf.
     """
-    ncol = const_expr(
-        cute.size(X.shape[cute.rank(X) - 1]) if not rank1 else cute.size(X.shape)
-    )
+    ncol = const_expr(cute.size(X.shape[cute.rank(X) - 1]) if not rank1 else cute.size(X.shape))
     # 32-column chunks. The mask_gen_fn returns a Uint32 bitmask (1=keep).
     CHUNK_SIZE = MASK_R2P_CHUNK_SIZE
     for s in cutlass.range_constexpr(cute.ceil_div(ncol, CHUNK_SIZE)):
@@ -95,7 +94,6 @@ def mask_r2p_lambda(
             else:
                 for r in cutlass.range_constexpr(cute.size(X.shape[0])):
                     X[r, c] = X[r, c] if in_bound else -Float32.inf
-
 
 
 @cute.jit
@@ -699,9 +697,7 @@ class AttentionMask:
                         mask = r2p_bitmask_above(row_limit, s)
 
                         if const_expr(self.window_size_left is not None):
-                            row_limit_bottom = row_to_r2p_idx(
-                                row_limit_bot + 1, num_rep, num_wg
-                            )
+                            row_limit_bottom = row_to_r2p_idx(row_limit_bot + 1, num_rep, num_wg)
                             mask = mask & r2p_bitmask_below(row_limit_bottom, s)
 
                         return mask
