@@ -465,7 +465,23 @@ def shuffle_sync(
 
 
 @dsl_user_op
-def shr_u32(val: cutlass.Uint32, shift: cutlass.Uint32, *, loc=None, ip=None) -> cutlass.Uint32:
+def shl_u32(val: cutlass.Uint32, shift: cutlass.Uint32, *, loc=None, ip=None) -> cutlass.Uint32:
+    """
+    Left-shift val by shift bits using PTX shl.b32 (sign-agnostic).
+
+    Named ``shl_u32`` (not ``shl_b32``) because python type annotations
+    distinguish signed/unsigned.
+
+    PTX semantics (§9.7.8.8): "Shift amounts greater than the register width N
+    are clamped to N."  So ``shl.b32 d, a, 32`` is well-defined and yields 0.
+
+    This differs from C/C++ and LLVM IR, where shifting by >= the type width is
+    undefined behavior.  CuTeDSL compiles through MLIR -> LLVM IR, so a plain
+    Python-level ``Uint32(x) << Uint32(n)`` inherits LLVM's UB: the optimizer
+    may treat the result as poison and eliminate dependent code.  Inline PTX
+    bypasses the LLVM IR shift entirely — the instruction is emitted verbatim
+    into PTX where clamping makes it safe for all shift amounts.
+    """
     return cutlass.Uint32(
         llvm.inline_asm(
             T.i32(),
@@ -473,7 +489,31 @@ def shr_u32(val: cutlass.Uint32, shift: cutlass.Uint32, *, loc=None, ip=None) ->
                 cutlass.Uint32(val).ir_value(loc=loc, ip=ip),
                 cutlass.Uint32(shift).ir_value(loc=loc, ip=ip),
             ],
-            "shr.s32 $0, $1, $2;",
+            "shl.b32 $0, $1, $2;",
+            "=r,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def shr_u32(val: cutlass.Uint32, shift: cutlass.Uint32, *, loc=None, ip=None) -> cutlass.Uint32:
+    """
+    Unsigned right-shift val by shift bits using PTX shr.u32 (zero-fills).
+
+    See ``shl_u32`` docstring for why inline PTX is used instead of plain
+    CuTeDSL shift operators (LLVM shift-by-type-width UB).
+    """
+    return cutlass.Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                cutlass.Uint32(val).ir_value(loc=loc, ip=ip),
+                cutlass.Uint32(shift).ir_value(loc=loc, ip=ip),
+            ],
+            "shr.u32 $0, $1, $2;",
             "=r,r,r",
             has_side_effects=False,
             is_align_stack=False,
