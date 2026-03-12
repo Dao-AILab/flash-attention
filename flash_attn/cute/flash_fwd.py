@@ -666,12 +666,15 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             LSE_layout_transpose = [2, 1, 0] if const_expr(mCuSeqlensQ is None) else [1, 0]
             mLSE = cute.make_tensor(mLSE.iterator, cute.select(mLSE.layout, mode=LSE_layout_transpose))
         # TileScheduler for varlen, simple grid for non-varlen
-        if const_expr(mCuSeqlensQ is not None):
+        if const_expr(mCuSeqlensQ is not None or mSeqUsedQ is not None):
             TileScheduler = SingleTileVarlenScheduler
-            num_batch = mCuSeqlensQ.shape[0] - 1
         else:
             TileScheduler = SingleTileScheduler
-            num_batch = mQ.shape[3]
+        num_batch = (
+            mCuSeqlensQ.shape[0] - 1
+            if const_expr(mCuSeqlensQ is not None)
+            else mQ.shape[3]
+        )
         tile_sched_args = TileSchedulerArguments(
             num_block=cute.ceil_div(mQ.shape[0], self.tile_m),
             num_head=cute.size(mQ.shape[2]),
@@ -680,7 +683,9 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             seqlen_k=0,
             headdim=mQ.shape[1],
             headdim_v=mV.shape[1],
-            total_q=cute.size(mQ.shape[0]),
+            total_q=cute.size(mQ.shape[0])
+            if const_expr(mCuSeqlensQ is not None)
+            else cute.size(mQ.shape[0]) * cute.size(mQ.shape[3]),
             tile_shape_mn=(self.tile_m, self.tile_n),
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
             mCuSeqlensQ=mCuSeqlensQ,
