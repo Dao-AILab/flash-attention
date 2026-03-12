@@ -1,0 +1,110 @@
+# 计算不跳过的KV序列长度(noSkipKvS)的逻辑图解
+
+## 1. 基本概念定义
+
+| 符号 | 含义 |
+|------|------|
+| kvSeqlen | KV缓存中的总序列长度（包含历史生成的所有token） |
+| qSeqlen | 当前查询序列的长度（新生成的token） |
+| diffS | KV序列与查询序列的长度差值 (diffS = kvSeqlen - qSeqlen) |
+| qSBlockIdx | 查询序列分块的索引 |
+| curQSBlockTile | 查询序列分块的大小 |
+| noSkipKvS | 当前查询分块需要计算注意力权重的有效KV序列长度 |
+
+## 2. 序列长度关系示意图
+
+```
+KV序列（历史+当前）: [历史token 1] [历史token 2] ... [历史token diffS] [当前token 1] [当前token 2] ... [当前token qSeqlen]
+                     |<------------------- kvSeqlen ----------------->|
+                     |<---- diffS ----->|<------------ qSeqlen -------->|
+
+查询序列:             [当前token 1] [当前token 2] ... [当前token qSeqlen]
+                     |<------------ qSeqlen -------->|
+```
+
+## 3. 查询序列分块示意图
+
+```
+查询序列: [token 1] [token 2] [token 3] [token 4] [token 5] [token 6] [token 7] [token 8]
+         |<------- block 0 ------->|<------- block 1 ------->|<------- block 2 ------->|
+         qSBlockIdx=0              qSBlockIdx=1              qSBlockIdx=2
+         curQSBlockTile=3          curQSBlockTile=3          curQSBlockTile=2 (最后一个分块可能较小)
+```
+
+## 4. 有效KV序列长度计算过程
+
+### 情况1：无掩码 (maskType == 0U)
+```
+noSkipKvS = kvSeqlen  # 使用完整的KV序列长度
+```
+
+### 情况2：有掩码 (maskType != 0U) 如因果掩码
+
+#### 步骤1：计算diffS
+```
+diffS = kvSeqlen - qSeqlen
+```
+
+#### 步骤2：计算当前查询分块对应的有效KV序列长度
+```
+noSkipKvS = (qSBlockIdx + 1U) * curQSBlockTile + diffS
+```
+
+#### 步骤3：确保不超过实际KV序列长度
+```
+noSkipKvS = min(kvSeqlen, noSkipKvS)
+```
+
+## 5. 示例图解
+
+假设：
+- kvSeqlen = 10 (历史5个token + 当前5个token)
+- qSeqlen = 5 (当前5个token)
+- diffS = 10 - 5 = 5
+- curQSBlockTile = 2
+- 总共有3个查询分块 (qSBlockIdx=0,1,2)
+
+### 查询分块0 (qSBlockIdx=0)
+```
+noSkipKvS = (0 + 1) * 2 + 5 = 2 + 5 = 7
+noSkipKvS = min(10, 7) = 7
+
+KV序列使用范围: [历史1-5] [当前1-2] 共7个token
+```
+
+### 查询分块1 (qSBlockIdx=1)
+```
+noSkipKvS = (1 + 1) * 2 + 5 = 4 + 5 = 9
+noSkipKvS = min(10, 9) = 9
+
+KV序列使用范围: [历史1-5] [当前1-4] 共9个token
+```
+
+### 查询分块2 (qSBlockIdx=2)
+```
+noSkipKvS = (2 + 1) * 2 + 5 = 6 + 5 = 11
+noSkipKvS = min(10, 11) = 10
+
+KV序列使用范围: [历史1-5] [当前1-5] 共10个token (完整KV序列)
+```
+
+## 6. 边界条件处理
+
+当计算结果超过实际KV序列长度时，使用min函数确保不越界：
+
+```
+KV序列最大长度: kvSeqlen
+计算结果: noSkipKvS_candidate
+最终结果: min(kvSeqlen, noSkipKvS_candidate)
+```
+
+## 7. 因果掩码效果
+
+通过这种计算方式，确保了自回归生成中的因果关系：
+- 查询分块i只能关注到KV序列中前(i+1)*curQSBlockTile + diffS个token
+- 每个查询token只能看到其生成时刻之前的所有token
+- 防止了模型在生成过程中访问未来信息
+
+## 8. 代码实现位置
+
+位于mha_fwd_kvcache.cpp文件中，是带KV缓存的多头注意力计算中的关键逻辑，确保了自回归生成的正确性。
