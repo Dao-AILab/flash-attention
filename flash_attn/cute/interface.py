@@ -53,6 +53,7 @@ from flash_attn.cute.cute_dsl_utils import (
 from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80
 from flash_attn.cute.flash_fwd_sm90 import FlashAttentionForwardSm90
 from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
+from flash_attn.cute.flash_fwd_sm120 import FlashAttentionForwardSm120
 from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
 from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
 from flash_attn.cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
@@ -298,10 +299,11 @@ def _flash_attn_fwd(
         )
     ), "inputs must be on CUDA device"
     arch = _get_device_arch() if _arch is None else _arch
-    assert arch // 10 in [9, 10, 11], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x"
+    assert arch // 10 in [9, 10, 11, 12], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x, 12.x"
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
     alignment = 16 // q.element_size()
-    _validate_head_dims(head_dim, head_dim_v, arch // 10, alignment)
+    if arch // 10 != 12:
+        _validate_head_dims(head_dim, head_dim_v, arch // 10, alignment)
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
     if softcap == 0.0:
@@ -341,9 +343,21 @@ def _flash_attn_fwd(
 
     current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
+    # SM120: uses SM80 MMA with 99 KB SMEM, 128 threads (4 warps)
+    if arch // 10 == 12:
+        num_threads = 128
+
     fwd_cfg = FwdConfig(128, 128, True, True)  # default
     if tile_mn is None:
-        if arch // 10 in [8, 12]:
+        if arch // 10 == 12:
+            # SM120 tile sizes tuned for 99 KB SMEM capacity:
+            # D<=64:  128x128 → 48 KB (good occupancy)
+            # D>64:   128x64  → 64 KB (128x128 would use 96 KB, hurting occupancy)
+            if head_dim <= 64:
+                fwd_cfg = FwdConfig(128, 128, True, True)
+            else:
+                fwd_cfg = FwdConfig(128, 64, True, True)
+        elif arch // 10 == 8:
             fwd_cfg = FwdConfig(128, 64, True, True)  # SM80, should tune
         elif arch // 10 == 9:
             fwd_cfg = _tile_size_fwd_sm90(head_dim, head_dim_v, causal, local, use_block_sparsity)
@@ -585,9 +599,31 @@ def _flash_attn_fwd(
                 q_subtile_factor=q_subtile_factor,
                 use_2cta_instrs=use_2cta_instrs,
             )
+        elif arch // 10 == 12:
+            # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
+            assert not use_block_sparsity, "Block sparsity not supported on SM 12.0"
+            assert page_table is None, "Paged KV not supported on SM 12.0 in this PR"
+            assert not is_split_kv, "SplitKV not supported on SM 12.0 in this PR"
+            fa_fwd = FlashAttentionForwardSm120(
+                dtype,
+                head_dim,
+                head_dim_v,
+                qhead_per_kvhead,
+                is_causal=causal,
+                is_local=local,
+                pack_gqa=pack_gqa,
+                tile_m=tile_m,
+                tile_n=tile_n,
+                num_stages=1,
+                num_threads=num_threads,
+                Q_in_regs=False,
+                score_mod=score_mod,
+                mask_mod=mask_mod,
+                has_aux_tensors=aux_tensors is not None,
+            )
         else:
             raise ValueError(
-                f"Unsupported compute capability: {arch}. Supported: 9.x, 10.x, 11.x"
+                f"Unsupported compute capability: {arch}. Supported: 9.x, 10.x, 11.x, 12.x"
             )
         # TODO: check @can_implement
         _flash_attn_fwd.compile_cache[compile_key] = cute.compile(

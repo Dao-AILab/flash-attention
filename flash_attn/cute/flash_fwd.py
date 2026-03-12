@@ -618,8 +618,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         mV: cute.Tensor,
         mO: cute.Tensor,
         mLSE: Optional[cute.Tensor],
+        softmax_scale: Float32,
         stream: cuda.CUstream,
-        softmax_scale: Optional[Float32] = None,
         mCuSeqlensQ: Optional[cute.Tensor] = None,
         mCuSeqlensK: Optional[cute.Tensor] = None,
         mSeqUsedQ: Optional[cute.Tensor] = None,
@@ -654,7 +654,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             cute.make_tensor(t.iterator, cute.select(t.layout, mode=[1, 3, 2, 0]))
             for t in (mQ, mK, mV, mO)
         ]
-        mLSE = cute.make_tensor(mLSE.iterator, cute.select(mLSE.layout, mode=[2, 1, 0]))
+        if const_expr(mLSE is not None):
+            mLSE = cute.make_tensor(mLSE.iterator, cute.select(mLSE.layout, mode=[2, 1, 0]))
         # grid_dim: (m_block, num_head, batch_size)
         grid_dim = (
             cute.ceil_div(mQ.shape[0], self.tile_m),
@@ -974,7 +975,6 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                     n_block,
                     smem_pipe_read,
                     smem_pipe_write,
-                    is_first_n_block=True,
                     seqlen=seqlen,
                     mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=True),
                 )
