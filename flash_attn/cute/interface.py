@@ -299,13 +299,6 @@ def _flash_attn_fwd(
             learnable_sink,
         )
     ), "inputs must be on CUDA device"
-    # Pad cu_seqlens with one extra element (repeating the last value) so that
-    # wasted grid tiles in the varlen scheduler can safely read
-    # cu_seqlens[num_batch+1] without an OOB access.
-    if cu_seqlens_q is not None:
-        cu_seqlens_q = torch.nn.functional.pad(cu_seqlens_q, (0, 1), value=cu_seqlens_q[-1].item())
-    if cu_seqlens_k is not None:
-        cu_seqlens_k = torch.nn.functional.pad(cu_seqlens_k, (0, 1), value=cu_seqlens_k[-1].item())
     arch = _get_device_arch() if _arch is None else _arch
     assert arch // 10 in [9, 10, 11, 12], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x, 12.x"
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
@@ -1026,13 +1019,6 @@ def _flash_attn_bwd(
     assert all(
         t is None or t.is_cuda for t in (q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k)
     ), "inputs must be on CUDA device"
-    # Pad cu_seqlens with one extra element (repeating the last value) so that
-    # wasted grid tiles in the varlen scheduler can safely read
-    # cu_seqlens[num_batch+1] without an OOB access.
-    if cu_seqlens_q is not None:
-        cu_seqlens_q = torch.nn.functional.pad(cu_seqlens_q, (0, 1), value=cu_seqlens_q[-1].item())
-    if cu_seqlens_k is not None:
-        cu_seqlens_k = torch.nn.functional.pad(cu_seqlens_k, (0, 1), value=cu_seqlens_k[-1].item())
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
     alignment = 16 // q.element_size()
     if arch // 10 != 12:
