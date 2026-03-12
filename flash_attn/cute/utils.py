@@ -9,6 +9,7 @@ import cutlass
 import cutlass.cute as cute
 
 from cutlass import Float32, const_expr
+from cutlass.cute import FastDivmodDivisor
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import nvvm, llvm
 from cutlass.cute.runtime import from_dlpack
@@ -121,6 +122,40 @@ def create_softcap_scoremod(softcap_val):
         return scores * cute.math.tanh(scores, fastmath=True)
 
     return scoremod_premask_fn
+
+
+LOG2_E = math.log2(math.e)
+
+
+def compute_softmax_scale_log2(softmax_scale, score_mod):
+    """Compute softmax_scale_log2 and adjusted softmax_scale based on whether score_mod is used.
+
+    When score_mod is None, fold the log2(e) factor into softmax_scale_log2 and set softmax_scale
+    to None. When score_mod is present, keep softmax_scale separate so it can be applied before
+    the score_mod, and set softmax_scale_log2 to just the change-of-base constant.
+
+    Returns (softmax_scale_log2, softmax_scale).
+    """
+    if const_expr(score_mod is None):
+        return softmax_scale * LOG2_E, None
+    else:
+        return LOG2_E, softmax_scale
+
+
+def compute_fastdiv_mods(mQ, mK, qhead_per_kvhead, pack_gqa, aux_tensors, mPageTable=None):
+    """Compute FastDivmodDivisor pairs for aux_tensors index computation.
+
+    Returns a (seqlen_q_divmod, seqlen_k_divmod) tuple, or None if aux_tensors is None.
+    """
+    if const_expr(aux_tensors is None):
+        return None
+    seqlen_q = cute.size(mQ.shape[0]) // (qhead_per_kvhead if const_expr(pack_gqa) else 1)
+    seqlen_k = (
+        cute.size(mK.shape[0])
+        if const_expr(mPageTable is None)
+        else mK.shape[0] * mPageTable.shape[1]
+    )
+    return (FastDivmodDivisor(seqlen_q), FastDivmodDivisor(seqlen_k))
 
 
 def convert_from_dlpack(x, leading_dim, alignment=16, divisibility=1) -> cute.Tensor:
@@ -430,7 +465,23 @@ def shuffle_sync(
 
 
 @dsl_user_op
-def shr_u32(val: cutlass.Uint32, shift: cutlass.Uint32, *, loc=None, ip=None) -> cutlass.Uint32:
+def shl_u32(val: cutlass.Uint32, shift: cutlass.Uint32, *, loc=None, ip=None) -> cutlass.Uint32:
+    """
+    Left-shift val by shift bits using PTX shl.b32 (sign-agnostic).
+
+    Named ``shl_u32`` (not ``shl_b32``) because python type annotations
+    distinguish signed/unsigned.
+
+    PTX semantics (§9.7.8.8): "Shift amounts greater than the register width N
+    are clamped to N."  So ``shl.b32 d, a, 32`` is well-defined and yields 0.
+
+    This differs from C/C++ and LLVM IR, where shifting by >= the type width is
+    undefined behavior.  CuTeDSL compiles through MLIR -> LLVM IR, so a plain
+    Python-level ``Uint32(x) << Uint32(n)`` inherits LLVM's UB: the optimizer
+    may treat the result as poison and eliminate dependent code.  Inline PTX
+    bypasses the LLVM IR shift entirely — the instruction is emitted verbatim
+    into PTX where clamping makes it safe for all shift amounts.
+    """
     return cutlass.Uint32(
         llvm.inline_asm(
             T.i32(),
@@ -438,7 +489,31 @@ def shr_u32(val: cutlass.Uint32, shift: cutlass.Uint32, *, loc=None, ip=None) ->
                 cutlass.Uint32(val).ir_value(loc=loc, ip=ip),
                 cutlass.Uint32(shift).ir_value(loc=loc, ip=ip),
             ],
-            "shr.s32 $0, $1, $2;",
+            "shl.b32 $0, $1, $2;",
+            "=r,r,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@dsl_user_op
+def shr_u32(val: cutlass.Uint32, shift: cutlass.Uint32, *, loc=None, ip=None) -> cutlass.Uint32:
+    """
+    Unsigned right-shift val by shift bits using PTX shr.u32 (zero-fills).
+
+    See ``shl_u32`` docstring for why inline PTX is used instead of plain
+    CuTeDSL shift operators (LLVM shift-by-type-width UB).
+    """
+    return cutlass.Uint32(
+        llvm.inline_asm(
+            T.i32(),
+            [
+                cutlass.Uint32(val).ir_value(loc=loc, ip=ip),
+                cutlass.Uint32(shift).ir_value(loc=loc, ip=ip),
+            ],
+            "shr.u32 $0, $1, $2;",
             "=r,r,r",
             has_side_effects=False,
             is_align_stack=False,

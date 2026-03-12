@@ -76,6 +76,9 @@ def test_flash_attn_output(
     local = local_enum > 0
     if local and causal:
         pytest.skip()
+    is_sm90 = torch.cuda.get_device_capability()[0] == 9
+    if is_sm90 and d == 192:
+        pytest.xfail("headdim 192 not supported on sm90")
     device = "cuda"
     # set seed
     torch.random.manual_seed(0)
@@ -412,8 +415,8 @@ def test_flash_attn_varlen_output(
     is_sm90 = torch.cuda.get_device_capability()[0] == 9
     if is_sm90 and local:
         pytest.xfail("bwd local attention not supported on sm90")
-    if is_sm90 and deterministic:
-        pytest.xfail("bwd deterministic not supported on sm90")
+    if is_sm90 and d == 192:
+        pytest.xfail("headdim 192 not supported on sm90")
     if (
         causal or local
     ):  # Right now reference only supports causal attention with seqlen_k == seqlen_q
