@@ -385,6 +385,7 @@ class FlashAttentionForwardCombine:
             seqlen_static=mO_partial.shape[0],
             cu_seqlens=cu_seqlens,
             seqused=seqused,
+            # Don't need to pass in tile size since we won't use offset_padded
         )
         seqlen, offset = seqlen_info.seqlen, seqlen_info.offset
 

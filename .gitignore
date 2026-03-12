@@ -2,6 +2,7 @@
 *.sass
 *.ptx
 *.cubin
+*.plk
 .DS_store
 .vscode
 

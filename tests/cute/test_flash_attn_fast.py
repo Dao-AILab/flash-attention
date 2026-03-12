@@ -47,6 +47,8 @@ IS_SM90 = torch.cuda.get_device_capability()[0] == 9
 )
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_output(seqlen_q, seqlen_k, d, causal, num_splits, mha_type, dtype):
+    if IS_SM90 and num_splits > 1:
+        pytest.skip("SM90 fwd doens't support num_splits > 1")
     device = "cuda"
     torch.random.manual_seed(0)
     random.seed(0)
@@ -149,8 +151,8 @@ def test_flash_attn_varlen_output(seqlen, d, causal, mha_type, dtype):
     fwd_atol = 2 * (out_ref + 0.3 - 0.3 - out_ref).abs().max().item()
     assert (out_reshaped - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item() + fwd_atol
 
-    # Backward (original test skips all SM90 varlen backward)
-    can_bwd = d <= 128 and not IS_SM90
+    # Backward
+    can_bwd = d <= 128
     if not can_bwd:
         return
 
