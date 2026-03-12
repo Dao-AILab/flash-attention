@@ -58,6 +58,7 @@ from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreproces
 from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
 from flash_attn.cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
 from flash_attn.cute.flash_bwd_sm100 import FlashAttentionBackwardSm100
+from flash_attn.cute.flash_bwd_sm120 import FlashAttentionBackwardSm120
 from flash_attn.cute.flash_bwd_postprocess import FlashAttentionBackwardPostprocess
 from flash_attn.cute.flash_fwd_combine import FlashAttentionForwardCombine
 
@@ -868,7 +869,7 @@ def _flash_attn_bwd(
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     arch = _get_device_arch()
-    assert arch // 10 in [9, 10, 11], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x"
+    assert arch // 10 in [9, 10, 11, 12], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x, 12.x"
 
     num_head, head_dim = q.shape[-2:]
 
@@ -876,7 +877,31 @@ def _flash_attn_bwd(
         causal, window_size_left, window_size_right
     )
 
-    if arch // 10 == 9:
+    if arch // 10 == 12:
+        # SM120: uses SM80 MMA with 99 KB SMEM, 128 threads (4 warps).
+        m_block_size = 64
+        n_block_size = 64
+        if head_dim <= 64:
+            num_stages_Q = 2
+            num_stages_dO = 2
+        else:
+            num_stages_Q = 1
+            num_stages_dO = 1
+        SdP_swapAB = False
+        dKV_swapAB = False
+        dQ_swapAB = False
+        AtomLayoutMSdP = 4
+        AtomLayoutNdKV = 4
+        AtomLayoutMdQ = 4
+        V_in_regs = False
+        cluster_size = 1
+        use_2cta_instrs = False
+        num_threads = 128
+        assert not (block_sparse_tensors is not None), "Block sparsity backward not supported on SM 12.0"
+        assert score_mod is None and score_mod_bwd is None, "score_mod backward not supported on SM 12.0"
+        assert mask_mod is None, "mask_mod backward not supported on SM 12.0"
+        assert deterministic is False, "deterministic backward not supported on SM 12.0"
+    elif arch // 10 == 9:
         m_block_size = 80 if not causal else 64
         n_block_size = 128
         num_stages_Q = 2
@@ -996,7 +1021,8 @@ def _flash_attn_bwd(
     ), "inputs must be on CUDA device"
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
     alignment = 16 // q.element_size()
-    _validate_head_dims(head_dim, head_dim_v, arch // 10, alignment)
+    if arch // 10 != 12:
+        _validate_head_dims(head_dim, head_dim_v, arch // 10, alignment)
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
     qhead_per_kvhead = num_head // num_head_kv
@@ -1117,8 +1143,11 @@ def _flash_attn_bwd(
     # NB num_threads application for 3 kernels
     # There are pre, main, post processing kernels, currenlty we hard code to 384 for the main and
     # post proc, and we do before cache key gen
+    # SM120 keeps 128 threads throughout (SM80 CpAsync code paths)
     # hdim 192 needs 3 MMA warp groups (192/64=3), so 4 total WGs → 512 threads
-    if arch // 10 == 9 and head_dim > 128 and head_dim <= 192:
+    if arch // 10 == 12:
+        pass  # num_threads already set to 128 above
+    elif arch // 10 == 9 and head_dim > 128 and head_dim <= 192:
         num_threads = 512
     else:
         num_threads = 384
@@ -1148,7 +1177,7 @@ def _flash_attn_bwd(
             subtile_factor=subtile_factor,
         )
 
-    if arch // 10 == 9:
+    if arch // 10 in [8, 9, 12]:
         compile_key = (
             arch,
             dtype,
@@ -1239,27 +1268,29 @@ def _flash_attn_bwd(
             if t is not None else None
             for t in (dQ_semaphore, dK_semaphore, dV_semaphore)
         ]
-        fa_bwd_sm80 = FlashAttentionBackwardSm80(
-            dtype,
-            head_dim,
-            head_dim_v,
-            qhead_per_kvhead,
-            m_block_size,
-            n_block_size,
-            num_stages_Q,
-            num_stages_dO,
-            num_threads,
-            pack_gqa,
-            causal,
-            SdP_swapAB,
-            dKV_swapAB,
-            dQ_swapAB,
-            AtomLayoutMSdP,
-            AtomLayoutNdKV,
-            AtomLayoutMdQ,
-            V_in_regs=V_in_regs,
-        )
-        if arch // 10 == 9:
+        if arch // 10 in [8, 12]:
+            flash_bwd_obj_cls = FlashAttentionBackwardSm120 if arch // 10 == 12 else FlashAttentionBackwardSm80
+            fa_bwd_obj = flash_bwd_obj_cls(
+                dtype,
+                head_dim,
+                head_dim_v,
+                qhead_per_kvhead,
+                m_block_size,
+                n_block_size,
+                num_stages_Q,
+                num_stages_dO,
+                num_threads,
+                pack_gqa,
+                causal,
+                SdP_swapAB,
+                dKV_swapAB,
+                dQ_swapAB,
+                AtomLayoutMSdP,
+                AtomLayoutNdKV,
+                AtomLayoutMdQ,
+                V_in_regs=V_in_regs,
+            )
+        elif arch // 10 == 9:
             fa_bwd_obj = FlashAttentionBackwardSm90(
                 dtype,
                 head_dim,
