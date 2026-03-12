@@ -52,6 +52,7 @@ class FlashAttentionBackwardSm90:
         head_dim_v: Optional[int] = None,
         qhead_per_kvhead: int = 1,
         is_causal: bool = False,
+        is_local: bool = False,
         deterministic: bool = False,
         tile_m: int = 64,
         tile_n: int = 128,
@@ -84,7 +85,7 @@ class FlashAttentionBackwardSm90:
         self.check_hdim_v_oob = head_dim_v != self.tile_hdimv
         self.qhead_per_kvhead = qhead_per_kvhead
         self.is_causal = is_causal
-        self.is_local = False
+        self.is_local = is_local
         self.deterministic = deterministic
         self.tile_m = tile_m
         self.tile_n = tile_n
@@ -496,6 +497,11 @@ class FlashAttentionBackwardSm90:
 
         self.use_block_sparsity = cutlass.const_expr(blocksparse_tensors is not None)
 
+        if const_expr(window_size_left is not None):
+            window_size_left = Int32(window_size_left)
+        if const_expr(window_size_right is not None):
+            window_size_right = Int32(window_size_right)
+
         self.kernel(
             tma_tensor_Q,
             tma_tensor_K,
@@ -537,6 +543,8 @@ class FlashAttentionBackwardSm90:
             blocksparse_tensors,
             qhead_per_kvhead_divmod,
             mdQ_semaphore,
+            window_size_left,
+            window_size_right,
         ).launch(
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
@@ -587,6 +595,8 @@ class FlashAttentionBackwardSm90:
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         qhead_per_kvhead_divmod: Optional[FastDivmodDivisor] = None,
         mdQ_semaphore: Optional[cute.Tensor] = None,
+        window_size_left: Optional[Int32] = None,
+        window_size_right: Optional[Int32] = None,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
@@ -649,8 +659,8 @@ class FlashAttentionBackwardSm90:
             self.is_causal,
             self.is_local,
             False,  # is_split_kv
-            None,
-            None,
+            window_size_left,
+            window_size_right,
             qhead_per_kvhead_packgqa=1,
         )
         SeqlenInfoCls = partial(
@@ -668,8 +678,8 @@ class FlashAttentionBackwardSm90:
             AttentionMask,
             self.tile_m,
             self.tile_n,
-            window_size_left=None,
-            window_size_right=None,
+            window_size_left=window_size_left,
+            window_size_right=window_size_right,
             swap_AB=self.SdP_swapAB,
         )
         TileSchedulerCls = partial(TileScheduler.create, tile_sched_params)
@@ -1276,8 +1286,8 @@ class FlashAttentionBackwardSm90:
                     qhead_per_kvhead_divmod,
                 )
             else:
-                # Block sparsity: KV tile with zero Q blocks produces no dK/dV; write zeros.
-                if const_expr(self.use_block_sparsity):
+                # KV tile with zero Q blocks produces no dK/dV; write zeros.
+                if const_expr(self.use_block_sparsity or self.is_local or self.is_varlen_q):
                     acc_dK.fill(0.0)
                     acc_dV.fill(0.0)
                     self.epilogue_dKV(

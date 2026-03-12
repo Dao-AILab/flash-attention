@@ -346,11 +346,18 @@ class AttentionMask:
                         # column, by setting row limit to be self.tile_m.
                         row_limit_top = (
                             self.tile_m
-                            if col0 >= seqlenk_col_limit
-                            else col0 - causal_row_offset - self.window_size_right
+                            if col0 >= seqlenk_col_limit and mask_seqlen
+                            else (
+                                col0 - causal_row_offset - self.window_size_right
+                                if const_expr(self.window_size_right is not None)
+                                else 0
+                            )
                         )
-                        # TODO: do we need col_limit_sink?
-                        row_limit_bot = col0 - causal_row_offset + self.window_size_left
+                        row_limit_bot = (
+                            col0 - causal_row_offset + self.window_size_left
+                            if const_expr(self.window_size_left is not None)
+                            else self.tile_m
+                        )
                         for r in cutlass.range(cute.size(tScS_mn.shape[0]), unroll_full=True):
                             row_idx = t0ScS_mn[r, 0][ROW]
                             acc_S_mn[r, c] = (

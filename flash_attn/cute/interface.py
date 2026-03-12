@@ -915,7 +915,6 @@ def _flash_attn_bwd(
         AtomLayoutMdQ = 1
         cluster_size = 1
         use_2cta_instrs = False
-        assert window_size_left is None and window_size_right is None, "local not supported yet on 9.x"
         is_varlen = (
             cu_seqlens_q is not None
             or cu_seqlens_k is not None
@@ -1185,6 +1184,8 @@ def _flash_attn_bwd(
             head_dim_v,
             qhead_per_kvhead,
             causal,
+            window_size_left is not None,
+            window_size_right is not None,
             softcap != 0.0,
             m_block_size,
             n_block_size,
@@ -1297,6 +1298,7 @@ def _flash_attn_bwd(
                 head_dim_v,
                 qhead_per_kvhead,
                 causal,
+                is_local=local,
                 deterministic=deterministic,
                 tile_m=m_block_size,
                 tile_n=n_block_size,

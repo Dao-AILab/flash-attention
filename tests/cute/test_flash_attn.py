@@ -299,9 +299,6 @@ def test_flash_attn_output(
             # Fix requires adjusting m_block_size or MMA config in flash_bwd_sm90.py
             if IS_SM90 and d == 64 and not causal:
                 pytest.xfail("SM90 backward: d=64 + non-causal has invalid MMA tile config (m_block=80)")
-            # TODO: SM90 backward pass does not support local attention yet
-            if IS_SM90 and local:
-                pytest.xfail("SM90 backward: local attention not supported yet")
             if d == 192 and local:
                 pytest.xfail("hdim 192 backward: local attention not supported yet")
             g = torch.randn_like(out)
@@ -740,8 +737,6 @@ def test_flash_attn_varlen_output(
         ):
             if d == 192 and local:
                 pytest.xfail("hdim 192 backward: local attention not supported yet")
-            if IS_SM90 and local:
-                pytest.xfail("SM90 backward: local attention not supported yet")
             g_unpad = torch.randn_like(out_unpad)
             # do_o = ((g_unpad.float() * out_unpad.float()).sum(-1)).transpose(-1, -2)
             # import flash_attn_3_cuda
