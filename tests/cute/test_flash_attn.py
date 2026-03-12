@@ -742,8 +742,6 @@ def test_flash_attn_varlen_output(
                 pytest.xfail("hdim 192 backward: local attention not supported yet")
             if IS_SM90 and local:
                 pytest.xfail("SM90 backward: local attention not supported yet")
-            if IS_SM90 and not unpad_kv:
-                pytest.xfail("SM90 backward: seqused_k not supported yet")
             g_unpad = torch.randn_like(out_unpad)
             # do_o = ((g_unpad.float() * out_unpad.float()).sum(-1)).transpose(-1, -2)
             # import flash_attn_3_cuda

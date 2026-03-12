@@ -1057,7 +1057,7 @@ def _flash_attn_bwd(
 
     # SM90 varlen needs dK/dV accum+postprocess even for qhead_per_kvhead==1
     # to avoid direct tile stores crossing packed sequence boundaries.
-    dKV_postprocess = qhead_per_kvhead > 1 or (arch // 10 == 9 and cu_seqlens_k is not None)
+    dKV_postprocess = qhead_per_kvhead > 1 or (arch // 10 == 9 and (cu_seqlens_k is not None or seqused_k is not None))
     if dKV_postprocess:
         head_dim_v_rounded = (head_dim_v + 32 - 1) // 32 * 32
         if cu_seqlens_k is None:
