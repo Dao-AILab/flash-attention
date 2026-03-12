@@ -7,7 +7,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils.hopper_helpers as sm90_utils_basic
-from cutlass.cute.nvgpu import cpasync, warp, warpgroup
+from cutlass.cute.nvgpu import cpasync, warpgroup
 from cutlass.cute import FastDivmodDivisor
 from cutlass import Float32, Int32, Boolean, const_expr
 from cutlass.utils import LayoutEnum
@@ -328,8 +328,8 @@ class FlashAttentionBackwardSm90:
         aux_tensors: Optional[list] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
     ):
-        # For varlen, direct tile stores to dK/dV can cross sequence boundaries in packed buffers.
-        # Route varlen dK/dV through the float32 accum path + postprocess instead.
+        # For varlen (cu_seqlens/seqused), direct tile stores to dK/dV can cross sequence
+        # boundaries or write beyond seqlen. Route through float32 accum path + postprocess.
         self.direct_dkv_store = (
             self.qhead_per_kvhead == 1 and mCuSeqlensK is None and mSeqUsedK is None
         )
@@ -347,10 +347,13 @@ class FlashAttentionBackwardSm90:
 
         # Non-varlen inputs are (b, s, n, h), varlen inputs are (s, n, h).
         # We convert both to a seqlen-major view with head-dim second.
-        layout_transpose = [1, 3, 2, 0] if cute.rank(mQ.shape) == 4 else [0, 2, 1]
-        mQ, mK, mV, mdO = [layout_utils.select(t, layout_transpose) for t in (mQ, mK, mV, mdO)]
+        # Each tensor may have different rank when Q is padded (seqused_q) but K/V are unpadded (cu_seqlens_k).
+        def _qkv_transpose(t):
+            return layout_utils.select(t, [1, 3, 2, 0] if cute.rank(t.shape) == 4 else [0, 2, 1])
+
+        mQ, mK, mV, mdO = [_qkv_transpose(t) for t in (mQ, mK, mV, mdO)]
         if const_expr(self.direct_dkv_store):
-            mdK, mdV = [layout_utils.select(t, layout_transpose) for t in (mdK, mdV)]
+            mdK, mdV = [_qkv_transpose(t) for t in (mdK, mdV)]
         else:
             # Accum tensors are (b, n, s*h) for non-varlen and (n, s*h) for varlen.
             accum_transpose = [2, 1, 0] if cute.rank(mdK.shape) == 3 else [1, 0]
@@ -366,7 +369,6 @@ class FlashAttentionBackwardSm90:
         if const_expr(self.deterministic):
             assert mdQ_semaphore is not None
             mdQ_semaphore = layout_utils.select(mdQ_semaphore, mode=[2, 3, 1, 0])
-
 
         self.num_mma_threads = tiled_mma_SdP.size
         assert self.num_mma_threads + 128 == self.num_threads
@@ -850,7 +852,10 @@ class FlashAttentionBackwardSm90:
 
                 if const_expr(not self.use_block_sparsity):
                     total_m_block_cnt = m_block_max - m_block_min
-                    process_tile = const_expr(not self.is_local) or m_block_min < m_block_max
+                    process_tile = (
+                        const_expr(not self.is_local and not seqlen.has_cu_seqlens_q)
+                        or m_block_min < m_block_max
+                    )
                 else:
                     total_m_block_cnt = get_total_q_block_count_bwd(
                         blocksparse_tensors,
@@ -1200,7 +1205,10 @@ class FlashAttentionBackwardSm90:
             m_block_min, m_block_max = block_info.get_m_block_min_max(seqlen, n_block)
 
             if const_expr(not self.use_block_sparsity):
-                process_tile = const_expr(not self.is_local) or m_block_min < m_block_max
+                process_tile = (
+                    const_expr(not self.is_local and not seqlen.has_cu_seqlens_q)
+                    or m_block_min < m_block_max
+                )
             else:
                 total_m_block_cnt = get_total_q_block_count_bwd(
                     blocksparse_tensors,
@@ -1618,7 +1626,10 @@ class FlashAttentionBackwardSm90:
 
             m_block_min, m_block_max = block_info.get_m_block_min_max(seqlen, n_block)
             if const_expr(not self.use_block_sparsity):
-                process_tile = const_expr(not self.is_local) or m_block_min < m_block_max
+                process_tile = (
+                    const_expr(not self.is_local and not seqlen.has_cu_seqlens_q)
+                    or m_block_min < m_block_max
+                )
                 loop_count = m_block_max - m_block_min
             else:
                 total_block_cnt = get_total_q_block_count_bwd(
@@ -1689,7 +1700,9 @@ class FlashAttentionBackwardSm90:
                                 1,
                             )
                 else:
-                    assert not self.deterministic, "Deterministic not implemented for block-sparse backward"
+                    assert not self.deterministic, (
+                        "Deterministic not implemented for block-sparse backward"
+                    )
                     dQaccum_store_block_sparse_bwd_sm90(
                         blocksparse_tensors,
                         batch_idx,

@@ -1114,7 +1114,6 @@ def _flash_attn_bwd(
         cu_seqlens_q, seqused_q,
         dtype, head_dim, head_dim_v, m_block_size,
     )
-
     # NB num_threads application for 3 kernels
     # There are pre, main, post processing kernels, currenlty we hard code to 384 for the main and
     # post proc, and we do before cache key gen

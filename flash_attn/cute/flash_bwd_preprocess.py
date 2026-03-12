@@ -213,7 +213,9 @@ class FlashAttentionBackwardPreprocess:
             # ///////////////////////////////////////////////////////////////////////////////
             # Get the appropriate tiles for this thread block.
             # ///////////////////////////////////////////////////////////////////////////////
-            seqlen = SeqlenInfo.create(batch_idx, mO.shape[1], mCuSeqlensQ, mSeqUsedQ, tile=self.tile_m)
+            seqlen = SeqlenInfo.create(
+                batch_idx, mO.shape[1], mCuSeqlensQ, mSeqUsedQ, tile=self.tile_m
+            )
             mO_cur = seqlen.offset_batch(mO, batch_idx, dim=0)[None, head_idx, None]
             mdO_cur = seqlen.offset_batch(mdO, batch_idx, dim=0)[None, head_idx, None]
             offset_padded = None if const_expr(not seqlen.has_cu_seqlens) else seqlen.offset_padded

@@ -484,7 +484,7 @@ def test_flash_attn_varlen_output(
     seed = seqlen_q + seqlen_k + d + int(causal) * 2 + int(local)
     random.seed(seed)
     torch.random.manual_seed(seed)
-    batch_size = 49 if seqlen_q <= 1024 else 7
+    batch_size = 49 if seqlen_q <= 512 else 7
     nheads = 6
     # nheads = 1
     nheads_kv = nheads if mha_type == "mha" else (3 if mha_type == "gqa" else 1)
@@ -736,11 +736,14 @@ def test_flash_attn_varlen_output(
             and not attention_chunk != 0
             and ((dv == d and d <= 128) or (d == 192 and dv == 128))
             and not has_learnable_sink
-            and not IS_SM90
             # and False
         ):
             if d == 192 and local:
                 pytest.xfail("hdim 192 backward: local attention not supported yet")
+            if IS_SM90 and local:
+                pytest.xfail("SM90 backward: local attention not supported yet")
+            if IS_SM90 and not unpad_kv:
+                pytest.xfail("SM90 backward: seqused_k not supported yet")
             g_unpad = torch.randn_like(out_unpad)
             # do_o = ((g_unpad.float() * out_unpad.float()).sum(-1)).transpose(-1, -2)
             # import flash_attn_3_cuda

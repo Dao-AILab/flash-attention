@@ -492,6 +492,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             mCuSeqlensK=mCuSeqlensK,
             mSeqUsedQ=mSeqUsedQ,
             mSeqUsedK=mSeqUsedK,
+            # Don't need to pass in tile_mn because we won't access offset_padded
         )
         AttentionMaskCls = partial(
             AttentionMask,
