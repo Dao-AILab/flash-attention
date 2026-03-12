@@ -11,36 +11,6 @@ from quack import layout_utils
 import flash_attn.cute.utils as utils
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 
-@cute.jit
-def mask_r2p(X: cute.Tensor, col_limit: Int32, arch: int = 90, rank1: bool = False) -> None:
-    # Bit manipulation, compiles down to the R2P instruction
-    # For sm100: we know that tScS_t2r[i][1] == i, for the particular tmem copy atom we're using.
-    # For sm90: instead of comparing limit to 0, 1, 8, 9, 16, 17, ...,
-    # we compare a transformed version of limit to 0, 1, 2, 3, 4, 5, ...
-    if const_expr(arch == 90):
-        col_limit_transformed = col_limit // 8 * 2 + min(col_limit % 8, 2)
-    else:
-        col_limit_transformed = col_limit
-    ncol = const_expr(cute.size(X.shape[cute.rank(X) - 1]) if not rank1 else cute.size(X.shape))
-    # Ideally we'd move by 32 instead of 24, but mask >> i isn't correct for i == 31
-    for s in cutlass.range_constexpr(cute.ceil_div(ncol, 24)):
-        # Don't need to clamp to 32 since the shr.u32 instruction does that already
-        col_limit_right_s = max(col_limit_transformed - s * 24, 0)
-        # 0 -> 0b00...00, 1 -> 0b00...01, ..., 31 -> 0b01...11, 32 -> 0b11...11
-        mask = (1 << col_limit_right_s) - 1
-        # This needs to be range_constexpr, o/w the compiler can't generate the R2P instruction
-        for i in cutlass.range_constexpr(min(24, ncol - s * 24)):
-            in_bound = cutlass.Boolean(mask & (1 << i))
-            c = s * 24 + i
-            if const_expr(rank1):
-                X[c] = X[c] if in_bound else -Float32.inf
-                # This is the equivalent of:
-                # X[s * 24 + i] = X[s * 24 + i] if col_limit_right_s <= i else -Float32.inf
-            else:
-                for r in cutlass.range_constexpr(cute.size(X.shape[0])):
-                    X[r, c] = X[r, c] if in_bound else -Float32.inf
-
-
 MaskGenFn: TypeAlias = Callable[[int], Uint32]
 MASK_R2P_CHUNK_SIZE: int = 32
 
@@ -79,9 +49,7 @@ def mask_r2p_lambda(
         Returns a 32-bit bitmask for the chunk. Bit i set means column
         chunk_idx * chunk_size + i is KEPT; bit i clear means masked to -inf.
     """
-    ncol = const_expr(
-        cute.size(X.shape[cute.rank(X) - 1]) if not rank1 else cute.size(X.shape)
-    )
+    ncol = const_expr(cute.size(X.shape[cute.rank(X) - 1]) if not rank1 else cute.size(X.shape))
     # 32-column chunks. The mask_gen_fn returns a Uint32 bitmask (1=keep).
     CHUNK_SIZE = MASK_R2P_CHUNK_SIZE
     for s in cutlass.range_constexpr(cute.ceil_div(ncol, CHUNK_SIZE)):
@@ -96,6 +64,16 @@ def mask_r2p_lambda(
                 for r in cutlass.range_constexpr(cute.size(X.shape[0])):
                     X[r, c] = X[r, c] if in_bound else -Float32.inf
 
+
+@cute.jit
+def sm90_col_to_r2p_idx(col_limit: Int32) -> Int32:
+    """Transform SM90 MMA column coordinate to R2P element index.
+
+    SM90 MMA accumulator column indices are non-contiguous: 0, 1, 8, 9, 16, 17, ...
+    Element indices are contiguous: 0, 1, 2, 3, 4, 5, ...
+    This converts a column-space threshold to element-space for r2p_bitmask_below/above.
+    """
+    return col_limit // 8 * 2 + min(col_limit % 8, 2)
 
 
 @cute.jit
@@ -176,8 +154,7 @@ class AttentionMask:
         seqlenk_col_limit = self.seqlen_k - n_block * self.tile_n - thr_col_offset
         if const_expr(not mask_causal and not mask_local and mask_mod is None):
             if const_expr(mask_seqlen):
-                # The compiler now choses not to use R2P
-                r2p = const_expr(False and not self.swap_AB)
+                r2p = const_expr(not self.swap_AB)
                 if const_expr(not r2p):
                     # traverse column index.
                     for c in cutlass.range(cute.size(tScS_mn.shape[1]), unroll_full=True):
@@ -185,7 +162,8 @@ class AttentionMask:
                         for r in cutlass.range(cute.size(tScS_mn.shape[0]), unroll_full=True):
                             acc_S_mn[r, c] = -Float32.inf if oob else acc_S_mn[r, c]
                 else:
-                    mask_r2p(acc_S_mn, seqlenk_col_limit, arch=90)
+                    seqlenk_col_limit_r2p = sm90_col_to_r2p_idx(seqlenk_col_limit)
+                    mask_r2p_lambda(acc_S_mn, lambda s: r2p_bitmask_below(seqlenk_col_limit_r2p, s))
 
         elif const_expr(
             not mask_causal and not mask_local and mask_mod is not None
@@ -287,7 +265,12 @@ class AttentionMask:
                                     else acc_S_mn[r, c]
                                 )
                         else:
-                            mask_r2p(acc_S_mn[r, None], col_limit_right, arch=90, rank1=True)
+                            col_limit_r2p = sm90_col_to_r2p_idx(col_limit_right)
+                            mask_r2p_lambda(
+                                acc_S_mn[r, None],
+                                lambda s: r2p_bitmask_below(col_limit_r2p, s),
+                                rank1=True,
+                            )
                 else:  # Local
                     local_row_offset_right = (
                         causal_row_offset + self.window_size_right
@@ -299,6 +282,7 @@ class AttentionMask:
                         if const_expr(self.window_size_left is not None)
                         else None
                     )
+                    r2p_local = const_expr(not self.swap_AB)
                     for r in cutlass.range(cute.size(tScS_mn.shape[0]), unroll_full=True):
                         if const_expr(self.qhead_per_kvhead_packgqa == 1):
                             row_idx = tScS_mn[r, 0][0] + m_block * self.tile_m
@@ -317,13 +301,22 @@ class AttentionMask:
                             if const_expr(self.window_size_left is not None)
                             else 0
                         )
-                        # if cute.arch.thread_idx()[0] == 128: cute.printf("n_block = {}, r = {}, row_idx = {}, causal_row_offset = {}, col_limit_right = {}, col_limit_left = {}", n_block, r, row_idx, causal_row_offset, col_limit_right, col_limit_left)
-                        # traverse column index.
-                        for c in cutlass.range(cute.size(tScS_mn.shape[1]), unroll_full=True):
-                            col_idx = t0ScS_mn[0, c][1]
-                            # only consider the column index, so the row index sets to 0.
-                            if col_idx >= col_limit_right or col_idx < col_limit_left:
-                                acc_S_mn[r, c] = -Float32.inf
+                        if const_expr(not r2p_local):
+                            # traverse column index.
+                            for c in cutlass.range(cute.size(tScS_mn.shape[1]), unroll_full=True):
+                                col_idx = t0ScS_mn[0, c][1]
+                                if col_idx >= col_limit_right or col_idx < col_limit_left:
+                                    acc_S_mn[r, c] = -Float32.inf
+                        else:
+                            col_limit_right_r2p = sm90_col_to_r2p_idx(col_limit_right)
+                            col_limit_left_r2p = sm90_col_to_r2p_idx(col_limit_left)
+
+                            def mask_gen_fn(s: int) -> Uint32:
+                                return r2p_bitmask_below(
+                                    col_limit_right_r2p, s
+                                ) & r2p_bitmask_above(col_limit_left_r2p, s)
+
+                            mask_r2p_lambda(acc_S_mn[r, None], mask_gen_fn, rank1=True)
             else:  # swap_AB
                 assert self.qhead_per_kvhead_packgqa == 1
                 thr_row_offset = tScS_mn[0][ROW]
@@ -516,7 +509,7 @@ class AttentionMask:
                             else acc_S[i]
                         )
                 else:
-                    # Dual-bound masking using two bitmasks for SM100, following mask_r2p.
+                    # Dual-bound R2P masking for SM100.
                     # Masks elements where: NOT (col_limit_left <= col < col_limit_right)
 
                     def mask_gen_fn(s: int) -> Uint32:
@@ -699,9 +692,7 @@ class AttentionMask:
                         mask = r2p_bitmask_above(row_limit, s)
 
                         if const_expr(self.window_size_left is not None):
-                            row_limit_bottom = row_to_r2p_idx(
-                                row_limit_bot + 1, num_rep, num_wg
-                            )
+                            row_limit_bottom = row_to_r2p_idx(row_limit_bot + 1, num_rep, num_wg)
                             mask = mask & r2p_bitmask_below(row_limit_bottom, s)
 
                         return mask
