@@ -274,7 +274,7 @@ class FlashAttentionForwardSm100:
             self.head_dim_padded == 192 and self.head_dim_v_padded == 128 and self.kv_stage == 3
         )
         self.uneven_kv_smem_offset = (
-            self.m_block_size * (self.head_dim_padded - self.head_dim_v_padded) // 2
+            self.n_block_size * (self.head_dim_padded - self.head_dim_v_padded) // 2
             if self.uneven_kv_smem
             else 0
         )

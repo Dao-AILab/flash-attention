@@ -387,18 +387,24 @@ def _flash_attn_fwd(
     else:
         q_stage = 1
 
+    m_block_size_effective = q_stage * tile_m
+    seqlen_k_loaded = max_seqlen_k if not local else max(0, min(max_seqlen_k, window_size_right + window_size_left + 1 + tile_m))
+    num_m_blocks = (seqlen_q_packgqa + m_block_size_effective - 1) // m_block_size_effective
+    total_mblocks = batch_size * num_head_kv * num_m_blocks
+    num_n_blocks = (seqlen_k_loaded + tile_n - 1) // tile_n
+    num_SMs = torch.cuda.get_device_properties(device).multi_processor_count
     if num_splits < 1:
-        m_block_size_effective = q_stage * tile_m
-        seqlen_k_loaded = max_seqlen_k if not local else max(0, min(max_seqlen_k, window_size_right + window_size_left + 1 + tile_m))
-        num_n_blocks = (seqlen_k_loaded + tile_n - 1) // tile_n
-        num_m_blocks = (seqlen_q_packgqa + m_block_size_effective - 1) // m_block_size_effective
-        total_mblocks = batch_size * num_head_kv * num_m_blocks
-        num_splits = num_splits_heuristic(
-            total_mblocks,
-            torch.cuda.get_device_properties(device).multi_processor_count,
-            num_n_blocks,
-            128,
-        )
+        num_splits = num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, 128)
+
+    # SplitKV uses float32 partial output, which doubles the O buffer size
+    # in shared memory, causing OOM for diff-headdim (192, 128)
+    if arch // 10 in [10, 11] and head_dim != head_dim_v and num_splits > 1:
+        if num_n_blocks >= 64:
+            tile_n = 64
+            num_n_blocks = (seqlen_k_loaded + tile_n - 1) // tile_n
+            num_splits = num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, 128)
+        else:
+            num_splits = 1
 
     is_split_kv = num_splits > 1
     if is_split_kv:
@@ -583,8 +589,8 @@ def _flash_attn_fwd(
                 is_local=local,
                 is_split_kv=is_split_kv,
                 pack_gqa=pack_gqa,
-                tile_m=tile_m,
-                tile_n=tile_n,
+                m_block_size=tile_m,
+                n_block_size=tile_n,
                 q_stage=q_stage,
                 is_persistent=not causal
                     and not local
