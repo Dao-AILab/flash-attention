@@ -8,6 +8,7 @@ import re
 import ast
 import glob
 import shutil
+from fnmatch import fnmatch
 from pathlib import Path
 from typing import Literal, Optional
 from packaging.version import parse, Version
@@ -607,6 +608,16 @@ class NinjaBuildExtension(BuildExtension):
 
         super().__init__(*args, **kwargs)
 
+    def run(self):
+        super().run()
+        # Patch `RPATH` to discover CUDA and PyTorch shared libraries in the
+        # virtual env where flash-attention is installed.
+        # https://github.com/Dao-AILab/flash-attention/issues/1548
+        for ext in self.extensions:
+            ext_path = self.get_ext_fullpath(ext.name)
+            if fnmatch(os.path.basename(ext_path), "flash_attn_2_cuda.*-x86_64-linux-gnu.so"):
+                subprocess.run(["patchelf", "--force-rpath", "--set-rpath", "$ORIGIN/torch/lib:$ORIGIN/nvidia/cuda_runtime/lib", ext_path], check=True)
+
 
 # Build install_requires based on platform
 if ROCM_BACKEND == "triton":
@@ -661,5 +672,6 @@ setup(
         "packaging",
         "psutil",
         "ninja",
+        "patchelf",
     ],
 )
