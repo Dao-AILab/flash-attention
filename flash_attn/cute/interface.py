@@ -1084,9 +1084,10 @@ def _flash_attn_bwd(
         dpsum = torch.empty(num_head, total_q_rounded_padded, dtype=torch.float32, device=device)
         lse_log2 = torch.empty(num_head, total_q_rounded_padded, dtype=torch.float32, device=device)
 
-    # SM90 varlen needs dK/dV accum+postprocess even for qhead_per_kvhead==1
-    # to avoid direct tile stores crossing packed sequence boundaries.
-    dKV_postprocess = qhead_per_kvhead > 1 or (arch // 10 == 9 and (cu_seqlens_k is not None or seqused_k is not None))
+    # GQA (qhead_per_kvhead > 1) needs dK/dV accum+postprocess since multiple Q heads
+    # accumulate into the same dK/dV. SM90 varlen_k with qhead_per_kvhead==1 now uses
+    # ragged TMA tensors for direct store, so no longer needs accum+postprocess.
+    dKV_postprocess = qhead_per_kvhead > 1
     if dKV_postprocess:
         head_dim_v_rounded = (head_dim_v + 32 - 1) // 32 * 32
         if cu_seqlens_k is None:

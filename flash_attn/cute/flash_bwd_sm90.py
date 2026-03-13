@@ -182,7 +182,7 @@ class FlashAttentionBackwardSm90:
             raise TypeError("dPsum tensor must be Float32")
         if const_expr(mdQaccum_type not in [Float32]):
             raise TypeError("dQaccum tensor must be Float32")
-        if const_expr(self.direct_dkv_store):
+        if const_expr(self.qhead_per_kvhead == 1):
             if const_expr(not (mdK_type == mdV_type == mQ_type)):
                 raise TypeError("mdK and mdV tensors must have the same data type as mQ")
         else:
@@ -328,11 +328,10 @@ class FlashAttentionBackwardSm90:
         aux_tensors: Optional[list] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
     ):
-        # For varlen (cu_seqlens/seqused), direct tile stores to dK/dV can cross sequence
-        # boundaries or write beyond seqlen. Route through float32 accum path + postprocess.
-        self.direct_dkv_store = (
-            self.qhead_per_kvhead == 1 and mCuSeqlensK is None and mSeqUsedK is None
-        )
+        # For GQA (qhead_per_kvhead > 1), multiple Q heads accumulate into the same dK/dV,
+        # so we need the float32 accum path + postprocess.
+        # For varlen_k with qhead_per_kvhead == 1, we use ragged TMA tensors.
+        self.varlen_k = mCuSeqlensK is not None or mSeqUsedK is not None
 
         self._check_type(
             *(
@@ -354,7 +353,7 @@ class FlashAttentionBackwardSm90:
             return layout_utils.select(t, [1, 3, 2, 0] if cute.rank(t.shape) == 4 else [0, 2, 1])
 
         mQ, mK, mV, mdO = [_qkv_transpose(t) for t in (mQ, mK, mV, mdO)]
-        if const_expr(self.direct_dkv_store):
+        if const_expr(self.qhead_per_kvhead == 1):
             mdK, mdV = [_qkv_transpose(t) for t in (mdK, mdV)]
         else:
             # Accum tensors are (b, n, s*h) for non-varlen and (n, s*h) for varlen.
@@ -427,16 +426,26 @@ class FlashAttentionBackwardSm90:
             cute.select(self.sdO_layout, mode=[0, 1]),
             (self.tile_m, self.tile_hdimv),
         )
-        if const_expr(self.direct_dkv_store):
+        if const_expr(self.qhead_per_kvhead == 1):
+            mdK_tma = (
+                copy_utils.create_ragged_tensor_for_tma(mdK, ragged_dim=0, ptr_shift=True)
+                if self.varlen_k
+                else mdK
+            )
+            mdV_tma = (
+                copy_utils.create_ragged_tensor_for_tma(mdV, ragged_dim=0, ptr_shift=True)
+                if self.varlen_k
+                else mdV
+            )
             tma_atom_dK, tma_tensor_dK = cpasync.make_tiled_tma_atom(
                 cpasync.CopyBulkTensorTileS2GOp(),
-                mdK,
+                mdK_tma,
                 cute.select(self.sK_layout, mode=[0, 1]),
                 (self.tile_n, self.tile_hdim),
             )
             tma_atom_dV, tma_tensor_dV = cpasync.make_tiled_tma_atom(
                 cpasync.CopyBulkTensorTileS2GOp(),
-                mdV,
+                mdV_tma,
                 cute.select(self.sV_layout, mode=[0, 1]),
                 (self.tile_n, self.tile_hdimv),
             )
@@ -491,7 +500,7 @@ class FlashAttentionBackwardSm90:
             fastdiv_mods = (seqlen_q_divmod, seqlen_k_divmod)
 
         qhead_per_kvhead_divmod = None
-        if const_expr(not self.direct_dkv_store):
+        if const_expr(self.qhead_per_kvhead > 1):
             qhead_per_kvhead_divmod = FastDivmodDivisor(self.qhead_per_kvhead)
 
         self.use_block_sparsity = cutlass.const_expr(blocksparse_tensors is not None)
@@ -506,8 +515,8 @@ class FlashAttentionBackwardSm90:
             tma_tensor_K,
             tma_tensor_V,
             tma_tensor_dO,
-            tma_tensor_dK if const_expr(self.direct_dkv_store) else mdK,
-            tma_tensor_dV if const_expr(self.direct_dkv_store) else mdV,
+            tma_tensor_dK if const_expr(self.qhead_per_kvhead == 1) else mdK,
+            tma_tensor_dV if const_expr(self.qhead_per_kvhead == 1) else mdV,
             tma_atom_Q,
             tma_atom_K,
             tma_atom_V,
@@ -601,10 +610,9 @@ class FlashAttentionBackwardSm90:
 
         # prefetch TMA descriptors
         if warp_idx == 0:
-            cpasync.prefetch_descriptor(tma_atom_Q)
-            cpasync.prefetch_descriptor(tma_atom_K)
-            cpasync.prefetch_descriptor(tma_atom_V)
-            cpasync.prefetch_descriptor(tma_atom_dO)
+            for atom in [tma_atom_Q, tma_atom_K, tma_atom_V, tma_atom_dO, tma_atom_dK, tma_atom_dV]:
+                if const_expr(atom is not None):
+                    cpasync.prefetch_descriptor(atom)
 
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(SharedStorage)
@@ -1274,7 +1282,7 @@ class FlashAttentionBackwardSm90:
                         fastdiv_mods=fastdiv_mods,
                     )
 
-                if const_expr(self.direct_dkv_store):
+                if const_expr(self.qhead_per_kvhead == 1):
                     acc_dK.store(acc_dK.load() * softmax_scale)
                 self.epilogue_dKV(
                     acc_dV,
@@ -1511,9 +1519,13 @@ class FlashAttentionBackwardSm90:
         )
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
-        if const_expr(self.direct_dkv_store):
-            mdV_cur = mdV[None, None, head_idx, batch_idx]
-            mdK_cur = mdK[None, None, head_idx, batch_idx]
+        if const_expr(self.qhead_per_kvhead == 1):
+            mdK_cur = seqlen.offset_batch_K(mdK, batch_idx, dim=3, ragged=self.varlen_k)[
+                None, None, head_idx
+            ]
+            mdV_cur = seqlen.offset_batch_K(mdV, batch_idx, dim=3, ragged=self.varlen_k)[
+                None, None, head_idx
+            ]
             gdK = cute.local_tile(mdK_cur, (self.tile_n, self.tile_hdim), (n_block, 0))
             gdV = cute.local_tile(mdV_cur, (self.tile_n, self.tile_hdimv), (n_block, 0))
             store_dK, _, _ = copy_utils.tma_get_copy_fn(

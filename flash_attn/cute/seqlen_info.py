@@ -5,6 +5,8 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, const_expr
 
+from quack import copy_utils
+
 """
 This consolidates all the info related to sequence length. This is so that we can do all
 the gmem reads once at the beginning of each tile, rather than having to repeat these reads
@@ -50,7 +52,7 @@ class SeqlenInfo:
         padded: cutlass.Constexpr[bool] = False,
         multiple: int = 1,
     ) -> cute.Tensor:
-        """Offset a tensor by batch index. Seqlen dim is at position `dim`."""
+        """Offset a tensor by batch index. batch dim is at position `dim`, seqlen is at dim=0."""
         if const_expr(not self.has_cu_seqlens):
             idx = (None,) * dim + (batch_idx,) + (None,) * (cute.rank(mT) - 1 - dim)
             return mT[idx]
@@ -150,15 +152,27 @@ class SeqlenInfoQK:
         batch_idx: Int32,
         dim: int,
         padded: cutlass.Constexpr[bool] = False,
+        ragged: cutlass.Constexpr[bool] = False,
     ) -> cute.Tensor:
         """Seqlen must be the first dimension of mK"""
-        if const_expr(not self.has_cu_seqlens_k):
-            idx = (None,) * dim + (batch_idx,) + (None,) * (cute.rank(mK) - 1 - dim)
-            return mK[idx]
+        if const_expr(not ragged):
+            if const_expr(not self.has_cu_seqlens_k):
+                idx = (None,) * dim + (batch_idx,) + (None,) * (cute.rank(mK) - 1 - dim)
+                return mK[idx]
+            else:
+                offset_k = self.offset_k if const_expr(not padded) else self.padded_offset_k
+                idx = (offset_k,) + (None,) * (cute.rank(mK) - 1)
+                return cute.domain_offset(idx, mK)
         else:
-            offset_k = self.offset_k if const_expr(not padded) else self.padded_offset_k
-            idx = (offset_k,) + (None,) * (cute.rank(mK) - 1)
-            return cute.domain_offset(idx, mK)
+            if const_expr(not self.has_cu_seqlens_k):
+                offset_k = 0
+                idx = (None,) * dim + (batch_idx,) + (None,) * (cute.rank(mK) - 1 - dim)
+                mK = mK[idx]
+            else:
+                offset_k = self.offset_k if const_expr(not padded) else self.padded_offset_k
+            return copy_utils.offset_ragged_tensor(
+                mK, offset_k, self.seqlen_k, ragged_dim=0, ptr_shift=True
+            )
 
 
 @dataclass(frozen=True)
