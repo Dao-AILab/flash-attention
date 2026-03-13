@@ -424,6 +424,7 @@ for headdim in [128]:
                 #     pytorch_profiler(flash_attn_varlen_func_v3, q_unpad, k_unpad, v_unpad, cu_seqlens_q, cu_seqlens_k, seqlen_q, seqlen, causal=causal, deterministic=deterministic, backward=True)
             # benchmark_forward(torch.clone, k, repeats=repeats, verbose=verbose, desc='Memcpy')
             if dtype != torch.float8_e4m3fn and flash_attn_func_python is not None and has_backward:
+                time.sleep(1)
                 if not varlen:
                     _, m1b_py = benchmark_backward(flash_attn_func_python, q, k, v, causal=causal, softcap=softcap, deterministic=deterministic, repeats=repeats, verbose=False, desc='Fav4 python')
                 else:

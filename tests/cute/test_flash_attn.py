@@ -294,11 +294,6 @@ def test_flash_attn_output(
             # and False
             and not ((causal or local) and seqlen_k < seqlen_q)
         ):
-            # TODO: SM90 backward pass has invalid MMA tile config for d=64 + non-causal
-            # The m_block_size=80 (non-causal) with head_dim=64 creates an invalid tile.
-            # Fix requires adjusting m_block_size or MMA config in flash_bwd_sm90.py
-            if IS_SM90 and d == 64 and not causal:
-                pytest.xfail("SM90 backward: d=64 + non-causal has invalid MMA tile config (m_block=80)")
             if d == 192 and local:
                 pytest.xfail("hdim 192 backward: local attention not supported yet")
             g = torch.randn_like(out)
@@ -1428,9 +1423,6 @@ def test_flash_attn_kvcache(
 @pytest.mark.parametrize("seqlen_q,seqlen_k", [(128, 128), (256, 256)])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_bwd_preallocated_outputs(seqlen_q, seqlen_k, d, causal, dtype):
-    if IS_SM90 and d == 64 and not causal:
-        pytest.xfail("SM90 backward: d=64 + non-causal has invalid MMA tile config (m_block=80)")
-
     from flash_attn.cute.interface import _flash_attn_fwd, _flash_attn_bwd
 
     device = "cuda"
@@ -1471,9 +1463,6 @@ def test_flash_attn_bwd_preallocated_outputs(seqlen_q, seqlen_k, d, causal, dtyp
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_lse_grad(seqlen_q, seqlen_k, d, causal, dtype):
     """Test that gradient flows through the returned LSE tensor."""
-    if IS_SM90 and d == 64:
-        pytest.xfail("SM90 backward: d=64 has MMA tile config issues")
-
     device = "cuda"
     torch.random.manual_seed(42)
     batch_size = 2

@@ -215,8 +215,9 @@ class FlashAttentionBackwardSm90:
         # TODO: assert that sVaccum and sKaccum don't overflow smem
 
     def _get_tiled_mma(self):
+        maybe_swap_mn = lambda shape, swap: (shape[1], shape[0], *shape[2:]) if swap else shape
         # S = Q @ K.T, dP = dO @ V.T
-        atom_layout_SdP = (self.AtomLayoutMSdP, self.num_mma_warp_groups // self.AtomLayoutMSdP)
+        atom_layout_SdP = (self.AtomLayoutMSdP, self.num_mma_warp_groups // self.AtomLayoutMSdP, 1)
         tiler_mn_SdP = (self.tile_m // atom_layout_SdP[0], self.tile_n // atom_layout_SdP[1])
         tiled_mma_SdP = sm90_utils_basic.make_trivial_tiled_mma(
             self.dtype,
@@ -224,12 +225,11 @@ class FlashAttentionBackwardSm90:
             warpgroup.OperandMajorMode.K,
             warpgroup.OperandMajorMode.K,
             Float32,
-            atom_layout_mnk=(atom_layout_SdP if not self.SdP_swapAB else atom_layout_SdP[::-1])
-            + (1,),
-            tiler_mn=tiler_mn_SdP if not self.SdP_swapAB else tiler_mn_SdP[::-1],
+            atom_layout_mnk=maybe_swap_mn(atom_layout_SdP, self.SdP_swapAB),
+            tiler_mn=maybe_swap_mn(tiler_mn_SdP, self.SdP_swapAB),
         )
         # dV = P.T @ dO, dK = dS.T @ Q
-        atom_layout_dKV = (self.AtomLayoutNdKV, self.num_mma_warp_groups // self.AtomLayoutNdKV)
+        atom_layout_dKV = (self.AtomLayoutNdKV, self.num_mma_warp_groups // self.AtomLayoutNdKV, 1)
         tiler_mn_dK = (self.tile_n // atom_layout_dKV[0], self.tile_hdim // atom_layout_dKV[1])
         tiler_mn_dV = (self.tile_n // atom_layout_dKV[0], self.tile_hdimv // atom_layout_dKV[1])
         tiled_mma_dK, tiled_mma_dV = [
@@ -241,9 +241,8 @@ class FlashAttentionBackwardSm90:
                 else warpgroup.OperandMajorMode.K,
                 warpgroup.OperandMajorMode.MN,
                 Float32,
-                atom_layout_mnk=(atom_layout_dKV if not self.dKV_swapAB else atom_layout_dKV[::-1])
-                + (1,),
-                tiler_mn=tiler_mn_d if not self.dKV_swapAB else tiler_mn_d[::-1],
+                atom_layout_mnk=maybe_swap_mn(atom_layout_dKV, self.dKV_swapAB),
+                tiler_mn=maybe_swap_mn(tiler_mn_d, self.dKV_swapAB),
                 a_source=warpgroup.OperandSource.RMEM
                 if self.mma_dkv_is_rs
                 else warpgroup.OperandSource.SMEM,
@@ -251,7 +250,7 @@ class FlashAttentionBackwardSm90:
             for tiler_mn_d in (tiler_mn_dK, tiler_mn_dV)
         ]
         # dQ = dS @ K
-        atom_layout_dQ = (self.AtomLayoutMdQ, self.num_mma_warp_groups // self.AtomLayoutMdQ)
+        atom_layout_dQ = (self.AtomLayoutMdQ, self.num_mma_warp_groups // self.AtomLayoutMdQ, 1)
         tiler_mn_dQ = (self.tile_m // atom_layout_dQ[0], self.tile_hdim // atom_layout_dQ[1])
         tiled_mma_dQ = sm90_utils_basic.make_trivial_tiled_mma(
             self.dtype,
@@ -259,8 +258,8 @@ class FlashAttentionBackwardSm90:
             warpgroup.OperandMajorMode.K if not self.dQ_swapAB else warpgroup.OperandMajorMode.MN,
             warpgroup.OperandMajorMode.MN if not self.dQ_swapAB else warpgroup.OperandMajorMode.K,
             Float32,
-            atom_layout_mnk=(atom_layout_dQ if not self.dQ_swapAB else atom_layout_dQ[::-1]) + (1,),
-            tiler_mn=tiler_mn_dQ if not self.dQ_swapAB else tiler_mn_dQ[::-1],
+            atom_layout_mnk=maybe_swap_mn(atom_layout_dQ, self.dQ_swapAB),
+            tiler_mn=maybe_swap_mn(tiler_mn_dQ, self.dQ_swapAB),
         )
         return tiled_mma_SdP, tiled_mma_dK, tiled_mma_dV, tiled_mma_dQ
 
@@ -377,10 +376,14 @@ class FlashAttentionBackwardSm90:
         self.num_threads_per_warp_group = 128
         self.num_producer_threads = 32
 
-        self.num_mma_regs = 240
-        self.num_producer_regs = 24
-        # self.num_mma_regs = 232
-        # self.num_producer_regs = 40
+        if const_expr(self.num_mma_warp_groups == 2):
+            self.num_mma_regs = 240
+            self.num_producer_regs = 24
+        else:  # 3 warp groups
+            self.num_mma_regs = 160
+            self.num_producer_regs = 32
+        REG_LIMIT = 504 if self.num_mma_warp_groups == 2 else 512
+        assert self.num_mma_regs * self.num_mma_warp_groups + self.num_producer_regs <= REG_LIMIT
 
         self._setup_attributes()
         SharedStorage = self._get_shared_storage_cls()
