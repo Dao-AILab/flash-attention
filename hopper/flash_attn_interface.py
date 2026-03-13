@@ -8,6 +8,12 @@ import torch.nn as nn
 
 
 USE_TRITON_ROCM = os.getenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", "FALSE") == "TRUE"
+if not USE_TRITON_ROCM and getattr(torch.version, 'hip', None) is not None:
+    try:
+        import flash_attn_3._C
+    except ImportError:
+        USE_TRITON_ROCM = True
+
 if USE_TRITON_ROCM:
     from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_3 as flash_attn_3_gpu
 else:
@@ -17,7 +23,7 @@ else:
 
     # isort: on
 
-    flash_attn_3_gpu = torch.ops.flash_attn_3
+    flash_attn_3_gpu = torch.ops.flash_attn_3_gpu
 
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
