@@ -170,7 +170,6 @@ class FlashAttentionForwardSm100:
             use_clc_scheduler
             and self.use_tma_KV
             and not self.overlap_sO_sQ
-            and not is_varlen_q
         )
         self.sched_stages = sched_stages
         if self.use_clc_scheduler:
@@ -989,15 +988,7 @@ class FlashAttentionForwardSm100:
             clc_pipeline_producer_group = cutlass_pipeline.CooperativeGroup(
                 cutlass_pipeline.Agent.Thread
             )
-            num_clc_consumer_warps_per_cta = (
-                len(self.empty_warp_ids)
-                + len(self.load_warp_ids)
-                + 1  # mma_warp_id
-                + len(self.softmax0_warp_ids)
-                + len(self.softmax1_warp_ids)
-                + len(self.correction_warp_ids)
-                + len(self.epilogue_warp_ids)
-            )
+            num_clc_consumer_warps_per_cta = self.threads_per_cta // cute.arch.WARP_SIZE
             # NB on CTA0 warp15 == scheduler on CTA1 == empty but still both consume
             num_clc_consumer_warps = num_clc_consumer_warps_per_cta * self.cta_group_size
             clc_pipeline_consumer_group = cutlass_pipeline.CooperativeGroup(
