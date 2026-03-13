@@ -31,13 +31,17 @@ pytestmark = pytest.mark.skipif(
     reason="CLC adversarial tests require SM100/SM110 persistent forward",
 )
 
-_captured_schedulers: list[tuple[type, SchedulingMode]] = []
+_captured_schedulers: list[tuple[type, SchedulingMode, bool]] = []
 _orig_init = FlashAttentionForwardSm100.__init__
 
 
 def _spy_init(self_inner, *a, **kw):
     _orig_init(self_inner, *a, **kw)
-    _captured_schedulers.append((self_inner.TileScheduler, self_inner.scheduling_mode))
+    _captured_schedulers.append((
+        self_inner.TileScheduler,
+        self_inner.scheduling_mode,
+        self_inner.use_2cta_instrs,
+    ))
 
 
 @contextmanager
@@ -50,14 +54,16 @@ def clc_scheduler_enabled():
         yield
 
 
-def check_output(q, k, v, *, causal=False, window_size=(None, None), num_splits=1, assert_clc=True):
+def check_output(q, k, v, *, causal=False, window_size=(None, None), num_splits=1, assert_clc=True, assert_2cta=False):
     _captured_schedulers.clear()
     out, _ = flash_attn_func(q, k, v, causal=causal, window_size=window_size, num_splits=num_splits)
     torch.cuda.synchronize()
     if assert_clc and _captured_schedulers:
-        sched_cls, sched_mode = _captured_schedulers[-1]
+        sched_cls, sched_mode, use_2cta = _captured_schedulers[-1]
         assert sched_cls is SingleTileLPTScheduler, f"Expected SingleTileLPTScheduler, got {sched_cls.__name__}"
         assert sched_mode == SchedulingMode.CLC, f"Expected CLC scheduling mode, got {sched_mode!r}"
+        if assert_2cta:
+            assert use_2cta, "Expected use_2cta_instrs=True but got False"
     out_ref, _ = attention_ref(q, k, v, causal=causal, window_size=window_size)
     out_pt, _ = attention_ref(q, k, v, causal=causal, window_size=window_size, upcast=False, reorder_ops=True)
     fwd_atol = 2 * (out_ref + 0.3 - 0.3 - out_ref).abs().max().item()
@@ -162,30 +168,31 @@ class TestCLCPrimes:
 
 class TestCLC2CTA:
     @pytest.mark.parametrize("sq,sk", [
-        (128, 512),
-        (256, 127),
-        (256, 129),
-        (128, 2048),
-        (1, 512),
-        (64, 1024),
+        (512, 512),
+        (512, 127),
+        (512, 129),
+        (512, 2048),
+        (1024, 64),
+        (768, 1024),
         (512, 64),
     ])
     def test_2cta_qk_mismatch(self, sq, sk):
-        check_output(randn(4, sq, 4, 128), randn(4, sk, 4, 128), randn(4, sk, 4, 128))
+        check_output(randn(4, sq, 4, 128), randn(4, sk, 4, 128), randn(4, sk, 4, 128), assert_2cta=True)
 
     @pytest.mark.parametrize("batch,heads,sq,sk", [
-        (1, 1, 128, 128),
-        (1, 1, 256, 512),
-        (3, 5, 128, 1024),
+        (1, 1, 512, 128),
+        (1, 1, 512, 512),
+        (3, 5, 768, 1024),
         (7, 3, 512, 127),
-        (9, 7, 256, 257),
-        (13, 1, 128, 64),
+        (9, 7, 1024, 257),
+        (13, 1, 512, 64),
     ])
     def test_2cta_adversarial_combos(self, batch, heads, sq, sk):
         check_output(
             randn(batch, sq, heads, 128),
             randn(batch, sk, heads, 128),
             randn(batch, sk, heads, 128),
+            assert_2cta=True,
         )
 
 
@@ -235,14 +242,14 @@ class TestCLCHeadDim:
         _captured_schedulers.clear()
         check_output(randn(4, 128, 4, 192), randn(4, 257, 4, 192), randn(4, 257, 4, 128), assert_clc=False)
         assert _captured_schedulers, "No scheduler was captured"
-        sched_cls, sched_mode = _captured_schedulers[-1]
+        sched_cls, sched_mode, *_ = _captured_schedulers[-1]
         assert sched_cls is SingleTileScheduler, f"Expected SingleTileScheduler fallback, got {sched_cls.__name__}"
         assert sched_mode == SchedulingMode.STATIC, f"Expected STATIC fallback, got {sched_mode!r}"
 
 
 class TestCLCFallback:
 
-    def test_varlen_fallback(self):
+    def test_varlen_uses_clc(self):
         _captured_schedulers.clear()
         batch, seqlen, heads, d = 4, 256, 4, 128
         lens = torch.tensor([64, 128, 32, 32], dtype=torch.int32)
@@ -260,11 +267,11 @@ class TestCLCFallback:
         )
         torch.cuda.synchronize()
         assert _captured_schedulers, "No scheduler was captured"
-        sched_cls, sched_mode = _captured_schedulers[-1]
+        sched_cls, sched_mode, *_ = _captured_schedulers[-1]
         assert sched_cls is SingleTileVarlenScheduler, (
-            f"Expected SingleTileVarlenScheduler fallback for varlen, got {sched_cls.__name__}"
+            f"Expected SingleTileVarlenScheduler for varlen, got {sched_cls.__name__}"
         )
-        assert sched_mode == SchedulingMode.STATIC, f"Expected STATIC fallback, got {sched_mode!r}"
+        assert sched_mode == SchedulingMode.CLC, f"Expected CLC scheduling mode, got {sched_mode!r}"
 
     @pytest.mark.parametrize("sq,sk,wl,wr", [
         (512, 512, 128, 128),
@@ -279,6 +286,181 @@ class TestCLCFallback:
             randn(4, sk, 4, 128),
             window_size=(wl, wr),
         )
+
+
+def check_varlen_output(seqlens, heads, d, *, causal=False, kv_heads=None, num_splits=1):
+    kv_heads = kv_heads or heads
+    cu_seqlens = torch.cat([torch.zeros(1, dtype=torch.int32), torch.tensor(seqlens, dtype=torch.int32).cumsum(0)]).to(device="cuda", dtype=torch.int32)
+    total = int(cu_seqlens[-1])
+    max_s = max(seqlens)
+    q = torch.randn(total, heads, d, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(total, kv_heads, d, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(total, kv_heads, d, device="cuda", dtype=torch.bfloat16)
+
+    _captured_schedulers.clear()
+    out, _ = flash_attn_varlen_func(
+        q, k, v,
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_k=cu_seqlens,
+        max_seqlen_q=max_s,
+        max_seqlen_k=max_s,
+        causal=causal,
+        num_splits=num_splits,
+    )
+    torch.cuda.synchronize()
+    if _captured_schedulers:
+        sched_cls, sched_mode, *_ = _captured_schedulers[-1]
+        assert sched_cls is SingleTileVarlenScheduler, f"Expected SingleTileVarlenScheduler, got {sched_cls.__name__}"
+        assert sched_mode == SchedulingMode.CLC, f"Expected CLC scheduling mode, got {sched_mode!r}"
+
+    for i in range(len(seqlens)):
+        s = slice(cu_seqlens[i], cu_seqlens[i + 1])
+        qi, ki, vi, oi = q[s].unsqueeze(0), k[s].unsqueeze(0), v[s].unsqueeze(0), out[s].unsqueeze(0)
+        out_ref_i, _ = attention_ref(qi, ki, vi, causal=causal)
+        out_pt_i, _ = attention_ref(qi, ki, vi, causal=causal, upcast=False, reorder_ops=True)
+        fwd_atol = 2 * (out_ref_i + 0.3 - 0.3 - out_ref_i).abs().max().item()
+        assert (oi - out_ref_i).abs().max().item() <= 2 * (
+            out_pt_i - out_ref_i
+        ).abs().max().item() + fwd_atol, (
+            f"batch={i} max_diff={(oi - out_ref_i).abs().max().item()}, "
+            f"pt_max_diff={(out_pt_i - out_ref_i).abs().max().item()}, "
+            f"seqlens={seqlens} heads={heads} d={d} causal={causal} num_splits={num_splits}"
+        )
+
+
+def check_varlen_output_seqused(seqlens, heads, d, *, causal=False, kv_heads=None, num_splits=1):
+    kv_heads = kv_heads or heads
+    batch = len(seqlens)
+    max_s = max(seqlens)
+    seqused = torch.tensor(seqlens, device="cuda", dtype=torch.int32)
+    q = torch.randn(batch, max_s, heads, d, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(batch, max_s, kv_heads, d, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(batch, max_s, kv_heads, d, device="cuda", dtype=torch.bfloat16)
+    q_mask = torch.arange(max_s, device="cuda")[None, :] < seqused[:, None]
+    k_mask = q_mask
+
+    _captured_schedulers.clear()
+    out, _ = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        max_seqlen_q=max_s,
+        max_seqlen_k=max_s,
+        seqused_q=seqused,
+        seqused_k=seqused,
+        causal=causal,
+        num_splits=num_splits,
+    )
+    torch.cuda.synchronize()
+    if _captured_schedulers:
+        sched_cls, sched_mode, *_ = _captured_schedulers[-1]
+        assert sched_cls is SingleTileVarlenScheduler, f"Expected SingleTileVarlenScheduler, got {sched_cls.__name__}"
+        assert sched_mode == SchedulingMode.CLC, f"Expected CLC scheduling mode, got {sched_mode!r}"
+
+    out_ref, _ = attention_ref(q, k, v, q_mask, k_mask, causal=causal)
+    out_pt, _ = attention_ref(q, k, v, q_mask, k_mask, causal=causal, upcast=False, reorder_ops=True)
+    q_mask_4d = q_mask.unsqueeze(-1).unsqueeze(-1)
+    out_masked = out.clone().masked_fill_(~q_mask_4d, 0.0)
+    out_ref_masked = out_ref.clone().masked_fill_(~q_mask_4d, 0.0)
+    out_pt_masked = out_pt.clone().masked_fill_(~q_mask_4d, 0.0)
+    fwd_atol = 2 * (out_ref_masked + 0.3 - 0.3 - out_ref_masked).abs().max().item()
+    assert (out_masked - out_ref_masked).abs().max().item() <= 2 * (
+        out_pt_masked - out_ref_masked
+    ).abs().max().item() + fwd_atol, (
+        f"max_diff={(out_masked - out_ref_masked).abs().max().item()}, "
+        f"pt_max_diff={(out_pt_masked - out_ref_masked).abs().max().item()}, "
+        f"seqlens={seqlens} heads={heads} d={d} causal={causal} num_splits={num_splits}"
+    )
+
+
+class TestCLCVarlen:
+
+    @pytest.mark.parametrize("seqlens", [
+        [64, 128, 32, 32],
+        [256, 64, 128, 256],
+        [1, 512, 1, 1],
+        [128, 128, 128, 128],
+        [512, 256, 128, 64],
+        [1, 1, 1, 1],
+        [255, 129, 63, 193],
+    ])
+    def test_varlen_basic(self, seqlens):
+        check_varlen_output(seqlens, heads=4, d=128)
+
+    @pytest.mark.parametrize("seqlens", [
+        [64, 128, 32, 32],
+        [256, 64, 128, 256],
+        [512, 256, 128, 64],
+        [255, 129, 63, 193],
+    ])
+    def test_varlen_causal(self, seqlens):
+        check_varlen_output(seqlens, heads=4, d=128, causal=True)
+
+    @pytest.mark.parametrize("seqlens", [
+        [64, 128, 32, 32],
+        [1, 512, 1, 1],
+        [255, 129, 63, 193],
+    ])
+    def test_varlen_gqa(self, seqlens):
+        check_varlen_output(seqlens, heads=8, d=128, kv_heads=2)
+
+    @pytest.mark.parametrize("seqlens,heads", [
+        pytest.param([512], 4, id="single_batch"),
+        pytest.param([256, 128], 8, id="two_batch"),
+        pytest.param([64] * 32, 4, id="many_batches"),
+        pytest.param([1, 1, 1, 1024, 1, 1, 1, 1], 4, id="imbalanced"),
+    ])
+    def test_varlen_edge_cases(self, seqlens, heads):
+        check_varlen_output(seqlens, heads=heads, d=128)
+
+    @pytest.mark.parametrize("seqlens", [
+        [127, 131, 251, 193],
+        [1, 3, 7, 13, 31, 61],
+        [509, 127, 251, 67],
+    ])
+    def test_varlen_primes(self, seqlens):
+        check_varlen_output(seqlens, heads=4, d=128)
+
+    @pytest.mark.parametrize("d", [64, 96, 128])
+    def test_varlen_head_dims(self, d):
+        check_varlen_output([128, 256, 64, 192], heads=4, d=d)
+
+    @pytest.mark.parametrize("trial", range(3))
+    def test_varlen_repeatability(self, trial):
+        torch.random.manual_seed(trial)
+        check_varlen_output([64, 128, 32, 256, 1, 512], heads=4, d=128)
+
+    @pytest.mark.parametrize("seqlens", [
+        [64, 128, 32, 256],
+        [255, 129, 63, 193],
+    ])
+    @pytest.mark.parametrize("num_splits", [2, 3])
+    def test_varlen_splitkv(self, seqlens, num_splits):
+        check_varlen_output(seqlens, heads=4, d=64, num_splits=num_splits)
+
+    @pytest.mark.parametrize("seqlens", [
+        [64, 128, 32, 256],
+        [255, 129, 63, 193],
+    ])
+    @pytest.mark.parametrize("num_splits", [2, 3])
+    def test_varlen_seqused_splitkv(self, seqlens, num_splits):
+        check_varlen_output_seqused(seqlens, heads=4, d=64, num_splits=num_splits)
+
+    @pytest.mark.parametrize("seqlens", [
+        [64, 128, 32, 256],
+        [255, 129, 63, 193],
+    ])
+    @pytest.mark.parametrize("num_splits", [2, 3])
+    def test_varlen_splitkv_gqa(self, seqlens, num_splits):
+        check_varlen_output(seqlens, heads=8, kv_heads=2, d=64, num_splits=num_splits)
+
+    @pytest.mark.parametrize("seqlens", [
+        [64, 128, 32, 256],
+        [255, 129, 63, 193],
+    ])
+    @pytest.mark.parametrize("num_splits", [2, 3])
+    def test_varlen_seqused_splitkv_gqa(self, seqlens, num_splits):
+        check_varlen_output_seqused(seqlens, heads=8, kv_heads=2, d=64, num_splits=num_splits)
 
 
 class TestCLCMinimal:

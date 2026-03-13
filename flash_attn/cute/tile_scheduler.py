@@ -588,6 +588,7 @@ class SingleTileLPTScheduler:
             work = self.get_current_work()
             self.clc.consumer_release(loc=loc, ip=ip)
             return work
+        # Single tile scheduler - set to invalid tile_idx to indicate no more work
         self._tile_idx = self.params.total_blocks
         return self.get_current_work()
 
@@ -767,12 +768,20 @@ class SingleTileVarlenScheduler:
         is_split_kv: cutlass.Constexpr[bool] = False
         head_swizzle: cutlass.Constexpr[bool] = False
         cluster_shape_m: cutlass.Constexpr[int] = 1
+        scheduling_mode: cutlass.Constexpr[SchedulingMode] = SchedulingMode.STATIC
 
         @staticmethod
         @cute.jit
         def create(
-            args: TileSchedulerArguments, *, loc=None, ip=None
+            args: TileSchedulerArguments,
+            *,
+            scheduling_mode: SchedulingMode = SchedulingMode.STATIC,
+            loc=None,
+            ip=None,
         ) -> "SingleTileVarlenScheduler.Params":
+            assert scheduling_mode in (SchedulingMode.STATIC, SchedulingMode.CLC), (
+                f"Only STATIC and CLC are supported, got {scheduling_mode!r}"
+            )
             size_l2 = 50 * 1024 * 1024  # 50 MB for K & V
             # if backward, this is qdo block size
             kv_block_size = (
@@ -786,6 +795,11 @@ class SingleTileVarlenScheduler:
                 "At least one of mCuSeqlensQ or mSeqUsedQ must be provided"
             )
             assert args.cluster_shape_mn[1] == 1, "Only cluster_shape_mn[1] == 1 is supported"
+            # TODO: Support varlen CLC with cluster_shape_m > 1 by refactoring the
+            # flattened-tile decode so cluster unpacking semantics are explicit.
+            assert scheduling_mode != SchedulingMode.CLC or args.cluster_shape_mn[0] == 1, (
+                "Varlen CLC currently requires cluster_shape_mn[0] == 1"
+            )
             return SingleTileVarlenScheduler.Params(
                 num_head=args.num_head,
                 num_batch=args.num_batch,
@@ -800,13 +814,24 @@ class SingleTileVarlenScheduler:
                 is_split_kv=args.is_split_kv,
                 head_swizzle=args.head_swizzle,
                 cluster_shape_m=args.cluster_shape_mn[0],
+                scheduling_mode=scheduling_mode,
             )
 
-    def __init__(self, params: Params, tile_idx: Int32, split_idx: Int32, *, loc=None, ip=None):
+    def __init__(
+        self,
+        params: Params,
+        tile_idx: Int32,
+        split_idx: Int32,
+        clc: ClcState | None = None,
+        *,
+        loc=None,
+        ip=None,
+    ):
         self.params = params
         self._tile_idx = tile_idx
         self._split_idx = split_idx
         self._is_first_block = True
+        self.clc = clc
         self._loc = loc
         self._ip = ip
 
@@ -818,13 +843,36 @@ class SingleTileVarlenScheduler:
         loc=None,
         ip=None,
     ) -> Params:
-        assert scheduling_mode == SchedulingMode.STATIC, (
-            f"SingleTileVarlenScheduler only supports STATIC, got {scheduling_mode!r}"
+        return SingleTileVarlenScheduler.Params.create(
+            args, scheduling_mode=scheduling_mode, loc=loc, ip=ip
         )
-        return SingleTileVarlenScheduler.Params.create(args, loc=loc, ip=ip)
 
     @staticmethod
-    def create(params: Params, *, loc=None, ip=None) -> "SingleTileVarlenScheduler":
+    @cute.jit
+    def clc_problem_shape(params: Params):
+        return ClcDynamicPersistentTileSchedulerParams(
+            problem_shape_ntile_mnl=SingleTileVarlenScheduler.get_grid_shape(params),
+            cluster_shape_mnk=(1, 1, 1),
+        )
+
+    @staticmethod
+    @cute.jit
+    def create(
+        params: Params, clc: ClcState | None = None, *, loc=None, ip=None
+    ) -> "SingleTileVarlenScheduler":
+        if const_expr(params.scheduling_mode == SchedulingMode.CLC):
+            block_idx = cute.arch.block_idx()
+            split_idx = Int32(0)
+            if const_expr(params.is_split_kv):
+                split_idx = block_idx[1]
+            return SingleTileVarlenScheduler(
+                params,
+                block_idx[0],
+                split_idx,
+                clc,
+                loc=loc,
+                ip=ip,
+            )
         tile_idx, split_idx, _ = cute.arch.block_idx()
         return SingleTileVarlenScheduler(params, tile_idx, split_idx, loc=loc, ip=ip)
 
@@ -840,7 +888,7 @@ class SingleTileVarlenScheduler:
             params.total_q
             + params.num_batch * (params.cluster_shape_m * params.tile_shape_mn[0] - 1)
         ) // params.tile_shape_mn[0]
-        # round down to nearest multiple of cluster since odd excess is always padding
+        # Round down to nearest multiple of cluster since odd excess is always padding.
         total_blocks_max = total_blocks_max // params.cluster_shape_m * params.cluster_shape_m
         return (total_blocks_max * params.num_head, params.num_splits, Int32(1))
 
@@ -868,7 +916,8 @@ class SingleTileVarlenScheduler:
         )
 
     @cute.jit
-    def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
+    def _varlen_coord_map(self) -> WorkTileInfo:
+        """Map self._tile_idx to (block, head, batch) via warp-level prefix sums."""
         params = self.params
         lane_idx = cute.arch.lane_idx()
         num_m_blocks = self._get_num_m_blocks(lane_idx, bidb_start=0)
@@ -966,20 +1015,62 @@ class SingleTileVarlenScheduler:
         split_idx = self._split_idx if const_expr(params.is_split_kv) else Int32(0)
         return WorkTileInfo((Int32(block), Int32(head_idx), Int32(batch_idx), split_idx), is_valid)
 
+    @cute.jit
+    def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
+        if const_expr(self.params.scheduling_mode == SchedulingMode.CLC):
+            clc_work = self.clc.get_current_work()
+            # Default to grid_dim (one past last valid flat index) so _varlen_coord_map
+            # returns is_valid=False when CLC is exhausted. CLC tile_idx is garbage when
+            # invalid, so we can't trust it. Local-then-assign avoids CuTe DSL structural
+            # mismatch on self inside the runtime if.
+            new_tile_idx = cute.arch.grid_dim()[0]
+            new_split_idx = Int32(0)
+            if clc_work.is_valid_tile:
+                new_tile_idx = clc_work.tile_idx[0]
+                if const_expr(self.params.is_split_kv):
+                    new_split_idx = clc_work.tile_idx[1]
+            self._tile_idx = new_tile_idx
+            self._split_idx = new_split_idx
+        return self._varlen_coord_map()
+
+    @cute.jit
     def initial_work_tile_info(self, *, loc=None, ip=None):
-        return self.get_current_work(loc=loc, ip=ip)
+        if const_expr(self.params.scheduling_mode == SchedulingMode.CLC):
+            clc_work = self.clc.initial_work_tile_info()
+            # See get_current_work for why grid_dim and local-then-assign.
+            new_tile_idx = cute.arch.grid_dim()[0]
+            new_split_idx = Int32(0)
+            if clc_work.is_valid_tile:
+                new_tile_idx = clc_work.tile_idx[0]
+                if const_expr(self.params.is_split_kv):
+                    new_split_idx = clc_work.tile_idx[1]
+            self._tile_idx = new_tile_idx
+            self._split_idx = new_split_idx
+        return self._varlen_coord_map()
 
     def prefetch_next_work(self, *, loc=None, ip=None):
-        pass
+        if const_expr(self.params.scheduling_mode == SchedulingMode.CLC):
+            self.clc.prefetch_next_work(loc=loc, ip=ip)
 
     def advance_to_next_work(self, *, loc=None, ip=None):
-        # Single tile scheduler - set to invalid tile_idx to indicate no more work
+        if const_expr(self.params.scheduling_mode == SchedulingMode.CLC):
+            self.clc.consumer_wait(loc=loc, ip=ip)
+            work = self.get_current_work()
+            self.clc.consumer_release(loc=loc, ip=ip)
+            return work
         self._is_first_block = False
         return self.get_current_work()
 
+    def producer_tail(self, *, loc=None, ip=None):
+        if const_expr(self.params.scheduling_mode == SchedulingMode.CLC):
+            self.clc.producer_tail(loc=loc, ip=ip)
+
     def __extract_mlir_values__(self):
         values, self._values_pos = [], []
-        for obj in [self.params, self._tile_idx, self._split_idx]:
+        objs = [self.params, self._tile_idx, self._split_idx]
+        if const_expr(self.params.scheduling_mode == SchedulingMode.CLC):
+            objs += [self.clc]
+        for obj in objs:
             obj_values = cutlass.extract_mlir_values(obj)
             values += obj_values
             self._values_pos.append(len(obj_values))
@@ -987,10 +1078,10 @@ class SingleTileVarlenScheduler:
 
     def __new_from_mlir_values__(self, values):
         obj_list = []
-        for obj, n_items in zip(
-            [self.params, self._tile_idx, self._split_idx],
-            self._values_pos,
-        ):
+        objs = [self.params, self._tile_idx, self._split_idx]
+        if const_expr(self.params.scheduling_mode == SchedulingMode.CLC):
+            objs += [self.clc]
+        for obj, n_items in zip(objs, self._values_pos):
             obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
             values = values[n_items:]
-        return SingleTileVarlenScheduler(*(tuple(obj_list)), loc=self._loc)
+        return self.__class__(*obj_list, loc=self._loc)
