@@ -1464,6 +1464,144 @@ def test_flash_attn_bwd_preallocated_outputs(seqlen_q, seqlen_k, d, causal, dtyp
     assert torch.allclose(dv, dv_ref, atol=1e-5, rtol=1e-5)
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("seqlen_q,seqlen_k", [(128, 128), (256, 256)])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_lse_grad(seqlen_q, seqlen_k, d, causal, dtype):
+    """Test that gradient flows through the returned LSE tensor."""
+    if IS_SM90 and d == 64:
+        pytest.xfail("SM90 backward: d=64 has MMA tile config issues")
+
+    device = "cuda"
+    torch.random.manual_seed(42)
+    batch_size = 2
+    nheads = 4
+
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype, requires_grad=True)
+    k = torch.randn(batch_size, seqlen_k, nheads, d, device=device, dtype=dtype, requires_grad=True)
+    v = torch.randn(batch_size, seqlen_k, nheads, d, device=device, dtype=dtype, requires_grad=True)
+
+    out, lse = flash_attn_func(q, k, v, causal=causal, return_lse=True)
+
+    if is_fake_mode():
+        return
+
+    assert lse is not None
+    assert lse.requires_grad
+
+    # Compute loss = sum(out * g) + sum(lse * dlse_weight) to test gradient flows through both
+    g = torch.randn_like(out)
+    dlse_weight = torch.randn_like(lse)
+    loss = (out * g).sum() + (lse * dlse_weight).sum()
+    dq, dk, dv = torch.autograd.grad(loss, (q, k, v))
+
+    # Compare against reference: manually compute what the gradients should be
+    # Reference: standard attention in float
+    q_ref = q.detach().float().requires_grad_()
+    k_ref = k.detach().float().requires_grad_()
+    v_ref = v.detach().float().requires_grad_()
+    # (batch, seqlen_q, nheads, d) -> (batch, nheads, seqlen_q, d)
+    qk = torch.einsum("bshd,bthd->bhst", q_ref, k_ref) / (d ** 0.5)
+    if causal:
+        mask = torch.triu(torch.ones(seqlen_q, seqlen_k, device=device, dtype=torch.bool), diagonal=seqlen_k - seqlen_q + 1)
+        qk = qk.masked_fill(mask, float("-inf"))
+    lse_ref = torch.logsumexp(qk, dim=-1)  # (batch, nheads, seqlen_q)
+    p = torch.softmax(qk, dim=-1)
+    # v_ref: (batch, seqlen_k, nheads, d)
+    out_ref = torch.einsum("bhst,bthd->bshd", p, v_ref)
+    loss_ref = (out_ref * g.float()).sum() + (lse_ref * dlse_weight.float()).sum()
+    dq_ref, dk_ref, dv_ref = torch.autograd.grad(loss_ref, (q_ref, k_ref, v_ref))
+
+    # Use relaxed tolerances since flash_attn operates in bf16 while reference is float32.
+    # The reference is also not a perfect bf16 simulation (it doesn't reorder ops), so
+    # we use a generous tolerance.
+    print(f"dQ max diff: {(dq.float() - dq_ref).abs().max().item()}")
+    print(f"dK max diff: {(dk.float() - dk_ref).abs().max().item()}")
+    print(f"dV max diff: {(dv.float() - dv_ref).abs().max().item()}")
+    # Absolute tolerance: bf16 has ~0.004-0.02 error for these sizes
+    atol = 0.02
+    assert (dq.float() - dq_ref).abs().max().item() <= atol, f"dQ error too large"
+    assert (dk.float() - dk_ref).abs().max().item() <= atol, f"dK error too large"
+    assert (dv.float() - dv_ref).abs().max().item() <= atol, f"dV error too large"
+
+    # Also test: gradient with only dLSE (no dO)
+    out2, lse2 = flash_attn_func(q, k, v, causal=causal, return_lse=True)
+    loss_lse_only = (lse2 * dlse_weight).sum()
+    dq2, dk2, dv2 = torch.autograd.grad(loss_lse_only, (q, k, v))
+
+    q_ref2 = q.detach().float().requires_grad_()
+    k_ref2 = k.detach().float().requires_grad_()
+    qk2 = torch.einsum("bshd,bthd->bhst", q_ref2, k_ref2) / (d ** 0.5)
+    if causal:
+        qk2 = qk2.masked_fill(mask, float("-inf"))
+    lse_ref2 = torch.logsumexp(qk2, dim=-1)
+    loss_ref2 = (lse_ref2 * dlse_weight.float()).sum()
+    dq_ref2, dk_ref2 = torch.autograd.grad(loss_ref2, (q_ref2, k_ref2))
+
+    print(f"LSE-only dQ max diff: {(dq2.float() - dq_ref2).abs().max().item()}")
+    print(f"LSE-only dK max diff: {(dk2.float() - dk_ref2).abs().max().item()}")
+    # dV should be zero when only LSE gradient flows (LSE doesn't depend on V)
+    print(f"LSE-only dV max: {dv2.abs().max().item()}")
+    assert dv2.abs().max().item() == 0.0, "dV should be zero when loss depends only on LSE"
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("d", [128])
+@pytest.mark.parametrize("seqlen_q,seqlen_k", [(128, 128)])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_lse_grad_unused(seqlen_q, seqlen_k, d, causal, dtype):
+    """Test return_lse=True when LSE is returned but not used in the loss.
+
+    With set_materialize_grads(False), dlse should be None (not a zero tensor),
+    so no extra zeroing kernel is launched. Gradients should match the standard
+    backward (without return_lse).
+    """
+    device = "cuda"
+    torch.random.manual_seed(42)
+    batch_size = 2
+    nheads = 4
+
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype, requires_grad=True)
+    k = torch.randn(batch_size, seqlen_k, nheads, d, device=device, dtype=dtype, requires_grad=True)
+    v = torch.randn(batch_size, seqlen_k, nheads, d, device=device, dtype=dtype, requires_grad=True)
+    g = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
+
+    # Case 1: return_lse=False (standard path, lse marked non-differentiable)
+    out1, lse1 = flash_attn_func(q, k, v, causal=causal, return_lse=False)
+    if is_fake_mode():
+        return
+    dq1, dk1, dv1 = torch.autograd.grad(out1, (q, k, v), g)
+
+    # Case 2: return_lse=True but lse NOT used in loss (dlse should be None)
+    out2, lse2 = flash_attn_func(q, k, v, causal=causal, return_lse=True)
+    dq2, dk2, dv2 = torch.autograd.grad(out2, (q, k, v), g)
+
+    # Case 3: return_lse=True and lse IS used in loss
+    out3, lse3 = flash_attn_func(q, k, v, causal=causal, return_lse=True)
+    dlse_weight = torch.randn_like(lse3)
+    loss3 = (out3 * g).sum() + (lse3 * dlse_weight).sum()
+    dq3, dk3, dv3 = torch.autograd.grad(loss3, (q, k, v))
+
+    # Cases 1 and 2 should produce identical gradients
+    assert torch.equal(dq1, dq2), "dQ should be identical when LSE is unused"
+    assert torch.equal(dk1, dk2), "dK should be identical when LSE is unused"
+    assert torch.equal(dv1, dv2), "dV should be identical when LSE is unused"
+
+    # Case 3 should differ from case 1 (LSE gradient adds extra contribution to dQ, dK)
+    assert not torch.equal(dq1, dq3), "dQ should differ when LSE gradient is included"
+    assert not torch.equal(dk1, dk3), "dK should differ when LSE gradient is included"
+    # dV should be the same since LSE doesn't depend on V
+    assert torch.equal(dv1, dv3), "dV should be identical since LSE doesn't depend on V"
+
+    print("Case 1 vs 2 (unused LSE): dQ diff =", (dq1 - dq2).abs().max().item())
+    print("Case 1 vs 3 (used LSE):   dQ diff =", (dq1 - dq3).abs().max().item())
+    print("Case 1 vs 3 (used LSE):   dK diff =", (dk1 - dk3).abs().max().item())
+    print("Case 1 vs 3 (used LSE):   dV diff =", (dv1 - dv3).abs().max().item())
+
+
 def _generate_block_kvcache(
     seqlen_k, page_size, batch_size, nheads_k, d, dv, device, dtype, dtype_ref
 ):

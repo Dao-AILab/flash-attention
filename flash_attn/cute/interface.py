@@ -220,7 +220,7 @@ def _flash_attn_fwd(
         mask_mod: A callable that takes token position information and selectively masks
         block_sparse_tensors: A tuple of tensors used for block sparsity.
         return_lse: Whether to return the log softmax of the attention scores. If set to True will always calculate
-            Note: the returned LSE currently does not support taking gradient.
+            The returned LSE supports taking gradient.
         out: Optional pre-allocated output tensor. If None, will be allocated internally.
         lse: Optional pre-allocated log-sum-exp tensor. If None, will be allocated when needed.
         aux_tensors: Some score_mods will want to read from global aux_tensors. This is how we thread them through to the inner kernel.
@@ -739,7 +739,7 @@ def make_fake_bwd_tensors(dtype, has_gqa, varlen_q, varlen_k):
 
 
 def _compile_bwd_preprocess(
-    dtype, head_dim, head_dim_v, m_block_size, has_cuseqlens_q, has_seqused_q,
+    dtype, head_dim, head_dim_v, m_block_size, has_cuseqlens_q, has_seqused_q, has_dlse,
 ):
     """Compile bwd preprocess kernel using cute fake tensors (no real GPU tensors needed)."""
     mQ, mK, mV, mO, mdO, mdQ, mdK, mdV, mLSE, mLSElog2, mPdPsum, mdQaccum, mdKaccum, mdVaccum = make_fake_bwd_tensors(
@@ -749,9 +749,10 @@ def _compile_bwd_preprocess(
     batchp1 = cute.sym_int()
     mCuSeqlensQ = fake_tensor(Int32, (batchp1,), divisibility=1) if has_cuseqlens_q else None
     mSequsedQ = fake_tensor(Int32, (batch,), divisibility=1) if has_seqused_q else None
+    mdLSE = fake_tensor(Float32, mLSE.shape, divisibility=1) if has_dlse else None
     fa_bwd_pre = FlashAttentionBackwardPreprocess(dtype, head_dim, head_dim_v, m_block_size)
     return cute.compile(
-        fa_bwd_pre, mO, mdO, mPdPsum, mLSE, mLSElog2, mdQaccum, mCuSeqlensQ, mSequsedQ,
+        fa_bwd_pre, mO, mdO, mPdPsum, mLSE, mLSElog2, mdQaccum, mCuSeqlensQ, mSequsedQ, mdLSE,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--enable-tvm-ffi",
     )
@@ -759,19 +760,19 @@ def _compile_bwd_preprocess(
 
 def _bwd_preprocess(
     out, dout, dpsum, lse, lse_log2, dq_accum,
-    cu_seqlens_q, seqused_q,
+    cu_seqlens_q, seqused_q, dlse,
     dtype, head_dim, head_dim_v, m_block_size,
 ):
-    """Backward preprocess: compute (o * dout).sum(dim=-1), lse * log2_e, and zero out dq_accum."""
+    """Backward preprocess: compute (o * dout).sum(dim=-1) - dLSE, lse * log2_e, and zero out dq_accum."""
     is_varlen = cu_seqlens_q is not None
     compile_key = (
-        dtype, head_dim, head_dim_v, m_block_size, is_varlen, seqused_q is not None,
+        dtype, head_dim, head_dim_v, m_block_size, is_varlen, seqused_q is not None, dlse is not None,
     )
     if compile_key not in _bwd_preprocess.compile_cache:
         _bwd_preprocess.compile_cache[compile_key] = _compile_bwd_preprocess(*compile_key)
     if not is_fake_mode():
         _bwd_preprocess.compile_cache[compile_key](
-            out, dout, dpsum, lse, lse_log2, dq_accum, cu_seqlens_q, seqused_q
+            out, dout, dpsum, lse, lse_log2, dq_accum, cu_seqlens_q, seqused_q, dlse
         )
 
 
@@ -867,6 +868,7 @@ def _flash_attn_bwd(
     mask_mod: Optional[Callable] = None,
     aux_tensors: Optional[list[torch.Tensor]] = None,
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
+    dlse: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     arch = _get_device_arch()
     assert arch // 10 in [9, 10, 11, 12], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x, 12.x"
@@ -1015,6 +1017,8 @@ def _flash_attn_bwd(
         if t is not None:
             assert t.dtype == torch.int32, "cu_seqlens_q, cu_seqlens_k must be int32"
     assert lse.dtype == torch.float32, "lse must be float32"
+    if dlse is not None:
+        dlse = maybe_contiguous(dlse)
     assert all(
         t is None or t.is_cuda for t in (q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k)
     ), "inputs must be on CUDA device"
@@ -1133,10 +1137,10 @@ def _flash_attn_bwd(
         dK_semaphore = None
         dV_semaphore = None
 
-    # Preprocess kernel: compute (o * dout).sum(dim=-1), lse * log2_e, and zero out dq_accum.
+    # Preprocess kernel: compute (o * dout).sum(dim=-1) - dLSE, lse * log2_e, and zero out dq_accum.
     _bwd_preprocess(
         out, dout, dpsum, lse, lse_log2, dq_accum,
-        cu_seqlens_q, seqused_q,
+        cu_seqlens_q, seqused_q, dlse,
         dtype, head_dim, head_dim_v, m_block_size,
     )
     # NB num_threads application for 3 kernels
@@ -1492,14 +1496,17 @@ class FlashAttnFunc(torch.autograd.Function):
         ctx.window_size = window_size
         ctx.softcap = softcap
         ctx.deterministic = deterministic
-        # LSE gradient is not supported yet
-        if lse is not None:
-            ctx.mark_non_differentiable(lse)
+        ctx.return_lse = return_lse
+        ctx.set_materialize_grads(False)
         return out, lse
 
     @staticmethod
-    def backward(ctx, dout, *args):
+    def backward(ctx, dout, dlse):
         q, k, v, out, lse = ctx.saved_tensors
+        if not ctx.return_lse:
+            dlse = None
+        if dout is None:
+            dout = torch.zeros_like(out)
         dq, dk, dv = _flash_attn_bwd(
             q,
             k,
@@ -1513,6 +1520,7 @@ class FlashAttnFunc(torch.autograd.Function):
             window_size_left=ctx.window_size[0],
             window_size_right=ctx.window_size[1],
             deterministic=ctx.deterministic,
+            dlse=dlse,
         )
         return dq, dk, dv, *((None,) * 20)  # Extra Nones is fine
 
@@ -1574,15 +1582,18 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         ctx.deterministic = deterministic
         ctx.max_seqlen_q = max_seqlen_q
         ctx.max_seqlen_k = max_seqlen_k
-        # LSE gradient is not supported yet
-        if lse is not None:
-            ctx.mark_non_differentiable(lse)
+        ctx.return_lse = return_lse
+        ctx.set_materialize_grads(False)
         return out, lse
 
     @staticmethod
-    def backward(ctx, dout, *args):
+    def backward(ctx, dout, dlse):
         q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = ctx.saved_tensors
         assert ctx.softcap == 0.0
+        if not ctx.return_lse:
+            dlse = None
+        if dout is None:
+            dout = torch.zeros_like(out)
         dq, dk, dv = _flash_attn_bwd(
             q,
             k,
@@ -1602,6 +1613,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             max_seqlen_q=ctx.max_seqlen_q,
             max_seqlen_k=ctx.max_seqlen_k,
             deterministic=ctx.deterministic,
+            dlse=dlse,
         )
 
         return dq, dk, dv, *((None,) * 20)
