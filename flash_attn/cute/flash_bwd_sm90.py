@@ -118,7 +118,6 @@ class FlashAttentionBackwardSm90:
         # them and then shuffle to get the value whenever we need? This can reduce register
         # pressure when SdP_swapAB, where each thread needs to keep statistics for (kBlockM / 4)
         # rows. If !SdP_swapAB, each thread only needs to keep statistics for 2 rows.
-        # TODO: impl these for hdim 64
         self.shuffle_LSE = self.SdP_swapAB and self.tile_hdim <= 64
         self.shuffle_dPsum = self.SdP_swapAB and self.tile_hdim <= 64
 
@@ -1129,6 +1128,16 @@ class FlashAttentionBackwardSm90:
         tLSEsdPsum = layout_utils.mma_partition_C_vec(
             sdPsum, thr_mma_SdP, expand_shape=self.tile_n, is_colvec=not self.SdP_swapAB
         )
+        # When shuffle=True, rows are distributed across 8 quads (4 threads each) within a warp.
+        # Each thread loads only ceil(num_rows/8) values;
+        shfl_copy = copy_utils.tiled_copy_1d(sLSE.element_type, num_threads=8, num_copy_elems=2)
+        if const_expr(self.shuffle_LSE):
+            tLSEsLSE = shfl_copy.get_slice(cute.arch.lane_idx() // 4).partition_S(tLSEsLSE)
+            # ((2, 1), 1, 2) -> (((2, 1), 1), 2)
+            tLSEsLSE = cute.group_modes(tLSEsLSE, 0, 2)
+        if const_expr(self.shuffle_dPsum):
+            tLSEsdPsum = shfl_copy.get_slice(cute.arch.lane_idx() // 4).partition_S(tLSEsdPsum)
+            tLSEsdPsum = cute.group_modes(tLSEsdPsum, 0, 2)
 
         smem_thr_copy_dQaccum = r2s_tiled_copy_dQaccum.get_slice(tidx)
         tdQsdQaccum = smem_thr_copy_dQaccum.partition_D(sdQaccum)
@@ -1316,6 +1325,22 @@ class FlashAttentionBackwardSm90:
         if warp_idx == 4:
             cute.arch.cp_async_bulk_wait_group(0, read=True)
 
+    @staticmethod
+    @cute.jit
+    def _get_stat(tSrS: cute.Tensor, row: Int32, lane: Int32, shuffle: bool) -> Float32:
+        """Retrieve the statistic for a given accumulator row.
+
+        When shuffle=False, direct register indexing.
+        When shuffle=True, warp shuffle from the thread group that holds the value.
+        """
+        if const_expr(not shuffle):
+            return tSrS[row]
+        # tSrS: (((2, 1), 1), 1)), distributed across 8 threads in the warp
+        vecsize = cute.size(tSrS, mode=[0, 0])  # 2
+        idx0, off, idx1 = cute.idx2crd(row, (vecsize, 8, cute.shape(tSrS, mode=[0, 1])))
+        # register index: 0, 1, 0, 1, ..., 2, 3, 2, 3, ...
+        return utils.shuffle_sync(tSrS[idx0 + idx1 * vecsize], offset=off * 4 + (lane % 4))
+
     @cute.jit
     def mma_one_m_block(
         self,
@@ -1351,6 +1376,7 @@ class FlashAttentionBackwardSm90:
         # (1) [GEMM 1] S = Q @ K^T
         pipeline_Q.consumer_wait(consumer_state_Q, pipeline_Q.consumer_try_wait(consumer_state_Q))
         acc_S = mma_qk_fn(A_idx=smem_idx_Q, wg_wait=-1)
+        # If shuffle_LSE, OOB reads are OK since sLSE is already padded
         tLSErLSE = copy_utils.load_s2r(tLSEsLSE[None, smem_idx_Q])
         # (2) [GEMM 2] dP = dO @ V.T
         pipeline_dO.consumer_wait(
@@ -1369,10 +1395,12 @@ class FlashAttentionBackwardSm90:
         if cutlass.const_expr(mask_fn is not None):
             mask_fn(acc_S, m_block=m_block)
         acc_S_mn = layout_utils.reshape_acc_to_mn(acc_S, transpose=self.SdP_swapAB)
+        lane_idx = cute.arch.lane_idx()
         for r in cutlass.range_constexpr(cute.size(acc_S_mn, mode=[0])):
+            lse_val = self._get_stat(tLSErLSE, r, lane_idx, shuffle=self.shuffle_LSE)
             for c in cutlass.range(cute.size(acc_S_mn, mode=[1]), unroll_full=True):
                 acc_S_mn[r, c] = cute.math.exp2(
-                    acc_S_mn[r, c] * softmax_scale_log2 - tLSErLSE[r], fastmath=True
+                    acc_S_mn[r, c] * softmax_scale_log2 - lse_val, fastmath=True
                 )
         tLSErdPsum = copy_utils.load_s2r(tLSEsdPsum[None, smem_idx_dO])
 
@@ -1389,8 +1417,9 @@ class FlashAttentionBackwardSm90:
         warpgroup.wait_group(0)
         acc_dP_mn = layout_utils.reshape_acc_to_mn(acc_dP, transpose=self.SdP_swapAB)
         for r in cutlass.range_constexpr(cute.size(acc_dP_mn, mode=[0])):
+            dpsum_val = self._get_stat(tLSErdPsum, r, lane_idx, shuffle=self.shuffle_dPsum)
             for c in cutlass.range(cute.size(acc_dP_mn, mode=[1]), unroll_full=True):
-                acc_dP_mn[r, c] = acc_S_mn[r, c] * (acc_dP_mn[r, c] - tLSErdPsum[r])
+                acc_dP_mn[r, c] = acc_S_mn[r, c] * (acc_dP_mn[r, c] - dpsum_val)
 
         if const_expr(self.score_mod_bwd is not None):
             score_mod_bwd_fn(acc_dP, acc_S_pre, m_block=m_block)
