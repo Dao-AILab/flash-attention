@@ -31,6 +31,7 @@ from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute.pack_gqa import PackGQA
 from flash_attn.cute.named_barrier import NamedBarrierFwd
 from flash_attn.cute.block_sparsity import BlockSparseTensors
+from flash_attn.cute.tile_scheduler import SingleTileScheduler, SingleTileVarlenScheduler, TileSchedulerArguments
 
 
 class FlashAttentionForwardBase:
@@ -650,18 +651,48 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         self._setup_attributes()
         SharedStorage = self._get_shared_storage_cls()
         mQ, mK, mV, mO = [assume_tensor_aligned(t) for t in (mQ, mK, mV, mO)]
-        mQ, mK, mV, mO = [
-            cute.make_tensor(t.iterator, cute.select(t.layout, mode=[1, 3, 2, 0]))
-            for t in (mQ, mK, mV, mO)
+        # Layout permutation: 4D non-varlen vs 3D varlen
+        QO_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
+        KV_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensK is None) else [0, 2, 1]
+        mQ, mO = [
+            cute.make_tensor(t.iterator, cute.select(t.layout, mode=QO_layout_transpose))
+            for t in (mQ, mO)
+        ]
+        mK, mV = [
+            cute.make_tensor(t.iterator, cute.select(t.layout, mode=KV_layout_transpose))
+            for t in (mK, mV)
         ]
         if const_expr(mLSE is not None):
-            mLSE = cute.make_tensor(mLSE.iterator, cute.select(mLSE.layout, mode=[2, 1, 0]))
-        # grid_dim: (m_block, num_head, batch_size)
-        grid_dim = (
-            cute.ceil_div(mQ.shape[0], self.tile_m),
-            cute.size(mQ.shape[2]),
-            cute.size(mQ.shape[3]),
+            LSE_layout_transpose = [2, 1, 0] if const_expr(mCuSeqlensQ is None) else [1, 0]
+            mLSE = cute.make_tensor(mLSE.iterator, cute.select(mLSE.layout, mode=LSE_layout_transpose))
+        # TileScheduler for varlen, simple grid for non-varlen
+        if const_expr(mCuSeqlensQ is not None or mSeqUsedQ is not None):
+            TileScheduler = SingleTileVarlenScheduler
+        else:
+            TileScheduler = SingleTileScheduler
+        num_batch = (
+            mCuSeqlensQ.shape[0] - 1
+            if const_expr(mCuSeqlensQ is not None)
+            else mQ.shape[3]
         )
+        tile_sched_args = TileSchedulerArguments(
+            num_block=cute.ceil_div(mQ.shape[0], self.tile_m),
+            num_head=cute.size(mQ.shape[2]),
+            num_batch=num_batch,
+            num_splits=1,
+            seqlen_k=0,
+            headdim=mQ.shape[1],
+            headdim_v=mV.shape[1],
+            total_q=cute.size(mQ.shape[0])
+            if const_expr(mCuSeqlensQ is not None)
+            else cute.size(mQ.shape[0]) * cute.size(mQ.shape[3]),
+            tile_shape_mn=(self.tile_m, self.tile_n),
+            qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+            mCuSeqlensQ=mCuSeqlensQ,
+            mSeqUsedQ=mSeqUsedQ,
+        )
+        tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
+        grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
         softmax_scale_log2, softmax_scale = utils.compute_softmax_scale_log2(softmax_scale, self.score_mod)
         fastdiv_mods = utils.compute_fastdiv_mods(mQ, mK, self.qhead_per_kvhead, self.pack_gqa, aux_tensors)
 
@@ -671,6 +702,10 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             mV,
             mO,
             mLSE,
+            mCuSeqlensQ,
+            mCuSeqlensK,
+            mSeqUsedQ,
+            mSeqUsedK,
             softmax_scale_log2,
             softmax_scale,
             window_size_left,
@@ -687,6 +722,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             tiled_mma_qk,
             tiled_mma_pv,
             SharedStorage,
+            tile_sched_params,
+            TileScheduler,
             aux_tensors,
             fastdiv_mods,
         ).launch(
@@ -704,6 +741,10 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         mV: cute.Tensor,
         mO: cute.Tensor,
         mLSE: Optional[cute.Tensor],
+        mCuSeqlensQ: Optional[cute.Tensor],
+        mCuSeqlensK: Optional[cute.Tensor],
+        mSeqUsedQ: Optional[cute.Tensor],
+        mSeqUsedK: Optional[cute.Tensor],
         softmax_scale_log2: Float32,
         softmax_scale: Optional[Float32],
         window_size_left: Optional[Int32],
@@ -720,12 +761,17 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         tiled_mma_qk: cute.TiledMma,
         tiled_mma_pv: cute.TiledMma,
         SharedStorage: cutlass.Constexpr,
+        tile_sched_params,
+        TileScheduler: cutlass.Constexpr[Callable],
         aux_tensors=None,
         fastdiv_mods=None,
     ):
         # Thread index, block index
         tidx, _, _ = cute.arch.thread_idx()
-        m_block, num_head, batch_size = cute.arch.block_idx()
+
+        tile_scheduler = TileScheduler.create(tile_sched_params)
+        work_tile = tile_scheduler.initial_work_tile_info()
+        m_block, num_head, batch_size, _ = work_tile.tile_idx
 
         block_info = BlockInfo(
             self.tile_m,
@@ -741,17 +787,17 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             batch_idx=batch_size,
             seqlen_q_static=mQ.shape[0],
             seqlen_k_static=mK.shape[0],
-            mCuSeqlensQ=None,
-            mCuSeqlensK=None,
-            mSeqUsedQ=None,
-            mSeqUsedK=None,
+            mCuSeqlensQ=mCuSeqlensQ,
+            mCuSeqlensK=mCuSeqlensK,
+            mSeqUsedQ=mSeqUsedQ,
+            mSeqUsedK=mSeqUsedK,
         )
         n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
-        # TODO: return early if n_block_max == 0
-        # if self.is_causal:
-        #     if n_block_max <= 0:
-        #         return
-        n_block = n_block_max - 1
+        # For varlen, wasted grid tiles (where batch_idx >= num_batch) will have
+        # seqlen_q=seqlen_k=0 and n_block_max=0.  Clamp to 0 so we don't use a
+        # negative block index for K/V loads; the load/store predicates already
+        # guard all memory accesses when seqlen is 0.
+        n_block = cutlass.max(n_block_max - 1, 0)
 
         # ///////////////////////////////////////////////////////////////////////////////
         # Get the appropriate tiles for this thread block.
@@ -759,10 +805,20 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         blkQ_shape = (self.tile_m, self.tile_hdim)
         blkK_shape = (self.tile_n, self.tile_hdim)
         blkV_shape = (self.tile_n, self.tile_hdimv)
-        gQ = cute.local_tile(mQ[None, None, num_head, batch_size], blkQ_shape, (m_block, 0))
         num_head_kv = num_head // self.qhead_per_kvhead
-        gK = cute.local_tile(mK[None, None, num_head_kv, batch_size], blkK_shape, (None, 0))
-        gV = cute.local_tile(mV[None, None, num_head_kv, batch_size], blkV_shape, (None, 0))
+        if const_expr(not seqlen.has_cu_seqlens_q):
+            mQ_cur = mQ[None, None, num_head, batch_size]
+        else:
+            mQ_cur = cute.domain_offset((seqlen.offset_q, 0), mQ[None, None, num_head])
+        if const_expr(not seqlen.has_cu_seqlens_k):
+            mK_cur = mK[None, None, num_head_kv, batch_size]
+            mV_cur = mV[None, None, num_head_kv, batch_size]
+        else:
+            mK_cur = cute.domain_offset((seqlen.offset_k, 0), mK[None, None, num_head_kv])
+            mV_cur = cute.domain_offset((seqlen.offset_k, 0), mV[None, None, num_head_kv])
+        gQ = cute.local_tile(mQ_cur, blkQ_shape, (m_block, 0))
+        gK = cute.local_tile(mK_cur, blkK_shape, (None, 0))
+        gV = cute.local_tile(mV_cur, blkV_shape, (None, 0))
 
         # ///////////////////////////////////////////////////////////////////////////////
         # Get shared memory buffer
