@@ -986,7 +986,7 @@ class FlashAttentionBackwardSm80:
 
         # MMA dK
         if cutlass.const_expr(self.Mma_dKV_is_RS):
-            tdVrP = layout_utils.reshape_acc_to_frgA(rdS)
+            tdKrdS = layout_utils.reshape_acc_to_frgA(rdS)
         else:
             tdKrdS = mma_params.tdKrdS
         sm80_utils.gemm(
