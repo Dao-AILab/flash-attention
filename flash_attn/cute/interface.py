@@ -803,7 +803,15 @@ def _flash_attn_fwd(
         elif arch // 10 == 12:
             # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
             assert not use_block_sparsity, "Block sparsity not supported on SM 12.0"
-            assert page_table is None, "Paged KV not supported on SM 12.0"
+            if page_table is not None:
+                assert seqused_k is not None, (
+                    "Paged KV on SM120 requires seqused_k (actual sequence lengths per batch)"
+                )
+                # Paged KV requires tile_n >= num_threads (each thread needs >=1 page entry)
+                assert tile_n >= num_threads, (
+                    f"SM120 paged KV requires tile_n({tile_n}) >= num_threads({num_threads}). "
+                    f"For head_dim>{64}, use non-paged KV or pre-gather pages."
+                )
             fa_fwd = FlashAttentionForwardSm120(
                 dtype,
                 head_dim,
