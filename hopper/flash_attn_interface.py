@@ -5,6 +5,7 @@ from typing import Optional, Union, List, Tuple
 import os
 import torch
 import torch.nn as nn
+import warnings
 
 
 USE_TRITON_ROCM = os.getenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", "FALSE") == "TRUE"
@@ -12,6 +13,7 @@ if not USE_TRITON_ROCM and getattr(torch.version, 'hip', None) is not None:
     try:
         import flash_attn_3._C
     except ImportError:
+        warnings.warn("flash_attn_3._C (which has ROCm/HIP kernels) not found, falling back to Triton implementation")
         USE_TRITON_ROCM = True
 
 if USE_TRITON_ROCM:
@@ -23,7 +25,7 @@ else:
 
     # isort: on
 
-    flash_attn_3_gpu = torch.ops.flash_attn_3_gpu
+    flash_attn_3_gpu = torch.ops.flash_attn_3
 
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x

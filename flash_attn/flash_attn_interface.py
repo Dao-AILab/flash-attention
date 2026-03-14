@@ -5,6 +5,7 @@ from typing import Optional, Sequence, Tuple, Union
 import torch
 import torch.nn as nn
 import os
+import warnings
 
 # isort: off
 # We need to import the CUDA kernels after importing torch
@@ -13,6 +14,7 @@ if not USE_TRITON_ROCM and getattr(torch.version, 'hip', None) is not None:
     try:
         import flash_attn_2_cuda
     except ImportError:
+        warnings.warn("flash_attn_2_cuda (which has ROCm/HIP kernels) not found, falling back to Triton implementation")
         USE_TRITON_ROCM = True
 
 if USE_TRITON_ROCM:
