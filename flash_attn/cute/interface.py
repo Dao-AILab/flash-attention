@@ -69,11 +69,33 @@ from flash_attn.cute.block_sparsity import (
     normalize_block_sparse_config_bwd,
 )
 
+def _parse_arch_str(arch_str):
+    """Parse arch string (e.g. 'sm_80', 'sm_90a', '80', '100') to int (e.g. 80, 90, 100)."""
+    import re
+    match = re.match(r"^(?:sm_?|SM_?)?(\d+)(\d)([af]?)$", arch_str)
+    if not match:
+        raise ValueError(f"Invalid arch format: {arch_str}")
+    major, minor, _ = match.groups()
+    return int(major) * 10 + int(minor)
+
+
 @lru_cache(maxsize=None)
 def _get_device_arch():
-    """Cached device arch check."""
+    """Cached device arch check.
+
+    Override with FLASH_ATTENTION_ARCH (e.g. 'sm_80' or '80') to select which
+    kernel path to use (SM80/SM90/SM100/SM120) independently of the compilation
+    target (CUTE_DSL_ARCH).
+
+    For CPU-only compilation (no GPU), set both:
+      FLASH_ATTENTION_ARCH=sm_80  (kernel selection)
+      CUTE_DSL_ARCH=sm_80         (compilation target)
+    """
+    arch_override = os.environ.get("FLASH_ATTENTION_ARCH", None)
+    if arch_override is not None:
+        return _parse_arch_str(arch_override)
     major, minor = torch.cuda.get_device_capability()
-    return major * 10 + minor
+    return major * 10 + int(minor)
 
 
 def _validate_head_dims(head_dim: int, head_dim_v: int, compute_capability: int, alignment: int) -> None:
@@ -204,7 +226,8 @@ def _validate_tensor(t, name, expected_shape, expected_dtype, expected_device):
     assert t.shape == expected_shape, f"{name} shape {t.shape} != expected {expected_shape}"
     assert t.dtype == expected_dtype, f"{name} dtype {t.dtype} != expected {expected_dtype}"
     assert t.device == expected_device, f"{name} device {t.device} != expected {expected_device}"
-    assert t.is_cuda, f"{name} must be on CUDA"
+    if not is_fake_mode():
+        assert t.is_cuda, f"{name} must be on CUDA"
 
 
 torch2cute_dtype_map = {
@@ -352,25 +375,26 @@ def _flash_attn_fwd(
         assert learnable_sink.shape == (num_head,)
         assert learnable_sink.dtype == torch.bfloat16, "learnable_sink must be bfloat16"
 
-    assert all(
-        t is None or t.is_cuda
-        for t in (
-            q,
-            k,
-            v,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            seqused_q,
-            seqused_k,
-            page_table,
-            learnable_sink,
-        )
-    ), "inputs must be on CUDA device"
+    if not is_fake_mode():
+        assert all(
+            t is None or t.is_cuda
+            for t in (
+                q,
+                k,
+                v,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                seqused_q,
+                seqused_k,
+                page_table,
+                learnable_sink,
+            )
+        ), "inputs must be on CUDA device"
     arch = _get_device_arch() if _arch is None else _arch
-    assert arch // 10 in [9, 10, 11, 12], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x, 12.x"
+    assert arch // 10 in [8, 9, 10, 11, 12], "Unsupported compute capability. Supported: 8.x, 9.x, 10.x, 11.x, 12.x"
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
     alignment = 16 // q.element_size()
-    if arch // 10 != 12:
+    if arch // 10 not in [8, 12]:
         _validate_head_dims(head_dim, head_dim_v, arch // 10, alignment)
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
@@ -409,10 +433,15 @@ def _flash_attn_fwd(
         causal, window_size_left, window_size_right, mask_mod
     )
 
-    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    # In fake mode (CPU-only compilation), use a fake stream placeholder.
+    current_stream = (
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+        if is_fake_mode()
+        else cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    )
 
-    # SM120: uses SM80 MMA with 99 KB SMEM, 128 threads (4 warps)
-    if arch // 10 == 12:
+    # SM80/SM120: uses SM80 MMA, 128 threads (4 warps)
+    if arch // 10 in [8, 12]:
         num_threads = 128
 
     fwd_cfg = FwdConfig(128, 128, True, True)  # default
@@ -460,7 +489,7 @@ def _flash_attn_fwd(
     num_m_blocks = (seqlen_q_packgqa + m_block_size_effective - 1) // m_block_size_effective
     total_mblocks = batch_size * num_head_kv * num_m_blocks
     num_n_blocks = (seqlen_k_loaded + tile_n - 1) // tile_n
-    num_SMs = torch.cuda.get_device_properties(device).multi_processor_count
+    num_SMs = 132 if is_fake_mode() else torch.cuda.get_device_properties(device).multi_processor_count
     if num_splits < 1:
         num_splits = num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, 128)
 
@@ -623,10 +652,29 @@ def _flash_attn_fwd(
         if aux_tensors is not None:
             cute_aux_tensors = [to_cute_aux_tensor(buf) for buf in aux_tensors]
 
-        if arch // 10 == 9:
+        if arch // 10 == 8:
+            assert page_table is None, "paged KV not supported on SM 8.0"
+            assert not is_split_kv, "SplitKV not supported on SM 8.0"
+            fa_fwd = FlashAttentionForwardSm80(
+                dtype,
+                head_dim,
+                head_dim_v,
+                qhead_per_kvhead,
+                is_causal=causal,
+                is_local=local,
+                pack_gqa=pack_gqa,
+                tile_m=tile_m,
+                tile_n=tile_n,
+                num_stages=1,
+                num_threads=num_threads,
+                Q_in_regs=False,
+                score_mod=score_mod,
+                mask_mod=mask_mod,
+                has_aux_tensors=aux_tensors is not None,
+            )
+        elif arch // 10 == 9:
             assert page_table is None, "paged KV not supported on SM 9.0"
             assert not is_split_kv, "SplitKV not supported on SM 9.0"
-            # fa_fwd = FlashAttentionForwardSm80(
             fa_fwd = FlashAttentionForwardSm90(
                 dtype,
                 head_dim,
@@ -697,7 +745,7 @@ def _flash_attn_fwd(
             )
         else:
             raise ValueError(
-                f"Unsupported compute capability: {arch}. Supported: 9.x, 10.x, 11.x, 12.x"
+                f"Unsupported compute capability: {arch}. Supported: 8.x, 9.x, 10.x, 11.x, 12.x"
             )
         # TODO: check @can_implement
         _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
@@ -1082,9 +1130,10 @@ def _flash_attn_bwd(
     assert lse.dtype == torch.float32, "lse must be float32"
     if dlse is not None:
         dlse = maybe_contiguous(dlse)
-    assert all(
-        t is None or t.is_cuda for t in (q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k)
-    ), "inputs must be on CUDA device"
+    if not is_fake_mode():
+        assert all(
+            t is None or t.is_cuda for t in (q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k)
+        ), "inputs must be on CUDA device"
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
     alignment = 16 // q.element_size()
     if arch // 10 != 12:
@@ -1187,16 +1236,20 @@ def _flash_attn_bwd(
             )
 
     dtype = torch2cute_dtype_map[q.dtype]
-    current_stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    current_stream = (
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
+        if is_fake_mode()
+        else cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    )
 
     if deterministic:
-        dQ_semaphore = torch.zeros(batch_size, num_head, seqlen_q_rounded // m_block_size, cluster_size, dtype=torch.int32, device="cuda")
+        dQ_semaphore = torch.zeros(batch_size, num_head, seqlen_q_rounded // m_block_size, cluster_size, dtype=torch.int32, device=device)
     else:
         dQ_semaphore = None
 
     if deterministic and qhead_per_kvhead > 1:
-        dK_semaphore = torch.zeros(batch_size, num_head_kv, seqlen_k_rounded // n_block_size, 2, dtype=torch.int32, device="cuda")
-        dV_semaphore = torch.zeros(batch_size, num_head_kv, seqlen_k_rounded // n_block_size, 2, dtype=torch.int32, device="cuda")
+        dK_semaphore = torch.zeros(batch_size, num_head_kv, seqlen_k_rounded // n_block_size, 2, dtype=torch.int32, device=device)
+        dV_semaphore = torch.zeros(batch_size, num_head_kv, seqlen_k_rounded // n_block_size, 2, dtype=torch.int32, device=device)
     else:
         dK_semaphore = None
         dV_semaphore = None
@@ -1865,7 +1918,8 @@ def _flash_attn_fwd_combine(
     assert out_partial.dtype in [torch.float16, torch.bfloat16, torch.float32], (
         "out_partial must be fp16, bf16, or fp32"
     )
-    assert out_partial.is_cuda and lse_partial.is_cuda, "tensors must be on CUDA device"
+    if not is_fake_mode():
+        assert out_partial.is_cuda and lse_partial.is_cuda, "tensors must be on CUDA device"
     # Determine if this is variable length based on dimensions
     is_varlen = out_partial.dim() == 4
     # Validate optional tensors
@@ -1875,7 +1929,8 @@ def _flash_attn_fwd_combine(
         (num_splits_dynamic_ptr, "num_splits_dynamic_ptr"),
     ]:
         if t is not None:
-            assert t.is_cuda, f"{name} must be on CUDA device"
+            if not is_fake_mode():
+                assert t.is_cuda, f"{name} must be on CUDA device"
             assert t.is_contiguous(), f"{name} must be contiguous"
     head_dim = out_partial.shape[-1]
     num_splits = out_partial.shape[0]
