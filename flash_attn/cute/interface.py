@@ -36,6 +36,7 @@ from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80
 from flash_attn.cute.flash_fwd_sm90 import FlashAttentionForwardSm90
 from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
 from flash_attn.cute.flash_fwd_sm120 import FlashAttentionForwardSm120
+from flash_attn.cute.flash_fwd_sm120_tma import FlashAttentionForwardSm120Tma
 from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
 from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
 from flash_attn.cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
@@ -803,25 +804,45 @@ def _flash_attn_fwd(
         elif arch // 10 == 12:
             # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
             assert not use_block_sparsity, "Block sparsity not supported on SM 12.0"
-            assert page_table is None, "Paged KV not supported on SM 12.0 in this PR"
-            assert not is_split_kv, "SplitKV not supported on SM 12.0 in this PR"
-            fa_fwd = FlashAttentionForwardSm120(
-                dtype,
-                head_dim,
-                head_dim_v,
-                qhead_per_kvhead,
-                is_causal=causal,
-                is_local=local,
-                pack_gqa=pack_gqa,
-                tile_m=tile_m,
-                tile_n=tile_n,
-                num_stages=1,
-                num_threads=num_threads,
-                Q_in_regs=False,
-                score_mod=score_mod,
-                mask_mod=mask_mod,
-                has_aux_tensors=aux_tensors is not None,
-            )
+            # TMA kernel when: no paged KV, no varlen
+            is_varlen = cu_seqlens_q is not None or cu_seqlens_k is not None
+            use_tma_sm120 = (page_table is None and not is_varlen)
+            if use_tma_sm120:
+                fa_fwd = FlashAttentionForwardSm120Tma(
+                    dtype,
+                    head_dim,
+                    head_dim_v,
+                    qhead_per_kvhead,
+                    is_causal=causal,
+                    is_local=local,
+                    pack_gqa=pack_gqa,
+                    tile_m=tile_m,
+                    tile_n=tile_n,
+                    num_mma_warps=4,
+                    kv_stages=2,
+                    score_mod=score_mod,
+                    mask_mod=mask_mod,
+                    has_aux_tensors=aux_tensors is not None,
+                )
+            else:
+                fa_fwd = FlashAttentionForwardSm120(
+                    dtype,
+                    head_dim,
+                    head_dim_v,
+                    qhead_per_kvhead,
+                    is_causal=causal,
+                    is_local=local,
+                    is_split_kv=is_split_kv,
+                    pack_gqa=pack_gqa,
+                    tile_m=tile_m,
+                    tile_n=tile_n,
+                    num_stages=1,
+                    num_threads=num_threads,
+                    Q_in_regs=False,
+                    score_mod=score_mod,
+                    mask_mod=mask_mod,
+                    has_aux_tensors=aux_tensors is not None,
+                )
         else:
             raise ValueError(
                 f"Unsupported compute capability: {arch}. Supported: 8.x, 9.x, 10.x, 11.x, 12.x"
