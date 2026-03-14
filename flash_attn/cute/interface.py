@@ -613,11 +613,10 @@ def _flash_attn_fwd(
                 assert seqused_k is not None, (
                     "Paged KV on SM120 requires seqused_k (actual sequence lengths per batch)"
                 )
-                # Paged KV requires tile_n >= num_threads (each thread needs >=1 page entry)
-                assert tile_n >= num_threads, (
-                    f"SM120 paged KV requires tile_n({tile_n}) >= num_threads({num_threads}). "
-                    f"For head_dim>{64}, use non-paged KV or pre-gather pages."
-                )
+                # Paged KV requires tile_n >= num_threads (each thread needs >=1 page entry).
+                # For D>64, the default tile_n=64 is too small; bump to 128 (fits in 99KB SMEM).
+                if tile_n < num_threads:
+                    tile_n = num_threads  # 128
             fa_fwd = FlashAttentionForwardSm120(
                 dtype,
                 head_dim,
