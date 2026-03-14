@@ -221,7 +221,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         self.use_tma_O = (
             self.arch >= 90 and mCuSeqlensQ is None and mSeqUsedQ is None and not self.pack_gqa
         )
-        # TODO: rescale_O_before_gemm
+        self.rescale_O_before_gemm = self.tile_hdimv > 128 and self.intra_wg_overlap
         self._setup_attributes()
         # TODO: we prob don't need most of what's in _setup_attributes
         self.sQ_layout, self.sK_layout, self.sV_layout, self.sO_layout = [
@@ -745,19 +745,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
         self.mma_init()
 
-        mma_one_n_block_all = partial(
-            self.mma_one_n_block_intrawg_overlap
-            if const_expr(self.intra_wg_overlap)
-            else self.mma_one_n_block,
-            mma_qk_fn=mma_qk_fn,
-            pipeline_k=pipeline_k,
-            pipeline_v=pipeline_v,
-            acc_O=acc_O,
-            tOrP=tOrP,
-            smem_copy_params=smem_copy_params,
-            check_inf=True,
-        )
-
         q_consumer_phase = Int32(0)
         kv_consumer_state = pipeline.make_pipeline_state(
             cutlass.pipeline.PipelineUserType.Consumer, self.num_stages
@@ -771,18 +758,42 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             softmax_scale=softmax_scale,
         )
 
+        # For RescaleOBeforeGemm: persistent scores_scale across iterations
+        scores_scale = None
+        if const_expr(self.rescale_O_before_gemm):
+            scores_scale = cute.make_rmem_tensor_like(softmax.row_max, Float32)
+
+        mma_one_n_block_all = partial(
+            self.mma_one_n_block_intrawg_overlap
+            if const_expr(self.intra_wg_overlap)
+            else self.mma_one_n_block,
+            mma_qk_fn=mma_qk_fn,
+            pipeline_k=pipeline_k,
+            pipeline_v=pipeline_v,
+            acc_O=acc_O,
+            tOrP=tOrP,
+            smem_copy_params=smem_copy_params,
+            check_inf=True,
+            scores_scale=scores_scale,
+        )
+
         process_first_half_block = partial(
             self.first_half_block_overlap,
             mma_qk_fn=mma_qk_fn,
             pipeline_k=pipeline_k,
             tOrP=tOrP,
             smem_copy_params=smem_copy_params,
+            scores_scale=scores_scale,
             softmax=softmax,
+            acc_O=acc_O,
         )
         process_last_half_block = partial(
             self.last_half_block_overlap,
             pipeline_v=pipeline_v,
             mma_pv_fn=mma_pv_fn,
+            scores_scale=scores_scale,
+            softmax=softmax,
+            acc_O=acc_O,
         )
         while work_tile.is_valid_tile:
             # if work_tile.is_valid_tile:
@@ -834,10 +845,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     fastdiv_mods=fastdiv_mods,
                 )
             mma_one_n_block = partial(
-                mma_one_n_block_all,
-                seqlen=seqlen,
-                softmax=softmax,
-                score_mod_fn=score_mod_fn,
+                mma_one_n_block_all, seqlen=seqlen, softmax=softmax, score_mod_fn=score_mod_fn
             )
             # Load Q if not TMA_Q
             if const_expr(not self.use_tma_Q):
@@ -880,8 +888,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         score_mod_fn=score_mod_fn,
                         is_first_block=True,
                     )
-                    # Need to initialize tOrO in the case of RescaleOBeforeGemm where we will scale tOrO even in the 1st iter
-                    # acc_O.fill(0.0)
                 else:
                     self.warp_scheduler_barrier_sync()
                     kv_consumer_state = mma_one_n_block(
@@ -986,7 +992,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 if const_expr(not self.pack_gqa):
                     sink_val = Float32(learnable_sink[head_idx])
                 else:  # Each thread might have a different sink value due to different q_head
-                    sink_val = cute.make_fragment_like(softmax.row_max, Float32)
+                    sink_val = cute.make_rmem_tensor_like(softmax.row_max, Float32)
                     cS = cute.make_identity_tensor((self.tile_m, self.tile_n))
                     tScS_mn = layout_utils.reshape_acc_to_mn(thr_mma_qk.partition_C(cS))
                     for r in cutlass.range(cute.size(sink_val), unroll_full=True):
@@ -1031,6 +1037,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         smem_copy_params: SimpleNamespace,
         softmax: Softmax,
         seqlen: SeqlenInfoQK,
+        scores_scale: Optional[cute.Tensor] = None,
+        acc_O: Optional[cute.Tensor] = None,
         mask_fn: Callable = None,
         score_mod_fn: Optional[Callable] = None,
         is_first_block: bool = False,
@@ -1050,21 +1058,27 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         # however, masking is being applied anyway, so essentially no perf hit
         mask_fn(acc_S, n_block=n_block, mask_seqlen=True)
 
-        softmax.online_softmax(acc_S, is_first=is_first_block)
+        row_scale = softmax.online_softmax(acc_S, is_first=is_first_block)
 
         tOrP_acc = layout_utils.reshape_acc_to_frgA(acc_S)
         tOrP_cur = (
-            tOrP if const_expr(self.mma_pv_is_rs) else cute.make_fragment_like(tOrP_acc, self.dtype)
+            tOrP
+            if const_expr(self.mma_pv_is_rs)
+            else cute.make_rmem_tensor_like(tOrP_acc, self.dtype)
         )
         tOrP_cur.store(tOrP_acc.load().to(self.dtype))
 
-        # if pv gemm not rs
         if const_expr(not self.mma_pv_is_rs):
             tPrP = smem_copy_params.smem_thr_copy_P.retile(tOrP_cur)
             cute.copy(smem_copy_params.smem_thr_copy_P, tPrP, smem_copy_params.tPsP)
             # Fence and barrier to make smem store visible to WGMMA
             cute.arch.fence_view_async_shared()
             cute.arch.sync_warp()
+
+        # For RescaleOBeforeGemm: initialize acc_O
+        if const_expr(self.rescale_O_before_gemm):
+            acc_O.fill(0.0)
+            scores_scale.store(row_scale.load())
 
         return kv_consumer_state
 
@@ -1075,8 +1089,15 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         pipeline_v,
         mma_pv_fn: Callable,
         zero_init: bool,
+        scores_scale: Optional[cute.Tensor] = None,
+        softmax: Optional[Softmax] = None,
+        acc_O: Optional[cute.Tensor] = None,
     ):
         """Processes the final PV GEMM when using intra-warpgroup-overlap"""
+
+        # For RescaleOBeforeGemm: rescale O before the final PV GEMM
+        if const_expr(self.rescale_O_before_gemm):
+            softmax.rescale_O(acc_O, scores_scale)
 
         pipeline_v.consumer_wait(kv_consumer_state, pipeline_v.consumer_try_wait(kv_consumer_state))
         mma_pv_fn(B_idx=kv_consumer_state.index, zero_init=zero_init, wg_wait=0)
@@ -1098,6 +1119,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         smem_copy_params: SimpleNamespace,
         softmax: Softmax,
         seqlen: SeqlenInfoQK,
+        scores_scale: Optional[cute.Tensor] = None,  # not used
         score_mod_fn: Optional[Callable] = None,
         mask_fn: Optional[Callable] = None,
         is_first_n_block: cutlass.Constexpr = False,
@@ -1120,7 +1142,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         # if cute.arch.thread_idx()[0] == 0: cute.print_tensor(layout_utils.reshape_acc_to_mn(acc_S))
         tOrP_acc = layout_utils.reshape_acc_to_frgA(acc_S)
         tOrP_cur = (
-            tOrP if const_expr(self.mma_pv_is_rs) else cute.make_fragment_like(tOrP_acc, self.dtype)
+            tOrP
+            if const_expr(self.mma_pv_is_rs)
+            else cute.make_rmem_tensor_like(tOrP_acc, self.dtype)
         )
         # tOrP.store(tOrP_acc.load().to(self.dtype))
         # the "to(self.dtype)" conversion fails to vectorize for block sizes other
@@ -1157,6 +1181,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         smem_copy_params: SimpleNamespace,
         softmax: Softmax,
         seqlen: SeqlenInfoQK,
+        scores_scale: Optional[cute.Tensor] = None,
         score_mod_fn: Optional[Callable] = None,
         mask_fn: Optional[Callable] = None,
         check_inf: cutlass.Constexpr = True,
@@ -1167,6 +1192,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         self.warp_scheduler_barrier_sync()
         # S = Q @ K.T
         acc_S = mma_qk_fn(B_idx=smem_pipe_read.index, wg_wait=-1)
+        # RescaleOBeforeGemm: rescale O while QK GEMM is in flight, before PV GEMM
+        if const_expr(self.rescale_O_before_gemm):
+            softmax.rescale_O(acc_O, scores_scale)
         pipeline_v.consumer_wait(smem_pipe_read_v, pipeline_v.consumer_try_wait(smem_pipe_read_v))
         # O += P @ V
         mma_pv_fn(B_idx=smem_pipe_read_v.index, wg_wait=-1)
@@ -1186,7 +1214,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         pipeline_v.consumer_release(smem_pipe_read_v)
         tOrP_acc = layout_utils.reshape_acc_to_frgA(acc_S)
         tOrP_cur = (
-            tOrP if const_expr(self.mma_pv_is_rs) else cute.make_fragment_like(tOrP_acc, self.dtype)
+            tOrP
+            if const_expr(self.mma_pv_is_rs)
+            else cute.make_rmem_tensor_like(tOrP_acc, self.dtype)
         )
         # tOrP_cur.store(tOrP_acc.load().to(self.dtype))
         # the "to(self.dtype)" conversion fails to vectorize for block sizes other
@@ -1196,7 +1226,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         if const_expr(not self.mma_pv_is_rs):
             tPrP = smem_copy_params.smem_thr_copy_P.retile(tOrP_cur)
             cute.copy(smem_copy_params.smem_thr_copy_P, tPrP, smem_copy_params.tPsP)
-        softmax.rescale_O(acc_O, row_scale)
+        if const_expr(not self.rescale_O_before_gemm):
+            softmax.rescale_O(acc_O, row_scale)
+        if const_expr(self.rescale_O_before_gemm):
+            scores_scale.store(row_scale.load())
         if const_expr(not self.mma_pv_is_rs):
             # Fence and barrier to make sure smem store is visible to WGMMA
             cute.arch.fence_view_async_shared()

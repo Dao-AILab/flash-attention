@@ -36,6 +36,7 @@ USE_FAKE_TENSOR = int(os.getenv("FLASH_ATTENTION_FAKE_TENSOR", 0)) == 1
 DISABLE_SPLIT = os.getenv("FLASH_ATTENTION_DISABLE_SPLIT", "FALSE") == "TRUE"
 # SplitKV and paged KV are not supported on SM90
 IS_SM90 = torch.cuda.get_device_capability()[0] == 9
+IS_SM100 = torch.cuda.get_device_capability()[0] == 10
 TEST_BWD_ONLY = False
 VERBOSE = True
 
@@ -63,7 +64,7 @@ VERBOSE = True
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128])
 # @pytest.mark.parametrize("d", [64, 96, 128, 192])
 # @pytest.mark.parametrize("d", [128, 192])
-@pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("d", [64, 128, 192, 256])
 # @pytest.mark.parametrize("d", [128])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
@@ -252,6 +253,8 @@ def test_flash_attn_output(
             # SplitKV not supported on SM90 - skip this iteration
             if IS_SM90 and num_splits > 1:
                 continue
+            if IS_SM100 and (d >= 192 and dv >= 192):  # hdim 192 and 256 not support on SM100
+                continue
             out, lse = flash_attn_func(
                 q,
                 k,
@@ -296,6 +299,8 @@ def test_flash_attn_output(
         ):
             if d == 192 and local:
                 pytest.xfail("hdim 192 backward: local attention not supported yet")
+            if d > 128 and IS_SM90:
+                pytest.xfail("hdim > 128 backward: SM90 not supported yet")
             g = torch.randn_like(out)
             # do_o = ((g.float() * out.float()).sum(-1)).transpose(1, 2)
             dq, dk, dv = torch.autograd.grad(out, (q, k, v), g)
@@ -732,6 +737,8 @@ def test_flash_attn_varlen_output(
         ):
             if d == 192 and local:
                 pytest.xfail("hdim 192 backward: local attention not supported yet")
+            if d > 128 and IS_SM90:
+                pytest.xfail("hdim > 128 backward: SM90 not supported yet")
             g_unpad = torch.randn_like(out_unpad)
             # do_o = ((g_unpad.float() * out_unpad.float()).sum(-1)).transpose(-1, -2)
             # import flash_attn_3_cuda
@@ -1623,7 +1630,7 @@ def _generate_block_kvcache(
     return k_cache, v_cache, page_table, k_cache_paged, v_cache_paged, num_blocks
 
 
-@pytest.mark.parametrize("head_dim", [4, 144, 256])
+@pytest.mark.parametrize("head_dim", [4, 148, 288])
 def test_flash_attn_invalid_head_dim(head_dim):
     device = "cuda"
     dtype = torch.bfloat16
