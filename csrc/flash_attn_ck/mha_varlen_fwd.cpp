@@ -279,7 +279,7 @@ fmha_fwd_splitkv_args get_ck_fmha_varlen_fwd_splitkv_args(bool has_lse,
     // o_acc: (nheads, split, total_q, d)
     // block_table: (batch_size, max_num_blocks_per_seq)
 
-    fmha_fwd_splitkv_args args;
+    fmha_fwd_splitkv_args args{};
     args.q_ptr = q.data_ptr();
     args.k_ptr = k.data_ptr();
     args.v_ptr = v.data_ptr();
@@ -309,7 +309,10 @@ fmha_fwd_splitkv_args get_ck_fmha_varlen_fwd_splitkv_args(bool has_lse,
     args.seqstart_q_ptr = seqlens_q.data_ptr();
     args.seqstart_k_ptr = seqlens_k.data_ptr();
     args.seqlen_k_ptr = nullptr;
+    args.sink_ptr = nullptr;
 
+    args.seqlen_q = q.size(0);
+    args.seqlen_k = k.size(0);
     args.batch = b;
     args.max_seqlen_q = max_seqlen_q;
     args.hdim_q = d;
@@ -321,6 +324,7 @@ fmha_fwd_splitkv_args get_ck_fmha_varlen_fwd_splitkv_args(bool has_lse,
     args.scale_s = softmax_scale;
     args.scale_p = 1;
     args.scale_o = 1;
+    args.logits_soft_cap = 0.0f;
 
     args.batch_stride_q = 0;
     args.stride_q = q.stride(0);
@@ -371,6 +375,7 @@ fmha_fwd_splitkv_args get_ck_fmha_varlen_fwd_splitkv_args(bool has_lse,
 
     args.window_size_left = mask.left;
     args.window_size_right = mask.right;
+    args.sink_size = 0;
     args.mask_type = static_cast<ck_tile::index_t>(mask.type);
 
     return args;
