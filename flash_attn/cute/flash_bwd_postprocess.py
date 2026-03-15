@@ -102,8 +102,8 @@ class FlashAttentionBackwardPostprocess:
                 permutation_mnk=(atom_layout_dQ[0] * 16, atom_layout_dQ[1] * 16, 16),
             )
         elif const_expr(self.arch // 10 == 9):
-            num_mma_warp_groups = self.num_threads // 128
-            atom_layout_dQ = (self.AtomLayoutMdQ, num_mma_warp_groups // self.AtomLayoutMdQ)
+            num_wg_mma = self.num_threads // 128
+            atom_layout_dQ = (self.AtomLayoutMdQ, num_wg_mma // self.AtomLayoutMdQ)
             tiler_mn_dQ = (self.tile_m // atom_layout_dQ[0], self.tile_hdim // atom_layout_dQ[1])
             tiled_mma = sm90_utils_basic.make_trivial_tiled_mma(
                 self.dtype,
@@ -156,14 +156,14 @@ class FlashAttentionBackwardPostprocess:
             self.sdQaccum_layout = cute.make_layout(self.tile_m * self.tile_hdim)
         elif const_expr(self.arch // 10 == 9):
             num_threads_per_warp_group = 128
-            num_mma_warp_groups = self.num_threads // 128
+            num_wg_mma = self.num_threads // 128
             self.s2r_tiled_copy_dQaccum = cute.make_tiled_copy_tv(
                 cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), Float32, num_bits_per_copy=128),
-                cute.make_layout((num_threads_per_warp_group, num_mma_warp_groups)),  # thr_layout
+                cute.make_layout((num_threads_per_warp_group, num_wg_mma)),  # thr_layout
                 cute.make_layout(128 // Float32.width),  # val_layout
             )
             self.sdQaccum_layout = cute.make_layout(
-                (self.tile_m * self.tile_hdim // num_mma_warp_groups, num_mma_warp_groups)
+                (self.tile_m * self.tile_hdim // num_wg_mma, num_wg_mma)
             )
         else:
             self.dQ_reduce_ncol = 32
@@ -194,8 +194,12 @@ class FlashAttentionBackwardPostprocess:
                 sdQ_layout_atom, (self.tile_m, self.tile_hdim), (0, 1)
             )
         elif const_expr(self.arch // 10 == 9):
+            wg_d_dQ = num_wg_mma // self.AtomLayoutMdQ
             self.sdQ_layout = sm90_utils.make_smem_layout(
-                self.dtype, LayoutEnum.ROW_MAJOR, (self.tile_m, self.tile_hdim)
+                self.dtype,
+                LayoutEnum.ROW_MAJOR,
+                (self.tile_m, self.tile_hdim),
+                major_mode_size=self.tile_hdim // wg_d_dQ,
             )
         else:
             # TODO: this is hard-coded for hdim 128

@@ -153,6 +153,7 @@ class SeqlenInfoQK:
         dim: int,
         padded: cutlass.Constexpr[bool] = False,
         ragged: cutlass.Constexpr[bool] = False,
+        multiple: int = 1,
     ) -> cute.Tensor:
         """Seqlen must be the first dimension of mK"""
         if const_expr(not ragged):
@@ -161,6 +162,7 @@ class SeqlenInfoQK:
                 return mK[idx]
             else:
                 offset_k = self.offset_k if const_expr(not padded) else self.padded_offset_k
+                offset_k *= multiple
                 idx = (offset_k,) + (None,) * (cute.rank(mK) - 1)
                 return cute.domain_offset(idx, mK)
         else:
@@ -170,6 +172,7 @@ class SeqlenInfoQK:
                 mK = mK[idx]
             else:
                 offset_k = self.offset_k if const_expr(not padded) else self.padded_offset_k
+                offset_k *= multiple
             return copy_utils.offset_ragged_tensor(
                 mK, offset_k, self.seqlen_k, ragged_dim=0, ptr_shift=True
             )

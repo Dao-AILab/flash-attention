@@ -1409,7 +1409,7 @@ def _store_one_dQaccum_sm90(
         with cute.arch.elect_one():
             copy_utils.cpasync_reduce_bulk_add_f32(
                 sdQaccum[None, warp_group_idx].iterator,
-                gdQaccum[None, warp_group_idx, m_block].iterator,
+                gdQaccum[(None, warp_group_idx), m_block].iterator,
                 tma_copy_bytes_dQ,
             )
         cute.arch.cp_async_bulk_commit_group()

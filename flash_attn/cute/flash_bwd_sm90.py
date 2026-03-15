@@ -137,10 +137,9 @@ class FlashAttentionBackwardSm90:
         # dQ_single_wg: WG0 computes the full dQ GEMM, WG1 skips it.
         # Only valid for 2 MMA warp groups.
         # Credit: Ben Spector
-        self.dQ_single_wg = dQ_single_wg
         if dQ_single_wg:
             assert self.num_wg_mma == 2, "dQ_single_wg only supports 2 warp groups"
-        self.num_wg_dQ = 1 if self.dQ_single_wg else self.num_wg_mma
+        self.num_wg_dQ = 1 if dQ_single_wg else self.num_wg_mma
 
     @staticmethod
     def can_implement(
@@ -199,16 +198,41 @@ class FlashAttentionBackwardSm90:
         assert mQ_type == self.dtype
 
     def _setup_attributes(self):
-        self.sQ_layout, self.sK_layout, self.sV_layout, self.sdO_layout, self.sPdS_layout = [
-            sm90_utils.make_smem_layout(self.dtype, LayoutEnum.ROW_MAJOR, shape, stage)
-            for shape, stage in [
-                ((self.tile_m, self.tile_hdim), self.Q_stage),
-                ((self.tile_n, self.tile_hdim), None),
-                ((self.tile_n, self.tile_hdimv), None),
-                ((self.tile_m, self.tile_hdimv), self.dO_stage),
-                ((self.tile_m, self.tile_n), self.PdS_stage),
+        # We need to accommodate both Q and Q^T (and dO and dO^T) in shared memory.
+        # Q & dO are used in the SdP Mma and Q^T and dO^T are used in the dKV Mma.
+        # The M dimension (tile_m) doesn't matter for the layout, only the K dimension
+        wg_d_dKV = self.num_wg_mma // self.AtomLayoutNdKV
+        self.sQ_layout, self.sdO_layout = [
+            # Need to set major_mode_size (mms) to accommodate Q and Q.T
+            sm90_utils.make_smem_layout(self.dtype, LayoutEnum.ROW_MAJOR, shape, stage, mms)
+            for shape, stage, mms in [
+                ((self.tile_m, self.tile_hdim), self.Q_stage, self.tile_hdim // wg_d_dKV),
+                ((self.tile_m, self.tile_hdimv), self.dO_stage, self.tile_hdim // wg_d_dKV),
             ]
         ]
+        wg_d_dQ = self.num_wg_dQ // self.AtomLayoutMdQ
+        # Accomodate both K and K.T
+        self.sK_layout = sm90_utils.make_smem_layout(
+            self.dtype,
+            LayoutEnum.ROW_MAJOR,
+            (self.tile_n, self.tile_hdim),
+            stage=None,
+            major_mode_size=self.tile_hdim // wg_d_dQ,
+        )
+        # There's only V, no V.T, so layout is normal
+        self.sV_layout = sm90_utils.make_smem_layout(
+            self.dtype, LayoutEnum.ROW_MAJOR, (self.tile_n, self.tile_hdimv), None
+        )
+        # Accomodate both S and S.T
+        wg_n_SdP = self.num_wg_mma // self.AtomLayoutMSdP
+        wg_n_dKV = self.AtomLayoutNdKV
+        self.sPdS_layout = sm90_utils.make_smem_layout(
+            self.dtype,
+            LayoutEnum.ROW_MAJOR,
+            (self.tile_m, self.tile_n),
+            stage=self.PdS_stage,
+            major_mode_size=math.gcd(self.tile_n // wg_n_SdP, self.tile_n // wg_n_dKV),
+        )
         self.sdQaccum_layout = cute.make_layout(
             (self.tile_m * self.tile_hdim // self.num_wg_dQ, self.num_wg_dQ)
         )
@@ -387,7 +411,7 @@ class FlashAttentionBackwardSm90:
 
         REG_LIMIT = 504 if self.num_wg_mma == 2 else 512
         if const_expr(self.num_wg_mma == 2):
-            if const_expr(self.dQ_single_wg):
+            if const_expr(self.num_wg_dQ == 1):
                 self.num_mma_regs_wg0 = 256
                 self.num_mma_regs_wg1 = 224
             else:
@@ -790,7 +814,7 @@ class FlashAttentionBackwardSm90:
                 blocksparse_tensors,
                 qhead_per_kvhead_divmod,
             )
-            if const_expr(not self.dQ_single_wg):
+            if const_expr(self.num_wg_dQ == self.num_wg_mma):
                 # Both WGs compute dQ
                 cute.arch.setmaxregister_increase(self.num_mma_regs_wg0)
                 self.mma(*mma_args, is_dQ_wg=True)
@@ -1106,7 +1130,7 @@ class FlashAttentionBackwardSm90:
         wg_mma_dV = tiled_mma_dV.get_slice(warp_group_thread_layout(warp_group_idx))
         wg_mma_dQ = None
         if const_expr(is_dQ_wg):
-            wg_idx_dQ = warp_group_idx if const_expr(not self.dQ_single_wg) else 0
+            wg_idx_dQ = warp_group_idx if const_expr(self.num_wg_dQ > 1) else 0
             wg_mma_dQ = tiled_mma_dQ.get_slice(warp_group_thread_layout(wg_idx_dQ))
         # S = Q @ K.T
         shape_mnk_S = (self.tile_m, self.tile_n, self.tile_hdim)
@@ -1169,14 +1193,27 @@ class FlashAttentionBackwardSm90:
 
         # Smem copy atom tiling for P/dS R2S
         copy_P_r2s = None
+        mms_PdS = self.tile_n // (self.num_wg_mma // self.AtomLayoutMSdP)
         if const_expr(sP is not None):
             sP_cpy = sP if const_expr(not self.SdP_swapAB) else sPt
             copy_P_r2s, _, _ = copy_utils.get_smem_store_C(
-                tiled_mma_SdP, sP_cpy, tidx, self.arch, transpose=self.SdP_swapAB
+                tiled_mma_SdP,
+                sP_cpy,
+                tidx,
+                self.arch,
+                transpose=self.SdP_swapAB,
+                position_independent=True,
+                major_mode_size=mms_PdS,
             )
         sdS_cpy = sdS if const_expr(not self.SdP_swapAB) else sdSt
         copy_dS_r2s, _, _ = copy_utils.get_smem_store_C(
-            tiled_mma_SdP, sdS_cpy, tidx, self.arch, transpose=self.SdP_swapAB
+            tiled_mma_SdP,
+            sdS_cpy,
+            tidx,
+            self.arch,
+            transpose=self.SdP_swapAB,
+            position_independent=True,
+            major_mode_size=mms_PdS,
         )
 
         tLSEsLSE = layout_utils.mma_partition_C_vec(
@@ -1604,10 +1641,20 @@ class FlashAttentionBackwardSm90:
             sdV = sV if const_expr(not self.dKV_swapAB) else layout_utils.transpose_view(sV)
             sdK = sK if const_expr(not self.dKV_swapAB) else layout_utils.transpose_view(sK)
             copy_dV_r2s, _, _ = copy_utils.get_smem_store_C(
-                tiled_mma_dV, sdV, tidx, self.arch, transpose=self.dKV_swapAB
+                tiled_mma_dV,
+                sdV,
+                tidx,
+                self.arch,
+                transpose=self.dKV_swapAB,
+                position_independent=True,
             )
             copy_dK_r2s, _, _ = copy_utils.get_smem_store_C(
-                tiled_mma_dK, sdK, tidx, self.arch, transpose=self.dKV_swapAB
+                tiled_mma_dK,
+                sdK,
+                tidx,
+                self.arch,
+                transpose=self.dKV_swapAB,
+                position_independent=True,
             )
             cute.arch.cp_async_bulk_wait_group(1, read=True)
             epi_barrier.arrive_and_wait()
@@ -1631,17 +1678,12 @@ class FlashAttentionBackwardSm90:
             sdKaccum_layout = cute.make_layout((sdKaccum_shape0, self.num_wg_mma))
             sdVaccum_layout = cute.make_layout((sdVaccum_shape0, self.num_wg_mma))
             head_idx_kv = head_idx // qhead_per_kvhead_divmod
-
-            if const_expr(not seqlen.has_cu_seqlens_k):
-                mdKaccum_cur = mdK[None, head_idx_kv, batch_idx]
-                mdVaccum_cur = mdV[None, head_idx_kv, batch_idx]
-            else:
-                mdKaccum_cur = cute.domain_offset(
-                    (seqlen.padded_offset_k * self.tile_hdim,), mdK[None, head_idx_kv]
-                )
-                mdVaccum_cur = cute.domain_offset(
-                    (seqlen.padded_offset_k * self.tile_hdimv,), mdV[None, head_idx_kv]
-                )
+            mdKaccum_cur = seqlen.offset_batch_K(
+                mdK, batch_idx, dim=2, padded=True, multiple=self.tile_hdim
+            )[None, head_idx_kv]
+            mdVaccum_cur = seqlen.offset_batch_K(
+                mdV, batch_idx, dim=2, padded=True, multiple=self.tile_hdimv
+            )[None, head_idx_kv]
             gdKaccum_ = cute.local_tile(mdKaccum_cur, (self.tile_n * self.tile_hdim,), (n_block,))
             gdKaccum = cute.flat_divide(gdKaccum_, (sdKaccum_shape0,))
             gdVaccum_ = cute.local_tile(mdVaccum_cur, (self.tile_n * self.tile_hdimv,), (n_block,))
@@ -1718,10 +1760,15 @@ class FlashAttentionBackwardSm90:
                 mdQaccum_cur = cute.domain_offset(
                     (seqlen.padded_offset_q * self.tile_hdim,), mdQaccum[None, head_idx]
                 )
-            gdQaccum_ = cute.local_tile(mdQaccum_cur, (self.tile_m * self.tile_hdim,), (None,))
-            # (M * K / num_wg_dQ, num_wg_dQ, num_m_blocks)
-            gdQaccum = cute.flat_divide(
-                gdQaccum_, (self.tile_m * self.tile_hdim // self.num_wg_dQ,)
+            # ((M * K / num_wg_dQ, num_wg_dQ), num_m_blocks)
+            gdQaccum = cute.local_tile(
+                mdQaccum_cur,
+                (
+                    cute.make_layout(
+                        (self.tile_m * self.tile_hdim // self.num_wg_dQ, self.num_wg_dQ)
+                    ),
+                ),
+                (None,),
             )
 
             if const_expr(mdQ_semaphore is not None):
@@ -1790,7 +1837,7 @@ class FlashAttentionBackwardSm90:
                             with cute.arch.elect_one():
                                 copy_utils.cpasync_reduce_bulk_add_f32(
                                     sdQaccum[None, warp_group_idx].iterator,
-                                    gdQaccum[None, warp_group_idx, m_block_safe].iterator,
+                                    gdQaccum[(None, warp_group_idx), m_block_safe].iterator,
                                     self.tma_copy_bytes["dQ"],
                                 )
                             cute.arch.cp_async_bulk_commit_group()

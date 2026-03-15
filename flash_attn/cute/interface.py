@@ -205,14 +205,23 @@ def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local):
             AtomLayoutMSdP=1, AtomLayoutNdKV=2, AtomLayoutMdQ=1,
         )
     elif head_dim <= 192:
-        # 3 MMA warp groups (192/64=3), num_threads=512
-        return BwdConfig(
-            m_block_size=64, n_block_size=96,
-            num_stages_Q=2, num_stages_dO=1, num_stages_PdS=1,
-            SdP_swapAB=False, dKV_swapAB=True, dQ_swapAB=True,
-            AtomLayoutMSdP=1, AtomLayoutNdKV=1, AtomLayoutMdQ=1,
-            num_wg=3,
-        )
+        hdimv128 = head_dim_v <= 128
+        if hdimv128:
+            return BwdConfig(
+                m_block_size=64, n_block_size=96,
+                num_stages_Q=2, num_stages_dO=2, num_stages_PdS=1,
+                SdP_swapAB=False, dKV_swapAB=True, dQ_swapAB=False,
+                AtomLayoutMSdP=1, AtomLayoutNdKV=2, AtomLayoutMdQ=1,
+                num_wg=2,
+            )
+        else:
+            return BwdConfig(
+                m_block_size=64, n_block_size=96,
+                num_stages_Q=2, num_stages_dO=1, num_stages_PdS=1,
+                SdP_swapAB=False, dKV_swapAB=True, dQ_swapAB=False,
+                AtomLayoutMSdP=1, AtomLayoutNdKV=2, AtomLayoutMdQ=1,
+                num_wg=2,
+            )
     else:
         # hdim 256
         return BwdConfig(

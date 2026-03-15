@@ -215,7 +215,7 @@ def parse_args():
     parser.add_argument('--fwd', action='store_true', help='Run forward only')
     parser.add_argument('--bwd', action='store_true', help='Run backward only')
     parser.add_argument('--varlen', action='store_true', default=False)
-    parser.add_argument('--causal', choices=['true', 'false', 'both'], default='both',
+    parser.add_argument('--causal', type=str.lower, choices=['true', 'false', 'both'], default='both',
                         help='Causal mode (default: both)')
     parser.add_argument('--seqlen', type=csv_ints, default=[8192],
                         help='Sequence length(s), comma-separated. Supports k suffix, e.g. 1k,2k,8k')
@@ -357,7 +357,7 @@ def main():
     if not shown_backends:
         return
 
-    col_w = 10
+    col_w = 16
 
     for direction, times, flops_mult in [("FWD", time_f, 1.0), ("BWD", time_b, 2.5)]:
         if not times:
@@ -366,13 +366,12 @@ def main():
         if not configs:
             continue
 
-        print(f"\n{'=' * 80}")
-        print(f"  {direction} TFLOPS")
-        print(f"{'=' * 80}")
-
         header = f"{'hdim':>9} {'causal':>6} {'batch':>5} {'seqlen':>6}"
         for b in shown_backends:
             header += f" {b:>{col_w}}"
+        print(f"\n{'=' * len(header)}")
+        print(f"  {direction} (ms / TFLOPS)")
+        print(f"{'=' * len(header)}")
         print(header)
         print("-" * len(header))
 
@@ -385,7 +384,9 @@ def main():
                 t = times.get((cfg, b))
                 if t is not None:
                     tflops = flops_mult * nFLOPS / t * 1e-12
-                    row += f" {tflops:>{col_w}.0f}"
+                    ms = t * 1e3
+                    cell = f"{ms:.2f}/{tflops:.0f}"
+                    row += f" {cell:>{col_w}}"
                 else:
                     row += f" {'—':>{col_w}}"
             print(row)
