@@ -644,8 +644,8 @@ class AttentionMask:
                         acc_S[i] = -cutlass.Float32.inf
         else:  # Causal or local
             thr_row_offset = tScS_t2r[0][ROW]
-            seqlenq_row_limit = self.seqlen_q - m_block * self.tile_m - thr_row_offset
-            causal_offset = seqlenq_row_limit - seqlenk_col_limit
+            seqlenq_row_limit = self.seqlen_q * self.qhead_per_kvhead_packgqa - m_block * self.tile_m - thr_row_offset
+            causal_offset = seqlenq_row_limit - seqlenk_col_limit * self.qhead_per_kvhead_packgqa
             if const_expr(mask_causal):
                 # tidx = cute.arch.thread_idx()[0] % 256
                 # if tidx < 32:
@@ -673,11 +673,11 @@ class AttentionMask:
                     )
             else:
                 if const_expr(self.window_size_right is not None):
-                    row_limit_top = causal_offset - self.window_size_right
+                    row_limit_top = causal_offset - self.window_size_right * self.qhead_per_kvhead_packgqa
                 else:
                     row_limit_top = 0
                 if const_expr(self.window_size_left is not None):
-                    row_limit_bot = causal_offset + self.window_size_left
+                    row_limit_bot = causal_offset + (self.window_size_left + 1) * self.qhead_per_kvhead_packgqa - 1
                 if const_expr(mask_seqlen):
                     if seqlenk_col_limit <= 0:
                         row_limit_top = self.tile_m

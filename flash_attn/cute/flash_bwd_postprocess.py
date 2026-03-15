@@ -43,6 +43,8 @@ class FlashAttentionBackwardPostprocess:
         dQ_swapAB: bool = False,
         use_2cta_instrs: bool = False,
         cluster_size: int = 1,  # for varlen offsets
+        pack_gqa: bool = False,
+        qhead_per_kvhead: cutlass.Constexpr[int] = 1,
     ):
         """
         :param head_dim: head dimension
@@ -56,6 +58,12 @@ class FlashAttentionBackwardPostprocess:
             "Only Ampere (8.x), Hopper (9.x), and Blackwell (10.x, 11.x, 12.x) are supported"
         )
         self.arch = arch
+        self.pack_gqa = pack_gqa
+        self.qhead_per_kvhead = qhead_per_kvhead
+        if pack_gqa:
+            assert tile_m % qhead_per_kvhead == 0, (
+                "For PackGQA, tile_m must be divisible by qhead_per_kvhead"
+            )
         # padding head_dim to a multiple of 32 as k_block_size
         hdim_multiple_of = 32
         self.tile_hdim = int(math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of)
@@ -222,6 +230,24 @@ class FlashAttentionBackwardPostprocess:
 
         mdQaccum, mdQ = [assume_tensor_aligned(t) for t in (mdQaccum, mdQ)]
 
+        if const_expr(self.pack_gqa):
+            # (..., s, n, h) -> (..., (qh/kvh, s), n_kv, h)
+            shape_mdQ_packed = (
+                *mdQ.shape[:-3],
+                (self.qhead_per_kvhead, mdQ.shape[-3]),
+                mdQ.shape[-2] // self.qhead_per_kvhead,
+                mdQ.shape[-1],
+            )
+            stride_mdQ_packed = (
+                *mdQ.stride[:-3],
+                (mdQ.stride[-2], mdQ.stride[-3]),
+                mdQ.stride[-2] * self.qhead_per_kvhead,
+                mdQ.stride[-1],
+            )
+            mdQ = cute.make_tensor(
+                mdQ.iterator, cute.make_layout(shape_mdQ_packed, stride=stride_mdQ_packed)
+            )
+
         self.tiled_mma = self._get_tiled_mma()
         self._setup_attributes()
 
@@ -234,12 +260,12 @@ class FlashAttentionBackwardPostprocess:
             TileScheduler = SingleTileVarlenScheduler
             num_head = mdQ.shape[1]
             num_batch = mCuSeqlensQ.shape[0] - 1
-            num_block = cute.ceil_div(mdQ.shape[0], self.tile_m)
+            num_block = cute.ceil_div(cute.size(mdQ.shape[0]), self.tile_m)
         else:
             TileScheduler = SingleTileScheduler
             num_head = mdQ.shape[2]
             num_batch = mdQ.shape[0]
-            num_block = cute.ceil_div(mdQ.shape[1], self.tile_m)
+            num_block = cute.ceil_div(cute.size(mdQ.shape[1]), self.tile_m)
 
         tile_sched_args = TileSchedulerArguments(
             num_block=num_block,
@@ -249,10 +275,11 @@ class FlashAttentionBackwardPostprocess:
             seqlen_k=0,
             headdim=mdQ.shape[2],
             headdim_v=0,
-            total_q=mdQ.shape[0],
+            total_q=cute.size(mdQ.shape[0]),
             tile_shape_mn=(self.tile_m, 1),
             mCuSeqlensQ=mCuSeqlensQ,
             mSeqUsedQ=mSeqUsedQ,
+            qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
         )
 
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
@@ -330,13 +357,14 @@ class FlashAttentionBackwardPostprocess:
 
             seqlen = SeqlenInfoQK.create(
                 batch_idx,
-                mdQ.shape[1],
+                mdQ.shape[-3] if const_expr(not self.pack_gqa) else mdQ.shape[-3][1],
                 0,
                 mCuSeqlensQ=mCuSeqlensQ,
                 mCuSeqlensK=None,
                 mSeqUsedQ=mSeqUsedQ,
                 mSeqUsedK=None,
                 tile_m=self.tile_m * self.cluster_size,
+                qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
             )
             if const_expr(not seqlen.has_cu_seqlens_q):
                 mdQ_cur = mdQ[batch_idx, None, head_idx, None]
@@ -344,7 +372,8 @@ class FlashAttentionBackwardPostprocess:
                 head_dim = mdQ.shape[3]
             else:
                 padded_offset_q = seqlen.padded_offset_q
-                mdQ_cur = cute.domain_offset((seqlen.offset_q, 0), mdQ[None, head_idx, None])
+                dq_offset = (seqlen.offset_q, 0) if const_expr(not self.pack_gqa) else ((0, seqlen.offset_q), 0)
+                mdQ_cur = cute.domain_offset(dq_offset, mdQ[None, head_idx, None])
                 mdQaccum_cur = cute.domain_offset(
                     (padded_offset_q * self.tile_hdim,), mdQaccum[head_idx, None]
                 )
@@ -365,7 +394,7 @@ class FlashAttentionBackwardPostprocess:
             gdQaccum = cute.local_tile(mdQaccum_cur, (self.tile_m * self.tile_hdim,), (m_block,))
             gdQ = cute.local_tile(mdQ_cur, (self.tile_m, self.tile_hdim), (m_block, 0))
 
-            seqlen_q = seqlen.seqlen_q
+            seqlen_q = seqlen.seqlen_q * (self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1)
             seqlen_q_rounded = cute.round_up(seqlen_q, self.tile_m)
 
             if const_expr(self.arch // 10 == 10 and self.use_2cta_instrs):

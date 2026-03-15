@@ -815,7 +815,7 @@ def _flash_attn_fwd(
 _flash_attn_fwd.compile_cache = get_jit_cache("fwd")
 
 
-def make_fake_bwd_tensors(dtype, has_gqa, varlen_q, varlen_k):
+def make_fake_bwd_tensors(dtype, has_gqa, varlen_q, varlen_k, pack_gqa=False):
     sym = cute.sym_int
     # divisibility in elements: assumed_align_bytes = divisibility * dtype.width // 8
     # For 16-byte align: fp16/bf16 → divisibility=8, float32 → divisibility=4
@@ -823,6 +823,8 @@ def make_fake_bwd_tensors(dtype, has_gqa, varlen_q, varlen_k):
     # Shared sym_ints for dimensions that must match across tensors
     b, seqlen_q, seqlen_k, h_q, d, d_v = sym(), sym(), sym(), sym(), sym(), sym()
     h_kv = h_q if not has_gqa else sym()
+    # When pack_gqa, accumulators (dpsum, lse_log2, dq_accum) use h_kv heads
+    h_accum = h_kv if pack_gqa else h_q
     seqlen_q_rounded, seqlen_k_rounded = sym(), sym()
     seqlen_q_d_rounded, seqlen_k_d_rounded, seqlen_k_dv_rounded = sym(), sym(), sym()
     total_q, total_k, total_q_rounded, total_k_rounded = sym(), sym(), sym(), sym()
@@ -839,14 +841,14 @@ def make_fake_bwd_tensors(dtype, has_gqa, varlen_q, varlen_k):
     mdV = fake_tensor(dtype, (*b_seqlenk, h_kv, d_v), divisibility=div)
     if not varlen_q:
         mLSE = fake_tensor(Float32, (b, h_q, seqlen_q), divisibility=1)
-        mLSElog2 = fake_tensor(Float32, (b, h_q, seqlen_q_rounded), divisibility=4)
-        mPdPsum = fake_tensor(Float32, (b, h_q, seqlen_q_rounded), divisibility=4)
-        dQaccum = fake_tensor(Float32, (b, h_q, seqlen_q_d_rounded), divisibility=4)
+        mLSElog2 = fake_tensor(Float32, (b, h_accum, seqlen_q_rounded), divisibility=4)
+        mPdPsum = fake_tensor(Float32, (b, h_accum, seqlen_q_rounded), divisibility=4)
+        dQaccum = fake_tensor(Float32, (b, h_accum, seqlen_q_d_rounded), divisibility=4)
     else:
         mLSE = fake_tensor(Float32, (h_q, total_q), divisibility=1)
-        mLSElog2 = fake_tensor(Float32, (h_q, total_q_rounded), divisibility=4)
-        mPdPsum = fake_tensor(Float32, (h_q, total_q_rounded), divisibility=4)
-        dQaccum = fake_tensor(Float32, (h_q, total_q_d_rounded), divisibility=4)
+        mLSElog2 = fake_tensor(Float32, (h_accum, total_q_rounded), divisibility=4)
+        mPdPsum = fake_tensor(Float32, (h_accum, total_q_rounded), divisibility=4)
+        dQaccum = fake_tensor(Float32, (h_accum, total_q_d_rounded), divisibility=4)
     if not has_gqa:
         mdKaccum, mdVaccum = None, None
     else:
@@ -861,17 +863,21 @@ def make_fake_bwd_tensors(dtype, has_gqa, varlen_q, varlen_k):
 
 def _compile_bwd_preprocess(
     dtype, head_dim, head_dim_v, m_block_size, has_cuseqlens_q, has_seqused_q, has_dlse,
+    pack_gqa=False, qhead_per_kvhead=1,
 ):
     """Compile bwd preprocess kernel using cute fake tensors (no real GPU tensors needed)."""
     mQ, mK, mV, mO, mdO, mdQ, mdK, mdV, mLSE, mLSElog2, mPdPsum, mdQaccum, mdKaccum, mdVaccum = make_fake_bwd_tensors(
-        dtype, has_gqa=True, varlen_q=has_cuseqlens_q, varlen_k=False
+        dtype, has_gqa=True, varlen_q=has_cuseqlens_q, varlen_k=False, pack_gqa=pack_gqa,
     )
     batch = mQ.shape[0] if not has_cuseqlens_q else cute.sym_int()
     batchp1 = cute.sym_int()
     mCuSeqlensQ = fake_tensor(Int32, (batchp1,), divisibility=1) if has_cuseqlens_q else None
     mSequsedQ = fake_tensor(Int32, (batch,), divisibility=1) if has_seqused_q else None
     mdLSE = fake_tensor(Float32, mLSE.shape, divisibility=1) if has_dlse else None
-    fa_bwd_pre = FlashAttentionBackwardPreprocess(dtype, head_dim, head_dim_v, m_block_size)
+    fa_bwd_pre = FlashAttentionBackwardPreprocess(
+        dtype, head_dim, head_dim_v, m_block_size,
+        qhead_per_kvhead=qhead_per_kvhead, pack_gqa=pack_gqa,
+    )
     return cute.compile(
         fa_bwd_pre, mO, mdO, mPdPsum, mLSE, mLSElog2, mdQaccum, mCuSeqlensQ, mSequsedQ, mdLSE,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
@@ -883,14 +889,19 @@ def _bwd_preprocess(
     out, dout, dpsum, lse, lse_log2, dq_accum,
     cu_seqlens_q, seqused_q, dlse,
     dtype, head_dim, head_dim_v, m_block_size,
+    pack_gqa=False, qhead_per_kvhead=1,
 ):
     """Backward preprocess: compute (o * dout).sum(dim=-1) - dLSE, lse * log2_e, and zero out dq_accum."""
     is_varlen = cu_seqlens_q is not None
     compile_key = (
         dtype, head_dim, head_dim_v, m_block_size, is_varlen, seqused_q is not None, dlse is not None,
+        pack_gqa, qhead_per_kvhead,
     )
     if compile_key not in _bwd_preprocess.compile_cache:
-        _bwd_preprocess.compile_cache[compile_key] = _compile_bwd_preprocess(*compile_key)
+        _bwd_preprocess.compile_cache[compile_key] = _compile_bwd_preprocess(
+            dtype, head_dim, head_dim_v, m_block_size, is_varlen, seqused_q is not None, dlse is not None,
+            pack_gqa=pack_gqa, qhead_per_kvhead=qhead_per_kvhead,
+        )
     if not is_fake_mode():
         _bwd_preprocess.compile_cache[compile_key](
             out, dout, dpsum, lse, lse_log2, dq_accum, cu_seqlens_q, seqused_q, dlse
@@ -904,10 +915,11 @@ def _compile_bwd_postprocess(
     dtype, hdim, block_size, num_threads, atom_layout, swap_ab,
     has_cuseqlens_q, has_seqused_q,
     use_2cta_instrs, cluster_size, arch,
+    pack_gqa=False, qhead_per_kvhead=1,
 ):
     """Compile bwd postprocess kernel using cute fake tensors."""
     mQ, mK, mV, mO, mdO, mdQ, mdK, mdV, mLSE, mLSElog2, mPdPsum, mdQaccum, mdKaccum, mdVaccum = make_fake_bwd_tensors(
-        dtype, has_gqa=True, varlen_q=has_cuseqlens_q, varlen_k=False
+        dtype, has_gqa=True, varlen_q=has_cuseqlens_q, varlen_k=False, pack_gqa=pack_gqa,
     )
     batch = mQ.shape[0] if not has_cuseqlens_q else cute.sym_int()
     batchp1 = cute.sym_int()
@@ -917,6 +929,8 @@ def _compile_bwd_postprocess(
         dtype, hdim, arch, block_size, num_threads, atom_layout, swap_ab,
         use_2cta_instrs=use_2cta_instrs,
         cluster_size=cluster_size,
+        pack_gqa=pack_gqa,
+        qhead_per_kvhead=qhead_per_kvhead,
     )
     return cute.compile(
         fa_bwd_post, mdQaccum, mdQ, Float32(0.0), mCuSeqlensQ, mSeqUsedQ,
@@ -931,15 +945,22 @@ def _bwd_postprocess_convert(
     arch, dtype, hdim, block_size, num_threads,
     atom_layout, swap_ab,
     use_2cta_instrs=False, cluster_size=1,
+    pack_gqa=False, qhead_per_kvhead=1,
 ):
     """Backward postprocess: convert float32 accumulator to bf16/fp16 output."""
     compile_key = (
         dtype, hdim, block_size, num_threads, atom_layout, swap_ab,
         cu_seqlens is not None, seqused is not None,
         use_2cta_instrs, cluster_size, arch,
+        pack_gqa, qhead_per_kvhead,
     )
     if compile_key not in _bwd_postprocess_convert.compile_cache:
-        _bwd_postprocess_convert.compile_cache[compile_key] = _compile_bwd_postprocess(*compile_key)
+        _bwd_postprocess_convert.compile_cache[compile_key] = _compile_bwd_postprocess(
+            dtype, hdim, block_size, num_threads, atom_layout, swap_ab,
+            cu_seqlens is not None, seqused is not None,
+            use_2cta_instrs, cluster_size, arch,
+            pack_gqa=pack_gqa, qhead_per_kvhead=qhead_per_kvhead,
+        )
     if not is_fake_mode():
         _bwd_postprocess_convert.compile_cache[compile_key](
             accum, output, scale, cu_seqlens, seqused,
@@ -1097,7 +1118,13 @@ def _flash_attn_bwd(
 
     # NB: this could be derived from the block_sparse_tensors but for now we hardcode it to 2
     subtile_factor = 2
-    seqlen_q_rounded = (seqlen_q + m_block_size - 1) // m_block_size * m_block_size
+    qhead_per_kvhead = num_head // num_head_kv
+    num_head_packgqa = num_head_kv if pack_gqa else num_head
+    seqlen_q_rounded = (
+        (seqlen_q * (qhead_per_kvhead if pack_gqa else 1) + m_block_size - 1)
+        // m_block_size
+        * m_block_size
+    )
     seqlen_k_rounded = (seqlen_k + n_block_size - 1) // n_block_size * n_block_size
     num_n_blocks = seqlen_k_rounded // n_block_size
     if cluster_size == 2 and num_n_blocks % cluster_size != 0:
@@ -1148,11 +1175,11 @@ def _flash_attn_bwd(
         _validate_head_dims(head_dim, head_dim_v, arch // 10, alignment)
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
-    qhead_per_kvhead = num_head // num_head_kv
     if pack_gqa is None:
-        pack_gqa = qhead_per_kvhead > 1
-    # pack_gqa backward not yet supported in bwd
-    pack_gqa = False
+        pack_gqa = qhead_per_kvhead > 1 and m_block_size % qhead_per_kvhead == 0
+    if arch // 10 not in [10, 11]:
+        # pack_gqa in backward not yet supported on Sm90
+        pack_gqa = False
     if score_mod is not None:
         assert score_mod_bwd is not None, "score_mod_bwd is required when score_mod is provided"
         assert softcap == 0.0, "softcap and score_mod are mutually exclusive (different log2 scaling)"
@@ -1183,31 +1210,33 @@ def _flash_attn_bwd(
     if cu_seqlens_q is None:
         dq_accum = torch.empty(
             batch_size,
-            num_head,
+            num_head_packgqa,
             seqlen_q_rounded * head_dim_rounded,
             dtype=torch.float32,
             device=device,
         )
         dpsum = torch.empty(
-            batch_size, num_head, seqlen_q_rounded, dtype=torch.float32, device=device
+            batch_size, num_head_packgqa, seqlen_q_rounded, dtype=torch.float32, device=device
         )
         lse_log2 = torch.empty(
-            batch_size, num_head, seqlen_q_rounded, dtype=torch.float32, device=device
+            batch_size, num_head_packgqa, seqlen_q_rounded, dtype=torch.float32, device=device
         )
     else:
+        total_q_packgqa = total_q if not pack_gqa else total_q * qhead_per_kvhead
         total_q_rounded_padded = (
-            (total_q + cu_seqlens_q.shape[0] * m_block_size - 1) // m_block_size * m_block_size
+            (total_q_packgqa + cu_seqlens_q.shape[0] * m_block_size - 1) // m_block_size * m_block_size
         )
         dq_accum = torch.empty(
-            num_head, total_q_rounded_padded * head_dim_rounded, dtype=torch.float32, device=device
+            num_head_packgqa, total_q_rounded_padded * head_dim_rounded, dtype=torch.float32, device=device
         )
-        dpsum = torch.empty(num_head, total_q_rounded_padded, dtype=torch.float32, device=device)
-        lse_log2 = torch.empty(num_head, total_q_rounded_padded, dtype=torch.float32, device=device)
+        dpsum = torch.empty(num_head_packgqa, total_q_rounded_padded, dtype=torch.float32, device=device)
+        lse_log2 = torch.empty(num_head_packgqa, total_q_rounded_padded, dtype=torch.float32, device=device)
 
     # GQA (qhead_per_kvhead > 1) needs dK/dV accum+postprocess since multiple Q heads
     # accumulate into the same dK/dV. SM90 varlen_k with qhead_per_kvhead==1 now uses
     # ragged TMA tensors for direct store, so no longer needs accum+postprocess.
-    dKV_postprocess = qhead_per_kvhead > 1
+    # With pack_gqa, Q heads are folded into M so each KV head only sees its own blocks.
+    dKV_postprocess = qhead_per_kvhead > 1 and not pack_gqa
     if dKV_postprocess:
         head_dim_v_rounded = (head_dim_v + 32 - 1) // 32 * 32
         if cu_seqlens_k is None:
@@ -1251,11 +1280,11 @@ def _flash_attn_bwd(
     )
 
     if deterministic:
-        dQ_semaphore = torch.zeros(batch_size, num_head, seqlen_q_rounded // m_block_size, cluster_size, dtype=torch.int32, device=device)
+        dQ_semaphore = torch.zeros(batch_size, num_head_packgqa, seqlen_q_rounded // m_block_size, cluster_size, dtype=torch.int32, device=device)
     else:
         dQ_semaphore = None
 
-    if deterministic and qhead_per_kvhead > 1:
+    if deterministic and qhead_per_kvhead > 1 and not pack_gqa:
         dK_semaphore = torch.zeros(batch_size, num_head_kv, seqlen_k_rounded // n_block_size, 2, dtype=torch.int32, device=device)
         dV_semaphore = torch.zeros(batch_size, num_head_kv, seqlen_k_rounded // n_block_size, 2, dtype=torch.int32, device=device)
     else:
@@ -1267,6 +1296,7 @@ def _flash_attn_bwd(
         out, dout, dpsum, lse, lse_log2, dq_accum,
         cu_seqlens_q, seqused_q, dlse,
         dtype, head_dim, head_dim_v, m_block_size,
+        pack_gqa=pack_gqa, qhead_per_kvhead=qhead_per_kvhead,
     )
     # num_threads: SM90 derives from BwdConfig.num_wg, SM120 is set to 128 above,
     # SM100/SM110 uses default from function signature (384).
@@ -1460,6 +1490,7 @@ def _flash_attn_bwd(
                 mask_mod=mask_mod,
                 has_aux_tensors=aux_tensors is not None,
                 subtile_factor=subtile_factor,
+                pack_gqa=pack_gqa,
             )
 
         # Block sparse tensors for backward use Q-direction indexing (transposed from forward).
@@ -1537,6 +1568,7 @@ def _flash_attn_bwd(
         arch, dtype, head_dim, m_block_size, num_threads_post_dQ,
         AtomLayoutMdQ, dQ_swapAB,
         use_2cta_instrs=use_2cta_instrs, cluster_size=1,
+        pack_gqa=pack_gqa, qhead_per_kvhead=qhead_per_kvhead,
     )
 
     if dKV_postprocess:
@@ -1618,6 +1650,7 @@ class FlashAttnFunc(torch.autograd.Function):
         ctx.window_size = window_size
         ctx.softcap = softcap
         ctx.deterministic = deterministic
+        ctx.pack_gqa = pack_gqa
         ctx.return_lse = return_lse
         ctx.set_materialize_grads(False)
         return out, lse
@@ -1642,6 +1675,7 @@ class FlashAttnFunc(torch.autograd.Function):
             window_size_left=ctx.window_size[0],
             window_size_right=ctx.window_size[1],
             deterministic=ctx.deterministic,
+            pack_gqa=ctx.pack_gqa,
             dlse=dlse,
         )
         return dq, dk, dv, *((None,) * 20)  # Extra Nones is fine
@@ -1702,6 +1736,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         ctx.window_size = window_size
         ctx.softcap = softcap
         ctx.deterministic = deterministic
+        ctx.pack_gqa = pack_gqa
         ctx.max_seqlen_q = max_seqlen_q
         ctx.max_seqlen_k = max_seqlen_k
         ctx.return_lse = return_lse
@@ -1735,6 +1770,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             max_seqlen_q=ctx.max_seqlen_q,
             max_seqlen_k=ctx.max_seqlen_k,
             deterministic=ctx.deterministic,
+            pack_gqa=ctx.pack_gqa,
             dlse=dlse,
         )
 
