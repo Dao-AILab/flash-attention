@@ -357,9 +357,9 @@ class FlashAttentionForwardSm100:
         # This is currently very ad-hoc, we should tune it systematically
         self.ex2_emu_freq = 0
         # self.ex2_emu_start_frg = 1 if self.is_causal else 0
-        self.ex2_emu_start_frg = 1
+        self.ex2_emu_start_frg = 0
         if const_expr(self.enable_ex2_emu):
-            self.ex2_emu_freq = 16
+            self.ex2_emu_freq = 10
             if const_expr(self.head_dim_padded == 128 and self.use_2cta_instrs):
                 self.ex2_emu_freq = 12
             if const_expr(
