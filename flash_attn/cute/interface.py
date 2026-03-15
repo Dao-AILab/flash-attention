@@ -1055,8 +1055,9 @@ def _flash_attn_bwd(
         dKV_swapAB = False
         AtomLayoutMdQ = 1
         AtomLayoutNdKV = 1
+        requires_2cta = head_dim == 192
         disable_2cta = (
-            local
+            (local and not requires_2cta)
             or score_mod is not None
             or score_mod_bwd is not None
             or mask_mod is not None
