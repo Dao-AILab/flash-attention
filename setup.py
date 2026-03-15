@@ -67,6 +67,7 @@ ROCM_BACKEND: Optional[Literal["triton", "ck"]] = None
 if IS_ROCM:
     ROCM_BACKEND = "triton" if os.getenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", "FALSE") == "TRUE" else "ck"
 NVCC_THREADS = os.getenv("NVCC_THREADS") or "4"
+DISABLE_SINK = os.getenv("FLASH_ATTENTION_DISABLE_SINK", "FALSE") == "TRUE"
 
 @functools.lru_cache(maxsize=None)
 def cuda_archs() -> str:
@@ -286,6 +287,7 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
     # "-DFLASHATTENTION_DISABLE_SOFTCAP",
     # "-DFLASHATTENTION_DISABLE_UNEVEN_K",
     # "-DFLASHATTENTION_DISABLE_LOCAL",
+    # "-DFLASHATTENTION_DISABLE_SINK",
     ]
 
     compiler_c17_flag=["-O3", "-std=c++17"]
