@@ -28,13 +28,14 @@ class SeqlenInfo:
         cu_seqlens: Optional[cute.Tensor] = None,
         seqused: Optional[cute.Tensor] = None,
         tile: cutlass.Constexpr[int] = 128,
+        qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1,
     ):
         offset = 0 if const_expr(cu_seqlens is None) else cu_seqlens[batch_idx]
         offset_padded = (
             0
             if const_expr(cu_seqlens is None)
             # Add divby so that the compiler knows the alignment when moving by offset_padded
-            else cute.assume((offset + batch_idx * tile) // tile * tile, divby=tile)
+            else cute.assume((offset * qhead_per_kvhead_packgqa + batch_idx * tile) // tile * tile, divby=tile)
         )
         if const_expr(seqused is not None):
             seqlen = seqused[batch_idx]
@@ -87,13 +88,14 @@ class SeqlenInfoQK:
         mSeqUsedK: Optional[cute.Tensor] = None,
         tile_m: cutlass.Constexpr[Int32] = 128,
         tile_n: cutlass.Constexpr[Int32] = 128,
+        qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1,
     ):
         offset_q = 0 if const_expr(mCuSeqlensQ is None) else mCuSeqlensQ[batch_idx]
         offset_k = 0 if const_expr(mCuSeqlensK is None) else mCuSeqlensK[batch_idx]
         padded_offset_q = (
             0
             if const_expr(mCuSeqlensQ is None)
-            else cute.assume((offset_q + batch_idx * tile_m) // tile_m * tile_m, divby=tile_m)
+            else cute.assume((offset_q * qhead_per_kvhead_packgqa + batch_idx * tile_m) // tile_m * tile_m, divby=tile_m)
         )
         padded_offset_k = (
             0
