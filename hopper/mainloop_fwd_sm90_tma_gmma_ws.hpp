@@ -42,6 +42,8 @@ struct CollectiveMainloopFwdSm90 {
     using ElementAccum = ElementAccum_;
     using ArchTag = ArchTag_;
     static constexpr bool Is_FP8 = cute::is_same_v<Element, cutlass::float_e4m3_t> || cute::is_same_v<Element, cutlass::float_e5m2_t>;;
+    static constexpr int kFP8TwoLevelInterval = FLASHATTENTION_FP8_TWO_LEVEL_INTERVAL;
+    static constexpr bool UseIntervalTwoLevel = Is_FP8 && (kFP8TwoLevelInterval >= 1);
     static constexpr bool Is_causal = Is_causal_;
     static constexpr bool Is_local = Is_local_;
     static constexpr bool Has_softcap = Has_softcap_;
@@ -1166,6 +1168,25 @@ struct CollectiveMainloopFwdSm90 {
             clear(tOrO);
             // tiled_mma_pv.accumulate_ = GMMA::ScaleOut::Zero;
 
+            // For interval-based two-level accumulation
+            using AccumFragment_t = std::conditional_t<
+                UseIntervalTwoLevel,
+                decltype(cute::make_fragment_like(tOrO)),
+                cute::array<float, 0>>;
+            using AccumScale_t = std::conditional_t<
+                UseIntervalTwoLevel,
+                decltype(cute::make_tensor_like(scores_scale)),
+                cute::array<float, 0>>;
+            [[maybe_unused]] AccumFragment_t tOrO_accum{};
+            [[maybe_unused]] AccumScale_t accum_scale{};
+            if constexpr (UseIntervalTwoLevel) {
+                tOrO_accum = cute::make_fragment_like(tOrO);
+                accum_scale = cute::make_tensor_like(scores_scale);
+                cute::clear(tOrO_accum);
+                cute::fill(accum_scale, 1.0f);
+            }
+            [[maybe_unused]] int tile_idx = 0;
+
             // Each step does gemm0 for iter n_block, gemm1 for iter n_block + 1, and softmax for iter n_block.
             auto fwd_step = [&](int const n_block, auto mask_fn, auto check_inf_type) {
                 static constexpr bool Check_inf = decltype(check_inf_type)::value;
@@ -1175,7 +1196,12 @@ struct CollectiveMainloopFwdSm90 {
                 if (!UseSchedulerBarrier || warp_group_idx == 0) { consumer_wait(pipeline_k, smem_pipe_read); }
                 warp_scheduler_barrier_sync();
                 flash::gemm</*zero_init=*/true, /*wg_wait=*/-1>(tiled_mma_qk, tSrQ, tSrK(_, _, _, smem_pipe_read.index()), tSrS);
-                if constexpr (RescaleOBeforeGemm) { softmax.rescale_o(tOrO, scores_scale); }
+                if constexpr (RescaleOBeforeGemm) {
+                    softmax.rescale_o(tOrO, scores_scale);
+                    if constexpr (UseIntervalTwoLevel) {
+                        softmax.update_accum_scale(accum_scale, scores_scale);
+                    }
+                }
                 if constexpr(!HasQv) {
                     if (!UseSchedulerBarrier || warp_group_idx == 0) { consumer_wait(pipeline_v, smem_pipe_read_v); }
                 }
@@ -1202,8 +1228,20 @@ struct CollectiveMainloopFwdSm90 {
                 convert_type_out(make_tensor(tSrS.data(), tOrP.layout()), tOrP);
                 if constexpr (Is_FP8 && V_colmajor) { flash::permute_Aregs_fp8(tOrP); }
                 if constexpr (!MmaPV_is_RS) { write_P_to_smem(tOrP); }
-                if constexpr (!RescaleOBeforeGemm) { softmax.rescale_o(tOrO, scores_scale); }
+                if constexpr (!RescaleOBeforeGemm) {
+                    softmax.rescale_o(tOrO, scores_scale);
+                    if constexpr (UseIntervalTwoLevel) {
+                        softmax.update_accum_scale(accum_scale, scores_scale);
+                    }
+                }
                 if constexpr (!MmaPV_is_RS) { arrive_on_P_write_barrier(); }
+                if constexpr (UseIntervalTwoLevel) {
+                    if (((tile_idx + 1) % kFP8TwoLevelInterval) == 0) {
+                        softmax.merge_accum_with_scale(tOrO, tOrO_accum, accum_scale);
+                        cute::clear(tOrO);
+                    }
+                    ++tile_idx;
+                }
             };
 
             if constexpr (Is_causal || Is_local) { // Separate iterations with causal or local masking
@@ -1235,8 +1273,19 @@ struct CollectiveMainloopFwdSm90 {
             }
             // Tell producers that smem_q is ready
             cutlass::arch::NamedBarrier::arrive(NumMmaThreadsQK + (Use_TMA_Q ? cutlass::NumThreadsPerWarp : NumProducerThreads), static_cast<uint32_t>(FwdNamedBarriers::QueryEmpty) /*id*/);
-            if constexpr (RescaleOBeforeGemm) { softmax.rescale_o(tOrO, scores_scale); }
+            if constexpr (RescaleOBeforeGemm) {
+                softmax.rescale_o(tOrO, scores_scale);
+                if constexpr (UseIntervalTwoLevel) {
+                    softmax.update_accum_scale(accum_scale, scores_scale);
+                }
+            }
             if constexpr (!HasQv) { consumer_wait(pipeline_v, smem_pipe_read); }
+            if constexpr (UseIntervalTwoLevel) {
+                if (((tile_idx + 1) % kFP8TwoLevelInterval) == 0) {
+                    softmax.merge_accum_with_scale(tOrO, tOrO_accum, accum_scale);
+                    cute::clear(tOrO);
+                }
+            }
             flash::gemm</*zero_init=*/false, /*wg_wait=*/-1>(tiled_mma_pv, cute::conditional_return<MmaPV_is_RS>(tOrP, tOsP), tOrV(_, _, _, smem_pipe_read.index()), tOrO);
             float const v_descale = !Is_FP8 || params.ptr_v_descale == nullptr ? 1.0f : params.ptr_v_descale[bidb * get<0>(params.stride_v_descale) + bidh_kv * get<1>(params.stride_v_descale)];
             cute::copy(softmax.finalize(v_descale), scores_scale);
@@ -1247,6 +1296,9 @@ struct CollectiveMainloopFwdSm90 {
             }
             warpgroup_wait<0>();
             pipeline_v.consumer_release(smem_pipe_read);  // release V, otherwise producers will hang
+            if constexpr (UseIntervalTwoLevel) {
+                softmax.final_merge_accum(tOrO, tOrO_accum, accum_scale);
+            }
             softmax.rescale_o(tOrO, scores_scale);
             if constexpr (Is_FP8 && !V_colmajor) { flash::permute_output_fp8(tOrO); }
             ++smem_pipe_read;
@@ -1254,6 +1306,24 @@ struct CollectiveMainloopFwdSm90 {
         } else {  // No intra-WG overlap
 
             warp_scheduler_barrier_sync();
+
+            using AccumFragmentNoOverlap_t = std::conditional_t<
+                UseIntervalTwoLevel,
+                decltype(cute::make_fragment_like(tOrO)),
+                cute::array<float, 0>>;
+            using AccumScaleNoOverlap_t = std::conditional_t<
+                UseIntervalTwoLevel,
+                decltype(cute::make_tensor_like(softmax.row_max)),
+                cute::array<float, 0>>;
+            [[maybe_unused]] AccumFragmentNoOverlap_t tOrO_accum_no_overlap{};
+            [[maybe_unused]] AccumScaleNoOverlap_t accum_scale_no_overlap{};
+            if constexpr (UseIntervalTwoLevel) {
+                tOrO_accum_no_overlap = cute::make_fragment_like(tOrO);
+                accum_scale_no_overlap = cute::make_tensor_like(softmax.row_max);
+                cute::clear(tOrO_accum_no_overlap);
+                cute::fill(accum_scale_no_overlap, 1.0f);
+            }
+            [[maybe_unused]] int tile_idx_no_overlap = 0;
 
             auto fwd_step = [&](int const n_block, auto mask_fn, auto is_first_iter_type, auto check_inf_type) {
                 static constexpr bool Is_first_iter = decltype(is_first_iter_type)::value;
@@ -1289,7 +1359,12 @@ struct CollectiveMainloopFwdSm90 {
                 convert_type_out(tOrP_acc, tOrP);
                 if constexpr (Is_FP8 && V_colmajor) { flash::permute_Aregs_fp8(tOrP); }
                 if constexpr (!MmaPV_is_RS) { write_P_to_smem(tOrP); }
-                if constexpr (!Is_first_iter) { softmax.rescale_o(tOrO, scores_scale); }
+                if constexpr (!Is_first_iter) {
+                    softmax.rescale_o(tOrO, scores_scale);
+                    if constexpr (UseIntervalTwoLevel) {
+                        softmax.update_accum_scale(accum_scale_no_overlap, scores_scale);
+                    }
+                }
                 if constexpr (!MmaPV_is_RS && !MmaPV_use_RS_WG1) { arrive_on_P_write_barrier(); }
                 if constexpr (!HasQv) { consumer_wait(pipeline_v, smem_pipe_read); }
                 warp_scheduler_barrier_sync();
@@ -1302,6 +1377,13 @@ struct CollectiveMainloopFwdSm90 {
                 if constexpr (!MmaPV_is_RS && MmaPV_use_RS_WG1) { arrive_on_P_write_barrier(); }
                 warpgroup_wait<0>();
                 pipeline_v.consumer_release(smem_pipe_read);  // release V
+                if constexpr (UseIntervalTwoLevel && !Is_first_iter) {
+                    if (((tile_idx_no_overlap + 1) % kFP8TwoLevelInterval) == 0) {
+                        softmax.merge_accum_with_scale(tOrO, tOrO_accum_no_overlap, accum_scale_no_overlap);
+                        cute::clear(tOrO);
+                    }
+                    ++tile_idx_no_overlap;
+                }
             };
 
             auto first_iter_mask_fn = [&](auto& tSrS, int n_block) { mask.template apply<true /*Seqlenk_mask*/, Is_causal, Is_local>(tSrS, m_block, n_block); };
@@ -1342,6 +1424,9 @@ struct CollectiveMainloopFwdSm90 {
                 cutlass::arch::NamedBarrier::sync(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PEmpty) /*id*/);
                 store_scales(scores_scale, smem_pipe_read.index());
                 cutlass::arch::NamedBarrier::arrive(NumMmaThreads, static_cast<uint32_t>(FwdNamedBarriers::PFull) /*id*/);
+            }
+            if constexpr (UseIntervalTwoLevel) {
+                softmax.final_merge_accum(tOrO, tOrO_accum_no_overlap, accum_scale_no_overlap);
             }
             softmax.rescale_o(tOrO, scores_scale);
             if constexpr (Is_FP8 && !V_colmajor) { flash::permute_output_fp8(tOrO); }
