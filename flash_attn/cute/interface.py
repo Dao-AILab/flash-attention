@@ -1176,8 +1176,9 @@ def _flash_attn_bwd(
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
     if pack_gqa is None:
-        pack_gqa = qhead_per_kvhead > 1
+        pack_gqa = qhead_per_kvhead > 1 and m_block_size % qhead_per_kvhead == 0
     if arch // 10 not in [10, 11]:
+        # pack_gqa in backward not yet supported on Sm90
         pack_gqa = False
     if score_mod is not None:
         assert score_mod_bwd is not None, "score_mod_bwd is required when score_mod is provided"
@@ -1473,6 +1474,7 @@ def _flash_attn_bwd(
                 dQ_single_wg=dQ_single_wg,
             )
         else:
+            print(f"{use_2cta_instrs = }")
             fa_bwd_obj = FlashAttentionBackwardSm100(
                 head_dim,
                 head_dim_v,
