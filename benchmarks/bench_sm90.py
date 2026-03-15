@@ -6,31 +6,31 @@ Usage:
     python benchmarks/bench_sm90.py
 
     # Forward only, specific hdims
-    python benchmarks/bench_sm90.py --direction fwd --hdim 64 96
+    python benchmarks/bench_sm90.py --direction fwd --hdim 64,96
 
     # Backward only
     python benchmarks/bench_sm90.py --direction bwd --hdim 128
 
     # Custom seqlens and batch size
-    python benchmarks/bench_sm90.py --seqlen 1024 2048 4096 8192 --batch 0
+    python benchmarks/bench_sm90.py --seqlen 1024,2048,4096,8192 --batch 0
 
     # Sweep tile sizes for fwd
     python benchmarks/bench_sm90.py --sweep-tiles --hdim 96
 
     # Sweep tile sizes for fwd (all hdims including 192, 256)
-    python benchmarks/bench_sm90.py --sweep-tiles --hdim 64 96 128 192 256
+    python benchmarks/bench_sm90.py --sweep-tiles --hdim 64,96,128,192,256
 
     # Sweep RS/overlap variants
-    python benchmarks/bench_sm90.py --sweep-rs-overlap --hdim 64 96
+    python benchmarks/bench_sm90.py --sweep-rs-overlap --hdim 64,96
 
     # Compare old vs new configs
     python benchmarks/bench_sm90.py --compare-configs
 
     # Sweep backward optimizations (V_in_regs, mma_dkv_is_rs, pipeline sharing)
-    python benchmarks/bench_sm90.py --sweep-bwd-opts --hdim 64 128
+    python benchmarks/bench_sm90.py --sweep-bwd-opts --hdim 64,128
 
-    # Causal only, more reps
-    python benchmarks/bench_sm90.py --causal-only --rep 50
+    # Causal only, more reps and warmup
+    python benchmarks/bench_sm90.py --causal-only --rep 50 --warmup 10
 """
 import argparse
 import time
@@ -41,6 +41,39 @@ from flash_attn.cute.interface import _flash_attn_fwd, _flash_attn_bwd
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
+
+def parse_int_k(s):
+    """Parse an integer with optional k/K suffix, e.g. '8k' -> 8192."""
+    s = s.strip().lower()
+    if s.endswith("k"):
+        return int(s[:-1]) * 1024
+    return int(s)
+
+
+def csv_ints(s):
+    """Parse comma-separated integers with optional k suffix, e.g. '512,1k,2k'."""
+    return [parse_int_k(x) for x in s.split(",")]
+
+
+def parse_headdims(s):
+    """Parse comma-separated headdim specs. Each entry is hdim or hdim-hdim_v.
+
+    Examples:
+        '128'           -> [(128, 128)]
+        '192-128'       -> [(192, 128)]
+        '64,128,192'    -> [(64, 64), (128, 128), (192, 192)]
+        '64,128,192-128,192' -> [(64, 64), (128, 128), (192, 128), (192, 192)]
+    """
+    result = []
+    for item in s.split(","):
+        if "-" in item:
+            parts = item.split("-")
+            result.append((int(parts[0]), int(parts[1])))
+        else:
+            hdim = int(item)
+            result.append((hdim, hdim))
+    return result
+
 
 def nheads_for_hdim(h):
     return 32 if h <= 64 else (16 if h <= 192 else 8)
@@ -53,8 +86,8 @@ def fwd_flops(batch, nheads, seqlen, hdim, hdim_v=None, causal=False):
     return batch * nheads * 2 * seqlen * avg_seqlen * (hdim + hdim_v)
 
 
-def bwd_flops(batch, nheads, seqlen, hdim, causal=False):
-    return 2.5 * fwd_flops(batch, nheads, seqlen, hdim, causal=causal)
+def bwd_flops(batch, nheads, seqlen, hdim, causal=False, hdim_v=None):
+    return 2.5 * fwd_flops(batch, nheads, seqlen, hdim, hdim_v=hdim_v, causal=causal)
 
 
 def get_causals(args):
@@ -73,11 +106,13 @@ def auto_batch(seqlen, batch_arg, total_tokens=32768):
 
 def bench_fwd(batch, seqlen, nheads, hdim, causal, tile_m=None, tile_n=None,
               mma_pv_is_rs=None, intra_wg_overlap=None, check_correctness=True,
-              warmup=5, rep=30):
+              warmup=5, rep=30, hdim_v=None):
     """Benchmark forward pass. Returns (ms, tflops, max_diff_or_error)."""
+    if hdim_v is None:
+        hdim_v = hdim
     q = torch.randn(batch, seqlen, nheads, hdim, dtype=torch.bfloat16, device="cuda")
     k = torch.randn(batch, seqlen, nheads, hdim, dtype=torch.bfloat16, device="cuda")
-    v = torch.randn(batch, seqlen, nheads, hdim, dtype=torch.bfloat16, device="cuda")
+    v = torch.randn(batch, seqlen, nheads, hdim_v, dtype=torch.bfloat16, device="cuda")
     kwargs = dict(softmax_scale=hdim ** -0.5, causal=causal)
     if tile_m is not None and tile_n is not None:
         kwargs["tile_mn"] = (tile_m, tile_n)
@@ -112,15 +147,17 @@ def bench_fwd(batch, seqlen, nheads, hdim, causal, tile_m=None, tile_n=None,
     end.record()
     torch.cuda.synchronize()
     ms = start.elapsed_time(end) / rep
-    tflops = fwd_flops(batch, nheads, seqlen, hdim, causal=causal) / ms / 1e9
+    tflops = fwd_flops(batch, nheads, seqlen, hdim, hdim_v=hdim_v, causal=causal) / ms / 1e9
     return ms, tflops, max_diff
 
 
-def bench_bwd(batch, seqlen, nheads, hdim, causal, warmup=5, rep=30, **bwd_kwargs):
+def bench_bwd(batch, seqlen, nheads, hdim, causal, warmup=5, rep=30, hdim_v=None, **bwd_kwargs):
     """Benchmark backward pass. Returns (ms, tflops, None_or_error)."""
+    if hdim_v is None:
+        hdim_v = hdim
     q = torch.randn(batch, seqlen, nheads, hdim, device="cuda", dtype=torch.bfloat16)
     k = torch.randn(batch, seqlen, nheads, hdim, device="cuda", dtype=torch.bfloat16)
-    v = torch.randn(batch, seqlen, nheads, hdim, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(batch, seqlen, nheads, hdim_v, device="cuda", dtype=torch.bfloat16)
     softmax_scale = hdim ** -0.5
     try:
         out, lse = _flash_attn_fwd(q, k, v, softmax_scale=softmax_scale, causal=causal,
@@ -149,7 +186,7 @@ def bench_bwd(batch, seqlen, nheads, hdim, causal, warmup=5, rep=30, **bwd_kwarg
     end.record()
     torch.cuda.synchronize()
     ms = start.elapsed_time(end) / rep
-    tflops = bwd_flops(batch, nheads, seqlen, hdim, causal) / ms / 1e9
+    tflops = bwd_flops(batch, nheads, seqlen, hdim, causal, hdim_v=hdim_v) / ms / 1e9
     return ms, tflops, None
 
 
@@ -302,36 +339,36 @@ def run_default(args):
         print(f"\n{'=' * 80}")
         print(f"  SM90 {direction.upper()}  (rep={args.rep})")
         print(f"{'=' * 80}")
-        cols = f"{'hdim':>5} {'causal':>6} {'batch':>5} {'seqlen':>6} {'ms':>8} {'TFLOPS':>8}"
+        cols = f"{'hdim':>5} {'hdim_v':>6} {'causal':>6} {'batch':>5} {'seqlen':>6} {'ms':>8} {'TFLOPS':>8}"
         if direction == "fwd":
             cols += f" {'max_diff':>10}"
         print(cols)
         print("-" * 80)
 
-        for hdim in args.hdim:
+        for hdim, hdim_v in args.hdim:
             nheads = nheads_for_hdim(hdim)
             for seqlen in args.seqlen:
                 batch = auto_batch(seqlen, args.batch)
                 for causal in get_causals(args):
                     if direction == "fwd":
-                        ms, tflops, diff = bench_fwd(batch, seqlen, nheads, hdim, causal, rep=args.rep)
+                        ms, tflops, diff = bench_fwd(batch, seqlen, nheads, hdim, causal, warmup=args.warmup, rep=args.rep, hdim_v=hdim_v)
                     else:
-                        ms, tflops, diff = bench_bwd(batch, seqlen, nheads, hdim, causal, rep=args.rep)
+                        ms, tflops, diff = bench_bwd(batch, seqlen, nheads, hdim, causal, warmup=args.warmup, rep=args.rep, hdim_v=hdim_v)
 
                     if ms is not None:
-                        line = f"{hdim:>5} {str(causal):>6} {batch:>5} {seqlen:>6} {ms:>8.3f} {tflops:>8.1f}"
+                        line = f"{hdim:>5} {hdim_v:>6} {str(causal):>6} {batch:>5} {seqlen:>6} {ms:>8.3f} {tflops:>8.1f}"
                         if diff is not None:
                             line += f" {diff:>10.6f}"
                         print(line)
                     else:
-                        print(f"{hdim:>5} {str(causal):>6} {batch:>5} {seqlen:>6} {'FAIL':>8} {'':>8} {diff}")
+                        print(f"{hdim:>5} {hdim_v:>6} {str(causal):>6} {batch:>5} {seqlen:>6} {'FAIL':>8} {'':>8} {diff}")
 
 
 def run_sweep_tiles(args):
     """Sweep tile sizes for fwd across seqlens."""
     seqlens = args.seqlen
 
-    for hdim in args.hdim:
+    for hdim, hdim_v in args.hdim:
         nheads = nheads_for_hdim(hdim)
         configs = TILE_SWEEP_CONFIGS.get(hdim, [])
         if not configs:
@@ -351,7 +388,7 @@ def run_sweep_tiles(args):
                     batch = auto_batch(sl, args.batch)
                     ms, tflops, diff = bench_fwd(batch, sl, nheads, hdim, causal,
                                                  tile_m, tile_n, rs, ol,
-                                                 check_correctness=False, rep=args.rep)
+                                                 check_correctness=False, warmup=args.warmup, rep=args.rep, hdim_v=hdim_v)
                     row += f" {tflops:>8.1f}" if tflops else f" {'FAIL':>8}"
                 print(row)
             print()
@@ -362,7 +399,7 @@ def run_sweep_rs_overlap(args):
     seqlens = args.seqlen
     tile_for_hdim = {64: (192, 128), 96: (192, 128), 128: (128, 128)}
 
-    for hdim in args.hdim:
+    for hdim, hdim_v in args.hdim:
         nheads = nheads_for_hdim(hdim)
         tile_m, tile_n = tile_for_hdim.get(hdim, (128, 128))
 
@@ -381,7 +418,7 @@ def run_sweep_rs_overlap(args):
                     batch = auto_batch(sl, args.batch)
                     ms, tflops, diff = bench_fwd(batch, sl, nheads, hdim, causal,
                                                  tile_m, tile_n, rs, ol,
-                                                 check_correctness=False, rep=args.rep)
+                                                 check_correctness=False, warmup=args.warmup, rep=args.rep, hdim_v=hdim_v)
                     row += f" {tflops:>8.1f}" if tflops else f" {'FAIL':>8}"
                 print(row)
             print()
@@ -406,7 +443,7 @@ def run_compare_configs(args):
             for sl in seqlens:
                 batch = auto_batch(sl, args.batch)
                 ms, tflops, diff = bench_fwd(batch, sl, nheads, hdim, causal, *cfg,
-                                             check_correctness=False, rep=args.rep)
+                                             check_correctness=False, warmup=args.warmup, rep=args.rep)
                 row += f" {tflops:>8.1f}" if tflops else f" {'FAIL':>8}"
             print(row)
         print("-" * len(header))
@@ -421,7 +458,7 @@ def run_sweep_bwd_opts(args):
             c_str = "causal" if causal else "non-causal"
             has_any = False
 
-            for hdim in args.hdim:
+            for hdim, hdim_v in args.hdim:
                 configs = get_configs_fn(hdim, causal)
                 if configs is None:
                     continue
@@ -435,12 +472,12 @@ def run_sweep_bwd_opts(args):
                 print(f"\n  hdim={hdim}:")
                 for sl in seqlens:
                     batch = auto_batch(sl, args.batch)
-                    f = bwd_flops(batch, nheads, sl, hdim, causal)
+                    f = bwd_flops(batch, nheads, sl, hdim, causal, hdim_v=hdim_v)
                     if len(seqlens) > 1:
                         print(f"    seqlen={sl}, batch={batch}:")
                     for label, kwargs in configs.items():
                         ms, tflops, err = bench_bwd(batch, sl, nheads, hdim, causal,
-                                                     rep=args.rep, **kwargs)
+                                                     warmup=args.warmup, rep=args.rep, hdim_v=hdim_v, **kwargs)
                         if ms is not None:
                             print(f"    {label:40s}: {ms:6.2f} ms  ({tflops:6.1f} TFLOPS)")
                         else:
@@ -457,12 +494,14 @@ def main():
     )
     parser.add_argument("--direction", choices=["fwd", "bwd", "both"], default="both",
                         help="Benchmark direction (default: both)")
-    parser.add_argument("--hdim", type=int, nargs="+", default=[64, 96, 128],
-                        help="Head dimensions (default: 64 96 128)")
-    parser.add_argument("--seqlen", type=int, nargs="+", default=[8192],
-                        help="Sequence lengths (default: 8192)")
+    parser.add_argument("--hdim", type=parse_headdims, default=[(64, 64), (96, 96), (128, 128)],
+                        help="Head dims, comma-separated. Each is hdim or hdim-hdim_v. E.g. 64,128,192-128")
+    parser.add_argument("--seqlen", type=csv_ints, default=[8192],
+                        help="Sequence lengths, comma-separated (default: 8192)")
     parser.add_argument("--batch", type=int, default=0,
                         help="Batch size (0 = auto ~32k tokens)")
+    parser.add_argument("--warmup", type=int, default=5,
+                        help="Warmup iterations (default: 5)")
     parser.add_argument("--rep", type=int, default=30,
                         help="Repetitions per benchmark (default: 30)")
     parser.add_argument("--causal-only", action="store_true")
