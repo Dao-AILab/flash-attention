@@ -219,7 +219,7 @@ def _flash_attn_varlen_forward_fake(
     paged_kv = block_table is not None
     batch_size = cu_seqlens_q.numel() - 1
     total_q, num_heads, _ = q.shape
-    
+
     out = torch.empty_like(q)
     softmax_lse = torch.empty((num_heads, total_q), dtype=torch.float32, device=q.device, layout=q.layout)
     p = torch.empty((0,), dtype=q.dtype, device=q.device, layout=q.layout)
@@ -323,7 +323,7 @@ def _flash_attn_backward_fake(
         softmax_d = torch.empty((batch_size, num_heads, seqlen_q), device=q.device, dtype=torch.float32)
     else:
         softmax_d = torch.empty((batch_size, num_heads, round_multiple(seqlen_q, 128)), device=q.device, dtype=torch.float32)
-    
+
     return softmax_d
 
 
@@ -437,7 +437,7 @@ def _flash_attn_varlen_backward_fake(
         softmax_d = torch.empty((num_heads, total_q), device=q.device, dtype=torch.float32)
     else:
         softmax_d = torch.empty((num_heads, total_q + 128 * batch_size), device=q.device, dtype=torch.float32)
-    
+
     return softmax_d
 
 
@@ -1614,3 +1614,43 @@ def flash_attn_with_kvcache(
         num_splits,
     )
     return (out, softmax_lse) if return_softmax_lse else out
+
+
+class _NoGradForwardSliceBackward(torch.autograd.Function):
+    """Identity in forward, zeros out padding gradients in backward.
+
+    When using varlen attention with padded inputs (input length > cu_seqlens[-1]),
+    the backward kernel only writes gradients for valid positions. Uninitialized
+    positions may contain NaN/inf that corrupt upstream gradients.
+
+    Wrap q, k, v with this before calling flash_attn_varlen_func to clean up
+    the padding gradients without adding unconditional overhead to the kernel.
+    """
+
+    @staticmethod
+    def forward(x, valid_len):
+        return x
+
+    @staticmethod
+    def setup_context(ctx, inputs, output):
+        _, valid_len = inputs
+        ctx.save_for_backward(valid_len)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        valid_len, = ctx.saved_tensors
+        mask = torch.arange(grad_output.shape[0], device=grad_output.device) < valid_len
+        return torch.where(mask[:, None, None], grad_output, 0.0), None
+
+
+def no_grad_forward_slice_backward(x, valid_len):
+    """Identity in forward, zeros out gradients beyond valid_len in backward.
+
+    Usage::
+
+        q = no_grad_forward_slice_backward(q, cu_seqlens_q[-1])
+        k = no_grad_forward_slice_backward(k, cu_seqlens_k[-1])
+        v = no_grad_forward_slice_backward(v, cu_seqlens_k[-1])
+        out = flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k, ...)
+    """
+    return _NoGradForwardSliceBackward.apply(x, valid_len)

@@ -1136,3 +1136,43 @@ def get_scheduler_metadata(
         sm_margin,
     )
     return scheduler_metadata
+
+
+class _NoGradForwardSliceBackward(torch.autograd.Function):
+    """Identity in forward, zeros out padding gradients in backward.
+
+    When using varlen attention with padded inputs (input length > cu_seqlens[-1]),
+    the backward kernel only writes gradients for valid positions. Uninitialized
+    positions may contain NaN/inf that corrupt upstream gradients.
+
+    Wrap q, k, v with this before calling flash_attn_varlen_func to clean up
+    the padding gradients without adding unconditional overhead to the kernel.
+    """
+
+    @staticmethod
+    def forward(x, valid_len):
+        return x
+
+    @staticmethod
+    def setup_context(ctx, inputs, output):
+        _, valid_len = inputs
+        ctx.save_for_backward(valid_len)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        valid_len, = ctx.saved_tensors
+        mask = torch.arange(grad_output.shape[0], device=grad_output.device) < valid_len
+        return torch.where(mask[:, None, None], grad_output, 0.0), None
+
+
+def no_grad_forward_slice_backward(x, valid_len):
+    """Identity in forward, zeros out gradients beyond valid_len in backward.
+
+    Usage::
+
+        q = no_grad_forward_slice_backward(q, cu_seqlens_q[-1])
+        k = no_grad_forward_slice_backward(k, cu_seqlens_k[-1])
+        v = no_grad_forward_slice_backward(v, cu_seqlens_k[-1])
+        out = flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k, ...)
+    """
+    return _NoGradForwardSliceBackward.apply(x, valid_len)
