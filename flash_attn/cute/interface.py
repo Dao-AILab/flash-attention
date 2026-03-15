@@ -189,6 +189,7 @@ def _tile_size_bwd_sm90(head_dim, causal, local):
             num_stages_Q=2, num_stages_dO=2, num_stages_PdS=2,
             SdP_swapAB=True, dKV_swapAB=False, dQ_swapAB=False,
             AtomLayoutMSdP=1, AtomLayoutNdKV=2, AtomLayoutMdQ=1,
+            dQ_single_wg=True,
         )
     elif head_dim <= 128:
         # C++ FA3: causal/local: 64, 128; non-causal: 80, 128 with dQ_swapAB
@@ -1527,15 +1528,20 @@ def _flash_attn_bwd(
 
     # hdim 192 with swapAB needs 3 WGs (192/64=3) in postprocess too
     if arch // 10 == 9 and head_dim > 128 and head_dim <= 192:
-        num_threads_post = 384
+        num_threads_post_dQ = 384
+        num_threads_post_dKV = 384
+    elif arch // 10 == 9:
+        num_threads_post_dQ = 128 if dQ_single_wg else 256
+        num_threads_post_dKV = 256
     else:
-        num_threads_post = 256 if arch // 10 == 9 else 128
+        num_threads_post_dQ = 128
+        num_threads_post_dKV = 128
 
     # Postprocess: convert dq_accum from float32 to dq in bf16/fp16
     _bwd_postprocess_convert(
         dq_accum, dq, softmax_scale,
         cu_seqlens_q, seqused_q,
-        arch, dtype, head_dim, m_block_size, num_threads_post,
+        arch, dtype, head_dim, m_block_size, num_threads_post_dQ,
         AtomLayoutMdQ, dQ_swapAB,
         use_2cta_instrs=use_2cta_instrs, cluster_size=1,
     )
@@ -1545,7 +1551,7 @@ def _flash_attn_bwd(
         _bwd_postprocess_convert(
             dk_accum, dk, softmax_scale,
             cu_seqlens_k, seqused_k,
-            arch, dtype, head_dim, n_block_size, num_threads_post,
+            arch, dtype, head_dim, n_block_size, num_threads_post_dKV,
             AtomLayoutNdKV, dKV_swapAB,
             cluster_size=cluster_size,
         )
@@ -1553,7 +1559,7 @@ def _flash_attn_bwd(
         _bwd_postprocess_convert(
             dv_accum, dv, 1.0,
             cu_seqlens_k, seqused_k,
-            arch, dtype, head_dim_v, n_block_size, num_threads_post,
+            arch, dtype, head_dim_v, n_block_size, num_threads_post_dKV,
             AtomLayoutNdKV, dKV_swapAB,
             cluster_size=cluster_size,
         )
