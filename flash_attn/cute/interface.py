@@ -511,8 +511,8 @@ def _flash_attn_fwd(
 
     is_split_kv = num_splits > 1
     if is_split_kv:
-        out_partial = torch.empty(num_splits, *q_batch_seqlen_shape, num_head, head_dim_v, dtype=torch.float32, device=device)
-        lse_partial = torch.empty(num_splits, *lse_shape, dtype=torch.float32, device=device)
+        out_partial = torch.zeros(num_splits, *q_batch_seqlen_shape, num_head, head_dim_v, dtype=torch.float32, device=device)
+        lse_partial = torch.full((num_splits, *lse_shape), float('-inf'), dtype=torch.float32, device=device)
 
     use_2cta_instrs = (
         arch // 10 in [10, 11]
@@ -730,8 +730,14 @@ def _flash_attn_fwd(
         elif arch // 10 == 12:
             # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
             assert not use_block_sparsity, "Block sparsity not supported on SM 12.0"
-            assert page_table is None, "Paged KV not supported on SM 12.0 in this PR"
-            assert not is_split_kv, "SplitKV not supported on SM 12.0 in this PR"
+            if page_table is not None:
+                assert seqused_k is not None, (
+                    "Paged KV on SM120 requires seqused_k (actual sequence lengths per batch)"
+                )
+                # Paged KV requires tile_n >= num_threads (each thread needs >=1 page entry).
+                # For D>64, the default tile_n=64 is too small; bump to 128 (fits in 99KB SMEM).
+                if tile_n < num_threads:
+                    tile_n = num_threads  # 128
             fa_fwd = FlashAttentionForwardSm120(
                 dtype,
                 head_dim,
@@ -739,6 +745,7 @@ def _flash_attn_fwd(
                 qhead_per_kvhead,
                 is_causal=causal,
                 is_local=local,
+                is_split_kv=is_split_kv,
                 pack_gqa=pack_gqa,
                 tile_m=tile_m,
                 tile_n=tile_n,

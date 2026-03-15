@@ -31,6 +31,8 @@ class FlashAttentionForwardSm120(FlashAttentionForwardSm80):
         """Check if the kernel can be implemented on SM120.
 
         Same logic as SM80 but uses SM120's shared memory capacity (99 KB).
+        For split-KV, FP32 partials are written directly from MMA accumulators
+        to GMEM (no SMEM round-trip), so sO doesn't affect SMEM budget.
         """
         if dtype not in [cutlass.Float16, cutlass.BFloat16]:
             return False
