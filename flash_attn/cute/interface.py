@@ -165,10 +165,11 @@ class BwdConfig:
     AtomLayoutMSdP: int
     AtomLayoutNdKV: int
     AtomLayoutMdQ: int
+    num_wg: int = 2  # MMA warp groups (total threads = (num_wg + 1) * 128)
     dQ_single_wg: bool = False
 
 
-def _tile_size_bwd_sm90(head_dim, causal, local):
+def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local):
     """Return BwdConfig for SM90.
 
     Configs based on C++ FA3 hopper/flash_bwd_launch_template.h,
@@ -207,9 +208,10 @@ def _tile_size_bwd_sm90(head_dim, causal, local):
         # 3 MMA warp groups (192/64=3), num_threads=512
         return BwdConfig(
             m_block_size=64, n_block_size=96,
-            num_stages_Q=1, num_stages_dO=1, num_stages_PdS=1,
+            num_stages_Q=2, num_stages_dO=1, num_stages_PdS=1,
             SdP_swapAB=False, dKV_swapAB=True, dQ_swapAB=True,
             AtomLayoutMSdP=1, AtomLayoutNdKV=1, AtomLayoutMdQ=1,
+            num_wg=3,
         )
     else:
         # hdim 256
@@ -993,6 +995,7 @@ def _flash_attn_bwd(
     assert arch // 10 in [9, 10, 11, 12], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x, 12.x"
 
     num_head, head_dim = q.shape[-2:]
+    head_dim_v = v.shape[-1]
 
     causal, local, window_size_left, window_size_right = _resolve_causal_local_window(
         causal, window_size_left, window_size_right
@@ -1023,7 +1026,7 @@ def _flash_attn_bwd(
         assert mask_mod is None, "mask_mod backward not supported on SM 12.0"
         assert deterministic is False, "deterministic backward not supported on SM 12.0"
     elif arch // 10 == 9:
-        cfg = _tile_size_bwd_sm90(head_dim, causal, local)
+        cfg = _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local)
         m_block_size = cfg.m_block_size
         n_block_size = cfg.n_block_size
         num_stages_Q = cfg.num_stages_Q
@@ -1035,6 +1038,7 @@ def _flash_attn_bwd(
         AtomLayoutMSdP = cfg.AtomLayoutMSdP
         AtomLayoutNdKV = cfg.AtomLayoutNdKV
         AtomLayoutMdQ = cfg.AtomLayoutMdQ
+        num_threads = (cfg.num_wg + 1) * 128
         dQ_single_wg = cfg.dQ_single_wg
         cluster_size = 1
         use_2cta_instrs = False
@@ -1081,7 +1085,6 @@ def _flash_attn_bwd(
         seqlen_k = max_seqlen_k if max_seqlen_k is not None else total_k
 
     num_head_kv = k.shape[-2]
-    head_dim_v = v.shape[-1]
 
     use_block_sparsity = block_sparse_tensors is not None
 
@@ -1265,16 +1268,9 @@ def _flash_attn_bwd(
         cu_seqlens_q, seqused_q, dlse,
         dtype, head_dim, head_dim_v, m_block_size,
     )
-    # NB num_threads application for 3 kernels
-    # There are pre, main, post processing kernels, currenlty we hard code to 384 for the main and
-    # post proc, and we do before cache key gen
-    # SM120 keeps 128 threads throughout (SM80 CpAsync code paths)
-    # hdim 192 needs 3 MMA warp groups (192/64=3), so 4 total WGs → 512 threads
-    if arch // 10 == 12:
-        pass  # num_threads already set to 128 above
-    elif arch // 10 == 9 and head_dim > 128 and head_dim <= 192:
-        num_threads = 512
-    else:
+    # num_threads: SM90 derives from BwdConfig.num_wg, SM120 is set to 128 above,
+    # SM100/SM110 uses default from function signature (384).
+    if arch // 10 not in [9, 12]:
         num_threads = 384
 
     # Backward kernel: compute dk, dv, dq_accum.
@@ -1526,13 +1522,10 @@ def _flash_attn_bwd(
             normalized_block_sparse_tensors[:4] if normalized_block_sparse_tensors is not None else None,
         )
 
-    # hdim 192 with swapAB needs 3 WGs (192/64=3) in postprocess too
-    if arch // 10 == 9 and head_dim > 128 and head_dim <= 192:
-        num_threads_post_dQ = 384
-        num_threads_post_dKV = 384
-    elif arch // 10 == 9:
-        num_threads_post_dQ = 128 if dQ_single_wg else 256
-        num_threads_post_dKV = 256
+    if arch // 10 == 9:
+        # dQ postprocess: match main kernel's MMA WG count, unless dQ_single_wg
+        num_threads_post_dQ = 128 if dQ_single_wg else cfg.num_wg * 128
+        num_threads_post_dKV = cfg.num_wg * 128
     else:
         num_threads_post_dQ = 128
         num_threads_post_dKV = 128

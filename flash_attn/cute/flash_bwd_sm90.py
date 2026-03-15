@@ -1429,7 +1429,7 @@ class FlashAttentionBackwardSm90:
         dKV_accumulate: Boolean = True,
     ):
         consumer_state_dO_cur = (
-            consumer_state_dO if const_expr(self.Q_stage == self.dO_stage) else consumer_state_Q
+            consumer_state_Q if const_expr(self.Q_stage == self.dO_stage) else consumer_state_dO
         )
         smem_idx_Q = consumer_state_Q.index
         smem_idx_dO = consumer_state_dO_cur.index if const_expr(self.dO_stage > 1) else 0
