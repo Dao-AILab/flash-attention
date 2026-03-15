@@ -72,6 +72,7 @@ class FlashAttentionBackwardSm90:
         mask_mod: cutlass.Constexpr | None = None,
         has_aux_tensors: cutlass.Constexpr = False,
         subtile_factor: cutlass.Constexpr[int] = 1,
+        dQ_single_wg: bool = False,
     ):
         self.dtype = dtype
         # padding head_dim to a multiple of 16 as k_block_size
@@ -101,10 +102,10 @@ class FlashAttentionBackwardSm90:
         self.AtomLayoutMSdP = AtomLayoutMSdP
         self.AtomLayoutNdKV = AtomLayoutNdKV
         self.AtomLayoutMdQ = AtomLayoutMdQ
-        self.num_mma_warp_groups = (self.num_threads // 128) - 1
+        self.num_wg_mma = (self.num_threads // 128) - 1
         self.mma_dkv_is_rs = (
             AtomLayoutMSdP == 1
-            and AtomLayoutNdKV == self.num_mma_warp_groups
+            and AtomLayoutNdKV == self.num_wg_mma
             and SdP_swapAB
             and not dKV_swapAB
         )
@@ -112,7 +113,7 @@ class FlashAttentionBackwardSm90:
         # May be overridden in __call__ for varlen inputs.
         if qhead_per_kvhead > 1:
             assert self.same_hdim_kv, "GQA backward requires head_dim == head_dim_v"
-            assert self.num_mma_warp_groups == 2, "GQA backward assumes 2 warp groups"
+            assert self.num_wg_mma == 2, "GQA backward assumes 2 warp groups"
         # These are tuned for speed
         # Do we keep the LSE and dPsum in each thread, or split them across 8 threads that share
         # them and then shuffle to get the value whenever we need? This can reduce register
@@ -133,6 +134,13 @@ class FlashAttentionBackwardSm90:
         else:
             self.vec_size: cutlass.Constexpr = 4
         self.qk_acc_dtype = Float32
+        # dQ_single_wg: WG0 computes the full dQ GEMM, WG1 skips it.
+        # Only valid for 2 MMA warp groups.
+        # Credit: Ben Spector
+        self.dQ_single_wg = dQ_single_wg
+        if dQ_single_wg:
+            assert self.num_wg_mma == 2, "dQ_single_wg only supports 2 warp groups"
+        self.num_wg_dQ = 1 if self.dQ_single_wg else self.num_wg_mma
 
     @staticmethod
     def can_implement(
@@ -202,13 +210,13 @@ class FlashAttentionBackwardSm90:
             ]
         ]
         self.sdQaccum_layout = cute.make_layout(
-            (self.tile_m * self.tile_hdim // self.num_mma_warp_groups, self.num_mma_warp_groups)
+            (self.tile_m * self.tile_hdim // self.num_wg_dQ, self.num_wg_dQ)
         )
         # dQaccum R->S
         self.r2s_tiled_copy_dQaccum = cute.make_tiled_copy_tv(
             cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), Float32, num_bits_per_copy=128),
             # thr_layout
-            cute.make_layout((self.num_threads_per_warp_group, self.num_mma_warp_groups)),
+            cute.make_layout((self.num_threads_per_warp_group, self.num_wg_dQ)),
             cute.make_layout(128 // Float32.width),  # val_layout
         )
         # dKVaccum for GQA epilogue - reuses sV+sK memory recast as f32
@@ -217,7 +225,7 @@ class FlashAttentionBackwardSm90:
     def _get_tiled_mma(self):
         maybe_swap_mn = lambda shape, swap: (shape[1], shape[0], *shape[2:]) if swap else shape
         # S = Q @ K.T, dP = dO @ V.T
-        atom_layout_SdP = (self.AtomLayoutMSdP, self.num_mma_warp_groups // self.AtomLayoutMSdP, 1)
+        atom_layout_SdP = (self.AtomLayoutMSdP, self.num_wg_mma // self.AtomLayoutMSdP, 1)
         tiler_mn_SdP = (self.tile_m // atom_layout_SdP[0], self.tile_n // atom_layout_SdP[1])
         tiled_mma_SdP = sm90_utils_basic.make_trivial_tiled_mma(
             self.dtype,
@@ -226,10 +234,10 @@ class FlashAttentionBackwardSm90:
             warpgroup.OperandMajorMode.K,
             Float32,
             atom_layout_mnk=maybe_swap_mn(atom_layout_SdP, self.SdP_swapAB),
-            tiler_mn=maybe_swap_mn(tiler_mn_SdP, self.SdP_swapAB),
+            tiler_mn=(64, tiler_mn_SdP[1] if not self.SdP_swapAB else tiler_mn_SdP[0]),
         )
         # dV = P.T @ dO, dK = dS.T @ Q
-        atom_layout_dKV = (self.AtomLayoutNdKV, self.num_mma_warp_groups // self.AtomLayoutNdKV, 1)
+        atom_layout_dKV = (self.AtomLayoutNdKV, self.num_wg_mma // self.AtomLayoutNdKV, 1)
         tiler_mn_dK = (self.tile_n // atom_layout_dKV[0], self.tile_hdim // atom_layout_dKV[1])
         tiler_mn_dV = (self.tile_n // atom_layout_dKV[0], self.tile_hdimv // atom_layout_dKV[1])
         tiled_mma_dK, tiled_mma_dV = [
@@ -242,7 +250,7 @@ class FlashAttentionBackwardSm90:
                 warpgroup.OperandMajorMode.MN,
                 Float32,
                 atom_layout_mnk=maybe_swap_mn(atom_layout_dKV, self.dKV_swapAB),
-                tiler_mn=maybe_swap_mn(tiler_mn_d, self.dKV_swapAB),
+                tiler_mn=(64, tiler_mn_d[1] if not self.dKV_swapAB else tiler_mn_d[0]),
                 a_source=warpgroup.OperandSource.RMEM
                 if self.mma_dkv_is_rs
                 else warpgroup.OperandSource.SMEM,
@@ -250,7 +258,8 @@ class FlashAttentionBackwardSm90:
             for tiler_mn_d in (tiler_mn_dK, tiler_mn_dV)
         ]
         # dQ = dS @ K
-        atom_layout_dQ = (self.AtomLayoutMdQ, self.num_mma_warp_groups // self.AtomLayoutMdQ, 1)
+        assert self.num_wg_dQ % self.AtomLayoutMdQ == 0
+        atom_layout_dQ = (self.AtomLayoutMdQ, self.num_wg_dQ // self.AtomLayoutMdQ, 1)
         tiler_mn_dQ = (self.tile_m // atom_layout_dQ[0], self.tile_hdim // atom_layout_dQ[1])
         tiled_mma_dQ = sm90_utils_basic.make_trivial_tiled_mma(
             self.dtype,
@@ -259,7 +268,7 @@ class FlashAttentionBackwardSm90:
             warpgroup.OperandMajorMode.MN if not self.dQ_swapAB else warpgroup.OperandMajorMode.K,
             Float32,
             atom_layout_mnk=maybe_swap_mn(atom_layout_dQ, self.dQ_swapAB),
-            tiler_mn=maybe_swap_mn(tiler_mn_dQ, self.dQ_swapAB),
+            tiler_mn=(64, tiler_mn_dQ[1] if not self.dQ_swapAB else tiler_mn_dQ[0]),
         )
         return tiled_mma_SdP, tiled_mma_dK, tiled_mma_dV, tiled_mma_dQ
 
@@ -376,14 +385,25 @@ class FlashAttentionBackwardSm90:
         self.num_threads_per_warp_group = 128
         self.num_producer_threads = 32
 
-        if const_expr(self.num_mma_warp_groups == 2):
-            self.num_mma_regs = 240
+        REG_LIMIT = 504 if self.num_wg_mma == 2 else 512
+        if const_expr(self.num_wg_mma == 2):
+            if const_expr(self.dQ_single_wg):
+                self.num_mma_regs_wg0 = 256
+                self.num_mma_regs_wg1 = 224
+            else:
+                self.num_mma_regs_wg0 = 240
+                self.num_mma_regs_wg1 = 240
+            self.num_mma_regs = self.num_mma_regs_wg0  # for backward compat
             self.num_producer_regs = 24
+            assert (
+                self.num_mma_regs_wg0 + self.num_mma_regs_wg1 + self.num_producer_regs <= REG_LIMIT
+            )
         else:  # 3 warp groups
+            self.num_mma_regs_wg0 = 160
+            self.num_mma_regs_wg1 = 160
             self.num_mma_regs = 160
             self.num_producer_regs = 32
-        REG_LIMIT = 504 if self.num_mma_warp_groups == 2 else 512
-        assert self.num_mma_regs * self.num_mma_warp_groups + self.num_producer_regs <= REG_LIMIT
+            assert self.num_mma_regs_wg0 * self.num_wg_mma + self.num_producer_regs <= REG_LIMIT
 
         self._setup_attributes()
         SharedStorage = self._get_shared_storage_cls()
@@ -400,7 +420,7 @@ class FlashAttentionBackwardSm90:
         self.tma_copy_bytes["LSE"] = self.tile_m * Float32.width // 8
         self.tma_copy_bytes["dPsum"] = self.tile_m * Float32.width // 8
         self.tma_copy_bytes["dQ"] = (
-            self.tile_m * self.tile_hdim * Float32.width // 8 // self.num_mma_warp_groups
+            self.tile_m * self.tile_hdim * Float32.width // 8 // self.num_wg_dQ
         )
         self.tma_copy_bytes["dKacc"] = self.tile_n * self.tile_hdim * Float32.width // 8
         self.tma_copy_bytes["dVacc"] = self.tile_n * self.tile_hdimv * Float32.width // 8
@@ -734,10 +754,9 @@ class FlashAttentionBackwardSm90:
                     mdQ_semaphore,
                 )
         else:
-            cute.arch.setmaxregister_increase(self.num_mma_regs)
             tidx, _, _ = cute.arch.thread_idx()
             tidx = tidx - 128
-            self.mma(
+            mma_args = (
                 tiled_mma_SdP,
                 tiled_mma_dK,
                 tiled_mma_dV,
@@ -771,6 +790,19 @@ class FlashAttentionBackwardSm90:
                 blocksparse_tensors,
                 qhead_per_kvhead_divmod,
             )
+            if const_expr(not self.dQ_single_wg):
+                # Both WGs compute dQ
+                cute.arch.setmaxregister_increase(self.num_mma_regs_wg0)
+                self.mma(*mma_args, is_dQ_wg=True)
+            else:
+                # WG0 computes dQ, WG1 skips it
+                warp_idx_in_mma = cute.arch.make_warp_uniform(cute.arch.warp_idx()) - 4
+                if warp_idx_in_mma < 4:
+                    cute.arch.setmaxregister_increase(self.num_mma_regs_wg0)
+                    self.mma(*mma_args, is_dQ_wg=True)
+                else:
+                    cute.arch.setmaxregister_increase(self.num_mma_regs_wg1)
+                    self.mma(*mma_args, is_dQ_wg=False)
 
     @cute.jit
     def load(
@@ -1062,16 +1094,20 @@ class FlashAttentionBackwardSm90:
         fastdiv_mods=(None, None),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         qhead_per_kvhead_divmod: Optional[FastDivmodDivisor] = None,
+        is_dQ_wg: cutlass.Constexpr[bool] = True,
     ):
         warp_group_idx = cute.arch.make_warp_uniform(tidx // self.num_threads_per_warp_group)
         warp_group_thread_layout = cute.make_layout(
-            self.num_mma_warp_groups, stride=self.num_threads_per_warp_group
+            self.num_wg_mma, stride=self.num_threads_per_warp_group
         )
         thr_mma_SdP = tiled_mma_SdP.get_slice(tidx)
         wg_mma_SdP = tiled_mma_SdP.get_slice(warp_group_thread_layout(warp_group_idx))
         wg_mma_dK = tiled_mma_dK.get_slice(warp_group_thread_layout(warp_group_idx))
         wg_mma_dV = tiled_mma_dV.get_slice(warp_group_thread_layout(warp_group_idx))
-        wg_mma_dQ = tiled_mma_dQ.get_slice(warp_group_thread_layout(warp_group_idx))
+        wg_mma_dQ = None
+        if const_expr(is_dQ_wg):
+            wg_idx_dQ = warp_group_idx if const_expr(not self.dQ_single_wg) else 0
+            wg_mma_dQ = tiled_mma_dQ.get_slice(warp_group_thread_layout(wg_idx_dQ))
         # S = Q @ K.T
         shape_mnk_S = (self.tile_m, self.tile_n, self.tile_hdim)
         _, tSrQ, tSrK = sm90_utils.partition_fragment_ABC(
@@ -1117,12 +1153,19 @@ class FlashAttentionBackwardSm90:
         # dQ = dS @ K
         sKt = layout_utils.transpose_view(sK)
         shape_mnk_dQ = (self.tile_m, self.tile_hdim, self.tile_n)
-        _, tdQrdS, tdQrKt = sm90_utils.partition_fragment_ABC(
-            wg_mma_dQ, shape_mnk_dQ, sdS, sKt, swap_AB=self.dQ_swapAB
-        )
-        mma_dsk_fn = partial(
-            gemm_zero_init, tiled_mma_dQ, shape_mnk_dQ[:2], tdQrdS, tdQrKt, swap_AB=self.dQ_swapAB
-        )
+        mma_dsk_fn = None
+        if const_expr(is_dQ_wg):
+            _, tdQrdS, tdQrKt = sm90_utils.partition_fragment_ABC(
+                wg_mma_dQ, shape_mnk_dQ, sdS, sKt, swap_AB=self.dQ_swapAB
+            )
+            mma_dsk_fn = partial(
+                gemm_zero_init,
+                tiled_mma_dQ,
+                shape_mnk_dQ[:2],
+                tdQrdS,
+                tdQrKt,
+                swap_AB=self.dQ_swapAB,
+            )
 
         # Smem copy atom tiling for P/dS R2S
         copy_P_r2s = None
@@ -1153,8 +1196,10 @@ class FlashAttentionBackwardSm90:
             tLSEsdPsum = shfl_copy.get_slice(cute.arch.lane_idx() // 4).partition_S(tLSEsdPsum)
             tLSEsdPsum = cute.group_modes(tLSEsdPsum, 0, 2)
 
-        smem_thr_copy_dQaccum = r2s_tiled_copy_dQaccum.get_slice(tidx)
-        tdQsdQaccum = smem_thr_copy_dQaccum.partition_D(sdQaccum)
+        tdQsdQaccum = None
+        if const_expr(is_dQ_wg):
+            smem_thr_copy_dQaccum = r2s_tiled_copy_dQaccum.get_slice(tidx)
+            tdQsdQaccum = smem_thr_copy_dQaccum.partition_D(sdQaccum)
 
         PdS_barrier = cutlass.pipeline.NamedBarrier(
             barrier_id=int(NamedBarrierBwd.PdS), num_threads=self.num_mma_threads
@@ -1193,6 +1238,7 @@ class FlashAttentionBackwardSm90:
             PdS_barrier=PdS_barrier,
             # acc_dV=acc_dV,
             # acc_dK=acc_dK,
+            is_dQ_wg=is_dQ_wg,
         )
 
         consumer_state_Q = cutlass.pipeline.make_pipeline_state(
@@ -1373,9 +1419,10 @@ class FlashAttentionBackwardSm90:
         pipeline_dO: cutlass.pipeline.PipelineAsync,
         tLSEsLSE: cute.Tensor,
         tLSEsdPsum: cute.Tensor,
-        tdQsdQaccum: cute.Tensor,
+        tdQsdQaccum: Optional[cute.Tensor],
         softmax_scale_log2: Float32,
         PdS_barrier: cutlass.pipeline.NamedBarrier,
+        is_dQ_wg: cutlass.Constexpr[bool] = True,
         mask_fn: Optional[Callable] = None,
         score_mod_fn: Optional[Callable] = None,
         score_mod_bwd_fn: Optional[Callable] = None,
@@ -1465,36 +1512,50 @@ class FlashAttentionBackwardSm90:
         # smem fence to make sure sdS is written before it's read by WGMMA
         cute.arch.fence_view_async_shared()
         PdS_barrier.arrive_and_wait()
-        # (6) [GEMM 4] dQ = dS @ K
-        acc_dQ = mma_dsk_fn(A_idx=smem_idx_PdS, wg_wait=1)
-        # if cute.arch.thread_idx()[0] == 128: cute.print_tensor(acc_dV)
-        pipeline_dO.consumer_release(consumer_state_dO_cur)  # release dO as dV mma is done
 
-        # (7) [GEMM 5] dK += dS.T @ Q
-        if const_expr(not self.mma_dkv_is_rs):
-            mma_dsq_fn(
-                A_idx=smem_idx_PdS, B_idx=smem_idx_Q, zero_init=not dKV_accumulate, wg_wait=1
+        if const_expr(is_dQ_wg):
+            # (6) [GEMM 4] dQ = dS @ K
+            acc_dQ = mma_dsk_fn(A_idx=smem_idx_PdS, wg_wait=1)
+            pipeline_dO.consumer_release(consumer_state_dO_cur)  # release dO as dV mma is done
+
+            # (7) [GEMM 5] dK += dS.T @ Q
+            if const_expr(not self.mma_dkv_is_rs):
+                mma_dsq_fn(
+                    A_idx=smem_idx_PdS, B_idx=smem_idx_Q, zero_init=not dKV_accumulate, wg_wait=1
+                )
+            else:
+                mma_dsq_fn(tCrA=tdKrdS, B_idx=smem_idx_Q, zero_init=not dKV_accumulate, wg_wait=1)
+
+            # dQ R2S: wait for dQaccum_store to free the smem buffer, then write dQ to smem
+            # When dQ_single_wg, only WG0 enters here so warp_group_idx == 0
+            cute.arch.barrier(
+                barrier_id=int(NamedBarrierBwd.dQEmptyWG0) + warp_group_idx,
+                number_of_threads=self.num_threads_per_warp_group + cute.arch.WARP_SIZE,
             )
+            tdQrdQaccum_flat = cute.make_tensor(
+                acc_dQ.iterator, cute.make_layout(tdQsdQaccum.shape)
+            )
+            cute.autovec_copy(tdQrdQaccum_flat, tdQsdQaccum)
+            cute.arch.fence_view_async_shared()
+            cute.arch.barrier_arrive(
+                barrier_id=int(NamedBarrierBwd.dQFullWG0) + warp_group_idx,
+                number_of_threads=self.num_threads_per_warp_group + cute.arch.WARP_SIZE,
+            )
+
+            warpgroup.wait_group(0)
+            pipeline_Q.consumer_release(consumer_state_Q)
         else:
-            mma_dsq_fn(tCrA=tdKrdS, B_idx=smem_idx_Q, zero_init=not dKV_accumulate, wg_wait=1)
-        # if cute.arch.thread_idx()[0] == 128: cute.print_tensor(acc_dQ)
-
-        cute.arch.barrier(
-            barrier_id=int(NamedBarrierBwd.dQEmptyWG0) + warp_group_idx,
-            number_of_threads=self.num_threads_per_warp_group + cute.arch.WARP_SIZE,
-        )
-        tdQrdQaccum_flat = cute.make_tensor(acc_dQ.iterator, cute.make_layout(tdQsdQaccum.shape))
-        cute.autovec_copy(tdQrdQaccum_flat, tdQsdQaccum)
-        cute.arch.fence_view_async_shared()
-        cute.arch.barrier_arrive(
-            barrier_id=int(NamedBarrierBwd.dQFullWG0) + warp_group_idx,
-            number_of_threads=self.num_threads_per_warp_group + cute.arch.WARP_SIZE,
-        )
-
-        warpgroup.wait_group(0)
-        # if cute.arch.thread_idx()[0] == 128: cute.print_tensor(acc_dK)
-        pipeline_Q.consumer_release(consumer_state_Q)
-        # if cute.arch.thread_idx()[0] % 32 == 0: cute.printf("tidx = {}, m_block = {}, after pipeline_Q consumer release", cute.arch.thread_idx()[0], m_block)
+            # dQ_single_wg: WG1 skips dQ, only does dV wait + dK
+            # (7) [GEMM 5] dK += dS.T @ Q
+            if const_expr(not self.mma_dkv_is_rs):
+                mma_dsq_fn(
+                    A_idx=smem_idx_PdS, B_idx=smem_idx_Q, zero_init=not dKV_accumulate, wg_wait=1
+                )
+            else:
+                mma_dsq_fn(tCrA=tdKrdS, B_idx=smem_idx_Q, zero_init=not dKV_accumulate, wg_wait=1)
+            pipeline_dO.consumer_release(consumer_state_dO_cur)
+            warpgroup.wait_group(0)
+            pipeline_Q.consumer_release(consumer_state_Q)
 
         consumer_state_Q.advance()
         consumer_state_dO.advance()
@@ -1565,10 +1626,10 @@ class FlashAttentionBackwardSm90:
                 store_dK()
                 cute.arch.cp_async_bulk_commit_group()
         else:
-            sdKaccum_shape0 = self.tile_n * self.tile_hdim // self.num_mma_warp_groups
-            sdVaccum_shape0 = self.tile_n * self.tile_hdimv // self.num_mma_warp_groups
-            sdKaccum_layout = cute.make_layout((sdKaccum_shape0, self.num_mma_warp_groups))
-            sdVaccum_layout = cute.make_layout((sdVaccum_shape0, self.num_mma_warp_groups))
+            sdKaccum_shape0 = self.tile_n * self.tile_hdim // self.num_wg_mma
+            sdVaccum_shape0 = self.tile_n * self.tile_hdimv // self.num_wg_mma
+            sdKaccum_layout = cute.make_layout((sdKaccum_shape0, self.num_wg_mma))
+            sdVaccum_layout = cute.make_layout((sdVaccum_shape0, self.num_wg_mma))
             head_idx_kv = head_idx // qhead_per_kvhead_divmod
 
             if const_expr(not seqlen.has_cu_seqlens_k):
@@ -1591,7 +1652,7 @@ class FlashAttentionBackwardSm90:
             sdVaccum = cute.make_tensor(sVaccum_ptr, sdVaccum_layout)
             tiled_copy_dKVaccum_r2s = cute.make_tiled_copy_tv(
                 cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), Float32, num_bits_per_copy=128),
-                cute.make_layout((self.num_threads_per_warp_group, self.num_mma_warp_groups)),
+                cute.make_layout((self.num_threads_per_warp_group, self.num_wg_mma)),
                 cute.make_layout(128 // Float32.width),
             )
             thr_copy_dKVaccum_r2s = tiled_copy_dKVaccum_r2s.get_slice(tidx)
@@ -1606,11 +1667,11 @@ class FlashAttentionBackwardSm90:
             epi_barrier.arrive_and_wait()
             if warp_idx == 4:
                 with cute.arch.elect_one():
-                    for wg_idx in cutlass.range_constexpr(self.num_mma_warp_groups):
+                    for wg_idx in cutlass.range_constexpr(self.num_wg_mma):
                         copy_utils.cpasync_reduce_bulk_add_f32(
                             sdKaccum[None, wg_idx].iterator,
                             gdKaccum[None, wg_idx].iterator,
-                            self.tma_copy_bytes["dKacc"] // self.num_mma_warp_groups,
+                            self.tma_copy_bytes["dKacc"] // self.num_wg_mma,
                         )
                 cute.arch.cp_async_bulk_commit_group()
 
@@ -1622,11 +1683,11 @@ class FlashAttentionBackwardSm90:
             epi_barrier.arrive_and_wait()
             if warp_idx == 4:
                 with cute.arch.elect_one():
-                    for wg_idx in cutlass.range_constexpr(self.num_mma_warp_groups):
+                    for wg_idx in cutlass.range_constexpr(self.num_wg_mma):
                         copy_utils.cpasync_reduce_bulk_add_f32(
                             sdVaccum[None, wg_idx].iterator,
                             gdVaccum[None, wg_idx].iterator,
-                            self.tma_copy_bytes["dVacc"] // self.num_mma_warp_groups,
+                            self.tma_copy_bytes["dVacc"] // self.num_wg_mma,
                         )
                 cute.arch.cp_async_bulk_commit_group()
 
@@ -1658,9 +1719,9 @@ class FlashAttentionBackwardSm90:
                     (seqlen.padded_offset_q * self.tile_hdim,), mdQaccum[None, head_idx]
                 )
             gdQaccum_ = cute.local_tile(mdQaccum_cur, (self.tile_m * self.tile_hdim,), (None,))
-            # (M * K / WG, WG, _)
+            # (M * K / num_wg_dQ, num_wg_dQ, num_m_blocks)
             gdQaccum = cute.flat_divide(
-                gdQaccum_, (self.tile_m * self.tile_hdim // self.num_mma_warp_groups,)
+                gdQaccum_, (self.tile_m * self.tile_hdim // self.num_wg_dQ,)
             )
 
             if const_expr(mdQ_semaphore is not None):
@@ -1691,11 +1752,12 @@ class FlashAttentionBackwardSm90:
                         m_block = m_block_min + iter_idx
                         m_block_safe = m_block
 
-                        for warp_group_idx in cutlass.range_constexpr(self.num_mma_warp_groups):
+                        num_dQ_chunks = self.num_wg_dQ
+                        for warp_group_idx in cutlass.range_constexpr(num_dQ_chunks):
                             if const_expr(not self.deterministic):
                                 # If deterministic, we already waited at the end of the prev iter
                                 cute.arch.cp_async_bulk_wait_group(
-                                    self.num_mma_warp_groups - 1 - warp_group_idx, read=read_flag
+                                    num_dQ_chunks - 1 - warp_group_idx, read=read_flag
                                 )
                             cute.arch.barrier_arrive(
                                 barrier_id=int(NamedBarrierBwd.dQEmptyWG0) + warp_group_idx,
@@ -1719,7 +1781,7 @@ class FlashAttentionBackwardSm90:
                                 lock_value,
                             )
 
-                        for warp_group_idx in cutlass.range_constexpr(self.num_mma_warp_groups):
+                        for warp_group_idx in cutlass.range_constexpr(num_dQ_chunks):
                             cute.arch.barrier(
                                 barrier_id=int(NamedBarrierBwd.dQFullWG0) + warp_group_idx,
                                 number_of_threads=self.num_threads_per_warp_group
@@ -1755,7 +1817,7 @@ class FlashAttentionBackwardSm90:
                         gdQaccum,
                         subtile_factor=self.subtile_factor,
                         m_block_max=m_block_max,
-                        num_mma_warp_groups=self.num_mma_warp_groups,
+                        num_wg_mma=self.num_wg_mma,
                         num_threads_per_warp_group=self.num_threads_per_warp_group,
                         tma_copy_bytes_dQ=self.tma_copy_bytes["dQ"],
                     )

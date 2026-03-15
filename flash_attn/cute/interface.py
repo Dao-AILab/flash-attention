@@ -165,6 +165,7 @@ class BwdConfig:
     AtomLayoutMSdP: int
     AtomLayoutNdKV: int
     AtomLayoutMdQ: int
+    dQ_single_wg: bool = False
 
 
 def _tile_size_bwd_sm90(head_dim, causal, local):
@@ -191,12 +192,14 @@ def _tile_size_bwd_sm90(head_dim, causal, local):
         )
     elif head_dim <= 128:
         # C++ FA3: causal/local: 64, 128; non-causal: 80, 128 with dQ_swapAB
+        is_causal_or_local = causal or local
+        m_block_size = 64 if is_causal_or_local else 80
         return BwdConfig(
-            m_block_size=80 if not (causal or local) else 64,
+            m_block_size=m_block_size,
             n_block_size=128,
             num_stages_Q=2, num_stages_dO=2, num_stages_PdS=2,
             SdP_swapAB=True, dKV_swapAB=False,
-            dQ_swapAB=not (causal or local),
+            dQ_swapAB=m_block_size % 64 != 0,
             AtomLayoutMSdP=1, AtomLayoutNdKV=2, AtomLayoutMdQ=1,
         )
     elif head_dim <= 192:
@@ -1031,6 +1034,7 @@ def _flash_attn_bwd(
         AtomLayoutMSdP = cfg.AtomLayoutMSdP
         AtomLayoutNdKV = cfg.AtomLayoutNdKV
         AtomLayoutMdQ = cfg.AtomLayoutMdQ
+        dQ_single_wg = cfg.dQ_single_wg
         cluster_size = 1
         use_2cta_instrs = False
         is_varlen = (
@@ -1321,6 +1325,7 @@ def _flash_attn_bwd(
             AtomLayoutNdKV,
             AtomLayoutMdQ,
             V_in_regs,
+            dQ_single_wg,
             deterministic,
             cu_seqlens_q is None,
             cu_seqlens_k is None,
@@ -1439,6 +1444,7 @@ def _flash_attn_bwd(
                 mask_mod=mask_mod,
                 has_aux_tensors=aux_tensors is not None,
                 subtile_factor=subtile_factor,
+                dQ_single_wg=dQ_single_wg,
             )
         else:
             fa_bwd_obj = FlashAttentionBackwardSm100(
