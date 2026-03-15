@@ -21,6 +21,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, const_expr
+from cutlass.cutlass_dsl import Arch, BaseDSL
 
 from quack import copy_utils, layout_utils
 
@@ -54,6 +55,7 @@ class FlashAttentionBackwardPreprocess:
         :param num_threads: number of threads
         :type num_threads: int
         """
+        self.use_pdl = BaseDSL._get_dsl().get_arch_enum() >= Arch.sm_90a
         self.dtype = dtype
         self.tile_m = tile_m
         # padding head_dim to a multiple of 32 as k_block_size
@@ -211,6 +213,7 @@ class FlashAttentionBackwardPreprocess:
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
             stream=stream,
+            use_pdl=self.use_pdl,
         )
 
     @cute.kernel
@@ -290,6 +293,10 @@ class FlashAttentionBackwardPreprocess:
                 if t0OcO[0, m, 0][0] < seqlen_limit - tOcO[0][0]:
                     copy(tOgO[None, m, None], tOrO[None, m, None])
                     copy(tOgdO[None, m, None], tOrdO[None, m, None])
+            # O and dO loads are done; signal that the next kernel can start.
+            # Correctness is ensured by griddepcontrol_wait() in bwd_sm90 before it reads our outputs.
+            if const_expr(self.use_pdl):
+                cute.arch.griddepcontrol_launch_dependents()
             # Sum across the "k" dimension
             pdpsum = (tOrO.load().to(Float32) * tOrdO.load().to(Float32)).reduce(
                 cute.ReductionOp.ADD, init_val=0.0, reduction_profile=(0, None, 1)

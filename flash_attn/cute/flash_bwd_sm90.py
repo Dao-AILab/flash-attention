@@ -561,6 +561,7 @@ class FlashAttentionBackwardSm90:
             block=[self.num_threads, 1, 1],
             stream=stream,
             min_blocks_per_mp=1,
+            use_pdl=True,
         )
 
     @cute.kernel
@@ -881,6 +882,8 @@ class FlashAttentionBackwardSm90:
                         )
                         load_K(tma_bar_ptr=pipeline_Q.producer_get_barrier(producer_state_Q))
                         load_Q(first_m_block, producer_state=producer_state_Q)
+                        # Wait for bwd preprocess to finish writing LSE and dPsum
+                        cute.arch.griddepcontrol_wait()
                         load_LSE(first_m_block, producer_state=producer_state_Q)
                         producer_state_dO_cur = (
                             producer_state_dO
