@@ -164,6 +164,7 @@ class TileSchedulerArguments(ParamsBase):
     is_split_kv: cutlass.Constexpr[bool] = False
     head_swizzle: cutlass.Constexpr[bool] = False
     use_cluster_idx: cutlass.Constexpr[bool] = False
+    is_bwd: cutlass.Constexpr[bool] = False
 
 
 class SingleTileScheduler:
@@ -785,6 +786,7 @@ class SingleTileVarlenScheduler:
         head_swizzle: cutlass.Constexpr[bool] = False
         cluster_shape_m: cutlass.Constexpr[int] = 1
         scheduling_mode: cutlass.Constexpr[SchedulingMode] = SchedulingMode.STATIC
+        is_bwd: cutlass.Constexpr[bool] = False
 
         @staticmethod
         @cute.jit
@@ -831,6 +833,7 @@ class SingleTileVarlenScheduler:
                 head_swizzle=args.head_swizzle,
                 cluster_shape_m=args.cluster_shape_mn[0],
                 scheduling_mode=scheduling_mode,
+                is_bwd=args.is_bwd,
             )
 
     def __init__(
@@ -923,7 +926,7 @@ class SingleTileVarlenScheduler:
                 cur_cu_seqlen = params.mCuSeqlensQ[batch_idx]
             next_cu_seqlen = cute.arch.shuffle_sync_down(cur_cu_seqlen, offset=1)
             seqlen = next_cu_seqlen - cur_cu_seqlen
-        if cutlass.const_expr(params.qhead_per_kvhead_packgqa > 1):
+        if cutlass.const_expr(params.qhead_per_kvhead_packgqa > 1 and not params.is_bwd):
             seqlen *= params.qhead_per_kvhead_packgqa
         return (
             cute.ceil_div(cute.ceil_div(seqlen, params.tile_shape_mn[0]), params.cluster_shape_m)
@@ -984,11 +987,21 @@ class SingleTileVarlenScheduler:
                 # TODO: is there any case where num_m_blocks is 0?
                 # TODO: by right we should read the seqlen_kv but we're assuming seqlen_q == seqlen_k here
                 num_n_blocks = (
-                    num_m_blocks
-                    * params.tile_shape_mn[0]
-                    * params.cluster_shape_m
-                    // params.qhead_per_kvhead_packgqa
-                    // params.tile_shape_mn[1]
+                    (
+                        num_m_blocks
+                        * params.tile_shape_mn[0]
+                        * params.cluster_shape_m
+                        // params.qhead_per_kvhead_packgqa
+                        // params.tile_shape_mn[1]
+                    )
+                    if const_expr(not params.is_bwd)
+                    else (
+                        num_m_blocks
+                        * params.tile_shape_mn[0]
+                        * params.cluster_shape_m
+                        * params.qhead_per_kvhead_packgqa
+                        // params.tile_shape_mn[1]
+                    )
                 )
                 # nheads_in_l2 = min(max(self.max_kvblock_in_l2 // num_n_blocks, 1), self.num_head)
                 # Seems faster to have this be a power of 2
