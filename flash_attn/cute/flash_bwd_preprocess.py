@@ -333,8 +333,9 @@ class FlashAttentionBackwardPreprocess:
                 if const_expr(not seqlen.has_cu_seqlens):
                     mLSE_cur = mLSE[None, head_idx, batch_idx]
                 else:
-                    lse_off = seqlen.offset if const_expr(not self.pack_gqa) else (0, seqlen.offset)
-                    mLSE_cur = cute.domain_offset((lse_off,), mLSE[head_idx, None])
+                    mLSE_cur = seqlen.offset_batch(mLSE, batch_idx, dim=2, padded=False)[
+                        None, head_idx
+                    ]
                 gLSE = cute.local_tile(mLSE_cur, (self.tile_m,), (m_block,))
                 lse = Float32.inf
                 if tidx < seqlen_limit:
@@ -388,8 +389,9 @@ class FlashAttentionBackwardPreprocess:
                 if const_expr(not seqlen.has_cu_seqlens):
                     mdLSE_cur = mdLSE[None, head_idx, batch_idx]
                 else:
-                    dlse_off = seqlen.offset if const_expr(not self.pack_gqa) else (0, seqlen.offset)
-                    mdLSE_cur = cute.domain_offset((dlse_off,), mdLSE[head_idx, None])
+                    mdLSE_cur = seqlen.offset_batch(mdLSE, batch_idx, dim=2, padded=False)[
+                        None, head_idx
+                    ]
                 gdLSE = cute.local_tile(mdLSE_cur, (self.tile_m,), (m_block,))
 
             # Write PdPsum from rmem -> gmem
