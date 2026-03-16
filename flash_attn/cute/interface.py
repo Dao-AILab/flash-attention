@@ -788,24 +788,26 @@ def _flash_attn_fwd(
     # - Return "fake" output tensors, which could be needed in follow-up fake operations
     # Thus, we skip the actual kernel invocation here.
     if not is_fake_mode():
-        _flash_attn_fwd.compile_cache[compile_key](
-            q.detach(),
-            k.detach(),
-            v.detach(),
-            out.detach() if not is_split_kv else out_partial,
-            lse_partial if is_split_kv else lse,
-            softmax_scale,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            seqused_q,
-            seqused_k,
-            page_table,
-            window_size_left,
-            window_size_right,
-            learnable_sink,
-            normalized_block_sparse_tensors[:4] if normalized_block_sparse_tensors is not None else None,
-            aux_tensors,
-        )
+        # Multi-GPU: set active CUDA device so TVM/runtime helpers match q.device (see #1782).
+        with torch.cuda.device(q.device.index):
+            _flash_attn_fwd.compile_cache[compile_key](
+                q.detach(),
+                k.detach(),
+                v.detach(),
+                out.detach() if not is_split_kv else out_partial,
+                lse_partial if is_split_kv else lse,
+                softmax_scale,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                seqused_q,
+                seqused_k,
+                page_table,
+                window_size_left,
+                window_size_right,
+                learnable_sink,
+                normalized_block_sparse_tensors[:4] if normalized_block_sparse_tensors is not None else None,
+                aux_tensors,
+            )
     if is_split_kv:
         _flash_attn_fwd_combine(
             out_partial,
@@ -898,9 +900,10 @@ def _bwd_preprocess(
     if compile_key not in _bwd_preprocess.compile_cache:
         _bwd_preprocess.compile_cache[compile_key] = _compile_bwd_preprocess(*compile_key)
     if not is_fake_mode():
-        _bwd_preprocess.compile_cache[compile_key](
-            out, dout, dpsum, lse, lse_log2, dq_accum, cu_seqlens_q, seqused_q, dlse
-        )
+        with torch.cuda.device(out.device.index):
+            _bwd_preprocess.compile_cache[compile_key](
+                out, dout, dpsum, lse, lse_log2, dq_accum, cu_seqlens_q, seqused_q, dlse
+            )
 
 
 _bwd_preprocess.compile_cache = get_jit_cache("bwd_pre")
@@ -947,9 +950,10 @@ def _bwd_postprocess_convert(
     if compile_key not in _bwd_postprocess_convert.compile_cache:
         _bwd_postprocess_convert.compile_cache[compile_key] = _compile_bwd_postprocess(*compile_key)
     if not is_fake_mode():
-        _bwd_postprocess_convert.compile_cache[compile_key](
-            accum, output, scale, cu_seqlens, seqused,
-        )
+        with torch.cuda.device(accum.device.index):
+            _bwd_postprocess_convert.compile_cache[compile_key](
+                accum, output, scale, cu_seqlens, seqused,
+            )
 
 
 _bwd_postprocess_convert.compile_cache = get_jit_cache("bwd_post")
@@ -1499,30 +1503,31 @@ def _flash_attn_bwd(
             options="--enable-tvm-ffi",
         )
     if not is_fake_mode():
-        _flash_attn_bwd.compile_cache[compile_key](
-            q.detach(),
-            k.detach(),
-            v.detach(),
-            dout,
-            lse_log2,
-            dpsum,
-            dq_accum,
-            dk if not dKV_postprocess else dk_accum,
-            dv if not dKV_postprocess else dv_accum,
-            softmax_scale,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            seqused_q,
-            seqused_k,
-            None,  # softcap - not yet supported in backward
-            window_size_left,
-            window_size_right,
-            dQ_semaphore,
-            dK_semaphore,
-            dV_semaphore,
-            aux_tensors,
-            normalized_block_sparse_tensors[:4] if normalized_block_sparse_tensors is not None else None,
-        )
+        with torch.cuda.device(q.device.index):
+            _flash_attn_bwd.compile_cache[compile_key](
+                q.detach(),
+                k.detach(),
+                v.detach(),
+                dout,
+                lse_log2,
+                dpsum,
+                dq_accum,
+                dk if not dKV_postprocess else dk_accum,
+                dv if not dKV_postprocess else dv_accum,
+                softmax_scale,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                seqused_q,
+                seqused_k,
+                None,  # softcap - not yet supported in backward
+                window_size_left,
+                window_size_right,
+                dQ_semaphore,
+                dK_semaphore,
+                dV_semaphore,
+                aux_tensors,
+                normalized_block_sparse_tensors[:4] if normalized_block_sparse_tensors is not None else None,
+            )
 
     if arch // 10 == 9:
         # dQ postprocess: match main kernel's MMA WG count, unless dQ_single_wg
@@ -1974,11 +1979,12 @@ def _flash_attn_fwd_combine(
             *compile_key
         )
     if not is_fake_mode():
-        _flash_attn_fwd_combine.compile_cache[compile_key](
-            out_partial, lse_partial, out, lse,
-            cu_seqlens, seqused, num_splits_dynamic_ptr, varlen_batch_idx,
-            semaphore_to_reset,
-        )
+        with torch.cuda.device(out_partial.device.index):
+            _flash_attn_fwd_combine.compile_cache[compile_key](
+                out_partial, lse_partial, out, lse,
+                cu_seqlens, seqused, num_splits_dynamic_ptr, varlen_batch_idx,
+                semaphore_to_reset,
+            )
 
 
 _flash_attn_fwd_combine.compile_cache = get_jit_cache("fwd_combine")
