@@ -171,6 +171,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         window_size_right: Int32 | int | None = None,
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        mCuTotalMBlocks: Optional[cute.Tensor] = None,
+        mCuTotalNBlocks: Optional[cute.Tensor] = None,
         aux_tensors: Optional[list] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
@@ -364,6 +366,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             mSeqUsedQ,
             mSeqUsedK,
             mPageTable,
+            mCuTotalMBlocks,
+            mCuTotalNBlocks,
             tma_atom_Q,
             tma_atom_K,
             tma_atom_V,
@@ -410,6 +414,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mSeqUsedQ: Optional[cute.Tensor],
         mSeqUsedK: Optional[cute.Tensor],
         mPageTable: Optional[cute.Tensor],
+        mCuTotalMBlocks: Optional[cute.Tensor],
+        mCuTotalNBlocks: Optional[cute.Tensor],
         tma_atom_Q: Optional[cute.CopyAtom],
         tma_atom_K: Optional[cute.CopyAtom],
         tma_atom_V: Optional[cute.CopyAtom],
@@ -553,6 +559,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             mCuSeqlensK=mCuSeqlensK,
             mSeqUsedQ=mSeqUsedQ,
             mSeqUsedK=mSeqUsedK,
+            mCuTotalMBlocks=mCuTotalMBlocks,
+            mCuTotalNBlocks=mCuTotalNBlocks,
             # Don't need to pass in tile_mn because we won't access offset_padded
         )
         AttentionMaskCls = partial(
