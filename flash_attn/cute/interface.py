@@ -619,7 +619,7 @@ def _flash_attn_fwd(
         is_split_kv,
         pack_gqa,
         arch,
-        page_size not in [None, 128],  # paged KV non-TMA
+        page_size not in [None, tile_n],  # paged KV non-TMA
         use_2cta_instrs,
         q_subtile_factor,
         mma_pv_is_rs,
@@ -684,7 +684,6 @@ def _flash_attn_fwd(
                 has_aux_tensors=aux_tensors is not None,
             )
         elif arch // 10 == 9:
-            assert page_table is None, "paged KV not supported on SM 9.0"
             assert not is_split_kv, "SplitKV not supported on SM 9.0"
             fa_fwd = FlashAttentionForwardSm90(
                 dtype,
@@ -706,6 +705,7 @@ def _flash_attn_fwd(
                 score_mod=score_mod,
                 has_aux_tensors=aux_tensors is not None,
                 q_subtile_factor=q_subtile_factor,
+                paged_kv_non_tma=page_size not in [None, tile_n],
             )
         elif arch // 10 in [10, 11]:
             fa_fwd = FlashAttentionForwardSm100(
@@ -727,7 +727,7 @@ def _flash_attn_fwd(
                 score_mod=score_mod,
                 mask_mod=mask_mod,
                 has_aux_tensors=aux_tensors is not None,
-                paged_kv_non_tma=page_size not in [None, 128],
+                paged_kv_non_tma=page_size not in [None, tile_n],
                 is_varlen_q=cu_seqlens_q is not None or seqused_q is not None,
                 q_subtile_factor=q_subtile_factor,
                 use_2cta_instrs=use_2cta_instrs,

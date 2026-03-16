@@ -34,7 +34,7 @@ from flash_attn.cute.interface import (
 # When operating fake tensors, we cannot perform data-dependent operations (e.g., `tensor.max()`).
 USE_FAKE_TENSOR = int(os.getenv("FLASH_ATTENTION_FAKE_TENSOR", 0)) == 1
 DISABLE_SPLIT = os.getenv("FLASH_ATTENTION_DISABLE_SPLIT", "FALSE") == "TRUE"
-# SplitKV and paged KV are not supported on SM90
+# SplitKV is not supported on SM90
 IS_SM90 = torch.cuda.get_device_capability()[0] == 9
 IS_SM100 = torch.cuda.get_device_capability()[0] == 10
 TEST_BWD_ONLY = False
@@ -943,8 +943,6 @@ def test_flash_attn_kvcache(
 ):
     if page_size is not None and seqlen_k % page_size != 0:
         pytest.skip()
-    if page_size is not None and IS_SM90:
-        pytest.xfail("paged KV not supported on SM90")
     if seqlen_q > seqlen_k and new_kv:
         pytest.skip()
     if not new_kv and rotary_fraction > 0.0:
