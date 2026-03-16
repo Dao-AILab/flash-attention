@@ -313,10 +313,11 @@ def _flash_attn_fwd(
     mask_mod: Optional[Callable] = None,
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     return_lse: bool = False,
+    return_entropy: bool = False,
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
     aux_tensors: Optional[list[torch.Tensor]] = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     """Forward pass for FlashAttention.
 
     Args:
@@ -407,6 +408,8 @@ def _flash_attn_fwd(
         ), "inputs must be on CUDA device"
     arch = _get_device_arch() if _arch is None else _arch
     assert arch // 10 in [8, 9, 10, 11, 12], "Unsupported compute capability. Supported: 8.x, 9.x, 10.x, 11.x, 12.x"
+    if return_entropy and arch // 10 in [10, 11]:
+        raise NotImplementedError("return_entropy is not yet supported on SM100/SM110")
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
     alignment = 16 // q.element_size()
     if arch // 10 not in [8, 12]:
@@ -440,6 +443,12 @@ def _flash_attn_fwd(
         )
     elif lse is not None:
         _validate_tensor(lse, "lse", lse_shape, torch.float32, device)
+
+    entropy_out = (
+        torch.empty(lse_shape, dtype=torch.float32, device=device)
+        if return_entropy
+        else None
+    )
 
     dtype = torch2cute_dtype_map[q.dtype]
     use_block_sparsity = block_sparse_tensors is not None
@@ -608,6 +617,7 @@ def _flash_attn_fwd(
         block_sparse_broadcast_pattern,
         aux_tensor_metadata,
         lse is None,
+        entropy_out is None,
         cu_seqlens_q is None,
         cu_seqlens_k is None,
         seqused_q is None,
@@ -657,6 +667,8 @@ def _flash_attn_fwd(
             lse_tensor = to_cute_tensor(lse, assumed_align=4)
         else:
             lse_tensor = None
+
+        entropy_tensor = to_cute_tensor(entropy_out, assumed_align=4) if entropy_out is not None else None
 
         sparse_tensors = None
         if normalized_block_sparse_tensors is not None:
@@ -782,6 +794,7 @@ def _flash_attn_fwd(
             learnable_sink_tensor,
             sparse_tensors,
             cute_aux_tensors,
+            entropy_tensor,
             options="--enable-tvm-ffi",
         )
 
@@ -808,6 +821,7 @@ def _flash_attn_fwd(
             learnable_sink,
             normalized_block_sparse_tensors[:4] if normalized_block_sparse_tensors is not None else None,
             aux_tensors,
+            entropy_out,
         )
     if is_split_kv:
         _flash_attn_fwd_combine(
@@ -818,7 +832,7 @@ def _flash_attn_fwd(
             cu_seqlens_q,
             seqused_q,
         )
-    return out, lse
+    return out, lse, entropy_out
 
 
 _flash_attn_fwd.compile_cache = get_jit_cache("fwd")
@@ -1594,8 +1608,8 @@ class FlashAttnFunc(torch.autograd.Function):
         mask_block_idx: Optional[torch.Tensor] = None,
         block_size: Optional[Tuple[int, int]] = None,
         return_lse: bool = False,
+        return_entropy: bool = False,
     ):
-        # Only create block sparse tensors if at least one block sparse parameter is provided
         block_sparse_tensors = None
         if any(t is not None for t in [full_block_cnt, full_block_idx, mask_block_cnt, mask_block_idx]):
             block_sparse_tensors = BlockSparseTensorsTorch(
@@ -1605,7 +1619,7 @@ class FlashAttnFunc(torch.autograd.Function):
                 mask_block_idx=mask_block_idx,
                 block_size=block_size,
             )
-        out, lse = _flash_attn_fwd(
+        out, lse, entropy_out = _flash_attn_fwd(
             q,
             k,
             v,
@@ -1620,6 +1634,7 @@ class FlashAttnFunc(torch.autograd.Function):
             mask_mod=mask_mod,
             block_sparse_tensors=block_sparse_tensors,
             return_lse=return_lse,
+            return_entropy=return_entropy,
         )
         ctx.save_for_backward(q, k, v, out, lse)
         ctx.softmax_scale = softmax_scale
@@ -1629,10 +1644,10 @@ class FlashAttnFunc(torch.autograd.Function):
         ctx.deterministic = deterministic
         ctx.return_lse = return_lse
         ctx.set_materialize_grads(False)
-        return out, lse
+        return out, lse, entropy_out
 
     @staticmethod
-    def backward(ctx, dout, dlse):
+    def backward(ctx, dout, dlse, _dentropy):
         q, k, v, out, lse = ctx.saved_tensors
         if not ctx.return_lse:
             dlse = None
@@ -1681,8 +1696,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         score_mod: Optional[Callable] = None,
         aux_tensors: Optional[list] = None,
         return_lse: bool = False,
+        return_entropy: bool = False,
     ):
-        out, lse = _flash_attn_fwd(
+        out, lse, entropy_out = _flash_attn_fwd(
             q,
             k,
             v,
@@ -1704,6 +1720,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             score_mod=score_mod,
             aux_tensors=aux_tensors,
             return_lse=return_lse,
+            return_entropy=return_entropy,
         )
         ctx.save_for_backward(q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
         ctx.softmax_scale = softmax_scale
@@ -1715,10 +1732,10 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         ctx.max_seqlen_k = max_seqlen_k
         ctx.return_lse = return_lse
         ctx.set_materialize_grads(False)
-        return out, lse
+        return out, lse, entropy_out
 
     @staticmethod
-    def backward(ctx, dout, dlse):
+    def backward(ctx, dout, dlse, _dentropy):
         q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = ctx.saved_tensors
         assert ctx.softcap == 0.0
         if not ctx.return_lse:
@@ -1769,6 +1786,7 @@ def flash_attn_func(
     mask_block_idx: Optional[torch.Tensor] = None,
     block_size: Optional[Tuple[int, int]] = None,
     return_lse: bool = False,
+    return_entropy: bool = False,
 ):
     return FlashAttnFunc.apply(
         q,
@@ -1789,6 +1807,7 @@ def flash_attn_func(
         mask_block_idx,
         block_size,
         return_lse,
+        return_entropy,
     )
 
 
@@ -1814,6 +1833,7 @@ def flash_attn_varlen_func(
     score_mod: Optional[Callable] = None,
     aux_tensors: Optional[list] = None,
     return_lse: bool = False,
+    return_entropy: bool = False,
 ):
     return FlashAttnVarlenFunc.apply(
         q,
@@ -1837,6 +1857,7 @@ def flash_attn_varlen_func(
         score_mod,
         aux_tensors,
         return_lse,
+        return_entropy,
     )
 
 

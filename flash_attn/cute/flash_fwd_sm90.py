@@ -164,6 +164,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors: Optional[list] = None,
+        mEntropy: Optional[cute.Tensor] = None,
     ):
         """Configures and launches the flash attention kernel.
 
@@ -187,6 +188,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mLSE = (
             layout_utils.select(mLSE, LSE_layout_transpose)
             if const_expr(mLSE is not None)
+            else None
+        )
+        mEntropy = (
+            layout_utils.select(mEntropy, LSE_layout_transpose)
+            if const_expr(mEntropy is not None)
             else None
         )
 
@@ -366,6 +372,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             SharedStorage,
             aux_tensors,
             fastdiv_mods,
+            mEntropy,
         ).launch(
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
@@ -411,6 +418,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         SharedStorage: cutlass.Constexpr[Callable],
         aux_tensors=Optional[list[cute.Tensor]],
         fastdiv_mods=None,
+        mEntropy: Optional[cute.Tensor] = None,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         # Prefetch tma descriptor
@@ -560,6 +568,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 blocksparse_tensors,
                 aux_tensors,
                 fastdiv_mods,
+                mEntropy,
             )
 
     @cute.jit
@@ -716,6 +725,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         blocksparse_tensors: Optional[BlockSparseTensors],
         aux_tensors: Optional[list],
         fastdiv_mods=None,
+        mEntropy: Optional[cute.Tensor] = None,
     ):
         warp_group_idx = cute.arch.make_warp_uniform(tidx // self.num_threads_per_warp_group)
         warp_group_thread_layout = cute.make_layout(
@@ -756,6 +766,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             softmax_scale_log2,
             num_rows=acc_O.shape[0][0] * acc_O.shape[1],
             softmax_scale=softmax_scale,
+            compute_entropy=mEntropy is not None,
         )
 
         # For RescaleOBeforeGemm: persistent scores_scale across iterations
@@ -1021,6 +1032,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 m_block,
                 head_idx,
                 batch_idx,
+                entropy=softmax.weighted_score_sum,
+                mEntropy=mEntropy,
             )
 
             tile_scheduler.advance_to_next_work()

@@ -23,6 +23,7 @@ class Softmax(ParamsBase):
     row_sum: cute.Tensor
     arch: cutlass.Constexpr[int] = 80
     softmax_scale: Float32 | None = None
+    weighted_score_sum: cute.Tensor | None = None  # For entropy computation
 
     @staticmethod
     def create(
@@ -30,14 +31,18 @@ class Softmax(ParamsBase):
         num_rows: cutlass.Constexpr[int],
         arch: cutlass.Constexpr[int] = 80,
         softmax_scale: Float32 | None = None,
+        compute_entropy: cutlass.Constexpr[bool] = False,
     ):
         row_max = cute.make_rmem_tensor(num_rows, Float32)
         row_sum = cute.make_rmem_tensor(num_rows, Float32)
-        return Softmax(scale_log2, num_rows, row_max, row_sum, arch, softmax_scale)
+        weighted_score_sum = cute.make_rmem_tensor(num_rows, Float32) if cutlass.const_expr(compute_entropy) else None
+        return Softmax(scale_log2, num_rows, row_max, row_sum, arch, softmax_scale, weighted_score_sum)
 
     def reset(self) -> None:
         self.row_max.fill(-Float32.inf)
         self.row_sum.fill(0.0)
+        if cutlass.const_expr(self.weighted_score_sum is not None):
+            self.weighted_score_sum.fill(0.0)
 
     def _compute_row_max(
         self, acc_S_row: cute.TensorSSA, init_val: float | Float32 | None = None
@@ -111,6 +116,15 @@ class Softmax(ParamsBase):
                 )
 
             row_sum[r] = acc_S_row_sum
+            # Accumulate weighted score sum for entropy: sum(exp(s - max) * s)
+            if cutlass.const_expr(self.weighted_score_sum is not None):
+                # s_i = acc_S_row * softmax_scale, exp(s_i - max) = acc_S_row_exp
+                weighted_score = acc_S_row_exp * acc_S_row * self.softmax_scale
+                ws_sum_new = utils.fadd_reduce(weighted_score, init_val=None, arch=arch)
+                if cutlass.const_expr(is_first):
+                    self.weighted_score_sum[r] = ws_sum_new
+                else:
+                    self.weighted_score_sum[r] = self.weighted_score_sum[r] * row_scale[r] + ws_sum_new
             acc_S_mn[r, None].store(acc_S_row_exp)
 
         return row_scale
@@ -128,6 +142,10 @@ class Softmax(ParamsBase):
 
         # quad reduction for row_sum as we didn't do it during each iteration of online softmax
         row_sum.store(utils.warp_reduce(row_sum.load(), operator.add, width=4))
+        if cutlass.const_expr(self.weighted_score_sum is not None):
+            self.weighted_score_sum.store(
+                utils.warp_reduce(self.weighted_score_sum.load(), operator.add, width=4)
+            )
         row_scale = cute.make_fragment_like(row_max, Float32)
 
         for r in cutlass.range(cute.size(row_sum), unroll_full=True):
@@ -145,11 +163,21 @@ class Softmax(ParamsBase):
             ) * final_scale
             row_sum_cur = row_sum[r]
             LN2 = math.log(2.0)
-            row_sum[r] = (
+            lse_val = (
                 (row_max[r] * scale_log2 + cute.math.log2(row_sum_cur, fastmath=True)) * LN2
                 if not acc_O_mn_row_is_zero_or_nan
                 else -Float32.inf
             )
+            # Compute entropy: H = lse - weighted_score_sum / row_sum
+            if cutlass.const_expr(self.weighted_score_sum is not None):
+                self.weighted_score_sum[r] = (
+                    lse_val - self.weighted_score_sum[r] * cute.arch.rcp_approx(
+                        row_sum_cur if not acc_O_mn_row_is_zero_or_nan else 1.0
+                    )
+                    if not acc_O_mn_row_is_zero_or_nan
+                    else 0.0
+                )
+            row_sum[r] = lse_val
         return row_scale
 
     @cute.jit

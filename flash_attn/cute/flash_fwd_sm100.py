@@ -300,6 +300,7 @@ class FlashAttentionForwardSm100:
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors: Optional[list] = None,
+        mEntropy: Optional[cute.Tensor] = None,  # Not yet supported on SM100
     ):
         """Execute the Fused Multi-Head Attention operation on the provided tensors.
 
