@@ -35,8 +35,14 @@ class Softmax(ParamsBase):
     ):
         row_max = cute.make_rmem_tensor(num_rows, Float32)
         row_sum = cute.make_rmem_tensor(num_rows, Float32)
-        weighted_score_sum = cute.make_rmem_tensor(num_rows, Float32) if cutlass.const_expr(compute_entropy) else None
-        return Softmax(scale_log2, num_rows, row_max, row_sum, arch, softmax_scale, weighted_score_sum)
+        weighted_score_sum = (
+            cute.make_rmem_tensor(num_rows, Float32)
+            if cutlass.const_expr(compute_entropy)
+            else None
+        )
+        return Softmax(
+            scale_log2, num_rows, row_max, row_sum, arch, softmax_scale, weighted_score_sum
+        )
 
     def reset(self) -> None:
         self.row_max.fill(-Float32.inf)
@@ -124,7 +130,9 @@ class Softmax(ParamsBase):
                 if cutlass.const_expr(is_first):
                     self.weighted_score_sum[r] = ws_sum_new
                 else:
-                    self.weighted_score_sum[r] = self.weighted_score_sum[r] * row_scale[r] + ws_sum_new
+                    self.weighted_score_sum[r] = (
+                        self.weighted_score_sum[r] * row_scale[r] + ws_sum_new
+                    )
             acc_S_mn[r, None].store(acc_S_row_exp)
 
         return row_scale
@@ -171,9 +179,9 @@ class Softmax(ParamsBase):
             # Compute entropy: H = lse - weighted_score_sum / row_sum
             if cutlass.const_expr(self.weighted_score_sum is not None):
                 self.weighted_score_sum[r] = (
-                    lse_val - self.weighted_score_sum[r] * cute.arch.rcp_approx(
-                        row_sum_cur if not acc_O_mn_row_is_zero_or_nan else 1.0
-                    )
+                    lse_val
+                    - self.weighted_score_sum[r]
+                    * cute.arch.rcp_approx(row_sum_cur if not acc_O_mn_row_is_zero_or_nan else 1.0)
                     if not acc_O_mn_row_is_zero_or_nan
                     else 0.0
                 )
