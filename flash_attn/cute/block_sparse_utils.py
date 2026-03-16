@@ -348,7 +348,7 @@ def consume_block_sparse_loads(
     batch_idx,
     head_idx,
     m_block,
-    seqlen,
+    seqlen_info,
     kv_consumer_state,
     mma_pv_fn,
     mma_one_n_block,
@@ -386,7 +386,7 @@ def consume_block_sparse_loads(
         head_idx,
         m_block_sparse,
         blocksparse_tensors,
-        seqlen,
+        seqlen_info,
     )
 
     processed_any = curr_mask_block_cnt + curr_full_block_cnt > 0
@@ -468,7 +468,7 @@ def consume_block_sparse_loads(
             mask_n_block = curr_mask_block_idx[curr_mask_block_cnt - 1]
             kv_consumer_state = process_first_half_block(
                 n_block=mask_n_block,
-                seqlen=seqlen,
+                seqlen=seqlen_info,
                 kv_consumer_state=kv_consumer_state,
                 mask_fn=partial(
                     mask_fn,
@@ -484,7 +484,7 @@ def consume_block_sparse_loads(
                 kv_consumer_state = mma_one_n_block(
                     kv_consumer_state,
                     n_block=mask_n_block,
-                    seqlen=seqlen,
+                    seqlen=seqlen_info,
                     mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
                     mask_fn=partial(mask_fn, mask_mod=mask_mod, mask_seqlen=False),
                 )
@@ -495,7 +495,7 @@ def consume_block_sparse_loads(
             if curr_mask_block_cnt == 0:
                 kv_consumer_state = process_first_half_block(
                     n_block=full_n_block,
-                    seqlen=seqlen,
+                    seqlen=seqlen_info,
                     kv_consumer_state=kv_consumer_state,
                     mask_fn=partial(mask_fn, mask_mod=None, mask_seqlen=True),
                     score_mod_fn=score_mod_fn,
@@ -505,7 +505,7 @@ def consume_block_sparse_loads(
                 kv_consumer_state = mma_one_n_block(
                     kv_consumer_state,
                     n_block=full_n_block,
-                    seqlen=seqlen,
+                    seqlen=seqlen_info,
                     mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
                     mask_fn=partial(mask_fn, mask_mod=None, mask_seqlen=True),
                 )
@@ -515,7 +515,7 @@ def consume_block_sparse_loads(
                 kv_consumer_state = mma_one_n_block(
                     kv_consumer_state,
                     n_block=full_n_block,
-                    seqlen=seqlen,
+                    seqlen=seqlen_info,
                     mma_pv_fn=partial(mma_pv_fn, zero_init=not O_should_accumulate),
                     mask_fn=partial(mask_fn, mask_mod=None, mask_seqlen=False),
                 )
@@ -579,7 +579,7 @@ def produce_block_sparse_loads_sm100(
     batch_idx,
     head_idx,
     m_block,
-    seqlen,
+    seqlen_info,
     kv_producer_state,
     load_Q,
     load_K,
@@ -611,7 +611,7 @@ def produce_block_sparse_loads_sm100(
         head_idx,
         m_block_sparse,
         blocksparse_tensors,
-        seqlen,
+        seqlen_info,
     )
 
     mask_empty = curr_mask_block_cnt == 0
@@ -706,7 +706,7 @@ def handle_block_sparse_empty_tile_correction_sm100(
     is_split_kv: cutlass.Constexpr,
     learnable_sink,
     mLSE,
-    seqlen,
+    seqlen_info,
     m_block: Int32,
     head_idx: Int32,
     batch_idx: Int32,
@@ -789,7 +789,7 @@ def handle_block_sparse_empty_tile_correction_sm100(
             tidx,
             stage,
             m_block,
-            seqlen.seqlen_q,
+            seqlen_info.seqlen_q,
             Float32(0.0),  # zero scale ensures empty tile writes zeros into staged outputs
             sO[None, None, stage],
             mO_cur,
@@ -815,7 +815,7 @@ def softmax_block_sparse_sm100(
     batch_idx,
     head_idx,
     m_block,
-    seqlen,
+    seqlen_info,
     softmax_step: Callable,
     mask_fn: Callable,
     mask_fn_none: Callable,
@@ -843,7 +843,7 @@ def softmax_block_sparse_sm100(
         head_idx,
         m_block_sparse,
         blocksparse_tensors,
-        seqlen,
+        seqlen_info,
     )
 
     total_block_cnt = curr_mask_block_cnt + curr_full_block_cnt
