@@ -328,6 +328,8 @@ class FlashAttentionForwardBase:
         m_block: Int32,
         head_idx: Int32,
         batch_idx: Int32,
+        row_max: Optional[cute.Tensor] = None,
+        mRowMax: Optional[cute.Tensor] = None,
     ):
         # store acc_O
         rO = cute.make_fragment_like(acc_O, self.dtype)
@@ -377,6 +379,33 @@ class FlashAttentionForwardBase:
                             taccOgLSE[m, 0] = lse[m]
             else:
                 pack_gqa.store_LSE(mLSE_cur, lse, tiled_mma, tidx, m_block, seqlen.seqlen_q)
+
+        # Write row_max from rmem -> gmem (same layout as LSE)
+        if const_expr(mRowMax is not None):
+            if const_expr(not seqlen.has_cu_seqlens_q):
+                mRowMax_cur = mRowMax[None, head_idx, batch_idx]
+            else:
+                offset = seqlen.offset_q if const_expr(not self.pack_gqa) else (0, seqlen.offset_q)
+                mRowMax_cur = cute.domain_offset((offset,), mRowMax[None, head_idx])
+            if const_expr(not self.pack_gqa):
+                gRowMax = cute.local_tile(mRowMax_cur, (self.tile_m,), (m_block,))
+                gRowMax_expanded_layout = cute.append(
+                    gRowMax.layout, cute.make_layout((self.tile_hdimv,), stride=(0,))
+                )
+                gRowMax_expanded = cute.make_tensor(gRowMax.iterator, gRowMax_expanded_layout)
+                thr_mma = tiled_mma.get_slice(tidx)
+                taccOgRowMax = layout_utils.reshape_acc_to_mn(thr_mma.partition_C(gRowMax_expanded))
+                taccOcO = layout_utils.reshape_acc_to_mn(thr_mma.partition_C(cO))
+                t0accOcO = layout_utils.reshape_acc_to_mn(thr_mma.get_slice(0).partition_C(cO))
+                if taccOcO[0][1] == 0:
+                    for m in cutlass.range_constexpr(cute.size(taccOgRowMax.shape[1])):
+                        if (
+                            t0accOcO[m, 0][0]
+                            < seqlen.seqlen_q - m_block * self.tile_m - taccOcO[0][0]
+                        ):
+                            taccOgRowMax[m, 0] = row_max[m]
+            else:
+                pack_gqa.store_LSE(mRowMax_cur, row_max, tiled_mma, tidx, m_block, seqlen.seqlen_q)
 
         if const_expr(not seqlen.has_cu_seqlens_q):
             mO_cur = mO[None, None, head_idx, batch_idx]
@@ -631,6 +660,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors=None,
+        mRowMax: Optional[cute.Tensor] = None,
     ):
         """Configures and launches the flash attention kernel.
 
@@ -665,6 +695,9 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         if const_expr(mLSE is not None):
             LSE_layout_transpose = [2, 1, 0] if const_expr(mCuSeqlensQ is None) else [1, 0]
             mLSE = cute.make_tensor(mLSE.iterator, cute.select(mLSE.layout, mode=LSE_layout_transpose))
+        if const_expr(mRowMax is not None):
+            RowMax_layout_transpose = [2, 1, 0] if const_expr(mCuSeqlensQ is None) else [1, 0]
+            mRowMax = cute.make_tensor(mRowMax.iterator, cute.select(mRowMax.layout, mode=RowMax_layout_transpose))
         # TileScheduler for varlen, simple grid for non-varlen
         if const_expr(mCuSeqlensQ is not None or mSeqUsedQ is not None):
             TileScheduler = SingleTileVarlenScheduler
@@ -726,6 +759,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             TileScheduler,
             aux_tensors,
             fastdiv_mods,
+            mRowMax,
         ).launch(
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
@@ -765,6 +799,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         TileScheduler: cutlass.Constexpr[Callable],
         aux_tensors=None,
         fastdiv_mods=None,
+        mRowMax: Optional[cute.Tensor] = None,
     ):
         # Thread index, block index
         tidx, _, _ = cute.arch.thread_idx()
@@ -1070,6 +1105,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             m_block,
             num_head,
             batch_size,
+            row_max=softmax.row_max,
+            mRowMax=mRowMax,
         )
 
     @cute.jit

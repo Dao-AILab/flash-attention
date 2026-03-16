@@ -164,6 +164,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors: Optional[list] = None,
+        mRowMax: Optional[cute.Tensor] = None,
     ):
         """Configures and launches the flash attention kernel.
 
@@ -187,6 +188,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mLSE = (
             layout_utils.select(mLSE, LSE_layout_transpose)
             if const_expr(mLSE is not None)
+            else None
+        )
+        mRowMax = (
+            layout_utils.select(mRowMax, LSE_layout_transpose)
+            if const_expr(mRowMax is not None)
             else None
         )
 
@@ -366,6 +372,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             SharedStorage,
             aux_tensors,
             fastdiv_mods,
+            mRowMax,
         ).launch(
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
@@ -411,6 +418,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         SharedStorage: cutlass.Constexpr[Callable],
         aux_tensors=Optional[list[cute.Tensor]],
         fastdiv_mods=None,
+        mRowMax: Optional[cute.Tensor] = None,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         # Prefetch tma descriptor
@@ -560,6 +568,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 blocksparse_tensors,
                 aux_tensors,
                 fastdiv_mods,
+                mRowMax,
             )
 
     @cute.jit
@@ -716,6 +725,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         blocksparse_tensors: Optional[BlockSparseTensors],
         aux_tensors: Optional[list],
         fastdiv_mods=None,
+        mRowMax: Optional[cute.Tensor] = None,
     ):
         warp_group_idx = cute.arch.make_warp_uniform(tidx // self.num_threads_per_warp_group)
         warp_group_thread_layout = cute.make_layout(
@@ -1021,6 +1031,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 m_block,
                 head_idx,
                 batch_idx,
+                row_max=softmax.row_max,
+                mRowMax=mRowMax,
             )
 
             tile_scheduler.advance_to_next_work()
