@@ -190,7 +190,7 @@ class PagedKVManager(ParamsBase):
                 ),
             )
 
-            if const_expr(K_or_V == "V" and self.v_gmem_transposed):
+            if const_expr(K_or_V == "V"):
                 # Transpose smem V to match transposed gmem layout
                 sX_pi = cute.make_tensor(sX_pi.iterator, cute.select(sX_pi.layout, mode=[1, 0]))
 
