@@ -1864,7 +1864,7 @@ class FlashAttentionBackwardSm90:
                         gdQaccum,
                         subtile_factor=self.subtile_factor,
                         m_block_max=m_block_max,
-                        num_wg_mma=self.num_wg_mma,
+                        num_mma_warp_groups=self.num_wg_mma,
                         num_threads_per_warp_group=self.num_threads_per_warp_group,
                         tma_copy_bytes_dQ=self.tma_copy_bytes["dQ"],
                     )
