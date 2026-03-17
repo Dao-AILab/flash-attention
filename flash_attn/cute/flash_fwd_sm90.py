@@ -444,8 +444,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             #     cute.arch.mbarrier_init(mbar_ptr_Q + tidx, 1 if tidx == 0 else self.num_mma_threads)
             if const_expr(not self.use_tma_Q):
                 cute.arch.mbarrier_init(mbar_ptr_Q, self.num_Q_load_threads)
-            elif const_expr(not self.use_tma_KV):
-                # Q uses TMA but K/V doesn't — Q needs its own mbarrier
+            else:
+                # Q always uses its own mbarrier, separate from pipeline_k
                 cute.arch.mbarrier_init(mbar_ptr_Q, 1)
             # cute.arch.mbarrier_init(mbar_ptr_Q + 1, self.num_mma_threads)
         # We rely on pipeline_k and pipeline_v to initialize the mbarrier fence and sync
@@ -728,26 +728,16 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     n_block = n_block_max - 1 if const_expr(self.use_tma_KV) else cutlass.max(n_block_max - 1, 0)
                     page_idx = mPageTable[batch_idx, n_block] if const_expr(mPageTable is not None and self.use_tma_KV) else None
 
-                    # First iteration: load both Q & K with the same mbarrier
-                    if const_expr(self.use_tma_KV):
-                        pipeline_k.producer_acquire(
-                            kv_producer_state,
-                            extra_tx_count=self.tma_copy_bytes["Q"]
-                            if const_expr(self.use_tma_Q)
-                            else 0,
-                        )
-                        if const_expr(self.use_tma_Q):
-                            load_Q(tma_bar_ptr=pipeline_k.producer_get_barrier(kv_producer_state))
-                    else:
-                        # Load Q on its own mbarrier (separate from K's arrive-count pipeline)
-                        if const_expr(self.use_tma_Q):
-                            if warp_idx_in_wg == 0:
-                                with cute.arch.elect_one():
-                                    cute.arch.mbarrier_arrive_and_expect_tx(
-                                        mbar_ptr_Q, self.tma_copy_bytes["Q"]
-                                    )
-                                load_Q(tma_bar_ptr=mbar_ptr_Q)
-                        pipeline_k.producer_acquire(kv_producer_state)
+                    # First iteration: load Q on its own mbarrier, K on pipeline_k
+                    if const_expr(self.use_tma_Q):
+                        if warp_idx_in_wg == 0:
+                            with cute.arch.elect_one():
+                                cute.arch.mbarrier_arrive_and_expect_tx(
+                                    mbar_ptr_Q, self.tma_copy_bytes["Q"]
+                                )
+                            load_Q(tma_bar_ptr=mbar_ptr_Q)
+                    pipeline_k.producer_acquire(kv_producer_state)
+                    if const_expr(not self.use_tma_KV):
                         paged_kv_manager.load_page_table(n_block)
                     load_K(block=n_block, producer_state=kv_producer_state, page_idx=page_idx)
 
@@ -784,19 +774,24 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         kv_producer_state.advance()
                 else:
                     # Block sparsity: use TMA closures directly (not paged)
+                    # Load Q on its own mbarrier, separate from K/V pipeline
+                    if const_expr(self.use_tma_Q):
+                        if warp_idx_in_wg == 0:
+                            with cute.arch.elect_one():
+                                cute.arch.mbarrier_arrive_and_expect_tx(
+                                    mbar_ptr_Q, self.tma_copy_bytes["Q"]
+                                )
+                            load_Q(tma_bar_ptr=mbar_ptr_Q)
                     kv_producer_state = produce_block_sparse_loads(
                         blocksparse_tensors,
                         batch_idx,
                         head_idx,
                         m_block,
                         kv_producer_state,
-                        load_Q,
                         tma_load_K_fn,
                         tma_load_V_fn,
                         pipeline_k,
                         pipeline_v,
-                        self.use_tma_Q,
-                        self.tma_copy_bytes["Q"],
                         self.intra_wg_overlap,
                         self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
                         self.q_subtile_factor if self.q_subtile_factor is not None else 1,
@@ -1005,11 +1000,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 cute.arch.cp_async_mbarrier_arrive_noinc(mbar_ptr_Q)
 
             n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
-            if const_expr(not (self.use_tma_Q and self.use_tma_KV)):
-                # Wait for Q on its own mbarrier whenever Q is NOT loaded
-                # together with K via TMA (i.e., when K/V uses cp_async
-                # even if Q still uses TMA, Q has a separate mbarrier).
-                cute.arch.mbarrier_wait(mbar_ptr_Q, phase=q_consumer_phase)
+            cute.arch.mbarrier_wait(mbar_ptr_Q, phase=q_consumer_phase)
             q_consumer_phase ^= 1
             # For performance reason, we separate out two kinds of iterations:
             # those that need masking on S, and those that don't.
