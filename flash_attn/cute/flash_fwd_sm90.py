@@ -439,11 +439,15 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         # Mbarrier init
         mbar_ptr_Q = storage.mbar_ptr.data_ptr()
         if warp_idx == 1:
+            # if tidx < 2:
+            #     # barrierO num threads should be self.num_mma_threads
+            #     cute.arch.mbarrier_init(mbar_ptr_Q + tidx, 1 if tidx == 0 else self.num_mma_threads)
             if const_expr(not self.use_tma_Q):
                 cute.arch.mbarrier_init(mbar_ptr_Q, self.num_Q_load_threads)
             elif const_expr(not self.use_tma_KV):
                 # Q uses TMA but K/V doesn't — Q needs its own mbarrier
                 cute.arch.mbarrier_init(mbar_ptr_Q, 1)
+            # cute.arch.mbarrier_init(mbar_ptr_Q + 1, self.num_mma_threads)
         # We rely on pipeline_k and pipeline_v to initialize the mbarrier fence and sync
         if const_expr(self.use_tma_KV):
             # PipelineTmaAsync: consumer_release has internal per-warp gating
@@ -642,6 +646,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             tile_scheduler = TileSchedulerCls()
             work_tile = tile_scheduler.initial_work_tile_info()
             while work_tile.is_valid_tile:
+                # if work_tile.is_valid_tile:
                 m_block, head_idx, batch_idx, _ = work_tile.tile_idx
                 seqlen = SeqlenInfoCls(batch_idx)
                 mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, head_idx]
@@ -670,6 +675,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         load_Q, _, _ = copy_utils.tma_get_copy_fn(
                             tma_atom_Q, 0, cute.make_layout(1), gQ, sQ, single_stage=True
                         )
+                    # TODO: mcast
+                    # TODO check warp_idx if we have 128 producer threads
                     load_K, _, _ = copy_utils.tma_get_copy_fn(
                         tma_atom_K, 0, cute.make_layout(1), gK, sK
                     )
@@ -681,6 +688,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
                     if const_expr(not self.use_block_sparsity):
                         n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
+                        # if cute.arch.thread_idx()[0] == 0:
+                        #     cute.printf("m_block = %d, n_block_min: %d, n_block_max: %d", m_block, n_block_min, n_block_max)
+                        # First iteration: load both Q & K with the same mbarrier
                         n_block = n_block_max - 1
                         if const_expr(mPageTable is not None):
                             page_idx = mPageTable[batch_idx, n_block]
