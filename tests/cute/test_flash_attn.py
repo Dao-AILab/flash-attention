@@ -1635,55 +1635,55 @@ def _generate_block_kvcache(
 
 
 @pytest.mark.parametrize("page_size", [16, 64, 256])
-@pytest.mark.parametrize("seq_len", [64, 128, 256])
+@pytest.mark.parametrize("seqlen_q", [64, 128, 256])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_flash_attn_paged_deepseek(seq_len, page_size):
-    """Regression test: paged non-TMA with DeepSeek MLA shape (head_dim=192, head_dim_v=128).
-
-    This exercises the uneven_kv_smem offset fix in the non-TMA cp.async load path.
-    seq_len<=128 triggers q_stage=1, seq_len>128 triggers q_stage=2.
+def test_flash_attn_paged_deepseek(seqlen_q, page_size):
+    """Regression test: paged non-TMA with DeepSeek MLA shape (d=192, dv=128).
+    seqlen_q<=128 triggers q_stage=1, seqlen_q>128 triggers q_stage=2.
     """
     if IS_SM90:
         pytest.skip("paged KV not supported on SM90")
     device = "cuda"
     dtype = torch.bfloat16
-    num_heads, num_kv_heads = 16, 16
-    head_dim, head_dim_v = 192, 128
-    scale = head_dim ** -0.5
+    d, dv = 192, 128
+    nheads = 16
+    nheads_kv = 16
 
-    torch.manual_seed(42)
-    q = torch.randn(seq_len, num_heads, head_dim, device=device, dtype=dtype)
-    k = torch.randn(seq_len, num_kv_heads, head_dim, device=device, dtype=dtype)
-    v = torch.randn(seq_len, num_kv_heads, head_dim_v, device=device, dtype=dtype)
-    cu = torch.tensor([0, seq_len], dtype=torch.int32, device=device)
+    torch.random.manual_seed(0)
+    q = torch.randn(seqlen_q, nheads, d, device=device, dtype=dtype)
+    k = torch.randn(seqlen_q, nheads_kv, d, device=device, dtype=dtype)
+    v = torch.randn(seqlen_q, nheads_kv, dv, device=device, dtype=dtype)
+    cu_seqlens = torch.tensor([0, seqlen_q], dtype=torch.int32, device=device)
 
-    ref, _ = flash_attn_varlen_func(
-        q=q, k=k, v=v, cu_seqlens_q=cu, cu_seqlens_k=cu,
-        max_seqlen_q=seq_len, max_seqlen_k=seq_len,
-        softmax_scale=scale, causal=True,
+    # Non-paged reference
+    out_ref, _ = flash_attn_varlen_func(
+        q, k, v, cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
+        max_seqlen_q=seqlen_q, max_seqlen_k=seqlen_q, causal=True,
+    )
+
+    # Paged
+    num_pages = (seqlen_q + page_size - 1) // page_size
+    k_cache_paged = torch.zeros(num_pages, page_size, nheads_kv, d, device=device, dtype=dtype)
+    v_cache_paged = torch.zeros(num_pages, page_size, nheads_kv, dv, device=device, dtype=dtype)
+    for i in range(seqlen_q):
+        k_cache_paged[i // page_size, i % page_size] = k[i]
+        v_cache_paged[i // page_size, i % page_size] = v[i]
+    page_table = torch.arange(num_pages, dtype=torch.int32, device=device).unsqueeze(0)
+    cache_seqlens = torch.tensor([seqlen_q], dtype=torch.int32, device=device)
+
+    out, _ = flash_attn_varlen_func(
+        q, k_cache_paged, v_cache_paged,
+        cu_seqlens_q=cu_seqlens, cu_seqlens_k=None,
+        max_seqlen_q=seqlen_q, max_seqlen_k=None,
+        seqused_k=cache_seqlens, page_table=page_table, causal=True,
     )
 
     if is_fake_mode():
         return
 
-    num_pages = (seq_len + page_size - 1) // page_size
-    kc = torch.zeros(num_pages, page_size, num_kv_heads, head_dim, device=device, dtype=dtype)
-    vc = torch.zeros(num_pages, page_size, num_kv_heads, head_dim_v, device=device, dtype=dtype)
-    for i in range(seq_len):
-        kc[i // page_size, i % page_size] = k[i]
-        vc[i // page_size, i % page_size] = v[i]
-    pt = torch.arange(num_pages, dtype=torch.int32, device=device).unsqueeze(0)
-    cl = torch.tensor([seq_len], dtype=torch.int32, device=device)
-
-    out, _ = flash_attn_varlen_func(
-        q=q, k=kc, v=vc, cu_seqlens_q=cu, cu_seqlens_k=None,
-        max_seqlen_q=seq_len, max_seqlen_k=None,
-        seqused_k=cl, page_table=pt,
-        softmax_scale=scale, causal=True,
-    )
-
-    max_diff = (out.float() - ref.float()).abs().max().item()
-    assert max_diff == 0.0, f"page_size={page_size} seq_len={seq_len}: max_diff={max_diff}"
+    print(f"Output max diff: {(out - out_ref).abs().max().item()}")
+    print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
+    assert torch.equal(out, out_ref)
 
 
 @pytest.mark.parametrize("head_dim", [4, 148, 288])
