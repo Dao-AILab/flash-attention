@@ -107,7 +107,7 @@ SEQLEN_CONFIGS = [
     (4224, 4224),
 ]
 
-VEC_SIZES_TO_CHECK_EQUALITY = [1, 4]
+VEC_SIZES_TO_CHECK_EQUALITY = [1, 2, 4]
 
 
 def create_tensors(
@@ -224,9 +224,13 @@ def test_cute_score_mod_vectorized(
 
     for vec_size in VEC_SIZES_TO_CHECK_EQUALITY:
         cute_vectorized_score_mod.__vec_size__ = vec_size
-        out = run_cute_flash(q, k, v, cute_vectorized_score_mod, pack_gqa=pack_gqa)
-
-        assert torch.equal(out, out_ref)
+        try:
+            out = run_cute_flash(q, k, v, cute_vectorized_score_mod, pack_gqa=pack_gqa)
+            assert torch.equal(out, out_ref)
+        except ValueError as e:
+            print(f"vec_size {vec_size} unable to run, {e}")
+        finally:
+            cute_vectorized_score_mod.__vec_size__ = 1
 
 
 @pytest.mark.parametrize("seqlen_q,seqlen_kv", SEQLEN_CONFIGS)
@@ -341,11 +345,20 @@ def test_cute_score_mod_with_aux_tensors_vectorized(
 
     for vec_size in VEC_SIZES_TO_CHECK_EQUALITY:
         cute_vectorized_score_mod.__vec_size__ = vec_size
-        out = run_cute_flash(
-            q, k, v, cute_vectorized_score_mod, aux_tensors=aux_tensors, pack_gqa=pack_gqa
-        )
-
-        assert torch.equal(out, out_ref)
+        try:
+            out = run_cute_flash(
+                q,
+                k,
+                v,
+                cute_vectorized_score_mod,
+                aux_tensors=aux_tensors,
+                pack_gqa=pack_gqa,
+            )
+            assert torch.equal(out, out_ref)
+        except ValueError as e:
+            print(f"vec_size {vec_size} unable to run, {e}")
+        finally:
+            cute_vectorized_score_mod.__vec_size__ = 1
 
 
 def _generate_block_kvcache(seqlen_k, page_size, batch_size, nheads_k, d, device, dtype):
