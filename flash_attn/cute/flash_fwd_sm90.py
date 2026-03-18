@@ -442,11 +442,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             # if tidx < 2:
             #     # barrierO num threads should be self.num_mma_threads
             #     cute.arch.mbarrier_init(mbar_ptr_Q + tidx, 1 if tidx == 0 else self.num_mma_threads)
-            if const_expr(not self.use_tma_Q):
-                cute.arch.mbarrier_init(mbar_ptr_Q, self.num_Q_load_threads)
-            else:
-                # Q always uses its own mbarrier, separate from pipeline_k
-                cute.arch.mbarrier_init(mbar_ptr_Q, 1)
+            cute.arch.mbarrier_init(
+                mbar_ptr_Q, 1 if const_expr(self.use_tma_Q) else self.num_Q_load_threads
+            )
             # cute.arch.mbarrier_init(mbar_ptr_Q + 1, self.num_mma_threads)
         # We rely on pipeline_k and pipeline_v to initialize the mbarrier fence and sync
         if const_expr(self.use_tma_KV):
@@ -631,14 +629,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         warp_idx_in_wg = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
         tidx, _, _ = cute.arch.thread_idx()
 
-        if const_expr(self.use_tma_KV):
-            # TMA path: only warp 0 does loads
-            is_load_thread = warp_idx_in_wg == 0
-        else:
-            # cp_async path: all producer threads (128) participate
-            is_load_thread = True
+        # TMA: only warp 0 loads. cp_async: all warps load
+        is_load_warp = warp_idx_in_wg == 0 or const_expr(not self.use_tma_KV)
 
-        if is_load_thread:
+        if is_load_warp:
             q_producer_phase = Int32(1)
             kv_producer_state = pipeline.make_pipeline_state(
                 cutlass.pipeline.PipelineUserType.Producer, self.num_stages
@@ -679,7 +673,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         gK = cute.local_tile(mK_cur, (self.tile_n, self.tile_hdim), (None, 0))
                         gV = cute.local_tile(mV_cur, (self.tile_n, self.tile_hdimv), (None, 0))
                     # TODO: mcast
-                    # TODO check warp_idx if we have 128 producer threads
                     tma_load_K_fn, _, _ = copy_utils.tma_get_copy_fn(
                         tma_atom_K, 0, cute.make_layout(1), gK, sK
                     )
