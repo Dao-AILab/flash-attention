@@ -668,8 +668,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         gV = cute.local_tile(mV_cur, (self.tile_n, self.tile_hdimv), (0, 0, None))
                     else:
                         # Non-paged TMA
-                        mK_cur = seqlen.offset_batch_K(mK, batch_idx, dim=3)[None, None, head_idx_kv]
-                        mV_cur = seqlen.offset_batch_K(mV, batch_idx, dim=3)[None, None, head_idx_kv]
+                        mK_cur = seqlen.offset_batch_K(mK, batch_idx, dim=3)[
+                            None, None, head_idx_kv
+                        ]
+                        mV_cur = seqlen.offset_batch_K(mV, batch_idx, dim=3)[
+                            None, None, head_idx_kv
+                        ]
                         gK = cute.local_tile(mK_cur, (self.tile_n, self.tile_hdim), (None, 0))
                         gV = cute.local_tile(mV_cur, (self.tile_n, self.tile_hdimv), (None, 0))
                     # TODO: mcast
@@ -702,12 +706,20 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     )
 
                 load_K = partial(
-                    self.load_KV, tma_load_K_fn, paged_kv_manager, sK,
-                    pipeline_kv=pipeline_k, K_or_V="K",
+                    self.load_KV,
+                    tma_load_K_fn,
+                    paged_kv_manager,
+                    sK,
+                    pipeline_kv=pipeline_k,
+                    K_or_V="K",
                 )
                 load_V = partial(
-                    self.load_KV, tma_load_V_fn, paged_kv_manager, sV,
-                    pipeline_kv=pipeline_v, K_or_V="V",
+                    self.load_KV,
+                    tma_load_V_fn,
+                    paged_kv_manager,
+                    sV,
+                    pipeline_kv=pipeline_v,
+                    K_or_V="V",
                 )
 
                 if const_expr(not self.use_block_sparsity):
@@ -718,8 +730,16 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     # + pack_gqa when seqlen_k < tile_n). TMA handles n_block=-1
                     # gracefully (fills zeros), but cp.async would crash on
                     # out-of-bounds page table access.
-                    n_block = n_block_max - 1 if const_expr(self.use_tma_KV) else cutlass.max(n_block_max - 1, 0)
-                    page_idx = mPageTable[batch_idx, n_block] if const_expr(mPageTable is not None and self.use_tma_KV) else None
+                    n_block = (
+                        n_block_max - 1
+                        if const_expr(self.use_tma_KV)
+                        else cutlass.max(n_block_max - 1, 0)
+                    )
+                    page_idx = (
+                        mPageTable[batch_idx, n_block]
+                        if const_expr(mPageTable is not None and self.use_tma_KV)
+                        else None
+                    )
 
                     # First iteration: load Q on its own mbarrier, K on pipeline_k
                     if const_expr(self.use_tma_Q):
@@ -740,28 +760,54 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         kv_producer_state.advance()
                         for i in cutlass.range(n_block_max - 1 - n_block_min, unroll=1):
                             n_block = n_block_max - 1 - i - 1
-                            page_idx = mPageTable[batch_idx, n_block] if const_expr(mPageTable is not None and self.use_tma_KV) else None
+                            page_idx = (
+                                mPageTable[batch_idx, n_block]
+                                if const_expr(mPageTable is not None and self.use_tma_KV)
+                                else None
+                            )
                             if const_expr(not self.use_tma_KV):
                                 paged_kv_manager.load_page_table(n_block)
                             pipeline_k.producer_acquire(kv_producer_state)
-                            load_K(block=n_block, producer_state=kv_producer_state, page_idx=page_idx)
+                            load_K(
+                                block=n_block, producer_state=kv_producer_state, page_idx=page_idx
+                            )
                             pipeline_v.producer_acquire(kv_producer_state)
-                            load_V(block=n_block, producer_state=kv_producer_state, page_idx=page_idx)
+                            load_V(
+                                block=n_block, producer_state=kv_producer_state, page_idx=page_idx
+                            )
                             kv_producer_state.advance()
                     else:
                         for i in cutlass.range(n_block_max - 1 - n_block_min, unroll=1):
                             n_block_prev = n_block_max - i - 1
                             n_block = n_block_prev - 1
-                            page_idx = mPageTable[batch_idx, n_block] if const_expr(mPageTable is not None) else None
-                            page_idx_prev = mPageTable[batch_idx, n_block_prev] if const_expr(mPageTable is not None) else None
+                            page_idx = (
+                                mPageTable[batch_idx, n_block]
+                                if const_expr(mPageTable is not None)
+                                else None
+                            )
+                            page_idx_prev = (
+                                mPageTable[batch_idx, n_block_prev]
+                                if const_expr(mPageTable is not None)
+                                else None
+                            )
                             kv_producer_state_prev = kv_producer_state.clone()
                             kv_producer_state.advance()
                             pipeline_k.producer_acquire(kv_producer_state)
-                            load_K(block=n_block, producer_state=kv_producer_state, page_idx=page_idx)
+                            load_K(
+                                block=n_block, producer_state=kv_producer_state, page_idx=page_idx
+                            )
                             pipeline_v.producer_acquire(kv_producer_state_prev)
-                            load_V(block=n_block_prev, producer_state=kv_producer_state_prev, page_idx=page_idx_prev)
+                            load_V(
+                                block=n_block_prev,
+                                producer_state=kv_producer_state_prev,
+                                page_idx=page_idx_prev,
+                            )
                         n_block = n_block_min
-                        page_idx = mPageTable[batch_idx, n_block] if const_expr(mPageTable is not None) else None
+                        page_idx = (
+                            mPageTable[batch_idx, n_block]
+                            if const_expr(mPageTable is not None)
+                            else None
+                        )
                         pipeline_v.producer_acquire(kv_producer_state)
                         load_V(block=n_block, producer_state=kv_producer_state, page_idx=page_idx)
                         kv_producer_state.advance()
