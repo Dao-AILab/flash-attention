@@ -497,10 +497,6 @@ def _flash_attn_fwd(
     paged_kv_non_tma = page_size not in [None, 128]
     if arch // 10 == 10:
         q_stage = 2 if seqlen_q_packgqa > tile_m else 1
-        # Workaround: q_stage=1 kernel produces wrong output for paged non-TMA
-        # with different K/V head dims (e.g., DeepSeek MLA shape 192/128).
-        if q_stage == 1 and paged_kv_non_tma and head_dim != head_dim_v:
-            q_stage = 2
     else:
         q_stage = 1
 

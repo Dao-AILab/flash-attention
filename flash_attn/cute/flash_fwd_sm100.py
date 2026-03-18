@@ -258,9 +258,7 @@ class FlashAttentionForwardSm100:
         smem_size_kv_per_stage = max(smem_size_k_per_stage, smem_size_v_per_stage) // self.cta_group_size
         kv_stage = (224 * 1024 - smem_size_q_o) // smem_size_kv_per_stage
         if self.head_dim_padded == 192 and self.head_dim_v_padded == 128 and kv_stage == 2 and self.use_tma_KV:
-            # For hdim 192,128, we can fit 3 stages if we use uneven_kv_smem.
-            # Only enabled for TMA path; paged KV non-TMA path uses cp.async which
-            # cannot handle the uneven smem offset due to alignment constraints.
+            # For hdim 192,128, we can fit 3 stages if we use uneven_kv_smem
              kv_stage = 3
         self.kv_stage = kv_stage
         # print("kv_stage", self.kv_stage)
@@ -274,6 +272,7 @@ class FlashAttentionForwardSm100:
         # but for the 1st stage we need to add or subtract (depending on phase) 128 x 64.
         self.uneven_kv_smem = (
             self.head_dim_padded == 192 and self.head_dim_v_padded == 128 and self.kv_stage == 3
+            and self.use_tma_KV
         )
         self.uneven_kv_smem_offset = (
             self.n_block_size * (self.head_dim_padded - self.head_dim_v_padded) // 2
