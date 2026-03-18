@@ -2689,9 +2689,9 @@ class FlashAttentionForwardSm100:
             # (smem_large + smem_small) // 2. So for stage == 1, move right by offset if
             # phase == 0, or left by offset if phase == 1.
             offset = 0 if stage != 1 else self.uneven_kv_smem_offset * (1 - 2 * phase)
-            # Hint that the offset is a multiple of 8 elements (16 bytes) so that
-            # ptr + offset preserves the 128-bit alignment needed by cp.async.
-            offset = cute.assume(offset, divby=8)
+            # Hint that the offset is 128-bit aligned so that
+            # ptr + offset preserves the alignment needed by cp.async.
+            offset = cute.assume(offset, divby=128 // self.k_dtype.width)
             return cute.make_tensor(sX.iterator + offset, sX.layout)
         else:
             return sX
