@@ -494,8 +494,13 @@ def _flash_attn_fwd(
     if max_seqlen_k is None:
         max_seqlen_k = seqlen_k
     seqlen_q_packgqa = max_seqlen_q * qhead_per_kvhead
+    paged_kv_non_tma = page_size not in [None, 128]
     if arch // 10 == 10:
         q_stage = 2 if seqlen_q_packgqa > tile_m else 1
+        # Workaround: q_stage=1 kernel produces wrong output for paged non-TMA
+        # with different K/V head dims (e.g., DeepSeek MLA shape 192/128).
+        if q_stage == 1 and paged_kv_non_tma and head_dim != head_dim_v:
+            q_stage = 2
     else:
         q_stage = 1
 
@@ -623,7 +628,7 @@ def _flash_attn_fwd(
         is_split_kv,
         pack_gqa,
         arch,
-        page_size not in [None, 128],  # paged KV non-TMA
+        paged_kv_non_tma,
         use_2cta_instrs,
         q_subtile_factor,
         mma_pv_is_rs,
@@ -731,7 +736,7 @@ def _flash_attn_fwd(
                 score_mod=score_mod,
                 mask_mod=mask_mod,
                 has_aux_tensors=aux_tensors is not None,
-                paged_kv_non_tma=page_size not in [None, 128],
+                paged_kv_non_tma=paged_kv_non_tma,
                 is_varlen_q=cu_seqlens_q is not None or seqused_q is not None,
                 q_subtile_factor=q_subtile_factor,
                 use_2cta_instrs=use_2cta_instrs,
