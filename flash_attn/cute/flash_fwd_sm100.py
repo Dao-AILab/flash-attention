@@ -257,7 +257,7 @@ class FlashAttentionForwardSm100:
         smem_size_v_per_stage = self.n_block_size * self.head_dim_v_padded * self.v_dtype.width // 8
         smem_size_kv_per_stage = max(smem_size_k_per_stage, smem_size_v_per_stage) // self.cta_group_size
         kv_stage = (224 * 1024 - smem_size_q_o) // smem_size_kv_per_stage
-        if self.head_dim_padded == 192 and self.head_dim_v_padded == 128 and kv_stage == 2 and self.use_tma_KV:
+        if self.head_dim_padded == 192 and self.head_dim_v_padded == 128 and kv_stage == 2:
             # For hdim 192,128, we can fit 3 stages if we use uneven_kv_smem
              kv_stage = 3
         self.kv_stage = kv_stage
@@ -272,7 +272,6 @@ class FlashAttentionForwardSm100:
         # but for the 1st stage we need to add or subtract (depending on phase) 128 x 64.
         self.uneven_kv_smem = (
             self.head_dim_padded == 192 and self.head_dim_v_padded == 128 and self.kv_stage == 3
-            and self.use_tma_KV
         )
         self.uneven_kv_smem_offset = (
             self.n_block_size * (self.head_dim_padded - self.head_dim_v_padded) // 2
@@ -2676,7 +2675,10 @@ class FlashAttentionForwardSm100:
         else:
             assert paged_kv_manager is not None
             assert extra_tx_count is None
-            paged_kv_manager.load_KV(block, sX[None, None, None, stage], K_or_V)
+            sX_cur = sX[None, None, None, stage]
+            if const_expr(self.uneven_kv_smem):
+                sX_cur = self.offset_kv_smem(sX_cur, stage, phase ^ 1)
+            paged_kv_manager.load_KV(block, sX_cur, K_or_V)
             cute.arch.cp_async_commit_group()
             pipeline_kv.sync_object_full.arrive_cp_async_mbarrier(stage)
 
@@ -2687,6 +2689,9 @@ class FlashAttentionForwardSm100:
             # (smem_large + smem_small) // 2. So for stage == 1, move right by offset if
             # phase == 0, or left by offset if phase == 1.
             offset = 0 if stage != 1 else self.uneven_kv_smem_offset * (1 - 2 * phase)
+            # Hint that the offset is a multiple of 8 elements (16 bytes) so that
+            # ptr + offset preserves the 128-bit alignment needed by cp.async.
+            offset = cute.assume(offset, divby=8)
             return cute.make_tensor(sX.iterator + offset, sX.layout)
         else:
             return sX
