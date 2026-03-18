@@ -239,10 +239,9 @@ class SoftmaxSm100(Softmax):
         self,
         acc_S_row: cute.Tensor,
         acc_S_row_converted: cute.Tensor,
-        e2e: cutlass.Constexpr[bool] = False,
-        e2e_freq: cutlass.Constexpr[int] = 16,
-        e2e_res: cutlass.Constexpr[int] = 4,
-        e2e_frg_limit: cutlass.Constexpr[int] = 1,
+        ex2_emu_freq: cutlass.Constexpr[int] = 0,
+        ex2_emu_res: cutlass.Constexpr[int] = 4,
+        ex2_emu_start_frg: cutlass.Constexpr[int] = 0,
     ):
         assert cute.size(acc_S_row.shape) % 2 == 0, "acc_S_row must have an even number of elements"
         frg_tile = 32
@@ -257,12 +256,14 @@ class SoftmaxSm100(Softmax):
             for k in cutlass.range_constexpr(0, cute.size(acc_S_row_frg, mode=[0]), 2):
                 # acc_S_row_frg[k, j] = cute.math.exp2(acc_S_row_frg[k, j], fastmath=True)
                 # acc_S_row_frg[k + 1, j] = cute.math.exp2(acc_S_row_frg[k + 1, j], fastmath=True)
-                if cutlass.const_expr(not e2e):
+                if cutlass.const_expr(ex2_emu_freq == 0):
                     acc_S_row_frg[k, j] = cute.math.exp2(acc_S_row_frg[k, j], fastmath=True)
                     acc_S_row_frg[k + 1, j] = cute.math.exp2(acc_S_row_frg[k + 1, j], fastmath=True)
                 else:
                     if cutlass.const_expr(
-                        k % e2e_freq < e2e_freq - e2e_res or j >= frg_cnt - e2e_frg_limit
+                        k % ex2_emu_freq < ex2_emu_freq - ex2_emu_res
+                        or j >= frg_cnt - 1
+                        or j < ex2_emu_start_frg
                     ):
                         acc_S_row_frg[k, j] = cute.math.exp2(acc_S_row_frg[k, j], fastmath=True)
                         acc_S_row_frg[k + 1, j] = cute.math.exp2(

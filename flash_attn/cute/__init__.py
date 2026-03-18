@@ -1,6 +1,11 @@
 """Flash Attention CUTE (CUDA Template Engine) implementation."""
 
-__version__ = "0.1.0"
+from importlib.metadata import PackageNotFoundError, version
+
+try:
+    __version__ = version("fa4")
+except PackageNotFoundError:
+    __version__ = "0.0.0"
 
 import cutlass.cute as cute
 

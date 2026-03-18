@@ -767,3 +767,323 @@ def gemm_ptx_partial1(
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
         )
+
+
+@cute.jit
+def gemm_ptx_precomputed(
+    acc_tmem_addr: Int32,
+    smem_desc_start_a: Int32,  # If TS, then this is the tmem start address for A
+    smem_desc_start_b: Int32,
+    idesc: int,
+    smem_desc_base_a: Optional[int],
+    smem_desc_base_b: int,
+    tCrA_layout: cute.Layout,
+    tCrB_layout: cute.Layout,
+    mbar_ptr: Optional[cutlass.Pointer] = None,
+    mbar_phase: Optional[Int32] = None,
+    zero_init: bool | Boolean = False,
+    cta_group: int = 1,
+) -> None:
+    # acc_tmem_addr += acc_offset
+    is_ts = const_expr(smem_desc_base_a is None)
+    num_k_tile = cute.size(tCrA_layout.shape[2])
+    if const_expr(not is_ts):
+        smem_desc_base_a_lo, smem_desc_a_hi = i64_to_i32x2(smem_desc_base_a)
+    else:
+        smem_desc_base_a_lo, smem_desc_a_hi = None, None
+    smem_desc_base_b_lo, smem_desc_b_hi = i64_to_i32x2(smem_desc_base_b)
+
+    tCrA_layout = (
+        tCrA_layout
+        if const_expr(not is_ts)
+        # else cute.recast_layout(32, tCrA.element_type.width, tCrA_layout)
+        # currently hard-coding the width to 16
+        else cute.recast_layout(32, 16, tCrA_layout)
+    )
+    offset_a = [cute.crd2idx((0, 0, k), tCrA_layout) for k in range(num_k_tile)]
+    offset_a_diff = [offset_a[k] - offset_a[k - 1] for k in range(1, num_k_tile)]
+    offset_b = [cute.crd2idx((0, 0, k), tCrB_layout) for k in range(num_k_tile)]
+    offset_b_diff = [offset_b[k] - offset_b[k - 1] for k in range(1, num_k_tile)]
+
+    smem_desc_start_a_lo = None
+    if const_expr(not is_ts):
+        smem_desc_start_a_lo = Int32(smem_desc_base_a_lo | smem_desc_start_a)
+        # smem_desc_start_a_lo = smem_desc_start_a
+    smem_desc_start_b_lo = Int32(smem_desc_base_b_lo | smem_desc_start_b)
+    pred_str = "p" if isinstance(zero_init, Boolean) else "0" if zero_init else "1"
+    if const_expr(not is_ts):
+        assert mbar_ptr is None, "mbar_ptr must be None when a_src is not TMEM"
+        llvm.inline_asm(
+            None,
+            [
+                # acc.iterator.toint().ir_value(),
+                Int32(cute.arch.make_warp_uniform(smem_desc_start_a_lo)).ir_value(),
+                Int32(cute.arch.make_warp_uniform(smem_desc_start_b_lo)).ir_value(),
+                Int32(not zero_init).ir_value(),
+                Int32(cute.arch.make_warp_uniform(acc_tmem_addr)).ir_value(),
+            ],
+            "{\n\t"
+            ".reg .pred leader_thread;\n\t"
+            ".reg .pred p;\n\t"
+            ".reg .b32 idesc;\n\t"
+            ".reg .b32 tmem_acc;\n\t"
+            ".reg .b32 smem_desc_a_lo_start, smem_desc_b_lo_start;\n\t"
+            ".reg .b32 smem_desc_a_lo, smem_desc_b_lo;\n\t"
+            ".reg .b32 smem_desc_a_hi, smem_desc_b_hi;\n\t"
+            ".reg .b64 smem_desc_a, smem_desc_b;\n\t"
+            "elect.sync _|leader_thread, -1;\n\t"
+            f"mov.b32 idesc, {hex(idesc)};\n\t"
+            # f"mov.b32 tmem_acc, {hex(acc_tmem_addr)};\n\t"
+            f"mov.b32 tmem_acc, $3;\n\t"
+            "mov.b32 smem_desc_a_lo_start, $0;\n\t"
+            "mov.b32 smem_desc_b_lo_start, $1;\n\t"
+            f"mov.b32 smem_desc_a_hi, {hex(smem_desc_a_hi)};\n\t"
+            f"mov.b32 smem_desc_b_hi, {hex(smem_desc_b_hi)};\n\t"
+            f"mov.b64 smem_desc_a, {{smem_desc_a_lo_start, smem_desc_a_hi}};\n\t"
+            f"mov.b64 smem_desc_b, {{smem_desc_b_lo_start, smem_desc_b_hi}};\n\t"
+            "setp.ne.b32 p, $2, 0;\n\t"
+            f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::f16 [tmem_acc], smem_desc_a, smem_desc_b, idesc, {pred_str};\n\t"
+            + "".join(
+                (
+                    # f"add.u32 smem_desc_a_lo, smem_desc_a_lo, {hex(offset_a_diff[k - 1])};\n\t"
+                    # f"add.u32 smem_desc_b_lo, smem_desc_b_lo, {hex(offset_b_diff[k - 1])};\n\t"
+                    f"add.s32 smem_desc_a_lo, smem_desc_a_lo_start, {hex(offset_a[k])};\n\t"
+                    f"add.s32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[k])};\n\t"
+                    f"mov.b64 smem_desc_a, {{smem_desc_a_lo, smem_desc_a_hi}};\n\t"
+                    f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
+                    f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::f16 [tmem_acc], smem_desc_a, smem_desc_b, idesc, 1;\n\t"
+                )
+                for k in range(1, num_k_tile)
+            )
+            + "}\n",
+            # "r,r,r",
+            "r,r,r,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    else:
+        input_args = [
+            Int32(cute.arch.make_warp_uniform(smem_desc_start_a)).ir_value(),
+            Int32(cute.arch.make_warp_uniform(smem_desc_start_b_lo)).ir_value(),
+            Int32(not zero_init).ir_value(),
+            Int32(cute.arch.make_warp_uniform(acc_tmem_addr)).ir_value(),
+        ]
+        if const_expr(mbar_ptr is not None):
+            assert mbar_phase is not None, "mbar_phase must be provided when mbar_ptr is not None"
+            input_args.append(mbar_ptr.toint().ir_value())
+            input_args.append(Int32(mbar_phase).ir_value())
+            mbar_wait_str = (
+                ".reg .pred P1; \n\t"
+                "LAB_WAIT: \n\t"
+                "mbarrier.try_wait.parity.shared::cta.b64 P1, [$4], $5, 10000000; \n\t"
+                "@P1 bra DONE; \n\t"
+                "bra     LAB_WAIT; \n\t"
+                "DONE: \n\t"
+            )
+        else:
+            mbar_wait_str = ""
+        llvm.inline_asm(
+            None,
+            # [
+            #     # acc.iterator.toint().ir_value(),
+            #     Int32(tCrA_layout[None, None, 0].iterator.toint()).ir_value(),
+            #     Int32(smem_desc_start_b_lo).ir_value(),
+            #     Int32(not zero_init).ir_value(),
+            # ],
+            input_args,
+            "{\n\t"
+            ".reg .pred leader_thread;\n\t"
+            ".reg .pred p;\n\t"
+            ".reg .b32 idesc;\n\t"
+            ".reg .b32 tmem_acc;\n\t"
+            ".reg .b32 tmem_a;\n\t"
+            ".reg .b32 smem_desc_b_lo_start;\n\t"
+            ".reg .b32 smem_desc_b_lo;\n\t"
+            ".reg .b32 smem_desc_b_hi;\n\t"
+            ".reg .b64 smem_desc_b;\n\t"
+            "elect.sync _|leader_thread, -1;\n\t"
+            f"mov.b32 idesc, {hex(idesc)};\n\t"
+            # f"mov.b32 tmem_acc, {hex(acc_tmem_addr)};\n\t"
+            f"mov.b32 tmem_acc, $3;\n\t"
+            f"mov.b32 tmem_a, $0;\n\t"
+            f"mov.b32 smem_desc_b_lo_start, $1;\n\t"
+            f"mov.b32 smem_desc_b_hi, {hex(smem_desc_b_hi)};\n\t"
+            f"mov.b64 smem_desc_b, {{smem_desc_b_lo_start, smem_desc_b_hi}};\n\t"
+            "setp.ne.b32 p, $2, 0;\n\t"
+            f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::f16 [tmem_acc], [tmem_a], smem_desc_b, idesc, {pred_str};\n\t"
+            + "".join(
+                (
+                    # f"add.u32 tmem_a, tmem_a, {hex(offset_a_diff[k - 1])};\n\t"
+                    # f"add.u32 smem_desc_b_lo, smem_desc_b_lo, {hex(offset_b_diff[k - 1])};\n\t"
+                    f"add.u32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[k])};\n\t"
+                    f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
+                    # f"@leader_thread tcgen05.mma.cta_group::1.kind::f16 [tmem_acc], [tmem_a], smem_desc_b, idesc, 1;\n\t"
+                    f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::f16 [tmem_acc], [tmem_a + {hex(offset_a[k])}], smem_desc_b, idesc, 1;\n\t"
+                )
+                for k in range(
+                    1,
+                    num_k_tile if const_expr(mbar_ptr is None) else num_k_tile // 4 * 3,
+                )
+            )
+            + mbar_wait_str
+            + (
+                "".join(
+                    (
+                        # f"add.u32 smem_desc_b_lo, smem_desc_b_lo, {hex(offset_b_diff[k - 1])};\n\t"
+                        f"add.u32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[k])};\n\t"
+                        f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
+                        f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::f16 [tmem_acc], [tmem_a + {hex(offset_a[k])}], smem_desc_b, idesc, 1;\n\t"
+                    )
+                    for k in range(num_k_tile // 4 * 3, num_k_tile)
+                )
+                if const_expr(mbar_ptr is not None)
+                else ""
+            )
+            + "}\n",
+            "r,r,r,r" if const_expr(mbar_ptr is None) else "r,r,r,r,r,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+
+
+@cute.jit
+def declare_ptx_smem_desc(
+    smem_desc_start_a: Int32,  # If TS, then this is the tmem start address for A
+    smem_desc_base_a: Optional[int],
+    tCrA_layout: cute.Layout,
+    var_name_prefix: str = "smem_desc",
+) -> None:
+    is_ts = const_expr(smem_desc_base_a is None)
+    num_k_tile = cute.size(tCrA_layout.shape[2])
+    smem_desc_base_a_lo, smem_desc_a_hi = None, None
+    if const_expr(not is_ts):
+        smem_desc_base_a_lo, smem_desc_a_hi = i64_to_i32x2(smem_desc_base_a)
+    tCrA_layout = (
+        tCrA_layout
+        if const_expr(not is_ts)
+        # else cute.recast_layout(32, tCrA.element_type.width, tCrA_layout)
+        # currently hard-coding the width to 16
+        else cute.recast_layout(32, 16, tCrA_layout)
+    )
+    offset_a = [cute.crd2idx((0, 0, k), tCrA_layout) for k in range(num_k_tile)]
+    smem_desc_start_a_lo = None
+    if const_expr(not is_ts):
+        smem_desc_start_a_lo = Int32(smem_desc_base_a_lo | smem_desc_start_a)
+    if const_expr(not is_ts):
+        llvm.inline_asm(
+            None,
+            [Int32(cute.arch.make_warp_uniform(smem_desc_start_a_lo)).ir_value()],
+            f".reg .b32 {var_name_prefix}_lo;\n\t"
+            f".reg .b64 {var_name_prefix}_<{num_k_tile}>;\n\t"
+            f"mov.b64 {var_name_prefix}_0, {{$0, {hex(smem_desc_a_hi)}}};\n\t"
+            + "".join(
+                (
+                    f"add.s32 {var_name_prefix}_lo, $0, {hex(offset_a[k])};\n\t"
+                    f"mov.b64 {var_name_prefix}_{k}, {{{var_name_prefix}_lo, {hex(smem_desc_a_hi)}}};\n\t"
+                )
+                for k in range(1, num_k_tile)
+            ),
+            "r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+
+
+@cute.jit
+def declare_ptx_idesc(op: cute.nvgpu.tcgen05.mma.MmaOp, var_name: str = "idesc") -> None:
+    idesc = const_expr(sm100_desc.mma_op_to_idesc(op))
+    llvm.inline_asm(
+        None,
+        [],
+        f".reg .b32 {var_name};\n\t"  # noqa
+        f"mov.b32 {var_name}, {hex(idesc)};\n\t",
+        constraints="",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@cute.jit
+def gemm_ptx_precomputed_varname(
+    acc_tmem_addr: Int32,
+    smem_desc_start_b: Int32,
+    # idesc: int,
+    smem_desc_base_b: int,
+    tCrB_layout: cute.Layout,
+    smem_var_name_prefix: str,
+    idesc_var_name: str,
+    smem_offset: int,
+    zero_init: bool | Boolean = False,
+    cta_group: int = 1,
+) -> None:
+    is_ts = False
+    num_k_tile = cute.size(tCrB_layout.shape[2])
+    smem_desc_base_b_lo, smem_desc_b_hi = i64_to_i32x2(smem_desc_base_b)
+    offset_b = [cute.crd2idx((0, 0, k), tCrB_layout) for k in range(num_k_tile)]
+
+    smem_desc_start_b_lo = Int32(smem_desc_base_b_lo | smem_desc_start_b)
+    pred_str = "p" if isinstance(zero_init, Boolean) else "0" if zero_init else "1"
+    if const_expr(not is_ts):
+        llvm.inline_asm(
+            None,
+            [
+                Int32(cute.arch.make_warp_uniform(smem_desc_start_b_lo)).ir_value(),
+                Int32(not zero_init).ir_value(),
+                Int32(cute.arch.make_warp_uniform(acc_tmem_addr)).ir_value(),
+            ],
+            "{\n\t"
+            ".reg .pred leader_thread;\n\t"
+            ".reg .pred p;\n\t"
+            # ".reg .b32 idesc;\n\t"
+            ".reg .b32 tmem_acc;\n\t"
+            ".reg .b32 smem_desc_b_lo_start;\n\t"
+            ".reg .b32 smem_desc_a_lo, smem_desc_b_lo;\n\t"
+            ".reg .b32 smem_desc_a_hi, smem_desc_b_hi;\n\t"
+            # ".reg .b64 smem_desc_b;\n\t"
+            f".reg .b64 smem_desc_b_<{num_k_tile}>;\n\t"
+            "elect.sync _|leader_thread, -1;\n\t"
+            # f"mov.b32 idesc, {hex(idesc)};\n\t"
+            # f"mov.b32 tmem_acc, {hex(acc_tmem_addr)};\n\t"
+            f"mov.b32 tmem_acc, $2;\n\t"
+            "mov.b32 smem_desc_b_lo_start, $0;\n\t"
+            f"mov.b32 smem_desc_b_hi, {hex(smem_desc_b_hi)};\n\t"
+            f"mov.b64 {{smem_desc_a_lo, smem_desc_a_hi}}, {smem_var_name_prefix}_0;\n\t"
+            f"add.s32 smem_desc_a_lo, smem_desc_a_lo, {smem_offset};\n\t"
+            f"mov.b64 {smem_var_name_prefix}_0, {{smem_desc_a_lo, smem_desc_a_hi}};\n\t"
+            f"mov.b64 smem_desc_b_0, {{smem_desc_b_lo_start, smem_desc_b_hi}};\n\t"
+            + "".join(
+                (
+                    f"mov.b64 {{smem_desc_a_lo, smem_desc_a_hi}}, {smem_var_name_prefix}_{k};\n\t"
+                    f"add.s32 smem_desc_a_lo, smem_desc_a_lo, {smem_offset};\n\t"
+                    f"add.s32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[k])};\n\t"
+                    f"mov.b64 {smem_var_name_prefix}_{k}, {{smem_desc_a_lo, smem_desc_a_hi}};\n\t"
+                    f"mov.b64 smem_desc_b_{k}, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
+                )
+                for k in range(1, num_k_tile)
+            )
+            + "setp.ne.b32 p, $1, 0;\n\t"
+            # f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::f16 [tmem_acc], {smem_var_name_prefix}_0, smem_desc_b, idesc, {pred_str};\n\t"
+            f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::f16 [tmem_acc], {smem_var_name_prefix}_0, smem_desc_b_0, {idesc_var_name}, {pred_str};\n\t"
+            + "".join(
+                (
+                    # f"mov.b64 {{smem_desc_a_lo, smem_desc_a_hi}}, {smem_var_name_prefix}_{k};\n\t"
+                    # f"add.s32 smem_desc_a_lo, smem_desc_a_lo, {smem_offset};\n\t"
+                    # f"add.s32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[k])};\n\t"
+                    # f"mov.b64 {smem_var_name_prefix}_{k}, {{smem_desc_a_lo, smem_desc_a_hi}};\n\t"
+                    # f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
+                    # f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::f16 [tmem_acc], {smem_var_name_prefix}_{k}, smem_desc_b, idesc, 1;\n\t"
+                    # f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::f16 [tmem_acc], {smem_var_name_prefix}_{k}, smem_desc_b, {idesc_var_name}, 1;\n\t"
+                    f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::f16 [tmem_acc], {smem_var_name_prefix}_{k}, smem_desc_b_{k}, {idesc_var_name}, 1;\n\t"
+                )
+                for k in range(1, num_k_tile)
+            )
+            + "}\n",
+            "r,r,r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )

@@ -28,6 +28,7 @@ from flash_attn.cute.block_sparsity import (
     fast_sampling,
     normalize_block_sparse_config,
 )
+from flash_attn.cute.cache_utils import get_jit_cache
 from flash_attn.cute import utils
 from mask_mod_definitions import get_mask_pair, random_doc_id_tensor
 COMPUTE_CAPABILITY = torch.cuda.get_device_capability()[0]
@@ -348,8 +349,7 @@ def _run_mask_test(
         window_size_left=window_left,
         window_size_right=window_right,
         learnable_sink=None,
-        m_block_size=tile_m,
-        n_block_size=tile_n,
+        tile_mn=(tile_m, tile_n),
         pack_gqa=pack_gqa,
         _arch=None,
         score_mod=None,
@@ -621,7 +621,7 @@ def test_single_doc_bwd_minimal():
         seqused_q=None, seqused_k=None, page_table=None,
         causal=False, softcap=None,
         window_size_left=-1, window_size_right=-1,
-        m_block_size=tile_m, n_block_size=tile_n, pack_gqa=False,
+        tile_mn=(tile_m, tile_n), pack_gqa=False,
         _arch=None, score_mod=None,
         mask_mod=mask_mod_cute,
         block_sparse_tensors=block_sparse_mask_fwd,
@@ -789,8 +789,7 @@ def test_sm100_block_sparse_sink_all_masked():
         window_size_left=None,
         window_size_right=None,
         learnable_sink=learnable_sink,
-        m_block_size=128,
-        n_block_size=128,
+        tile_mn=(128, 128),
         num_threads=384,
         pack_gqa=False,
         block_sparse_tensors=sparse,
@@ -818,8 +817,8 @@ def test_sm100_block_sparse_q_stage1():
         "__init__",
         wrapped_init,
     ):
-        compile_cache = dict(_flash_attn_fwd.compile_cache)
-        _flash_attn_fwd.compile_cache.clear()
+        compile_cache = _flash_attn_fwd.compile_cache
+        _flash_attn_fwd.compile_cache = get_jit_cache("test_mask_mod.fwd")
         try:
             _run_mask_test(
                 seqlen_q=128,
@@ -839,7 +838,7 @@ def test_sm100_block_sparse_q_stage1():
             )
         finally:
             _flash_attn_fwd.compile_cache.clear()
-            _flash_attn_fwd.compile_cache.update(compile_cache)
+            _flash_attn_fwd.compile_cache = compile_cache
     assert observed.get("q_stage") == 1
 
 
@@ -907,8 +906,7 @@ def test_sm100_block_sparse_coarse_blocks():
         window_size_left=None,
         window_size_right=None,
         learnable_sink=None,
-        m_block_size=tile_m,
-        n_block_size=tile_n,
+        tile_mn=(tile_m, tile_n),
         pack_gqa=False,
         _arch=None,
         score_mod=None,
@@ -1014,8 +1012,7 @@ def test_sm100_block_sparse_coarse_blocks_mismatch():
             window_size_left=None,
             window_size_right=None,
             learnable_sink=None,
-            m_block_size=tile_m,
-            n_block_size=tile_n,
+            tile_mn=(tile_m, tile_n),
             pack_gqa=False,
             _arch=None,
             score_mod=None,
@@ -1268,7 +1265,7 @@ def test_gqa_block_sparse_broadcast_pattern_recompilation():
             q=q, k=k, v=v, out=out, lse=lse,
             softmax_scale=softmax_scale, causal=False,
             window_size_left=-1, window_size_right=-1,
-            m_block_size=tile_m, n_block_size=tile_n, pack_gqa=False,
+            tile_mn=(tile_m, tile_n), pack_gqa=False,
             mask_mod=mask_mod_cute, block_sparse_tensors=block_sparse_fwd,
             return_lse=True,
         )
@@ -1343,7 +1340,7 @@ def test_gqa_expand_stride_zero_bug():
         q=q, k=k, v=v, out=out, lse=lse,
         softmax_scale=softmax_scale,
         causal=True,
-        m_block_size=128, n_block_size=128,
+        tile_mn=(128, 128),
         return_lse=True,
     )
     out_fwd, lse_fwd = out_tuple[0], out_tuple[1]
@@ -1459,7 +1456,7 @@ def test_persistent_blocksparse_empty_tiles():
         causal=False, softcap=None,
         window_size_left=None, window_size_right=None,
         learnable_sink=None,
-        m_block_size=tile_m, n_block_size=tile_n,
+        tile_mn=(tile_m, tile_n),
         pack_gqa=False, _arch=None,
         score_mod=None, mask_mod=mask_mod_cute,
         block_sparse_tensors=block_sparse_mask_fwd,

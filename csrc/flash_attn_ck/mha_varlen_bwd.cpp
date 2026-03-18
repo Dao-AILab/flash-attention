@@ -9,13 +9,27 @@
 
 fmha_bwd_traits get_ck_fmha_varlen_bwd_traits(const mask_info &mask,
                                               std::string dtype,
+                                              int seqlen_q,
+                                              int seqlen_k,
+                                              int batch,
+                                              int max_seqlen_q,
+                                              int max_seqlen_k,
                                               int head_size,
+                                              int nhead_q,
+                                              int nhead_k,
                                               bool has_dropout,
                                               bool enable_alibi,
                                               bool deterministic)
 {
-    return fmha_bwd_traits{head_size,
-                           head_size,
+    return fmha_bwd_traits{seqlen_q,
+                           seqlen_k,
+                           batch,
+                           max_seqlen_q,
+                           max_seqlen_k,
+                           head_size, // hdim_q
+                           head_size, // hdim_k
+                           nhead_q,
+                           nhead_k,
                            dtype,
                            true, // is_group_mode
                            mask.type,
@@ -25,7 +39,6 @@ fmha_bwd_traits get_ck_fmha_varlen_bwd_traits(const mask_info &mask,
                            false, // s_randval
                            deterministic};
 }
-
 fmha_bwd_args get_ck_fmha_varlen_bwd_args(const mask_info &mask,
                                           // sizes
                                           const int b,
@@ -104,11 +117,11 @@ fmha_bwd_args get_ck_fmha_varlen_bwd_args(const mask_info &mask,
     ck_tile::index_t stride_dv = dv.stride(0);
     ck_tile::index_t nhead_stride_dv = dv.stride(1);
 
-    // dq_acc: (split, total_q, nheads, hdim)
-    ck_tile::index_t split_stride_dq_acc = dq_acc.stride(0);
-    ck_tile::index_t batch_stride_dq_acc = 0;
-    ck_tile::index_t stride_dq_acc = dq_acc.stride(1);
-    ck_tile::index_t nhead_stride_dq_acc = dq_acc.stride(2);
+    // dq_acc: (nheads, split, total_q, hdim)
+    ck_tile::long_index_t batch_stride_dq_acc = 0;
+    ck_tile::long_index_t nhead_stride_dq_acc = dq_acc.stride(0);
+    ck_tile::index_t split_stride_dq_acc = dq_acc.stride(1);
+    ck_tile::index_t stride_dq_acc = dq_acc.stride(2);
 
     float p_undrop = 1.0 - p_dropout;
 
@@ -233,7 +246,7 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
 #endif
     if (is_causal) { window_size_right = 0; }
 
-    bool is_dropout = p_dropout > 0.0;
+    const bool is_dropout = p_dropout > 0.0;
     auto stream = at::cuda::getCurrentCUDAStream().stream();
 
     auto q_dtype = q.dtype();
@@ -247,7 +260,7 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
     TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32, "cu_seqlens_q must have dtype int32");
     TORCH_CHECK(cu_seqlens_k.dtype() == torch::kInt32, "cu_seqlens_k must have dtype int32");
 
-    std::string q_dtype_str = q_dtype == torch::kFloat16 ? "fp16" : "bf16";
+    const std::string q_dtype_str = q_dtype == torch::kFloat16 ? "fp16" : "bf16";
 
     CHECK_DEVICE(q); CHECK_DEVICE(k); CHECK_DEVICE(v);
     CHECK_DEVICE(out); CHECK_DEVICE(dout); CHECK_DEVICE(softmax_lse);
@@ -330,19 +343,28 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
         dv = torch::empty_like(v);
     }
 
+    const auto traits = get_ck_fmha_varlen_bwd_traits(
+        mask,
+        q_dtype_str,
+        total_q,
+        total_k,
+        batch_size,
+        max_seqlen_q,
+        max_seqlen_k,
+        head_size,
+        num_heads,
+        num_heads_k,
+        is_dropout,
+        alibi_slopes_.has_value(),
+        deterministic);
+    fmha_bwd_launcher launcher(traits);
+    const ck_tile::index_t nsplits = launcher.dq_acc_splits;
+
     at::cuda::CUDAGuard device_guard{q.device()};
 
     auto opts = q.options();
     auto softmax_d = torch::empty({batch_size, num_heads, max_seqlen_q}, opts.dtype(at::kFloat));
-    at::Tensor dq_accum;
-
-    if (!deterministic) {
-        dq_accum = torch::zeros({1, total_q, num_heads, head_size}, opts.dtype(at::kFloat));
-    } else {
-        const ck_tile::index_t kN0 = head_size <= 128 ? 128 : 64;
-        const ck_tile::index_t nsplits = ck_tile::integer_divide_ceil(max_seqlen_k, kN0);
-        dq_accum = torch::zeros({nsplits, total_q, num_heads, head_size}, opts.dtype(at::kFloat));
-    }
+    at::Tensor dq_accum  = torch::zeros({num_heads, nsplits, total_q, head_size}, opts.dtype(at::kFloat));
 
     at::Tensor dk_expanded, dv_expanded;
     if (num_heads_k != num_heads) {  // MQA / GQA
@@ -384,9 +406,6 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
         auto rng_state_ptr = reinterpret_cast<uint64_t*>(rng_state.data_ptr());
         auto drop_seed_offset = std::make_pair(rng_state_ptr, rng_state_ptr + 1);
         ck_tile::stream_config stream_config{stream};
-
-        auto traits =
-            get_ck_fmha_varlen_bwd_traits(mask, q_dtype_str, head_size, is_dropout, alibi_slopes_.has_value(), deterministic);
 
         auto args =
             get_ck_fmha_varlen_bwd_args(

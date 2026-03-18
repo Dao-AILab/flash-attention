@@ -1,4 +1,8 @@
 *.ncu-rep
+*.sass
+*.ptx
+*.cubin
+*.plk
 .DS_store
 .vscode
 

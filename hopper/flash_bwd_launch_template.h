@@ -100,7 +100,7 @@ void run_flash_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     >;
     using AttnKernel = std::conditional_t<
         Arch >= 90,
-        flash::enable_sm90_or_later<flash::FlashAttnBwdSm90<CollectiveMainloop, CollectiveEpilogue, Scheduler>>,
+        flash::enable_sm90<flash::FlashAttnBwdSm90<CollectiveMainloop, CollectiveEpilogue, Scheduler>>,
         flash::enable_sm80_to_sm89<flash::FlashAttnBwdSm80<CollectiveMainloop, CollectiveEpilogue, Scheduler>>
     >;
 

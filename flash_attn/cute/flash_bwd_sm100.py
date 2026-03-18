@@ -8,7 +8,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute import FastDivmodDivisor
-from cutlass import Float32, Int32, const_expr
+from cutlass import Float32, Int32, Int64, const_expr
 from cutlass.utils import LayoutEnum
 from cutlass.cute.nvgpu import cpasync, tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
@@ -168,8 +168,7 @@ class FlashAttentionBackwardSm100:
             num_threads=len(self.reduce_warp_ids) * cute.arch.WARP_SIZE,
         )
         # TMEM setup
-        SM100_TMEM_CAPACITY_COLUMNS = 512
-        self.tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
+        self.tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols("sm_100")
         # self.tmem_dK_offset = 0
         # self.tmem_dV_offset = self.tmem_dK_offset + self.tile_hdim
         # self.tmem_dQ_offset = self.tmem_dV_offset + self.tile_hdimv
@@ -259,8 +258,8 @@ class FlashAttentionBackwardSm100:
         self.dQaccum_reduce_stage = self.tile_hdim // self.dQ_reduce_ncol
         self.dQaccum_reduce_stage_t2r = self.tile_hdim // self.dQ_reduce_ncol_t2r
         self.cluster_reduce_dQ = False and cute.size(self.cluster_shape_mn) > 1
-        # number of tma reduce adds for dKacc and dVacc epilogue
-        self.dK_reduce_ncol = 32
+        # number of tma reduce adds for dKacc and dVacc epilogue (must divide hdim_per_wg)
+        self.dK_reduce_ncol = math.gcd(32, self.tile_hdim // 2)
         # CTA group for MMA operations
         self.cta_group = tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
 
@@ -453,7 +452,6 @@ class FlashAttentionBackwardSm100:
         mdK: cute.Tensor,
         mdV: cute.Tensor,
         softmax_scale: Float32,
-        stream: cuda.CUstream,
         mCuSeqlensQ: Optional[cute.Tensor] = None,
         mCuSeqlensK: Optional[cute.Tensor] = None,
         mSeqUsedQ: Optional[cute.Tensor] = None,
@@ -467,6 +465,8 @@ class FlashAttentionBackwardSm100:
         aux_tensors: Optional[list] = None,
         # Block-sparse tensors (Q direction - for iterating m_blocks per n_block):
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
+        stream: cuda.CUstream = None,
     ):
         self.q_dtype = mQ.element_type
         self.k_dtype = mK.element_type
@@ -782,7 +782,7 @@ class FlashAttentionBackwardSm100:
                     cutlass.Int64, self.dQaccum_reduce_stage // 2
                 ]
                 tmem_holding_buf: Int32
-                tmem_dealloc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 1]
+                tmem_dealloc_mbar_ptr: cutlass.Int64
 
                 # 2-CTA
                 Qt_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.Q_stage]
@@ -790,7 +790,6 @@ class FlashAttentionBackwardSm100:
                 dS_cluster_empty_mbar_ptr: cutlass.Int64
                 dS_cluster_full_mbar_ptr: cutlass.Int64
                 dS_cluster_leader_mbar_ptr: cutlass.Int64
-                tmem_cluster_mbar_ptr: cutlass.Int64
                 dQaccum_empty_mbar_ptr: cutlass.Int64
 
                 sQ: cute.struct.Align[
@@ -862,7 +861,7 @@ class FlashAttentionBackwardSm100:
                     cutlass.Int64, self.dQaccum_reduce_stage // 2
                 ]
                 tmem_holding_buf: Int32
-                tmem_dealloc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 1]
+                tmem_dealloc_mbar_ptr: Int64
 
                 sQ: cute.struct.Align[
                     cute.struct.MemRange[cute.Uint8, sQ_alloc_bytes],
@@ -1107,31 +1106,19 @@ class FlashAttentionBackwardSm100:
         dQ_cluster_full_mbar_ptr = storage.dQ_cluster_full_mbar_ptr.data_ptr()
         dQ_cluster_empty_mbar_ptr = storage.dQ_cluster_empty_mbar_ptr.data_ptr()
 
-        tmem_dealloc_mbar_ptr = storage.tmem_dealloc_mbar_ptr.data_ptr()
-
         if const_expr(self.use_2cta_instrs):
             dS_cluster_full_mbar_ptr = storage.dS_cluster_full_mbar_ptr
             dS_cluster_empty_mbar_ptr = storage.dS_cluster_empty_mbar_ptr
             dS_cluster_leader_mbar_ptr = storage.dS_cluster_leader_mbar_ptr
-            tmem_cluster_mbar_ptr = storage.tmem_cluster_mbar_ptr
             dQaccum_empty_mbar_ptr = storage.dQaccum_empty_mbar_ptr
         else:
             dS_cluster_full_mbar_ptr = None
             dS_cluster_empty_mbar_ptr = None
             dS_cluster_leader_mbar_ptr = None
-            tmem_cluster_mbar_ptr = None
             dQaccum_empty_mbar_ptr = None
 
         # Barrier initialization
-        if warp_idx == 1:
-            cute.arch.mbarrier_init(
-                tmem_dealloc_mbar_ptr, cute.arch.WARP_SIZE * (len(self.compute_warp_ids))
-            )
         if const_expr(self.use_2cta_instrs):
-            if warp_idx == 1:
-                cute.arch.mbarrier_init(
-                    tmem_cluster_mbar_ptr, cute.arch.WARP_SIZE * len([self.mma_warp_id])
-                )
             if const_expr(self.tile_hdim == 192):
                 if warp_idx == 2:
                     cute.arch.mbarrier_init(
@@ -1148,6 +1135,19 @@ class FlashAttentionBackwardSm100:
                 for i in range(self.dQaccum_reduce_stage // 2):
                     cute.arch.mbarrier_init(dQ_cluster_full_mbar_ptr + i, 1)
                     cute.arch.mbarrier_init(dQ_cluster_empty_mbar_ptr + i, 1)
+
+        tmem_alloc_barrier = cutlass.pipeline.NamedBarrier(
+            barrier_id=int(NamedBarrierBwdSm100.TmemPtr),
+            num_threads=cute.arch.WARP_SIZE
+            * len((self.mma_warp_id, *self.compute_warp_ids, *self.reduce_warp_ids)),
+        )
+        tmem = cutlass.utils.TmemAllocator(
+            storage.tmem_holding_buf,
+            barrier_for_retrieve=tmem_alloc_barrier,
+            allocator_warp_id=self.mma_warp_id,
+            is_two_cta=self.use_2cta_instrs,
+            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr,
+        )
 
         # UMMA producers and AsyncThread consumers
         pipeline_producer_group_MMA_AsyncThread = cutlass.pipeline.CooperativeGroup(
@@ -1424,8 +1424,10 @@ class FlashAttentionBackwardSm100:
         #  RELAY
         # (14)
         if warp_idx == self.relay_warp_id:
+            cute.arch.setmaxregister_decrease(
+                self.num_regs_mma if self.use_2cta_instrs else self.num_regs_empty
+            )
             if const_expr(self.use_2cta_instrs):
-                cute.arch.setmaxregister_decrease(self.num_regs_mma)
                 self.relay(
                     dS_cluster_full_mbar_ptr,
                     dS_cluster_empty_mbar_ptr,
@@ -1435,8 +1437,6 @@ class FlashAttentionBackwardSm100:
                     SeqlenInfoCls,
                     TileSchedulerCls,
                 )
-            else:
-                cute.arch.setmaxregister_decrease(self.num_regs_empty)
 
         #  LOAD
         # (13)
@@ -1494,11 +1494,9 @@ class FlashAttentionBackwardSm100:
             cute.arch.setmaxregister_decrease(self.num_regs_mma)
 
             # Alloc tmem buffer
-            tmem_alloc_cols = Int32(self.tmem_alloc_cols)
-            cute.arch.alloc_tmem(
-                tmem_alloc_cols, storage.tmem_holding_buf, is_two_cta=self.use_2cta_instrs
-            )
-            cute.arch.sync_warp()
+            tmem.allocate(self.tmem_alloc_cols)
+            tmem.wait_for_alloc()
+            tmem_ptr = tmem.retrieve_ptr(Float32)
 
             self.mma(
                 tiled_mma_S,
@@ -1540,24 +1538,17 @@ class FlashAttentionBackwardSm100:
                 is_leader_cta,
                 blocksparse_tensors,
             )
-            cute.arch.relinquish_tmem_alloc_permit(is_two_cta=self.use_2cta_instrs)
-            tmem_ptr = cute.arch.retrieve_tmem_ptr(
-                Float32, alignment=16, ptr_to_buffer_holding_addr=storage.tmem_holding_buf
-            )
-            cute.arch.mbarrier_wait(tmem_dealloc_mbar_ptr, 0)
-
-            # TODO: might not need this ???
-            if const_expr(self.use_2cta_instrs):
-                cute.arch.mbarrier_arrive(tmem_cluster_mbar_ptr, cta_rank_in_cluster ^ 1)
-                cute.arch.mbarrier_wait(tmem_cluster_mbar_ptr, 0)
-
-            tmem_alloc_cols = Int32(self.tmem_alloc_cols)
-            cute.arch.dealloc_tmem(tmem_ptr, tmem_alloc_cols, is_two_cta=self.use_2cta_instrs)
+            # Dealloc the tensor memory buffer
+            tmem.relinquish_alloc_permit()
+            tmem_alloc_barrier.arrive_and_wait()
+            tmem.free(tmem_ptr)
 
         # Compute
         # (4, 5, 6, 7, 8, 9, 10, 11) --> 8 warps
         if warp_idx >= self.compute_warp_ids[0] and warp_idx <= self.compute_warp_ids[-1]:
             cute.arch.setmaxregister_increase(self.num_regs_compute)  # 8 warps
+            tmem.wait_for_alloc()
+            tmem_ptr = tmem.retrieve_ptr(Float32)
             self.compute_loop(
                 thr_mma_S,
                 thr_mma_dP,
@@ -1601,12 +1592,14 @@ class FlashAttentionBackwardSm100:
                 fastdiv_mods,
                 blocksparse_tensors,
             )
-            cute.arch.mbarrier_arrive(tmem_dealloc_mbar_ptr)
+            tmem_alloc_barrier.arrive()
 
         # Reduce
         # (0, 1, 2, 3) - dQ
         if warp_idx >= self.reduce_warp_ids[0] and warp_idx <= self.reduce_warp_ids[-1]:
             cute.arch.setmaxregister_increase(self.num_regs_reduce)
+            tmem.wait_for_alloc()
+            tmem_ptr = tmem.retrieve_ptr(Float32)
             self.dQacc_reduce(
                 mdQaccum,
                 sdQaccum,
@@ -1620,6 +1613,7 @@ class FlashAttentionBackwardSm100:
                 mdQ_semaphore,
                 blocksparse_tensors,
             )
+            tmem_alloc_barrier.arrive()
 
         return
 
@@ -3138,12 +3132,15 @@ class FlashAttentionBackwardSm100:
                     )
 
                 cute.arch.fence_view_async_tmem_store()
+                cute.arch.fence_view_async_shared()
                 self.compute_sync_barrier.arrive_and_wait()
                 if const_expr(not self.tile_hdim == 192):
                     # Signal tmem store P completion with pipeline_S_P
                     with cute.arch.elect_one():
                         pipeline_S_P.consumer_release(consumer_state_S_P_dP)
                         # pipeline_S_P.sync_object_empty.arrive(0, pipeline_S_P.consumer_mask)
+                # Normally we'd need syncwarp here since only 1 thread will signal in
+                # consumer_release, but we already have the self.compute_sync_barrier before this
                 pipeline_LSE.consumer_release(consumer_state_LSE)
                 consumer_state_LSE.advance()
                 # ---------------------------------------------
@@ -3254,6 +3251,8 @@ class FlashAttentionBackwardSm100:
 
                 cute.arch.fence_view_async_shared()
                 self.compute_sync_barrier.arrive_and_wait()
+                # Normally we'd need syncwarp here since only 1 thread will signal in
+                # consumer_release, but we already have the self.compute_sync_barrier before this
                 pipeline_dPsum.consumer_release(consumer_state_dPsum)
                 consumer_state_dPsum.advance()
                 # when 2cta hdim 128, pipeline_dS also signals S tmem load completion so is deferred
@@ -3651,6 +3650,9 @@ class FlashAttentionBackwardSm100:
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
 
+        if const_expr(not self.deterministic):
+            cute.arch.cp_async_bulk_wait_group(0, read=True)
+
     @cute.jit
     def epilogue_dKV(
         self,
@@ -3885,7 +3887,7 @@ class FlashAttentionBackwardSm100:
             )
 
         tmem_load_atom = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), Float32
+            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(self.dK_reduce_ncol)), Float32
         )
 
         read_flag = const_expr(not deterministic_KV)
