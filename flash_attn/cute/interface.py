@@ -449,11 +449,7 @@ def _flash_attn_fwd(
     )
 
     # In fake mode (CPU-only compilation), use a fake stream placeholder.
-    current_stream = (
-        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-        if is_fake_mode()
-        else cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    )
+    current_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
     # SM80/SM120: uses SM80 MMA, 128 threads (4 warps)
     if arch // 10 in [8, 12]:
@@ -771,7 +767,6 @@ def _flash_attn_fwd(
             o_tensor,
             lse_tensor,
             softmax_scale,
-            current_stream,
             cu_seqlens_q_tensor,
             cu_seqlens_k_tensor,
             seqused_q_tensor,
@@ -782,6 +777,7 @@ def _flash_attn_fwd(
             learnable_sink_tensor,
             sparse_tensors,
             cute_aux_tensors,
+            current_stream,
             options="--enable-tvm-ffi",
         )
 
@@ -797,7 +793,6 @@ def _flash_attn_fwd(
             out.detach() if not is_split_kv else out_partial,
             lse_partial if is_split_kv else lse,
             softmax_scale,
-            current_stream,
             cu_seqlens_q,
             cu_seqlens_k,
             seqused_q,
@@ -1253,11 +1248,7 @@ def _flash_attn_bwd(
             )
 
     dtype = torch2cute_dtype_map[q.dtype]
-    current_stream = (
-        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-        if is_fake_mode()
-        else cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    )
+    current_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
     if deterministic:
         dQ_semaphore = torch.zeros(batch_size, num_head, seqlen_q_rounded // m_block_size, cluster_size, dtype=torch.int32, device=device)
@@ -1489,7 +1480,6 @@ def _flash_attn_bwd(
             dk_tensor if not dKV_postprocess else dk_accum_tensor,
             dv_tensor if not dKV_postprocess else dv_accum_tensor,
             softmax_scale,
-            current_stream,
             cu_seqlens_q_tensor,
             cu_seqlens_k_tensor,
             seqused_q_tensor,
@@ -1502,6 +1492,7 @@ def _flash_attn_bwd(
             dV_semaphore_tensor,
             cute_aux_tensors,
             sparse_tensors_compile,
+            current_stream,
             options="--enable-tvm-ffi",
         )
     if not is_fake_mode():
@@ -1516,7 +1507,6 @@ def _flash_attn_bwd(
             dk if not dKV_postprocess else dk_accum,
             dv if not dKV_postprocess else dv_accum,
             softmax_scale,
-            current_stream,
             cu_seqlens_q,
             cu_seqlens_k,
             seqused_q,
