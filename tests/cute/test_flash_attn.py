@@ -58,7 +58,7 @@ VERBOSE = True
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128])
 # @pytest.mark.parametrize("d", [64, 96, 128, 192])
 # @pytest.mark.parametrize("d", [128, 192])
-@pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("d", [64, 128, 192])
 # @pytest.mark.parametrize("d", [128])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
@@ -289,8 +289,6 @@ def test_flash_attn_output(
             # TODO: SM90 backward pass does not support local attention yet
             if IS_SM90 and local:
                 pytest.xfail("SM90 backward: local attention not supported yet")
-            if d == 192 and local:
-                pytest.xfail("hdim 192 backward: local attention not supported yet")
             g = torch.randn_like(out)
             # do_o = ((g.float() * out.float()).sum(-1)).transpose(1, 2)
             dq, dk, dv = torch.autograd.grad(out, (q, k, v), g)
@@ -389,7 +387,7 @@ def test_flash_attn_output(
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128])
 # @pytest.mark.parametrize("d", [64, 96, 128])
 # @pytest.mark.parametrize("d", [128, 192])
-@pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("d", [64, 128, 192])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -713,8 +711,6 @@ def test_flash_attn_varlen_output(
             and not IS_SM90
             # and False
         ):
-            if d == 192 and local:
-                pytest.xfail("hdim 192 backward: local attention not supported yet")
             g_unpad = torch.randn_like(out_unpad)
             # do_o = ((g_unpad.float() * out_unpad.float()).sum(-1)).transpose(-1, -2)
             # import flash_attn_3_cuda

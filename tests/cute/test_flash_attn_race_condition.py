@@ -252,8 +252,6 @@ def test_flash_attn_output(
                 pytest.xfail("SM90 backward: GQA/MQA has tensor layout issue (qhead_per_kvhead > 1)")
             if IS_SM90 and local:
                 pytest.xfail("SM90 backward: local attention not supported yet")
-            if d == 192 and local:
-                pytest.xfail("hdim 192 backward: local attention not supported yet")
             g = torch.randn_like(out)
             # do_o = ((g.float() * out.float()).sum(-1)).transpose(1, 2)
             dq, dk, dv = torch.autograd.grad(out, (q, k, v), g)
@@ -655,8 +653,6 @@ def test_flash_attn_varlen_output(
             and not is_sm90
             # and False
         ):
-            if d == 192 and local:
-                pytest.xfail("hdim 192 backward: local attention not supported yet")
             g_unpad = torch.randn_like(out_unpad)
             # do_o = ((g_unpad.float() * out_unpad.float()).sum(-1)).transpose(-1, -2)
             # import flash_attn_3_cuda
