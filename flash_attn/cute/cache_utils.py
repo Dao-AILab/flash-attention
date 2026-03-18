@@ -7,7 +7,6 @@ import pickle
 import sys
 import tempfile
 import time
-from distutils.ccompiler import CCompiler, new_compiler
 from functools import lru_cache
 from getpass import getuser
 from pathlib import Path
@@ -32,8 +31,10 @@ CompileKeyType: TypeAlias = tuple[Hashable, ...]
 CallableFunction: TypeAlias = JitCompiledFunction | tvm_ffi.Function
 
 logger = logging.getLogger(__name__)
-logger.addHandler(logging.StreamHandler())
-logger.setLevel(logging.WARNING)
+_handler = logging.StreamHandler()
+_handler.setFormatter(logging.Formatter("%(asctime)s.%(msecs)03d %(levelname)s %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+logger.addHandler(_handler)
+logger.setLevel(logging.DEBUG)
 
 
 # Enable cache via `FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1`
@@ -185,8 +186,6 @@ class JITPersistentCache(JITCache):
     EXPORT_FUNCTION_PREFIX = "func"
     LOCK_TIMEOUT_SECONDS = 15
 
-    _compiler: CCompiler | None = None
-
     def __init__(self, cache_path: Path):
         super().__init__()
         cache_path.mkdir(parents=True, exist_ok=True)
@@ -215,16 +214,16 @@ class JITPersistentCache(JITCache):
         Holds a shared lock during loading to prevent concurrent writes.
         """
         sha256_hex = self._key_to_hash(key)
-        so_path = self.cache_path / f"{sha256_hex}.so"
+        obj_path = self.cache_path / f"{sha256_hex}.o"
         with FileLock(
             self._lock_path(sha256_hex),
             exclusive=False,
             timeout=self.LOCK_TIMEOUT_SECONDS,
             label=sha256_hex,
         ):
-            if so_path.exists():
-                logger.debug("Loading compiled function from disk: %s", so_path)
-                m = cute.runtime.load_module(str(so_path), enable_tvm_ffi=True)
+            if obj_path.exists():
+                logger.debug("Loading compiled function from disk: %s", obj_path)
+                m = cute.runtime.load_module(str(obj_path), enable_tvm_ffi=True)
                 fn = getattr(m, self.EXPORT_FUNCTION_PREFIX)
                 JITCache.__setitem__(self, key, fn)
                 return True
@@ -241,25 +240,17 @@ class JITPersistentCache(JITCache):
             timeout=self.LOCK_TIMEOUT_SECONDS,
             label=sha256_hex,
         ):
-            so_path = self.cache_path / f"{sha256_hex}.so"
-            if so_path.exists():
-                # Another process already exported.
-                logger.debug("Skipping export, already on disk: %s", so_path)
-                return
             obj_path = self.cache_path / f"{sha256_hex}.o"
-            logger.debug("Exporting compiled function to disk: %s", so_path)
+            if obj_path.exists():
+                # Another process already exported.
+                logger.debug("Skipping export, already on disk: %s", obj_path)
+                return
+            logger.debug("Exporting compiled function to disk: %s", obj_path)
             fn.export_to_c(
                 object_file_path=str(obj_path),
                 function_name=self.EXPORT_FUNCTION_PREFIX,
             )
-            # TODO: as of cutedsl 4.4.0, `export_to_c` only supports exporting
-            # "relocatable" .o files. But tvm_ffi expects "shared library" .so
-            # files. Link ourselves to workaround.
-            if JITPersistentCache._compiler is None:
-                JITPersistentCache._compiler = new_compiler()
-            JITPersistentCache._compiler.link_shared_object([str(obj_path)], str(so_path))
-            obj_path.unlink()
-            logger.debug("Successfully exported compiled function to disk: %s", so_path)
+            logger.debug("Successfully exported compiled function to disk: %s", obj_path)
 
     def _key_to_hash(self, key: CompileKeyType) -> str:
         return hashlib.sha256(pickle.dumps(key)).hexdigest()
