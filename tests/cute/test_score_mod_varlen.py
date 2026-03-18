@@ -65,6 +65,7 @@ from score_mod_definitions import (
 )
 
 IS_SM90 = torch.cuda.get_device_capability()[0] == 9
+IS_SM100 = torch.cuda.get_device_capability()[0] == 10
 
 # =============================================================================
 # Test pairs
@@ -172,7 +173,7 @@ SEQLEN_CONFIGS = [
     ([1, 1, 1], [256 * 1024] * 3),
 ]
 
-VEC_SIZES_TO_CHECK_EQUALITY = [1, 2, 4]
+VEC_SIZES_TO_CHECK_EQUALITY = [1, 2, 4] if IS_SM100 else [1, 2]
 
 # =============================================================================
 # Helper functions
@@ -580,23 +581,17 @@ def test_varlen_with_score_mod_vectorized(
 
     for vec_size in VEC_SIZES_TO_CHECK_EQUALITY:
         cute_vectorized_score_mod.__vec_size__ = vec_size
-        try:
-            out = run_cute_flash(
-                q,
-                k,
-                v,
-                cute_vectorized_score_mod,
-                aux_tensors=aux_tensors,
-                pack_gqa=pack_gqa,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
-            )
-
-            assert torch.equal(out, out_ref)
-        except ValueError as e:
-            print(f"vec_size {vec_size} unable to run, {e}")
-        finally:
-            cute_vectorized_score_mod.__vec_size__ = 1
+        out = run_cute_flash(
+            q,
+            k,
+            v,
+            cute_vectorized_score_mod,
+            aux_tensors=aux_tensors,
+            pack_gqa=pack_gqa,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+        )
+        assert torch.equal(out, out_ref)
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("varlen_q", [True, False])
