@@ -28,6 +28,9 @@ class PagedKVManager(ParamsBase):
     head_dim_padded: cutlass.Constexpr[Int32]
     head_dim_v_padded: cutlass.Constexpr[Int32]
 
+    arch: cutlass.Constexpr[Int32]
+    v_gmem_transposed: cutlass.Constexpr[bool]
+
     gmem_threads_per_row: cutlass.Constexpr[Int32]
     page_entry_per_thread: Int32
     async_copy_elems: Int32
@@ -55,7 +58,11 @@ class PagedKVManager(ParamsBase):
         head_dim_v_padded: cutlass.Constexpr[Int32],
         num_threads: cutlass.Constexpr[Int32],
         dtype: Type[cutlass.Numeric],
+        arch: cutlass.Constexpr[int] = 100,
     ):
+        # SM100 transposes V in gmem to (dv, page_size, num_pages);
+        # SM90 keeps V as (page_size, dv, num_pages), same layout as K.
+        v_gmem_transposed = arch != 90
         universal_copy_bits = 128
         async_copy_elems = universal_copy_bits // dtype.width
         dtype_bytes = dtype.width // 8
@@ -97,7 +104,8 @@ class PagedKVManager(ParamsBase):
         else:
             cV = cute.make_identity_tensor((n_block_size, head_dim_v_padded))
             tVcV = gmem_thr_copy_KV.partition_S(cV)
-            tVpV = utils.predicate_k(tVcV, limit=mV_paged.shape[0])
+            # When V is transposed in gmem, dv is shape[0]; otherwise dv is shape[1] (same as K)
+            tVpV = utils.predicate_k(tVcV, limit=mV_paged.shape[0 if v_gmem_transposed else 1])
 
         return PagedKVManager(
             mPageTable,
@@ -111,6 +119,8 @@ class PagedKVManager(ParamsBase):
             num_threads,
             head_dim_padded,
             head_dim_v_padded,
+            arch,
+            v_gmem_transposed,
             gmem_threads_per_row,
             page_entry_per_thread,
             async_copy_elems,
@@ -146,13 +156,17 @@ class PagedKVManager(ParamsBase):
     @cute.jit
     def compute_X_ptr(self, K_or_V: str):
         tPrXPtr = cute.make_rmem_tensor((self.page_entry_per_thread,), cutlass.Int64)
+        mX = self.mK_paged if const_expr(K_or_V == "K") else self.mV_paged
+        # K is always (page_size, d, num_pages). V matches K when not transposed,
+        # but is (dv, page_size, num_pages) when transposed (SM100).
+        transposed = const_expr(K_or_V == "V" and self.v_gmem_transposed)
         for i in cutlass.range(self.page_entry_per_thread, unroll=1):
             page = self.tPrPage[i]
             page_offset = self.tPrPageOffset[i]
-            if const_expr(K_or_V == "K"):
-                tPrXPtr[i] = utils.elem_pointer(self.mK_paged, (page_offset, 0, page)).toint()
+            if const_expr(transposed):
+                tPrXPtr[i] = utils.elem_pointer(mX, (0, page_offset, page)).toint()
             else:
-                tPrXPtr[i] = utils.elem_pointer(self.mV_paged, (0, page_offset, page)).toint()
+                tPrXPtr[i] = utils.elem_pointer(mX, (page_offset, 0, page)).toint()
         return tPrXPtr
 
     @cute.jit
@@ -161,18 +175,24 @@ class PagedKVManager(ParamsBase):
 
         tPrXPtr = self.compute_X_ptr(K_or_V)
 
-        # Finesse sX layout to be (M, N).
-        sX_pi = cute.make_tensor(
-            sX.iterator,
-            cute.make_layout(
-                (sX.shape[0][0], (sX.shape[0][1], sX.shape[2])),
-                stride=(sX.stride[0][0], (sX.stride[0][1], sX.stride[2])),
-            ),
-        )
+        if const_expr(self.arch == 90):
+            # SM90: sX is already stage-sliced by caller (sK[None, None, stage]).
+            # Flatten hierarchical modes to get (n_block_size, head_dim).
+            sX_pi = cute.group_modes(sX, 0, 1)
+            # SM90 does NOT transpose V here (it's transposed via utils.transpose_view before MMA)
+        else:
+            # SM100: Finesse sX layout to be (M, N).
+            sX_pi = cute.make_tensor(
+                sX.iterator,
+                cute.make_layout(
+                    (sX.shape[0][0], (sX.shape[0][1], sX.shape[2])),
+                    stride=(sX.stride[0][0], (sX.stride[0][1], sX.stride[2])),
+                ),
+            )
 
-        if const_expr(K_or_V == "V"):
-            # Need to transpose V
-            sX_pi = cute.make_tensor(sX_pi.iterator, cute.select(sX_pi.layout, mode=[1, 0]))
+            if const_expr(K_or_V == "V"):
+                # Transpose smem V to match transposed gmem layout
+                sX_pi = cute.make_tensor(sX_pi.iterator, cute.select(sX_pi.layout, mode=[1, 0]))
 
         head_dim = self.head_dim_v_padded if const_expr(K_or_V == "V") else self.head_dim_padded
         cX = cute.make_identity_tensor((self.n_block_size, head_dim))
