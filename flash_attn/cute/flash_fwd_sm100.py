@@ -2676,7 +2676,10 @@ class FlashAttentionForwardSm100:
         else:
             assert paged_kv_manager is not None
             assert extra_tx_count is None
-            paged_kv_manager.load_KV(block, sX[None, None, None, stage], K_or_V)
+            sX_cur = sX[None, None, None, stage]
+            if const_expr(self.uneven_kv_smem):
+                sX_cur = self.offset_kv_smem(sX_cur, stage, phase ^ 1)
+            paged_kv_manager.load_KV(block, sX_cur, K_or_V)
             cute.arch.cp_async_commit_group()
             pipeline_kv.sync_object_full.arrive_cp_async_mbarrier(stage)
 
@@ -2687,6 +2690,9 @@ class FlashAttentionForwardSm100:
             # (smem_large + smem_small) // 2. So for stage == 1, move right by offset if
             # phase == 0, or left by offset if phase == 1.
             offset = 0 if stage != 1 else self.uneven_kv_smem_offset * (1 - 2 * phase)
+            # Hint that the offset is 128-bit aligned so that
+            # ptr + offset preserves the alignment needed by cp.async.
+            offset = cute.assume(offset, divby=128 // self.k_dtype.width)
             return cute.make_tensor(sX.iterator + offset, sX.layout)
         else:
             return sX
