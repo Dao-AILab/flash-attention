@@ -225,6 +225,51 @@ class PipelineTmaAsync(PipelineTmaAsyncOg):
             tx_count = self.sync_object_full.tx_count + extra_tx_count
             self.sync_object_full.arrive_and_expect_tx(state.index, tx_count, loc=loc, ip=ip)
 
+    @dsl_user_op
+    def producer_acquire_w_index_phase(
+        self,
+        index: Int32,
+        phase: Int32,
+        try_acquire_token: Optional[Boolean] = None,
+        *,
+        loc=None,
+        ip=None,
+    ):
+        if_generate(
+            try_acquire_token is None or try_acquire_token == 0,
+            lambda: self.sync_object_empty.wait(index, phase, loc=loc, ip=ip),
+            loc=loc,
+            ip=ip,
+        )
+        self.sync_object_full.arrive(index, self.producer_mask, loc=loc, ip=ip)
+
+    @dsl_user_op
+    def consumer_wait_w_index_phase(
+        self,
+        index: Int32,
+        phase: Int32,
+        try_wait_token: Optional[Boolean] = None,
+        *,
+        loc=None,
+        ip=None,
+    ):
+        if_generate(
+            try_wait_token is None or try_wait_token == 0,
+            lambda: self.sync_object_full.wait(index, phase, loc=loc, ip=ip),
+            loc=loc,
+            ip=ip,
+        )
+
+    @dsl_user_op
+    def consumer_release_w_index(self, index: Int32, *, loc=None, ip=None):
+        """
+        TMA consumer release conditionally signals the empty buffer to the producer.
+        """
+        if_generate(
+            self.is_signalling_thread,
+            lambda: self.sync_object_empty.arrive(index, self.consumer_mask, loc=loc, ip=ip),
+        )
+
 
 @dataclass(frozen=True)
 class PipelineTmaUmma(PipelineTmaUmmaOg):

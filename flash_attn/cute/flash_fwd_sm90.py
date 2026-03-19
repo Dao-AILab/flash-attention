@@ -13,6 +13,9 @@ from cutlass import Float32, Int32, const_expr
 from cutlass.cute.nvgpu import cpasync, warpgroup
 from cutlass.utils import LayoutEnum
 import cutlass.utils.hopper_helpers as sm90_utils_basic
+from cutlass import pipeline
+from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
+from cutlass.base_dsl.arch import Arch
 
 from quack import copy_utils
 from quack import layout_utils
@@ -29,7 +32,7 @@ from flash_attn.cute.block_sparse_utils import (
     produce_block_sparse_loads,
     consume_block_sparse_loads,
 )
-from flash_attn.cute import pipeline
+from flash_attn.cute import pipeline as pipeline_custom
 from flash_attn.cute.pack_gqa import PackGQA, pack_gqa_layout
 from flash_attn.cute.paged_kv import PagedKVManager
 from flash_attn.cute.named_barrier import NamedBarrierFwd
@@ -46,8 +49,6 @@ from flash_attn.cute.flash_fwd import FlashAttentionForwardBase
 
 
 class FlashAttentionForwardSm90(FlashAttentionForwardBase):
-    arch = 90
-
     def __init__(
         self,
         *args,
@@ -64,6 +65,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         assert self.use_tma_KV or not (self.check_hdim_oob or self.check_hdim_v_oob), (
             "Paged KV does not support irregular head dim"
         )
+        self.cluster_shape_mn = (1, 1)
+        assert self.arch >= Arch.sm_90 and self.arch <= Arch.sm_90a, "Only SM 9.x is supported"
 
     def _get_smem_layout_atom(self):
         sQ_layout_atom = warpgroup.make_smem_layout_atom(
@@ -124,14 +127,14 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         sQV_struct = cute.struct.Align[cute.struct.MemRange[self.dtype, cosize_sQV], 1024]
         cosize_sP = cute.cosize(self.sP_layout) if const_expr(self.sP_layout is not None) else 0
         sP_struct = cute.struct.Align[cute.struct.MemRange[self.dtype, cosize_sP], 1024]
-        # 1 for Q, 1 for O, self.num_stages*2 for K, self.num_stages*2 for V,
-        mbar_ptr_QO_struct = cute.struct.MemRange[cutlass.Int64, 2]
+        # 1 stage * 2 for Q pipeline (full + empty), self.num_stages*2 for K, self.num_stages*2 for V,
+        mbar_ptr_Q_struct = cute.struct.MemRange[cutlass.Int64, 1 * 2]
         mbar_ptr_K_struct = cute.struct.MemRange[cutlass.Int64, self.num_stages * 2]
         mbar_ptr_V_struct = cute.struct.MemRange[cutlass.Int64, self.num_stages * 2]
 
         @cute.struct
         class SharedStorageQKV:
-            mbar_ptr: mbar_ptr_QO_struct
+            mbar_ptr_Q: mbar_ptr_Q_struct
             mbar_ptr_K: mbar_ptr_K_struct
             mbar_ptr_V: mbar_ptr_V_struct
             sV: sV_struct
@@ -141,7 +144,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
         @cute.struct
         class SharedStorageSharedQV:
-            mbar_ptr: mbar_ptr_QO_struct
+            mbar_ptr_Q: mbar_ptr_Q_struct
             mbar_ptr_K: mbar_ptr_K_struct
             mbar_ptr_V: mbar_ptr_V_struct
             sQ: sQV_struct
@@ -200,33 +203,30 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         tiled_mma_qk, tiled_mma_pv = self._get_tiled_mma()
         self.num_mma_threads = tiled_mma_qk.size
         self.num_threads_per_warp_group = 128
-        self.num_mma_warp_groups = self.num_mma_threads // self.num_threads_per_warp_group
-        self.num_threads = self.num_threads_per_warp_group * (self.num_mma_warp_groups + 1)
+        self.num_wg_mma = self.num_mma_threads // self.num_threads_per_warp_group
+        assert self.num_wg_mma in [1, 2, 3]
+        self.num_threads = self.num_threads_per_warp_group * (self.num_wg_mma + 1)
         self.num_producer_threads = 32
         self.num_Q_load_threads = self.num_mma_threads  # If not TMA_Q, MMA threads load Q
         self.num_epilogue_threads = self.num_mma_threads
-        self.num_mma_regs = (
-            256
-            if self.num_mma_warp_groups == 1
-            else (240 if self.num_mma_warp_groups == 2 else 160)
-        )
-        self.num_producer_regs = (
-            56 if self.num_mma_warp_groups == 1 else (24 if self.num_mma_warp_groups == 2 else 32)
-        )
-        # self.num_mma_regs = 232
-        # self.num_producer_regs = 40
+        self.num_mma_regs, self.num_producer_regs = {1: (256, 56), 2: (240, 24), 3: (160, 32)}[
+            self.num_wg_mma
+        ]
         self.use_block_sparsity = cutlass.const_expr(blocksparse_tensors is not None)
 
         self.use_scheduler_barrier = (
-            (self.num_mma_warp_groups >= 2 and self.tile_hdim <= 128)
+            (self.num_wg_mma >= 2 and self.tile_hdim <= 128)
             if const_expr(self.intra_wg_overlap)
-            else (self.num_mma_warp_groups == 2)
+            else (self.num_wg_mma == 2)
         )
-        self.use_tma_Q = self.arch >= 90 and not (
+        self.use_tma_Q = self.arch >= Arch.sm_90 and not (
             self.pack_gqa and self.tile_m % self.qhead_per_kvhead != 0
         )
         self.use_tma_O = (
-            self.arch >= 90 and mCuSeqlensQ is None and mSeqUsedQ is None and not self.pack_gqa
+            self.arch >= Arch.sm_90
+            and mCuSeqlensQ is None
+            and mSeqUsedQ is None
+            and not self.pack_gqa
         )
         self.rescale_O_before_gemm = self.tile_hdimv > 128 and self.intra_wg_overlap
         self._setup_attributes()
@@ -436,64 +436,68 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(SharedStorage)
 
-        # Mbarrier init
-        mbar_ptr_Q = storage.mbar_ptr.data_ptr()
-        if warp_idx == 1:
-            # if tidx < 2:
-            #     # barrierO num threads should be self.num_mma_threads
-            #     cute.arch.mbarrier_init(mbar_ptr_Q + tidx, 1 if tidx == 0 else self.num_mma_threads)
-            cute.arch.mbarrier_init(
-                mbar_ptr_Q, 1 if const_expr(self.use_tma_Q) else self.num_Q_load_threads
+        # Mbarrier / pipeline init
+        mbar_ptr_Q = storage.mbar_ptr_Q.data_ptr()
+        if const_expr(not self.use_tma_Q):
+            if warp_idx == 1:
+                cute.arch.mbarrier_init(mbar_ptr_Q, self.num_Q_load_threads)
+
+        ThreadCooperativeGroup = partial(pipeline.CooperativeGroup, pipeline.Agent.Thread)
+        tma_warp = ThreadCooperativeGroup(1)
+        load_threads = ThreadCooperativeGroup(self.num_threads_per_warp_group)
+        mma_warps = ThreadCooperativeGroup(self.num_mma_threads // cute.arch.WARP_SIZE)
+        mma_threads = ThreadCooperativeGroup(self.num_mma_threads)
+        pipeline_q = None
+        if const_expr(self.use_tma_Q):
+            pipeline_q = pipeline_custom.PipelineTmaAsync.create(
+                barrier_storage=mbar_ptr_Q,
+                num_stages=1,
+                producer_group=tma_warp,
+                consumer_group=mma_warps,
+                tx_count=self.tma_copy_bytes["Q"],
+                defer_sync=True,
             )
-            # cute.arch.mbarrier_init(mbar_ptr_Q + 1, self.num_mma_threads)
+
         # We rely on pipeline_k and pipeline_v to initialize the mbarrier fence and sync
         if const_expr(self.use_tma_KV):
             # PipelineTmaAsync: consumer_release has internal per-warp gating
             # (is_signalling_thread), so arrive count = num_consumer_warps
-            pipeline_kv_consumer_group = cutlass.pipeline.CooperativeGroup(
-                cutlass.pipeline.Agent.Thread, self.num_mma_threads // cute.arch.WARP_SIZE
-            )
-            pipeline_kv_producer_group = cutlass.pipeline.CooperativeGroup(
-                cutlass.pipeline.Agent.Thread
-            )
-            pipeline_k = pipeline.PipelineTmaAsync.create(
+            pipeline_k = pipeline_custom.PipelineTmaAsync.create(
                 barrier_storage=storage.mbar_ptr_K.data_ptr(),
                 num_stages=self.num_stages,
-                producer_group=pipeline_kv_producer_group,
-                consumer_group=pipeline_kv_consumer_group,
+                producer_group=tma_warp,
+                consumer_group=mma_warps,
                 tx_count=self.tma_copy_bytes["K"],
                 defer_sync=True,
             )
-            pipeline_v = pipeline.PipelineTmaAsync.create(
+            pipeline_v = pipeline_custom.PipelineTmaAsync.create(
                 barrier_storage=storage.mbar_ptr_V.data_ptr(),
                 num_stages=self.num_stages,
-                producer_group=pipeline_kv_producer_group,
-                consumer_group=pipeline_kv_consumer_group,
+                producer_group=tma_warp,
+                consumer_group=mma_warps,
                 tx_count=self.tma_copy_bytes["V"],
-                defer_sync=False,
+                defer_sync=True,
             )
         else:
             # PipelineAsync: no thread gating in producer_commit/consumer_release,
             # so arrive counts must equal actual thread counts
-            pipeline_kv_consumer_group = cutlass.pipeline.CooperativeGroup(
-                cutlass.pipeline.Agent.Thread, self.num_mma_threads
-            )
-            pipeline_kv_producer_group = cutlass.pipeline.CooperativeGroup(
-                cutlass.pipeline.Agent.Thread,
-                self.num_threads_per_warp_group,
-            )
-            pipeline_k = cutlass.pipeline.PipelineAsync.create(
+            pipeline_k = pipeline.PipelineAsync.create(
                 num_stages=self.num_stages,
-                producer_group=pipeline_kv_producer_group,
-                consumer_group=pipeline_kv_consumer_group,
+                producer_group=load_threads,
+                consumer_group=mma_threads,
                 barrier_storage=storage.mbar_ptr_K.data_ptr(),
+                defer_sync=True,
             )
-            pipeline_v = cutlass.pipeline.PipelineAsync.create(
+            pipeline_v = pipeline.PipelineAsync.create(
                 num_stages=self.num_stages,
-                producer_group=pipeline_kv_producer_group,
-                consumer_group=pipeline_kv_consumer_group,
+                producer_group=load_threads,
+                consumer_group=mma_threads,
                 barrier_storage=storage.mbar_ptr_V.data_ptr(),
+                defer_sync=True,
             )
+
+        # Cluster arrive after barrier init
+        pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mn, is_relaxed=True)
 
         # ///////////////////////////////////////////////////////////////////////////////
         # Get shared memory buffer
@@ -546,6 +550,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         )
         TileSchedulerCls = partial(TileScheduler.create, tile_sched_params)
 
+        # Cluster wait before starting
+        pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
+
         if warp_idx < 4:  # Producer
             cute.arch.setmaxregister_decrease(self.num_producer_regs)
             self.load(
@@ -560,7 +567,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 tma_atom_V,
                 pipeline_k,
                 pipeline_v,
-                mbar_ptr_Q,
+                pipeline_q,
                 mPageTable,
                 blocksparse_tensors,
                 block_info,
@@ -589,6 +596,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 learnable_sink,
                 pipeline_k,
                 pipeline_v,
+                pipeline_q,
                 mbar_ptr_Q,
                 gmem_tiled_copy_Q,
                 gmem_tiled_copy_O,
@@ -617,9 +625,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         tma_atom_Q: Optional[cute.CopyAtom],
         tma_atom_K: Optional[cute.CopyAtom],
         tma_atom_V: Optional[cute.CopyAtom],
-        pipeline_k: cutlass.pipeline.PipelineAsync,
-        pipeline_v: cutlass.pipeline.PipelineAsync,
-        mbar_ptr_Q: cutlass.Pointer,
+        pipeline_k: pipeline.PipelineAsync,
+        pipeline_v: pipeline.PipelineAsync,
+        pipeline_q: Optional[pipeline.PipelineAsync],
         mPageTable: Optional[cute.Tensor],
         blocksparse_tensors: Optional[BlockSparseTensors],
         block_info: BlockInfo,
@@ -635,7 +643,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         if is_load_warp:
             q_producer_phase = Int32(1)
             kv_producer_state = pipeline.make_pipeline_state(
-                cutlass.pipeline.PipelineUserType.Producer, self.num_stages
+                pipeline.PipelineUserType.Producer, self.num_stages
             )
             tile_scheduler = TileSchedulerCls()
             work_tile = tile_scheduler.initial_work_tile_info()
@@ -702,7 +710,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         self.tile_hdimv,
                         self.num_threads_per_warp_group,
                         mK.element_type,
-                        arch=self.arch,
+                        arch=self.arch.major * 10 + self.arch.minor,
                     )
 
                 load_K = partial(
@@ -741,18 +749,16 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         else None
                     )
 
-                    # First iteration: load Q on its own mbarrier, K on pipeline_k
-                    if const_expr(self.use_tma_Q):
-                        if warp_idx_in_wg == 0:
-                            with cute.arch.elect_one():
-                                cute.arch.mbarrier_arrive_and_expect_tx(
-                                    mbar_ptr_Q, self.tma_copy_bytes["Q"]
-                                )
-                            load_Q(tma_bar_ptr=mbar_ptr_Q)
+                    # First iteration: load Q on pipeline_q, K on pipeline_k
                     pipeline_k.producer_acquire(kv_producer_state)
                     if const_expr(not self.use_tma_KV):
                         paged_kv_manager.load_page_table(n_block)
                     load_K(block=n_block, producer_state=kv_producer_state, page_idx=page_idx)
+                    if const_expr(self.use_tma_Q):
+                        if warp_idx_in_wg == 0:
+                            pipeline_q.producer_acquire_w_index_phase(0, q_producer_phase)
+                            load_Q(tma_bar_ptr=pipeline_q.sync_object_full.get_barrier(0))
+                            q_producer_phase ^= 1
 
                     if const_expr(not self.intra_wg_overlap or not self.use_tma_KV):
                         pipeline_v.producer_acquire(kv_producer_state)
@@ -813,14 +819,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         kv_producer_state.advance()
                 else:
                     # Block sparsity: use TMA closures directly (not paged)
-                    # Load Q on its own mbarrier, separate from K/V pipeline
+                    # Load Q on pipeline_q, separate from K/V pipeline
                     if const_expr(self.use_tma_Q):
                         if warp_idx_in_wg == 0:
-                            with cute.arch.elect_one():
-                                cute.arch.mbarrier_arrive_and_expect_tx(
-                                    mbar_ptr_Q, self.tma_copy_bytes["Q"]
-                                )
-                            load_Q(tma_bar_ptr=mbar_ptr_Q)
+                            pipeline_q.producer_acquire_w_index_phase(0, q_producer_phase)
+                            load_Q(tma_bar_ptr=pipeline_q.sync_object_full.get_barrier(0))
+                            q_producer_phase ^= 1
                     kv_producer_state = produce_block_sparse_loads(
                         blocksparse_tensors,
                         batch_idx,
@@ -841,6 +845,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 work_tile = tile_scheduler.get_current_work()
                 # End of persistent scheduler loop
 
+            # Producer tail is only useful for cluster to avoid early exit of blocks.
+            # We only need producer_tail on V since that's the last that's loaded, we don't
+            # need it for Q (no cluster) and K.
+            pipeline_v.producer_tail(kv_producer_state)
+
     @cute.jit
     def load_KV(
         self,
@@ -848,7 +857,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         paged_kv_manager: Optional[PagedKVManager],
         sX: cute.Tensor,
         block: Int32,
-        pipeline_kv: cutlass.pipeline.PipelineAsync,
+        pipeline_kv: pipeline.PipelineAsync,
         producer_state: pipeline.PipelineState,
         K_or_V: Literal["K", "V"],
         page_idx: Optional[Int32] = None,
@@ -878,8 +887,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         sP: Optional[cute.Tensor],
         sO: cute.Tensor,
         learnable_sink: Optional[cute.Tensor],
-        pipeline_k: cutlass.pipeline.PipelineAsync,
-        pipeline_v: cutlass.pipeline.PipelineAsync,
+        pipeline_k: pipeline.PipelineAsync,
+        pipeline_v: pipeline.PipelineAsync,
+        pipeline_q: Optional[pipeline.PipelineAsync],
         mbar_ptr_Q: cutlass.Pointer,
         gmem_tiled_copy_Q: cute.TiledCopy,
         gmem_tiled_copy_O: cute.TiledCopy,
@@ -897,7 +907,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
     ):
         warp_group_idx = cute.arch.make_warp_uniform(tidx // self.num_threads_per_warp_group)
         warp_group_thread_layout = cute.make_layout(
-            self.num_mma_warp_groups, stride=self.num_threads_per_warp_group
+            self.num_wg_mma, stride=self.num_threads_per_warp_group
         )
         thr_mma_qk = tiled_mma_qk.get_slice(tidx)
         wg_mma_qk = tiled_mma_qk.get_slice(warp_group_thread_layout(warp_group_idx))
@@ -916,16 +926,19 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         # ///////////////////////////////////////////////////////////////////////////////
         # Smem copy atom tiling
         # ///////////////////////////////////////////////////////////////////////////////
-        smem_copy_atom_P = utils.get_smem_store_atom(self.arch, self.dtype)
+        smem_copy_atom_P = utils.get_smem_store_atom(
+            self.arch.major * 10 + self.arch.minor, self.dtype
+        )
         smem_thr_copy_P = cute.make_tiled_copy_C(smem_copy_atom_P, tiled_mma_qk).get_slice(tidx)
         tPsP = smem_thr_copy_P.partition_D(sP) if const_expr(sP is not None) else None
         smem_copy_params = SimpleNamespace(smem_thr_copy_P=smem_thr_copy_P, tPsP=tPsP)
 
         self.mma_init()
 
+        mma_q_consumer_phase = Int32(0)
         q_consumer_phase = Int32(0)
         kv_consumer_state = pipeline.make_pipeline_state(
-            cutlass.pipeline.PipelineUserType.Consumer, self.num_stages
+            pipeline.PipelineUserType.Consumer, self.num_stages
         )
 
         tile_scheduler = TileSchedulerCls()
@@ -1039,8 +1052,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 cute.arch.cp_async_mbarrier_arrive_noinc(mbar_ptr_Q)
 
             n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
-            cute.arch.mbarrier_wait(mbar_ptr_Q, phase=q_consumer_phase)
-            q_consumer_phase ^= 1
+            if const_expr(self.use_tma_Q):
+                pipeline_q.consumer_wait_w_index_phase(0, mma_q_consumer_phase)
+            else:
+                cute.arch.mbarrier_wait(mbar_ptr_Q, phase=q_consumer_phase)
+                q_consumer_phase ^= 1
             # For performance reason, we separate out two kinds of iterations:
             # those that need masking on S, and those that don't.
             # We need masking on S for the very last block when K and V has length not multiple of tile_n.
@@ -1200,6 +1216,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 batch_idx,
             )
 
+            # Release Q pipeline so the producer can load the next tile's Q
+            if const_expr(self.use_tma_Q):
+                pipeline_q.consumer_release_w_index(0)
+                mma_q_consumer_phase ^= 1
+
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
 
@@ -1285,12 +1306,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
     @cute.jit
     def mma_one_n_block(
         self,
-        smem_pipe_read: cutlass.pipeline.PipelineState | pipeline.PipelineStateSimple,
+        smem_pipe_read: pipeline.PipelineState | pipeline_custom.PipelineStateSimple,
         n_block: Int32,
         mma_qk_fn: Callable,
         mma_pv_fn: Callable,
-        pipeline_k: cutlass.pipeline.PipelineAsync,
-        pipeline_v: cutlass.pipeline.PipelineAsync,
+        pipeline_k: pipeline.PipelineAsync,
+        pipeline_v: pipeline.PipelineAsync,
         acc_O: cute.Tensor,
         tOrP: cute.Tensor,
         smem_copy_params: SimpleNamespace,
@@ -1347,12 +1368,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
     @cute.jit
     def mma_one_n_block_intrawg_overlap(
         self,
-        smem_pipe_read: cutlass.pipeline.PipelineState | pipeline.PipelineStateSimple,
+        smem_pipe_read: pipeline.PipelineState | pipeline_custom.PipelineStateSimple,
         n_block: Int32,
         mma_qk_fn: Callable,
         mma_pv_fn: Callable,
-        pipeline_k: cutlass.pipeline.PipelineAsync,
-        pipeline_v: cutlass.pipeline.PipelineAsync,
+        pipeline_k: pipeline.PipelineAsync,
+        pipeline_v: pipeline.PipelineAsync,
         acc_O: cute.Tensor,
         tOrP: cute.Tensor,
         smem_copy_params: SimpleNamespace,
@@ -1469,13 +1490,13 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
     def warp_scheduler_barrier_arrive(self):
         if const_expr(self.use_scheduler_barrier):
-            assert self.num_mma_warp_groups in [2, 3]
+            assert self.num_wg_mma in [2, 3]
             cur_wg = utils.canonical_warp_group_idx(sync=False) - 1
-            if const_expr(self.num_mma_warp_groups == 2):
+            if const_expr(self.num_wg_mma == 2):
                 next_wg = 1 - cur_wg
             else:
                 t = cur_wg + 1
-                next_wg = t % self.num_mma_warp_groups
+                next_wg = t % self.num_wg_mma
             cute.arch.barrier_arrive(
                 barrier_id=int(NamedBarrierFwd.WarpSchedulerWG1) + next_wg,
                 number_of_threads=2 * self.num_threads_per_warp_group,

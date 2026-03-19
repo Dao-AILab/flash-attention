@@ -17,6 +17,8 @@ import cutlass.cute as cute
 from cutlass import Constexpr, Float32, Int32, const_expr, Boolean
 from cutlass.cute.nvgpu import cpasync, warp
 import cutlass.utils as utils_basic
+from cutlass.base_dsl.arch import Arch
+from cutlass.cutlass_dsl import BaseDSL
 
 from quack import copy_utils
 from quack import layout_utils
@@ -35,7 +37,6 @@ from flash_attn.cute.tile_scheduler import SingleTileScheduler, SingleTileVarlen
 
 
 class FlashAttentionForwardBase:
-    arch: int = 80
 
     def __init__(
         self,
@@ -106,6 +107,7 @@ class FlashAttentionForwardBase:
                 f"score_mod vec_size {self.vec_size} not supported on Sm80/90/120 "
                 "due to accumulator thread ownership pattern."
             )
+        self.arch = BaseDSL._get_dsl().get_arch_enum()
 
     @staticmethod
     def can_implement(
@@ -342,7 +344,7 @@ class FlashAttentionForwardBase:
         cute.arch.barrier(
             barrier_id=int(NamedBarrierFwd.Epilogue), number_of_threads=self.num_epilogue_threads
         )
-        smem_copy_atom_O = utils.get_smem_store_atom(self.arch, self.dtype)
+        smem_copy_atom_O = utils.get_smem_store_atom(self.arch.major * 10 + self.arch.minor, self.dtype)
         smem_thr_copy_O = cute.make_tiled_copy_C(smem_copy_atom_O, tiled_mma).get_slice(tidx)
         taccOrO = smem_thr_copy_O.retile(rO)
         taccOsO = smem_thr_copy_O.partition_D(sO)
@@ -654,7 +656,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         self.num_Q_load_threads = self.num_threads
         self.num_epilogue_threads = self.num_threads
         # self.use_tma_O = self.arch >= 90 and mCuSeqlensQ is None
-        self.use_tma_O = self.arch >= 90
+        self.use_tma_O = self.arch >= Arch.sm_90
         self._setup_attributes()
         SharedStorage = self._get_shared_storage_cls()
         mQ, mK, mV, mO = [assume_tensor_aligned(t) for t in (mQ, mK, mV, mO)]
