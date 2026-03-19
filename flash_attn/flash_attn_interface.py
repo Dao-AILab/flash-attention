@@ -4,8 +4,17 @@ from typing import Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn as nn
+import os
 
-from flash_attn._backend import flash_attn_2 as flash_attn_gpu
+# isort: off
+# We need to import the CUDA kernels after importing torch
+USE_TRITON_ROCM = os.getenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", "FALSE") == "TRUE"
+if USE_TRITON_ROCM:
+    from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_2 as flash_attn_gpu
+else:
+    import flash_attn_2_cuda as flash_attn_gpu
+
+# isort: on
 
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x

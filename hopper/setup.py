@@ -37,15 +37,15 @@ PACKAGE_NAME = "flash_attn_3"
 
 BASE_WHEEL_URL = "https://github.com/Dao-AILab/flash-attention/releases/download/{tag_name}/{wheel_name}"
 
-IS_ROCM = torch.version.hip is not None
 # FORCE_BUILD: Force a fresh build locally, instead of attempting to find prebuilt wheels
 # SKIP_CUDA_BUILD: Intended to allow CI to use a simple `python setup.py sdist` run to copy over raw files, without any cuda compilation
-FORCE_BUILD = os.getenv("FLASH_ATTENTION_FORCE_BUILD", "FALSE") == "TRUE" or IS_ROCM
+FORCE_BUILD = os.getenv("FLASH_ATTENTION_FORCE_BUILD", "FALSE") == "TRUE"
 SKIP_CUDA_BUILD = os.getenv("FLASH_ATTENTION_SKIP_CUDA_BUILD", "FALSE") == "TRUE"
 # For CI, we want the option to build with C++11 ABI since the nvcr images use C++11 ABI
 FORCE_CXX11_ABI = os.getenv("FLASH_ATTENTION_FORCE_CXX11_ABI", "FALSE") == "TRUE"
-# ROCm: skip CUDA/cutlass build, route through aiter at runtime
-if IS_ROCM:
+# ROCm specific settings
+USE_TRITON_ROCM = os.getenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", "FALSE") == "TRUE"
+if USE_TRITON_ROCM:
     SKIP_CUDA_BUILD = True
 
 DISABLE_BACKWARD = os.getenv("FLASH_ATTENTION_DISABLE_BACKWARD", "FALSE") == "TRUE"
@@ -427,7 +427,7 @@ cmdclass = {}
 ext_modules = []
 # We want this even if SKIP_CUDA_BUILD because when we run python setup.py sdist we want the .hpp
 # files included in the source distribution, in case the user compiles from source.
-if not IS_ROCM:
+if not USE_TRITON_ROCM:
     subprocess.run(["git", "submodule", "update", "--init", "../csrc/cutlass"])
 
 if not SKIP_CUDA_BUILD:
@@ -734,9 +734,10 @@ setup(
     },
     python_requires=">=3.8",
     install_requires=[
+        "torch",
         "einops",
         "packaging",
         "ninja",
-    ] + ([] if IS_ROCM else ["torch"]),
+    ],
     options={"bdist_wheel": {"py_limited_api": "cp39"}},
 )
