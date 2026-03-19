@@ -27,8 +27,25 @@ from test_flash_attn import (
 
 from flash_attn.layers.rotary import apply_rotary_emb
 
+
+def is_gfx1x(device="cuda"):
+    if not torch.cuda.is_available():
+        return False
+    props = torch.cuda.get_device_properties(device)
+    name = (getattr(props, "gcnArchName", "") or getattr(props, "name", "")).lower()
+    return "gfx11" in name or "gfx12" in name
+
+
 def is_bwd_hdim_supported(d):
     return d <= 256
+
+
+def skip_deterministic_bwd(deterministic: bool) -> bool:
+    return deterministic and is_gfx1x()
+
+
+def is_bwd_supported(d, deterministic):
+    return is_bwd_hdim_supported(d) and not skip_deterministic_bwd(deterministic)
 
 
 def ck_randval_to_dropout_mask(randval, p):
@@ -143,7 +160,7 @@ def test_flash_attn_qkvpacked(seqlen, d, dropout_p, causal, local, alibi, determ
     assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item()
 
     g = torch.randn_like(out)
-    if is_bwd_hdim_supported(d):
+    if is_bwd_supported(d, deterministic):
         (dqkv,) = torch.autograd.grad(out, qkv, g)
         (dqkv_ref,) = torch.autograd.grad(out_ref, qkv, g)
         (dqkv_pt,) = torch.autograd.grad(out_pt, qkv, g)
@@ -260,7 +277,7 @@ def test_flash_attn_varlen_qkvpacked(seqlen, d, dropout_p, causal, local, alibi,
     assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item()
 
     g = torch.randn_like(out)
-    if is_bwd_hdim_supported(d):
+    if is_bwd_supported(d, deterministic):
         (dqkv_unpad,) = torch.autograd.grad(out, qkv_unpad, g)
         dqkv = dqkv_pad_fn(dqkv_unpad)
         (dqkv_ref,) = torch.autograd.grad(out_ref, qkv, g)
@@ -442,7 +459,7 @@ def test_flash_attn_output(
     assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item()
 
     g = torch.randn_like(out)
-    if is_bwd_hdim_supported(d):
+    if is_bwd_supported(d, deterministic):
         if kvpacked:
             (
                 dq,
@@ -703,7 +720,7 @@ def test_flash_attn_varlen_output(
     assert (out - out_ref).abs().max().item() <= 4 * (out_pt - out_ref).abs().max().item()
 
     g = torch.randn_like(out)
-    if is_bwd_hdim_supported(d):
+    if is_bwd_supported(d, deterministic):
         if kvpacked:
             (
                 dq_unpad,
@@ -1513,6 +1530,8 @@ def test_flash_attn_bwd_varlen_overflow(d, causal, dtype):
     ],
 )
 def test_flash_attn_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, causal, local, dtype):
+    if is_gfx1x():
+        pytest.skip("Deterministic backward not yet supported on CK backend for gfx11/gfx12")
     if (
         max(seqlen_q, seqlen_k) >= 2048
         and torch.cuda.get_device_properties("cuda").total_memory <= 16 * 2**30
@@ -1561,6 +1580,8 @@ def test_flash_attn_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, causal, loc
     ],
 )
 def test_flash_attn_varlen_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, causal, local, dtype):
+    if is_gfx1x():
+        pytest.skip("Deterministic backward not yet supported on CK backend for gfx11/gfx12")
     if (
         max(seqlen_q, seqlen_k) >= 2048
         and torch.cuda.get_device_properties("cuda").total_memory <= 16 * 2**30
@@ -1615,4 +1636,3 @@ def test_flash_attn_varlen_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, caus
         assert torch.equal(dv, dv0)
         assert torch.equal(dk, dk0)
         assert torch.equal(dq, dq0)
-
