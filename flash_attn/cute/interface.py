@@ -1060,8 +1060,7 @@ def _flash_attn_bwd(
         AtomLayoutMdQ = 1
         AtomLayoutNdKV = 1
         disable_2cta = (
-            local
-            or score_mod is not None
+            score_mod is not None
             or score_mod_bwd is not None
             or mask_mod is not None
         )

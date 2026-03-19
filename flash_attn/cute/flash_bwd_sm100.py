@@ -84,7 +84,6 @@ class FlashAttentionBackwardSm100:
         self.use_2cta_instrs = bool(
             use_2cta_instrs
             and cluster_size == 2
-            and not is_local
             and score_mod is None
             and score_mod_bwd is None
             and mask_mod is None
@@ -927,10 +926,6 @@ class FlashAttentionBackwardSm100:
             assert blocksparse_tensors is None, (
                 "2-CTA mode does not support block sparsity. "
                 "Please create kernel with use_2cta_instrs=False for block sparse attention."
-            )
-            assert window_size_left is None and window_size_right is None, (
-                "2-CTA mode does not support window attention. "
-                "Please create kernel with use_2cta_instrs=False for window attention."
             )
         # 2-CTA: 231424 and 1-CTA: 232448
         # print("SMEM: ", self.shared_storage.size_in_bytes())

@@ -297,8 +297,6 @@ def test_flash_attn_output(
             # and False
             and not ((causal or local) and seqlen_k < seqlen_q)
         ):
-            if d == 192 and local:
-                pytest.xfail("hdim 192 backward: local attention not supported yet")
             if d > 192 and IS_SM90:
                 pytest.xfail("hdim > 192 backward: SM90 not supported yet")
             if d != dv and mha_type != "mha" and IS_SM90:
@@ -405,7 +403,7 @@ def test_flash_attn_output(
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128])
 # @pytest.mark.parametrize("d", [64, 96, 128])
 # @pytest.mark.parametrize("d", [128, 192])
-@pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("d", [64, 128, 192])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -737,8 +735,6 @@ def test_flash_attn_varlen_output(
             and not has_learnable_sink
             # and False
         ):
-            if d == 192 and local:
-                pytest.xfail("hdim 192 backward: local attention not supported yet")
             if d > 192 and IS_SM90:
                 pytest.xfail("hdim > 192 backward: SM90 not supported yet")
             if d != dv and mha_type != "mha" and IS_SM90:
