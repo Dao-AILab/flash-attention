@@ -4,50 +4,32 @@
 
 #include "flash_common.hpp"
 
-#include "fmha_fwd.hpp"
+#include "mha_fwd.h"
 #include "mask.hpp"
 
-fmha_fwd_traits get_ck_fmha_fwd_traits(const mask_info &mask,
-                                       std::string dtype,
-                                       int head_size,
-                                       bool has_dropout,
-                                       bool has_lse,
-                                       bool enable_alibi)
-{
-    return fmha_fwd_traits{head_size,
-                           head_size,
-                           dtype,
-                           false, // is_group_mode
-                           true,  // is_v_rowmajor
-                           false, // has_logits_soft_cap
-                           mask.type,
-                           enable_alibi ? bias_enum::alibi : bias_enum::no_bias,
-                           has_lse,
-                           has_dropout,
-                           quant_scale_enum::no_scale}; // qscale_type
-}
-
-fmha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
-                                   bool has_dropout_randval,
-                                   const mask_info &mask,
-                                   // sizes
-                                   const int b,
-                                   const int seqlen_q,
-                                   const int seqlen_k,
-                                   const int h,
-                                   const int h_k,
-                                   const int d,
-                                   // device pointers
-                                   const at::Tensor q,
-                                   const at::Tensor k,
-                                   const at::Tensor v,
-                                   std::optional<at::Tensor> &alibi_slopes_,
-                                   at::Tensor out,
-                                   at::Tensor softmax_lse,
-                                   at::Tensor dropout_randval,
-                                   float softmax_scale,
-                                   float p_dropout,
-                                   std::pair<uint64_t*, uint64_t*> drop_seed_offset)
+aiter::mha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
+                                          bool has_dropout_randval,
+                                          const mask_info &mask,
+                                          std::string dtype,
+                                          bool enable_alibi,
+                                          // sizes
+                                          const int b,
+                                          const int seqlen_q,
+                                          const int seqlen_k,
+                                          const int h,
+                                          const int h_k,
+                                          const int d,
+                                          // device pointers
+                                          const at::Tensor q,
+                                          const at::Tensor k,
+                                          const at::Tensor v,
+                                          std::optional<at::Tensor> &alibi_slopes_,
+                                          at::Tensor out,
+                                          at::Tensor softmax_lse,
+                                          at::Tensor dropout_randval,
+                                          float softmax_scale,
+                                          float p_dropout,
+                                          std::pair<uint64_t*, uint64_t*> drop_seed_offset)
 {
     // q: (batch_size, seqlen_q, nheads, d)
     // k: (batch_size, seqlen_k, nheads_k, d)
@@ -91,59 +73,80 @@ fmha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
         stride_alibi_slopes = alibi_slopes.dim() == 2 ? alibi_slopes.stride(0) : 0;
     }
 
-    return fmha_fwd_args{q.data_ptr(),
-                         k.data_ptr(),
-                         v.data_ptr(),
-                         alibi_slopes_ptr, // bias
-                         nullptr, // q_descale_ptr
-                         nullptr, // k_descale_ptr
-                         nullptr, // v_descale_ptr
-                         has_dropout_randval ? dropout_randval.data_ptr() : nullptr,
-                         has_lse ? softmax_lse.data_ptr() : nullptr,
-                         out.data_ptr(),
-                         nullptr, // seqstart_q_ptr
-                         nullptr, // seqstart_k_ptr
-                         nullptr, // seqlen_q_ptr
-                         nullptr, // seqlen_k_ptr
-                         nullptr, // cu_seqlen_q_ptr
-                         nullptr, // cu_seqlen_k_ptr
-                         seqlen_q,
-                         seqlen_k,
-                         b,
-                         seqlen_q,      // max_seqlen_q
-                         d,             // hdim_q
-                         d,             // hdim_v
-                         h,             // nhead
-                         h_k,           // nhead_k
-                         softmax_scale, // scale_s
-                         0.0f,          // logits_soft_cap
-                         stride_q,
-                         stride_k,
-                         stride_v,
-                         stride_alibi_slopes,
-                         stride_randval,
-                         stride_o,
-                         nhead_stride_q,
-                         nhead_stride_k,
-                         nhead_stride_v,
-                         0, // nhead_stride_bias, FA without bias
-                         nhead_stride_randval,
-                         nhead_stride_lse,
-                         nhead_stride_o,
-                         batch_stride_q,
-                         batch_stride_k,
-                         batch_stride_v,
-                         0, // batch_stride_bias, FA without bias
-                         batch_stride_randval,
-                         batch_stride_lse,
-                         batch_stride_o,
-                         mask.left,
-                         mask.right,
-                         static_cast<ck_tile::index_t>(mask.type),
-                         0, // min_seqlen_q
-                         p_dropout,
-                         has_dropout_randval,
-                         drop_seed_offset};
+    return aiter::mha_fwd_args{false,  // use_asm_v3
+                               false,  // v3_api_check
+                               1,      // how_v3_bf16_cvt
+                               dtype,
+                               false,  // is_group_mode
+                               static_cast<int>(enable_alibi ? bias_enum::alibi : bias_enum::no_bias),
+                               has_lse,
+                               static_cast<int>(quant_scale_enum::no_scale),
+                               false,  // has_sink
+                               q.data_ptr(),
+                               k.data_ptr(),
+                               v.data_ptr(),
+                               alibi_slopes_ptr, // bias
+                               nullptr, // q_descale_ptr
+                               nullptr, // k_descale_ptr
+                               nullptr, // v_descale_ptr
+                               has_dropout_randval ? dropout_randval.data_ptr() : nullptr,
+                               has_lse ? softmax_lse.data_ptr() : nullptr,
+                               out.data_ptr(),
+                               nullptr, // seqstart_q_ptr
+                               nullptr, // seqstart_k_ptr
+                               nullptr, // seqlen_q_ptr
+                               nullptr, // seqlen_k_ptr
+                               nullptr, // cu_seqlen_q_ptr
+                               nullptr, // cu_seqlen_k_ptr
+                               nullptr, // block_scale_seqstart_q_ptr
+                               nullptr, // block_scale_seqstart_k_ptr
+                               nullptr, // sink_ptr
+                               seqlen_q,
+                               seqlen_k,
+                               b,
+                               seqlen_q,      // max_seqlen_q
+                               d,             // hdim_q
+                               d,             // hdim_v
+                               h,             // nhead_q
+                               h_k,           // nhead_k
+                               softmax_scale, // scale_s
+                               0.0f,          // logits_soft_cap
+                               stride_q,
+                               stride_k,
+                               stride_v,
+                               stride_alibi_slopes,
+                               stride_randval,
+                               stride_o,
+                               nhead_stride_q,
+                               nhead_stride_k,
+                               nhead_stride_v,
+                               0, // nhead_stride_bias
+                               nhead_stride_randval,
+                               nhead_stride_lse,
+                               nhead_stride_o,
+                               0, // nhead_stride_q_descale
+                               0, // nhead_stride_k_descale
+                               0, // nhead_stride_v_descale
+                               batch_stride_q,
+                               batch_stride_k,
+                               batch_stride_v,
+                               0, // batch_stride_bias
+                               batch_stride_randval,
+                               batch_stride_lse,
+                               batch_stride_o,
+                               0, // batch_stride_q_descale
+                               0, // batch_stride_k_descale
+                               0, // batch_stride_v_descale
+                               mask.left,
+                               mask.right,
+                               0, // sink_size
+                               static_cast<ck_tile::index_t>(mask.type),
+                               0, // min_seqlen_q
+                               p_dropout,
+                               has_dropout_randval,
+                               drop_seed_offset,
+                               128, // block_scale_size_q
+                               128}; // block_scale_size_kv
 }
 
 std::vector<at::Tensor>
@@ -283,20 +286,13 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
 #endif
         ck_tile::stream_config stream_config{stream};
 
-        auto traits =
-            get_ck_fmha_fwd_traits(
-                mask,
-                q_dtype_str,
-                head_size,
-                has_dropout,
-                has_lse,
-                alibi_slopes_.has_value());
-
         auto args =
             get_ck_fmha_fwd_args(
                 has_lse,
                 return_dropout_randval,
                 mask,
+                q_dtype_str,
+                alibi_slopes_.has_value(),
                 batch_size,
                 seqlen_q,
                 seqlen_k,
@@ -314,7 +310,7 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
                 p_dropout,
                 drop_seed_offset);
 
-        float t = fmha_fwd(traits, args, stream_config);
+        float t = aiter::mha_fwd(args, stream_config);
         TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd");
     }
     else {

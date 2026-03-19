@@ -213,24 +213,17 @@ ext_modules = []
 # We want this even if SKIP_CUDA_BUILD because when we run python setup.py sdist we want the .hpp
 # files included in the source distribution, in case the user compiles from source.
 if IS_ROCM:
+    if os.path.isdir(".git"):
+        subprocess.run(["git", "submodule", "update", "--init", "--recursive", "third_party/aiter"], check=True)
+    else:
+        assert os.path.isdir("third_party/aiter"), (
+            "third_party/aiter is missing, please use source distribution or git clone"
+        )
     if ROCM_BACKEND == "triton":
-        if os.path.isdir(".git"):
-            subprocess.run(["git", "submodule", "update", "--init", "third_party/aiter"], check=True)
-        else:
-            assert os.path.isdir("third_party/aiter"), (
-                "third_party/aiter is missing, please use source distribution or git clone"
-            )
         subprocess.run(
             [sys.executable, "-m", "pip", "install", "--no-build-isolation", "third_party/aiter"],
             check=True,
         )
-    elif ROCM_BACKEND == "ck":
-        if os.path.isdir(".git"):
-            subprocess.run(["git", "submodule", "update", "--init", "csrc/composable_kernel"], check=True)
-        else:
-            assert os.path.exists("csrc/composable_kernel/example/ck_tile/01_fmha/generate.py"), (
-                "csrc/composable_kernel is missing, please use source distribution or git clone"
-            )
 else:
     # CUDA: cutlass submodule
     if os.path.isdir(".git"):
@@ -390,7 +383,8 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
 
     # Skips CK C++ extension compilation if using Triton Backend
     if ROCM_BACKEND == "ck":
-        ck_dir = "csrc/composable_kernel"
+        aiter_dir = "third_party/aiter"
+        ck_dir = f"{aiter_dir}/3rdparty/composable_kernel"
 
         #use codegen get code dispatch
         if not os.path.exists("./build"):
@@ -401,6 +395,38 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
         subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd_appendkv", "--output_dir", "build", "--receipt", "2", "--optdim", optdim], check=True)
         subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd_splitkv", "--output_dir", "build", "--receipt", "2", "--optdim", optdim], check=True)
         subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "bwd", "--output_dir", "build", "--receipt", "2", "--optdim", optdim], check=True)
+
+        # Generate stub header for ASM v3 bwd configs (v3 ASM path is disabled, but header is required)
+        with open("build/asm_fmha_v3_bwd_configs.hpp", "w") as f:
+            f.write("""// Auto-generated stub - ASM v3 path is disabled
+#pragma once
+#include <unordered_map>
+#include <string>
+
+struct fmha_v3_bwdConfig {
+    std::string knl_name;
+    std::string co_name;
+    std::string arch;
+    std::string dtype;
+    int hdim_q;
+    int hdim_v;
+    int mask;
+    int atomic32;
+    int pssk;
+    int pddv;
+    int mode;
+    int bf16_cvt;
+    int ts_qo;
+    int ts;
+};
+
+using CFG = std::unordered_map<std::string, fmha_v3_bwdConfig>;
+
+static CFG cfg_fmha_bwd_odo = {};
+static CFG cfg_fmha_bwd_dqdkdv = {};
+static CFG cfg_fmha_bwd_dq_convert = {};
+static CFG cfg_fmha_bwd_dq_shuffle = {};
+""")
 
         # Check, if ATen/CUDAGeneratorImpl.h is found, otherwise use ATen/cuda/CUDAGeneratorImpl.h
         # See https://github.com/pytorch/pytorch/pull/70650
@@ -435,6 +461,12 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
             f"build/fmha_*wd*.cpp"
         )
 
+        # Aiter C++ interface sources (already .cu, added to renamed_sources below)
+        aiter_sources = [
+            f"{aiter_dir}/csrc/cpp_itfs/mha_fwd.cu",
+            f"{aiter_dir}/csrc/cpp_itfs/mha_bwd.cu",
+        ]
+
         # Check if torch is using hipify v2. Until CK is updated with HIPIFY_V2 macro,
         # we must replace the incorrect APIs.
         maybe_hipify_v2_flag = []
@@ -449,7 +481,7 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
                         "csrc/flash_attn_ck/mha_fwd_kvcache.cu",
                         "csrc/flash_attn_ck/mha_fwd.cu",
                         "csrc/flash_attn_ck/mha_varlen_bwd.cu",
-                        "csrc/flash_attn_ck/mha_varlen_fwd.cu"] + glob.glob(f"build/fmha_*wd*.cu")
+                        "csrc/flash_attn_ck/mha_varlen_fwd.cu"] + glob.glob(f"build/fmha_*wd*.cu") + aiter_sources
 
         cc_flag += ["-O3","-std=c++20",
                     "-DCK_TILE_FMHA_FWD_FAST_EXP2=1",
@@ -464,7 +496,8 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
                     "-DCK_USE_XDL",
                     "-DUSE_PROF_API=1",
                     # "-DFLASHATTENTION_DISABLE_BACKWARD",
-                    "-D__HIP_PLATFORM_HCC__=1"]
+                    "-D__HIP_PLATFORM_HCC__=1",
+                    "-DFAV2_ON=1"]
 
         cc_flag += [f"-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={os.environ.get('CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT', 3)}"]
 
@@ -488,9 +521,11 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
         }
 
         include_dirs = [
-            Path(this_dir) / "csrc" / "composable_kernel" / "include",
-            Path(this_dir) / "csrc" / "composable_kernel" / "library" / "include",
-            Path(this_dir) / "csrc" / "composable_kernel" / "example" / "ck_tile" / "01_fmha",
+            Path(this_dir) / ck_dir / "include",
+            Path(this_dir) / ck_dir / "library" / "include",
+            Path(this_dir) / ck_dir / "example" / "ck_tile" / "01_fmha",
+            Path(this_dir) / aiter_dir / "csrc" / "include",
+            Path(this_dir) / "build",
         ]
 
         ext_modules.append(
