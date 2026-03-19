@@ -33,7 +33,7 @@ from flash_attn.cute.block_sparse_utils import (
     consume_block_sparse_loads,
 )
 from flash_attn.cute import pipeline as pipeline_custom
-from flash_attn.cute.pack_gqa import PackGQA, pack_gqa_layout
+from flash_attn.cute.pack_gqa import PackGQA, pack_gqa_layout, make_packgqa_tiled_tma_atom
 from flash_attn.cute.paged_kv import PagedKVManager
 from flash_attn.cute.named_barrier import NamedBarrierFwd
 from quack.cute_dsl_utils import ParamsBase
@@ -226,7 +226,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             self.arch >= Arch.sm_90
             and mCuSeqlensQ is None
             and mSeqUsedQ is None
-            and not self.pack_gqa
+            and not (self.pack_gqa and self.tile_m % self.qhead_per_kvhead != 0)
         )
         self.rescale_O_before_gemm = self.tile_hdimv > 128 and self.intra_wg_overlap
         self._setup_attributes()
@@ -248,6 +248,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
         SharedStorage = self._get_shared_storage_cls()
 
+        mQ_og, mO_og = mQ, mO
         if const_expr(self.pack_gqa):
             nheads_kv = mK.shape[2]
             mQ = pack_gqa_layout(mQ, self.qhead_per_kvhead, nheads_kv, head_idx=2)
@@ -267,11 +268,16 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 ("V", mV, self.sV_layout),
             ]
         }
+        make_tiled_tma_atom_fn = (
+            partial(make_packgqa_tiled_tma_atom, qhead_per_kvhead=self.qhead_per_kvhead, head_idx=2)
+            if const_expr(self.pack_gqa)
+            else cpasync.make_tiled_tma_atom
+        )
         tma_atom_Q, tma_tensor_Q = None, None
         if const_expr(self.use_tma_Q):
-            tma_atom_Q, tma_tensor_Q = cpasync.make_tiled_tma_atom(
+            tma_atom_Q, tma_tensor_Q = make_tiled_tma_atom_fn(
                 gmem_tiled_copy_Q,
-                mQ,
+                mQ_og if const_expr(self.pack_gqa) else mQ,
                 self.sQ_layout,
                 (self.tile_m, self.tile_hdim),  # No mcast
             )
@@ -294,9 +300,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             )
         tma_atom_O, tma_tensor_O = None, None
         if const_expr(self.use_tma_O):
-            tma_atom_O, tma_tensor_O = cpasync.make_tiled_tma_atom(
+            tma_atom_O, tma_tensor_O = make_tiled_tma_atom_fn(
                 gmem_tiled_copy_O,
-                mO,
+                mO_og if const_expr(self.pack_gqa) else mO,
                 self.sO_layout,
                 (self.tile_m, self.tile_hdimv),  # No mcast
             )

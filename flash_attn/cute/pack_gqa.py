@@ -1,8 +1,11 @@
 # Copyright (c) 2025, Tri Dao.
 
+from typing import Union, Tuple
 
 import cutlass
 import cutlass.cute as cute
+from cutlass.cute.nvgpu import cpasync
+
 
 from quack import layout_utils
 import flash_attn.cute.utils as utils
@@ -34,6 +37,49 @@ def pack_gqa_layout(T, qhead_per_kvhead, nheads_kv, head_idx):
         *[T.stride[i] for i in range(head_idx + 1, len(T.shape))],
     )
     return cute.make_tensor(T.iterator, cute.make_layout(shape_packed, stride=stride_packed))
+
+
+def make_packgqa_tiled_tma_atom(
+    op: cute.atom.CopyOp,
+    gmem_tensor: cute.Tensor,
+    smem_layout: Union[cute.Layout, cute.ComposedLayout],
+    cta_tiler: Tuple[int, int],
+    qhead_per_kvhead: int,
+    head_idx: int,
+):
+    # This packing and unpacking of the layout is so that we keep the same TMA dimension as usual.
+    # e.g. for (seqlen, d, nheads, b) layout, we still have 4D TMA after packing to
+    # ((nheads, seqlen), d, b).
+    # If we instead pack directly to ((qhead_per_kvhead, seqlen), d, nheads_kv, b) we'd have 5D TMA.
+    # Pack headdim and seqlen dim into 1: (seqlen, d, nheads, b) -> ((nheads, seqlen), d, b)
+    gmem_tensor = layout_utils.select(
+        gmem_tensor, [head_idx, *range(head_idx), *range(head_idx + 1, cute.rank(gmem_tensor))]
+    )
+    gmem_tensor = cute.group_modes(gmem_tensor, 0, 2)
+    assert cta_tiler[0] % qhead_per_kvhead == 0, (
+        "CTA tile size in the seqlen dimension must be divisible by qhead_per_kvhead"
+    )
+    tma_atom, tma_tensor = cpasync.make_tiled_tma_atom(
+        op,
+        gmem_tensor,
+        smem_layout,
+        ((qhead_per_kvhead, cta_tiler[0] // qhead_per_kvhead), cta_tiler[1]),  # No mcast
+    )
+    # Unpack from ((nheads, seqlen), d, b) -> ((qhead_per_kvhead, seqlen), d, nheads_kv, b)
+    T = tma_tensor
+    shape_packed = (
+        (qhead_per_kvhead, T.shape[0][1]),
+        *[T.shape[i] for i in range(1, head_idx)],
+        T.shape[0][0] // qhead_per_kvhead,
+        *[T.shape[i] for i in range(head_idx, len(T.shape))],
+    )
+    stride_packed = (
+        *[T.stride[i] for i in range(head_idx)],
+        T.stride[0][0] * qhead_per_kvhead,
+        *[T.stride[i] for i in range(head_idx, len(T.shape))],
+    )
+    tma_tensor = cute.make_tensor(T.iterator, cute.make_layout(shape_packed, stride=stride_packed))
+    return tma_atom, tma_tensor
 
 
 def unpack_gqa_layout(T, qhead_per_kvhead, head_idx):
