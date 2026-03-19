@@ -5,7 +5,15 @@
 #include "flash_common.hpp"
 
 #include "fmha_fwd.hpp"
+#include "fmha_fwd_head_grouping.hpp"
 #include "mask.hpp"
+
+#include <algorithm>
+#include <optional>
+#include <string>
+#include <iostream>
+
+namespace head_grouping = flash::ck_fmha_head_grouping;
 
 fmha_fwd_traits get_ck_fmha_fwd_traits(const mask_info &mask,
                                        std::string dtype,
@@ -119,6 +127,8 @@ fmha_fwd_args get_ck_fmha_fwd_args(bool has_lse,
                          d,             // hdim_v
                          h,             // nhead
                          h_k,           // nhead_k
+                         0,             // num_head_q_total
+                         0,             // head_start
                          softmax_scale, // scale_s
                          0.0f,          // logits_soft_cap
                          stride_q,
@@ -329,8 +339,61 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
                 softmax_scale,
                 p_dropout,
                 drop_seed_offset);
+        const size_t q_elem_bytes    = q.element_size();
+        const size_t k_elem_bytes    = k.element_size();
+        const size_t v_elem_bytes    = v.element_size();
+        const size_t o_elem_bytes    = out.element_size();
+        const size_t lse_elem_bytes  = has_lse ? softmax_lse.element_size() : 0;
+        const size_t rand_elem_bytes = return_dropout_randval ? p.element_size() : 0;
+        const size_t bias_elem_bytes = alibi_slopes_.has_value() ? alibi_slopes_.value().element_size() : 0;
+        const head_grouping::GroupedLaunchElemBytes grouped_elem_bytes{
+            q_elem_bytes, k_elem_bytes, v_elem_bytes, o_elem_bytes, lse_elem_bytes, rand_elem_bytes, bias_elem_bytes};
 
-        float t = fmha_fwd(traits, args, stream_config);
+        float t = -1.0f;
+        if(head_grouping::disabled_by_env())
+        {
+            if(head_grouping::log_enabled())
+                std::cout << "[LLC Head Grouping] disabled by env" << std::endl;
+        }
+        else
+        {
+            const auto group_size_opt = head_grouping::get_head_group_size(
+                num_heads,
+                num_heads_k,
+                batch_size,
+                seqlen_k,
+                head_size,
+                head_size,
+                k_elem_bytes,
+                v_elem_bytes);
+            if(group_size_opt.has_value() && group_size_opt.value() < num_heads)
+            {
+                head_grouping::log_grouping_enabled(num_heads, num_heads_k, group_size_opt.value());
+                t = head_grouping::run_fwd_head_grouped(stream_config,
+                                                        traits,
+                                                        args,
+                                                        num_heads,
+                                                        num_heads_k,
+                                                        group_size_opt.value(),
+                                                        grouped_elem_bytes,
+                                                        [&](const fmha_fwd_traits& grouped_traits,
+                                                            const fmha_fwd_args& grouped_args,
+                                                            const ck_tile::stream_config& grouped_sc) {
+                                                            return fmha_fwd(grouped_traits,
+                                                                            grouped_args,
+                                                                            grouped_sc);
+                                                        });
+            }
+            else if(head_grouping::log_enabled())
+            {
+                std::cout << "[LLC Head Grouping] skipped (group_size not set or >= nhead)"
+                          << std::endl;
+            }
+        }
+        if(t < 0.0f)
+        {
+            t = fmha_fwd(traits, args, stream_config);
+        }
         TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd");
     }
     else {

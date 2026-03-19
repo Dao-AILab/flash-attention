@@ -199,7 +199,7 @@ def rename_cpp_to_cu(cpp_files):
 
 def validate_and_update_archs(archs):
     # List of allowed architectures
-    allowed_archs = ["native", "gfx90a", "gfx950", "gfx942"]
+    allowed_archs = ["native", "gfx90a", "gfx942", "gfx950", "gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1200", "gfx1201"]
 
     # Validate if each element in archs is in allowed_archs
     assert all(
@@ -397,10 +397,24 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
             os.makedirs("build")
 
         optdim = os.getenv("OPT_DIM", "32,64,128,256")
-        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd", "--output_dir", "build", "--receipt", "2", "--optdim", optdim], check=True)
-        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd_appendkv", "--output_dir", "build", "--receipt", "2", "--optdim", optdim], check=True)
-        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "fwd_splitkv", "--output_dir", "build", "--receipt", "2", "--optdim", optdim], check=True)
-        subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", "bwd", "--output_dir", "build", "--receipt", "2", "--optdim", optdim], check=True)
+        archs = [arch.lower() for arch in os.getenv("GPU_ARCHS", "native").split(";")]
+        validate_and_update_archs(archs)
+
+        if archs != ["native"]:
+            kernel_targets = archs
+        else:
+            if not torch.cuda.is_available():
+                raise RuntimeError(
+                    "GPU_ARCHS not provided and no ROCm device detected. "
+                    "Set GPU_ARCHS (e.g., gfx942) to target your GPU."
+                )
+            detected_arch = torch.cuda.get_device_properties(torch.cuda.current_device()).gcnArchName.split(":")[0]
+            kernel_targets = [detected_arch.lower()]
+            validate_and_update_archs(kernel_targets)
+
+        targets_arg = ",".join(kernel_targets)
+        for direction in ["fwd", "fwd_appendkv", "fwd_splitkv", "bwd"]:
+            subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", direction, "--output_dir", "build", "--receipt", "2", "--optdim", optdim, "--targets", targets_arg], check=True)
 
         # Check, if ATen/CUDAGeneratorImpl.h is found, otherwise use ATen/cuda/CUDAGeneratorImpl.h
         # See https://github.com/pytorch/pytorch/pull/70650
@@ -410,14 +424,7 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
             generator_flag = ["-DOLD_GENERATOR_PATH"]
 
         check_if_rocm_home_none("flash_attn")
-        archs = os.getenv("GPU_ARCHS", "native").split(";")
-        validate_and_update_archs(archs)
-
-        if archs != ['native']:
-            cc_flag = [f"--offload-arch={arch}" for arch in archs]
-        else:
-            arch = torch.cuda.get_device_properties("cuda").gcnArchName.split(":")[0]
-            cc_flag = [f"--offload-arch={arch}"]
+        cc_flag = [f"--offload-arch={arch}" for arch in kernel_targets]
 
         # HACK: The compiler flag -D_GLIBCXX_USE_CXX11_ABI is set to be the same as
         # torch._C._GLIBCXX_USE_CXX11_ABI
