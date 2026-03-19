@@ -135,16 +135,38 @@ class SeqlenInfoQK:
         batch_idx: Int32,
         dim: int,
         padded: cutlass.Constexpr[bool] = False,
+        ragged: cutlass.Constexpr[bool] = False,
     ) -> cute.Tensor:
         """Seqlen must be the first dimension of mQ"""
-        if const_expr(not self.has_cu_seqlens_q):
-            idx = (None,) * dim + (batch_idx,) + (None,) * (cute.rank(mQ) - 1 - dim)
-            return mQ[idx]
+        if const_expr(not ragged):
+            if const_expr(not self.has_cu_seqlens_q):
+                idx = (None,) * dim + (batch_idx,) + (None,) * (cute.rank(mQ) - 1 - dim)
+                return mQ[idx]
+            else:
+                offset_q = self.offset_q if const_expr(not padded) else self.padded_offset_q
+                offset_q = offset_q if const_expr(cute.rank(mQ.shape[0]) == 1) else (None, offset_q)
+                idx = (offset_q,) + (None,) * (cute.rank(mQ) - 1)
+                return cute.domain_offset(idx, mQ)
         else:
-            offset_q = self.offset_q if const_expr(not padded) else self.padded_offset_q
-            offset = offset_q if const_expr(cute.rank(mQ.shape[0]) == 1) else (0, offset_q)
-            idx = (offset,) + (None,) * (cute.rank(mQ) - 1)
-            return cute.domain_offset(idx, mQ)
+            if const_expr(not self.has_cu_seqlens_q):
+                offset_q = 0
+                idx = (None,) * dim + (batch_idx,) + (None,) * (cute.rank(mQ) - 1 - dim)
+                mQ = mQ[idx]
+            else:
+                offset_q = self.offset_q if const_expr(not padded) else self.padded_offset_q
+            if const_expr(cute.rank(mQ.shape[0]) == 1):
+                return copy_utils.offset_ragged_tensor(
+                    mQ, offset_q, self.seqlen_q, ragged_dim=0, ptr_shift=True
+                )
+            else:  # PackGQA
+                assert cute.rank(mQ.shape[0]) == 2
+                # Unpack before calling offset_ragged_tensor, then pack
+                idx = ((None, None),) + (None,) * (cute.rank(mQ) - 1)
+                mQ = mQ[idx]
+                mQ = copy_utils.offset_ragged_tensor(
+                    mQ, offset_q, self.seqlen_q, ragged_dim=1, ptr_shift=True
+                )
+                return cute.group_modes(mQ, 0, 2)
 
     def offset_batch_K(
         self,

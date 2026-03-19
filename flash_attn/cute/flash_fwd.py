@@ -386,11 +386,8 @@ class FlashAttentionForwardBase:
             else:
                 pack_gqa.store_LSE(mLSE_cur, lse, tiled_mma, tidx, m_block, seqlen.seqlen_q)
 
-        if const_expr(not seqlen.has_cu_seqlens_q):
-            mO_cur = mO[None, None, head_idx, batch_idx]
-        else:
-            offset = seqlen.offset_q if const_expr(not self.pack_gqa) else (0, seqlen.offset_q)
-            mO_cur = cute.domain_offset((offset, 0), mO[None, None, head_idx])
+        ragged = self.use_tma_O and (seqlen.has_cu_seqlens_q or seqlen.has_seqused_q)
+        mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3, ragged=ragged)[None, None, head_idx]
         # thr_mma = tiled_mma.get_slice(tidx)
         # taccOgO = thr_mma.partition_C(gO)
         # cute.autovec_copy(rO, taccOgO)

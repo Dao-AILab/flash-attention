@@ -188,6 +188,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             )
         )
 
+        self.varlen_q = mCuSeqlensQ is not None or mSeqUsedQ is not None
+
         mQ, mK, mV, mO = [assume_tensor_aligned(t) for t in (mQ, mK, mV, mO)]
         QO_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
         mQ, mO = [layout_utils.select(t, QO_layout_transpose) for t in (mQ, mO)]
@@ -222,12 +224,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         self.use_tma_Q = self.arch >= Arch.sm_90 and not (
             self.pack_gqa and self.tile_m % self.qhead_per_kvhead != 0
         )
-        self.use_tma_O = (
-            self.arch >= Arch.sm_90
-            and mCuSeqlensQ is None
-            and mSeqUsedQ is None
-            and not (self.pack_gqa and self.tile_m % self.qhead_per_kvhead != 0)
-        )
+        self.use_tma_O = self.use_tma_Q
         self.rescale_O_before_gemm = self.tile_hdimv > 128 and self.intra_wg_overlap
         self._setup_attributes()
         # TODO: we prob don't need most of what's in _setup_attributes
@@ -300,9 +297,14 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             )
         tma_atom_O, tma_tensor_O = None, None
         if const_expr(self.use_tma_O):
+            mO_tma = mO_og if const_expr(self.pack_gqa) else mO
+            if const_expr(self.varlen_q):
+                mO_tma = copy_utils.create_ragged_tensor_for_tma(
+                    mO_tma, ragged_dim=0, ptr_shift=True
+                )
             tma_atom_O, tma_tensor_O = make_tiled_tma_atom_fn(
                 gmem_tiled_copy_O,
-                mO_og if const_expr(self.pack_gqa) else mO,
+                mO_tma,
                 self.sO_layout,
                 (self.tile_m, self.tile_hdimv),  # No mcast
             )
