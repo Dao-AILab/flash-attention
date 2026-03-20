@@ -481,10 +481,6 @@ def _flash_attn_fwd(
     if pack_gqa and num_splits != 1 and cu_seqlens_q is None:
         pack_gqa = False
 
-    if arch // 10 in [10, 11]:
-        if pack_gqa and (128 % qhead_per_kvhead != 0):
-            pack_gqa = False
-
     if max_seqlen_q is None:
         max_seqlen_q = seqlen_q if cu_seqlens_q is None else total_q
     if max_seqlen_k is None:
@@ -531,6 +527,7 @@ def _flash_attn_fwd(
         and int(math.ceil(head_dim / 16) * 16) == 128
         and int(math.ceil(head_dim_v / 16) * 16) == 128
         and seqlen_q_packgqa > 2 * tile_m
+        and (tile_m % qhead_per_kvhead == 0 or not pack_gqa)
     )
 
     # hash score and mask mods for compile cache
