@@ -714,16 +714,26 @@ def test_flash_attn_varlen_output(
                 continue
             if query_unused_mask is not None:
                 out.masked_fill_(q_zero_masking, 0.0)
-            print(f"Output max diff: {(out - out_ref).abs().max().item()}")
-            print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
+            # When unpad_q=False with seqused_q, the kernel doesn't write positions
+            # beyond seqused_q, so those contain uninitialized values. Mask them out
+            # before comparing.
+            out_cmp, out_ref_cmp, out_pt_cmp = out, out_ref, out_pt
+            if not unpad_q and seqused_q is not None:
+                seqused_mask = torch.arange(seqlen_q, device=device)[None, :] < seqused_q[:, None]
+                seqused_mask = rearrange(seqused_mask, "b s -> b s 1 1")
+                out_cmp = out.clone().masked_fill_(~seqused_mask, 0.0)
+                out_ref_cmp = out_ref.clone().masked_fill_(~seqused_mask, 0.0)
+                out_pt_cmp = out_pt.clone().masked_fill_(~seqused_mask, 0.0)
+            print(f"Output max diff: {(out_cmp - out_ref_cmp).abs().max().item()}")
+            print(f"Output mean diff: {(out_cmp - out_ref_cmp).abs().mean().item()}")
             # if not causal:
             #     print(f"LSE max diff: {(lse - lse_ref).abs().max().item()}")
             # breakpoint()
 
             # Check that FlashAttention's numerical error is at most 3x the numerical error
             # of a Pytorch implementation.
-            assert (out - out_ref).abs().max().item() <= rtol * (
-                out_pt - out_ref
+            assert (out_cmp - out_ref_cmp).abs().max().item() <= rtol * (
+                out_pt_cmp - out_ref_cmp
             ).abs().max().item() + fwd_atol
 
         if (

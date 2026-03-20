@@ -359,11 +359,7 @@ class FlashAttentionForwardBase:
 
         # Write LSE from rmem -> gmem
         if const_expr(mLSE is not None):
-            if const_expr(not seqlen.has_cu_seqlens_q):
-                mLSE_cur = mLSE[None, head_idx, batch_idx]
-            else:
-                offset = seqlen.offset_q if const_expr(not self.pack_gqa) else (0, seqlen.offset_q)
-                mLSE_cur = cute.domain_offset((offset,), mLSE[None, head_idx])
+            mLSE_cur = seqlen.offset_batch_Q(mLSE, batch_idx, dim=2)[None, head_idx]
             if const_expr(not self.pack_gqa):
                 gLSE = cute.local_tile(mLSE_cur, (self.tile_m,), (m_block,))
                 gLSE_expanded_layout = cute.append(
@@ -377,7 +373,7 @@ class FlashAttentionForwardBase:
                 t0accOcO = layout_utils.reshape_acc_to_mn(thr_mma.get_slice(0).partition_C(cO))
                 # Only the thread corresponding to column 0 writes out the lse to gmem
                 if taccOcO[0][1] == 0:
-                    for m in cutlass.range_constexpr(cute.size(taccOgLSE.shape[1])):
+                    for m in cutlass.range(cute.size(taccOgLSE.shape[1]), unroll_full=True):
                         if (
                             t0accOcO[m, 0][0]
                             < seqlen.seqlen_q - m_block * self.tile_m - taccOcO[0][0]

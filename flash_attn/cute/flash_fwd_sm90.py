@@ -209,7 +209,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         assert self.num_wg_mma in [1, 2, 3]
         self.num_threads = self.num_threads_per_warp_group * (self.num_wg_mma + 1)
         self.num_producer_threads = 32
-        self.num_Q_load_threads = self.num_mma_threads  # If not TMA_Q, MMA threads load Q
+        self.num_Q_load_threads = self.num_threads_per_warp_group  # If not TMA_Q
         self.num_epilogue_threads = self.num_mma_threads
         self.num_mma_regs, self.num_producer_regs = {1: (256, 56), 2: (240, 24), 3: (160, 32)}[
             self.num_wg_mma
@@ -225,6 +225,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             self.pack_gqa and self.tile_m % self.qhead_per_kvhead != 0
         )
         self.use_tma_O = self.use_tma_Q
+        # Producer needs more registers when doing cp.async Q or KV loads
+        if const_expr(self.num_wg_mma == 2 and (not self.use_tma_Q or not self.use_tma_KV)):
+            self.num_mma_regs, self.num_producer_regs = 224, 40
         self.rescale_O_before_gemm = self.tile_hdimv > 128 and self.intra_wg_overlap
         self._setup_attributes()
         # TODO: we prob don't need most of what's in _setup_attributes
@@ -446,16 +449,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
         # Mbarrier / pipeline init
         mbar_ptr_Q = storage.mbar_ptr_Q.data_ptr()
-        if const_expr(not self.use_tma_Q):
-            if warp_idx == 1:
-                cute.arch.mbarrier_init(mbar_ptr_Q, self.num_Q_load_threads)
 
         ThreadCooperativeGroup = partial(pipeline.CooperativeGroup, pipeline.Agent.Thread)
         tma_warp = ThreadCooperativeGroup(1)
         load_threads = ThreadCooperativeGroup(self.num_threads_per_warp_group)
         mma_warps = ThreadCooperativeGroup(self.num_mma_threads // cute.arch.WARP_SIZE)
         mma_threads = ThreadCooperativeGroup(self.num_mma_threads)
-        pipeline_q = None
         if const_expr(self.use_tma_Q):
             pipeline_q = pipeline_custom.PipelineTmaAsync.create(
                 barrier_storage=mbar_ptr_Q,
@@ -463,6 +462,14 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 producer_group=tma_warp,
                 consumer_group=mma_warps,
                 tx_count=self.tma_copy_bytes["Q"],
+                defer_sync=True,
+            )
+        else:
+            pipeline_q = pipeline_custom.PipelineCpAsync.create(
+                num_stages=1,
+                producer_group=load_threads,
+                consumer_group=mma_threads,
+                barrier_storage=mbar_ptr_Q,
                 defer_sync=True,
             )
 
@@ -576,6 +583,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 pipeline_k,
                 pipeline_v,
                 pipeline_q,
+                gmem_tiled_copy_Q,
                 mPageTable,
                 blocksparse_tensors,
                 block_info,
@@ -593,7 +601,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             self.mma(
                 tiled_mma_qk,
                 tiled_mma_pv,
-                mQ,
                 mO,
                 mLSE,
                 sQ,
@@ -605,8 +612,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 pipeline_k,
                 pipeline_v,
                 pipeline_q,
-                mbar_ptr_Q,
-                gmem_tiled_copy_Q,
                 gmem_tiled_copy_O,
                 tma_atom_O,
                 tidx,
@@ -635,7 +640,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         tma_atom_V: Optional[cute.CopyAtom],
         pipeline_k: pipeline.PipelineAsync,
         pipeline_v: pipeline.PipelineAsync,
-        pipeline_q: Optional[pipeline.PipelineAsync],
+        pipeline_q: pipeline.PipelineAsync,
+        gmem_tiled_copy_Q: cute.TiledCopy,
         mPageTable: Optional[cute.Tensor],
         blocksparse_tensors: Optional[BlockSparseTensors],
         block_info: BlockInfo,
@@ -645,8 +651,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         warp_idx_in_wg = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
         tidx, _, _ = cute.arch.thread_idx()
 
-        # TMA: only warp 0 loads. cp_async: all warps load
-        is_load_warp = warp_idx_in_wg == 0 or const_expr(not self.use_tma_KV)
+        # TMA: only warp 0 loads. cp_async: all warps load.
+        # When not use_tma_Q, all 128 producer threads participate in Q loading.
+        is_load_warp = warp_idx_in_wg == 0 or const_expr(not self.use_tma_KV or not self.use_tma_Q)
+        # KV loading restricted to warp 0 for TMA, all warps for non-TMA KV
+        is_kv_load_warp = warp_idx_in_wg == 0 or const_expr(not self.use_tma_KV)
 
         if is_load_warp:
             q_producer_phase = Int32(1)
@@ -738,6 +747,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     K_or_V="V",
                 )
 
+                pack_gqa = None
+                if const_expr(not self.use_tma_Q):
+                    pack_gqa = PackGQA(
+                        self.tile_m, self.tile_hdim, self.check_hdim_oob, self.qhead_per_kvhead
+                    )
+
                 if const_expr(not self.use_block_sparsity):
                     n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
                     # if cute.arch.thread_idx()[0] == 0:
@@ -757,74 +772,94 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         else None
                     )
 
-                    # First iteration: load Q on pipeline_q, K on pipeline_k
-                    pipeline_k.producer_acquire(kv_producer_state)
-                    if const_expr(not self.use_tma_KV):
-                        paged_kv_manager.load_page_table(n_block)
-                    load_K(block=n_block, producer_state=kv_producer_state, page_idx=page_idx)
+                    # First iteration: load K on pipeline_k, Q on pipeline_q
+                    if is_kv_load_warp:
+                        pipeline_k.producer_acquire(kv_producer_state)
+                        if const_expr(not self.use_tma_KV):
+                            paged_kv_manager.load_page_table(n_block)
+                        load_K(block=n_block, producer_state=kv_producer_state, page_idx=page_idx)
                     if const_expr(self.use_tma_Q):
                         if warp_idx_in_wg == 0:
                             pipeline_q.producer_acquire_w_index_phase(0, q_producer_phase)
                             load_Q(tma_bar_ptr=pipeline_q.sync_object_full.get_barrier(0))
                             q_producer_phase ^= 1
+                    else:
+                        pipeline_q.producer_acquire_w_index_phase(0, q_producer_phase)
+                        pack_gqa.load_Q(
+                            mQ_cur, sQ, gmem_tiled_copy_Q, tidx, m_block, seqlen.seqlen_q
+                        )
+                        cute.arch.cp_async_commit_group()
+                        pipeline_q.producer_commit_w_index(0)
+                        q_producer_phase ^= 1
 
-                    if const_expr(not self.intra_wg_overlap or not self.use_tma_KV):
-                        pipeline_v.producer_acquire(kv_producer_state)
-                        load_V(block=n_block, producer_state=kv_producer_state, page_idx=page_idx)
-                        kv_producer_state.advance()
-                        for i in cutlass.range(n_block_max - 1 - n_block_min, unroll=1):
-                            n_block = n_block_max - 1 - i - 1
+                    if is_kv_load_warp:
+                        if const_expr(not self.intra_wg_overlap or not self.use_tma_KV):
+                            pipeline_v.producer_acquire(kv_producer_state)
+                            load_V(
+                                block=n_block, producer_state=kv_producer_state, page_idx=page_idx
+                            )
+                            kv_producer_state.advance()
+                            for i in cutlass.range(n_block_max - 1 - n_block_min, unroll=1):
+                                n_block = n_block_max - 1 - i - 1
+                                page_idx = (
+                                    mPageTable[batch_idx, n_block]
+                                    if const_expr(mPageTable is not None and self.use_tma_KV)
+                                    else None
+                                )
+                                if const_expr(not self.use_tma_KV):
+                                    paged_kv_manager.load_page_table(n_block)
+                                pipeline_k.producer_acquire(kv_producer_state)
+                                load_K(
+                                    block=n_block,
+                                    producer_state=kv_producer_state,
+                                    page_idx=page_idx,
+                                )
+                                pipeline_v.producer_acquire(kv_producer_state)
+                                load_V(
+                                    block=n_block,
+                                    producer_state=kv_producer_state,
+                                    page_idx=page_idx,
+                                )
+                                kv_producer_state.advance()
+                        else:
+                            for i in cutlass.range(n_block_max - 1 - n_block_min, unroll=1):
+                                n_block_prev = n_block_max - i - 1
+                                n_block = n_block_prev - 1
+                                page_idx = (
+                                    mPageTable[batch_idx, n_block]
+                                    if const_expr(mPageTable is not None)
+                                    else None
+                                )
+                                page_idx_prev = (
+                                    mPageTable[batch_idx, n_block_prev]
+                                    if const_expr(mPageTable is not None)
+                                    else None
+                                )
+                                kv_producer_state_prev = kv_producer_state.clone()
+                                kv_producer_state.advance()
+                                pipeline_k.producer_acquire(kv_producer_state)
+                                load_K(
+                                    block=n_block,
+                                    producer_state=kv_producer_state,
+                                    page_idx=page_idx,
+                                )
+                                pipeline_v.producer_acquire(kv_producer_state_prev)
+                                load_V(
+                                    block=n_block_prev,
+                                    producer_state=kv_producer_state_prev,
+                                    page_idx=page_idx_prev,
+                                )
+                            n_block = n_block_min
                             page_idx = (
                                 mPageTable[batch_idx, n_block]
-                                if const_expr(mPageTable is not None and self.use_tma_KV)
+                                if const_expr(mPageTable is not None)
                                 else None
-                            )
-                            if const_expr(not self.use_tma_KV):
-                                paged_kv_manager.load_page_table(n_block)
-                            pipeline_k.producer_acquire(kv_producer_state)
-                            load_K(
-                                block=n_block, producer_state=kv_producer_state, page_idx=page_idx
                             )
                             pipeline_v.producer_acquire(kv_producer_state)
                             load_V(
                                 block=n_block, producer_state=kv_producer_state, page_idx=page_idx
                             )
                             kv_producer_state.advance()
-                    else:
-                        for i in cutlass.range(n_block_max - 1 - n_block_min, unroll=1):
-                            n_block_prev = n_block_max - i - 1
-                            n_block = n_block_prev - 1
-                            page_idx = (
-                                mPageTable[batch_idx, n_block]
-                                if const_expr(mPageTable is not None)
-                                else None
-                            )
-                            page_idx_prev = (
-                                mPageTable[batch_idx, n_block_prev]
-                                if const_expr(mPageTable is not None)
-                                else None
-                            )
-                            kv_producer_state_prev = kv_producer_state.clone()
-                            kv_producer_state.advance()
-                            pipeline_k.producer_acquire(kv_producer_state)
-                            load_K(
-                                block=n_block, producer_state=kv_producer_state, page_idx=page_idx
-                            )
-                            pipeline_v.producer_acquire(kv_producer_state_prev)
-                            load_V(
-                                block=n_block_prev,
-                                producer_state=kv_producer_state_prev,
-                                page_idx=page_idx_prev,
-                            )
-                        n_block = n_block_min
-                        page_idx = (
-                            mPageTable[batch_idx, n_block]
-                            if const_expr(mPageTable is not None)
-                            else None
-                        )
-                        pipeline_v.producer_acquire(kv_producer_state)
-                        load_V(block=n_block, producer_state=kv_producer_state, page_idx=page_idx)
-                        kv_producer_state.advance()
                 else:
                     # Block sparsity: use TMA closures directly (not paged)
                     # Load Q on pipeline_q, separate from K/V pipeline
@@ -833,20 +868,29 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                             pipeline_q.producer_acquire_w_index_phase(0, q_producer_phase)
                             load_Q(tma_bar_ptr=pipeline_q.sync_object_full.get_barrier(0))
                             q_producer_phase ^= 1
-                    kv_producer_state = produce_block_sparse_loads(
-                        blocksparse_tensors,
-                        batch_idx,
-                        head_idx,
-                        m_block,
-                        kv_producer_state,
-                        tma_load_K_fn,
-                        tma_load_V_fn,
-                        pipeline_k,
-                        pipeline_v,
-                        self.intra_wg_overlap,
-                        self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
-                        self.q_subtile_factor if self.q_subtile_factor is not None else 1,
-                    )
+                    else:
+                        pipeline_q.producer_acquire_w_index_phase(0, q_producer_phase)
+                        pack_gqa.load_Q(
+                            mQ_cur, sQ, gmem_tiled_copy_Q, tidx, m_block, seqlen.seqlen_q
+                        )
+                        cute.arch.cp_async_commit_group()
+                        pipeline_q.producer_commit_w_index(0)
+                        q_producer_phase ^= 1
+                    if is_kv_load_warp:
+                        kv_producer_state = produce_block_sparse_loads(
+                            blocksparse_tensors,
+                            batch_idx,
+                            head_idx,
+                            m_block,
+                            kv_producer_state,
+                            tma_load_K_fn,
+                            tma_load_V_fn,
+                            pipeline_k,
+                            pipeline_v,
+                            self.intra_wg_overlap,
+                            self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+                            self.q_subtile_factor if self.q_subtile_factor is not None else 1,
+                        )
 
                 tile_scheduler.prefetch_next_work()
                 tile_scheduler.advance_to_next_work()
@@ -856,7 +900,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             # Producer tail is only useful for cluster to avoid early exit of blocks.
             # We only need producer_tail on V since that's the last that's loaded, we don't
             # need it for Q (no cluster) and K.
-            pipeline_v.producer_tail(kv_producer_state)
+            if is_kv_load_warp:
+                pipeline_v.producer_tail(kv_producer_state)
 
     @cute.jit
     def load_KV(
@@ -884,9 +929,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         self,
         tiled_mma_qk: cute.TiledMma,
         tiled_mma_pv: cute.TiledMma,
-        # softmax: Softmax,
-        # acc_O: cute.Tensor,
-        mQ: cute.Tensor,
         mO: cute.Tensor,
         mLSE: Optional[cute.Tensor],
         sQ: cute.Tensor,
@@ -897,9 +939,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         learnable_sink: Optional[cute.Tensor],
         pipeline_k: pipeline.PipelineAsync,
         pipeline_v: pipeline.PipelineAsync,
-        pipeline_q: Optional[pipeline.PipelineAsync],
-        mbar_ptr_Q: cutlass.Pointer,
-        gmem_tiled_copy_Q: cute.TiledCopy,
+        pipeline_q: pipeline.PipelineAsync,
         gmem_tiled_copy_O: cute.TiledCopy,
         tma_atom_O: Optional[cute.CopyAtom],
         tidx: Int32,
@@ -943,7 +983,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
         self.mma_init()
 
-        mma_q_consumer_phase = Int32(0)
         q_consumer_phase = Int32(0)
         kv_consumer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Consumer, self.num_stages
@@ -1046,25 +1085,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             mma_one_n_block = partial(
                 mma_one_n_block_all, seqlen=seqlen, softmax=softmax, score_mod_fn=score_mod_fn
             )
-            # Load Q if not TMA_Q
-            if const_expr(not self.use_tma_Q):
-                pack_gqa = PackGQA(
-                    self.tile_m, self.tile_hdim, self.check_hdim_oob, self.qhead_per_kvhead
-                )
-                mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, head_idx]
-                # gmem_thr_copy_Q = gmem_tiled_copy_Q.get_slice(tidx)
-                # gQ = cute.local_tile(mQ_cur, (self.tile_m, self.tile_hdim), (m_block, 0))
-                # self.load_Q(gmem_thr_copy_Q, gQ, sQ, m_block, seqlen=seqlen.seqlen_q,
-                #             headdim=mQ.shape[1])
-                pack_gqa.load_Q(mQ_cur, sQ, gmem_tiled_copy_Q, tidx, m_block, seqlen.seqlen_q)
-                cute.arch.cp_async_mbarrier_arrive_noinc(mbar_ptr_Q)
-
             n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
-            if const_expr(self.use_tma_Q):
-                pipeline_q.consumer_wait_w_index_phase(0, mma_q_consumer_phase)
-            else:
-                cute.arch.mbarrier_wait(mbar_ptr_Q, phase=q_consumer_phase)
-                q_consumer_phase ^= 1
+            pipeline_q.consumer_wait_w_index_phase(0, q_consumer_phase)
             # For performance reason, we separate out two kinds of iterations:
             # those that need masking on S, and those that don't.
             # We need masking on S for the very last block when K and V has length not multiple of tile_n.
@@ -1146,6 +1168,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                             mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=False),
                         )
                         O_should_accumulate = True
+                # Release Q pipeline so the producer can load the next tile's Q
+                pipeline_q.consumer_release_w_index(0)
                 # Last "half" iteration
                 if const_expr(self.intra_wg_overlap):
                     kv_consumer_state = process_last_half_block(
@@ -1183,10 +1207,15 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     self.q_subtile_factor if self.q_subtile_factor is not None else 1,
                 )
 
+                # Release Q pipeline so the producer can load the next tile's Q
+                pipeline_q.consumer_release_w_index(0)
+
                 # Handle empty case (when no blocks to process)
                 if not processed_any:
                     softmax.reset()
                     acc_O.fill(0.0)
+
+            q_consumer_phase ^= 1
 
             sink_val = None
             if const_expr(learnable_sink is not None):
@@ -1223,11 +1252,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 head_idx,
                 batch_idx,
             )
-
-            # Release Q pipeline so the producer can load the next tile's Q
-            if const_expr(self.use_tma_Q):
-                pipeline_q.consumer_release_w_index(0)
-                mma_q_consumer_phase ^= 1
 
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
