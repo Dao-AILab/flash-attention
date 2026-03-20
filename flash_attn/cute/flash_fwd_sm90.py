@@ -454,7 +454,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         tma_warp = ThreadCooperativeGroup(1)
         load_threads = ThreadCooperativeGroup(self.num_threads_per_warp_group)
         mma_warps = ThreadCooperativeGroup(self.num_mma_threads // cute.arch.WARP_SIZE)
-        mma_threads = ThreadCooperativeGroup(self.num_mma_threads)
         if const_expr(self.use_tma_Q):
             pipeline_q = pipeline_custom.PipelineTmaAsync.create(
                 barrier_storage=mbar_ptr_Q,
@@ -466,17 +465,16 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             )
         else:
             pipeline_q = pipeline_custom.PipelineCpAsync.create(
+                barrier_storage=mbar_ptr_Q,
                 num_stages=1,
                 producer_group=load_threads,
-                consumer_group=mma_threads,
-                barrier_storage=mbar_ptr_Q,
+                consumer_group=mma_warps,
                 defer_sync=True,
+                elect_one_release=True,
+                syncwarp_before_release=False,
             )
 
-        # We rely on pipeline_k and pipeline_v to initialize the mbarrier fence and sync
         if const_expr(self.use_tma_KV):
-            # PipelineTmaAsync: consumer_release has internal per-warp gating
-            # (is_signalling_thread), so arrive count = num_consumer_warps
             pipeline_k = pipeline_custom.PipelineTmaAsync.create(
                 barrier_storage=storage.mbar_ptr_K.data_ptr(),
                 num_stages=self.num_stages,
@@ -494,21 +492,23 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 defer_sync=True,
             )
         else:
-            # PipelineAsync: no thread gating in producer_commit/consumer_release,
-            # so arrive counts must equal actual thread counts
-            pipeline_k = pipeline.PipelineAsync.create(
-                num_stages=self.num_stages,
-                producer_group=load_threads,
-                consumer_group=mma_threads,
+            pipeline_k = pipeline_custom.PipelineCpAsync.create(
                 barrier_storage=storage.mbar_ptr_K.data_ptr(),
-                defer_sync=True,
-            )
-            pipeline_v = pipeline.PipelineAsync.create(
                 num_stages=self.num_stages,
                 producer_group=load_threads,
-                consumer_group=mma_threads,
-                barrier_storage=storage.mbar_ptr_V.data_ptr(),
+                consumer_group=mma_warps,
                 defer_sync=True,
+                elect_one_release=True,
+                syncwarp_before_release=False,
+            )
+            pipeline_v = pipeline_custom.PipelineCpAsync.create(
+                barrier_storage=storage.mbar_ptr_V.data_ptr(),
+                num_stages=self.num_stages,
+                producer_group=load_threads,
+                consumer_group=mma_warps,
+                defer_sync=True,
+                elect_one_release=True,
+                syncwarp_before_release=False,
             )
 
         # Cluster arrive after barrier init
@@ -921,8 +921,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         else:
             paged_kv_manager.load_KV(block, sX[None, None, producer_state.index], K_or_V)
             cute.arch.cp_async_commit_group()
-            cute.arch.cp_async_wait_group(0)
-            pipeline_kv.producer_commit(producer_state)
+        pipeline_kv.producer_commit(producer_state)
 
     @cute.jit
     def mma(

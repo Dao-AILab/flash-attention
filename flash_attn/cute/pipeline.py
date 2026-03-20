@@ -95,6 +95,20 @@ def make_pipeline_state(type: PipelineUserType, stages: int):
         assert False, "Error: invalid PipelineUserType specified for make_pipeline_state."
 
 
+# ── Shared helpers ───────────────────────────────────────────────────────────
+
+
+def _call_with_elect_one(parent_method, self, state, elect_one, syncwarp, loc, ip):
+    """Optionally wrap a parent pipeline method call in sync_warp + elect_one."""
+    if const_expr(elect_one):
+        if const_expr(syncwarp):
+            cute.arch.sync_warp()
+        with cute.arch.elect_one():
+            parent_method(self, state, loc=loc, ip=ip)
+    else:
+        parent_method(self, state, loc=loc, ip=ip)
+
+
 # ── Mixin: _w_index / _w_index_phase variants that delegate to parent ───────
 # Each parent class has PipelineState-based methods (producer_acquire, producer_commit,
 # consumer_wait, consumer_release). The _w_index_phase variants just construct a
@@ -180,10 +194,68 @@ NamedBarrier.create = _override_create(NamedBarrierOg, NamedBarrier)
 
 @dataclass(frozen=True)
 class PipelineAsync(_PipelineIndexPhaseMixin, PipelineAsyncOg):
-    pass
+    """
+    PipelineAsync with optional elect_one for producer_commit and consumer_release.
 
+    When elect_one_*=True (set at create time), only one elected thread per warp
+    signals the barrier arrive. This is useful when the mask count is set to 1 per warp.
 
-PipelineAsync.create = _override_create(PipelineAsyncOg, PipelineAsync)
+    Args (to create):
+        elect_one_commit: If True, only elected thread signals producer_commit.
+        syncwarp_before_commit: If True (default), issue syncwarp before elect_one.
+        elect_one_release: If True, only elected thread signals consumer_release.
+        syncwarp_before_release: If True (default), issue syncwarp before elect_one.
+            Set syncwarp to False when threads are already converged (e.g. after wgmma wait_group).
+    """
+
+    _elect_one_commit: bool = False
+    _syncwarp_before_commit: bool = True
+    _elect_one_release: bool = False
+    _syncwarp_before_release: bool = True
+
+    @staticmethod
+    def create(
+        *args,
+        elect_one_commit: bool = False,
+        syncwarp_before_commit: bool = True,
+        elect_one_release: bool = False,
+        syncwarp_before_release: bool = True,
+        **kwargs,
+    ):
+        obj = PipelineAsyncOg.create(*args, **kwargs)
+        object.__setattr__(obj, "__class__", PipelineAsync)
+        object.__setattr__(obj, "_elect_one_commit", elect_one_commit)
+        object.__setattr__(obj, "_syncwarp_before_commit", syncwarp_before_commit)
+        object.__setattr__(obj, "_elect_one_release", elect_one_release)
+        object.__setattr__(obj, "_syncwarp_before_release", syncwarp_before_release)
+        return obj
+
+    @dsl_user_op
+    def producer_commit(self, state: PipelineState, *, loc=None, ip=None):
+        _call_with_elect_one(
+            PipelineAsyncOg.producer_commit,
+            self,
+            state,
+            self._elect_one_commit,
+            self._syncwarp_before_commit,
+            loc,
+            ip,
+        )
+
+    @dsl_user_op
+    def consumer_release(self, state: PipelineState, *, loc=None, ip=None):
+        _call_with_elect_one(
+            PipelineAsyncOg.consumer_release,
+            self,
+            state,
+            self._elect_one_release,
+            self._syncwarp_before_release,
+            loc,
+            ip,
+        )
+
+    # _w_index variants inherited from _PipelineIndexPhaseMixin, which delegate
+    # to producer_commit / consumer_release above.
 
 
 # ── PipelineCpAsync ──────────────────────────────────────────────────────────
@@ -191,10 +263,35 @@ PipelineAsync.create = _override_create(PipelineAsyncOg, PipelineAsync)
 
 @dataclass(frozen=True)
 class PipelineCpAsync(_PipelineIndexPhaseMixin, PipelineCpAsyncOg):
-    pass
+    _elect_one_release: bool = False
+    _syncwarp_before_release: bool = True
 
+    @staticmethod
+    def create(
+        *args,
+        elect_one_release: bool = False,
+        syncwarp_before_release: bool = True,
+        **kwargs,
+    ):
+        obj = PipelineCpAsyncOg.create(*args, **kwargs)
+        object.__setattr__(obj, "__class__", PipelineCpAsync)
+        object.__setattr__(obj, "_elect_one_release", elect_one_release)
+        object.__setattr__(obj, "_syncwarp_before_release", syncwarp_before_release)
+        return obj
 
-PipelineCpAsync.create = _override_create(PipelineCpAsyncOg, PipelineCpAsync)
+    @dsl_user_op
+    def consumer_release(self, state: PipelineState, *, loc=None, ip=None):
+        _call_with_elect_one(
+            PipelineCpAsyncOg.consumer_release,
+            self,
+            state,
+            self._elect_one_release,
+            self._syncwarp_before_release,
+            loc,
+            ip,
+        )
+
+    # _w_index variants inherited from _PipelineIndexPhaseMixin.
 
 
 # ── PipelineTmaAsync ────────────────────────────────────────────────────────
