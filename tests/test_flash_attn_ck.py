@@ -28,24 +28,45 @@ from test_flash_attn import (
 from flash_attn.layers.rotary import apply_rotary_emb
 
 
+def is_gfx11(device="cuda"):
+    if not torch.cuda.is_available():
+        return False
+    props = torch.cuda.get_device_properties(device)
+    name = (getattr(props, "gcnArchName", "") or getattr(props, "name", "")).lower()
+    return "gfx11" in name
+
+
+def is_gfx12(device="cuda"):
+    if not torch.cuda.is_available():
+        return False
+    props = torch.cuda.get_device_properties(device)
+    name = (getattr(props, "gcnArchName", "") or getattr(props, "name", "")).lower()
+    return "gfx12" in name
+
+
 def is_gfx1x(device="cuda"):
     if not torch.cuda.is_available():
         return False
     props = torch.cuda.get_device_properties(device)
     name = (getattr(props, "gcnArchName", "") or getattr(props, "name", "")).lower()
-    return "gfx11" in name or "gfx12" in name
+    return ("gfx11" in name) or ("gfx12" in name)
 
 
 def is_bwd_hdim_supported(d):
     return d <= 256
 
 
-def skip_deterministic_bwd(deterministic: bool) -> bool:
-    return deterministic and is_gfx1x()
-
-
 def is_bwd_supported(d, deterministic):
-    return is_bwd_hdim_supported(d) and not skip_deterministic_bwd(deterministic)
+    if not is_bwd_hdim_supported(d):
+        return False
+
+    if is_gfx11():
+        return False
+
+    if is_gfx12() and deterministic:
+        return False
+
+    return True
 
 
 def ck_randval_to_dropout_mask(randval, p):
