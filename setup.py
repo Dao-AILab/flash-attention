@@ -9,7 +9,6 @@ import ast
 import glob
 import shutil
 from pathlib import Path
-from typing import Literal, Optional
 from packaging.version import parse, Version
 import platform
 
@@ -63,9 +62,8 @@ FORCE_BUILD = os.getenv("FLASH_ATTENTION_FORCE_BUILD", "FALSE") == "TRUE"
 SKIP_CUDA_BUILD = os.getenv("FLASH_ATTENTION_SKIP_CUDA_BUILD", "FALSE") == "TRUE"
 # For CI, we want the option to build with C++11 ABI since the nvcr images use C++11 ABI
 FORCE_CXX11_ABI = os.getenv("FLASH_ATTENTION_FORCE_CXX11_ABI", "FALSE") == "TRUE"
-ROCM_BACKEND: Optional[Literal["triton", "ck"]] = None
-if IS_ROCM:
-    ROCM_BACKEND = "triton" if os.getenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", "FALSE") == "TRUE" else "ck"
+USE_TRITON_ROCM = os.getenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", "FALSE") == "TRUE"
+SKIP_CK_BUILD = os.getenv("FLASH_ATTENTION_SKIP_CK_BUILD", "TRUE") == "TRUE" if USE_TRITON_ROCM else False
 NVCC_THREADS = os.getenv("NVCC_THREADS") or "4"
 
 @functools.lru_cache(maxsize=None)
@@ -212,33 +210,20 @@ ext_modules = []
 
 # We want this even if SKIP_CUDA_BUILD because when we run python setup.py sdist we want the .hpp
 # files included in the source distribution, in case the user compiles from source.
-if IS_ROCM:
-    if ROCM_BACKEND == "triton":
-        if os.path.isdir(".git"):
-            subprocess.run(["git", "submodule", "update", "--init", "third_party/aiter"], check=True)
-        else:
-            assert os.path.isdir("third_party/aiter"), (
-                "third_party/aiter is missing, please use source distribution or git clone"
-            )
-        subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--no-build-isolation", "third_party/aiter"],
-            check=True,
-        )
-    elif ROCM_BACKEND == "ck":
-        if os.path.isdir(".git"):
-            subprocess.run(["git", "submodule", "update", "--init", "csrc/composable_kernel"], check=True)
-        else:
-            assert os.path.exists("csrc/composable_kernel/example/ck_tile/01_fmha/generate.py"), (
-                "csrc/composable_kernel is missing, please use source distribution or git clone"
-            )
-else:
-    # CUDA: cutlass submodule
-    if os.path.isdir(".git"):
+if os.path.isdir(".git"):
+    if not SKIP_CK_BUILD:
+        subprocess.run(["git", "submodule", "update", "--init", "csrc/composable_kernel"], check=True)
         subprocess.run(["git", "submodule", "update", "--init", "csrc/cutlass"], check=True)
+else:
+    if IS_ROCM:
+        if not SKIP_CK_BUILD:
+            assert (
+                os.path.exists("csrc/composable_kernel/example/ck_tile/01_fmha/generate.py")
+            ), "csrc/composable_kernel is missing, please use source distribution or git clone"
     else:
-        assert os.path.exists("csrc/cutlass/include/cutlass/cutlass.h"), (
-            "csrc/cutlass is missing, please use source distribution or git clone"
-        )
+        assert (
+            os.path.exists("csrc/cutlass/include/cutlass/cutlass.h")
+        ), "csrc/cutlass is missing, please use source distribution or git clone"
 
 if not SKIP_CUDA_BUILD and not IS_ROCM:
     print("\n\ntorch.__version__  = {}\n\n".format(torch.__version__))
@@ -389,7 +374,7 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
     TORCH_MINOR = int(torch.__version__.split(".")[1])
 
     # Skips CK C++ extension compilation if using Triton Backend
-    if ROCM_BACKEND == "ck":
+    if not SKIP_CK_BUILD:
         ck_dir = "csrc/composable_kernel"
 
         #use codegen get code dispatch
@@ -610,19 +595,6 @@ class NinjaBuildExtension(BuildExtension):
         super().__init__(*args, **kwargs)
 
 
-# Build install_requires based on platform
-if ROCM_BACKEND == "triton":
-    # Note: torch is excluded because pip resolves it to CUDA PyTorch from PyPI, overwriting any pre-installed ROCm PyTorch. Users must have torch installed.
-    install_requires = [
-        "einops",
-        "triton==3.5.1",
-    ]
-else:
-    install_requires = [
-        "torch",
-        "einops",
-    ]
-
 setup(
     name=PACKAGE_NAME,
     version=get_package_version(),
@@ -658,7 +630,10 @@ setup(
         "bdist_wheel": CachedWheelsCommand,
     },
     python_requires=">=3.9",
-    install_requires=install_requires,
+    install_requires=[
+        "torch",
+        "einops",
+    ],
     setup_requires=[
         "packaging",
         "psutil",
