@@ -1,5 +1,6 @@
 # Copyright (c) 2025, Tri Dao.
 
+from dataclasses import dataclass
 from typing import Union, Tuple
 
 import cutlass
@@ -111,18 +112,12 @@ def unpack_gqa_layout(T, qhead_per_kvhead, head_idx):
     return cute.make_tensor(T.iterator, cute.make_layout(shape_unpacked, stride=stride_unpacked))
 
 
+@dataclass
 class PackGQA:
-    def __init__(
-        self,
-        m_block_size: cutlass.Constexpr[int],
-        head_dim_padded: cutlass.Constexpr[int],
-        check_hdim_oob: cutlass.Constexpr[bool],
-        qhead_per_kvhead: cutlass.Constexpr[bool],
-    ):
-        self.m_block_size = m_block_size
-        self.head_dim_padded = head_dim_padded
-        self.check_hdim_oob = check_hdim_oob
-        self.qhead_per_kvhead = qhead_per_kvhead
+    m_block_size: cutlass.Constexpr[int]
+    head_dim_padded: cutlass.Constexpr[int]
+    check_hdim_oob: cutlass.Constexpr[bool]
+    qhead_per_kvhead: cutlass.Constexpr[bool]
 
     @cute.jit
     def compute_ptr(

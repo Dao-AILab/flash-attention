@@ -4,7 +4,6 @@ import os
 import pathlib
 from typing import Tuple
 from functools import partial, lru_cache
-from dataclasses import dataclass, fields
 
 import torch
 
@@ -15,7 +14,6 @@ except ImportError:
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.base_dsl.typing import JitArgument
 from cutlass.cutlass_dsl import NumericMeta
 from cutlass.cute.runtime import from_dlpack
 
@@ -41,42 +39,6 @@ def get_max_active_clusters(cluster_size):
 @lru_cache
 def get_device_capacity(device: torch.device = None) -> Tuple[int, int]:
     return torch.cuda.get_device_capability(device)
-
-
-@dataclass
-class ArgumentsBase(JitArgument):
-    def __c_pointers__(self):
-        all_fields = [getattr(self, field.name) for field in fields(self)]
-        non_constexpr_fields = [f for f in all_fields if not isinstance(f, StaticTypes)]
-        c_ptrs = []
-        for obj in non_constexpr_fields:
-            if hasattr(obj, "__c_pointers__"):
-                c_ptrs.extend(obj.__c_pointers__())
-        return c_ptrs
-
-    def __get_mlir_types__(self):
-        all_fields = [getattr(self, field.name) for field in fields(self)]
-        non_constexpr_fields = [f for f in all_fields if not isinstance(f, StaticTypes)]
-        types, self._values_pos = [], []
-        for obj in non_constexpr_fields:
-            if hasattr(obj, "__get_mlir_types__"):
-                obj_types = obj.__get_mlir_types__()
-                types.extend(obj_types)
-                self._values_pos.append(len(obj_types))
-            else:
-                self._values_pos.append(0)
-        return types
-
-    def __new_from_mlir_values__(self, values):
-        all_fields = {field.name: getattr(self, field.name) for field in fields(self)}
-        constexpr_fields = {n: f for n, f in all_fields.items() if isinstance(f, StaticTypes)}
-        non_constexpr_fields = {
-            n: f for n, f in all_fields.items() if not isinstance(f, StaticTypes)
-        }
-        for (name, field), n_items in zip(non_constexpr_fields.items(), self._values_pos):
-            non_constexpr_fields[name] = cutlass.new_from_mlir_values(field, values[:n_items])
-            values = values[n_items:]
-        return self.__class__(**non_constexpr_fields, **constexpr_fields)
 
 
 def load_cubin_module_data_patched(cubin_data, filepath):
