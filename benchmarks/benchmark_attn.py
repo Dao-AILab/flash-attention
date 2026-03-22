@@ -170,59 +170,49 @@ BACKENDS = [
 ]
 
 
-def get_peak_flops(device_name: str, dtype: torch.dtype = torch.bfloat16) -> float:
-    """Return peak FLOPS for known GPUs scaled to the given dtype. Returns None if unknown.
+def get_peak_flops(device_index: int = 0, dtype: torch.dtype = torch.bfloat16) -> float | None:
+    """Return peak BF16 dense TFLOPS for the given device. Returns None if unknown.
 
-    Base values are BF16 dense (without sparsity). Scaling:
+    Scaling by dtype:
       FP16 / BF16 : 1x  (identical hardware throughput)
       FP8         : 2x
-      FP32        : 0.5x
     """
-    if "A100" in device_name:
-        # data from https://www.nvidia.com/en-us/data-center/a100/
-        flops = 312e12
-    elif "H100" in device_name:
-        # data from https://www.nvidia.com/en-us/data-center/h100/
-        # NOTE: Specifications are one-half lower without sparsity.
-        if "NVL" in device_name:
-            flops = 835e12
-        elif "PCIe" in device_name:
-            flops = 756e12
-        else:  # for H100 SXM and other variants
-            flops = 989e12
-    elif "H200" in device_name:
-        # data from https://www.nvidia.com/en-us/data-center/h200/
-        flops = 989e12
-    elif "H20" in device_name:
-        flops = 148e12
-    elif "GB200" in device_name or "GB300" in device_name:
-        # Grace Blackwell Superchips (Grace CPU + Blackwell GPU)
-        # BF16 dense per GPU: 2,500 TFLOPS (half of 5,000 TFLOPS with sparsity)
-        # GB200 data from https://www.nvidia.com/en-us/data-center/dgx-gb200
-        # GB300 data from https://www.nvidia.com/en-us/data-center/dgx-gb300
-        flops = 2.5e15
-    elif "B300" in device_name:
-        # data from https://www.nvidia.com/en-us/data-center/b300/
-        # NOTE: Specifications are one-half lower without sparsity.
-        flops = 3.5e15
-    elif "B200" in device_name:
-        # data from https://www.nvidia.com/en-us/data-center/b200/
-        # data from https://nvdam.widen.net/s/wwnsxrhm2w/blackwell-datasheet-3384703
-        # NOTE: Specifications are one-half lower without sparsity.
-        flops = 2.25e15
-    elif "A6000" in device_name:
-        flops = 309.7e12
-    elif "L40S" in device_name or "l40s" in device_name:
-        flops = 362e12
-    else:
-        return None  # unknown device, MFU will be omitted
+    # BF16 dense peak FLOPS from official NVIDIA spec sheets.
+    # Checked against: num_SMs * tensor_core_clock * ops_per_SM_per_cycle.
+    # The tensor core clock is NOT queryable (it differs from the max boost SM
+    # clock reported by nvidia-smi), so we hardcode the spec-sheet values.
+    _PEAK_BF16_FLOPS = {
+        # Ampere
+        "A100":  312e12,
+        "A6000": 309.7e12,
+        # Ada Lovelace
+        "L40S":  362e12,
+        # Hopper
+        "H100 SXM": 989e12,
+        "H100 NVL": 835e12,
+        "H100 PCIe": 756e12,
+        "H200":  989e12,
+        "H20":   148e12,
+        # Blackwell
+        "GB200": 2.5e15,
+        "GB300": 2.5e15,
+        "B300":  2.25e15,
+        "B200":  2.25e15,
+    }
+
+    device_name = torch.cuda.get_device_name(device_index)
+    # Match longest key first so "H100 SXM" matches before "H100"
+    peak = None
+    for key in sorted(_PEAK_BF16_FLOPS, key=len, reverse=True):
+        if key.lower() in device_name.lower():
+            peak = _PEAK_BF16_FLOPS[key]
+            break
+    if peak is None:
+        return None
 
     if dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-        flops *= 2
-    elif dtype == torch.float32:
-        flops *= 0.5
-    # torch.float16 and torch.bfloat16 have identical throughput, no scaling needed
-    return flops
+        peak *= 2
+    return peak
 
 
 def parse_int_k(s):
@@ -326,7 +316,7 @@ def main():
     dtype = torch.bfloat16
     dtype_gen = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
     device = 'cuda'
-    peak_flops = get_peak_flops(torch.cuda.get_device_name(0), dtype=dtype)
+    peak_flops = get_peak_flops(0, dtype=dtype)
     page_size = None
     softcap = 0.0
     deterministic = args.deterministic
