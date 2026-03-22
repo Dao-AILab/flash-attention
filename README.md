@@ -1,4 +1,6 @@
 # FlashAttention
+
+[![gitcgr](https://gitcgr.com/badge/Dao-AILab/flash-attention.svg)](https://gitcgr.com/Dao-AILab/flash-attention)
 This repository provides the official implementation of FlashAttention and
 FlashAttention-2 from the
 following papers.
