@@ -214,15 +214,27 @@ ext_modules = []
 # files included in the source distribution, in case the user compiles from source.
 if IS_ROCM:
     if ROCM_BACKEND == "triton":
-        if os.path.isdir(".git"):
+        if os.path.isdir("third_party/aiter"):
+            # If the submodule is already present (possibly with local patches applied),
+            # skip `git submodule update` to avoid overwriting local changes.
+            pass
+        elif os.path.isdir(".git"):
             subprocess.run(["git", "submodule", "update", "--init", "third_party/aiter"], check=True)
         else:
             assert os.path.isdir("third_party/aiter"), (
                 "third_party/aiter is missing, please use source distribution or git clone"
             )
+        aiter_install_env = os.environ.copy()
+        if sys.platform == "win32":
+            # CK (composable_kernel) is not available on Windows; disable it
+            # and skip pre-building HIP C++ kernels so only the pure-Triton
+            # flash-attention path is installed.
+            aiter_install_env["ENABLE_CK"] = "0"
+            aiter_install_env["PREBUILD_KERNELS"] = "0"
         subprocess.run(
             [sys.executable, "-m", "pip", "install", "--no-build-isolation", "third_party/aiter"],
             check=True,
+            env=aiter_install_env,
         )
     elif ROCM_BACKEND == "ck":
         if os.path.isdir(".git"):
@@ -615,8 +627,12 @@ if ROCM_BACKEND == "triton":
     # Note: torch is excluded because pip resolves it to CUDA PyTorch from PyPI, overwriting any pre-installed ROCm PyTorch. Users must have torch installed.
     install_requires = [
         "einops",
-        "triton==3.5.1",
     ]
+    if sys.platform == "win32":
+        # triton-windows is the community port of Triton for Windows ROCm
+        install_requires.append("triton-windows>=3.2.0")
+    else:
+        install_requires.append("triton==3.5.1")
 else:
     install_requires = [
         "torch",
@@ -650,6 +666,7 @@ setup(
         "Programming Language :: Python :: 3",
         "License :: OSI Approved :: BSD License",
         "Operating System :: Unix",
+        "Operating System :: Microsoft :: Windows",
     ],
     ext_modules=ext_modules,
     cmdclass={"bdist_wheel": CachedWheelsCommand, "build_ext": NinjaBuildExtension}
