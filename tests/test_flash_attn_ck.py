@@ -859,7 +859,7 @@ def test_flash_attn_causal(seqlen_q, seqlen_k, swap_sq_sk, d, local, dtype):
     assert (out - out_ref).abs().max().item() <= 4 * (out_pt - out_ref).abs().max().item() + 1e-5
 
     g = torch.randn_like(out)
-    if is_bwd_hdim_supported(d):
+    if is_bwd_supported(d, deterministic=False):
         do_o = (g.float() * out.float()).sum(-1)
         (
             dq,
@@ -889,10 +889,10 @@ def test_flash_attn_causal(seqlen_q, seqlen_k, swap_sq_sk, d, local, dtype):
         print(f"dK Pytorch mean diff: {(dk_pt - dk_ref).abs().mean().item()}")
         print(f"dV Pytorch mean diff: {(dv_pt - dv_ref).abs().mean().item()}")
 
-    # TODO - use 10 times to check, wait for ck to fix bwd precision issue
-    assert (dq - dq_ref).abs().max().item() <= 10 * (dq_pt - dq_ref).abs().max().item() + 1e-4
-    assert (dk - dk_ref).abs().max().item() <= 10 * (dk_pt - dk_ref).abs().max().item() + 1e-4
-    assert (dv - dv_ref).abs().max().item() <= 10 * (dv_pt - dv_ref).abs().max().item() + 1e-4
+        # TODO - use 10 times to check, wait for ck to fix bwd precision issue
+        assert (dq - dq_ref).abs().max().item() <= 10 * (dq_pt - dq_ref).abs().max().item() + 1e-4
+        assert (dk - dk_ref).abs().max().item() <= 10 * (dk_pt - dk_ref).abs().max().item() + 1e-4
+        assert (dv - dv_ref).abs().max().item() <= 10 * (dv_pt - dv_ref).abs().max().item() + 1e-4
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
@@ -1013,7 +1013,7 @@ def test_flash_attn_varlen_causal(
     g = torch.randn_like(out)
     if is_bwd_hdim_supported(d):
         do_o = (g.float() * out.float()).sum(-1)
-        test_backward = block_table is None
+        test_backward = block_table is None and is_bwd_supported(d, deterministic=False)
         if test_backward:
             (
                 dq_unpad,
@@ -1361,6 +1361,8 @@ def test_flash_attn_race_condition(seqlen_q, seqlen_k, d, dropout_p, causal, dty
     torch.random.manual_seed(42)
     out0, lse0, _ = flash_attn_func(q, k, v, dropout_p, causal=causal, return_attn_probs=True)
     g = torch.randn_like(out0)
+    if dropout_p == 0 and not is_bwd_supported(d, deterministic=False):
+        pytest.skip("CK backward is not supported on gfx11.")
     if dropout_p == 0 and is_bwd_hdim_supported(d):
         (
             dq0,
@@ -1403,6 +1405,8 @@ def test_flash_attn_bwd_overflow(seqlen, d, causal, dtype):
     # TODO - 1 or 2 might fail, need to check
     if seqlen == 1 or seqlen == 2:
         pytest.skip()
+    if not is_bwd_supported(d, deterministic=False):
+        pytest.skip("CK backward is not supported on gfx11.")
 
     device = "cuda"
     # set seed
@@ -1456,6 +1460,9 @@ def test_flash_attn_bwd_transpose(seqlen, d, causal, dtype):
     """We previously had a bug where we were using the wrong strides of dout, which shows up
     when dout is not contiguous.
     """
+    if not is_bwd_supported(d, deterministic=False):
+        pytest.skip("CK backward is not supported on gfx11.")
+
     device = "cuda"
     # set seed
     torch.random.manual_seed(0)
@@ -1506,6 +1513,9 @@ def test_flash_attn_bwd_varlen_overflow(d, causal, dtype):
     """We previously had a bug where not masking elements beyond seqlen_k caused NaN in dQ,
     in the case where seqlen % 128 != 0 or varlen.
     """
+    if not is_bwd_supported(d, deterministic=False):
+        pytest.skip("CK backward is not supported on gfx11.")
+
     device = "cuda"
     # set seed
     torch.random.manual_seed(0)
