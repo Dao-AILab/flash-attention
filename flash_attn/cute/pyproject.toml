@@ -32,6 +32,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+cu13 = ["nvidia-cutlass-dsl[cu13]>=4.4.2"]
 dev = [
     "pytest",
     "ruff",
@@ -50,6 +51,16 @@ root = "../.."
 tag_regex = "^fa4-v(?P<version>.+)$"
 git_describe_command = "git describe --dirty --tags --long --match 'fa4-v*'"
 fallback_version = "0.0.0"
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu130", marker = "extra == 'cu13'" },
+]
 
 [tool.ruff]
 line-length = 100

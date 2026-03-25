@@ -71,6 +71,11 @@ To install:
 pip install flash-attn-4
 ```
 
+If you're on CUDA 13, we recommend installing with the `cu13` extra for best performance:
+```sh
+pip install "flash-attn-4[cu13]"
+```
+
 Once installed, you can use it as follows:
 ```python
 from flash_attn.cute import flash_attn_func
