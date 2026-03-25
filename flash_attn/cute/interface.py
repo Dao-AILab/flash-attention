@@ -524,7 +524,7 @@ def _flash_attn_fwd(
         and seqused_q is None
         and not use_block_sparsity
         and page_size in [None, 128]
-        and int(math.ceil(head_dim / 16) * 16) == 128
+        and int(math.ceil(head_dim / 16) * 16) in [128, 192]
         and int(math.ceil(head_dim_v / 16) * 16) == 128
         and seqlen_q_packgqa > 2 * tile_m
         and (tile_m % qhead_per_kvhead == 0 or not pack_gqa)

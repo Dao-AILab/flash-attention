@@ -73,8 +73,8 @@ from flash_attn.cute.tile_scheduler import (
 _TUNING_CONFIG = {
     (True, False, 128, False): {'ex2_emu_freq': 10, 'ex2_emu_start_frg': 1, 'num_regs_softmax': 176, 'num_regs_correction': 88},
     (False, True, 128, False): {'ex2_emu_freq': 16, 'ex2_emu_start_frg': 1, 'num_regs_softmax': 192, 'num_regs_correction': 72},
-    (True, False, 192, False): {"ex2_emu_freq": 14, "ex2_emu_start_frg": 0, "num_regs_softmax": 184, "num_regs_correction": 72},
-    (False, True, 192, False): {"ex2_emu_freq": 24, "ex2_emu_start_frg": 1, "num_regs_softmax": 192, "num_regs_correction": 80},
+    (True, False, 192, False): {"ex2_emu_freq": 16, "ex2_emu_start_frg": 0, "num_regs_softmax": 184, "num_regs_correction": 80},
+    (False, True, 192, False): {"ex2_emu_freq": 32, "ex2_emu_start_frg": 1, "num_regs_softmax": 192, "num_regs_correction": 72},
     (True, False, 128, True): {"ex2_emu_freq": 0, "ex2_emu_start_frg": 0, "num_regs_softmax": 176, "num_regs_correction": 80},
     (False, True, 128, True): {"ex2_emu_freq": 0, "ex2_emu_start_frg": 0, "num_regs_softmax": 176, "num_regs_correction": 64},
     (True, False, 192, True): {"ex2_emu_freq": 0, "ex2_emu_start_frg": 0, "num_regs_softmax": 176, "num_regs_correction": 64},
@@ -499,7 +499,7 @@ class FlashAttentionForwardSm100:
             tma_atom_Q = None
             async_copy_elems = 128 // self.q_dtype.width
             num_load_threads = cute.arch.WARP_SIZE * len(self.load_warp_ids)
-            threads_per_row = self.head_dim_padded // async_copy_elems
+            threads_per_row = math.gcd(self.head_dim_padded // async_copy_elems, num_load_threads)
             gmem_tiled_copy_Q = copy_utils.tiled_copy_2d(
                 self.q_dtype, threads_per_row, num_load_threads, async_copy_elems, is_async=True
             )
@@ -562,8 +562,11 @@ class FlashAttentionForwardSm100:
                     if const_expr(not self.is_persistent)
                     else StaticPersistentTileScheduler
                 )
+        # For non-persistent 2CTA (use_cluster_idx), each cluster covers
+        # cta_tiler[0] * cta_group_size rows, so num_block must be divided accordingly
+        _num_block_divisor = self.cta_tiler[0] * (self.cta_group_size if not self.is_persistent and self.cta_group_size > 1 else 1)
         tile_sched_args = TileSchedulerArguments(
-            cute.ceil_div(cute.size(mQ.shape[0]), self.cta_tiler[0]),
+            cute.ceil_div(cute.size(mQ.shape[0]), _num_block_divisor),
             cute.size(mQ.shape[2]),
             cute.size(mQ.shape[3])
             if const_expr(mCuSeqlensQ is None)
@@ -586,6 +589,7 @@ class FlashAttentionForwardSm100:
             lpt=self.is_causal or self.is_local,
             is_split_kv=self.is_split_kv,
             cluster_shape_mn=self.cluster_shape_mn,
+            use_cluster_idx=not self.is_persistent and self.cta_group_size > 1,
         )
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
         self.tile_scheduler_cls = TileScheduler

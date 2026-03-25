@@ -5,6 +5,7 @@
 *.plk
 .DS_store
 .vscode
+worktrees/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

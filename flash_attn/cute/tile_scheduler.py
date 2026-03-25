@@ -51,6 +51,7 @@ class TileSchedulerArguments(ParamsBase):
     lpt: cutlass.Constexpr[bool] = False
     is_split_kv: cutlass.Constexpr[bool] = False
     head_swizzle: cutlass.Constexpr[bool] = False
+    use_cluster_idx: cutlass.Constexpr[bool] = False
 
 
 class SingleTileScheduler:
@@ -63,6 +64,7 @@ class SingleTileScheduler:
         num_splits_divmod: FastDivmodDivisor
         is_split_kv: cutlass.Constexpr[bool] = False
         cluster_shape_mn: cutlass.Constexpr[Tuple[int, int]] = (1, 1)
+        use_cluster_idx: cutlass.Constexpr[bool] = False
 
         @staticmethod
         def create(
@@ -76,6 +78,7 @@ class SingleTileScheduler:
                 FastDivmodDivisor(args.num_splits),
                 args.is_split_kv,
                 args.cluster_shape_mn,
+                args.use_cluster_idx,
             )
 
     def __init__(self, params: Params, blk_coord: cute.Coord, *, loc=None, ip=None):
@@ -91,13 +94,11 @@ class SingleTileScheduler:
 
     @staticmethod
     def create(params: Params, *, loc=None, ip=None) -> "SingleTileScheduler":
-        # if const_expr(cute.size(params.cluster_shape_mn) == 1):
-        #     blk_coord = cute.arch.block_idx()
-        # else:
-        #     # All CTAs in a cluster must get the same block coordinate
-        #     blk_coord = cute.arch.cluster_idx()
-        # Temporary set to block_idx until we sort out the best way to handle cluster
-        blk_coord = cute.arch.block_idx()
+        if const_expr(cute.size(params.cluster_shape_mn) == 1 or not params.use_cluster_idx):
+            blk_coord = cute.arch.block_idx()
+        else:
+            # All CTAs in a cluster must get the same block coordinate
+            blk_coord = cute.arch.cluster_idx()
         return SingleTileScheduler(params, blk_coord, loc=loc, ip=ip)
 
     # called by host
@@ -110,8 +111,13 @@ class SingleTileScheduler:
     ) -> Tuple[Int32, Int32, Int32]:
         # TODO: this hard-codes the fact that we only use cluster = (1, 1) or (2, 1)
         assert params.cluster_shape_mn[1] == 1, "Only cluster_shape_mn[1] == 1 is supported"
+        if const_expr(params.use_cluster_idx):
+            # Grid must have num_block * cluster_m physical blocks so that there are num_block clusters
+            grid_x = params.num_block * params.cluster_shape_mn[0]
+        else:
+            grid_x = cute.round_up(params.num_block, params.cluster_shape_mn[0])
         return (
-            cute.round_up(params.num_block, params.cluster_shape_mn[0]),
+            grid_x,
             params.num_head * params.num_splits,
             params.num_batch,
         )
