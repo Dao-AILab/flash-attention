@@ -395,8 +395,8 @@ class SingleTileLPTBwdScheduler:
         ) -> "SingleTileLPTBwdScheduler.Params":
             size_l2 = 50 * 1024 * 1024
             size_one_qdo_head = args.seqlen_k * (args.headdim + args.headdim_v) * args.element_size
-            # size_one_dqaccum_head = args.seqlen_k * (args.headdim) * 4
-            size_one_dqaccum_head = 0
+            size_one_dqaccum_head = args.seqlen_k * (args.headdim) * 4
+            # size_one_dqaccum_head = 0
             size_one_head = size_one_qdo_head + size_one_dqaccum_head
             log2_floor = lambda n: 31 - clz(n)
             swizzle = 1 if size_l2 < size_one_head else (1 << log2_floor(size_l2 // size_one_head))
@@ -521,9 +521,12 @@ class SingleTileVarlenScheduler:
             args: TileSchedulerArguments, *, loc=None, ip=None
         ) -> "SingleTileVarlenScheduler.Params":
             size_l2 = 50 * 1024 * 1024  # 50 MB for K & V
-            max_kvblock_in_l2 = size_l2 // (
-                (args.headdim + args.headdim_v) * args.element_size * args.tile_shape_mn[1]
-            )
+            # if backward, this is qdo block size
+            kv_block_size = (args.headdim + args.headdim_v) * args.element_size * args.tile_shape_mn[1]
+            # if backward, add dqaccum block size to calculate swizzle
+            if args.head_swizzle:
+                kv_block_size += args.headdim * 4 * args.tile_shape_mn[1]
+            max_kvblock_in_l2 = size_l2 // kv_block_size
             assert args.mCuSeqlensQ is not None or args.mSeqUsedQ is not None, (
                 "At least one of mCuSeqlensQ or mSeqUsedQ must be provided"
             )
@@ -654,6 +657,7 @@ class SingleTileVarlenScheduler:
                 num_n_blocks = (
                     num_m_blocks
                     * params.tile_shape_mn[0]
+                    * params.cluster_shape_m
                     // params.qhead_per_kvhead_packgqa
                     // params.tile_shape_mn[1]
                 )
