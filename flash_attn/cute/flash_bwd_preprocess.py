@@ -43,6 +43,8 @@ class FlashAttentionBackwardPreprocess:
         head_dim_v: int,
         tile_m: int = 128,
         num_threads: int = 256,
+        qhead_per_kvhead: cutlass.Constexpr[int] = 1,
+        pack_gqa: bool = False,
     ):
         """
         All contiguous dimensions must be at least 16 bytes aligned which indicates the head dimension
@@ -58,6 +60,12 @@ class FlashAttentionBackwardPreprocess:
         self.use_pdl = BaseDSL._get_dsl().get_arch_enum() >= Arch.sm_90a
         self.dtype = dtype
         self.tile_m = tile_m
+        self.pack_gqa = pack_gqa
+        self.qhead_per_kvhead = qhead_per_kvhead
+        if pack_gqa:
+            assert tile_m % qhead_per_kvhead == 0, (
+                "For PackGQA, tile_m must be divisible by qhead_per_kvhead"
+            )
         # padding head_dim to a multiple of 32 as k_block_size
         hdim_multiple_of = 32
         self.head_dim_padded = int(math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of)
@@ -157,6 +165,58 @@ class FlashAttentionBackwardPreprocess:
             if const_expr(mdLSE.element_type not in [Float32]):
                 raise TypeError("dLSE tensor must be Float32")
 
+        if const_expr(self.pack_gqa):
+            # (..., s, h, d) --> (..., (qhead_per_kvhead, s), h//qhead_per_kvhead, d)
+            shape_O_packed = (
+                *mO.shape[:-3],
+                (self.qhead_per_kvhead, mO.shape[-3]),
+                mO.shape[-2] // self.qhead_per_kvhead,
+                mO.shape[-1],
+            )
+            stride_O_packed = (
+                *mO.stride[:-3],
+                (mO.stride[-2], mO.stride[-3]),
+                mO.stride[-2] * self.qhead_per_kvhead,
+                mO.stride[-1],
+            )
+            mO = cute.make_tensor(
+                mO.iterator, cute.make_layout(shape_O_packed, stride=stride_O_packed)
+            )
+            mdO = cute.make_tensor(
+                mdO.iterator, cute.make_layout(shape_O_packed, stride=stride_O_packed)
+            )
+
+            if const_expr(mLSE is not None):
+                # (..., h, s) --> (..., h//qhead_per_kvhead, (qhead_per_kvhead, s))
+                shape_LSE_packed = (
+                    *mLSE.shape[:-2],
+                    mLSE.shape[-2] // self.qhead_per_kvhead,
+                    (self.qhead_per_kvhead, mLSE.shape[-1]),
+                )
+                stride_LSE_packed = (
+                    *mLSE.stride[:-2],
+                    mLSE.stride[-2] * self.qhead_per_kvhead,
+                    (mLSE.stride[-2], mLSE.stride[-1]),
+                )
+                mLSE = cute.make_tensor(
+                    mLSE.iterator, cute.make_layout(shape_LSE_packed, stride=stride_LSE_packed)
+                )
+
+            if const_expr(mdLSE is not None):
+                shape_dLSE_packed = (
+                    *mdLSE.shape[:-2],
+                    mdLSE.shape[-2] // self.qhead_per_kvhead,
+                    (self.qhead_per_kvhead, mdLSE.shape[-1]),
+                )
+                stride_dLSE_packed = (
+                    *mdLSE.stride[:-2],
+                    mdLSE.stride[-2] * self.qhead_per_kvhead,
+                    (mdLSE.stride[-2], mdLSE.stride[-1]),
+                )
+                mdLSE = cute.make_tensor(
+                    mdLSE.iterator, cute.make_layout(shape_dLSE_packed, stride=stride_dLSE_packed)
+                )
+
         self._setup_attributes()
 
         # (batch, nheads, seqlen) -> (seqlen, nheads, batch) or (total_q, nheads) -> (nheads, total_q)
@@ -164,7 +224,7 @@ class FlashAttentionBackwardPreprocess:
         mPdPsum = layout_utils.select(mPdPsum, transpose)
         if const_expr(mLSE is not None):
             mLSE = layout_utils.select(mLSE, transpose)
-            mLSElog2 = layout_utils.select(mLSElog2, transpose)
+            mLSElog2 = layout_utils.select(mLSElog2, transpose) 
         if const_expr(mdLSE is not None):
             mdLSE = layout_utils.select(mdLSE, transpose)
         if const_expr(mdQaccum is not None):
@@ -180,17 +240,18 @@ class FlashAttentionBackwardPreprocess:
             num_batch = mO.shape[0]
 
         tile_sched_args = TileSchedulerArguments(
-            num_block=cute.ceil_div(mO.shape[1], self.tile_m),
+            num_block=cute.ceil_div(cute.size(mO.shape[1]), self.tile_m),
             num_head=num_head,
             num_batch=num_batch,
             num_splits=1,
             seqlen_k=0,
             headdim=0,
             headdim_v=mO.shape[2],
-            total_q=mO.shape[0],
+            total_q=cute.size(mO.shape[0]),
             tile_shape_mn=(self.tile_m, 1),
             mCuSeqlensQ=mCuSeqlensQ,
             mSeqUsedQ=mSeqUsedQ,
+            qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
         )
 
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
@@ -246,21 +307,36 @@ class FlashAttentionBackwardPreprocess:
             # Get the appropriate tiles for this thread block.
             # ///////////////////////////////////////////////////////////////////////////////
             seqlen = SeqlenInfo.create(
-                batch_idx, mO.shape[1], mCuSeqlensQ, mSeqUsedQ, tile=self.tile_m
+                batch_idx,
+                mO.shape[-3] if const_expr(not self.pack_gqa) else mO.shape[-3][1],
+                mCuSeqlensQ,
+                mSeqUsedQ,
+                tile=self.tile_m,
+                qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
             )
-            mO_cur = seqlen.offset_batch(mO, batch_idx, dim=0)[None, head_idx, None]
-            mdO_cur = seqlen.offset_batch(mdO, batch_idx, dim=0)[None, head_idx, None]
+            if const_expr(not seqlen.has_cu_seqlens):
+                mO_cur = mO[batch_idx, None, head_idx, None]
+                mdO_cur = mdO[batch_idx, None, head_idx, None]
+            else:
+                seq_off = seqlen.offset if const_expr(not self.pack_gqa) else (0, seqlen.offset)
+                mO_cur = cute.domain_offset((seq_off, 0), mO[None, head_idx, None])
+                mdO_cur = cute.domain_offset((seq_off, 0), mdO[None, head_idx, None])
             mPdPsum_cur = seqlen.offset_batch(mPdPsum, batch_idx, dim=2, padded=True)[
                 None, head_idx
             ]
             headdim_v = mO_cur.shape[cute.rank(mO_cur) - 1]
-            seqlen_q = seqlen.seqlen
+            seqlen_q = seqlen.seqlen * (self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1)
             seqlen_q_rounded = cute.round_up(seqlen_q, self.tile_m)
             seqlen_limit = seqlen_q - m_block * self.tile_m
 
             lse = None
             if const_expr(mLSE is not None):
-                mLSE_cur = seqlen.offset_batch(mLSE, batch_idx, dim=2)[None, head_idx]
+                if const_expr(not seqlen.has_cu_seqlens):
+                    mLSE_cur = mLSE[None, head_idx, batch_idx]
+                else:
+                    mLSE_cur = seqlen.offset_batch(mLSE, batch_idx, dim=2, padded=False)[
+                        None, head_idx
+                    ]
                 gLSE = cute.local_tile(mLSE_cur, (self.tile_m,), (m_block,))
                 lse = Float32.inf
                 if tidx < seqlen_limit:
@@ -311,7 +387,12 @@ class FlashAttentionBackwardPreprocess:
             # If dLSE is provided, compute D' = D - dLSE (see module docstring for derivation).
             gdLSE = None
             if const_expr(mdLSE is not None):
-                mdLSE_cur = seqlen.offset_batch(mdLSE, batch_idx, dim=2)[None, head_idx]
+                if const_expr(not seqlen.has_cu_seqlens):
+                    mdLSE_cur = mdLSE[None, head_idx, batch_idx]
+                else:
+                    mdLSE_cur = seqlen.offset_batch(mdLSE, batch_idx, dim=2, padded=False)[
+                        None, head_idx
+                    ]
                 gdLSE = cute.local_tile(mdLSE_cur, (self.tile_m,), (m_block,))
 
             # Write PdPsum from rmem -> gmem

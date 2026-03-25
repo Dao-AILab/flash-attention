@@ -245,7 +245,7 @@ def test_flash_attn_output(
             print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
             print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
         # num_splits_vals = [1, 3]
-        pack_gqa_vals = [False, True, None] if not TEST_BWD_ONLY else [False]
+        pack_gqa_vals = [False, True, None]
         # SplitKV is not supported for hdim >= 192
         # pack_gqa_vals = [False]
         num_splits_vals = [1, 3] if d < 192 and not DISABLE_SPLIT and not TEST_BWD_ONLY else [1]
@@ -676,7 +676,7 @@ def test_flash_attn_varlen_output(
             fwd_atol = 2 * (out_ref + 0.3 - 0.3 - out_ref).abs().max().item()
             rtol = 2 if softcap == 0.0 else 3
 
-        pack_gqa_vals = [False, True, None] if not TEST_BWD_ONLY else [False]
+        pack_gqa_vals = [False, True, None]
         # pack_gqa_vals = [False]
         # num_splits_vals = [1, 3]
         # SplitKV is not supported for hdim >= 192

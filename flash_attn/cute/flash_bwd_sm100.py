@@ -65,6 +65,7 @@ class FlashAttentionBackwardSm100:
         mask_mod: cutlass.Constexpr | None = None,
         has_aux_tensors: cutlass.Constexpr = False,
         subtile_factor: cutlass.Constexpr[int] = 1,
+        pack_gqa: bool = False,
     ):
         # padding head_dim to a multiple of 16 as k_block_size
         hdim_multiple_of = 16
@@ -114,7 +115,7 @@ class FlashAttentionBackwardSm100:
         self.is_causal = is_causal
         self.is_local = is_local
         self.qhead_per_kvhead = qhead_per_kvhead
-        self.pack_gqa = False
+        self.pack_gqa = pack_gqa
         self.deterministic = deterministic
 
         # Score mod and mask mod support
@@ -481,9 +482,8 @@ class FlashAttentionBackwardSm100:
 
         self.is_varlen_k = mCuSeqlensK is not None or mSeqUsedK is not None
         self.is_varlen_q = mCuSeqlensQ is not None or mSeqUsedQ is not None
-        self.use_tma_store = not (self.qhead_per_kvhead == 1 and mCuSeqlensK is not None)
-        # self.use_tma_store = not self.qhead_per_kvhead == 1
-        self.dKV_postprocess = self.qhead_per_kvhead > 1
+        self.dKV_postprocess = self.qhead_per_kvhead > 1 and not self.pack_gqa
+        self.use_tma_store = self.dKV_postprocess or mCuSeqlensK is None
 
         if const_expr(self.dKV_postprocess):
             assert self.dk_dtype.width == 32, "Must accumulate dK in float precision for GQA"
@@ -514,6 +514,43 @@ class FlashAttentionBackwardSm100:
         dO_transpose = [1, 0, 2, 3] if const_expr(mCuSeqlensQ is None) else [1, 0, 2]
         mdO = layout_utils.select(mdO, mode=dO_transpose)
 
+        if const_expr(self.pack_gqa):
+            # Repack Q: (s, h, n, b) -> ((qh/kvh, s), h, n_kv, b)
+            # or varlen: (t, h, n) -> ((qh/kvh, t), h, n_kv)
+            shape_Q_packed = (
+                (self.qhead_per_kvhead, mQ.shape[0]),
+                mQ.shape[1],
+                mQ.shape[2] // self.qhead_per_kvhead,
+                *mQ.shape[3:],
+            )
+            stride_Q_packed = (
+                (mQ.stride[2], mQ.stride[0]),
+                mQ.stride[1],
+                mQ.stride[2] * self.qhead_per_kvhead,
+                *mQ.stride[3:],
+            )
+            mQ = cute.make_tensor(
+                mQ.iterator, cute.make_layout(shape_Q_packed, stride=stride_Q_packed)
+            )
+
+            # Repack dO: (h, s, n, b) -> (h, (qh/kvh, s), n_kv, b)
+            # or varlen: (h, t, n) -> (h, (qh/kvh, t), n_kv)
+            shape_dO_packed = (
+                mdO.shape[0],
+                (self.qhead_per_kvhead, mdO.shape[1]),
+                mdO.shape[2] // self.qhead_per_kvhead,
+                *mdO.shape[3:],
+            )
+            stride_dO_packed = (
+                mdO.stride[0],
+                (mdO.stride[2], mdO.stride[1]),
+                mdO.stride[2] * self.qhead_per_kvhead,
+                *mdO.stride[3:],
+            )
+            mdO = cute.make_tensor(
+                mdO.iterator, cute.make_layout(shape_dO_packed, stride=stride_dO_packed)
+            )
+
         # Transposes for 2-CTA K/Q paths (Q follows Q seqlens, K follows K seqlens)
         transpose_sh_q = dO_transpose
         transpose_sh_k = [1, 0, 2, 3] if const_expr(mCuSeqlensK is None) else [1, 0, 2]
@@ -524,7 +561,7 @@ class FlashAttentionBackwardSm100:
             assert mdQ_semaphore is not None
             mdQ_semaphore = layout_utils.select(mdQ_semaphore, mode=semaphore_transpose)
 
-        if const_expr(self.deterministic and self.qhead_per_kvhead > 1):
+        if const_expr(self.deterministic and self.qhead_per_kvhead > 1 and not self.pack_gqa):
             assert mdK_semaphore is not None
             assert mdV_semaphore is not None
             mdK_semaphore, mdV_semaphore = [
@@ -724,11 +761,12 @@ class FlashAttentionBackwardSm100:
             cluster_shape_mn=self.cluster_shape_mnk[:2],
             mCuSeqlensQ=mCuSeqlensK,
             mSeqUsedQ=mSeqUsedK,
-            qhead_per_kvhead_packgqa=1,  # pack_gqa disabled for bwd
+            qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
             element_size=self.k_dtype.width // 8,
             is_persistent=self.is_persistent,  # persistent mode not tested
             lpt=self.spt,
             head_swizzle=self.deterministic,
+            is_bwd=True,
         )
 
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
@@ -1384,6 +1422,7 @@ class FlashAttentionBackwardSm100:
         tdQtdQ = thr_mma_dQ.make_fragment_C(dQacc_shape)
         tdQtdQ = cute.make_tensor(tmem_ptr + self.tmem_dQ_offset, tdQtdQ.layout)
 
+        qhead_per_kvhead_packgqa = self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1
         block_info = BlockInfo(
             self.tile_m,
             # self.tile_n,
@@ -1393,11 +1432,11 @@ class FlashAttentionBackwardSm100:
             False,  # is_split_kv
             window_size_left,
             window_size_right,
-            qhead_per_kvhead_packgqa=1,
+            qhead_per_kvhead_packgqa=qhead_per_kvhead_packgqa,
         )
         SeqlenInfoCls = partial(
             SeqlenInfoQK.create,
-            seqlen_q_static=mQ.shape[0],
+            seqlen_q_static=mQ.shape[0] if const_expr(not self.pack_gqa) else mQ.shape[0][1],
             seqlen_k_static=mK.shape[0],
             mCuSeqlensQ=mCuSeqlensQ,
             mCuSeqlensK=mCuSeqlensK,
@@ -1405,6 +1444,7 @@ class FlashAttentionBackwardSm100:
             mSeqUsedK=mSeqUsedK,
             tile_m=self.tile_m,
             tile_n=self.tile_n * self.cluster_shape_mnk[0],
+            qhead_per_kvhead_packgqa=qhead_per_kvhead_packgqa,
         )
         TileSchedulerCls = partial(self.tile_scheduler_cls.create, tile_sched_params)
 
@@ -1415,6 +1455,7 @@ class FlashAttentionBackwardSm100:
             swap_AB=True,
             window_size_left=window_size_left,
             window_size_right=window_size_right,
+            qhead_per_kvhead_packgqa=qhead_per_kvhead_packgqa,
         )
         #  EMPTY
         # (15)
@@ -1639,7 +1680,7 @@ class FlashAttentionBackwardSm100:
             m_block_min, m_block_max = block_info.get_m_block_min_max(
                 seqlen, n_block // self.cluster_shape_mnk[0]
             )
-            head_idx_kv = head_idx // self.qhead_per_kvhead
+            head_idx_kv = head_idx // self.qhead_per_kvhead if const_expr(not self.pack_gqa) else head_idx
 
             process_tile = (
                 const_expr(not self.is_local and not self.is_varlen_q) or m_block_min < m_block_max
@@ -1660,6 +1701,23 @@ class FlashAttentionBackwardSm100:
             tile_scheduler.prefetch_next_work()
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
+
+    @cute.jit 
+    def get_m_block_from_iter(self, iter_idx, m_block_min, m_block_max):
+        if const_expr(self.pack_gqa):
+            num_m_blocks = m_block_max - m_block_min 
+            num_m_blocks_per_head = num_m_blocks // self.qhead_per_kvhead
+            boundary = num_m_blocks_per_head * self.qhead_per_kvhead
+            qhead_swizzled = Int32(0)
+            pos_block = Int32(0)
+            if iter_idx < boundary:
+                qhead_swizzled = iter_idx // num_m_blocks_per_head
+                pos_block = iter_idx - qhead_swizzled * num_m_blocks_per_head
+            else:
+                qhead_swizzled = iter_idx 
+            return m_block_min + pos_block * self.qhead_per_kvhead + qhead_swizzled 
+        else:
+            return m_block_min + iter_idx
 
     @cute.jit
     def load(
@@ -1750,7 +1808,7 @@ class FlashAttentionBackwardSm100:
             m_block_min, m_block_max = block_info.get_m_block_min_max(
                 seqlen, n_block // self.cluster_shape_mnk[0]
             )
-            head_idx_kv = head_idx // self.qhead_per_kvhead
+            head_idx_kv = head_idx // self.qhead_per_kvhead if const_expr(not self.pack_gqa) else head_idx
             n_block_cta_group = n_block // self.cta_group_size
 
             # GMEM tensors (varlen-aware)
@@ -1760,7 +1818,8 @@ class FlashAttentionBackwardSm100:
             if const_expr(not seqlen.has_cu_seqlens_q):
                 mdO_cur = mdO[None, None, head_idx, batch_idx]
             else:
-                mdO_cur = cute.domain_offset((0, seqlen.offset_q), mdO[None, None, head_idx])
+                dO_seq_offset = seqlen.offset_q if const_expr(not self.pack_gqa) else (0, seqlen.offset_q)
+                mdO_cur = cute.domain_offset((0, dO_seq_offset), mdO[None, None, head_idx])
             mLSE_cur = seqlen.offset_batch_Q(mLSE, batch_idx, dim=2, padded=True)[None, head_idx]
             mdPsum_cur = seqlen.offset_batch_Q(mdPsum, batch_idx, dim=2, padded=True)[
                 None, head_idx
@@ -1771,8 +1830,9 @@ class FlashAttentionBackwardSm100:
                     mQt_cur = mQt[None, None, head_idx, batch_idx]
                     mdOt_cur = mdOt[None, None, head_idx, batch_idx]
                 else:
-                    mQt_cur = cute.domain_offset((0, seqlen.offset_q, 0), mQt)[None, None, head_idx]
-                    mdOt_cur = cute.domain_offset((seqlen.offset_q, 0, 0), mdOt)[
+                    qt_seq_offset = seqlen.offset_q if const_expr(not self.pack_gqa) else (0, seqlen.offset_q)
+                    mQt_cur = cute.domain_offset((0, qt_seq_offset, 0), mQt)[None, None, head_idx]
+                    mdOt_cur = cute.domain_offset((qt_seq_offset, 0, 0), mdOt)[
                         None, None, head_idx
                     ]
                 if const_expr(not seqlen.has_cu_seqlens_k):
@@ -1949,7 +2009,7 @@ class FlashAttentionBackwardSm100:
                         )
                     )
                 else:
-                    first_m_block = m_block_min
+                    first_m_block = self.get_m_block_from_iter(Int32(0), m_block_min, m_block_max)
                     if const_expr(self.use_2cta_instrs and self.tile_hdim == 192):
                         #### Prologue ####
                         assert should_load_Q and should_load_dO
@@ -3030,7 +3090,7 @@ class FlashAttentionBackwardSm100:
                     )
                     m_block_oob = m_block >= m_block_max
                 else:
-                    m_block = m_block_min + iter_idx
+                    m_block = self.get_m_block_from_iter(iter_idx, m_block_min, m_block_max)
                     m_block_oob = False
                     is_full_block = False
                 # Prefetch 1 stage of LSE
@@ -3081,7 +3141,8 @@ class FlashAttentionBackwardSm100:
                     )
 
                 #### APPLY MASK (after score_mod, matching forward pass order)
-                check_m_boundary = (m_block + 1) * self.tile_m > seqlen.seqlen_q
+                seqlen_q_packgqa = seqlen.seqlen_q * (self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1)
+                check_m_boundary = (m_block + 1) * self.tile_m > seqlen_q_packgqa
                 mask_fn(
                     tSrS_t2r,
                     m_block=m_block,
@@ -3531,7 +3592,7 @@ class FlashAttentionBackwardSm100:
                     if m_block_max > 0:
                         m_block = cutlass.min(m_block, m_block_max - 1)
                 else:
-                    m_block = m_block_min + iter_idx
+                    m_block = self.get_m_block_from_iter(iter_idx, m_block_min, m_block_max)
                 pipeline_dQ.consumer_wait(dQ_consumer_state)
                 # TMEM -> RMEM
                 tdQrdQ_t2r = cute.make_fragment(tdQrdQ_t2r_shape, Float32)
@@ -3598,9 +3659,10 @@ class FlashAttentionBackwardSm100:
                     #     )
                     # semaphore release for prior m_block
                     if const_expr(self.deterministic and stage == 0 and delay_semaphore_release):
-                        if m_block > m_block_min:
+                        if iter_idx > 0:
+                            prev_m_block = self.get_m_block_from_iter(iter_idx - 1, m_block_min, m_block_max)
                             barrier.arrive_inc(
-                                mdQ_semaphore_cur[(m_block - 1, None)].iterator,
+                                mdQ_semaphore_cur[(prev_m_block, None)].iterator,
                                 tidx,
                                 cta_rank_in_cluster,
                                 1,
@@ -3631,8 +3693,9 @@ class FlashAttentionBackwardSm100:
                 self.reduce_sync_barrier.arrive_and_wait()
                 # final semaphore release
                 if const_expr(self.deterministic and delay_semaphore_release):
+                    last_m_block = self.get_m_block_from_iter(loop_count - 1, m_block_min, m_block_max)
                     barrier.arrive_inc(
-                        mdQ_semaphore_cur[(m_block_max - 1, None)].iterator,
+                        mdQ_semaphore_cur[(last_m_block, None)].iterator,
                         tidx,
                         cta_rank_in_cluster,
                         1,
@@ -3677,7 +3740,7 @@ class FlashAttentionBackwardSm100:
         ) // 128
         num_wg = cute.arch.WARP_SIZE * len(self.compute_warp_ids) // 128
 
-        assert self.qhead_per_kvhead == 1, "This epilogue path is only for MHA"
+        assert self.qhead_per_kvhead == 1 or self.pack_gqa, "This epilogue path is only for MHA or pack_gqa"
         mdV_cur = seqlen.offset_batch_K(mdV, batch_idx, dim=3)[None, None, head_idx]
         mdK_cur = seqlen.offset_batch_K(mdK, batch_idx, dim=3)[None, None, head_idx]
 
@@ -3833,7 +3896,7 @@ class FlashAttentionBackwardSm100:
         # (8, tile_n / 128, 64 / 8) = (8, 1, 8) or (4, tile_n * 32 / (128 * 4)) = (4, 8)
         tdKVsdKV_r2s = thr_copy_r2s_dKV.partition_D(sdKV)
 
-        head_idx_kv = head_idx // self.qhead_per_kvhead
+        head_idx_kv = head_idx // self.qhead_per_kvhead if const_expr(not self.pack_gqa) else head_idx
         if const_expr(not self.dKV_postprocess):
             assert not seqlen.has_cu_seqlens_k, "varlen uses non tma store path"
             mdKV_cur = mdKV[None, None, head_idx_kv, batch_idx]  # (seqlen, hdim)
@@ -3862,7 +3925,7 @@ class FlashAttentionBackwardSm100:
                 gdKV, (flat_epi_tile,)
             )  # (tile_n * hdim / 2 / epi_stage, epi_stage)
 
-        deterministic_KV = self.deterministic and self.qhead_per_kvhead > 1
+        deterministic_KV = self.deterministic and self.qhead_per_kvhead > 1 and not self.pack_gqa
         if const_expr(deterministic_KV):
             mdKV_semaphore_cur = mdKV_semaphore[n_block, None, head_idx_kv, batch_idx]
 
