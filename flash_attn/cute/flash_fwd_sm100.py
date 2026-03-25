@@ -61,6 +61,28 @@ from flash_attn.cute.tile_scheduler import (
     SingleTileVarlenScheduler,
 )
 
+# === TUNING KNOBS (agent-editable) ===
+# Keys: (use_2cta_instrs: bool, is_causal: bool, head_dim_padded: int, is_sm103: bool)
+# Values:
+#   ex2_emu_freq: int — how often to use emulated exp2 (0=all hardware exp2, higher=more emulation).
+#                        SM103 has fast native exp2, so set freq=0 there.
+#   ex2_emu_start_frg: int — fragment index to start emulation from
+#   num_regs_softmax: int — register count for softmax warps (multiple of 8)
+#   num_regs_correction: int — register count for correction warps (multiple of 8)
+#   num_regs_other is derived: 512 - num_regs_softmax * 2 - num_regs_correction
+_TUNING_CONFIG = {
+    (True, False, 128, False): {'ex2_emu_freq': 10, 'ex2_emu_start_frg': 1, 'num_regs_softmax': 176, 'num_regs_correction': 88},
+    (False, True, 128, False): {'ex2_emu_freq': 16, 'ex2_emu_start_frg': 1, 'num_regs_softmax': 192, 'num_regs_correction': 72},
+    (True, False, 192, False): {"ex2_emu_freq": 14, "ex2_emu_start_frg": 0, "num_regs_softmax": 184, "num_regs_correction": 72},
+    (False, True, 192, False): {"ex2_emu_freq": 24, "ex2_emu_start_frg": 1, "num_regs_softmax": 192, "num_regs_correction": 80},
+    (True, False, 128, True): {"ex2_emu_freq": 0, "ex2_emu_start_frg": 0, "num_regs_softmax": 176, "num_regs_correction": 80},
+    (False, True, 128, True): {"ex2_emu_freq": 0, "ex2_emu_start_frg": 0, "num_regs_softmax": 176, "num_regs_correction": 64},
+    (True, False, 192, True): {"ex2_emu_freq": 0, "ex2_emu_start_frg": 0, "num_regs_softmax": 176, "num_regs_correction": 64},
+    (False, True, 192, True): {"ex2_emu_freq": 0, "ex2_emu_start_frg": 0, "num_regs_softmax": 176, "num_regs_correction": 72},
+}
+# === END TUNING KNOBS ===
+
+
 class FlashAttentionForwardSm100:
 
     def __init__(
@@ -141,8 +163,10 @@ class FlashAttentionForwardSm100:
         # Does S1 need to wait for S0 to finish
         # self.s0_s1_barrier = self.head_dim_padded in [64, 96] and (not self.is_causal and not self.is_local)
         is_sm103 = self.arch >= Arch.sm_103 and self.arch <= Arch.sm_103f
-        # self.enable_ex2_emu = self.head_dim_padded <= 128 and not is_sm103
-        self.enable_ex2_emu = (self.head_dim_padded <= 128 or (self.head_dim_padded == 192 and self.use_2cta_instrs and not self.is_causal and not self.is_local)) and not is_sm103
+        self.is_sm103 = is_sm103
+        # enable_ex2_emu is derived: True if tuning config has freq > 0, else fallback to default logic
+        _default_enable_ex2_emu = (self.head_dim_padded <= 128 or (self.head_dim_padded == 192 and self.use_2cta_instrs and not self.is_causal and not self.is_local)) and not is_sm103
+        self.enable_ex2_emu = _default_enable_ex2_emu
         self.s0_s1_barrier = False
         self.overlap_sO_sQ = (
             (self.head_dim_padded == 192 and self.head_dim_v_padded >= 64) or
@@ -210,31 +234,26 @@ class FlashAttentionForwardSm100:
         # vec buffer for row_max & row_sum
         self.tmem_vec_offset = self.tmem_s_offset
 
+        # Look up tuning config for register counts and ex2_emu params
+        _tune_key = (self.use_2cta_instrs, self.is_causal, self.head_dim_padded, self.is_sm103)
+        self._tune = _TUNING_CONFIG.get(_tune_key, {})
+        if "ex2_emu_freq" in self._tune:
+            self.enable_ex2_emu = self._tune["ex2_emu_freq"] > 0
         if self.head_dim_padded < 96:
             self.num_regs_softmax = 200 if not paged_kv_non_tma else 184
             self.num_regs_correction = 64
             self.num_regs_other = 48 if not paged_kv_non_tma else 80
         else:
-            # self.num_regs_softmax = 192 if self.is_causal or self.is_local else 184
-            if not self.enable_ex2_emu:
-                self.num_regs_softmax = 192 if not paged_kv_non_tma else 184
+            if not paged_kv_non_tma and "num_regs_softmax" in self._tune:
+                self.num_regs_softmax = self._tune["num_regs_softmax"]
+                self.num_regs_correction = self._tune["num_regs_correction"]
+            elif not paged_kv_non_tma:
+                self.num_regs_softmax = 192
+                self.num_regs_correction = 80
             else:
-                # self.num_regs_softmax = 200 if not paged_kv_non_tma else 184
-                self.num_regs_softmax = 192 if not paged_kv_non_tma else 184
-            # self.num_regs_softmax = 176
-            # self.num_regs_correction = 96
-            # self.num_regs_correction = 64 if self.is_causal or self.is_local else 80
-            if not self.enable_ex2_emu:
-                self.num_regs_correction = 80 if not paged_kv_non_tma else 64
-            else:
-                # self.num_regs_correction = 64
-                self.num_regs_correction = 80 if not paged_kv_non_tma else 64
-            # self.num_regs_other = 32
-            # self.num_regs_other = 64
-            # self.num_regs_other = 80
-            self.num_regs_other = 48 if not paged_kv_non_tma else 80
-            # self.num_regs_other = 96 if self.is_causal or self.is_local else 80
-            # self.num_regs_other = 64 if self.is_causal or self.is_local else 80
+                self.num_regs_softmax = 184
+                self.num_regs_correction = 64
+            self.num_regs_other = 512 - self.num_regs_softmax * 2 - self.num_regs_correction
 
         self.buffer_align_bytes = 1024
 
@@ -358,21 +377,14 @@ class FlashAttentionForwardSm100:
             and not (self.pack_gqa and self.m_block_size % self.qhead_per_kvhead != 0)
             and not (self.pack_gqa and self.is_split_kv)
         )
-        # This can be tuned
-        # This is currently very ad-hoc, we should tune it systematically
         self.ex2_emu_freq = 0
-        # self.ex2_emu_start_frg = 1 if self.is_causal else 0
-        self.ex2_emu_start_frg = 1
+        self.ex2_emu_start_frg = self._tune.get("ex2_emu_start_frg", 1)
         if const_expr(self.enable_ex2_emu):
-            self.ex2_emu_freq = 16
-            if const_expr(self.head_dim_padded == 128 and self.use_2cta_instrs):
-                self.ex2_emu_freq = 12
+            self.ex2_emu_freq = self._tune.get("ex2_emu_freq", 16)
             if const_expr(
                 self.pack_gqa and self.head_dim_padded > 64 and not self.is_causal and not self.is_local
             ):
-                self.ex2_emu_freq = 32 if mCuSeqlensQ is not None or mSeqUsedQ is not None else 10
-            if const_expr(self.head_dim_padded > 64 and self.is_causal):
-                self.ex2_emu_freq = 10
+                self.ex2_emu_freq = 32 if mCuSeqlensQ is not None or mSeqUsedQ is not None else self._tune.get("ex2_emu_freq", 10)
 
         cta_group = tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
         q_major_mode = tcgen05.OperandMajorMode.K
