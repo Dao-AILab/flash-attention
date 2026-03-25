@@ -59,9 +59,16 @@ jobs:
         python-version: '3.12'
     - name: Install build dependencies
       run: pip install build twine
+    - name: Extract version from tag
+      id: strip-prefix
+      run: |
+        TAG="${{ needs.prepare-release.outputs.release_tag }}"
+        echo "version=${TAG#fa4-v}" >> "$GITHUB_OUTPUT"
     - name: Build package
       run: python -m build
       working-directory: flash_attn/cute
+      env:
+        SETUPTOOLS_SCM_PRETEND_VERSION: ${{ steps.strip-prefix.outputs.version }}
     - name: Check package metadata
       run: twine check dist/*
       working-directory: flash_attn/cute
