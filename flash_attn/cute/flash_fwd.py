@@ -33,7 +33,7 @@ from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute.pack_gqa import PackGQA
 from flash_attn.cute.named_barrier import NamedBarrierFwd
 from flash_attn.cute.block_sparsity import BlockSparseTensors
-from flash_attn.cute.block_sparse_utils import sparse_tensor_m_block, run_block_sparse_mainloop_sm80
+from flash_attn.cute.block_sparse_utils import run_block_sparse_mainloop_sm80, get_total_block_count
 from flash_attn.cute.tile_scheduler import SingleTileScheduler, SingleTileVarlenScheduler, TileSchedulerArguments
 
 
@@ -954,11 +954,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             # ///////////////////////////////////////////////////////////////////////////////
             qkv_factor = self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1
             subtile = self.q_subtile_factor if self.q_subtile_factor is not None else 1
-            bs_m = sparse_tensor_m_block(m_block, qkv_factor, subtile)
-            total_block_cnt = blocksparse_tensors[0][batch_size, num_head, bs_m] + (
-                blocksparse_tensors[2][batch_size, num_head, bs_m]
-                if const_expr(blocksparse_tensors[2] is not None)
-                else Int32(0)
+            total_block_cnt = get_total_block_count(
+                blocksparse_tensors, batch_size, num_head, m_block, qkv_factor, subtile
             )
 
             bs_mask = AttentionMask(
