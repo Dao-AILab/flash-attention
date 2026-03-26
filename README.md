@@ -143,9 +143,10 @@ container from ROCm, which has all the required tools to install FlashAttention.
 
 #### Composable Kernel Backend
 FlashAttention-2 ROCm CK backend currently supports:
-1. MI200x, MI250x, MI300x, and MI355x GPUs.
+1. MI200x, MI250x, MI300x, MI355x, and RDNA 3/4 GPUs.
 2. Datatype fp16 and bf16
 3. Both forward's and backward's head dimensions up to 256.
+4. RDNA 3 GPUs do not currently support backward, and RDNA 4 GPUs support backward only with deterministic=False
 
 #### Triton Backend
 The Triton implementation of [Flash Attention](https://tridao.me/publications/flash2/flash2.pdf) supports AMD's CDNA (MI200, MI300) and RDNA GPUs using fp16, bf16, and fp32 datatypes. It provides forward and backward passes with causal masking, variable sequence lengths, arbitrary Q/KV sequence lengths and head sizes, MQA/GQA, dropout, rotary embeddings, ALiBi, paged attention, and FP8 (via the Flash Attention v3 interface). Sliding window attention is currently a work in progress.

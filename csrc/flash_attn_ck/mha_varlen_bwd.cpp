@@ -363,6 +363,9 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
     at::cuda::CUDAGuard device_guard{q.device()};
 
     auto opts = q.options();
+    if (flash::is_gfx1x_arch()) {
+        flash::check_gfx1x_bwd_supported(deterministic);
+    }
     auto softmax_d = torch::empty({batch_size, num_heads, max_seqlen_q}, opts.dtype(at::kFloat));
     at::Tensor dq_accum  = torch::zeros({num_heads, nsplits, total_q, head_size}, opts.dtype(at::kFloat));
 
