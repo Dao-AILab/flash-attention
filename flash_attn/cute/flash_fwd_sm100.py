@@ -787,8 +787,8 @@ class FlashAttentionForwardSm100:
 
         ThreadCooperativeGroup = partial(pipeline.CooperativeGroup, pipeline.Agent.Thread)
         mma_warp = ThreadCooperativeGroup(len([self.mma_warp_id]))
-        load_warps = ThreadCooperativeGroup(len(self.load_warp_ids))
         tma_warp = ThreadCooperativeGroup(1)
+        load_threads = ThreadCooperativeGroup(len(self.load_warp_ids) * cute.arch.WARP_SIZE)
         softmax_warps = ThreadCooperativeGroup(len(self.softmax0_warp_ids))
         softmax_threads = ThreadCooperativeGroup(cute.arch.WARP_SIZE * len(self.softmax0_warp_ids))
         # softmax_threads = ThreadCooperativeGroup(cute.arch.WARP_SIZE)
@@ -822,13 +822,10 @@ class FlashAttentionForwardSm100:
                 defer_sync=True,
             )
         else:
-            cpasync_producer_group_q = pipeline.CooperativeGroup(
-                pipeline.Agent.Thread, len(self.load_warp_ids) * cute.arch.WARP_SIZE
-            )
             pipeline_q = pipeline_custom.PipelineAsyncUmma.create(
                 barrier_storage=storage.mbar_load_Q.data_ptr(),
                 num_stages=self.q_stage,
-                producer_group=cpasync_producer_group_q,
+                producer_group=load_threads,
                 consumer_group=mma_warp,
                 cta_layout_vmnk=cta_layout_vmnk,
                 defer_sync=True,
@@ -844,13 +841,10 @@ class FlashAttentionForwardSm100:
                 defer_sync=True,
             )
         else:
-            cpasync_producer_group = pipeline.CooperativeGroup(
-                pipeline.Agent.Thread, len(self.load_warp_ids) * cute.arch.WARP_SIZE
-            )
             pipeline_kv = pipeline.PipelineAsyncUmma.create(
                 barrier_storage=storage.mbar_load_KV.data_ptr(),
                 num_stages=self.kv_stage,
-                producer_group=cpasync_producer_group,
+                producer_group=load_threads,
                 consumer_group=mma_warp,
                 cta_layout_vmnk=cta_layout_vmnk,
                 defer_sync=True,
