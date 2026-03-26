@@ -284,25 +284,12 @@ class SoftmaxSm100(Softmax):
         acc_S_row: cute.Tensor,
         row_max: Float32,
         acc_S_row_converted: cute.Tensor,
+        ex2_emu_freq: cutlass.Constexpr[int] = 0,
+        ex2_emu_res: cutlass.Constexpr[int] = 4,
+        ex2_emu_start_frg: cutlass.Constexpr[int] = 0,
     ):
         assert cute.size(acc_S_row.shape) % 2 == 0, "acc_S_row must have an even number of elements"
         minus_row_max_scaled = -row_max * self.scale_log2
-        for i in cutlass.range_constexpr(0, cute.size(acc_S_row.shape), 2):
-            acc_S_row[i], acc_S_row[i + 1] = cute.arch.fma_packed_f32x2(
-                (acc_S_row[i], acc_S_row[i + 1]),
-                (self.scale_log2, self.scale_log2),
-                (minus_row_max_scaled, minus_row_max_scaled),
-            )
-
-        # for i in cutlass.range_constexpr(0, cute.size(acc_S_row.shape), 2):
-        #     acc_S_row[i], acc_S_row[i + 1] = cute.arch.fma_packed_f32x2(
-        #         (acc_S_row[i], acc_S_row[i + 1]),
-        #         (self.scale_log2, self.scale_log2),
-        #         (minus_row_max_scaled, minus_row_max_scaled),
-        #     )
-        #     acc_S_row[i] = cute.math.exp2(acc_S_row[i], fastmath=True)
-        #     acc_S_row[i + 1] = cute.math.exp2(acc_S_row[i + 1], fastmath=True)
-
         frg_tile = 32
         assert frg_tile % 2 == 0
         frg_cnt = cute.size(acc_S_row) // frg_tile
@@ -313,17 +300,28 @@ class SoftmaxSm100(Softmax):
         )
         for j in cutlass.range_constexpr(frg_cnt):
             for k in cutlass.range_constexpr(0, cute.size(acc_S_row_frg, mode=[0]), 2):
-                # acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = (
-                #     cute.arch.fma_packed_f32x2(
-                #         (acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j]),
-                #         (self.scale_log2, self.scale_log2),
-                #         (minus_row_max_scaled, minus_row_max_scaled),
-                #     )
-                # )
-                # acc_S_row_frg[k, j] = cute.math.exp2(acc_S_row_frg[k, j], fastmath=True)
-                # acc_S_row_frg[k + 1, j] = cute.math.exp2(acc_S_row_frg[k + 1, j], fastmath=True)
-                acc_S_row_frg[k, j] = cute.math.exp2(acc_S_row_frg[k, j], fastmath=True)
-                acc_S_row_frg[k + 1, j] = cute.math.exp2(acc_S_row_frg[k + 1, j], fastmath=True)
+                acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = cute.arch.fma_packed_f32x2(
+                    (acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j]),
+                    (self.scale_log2, self.scale_log2),
+                    (minus_row_max_scaled, minus_row_max_scaled),
+                )
+                if cutlass.const_expr(ex2_emu_freq == 0):
+                    acc_S_row_frg[k, j] = cute.math.exp2(acc_S_row_frg[k, j], fastmath=True)
+                    acc_S_row_frg[k + 1, j] = cute.math.exp2(acc_S_row_frg[k + 1, j], fastmath=True)
+                else:
+                    if cutlass.const_expr(
+                        k % ex2_emu_freq < ex2_emu_freq - ex2_emu_res
+                        or j >= frg_cnt - 1
+                        or j < ex2_emu_start_frg
+                    ):
+                        acc_S_row_frg[k, j] = cute.math.exp2(acc_S_row_frg[k, j], fastmath=True)
+                        acc_S_row_frg[k + 1, j] = cute.math.exp2(
+                            acc_S_row_frg[k + 1, j], fastmath=True
+                        )
+                    else:
+                        acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = utils.ex2_emulation_2(
+                            acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j]
+                        )
             acc_S_row_converted_frg[None, j].store(
                 acc_S_row_frg[None, j].load().to(acc_S_row_converted.element_type)
             )

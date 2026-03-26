@@ -71,7 +71,7 @@ from flash_attn.cute.tile_scheduler import (
 #   num_regs_correction: int — register count for correction warps (multiple of 8)
 #   num_regs_other is derived: 512 - num_regs_softmax * 2 - num_regs_correction
 _TUNING_CONFIG = {
-    (True, False, 128, False): {'ex2_emu_freq': 10, 'ex2_emu_start_frg': 1, 'num_regs_softmax': 176, 'num_regs_correction': 88},
+    (True, False, 128, False): {'ex2_emu_freq': 16, 'ex2_emu_start_frg': 1, 'num_regs_softmax': 176, 'num_regs_correction': 88},
     (False, True, 128, False): {'ex2_emu_freq': 16, 'ex2_emu_start_frg': 1, 'num_regs_softmax': 192, 'num_regs_correction': 72},
     (True, False, 192, False): {"ex2_emu_freq": 16, "ex2_emu_start_frg": 0, "num_regs_softmax": 184, "num_regs_correction": 80},
     (False, True, 192, False): {"ex2_emu_freq": 32, "ex2_emu_start_frg": 1, "num_regs_softmax": 192, "num_regs_correction": 72},
@@ -2108,7 +2108,6 @@ class FlashAttentionForwardSm100:
         sm_stats_barrier.arrive_w_index(index=stage * 4 + warp_idx)
 
         # if thread_idx == 0 and stage == 0: cute.print_tensor(tSrS_t2r)
-        softmax.scale_subtract_rowmax(tSrS_t2r, row_max)
         # Sequence barrier wait
         if const_expr(self.s0_s1_barrier):
             pipeline_s0_s1_sequence.sync_object_full.wait(stage, s0_s1_sequence_phase)
@@ -2118,9 +2117,9 @@ class FlashAttentionForwardSm100:
         tSrP_r2t = cute.make_tensor(
             cute.recast_ptr(tSrP_r2t_f32.iterator, dtype=self.q_dtype), tSrS_t2r.layout
         )
-        # softmax.scale_apply_exp2_convert(tSrS_t2r, row_max, tSrP_r2t)
-        softmax.apply_exp2_convert(
+        softmax.scale_apply_exp2_convert(
             tSrS_t2r,
+            row_max,
             tSrP_r2t,
             ex2_emu_freq=self.ex2_emu_freq if const_expr(mask_fn is None) else 0,
             ex2_emu_start_frg=self.ex2_emu_start_frg,
