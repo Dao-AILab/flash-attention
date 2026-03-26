@@ -204,7 +204,13 @@ def validate_and_update_archs(archs):
     # Validate if each element in archs is in allowed_archs
     assert all(
         arch in allowed_archs for arch in archs
-    ), f"One of GPU archs of {archs} is invalid or not supported by Flash-Attention"
+    ), f"Invalid archs: {archs}. Allowed: {allowed_archs}"
+
+    if "native" in archs and len(archs) > 1:
+        raise ValueError(
+            f"'native' cannot be combined with explicit archs: {archs}. "
+            "Use either GPU_ARCHS='native' or GPU_ARCHS='gfx942;gfx950'."
+        )
 
 
 cmdclass = {}
@@ -405,13 +411,24 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
         else:
             if not torch.cuda.is_available():
                 raise RuntimeError(
-                    "GPU_ARCHS not provided and no ROCm device detected. "
-                    "Set GPU_ARCHS (e.g., gfx942) to target your GPU."
+                    "GPU_ARCHS not set and no GPU detected. "
+                    "Please set GPU_ARCHS (e.g. GPU_ARCHS='gfx942') to cross-compile."
                 )
-            detected_arch = torch.cuda.get_device_properties(torch.cuda.current_device()).gcnArchName.split(":")[0]
+            props = torch.cuda.get_device_properties(torch.cuda.current_device())
+            gcn_arch = getattr(props, "gcnArchName", None)
+            if not gcn_arch:
+                raise RuntimeError(
+                    "GPU_ARCHS not set and current device does not expose gcnArchName. "
+                    "This usually means the active PyTorch build is not ROCm. "
+                    "Please set GPU_ARCHS explicitly."
+                )
+            detected_arch = gcn_arch.split(":")[0]
             kernel_targets = [detected_arch.lower()]
             validate_and_update_archs(kernel_targets)
 
+        # NOTE: --targets requires CK >= 859acb5 (the submodule version pinned in this repo).
+        # If generate.py fails with an unknown argument error, ensure the
+        # composable_kernel submodule is up to date.
         targets_arg = ",".join(kernel_targets)
         for direction in ["fwd", "fwd_appendkv", "fwd_splitkv", "bwd"]:
             subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", direction, "--output_dir", "build", "--receipt", "2", "--optdim", optdim, "--targets", targets_arg], check=True)

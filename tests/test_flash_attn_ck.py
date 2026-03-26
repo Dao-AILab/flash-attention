@@ -69,6 +69,19 @@ def is_bwd_supported(d, deterministic):
     return True
 
 
+def get_bwd_unsupported_reason(d, deterministic):
+    if is_bwd_hdim_supported(d) is False:
+        return f"CK backward is not supported for head dim {d}."
+
+    if is_gfx11():
+        return "CK backward is not supported on gfx11."
+
+    if is_gfx12() and deterministic:
+        return "Deterministic CK backward is not supported on gfx12."
+
+    return "CK backward is not supported on this arch/configuration."
+
+
 def ck_randval_to_dropout_mask(randval, p):
     # If p = 0.3, randval in 255 * (0.7, 1.0] will be dropout
     # randval in 255 * [0, 0.7] will be kept
@@ -1011,46 +1024,44 @@ def test_flash_attn_varlen_causal(
     assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item() + 1e-5
 
     g = torch.randn_like(out)
-    if is_bwd_hdim_supported(d):
+    test_backward = block_table is None and is_bwd_supported(d, deterministic=False)
+    if test_backward:
         do_o = (g.float() * out.float()).sum(-1)
-        test_backward = block_table is None and is_bwd_supported(d, deterministic=False)
-        if test_backward:
-            (
-                dq_unpad,
-                dk_unpad,
-                dv_unpad,
-            ) = torch.autograd.grad(out, (q_unpad, k_unpad, v_unpad), g)
-            dq = dq_pad_fn(dq_unpad)
-            dk = dk_pad_fn(dk_unpad)
-            dv = dk_pad_fn(dv_unpad)
-            (
-                dq_ref,
-                dk_ref,
-                dv_ref,
-            ) = torch.autograd.grad(out_ref, (q, k, v), g)
-            (
-                dq_pt,
-                dk_pt,
-                dv_pt,
-            ) = torch.autograd.grad(out_pt, (q, k, v), g)
-            print(f"dQ max diff: {(dq - dq_ref).abs().max().item()}")
-            print(f"dK max diff: {(dk - dk_ref).abs().max().item()}")
-            print(f"dV max diff: {(dv - dv_ref).abs().max().item()}")
-            print(f"dQ mean diff: {(dq - dq_ref).abs().mean().item()}")
-            print(f"dK mean diff: {(dk - dk_ref).abs().mean().item()}")
-            print(f"dV mean diff: {(dv - dv_ref).abs().mean().item()}")
-            print(f"dQ Pytorch max diff: {(dq_pt - dq_ref).abs().max().item()}")
-            print(f"dK Pytorch max diff: {(dk_pt - dk_ref).abs().max().item()}")
-            print(f"dV Pytorch max diff: {(dv_pt - dv_ref).abs().max().item()}")
-            print(f"dQ Pytorch mean diff: {(dq_pt - dq_ref).abs().mean().item()}")
-            print(f"dK Pytorch mean diff: {(dk_pt - dk_ref).abs().mean().item()}")
-            print(f"dV Pytorch mean diff: {(dv_pt - dv_ref).abs().mean().item()}")
+        (
+            dq_unpad,
+            dk_unpad,
+            dv_unpad,
+        ) = torch.autograd.grad(out, (q_unpad, k_unpad, v_unpad), g)
+        dq = dq_pad_fn(dq_unpad)
+        dk = dk_pad_fn(dk_unpad)
+        dv = dk_pad_fn(dv_unpad)
+        (
+            dq_ref,
+            dk_ref,
+            dv_ref,
+        ) = torch.autograd.grad(out_ref, (q, k, v), g)
+        (
+            dq_pt,
+            dk_pt,
+            dv_pt,
+        ) = torch.autograd.grad(out_pt, (q, k, v), g)
+        print(f"dQ max diff: {(dq - dq_ref).abs().max().item()}")
+        print(f"dK max diff: {(dk - dk_ref).abs().max().item()}")
+        print(f"dV max diff: {(dv - dv_ref).abs().max().item()}")
+        print(f"dQ mean diff: {(dq - dq_ref).abs().mean().item()}")
+        print(f"dK mean diff: {(dk - dk_ref).abs().mean().item()}")
+        print(f"dV mean diff: {(dv - dv_ref).abs().mean().item()}")
+        print(f"dQ Pytorch max diff: {(dq_pt - dq_ref).abs().max().item()}")
+        print(f"dK Pytorch max diff: {(dk_pt - dk_ref).abs().max().item()}")
+        print(f"dV Pytorch max diff: {(dv_pt - dv_ref).abs().max().item()}")
+        print(f"dQ Pytorch mean diff: {(dq_pt - dq_ref).abs().mean().item()}")
+        print(f"dK Pytorch mean diff: {(dk_pt - dk_ref).abs().mean().item()}")
+        print(f"dV Pytorch mean diff: {(dv_pt - dv_ref).abs().mean().item()}")
 
-        if test_backward:
-            # TODO - use 10 times to check, wait for ck to fix bwd precision issue
-            assert (dq - dq_ref).abs().max().item() <= 10 * (dq_pt - dq_ref).abs().max().item() + 1e-5
-            assert (dk - dk_ref).abs().max().item() <= 10 * (dk_pt - dk_ref).abs().max().item() + 1e-5
-            assert (dv - dv_ref).abs().max().item() <= 10 * (dv_pt - dv_ref).abs().max().item() + 1e-5
+        # TODO - use 10 times to check, wait for ck to fix bwd precision issue
+        assert (dq - dq_ref).abs().max().item() <= 10 * (dq_pt - dq_ref).abs().max().item() + 1e-5
+        assert (dk - dk_ref).abs().max().item() <= 10 * (dk_pt - dk_ref).abs().max().item() + 1e-5
+        assert (dv - dv_ref).abs().max().item() <= 10 * (dv_pt - dv_ref).abs().max().item() + 1e-5
 
 
 # TODO - support splitkv
@@ -1361,9 +1372,8 @@ def test_flash_attn_race_condition(seqlen_q, seqlen_k, d, dropout_p, causal, dty
     torch.random.manual_seed(42)
     out0, lse0, _ = flash_attn_func(q, k, v, dropout_p, causal=causal, return_attn_probs=True)
     g = torch.randn_like(out0)
-    if dropout_p == 0 and not is_bwd_supported(d, deterministic=False):
-        pytest.skip("CK backward is not supported on gfx11.")
-    if dropout_p == 0 and is_bwd_hdim_supported(d):
+    test_backward = dropout_p == 0 and is_bwd_supported(d, deterministic=False)
+    if test_backward:
         (
             dq0,
             dk0,
@@ -1378,7 +1388,7 @@ def test_flash_attn_race_condition(seqlen_q, seqlen_k, d, dropout_p, causal, dty
         assert torch.equal(out, out0)
         assert torch.equal(lse, lse0)
 
-        if dropout_p == 0:
+        if test_backward:
             (
                 dq,
                 dk,
@@ -1406,7 +1416,7 @@ def test_flash_attn_bwd_overflow(seqlen, d, causal, dtype):
     if seqlen == 1 or seqlen == 2:
         pytest.skip()
     if not is_bwd_supported(d, deterministic=False):
-        pytest.skip("CK backward is not supported on gfx11.")
+        pytest.skip(get_bwd_unsupported_reason(d, deterministic=False))
 
     device = "cuda"
     # set seed
@@ -1461,7 +1471,7 @@ def test_flash_attn_bwd_transpose(seqlen, d, causal, dtype):
     when dout is not contiguous.
     """
     if not is_bwd_supported(d, deterministic=False):
-        pytest.skip("CK backward is not supported on gfx11.")
+        pytest.skip(get_bwd_unsupported_reason(d, deterministic=False))
 
     device = "cuda"
     # set seed
@@ -1514,7 +1524,7 @@ def test_flash_attn_bwd_varlen_overflow(d, causal, dtype):
     in the case where seqlen % 128 != 0 or varlen.
     """
     if not is_bwd_supported(d, deterministic=False):
-        pytest.skip("CK backward is not supported on gfx11.")
+        pytest.skip(get_bwd_unsupported_reason(d, deterministic=False))
 
     device = "cuda"
     # set seed
@@ -1561,8 +1571,6 @@ def test_flash_attn_bwd_varlen_overflow(d, causal, dtype):
     ],
 )
 def test_flash_attn_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, causal, local, dtype):
-    if is_gfx1x():
-        pytest.skip("Deterministic backward not yet supported on CK backend for gfx11/gfx12")
     if (
         max(seqlen_q, seqlen_k) >= 2048
         and torch.cuda.get_device_properties("cuda").total_memory <= 16 * 2**30
@@ -1580,6 +1588,9 @@ def test_flash_attn_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, causal, loc
     k = torch.randn(batch_size, seqlen_k, nheads, d, device=device, dtype=dtype, requires_grad=True)
     v = torch.randn(batch_size, seqlen_k, nheads, d, device=device, dtype=dtype, requires_grad=True)
     out = flash_attn_func(q, k, v, 0.0, causal=causal, window_size=window_size, deterministic=True)
+
+    if not is_bwd_supported(d, deterministic=True):
+        pytest.skip(get_bwd_unsupported_reason(d, deterministic=True))
 
     g = torch.randn_like(out)
     dq0, dk0, dv0 = torch.autograd.grad(out, (q, k, v), g, retain_graph=True)
@@ -1611,8 +1622,6 @@ def test_flash_attn_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, causal, loc
     ],
 )
 def test_flash_attn_varlen_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, causal, local, dtype):
-    if is_gfx1x():
-        pytest.skip("Deterministic backward not yet supported on CK backend for gfx11/gfx12")
     if (
         max(seqlen_q, seqlen_k) >= 2048
         and torch.cuda.get_device_properties("cuda").total_memory <= 16 * 2**30
@@ -1659,6 +1668,9 @@ def test_flash_attn_varlen_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, caus
         window_size=window_size,
         deterministic=True,
     )
+
+    if not is_bwd_supported(d, deterministic=True):
+        pytest.skip(get_bwd_unsupported_reason(d, deterministic=True))
 
     g = torch.randn_like(out)
     dq0, dk0, dv0 = torch.autograd.grad(out, (q_unpad, k_unpad, v_unpad), g, retain_graph=True)

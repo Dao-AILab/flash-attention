@@ -2,17 +2,12 @@
  * Copyright (c) 2024, Tri Dao.
  ******************************************************************************/
 
-#include "flash_common.hpp"
+#include "mha_fwd_head_grouping_utils.hpp"
 
-#include "fmha_fwd.hpp"
-#include "fmha_fwd_head_grouping.hpp"
 #include "mask.hpp"
 
 #include <optional>
 #include <string>
-#include <iostream>
-
-namespace head_grouping = fmha_fwd_head_grouping;
 
 fmha_fwd_traits get_ck_fmha_fwd_traits(const mask_info &mask,
                                        std::string dtype,
@@ -338,15 +333,12 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
                 softmax_scale,
                 p_dropout,
                 drop_seed_offset);
-        float t = -1.0f;
-        if(head_grouping::disabled_by_env())
-        {
-            if(head_grouping::log_enabled())
-                std::cout << "[LLC Head Grouping] disabled by env" << std::endl;
-        }
-        else
-        {
-            const auto group_size_opt = head_grouping::get_head_group_size(
+
+        float t =
+            flash::maybe_dispatch_head_grouped_fwd(
+                stream_config,
+                traits,
+                args,
                 num_heads,
                 num_heads_k,
                 batch_size,
@@ -354,63 +346,13 @@ mha_fwd(at::Tensor &q,                            // batch_size x seqlen_q x num
                 head_size,
                 head_size,
                 k.element_size(),
-                v.element_size());
-            if(group_size_opt.has_value() && group_size_opt.value() < num_heads)
-            {
-                if(head_grouping::log_enabled())
-                {
-                    const std::string arch = ck_tile::get_device_name();
-                    const size_t llc_bytes = head_grouping::get_llc_cache_bytes(arch);
-                    const ck_tile::index_t gqa_ratio = (num_heads_k > 0 ? (num_heads / num_heads_k) : 1);
-                    const ck_tile::index_t group_sz  = group_size_opt.value();
-                    const ck_tile::index_t n_groups = ck_tile::integer_divide_ceil(num_heads, group_sz);
-                    std::cout << "[LLC Head Grouping] enabled" << std::endl;
-                    std::cout << "[LLC Head Grouping] arch=" << (arch.empty() ? "unknown" : arch)
-                              << " llc_mb=" << (llc_bytes / (1024ull * 1024ull))
-                              << " nhead_q=" << num_heads << " nhead_k=" << num_heads_k
-                              << " gqa_ratio=" << gqa_ratio << " group_size=" << group_sz
-                              << " groups=" << n_groups << std::endl;
-                }
-                const bool use_blockscale_qscale = traits.qscale_type == quant_scale_enum::blockscale;
-                auto dispatch_grouped_fwd = [&](auto type_config_tag) {
-                    using TypeConfig = decltype(type_config_tag);
-                    return head_grouping::run_fwd_head_grouped<typename TypeConfig::QDataType,
-                                                               typename TypeConfig::KDataType,
-                                                               typename TypeConfig::VDataType,
-                                                               typename TypeConfig::ODataType,
-                                                               float,
-                                                               typename TypeConfig::LSEDataType,
-                                                               typename TypeConfig::RandValOutputDataType>(
-                        stream_config,
-                        traits,
-                        args,
-                        num_heads,
-                        num_heads_k,
-                        group_size_opt.value(),
-                        use_blockscale_qscale,
-                        [&](const auto& grouped_traits,
-                            auto& grouped_args,
-                            const auto& grouped_sc) {
-                            return fmha_fwd(grouped_traits, grouped_args, grouped_sc);
-                        });
-                };
-                if(q_dtype == torch::kFloat16)
-                {
-                    t = dispatch_grouped_fwd(FmhaFwdTypeConfig<FmhaFwdFp16>{});
-                }
-                else if(q_dtype == torch::kBFloat16)
-                {
-                    t = dispatch_grouped_fwd(FmhaFwdTypeConfig<FmhaFwdBf16>{});
-                }
-            }
-            else if(head_grouping::log_enabled())
-            {
-                std::cout << "[LLC Head Grouping] skipped (group_size not set or >= nhead)"
-                          << std::endl;
-            }
-        }
-        if(t < 0.0f)
-        {
+                v.element_size(),
+                q.scalar_type(),
+                [&](const auto& grouped_traits, auto& grouped_args, const auto& grouped_sc) {
+                    return fmha_fwd(grouped_traits, grouped_args, grouped_sc);
+                });
+
+        if (t < 0.0f) {
             t = fmha_fwd(traits, args, stream_config);
         }
         TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd");

@@ -80,42 +80,32 @@ int override_num_splits_if_necessary(int batch, int nhead, int max_seqlen_q, int
 
 inline std::string get_gcn_arch_name() {
 #ifdef USE_ROCM
-    static const std::string cached_arch = []() {
-        int dev = 0;
-        if (hipGetDevice(&dev) != hipSuccess) {
-            return std::string{};
-        }
-        hipDeviceProp_t prop{};
-        if (hipGetDeviceProperties(&prop, dev) != hipSuccess) {
-            return std::string{};
-        }
-        return std::string{prop.gcnArchName};
-    }();
-    return cached_arch;
+    int dev = 0;
+    if (hipGetDevice(&dev) != hipSuccess) {
+        return std::string{};
+    }
+    hipDeviceProp_t prop{};
+    if (hipGetDeviceProperties(&prop, dev) != hipSuccess) {
+        return std::string{};
+    }
+    return std::string{prop.gcnArchName};
 #else
     return "";
 #endif
 }
 
 inline bool is_gfx11_arch() {
-    static const bool cached = []() {
-        const std::string arch = get_gcn_arch_name();
-        return !arch.empty() && arch.rfind("gfx11", 0) == 0;
-    }();
-    return cached;
+    const std::string arch = get_gcn_arch_name();
+    return !arch.empty() && arch.rfind("gfx11", 0) == 0;
 }
 
 inline bool is_gfx12_arch() {
-    static const bool cached = []() {
-        const std::string arch = get_gcn_arch_name();
-        return !arch.empty() && arch.rfind("gfx12", 0) == 0;
-    }();
-    return cached;
+    const std::string arch = get_gcn_arch_name();
+    return !arch.empty() && arch.rfind("gfx12", 0) == 0;
 }
 
 inline bool is_gfx1x_arch() {
-    static const bool cached = is_gfx11_arch() || is_gfx12_arch();
-    return cached;
+    return is_gfx11_arch() || is_gfx12_arch();
 }
 
 inline void check_gfx1x_bwd_supported(bool deterministic) {
