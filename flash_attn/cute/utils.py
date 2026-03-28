@@ -391,8 +391,17 @@ def atomic_add_fp32(a: float | Float32, gmem_ptr: cute.Pointer, *, loc=None, ip=
     #     is_align_stack=False,
     #     asm_dialect=llvm.AsmDialect.AD_ATT,
     # )
-    nvvm.atomicrmw(
-        res=T.f32(), op=nvvm.AtomicOpKind.FADD, ptr=gmem_ptr.llvm_ptr, a=Float32(a).ir_value()
+    # Use PTX red.global.add.f32 for compatibility across NVVM Python binding versions
+    # (nvvm.atomicrmw(res=...) is not supported on some stacks; see #2386).
+    gmem_ptr_i64 = gmem_ptr.toint(loc=loc, ip=ip).ir_value()
+    llvm.inline_asm(
+        None,
+        [gmem_ptr_i64, Float32(a).ir_value(loc=loc, ip=ip)],
+        "red.global.add.f32 [$0], $1;",
+        "l,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
     )
 
 
