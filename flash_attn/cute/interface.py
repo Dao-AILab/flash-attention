@@ -789,6 +789,7 @@ def _flash_attn_fwd(
     # Thus, we skip the actual kernel invocation here.
     if not is_fake_mode():
         # Multi-GPU: set active CUDA device so TVM/runtime helpers match q.device (see #1782).
+        # tvm-ffi may bind stream from tensors; without this guard the Python default device can still be wrong.
         with torch.cuda.device(q.device.index):
             _flash_attn_fwd.compile_cache[compile_key](
                 q.detach(),
