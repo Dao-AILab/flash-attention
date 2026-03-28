@@ -825,7 +825,6 @@ class FlashAttnVarlenKVPackedFunc(torch.autograd.Function):
 class FlashAttnFunc(torch.autograd.Function):
     @staticmethod
     def forward(
-        ctx,
         q,
         k,
         v,
