@@ -33,8 +33,10 @@ class NamedBarrierBwd(enum.IntEnum):
     PdS = enum.auto()
     dQFullWG0 = enum.auto()
     dQFullWG1 = enum.auto()
+    dQFullWG2 = enum.auto()
     dQEmptyWG0 = enum.auto()
     dQEmptyWG1 = enum.auto()
+    dQEmptyWG2 = enum.auto()
 
 
 class NamedBarrierBwdSm100(enum.IntEnum):

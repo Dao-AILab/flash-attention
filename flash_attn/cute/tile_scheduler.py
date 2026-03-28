@@ -51,6 +51,7 @@ class TileSchedulerArguments(ParamsBase):
     lpt: cutlass.Constexpr[bool] = False
     is_split_kv: cutlass.Constexpr[bool] = False
     head_swizzle: cutlass.Constexpr[bool] = False
+    use_cluster_idx: cutlass.Constexpr[bool] = False
 
 
 class SingleTileScheduler:
@@ -63,6 +64,7 @@ class SingleTileScheduler:
         num_splits_divmod: FastDivmodDivisor
         is_split_kv: cutlass.Constexpr[bool] = False
         cluster_shape_mn: cutlass.Constexpr[Tuple[int, int]] = (1, 1)
+        use_cluster_idx: cutlass.Constexpr[bool] = False
 
         @staticmethod
         def create(
@@ -76,6 +78,7 @@ class SingleTileScheduler:
                 FastDivmodDivisor(args.num_splits),
                 args.is_split_kv,
                 args.cluster_shape_mn,
+                args.use_cluster_idx,
             )
 
     def __init__(self, params: Params, blk_coord: cute.Coord, *, loc=None, ip=None):
@@ -91,13 +94,11 @@ class SingleTileScheduler:
 
     @staticmethod
     def create(params: Params, *, loc=None, ip=None) -> "SingleTileScheduler":
-        # if const_expr(cute.size(params.cluster_shape_mn) == 1):
-        #     blk_coord = cute.arch.block_idx()
-        # else:
-        #     # All CTAs in a cluster must get the same block coordinate
-        #     blk_coord = cute.arch.cluster_idx()
-        # Temporary set to block_idx until we sort out the best way to handle cluster
-        blk_coord = cute.arch.block_idx()
+        if const_expr(cute.size(params.cluster_shape_mn) == 1 or not params.use_cluster_idx):
+            blk_coord = cute.arch.block_idx()
+        else:
+            # All CTAs in a cluster must get the same block coordinate
+            blk_coord = cute.arch.cluster_idx()
         return SingleTileScheduler(params, blk_coord, loc=loc, ip=ip)
 
     # called by host
@@ -110,8 +111,13 @@ class SingleTileScheduler:
     ) -> Tuple[Int32, Int32, Int32]:
         # TODO: this hard-codes the fact that we only use cluster = (1, 1) or (2, 1)
         assert params.cluster_shape_mn[1] == 1, "Only cluster_shape_mn[1] == 1 is supported"
+        if const_expr(params.use_cluster_idx):
+            # Grid must have num_block * cluster_m physical blocks so that there are num_block clusters
+            grid_x = params.num_block * params.cluster_shape_mn[0]
+        else:
+            grid_x = cute.round_up(params.num_block, params.cluster_shape_mn[0])
         return (
-            cute.round_up(params.num_block, params.cluster_shape_mn[0]),
+            grid_x,
             params.num_head * params.num_splits,
             params.num_batch,
         )
@@ -395,8 +401,8 @@ class SingleTileLPTBwdScheduler:
         ) -> "SingleTileLPTBwdScheduler.Params":
             size_l2 = 50 * 1024 * 1024
             size_one_qdo_head = args.seqlen_k * (args.headdim + args.headdim_v) * args.element_size
-            # size_one_dqaccum_head = args.seqlen_k * (args.headdim) * 4
-            size_one_dqaccum_head = 0
+            size_one_dqaccum_head = args.seqlen_k * (args.headdim) * 4
+            # size_one_dqaccum_head = 0
             size_one_head = size_one_qdo_head + size_one_dqaccum_head
             log2_floor = lambda n: 31 - clz(n)
             swizzle = 1 if size_l2 < size_one_head else (1 << log2_floor(size_l2 // size_one_head))
@@ -521,9 +527,12 @@ class SingleTileVarlenScheduler:
             args: TileSchedulerArguments, *, loc=None, ip=None
         ) -> "SingleTileVarlenScheduler.Params":
             size_l2 = 50 * 1024 * 1024  # 50 MB for K & V
-            max_kvblock_in_l2 = size_l2 // (
-                (args.headdim + args.headdim_v) * args.element_size * args.tile_shape_mn[1]
-            )
+            # if backward, this is qdo block size
+            kv_block_size = (args.headdim + args.headdim_v) * args.element_size * args.tile_shape_mn[1]
+            # if backward, add dqaccum block size to calculate swizzle
+            if args.head_swizzle:
+                kv_block_size += args.headdim * 4 * args.tile_shape_mn[1]
+            max_kvblock_in_l2 = size_l2 // kv_block_size
             assert args.mCuSeqlensQ is not None or args.mSeqUsedQ is not None, (
                 "At least one of mCuSeqlensQ or mSeqUsedQ must be provided"
             )
@@ -654,6 +663,7 @@ class SingleTileVarlenScheduler:
                 num_n_blocks = (
                     num_m_blocks
                     * params.tile_shape_mn[0]
+                    * params.cluster_shape_m
                     // params.qhead_per_kvhead_packgqa
                     // params.tile_shape_mn[1]
                 )

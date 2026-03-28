@@ -2,10 +2,12 @@
  * Copyright (c) 2024, Tri Dao.
  ******************************************************************************/
 
-#include "flash_common.hpp"
+#include "mha_fwd_head_grouping_utils.hpp"
 
-#include "fmha_fwd.hpp"
 #include "mask.hpp"
+
+#include <optional>
+#include <string>
 
 fmha_fwd_traits get_ck_fmha_varlen_fwd_traits(const mask_info &mask,
                                               std::string dtype,
@@ -42,7 +44,8 @@ fmha_fwd_splitkv_traits get_ck_fmha_varlen_fwd_splitkv_traits(const mask_info &m
                                    mask.type,
                                    enable_alibi ? bias_enum::alibi : bias_enum::no_bias,
                                    has_lse,
-                                   false}; // do_fp8_static_quant
+                                   false,  // do_fp8_static_quant
+                                   false}; // has_sink
 }
 
 fmha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
@@ -128,6 +131,10 @@ fmha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
                          nullptr,              // seqlen_k_ptr
                          nullptr,              // cu_seqlen_q_ptr
                          nullptr,              // cu_seqlen_kv_ptr
+                         nullptr,              // block_scale_seqstart_q_ptr
+                         nullptr,              // block_scale_seqstart_k_ptr
+                         nullptr,              // seqstart_v_scale_ptr
+                         nullptr,              // sink_ptr
                          total_q,
                          total_k,
                          b,
@@ -136,6 +143,8 @@ fmha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
                          d,             // hdim_v
                          h,             // nhead
                          h_k,           // nhead_k
+                         0,             // num_head_q_total
+                         0,             // head_start
                          softmax_scale, // scale_s
                          0.0f,          // logits_soft_cap
                          stride_q,
@@ -144,6 +153,9 @@ fmha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
                          stride_alibi_slopes,
                          stride_randval,
                          stride_o,
+                         0, // stride_q_descale
+                         0, // stride_k_descale
+                         0, // stride_v_descale
                          nhead_stride_q,
                          nhead_stride_k,
                          nhead_stride_v,
@@ -151,6 +163,9 @@ fmha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
                          nhead_stride_randval,
                          nhead_stride_lse,
                          nhead_stride_o,
+                         0, // nhead_stride_q_descale
+                         0, // nhead_stride_k_descale
+                         0, // nhead_stride_v_descale
                          batch_stride_q,
                          batch_stride_k,
                          batch_stride_v,
@@ -158,13 +173,19 @@ fmha_fwd_args get_ck_fmha_varlen_fwd_args(bool has_lse,
                          batch_stride_randval,
                          batch_stride_lse,
                          batch_stride_o,
+                         0, // batch_stride_q_descale
+                         0, // batch_stride_k_descale
+                         0, // batch_stride_v_descale
                          mask.left,
                          mask.right,
+                         0, // sink_size
                          static_cast<ck_tile::index_t>(mask.type),
                          0, // min_seqlen_q
                          p_dropout,
                          has_dropout_randval,
-                         drop_seed_offset};
+                         drop_seed_offset,
+                         0,     // block_scale_size_q
+                         0};    // block_scale_size_kv
 }
 
 fmha_fwd_splitkv_args get_ck_fmha_varlen_fwd_splitkv_args(bool has_lse,
@@ -210,6 +231,7 @@ fmha_fwd_splitkv_args get_ck_fmha_varlen_fwd_splitkv_args(bool has_lse,
     args.o_acc_ptr = out_acc.data_ptr();
     args.lse_ptr = nullptr;
     args.o_ptr = out.data_ptr();
+    args.sink_ptr = nullptr;
 
     if (block_table_.has_value())
     {
@@ -293,6 +315,7 @@ fmha_fwd_splitkv_args get_ck_fmha_varlen_fwd_splitkv_args(bool has_lse,
 
     args.window_size_left = mask.left;
     args.window_size_right = mask.right;
+    args.sink_size = 0;
     args.mask_type = static_cast<ck_tile::index_t>(mask.type);
 
     return args;
@@ -553,7 +576,27 @@ mha_varlen_fwd(at::Tensor &q,                   // total_q x num_heads x head_si
                     p_dropout,
                     drop_seed_offset);
 
-            float t = fmha_fwd(traits, args, stream_config);
+            float t =
+                flash::maybe_dispatch_head_grouped_fwd(
+                    stream_config,
+                    traits,
+                    args,
+                    num_heads,
+                    num_heads_k,
+                    batch_size,
+                    max_seqlen_k,
+                    head_size,
+                    head_size,
+                    k.element_size(),
+                    v.element_size(),
+                    q.scalar_type(),
+                    [&](const auto& grouped_traits, auto& grouped_args, const auto& grouped_sc) {
+                        return fmha_fwd(grouped_traits, grouped_args, grouped_sc);
+                    });
+
+            if (t < 0.0f) {
+                t = fmha_fwd(traits, args, stream_config);
+            }
             TORCH_CHECK(t >= 0, "invalid argument for fmha_fwd");
         }
     }

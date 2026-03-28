@@ -16,7 +16,7 @@ from flash_attn import (
 from flash_attn.bert_padding import pad_input, unpad_input
 from flash_attn.flash_attn_interface import _get_block_size_n
 from flash_attn.layers.rotary import apply_rotary_emb
-from flash_attn.flash_attn_triton_amd.utils import USE_TRITON_ROCM, is_hip, get_arch
+from aiter.ops.triton._triton_kernels.flash_attn_triton_amd.utils import USE_TRITON_ROCM, is_hip, get_arch
 
 
 def _get_block_size_n_triton(device, head_dim, is_dropout, is_causal):
