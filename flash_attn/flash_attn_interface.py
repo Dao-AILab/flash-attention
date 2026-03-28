@@ -862,17 +862,49 @@ class FlashAttnFunc(torch.autograd.Function):
             alibi_slopes=alibi_slopes,
             return_softmax=return_softmax and dropout_p > 0,
         )
-        if is_grad:
-            ctx.save_for_backward(q, k, v, out_padded, softmax_lse, rng_state)
-            ctx.dropout_p = dropout_p
-            ctx.softmax_scale = softmax_scale
-            ctx.causal = causal
-            ctx.window_size = window_size
-            ctx.softcap = softcap
-            ctx.alibi_slopes = alibi_slopes
-            ctx.deterministic = deterministic
         out = out_padded[..., :head_size_og]
+        if is_grad:
+            # Detach from out_padded so ctx.mark_non_differentiable(out_padded) does not break the graph for out.
+            out = out.clone()
+            if not return_softmax:
+                S_dmask = torch.empty(0, device=q.device)
+            return out, softmax_lse, S_dmask, out_padded, rng_state
         return out if not return_softmax else (out, softmax_lse, S_dmask)
+
+    @staticmethod
+    def setup_context(ctx, inputs, output):
+        if not isinstance(output, tuple) or len(output) != 5:
+            return
+        q, k, v = inputs[0], inputs[1], inputs[2]
+        (
+            dropout_p,
+            softmax_scale,
+            causal,
+            window_size,
+            softcap,
+            alibi_slopes,
+            deterministic,
+            _return_softmax,
+            _is_grad_enabled,
+        ) = inputs[3:]
+        _out, softmax_lse, S_dmask, out_padded, rng_state = output
+        ctx.mark_non_differentiable(softmax_lse, S_dmask, out_padded, rng_state)
+        if softmax_scale is None:
+            softmax_scale = q.shape[-1] ** (-0.5)
+        head_size_og = q.size(3)
+        if head_size_og % 8 != 0:
+            pad = 8 - head_size_og % 8
+            q = torch.nn.functional.pad(q, [0, pad])
+            k = torch.nn.functional.pad(k, [0, pad])
+            v = torch.nn.functional.pad(v, [0, pad])
+        ctx.dropout_p = dropout_p
+        ctx.softmax_scale = softmax_scale
+        ctx.causal = causal
+        ctx.window_size = window_size
+        ctx.softcap = softcap
+        ctx.alibi_slopes = alibi_slopes
+        ctx.deterministic = deterministic
+        ctx.save_for_backward(q, k, v, out_padded, softmax_lse, rng_state)
 
     @staticmethod
     def backward(ctx, dout, *args):
@@ -1211,7 +1243,7 @@ def flash_attn_func(
             The output of softmax (possibly with different scaling). It also encodes the dropout
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
-    return FlashAttnFunc.apply(
+    result = FlashAttnFunc.apply(
         q,
         k,
         v,
@@ -1225,6 +1257,12 @@ def flash_attn_func(
         return_attn_probs,
         torch.is_grad_enabled(),
     )
+    if isinstance(result, tuple) and len(result) == 5:
+        out, softmax_lse, S_dmask = result[0], result[1], result[2]
+        if return_attn_probs:
+            return out, softmax_lse, S_dmask
+        return out
+    return result
 
 
 def flash_attn_varlen_qkvpacked_func(
