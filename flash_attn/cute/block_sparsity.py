@@ -401,6 +401,7 @@ def to_cute_block_sparse_tensors(
     """Convert torch block sparsity tensors to CuTe tensors, optionally for tvm ffi"""
     if not is_block_sparsity_enabled(tensors):
         return None
+
     (
         mask_block_cnt,
         mask_block_idx,
