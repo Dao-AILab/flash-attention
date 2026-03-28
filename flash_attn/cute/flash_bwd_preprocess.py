@@ -43,6 +43,7 @@ class FlashAttentionBackwardPreprocess:
         head_dim_v: int,
         tile_m: int = 128,
         num_threads: int = 256,
+        use_padded_offsets: bool = True,
     ):
         """
         All contiguous dimensions must be at least 16 bytes aligned which indicates the head dimension
@@ -64,6 +65,7 @@ class FlashAttentionBackwardPreprocess:
         self.head_dim_v_padded = int(math.ceil(head_dim_v / hdim_multiple_of) * hdim_multiple_of)
         self.check_hdim_v_oob = head_dim_v != self.head_dim_v_padded
         self.num_threads = num_threads
+        self.use_padded_offsets = use_padded_offsets
 
     @staticmethod
     def can_implement(dtype, head_dim, tile_m, num_threads) -> bool:
@@ -250,7 +252,15 @@ class FlashAttentionBackwardPreprocess:
             )
             mO_cur = seqlen.offset_batch(mO, batch_idx, dim=0)[None, head_idx, None]
             mdO_cur = seqlen.offset_batch(mdO, batch_idx, dim=0)[None, head_idx, None]
-            mPdPsum_cur = seqlen.offset_batch(mPdPsum, batch_idx, dim=2, padded=True)[
+            # Stats buffers (dpsum/lse_log2) are always consumed with padded q-offsets
+            # on the generic backward path (mdQaccum is present). Keep dedicated hd256
+            # behavior controlled by self.use_padded_offsets.
+            stats_use_padded_offsets = self.use_padded_offsets
+            if const_expr(mdQaccum is not None):
+                stats_use_padded_offsets = True
+            mPdPsum_cur = seqlen.offset_batch(
+                mPdPsum, batch_idx, dim=2, padded=stats_use_padded_offsets
+            )[
                 None, head_idx
             ]
             headdim_v = mO_cur.shape[cute.rank(mO_cur) - 1]
@@ -330,7 +340,11 @@ class FlashAttentionBackwardPreprocess:
             # Clear dQaccum
             if const_expr(mdQaccum is not None):
                 mdQaccum_cur = seqlen.offset_batch(
-                    mdQaccum, batch_idx, dim=2, padded=True, multiple=self.head_dim_padded
+                    mdQaccum,
+                    batch_idx,
+                    dim=2,
+                    padded=True,
+                    multiple=self.head_dim_padded,
                 )[None, head_idx]
                 blkdQaccum_shape = (self.tile_m * self.head_dim_padded,)
                 gdQaccum = cute.local_tile(mdQaccum_cur, blkdQaccum_shape, (m_block,))
@@ -341,7 +355,9 @@ class FlashAttentionBackwardPreprocess:
                 cute.copy(gmem_tiled_copy_dQaccum, zero, tdQgdQaccum)
 
             if const_expr(mLSE is not None):
-                mLSElog2_cur = seqlen.offset_batch(mLSElog2, batch_idx, dim=2, padded=True)[
+                mLSElog2_cur = seqlen.offset_batch(
+                    mLSElog2, batch_idx, dim=2, padded=stats_use_padded_offsets
+                )[
                     None, head_idx
                 ]
                 gLSElog2 = cute.local_tile(mLSElog2_cur, (self.tile_m,), (m_block,))
