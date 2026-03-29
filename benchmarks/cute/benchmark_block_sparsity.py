@@ -2,12 +2,17 @@
 Comparative benchmark: CuTe DSL vs Native PyTorch block sparsity computation.
 """
 
+import os
+import sys
 import torch
 from dataclasses import dataclass
 from typing import Callable, Optional, List
 from tabulate import tabulate
 from tqdm import tqdm
 import itertools
+
+# mask_mod_definitions lives in tests/cute/ alongside the test files
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../tests/cute"))
 
 from cutlass.cute.runtime import from_dlpack
 from cutlass.cute.testing import benchmark as cute_benchmark
