@@ -1,6 +1,5 @@
 """Tests for block sparsity computation in flash attention."""
 
-import logging
 import pytest
 import torch
 from torch.nn.attention.flex_attention import create_block_mask
@@ -250,17 +249,16 @@ def test_fixed_length_masks(
         *_,
     ) = block_mask.as_tuple()
 
-    logger = logging.getLogger(__name__)
-    logger.debug("CuTe results:")
-    logger.debug("    mask_block_cnt: %s", mask_block_cnt)
-    logger.debug("    full_block_cnt: %s", full_block_cnt)
-    logger.debug("    mask_block_idx: %s", mask_block_idx)
-    logger.debug("    full_block_idx: %s", full_block_idx)
-    logger.debug("Torch results:")
-    logger.debug("    mask_block_cnt: %s", mask_block_cnt_ref)
-    logger.debug("    full_block_cnt: %s", full_block_cnt_ref)
-    logger.debug("    mask_block_idx: %s", mask_block_idx_ref)
-    logger.debug("    full_block_idx: %s", full_block_idx_ref)
+    print("CuTe results:")
+    print(f"    mask_block_cnt: {mask_block_cnt}")
+    print(f"    full_block_cnt: {full_block_cnt}")
+    print(f"    mask_block_idx: {mask_block_idx}")
+    print(f"    full_block_idx: {full_block_idx}")
+    print("Torch results:")
+    print(f"    mask_block_cnt: {mask_block_cnt_ref}")
+    print(f"    full_block_cnt: {full_block_cnt_ref}")
+    print(f"    mask_block_idx: {mask_block_idx_ref}")
+    print(f"    full_block_idx: {full_block_idx_ref}")
 
     all_match, error_msg = _compare_block_sparsity(
         mask_block_cnt,

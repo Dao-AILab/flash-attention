@@ -3,8 +3,6 @@ FlashAttention benchmarking script with Flex Attention-style
 mask mod support and varlen sequences.
 """
 
-import os
-import sys
 from dataclasses import dataclass
 import math
 from typing import Any, Dict, Optional, Tuple
@@ -15,9 +13,6 @@ import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 import numpy as np
 import torch
-
-# mask_mod_definitions lives in tests/cute/ alongside the test files
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../tests/cute"))
 
 from flash_attn.cute.flash_fwd_sm90 import FlashAttentionForwardSm90
 from mask_mod_definitions import (
