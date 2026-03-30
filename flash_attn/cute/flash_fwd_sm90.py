@@ -55,6 +55,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         intra_wg_overlap: bool = True,
         mma_pv_is_rs: bool = True,
         paged_kv_non_tma: bool = False,
+        is_split_kv: bool = False,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -62,6 +63,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         self.mma_pv_is_rs = mma_pv_is_rs
         self.buffer_align_bytes = 1024
         self.use_tma_KV = not paged_kv_non_tma
+        self.is_split_kv = is_split_kv
         assert self.use_tma_KV or not (self.check_hdim_oob or self.check_hdim_v_oob), (
             "Paged KV does not support irregular head dim"
         )
@@ -181,21 +183,35 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         (batch_size, seqlen_q, num_head, head_dim):(_, _, _, 1)
         """
 
-        self._check_type(
-            *(
-                t.element_type if t is not None else None
-                for t in (mQ, mK, mV, mO, mLSE, mCuSeqlensQ, mCuSeqlensK, mSeqUsedQ, mSeqUsedK)
+        # TODO: do something better...
+        if const_expr(not self.is_split_kv):
+            self._check_type(
+                *(
+                    t.element_type if t is not None else None
+                    for t in (mQ, mK, mV, mO, mLSE, mCuSeqlensQ, mCuSeqlensK, mSeqUsedQ, mSeqUsedK)
+                )
             )
-        )
 
         self.varlen_q = mCuSeqlensQ is not None or mSeqUsedQ is not None
 
         mQ, mK, mV, mO = [assume_tensor_aligned(t) for t in (mQ, mK, mV, mO)]
-        QO_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
-        mQ, mO = [layout_utils.select(t, QO_layout_transpose) for t in (mQ, mO)]
+        Q_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
+        mQ = layout_utils.select(mQ, Q_layout_transpose)
+        num_splits = Int32(1)
+        if const_expr(not self.is_split_kv):
+            O_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
+            LSE_layout_transpose = [2, 1, 0] if const_expr(mCuSeqlensQ is None) else [1, 0]
+        else:
+            # Fixed-len O: (num_splits, batch, seqlen_q, heads, d) -> (seqlen_q, d, heads, batch, num_splits)
+            # Varlen O:    (num_splits, total_q, heads, d)         -> (total_q, d, heads, num_splits)
+            O_layout_transpose = [2, 4, 3, 1, 0] if const_expr(mCuSeqlensQ is None) else [1, 3, 2, 0]
+            # Fixed-len LSE: (num_splits, batch, heads, seqlen_q) -> (seqlen_q, heads, batch, num_splits)
+            # Varlen LSE:    (num_splits, heads, total_q)         -> (total_q, heads, num_splits)
+            LSE_layout_transpose = [3, 2, 1, 0] if const_expr(mCuSeqlensQ is None) else [2, 1, 0]
+            num_splits = mO.shape[0]
+        mO = layout_utils.select(mO, O_layout_transpose)
         KV_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensK is None) else [0, 2, 1]
         mK, mV = [layout_utils.select(t, KV_layout_transpose) for t in (mK, mV)]
-        LSE_layout_transpose = [2, 1, 0] if const_expr(mCuSeqlensQ is None) else [1, 0]
         mLSE = (
             layout_utils.select(mLSE, LSE_layout_transpose)
             if const_expr(mLSE is not None)
@@ -224,7 +240,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         self.use_tma_Q = self.arch >= Arch.sm_90 and not (
             self.pack_gqa and self.tile_m % self.qhead_per_kvhead != 0
         )
-        self.use_tma_O = self.use_tma_Q
+        self.use_tma_O = self.use_tma_Q and not self.is_split_kv
         # Producer needs more registers when doing cp.async Q or KV loads
         if const_expr(self.num_wg_mma == 2 and (not self.use_tma_Q or not self.use_tma_KV)):
             self.num_mma_regs, self.num_producer_regs = 224, 40
@@ -237,7 +253,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 (mQ, (self.tile_m, self.tile_hdim), None),
                 (mK, (self.tile_n, self.tile_hdim), self.num_stages),
                 (mV, (self.tile_n, self.tile_hdimv), self.num_stages),
-                (mO, (self.tile_m, self.tile_hdimv), None),
+                # sO layout dtype possibly different from mO dtype when using splitkv (fp32)
+                (mQ, (self.tile_m, self.tile_hdimv), None), 
             ]
         ]
         self.sP_layout = None
@@ -325,7 +342,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             cute.size(mQ.shape[3])
             if const_expr(mCuSeqlensQ is None)
             else cute.size(mCuSeqlensQ.shape[0] - 1),
-            1,  # num_splits
+            num_splits,
             cute.size(mK.shape[0])
             if const_expr(mPageTable is None)
             else mK.shape[0] * mPageTable.shape[1],
@@ -341,6 +358,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             element_size=self.dtype.width // 8,
             is_persistent=False,
             lpt=self.is_causal or self.is_local,
+            is_split_kv=self.is_split_kv,
         )
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
         grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
@@ -388,6 +406,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             tile_sched_params,
             TileScheduler,
             SharedStorage,
+            num_splits,
             aux_tensors,
             fastdiv_mods,
         ).launch(
@@ -434,6 +453,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         tile_sched_params: ParamsBase,
         TileScheduler: cutlass.Constexpr[Callable],
         SharedStorage: cutlass.Constexpr[Callable],
+        num_splits: Int32 = Int32(1),
         aux_tensors=Optional[list[cute.Tensor]],
         fastdiv_mods=None,
     ):
@@ -538,7 +558,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             self.tile_n,
             self.is_causal,
             self.is_local,
-            False,  # is_split_kv
+            self.is_split_kv,
             window_size_left,
             window_size_right,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
@@ -589,6 +609,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 block_info,
                 SeqlenInfoCls,
                 TileSchedulerCls,
+                num_splits,
             )
 
         else:  # Consumer
@@ -624,6 +645,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 blocksparse_tensors,
                 aux_tensors,
                 fastdiv_mods,
+                num_splits,
             )
 
     @cute.jit
@@ -647,6 +669,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
+        num_splits: Int32 = Int32(1),
     ):
         warp_idx_in_wg = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
         tidx, _, _ = cute.arch.thread_idx()
@@ -666,7 +689,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             work_tile = tile_scheduler.initial_work_tile_info()
             while work_tile.is_valid_tile:
                 # if work_tile.is_valid_tile:
-                m_block, head_idx, batch_idx, _ = work_tile.tile_idx
+                m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
                 seqlen = SeqlenInfoCls(batch_idx)
                 mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, head_idx]
                 head_idx_kv = (
@@ -754,7 +777,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     )
 
                 if const_expr(not self.use_block_sparsity):
-                    n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
+                    n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
                     # if cute.arch.thread_idx()[0] == 0:
                     #     cute.printf("m_block = %d, n_block_min: %d, n_block_max: %d", m_block, n_block_min, n_block_max)
                     # Clamp n_block to 0 when n_block_max == 0 (can happen with causal
@@ -951,6 +974,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         blocksparse_tensors: Optional[BlockSparseTensors],
         aux_tensors: Optional[list],
         fastdiv_mods=None,
+        num_splits: Int32 = Int32(1),
     ):
         warp_group_idx = cute.arch.make_warp_uniform(tidx // self.num_threads_per_warp_group)
         warp_group_thread_layout = cute.make_layout(
@@ -1036,7 +1060,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             # if work_tile.is_valid_tile:
 
             # shape: (atom_v_m * rest_m)
-            m_block, head_idx, batch_idx, _ = work_tile.tile_idx
+            m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
 
             # Recompute fastdiv_mods if necessary for varlen with aux_tensors
@@ -1084,7 +1108,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             mma_one_n_block = partial(
                 mma_one_n_block_all, seqlen=seqlen, softmax=softmax, score_mod_fn=score_mod_fn
             )
-            n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
+            n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
             pipeline_q.consumer_wait_w_index_phase(0, q_consumer_phase)
             # For performance reason, we separate out two kinds of iterations:
             # those that need masking on S, and those that don't.
@@ -1250,6 +1274,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 m_block,
                 head_idx,
                 batch_idx,
+                split_idx,
             )
 
             tile_scheduler.advance_to_next_work()
