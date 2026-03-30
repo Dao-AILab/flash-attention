@@ -34,6 +34,23 @@ class BlockSparseTensorsTorch(NamedTuple):
     block_size: tuple[int, int] | None = None
 
 
+def get_sparse_q_block_size(
+    tensors: BlockSparseTensorsTorch | None,
+    seqlen_q: int,
+) -> int | None:
+    """Return the Q sparse block size, or None when sparsity is unset or ambiguous."""
+    if tensors is None:
+        return None
+    if tensors.block_size is not None:
+        return tensors.block_size[0]
+    num_m_blocks = tensors.mask_block_idx.shape[2]
+    min_block_size = ceildiv(seqlen_q, num_m_blocks)
+    max_block_size = seqlen_q if num_m_blocks == 1 else (seqlen_q - 1) // (num_m_blocks - 1)
+    if min_block_size != max_block_size:
+        return None
+    return min_block_size
+
+
 def _expand_sparsity_tensor(
     tensor: torch.Tensor,
     expected_shape: Tuple[int, ...],
@@ -140,17 +157,14 @@ def infer_block_sparse_expected_shapes(
     num_m_blocks = tensors.mask_block_idx.shape[2]
 
     if sparse_block_size_q is None:
-        min_block_size = ceildiv(seqlen_q, num_m_blocks)
-        if num_m_blocks == 1:
-            max_block_size = seqlen_q
-        else:
-            max_block_size = (seqlen_q - 1) // (num_m_blocks - 1)
-        if max_block_size != min_block_size and base_m_block != 1:
+        sparse_block_size_q = get_sparse_q_block_size(tensors, seqlen_q)
+        if sparse_block_size_q is None and base_m_block != 1:
             raise ValueError(
                 f"Block sparse tensors{context} require explicit sparse_block_size[0] "
                 f"to disambiguate block size for seqlen_q={seqlen_q} and num_m_blocks={num_m_blocks}."
             )
-        sparse_block_size_q = min_block_size
+        if sparse_block_size_q is None:
+            sparse_block_size_q = ceildiv(seqlen_q, num_m_blocks)
 
     if sparse_block_size_q % base_m_block != 0:
         raise ValueError(
@@ -314,7 +328,7 @@ def normalize_block_sparse_config(
 ) -> tuple[BlockSparseTensorsTorch, Tuple[Tuple[bool, ...], ...] | None, int]:
     m_block_size, n_block_size = block_size
     if tensors.block_size is None:
-        sparse_block_size_q, sparse_block_size_kv = q_stage * m_block_size, n_block_size
+        sparse_block_size_q, sparse_block_size_kv = None, n_block_size
     else:
         sparse_block_size_q, sparse_block_size_kv = tensors.block_size
     if sparse_block_size_kv != n_block_size:
