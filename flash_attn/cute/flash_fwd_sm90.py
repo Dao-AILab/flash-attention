@@ -1109,6 +1109,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 mma_one_n_block_all, seqlen=seqlen, softmax=softmax, score_mod_fn=score_mod_fn
             )
             n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
+            n_block_max_orig = n_block_max
             pipeline_q.consumer_wait_w_index_phase(0, q_consumer_phase)
             # For performance reason, we separate out two kinds of iterations:
             # those that need masking on S, and those that don't.
@@ -1256,6 +1257,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             # normalize acc_O by row_sum and calculate the lse
             row_scale = softmax.finalize(sink_val=sink_val)
             softmax.rescale_O(acc_O, row_scale)
+
+            # Override empty splits so combine kernel gives zero weight
+            if const_expr(self.is_split_kv):
+                if n_block_min >= n_block_max_orig:
+                    acc_O.fill(Float32(0.0))
+                    softmax.row_sum.fill(-Float32.inf)
 
             # ///////////////////////////////////////////////////////////////////////////////
             # Epilogue
