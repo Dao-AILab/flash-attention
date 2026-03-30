@@ -34,7 +34,6 @@ from flash_attn.cute.interface import (
 # When operating fake tensors, we cannot perform data-dependent operations (e.g., `tensor.max()`).
 USE_FAKE_TENSOR = int(os.getenv("FLASH_ATTENTION_FAKE_TENSOR", 0)) == 1
 DISABLE_SPLIT = os.getenv("FLASH_ATTENTION_DISABLE_SPLIT", "FALSE") == "TRUE"
-# SplitKV is not supported on SM90
 IS_SM90 = torch.cuda.get_device_capability()[0] == 9
 IS_SM100 = torch.cuda.get_device_capability()[0] == 10
 TEST_BWD_ONLY = False
@@ -250,9 +249,6 @@ def test_flash_attn_output(
         # pack_gqa_vals = [False]
         num_splits_vals = [1, 3] if d < 192 and not DISABLE_SPLIT and not TEST_BWD_ONLY else [1]
         for pack_gqa, num_splits in itertools.product(pack_gqa_vals, num_splits_vals):
-            # SplitKV not supported on SM90 - skip this iteration
-            if IS_SM90 and num_splits > 1:
-                continue
             if IS_SM100 and (d >= 192 and dv >= 192):  # hdim 192 and 256 not support on SM100
                 continue
             out, lse = flash_attn_func(
@@ -682,9 +678,6 @@ def test_flash_attn_varlen_output(
         # SplitKV is not supported for hdim >= 192
         num_splits_vals = [1, 3] if d < 192 and not DISABLE_SPLIT and not TEST_BWD_ONLY else [1]
         for pack_gqa, num_splits in itertools.product(pack_gqa_vals, num_splits_vals):
-            # SplitKV not supported on SM90 - skip this iteration
-            if IS_SM90 and num_splits > 1:
-                continue
             out_unpad, lse = flash_attn_varlen_func(
                 q_unpad if unpad_q else q,
                 k_unpad if unpad_kv else k,
@@ -1291,9 +1284,6 @@ def test_flash_attn_kvcache(
         for num_splits, precompute_metadata in itertools.product(
             num_splits_vals, precompute_metadata_vals
         ):
-            # SplitKV not supported on SM90 - skip this iteration
-            if IS_SM90 and num_splits > 1:
-                continue
             # if precompute_metadata:
             #     scheduler_metadata = get_scheduler_metadata(
             #         batch_size, max_seqlen_q if varlen_q else seqlen_q, seqlen_k, nheads, nheads_k, d,
