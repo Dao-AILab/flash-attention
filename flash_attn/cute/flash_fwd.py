@@ -412,8 +412,13 @@ class FlashAttentionForwardBase:
                             if const_expr(not self.check_hdim_v_oob) or taccOcO[k, m][1] < mO.shape[1]:
                                 taccOgO[k, m] = taccOrO[k, m]
             else:
-                # TODO: pack_gqa + split_kv needs store_O_splitkv
-                pack_gqa.store_O_splitkv(mO_cur, acc_O, tiled_mma, tidx, m_block, seqlen.seqlen_q, head_idx)
+                # mO_gqa is ((qheads_per_kvhead, seqlen_q), d, h_kv)
+                if const_expr(not seqlen.has_cu_seqlens_q):
+                    mO_gqa = mO[None, None, None, batch_idx, split_idx]
+                else:
+                    offset = (0, seqlen.offset_q)
+                    mO_gqa = cute.domain_offset((offset, 0, 0), mO[None, None, None, split_idx])
+                pack_gqa.store_O_splitkv(mO_gqa, acc_O, tiled_mma, tidx, m_block, seqlen.seqlen_q, head_idx)
         else:
             # Non-split: smem -> gmem (TMA or non-TMA)
             if const_expr(self.use_tma_O):
