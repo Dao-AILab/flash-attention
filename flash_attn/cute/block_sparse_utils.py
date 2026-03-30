@@ -1348,18 +1348,18 @@ def _store_one_dQaccum_sm90(
     m_block,
     sdQaccum: cute.Tensor,
     gdQaccum: cute.Tensor,
-    num_mma_warp_groups: cutlass.Constexpr,
+    num_dQ_warp_groups: cutlass.Constexpr,
     num_threads_per_warp_group: cutlass.Constexpr,
     tma_copy_bytes_dQ,
 ):
     """Store dQaccum for a single m_block."""
-    for warp_group_idx in cutlass.range_constexpr(num_mma_warp_groups):
-        cute.arch.cp_async_bulk_wait_group(num_mma_warp_groups - 1 - warp_group_idx, read=True)
+    for warp_group_idx in cutlass.range_constexpr(num_dQ_warp_groups):
+        cute.arch.cp_async_bulk_wait_group(num_dQ_warp_groups - 1 - warp_group_idx, read=True)
         cute.arch.barrier_arrive(
             barrier_id=int(NamedBarrierBwd.dQEmptyWG0) + warp_group_idx,
             number_of_threads=num_threads_per_warp_group + cute.arch.WARP_SIZE,
         )
-    for warp_group_idx in cutlass.range_constexpr(num_mma_warp_groups):
+    for warp_group_idx in cutlass.range_constexpr(num_dQ_warp_groups):
         cute.arch.barrier(
             barrier_id=int(NamedBarrierBwd.dQFullWG0) + warp_group_idx,
             number_of_threads=num_threads_per_warp_group + cute.arch.WARP_SIZE,
@@ -1383,7 +1383,7 @@ def dQaccum_store_block_sparse_bwd_sm90(
     gdQaccum: cute.Tensor,
     subtile_factor: cutlass.Constexpr,
     m_block_max: int,
-    num_mma_warp_groups: cutlass.Constexpr,
+    num_dQ_warp_groups: cutlass.Constexpr,
     num_threads_per_warp_group: cutlass.Constexpr,
     tma_copy_bytes_dQ,
 ):
@@ -1412,7 +1412,7 @@ def dQaccum_store_block_sparse_bwd_sm90(
                 m_block,
                 sdQaccum,
                 gdQaccum,
-                num_mma_warp_groups,
+                num_dQ_warp_groups,
                 num_threads_per_warp_group,
                 tma_copy_bytes_dQ,
             )
@@ -1428,7 +1428,7 @@ def dQaccum_store_block_sparse_bwd_sm90(
                     m_block,
                     sdQaccum,
                     gdQaccum,
-                    num_mma_warp_groups,
+                    num_dQ_warp_groups,
                     num_threads_per_warp_group,
                     tma_copy_bytes_dQ,
                 )

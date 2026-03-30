@@ -64,6 +64,7 @@ from flash_attn.cute.flash_fwd_combine import FlashAttentionForwardCombine
 
 from flash_attn.cute.block_sparsity import (
     BlockSparseTensorsTorch,
+    get_sparse_q_block_size,
     to_cute_block_sparse_tensors,
     normalize_block_sparse_config,
     normalize_block_sparse_config_bwd,
@@ -124,20 +125,27 @@ class FwdConfig:
     intra_wg_overlap: bool
 
 
-def _tile_size_fwd_sm90(head_dim, head_dim_v, is_causal, is_local, use_block_sparsity):
+def _tile_size_fwd_sm90(head_dim, head_dim_v, is_causal, is_local, sparse_block_size_q=None):
     """Return FwdConfig for SM90 forward.
 
     Tile sizes and flags based on tile_size_fwd_sm90 in hopper/tile_size.h, adjusted
     for the Python kernel's different register/smem tradeoffs (benchmarked on H100 SXM).
+
+    When sparse_block_size_q is set, tile_m must divide it. For head_dim <= 96 the
+    optimal tile_m=192 is used when compatible, otherwise we fall back to 128.
     """
     if head_dim <= 64:
         # C++: 192×192 non-causal, 192×128 causal/local.
         # Python: 192×128 RS+OL is consistently best across seqlens.
+        if sparse_block_size_q is not None and sparse_block_size_q % 192 != 0:
+            return FwdConfig(128, 128, True, True)
         return FwdConfig(192, 128, True, True)
     elif head_dim <= 96:
         # C++: 192×144 noRS+OL for all cases.
         # Python: RS is catastrophic with 192× tiles (~300 vs ~600 TFLOPS).
         # noRS+OL is always required. Causal: 192×128 slightly better short seqlen.
+        if sparse_block_size_q is not None and sparse_block_size_q % 192 != 0:
+            return FwdConfig(128, 128, False, True)
         if is_causal or is_local:
             return FwdConfig(192, 128, False, True)
         else:
@@ -150,7 +158,6 @@ def _tile_size_fwd_sm90(head_dim, head_dim_v, is_causal, is_local, use_block_spa
     else:  # hdim 256
         tile_n = 64 if is_local else 80
         return FwdConfig(128, tile_n, True, True)
-
 
 @dataclass(frozen=True)
 class BwdConfig:
@@ -169,7 +176,7 @@ class BwdConfig:
     dQ_single_wg: bool = False
 
 
-def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local):
+def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q=None):
     """Return BwdConfig for SM90.
 
     Configs based on C++ FA3 hopper/flash_bwd_launch_template.h,
@@ -196,6 +203,8 @@ def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local):
         # C++ FA3: causal/local: 64, 128; non-causal: 80, 128 with dQ_swapAB
         is_causal_or_local = causal or local
         m_block_size = 64 if is_causal_or_local else 80
+        if sparse_block_size_q is not None and sparse_block_size_q % m_block_size != 0:
+            m_block_size = 64
         return BwdConfig(
             m_block_size=m_block_size,
             n_block_size=128,
@@ -470,7 +479,8 @@ def _flash_attn_fwd(
         elif arch // 10 == 8:
             fwd_cfg = FwdConfig(128, 64, True, True)  # SM80, should tune
         elif arch // 10 == 9:
-            fwd_cfg = _tile_size_fwd_sm90(head_dim, head_dim_v, causal, local, use_block_sparsity)
+            sparse_q = get_sparse_q_block_size(block_sparse_tensors, seqlen_q)
+            fwd_cfg = _tile_size_fwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q=sparse_q)
     else:
         fwd_cfg = FwdConfig(tile_mn[0], tile_mn[1], fwd_cfg.mma_pv_is_rs, fwd_cfg.intra_wg_overlap)
     tile_m, tile_n = fwd_cfg.m_block_size, fwd_cfg.n_block_size
@@ -999,6 +1009,9 @@ def _flash_attn_bwd(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     arch = _get_device_arch()
     assert arch // 10 in [9, 10, 11, 12], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x, 12.x"
+    sparse_q = None
+    if block_sparse_tensors is not None and arch // 10 == 9:
+        sparse_q = block_sparse_tensors.block_size[0] if block_sparse_tensors.block_size is not None else 128
 
     num_head, head_dim = q.shape[-2:]
     head_dim_v = v.shape[-1]
@@ -1032,7 +1045,13 @@ def _flash_attn_bwd(
         assert mask_mod is None, "mask_mod backward not supported on SM 12.0"
         assert deterministic is False, "deterministic backward not supported on SM 12.0"
     elif arch // 10 == 9:
-        cfg = _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local)
+        cfg = _tile_size_bwd_sm90(
+            head_dim,
+            head_dim_v,
+            causal,
+            local,
+            sparse_block_size_q=sparse_q,
+        )
         m_block_size = cfg.m_block_size
         n_block_size = cfg.n_block_size
         num_stages_Q = cfg.num_stages_Q
@@ -1094,16 +1113,7 @@ def _flash_attn_bwd(
     num_head_kv = k.shape[-2]
 
     use_block_sparsity = block_sparse_tensors is not None
-
-    # SM90 block-sparse backward: tile_m=64 is the GCD between a m_block_size that fits,
-    # the base block_m of 128 from forward, and block-sparse size for subtiling.
-    if arch // 10 == 9 and use_block_sparsity:
-        m_block_size = 64
-        # dQ_swapAB tuning: use False when m_block_size=64 (same as causal case)
-        dQ_swapAB = False
-
-    # NB: this could be derived from the block_sparse_tensors but for now we hardcode it to 2
-    subtile_factor = 2
+    subtile_factor = sparse_q // m_block_size if sparse_q is not None else 2
     seqlen_q_rounded = (seqlen_q + m_block_size - 1) // m_block_size * m_block_size
     seqlen_k_rounded = (seqlen_k + n_block_size - 1) // n_block_size * n_block_size
     num_n_blocks = seqlen_k_rounded // n_block_size
