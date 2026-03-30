@@ -1253,6 +1253,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         row = m_block * self.tile_m + tScS_mn[r][0]
                         q_head_idx = row % self.qhead_per_kvhead + head_idx * self.qhead_per_kvhead
                         sink_val[r] = Float32(learnable_sink[q_head_idx])
+                if const_expr(self.is_split_kv):
+                    if split_idx > 0:
+                        if const_expr(not self.pack_gqa):
+                            sink_val = -Float32.inf
+                        else:
+                            sink_val.fill(-Float32.inf)
 
             # normalize acc_O by row_sum and calculate the lse
             row_scale = softmax.finalize(sink_val=sink_val)
