@@ -114,6 +114,7 @@ class FlashAttentionForwardSm100:
         is_varlen_q: bool = False,
         use_2cta_instrs: bool = False,
         use_clc_scheduler: bool = False,
+        compress_factor: cutlass.Constexpr[int] = 1,
     ):
         self.use_tma_KV = not paged_kv_non_tma
         # self.dtype = dtype
@@ -165,6 +166,7 @@ class FlashAttentionForwardSm100:
         )
         self.score_mod = score_mod
         self.mask_mod = mask_mod
+        self.compress_factor = compress_factor
         self.vec_size: cutlass.Constexpr = getattr(
             score_mod, "__vec_size__", 1 if cutlass.const_expr(has_aux_tensors) else 2
         )
@@ -996,6 +998,7 @@ class FlashAttentionForwardSm100:
             window_size_left,
             window_size_right,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+            compress_factor=self.compress_factor,
         )
         SeqlenInfoCls = partial(
             SeqlenInfoQK.create,
@@ -1015,6 +1018,7 @@ class FlashAttentionForwardSm100:
             window_size_left=window_size_left,
             window_size_right=window_size_right,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+            compress_factor=self.compress_factor,
         )
         # Cluster wait before tensor memory alloc
         pipeline_init_wait(cluster_shape_mn=cta_layout_vmnk)

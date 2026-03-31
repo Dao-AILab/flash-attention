@@ -19,6 +19,7 @@ class BlockInfo:
     window_size_left: Optional[Int32] = None
     window_size_right: Optional[Int32] = None
     qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1
+    compress_factor: cutlass.Constexpr[int] = 1
 
     @cute.jit
     def get_n_block_min_max(
@@ -33,7 +34,12 @@ class BlockInfo:
             m_idx_max = (m_block + 1) * self.tile_m
             if const_expr(self.qhead_per_kvhead_packgqa > 1):
                 m_idx_max = cute.ceil_div(m_idx_max, self.qhead_per_kvhead_packgqa)
-            n_idx = m_idx_max + seqlen_info.seqlen_k - seqlen_info.seqlen_q
+            if const_expr(self.compress_factor > 1):
+                # Compressed causal: kv_idx * compress_factor <= q_idx
+                # Max KV index for Q tile ending at m_idx_max is m_idx_max // compress_factor
+                n_idx = m_idx_max // self.compress_factor + 1
+            else:
+                n_idx = m_idx_max + seqlen_info.seqlen_k - seqlen_info.seqlen_q
             n_idx_right = n_idx if const_expr(self.is_causal) else n_idx + self.window_size_right
             n_block_max = min(n_block_max, cute.ceil_div(n_idx_right, self.tile_n))
         n_block_min = 0
@@ -60,7 +66,11 @@ class BlockInfo:
         m_block_min = 0
         if const_expr(self.is_causal or (self.is_local and self.window_size_right is not None)):
             n_idx_min = n_block * self.tile_n
-            m_idx = n_idx_min + seqlen_info.seqlen_q - seqlen_info.seqlen_k
+            if const_expr(self.compress_factor > 1):
+                # Compressed causal: q >= kv * compress_factor
+                m_idx = n_idx_min * self.compress_factor
+            else:
+                m_idx = n_idx_min + seqlen_info.seqlen_q - seqlen_info.seqlen_k
             m_idx_right = m_idx if const_expr(self.is_causal) else m_idx - self.window_size_right
             m_block_min = max(m_block_min, m_idx_right // self.tile_m)
         if const_expr(self.is_local and self.window_size_left is not None):

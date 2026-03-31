@@ -325,6 +325,7 @@ def _flash_attn_fwd(
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
     aux_tensors: Optional[list[torch.Tensor]] = None,
+    compress_factor: int = 1,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for FlashAttention.
 
@@ -636,6 +637,7 @@ def _flash_attn_fwd(
         intra_wg_overlap,
         requested_use_clc_scheduler,
         fa_logging.get_fa_log_level(),
+        compress_factor,
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
         (
@@ -743,6 +745,7 @@ def _flash_attn_fwd(
                 q_subtile_factor=q_subtile_factor,
                 use_2cta_instrs=use_2cta_instrs,
                 use_clc_scheduler=requested_use_clc_scheduler,
+                compress_factor=compress_factor,
             )
         elif arch // 10 == 12:
             # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
@@ -1006,6 +1009,7 @@ def _flash_attn_bwd(
     aux_tensors: Optional[list[torch.Tensor]] = None,
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     dlse: Optional[torch.Tensor] = None,
+    compress_factor: int = 1,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     arch = _get_device_arch()
     assert arch // 10 in [9, 10, 11, 12], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x, 12.x"
@@ -1384,6 +1388,7 @@ def _flash_attn_bwd(
             get_broadcast_dims(k),
             get_broadcast_dims(v),
             get_broadcast_dims(dout),
+            compress_factor,
         )
     if compile_key not in _flash_attn_bwd.compile_cache:
         q_tensor, k_tensor, v_tensor, do_tensor, dq_tensor, dk_tensor, dv_tensor = [
@@ -1473,6 +1478,7 @@ def _flash_attn_bwd(
                 mask_mod=mask_mod,
                 has_aux_tensors=aux_tensors is not None,
                 subtile_factor=subtile_factor,
+                compress_factor=compress_factor,
             )
 
         # Block sparse tensors for backward use Q-direction indexing (transposed from forward).

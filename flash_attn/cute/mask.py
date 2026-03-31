@@ -108,6 +108,7 @@ class AttentionMask:
     window_size_right: Optional[Int32] = None
     qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1  # only pass in if we're doing PackGQA
     swap_AB: cutlass.Constexpr[bool] = False
+    compress_factor: cutlass.Constexpr[int] = 1
 
     @property
     def seqlen_q(self) -> Int32:
@@ -242,6 +243,8 @@ class AttentionMask:
                     ) // self.qhead_per_kvhead_packgqa
                 causal_row_offset = (
                     1 + self.seqlen_k - n_block * self.tile_n - self.seqlen_q - thr_col_offset
+                    if const_expr(self.compress_factor == 1)
+                    else 1 - n_block * self.tile_n - thr_col_offset
                 )
                 if const_expr(mask_causal):
                     r2p = const_expr(not self.swap_AB)  # R2P trick, see apply_mask_sm100
@@ -253,6 +256,8 @@ class AttentionMask:
                             row_idx = utils.shuffle_sync(
                                 mma_m_idx, r % threads_per_row, width=threads_per_row
                             )
+                        if const_expr(self.compress_factor > 1):
+                            row_idx = row_idx // self.compress_factor
                         col_limit_right = row_idx + causal_row_offset
                         if const_expr(mask_seqlen):
                             col_limit_right = cutlass.min(col_limit_right, seqlenk_col_limit)
@@ -464,10 +469,16 @@ class AttentionMask:
                     acc_S[i] = -Float32.inf if mask_row >= self.seqlen_q else acc_S[i]
 
         else:  # Causal or local
-            causal_row_offset = self.seqlen_k - n_block * self.tile_n - self.seqlen_q
+            causal_row_offset = (
+                self.seqlen_k - n_block * self.tile_n - self.seqlen_q
+                if const_expr(self.compress_factor == 1)
+                else -n_block * self.tile_n
+            )
             row_idx = tScS_t2r[0][0] + m_block * self.tile_m
             if const_expr(self.qhead_per_kvhead_packgqa != 1):
                 row_idx = row_idx // self.qhead_per_kvhead_packgqa
+            if const_expr(self.compress_factor > 1):
+                row_idx = row_idx // self.compress_factor
             if const_expr(mask_causal):
                 col_limit_right = row_idx + causal_row_offset + 1
                 if const_expr(mask_seqlen):
@@ -645,7 +656,17 @@ class AttentionMask:
         else:  # Causal or local
             thr_row_offset = tScS_t2r[0][ROW]
             seqlenq_row_limit = self.seqlen_q - m_block * self.tile_m - thr_row_offset
-            causal_offset = seqlenq_row_limit - seqlenk_col_limit
+            if const_expr(self.compress_factor > 1):
+                # Compressed causal: q_idx >= kv_idx * compress_factor
+                # row_limit = kv_col * cf - q_row
+                causal_offset = (
+                    seqlenq_row_limit
+                    - self.compress_factor * seqlenk_col_limit
+                    + self.compress_factor * self.seqlen_k
+                    - self.seqlen_q
+                )
+            else:
+                causal_offset = seqlenq_row_limit - seqlenk_col_limit
             if const_expr(mask_causal):
                 # tidx = cute.arch.thread_idx()[0] % 256
                 # if tidx < 32:
