@@ -201,7 +201,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             O_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
             LSE_layout_transpose = [2, 1, 0] if const_expr(mCuSeqlensQ is None) else [1, 0]
         else:
-            O_layout_transpose = [2, 4, 3, 1, 0] if const_expr(mCuSeqlensQ is None) else [1, 3, 2, 0]
+            O_layout_transpose = (
+                [2, 4, 3, 1, 0] if const_expr(mCuSeqlensQ is None) else [1, 3, 2, 0]
+            )
             LSE_layout_transpose = [3, 2, 1, 0] if const_expr(mCuSeqlensQ is None) else [2, 1, 0]
             num_splits = mO.shape[0]
         mO = layout_utils.select(mO, O_layout_transpose)
@@ -249,7 +251,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 (mK, (self.tile_n, self.tile_hdim), self.num_stages),
                 (mV, (self.tile_n, self.tile_hdimv), self.num_stages),
                 # sO layout dtype possibly different from mO dtype when using splitkv (fp32)
-                (mQ, (self.tile_m, self.tile_hdimv), None), 
+                (mQ, (self.tile_m, self.tile_hdimv), None),
             ]
         ]
         self.sP_layout = None
@@ -772,7 +774,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     )
 
                 if const_expr(not self.use_block_sparsity):
-                    n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
+                    n_block_min, n_block_max = block_info.get_n_block_min_max(
+                        seqlen, m_block, split_idx, num_splits
+                    )
                     # if cute.arch.thread_idx()[0] == 0:
                     #     cute.printf("m_block = %d, n_block_min: %d, n_block_max: %d", m_block, n_block_min, n_block_max)
                     # Clamp n_block to 0 when n_block_max == 0 (can happen with causal
@@ -1103,7 +1107,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             mma_one_n_block = partial(
                 mma_one_n_block_all, seqlen=seqlen, softmax=softmax, score_mod_fn=score_mod_fn
             )
-            n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
+            n_block_min, n_block_max = block_info.get_n_block_min_max(
+                seqlen, m_block, split_idx, num_splits
+            )
             n_block_max_orig = n_block_max
             pipeline_q.consumer_wait_w_index_phase(0, q_consumer_phase)
             # For performance reason, we separate out two kinds of iterations:
