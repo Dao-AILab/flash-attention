@@ -265,12 +265,12 @@ class PackGQA:
     @cute.jit
     def store_O_splitkv(
         self,
-        mO: cute.Tensor,  # ((qhd_per_kv, seqlen_q), d, nhead_kv)
-        acc_O: cute.Tensor,  # MMA accumulator, fp32
+        mO: cute.Tensor,
+        acc_O: cute.Tensor,
         tiled_mma: cute.TiledMma,
         tidx: cutlass.Int32,
         block: cutlass.Int32,
-        seqlen: cutlass.Int32,  # seqlen_q for this batch element
+        seqlen: cutlass.Int32,
         head_idx_kv: cutlass.Int32,
     ):
         # Writing acc_O directly to gmem for packgqa + splitkv in sm90

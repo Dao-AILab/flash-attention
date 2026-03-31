@@ -167,7 +167,6 @@ class FlashAttentionForwardBase:
             return False
         return True
 
-    # TODO: fix to allow split kv --> mO type fp32
     def _check_type(
         self,
         mQ_type: Type[cutlass.Numeric],
@@ -179,10 +178,16 @@ class FlashAttentionForwardBase:
         mCuSeqlensK_type: Type[cutlass.Numeric] | None,
         mSeqUsedQ_type: Type[cutlass.Numeric] | None,
         mSeqUsedK_type: Type[cutlass.Numeric] | None,
+        is_split_kv: bool = False,
     ):
-        # Get the data type and check if it is fp16 or bf16
-        if const_expr(not (mQ_type == mK_type == mV_type == mO_type)):
-            raise TypeError("All tensors must have the same data type")
+        if is_split_kv:
+            if const_expr(not (mQ_type == mK_type == mV_type)):
+                raise TypeError("Q, K, V tensors must have the same data type")
+            if const_expr(mO_type != Float32):
+                raise TypeError("O tensor must be Float32 for split_kv")
+        else:
+            if const_expr(not (mQ_type == mK_type == mV_type == mO_type)):
+                raise TypeError("All tensors must have the same data type")
         if const_expr(mQ_type not in [cutlass.Float16, cutlass.BFloat16]):
             raise TypeError("Only Float16 or BFloat16 is supported")
         if const_expr(mLSE_type not in [None, Float32]):
@@ -344,7 +349,6 @@ class FlashAttentionForwardBase:
             self.tile_m, self.tile_hdimv, self.check_hdim_v_oob, self.qhead_per_kvhead
         )
 
-        # Non-split: acc_O -> bf16 -> smem (before LSE write, preserving original order)
         if const_expr(not self.is_split_kv):
             rO = cute.make_fragment_like(acc_O, self.dtype)
             rO.store(acc_O.load().to(self.dtype))
@@ -387,7 +391,6 @@ class FlashAttentionForwardBase:
             else:
                 pack_gqa.store_LSE(mLSE_cur, lse, tiled_mma, tidx, m_block, seqlen.seqlen_q)
 
-        # Write O to gmem
         ragged = self.use_tma_O and (seqlen.has_cu_seqlens_q or seqlen.has_seqused_q)
         if const_expr(self.is_split_kv):
             mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3)[None, None, head_idx, split_idx]
@@ -395,7 +398,6 @@ class FlashAttentionForwardBase:
             mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3, ragged=ragged)[None, None, head_idx]
 
         if const_expr(self.is_split_kv):
-            # SplitKV: fp32 acc_O directly from registers to gmem, bypassing smem
             cute.arch.barrier(
                 barrier_id=int(NamedBarrierFwd.Epilogue), number_of_threads=self.num_epilogue_threads
             )
@@ -420,7 +422,6 @@ class FlashAttentionForwardBase:
                     mO_gqa = cute.domain_offset((offset, 0, 0), mO[None, None, None, split_idx])
                 pack_gqa.store_O_splitkv(mO_gqa, acc_O, tiled_mma, tidx, m_block, seqlen.seqlen_q, head_idx)
         else:
-            # Non-split: smem -> gmem (TMA or non-TMA)
             if const_expr(self.use_tma_O):
                 # ensure smem writes are visible to TMA
                 cute.arch.fence_view_async_shared()

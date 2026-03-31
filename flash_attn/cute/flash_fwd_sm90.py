@@ -183,14 +183,13 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         (batch_size, seqlen_q, num_head, head_dim):(_, _, _, 1)
         """
 
-        # TODO: do something better...
-        if const_expr(not self.is_split_kv):
-            self._check_type(
-                *(
-                    t.element_type if t is not None else None
-                    for t in (mQ, mK, mV, mO, mLSE, mCuSeqlensQ, mCuSeqlensK, mSeqUsedQ, mSeqUsedK)
-                )
-            )
+        self._check_type(
+            *(
+                t.element_type if t is not None else None
+                for t in (mQ, mK, mV, mO, mLSE, mCuSeqlensQ, mCuSeqlensK, mSeqUsedQ, mSeqUsedK)
+            ),
+            is_split_kv=self.is_split_kv,
+        )
 
         self.varlen_q = mCuSeqlensQ is not None or mSeqUsedQ is not None
 
@@ -202,11 +201,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             O_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
             LSE_layout_transpose = [2, 1, 0] if const_expr(mCuSeqlensQ is None) else [1, 0]
         else:
-            # Fixed-len O: (num_splits, batch, seqlen_q, heads, d) -> (seqlen_q, d, heads, batch, num_splits)
-            # Varlen O:    (num_splits, total_q, heads, d)         -> (total_q, d, heads, num_splits)
             O_layout_transpose = [2, 4, 3, 1, 0] if const_expr(mCuSeqlensQ is None) else [1, 3, 2, 0]
-            # Fixed-len LSE: (num_splits, batch, heads, seqlen_q) -> (seqlen_q, heads, batch, num_splits)
-            # Varlen LSE:    (num_splits, heads, total_q)         -> (total_q, heads, num_splits)
             LSE_layout_transpose = [3, 2, 1, 0] if const_expr(mCuSeqlensQ is None) else [2, 1, 0]
             num_splits = mO.shape[0]
         mO = layout_utils.select(mO, O_layout_transpose)
