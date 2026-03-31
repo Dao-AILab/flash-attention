@@ -5,7 +5,7 @@ on:
     branches: [main]
 
 env:
-  FA4_IMAGE: togethercomputer/training-performance:flash-attn-cu12.9-26.03.25
+  FA4_IMAGE: togethercomputer/training-performance:flash-attn-cu13.0-26.03.31
   CI_WORK_DIR: ${{ vars.CI_WORK_DIR || format('/scratch/user/{0}', github.actor) }}
 
 jobs:

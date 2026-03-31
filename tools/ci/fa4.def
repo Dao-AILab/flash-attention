@@ -1,7 +1,7 @@
 Bootstrap: docker
-From: togethercomputer/training-performance:flash-attn-cu12.9-26.03.25
+From: togethercomputer/training-performance:flash-attn-cu13.0-26.03.31
 
 %labels
     maintainer tridao
-    cuda cu129
+    cuda cu130
     built_for B200/SM100

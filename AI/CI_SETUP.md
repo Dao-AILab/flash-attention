@@ -15,7 +15,7 @@ Triggered on every push to `main`.
 ## Prerequisites
 
 - Linux x86_64, GPU with >= 40GB VRAM (tested on B200)
-- CUDA 12.9+ driver
+- CUDA 13.1+ driver
 - `apptainer` installed on the runner
 - `uv` installed (`curl -LsSf https://astral.sh/uv/install.sh | sh`)
 
@@ -30,7 +30,7 @@ source .venv/bin/activate
 
 # Install PyTorch nightly matching your CUDA driver
 # Check your CUDA version first: cat /usr/local/cuda/version.json
-uv pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu129
+uv pip install --pre torch --index-url https://download.pytorch.org/whl/nightly/cu131
 
 # Install flash-attn-4 + dev dependencies
 uv pip install -e "flash_attn/cute[dev]"
@@ -40,7 +40,7 @@ uv pip install pytest-xdist
 
 # Verify
 python -c "import torch; print(torch.__version__); print(torch.cuda.get_device_capability())"
-# Expected: 2.12.x+cu129, (10, 0) for B200
+# Expected: 2.12.x+cu131, (10, 0) for B200
 ```
 
 ---

@@ -13,14 +13,15 @@ RUN apt-get update -y && apt-get install -y \
 # Install uv
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# torch nightly cu129 (required for B200/SM100, pin to cu129 to match driver 12.9)
+# Install torch from the published cu130 nightly package page and let pip resolve
+# the matching nightly Triton wheel from PyTorch's nightly triton page.
 RUN uv pip install --system --break-system-packages --no-cache --pre \
-        "torch==2.12.0.dev20260324+cu129" \
-        --index-url https://download.pytorch.org/whl/nightly/cu129
+        "torch>=2.12.0.dev0,<2.13.0" \
+        --find-links https://download.pytorch.org/whl/nightly/cu130/torch \
+        --find-links https://download.pytorch.org/whl/nightly/triton
 
-# FA4 dependencies — torch pin included to prevent transitive deps from overriding cu129
+# FA4 dependencies — torch stays pinned from the direct wheel install above.
 RUN uv pip install --system --break-system-packages --no-cache \
-        "torch==2.12.0.dev20260324+cu129" \
         "nvidia-cutlass-dsl>=4.4.2" \
         "quack-kernels>=0.3.3" \
         "apache-tvm-ffi>=0.1.5,<0.2" \
@@ -29,7 +30,6 @@ RUN uv pip install --system --break-system-packages --no-cache \
         "typing_extensions" \
         "pytest" \
         "pytest-xdist" \
-        "ruff" \
-        --extra-index-url https://download.pytorch.org/whl/nightly/cu129
+        "ruff"
 
 CMD ["/bin/bash"]
