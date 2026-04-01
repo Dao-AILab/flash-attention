@@ -1551,6 +1551,52 @@ def test_flash_attn_bwd_varlen_overflow(d, causal, dtype):
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("deterministic", [False, True])
+@pytest.mark.parametrize("nheads_kv", [1, 8])  # GQA (1) and MHA (8)
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("d", [64, 128])
+def test_flash_attn_bwd_varlen_seqq_zero(d, causal, nheads_kv, deterministic, dtype):
+    """Regression test: NaN in dK/dV for the zero-length Q subsequence (run for both GQA and MHA).
+    """
+    if not is_bwd_supported(d, deterministic=deterministic):
+        pytest.skip(get_bwd_unsupported_reason(d, deterministic=deterministic))
+
+    device = "cuda"
+    torch.random.manual_seed(0)
+    nheads = 8  # n_q_heads; GQA when nheads_kv < nheads
+    q_cuseqlen = torch.tensor([0, 0, 256, 512], device=device, dtype=torch.int32)
+    k_cuseqlen = torch.tensor([0, 503, 768, 1536], device=device, dtype=torch.int32)
+    total_q = int(q_cuseqlen[-1])   # 512
+    total_k = int(k_cuseqlen[-1])   # 1536
+    Mq = 256
+    Mk = 768
+
+    q = torch.randn([total_q, nheads, d], dtype=dtype, device=device)
+    k = torch.randn([total_k, nheads_kv, d], dtype=dtype, device=device)
+    v = torch.randn([total_k, nheads_kv, d], dtype=dtype, device=device)
+    q.requires_grad_(True)
+    k.requires_grad_(True)
+    v.requires_grad_(True)
+
+    out = flash_attn_varlen_func(
+        q, k, v, q_cuseqlen, k_cuseqlen, Mq, Mk, causal=causal, deterministic=deterministic
+    )
+    g = torch.randn_like(out)
+    out.backward(g)
+
+    # The bug produced NaN specifically in dK/dV for the zero-length Q subsequence
+    assert not q.grad.isnan().any()
+    assert not k.grad.isnan().any()
+    assert not v.grad.isnan().any()
+
+    # Additionally, for the batch with seqlen_q == 0, the corresponding K/V segment
+    # should contribute nothing to the loss, so dK/dV for that segment must be zero.
+    end_kv_zero = int(k_cuseqlen[1])
+    assert k.grad[:end_kv_zero].abs().max() == 0
+    assert v.grad[:end_kv_zero].abs().max() == 0
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("local", [False, True])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("d", [32, 40, 59, 64, 80, 96, 111, 128, 160, 192, 224, 256])
