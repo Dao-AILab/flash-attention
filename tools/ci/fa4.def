@@ -1,5 +1,5 @@
 Bootstrap: docker
-From: togethercomputer/training-performance:flash-attn-cu13.0-26.03.31
+From: togethercomputer/training-performance:flash-attn-cu13.0-26.04.01
 
 %labels
     maintainer tridao

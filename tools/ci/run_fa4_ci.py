@@ -1,21 +1,19 @@
 #!/usr/bin/env python3
-"""Shared FA4 CI driver for local runs and GitHub Actions.
+"""FA4 CI driver — runs inside an Apptainer SIF on a self-hosted GPU runner.
 
-Execution modes (auto-detected, in priority order):
-  1. Apptainer  — FA4_SIF env var is set and `apptainer` is on PATH
-  2. Venv       — FA4_VENV env var or --venv argument points to a virtualenv
+Requires FA4_SIF (path to the .sif image) to be set, either via env var or --sif.
 """
 
 from __future__ import annotations
 
 import argparse
 import os
-import shutil
+import shlex
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-DEFAULT_TEST_FILTER = "1-1-128-True-0-0.0-False-False-False-mha-dtype0"
+DEFAULT_TEST_FILTER = ""  # empty = run all; CI overrides via --test-filter
 DEFAULT_TEST_TARGET = "tests/cute/test_flash_attn.py"
 
 
@@ -59,34 +57,9 @@ def read_free_gpu_indices(min_free_memory_mb: int) -> list[str]:
     return parse_free_gpu_indices(result.stdout, min_free_memory_mb)
 
 
-# ── Execution mode ────────────────────────────────────────────────────────────
-
-def resolve_execution_mode(sif: str | None, venv: Path | None, repo_root: Path) -> tuple[str, Path | None]:
-    """Return (mode, python_bin).
-
-    mode is 'apptainer' or 'venv'.
-    python_bin is None for apptainer (container provides python3).
-    """
-    if sif and shutil.which("apptainer"):
-        return "apptainer", None
-    if sif and not shutil.which("apptainer"):
-        print(f"WARNING: FA4_SIF is set ({sif}) but apptainer is not on PATH — falling back to venv")
-
-    # venv mode
-    venv_path = venv if (venv and venv.is_absolute()) else repo_root / (venv or Path(".venv"))
-    python_bin = venv_path / "bin" / "python"
-    if not python_bin.exists():
-        raise FileNotFoundError(
-            f"Virtualenv Python not found: {python_bin}\n"
-            f"Set FA4_SIF (for Apptainer) or FA4_VENV (for venv) on this runner."
-        )
-    return "venv", python_bin
-
-
 # ── Step plan ─────────────────────────────────────────────────────────────────
 
 def build_step_plan(
-    python_bin: Path | None,
     test_target: str,
     test_filter: str,
     compile_workers: int,
@@ -95,9 +68,7 @@ def build_step_plan(
     benchmark_visible_devices: str,
     skip_benchmark: bool,
 ) -> list[Step]:
-    # In apptainer mode python_bin is None; use bare 'python3' (from container)
-    py = str(python_bin) if python_bin else "python3"
-    pytest_base = [py, "-m", "pytest", test_target, "-k", test_filter]
+    pytest_base = ["python3", "-m", "pytest", test_target, *(["-k", test_filter] if test_filter else [])]
 
     steps = [
         Step(
@@ -118,7 +89,7 @@ def build_step_plan(
         steps.append(Step(
             name="Benchmark (FA4 fwd, hdim=128, seqlen=8192)",
             command=[
-                py, "benchmarks/benchmark_attn.py",
+                "python3", "benchmarks/benchmark_attn.py",
                 "--backend", "fa4", "--fwd",
                 "--headdim", "128", "--seqlen", "8192",
                 "--causal", "both", "--warmup", "1", "--rep", "3",
@@ -130,32 +101,28 @@ def build_step_plan(
 
 # ── Step runner ───────────────────────────────────────────────────────────────
 
-def run_step(step: Step, repo_root: Path, base_env: dict[str, str], mode: str, sif: str, work_dir: str) -> None:
+def run_step(step: Step, repo_root: Path, base_env: dict[str, str], sif: str, work_dir: str) -> None:
     print(f"=== {step.name} ===")
-    env = {**base_env, **step.extra_env}
 
-    if mode == "apptainer":
-        # Install FA4 from the current repo inside this exec invocation.
-        # Must be done per-step because --writable-tmpfs creates a fresh overlay each time.
-        install_cmd = f"uv pip install --system --break-system-packages --no-deps -q -e {repo_root}/flash_attn/cute"
+    # Install FA4 from the current repo inside this exec invocation.
+    # Must be done per-step because --writable-tmpfs creates a fresh overlay each time.
+    install_cmd = f"uv pip install --system --break-system-packages --no-deps -q -e {shlex.quote(str(repo_root / 'flash_attn/cute'))}"
 
-        # Convert relative test/benchmark paths to absolute so we can run from /tmp.
-        # Running from /tmp ensures Python does not insert repo_root into sys.path[0]
-        # (which would cause flash_attn/__init__.py to trigger FA2 imports unavailable in the SIF).
-        command = [
-            str(repo_root / arg) if (arg.startswith("tests/") or arg.startswith("benchmarks/")) else arg
-            for arg in step.command
-        ]
-        env_exports = " && ".join(f"export {k}={v}" for k, v in step.extra_env.items())
-        inner_cmd = " ".join(command)
-        shell_parts = [install_cmd]
-        if env_exports:
-            shell_parts.append(env_exports)
-        shell_parts.append(f"cd /tmp && {inner_cmd}")
-        cmd = ["apptainer", "exec", "--nv", "--writable-tmpfs", "--bind", work_dir, sif, "bash", "-c", " && ".join(shell_parts)]
-        subprocess.run(cmd, check=True, cwd=repo_root, env=base_env)
-    else:
-        subprocess.run(step.command, check=True, cwd=repo_root, env=env)
+    # Convert relative test/benchmark paths to absolute so we can run from /tmp.
+    # Running from /tmp ensures Python does not insert repo_root into sys.path[0]
+    # (which would cause flash_attn/__init__.py to trigger FA2 imports unavailable in the SIF).
+    command = [
+        str(repo_root / arg) if (arg.startswith("tests/") or arg.startswith("benchmarks/")) else arg
+        for arg in step.command
+    ]
+    env_exports = " && ".join(f"export {k}={shlex.quote(v)}" for k, v in step.extra_env.items())
+    inner_cmd = shlex.join(command)
+    shell_parts = [install_cmd]
+    if env_exports:
+        shell_parts.append(env_exports)
+    shell_parts.append(f"cd /tmp && {inner_cmd}")
+    cmd = ["apptainer", "exec", "--nv", "--writable-tmpfs", "--bind", work_dir, sif, "bash", "-c", " && ".join(shell_parts)]
+    subprocess.run(cmd, check=True, cwd=repo_root, env=base_env)
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -165,8 +132,6 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--repo-root", type=Path, default=Path.cwd())
     parser.add_argument("--sif", default=os.environ.get("FA4_SIF", ""),
                         help="Apptainer .sif image path (or set FA4_SIF env var)")
-    parser.add_argument("--venv", type=Path, default=Path(os.environ.get("FA4_VENV", ".venv")),
-                        help="Virtualenv path (or set FA4_VENV env var)")
     parser.add_argument("--test-target", default=DEFAULT_TEST_TARGET)
     parser.add_argument("--test-filter", default=DEFAULT_TEST_FILTER)
     parser.add_argument("--compile-workers", type=int, default=1)
@@ -181,8 +146,9 @@ def main() -> None:
     args = make_parser().parse_args()
     repo_root = args.repo_root.resolve()
 
-    mode, python_bin = resolve_execution_mode(args.sif, args.venv, repo_root)
-    print(f"Execution mode: {mode}" + (f" ({args.sif})" if mode == "apptainer" else f" ({python_bin})"))
+    if not args.sif:
+        raise SystemExit("FA4_SIF is not set — provide --sif or set the FA4_SIF env var.")
+    print(f"Using SIF: {args.sif}")
 
     free_gpu_indices = read_free_gpu_indices(args.min_free_memory_mb)
     test_visible_devices = select_visible_devices(free_gpu_indices, args.use_all_free_gpus)
@@ -193,7 +159,6 @@ def main() -> None:
     work_dir = os.environ.get("CI_WORK_DIR", f"/scratch/user/{os.environ.get('USER', 'user')}")
 
     for step in build_step_plan(
-        python_bin=python_bin,
         test_target=args.test_target,
         test_filter=args.test_filter,
         compile_workers=args.compile_workers,
@@ -202,7 +167,7 @@ def main() -> None:
         benchmark_visible_devices=benchmark_visible_devices,
         skip_benchmark=args.skip_benchmark,
     ):
-        run_step(step, repo_root=repo_root, base_env=base_env, mode=mode, sif=args.sif, work_dir=work_dir)
+        run_step(step, repo_root=repo_root, base_env=base_env, sif=args.sif, work_dir=work_dir)
 
     print("=== All tests passed ===")
 

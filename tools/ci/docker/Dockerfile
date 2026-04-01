@@ -20,16 +20,11 @@ RUN uv pip install --system --break-system-packages --no-cache --pre \
         --find-links https://download.pytorch.org/whl/nightly/cu130/torch \
         --find-links https://download.pytorch.org/whl/nightly/triton
 
-# FA4 dependencies — torch stays pinned from the direct wheel install above.
-RUN uv pip install --system --break-system-packages --no-cache \
-        "nvidia-cutlass-dsl>=4.4.2" \
-        "quack-kernels>=0.3.3" \
-        "apache-tvm-ffi>=0.1.5,<0.2" \
-        "torch-c-dlpack-ext" \
-        "einops" \
-        "typing_extensions" \
-        "pytest" \
-        "pytest-xdist" \
-        "ruff"
+# FA4 dependencies — derived from pyproject.toml to keep a single source of truth.
+# torch stays pinned from the direct wheel install above.
+# The package itself (version 0.0.0 via setuptools-scm fallback) is overwritten at
+# step time by the editable install from the mounted repo.
+COPY flash_attn/cute/ /tmp/fa4/
+RUN uv pip install --system --break-system-packages --no-cache "/tmp/fa4[cu13,dev]"
 
 CMD ["/bin/bash"]

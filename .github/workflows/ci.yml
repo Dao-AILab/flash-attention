@@ -4,9 +4,13 @@ on:
   push:
     branches: [main]
 
+permissions:
+  contents: read
+
 env:
-  FA4_IMAGE: togethercomputer/training-performance:flash-attn-cu13.0-26.03.31
+  FA4_IMAGE: togethercomputer/training-performance:flash-attn-cu13.0-26.04.01@sha256:56e50b056eb4d671410846c3483e843ee7bd0f5b13cb45b6f0d7eb8bd27694a5
   CI_WORK_DIR: ${{ vars.CI_WORK_DIR || format('/scratch/user/{0}', github.actor) }}
+  FA4_TEST_FILTER: "1-1-128-True-0-0.0-False-False-False-mha-dtype0"
 
 jobs:
   lint:
@@ -36,3 +40,5 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
       - uses: ./.github/actions/gpu-test
+        with:
+          test-filter: ${{ env.FA4_TEST_FILTER }}

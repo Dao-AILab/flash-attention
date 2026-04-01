@@ -1,6 +1,12 @@
 name: GPU Test
 description: Compile and run FA4 tests (pull SIF from Docker Hub, cache by tag)
 
+inputs:
+  test-filter:
+    description: pytest -k filter expression
+    required: false
+    default: ""
+
 runs:
   using: composite
   steps:
@@ -26,4 +32,5 @@ runs:
       shell: bash
       run: |
         python3 "$GITHUB_WORKSPACE/tools/ci/run_fa4_ci.py" \
-          --repo-root "$GITHUB_WORKSPACE"
+          --repo-root "$GITHUB_WORKSPACE" \
+          --test-filter "${{ inputs.test-filter }}"
