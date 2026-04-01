@@ -15,5 +15,6 @@ try:
         flash_attn_varlen_qkvpacked_func,
         flash_attn_with_kvcache,
     )
-except ImportError:
+except ModuleNotFoundError:
+    # flash_attn_2_cuda not built — FA4 (flash_attn.cute) can still be used directly
     pass
