@@ -98,6 +98,12 @@ def _check_and_expand_block(
     expanded_cnt = _expand_sparsity_tensor(
         cnt, expected_count_shape, f"{name}_block_cnt", context, hint
     )
+    # [Note] Allow Compact block sparse indices
+    # Allow the last dimension (n_blocks) of idx to be <= expected, since
+    # FA4 only accesses indices 0..cnt-1 per query tile. This enables compact
+    # index tensors that avoid O(N^2) memory at long sequence lengths.
+    if idx.ndim == 4 and idx.shape[3] <= expected_index_shape[3]:
+        expected_index_shape = (*expected_index_shape[:3], idx.shape[3])
     expanded_idx = _expand_sparsity_tensor(
         idx, expected_index_shape, f"{name}_block_idx", context, hint
     )
@@ -200,9 +206,11 @@ def infer_block_sparse_expected_shapes(
             raise ValueError(f"Block sparse tensors{context} {dim_name} dim must be {tgt} or 1.")
     if mask_block_cnt.shape[2] != mask_block_idx.shape[2]:
         raise ValueError(f"Block sparse tensors{context} must share the same m-block dimension.")
-    if mask_block_idx.shape[3] != expected_n_blocks:
+    # [Note] Allow Compact block sparse indices: FA4 only accesses indices 0..cnt-1
+    # per query tile, so idx.shape[3] can be <= expected_n_blocks.
+    if mask_block_idx.shape[3] > expected_n_blocks:
         raise ValueError(
-            f"Block sparse tensors{context} n-block dimension must be {expected_n_blocks}."
+            f"Block sparse tensors{context} n-block dimension must be <= {expected_n_blocks}."
         )
     if expected_m_blocks != num_m_blocks:
         raise ValueError(
