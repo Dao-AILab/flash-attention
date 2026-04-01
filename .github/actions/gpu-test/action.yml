@@ -6,6 +6,10 @@ inputs:
     description: pytest -k filter expression
     required: false
     default: ""
+  compile-workers:
+    description: parallel workers for Pass 1 kernel compilation
+    required: false
+    default: "64"
 
 runs:
   using: composite
@@ -33,4 +37,5 @@ runs:
       run: |
         python3 "$GITHUB_WORKSPACE/tools/ci/run_fa4_ci.py" \
           --repo-root "$GITHUB_WORKSPACE" \
-          --test-filter "${{ inputs.test-filter }}"
+          --test-filter "${{ inputs.test-filter }}" \
+          --compile-workers "${{ inputs.compile-workers }}"
