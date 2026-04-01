@@ -109,7 +109,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             warpgroup.OperandMajorMode.MN,
             Float32,
             atom_layout_mnk=(self.tile_m // 64, 1, 1),  # Might need (1, 2, 1) for hdim 512
-            tiler_mn=(64, self.tile_hdimv),
+            tiler_mn=(64, min(256, self.tile_hdimv)),
             a_source=warpgroup.OperandSource.RMEM
             if self.mma_pv_is_rs
             else warpgroup.OperandSource.SMEM,

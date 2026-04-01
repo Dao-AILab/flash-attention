@@ -86,7 +86,7 @@ class PagedKVManager(ParamsBase):
         val_layout = cute.make_layout((1, async_copy_elems))
         gmem_tiled_copy_KV = cute.make_tiled_copy_tv(atom_async_copy, thr_layout, val_layout)
         gmem_thr_copy_KV = gmem_tiled_copy_KV.get_slice(thread_idx)
-        page_entry_per_thread = n_block_size // num_threads
+        page_entry_per_thread = max(1, n_block_size // num_threads)
 
         tPrPage = cute.make_rmem_tensor((page_entry_per_thread,), Int32)
         tPrPageOffset = cute.make_rmem_tensor((page_entry_per_thread,), Int32)
