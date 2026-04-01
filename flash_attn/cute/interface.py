@@ -543,13 +543,13 @@ def _flash_attn_fwd(
         and (tile_m % qhead_per_kvhead == 0 or not pack_gqa)
     )
 
-    # hash score and mask mods for compile cache
-    score_mod_hash = utils.hash_callable(score_mod) if score_mod is not None else False
-    mask_mod_hash = utils.hash_callable(mask_mod) if mask_mod is not None else False
-
     if softcap is not None:
         assert score_mod is None, "softcap and score_mod cannot be used together"
         score_mod = utils.create_softcap_scoremod(softcap)
+        
+    # hash score and mask mods for compile cache
+    score_mod_hash = utils.hash_callable(score_mod) if score_mod is not None else False
+    mask_mod_hash = utils.hash_callable(mask_mod) if mask_mod is not None else False
 
     is_varlen = (
         cu_seqlens_q is not None
@@ -1170,23 +1170,17 @@ def _flash_attn_bwd(
         pack_gqa = qhead_per_kvhead > 1
     # pack_gqa backward not yet supported in bwd
     pack_gqa = False
-    softcap_score_mod = False
+    if softcap != 0.0 and (score_mod is None and score_mod_bwd is None):
+        raise ValueError("softcap and score_mod/score_mod_bwd cannot be used together")
+    
     if softcap != 0.0:
-        assert score_mod is None and score_mod_bwd is None, (
-            "softcap and score_mod/score_mod_bwd cannot be used together"
-        )
         score_mod = utils.create_softcap_scoremod(softcap)
         score_mod_bwd = utils.create_softcap_scoremod_bwd(softcap)
-        softcap = 0.0
-        softcap_score_mod = True
-
-    if score_mod is not None:
+    elif score_mod is not None:
         assert score_mod_bwd is not None, "score_mod_bwd is required when score_mod is provided"
-        assert softcap == 0.0, "softcap and score_mod are mutually exclusive (different log2 scaling)"
-        if not softcap_score_mod:
-            assert cu_seqlens_q is None and cu_seqlens_k is None, (
-                "varlen + score_mod not supported in bwd yet"
-            )
+        assert cu_seqlens_q is None and cu_seqlens_k is None, (
+            "varlen + score_mod not supported in bwd yet"
+        )
 
     device = q.device
     out_torch_dtype = q.dtype
@@ -1332,7 +1326,6 @@ def _flash_attn_bwd(
             causal,
             window_size_left is not None,
             window_size_right is not None,
-            softcap != 0.0,
             m_block_size,
             n_block_size,
             num_threads,
@@ -1376,7 +1369,6 @@ def _flash_attn_bwd(
             causal,
             window_size_left is not None,
             window_size_right is not None,
-            softcap != 0.0,
             m_block_size,
             n_block_size,
             num_threads,
