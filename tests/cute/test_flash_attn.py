@@ -37,6 +37,7 @@ DISABLE_SPLIT = os.getenv("FLASH_ATTENTION_DISABLE_SPLIT", "FALSE") == "TRUE"
 # SplitKV is not supported on SM90
 IS_SM90 = torch.cuda.get_device_capability()[0] == 9
 IS_SM100 = torch.cuda.get_device_capability()[0] == 10
+IS_SM120 = torch.cuda.get_device_capability() == (12, 0)
 TEST_BWD_ONLY = False
 VERBOSE = True
 
@@ -113,6 +114,11 @@ def test_flash_attn_output(
     local = local_enum > 0
     if local and causal:
         pytest.skip()
+    if IS_SM120 and has_learnable_sink:
+        pytest.skip("learnable_sink not supported on SM120")
+    # TODO(SM120): GQA/MQA hits crd2idx incompatibility in pack_gqa on newer CUTLASS DSL
+    if IS_SM120 and mha_type != "mha":
+        pytest.skip("GQA/MQA not yet supported on SM120 (pack_gqa crd2idx issue)")
     device = "cuda"
     # set seed
     seed = 0
@@ -250,8 +256,11 @@ def test_flash_attn_output(
         # pack_gqa_vals = [False]
         num_splits_vals = [1, 3] if d < 192 and not DISABLE_SPLIT and not TEST_BWD_ONLY else [1]
         for pack_gqa, num_splits in itertools.product(pack_gqa_vals, num_splits_vals):
-            # SplitKV not supported on SM90 - skip this iteration
-            if IS_SM90 and num_splits > 1:
+            # SplitKV not supported on SM90/SM120 - skip this iteration
+            if (IS_SM90 or IS_SM120) and num_splits > 1:
+                continue
+            # TODO(SM120): pack_gqa hits crd2idx incompatibility on newer CUTLASS DSL
+            if IS_SM120 and pack_gqa:
                 continue
             if IS_SM100 and (d >= 192 and dv >= 192):  # hdim 192 and 256 not support on SM100
                 continue
@@ -301,6 +310,8 @@ def test_flash_attn_output(
                 pytest.xfail("hdim > 192 backward: SM90 not supported yet")
             if d != dv and mha_type != "mha" and IS_SM90:
                 pytest.xfail("SM90 GQA bwd currently requires headdim == headdim_v")
+            if IS_SM120 and deterministic:
+                pytest.skip("deterministic backward not supported on SM120")
             g = torch.randn_like(out)
             # do_o = ((g.float() * out.float()).sum(-1)).transpose(1, 2)
             dq, dk, dv = torch.autograd.grad(out, (q, k, v), g)
@@ -472,6 +483,10 @@ def test_flash_attn_varlen_output(
     local = local_enum > 0
     if local and causal:
         pytest.skip()
+    if IS_SM120 and has_learnable_sink:
+        pytest.skip("learnable_sink not supported on SM120")
+    if IS_SM120 and mha_type != "mha":
+        pytest.skip("GQA/MQA not yet supported on SM120 (pack_gqa crd2idx issue)")
     if (
         causal or local
     ):  # Right now reference only supports causal attention with seqlen_k == seqlen_q
@@ -682,8 +697,11 @@ def test_flash_attn_varlen_output(
         # SplitKV is not supported for hdim >= 192
         num_splits_vals = [1, 3] if d < 192 and not DISABLE_SPLIT and not TEST_BWD_ONLY else [1]
         for pack_gqa, num_splits in itertools.product(pack_gqa_vals, num_splits_vals):
-            # SplitKV not supported on SM90 - skip this iteration
-            if IS_SM90 and num_splits > 1:
+            # SplitKV not supported on SM90/SM120 - skip this iteration
+            if (IS_SM90 or IS_SM120) and num_splits > 1:
+                continue
+            # TODO(SM120): pack_gqa hits crd2idx incompatibility on newer CUTLASS DSL
+            if IS_SM120 and pack_gqa:
                 continue
             out_unpad, lse = flash_attn_varlen_func(
                 q_unpad if unpad_q else q,
@@ -749,6 +767,8 @@ def test_flash_attn_varlen_output(
                 pytest.xfail("hdim > 192 backward: SM90 not supported yet")
             if d != dv and mha_type != "mha" and IS_SM90:
                 pytest.xfail("SM90 GQA bwd currently requires headdim == headdim_v")
+            if IS_SM120 and deterministic:
+                pytest.skip("deterministic backward not supported on SM120")
             g_unpad = torch.randn_like(out_unpad)
             # do_o = ((g_unpad.float() * out_unpad.float()).sum(-1)).transpose(-1, -2)
             # import flash_attn_3_cuda
@@ -949,6 +969,12 @@ def test_flash_attn_kvcache(
 ):
     if page_size is not None and seqlen_k % page_size != 0:
         pytest.skip()
+    if IS_SM120 and page_size is not None:
+        pytest.skip("Paged KV not supported on SM120")
+    if IS_SM120 and has_learnable_sink:
+        pytest.skip("learnable_sink not supported on SM120")
+    if IS_SM120 and mha_type != "mha":
+        pytest.skip("GQA/MQA not yet supported on SM120 (pack_gqa crd2idx issue)")
     if seqlen_q > seqlen_k and new_kv:
         pytest.skip()
     if not new_kv and rotary_fraction > 0.0:
@@ -1291,8 +1317,8 @@ def test_flash_attn_kvcache(
         for num_splits, precompute_metadata in itertools.product(
             num_splits_vals, precompute_metadata_vals
         ):
-            # SplitKV not supported on SM90 - skip this iteration
-            if IS_SM90 and num_splits > 1:
+            # SplitKV not supported on SM90/SM120 - skip this iteration
+            if (IS_SM90 or IS_SM120) and num_splits > 1:
                 continue
             # if precompute_metadata:
             #     scheduler_metadata = get_scheduler_metadata(
