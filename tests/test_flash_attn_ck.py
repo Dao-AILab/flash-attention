@@ -1556,7 +1556,7 @@ def test_flash_attn_bwd_varlen_overflow(d, causal, dtype):
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("d", [64, 128])
 def test_flash_attn_bwd_varlen_seqq_zero(d, causal, nheads_kv, deterministic, dtype):
-    """Regression test: NaN in dK/dV for the zero-length Q subsequence when using GQA.
+    """Regression test: NaN in dK/dV for the zero-length Q subsequence (run for both GQA and MHA).
     """
     if not is_bwd_supported(d, deterministic=deterministic):
         pytest.skip(get_bwd_unsupported_reason(d, deterministic=deterministic))
@@ -1589,7 +1589,11 @@ def test_flash_attn_bwd_varlen_seqq_zero(d, causal, nheads_kv, deterministic, dt
     assert not k.grad.isnan().any()
     assert not v.grad.isnan().any()
 
-
+    # Additionally, for the batch with seqlen_q == 0, the corresponding K/V segment
+    # should contribute nothing to the loss, so dK/dV for that segment must be zero.
+    end_kv_zero = int(k_cuseqlen[1])
+    assert k.grad[:end_kv_zero].abs().max() == 0
+    assert v.grad[:end_kv_zero].abs().max() == 0
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("local", [False, True])
 @pytest.mark.parametrize("causal", [False, True])
