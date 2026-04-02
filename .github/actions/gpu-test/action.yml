@@ -1,0 +1,43 @@
+name: GPU Test
+description: Compile and run FA4 tests (pull SIF from Docker Hub, cache by tag)
+
+inputs:
+  test-filter:
+    description: pytest -k filter expression
+    required: false
+    default: ""
+  compile-workers:
+    description: parallel workers for Pass 1 kernel compilation
+    required: false
+    default: "64"
+
+runs:
+  using: composite
+  steps:
+    - name: Pull FA4 SIF
+      shell: bash
+      run: |
+        CI_WORK_DIR="${CI_WORK_DIR:-/scratch/user/$USER}"
+        TAG=$(echo "$FA4_IMAGE" | tr '/: ' '---')
+        SIF="$CI_WORK_DIR/${TAG}.sif"
+        echo "FA4_IMAGE=$FA4_IMAGE"
+        echo "SIF=$SIF"
+        if [ ! -f "$SIF" ]; then
+          echo "Pulling $FA4_IMAGE → $SIF"
+          APPTAINER_TMPDIR="$CI_WORK_DIR/apptainer_tmp" \
+          APPTAINER_CACHEDIR="$CI_WORK_DIR/apptainer_cache" \
+          apptainer pull "$SIF" "docker://$FA4_IMAGE"
+        else
+          echo "Using cached SIF: $SIF"
+        fi
+        # Remove stale SIFs from previous image versions to prevent unbounded disk growth.
+        find "$CI_WORK_DIR" -maxdepth 1 -name "*.sif" ! -name "$(basename "$SIF")" -delete
+        echo "FA4_SIF=$SIF" >> "$GITHUB_ENV"
+
+    - name: Compile and run tests
+      shell: bash
+      run: |
+        python3 "$GITHUB_WORKSPACE/tools/ci/run_fa4_ci.py" \
+          --repo-root "$GITHUB_WORKSPACE" \
+          --test-filter "${{ inputs.test-filter }}" \
+          --compile-workers "${{ inputs.compile-workers }}"
