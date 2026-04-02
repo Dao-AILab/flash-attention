@@ -30,6 +30,8 @@ runs:
         else
           echo "Using cached SIF: $SIF"
         fi
+        # Remove stale SIFs from previous image versions to prevent unbounded disk growth.
+        find "$CI_WORK_DIR" -maxdepth 1 -name "*.sif" ! -name "$(basename "$SIF")" -delete
         echo "FA4_SIF=$SIF" >> "$GITHUB_ENV"
 
     - name: Compile and run tests
