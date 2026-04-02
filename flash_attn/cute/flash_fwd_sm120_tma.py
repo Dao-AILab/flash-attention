@@ -137,6 +137,11 @@ class FlashAttentionForwardSm120Tma(FlashAttentionForwardBase):
             mask_mod=mask_mod,
             has_aux_tensors=has_aux_tensors,
         )
+        # Override arch after parent __init__ which sets it to the runtime GPU arch.
+        # SM120 uses SM80 mma.sync, so base class code paths must see arch=sm_80
+        # to avoid enabling SM90+ features (TMA-O, WGMMA, etc.).
+        from cutlass.base_dsl.arch import Arch
+        self.arch = Arch.sm_80
         self.num_mma_warps = num_mma_warps
         self.kv_stages = kv_stages
         self.use_tma_O = False  # SM120 doesn't have WGMMA, so O store uses SMEM not TMA

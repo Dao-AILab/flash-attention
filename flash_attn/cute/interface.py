@@ -807,7 +807,10 @@ def _flash_attn_fwd(
             # TMA kernel when: no paged KV, no varlen
             is_varlen = cu_seqlens_q is not None or cu_seqlens_k is not None
             use_tma_sm120 = (page_table is None and not is_varlen)
-            if use_tma_sm120:
+            if use_tma_sm120 and FlashAttentionForwardSm120Tma.can_implement(
+                dtype, head_dim, head_dim_v, tile_m, tile_n,
+                num_mma_warps=4, kv_stages=2, is_causal=causal,
+            ):
                 fa_fwd = FlashAttentionForwardSm120Tma(
                     dtype,
                     head_dim,
