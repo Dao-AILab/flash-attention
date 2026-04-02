@@ -2,13 +2,12 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, ci-fix]
 
 permissions:
   contents: read
 
 env:
-  FA4_IMAGE: togethercomputer/training-performance:flash-attn-cu13.0-26.04.01@sha256:56e50b056eb4d671410846c3483e843ee7bd0f5b13cb45b6f0d7eb8bd27694a5
   CI_WORK_DIR: ${{ vars.CI_WORK_DIR || format('/scratch/user/{0}', github.actor) }}
   FA4_TEST_FILTER: "1-1-128-True-0-0.0-False-False-False-mha-dtype0"
 
@@ -42,3 +41,5 @@ jobs:
       - uses: ./.github/actions/gpu-test
         with:
           test-filter: ${{ env.FA4_TEST_FILTER }}
+          fa4_image_cu129: "togethercomputer/training-performance:flash-attn-cu12.9-26.03.25@sha256:304a5c3d2b3a75b151cd2a964cd26d444e0d8b5686d63943df13378c9705f943"
+          fa4_image_cu130: "togethercomputer/training-performance:flash-attn-cu13.0-26.04.01@sha256:56e50b056eb4d671410846c3483e843ee7bd0f5b13cb45b6f0d7eb8bd27694a5"
