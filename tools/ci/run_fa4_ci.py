@@ -87,11 +87,12 @@ def build_step_plan(
     ]
     if not skip_benchmark:
         steps.append(Step(
-            name="Benchmark (FA4 fwd, hdim=128, seqlen=8192)",
+            name="Benchmark (FA4 fwd, hdim=128, causal=both, seqlen=1K-32K)",
             command=[
                 "python3", "benchmarks/benchmark_attn.py",
-                "--backend", "fa4", "--fwd",
-                "--headdim", "128", "--seqlen", "8192",
+                "--backend", "fa4", "--fwd", "--bwd",
+                "--headdim", "128",
+                "--seqlen", "1024,2048,4096,8192,16384,32768",
                 "--causal", "both", "--warmup", "1", "--rep", "3",
             ],
             extra_env={"CUDA_VISIBLE_DEVICES": benchmark_visible_devices},
