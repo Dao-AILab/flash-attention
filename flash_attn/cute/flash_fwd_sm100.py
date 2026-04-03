@@ -9,6 +9,7 @@
 # Unsupported features that will be added later:
 # - page size != 128
 # - more hdim (192, 256)
+# - native full-width V tiles > 256 (the interface chunks V/O slices into <=256)
 # Based on the cutlass example and cute-dsl example:
 # https://github.com/NVIDIA/cutlass/tree/main/examples/77_blackwell_fmha
 # https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/blackwell/fmha.py
@@ -130,6 +131,8 @@ class FlashAttentionForwardSm100:
         self.n_block_size = n_block_size
         self.q_stage = q_stage
         assert self.q_stage in [1, 2]
+        if self.head_dim_v_padded >= 256:
+            self.q_stage = 1
         self.use_2cta_instrs = use_2cta_instrs
         # If split_P_arrive, the softmax warps write some columns of P first, signal to the MMA warp
         # to being the P @ V MMA, then write the rest of P and signal again. This allows some overlap
