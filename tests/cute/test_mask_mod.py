@@ -28,6 +28,7 @@ from flash_attn.cute.block_sparsity import (
     fast_sampling,
     normalize_block_sparse_config,
 )
+from flash_attn.cute.cache_utils import get_jit_cache
 from flash_attn.cute import utils
 from mask_mod_definitions import get_mask_pair, random_doc_id_tensor
 COMPUTE_CAPABILITY = torch.cuda.get_device_capability()[0]
@@ -105,6 +106,76 @@ def compute_reference_flex_attn(tensors, mask_mod_flex, block_size: tuple[int, i
     )
     out_ref = flex_attention(q, k, v, block_mask=block_mask, scale=scale, enable_gqa=True)
     return out_ref.transpose(1, 2).contiguous()
+
+
+def assert_fwd_matches_reference(out_cute, out_ref_fp32, out_pt, test_desc: str | None = None):
+    assert out_cute.shape == out_ref_fp32.shape == out_pt.shape
+    assert not torch.isnan(out_cute).any()
+    assert not torch.isnan(out_ref_fp32).any()
+    assert torch.isfinite(out_cute).all()
+    assert torch.isfinite(out_ref_fp32).all()
+
+    fwd_atol = 2 * (out_ref_fp32 + 0.3 - 0.3 - out_ref_fp32).abs().max().item()
+    rtol = 2
+
+    pt_error = (out_pt - out_ref_fp32).abs().max().item()
+    cute_error = (out_cute - out_ref_fp32).abs().max().item()
+
+    if test_desc is not None:
+        print(f"\n{test_desc}")
+        print("  Reference implementation: FlexAttention")
+        print(f"  PyTorch vs FP32: {pt_error:.2e}")
+        print(f"  Kernel vs FP32: {cute_error:.2e}")
+        print(f"  Tolerance: rtol={rtol} * {pt_error:.2e} + {fwd_atol:.2e}")
+
+    assert cute_error <= rtol * pt_error + fwd_atol, (
+        f"Kernel error {cute_error:.2e} exceeds {rtol}x PyTorch error {pt_error:.2e} + {fwd_atol:.2e}"
+    )
+
+
+def assert_bwd_matches_reference(
+    dq_cute,
+    dk_cute,
+    dv_cute,
+    dq_ref_fp32,
+    dk_ref_fp32,
+    dv_ref_fp32,
+    dq_pt,
+    dk_pt,
+    dv_pt,
+    dtype,
+    min_seqlen: int,
+):
+    assert not torch.isnan(dq_cute).any(), "dQ contains NaN"
+    assert not torch.isnan(dk_cute).any(), "dK contains NaN"
+    assert not torch.isnan(dv_cute).any(), "dV contains NaN"
+
+    bwd_rtol = 2
+    bwd_atol_floor = 1e-5 if min_seqlen >= 64 else 3e-5
+    dq_atol = max(bwd_atol_floor, 2 * (dq_ref_fp32 + 0.3 - 0.3 - dq_ref_fp32).abs().max().item())
+    dk_atol = max(bwd_atol_floor, 2 * (dk_ref_fp32 + 0.3 - 0.3 - dk_ref_fp32).abs().max().item())
+    dv_atol = max(bwd_atol_floor, 2 * (dv_ref_fp32 + 0.3 - 0.3 - dv_ref_fp32).abs().max().item())
+
+    dq_ref = dq_ref_fp32.to(dtype)
+    dk_ref = dk_ref_fp32.to(dtype)
+    dv_ref = dv_ref_fp32.to(dtype)
+
+    pt_dq_err = (dq_pt - dq_ref).abs().max().item()
+    pt_dk_err = (dk_pt - dk_ref).abs().max().item()
+    pt_dv_err = (dv_pt - dv_ref).abs().max().item()
+
+    cute_dq_err = (dq_cute - dq_ref).abs().max().item()
+    cute_dk_err = (dk_cute - dk_ref).abs().max().item()
+    cute_dv_err = (dv_cute - dv_ref).abs().max().item()
+
+    print("  Backward comparison:")
+    print(f"    dQ: PT err={pt_dq_err:.2e}, CuTE err={cute_dq_err:.2e}, atol={dq_atol:.2e}")
+    print(f"    dK: PT err={pt_dk_err:.2e}, CuTE err={cute_dk_err:.2e}, atol={dk_atol:.2e}")
+    print(f"    dV: PT err={pt_dv_err:.2e}, CuTE err={cute_dv_err:.2e}, atol={dv_atol:.2e}")
+
+    assert cute_dq_err <= bwd_rtol * pt_dq_err + dq_atol, f"dQ error too large: {cute_dq_err:.2e}"
+    assert cute_dk_err <= bwd_rtol * pt_dk_err + dk_atol, f"dK error too large: {cute_dk_err:.2e}"
+    assert cute_dv_err <= bwd_rtol * pt_dv_err + dv_atol, f"dV error too large: {cute_dv_err:.2e}"
 
 
 def get_coarse_block_mask_pair(sparse_tile_m: int, tile_n: int, last_block: int):
@@ -348,10 +419,9 @@ def _run_mask_test(
         window_size_left=window_left,
         window_size_right=window_right,
         learnable_sink=None,
-        m_block_size=tile_m,
-        n_block_size=tile_n,
+        tile_mn=(tile_m, tile_n),
         pack_gqa=pack_gqa,
-        _compute_capability=None,
+        _arch=None,
         score_mod=None,
         mask_mod=mask_mod_cute,
         block_sparse_tensors=block_sparse_mask_fwd,
@@ -370,18 +440,8 @@ def _run_mask_test(
     out_ref_fp32 = compute_reference_flex_attn(tensors_fp32, mask_mod_flex, block_size)
     out_ref = compute_reference_flex_attn(tensors, mask_mod_flex, block_size)
     out_pt = out_ref.clone()
-
-    # Check for invalid values
-    assert out_cute.shape == out_ref_fp32.shape == out_ref.shape
-    assert not torch.isnan(out_cute).any()
-    assert not torch.isnan(out_ref_fp32).any()
-    assert torch.isfinite(out_cute).all()
-    assert torch.isfinite(out_ref_fp32).all()
-
-    # Compute numerical tolerance (matching flash attention tests)
     fwd_atol = 2 * (out_ref_fp32 + 0.3 - 0.3 - out_ref_fp32).abs().max().item()
     rtol = 2
-
     ref_error = (out_ref - out_ref_fp32).abs().max().item()
     pt_error = (out_pt - out_ref_fp32).abs().max().item()
     cute_error = (out_cute - out_ref_fp32).abs().max().item()
@@ -412,10 +472,7 @@ def _run_mask_test(
         print(f"  DEBUG: Kernel value: {out_cute[max_diff_coords]:.6f}")
         print(f"  DEBUG: Reference value: {out_ref_fp32[max_diff_coords]:.6f}")
 
-    # Use the same assertion logic as FlashAttention tests
-    assert cute_error <= rtol * pt_error + fwd_atol, (
-        f"Kernel error {cute_error:.2e} exceeds {rtol}x PyTorch error {pt_error:.2e} + {fwd_atol:.2e}"
-    )
+    assert_fwd_matches_reference(out_cute, out_ref_fp32, out_pt, mask_desc)
 
     if needs_backward:
         q = tensors["q"]
@@ -443,38 +500,19 @@ def _run_mask_test(
             q, k, v, flex_block_mask, grad_out
         )
 
-        # Check for invalid values
-        assert not torch.isnan(dq_cute).any(), "dQ contains NaN"
-        assert not torch.isnan(dk_cute).any(), "dK contains NaN"
-        assert not torch.isnan(dv_cute).any(), "dV contains NaN"
-
-        bwd_rtol = 2
-        min_seqlen = min(seqlen_q, seqlen_k)
-        bwd_atol_floor = 1e-5 if min_seqlen >= 64 else 3e-5
-        dq_atol = max(bwd_atol_floor, 2 * (dq_ref_fp32 + 0.3 - 0.3 - dq_ref_fp32).abs().max().item())
-        dk_atol = max(bwd_atol_floor, 2 * (dk_ref_fp32 + 0.3 - 0.3 - dk_ref_fp32).abs().max().item())
-        dv_atol = max(bwd_atol_floor, 2 * (dv_ref_fp32 + 0.3 - 0.3 - dv_ref_fp32).abs().max().item())
-
-        dq_ref = dq_ref_fp32.to(dtype)
-        dk_ref = dk_ref_fp32.to(dtype)
-        dv_ref = dv_ref_fp32.to(dtype)
-
-        pt_dq_err = (dq_pt - dq_ref).abs().max().item()
-        pt_dk_err = (dk_pt - dk_ref).abs().max().item()
-        pt_dv_err = (dv_pt - dv_ref).abs().max().item()
-
-        cute_dq_err = (dq_cute - dq_ref).abs().max().item()
-        cute_dk_err = (dk_cute - dk_ref).abs().max().item()
-        cute_dv_err = (dv_cute - dv_ref).abs().max().item()
-
-        print("  Backward comparison:")
-        print(f"    dQ: PT err={pt_dq_err:.2e}, CuTE err={cute_dq_err:.2e}, atol={dq_atol:.2e}")
-        print(f"    dK: PT err={pt_dk_err:.2e}, CuTE err={cute_dk_err:.2e}, atol={dk_atol:.2e}")
-        print(f"    dV: PT err={pt_dv_err:.2e}, CuTE err={cute_dv_err:.2e}, atol={dv_atol:.2e}")
-
-        assert cute_dq_err <= bwd_rtol * pt_dq_err + dq_atol, f"dQ error too large: {cute_dq_err:.2e}"
-        assert cute_dk_err <= bwd_rtol * pt_dk_err + dk_atol, f"dK error too large: {cute_dk_err:.2e}"
-        assert cute_dv_err <= bwd_rtol * pt_dv_err + dv_atol, f"dV error too large: {cute_dv_err:.2e}"
+        assert_bwd_matches_reference(
+            dq_cute,
+            dk_cute,
+            dv_cute,
+            dq_ref_fp32,
+            dk_ref_fp32,
+            dv_ref_fp32,
+            dq_pt,
+            dk_pt,
+            dv_pt,
+            dtype,
+            min(seqlen_q, seqlen_k),
+        )
 
 
 def test_mask_mod_ima_partial_block():
@@ -621,8 +659,8 @@ def test_single_doc_bwd_minimal():
         seqused_q=None, seqused_k=None, page_table=None,
         causal=False, softcap=None,
         window_size_left=-1, window_size_right=-1,
-        m_block_size=tile_m, n_block_size=tile_n, pack_gqa=False,
-        _compute_capability=None, score_mod=None,
+        tile_mn=(tile_m, tile_n), pack_gqa=False,
+        _arch=None, score_mod=None,
         mask_mod=mask_mod_cute,
         block_sparse_tensors=block_sparse_mask_fwd,
         return_lse=True, aux_tensors=aux_tensors_arg,
@@ -789,8 +827,7 @@ def test_sm100_block_sparse_sink_all_masked():
         window_size_left=None,
         window_size_right=None,
         learnable_sink=learnable_sink,
-        m_block_size=128,
-        n_block_size=128,
+        tile_mn=(128, 128),
         num_threads=384,
         pack_gqa=False,
         block_sparse_tensors=sparse,
@@ -818,8 +855,8 @@ def test_sm100_block_sparse_q_stage1():
         "__init__",
         wrapped_init,
     ):
-        compile_cache = dict(_flash_attn_fwd.compile_cache)
-        _flash_attn_fwd.compile_cache.clear()
+        compile_cache = _flash_attn_fwd.compile_cache
+        _flash_attn_fwd.compile_cache = get_jit_cache("test_mask_mod.fwd")
         try:
             _run_mask_test(
                 seqlen_q=128,
@@ -839,7 +876,7 @@ def test_sm100_block_sparse_q_stage1():
             )
         finally:
             _flash_attn_fwd.compile_cache.clear()
-            _flash_attn_fwd.compile_cache.update(compile_cache)
+            _flash_attn_fwd.compile_cache = compile_cache
     assert observed.get("q_stage") == 1
 
 
@@ -907,10 +944,9 @@ def test_sm100_block_sparse_coarse_blocks():
         window_size_left=None,
         window_size_right=None,
         learnable_sink=None,
-        m_block_size=tile_m,
-        n_block_size=tile_n,
+        tile_mn=(tile_m, tile_n),
         pack_gqa=False,
-        _compute_capability=None,
+        _arch=None,
         score_mod=None,
         mask_mod=mask_mod_cute,
         block_sparse_tensors=block_sparse_mask_fwd,
@@ -1014,10 +1050,9 @@ def test_sm100_block_sparse_coarse_blocks_mismatch():
             window_size_left=None,
             window_size_right=None,
             learnable_sink=None,
-            m_block_size=tile_m,
-            n_block_size=tile_n,
+            tile_mn=(tile_m, tile_n),
             pack_gqa=False,
-            _compute_capability=None,
+            _arch=None,
             score_mod=None,
             mask_mod=mask_mod_cute,
             block_sparse_tensors=block_sparse_mask_fwd,
@@ -1143,6 +1178,9 @@ def test_sm90_block_sparse_bwd_mismatched_q_block_granularity_error_message():
 
     tensors = create_tensors(batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, headdim, headdim, dtype)
     mask_mod_cute, mask_mod_flex = get_mask_pair("block_diagonal", seqlen_q=seqlen_q, seqlen_k=seqlen_k)
+
+    # Use a block_size whose Q dimension doesn't divide m_block_size (100 % 80 != 0)
+    bad_block_size_q = 100
     bm = create_block_mask(
         mask_mod_flex,
         batch_size,
@@ -1150,7 +1188,7 @@ def test_sm90_block_sparse_bwd_mismatched_q_block_granularity_error_message():
         seqlen_q,
         seqlen_k,
         device="cuda",
-        BLOCK_SIZE=(tile_m, tile_n),
+        BLOCK_SIZE=(bad_block_size_q, tile_n),
     )
     (
         _seq_q,
@@ -1171,7 +1209,7 @@ def test_sm90_block_sparse_bwd_mismatched_q_block_granularity_error_message():
         mask_block_idx=q_mask_idx,
         full_block_cnt=full_q_cnt,
         full_block_idx=full_q_idx,
-        block_size=(tile_m, tile_n),
+        block_size=(bad_block_size_q, tile_n),
     )
 
     softmax_scale = 1.0 / math.sqrt(headdim)
@@ -1181,7 +1219,7 @@ def test_sm90_block_sparse_bwd_mismatched_q_block_granularity_error_message():
 
     with pytest.raises(
         ValueError,
-        match=r"Block sparsity expects sparse_block_size_q=128 for subtile_factor=2\.",
+        match=r"Block sparsity expects sparse_block_size_q=",
     ):
         _flash_attn_bwd(
             q=tensors["q"],
@@ -1197,6 +1235,209 @@ def test_sm90_block_sparse_bwd_mismatched_q_block_granularity_error_message():
             mask_mod=mask_mod_cute,
             block_sparse_tensors=block_sparse_mask_bwd,
         )
+
+
+@pytest.mark.skipif(COMPUTE_CAPABILITY != 9, reason="SM90-only test")
+def test_sm90_block_sparse_infers_block_size():
+    torch.manual_seed(0)
+
+    batch_size = 1
+    nheads = 4
+    seqlen_q = 128
+    seqlen_k = 128
+    headdim = 64
+    tile_m = 128
+    tile_n = 128
+    dtype = torch.bfloat16
+    softmax_scale = 1.0 / math.sqrt(headdim)
+
+    q = torch.randn(batch_size, seqlen_q, nheads, headdim, device="cuda", dtype=dtype)
+    k = torch.randn(batch_size, seqlen_k, nheads, headdim, device="cuda", dtype=dtype)
+    v = torch.randn(batch_size, seqlen_k, nheads, headdim, device="cuda", dtype=dtype)
+
+    def block_causal(batch, head, q_idx, kv_idx):
+        return kv_idx // tile_n <= q_idx // tile_m
+
+    bm = create_block_mask(
+        block_causal,
+        batch_size,
+        nheads,
+        seqlen_q,
+        seqlen_k,
+        device="cuda",
+        BLOCK_SIZE=(tile_m, tile_n),
+    )
+    (
+        _seq_q,
+        _seq_k,
+        kv_mask_cnt,
+        kv_mask_idx,
+        full_kv_cnt,
+        full_kv_idx,
+        q_mask_cnt,
+        q_mask_idx,
+        full_q_cnt,
+        full_q_idx,
+        *_,
+    ) = bm.as_tuple()
+
+    block_sparse_mask_fwd = BlockSparseTensorsTorch(
+        mask_block_cnt=kv_mask_cnt,
+        mask_block_idx=kv_mask_idx,
+        full_block_cnt=full_kv_cnt,
+        full_block_idx=full_kv_idx,
+        block_size=None,
+    )
+    block_sparse_mask_bwd = BlockSparseTensorsTorch(
+        mask_block_cnt=q_mask_cnt,
+        mask_block_idx=q_mask_idx,
+        full_block_cnt=full_q_cnt,
+        full_block_idx=full_q_idx,
+        block_size=None,
+    )
+
+    out, lse = _flash_attn_fwd(
+        q=q,
+        k=k,
+        v=v,
+        softmax_scale=softmax_scale,
+        causal=False,
+        block_sparse_tensors=block_sparse_mask_fwd,
+        return_lse=True,
+    )
+    grad_out = torch.randn_like(out)
+    dq, dk, dv = run_cute_mask_bwd(
+        q,
+        k,
+        v,
+        out,
+        lse,
+        grad_out,
+        None,
+        block_sparse_mask_bwd=block_sparse_mask_bwd,
+        tile_m=tile_m,
+        tile_n=tile_n,
+    )
+
+    out_ref, dq_ref, dk_ref, dv_ref = run_flex_reference_bwd(
+        q, k, v, bm, grad_out, dtype=torch.float32
+    )
+    out_pt, dq_pt, dk_pt, dv_pt = run_flex_reference_bwd(q, k, v, bm, grad_out)
+    assert_fwd_matches_reference(out, out_ref, out_pt)
+    assert_bwd_matches_reference(
+        dq,
+        dk,
+        dv,
+        dq_ref,
+        dk_ref,
+        dv_ref,
+        dq_pt,
+        dk_pt,
+        dv_pt,
+        dtype,
+        min(seqlen_q, seqlen_k),
+    )
+
+
+@pytest.mark.skipif(COMPUTE_CAPABILITY != 9, reason="SM90-only test")
+def test_sm90_block_sparse_explicit_192_block_size():
+    torch.manual_seed(0)
+
+    batch_size = 1
+    nheads = 4
+    seqlen_q = 384
+    seqlen_k = 384
+    headdim = 96
+    block_size_q = 192
+    block_size_kv = 128
+    dtype = torch.bfloat16
+    softmax_scale = 1.0 / math.sqrt(headdim)
+
+    q = torch.randn(batch_size, seqlen_q, nheads, headdim, device="cuda", dtype=dtype)
+    k = torch.randn(batch_size, seqlen_k, nheads, headdim, device="cuda", dtype=dtype)
+    v = torch.randn(batch_size, seqlen_k, nheads, headdim, device="cuda", dtype=dtype)
+
+    def block_causal(batch, head, q_idx, kv_idx):
+        return (q_idx >= block_size_q) & (kv_idx < block_size_kv)
+
+    bm = create_block_mask(
+        block_causal,
+        batch_size,
+        nheads,
+        seqlen_q,
+        seqlen_k,
+        device="cuda",
+        BLOCK_SIZE=(block_size_q, block_size_kv),
+    )
+    (
+        _seq_q,
+        _seq_k,
+        kv_mask_cnt,
+        kv_mask_idx,
+        full_kv_cnt,
+        full_kv_idx,
+        q_mask_cnt,
+        q_mask_idx,
+        full_q_cnt,
+        full_q_idx,
+        *_,
+    ) = bm.as_tuple()
+
+    block_sparse_mask_fwd = BlockSparseTensorsTorch(
+        mask_block_cnt=kv_mask_cnt,
+        mask_block_idx=kv_mask_idx,
+        full_block_cnt=full_kv_cnt,
+        full_block_idx=full_kv_idx,
+        block_size=(block_size_q, block_size_kv),
+    )
+    block_sparse_mask_bwd = BlockSparseTensorsTorch(
+        mask_block_cnt=q_mask_cnt,
+        mask_block_idx=q_mask_idx,
+        full_block_cnt=full_q_cnt,
+        full_block_idx=full_q_idx,
+        block_size=(block_size_q, block_size_kv),
+    )
+
+    out, lse = _flash_attn_fwd(
+        q=q,
+        k=k,
+        v=v,
+        softmax_scale=softmax_scale,
+        causal=True,
+        block_sparse_tensors=block_sparse_mask_fwd,
+        return_lse=True,
+    )
+    grad_out = torch.randn_like(out)
+    dq, dk, dv = _flash_attn_bwd(
+        q=q,
+        k=k,
+        v=v,
+        out=out,
+        dout=grad_out,
+        lse=lse,
+        softmax_scale=softmax_scale,
+        causal=True,
+        block_sparse_tensors=block_sparse_mask_bwd,
+    )
+
+    out_ref, dq_ref, dk_ref, dv_ref = run_flex_reference_bwd(
+        q, k, v, bm, grad_out, dtype=torch.float32
+    )
+    out_pt, dq_pt, dk_pt, dv_pt = run_flex_reference_bwd(q, k, v, bm, grad_out)
+    assert_fwd_matches_reference(out, out_ref, out_pt)
+    assert_bwd_matches_reference(
+        dq,
+        dk,
+        dv,
+        dq_ref,
+        dk_ref,
+        dv_ref,
+        dq_pt,
+        dk_pt,
+        dv_pt,
+        dtype,
+        min(seqlen_q, seqlen_k),
+    )
 
 
 def test_gqa_block_sparse_broadcast_pattern_recompilation():
@@ -1268,7 +1509,7 @@ def test_gqa_block_sparse_broadcast_pattern_recompilation():
             q=q, k=k, v=v, out=out, lse=lse,
             softmax_scale=softmax_scale, causal=False,
             window_size_left=-1, window_size_right=-1,
-            m_block_size=tile_m, n_block_size=tile_n, pack_gqa=False,
+            tile_mn=(tile_m, tile_n), pack_gqa=False,
             mask_mod=mask_mod_cute, block_sparse_tensors=block_sparse_fwd,
             return_lse=True,
         )
@@ -1343,7 +1584,7 @@ def test_gqa_expand_stride_zero_bug():
         q=q, k=k, v=v, out=out, lse=lse,
         softmax_scale=softmax_scale,
         causal=True,
-        m_block_size=128, n_block_size=128,
+        tile_mn=(128, 128),
         return_lse=True,
     )
     out_fwd, lse_fwd = out_tuple[0], out_tuple[1]
@@ -1413,6 +1654,148 @@ def test_gqa_expand_stride_zero_bug():
     assert cute_dq_err <= bwd_rtol * pt_dq_err + dq_atol, f"dQ error too large: {cute_dq_err:.2e}"
     assert cute_dk_err <= bwd_rtol * pt_dk_err + dk_atol, f"dK error too large: {cute_dk_err:.2e}"
     assert cute_dv_err <= bwd_rtol * pt_dv_err + dv_atol, f"dV error too large: {cute_dv_err:.2e}"
+
+
+@pytest.mark.skipif(COMPUTE_CAPABILITY not in (10, 11), reason="SM100/SM110 persistent forward only")
+def test_persistent_blocksparse_empty_tiles():
+    """Regression test for persistent forward deadlock with highly-sparse block masks.
+
+    When most Q-tiles are empty (no active KV blocks), the persistent kernel
+    deadlocked due to barrier phase desync in the empty-tile paths of both the
+    softmax and correction warp groups.
+    """
+    torch.manual_seed(5)
+    batch_size, nheads_q, nheads_kv = 2, 16, 1
+    seqlen_q, seqlen_k, headdim = 8192, 128, 128
+    tile_m, tile_n = 128, 128
+    dtype = torch.bfloat16
+
+    sparse_tile_m = 2 * tile_m if COMPUTE_CAPABILITY == 10 else tile_m
+    window_size = 64
+    mask_mod_cute, mask_mod_flex = get_mask_pair(
+        "sliding_window", seqlen_q=seqlen_q, seqlen_k=seqlen_k, window_size=window_size,
+    )
+
+    bm = create_block_mask(
+        mask_mod_flex, batch_size, nheads_q, seqlen_q, seqlen_k,
+        device="cuda", BLOCK_SIZE=(sparse_tile_m, tile_n),
+    )
+    (_, _, kv_mask_cnt, kv_mask_idx, full_kv_cnt, full_kv_idx, *_) = bm.as_tuple()
+    block_sparse_mask_fwd = BlockSparseTensorsTorch(
+        mask_block_cnt=kv_mask_cnt, mask_block_idx=kv_mask_idx,
+        full_block_cnt=full_kv_cnt, full_block_idx=full_kv_idx,
+        block_size=(sparse_tile_m, tile_n),
+    )
+
+    q = torch.randn(batch_size, seqlen_q, nheads_q, headdim, device="cuda", dtype=dtype)
+    k = torch.randn(batch_size, seqlen_k, nheads_kv, headdim, device="cuda", dtype=dtype)
+    v = torch.randn(batch_size, seqlen_k, nheads_kv, headdim, device="cuda", dtype=dtype)
+
+    out, lse = _flash_attn_fwd(
+        q=q, k=k, v=v,
+        out=torch.empty(batch_size, seqlen_q, nheads_q, headdim, device="cuda", dtype=dtype),
+        lse=torch.empty(batch_size, nheads_q, seqlen_q, device="cuda", dtype=torch.float32),
+        cu_seqlens_q=None, cu_seqlens_k=None, seqused_q=None, seqused_k=None,
+        page_table=None, softmax_scale=1.0 / math.sqrt(headdim),
+        causal=False, softcap=None,
+        window_size_left=None, window_size_right=None,
+        learnable_sink=None,
+        tile_mn=(tile_m, tile_n),
+        pack_gqa=False, _arch=None,
+        score_mod=None, mask_mod=mask_mod_cute,
+        block_sparse_tensors=block_sparse_mask_fwd,
+        return_lse=True, aux_tensors=None,
+    )
+    torch.cuda.synchronize()
+    assert out.shape == (batch_size, seqlen_q, nheads_q, headdim)
+    assert not out.isnan().any()
+
+
+
+def test_compact_block_sparse_indices():
+    """Test that compact block sparse index tensors (idx.shape[3] < n_blocks) work correctly.
+
+    FA4 only accesses indices 0..cnt-1 per query tile, so the index tensor's last
+    dimension does not need to be as large as ceil(seqlen_k / block_size_n). This
+    test verifies that truncated (compact) index tensors produce identical output
+    to full-sized ones.
+    """
+    torch.manual_seed(42)
+    batch_size = 1
+    nheads = 4
+    seqlen_q = 1024
+    seqlen_k = 1024
+    headdim = 128
+    tile_m = 128
+    tile_n = 128
+    dtype = torch.bfloat16
+
+    sparse_tile_m = 2 * tile_m if COMPUTE_CAPABILITY == 10 else tile_m
+
+    mask_mod_cute, mask_mod_flex = get_mask_pair(
+        "block_diagonal", seqlen_q=seqlen_q, seqlen_k=seqlen_k, window_size=None
+    )
+    tensors = create_tensors(
+        batch_size, seqlen_q, seqlen_k, nheads, nheads, headdim, headdim, dtype
+    )
+
+    bm = create_block_mask(
+        mask_mod_flex, batch_size, nheads, seqlen_q, seqlen_k,
+        device="cuda", BLOCK_SIZE=(sparse_tile_m, tile_n),
+    )
+    (_, _, kv_mask_cnt, kv_mask_idx, full_kv_cnt, full_kv_idx, *_) = bm.as_tuple()
+
+    # Determine the max count across all query tiles — this is the compact last dim
+    max_mask_k = kv_mask_cnt.max().item() if kv_mask_cnt is not None else 0
+    max_full_k = full_kv_cnt.max().item() if full_kv_cnt is not None else 0
+    max_k = max(max_mask_k, max_full_k, 1)
+
+    # Truncate index tensors to compact size
+    kv_mask_idx_compact = kv_mask_idx[:, :, :, :max_k].contiguous()
+    full_kv_idx_compact = full_kv_idx[:, :, :, :max_k].contiguous() if full_kv_idx is not None else None
+
+    block_sparse_compact = BlockSparseTensorsTorch(
+        mask_block_cnt=kv_mask_cnt,
+        mask_block_idx=kv_mask_idx_compact,
+        full_block_cnt=full_kv_cnt,
+        full_block_idx=full_kv_idx_compact,
+        block_size=(sparse_tile_m, tile_n),
+    )
+
+    out_compact, _ = _flash_attn_fwd(
+        q=tensors["q"], k=tensors["k"], v=tensors["v"],
+        out=tensors["out"].clone(), lse=tensors["lse"].clone(),
+        softmax_scale=1.0 / math.sqrt(headdim),
+        causal=False, mask_mod=mask_mod_cute,
+        block_sparse_tensors=block_sparse_compact,
+        return_lse=True,
+    )
+
+    # Reference: use full-sized index tensors
+    block_sparse_full = BlockSparseTensorsTorch(
+        mask_block_cnt=kv_mask_cnt,
+        mask_block_idx=kv_mask_idx,
+        full_block_cnt=full_kv_cnt,
+        full_block_idx=full_kv_idx,
+        block_size=(sparse_tile_m, tile_n),
+    )
+
+    out_full, _ = _flash_attn_fwd(
+        q=tensors["q"], k=tensors["k"], v=tensors["v"],
+        out=tensors["out"].clone(), lse=tensors["lse"].clone(),
+        softmax_scale=1.0 / math.sqrt(headdim),
+        causal=False, mask_mod=mask_mod_cute,
+        block_sparse_tensors=block_sparse_full,
+        return_lse=True,
+    )
+
+    assert not torch.isnan(out_compact).any(), "Compact output has NaN"
+    assert torch.isfinite(out_compact).all(), "Compact output has Inf"
+    # Compact and full should produce bit-identical results
+    assert torch.equal(out_compact, out_full), (
+        f"Compact and full block sparse outputs differ: "
+        f"max diff = {(out_compact - out_full).abs().max().item():.2e}"
+    )
 
 
 if __name__ == "__main__":

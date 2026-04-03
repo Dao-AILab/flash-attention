@@ -117,8 +117,10 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         + (m_block_max - 1) * kBlockM * params.o_row_stride + bidh * params.o_head_stride;
     const index_t row_offset_dq = binfo.q_offset(params.dq_batch_stride, params.dq_row_stride, bidb)
         + (m_block_max - 1) * kBlockM * params.dq_row_stride + bidh * params.dq_head_stride;
-    const index_t row_offset_dq_accum = binfo.q_offset(params.seqlen_q_rounded * params.h * params.d_rounded, params.h * params.d_rounded, bidb)
-        + ((m_block_max - 1) * kBlockM + (params.cu_seqlens_q == nullptr ? 0 : 128ll * bidb)) * params.h * params.d_rounded + bidh * params.d_rounded
+    const index_t dq_accum_batch_stride = static_cast<index_t>(params.seqlen_q_rounded) * params.h * params.d_rounded;
+    const index_t dq_accum_row_stride = static_cast<index_t>(params.h) * params.d_rounded;
+    const index_t row_offset_dq_accum = binfo.q_offset(dq_accum_batch_stride, dq_accum_row_stride, bidb)
+        + ((m_block_max - 1) * kBlockM + (params.cu_seqlens_q == nullptr ? 0 : 128ll * bidb)) * dq_accum_row_stride + bidh * params.d_rounded
         // If deterministic, each thread block will do atomicAdd to a different dQ_accum buffer.
         + (!params.deterministic ? 0 : blockIdx.x * params.dq_accum_split_stride);
     const index_t row_offset_lse = (params.unpadded_lse? bidh * params.total_q + binfo.q_offset(params.seqlen_q, 1, bidb): (bidb * params.h + bidh) * params.seqlen_q) + (m_block_max - 1) * kBlockM;
@@ -548,7 +550,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
             : FLASH_NAMESPACE::convert_type_relu<Element>(acc_s);
         // Reshape rP from (MMA=4, MMA_M, MMA_N) to ((4, 2), MMA_N, MMA_N / 2)
         // if using m16n8k16 or (4, MMA_N, MMA_N) if using m16n8k8.
-        Tensor tPrP = make_tensor(rP.data(), FLASH_NAMESPACE::convert_layout_acc_Aregs<Kernel_traits::TiledMmaSdP>(rP.layout()));
+        Tensor tPrP = make_tensor(rP.data(), FLASH_NAMESPACE::convert_layout_acc_Aregs<typename Kernel_traits::TiledMmaSdP>(rP.layout()));
         Tensor tPaP = smem_thr_copy_PdS.retile_S(tPrP);     // ((Atom,AtomNum), MMA_N, MMA_N)
         cute::copy(smem_tiled_copy_PdS, tPaP, tPsP);
         // if (cute::thread0()) { print(tPaP); }

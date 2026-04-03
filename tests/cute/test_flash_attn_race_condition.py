@@ -26,7 +26,6 @@ from flash_attn.cute.interface import (
     flash_attn_varlen_func,
     flash_attn_combine,
     _flash_attn_bwd,
-    _get_device_capability,
 )
 
 
@@ -36,8 +35,8 @@ INCREASED_TRIALS = False
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-# @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
-@pytest.mark.parametrize("mha_type", ["gqa"])
+@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
+# @pytest.mark.parametrize("mha_type", ["gqa"])
 # @pytest.mark.parametrize("has_learnable_sink", [False, True])
 @pytest.mark.parametrize("has_learnable_sink", [False])
 # @pytest.mark.parametrize("has_qv", [False, True])
@@ -46,12 +45,13 @@ INCREASED_TRIALS = False
 @pytest.mark.parametrize("deterministic", [True])
 # @pytest.mark.parametrize("softcap", [0.0, 15.0])
 @pytest.mark.parametrize("softcap", [0.0])
-@pytest.mark.parametrize("local_enum", [0, 1, 2, 3])
-# @pytest.mark.parametrize("local_enum", [0])
-# @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("causal", [False])
-@pytest.mark.parametrize("d", [64, 128])
-# @pytest.mark.parametrize("d", [128])
+# @pytest.mark.parametrize("local_enum", [0, 1, 2, 3])
+@pytest.mark.parametrize("local_enum", [0, 1])
+@pytest.mark.parametrize("causal", [False, True])
+# @pytest.mark.parametrize("causal", [True])
+# @pytest.mark.parametrize("d", [64, 128])
+# @pytest.mark.parametrize("d", [128, 192])
+@pytest.mark.parametrize("d", [64, 128, 192])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -76,6 +76,9 @@ def test_flash_attn_output(
     local = local_enum > 0
     if local and causal:
         pytest.skip()
+    is_sm90 = torch.cuda.get_device_capability()[0] == 9
+    if is_sm90 and d == 192:
+        pytest.xfail("headdim 192 not supported on sm90")
     device = "cuda"
     # set seed
     torch.random.manual_seed(0)
@@ -88,10 +91,9 @@ def test_flash_attn_output(
     nheads_kv = nheads if mha_type == "mha" else (3 if mha_type == "gqa" else 1)
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
     # dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
-    dv_vals = [128] if d == 192 else ([d] if d != 128 else [64, d])
+    dv_vals = [128] if d == 192 else [d]
     if dtype == torch.float8_e4m3fn:
         dv_vals = [d]
-    dv_vals = [d]
     # attention_chunk_vals = [torch.randint(1, seqlen_k * 2, (1,)).item(), 0]
     attention_chunk_vals = [0]
     for dv, attention_chunk in itertools.product(dv_vals, attention_chunk_vals):
@@ -245,7 +247,7 @@ def test_flash_attn_output(
             and not dv > 256
             and not attention_chunk != 0
             and softcap == 0.0
-            and dv == d
+            and ((dv == d and d <= 128) or (d == 192 and dv == 128))
             and learnable_sink is None
             # and False
         ):
@@ -356,8 +358,8 @@ def test_flash_attn_output(
 @pytest.mark.parametrize("deterministic", [True])
 # @pytest.mark.parametrize("softcap", [0.0, 15.0])
 @pytest.mark.parametrize("softcap", [0.0])
-@pytest.mark.parametrize("local_enum", [0, 1, 2, 3])
-# @pytest.mark.parametrize("local_enum", [0, 1])
+# @pytest.mark.parametrize("local_enum", [0, 1, 2, 3])
+@pytest.mark.parametrize("local_enum", [0, 1])
 @pytest.mark.parametrize("causal", [False, True])
 # @pytest.mark.parametrize("causal", [True])
 # @pytest.mark.parametrize("add_unused_qkv", [False, True])
@@ -368,8 +370,8 @@ def test_flash_attn_output(
 # @pytest.mark.parametrize('d', [56, 80])
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128])
 # @pytest.mark.parametrize("d", [64, 96, 128])
-# @pytest.mark.parametrize("d", [128, 192])
-@pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("d", [64, 128, 192])
+# @pytest.mark.parametrize("d", [192])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -408,11 +410,11 @@ def test_flash_attn_varlen_output(
     local = local_enum > 0
     if local and causal:
         pytest.skip()
-    is_sm90 = _get_device_capability() == 9
+    is_sm90 = torch.cuda.get_device_capability()[0] == 9
     if is_sm90 and local:
         pytest.xfail("bwd local attention not supported on sm90")
-    if is_sm90 and deterministic:
-        pytest.xfail("bwd deterministic not supported on sm90")
+    if is_sm90 and d == 192:
+        pytest.xfail("headdim 192 not supported on sm90")
     if (
         causal or local
     ):  # Right now reference only supports causal attention with seqlen_k == seqlen_q
@@ -426,8 +428,8 @@ def test_flash_attn_varlen_output(
     nheads_kv = nheads if mha_type == "mha" else (3 if mha_type == "gqa" else 1)
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
     # dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
-    dv_vals = [128] if d == 192 else ([d] if d != 128 else [64, d])
-    dv_vals = [d] # override
+    # dv_vals = [128] if d == 192 else ([d] if d != 128 else [64, d])
+    dv_vals = [128] if d == 192 else [d]
     # attention_chunk_vals = [torch.randint(1, seqlen_k * 2, (1,)).item(), 0] if seqlen_q <= seqlen_k else [0]
     attention_chunk_vals = [0]
     for dv, attention_chunk in itertools.product(dv_vals, attention_chunk_vals):
@@ -649,7 +651,7 @@ def test_flash_attn_varlen_output(
             and not has_qv
             and not dv > 256
             and not attention_chunk != 0
-            and dv == d
+            and ((dv == d and d <= 128) or (d == 192 and dv == 128))
             and not has_learnable_sink
             and not is_sm90
             # and False

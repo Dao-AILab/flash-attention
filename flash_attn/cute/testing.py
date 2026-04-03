@@ -1,9 +1,13 @@
 import math
+from contextlib import nullcontext
+from functools import wraps
 from typing import Optional
 
 import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
+from torch._guards import active_fake_mode
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 
 class IndexFirstAxis(torch.autograd.Function):
@@ -63,8 +67,15 @@ def unpad_input(hidden_states, attention_mask, unused_mask=None):
     all_masks = (attention_mask + unused_mask) if unused_mask is not None else attention_mask
     seqlens_in_batch = all_masks.sum(dim=-1, dtype=torch.int32)
     used_seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
-    indices = torch.nonzero(all_masks.flatten(), as_tuple=False).flatten()
-    max_seqlen_in_batch = seqlens_in_batch.max().item()
+    in_fake_mode = active_fake_mode() is not None
+    if not in_fake_mode:
+        indices = torch.nonzero(all_masks.flatten(), as_tuple=False).flatten()
+        max_seqlen_in_batch = seqlens_in_batch.max().item()
+    else:
+        # torch.nonzero and .item() are not supported in FakeTensorMode
+        batch_size, seqlen = attention_mask.shape
+        indices = torch.arange(batch_size * seqlen, device=hidden_states.device)
+        max_seqlen_in_batch = seqlen
     cu_seqlens = F.pad(torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0))
     return (
         index_first_axis(rearrange(hidden_states, "b s ... -> (b s) ..."), indices),
@@ -421,3 +432,25 @@ def attention_ref(
     if query_padding_mask is not None:
         output.masked_fill_(rearrange(~query_padding_mask, "b s -> b s 1 1"), 0.0)
     return output.to(dtype=dtype_og), attention.to(dtype=dtype_og)
+
+
+def maybe_fake_tensor_mode(fake: bool = True):
+    """
+    One way to populate/pre-compile cache is to use torch fake tensor mode,
+    which does not allocate actual GPU tensors but retains tensor shape/dtype
+    metadata for cute.compile.
+    """
+
+    def decorator(fn):
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+            with FakeTensorMode() if fake else nullcontext():
+                return fn(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
+def is_fake_mode() -> bool:
+    return active_fake_mode() is not None

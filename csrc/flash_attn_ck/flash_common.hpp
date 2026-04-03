@@ -9,6 +9,11 @@
 #include <torch/nn/functional.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <string>
+
+#ifdef USE_ROCM
+#include <hip/hip_runtime.h>
+#endif
 
 #ifdef OLD_GENERATOR_PATH
 #include <ATen/CUDAGeneratorImpl.h>
@@ -72,5 +77,47 @@ inline int num_splits_heuristic_ck(int batch_nheads_mblocks, int num_SMs, int nu
 }
 
 int override_num_splits_if_necessary(int batch, int nhead, int max_seqlen_q, int hdim_v, float p_drop, int num_splits);
+
+inline std::string get_gcn_arch_name() {
+#ifdef USE_ROCM
+    int dev = 0;
+    if (hipGetDevice(&dev) != hipSuccess) {
+        return std::string{};
+    }
+    hipDeviceProp_t prop{};
+    if (hipGetDeviceProperties(&prop, dev) != hipSuccess) {
+        return std::string{};
+    }
+    return std::string{prop.gcnArchName};
+#else
+    return "";
+#endif
+}
+
+inline bool is_gfx11_arch() {
+    const std::string arch = get_gcn_arch_name();
+    return !arch.empty() && arch.rfind("gfx11", 0) == 0;
+}
+
+inline bool is_gfx12_arch() {
+    const std::string arch = get_gcn_arch_name();
+    return !arch.empty() && arch.rfind("gfx12", 0) == 0;
+}
+
+inline bool is_gfx1x_arch() {
+    return is_gfx11_arch() || is_gfx12_arch();
+}
+
+inline void check_gfx1x_bwd_supported(bool deterministic) {
+    if (is_gfx11_arch()) {
+        TORCH_CHECK(false, "CK backward is not supported on gfx11.");
+    }
+
+    if (is_gfx12_arch() && deterministic) {
+        TORCH_CHECK(false,
+                    "Deterministic CK backward is not supported on gfx12. "
+                    "Please rerun with deterministic=False.");
+    }
+}
 
 } // namespace flash
