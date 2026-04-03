@@ -10,6 +10,7 @@ import pytest
 import torch
 
 from einops import rearrange, repeat
+import flash_attn.cute.interface as cute_interface
 
 try:
     from flash_attn.layers.rotary import apply_rotary_emb
@@ -1702,3 +1703,74 @@ def test_flash_attn_invalid_head_dim(head_dim):
 
     with pytest.raises(AssertionError, match=re.escape(f"(head_dim, head_dim_v)=({head_dim}, {head_dim}) is not supported on SM")):
         flash_attn_func(q, k, v)
+
+
+def test_validate_head_dims_sm100_native_v_chunking():
+    cute_interface._validate_head_dims(512, 256, 10, 8)
+    with pytest.raises(
+        AssertionError,
+        match=re.escape("(head_dim, head_dim_v)=(512, 512) is not supported on SM100/SM110."),
+    ):
+        cute_interface._validate_head_dims(512, 512, 10, 8)
+
+
+def test_flash_attn_func_sm100_chunks_v(monkeypatch):
+    calls = []
+
+    def fake_apply(q, k, v, *args):
+        chunk_idx = len(calls)
+        calls.append(v.shape[-1])
+        out = torch.full((*q.shape[:-1], v.shape[-1]), chunk_idx + 1, dtype=q.dtype)
+        lse = torch.full(q.shape[:-1], chunk_idx + 11, dtype=torch.float32)
+        return out, lse
+
+    monkeypatch.setattr(cute_interface, "_get_device_arch", lambda: 100)
+    monkeypatch.setattr(cute_interface.FlashAttnFunc, "apply", staticmethod(fake_apply))
+
+    q = torch.zeros(2, 8, 4, 512, dtype=torch.float32)
+    k = torch.zeros(2, 8, 4, 512, dtype=torch.float32)
+    v = torch.zeros(2, 8, 4, 512, dtype=torch.float32)
+
+    out, lse = cute_interface.flash_attn_func(q, k, v, return_lse=True)
+
+    assert calls == [256, 256]
+    assert out.shape == v.shape
+    assert torch.equal(out[..., :256], torch.ones_like(out[..., :256]))
+    assert torch.equal(out[..., 256:], torch.full_like(out[..., 256:], 2))
+    assert torch.equal(lse, torch.full(q.shape[:-1], 11, dtype=torch.float32))
+
+
+def test_flash_attn_varlen_func_sm100_chunks_v(monkeypatch):
+    calls = []
+
+    def fake_apply(q, k, v, *args):
+        chunk_idx = len(calls)
+        calls.append(v.shape[-1])
+        out = torch.full((q.shape[0], q.shape[1], v.shape[-1]), chunk_idx + 1, dtype=q.dtype)
+        lse = torch.full((q.shape[0], q.shape[1]), chunk_idx + 21, dtype=torch.float32)
+        return out, lse
+
+    monkeypatch.setattr(cute_interface, "_get_device_arch", lambda: 100)
+    monkeypatch.setattr(cute_interface.FlashAttnVarlenFunc, "apply", staticmethod(fake_apply))
+
+    q = torch.zeros(16, 4, 512, dtype=torch.float32)
+    k = torch.zeros(16, 4, 512, dtype=torch.float32)
+    v = torch.zeros(16, 4, 512, dtype=torch.float32)
+    cu_seqlens = torch.tensor([0, 8, 16], dtype=torch.int32)
+
+    out, lse = cute_interface.flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_k=cu_seqlens,
+        max_seqlen_q=8,
+        max_seqlen_k=8,
+        return_lse=True,
+    )
+
+    assert calls == [256, 256]
+    assert out.shape == v.shape
+    assert torch.equal(out[..., :256], torch.ones_like(out[..., :256]))
+    assert torch.equal(out[..., 256:], torch.full_like(out[..., 256:], 2))
+    assert torch.equal(lse, torch.full((q.shape[0], q.shape[1]), 21, dtype=torch.float32))
