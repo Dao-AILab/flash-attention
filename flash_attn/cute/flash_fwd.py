@@ -56,6 +56,7 @@ class FlashAttentionForwardBase:
         mask_mod: Optional[cutlass.Constexpr] = None,
         has_aux_tensors: bool = False,
         q_subtile_factor: int | None = None,
+        compress_factor: cutlass.Constexpr[int] = 1,
     ):
         """Initializes the configuration for a flash attention kernel.
 
@@ -98,6 +99,7 @@ class FlashAttentionForwardBase:
         self.Q_in_regs = Q_in_regs
         self.score_mod = score_mod
         self.mask_mod = mask_mod
+        self.compress_factor = compress_factor
         self.qk_acc_dtype = Float32
         self.vec_size: cutlass.Constexpr = getattr(
             score_mod, "__vec_size__", 1 if cutlass.const_expr(has_aux_tensors) else 2

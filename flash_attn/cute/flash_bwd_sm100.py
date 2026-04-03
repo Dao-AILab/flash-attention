@@ -65,6 +65,7 @@ class FlashAttentionBackwardSm100:
         mask_mod: cutlass.Constexpr | None = None,
         has_aux_tensors: cutlass.Constexpr = False,
         subtile_factor: cutlass.Constexpr[int] = 1,
+        compress_factor: cutlass.Constexpr[int] = 1,
     ):
         # padding head_dim to a multiple of 16 as k_block_size
         hdim_multiple_of = 16
@@ -123,6 +124,7 @@ class FlashAttentionBackwardSm100:
         self.mask_mod = mask_mod
         self.has_aux_tensors = has_aux_tensors
         self.subtile_factor = subtile_factor
+        self.compress_factor = compress_factor
         # For score_mod, use vec_size=1 (like forward) to handle per-element indices
         if cutlass.const_expr(has_aux_tensors):
             self.vec_size: cutlass.Constexpr = 1
@@ -1394,6 +1396,7 @@ class FlashAttentionBackwardSm100:
             window_size_left,
             window_size_right,
             qhead_per_kvhead_packgqa=1,
+            compress_factor=self.compress_factor,
         )
         SeqlenInfoCls = partial(
             SeqlenInfoQK.create,
@@ -1415,6 +1418,7 @@ class FlashAttentionBackwardSm100:
             swap_AB=True,
             window_size_left=window_size_left,
             window_size_right=window_size_right,
+            compress_factor=self.compress_factor,
         )
         #  EMPTY
         # (15)

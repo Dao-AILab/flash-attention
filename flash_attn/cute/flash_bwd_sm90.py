@@ -73,6 +73,7 @@ class FlashAttentionBackwardSm90:
         has_aux_tensors: cutlass.Constexpr = False,
         subtile_factor: cutlass.Constexpr[int] = 1,
         dQ_single_wg: bool = False,
+        compress_factor: cutlass.Constexpr[int] = 1,
     ):
         self.dtype = dtype
         # padding head_dim to a multiple of 16 as k_block_size
@@ -129,6 +130,7 @@ class FlashAttentionBackwardSm90:
         self.mask_mod = mask_mod
         self.has_aux_tensors = has_aux_tensors
         self.subtile_factor = subtile_factor
+        self.compress_factor = compress_factor
         if cutlass.const_expr(has_aux_tensors):
             self.vec_size: cutlass.Constexpr = 1
         else:
@@ -718,6 +720,7 @@ class FlashAttentionBackwardSm90:
             window_size_left,
             window_size_right,
             qhead_per_kvhead_packgqa=1,
+            compress_factor=self.compress_factor,
         )
         SeqlenInfoCls = partial(
             SeqlenInfoQK.create,
@@ -737,6 +740,7 @@ class FlashAttentionBackwardSm90:
             window_size_left=window_size_left,
             window_size_right=window_size_right,
             swap_AB=self.SdP_swapAB,
+            compress_factor=self.compress_factor,
         )
         TileSchedulerCls = partial(TileScheduler.create, tile_sched_params)
 

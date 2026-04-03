@@ -542,6 +542,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             window_size_left,
             window_size_right,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+            compress_factor=self.compress_factor,
         )
         SeqlenInfoCls = partial(
             SeqlenInfoQK.create,
@@ -562,6 +563,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             window_size_left=window_size_left,
             window_size_right=window_size_right,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+            compress_factor=self.compress_factor,
         )
         TileSchedulerCls = partial(TileScheduler.create, tile_sched_params)
 
