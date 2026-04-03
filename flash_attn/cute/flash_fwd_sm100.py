@@ -2,13 +2,13 @@
 # - BF16 & FP16 dtype
 # - noncausal & causal attention
 # - MHA, GQA, MQA
-# - hdim 64, 96, 128, (192, 128).
+# - hdim 64, 96, 128, (192, 128), 256.
 # - varlen
 # - sliding window
 # - split-kv
 # Unsupported features that will be added later:
 # - page size != 128
-# - more hdim (192, 256)
+# - more hdim (192)
 # Based on the cutlass example and cute-dsl example:
 # https://github.com/NVIDIA/cutlass/tree/main/examples/77_blackwell_fmha
 # https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/blackwell/fmha.py
@@ -86,6 +86,10 @@ _TUNING_CONFIG = {
     (False, True, 128, True): {"ex2_emu_freq": 0, "ex2_emu_start_frg": 0, "num_regs_softmax": 176, "num_regs_correction": 64},
     (True, False, 192, True): {"ex2_emu_freq": 0, "ex2_emu_start_frg": 0, "num_regs_softmax": 176, "num_regs_correction": 64},
     (False, True, 192, True): {"ex2_emu_freq": 0, "ex2_emu_start_frg": 0, "num_regs_softmax": 176, "num_regs_correction": 72},
+    (False, False, 256, False): {"ex2_emu_freq": 16, "ex2_emu_start_frg": 0, "num_regs_softmax": 176, "num_regs_correction": 88},
+    (False, True, 256, False): {"ex2_emu_freq": 16, "ex2_emu_start_frg": 0, "num_regs_softmax": 176, "num_regs_correction": 88},
+    (False, False, 256, True): {"ex2_emu_freq": 0, "ex2_emu_start_frg": 0, "num_regs_softmax": 176, "num_regs_correction": 80},
+    (False, True, 256, True): {"ex2_emu_freq": 0, "ex2_emu_start_frg": 0, "num_regs_softmax": 176, "num_regs_correction": 80},    
 }
 # === END TUNING KNOBS ===
 
@@ -173,12 +177,13 @@ class FlashAttentionForwardSm100:
         is_sm103 = self.arch >= Arch.sm_103 and self.arch <= Arch.sm_103f
         self.is_sm103 = is_sm103
         # enable_ex2_emu is derived: True if tuning config has freq > 0, else fallback to default logic
-        _default_enable_ex2_emu = (self.head_dim_padded <= 128 or (self.head_dim_padded == 192 and self.use_2cta_instrs and not self.is_causal and not self.is_local)) and not is_sm103
+        _default_enable_ex2_emu = (self.head_dim_padded <= 128 or (self.head_dim_padded == 192 and self.use_2cta_instrs and not self.is_causal and not self.is_local) or self.head_dim_padded == 256) and not is_sm103
         self.enable_ex2_emu = _default_enable_ex2_emu
         self.s0_s1_barrier = False
         self.overlap_sO_sQ = (
             (self.head_dim_padded == 192 and self.head_dim_v_padded >= 64) or
-            (self.head_dim_v_padded >= 128 and self.is_split_kv)
+            (self.head_dim_v_padded >= 128 and self.is_split_kv) or
+            self.head_dim_padded >= 256 or self.head_dim_v_padded >= 256
         )
         if self.overlap_sO_sQ:
             self.is_persistent = False

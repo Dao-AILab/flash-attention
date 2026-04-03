@@ -111,9 +111,10 @@ def _validate_head_dims(head_dim: int, head_dim_v: int, compute_capability: int,
             f"head_dim and head_dim_v must be between 8 and 256 and divisible by {alignment}."
         )
     elif compute_capability in [10, 11]:
-        assert (is_standard_range or is_deepseek_shape) and head_dim % alignment == 0 and head_dim_v % alignment == 0, (
+        is_sm100_range = 8 <= head_dim <= 256 and 8 <= head_dim_v <= 256
+        assert (is_sm100_range or is_deepseek_shape) and head_dim % alignment == 0 and head_dim_v % alignment == 0, (
             f"(head_dim, head_dim_v)=({head_dim}, {head_dim_v}) is not supported on SM100/SM110. "
-            f"head_dim and head_dim_v must be between 8 and 128 and divisible by {alignment}, or (192, 128) for DeepSeek."
+            f"head_dim and head_dim_v must be between 8 and 256 and divisible by {alignment}, or (192, 128) for DeepSeek."
         )
 
 
@@ -158,6 +159,13 @@ def _tile_size_fwd_sm90(head_dim, head_dim_v, is_causal, is_local, sparse_block_
     else:  # hdim 256
         tile_n = 64 if is_local else 80
         return FwdConfig(128, tile_n, True, True)
+
+def _tile_size_fwd_sm100(head_dim, head_dim_v, is_causal, is_local):
+    """Return FwdConfig for SM100 forward."""
+    if head_dim <= 192:
+        return FwdConfig(128, 128, True, True)
+    else:  # hdim 256
+        return FwdConfig(128, 64, True, True)
 
 @dataclass(frozen=True)
 class BwdConfig:
@@ -476,6 +484,8 @@ def _flash_attn_fwd(
                 fwd_cfg = FwdConfig(128, 128, True, True)
             else:
                 fwd_cfg = FwdConfig(128, 64, True, True)
+        elif arch // 10 in [10, 11]:
+            fwd_cfg = _tile_size_fwd_sm100(head_dim, head_dim_v, causal, local)        
         elif arch // 10 == 8:
             fwd_cfg = FwdConfig(128, 64, True, True)  # SM80, should tune
         elif arch // 10 == 9:
@@ -499,7 +509,10 @@ def _flash_attn_fwd(
         max_seqlen_k = seqlen_k
     seqlen_q_packgqa = max_seqlen_q * qhead_per_kvhead
     if arch // 10 == 10:
-        q_stage = 2 if seqlen_q_packgqa > tile_m else 1
+        if head_dim > 192 or head_dim_v > 192: # hdim 256
+            q_stage = 1
+        else:
+            q_stage = 2 if seqlen_q_packgqa > tile_m else 1
     else:
         q_stage = 1
 

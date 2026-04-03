@@ -253,7 +253,7 @@ def test_flash_attn_output(
             # SplitKV not supported on SM90 - skip this iteration
             if IS_SM90 and num_splits > 1:
                 continue
-            if IS_SM100 and (d >= 192 and dv >= 192):  # hdim 192 and 256 not support on SM100
+            if IS_SM100 and (d == 192 and dv == 192):  # hdim 192 not support on SM100
                 continue
             out, lse = flash_attn_func(
                 q,
