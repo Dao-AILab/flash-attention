@@ -127,7 +127,9 @@ def hash_callable(
 
 def create_softcap_scoremod(softcap_val):
     @cute.jit
-    def scoremod_premask_fn(acc_S_SSA, batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+    def scoremod_premask_fn(
+        acc_S_SSA, batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors
+    ):
         scores = acc_S_SSA / softcap_val
         return softcap_val * cute.math.tanh(scores, fastmath=True)
 
@@ -136,7 +138,9 @@ def create_softcap_scoremod(softcap_val):
 
 def create_softcap_scoremod_bwd(softcap_val):
     @cute.jit
-    def scoremod_bwd_fn(grad_out_SSA, score_SSA, batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+    def scoremod_bwd_fn(
+        grad_out_SSA, score_SSA, batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors
+    ):
         scores = score_SSA / softcap_val
         tanh_scores = cute.math.tanh(scores, fastmath=True)
         return grad_out_SSA * (1.0 - tanh_scores * tanh_scores)

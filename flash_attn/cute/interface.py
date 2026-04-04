@@ -546,6 +546,9 @@ def _flash_attn_fwd(
     if softcap is not None:
         assert score_mod is None, "softcap and score_mod cannot be used together"
         score_mod = utils.create_softcap_scoremod(softcap)
+    elif score_mod is not None:
+        if arch // 10 == 8:
+            raise NotImplementedError("Custom user-provided score_mod is not supported on SM8x architectures.")
         
     # hash score and mask mods for compile cache
     score_mod_hash = utils.hash_callable(score_mod) if score_mod is not None else False
@@ -1170,10 +1173,11 @@ def _flash_attn_bwd(
         pack_gqa = qhead_per_kvhead > 1
     # pack_gqa backward not yet supported in bwd
     pack_gqa = False
-    if softcap != 0.0 and (score_mod is None and score_mod_bwd is None):
-        raise ValueError("softcap and score_mod/score_mod_bwd cannot be used together")
     
     if softcap != 0.0:
+        assert score_mod is None and score_mod_bwd is None, (
+            "softcap and score_mod/score_mod_bwd cannot be used together"
+        )
         score_mod = utils.create_softcap_scoremod(softcap)
         score_mod_bwd = utils.create_softcap_scoremod_bwd(softcap)
     elif score_mod is not None:
@@ -1181,6 +1185,8 @@ def _flash_attn_bwd(
         assert cu_seqlens_q is None and cu_seqlens_k is None, (
             "varlen + score_mod not supported in bwd yet"
         )
+        if arch // 10 == 8:
+            raise NotImplementedError("Custom user-provided score_mod is not supported on SM8x architectures.")
 
     device = q.device
     out_torch_dtype = q.dtype
