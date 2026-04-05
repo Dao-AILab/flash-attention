@@ -138,7 +138,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         s_q64 = Int64(s_q)
         s_k64 = Int64(s_k)
         s_lse64 = Int64(s_lse)
-        d64 = Int64(d)
+        d64 = cute.assume(Int64(d), divby=128)
         h_r64 = Int64(h_r)
         h_k64 = Int64(h_k)
         b64 = Int64(b)
