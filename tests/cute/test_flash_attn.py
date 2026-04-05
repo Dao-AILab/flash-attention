@@ -253,7 +253,7 @@ def test_flash_attn_output(
             # SplitKV not supported on SM90 - skip this iteration
             if IS_SM90 and num_splits > 1:
                 continue
-            if IS_SM100 and (d >= 192 and dv >= 192):  # hdim 192 and 256 not support on SM100
+            if IS_SM100 and (d >= 192 and dv >= 192) and not (d == 256 and dv == 256):
                 continue
             out, lse = flash_attn_func(
                 q,
@@ -292,7 +292,11 @@ def test_flash_attn_output(
             and not dv > 256
             and not attention_chunk != 0
             and softcap == 0.0
-            and ((dv == d and d <= 128) or (d == 192 and dv == 128))
+            and (
+                (dv == d and d <= 128)
+                or (d == 192 and dv == 128)
+                or (IS_SM100 and d == 256 and dv == 256)
+            )
             and learnable_sink is None
             # and False
             and not ((causal or local) and seqlen_k < seqlen_q)
@@ -741,7 +745,11 @@ def test_flash_attn_varlen_output(
             and not has_qv
             and not dv > 256
             and not attention_chunk != 0
-            and ((dv == d and d <= 128) or (d == 192 and dv == 128))
+            and (
+                (dv == d and d <= 128)
+                or (d == 192 and dv == 128)
+                or (IS_SM100 and d == 256 and dv == 256)
+            )
             and not has_learnable_sink
             # and False
         ):
