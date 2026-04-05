@@ -447,7 +447,7 @@ def flash_attn_fwd_sm100_hd256_2cta(
             mma_tiler,
             False,
             mask_type,
-            use_clc_dynamic_scheduler=USE_CLC,
+            use_clc_scheduler=USE_CLC,
         )
         flash_attn_fwd_sm100_hd256_2cta.compile_cache[compile_key] = cute.compile(  # type: ignore[attr-defined]
             fa_fwd,
@@ -671,7 +671,7 @@ def flash_attn_bwd_sm100_hd256_2cta(
             window_size[0],
             window_size[1],
             False,
-            use_clc_dynamic_scheduler=USE_CLC,
+            use_clc_scheduler=USE_CLC,
         )
 
         flash_attn_bwd_sm100_hd256_2cta.compile_cache[compile_key] = cute.compile(  # type: ignore[attr-defined]
@@ -871,9 +871,9 @@ torch2cute_dtype_map = {
     torch.float32: cutlass.Float32,
 }
 
-# SM100 hdim=256 2CTA path knobs (kept opt-in/default-compatible with upstream behavior).
+# SM100 hdim=256 2CTA path knobs (aligned with upstream FA_CLC semantics).
 ENABLE_TVM_FFI = os.environ.get("ENABLE_TVM_FFI", "0") == "1"
-USE_CLC = os.environ.get("USE_CLC", "1") == "1"
+USE_CLC = utils._get_use_clc_scheduler_default()  # reads FA_CLC env var (default off)
 
 
 def num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, max_splits):

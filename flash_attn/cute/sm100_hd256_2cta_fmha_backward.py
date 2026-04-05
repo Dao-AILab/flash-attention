@@ -110,7 +110,7 @@ class BlackwellFusedMultiHeadAttentionBackward:
         window_size_left: int | None,
         window_size_right: int | None,
         split_head: bool,
-        use_clc_dynamic_scheduler: bool = False,
+        use_clc_scheduler: bool = False,
     ):
         """Initialization."""
         self.element_dtype = element_dtype
@@ -146,7 +146,7 @@ class BlackwellFusedMultiHeadAttentionBackward:
             window_size_right,
             False,
             split_head,
-            use_clc_dynamic_scheduler=use_clc_dynamic_scheduler,
+            use_clc_scheduler=use_clc_scheduler,
         )
 
         dkdv_cta_mma_tiler = (dkdv_mma_tiler[0], dkdv_mma_tiler[1], 256)
@@ -160,7 +160,7 @@ class BlackwellFusedMultiHeadAttentionBackward:
             self.mask_type,
             window_size_left,
             window_size_right,
-            use_clc_dynamic_scheduler=use_clc_dynamic_scheduler,
+            use_clc_scheduler=use_clc_scheduler,
         )
 
     @cute.jit
@@ -460,7 +460,7 @@ def run(
     skip_ref_check: bool,
     use_cold_l2: bool = False,
     split_head: bool = False,
-    use_clc_dynamic_scheduler: bool = False,
+    use_clc_scheduler: bool = False,
     **kwargs,
 ):
     print(f"Running Blackwell SM100 FMHA bwd test with:")
@@ -482,7 +482,7 @@ def run(
     print(f"  iterations: {iterations}")
     print(f"  skip_ref_check: {skip_ref_check}")
     print(f"  split_head: {split_head}")
-    print(f"  use_clc_dynamic_scheduler: {use_clc_dynamic_scheduler}")
+    print(f"  use_clc_scheduler: {use_clc_scheduler}")
 
     torch.manual_seed(42)
     random.seed(123)
@@ -647,7 +647,7 @@ def run(
         window_size_left,
         window_size_right,
         split_head,
-        use_clc_dynamic_scheduler=use_clc_dynamic_scheduler,
+        use_clc_scheduler=use_clc_scheduler,
     )
 
     workspace_size = BlackwellFusedMultiHeadAttentionBackward.get_workspace_size(
@@ -1171,7 +1171,7 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
-        "--use_clc_dynamic_scheduler",
+        "--use_clc_scheduler",
         action="store_true",
         default=False,
         help="Use CLC dynamic tile scheduling for dQ kernel",
@@ -1199,7 +1199,7 @@ if __name__ == "__main__":
         args.skip_ref_check,
         args.use_cold_l2,
         args.split_head,
-        args.use_clc_dynamic_scheduler,
+        args.use_clc_scheduler,
     )
 
     print("PASS")

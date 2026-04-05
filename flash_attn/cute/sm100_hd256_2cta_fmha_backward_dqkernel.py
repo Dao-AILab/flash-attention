@@ -18,11 +18,11 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cute.typing import Int32, Int64, Float32
 from cutlass._mlir.dialects import llvm
 
+from cutlass.utils import ClcDynamicPersistentTileScheduler
 from flash_attn.cute.tile_scheduler import (
+    ClcState,
     compute_sm100_fmha_grid as compute_grid,
     compute_sm100_fmha_grid_clc as compute_grid_clc,
-    create_sm100_fmha_static_tile_scheduler as create_fmha_static_tile_scheduler,
-    create_sm100_fmha_clc_dynamic_tile_scheduler as create_fmha_clc_dynamic_tile_scheduler,
     make_sm100_thread_cooperative_group as make_thread_cooperative_group,
     Sm100FmhaStaticTileScheduler as FmhaStaticTileScheduler,
     Sm100FmhaStaticTileSchedulerParams as FmhaStaticTileSchedulerParams,
@@ -49,7 +49,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         window_size_right: int | None,
         is_persistent: bool,
         split_head: bool,
-        use_clc_dynamic_scheduler: bool = False,
+        use_clc_scheduler: bool = False,
     ):
         self.element_dtype = element_dtype
         self.acc_dtype = acc_dtype
@@ -94,7 +94,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         self.cluster_shape_mn = (2, 1)
         self.tmem_warp_shape_mn = (4, 1)
         self.is_persistent = is_persistent
-        self.use_clc_dynamic_scheduler = use_clc_dynamic_scheduler
+        self.use_clc_scheduler = use_clc_scheduler
         self.mask_type = mask_type
 
         self.compute_warp_ids = (0, 1, 2, 3)
@@ -102,7 +102,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         self.mma_warp_id = 8
         self.load_warp_id = 9
         self.empty_warp_id = (10, 11)
-        self.sched_warp_id = self.empty_warp_id[0] if use_clc_dynamic_scheduler else None
+        self.sched_warp_id = self.empty_warp_id[0] if use_clc_scheduler else None
         self.tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
         self.num_compute_warps = len(self.compute_warp_ids)
 
@@ -148,7 +148,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         self.epi_stage = 1
         self.load_compute_LSE_stage = 1
         self.load_compute_sum_OdO_stage = 1
-        if cutlass.const_expr(self.use_clc_dynamic_scheduler):
+        if cutlass.const_expr(self.use_clc_scheduler):
             self.num_clc_stage = 1
             self.num_clc_response_bytes = 16
 
@@ -245,7 +245,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         self.dq_dtype = dq.element_type
         self.tilePlikeFP32 = self.qk_mma_tiler[1] // Float32.width * self.q_dtype.width
 
-        if cutlass.const_expr(self.use_clc_dynamic_scheduler):
+        if cutlass.const_expr(self.use_clc_scheduler):
             self.tile_sched_params, grid = compute_grid_clc(
                 (s_q, dq.shape[1], dq.shape[2]) if cum_seqlen_q is not None else dq.shape,
                 self.cta_tiler,
@@ -695,8 +695,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         tmem.wait_for_alloc()
         tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
 
-        # Initialize CLC pipeline if using dynamic scheduler
-        if cutlass.const_expr(self.use_clc_dynamic_scheduler):
+        # Initialize CLC state if using dynamic scheduler
+        if cutlass.const_expr(self.use_clc_scheduler):
             clc_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
             cluster_size = cute.size(self.cluster_shape_mnk)
             num_clc_consumer_threads = self.threads_per_warp * (
@@ -711,23 +711,33 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
             clc_pipeline_consumer_group = pipeline.CooperativeGroup(
                 pipeline.Agent.Thread, num_clc_consumer_threads
             )
-            clc_pipeline = pipeline.PipelineClcFetchAsync.create(
-                barrier_storage=storage.clc_mbar_ptr.data_ptr(),
-                num_stages=self.num_clc_stage,
-                producer_group=clc_pipeline_producer_group,
-                consumer_group=clc_pipeline_consumer_group,
-                tx_count=self.num_clc_response_bytes,
-                cta_layout_vmnk=cluster_layout_vmnk,
-                defer_sync=True,
-            )
             clc_response_ptr = storage.clc_response.data_ptr()
-            clc_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, self.num_clc_stage
+            clc = ClcState.create(
+                hw_scheduler=ClcDynamicPersistentTileScheduler.create(
+                    self.tile_sched_params.clc_hw_params(),
+                    cute.arch.block_idx(),
+                    cute.arch.grid_dim(),
+                    clc_response_ptr,
+                ),
+                pipeline=pipeline.PipelineClcFetchAsync.create(
+                    barrier_storage=storage.clc_mbar_ptr.data_ptr(),
+                    num_stages=self.num_clc_stage,
+                    producer_group=clc_pipeline_producer_group,
+                    consumer_group=clc_pipeline_consumer_group,
+                    tx_count=self.num_clc_response_bytes,
+                    cta_layout_vmnk=cluster_layout_vmnk,
+                    defer_sync=True,
+                ),
+                consumer_state=pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Consumer, self.num_clc_stage
+                ),
+                producer_state=pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Producer, self.num_clc_stage
+                ),
             )
         else:
-            clc_pipeline = None
+            clc = None
             clc_response_ptr = None
-            clc_consumer_state = None
 
         # Cluster arrive after barrier init
         pipeline.pipeline_init_arrive(
@@ -812,14 +822,15 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         if warp_idx == self.empty_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
 
-        if cutlass.const_expr(self.use_clc_dynamic_scheduler):
-            tile_sched = create_fmha_clc_dynamic_tile_scheduler(
+        if cutlass.const_expr(self.use_clc_scheduler):
+            tile_sched = FmhaClcDynamicTileScheduler.create(
                 tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim(),
-                clc_response_ptr,
+                clc_response_ptr, clc,
             )
         else:
-            tile_sched = create_fmha_static_tile_scheduler(
-                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim()
+            blk_idx = cute.arch.block_idx()
+            tile_sched = FmhaStaticTileScheduler(
+                tile_sched_params, blk_idx[0], blk_idx, cute.arch.grid_dim()
             )
         work_tile = tile_sched.initial_work_tile_info()
 
@@ -1097,14 +1108,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                             )
                         kv_coord += 1
 
-                if cutlass.const_expr(self.use_clc_dynamic_scheduler):
-                    clc_pipeline.consumer_wait(clc_consumer_state)
-                    work_tile = tile_sched.get_current_work()
-                    clc_pipeline.consumer_release(clc_consumer_state)
-                    clc_consumer_state.advance()
-                else:
-                    tile_sched.advance_to_next_work()
-                    work_tile = tile_sched.get_current_work()
+                work_tile = tile_sched.advance_to_next_work()
                 # End of persistent scheduler loop
             load_k_producer.tail()
             load_v_producer.tail()
@@ -1735,14 +1739,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                                 kt_handle.release()
                             ds_handle.release()
                         dq_handle.commit()
-                if cutlass.const_expr(self.use_clc_dynamic_scheduler):
-                    clc_pipeline.consumer_wait(clc_consumer_state)
-                    work_tile = tile_sched.get_current_work()
-                    clc_pipeline.consumer_release(clc_consumer_state)
-                    clc_consumer_state.advance()
-                else:
-                    tile_sched.advance_to_next_work()
-                    work_tile = tile_sched.get_current_work()
+                work_tile = tile_sched.advance_to_next_work()
             # End of persistent scheduler loop
             mma_s_producer.tail()
             mma_dp_producer.tail()
@@ -1856,14 +1853,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                         )
                     lse_handle.release()
                     sum_odo_handle.release()
-                if cutlass.const_expr(self.use_clc_dynamic_scheduler):
-                    clc_pipeline.consumer_wait(clc_consumer_state)
-                    work_tile = tile_sched.get_current_work()
-                    clc_pipeline.consumer_release(clc_consumer_state)
-                    clc_consumer_state.advance()
-                else:
-                    tile_sched.advance_to_next_work()
-                    work_tile = tile_sched.get_current_work()
+                work_tile = tile_sched.advance_to_next_work()
             ds_mma_producer.tail()
 
         # ///////////////////////////////////////////////////////////////////////////////
@@ -1935,43 +1925,26 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                         (mma_dq_consumer, gdQ_staged, cdQ_staged, tdQtdQ_staged),
                         self.epi_tile,
                     )
-                if cutlass.const_expr(self.use_clc_dynamic_scheduler):
-                    clc_pipeline.consumer_wait(clc_consumer_state)
-                    work_tile = tile_sched.get_current_work()
-                    clc_pipeline.consumer_release(clc_consumer_state)
-                    clc_consumer_state.advance()
-                else:
-                    tile_sched.advance_to_next_work()
-                    work_tile = tile_sched.get_current_work()
+                work_tile = tile_sched.advance_to_next_work()
             # NOTE: tmem.free() moved to kernel end to enable cluster-wide sync
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  Scheduler Warp (only for CLC dynamic scheduler)
         # ///////////////////////////////////////////////////////////////////////////////
-        if cutlass.const_expr(self.use_clc_dynamic_scheduler):
+        if cutlass.const_expr(self.use_clc_scheduler):
             is_first_cta_in_cluster = cta_rank_in_cluster == 0
 
             if warp_idx == self.sched_warp_id and is_first_cta_in_cluster:
                 cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
-                clc_producer_state = pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.ProducerConsumer, self.num_clc_stage
-                )
                 while work_tile.is_valid_tile:
-                    clc_pipeline.producer_acquire(clc_producer_state)
-                    mbarrier_addr = clc_pipeline.producer_get_barrier(clc_producer_state)
-                    tile_sched.advance_to_next_work(mbarrier_addr)
-                    clc_producer_state.advance()
-
-                    clc_pipeline.consumer_wait(clc_consumer_state)
-                    work_tile = tile_sched.get_current_work()
-                    clc_pipeline.consumer_release(clc_consumer_state)
-                    clc_consumer_state.advance()
-                clc_pipeline.producer_tail(clc_producer_state)
+                    tile_sched.prefetch_next_work()
+                    work_tile = tile_sched.advance_to_next_work()
+                tile_sched.producer_tail()
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  Empty warps reg dealloc
         # ///////////////////////////////////////////////////////////////////////////////
-        if cutlass.const_expr(self.use_clc_dynamic_scheduler):
+        if cutlass.const_expr(self.use_clc_scheduler):
             if warp_idx > self.load_warp_id:
                 if not (warp_idx == self.sched_warp_id and is_first_cta_in_cluster):
                     cute.arch.warpgroup_reg_dealloc(self.num_regs_other)

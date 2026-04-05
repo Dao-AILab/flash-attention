@@ -1314,17 +1314,23 @@ class Sm100FmhaStaticTileScheduler:
 
     def advance_to_next_work(self, *, advance_count=1, loc=None, ip=None):
         """
-        Advance to the next work tile.
+        Advance to the next work tile and return it.
 
         For persistent kernels, advances by the number of persistent SMs.
         For non-persistent kernels, marks that the first block has been processed.
-
-        :param advance_count: Number of steps to advance (default: 1).
-        :type advance_count: int
         """
         if self._is_persistent:
             self._current_work_linear_idx += advance_count * self.num_persistent_sm
         self._is_first_block = False
+        return self.get_current_work()
+
+    def prefetch_next_work(self, *, loc=None, ip=None):
+        """No-op for static scheduler."""
+        pass
+
+    def producer_tail(self, *, loc=None, ip=None):
+        """No-op for static scheduler."""
+        pass
 
     def __extract_mlir_values__(self):
         values = extract_mlir_values(self._params)
@@ -1346,75 +1352,16 @@ class Sm100FmhaStaticTileScheduler:
         )
 
 
-def create_sm100_fmha_static_tile_scheduler(
-    params: Sm100FmhaStaticTileSchedulerParams,
-    blk_coord: cute.Coord,
-    grid_shape: cute.Shape,
-) -> Sm100FmhaStaticTileScheduler:
-    """
-    Create a new FMHA static tile scheduler.
-
-    :param params: Scheduler parameters.
-    :type params: Sm100FmhaStaticTileSchedulerParams
-    :param blk_coord: Block coordinates.
-    :type blk_coord: cute.Coord
-    :param grid_shape: Grid shape.
-    :type grid_shape: cute.Shape
-
-    :return: New Sm100FmhaStaticTileScheduler instance.
-    :rtype: Sm100FmhaStaticTileScheduler
-    """
-    return Sm100FmhaStaticTileScheduler(params, blk_coord[0], blk_coord, grid_shape)
-
-
-def create_sm100_fmha_static_tile_scheduler_params(
-    is_persistent: bool,
-    problem_shape_mbh: cute.Shape,
-) -> Sm100FmhaStaticTileSchedulerParams:
-    """
-    Create FMHA static tile scheduler parameters.
-
-    :param is_persistent: Whether to use persistent kernel mode.
-    :type is_persistent: bool
-    :param problem_shape_mbh: Problem shape in (M, B, H) format.
-    :type problem_shape_mbh: cute.Shape
-
-    :return: New Sm100FmhaStaticTileSchedulerParams instance.
-    :rtype: Sm100FmhaStaticTileSchedulerParams
-    """
-    return Sm100FmhaStaticTileSchedulerParams(is_persistent, problem_shape_mbh)
-
-
 def compute_sm100_fmha_grid(
     o_shape: cute.Shape,
     cta_tiler: Tuple[int, int, int],
     is_persistent: bool,
 ) -> Tuple[Sm100FmhaStaticTileSchedulerParams, Tuple[int, int, int]]:
+    """Compute grid parameters for FMHA (static scheduler).
+
+    The output tensor o has shape (s, d, ((h_r, h_k), b)).
     """
-    Compute grid parameters for FMHA operation.
-
-    This function calculates the appropriate grid shape and scheduler parameters
-    based on the output tensor shape, CTA (Cooperative Thread Array) tiler,
-    and whether to use persistent kernel mode.
-
-    The output tensor o has shape (s, d, ((h_r, h_k), b)) where:
-    - s: sequence length
-    - d: head dimension
-    - h_r: number of heads for query
-    - h_k: number of heads for key
-    - b: batch size
-
-    :param o_shape: Output tensor shape for grid computation.
-    :type o_shape: cute.Shape
-    :param cta_tiler: CTA tiler dimensions (M, N, K).
-    :type cta_tiler: Tuple[int, int, int]
-    :param is_persistent: Whether to use persistent kernel mode.
-    :type is_persistent: bool
-
-    :return: Tuple of (scheduler_params, grid_shape).
-    :rtype: Tuple[Sm100FmhaStaticTileSchedulerParams, Tuple[int, int, int]]
-    """
-    tile_sched_params = create_sm100_fmha_static_tile_scheduler_params(
+    tile_sched_params = Sm100FmhaStaticTileSchedulerParams(
         is_persistent,
         (
             cute.ceil_div(cute.size(o_shape[0]), cta_tiler[0]),
@@ -1423,7 +1370,6 @@ def compute_sm100_fmha_grid(
         ),
     )
     grid = Sm100FmhaStaticTileScheduler.get_grid_shape(tile_sched_params)
-
     return tile_sched_params, grid
 
 
@@ -1505,6 +1451,13 @@ class Sm100FmhaClcDynamicTileSchedulerParams:
             self.problem_shape_ntile_mnl, self._cluster_shape_mnk
         )
 
+    def clc_hw_params(self) -> ClcDynamicPersistentTileSchedulerParams:
+        """Return params for the upstream CLC hardware scheduler."""
+        return ClcDynamicPersistentTileSchedulerParams(
+            problem_shape_ntile_mnl=self.problem_shape_ntile_mnl,
+            cluster_shape_mnk=self._cluster_shape_mnk,
+        )
+
 
 class Sm100FmhaClcDynamicTileScheduler:
     """CLC dynamic persistent tile scheduler for FMHA.
@@ -1521,6 +1474,7 @@ class Sm100FmhaClcDynamicTileScheduler:
         num_tiles_executed: Int32,
         clc_response_ptr: cute.Pointer,
         block_idx: Tuple,
+        clc: ClcState = None,
         *,
         loc=None,
         ip=None,
@@ -1530,6 +1484,7 @@ class Sm100FmhaClcDynamicTileScheduler:
         self._num_tiles_executed = num_tiles_executed
         self._clc_response_ptr = clc_response_ptr
         self._block_idx = block_idx
+        self.clc = clc
         self._loc = loc
         self._ip = ip
 
@@ -1538,6 +1493,8 @@ class Sm100FmhaClcDynamicTileScheduler:
         values.extend(extract_mlir_values(self._num_tiles_executed))
         values.extend(extract_mlir_values(self._clc_response_ptr))
         values.extend(extract_mlir_values(self._block_idx))
+        if self.clc is not None:
+            values.extend(extract_mlir_values(self.clc))
         return values
 
     def __new_from_mlir_values__(self, values):
@@ -1549,12 +1506,16 @@ class Sm100FmhaClcDynamicTileScheduler:
         )
         new_clc_response_ptr = new_from_mlir_values(self._clc_response_ptr, [values[4]])
         new_block_idx = new_from_mlir_values(self._block_idx, values[5:8])
+        new_clc = None
+        if self.clc is not None:
+            new_clc = new_from_mlir_values(self.clc, values[8:])
         return Sm100FmhaClcDynamicTileScheduler(
             self.params,
             new_cta_id_in_cluster,
             new_num_tiles_executed,
             new_clc_response_ptr,
             new_block_idx,
+            new_clc,
         )
 
     @staticmethod
@@ -1563,6 +1524,7 @@ class Sm100FmhaClcDynamicTileScheduler:
         block_idx: Tuple,
         grid_dim: Tuple,
         clc_response_ptr: cute.Pointer,
+        clc: ClcState = None,
         *,
         loc=None,
         ip=None,
@@ -1585,6 +1547,7 @@ class Sm100FmhaClcDynamicTileScheduler:
             num_tiles_executed,
             clc_response_ptr,
             block_idx,
+            clc,
         )
 
     @staticmethod
@@ -1630,37 +1593,25 @@ class Sm100FmhaClcDynamicTileScheduler:
         bid = bidz // self.params.problem_shape_mbh[2]
         return cutlass.utils.WorkTileInfo((bidx, 0, (bid, hid)), True)
 
-    def advance_to_next_work(self, mbarrier_addr, *, loc=None, ip=None):
-        """Request next tile from CLC hardware."""
-        with cute.arch.elect_one():
-            cute.arch.issue_clc_query(
-                mbarrier_addr, self._clc_response_ptr, loc=loc, ip=ip
-            )
+    def advance_to_next_work(self, *, loc=None, ip=None):
+        """Consumer-side advance: wait for next tile, read coordinates, release."""
+        self.clc.consumer_wait(loc=loc, ip=ip)
+        work = self.get_current_work(loc=loc, ip=ip)
+        self.clc.consumer_release(loc=loc, ip=ip)
         self._num_tiles_executed += Int32(1)
+        return work
+
+    def prefetch_next_work(self, *, loc=None, ip=None):
+        """Producer-side: issue CLC query for next tile."""
+        self.clc.prefetch_next_work(loc=loc, ip=ip)
+
+    def producer_tail(self, *, loc=None, ip=None):
+        """Producer-side cleanup after last tile."""
+        self.clc.producer_tail(loc=loc, ip=ip)
 
     @property
     def num_tiles_executed(self) -> Int32:
         return self._num_tiles_executed
-
-
-def create_sm100_fmha_clc_dynamic_tile_scheduler(
-    params: Sm100FmhaClcDynamicTileSchedulerParams,
-    block_idx: Tuple,
-    grid_dim: Tuple,
-    clc_response_ptr: cute.Pointer,
-) -> Sm100FmhaClcDynamicTileScheduler:
-    """Create FMHA CLC dynamic tile scheduler."""
-    return Sm100FmhaClcDynamicTileScheduler.create(
-        params, block_idx, grid_dim, clc_response_ptr
-    )
-
-
-def create_sm100_fmha_clc_dynamic_tile_scheduler_params(
-    problem_shape_mbh: cute.Shape,
-    cluster_shape_mnk: cute.Shape,
-) -> Sm100FmhaClcDynamicTileSchedulerParams:
-    """Create FMHA CLC dynamic tile scheduler parameters."""
-    return Sm100FmhaClcDynamicTileSchedulerParams(problem_shape_mbh, cluster_shape_mnk)
 
 
 def compute_sm100_fmha_grid_clc(
@@ -1674,7 +1625,7 @@ def compute_sm100_fmha_grid_clc(
         cute.size(o_shape[2][0]),
         cute.size(o_shape[2][1]),
     )
-    tile_sched_params = create_sm100_fmha_clc_dynamic_tile_scheduler_params(
+    tile_sched_params = Sm100FmhaClcDynamicTileSchedulerParams(
         problem_shape_mbh, cluster_shape_mnk
     )
     grid = Sm100FmhaClcDynamicTileScheduler.get_grid_shape(tile_sched_params)
