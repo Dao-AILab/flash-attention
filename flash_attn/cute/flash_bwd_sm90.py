@@ -19,6 +19,7 @@ from quack.sm90_utils import gemm_zero_init, gemm_w_idx
 
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import utils
+from flash_attn.cute.dropout import apply_dropout_mask
 from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
@@ -73,8 +74,13 @@ class FlashAttentionBackwardSm90:
         has_aux_tensors: cutlass.Constexpr = False,
         subtile_factor: cutlass.Constexpr[int] = 1,
         dQ_single_wg: bool = False,
+        p_dropout: float = 0.0,
     ):
         self.dtype = dtype
+        self.p_dropout = p_dropout
+        self.is_dropout = p_dropout > 0.0
+        self.p_keep_uint8 = int(255 * (1.0 - p_dropout)) if p_dropout > 0 else 255
+        self.rp_dropout = 1.0 / (1.0 - p_dropout) if 0 < p_dropout < 1.0 else 1.0
         # padding head_dim to a multiple of 16 as k_block_size
         hdim_multiple_of = 16
         self.tile_hdim = int(math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of)
@@ -357,6 +363,8 @@ class FlashAttentionBackwardSm90:
         mdV_semaphore: Optional[cute.Tensor] = None,
         aux_tensors: Optional[list] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        dropout_seed_lo: Optional[int] = None,
+        dropout_seed_hi: Optional[int] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -600,6 +608,9 @@ class FlashAttentionBackwardSm90:
             mdQ_semaphore,
             window_size_left,
             window_size_right,
+            Int32(cute.size(mQ.shape[2])) if const_expr(self.is_dropout) else None,  # dropout_nheads
+            Int32(dropout_seed_lo) if dropout_seed_lo is not None and self.is_dropout else None,
+            Int32(dropout_seed_hi) if dropout_seed_hi is not None and self.is_dropout else None,
         ).launch(
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
@@ -653,6 +664,9 @@ class FlashAttentionBackwardSm90:
         mdQ_semaphore: Optional[cute.Tensor] = None,
         window_size_left: Optional[Int32] = None,
         window_size_right: Optional[Int32] = None,
+        dropout_nheads: Optional[Int32] = None,
+        dropout_seed_lo: Optional[Int32] = None,
+        dropout_seed_hi: Optional[Int32] = None,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
@@ -813,6 +827,9 @@ class FlashAttentionBackwardSm90:
                 fastdiv_mods,
                 blocksparse_tensors,
                 qhead_per_kvhead_divmod,
+                dropout_nheads,
+                dropout_seed_lo,
+                dropout_seed_hi,
             )
             if const_expr(self.num_wg_dQ == self.num_wg_mma):
                 # Both WGs compute dQ
@@ -1118,6 +1135,9 @@ class FlashAttentionBackwardSm90:
         fastdiv_mods=(None, None),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         qhead_per_kvhead_divmod: Optional[FastDivmodDivisor] = None,
+        dropout_nheads: Optional[Int32] = None,
+        dropout_seed_lo: Optional[Int32] = None,
+        dropout_seed_hi: Optional[Int32] = None,
         is_dQ_wg: cutlass.Constexpr[bool] = True,
     ):
         warp_group_idx = cute.arch.make_warp_uniform(tidx // self.num_threads_per_warp_group)
@@ -1304,6 +1324,25 @@ class FlashAttentionBackwardSm90:
                 n_block=n_block,
                 seqlen_info=seqlen,
             )
+            # Dropout closure — bind n_block (outer loop), m_block passed at call time
+            dropout_fn_cur = None
+            if const_expr(self.is_dropout):
+                dropout_fn_cur = partial(
+                    apply_dropout_mask,
+                    thr_mma=thr_mma_SdP,
+                    batch_idx=batch_idx,
+                    head_idx=head_idx,
+                    nheads=dropout_nheads,
+                    n_block=n_block,
+                    tile_m=self.tile_m,
+                    tile_n=self.tile_n,
+                    p_keep_uint8=self.p_keep_uint8,
+                    rp_dropout=Float32(self.rp_dropout),
+                    seed_lo=cutlass.Uint32(dropout_seed_lo),
+                    seed_hi=cutlass.Uint32(dropout_seed_hi),
+                    transpose=self.SdP_swapAB,
+                )
+
             m_block_min, m_block_max = block_info.get_m_block_min_max(seqlen, n_block)
 
             if const_expr(not self.use_block_sparsity):
@@ -1346,6 +1385,7 @@ class FlashAttentionBackwardSm90:
                             mask_fn=mask_fn,
                             score_mod_fn=score_mod_fn_cur,
                             score_mod_bwd_fn=score_mod_bwd_fn_cur,
+                            dropout_fn=dropout_fn_cur,
                             dKV_accumulate=dKV_accumulate,
                         )
                         dKV_accumulate = True
@@ -1463,6 +1503,7 @@ class FlashAttentionBackwardSm90:
         mask_fn: Optional[Callable] = None,
         score_mod_fn: Optional[Callable] = None,
         score_mod_bwd_fn: Optional[Callable] = None,
+        dropout_fn: Optional[Callable] = None,
         dKV_accumulate: Boolean = True,
     ):
         consumer_state_dO_cur = (
@@ -1500,6 +1541,10 @@ class FlashAttentionBackwardSm90:
                 acc_S_mn[r, c] = cute.math.exp2(
                     acc_S_mn[r, c] * softmax_scale_log2 - lse_val, fastmath=True
                 )
+        # Apply dropout mask to recomputed P (same mask as forward)
+        if const_expr(dropout_fn is not None):
+            dropout_fn(acc_S=acc_S, m_block=m_block)
+
         tLSErdPsum = copy_utils.load_s2r(tLSEsdPsum[None, smem_idx_dO])
 
         # Convert P from f32 -> f16

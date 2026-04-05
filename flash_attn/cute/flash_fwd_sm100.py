@@ -33,6 +33,7 @@ from cutlass.cutlass_dsl import BaseDSL
 
 from quack import copy_utils, layout_utils
 
+from flash_attn.cute.dropout import apply_dropout_mask_sm100
 from flash_attn.cute.paged_kv import PagedKVManager
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import utils
@@ -130,7 +131,12 @@ class FlashAttentionForwardSm100:
         is_varlen_q: bool = False,
         use_2cta_instrs: bool = False,
         use_clc_scheduler: bool = False,
+        p_dropout: float = 0.0,
     ):
+        self.p_dropout = p_dropout
+        self.is_dropout = p_dropout > 0.0
+        self.p_keep_uint8 = int(255 * (1.0 - p_dropout)) if p_dropout > 0 else 255
+        self.rp_dropout = 1.0 / (1.0 - p_dropout) if 0 < p_dropout < 1.0 else 1.0
         self.use_tma_KV = not paged_kv_non_tma
         # self.dtype = dtype
         # padding head_dim to a multiple of 16 as k_block_size
@@ -370,6 +376,8 @@ class FlashAttentionForwardSm100:
         descale_tensors: Optional[DescaleTensors] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors: Optional[list] = None,
+        dropout_seed_lo: Optional[int] = None,
+        dropout_seed_hi: Optional[int] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -756,6 +764,9 @@ class FlashAttentionForwardSm100:
             aux_tensors,
             fastdiv_mods,
             head_divmod,
+            Int32(cute.size(mQ.shape[2])) if const_expr(self.is_dropout) else None,  # dropout_nheads
+            Int32(dropout_seed_lo) if dropout_seed_lo is not None and self.is_dropout else None,
+            Int32(dropout_seed_hi) if dropout_seed_hi is not None and self.is_dropout else None,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -803,6 +814,9 @@ class FlashAttentionForwardSm100:
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
         head_divmod=None,
+        dropout_nheads: Optional[Int32] = None,
+        dropout_seed_lo: Optional[Int32] = None,
+        dropout_seed_hi: Optional[Int32] = None,
     ):
         """The device kernel implementation of the Fused Multi-Head Attention.
 
@@ -1235,6 +1249,9 @@ class FlashAttentionForwardSm100:
                 head_divmod=head_divmod,
                 blocksparse_tensors=blocksparse_tensors,
                 tile_scheduler=tile_scheduler,
+                dropout_nheads=dropout_nheads,
+                dropout_seed_lo=dropout_seed_lo,
+                dropout_seed_hi=dropout_seed_hi,
             )
 
             if const_expr(not self.s0_s1_barrier):
@@ -1848,6 +1865,9 @@ class FlashAttentionForwardSm100:
         head_divmod=None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         tile_scheduler=None,
+        dropout_nheads: Optional[Int32] = None,
+        dropout_seed_lo: Optional[Int32] = None,
+        dropout_seed_hi: Optional[Int32] = None,
     ):
         """Compute softmax on attention scores from QK matrix multiplication.
 
@@ -2005,6 +2025,28 @@ class FlashAttentionForwardSm100:
                 tile_block_count = n_block_max - n_block_min
                 has_work = const_expr(not self.is_split_kv) or tile_block_count > Int32(0)
 
+            # Dropout closure — applied after softmax exp2, before P TMEM store
+            dropout_fn = None
+            if const_expr(self.is_dropout):
+                dropout_fn = partial(
+                    apply_dropout_mask_sm100,
+                    tScS_t2r=thr_tmem_load.partition_D(
+                        thr_mma_qk.partition_C(
+                            cute.make_identity_tensor(self.mma_tiler_qk[:2])
+                        )[(None, None), 0, 0]
+                    ),
+                    batch_idx=batch_idx,
+                    head_idx=head_idx,
+                    nheads=dropout_nheads,
+                    m_block=(self.q_stage * m_block + stage) * self.cta_group_size,
+                    tile_m=self.m_block_size,
+                    tile_n=self.n_block_size,
+                    p_keep_uint8=self.p_keep_uint8,
+                    rp_dropout=Float32(self.rp_dropout),
+                    seed_lo=cutlass.cast(dropout_seed_lo, cutlass.Uint32),
+                    seed_hi=cutlass.cast(dropout_seed_hi, cutlass.Uint32),
+                )
+
             softmax_step = partial(
                 self.softmax_step,
                 softmax=softmax,
@@ -2029,6 +2071,7 @@ class FlashAttentionForwardSm100:
                 aux_tensors=aux_tensors,
                 fastdiv_mods=fastdiv_mods,
                 head_divmod=head_divmod,
+                dropout_fn=dropout_fn,
             )
 
             if const_expr(self.use_block_sparsity) or has_work:
@@ -2210,13 +2253,14 @@ class FlashAttentionForwardSm100:
         head_divmod=None,
         mask_fn: Optional[Callable] = None,
         is_first: bool = False,
+        dropout_fn: Optional[Callable] = None,
     ) -> Tuple[cute.Int32, cute.Int32, cute.Int32]:
         """Perform a single step of the softmax computation on a block of attention scores.
 
         This method processes one block of the attention matrix, computing numerically stable
         softmax by first finding the row maximum, subtracting it from all elements, applying
         exponential function, and then normalizing by the sum of exponentials. It also handles
-        optional masking of attention scores.
+        optional masking of attention scores and dropout.
 
         The method involves several key operations:
         1. Loading attention scores from tensor memory
@@ -2290,6 +2334,12 @@ class FlashAttentionForwardSm100:
             ex2_emu_freq=self.ex2_emu_freq if const_expr(mask_fn is None) else 0,
             ex2_emu_start_frg=self.ex2_emu_start_frg,
         )
+        # Apply dropout mask after exp2 conversion, before P TMEM store.
+        # Modifies tSrS_t2r (f32, used for row_sum) and re-converts to half for tSrP_r2t.
+        if const_expr(dropout_fn is not None):
+            dropout_fn(acc_S=tSrS_t2r, n_block=n_block)
+            # Re-convert dropped f32 values to half precision for TMEM P store
+            tSrP_r2t.store(tSrS_t2r.load().to(self.q_dtype))
         # Sequence barrier arrive
         if const_expr(self.s0_s1_barrier):
             pipeline_s0_s1_sequence.sync_object_full.arrive(1 - stage, dst=None)

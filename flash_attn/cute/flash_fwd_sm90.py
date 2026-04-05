@@ -23,6 +23,7 @@ from quack import sm90_utils
 
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import utils
+from flash_attn.cute.dropout import apply_dropout_mask
 from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.softmax import Softmax, apply_score_mod_inner
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
@@ -172,6 +173,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors: Optional[list] = None,
+        dropout_seed_lo: Optional[int] = None,
+        dropout_seed_hi: Optional[int] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -390,6 +393,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             SharedStorage,
             aux_tensors,
             fastdiv_mods,
+            Int32(cute.size(mQ.shape[2])) if const_expr(self.is_dropout) else None,  # nheads
+            Int32(dropout_seed_lo) if dropout_seed_lo is not None and self.is_dropout else None,
+            Int32(dropout_seed_hi) if dropout_seed_hi is not None and self.is_dropout else None,
         ).launch(
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
@@ -436,6 +442,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         SharedStorage: cutlass.Constexpr[Callable],
         aux_tensors=Optional[list[cute.Tensor]],
         fastdiv_mods=None,
+        dropout_nheads: Optional[Int32] = None,
+        dropout_seed_lo: Optional[Int32] = None,
+        dropout_seed_hi: Optional[Int32] = None,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         # Prefetch tma descriptor
@@ -624,6 +633,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 blocksparse_tensors,
                 aux_tensors,
                 fastdiv_mods,
+                dropout_nheads,
+                dropout_seed_lo,
+                dropout_seed_hi,
             )
 
     @cute.jit
@@ -951,6 +963,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         blocksparse_tensors: Optional[BlockSparseTensors],
         aux_tensors: Optional[list],
         fastdiv_mods=None,
+        dropout_nheads: Optional[Int32] = None,
+        dropout_seed_lo: Optional[Int32] = None,
+        dropout_seed_hi: Optional[Int32] = None,
     ):
         warp_group_idx = cute.arch.make_warp_uniform(tidx // self.num_threads_per_warp_group)
         warp_group_thread_layout = cute.make_layout(
@@ -1081,8 +1096,27 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     aux_tensors=aux_tensors,
                     fastdiv_mods=fastdiv_mods,
                 )
+            # Dropout closure — applied after softmax, before P→V GEMM
+            dropout_fn = None
+            if const_expr(self.is_dropout):
+                dropout_fn = partial(
+                    apply_dropout_mask,
+                    thr_mma=thr_mma_qk,
+                    batch_idx=batch_idx,
+                    head_idx=head_idx,
+                    nheads=dropout_nheads,
+                    m_block=m_block,
+                    tile_m=self.tile_m,
+                    tile_n=self.tile_n,
+                    p_keep_uint8=self.p_keep_uint8,
+                    rp_dropout=Float32(self.rp_dropout),
+                    seed_lo=cutlass.cast(dropout_seed_lo, cutlass.Uint32),
+                    seed_hi=cutlass.cast(dropout_seed_hi, cutlass.Uint32),
+                )
+
             mma_one_n_block = partial(
-                mma_one_n_block_all, seqlen=seqlen, softmax=softmax, score_mod_fn=score_mod_fn
+                mma_one_n_block_all, seqlen=seqlen, softmax=softmax, score_mod_fn=score_mod_fn,
+                dropout_fn=dropout_fn,
             )
             n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
             pipeline_q.consumer_wait_w_index_phase(0, q_consumer_phase)
@@ -1108,6 +1142,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         kv_consumer_state=kv_consumer_state,
                         mask_fn=partial(mask_fn, mask_mod=self.mask_mod),
                         score_mod_fn=score_mod_fn,
+                        dropout_fn=dropout_fn,
                         is_first_block=True,
                     )
                 else:
@@ -1270,6 +1305,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         acc_O: Optional[cute.Tensor] = None,
         mask_fn: Callable = None,
         score_mod_fn: Optional[Callable] = None,
+        dropout_fn: Optional[Callable] = None,
         is_first_block: bool = False,
     ):
         """Processes the first half block when using intra-warpgroup-overlap"""
@@ -1288,6 +1324,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mask_fn(acc_S, n_block=n_block, mask_seqlen=True)
 
         row_scale = softmax.online_softmax(acc_S, is_first=is_first_block)
+        if const_expr(dropout_fn is not None):
+            dropout_fn(acc_S=acc_S, n_block=n_block)
 
         tOrP_acc = layout_utils.reshape_acc_to_frgA(acc_S)
         tOrP_cur = (
@@ -1351,6 +1389,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         scores_scale: Optional[cute.Tensor] = None,  # not used
         score_mod_fn: Optional[Callable] = None,
         mask_fn: Optional[Callable] = None,
+        dropout_fn: Optional[Callable] = None,
         is_first_n_block: cutlass.Constexpr = False,
         check_inf: cutlass.Constexpr = True,
     ):
@@ -1368,6 +1407,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             mask_fn(acc_S=acc_S, n_block=n_block)
 
         row_scale = softmax.online_softmax(acc_S, is_first=is_first_n_block, check_inf=check_inf)
+        # Apply dropout mask after softmax, before P→V GEMM
+        if const_expr(dropout_fn is not None):
+            dropout_fn(acc_S=acc_S, n_block=n_block)
         # if cute.arch.thread_idx()[0] == 0: cute.print_tensor(layout_utils.reshape_acc_to_mn(acc_S))
         tOrP_acc = layout_utils.reshape_acc_to_frgA(acc_S)
         tOrP_cur = (
@@ -1413,6 +1455,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         scores_scale: Optional[cute.Tensor] = None,
         score_mod_fn: Optional[Callable] = None,
         mask_fn: Optional[Callable] = None,
+        dropout_fn: Optional[Callable] = None,
         check_inf: cutlass.Constexpr = True,
     ):
         smem_pipe_read_v = smem_pipe_read.clone()
@@ -1439,6 +1482,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         # if cute.arch.thread_idx()[0] == 128: cute.print_tensor(layout_utils.reshape_acc_to_mn(acc_S))
 
         row_scale = softmax.online_softmax(acc_S, check_inf=check_inf)
+        if const_expr(dropout_fn is not None):
+            dropout_fn(acc_S=acc_S, n_block=n_block)
         warpgroup.wait_group(0)
         pipeline_v.consumer_release(smem_pipe_read_v)
         tOrP_acc = layout_utils.reshape_acc_to_frgA(acc_S)
