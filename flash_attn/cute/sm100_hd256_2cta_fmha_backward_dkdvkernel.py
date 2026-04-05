@@ -1,3 +1,4 @@
+# Copyright (c) 2025, Siyu Wang, Shengbin Di, Yuxi Chi, Linfeng Zheng, Haoyan Huang, Lanbo Li, Yun Zhong, Man Yuan, Minmin Sun, Yong Li, Wei Lin.
 
 """Fused multi-head attention (FMHA) backward for the SM100 architecture using CUTE DSL.
 

@@ -1,4 +1,4 @@
-# Copyright (c) 2025, Tri Dao.
+# Copyright (c) 2025, Tri Dao, Siyu Wang, Shengbin Di, Yuxi Chi, Linfeng Zheng, Haoyan Huang, Lanbo Li, Yun Zhong, Man Yuan, Minmin Sun, Yong Li, Wei Lin.
 
 from enum import IntEnum, auto
 from typing import Optional, Tuple, Protocol, runtime_checkable

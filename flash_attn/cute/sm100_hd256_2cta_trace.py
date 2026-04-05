@@ -1,4 +1,5 @@
-# Copyright (c) 2025 Aliyun Inc. All Rights Reserved.
+# Copyright (c) 2025, Siyu Wang, Shengbin Di, Yuxi Chi, Linfeng Zheng, Haoyan Huang, Lanbo Li, Yun Zhong, Man Yuan, Minmin Sun, Yong Li, Wei Lin.
+
 """Call counters for SM100 head_dim=256 2CTA kernels (diagnostics / regression tests)."""
 
 _fwd = 0

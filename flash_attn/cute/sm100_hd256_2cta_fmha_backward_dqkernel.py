@@ -1,3 +1,5 @@
+# Copyright (c) 2025, Siyu Wang, Shengbin Di, Yuxi Chi, Linfeng Zheng, Haoyan Huang, Lanbo Li, Yun Zhong, Man Yuan, Minmin Sun, Yong Li, Wei Lin.
+
 from typing import Type, Tuple, Optional
 
 import cuda.bindings.driver as cuda

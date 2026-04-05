@@ -1,6 +1,5 @@
-# Copyright (c) 2025 Aliyun Inc. All Rights Reserved.
-# Due to the naming convention of CuteDSL, we disable the following naming lint check.
-# ruff: noqa: N802,N803,N806,N815,E741
+# Copyright (c) 2025, Siyu Wang, Shengbin Di, Yuxi Chi, Linfeng Zheng, Haoyan Huang, Lanbo Li, Yun Zhong, Man Yuan, Minmin Sun, Yong Li, Wei Lin.
+
 
 """Fused multi-head attention (FMHA) backward for the SM100 architecture using CUTE DSL.
 

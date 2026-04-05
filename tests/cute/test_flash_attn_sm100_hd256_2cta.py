@@ -1,4 +1,5 @@
-# Copyright (c) 2024 Aliyun Inc. All Rights Reserved.
+# Copyright (c) 2025, Siyu Wang, Shengbin Di, Yuxi Chi, Linfeng Zheng, Haoyan Huang, Lanbo Li, Yun Zhong, Man Yuan, Minmin Sun, Yong Li, Wei Lin.
+
 # Integrated into flash-attention: exercises SM100 Blackwell head_dim=256 2CTA Cute-DSL kernels
 # via `flash_attn.cute.interface` (524 parametrized cases from the upstream Aliyun test suite).
 
