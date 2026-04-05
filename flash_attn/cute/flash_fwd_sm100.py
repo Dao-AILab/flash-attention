@@ -87,6 +87,13 @@ _TUNING_CONFIG = {
     (True, False, 192, True): {"ex2_emu_freq": 0, "ex2_emu_start_frg": 0, "num_regs_softmax": 176, "num_regs_correction": 64},
     (False, True, 192, True): {"ex2_emu_freq": 0, "ex2_emu_start_frg": 0, "num_regs_softmax": 176, "num_regs_correction": 72},
 }
+_FP8_TUNING_CONFIG = {
+    (True, False, 128, False): {'ex2_emu_freq': 10, 'ex2_emu_start_frg': 1, 'num_regs_softmax': 160, 'num_regs_correction': 72},
+}
+_FP8_SMALL_HDIM_REGS = {
+    False: {"num_regs_softmax": 168, "num_regs_correction": 96, "num_regs_other": 80},
+    True: {"num_regs_softmax": 152, "num_regs_correction": 96, "num_regs_other": 112},
+}
 # === END TUNING KNOBS ===
 
 
@@ -415,6 +422,24 @@ class FlashAttentionForwardSm100:
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.k_dtype}")
         if const_expr(self.q_dtype != self.v_dtype):
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.v_dtype}")
+        if const_expr(self.q_dtype.width == 8):
+            paged_kv_non_tma = not self.use_tma_KV
+            if const_expr(self.head_dim_padded < 96):
+                fp8_regs = _FP8_SMALL_HDIM_REGS[paged_kv_non_tma]
+                self.num_regs_softmax = fp8_regs["num_regs_softmax"]
+                self.num_regs_correction = fp8_regs["num_regs_correction"]
+                self.num_regs_other = fp8_regs["num_regs_other"]
+            else:
+                fp8_tune = _FP8_TUNING_CONFIG.get(
+                    (self.use_2cta_instrs, self.is_causal, self.head_dim_padded, self.is_sm103), {}
+                )
+                if const_expr("ex2_emu_freq" in fp8_tune):
+                    self._tune = {**self._tune, **fp8_tune}
+                    self.enable_ex2_emu = self._tune["ex2_emu_freq"] > 0
+                if const_expr(not paged_kv_non_tma and "num_regs_softmax" in fp8_tune):
+                    self.num_regs_softmax = fp8_tune["num_regs_softmax"]
+                    self.num_regs_correction = fp8_tune["num_regs_correction"]
+                    self.num_regs_other = 512 - self.num_regs_softmax * 2 - self.num_regs_correction
         self._setup_attributes()
         self.use_tma_O = (
             self.arch >= Arch.sm_90
