@@ -1955,7 +1955,7 @@ class FlashAttentionForwardSm100:
 
             softmax = SoftmaxSm100.create(
                 softmax_scale_log2_eff,
-                rescale_threshold=8.0 if const_expr(self.q_dtype.width == 16) else 0.0,
+                rescale_threshold=8.0 if const_expr(self.q_dtype.width == 16) else 4.0,
                 softmax_scale=softmax_scale_eff,
                 max_offset=max_offset,
             )
