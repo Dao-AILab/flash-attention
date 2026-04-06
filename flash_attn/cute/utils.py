@@ -293,7 +293,7 @@ def mma_make_fragment_B(
 def get_smem_store_atom(
     arch: cutlass.Constexpr[int], element_type: Type[cute.Numeric], transpose: bool = False
 ) -> cute.CopyAtom:
-    if const_expr(arch < 90 or element_type.width != 16):
+    if const_expr(arch < 90 or arch >= 120 or element_type.width != 16):
         return cute.make_copy_atom(
             cute.nvgpu.CopyUniversalOp(),
             element_type,
