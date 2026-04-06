@@ -1,11 +1,13 @@
 """
 Dropout for Flash Attention CuTe DSL kernels.
 
-Philox 4x32 counter-based PRNG for deterministic dropout mask generation.
-Position-based keying on global (row, col) ensures identical masks in
-forward and backward regardless of thread partitioning.
+Philox 4x32 counter-based PRNG with 2x4 group batching for efficient
+dropout mask generation. Each Philox call produces 128 random bits
+used as 8 × 16-bit masks covering 8 elements — matching TriDao's
+recommended approach from FA2.
 
-Uses quack's mul_wide_u32 and Philox constants.
+Keying on global (row, col) position ensures identical masks in forward
+and backward regardless of MMA layout, tile size, or architecture.
 
 Reference: FA2 C++ in csrc/flash_attn/src/{dropout.h, philox.cuh}
 """
@@ -13,6 +15,7 @@ Reference: FA2 C++ in csrc/flash_attn/src/{dropout.h, philox.cuh}
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional
 
 import cutlass
 import cutlass.cute as cute
@@ -28,6 +31,11 @@ from quack.rounding import (
     PHILOX_N_ROUNDS_DEFAULT,
 )
 
+# Group dimensions: 2 rows × 4 cols = 8 elements per Philox call.
+# Each element gets 16 random bits (128 / 8 = 16).
+DROPOUT_GROUP_ROWS: int = 2
+DROPOUT_GROUP_COLS: int = 4
+
 
 # ---------------------------------------------------------------------------
 # Philox 4x32 PRNG
@@ -36,25 +44,17 @@ from quack.rounding import (
 
 @cute.jit
 def philox_4x32(
-    c0_in: Uint32,
-    c1_in: Uint32,
-    c2_in: Uint32,
-    c3_in: Uint32,
-    k0_in: Uint32,
-    k1_in: Uint32,
+    c0_in: Uint32, c1_in: Uint32,
+    c2_in: Uint32, c3_in: Uint32,
+    k0_in: Uint32, k1_in: Uint32,
 ) -> tuple:
-    """Philox 4x32 PRNG with full 4-element counter + 2-element key.
-
-    Extends quack.rounding.philox to accept FA2's full 6-input layout.
-    Uses quack's mul_wide_u32 and default round count.
-    """
+    """Philox 4x32 PRNG. Counter=(c0..c3), Key=(k0,k1)."""
     c0 = Uint32(c0_in)
     c1 = Uint32(c1_in)
     c2 = Uint32(c2_in)
     c3 = Uint32(c3_in)
     k0 = Uint32(k0_in)
     k1 = Uint32(k1_in)
-
     for _ in range(PHILOX_N_ROUNDS_DEFAULT):
         hi_b, lo_b = mul_wide_u32(c2, Uint32(PHILOX_ROUND_B))
         hi_a, lo_a = mul_wide_u32(c0, Uint32(PHILOX_ROUND_A))
@@ -64,7 +64,6 @@ def philox_4x32(
         c3 = lo_a
         k0 = k0 + Uint32(PHILOX_KEY_A)
         k1 = k1 + Uint32(PHILOX_KEY_B)
-
     return c0, c1, c2, c3
 
 
@@ -77,16 +76,20 @@ def philox_4x32(
 class DropoutParams:
     """Dropout configuration."""
 
-    p_dropout: float  # Dropout probability (0 = disabled)
+    p_dropout: float
+
+    @property
+    def p_keep_uint16(self) -> int:
+        """16-bit threshold: random u16 <= this -> keep."""
+        return int(65535 * (1.0 - self.p_dropout))
 
     @property
     def p_keep_uint8(self) -> int:
-        """Threshold: random byte <= this -> keep. E.g. p=0.1 -> 229."""
+        """8-bit threshold (for backward compat)."""
         return int(255 * (1.0 - self.p_dropout))
 
     @property
     def rp_dropout(self) -> float:
-        """Scale factor: 1 / (1 - p_dropout)."""
         if self.p_dropout >= 1.0:
             return 0.0
         return 1.0 / (1.0 - self.p_dropout)
@@ -97,7 +100,7 @@ class DropoutParams:
 
 
 # ---------------------------------------------------------------------------
-# Dropout mask application
+# Dropout mask application — 8 elements per Philox call
 # ---------------------------------------------------------------------------
 
 
@@ -118,17 +121,19 @@ def apply_dropout_mask(
     seed_hi: Uint32,
     transpose: cutlass.Constexpr[bool] = False,
 ):
-    """Apply dropout mask to attention accumulator in-place.
+    """Apply dropout mask with 2x4 group batching.
 
-    Per-element Philox keyed on global (row, col) position with full
-    64-bit seed. Each element gets one Philox call; byte 0 of word 0
-    determines keep/drop.
+    Each Philox call produces 128 bits = 8 × 16-bit random values,
+    covering a 2-row × 4-col group of 8 elements. Elements within the
+    group are assigned by (row % 2) * 4 + (col % 4), giving each element
+    a unique 16-bit random value for the keep/drop decision.
 
-    Keying layout (all 6 Philox inputs used):
-      counter[0]   = batch*nheads + head
-      counter[1]   = 0
-      counter[2:3] = (row, col) position
-      key[0:1]     = (seed_lo, seed_hi) full 64-bit seed
+    Uses global (row, col) position for the group key, ensuring identical
+    masks in forward and backward regardless of MMA layout or tile size.
+
+    Keying:
+      counter = (batch*nheads + head, 0, row_group, col_group)
+      key     = (seed_lo, seed_hi)
     """
     acc_shape = (tile_m, tile_n) if not cutlass.const_expr(transpose) else (tile_n, tile_m)
     cS = cute.make_identity_tensor(acc_shape)
@@ -139,28 +144,61 @@ def apply_dropout_mask(
     thr_col_offset = tScS_mn[0][1]
 
     rng_key_lo = Uint32(batch_idx * nheads + head_idx)
-    p_threshold = Uint32(p_keep_uint8)
+    # 16-bit threshold from the 8-bit parameter (scale up)
+    p_threshold_16 = Uint32(p_keep_uint8) * Uint32(257)  # 0-255 -> 0-65535
 
     acc_mn = layout_utils.reshape_acc_to_mn(acc_S, transpose=transpose)
     nrow = cute.size(acc_mn.shape[0])
     ncol = cute.size(acc_mn.shape[1])
 
+    # Cache: Philox called once per 2x4 group (8 elements)
+    cache_rg = Uint32(0xFFFFFFFF)
+    cache_cg = Uint32(0xFFFFFFFF)
+    cache_r0 = Uint32(0)
+    cache_r1 = Uint32(0)
+    cache_r2 = Uint32(0)
+    cache_r3 = Uint32(0)
+
     for r in cutlass.range_constexpr(nrow):
         local_row = tScS_mn[r, 0][0]
         global_row = local_row + m_block * tile_m
+        row_group = Uint32(global_row) >> Uint32(1)  # // 2
 
         for c in cutlass.range_constexpr(ncol):
             col_local = t0ScS_mn[0, c][1]
             global_col = thr_col_offset + col_local + n_block * tile_n
+            col_group = Uint32(global_col) >> Uint32(2)  # // 4
 
-            pr0, _pr1, _pr2, _pr3 = philox_4x32(
-                rng_key_lo, Uint32(0),
-                Uint32(global_row), Uint32(global_col),
-                seed_lo, seed_hi,
-            )
-            rand_byte = pr0 & Uint32(255)
+            # Philox on group change
+            if (row_group != cache_rg) | (col_group != cache_cg):
+                cache_rg = row_group
+                cache_cg = col_group
+                cache_r0, cache_r1, cache_r2, cache_r3 = philox_4x32(
+                    rng_key_lo, Uint32(0), row_group, col_group,
+                    seed_lo, seed_hi,
+                )
 
-            keep_f = Float32(Uint32(rand_byte <= p_threshold))
+            # Element index within the 2x4 group: (row%2)*4 + (col%4) -> 0..7
+            elem_in_group = (Int32(global_row) & Int32(1)) * Int32(4) + (Int32(global_col) & Int32(3))
+
+            # Extract 16-bit value: 8 values packed in 4 words (2 per word)
+            # word_idx = elem_in_group // 2, half_idx = elem_in_group % 2
+            # rand_u16 = (word >> (half_idx * 16)) & 0xFFFF
+            word_idx = elem_in_group >> Int32(1)
+            half_shift = Uint32(elem_in_group & Int32(1)) << Uint32(4)  # 0 or 16
+
+            # Select word (constexpr-friendly since only 4 options)
+            word = cache_r0
+            if word_idx == Int32(1):
+                word = cache_r1
+            if word_idx == Int32(2):
+                word = cache_r2
+            if word_idx == Int32(3):
+                word = cache_r3
+
+            rand_u16 = (word >> half_shift) & Uint32(65535)
+
+            keep_f = Float32(Uint32(rand_u16 <= p_threshold_16))
             acc_mn[r, c] = acc_mn[r, c] * (rp_dropout * keep_f)
 
 
@@ -183,15 +221,18 @@ def apply_dropout_mask_sm100(
 ):
     """Apply dropout mask to SM100 attention scores (TMEM layout).
 
-    Same per-element Philox as apply_dropout_mask but uses a pre-computed
-    coordinate tensor (tScS_t2r) instead of reshape_acc_to_mn, since SM100
-    softmax operates on TMEM-loaded data with a different layout.
-
-    When transpose=True (backward), coord indices are swapped because
-    S^T = K @ Q^T uses an (N, M) identity tensor.
+    Same 2x4 group batching as apply_dropout_mask but uses TMEM
+    coordinate tensor.
     """
     rng_key_lo = Uint32(batch_idx * nheads + head_idx)
-    p_threshold = Uint32(p_keep_uint8)
+    p_threshold_16 = Uint32(p_keep_uint8) * Uint32(257)
+
+    cache_rg = Uint32(0xFFFFFFFF)
+    cache_cg = Uint32(0xFFFFFFFF)
+    cache_r0 = Uint32(0)
+    cache_r1 = Uint32(0)
+    cache_r2 = Uint32(0)
+    cache_r3 = Uint32(0)
 
     nelem = cute.size(tScS_t2r.shape)
     for i in cutlass.range_constexpr(nelem):
@@ -203,13 +244,30 @@ def apply_dropout_mask_sm100(
             local_col = tScS_t2r[i][0]
         global_row = local_row + m_block * tile_m
         global_col = local_col + n_block * tile_n
+        row_group = Uint32(global_row) >> Uint32(1)
+        col_group = Uint32(global_col) >> Uint32(2)
 
-        pr0, _pr1, _pr2, _pr3 = philox_4x32(
-            rng_key_lo, Uint32(0),
-            Uint32(global_row), Uint32(global_col),
-            seed_lo, seed_hi,
-        )
-        rand_byte = pr0 & Uint32(255)
+        if (row_group != cache_rg) | (col_group != cache_cg):
+            cache_rg = row_group
+            cache_cg = col_group
+            cache_r0, cache_r1, cache_r2, cache_r3 = philox_4x32(
+                rng_key_lo, Uint32(0), row_group, col_group,
+                seed_lo, seed_hi,
+            )
 
-        keep_f = Float32(Uint32(rand_byte <= p_threshold))
+        elem_in_group = (Int32(global_row) & Int32(1)) * Int32(4) + (Int32(global_col) & Int32(3))
+        word_idx = elem_in_group >> Int32(1)
+        half_shift = Uint32(elem_in_group & Int32(1)) << Uint32(4)
+
+        word = cache_r0
+        if word_idx == Int32(1):
+            word = cache_r1
+        if word_idx == Int32(2):
+            word = cache_r2
+        if word_idx == Int32(3):
+            word = cache_r3
+
+        rand_u16 = (word >> half_shift) & Uint32(65535)
+
+        keep_f = Float32(Uint32(rand_u16 <= p_threshold_16))
         acc_S[i] = acc_S[i] * (rp_dropout * keep_f)

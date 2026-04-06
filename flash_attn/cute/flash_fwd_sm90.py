@@ -1110,8 +1110,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     tile_n=self.tile_n,
                     p_keep_uint8=self.p_keep_uint8,
                     rp_dropout=Float32(self.rp_dropout),
-                    seed_lo=cutlass.cast(dropout_seed_lo, cutlass.Uint32),
-                    seed_hi=cutlass.cast(dropout_seed_hi, cutlass.Uint32),
+                    seed_lo=cutlass.Uint32(dropout_seed_lo),
+                    seed_hi=cutlass.Uint32(dropout_seed_hi),
                 )
 
             mma_one_n_block = partial(
