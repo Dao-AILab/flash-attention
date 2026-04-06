@@ -134,7 +134,8 @@ class FlashAttentionBackwardPreprocess:
         mCuSeqlensQ: Optional[cute.Tensor],  # (batch + 1,)
         mSeqUsedQ: Optional[cute.Tensor],  # (batch,)
         mdLSE: Optional[cute.Tensor],  # (batch, nheads, seqlen) or (nheads, total_q)
-        stream: cuda.CUstream,
+        # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
+        stream: cuda.CUstream = None,
     ):
         # Get the data type and check if it is fp16 or bf16
         if const_expr(not (mO.element_type == mdO.element_type)):

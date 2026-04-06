@@ -152,9 +152,9 @@ def setup_fa4(ctx):
     bwd_fn = None
     if ctx["has_backward"] and ctx["dtype"] != torch.float8_e4m3fn:
         if ctx["varlen"]:
-            qu, ku, vu = ctx["q_unpad"], ctx["k_unpad"], ctx["v_unpad"]
+            qu, ku, vu, gu = ctx["q_unpad"], ctx["k_unpad"], ctx["v_unpad"], ctx["g_unpad"]
             csq, csk = ctx["cu_seqlens_q"], ctx["cu_seqlens_k"]
-            bwd_fn = _make_bwd_fn(lambda: flash_attn_varlen_func_python(qu, ku, vu, csq, csk, causal=causal, softcap=softcap, deterministic=deterministic), g, [qu, ku, vu])
+            bwd_fn = _make_bwd_fn(lambda: flash_attn_varlen_func_python(qu, ku, vu, csq, csk, causal=causal, softcap=softcap, deterministic=deterministic), gu, [qu, ku, vu])
         else:
             bwd_fn = _make_bwd_fn(lambda: flash_attn_func_python(q, k, v, causal=causal, softcap=softcap, deterministic=deterministic), g, [q, k, v])
     return fwd_fn, bwd_fn
@@ -168,6 +168,51 @@ BACKENDS = [
     ("FA3",      "fa3",      setup_fa3),
     ("FA4",      "fa4",      setup_fa4),
 ]
+
+
+def get_peak_flops(device_index: int = 0, dtype: torch.dtype = torch.bfloat16) -> float | None:
+    """Return peak BF16 dense TFLOPS for the given device. Returns None if unknown.
+
+    Scaling by dtype:
+      FP16 / BF16 : 1x  (identical hardware throughput)
+      FP8         : 2x
+    """
+    # BF16 dense peak FLOPS from official NVIDIA spec sheets.
+    # Checked against: num_SMs * tensor_core_clock * ops_per_SM_per_cycle.
+    # The tensor core clock is NOT queryable (it differs from the max boost SM
+    # clock reported by nvidia-smi), so we hardcode the spec-sheet values.
+    _PEAK_BF16_FLOPS = {
+        # Ampere
+        "A100":  312e12,
+        "A6000": 309.7e12,
+        # Ada Lovelace
+        "L40S":  362e12,
+        # Hopper
+        "H100 SXM": 989e12,
+        "H100 NVL": 835e12,
+        "H100 PCIe": 756e12,
+        "H200":  989e12,
+        "H20":   148e12,
+        # Blackwell
+        "GB200": 2.5e15,
+        "GB300": 2.5e15,
+        "B300":  2.25e15,
+        "B200":  2.25e15,
+    }
+
+    device_name = torch.cuda.get_device_name(device_index)
+    # Match longest key first so "H100 SXM" matches before "H100"
+    peak = None
+    for key in sorted(_PEAK_BF16_FLOPS, key=len, reverse=True):
+        if key.lower() in device_name.lower():
+            peak = _PEAK_BF16_FLOPS[key]
+            break
+    if peak is None:
+        return None
+
+    if dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        peak *= 2
+    return peak
 
 
 def parse_int_k(s):
@@ -271,6 +316,7 @@ def main():
     dtype = torch.bfloat16
     dtype_gen = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
     device = 'cuda'
+    peak_flops = get_peak_flops(0, dtype=dtype)
     page_size = None
     softcap = 0.0
     deterministic = args.deterministic
@@ -306,9 +352,10 @@ def main():
             g = torch.randn(batch_size, seqlen_q, nheads, headdim_v, device=device, dtype=dtype_gen)
 
             # Varlen tensors
-            q_unpad = k_unpad = v_unpad = cu_seqlens_q = cu_seqlens_k = None
+            q_unpad = k_unpad = v_unpad = g_unpad = cu_seqlens_q = cu_seqlens_k = None
             if varlen:
                 q_unpad, k_unpad, v_unpad = [rearrange(x.detach(), "b s h d -> (b s) h d").requires_grad_(has_backward) for x in [q, k, v]]
+                g_unpad = rearrange(g.detach(), "b s h d -> (b s) h d")
                 cu_seqlens_q = torch.arange(batch_size + 1, device=device, dtype=torch.int32) * seqlen_q
                 cu_seqlens_k = torch.arange(batch_size + 1, device=device, dtype=torch.int32) * seqlen if page_size is None else None
 
@@ -328,7 +375,7 @@ def main():
                     q=q, k=k, v=v, g=g, causal=causal,
                     headdim=headdim, headdim_v=headdim_v, dtype=dtype,
                     has_backward=has_backward,
-                    varlen=varlen, q_unpad=q_unpad, k_unpad=k_unpad, v_unpad=v_unpad,
+                    varlen=varlen, q_unpad=q_unpad, k_unpad=k_unpad, v_unpad=v_unpad, g_unpad=g_unpad,
                     cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
                     seqlen_q=seqlen_q, seqlen=seqlen,
                     page_size=page_size, k_paged=k_paged, v_paged=v_paged, page_table=page_table,
@@ -341,12 +388,12 @@ def main():
                     fwd_fn, bwd_fn = setup_fn(ctx)
                     if fwd_fn is not None and has_forward:
                         time.sleep(1.0)
-                        print(f"Benchmarking {display_name} fwd, hdim={headdim}, seqlen={seqlen}, causal={causal}")
+                        print(f"Benchmarking {display_name} fwd, hdim={headdim}, seqlen={seqlen}, causal={causal}, {nheads=}, {nheads_kv=}")
                         ms = do_bench(fwd_fn, warmup=warmup, rep=rep) * 1e-3
                         time_f[cfg, display_name] = ms
                     if bwd_fn is not None and has_backward:
                         time.sleep(1.0)
-                        print(f"Benchmarking {display_name} bwd, hdim={headdim}, seqlen={seqlen}, causal={causal}")
+                        print(f"Benchmarking {display_name} bwd, hdim={headdim}, seqlen={seqlen}, causal={causal}, {nheads=}, {nheads_kv=}, {deterministic=}")
                         ms = do_bench(bwd_fn, warmup=warmup, rep=rep) * 1e-3
                         time_b[cfg, display_name] = ms
 
@@ -357,7 +404,7 @@ def main():
     if not shown_backends:
         return
 
-    col_w = 16
+    col_w = 20 if peak_flops is not None else 16
 
     for direction, times, flops_mult in [("FWD", time_f, 1.0), ("BWD", time_b, 2.5)]:
         if not times:
@@ -366,11 +413,12 @@ def main():
         if not configs:
             continue
 
+        col_label = "ms / TFLOPS / MFU%" if peak_flops is not None else "ms / TFLOPS"
         header = f"{'hdim':>9} {'causal':>6} {'batch':>5} {'seqlen':>6}"
         for b in shown_backends:
             header += f" {b:>{col_w}}"
         print(f"\n{'=' * len(header)}")
-        print(f"  {direction} (ms / TFLOPS)")
+        print(f"  {direction} ({col_label})")
         print(f"{'=' * len(header)}")
         print(header)
         print("-" * len(header))
@@ -385,7 +433,11 @@ def main():
                 if t is not None:
                     tflops = flops_mult * nFLOPS / t * 1e-12
                     ms = t * 1e3
-                    cell = f"{ms:.2f}/{tflops:.0f}"
+                    if peak_flops is not None:
+                        mfu = flops_mult * nFLOPS / t / peak_flops * 100
+                        cell = f"{ms:.2f}/{tflops:.0f}/{mfu:.1f}%"
+                    else:
+                        cell = f"{ms:.2f}/{tflops:.0f}"
                     row += f" {cell:>{col_w}}"
                 else:
                     row += f" {'—':>{col_w}}"

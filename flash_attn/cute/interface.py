@@ -64,6 +64,7 @@ from flash_attn.cute.flash_fwd_combine import FlashAttentionForwardCombine
 
 from flash_attn.cute.block_sparsity import (
     BlockSparseTensorsTorch,
+    get_sparse_q_block_size,
     to_cute_block_sparse_tensors,
     normalize_block_sparse_config,
     normalize_block_sparse_config_bwd,
@@ -124,20 +125,27 @@ class FwdConfig:
     intra_wg_overlap: bool
 
 
-def _tile_size_fwd_sm90(head_dim, head_dim_v, is_causal, is_local, use_block_sparsity):
+def _tile_size_fwd_sm90(head_dim, head_dim_v, is_causal, is_local, sparse_block_size_q=None):
     """Return FwdConfig for SM90 forward.
 
     Tile sizes and flags based on tile_size_fwd_sm90 in hopper/tile_size.h, adjusted
     for the Python kernel's different register/smem tradeoffs (benchmarked on H100 SXM).
+
+    When sparse_block_size_q is set, tile_m must divide it. For head_dim <= 96 the
+    optimal tile_m=192 is used when compatible, otherwise we fall back to 128.
     """
     if head_dim <= 64:
         # C++: 192×192 non-causal, 192×128 causal/local.
         # Python: 192×128 RS+OL is consistently best across seqlens.
+        if sparse_block_size_q is not None and sparse_block_size_q % 192 != 0:
+            return FwdConfig(128, 128, True, True)
         return FwdConfig(192, 128, True, True)
     elif head_dim <= 96:
         # C++: 192×144 noRS+OL for all cases.
         # Python: RS is catastrophic with 192× tiles (~300 vs ~600 TFLOPS).
         # noRS+OL is always required. Causal: 192×128 slightly better short seqlen.
+        if sparse_block_size_q is not None and sparse_block_size_q % 192 != 0:
+            return FwdConfig(128, 128, False, True)
         if is_causal or is_local:
             return FwdConfig(192, 128, False, True)
         else:
@@ -150,7 +158,6 @@ def _tile_size_fwd_sm90(head_dim, head_dim_v, is_causal, is_local, use_block_spa
     else:  # hdim 256
         tile_n = 64 if is_local else 80
         return FwdConfig(128, tile_n, True, True)
-
 
 @dataclass(frozen=True)
 class BwdConfig:
@@ -169,7 +176,7 @@ class BwdConfig:
     dQ_single_wg: bool = False
 
 
-def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local):
+def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q=None):
     """Return BwdConfig for SM90.
 
     Configs based on C++ FA3 hopper/flash_bwd_launch_template.h,
@@ -196,6 +203,8 @@ def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local):
         # C++ FA3: causal/local: 64, 128; non-causal: 80, 128 with dQ_swapAB
         is_causal_or_local = causal or local
         m_block_size = 64 if is_causal_or_local else 80
+        if sparse_block_size_q is not None and sparse_block_size_q % m_block_size != 0:
+            m_block_size = 64
         return BwdConfig(
             m_block_size=m_block_size,
             n_block_size=128,
@@ -448,12 +457,10 @@ def _flash_attn_fwd(
         causal, window_size_left, window_size_right, mask_mod
     )
 
-    # In fake mode (CPU-only compilation), use a fake stream placeholder.
-    current_stream = (
-        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-        if is_fake_mode()
-        else cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    )
+    requested_use_clc_scheduler = utils._get_use_clc_scheduler_default()
+    requested_disable_2cta = utils._get_disable_2cta_default()
+
+    current_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
     # SM80/SM120: uses SM80 MMA, 128 threads (4 warps)
     if arch // 10 in [8, 12]:
@@ -472,7 +479,8 @@ def _flash_attn_fwd(
         elif arch // 10 == 8:
             fwd_cfg = FwdConfig(128, 64, True, True)  # SM80, should tune
         elif arch // 10 == 9:
-            fwd_cfg = _tile_size_fwd_sm90(head_dim, head_dim_v, causal, local, use_block_sparsity)
+            sparse_q = get_sparse_q_block_size(block_sparse_tensors, seqlen_q)
+            fwd_cfg = _tile_size_fwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q=sparse_q)
     else:
         fwd_cfg = FwdConfig(tile_mn[0], tile_mn[1], fwd_cfg.mma_pv_is_rs, fwd_cfg.intra_wg_overlap)
     tile_m, tile_n = fwd_cfg.m_block_size, fwd_cfg.n_block_size
@@ -484,10 +492,6 @@ def _flash_attn_fwd(
     # TODO: fix GQA + SplitKV + non-varlen
     if pack_gqa and num_splits != 1 and cu_seqlens_q is None:
         pack_gqa = False
-
-    if arch // 10 in [10, 11]:
-        if pack_gqa and (128 % qhead_per_kvhead != 0):
-            pack_gqa = False
 
     if max_seqlen_q is None:
         max_seqlen_q = seqlen_q if cu_seqlens_q is None else total_q
@@ -525,6 +529,7 @@ def _flash_attn_fwd(
 
     use_2cta_instrs = (
         arch // 10 in [10, 11]
+        and not requested_disable_2cta
         and not causal
         and not local
         and not is_split_kv
@@ -532,9 +537,10 @@ def _flash_attn_fwd(
         and seqused_q is None
         and not use_block_sparsity
         and page_size in [None, 128]
-        and int(math.ceil(head_dim / 16) * 16) == 128
+        and int(math.ceil(head_dim / 16) * 16) in [128, 192]
         and int(math.ceil(head_dim_v / 16) * 16) == 128
         and seqlen_q_packgqa > 2 * tile_m
+        and (tile_m % qhead_per_kvhead == 0 or not pack_gqa)
     )
 
     # hash score and mask mods for compile cache
@@ -623,11 +629,12 @@ def _flash_attn_fwd(
         is_split_kv,
         pack_gqa,
         arch,
-        page_size not in [None, 128],  # paged KV non-TMA
+        page_size not in [None, tile_n],  # paged KV non-TMA
         use_2cta_instrs,
         q_subtile_factor,
         mma_pv_is_rs,
         intra_wg_overlap,
+        requested_use_clc_scheduler,
         fa_logging.get_fa_log_level(),
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
@@ -688,7 +695,6 @@ def _flash_attn_fwd(
                 has_aux_tensors=aux_tensors is not None,
             )
         elif arch // 10 == 9:
-            assert page_table is None, "paged KV not supported on SM 9.0"
             assert not is_split_kv, "SplitKV not supported on SM 9.0"
             fa_fwd = FlashAttentionForwardSm90(
                 dtype,
@@ -710,6 +716,7 @@ def _flash_attn_fwd(
                 score_mod=score_mod,
                 has_aux_tensors=aux_tensors is not None,
                 q_subtile_factor=q_subtile_factor,
+                paged_kv_non_tma=page_size not in [None, tile_n],
             )
         elif arch // 10 in [10, 11]:
             fa_fwd = FlashAttentionForwardSm100(
@@ -731,10 +738,11 @@ def _flash_attn_fwd(
                 score_mod=score_mod,
                 mask_mod=mask_mod,
                 has_aux_tensors=aux_tensors is not None,
-                paged_kv_non_tma=page_size not in [None, 128],
+                paged_kv_non_tma=page_size not in [None, tile_n],
                 is_varlen_q=cu_seqlens_q is not None or seqused_q is not None,
                 q_subtile_factor=q_subtile_factor,
                 use_2cta_instrs=use_2cta_instrs,
+                use_clc_scheduler=requested_use_clc_scheduler,
             )
         elif arch // 10 == 12:
             # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
@@ -771,7 +779,6 @@ def _flash_attn_fwd(
             o_tensor,
             lse_tensor,
             softmax_scale,
-            current_stream,
             cu_seqlens_q_tensor,
             cu_seqlens_k_tensor,
             seqused_q_tensor,
@@ -782,6 +789,7 @@ def _flash_attn_fwd(
             learnable_sink_tensor,
             sparse_tensors,
             cute_aux_tensors,
+            current_stream,
             options="--enable-tvm-ffi",
         )
 
@@ -797,7 +805,6 @@ def _flash_attn_fwd(
             out.detach() if not is_split_kv else out_partial,
             lse_partial if is_split_kv else lse,
             softmax_scale,
-            current_stream,
             cu_seqlens_q,
             cu_seqlens_k,
             seqused_q,
@@ -1002,6 +1009,9 @@ def _flash_attn_bwd(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     arch = _get_device_arch()
     assert arch // 10 in [9, 10, 11, 12], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x, 12.x"
+    sparse_q = None
+    if block_sparse_tensors is not None and arch // 10 == 9:
+        sparse_q = block_sparse_tensors.block_size[0] if block_sparse_tensors.block_size is not None else 128
 
     num_head, head_dim = q.shape[-2:]
     head_dim_v = v.shape[-1]
@@ -1035,7 +1045,13 @@ def _flash_attn_bwd(
         assert mask_mod is None, "mask_mod backward not supported on SM 12.0"
         assert deterministic is False, "deterministic backward not supported on SM 12.0"
     elif arch // 10 == 9:
-        cfg = _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local)
+        cfg = _tile_size_bwd_sm90(
+            head_dim,
+            head_dim_v,
+            causal,
+            local,
+            sparse_block_size_q=sparse_q,
+        )
         m_block_size = cfg.m_block_size
         n_block_size = cfg.n_block_size
         num_stages_Q = cfg.num_stages_Q
@@ -1064,11 +1080,13 @@ def _flash_attn_bwd(
         dKV_swapAB = False
         AtomLayoutMdQ = 1
         AtomLayoutNdKV = 1
+        requested_disable_2cta = utils._get_disable_2cta_default()
         disable_2cta = (
-            local
+            requested_disable_2cta
             or score_mod is not None
             or score_mod_bwd is not None
             or mask_mod is not None
+            or block_sparse_tensors is not None
         )
         cluster_size = 2 if head_dim >= 128 and not disable_2cta else 1
         use_2cta_instrs = cluster_size==2
@@ -1096,16 +1114,7 @@ def _flash_attn_bwd(
     num_head_kv = k.shape[-2]
 
     use_block_sparsity = block_sparse_tensors is not None
-
-    # SM90 block-sparse backward: tile_m=64 is the GCD between a m_block_size that fits,
-    # the base block_m of 128 from forward, and block-sparse size for subtiling.
-    if arch // 10 == 9 and use_block_sparsity:
-        m_block_size = 64
-        # dQ_swapAB tuning: use False when m_block_size=64 (same as causal case)
-        dQ_swapAB = False
-
-    # NB: this could be derived from the block_sparse_tensors but for now we hardcode it to 2
-    subtile_factor = 2
+    subtile_factor = sparse_q // m_block_size if sparse_q is not None else 2
     seqlen_q_rounded = (seqlen_q + m_block_size - 1) // m_block_size * m_block_size
     seqlen_k_rounded = (seqlen_k + n_block_size - 1) // n_block_size * n_block_size
     num_n_blocks = seqlen_k_rounded // n_block_size
@@ -1253,11 +1262,7 @@ def _flash_attn_bwd(
             )
 
     dtype = torch2cute_dtype_map[q.dtype]
-    current_stream = (
-        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
-        if is_fake_mode()
-        else cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-    )
+    current_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
     if deterministic:
         dQ_semaphore = torch.zeros(batch_size, num_head, seqlen_q_rounded // m_block_size, cluster_size, dtype=torch.int32, device=device)
@@ -1489,7 +1494,6 @@ def _flash_attn_bwd(
             dk_tensor if not dKV_postprocess else dk_accum_tensor,
             dv_tensor if not dKV_postprocess else dv_accum_tensor,
             softmax_scale,
-            current_stream,
             cu_seqlens_q_tensor,
             cu_seqlens_k_tensor,
             seqused_q_tensor,
@@ -1502,6 +1506,7 @@ def _flash_attn_bwd(
             dV_semaphore_tensor,
             cute_aux_tensors,
             sparse_tensors_compile,
+            current_stream,
             options="--enable-tvm-ffi",
         )
     if not is_fake_mode():
@@ -1516,7 +1521,6 @@ def _flash_attn_bwd(
             dk if not dKV_postprocess else dk_accum,
             dv if not dKV_postprocess else dv_accum,
             softmax_scale,
-            current_stream,
             cu_seqlens_q,
             cu_seqlens_k,
             seqused_q,

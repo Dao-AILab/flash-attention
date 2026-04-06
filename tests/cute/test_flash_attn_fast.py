@@ -32,7 +32,7 @@ IS_SM90 = torch.cuda.get_device_capability()[0] == 9
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("mha_type", ["mha", "gqa"])
+@pytest.mark.parametrize("mha_type", ["mha", "gqa", "mqa"])
 @pytest.mark.parametrize("num_splits", [1, 3])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("d", [64, 128])
@@ -55,7 +55,7 @@ def test_flash_attn_output(seqlen_q, seqlen_k, d, causal, num_splits, mha_type, 
     torch.cuda.empty_cache()
     batch_size = 4
     nheads = 6
-    nheads_kv = nheads if mha_type == "mha" else 3
+    nheads_kv = nheads if mha_type == "mha" else (3 if mha_type == "gqa" else 1)
 
     q_ref = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype).to(dtype).requires_grad_()
     k_ref = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype).to(dtype).requires_grad_()
@@ -108,7 +108,7 @@ def test_flash_attn_output(seqlen_q, seqlen_k, d, causal, num_splits, mha_type, 
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("mha_type", ["mha", "gqa"])
+@pytest.mark.parametrize("mha_type", ["mha", "gqa", "mqa"])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("d", [64, 128])
 @pytest.mark.parametrize("seqlen", [128, 256, 1024])
@@ -121,7 +121,7 @@ def test_flash_attn_varlen_output(seqlen, d, causal, mha_type, dtype):
     random.seed(seed)
     batch_size = 9
     nheads = 6
-    nheads_kv = nheads if mha_type == "mha" else 3
+    nheads_kv = nheads if mha_type == "mha" else (3 if mha_type == "gqa" else 1)
 
     q_ref = torch.randn(batch_size, seqlen, nheads, d, device=device, dtype=dtype).to(dtype).requires_grad_()
     k_ref = torch.randn(batch_size, seqlen, nheads_kv, d, device=device, dtype=dtype).to(dtype).requires_grad_()
@@ -177,7 +177,7 @@ def test_flash_attn_varlen_output(seqlen, d, causal, mha_type, dtype):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("mha_type", ["mha", "gqa"])
+@pytest.mark.parametrize("mha_type", ["mha", "gqa", "mqa"])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("d", [64, 128])
 @pytest.mark.parametrize("seqlen", [128, 256])
@@ -194,7 +194,7 @@ def test_flash_attn_varlen_unpad_output(seqlen, d, causal, mha_type, unpad_q, un
     random.seed(seed)
     batch_size = 9
     nheads = 6
-    nheads_kv = nheads if mha_type == "mha" else 3
+    nheads_kv = nheads if mha_type == "mha" else (3 if mha_type == "gqa" else 1)
 
     q = torch.randn(batch_size, seqlen, nheads, d, device=device, dtype=dtype)
     k = torch.randn(batch_size, seqlen, nheads_kv, d, device=device, dtype=dtype)
@@ -271,6 +271,14 @@ def test_flash_attn_varlen_unpad_output(seqlen, d, causal, mha_type, unpad_q, un
 
     g = torch.randn_like(out_unpad)
     dq_in, dk_in, dv_in = torch.autograd.grad(out_unpad, (q_in, k_in, v_in), g)
+
+    # Mask out padding positions again
+    k_mask = rearrange(key_padding_mask, "b s -> b s 1 1")
+    if not unpad_q:
+        dq_in = dq_in.clone().masked_fill_(~q_mask, 0.0)
+    if not unpad_kv:
+        dk_in = dk_in.clone().masked_fill_(~k_mask, 0.0)
+        dv_in = dv_in.clone().masked_fill_(~k_mask, 0.0)
 
     assert dq_in.isfinite().all(), "dq contains non-finite values"
     assert dk_in.isfinite().all(), "dk contains non-finite values"

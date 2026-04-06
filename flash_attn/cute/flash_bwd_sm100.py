@@ -84,7 +84,6 @@ class FlashAttentionBackwardSm100:
         self.use_2cta_instrs = bool(
             use_2cta_instrs
             and cluster_size == 2
-            and not is_local
             and score_mod is None
             and score_mod_bwd is None
             and mask_mod is None
@@ -453,7 +452,6 @@ class FlashAttentionBackwardSm100:
         mdK: cute.Tensor,
         mdV: cute.Tensor,
         softmax_scale: Float32,
-        stream: cuda.CUstream,
         mCuSeqlensQ: Optional[cute.Tensor] = None,
         mCuSeqlensK: Optional[cute.Tensor] = None,
         mSeqUsedQ: Optional[cute.Tensor] = None,
@@ -467,6 +465,8 @@ class FlashAttentionBackwardSm100:
         aux_tensors: Optional[list] = None,
         # Block-sparse tensors (Q direction - for iterating m_blocks per n_block):
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
+        stream: cuda.CUstream = None,
     ):
         self.q_dtype = mQ.element_type
         self.k_dtype = mK.element_type
@@ -926,10 +926,6 @@ class FlashAttentionBackwardSm100:
             assert blocksparse_tensors is None, (
                 "2-CTA mode does not support block sparsity. "
                 "Please create kernel with use_2cta_instrs=False for block sparse attention."
-            )
-            assert window_size_left is None and window_size_right is None, (
-                "2-CTA mode does not support window attention. "
-                "Please create kernel with use_2cta_instrs=False for window attention."
             )
         # 2-CTA: 231424 and 1-CTA: 232448
         # print("SMEM: ", self.shared_storage.size_in_bytes())

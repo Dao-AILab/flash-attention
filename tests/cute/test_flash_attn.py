@@ -34,7 +34,7 @@ from flash_attn.cute.interface import (
 # When operating fake tensors, we cannot perform data-dependent operations (e.g., `tensor.max()`).
 USE_FAKE_TENSOR = int(os.getenv("FLASH_ATTENTION_FAKE_TENSOR", 0)) == 1
 DISABLE_SPLIT = os.getenv("FLASH_ATTENTION_DISABLE_SPLIT", "FALSE") == "TRUE"
-# SplitKV and paged KV are not supported on SM90
+# SplitKV is not supported on SM90
 IS_SM90 = torch.cuda.get_device_capability()[0] == 9
 IS_SM100 = torch.cuda.get_device_capability()[0] == 10
 TEST_BWD_ONLY = False
@@ -297,8 +297,6 @@ def test_flash_attn_output(
             # and False
             and not ((causal or local) and seqlen_k < seqlen_q)
         ):
-            if d == 192 and local:
-                pytest.xfail("hdim 192 backward: local attention not supported yet")
             if d > 192 and IS_SM90:
                 pytest.xfail("hdim > 192 backward: SM90 not supported yet")
             if d != dv and mha_type != "mha" and IS_SM90:
@@ -405,7 +403,7 @@ def test_flash_attn_output(
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128])
 # @pytest.mark.parametrize("d", [64, 96, 128])
 # @pytest.mark.parametrize("d", [128, 192])
-@pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("d", [64, 128, 192])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -716,16 +714,26 @@ def test_flash_attn_varlen_output(
                 continue
             if query_unused_mask is not None:
                 out.masked_fill_(q_zero_masking, 0.0)
-            print(f"Output max diff: {(out - out_ref).abs().max().item()}")
-            print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
+            # When unpad_q=False with seqused_q, the kernel doesn't write positions
+            # beyond seqused_q, so those contain uninitialized values. Mask them out
+            # before comparing.
+            out_cmp, out_ref_cmp, out_pt_cmp = out, out_ref, out_pt
+            if not unpad_q and seqused_q is not None:
+                seqused_mask = torch.arange(seqlen_q, device=device)[None, :] < seqused_q[:, None]
+                seqused_mask = rearrange(seqused_mask, "b s -> b s 1 1")
+                out_cmp = out.clone().masked_fill_(~seqused_mask, 0.0)
+                out_ref_cmp = out_ref.clone().masked_fill_(~seqused_mask, 0.0)
+                out_pt_cmp = out_pt.clone().masked_fill_(~seqused_mask, 0.0)
+            print(f"Output max diff: {(out_cmp - out_ref_cmp).abs().max().item()}")
+            print(f"Output mean diff: {(out_cmp - out_ref_cmp).abs().mean().item()}")
             # if not causal:
             #     print(f"LSE max diff: {(lse - lse_ref).abs().max().item()}")
             # breakpoint()
 
             # Check that FlashAttention's numerical error is at most 3x the numerical error
             # of a Pytorch implementation.
-            assert (out - out_ref).abs().max().item() <= rtol * (
-                out_pt - out_ref
+            assert (out_cmp - out_ref_cmp).abs().max().item() <= rtol * (
+                out_pt_cmp - out_ref_cmp
             ).abs().max().item() + fwd_atol
 
         if (
@@ -737,8 +745,6 @@ def test_flash_attn_varlen_output(
             and not has_learnable_sink
             # and False
         ):
-            if d == 192 and local:
-                pytest.xfail("hdim 192 backward: local attention not supported yet")
             if d > 192 and IS_SM90:
                 pytest.xfail("hdim > 192 backward: SM90 not supported yet")
             if d != dv and mha_type != "mha" and IS_SM90:
@@ -943,8 +949,6 @@ def test_flash_attn_kvcache(
 ):
     if page_size is not None and seqlen_k % page_size != 0:
         pytest.skip()
-    if page_size is not None and IS_SM90:
-        pytest.xfail("paged KV not supported on SM90")
     if seqlen_q > seqlen_k and new_kv:
         pytest.skip()
     if not new_kv and rotary_fraction > 0.0:
@@ -1632,6 +1636,58 @@ def _generate_block_kvcache(
         b=batch_size,
     )[:, :seqlen_k]
     return k_cache, v_cache, page_table, k_cache_paged, v_cache_paged, num_blocks
+
+
+@pytest.mark.parametrize("page_size", [16, 64, 256])
+@pytest.mark.parametrize("seqlen_q", [64, 128, 256])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_paged_deepseek(seqlen_q, page_size):
+    """Regression test: paged non-TMA with DeepSeek MLA shape (d=192, dv=128).
+    seqlen_q<=128 triggers q_stage=1, seqlen_q>128 triggers q_stage=2.
+    """
+    if IS_SM90:
+        pytest.skip("paged KV not supported on SM90")
+    device = "cuda"
+    dtype = torch.bfloat16
+    d, dv = 192, 128
+    nheads = 16
+    nheads_kv = 16
+
+    torch.random.manual_seed(0)
+    q = torch.randn(seqlen_q, nheads, d, device=device, dtype=dtype)
+    k = torch.randn(seqlen_q, nheads_kv, d, device=device, dtype=dtype)
+    v = torch.randn(seqlen_q, nheads_kv, dv, device=device, dtype=dtype)
+    cu_seqlens = torch.tensor([0, seqlen_q], dtype=torch.int32, device=device)
+
+    # Non-paged reference
+    out_ref, _ = flash_attn_varlen_func(
+        q, k, v, cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
+        max_seqlen_q=seqlen_q, max_seqlen_k=seqlen_q, causal=True,
+    )
+
+    # Paged
+    num_pages = (seqlen_q + page_size - 1) // page_size
+    k_cache_paged = torch.zeros(num_pages, page_size, nheads_kv, d, device=device, dtype=dtype)
+    v_cache_paged = torch.zeros(num_pages, page_size, nheads_kv, dv, device=device, dtype=dtype)
+    for i in range(seqlen_q):
+        k_cache_paged[i // page_size, i % page_size] = k[i]
+        v_cache_paged[i // page_size, i % page_size] = v[i]
+    page_table = torch.arange(num_pages, dtype=torch.int32, device=device).unsqueeze(0)
+    cache_seqlens = torch.tensor([seqlen_q], dtype=torch.int32, device=device)
+
+    out, _ = flash_attn_varlen_func(
+        q, k_cache_paged, v_cache_paged,
+        cu_seqlens_q=cu_seqlens, cu_seqlens_k=None,
+        max_seqlen_q=seqlen_q, max_seqlen_k=None,
+        seqused_k=cache_seqlens, page_table=page_table, causal=True,
+    )
+
+    if is_fake_mode():
+        return
+
+    print(f"Output max diff: {(out - out_ref).abs().max().item()}")
+    print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
+    assert torch.equal(out, out_ref)
 
 
 @pytest.mark.parametrize("head_dim", [4, 148, 288])

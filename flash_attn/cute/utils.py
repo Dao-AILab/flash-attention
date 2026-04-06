@@ -3,12 +3,13 @@
 import math
 import hashlib
 import inspect
+import os
 from typing import Type, Callable, Optional, Tuple, overload
 
 import cutlass
 import cutlass.cute as cute
 
-from cutlass import Float32, const_expr
+from cutlass import Float32, Int32, const_expr
 from cutlass.cute import FastDivmodDivisor
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import nvvm, llvm
@@ -54,6 +55,17 @@ POLY_EX2 = {
         1.86810153536498546600341796875e-3,
     ),
 }
+
+_fa_clc_enabled: bool = os.environ.get("FA_CLC", "0") == "1"
+_fa_disable_2cta_enabled: bool = os.environ.get("FA_DISABLE_2CTA", "0") == "1"
+
+
+def _get_use_clc_scheduler_default() -> bool:
+    return _fa_clc_enabled
+
+
+def _get_disable_2cta_default() -> bool:
+    return _fa_disable_2cta_enabled
 
 
 def _compute_base_hash(func: Callable) -> str:
@@ -248,6 +260,21 @@ def warp_reduce(
         for i in cutlass.range_constexpr(int(math.log2(width))):
             val = op(val, cute.arch.shuffle_sync_bfly(val, offset=1 << i))
     return val
+
+
+@dsl_user_op
+def smid(*, loc=None, ip=None) -> Int32:
+    return Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [],
+            "mov.u32 $0, %smid;",
+            "=r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
 
 
 @dsl_user_op

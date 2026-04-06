@@ -14,7 +14,7 @@
 # https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/blackwell/fmha.py
 
 import math
-from typing import Type, Tuple, Callable, Optional, Literal
+from typing import Tuple, Callable, Optional, Literal
 from functools import partial
 
 import cuda.bindings.driver as cuda
@@ -27,6 +27,7 @@ import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
 from cutlass import pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
+from cutlass.utils import ClcDynamicPersistentTileScheduler
 from cutlass.base_dsl.arch import Arch
 from cutlass.cutlass_dsl import BaseDSL
 
@@ -36,6 +37,7 @@ from flash_attn.cute.paged_kv import PagedKVManager
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import utils
 import flash_attn.cute.pipeline as pipeline_custom
+import cutlass.pipeline as cutlass_pipeline
 from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.softmax import SoftmaxSm100, apply_score_mod_inner
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
@@ -54,12 +56,39 @@ from flash_attn.cute.named_barrier import NamedBarrierFwdSm100
 from cutlass.cute import FastDivmodDivisor
 from quack.cute_dsl_utils import ParamsBase
 from flash_attn.cute.tile_scheduler import (
+    ClcState,
+    SchedulingMode,
     TileSchedulerArguments,
+    TileSchedulerProtocol,
     SingleTileScheduler,
     StaticPersistentTileScheduler,
     SingleTileLPTScheduler,
     SingleTileVarlenScheduler,
 )
+from flash_attn.cute.fa_logging import fa_log, fa_printf
+from flash_attn.cute.utils import smid
+
+# === TUNING KNOBS (agent-editable) ===
+# Keys: (use_2cta_instrs: bool, is_causal: bool, head_dim_padded: int, is_sm103: bool)
+# Values:
+#   ex2_emu_freq: int — how often to use emulated exp2 (0=all hardware exp2, higher=more emulation).
+#                        SM103 has fast native exp2, so set freq=0 there.
+#   ex2_emu_start_frg: int — fragment index to start emulation from
+#   num_regs_softmax: int — register count for softmax warps (multiple of 8)
+#   num_regs_correction: int — register count for correction warps (multiple of 8)
+#   num_regs_other is derived: 512 - num_regs_softmax * 2 - num_regs_correction
+_TUNING_CONFIG = {
+    (True, False, 128, False): {'ex2_emu_freq': 10, 'ex2_emu_start_frg': 1, 'num_regs_softmax': 176, 'num_regs_correction': 88},
+    (False, True, 128, False): {'ex2_emu_freq': 16, 'ex2_emu_start_frg': 1, 'num_regs_softmax': 192, 'num_regs_correction': 72},
+    (True, False, 192, False): {"ex2_emu_freq": 16, "ex2_emu_start_frg": 0, "num_regs_softmax": 184, "num_regs_correction": 80},
+    (False, True, 192, False): {"ex2_emu_freq": 32, "ex2_emu_start_frg": 1, "num_regs_softmax": 192, "num_regs_correction": 72},
+    (True, False, 128, True): {"ex2_emu_freq": 0, "ex2_emu_start_frg": 0, "num_regs_softmax": 176, "num_regs_correction": 80},
+    (False, True, 128, True): {"ex2_emu_freq": 0, "ex2_emu_start_frg": 0, "num_regs_softmax": 176, "num_regs_correction": 64},
+    (True, False, 192, True): {"ex2_emu_freq": 0, "ex2_emu_start_frg": 0, "num_regs_softmax": 176, "num_regs_correction": 64},
+    (False, True, 192, True): {"ex2_emu_freq": 0, "ex2_emu_start_frg": 0, "num_regs_softmax": 176, "num_regs_correction": 72},
+}
+# === END TUNING KNOBS ===
+
 
 class FlashAttentionForwardSm100:
 
@@ -84,6 +113,7 @@ class FlashAttentionForwardSm100:
         paged_kv_non_tma: bool = False,
         is_varlen_q: bool = False,
         use_2cta_instrs: bool = False,
+        use_clc_scheduler: bool = False,
     ):
         self.use_tma_KV = not paged_kv_non_tma
         # self.dtype = dtype
@@ -130,10 +160,6 @@ class FlashAttentionForwardSm100:
         self.is_split_kv = is_split_kv
         self.pack_gqa = pack_gqa
         self.q_subtile_factor = q_subtile_factor
-        if pack_gqa:
-            assert m_block_size % self.qhead_per_kvhead == 0, (
-                "For PackGQA, m_block_size must be divisible by qhead_per_kvhead"
-            )
         assert not (self.is_split_kv and self.head_dim_v_padded >= 192), (
             "SplitKV is not supported for hdim >= 192"
         )
@@ -145,8 +171,10 @@ class FlashAttentionForwardSm100:
         # Does S1 need to wait for S0 to finish
         # self.s0_s1_barrier = self.head_dim_padded in [64, 96] and (not self.is_causal and not self.is_local)
         is_sm103 = self.arch >= Arch.sm_103 and self.arch <= Arch.sm_103f
-        # self.enable_ex2_emu = self.head_dim_padded <= 128 and not is_sm103
-        self.enable_ex2_emu = (self.head_dim_padded <= 128 or (self.head_dim_padded == 192 and self.use_2cta_instrs and not self.is_causal and not self.is_local)) and not is_sm103
+        self.is_sm103 = is_sm103
+        # enable_ex2_emu is derived: True if tuning config has freq > 0, else fallback to default logic
+        _default_enable_ex2_emu = (self.head_dim_padded <= 128 or (self.head_dim_padded == 192 and self.use_2cta_instrs and not self.is_causal and not self.is_local)) and not is_sm103
+        self.enable_ex2_emu = _default_enable_ex2_emu
         self.s0_s1_barrier = False
         self.overlap_sO_sQ = (
             (self.head_dim_padded == 192 and self.head_dim_v_padded >= 64) or
@@ -158,6 +186,32 @@ class FlashAttentionForwardSm100:
         assert self.use_tma_KV or not (self.check_hdim_oob or self.check_hdim_v_oob), (
             "Paged KV does not support irregular head dim"
         )
+
+        self.use_clc_scheduler = (
+            use_clc_scheduler
+            and self.use_tma_KV
+            and not self.overlap_sO_sQ
+        )
+        self.sched_stages = 1
+        if self.use_clc_scheduler:
+            assert self.cluster_shape_mn[1] == 1, f"CLC requires cluster N == 1: {self.cluster_shape_mn}"
+            assert self.cluster_shape_mn[0] in (1, 2), f"bad CLC cluster M: {self.cluster_shape_mn}"
+            assert self.cluster_shape_mn[0] == self.cta_group_size, (
+                f"CLC cluster M != cta_group_size: {self.cluster_shape_mn}, {self.cta_group_size}"
+            )
+
+        self.scheduling_mode = SchedulingMode.CLC if self.use_clc_scheduler else SchedulingMode.STATIC
+
+        if is_varlen_q:
+            self.TileScheduler = SingleTileVarlenScheduler
+        elif self.is_causal or self.is_local or self.use_clc_scheduler:
+            self.TileScheduler = SingleTileLPTScheduler
+        elif self.is_persistent:
+            self.TileScheduler = StaticPersistentTileScheduler
+        else:
+            self.TileScheduler = SingleTileScheduler
+
+        fa_log(1, f"TileScheduler={self.TileScheduler.__name__}, scheduling_mode={self.scheduling_mode.name}, USE_2CTA={self.use_2cta_instrs}")
 
         self.softmax0_warp_ids = (0, 1, 2, 3)
         self.softmax1_warp_ids = (4, 5, 6, 7)
@@ -180,8 +234,10 @@ class FlashAttentionForwardSm100:
             )
         )
 
+        self.use_tma_Q = not (self.pack_gqa and self.m_block_size % self.qhead_per_kvhead != 0)
+
         if self.q_stage == 1:
-            if not self.use_tma_KV:
+            if not self.use_tma_KV or not self.use_tma_Q:
                 self.empty_warp_ids = self.empty_warp_ids + self.load_warp_ids
                 self.load_warp_ids = self.softmax1_warp_ids
             else:
@@ -196,6 +252,8 @@ class FlashAttentionForwardSm100:
             self.epilogue_warp_ids = self.correction_warp_ids
         elif self.is_varlen_q: # fallback
             self.epilogue_warp_ids = (13, 14)
+
+        self.clc_scheduler_warp_id = self.empty_warp_ids[0] if self.use_clc_scheduler else None
 
         self.tmem_s_offset = [0, self.n_block_size]  # e.g., 0, 128
         self.tmem_o_offset = [
@@ -212,31 +270,26 @@ class FlashAttentionForwardSm100:
         # vec buffer for row_max & row_sum
         self.tmem_vec_offset = self.tmem_s_offset
 
+        # Look up tuning config for register counts and ex2_emu params
+        _tune_key = (self.use_2cta_instrs, self.is_causal, self.head_dim_padded, self.is_sm103)
+        self._tune = _TUNING_CONFIG.get(_tune_key, {})
+        if "ex2_emu_freq" in self._tune:
+            self.enable_ex2_emu = self._tune["ex2_emu_freq"] > 0
         if self.head_dim_padded < 96:
             self.num_regs_softmax = 200 if not paged_kv_non_tma else 184
             self.num_regs_correction = 64
             self.num_regs_other = 48 if not paged_kv_non_tma else 80
         else:
-            # self.num_regs_softmax = 192 if self.is_causal or self.is_local else 184
-            if not self.enable_ex2_emu:
-                self.num_regs_softmax = 192 if not paged_kv_non_tma else 184
+            if not paged_kv_non_tma and "num_regs_softmax" in self._tune:
+                self.num_regs_softmax = self._tune["num_regs_softmax"]
+                self.num_regs_correction = self._tune["num_regs_correction"]
+            elif not paged_kv_non_tma:
+                self.num_regs_softmax = 192
+                self.num_regs_correction = 80
             else:
-                # self.num_regs_softmax = 200 if not paged_kv_non_tma else 184
-                self.num_regs_softmax = 192 if not paged_kv_non_tma else 184
-            # self.num_regs_softmax = 176
-            # self.num_regs_correction = 96
-            # self.num_regs_correction = 64 if self.is_causal or self.is_local else 80
-            if not self.enable_ex2_emu:
-                self.num_regs_correction = 80 if not paged_kv_non_tma else 64
-            else:
-                # self.num_regs_correction = 64
-                self.num_regs_correction = 80 if not paged_kv_non_tma else 64
-            # self.num_regs_other = 32
-            # self.num_regs_other = 64
-            # self.num_regs_other = 80
-            self.num_regs_other = 48 if not paged_kv_non_tma else 80
-            # self.num_regs_other = 96 if self.is_causal or self.is_local else 80
-            # self.num_regs_other = 64 if self.is_causal or self.is_local else 80
+                self.num_regs_softmax = 184
+                self.num_regs_correction = 64
+            self.num_regs_other = 512 - self.num_regs_softmax * 2 - self.num_regs_correction
 
         self.buffer_align_bytes = 1024
 
@@ -289,7 +342,6 @@ class FlashAttentionForwardSm100:
         mO: cute.Tensor,  # (b, s_q, h, dv) or (total_q, h, dv) if there is cu_seqlens_q
         mLSE: Optional[cute.Tensor],
         softmax_scale: Float32,
-        stream: cuda.CUstream,
         mCuSeqlensQ: Optional[cute.Tensor] = None,
         mCuSeqlensK: Optional[cute.Tensor] = None,
         mSeqUsedQ: Optional[cute.Tensor] = None,
@@ -300,6 +352,8 @@ class FlashAttentionForwardSm100:
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors: Optional[list] = None,
+        # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
+        stream: cuda.CUstream = None,
     ):
         """Execute the Fused Multi-Head Attention operation on the provided tensors.
 
@@ -352,22 +406,21 @@ class FlashAttentionForwardSm100:
         if const_expr(self.q_dtype != self.v_dtype):
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.v_dtype}")
         self._setup_attributes()
-        self.use_tma_O = self.arch >= Arch.sm_90 and mCuSeqlensQ is None and mSeqUsedQ is None
-        # This can be tuned
-        # This is currently very ad-hoc, we should tune it systematically
+        self.use_tma_O = (
+            self.arch >= Arch.sm_90
+            and mCuSeqlensQ is None
+            and mSeqUsedQ is None
+            and not (self.pack_gqa and self.m_block_size % self.qhead_per_kvhead != 0)
+            and not (self.pack_gqa and self.is_split_kv)
+        )
         self.ex2_emu_freq = 0
-        # self.ex2_emu_start_frg = 1 if self.is_causal else 0
-        self.ex2_emu_start_frg = 1
+        self.ex2_emu_start_frg = self._tune.get("ex2_emu_start_frg", 1)
         if const_expr(self.enable_ex2_emu):
-            self.ex2_emu_freq = 16
-            if const_expr(self.head_dim_padded == 128 and self.use_2cta_instrs):
-                self.ex2_emu_freq = 12
+            self.ex2_emu_freq = self._tune.get("ex2_emu_freq", 16)
             if const_expr(
                 self.pack_gqa and self.head_dim_padded > 64 and not self.is_causal and not self.is_local
             ):
-                self.ex2_emu_freq = 32 if mCuSeqlensQ is not None or mSeqUsedQ is not None else 10
-            if const_expr(self.head_dim_padded > 64 and self.is_causal):
-                self.ex2_emu_freq = 10
+                self.ex2_emu_freq = 32 if mCuSeqlensQ is not None or mSeqUsedQ is not None else self._tune.get("ex2_emu_freq", 10)
 
         cta_group = tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
         q_major_mode = tcgen05.OperandMajorMode.K
@@ -468,14 +521,24 @@ class FlashAttentionForwardSm100:
         tma_load_op = cpasync.CopyBulkTensorTileG2SOp(cta_group)
         tma_store_op = cpasync.CopyBulkTensorTileS2GOp()
 
-        tma_atom_Q, mQ = cute.nvgpu.make_tiled_tma_atom_A(
-            tma_load_op,
-            mQ,
-            cute.select(sQ_layout, mode=[0, 1, 2]),
-            self.mma_tiler_qk,
-            tiled_mma_qk,
-            cta_layout_vmnk.shape,
-        )
+        if const_expr(self.use_tma_Q):
+            tma_atom_Q, mQ = cute.nvgpu.make_tiled_tma_atom_A(
+                tma_load_op,
+                mQ,
+                cute.select(sQ_layout, mode=[0, 1, 2]),
+                self.mma_tiler_qk,
+                tiled_mma_qk,
+                cta_layout_vmnk.shape,
+            )
+            gmem_tiled_copy_Q = None
+        else:
+            tma_atom_Q = None
+            async_copy_elems = 128 // self.q_dtype.width
+            num_load_threads = cute.arch.WARP_SIZE * len(self.load_warp_ids)
+            threads_per_row = math.gcd(self.head_dim_padded // async_copy_elems, num_load_threads)
+            gmem_tiled_copy_Q = copy_utils.tiled_copy_2d(
+                self.q_dtype, threads_per_row, num_load_threads, async_copy_elems, is_async=True
+            )
 
         tma_atom_K = None
         tma_atom_V = None
@@ -524,19 +587,10 @@ class FlashAttentionForwardSm100:
             vO_layout = cute.make_layout((1, async_copy_elems))
             gmem_tiled_copy_O = cute.make_tiled_copy_tv(atom_universal_copy, tO_layout, vO_layout)
 
-        if const_expr(mCuSeqlensQ is not None or mSeqUsedQ is not None):
-            TileScheduler = SingleTileVarlenScheduler
-        else:
-            if const_expr(self.is_causal or self.is_local):
-                TileScheduler = SingleTileLPTScheduler
-            else:
-                TileScheduler = (
-                    SingleTileScheduler
-                    if const_expr(not self.is_persistent)
-                    else StaticPersistentTileScheduler
-                )
+        TileScheduler = self.TileScheduler
+        _num_block_divisor = self.cta_tiler[0] * (self.cta_group_size if not self.is_persistent and self.cta_group_size > 1 else 1)
         tile_sched_args = TileSchedulerArguments(
-            cute.ceil_div(cute.size(mQ.shape[0]), self.cta_tiler[0]),
+            cute.ceil_div(cute.size(mQ.shape[0]), _num_block_divisor),
             cute.size(mQ.shape[2]),
             cute.size(mQ.shape[3])
             if const_expr(mCuSeqlensQ is None)
@@ -559,8 +613,11 @@ class FlashAttentionForwardSm100:
             lpt=self.is_causal or self.is_local,
             is_split_kv=self.is_split_kv,
             cluster_shape_mn=self.cluster_shape_mn,
+            use_cluster_idx=not self.is_persistent and self.cta_group_size > 1,
         )
-        tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
+        tile_sched_params = TileScheduler.to_underlying_arguments(
+            tile_sched_args, scheduling_mode=self.scheduling_mode
+        )
         self.tile_scheduler_cls = TileScheduler
         grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
 
@@ -569,6 +626,9 @@ class FlashAttentionForwardSm100:
             cute.cosize(sQ_layout) if const_expr(not self.overlap_sO_sQ) else
             cutlass.max(cute.cosize(sQ_layout), cute.cosize(sO_layout) * self.o_dtype.width // self.q_dtype.width)
         )
+
+        clc_response_size = self.sched_stages * 4 if self.use_clc_scheduler else 0
+        clc_mbar_size = self.sched_stages * 2 if self.use_clc_scheduler else 0
 
         @cute.struct
         class SharedStorage:
@@ -589,6 +649,13 @@ class FlashAttentionForwardSm100:
             # Smem tensors
             # store row max and row sum
             sScale: cute.struct.MemRange[Float32, self.q_stage * self.m_block_size * 2]
+            # CLC buffers placed here to utilize padding before sO's 1024-byte alignment.
+            # This avoids adding bytes at the end when we're at the smem limit.
+            # PipelineClcFetchAsync expects 2 * sched_stages mbarriers (full + empty).
+            clc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, clc_mbar_size]
+            # CLC response storage (16 bytes per stage, stored as 4 Int32s).
+            clc_response: cute.struct.MemRange[Int32, clc_response_size]
+            # Large TMA buffers with 1024-byte alignment
             sO: cute.struct.Align[
                 cute.struct.MemRange[self.o_dtype, sO_size], self.buffer_align_bytes
             ]
@@ -643,6 +710,7 @@ class FlashAttentionForwardSm100:
             tP_layout,
             sV_layout,
             sO_layout,
+            gmem_tiled_copy_Q,
             gmem_tiled_copy_O,
             tiled_mma_qk,
             tiled_mma_pv,
@@ -673,7 +741,7 @@ class FlashAttentionForwardSm100:
         mSeqUsedQ: Optional[cute.Tensor],
         mSeqUsedK: Optional[cute.Tensor],
         mPageTable: Optional[cute.Tensor],
-        tma_atom_Q: cute.CopyAtom,
+        tma_atom_Q: Optional[cute.CopyAtom],
         tma_atom_K: Optional[cute.CopyAtom],
         tma_atom_V: Optional[cute.CopyAtom],
         tma_atom_O: Optional[cute.CopyAtom],
@@ -688,6 +756,7 @@ class FlashAttentionForwardSm100:
         tP_layout: cute.ComposedLayout,
         sV_layout: cute.ComposedLayout,
         sO_layout: cute.ComposedLayout,
+        gmem_tiled_copy_Q: Optional[cute.TiledCopy],
         gmem_tiled_copy_O: Optional[cute.TiledCopy],
         tiled_mma_qk: cute.TiledMma,
         tiled_mma_pv: cute.TiledMma,
@@ -754,8 +823,8 @@ class FlashAttentionForwardSm100:
 
         ThreadCooperativeGroup = partial(pipeline.CooperativeGroup, pipeline.Agent.Thread)
         mma_warp = ThreadCooperativeGroup(len([self.mma_warp_id]))
-        load_warps = ThreadCooperativeGroup(len(self.load_warp_ids))
         tma_warp = ThreadCooperativeGroup(1)
+        load_threads = ThreadCooperativeGroup(len(self.load_warp_ids) * cute.arch.WARP_SIZE)
         softmax_warps = ThreadCooperativeGroup(len(self.softmax0_warp_ids))
         softmax_threads = ThreadCooperativeGroup(cute.arch.WARP_SIZE * len(self.softmax0_warp_ids))
         # softmax_threads = ThreadCooperativeGroup(cute.arch.WARP_SIZE)
@@ -778,15 +847,25 @@ class FlashAttentionForwardSm100:
         softmax_correction_threads_cluster = ThreadCooperativeGroup(
             cute.arch.WARP_SIZE * len(self.softmax0_warp_ids + self.correction_warp_ids) * self.cta_group_size
         )
-        pipeline_q = pipeline_custom.PipelineTmaUmma.create(
-            barrier_storage=storage.mbar_load_Q.data_ptr(),
-            num_stages=self.q_stage,
-            producer_group=tma_warp,
-            consumer_group=mma_warp,
-            tx_count=self.tma_copy_bytes["Q"],
-            cta_layout_vmnk=cta_layout_vmnk,
-            defer_sync=True,
-        )
+        if const_expr(self.use_tma_Q):
+            pipeline_q = pipeline_custom.PipelineTmaUmma.create(
+                barrier_storage=storage.mbar_load_Q.data_ptr(),
+                num_stages=self.q_stage,
+                producer_group=tma_warp,
+                consumer_group=mma_warp,
+                tx_count=self.tma_copy_bytes["Q"],
+                cta_layout_vmnk=cta_layout_vmnk,
+                defer_sync=True,
+            )
+        else:
+            pipeline_q = pipeline_custom.PipelineAsyncUmma.create(
+                barrier_storage=storage.mbar_load_Q.data_ptr(),
+                num_stages=self.q_stage,
+                producer_group=load_threads,
+                consumer_group=mma_warp,
+                cta_layout_vmnk=cta_layout_vmnk,
+                defer_sync=True,
+            )
         if const_expr(self.use_tma_KV):
             pipeline_kv = pipeline_custom.PipelineTmaUmma.create(
                 barrier_storage=storage.mbar_load_KV.data_ptr(),
@@ -798,13 +877,10 @@ class FlashAttentionForwardSm100:
                 defer_sync=True,
             )
         else:
-            cpasync_producer_group = pipeline.CooperativeGroup(
-                pipeline.Agent.Thread, len(self.load_warp_ids) * cute.arch.WARP_SIZE
-            )
             pipeline_kv = pipeline.PipelineAsyncUmma.create(
                 barrier_storage=storage.mbar_load_KV.data_ptr(),
                 num_stages=self.kv_stage,
-                producer_group=cpasync_producer_group,
+                producer_group=load_threads,
                 consumer_group=mma_warp,
                 cta_layout_vmnk=cta_layout_vmnk,
                 defer_sync=True,
@@ -940,17 +1016,69 @@ class FlashAttentionForwardSm100:
             window_size_right=window_size_right,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
         )
-        TileSchedulerCls = partial(self.tile_scheduler_cls.create, tile_sched_params)
-
         # Cluster wait before tensor memory alloc
         pipeline_init_wait(cluster_shape_mn=cta_layout_vmnk)
 
+        if const_expr(self.use_clc_scheduler):
+            clc_response_ptr = storage.clc_response.data_ptr()
+            clc_mbar_ptr = storage.clc_mbar_ptr.data_ptr()
+
+            clc_pipeline_producer_group = cutlass_pipeline.CooperativeGroup(
+                cutlass_pipeline.Agent.Thread
+            )
+            num_clc_consumer_warps_per_cta = self.threads_per_cta // cute.arch.WARP_SIZE
+            # NB on CTA0 warp15 == scheduler on CTA1 == empty but still both consume
+            num_clc_consumer_warps = num_clc_consumer_warps_per_cta * self.cta_group_size
+            clc_pipeline_consumer_group = cutlass_pipeline.CooperativeGroup(
+                cutlass_pipeline.Agent.Thread, cute.arch.WARP_SIZE * num_clc_consumer_warps
+            )
+
+            block_idx = cute.arch.block_idx()
+            clc = ClcState.create(
+                hw_scheduler=ClcDynamicPersistentTileScheduler.create(
+                    self.tile_scheduler_cls.clc_problem_shape(tile_sched_params),
+                    block_idx,
+                    cute.arch.grid_dim(),
+                    clc_response_ptr,
+                ),
+                pipeline=cutlass_pipeline.PipelineClcFetchAsync.create(
+                    barrier_storage=clc_mbar_ptr,
+                    num_stages=self.sched_stages,
+                    producer_group=clc_pipeline_producer_group,
+                    consumer_group=clc_pipeline_consumer_group,
+                    tx_count=16,
+                    cta_layout_vmnk=cta_layout_vmnk,
+                ),
+                consumer_state=cutlass_pipeline.make_pipeline_state(
+                    cutlass_pipeline.PipelineUserType.Consumer, self.sched_stages
+                ),
+                producer_state=cutlass_pipeline.make_pipeline_state(
+                    cutlass_pipeline.PipelineUserType.Producer, self.sched_stages
+                ),
+            )
+            tile_scheduler = self.tile_scheduler_cls.create(tile_sched_params, clc=clc)
+        else:
+            tile_scheduler = self.tile_scheduler_cls.create(tile_sched_params)
+        assert isinstance(tile_scheduler, TileSchedulerProtocol), f"tile_scheduler is not a TileSchedulerProtocol: {type(tile_scheduler)}"
+
         # ///////////////////////////////////////////////////////////////////////////////
-        #  EMPTY
+        #  EMPTY / CLC SCHEDULER WARP
         # ///////////////////////////////////////////////////////////////////////////////
-        for i in cutlass.range_constexpr(len(self.empty_warp_ids)):
-            if warp_idx == self.empty_warp_ids[i]:
+        if const_expr(self.use_clc_scheduler):
+            if warp_idx == self.clc_scheduler_warp_id:
                 cute.arch.setmaxregister_decrease(self.num_regs_other)
+                if is_leader_cta:
+                    self.clc_scheduler_warp(tile_scheduler)
+                else:
+                    self.empty_warp(tile_scheduler)
+            for i in cutlass.range_constexpr(len(self.empty_warp_ids)):
+                if warp_idx == self.empty_warp_ids[i] and warp_idx != self.clc_scheduler_warp_id:
+                    cute.arch.setmaxregister_decrease(self.num_regs_other)
+                    self.empty_warp(tile_scheduler)
+        else:
+            for i in cutlass.range_constexpr(len(self.empty_warp_ids)):
+                if warp_idx == self.empty_warp_ids[i]:
+                    cute.arch.setmaxregister_decrease(self.num_regs_other)
 
         # ///////////////////////////////////////////////////////////////////////////////
         #  LOAD
@@ -970,13 +1098,14 @@ class FlashAttentionForwardSm100:
                 tma_atom_Q,
                 tma_atom_K,
                 tma_atom_V,
+                gmem_tiled_copy_Q,
                 pipeline_q,
                 pipeline_kv,
                 block_info,
                 num_splits,
                 SeqlenInfoCls,
-                TileSchedulerCls,
                 blocksparse_tensors,
+                tile_scheduler=tile_scheduler,
             )
 
         # ///////////////////////////////////////////////////////////////////////////////
@@ -1006,8 +1135,8 @@ class FlashAttentionForwardSm100:
                 block_info,
                 num_splits,
                 SeqlenInfoCls,
-                TileSchedulerCls,
                 blocksparse_tensors,
+                tile_scheduler=tile_scheduler,
             )
             # Dealloc the tensor memory buffer
             tmem.relinquish_alloc_permit()
@@ -1029,8 +1158,8 @@ class FlashAttentionForwardSm100:
                     block_info,
                     num_splits,
                     SeqlenInfoCls,
-                    TileSchedulerCls,
                     mma_tile_coord_v,
+                    tile_scheduler=tile_scheduler,
                 )
 
         # ///////////////////////////////////////////////////////////////////////////////
@@ -1062,11 +1191,11 @@ class FlashAttentionForwardSm100:
                 num_splits=num_splits,
                 SeqlenInfoCls=SeqlenInfoCls,
                 AttentionMaskCls=AttentionMaskCls,
-                TileSchedulerCls=TileSchedulerCls,
                 aux_tensors=aux_tensors,
                 fastdiv_mods=fastdiv_mods,
                 head_divmod=head_divmod,
                 blocksparse_tensors=blocksparse_tensors,
+                tile_scheduler=tile_scheduler,
             )
 
             if const_expr(not self.s0_s1_barrier):
@@ -1110,8 +1239,8 @@ class FlashAttentionForwardSm100:
                 block_info,
                 num_splits,
                 SeqlenInfoCls,
-                TileSchedulerCls,
                 blocksparse_tensors,
+                tile_scheduler=tile_scheduler,
             )
             tmem_alloc_barrier.arrive()
 
@@ -1129,35 +1258,38 @@ class FlashAttentionForwardSm100:
         sK: cute.Tensor,
         sV: cute.Tensor,
         mPageTable: Optional[cute.Tensor],
-        tma_atom_Q: cute.CopyAtom,
+        tma_atom_Q: Optional[cute.CopyAtom],
         tma_atom_K: Optional[cute.CopyAtom],
         tma_atom_V: Optional[cute.CopyAtom],
+        gmem_tiled_copy_Q: Optional[cute.TiledCopy],
         pipeline_q: pipeline.PipelineAsync,
         pipeline_kv: pipeline.PipelineAsync,
         block_info: BlockInfo,
         num_splits: Int32,
         SeqlenInfoCls: Callable,
-        TileSchedulerCls: Callable,
         blocksparse_tensors: Optional[BlockSparseTensors],
+        tile_scheduler: TileSchedulerProtocol,
     ):
         num_load_threads = len(self.load_warp_ids) * cute.arch.WARP_SIZE
         tidx = cute.arch.thread_idx()[0] % num_load_threads
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        issue_kv_for_this_warp = (
+            const_expr(not self.use_tma_KV or len(self.load_warp_ids) == 1) or
+            warp_idx == self.load_warp_ids[0]
+        )
+        issue_q_for_this_warp = (
+            const_expr(not self.use_tma_Q or len(self.load_warp_ids) == 1) or
+            warp_idx == self.load_warp_ids[0]
+        )
         q_producer_phase = Int32(1)
         kv_producer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Producer, self.kv_stage
         )
-        tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
             mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, head_idx]
-            tiler_gQ = ((self.mma_tiler_qk[0] * self.q_stage), self.head_dim_padded)
-            gQ = cute.local_tile(mQ_cur, tiler_gQ, (m_block, 0))  # (128 * 2, 128)
-            gQ = layout_utils.select(
-                cute.flat_divide(gQ, (self.mma_tiler_qk[0],)), mode=[0, 2, 1]
-            )  # (128, 128, 2)
 
             head_idx_kv = (
                 head_idx // self.qhead_per_kvhead if const_expr(not self.pack_gqa) else head_idx
@@ -1179,12 +1311,32 @@ class FlashAttentionForwardSm100:
                 gV = cute.local_tile(
                     mV_cur, cute.select(self.mma_tiler_pv, mode=[1, 2]), (0, None, None)
                 )
-            tSgQ = thr_mma_qk.partition_A(gQ)
             tSgK = thr_mma_qk.partition_B(gK)
             tOgV = thr_mma_pv.partition_B(gV)
-            load_Q_fn, _, _ = copy_utils.tma_get_copy_fn(
-                tma_atom_Q, 0, cute.make_layout(1), tSgQ, sQ
-            )
+            if const_expr(self.use_tma_Q):
+                tiler_gQ = ((self.mma_tiler_qk[0] * self.q_stage), self.head_dim_padded)
+                gQ = cute.local_tile(mQ_cur, tiler_gQ, (m_block, 0))  # (128 * 2, 128)
+                gQ = layout_utils.select(
+                    cute.flat_divide(gQ, (self.mma_tiler_qk[0],)), mode=[0, 2, 1]
+                )  # (128, 128, 2)
+                tSgQ = thr_mma_qk.partition_A(gQ)
+                load_Q_fn, _, _ = copy_utils.tma_get_copy_fn(
+                    tma_atom_Q, 0, cute.make_layout(1), tSgQ, sQ
+                )
+                load_Q = partial(self.load_Q, load_Q_fn, pipeline_q=pipeline_q, phase=q_producer_phase)
+            else:
+                assert gmem_tiled_copy_Q is not None
+                load_Q = partial(
+                    self.load_Q_non_tma,
+                    mQ_cur,
+                    sQ,
+                    gmem_tiled_copy_Q,
+                    pipeline_q,
+                    tidx,
+                    seqlen.seqlen_q,
+                    m_block,
+                    phase=q_producer_phase,
+                )
 
             if const_expr(self.use_tma_KV):
                 tKsK, tKgK = cpasync.tma_partition(
@@ -1223,7 +1375,6 @@ class FlashAttentionForwardSm100:
                 tKsK, tKgK = None, None
                 tVsV, tVgV = None, None
 
-            load_Q = partial(self.load_Q, load_Q_fn, pipeline_q=pipeline_q, phase=q_producer_phase)
             load_K = partial(
                 self.load_KV,
                 tma_atom_K,
@@ -1258,24 +1409,19 @@ class FlashAttentionForwardSm100:
                     )
                     if const_expr(not self.use_tma_KV):
                         paged_kv_manager.load_page_table(n_block_first)
-                    load_K(block=n_block_max - 1, producer_state=kv_producer_state, page_idx=page_idx)  # K0
+                    if issue_kv_for_this_warp:
+                        load_K(block=n_block_max - 1, producer_state=kv_producer_state, page_idx=page_idx)  # K0
                     # load_K(block=n_block_max - 1, producer_state=kv_producer_state, page_idx=page_idx, extra_tx_count=self.tma_copy_bytes["Q"])  # K0
-                    if const_expr(len(self.load_warp_ids) == 1) or warp_idx == self.load_warp_ids[0]:
-                        # load_Q(block=0, stage=0)  # Q0
-                        pipeline_q.producer_acquire_w_index_phase(0, q_producer_phase)
-                        # pipeline_q.sync_object_empty.wait(0, q_producer_phase)
-                        tma_bar_ptr = pipeline_q.sync_object_full.get_barrier(0)
-                        # tma_bar_ptr = pipeline_kv.producer_get_barrier(kv_producer_state)
-                        load_Q_fn(src_idx=0, dst_idx=0, tma_bar_ptr=tma_bar_ptr)
-                    kv_producer_state.advance()
-                    if const_expr(self.q_stage == 2) and (const_expr(len(self.load_warp_ids) == 1) or warp_idx == self.load_warp_ids[0]):
-                        # load_Q(block=1, stage=1)  # Q1
-                        pipeline_q.producer_acquire_w_index_phase(1, q_producer_phase)
-                        tma_bar_ptr = pipeline_q.sync_object_full.get_barrier(1)
-                        load_Q_fn(src_idx=1, dst_idx=1, tma_bar_ptr=tma_bar_ptr)
+                    if issue_q_for_this_warp:
+                        load_Q(block=0, stage=0)
+                    if issue_kv_for_this_warp:
+                        kv_producer_state.advance()
+                    if const_expr(self.q_stage == 2) and issue_q_for_this_warp:
+                        load_Q(block=1, stage=1)
                     q_producer_phase ^= 1
-                    load_V(block=n_block_max - 1, producer_state=kv_producer_state, page_idx=page_idx)  # V0
-                    kv_producer_state.advance()
+                    if issue_kv_for_this_warp:
+                        load_V(block=n_block_max - 1, producer_state=kv_producer_state, page_idx=page_idx)  # V0
+                        kv_producer_state.advance()
                     for i in cutlass.range(n_block_max - 1 - n_block_min, unroll=1):
                         n_block = n_block_max - 2 - i
                         page_idx = (
@@ -1286,10 +1432,11 @@ class FlashAttentionForwardSm100:
                         if const_expr(not self.use_tma_KV):
                             paged_kv_manager.load_page_table(n_block)
                     # if cute.arch.thread_idx()[0] % 32 == 0: cute.printf("n_block = {}, page_idx = {}", n_block, page_idx)
-                        load_K(block=n_block, producer_state=kv_producer_state, page_idx=page_idx)  # Ki
-                        kv_producer_state.advance()
-                        load_V(block=n_block, producer_state=kv_producer_state, page_idx=page_idx)  # Vi
-                        kv_producer_state.advance()
+                        if issue_kv_for_this_warp:
+                            load_K(block=n_block, producer_state=kv_producer_state, page_idx=page_idx)  # Ki
+                            kv_producer_state.advance()
+                            load_V(block=n_block, producer_state=kv_producer_state, page_idx=page_idx)  # Vi
+                            kv_producer_state.advance()
 
             else:
                 kv_producer_state, q_producer_phase = produce_block_sparse_loads_sm100(
@@ -1308,14 +1455,14 @@ class FlashAttentionForwardSm100:
                     self.q_subtile_factor if self.q_subtile_factor is not None else 1,
                 )
 
-            tile_scheduler.prefetch_next_work()
-            tile_scheduler.advance_to_next_work()
-            work_tile = tile_scheduler.get_current_work()
+
+            work_tile = tile_scheduler.advance_to_next_work()
             # End of persistent scheduler loop
 
-        pipeline_kv.producer_tail(kv_producer_state)
-        # This is equivalent to pipeline_q.producer_tail
-        if const_expr(len(self.load_warp_ids) == 1) or warp_idx == self.load_warp_ids[0]:
+        if issue_kv_for_this_warp:
+            pipeline_kv.producer_tail(kv_producer_state)
+        # This is equivalent to pipeline_q.producer_tail for the TMA-Q producer warp.
+        if issue_q_for_this_warp:
             pipeline_q.producer_acquire_w_index_phase(self.q_stage - 1, q_producer_phase)
 
     @cute.jit
@@ -1338,8 +1485,8 @@ class FlashAttentionForwardSm100:
         block_info: BlockInfo,
         num_splits: Int32,
         SeqlenInfoCls: Callable,
-        TileSchedulerCls: Callable,
         blocksparse_tensors: Optional[BlockSparseTensors],
+        tile_scheduler=None,
     ):
         tSrQ = tiled_mma_qk.make_fragment_A(sQ)
         tSrK = tiled_mma_qk.make_fragment_B(sK)
@@ -1428,7 +1575,6 @@ class FlashAttentionForwardSm100:
         )
         P_full_O_rescaled_phase = Int32(0)
 
-        tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
@@ -1599,8 +1745,7 @@ class FlashAttentionForwardSm100:
                 # End of GEMM_PV1(i_end) (P1 * Vi_end -> O1)
 
             # Advance to next tile
-            tile_scheduler.advance_to_next_work()
-            work_tile = tile_scheduler.get_current_work()
+            work_tile = tile_scheduler.advance_to_next_work()
         # End of persistent scheduler loop
 
         # We don't need pipeline_s_p_o.producer_tail() since there's no dangling mbarrier at the end
@@ -1629,11 +1774,11 @@ class FlashAttentionForwardSm100:
         num_splits: Int32,
         SeqlenInfoCls: Callable,
         AttentionMaskCls: Callable,
-        TileSchedulerCls: Callable,
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
         head_divmod=None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        tile_scheduler=None,
     ):
         """Compute softmax on attention scores from QK matrix multiplication.
 
@@ -1693,7 +1838,6 @@ class FlashAttentionForwardSm100:
 
         warp_idx_in_wg = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
 
-        tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
@@ -1936,8 +2080,7 @@ class FlashAttentionForwardSm100:
             #         gLSE[tidx] = lse
 
             # Advance to next tile
-            tile_scheduler.advance_to_next_work()
-            work_tile = tile_scheduler.get_current_work()
+            work_tile = tile_scheduler.advance_to_next_work()
         # End of persistent scheduler loop
 
         # This is equivalent to pipeline_sm_stats.producer_tail
@@ -2107,8 +2250,8 @@ class FlashAttentionForwardSm100:
         block_info: BlockInfo,
         num_splits: Int32,
         SeqlenInfoCls: Callable,
-        TileSchedulerCls: Callable,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        tile_scheduler=None,
     ):
         tidx = cute.arch.thread_idx()[0] % (cute.arch.WARP_SIZE * len(self.correction_warp_ids))
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
@@ -2138,7 +2281,6 @@ class FlashAttentionForwardSm100:
         o_corr_consumer_phase = Int32(0)
         corr_epi_producer_phase = Int32(1)
 
-        tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
@@ -2149,12 +2291,14 @@ class FlashAttentionForwardSm100:
                 mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3)[None, None, head_idx, split_idx]
             else:
                 mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3)[None, None, head_idx]
-            tiler_gO = ((self.mma_tiler_pv[0] * self.q_stage), self.head_dim_v_padded)
-            gO = cute.local_tile(mO_cur, tiler_gO, (m_block, 0))  # (128 * 2, 128)
-            gO = layout_utils.select(
-                cute.flat_divide(gO, (self.mma_tiler_pv[0],)), mode=[0, 2, 1]
-            )  # (128, 128, 2)
-            gO = cute.flat_divide(gO, (self.mma_tiler_pv[0] // self.cta_group_size,))[None, mma_tile_coord_v, None, None]
+            gO = None
+            if const_expr(self.use_tma_O or not self.pack_gqa):
+                tiler_gO = ((self.mma_tiler_pv[0] * self.q_stage), self.head_dim_v_padded)
+                gO = cute.local_tile(mO_cur, tiler_gO, (m_block, 0))  # (128 * 2, 128)
+                gO = layout_utils.select(
+                    cute.flat_divide(gO, (self.mma_tiler_pv[0],)), mode=[0, 2, 1]
+                )  # (128, 128, 2)
+                gO = cute.flat_divide(gO, (self.mma_tiler_pv[0] // self.cta_group_size,))[None, mma_tile_coord_v, None, None]
 
             # Default LSE to -inf for invalid split_idx tiles
             stats = [(0.0, -Float32.inf if const_expr(mLSE is not None or learnable_sink is not None) else None, True)] * self.q_stage
@@ -2255,6 +2399,7 @@ class FlashAttentionForwardSm100:
                     pipeline_o_acc.consumer_wait_w_index_phase(stage, o_corr_consumer_phase)
                     if const_expr(not self.use_correction_warps_for_epi):
                         pipeline_o_epi.producer_acquire_w_index_phase(stage, corr_epi_producer_phase)
+                    gO_stage = gO[None, None, stage] if const_expr(gO is not None) else None
                     self.correction_epilogue(
                         thr_mma_pv,
                         tOtO[None, None, None, stage],
@@ -2265,7 +2410,7 @@ class FlashAttentionForwardSm100:
                         scale,
                         sO[None, None, stage],
                         mO_cur,
-                        gO[None, None, stage],
+                        gO_stage,
                         gmem_tiled_copy_O,
                     )
                     # Signal for the next work tile that O buffers in tmem are already read, so
@@ -2335,7 +2480,6 @@ class FlashAttentionForwardSm100:
                         mLSE_cur = cute.domain_offset((offset,), mLSE[None, head_idx])
                 for stage in cutlass.range_constexpr(self.q_stage):
                     m_tile_idx = (m_block * self.q_stage + stage) * self.cta_group_size + mma_tile_coord_v
-                    gLSE = cute.local_tile(mLSE_cur, (self.m_block_size,), (m_tile_idx,))
                     row_sum, row_max, acc_O_mn_row_is_zero_or_nan = stats[stage]
                     # if tidx == 0 and stage <= 1:
                     #     cute.printf("row_sum = {}, row_max = {}, acc_O_mn_row_is_zero_or_nan = {}\n", row_sum, row_max, acc_O_mn_row_is_zero_or_nan)
@@ -2350,13 +2494,24 @@ class FlashAttentionForwardSm100:
                         if const_expr(not self.pack_gqa)
                         else seqlen.seqlen_q * self.qhead_per_kvhead
                     )
-                    if tidx < seqlen_q - m_tile_idx * self.m_block_size:
-                        # This actually just works with PackGQA too
-                        gLSE[tidx] = lse
+                    if const_expr(not self.pack_gqa or self.m_block_size % self.qhead_per_kvhead == 0):
+                        gLSE = cute.local_tile(mLSE_cur, (self.m_block_size,), (m_tile_idx,))
+                        if tidx < seqlen_q - m_tile_idx * self.m_block_size:
+                            # This actually just works with PackGQA too
+                            gLSE[tidx] = lse
+                    else:
+                        idx = m_tile_idx * self.m_block_size + tidx
+                        if idx < seqlen_q:
+                            m_idx = idx // self.qhead_per_kvhead
+                            h_idx = idx - m_idx * self.qhead_per_kvhead
+                            lse_ptr_i64 = utils.elem_pointer(mLSE_cur, ((h_idx, m_idx),)).toint()
+                            lse_gmem_ptr = cute.make_ptr(
+                                mLSE_cur.element_type, lse_ptr_i64, cute.AddressSpace.gmem, assumed_align=4
+                            )
+                            cute.make_tensor(lse_gmem_ptr, (1,))[0] = lse
 
             # Advance to next tile
-            tile_scheduler.advance_to_next_work()
-            work_tile = tile_scheduler.get_current_work()
+            work_tile = tile_scheduler.advance_to_next_work()
         # End of persistent scheduler loop
 
         # This is equivalent to pipeline_o_epi.consumer_tail() for the correction warps
@@ -2507,7 +2662,7 @@ class FlashAttentionForwardSm100:
     def _store_O_to_gmem(
         self,
         sO_stage: cute.Tensor,
-        gO: cute.Tensor,
+        gO: Optional[cute.Tensor],
         mO_cur: cute.Tensor,
         gmem_tiled_copy_O: cute.TiledCopy,
         tidx: Int32,
@@ -2518,7 +2673,6 @@ class FlashAttentionForwardSm100:
         gmem_thr_copy_O = gmem_tiled_copy_O.get_slice(tidx)
         tOsO = gmem_thr_copy_O.partition_S(sO_stage)
         cO = cute.make_identity_tensor((self.m_block_size, self.head_dim_v_padded))
-        tOgO = gmem_thr_copy_O.partition_D(gO)
         tOcO = gmem_thr_copy_O.partition_S(cO)
         t0OcO = gmem_tiled_copy_O.get_slice(0).partition_S(cO)
         tOpO = copy_utils.predicate_k(tOcO, limit=mO_cur.shape[1])
@@ -2534,6 +2688,8 @@ class FlashAttentionForwardSm100:
         cute.autovec_copy(tOsO, tOrO)
         # copy acc O from rmem to gmem
         if const_expr(not self.pack_gqa):
+            assert gO is not None
+            tOgO = gmem_thr_copy_O.partition_D(gO)
             for rest_m in cutlass.range_constexpr(cute.size(tOrO.shape[1])):
                 if (
                     t0OcO[0, rest_m, 0][0] < seqlen_q - m_tile_idx * self.m_block_size - tOcO[0][0]
@@ -2562,11 +2718,10 @@ class FlashAttentionForwardSm100:
         block_info: BlockInfo,
         num_splits: int,
         SeqlenInfoCls: Callable,
-        TileSchedulerCls: Callable,
         mma_tile_coord_v: Int32 = 0,
+        tile_scheduler=None,
     ):
         epi_consumer_phase = Int32(0)
-        tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
@@ -2578,12 +2733,14 @@ class FlashAttentionForwardSm100:
                     mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3)[None, None, head_idx, split_idx]
                 else:
                     mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3)[None, None, head_idx]
-                tiler_gO = ((self.mma_tiler_pv[0] * self.q_stage), self.head_dim_v_padded)
-                gO = cute.local_tile(mO_cur, tiler_gO, (m_block, 0))  # (128 * 2, 128)
-                gO = layout_utils.select(
-                    cute.flat_divide(gO, (self.mma_tiler_pv[0],)), mode=[0, 2, 1]
-                )  # (128, 128, 2)
-                gO = cute.flat_divide(gO, (self.mma_tiler_pv[0] // self.cta_group_size,))[None, mma_tile_coord_v, None, None]
+                gO = None
+                if const_expr(self.use_tma_O or not self.pack_gqa):
+                    tiler_gO = ((self.mma_tiler_pv[0] * self.q_stage), self.head_dim_v_padded)
+                    gO = cute.local_tile(mO_cur, tiler_gO, (m_block, 0))  # (128 * 2, 128)
+                    gO = layout_utils.select(
+                        cute.flat_divide(gO, (self.mma_tiler_pv[0],)), mode=[0, 2, 1]
+                    )  # (128, 128, 2)
+                    gO = cute.flat_divide(gO, (self.mma_tiler_pv[0] // self.cta_group_size,))[None, mma_tile_coord_v, None, None]
 
                 if const_expr(self.use_tma_O):
                     store_O, _, _ = copy_utils.tma_get_copy_fn(
@@ -2610,8 +2767,9 @@ class FlashAttentionForwardSm100:
                         pipeline_o_epi.consumer_wait_w_index_phase(stage, epi_consumer_phase)
                         # 2. copy O0 / O1 to gmem
                         m_tile_idx = (m_block * self.q_stage + stage) * self.cta_group_size + mma_tile_coord_v
+                        gO_stage = gO[None, None, stage] if const_expr(gO is not None) else None
                         self._store_O_to_gmem(
-                            sO[None, None, stage], gO[None, None, stage], mO_cur, gmem_tiled_copy_O,
+                            sO[None, None, stage], gO_stage, mO_cur, gmem_tiled_copy_O,
                             tidx, seqlen.seqlen_q, m_tile_idx,
                         )
                         pipeline_o_epi.consumer_release_w_index(stage)
@@ -2619,8 +2777,39 @@ class FlashAttentionForwardSm100:
                 epi_consumer_phase ^= 1
 
             # Advance to next tile
-            tile_scheduler.advance_to_next_work()
-            work_tile = tile_scheduler.get_current_work()
+            work_tile = tile_scheduler.advance_to_next_work()
+
+    @cute.jit
+    def clc_scheduler_warp(
+        self,
+        tile_scheduler: TileSchedulerProtocol,
+    ):
+        work_tile = tile_scheduler.initial_work_tile_info()
+        while work_tile.is_valid_tile:
+            tile_scheduler.prefetch_next_work()
+            work_tile = tile_scheduler.advance_to_next_work()
+            if cute.arch.thread_idx()[0] == self.clc_scheduler_warp_id * cute.arch.WARP_SIZE:
+                fa_printf(
+                    3,
+                    "[CLC] query sm={} cta={} (m_blk={},h={},b={},s={}) valid={}\n",
+                    smid(),
+                    cute.arch.block_idx()[0],
+                    work_tile.tile_idx[0],
+                    work_tile.tile_idx[1],
+                    work_tile.tile_idx[2],
+                    work_tile.tile_idx[3],
+                    work_tile.is_valid_tile,
+                )
+        tile_scheduler.producer_tail()
+
+    @cute.jit
+    def empty_warp(
+        self,
+        tile_scheduler: TileSchedulerProtocol,
+    ):
+        work_tile = tile_scheduler.initial_work_tile_info()
+        while work_tile.is_valid_tile:
+            work_tile = tile_scheduler.advance_to_next_work()
 
     def load_Q(
         self,
@@ -2632,6 +2821,39 @@ class FlashAttentionForwardSm100:
     ):
         pipeline_q.producer_acquire_w_index_phase(stage, phase)
         load_Q_fn(src_idx=block, dst_idx=stage, tma_bar_ptr=pipeline_q.sync_object_full.get_barrier(stage))
+
+    def load_Q_non_tma(
+        self,
+        mQ: cute.Tensor,
+        sQ: cute.Tensor,
+        gmem_tiled_copy_Q: cute.TiledCopy,
+        pipeline_q: pipeline.PipelineAsync,
+        tidx: Int32,
+        seqlen_q: Int32,
+        m_block: Int32,
+        block: Int32,
+        stage: int,
+        phase: Int32,
+    ):
+        assert self.cta_group_size == 1, "cta_group_size must be 1 for non-tma Q load"
+        pipeline_q.producer_acquire_w_index_phase(stage, phase)
+        pack_gqa = PackGQA(
+            self.m_block_size,
+            self.head_dim_padded,
+            self.check_hdim_oob,
+            self.qhead_per_kvhead,
+        )
+        sQ_stage = sQ[None, None, None, stage]
+        sQ_pi = cute.make_tensor(
+            sQ_stage.iterator,
+            cute.make_layout(
+                (sQ_stage.shape[0][0], (sQ_stage.shape[0][1], sQ_stage.shape[2])),
+                stride=(sQ_stage.stride[0][0], (sQ_stage.stride[0][1], sQ_stage.stride[2])),
+            ),
+        )
+        pack_gqa.load_Q(mQ, sQ_pi, gmem_tiled_copy_Q, tidx, m_block * self.q_stage + block, seqlen_q)
+        cute.arch.cp_async_commit_group()
+        pipeline_q.sync_object_full.arrive_cp_async_mbarrier(stage)
 
     @cute.jit
     def load_KV(
@@ -2675,7 +2897,10 @@ class FlashAttentionForwardSm100:
         else:
             assert paged_kv_manager is not None
             assert extra_tx_count is None
-            paged_kv_manager.load_KV(block, sX[None, None, None, stage], K_or_V)
+            sX_cur = sX[None, None, None, stage]
+            if const_expr(self.uneven_kv_smem):
+                sX_cur = self.offset_kv_smem(sX_cur, stage, phase ^ 1)
+            paged_kv_manager.load_KV(block, sX_cur, K_or_V)
             cute.arch.cp_async_commit_group()
             pipeline_kv.sync_object_full.arrive_cp_async_mbarrier(stage)
 
@@ -2686,6 +2911,9 @@ class FlashAttentionForwardSm100:
             # (smem_large + smem_small) // 2. So for stage == 1, move right by offset if
             # phase == 0, or left by offset if phase == 1.
             offset = 0 if stage != 1 else self.uneven_kv_smem_offset * (1 - 2 * phase)
+            # Hint that the offset is 128-bit aligned so that
+            # ptr + offset preserves the alignment needed by cp.async.
+            offset = cute.assume(offset, divby=128 // self.k_dtype.width)
             return cute.make_tensor(sX.iterator + offset, sX.layout)
         else:
             return sX

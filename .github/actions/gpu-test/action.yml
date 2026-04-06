@@ -1,0 +1,67 @@
+name: GPU Test
+description: Compile and run FA4 tests (pull SIF from Docker Hub, cache by tag)
+
+inputs:
+  test-filter:
+    description: pytest -k filter expression
+    required: false
+    default: ""
+  compile-workers:
+    description: parallel workers for Pass 1 kernel compilation
+    required: false
+    default: "64"
+  fa4_image_cu129:
+    description: Docker image for CUDA 12.9 (used when driver does not support CUDA 13.0)
+    required: true
+  fa4_image_cu130:
+    description: Docker image for CUDA 13.0 (used when driver supports CUDA 13.0)
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Select FA4 image based on CUDA version
+      shell: bash
+      run: |
+        # Read max supported CUDA version from nvidia-smi header, e.g. "CUDA Version: 12.9"
+        CUDA_VER=$(nvidia-smi | grep -oP "CUDA Version: \K[0-9]+\.[0-9]+")
+        CUDA_MAJOR=$(echo "$CUDA_VER" | cut -d. -f1)
+        echo "Detected max CUDA version: $CUDA_VER"
+        if [ "$CUDA_MAJOR" -ge 13 ]; then
+          echo "Using cu130 image"
+          echo "FA4_IMAGE=${{ inputs.fa4_image_cu130 }}" >> "$GITHUB_ENV"
+        else
+          echo "Using cu129 image"
+          echo "FA4_IMAGE=${{ inputs.fa4_image_cu129 }}" >> "$GITHUB_ENV"
+        fi
+
+    - name: Pull FA4 SIF
+      shell: bash
+      run: |
+        CI_WORK_DIR="${CI_WORK_DIR:-/scratch/user/$USER}"
+        TAG=$(echo "$FA4_IMAGE" | tr '/: ' '---')
+        SIF="$CI_WORK_DIR/${TAG}.sif"
+        # Apptainer doesn't support tag@digest refs — strip the tag, keep digest only.
+        PULL_REF=$(echo "$FA4_IMAGE" | sed 's/:[^@]*@/@/')
+        echo "PULL_REF=$PULL_REF"
+        echo "SIF=$SIF"
+        mkdir -p "$CI_WORK_DIR/apptainer_tmp" "$CI_WORK_DIR/apptainer_cache"
+        if [ ! -f "$SIF" ]; then
+          echo "Pulling $PULL_REF → $SIF"
+          APPTAINER_TMPDIR="$CI_WORK_DIR/apptainer_tmp" \
+          APPTAINER_CACHEDIR="$CI_WORK_DIR/apptainer_cache" \
+          apptainer pull "$SIF" "docker://$PULL_REF"
+        else
+          echo "Using cached SIF: $SIF"
+        fi
+        # Remove stale SIFs from previous image versions to prevent unbounded disk growth.
+        find "$CI_WORK_DIR" -maxdepth 1 -name "*.sif" ! -name "$(basename "$SIF")" -delete
+        echo "FA4_SIF=$SIF" >> "$GITHUB_ENV"
+
+    - name: Compile and run tests
+      shell: bash
+      run: |
+        python3 "$GITHUB_WORKSPACE/tools/ci/run_fa4_ci.py" \
+          --repo-root "$GITHUB_WORKSPACE" \
+          --test-filter "${{ inputs.test-filter }}" \
+          --compile-workers "${{ inputs.compile-workers }}"
