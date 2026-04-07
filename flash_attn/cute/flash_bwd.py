@@ -790,18 +790,17 @@ class FlashAttentionBackwardSm80:
             if cutlass.const_expr(self.is_dropout):
                 dropout_fn = partial(
                     apply_dropout_mask,
-                    thr_mma=thr_mma_sdp,
                     batch_idx=batch_idx,
                     head_idx=head_idx,
                     nheads=dropout_nheads,
                     n_block=n_block,
                     tile_m=self.m_block_size,
                     tile_n=self.n_block_size,
+                    num_warps_m=self.num_threads // 32,
                     p_keep_uint8=self.p_keep_uint8,
                     rp_dropout=Float32(self.rp_dropout),
                     seed_lo=cutlass.Uint32(dropout_seed_lo),
                     seed_hi=cutlass.Uint32(dropout_seed_hi),
-                    transpose=self.SdP_swapAB,
                 )
 
             compute_one_m_block = partial(
@@ -955,7 +954,11 @@ class FlashAttentionBackwardSm80:
         for r in cutlass.range(cute.size(acc_S_mn, mode=[0]), unroll_full=True):
             acc_S_mn[r, None].store(cute.math.exp2(acc_S_mn[r, None].load() * softmax_scale_log2 - tLSErLSE[r], fastmath=True))
         # Apply dropout mask to recomputed P (same mask as forward)
+        # Save P before dropout for correct backward gradient formula:
+        # dS = P_drop * dP - P * D  (NOT P_drop * (dP - D))
         if cutlass.const_expr(dropout_fn is not None):
+            acc_P = cute.make_fragment(acc_shape_SdP, cutlass.Float32)
+            acc_P.store(acc_S.load())
             dropout_fn(acc_S=acc_S, m_block=m_block)
 
         # MMA dP
@@ -978,15 +981,25 @@ class FlashAttentionBackwardSm80:
         acc_dP_mn = layout_utils.reshape_acc_to_mn(acc_dP)
         # if cute.arch.thread_idx()[0] == 0 and cute.arch.block_idx()[0] == bidx: cute.print_tensor(acc_dP_mn)
         assert cute.size(acc_dP_mn, mode=[0]) == cute.size(tLSErdPsum)
-        for r in cutlass.range(cute.size(acc_dP_mn, mode=[0]), unroll_full=True):
-            grad_val = acc_S_mn[r, None].load() * (acc_dP_mn[r, None].load() - tLSErdPsum[r])
-            if cutlass.const_expr(self.score_mod_bwd is not None):
-                grad_val = self.score_mod_bwd(
-                    grad_val,
-                    acc_S_pre_mn[r, None].load() * softmax_scale,
-                    0, 0, 0, 0, None, [],
+        if cutlass.const_expr(dropout_fn is not None):
+            # Correct gradient: dS = P_drop * dP - P * D
+            # (P_drop is in acc_S_mn, P is in acc_P)
+            acc_P_mn = layout_utils.reshape_acc_to_mn(acc_P)
+            for r in cutlass.range(cute.size(acc_dP_mn, mode=[0]), unroll_full=True):
+                acc_dP_mn[r, None].store(
+                    acc_S_mn[r, None].load() * acc_dP_mn[r, None].load()
+                    - acc_P_mn[r, None].load() * tLSErdPsum[r]
                 )
-            acc_dP_mn[r, None].store(grad_val)
+        else:
+            for r in cutlass.range(cute.size(acc_dP_mn, mode=[0]), unroll_full=True):
+                grad_val = acc_S_mn[r, None].load() * (acc_dP_mn[r, None].load() - tLSErdPsum[r])
+                if cutlass.const_expr(self.score_mod_bwd is not None):
+                    grad_val = self.score_mod_bwd(
+                        grad_val,
+                        acc_S_pre_mn[r, None].load() * softmax_scale,
+                        0, 0, 0, 0, None, [],
+                    )
+                acc_dP_mn[r, None].store(grad_val)
         # if cute.arch.thread_idx()[0] == 0 and cute.arch.block_idx()[0] == bidx: cute.print_tensor(acc_dP_mn)
         rP = cute.make_fragment_like(acc_S, self.dtype)
         rP.store(acc_S.load().to(self.dtype))

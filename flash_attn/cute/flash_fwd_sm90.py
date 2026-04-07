@@ -1101,13 +1101,13 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             if const_expr(self.is_dropout):
                 dropout_fn = partial(
                     apply_dropout_mask,
-                    thr_mma=thr_mma_qk,
                     batch_idx=batch_idx,
                     head_idx=head_idx,
                     nheads=dropout_nheads,
                     m_block=m_block,
                     tile_m=self.tile_m,
                     tile_n=self.tile_n,
+                    num_warps_m=self.num_threads // 32,
                     p_keep_uint8=self.p_keep_uint8,
                     rp_dropout=Float32(self.rp_dropout),
                     seed_lo=cutlass.Uint32(dropout_seed_lo),

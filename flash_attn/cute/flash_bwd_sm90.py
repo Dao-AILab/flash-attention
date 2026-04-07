@@ -1329,18 +1329,17 @@ class FlashAttentionBackwardSm90:
             if const_expr(self.is_dropout):
                 dropout_fn_cur = partial(
                     apply_dropout_mask,
-                    thr_mma=thr_mma_SdP,
                     batch_idx=batch_idx,
                     head_idx=head_idx,
                     nheads=dropout_nheads,
                     n_block=n_block,
                     tile_m=self.tile_m,
                     tile_n=self.tile_n,
+                    num_warps_m=self.num_threads // 32,
                     p_keep_uint8=self.p_keep_uint8,
                     rp_dropout=Float32(self.rp_dropout),
                     seed_lo=cutlass.Uint32(dropout_seed_lo),
                     seed_hi=cutlass.Uint32(dropout_seed_hi),
-                    transpose=self.SdP_swapAB,
                 )
 
             m_block_min, m_block_max = block_info.get_m_block_min_max(seqlen, n_block)
@@ -1542,7 +1541,11 @@ class FlashAttentionBackwardSm90:
                     acc_S_mn[r, c] * softmax_scale_log2 - lse_val, fastmath=True
                 )
         # Apply dropout mask to recomputed P (same mask as forward)
+        # Save P before dropout for correct backward gradient formula:
+        # dS = P_drop * dP - P * D  (NOT P_drop * (dP - D))
         if const_expr(dropout_fn is not None):
+            acc_P = cute.make_fragment(acc_shape_SdP, cutlass.Float32)
+            acc_P.store(acc_S.load())
             dropout_fn(acc_S=acc_S, m_block=m_block)
 
         tLSErdPsum = copy_utils.load_s2r(tLSEsdPsum[None, smem_idx_dO])
@@ -1556,13 +1559,20 @@ class FlashAttentionBackwardSm90:
                 PdS_barrier.arrive_and_wait()
             copy_P_r2s(tdVrP, dst_idx=smem_idx_PdS)
 
-        # (4) [Pointwise 2] dS = P*(dP-dPsum)
+        # (4) [Pointwise 2] dS = P_drop * dP - P * D (correct dropout gradient)
         warpgroup.wait_group(0)
         acc_dP_mn = layout_utils.reshape_acc_to_mn(acc_dP, transpose=self.SdP_swapAB)
-        for r in cutlass.range_constexpr(cute.size(acc_dP_mn, mode=[0])):
-            dpsum_val = self._get_stat(tLSErdPsum, r, lane_idx, shuffle=self.shuffle_dPsum)
-            for c in cutlass.range(cute.size(acc_dP_mn, mode=[1]), unroll_full=True):
-                acc_dP_mn[r, c] = acc_S_mn[r, c] * (acc_dP_mn[r, c] - dpsum_val)
+        if const_expr(dropout_fn is not None):
+            acc_P_mn = layout_utils.reshape_acc_to_mn(acc_P, transpose=self.SdP_swapAB)
+            for r in cutlass.range_constexpr(cute.size(acc_dP_mn, mode=[0])):
+                dpsum_val = self._get_stat(tLSErdPsum, r, lane_idx, shuffle=self.shuffle_dPsum)
+                for c in cutlass.range(cute.size(acc_dP_mn, mode=[1]), unroll_full=True):
+                    acc_dP_mn[r, c] = acc_S_mn[r, c] * acc_dP_mn[r, c] - acc_P_mn[r, c] * dpsum_val
+        else:
+            for r in cutlass.range_constexpr(cute.size(acc_dP_mn, mode=[0])):
+                dpsum_val = self._get_stat(tLSErdPsum, r, lane_idx, shuffle=self.shuffle_dPsum)
+                for c in cutlass.range(cute.size(acc_dP_mn, mode=[1]), unroll_full=True):
+                    acc_dP_mn[r, c] = acc_S_mn[r, c] * (acc_dP_mn[r, c] - dpsum_val)
 
         if const_expr(self.score_mod_bwd is not None):
             score_mod_bwd_fn(acc_dP, acc_S_pre, m_block=m_block)

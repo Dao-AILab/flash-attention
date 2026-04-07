@@ -3113,6 +3113,10 @@ class FlashAttentionBackwardSm100:
                 lane_idx = cute.arch.lane_idx()
                 tSrP_r2t_f32 = cute.make_fragment(tScP_r2t.shape, Float32)  # 64
                 tSrP_r2t = cute.recast_tensor(tSrP_r2t_f32, self.q_dtype)
+                # Save pre-dropout P for correct backward gradient formula:
+                # dS = P_drop * dP - P * D  (NOT P_drop * (dP - D))
+                if cutlass.const_expr(self.is_dropout):
+                    tSrP_pre_drop = cute.make_fragment(tSrS_t2r.shape, Float32)
                 for stage in cutlass.range_constexpr(num_stages):
                     tSrS_cur = tSrS_t2r[None, stage, 0, 0]
                     tSsLSE_cur = tSsLSE[None, stage, 0, 0, consumer_state_LSE.index]
@@ -3141,6 +3145,11 @@ class FlashAttentionBackwardSm100:
                     # SM100 bwd computes S^T = K @ Q^T, so tScS coords are (N, M)
                     # — coord[0] = N-local, coord[1] = M-local. Forward keying
                     # uses Philox(global_row=M, global_col=N), so we swap here.
+                    if cutlass.const_expr(self.is_dropout):
+                        # Save pre-dropout P for correct dS gradient
+                        tSrP_pre_cur = tSrP_pre_drop[None, stage, 0, 0]
+                        for v in cutlass.range_constexpr(cute.size(tSrS_cur)):
+                            tSrP_pre_cur[v] = tSrS_cur[v]
                     if cutlass.const_expr(self.is_dropout):
                         apply_dropout_mask_sm100(
                             acc_S=tSrS_cur,
@@ -3183,7 +3192,8 @@ class FlashAttentionBackwardSm100:
                 pipeline_LSE.consumer_release(consumer_state_LSE)
                 consumer_state_LSE.advance()
                 # ---------------------------------------------
-                # dS.T = P.T * (dP.T - D)
+                # dS.T = P_drop.T * dP.T - P.T * D  (dropout)
+                # dS.T = P.T * (dP.T - D)           (no dropout)
                 # ---------------------------------------------
                 pipeline_dPsum.consumer_wait(consumer_state_dPsum)
                 pipeline_dP.consumer_wait(consumer_state_S_P_dP)
@@ -3206,6 +3216,8 @@ class FlashAttentionBackwardSm100:
                         cute.autovec_copy(tSsdPsum_cur, tSrdPsum)
                     else:
                         tSrdPsum = tSsdPsum_cur[lane_idx]
+                    if cutlass.const_expr(self.is_dropout):
+                        tSrP_pre_cur = tSrP_pre_drop[None, stage, 0, 0]
                     for v in cutlass.range_constexpr(cute.size(tdPrdP_t2r, mode=[0]) // 2):
                         if const_expr(not self.shuffle_dPsum):
                             dPsum_pair = (tSrdPsum[2 * v], tSrdPsum[2 * v + 1])
@@ -3214,15 +3226,35 @@ class FlashAttentionBackwardSm100:
                                 utils.shuffle_sync(tSrdPsum, offset=2 * v),
                                 utils.shuffle_sync(tSrdPsum, offset=2 * v + 1),
                             )
-                        tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1] = (
-                            quack.activation.sub_packed_f32x2(
-                                (tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1]), dPsum_pair
+                        if cutlass.const_expr(self.is_dropout):
+                            # tmp1 = P_drop * dP
+                            tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1] = cute.arch.mul_packed_f32x2(
+                                (tSrS_cur[2 * v], tSrS_cur[2 * v + 1]),
+                                (tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1]),
                             )
-                        )
-                        tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1] = cute.arch.mul_packed_f32x2(
-                            (tSrS_cur[2 * v], tSrS_cur[2 * v + 1]),
-                            (tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1]),
-                        )
+                            # tmp2 = P * D
+                            p_d_0, p_d_1 = cute.arch.mul_packed_f32x2(
+                                (tSrP_pre_cur[2 * v], tSrP_pre_cur[2 * v + 1]),
+                                dPsum_pair,
+                            )
+                            # dS = P_drop * dP - P * D
+                            tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1] = (
+                                quack.activation.sub_packed_f32x2(
+                                    (tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1]),
+                                    (p_d_0, p_d_1),
+                                )
+                            )
+                        else:
+                            # Non-dropout: dS = P * (dP - D)
+                            tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1] = (
+                                quack.activation.sub_packed_f32x2(
+                                    (tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1]), dPsum_pair
+                                )
+                            )
+                            tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1] = cute.arch.mul_packed_f32x2(
+                                (tSrS_cur[2 * v], tSrS_cur[2 * v + 1]),
+                                (tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1]),
+                            )
 
                     if const_expr(self.score_mod_bwd is not None):
                         tSrS_pre_cur = tSrS_pre[None, stage, 0, 0]

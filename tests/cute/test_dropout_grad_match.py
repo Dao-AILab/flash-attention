@@ -6,14 +6,16 @@ uses the same extracted mask. This is the definitive test that the
 forward and backward masks are identical and the implementation is correct.
 
 Forward: flash vs f32 ref should match within bf16 precision (~0.003)
-Backward dv: should match within bf16 precision (~0.004)
-Backward dq/dk: elevated error from P_drop * (dP - D) amplification,
-consistent across runs (NOT a mask mismatch)
+Backward dq/dk/dv: all within ~1-3x of no-dropout baseline error.
+The backward uses the correct gradient formula dS = P_drop * dP - P * D
+(not the approximation P_drop * (dP - D) used in FA2 C++).
 """
 
 import math
 import torch
 import pytest
+
+from flash_attn.cute.testing import attention_ref
 
 
 def extract_dropout_mask(q, k, p_dropout, seed, flash_attn_func, causal=False):
@@ -52,87 +54,71 @@ def attention_dropout_ref(q, k, v, mask, p_dropout, causal=False):
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("p_dropout", [0.1, 0.3])
 def test_dropout_fwd_bwd_with_extracted_mask(causal, p_dropout):
-    """Forward and backward vs f32 reference using the kernel's own mask."""
+    """Forward and backward vs f32 reference using the repo's standard metric.
+
+    Uses the same error metric as test_flash_attn.py:
+      flash_err <= 2 * pt_err + atol
+    where pt_err is the bf16 PyTorch baseline error vs f32 reference.
+    """
     from flash_attn.cute.interface import flash_attn_func
 
     B, S, H, D = 1, 64, 1, 64
     seed = 42
     torch.manual_seed(0)
 
-    q = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
-    k = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
-    v = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
+    q_ref = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16).requires_grad_()
+    k_ref = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16).requires_grad_()
+    v_ref = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16).requires_grad_()
 
     # Extract mask from kernel
-    mask = extract_dropout_mask(q, k, p_dropout, seed, flash_attn_func, causal)
+    mask = extract_dropout_mask(
+        q_ref.detach(), k_ref.detach(), p_dropout, seed, flash_attn_func, causal
+    )
     kept = mask.float().mean().item()
     print(f"[causal={causal} p={p_dropout}] Kept: {kept:.3f}")
 
-    # f32 reference with extracted mask
-    q_ref = q.float().detach().requires_grad_(True)
-    k_ref = k.float().detach().requires_grad_(True)
-    v_ref = v.float().detach().requires_grad_(True)
-    out_ref = attention_dropout_ref(q_ref, k_ref, v_ref, mask, p_dropout, causal)
+    # f32 reference (gold standard) — uses attention_ref from the repo
+    out_ref, _ = attention_ref(
+        q_ref, k_ref, v_ref, dropout_p=p_dropout, dropout_mask=mask,
+        causal=causal, upcast=True,
+    )
+    # bf16 baseline — same metric as test_flash_attn.py
+    out_pt, _ = attention_ref(
+        q_ref, k_ref, v_ref, dropout_p=p_dropout, dropout_mask=mask,
+        causal=causal, upcast=False, reorder_ops=True,
+    )
 
     # Flash forward + backward
-    q2 = q.detach().requires_grad_(True)
-    k2 = k.detach().requires_grad_(True)
-    v2 = v.detach().requires_grad_(True)
-    out_flash, _ = flash_attn_func(q2, k2, v2, causal=causal, dropout_p=p_dropout, dropout_seed=seed)
+    q = q_ref.detach().requires_grad_(True)
+    k = k_ref.detach().requires_grad_(True)
+    v = v_ref.detach().requires_grad_(True)
+    out_flash, _ = flash_attn_func(q, k, v, causal=causal, dropout_p=p_dropout, dropout_seed=seed)
 
-    # Forward check (causal has higher baseline error from mask interaction)
-    fwd_err = (out_flash.float() - out_ref).abs().max().item()
-    fwd_bound = 0.02 if causal else 0.01
-    print(f"  Fwd: {fwd_err:.6f} (bound: {fwd_bound})")
-    assert fwd_err < fwd_bound, f"Forward error {fwd_err:.6f} > {fwd_bound}"
-
-    # Backward check
-    g = torch.randn(B, S, H, D, device="cuda", dtype=torch.float32)
-    dq_ref, dk_ref, dv_ref = torch.autograd.grad(out_ref, (q_ref, k_ref, v_ref), g)
-    dq_flash, dk_flash, dv_flash = torch.autograd.grad(out_flash, (q2, k2, v2), g.to(torch.bfloat16))
-
-    # Also compute no-dropout backward as baseline for amplification check
-    q_ref_nd = q.float().detach().requires_grad_(True)
-    k_ref_nd = k.float().detach().requires_grad_(True)
-    v_ref_nd = v.float().detach().requires_grad_(True)
-    out_ref_nd = attention_dropout_ref(
-        q_ref_nd, k_ref_nd, v_ref_nd,
-        torch.ones_like(mask), 0.0, causal,
+    # Forward: repo standard metric
+    fwd_atol = 2 * (out_ref + 0.3 - 0.3 - out_ref).abs().max().item()
+    rtol = 2
+    flash_err = (out_flash.float() - out_ref).abs().max().item()
+    pt_err = (out_pt - out_ref).abs().max().item()
+    print(f"  Fwd: flash={flash_err:.6f} pt={pt_err:.6f} ratio={flash_err / max(pt_err, 1e-10):.2f}x")
+    assert flash_err <= rtol * pt_err + fwd_atol, (
+        f"Forward error {flash_err:.6f} > {rtol} * {pt_err:.6f} + {fwd_atol:.6f}"
     )
-    q_nd = q.detach().requires_grad_(True)
-    k_nd = k.detach().requires_grad_(True)
-    v_nd = v.detach().requires_grad_(True)
-    out_nd, _ = flash_attn_func(q_nd, k_nd, v_nd, causal=causal)
-    dq_ref_nd, dk_ref_nd, dv_ref_nd = torch.autograd.grad(out_ref_nd, (q_ref_nd, k_ref_nd, v_ref_nd), g)
-    dq_nd, dk_nd, dv_nd = torch.autograd.grad(out_nd, (q_nd, k_nd, v_nd), g.to(torch.bfloat16))
 
-    for name, df, dr, df_nd, dr_nd in [
-        ("dq", dq_flash, dq_ref, dq_nd, dq_ref_nd),
-        ("dk", dk_flash, dk_ref, dk_nd, dk_ref_nd),
-        ("dv", dv_flash, dv_ref, dv_nd, dv_ref_nd),
-    ]:
-        do_err = (df.float() - dr).abs().max().item()
-        nd_err = (df_nd.float() - dr_nd).abs().max().item()
-        amplification = do_err / (nd_err + 1e-10)
-        print(f"  {name}: dropout={do_err:.6f} no_dropout={nd_err:.6f} amp={amplification:.1f}x")
+    # Backward: repo standard metric for dq, dk, dv
+    g = torch.randn_like(out_flash)
+    dq, dk, dv = torch.autograd.grad(out_flash, (q, k, v), g)
+    dq_ref, dk_ref, dv_ref = torch.autograd.grad(out_ref, (q_ref, k_ref, v_ref), g)
+    dq_pt, dk_pt, dv_pt = torch.autograd.grad(out_pt, (q_ref, k_ref, v_ref), g)
 
-        # dv: no amplification expected (1-2x of baseline)
-        # dq/dk: amplification from P_drop*(dP-D), bounded at 50x baseline
-        if name == "dv":
-            bound = max(0.03 if causal else 0.01, 3 * nd_err)
-            assert do_err < bound, f"{name} error {do_err:.6f} > {bound:.6f}"
-        else:
-            # dq/dk: check MEAN error is bounded (max error has outliers at
-            # causal boundaries where few attention elements amplify bf16
-            # dPsum precision loss through P_drop * (dP - D))
-            do_mean = (df.float() - dr).abs().mean().item()
-            nd_mean = (df_nd.float() - dr_nd).abs().mean().item()
-            # Causal: early rows have few elements, amplifying P*(dP-D) error
-            rtol_bwd = 100 if causal else 50
-            mean_bound = rtol_bwd * nd_mean + 0.005
-            assert do_mean < mean_bound, (
-                f"{name} mean error {do_mean:.6f} > 50x baseline {nd_mean:.6f}"
-            )
+    for name, d, d_ref, d_pt in [("dq", dq, dq_ref, dq_pt), ("dk", dk, dk_ref, dk_pt), ("dv", dv, dv_ref, dv_pt)]:
+        d_atol = 2 * (d_ref + 0.3 - 0.3 - d_ref).abs().max().item()
+        d_err = (d.float() - d_ref).abs().max().item()
+        d_pt_err = (d_pt - d_ref).abs().max().item()
+        d_ratio = d_err / max(d_pt_err, 1e-10)
+        print(f"  {name}: flash={d_err:.6f} pt={d_pt_err:.6f} ratio={d_ratio:.2f}x")
+        assert d_err <= rtol * d_pt_err + d_atol, (
+            f"{name} error {d_err:.6f} > {rtol} * {d_pt_err:.6f} + {d_atol:.6f}"
+        )
 
 
 @pytest.mark.parametrize("causal", [False, True])
@@ -207,12 +193,48 @@ def test_dropout_mask_extraction():
     assert 0.7 < kept < 0.9, f"Keep fraction {kept:.3f} out of range for p=0.2"
 
 
+def test_dropout_varlen():
+    """Dropout works with variable-length sequences."""
+    from flash_attn.cute.interface import flash_attn_varlen_func
+
+    torch.manual_seed(0)
+    # Two sequences of different lengths
+    seqlens = [48, 64]
+    total = sum(seqlens)
+    H, D = 2, 64
+    cu_seqlens = torch.tensor([0, seqlens[0], sum(seqlens)], dtype=torch.int32, device="cuda")
+    q = torch.randn(total, H, D, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    k = torch.randn(total, H, D, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+    v = torch.randn(total, H, D, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+
+    seed = 42
+    p = 0.2
+    out1, _ = flash_attn_varlen_func(
+        q, k, v, cu_seqlens, cu_seqlens, max(seqlens), max(seqlens),
+        dropout_p=p, dropout_seed=seed,
+    )
+    dq1, dk1, dv1 = torch.autograd.grad(out1, (q, k, v), torch.randn_like(out1))
+
+    # Determinism
+    out2, _ = flash_attn_varlen_func(
+        q, k, v, cu_seqlens, cu_seqlens, max(seqlens), max(seqlens),
+        dropout_p=p, dropout_seed=seed,
+    )
+    assert torch.equal(out1, out2), "Varlen dropout not deterministic"
+
+    # p=0 baseline
+    out_base, _ = flash_attn_varlen_func(
+        q, k, v, cu_seqlens, cu_seqlens, max(seqlens), max(seqlens),
+    )
+    assert not torch.equal(out1, out_base), "Dropout had no effect on varlen"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-x"])
 
 
 # ---------------------------------------------------------------------------
-# Python Philox reference for mask verification
+# Python Philox reference with MMA-layout keying (m16n8k16)
 # ---------------------------------------------------------------------------
 
 PHILOX_ROUND_A = 0xD2511F53
@@ -241,34 +263,100 @@ def philox_py(c0, c1, c2, c3, k0, k1):
     return c0, c1, c2, c3
 
 
-def generate_mask_py(B, H, Sq, Sk, p_dropout, seed):
-    """Generate dropout mask matching the kernel's 2x4 group batching with 16-bit threshold."""
+def generate_mask_mma_layout(B, H, Sq, Sk, p_dropout, seed,
+                             tile_m=64, tile_n=64, num_warps=4):
+    """Generate dropout mask matching the kernel's MMA-layout Philox keying.
+
+    Reproduces the exact m16n8k16 accumulator thread-to-element mapping used by
+    apply_dropout_mask with logical_divide.
+
+    CuTe m16n8k16 accumulator layout per thread (lane_id):
+      t1 = lane_id // 4 (row base, 0..7)
+      t0 = lane_id % 4  (col pair, 0..3)
+      V-mode shape (2,2) with strides (2,1) gives flat reg → (v0, v1):
+        reg 0 → (v0=0, v1=0): row = t1,     col = t0 * 2
+        reg 1 → (v0=0, v1=1): row = t1,     col = t0 * 2 + 1
+        reg 2 → (v0=1, v1=0): row = t1 + 8, col = t0 * 2
+        reg 3 → (v0=1, v1=1): row = t1 + 8, col = t0 * 2 + 1
+
+    Kernel keying:
+      philox_offset = (batch * nheads + head) * 32 + lane_id
+      block_row = m_block * (tile_m // 16) + warp_id + m * num_warps
+      block_col = n_block * (tile_n // 32) + n_half
+      u16_idx = j * 4 + reg  (j from logical_divide pair-half, reg 0..3)
+    """
     seed_lo = seed & MASK32
     seed_hi = (seed >> 32) & MASK32
     threshold_8 = int(255 * (1.0 - p_dropout))
-    threshold_16 = threshold_8 * 257  # scale 8-bit to 16-bit
+    threshold_16 = threshold_8 * 257
+
     mask = torch.ones(B, H, Sq, Sk, dtype=torch.bool)
+    n_m_blocks = (Sq + tile_m - 1) // tile_m
+    n_n_blocks = (Sk + tile_n - 1) // tile_n
+
+    # CuTe m16n8k16 layout: row = t1 + (reg%2)*8, col = t0*2 + (reg//2)
+    # where t0 = lane_id % 4, t1 = lane_id // 4
+
     for b in range(B):
         for h in range(H):
-            key_lo = (b * H + h) & MASK32
-            for row in range(Sq):
-                for col in range(Sk):
-                    row_group = row >> 1  # // 2
-                    col_group = col >> 2  # // 4
-                    r0, r1, r2, r3 = philox_py(key_lo, 0, row_group, col_group, seed_lo, seed_hi)
-                    # Element index in 2x4 group
-                    elem = (row & 1) * 4 + (col & 3)  # 0..7
-                    # Extract 16-bit value from the 4 words
-                    words = [r0, r1, r2, r3]
-                    word = words[elem >> 1]
-                    half = elem & 1
-                    rand_u16 = (word >> (half * 16)) & 0xFFFF
-                    mask[b, h, row, col] = rand_u16 <= threshold_16
+            for m_block in range(n_m_blocks):
+                for n_block in range(n_n_blocks):
+                    for warp_id in range(num_warps):
+                        for lane_id in range(32):
+                            t0 = lane_id % 4
+                            t1 = lane_id // 4
+
+                            philox_offset = ((b * H + h) * 32 + lane_id) & MASK32
+
+                            # MMA_M = tile_m / (16 * num_warps), MMA_N = tile_n / 8
+                            mma_m = tile_m // (16 * num_warps)
+                            mma_n = tile_n // 8
+                            # After logical_divide by 2: (2, mma_n // 2)
+                            mma_n_half = mma_n // 2
+
+                            for m in range(mma_m):
+                                block_row = (m_block * (tile_m // 16)
+                                             + warp_id + m * num_warps)
+                                for n_half in range(mma_n_half):
+                                    block_col = (n_block * (tile_n // 32)
+                                                 + n_half)
+
+                                    r0, r1, r2, r3 = philox_py(
+                                        philox_offset, 0,
+                                        block_row, block_col,
+                                        seed_lo, seed_hi,
+                                    )
+                                    words = [r0, r1, r2, r3]
+
+                                    for j in range(2):
+                                        for reg in range(4):
+                                            u16_idx = j * 4 + reg
+                                            word = words[u16_idx >> 1]
+                                            half = u16_idx & 1
+                                            rand_u16 = (word >> (half * 16)) & 0xFFFF
+
+                                            # CuTe m16n8k16 mapping (V-mode strides (2,1))
+                                            # reg → (v0, v1): v0 = reg // 2, v1 = reg % 2
+                                            n_idx = j + 2 * n_half
+                                            row_in_mma = t1 + (reg // 2) * 8
+                                            col_in_mma = t0 * 2 + (reg % 2)
+                                            global_row = (m_block * tile_m
+                                                          + warp_id * 16
+                                                          + m * num_warps * 16
+                                                          + row_in_mma)
+                                            global_col = (n_block * tile_n
+                                                          + n_idx * 8
+                                                          + col_in_mma)
+
+                                            if global_row < Sq and global_col < Sk:
+                                                mask[b, h, global_row, global_col] = (
+                                                    rand_u16 <= threshold_16
+                                                )
     return mask
 
 
 def test_mask_matches_python_philox():
-    """Verify kernel dropout mask matches independent Python Philox reference."""
+    """Verify kernel dropout mask matches independent MMA-layout Python Philox."""
     from flash_attn.cute.interface import flash_attn_func
 
     B, S, H, D = 1, 64, 1, 64
@@ -277,19 +365,16 @@ def test_mask_matches_python_philox():
     q = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
     k = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
 
-    # Extract kernel mask via V=I
     kernel_mask = extract_dropout_mask(q, k, p, seed, flash_attn_func)
-
-    # Generate Python reference mask
-    python_mask = generate_mask_py(B, H, S, S, p, seed).to("cuda")
+    python_mask = generate_mask_mma_layout(B, H, S, S, p, seed).to("cuda")
 
     match = (kernel_mask == python_mask).float().mean().item()
-    print(f"Kernel vs Python Philox mask agreement: {match:.4f}")
+    print(f"Kernel vs MMA-layout Python Philox: {match:.4f}")
     assert match > 0.99, f"Mask agreement {match:.4f} < 0.99"
 
 
 def test_fwd_matches_python_philox_ref():
-    """Forward output matches f32 reference using Python-generated mask."""
+    """Forward output matches f32 reference using MMA-layout Python mask."""
     from flash_attn.cute.interface import flash_attn_func
 
     B, S, H, D = 1, 64, 1, 64
@@ -299,10 +384,10 @@ def test_fwd_matches_python_philox_ref():
     k = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
     v = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
 
-    mask = generate_mask_py(B, H, S, S, p, seed).to("cuda")
+    mask = generate_mask_mma_layout(B, H, S, S, p, seed).to("cuda")
     out_ref = attention_dropout_ref(q, k, v, mask, p)
     out_flash, _ = flash_attn_func(q, k, v, dropout_p=p, dropout_seed=seed)
 
     err = (out_flash.float() - out_ref).abs().max().item()
-    print(f"Flash vs Python Philox ref: {err:.6f}")
-    assert err < 0.01, f"Forward error {err:.6f} vs Python Philox ref"
+    print(f"Flash vs MMA-layout Python Philox ref: {err:.6f}")
+    assert err < 0.01, f"Forward error {err:.6f} vs MMA-layout Python Philox ref"
