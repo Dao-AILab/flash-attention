@@ -70,6 +70,54 @@ from flash_attn.cute.block_sparsity import (
     normalize_block_sparse_config_bwd,
 )
 
+def _create_tma_paged_descriptor(
+    data_ptr, dtype, head_dim, num_kv_heads, page_size, total_rows, row_stride_bytes, device,
+):
+    """Create a CUtensorMap descriptor for TMA-based paged KV loading.
+
+    Views K/V as 2D: dim0 = num_kv_heads * head_dim, dim1 = total_rows.
+    boxDim = (head_dim, page_size); requires head_dim * elem_size <= 128.
+    """
+    dtype_map = {
+        torch.float16: cuda.CUtensorMapDataType.CU_TENSOR_MAP_DATA_TYPE_FLOAT16,
+        torch.bfloat16: cuda.CUtensorMapDataType.CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+        torch.float32: cuda.CUtensorMapDataType.CU_TENSOR_MAP_DATA_TYPE_FLOAT32,
+    }
+    elem_size = {torch.float16: 2, torch.bfloat16: 2, torch.float32: 4}[dtype]
+    row_bytes = head_dim * elem_size
+    global_dim0 = num_kv_heads * head_dim
+
+    if row_bytes >= 128 and row_bytes % 128 == 0:
+        swizzle = cuda.CUtensorMapSwizzle.CU_TENSOR_MAP_SWIZZLE_128B
+    elif row_bytes >= 64 and row_bytes % 64 == 0:
+        swizzle = cuda.CUtensorMapSwizzle.CU_TENSOR_MAP_SWIZZLE_64B
+    elif row_bytes >= 32 and row_bytes % 32 == 0:
+        swizzle = cuda.CUtensorMapSwizzle.CU_TENSOR_MAP_SWIZZLE_32B
+    else:
+        swizzle = cuda.CUtensorMapSwizzle.CU_TENSOR_MAP_SWIZZLE_NONE
+
+    err, desc = cuda.cuTensorMapEncodeTiled(
+        dtype_map[dtype],
+        2,  # tensorRank
+        data_ptr,
+        (cuda.cuuint64_t(global_dim0), cuda.cuuint64_t(total_rows)),
+        (cuda.cuuint64_t(row_stride_bytes),),
+        (cuda.cuuint32_t(head_dim), cuda.cuuint32_t(page_size)),
+        (cuda.cuuint32_t(1), cuda.cuuint32_t(1)),
+        cuda.CUtensorMapInterleave.CU_TENSOR_MAP_INTERLEAVE_NONE,
+        swizzle,
+        cuda.CUtensorMapL2promotion.CU_TENSOR_MAP_L2_PROMOTION_L2_256B,
+        cuda.CUtensorMapFloatOOBfill.CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE,
+    )
+    if err != cuda.CUresult.CUDA_SUCCESS:
+        raise RuntimeError(f"cuTensorMapEncodeTiled failed: {err}")
+    tmap_gpu = torch.empty(16, dtype=torch.int64, device=device)
+    (err,) = cuda.cuMemcpyHtoD(tmap_gpu.data_ptr(), desc.getPtr(), 128)
+    if err != cuda.CUresult.CUDA_SUCCESS:
+        raise RuntimeError(f"cuMemcpyHtoD failed: {err}")
+    return tmap_gpu
+
+
 def _parse_arch_str(arch_str):
     """Parse arch string (e.g. 'sm_80', 'sm_90a', '80', '100') to int (e.g. 80, 90, 100)."""
     import re
@@ -602,6 +650,21 @@ def _flash_attn_fwd(
     else:
         aux_tensor_metadata = None
 
+    # Auto-detect TMA-paged KV: use TMA for paged KV when the page count per
+    # n-block is a small power of two and each row fits in a single TMA tile.
+    _pages_per_nblock = (
+        tile_n // page_size
+        if page_size is not None and page_size < tile_n and tile_n % page_size == 0
+        else 0
+    )
+    _elem_sz = q.element_size()
+    _use_tma_paged = (
+        arch // 10 in [10, 11]
+        and _pages_per_nblock in (2, 4, 8)
+        and head_dim * _elem_sz <= 128             # single TMA tile per page
+        and head_dim_v * _elem_sz <= 128
+    )
+
     compile_key = (
         dtype,
         head_dim,
@@ -629,7 +692,9 @@ def _flash_attn_fwd(
         is_split_kv,
         pack_gqa,
         arch,
-        page_size not in [None, tile_n],  # paged KV non-TMA
+        page_size not in [None, tile_n] and not _use_tma_paged,  # paged KV non-TMA
+        _use_tma_paged,
+        page_size if _use_tma_paged else None,
         use_2cta_instrs,
         q_subtile_factor,
         mma_pv_is_rs,
@@ -738,7 +803,8 @@ def _flash_attn_fwd(
                 score_mod=score_mod,
                 mask_mod=mask_mod,
                 has_aux_tensors=aux_tensors is not None,
-                paged_kv_non_tma=page_size not in [None, tile_n],
+                paged_kv_non_tma=False if _use_tma_paged else (page_size not in [None, tile_n]),
+                paged_kv_page_size=page_size if _use_tma_paged else 0,
                 is_varlen_q=cu_seqlens_q is not None or seqused_q is not None,
                 q_subtile_factor=q_subtile_factor,
                 use_2cta_instrs=use_2cta_instrs,
@@ -771,6 +837,27 @@ def _flash_attn_fwd(
                 f"Unsupported compute capability: {arch}. Supported: 8.x, 9.x, 10.x, 11.x, 12.x"
             )
         # TODO: check @can_implement
+        tma_paged_compile_tensors = []
+        if _use_tma_paged:
+            elem_size = q.element_size()
+            total_rows = k.shape[0] * k.shape[1]
+            tmap_K = _create_tma_paged_descriptor(
+                k.data_ptr(), k.dtype, head_dim, num_head_kv,
+                page_size, total_rows, k.shape[2] * k.shape[3] * elem_size, device,
+            )
+            tmap_V = _create_tma_paged_descriptor(
+                v.data_ptr(), v.dtype, head_dim_v, num_head_kv,
+                page_size, total_rows, v.shape[2] * v.shape[3] * elem_size, device,
+            )
+            K_ptr_tensor = torch.tensor([tmap_K.data_ptr()], dtype=torch.int64, device=device)
+            V_ptr_tensor = torch.tensor([tmap_V.data_ptr()], dtype=torch.int64, device=device)
+            tma_paged_compile_tensors = [
+                to_cute_tensor(tmap_K, assumed_align=64),
+                to_cute_tensor(tmap_V, assumed_align=64),
+                to_cute_tensor(K_ptr_tensor),
+                to_cute_tensor(V_ptr_tensor),
+            ]
+
         _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
             fa_fwd,
             q_tensor,
@@ -790,6 +877,7 @@ def _flash_attn_fwd(
             sparse_tensors,
             cute_aux_tensors,
             current_stream,
+            *tma_paged_compile_tensors,
             options="--enable-tvm-ffi",
         )
 
@@ -797,6 +885,29 @@ def _flash_attn_fwd(
     # - Use those fake metadata to populate compilation cache
     # - Return "fake" output tensors, which could be needed in follow-up fake operations
     # Thus, we skip the actual kernel invocation here.
+    tma_paged_runtime_tensors = []
+    if _use_tma_paged and not is_fake_mode():
+        cache_key = (device, k.data_ptr(), v.data_ptr(), k.shape, v.shape, k.dtype, v.dtype)
+        if not hasattr(_flash_attn_fwd, "_tma_paged_cache"):
+            _flash_attn_fwd._tma_paged_cache = {}
+        cache = _flash_attn_fwd._tma_paged_cache
+        if cache_key not in cache:
+            elem_size = q.element_size()
+            total_rows = k.shape[0] * k.shape[1]
+            tmap_K = _create_tma_paged_descriptor(
+                k.data_ptr(), k.dtype, head_dim, num_head_kv,
+                page_size, total_rows, k.shape[2] * k.shape[3] * elem_size, device,
+            )
+            tmap_V = _create_tma_paged_descriptor(
+                v.data_ptr(), v.dtype, head_dim_v, num_head_kv,
+                page_size, total_rows, v.shape[2] * v.shape[3] * elem_size, device,
+            )
+            K_ptr_tensor = torch.tensor([tmap_K.data_ptr()], dtype=torch.int64, device=device)
+            V_ptr_tensor = torch.tensor([tmap_V.data_ptr()], dtype=torch.int64, device=device)
+            cache[cache_key] = (tmap_K, tmap_V, K_ptr_tensor, V_ptr_tensor)
+        tmap_K, tmap_V, K_ptr_tensor, V_ptr_tensor = cache[cache_key]
+        tma_paged_runtime_tensors = [tmap_K, tmap_V, K_ptr_tensor, V_ptr_tensor]
+
     if not is_fake_mode():
         _flash_attn_fwd.compile_cache[compile_key](
             q.detach(),
@@ -815,6 +926,7 @@ def _flash_attn_fwd(
             learnable_sink,
             normalized_block_sparse_tensors[:4] if normalized_block_sparse_tensors is not None else None,
             aux_tensors,
+            *tma_paged_runtime_tensors,
         )
     if is_split_kv:
         _flash_attn_fwd_combine(

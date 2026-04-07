@@ -240,6 +240,60 @@ def cpasync_bulk_s2cluster(
 
 
 @dsl_user_op
+def tma_tile_g2s(
+    smem_ptr: Int32,
+    tmap_ptr: cutlass.Int64,
+    col: Int32,
+    row: Int32,
+    mbar_ptr: Int32,
+    *,
+    loc=None,
+    ip=None,
+):
+    """2D TMA tile copy from global to shared memory.
+
+    Loads one tile of boxDim=(width, height) at (col, row) from the tensor
+    described by tmap_ptr into smem_ptr.  Used for paged KV cache loading.
+    """
+    llvm.inline_asm(
+        None,
+        [
+            Int32(smem_ptr).ir_value(loc=loc, ip=ip),
+            cutlass.Int64(tmap_ptr).ir_value(loc=loc, ip=ip),
+            Int32(col).ir_value(loc=loc, ip=ip),
+            Int32(row).ir_value(loc=loc, ip=ip),
+            Int32(mbar_ptr).ir_value(loc=loc, ip=ip),
+        ],
+        "cp.async.bulk.tensor.2d.tile.shared::cta.global"
+        ".mbarrier::complete_tx::bytes"
+        " [$0], [$1, {$2, $3}], [$4];",
+        "r,l,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
+def fence_tma_desc_i64(
+    desc_ptr_i64: cutlass.Int64,
+    *,
+    loc=None,
+    ip=None,
+):
+    """Fence for TMA descriptor acquire on GPU."""
+    llvm.inline_asm(
+        None,
+        [cutlass.Int64(desc_ptr_i64).ir_value(loc=loc, ip=ip)],
+        "fence.proxy.tensormap::generic.acquire.gpu [$0], 128;",
+        "l",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@dsl_user_op
 def cpasync_bulk_g2s(
     gmem_ptr: cute.Pointer,
     smem_ptr: cute.Pointer,
