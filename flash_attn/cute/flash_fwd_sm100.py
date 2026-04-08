@@ -114,6 +114,7 @@ class FlashAttentionForwardSm100:
         is_varlen_q: bool = False,
         use_2cta_instrs: bool = False,
         use_clc_scheduler: bool = False,
+        is_split_d: bool = False,
     ):
         self.use_tma_KV = not paged_kv_non_tma
         # self.dtype = dtype
@@ -126,6 +127,19 @@ class FlashAttentionForwardSm100:
         self.same_hdim_kv_padded = self.head_dim_padded == self.head_dim_v_padded
         self.check_hdim_oob = head_dim != self.head_dim_padded
         self.check_hdim_v_oob = head_dim_v != self.head_dim_v_padded
+
+        self.is_split_d = is_split_d
+        if self.is_split_d:
+            assert self.head_dim_padded == 256 and self.head_dim_v_padded == 256
+            self.half_head_dim = self.head_dim_padded // 2
+            self.half_head_dim_v = self.head_dim_v_padded // 2
+            q_stage = 1
+            use_2cta_instrs = False
+            is_persistent = False
+            pack_gqa = False
+            assert not paged_kv_non_tma, "Paged KV not supported with Split-D"
+            assert not is_split_kv, "SplitKV not supported with Split-D"
+
         self.m_block_size = m_block_size
         self.n_block_size = n_block_size
         self.q_stage = q_stage
@@ -143,11 +157,16 @@ class FlashAttentionForwardSm100:
 
         self.cta_group_size = 2 if self.use_2cta_instrs else 1
         # cta_tiler M includes only 1 CTA, the scheduler will take into account the cluster shape
-        self.cta_tiler = (self.q_stage * m_block_size, n_block_size, self.head_dim_padded)
-        # With 2CTA, the MMA tiler M covers both CTAs, so it's cta_group_size * m_block_size.
-        # Each CTA owns m_block_size rows; the 2CTA MMA instruction spans both.
-        self.mma_tiler_qk = (self.cta_group_size * m_block_size, n_block_size, self.head_dim_padded)
-        self.mma_tiler_pv = (self.cta_group_size * m_block_size, self.head_dim_v_padded, n_block_size)
+        if self.is_split_d:
+            self.cta_tiler = (self.q_stage * m_block_size, n_block_size, self.half_head_dim)
+            self.mma_tiler_qk = (m_block_size, n_block_size, self.half_head_dim)
+            self.mma_tiler_pv = (m_block_size, self.half_head_dim_v, n_block_size)
+        else:
+            self.cta_tiler = (self.q_stage * m_block_size, n_block_size, self.head_dim_padded)
+            # With 2CTA, the MMA tiler M covers both CTAs, so it's cta_group_size * m_block_size.
+            # Each CTA owns m_block_size rows; the 2CTA MMA instruction spans both.
+            self.mma_tiler_qk = (self.cta_group_size * m_block_size, n_block_size, self.head_dim_padded)
+            self.mma_tiler_pv = (self.cta_group_size * m_block_size, self.head_dim_v_padded, n_block_size)
         self.qk_acc_dtype = Float32
         self.pv_acc_dtype = Float32
         self.cluster_shape_mn = (2, 1) if self.use_2cta_instrs else (1, 1)
@@ -178,7 +197,8 @@ class FlashAttentionForwardSm100:
         self.s0_s1_barrier = False
         self.overlap_sO_sQ = (
             (self.head_dim_padded == 192 and self.head_dim_v_padded >= 64) or
-            (self.head_dim_v_padded >= 128 and self.is_split_kv)
+            (self.head_dim_v_padded >= 128 and self.is_split_kv) or
+            self.is_split_d
         )
         if self.overlap_sO_sQ:
             self.is_persistent = False
@@ -255,17 +275,30 @@ class FlashAttentionForwardSm100:
 
         self.clc_scheduler_warp_id = self.empty_warp_ids[0] if self.use_clc_scheduler else None
 
-        self.tmem_s_offset = [0, self.n_block_size]  # e.g., 0, 128
-        self.tmem_o_offset = [
-            self.tmem_s_offset[-1] + self.n_block_size + i * self.head_dim_v_padded
-            for i in range(self.q_stage)
-        ]  # e.g., 256, 384
-        self.tmem_total = self.tmem_o_offset[-1] + self.head_dim_v_padded
-        assert self.tmem_total <= self.tmem_alloc_cols
-        self.tmem_s_to_p_offset = self.n_block_size // 2
-        self.tmem_p_offset = [
-            self.tmem_s_offset[i] + self.tmem_s_to_p_offset for i in range(2)
-        ]  # 0, 128
+        if self.is_split_d:
+            # Split-D TMEM layout: S0[0,128) + S1/P[128,256) + O_low[256,384) + O_high[384,512)
+            self.tmem_s_offset = [0, self.n_block_size]  # [0, 128]
+            self.tmem_o_low_offset = 2 * self.n_block_size  # 256
+            self.tmem_o_high_offset = 2 * self.n_block_size + self.half_head_dim_v  # 384
+            self.tmem_o_offset = [self.tmem_o_low_offset]  # q_stage=1, only one entry
+            self.tmem_total = self.tmem_o_high_offset + self.half_head_dim_v  # 512
+            assert self.tmem_total <= self.tmem_alloc_cols
+            self.tmem_s_to_p_offset = self.n_block_size // 2
+            self.tmem_p_offset = [
+                self.tmem_s_offset[i] + self.tmem_s_to_p_offset for i in range(2)
+            ]
+        else:
+            self.tmem_s_offset = [0, self.n_block_size]  # e.g., 0, 128
+            self.tmem_o_offset = [
+                self.tmem_s_offset[-1] + self.n_block_size + i * self.head_dim_v_padded
+                for i in range(self.q_stage)
+            ]  # e.g., 256, 384
+            self.tmem_total = self.tmem_o_offset[-1] + self.head_dim_v_padded
+            assert self.tmem_total <= self.tmem_alloc_cols
+            self.tmem_s_to_p_offset = self.n_block_size // 2
+            self.tmem_p_offset = [
+                self.tmem_s_offset[i] + self.tmem_s_to_p_offset for i in range(2)
+            ]  # 0, 128
 
         # vec buffer for row_max & row_sum
         self.tmem_vec_offset = self.tmem_s_offset
@@ -303,35 +336,42 @@ class FlashAttentionForwardSm100:
         - Configures pipeline stages for softmax, correction, and epilogue operations
         """
 
-        smem_size_q = self.q_stage * self.m_block_size * self.head_dim_padded * self.q_dtype.width // 8
-        smem_size_o = self.q_stage * self.m_block_size * self.head_dim_v_padded * self.o_dtype.width // 8
-        smem_size_q_o = smem_size_q + smem_size_o if not self.overlap_sO_sQ else max(smem_size_q, smem_size_o)
-        smem_size_k_per_stage = self.n_block_size * self.head_dim_padded * self.k_dtype.width // 8
-        smem_size_v_per_stage = self.n_block_size * self.head_dim_v_padded * self.v_dtype.width // 8
-        smem_size_kv_per_stage = max(smem_size_k_per_stage, smem_size_v_per_stage) // self.cta_group_size
-        kv_stage = (224 * 1024 - smem_size_q_o) // smem_size_kv_per_stage
-        if self.head_dim_padded == 192 and self.head_dim_v_padded == 128 and kv_stage == 2:
-            # For hdim 192,128, we can fit 3 stages if we use uneven_kv_smem
-             kv_stage = 3
-        self.kv_stage = kv_stage
-        # print("kv_stage", self.kv_stage)
-        self.s_stage = 2
-        assert self.s_stage >= self.q_stage
-        # For hdim 192,128 1CTA, we don't have enough smem to store all 3 stages of KV:
-        # 128 x 192 x 2 bytes x 3 stages = 144KB, and we need 96KB for Q.
-        # Instead we store smem as [smem_large, smem_small, smem_large], where smem_large is
-        # 128 x 192 and smem_small is 128 x 128. We set the stride between the stages to be
-        # 128 * 160, so that indexing the 0th and 2nd stages will get the right address,
-        # but for the 1st stage we need to add or subtract (depending on phase) 128 x 64.
-        self.uneven_kv_smem = (
-            self.head_dim_padded == 192 and self.head_dim_v_padded == 128 and self.kv_stage == 3
-        )
-        self.uneven_kv_smem_offset = (
-            self.n_block_size * (self.head_dim_padded - self.head_dim_v_padded) // 2
-            if self.uneven_kv_smem
-            else 0
-        )
-        assert self.uneven_kv_smem_offset % 1024 == 0
+        if self.is_split_d:
+            # Split-D: sQ has 2 physical stages (Q_low, Q_high) but q_stage=1
+            # sO has full head_dim_v_padded=256
+            self.q_smem_stages = 2
+            smem_size_q = self.q_smem_stages * self.m_block_size * self.half_head_dim * self.q_dtype.width // 8
+            smem_size_o = self.m_block_size * self.head_dim_v_padded * self.o_dtype.width // 8
+            smem_size_q_o = max(smem_size_q, smem_size_o)  # overlap_sO_sQ=True
+            smem_size_kv_per_stage = self.n_block_size * self.half_head_dim * self.k_dtype.width // 8
+            kv_stage = (224 * 1024 - smem_size_q_o) // smem_size_kv_per_stage
+            self.kv_stage = kv_stage
+            self.s_stage = 2
+            self.uneven_kv_smem = False
+            self.uneven_kv_smem_offset = 0
+        else:
+            self.q_smem_stages = self.q_stage
+            smem_size_q = self.q_stage * self.m_block_size * self.head_dim_padded * self.q_dtype.width // 8
+            smem_size_o = self.q_stage * self.m_block_size * self.head_dim_v_padded * self.o_dtype.width // 8
+            smem_size_q_o = smem_size_q + smem_size_o if not self.overlap_sO_sQ else max(smem_size_q, smem_size_o)
+            smem_size_k_per_stage = self.n_block_size * self.head_dim_padded * self.k_dtype.width // 8
+            smem_size_v_per_stage = self.n_block_size * self.head_dim_v_padded * self.v_dtype.width // 8
+            smem_size_kv_per_stage = max(smem_size_k_per_stage, smem_size_v_per_stage) // self.cta_group_size
+            kv_stage = (224 * 1024 - smem_size_q_o) // smem_size_kv_per_stage
+            if self.head_dim_padded == 192 and self.head_dim_v_padded == 128 and kv_stage == 2:
+                kv_stage = 3
+            self.kv_stage = kv_stage
+            self.s_stage = 2
+            assert self.s_stage >= self.q_stage
+            self.uneven_kv_smem = (
+                self.head_dim_padded == 192 and self.head_dim_v_padded == 128 and self.kv_stage == 3
+            )
+            self.uneven_kv_smem_offset = (
+                self.n_block_size * (self.head_dim_padded - self.head_dim_v_padded) // 2
+                if self.uneven_kv_smem
+                else 0
+            )
+            assert self.uneven_kv_smem_offset % 1024 == 0
 
     @cute.jit
     def __call__(
@@ -457,7 +497,7 @@ class FlashAttentionForwardSm100:
         self.epi_tile = (self.m_block_size, self.head_dim_v_padded)
 
         sQ_layout = sm100_utils_basic.make_smem_layout_a(
-            tiled_mma_qk, self.mma_tiler_qk, self.q_dtype, self.q_stage
+            tiled_mma_qk, self.mma_tiler_qk, self.q_dtype, self.q_smem_stages
         )
         sK_layout = sm100_utils_basic.make_smem_layout_b(
             tiled_mma_qk, self.mma_tiler_qk, self.k_dtype, self.kv_stage
@@ -516,6 +556,9 @@ class FlashAttentionForwardSm100:
         }
         for name in ("Q", "K", "V"):
             self.tma_copy_bytes[name] *= self.cta_group_size
+        if const_expr(self.is_split_d):
+            # Split-D: Q load covers both Q_low and Q_high (2 halves on same barrier)
+            self.tma_copy_bytes["Q"] *= 2
 
         # TMA load for Q
         tma_load_op = cpasync.CopyBulkTensorTileG2SOp(cta_group)
@@ -973,8 +1016,17 @@ class FlashAttentionForwardSm100:
         # request 512 columns of tmem, so we know that it starts at 0.
         tStS = thr_mma_qk.make_fragment_C(cute.append(qk_acc_shape, self.s_stage))
         pv_acc_shape = thr_mma_pv.partition_shape_C(self.mma_tiler_pv[:2])
-        tOtO = thr_mma_pv.make_fragment_C(cute.append(pv_acc_shape, self.q_stage))
-        tOtO = cute.make_tensor(tOtO.iterator + self.tmem_o_offset[0], tOtO.layout)
+        if const_expr(self.is_split_d):
+            # Split-D: O_low and O_high each use half_head_dim_v cols in TMEM
+            # For MMA gemm_Pi_low/gemm_Pi_high: TMEM offsets baked into GEMM partials
+            # For correction/epilogue: use half-width tOtO_low and tOtO_high
+            tOtO_half = thr_mma_pv.make_fragment_C(cute.append(pv_acc_shape, 1))
+            tOtO_low = cute.make_tensor(tOtO_half.iterator + self.tmem_o_low_offset, tOtO_half.layout)
+            tOtO_high = cute.make_tensor(tOtO_half.iterator + self.tmem_o_high_offset, tOtO_half.layout)
+            tOtO = tOtO_low
+        else:
+            tOtO = thr_mma_pv.make_fragment_C(cute.append(pv_acc_shape, self.q_stage))
+            tOtO = cute.make_tensor(tOtO.iterator + self.tmem_o_offset[0], tOtO.layout)
         tP = cute.make_tensor(tStS.iterator, tP_layout.outer)
         tOrP = thr_mma_pv.make_fragment_A(tP)[None, None, None, 0]
         # Need to multiply by width ratio bc tP is in v_dtype but tmem offsets are in FP32
@@ -1300,8 +1352,18 @@ class FlashAttentionForwardSm100:
                 else:
                     mK_cur = cute.domain_offset((seqlen.offset_k, 0), mK[None, None, head_idx_kv])
                     mV_cur = cute.domain_offset((0, seqlen.offset_k), mV[None, None, head_idx_kv])
-                gK = cute.local_tile(mK_cur, cute.select(self.mma_tiler_qk, mode=[1, 2]), (None, 0))
-                gV = cute.local_tile(mV_cur, cute.select(self.mma_tiler_pv, mode=[1, 2]), (0, None))
+                if const_expr(self.is_split_d):
+                    kv_tile = cute.select(self.mma_tiler_qk, mode=[1, 2])  # (n_block_size, half_head_dim)
+                    pv_tile = cute.select(self.mma_tiler_pv, mode=[1, 2])  # (half_head_dim_v, n_block_size)
+                    gK_low = cute.local_tile(mK_cur, kv_tile, (None, 0))
+                    gK_high = cute.local_tile(mK_cur, kv_tile, (None, 1))
+                    gV_low = cute.local_tile(mV_cur, pv_tile, (0, None))
+                    gV_high = cute.local_tile(mV_cur, pv_tile, (1, None))
+                    gK = gK_low  # placeholder for existing code paths
+                    gV = gV_low
+                else:
+                    gK = cute.local_tile(mK_cur, cute.select(self.mma_tiler_qk, mode=[1, 2]), (None, 0))
+                    gV = cute.local_tile(mV_cur, cute.select(self.mma_tiler_pv, mode=[1, 2]), (0, None))
             else:
                 # Need to keep batch coord None since we'll index into it with page idx
                 mK_cur, mV_cur = [t[None, None, head_idx_kv, None] for t in (mK, mV)]
@@ -1313,7 +1375,23 @@ class FlashAttentionForwardSm100:
                 )
             tSgK = thr_mma_qk.partition_B(gK)
             tOgV = thr_mma_pv.partition_B(gV)
-            if const_expr(self.use_tma_Q):
+            if const_expr(self.is_split_d):
+                tSgK_high = thr_mma_qk.partition_B(gK_high)
+                tOgV_high = thr_mma_pv.partition_B(gV_high)
+            if const_expr(self.is_split_d):
+                q_tile_splitd = (self.mma_tiler_qk[0], self.half_head_dim)
+                gQ_low = cute.local_tile(mQ_cur, q_tile_splitd, (None, 0))
+                gQ_high = cute.local_tile(mQ_cur, q_tile_splitd, (None, 1))
+                tSgQ_low = thr_mma_qk.partition_A(gQ_low)
+                tSgQ_high = thr_mma_qk.partition_A(gQ_high)
+                load_Q_low_fn, _, _ = copy_utils.tma_get_copy_fn(
+                    tma_atom_Q, 0, cute.make_layout(1), tSgQ_low, sQ
+                )
+                load_Q_high_fn, _, _ = copy_utils.tma_get_copy_fn(
+                    tma_atom_Q, 0, cute.make_layout(1), tSgQ_high, sQ
+                )
+                load_Q = partial(self.load_Q_split_d, load_Q_low_fn, load_Q_high_fn, pipeline_q=pipeline_q, phase=q_producer_phase)
+            elif const_expr(self.use_tma_Q):
                 tiler_gQ = ((self.mma_tiler_qk[0] * self.q_stage), self.head_dim_padded)
                 gQ = cute.local_tile(mQ_cur, tiler_gQ, (m_block, 0))  # (128 * 2, 128)
                 gQ = layout_utils.select(
@@ -1353,8 +1431,20 @@ class FlashAttentionForwardSm100:
                     cute.group_modes(sV, 0, 3),
                     cute.group_modes(tOgV, 0, 3),
                 )
+                if const_expr(self.is_split_d):
+                    _, tKgK_high = cpasync.tma_partition(
+                        tma_atom_K, 0, cute.make_layout(1),
+                        cute.group_modes(sK, 0, 3),
+                        cute.group_modes(tSgK_high, 0, 3),
+                    )
+                    _, tVgV_high = cpasync.tma_partition(
+                        tma_atom_V, 0, cute.make_layout(1),
+                        cute.group_modes(sV, 0, 3),
+                        cute.group_modes(tOgV_high, 0, 3),
+                    )
                 paged_kv_manager = None
             else:
+                assert not self.is_split_d, "Paged KV not supported with Split-D"
                 page_size = mK.shape[0]
                 paged_kv_manager = PagedKVManager.create(
                     mPageTable,
@@ -1395,6 +1485,27 @@ class FlashAttentionForwardSm100:
                 pipeline_kv=pipeline_kv,
                 K_or_V="V",
             )
+            if const_expr(self.is_split_d):
+                load_K_high = partial(
+                    self.load_KV,
+                    tma_atom_K,
+                    tKgK_high,
+                    tKsK,
+                    None,
+                    sK,
+                    pipeline_kv=pipeline_kv,
+                    K_or_V="K",
+                )
+                load_V_high = partial(
+                    self.load_KV,
+                    tma_atom_V,
+                    tVgV_high,
+                    tVsV,
+                    None,
+                    sV,
+                    pipeline_kv=pipeline_kv,
+                    K_or_V="V",
+                )
 
             if const_expr(not self.use_block_sparsity):
                 n_block_min, n_block_max = block_info.get_n_block_min_max(
@@ -1409,34 +1520,61 @@ class FlashAttentionForwardSm100:
                     )
                     if const_expr(not self.use_tma_KV):
                         paged_kv_manager.load_page_table(n_block_first)
-                    if issue_kv_for_this_warp:
-                        load_K(block=n_block_max - 1, producer_state=kv_producer_state, page_idx=page_idx)  # K0
-                    # load_K(block=n_block_max - 1, producer_state=kv_producer_state, page_idx=page_idx, extra_tx_count=self.tma_copy_bytes["Q"])  # K0
-                    if issue_q_for_this_warp:
-                        load_Q(block=0, stage=0)
-                    if issue_kv_for_this_warp:
-                        kv_producer_state.advance()
-                    if const_expr(self.q_stage == 2) and issue_q_for_this_warp:
-                        load_Q(block=1, stage=1)
-                    q_producer_phase ^= 1
-                    if issue_kv_for_this_warp:
-                        load_V(block=n_block_max - 1, producer_state=kv_producer_state, page_idx=page_idx)  # V0
-                        kv_producer_state.advance()
-                    for i in cutlass.range(n_block_max - 1 - n_block_min, unroll=1):
-                        n_block = n_block_max - 2 - i
-                        page_idx = (
-                            mPageTable[batch_idx, n_block]
-                            if const_expr(mPageTable is not None and self.use_tma_KV)
-                            else None
-                        )
-                        if const_expr(not self.use_tma_KV):
-                            paged_kv_manager.load_page_table(n_block)
-                    # if cute.arch.thread_idx()[0] % 32 == 0: cute.printf("n_block = {}, page_idx = {}", n_block, page_idx)
+                    if const_expr(self.is_split_d):
+                        # Split-D: load K_low, K_high, Q(split), V_low, V_high per N-block
                         if issue_kv_for_this_warp:
-                            load_K(block=n_block, producer_state=kv_producer_state, page_idx=page_idx)  # Ki
+                            load_K(block=n_block_max - 1, producer_state=kv_producer_state, page_idx=page_idx)
                             kv_producer_state.advance()
-                            load_V(block=n_block, producer_state=kv_producer_state, page_idx=page_idx)  # Vi
+                            load_K_high(block=n_block_max - 1, producer_state=kv_producer_state, page_idx=page_idx)
                             kv_producer_state.advance()
+                        if issue_q_for_this_warp:
+                            load_Q(block=m_block)
+                        q_producer_phase ^= 1
+                        if issue_kv_for_this_warp:
+                            load_V(block=n_block_max - 1, producer_state=kv_producer_state, page_idx=page_idx)
+                            kv_producer_state.advance()
+                            load_V_high(block=n_block_max - 1, producer_state=kv_producer_state, page_idx=page_idx)
+                            kv_producer_state.advance()
+                        for i in cutlass.range(n_block_max - 1 - n_block_min, unroll=1):
+                            n_block = n_block_max - 2 - i
+                            if issue_kv_for_this_warp:
+                                load_K(block=n_block, producer_state=kv_producer_state, page_idx=None)
+                                kv_producer_state.advance()
+                                load_K_high(block=n_block, producer_state=kv_producer_state, page_idx=None)
+                                kv_producer_state.advance()
+                                load_V(block=n_block, producer_state=kv_producer_state, page_idx=None)
+                                kv_producer_state.advance()
+                                load_V_high(block=n_block, producer_state=kv_producer_state, page_idx=None)
+                                kv_producer_state.advance()
+                    else:
+                        if issue_kv_for_this_warp:
+                            load_K(block=n_block_max - 1, producer_state=kv_producer_state, page_idx=page_idx)  # K0
+                        # load_K(block=n_block_max - 1, producer_state=kv_producer_state, page_idx=page_idx, extra_tx_count=self.tma_copy_bytes["Q"])  # K0
+                        if issue_q_for_this_warp:
+                            load_Q(block=0, stage=0)
+                        if issue_kv_for_this_warp:
+                            kv_producer_state.advance()
+                        if const_expr(self.q_stage == 2) and issue_q_for_this_warp:
+                            load_Q(block=1, stage=1)
+                        q_producer_phase ^= 1
+                        if issue_kv_for_this_warp:
+                            load_V(block=n_block_max - 1, producer_state=kv_producer_state, page_idx=page_idx)  # V0
+                            kv_producer_state.advance()
+                        for i in cutlass.range(n_block_max - 1 - n_block_min, unroll=1):
+                            n_block = n_block_max - 2 - i
+                            page_idx = (
+                                mPageTable[batch_idx, n_block]
+                                if const_expr(mPageTable is not None and self.use_tma_KV)
+                                else None
+                            )
+                            if const_expr(not self.use_tma_KV):
+                                paged_kv_manager.load_page_table(n_block)
+                        # if cute.arch.thread_idx()[0] % 32 == 0: cute.printf("n_block = {}, page_idx = {}", n_block, page_idx)
+                            if issue_kv_for_this_warp:
+                                load_K(block=n_block, producer_state=kv_producer_state, page_idx=page_idx)  # Ki
+                                kv_producer_state.advance()
+                                load_V(block=n_block, producer_state=kv_producer_state, page_idx=page_idx)  # Vi
+                                kv_producer_state.advance()
 
             else:
                 kv_producer_state, q_producer_phase = produce_block_sparse_loads_sm100(
@@ -1501,73 +1639,89 @@ class FlashAttentionForwardSm100:
         q_smem_base = sm100_desc.smem_desc_base_from_tensor(sQ, sm100_desc.Major.K)
         k_smem_base = sm100_desc.smem_desc_base_from_tensor(sK, sm100_desc.Major.K)
         v_smem_base = sm100_desc.smem_desc_base_from_tensor(sV, sm100_desc.Major.MN)
-        q_smem_start = [sm100_desc.make_smem_desc_start_addr(sQ[None, None, None, stage].iterator) for stage in range(self.q_stage)]
-
-        sm100_utils.declare_ptx_smem_desc(q_smem_start[self.q_stage - 1], q_smem_base, tSrQ[None, None, None, 0].layout, var_name_prefix="fa_fwd_q_smem_desc")
+        if const_expr(self.is_split_d):
+            q_smem_start = [sm100_desc.make_smem_desc_start_addr(sQ[None, None, None, stage].iterator) for stage in range(self.q_smem_stages)]
+            sm100_utils.declare_ptx_smem_desc(q_smem_start[1], q_smem_base, tSrQ[None, None, None, 0].layout, var_name_prefix="fa_fwd_q_smem_desc")
+        else:
+            q_smem_start = [sm100_desc.make_smem_desc_start_addr(sQ[None, None, None, stage].iterator) for stage in range(self.q_stage)]
+            sm100_utils.declare_ptx_smem_desc(q_smem_start[self.q_stage - 1], q_smem_base, tSrQ[None, None, None, 0].layout, var_name_prefix="fa_fwd_q_smem_desc")
         sm100_utils.declare_ptx_idesc(qk_mma_op, var_name="fa_fwd_qk_mma_idesc")
         sm100_utils.declare_ptx_idesc(pv_mma_op, var_name="fa_fwd_pv_mma_idesc")
 
         sQ_stage_stride = (sQ.layout.stride[-1] * sQ.element_type.width // 8) >> 4
-        if const_expr(self.q_stage == 1):
+        if const_expr(self.q_stage == 1 and not self.is_split_d):
             sQ_stage_stride = 0
-        gemm_Si = [
-            partial(
-                # sm100_utils.gemm_ptx_precomputed,
-                # self.tmem_s_offset[stage],
-                # smem_desc_start_a=q_smem_start[stage],
-                # idesc=qk_mma_idesc,
-                # smem_desc_base_a=q_smem_base,
-                # smem_desc_base_b=k_smem_base,
-                # tCrA_layout=tSrQ[None, None, None, 0].layout,
+
+        if const_expr(self.is_split_d):
+            gemm_Si_low = partial(
                 sm100_utils.gemm_ptx_precomputed_varname,
-                self.tmem_s_offset[stage],
-                # idesc=qk_mma_idesc,
+                self.tmem_s_offset[0],
                 smem_desc_base_b=k_smem_base,
                 tCrB_layout=tSrK[None, None, None, 0].layout,
-                smem_var_name_prefix=f"fa_fwd_q_smem_desc",
-                idesc_var_name=f"fa_fwd_qk_mma_idesc",
-                smem_offset=-sQ_stage_stride if stage == 0 else sQ_stage_stride,
+                smem_var_name_prefix="fa_fwd_q_smem_desc",
+                idesc_var_name="fa_fwd_qk_mma_idesc",
+                smem_offset=-sQ_stage_stride,
                 zero_init=True,
                 cta_group=self.cta_group_size,
             )
-            for stage in range(self.q_stage)
-        ]
-        # gemm_Si = [
-        #     partial(
-        #         sm100_utils.gemm,
-        #         tiled_mma_qk,
-        #         tStS[None, None, None, stage],
-        #         tCrA=tSrQ[None, None, None, stage],
-        #         zero_init=True,
-        #     )
-        #     for stage in range(self.q_stage)
-        # ]
-        gemm_Pi = [
-            partial(
-                # sm100_utils.gemm_ptx_precomputed,
-                sm100_utils.gemm_ptx_partial,
-                pv_mma_op,
-                self.tmem_o_offset[stage],
-                tOrP[None, None, None, stage],
-                sA=None,
-                split_arrive=self.split_P_arrive if self.split_P_arrive > 0 else None,
-                # smem_desc_start_a=tOrP[None, None, None, stage].iterator.toint(),
-                # smem_desc_start_a=self.tmem_p_offset[stage],
-                # idesc=pv_mma_idesc,
-                # smem_desc_base_a=None,
-                # smem_desc_base_b=v_smem_base,
-                # tCrA_layout=tOrP[None, None, None, 0].layout,
-                # tCrB_layout=tOrV[None, None, None, 0].layout
+            gemm_Si_high = partial(
+                sm100_utils.gemm_ptx_precomputed_varname,
+                self.tmem_s_offset[0],
+                smem_desc_base_b=k_smem_base,
+                tCrB_layout=tSrK[None, None, None, 0].layout,
+                smem_var_name_prefix="fa_fwd_q_smem_desc",
+                idesc_var_name="fa_fwd_qk_mma_idesc",
+                smem_offset=sQ_stage_stride,
+                zero_init=False,
                 cta_group=self.cta_group_size,
             )
-            for stage in range(self.q_stage)
-        ]
-        # gemm_Pi = [
-        #     partial(
-        #         sm100_utils.gemm, tOtO[None, None, None, stage], tCrA=tOrP[None, None, None, stage]
-        #     )
-        #     for stage in range(self.q_stage)
-        # ]
+            gemm_Si = [gemm_Si_low]
+            gemm_Pi_low = partial(
+                sm100_utils.gemm_ptx_partial,
+                pv_mma_op,
+                self.tmem_o_low_offset,
+                tOrP[None, None, None, 0],
+                sA=None,
+                split_arrive=self.split_P_arrive if self.split_P_arrive > 0 else None,
+                cta_group=self.cta_group_size,
+            )
+            gemm_Pi_high = partial(
+                sm100_utils.gemm_ptx_partial,
+                pv_mma_op,
+                self.tmem_o_high_offset,
+                tOrP[None, None, None, 0],
+                sA=None,
+                split_arrive=None,
+                cta_group=self.cta_group_size,
+            )
+            gemm_Pi = [gemm_Pi_low]
+        else:
+            gemm_Si = [
+                partial(
+                    sm100_utils.gemm_ptx_precomputed_varname,
+                    self.tmem_s_offset[stage],
+                    smem_desc_base_b=k_smem_base,
+                    tCrB_layout=tSrK[None, None, None, 0].layout,
+                    smem_var_name_prefix=f"fa_fwd_q_smem_desc",
+                    idesc_var_name=f"fa_fwd_qk_mma_idesc",
+                    smem_offset=-sQ_stage_stride if stage == 0 else sQ_stage_stride,
+                    zero_init=True,
+                    cta_group=self.cta_group_size,
+                )
+                for stage in range(self.q_stage)
+            ]
+            gemm_Pi = [
+                partial(
+                    sm100_utils.gemm_ptx_partial,
+                    pv_mma_op,
+                    self.tmem_o_offset[stage],
+                    tOrP[None, None, None, stage],
+                    sA=None,
+                    split_arrive=self.split_P_arrive if self.split_P_arrive > 0 else None,
+                    cta_group=self.cta_group_size,
+                )
+                for stage in range(self.q_stage)
+            ]
 
         mma_q_consumer_phase = Int32(0)
         mma_kv_consumer_state = pipeline.make_pipeline_state(
@@ -1602,6 +1756,101 @@ class FlashAttentionForwardSm100:
                     process_tile = n_block_min < n_block_max
 
             if process_tile and is_leader_cta:
+              if const_expr(self.is_split_d):
+                # ── Split-D MMA: 4 KV stages per N-block ──
+                # Prologue: QK_low + QK_high for first N-block
+                pipeline_q.consumer_wait_w_index_phase(0, mma_q_consumer_phase)
+                # K_low
+                pipeline_kv.consumer_wait(mma_kv_consumer_state)
+                sK_cur = sK[None, None, None, mma_kv_consumer_state.index]
+                gemm_Si_low(smem_desc_start_b=sm100_desc.make_smem_desc_start_addr(sK_cur.iterator))
+                pipeline_kv.consumer_release(mma_kv_consumer_state)
+                mma_kv_consumer_state.advance()
+                # K_high
+                pipeline_kv.consumer_wait(mma_kv_consumer_state)
+                sK_cur = sK[None, None, None, mma_kv_consumer_state.index]
+                gemm_Si_high(smem_desc_start_b=sm100_desc.make_smem_desc_start_addr(sK_cur.iterator))
+                pipeline_kv.consumer_release(mma_kv_consumer_state)
+                mma_kv_consumer_state.advance()
+                pipeline_s_p_o.producer_commit_w_index(0)
+                mma_q_consumer_phase ^= 1
+
+                block_loop_count = block_iter_count - 1
+                O_should_accumulate = False
+                Vi_index = Int32(0)
+                for i in cutlass.range(block_loop_count, unroll=1):
+                    # PV_low
+                    pipeline_kv.consumer_wait(mma_kv_consumer_state)
+                    Vi_index = mma_kv_consumer_state.index
+                    pipeline_s_p_o.producer_acquire_w_index_phase(0, P_full_O_rescaled_phase)
+                    gemm_Pi_low(
+                        tCrB=tOrV[None, None, None, Vi_index],
+                        sB=sV[None, None, None, Vi_index],
+                        zero_init=not O_should_accumulate,
+                        mbar_ptr=pipeline_p_lastsplit.sync_object_full.get_barrier(0) if self.split_P_arrive > 0 else None,
+                        mbar_phase=P_full_O_rescaled_phase,
+                    )
+                    pipeline_kv.consumer_release(mma_kv_consumer_state)
+                    mma_kv_consumer_state.advance()
+                    # PV_high
+                    pipeline_kv.consumer_wait(mma_kv_consumer_state)
+                    Vi_index = mma_kv_consumer_state.index
+                    gemm_Pi_high(
+                        tCrB=tOrV[None, None, None, Vi_index],
+                        sB=sV[None, None, None, Vi_index],
+                        zero_init=not O_should_accumulate,
+                        mbar_ptr=None,
+                        mbar_phase=P_full_O_rescaled_phase,
+                    )
+                    pipeline_kv.consumer_release(mma_kv_consumer_state)
+                    mma_kv_consumer_state.advance()
+                    # QK_low
+                    pipeline_kv.consumer_wait(mma_kv_consumer_state)
+                    sK_cur = sK[None, None, None, mma_kv_consumer_state.index]
+                    gemm_Si_low(smem_desc_start_b=sm100_desc.make_smem_desc_start_addr(sK_cur.iterator))
+                    pipeline_kv.consumer_release(mma_kv_consumer_state)
+                    mma_kv_consumer_state.advance()
+                    # QK_high
+                    pipeline_kv.consumer_wait(mma_kv_consumer_state)
+                    sK_cur = sK[None, None, None, mma_kv_consumer_state.index]
+                    gemm_Si_high(smem_desc_start_b=sm100_desc.make_smem_desc_start_addr(sK_cur.iterator))
+                    pipeline_kv.consumer_release(mma_kv_consumer_state)
+                    mma_kv_consumer_state.advance()
+                    pipeline_s_p_o.producer_commit_w_index(0)
+                    P_full_O_rescaled_phase ^= 1
+                    O_should_accumulate = True
+
+                # Release Q
+                pipeline_q.consumer_release_w_index(0)
+
+                # Epilogue: last PV_low + PV_high
+                pipeline_kv.consumer_wait(mma_kv_consumer_state)
+                Vi_index = mma_kv_consumer_state.index
+                pipeline_s_p_o.producer_acquire_w_index_phase(0, P_full_O_rescaled_phase)
+                gemm_Pi_low(
+                    tCrB=tOrV[None, None, None, Vi_index],
+                    sB=sV[None, None, None, Vi_index],
+                    zero_init=not O_should_accumulate,
+                    mbar_ptr=pipeline_p_lastsplit.sync_object_full.get_barrier(0) if self.split_P_arrive > 0 else None,
+                    mbar_phase=P_full_O_rescaled_phase,
+                )
+                pipeline_kv.consumer_release(mma_kv_consumer_state)
+                mma_kv_consumer_state.advance()
+
+                pipeline_kv.consumer_wait(mma_kv_consumer_state)
+                Vi_index = mma_kv_consumer_state.index
+                gemm_Pi_high(
+                    tCrB=tOrV[None, None, None, Vi_index],
+                    sB=sV[None, None, None, Vi_index],
+                    zero_init=not O_should_accumulate,
+                    mbar_ptr=None,
+                    mbar_phase=P_full_O_rescaled_phase,
+                )
+                pipeline_o_acc.producer_commit_w_index(0)
+                P_full_O_rescaled_phase ^= 1
+                pipeline_kv.consumer_release(mma_kv_consumer_state)
+                mma_kv_consumer_state.advance()
+              else:
                 for stage in cutlass.range_constexpr(self.q_stage):
                     # GEMM_QK00 (Q0 * K0 -> S0) or GEMM_QK01 (Q1 * K0 -> S1)
                     # 1. wait for Q0 / Q1
@@ -1611,93 +1860,58 @@ class FlashAttentionForwardSm100:
                         pipeline_kv.consumer_wait(mma_kv_consumer_state)
                     Ki_index, Ki_phase = mma_kv_consumer_state.index, mma_kv_consumer_state.phase
                     tSrKi = tSrK[None, None, None, Ki_index]
-                    # We don't need to acquire empty S0 / S1.
-                    # For the first iteration, we don't need to wait as we're guaranteed S0 / S1
-                    # are empty. For subsequent iterations, the wait happened at the end
-                    # of the while loop.
-                    # 3. gemm
-                    # sm100_utils.gemm(tiled_mma_qk, tStS[None, None, None, stage], tSrQ[None, None, None, stage], tSrKi, zero_init=True)
                     sK_cur = sK[None, None, None, Ki_index]
                     if const_expr(self.uneven_kv_smem):
                         sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
-                    # gemm_Si[stage](tCrB=tSrKi, sB=sK_cur)
                     gemm_Si[stage](
                         smem_desc_start_b=sm100_desc.make_smem_desc_start_addr(sK_cur.iterator)
                     )
-                    # gemm_Si[stage](tCrB=tSrKi)
                     # 4. release S0 / S1
                     pipeline_s_p_o.producer_commit_w_index(stage)
                 mma_q_consumer_phase ^= 1
                 # 5. release K0
                 pipeline_kv.consumer_release(mma_kv_consumer_state)
                 mma_kv_consumer_state.advance()
-                # End of GEMM (Q1 * K0 -> S1)
-                # Note: Q0 & Q1 are still needed in the seqlen_kv loop
-                # so we need to release them after the seqlen_kv loop
 
                 # O hasn't been accumulated yet, its first MMA calculation doesn't need to accumulate
                 block_loop_count = block_iter_count - 1
                 O_should_accumulate = False
+                Vi_index = Int32(0)
                 for i in cutlass.range(block_loop_count, unroll=1):
-                    # GEMM_PV00 (P0 * V0 -> O0_partial), O0 needs to be accumulated in the seqlen_kv loop
+                    # GEMM_PV00 (P0 * V0 -> O0_partial)
                     # 1. wait for V0
                     pipeline_kv.consumer_wait(mma_kv_consumer_state)
                     mma_kv_release_state = mma_kv_consumer_state.clone()
                     Vi_index, Vi_phase = mma_kv_consumer_state.index, mma_kv_consumer_state.phase
                     tOrVi = tOrV[None, None, None, Vi_index]
                     for stage in cutlass.range_constexpr(self.q_stage):
-                        # 2. acquire corrected O0/O1_partial and P0 / P1
-                        # For the first iteration in this work tile, waiting for O0/O1_partial
-                        # means that the correction warps has finished reading tO during
-                        # the last iteration of the previous work tile.
                         pipeline_s_p_o.producer_acquire_w_index_phase(stage, P_full_O_rescaled_phase)
-                        # 3. gemm
-                        # sm100_utils.gemm(tiled_mma_pv, tOtO0, tOrP0, tOrVi, zero_init=True)
-                        # gemm_Pi[stage](tCrB=tOrVi, sB=sV[None, None, None, Vi_index], zero_init=not O_should_accumulate)
                         sV_cur = sV[None, None, None, Vi_index]
                         if const_expr(self.uneven_kv_smem):
                             sV_cur = self.offset_kv_smem(sV_cur, Vi_index, Vi_phase)
                         gemm_Pi[stage](
                             tCrB=tOrVi,
                             sB=sV_cur,
-                            # smem_desc_start_b=sm100_desc.make_smem_desc_start_addr(sV_cur.iterator),
                             zero_init=not O_should_accumulate,
                             mbar_ptr=pipeline_p_lastsplit.sync_object_full.get_barrier(stage) if self.split_P_arrive > 0 else None,
                             mbar_phase=P_full_O_rescaled_phase,
                         )
-                        # Don't need to signal O_full to the correction warps since the
-                        # correction warps wait for the softmax warps anyway. By the time the softmax
-                        # warps finished, S_i for the next iteration must have been done, so O_i-1
-                        # must have been done as well.
-                        # pipeline_o_acc.producer_commit_w_index(stage)
-                        # 4. release V(i-1)
                         if const_expr(stage == self.q_stage - 1):
                             pipeline_kv.consumer_release(mma_kv_release_state)
                             mma_kv_release_state.advance()
-                        # End of GEMM_PV00 (P0 * V0 -> O0_partial)
 
                         # GEMM_QK0i (Q0 * Ki -> S0)
-                        # 1. wait for Ki
                         if const_expr(stage == 0):
                             mma_kv_consumer_state.advance()
                             pipeline_kv.consumer_wait(mma_kv_consumer_state)
                         Ki_index, Ki_phase = mma_kv_consumer_state.index, mma_kv_consumer_state.phase
-                        # 2. gemm
-                        # Don't need to wait for the softmax warp to have finished reading the previous
-                        # Si, since this gemm is scheduled after the PV gemm, which guaranteed that Si
-                        # has been read and Pi has been written.
-                        # sm100_utils.gemm(tiled_mma_qk, tStS[None, None, None, stage], tSrQ[None, None, None, stage], tSrK[None, None, None, Ki_index], zero_init=True)
                         sK_cur = sK[None, None, None, Ki_index]
                         if const_expr(self.uneven_kv_smem):
                             sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
-                        # gemm_Si[stage](tCrB=tSrK[None, None, None, Ki_index], sB=sK_cur)
                         gemm_Si[stage](
                             smem_desc_start_b=sm100_desc.make_smem_desc_start_addr(sK_cur.iterator)
                         )
-                        # gemm_Si[stage](tCrB=tSrK[None, None, None, Ki_index])
-                        # 3. release S0 / S1
                         pipeline_s_p_o.producer_commit_w_index(stage)
-                        # End of GEMM_QK0i (Q0 * Ki -> S0)
                     # 4. release Ki
                     pipeline_kv.consumer_release(mma_kv_consumer_state)
                     mma_kv_consumer_state.advance()
@@ -1709,40 +1923,26 @@ class FlashAttentionForwardSm100:
                 for stage in cutlass.range(self.q_stage):
                     pipeline_q.consumer_release_w_index(stage)
 
-                # GEMM_PV00 (P0 * V0 -> O0_partial), O0 needs to be accumulated in the seqlen_kv loop
-                # 1. wait for V0
+                # Last PV GEMM
                 pipeline_kv.consumer_wait(mma_kv_consumer_state)
                 Vi_index, Vi_phase = mma_kv_consumer_state.index, mma_kv_consumer_state.phase
                 tOrVi = tOrV[None, None, None, Vi_index]
                 for stage in cutlass.range_constexpr(self.q_stage):
-                    # 2. acquire corrected Oi_partial and Pi
                     pipeline_s_p_o.producer_acquire_w_index_phase(stage, P_full_O_rescaled_phase)
-                    # 3. gemm
-                    # sm100_utils.gemm(tiled_mma_pv, tOtO0, tOrP0, tOrVi, zero_init=True)
-                    # gemm_Pi[stage](tCrB=tOrVi, sB=sV[None, None, None, Vi_index], zero_init=not O_should_accumulate)
                     sV_cur = sV[None, None, None, Vi_index]
                     if const_expr(self.uneven_kv_smem):
                         sV_cur = self.offset_kv_smem(sV_cur, Vi_index, Vi_phase)
                     gemm_Pi[stage](
                         tCrB=tOrVi,
                         sB=sV_cur,
-                        # smem_desc_start_b=sm100_desc.make_smem_desc_start_addr(sV_cur.iterator),
                         zero_init=not O_should_accumulate,
                         mbar_ptr=pipeline_p_lastsplit.sync_object_full.get_barrier(stage) if self.split_P_arrive > 0 else None,
                         mbar_phase=P_full_O_rescaled_phase,
                     )
-                    # 4. release accumulated O0_partial
-                    # We do need O_full here since for the last tile, by the time the softmax warp
-                    # has signaled to the correction warps, the softmax warp has just finished
-                    # computing the row sum of the current tile. It does not guarantee that the 1st
-                    # tile of the next work tile has been computed yet.
                     pipeline_o_acc.producer_commit_w_index(stage)
-                    # End of GEMM_PV00 (P0 * V0 -> O0_partial)
                 P_full_O_rescaled_phase ^= 1
-                # 5. release Vi_end
                 pipeline_kv.consumer_release(mma_kv_consumer_state)
                 mma_kv_consumer_state.advance()
-                # End of GEMM_PV1(i_end) (P1 * Vi_end -> O1)
 
             # Advance to next tile
             work_tile = tile_scheduler.advance_to_next_work()
@@ -2635,10 +2835,19 @@ class FlashAttentionForwardSm100:
         tOtO_t2r = thr_tmem_load.partition_S(tOtO_i[(None, None), None])
         tOsO_s2r = copy_utils.partition_D_position_independent(thr_tmem_load, tOsO_i[(None, None), None])
         tOcO_t2r = thr_tmem_load.partition_D(tOcO_i[(None, None), None])
+        tOrO_frg_shape = tOcO_t2r[None, 0, 0, 0].shape
+        single_tile_layout = tOtO_t2r[None, 0, 0, 0].layout
         for i in cutlass.range(self.head_dim_v_padded // corr_tile_size, unroll_full=True):
-            tOtO_t2r_i = tOtO_t2r[None, 0, 0, i]
+            if const_expr(self.is_split_d):
+                # Split-D: tOtO only covers half_head_dim_v cols, but O_low and O_high are
+                # contiguous in TMEM. Use manual iterator arithmetic to reach O_high cols.
+                tOtO_t2r_i = cute.make_tensor(
+                    tOtO_t2r.iterator + i * corr_tile_size, single_tile_layout
+                )
+            else:
+                tOtO_t2r_i = tOtO_t2r[None, 0, 0, i]
             tOsO_r2s_i = tOsO_s2r[None, 0, 0, i]
-            tOrO_frg = cute.make_fragment(tOcO_t2r[None, 0, 0, i].shape, self.pv_acc_dtype)
+            tOrO_frg = cute.make_fragment(tOrO_frg_shape, self.pv_acc_dtype)
             cute.copy(tiled_tmem_load, tOtO_t2r_i, tOrO_frg)
             for j in cutlass.range(0, cute.size(tOrO_frg), 2, unroll_full=True):
                 tOrO_frg[j], tOrO_frg[j + 1] = cute.arch.mul_packed_f32x2(
@@ -2821,6 +3030,20 @@ class FlashAttentionForwardSm100:
     ):
         pipeline_q.producer_acquire_w_index_phase(stage, phase)
         load_Q_fn(src_idx=block, dst_idx=stage, tma_bar_ptr=pipeline_q.sync_object_full.get_barrier(stage))
+
+    def load_Q_split_d(
+        self,
+        load_Q_low_fn: Callable,
+        load_Q_high_fn: Callable,
+        pipeline_q: pipeline.PipelineAsync,
+        block: Int32,
+        phase: Int32,
+    ):
+        """Load both Q_low and Q_high for Split-D on the same pipeline barrier (stage=0)."""
+        pipeline_q.producer_acquire_w_index_phase(0, phase)
+        bar_ptr = pipeline_q.sync_object_full.get_barrier(0)
+        load_Q_low_fn(src_idx=block, dst_idx=0, tma_bar_ptr=bar_ptr)
+        load_Q_high_fn(src_idx=block, dst_idx=1, tma_bar_ptr=bar_ptr)
 
     def load_Q_non_tma(
         self,

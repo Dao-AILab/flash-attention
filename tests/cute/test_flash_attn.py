@@ -253,7 +253,7 @@ def test_flash_attn_output(
             # SplitKV not supported on SM90 - skip this iteration
             if IS_SM90 and num_splits > 1:
                 continue
-            if IS_SM100 and (d >= 192 and dv >= 192):  # hdim 192 and 256 not support on SM100
+            if IS_SM100 and d >= 192 and dv >= 192 and d != 256:
                 continue
             out, lse = flash_attn_func(
                 q,
@@ -292,7 +292,7 @@ def test_flash_attn_output(
             and not dv > 256
             and not attention_chunk != 0
             and softcap == 0.0
-            and ((dv == d and d <= 128) or (d == 192 and dv == 128))
+            and ((dv == d and (d <= 128 or d == 256)) or (d == 192 and dv == 128))
             and learnable_sink is None
             # and False
             and not ((causal or local) and seqlen_k < seqlen_q)
@@ -403,7 +403,7 @@ def test_flash_attn_output(
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128])
 # @pytest.mark.parametrize("d", [64, 96, 128])
 # @pytest.mark.parametrize("d", [128, 192])
-@pytest.mark.parametrize("d", [64, 128, 192])
+@pytest.mark.parametrize("d", [64, 128, 192, 256])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -741,7 +741,7 @@ def test_flash_attn_varlen_output(
             and not has_qv
             and not dv > 256
             and not attention_chunk != 0
-            and ((dv == d and d <= 128) or (d == 192 and dv == 128))
+            and ((dv == d and (d <= 128 or d == 256)) or (d == 192 and dv == 128))
             and not has_learnable_sink
             # and False
         ):

@@ -35,7 +35,7 @@ IS_SM90 = torch.cuda.get_device_capability()[0] == 9
 @pytest.mark.parametrize("mha_type", ["mha", "gqa", "mqa"])
 @pytest.mark.parametrize("num_splits", [1, 3])
 @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("d", [64, 128, 256])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -49,11 +49,13 @@ IS_SM90 = torch.cuda.get_device_capability()[0] == 9
 def test_flash_attn_output(seqlen_q, seqlen_k, d, causal, num_splits, mha_type, dtype):
     if IS_SM90 and num_splits > 1:
         pytest.skip("SM90 fwd doens't support num_splits > 1")
+    if d >= 192 and num_splits > 1:
+        pytest.skip("SplitKV not supported for hdim >= 192")
     device = "cuda"
     torch.random.manual_seed(0)
     random.seed(0)
     torch.cuda.empty_cache()
-    batch_size = 4
+    batch_size = 2 if d == 256 else 4
     nheads = 6
     nheads_kv = nheads if mha_type == "mha" else (3 if mha_type == "gqa" else 1)
 
@@ -81,7 +83,7 @@ def test_flash_attn_output(seqlen_q, seqlen_k, d, causal, num_splits, mha_type, 
     # Backward (only for non-split, matching d)
     can_bwd = (
         num_splits == 1
-        and d <= 128
+        and d <= 256
         and not (causal and seqlen_k < seqlen_q)
     )
     if IS_SM90 and d == 64 and not causal:
@@ -110,7 +112,7 @@ def test_flash_attn_output(seqlen_q, seqlen_k, d, causal, num_splits, mha_type, 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("mha_type", ["mha", "gqa", "mqa"])
 @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("d", [64, 128, 256])
 @pytest.mark.parametrize("seqlen", [128, 256, 1024])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_varlen_output(seqlen, d, causal, mha_type, dtype):
@@ -119,7 +121,7 @@ def test_flash_attn_varlen_output(seqlen, d, causal, mha_type, dtype):
     seed = seqlen + d + int(causal) * 2
     torch.random.manual_seed(seed)
     random.seed(seed)
-    batch_size = 9
+    batch_size = 3 if d == 256 else 9
     nheads = 6
     nheads_kv = nheads if mha_type == "mha" else (3 if mha_type == "gqa" else 1)
 
@@ -152,7 +154,7 @@ def test_flash_attn_varlen_output(seqlen, d, causal, mha_type, dtype):
     assert (out_reshaped - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item() + fwd_atol
 
     # Backward
-    can_bwd = d <= 128
+    can_bwd = d <= 256
     if not can_bwd:
         return
 
@@ -179,7 +181,7 @@ def test_flash_attn_varlen_output(seqlen, d, causal, mha_type, dtype):
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("mha_type", ["mha", "gqa", "mqa"])
 @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("d", [64, 128, 256])
 @pytest.mark.parametrize("seqlen", [128, 256])
 @pytest.mark.parametrize(
     "unpad_q,unpad_kv",
@@ -192,7 +194,7 @@ def test_flash_attn_varlen_unpad_output(seqlen, d, causal, mha_type, unpad_q, un
     seed = seqlen + d + int(causal) * 2 + int(unpad_q) * 7 + int(unpad_kv) * 13
     torch.random.manual_seed(seed)
     random.seed(seed)
-    batch_size = 9
+    batch_size = 3 if d == 256 else 9
     nheads = 6
     nheads_kv = nheads if mha_type == "mha" else (3 if mha_type == "gqa" else 1)
 
@@ -265,7 +267,7 @@ def test_flash_attn_varlen_unpad_output(seqlen, d, causal, mha_type, unpad_q, un
     assert (out_masked - out_ref_masked).abs().max().item() <= 2 * (out_pt_masked - out_ref_masked).abs().max().item() + fwd_atol
 
     # Backward (original test skips all SM90 varlen backward)
-    can_bwd = d <= 128 and not IS_SM90
+    can_bwd = d <= 256 and not IS_SM90
     if not can_bwd:
         return
 
@@ -301,7 +303,7 @@ def attention_combine_ref(out_partial, lse_partial):
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("d", [64, 128, 256])
 @pytest.mark.parametrize("seqlen", [32, 256])
 @pytest.mark.parametrize("num_splits", [2, 5, 17])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
