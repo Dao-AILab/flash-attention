@@ -39,9 +39,12 @@ from quack.rounding import (
 
 @cute.jit
 def philox_4x32(
-    c0_in: Uint32, c1_in: Uint32,
-    c2_in: Uint32, c3_in: Uint32,
-    k0_in: Uint32, k1_in: Uint32,
+    c0_in: Uint32,
+    c1_in: Uint32,
+    c2_in: Uint32,
+    c3_in: Uint32,
+    k0_in: Uint32,
+    k1_in: Uint32,
 ) -> tuple:
     """Philox 4x32 PRNG. Counter=(c0..c3), Key=(k0,k1)."""
     c0 = Uint32(c0_in)
@@ -68,8 +71,9 @@ def philox_4x32(
 
 
 @cute.jit
-def _extract_u16(r0: Uint32, r1: Uint32, r2: Uint32, r3: Uint32,
-                 idx: cutlass.Constexpr[int]) -> Uint32:
+def _extract_u16(
+    r0: Uint32, r1: Uint32, r2: Uint32, r3: Uint32, idx: cutlass.Constexpr[int]
+) -> Uint32:
     """Extract 16-bit value at index idx (0-7) from 4 Philox words.
 
     idx is constexpr so word/half selection is resolved at compile time.
@@ -146,9 +150,12 @@ def apply_dropout_mask(
 
             # One Philox call per 8 elements (2 pair-halves × 4 registers)
             r0, r1, r2, r3 = philox_4x32(
-                philox_offset, Uint32(0),
-                Uint32(block_row), Uint32(block_col),
-                seed_lo, seed_hi,
+                philox_offset,
+                Uint32(0),
+                Uint32(block_row),
+                Uint32(block_col),
+                seed_lo,
+                seed_hi,
             )
 
             # Apply 8 × 16-bit masks to 8 elements.
@@ -160,8 +167,8 @@ def apply_dropout_mask(
                     rand_u16 = _extract_u16(r0, r1, r2, r3, u16_idx)
 
                     keep_f = Float32(Uint32(rand_u16 <= p_threshold))
-                    divided[reg, m, (j, n_half)] = (
-                        divided[reg, m, (j, n_half)] * (rp_dropout * keep_f)
+                    divided[reg, m, (j, n_half)] = divided[reg, m, (j, n_half)] * (
+                        rp_dropout * keep_f
                     )
 
 
@@ -211,9 +218,12 @@ def apply_dropout_mask_sm100(
         global_col = local_col + n_block * tile_n
 
         pr0, _pr1, _pr2, _pr3 = philox_4x32(
-            rng_key_lo, Uint32(0),
-            Uint32(global_row), Uint32(global_col),
-            seed_lo, seed_hi,
+            rng_key_lo,
+            Uint32(0),
+            Uint32(global_row),
+            Uint32(global_col),
+            seed_lo,
+            seed_hi,
         )
         rand_byte = pr0 & Uint32(255)
 

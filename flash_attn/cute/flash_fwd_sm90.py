@@ -1115,7 +1115,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 )
 
             mma_one_n_block = partial(
-                mma_one_n_block_all, seqlen=seqlen, softmax=softmax, score_mod_fn=score_mod_fn,
+                mma_one_n_block_all,
+                seqlen=seqlen,
+                softmax=softmax,
+                score_mod_fn=score_mod_fn,
                 dropout_fn=dropout_fn,
             )
             n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)

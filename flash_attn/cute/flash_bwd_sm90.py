@@ -608,7 +608,9 @@ class FlashAttentionBackwardSm90:
             mdQ_semaphore,
             window_size_left,
             window_size_right,
-            Int32(cute.size(mQ.shape[2])) if const_expr(self.is_dropout) else None,  # dropout_nheads
+            Int32(cute.size(mQ.shape[2]))
+            if const_expr(self.is_dropout)
+            else None,  # dropout_nheads
             Int32(dropout_seed_lo) if dropout_seed_lo is not None and self.is_dropout else None,
             Int32(dropout_seed_hi) if dropout_seed_hi is not None and self.is_dropout else None,
         ).launch(
@@ -1544,7 +1546,7 @@ class FlashAttentionBackwardSm90:
         # Save P before dropout for correct backward gradient formula:
         # dS = P_drop * dP - P * D  (NOT P_drop * (dP - D))
         if const_expr(dropout_fn is not None):
-            acc_P = cute.make_fragment(acc_shape_SdP, cutlass.Float32)
+            acc_P = cute.make_fragment_like(acc_S)
             acc_P.store(acc_S.load())
             dropout_fn(acc_S=acc_S, m_block=m_block)
 
