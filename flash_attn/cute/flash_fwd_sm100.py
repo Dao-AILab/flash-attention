@@ -1803,6 +1803,25 @@ class FlashAttentionForwardSm100:
         return head_idx // self.qhead_per_kvhead
 
     @cute.jit
+    def _load_effective_descales(
+        self,
+        descale_tensors: Optional[DescaleTensors],
+        batch_idx: Int32,
+        kv_head_idx: Int32,
+    ) -> Tuple[Float32, Float32]:
+        """Load effective QK and V descales, defaulting unspecified tensors to identity."""
+        qk_descale = Float32(1.0)
+        v_descale = Float32(1.0)
+        if cutlass.const_expr(descale_tensors is not None):
+            if cutlass.const_expr(descale_tensors.q_descale is not None):
+                qk_descale = qk_descale * Float32(descale_tensors.q_descale[batch_idx, kv_head_idx])
+            if cutlass.const_expr(descale_tensors.k_descale is not None):
+                qk_descale = qk_descale * Float32(descale_tensors.k_descale[batch_idx, kv_head_idx])
+            if cutlass.const_expr(descale_tensors.v_descale is not None):
+                v_descale = Float32(descale_tensors.v_descale[batch_idx, kv_head_idx])
+        return qk_descale, v_descale
+
+    @cute.jit
     def softmax_loop(
         self,
         stage: int | Int32,
@@ -1948,35 +1967,15 @@ class FlashAttentionForwardSm100:
             else:
                 mask_fn_none = None
 
-            q_descale_tensor = (
-                descale_tensors.q_descale if cutlass.const_expr(descale_tensors is not None) else None
-            )
-            k_descale_tensor = (
-                descale_tensors.k_descale if cutlass.const_expr(descale_tensors is not None) else None
-            )
-            has_qk_descale = q_descale_tensor is not None or k_descale_tensor is not None
-            if cutlass.const_expr(has_qk_descale):
-                q_descale = Float32(1.0)
-                k_descale = Float32(1.0)
-                if cutlass.const_expr(q_descale_tensor is not None):
-                    q_descale = Float32(q_descale_tensor[batch_idx, kv_head_idx])
-                if cutlass.const_expr(k_descale_tensor is not None):
-                    k_descale = Float32(k_descale_tensor[batch_idx, kv_head_idx])
-                qk_descale = q_descale * k_descale
+            qk_descale, _ = self._load_effective_descales(descale_tensors, batch_idx, kv_head_idx)
 
             max_offset = 8 if cutlass.const_expr(self.q_dtype.width == 8) else 0
             if const_expr(self.score_mod is None):
-                if cutlass.const_expr(has_qk_descale):
-                    softmax_scale_log2_eff = softmax_scale_log2 * qk_descale
-                else:
-                    softmax_scale_log2_eff = softmax_scale_log2
+                softmax_scale_log2_eff = softmax_scale_log2 * qk_descale
                 softmax_scale_eff = None
             else:
                 softmax_scale_log2_eff = softmax_scale_log2
-                if cutlass.const_expr(has_qk_descale):
-                    softmax_scale_eff = softmax_scale * qk_descale
-                else:
-                    softmax_scale_eff = softmax_scale
+                softmax_scale_eff = softmax_scale * qk_descale
 
             rescale_threshold = (
                 8.0 if const_expr(self.q_dtype.width == 16) else
@@ -2375,33 +2374,11 @@ class FlashAttentionForwardSm100:
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             kv_head_idx = self._kv_head_idx(head_idx)
-            q_descale_tensor = (
-                descale_tensors.q_descale if cutlass.const_expr(descale_tensors is not None) else None
-            )
-            k_descale_tensor = (
-                descale_tensors.k_descale if cutlass.const_expr(descale_tensors is not None) else None
-            )
-            v_descale_tensor = (
-                descale_tensors.v_descale if cutlass.const_expr(descale_tensors is not None) else None
-            )
-            has_qk_descale = q_descale_tensor is not None or k_descale_tensor is not None
+            qk_descale, v_descale = self._load_effective_descales(descale_tensors, batch_idx, kv_head_idx)
             if const_expr(self.score_mod is None):
-                if cutlass.const_expr(has_qk_descale):
-                    q_descale = Float32(1.0)
-                    k_descale = Float32(1.0)
-                    if cutlass.const_expr(q_descale_tensor is not None):
-                        q_descale = Float32(q_descale_tensor[batch_idx, kv_head_idx])
-                    if cutlass.const_expr(k_descale_tensor is not None):
-                        k_descale = Float32(k_descale_tensor[batch_idx, kv_head_idx])
-                    softmax_scale_log2_eff = softmax_scale_log2 * (q_descale * k_descale)
-                else:
-                    softmax_scale_log2_eff = softmax_scale_log2
+                softmax_scale_log2_eff = softmax_scale_log2 * qk_descale
             else:
                 softmax_scale_log2_eff = softmax_scale_log2
-
-            has_v_descale = v_descale_tensor is not None
-            if cutlass.const_expr(has_v_descale):
-                v_descale = Float32(v_descale_tensor[batch_idx, kv_head_idx])
 
             max_offset = Float32(8.0) if cutlass.const_expr(self.q_dtype.width == 8) else Float32(0.0)
             max_offset_scale = (
@@ -2518,8 +2495,7 @@ class FlashAttentionForwardSm100:
                     acc_O_mn_row_is_zero_or_nan = row_sum == 0.0 or row_sum != row_sum
                     stats[stage] = (row_sum, row_max, acc_O_mn_row_is_zero_or_nan)
                     scale = cute.arch.rcp_approx(row_sum if not acc_O_mn_row_is_zero_or_nan else 1.0)
-                    if cutlass.const_expr(has_v_descale):
-                        scale = scale * v_descale
+                    scale = scale * v_descale
                     # Wait for the last O to be ready from the MMA warp
                     pipeline_o_acc.consumer_wait_w_index_phase(stage, o_corr_consumer_phase)
                     if const_expr(not self.use_correction_warps_for_epi):
