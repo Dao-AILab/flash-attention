@@ -210,6 +210,33 @@ class SoftmaxSm100(Softmax):
         self.row_max[0] = row_max_new
         return row_max_safe, acc_scale
 
+    @cute.jit
+    def update_row_max_precomputed(
+        self, hw_row_max: Float32, is_first: int
+    ) -> Tuple[Float32, Float32]:
+        """SM103 fast path: row_max already computed by tcgen05.ld.red hardware.
+
+        Skips the fmax_reduce tree reduction (~64 ALU ops) since the TMEM controller
+        computed the max during the load.
+        """
+        if cutlass.const_expr(is_first):
+            row_max_new = hw_row_max
+            row_max_safe = row_max_new if row_max_new != -cutlass.Float32.inf else 0.0
+            acc_scale = 0.0
+        else:
+            row_max_old = self.row_max[0]
+            row_max_new = cute.arch.fmax(hw_row_max, row_max_old)
+            row_max_safe = row_max_new if row_max_new != -cutlass.Float32.inf else 0.0
+            acc_scale_ = (row_max_old - row_max_safe) * self.scale_log2
+            acc_scale = cute.math.exp2(acc_scale_, fastmath=True)
+            if cutlass.const_expr(self.rescale_threshold > 0.0):
+                if acc_scale_ >= -self.rescale_threshold:
+                    row_max_new = row_max_old
+                    row_max_safe = row_max_old
+                    acc_scale = 1.0
+        self.row_max[0] = row_max_new
+        return row_max_safe, acc_scale
+
     def update_row_sum(
         self, acc_S_row_exp: cute.TensorSSA, row_scale: Float32, is_first: int = False
     ) -> None:

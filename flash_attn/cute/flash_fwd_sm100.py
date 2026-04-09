@@ -2148,9 +2148,15 @@ class FlashAttentionForwardSm100:
 
         # Wait for Si
         pipeline_s_p_o.consumer_wait_w_index_phase(stage, mma_si_consumer_phase)
+
+        # Load S from TMEM. SM103 uses tcgen05.ld.red (fused load + max).
         tSrS_t2r = cute.make_fragment(thr_tmem_load.partition_D(tScS).shape, self.qk_acc_dtype)
-        cute.copy(thr_tmem_load, tStS_t2r, tSrS_t2r)
-        # tSrS_t2r = copy_utils.load_t2r(thr_tmem_load, tScS_shape, tStS_t2r)
+        if const_expr(self.is_sm103 and self.score_mod is None and self.n_block_size >= 128):
+            hw_max = sm100_utils.tmem_ld_red_max(tStS_t2r, tSrS_t2r)
+        else:
+            cute.copy(thr_tmem_load, tStS_t2r, tSrS_t2r)
+            hw_max = None
+
         if cutlass.const_expr(self.score_mod is not None):
             self.apply_score_mod(
                 tSrS_t2r,
@@ -2169,7 +2175,14 @@ class FlashAttentionForwardSm100:
 
         if const_expr(mask_fn is not None):
             mask_fn(tSrS_t2r, n_block=n_block)
-        row_max, acc_scale = softmax.update_row_max(tSrS_t2r.load(), is_first)
+
+        # SM103: always use hardware max (valid even after masking — softmax is
+        # translation-invariant, so max >= true_max just shifts exp2 values down
+        # proportionally; row_sum normalization corrects the ratios).
+        if const_expr(hw_max is not None):
+            row_max, acc_scale = softmax.update_row_max_precomputed(hw_max, is_first)
+        else:
+            row_max, acc_scale = softmax.update_row_max(tSrS_t2r.load(), is_first)
 
         if const_expr(not is_first):
             # tSrScale_r2t = cute.make_fragment(thr_tmem_store_scale.partition_S(tScScale).shape, Float32)

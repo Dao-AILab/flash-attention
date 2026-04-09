@@ -1087,3 +1087,44 @@ def gemm_ptx_precomputed_varname(
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
         )
+
+
+@cute.jit
+def tmem_ld_red_max(
+    tStS: cute.Tensor,
+    tSrS: cute.Tensor,
+) -> cutlass.Float32:
+    """SM103: fused TMEM load + row-max via raw tcgen05.ld.red PTX.
+
+    Drop-in replacement for cute.copy(thr_tmem_load, src, dst) that also
+    returns the row max. Same instruction count as baseline (one x32 load
+    per tile), with the max computed in the TMEM controller at zero ALU cost.
+    """
+    from cutlass._mlir import ir as _ir
+
+    num_tiles = cute.size(tStS.shape[2])
+    f32_ty = _ir.F32Type.get()
+    struct_ty = llvm.StructType.get_literal([f32_ty] * 33)
+    
+    asm_str = (
+        "tcgen05.ld.red.sync.aligned.32x32b.x32.f32.max"
+        " {" + ", ".join(f"${i}" for i in range(32)) + "}"
+        ", $32, [$33];\n"
+    )
+
+    row_max = cutlass.Float32(0.0)
+    for k in cutlass.range_constexpr(num_tiles):
+        result = llvm.inline_asm(
+            struct_ty,
+            [tStS[None, None, k].iterator.toint().ir_value()],
+            asm_str,
+            "=f," * 33 + "r",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+        for i in cutlass.range_constexpr(32):
+            tSrS[k * 32 + i] = cutlass.Float32(llvm.extractvalue(f32_ty, result, [i]))
+        tile_max = cutlass.Float32(llvm.extractvalue(f32_ty, result, [32]))
+        row_max = tile_max if cutlass.const_expr(k == 0) else cute.arch.fmax(row_max, tile_max)
+    return row_max
