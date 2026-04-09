@@ -145,6 +145,8 @@ fmha_bwd_args get_ck_fmha_bwd_args(const mask_info &mask,
                          dv.data_ptr(),
                          nullptr, // dbias
                          dq_acc.data_ptr(), // dq_acc
+                         nullptr, // sink_ptr
+                         nullptr, // d_sink_ptr
                          nullptr, // seqstart_q_ptr
                          nullptr, // seqstart_k_ptr
                          nullptr, // seqlen_q_ptr
