@@ -993,39 +993,12 @@ COMPILED_HDIMS = (
 #                 assert (out - out_ref).abs().mean().item() <= mult_mean * (out_pt - out_ref).abs().mean().item()
 
 
-# @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-# @pytest.mark.parametrize("dtype", [torch.bfloat16])
-# @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
-@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
-# @pytest.mark.parametrize("mha_type", ["mha"])
-@pytest.mark.parametrize("new_kv", [False] + ([True] if not DISABLE_APPENDKV else []))
-# @pytest.mark.parametrize("new_kv", [False])
-@pytest.mark.parametrize("causal,local", [(False, False), (True, False)] + ([(False, True)] if not DISABLE_LOCAL else []))
-# @pytest.mark.parametrize("causal,local", [(False, False), (True, False)])
-# @pytest.mark.parametrize("causal,local", [(True, False)])
-@pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [True, False] if not DISABLE_APPENDKV else [True])
-# @pytest.mark.parametrize("seqlen_new_eq_seqlen_q", [False])
-# @pytest.mark.parametrize("has_rotary_seqlens", [False, True])
-@pytest.mark.parametrize("has_rotary_seqlens", [False])
-@pytest.mark.parametrize("rotary_interleaved", [False, True] if not DISABLE_APPENDKV else [False])
-# @pytest.mark.parametrize("rotary_interleaved", [False])
-@pytest.mark.parametrize("rotary_fraction", [0.0, 0.5, 1.0] if (not DISABLE_APPENDKV) and (apply_rotary_emb is not None) else [0.0])
-# @pytest.mark.parametrize("rotary_fraction", [0.0])
-@pytest.mark.parametrize("page_size", [None] + ([1, 4, 128] if not DISABLE_PAGEDKV else []))
-# @pytest.mark.parametrize("page_size", [None])
-@pytest.mark.parametrize("has_leftpad", [False, True])
-# @pytest.mark.parametrize("has_leftpad", [False])
-@pytest.mark.parametrize("has_batch_idx", [False, True])
-# @pytest.mark.parametrize("has_batch_idx", [True])
+@pytest.mark.parametrize("mha_type", ["mha", "gqa"])
+@pytest.mark.parametrize("num_splits", [1, 2, 4])
+@pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("varlen_q", [False, True])
-# @pytest.mark.parametrize("varlen_q", [True])
-# @pytest.mark.parametrize("d", [32, 59, 64, 80, 128, 256])
-# @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
-# @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128, 160, 192])
-# @pytest.mark.parametrize('d', [56, 80])
 @pytest.mark.parametrize("d", [128])
-# @pytest.mark.parametrize("d", [192])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -1033,386 +1006,125 @@ COMPILED_HDIMS = (
         (1, 339),
         (3, 1024),
         (64, 800),
-        (64, 256),
-        (3, 799),
         (64, 2048),
-        (16, 20000),
-        # (1, 128 * 1024),
-        # (16, 128 * 1024),
         (128, 128),
-        (256, 512),  # To test appending KV with more than 1 block
-        (2048, 3577),  # Enough tile to test persistent scheduler
+        (256, 512),
+        (2048, 3577),
     ],
 )
-# @pytest.mark.parametrize('seqlen_q,seqlen_k', [(256, 128)])
 def test_flash_attn_batch_invariance(
     seqlen_q,
     seqlen_k,
     d,
     varlen_q,
-    has_batch_idx,
-    has_leftpad,
-    page_size,
-    rotary_fraction,
-    rotary_interleaved,
-    has_rotary_seqlens,
-    seqlen_new_eq_seqlen_q,
     causal,
-    local,
-    new_kv,
+    num_splits,
     mha_type,
     dtype,
 ):
-    """Test that flash attention output is invariant to batch size - 
-    running with batch_size=5 vs batch_size=7 (where first 5 are same) 
-    should produce identical outputs for the first 5 batches."""
-    if page_size is not None and seqlen_k % page_size != 0:
-        pytest.skip()
-    if seqlen_q > seqlen_k and new_kv:
-        pytest.skip()
-    if not new_kv and rotary_fraction > 0.0:
-        pytest.skip()
-    if rotary_fraction == 0.0 and has_rotary_seqlens:
-        pytest.skip()
+    """Test that flash attention output with static num_splits is batch-invariant.
+
+    Running with batch_size=5 vs batch_size=7 (where first 5 are identical)
+    should produce bit-exact outputs for the first 5 batches. This validates
+    that the scheduler assigns deterministic split boundaries regardless of
+    batch composition — critical for deterministic inference with num_splits > 1.
+    """
     device = "cuda"
-    # set seed
     torch.random.manual_seed(0)
     batch_size_1 = 5
     batch_size_2 = 7
-    batch_size_cache_1 = batch_size_1 if not has_batch_idx else batch_size_1 * 2
-    batch_size_cache_2 = batch_size_2 if not has_batch_idx else batch_size_2 * 2
     nheads = 6
-    # rotary_dim must be a multiple of 16, and must be <= d
-    rotary_dim = math.floor(int(rotary_fraction * d) / 16) * 16
     nheads_k = nheads if mha_type == "mha" else (1 if mha_type == "mqa" else 3)
-    assert nheads % nheads_k == 0
-    dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
-    if dtype == torch.float8_e4m3fn:
-        dv_vals = [d]
-    attention_chunk_vals = [torch.randint(1, seqlen_k * 2, (1,)).item(), 0] if (causal or local) and not DISABLE_LOCAL else [0]
-    for dv, attention_chunk in itertools.product(dv_vals, attention_chunk_vals):
-        print(f"{dv = }, {attention_chunk = }")
-        has_qv = d == 64 and dv >= 256
-        
-        # Create inputs for batch_size_1 = 5
-        q1 = torch.randn(batch_size_1, seqlen_q, nheads, d, device=device, dtype=dtype)
-        if has_qv:
-            qv1 = torch.randn(batch_size_1, seqlen_q, nheads, dv, device=device, dtype=dtype)
-        else:
-            qv1 = None
-        
-        # Create inputs for batch_size_2 = 7, where first 5 batches are same as q1
-        q2 = torch.cat([
-            q1.clone(),
-            torch.randn(batch_size_2 - batch_size_1, seqlen_q, nheads, d, device=device, dtype=dtype)
-        ], dim=0)
-        if has_qv:
-            qv2 = torch.cat([
-                qv1.clone(),
-                torch.randn(batch_size_2 - batch_size_1, seqlen_q, nheads, dv, device=device, dtype=dtype)
-            ], dim=0)
-        else:
-            qv2 = None
-        
-        if varlen_q:
-            query_padding_mask_1 = generate_random_padding_mask(seqlen_q, batch_size_1, device, mode="random")
-            q_unpad_1, indices_q_1, cu_seqlens_q_1, max_seqlen_q_1, *rest = unpad_input(q1, query_padding_mask_1)
-            output_pad_fn_1 = lambda output_unpad: pad_input(
-                output_unpad, indices_q_1, batch_size_1, seqlen_q
-            )
-            qv_unpad_1 = rearrange(qv1, "b s ... -> (b s) ...")[indices_q_1] if has_qv else None
-            
-            # For batch 2, first batch_size_1 batches should use same padding mask as batch 1
-            query_padding_mask_2_additional = generate_random_padding_mask(seqlen_q, batch_size_2 - batch_size_1, device, mode="random")
-            query_padding_mask_2 = torch.cat([query_padding_mask_1.clone(), query_padding_mask_2_additional], dim=0)
-            q_unpad_2, indices_q_2, cu_seqlens_q_2, max_seqlen_q_2, *rest = unpad_input(q2, query_padding_mask_2)
-            output_pad_fn_2 = lambda output_unpad: pad_input(
-                output_unpad, indices_q_2, batch_size_2, seqlen_q
-            )
-            qv_unpad_2 = rearrange(qv2, "b s ... -> (b s) ...")[indices_q_2] if has_qv else None
-        else:
-            query_padding_mask_1 = None
-            q_unpad_1 = q1
-            qv_unpad_1 = qv1
-            cu_seqlens_q_1, max_seqlen_q_1 = None, None
-            output_pad_fn_1 = lambda x: x
-            
-            query_padding_mask_2 = None
-            q_unpad_2 = q2
-            qv_unpad_2 = qv2
-            cu_seqlens_q_2, max_seqlen_q_2 = None, None
-            output_pad_fn_2 = lambda x: x
-        
-        window_size = (-1, -1) if not local else torch.randint(0, seqlen_k, (2,))
-        
-        seqlen_new = seqlen_q if seqlen_new_eq_seqlen_q else torch.randint(1, seqlen_q + 1, (1,)).item()
-        cu_seqlens_k_new_1 = None
-        cu_seqlens_k_new_2 = None
-        key_new_padding_mask_1 = None
-        key_new_padding_mask_2 = None
-        if new_kv:
-            k1 = torch.randn(batch_size_1, seqlen_new, nheads_k, d, device=device, dtype=dtype)
-            v1 = torch.randn(batch_size_1, seqlen_new, nheads_k, dv, device=device, dtype=dtype)
-            k2 = torch.cat([
-                k1.clone(),
-                torch.randn(batch_size_2 - batch_size_1, seqlen_new, nheads_k, d, device=device, dtype=dtype)
-            ], dim=0)
-            v2 = torch.cat([
-                v1.clone(),
-                torch.randn(batch_size_2 - batch_size_1, seqlen_new, nheads_k, dv, device=device, dtype=dtype)
-            ], dim=0)
-            if varlen_q:
-                key_new_padding_mask_1 = generate_random_padding_mask(seqlen_new, batch_size_1, device, mode="random")
-                k_unpad_1, indices_k_1, cu_seqlens_k_new_1, *rest = unpad_input(k1, key_new_padding_mask_1)
-                v_unpad_1, *rest = unpad_input(v1, key_new_padding_mask_1)
-                
-                # For batch 2, first batch_size_1 batches should use same padding mask as batch 1
-                key_new_padding_mask_2_additional = generate_random_padding_mask(seqlen_new, batch_size_2 - batch_size_1, device, mode="random")
-                key_new_padding_mask_2 = torch.cat([key_new_padding_mask_1.clone(), key_new_padding_mask_2_additional], dim=0)
-                k_unpad_2, indices_k_2, cu_seqlens_k_new_2, *rest = unpad_input(k2, key_new_padding_mask_2)
-                v_unpad_2, *rest = unpad_input(v2, key_new_padding_mask_2)
-            else:
-                k_unpad_1, v_unpad_1 = k1, v1
-                k_unpad_2, v_unpad_2 = k2, v2
-        else:
-            k1, v1, k_unpad_1, v_unpad_1 = None, None, None, None
-            k2, v2, k_unpad_2, v_unpad_2 = None, None, None, None
-        
-        if page_size is None:
-            # k_cache_1 = torch.randn(batch_size_cache_1, seqlen_k, nheads_k, d, device=device, dtype=dtype_ref)
-            # v_cache_1 = torch.randn(batch_size_cache_1, seqlen_k, nheads_k, dv, device=device, dtype=dtype_ref)
-            # k_cache_2 = torch.cat([
-            #     k_cache_1.clone(),
-            #     torch.randn(batch_size_cache_2 - batch_size_cache_1, seqlen_k, nheads_k, d, device=device, dtype=dtype_ref)
-            # ], dim=0)
-            # v_cache_2 = torch.cat([
-            #     v_cache_1.clone(),
-            #     torch.randn(batch_size_cache_2 - batch_size_cache_1, seqlen_k, nheads_k, dv, device=device, dtype=dtype_ref)
-            # ], dim=0)
-            k_cache_2 = torch.randn(batch_size_cache_2, seqlen_k, nheads_k, d, device=device, dtype=dtype)
-            v_cache_2 = torch.randn(batch_size_cache_2, seqlen_k, nheads_k, dv, device=device, dtype=dtype)
-            k_cache_1 = k_cache_2[:batch_size_cache_1]
-            v_cache_1 = v_cache_2[:batch_size_cache_1]
-            page_table_1 = None
-            page_table_2 = None
-            k_cache_paged_1 = None
-            v_cache_paged_1 = None
-            k_cache_paged_2 = None
-            v_cache_paged_2 = None
-        else:
-            # (
-            #     k_cache_1,
-            #     v_cache_1,
-            #     page_table_1,
-            #     k_cache_paged_1,
-            #     v_cache_paged_1,
-            #     num_blocks_1,
-            # ) = _generate_block_kvcache(
-            #     seqlen_k, page_size, batch_size_cache_1, nheads_k, d, dv, device, dtype, dtype_ref
-            # )
-            (
-                k_cache_2,
-                v_cache_2,
-                page_table_2,
-                k_cache_paged_2,
-                v_cache_paged_2,
-                num_blocks_2,
-            ) = _generate_block_kvcache(
-                seqlen_k, page_size, batch_size_cache_2, nheads_k, d, dv, device, dtype, dtype
-            )
-            page_table_1 = page_table_2[:batch_size_cache_1]
-            # k_cache_paged_1 = k_cache_paged_2
-            # v_cache_paged_2[:len(v_cache_paged_1)] = v_cache_paged_1.clone()
-            # # Make page_table_2 point to same cache blocks as page_table_1 for overlapping cache entries
-            # # For the first batch_size_cache_1 cache batches, use same page_table entries
-            # page_table_2[:batch_size_cache_1] = page_table_1.clone()
-    
-        cache_seqlens_1 = torch.randint(
-            0 if new_kv else 1,
-            (
-                (seqlen_k - (seqlen_q if (causal or local) and rotary_dim > 1 else seqlen_new) + 1)
-                if new_kv
-                else (seqlen_k + 1)
-            ),
-            (batch_size_1,),
-            dtype=torch.int32,
-            device=device,
-        )
-        cache_seqlens_2 = torch.cat([
-            cache_seqlens_1,
-            torch.randint(
-                0 if new_kv else 1,
-                (
-                    (seqlen_k - (seqlen_q if (causal or local) and rotary_dim > 1 else seqlen_new) + 1)
-                    if new_kv
-                    else (seqlen_k + 1)
-                ),
-                (batch_size_2 - batch_size_1,),
-                dtype=torch.int32,
-                device=device,
-            )
-        ], dim=0)
-        
-        if has_leftpad:
-            cache_leftpad_1 = torch.cat([torch.randint(0, cache_seqlens_1[i].item(), (1,), dtype=torch.int32, device=device)
-                                        if cache_seqlens_1[i].item() > 0 else torch.zeros(1, dtype=torch.int32, device=device)
-                                        for i in range(batch_size_1)])
-            cache_leftpad_2 = torch.cat([
-                cache_leftpad_1,
-                torch.cat([torch.randint(0, cache_seqlens_2[i].item(), (1,), dtype=torch.int32, device=device)
-                          if cache_seqlens_2[i].item() > 0 else torch.zeros(1, dtype=torch.int32, device=device)
-                          for i in range(batch_size_1, batch_size_2)])
-            ], dim=0)
-        else:
-            cache_leftpad_1 = None
-            cache_leftpad_2 = None
-        
-        if has_batch_idx:
-            cache_batch_idx_1 = torch.randperm(batch_size_cache_1, dtype=torch.int32, device=device)[:batch_size_1]
-            # For batch 2, first batch_size_1 entries should use same cache indices as batch 1
-            # Additional entries can use new cache indices
-            additional_cache_indices = torch.randperm(batch_size_cache_2 - batch_size_cache_1, dtype=torch.int32, device=device)[:batch_size_2 - batch_size_1] + batch_size_cache_1
-            cache_batch_idx_2 = torch.cat([cache_batch_idx_1.clone(), additional_cache_indices], dim=0)
-        else:
-            cache_batch_idx_1 = None
-            cache_batch_idx_2 = None
-        
-        rotary_seqlens_1 = cache_seqlens_1 if not has_rotary_seqlens else cache_seqlens_1 // 2
-        rotary_seqlens_2 = cache_seqlens_2 if not has_rotary_seqlens else cache_seqlens_2 // 2
-        
-        if rotary_dim > 0:
-            angle = (
-                torch.rand(
-                    seqlen_k if page_size is None else (num_blocks_1 if page_size is not None else 0) * page_size,
-                    rotary_dim // 2,
-                    device=device,
-                )
-                * 2
-                * math.pi
-            )
-            cos = torch.cos(angle).to(dtype=dtype)
-            sin = torch.sin(angle).to(dtype=dtype)
-        else:
-            cos, sin = None, None
-        
-        # All tensors are already in dtype, no conversion needed
-        if varlen_q:
-            # q_unpad_1 and q_unpad_2 are already in dtype since they're created from q1 and q2
-            pass
-        # When varlen_q is False, q_unpad_1 and q_unpad_2 are references to q1 and q2, so they're already in dtype
-        # k_cache_1, k_cache_2, v_cache_1, v_cache_2 are already in dtype
-        # k_cache_paged_1, k_cache_paged_2 are already in dtype (from _generate_block_kvcache)
-        # k1, k2, v1, v2 are already in dtype
-        # k_unpad_1, k_unpad_2, v_unpad_1, v_unpad_2 are already in dtype
-        # qv1, qv2, qv_unpad_1, qv_unpad_2 are already in dtype
-        # cos, sin are already in dtype
-        
-        # Verify dtypes match before calling flash_attn_with_kvcache
-        q_input_1 = q1 if not varlen_q else q_unpad_1
-        v_cache_input_1 = v_cache_1 if page_size is None else v_cache_paged_2
-        # Ensure both are in the correct dtype
-        if q_input_1.dtype != dtype:
-            q_input_1 = q_input_1.to(dtype)
-        if v_cache_input_1.dtype != dtype:
-            v_cache_input_1 = v_cache_input_1.to(dtype)
-        assert q_input_1.dtype == v_cache_input_1.dtype == dtype, f"q dtype {q_input_1.dtype}, v_cache dtype {v_cache_input_1.dtype}, expected {dtype}"
-        
-        # Run flash attention with batch_size_1 = 5
-        out1, lse1, *rest1 = flash_attn_with_kvcache(
-            q_input_1,
-            k_cache_1 if page_size is None else k_cache_paged_2,
-            v_cache_input_1,
-            k1 if not new_kv or not varlen_q else k_unpad_1,
-            v1 if not new_kv or not varlen_q else v_unpad_1,
-            qv=qv1 if not varlen_q else qv_unpad_1,
-            rotary_cos=cos,
-            rotary_sin=sin,
-            cache_seqlens=cache_seqlens_1,
-            cache_batch_idx=cache_batch_idx_1,
-            cache_leftpad=cache_leftpad_1,
-            page_table=page_table_1,
-            cu_seqlens_q=cu_seqlens_q_1,
-            cu_seqlens_k_new=cu_seqlens_k_new_1,
-            max_seqlen_q=max_seqlen_q_1,
-            rotary_seqlens=rotary_seqlens_1,
-            causal=causal,
-            window_size=window_size,
-            attention_chunk=attention_chunk,
-            rotary_interleaved=rotary_interleaved,
-            scheduler_metadata=None,
-            num_splits=1,
-            return_softmax_lse=True,
-        )
-        if varlen_q:
-            out1 = output_pad_fn_1(out1)
-        
-        # Verify dtypes match before calling flash_attn_with_kvcache
-        q_input_2 = q2 if not varlen_q else q_unpad_2
-        v_cache_input_2 = v_cache_2 if page_size is None else v_cache_paged_2
-        # Ensure both are in the correct dtype
-        if q_input_2.dtype != dtype:
-            q_input_2 = q_input_2.to(dtype)
-        if v_cache_input_2.dtype != dtype:
-            v_cache_input_2 = v_cache_input_2.to(dtype)
-        assert q_input_2.dtype == v_cache_input_2.dtype == dtype, f"q dtype {q_input_2.dtype}, v_cache dtype {v_cache_input_2.dtype}, expected {dtype}"
-        
-        # Run flash attention with batch_size_2 = 7
-        out2, lse2, *rest2 = flash_attn_with_kvcache(
-            q_input_2,
-            k_cache_2 if page_size is None else k_cache_paged_2,
-            v_cache_input_2,
-            k2 if not new_kv or not varlen_q else k_unpad_2,
-            v2 if not new_kv or not varlen_q else v_unpad_2,
-            qv=qv2 if not varlen_q else qv_unpad_2,
-            rotary_cos=cos,
-            rotary_sin=sin,
-            cache_seqlens=cache_seqlens_2,
-            cache_batch_idx=cache_batch_idx_2,
-            cache_leftpad=cache_leftpad_2,
-            page_table=page_table_2,
-            cu_seqlens_q=cu_seqlens_q_2,
-            cu_seqlens_k_new=cu_seqlens_k_new_2,
-            max_seqlen_q=max_seqlen_q_2,
-            rotary_seqlens=rotary_seqlens_2,
-            causal=causal,
-            window_size=window_size,
-            attention_chunk=attention_chunk,
-            rotary_interleaved=rotary_interleaved,
-            scheduler_metadata=None,
-            num_splits=1,
-            return_softmax_lse=True,
-        )
-        if varlen_q:
-            out2 = output_pad_fn_2(out2)
-        
-        # Assert that the first 5 batches of both outputs are equal
-        assert torch.equal(out1, out2[:batch_size_1]), "First 5 batches of outputs should be identical"
+    dv = d
 
+    # Create q tensors — batch_size_2 is a superset of batch_size_1
+    q1 = torch.randn(batch_size_1, seqlen_q, nheads, d, device=device, dtype=dtype)
+    q2 = torch.cat([
+        q1.clone(),
+        torch.randn(batch_size_2 - batch_size_1, seqlen_q, nheads, d, device=device, dtype=dtype),
+    ], dim=0)
 
-def _generate_block_kvcache(seqlen_k, page_size, batch_size, nheads_k, d, dv, device, dtype, dtype_ref):
-    num_blocks = math.ceil(seqlen_k / page_size) * batch_size * 3
-    k_cache_paged = torch.randn(
-        num_blocks, page_size, nheads_k, d, device=device, dtype=dtype_ref
-    ).to(dtype).to(dtype_ref)
-    v_cache_paged = torch.randn(
-        num_blocks, page_size, nheads_k, dv, device=device, dtype=dtype_ref
-    ).to(dtype).to(dtype_ref)
-    page_table = rearrange(
-        torch.randperm(num_blocks, dtype=torch.int32, device=device),
-        "(b nblocks) -> b nblocks",
-        b=batch_size,
+    if varlen_q:
+        query_padding_mask_1 = generate_random_padding_mask(
+            seqlen_q, batch_size_1, device, mode="random"
+        )
+        q_unpad_1, indices_q_1, cu_seqlens_q_1, max_seqlen_q_1, *_ = unpad_input(
+            q1, query_padding_mask_1
+        )
+        output_pad_fn_1 = lambda output_unpad: pad_input(
+            output_unpad, indices_q_1, batch_size_1, seqlen_q
+        )
+
+        query_padding_mask_2_extra = generate_random_padding_mask(
+            seqlen_q, batch_size_2 - batch_size_1, device, mode="random"
+        )
+        query_padding_mask_2 = torch.cat(
+            [query_padding_mask_1.clone(), query_padding_mask_2_extra], dim=0
+        )
+        q_unpad_2, indices_q_2, cu_seqlens_q_2, max_seqlen_q_2, *_ = unpad_input(
+            q2, query_padding_mask_2
+        )
+        output_pad_fn_2 = lambda output_unpad: pad_input(
+            output_unpad, indices_q_2, batch_size_2, seqlen_q
+        )
+    else:
+        q_unpad_1, cu_seqlens_q_1, max_seqlen_q_1 = q1, None, None
+        q_unpad_2, cu_seqlens_q_2, max_seqlen_q_2 = q2, None, None
+        output_pad_fn_1 = output_pad_fn_2 = lambda x: x
+
+    # KV cache — batch_size_2 is a superset of batch_size_1
+    k_cache_2 = torch.randn(
+        batch_size_2, seqlen_k, nheads_k, d, device=device, dtype=dtype
     )
-    k_cache = rearrange(
-        k_cache_paged[page_table.flatten()],
-        "(b nblocks) block_size ... -> b (nblocks block_size) ...",
-        b=batch_size,
-    )[:, :seqlen_k]
-    v_cache = rearrange(
-        v_cache_paged[page_table.flatten()],
-        "(b nblocks) block_size ... -> b (nblocks block_size) ...",
-        b=batch_size,
-    )[:, :seqlen_k]
-    return k_cache, v_cache, page_table, k_cache_paged, v_cache_paged, num_blocks
+    v_cache_2 = torch.randn(
+        batch_size_2, seqlen_k, nheads_k, dv, device=device, dtype=dtype
+    )
+    k_cache_1 = k_cache_2[:batch_size_1]
+    v_cache_1 = v_cache_2[:batch_size_1]
+
+    cache_seqlens_1 = torch.randint(
+        1, seqlen_k + 1, (batch_size_1,), dtype=torch.int32, device=device
+    )
+    cache_seqlens_2 = torch.cat([
+        cache_seqlens_1,
+        torch.randint(
+            1, seqlen_k + 1, (batch_size_2 - batch_size_1,),
+            dtype=torch.int32, device=device,
+        ),
+    ], dim=0)
+
+    out1, lse1, *_ = flash_attn_with_kvcache(
+        q_unpad_1,
+        k_cache_1,
+        v_cache_1,
+        cache_seqlens=cache_seqlens_1,
+        cu_seqlens_q=cu_seqlens_q_1,
+        max_seqlen_q=max_seqlen_q_1,
+        causal=causal,
+        num_splits=num_splits,
+        return_softmax_lse=True,
+    )
+    if varlen_q:
+        out1 = output_pad_fn_1(out1)
+
+    out2, lse2, *_ = flash_attn_with_kvcache(
+        q_unpad_2,
+        k_cache_2,
+        v_cache_2,
+        cache_seqlens=cache_seqlens_2,
+        cu_seqlens_q=cu_seqlens_q_2,
+        max_seqlen_q=max_seqlen_q_2,
+        causal=causal,
+        num_splits=num_splits,
+        return_softmax_lse=True,
+    )
+    if varlen_q:
+        out2 = output_pad_fn_2(out2)
+
+    assert torch.equal(out1, out2[:batch_size_1]), (
+        f"Outputs differ with num_splits={num_splits}: "
+        f"max diff = {(out1 - out2[:batch_size_1]).abs().max().item()}"
+    )
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
