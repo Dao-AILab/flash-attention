@@ -1335,7 +1335,7 @@ void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
 // h: num_heads
 // h_k: num_heads_k
 // d: head_size
-std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor> mha_bwd(
+std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor> mha_bwd(
     Tensor dout,  // (b, s_q, h, dv) or (total_q, h, dv) if there is cu_seqlens_q
     Tensor q,     // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
     Tensor k,     // (b, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k
@@ -1610,10 +1610,11 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor> mha_b
     // Will be zero'ed out in the backward preprocess kernel
     Tensor dq_semaphore = torch::stable::new_empty(q, {(seqlen_q + kBlockM - 1) / kBlockM, batch_size, num_heads}, std::make_optional(torch::headeronly::ScalarType::Int));
     params.dq_semaphore = static_cast<int*>(dq_semaphore.data_ptr());
+    Tensor dk_semaphore, dv_semaphore;
     if (num_heads_k != num_heads && params.deterministic) {
         // TODO: maybe also zero'ed out dk_semaphore and dv_semaphore in the backward preprocess kernel
-        Tensor dk_semaphore = torch::stable::new_zeros(q, {(seqlen_k + kBlockN - 1) / kBlockN, batch_size, num_heads_k}, std::make_optional(torch::headeronly::ScalarType::Int));
-        Tensor dv_semaphore = torch::stable::new_zeros(q, {(seqlen_k + kBlockN - 1) / kBlockN, batch_size, num_heads_k}, std::make_optional(torch::headeronly::ScalarType::Int));
+        dk_semaphore = torch::stable::new_zeros(q, {(seqlen_k + kBlockN - 1) / kBlockN, batch_size, num_heads_k}, std::make_optional(torch::headeronly::ScalarType::Int));
+        dv_semaphore = torch::stable::new_zeros(q, {(seqlen_k + kBlockN - 1) / kBlockN, batch_size, num_heads_k}, std::make_optional(torch::headeronly::ScalarType::Int));
         params.dk_semaphore = static_cast<int*>(dk_semaphore.data_ptr());
         params.dv_semaphore = static_cast<int*>(dv_semaphore.data_ptr());
     }
@@ -1641,7 +1642,7 @@ std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor> mha_b
         torch::stable::zero_(softmax_d);
     }
 
-    return { dq, dk, dv, softmax_d, softmax_lse_log2, dq_accum, dk_accum, dv_accum };
+    return { softmax_d, softmax_lse_log2, dq_accum, dk_accum, dv_accum };
 }
 
 std::tuple<Tensor, Tensor>
@@ -1828,16 +1829,13 @@ void boxed_mha_bwd(
     auto deterministic = to<bool>(stack[20]);
     auto sm_margin = to<int64_t>(stack[21]);
 
-    auto [dq_, dk_, dv_, softmax_d, softmax_lse_log2, dq_accum, dk_accum, dv_accum] = mha_bwd(dout, q, k, v, out, softmax_lse, dq, dk, dv, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, max_seqlen_q, max_seqlen_k, softmax_scale, is_causal, window_size_left, window_size_right, softcap, deterministic, sm_margin);
+    auto [softmax_d, softmax_lse_log2, dq_accum, dk_accum, dv_accum] = mha_bwd(dout, q, k, v, out, softmax_lse, dq, dk, dv, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, max_seqlen_q, max_seqlen_k, softmax_scale, is_causal, window_size_left, window_size_right, softcap, deterministic, sm_margin);
 
-    stack[0] = from(dq_);
-    stack[1] = from(dk_);
-    stack[2] = from(dv_);
-    stack[3] = from(softmax_d);
-    stack[4] = from(softmax_lse_log2);
-    stack[5] = from(dq_accum);
-    stack[6] = from(dk_accum);
-    stack[7] = from(dv_accum);
+    stack[0] = from(softmax_d);
+    stack[1] = from(softmax_lse_log2);
+    stack[2] = from(dq_accum);
+    stack[3] = from(dk_accum);
+    stack[4] = from(dv_accum);
 }
 
 void boxed_mha_combine(
@@ -1949,7 +1947,7 @@ STABLE_TORCH_LIBRARY(flash_attn_3, m) {
         "int window_size_right = -1,"
         "float softcap = 0.0,"
         "bool deterministic = False,"
-        "int sm_margin = 0) -> (Tensor(dq!), Tensor(dk!), Tensor(dv!), Tensor, Tensor, Tensor, Tensor, Tensor)");
+        "int sm_margin = 0) -> (Tensor, Tensor, Tensor, Tensor, Tensor)");
     m.def("fwd_combine("
         "Tensor out_partial,"
         "Tensor lse_partial,"

@@ -1,6 +1,11 @@
 *.ncu-rep
+*.sass
+*.ptx
+*.cubin
+*.plk
 .DS_store
 .vscode
+worktrees/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
@@ -27,6 +32,10 @@ var/
 
 # IDE-related
 .idea/
+.vscode/
 
 # Dev
 venv
+
+# compile-time generated file
+flash_attn_config.py

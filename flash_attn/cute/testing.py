@@ -1,9 +1,13 @@
 import math
+from contextlib import nullcontext
+from functools import wraps
 from typing import Optional
 
 import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
+from torch._guards import active_fake_mode
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 
 class IndexFirstAxis(torch.autograd.Function):
@@ -63,8 +67,15 @@ def unpad_input(hidden_states, attention_mask, unused_mask=None):
     all_masks = (attention_mask + unused_mask) if unused_mask is not None else attention_mask
     seqlens_in_batch = all_masks.sum(dim=-1, dtype=torch.int32)
     used_seqlens_in_batch = attention_mask.sum(dim=-1, dtype=torch.int32)
-    indices = torch.nonzero(all_masks.flatten(), as_tuple=False).flatten()
-    max_seqlen_in_batch = seqlens_in_batch.max().item()
+    in_fake_mode = active_fake_mode() is not None
+    if not in_fake_mode:
+        indices = torch.nonzero(all_masks.flatten(), as_tuple=False).flatten()
+        max_seqlen_in_batch = seqlens_in_batch.max().item()
+    else:
+        # torch.nonzero and .item() are not supported in FakeTensorMode
+        batch_size, seqlen = attention_mask.shape
+        indices = torch.arange(batch_size * seqlen, device=hidden_states.device)
+        max_seqlen_in_batch = seqlen
     cu_seqlens = F.pad(torch.cumsum(seqlens_in_batch, dim=0, dtype=torch.int32), (1, 0))
     return (
         index_first_axis(rearrange(hidden_states, "b s ... -> (b s) ..."), indices),
@@ -92,14 +103,21 @@ def generate_random_padding_mask(max_seqlen, batch_size, device, mode="random", 
             device=device,
         )
     else:
-        lengths = torch.randint(max_seqlen // 3, max_seqlen + 1, (batch_size, 1), device=device)
+        lengths = torch.randint(
+            max(0 if zero_lengths else 1, max_seqlen // 3),
+            max_seqlen + 1,
+            (batch_size, 1),
+            device=device,
+        )
 
     if zero_lengths:
         for i in range(batch_size):
             if i % 5 == 0:
                 lengths[i] = 0
         lengths[-1] = 0
-    padding_mask = repeat(torch.arange(max_seqlen, device=device), "s -> b s", b=batch_size) < lengths
+    padding_mask = (
+        repeat(torch.arange(max_seqlen, device=device), "s -> b s", b=batch_size) < lengths
+    )
     return padding_mask
 
 
@@ -129,7 +147,9 @@ def generate_qkv(
         q_unpad, indices_q, cu_seqlens_q, max_seqlen_q, seqused_q = unpad_input(
             q, query_padding_mask, query_unused_mask
         )
-        output_pad_fn = lambda output_unpad: pad_input(output_unpad, indices_q, batch_size, seqlen_q)
+        output_pad_fn = lambda output_unpad: pad_input(
+            output_unpad, indices_q, batch_size, seqlen_q
+        )
         qv_unpad = rearrange(qv, "b s ... -> (b s) ...")[indices_q] if qv is not None else None
     else:
         q_unpad = rearrange(q, "b s h d -> (b s) h d")
@@ -138,7 +158,9 @@ def generate_qkv(
         )
         seqused_q = None
         max_seqlen_q = seqlen_q
-        output_pad_fn = lambda output_unpad: rearrange(output_unpad, "(b s) h d -> b s h d", b=batch_size)
+        output_pad_fn = lambda output_unpad: rearrange(
+            output_unpad, "(b s) h d -> b s h d", b=batch_size
+        )
         qv_unpad = rearrange(qv, "b s ... -> (b s) ...") if qv is not None else None
 
     if key_padding_mask is not None:
@@ -254,9 +276,15 @@ def construct_local_mask(
         return col_idx > row_idx + sk - sq + window_size[1]
     else:
         sk = torch.full_like(col_idx, seqlen_k) if key_padding_mask is None else sk
+        if window_size[1] is None:
+            local_mask_left = col_idx > sk
+        else:
+            local_mask_left = col_idx > torch.minimum(row_idx + sk - sq + window_size[1], sk)
         return torch.logical_or(
-            col_idx > torch.minimum(row_idx + sk - sq + window_size[1], sk),
-            torch.logical_and(col_idx < row_idx + sk - sq - window_size[0], col_idx >= sink_token_length),
+            local_mask_left,
+            torch.logical_and(
+                col_idx < row_idx + sk - sq - window_size[0], col_idx >= sink_token_length
+            ),
         )
 
 
@@ -368,7 +396,9 @@ def attention_ref(
             key_leftpad=key_leftpad,
             device=q.device,
         )
-        local_mask = torch.logical_or(local_mask, chunk_mask) if local_mask is not None else chunk_mask
+        local_mask = (
+            torch.logical_or(local_mask, chunk_mask) if local_mask is not None else chunk_mask
+        )
     if local_mask is not None:
         scores.masked_fill_(local_mask, float("-inf"))
     if attn_bias is not None:
@@ -402,3 +432,25 @@ def attention_ref(
     if query_padding_mask is not None:
         output.masked_fill_(rearrange(~query_padding_mask, "b s -> b s 1 1"), 0.0)
     return output.to(dtype=dtype_og), attention.to(dtype=dtype_og)
+
+
+def maybe_fake_tensor_mode(fake: bool = True):
+    """
+    One way to populate/pre-compile cache is to use torch fake tensor mode,
+    which does not allocate actual GPU tensors but retains tensor shape/dtype
+    metadata for cute.compile.
+    """
+
+    def decorator(fn):
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+            with FakeTensorMode() if fake else nullcontext():
+                return fn(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
+
+
+def is_fake_mode() -> bool:
+    return active_fake_mode() is not None

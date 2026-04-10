@@ -11,6 +11,7 @@
 #include "cutlass/device_kernel.h"  // For device_kernel
 #include "cutlass/kernel_launch.h"  // For kernel_launch
 
+#include "cuda_check.h"
 #include "static_switch.h"
 #include "flash.h"
 #include "flash_fwd_combine_kernel.h"
@@ -48,8 +49,7 @@ void run_flash_fwd_combine(Flash_fwd_params &params, cudaStream_t stream, bool e
         CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
     }
     // kernel<<<grid_m, CombineKernel::MaxThreadsPerBlock, smem_size, stream>>>(kernel_params);
-    cutlass::kernel_launch<CombineKernel>(grid_m, CombineKernel::MaxThreadsPerBlock, smem_size, stream, kernel_params, Arch >= 90 && enable_pdl /*launch_with_pdl*/);
-    CHECK_CUDA_KERNEL_LAUNCH();
+    CHECK_CUTLASS(cutlass::kernel_launch<CombineKernel>(grid_m, CombineKernel::MaxThreadsPerBlock, smem_size, stream, kernel_params, Arch >= 90 && enable_pdl /*launch_with_pdl*/));
 }
 
 template<typename T, typename Tpartial, int kBlockK>

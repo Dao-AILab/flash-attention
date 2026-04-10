@@ -62,11 +62,33 @@ import flash_attn_interface
 flash_attn_interface.flash_attn_func()
 ```
 
+## FlashAttention-4 (CuTeDSL)
+
+FlashAttention-4 is written in CuTeDSL and optimized for Hopper and Blackwell GPUs (e.g. H100, B200).
+
+To install:
+```sh
+pip install flash-attn-4
+```
+
+If you're on CUDA 13, we recommend installing with the `cu13` extra for best performance:
+```sh
+pip install "flash-attn-4[cu13]"
+```
+
+Once installed, you can use it as follows:
+```python
+from flash_attn.cute import flash_attn_func
+
+out = flash_attn_func(q, k, v, causal=True)
+```
+
 ## Installation and features
 **Requirements:**
 - CUDA toolkit or ROCm toolkit
 - PyTorch 2.2 and above.
 - `packaging` Python package (`pip install packaging`)
+- `psutil` Python package (`pip install psutil`)
 - `ninja` Python package (`pip install ninja`) *
 - Linux. Might work for Windows starting v2.3.2 (we've seen a few positive [reports](https://github.com/Dao-AILab/flash-attention/issues/595)) but Windows compilation still requires more testing. If you have ideas on how to set up prebuilt CUDA wheels for Windows, please reach out via Github issue.
 
@@ -105,9 +127,7 @@ We recommend the
 container from Nvidia, which has all the required tools to install FlashAttention.
 
 FlashAttention-2 with CUDA currently supports:
-1. Ampere, Ada, or Hopper GPUs (e.g., A100, RTX 3090, RTX 4090, H100). Support for Turing
-   GPUs (T4, RTX 2080) is coming soon, please use FlashAttention 1.x for Turing
-   GPUs for now.
+1. Ampere, Ada, or Hopper GPUs (e.g., A100, RTX 3090, RTX 4090, H100). For Turing GPUs (T4, RTX 2080), see the separate [flash-attention-turing](https://github.com/ssiu/flash-attention-turing) repo, which supports a core subset of FlashAttention features on Turing.
 2. Datatype fp16 and bf16 (bf16 requires Ampere, Ada, or Hopper GPUs).
 3. All head dimensions up to 256. ~~Head dim > 192 backward requires A100/A800 or H100/H800~~. Head dim 256 backward now works on consumer GPUs (if there's no dropout) as of flash-attn 2.5.5.
 
@@ -123,87 +143,63 @@ container from ROCm, which has all the required tools to install FlashAttention.
 
 #### Composable Kernel Backend
 FlashAttention-2 ROCm CK backend currently supports:
-1. MI200 or MI300 GPUs.
+1. MI200x, MI250x, MI300x, MI355x, and RDNA 3/4 GPUs.
 2. Datatype fp16 and bf16
 3. Both forward's and backward's head dimensions up to 256.
+4. RDNA 3 GPUs do not currently support backward, and RDNA 4 GPUs support backward only with deterministic=False
 
 #### Triton Backend
-The Triton implementation of the [Flash Attention v2](https://tridao.me/publications/flash2/flash2.pdf) is currently a work in progress.
+The Triton implementation of [Flash Attention](https://tridao.me/publications/flash2/flash2.pdf) supports AMD's CDNA (MI200, MI300) and RDNA GPUs using fp16, bf16, and fp32 datatypes. It provides forward and backward passes with causal masking, variable sequence lengths, arbitrary Q/KV sequence lengths and head sizes, MQA/GQA, dropout, rotary embeddings, ALiBi, paged attention, and FP8 (via the Flash Attention v3 interface). Sliding window attention is currently a work in progress.
 
-It supports AMD's CDNA (MI200, MI300) and RDNA GPU's using fp16, bf16 and fp32 datatypes.
+The Triton backend kernels are provided by the [aiter](https://github.com/ROCm/aiter) package, included as a git submodule at `third_party/aiter` and automatically installed during setup.
 
-These features are supported in Fwd and Bwd
-1) Fwd and Bwd with causal masking
-2) Variable sequence lengths
-3) Arbitrary Q and KV sequence lengths
-4) Arbitrary head sizes
-5) Multi and grouped query attention
-6) Dropout
-7) Rotary embeddings
-8) ALiBi
-
-We are working on the following things
-1) Paged Attention 
-2) Sliding Window
-3) FP8
-4) Performance Improvements
-
-##### Getting Started
-To get started with the triton backend for AMD, follow the steps below.
-
-First install the recommended Triton version 
-
-```
-pip install triton==3.2.0
-```
-Then install Flash Attention with the flag `FLASH_ATTENTION_TRITON_AMD_ENABLE` set to `"TRUE"`.
-
-```
+To install, first get PyTorch for ROCm from https://pytorch.org/get-started/locally/, then install Flash Attention:
+```sh
 cd flash-attention
-git checkout main_perf
-FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" python setup.py install
+FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" pip install --no-build-isolation .
 ```
 
-To test that things are working, you can run our tests. These tests take hours so you don't need to run the full thing.
+To use a specific aiter commit (e.g., for testing or development):
+```sh
+cd flash-attention
+cd third_party/aiter && git fetch origin && git checkout <commit-sha> && cd ../..
+FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" pip install --no-build-isolation .
 ```
+
+To run the tests (note: full suite takes hours):
+```sh
 FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" pytest tests/test_flash_attn_triton_amd.py
 ```
 
-You can use autotune for better performance by using this flag `FLASH_ATTENTION_TRITON_AMD_AUTOTUNE="TRUE"`
-```
-FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" FLASH_ATTENTION_TRITON_AMD_AUTOTUNE="TRUE" python $PATH_TO_CODE
+The Triton backend uses a default kernel configuration optimized for determinism and reasonable performance across workloads. For peak throughput, enable `FLASH_ATTENTION_TRITON_AMD_AUTOTUNE="TRUE"` to search for optimal settings, which incurs a one-time warmup cost.
+
+Alternativly, if _not_ autotuning, `FLASH_ATTENTION_FWD_TRITON_AMD_CONFIG_JSON` may be used to set a single triton config overriding the hardcoded defaults for `attn_fwd`. E.g.
+```sh
+FLASH_ATTENTION_FWD_TRITON_AMD_CONFIG_JSON='{"BLOCK_M":128,"BLOCK_N":64,"waves_per_eu":1,"PRE_LOAD_V":false,"num_stages":1,"num_warps":8}'
 ```
 
-###### Docker
-You can also use the Dockerfile below which does the above steps on top of the latest rocm/pytorch image.
-```
+For a quick start with Docker:
+```dockerfile
 FROM rocm/pytorch:latest
 
 WORKDIR /workspace
 
-# install triton
-RUN pip install triton==3.2.0
-
-# install flash attention
-ENV FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
-
-RUN git clone https://github.com/ROCm/flash-attention.git &&\ 
+# build flash attention with triton backend
+RUN git clone https://github.com/Dao-AILab/flash-attention &&\ 
     cd flash-attention &&\
-    git checkout main_perf &&\
-    python setup.py install
+    FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" pip install --no-build-isolation .
 
 # set working dir
 WORKDIR /workspace/flash-attention
+
+# set env variable to use triton backend
+ENV FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE"
 ```
 
-To build the docker file
-```
-docker build -t fa_triton .
-```
-
-To run the docker image
-```
-docker run -it --network=host --user root --group-add video --cap-add=SYS_PTRACE --security-opt seccomp=unconfined --ipc=host --shm-size 16G --device=/dev/kfd --device=/dev/dri fa_triton
+Build and run:
+```sh
+docker build -t flash-attn-triton .
+docker run -it --network=host --user root --group-add video --cap-add=SYS_PTRACE --security-opt seccomp=unconfined --ipc=host --shm-size 16G --device=/dev/kfd --device=/dev/dri flash-attn-triton
 ```
 
 ## How to use FlashAttention
@@ -369,6 +365,25 @@ def flash_attn_with_kvcache(
 
 To see how these functions are used in a multi-head attention layer (which
 includes QKV projection, output projection), see the MHA [implementation](https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/modules/mha.py).
+
+### Using with 🤗 Kernels
+
+If your hardware environment belongs to any of the above-mentioned, you can also use the [`kernels` library](https://github.com/huggingface/kernels)
+to use Flash Attention 2 and 3 right away.
+
+```py
+# pip install kernels
+
+from kernels import get_kernel
+
+# FA2
+fa_module = get_kernel("kernels-community/flash-attn2", version=1)
+flash_attn_func = fa_module.flash_attn_func
+
+# FA3
+fa3_module = get_kernel("kernels-community/flash-attn3", version=1)
+flash_attn_func = fa3_module.flash_attn_func
+```
 
 ## Changelog
 

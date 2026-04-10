@@ -12,6 +12,7 @@
 #include "cutlass/cluster_launch.hpp"
 #include "cutlass/kernel_launch.h"
 
+#include "cuda_check.h"
 #include "static_switch.h"
 #include "flash.h"
 #include "tile_size.h"
@@ -75,7 +76,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     using Scheduler = std::conditional_t<!UsePersistentScheduler, SchedulerSingleTile, SchedulerPersistent>;
     using AttnKernel = std::conditional_t<
         Arch >= 90,
-        flash::enable_sm90_or_later<flash::FlashAttnFwdSm90<CollectiveMainloop, CollectiveEpilogue, Scheduler>>,
+        flash::enable_sm90<flash::FlashAttnFwdSm90<CollectiveMainloop, CollectiveEpilogue, Scheduler>>,
         flash::enable_sm80_to_sm89<flash::FlashAttnFwdSm80<CollectiveMainloop, CollectiveEpilogue, Scheduler>>
     >;
 
@@ -139,7 +140,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         static_cast<float*>(params.softmax_lse_ptr),
         {_1{}, seqlen_q, !is_varlen_q ? params.h * seqlen_q : 0, 0},  // stride_LSE
         static_cast<float*>(params.softmax_lseaccum_ptr),
-        {_1{}, seqlen_q, !is_varlen_q ? params.h * seqlen_q : 0, params.h * seqlen_q * batch_q},  // stride_LSE_partial
+        {_1{}, params.lseaccum_head_stride, !is_varlen_q ? params.lseaccum_batch_stride : 0, params.lseaccum_split_stride},  // stride_LSE_partial
         params.h_k,
         params.cu_seqlens_q, params.seqused_q
     };
@@ -185,17 +186,16 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
         }
         dim3 cluster_dims(size<0>(ClusterShape{}), size<1>(ClusterShape{}), size<2>(ClusterShape{}));
         cutlass::ClusterLaunchParams launch_params{grid_dims, block_dims, cluster_dims, smem_size, stream};
-        cutlass::launch_kernel_on_cluster(launch_params, kernel, kernel_params);
+        CHECK_CUTLASS(cutlass::launch_kernel_on_cluster(launch_params, kernel, kernel_params));
     } else {
         auto kernel = cutlass::device_kernel<AttnKernel>;
         if (smem_size >= 48 * 1024) {
             CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
         }
         // kernel<<<grid_dims, block_dims, smem_size, stream>>>(kernel_params);
-        cutlass::kernel_launch<AttnKernel>(grid_dims, block_dims, smem_size, stream, kernel_params,
-                                           Arch >= 90 && Varlen && !params.skip_scheduler_metadata_computation && params.prepare_varlen_pdl /*launch_with_pdl*/);
+        CHECK_CUTLASS(cutlass::kernel_launch<AttnKernel>(grid_dims, block_dims, smem_size, stream, kernel_params,
+                                           Arch >= 90 && Varlen && !params.skip_scheduler_metadata_computation && params.prepare_varlen_pdl /*launch_with_pdl*/));
     }
-    CHECK_CUDA_KERNEL_LAUNCH();
 }
 
 template<int Arch, typename T, int kHeadDim, int kHeadDimV, bool Split, bool PagedKVNonTMA, bool Has_softcap, bool PackGQA>
