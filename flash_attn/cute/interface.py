@@ -855,6 +855,7 @@ def _flash_attn_fwd(
     if not is_fake_mode():
         q_call, k_call, v_call = q.detach(), k.detach(), v.detach()
         if is_fp8:
+            # need uint8 workaround until we pin torch >= 2.11.0 where fp8 export is supported
             q_call = q_call.view(torch.uint8)
             k_call = k_call.view(torch.uint8)
             v_call = v_call.view(torch.uint8)
