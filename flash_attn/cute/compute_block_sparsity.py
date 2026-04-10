@@ -12,6 +12,7 @@ from flash_attn.cute.block_sparsity import (
     to_cute_block_sparse_tensors,
 )
 from flash_attn.cute.block_sparse_utils import get_curr_blocksparse_tensors
+from flash_attn.cute.testing import is_fake_mode
 from flash_attn.cute.cute_dsl_utils import to_cute_tensor, get_aux_tensor_metadata, to_cute_aux_tensor
 from flash_attn.cute.utils import hash_callable, scalar_to_ssa, ssa_to_scalar
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
@@ -521,18 +522,19 @@ def compute_block_sparsity(
             options="--enable-tvm-ffi",
         )
 
-    compute_block_sparsity.compile_cache[compile_key](
-        blocksparse_tensors_torch[:4],
-        seqlen_q,
-        seqlen_k,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        seqused_q,
-        seqused_k,
-        cu_total_m_blocks,
-        cu_total_n_blocks,
-        aux_tensors,
-    )
+    if not is_fake_mode():
+        compute_block_sparsity.compile_cache[compile_key](
+            blocksparse_tensors_torch[:4],
+            seqlen_q,
+            seqlen_k,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            seqused_q,
+            seqused_k,
+            cu_total_m_blocks,
+            cu_total_n_blocks,
+            aux_tensors,
+        )
 
     return blocksparse_tensors_torch
 
