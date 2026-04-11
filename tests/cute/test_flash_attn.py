@@ -5,6 +5,8 @@ import itertools
 import os
 import random
 import re
+import gc
+from functools import wraps
 
 import pytest
 import torch
@@ -28,7 +30,27 @@ from flash_attn.cute.testing import (
 from flash_attn.cute.interface import (
     flash_attn_func,
     flash_attn_varlen_func,
+    _flash_attn_fwd,
+    _flash_attn_bwd,
 )
+
+def retry_on_oom(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except torch.OutOfMemoryError as e:
+            if "out of memory" in str(e).lower():
+                if hasattr(_flash_attn_fwd, "compile_cache"):
+                    _flash_attn_fwd.compile_cache.clear()
+                if hasattr(_flash_attn_bwd, "compile_cache"):
+                    _flash_attn_bwd.compile_cache.clear()
+                gc.collect()
+                torch.cuda.empty_cache()
+                return func(*args, **kwargs)
+            else:
+                raise
+    return wrapper
 
 # torch FakeTensorMode would enable fast cutedsl kernel compilation without allocating the actual GPU memory or running the kernel
 # When operating fake tensors, we cannot perform data-dependent operations (e.g., `tensor.max()`).
@@ -50,8 +72,8 @@ VERBOSE = True
 @pytest.mark.parametrize("has_qv", [False])
 @pytest.mark.parametrize("deterministic", [False, True])
 # @pytest.mark.parametrize("deterministic", [False])
-# @pytest.mark.parametrize("softcap", [0.0, 15.0])
-@pytest.mark.parametrize("softcap", [0.0])
+@pytest.mark.parametrize("softcap", [0.0, 15.0])
+# @pytest.mark.parametrize("softcap", [0.0])
 @pytest.mark.parametrize("local_enum", [0, 1, 2, 3])
 # @pytest.mark.parametrize("local_enum", [0])
 @pytest.mark.parametrize("causal", [False, True])
@@ -96,6 +118,7 @@ VERBOSE = True
     ],
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(128, 128)])
+@retry_on_oom
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_output(
     seqlen_q,
@@ -388,8 +411,8 @@ def test_flash_attn_output(
 @pytest.mark.parametrize("has_qv", [False])
 @pytest.mark.parametrize("deterministic", [False, True])
 # @pytest.mark.parametrize("deterministic", [False])
-# @pytest.mark.parametrize("softcap", [0.0, 15.0])
-@pytest.mark.parametrize("softcap", [0.0])
+@pytest.mark.parametrize("softcap", [0.0, 15.0])
+# @pytest.mark.parametrize("softcap", [0.0])
 @pytest.mark.parametrize("local_enum", [0, 1, 2, 3])
 # @pytest.mark.parametrize("local_enum", [0])
 @pytest.mark.parametrize("causal", [False, True])
@@ -449,6 +472,7 @@ def test_flash_attn_output(
         (False, True),
     ],
 )
+@retry_on_oom
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_varlen_output(
     seqlen_q,
@@ -927,6 +951,7 @@ def test_flash_attn_varlen_output(
     ],
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(256, 128)])
+@retry_on_oom
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_kvcache(
     seqlen_q,

@@ -543,13 +543,16 @@ def _flash_attn_fwd(
         and (tile_m % qhead_per_kvhead == 0 or not pack_gqa)
     )
 
-    # hash score and mask mods for compile cache
-    score_mod_hash = utils.hash_callable(score_mod) if score_mod is not None else False
-    mask_mod_hash = utils.hash_callable(mask_mod) if mask_mod is not None else False
-
     if softcap is not None:
         assert score_mod is None, "softcap and score_mod cannot be used together"
         score_mod = utils.create_softcap_scoremod(softcap)
+    elif score_mod is not None:
+        if arch // 10 == 8:
+            raise NotImplementedError("Custom user-provided score_mod is not supported on SM8x architectures.")
+        
+    # hash score and mask mods for compile cache
+    score_mod_hash = utils.hash_callable(score_mod) if score_mod is not None else False
+    mask_mod_hash = utils.hash_callable(mask_mod) if mask_mod is not None else False
 
     is_varlen = (
         cu_seqlens_q is not None
@@ -1171,12 +1174,20 @@ def _flash_attn_bwd(
         pack_gqa = qhead_per_kvhead > 1
     # pack_gqa backward not yet supported in bwd
     pack_gqa = False
-    if score_mod is not None:
+    
+    if softcap != 0.0:
+        assert score_mod is None and score_mod_bwd is None, (
+            "softcap and score_mod/score_mod_bwd cannot be used together"
+        )
+        score_mod = utils.create_softcap_scoremod(softcap)
+        score_mod_bwd = utils.create_softcap_scoremod_bwd(softcap)
+    elif score_mod is not None:
         assert score_mod_bwd is not None, "score_mod_bwd is required when score_mod is provided"
-        assert softcap == 0.0, "softcap and score_mod are mutually exclusive (different log2 scaling)"
         assert cu_seqlens_q is None and cu_seqlens_k is None, (
             "varlen + score_mod not supported in bwd yet"
         )
+        if arch // 10 == 8:
+            raise NotImplementedError("Custom user-provided score_mod is not supported on SM8x architectures.")
 
     device = q.device
     out_torch_dtype = q.dtype
@@ -1322,7 +1333,6 @@ def _flash_attn_bwd(
             causal,
             window_size_left is not None,
             window_size_right is not None,
-            softcap != 0.0,
             m_block_size,
             n_block_size,
             num_threads,
@@ -1352,6 +1362,9 @@ def _flash_attn_bwd(
             get_broadcast_dims(k),
             get_broadcast_dims(v),
             get_broadcast_dims(dout),
+            # Prevent TVM stride poisoning when only one block is present.
+            (seqlen_q_rounded // m_block_size == 1),
+            (seqlen_k_rounded // n_block_size == 1),
         )
     else:
         compile_key = (
@@ -1363,7 +1376,6 @@ def _flash_attn_bwd(
             causal,
             window_size_left is not None,
             window_size_right is not None,
-            softcap != 0.0,
             m_block_size,
             n_block_size,
             num_threads,
@@ -1385,6 +1397,9 @@ def _flash_attn_bwd(
             get_broadcast_dims(k),
             get_broadcast_dims(v),
             get_broadcast_dims(dout),
+            # Prevent TVM stride poisoning when only one block is present.
+            (seqlen_q_rounded // m_block_size == 1),
+            (seqlen_k_rounded // n_block_size == 1),
         )
     if compile_key not in _flash_attn_bwd.compile_cache:
         q_tensor, k_tensor, v_tensor, do_tensor, dq_tensor, dk_tensor, dv_tensor = [
@@ -1427,6 +1442,8 @@ def _flash_attn_bwd(
                 AtomLayoutNdKV,
                 AtomLayoutMdQ,
                 V_in_regs=V_in_regs,
+                score_mod=score_mod,
+                score_mod_bwd=score_mod_bwd,
             )
         elif arch // 10 == 9:
             fa_bwd_obj = FlashAttentionBackwardSm90(
@@ -1498,7 +1515,6 @@ def _flash_attn_bwd(
             cu_seqlens_k_tensor,
             seqused_q_tensor,
             seqused_k_tensor,
-            None,  # softcap - not yet supported in backward
             window_size_left,
             window_size_right,
             dQ_semaphore_tensor,
@@ -1525,7 +1541,6 @@ def _flash_attn_bwd(
             cu_seqlens_k,
             seqused_q,
             seqused_k,
-            None,  # softcap - not yet supported in backward
             window_size_left,
             window_size_right,
             dQ_semaphore,
@@ -1724,7 +1739,6 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dout, dlse):
         q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = ctx.saved_tensors
-        assert ctx.softcap == 0.0
         if not ctx.return_lse:
             dlse = None
         if dout is None:
