@@ -151,7 +151,10 @@ class FlashAttentionForwardSm120TMAOptimized(FlashAttentionForwardSm80):
         self.v_num_stages = self.num_stages
 
         # Match SM100-style shared K/V stage-offset scheduling when stage counts align.
-        self.share_kv_tma_stage_offset = self.num_stages > 1
+        # When K and V head dims differ, interleaving the shared-KV stage stream can alias
+        # incompatible K/V stage footprints and corrupt V tiles. Keep separate K/V stage
+        # progression in that case.
+        self.share_kv_tma_stage_offset = self.num_stages > 1 and self.same_hdim_kv
         self.shared_kv_mbar = self.share_kv_tma_stage_offset
         self.use_tma_Q_mainloop = self.use_tma_Q and (not self.use_direct_q_gmem_regs_decode)
         # In shared-KV stage-offset mode, piggyback the first Q TMA transaction on K's mbarrier.
@@ -273,7 +276,8 @@ class FlashAttentionForwardSm120TMAOptimized(FlashAttentionForwardSm80):
 
         k_num_stages = num_stages
         v_num_stages = num_stages
-        shared_kv_mbar = (num_stages > 1) and (k_num_stages == v_num_stages)
+        same_hdim_kv = head_dim == head_dim_v
+        shared_kv_mbar = (num_stages > 1) and (k_num_stages == v_num_stages) and same_hdim_kv
         unify_qk_tma_barrier = use_tma_Q_effective and shared_kv_mbar
         q_mbar_slots = 0 if unify_qk_tma_barrier else (2 if use_tma_Q_effective else 0)
         mbar_load_k_full_offset = q_mbar_slots
