@@ -191,20 +191,17 @@ class SoftmaxSm100(Softmax):
         )
 
     @cute.jit
-    def compute_row_max_local(
-        self,
-        acc_S_row: cute.TensorSSA,
-        is_first: Boolean
-    ) -> Float32:
+    def compute_row_max_local(self, acc_S_row: cute.TensorSSA, is_first: Boolean) -> Float32:
         if cutlass.const_expr(is_first):
             row_max_new = self._compute_row_max(acc_S_row)
         else:
             row_max_old = self.row_max[0]
             row_max_new = self._compute_row_max(acc_S_row, init_val=row_max_old)
         return row_max_new
-    
+
     @cute.jit
-    def update_row_max_from_local(self,
+    def update_row_max_from_local(
+        self,
         row_max_new: Float32,
         is_first: Boolean,
     ) -> Tuple[Float32, Float32]:

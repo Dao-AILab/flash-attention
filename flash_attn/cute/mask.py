@@ -408,10 +408,8 @@ class AttentionMask:
                 for j in cutlass.range_constexpr(32):
                     curr_col = col_start + j
                     mask = (curr_mask_val >> j) & 1
-                    acc_S[curr_col] = (
-                        acc_S[curr_col] if Boolean(mask) else -Float32.inf
-                    )
-        
+                    acc_S[curr_col] = acc_S[curr_col] if Boolean(mask) else -Float32.inf
+
         elif const_expr(not mask_causal and not mask_local and mask_mod is None):
             if const_expr(mask_seqlen):
                 if const_expr(not r2p):

@@ -39,7 +39,7 @@ class CpasyncGatherKVManager(ParamsBase):
 
     gmem_tiled_copy_KV: cute.TiledCopy
     gmem_thr_copy_KV: cute.TiledCopy
-    
+
     rTopk: cute.Tensor
     rTopkHalf: cute.Tensor
     # for bitmask
@@ -55,7 +55,7 @@ class CpasyncGatherKVManager(ParamsBase):
         mIndexTopk: cute.Tensor,
         sBitmask: cute.Tensor,
         cta_rank_in_cluster: Int32,
-        thread_idx: Int32, 
+        thread_idx: Int32,
         warp_idx: Int32,
         topk_length: Int32,
         seqlen_k_limit: Int32,
@@ -140,11 +140,7 @@ class CpasyncGatherKVManager(ParamsBase):
         transpose: bool,
     ):
         entries_per_thread = self.topk_indices_per_thread
-        rTopk = (
-            self.rTopk
-            if const_expr(transpose) else
-            self.rTopkHalf
-        )
+        rTopk = self.rTopk if const_expr(transpose) else self.rTopkHalf
 
         for i in cutlass.range_constexpr(entries_per_thread):
             row = (
@@ -193,21 +189,16 @@ class CpasyncGatherKVManager(ParamsBase):
         producer_state_bitmask.advance()
         return producer_state_bitmask
 
-        
     @cute.jit
     def compute_X_ptr(
         self,
         mX: cute.Tensor,
         transpose: bool,
-    ):  
+    ):
         entries_per_thread = self.topk_indices_per_thread
         tPrXPtr = cute.make_rmem_tensor((entries_per_thread,), cutlass.Int64)
         tPrRowValid = cute.make_rmem_tensor((entries_per_thread,), cutlass.Int32)
-        rTopk = (
-            self.rTopk
-            if const_expr(transpose) else
-            self.rTopkHalf
-        )
+        rTopk = self.rTopk if const_expr(transpose) else self.rTopkHalf
 
         for i in cutlass.range_constexpr(entries_per_thread):
             topk_idx = rTopk[i]
@@ -218,7 +209,7 @@ class CpasyncGatherKVManager(ParamsBase):
                 tPrXPtr[i] = utils.elem_pointer(mX, (topk_idx, 0)).toint()
             else:
                 tPrXPtr[i] = utils.elem_pointer(mX, (0, topk_idx)).toint()
-        
+
         return tPrXPtr, tPrRowValid
 
     @cute.jit
@@ -230,12 +221,12 @@ class CpasyncGatherKVManager(ParamsBase):
         K_or_V: str,
     ):
         assert K_or_V in ("K", "V")
-        cta_tile_n = self.tile_n if const_expr(transpose) else self.tile_n//self.cta_group_size
-        head_dim = self.hdim if const_expr(K_or_V == "K") else self.hdim_v//self.num_hdimv_splits
+        cta_tile_n = self.tile_n if const_expr(transpose) else self.tile_n // self.cta_group_size
+        head_dim = self.hdim if const_expr(K_or_V == "K") else self.hdim_v // self.num_hdimv_splits
         if const_expr(transpose):
-            head_dim = head_dim//self.cta_group_size
+            head_dim = head_dim // self.cta_group_size
         order = (1, 0) if const_expr(transpose) else (0, 1)
-        
+
         sX_nd_layout = cute.make_ordered_layout((cta_tile_n, head_dim), order=order)
         sX_nd = cute.composition(sX, sX_nd_layout)
 
@@ -274,13 +265,10 @@ class CpasyncGatherKVManager(ParamsBase):
                 ki = tXcX[0, 0, k][1] // self.async_copy_elems
                 mX_cur_copy_ki = mX_cur_copy[None, ki]
                 tXsX_k = tXsX[None, m, k]
-                mX_cur_copy_ki = cute.make_tensor(
-                    mX_cur_copy_ki.iterator, tXsX_k.layout
-                )
+                mX_cur_copy_ki = cute.make_tensor(mX_cur_copy_ki.iterator, tXsX_k.layout)
                 cute.copy(
                     self.gmem_tiled_copy_KV,
                     mX_cur_copy_ki,
                     tXsX_k,
-                    pred=should_load
-                    if const_expr(not self.disable_bitmask) else None,
+                    pred=should_load if const_expr(not self.disable_bitmask) else None,
                 )

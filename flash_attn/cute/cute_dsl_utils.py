@@ -133,6 +133,7 @@ def dump_kernel_attributes(compiled_kernel):
     from cuda.bindings import driver
     from cutlass.utils import HardwareInfo
     import torch
+
     device_id = torch.cuda.current_device()
     hardware_info = HardwareInfo(device_id=device_id)
     cubin_data = compiled_kernel.artifacts.CUBIN
@@ -156,7 +157,7 @@ def dump_kernel_attributes(compiled_kernel):
         )
     )
 
-    print(f"--- Kernel Info ---")
+    print("--- Kernel Info ---")
     print(f"local_size_bytes: {local_size_bytes}")
     print(f"num_regs: {num_regs}")
-    print(f"--- End Kernel Info ---")
+    print("--- End Kernel Info ---")

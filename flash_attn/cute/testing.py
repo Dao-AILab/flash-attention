@@ -405,7 +405,9 @@ def attention_ref(
         batch = q.shape[0]
         topk_len = topk_indices.shape[2]
         if topk_len < seqlen_k:
-            topk_index_mask = torch.full((batch, seqlen_q, seqlen_k), False, device="cuda").scatter_(-1, topk_indices, True)
+            topk_index_mask = torch.full(
+                (batch, seqlen_q, seqlen_k), False, device="cuda"
+            ).scatter_(-1, topk_indices, True)
             scores.masked_fill_(rearrange(~topk_index_mask, "b t s -> b 1 t s"), float("-inf"))
     if local_mask is not None:
         scores.masked_fill_(local_mask, float("-inf"))
