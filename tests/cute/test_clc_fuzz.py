@@ -17,7 +17,12 @@ from flash_attn.cute import utils as cute_utils
 from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
 from flash_attn.cute.interface import flash_attn_func, flash_attn_varlen_func
 from flash_attn.cute.testing import attention_ref
-from flash_attn.cute.tile_scheduler import SchedulingMode, SingleTileLPTScheduler, SingleTileVarlenScheduler
+from flash_attn.cute.tile_scheduler import (
+    SchedulingMode,
+    SingleTileLPTScheduler,
+    SingleTileVarlenScheduler,
+    StaticPersistentTileScheduler,
+)
 
 
 if torch.cuda.is_available():
@@ -60,10 +65,19 @@ def check_output(q, k, v, *, causal=False, window_size=(None, None), num_splits=
     torch.cuda.synchronize()
     if assert_clc and _captured_schedulers:
         sched_cls, sched_mode, use_2cta = _captured_schedulers[-1]
-        assert sched_cls is SingleTileLPTScheduler, f"Expected SingleTileLPTScheduler, got {sched_cls.__name__}"
-        assert sched_mode == SchedulingMode.CLC, f"Expected CLC scheduling mode, got {sched_mode!r}"
-        if assert_2cta:
-            assert use_2cta, "Expected use_2cta_instrs=True but got False"
+        is_local = window_size != (None, None)
+        if causal or is_local:
+            assert sched_cls is SingleTileLPTScheduler, f"Expected SingleTileLPTScheduler, got {sched_cls.__name__}"
+            assert sched_mode == SchedulingMode.CLC, f"Expected CLC scheduling mode, got {sched_mode!r}"
+            if assert_2cta:
+                assert use_2cta, "Expected use_2cta_instrs=True but got False"
+        else:
+            assert sched_cls is StaticPersistentTileScheduler, (
+                f"Expected StaticPersistentTileScheduler for dense noncausal, got {sched_cls.__name__}"
+            )
+            assert sched_mode == SchedulingMode.STATIC, (
+                f"Expected STATIC scheduling mode for dense noncausal, got {sched_mode!r}"
+            )
     out_ref, _ = attention_ref(q, k, v, causal=causal, window_size=window_size)
     out_pt, _ = attention_ref(q, k, v, causal=causal, window_size=window_size, upcast=False, reorder_ops=True)
     fwd_atol = 2 * (out_ref + 0.3 - 0.3 - out_ref).abs().max().item()
@@ -249,7 +263,7 @@ class TestCLCHeadDim:
 
 class TestCLCFallback:
 
-    def test_varlen_uses_clc(self):
+    def test_varlen_mha_uses_static(self):
         _captured_schedulers.clear()
         batch, seqlen, heads, d = 4, 256, 4, 128
         lens = torch.tensor([64, 128, 32, 32], dtype=torch.int32)
@@ -271,7 +285,7 @@ class TestCLCFallback:
         assert sched_cls is SingleTileVarlenScheduler, (
             f"Expected SingleTileVarlenScheduler for varlen, got {sched_cls.__name__}"
         )
-        assert sched_mode == SchedulingMode.CLC, f"Expected CLC scheduling mode, got {sched_mode!r}"
+        assert sched_mode == SchedulingMode.STATIC, f"Expected STATIC scheduling mode, got {sched_mode!r}"
 
     @pytest.mark.parametrize("sq,sk,wl,wr", [
         (512, 512, 128, 128),
@@ -311,7 +325,10 @@ def check_varlen_output(seqlens, heads, d, *, causal=False, kv_heads=None, num_s
     if _captured_schedulers:
         sched_cls, sched_mode, *_ = _captured_schedulers[-1]
         assert sched_cls is SingleTileVarlenScheduler, f"Expected SingleTileVarlenScheduler, got {sched_cls.__name__}"
-        assert sched_mode == SchedulingMode.CLC, f"Expected CLC scheduling mode, got {sched_mode!r}"
+        expected_sched_mode = SchedulingMode.CLC if heads != kv_heads else SchedulingMode.STATIC
+        assert sched_mode == expected_sched_mode, (
+            f"Expected {expected_sched_mode.name} scheduling mode, got {sched_mode!r}"
+        )
 
     for i in range(len(seqlens)):
         s = slice(cu_seqlens[i], cu_seqlens[i + 1])
@@ -355,7 +372,10 @@ def check_varlen_output_seqused(seqlens, heads, d, *, causal=False, kv_heads=Non
     if _captured_schedulers:
         sched_cls, sched_mode, *_ = _captured_schedulers[-1]
         assert sched_cls is SingleTileVarlenScheduler, f"Expected SingleTileVarlenScheduler, got {sched_cls.__name__}"
-        assert sched_mode == SchedulingMode.CLC, f"Expected CLC scheduling mode, got {sched_mode!r}"
+        expected_sched_mode = SchedulingMode.CLC if heads != kv_heads else SchedulingMode.STATIC
+        assert sched_mode == expected_sched_mode, (
+            f"Expected {expected_sched_mode.name} scheduling mode, got {sched_mode!r}"
+        )
 
     out_ref, _ = attention_ref(q, k, v, q_mask, k_mask, causal=causal)
     out_pt, _ = attention_ref(q, k, v, q_mask, k_mask, causal=causal, upcast=False, reorder_ops=True)
