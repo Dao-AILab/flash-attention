@@ -25,6 +25,7 @@ from flash_attn.cute.pack_gqa import PackGQA, pack_gqa_layout
 from flash_attn.cute import utils
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
+from flash_attn.cute.block_sparsity import BlockSparseTensors
 from flash_attn.cute.mask import AttentionMask
 import flash_attn.cute.blackwell_helpers as fa_sm100_utils
 from flash_attn.cute.softmax import SoftmaxSm100
@@ -63,13 +64,11 @@ class FlashAttentionMLAForwardSm100:
         hdim: int = 64,
         hdimv: int = 512,
         is_varlen_q: bool = False,
-        is_varlen_k: bool = False,
         disable_bitmask: bool = False,
     ):
         self.is_causal = is_causal
         self.is_local = False
         self.is_varlen_q = is_varlen_q
-        self.is_varlen_k = is_varlen_k
         self.use_tma_O = not is_varlen_q
         self.use_cpasync_load_KV = use_cpasync_load_KV
         self.use_tma_KV = not use_cpasync_load_KV
@@ -81,9 +80,8 @@ class FlashAttentionMLAForwardSm100:
         if is_topk_gather:
             assert pack_gqa
             assert qhead_per_kvhead == 128, "require MQA 128 for DSA path"
-        # user-provided option if topk indices guaranteed < seqlen_k and not causal
+        # user-provided option if topk indices guaranteed in bounds
         self.disable_bitmask = disable_bitmask
-        assert not (disable_bitmask and is_causal), "must have bitmask to causal mask for DSA"
         
         # ==== tile scheduler ====
         self.is_persistent = False
@@ -296,14 +294,22 @@ class FlashAttentionMLAForwardSm100:
         mK: cute.Tensor,   # (b_k, s_k, h_k, d)  or (total_k, h_k, d)  if there is cu_seqlens_k or (num_pages, page_size, h_k, d)  if there is page_table
         mV: cute.Tensor,   # (b_k, s_k, h_k, dv) or (total_k, h_k, dv) if there is cu_seqlens_k or (num_pages, page_size, h_k, dv) if there is page_table
         mO: cute.Tensor,   # (b, s_q, h, dv) or (total_q, h, dv) if there is cu_seqlens_q
+        mLSE: Optional[cute.Tensor],  # (b, h, s_q) or (h, total_q) if there is cu_seqlens_q
         softmax_scale: Float32,
-        mLSE: Optional[cute.Tensor] = None,        # (b, h, s_q) or (h, total_q) if there is cu_seqlens_q
         mCuSeqlensQ: Optional[cute.Tensor] = None, # (b + 1)
         mCuSeqlensK: Optional[cute.Tensor] = None, # (b + 1)
         mSeqUsedQ: Optional[cute.Tensor] = None,   # (b)
         mSeqUsedK: Optional[cute.Tensor] = None,   # (b)
         mIndexTopk: Optional[cute.Tensor] = None,  # (b, s_q, topk) or (total_q, topk) if there is cu_seqlens_q
+        mPageTable: Optional[cute.Tensor] = None,
+        window_size_left: Int32 | int | None = None,
+        window_size_right: Int32 | int | None = None,
+        # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
+        stream: cuda.CUstream = None,
     ):  
+        # ==== asserts for unimplemented features ====
+        assert mPageTable is None, "page table tbd for MLA"
+
         # ==== dtype info ====
         self.dtype_Q = mQ.element_type
         self.dtype_K = mK.element_type
@@ -1545,7 +1551,7 @@ class FlashAttentionMLAForwardSm100:
                     seqlen, cluster_m_block,
                 )
             num_n_blocks = n_block_max - n_block_min
-            even_n_blocks = num_n_blocks % 2 == 0
+            even_n_blocks = num_n_blocks % 2 == 0 and num_n_blocks > 0
             num_n_block_groups = cute.ceil_div(num_n_blocks, self.num_stages_S)
 
             # ==== Partition GMEM tensors ====
@@ -1914,7 +1920,7 @@ class FlashAttentionMLAForwardSm100:
                     seqlen, cluster_m_block,
                 )
             num_n_blocks = n_block_max - n_block_min
-            even_n_blocks = num_n_blocks % 2 == 0
+            even_n_blocks = num_n_blocks % 2 == 0 and num_n_blocks > 0
             num_n_block_groups = cute.ceil_div(num_n_blocks, self.num_stages_S)
 
             if is_leader_cta:
@@ -2164,7 +2170,7 @@ class FlashAttentionMLAForwardSm100:
                     seqlen, cluster_m_block,
                 )
             num_n_blocks = n_block_max - n_block_min
-            even_n_blocks = num_n_blocks % 2 == 0
+            even_n_blocks = num_n_blocks % 2 == 0 and num_n_blocks > 0
             num_n_block_groups = cute.ceil_div(num_n_blocks, self.num_stages_S)
 
             mask = AttentionMaskCls(seqlen)
@@ -2673,10 +2679,6 @@ def test_mla_kernel(
     nheads_kv = 1
     qhead_per_kvhead = nheads
 
-    if seqlen_k < seqlen_q and is_causal:
-        print(f"skip {seqlen_k=} less than {seqlen_q} for causal")
-        return
-
     compile_key = (
         is_causal,
         gather_kv,
@@ -2735,7 +2737,7 @@ def test_mla_kernel(
         else:
             mIndexTopk = None
 
-        compile_kwargs = dict(mLSE=mLSE, mIndexTopk=mIndexTopk)
+        compile_kwargs = dict(mIndexTopk=mIndexTopk)
         if varlen_q:
             compile_kwargs["mCuSeqlensQ"] = from_dlpack(cu_seqlens_q_dummy, assumed_align=4)
         if varlen_k:
@@ -2751,10 +2753,9 @@ def test_mla_kernel(
                 qhead_per_kvhead=qhead_per_kvhead,
                 nheads_kv=nheads_kv,
                 is_varlen_q=varlen_q,
-                is_varlen_k=varlen_k,
                 disable_bitmask=disable_bitmask,
             ),
-            mQ, mQv, mK, mV, mO, softmax_scale,
+            mQ, mQv, mK, mV, mO, mLSE, softmax_scale,
             **compile_kwargs,
             options="--keep-ptx --keep-cubin --generate-line-info"
         )
@@ -2890,7 +2891,7 @@ def test_mla_kernel(
     else:
         mIndexTopk = None
 
-    run_kwargs = dict(mLSE=mLSE, mIndexTopk=mIndexTopk)
+    run_kwargs = dict(mIndexTopk=mIndexTopk)
     if varlen_q:
         run_kwargs["mCuSeqlensQ"] = from_dlpack(cu_seqlens_q, assumed_align=4)
     if varlen_k:
@@ -2898,7 +2899,7 @@ def test_mla_kernel(
 
     # ---- Run kernel ----
     compile_cache[compile_key](
-        mQ, mQv, mK, mV, mO, softmax_scale,
+        mQ, mQv, mK, mV, mO, mLSE, softmax_scale,
         **run_kwargs,
     )
 
@@ -2991,6 +2992,8 @@ def benchmark_mla_kernel(
         else:
             mIndexTopk = None
 
+        mLSE = None
+
         kernel = cute.compile(
             FlashAttentionMLAForwardSm100(
                 is_causal=is_causal,
@@ -3002,7 +3005,7 @@ def benchmark_mla_kernel(
                 nheads_kv=nheads_kv,
                 disable_bitmask=disable_bitmask,
             ),
-            mQ, mQv, mK, mV, mO, softmax_scale,
+            mQ, mQv, mK, mV, mO, mLSE, softmax_scale,
             mIndexTopk=mIndexTopk,
         )
         compile_cache[compile_key] = kernel
@@ -3024,10 +3027,11 @@ def benchmark_mla_kernel(
         mIndexTopk = from_dlpack(index_topk, assumed_align=16).mark_layout_dynamic(leading_dim=index_topk.ndim - 1)
     else:
         mIndexTopk = None
+    mLSE = None
 
     exec_time_in_s = timeit(
         compile_cache[compile_key],
-        mQ, mQv, mK, mV, mO, softmax_scale,
+        mQ, mQv, mK, mV, mO, mLSE, softmax_scale,
         mIndexTopk=mIndexTopk,
     )
 
@@ -3046,13 +3050,13 @@ def benchmark_mla_kernel(
 if __name__ == "__main__":
     run_test = True
     run_benchmark = True
-    gather_kv = True
-    is_causal = False
+    gather_kv = False
+    is_causal = True
     pack_gqa = True
     topk_length = 2048
     varlen_q = False
     varlen_k = False
-    disable_bitmask = True
+    disable_bitmask = False
     validate = True
 
     if run_test:
@@ -3062,10 +3066,10 @@ if __name__ == "__main__":
         else:
             seqlen_q_test_values = range(1, 1001, 200)
             seqlen_k_test_values = range(topk_length, 9001, 2000)
-        seqlen_q_test_values = [1]
-        seqlen_k_test_values = [4096]
+        seqlen_q_test_values = [256]
+        seqlen_k_test_values = [128]
         nheads_test_values = [128]
-        batch_test_values = [512]
+        batch_test_values = [5]
         test_configs = [
             (batch, nheads, seqlen_q, seqlen_k,)
             for batch in batch_test_values
@@ -3080,8 +3084,8 @@ if __name__ == "__main__":
         print("=" * 40)
         for config in test_configs:
             batch, nheads, seqlen_q, seqlen_k = config
-            if is_causal and seqlen_k < seqlen_q:
-                continue
+            # if is_causal and seqlen_k < seqlen_q:
+            #     continue
             for iter in range(iters_per_config):
                 test_mla_kernel(
                     seqlen_q=seqlen_q,

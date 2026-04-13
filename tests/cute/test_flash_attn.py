@@ -113,6 +113,12 @@ def test_flash_attn_output(
     local = local_enum > 0
     if local and causal:
         pytest.skip()
+    if has_qv and d != 64:
+        pytest.skip()
+    if has_qv and local:
+        pytest.xfail("has_qv: local not supported yet")
+    if has_qv and has_learnable_sink:
+        pytest.xfail("has_qv: learnable sink not supported yet")
     device = "cuda"
     # set seed
     seed = 0
@@ -122,14 +128,20 @@ def test_flash_attn_output(
     torch.cuda.synchronize()
     batch_size = 9 if seqlen_k <= 2048 else 2
     # batch_size = 2
-    nheads = 6
+    nheads = 6 if not has_qv else 128
     # nheads = 1
-    nheads_kv = nheads if mha_type == "mha" else (3 if mha_type == "gqa" else 1)
+    if not has_qv:
+        nheads_kv = nheads if mha_type == "mha" else (3 if mha_type == "gqa" else 1)
+    else:
+        nheads_kv = nheads if mha_type == "mha" else (8 if mha_type == "gqa" else 1)
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
     # dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
     dv_vals = [128] if d == 192 else ([d] if d != 128 else [64, d])
     if dtype == torch.float8_e4m3fn:
         dv_vals = [d]
+    if has_qv:
+        assert d == 64
+        dv_vals = [512]
     # attention_chunk_vals = [torch.randint(1, seqlen_k * 2, (1,)).item(), 0]
     attention_chunk_vals = [0]
     for dv, attention_chunk in itertools.product(dv_vals, attention_chunk_vals):
@@ -245,10 +257,10 @@ def test_flash_attn_output(
             print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
             print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
         # num_splits_vals = [1, 3]
-        pack_gqa_vals = [False, True, None] if not TEST_BWD_ONLY else [False]
+        pack_gqa_vals = [True] if has_qv else [False, True, None] if not TEST_BWD_ONLY else [False]
         # SplitKV is not supported for hdim >= 192
         # pack_gqa_vals = [False]
-        num_splits_vals = [1, 3] if d < 192 and not DISABLE_SPLIT and not TEST_BWD_ONLY else [1]
+        num_splits_vals = [1, 3] if d < 192 and not DISABLE_SPLIT and not TEST_BWD_ONLY and not has_qv else [1]
         for pack_gqa, num_splits in itertools.product(pack_gqa_vals, num_splits_vals):
             # SplitKV not supported on SM90 - skip this iteration
             if IS_SM90 and num_splits > 1:
@@ -259,8 +271,8 @@ def test_flash_attn_output(
                 q,
                 k,
                 v,
+                qv=qv,
                 causal=causal,
-                # qv=qv,
                 # q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
                 window_size=window_size,
                 # attention_chunk=attention_chunk,
@@ -1702,3 +1714,242 @@ def test_flash_attn_invalid_head_dim(head_dim):
 
     with pytest.raises(AssertionError, match=re.escape(f"(head_dim, head_dim_v)=({head_dim}, {head_dim}) is not supported on SM")):
         flash_attn_func(q, k, v)
+
+
+# @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+# @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
+@pytest.mark.parametrize("mha_type", ["mqa"])
+@pytest.mark.parametrize("has_qv", [True])
+@pytest.mark.parametrize("has_learnable_sink", [False])
+@pytest.mark.parametrize("softcap", [0.0])
+@pytest.mark.parametrize("deterministic", [False])
+# @pytest.mark.parametrize("local_enum", [0, 1])
+@pytest.mark.parametrize("local_enum", [0])
+@pytest.mark.parametrize("causal", [False, True])
+# @pytest.mark.parametrize("causal", [True])
+@pytest.mark.parametrize("d", [64])
+@pytest.mark.parametrize("topk_sparsity", [False, True])
+# @pytest.mark.parametrize("topk_sparsity", [True])
+@pytest.mark.parametrize("topk_length", [2048])
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_k",
+    [
+        (1, 1),
+        (1, 8192),
+        (3, 3),
+        (64, 32),
+        (64, 128),
+        (128, 128),
+        (128, 192),
+        (256, 256),
+        (239, 1),
+        (799, 3),
+        (113, 203),
+        (113, 128),
+        (128, 217),
+        (113, 211),
+        (108, 256),
+        (256, 512),
+        (384, 256),
+        (640, 128),
+        (512, 256),
+        (1024, 1024),
+        (1023, 1024),
+        (1024, 1023),
+        (2048, 2048),
+    ],
+)
+# @pytest.mark.parametrize('seqlen_q,seqlen_k', [(128, 128)])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_mla_absorbed(
+    seqlen_q,
+    seqlen_k,
+    d,
+    causal,
+    local_enum,
+    softcap,
+    deterministic,
+    has_qv,
+    has_learnable_sink,
+    mha_type,
+    dtype,
+    topk_sparsity,
+    topk_length,
+):
+    if not IS_SM100:
+        pytest.skip()
+    if topk_sparsity and seqlen_k < topk_length:
+        seqlen_k += topk_length
+    local = local_enum > 0
+    if local and causal:
+        pytest.skip()
+    if has_qv and local:
+        pytest.xfail("has_qv: local not supported yet")
+    device = "cuda"
+    # set seed
+    seed = 0
+    random.seed(seed)
+    torch.random.manual_seed(seed)
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    batch_size = 9 if seqlen_k <= 2048 else 2
+    # batch_size = 2
+    nheads = 128
+    nheads_kv = nheads if mha_type == "mha" else (8 if mha_type == "gqa" else 1)
+    dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
+    dv_vals = [512]
+    # attention_chunk_vals = [torch.randint(1, seqlen_k * 2, (1,)).item(), 0]
+    attention_chunk_vals = [0]
+    for dv, attention_chunk in itertools.product(dv_vals, attention_chunk_vals):
+        q_ref = torch.randn(
+            batch_size, seqlen_q, nheads, d, device=device, dtype=dtype_ref
+        )
+        if softcap > 0.0:
+            # Ensure the values of qk are at least within softcap range.
+            q_ref = q_ref * softcap / 4
+        q_ref = q_ref.to(dtype).to(dtype_ref).requires_grad_()
+        k_ref = (
+            torch.randn(
+                batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype_ref
+            )
+            .to(dtype)
+            .to(dtype_ref)
+            .requires_grad_()
+        )
+        v_ref = (
+            torch.randn(
+                batch_size, seqlen_k, nheads_kv, dv, device=device, dtype=dtype_ref
+            )
+            .to(dtype)
+            .to(dtype_ref)
+            .requires_grad_()
+        )
+        if has_qv:
+            qv_ref = (
+                torch.randn(
+                    batch_size, seqlen_q, nheads, dv, device=device, dtype=dtype_ref
+                )
+                .to(dtype)
+                .to(dtype_ref)
+            )
+        else:
+            qv_ref = None
+        if topk_sparsity:
+            topk_indices = torch.rand(batch_size, seqlen_q, topk_length, device=device).argsort(dim=-1).to(torch.int32)
+        else:
+            topk_indices = None
+        # Put window_size after QKV randn so that window_size changes from test to test
+        window_size = (
+            (None, None) if not local else tuple(random.randrange(0, seqlen_k) for _ in range(2))
+        )
+        if local_enum == 2:
+            window_size = (None, -window_size[1])
+        elif local_enum == 3:
+            window_size = (-window_size[0], None)
+        if local:
+            print("window size = ", window_size)
+        # window_size = (-1, -1) if not local else (16, 0)
+        if has_learnable_sink:
+            learnable_sink = torch.randn(nheads, dtype=torch.bfloat16, device=device)
+        else:
+            learnable_sink = None
+        if dtype == torch.float8_e4m3fn:
+            q_descale, k_descale, v_descale = [
+                torch.rand(batch_size, nheads_kv, device=device, dtype=torch.float32)
+                * 2
+                for _ in range(3)
+            ]
+        else:
+            q_descale, k_descale, v_descale = None, None, None
+        q, k, v = [x.detach().to(dtype).requires_grad_() for x in (q_ref, k_ref, v_ref)]
+        qv = qv_ref.detach().to(dtype).requires_grad_() if has_qv else None
+        out_ref, attn_ref = attention_ref(
+            q_ref,
+            k_ref,
+            v_ref,
+            None,
+            None,
+            causal=causal,
+            qv=qv_ref,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            window_size=window_size,
+            attention_chunk=attention_chunk,
+            learnable_sink=learnable_sink,
+            softcap=softcap,
+            topk_indices=topk_indices,
+        )
+        out_pt, attn_pt = attention_ref(
+            q_ref,
+            k_ref,
+            v_ref,
+            None,
+            None,
+            causal=causal,
+            qv=qv_ref,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            window_size=window_size,
+            attention_chunk=attention_chunk,
+            learnable_sink=learnable_sink,
+            softcap=softcap,
+            upcast=False,
+            reorder_ops=True,
+            intermediate_dtype=dtype if dtype == torch.float8_e4m3fn else None,
+            topk_indices=topk_indices,
+        )
+
+        # k_extended = repeat(k_ref, "b s h d -> b s (h k) d", k=nheads // nheads_kv)
+        # qk = torch.einsum('bshd,bthd->bhst', q_ref, k_extended).float()
+        # # if qv is not None:
+        # #     qk += torch.einsum('bshd,bthd->bhst', qv_ref, v_ref).float()
+        # m = qk.amax(-1, keepdim=True)
+        # s_tmp = torch.exp((qk - m) / math.sqrt(d))
+        # exp_sum = s_tmp.sum(-1)
+        # # qk = torch.einsum('bthd,bshd->bhts', q_ref.float() / math.sqrt(d), k_ref.float())
+        # # lse_ref = torch.logsumexp(qk, dim=-1)
+
+        # Numerical error if we just do any arithmetic on out_ref
+        if not is_fake_mode():
+            fwd_atol = 2 * (out_ref + 0.3 - 0.3 - out_ref).abs().max().item()
+            rtol = 2 if softcap == 0.0 else 3
+            print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
+            print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
+        num_splits_vals = [1]
+        pack_gqa_vals = [True]
+        for pack_gqa, num_splits in itertools.product(pack_gqa_vals, num_splits_vals):
+            out, lse = flash_attn_func(
+                q,
+                k,
+                v,
+                qv=qv,
+                topk_indices=topk_indices,
+                causal=causal,
+                # q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
+                window_size=window_size,
+                # attention_chunk=attention_chunk,
+                softcap=softcap,
+                learnable_sink=learnable_sink,
+                pack_gqa=pack_gqa,
+                num_splits=num_splits,
+                deterministic=deterministic,
+                topk_indices_maybe_oob=causal,
+            )
+            if is_fake_mode():
+                # no more flash_attn cutedsl calls for the rest of the loop
+                # skip data-dependent postprocessing
+                continue
+            print(f"Output max diff: {(out - out_ref).abs().max().item()}")
+            print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
+            # if not causal:
+            #     print(f"LSE max diff: {(lse - lse_ref).abs().max().item()}")
+            # breakpoint()
+
+            # Check that FlashAttention's numerical error is at most twice the numerical error
+            # of a Pytorch implementation.
+            assert (out - out_ref).abs().max().item() <= rtol * (
+                out_pt - out_ref
+            ).abs().max().item() + fwd_atol
