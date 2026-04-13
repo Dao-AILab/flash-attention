@@ -1,9 +1,7 @@
 # Copyright (c) 2025, Tri Dao.
 
-import os
-import pathlib
 from typing import Tuple
-from functools import partial, lru_cache
+from functools import lru_cache
 
 import torch
 
@@ -39,27 +37,6 @@ def get_max_active_clusters(cluster_size):
 @lru_cache
 def get_device_capacity(device: torch.device = None) -> Tuple[int, int]:
     return torch.cuda.get_device_capability(device)
-
-
-def load_cubin_module_data_patched(cubin_data, filepath):
-    pathlib.Path(filepath).write_bytes(cubin_data)
-    return load_cubin_module_data_og(cubin_data)
-
-
-def cute_compile_patched(*args, **kwargs):
-    """A patched version of cute.compile that dump the SASS to a file if CUTE_CUBIN_PATH is set."""
-    cubin_path = os.getenv("CUTE_CUBIN_PATH", None)
-    if cubin_path is not None:
-        cutlass.base_dsl.runtime.cuda.load_cubin_module_data = partial(
-            load_cubin_module_data_patched, filepath=cubin_path
-        )
-    output = cute_compile_og(*args, **kwargs)
-    if cubin_path is not None:
-        cutlass.base_dsl.runtime.cuda.load_cubin_module_data = load_cubin_module_data_og
-        if extract is not None:
-            sass = extract(cubin_path, None)
-            pathlib.Path(cubin_path).with_suffix(".annotated.sass").write_text(sass)
-    return output
 
 
 def assume_strides_aligned(t):
