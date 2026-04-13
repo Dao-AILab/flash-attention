@@ -46,7 +46,6 @@ class CpasyncGatherKVManager(ParamsBase):
     rTopk_NonInterleaved: cute.Tensor
 
     pipeline_bitmask: Optional[pipeline.PipelineAsync]
-    producer_state_bitmask: pipeline.PipelineState
     cpasync_barrier: pipeline.NamedBarrier
 
     disable_bitmask: cutlass.Constexpr[Boolean]
@@ -107,10 +106,6 @@ class CpasyncGatherKVManager(ParamsBase):
         rTopkHalf = cute.make_rmem_tensor((topk_indices_per_thread,), Int32)
         rTopk_NonInterleaved = cute.make_rmem_tensor((topk_indices_per_thread,), Int32)
 
-        producer_state_bitmask = pipeline.make_pipeline_state(
-            pipeline.PipelineUserType.Producer, stages=num_stages_bitmask,
-        )
-
         return CpasyncGatherKVManager(
             mIndexTopk,
             sBitmask,
@@ -134,7 +129,6 @@ class CpasyncGatherKVManager(ParamsBase):
             rTopkHalf,
             rTopk_NonInterleaved,
             pipeline_bitmask,
-            producer_state_bitmask,
             cpasync_barrier,
             disable_bitmask,
         )
@@ -172,29 +166,32 @@ class CpasyncGatherKVManager(ParamsBase):
                 self.rTopk_NonInterleaved[0] = self.mIndexTopk[row_idx_non_interleaved]
 
     @cute.jit
-    def compute_bitmask(self):  
-        if const_expr(not self.disable_bitmask):
-            lane_idx = cute.arch.lane_idx()
-            assert cute.size(self.rTopk_NonInterleaved) == 1
-            bitmask = Uint32(0)
+    def compute_bitmask(
+        self,
+        producer_state_bitmask,
+    ):
+        lane_idx = cute.arch.lane_idx()
+        assert cute.size(self.rTopk_NonInterleaved) == 1
+        bitmask = Uint32(0)
 
-            # Step 1. Construct per-thread bitmask
-            topk_idx = self.rTopk_NonInterleaved[0]
-            is_valid = topk_idx >= 0 and topk_idx < self.seqlen_k_limit
-            if is_valid:
-                bitmask = Uint32(1 << lane_idx)
+        # Step 1. Construct per-thread bitmask
+        topk_idx = self.rTopk_NonInterleaved[0]
+        is_valid = topk_idx >= 0 and topk_idx < self.seqlen_k_limit
+        if is_valid:
+            bitmask = Uint32(1 << lane_idx)
 
-            # Step 2. Warp shuffle bitwise OR = add since indices are exclusive.
-            bitmask = warp_reduce(bitmask, operator.add)
+        # Step 2. Warp shuffle bitwise OR = add since indices are exclusive.
+        bitmask = warp_reduce(bitmask, operator.add)
 
-            self.pipeline_bitmask.producer_acquire(self.producer_state_bitmask)
-            # store to smem and sync threads
-            if lane_idx == 0:
-                self.sBitmask[self.warp_idx, self.producer_state_bitmask.index] = bitmask
-            self.cpasync_barrier.arrive_and_wait()
+        self.pipeline_bitmask.producer_acquire(producer_state_bitmask)
+        # store to smem and sync threads
+        if lane_idx == 0:
+            self.sBitmask[self.warp_idx, producer_state_bitmask.index] = bitmask
+        self.cpasync_barrier.arrive_and_wait()
 
-            self.pipeline_bitmask.producer_commit(self.producer_state_bitmask)
-            self.producer_state_bitmask.advance()
+        self.pipeline_bitmask.producer_commit(producer_state_bitmask)
+        producer_state_bitmask.advance()
+        return producer_state_bitmask
 
         
     @cute.jit

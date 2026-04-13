@@ -1155,8 +1155,8 @@ class FlashAttentionMLAForwardSm100:
             seqlen = SeqlenInfoCls(batch_idx)
             if const_expr(self.is_topk_gather):
                 n_block_min = 0
-                # n_block_max = self.topk_length // self.tile_n
-                n_block_max = topk_length_dynamic // self.tile_n
+                n_block_max = self.topk_length // self.tile_n
+                # n_block_max = topk_length_dynamic // self.tile_n
             else:
                 n_block_min, n_block_max = block_info.get_n_block_min_max(
                     seqlen, cluster_m_block,
@@ -1185,7 +1185,9 @@ class FlashAttentionMLAForwardSm100:
             # Advance to next tile
             work_tile = tile_scheduler.advance_to_next_work()
 
-        # TODO: producer tails
+        pipeline_K.producer_tail(producer_state_K)
+        pipeline_V0.producer_tail(producer_state_V0)
+        pipeline_V1.producer_tail(producer_state_V1)
 
 
     @cute.jit
@@ -1255,6 +1257,10 @@ class FlashAttentionMLAForwardSm100:
         producer_state_V1 = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Producer, stages=self.num_stages_Vi
         )
+        if const_expr(not self.disable_bitmask):
+            producer_state_bitmask = pipeline.make_pipeline_state(
+                pipeline.PipelineUserType.Producer, stages=self.num_stages_bitmask,
+            )
         if const_expr(self.use_tma_O):
             producer_phase_O = Int32(1)
 
@@ -1269,8 +1275,8 @@ class FlashAttentionMLAForwardSm100:
             seqlen = SeqlenInfoCls(batch_idx)
             if const_expr(self.is_topk_gather):
                 n_block_min = 0
-                # n_block_max = self.topk_length // self.tile_n
-                n_block_max = topk_length_dynamic // self.tile_n
+                n_block_max = self.topk_length // self.tile_n
+                # n_block_max = topk_length_dynamic // self.tile_n
             else:
                 n_block_min, n_block_max = block_info.get_n_block_min_max(
                     seqlen, cluster_m_block,
@@ -1357,7 +1363,10 @@ class FlashAttentionMLAForwardSm100:
             producer_state_K = load_K(producer_state_K)
             producer_state_V0 = load_V0(producer_state_V0)
             producer_state_V1 = load_V1(producer_state_V1)
-            cpasync_gather_kv_manager.compute_bitmask()
+            if const_expr(not self.disable_bitmask):
+                producer_state_bitmask = cpasync_gather_kv_manager.compute_bitmask(
+                    producer_state_bitmask
+                )
 
             if const_expr(self.use_tma_O and self.overlap_sO_sV):
                 cute.arch.mbarrier_wait(sO_empty_mbar_ptr, phase=producer_phase_O)
@@ -1372,7 +1381,10 @@ class FlashAttentionMLAForwardSm100:
                     producer_state_K = load_K(producer_state_K)
                     producer_state_V0 = load_V0(producer_state_V0)
                     producer_state_V1 = load_V1(producer_state_V1)
-                    cpasync_gather_kv_manager.compute_bitmask()
+                    if const_expr(not self.disable_bitmask):
+                        producer_state_bitmask = cpasync_gather_kv_manager.compute_bitmask(
+                            producer_state_bitmask
+                        )
                     # Vt0, Vt1
                     cpasync_gather_kv_manager.load_index_topk(n_block, transpose=True)
                     producer_state_V0 = load_Vt0(producer_state_V0)
@@ -1387,7 +1399,11 @@ class FlashAttentionMLAForwardSm100:
                     producer_state_K = load_K(producer_state_K)
                     producer_state_V0 = load_V0(producer_state_V0)
                     producer_state_V1 = load_V1(producer_state_V1)
-                    cpasync_gather_kv_manager.compute_bitmask()
+                    if const_expr(not self.disable_bitmask):
+                        producer_state_bitmask = cpasync_gather_kv_manager.compute_bitmask(
+                            producer_state_bitmask
+                        )
+                        
                 # Vt0, Vt1
                 cpasync_gather_kv_manager.load_index_topk(n_block, transpose=True)
                 producer_state_V0 = load_Vt0(producer_state_V0)
@@ -1396,7 +1412,11 @@ class FlashAttentionMLAForwardSm100:
             # Advance to next tile
             work_tile = tile_scheduler.advance_to_next_work()
         
-        # TODO: producer tail
+        pipeline_K_cpasync.producer_tail(producer_state_K)
+        pipeline_V0_cpasync.producer_tail(producer_state_V0)
+        pipeline_V1_cpasync.producer_tail(producer_state_V1)
+        if const_expr(not self.disable_bitmask):
+            pipeline_bitmask.producer_tail(producer_state_bitmask)
 
 
     @cute.jit
@@ -1518,8 +1538,8 @@ class FlashAttentionMLAForwardSm100:
             seqlen = SeqlenInfoCls(batch_idx)
             if const_expr(self.is_topk_gather):
                 n_block_min = 0
-                # n_block_max = self.topk_length // self.tile_n
-                n_block_max = topk_length_dynamic // self.tile_n
+                n_block_max = self.topk_length // self.tile_n
+                # n_block_max = topk_length_dynamic // self.tile_n
             else:
                 n_block_min, n_block_max = block_info.get_n_block_min_max(
                     seqlen, cluster_m_block,
@@ -2137,8 +2157,8 @@ class FlashAttentionMLAForwardSm100:
             seqlen = SeqlenInfoCls(batch_idx)
             if const_expr(self.is_topk_gather):
                 n_block_min = 0
-                # n_block_max = self.topk_length // self.tile_n
-                n_block_max = topk_length_dynamic // self.tile_n
+                n_block_max = self.topk_length // self.tile_n
+                # n_block_max = topk_length_dynamic // self.tile_n
             else:
                 n_block_min, n_block_max = block_info.get_n_block_min_max(
                     seqlen, cluster_m_block,
@@ -2447,8 +2467,8 @@ class FlashAttentionMLAForwardSm100:
             seqlen = SeqlenInfoCls(batch_idx)
             if const_expr(self.is_topk_gather):
                 n_block_min = 0
-                # n_block_max = self.topk_length // self.tile_n
-                n_block_max = topk_length_dynamic // self.tile_n
+                n_block_max = self.topk_length // self.tile_n
+                # n_block_max = topk_length_dynamic // self.tile_n
             else:
                 n_block_min, n_block_max = block_info.get_n_block_min_max(
                     seqlen, cluster_m_block,
