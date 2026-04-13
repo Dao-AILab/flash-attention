@@ -48,6 +48,7 @@ from flash_attn.cute.testing import attention_ref
 
 from flash_attn.cute.named_barrier import NamedBarrierFwdSm100_MLA2CTA
 
+from flash_attn.cute.cute_dsl_utils import dump_kernel_attributes
 
 class FlashAttentionMLAForwardSm100:
     def __init__(
@@ -86,7 +87,7 @@ class FlashAttentionMLAForwardSm100:
         
         # ==== tile scheduler ====
         self.is_persistent = False
-        self.use_clc_scheduler = False
+        self.use_clc_scheduler = is_topk_gather and not is_varlen_q
         self.sched_stages = 1
         self.scheduling_mode = SchedulingMode.CLC if self.use_clc_scheduler else SchedulingMode.STATIC
 
@@ -136,9 +137,9 @@ class FlashAttentionMLAForwardSm100:
         self.num_regs_softmax = 208
         self.num_regs_epilogue = 128
         self.num_regs_cpasync = 96
-        self.num_regs_other = 24
+        self.num_regs_other = 48
         
-        assert self.num_regs_load + self.num_regs_softmax + self.num_regs_epilogue + self.num_regs_cpasync <= 512
+        assert self.num_regs_mma + self.num_regs_softmax + self.num_regs_epilogue + self.num_regs_cpasync <= 512
 
         # ==== 2cta info ====
         self.use_2cta_instrs = True
@@ -269,6 +270,7 @@ class FlashAttentionMLAForwardSm100:
             tmem_holding_buf: tmem_holding_buf_struct
             clc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, clc_mbar_size]
             clc_response: cute.struct.MemRange[Int32, clc_response_size]
+            sO_empty_mbar_ptr: cutlass.Int64
 
             sRowMax: sRowMax_struct
             sRowSum: sRowSum_struct
@@ -346,6 +348,7 @@ class FlashAttentionMLAForwardSm100:
             cute.make_tensor(t.iterator, cute.select(t.layout, mode=LSE_layout_transpose))
             if t is not None else None for t in (mLSE, mIndexTopk)
         )
+        topk_length_dynamic = mIndexTopk.shape[0] if mIndexTopk is not None else None
 
         self.o_layout = cutlass.utils.LayoutEnum.from_tensor(mO)
 
@@ -465,8 +468,13 @@ class FlashAttentionMLAForwardSm100:
 
         # ==== Set up Oi smem -> gmem tma store ====
 
+        self.overlap_sO_sV = True
+        if const_expr(self.overlap_sO_sV):
+            num_stages_sO = self.num_hdimv_splits * self.num_stages_Vi
+        else:
+            num_stages_sO = self.num_hdimv_splits
         sO_layout = sm100_utils.make_smem_layout_epi(
-            self.dtype_O, self.o_layout, self.epi_tile, self.num_hdimv_splits
+            self.dtype_O, self.o_layout, self.epi_tile, num_stages_sO
         )
         if const_expr(self.use_tma_O):
             tma_store_op = cpasync.CopyBulkTensorTileS2GOp()
@@ -595,6 +603,7 @@ class FlashAttentionMLAForwardSm100:
             tiled_mma_PVti,
             softmax_scale,
             softmax_scale_log2,
+            topk_length_dynamic,
             tile_sched_params,
             SharedStorage,
         ).launch(
@@ -646,6 +655,7 @@ class FlashAttentionMLAForwardSm100:
         tiled_mma_PVti: cute.TiledMma,
         softmax_scale: Float32,
         softmax_scale_log2: Float32,
+        topk_length_dynamic: Optional[Int32],
         tile_sched_params: ParamsBase,
         SharedStorage: cutlass.Constexpr[Callable],
     ):
@@ -745,6 +755,13 @@ class FlashAttentionMLAForwardSm100:
                 make_pipeline(Async, storage.mbar_ptr_bitmask, self.num_stages_bitmask, cpasync_load_threads, sm_threads)
                 if const_expr(self.is_topk_gather and not self.disable_bitmask) else None
             )
+        
+        sO_empty_mbar_ptr = None
+        if const_expr(self.use_tma_O and self.overlap_sO_sV):
+            sO_empty_mbar_ptr = storage.sO_empty_mbar_ptr
+            if warp_idx == 0:
+                cute.arch.mbarrier_init(sO_empty_mbar_ptr, 1)
+
         pipeline.pipeline_init_arrive(cluster_shape_mn=cta_layout_vmnk, is_relaxed=True)
 
         # ==== Get SMEM tensors ====
@@ -768,9 +785,13 @@ class FlashAttentionMLAForwardSm100:
         if const_expr(self.is_topk_gather):
             sBitmask = storage.sBitmask.get_tensor(sBitmask_layout)
 
-        # write sOi to sQvi
-        sO = cute.make_tensor(cute.recast_ptr(sQv0.iterator, sO_layout.inner, self.dtype_O), sO_layout.outer)
-        assert cute.cosize(sO_layout) <= cute.cosize(sQvi_layout_staged) * self.num_hdimv_splits
+        if const_expr(self.overlap_sO_sV):
+            sO_iterator = sV0.iterator
+            assert cute.cosize(sO_layout) <= cute.cosize(sVi_layout_staged) * self.num_hdimv_splits
+        else:
+            sO_iterator = sQv0.iterator
+            assert cute.cosize(sO_layout) <= cute.cosize(sQvi_layout_staged) * self.num_hdimv_splits
+        sO = cute.make_tensor(cute.recast_ptr(sV0.iterator, sO_layout.inner, self.dtype_O), sO_layout.outer)
 
         # ==== Get thread MMAs and accumulator fragments ====
         thr_mma_QK = tiled_mma_QK.get_slice(mma_tile_coord_v)
@@ -869,7 +890,8 @@ class FlashAttentionMLAForwardSm100:
 
         if const_expr(self.use_cpasync_load_KV):
             if warp_idx == self.relay_warp_id:
-                cute.arch.setmaxregister_decrease(self.num_regs_load)
+                if const_expr(self.num_regs_load < 128):
+                    cute.arch.setmaxregister_decrease(self.num_regs_load)
                 self.relay(
                     pipeline_K,
                     pipeline_V0,
@@ -877,6 +899,7 @@ class FlashAttentionMLAForwardSm100:
                     pipeline_K_cpasync,
                     pipeline_V0_cpasync,
                     pipeline_V1_cpasync,
+                    topk_length_dynamic,
                     block_info,
                     SeqlenInfoCls,
                     tile_scheduler=tile_scheduler,
@@ -905,13 +928,16 @@ class FlashAttentionMLAForwardSm100:
                     pipeline_V0_cpasync,
                     pipeline_V1_cpasync,
                     pipeline_bitmask,
+                    sO_empty_mbar_ptr,
+                    topk_length_dynamic,
                     block_info,
                     SeqlenInfoCls,
                     tile_scheduler=tile_scheduler,
                 )
 
         if warp_idx == self.load_warp_id:
-            cute.arch.setmaxregister_decrease(self.num_regs_load)
+            if const_expr(self.num_regs_load < 128):
+                cute.arch.setmaxregister_decrease(self.num_regs_load)
             self.load(
                 mQ,
                 mK,
@@ -943,16 +969,19 @@ class FlashAttentionMLAForwardSm100:
                 pipeline_Qv1,
                 pipeline_V0,
                 pipeline_V1,
+                sO_empty_mbar_ptr,
                 thr_mma_QK,
                 thr_mma_QviVi,
                 thr_mma_PVti,
+                topk_length_dynamic,
                 block_info,
                 SeqlenInfoCls,
                 tile_scheduler=tile_scheduler,
             )
 
         if warp_idx == self.mma_warp_id:
-            cute.arch.setmaxregister_decrease(self.num_regs_mma)
+            if const_expr(self.num_regs_mma < 128):
+                cute.arch.setmaxregister_decrease(self.num_regs_mma)
             # ==== Allocate TMEM ====
             tmem.allocate(self.tmem_alloc_cols)
             tmem.wait_for_alloc()
@@ -981,6 +1010,7 @@ class FlashAttentionMLAForwardSm100:
                 pipeline_O0,
                 pipeline_O1,
                 is_leader_cta,
+                topk_length_dynamic,
                 block_info,
                 SeqlenInfoCls,
                 tile_scheduler=tile_scheduler,
@@ -1008,6 +1038,7 @@ class FlashAttentionMLAForwardSm100:
                 pipeline_sm_stats,
                 pipeline_bitmask,
                 AttentionMaskCls,
+                topk_length_dynamic,
                 block_info,
                 SeqlenInfoCls,
                 tile_scheduler=tile_scheduler,
@@ -1035,7 +1066,9 @@ class FlashAttentionMLAForwardSm100:
                 pipeline_O0,
                 pipeline_O1,
                 pipeline_sm_stats,
+                sO_empty_mbar_ptr,
                 tiled_copy_O_r2g,
+                topk_length_dynamic,
                 block_info,
                 SeqlenInfoCls,
                 tile_scheduler=tile_scheduler,
@@ -1084,6 +1117,7 @@ class FlashAttentionMLAForwardSm100:
         pipeline_K_cpasync: pipeline.PipelineAsync,
         pipeline_V0_cpasync: pipeline.PipelineAsync,
         pipeline_V1_cpasync: pipeline.PipelineAsync,
+        topk_length_dynamic: Optional[Int32],
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
         tile_scheduler: TileSchedulerProtocol,
@@ -1121,7 +1155,8 @@ class FlashAttentionMLAForwardSm100:
             seqlen = SeqlenInfoCls(batch_idx)
             if const_expr(self.is_topk_gather):
                 n_block_min = 0
-                n_block_max = self.topk_length // self.tile_n
+                # n_block_max = self.topk_length // self.tile_n
+                n_block_max = topk_length_dynamic // self.tile_n
             else:
                 n_block_min, n_block_max = block_info.get_n_block_min_max(
                     seqlen, cluster_m_block,
@@ -1191,6 +1226,8 @@ class FlashAttentionMLAForwardSm100:
         pipeline_V0_cpasync: pipeline.PipelineAsync,
         pipeline_V1_cpasync: pipeline.PipelineAsync,
         pipeline_bitmask: pipeline.PipelineAsync,
+        sO_empty_mbar_ptr: Optional[cute.Pointer],
+        topk_length_dynamic: Optional[Int32],
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
         tile_scheduler: TileSchedulerProtocol,
@@ -1218,6 +1255,8 @@ class FlashAttentionMLAForwardSm100:
         producer_state_V1 = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Producer, stages=self.num_stages_Vi
         )
+        if const_expr(self.use_tma_O):
+            producer_phase_O = Int32(1)
 
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
@@ -1230,7 +1269,8 @@ class FlashAttentionMLAForwardSm100:
             seqlen = SeqlenInfoCls(batch_idx)
             if const_expr(self.is_topk_gather):
                 n_block_min = 0
-                n_block_max = self.topk_length // self.tile_n
+                # n_block_max = self.topk_length // self.tile_n
+                n_block_max = topk_length_dynamic // self.tile_n
             else:
                 n_block_min, n_block_max = block_info.get_n_block_min_max(
                     seqlen, cluster_m_block,
@@ -1318,6 +1358,10 @@ class FlashAttentionMLAForwardSm100:
             producer_state_V0 = load_V0(producer_state_V0)
             producer_state_V1 = load_V1(producer_state_V1)
             cpasync_gather_kv_manager.compute_bitmask()
+
+            if const_expr(self.use_tma_O and self.overlap_sO_sV):
+                cute.arch.mbarrier_wait(sO_empty_mbar_ptr, phase=producer_phase_O)
+                producer_phase_O ^= 1
 
             # ==== Mainloop ====
             for n_block_group in cutlass.range(num_n_block_groups-1, unroll=1):
@@ -1411,9 +1455,11 @@ class FlashAttentionMLAForwardSm100:
         pipeline_Qv1: pipeline.PipelineAsync,
         pipeline_V0: pipeline.PipelineAsync,
         pipeline_V1: pipeline.PipelineAsync,
+        sO_empty_mbar_ptr: Optional[cute.Pointer],
         thr_mma_QK: cute.ThrMma,
         thr_mma_QviVi: cute.ThrMma,
         thr_mma_PVti: cute.ThrMma,
+        topk_length_dynamic: Optional[Int32],
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
         tile_scheduler: TileSchedulerProtocol,
@@ -1458,6 +1504,8 @@ class FlashAttentionMLAForwardSm100:
             producer_state_V1 = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, stages=self.num_stages_Vi
             )
+        if const_expr(self.use_tma_O):
+            producer_phase_O = Int32(1)
 
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
@@ -1470,7 +1518,8 @@ class FlashAttentionMLAForwardSm100:
             seqlen = SeqlenInfoCls(batch_idx)
             if const_expr(self.is_topk_gather):
                 n_block_min = 0
-                n_block_max = self.topk_length // self.tile_n
+                # n_block_max = self.topk_length // self.tile_n
+                n_block_max = topk_length_dynamic // self.tile_n
             else:
                 n_block_min, n_block_max = block_info.get_n_block_min_max(
                     seqlen, cluster_m_block,
@@ -1621,6 +1670,10 @@ class FlashAttentionMLAForwardSm100:
                 producer_state_V0 = load_V(producer_state_V0, n_block=n_block_first, split=0)
                 producer_state_V1 = load_V(producer_state_V1, n_block=n_block_first, split=1)
 
+                if const_expr(self.use_tma_O and self.overlap_sO_sV):
+                    cute.arch.mbarrier_wait(sO_empty_mbar_ptr, phase=producer_phase_O)
+                    producer_phase_O ^= 1
+
                 # ==== Main loop ====
                 for n_block_group in cutlass.range(num_n_block_groups-1, unroll=1):
                     for stage in cutlass.range_constexpr(self.num_stages_S):
@@ -1712,6 +1765,7 @@ class FlashAttentionMLAForwardSm100:
         pipeline_O0: pipeline.PipelineAsync,
         pipeline_O1: pipeline.PipelineAsync,
         is_leader_cta: Boolean,
+        topk_length_dynamic: Optional[Int32],
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
         tile_scheduler: TileSchedulerProtocol,
@@ -1833,7 +1887,8 @@ class FlashAttentionMLAForwardSm100:
             seqlen = SeqlenInfoCls(batch_idx)
             if const_expr(self.is_topk_gather):
                 n_block_min = 0
-                n_block_max = self.topk_length // self.tile_n
+                # n_block_max = self.topk_length // self.tile_n
+                n_block_max = topk_length_dynamic // self.tile_n
             else:
                 n_block_min, n_block_max = block_info.get_n_block_min_max(
                     seqlen, cluster_m_block,
@@ -1930,12 +1985,13 @@ class FlashAttentionMLAForwardSm100:
                 consumer_state_V0, consumer_state_V1 = consumer_states_V
                 producer_state_O0, producer_state_O1 = producer_states_O
 
-                # since we overlap sOi with sQvi for tma store, need to acquire signal
-                if const_expr(self.use_tma_O):
+                pipeline_Q.consumer_release(consumer_state_Q)
+
+                # if we overlap sOi with sQvi for tma store, need to acquire signal
+                if const_expr(self.use_tma_O and not self.overlap_sO_sV):
                     pipeline_O0.producer_tail(producer_state_O0.clone())
                     pipeline_O1.producer_tail(producer_state_O1.clone())
-
-                pipeline_Q.consumer_release(consumer_state_Q)
+                
                 pipeline_Qv0.consumer_release(consumer_state_Qv0)
                 pipeline_Qv1.consumer_release(consumer_state_Qv1)
                 consumer_state_Q.advance()
@@ -2001,6 +2057,7 @@ class FlashAttentionMLAForwardSm100:
         pipeline_sm_stats: pipeline.PipelineAsync,
         pipeline_bitmask: Optional[pipeline.PipelineAsync],
         AttentionMaskCls: Callable,
+        topk_length_dynamic: Optional[Int32],
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
         tile_scheduler: TileSchedulerProtocol,
@@ -2080,7 +2137,8 @@ class FlashAttentionMLAForwardSm100:
             seqlen = SeqlenInfoCls(batch_idx)
             if const_expr(self.is_topk_gather):
                 n_block_min = 0
-                n_block_max = self.topk_length // self.tile_n
+                # n_block_max = self.topk_length // self.tile_n
+                n_block_max = topk_length_dynamic // self.tile_n
             else:
                 n_block_min, n_block_max = block_info.get_n_block_min_max(
                     seqlen, cluster_m_block,
@@ -2309,7 +2367,9 @@ class FlashAttentionMLAForwardSm100:
         pipeline_O0: pipeline.PipelineAsync,
         pipeline_O1: pipeline.PipelineAsync,
         pipeline_sm_stats: pipeline.PipelineAsync,
+        sO_empty_mbar_ptr: Optional[cute.Pointer],
         tiled_copy_O_r2g: cute.TiledCopy,
+        topk_length_dynamic: Optional[Int32],
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
         tile_scheduler: TileSchedulerProtocol,
@@ -2387,7 +2447,8 @@ class FlashAttentionMLAForwardSm100:
             seqlen = SeqlenInfoCls(batch_idx)
             if const_expr(self.is_topk_gather):
                 n_block_min = 0
-                n_block_max = self.topk_length // self.tile_n
+                # n_block_max = self.topk_length // self.tile_n
+                n_block_max = topk_length_dynamic // self.tile_n
             else:
                 n_block_min, n_block_max = block_info.get_n_block_min_max(
                     seqlen, cluster_m_block,
@@ -2510,18 +2571,26 @@ class FlashAttentionMLAForwardSm100:
                         )
                 else:
                     # copy Oi rmem -> smem
+                    if const_expr(self.overlap_sO_sV):
+                        # last slot for Vti is always 1, 3
+                        sO_idx = 1 + 2 * split
+                    else:
+                        sO_idx = split
                     cute.copy(
                         thr_tiled_copy_O_r2g,
                         tOrOs_r2g[split],
-                        tOsO[None, None, None, split],
+                        tOsO[None, None, None, sO_idx],
                     )
                     cute.arch.fence_view_async_shared()
                     self.epi_barrier.arrive_and_wait()
                     # tma store Oi smem -> gmem
                     if leader_warp:
-                        store_O(src_idx=split, dst_idx=split)
+                        store_O(src_idx=sO_idx, dst_idx=split)
                         cute.arch.cp_async_bulk_commit_group()
                         cute.arch.cp_async_bulk_wait_group(1 - split, read=True)
+                        if const_expr(split == 1 and self.overlap_sO_sV):
+                            with cute.arch.elect_one():
+                                cute.arch.mbarrier_arrive(sO_empty_mbar_ptr)
 
             consumer_state_O0, consumer_state_O1 = consumer_states_O
 
@@ -2667,8 +2736,9 @@ def test_mla_kernel(
             ),
             mQ, mQv, mK, mV, mO, softmax_scale,
             **compile_kwargs,
-            options="--keep-ptx --generate-line-info"
+            options="--keep-ptx --keep-cubin --generate-line-info"
         )
+        dump_kernel_attributes(kernel)
         compile_cache[compile_key] = kernel
 
     # ================================================================
@@ -2963,6 +3033,7 @@ if __name__ == "__main__":
     varlen_q = False
     varlen_k = False
     disable_bitmask = True
+    validate = True
 
     if run_test:
         if not gather_kv:
@@ -2974,7 +3045,7 @@ if __name__ == "__main__":
         seqlen_q_test_values = [1]
         seqlen_k_test_values = [4096]
         nheads_test_values = [128]
-        batch_test_values = [10]
+        batch_test_values = [512]
         test_configs = [
             (batch, nheads, seqlen_q, seqlen_k,)
             for batch in batch_test_values
@@ -3000,7 +3071,7 @@ if __name__ == "__main__":
                     batch=batch,
                     iter=iter,
                     compile_cache=compile_cache,
-                    validate=True,
+                    validate=validate,
                     seed=0,
                     gather_kv=gather_kv,
                     pack_gqa=pack_gqa,
