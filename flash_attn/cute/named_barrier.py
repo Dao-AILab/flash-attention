@@ -52,4 +52,5 @@ class NamedBarrierFwdSm100_MLA2CTA(enum.IntEnum):
     TmemPtr = enum.auto()
     Cpasync = enum.auto()
     Softmax = enum.auto()
-    Correction = enum.auto()
+    SoftmaxStatsFull = enum.auto()
+    SoftmaxStatsEmpty = enum.auto()

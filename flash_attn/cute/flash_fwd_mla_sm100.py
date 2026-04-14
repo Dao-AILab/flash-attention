@@ -227,8 +227,8 @@ class FlashAttentionMLAForwardSm100:
                 (self.dtype_P,  self.sP_layout_staged),
             ]
         )
-        sRowMax_struct = cute.struct.MemRange[Float32, cute.cosize(self.sScale_layout)]
-        sRowSum_struct = cute.struct.MemRange[Float32, cute.cosize(self.sScale_layout)]
+        sStats_struct = cute.struct.MemRange[Float32, cute.cosize(self.sStats_layout)]
+        sScale_struct = cute.struct.MemRange[Float32, cute.cosize(self.sScale_layout)]
         sBitmask_struct = cute.struct.MemRange[Uint32, cute.cosize(self.sBitmask_layout)]
 
         (mbar_ptr_Q_struct, mbar_ptr_K_struct, mbar_ptr_Qv0_struct, mbar_ptr_Qv1_struct,
@@ -275,8 +275,9 @@ class FlashAttentionMLAForwardSm100:
             clc_response: cute.struct.MemRange[Int32, clc_response_size]
             sO_empty_mbar_ptr: cutlass.Int64
 
-            sRowMax: sRowMax_struct
-            sRowSum: sRowSum_struct
+            sRowMax: sStats_struct
+            sRowSum: sStats_struct
+            sScale: sScale_struct
             sBitmask: sBitmask_struct
             sQv0: sQv0_struct
             sQv1: sQv1_struct
@@ -428,7 +429,8 @@ class FlashAttentionMLAForwardSm100:
             setattr(self, f"{attr}_staged", staged)
             setattr(self, attr, cute.select(staged, mode=[0, 1, 2]))
 
-        self.sScale_layout = cute.make_layout((self.cta_tile_m, self.cta_group_size))
+        self.sStats_layout = cute.make_layout((self.cta_tile_m, self.cta_group_size))
+        self.sScale_layout = cute.make_layout((self.cta_tile_m, self.num_stages_sm_stats))
         self.sBitmask_layout = cute.make_layout((self.tile_n//32, self.num_stages_bitmask))
 
         for attr, dtype, layout in [
@@ -582,8 +584,12 @@ class FlashAttentionMLAForwardSm100:
             num_threads=self.num_epilogue_threads,
         )
         # softmax -> correction
-        self.sm_stats_barrier = cutlass.pipeline.NamedBarrier(
-            barrier_id=int(NamedBarrierFwdSm100_MLA2CTA.Correction),
+        self.sm_stats_barrier_full = cutlass.pipeline.NamedBarrier(
+            barrier_id=int(NamedBarrierFwdSm100_MLA2CTA.SoftmaxStatsFull),
+            num_threads=self.num_softmax_threads + self.num_epilogue_threads,
+        )
+        self.sm_stats_barrier_empty = cutlass.pipeline.NamedBarrier(
+            barrier_id=int(NamedBarrierFwdSm100_MLA2CTA.SoftmaxStatsEmpty),
             num_threads=self.num_softmax_threads + self.num_epilogue_threads,
         )
 
@@ -623,6 +629,7 @@ class FlashAttentionMLAForwardSm100:
             self.sVi_layout_staged,
             self.sVti_layout_staged,
             self.sP_layout_staged,
+            self.sStats_layout,
             self.sScale_layout,
             self.sBitmask_layout,
             sO_layout,
@@ -675,6 +682,7 @@ class FlashAttentionMLAForwardSm100:
         sVi_layout_staged: cute.ComposedLayout,
         sVti_layout_staged: cute.ComposedLayout,
         sP_layout_staged: cute.ComposedLayout,
+        sStats_layout: cute.Layout,
         sScale_layout: cute.Layout,
         sBitmask_layout: cute.Layout,
         sO_layout: cute.ComposedLayout,
@@ -807,8 +815,9 @@ class FlashAttentionMLAForwardSm100:
                 (storage.sP,   sP_layout_staged),
             ]
         )
-        sRowMax = storage.sRowMax.get_tensor(sScale_layout)
-        sRowSum = storage.sRowSum.get_tensor(sScale_layout)
+        sRowMax = storage.sRowMax.get_tensor(sStats_layout)
+        sRowSum = storage.sRowSum.get_tensor(sStats_layout)
+        sScale  = storage.sScale.get_tensor(sScale_layout)
         sBitmask = None
         if const_expr(self.is_topk_gather):
             sBitmask = storage.sBitmask.get_tensor(sBitmask_layout)
@@ -1057,6 +1066,7 @@ class FlashAttentionMLAForwardSm100:
                 mLSE,
                 sRowMax,
                 sRowSum,
+                sScale,
                 sBitmask,
                 sP,
                 tStS,
@@ -1088,6 +1098,7 @@ class FlashAttentionMLAForwardSm100:
                 tma_atom_O,
                 sRowMax,
                 sRowSum,
+                sScale,
                 sO,
                 tO0tO0,
                 tO1tO1,
@@ -2096,6 +2107,7 @@ class FlashAttentionMLAForwardSm100:
         mLSE: Optional[cute.Tensor],
         sRowMax: cute.Tensor,
         sRowSum: cute.Tensor,
+        sScale: cute.Tensor,
         sBitmask: Optional[cute.Tensor],
         sP: cute.Tensor,
         tStS: cute.Tensor,
@@ -2220,7 +2232,7 @@ class FlashAttentionMLAForwardSm100:
                 self.softmax_step,
                 softmax,
                 sRowMax,
-                sRowSum,
+                sScale,
                 sBitmask,
                 tStS_t2r_staged,
                 tSrS_t2r,
@@ -2292,20 +2304,20 @@ class FlashAttentionMLAForwardSm100:
                     if not const_expr(disable_mask) else None,
                 )
                 n_block -= 1
-
-            # ensure row sum buffer is free
-            pipeline_sm_stats.producer_tail(producer_state_sm_stats.clone())
+            
             # write row max and sum to smem
             sRowSum[tidx % self.cta_tile_m, warp_idx//self.cta_group_size] = softmax.row_sum[0]
             if const_expr(mLSE is not None):
                 if tidx < self.cta_tile_m:
                     sRowMax[tidx, 0] = softmax.row_max[0]
-            self.sm_stats_barrier.arrive()
+            self.sm_stats_barrier_full.arrive()
 
             # Advance to next tile
             work_tile = tile_scheduler.advance_to_next_work()
+            self.sm_stats_barrier_empty.arrive_and_wait()
 
         pipeline_P.producer_tail(producer_state_P)
+        pipeline_sm_stats.producer_tail(producer_state_sm_stats)
 
 
     @cute.jit
@@ -2313,7 +2325,7 @@ class FlashAttentionMLAForwardSm100:
         self,
         softmax: SoftmaxSm100,
         sRowMax: cute.Tensor,
-        sRowSum: cute.Tensor,
+        sScale: cute.Tensor,
         sBitmask: Optional[cute.Tensor],
         tStS_t2r_staged: cute.Tensor,
         tSrS_t2r: cute.Tensor,
@@ -2375,7 +2387,7 @@ class FlashAttentionMLAForwardSm100:
         # note: acc_scales agree for paired threads
         pipeline_sm_stats.producer_acquire(producer_state_sm_stats)
         if warp_idx < self.cta_group_size:
-            sRowSum[tidx % self.cta_tile_m, producer_state_sm_stats.index] = acc_scale
+            sScale[tidx % self.cta_tile_m, producer_state_sm_stats.index] = acc_scale
         pipeline_sm_stats.producer_commit(producer_state_sm_stats)
         
         # x -> scale_log2*x-rowmax
@@ -2409,6 +2421,7 @@ class FlashAttentionMLAForwardSm100:
         tma_atom_O: Optional[cute.CopyAtom],
         sRowMax: cute.Tensor,
         sRowSum: cute.Tensor,
+        sScale: cute.Tensor,
         sO: cute.Tensor,
         tO0tO0: cute.Tensor,
         tO1tO1: cute.Tensor,
@@ -2512,7 +2525,7 @@ class FlashAttentionMLAForwardSm100:
 
             for _ in cutlass.range(num_n_blocks - 1, unroll=1):
                 pipeline_sm_stats.consumer_wait(consumer_state_sm_stats)
-                scale = sRowSum[tidx % self.cta_tile_m, consumer_state_sm_stats.index]
+                scale = sScale[tidx % self.cta_tile_m, consumer_state_sm_stats.index]
                 should_rescale = cute.arch.vote_ballot_sync(scale < 1.0) != 0
                 pipeline_sm_stats.consumer_release(consumer_state_sm_stats)
                 consumer_state_sm_stats.advance()
@@ -2561,13 +2574,15 @@ class FlashAttentionMLAForwardSm100:
                     sO, gO,
                 )
 
-            self.sm_stats_barrier.arrive_and_wait()
+            self.sm_stats_barrier_full.arrive_and_wait()
 
             row_sum0 = sRowSum[tidx % self.cta_tile_m, 0]
             row_sum1 = sRowSum[tidx % self.cta_tile_m, 1]
-            row_sum = row_sum0 + row_sum1    
+            row_sum = row_sum0 + row_sum1
             acc_O_mn_row_is_zero_or_nan = row_sum == 0.0 or row_sum != row_sum
             scale = cute.arch.rcp_approx(row_sum if not acc_O_mn_row_is_zero_or_nan else 1.0)
+
+            self.sm_stats_barrier_empty.arrive()
 
             seqlen_q = (
                 seqlen.seqlen_q
@@ -3073,8 +3088,8 @@ def benchmark_mla_kernel(
 
 if __name__ == "__main__":
     run_test = True
-    run_benchmark = False
-    gather_kv = False
+    run_benchmark = True
+    gather_kv = True
     is_causal = False
     pack_gqa = True
     topk_length = 2048
@@ -3093,7 +3108,7 @@ if __name__ == "__main__":
         seqlen_q_test_values = [1]
         seqlen_k_test_values = [4096]
         nheads_test_values = [128]
-        batch_test_values = [15]
+        batch_test_values = [128]
         test_configs = [
             (batch, nheads, seqlen_q, seqlen_k,)
             for batch in batch_test_values
