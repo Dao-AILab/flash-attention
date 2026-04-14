@@ -129,6 +129,7 @@ def get_broadcast_dims(tensor: torch.Tensor) -> Tuple[bool, ...]:
     return tuple(s == 0 for s in tensor.stride())
 
 
+# credit: monellz (https://github.com/NVIDIA/cutlass/issues/2658#issuecomment-3630564264)
 def dump_kernel_attributes(compiled_kernel):
     from cuda.bindings import driver
     from cutlass.utils import HardwareInfo
