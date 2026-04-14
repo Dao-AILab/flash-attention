@@ -87,15 +87,17 @@ def _validate_head_dims(head_dim: int, head_dim_v: int, compute_capability: int,
     is_standard_range = 8 <= head_dim <= 128 and 8 <= head_dim_v <= 128
 
     is_sm90_range = 8 <= head_dim <= 256 and 8 <= head_dim_v <= 256
+    is_sm100_chunked_v_range = 8 <= head_dim <= 512 and 8 <= head_dim_v <= 256
     if compute_capability == 9:
         assert is_sm90_range and head_dim % alignment == 0 and head_dim_v % alignment == 0, (
             f"(head_dim, head_dim_v)=({head_dim}, {head_dim_v}) is not supported on SM90. "
             f"head_dim and head_dim_v must be between 8 and 256 and divisible by {alignment}."
         )
     elif compute_capability in [10, 11]:
-        assert (is_standard_range or is_deepseek_shape) and head_dim % alignment == 0 and head_dim_v % alignment == 0, (
+        assert (is_standard_range or is_deepseek_shape or is_sm100_chunked_v_range) and head_dim % alignment == 0 and head_dim_v % alignment == 0, (
             f"(head_dim, head_dim_v)=({head_dim}, {head_dim_v}) is not supported on SM100/SM110. "
-            f"head_dim and head_dim_v must be between 8 and 128 and divisible by {alignment}, or (192, 128) for DeepSeek."
+            f"head_dim and head_dim_v must be between 8 and 128 and divisible by {alignment}, "
+            f"or (192, 128) for DeepSeek, or head_dim<=512 with native V chunking and head_dim_v<=256."
         )
 
 
@@ -484,6 +486,12 @@ def _flash_attn_fwd(
         q_stage = 2 if seqlen_q_packgqa > tile_m else 1
     else:
         q_stage = 1
+    if arch // 10 in [10, 11]:
+        head_dim_v_padded = int(math.ceil(head_dim_v / 16) * 16)
+        max_tmem_cols = 512
+        predicted_tmem_total = 2 * tile_n + q_stage * head_dim_v_padded
+        if predicted_tmem_total > max_tmem_cols:
+            q_stage = 1
 
     m_block_size_effective = q_stage * tile_m
     seqlen_k_loaded = max_seqlen_k if not local else max(0, min(max_seqlen_k, (window_size_right or max_seqlen_k) + (window_size_left or max_seqlen_k) + 1 + tile_m))
@@ -1770,6 +1778,37 @@ def flash_attn_func(
     block_size: Optional[Tuple[int, int]] = None,
     return_lse: bool = False,
 ):
+    arch = _get_device_arch()
+    if arch // 10 in [10, 11] and v.shape[-1] > 256:
+        out_chunks = []
+        lse = None
+        for start in range(0, v.shape[-1], 256):
+            end = min(start + 256, v.shape[-1])
+            out_i, lse_i = FlashAttnFunc.apply(
+                q,
+                k,
+                v[..., start:end],
+                softmax_scale,
+                causal,
+                window_size,
+                learnable_sink,
+                softcap,
+                num_splits,
+                pack_gqa,
+                deterministic,
+                mask_mod,
+                full_block_cnt,
+                full_block_idx,
+                mask_block_cnt,
+                mask_block_idx,
+                block_size,
+                return_lse and lse is None,
+            )
+            out_chunks.append(out_i)
+            if lse is None:
+                lse = lse_i
+        out = torch.cat(out_chunks, dim=-1)
+        return (out, lse) if return_lse else out
     return FlashAttnFunc.apply(
         q,
         k,
@@ -1815,6 +1854,40 @@ def flash_attn_varlen_func(
     aux_tensors: Optional[list] = None,
     return_lse: bool = False,
 ):
+    arch = _get_device_arch()
+    if arch // 10 in [10, 11] and v.shape[-1] > 256:
+        out_chunks = []
+        lse = None
+        for start in range(0, v.shape[-1], 256):
+            end = min(start + 256, v.shape[-1])
+            out_i, lse_i = FlashAttnVarlenFunc.apply(
+                q,
+                k,
+                v[..., start:end],
+                cu_seqlens_q,
+                cu_seqlens_k,
+                seqused_q,
+                seqused_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                page_table,
+                softmax_scale,
+                causal,
+                window_size,
+                learnable_sink,
+                softcap,
+                num_splits,
+                pack_gqa,
+                deterministic,
+                score_mod,
+                aux_tensors,
+                return_lse and lse is None,
+            )
+            out_chunks.append(out_i)
+            if lse is None:
+                lse = lse_i
+        out = torch.cat(out_chunks, dim=-1)
+        return (out, lse) if return_lse else out
     return FlashAttnVarlenFunc.apply(
         q,
         k,
