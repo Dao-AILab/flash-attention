@@ -51,7 +51,7 @@ INCREASED_TRIALS = False
 # @pytest.mark.parametrize("causal", [True])
 # @pytest.mark.parametrize("d", [64, 128])
 # @pytest.mark.parametrize("d", [128, 192])
-@pytest.mark.parametrize("d", [64, 128, 192])
+@pytest.mark.parametrize("d", [64, 128, 192, 256])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -96,6 +96,8 @@ def test_flash_attn_output(
         dv_vals = [d]
     # attention_chunk_vals = [torch.randint(1, seqlen_k * 2, (1,)).item(), 0]
     attention_chunk_vals = [0]
+    if d == 256:
+        batch_size = max(1, batch_size // 3)
     for dv, attention_chunk in itertools.product(dv_vals, attention_chunk_vals):
         q_ref = torch.randn(
             batch_size, seqlen_q, nheads, d, device=device, dtype=dtype_ref
@@ -247,7 +249,7 @@ def test_flash_attn_output(
             and not dv > 256
             and not attention_chunk != 0
             and softcap == 0.0
-            and ((dv == d and d <= 128) or (d == 192 and dv == 128))
+            and ((dv == d and d <= 128) or (d == 192 and dv == 128) or (d == 256 and dv == 256))
             and learnable_sink is None
             # and False
         ):
@@ -370,7 +372,7 @@ def test_flash_attn_output(
 # @pytest.mark.parametrize('d', [56, 80])
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128])
 # @pytest.mark.parametrize("d", [64, 96, 128])
-@pytest.mark.parametrize("d", [64, 128, 192])
+@pytest.mark.parametrize("d", [64, 128, 192, 256])
 # @pytest.mark.parametrize("d", [192])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
@@ -423,6 +425,8 @@ def test_flash_attn_varlen_output(
     # set seed
     torch.random.manual_seed(seqlen_q + seqlen_k + d + int(causal) * 2 + int(local))
     batch_size = 49 if seqlen_q <= 1024 else 7
+    if d == 256:
+        batch_size = max(1, batch_size // 3)
     nheads = 6
     # nheads = 1
     nheads_kv = nheads if mha_type == "mha" else (3 if mha_type == "gqa" else 1)
@@ -651,7 +655,7 @@ def test_flash_attn_varlen_output(
             and not has_qv
             and not dv > 256
             and not attention_chunk != 0
-            and ((dv == d and d <= 128) or (d == 192 and dv == 128))
+            and ((dv == d and d <= 128) or (d == 192 and dv == 128) or (d == 256 and dv == 256))
             and not has_learnable_sink
             and not is_sm90
             # and False

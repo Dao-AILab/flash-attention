@@ -85,6 +85,7 @@ def _validate_head_dims(head_dim: int, head_dim_v: int, compute_capability: int,
     """Validate head dimension constraints based on compute capability."""
     is_deepseek_shape = head_dim == 192 and head_dim_v == 128
     is_standard_range = 8 <= head_dim <= 128 and 8 <= head_dim_v <= 128
+    is_d256_shape = head_dim == 256 and head_dim_v == 256
 
     is_sm90_range = 8 <= head_dim <= 256 and 8 <= head_dim_v <= 256
     if compute_capability == 9:
@@ -93,9 +94,9 @@ def _validate_head_dims(head_dim: int, head_dim_v: int, compute_capability: int,
             f"head_dim and head_dim_v must be between 8 and 256 and divisible by {alignment}."
         )
     elif compute_capability in [10, 11]:
-        assert (is_standard_range or is_deepseek_shape) and head_dim % alignment == 0 and head_dim_v % alignment == 0, (
+        assert (is_standard_range or is_deepseek_shape or is_d256_shape) and head_dim % alignment == 0 and head_dim_v % alignment == 0, (
             f"(head_dim, head_dim_v)=({head_dim}, {head_dim_v}) is not supported on SM100/SM110. "
-            f"head_dim and head_dim_v must be between 8 and 128 and divisible by {alignment}, or (192, 128) for DeepSeek."
+            f"head_dim and head_dim_v must be between 8 and 128 and divisible by {alignment}, or (192, 128) for DeepSeek, or (256, 256) for Split-D."
         )
 
 
@@ -509,6 +510,19 @@ def _flash_attn_fwd(
         out_partial = torch.empty(num_splits, *q_batch_seqlen_shape, num_head, head_dim_v, dtype=torch.float32, device=device)
         lse_partial = torch.empty(num_splits, *lse_shape, dtype=torch.float32, device=device)
 
+    is_split_d = (
+        arch // 10 in [10, 11]
+        and head_dim > 128
+        and head_dim == head_dim_v
+        and head_dim != 192
+    )
+    if is_split_d:
+        q_stage = 1
+        pack_gqa = False
+        if num_splits > 1:
+            num_splits = 1
+            is_split_kv = False
+
     use_2cta_instrs = (
         arch // 10 in [10, 11]
         and not requested_disable_2cta
@@ -620,6 +634,7 @@ def _flash_attn_fwd(
         mma_pv_is_rs,
         intra_wg_overlap,
         requested_use_clc_scheduler,
+        is_split_d,
         fa_logging.get_fa_log_level(),
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
@@ -728,6 +743,7 @@ def _flash_attn_fwd(
                 q_subtile_factor=q_subtile_factor,
                 use_2cta_instrs=use_2cta_instrs,
                 use_clc_scheduler=requested_use_clc_scheduler,
+                is_split_d=is_split_d,
             )
         elif arch // 10 == 12:
             # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
@@ -1065,6 +1081,12 @@ def _flash_attn_bwd(
         dKV_swapAB = False
         AtomLayoutMdQ = 1
         AtomLayoutNdKV = 1
+        is_split_d_bwd = (
+            arch // 10 in [10, 11]
+            and head_dim > 128
+            and head_dim == head_dim_v
+            and head_dim != 192
+        )
         requested_disable_2cta = utils._get_disable_2cta_default()
         disable_2cta = (
             requested_disable_2cta
@@ -1072,6 +1094,7 @@ def _flash_attn_bwd(
             or score_mod_bwd is not None
             or mask_mod is not None
             or block_sparse_tensors is not None
+            or is_split_d_bwd
         )
         cluster_size = 2 if head_dim >= 128 and not disable_2cta else 1
         use_2cta_instrs = cluster_size==2
@@ -1209,7 +1232,8 @@ def _flash_attn_bwd(
         total_q_rounded_padded = (
             (total_q + cu_seqlens_q.shape[0] * m_block_size - 1) // m_block_size * m_block_size
         )
-        dq_accum = torch.empty(
+        dq_alloc = torch.zeros if is_split_d_bwd else torch.empty
+        dq_accum = dq_alloc(
             num_head, total_q_rounded_padded * head_dim_rounded, dtype=torch.float32, device=device
         )
         dpsum = torch.empty(num_head, total_q_rounded_padded, dtype=torch.float32, device=device)
@@ -1218,7 +1242,8 @@ def _flash_attn_bwd(
     # GQA (qhead_per_kvhead > 1) needs dK/dV accum+postprocess since multiple Q heads
     # accumulate into the same dK/dV. SM90 varlen_k with qhead_per_kvhead==1 now uses
     # ragged TMA tensors for direct store, so no longer needs accum+postprocess.
-    dKV_postprocess = qhead_per_kvhead > 1
+    # Split-D BWD always needs dK reduce via GMEM atomics (TMEM budget exhausted).
+    dKV_postprocess = qhead_per_kvhead > 1 or is_split_d_bwd
     if dKV_postprocess:
         head_dim_v_rounded = (head_dim_v + 32 - 1) // 32 * 32
         if cu_seqlens_k is None:
@@ -1371,6 +1396,7 @@ def _flash_attn_bwd(
             num_aux_tensors,
             use_block_sparsity,
             block_sparse_broadcast_pattern,
+            is_split_d_bwd,
             cu_seqlens_q is None,
             cu_seqlens_k is None,
             seqused_q is None,
@@ -1473,6 +1499,7 @@ def _flash_attn_bwd(
                 mask_mod=mask_mod,
                 has_aux_tensors=aux_tensors is not None,
                 subtile_factor=subtile_factor,
+                is_split_d=is_split_d_bwd,
             )
 
         # Block sparse tensors for backward use Q-direction indexing (transposed from forward).
@@ -1540,32 +1567,101 @@ def _flash_attn_bwd(
         num_threads_post_dQ = 128
         num_threads_post_dKV = 128
 
-    # Postprocess: convert dq_accum from float32 to dq in bf16/fp16
-    _bwd_postprocess_convert(
-        dq_accum, dq, softmax_scale,
-        cu_seqlens_q, seqused_q,
-        arch, dtype, head_dim, m_block_size, num_threads_post_dQ,
-        AtomLayoutMdQ, dQ_swapAB,
-        use_2cta_instrs=use_2cta_instrs, cluster_size=1,
-    )
+    if is_split_d_bwd:
+        half_hdim = head_dim // 2
+        half_hdim_v = head_dim_v // 2
 
-    if dKV_postprocess:
-        # Postprocess: convert dk_accum from float32 to dk in bf16/fp16
+        # dQ: accum layout is [low_half | high_half], each with half_hdim MMA layout
+        dq_accum_low = dq_accum[..., :dq_accum.shape[-1] // 2]
+        dq_accum_high = dq_accum[..., dq_accum.shape[-1] // 2:]
+        dq_low = dq[..., :half_hdim].contiguous()
+        dq_high = dq[..., half_hdim:].contiguous()
         _bwd_postprocess_convert(
-            dk_accum, dk, softmax_scale,
-            cu_seqlens_k, seqused_k,
-            arch, dtype, head_dim, n_block_size, num_threads_post_dKV,
-            AtomLayoutNdKV, dKV_swapAB,
-            cluster_size=cluster_size,
+            dq_accum_low, dq_low, softmax_scale,
+            cu_seqlens_q, seqused_q,
+            arch, dtype, half_hdim, m_block_size, num_threads_post_dQ,
+            AtomLayoutMdQ, dQ_swapAB,
+            use_2cta_instrs=False, cluster_size=1,
         )
-        # Postprocess: convert dv_accum from float32 to dv in bf16/fp16
         _bwd_postprocess_convert(
-            dv_accum, dv, 1.0,
-            cu_seqlens_k, seqused_k,
-            arch, dtype, head_dim_v, n_block_size, num_threads_post_dKV,
-            AtomLayoutNdKV, dKV_swapAB,
-            cluster_size=cluster_size,
+            dq_accum_high, dq_high, softmax_scale,
+            cu_seqlens_q, seqused_q,
+            arch, dtype, half_hdim, m_block_size, num_threads_post_dQ,
+            AtomLayoutMdQ, dQ_swapAB,
+            use_2cta_instrs=False, cluster_size=1,
         )
+        dq[..., :half_hdim].copy_(dq_low)
+        dq[..., half_hdim:].copy_(dq_high)
+
+        # dK/dV: same split pattern
+        dk_accum_low = dk_accum[..., :dk_accum.shape[-1] // 2]
+        dk_accum_high = dk_accum[..., dk_accum.shape[-1] // 2:]
+        dk_low = dk[..., :half_hdim].contiguous()
+        dk_high = dk[..., half_hdim:].contiguous()
+        _bwd_postprocess_convert(
+            dk_accum_low, dk_low, softmax_scale,
+            cu_seqlens_k, seqused_k,
+            arch, dtype, half_hdim, n_block_size, num_threads_post_dKV,
+            AtomLayoutNdKV, dKV_swapAB,
+            cluster_size=1,
+        )
+        _bwd_postprocess_convert(
+            dk_accum_high, dk_high, softmax_scale,
+            cu_seqlens_k, seqused_k,
+            arch, dtype, half_hdim, n_block_size, num_threads_post_dKV,
+            AtomLayoutNdKV, dKV_swapAB,
+            cluster_size=1,
+        )
+        dk[..., :half_hdim].copy_(dk_low)
+        dk[..., half_hdim:].copy_(dk_high)
+
+        dv_accum_low = dv_accum[..., :dv_accum.shape[-1] // 2]
+        dv_accum_high = dv_accum[..., dv_accum.shape[-1] // 2:]
+        dv_low = dv[..., :half_hdim_v].contiguous()
+        dv_high = dv[..., half_hdim_v:].contiguous()
+        _bwd_postprocess_convert(
+            dv_accum_low, dv_low, 1.0,
+            cu_seqlens_k, seqused_k,
+            arch, dtype, half_hdim_v, n_block_size, num_threads_post_dKV,
+            AtomLayoutNdKV, dKV_swapAB,
+            cluster_size=1,
+        )
+        _bwd_postprocess_convert(
+            dv_accum_high, dv_high, 1.0,
+            cu_seqlens_k, seqused_k,
+            arch, dtype, half_hdim_v, n_block_size, num_threads_post_dKV,
+            AtomLayoutNdKV, dKV_swapAB,
+            cluster_size=1,
+        )
+        dv[..., :half_hdim_v].copy_(dv_low)
+        dv[..., half_hdim_v:].copy_(dv_high)
+    else:
+        # Postprocess: convert dq_accum from float32 to dq in bf16/fp16
+        _bwd_postprocess_convert(
+            dq_accum, dq, softmax_scale,
+            cu_seqlens_q, seqused_q,
+            arch, dtype, head_dim, m_block_size, num_threads_post_dQ,
+            AtomLayoutMdQ, dQ_swapAB,
+            use_2cta_instrs=use_2cta_instrs, cluster_size=1,
+        )
+
+        if dKV_postprocess:
+            # Postprocess: convert dk_accum from float32 to dk in bf16/fp16
+            _bwd_postprocess_convert(
+                dk_accum, dk, softmax_scale,
+                cu_seqlens_k, seqused_k,
+                arch, dtype, head_dim, n_block_size, num_threads_post_dKV,
+                AtomLayoutNdKV, dKV_swapAB,
+                cluster_size=cluster_size,
+            )
+            # Postprocess: convert dv_accum from float32 to dv in bf16/fp16
+            _bwd_postprocess_convert(
+                dv_accum, dv, 1.0,
+                cu_seqlens_k, seqused_k,
+                arch, dtype, head_dim_v, n_block_size, num_threads_post_dKV,
+                AtomLayoutNdKV, dKV_swapAB,
+                cluster_size=cluster_size,
+            )
 
     return dq, dk, dv
 
