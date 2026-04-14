@@ -1727,7 +1727,7 @@ def test_flash_attn_invalid_head_dim(head_dim):
 # @pytest.mark.parametrize("local_enum", [0, 1])
 @pytest.mark.parametrize("local_enum", [0])
 @pytest.mark.parametrize("causal", [False, True])
-# @pytest.mark.parametrize("causal", [True])
+# @pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("d", [64])
 @pytest.mark.parametrize("topk_sparsity", [False, True])
 # @pytest.mark.parametrize("topk_sparsity", [True])
@@ -1736,7 +1736,6 @@ def test_flash_attn_invalid_head_dim(head_dim):
     "seqlen_q,seqlen_k",
     [
         (1, 1),
-        (1, 8192),
         (3, 3),
         (64, 32),
         (64, 128),
@@ -1758,6 +1757,7 @@ def test_flash_attn_invalid_head_dim(head_dim):
         (1023, 1024),
         (1024, 1023),
         (2048, 2048),
+        (1, 8192),
     ],
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(128, 128)])
@@ -1952,4 +1952,370 @@ def test_flash_attn_mla_absorbed(
             # of a Pytorch implementation.
             assert (out - out_ref).abs().max().item() <= rtol * (
                 out_pt - out_ref
+            ).abs().max().item() + fwd_atol
+
+
+# @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+# @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
+@pytest.mark.parametrize("mha_type", ["mqa"])
+@pytest.mark.parametrize("has_learnable_sink", [False])
+@pytest.mark.parametrize("has_qv", [True])
+@pytest.mark.parametrize("deterministic", [False])
+@pytest.mark.parametrize("softcap", [0.0])
+@pytest.mark.parametrize("local_enum", [0])
+@pytest.mark.parametrize("causal", [False, True])
+# @pytest.mark.parametrize("causal", [True])
+@pytest.mark.parametrize("add_unused_qkv", [False])
+@pytest.mark.parametrize("topk_sparsity", [False, True])
+# @pytest.mark.parametrize("topk_sparsity", [True])
+@pytest.mark.parametrize("topk_length", [2048])
+@pytest.mark.parametrize("d", [64])
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_k",
+    [
+        # (1, 1),
+        # (1, 3),
+        # (2, 1),
+        (511, 1),
+        (3, 513),
+        (64, 128),
+        (128, 128),
+        (256, 256),
+        (113, 203),
+        (128, 217),
+        (113, 211),
+        (108, 256),
+        (256, 512),
+        (307, 256),
+        (640, 128),
+        (512, 256),
+        (1024, 1024),
+        (1023, 1024),
+        (1024, 1023),
+        (2048, 2048),
+    ],
+)
+@pytest.mark.parametrize("varlen_mode", ["random", "full"])
+# @pytest.mark.parametrize("varlen_mode", ["full"])
+@pytest.mark.parametrize(
+    "zero_lengths_q, zero_lengths_k",
+    [
+        (False, False),
+        # (True, False),
+    ],
+)
+@pytest.mark.parametrize(
+    "unpad_q, unpad_kv",
+    [
+        (True, True),
+        (True, False),
+        (False, False),
+        (False, True),
+    ],
+)
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_mla_absorbed_varlen(
+    seqlen_q,
+    seqlen_k,
+    d,
+    add_unused_qkv,
+    causal,
+    local_enum,
+    softcap,
+    deterministic,
+    has_qv,
+    has_learnable_sink,
+    mha_type,
+    dtype,
+    varlen_mode,
+    zero_lengths_q,
+    zero_lengths_k,
+    unpad_q,
+    unpad_kv,
+    topk_sparsity,
+    topk_length,
+):
+    if not IS_SM100:
+        pytest.skip()
+    if topk_sparsity and seqlen_k < topk_length:
+        seqlen_k += topk_length
+    local = local_enum > 0
+    if local and causal:
+        pytest.skip()
+    if has_qv and local:
+        pytest.xfail("has_qv: local not supported yet")
+    seqlen_q_og = seqlen_q
+    seqlen_k_og = seqlen_k
+    if (
+        causal or local
+    ):  # Right now reference only supports causal attention with seqlen_k == seqlen_q
+        seqlen_q = max(seqlen_q_og, seqlen_k_og)
+        seqlen_k = max(seqlen_q_og, seqlen_k_og)
+    device = "cuda"
+    # set seed
+    seed = seqlen_q + seqlen_k + d + int(causal) * 2 + int(local)
+    random.seed(seed)
+    torch.random.manual_seed(seed)
+    batch_size = 7 if seqlen_q <= 512 else 3
+    nheads = 128
+    nheads_kv = nheads if mha_type == "mha" else (8 if mha_type == "gqa" else 1)
+    dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
+    dv_vals = [512]
+    # attention_chunk_vals = [torch.randint(1, seqlen_k * 2, (1,)).item(), 0] if seqlen_q <= seqlen_k else [0]
+    attention_chunk_vals = [0]
+    for dv, attention_chunk in itertools.product(dv_vals, attention_chunk_vals):
+        q_ref = torch.randn(
+            batch_size, seqlen_q, nheads, d, device=device, dtype=dtype_ref
+        )
+        if softcap > 0.0:
+            # Ensure the values of qk are at least within softcap range.
+            q_ref = (q_ref * softcap / 4).detach().requires_grad_()
+        q_ref = q_ref.to(dtype).to(dtype_ref).requires_grad_()
+        k_ref = (
+            torch.randn(
+                batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype_ref
+            )
+            .to(dtype)
+            .to(dtype_ref)
+            .requires_grad_()
+        )
+        v_ref = (
+            torch.randn(
+                batch_size, seqlen_k, nheads_kv, dv, device=device, dtype=dtype_ref
+            )
+            .to(dtype)
+            .to(dtype_ref)
+            .requires_grad_()
+        )
+        if has_qv:
+            qv_ref = (
+                torch.randn(
+                    batch_size, seqlen_q, nheads, dv, device=device, dtype=dtype_ref
+                )
+                .to(dtype)
+                .to(dtype_ref)
+            )
+        else:
+            qv_ref = None
+        if topk_sparsity:
+            topk_indices = torch.rand(batch_size, seqlen_q, topk_length, device=device).argsort(dim=-1).to(torch.int32)
+        else:
+            topk_indices = None
+            
+        # Put window_size after QKV randn so that window_size changes from test to test
+        window_size = (
+            (None, None) if not local else tuple(random.randrange(0, seqlen_k) for _ in range(2))
+        )
+        if local_enum == 2:
+            window_size = (None, window_size[1])
+        elif local_enum == 3:
+            window_size = (window_size[0], None)
+        if local:
+            print("window size = ", window_size)
+        if has_learnable_sink:
+            learnable_sink = torch.randn(nheads, dtype=torch.bfloat16, device=device)
+        else:
+            learnable_sink = None
+        if dtype == torch.float8_e4m3fn:
+            q_descale, k_descale, v_descale = [
+                torch.rand(batch_size, nheads_kv, device=device, dtype=torch.float32)
+                * 2
+                for _ in range(3)
+            ]
+        else:
+            q_descale, k_descale, v_descale = None, None, None
+        q, k, v = [x.detach().requires_grad_() for x in (q_ref, k_ref, v_ref)]
+        qv = qv_ref.detach() if has_qv else None
+        query_padding_mask = generate_random_padding_mask(
+            seqlen_q,
+            batch_size,
+            device,
+            mode=varlen_mode,
+            zero_lengths=zero_lengths_q,
+        )
+        key_padding_mask = generate_random_padding_mask(
+            seqlen_k,
+            batch_size,
+            device,
+            mode=varlen_mode,
+            zero_lengths=zero_lengths_k,
+            min_seqlen=topk_length if topk_sparsity else None,
+        )
+        def _gen_unused_masks(padding_mask, add_unused, max_seq_len, bs, device):
+            if add_unused:
+                another_mask = generate_random_padding_mask(max_seq_len, bs, device)
+                attn_mask = torch.logical_and(padding_mask, another_mask)
+                unused_mask = torch.logical_xor(
+                    torch.logical_or(padding_mask, another_mask), attn_mask
+                )
+            else:
+                attn_mask = padding_mask
+                unused_mask = None
+            return attn_mask, unused_mask
+
+        query_padding_mask, query_unused_mask = _gen_unused_masks(
+            query_padding_mask, add_unused_qkv, seqlen_q, batch_size, q.device
+        )
+        # query_padding_mask[:] = True
+        # query_unused_mask = None
+        key_padding_mask, key_unused_mask = _gen_unused_masks(
+            key_padding_mask, add_unused_qkv, seqlen_k, batch_size, k.device
+        )
+
+        if causal or local:
+            key_padding_mask = query_padding_mask
+
+        (
+            q_unpad,
+            k_unpad,
+            v_unpad,
+            qv_unpad,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            seqused_q,
+            seqused_k,
+            max_seqlen_q,
+            max_seqlen_k,
+            q,
+            k,
+            v,
+            qv,
+            output_pad_fn,
+            dq_pad_fn,
+            dk_pad_fn,
+        ) = generate_qkv(
+            q,
+            k,
+            v,
+            query_padding_mask,
+            key_padding_mask,
+            qv=qv,
+            kvpacked=False,
+            query_unused_mask=query_unused_mask,
+            key_unused_mask=key_unused_mask,
+        )
+        # unpad topk_indices
+        if topk_sparsity:
+            _, indices_q, _, _, _ = unpad_input(
+                q, query_padding_mask, query_unused_mask
+            )
+            topk_indices_unpad = rearrange(topk_indices, "b s ... -> (b s) ...")[indices_q]
+        else:
+            topk_indices_unpad = None
+        if unpad_q:
+            print("cu_seqlens_q = ", cu_seqlens_q)
+        else:
+            print("seqused_q = ", seqused_q)
+        if unpad_kv:
+            print("cu_seqlens_k = ", cu_seqlens_k)
+        else:
+            print("seqused_k = ", seqused_k)
+        q_unpad, k_unpad, v_unpad = [
+            x.detach().to(dtype).requires_grad_() for x in (q_unpad, k_unpad, v_unpad)
+        ]
+
+        out_ref, attn_ref = attention_ref(
+            q_ref,
+            k_ref,
+            v_ref,
+            query_padding_mask,
+            key_padding_mask,
+            causal=causal,
+            qv=qv_ref,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            window_size=window_size,
+            attention_chunk=attention_chunk,
+            learnable_sink=learnable_sink,
+            softcap=softcap,
+            topk_indices=topk_indices,
+        )
+        out_pt, attn_pt = attention_ref(
+            q_ref,
+            k_ref,
+            v_ref,
+            query_padding_mask,
+            key_padding_mask,
+            causal=causal,
+            qv=qv_ref,
+            q_descale=q_descale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            window_size=window_size,
+            attention_chunk=attention_chunk,
+            learnable_sink=learnable_sink,
+            softcap=softcap,
+            upcast=False,
+            reorder_ops=True,
+            intermediate_dtype=dtype if dtype == torch.float8_e4m3fn else None,
+            topk_indices=topk_indices,
+        )
+
+        if not is_fake_mode():
+            print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
+            print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
+
+            if query_unused_mask is not None:
+                q_zero_masking = rearrange(query_unused_mask, "b s -> b s 1 1")
+
+            # Numerical error if we just do any arithmetic on out_ref
+            fwd_atol = 2 * (out_ref + 0.3 - 0.3 - out_ref).abs().max().item()
+            rtol = 2 if softcap == 0.0 else 3
+
+        pack_gqa_vals = [True]
+        num_splits_vals = [1]
+        for pack_gqa, num_splits in itertools.product(pack_gqa_vals, num_splits_vals):
+            # SplitKV not supported on SM90 - skip this iteration
+            if IS_SM90 and num_splits > 1:
+                continue
+            out_unpad, lse = flash_attn_varlen_func(
+                q_unpad if unpad_q else q,
+                k_unpad if unpad_kv else k,
+                v_unpad if unpad_kv else v,
+                qv_unpad if unpad_q else qv,
+                cu_seqlens_q=cu_seqlens_q if unpad_q else None,
+                cu_seqlens_k=cu_seqlens_k if unpad_kv else None,
+                max_seqlen_q=seqlen_q,
+                max_seqlen_k=seqlen_k,
+                seqused_q=seqused_q if not unpad_q else None,
+                seqused_k=seqused_k if not unpad_kv else None,
+                causal=causal,
+                window_size=window_size,
+                learnable_sink=learnable_sink,
+                softcap=softcap,
+                num_splits=num_splits,
+                pack_gqa=pack_gqa,
+                deterministic=deterministic,
+                topk_indices=topk_indices_unpad if unpad_q else topk_indices,
+                topk_indices_maybe_oob=causal,
+            )
+            out = output_pad_fn(out_unpad) if unpad_q else out_unpad
+            if is_fake_mode():
+                # no more flash_attn cutedsl calls for the rest of the loop
+                # skip data-dependent postprocessing
+                continue
+            if query_unused_mask is not None:
+                out.masked_fill_(q_zero_masking, 0.0)
+            # When unpad_q=False with seqused_q, the kernel doesn't write positions
+            # beyond seqused_q, so those contain uninitialized values. Mask them out
+            # before comparing.
+            out_cmp, out_ref_cmp, out_pt_cmp = out, out_ref, out_pt
+            if not unpad_q and seqused_q is not None:
+                seqused_mask = torch.arange(seqlen_q, device=device)[None, :] < seqused_q[:, None]
+                seqused_mask = rearrange(seqused_mask, "b s -> b s 1 1")
+                out_cmp = out.clone().masked_fill_(~seqused_mask, 0.0)
+                out_ref_cmp = out_ref.clone().masked_fill_(~seqused_mask, 0.0)
+                out_pt_cmp = out_pt.clone().masked_fill_(~seqused_mask, 0.0)
+            print(f"Output max diff: {(out_cmp - out_ref_cmp).abs().max().item()}")
+            print(f"Output mean diff: {(out_cmp - out_ref_cmp).abs().mean().item()}")
+            # if not causal:
+            #     print(f"LSE max diff: {(lse - lse_ref).abs().max().item()}")
+            # breakpoint()
+
+            # Check that FlashAttention's numerical error is at most 3x the numerical error
+            # of a Pytorch implementation.
+            assert (out_cmp - out_ref_cmp).abs().max().item() <= rtol * (
+                out_pt_cmp - out_ref_cmp
             ).abs().max().item() + fwd_atol

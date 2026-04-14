@@ -91,20 +91,23 @@ def pad_input(hidden_states, indices, batch, seqlen):
     return rearrange(output, "(b s) ... -> b s ...", b=batch)
 
 
-def generate_random_padding_mask(max_seqlen, batch_size, device, mode="random", zero_lengths=False):
+def generate_random_padding_mask(
+    max_seqlen, batch_size, device, mode="random", zero_lengths=False, min_seqlen=None
+):
     assert mode in ["full", "random", "third"]
+    min_seqlen = min_seqlen if min_seqlen is not None else 0 if zero_lengths else 1
     if mode == "full":
         lengths = torch.full((batch_size, 1), max_seqlen, device=device, dtype=torch.int32)
     elif mode == "random":
         lengths = torch.randint(
-            max(0 if zero_lengths else 1, max_seqlen - 20),
+            max(min_seqlen, max_seqlen - 20),
             max_seqlen + 1,
             (batch_size, 1),
             device=device,
         )
     else:
         lengths = torch.randint(
-            max(0 if zero_lengths else 1, max_seqlen // 3),
+            max(min_seqlen, max_seqlen // 3),
             max_seqlen + 1,
             (batch_size, 1),
             device=device,
