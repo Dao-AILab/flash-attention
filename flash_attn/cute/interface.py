@@ -452,12 +452,13 @@ def _flash_attn_fwd(
     if tile_mn is None:
         if arch // 10 == 12:
             # SM120 tile sizes tuned for 99 KB SMEM capacity:
-            # D<=64:  128x128 → 48 KB (good occupancy)
-            # D>64:   128x64  → 64 KB (128x128 would use 96 KB, hurting occupancy)
+            # SMEM = tile_m*D*2 + tile_n*D*stages*2 + tile_n*Dv*stages*2
             if head_dim <= 64:
-                fwd_cfg = FwdConfig(128, 128, True, True)
+                fwd_cfg = FwdConfig(128, 128, True, True)  # 48 KB
+            elif head_dim <= 128:
+                fwd_cfg = FwdConfig(128, 64, True, True)   # 64 KB
             else:
-                fwd_cfg = FwdConfig(128, 64, True, True)
+                fwd_cfg = FwdConfig(64, 64, True, True)    # 64 KB for D=256
         elif arch // 10 == 8:
             fwd_cfg = FwdConfig(128, 64, True, True)  # SM80, should tune
         elif arch // 10 == 9:
@@ -732,8 +733,8 @@ def _flash_attn_fwd(
         elif arch // 10 == 12:
             # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
             assert not use_block_sparsity, "Block sparsity not supported on SM 12.0"
-            assert page_table is None, "Paged KV not supported on SM 12.0 in this PR"
-            assert not is_split_kv, "SplitKV not supported on SM 12.0 in this PR"
+            assert page_table is None, "Paged KV not supported on SM 12.0"
+            assert not is_split_kv, "SplitKV not supported on SM 12.0"
             fa_fwd = FlashAttentionForwardSm120(
                 dtype,
                 head_dim,
@@ -1022,9 +1023,14 @@ def _flash_attn_bwd(
         AtomLayoutNdKV = 4
         AtomLayoutMdQ = 4
         V_in_regs = False
+        dQ_single_wg = False
+        num_stages_PdS = 1
         cluster_size = 1
         use_2cta_instrs = False
         num_threads = 128
+        # TODO(SM120): These features require an SM90-style backward kernel. The SM80
+        # backward kernel used by SM120 does not implement them. Forward block sparsity
+        # is tracked in #2389, SplitKV in #2336, paged KV in #2348.
         assert not (block_sparse_tensors is not None), "Block sparsity backward not supported on SM 12.0"
         assert score_mod is None and score_mod_bwd is None, "score_mod backward not supported on SM 12.0"
         assert mask_mod is None, "mask_mod backward not supported on SM 12.0"

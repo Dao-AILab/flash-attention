@@ -415,23 +415,15 @@ def fadd_reduce(
 
 @dsl_user_op
 def atomic_add_fp32(a: float | Float32, gmem_ptr: cute.Pointer, *, loc=None, ip=None) -> None:
-    # gmem_ptr_i64 = gmem_ptr.toint(loc=loc, ip=ip).ir_value()
-    # # cache_hint = cutlass.Int64(0x12F0000000000000)
-    # llvm.inline_asm(
-    #     None,
-    #     [gmem_ptr_i64, Float32(a).ir_value(loc=loc, ip=ip)],
-    #     # [gmem_ptr_i64, Float32(a).ir_value(loc=loc, ip=ip), cache_hint.ir_value()],
-    #     "red.global.add.f32 [$0], $1;",
-    #     # "red.global.add.L2::cache_hint.f32 [$0], $1, 0x12F0000000000000;",
-    #     # "red.global.add.L2::cache_hint.f32 [$0], $1, $2;",
-    #     "l,f",
-    #     # "l,f,l",
-    #     has_side_effects=True,
-    #     is_align_stack=False,
-    #     asm_dialect=llvm.AsmDialect.AD_ATT,
-    # )
-    nvvm.atomicrmw(
-        res=T.f32(), op=nvvm.AtomicOpKind.FADD, ptr=gmem_ptr.llvm_ptr, a=Float32(a).ir_value()
+    gmem_ptr_i64 = gmem_ptr.toint(loc=loc, ip=ip).ir_value()
+    llvm.inline_asm(
+        None,
+        [gmem_ptr_i64, Float32(a).ir_value(loc=loc, ip=ip)],
+        "red.global.add.f32 [$0], $1;",
+        "l,f",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
     )
 
 
