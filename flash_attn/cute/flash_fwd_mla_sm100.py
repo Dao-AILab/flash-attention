@@ -21,7 +21,7 @@ from cutlass.utils import ClcDynamicPersistentTileScheduler
 
 from quack import copy_utils, layout_utils
 
-from flash_attn.cute.pack_gqa import PackGQA, pack_gqa_layout
+from flash_attn.cute.pack_gqa import PackGQA, pack_gqa_layout, make_packgqa_tiled_tma_atom
 from flash_attn.cute import utils
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
@@ -68,15 +68,15 @@ class FlashAttentionMLAForwardSm100:
     ):
         self.is_causal = is_causal
         self.is_local = False
+        self.pack_gqa = pack_gqa
+        self.qhead_per_kvhead = qhead_per_kvhead
+        self.nheads_kv = nheads_kv
         self.is_varlen_q = is_varlen_q
-        self.use_tma_O = not is_varlen_q
+        self.use_tma_O = True
         self.use_cpasync_load_KV = use_cpasync_load_KV
         self.use_tma_KV = not use_cpasync_load_KV
         self.topk_length = topk_length
         self.is_topk_gather = is_topk_gather
-        self.pack_gqa = pack_gqa
-        self.qhead_per_kvhead = qhead_per_kvhead
-        self.nheads_kv = nheads_kv
         if is_topk_gather:
             assert pack_gqa
             assert qhead_per_kvhead == 128, "require MQA 128 for DSA path"
@@ -152,6 +152,11 @@ class FlashAttentionMLAForwardSm100:
         self.cta_tile_m = 64
         self.cluster_tile_m = self.cta_group_size * self.cta_tile_m
         self.tile_n = 128
+        assert (
+            pack_gqa is False
+            or self.cluster_tile_m % qhead_per_kvhead == 0
+            or qhead_per_kvhead % self.cluster_tile_m == 0
+        )
         self.num_hdimv_splits = 2  # split hdimv in half for our Qv @ V^T and P @ V mmas.
         assert hdimv % 32 == 0
         assert self.topk_length % (self.tile_n * 2) == 0 or not self.is_topk_gather
@@ -358,6 +363,7 @@ class FlashAttentionMLAForwardSm100:
 
         self.o_layout = cutlass.utils.LayoutEnum.from_tensor(mO)
 
+        mO_og = mO
         if const_expr(self.pack_gqa):
             mQ, mQv, mO = [
                 pack_gqa_layout(mX, self.qhead_per_kvhead, self.nheads_kv, head_idx=2)
@@ -482,10 +488,26 @@ class FlashAttentionMLAForwardSm100:
         sO_layout = sm100_utils.make_smem_layout_epi(
             self.dtype_O, self.o_layout, self.epi_tile, num_stages_sO
         )
+        self.ragged_tma_O = (
+            self.use_tma_O
+            and self.is_varlen_q
+            and self.pack_gqa
+            and self.cta_tile_m % self.qhead_per_kvhead == 0
+        )
+        make_tiled_tma_atom_fn = (
+            partial(make_packgqa_tiled_tma_atom, qhead_per_kvhead=self.qhead_per_kvhead, head_idx=2)
+            if const_expr(self.ragged_tma_O)
+            else cpasync.make_tiled_tma_atom
+        )
         if const_expr(self.use_tma_O):
+            mO_tma = mO_og if const_expr(self.ragged_tma_O) else mO
+            if const_expr(self.ragged_tma_O):
+                mO_tma = copy_utils.create_ragged_tensor_for_tma(
+                    mO_tma, ragged_dim=0, ptr_shift=True
+                )
             tma_store_op = cpasync.CopyBulkTensorTileS2GOp()
-            tma_atom_O, tma_tensor_O = cpasync.make_tiled_tma_atom(
-                tma_store_op, mO, cute.select(sO_layout, mode=[0, 1]), self.epi_tile
+            tma_atom_O, tma_tensor_O = make_tiled_tma_atom_fn(
+                tma_store_op, mO_tma, cute.select(sO_layout, mode=[0, 1]), self.epi_tile
             )
         else:
             tma_atom_O = None
@@ -2509,7 +2531,9 @@ class FlashAttentionMLAForwardSm100:
                     consumer_states_O[split] = consumer_state_Oi
 
             # (seqlen_q, hdimv)
-            mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3)[None, None, head_idx]
+            mO_cur = seqlen.offset_batch_Q(
+                mO, batch_idx, dim=3, ragged=self.ragged_tma_O
+            )[None, None, head_idx]
             # (cta_tile_m, hdimv//2, 2)
             gO = cute.local_tile(
                 mO_cur,
@@ -3049,9 +3073,9 @@ def benchmark_mla_kernel(
 
 if __name__ == "__main__":
     run_test = True
-    run_benchmark = True
+    run_benchmark = False
     gather_kv = False
-    is_causal = True
+    is_causal = False
     pack_gqa = True
     topk_length = 2048
     varlen_q = False
@@ -3066,10 +3090,10 @@ if __name__ == "__main__":
         else:
             seqlen_q_test_values = range(1, 1001, 200)
             seqlen_k_test_values = range(topk_length, 9001, 2000)
-        seqlen_q_test_values = [256]
-        seqlen_k_test_values = [128]
+        seqlen_q_test_values = [1]
+        seqlen_k_test_values = [4096]
         nheads_test_values = [128]
-        batch_test_values = [5]
+        batch_test_values = [15]
         test_configs = [
             (batch, nheads, seqlen_q, seqlen_k,)
             for batch in batch_test_values
