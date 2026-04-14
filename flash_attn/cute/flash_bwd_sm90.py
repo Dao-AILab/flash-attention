@@ -19,7 +19,7 @@ from quack.sm90_utils import gemm_zero_init, gemm_w_idx
 
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import utils
-from flash_attn.cute.dropout import apply_dropout_mask
+from flash_attn.cute.dropout import apply_dropout_mask_sm100 as apply_dropout_mask_sm90
 from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
@@ -1326,22 +1326,31 @@ class FlashAttentionBackwardSm90:
                 n_block=n_block,
                 seqlen_info=seqlen,
             )
-            # Dropout closure — bind n_block (outer loop), m_block passed at call time
+            # Dropout closure — SM90 uses per-element position-keyed Philox
+            # (same approach as SM100) because WGMMA has a different register
+            # layout than SM80/SM120's warp-level MMA.
             dropout_fn_cur = None
             if const_expr(self.is_dropout):
+                cS_dropout = cute.make_identity_tensor(
+                    (self.tile_n, self.tile_m)
+                    if const_expr(self.SdP_swapAB)
+                    else (self.tile_m, self.tile_n)
+                )
+                tScS_dropout = thr_mma_SdP.partition_C(cS_dropout)
                 dropout_fn_cur = partial(
-                    apply_dropout_mask,
+                    apply_dropout_mask_sm90,
+                    tScS_t2r=tScS_dropout,
                     batch_idx=batch_idx,
                     head_idx=head_idx,
                     nheads=dropout_nheads,
                     n_block=n_block,
                     tile_m=self.tile_m,
                     tile_n=self.tile_n,
-                    num_warps_m=self.num_threads // 32,
                     p_keep_uint8=self.p_keep_uint8,
                     rp_dropout=Float32(self.rp_dropout),
                     seed_lo=cutlass.Uint32(dropout_seed_lo),
                     seed_hi=cutlass.Uint32(dropout_seed_hi),
+                    transpose=self.SdP_swapAB,
                 )
 
             m_block_min, m_block_max = block_info.get_m_block_min_max(seqlen, n_block)
