@@ -330,7 +330,7 @@ def _flash_attn_fwd(
     lse: Optional[torch.Tensor] = None,
     aux_tensors: Optional[list[torch.Tensor]] = None,
     topk_indices: Optional[torch.Tensor] = None,
-    topk_indices_maybe_oob: bool = False,
+    topk_indices_maybe_oob: Optional[bool] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for FlashAttention.
 
@@ -635,11 +635,16 @@ def _flash_attn_fwd(
             assert topk_indices.shape[:-1] == q.shape[:-2]
             topk_length = topk_indices.shape[-1]
             assert topk_length % 256 == 0
-            if min_seqlen_k is None or topk_indices_maybe_oob:
+            if topk_indices_maybe_oob is False:
+                disable_topk_bitmask = True
+            elif topk_indices_maybe_oob is True:
                 disable_topk_bitmask = False
             else:
-                seqlen_k_boundary = min_seqlen_k - max_seqlen_q + 1 if causal else min_seqlen_k
-                disable_topk_bitmask = seqlen_k_boundary >= topk_length
+                if min_seqlen_k is None or causal:
+                    disable_topk_bitmask = False
+                else:
+                    seqlen_k_boundary = min_seqlen_k - max_seqlen_q + 1 if causal else min_seqlen_k
+                    disable_topk_bitmask = seqlen_k_boundary >= topk_length
 
     compile_key = (
         dtype,
@@ -1700,7 +1705,7 @@ class FlashAttnFunc(torch.autograd.Function):
         mask_block_idx: Optional[torch.Tensor] = None,
         block_size: Optional[Tuple[int, int]] = None,
         return_lse: bool = False,
-        topk_indices_maybe_oob: bool = False,
+        topk_indices_maybe_oob: Optional[bool] = None,
     ):
         # Only create block sparse tensors if at least one block sparse parameter is provided
         block_sparse_tensors = None
@@ -1794,7 +1799,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         score_mod: Optional[Callable] = None,
         aux_tensors: Optional[list] = None,
         return_lse: bool = False,
-        topk_indices_maybe_oob: bool = False,
+        topk_indices_maybe_oob: Optional[bool] = None,
     ):
         out, lse = _flash_attn_fwd(
             q,
@@ -1889,7 +1894,7 @@ def flash_attn_func(
     mask_block_idx: Optional[torch.Tensor] = None,
     block_size: Optional[Tuple[int, int]] = None,
     return_lse: bool = False,
-    topk_indices_maybe_oob: bool = False,
+    topk_indices_maybe_oob: Optional[bool] = None,
 ):
     return FlashAttnFunc.apply(
         q,
@@ -1941,8 +1946,28 @@ def flash_attn_varlen_func(
     score_mod: Optional[Callable] = None,
     aux_tensors: Optional[list] = None,
     return_lse: bool = False,
-    topk_indices_maybe_oob: bool = False,
+    topk_indices_maybe_oob: Optional[bool] = None,
 ):
+    """
+    Explanation of some optional arguments:
+
+    qv: we write the MLA weight absorbed formula as
+        O = softmax(scale * (Q @ K.T + Qv @ V.T)) @ V
+        where Q = q_pe, Qv = q_nope, K = pe_cache, V = kv_cache.
+
+    topk_indices: a tensor of shape (batch, seqlen_q, topk_length) or
+        (total_q, topk_length) if there is cu_seqlens_q.
+        Used for topk sparsity with MLA absorption kernel (i.e. DSA).
+
+    topk_indices_maybe_oob: indicates whether topk selected tokens need further masking,
+        e.g., we could need to apply causal mask on top of topk sparse mask if
+        topk indices lie above the causal diagonal, or
+        topk indices could be out of bounds if topk_length > seqlen_k.
+        If None, we set via a heuristic.
+    
+    min_seqlen_k: for varlen, specifies the minimum kv sequence length for any batch.
+        Used with topk_indices to determine if we need oob masking.
+    """
     return FlashAttnVarlenFunc.apply(
         q,
         k,
