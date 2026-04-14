@@ -526,7 +526,7 @@ def _flash_attn_fwd(
     # SplitKV uses float32 partial output, which doubles the O buffer size
     # in shared memory, causing OOM for diff-headdim (192, 128)
     if arch // 10 in [10, 11] and head_dim != head_dim_v and num_splits > 1:
-        if num_n_blocks >= 64:
+        if num_n_blocks >= 64 and head_dim_v != 512:
             tile_n = 64
             num_n_blocks = (seqlen_k_loaded + tile_n - 1) // tile_n
             num_splits = num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, 128)
@@ -617,9 +617,10 @@ def _flash_attn_fwd(
         assert arch // 10 in [10, 11], "only support Blackwell arch with qv"
         assert qv.shape[:-1] == q.shape[:-1]
         assert qv.shape[-1] == head_dim_v
-        assert head_dim == 64 and head_dim_v == 512, "only support MLA shape with qv"
+        assert head_dim == 64 and head_dim_v == 512, "only support MLA weight absorbed shape with qv"
         assert not local, "local not yet supported with qv"
         assert page_table is None, "page table not yet supported with qv"
+
         assert not is_split_kv, "split kv not supported with qv"
         assert learnable_sink is None
         assert softcap is None
@@ -645,6 +646,10 @@ def _flash_attn_fwd(
                 else:
                     seqlen_k_boundary = min_seqlen_k - max_seqlen_q + 1 if causal else min_seqlen_k
                     disable_topk_bitmask = seqlen_k_boundary >= topk_length
+    else:
+        topk_length = None
+        sparse_topk = None
+        disable_topk_bitmask = None
 
     compile_key = (
         dtype,
