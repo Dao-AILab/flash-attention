@@ -610,9 +610,14 @@ def _flash_attn_fwd(
         assert qv.shape[-1] == head_dim_v
         assert head_dim == 64 and head_dim_v == 512, "only support MLA weight absorbed shape with qv"
         assert not local, "local not yet supported with qv"
-        assert page_table is None, "page table not yet supported with qv"
-
         assert not is_split_kv, "split kv not supported with qv"
+        if page_table is not None:
+            page_size = k.shape[1]
+            assert page_size == tile_n, (
+                f"MLA paged KV currently requires page_size ({page_size}) == tile_n ({tile_n})"
+            )
+            assert gather_kv_indices is None, "paged KV + topk sparsity not yet supported together"
+            assert seqused_k is not None, "seqused_k required for paged KV with MLA"
         assert learnable_sink is None
         assert softcap is None
         assert score_mod is None

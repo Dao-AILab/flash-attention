@@ -370,9 +370,6 @@ class FlashAttentionMLAForwardSm100:
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
-        # ==== asserts for unimplemented features ====
-        assert mPageTable is None, "page table tbd for MLA"
-
         # ==== dtype info ====
         self.dtype_Q = mQ.element_type
         self.dtype_K = mK.element_type
@@ -609,8 +606,10 @@ class FlashAttentionMLAForwardSm100:
             num_batch=cute.size(mQ.shape[3])
             if const_expr(mCuSeqlensQ is None)
             else cute.size(mCuSeqlensQ.shape[0] - 1),
-            num_splits=1,  # todo: split_kv
-            seqlen_k=cute.size(mK.shape[0]),  # todo: page table
+            num_splits=1, # todo: split_kv
+            seqlen_k=cute.size(mK.shape[0])
+            if const_expr(mPageTable is None)
+            else cute.size(mK.shape[0]) * cute.size(mPageTable.shape[1]),
             headdim=self.hdim,
             headdim_v=self.hdimv,
             total_q=cute.size(mQ.shape[0])
@@ -709,6 +708,7 @@ class FlashAttentionMLAForwardSm100:
             topk_length_dynamic,
             tile_sched_params,
             SharedStorage,
+            mPageTable,
         ).launch(
             grid=grid_dim,
             block=(
@@ -766,6 +766,7 @@ class FlashAttentionMLAForwardSm100:
         topk_length_dynamic: Optional[Int32],
         tile_sched_params: ParamsBase,
         SharedStorage: cutlass.Constexpr[Callable],
+        mPageTable: Optional[cute.Tensor] = None,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         cta_layout_vmnk = cute.tiled_divide(
@@ -935,7 +936,9 @@ class FlashAttentionMLAForwardSm100:
         SeqlenInfoCls = partial(
             SeqlenInfoQK.create,
             seqlen_q_static=mQ.shape[0] if const_expr(not self.pack_gqa) else mQ.shape[0][1],
-            seqlen_k_static=mK.shape[0],
+            seqlen_k_static=mK.shape[0]
+            if const_expr(mPageTable is None)
+            else mK.shape[0] * mPageTable.shape[1],
             tile_m=self.cta_tile_m,
             tile_n=self.tile_n,
             mCuSeqlensQ=mCuSeqlensQ,
@@ -1097,6 +1100,7 @@ class FlashAttentionMLAForwardSm100:
                 block_info,
                 SeqlenInfoCls,
                 tile_scheduler=tile_scheduler,
+                mPageTable=mPageTable,
             )
 
         if warp_idx == self.mma_warp_id:
@@ -1645,6 +1649,7 @@ class FlashAttentionMLAForwardSm100:
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
         tile_scheduler: TileSchedulerProtocol,
+        mPageTable: Optional[cute.Tensor] = None,
     ):
         # ==== Load warp ====
         # Description: loads tiles of Q, Qv, K, V, V0, V1 from gmem to smem using TMA
@@ -1757,48 +1762,80 @@ class FlashAttentionMLAForwardSm100:
             )
 
             if const_expr(self.use_tma_KV):
-                # (seqlen_k, hdim) or (seqlen_k, hdimv//2)
-                mK_cur = seqlen.offset_batch_K(mK, batch_idx, dim=3)[None, None, head_idx_kv]
-                mVs_cur = [
-                    seqlen.offset_batch_K(mVs[split], batch_idx, dim=3)[None, None, head_idx_kv]
-                    for split in range(self.num_hdimv_splits)
-                ]
-                # (hdimv//2, seqlen_k)
-                if const_expr(not seqlen.has_cu_seqlens_k):
-                    mVts_cur = [
-                        mVts[split][None, None, head_idx_kv, batch_idx]
+                if const_expr(mPageTable is None):
+                    # Non-paged: select batch, tile over seqlen_k
+                    # (seqlen_k, hdim) or (seqlen_k, hdimv//2)
+                    mK_cur = seqlen.offset_batch_K(mK, batch_idx, dim=3)[None, None, head_idx_kv]
+                    mVs_cur = [
+                        seqlen.offset_batch_K(mVs[split], batch_idx, dim=3)[None, None, head_idx_kv]
                         for split in range(self.num_hdimv_splits)
                     ]
-                else:
-                    mVts_cur = [
-                        cute.domain_offset(
-                            (0, seqlen.offset_k), mVts[split][None, None, head_idx_kv]
-                        )
-                        for split in range(self.num_hdimv_splits)
-                    ]
-                # (tile_n, hdim or hdimv//2, num_n_blocks)
-                gK = cute.local_tile(
-                    mK_cur,
-                    (self.mma_tiler_QK[1], self.mma_tiler_QK[2]),
-                    (None, 0),
-                )
-                gVs = [
-                    cute.local_tile(
-                        mVs_cur[split],
-                        (self.mma_tiler_QviVi[1], self.mma_tiler_QviVi[2]),
+                    # (hdimv//2, seqlen_k)
+                    if const_expr(not seqlen.has_cu_seqlens_k):
+                        mVts_cur = [
+                            mVts[split][None, None, head_idx_kv, batch_idx]
+                            for split in range(self.num_hdimv_splits)
+                        ]
+                    else:
+                        mVts_cur = [
+                            cute.domain_offset((0, seqlen.offset_k), mVts[split][None, None, head_idx_kv])
+                            for split in range(self.num_hdimv_splits)
+                        ]
+                    # (tile_n, hdim or hdimv//2, num_n_blocks)
+                    gK = cute.local_tile(
+                        mK_cur,
+                        (self.mma_tiler_QK[1], self.mma_tiler_QK[2]),
                         (None, 0),
                     )
-                    for split in range(self.num_hdimv_splits)
-                ]
-                # (hdim or hdimv//2, tile_n, num_n_blocks)
-                gVts = [
-                    cute.local_tile(
-                        mVts_cur[split],
-                        (self.mma_tiler_PVti[1], self.mma_tiler_PVti[2]),
-                        (0, None),
+                    gVs = [
+                        cute.local_tile(
+                            mVs_cur[split],
+                            (self.mma_tiler_QviVi[1], self.mma_tiler_QviVi[2]),
+                            (None, 0),
+                        ) for split in range(self.num_hdimv_splits)
+                    ]
+                    # (hdim or hdimv//2, tile_n, num_n_blocks)
+                    gVts = [
+                        cute.local_tile(
+                            mVts_cur[split],
+                            (self.mma_tiler_PVti[1], self.mma_tiler_PVti[2]),
+                            (0, None),
+                        ) for split in range(self.num_hdimv_splits)
+                    ]
+                else:
+                    # Paged KV: keep pages dim, index by page_idx at load time
+                    # (page_size, hdim, num_pages) or (page_size, hdimv//2, num_pages)
+                    mK_cur = mK[None, None, head_idx_kv, None]
+                    mVs_cur = [
+                        mVs[split][None, None, head_idx_kv, None]
+                        for split in range(self.num_hdimv_splits)
+                    ]
+                    # (hdimv//2, page_size, num_pages)
+                    mVts_cur = [
+                        mVts[split][None, None, head_idx_kv, None]
+                        for split in range(self.num_hdimv_splits)
+                    ]
+                    # (tile_n, hdim or hdimv//2, 1, num_pages)
+                    gK = cute.local_tile(
+                        mK_cur,
+                        (self.mma_tiler_QK[1], self.mma_tiler_QK[2]),
+                        (None, 0, None),
                     )
-                    for split in range(self.num_hdimv_splits)
-                ]
+                    gVs = [
+                        cute.local_tile(
+                            mVs_cur[split],
+                            (self.mma_tiler_QviVi[1], self.mma_tiler_QviVi[2]),
+                            (None, 0, None),
+                        ) for split in range(self.num_hdimv_splits)
+                    ]
+                    # (hdim or hdimv//2, tile_n, 1, num_pages)
+                    gVts = [
+                        cute.local_tile(
+                            mVts_cur[split],
+                            (self.mma_tiler_PVti[1], self.mma_tiler_PVti[2]),
+                            (0, None, None),
+                        ) for split in range(self.num_hdimv_splits)
+                    ]
                 tSgK = thr_mma_QK.partition_B(gK)
                 tSgVs = [
                     thr_mma_QviVi.partition_B(gVs[split]) for split in range(self.num_hdimv_splits)
@@ -1855,11 +1892,16 @@ class FlashAttentionMLAForwardSm100:
             if const_expr(self.use_tma_KV):
                 # ==== Prologue ====
                 n_block_first = n_block_max - 1
+                page_idx = (
+                    mPageTable[batch_idx, n_block_first]
+                    if const_expr(mPageTable is not None)
+                    else None
+                )
                 # copy K gmem -> smem
-                producer_state_K = load_K(producer_state_K, n_block=n_block_first)
+                producer_state_K = load_K(producer_state_K, n_block=n_block_first, page_idx=page_idx)
                 # copy Vi gmem -> smem
-                producer_state_V0 = load_V(producer_state_V0, n_block=n_block_first, split=0)
-                producer_state_V1 = load_V(producer_state_V1, n_block=n_block_first, split=1)
+                producer_state_V0 = load_V(producer_state_V0, n_block=n_block_first, split=0, page_idx=page_idx)
+                producer_state_V1 = load_V(producer_state_V1, n_block=n_block_first, split=1, page_idx=page_idx)
 
                 if const_expr(self.use_tma_O and self.overlap_sO_sV):
                     cute.arch.mbarrier_wait(sO_empty_mbar_ptr, phase=producer_phase_O)
@@ -1869,28 +1911,48 @@ class FlashAttentionMLAForwardSm100:
                 for n_block_group in cutlass.range(num_n_block_groups - 1, unroll=1):
                     for stage in cutlass.range_constexpr(self.num_stages_S):
                         n_block = n_block_max - 1 - n_block_group * self.num_stages_S - stage
+                        page_idx_next = (
+                            mPageTable[batch_idx, n_block - 1]
+                            if const_expr(mPageTable is not None)
+                            else None
+                        )
+                        page_idx_cur = (
+                            mPageTable[batch_idx, n_block]
+                            if const_expr(mPageTable is not None)
+                            else None
+                        )
                         # copy K gmem -> smem
-                        producer_state_K = load_K(producer_state_K, n_block=n_block - 1)
+                        producer_state_K = load_K(producer_state_K, n_block=n_block-1, page_idx=page_idx_next)
                         # copy Vi gmem -> smem
-                        producer_state_V0 = load_V(producer_state_V0, n_block=n_block - 1, split=0)
-                        producer_state_V1 = load_V(producer_state_V1, n_block=n_block - 1, split=1)
+                        producer_state_V0 = load_V(producer_state_V0, n_block=n_block-1, split=0, page_idx=page_idx_next)
+                        producer_state_V1 = load_V(producer_state_V1, n_block=n_block-1, split=1, page_idx=page_idx_next)
                         # copy Vti gmem -> smem
-                        producer_state_V0 = load_Vt(producer_state_V0, n_block=n_block, split=0)
-                        producer_state_V1 = load_Vt(producer_state_V1, n_block=n_block, split=1)
+                        producer_state_V0 = load_Vt(producer_state_V0, n_block=n_block, split=0, page_idx=page_idx_cur)
+                        producer_state_V1 = load_Vt(producer_state_V1, n_block=n_block, split=1, page_idx=page_idx_cur)
 
                 # ==== Epilogue ====
                 num_final_n_blocks = self.num_stages_S if even_n_blocks else self.num_stages_S - 1
                 for stage in cutlass.range(num_final_n_blocks, unroll_full=True):
                     n_block = num_final_n_blocks - 1 - stage
                     if n_block > 0:
+                        page_idx_next = (
+                            mPageTable[batch_idx, n_block - 1]
+                            if const_expr(mPageTable is not None)
+                            else None
+                        )
                         # copy K gmem -> smem
-                        producer_state_K = load_K(producer_state_K, n_block=n_block - 1)
+                        producer_state_K = load_K(producer_state_K, n_block=n_block-1, page_idx=page_idx_next)
                         # copy Vi gmem -> smem
-                        producer_state_V0 = load_V(producer_state_V0, n_block=n_block - 1, split=0)
-                        producer_state_V1 = load_V(producer_state_V1, n_block=n_block - 1, split=1)
+                        producer_state_V0 = load_V(producer_state_V0, n_block=n_block-1, split=0, page_idx=page_idx_next)
+                        producer_state_V1 = load_V(producer_state_V1, n_block=n_block-1, split=1, page_idx=page_idx_next)
+                    page_idx_cur = (
+                        mPageTable[batch_idx, n_block]
+                        if const_expr(mPageTable is not None)
+                        else None
+                    )
                     # copy Vti gmem -> smem
-                    producer_state_V0 = load_Vt(producer_state_V0, n_block=n_block, split=0)
-                    producer_state_V1 = load_Vt(producer_state_V1, n_block=n_block, split=1)
+                    producer_state_V0 = load_Vt(producer_state_V0, n_block=n_block, split=0, page_idx=page_idx_cur)
+                    producer_state_V1 = load_Vt(producer_state_V1, n_block=n_block, split=1, page_idx=page_idx_cur)
 
             # Advance to next tile
             work_tile = tile_scheduler.advance_to_next_work()
@@ -1913,6 +1975,7 @@ class FlashAttentionMLAForwardSm100:
         producer_state: pipeline.PipelineState,
         n_block: Optional[Int32] = None,
         split: Optional[Int32] = None,
+        page_idx: Optional[Int32] = None,
     ):
         stage = producer_state.index
         if const_expr(split is not None):
@@ -1921,7 +1984,10 @@ class FlashAttentionMLAForwardSm100:
             tXsX = tXsX[split]
             load_pipeline = load_pipeline[split]
         if const_expr(n_block is not None):
-            tXgX = tXgX[(None, n_block)]
+            if const_expr(page_idx is not None):
+                tXgX = tXgX[(None, 0, page_idx)]
+            else:
+                tXgX = tXgX[(None, n_block)]
         tXsX = tXsX[(None, stage)]
 
         load_pipeline.producer_acquire(producer_state)
