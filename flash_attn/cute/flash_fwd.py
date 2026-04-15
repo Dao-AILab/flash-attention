@@ -25,7 +25,7 @@ from quack import layout_utils
 
 from flash_attn.cute import ampere_helpers as sm80_utils
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
-from flash_attn.cute.dropout import apply_dropout_mask
+from flash_attn.cute.dropout import apply_dropout_mask, precompute_dropout_mask, apply_dropout_from_state
 from flash_attn.cute import utils
 from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.softmax import Softmax, apply_score_mod_inner
@@ -946,11 +946,13 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             self.load_V, gmem_tiled_copy_V, tVgV, tVsV, tVcV, t0VcV, tVpV, seqlen=seqlen.seqlen_k
         )
 
-        # Dropout closure — applied after softmax, before P→V GEMM
+        # Dropout closures — split into precompute (INT32 Philox) + apply (FP32 mask).
+        # Placing precompute before softmax allows INT32/FP32 execution unit overlap.
         dropout_fn = None
+        dropout_precompute_fn = None
+        dropout_apply_fn = None
         if const_expr(self.is_dropout):
-            dropout_fn = partial(
-                apply_dropout_mask,
+            dropout_common = dict(
                 batch_idx=batch_size,
                 head_idx=num_head,
                 nheads=dropout_nheads,
@@ -959,9 +961,22 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                 tile_n=self.tile_n,
                 num_warps_m=self.num_threads // 32,
                 p_keep_uint8=self.p_keep_uint8,
-                rp_dropout=Float32(self.rp_dropout),
                 seed_lo=cutlass.Uint32(dropout_seed_lo),
                 seed_hi=cutlass.Uint32(dropout_seed_hi),
+            )
+            dropout_fn = partial(
+                apply_dropout_mask,
+                rp_dropout=Float32(self.rp_dropout),
+                **dropout_common,
+            )
+            dropout_precompute_fn = partial(
+                precompute_dropout_mask,
+                **dropout_common,
+            )
+            dropout_apply_fn = partial(
+                apply_dropout_from_state,
+                p_keep_uint8=self.p_keep_uint8,
+                rp_dropout=Float32(self.rp_dropout),
             )
 
         compute_one_n_block = partial(
@@ -978,6 +993,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             aux_tensors=aux_tensors,
             fastdiv_mods=fastdiv_mods,
             dropout_fn=dropout_fn,
+            dropout_precompute_fn=dropout_precompute_fn,
+            dropout_apply_fn=dropout_apply_fn,
         )
 
         # ///////////////////////////////////////////////////////////////////////////////
@@ -1129,6 +1146,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         fastdiv_mods=None,
         mask_fn: Optional[Callable] = None,
         dropout_fn: Optional[Callable] = None,
+        dropout_precompute_fn: Optional[Callable] = None,
+        dropout_apply_fn: Optional[Callable] = None,
         is_first_n_block: cutlass.Constexpr = False,
         check_inf: cutlass.Constexpr = True,
     ):
@@ -1145,6 +1164,16 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         acc_shape_S = mma_params.thr_mma_qk.partition_shape_C((self.tile_m, self.tile_n))
         acc_S = cute.make_fragment(acc_shape_S, Float32)
         acc_S.fill(0.0)
+
+        # Allocate compact bitmask for split dropout.
+        # Shape: (mma_m, mma_n_half) — 8 packed keep-bits per uint32 word.
+        if const_expr(dropout_precompute_fn is not None):
+            divided_tmp = cute.logical_divide(acc_S, (None, None, 2))
+            philox_state = cute.make_rmem_tensor(
+                (cute.size(divided_tmp.shape[1]), cute.size(divided_tmp.shape[2][1])),
+                cutlass.Uint32,
+            )
+
         # wait for smem tile QK before mma calculation for S
         sync()
 
@@ -1200,10 +1229,14 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             load_K_next()
         if const_expr(mask_fn is not None):
             mask_fn(acc_S, n_block=n_block)
+        # Precompute Philox RNG state (INT32 ops) before softmax (FP32 ops)
+        # to enable hardware scheduling overlap on separate execution units.
+        if const_expr(dropout_precompute_fn is not None):
+            dropout_precompute_fn(philox_state=philox_state, acc_S=acc_S, n_block=n_block)
         row_scale = softmax.online_softmax(acc_S, is_first=is_first_n_block, check_inf=check_inf)
-        # Apply dropout mask after softmax, before P→V GEMM
-        if const_expr(dropout_fn is not None):
-            dropout_fn(acc_S=acc_S, n_block=n_block)
+        # Apply precomputed dropout mask — only threshold comparison + multiply
+        if const_expr(dropout_apply_fn is not None):
+            dropout_apply_fn(acc_S=acc_S, philox_state=philox_state)
         softmax.rescale_O(mma_params.acc_O, row_scale)
         rP = cute.make_fragment_like(acc_S, self.dtype)
         rP.store(acc_S.load().to(self.dtype))

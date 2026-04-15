@@ -173,6 +173,170 @@ def apply_dropout_mask(
 
 
 @cute.jit
+def precompute_dropout_mask(
+    philox_state: cute.Tensor,
+    acc_S: cute.Tensor,
+    batch_idx: Int32,
+    head_idx: Int32,
+    nheads: Int32,
+    m_block: Int32,
+    n_block: Int32,
+    tile_m: cutlass.Constexpr[int],
+    tile_n: cutlass.Constexpr[int],
+    num_warps_m: cutlass.Constexpr[int],
+    p_keep_uint8: cutlass.Constexpr[int],
+    seed_lo: Uint32,
+    seed_hi: Uint32,
+):
+    """Precompute Philox RNG and compact to keep/drop bitmask.
+
+    Generates all Philox 4x32 outputs, compares against threshold, and
+    packs results as 8 keep-bits per uint32 word. This is the expensive
+    INT32 work that can overlap with FP32 softmax on separate execution
+    units.
+
+    philox_state shape: (mma_m, mma_n_half) — 8 packed keep-bits per word.
+    """
+    tidx = cute.arch.thread_idx()[0]
+    warp_id = tidx / Int32(32)
+    lane_id = tidx % Int32(32)
+
+    p_threshold = Uint32(p_keep_uint8) * Uint32(257)
+    philox_offset = Uint32((batch_idx * nheads + head_idx) * Int32(32) + lane_id)
+
+    divided = cute.logical_divide(acc_S, (None, None, 2))
+    mma_m = cute.size(divided.shape[1])
+    mma_n_half = cute.size(divided.shape[2][1])
+
+    block_row_base = m_block * Int32(tile_m // 16) + warp_id
+    block_col_base = n_block * Int32(tile_n // 32)
+
+    for m in cutlass.range_constexpr(mma_m):
+        block_row = block_row_base + Int32(m) * Int32(num_warps_m)
+        for n_half in cutlass.range_constexpr(mma_n_half):
+            block_col = block_col_base + Int32(n_half)
+            r0, r1, r2, r3 = philox_4x32(
+                philox_offset, Uint32(0),
+                Uint32(block_row), Uint32(block_col),
+                seed_lo, seed_hi,
+            )
+            # Pack 8 keep/drop decisions into bits 0-7 of one uint32.
+            bits = Uint32(0)
+            for j in cutlass.range_constexpr(2):
+                for reg in cutlass.range_constexpr(4):
+                    u16_idx = j * 4 + reg
+                    rand_u16 = _extract_u16(r0, r1, r2, r3, u16_idx)
+                    bits = bits | (Uint32(rand_u16 <= p_threshold) << Uint32(u16_idx))
+            philox_state[m, n_half] = bits
+
+
+@cute.jit
+def apply_dropout_from_state(
+    acc_S: cute.Tensor,
+    philox_state: cute.Tensor,
+    p_keep_uint8: cutlass.Constexpr[int],
+    rp_dropout: Float32,
+):
+    """Apply dropout mask from precomputed bitmask.
+
+    Only does bit extraction + multiply — no Philox RNG work.
+    """
+    divided = cute.logical_divide(acc_S, (None, None, 2))
+    mma_m = cute.size(divided.shape[1])
+    mma_n_half = cute.size(divided.shape[2][1])
+
+    for m in cutlass.range_constexpr(mma_m):
+        for n_half in cutlass.range_constexpr(mma_n_half):
+            bits = philox_state[m, n_half]
+            for j in cutlass.range_constexpr(2):
+                for reg in cutlass.range_constexpr(4):
+                    bit_idx = j * 4 + reg
+                    keep_f = Float32((bits >> Uint32(bit_idx)) & Uint32(1))
+                    divided[reg, m, (j, n_half)] = divided[reg, m, (j, n_half)] * (
+                        rp_dropout * keep_f
+                    )
+
+
+@cute.jit
+def apply_dropout_bwd_fused(
+    acc_S: cute.Tensor,
+    acc_dP: cute.Tensor,
+    tLSErdPsum: cute.Tensor,
+    batch_idx: Int32,
+    head_idx: Int32,
+    nheads: Int32,
+    m_block: Int32,
+    n_block: Int32,
+    tile_m: cutlass.Constexpr[int],
+    tile_n: cutlass.Constexpr[int],
+    num_warps_m: cutlass.Constexpr[int],
+    p_keep_uint8: cutlass.Constexpr[int],
+    rp_dropout: Float32,
+    seed_lo: Uint32,
+    seed_hi: Uint32,
+):
+    """Fused backward dropout: generates mask, computes dS and P_drop in one pass.
+
+    Eliminates the separate acc_P register copy needed by the two-pass approach.
+
+    Uses the identity:
+        dS = P_drop * dP - P * D = P * (keep * rp * dP - D)
+
+    D (per-row softmax correction) is accessed via the MMA register-to-row
+    mapping: reg 0,1 share one M-row, reg 2,3 share the next, giving
+    D_index = m * 2 + reg // 2 for the SM80 m16n8k16 accumulator layout.
+
+    On entry:  acc_S = P (softmax output), acc_dP = dP (dO @ V^T)
+    On exit:   acc_S = P_drop,             acc_dP = dS
+    """
+    tidx = cute.arch.thread_idx()[0]
+    warp_id = tidx / Int32(32)
+    lane_id = tidx % Int32(32)
+
+    p_threshold = Uint32(p_keep_uint8) * Uint32(257)
+    philox_offset = Uint32((batch_idx * nheads + head_idx) * Int32(32) + lane_id)
+
+    divided_S = cute.logical_divide(acc_S, (None, None, 2))
+    divided_dP = cute.logical_divide(acc_dP, (None, None, 2))
+
+    mma_m = cute.size(divided_S.shape[1])
+    mma_n_half = cute.size(divided_S.shape[2][1])
+
+    block_row_base = m_block * Int32(tile_m // 16) + warp_id
+    block_col_base = n_block * Int32(tile_n // 32)
+
+    for m in cutlass.range_constexpr(mma_m):
+        block_row = block_row_base + Int32(m) * Int32(num_warps_m)
+
+        for n_half in cutlass.range_constexpr(mma_n_half):
+            block_col = block_col_base + Int32(n_half)
+
+            r0, r1, r2, r3 = philox_4x32(
+                philox_offset,
+                Uint32(0),
+                Uint32(block_row),
+                Uint32(block_col),
+                seed_lo,
+                seed_hi,
+            )
+
+            for j in cutlass.range_constexpr(2):
+                for reg in cutlass.range_constexpr(4):
+                    u16_idx = j * 4 + reg
+                    rand_u16 = _extract_u16(r0, r1, r2, r3, u16_idx)
+                    keep_rp = rp_dropout * Float32(Uint32(rand_u16 <= p_threshold))
+
+                    P_val = divided_S[reg, m, (j, n_half)]
+                    dP_val = divided_dP[reg, m, (j, n_half)]
+                    D_val = tLSErdPsum[m * 2 + reg // 2]
+
+                    # P_drop = P * keep * rp (for dV GEMM)
+                    divided_S[reg, m, (j, n_half)] = P_val * keep_rp
+                    # dS = P * (keep*rp*dP - D)
+                    divided_dP[reg, m, (j, n_half)] = P_val * (keep_rp * dP_val - D_val)
+
+
+@cute.jit
 def apply_dropout_mask_sm100(
     acc_S: cute.Tensor,
     tScS_t2r: cute.Tensor,

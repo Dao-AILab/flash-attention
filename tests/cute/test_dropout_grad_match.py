@@ -210,21 +210,27 @@ def test_dropout_varlen():
     seed = 42
     p = 0.2
     out1, _ = flash_attn_varlen_func(
-        q, k, v, cu_seqlens, cu_seqlens, max(seqlens), max(seqlens),
+        q, k, v,
+        cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
+        max_seqlen_q=max(seqlens), max_seqlen_k=max(seqlens),
         dropout_p=p, dropout_seed=seed,
     )
     dq1, dk1, dv1 = torch.autograd.grad(out1, (q, k, v), torch.randn_like(out1))
 
     # Determinism
     out2, _ = flash_attn_varlen_func(
-        q, k, v, cu_seqlens, cu_seqlens, max(seqlens), max(seqlens),
+        q, k, v,
+        cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
+        max_seqlen_q=max(seqlens), max_seqlen_k=max(seqlens),
         dropout_p=p, dropout_seed=seed,
     )
     assert torch.equal(out1, out2), "Varlen dropout not deterministic"
 
     # p=0 baseline
     out_base, _ = flash_attn_varlen_func(
-        q, k, v, cu_seqlens, cu_seqlens, max(seqlens), max(seqlens),
+        q, k, v,
+        cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
+        max_seqlen_q=max(seqlens), max_seqlen_k=max(seqlens),
     )
     assert not torch.equal(out1, out_base), "Dropout had no effect on varlen"
 

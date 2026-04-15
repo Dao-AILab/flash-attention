@@ -497,12 +497,15 @@ def _flash_attn_fwd(
     fwd_cfg = FwdConfig(128, 128, True, True)  # default
     if tile_mn is None:
         if arch // 10 == 12:
-            # SM120 tile sizes tuned for 99 KB SMEM capacity:
-            # D<=64:  128x128 → 48 KB (good occupancy)
-            # D>64:   128x64  → 64 KB (128x128 would use 96 KB, hurting occupancy)
+            # SM120 tile sizes tuned for 99 KB SMEM capacity.
+            # Dropout Philox PRNG causes register spilling at 128x128
+            # non-causal. Split precompute/apply enables INT32/FP32
+            # overlap; 128x64 avoids the spilling.
             if dropout_p > 0.0:
-                # Match backward tile (64x64) for MMA-layout dropout mask consistency
-                fwd_cfg = FwdConfig(64, 64, True, True)
+                if head_dim <= 64:
+                    fwd_cfg = FwdConfig(128, 64, True, True)
+                else:
+                    fwd_cfg = FwdConfig(64, 64, True, True)
             elif head_dim <= 64:
                 fwd_cfg = FwdConfig(128, 128, True, True)
             else:
