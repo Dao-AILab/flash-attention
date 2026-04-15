@@ -355,8 +355,47 @@ def generate_mask_mma_layout(B, H, Sq, Sk, p_dropout, seed,
     return mask
 
 
+def generate_mask_per_element(B, H, Sq, Sk, p_dropout, seed):
+    """Generate dropout mask matching per-element position-keyed Philox.
+
+    Used by SM90 (WGMMA) and SM100 (TMEM) kernels which key Philox on
+    global (row, col) coordinates rather than MMA register positions.
+
+    Keying: counter = (batch*nheads+head, 0, global_row, global_col)
+            key = (seed_lo, seed_hi)
+            keep = (pr0 & 0xFF) <= p_keep_uint8
+    """
+    seed_lo = seed & MASK32
+    seed_hi = (seed >> 32) & MASK32
+    threshold = int(255 * (1.0 - p_dropout))
+
+    mask = torch.ones(B, H, Sq, Sk, dtype=torch.bool)
+    for b in range(B):
+        for h in range(H):
+            rng_key_lo = (b * H + h) & MASK32
+            for row in range(Sq):
+                for col in range(Sk):
+                    r0, _, _, _ = philox_py(rng_key_lo, 0, row, col, seed_lo, seed_hi)
+                    rand_byte = r0 & 0xFF
+                    mask[b, h, row, col] = rand_byte <= threshold
+    return mask
+
+
+def _get_python_mask(B, H, Sq, Sk, p_dropout, seed):
+    """Return the correct Python Philox mask for the current architecture.
+
+    SM80/SM120 (warp-level MMA): MMA-layout keying via register positions.
+    SM90/SM100/SM110 (WGMMA/TMEM): per-element position keying.
+    """
+    major, _ = torch.cuda.get_device_capability()
+    if major == 12 or major == 8:
+        return generate_mask_mma_layout(B, H, Sq, Sk, p_dropout, seed)
+    else:
+        return generate_mask_per_element(B, H, Sq, Sk, p_dropout, seed)
+
+
 def test_mask_matches_python_philox():
-    """Verify kernel dropout mask matches independent MMA-layout Python Philox."""
+    """Verify kernel dropout mask matches independent Python Philox reference."""
     from flash_attn.cute.interface import flash_attn_func
 
     B, S, H, D = 1, 64, 1, 64
@@ -366,15 +405,15 @@ def test_mask_matches_python_philox():
     k = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
 
     kernel_mask = extract_dropout_mask(q, k, p, seed, flash_attn_func)
-    python_mask = generate_mask_mma_layout(B, H, S, S, p, seed).to("cuda")
+    python_mask = _get_python_mask(B, H, S, S, p, seed).to("cuda")
 
     match = (kernel_mask == python_mask).float().mean().item()
-    print(f"Kernel vs MMA-layout Python Philox: {match:.4f}")
+    print(f"Kernel vs Python Philox: {match:.4f}")
     assert match > 0.99, f"Mask agreement {match:.4f} < 0.99"
 
 
 def test_fwd_matches_python_philox_ref():
-    """Forward output matches f32 reference using MMA-layout Python mask."""
+    """Forward output matches f32 reference using Python-generated mask."""
     from flash_attn.cute.interface import flash_attn_func
 
     B, S, H, D = 1, 64, 1, 64
@@ -384,7 +423,7 @@ def test_fwd_matches_python_philox_ref():
     k = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
     v = torch.randn(B, S, H, D, device="cuda", dtype=torch.bfloat16)
 
-    mask = generate_mask_mma_layout(B, H, S, S, p, seed).to("cuda")
+    mask = _get_python_mask(B, H, S, S, p, seed).to("cuda")
     out_ref = attention_dropout_ref(q, k, v, mask, p)
     out_flash, _ = flash_attn_func(q, k, v, dropout_p=p, dropout_seed=seed)
 
