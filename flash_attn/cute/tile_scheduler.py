@@ -402,6 +402,7 @@ class SingleTileLPTScheduler:
         cluster_shape_m: cutlass.Constexpr[int] = 1
         scheduling_mode: cutlass.Constexpr[SchedulingMode] = SchedulingMode.STATIC
         lpt: cutlass.Constexpr[bool] = True
+        use_cluster_idx: cutlass.Constexpr[bool] = True
 
         @staticmethod
         @cute.jit
@@ -445,6 +446,7 @@ class SingleTileLPTScheduler:
                 cluster_shape_m=args.cluster_shape_mn[0],
                 scheduling_mode=scheduling_mode,
                 lpt=args.lpt,
+                use_cluster_idx=args.use_cluster_idx,
             )
 
     def __init__(
@@ -532,12 +534,19 @@ class SingleTileLPTScheduler:
             block_idx = block_idx // self.params.cluster_shape_m
         if const_expr(self.params.lpt):
             # Longest-processing-time-first: reverse block order
-            block_idx = self.params.num_block - 1 - block_idx
+            if const_expr(self.params.cluster_shape_m > 1 and not self.params.use_cluster_idx):
+                num_block = self.params.num_block // self.params.cluster_shape_m
+            else:
+                num_block = self.params.num_block
+            block_idx = num_block - 1 - block_idx
         split_idx = Int32(0)
         if const_expr(self.params.is_split_kv):
             batch_idx, split_idx = divmod(work.tile_idx[2], self.params.num_splits_divmod)
         else:
             batch_idx = work.tile_idx[2]
+        if const_expr(self.params.cluster_shape_m > 1 and not self.params.use_cluster_idx):
+            bidx_in_cluster = cute.arch.block_in_cluster_idx()
+            block_idx = block_idx * self.params.cluster_shape_m + bidx_in_cluster[0]
         return WorkTileInfo(
             (Int32(block_idx), Int32(work.tile_idx[1]), Int32(batch_idx), Int32(split_idx)),
             work.is_valid_tile,

@@ -10,6 +10,7 @@ repos:
             flash_bwd|
             flash_fwd|
             flash_fwd_sm100|
+            flash_fwd_mla_sm100|
             interface|
           )\.py$
       - id: ruff-format

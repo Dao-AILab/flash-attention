@@ -5,7 +5,7 @@ from dataclasses import dataclass
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int32, Uint32, const_expr
+from cutlass import Float32, Int32, Uint32, const_expr, Boolean
 
 from quack import layout_utils
 import flash_attn.cute.utils as utils
@@ -384,6 +384,8 @@ class AttentionMask:
         fastdiv_mods=(None, None),
         head_divmod=None,
         check_q_boundary: bool = False,
+        r2p: bool = True,
+        rBitmask: Optional[cute.Tensor] = None,
     ) -> None:
         assert not (mask_causal and mask_local), "mask_causal and mask_local cannot be both True"
         acc_shape = (self.tile_m, self.tile_n)
@@ -397,8 +399,18 @@ class AttentionMask:
         if n_block < 0:
             n_block = 0
         seqlenk_col_limit = self.seqlen_k - n_block * self.tile_n
-        r2p = True
-        if const_expr(not mask_causal and not mask_local and mask_mod is None):
+
+        if const_expr(rBitmask is not None):
+            ncol_packed = const_expr(cute.size(rBitmask.shape[0]))
+            for i in cutlass.range_constexpr(ncol_packed):
+                col_start = 32 * i  # mask is bit-packed into uint32
+                curr_mask_val = rBitmask[i]
+                for j in cutlass.range_constexpr(32):
+                    curr_col = col_start + j
+                    mask = (curr_mask_val >> j) & 1
+                    acc_S[curr_col] = acc_S[curr_col] if Boolean(mask) else -Float32.inf
+
+        elif const_expr(not mask_causal and not mask_local and mask_mod is None):
             if const_expr(mask_seqlen):
                 if const_expr(not r2p):
                     for i in cutlass.range(cute.size(tScS_t2r.shape), unroll_full=True):

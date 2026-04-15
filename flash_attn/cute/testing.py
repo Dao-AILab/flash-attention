@@ -91,20 +91,23 @@ def pad_input(hidden_states, indices, batch, seqlen):
     return rearrange(output, "(b s) ... -> b s ...", b=batch)
 
 
-def generate_random_padding_mask(max_seqlen, batch_size, device, mode="random", zero_lengths=False):
+def generate_random_padding_mask(
+    max_seqlen, batch_size, device, mode="random", zero_lengths=False, min_seqlen=None
+):
     assert mode in ["full", "random", "third"]
+    min_seqlen = min_seqlen if min_seqlen is not None else 0 if zero_lengths else 1
     if mode == "full":
         lengths = torch.full((batch_size, 1), max_seqlen, device=device, dtype=torch.int32)
     elif mode == "random":
         lengths = torch.randint(
-            max(0 if zero_lengths else 1, max_seqlen - 20),
+            max(min_seqlen, max_seqlen - 20),
             max_seqlen + 1,
             (batch_size, 1),
             device=device,
         )
     else:
         lengths = torch.randint(
-            max(0 if zero_lengths else 1, max_seqlen // 3),
+            max(min_seqlen, max_seqlen // 3),
             max_seqlen + 1,
             (batch_size, 1),
             device=device,
@@ -343,6 +346,8 @@ def attention_ref(
     upcast=True,
     reorder_ops=False,
     intermediate_dtype=None,
+    return_lse=False,
+    gather_kv_indices=None,
 ):
     if causal:
         window_size = (window_size[0], 0)
@@ -399,10 +404,21 @@ def attention_ref(
         local_mask = (
             torch.logical_or(local_mask, chunk_mask) if local_mask is not None else chunk_mask
         )
+    if gather_kv_indices is not None:
+        batch = q.shape[0]
+        topk_len = gather_kv_indices.shape[2]
+        if topk_len < seqlen_k:
+            topk_index_mask = torch.full(
+                (batch, seqlen_q, seqlen_k), False, device="cuda"
+            ).scatter_(-1, gather_kv_indices, True)
+            scores.masked_fill_(rearrange(~topk_index_mask, "b t s -> b 1 t s"), float("-inf"))
     if local_mask is not None:
         scores.masked_fill_(local_mask, float("-inf"))
     if attn_bias is not None:
         scores = scores + attn_bias
+    # After all masks are applied, before softmax:
+    # scores shape: [b, h, t, s]
+    lse = torch.logsumexp(scores, dim=-1)  # [b, h, t]
     if learnable_sink is None:
         attention = torch.softmax(scores, dim=-1).to(v.dtype)
     else:
@@ -414,6 +430,8 @@ def attention_ref(
         normalizer = unnormalized_scores.sum(dim=-1, keepdim=True) + torch.exp(
             learnable_sink - logits_or_sinks_max
         )
+        # LSE with sink: log(Z) = log(normalizer) + max
+        lse = (torch.log(normalizer.squeeze(-1)) + logits_or_sinks_max.squeeze(-1)).to(dtype_og)
         attention = (unnormalized_scores / normalizer).to(v.dtype)
     if query_padding_mask is not None:
         attention = attention.masked_fill(rearrange(~query_padding_mask, "b s -> b 1 s 1"), 0.0)
@@ -431,6 +449,8 @@ def attention_ref(
     output = torch.einsum("bhts,bshd->bthd", attention_drop, v * dropout_scaling)
     if query_padding_mask is not None:
         output.masked_fill_(rearrange(~query_padding_mask, "b s -> b s 1 1"), 0.0)
+    if return_lse:
+        return output.to(dtype_og), attention.to(dtype_og), lse.to(dtype_og)
     return output.to(dtype=dtype_og), attention.to(dtype=dtype_og)
 
 
