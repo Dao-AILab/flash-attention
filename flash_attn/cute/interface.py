@@ -1766,7 +1766,7 @@ class FlashAttnFunc(torch.autograd.Function):
             deterministic=ctx.deterministic,
             dlse=dlse,
         )
-        return dq, dk, dv, *((None,) * 20)  # Extra Nones is fine
+        return dq, dk, dv, *((None,) * 30)  # Extra Nones is fine
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -1866,7 +1866,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             dlse=dlse,
         )
 
-        return dq, dk, dv, *((None,) * 20)
+        return dq, dk, dv, *((None,) * 30)
 
 
 def flash_attn_func(
