@@ -65,6 +65,7 @@ class FlashAttentionMLAForwardSm100:
         hdimv: int = 512,
         is_varlen_q: bool = False,
         disable_bitmask: bool = False,
+        use_clc_scheduler: bool = True,
     ):
         self.is_causal = is_causal
         self.is_local = False
@@ -80,12 +81,13 @@ class FlashAttentionMLAForwardSm100:
         if is_topk_gather:
             assert pack_gqa
             assert qhead_per_kvhead == 128, "require MQA 128 for DSA path"
+            assert use_cpasync_load_KV
         # user-provided option if topk indices guaranteed in bounds
         self.disable_bitmask = disable_bitmask
         
         # ==== tile scheduler ====
         self.is_persistent = False
-        self.use_clc_scheduler = is_topk_gather and not is_varlen_q
+        self.use_clc_scheduler = use_clc_scheduler and not is_varlen_q
         self.sched_stages = 1
         self.scheduling_mode = SchedulingMode.CLC if self.use_clc_scheduler else SchedulingMode.STATIC
 
@@ -115,6 +117,8 @@ class FlashAttentionMLAForwardSm100:
             + self.num_relay_threads
             + self.num_cpasync_load_threads
         )
+        self.num_warps = self.num_threads // 32
+        assert self.num_warps == 12 or self.num_warps == 16
         self.softmax_warp_indices = (0, 1, 2, 3,)
         self.epilogue_warp_indices = (4, 5, 6, 7,)
         self.load_warp_id = 8
@@ -130,14 +134,25 @@ class FlashAttentionMLAForwardSm100:
         self.cpasync_load_warp_indices = (12, 13, 14, 15,)
 
         # ==== register usage ====
-        self.num_regs_load = 80
-        self.num_regs_mma = 80
-        self.num_regs_softmax = 208
-        self.num_regs_epilogue = 128
-        self.num_regs_cpasync = 96
-        self.num_regs_other = 48
+        if self.num_warps == 16:
+            self.num_regs_load = 80
+            self.num_regs_mma = 80
+            self.num_regs_softmax = 208
+            self.num_regs_epilogue = 128
+            self.num_regs_cpasync = 96 if self.use_cpasync_load_KV else 0
+            self.num_regs_other = 48
+        else:
+            self.num_regs_load = 168 - 40
+            self.num_regs_mma = 168 - 40
+            self.num_regs_softmax = 168 + 80
+            self.num_regs_epilogue = 168 - 40
+            self.num_regs_cpasync = 0
+            self.num_regs_other = 48
+
+        self.num_regs_per_thread = 168 if self.num_warps == 12 else 128
+        self.num_regs_total = 504 if self.num_warps == 12 else 512
         
-        assert self.num_regs_mma + self.num_regs_softmax + self.num_regs_epilogue + self.num_regs_cpasync <= 512
+        assert self.num_regs_mma + self.num_regs_softmax + self.num_regs_epilogue + self.num_regs_cpasync <= self.num_regs_total
 
         # ==== 2cta info ====
         self.use_2cta_instrs = True
@@ -557,9 +572,10 @@ class FlashAttentionMLAForwardSm100:
             mSeqUsedQ=mSeqUsedQ,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
             element_size=self.dtype_K.width // 8,
-            is_persistent=self.is_persistent, # todo: persistent
-            lpt=False, # todo: lpt
-            is_split_kv=False, # todo: split_kv
+            is_persistent=self.is_persistent,
+            # lpt=self.is_causal or self.is_local,
+            lpt=False,
+            is_split_kv=False,
             cluster_shape_mn=self.cluster_shape_mn,
             use_cluster_idx=False,
         )
@@ -828,7 +844,7 @@ class FlashAttentionMLAForwardSm100:
         else:
             sO_iterator = sQv0.iterator
             assert cute.cosize(sO_layout) <= cute.cosize(sQvi_layout_staged) * self.num_hdimv_splits
-        sO = cute.make_tensor(cute.recast_ptr(sV0.iterator, sO_layout.inner, self.dtype_O), sO_layout.outer)
+        sO = cute.make_tensor(cute.recast_ptr(sO_iterator, sO_layout.inner, self.dtype_O), sO_layout.outer)
 
         # ==== Get thread MMAs and accumulator fragments ====
         thr_mma_QK = tiled_mma_QK.get_slice(mma_tile_coord_v)
@@ -927,7 +943,7 @@ class FlashAttentionMLAForwardSm100:
 
         if const_expr(self.use_cpasync_load_KV):
             if warp_idx == self.relay_warp_id:
-                if const_expr(self.num_regs_load < 128):
+                if const_expr(self.num_regs_load < self.num_regs_per_thread):
                     cute.arch.setmaxregister_decrease(self.num_regs_load)
                 self.relay(
                     pipeline_K,
@@ -936,6 +952,7 @@ class FlashAttentionMLAForwardSm100:
                     pipeline_K_cpasync,
                     pipeline_V0_cpasync,
                     pipeline_V1_cpasync,
+                    sO_empty_mbar_ptr,
                     topk_length_dynamic,
                     block_info,
                     SeqlenInfoCls,
@@ -943,7 +960,7 @@ class FlashAttentionMLAForwardSm100:
                 )
 
             if warp_idx in self.cpasync_load_warp_indices:
-                if const_expr(self.num_regs_cpasync < 128):
+                if const_expr(self.num_regs_cpasync < self.num_regs_per_thread):
                     cute.arch.setmaxregister_decrease(self.num_regs_cpasync)
                 self.load_cpasync(
                     mIndexTopk,
@@ -973,7 +990,7 @@ class FlashAttentionMLAForwardSm100:
                 )
 
         if warp_idx == self.load_warp_id:
-            if const_expr(self.num_regs_load < 128):
+            if const_expr(self.num_regs_load < self.num_regs_per_thread):
                 cute.arch.setmaxregister_decrease(self.num_regs_load)
             self.load(
                 mQ,
@@ -1017,7 +1034,7 @@ class FlashAttentionMLAForwardSm100:
             )
 
         if warp_idx == self.mma_warp_id:
-            if const_expr(self.num_regs_mma < 128):
+            if const_expr(self.num_regs_mma < self.num_regs_per_thread):
                 cute.arch.setmaxregister_decrease(self.num_regs_mma)
             # ==== Allocate TMEM ====
             tmem.allocate(self.tmem_alloc_cols)
@@ -1046,6 +1063,7 @@ class FlashAttentionMLAForwardSm100:
                 pipeline_P,
                 pipeline_O0,
                 pipeline_O1,
+                sO_empty_mbar_ptr,
                 is_leader_cta,
                 topk_length_dynamic,
                 block_info,
@@ -1075,6 +1093,7 @@ class FlashAttentionMLAForwardSm100:
                 pipeline_P,
                 pipeline_sm_stats,
                 pipeline_bitmask,
+                sO_empty_mbar_ptr,
                 AttentionMaskCls,
                 topk_length_dynamic,
                 block_info,
@@ -1084,9 +1103,9 @@ class FlashAttentionMLAForwardSm100:
             tmem_alloc_barrier.arrive()
 
         if warp_idx in self.epilogue_warp_indices:
-            if const_expr(self.num_regs_epilogue < 128):
+            if const_expr(self.num_regs_epilogue < self.num_regs_per_thread):
                 cute.arch.setmaxregister_decrease(self.num_regs_epilogue)
-            elif const_expr(self.num_regs_epilogue > 128):
+            elif const_expr(self.num_regs_epilogue > self.num_regs_per_thread):
                 cute.arch.setmaxregister_increase(self.num_regs_epilogue)
 
             tmem.wait_for_alloc()
@@ -1156,6 +1175,7 @@ class FlashAttentionMLAForwardSm100:
         pipeline_K_cpasync: pipeline.PipelineAsync,
         pipeline_V0_cpasync: pipeline.PipelineAsync,
         pipeline_V1_cpasync: pipeline.PipelineAsync,
+        sO_empty_mbar_ptr: Optional[cute.Pointer],
         topk_length_dynamic: Optional[Int32],
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
@@ -1823,6 +1843,7 @@ class FlashAttentionMLAForwardSm100:
         pipeline_P: pipeline.PipelineAsync,
         pipeline_O0: pipeline.PipelineAsync,
         pipeline_O1: pipeline.PipelineAsync,
+        sO_empty_mbar_ptr: Optional[cute.Pointer],
         is_leader_cta: Boolean,
         topk_length_dynamic: Optional[Int32],
         block_info: BlockInfo,
@@ -2116,6 +2137,7 @@ class FlashAttentionMLAForwardSm100:
         pipeline_P: pipeline.PipelineAsync,
         pipeline_sm_stats: pipeline.PipelineAsync,
         pipeline_bitmask: Optional[pipeline.PipelineAsync],
+        sO_empty_mbar_ptr: Optional[cute.Pointer],
         AttentionMaskCls: Callable,
         topk_length_dynamic: Optional[Int32],
         block_info: BlockInfo,
@@ -2370,6 +2392,7 @@ class FlashAttentionMLAForwardSm100:
 
         # compute threadwise row_max
         row_max = softmax.compute_row_max_local(tSrS_t2r.load(), is_first)
+        self.softmax_barrier.arrive_and_wait()
 
         # 2-thread reduce row_max through smem
         assert self.cta_tile_m * self.cta_group_size == 128
@@ -3073,16 +3096,25 @@ def benchmark_mla_kernel(
         mQ, mQv, mK, mV, mO, mLSE, softmax_scale,
         mIndexTopk=mIndexTopk,
     )
+    
+    seqlen_k_eff = topk_length if gather_kv else seqlen_k
 
-    if gather_kv:
-        FLOPs = 2 * batch * nheads * seqlen_q * topk_length * (hdim + 2 * hdimv)
-    else:
-        FLOPs = 2 * batch * nheads * seqlen_q * seqlen_k * (hdim + 2 * hdimv)
+    FLOPs = 2 * batch * nheads * seqlen_q * seqlen_k_eff * (hdim + 2 * hdimv)
+    if is_causal and not gather_kv:
+        FLOPs /= 2
 
     TFLOPS = FLOPs / exec_time_in_s / 1e12
 
+    q_bytes = 2 * batch * nheads * seqlen_q * hdim
+    qv_bytes = 2 * batch * nheads * seqlen_q * hdimv
+    k_bytes = 2 * batch * nheads_kv * seqlen_k_eff * hdim
+    v_bytes = 2 * batch * nheads_kv * seqlen_k_eff * hdimv
+    o_bytes = 2 * batch * nheads * seqlen_q * hdimv
+    total_bytes = q_bytes + qv_bytes + k_bytes + v_bytes + o_bytes
+    TBs = total_bytes / exec_time_in_s / 1e12
+
     print(
-        f"batch: {batch}, seqlen_q: {seqlen_q}, seqlen_k: {seqlen_k}, nheads: {nheads}, -> {exec_time_in_s * 1e3:.2f} ms, {TFLOPS:.2f} TFLOPS"
+        f"batch: {batch}, seqlen_q: {seqlen_q}, seqlen_k: {seqlen_k}, nheads: {nheads}, -> {exec_time_in_s * 1e3:.2f} ms, {TFLOPS:.2f} TFLOPS, {TBs:.2f} TBs"
     )
 
 
@@ -3095,7 +3127,7 @@ if __name__ == "__main__":
     topk_length = 2048
     varlen_q = False
     varlen_k = False
-    disable_bitmask = False
+    disable_bitmask = True
     validate = True
 
     if run_test:
@@ -3108,7 +3140,7 @@ if __name__ == "__main__":
         seqlen_q_test_values = [1]
         seqlen_k_test_values = [4096]
         nheads_test_values = [128]
-        batch_test_values = [128]
+        batch_test_values = [4]
         test_configs = [
             (batch, nheads, seqlen_q, seqlen_k,)
             for batch in batch_test_values
@@ -3154,11 +3186,10 @@ if __name__ == "__main__":
             seqlen_k_benchmark_values = [8192*2]
             nheads_benchmark_values = [128]
             batch_benchmark_values = [512]
-            # seqlen_q_benchmark_values = [8192]
-            # seqlen_k_benchmark_values = [8192]
-            # nheads_benchmark_values = [128]
-            # batch_benchmark_values = [4]
-        # batch_benchmark_values = [148]
+        seqlen_q_benchmark_values = [1]
+        seqlen_k_benchmark_values = [8192 * 2]
+        nheads_benchmark_values = [128]
+        batch_benchmark_values = [512]
         benchmark_configs = [ (batch, nheads, seqlen_q, seqlen_k,)
                 for batch in batch_benchmark_values
                 for nheads in nheads_benchmark_values

@@ -1720,7 +1720,6 @@ def test_flash_attn_invalid_head_dim(head_dim):
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 # @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 @pytest.mark.parametrize("mha_type", ["mqa"])
-@pytest.mark.parametrize("has_qv", [True])
 @pytest.mark.parametrize("has_learnable_sink", [False])
 @pytest.mark.parametrize("softcap", [0.0])
 @pytest.mark.parametrize("deterministic", [False])
@@ -1729,6 +1728,7 @@ def test_flash_attn_invalid_head_dim(head_dim):
 @pytest.mark.parametrize("causal", [False, True])
 # @pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("d", [64])
+@pytest.mark.parametrize("nheads", [16, 128])
 @pytest.mark.parametrize("topk_sparsity", [False, True])
 # @pytest.mark.parametrize("topk_sparsity", [True])
 @pytest.mark.parametrize("topk_length", [2048])
@@ -1766,17 +1766,18 @@ def test_flash_attn_mla_absorbed(
     seqlen_q,
     seqlen_k,
     d,
+    nheads,
     causal,
     local_enum,
     softcap,
     deterministic,
-    has_qv,
     has_learnable_sink,
     mha_type,
     dtype,
     topk_sparsity,
     topk_length,
 ):
+    has_qv = True
     if not IS_SM100:
         pytest.skip()
     if topk_sparsity and seqlen_k < topk_length:
@@ -1784,8 +1785,10 @@ def test_flash_attn_mla_absorbed(
     local = local_enum > 0
     if local and causal:
         pytest.skip()
-    if has_qv and local:
-        pytest.xfail("has_qv: local not supported yet")
+    if local:
+        pytest.xfail("mla absorbed: local not supported yet")
+    if topk_sparsity and nheads != 128:
+        pytest.skip()
     device = "cuda"
     # set seed
     seed = 0
@@ -1936,7 +1939,6 @@ def test_flash_attn_mla_absorbed(
                 pack_gqa=pack_gqa,
                 num_splits=num_splits,
                 deterministic=deterministic,
-                topk_indices_maybe_oob=causal,
             )
             if is_fake_mode():
                 # no more flash_attn cutedsl calls for the rest of the loop
@@ -1954,23 +1956,47 @@ def test_flash_attn_mla_absorbed(
                 out_pt - out_ref
             ).abs().max().item() + fwd_atol
 
+            repeats = 1000
+            for iter in range(repeats):
+                out2, lse2 = flash_attn_func(
+                    q,
+                    k,
+                    v,
+                    qv=qv,
+                    topk_indices=topk_indices,
+                    causal=causal,
+                    # q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
+                    window_size=window_size,
+                    # attention_chunk=attention_chunk,
+                    softcap=softcap,
+                    learnable_sink=learnable_sink,
+                    pack_gqa=pack_gqa,
+                    num_splits=num_splits,
+                    deterministic=deterministic,
+                )
+                # print(f"out max: {out.abs().max().item()}, {iter=}")
+                # print(f"out vs out2 max diff: {(out - out2).abs().max().item()}, {iter=}")
+                # print(f"out vs out2 mean diff: {(out - out2).abs().mean().item()}, {iter=}")
+                assert torch.equal(out, out2), f"non-deterministic with max diff = {(out - out2).abs().max().item()} on {iter=}"
+
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 # @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 @pytest.mark.parametrize("mha_type", ["mqa"])
 @pytest.mark.parametrize("has_learnable_sink", [False])
-@pytest.mark.parametrize("has_qv", [True])
 @pytest.mark.parametrize("deterministic", [False])
 @pytest.mark.parametrize("softcap", [0.0])
 @pytest.mark.parametrize("local_enum", [0])
 @pytest.mark.parametrize("causal", [False, True])
-# @pytest.mark.parametrize("causal", [True])
+# @pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("add_unused_qkv", [False])
 @pytest.mark.parametrize("topk_sparsity", [False, True])
-# @pytest.mark.parametrize("topk_sparsity", [True])
+# @pytest.mark.parametrize("topk_sparsity", [False])
 @pytest.mark.parametrize("topk_length", [2048])
 @pytest.mark.parametrize("d", [64])
+@pytest.mark.parametrize("nheads", [16, 128])
+# @pytest.mark.parametrize("nheads", [128])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -1997,7 +2023,7 @@ def test_flash_attn_mla_absorbed(
     ],
 )
 @pytest.mark.parametrize("varlen_mode", ["random", "full"])
-# @pytest.mark.parametrize("varlen_mode", ["full"])
+# @pytest.mark.parametrize("varlen_mode", ["random"])
 @pytest.mark.parametrize(
     "zero_lengths_q, zero_lengths_k",
     [
@@ -2019,12 +2045,12 @@ def test_flash_attn_mla_absorbed_varlen(
     seqlen_q,
     seqlen_k,
     d,
+    nheads,
     add_unused_qkv,
     causal,
     local_enum,
     softcap,
     deterministic,
-    has_qv,
     has_learnable_sink,
     mha_type,
     dtype,
@@ -2036,6 +2062,7 @@ def test_flash_attn_mla_absorbed_varlen(
     topk_sparsity,
     topk_length,
 ):
+    has_qv = True
     if not IS_SM100:
         pytest.skip()
     if topk_sparsity and seqlen_k < topk_length:
@@ -2045,6 +2072,8 @@ def test_flash_attn_mla_absorbed_varlen(
         pytest.skip()
     if has_qv and local:
         pytest.xfail("has_qv: local not supported yet")
+    if topk_sparsity and nheads != 128:
+        pytest.skip()
     seqlen_q_og = seqlen_q
     seqlen_k_og = seqlen_k
     if (
@@ -2058,7 +2087,6 @@ def test_flash_attn_mla_absorbed_varlen(
     random.seed(seed)
     torch.random.manual_seed(seed)
     batch_size = 7 if seqlen_q <= 512 else 3
-    nheads = 128
     nheads_kv = nheads if mha_type == "mha" else (8 if mha_type == "gqa" else 1)
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
     dv_vals = [512]
@@ -2279,6 +2307,7 @@ def test_flash_attn_mla_absorbed_varlen(
                 cu_seqlens_k=cu_seqlens_k if unpad_kv else None,
                 max_seqlen_q=seqlen_q,
                 max_seqlen_k=seqlen_k,
+                min_seqlen_k=topk_length if topk_sparsity else None,
                 seqused_q=seqused_q if not unpad_q else None,
                 seqused_k=seqused_k if not unpad_kv else None,
                 causal=causal,
@@ -2289,7 +2318,6 @@ def test_flash_attn_mla_absorbed_varlen(
                 pack_gqa=pack_gqa,
                 deterministic=deterministic,
                 topk_indices=topk_indices_unpad if unpad_q else topk_indices,
-                topk_indices_maybe_oob=causal,
             )
             out = output_pad_fn(out_unpad) if unpad_q else out_unpad
             if is_fake_mode():
@@ -2319,3 +2347,41 @@ def test_flash_attn_mla_absorbed_varlen(
             assert (out_cmp - out_ref_cmp).abs().max().item() <= rtol * (
                 out_pt_cmp - out_ref_cmp
             ).abs().max().item() + fwd_atol
+
+            repeats = 1000
+            for iter in range(repeats):
+                out_unpad2, lse = flash_attn_varlen_func(
+                    q_unpad if unpad_q else q,
+                    k_unpad if unpad_kv else k,
+                    v_unpad if unpad_kv else v,
+                    qv_unpad if unpad_q else qv,
+                    cu_seqlens_q=cu_seqlens_q if unpad_q else None,
+                    cu_seqlens_k=cu_seqlens_k if unpad_kv else None,
+                    max_seqlen_q=seqlen_q,
+                    max_seqlen_k=seqlen_k,
+                    min_seqlen_k=topk_length if topk_sparsity else None,
+                    seqused_q=seqused_q if not unpad_q else None,
+                    seqused_k=seqused_k if not unpad_kv else None,
+                    causal=causal,
+                    window_size=window_size,
+                    learnable_sink=learnable_sink,
+                    softcap=softcap,
+                    num_splits=num_splits,
+                    pack_gqa=pack_gqa,
+                    deterministic=deterministic,
+                    topk_indices=topk_indices_unpad if unpad_q else topk_indices,
+                )
+                out2 = output_pad_fn(out_unpad2) if unpad_q else out_unpad2
+                if query_unused_mask is not None:
+                    out2.masked_fill_(q_zero_masking, 0.0)
+                # When unpad_q=False with seqused_q, the kernel doesn't write positions
+                # beyond seqused_q, so those contain uninitialized values. Mask them out
+                # before comparing.
+                if not unpad_q and seqused_q is not None:
+                    seqused_mask = torch.arange(seqlen_q, device=device)[None, :] < seqused_q[:, None]
+                    seqused_mask = rearrange(seqused_mask, "b s -> b s 1 1")
+                    out2.masked_fill_(~seqused_mask, 0.0)
+                # print(f"out2 max: {out2.abs().max().item()}, {iter=}")
+                # print(f"out vs out2 max diff: {(out_cmp - out2).abs().max().item()}, {iter=}")
+                # print(f"out vs out2 mean diff: {(out_cmp - out2).abs().mean().item()}, {iter=}")
+                assert torch.equal(out_cmp, out2), f"non-deterministic with max diff = {(out_cmp - out2).abs().max().item()} on {iter=}"

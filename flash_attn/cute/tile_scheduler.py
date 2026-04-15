@@ -534,7 +534,11 @@ class SingleTileLPTScheduler:
             block_idx = block_idx // self.params.cluster_shape_m
         if const_expr(self.params.lpt):
             # Longest-processing-time-first: reverse block order
-            block_idx = self.params.num_block - 1 - block_idx
+            if const_expr(self.params.cluster_shape_m > 1 and not self.params.use_cluster_idx):
+                num_block = self.params.num_block // self.params.cluster_shape_m
+            else:
+                num_block = self.params.num_block
+            block_idx = num_block - 1 - block_idx
         split_idx = Int32(0)
         if const_expr(self.params.is_split_kv):
             batch_idx, split_idx = divmod(work.tile_idx[2], self.params.num_splits_divmod)
