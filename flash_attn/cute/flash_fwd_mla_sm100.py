@@ -2915,10 +2915,10 @@ def test_mla_kernel(
             topk_b = None
 
         O_b,    _, lse_b    = attention_ref(Q_b, K_b, V_b, qv=Qv_b, causal=is_causal,
-                                             return_lse=True, topk_indices=topk_b)
+                                             return_lse=True, gather_kv_indices=topk_b)
         O_pt_b, _, lse_pt_b = attention_ref(Q_b, K_b, V_b, qv=Qv_b, causal=is_causal,
                                              upcast=False, reorder_ops=True,
-                                             return_lse=True, topk_indices=topk_b)
+                                             return_lse=True, gather_kv_indices=topk_b)
         O_ref_list.append(O_b.squeeze(0))
         O_pt_list.append(O_pt_b.squeeze(0))
         lse_ref_list.append(lse_b.squeeze(0))
@@ -3121,8 +3121,8 @@ def benchmark_mla_kernel(
 if __name__ == "__main__":
     run_test = True
     run_benchmark = True
-    gather_kv = True
-    is_causal = False
+    gather_kv = False
+    is_causal = True
     pack_gqa = True
     topk_length = 2048
     varlen_q = False
@@ -3186,10 +3186,10 @@ if __name__ == "__main__":
             seqlen_k_benchmark_values = [8192*2]
             nheads_benchmark_values = [128]
             batch_benchmark_values = [512]
-        seqlen_q_benchmark_values = [1]
-        seqlen_k_benchmark_values = [8192 * 2]
-        nheads_benchmark_values = [128]
-        batch_benchmark_values = [512]
+        seqlen_q_benchmark_values = [4096]
+        seqlen_k_benchmark_values = [4096]
+        nheads_benchmark_values = [16]
+        batch_benchmark_values = [8]
         benchmark_configs = [ (batch, nheads, seqlen_q, seqlen_k,)
                 for batch in batch_benchmark_values
                 for nheads in nheads_benchmark_values

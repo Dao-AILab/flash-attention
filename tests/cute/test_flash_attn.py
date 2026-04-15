@@ -1729,9 +1729,9 @@ def test_flash_attn_invalid_head_dim(head_dim):
 # @pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("d", [64])
 @pytest.mark.parametrize("nheads", [16, 128])
-@pytest.mark.parametrize("topk_sparsity", [False, True])
-# @pytest.mark.parametrize("topk_sparsity", [True])
-@pytest.mark.parametrize("topk_length", [2048])
+@pytest.mark.parametrize("kv_sparsity", [False, True])
+# @pytest.mark.parametrize("kv_sparsity", [True])
+@pytest.mark.parametrize("gather_kv_length", [2048])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -1774,20 +1774,20 @@ def test_flash_attn_mla_absorbed(
     has_learnable_sink,
     mha_type,
     dtype,
-    topk_sparsity,
-    topk_length,
+    kv_sparsity,
+    gather_kv_length,
 ):
     has_qv = True
     if not IS_SM100:
         pytest.skip()
-    if topk_sparsity and seqlen_k < topk_length:
-        seqlen_k += topk_length
+    if kv_sparsity and seqlen_k < gather_kv_length:
+        seqlen_k += gather_kv_length
     local = local_enum > 0
     if local and causal:
         pytest.skip()
     if local:
         pytest.xfail("mla absorbed: local not supported yet")
-    if topk_sparsity and nheads != 128:
+    if kv_sparsity and nheads != 128:
         pytest.skip()
     device = "cuda"
     # set seed
@@ -1838,10 +1838,10 @@ def test_flash_attn_mla_absorbed(
             )
         else:
             qv_ref = None
-        if topk_sparsity:
-            topk_indices = torch.rand(batch_size, seqlen_q, topk_length, device=device).argsort(dim=-1).to(torch.int32)
+        if kv_sparsity:
+            gather_kv_indices = torch.rand(batch_size, seqlen_q, gather_kv_length, device=device).argsort(dim=-1).to(torch.int32)
         else:
-            topk_indices = None
+            gather_kv_indices = None
         # Put window_size after QKV randn so that window_size changes from test to test
         window_size = (
             (None, None) if not local else tuple(random.randrange(0, seqlen_k) for _ in range(2))
@@ -1882,7 +1882,7 @@ def test_flash_attn_mla_absorbed(
             attention_chunk=attention_chunk,
             learnable_sink=learnable_sink,
             softcap=softcap,
-            topk_indices=topk_indices,
+            gather_kv_indices=gather_kv_indices,
         )
         out_pt, attn_pt = attention_ref(
             q_ref,
@@ -1902,7 +1902,7 @@ def test_flash_attn_mla_absorbed(
             upcast=False,
             reorder_ops=True,
             intermediate_dtype=dtype if dtype == torch.float8_e4m3fn else None,
-            topk_indices=topk_indices,
+            gather_kv_indices=gather_kv_indices,
         )
 
         # k_extended = repeat(k_ref, "b s h d -> b s (h k) d", k=nheads // nheads_kv)
@@ -1929,7 +1929,7 @@ def test_flash_attn_mla_absorbed(
                 k,
                 v,
                 qv=qv,
-                topk_indices=topk_indices,
+                gather_kv_indices=gather_kv_indices,
                 causal=causal,
                 # q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
                 window_size=window_size,
@@ -1963,7 +1963,7 @@ def test_flash_attn_mla_absorbed(
                     k,
                     v,
                     qv=qv,
-                    topk_indices=topk_indices,
+                    gather_kv_indices=gather_kv_indices,
                     causal=causal,
                     # q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
                     window_size=window_size,
@@ -1991,9 +1991,9 @@ def test_flash_attn_mla_absorbed(
 @pytest.mark.parametrize("causal", [False, True])
 # @pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("add_unused_qkv", [False])
-@pytest.mark.parametrize("topk_sparsity", [False, True])
-# @pytest.mark.parametrize("topk_sparsity", [False])
-@pytest.mark.parametrize("topk_length", [2048])
+@pytest.mark.parametrize("kv_sparsity", [False, True])
+# @pytest.mark.parametrize("kv_sparsity", [False])
+@pytest.mark.parametrize("gather_kv_length", [2048])
 @pytest.mark.parametrize("d", [64])
 @pytest.mark.parametrize("nheads", [16, 128])
 # @pytest.mark.parametrize("nheads", [128])
@@ -2059,20 +2059,20 @@ def test_flash_attn_mla_absorbed_varlen(
     zero_lengths_k,
     unpad_q,
     unpad_kv,
-    topk_sparsity,
-    topk_length,
+    kv_sparsity,
+    gather_kv_length,
 ):
     has_qv = True
     if not IS_SM100:
         pytest.skip()
-    if topk_sparsity and seqlen_k < topk_length:
-        seqlen_k += topk_length
+    if kv_sparsity and seqlen_k < gather_kv_length:
+        seqlen_k += gather_kv_length
     local = local_enum > 0
     if local and causal:
         pytest.skip()
     if has_qv and local:
         pytest.xfail("has_qv: local not supported yet")
-    if topk_sparsity and nheads != 128:
+    if kv_sparsity and nheads != 128:
         pytest.skip()
     seqlen_q_og = seqlen_q
     seqlen_k_og = seqlen_k
@@ -2126,10 +2126,10 @@ def test_flash_attn_mla_absorbed_varlen(
             )
         else:
             qv_ref = None
-        if topk_sparsity:
-            topk_indices = torch.rand(batch_size, seqlen_q, topk_length, device=device).argsort(dim=-1).to(torch.int32)
+        if kv_sparsity:
+            gather_kv_indices = torch.rand(batch_size, seqlen_q, gather_kv_length, device=device).argsort(dim=-1).to(torch.int32)
         else:
-            topk_indices = None
+            gather_kv_indices = None
             
         # Put window_size after QKV randn so that window_size changes from test to test
         window_size = (
@@ -2168,7 +2168,7 @@ def test_flash_attn_mla_absorbed_varlen(
             device,
             mode=varlen_mode,
             zero_lengths=zero_lengths_k,
-            min_seqlen=topk_length if topk_sparsity else None,
+            min_seqlen=gather_kv_length if kv_sparsity else None,
         )
         def _gen_unused_masks(padding_mask, add_unused, max_seq_len, bs, device):
             if add_unused:
@@ -2223,14 +2223,14 @@ def test_flash_attn_mla_absorbed_varlen(
             query_unused_mask=query_unused_mask,
             key_unused_mask=key_unused_mask,
         )
-        # unpad topk_indices
-        if topk_sparsity:
+        # unpad gather_kv_indices
+        if kv_sparsity:
             _, indices_q, _, _, _ = unpad_input(
                 q, query_padding_mask, query_unused_mask
             )
-            topk_indices_unpad = rearrange(topk_indices, "b s ... -> (b s) ...")[indices_q]
+            gather_kv_indices_unpad = rearrange(gather_kv_indices, "b s ... -> (b s) ...")[indices_q]
         else:
-            topk_indices_unpad = None
+            gather_kv_indices_unpad = None
         if unpad_q:
             print("cu_seqlens_q = ", cu_seqlens_q)
         else:
@@ -2258,7 +2258,7 @@ def test_flash_attn_mla_absorbed_varlen(
             attention_chunk=attention_chunk,
             learnable_sink=learnable_sink,
             softcap=softcap,
-            topk_indices=topk_indices,
+            gather_kv_indices=gather_kv_indices,
         )
         out_pt, attn_pt = attention_ref(
             q_ref,
@@ -2278,7 +2278,7 @@ def test_flash_attn_mla_absorbed_varlen(
             upcast=False,
             reorder_ops=True,
             intermediate_dtype=dtype if dtype == torch.float8_e4m3fn else None,
-            topk_indices=topk_indices,
+            gather_kv_indices=gather_kv_indices,
         )
 
         if not is_fake_mode():
@@ -2307,7 +2307,7 @@ def test_flash_attn_mla_absorbed_varlen(
                 cu_seqlens_k=cu_seqlens_k if unpad_kv else None,
                 max_seqlen_q=seqlen_q,
                 max_seqlen_k=seqlen_k,
-                min_seqlen_k=topk_length if topk_sparsity else None,
+                min_seqlen_k=gather_kv_length if kv_sparsity else None,
                 seqused_q=seqused_q if not unpad_q else None,
                 seqused_k=seqused_k if not unpad_kv else None,
                 causal=causal,
@@ -2317,7 +2317,7 @@ def test_flash_attn_mla_absorbed_varlen(
                 num_splits=num_splits,
                 pack_gqa=pack_gqa,
                 deterministic=deterministic,
-                topk_indices=topk_indices_unpad if unpad_q else topk_indices,
+                gather_kv_indices=gather_kv_indices_unpad if unpad_q else gather_kv_indices,
             )
             out = output_pad_fn(out_unpad) if unpad_q else out_unpad
             if is_fake_mode():
@@ -2359,7 +2359,7 @@ def test_flash_attn_mla_absorbed_varlen(
                     cu_seqlens_k=cu_seqlens_k if unpad_kv else None,
                     max_seqlen_q=seqlen_q,
                     max_seqlen_k=seqlen_k,
-                    min_seqlen_k=topk_length if topk_sparsity else None,
+                    min_seqlen_k=gather_kv_length if kv_sparsity else None,
                     seqused_q=seqused_q if not unpad_q else None,
                     seqused_k=seqused_k if not unpad_kv else None,
                     causal=causal,
@@ -2369,7 +2369,7 @@ def test_flash_attn_mla_absorbed_varlen(
                     num_splits=num_splits,
                     pack_gqa=pack_gqa,
                     deterministic=deterministic,
-                    topk_indices=topk_indices_unpad if unpad_q else topk_indices,
+                    gather_kv_indices=gather_kv_indices_unpad if unpad_q else gather_kv_indices,
                 )
                 out2 = output_pad_fn(out_unpad2) if unpad_q else out_unpad2
                 if query_unused_mask is not None:

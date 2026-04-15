@@ -143,7 +143,7 @@ def setup_fa4(ctx):
     window_size, softcap = ctx["window_size"], ctx["softcap"]
     pack_gqa, deterministic = ctx["pack_gqa"], ctx["deterministic"]
     sinks = ctx["sinks"]
-    topk_indices = ctx.get("topk_indices")
+    gather_kv_indices = ctx.get("gather_kv_indices")
     k_use = ctx.get("k_paged", k) if ctx["page_size"] is not None else k
     v_use = ctx.get("v_paged", v) if ctx["page_size"] is not None else v
     if ctx["varlen"]:
@@ -153,20 +153,20 @@ def setup_fa4(ctx):
         qvu = ctx["qv_unpad"]
         csq, csk = ctx["cu_seqlens_q"], ctx["cu_seqlens_k"]
         pt = ctx["page_table"]
-        topk_indices_unpad = ctx.get("topk_indices_unpad")
-        fwd_fn = lambda: flash_attn_varlen_func_python(qu, ku, vu, qvu, csq, csk, page_table=pt, causal=causal, window_size=window_size, softcap=softcap, pack_gqa=pack_gqa, topk_indices=topk_indices_unpad)
+        gather_kv_indices_unpad = ctx.get("gather_kv_indices_unpad")
+        fwd_fn = lambda: flash_attn_varlen_func_python(qu, ku, vu, qvu, csq, csk, page_table=pt, causal=causal, window_size=window_size, softcap=softcap, pack_gqa=pack_gqa, gather_kv_indices=gather_kv_indices_unpad)
     else:
-        fwd_fn = lambda: flash_attn_func_python(q, k_use, v_use, qv=qv, causal=causal, window_size=window_size, learnable_sink=sinks, softcap=softcap, pack_gqa=pack_gqa, topk_indices=topk_indices)
+        fwd_fn = lambda: flash_attn_func_python(q, k_use, v_use, qv=qv, causal=causal, window_size=window_size, learnable_sink=sinks, softcap=softcap, pack_gqa=pack_gqa, gather_kv_indices=gather_kv_indices)
     bwd_fn = None
     if ctx["has_backward"] and ctx["dtype"] != torch.float8_e4m3fn:
         if ctx["varlen"]:
             qu, ku, vu, gu = ctx["q_unpad"], ctx["k_unpad"], ctx["v_unpad"], ctx["g_unpad"]
             qvu = ctx["qv_unpad"]
             csq, csk = ctx["cu_seqlens_q"], ctx["cu_seqlens_k"]
-            topk_indices_unpad = ctx.get("topk_indices_unpad")
-            bwd_fn = _make_bwd_fn(lambda: flash_attn_varlen_func_python(qu, ku, vu, qvu, csq, csk, causal=causal, softcap=softcap, deterministic=deterministic, topk_indices=topk_indices_unpad), gu, [qu, ku, vu, qvu])
+            gather_kv_indices_unpad = ctx.get("gather_kv_indices_unpad")
+            bwd_fn = _make_bwd_fn(lambda: flash_attn_varlen_func_python(qu, ku, vu, qvu, csq, csk, causal=causal, softcap=softcap, deterministic=deterministic, gather_kv_indices=gather_kv_indices_unpad), gu, [qu, ku, vu, qvu])
         else:
-            bwd_fn = _make_bwd_fn(lambda: flash_attn_func_python(q, k, v, qv=qv, causal=causal, softcap=softcap, deterministic=deterministic, topk_indices=topk_indices), g, [q, k, v, qv])
+            bwd_fn = _make_bwd_fn(lambda: flash_attn_func_python(q, k, v, qv=qv, causal=causal, softcap=softcap, deterministic=deterministic, gather_kv_indices=gather_kv_indices), g, [q, k, v, qv])
     return fwd_fn, bwd_fn
 
 
@@ -319,9 +319,9 @@ def parse_args():
                         help='GQA ratio (nheads // nheads_kv). Ignored if --nheads-kv is set.')
     parser.add_argument('--backend', type=csv_strs, default=['all'],
                         help='Which backends to benchmark, comma-separated (choices: all,standard,fa2,fa3,fa4,cudnn)')
-    parser.add_argument('--topk', type=int, default=None,
-                        help='TopK sparsity length for MLA (hdim=64, hdim_v=512 only). '
-                             'When set, passes random topk_indices to FA4 and uses topk as '
+    parser.add_argument('--gather-kv', type=int, default=None,
+                        help='kv sparsity length for MLA (hdim=64, hdim_v=512 only). '
+                             'When set, passes random kv indices (without repeats) to FA4 and uses gather-kv as '
                              'the effective KV length for flops/bandwidth accounting.')
     parser.add_argument('--warmup', type=int, default=5,
                         help='Warmup iterations (default: 5)')
@@ -371,7 +371,7 @@ def main():
     seqlen_list = args.seqlen
     seqlen_q_list = resolve_seqlen_q_list(seqlen_list, args.seqlen_q)
     varlen = args.varlen
-    topk_length = args.topk
+    gather_kv_length = args.gather_kv
 
     # Filter backends to those requested and available
     enabled = set(args.backend)
@@ -437,22 +437,22 @@ def main():
                 page_table = rearrange(torch.arange(batch_size * seqlen // page_size, device=device, dtype=torch.int32),
                                        "(b s) -> b s", s=seqlen // page_size)
 
-            # TopK sparsity indices — only meaningful for MLA (hdim=64, hdim_v=512)
-            index_topk = index_topk_unpad = None
-            topk_eff = None  # effective KV length for this config
-            if topk_length is not None and has_qv:
-                assert topk_length <= seqlen, f"--topk {topk_length} > seqlen_kv {seqlen}"
-                index_topk = (
-                    torch.rand(batch_size, seqlen_q, topk_length, device=device)
+            # kv sparsity indices — only meaningful for MLA (hdim=64, hdim_v=512)
+            gather_kv_indices = gather_kv_indices_unpad = None
+            gather_kv_eff = None  # effective KV length for this config
+            if gather_kv_length is not None and has_qv:
+                assert gather_kv_length <= seqlen, f"--gather_kv {gather_kv_length} > seqlen_kv {seqlen}"
+                gather_kv_indices = (
+                    torch.rand(batch_size, seqlen_q, gather_kv_length, device=device)
                     .argsort(dim=-1)
                     .to(torch.int32)
                 )
                 if varlen:
-                    index_topk_unpad = rearrange(index_topk, "b s t -> (b s) t")
-                topk_eff = topk_length
+                    gather_kv_indices_unpad = rearrange(gather_kv_indices, "b s t -> (b s) t")
+                gather_kv_eff = gather_kv_length
 
             for causal in causal_vals:
-                cfg = (headdim, headdim_v, causal, seqlen_q, seqlen, batch_size, nheads, nheads_kv, topk_eff)
+                cfg = (headdim, headdim_v, causal, seqlen_q, seqlen, batch_size, nheads, nheads_kv, gather_kv_eff)
 
                 # Build context dict shared by all backends
                 ctx = dict(
@@ -466,21 +466,21 @@ def main():
                     dropout_p=dropout_p, window_size=window_size, window_size_fa=window_size_fa,
                     softcap=softcap, deterministic=deterministic,
                     num_splits=num_splits, pack_gqa=pack_gqa, sinks=sinks,
-                    topk_indices=index_topk, topk_indices_unpad=index_topk_unpad,
+                    gather_kv_indices=gather_kv_indices, gather_kv_indices_unpad=gather_kv_indices_unpad,
                 )
 
                 for display_name, cli_name, setup_fn in active_backends:
                     fwd_fn, bwd_fn = setup_fn(ctx)
                     if fwd_fn is not None and has_forward:
                         time.sleep(1.0)
-                        topk_str = f", topk={topk_eff}" if topk_eff is not None else ""
-                        print(f"Benchmarking {display_name} fwd, hdim={headdim}, seqlen_q={seqlen_q}, seqlen_kv={seqlen}{topk_str}, causal={causal}, {nheads=}, {nheads_kv=}")
+                        gather_kv_str = f", gather_kv={gather_kv_eff}" if gather_kv_eff is not None else ""
+                        print(f"Benchmarking {display_name} fwd, hdim={headdim}, seqlen_q={seqlen_q}, seqlen_kv={seqlen}{gather_kv_str}, causal={causal}, {nheads=}, {nheads_kv=}")
                         ms = do_bench(fwd_fn, warmup=warmup, rep=rep) * 1e-3
                         time_f[cfg, display_name] = ms
                     if bwd_fn is not None and has_backward:
                         time.sleep(1.0)
-                        topk_str = f", topk={topk_eff}" if topk_eff is not None else ""
-                        print(f"Benchmarking {display_name} bwd, hdim={headdim}, seqlen_q={seqlen_q}, seqlen_kv={seqlen}{topk_str}, causal={causal}, {nheads=}, {nheads_kv=}, {deterministic=}")
+                        gather_kv_str = f", gather_kv={gather_kv_eff}" if gather_kv_eff is not None else ""
+                        print(f"Benchmarking {display_name} bwd, hdim={headdim}, seqlen_q={seqlen_q}, seqlen_kv={seqlen}{gather_kv_str}, causal={causal}, {nheads=}, {nheads_kv=}, {deterministic=}")
                         ms = do_bench(bwd_fn, warmup=warmup, rep=rep) * 1e-3
                         time_b[cfg, display_name] = ms
 
@@ -497,7 +497,7 @@ def main():
     # the extra column only when it's actually useful.
     all_cfgs = sorted(set(k[0] for k in list(time_f) + list(time_b)))
     show_seqlen_q_col = any(cfg[3] != cfg[4] for cfg in all_cfgs)  # seqlen_q vs seqlen_kv
-    show_topk_col     = any(cfg[8] is not None for cfg in all_cfgs)
+    show_gather_kv_col     = any(cfg[8] is not None for cfg in all_cfgs)
 
     for direction, times, flops_mult in [("FWD", time_f, 1.0), ("BWD", time_b, 2.5)]:
         if not times:
@@ -512,8 +512,8 @@ def main():
             header += f" {'seqlen_q':>8} {'seqlen_kv':>9}"
         else:
             header += f" {'seqlen':>6}"
-        if show_topk_col:
-            header += f" {'topk':>6}"
+        if show_gather_kv_col:
+            header += f" {'gather_kv':>6}"
         for b in shown_backends:
             header += f" {b:>{col_w}}"
         print(f"\n{'=' * len(header)}")
@@ -523,9 +523,9 @@ def main():
         print("-" * len(header))
 
         for cfg in configs:
-            headdim, headdim_v, causal, seqlen_q, seqlen, batch_size, nheads, nheads_kv, topk_eff = cfg
+            headdim, headdim_v, causal, seqlen_q, seqlen, batch_size, nheads, nheads_kv, gather_kv_eff = cfg
             has_qv = (headdim == 64 and headdim_v == 512)
-            seqlen_k_eff = topk_eff if topk_eff is not None else seqlen
+            seqlen_k_eff = gather_kv_eff if gather_kv_eff is not None else seqlen
             nFLOPS = flops(batch_size, nheads, seqlen_q, seqlen_k_eff, headdim, headdim_v, causal=causal, has_qv=has_qv)
             dtype_bytes = 1 if dtype == torch.float8_e4m3fn else 2
             if direction == "FWD":
@@ -540,8 +540,8 @@ def main():
                 row += f" {seqlen_q:>8} {seqlen:>9}"
             else:
                 row += f" {seqlen:>6}"
-            if show_topk_col:
-                row += f" {str(topk_eff) if topk_eff is not None else '—':>6}"
+            if show_gather_kv_col:
+                row += f" {str(gather_kv_eff) if gather_kv_eff is not None else '—':>6}"
             for b in shown_backends:
                 t = times.get((cfg, b))
                 if t is not None:

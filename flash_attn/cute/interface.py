@@ -329,8 +329,7 @@ def _flash_attn_fwd(
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
     aux_tensors: Optional[list[torch.Tensor]] = None,
-    topk_indices: Optional[torch.Tensor] = None,
-    topk_indices_maybe_oob: Optional[bool] = None,
+    gather_kv_indices: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for FlashAttention.
 
@@ -629,27 +628,23 @@ def _flash_attn_fwd(
         
         qv = maybe_contiguous(qv)
 
-        topk_length = 2048
-        sparse_topk = topk_indices is not None
-        disable_topk_bitmask = False
-        if sparse_topk:
-            assert topk_indices.shape[:-1] == q.shape[:-2]
-            topk_length = topk_indices.shape[-1]
-            assert topk_length % 256 == 0
-            if topk_indices_maybe_oob is False:
-                disable_topk_bitmask = True
-            elif topk_indices_maybe_oob is True:
-                disable_topk_bitmask = False
+        gather_kv_length = 2048
+        sparse_kv = gather_kv_indices is not None
+        disable_sparse_kv_bitmask = False
+        if sparse_kv:
+            assert gather_kv_indices.shape[:-1] == q.shape[:-2]
+            gather_kv_length = gather_kv_indices.shape[-1]
+            assert gather_kv_length % 256 == 0
+            if min_seqlen_k is None or causal:
+                disable_sparse_kv_bitmask = False
             else:
-                if min_seqlen_k is None or causal:
-                    disable_topk_bitmask = False
-                else:
-                    seqlen_k_boundary = min_seqlen_k - max_seqlen_q + 1 if causal else min_seqlen_k
-                    disable_topk_bitmask = seqlen_k_boundary >= topk_length
+                # seqlen_k_boundary = min_seqlen_k - max_seqlen_q + 1 if causal else min_seqlen_k
+                seqlen_k_boundary = min_seqlen_k
+                disable_sparse_kv_bitmask = seqlen_k_boundary >= gather_kv_length
     else:
-        topk_length = None
-        sparse_topk = None
-        disable_topk_bitmask = None
+        gather_kv_length = None
+        sparse_kv = None
+        disable_sparse_kv_bitmask = None
 
     compile_key = (
         dtype,
@@ -685,9 +680,9 @@ def _flash_attn_fwd(
         intra_wg_overlap,
         requested_use_clc_scheduler,
         qv is not None,
-        topk_length,
-        sparse_topk,
-        disable_topk_bitmask,
+        gather_kv_length,
+        sparse_kv,
+        disable_sparse_kv_bitmask,
         fa_logging.get_fa_log_level(),
     )
     if compile_key not in _flash_attn_fwd.compile_cache:
@@ -728,7 +723,7 @@ def _flash_attn_fwd(
             cute_aux_tensors = [to_cute_aux_tensor(buf) for buf in aux_tensors]
 
         qv_tensor = to_cute_tensor(qv) if qv is not None else None
-        topk_indices_tensor = to_cute_tensor(topk_indices) if topk_indices is not None else None
+        gather_kv_indices_tensor = to_cute_tensor(gather_kv_indices) if gather_kv_indices is not None else None
 
         if arch // 10 == 8:
             assert page_table is None, "paged KV not supported on SM 8.0"
@@ -778,14 +773,14 @@ def _flash_attn_fwd(
             if qv is not None:
                 fa_fwd = FlashAttentionMLAForwardSm100(
                     is_causal=causal,
-                    use_cpasync_load_KV=sparse_topk,
-                    topk_length=topk_length,
-                    is_topk_gather=sparse_topk,
+                    use_cpasync_load_KV=sparse_kv,
+                    topk_length=gather_kv_length,
+                    is_topk_gather=sparse_kv,
                     pack_gqa=pack_gqa,
                     qhead_per_kvhead=qhead_per_kvhead,
                     nheads_kv=num_head_kv,
                     is_varlen_q=cu_seqlens_q is not None or seqused_q is not None,
-                    disable_bitmask=disable_topk_bitmask,
+                    disable_bitmask=disable_sparse_kv_bitmask,
                 )
             else:
                 fa_fwd = FlashAttentionForwardSm100(
@@ -854,7 +849,7 @@ def _flash_attn_fwd(
                 cu_seqlens_k_tensor,
                 seqused_q_tensor,
                 seqused_k_tensor,
-                topk_indices_tensor,
+                gather_kv_indices_tensor,
                 page_table_tensor,
                 window_size_left,
                 window_size_right,
@@ -902,7 +897,7 @@ def _flash_attn_fwd(
                 cu_seqlens_k,
                 seqused_q,
                 seqused_k,
-                topk_indices,
+                gather_kv_indices,
                 page_table,
                 window_size_left,
                 window_size_right,
@@ -1694,7 +1689,7 @@ class FlashAttnFunc(torch.autograd.Function):
         k: torch.Tensor,
         v: torch.Tensor,
         qv: Optional[torch.Tensor] = None,
-        topk_indices: Optional[torch.Tensor] = None,
+        gather_kv_indices: Optional[torch.Tensor] = None,
         softmax_scale: Optional[float] = None,
         causal: bool = False,
         window_size: Tuple[Optional[int], Optional[int]] = (None, None),
@@ -1710,7 +1705,6 @@ class FlashAttnFunc(torch.autograd.Function):
         mask_block_idx: Optional[torch.Tensor] = None,
         block_size: Optional[Tuple[int, int]] = None,
         return_lse: bool = False,
-        topk_indices_maybe_oob: Optional[bool] = None,
     ):
         # Only create block sparse tensors if at least one block sparse parameter is provided
         block_sparse_tensors = None
@@ -1738,8 +1732,7 @@ class FlashAttnFunc(torch.autograd.Function):
             mask_mod=mask_mod,
             block_sparse_tensors=block_sparse_tensors,
             return_lse=return_lse,
-            topk_indices=topk_indices,
-            topk_indices_maybe_oob=topk_indices_maybe_oob,
+            gather_kv_indices=gather_kv_indices,
         )
         ctx.save_for_backward(q, k, v, out, lse)
         ctx.softmax_scale = softmax_scale
@@ -1791,7 +1784,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         max_seqlen_q: Optional[int] = None,
         max_seqlen_k: Optional[int] = None,
         min_seqlen_k: Optional[int] = None,
-        topk_indices: Optional[torch.Tensor] = None,
+        gather_kv_indices: Optional[torch.Tensor] = None,
         page_table: Optional[torch.Tensor] = None,
         softmax_scale: Optional[float] = None,
         causal: bool = False,
@@ -1804,7 +1797,6 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         score_mod: Optional[Callable] = None,
         aux_tensors: Optional[list] = None,
         return_lse: bool = False,
-        topk_indices_maybe_oob: Optional[bool] = None,
     ):
         out, lse = _flash_attn_fwd(
             q,
@@ -1830,8 +1822,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             score_mod=score_mod,
             aux_tensors=aux_tensors,
             return_lse=return_lse,
-            topk_indices=topk_indices,
-            topk_indices_maybe_oob=topk_indices_maybe_oob,
+            gather_kv_indices=gather_kv_indices,
         )
         ctx.save_for_backward(q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
         ctx.softmax_scale = softmax_scale
@@ -1883,7 +1874,7 @@ def flash_attn_func(
     k: torch.Tensor,
     v: torch.Tensor,
     qv: Optional[torch.Tensor] = None,
-    topk_indices: Optional[torch.Tensor] = None,
+    gather_kv_indices: Optional[torch.Tensor] = None,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
     window_size: Tuple[Optional[int], Optional[int]] = (None, None),
@@ -1899,14 +1890,13 @@ def flash_attn_func(
     mask_block_idx: Optional[torch.Tensor] = None,
     block_size: Optional[Tuple[int, int]] = None,
     return_lse: bool = False,
-    topk_indices_maybe_oob: Optional[bool] = None,
 ):
     return FlashAttnFunc.apply(
         q,
         k,
         v,
         qv,
-        topk_indices,
+        gather_kv_indices,
         softmax_scale,
         causal,
         window_size,
@@ -1922,7 +1912,6 @@ def flash_attn_func(
         mask_block_idx,
         block_size,
         return_lse,
-        topk_indices_maybe_oob,
     )
 
 
@@ -1938,7 +1927,7 @@ def flash_attn_varlen_func(
     min_seqlen_k: Optional[int] = None,
     seqused_q: Optional[torch.Tensor] = None,
     seqused_k: Optional[torch.Tensor] = None,
-    topk_indices: Optional[torch.Tensor] = None,
+    gather_kv_indices: Optional[torch.Tensor] = None,
     page_table: Optional[torch.Tensor] = None,
     softmax_scale: Optional[float] = None,
     causal: bool = False,
@@ -1951,7 +1940,6 @@ def flash_attn_varlen_func(
     score_mod: Optional[Callable] = None,
     aux_tensors: Optional[list] = None,
     return_lse: bool = False,
-    topk_indices_maybe_oob: Optional[bool] = None,
 ):
     """
     Explanation of some optional arguments:
@@ -1960,18 +1948,12 @@ def flash_attn_varlen_func(
         O = softmax(scale * (Q @ K.T + Qv @ V.T)) @ V
         where Q = q_pe, Qv = q_nope, K = pe_cache, V = kv_cache.
 
-    topk_indices: a tensor of shape (batch, seqlen_q, topk_length) or
-        (total_q, topk_length) if there is cu_seqlens_q.
-        Used for topk sparsity with MLA absorption kernel (i.e. DSA).
-
-    topk_indices_maybe_oob: indicates whether topk selected tokens need further masking,
-        e.g., we could need to apply causal mask on top of topk sparse mask if
-        topk indices lie above the causal diagonal, or
-        topk indices could be out of bounds if topk_length > seqlen_k.
-        If None, we set via a heuristic.
+    gather_kv_indices: a tensor of shape (batch, seqlen_q, gather_kv_length) or
+        (total_q, gather_kv_length) if there is cu_seqlens_q.
+        Currently, only used for topk sparsity with MLA absorption kernel.
     
     min_seqlen_k: for varlen, specifies the minimum kv sequence length for any batch.
-        Used with topk_indices to determine if we need oob masking.
+        Used with gather_kv_indices to determine if we need oob masking.
     """
     return FlashAttnVarlenFunc.apply(
         q,
@@ -1985,7 +1967,7 @@ def flash_attn_varlen_func(
         max_seqlen_q,
         max_seqlen_k,
         min_seqlen_k,
-        topk_indices,
+        gather_kv_indices,
         page_table,
         softmax_scale,
         causal,
@@ -1998,7 +1980,6 @@ def flash_attn_varlen_func(
         score_mod,
         aux_tensors,
         return_lse,
-        topk_indices_maybe_oob,
     )
 
 
