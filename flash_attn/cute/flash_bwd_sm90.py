@@ -1592,6 +1592,9 @@ class FlashAttentionBackwardSm90:
                 mma_dsq_fn(tCrA=tdKrdS, B_idx=smem_idx_Q, zero_init=not dKV_accumulate, wg_wait=1)
             pipeline_dO.consumer_release(consumer_state_dO_cur)
             warpgroup.wait_group(0)
+            # Fence generic-proxy reads of sLSE before releasing the pipeline_Q
+            # stage back to TMA for overwriting.
+            cute.arch.fence_view_async_shared()
             pipeline_Q.consumer_release(consumer_state_Q)
 
         consumer_state_Q.advance()
