@@ -9,23 +9,19 @@ import torch.utils.benchmark as benchmark
 import cuda.bindings.driver as cuda
 
 import cutlass
-from cutlass.base_dsl.arch import Arch
-from cutlass.cutlass_dsl import BaseDSL
 import cutlass.cute as cute
-from cutlass import Float32, BFloat16, Int64, Int32, Uint32, Boolean, const_expr
+from cutlass import Float32, Int64, Int32, Uint32, Boolean, const_expr
 import cutlass.pipeline as pipeline
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import from_dlpack
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.utils import ClcDynamicPersistentTileScheduler
 
-from quack import copy_utils, layout_utils
+from quack import copy_utils
 
-from flash_attn.cute.pack_gqa import PackGQA, pack_gqa_layout, make_packgqa_tiled_tma_atom
-from flash_attn.cute import utils
+from flash_attn.cute.pack_gqa import pack_gqa_layout, make_packgqa_tiled_tma_atom
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
-from flash_attn.cute.block_sparsity import BlockSparseTensors
 from flash_attn.cute.mask import AttentionMask
 import flash_attn.cute.blackwell_helpers as fa_sm100_utils
 from flash_attn.cute.softmax import SoftmaxSm100
@@ -35,7 +31,6 @@ from flash_attn.cute.tile_scheduler import (
     TileSchedulerArguments,
     TileSchedulerProtocol,
     SingleTileScheduler,
-    StaticPersistentTileScheduler,
     SingleTileLPTScheduler,
     SingleTileVarlenScheduler,
     ParamsBase,
@@ -2978,8 +2973,10 @@ def test_mla_kernel(
     if validate:
         assert (O - O_ref).abs().max().item() <= rtol * (O_pt - O_ref).abs().max().item() + atol
         varlen_tag = ""
-        if varlen_q: varlen_tag += f", total_q:{total_q}"
-        if varlen_k: varlen_tag += f", total_k:{total_k}"
+        if varlen_q:
+            varlen_tag += f", total_q:{total_q}"
+        if varlen_k:
+            varlen_tag += f", total_k:{total_k}"
         print(
             f"batch:{batch:3d}, nheads:{nheads:3d}, seqlen_q:{seqlen_q:5d}, seqlen_k:{seqlen_k:5d}"
             f"{varlen_tag}, iter:{iter:2d} PASSED"
