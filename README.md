@@ -57,9 +57,8 @@ export PYTHONPATH=$PWD
 pytest -q -s test_flash_attn.py
 ```
 Once the package is installed, you can import it as follows:
-```python
-import flash_attn_interface
-flash_attn_interface.flash_attn_func()
+```bash
+python3 -c "import flash_attn_interface; print(dir(flash_attn_interface))" | grep flash_attn_3
 ```
 
 ## FlashAttention-4 (CuTeDSL)
