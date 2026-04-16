@@ -58,7 +58,7 @@ pytest -q -s test_flash_attn.py
 ```
 Once the package is installed, you can import it as follows:
 ```bash
-python3 -c "import flash_attn_interface; print(dir(flash_attn_interface))" | grep flash_attn_3
+python -c "import flash_attn_interface; print(dir(flash_attn_interface))" 2>/dev/null | grep -q flash_attn_3 && echo "✓ flash_attn_3 installed" || echo "✗ flash_attn_3 not installed"
 ```
 
 ## FlashAttention-4 (CuTeDSL)
