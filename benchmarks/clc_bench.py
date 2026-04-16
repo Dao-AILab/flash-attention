@@ -468,11 +468,40 @@ def build_inputs(case: Case, dtype_name: DTypeName, fake_tensor: bool):
 
 
 def attended_pairs(seqlen_q: int, seqlen_k: int, causal: bool) -> float:
+    """Lower-right aligned causal: last query aligns with last key.
+    When M > N, only the bottom N query rows attend (triangle of size N),
+    so valid pairs = N*(N+1)/2, not the upper-left formula M*N - N*(N-1)/2.
+    """
     if not causal:
         return float(seqlen_q * seqlen_k)
     if seqlen_q <= seqlen_k:
         return float(seqlen_q * (2 * seqlen_k - seqlen_q + 1) / 2)
-    return float(seqlen_q * seqlen_k - seqlen_k * (seqlen_k - 1) / 2)
+    return float(seqlen_k * (seqlen_k + 1) / 2)
+
+
+def block_sparse_pairs(case: Case) -> float:
+    seqlen_q = case.seqlen_q or 0
+    seqlen_k = case.seqlen_k or 0
+    match case.mask_name:
+        case "block_diagonal":
+            total = 0
+            for q_idx in range(seqlen_q):
+                block_start = (q_idx // BLOCK_SIZE_K) * BLOCK_SIZE_K
+                block_end = min(block_start + BLOCK_SIZE_K, seqlen_k)
+                total += max(0, block_end - block_start)
+            return float(total)
+        case "sliding_window":
+            window = case.window_size or 0
+            offset = seqlen_k - seqlen_q
+            total = 0
+            for q_idx in range(seqlen_q):
+                center = q_idx + offset
+                lower = max(0, center - window)
+                upper = min(seqlen_k - 1, center + window)
+                total += max(0, upper - lower + 1)
+            return float(total)
+        case _:
+            raise ValueError(f"Unsupported block-sparse FLOP mask: {case.mask_name}")
 
 
 def fwd_flops(case: Case, kwargs: dict | None = None) -> float:
@@ -483,12 +512,8 @@ def fwd_flops(case: Case, kwargs: dict | None = None) -> float:
             case.causal,
         ) * (case.d + case.d)
     if case.mode == "block_sparse":
-        if kwargs is None:
-            return 0.0
-        total_blocks = kwargs["mask_block_cnt"].sum().item()
-        if kwargs["full_block_cnt"] is not None:
-            total_blocks += kwargs["full_block_cnt"].sum().item()
-        return float(total_blocks * BLOCK_SIZE_Q * BLOCK_SIZE_K * case.q_heads * 2 * (case.d + case.d))
+        num_pairs = (case.batch or 0) * block_sparse_pairs(case)
+        return case.q_heads * 2 * num_pairs * (case.d + case.d)
     lengths_q = case.seqlens_q or []
     lengths_k = case.seqlens_k or lengths_q
     total = 0.0
