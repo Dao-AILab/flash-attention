@@ -1338,7 +1338,8 @@ class FlashAttentionBackwardSm90:
             if const_expr(self.is_dropout):
                 tScS_dropout = thr_mma_SdP.partition_C(
                     cute.make_identity_tensor(
-                        (self.tile_n, self.tile_m) if self.SdP_swapAB
+                        (self.tile_n, self.tile_m)
+                        if self.SdP_swapAB
                         else (self.tile_m, self.tile_n)
                     )
                 )

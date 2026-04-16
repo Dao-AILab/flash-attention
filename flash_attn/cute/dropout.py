@@ -220,9 +220,12 @@ def precompute_dropout_mask(
         for n_half in cutlass.range_constexpr(mma_n_half):
             block_col = block_col_base + Int32(n_half)
             r0, r1, r2, r3 = philox_4x32(
-                philox_offset, Uint32(0),
-                Uint32(block_row), Uint32(block_col),
-                seed_lo, seed_hi,
+                philox_offset,
+                Uint32(0),
+                Uint32(block_row),
+                Uint32(block_col),
+                seed_lo,
+                seed_hi,
             )
             # Pack 8 keep/drop decisions into bits 0-7 of one uint32.
             bits = Uint32(0)
