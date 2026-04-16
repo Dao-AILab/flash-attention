@@ -717,7 +717,7 @@ setup(
     version=get_package_version(),
     packages=[PACKAGE_NAME],
     package_dir={PACKAGE_NAME: PACKAGE_NAME},
-    py_modules=["flash_attn_interface"],
+    py_modules=["flash_attn_interface", "flash_attn_config"],
     description="FlashAttention-3",
     long_description=long_description,
     long_description_content_type="text/markdown",
