@@ -313,7 +313,8 @@ def _write_ninja_file(path,
 torch.utils.cpp_extension._write_ninja_file = _write_ninja_file
 
 
-create_build_config_file()
+# Do not generate build config at import time; it is created later in the
+# actual build/setup path to avoid unexpected file writes on metadata import.
 
 
 def get_platform():
