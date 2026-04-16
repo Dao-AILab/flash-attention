@@ -105,6 +105,10 @@ def apply_dropout_mask(
 ):
     """Apply dropout mask via MMA-layout Philox keying (FA2-style).
 
+    Only correct for SM80/SM120 where each warp independently runs m16n8k16
+    and the (warp_id, lane_id) → element mapping is well-defined.
+    Do NOT use for SM90 (WGMMA) — use apply_dropout_mask_per_element instead.
+
     1. logical_divide the accumulator's N mode by 2:
        (4, MMA_M, MMA_N) -> (4, MMA_M, (2, MMA_N/2))
 
@@ -337,7 +341,7 @@ def apply_dropout_bwd_fused(
 
 
 @cute.jit
-def apply_dropout_mask_sm100(
+def apply_dropout_mask_per_element(
     acc_S: cute.Tensor,
     tScS_t2r: cute.Tensor,
     batch_idx: Int32,
@@ -353,19 +357,23 @@ def apply_dropout_mask_sm100(
     seed_hi: Uint32,
     transpose: cutlass.Constexpr[bool] = False,
 ):
-    """Apply dropout mask to SM100 TMEM layout (per-element, position-keyed).
+    """Apply dropout mask using per-element position-keyed Philox.
 
-    SM100 uses UMMA with TMEM — different register layout from SM80/SM90.
-    Uses per-element Philox keyed on global (row, col) since TMEM elements
-    don't group into the 8-element MMA register blocks used by SM80/SM90/SM120.
+    Architecture-agnostic: works for any MMA layout (SM90 WGMMA, SM100
+    UMMA/TMEM, etc.) by using an explicit coordinate tensor rather than
+    inferring positions from warp/lane/register indices.
 
-    NOTE: This keying scheme differs from apply_dropout_mask. Both are
-    internally consistent (fwd/bwd masks match), but produce different
-    dropout patterns for the same seed. This is acceptable since SM100
-    kernels are a separate compilation target.
+    Each accumulator element gets a Philox call keyed on its global
+    (row, col) position. Only 1 byte of the 128-bit output is used per
+    call — less efficient than the batched SM80 approach but correct for
+    all MMA layouts.
 
-    TODO: Optimize to batch Philox calls once TMEM element grouping is
-    understood (currently uses 1 byte of 128 random bits per call).
+    Args:
+        acc_S: Accumulator tensor (any layout, flat-indexed).
+        tScS_t2r: Coordinate tensor with same number of elements as acc_S.
+                   tScS_t2r[i] gives (local_row, local_col) for acc_S[i].
+        transpose: If True, swap row/col in coordinate reads (for backward
+                   where the S matrix is transposed).
     """
     rng_key_lo = Uint32(batch_idx * nheads + head_idx)
     p_threshold = Uint32(p_keep_uint8)
@@ -393,3 +401,7 @@ def apply_dropout_mask_sm100(
 
         keep_f = Float32(Uint32(rand_byte <= p_threshold))
         acc_S[i] = acc_S[i] * (rp_dropout * keep_f)
+
+
+# Backward-compat alias for SM100 callers
+apply_dropout_mask_sm100 = apply_dropout_mask_per_element

@@ -19,7 +19,7 @@ from quack.sm90_utils import gemm_zero_init, gemm_w_idx
 
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import utils
-from flash_attn.cute.dropout import apply_dropout_mask_sm100 as apply_dropout_mask_sm90
+from flash_attn.cute.dropout import apply_dropout_mask_per_element
 from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
@@ -1327,18 +1327,23 @@ class FlashAttentionBackwardSm90:
                 seqlen_info=seqlen,
             )
             # Dropout closure — SM90 uses per-element position-keyed Philox
-            # (same approach as SM100) because WGMMA has a different register
-            # layout than SM80/SM120's warp-level MMA.
+            # because WGMMA's thread-to-element mapping differs from SM80's
+            # per-warp m16n8k16 layout that apply_dropout_mask assumes.
+            # [NOTE] SdP_swapAB: when A/B are swapped the accumulator's M
+            # mode indexes keys and N mode indexes queries (transposed from
+            # normal). Use (tile_n, tile_m) so partition_C yields coords in
+            # (key_local, query_local) range, then transpose=True maps them
+            # to (query→global_row, key→global_col) matching the forward.
             dropout_fn_cur = None
             if const_expr(self.is_dropout):
-                cS_dropout = cute.make_identity_tensor(
-                    (self.tile_n, self.tile_m)
-                    if const_expr(self.SdP_swapAB)
-                    else (self.tile_m, self.tile_n)
+                tScS_dropout = thr_mma_SdP.partition_C(
+                    cute.make_identity_tensor(
+                        (self.tile_n, self.tile_m) if self.SdP_swapAB
+                        else (self.tile_m, self.tile_n)
+                    )
                 )
-                tScS_dropout = thr_mma_SdP.partition_C(cS_dropout)
                 dropout_fn_cur = partial(
-                    apply_dropout_mask_sm90,
+                    apply_dropout_mask_per_element,
                     tScS_t2r=tScS_dropout,
                     batch_idx=batch_idx,
                     head_idx=head_idx,
