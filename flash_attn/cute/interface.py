@@ -553,6 +553,13 @@ def _flash_attn_fwd(
         or seqused_k is not None
     )
 
+    # CLC regressed for varlen MHA and dense noncausal. Imbalanced varlen shapes
+    # keep more K/V blocks in flight and hurt L2; dense noncausal mostly just
+    # pays work-stealing overhead.
+    is_varlen_mha = is_varlen and qhead_per_kvhead == 1
+    is_dense_noncausal = not is_varlen and not causal and not local
+    use_clc_scheduler = requested_use_clc_scheduler and not is_varlen_mha and not is_dense_noncausal
+
     if mask_mod is not None:
         if is_varlen:
             raise NotImplementedError(
@@ -791,7 +798,7 @@ def _flash_attn_fwd(
                     is_varlen_q=cu_seqlens_q is not None or seqused_q is not None,
                     q_subtile_factor=q_subtile_factor,
                     use_2cta_instrs=use_2cta_instrs,
-                    use_clc_scheduler=requested_use_clc_scheduler,
+                    use_clc_scheduler=use_clc_scheduler,
                 )
         elif arch // 10 == 12:
             # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity

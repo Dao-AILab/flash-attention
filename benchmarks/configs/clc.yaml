@@ -1,0 +1,35 @@
+dtype_str: bfloat16
+seed: 0
+workers: 64
+profile_repeats: 1
+bench_iters: 256
+
+dense:
+  enabled: true
+  batches: [1, 4, 8, 16, 32]
+  seqlen_pairs: [[1024, 1024], [2048, 2048], [4096, 4096], [8192, 8192], [16384, 16384]]
+  head_dims: [64, 96, 128]
+  head_pairs: [[16, 16], [16, 8], [16, 4], [16, 2], [16, 1]]
+  causal: [true]
+
+varlen:
+  enabled: true
+  max_q_tokens: [2048, 4096, 8192, 16384, 32768]
+  max_kv_tokens: [2048, 4096, 8192, 16384, 32768]
+  batches: [4, 8, 16, 32]
+  # uniform: all sequences in the batch are similar length
+  # longtail: a few long sequences plus many shorter ones
+  patterns: [uniform, longtail]
+  head_dims: [64, 96, 128]
+  head_pairs: [[16, 8], [16, 4], [16, 2], [16, 1]]
+  causal: [false]
+
+block_sparse:
+  enabled: false
+  batches: [1, 4, 8, 16, 32]
+  seqlen_pairs: [[1024, 1024], [2048, 2048], [4096, 4096], [4096, 8192]]
+  head_dims: [64, 128]
+  head_pairs: [[16, 16], [16, 4], [16, 1]]
+  # supported mask_names: block_diagonal, sliding_window
+  mask_names: [block_diagonal]
+  sliding_window_sizes: [2048]
