@@ -609,7 +609,7 @@ class FlashAttentionMLAForwardSm100:
             num_batch=cute.size(mQ.shape[3])
             if const_expr(mCuSeqlensQ is None)
             else cute.size(mCuSeqlensQ.shape[0] - 1),
-            num_splits=1, # todo: split_kv
+            num_splits=1,  # todo: split_kv
             seqlen_k=cute.size(mK.shape[0])
             if const_expr(mPageTable is None)
             else cute.size(mK.shape[0]) * cute.size(mPageTable.shape[1]),
@@ -1470,32 +1470,70 @@ class FlashAttentionMLAForwardSm100:
                     mVt0_cur = mVt0[None, None, head_idx_kv, batch_idx]
                     mVt1_cur = mVt1[None, None, head_idx_kv, batch_idx]
                 else:
-                    mVt0_cur = cute.domain_offset((0, seqlen.offset_k), mVt0[None, None, head_idx_kv])
-                    mVt1_cur = cute.domain_offset((0, seqlen.offset_k), mVt1[None, None, head_idx_kv])
+                    mVt0_cur = cute.domain_offset(
+                        (0, seqlen.offset_k), mVt0[None, None, head_idx_kv]
+                    )
+                    mVt1_cur = cute.domain_offset(
+                        (0, seqlen.offset_k), mVt1[None, None, head_idx_kv]
+                    )
                 # (hdimv//4, seqlen_k)
                 hdimv_split_per_cta = self.hdimv // self.num_hdimv_splits // self.cta_group_size
-                mVt0_cur = cute.tiled_divide(mVt0_cur, (hdimv_split_per_cta, ))[None, cta_rank_in_cluster, None]
-                mVt1_cur = cute.tiled_divide(mVt1_cur, (hdimv_split_per_cta, ))[None, cta_rank_in_cluster, None]
+                mVt0_cur = cute.tiled_divide(mVt0_cur, (hdimv_split_per_cta,))[
+                    None, cta_rank_in_cluster, None
+                ]
+                mVt1_cur = cute.tiled_divide(mVt1_cur, (hdimv_split_per_cta,))[
+                    None, cta_rank_in_cluster, None
+                ]
 
-                load_K = partial(self.cpasync_gather_load_KV,
+                load_K = partial(
+                    self.cpasync_gather_load_KV,
                     cpasync_gather_kv_manager,
-                    pipeline_K, pipeline_K_cpasync, sK, False, "K", mK_cur,
+                    pipeline_K,
+                    pipeline_K_cpasync,
+                    sK,
+                    False,
+                    "K",
+                    mK_cur,
                 )
-                load_V0 = partial(self.cpasync_gather_load_KV,
+                load_V0 = partial(
+                    self.cpasync_gather_load_KV,
                     cpasync_gather_kv_manager,
-                    pipeline_V0, pipeline_V0_cpasync, sV0, False, "V", mV0_cur,
+                    pipeline_V0,
+                    pipeline_V0_cpasync,
+                    sV0,
+                    False,
+                    "V",
+                    mV0_cur,
                 )
-                load_V1 = partial(self.cpasync_gather_load_KV,
+                load_V1 = partial(
+                    self.cpasync_gather_load_KV,
                     cpasync_gather_kv_manager,
-                    pipeline_V1, pipeline_V1_cpasync, sV1, False, "V", mV1_cur,
+                    pipeline_V1,
+                    pipeline_V1_cpasync,
+                    sV1,
+                    False,
+                    "V",
+                    mV1_cur,
                 )
-                load_Vt0 = partial(self.cpasync_gather_load_KV,
+                load_Vt0 = partial(
+                    self.cpasync_gather_load_KV,
                     cpasync_gather_kv_manager,
-                    pipeline_V0, pipeline_V0_cpasync, sVt0, True, "V", mVt0_cur,
+                    pipeline_V0,
+                    pipeline_V0_cpasync,
+                    sVt0,
+                    True,
+                    "V",
+                    mVt0_cur,
                 )
-                load_Vt1 = partial(self.cpasync_gather_load_KV,
+                load_Vt1 = partial(
+                    self.cpasync_gather_load_KV,
                     cpasync_gather_kv_manager,
-                    pipeline_V1, pipeline_V1_cpasync, sVt1, True, "V", mVt1_cur,
+                    pipeline_V1,
+                    pipeline_V1_cpasync,
+                    sVt1,
+                    True,
+                    "V",
+                    mVt1_cur,
                 )
 
                 # gather KV path processes n_blocks in increasing order
@@ -1517,7 +1555,7 @@ class FlashAttentionMLAForwardSm100:
                     producer_phase_O ^= 1
 
                 # ==== Mainloop ====
-                for n_block_group in cutlass.range(num_n_block_groups-1, unroll=1):
+                for n_block_group in cutlass.range(num_n_block_groups - 1, unroll=1):
                     for stage in cutlass.range_constexpr(self.num_stages_S):
                         n_block = n_block_group * self.num_stages_S + stage
                         # K, V0, V1
@@ -1536,7 +1574,7 @@ class FlashAttentionMLAForwardSm100:
 
                 # ==== Epilogue ====
                 for stage in cutlass.range_constexpr(self.num_stages_S):
-                    n_block = (num_n_block_groups-1) * self.num_stages_S + stage
+                    n_block = (num_n_block_groups - 1) * self.num_stages_S + stage
                     if const_expr(stage == 0):
                         # K, V0, V1
                         cpasync_gather_kv_manager.load_index_topk(n_block + 1, transpose=False)
@@ -1584,39 +1622,109 @@ class FlashAttentionMLAForwardSm100:
 
                 # PagedKVManager for K (hdim=64): uses "K" mode only
                 paged_kv_K = PagedKVManager.create(
-                    mPageTable, mK, mK,
-                    page_size_divmod, batch_idx, head_idx_kv, tidx,
-                    seqlen.seqlen_k, 0,
-                    self.tile_n, self.hdim, self.hdim,
-                    self.num_cpasync_load_threads, mK.element_type, arch=100,
+                    mPageTable,
+                    mK,
+                    mK,
+                    page_size_divmod,
+                    batch_idx,
+                    head_idx_kv,
+                    tidx,
+                    seqlen.seqlen_k,
+                    0,
+                    self.tile_n,
+                    self.hdim,
+                    self.hdim,
+                    self.num_cpasync_load_threads,
+                    mK.element_type,
+                    arch=100,
                 )
                 # PagedKVManager for V0/Vt0: "K" mode → V0 (non-transposed), "V" mode → Vt0 (transposed)
                 paged_kv_V0 = PagedKVManager.create(
-                    mPageTable, mV0, mVt0_cta,
-                    page_size_divmod, batch_idx, head_idx_kv, tidx,
-                    seqlen.seqlen_k, 0,
-                    self.tile_n, hdimv_split, hdimv_split_per_cta,
-                    self.num_cpasync_load_threads, mV0.element_type, arch=100,
+                    mPageTable,
+                    mV0,
+                    mVt0_cta,
+                    page_size_divmod,
+                    batch_idx,
+                    head_idx_kv,
+                    tidx,
+                    seqlen.seqlen_k,
+                    0,
+                    self.tile_n,
+                    hdimv_split,
+                    hdimv_split_per_cta,
+                    self.num_cpasync_load_threads,
+                    mV0.element_type,
+                    arch=100,
                 )
                 # PagedKVManager for V1/Vt1: "K" mode → V1, "V" mode → Vt1
                 paged_kv_V1 = PagedKVManager.create(
-                    mPageTable, mV1, mVt1_cta,
-                    page_size_divmod, batch_idx, head_idx_kv, tidx,
-                    seqlen.seqlen_k, 0,
-                    self.tile_n, hdimv_split, hdimv_split_per_cta,
-                    self.num_cpasync_load_threads, mV1.element_type, arch=100,
+                    mPageTable,
+                    mV1,
+                    mVt1_cta,
+                    page_size_divmod,
+                    batch_idx,
+                    head_idx_kv,
+                    tidx,
+                    seqlen.seqlen_k,
+                    0,
+                    self.tile_n,
+                    hdimv_split,
+                    hdimv_split_per_cta,
+                    self.num_cpasync_load_threads,
+                    mV1.element_type,
+                    arch=100,
                 )
 
-                load_K = partial(self.cpasync_paged_load_KV,
-                    paged_kv_K, pipeline_K, pipeline_K_cpasync, sK, False, "K", cta_rank_in_cluster)
-                load_V0 = partial(self.cpasync_paged_load_KV,
-                    paged_kv_V0, pipeline_V0, pipeline_V0_cpasync, sV0, False, "K", cta_rank_in_cluster)
-                load_V1 = partial(self.cpasync_paged_load_KV,
-                    paged_kv_V1, pipeline_V1, pipeline_V1_cpasync, sV1, False, "K", cta_rank_in_cluster)
-                load_Vt0 = partial(self.cpasync_paged_load_KV,
-                    paged_kv_V0, pipeline_V0, pipeline_V0_cpasync, sVt0, True, "V", cta_rank_in_cluster)
-                load_Vt1 = partial(self.cpasync_paged_load_KV,
-                    paged_kv_V1, pipeline_V1, pipeline_V1_cpasync, sVt1, True, "V", cta_rank_in_cluster)
+                load_K = partial(
+                    self.cpasync_paged_load_KV,
+                    paged_kv_K,
+                    pipeline_K,
+                    pipeline_K_cpasync,
+                    sK,
+                    False,
+                    "K",
+                    cta_rank_in_cluster,
+                )
+                load_V0 = partial(
+                    self.cpasync_paged_load_KV,
+                    paged_kv_V0,
+                    pipeline_V0,
+                    pipeline_V0_cpasync,
+                    sV0,
+                    False,
+                    "K",
+                    cta_rank_in_cluster,
+                )
+                load_V1 = partial(
+                    self.cpasync_paged_load_KV,
+                    paged_kv_V1,
+                    pipeline_V1,
+                    pipeline_V1_cpasync,
+                    sV1,
+                    False,
+                    "K",
+                    cta_rank_in_cluster,
+                )
+                load_Vt0 = partial(
+                    self.cpasync_paged_load_KV,
+                    paged_kv_V0,
+                    pipeline_V0,
+                    pipeline_V0_cpasync,
+                    sVt0,
+                    True,
+                    "V",
+                    cta_rank_in_cluster,
+                )
+                load_Vt1 = partial(
+                    self.cpasync_paged_load_KV,
+                    paged_kv_V1,
+                    pipeline_V1,
+                    pipeline_V1_cpasync,
+                    sVt1,
+                    True,
+                    "V",
+                    cta_rank_in_cluster,
+                )
 
                 # Paged path must follow the same descending n_block order as the
                 # MLA TMA path (`n_block_max - 1` down to `n_block_min`). The MMA
@@ -1730,7 +1838,11 @@ class FlashAttentionMLAForwardSm100:
         tPrXPtr = paged_kv_manager.compute_X_ptr(K_or_V)
 
         # Reshape smem to flat 2D using composition (matches CpasyncGatherKVManager.load_X)
-        head_dim = paged_kv_manager.head_dim_v_padded if const_expr(K_or_V == "V") else paged_kv_manager.head_dim_padded
+        head_dim = (
+            paged_kv_manager.head_dim_v_padded
+            if const_expr(K_or_V == "V")
+            else paged_kv_manager.head_dim_padded
+        )
         cta_tile_n = self.tile_n if const_expr(transpose) else self.tile_n // self.cta_group_size
         order = (1, 0) if const_expr(transpose) else (0, 1)
 
@@ -1744,12 +1856,13 @@ class FlashAttentionMLAForwardSm100:
         tXc0X = paged_kv_manager.gmem_thr_copy_KV.get_slice(0).partition_S(cX)
 
         seqlenk_row_limit = (
-            paged_kv_manager.seqlen_k - n_block * self.tile_n - tXcX[0][0]
-            if n_block >= 0 else 0
+            paged_kv_manager.seqlen_k - n_block * self.tile_n - tXcX[0][0] if n_block >= 0 else 0
         )
 
         if const_expr(not transpose):
-            offset = cta_rank_in_cluster * (paged_kv_manager.gmem_threads_per_row // self.cta_group_size)
+            offset = cta_rank_in_cluster * (
+                paged_kv_manager.gmem_threads_per_row // self.cta_group_size
+            )
         else:
             offset = 0
 
@@ -1764,8 +1877,10 @@ class FlashAttentionMLAForwardSm100:
                 width=paged_kv_manager.gmem_threads_per_row,
             )
             x_gmem_ptr = cute.make_ptr(
-                paged_kv_manager.mK_paged.element_type, x_ptr_i64,
-                cute.AddressSpace.gmem, assumed_align=16,
+                paged_kv_manager.mK_paged.element_type,
+                x_ptr_i64,
+                cute.AddressSpace.gmem,
+                assumed_align=16,
             )
             mX_cur = cute.make_tensor(x_gmem_ptr, cute.make_layout((head_dim,)))
             mX_cur_copy = cute.tiled_divide(mX_cur, (paged_kv_manager.async_copy_elems,))
@@ -1957,7 +2072,9 @@ class FlashAttentionMLAForwardSm100:
                         ]
                     else:
                         mVts_cur = [
-                            cute.domain_offset((0, seqlen.offset_k), mVts[split][None, None, head_idx_kv])
+                            cute.domain_offset(
+                                (0, seqlen.offset_k), mVts[split][None, None, head_idx_kv]
+                            )
                             for split in range(self.num_hdimv_splits)
                         ]
                     # (tile_n, hdim or hdimv//2, num_n_blocks)
@@ -1971,7 +2088,8 @@ class FlashAttentionMLAForwardSm100:
                             mVs_cur[split],
                             (self.mma_tiler_QviVi[1], self.mma_tiler_QviVi[2]),
                             (None, 0),
-                        ) for split in range(self.num_hdimv_splits)
+                        )
+                        for split in range(self.num_hdimv_splits)
                     ]
                     # (hdim or hdimv//2, tile_n, num_n_blocks)
                     gVts = [
@@ -1979,7 +2097,8 @@ class FlashAttentionMLAForwardSm100:
                             mVts_cur[split],
                             (self.mma_tiler_PVti[1], self.mma_tiler_PVti[2]),
                             (0, None),
-                        ) for split in range(self.num_hdimv_splits)
+                        )
+                        for split in range(self.num_hdimv_splits)
                     ]
                 else:
                     # Paged KV: keep pages dim, index by page_idx at load time
@@ -2005,7 +2124,8 @@ class FlashAttentionMLAForwardSm100:
                             mVs_cur[split],
                             (self.mma_tiler_QviVi[1], self.mma_tiler_QviVi[2]),
                             (None, 0, None),
-                        ) for split in range(self.num_hdimv_splits)
+                        )
+                        for split in range(self.num_hdimv_splits)
                     ]
                     # (hdim or hdimv//2, tile_n, 1, num_pages)
                     gVts = [
@@ -2013,7 +2133,8 @@ class FlashAttentionMLAForwardSm100:
                             mVts_cur[split],
                             (self.mma_tiler_PVti[1], self.mma_tiler_PVti[2]),
                             (0, None, None),
-                        ) for split in range(self.num_hdimv_splits)
+                        )
+                        for split in range(self.num_hdimv_splits)
                     ]
                 tSgK = thr_mma_QK.partition_B(gK)
                 tSgVs = [
@@ -2077,10 +2198,16 @@ class FlashAttentionMLAForwardSm100:
                     else None
                 )
                 # copy K gmem -> smem
-                producer_state_K = load_K(producer_state_K, n_block=n_block_first, page_idx=page_idx)
+                producer_state_K = load_K(
+                    producer_state_K, n_block=n_block_first, page_idx=page_idx
+                )
                 # copy Vi gmem -> smem
-                producer_state_V0 = load_V(producer_state_V0, n_block=n_block_first, split=0, page_idx=page_idx)
-                producer_state_V1 = load_V(producer_state_V1, n_block=n_block_first, split=1, page_idx=page_idx)
+                producer_state_V0 = load_V(
+                    producer_state_V0, n_block=n_block_first, split=0, page_idx=page_idx
+                )
+                producer_state_V1 = load_V(
+                    producer_state_V1, n_block=n_block_first, split=1, page_idx=page_idx
+                )
 
                 if const_expr(self.use_tma_O and self.overlap_sO_sV):
                     cute.arch.mbarrier_wait(sO_empty_mbar_ptr, phase=producer_phase_O)
@@ -2101,13 +2228,23 @@ class FlashAttentionMLAForwardSm100:
                             else None
                         )
                         # copy K gmem -> smem
-                        producer_state_K = load_K(producer_state_K, n_block=n_block-1, page_idx=page_idx_next)
+                        producer_state_K = load_K(
+                            producer_state_K, n_block=n_block - 1, page_idx=page_idx_next
+                        )
                         # copy Vi gmem -> smem
-                        producer_state_V0 = load_V(producer_state_V0, n_block=n_block-1, split=0, page_idx=page_idx_next)
-                        producer_state_V1 = load_V(producer_state_V1, n_block=n_block-1, split=1, page_idx=page_idx_next)
+                        producer_state_V0 = load_V(
+                            producer_state_V0, n_block=n_block - 1, split=0, page_idx=page_idx_next
+                        )
+                        producer_state_V1 = load_V(
+                            producer_state_V1, n_block=n_block - 1, split=1, page_idx=page_idx_next
+                        )
                         # copy Vti gmem -> smem
-                        producer_state_V0 = load_Vt(producer_state_V0, n_block=n_block, split=0, page_idx=page_idx_cur)
-                        producer_state_V1 = load_Vt(producer_state_V1, n_block=n_block, split=1, page_idx=page_idx_cur)
+                        producer_state_V0 = load_Vt(
+                            producer_state_V0, n_block=n_block, split=0, page_idx=page_idx_cur
+                        )
+                        producer_state_V1 = load_Vt(
+                            producer_state_V1, n_block=n_block, split=1, page_idx=page_idx_cur
+                        )
 
                 # ==== Epilogue ====
                 num_final_n_blocks = self.num_stages_S if even_n_blocks else self.num_stages_S - 1
@@ -2120,18 +2257,28 @@ class FlashAttentionMLAForwardSm100:
                             else None
                         )
                         # copy K gmem -> smem
-                        producer_state_K = load_K(producer_state_K, n_block=n_block-1, page_idx=page_idx_next)
+                        producer_state_K = load_K(
+                            producer_state_K, n_block=n_block - 1, page_idx=page_idx_next
+                        )
                         # copy Vi gmem -> smem
-                        producer_state_V0 = load_V(producer_state_V0, n_block=n_block-1, split=0, page_idx=page_idx_next)
-                        producer_state_V1 = load_V(producer_state_V1, n_block=n_block-1, split=1, page_idx=page_idx_next)
+                        producer_state_V0 = load_V(
+                            producer_state_V0, n_block=n_block - 1, split=0, page_idx=page_idx_next
+                        )
+                        producer_state_V1 = load_V(
+                            producer_state_V1, n_block=n_block - 1, split=1, page_idx=page_idx_next
+                        )
                     page_idx_cur = (
                         mPageTable[batch_idx, n_block]
                         if const_expr(mPageTable is not None)
                         else None
                     )
                     # copy Vti gmem -> smem
-                    producer_state_V0 = load_Vt(producer_state_V0, n_block=n_block, split=0, page_idx=page_idx_cur)
-                    producer_state_V1 = load_Vt(producer_state_V1, n_block=n_block, split=1, page_idx=page_idx_cur)
+                    producer_state_V0 = load_Vt(
+                        producer_state_V0, n_block=n_block, split=0, page_idx=page_idx_cur
+                    )
+                    producer_state_V1 = load_Vt(
+                        producer_state_V1, n_block=n_block, split=1, page_idx=page_idx_cur
+                    )
 
             # Advance to next tile
             work_tile = tile_scheduler.advance_to_next_work()
