@@ -60,12 +60,33 @@ _fa_clc_enabled: bool = os.environ.get("FA_CLC", "0") == "1"
 _fa_disable_2cta_enabled: bool = os.environ.get("FA_DISABLE_2CTA", "0") == "1"
 
 
+def _is_cuda_12() -> bool:
+    """Check if the CUDA toolkit version is 12.x.
+
+    2CTA forward non-causal has a codegen regression on CUDA 12 that causes
+    ~18% slowdown compared to 1CTA. This is fixed in CUDA 13.x.
+    """
+    try:
+        import torch
+
+        cuda_version = torch.version.cuda
+        if cuda_version is not None:
+            major = cuda_version.split(".")[0]
+            return int(major) == 12
+    except Exception:
+        pass
+    return False
+
+
+_fa_disable_2cta_cuda12: bool = _is_cuda_12()
+
+
 def _get_use_clc_scheduler_default() -> bool:
     return _fa_clc_enabled
 
 
 def _get_disable_2cta_default() -> bool:
-    return _fa_disable_2cta_enabled
+    return _fa_disable_2cta_enabled or _fa_disable_2cta_cuda12
 
 
 def _compute_base_hash(func: Callable) -> str:
@@ -126,14 +147,26 @@ def hash_callable(
 
 
 def create_softcap_scoremod(softcap_val):
-    inv_softcap = 1.0 / softcap_val
-
     @cute.jit
-    def scoremod_premask_fn(acc_S_SSA, batch_idx, head_idx, q_idx, kv_idx, aux_tensors):
-        scores = acc_S_SSA * inv_softcap
-        return scores * cute.math.tanh(scores, fastmath=True)
+    def scoremod_premask_fn(
+        acc_S_SSA, batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors
+    ):
+        scores = acc_S_SSA / softcap_val
+        return softcap_val * cute.math.tanh(scores, fastmath=True)
 
     return scoremod_premask_fn
+
+
+def create_softcap_scoremod_bwd(softcap_val):
+    @cute.jit
+    def scoremod_bwd_fn(
+        grad_out_SSA, score_SSA, batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors
+    ):
+        scores = score_SSA / softcap_val
+        tanh_scores = cute.math.tanh(scores, fastmath=True)
+        return grad_out_SSA * (1.0 - tanh_scores * tanh_scores)
+
+    return scoremod_bwd_fn
 
 
 LOG2_E = math.log2(math.e)

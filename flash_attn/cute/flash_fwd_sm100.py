@@ -203,6 +203,7 @@ class FlashAttentionForwardSm100:
             "Paged KV does not support irregular head dim"
         )
 
+        # ClC does not compose with these other features, so disable even if requested
         self.use_clc_scheduler = (
             use_clc_scheduler
             and self.use_tma_KV

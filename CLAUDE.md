@@ -8,6 +8,10 @@ FlashAttention-4 (FA4) — fast, memory-efficient exact attention kernels writte
 
 The repository also contains older generations (FA2 in top-level `csrc/`, FA3 in `hopper/`) but active development is on FA4 in `flash_attn/cute/`.
 
+## Agent Scratch Space
+
+Use `agent_space/` for project-local scratch work such as lab notes, profiling outputs, temporary repro scripts, and experiment artifacts. Treat it as disposable workspace rather than product code.
+
 ## Build & Install
 
 ```bash

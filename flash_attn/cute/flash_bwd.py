@@ -46,6 +46,8 @@ class FlashAttentionBackwardSm80:
         AtomLayoutNdKV: int = 8,
         AtomLayoutMdQ: int = 1,
         V_in_regs: bool = False,
+        score_mod: cutlass.Constexpr | None = None,
+        score_mod_bwd: cutlass.Constexpr | None = None,
     ):
         """Initializes the configuration for a flash attention v2 kernel.
 
@@ -90,6 +92,8 @@ class FlashAttentionBackwardSm80:
         self.Mma_dKV_is_RS = AtomLayoutMSdP == 1 and AtomLayoutNdKV == num_mma_warps and SdP_swapAB and not dKV_swapAB
         self.V_in_regs = V_in_regs
         self.share_QV_smem = V_in_regs
+        self.score_mod = score_mod
+        self.score_mod_bwd = score_mod_bwd
 
     @staticmethod
     def can_implement(
@@ -377,7 +381,6 @@ class FlashAttentionBackwardSm80:
         mCuSeqlensK: Optional[cute.Tensor] = None,
         mSeqUsedQ: Optional[cute.Tensor] = None,
         mSeqUsedK: Optional[cute.Tensor] = None,
-        softcap: Float32 | float | None = None,
         window_size_left: Int32 | int | None = None,
         window_size_right: Int32 | int | None = None,
         mdQ_semaphore: Optional[cute.Tensor] = None,
@@ -430,7 +433,7 @@ class FlashAttentionBackwardSm80:
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
         grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
 
-        softmax_scale_log2 = softmax_scale * math.log2(math.e)
+        softmax_scale_log2, softmax_scale = utils.compute_softmax_scale_log2(softmax_scale, self.score_mod)
         self.kernel(
             mQ,
             mK,
@@ -773,6 +776,7 @@ class FlashAttentionBackwardSm80:
                 smem_copy_params=smem_copy_params, gmem_copy_params=gmem_copy_params,
                 load_Q_LSE=load_Q_LSE, load_dO_dPsum=load_dO_dPsum,
                 m_block_max=m_block_max,
+                softmax_scale=softmax_scale,
                 softmax_scale_log2=softmax_scale_log2,
             )
 
@@ -861,6 +865,7 @@ class FlashAttentionBackwardSm80:
         load_Q_LSE: Callable,
         load_dO_dPsum: Callable,
         m_block_max: cutlass.Int32,
+        softmax_scale: cutlass.Float32,
         softmax_scale_log2: cutlass.Float32,
         mask_fn: Optional[Callable] = None,
     ):
@@ -890,13 +895,24 @@ class FlashAttentionBackwardSm80:
             smem_copy_params.smem_thr_copy_QdO, smem_copy_params.smem_thr_copy_KV,
             swap_AB=self.SdP_swapAB,
         )
+        acc_S_pre = cute.make_fragment_like(acc_S)
+        acc_S_pre.store(acc_S.load())
         tLSErLSE = cute.make_fragment_like(smem_copy_params.tSsLSEMma[None, 0])
         cute.autovec_copy(
             smem_copy_params.tSsLSEMma[None, smem_pipe_read_q if cutlass.const_expr(self.num_stages_Q > 1) else 0], tLSErLSE
         )
+        acc_S_mn = layout_utils.reshape_acc_to_mn(acc_S)
+        acc_S_pre_mn = layout_utils.reshape_acc_to_mn(acc_S_pre)
+        if cutlass.const_expr(self.score_mod is not None):
+            for r in cutlass.range(cute.size(acc_S_mn, mode=[0]), unroll_full=True):
+                acc_S_mn[r, None].store(
+                    self.score_mod(
+                        acc_S_mn[r, None].load() * softmax_scale,
+                        0, 0, 0, 0, None, [],
+                    )
+                )
         if cutlass.const_expr(mask_fn is not None):
             mask_fn(acc_S, m_block=m_block)
-        acc_S_mn = layout_utils.reshape_acc_to_mn(acc_S)
         bidx = 0
         # if cute.arch.thread_idx()[0] == 0 and cute.arch.block_idx()[0] == bidx: cute.print_tensor(acc_S_mn)
         # if cute.arch.thread_idx()[0] == 0 and cute.arch.block_idx()[0] == 1: cute.print_tensor(tLSErLSE)
@@ -926,7 +942,14 @@ class FlashAttentionBackwardSm80:
         # if cute.arch.thread_idx()[0] == 0 and cute.arch.block_idx()[0] == bidx: cute.print_tensor(acc_dP_mn)
         assert cute.size(acc_dP_mn, mode=[0]) == cute.size(tLSErdPsum)
         for r in cutlass.range(cute.size(acc_dP_mn, mode=[0]), unroll_full=True):
-            acc_dP_mn[r, None].store(acc_S_mn[r, None].load() * (acc_dP_mn[r, None].load() - tLSErdPsum[r]))
+            grad_val = acc_S_mn[r, None].load() * (acc_dP_mn[r, None].load() - tLSErdPsum[r])
+            if cutlass.const_expr(self.score_mod_bwd is not None):
+                grad_val = self.score_mod_bwd(
+                    grad_val,
+                    acc_S_pre_mn[r, None].load() * softmax_scale,
+                    0, 0, 0, 0, None, [],
+                )
+            acc_dP_mn[r, None].store(grad_val)
         # if cute.arch.thread_idx()[0] == 0 and cute.arch.block_idx()[0] == bidx: cute.print_tensor(acc_dP_mn)
         rP = cute.make_fragment_like(acc_S, self.dtype)
         rP.store(acc_S.load().to(self.dtype))

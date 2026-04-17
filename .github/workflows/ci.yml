@@ -9,7 +9,7 @@ permissions:
 
 env:
   CI_WORK_DIR: ${{ vars.CI_WORK_DIR || format('/scratch/user/{0}', github.actor) }}
-  FA4_TEST_FILTER: "1-1-128-True-0-0.0-False-False-False-mha-dtype0"
+  FA4_TEST_FILTER: "1024-1024-128-True-0-0.0-False-False-False-mha-dtype0 or 1024-1024-128-False-0-0.0-False-False-False-mha-dtype0"
 
 jobs:
   lint:
@@ -23,13 +23,13 @@ jobs:
       - name: Ruff format
         run: ruff format --check flash_attn/cute/ --exclude "flash_attn/cute/flash_bwd.py,flash_attn/cute/flash_fwd.py,flash_attn/cute/flash_fwd_sm100.py,flash_attn/cute/interface.py"
 
-  test:
+  fa4-correctness-and-benchmark:
     strategy:
       fail-fast: false
       matrix:
         gpu: [b200]
     runs-on: [self-hosted, '${{ matrix.gpu }}']
-    name: test (${{ matrix.gpu }})
+    name: fa4-correctness-and-benchmark (${{ matrix.gpu }})
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
