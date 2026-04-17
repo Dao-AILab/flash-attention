@@ -613,9 +613,6 @@ def _flash_attn_fwd(
         assert not is_split_kv, "split kv not supported with qv"
         if page_table is not None:
             page_size = k.shape[1]
-            assert page_size == tile_n, (
-                f"MLA paged KV currently requires page_size ({page_size}) == tile_n ({tile_n})"
-            )
             assert gather_kv_indices is None, "paged KV + topk sparsity not yet supported together"
             assert seqused_k is not None, "seqused_k required for paged KV with MLA"
         assert learnable_sink is None
@@ -768,9 +765,10 @@ def _flash_attn_fwd(
             )
         elif arch // 10 in [10, 11]:
             if qv is not None:
+                paged_kv_cpasync = page_table is not None and page_size != 128
                 fa_fwd = FlashAttentionMLAForwardSm100(
                     is_causal=causal,
-                    use_cpasync_load_KV=sparse_kv,
+                    use_cpasync_load_KV=sparse_kv or paged_kv_cpasync,
                     topk_length=gather_kv_length,
                     is_topk_gather=sparse_kv,
                     pack_gqa=pack_gqa,
