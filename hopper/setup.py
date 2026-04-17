@@ -64,6 +64,7 @@ DISABLE_HDIM96 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM96", "FALSE") == "TRUE"
 DISABLE_HDIM128 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM128", "FALSE") == "TRUE"
 DISABLE_HDIM192 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM192", "FALSE") == "TRUE"
 DISABLE_HDIM256 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM256", "FALSE") == "TRUE"
+DISABLE_HDIM512 = os.getenv("FLASH_ATTENTION_DISABLE_HDIM512", "FALSE") == "TRUE"
 DISABLE_SM8x = os.getenv("FLASH_ATTENTION_DISABLE_SM80", "FALSE") == "TRUE"
 
 ENABLE_VCOLMAJOR = os.getenv("FLASH_ATTENTION_ENABLE_VCOLMAJOR", "FALSE") == "TRUE"
@@ -516,6 +517,7 @@ if not SKIP_CUDA_BUILD:
         + (["-DFLASHATTENTION_DISABLE_HDIM128"] if DISABLE_HDIM128 else [])
         + (["-DFLASHATTENTION_DISABLE_HDIM192"] if DISABLE_HDIM192 else [])
         + (["-DFLASHATTENTION_DISABLE_HDIM256"] if DISABLE_HDIM256 else [])
+        + (["-DFLASHATTENTION_DISABLE_HDIM512"] if DISABLE_HDIM512 else [])
         + (["-DFLASHATTENTION_DISABLE_SM8x"] if DISABLE_SM8x else [])
         + (["-DFLASHATTENTION_ENABLE_VCOLMAJOR"] if ENABLE_VCOLMAJOR else [])
         + (["-DFLASHATTENTION_DISABLE_HDIMDIFF64"] if DISABLE_HDIMDIFF64 else [])
@@ -562,6 +564,12 @@ if not SKIP_CUDA_BUILD:
     if not DISABLE_HDIMDIFF64:
         sources_fwd_sm90 += [f"instantiations/flash_fwd_hdim{hdim}_{dtype}{paged}{split}{softcap}{packgqa}_sm90.cu"
                              for hdim, dtype, split, paged, softcap, packgqa in itertools.product(HEAD_DIMENSIONS_DIFF64_FWD, HALF_DTYPE_FWD_SM90, SPLIT, PAGEDKV, SOFTCAP, PACKGQA)
+                             if not (packgqa and (paged or split))]
+    if not DISABLE_HDIM512:
+        # Symmetric d=512: SM90 only, BF16/FP16 only (no FP8, no backward)
+        sources_fwd_sm90 += [f"instantiations/flash_fwd_hdim512_{dtype}{paged}{split}{softcap}{packgqa}_sm90.cu"
+                             for dtype, split, paged, softcap, packgqa in itertools.product(
+                                 HALF_DTYPE_FWD_SM90, SPLIT, PAGEDKV, SOFTCAP, PACKGQA)
                              if not (packgqa and (paged or split))]
     if not DISABLE_HDIMDIFF192:
         sources_fwd_sm90 += [f"instantiations/flash_fwd_hdim{hdim}_{dtype}{paged}{split}{softcap}{packgqa}_sm90.cu"
