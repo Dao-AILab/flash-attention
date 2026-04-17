@@ -450,6 +450,12 @@ def _flash_attn_fwd(
     elif lse is not None:
         _validate_tensor(lse, "lse", lse_shape, torch.float32, device)
 
+    if seqlen_k == 0:
+        out.zero_()
+        if lse is not None:
+            lse.fill_(float("-inf"))
+        return out, lse
+
     if is_fp8:
         for t, name in ((q_descale, "q_descale"), (k_descale, "k_descale"), (v_descale, "v_descale")):
             if t is not None:
