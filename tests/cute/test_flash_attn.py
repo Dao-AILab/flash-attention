@@ -2576,3 +2576,75 @@ def test_flash_attn_mla_paged_cpasync(seqlen_q, seqlen_k, page_size, causal, dty
     print(f"Output max diff: {(out - out_ref).abs().max().item()}")
     print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
     assert torch.equal(out, out_ref)
+
+
+# ---------------------------------------------------------------------------
+# Regression test: seqlen_k=0 must not deadlock (CUDA graph padding scenario)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("num_splits", [1, 3])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("d", [128, 192])
+@pytest.mark.parametrize("seqlen_q", [1, 64, 128, 256])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_seqlen_k_zero(seqlen_q, d, causal, num_splits):
+    """Regression: seqlen_k=0 must not deadlock in the 2CTA SM100 kernel.
+
+    When vLLM captures CUDA graphs with padded batches, padding entries set
+    seqlen_k=0.  This makes n_block_max - n_block_min = 0.  Previously the
+    early-out check was guarded by ``is_split_kv``, so on the default
+    non-split-KV path the MMA warp entered a branch that unconditionally
+    waited for a Softmax pipeline token that was never produced (0 loop
+    iterations → 0 tokens), causing a permanent mbarrier deadlock.
+
+    Fix: remove the ``is_split_kv`` guard so that ``n_block_min >= n_block_max
+    → skip`` applies to ALL warp roles (Load, MMA, Softmax, Correction,
+    EpilogueS2G) on every code path.
+
+    Expected output: all-zeros tensor (no KV tokens → identity output for
+    attention, i.e. the accumulator stays at zero).
+    """
+    if IS_SM90:
+        pytest.skip("SM90 uses a different kernel path; deadlock not reproducible here")
+    if num_splits > 1 and DISABLE_SPLIT:
+        pytest.skip("Split-KV disabled by env")
+    if d >= 192 and num_splits > 1:
+        pytest.skip("Split-KV not supported for hdim >= 192")
+
+    device = "cuda"
+    dtype = torch.bfloat16
+    dv = 128 if d == 192 else d
+    batch_size = 4   # mix of real and zero-length entries
+    nheads = 16
+    nheads_kv = 16
+
+    torch.manual_seed(0)
+    # All entries have seqlen_k = 0 to maximally stress the early-out path.
+    seqlen_k = 0
+
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
+    k = torch.empty(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype)
+    v = torch.empty(batch_size, seqlen_k, nheads_kv, dv, device=device, dtype=dtype)
+
+    out, lse = flash_attn_func(
+        q, k, v,
+        causal=causal,
+        num_splits=num_splits,
+    )
+
+    if is_fake_mode():
+        return
+
+    # With seqlen_k=0 the output must be all-zeros (no KV to attend to).
+    assert out.shape == (batch_size, seqlen_q, nheads, dv), \
+        f"Unexpected output shape: {out.shape}"
+    assert torch.all(out == 0).item(), \
+        f"Expected all-zero output when seqlen_k=0, got max={out.abs().max().item():.6f}"
+
+    # LSE must be -inf (no valid attention scores).
+    if lse is not None:
+        assert torch.all(torch.isinf(lse) & (lse < 0)).item(), \
+            f"Expected all -inf LSE when seqlen_k=0, got: {lse}"
+
+    print(f"[OK] seqlen_q={seqlen_q}, seqlen_k=0, d={d}, causal={causal},"
+          f" num_splits={num_splits}: no deadlock, output is all-zeros")

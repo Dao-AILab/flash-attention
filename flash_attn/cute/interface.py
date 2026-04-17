@@ -437,6 +437,15 @@ def _flash_attn_fwd(
     elif lse is not None:
         _validate_tensor(lse, "lse", lse_shape, torch.float32, device)
 
+    # Early return when there are no KV tokens: output is all-zeros, LSE is -inf.
+    # This avoids launching the kernel which would otherwise skip all work but
+    # leave the output tensor uninitialised (torch.empty).
+    if seqlen_k == 0:
+        out.zero_()
+        if lse is not None:
+            lse.fill_(float("-inf"))
+        return out, lse
+
     dtype = torch2cute_dtype_map[q.dtype]
     use_block_sparsity = block_sparse_tensors is not None
 
