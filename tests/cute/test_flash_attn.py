@@ -2586,26 +2586,27 @@ def test_flash_attn_mla_paged_cpasync(seqlen_q, seqlen_k, page_size, causal, dty
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("d", [128, 192])
 @pytest.mark.parametrize("seqlen_q", [1, 64, 128, 256])
+@pytest.mark.parametrize("page_size", [128])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_flash_attn_seqlen_k_zero(seqlen_q, d, causal, num_splits):
-    """Regression: seqlen_k=0 must not deadlock in the 2CTA SM100 kernel.
+def test_flash_attn_seqlen_k_zero(seqlen_q, d, causal, num_splits, page_size):
+    """Regression: seqused_k=0 (paged KV) must not deadlock in the 2CTA SM100 kernel.
 
     When vLLM captures CUDA graphs with padded batches, padding entries set
-    seqlen_k=0.  This makes n_block_max - n_block_min = 0.  Previously the
-    early-out check was guarded by ``is_split_kv``, so on the default
-    non-split-KV path the MMA warp entered a branch that unconditionally
-    waited for a Softmax pipeline token that was never produced (0 loop
-    iterations → 0 tokens), causing a permanent mbarrier deadlock.
+    seqused_k=0 while the paged KV cache still has pages allocated.  This makes
+    n_block_max - n_block_min = 0 inside the kernel.  Previously the early-out
+    check in the softmax warp was guarded by ``is_split_kv``, so on the default
+    non-split-KV path the warp unconditionally waited for a pipeline token that
+    was never produced (0 loop iterations -> 0 tokens), causing a permanent
+    mbarrier deadlock.
 
     Fix: remove the ``is_split_kv`` guard so that ``n_block_min >= n_block_max
-    → skip`` applies to ALL warp roles (Load, MMA, Softmax, Correction,
-    EpilogueS2G) on every code path.
+    -> skip`` applies to ALL warp roles on every code path.
 
-    Expected output: all-zeros tensor (no KV tokens → identity output for
+    Expected output: all-zeros tensor (no KV tokens -> identity output for
     attention, i.e. the accumulator stays at zero).
     """
     if IS_SM90:
-        pytest.skip("SM90 uses a different kernel path; deadlock not reproducible here")
+        pytest.skip("paged KV not supported on SM90")
     if num_splits > 1 and DISABLE_SPLIT:
         pytest.skip("Split-KV disabled by env")
     if d >= 192 and num_splits > 1:
@@ -2614,20 +2615,38 @@ def test_flash_attn_seqlen_k_zero(seqlen_q, d, causal, num_splits):
     device = "cuda"
     dtype = torch.bfloat16
     dv = 128 if d == 192 else d
-    batch_size = 4   # mix of real and zero-length entries
+    batch_size = 4
     nheads = 16
     nheads_kv = 16
+    total_q = batch_size * seqlen_q
 
     torch.manual_seed(0)
-    # All entries have seqlen_k = 0 to maximally stress the early-out path.
-    seqlen_k = 0
 
-    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
-    k = torch.empty(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype)
-    v = torch.empty(batch_size, seqlen_k, nheads_kv, dv, device=device, dtype=dtype)
+    # Q in varlen (flat) format: all sequences have the same seqlen_q
+    q = torch.randn(total_q, nheads, d, device=device, dtype=dtype)
+    cu_seqlens_q = torch.arange(
+        0, (batch_size + 1) * seqlen_q, seqlen_q, dtype=torch.int32, device=device
+    )
 
-    out, lse = flash_attn_func(
-        q, k, v,
+    # Paged KV cache: pages are allocated but seqused_k=0 for every entry,
+    # simulating CUDA graph padding where no batch entry has real KV tokens.
+    max_num_pages = max(1, seqlen_q // page_size)  # at least 1 page per batch
+    num_pages = max_num_pages * batch_size
+    k_paged = torch.randn(num_pages, page_size, nheads_kv, d, device=device, dtype=dtype)
+    v_paged = torch.randn(num_pages, page_size, nheads_kv, dv, device=device, dtype=dtype)
+    page_table = torch.arange(num_pages, dtype=torch.int32, device=device).reshape(
+        batch_size, max_num_pages
+    )
+    seqused_k = torch.zeros(batch_size, dtype=torch.int32, device=device)
+
+    out, lse = flash_attn_varlen_func(
+        q, k_paged, v_paged,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=None,
+        max_seqlen_q=seqlen_q,
+        max_seqlen_k=None,
+        seqused_k=seqused_k,
+        page_table=page_table,
         causal=causal,
         num_splits=num_splits,
     )
@@ -2635,16 +2654,16 @@ def test_flash_attn_seqlen_k_zero(seqlen_q, d, causal, num_splits):
     if is_fake_mode():
         return
 
-    # With seqlen_k=0 the output must be all-zeros (no KV to attend to).
-    assert out.shape == (batch_size, seqlen_q, nheads, dv), \
+    # With seqused_k=0 the output must be all-zeros (no KV to attend to).
+    assert out.shape == (total_q, nheads, dv), \
         f"Unexpected output shape: {out.shape}"
     assert torch.all(out == 0).item(), \
-        f"Expected all-zero output when seqlen_k=0, got max={out.abs().max().item():.6f}"
+        f"Expected all-zero output when seqused_k=0, got max={out.abs().max().item():.6f}"
 
     # LSE must be -inf (no valid attention scores).
     if lse is not None:
         assert torch.all(torch.isinf(lse) & (lse < 0)).item(), \
-            f"Expected all -inf LSE when seqlen_k=0, got: {lse}"
+            f"Expected all -inf LSE when seqused_k=0, got: {lse}"
 
-    print(f"[OK] seqlen_q={seqlen_q}, seqlen_k=0, d={d}, causal={causal},"
-          f" num_splits={num_splits}: no deadlock, output is all-zeros")
+    print(f"[OK] seqlen_q={seqlen_q}, seqused_k=0, d={d}, causal={causal},"
+          f" num_splits={num_splits}, page_size={page_size}: no deadlock, output is all-zeros")

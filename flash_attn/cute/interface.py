@@ -422,7 +422,10 @@ def _flash_attn_fwd(
     requires_grad = q.requires_grad or k.requires_grad or v.requires_grad
 
     if out is None:
-        out = torch.empty(
+        # Zero-init so that tiles skipped by the kernel (e.g. seqused_k=0
+        # padding entries in CUDA-graph capture) produce deterministic zeros
+        # instead of stale memory contents.
+        out = torch.zeros(
             *q_batch_seqlen_shape, num_head, head_dim_v, dtype=out_torch_dtype, device=device
         )
     else:
@@ -430,21 +433,12 @@ def _flash_attn_fwd(
 
     if lse is None:
         lse = (
-            torch.empty(lse_shape, dtype=torch.float32, device=device)
+            torch.full(lse_shape, float("-inf"), dtype=torch.float32, device=device)
             if requires_grad or return_lse
             else None
         )
     elif lse is not None:
         _validate_tensor(lse, "lse", lse_shape, torch.float32, device)
-
-    # Early return when there are no KV tokens: output is all-zeros, LSE is -inf.
-    # This avoids launching the kernel which would otherwise skip all work but
-    # leave the output tensor uninitialised (torch.empty).
-    if seqlen_k == 0:
-        out.zero_()
-        if lse is not None:
-            lse.fill_(float("-inf"))
-        return out, lse
 
     dtype = torch2cute_dtype_map[q.dtype]
     use_block_sparsity = block_sparse_tensors is not None
