@@ -2,7 +2,7 @@
 
 import math
 from functools import partial
-from typing import Optional, Tuple, Union
+from typing import Dict, Optional, Tuple, Union
 
 import torch
 from torch import Tensor
@@ -353,14 +353,24 @@ class RotaryEmbedding(torch.nn.Module):
         interleaved=False,
         scale_base=None,
         device=None,
+        rope_scaling: Optional[Dict] = None,
     ):
         """
         interleaved: if True, rotate pairs of even and odd dimensions (GPT-J style) instead
             of 1st half and 2nd half (GPT-NeoX style).
+        rope_scaling: optional dict for context-extension scaling. Supported types:
+            - {"type": "linear", "factor": float}
+            - {"type": "ntk", "factor": float}
+            - {"type": "yarn", "factor": float,
+               "original_max_position_embeddings": int,  # default 4096
+               "beta_fast": float,                       # default 32
+               "beta_slow": float,                       # default 1
+               "mscale": float}                          # default 0.1
         """
         super().__init__()
         self.dim = dim
         self.base = float(base)
+        self.rope_scaling = rope_scaling
         # Generate and save the inverse frequency buffer (non trainable)
         inv_freq = self._compute_inv_freq(device)
         self.register_buffer("inv_freq", inv_freq, persistent=False)
@@ -378,12 +388,54 @@ class RotaryEmbedding(torch.nn.Module):
         self._sin_cached = None
         self._cos_k_cached = None
         self._sin_k_cached = None
+        self._yarn_mscale = 1.0
 
     def _compute_inv_freq(self, device=None):
-        return 1.0 / (
+        base_inv_freq = 1.0 / (
             self.base
             ** (torch.arange(0, self.dim, 2, device=device, dtype=torch.float32) / self.dim)
         )
+        if self.rope_scaling is None:
+            return base_inv_freq
+
+        scaling_type = self.rope_scaling["type"]
+        factor = float(self.rope_scaling["factor"])
+
+        if scaling_type == "linear":
+            return base_inv_freq / factor
+
+        elif scaling_type == "ntk":
+            scaled_base = self.base * (factor ** (self.dim / (self.dim - 2)))
+            return 1.0 / (
+                scaled_base
+                ** (torch.arange(0, self.dim, 2, device=device, dtype=torch.float32) / self.dim)
+            )
+
+        elif scaling_type == "yarn":
+            orig_ctx = int(self.rope_scaling.get("original_max_position_embeddings", 4096))
+            beta_fast = float(self.rope_scaling.get("beta_fast", 32))
+            beta_slow = float(self.rope_scaling.get("beta_slow", 1))
+            mscale_coeff = float(self.rope_scaling.get("mscale", 0.1))
+
+            freq_idx = torch.arange(0, self.dim, 2, device=device, dtype=torch.float32)
+            wavelengths = 2.0 * math.pi / (self.base ** (freq_idx / self.dim))
+
+            lo = orig_ctx / beta_fast
+            hi = orig_ctx / beta_slow
+            ramp = torch.clamp((wavelengths - lo) / (hi - lo + 1e-8), 0.0, 1.0)
+
+            per_dim_scale = (1.0 - ramp) / factor + ramp
+            inv_freq = base_inv_freq * per_dim_scale
+
+            if mscale_coeff != 0.0 and factor > 1.0:
+                self._yarn_mscale = 0.1 * mscale_coeff * math.log(factor) + 1.0
+            return inv_freq
+
+        else:
+            raise ValueError(
+                f"Unknown rope_scaling type '{scaling_type}'. "
+                "Expected one of: 'linear', 'ntk', 'yarn'."
+            )
 
     def _update_cos_sin_cache(self, seqlen, device=None, dtype=None):
         # Reset the tables if the sequence length has changed,
