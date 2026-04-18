@@ -330,7 +330,6 @@ class FlashAttentionForwardSm120Tma(FlashAttentionForwardBase):
         mO: cute.Tensor,
         mLSE: Optional[cute.Tensor],
         softmax_scale: Float32,
-        stream: cuda.CUstream,
         mCuSeqlensQ: Optional[cute.Tensor] = None,
         mCuSeqlensK: Optional[cute.Tensor] = None,
         mSeqUsedQ: Optional[cute.Tensor] = None,
@@ -341,6 +340,11 @@ class FlashAttentionForwardSm120Tma(FlashAttentionForwardBase):
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors=None,
         aux_tensors=None,
+        # Always keep stream as the last parameter (matches base
+        # FlashAttentionForwardSm80.__call__ convention; cute.compile
+        # binds arguments positionally against compile_args, which ends
+        # with current_stream).
+        stream: cuda.CUstream = None,
     ):
         """Configures and launches the TMA SM120 flash attention kernel.
 
