@@ -433,7 +433,13 @@ class FlashAttentionBackwardSm80:
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
         grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
 
-        softmax_scale_log2, softmax_scale = utils.compute_softmax_scale_log2(softmax_scale, self.score_mod)
+        softmax_scale_for_scoremod = softmax_scale
+        if cutlass.const_expr(self.score_mod is None):
+            softmax_scale_log2 = softmax_scale * math.log2(math.e)
+        else:
+            softmax_scale_log2, softmax_scale_for_scoremod = utils.compute_softmax_scale_log2(
+                softmax_scale, self.score_mod
+            )
         self.kernel(
             mQ,
             mK,
@@ -448,7 +454,7 @@ class FlashAttentionBackwardSm80:
             mCuSeqlensK,
             mSeqUsedQ,
             mSeqUsedK,
-            softmax_scale,
+            softmax_scale_for_scoremod,
             softmax_scale_log2,
             self.sQ_layout,
             self.sK_layout,
