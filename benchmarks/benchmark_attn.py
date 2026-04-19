@@ -323,6 +323,13 @@ def parse_args():
                         help='kv sparsity length for MLA (hdim=64, hdim_v=512 only). '
                              'When set, passes random kv indices (without repeats) to FA4 and uses gather-kv as '
                              'the effective KV length for flops/bandwidth accounting.')
+    parser.add_argument('--num-splits', type=int, default=0,
+                        help='Override kernel num_splits heuristic. 0 = auto (default). '
+                             '>1 forces SplitKV with that many splits.')
+    parser.add_argument('--pack-gqa', type=str.lower, choices=['auto', 'true', 'false'], default='auto',
+                        help='Override kernel pack_gqa heuristic. auto = kernel default (default). '
+                             'true/false force pack_gqa on or off. Note: for non-MLA GQA with '
+                             'num_splits>1, interface.py may still force pack_gqa off pending a fix.')
     parser.add_argument('--warmup', type=int, default=5,
                         help='Warmup iterations (default: 5)')
     parser.add_argument('--rep', type=int, default=10,
@@ -406,10 +413,10 @@ def main():
         has_qv = headdim == 64 and headdim_v == 512
         sinks = None
 
-        num_splits = 0
+        num_splits = args.num_splits
         window_size = (None, None)
         window_size_fa = (-1, -1)
-        pack_gqa = None
+        pack_gqa = None if args.pack_gqa == 'auto' else (args.pack_gqa == 'true')
 
         for seqlen, seqlen_q in zip(seqlen_list, seqlen_q_list):
             batch_size = args.batch_size if args.batch_size is not None else max(1, args.total_seqlen // seqlen)
