@@ -89,6 +89,11 @@ def _get_disable_2cta_default() -> bool:
     return _fa_disable_2cta_enabled or _fa_disable_2cta_cuda12
 
 
+def _nvvm_atomicrmw_accepts_res(fn: Callable = nvvm.atomicrmw) -> bool:
+    """Handle CUTLASS DSL bindings with and without an explicit result type."""
+    return "res" in inspect.signature(fn).parameters
+
+
 def _compute_base_hash(func: Callable) -> str:
     """Compute hash from source code or bytecode and closure values."""
     try:
@@ -451,9 +456,15 @@ def atomic_add_fp32(a: float | Float32, gmem_ptr: cute.Pointer, *, loc=None, ip=
     #     is_align_stack=False,
     #     asm_dialect=llvm.AsmDialect.AD_ATT,
     # )
-    nvvm.atomicrmw(
-        res=T.f32(), op=nvvm.AtomicOpKind.FADD, ptr=gmem_ptr.llvm_ptr, a=Float32(a).ir_value()
-    )
+    atomicrmw_kwargs = {
+        "op": nvvm.AtomicOpKind.FADD,
+        "ptr": gmem_ptr.llvm_ptr,
+        "a": Float32(a).ir_value(loc=loc, ip=ip),
+    }
+    if _nvvm_atomicrmw_accepts_res():
+        nvvm.atomicrmw(res=T.f32(), **atomicrmw_kwargs)
+    else:
+        nvvm.atomicrmw(**atomicrmw_kwargs)
 
 
 @dsl_user_op
