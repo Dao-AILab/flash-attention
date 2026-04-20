@@ -2410,3 +2410,65 @@ def test_flash_attn_mla_absorbed_varlen(
                 # print(f"out vs out2 max diff: {(out_cmp - out2).abs().max().item()}, {iter=}")
                 # print(f"out vs out2 mean diff: {(out_cmp - out2).abs().mean().item()}, {iter=}")
                 assert torch.equal(out_cmp, out2), f"non-deterministic with max diff = {(out_cmp - out2).abs().max().item()} on {iter=}"
+
+
+# ---------------------------------------------------------------------------
+# Regression test: seqlen_k=0 must not crash (CUDA graph padding scenario)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("d", [128, 192])
+@pytest.mark.parametrize("seqlen_q", [1, 64, 128, 256])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_seqlen_k_zero(seqlen_q, d, causal):
+    """K/V with physical seqlen dim == 0 must not crash.
+
+    seqlen_k == 0 violates two downstream invariants, producing two
+    different crashes depending on the mask:
+
+      causal=False -> TMA descriptor over a 0-length K tensor goes OOB
+                      on first tile load -> PTX IllegalInstruction.
+
+      causal=True  -> SingleTileLPTScheduler's L2-swizzle heuristic in
+                      tile_scheduler.py evaluates
+                          size_l2 // (seqlen_k * (d + d_v) * elem_size)
+                      -> host SIGFPE before the kernel launches.
+
+    Varlen paths (cu_seqlens_k / seqused_k with K physical seqlen > 0)
+    are not exercised here: per-batch empty slots are already handled
+    by the kernel's fake-iteration path and do not hit either invariant.
+    """
+    if IS_SM90:
+        pytest.skip("SM90 uses a different kernel path")
+
+    device = "cuda"
+    dtype = torch.bfloat16
+    dv = 128 if d == 192 else d
+    batch_size = 4
+    nheads = 16
+    nheads_kv = 16
+
+    torch.manual_seed(0)
+
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
+    # K/V have physical seqlen dim == 0 — this is what crashes on unpatched FA4.
+    # causal=False hits GPU IllegalInstruction (TMA OOB on 0-length K tensor).
+    # causal=True  hits host SIGFPE in tile_scheduler.py LPT L2-swizzle heuristic
+    #              (size_l2 // size_one_head with size_one_head = seqlen_k*... = 0).
+    k = torch.empty(batch_size, 0, nheads_kv, d, device=device, dtype=dtype)
+    v = torch.empty(batch_size, 0, nheads_kv, dv, device=device, dtype=dtype)
+
+    out, lse = flash_attn_func(q, k, v, causal=causal)
+
+    if is_fake_mode():
+        return
+
+    # No crash above already validates the fix. Below validates the contract
+    # the early-return promises: zero output, -inf LSE.
+    assert out.shape == (batch_size, seqlen_q, nheads, dv), \
+        f"Unexpected output shape: {out.shape}"
+    assert torch.all(out == 0).item(), \
+        f"Expected all-zero output when seqlen_k=0, got max={out.abs().max().item():.6f}"
+    if lse is not None:
+        assert torch.all(torch.isinf(lse) & (lse < 0)).item(), \
+            f"Expected all -inf LSE when seqlen_k=0, got: {lse}"
