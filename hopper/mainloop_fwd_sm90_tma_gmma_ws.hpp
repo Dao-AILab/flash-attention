@@ -396,6 +396,8 @@ struct CollectiveMainloopFwdSm90 {
         int const* const seqused_k = nullptr;
         int const* const leftpad_k = nullptr;
         int const* const seqlens_rotary = nullptr;
+        bool const* const image_token_tag = nullptr;
+        int const max_image_q_idx = -1;
     };
 
     // Device side kernel params
@@ -453,6 +455,8 @@ struct CollectiveMainloopFwdSm90 {
         int const* const seqused_k = nullptr;
         int const* const leftpad_k = nullptr;
         int const *const seqlens_rotary = nullptr;
+        bool const* const image_token_tag = nullptr;
+        int const max_image_q_idx = -1;
     };
 
     static Params
@@ -564,7 +568,8 @@ struct CollectiveMainloopFwdSm90 {
                 !Split ? 1 : args.num_splits,
                 args.kv_batch_idx,
                 args.cu_seqlens_q, args.cu_seqlens_k, args.cu_seqlens_k_new,
-                args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary};
+                args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary,
+                args.image_token_tag, args.max_image_q_idx};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -608,7 +613,7 @@ struct CollectiveMainloopFwdSm90 {
         auto [n_block_min, n_block_max] = BlockMN_t::get_n_block_min_max(
             seqlen_info, m_block, bidb, split_idx, params.num_splits,
             params.window_size_left, params.window_size_right, params.attention_chunk_divmod,
-            params.qhead_per_khead_divmod);
+            params.qhead_per_khead_divmod, params.max_image_q_idx);
         // It's possible to have n_block_max <= n_block_min. Loading K can cause illegal memory access.
         if constexpr (Is_causal || Is_local || Varlen || Split) {
             if (n_block_max <= n_block_min) {
@@ -977,7 +982,7 @@ struct CollectiveMainloopFwdSm90 {
         auto [n_block_min, n_block_max] = BlockMN_t::get_n_block_min_max(
             seqlen_info, m_block, bidb, split_idx, params.num_splits,
             params.window_size_left, params.window_size_right, params.attention_chunk_divmod,
-            params.qhead_per_khead_divmod);
+            params.qhead_per_khead_divmod, params.max_image_q_idx);
         // It's possible to have n_block_max <= n_block_min. We don't want to load Q or change any barrier
         if constexpr (Is_causal || Is_local || Varlen || Split) {
             if (n_block_max <= n_block_min) { return false; }
@@ -1061,7 +1066,8 @@ struct CollectiveMainloopFwdSm90 {
 
         flash::Mask<kBlockM, kBlockN, PackGQA, TiledMmaQK> mask(
             thread_idx, seqlen_q, seqlen_k, params.window_size_left, params.window_size_right, 0 /*sink_token_length*/,
-            params.attention_chunk_divmod, params.qhead_per_khead_divmod
+            params.attention_chunk_divmod, params.qhead_per_khead_divmod,
+            params.image_token_tag, seqlen_info.offset_q
         );
 
         float softcap_val = params.softcap_val;
@@ -1371,7 +1377,7 @@ struct CollectiveMainloopFwdSm90 {
         auto [n_block_min, n_block_max] = BlockMN_t::get_n_block_min_max(
             seqlen_info, m_block, bidb, split_idx, params.num_splits,
             params.window_size_left, params.window_size_right, params.attention_chunk_divmod,
-            params.qhead_per_khead_divmod);
+            params.qhead_per_khead_divmod, params.max_image_q_idx);
         // It's possible to have n_block_max <= n_block_min. We don't want to load Q or change any barrier
         if constexpr (Is_causal || Is_local || Varlen || Split) {
             if (n_block_max <= n_block_min) { return false; }
@@ -1458,7 +1464,7 @@ struct CollectiveMainloopFwdSm90 {
         auto [n_block_new_min, n_block_new_max] = BlockMN_t::get_n_block_k_new_min_max(
             seqlen_info, m_block, bidb, split_idx, params.num_splits,
             params.window_size_left, params.window_size_right, params.attention_chunk_divmod,
-            params.qhead_per_khead_divmod);
+            params.qhead_per_khead_divmod, params.max_image_q_idx);
 
         if (n_block_new_max <= n_block_new_min) { return false; }
 
@@ -1561,7 +1567,7 @@ struct CollectiveMainloopFwdSm90 {
         auto [n_block_new_min, n_block_new_max] = BlockMN_t::get_n_block_k_new_min_max(
             seqlen_info, m_block, bidb, split_idx, params.num_splits,
             params.window_size_left, params.window_size_right, params.attention_chunk_divmod,
-            params.qhead_per_khead_divmod);
+            params.qhead_per_khead_divmod, params.max_image_q_idx);
         if (n_block_new_max <= n_block_new_min) { return false; }
 
         // as_position_independent_swizzle_tensor makes address calculation easier

@@ -16,7 +16,8 @@ struct BlockMN {
             int const m_block, int const bidb, int const split_idx, int const num_splits,
             int const window_size_left, int const window_size_right,
             cutlass::FastDivmod const& attention_chunk_divmod,
-            cutlass::FastDivmod const& qhead_per_khead_divmod) {
+            cutlass::FastDivmod const& qhead_per_khead_divmod,
+            int const max_image_q_idx = -1) {
 
         int const seqlen_k = seqlen_info.seqlen_k;
         int const seqlen_q = seqlen_info.seqlen_q;
@@ -30,7 +31,19 @@ struct BlockMN {
             if (Is_local && attention_chunk_divmod.divisor > 0) {
                 n_idx_right = std::min(n_idx_right, flash::round_up(attention_chunk_divmod, n_idx));
             }
-            n_block_max = std::min(n_block_max, cute::ceil_div(n_idx_right, kBlockN));
+            // Skip causal n_block_max restriction for M-blocks that may contain image tokens.
+            // Image tokens need full attention (all K blocks visible).
+            bool restrict_causal = true;
+            if (max_image_q_idx >= 0) {
+                int m_idx_min = m_block * kBlockM;
+                if (PackGQA) { m_idx_min = qhead_per_khead_divmod.divide(m_idx_min); }
+                if (max_image_q_idx >= seqlen_info.offset_q + m_idx_min) {
+                    restrict_causal = false;
+                }
+            }
+            if (restrict_causal) {
+                n_block_max = std::min(n_block_max, cute::ceil_div(n_idx_right, kBlockN));
+            }
         }
         int n_block_min = 0;
         if constexpr (Is_local) {
@@ -65,11 +78,13 @@ struct BlockMN {
             int const m_block, int const bidb, int const split_idx, int const num_splits,
             int const window_size_left, int const window_size_right,
             cutlass::FastDivmod const& attention_chunk_divmod,
-            cutlass::FastDivmod const& qhead_per_khead_divmod) {
+            cutlass::FastDivmod const& qhead_per_khead_divmod,
+            int const max_image_q_idx = -1) {
 
         auto [n_block_min, n_block_max] = get_n_block_min_max(
             seqlen_info, m_block, bidb, split_idx, num_splits,
-            window_size_left, window_size_right, attention_chunk_divmod, qhead_per_khead_divmod);
+            window_size_left, window_size_right, attention_chunk_divmod, qhead_per_khead_divmod,
+            max_image_q_idx);
         int const idx_k_new_min = std::max(n_block_min * kBlockN - seqlen_info.seqlen_k_og, 0);
         int const idx_k_new_max = std::min(n_block_max * kBlockN - seqlen_info.seqlen_k_og, seqlen_info.seqlen_k_new);
         int const n_block_new_min = idx_k_new_min / kBlockN;

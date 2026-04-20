@@ -78,6 +78,7 @@ void set_params_fprop(Flash_fwd_params &params,
 
     // Reset the parameters
     params = {};
+    params.max_image_q_idx = -1;
 
     params.is_bf16 = q.dtype() == torch::kBFloat16;
     params.is_e4m3 = q.dtype() == torch::kFloat8_e4m3fn;
@@ -704,7 +705,9 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         std::optional<at::Tensor> scheduler_metadata_,  // (b + 1)
         int64_t num_splits,
         std::optional<bool> pack_gqa_,
-        int64_t sm_margin
+        int64_t sm_margin,
+        std::optional<at::Tensor> image_token_tag_,
+        int64_t max_image_q_idx
         ) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
@@ -1143,6 +1146,20 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         } else {
             params.v_descale_ptr = nullptr;
         }
+    }
+
+    if (image_token_tag_.has_value()) {
+        auto image_token_tag = image_token_tag_.value();
+        CHECK_DEVICE(image_token_tag);
+        CHECK_CONTIGUOUS(image_token_tag);
+        TORCH_CHECK(image_token_tag.dtype() == torch::kBool, "image_token_tag must have dtype torch.bool");
+        CHECK_SHAPE(image_token_tag, total_q);
+        TORCH_CHECK(is_varlen_q, "image_token_tag requires varlen mode (cu_seqlens_q must be provided)");
+        TORCH_CHECK(is_causal, "image_token_tag requires causal=True");
+        TORCH_CHECK(!params.is_local, "image_token_tag is incompatible with sliding window attention");
+        TORCH_CHECK(attention_chunk == 0, "image_token_tag is incompatible with attention_chunk");
+        params.image_token_tag = static_cast<bool*>(image_token_tag.data_ptr());
+        params.max_image_q_idx = static_cast<int>(max_image_q_idx);
     }
 
     #ifdef FLASHATTENTION_DISABLE_LOCAL
@@ -1705,7 +1722,9 @@ TORCH_LIBRARY(flash_attn_3, m) {
         "Tensor? scheduler_metadata = None,"
         "int num_splits = 0,"
         "bool? pack_gqa = None,"
-        "int sm_margin = 0) -> (Tensor(out!), Tensor, Tensor, Tensor)");
+        "int sm_margin = 0,"
+        "Tensor? image_token_tag = None,"
+        "int max_image_q_idx = -1) -> (Tensor(out!), Tensor, Tensor, Tensor)");
     m.def("bwd("
         "Tensor dout,"
         "Tensor q,"

@@ -24,12 +24,15 @@ struct Mask {
     int const window_size_left, window_size_right, sink_token_length;
     cutlass::FastDivmod const attention_chunk_divmod;
     cutlass::FastDivmod const qhead_per_khead_divmod;
+    bool const * image_token_tag;
+    int const offset_q;
 
     CUTLASS_DEVICE
     Mask(const int thread_idx, const int seqlen_q, const int seqlen_k,
          const int window_size_left, const int window_size_right, const int sink_token_length,
          cutlass::FastDivmod const &attention_chunk_divmod,
-         cutlass::FastDivmod const &qhead_per_khead_divmod)
+         cutlass::FastDivmod const &qhead_per_khead_divmod,
+         bool const * image_token_tag = nullptr, int offset_q = 0)
         : thread_idx(thread_idx)
         , seqlen_q(seqlen_q)
         , seqlen_k(seqlen_k)
@@ -38,6 +41,8 @@ struct Mask {
         , sink_token_length(sink_token_length)
         , attention_chunk_divmod(attention_chunk_divmod)
         , qhead_per_khead_divmod(qhead_per_khead_divmod)
+        , image_token_tag(image_token_tag)
+        , offset_q(offset_q)
     {
     };
 
@@ -92,9 +97,14 @@ struct Mask {
                         int const row_idx = !PackGQA
                             ? get<Row>(tScS_rowcol(m, _0{})) + m_block * kBlockM
                             :  __shfl_sync(0xffffffff, mma_m_idx, m % kMmaThreadsPerRow, kMmaThreadsPerRow);
-                        int const col_limit_right = !Seqlenk_mask
-                            ? row_idx + causal_row_offset
-                            : __viaddmin_s32(row_idx, causal_row_offset, seqlenk_col_limit);
+                        // Image tokens skip causal masking (full attention to all keys)
+                        bool const is_image = image_token_tag != nullptr && row_idx < seqlen_q
+                            && image_token_tag[offset_q + row_idx];
+                        int const col_limit_right = is_image
+                            ? seqlenk_col_limit
+                            : (!Seqlenk_mask
+                                ? row_idx + causal_row_offset
+                                : __viaddmin_s32(row_idx, causal_row_offset, seqlenk_col_limit));
                         #pragma unroll
                         for (int n = 0; n < size<1>(tSrS_rowcol); ++n) {
                             if (int(get<Col>(t0ScS_rowcol(_0{}, n))) >= col_limit_right) { tSrS_rowcol(m, n) = -INFINITY; }
