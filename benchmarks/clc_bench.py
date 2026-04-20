@@ -50,9 +50,9 @@ class DenseSweep:
     enabled: bool = True
     batches: list[int] = field(default_factory=lambda: [1, 4, 8, 16, 32])
     seqlen_pairs: list[list[int]] = field(
-        default_factory=lambda: [[1024, 1024], [2048, 2048], [4096, 4096], [8192, 8192], [16384, 16384]]
+        default_factory=lambda: [[32, 8192], [1024, 1024], [2048, 2048], [4096, 4096], [8192, 8192], [16384, 16384]]
     )
-    head_dims: list[int] = field(default_factory=lambda: [64, 96, 128])
+    head_dims: list[int | list[int]] = field(default_factory=lambda: [64, 96, 128, [192, 128]])
     head_pairs: list[list[int]] = field(default_factory=lambda: [[16, 16], [16, 8], [16, 4], [16, 2], [16, 1]])
     causal: bool | list[bool] = True
 
@@ -64,7 +64,7 @@ class VarlenSweep:
     max_kv_tokens: list[int] = field(default_factory=lambda: [2048, 4096, 8192, 16384, 32768])
     batches: list[int] = field(default_factory=lambda: [4, 8, 16, 32])
     patterns: list[str] = field(default_factory=lambda: ["uniform", "longtail"])
-    head_dims: list[int] = field(default_factory=lambda: [64, 96, 128])
+    head_dims: list[int | list[int]] = field(default_factory=lambda: [64, 96, 128, [192, 128]])
     head_pairs: list[list[int]] = field(default_factory=lambda: [[16, 8], [16, 4], [16, 2], [16, 1]])
     causal: bool | list[bool] = False
 
@@ -76,7 +76,7 @@ class BlockSparseSweep:
     seqlen_pairs: list[list[int]] = field(
         default_factory=lambda: [[1024, 1024], [2048, 2048], [4096, 4096], [4096, 8192]]
     )
-    head_dims: list[int] = field(default_factory=lambda: [64, 128])
+    head_dims: list[int | list[int]] = field(default_factory=lambda: [64, 128, [192, 128]])
     head_pairs: list[list[int]] = field(default_factory=lambda: [[16, 16], [16, 4], [16, 1]])
     mask_names: list[str] = field(default_factory=lambda: ["block_diagonal"])
     sliding_window_sizes: list[int] = field(default_factory=lambda: [2048])
@@ -89,6 +89,7 @@ class Case:
     q_heads: int
     kv_heads: int
     d: int
+    dv: int
     causal: bool
     batch: int | None = None
     seqlen_q: int | None = None
@@ -116,12 +117,36 @@ def token_label(value: int) -> str:
     return f"{value // 1024}k" if value >= 1024 and value % 1024 == 0 else str(value)
 
 
-def dense_case_name(q_heads: int, kv_heads: int, causal: bool, d: int, batch: int, seqlen_q: int, seqlen_k: int) -> str:
+def head_dim_label(d: int, dv: int) -> str:
+    return f"h{d}" if d == dv else f"h{d}_dv{dv}"
+
+
+def head_dim_pairs(head_dims: list[int | list[int]]) -> list[tuple[int, int]]:
+    pairs: list[tuple[int, int]] = []
+    invalid_pairs: list[int | list[int]] = []
+    for dims in head_dims:
+        if isinstance(dims, int):
+            pairs.append((dims, dims))
+            continue
+        if len(dims) == 1:
+            pairs.append((dims[0], dims[0]))
+            continue
+        if len(dims) == 2:
+            pairs.append((dims[0], dims[1]))
+            continue
+        invalid_pairs.append(dims)
+    if invalid_pairs:
+        raise ValueError(f"Expected d or [d] or [d, dv], got {invalid_pairs}")
+    return pairs
+
+
+def dense_case_name(q_heads: int, kv_heads: int, causal: bool, d: int, dv: int, batch: int, seqlen_q: int, seqlen_k: int) -> str:
     causal_name = "causal" if causal else "noncausal"
     pair = head_pair_label(q_heads, kv_heads)
+    dims = head_dim_label(d, dv)
     if seqlen_q == seqlen_k:
-        return f"{pair}_{causal_name}_h{d}_{token_label(seqlen_q)}_b{batch}"
-    return f"{pair}_{causal_name}_q{seqlen_q}_k{seqlen_k}_h{d}_b{batch}"
+        return f"{pair}_{causal_name}_{dims}_{token_label(seqlen_q)}_b{batch}"
+    return f"{pair}_{causal_name}_q{seqlen_q}_k{seqlen_k}_{dims}_b{batch}"
 
 
 def varlen_case_name(
@@ -130,14 +155,16 @@ def varlen_case_name(
     kv_heads: int,
     causal: bool,
     d: int,
+    dv: int,
     batch: int,
     max_q_tokens: int,
     max_kv_tokens: int,
 ) -> str:
     causal_name = "causal" if causal else "noncausal"
     pair = head_pair_label(q_heads, kv_heads)
+    dims = head_dim_label(d, dv)
     return (
-        f"varlen_{pattern}_{pair}_{causal_name}_h{d}_"
+        f"varlen_{pattern}_{pair}_{causal_name}_{dims}_"
         f"b{batch}_q{token_label(max_q_tokens)}_kv{token_label(max_kv_tokens)}"
     )
 
@@ -200,21 +227,22 @@ def generate_cases(
 ) -> list[Case]:
     cases: list[Case] = []
     if dense.enabled:
-        for batch, seqlen_pair, d, (q_heads, kv_heads), causal in product(
+        for batch, seqlen_pair, (d, dv), (q_heads, kv_heads), causal in product(
             dense.batches,
             dense.seqlen_pairs,
-            dense.head_dims,
+            head_dim_pairs(dense.head_dims),
             dense.head_pairs,
             bool_values(dense.causal),
         ):
             seqlen_q, seqlen_k = seqlen_pair
             cases.append(
                 Case(
-                    name=dense_case_name(q_heads, kv_heads, causal, d, batch, seqlen_q, seqlen_k),
+                    name=dense_case_name(q_heads, kv_heads, causal, d, dv, batch, seqlen_q, seqlen_k),
                     mode="dense",
                     q_heads=q_heads,
                     kv_heads=kv_heads,
                     d=d,
+                    dv=dv,
                     causal=causal,
                     batch=batch,
                     seqlen_q=seqlen_q,
@@ -222,12 +250,12 @@ def generate_cases(
                 )
             )
     if varlen.enabled:
-        for max_q_tokens, max_kv_tokens, batch, pattern, d, (q_heads, kv_heads), causal in product(
+        for max_q_tokens, max_kv_tokens, batch, pattern, (d, dv), (q_heads, kv_heads), causal in product(
             varlen.max_q_tokens,
             varlen.max_kv_tokens,
             varlen.batches,
             varlen.patterns,
-            varlen.head_dims,
+            head_dim_pairs(varlen.head_dims),
             varlen.head_pairs,
             bool_values(varlen.causal),
         ):
@@ -236,11 +264,12 @@ def generate_cases(
             lengths_k = normalize_lengths(weights, max(batch, max_kv_tokens))
             cases.append(
                 Case(
-                    name=varlen_case_name(pattern, q_heads, kv_heads, causal, d, batch, max_q_tokens, max_kv_tokens),
+                    name=varlen_case_name(pattern, q_heads, kv_heads, causal, d, dv, batch, max_q_tokens, max_kv_tokens),
                     mode="varlen",
                     q_heads=q_heads,
                     kv_heads=kv_heads,
                     d=d,
+                    dv=dv,
                     causal=causal,
                     batch=batch,
                     seqlens_q=lengths_q,
@@ -249,10 +278,10 @@ def generate_cases(
                 )
             )
     if block_sparse.enabled:
-        for batch, seqlen_pair, d, (q_heads, kv_heads), mask_name in product(
+        for batch, seqlen_pair, (d, dv), (q_heads, kv_heads), mask_name in product(
             block_sparse.batches,
             block_sparse.seqlen_pairs,
-            block_sparse.head_dims,
+            head_dim_pairs(block_sparse.head_dims),
             block_sparse.head_pairs,
             block_sparse.mask_names,
         ):
@@ -263,16 +292,18 @@ def generate_cases(
             for window_size in window_sizes:
                 window_label = f"_w{window_size}" if window_size is not None else ""
                 pair = head_pair_label(q_heads, kv_heads)
+                dims = head_dim_label(d, dv)
                 cases.append(
                     Case(
                         name=(
                             f"block_sparse_{mask_name}{window_label}_{pair}_"
-                            f"h{d}_q{seqlen_q}_k{seqlen_k}_b{batch}"
+                            f"{dims}_q{seqlen_q}_k{seqlen_k}_b{batch}"
                         ),
                         mode="block_sparse",
                         q_heads=q_heads,
                         kv_heads=kv_heads,
                         d=d,
+                        dv=dv,
                         causal=False,
                         batch=batch,
                         seqlen_q=seqlen_q,
@@ -302,11 +333,12 @@ def compile_signature(case: Case) -> tuple:
             case.q_heads,
             case.kv_heads,
             case.d,
+            case.dv,
             case.mask_name,
             case.window_size,
             q_stage,
         )
-    return case.mode, case.q_heads, case.kv_heads, case.d, case.causal, q_stage
+    return case.mode, case.q_heads, case.kv_heads, case.d, case.dv, case.causal, q_stage
 
 
 def select_compile_cases(cases: list[Case]) -> list[Case]:
@@ -369,7 +401,7 @@ def build_cu_seqlens(torch_mod, lengths: list[int]) -> torch_mod.Tensor:
 def build_dense_inputs(torch_mod, flash_attn_func, case: Case, dtype, factory):
     q = factory(case.batch, case.seqlen_q, case.q_heads, case.d, device="cuda", dtype=dtype)
     k = factory(case.batch, case.seqlen_k, case.kv_heads, case.d, device="cuda", dtype=dtype)
-    v = factory(case.batch, case.seqlen_k, case.kv_heads, case.d, device="cuda", dtype=dtype)
+    v = factory(case.batch, case.seqlen_k, case.kv_heads, case.dv, device="cuda", dtype=dtype)
     return flash_attn_func, dict(q=q, k=k, v=v, causal=case.causal)
 
 
@@ -380,7 +412,7 @@ def build_varlen_inputs(torch_mod, flash_attn_varlen_func, case: Case, dtype, fa
     total_k = sum(lengths_k)
     q = factory(total_q, case.q_heads, case.d, device="cuda", dtype=dtype)
     k = factory(total_k, case.kv_heads, case.d, device="cuda", dtype=dtype)
-    v = factory(total_k, case.kv_heads, case.d, device="cuda", dtype=dtype)
+    v = factory(total_k, case.kv_heads, case.dv, device="cuda", dtype=dtype)
     return flash_attn_varlen_func, dict(
         q=q,
         k=k,
@@ -412,7 +444,7 @@ def build_block_sparse_inputs(torch_mod, flash_attn_func, case: Case, dtype, ten
         raise ValueError(f"Aux-backed block-sparse masks are not supported by clc_bench.py: {case.mask_name}")
     q = tensor_factory(case.batch, case.seqlen_q, case.q_heads, case.d, device="cuda", dtype=dtype)
     k = tensor_factory(case.batch, case.seqlen_k, case.kv_heads, case.d, device="cuda", dtype=dtype)
-    v = tensor_factory(case.batch, case.seqlen_k, case.kv_heads, case.d, device="cuda", dtype=dtype)
+    v = tensor_factory(case.batch, case.seqlen_k, case.kv_heads, case.dv, device="cuda", dtype=dtype)
     cute_mask, _ = get_mask_pair(
         case.mask_name,
         seqlen_q=case.seqlen_q,
@@ -468,11 +500,40 @@ def build_inputs(case: Case, dtype_name: DTypeName, fake_tensor: bool):
 
 
 def attended_pairs(seqlen_q: int, seqlen_k: int, causal: bool) -> float:
+    """Lower-right aligned causal: last query aligns with last key.
+    When M > N, only the bottom N query rows attend (triangle of size N),
+    so valid pairs = N*(N+1)/2, not the upper-left formula M*N - N*(N-1)/2.
+    """
     if not causal:
         return float(seqlen_q * seqlen_k)
     if seqlen_q <= seqlen_k:
         return float(seqlen_q * (2 * seqlen_k - seqlen_q + 1) / 2)
-    return float(seqlen_q * seqlen_k - seqlen_k * (seqlen_k - 1) / 2)
+    return float(seqlen_k * (seqlen_k + 1) / 2)
+
+
+def block_sparse_pairs(case: Case) -> float:
+    seqlen_q = case.seqlen_q or 0
+    seqlen_k = case.seqlen_k or 0
+    match case.mask_name:
+        case "block_diagonal":
+            total = 0
+            for q_idx in range(seqlen_q):
+                block_start = (q_idx // BLOCK_SIZE_K) * BLOCK_SIZE_K
+                block_end = min(block_start + BLOCK_SIZE_K, seqlen_k)
+                total += max(0, block_end - block_start)
+            return float(total)
+        case "sliding_window":
+            window = case.window_size or 0
+            offset = seqlen_k - seqlen_q
+            total = 0
+            for q_idx in range(seqlen_q):
+                center = q_idx + offset
+                lower = max(0, center - window)
+                upper = min(seqlen_k - 1, center + window)
+                total += max(0, upper - lower + 1)
+            return float(total)
+        case _:
+            raise ValueError(f"Unsupported block-sparse FLOP mask: {case.mask_name}")
 
 
 def fwd_flops(case: Case, kwargs: dict | None = None) -> float:
@@ -481,19 +542,15 @@ def fwd_flops(case: Case, kwargs: dict | None = None) -> float:
             case.seqlen_q or 0,
             case.seqlen_k or 0,
             case.causal,
-        ) * (case.d + case.d)
+        ) * (case.d + case.dv)
     if case.mode == "block_sparse":
-        if kwargs is None:
-            return 0.0
-        total_blocks = kwargs["mask_block_cnt"].sum().item()
-        if kwargs["full_block_cnt"] is not None:
-            total_blocks += kwargs["full_block_cnt"].sum().item()
-        return float(total_blocks * BLOCK_SIZE_Q * BLOCK_SIZE_K * case.q_heads * 2 * (case.d + case.d))
+        num_pairs = (case.batch or 0) * block_sparse_pairs(case)
+        return case.q_heads * 2 * num_pairs * (case.d + case.dv)
     lengths_q = case.seqlens_q or []
     lengths_k = case.seqlens_k or lengths_q
     total = 0.0
     for seqlen_q, seqlen_k in zip(lengths_q, lengths_k):
-        total += case.q_heads * 2 * attended_pairs(seqlen_q, seqlen_k, case.causal) * (case.d + case.d)
+        total += case.q_heads * 2 * attended_pairs(seqlen_q, seqlen_k, case.causal) * (case.d + case.dv)
     return total
 
 
@@ -531,6 +588,7 @@ def case_metadata(case: Case) -> dict:
         "q_heads": case.q_heads,
         "kv_heads": case.kv_heads,
         "d": case.d,
+        "dv": case.dv,
         "causal": case.causal,
         "pattern": case.pattern,
         "mask_name": case.mask_name,
