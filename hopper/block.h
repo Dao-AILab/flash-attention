@@ -17,7 +17,7 @@ struct BlockMN {
             int const window_size_left, int const window_size_right,
             cutlass::FastDivmod const& attention_chunk_divmod,
             cutlass::FastDivmod const& qhead_per_khead_divmod,
-            int const max_image_q_idx = -1) {
+            int const * __restrict__ max_image_q_idx = nullptr) {
 
         int const seqlen_k = seqlen_info.seqlen_k;
         int const seqlen_q = seqlen_info.seqlen_q;
@@ -34,10 +34,11 @@ struct BlockMN {
             // Skip causal n_block_max restriction for M-blocks that may contain image tokens.
             // Image tokens need full attention (all K blocks visible).
             bool restrict_causal = true;
-            if (max_image_q_idx >= 0) {
+            if (max_image_q_idx != nullptr && max_image_q_idx[bidb] >= 0) {
                 int m_idx_min = m_block * kBlockM;
                 if (PackGQA) { m_idx_min = qhead_per_khead_divmod.divide(m_idx_min); }
-                if (max_image_q_idx >= seqlen_info.offset_q + m_idx_min) {
+                // max_image_q_idx[bidb] is in batch-local coordinates
+                if (max_image_q_idx[bidb] >= m_idx_min) {
                     restrict_causal = false;
                 }
             }
@@ -79,7 +80,7 @@ struct BlockMN {
             int const window_size_left, int const window_size_right,
             cutlass::FastDivmod const& attention_chunk_divmod,
             cutlass::FastDivmod const& qhead_per_khead_divmod,
-            int const max_image_q_idx = -1) {
+            int const * __restrict__ max_image_q_idx = nullptr) {
 
         auto [n_block_min, n_block_max] = get_n_block_min_max(
             seqlen_info, m_block, bidb, split_idx, num_splits,

@@ -78,7 +78,7 @@ void set_params_fprop(Flash_fwd_params &params,
 
     // Reset the parameters
     params = {};
-    params.max_image_q_idx = -1;
+    params.max_image_q_idx = nullptr;
 
     params.is_bf16 = q.dtype() == torch::kBFloat16;
     params.is_e4m3 = q.dtype() == torch::kFloat8_e4m3fn;
@@ -707,7 +707,7 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         std::optional<bool> pack_gqa_,
         int64_t sm_margin,
         std::optional<at::Tensor> image_token_tag_,
-        int64_t max_image_q_idx
+        std::optional<at::Tensor> max_image_q_idx_
         ) {
 
     auto dprops = at::cuda::getCurrentDeviceProperties();
@@ -1159,7 +1159,14 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         TORCH_CHECK(!params.is_local, "image_token_tag is incompatible with sliding window attention");
         TORCH_CHECK(attention_chunk == 0, "image_token_tag is incompatible with attention_chunk");
         params.image_token_tag = static_cast<bool*>(image_token_tag.data_ptr());
-        params.max_image_q_idx = static_cast<int>(max_image_q_idx);
+        if (max_image_q_idx_.has_value()) {
+            auto max_image_q_idx = max_image_q_idx_.value();
+            CHECK_DEVICE(max_image_q_idx);
+            CHECK_CONTIGUOUS(max_image_q_idx);
+            TORCH_CHECK(max_image_q_idx.dtype() == torch::kInt32, "max_image_q_idx must have dtype torch.int32");
+            CHECK_SHAPE(max_image_q_idx, batch_size);
+            params.max_image_q_idx = static_cast<int const*>(max_image_q_idx.data_ptr());
+        }
     }
 
     #ifdef FLASHATTENTION_DISABLE_LOCAL
@@ -1724,7 +1731,7 @@ TORCH_LIBRARY(flash_attn_3, m) {
         "bool? pack_gqa = None,"
         "int sm_margin = 0,"
         "Tensor? image_token_tag = None,"
-        "int max_image_q_idx = -1) -> (Tensor(out!), Tensor, Tensor, Tensor)");
+        "Tensor? max_image_q_idx = None) -> (Tensor(out!), Tensor, Tensor, Tensor)");
     m.def("bwd("
         "Tensor dout,"
         "Tensor q,"

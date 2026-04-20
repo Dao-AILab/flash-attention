@@ -93,7 +93,7 @@ def _flash_attn_forward(
     pack_gqa: Optional[bool] = None,
     sm_margin: int = 0,
     image_token_tag: Optional[torch.Tensor] = None,
-    max_image_q_idx: int = -1,
+    max_image_q_idx: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, k_new, v_new = [maybe_contiguous(x) for x in (q, k, k_new, v_new)]
     v = v.contiguous() if v.stride(-1) != 1 and v.stride(-3) != 1 else v
@@ -192,7 +192,7 @@ def _flash_attn_forward_fake(
     pack_gqa: Optional[bool] = None,
     sm_margin: int = 0,
     image_token_tag: Optional[torch.Tensor] = None,
-    max_image_q_idx: int = -1,
+    max_image_q_idx: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Symbolic fake implementation of flash attention forward.
@@ -978,7 +978,7 @@ def flash_attn_with_kvcache(
     sm_margin=0,     # Can be tuned if some SMs are used for communication
     return_softmax_lse=False,
     image_token_tag=None,  # [total_q] bool, True = full attention (no causal mask)
-    max_image_q_idx=None,  # pre-computed last True index in image_token_tag (for CUDA graph)
+    max_image_q_idx=None,  # int32[batch], per-batch last image q idx (-1 = no image)
 ):
     """
     If k and v are not None, k_cache and v_cache will be updated *inplace* with the new values from
@@ -1074,14 +1074,17 @@ def flash_attn_with_kvcache(
             (q.shape[0],), cache_seqlens, dtype=torch.int32, device=k_cache.device
         )
         cache_seqlens = maybe_contiguous(cache_seqlens)
-    _max_image_q_idx = -1
+    _max_image_q_idx = None
     if image_token_tag is not None:
         assert cu_seqlens_q is not None, "image_token_tag requires varlen mode (cu_seqlens_q)"
         assert causal, "image_token_tag requires causal=True"
         assert window_size == (-1, -1), "image_token_tag incompatible with sliding window"
         assert attention_chunk == 0, "image_token_tag incompatible with attention_chunk"
         image_token_tag = image_token_tag.contiguous()
-        _max_image_q_idx = max_image_q_idx if max_image_q_idx is not None else q.shape[0] - 1
+        if max_image_q_idx is not None:
+            _max_image_q_idx = max_image_q_idx.contiguous()
+        # If max_image_q_idx is not provided, leave as None — the C++ side
+        # will treat nullptr as normal causal (no n_block_max extension).
     out, softmax_lse, *rest = _flash_attn_forward(
         q,
         k_cache,

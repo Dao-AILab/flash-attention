@@ -214,7 +214,7 @@ struct CollectiveMainloopFwdSm80 {
         int const* const leftpad_k = nullptr;
         int const* const seqlens_rotary = nullptr;
         bool const* const image_token_tag = nullptr;
-        int const max_image_q_idx = -1;
+        int const * __restrict__ max_image_q_idx = nullptr;
     };
 
     // Device side kernel params
@@ -262,7 +262,7 @@ struct CollectiveMainloopFwdSm80 {
         int const* const leftpad_k = nullptr;
         int const* const seqlens_rotary = nullptr;
         bool const* const image_token_tag = nullptr;
-        int const max_image_q_idx = -1;
+        int const * __restrict__ max_image_q_idx = nullptr;
     };
 
     static Params

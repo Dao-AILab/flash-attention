@@ -169,7 +169,7 @@ struct Flash_fwd_params : public Qkv_params {
     // Image token tag: per-Q-token bool, packed like Q [total_q].
     // When tag is true, the query does full attention (no causal mask).
     bool * __restrict__ image_token_tag;
-    int max_image_q_idx;  // global packed index of last image tag, or -1
+    int const * __restrict__ max_image_q_idx;  // per-batch last image q idx, or nullptr
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
