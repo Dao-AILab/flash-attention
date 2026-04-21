@@ -241,6 +241,14 @@ class FlashAttentionBackwardPreprocess:
         work_tile = tile_scheduler.initial_work_tile_info()
         m_block, head_idx, batch_idx, _ = work_tile.tile_idx
 
+        # This kernel is launched with use_pdl=True, so the GPU may start executing it in
+        # "prologue" mode while the previous stream kernel is still running. We must wait
+        # before touching any upstream GMEM outputs (mO, mdO, mLSE); otherwise we risk
+        # reading a partially-written dout, which silently corrupts dpsum = sum(O * dO) and
+        # propagates to dQ/dK via dS = P * (dP - dpsum).
+        if const_expr(self.use_pdl):
+            cute.arch.griddepcontrol_wait()
+
         if work_tile.is_valid_tile:
             # ///////////////////////////////////////////////////////////////////////////////
             # Get the appropriate tiles for this thread block.
