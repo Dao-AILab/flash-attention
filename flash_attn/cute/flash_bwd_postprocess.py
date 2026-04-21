@@ -43,12 +43,15 @@ class FlashAttentionBackwardPostprocess:
         dQ_swapAB: bool = False,
         use_2cta_instrs: bool = False,
         cluster_size: int = 1,  # for varlen offsets
+        hdim_multiple_of: int = 32,
     ):
         """
         :param head_dim: head dimension
         :type head_dim: int
         :param tile_m: m block size
         :type tile_m: int
+        :param hdim_multiple_of: tile_hdim alignment; must match the bwd
+            kernel (SM90: 16 default, 64 when ``dKV_swapAB=True``).
         """
         self.dtype = dtype
         self.tile_m = tile_m
@@ -56,8 +59,6 @@ class FlashAttentionBackwardPostprocess:
             "Only Ampere (8.x), Hopper (9.x), and Blackwell (10.x, 11.x, 12.x) are supported"
         )
         self.arch = arch
-        # padding head_dim to a multiple of 32 as k_block_size
-        hdim_multiple_of = 32
         self.tile_hdim = int(math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of)
         self.check_hdim_oob = head_dim != self.tile_hdim
         self.num_threads = num_threads

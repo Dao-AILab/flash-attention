@@ -43,6 +43,7 @@ class FlashAttentionBackwardPreprocess:
         head_dim_v: int,
         tile_m: int = 128,
         num_threads: int = 256,
+        hdim_multiple_of: int = 32,
     ):
         """
         All contiguous dimensions must be at least 16 bytes aligned which indicates the head dimension
@@ -54,12 +55,12 @@ class FlashAttentionBackwardPreprocess:
         :type tile_m: int
         :param num_threads: number of threads
         :type num_threads: int
+        :param hdim_multiple_of: tile_hdim alignment; must match the bwd
+            kernel (SM90: 16 default, 64 when ``dKV_swapAB=True``).
         """
         self.use_pdl = BaseDSL._get_dsl().get_arch_enum() >= Arch.sm_90a
         self.dtype = dtype
         self.tile_m = tile_m
-        # padding head_dim to a multiple of 32 as k_block_size
-        hdim_multiple_of = 32
         self.head_dim_padded = int(math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of)
         self.head_dim_v_padded = int(math.ceil(head_dim_v / hdim_multiple_of) * hdim_multiple_of)
         self.check_hdim_v_oob = head_dim_v != self.head_dim_v_padded
