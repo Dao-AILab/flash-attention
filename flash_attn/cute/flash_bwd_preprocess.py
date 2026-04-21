@@ -260,9 +260,7 @@ class FlashAttentionBackwardPreprocess:
                 stats_use_padded_offsets = True
             mPdPsum_cur = seqlen.offset_batch(
                 mPdPsum, batch_idx, dim=2, padded=stats_use_padded_offsets
-            )[
-                None, head_idx
-            ]
+            )[None, head_idx]
             headdim_v = mO_cur.shape[cute.rank(mO_cur) - 1]
             seqlen_q = seqlen.seqlen
             seqlen_q_rounded = cute.round_up(seqlen_q, self.tile_m)
@@ -357,9 +355,7 @@ class FlashAttentionBackwardPreprocess:
             if const_expr(mLSE is not None):
                 mLSElog2_cur = seqlen.offset_batch(
                     mLSElog2, batch_idx, dim=2, padded=stats_use_padded_offsets
-                )[
-                    None, head_idx
-                ]
+                )[None, head_idx]
                 gLSElog2 = cute.local_tile(mLSElog2_cur, (self.tile_m,), (m_block,))
                 LOG2_E = math.log2(math.e)
                 if tidx < seqlen_q_rounded - m_block * self.tile_m:

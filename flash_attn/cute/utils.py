@@ -858,13 +858,17 @@ def warp_reduction(
     while offset > 0:
         val = op(
             val,
-            cute.arch.shuffle_sync_bfly(val, offset=offset, mask=-1, mask_and_clamp=31, loc=loc, ip=ip),
+            cute.arch.shuffle_sync_bfly(
+                val, offset=offset, mask=-1, mask_and_clamp=31, loc=loc, ip=ip
+            ),
         )
         offset //= 2
     return val
 
 
-warp_reduction_max = partial(warp_reduction, op=lambda x, y: fmax(x, y) if isinstance(x, Float32) else max(x, y))
+warp_reduction_max = partial(
+    warp_reduction, op=lambda x, y: fmax(x, y) if isinstance(x, Float32) else max(x, y)
+)
 warp_reduction_sum = partial(warp_reduction, op=lambda x, y: x + y)  # noqa: FURB118
 
 
@@ -877,7 +881,9 @@ def make_cotiled_copy(
     assert cute.is_static(data_layout.type), "data_layout must be static"
 
     inv_layout_ = cute.left_inverse(data_layout, loc=loc, ip=ip)
-    inv_data_layout = cute.make_layout((inv_layout_.shape, (1)), stride=(inv_layout_.stride, (0)), loc=loc, ip=ip)
+    inv_data_layout = cute.make_layout(
+        (inv_layout_.shape, (1)), stride=(inv_layout_.stride, (0)), loc=loc, ip=ip
+    )
     layout_tv_data = cute.composition(inv_data_layout, atom_layout_tv, loc=loc, ip=ip)
 
     atom_layout_v_to_check = cute.coalesce(
@@ -888,7 +894,9 @@ def make_cotiled_copy(
     data_layout_v_to_check = cute.coalesce(
         cute.composition(
             data_layout,
-            cute.make_layout(layout_tv_data.shape[1], stride=layout_tv_data.stride[1], loc=loc, ip=ip),
+            cute.make_layout(
+                layout_tv_data.shape[1], stride=layout_tv_data.stride[1], loc=loc, ip=ip
+            ),
             loc=loc,
             ip=ip,
         ),
@@ -918,8 +926,12 @@ def make_cotiled_copy(
         )
         for i in range(cute.rank(flat_data_shape))
     )
-    tile2data = cute.composition(cute.make_layout(flat_data_shape, loc=loc, ip=ip), tiler, loc=loc, ip=ip)
-    layout_tv = cute.composition(cute.left_inverse(tile2data, loc=loc, ip=ip), layout_tv_data, loc=loc, ip=ip)
+    tile2data = cute.composition(
+        cute.make_layout(flat_data_shape, loc=loc, ip=ip), tiler, loc=loc, ip=ip
+    )
+    layout_tv = cute.composition(
+        cute.left_inverse(tile2data, loc=loc, ip=ip), layout_tv_data, loc=loc, ip=ip
+    )
     return cute.make_tiled_copy(atom, layout_tv, tiler, loc=loc, ip=ip)
 
 

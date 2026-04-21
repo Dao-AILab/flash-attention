@@ -9,45 +9,18 @@ Constraints:
 * Batch size must be the same for Q, K, and V tensors
 """
 
-import argparse
-import enum
-import math
-import random
-import time
-from typing import Type, Tuple
-
-import torch
-import torch.nn.functional as F
 import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
-import cutlass.cute.testing as testing
-from cutlass.cute.nvgpu import cpasync, tcgen05
-import cutlass.utils as utils
-import cutlass.pipeline as pipeline
-import cutlass.torch as cutlass_torch
-import cutlass.utils.blackwell_helpers as sm100_utils
-from cutlass.cute.runtime import from_dlpack
-from cutlass.cute.typing import Int32, Int64, Float32
+from cutlass.cute.typing import Int32
 
-try:
-    from flash_attn.cute.utils import make_cotiled_copy, warp_reduction_sum
-    from flash_attn.cute.sm100_hd256_2cta_fmha_backward_dqkernel import (
-        BlackwellFusedMultiHeadAttentionBackwardDQKernel,
-    )
-    from flash_attn.cute.sm100_hd256_2cta_fmha_backward_dkdvkernel import (
-        BlackwellFusedMultiHeadAttentionBackwardDKDVKernel,
-    )
-except ImportError:
-    # Allow direct execution as a script (no package context).
-    from flash_attn.cute.utils import make_cotiled_copy, warp_reduction_sum
-    from flash_attn.cute.sm100_hd256_2cta_fmha_backward_dqkernel import (
-        BlackwellFusedMultiHeadAttentionBackwardDQKernel,
-    )
-    from flash_attn.cute.sm100_hd256_2cta_fmha_backward_dkdvkernel import (
-        BlackwellFusedMultiHeadAttentionBackwardDKDVKernel,
-    )
+from flash_attn.cute.sm100_hd256_2cta_fmha_backward_dqkernel import (
+    BlackwellFusedMultiHeadAttentionBackwardDQKernel,
+)
+from flash_attn.cute.sm100_hd256_2cta_fmha_backward_dkdvkernel import (
+    BlackwellFusedMultiHeadAttentionBackwardDKDVKernel,
+)
 
 
 def _as_bshkrd_tensor(
@@ -165,17 +138,25 @@ class BlackwellFusedMultiHeadAttentionBackward:
         assert score_mod is None and score_mod_bwd is None and mask_mod is None, (
             "SM100 backward with head_dim=256 does not support score_mod/mask_mod"
         )
-        assert not deterministic, "SM100 backward with head_dim=256 does not support deterministic mode"
+        assert not deterministic, (
+            "SM100 backward with head_dim=256 does not support deterministic mode"
+        )
         assert not has_aux_tensors, "SM100 backward with head_dim=256 does not support aux_tensors"
-        assert cluster_size in (1, 2), "SM100 backward with head_dim=256 only supports cluster_size in {1, 2}"
+        assert cluster_size in (1, 2), (
+            "SM100 backward with head_dim=256 only supports cluster_size in {1, 2}"
+        )
         assert use_2cta_instrs, "SM100 backward with head_dim=256 requires use_2cta_instrs=True"
         # subtile_factor is accepted for interface parity with FlashAttentionBackwardSm100,
         # but this dedicated kernel uses fixed internal behavior.
 
         self.acc_dtype = cutlass.Float32
         self.is_causal = is_causal
-        self.window_size_left = None if (window_size_left is None or window_size_left < 0) else window_size_left
-        self.window_size_right = None if (window_size_right is None or window_size_right < 0) else window_size_right
+        self.window_size_left = (
+            None if (window_size_left is None or window_size_left < 0) else window_size_left
+        )
+        self.window_size_right = (
+            None if (window_size_right is None or window_size_right < 0) else window_size_right
+        )
         self.tile_m_dq = tile_m_dq
         self.tile_n_dq = tile_n_dq
         self.tile_m_dkdv = tile_m_dkdv
@@ -243,7 +224,9 @@ class BlackwellFusedMultiHeadAttentionBackward:
         assert aux_tensors is None or len(aux_tensors) == 0, (
             "SM100 backward with head_dim=256 does not support aux_tensors"
         )
-        assert dQ_accum is not None, "SM100 backward with head_dim=256 expects dQ tensor at dQ_accum slot"
+        assert dQ_accum is not None, (
+            "SM100 backward with head_dim=256 expects dQ tensor at dQ_accum slot"
+        )
         dQ = dQ_accum
         varlen = cumulative_s_q is not None or cumulative_s_k is not None
         q_rank = cute.rank(Q.layout)
@@ -277,7 +260,6 @@ class BlackwellFusedMultiHeadAttentionBackward:
         dO = _as_bshkrd_tensor(dO, h_k, h_r, varlen)
         scaled_LSE = _as_shhb_tensor(lse_log2, h_k, h_r, b, varlen)
         sum_OdO = _as_shhb_tensor(dpsum, h_k, h_r, b, varlen)
-
 
         # Keep original order: dQ first, then dKdV.
         self.dq_kernel(

@@ -4,19 +4,15 @@ from typing import Type, Tuple, Optional
 
 import cuda.bindings.driver as cuda
 
-import argparse
 import math
-import os
 import cutlass
 import cutlass.cute as cute
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
 from cutlass.cute.nvgpu import cpasync
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
-from cutlass.cute.runtime import from_dlpack
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cute.typing import Int32, Int64, Float32
-from cutlass._mlir.dialects import llvm
 
 from cutlass.utils import ClcDynamicPersistentTileScheduler
 from flash_attn.cute.tile_scheduler import (
@@ -52,17 +48,22 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         self.is_causal = is_causal
         self.window_size_left = window_size_left
         # Keep original behavior (known-good in this repo)
-        window_size_left = None if (window_size_left is None or window_size_left < 0) else cutlass.Int32(window_size_left)
-        window_size_right = None if (window_size_right is None or window_size_right < 0) else cutlass.Int32(window_size_right)
+        window_size_left = (
+            None
+            if (window_size_left is None or window_size_left < 0)
+            else cutlass.Int32(window_size_left)
+        )
+        window_size_right = (
+            None
+            if (window_size_right is None or window_size_right < 0)
+            else cutlass.Int32(window_size_right)
+        )
         self.window_size_left = None if self.is_causal else window_size_left
         self.window_size_right = cutlass.Int32(0) if self.is_causal else window_size_right
-        self.is_local = (
-            (not self.is_causal)
-            and (self.window_size_left is not None or self.window_size_right is not None)
+        self.is_local = (not self.is_causal) and (
+            self.window_size_left is not None or self.window_size_right is not None
         )
-        assert mma_tiler[0] == 128 and mma_tiler[1] == 128, (
-            "Only 128x128 tile impl is supported"
-        )
+        assert mma_tiler[0] == 128 and mma_tiler[1] == 128, "Only 128x128 tile impl is supported"
         assert mma_tiler[2] == 256, "Only 256 is supported for 128x128 tile impl"
         self.cta_tiler = (
             mma_tiler[0],
@@ -75,7 +76,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
             min(self.cta_tiler[2], 128) if split_head else self.cta_tiler[2],
         )
         self.dov_mma_tiler = self.qk_mma_tiler
-        self.dsk_mma_tiler =  (
+        self.dsk_mma_tiler = (
             2 * mma_tiler[0],
             min(self.cta_tiler[2], 128) if split_head else self.cta_tiler[2],
             mma_tiler[1],
@@ -265,7 +266,6 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                 self.cta_tiler,
                 self.is_persistent,
             )
-
 
         self.q_major_mode = utils.LayoutEnum.from_tensor(q).mma_major_mode()
         self.do_major_mode = utils.LayoutEnum.from_tensor(do).mma_major_mode()
@@ -458,7 +458,9 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
             mma_dq_mbar_ptr: cute.struct.MemRange[Int64, self.epi_stage * 2]
             ds_mma_mbar_ptr: cute.struct.MemRange[Int64, self.dsk_acc_stage * 2]
             lse_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.load_compute_LSE_stage * 2]
-            sum_odo_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.load_compute_sum_OdO_stage * 2]
+            sum_odo_mbar_ptr: cute.struct.MemRange[
+                cutlass.Int64, self.load_compute_sum_OdO_stage * 2
+            ]
             # A CTA-wide "TMEM lifetime" barrier used to safely deallocate TMEM after all users finish.
             tmem_dealloc_mbar_ptr: Int64
             # Tmem holding buffer
@@ -572,12 +574,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         tidx, _, _ = cute.arch.thread_idx()
         varlen = cum_seqlen_q is not None or cum_seqlen_k is not None
         mma_tile_coord_v = bidx % cute.size(qk_tiled_mma.thr_id.shape)
-        cta_rank_in_cluster = cute.arch.make_warp_uniform(
-            cute.arch.block_idx_in_cluster()
-        )
-        block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(
-            cta_rank_in_cluster
-        )
+        cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+        block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(cta_rank_in_cluster)
 
         # Alloc
         smem = utils.SmemAllocator()
@@ -632,9 +630,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
             num_stages=self.qk_acc_stage,
             producer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
             consumer_group=make_thread_cooperative_group(
-                len(self.compute_warp_ids)
-                * self.threads_per_warp
-                * self.cluster_shape_mnk[0],
+                len(self.compute_warp_ids) * self.threads_per_warp * self.cluster_shape_mnk[0],
             ),
             barrier_storage=storage.mma_s_mbar_ptr.data_ptr(),
             cta_layout_vmnk=cluster_layout_vmnk,
@@ -644,9 +640,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
             num_stages=self.dov_acc_stage,
             producer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
             consumer_group=make_thread_cooperative_group(
-                len(self.compute_warp_ids)
-                * self.threads_per_warp
-                * self.cluster_shape_mnk[0],
+                len(self.compute_warp_ids) * self.threads_per_warp * self.cluster_shape_mnk[0],
             ),
             barrier_storage=storage.mma_dp_mbar_ptr.data_ptr(),
             cta_layout_vmnk=cluster_layout_vmnk,
@@ -655,9 +649,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         ds_mma_producer, ds_mma_consumer = pipeline.PipelineAsyncUmma.create(
             num_stages=self.dsk_acc_stage,
             producer_group=make_thread_cooperative_group(
-                len(self.compute_warp_ids)
-                * self.threads_per_warp
-                * self.cluster_shape_mnk[0],
+                len(self.compute_warp_ids) * self.threads_per_warp * self.cluster_shape_mnk[0],
             ),
             consumer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
             barrier_storage=storage.ds_mma_mbar_ptr.data_ptr(),
@@ -668,9 +660,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
             num_stages=self.epi_stage,
             producer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
             consumer_group=make_thread_cooperative_group(
-                len(self.epilogue_warp_ids)
-                * self.threads_per_warp
-                * self.cluster_shape_mnk[0],
+                len(self.epilogue_warp_ids) * self.threads_per_warp * self.cluster_shape_mnk[0],
             ),
             barrier_storage=storage.mma_dq_mbar_ptr.data_ptr(),
             cta_layout_vmnk=cluster_layout_vmnk,
@@ -678,15 +668,19 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         ).make_participants()
 
         load_lse_producer, load_lse_consumer = pipeline.PipelineCpAsync.create(
-            num_stages = self.load_compute_LSE_stage,
+            num_stages=self.load_compute_LSE_stage,
             producer_group=make_thread_cooperative_group(self.threads_per_warp),
-            consumer_group=make_thread_cooperative_group(self.threads_per_warp * self.num_compute_warps),
+            consumer_group=make_thread_cooperative_group(
+                self.threads_per_warp * self.num_compute_warps
+            ),
             barrier_storage=storage.lse_mbar_ptr.data_ptr(),
         ).make_participants()
         load_sum_odo_producer, load_sum_odo_consumer = pipeline.PipelineCpAsync.create(
-            num_stages = self.load_compute_sum_OdO_stage,
+            num_stages=self.load_compute_sum_OdO_stage,
             producer_group=make_thread_cooperative_group(self.threads_per_warp),
-            consumer_group=make_thread_cooperative_group(self.threads_per_warp * self.num_compute_warps),
+            consumer_group=make_thread_cooperative_group(
+                self.threads_per_warp * self.num_compute_warps
+            ),
             barrier_storage=storage.sum_odo_mbar_ptr.data_ptr(),
         ).make_participants()
 
@@ -707,12 +701,13 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
             clc_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
             cluster_size = cute.size(self.cluster_shape_mnk)
             num_clc_consumer_threads = self.threads_per_warp * (
-                1 +  # sched_warp (CTA 0 only)
-                cluster_size * (
-                    len(self.compute_warp_ids) +
-                    len(self.epilogue_warp_ids) +
-                    1 +  # mma_warp
-                    1    # load_warp
+                1  # sched_warp (CTA 0 only)
+                + cluster_size
+                * (
+                    len(self.compute_warp_ids)
+                    + len(self.epilogue_warp_ids)
+                    + 1  # mma_warp
+                    + 1  # load_warp
                 )
             )
             clc_pipeline_consumer_group = pipeline.CooperativeGroup(
@@ -747,9 +742,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
             clc_response_ptr = None
 
         # Cluster arrive after barrier init
-        pipeline.pipeline_init_arrive(
-            cluster_shape_mn=cluster_layout_vmnk, is_relaxed=True
-        )
+        pipeline.pipeline_init_arrive(cluster_shape_mn=cluster_layout_vmnk, is_relaxed=True)
 
         sQ = smem.allocate_tensor(
             element_type=self.q_dtype,
@@ -800,9 +793,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         tdPrdO = dov_thr_mma.make_fragment_A(sdO)
         tdPrV = dov_thr_mma.make_fragment_B(sV)
         tdQrKT = dsk_thr_mma.make_fragment_B(sKT)
-        qk_acc_shape = qk_thr_mma.partition_shape_C(
-            (self.qk_mma_tiler[0], self.qk_mma_tiler[1])
-        )
+        qk_acc_shape = qk_thr_mma.partition_shape_C((self.qk_mma_tiler[0], self.qk_mma_tiler[1]))
         tStS = qk_thr_mma.make_fragment_C(cute.append(qk_acc_shape, self.qk_acc_stage))
         dov_acc_shape = dov_thr_mma.partition_shape_C(
             (self.dov_mma_tiler[0], self.dov_mma_tiler[1])
@@ -832,8 +823,11 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
 
         if cutlass.const_expr(self.use_clc_scheduler):
             tile_sched = FmhaClcDynamicTileScheduler.create(
-                tile_sched_params, cute.arch.block_idx(), cute.arch.grid_dim(),
-                clc_response_ptr, clc,
+                tile_sched_params,
+                cute.arch.block_idx(),
+                cute.arch.grid_dim(),
+                clc_response_ptr,
+                clc,
             )
         else:
             blk_idx = cute.arch.block_idx()
@@ -882,33 +876,25 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                         Int32(0),
                         ((Int32(0), Int32(0)), Int32(0)),
                     )
-                    continue_cond = (
-                        not FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
-                            self.qk_mma_tiler[0],
-                            mma_block_coord[0],
-                            seqlen_q,
-                        )
+                    continue_cond = not FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
+                        self.qk_mma_tiler[0],
+                        mma_block_coord[0],
+                        seqlen_q,
                     )
                 if not continue_cond:
-                    mQ_qdl_ = cute.domain_offset(
-                        cute.select(block_offset, mode=[0, 2, 3]), mQ_qdl
-                    )
-                    mK_kdl_ = cute.domain_offset(
-                        cute.select(block_offset, mode=[1, 2, 3]), mK_kdl
-                    )
+                    mQ_qdl_ = cute.domain_offset(cute.select(block_offset, mode=[0, 2, 3]), mQ_qdl)
+                    mK_kdl_ = cute.domain_offset(cute.select(block_offset, mode=[1, 2, 3]), mK_kdl)
                     mdO_qdl_ = cute.domain_offset(
                         cute.select(block_offset, mode=[0, 2, 3]), mdO_qdl
                     )
-                    mV_dkl_ = cute.domain_offset(
-                        cute.select(block_offset, mode=[1, 2, 3]), mV_dkl
-                    )
-                    mK_dkl_ = cute.domain_offset(
-                        cute.select(block_offset, mode=[2, 1, 3]), mK_dkl
-                    )
+                    mV_dkl_ = cute.domain_offset(cute.select(block_offset, mode=[1, 2, 3]), mV_dkl)
+                    mK_dkl_ = cute.domain_offset(cute.select(block_offset, mode=[2, 1, 3]), mK_dkl)
                     block_offset_stats = block_offset
                     if cutlass.const_expr(cum_seqlen_q is not None):
                         cuseqlen_q_stats = cute.assume(
-                            (cuseqlen_q + batch_coord * self.cta_tiler[0]) // self.cta_tiler[0] * self.cta_tiler[0],
+                            (cuseqlen_q + batch_coord * self.cta_tiler[0])
+                            // self.cta_tiler[0]
+                            * self.cta_tiler[0],
                             divby=self.cta_tiler[0],
                         )
                         block_offset_stats = (
@@ -918,16 +904,16 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                             block_offset[3],
                         )
                     LSE = cute.domain_offset(cute.select(block_offset_stats, mode=[0, 3]), mLSE)
-                    sum_OdO = cute.domain_offset(cute.select(block_offset_stats, mode=[0, 3]), mSum_OdO)
+                    sum_OdO = cute.domain_offset(
+                        cute.select(block_offset_stats, mode=[0, 3]), mSum_OdO
+                    )
 
                     # Local tile partition global tensors
                     q_cta_layout = cute.make_layout(
                         cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape
                     )
                     # (bM, bK, loopM, loopK, loopL)
-                    gQ_qdl = cute.flat_divide(
-                        mQ_qdl_, cute.select(self.qk_mma_tiler, mode=[0, 2])
-                    )
+                    gQ_qdl = cute.flat_divide(mQ_qdl_, cute.select(self.qk_mma_tiler, mode=[0, 2]))
                     tSgQ_qdl = qk_thr_mma.partition_A(gQ_qdl)
                     tQsQ, tQgQ_qdl = cute.nvgpu.cpasync.tma_partition(
                         tma_atom_q,
@@ -939,9 +925,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                     k_cta_layout = cute.make_layout(
                         cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape
                     )
-                    gK_kdl = cute.flat_divide(
-                        mK_kdl_, cute.select(self.qk_mma_tiler, mode=[1, 2])
-                    )
+                    gK_kdl = cute.flat_divide(mK_kdl_, cute.select(self.qk_mma_tiler, mode=[1, 2]))
                     tSgK_kdl = qk_thr_mma.partition_B(gK_kdl)
                     tKsK, tKgK_kdl = cute.nvgpu.cpasync.tma_partition(
                         tma_atom_k,
@@ -968,9 +952,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                     v_cta_layout = cute.make_layout(
                         cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape
                     )
-                    gV_dkl = cute.flat_divide(
-                        mV_dkl_, cute.select(self.dov_mma_tiler, mode=[1, 2])
-                    )
+                    gV_dkl = cute.flat_divide(mV_dkl_, cute.select(self.dov_mma_tiler, mode=[1, 2]))
                     tSgV_dkl = dov_thr_mma.partition_B(gV_dkl)
                     tVsV, tVgV_dkl = cute.nvgpu.cpasync.tma_partition(
                         tma_atom_v,
@@ -983,9 +965,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                     kt_cta_layout = cute.make_layout(
                         cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape
                     )
-                    gK_dkl = cute.flat_divide(
-                        mK_dkl_, cute.select(self.dsk_mma_tiler, mode=[1, 2])
-                    )
+                    gK_dkl = cute.flat_divide(mK_dkl_, cute.select(self.dsk_mma_tiler, mode=[1, 2]))
                     tdQgK_dkl = dsk_thr_mma.partition_B(gK_dkl)
                     tKTsKT, tKgK_dkl = cute.nvgpu.cpasync.tma_partition(
                         tma_atom_kt,
@@ -1007,14 +987,14 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
 
                     seqlen_kv_loop_start, seqlen_kv_loop_steps = (
                         FusedMask.get_trip_start_count_via_block_info(
-                        mma_block_coord,
-                        self.qk_mma_tiler,
-                        seqlen_q,
-                        seqlen_k,
-                        self.is_causal,
-                        self.is_local,
-                        window_size_left,
-                        window_size_right,
+                            mma_block_coord,
+                            self.qk_mma_tiler,
+                            seqlen_q,
+                            seqlen_k,
+                            self.is_causal,
+                            self.is_local,
+                            window_size_left,
+                            window_size_right,
                         )
                     )
                     # LSE
@@ -1031,7 +1011,10 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                     sLSE_for_copy = cute.flat_divide(sLSE, (1,))
                     LSE_for_copy = cute.flat_divide(LSE, (1,))
                     for i in cutlass.range_constexpr(async_copy_num_elts):
-                        LSE_idx = self.cta_tiler[0] * curr_block_coord[0] + thread_idx * async_copy_num_elts
+                        LSE_idx = (
+                            self.cta_tiler[0] * curr_block_coord[0]
+                            + thread_idx * async_copy_num_elts
+                        )
                         if cute.elem_less(LSE_idx + i, seqlen_q):
                             cute.copy(
                                 atom_async_copy,
@@ -1054,7 +1037,10 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                     sSum_OdO_for_copy = cute.flat_divide(sSum_OdO, (1,))
                     sum_OdO_for_copy = cute.flat_divide(sum_OdO, (1,))
                     for i in cutlass.range_constexpr(async_copy_num_elts):
-                        sum_OdO_idx = self.cta_tiler[0] * curr_block_coord[0] + thread_idx * async_copy_num_elts
+                        sum_OdO_idx = (
+                            self.cta_tiler[0] * curr_block_coord[0]
+                            + thread_idx * async_copy_num_elts
+                        )
                         if cute.elem_less(sum_OdO_idx + i, seqlen_q):
                             cute.copy(
                                 atom_async_copy,
@@ -1153,12 +1139,10 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                 if cutlass.const_expr(cum_seqlen_q is not None):
                     cuseqlen_q = cum_seqlen_q[batch_coord]
                     seqlen_q = cum_seqlen_q[batch_coord + 1] - cuseqlen_q
-                    continue_cond = (
-                        not FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
-                            self.qk_mma_tiler[0],
-                            mma_block_coord[0],
-                            seqlen_q,
-                        )
+                    continue_cond = not FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
+                        self.qk_mma_tiler[0],
+                        mma_block_coord[0],
+                        seqlen_q,
                     )
 
                 if not continue_cond:
@@ -1168,14 +1152,14 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
 
                     seqlen_kv_loop_start, seqlen_kv_loop_steps = (
                         FusedMask.get_trip_start_count_via_block_info(
-                        mma_block_coord,
-                        self.qk_mma_tiler,
-                        seqlen_q,
-                        seqlen_k,
-                        self.is_causal,
-                        self.is_local,
-                        window_size_left,
-                        window_size_right,
+                            mma_block_coord,
+                            self.qk_mma_tiler,
+                            seqlen_q,
+                            seqlen_k,
+                            self.is_causal,
+                            self.is_local,
+                            window_size_left,
+                            window_size_right,
                         )
                     )
 
@@ -1183,7 +1167,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                         cute.arch.block_idx_in_cluster()
                     )
                     is_leader_cta = cta_rank_in_cluster % 2 == 0
-                    #dq_handle = mma_dq_producer.acquire_and_advance()
+                    # dq_handle = mma_dq_producer.acquire_and_advance()
                     load_q_releaser = load_q_consumer.clone()
                     load_do_releaser = load_do_consumer.clone()
                     dsk_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
@@ -1202,15 +1186,19 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                                 tSrQ_slice = tSrQ[None, None, None, iter]
 
                                 k_handle = load_k_consumer.wait_and_advance()
-                                tSrK_trans_slice = tSrK[
-                                    None, None, None, k_handle.index
-                                ]
+                                tSrK_trans_slice = tSrK[None, None, None, k_handle.index]
                                 num_kphases = cute.size(tSrQ_slice, mode=[2])
                                 if cutlass.const_expr(num_kphases % num_innerloop == 0):
                                     num_outer_iter = num_kphases // num_innerloop
                                     for outer_iter in cutlass.range(num_outer_iter, unroll=1):
-                                        for kphase_idx in cutlass.range(num_innerloop, unroll_full=True):
-                                            kphase_coord = (None, None, outer_iter * num_innerloop + kphase_idx)
+                                        for kphase_idx in cutlass.range(
+                                            num_innerloop, unroll_full=True
+                                        ):
+                                            kphase_coord = (
+                                                None,
+                                                None,
+                                                outer_iter * num_innerloop + kphase_idx,
+                                            )
                                             cute.gemm(
                                                 qk_tiled_mma,
                                                 tStS_slice,
@@ -1220,9 +1208,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                                             )
                                             qk_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
                                 else:
-                                    for kphase_idx in cutlass.range(
-                                        num_kphases, unroll_full=True
-                                    ):
+                                    for kphase_idx in cutlass.range(num_kphases, unroll_full=True):
                                         kphase_coord = (None, None, kphase_idx)
                                         cute.gemm(
                                             qk_tiled_mma,
@@ -1244,15 +1230,19 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                                 load_do_consumer.wait_and_advance()
                                 tdPrdO_slice = tdPrdO[None, None, None, iter]
                                 v_handle = load_v_consumer.wait_and_advance()
-                                tdPrV_trans_slice = tdPrV[
-                                    None, None, None, v_handle.index
-                                ]
+                                tdPrV_trans_slice = tdPrV[None, None, None, v_handle.index]
                                 num_kphases = cute.size(tdPrdO_slice, mode=[2])
                                 if cutlass.const_expr(num_kphases % num_innerloop == 0):
                                     num_outer_iter = num_kphases // num_innerloop
                                     for outer_iter in cutlass.range(num_outer_iter, unroll=1):
-                                        for kphase_idx in cutlass.range(num_innerloop, unroll_full=True):
-                                            kphase_coord = (None, None, outer_iter * num_innerloop + kphase_idx)
+                                        for kphase_idx in cutlass.range(
+                                            num_innerloop, unroll_full=True
+                                        ):
+                                            kphase_coord = (
+                                                None,
+                                                None,
+                                                outer_iter * num_innerloop + kphase_idx,
+                                            )
                                             cute.gemm(
                                                 dov_tiled_mma,
                                                 tdPtdP_slice,
@@ -1262,9 +1252,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                                             )
                                             dov_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
                                 else:
-                                    for kphase_idx in cutlass.range(
-                                        num_kphases, unroll_full=True
-                                    ):
+                                    for kphase_idx in cutlass.range(num_kphases, unroll_full=True):
                                         kphase_coord = (None, None, kphase_idx)
                                         cute.gemm(
                                             dov_tiled_mma,
@@ -1278,9 +1266,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                             cute.arch.fence_view_async_tmem_store()
                             dp_handle.commit()
 
-                            for i in cutlass.range(
-                                1, seqlen_kv_loop_steps - 1, 1, unroll=1
-                            ):
+                            for i in cutlass.range(1, seqlen_kv_loop_steps - 1, 1, unroll=1):
                                 # QKi
                                 s_handle = mma_s_producer.acquire_and_advance()
 
@@ -1289,15 +1275,19 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                                 for iter in cutlass.range(self.iterations_qk, unroll=1):
                                     tSrQ_slice = tSrQ[None, None, None, iter]
                                     k_handle = load_k_consumer.wait_and_advance()
-                                    tSrK_trans_slice = tSrK[
-                                        None, None, None, k_handle.index
-                                    ]
+                                    tSrK_trans_slice = tSrK[None, None, None, k_handle.index]
                                     num_kphases = cute.size(tSrQ_slice, mode=[2])
                                     if cutlass.const_expr(num_kphases % num_innerloop == 0):
                                         num_outer_iter = num_kphases // num_innerloop
                                         for outer_iter in cutlass.range(num_outer_iter, unroll=1):
-                                            for kphase_idx in cutlass.range(num_innerloop, unroll_full=True):
-                                                kphase_coord = (None, None, outer_iter * num_innerloop + kphase_idx)
+                                            for kphase_idx in cutlass.range(
+                                                num_innerloop, unroll_full=True
+                                            ):
+                                                kphase_coord = (
+                                                    None,
+                                                    None,
+                                                    outer_iter * num_innerloop + kphase_idx,
+                                                )
                                                 cute.gemm(
                                                     qk_tiled_mma,
                                                     tStS_slice,
@@ -1324,14 +1314,10 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
 
                                 # dSKTi
                                 ds_handle = ds_mma_consumer.wait_and_advance()
-                                dsk_whether_acc = dsk_tiled_mma.get(
-                                    tcgen05.Field.ACCUMULATE
-                                )
+                                dsk_whether_acc = dsk_tiled_mma.get(tcgen05.Field.ACCUMULATE)
                                 for iter in cutlass.range(self.iterations_dsk, unroll=1):
                                     kt_handle = load_kt_consumer.wait_and_advance()
-                                    dsk_tiled_mma.set(
-                                        tcgen05.Field.ACCUMULATE, dsk_whether_acc
-                                    )
+                                    dsk_tiled_mma.set(tcgen05.Field.ACCUMULATE, dsk_whether_acc)
                                     tdQtdQ_slice = tdQtdQ_staged[None, None, None, iter]
                                     tdStdS_slice = tdPtdP[None, None, None, ds_handle.index]
                                     tdS = cute.make_tensor(
@@ -1339,9 +1325,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                                     )
                                     tdQrdS = dsk_thr_mma.make_fragment_A(tdS)
                                     tdQrdS_slice = cute.make_tensor(
-                                        cute.recast_ptr(
-                                            tdStdS_slice.iterator, dtype=self.q_dtype
-                                        ),
+                                        cute.recast_ptr(tdStdS_slice.iterator, dtype=self.q_dtype),
                                         tdQrdS.layout,
                                     )
 
@@ -1350,8 +1334,14 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                                     if cutlass.const_expr(num_kphases % num_innerloop == 0):
                                         num_outer_iter = num_kphases // num_innerloop
                                         for outer_iter in cutlass.range(num_outer_iter, unroll=1):
-                                            for kphase_idx in cutlass.range(num_innerloop, unroll_full=True):
-                                                kphase_coord = (None, None, outer_iter * num_innerloop + kphase_idx)
+                                            for kphase_idx in cutlass.range(
+                                                num_innerloop, unroll_full=True
+                                            ):
+                                                kphase_coord = (
+                                                    None,
+                                                    None,
+                                                    outer_iter * num_innerloop + kphase_idx,
+                                                )
                                                 cute.gemm(
                                                     dsk_tiled_mma,
                                                     tdQtdQ_slice,
@@ -1383,15 +1373,19 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                                 for iter in cutlass.range(self.iterations_dov, unroll=1):
                                     tdPrdO_slice = tdPrdO[None, None, None, iter]
                                     v_handle = load_v_consumer.wait_and_advance()
-                                    tdPrV_trans_slice = tdPrV[
-                                        None, None, None, v_handle.index
-                                    ]
+                                    tdPrV_trans_slice = tdPrV[None, None, None, v_handle.index]
                                     num_kphases = cute.size(tdPrdO_slice, mode=[2])
                                     if cutlass.const_expr(num_kphases % num_innerloop == 0):
                                         num_outer_iter = num_kphases // num_innerloop
                                         for outer_iter in cutlass.range(num_outer_iter, unroll=1):
-                                            for kphase_idx in cutlass.range(num_innerloop, unroll_full=True):
-                                                kphase_coord = (None, None, outer_iter * num_innerloop + kphase_idx)
+                                            for kphase_idx in cutlass.range(
+                                                num_innerloop, unroll_full=True
+                                            ):
+                                                kphase_coord = (
+                                                    None,
+                                                    None,
+                                                    outer_iter * num_innerloop + kphase_idx,
+                                                )
                                                 cute.gemm(
                                                     dov_tiled_mma,
                                                     tdPtdP_slice,
@@ -1416,7 +1410,6 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                                     v_handle.release()
                                 dp_handle.commit()
 
-
                             # QKend
                             s_handle = mma_s_producer.acquire_and_advance()
                             tStS_slice = tStS[None, None, None, s_handle.index]
@@ -1425,16 +1418,20 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                                 tSrQ_slice = tSrQ[None, None, None, iter]
                                 k_handle = load_k_consumer.wait_and_advance()
 
-                                tSrK_trans_slice = tSrK[
-                                    None, None, None, k_handle.index
-                                ]
+                                tSrK_trans_slice = tSrK[None, None, None, k_handle.index]
 
                                 num_kphases = cute.size(tSrQ_slice, mode=[2])
                                 if cutlass.const_expr(num_kphases % num_innerloop == 0):
                                     num_outer_iter = num_kphases // num_innerloop
                                     for outer_iter in cutlass.range(num_outer_iter, unroll=1):
-                                        for kphase_idx in cutlass.range(num_innerloop, unroll_full=True):
-                                            kphase_coord = (None, None, outer_iter * num_innerloop + kphase_idx)
+                                        for kphase_idx in cutlass.range(
+                                            num_innerloop, unroll_full=True
+                                        ):
+                                            kphase_coord = (
+                                                None,
+                                                None,
+                                                outer_iter * num_innerloop + kphase_idx,
+                                            )
                                             cute.gemm(
                                                 qk_tiled_mma,
                                                 tStS_slice,
@@ -1444,9 +1441,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                                             )
                                             qk_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
                                 else:
-                                    for kphase_idx in cutlass.range(
-                                        num_kphases, unroll_full=True
-                                    ):
+                                    for kphase_idx in cutlass.range(num_kphases, unroll_full=True):
                                         kphase_coord = (None, None, kphase_idx)
                                         cute.gemm(
                                             qk_tiled_mma,
@@ -1463,14 +1458,10 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
 
                             # dSKTend - 1
                             ds_handle = ds_mma_consumer.wait_and_advance()
-                            dsk_whether_acc = dsk_tiled_mma.get(
-                                tcgen05.Field.ACCUMULATE
-                            )
+                            dsk_whether_acc = dsk_tiled_mma.get(tcgen05.Field.ACCUMULATE)
                             for iter in cutlass.range(self.iterations_dsk, unroll=1):
                                 kt_handle = load_kt_consumer.wait_and_advance()
-                                dsk_tiled_mma.set(
-                                    tcgen05.Field.ACCUMULATE, dsk_whether_acc
-                                )
+                                dsk_tiled_mma.set(tcgen05.Field.ACCUMULATE, dsk_whether_acc)
                                 tdQtdQ_slice = tdQtdQ_staged[None, None, None, iter]
                                 tdStdS_slice = tdPtdP[None, None, None, ds_handle.index]
                                 tdS = cute.make_tensor(
@@ -1478,9 +1469,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                                 )
                                 tdQrdS = dsk_thr_mma.make_fragment_A(tdS)
                                 tdQrdS_slice = cute.make_tensor(
-                                    cute.recast_ptr(
-                                        tdStdS_slice.iterator, dtype=self.q_dtype
-                                    ),
+                                    cute.recast_ptr(tdStdS_slice.iterator, dtype=self.q_dtype),
                                     tdQrdS.layout,
                                 )
 
@@ -1489,8 +1478,14 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                                 if cutlass.const_expr(num_kphases % num_innerloop == 0):
                                     num_outer_iter = num_kphases // num_innerloop
                                     for outer_iter in cutlass.range(num_outer_iter, unroll=1):
-                                        for kphase_idx in cutlass.range(num_innerloop, unroll_full=True):
-                                            kphase_coord = (None, None, outer_iter * num_innerloop + kphase_idx)
+                                        for kphase_idx in cutlass.range(
+                                            num_innerloop, unroll_full=True
+                                        ):
+                                            kphase_coord = (
+                                                None,
+                                                None,
+                                                outer_iter * num_innerloop + kphase_idx,
+                                            )
                                             cute.gemm(
                                                 dsk_tiled_mma,
                                                 tdQtdQ_slice,
@@ -1500,9 +1495,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                                             )
                                             dsk_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
                                 else:
-                                    for kphase_idx in cutlass.range(
-                                        num_kphases, unroll_full=True
-                                    ):
+                                    for kphase_idx in cutlass.range(num_kphases, unroll_full=True):
                                         kphase_coord = (None, None, kphase_idx)
                                         cute.gemm(
                                             dsk_tiled_mma,
@@ -1522,15 +1515,19 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                             for iter in cutlass.range(self.iterations_dov, unroll=1):
                                 tdPrdO_slice = tdPrdO[None, None, None, iter]
                                 v_handle = load_v_consumer.wait_and_advance()
-                                tdPrV_trans_slice = tdPrV[
-                                    None, None, None, v_handle.index
-                                ]
+                                tdPrV_trans_slice = tdPrV[None, None, None, v_handle.index]
                                 num_kphases = cute.size(tdPrdO_slice, mode=[2])
                                 if cutlass.const_expr(num_kphases % num_innerloop == 0):
                                     num_outer_iter = num_kphases // num_innerloop
                                     for outer_iter in cutlass.range(num_outer_iter, unroll=1):
-                                        for kphase_idx in cutlass.range(num_innerloop, unroll_full=True):
-                                            kphase_coord = (None, None, outer_iter * num_innerloop + kphase_idx)
+                                        for kphase_idx in cutlass.range(
+                                            num_innerloop, unroll_full=True
+                                        ):
+                                            kphase_coord = (
+                                                None,
+                                                None,
+                                                outer_iter * num_innerloop + kphase_idx,
+                                            )
                                             cute.gemm(
                                                 dov_tiled_mma,
                                                 tdPtdP_slice,
@@ -1540,9 +1537,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                                             )
                                             dov_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
                                 else:
-                                    for kphase_idx in cutlass.range(
-                                        num_kphases, unroll_full=True
-                                    ):
+                                    for kphase_idx in cutlass.range(num_kphases, unroll_full=True):
                                         kphase_coord = (None, None, kphase_idx)
                                         cute.gemm(
                                             dov_tiled_mma,
@@ -1558,14 +1553,10 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                             dp_handle.commit()
                             # dSKTend
                             ds_handle = ds_mma_consumer.wait_and_advance()
-                            dsk_whether_acc = dsk_tiled_mma.get(
-                                tcgen05.Field.ACCUMULATE
-                            )
+                            dsk_whether_acc = dsk_tiled_mma.get(tcgen05.Field.ACCUMULATE)
                             for iter in cutlass.range(self.iterations_dsk, unroll=1):
                                 kt_handle = load_kt_consumer.wait_and_advance()
-                                dsk_tiled_mma.set(
-                                    tcgen05.Field.ACCUMULATE, dsk_whether_acc
-                                )
+                                dsk_tiled_mma.set(tcgen05.Field.ACCUMULATE, dsk_whether_acc)
                                 tdQtdQ_slice = tdQtdQ_staged[None, None, None, iter]
                                 tdStdS_slice = tdPtdP[None, None, None, ds_handle.index]
                                 tdS = cute.make_tensor(
@@ -1573,9 +1564,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                                 )
                                 tdQrdS = dsk_thr_mma.make_fragment_A(tdS)
                                 tdQrdS_slice = cute.make_tensor(
-                                    cute.recast_ptr(
-                                        tdStdS_slice.iterator, dtype=self.q_dtype
-                                    ),
+                                    cute.recast_ptr(tdStdS_slice.iterator, dtype=self.q_dtype),
                                     tdQrdS.layout,
                                 )
 
@@ -1584,8 +1573,14 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                                 if cutlass.const_expr(num_kphases % num_innerloop == 0):
                                     num_outer_iter = num_kphases // num_innerloop
                                     for outer_iter in cutlass.range(num_outer_iter, unroll=1):
-                                        for kphase_idx in cutlass.range(num_innerloop, unroll_full=True):
-                                            kphase_coord = (None, None, outer_iter * num_innerloop + kphase_idx)
+                                        for kphase_idx in cutlass.range(
+                                            num_innerloop, unroll_full=True
+                                        ):
+                                            kphase_coord = (
+                                                None,
+                                                None,
+                                                outer_iter * num_innerloop + kphase_idx,
+                                            )
                                             cute.gemm(
                                                 dsk_tiled_mma,
                                                 tdQtdQ_slice,
@@ -1595,9 +1590,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                                             )
                                             dsk_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
                                 else:
-                                    for kphase_idx in cutlass.range(
-                                        num_kphases, unroll_full=True
-                                    ):
+                                    for kphase_idx in cutlass.range(num_kphases, unroll_full=True):
                                         kphase_coord = (None, None, kphase_idx)
                                         cute.gemm(
                                             dsk_tiled_mma,
@@ -1619,15 +1612,19 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                                 load_q_consumer.wait_and_advance()
                                 tSrQ_slice = tSrQ[None, None, None, iter]
                                 k_handle = load_k_consumer.wait_and_advance()
-                                tSrK_trans_slice = tSrK[
-                                    None, None, None, k_handle.index
-                                ]
+                                tSrK_trans_slice = tSrK[None, None, None, k_handle.index]
                                 num_kphases = cute.size(tSrQ_slice, mode=[2])
                                 if cutlass.const_expr(num_kphases % num_innerloop == 0):
                                     num_outer_iter = num_kphases // num_innerloop
                                     for outer_iter in cutlass.range(num_outer_iter, unroll=1):
-                                        for kphase_idx in cutlass.range(num_innerloop, unroll_full=True):
-                                            kphase_coord = (None, None, outer_iter * num_innerloop + kphase_idx)
+                                        for kphase_idx in cutlass.range(
+                                            num_innerloop, unroll_full=True
+                                        ):
+                                            kphase_coord = (
+                                                None,
+                                                None,
+                                                outer_iter * num_innerloop + kphase_idx,
+                                            )
                                             cute.gemm(
                                                 qk_tiled_mma,
                                                 tStS_slice,
@@ -1637,9 +1634,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                                             )
                                             qk_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
                                 else:
-                                    for kphase_idx in cutlass.range(
-                                        num_kphases, unroll_full=True
-                                    ):
+                                    for kphase_idx in cutlass.range(num_kphases, unroll_full=True):
                                         kphase_coord = (None, None, kphase_idx)
                                         cute.gemm(
                                             qk_tiled_mma,
@@ -1662,15 +1657,19 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                                 load_do_consumer.wait_and_advance()
                                 tdPrdO_slice = tdPrdO[None, None, None, iter]
                                 v_handle = load_v_consumer.wait_and_advance()
-                                tdPrV_trans_slice = tdPrV[
-                                    None, None, None, v_handle.index
-                                ]
+                                tdPrV_trans_slice = tdPrV[None, None, None, v_handle.index]
                                 num_kphases = cute.size(tdPrdO_slice, mode=[2])
                                 if cutlass.const_expr(num_kphases % num_innerloop == 0):
                                     num_outer_iter = num_kphases // num_innerloop
                                     for outer_iter in cutlass.range(num_outer_iter, unroll=1):
-                                        for kphase_idx in cutlass.range(num_innerloop, unroll_full=True):
-                                            kphase_coord = (None, None, outer_iter * num_innerloop + kphase_idx)
+                                        for kphase_idx in cutlass.range(
+                                            num_innerloop, unroll_full=True
+                                        ):
+                                            kphase_coord = (
+                                                None,
+                                                None,
+                                                outer_iter * num_innerloop + kphase_idx,
+                                            )
                                             cute.gemm(
                                                 dov_tiled_mma,
                                                 tdPtdP_slice,
@@ -1680,9 +1679,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                                             )
                                             dov_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
                                 else:
-                                    for kphase_idx in cutlass.range(
-                                        num_kphases, unroll_full=True
-                                    ):
+                                    for kphase_idx in cutlass.range(num_kphases, unroll_full=True):
                                         kphase_coord = (None, None, kphase_idx)
                                         cute.gemm(
                                             dov_tiled_mma,
@@ -1699,14 +1696,10 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
 
                             # dSKT0
                             ds_handle = ds_mma_consumer.wait_and_advance()
-                            dsk_whether_acc = dsk_tiled_mma.get(
-                                tcgen05.Field.ACCUMULATE
-                            )
+                            dsk_whether_acc = dsk_tiled_mma.get(tcgen05.Field.ACCUMULATE)
                             for iter in cutlass.range(self.iterations_dsk, unroll=1):
                                 kt_handle = load_kt_consumer.wait_and_advance()
-                                dsk_tiled_mma.set(
-                                    tcgen05.Field.ACCUMULATE, dsk_whether_acc
-                                )
+                                dsk_tiled_mma.set(tcgen05.Field.ACCUMULATE, dsk_whether_acc)
                                 tdQtdQ_slice = tdQtdQ_staged[None, None, None, iter]
                                 tdStdS_slice = tdPtdP[None, None, None, ds_handle.index]
                                 tdS = cute.make_tensor(
@@ -1714,9 +1707,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                                 )
                                 tdQrdS = dsk_thr_mma.make_fragment_A(tdS)
                                 tdQrdS_slice = cute.make_tensor(
-                                    cute.recast_ptr(
-                                        tdStdS_slice.iterator, dtype=self.q_dtype
-                                    ),
+                                    cute.recast_ptr(tdStdS_slice.iterator, dtype=self.q_dtype),
                                     tdQrdS.layout,
                                 )
 
@@ -1725,8 +1716,14 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                                 if cutlass.const_expr(num_kphases % num_innerloop == 0):
                                     num_outer_iter = num_kphases // num_innerloop
                                     for outer_iter in cutlass.range(num_outer_iter, unroll=1):
-                                        for kphase_idx in cutlass.range(num_innerloop, unroll_full=True):
-                                            kphase_coord = (None, None, outer_iter * num_innerloop + kphase_idx)
+                                        for kphase_idx in cutlass.range(
+                                            num_innerloop, unroll_full=True
+                                        ):
+                                            kphase_coord = (
+                                                None,
+                                                None,
+                                                outer_iter * num_innerloop + kphase_idx,
+                                            )
                                             cute.gemm(
                                                 dsk_tiled_mma,
                                                 tdQtdQ_slice,
@@ -1736,9 +1733,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                                             )
                                             dsk_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
                                 else:
-                                    for kphase_idx in cutlass.range(
-                                        num_kphases, unroll_full=True
-                                    ):
+                                    for kphase_idx in cutlass.range(num_kphases, unroll_full=True):
                                         kphase_coord = (None, None, kphase_idx)
                                         cute.gemm(
                                             dsk_tiled_mma,
@@ -1758,10 +1753,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
             mma_dq_producer.tail()
 
         # Softmax and dSoftmax warp
-        if (
-            warp_idx >= self.compute_warp_ids[0]
-            and warp_idx <= self.compute_warp_ids[-1]
-        ):
+        if warp_idx >= self.compute_warp_ids[0] and warp_idx <= self.compute_warp_ids[-1]:
             # increase register after decreasing
             cute.arch.warpgroup_reg_alloc(self.num_regs_compute)
             while work_tile.is_valid_tile:
@@ -1779,12 +1771,10 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                 if cutlass.const_expr(cum_seqlen_q is not None):
                     cuseqlen_q = cum_seqlen_q[batch_coord]
                     seqlen_q = cum_seqlen_q[batch_coord + 1] - cuseqlen_q
-                    continue_cond = (
-                        not FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
-                            self.qk_mma_tiler[0],
-                            mma_block_coord[0],
-                            seqlen_q,
-                        )
+                    continue_cond = not FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
+                        self.qk_mma_tiler[0],
+                        mma_block_coord[0],
+                        seqlen_q,
                     )
                 if not continue_cond:
                     if cutlass.const_expr(cum_seqlen_k is not None):
@@ -1819,9 +1809,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                     cS_base = cute.make_identity_tensor(
                         (self.qk_mma_tiler[0], self.qk_mma_tiler[1])
                     )
-                    cS = cute.domain_offset(
-                        (mma_block_coord[0] * self.qk_mma_tiler[0], 0), cS_base
-                    )
+                    cS = cute.domain_offset((mma_block_coord[0] * self.qk_mma_tiler[0], 0), cS_base)
                     tScS = qk_thr_mma.partition_C(cS)
 
                     cdP_base = cute.make_identity_tensor(
@@ -1832,18 +1820,13 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                     )
                     tdPcdP = dov_thr_mma.partition_C(cdP)
 
-
                     lse_handle = load_lse_consumer.wait_and_advance()
                     sum_odo_handle = load_sum_odo_consumer.wait_and_advance()
                     for step in cutlass.range(start_count, end_count, 1, unroll=1):
-                        cS_iter = cute.domain_offset(
-                            (0, step * self.qk_mma_tiler[1]), cS
-                        )
+                        cS_iter = cute.domain_offset((0, step * self.qk_mma_tiler[1]), cS)
                         tScS_iter = qk_thr_mma.partition_C(cS_iter)
 
-                        cdP_iter = cute.domain_offset(
-                            (0, step * self.dov_mma_tiler[1]), cdP
-                        )
+                        cdP_iter = cute.domain_offset((0, step * self.dov_mma_tiler[1]), cdP)
 
                         tdPcdP_iter = dov_thr_mma.partition_C(cdP_iter)
 
@@ -1866,7 +1849,13 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                                 varlen,
                             ),
                             (tStS, tScS_iter, tdPtdP, tdPcdP_iter, sLSE, sSum_OdO),
-                            (mma_s_consumer, mma_dp_consumer, ds_mma_producer, lse_handle, sum_odo_handle),
+                            (
+                                mma_s_consumer,
+                                mma_dp_consumer,
+                                ds_mma_producer,
+                                lse_handle,
+                                sum_odo_handle,
+                            ),
                             step,
                         )
                     lse_handle.release()
@@ -1888,7 +1877,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                     curr_block_coord[2],
                 )
                 batch_coord = curr_block_coord[2][1]
-                #cute.printf("batch_coord={}", batch_coord)
+                # cute.printf("batch_coord={}", batch_coord)
                 seqlen_q = mQ_qdl.shape[0]
                 seqlen_k = mK_kdl.shape[0]
                 continue_cond = False
@@ -1896,12 +1885,10 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                 if cutlass.const_expr(cum_seqlen_q is not None):
                     cuseqlen_q = cum_seqlen_q[batch_coord]
                     seqlen_q = cum_seqlen_q[batch_coord + 1] - cuseqlen_q
-                    continue_cond = (
-                        not FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
-                            self.qk_mma_tiler[0],
-                            mma_block_coord[0],
-                            seqlen_q,
-                        )
+                    continue_cond = not FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
+                        self.qk_mma_tiler[0],
+                        mma_block_coord[0],
+                        seqlen_q,
                     )
 
                 if not continue_cond:
@@ -1930,12 +1917,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                         cute.select(self.dsk_block_tiler, mode=[0, 1]),
                     )
 
-                    gdQ_staged = gdQ_qdl[
-                        None, None, curr_block_coord[0], None, curr_block_coord[2]
-                    ]
-                    cdQ_staged = cdQ_qdl[
-                        None, None, curr_block_coord[0], None, curr_block_coord[2]
-                    ]
+                    gdQ_staged = gdQ_qdl[None, None, curr_block_coord[0], None, curr_block_coord[2]]
+                    cdQ_staged = cdQ_qdl[None, None, curr_block_coord[0], None, curr_block_coord[2]]
 
                     # dQ TMEM to GMEM
                     mma_dq_consumer = self.dQ_epilogue(
@@ -2151,14 +2134,12 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                 tTMEM_LOADtdQ_i = tTMEM_LOADtdQ[None, i, 0]
                 tTMEM_LOADgdQ_i = tTMEM_LOADgdQ[None, i, 0]
                 tTMEM_LOADcdQ_i = tTMEM_LOADcdQ[None, i, 0]
-                tTMrdQ = cute.make_rmem_tensor(
-                    tTMEM_LOADcdQ[None, 0, i].shape, self.acc_dtype
-                )
+                tTMrdQ = cute.make_rmem_tensor(tTMEM_LOADcdQ[None, 0, i].shape, self.acc_dtype)
                 cute.copy(tiled_tmem_load, tTMEM_LOADtdQ_i, tTMrdQ)
                 tSMrdQ = cute.make_rmem_tensor(tTMrdQ.shape, self.q_dtype)
                 dq_vec = tTMrdQ.load()
                 tSMrdQ.store(dq_vec.to(self.q_dtype))
                 if cute.elem_less(tTMEM_LOADcdQ_i[0][0], seqlen_q):
-                   cute.autovec_copy(tSMrdQ, tTMEM_LOADgdQ_i)
+                    cute.autovec_copy(tSMrdQ, tTMEM_LOADgdQ_i)
         dq_handle.release()
         return mma_dq_consumer

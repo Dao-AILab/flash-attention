@@ -411,7 +411,7 @@ class AttentionMask:
                 for j in cutlass.range_constexpr(32):
                     curr_col = col_start + j
                     mask = (curr_mask_val >> j) & 1
-                    acc_S[curr_col] = acc_S[curr_col] if Boolean(mask) else -Float32.inf
+                    acc_S[curr_col] = acc_S[curr_col] if cutlass.Boolean(mask) else -Float32.inf
 
         elif const_expr(not mask_causal and not mask_local and mask_mod is None):
             if const_expr(mask_seqlen):
@@ -726,10 +726,10 @@ class AttentionMask:
                     )
 
 
-
 # -----------------------------------------------------------------------------
 # SM100 FMHA fused-mask policy layer (separate from generic mask primitives).
 # -----------------------------------------------------------------------------
+
 
 class Sm100MaskEnum(enum.Enum):
     """Enumeration of mask types for FMHA operations.
@@ -750,6 +750,7 @@ class Sm100MaskEnum(enum.Enum):
     WINDOW_MASK_BWD = enum.auto()
     WINDOW_MASK_BWD_INFERENCE = enum.auto()
     RESIDUAL_MASK_BWD = enum.auto()
+
 
 class Sm100FusedMask:
     """A fused mask implementation for FMHA operations.
@@ -1039,9 +1040,7 @@ class Sm100FusedMask:
             or mask_type is Sm100MaskEnum.WINDOW_MASK_INFERENCE
         ):
             if cutlass.const_expr(window_size_left is not None):
-                min_idx_q = (
-                    (blk_coord[0] + 1) * tile_shape[0] + offset - window_size_left
-                )
+                min_idx_q = (blk_coord[0] + 1) * tile_shape[0] + offset - window_size_left
                 leading_mask_end = dsl_min(
                     cute.ceil_div(min_idx_q, tile_shape[1]) - 1,
                     trip_count + leading_mask_begin - 1,
@@ -1053,9 +1052,7 @@ class Sm100FusedMask:
             or mask_type is Sm100MaskEnum.WINDOW_MASK_BWD_INFERENCE
         ):
             if cutlass.const_expr(window_size_right is not None):
-                min_idx_k = (
-                    (blk_coord[1] + 1) * tile_shape[1] + offset - window_size_right
-                )
+                min_idx_k = (blk_coord[1] + 1) * tile_shape[1] + offset - window_size_right
                 leading_mask_end = cute.ceil_div(min_idx_k, tile_shape[0]) - 1
             else:
                 leading_mask_end = leading_mask_begin - 1
@@ -1134,9 +1131,7 @@ class Sm100FusedMask:
         else:
             if cutlass.const_expr(window_size_left is not None):
                 min_idx_k = blk_coord[1] * tile_shape[1] + offset + window_size_left + 1
-                max_idx_k = (
-                    (blk_coord[1] + 1) * tile_shape[1] + offset + window_size_left
-                )
+                max_idx_k = (blk_coord[1] + 1) * tile_shape[1] + offset + window_size_left
                 trailing_mask_begin = dsl_min(
                     cute.ceil_div(min_idx_k, tile_shape[0]) - 1,
                     trip_count + trip_start - 1,
@@ -1190,9 +1185,7 @@ class Sm100FusedMask:
             mask_type is not Sm100MaskEnum.RESIDUAL_MASK
             and mask_type is not Sm100MaskEnum.RESIDUAL_MASK_BWD
         ):
-            if cutlass.const_expr(
-                window_size_left is not None or window_size_right is not None
-            ):
+            if cutlass.const_expr(window_size_left is not None or window_size_right is not None):
                 leading_mask_begin, leading_mask_end = Sm100FusedMask.get_leading_mask_id(
                     mask_type,
                     blk_coord,
@@ -1248,9 +1241,7 @@ class Sm100FusedMask:
             mask_type is not Sm100MaskEnum.RESIDUAL_MASK
             and mask_type is not Sm100MaskEnum.RESIDUAL_MASK_BWD
         ):
-            if cutlass.const_expr(
-                window_size_left is not None or window_size_right is not None
-            ):
+            if cutlass.const_expr(window_size_left is not None or window_size_right is not None):
                 trailing_mask_begin, trailing_mask_end = Sm100FusedMask.get_trailing_mask_id(
                     mask_type,
                     blk_coord,
@@ -1401,9 +1392,7 @@ class Sm100FusedMask:
             offset = seqlen_k - seqlen_q
         for i in cutlass.range_constexpr(cute.size(acc_qk), unroll_full=True):
             index_q, index_k = index_transform(*index_qk[i])
-            if cutlass.const_expr(
-                window_size_left is not None or window_size_right is not None
-            ):
+            if cutlass.const_expr(window_size_left is not None or window_size_right is not None):
                 if cutlass.const_expr(window_size_left is None):
                     if index_q + offset + window_size_right < index_k:
                         acc_qk[i] = -Float32.inf
