@@ -672,6 +672,23 @@ CUTE_DEVICE T warp_uniform(T a) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// Warp-cooperative OR reduction over a bool array in global memory.
+// Each lane reads a strided subset of [ptr, ptr+count), then all lanes vote.
+// Returns true if any element in the range is true.
+// All threads in the warp must call this (no divergence before __ballot_sync).
+CUTE_DEVICE bool warp_or_reduce_bool(bool const* __restrict__ ptr, int count) {
+    int lane = threadIdx.x % cutlass::NumThreadsPerWarp;
+    bool local_or = false;
+    for (int i = lane; i < count; i += cutlass::NumThreadsPerWarp) {
+        local_or = local_or || ptr[i];
+        if (local_or) { break; }
+    }
+    unsigned mask = __ballot_sync(0xffffffff, local_or);
+    return mask != 0;
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
 CUTLASS_DEVICE
 int canonical_warp_group_idx_nosync() {
     return threadIdx.x / cutlass::NumThreadsPerWarpGroup;

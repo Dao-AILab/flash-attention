@@ -397,7 +397,6 @@ struct CollectiveMainloopFwdSm90 {
         int const* const leftpad_k = nullptr;
         int const* const seqlens_rotary = nullptr;
         bool const* const image_token_tag = nullptr;
-        int const * __restrict__ max_image_q_idx = nullptr;
     };
 
     // Device side kernel params
@@ -456,7 +455,6 @@ struct CollectiveMainloopFwdSm90 {
         int const* const leftpad_k = nullptr;
         int const *const seqlens_rotary = nullptr;
         bool const* const image_token_tag = nullptr;
-        int const * __restrict__ max_image_q_idx = nullptr;
     };
 
     static Params
@@ -569,7 +567,7 @@ struct CollectiveMainloopFwdSm90 {
                 args.kv_batch_idx,
                 args.cu_seqlens_q, args.cu_seqlens_k, args.cu_seqlens_k_new,
                 args.seqused_q, args.seqused_k, args.leftpad_k, args.seqlens_rotary,
-                args.image_token_tag, args.max_image_q_idx};
+                args.image_token_tag};
     }
 
     /// Issue Tma Descriptor Prefetch -- ideally from a single thread for best performance
@@ -605,15 +603,34 @@ struct CollectiveMainloopFwdSm90 {
          int &work_idx
          ) {
 
+        static constexpr int kBlockM = get<0>(TileShape_MNK{});
+        static constexpr int kBlockN = get<1>(TileShape_MNK{});
         // some of these are captured in lambda so can't use structured binding
         int const m_block = get<0>(block_coord);
         int const bidh = get<1>(block_coord);
         int const bidb = get<2>(block_coord);
         int const split_idx = get<3>(block_coord);
+        // Check if this M-block contains image tokens (need full attention).
+        bool has_image = false;
+        if constexpr (Is_causal) {
+            if (params.image_token_tag != nullptr) {
+                int m_idx_start = m_block * kBlockM;
+                int m_idx_end = (m_block + 1) * kBlockM;
+                if constexpr (PackGQA) {
+                    m_idx_start = params.qhead_per_khead_divmod.divide(m_idx_start);
+                    m_idx_end = params.qhead_per_khead_divmod.divide(m_idx_end - 1) + 1;
+                }
+                int valid_count = std::min(m_idx_end - m_idx_start, seqlen_info.seqlen_q - m_idx_start);
+                if (valid_count > 0) {
+                    has_image = flash::warp_or_reduce_bool(
+                        params.image_token_tag + seqlen_info.offset_q + m_idx_start, valid_count);
+                }
+            }
+        }
         auto [n_block_min, n_block_max] = BlockMN_t::get_n_block_min_max(
             seqlen_info, m_block, bidb, split_idx, params.num_splits,
             params.window_size_left, params.window_size_right, params.attention_chunk_divmod,
-            params.qhead_per_khead_divmod, params.max_image_q_idx);
+            params.qhead_per_khead_divmod, has_image);
         // It's possible to have n_block_max <= n_block_min. Loading K can cause illegal memory access.
         if constexpr (Is_causal || Is_local || Varlen || Split) {
             if (n_block_max <= n_block_min) {
@@ -979,10 +996,26 @@ struct CollectiveMainloopFwdSm90 {
         int const bidb = get<2>(block_coord);
         int const split_idx = get<3>(block_coord);
         int const bidh_kv = !PackGQA ? params.qhead_per_khead_divmod.divide(bidh) : bidh;
+        bool has_image = false;
+        if constexpr (Is_causal) {
+            if (params.image_token_tag != nullptr) {
+                int m_idx_start = m_block * kBlockM;
+                int m_idx_end = (m_block + 1) * kBlockM;
+                if constexpr (PackGQA) {
+                    m_idx_start = params.qhead_per_khead_divmod.divide(m_idx_start);
+                    m_idx_end = params.qhead_per_khead_divmod.divide(m_idx_end - 1) + 1;
+                }
+                int valid_count = std::min(m_idx_end - m_idx_start, seqlen_info.seqlen_q - m_idx_start);
+                if (valid_count > 0) {
+                    has_image = flash::warp_or_reduce_bool(
+                        params.image_token_tag + seqlen_info.offset_q + m_idx_start, valid_count);
+                }
+            }
+        }
         auto [n_block_min, n_block_max] = BlockMN_t::get_n_block_min_max(
             seqlen_info, m_block, bidb, split_idx, params.num_splits,
             params.window_size_left, params.window_size_right, params.attention_chunk_divmod,
-            params.qhead_per_khead_divmod, params.max_image_q_idx);
+            params.qhead_per_khead_divmod, has_image);
         // It's possible to have n_block_max <= n_block_min. We don't want to load Q or change any barrier
         if constexpr (Is_causal || Is_local || Varlen || Split) {
             if (n_block_max <= n_block_min) { return false; }
@@ -1370,14 +1403,32 @@ struct CollectiveMainloopFwdSm90 {
            SharedStorage& shared_storage
            ) {
         static_assert(is_rmem<FrgTensorO>::value, "O tensor must be rmem resident.");
+        static constexpr int kBlockM = get<0>(TileShape_MNK{});
+        static constexpr int kBlockN = get<1>(TileShape_MNK{});
         // can't use auto [m_block, ...] = block_coord since structured binding cannot be captured in lambda
         int const m_block = get<0>(block_coord);
         int const bidb = get<2>(block_coord);
         int const split_idx = get<3>(block_coord);
+        bool has_image = false;
+        if constexpr (Is_causal) {
+            if (params.image_token_tag != nullptr) {
+                int m_idx_start = m_block * kBlockM;
+                int m_idx_end = (m_block + 1) * kBlockM;
+                if constexpr (PackGQA) {
+                    m_idx_start = params.qhead_per_khead_divmod.divide(m_idx_start);
+                    m_idx_end = params.qhead_per_khead_divmod.divide(m_idx_end - 1) + 1;
+                }
+                int valid_count = std::min(m_idx_end - m_idx_start, seqlen_info.seqlen_q - m_idx_start);
+                if (valid_count > 0) {
+                    has_image = flash::warp_or_reduce_bool(
+                        params.image_token_tag + seqlen_info.offset_q + m_idx_start, valid_count);
+                }
+            }
+        }
         auto [n_block_min, n_block_max] = BlockMN_t::get_n_block_min_max(
             seqlen_info, m_block, bidb, split_idx, params.num_splits,
             params.window_size_left, params.window_size_right, params.attention_chunk_divmod,
-            params.qhead_per_khead_divmod, params.max_image_q_idx);
+            params.qhead_per_khead_divmod, has_image);
         // It's possible to have n_block_max <= n_block_min. We don't want to load Q or change any barrier
         if constexpr (Is_causal || Is_local || Varlen || Split) {
             if (n_block_max <= n_block_min) { return false; }
@@ -1460,11 +1511,29 @@ struct CollectiveMainloopFwdSm90 {
          int const work_idx
          ) {
 
+        static constexpr int kBlockM = get<0>(TileShape_MNK{});
+        static constexpr int kBlockN = get<1>(TileShape_MNK{});
         auto [m_block, bidh, bidb, split_idx] = block_coord;
+        bool has_image = false;
+        if constexpr (Is_causal) {
+            if (params.image_token_tag != nullptr) {
+                int m_idx_start = m_block * kBlockM;
+                int m_idx_end = (m_block + 1) * kBlockM;
+                if constexpr (PackGQA) {
+                    m_idx_start = params.qhead_per_khead_divmod.divide(m_idx_start);
+                    m_idx_end = params.qhead_per_khead_divmod.divide(m_idx_end - 1) + 1;
+                }
+                int valid_count = std::min(m_idx_end - m_idx_start, seqlen_info.seqlen_q - m_idx_start);
+                if (valid_count > 0) {
+                    has_image = flash::warp_or_reduce_bool(
+                        params.image_token_tag + seqlen_info.offset_q + m_idx_start, valid_count);
+                }
+            }
+        }
         auto [n_block_new_min, n_block_new_max] = BlockMN_t::get_n_block_k_new_min_max(
             seqlen_info, m_block, bidb, split_idx, params.num_splits,
             params.window_size_left, params.window_size_right, params.attention_chunk_divmod,
-            params.qhead_per_khead_divmod, params.max_image_q_idx);
+            params.qhead_per_khead_divmod, has_image);
 
         if (n_block_new_max <= n_block_new_min) { return false; }
 
@@ -1564,10 +1633,27 @@ struct CollectiveMainloopFwdSm90 {
                  cute::tuple<int32_t, int32_t, int32_t, int32_t> block_coord
     ) {
         auto [m_block, bidh, bidb, split_idx] = block_coord;
+        bool has_image = false;
+        if constexpr (Is_causal) {
+            if (params.image_token_tag != nullptr) {
+                static constexpr int kBlockM_ = get<0>(TileShape_MNK{});
+                int m_idx_start = m_block * kBlockM_;
+                int m_idx_end = (m_block + 1) * kBlockM_;
+                if constexpr (PackGQA) {
+                    m_idx_start = params.qhead_per_khead_divmod.divide(m_idx_start);
+                    m_idx_end = params.qhead_per_khead_divmod.divide(m_idx_end - 1) + 1;
+                }
+                int valid_count = std::min(m_idx_end - m_idx_start, seqlen_info.seqlen_q - m_idx_start);
+                if (valid_count > 0) {
+                    has_image = flash::warp_or_reduce_bool(
+                        params.image_token_tag + seqlen_info.offset_q + m_idx_start, valid_count);
+                }
+            }
+        }
         auto [n_block_new_min, n_block_new_max] = BlockMN_t::get_n_block_k_new_min_max(
             seqlen_info, m_block, bidb, split_idx, params.num_splits,
             params.window_size_left, params.window_size_right, params.attention_chunk_divmod,
-            params.qhead_per_khead_divmod, params.max_image_q_idx);
+            params.qhead_per_khead_divmod, has_image);
         if (n_block_new_max <= n_block_new_min) { return false; }
 
         // as_position_independent_swizzle_tensor makes address calculation easier

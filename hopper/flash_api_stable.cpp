@@ -142,8 +142,6 @@ void set_params_fprop(Flash_fwd_params &params,
 
     // Reset the parameters
     params = {};
-    params.max_image_q_idx = nullptr;
-
     params.is_bf16 = q.scalar_type() == torch::headeronly::ScalarType::BFloat16;
     params.is_e4m3 = q.scalar_type() == torch::headeronly::ScalarType::Float8_e4m3fn;
 
@@ -775,8 +773,7 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
         int64_t num_splits,
         std::optional<bool> pack_gqa_,
         int64_t sm_margin,
-        std::optional<Tensor> image_token_tag_,
-        std::optional<Tensor> max_image_q_idx_
+        std::optional<Tensor> image_token_tag_
         ) {
 
     auto dprops = get_device_prop();
@@ -1226,14 +1223,6 @@ mha_fwd(Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_
         STD_TORCH_CHECK(!params.is_local, "image_token_tag is incompatible with sliding window attention");
         STD_TORCH_CHECK(attention_chunk == 0, "image_token_tag is incompatible with attention_chunk");
         params.image_token_tag = static_cast<bool*>(image_token_tag.data_ptr());
-        if (max_image_q_idx_.has_value()) {
-            auto max_image_q_idx = max_image_q_idx_.value();
-            STD_TORCH_CHECK(max_image_q_idx.is_cuda(), "max_image_q_idx must be on CUDA");
-            STD_TORCH_CHECK(max_image_q_idx.is_contiguous(), "max_image_q_idx must be contiguous");
-            STD_TORCH_CHECK(max_image_q_idx.scalar_type() == torch::headeronly::ScalarType::Int, "max_image_q_idx must have dtype torch.int32");
-            STD_TORCH_CHECK(max_image_q_idx.sizes() == std::array<int64_t, 1>{batch_size}, "max_image_q_idx must have shape [batch_size]");
-            params.max_image_q_idx = static_cast<int const*>(max_image_q_idx.data_ptr());
-        }
     }
 
     #ifdef FLASHATTENTION_DISABLE_LOCAL
@@ -1816,9 +1805,8 @@ void boxed_mha_fwd(
     auto pack_gqa = to<std::optional<bool>>(stack[32]);
     auto sm_margin = to<int64_t>(stack[33]);
     auto image_token_tag = to<std::optional<Tensor>>(stack[34]);
-    auto max_image_q_idx = to<std::optional<Tensor>>(stack[35]);
 
-    auto [out_, softmax_lse, out_accum, softmax_lse_accum] = mha_fwd(q, k, v, k_new, v_new, q_v, out, cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new, seqused_q, seqused_k, max_seqlen_q, max_seqlen_k, page_table, kv_batch_idx, leftpad_k, rotary_cos, rotary_sin, seqlens_rotary, q_descale, k_descale, v_descale, softmax_scale, is_causal, window_size_left, window_size_right, attention_chunk, softcap, is_rotary_interleaved, scheduler_metadata, num_splits, pack_gqa, sm_margin, image_token_tag, max_image_q_idx);
+    auto [out_, softmax_lse, out_accum, softmax_lse_accum] = mha_fwd(q, k, v, k_new, v_new, q_v, out, cu_seqlens_q, cu_seqlens_k, cu_seqlens_k_new, seqused_q, seqused_k, max_seqlen_q, max_seqlen_k, page_table, kv_batch_idx, leftpad_k, rotary_cos, rotary_sin, seqlens_rotary, q_descale, k_descale, v_descale, softmax_scale, is_causal, window_size_left, window_size_right, attention_chunk, softcap, is_rotary_interleaved, scheduler_metadata, num_splits, pack_gqa, sm_margin, image_token_tag);
 
 
     stack[0] = from(out_);
@@ -1951,8 +1939,7 @@ STABLE_TORCH_LIBRARY(flash_attn_3, m) {
         "int num_splits = 0,"
         "bool? pack_gqa = None,"
         "int sm_margin = 0,"
-        "Tensor? image_token_tag = None,"
-        "Tensor? max_image_q_idx = None) -> (Tensor(out!), Tensor, Tensor, Tensor)");
+        "Tensor? image_token_tag = None) -> (Tensor(out!), Tensor, Tensor, Tensor)");
     m.def("bwd("
         "Tensor dout,"
         "Tensor q,"
