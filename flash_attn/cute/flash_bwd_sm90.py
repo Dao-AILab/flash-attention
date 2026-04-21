@@ -75,8 +75,11 @@ class FlashAttentionBackwardSm90:
         dQ_single_wg: bool = False,
     ):
         self.dtype = dtype
-        # padding head_dim to a multiple of 16 as k_block_size
-        hdim_multiple_of = 16
+        # padding head_dim to a multiple of 16 as k_block_size, or 64 when
+        # dKV_swapAB=True (needed for WGMMA M=64 atom to partition the dK/dV
+        # accumulator — otherwise head_dim in {144, 160, 176} crash the CuTe
+        # tiled-mma partition).
+        hdim_multiple_of = 64 if dKV_swapAB else 16
         self.tile_hdim = int(math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of)
         head_dim_v = head_dim_v if head_dim_v is not None else head_dim
         self.same_hdim_kv = head_dim == head_dim_v
