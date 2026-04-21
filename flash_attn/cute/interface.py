@@ -381,17 +381,19 @@ def _flash_attn_fwd(
         "inputs must be float16, bfloat16, fp8 e4m3fn, or fp8 e5m2"
     )
     assert q.dtype == k.dtype == v.dtype, "inputs must have the same dtype"
-    for t in [cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k]:
+    for t, name in [
+        (cu_seqlens_q, "cu_seqlens_q"),
+        (cu_seqlens_k, "cu_seqlens_k"),
+        (seqused_q, "seqused_q"),
+        (seqused_k, "seqused_k"),
+    ]:
         if t is not None:
-            assert t.dtype == torch.int32, (
-                "cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k must be int32"
-            )
-            assert t.stride(0) == 1, (
-                "cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k must be contiguous"
-            )
+            assert t.dtype == torch.int32, f"{name} must be int32, got {t.dtype}"
+            assert t.stride(-1) == 1, f"{name} must be contiguous in the last dim"
     if learnable_sink is not None:
-        assert learnable_sink.shape == (num_head,)
-        assert learnable_sink.dtype == torch.bfloat16, "learnable_sink must be bfloat16"
+        _validate_tensor(
+            learnable_sink, "learnable_sink", (num_head,), torch.bfloat16, q.device
+        )
 
     if not is_fake_mode():
         assert all(
@@ -414,6 +416,9 @@ def _flash_attn_fwd(
     arch = _get_device_arch() if _arch is None else _arch
     assert arch // 10 in [8, 9, 10, 11, 12], "Unsupported compute capability. Supported: 8.x, 9.x, 10.x, 11.x, 12.x"
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
+    qhead_per_kvhead = num_head // num_head_kv
+    if pack_gqa is None:
+        pack_gqa = qhead_per_kvhead > 1
     alignment = 16 // q.element_size()
     if arch // 10 not in [8, 12]:
         _validate_head_dims(head_dim, head_dim_v, arch // 10, alignment)
@@ -421,9 +426,6 @@ def _flash_attn_fwd(
         softmax_scale = 1.0 / math.sqrt(head_dim) if qv is None else 1.0 / math.sqrt(head_dim + head_dim_v)
     if softcap == 0.0:
         softcap = None
-    qhead_per_kvhead = num_head // num_head_kv
-    if pack_gqa is None:
-        pack_gqa = qhead_per_kvhead > 1
 
     is_fp8 = q.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
     if is_fp8 and (q.requires_grad or k.requires_grad or v.requires_grad):
