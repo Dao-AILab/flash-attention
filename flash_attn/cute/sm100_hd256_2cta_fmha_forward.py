@@ -61,7 +61,9 @@ class BlackwellFusedMultiHeadAttentionForward:
         assert score_mod is None, "SM100 forward with head_dim=256 does not support score_mod"
         assert mask_mod is None, "SM100 forward with head_dim=256 does not support mask_mod"
         assert not has_aux_tensors, "SM100 forward with head_dim=256 does not support aux tensors"
-        assert not paged_kv_non_tma, "SM100 forward with head_dim=256 does not support paged KV"
+        assert not paged_kv_non_tma, (
+            "SM100 hd256 2CTA supports TMA paged KV only (page_size must equal tile_n=128)"
+        )
         assert not pack_gqa, "SM100 forward with head_dim=256 does not support pack_gqa"
         assert not is_split_kv, "SM100 forward with head_dim=256 does not support SplitKV"
         assert q_subtile_factor is None, (
@@ -78,6 +80,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         mma_tiler = (128, 128, head_dim)
         self.qk_acc_dtype = qk_acc_dtype
         self.pv_acc_dtype = pv_acc_dtype
+        self.qhead_per_kvhead = qhead_per_kvhead
         self.mma_tiler = mma_tiler
         assert mma_tiler[0] == 128 and mma_tiler[1] == 128, "Only 128x128 tile impl is supported"
         assert mma_tiler[2] == 256, "Only 256 is supported for 128x128 tile impl"
@@ -178,7 +181,6 @@ class BlackwellFusedMultiHeadAttentionForward:
         assert mSeqUsedQ is None and mSeqUsedK is None, (
             "SM100 forward with head_dim=256 does not support seqused_q/seqused_k"
         )
-        assert mPageTable is None, "SM100 forward with head_dim=256 does not support paged KV"
         assert learnable_sink is None, (
             "SM100 forward with head_dim=256 does not support learnable_sink"
         )
@@ -290,18 +292,48 @@ class BlackwellFusedMultiHeadAttentionForward:
             stride=(d64 * h_r64 * h_k64, 1, ((d64, d64 * h_r64), stride_b_qo)),
         )
         q = cute.make_tensor(q_tensor.iterator, q_layout)
-        # (s, d, ((h_r, h_k), b)), 0-stride for h_r to broadcast
-        k_layout = cute.make_layout(
-            (s_k_total, d, ((h_r, h_k), b)),
-            stride=(d64 * h_k64, 1, ((0, d64), stride_b_kv)),
-        )
-        k = cute.make_tensor(k_tensor.iterator, k_layout)
-        # (d, s, ((h_r, h_k), b)), 0-stride for h_r to broadcast
-        v_layout = cute.make_layout(
-            (d, s_k_total, ((h_r, h_k), b)),
-            stride=(1, d64 * h_k64, ((0, d64), stride_b_kv)),
-        )
-        v = cute.make_tensor(v_tensor.iterator, v_layout)
+        if cutlass.const_expr(mPageTable is not None):
+            # Paged KV uses the same TMA load path as dense KV. Each page is
+            # presented as one tile_n=128 tile; logical KV blocks are remapped
+            # to physical page indices through the page table at load time.
+            # k_tensor layout (from interface.py): (num_pages, page_size, h_k, d)
+            num_pages = k_tensor.shape[0]
+            page_size = k_tensor.shape[1]
+            page_size64 = Int64(page_size)
+            # For paged mode, the per-sequence max_seqlen_k is pages_per_seq * page_size.
+            # Overrides the inferred s_k from dense K shape (which would be page_size here).
+            max_seqlen_k_paged = Int32(mPageTable.shape[1] * page_size)
+            k_paged_layout = cute.make_layout(
+                (page_size, d, h_k, num_pages),
+                stride=(d64 * h_k64, 1, d64, page_size64 * d64 * h_k64),
+            )
+            k = cute.make_tensor(k_tensor.iterator, k_paged_layout)
+            v_paged_layout = cute.make_layout(
+                (d, page_size, h_k, num_pages),
+                stride=(1, d64 * h_k64, d64, page_size64 * d64 * h_k64),
+            )
+            v = cute.make_tensor(v_tensor.iterator, v_paged_layout)
+            # page_table: (b, max_num_pages_per_seq)
+            page_table_layout = cute.make_layout(
+                (b, mPageTable.shape[1]),
+                stride=(Int64(mPageTable.shape[1]), 1),
+            )
+            page_table = cute.make_tensor(mPageTable.iterator, page_table_layout)
+        else:
+            # (s, d, ((h_r, h_k), b)), 0-stride for h_r to broadcast
+            k_layout = cute.make_layout(
+                (s_k_total, d, ((h_r, h_k), b)),
+                stride=(d64 * h_k64, 1, ((0, d64), stride_b_kv)),
+            )
+            k = cute.make_tensor(k_tensor.iterator, k_layout)
+            # (d, s, ((h_r, h_k), b)), 0-stride for h_r to broadcast
+            v_layout = cute.make_layout(
+                (d, s_k_total, ((h_r, h_k), b)),
+                stride=(1, d64 * h_k64, ((0, d64), stride_b_kv)),
+            )
+            v = cute.make_tensor(v_tensor.iterator, v_layout)
+            page_table = None
+            max_seqlen_k_paged = None
         # (s, d, ((h_r, h_k), b))
         o_layout = cute.make_layout(
             (s_q_total, d, ((h_r, h_k), b)),
@@ -499,6 +531,8 @@ class BlackwellFusedMultiHeadAttentionForward:
             scale_softmax_log2,
             scale_softmax,
             scale_output,
+            page_table,
+            max_seqlen_k_paged,
             window_size_left,
             window_size_right,
             self.cluster_layout_vmnk,
@@ -534,6 +568,8 @@ class BlackwellFusedMultiHeadAttentionForward:
         scale_softmax_log2: Float32,
         scale_softmax: Float32,
         scale_output: Float32,
+        mPageTable: Optional[cute.Tensor],
+        max_seqlen_k: Optional[Int32],
         window_size_left: Optional[Int32],
         window_size_right: Optional[Int32],
         cluster_layout_vmnk: cute.Layout,
@@ -775,7 +811,9 @@ class BlackwellFusedMultiHeadAttentionForward:
                 continue_cond = False
                 batch_coord = curr_block_coord[2][1]
                 seqlen_q = mQ_qdl.shape[0]
-                seqlen_k = mK_kdl.shape[0]
+                seqlen_k = (
+                    mK_kdl.shape[0] if cutlass.const_expr(mPageTable is None) else max_seqlen_k
+                )
                 cuseqlen_q = Int32(0)
                 cuseqlen_k = Int32(0)
                 block_offset = (
@@ -803,8 +841,6 @@ class BlackwellFusedMultiHeadAttentionForward:
                     )
                 if not continue_cond:
                     mQ_qdl_ = cute.domain_offset(cute.select(block_offset, mode=[0, 2, 3]), mQ_qdl)
-                    mK_kdl_ = cute.domain_offset(cute.select(block_offset, mode=[1, 2, 3]), mK_kdl)
-                    mV_dkl_ = cute.domain_offset(cute.select(block_offset, mode=[2, 1, 3]), mV_dkl)
                     # Local tile partition global tensors
                     q_cta_layout = cute.make_layout(
                         cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape
@@ -822,31 +858,76 @@ class BlackwellFusedMultiHeadAttentionForward:
                     kv_cta_layout = cute.make_layout(
                         cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape
                     )
-                    gK_kdl = cute.flat_divide(mK_kdl_, cute.select(self.qk_mma_tiler, mode=[1, 2]))
-                    tSgK_kdl = qk_thr_mma.partition_B(gK_kdl)
-                    tKsK, tKgK_kdl = cute.nvgpu.cpasync.tma_partition(
-                        tma_atom_k,
-                        block_in_cluster_coord_vmnk[1],
-                        kv_cta_layout,
-                        cute.group_modes(sK, 0, 3),
-                        cute.group_modes(tSgK_kdl, 0, 3),
-                    )
-
-                    gV_dkl = cute.flat_divide(mV_dkl_, cute.select(self.pv_mma_tiler, mode=[1, 2]))
-                    tSgV_dkl = pv_thr_mma.partition_B(gV_dkl)
-                    tVsV, tVgV_dkl = cute.nvgpu.cpasync.tma_partition(
-                        tma_atom_v,
-                        block_in_cluster_coord_vmnk[1],
-                        kv_cta_layout,
-                        cute.group_modes(sV, 0, 3),
-                        cute.group_modes(tSgV_dkl, 0, 3),
-                    )
+                    if cutlass.const_expr(mPageTable is None):
+                        # Dense path: K/V have ((h_r, h_k), b) nested batch mode; resolve
+                        # batch via domain_offset, then index by mma_block_coord[2] (batch).
+                        mK_kdl_ = cute.domain_offset(
+                            cute.select(block_offset, mode=[1, 2, 3]), mK_kdl
+                        )
+                        mV_dkl_ = cute.domain_offset(
+                            cute.select(block_offset, mode=[2, 1, 3]), mV_dkl
+                        )
+                        gK_kdl = cute.flat_divide(
+                            mK_kdl_, cute.select(self.qk_mma_tiler, mode=[1, 2])
+                        )
+                        tSgK_kdl = qk_thr_mma.partition_B(gK_kdl)
+                        tKsK, tKgK_kdl = cute.nvgpu.cpasync.tma_partition(
+                            tma_atom_k,
+                            block_in_cluster_coord_vmnk[1],
+                            kv_cta_layout,
+                            cute.group_modes(sK, 0, 3),
+                            cute.group_modes(tSgK_kdl, 0, 3),
+                        )
+                        gV_dkl = cute.flat_divide(
+                            mV_dkl_, cute.select(self.pv_mma_tiler, mode=[1, 2])
+                        )
+                        tSgV_dkl = pv_thr_mma.partition_B(gV_dkl)
+                        tVsV, tVgV_dkl = cute.nvgpu.cpasync.tma_partition(
+                            tma_atom_v,
+                            block_in_cluster_coord_vmnk[1],
+                            kv_cta_layout,
+                            cute.group_modes(sV, 0, 3),
+                            cute.group_modes(tSgV_dkl, 0, 3),
+                        )
+                        # ((atom_v, rest_v), RestN, RestK)
+                        tKgK = tKgK_kdl[None, None, None, mma_block_coord[2]]
+                        tVgV = tVgV_dkl[None, None, None, mma_block_coord[2]]
+                    else:
+                        # Paged path: K/V have (page_size, d, h_k, num_pages) layout. Fix
+                        # h_k via direct slicing (no batch-offset), keep num_pages as the
+                        # outer mode so each TMA load can select a page via page_idx.
+                        # curr_block_coord[2][0] is the flat q-head index (0..nheads_q-1).
+                        # Map to KV head via integer divide (contiguous GQA grouping, matches
+                        # flash_fwd_sm100 convention). Modulo would alias heads for GQA.
+                        head_kv_coord = curr_block_coord[2][0] // self.qhead_per_kvhead
+                        mK_kdl_ = mK_kdl[None, None, head_kv_coord, None]
+                        mV_dkl_ = mV_dkl[None, None, head_kv_coord, None]
+                        gK_kdl = cute.flat_divide(
+                            mK_kdl_, cute.select(self.qk_mma_tiler, mode=[1, 2])
+                        )
+                        tSgK_kdl = qk_thr_mma.partition_B(gK_kdl)
+                        tKsK, tKgK_kdl = cute.nvgpu.cpasync.tma_partition(
+                            tma_atom_k,
+                            block_in_cluster_coord_vmnk[1],
+                            kv_cta_layout,
+                            cute.group_modes(sK, 0, 3),
+                            cute.group_modes(tSgK_kdl, 0, 3),
+                        )
+                        gV_dkl = cute.flat_divide(
+                            mV_dkl_, cute.select(self.pv_mma_tiler, mode=[1, 2])
+                        )
+                        tSgV_dkl = pv_thr_mma.partition_B(gV_dkl)
+                        tVsV, tVgV_dkl = cute.nvgpu.cpasync.tma_partition(
+                            tma_atom_v,
+                            block_in_cluster_coord_vmnk[1],
+                            kv_cta_layout,
+                            cute.group_modes(sV, 0, 3),
+                            cute.group_modes(tSgV_dkl, 0, 3),
+                        )
+                        tKgK = tKgK_kdl
+                        tVgV = tVgV_dkl
                     # ((atom_v, rest_v), RestK)
                     tQgQ = tQgQ_qdl[None, mma_block_coord[0], None, mma_block_coord[2]]
-                    # ((atom_v, rest_v), RestN, RestK)
-                    tKgK = tKgK_kdl[None, None, None, mma_block_coord[2]]
-                    # ((atom_v, rest_v), RestN, RestK)
-                    tVgV = tVgV_dkl[None, None, None, mma_block_coord[2]]
 
                     seqlen_kv_loop_start, seqlen_kv_loop_steps = (
                         FusedMask.get_trip_start_count_via_block_info(
@@ -871,13 +952,26 @@ class BlackwellFusedMultiHeadAttentionForward:
                             tma_bar_ptr=q_handle.barrier,
                         )
 
+                    # TMA load path for K and V tiles.
+                    # Dense:  tKgK[None, kv_coord, iter]       — kv_coord selects the seqlen block
+                    # Paged:  tKgK[None, 0, iter, k_page_idx]  — page_idx selects the physical page,
+                    #         iter selects the 128-wide k-subtile (mode 2), block is always 0 (mode 1)
+                    #         since each page IS one tile_n block. V follows the same pattern with
+                    #         transposed mode order.
                     # K0
                     kv_coord = seqlen_kv_loop_start
+                    k_page_idx = (
+                        mPageTable[batch_coord, kv_coord]
+                        if cutlass.const_expr(mPageTable is not None)
+                        else None
+                    )
                     for iter in cutlass.range(self.iterations_qk, unroll=1):
                         k_handle = load_kv_producer.acquire_and_advance()
                         cute.copy(
                             tma_atom_k,
-                            tKgK[None, kv_coord, iter],
+                            tKgK[None, kv_coord, iter]
+                            if cutlass.const_expr(mPageTable is None)
+                            else tKgK[None, 0, iter, k_page_idx],
                             tKsK[None, k_handle.index],
                             tma_bar_ptr=k_handle.barrier,
                         )
@@ -885,30 +979,51 @@ class BlackwellFusedMultiHeadAttentionForward:
 
                     for i in cutlass.range(1, seqlen_kv_loop_steps, 1, unroll=1):
                         # Ki
+                        k_page_idx = (
+                            mPageTable[batch_coord, kv_coord]
+                            if cutlass.const_expr(mPageTable is not None)
+                            else None
+                        )
                         for iter in cutlass.range(self.iterations_qk, unroll=1):
                             k_handle = load_kv_producer.acquire_and_advance()
                             cute.copy(
                                 tma_atom_k,
-                                tKgK[None, kv_coord, iter],
+                                tKgK[None, kv_coord, iter]
+                                if cutlass.const_expr(mPageTable is None)
+                                else tKgK[None, 0, iter, k_page_idx],
                                 tKsK[None, k_handle.index],
                                 tma_bar_ptr=k_handle.barrier,
                             )
                         # Vi-1
+                        v_page_idx = (
+                            mPageTable[batch_coord, kv_coord - 1]
+                            if cutlass.const_expr(mPageTable is not None)
+                            else None
+                        )
                         for iter in cutlass.range(self.iterations_pv, unroll=1):
                             v_handle = load_kv_producer.acquire_and_advance()
                             cute.copy(
                                 tma_atom_v,
-                                tVgV[None, iter, kv_coord - 1],
+                                tVgV[None, iter, kv_coord - 1]
+                                if cutlass.const_expr(mPageTable is None)
+                                else tVgV[None, iter, 0, v_page_idx],
                                 tVsV[None, v_handle.index],
                                 tma_bar_ptr=v_handle.barrier,
                             )
                         kv_coord += 1
                     # Vend
+                    v_page_idx = (
+                        mPageTable[batch_coord, seqlen_kv_loop_end - 1]
+                        if cutlass.const_expr(mPageTable is not None)
+                        else None
+                    )
                     for iter in cutlass.range(self.iterations_pv, unroll=1):
                         v_handle = load_kv_producer.acquire_and_advance()
                         cute.copy(
                             tma_atom_v,
-                            tVgV[None, iter, seqlen_kv_loop_end - 1],
+                            tVgV[None, iter, seqlen_kv_loop_end - 1]
+                            if cutlass.const_expr(mPageTable is None)
+                            else tVgV[None, iter, 0, v_page_idx],
                             tVsV[None, v_handle.index],
                             tma_bar_ptr=v_handle.barrier,
                         )
@@ -933,7 +1048,9 @@ class BlackwellFusedMultiHeadAttentionForward:
                 )
                 continue_cond = False
                 seqlen_q = mQ_qdl.shape[0]
-                seqlen_k = mK_kdl.shape[0]
+                seqlen_k = (
+                    mK_kdl.shape[0] if cutlass.const_expr(mPageTable is None) else max_seqlen_k
+                )
                 batch_coord = curr_block_coord[2][1]
                 if cutlass.const_expr(cum_seqlen_q is not None):
                     cuseqlen_q = cum_seqlen_q[batch_coord]
@@ -1183,7 +1300,9 @@ class BlackwellFusedMultiHeadAttentionForward:
                 batch_coord = curr_block_coord[2][1]
                 continue_cond = False
                 seqlen_q = mQ_qdl.shape[0]
-                seqlen_k = mK_kdl.shape[0]
+                seqlen_k = (
+                    mK_kdl.shape[0] if cutlass.const_expr(mPageTable is None) else max_seqlen_k
+                )
                 cuseqlen_q = Int32(0)
                 if cutlass.const_expr(cum_seqlen_q is not None):
                     cuseqlen_q = cum_seqlen_q[batch_coord]
@@ -1294,7 +1413,9 @@ class BlackwellFusedMultiHeadAttentionForward:
                 )
                 batch_coord = curr_block_coord[2][1]
                 seqlen_q = mQ_qdl.shape[0]
-                seqlen_k = mK_kdl.shape[0]
+                seqlen_k = (
+                    mK_kdl.shape[0] if cutlass.const_expr(mPageTable is None) else max_seqlen_k
+                )
                 continue_cond = False
                 cuseqlen_q = Int32(0)
                 if cutlass.const_expr(cum_seqlen_q is not None):
