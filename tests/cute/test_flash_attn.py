@@ -1,4 +1,4 @@
-# Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao, Siyu Wang, Shengbin Di, Yuxi Chi, Johnsonms, Linfeng Zheng, Haoyan Huang, Lanbo Li, Yun Zhong, Man Yuan, Minmin Sun, Yong Li, Wei Lin.
+# Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
 
 import math
 import itertools
@@ -95,11 +95,9 @@ VERBOSE = True
         (3, 3),
         (64, 32),
         (64, 128),
-        (64, 1),  # SM100 hd256 2CTA test case
         (128, 128),
         (128, 192),
         (256, 256),
-        (255, 256),  # SM100 hd256 2CTA test case
         (239, 1),
         (799, 3),
         (113, 203),
@@ -144,19 +142,6 @@ def test_flash_attn_output(
         pytest.xfail("has_qv: local not supported yet")
     if has_qv and has_learnable_sink:
         pytest.xfail("has_qv: learnable sink not supported yet")
-    # TODO(wangsiyu): SM100/SM110 head_dim=256 2CTA kernel currently does not support the following features.
-    # Remove these skips when support is added.
-    if d == 256 and IS_SM100:
-        if has_learnable_sink:
-            pytest.skip("SM100 head_dim=256 2CTA kernel does not support learnable_sink yet")
-        if local:
-            pytest.skip("SM100 head_dim=256 2CTA kernel does not support local attention yet")
-        if softcap > 0.0:
-            pytest.skip("SM100 head_dim=256 2CTA kernel does not support softcap yet")
-        if deterministic:
-            pytest.skip("SM100 head_dim=256 2CTA kernel does not support deterministic mode yet")
-        if causal and seqlen_q > seqlen_k:
-            pytest.skip("SM100 head_dim=256 2CTA kernel does not support causal attention with seqlen_q > seqlen_k yet")
     device = "cuda"
     # set seed
     seed = 0
@@ -303,16 +288,8 @@ def test_flash_attn_output(
             # SplitKV not supported on SM90 - skip this iteration
             if IS_SM90 and num_splits > 1:
                 continue
-            if IS_SM100 and (d >= 192 and dv >= 192) and not (d == 256 and dv == 256):
+            if IS_SM100 and (d >= 192 and dv >= 192):  # hdim 192 and 256 not support on SM100
                 continue
-            # TODO(wangsiyu): SM100 head_dim=256 2CTA kernel does not support pack_gqa yet.
-            # pack_gqa=None means auto-enable for GQA/MQA (qhead_per_kvhead > 1)
-            # Remove this when support is added.
-            if d == 256 and IS_SM100:
-                if pack_gqa is True:
-                    continue
-                if pack_gqa is None and mha_type != "mha":
-                    continue
             out, lse = flash_attn_func(
                 q,
                 k,
@@ -350,11 +327,7 @@ def test_flash_attn_output(
             and not dv > 256
             and not attention_chunk != 0
             and softcap == 0.0
-            and (
-                (dv == d and d <= 128)
-                or (d == 192 and dv == 128)
-                or (IS_SM100 and d == 256 and dv == 256)
-            )
+            and ((dv == d and d <= 128) or (d == 192 and dv == 128))
             and learnable_sink is None
             # and False
             and not ((causal or local) and seqlen_k < seqlen_q)
@@ -465,7 +438,7 @@ def test_flash_attn_output(
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128])
 # @pytest.mark.parametrize("d", [64, 96, 128])
 # @pytest.mark.parametrize("d", [128, 192])
-@pytest.mark.parametrize("d", [64, 128, 192, 256])
+@pytest.mark.parametrize("d", [64, 128, 192])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -489,11 +462,6 @@ def test_flash_attn_output(
         (1023, 1024),
         (1024, 1023),
         (2048, 2048),
-        # SM100 hd256 2CTA test cases
-        (64, 1),
-        (255, 256),
-        (4096, 4096),
-        (4224, 4224),
     ],
 )
 @pytest.mark.parametrize("varlen_mode", ["random", "third", "full"])
@@ -540,23 +508,6 @@ def test_flash_attn_varlen_output(
     local = local_enum > 0
     if local and causal:
         pytest.skip()
-    # TODO(wangsiyu): SM100/SM110 head_dim=256 2CTA kernel currently does not support the following features.
-    # Remove these skips when support is added.
-    if d == 256 and IS_SM100:
-        if has_learnable_sink:
-            pytest.skip("SM100 head_dim=256 2CTA kernel does not support learnable_sink yet")
-        if local:
-            pytest.skip("SM100 head_dim=256 2CTA kernel does not support local attention yet")
-        if softcap > 0.0:
-            pytest.skip("SM100 head_dim=256 2CTA kernel does not support softcap yet")
-        if deterministic:
-            pytest.skip("SM100 head_dim=256 2CTA kernel does not support deterministic mode yet")
-        if causal and seqlen_q > seqlen_k:
-            pytest.skip("SM100 head_dim=256 2CTA kernel does not support causal attention with seqlen_q > seqlen_k yet")
-        if zero_lengths_q or zero_lengths_k:
-            pytest.skip("SM100 head_dim=256 2CTA kernel does not support zero-length sequences yet")
-        if not unpad_q or not unpad_kv:
-            pytest.skip("SM100 head_dim=256 2CTA kernel does not support seqused_q/seqused_k mode yet (requires unpad_q=True and unpad_kv=True)")
     if (
         causal or local
     ):  # Right now reference only supports causal attention with seqlen_k == seqlen_q
@@ -573,8 +524,6 @@ def test_flash_attn_varlen_output(
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
     # dv_vals = [128, d] if d > 128 and d <= 192 else ([256, 512, d] if d <= 64 else [d])
     dv_vals = [128] if d == 192 else ([d] if d != 128 else [64, d])
-    if d == 256:
-        dv_vals = [256]  # SM100 hd=256 2CTA kernel only supports dv=256
     if dtype == torch.float8_e4m3fn:
         dv_vals = [d]
     # attention_chunk_vals = [torch.randint(1, seqlen_k * 2, (1,)).item(), 0] if seqlen_q <= seqlen_k else [0]
@@ -772,14 +721,6 @@ def test_flash_attn_varlen_output(
             # SplitKV not supported on SM90 - skip this iteration
             if IS_SM90 and num_splits > 1:
                 continue
-            # TODO(wangsiyu): SM100 head_dim=256 2CTA kernel does not support pack_gqa yet.
-            # pack_gqa=None means auto-enable for GQA/MQA (qhead_per_kvhead > 1)
-            # Remove this when support is added.
-            if d == 256 and IS_SM100:
-                if pack_gqa is True:
-                    continue
-                if pack_gqa is None and mha_type != "mha":
-                    continue
             out_unpad, lse = flash_attn_varlen_func(
                 q_unpad if unpad_q else q,
                 k_unpad if unpad_kv else k,
@@ -836,11 +777,7 @@ def test_flash_attn_varlen_output(
             and not has_qv
             and not dv > 256
             and not attention_chunk != 0
-            and (
-                (dv == d and d <= 128)
-                or (d == 192 and dv == 128)
-                or (IS_SM100 and d == 256 and dv == 256)
-            )
+            and ((dv == d and d <= 128) or (d == 192 and dv == 128))
             and not has_learnable_sink
             # and False
         ):
