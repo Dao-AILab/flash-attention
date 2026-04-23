@@ -1787,7 +1787,10 @@ class FlashAttnFunc(torch.autograd.Function):
         num_splits: int = 1,
         pack_gqa: Optional[bool] = None,
         deterministic: bool = False,
+        score_mod: Optional[Callable] = None,
+        score_mod_bwd: Optional[Callable] = None,
         mask_mod: Optional[Callable] = None,
+        aux_tensors: Optional[list] = None,
         full_block_cnt: Optional[torch.Tensor] = None,
         full_block_idx: Optional[torch.Tensor] = None,
         mask_block_cnt: Optional[torch.Tensor] = None,
@@ -1818,24 +1821,30 @@ class FlashAttnFunc(torch.autograd.Function):
             softcap=softcap,
             num_splits=num_splits,
             pack_gqa=pack_gqa,
+            score_mod=score_mod,
             mask_mod=mask_mod,
+            aux_tensors=aux_tensors,
             block_sparse_tensors=block_sparse_tensors,
             return_lse=return_lse,
             gather_kv_indices=gather_kv_indices,
         )
-        ctx.save_for_backward(q, k, v, out, lse)
+        ctx.save_for_backward(q, k, v, out, lse, *(aux_tensors or ()))
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size = window_size
         ctx.softcap = softcap
         ctx.deterministic = deterministic
         ctx.return_lse = return_lse
+        ctx.score_mod = score_mod 
+        ctx.score_mod_bwd = score_mod_bwd 
+        ctx.mask_mod = mask_mod
         ctx.set_materialize_grads(False)
         return out, lse
 
     @staticmethod
     def backward(ctx, dout, dlse):
-        q, k, v, out, lse = ctx.saved_tensors
+        q, k, v, out, lse, *aux = ctx.saved_tensors
+        aux_tensors = aux if aux else None
         if not ctx.return_lse:
             dlse = None
         if dout is None:
@@ -1853,6 +1862,10 @@ class FlashAttnFunc(torch.autograd.Function):
             window_size_left=ctx.window_size[0],
             window_size_right=ctx.window_size[1],
             deterministic=ctx.deterministic,
+            score_mod=ctx.score_mod,
+            score_mod_bwd=ctx.score_mod_bwd,
+            mask_mod=ctx.mask_mod,
+            aux_tensors=aux_tensors,
             dlse=dlse,
         )
         return dq, dk, dv, *((None,) * 30)  # Extra Nones is fine
@@ -1884,6 +1897,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         pack_gqa: Optional[bool] = None,
         deterministic: bool = False,
         score_mod: Optional[Callable] = None,
+        score_mod_bwd: Optional[Callable] = None,
         aux_tensors: Optional[list] = None,
         return_lse: bool = False,
     ):
@@ -1913,7 +1927,18 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             return_lse=return_lse,
             gather_kv_indices=gather_kv_indices,
         )
-        ctx.save_for_backward(q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
+        ctx.save_for_backward(
+            q,
+            k,
+            v,
+            out,
+            lse,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            seqused_q,
+            seqused_k,
+            *(aux_tensors or ()),
+        )
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size = window_size
@@ -1922,12 +1947,15 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         ctx.max_seqlen_q = max_seqlen_q
         ctx.max_seqlen_k = max_seqlen_k
         ctx.return_lse = return_lse
+        ctx.score_mod = score_mod
+        ctx.score_mod_bwd = score_mod_bwd
         ctx.set_materialize_grads(False)
         return out, lse
 
     @staticmethod
     def backward(ctx, dout, dlse):
-        q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = ctx.saved_tensors
+        q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, *aux = ctx.saved_tensors
+        aux_tensors = aux if aux else None
         if not ctx.return_lse:
             dlse = None
         if dout is None:
@@ -1951,6 +1979,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             max_seqlen_q=ctx.max_seqlen_q,
             max_seqlen_k=ctx.max_seqlen_k,
             deterministic=ctx.deterministic,
+            score_mod=ctx.score_mod,
+            score_mod_bwd=ctx.score_mod_bwd,
+            aux_tensors=aux_tensors,
             dlse=dlse,
         )
 
@@ -1971,7 +2002,10 @@ def flash_attn_func(
     num_splits: int = 1,
     pack_gqa: Optional[bool] = None,
     deterministic: bool = False,
+    score_mod: Optional[Callable] = None,
+    score_mod_bwd: Optional[Callable] = None,
     mask_mod: Optional[Callable] = None,
+    aux_tensors: Optional[list] = None,
     full_block_cnt: Optional[torch.Tensor] = None,
     full_block_idx: Optional[torch.Tensor] = None,
     mask_block_cnt: Optional[torch.Tensor] = None,
@@ -1993,7 +2027,10 @@ def flash_attn_func(
         num_splits,
         pack_gqa,
         deterministic,
+        score_mod,
+        score_mod_bwd,
         mask_mod,
+        aux_tensors,
         full_block_cnt,
         full_block_idx,
         mask_block_cnt,
