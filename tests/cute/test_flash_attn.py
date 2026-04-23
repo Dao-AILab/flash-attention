@@ -144,7 +144,7 @@ def test_flash_attn_output(
         pytest.xfail("has_qv: local not supported yet")
     if has_qv and has_learnable_sink:
         pytest.xfail("has_qv: learnable sink not supported yet")
-    # TODO(wangsiyu): SM100/SM110 head_dim=256 2CTA kernel currently does not support the following features.
+    # TODO(wangsiyu): SM100 head_dim=256 2CTA kernel currently does not support the following features.
     # Remove these skips when support is added.
     if d == 256 and IS_SM100:
         if has_learnable_sink:
@@ -540,7 +540,7 @@ def test_flash_attn_varlen_output(
     local = local_enum > 0
     if local and causal:
         pytest.skip()
-    # TODO(wangsiyu): SM100/SM110 head_dim=256 2CTA kernel currently does not support the following features.
+    # TODO(wangsiyu): SM100 head_dim=256 2CTA kernel currently does not support the following features.
     # Remove these skips when support is added.
     if d == 256 and IS_SM100:
         if has_learnable_sink:
