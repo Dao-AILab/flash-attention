@@ -1376,8 +1376,6 @@ class Sm100FusedMask:
         :param window_size_right: Right-side sliding window size for attention masking.
         :type window_size_right: Optional[int]
         """
-
-        tidx, tidy, tidx = cute.arch.thread_idx()
         offset = 0
         # NOTE: causal masking in this repo aligns the *end* of Q with the *end* of K
         # when seqlen_k != seqlen_q (same as the test/reference implementation):
@@ -1439,7 +1437,6 @@ class Sm100FusedMask:
         - If apply_semantic_window=True, apply causal/local window constraints.
         - Always apply residual OOB masking (index_k>=seqlen_k or index_q>=seqlen_q).
         """
-        tidx, tidy, tidx = cute.arch.thread_idx()
         offset = 0
         if cutlass.const_expr(apply_semantic_window):
             # Match WINDOW_MASK_INFERENCE semantics: end-align Q/K when lengths differ.
