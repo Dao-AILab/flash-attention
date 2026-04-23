@@ -21,6 +21,7 @@ from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import copy_utils
 from flash_attn.cute import pipeline
 from flash_attn.cute.blackwell_helpers import gemm_w_idx, gemm_ptx_w_idx  # noqa
+from flash_attn.cute.dropout import apply_dropout_mask_sm100
 from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
@@ -65,7 +66,12 @@ class FlashAttentionBackwardSm100:
         mask_mod: cutlass.Constexpr | None = None,
         has_aux_tensors: cutlass.Constexpr = False,
         subtile_factor: cutlass.Constexpr[int] = 1,
+        p_dropout: float = 0.0,
     ):
+        self.p_dropout = p_dropout
+        self.is_dropout = p_dropout > 0.0
+        self.p_keep_uint8 = int(255 * (1.0 - p_dropout)) if p_dropout > 0 else 255
+        self.rp_dropout = 1.0 / (1.0 - p_dropout) if 0 < p_dropout < 1.0 else 1.0
         # padding head_dim to a multiple of 16 as k_block_size
         hdim_multiple_of = 16
         self.tile_hdim = int(math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of)
@@ -464,6 +470,8 @@ class FlashAttentionBackwardSm100:
         aux_tensors: Optional[list] = None,
         # Block-sparse tensors (Q direction - for iterating m_blocks per n_block):
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        dropout_seed_lo: Optional[int] = None,
+        dropout_seed_hi: Optional[int] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -995,6 +1003,9 @@ class FlashAttentionBackwardSm100:
             aux_tensors,
             fastdiv_mods,
             blocksparse_tensors,
+            Int32(cute.size(mQ.shape[2])) if cutlass.const_expr(self.is_dropout) else None,
+            Int32(dropout_seed_lo) if dropout_seed_lo is not None and self.is_dropout else None,
+            Int32(dropout_seed_hi) if dropout_seed_hi is not None and self.is_dropout else None,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -1068,6 +1079,9 @@ class FlashAttentionBackwardSm100:
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        dropout_nheads: Optional[Int32] = None,
+        dropout_seed_lo: Optional[Int32] = None,
+        dropout_seed_hi: Optional[Int32] = None,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         bidx, _, _ = cute.arch.block_idx()
@@ -1590,6 +1604,9 @@ class FlashAttentionBackwardSm100:
                 aux_tensors,
                 fastdiv_mods,
                 blocksparse_tensors,
+                dropout_nheads,
+                dropout_seed_lo,
+                dropout_seed_hi,
             )
             tmem_alloc_barrier.arrive()
 
@@ -2851,6 +2868,9 @@ class FlashAttentionBackwardSm100:
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        dropout_nheads: Optional[Int32] = None,
+        dropout_seed_lo: Optional[Int32] = None,
+        dropout_seed_hi: Optional[Int32] = None,
     ):
         sLSE_2D = cute.make_tensor(
             sLSE.iterator,
@@ -2986,7 +3006,6 @@ class FlashAttentionBackwardSm100:
                 aux_tensors=aux_tensors,
                 fastdiv_mods=fastdiv_mods,
             )
-
             # prefetch_LSE = not self.is_causal
             prefetch_LSE = False
             # some tiles might be empty due to block sparsity
@@ -3094,6 +3113,10 @@ class FlashAttentionBackwardSm100:
                 lane_idx = cute.arch.lane_idx()
                 tSrP_r2t_f32 = cute.make_fragment(tScP_r2t.shape, Float32)  # 64
                 tSrP_r2t = cute.recast_tensor(tSrP_r2t_f32, self.q_dtype)
+                # Save pre-dropout P for correct backward gradient formula:
+                # dS = P_drop * dP - P * D  (NOT P_drop * (dP - D))
+                if cutlass.const_expr(self.is_dropout):
+                    tSrP_pre_drop = cute.make_fragment(tSrS_t2r.shape, Float32)
                 for stage in cutlass.range_constexpr(num_stages):
                     tSrS_cur = tSrS_t2r[None, stage, 0, 0]
                     tSsLSE_cur = tSsLSE[None, stage, 0, 0, consumer_state_LSE.index]
@@ -3118,6 +3141,32 @@ class FlashAttentionBackwardSm100:
                         )
                         tSrS_cur[2 * v] = cute.math.exp2(tSrS_cur[2 * v], fastmath=True)
                         tSrS_cur[2 * v + 1] = cute.math.exp2(tSrS_cur[2 * v + 1], fastmath=True)
+                    # Apply dropout mask to recomputed P (same mask as forward)
+                    # SM100 bwd computes S^T = K @ Q^T, so tScS coords are (N, M)
+                    # — coord[0] = N-local, coord[1] = M-local. Forward keying
+                    # uses Philox(global_row=M, global_col=N), so we swap here.
+                    if cutlass.const_expr(self.is_dropout):
+                        # Save pre-dropout P for correct dS gradient
+                        tSrP_pre_cur = tSrP_pre_drop[None, stage, 0, 0]
+                        for v in cutlass.range_constexpr(cute.size(tSrS_cur)):
+                            tSrP_pre_cur[v] = tSrS_cur[v]
+                    if cutlass.const_expr(self.is_dropout):
+                        apply_dropout_mask_sm100(
+                            acc_S=tSrS_cur,
+                            tScS_t2r=tScS_t2r[None, stage, 0, 0],
+                            batch_idx=batch_idx,
+                            head_idx=head_idx,
+                            nheads=dropout_nheads,
+                            m_block=m_block,
+                            n_block=n_block,
+                            tile_m=self.tile_m,
+                            tile_n=self.tile_n,
+                            p_keep_uint8=self.p_keep_uint8,
+                            rp_dropout=Float32(self.rp_dropout),
+                            seed_lo=cutlass.Uint32(dropout_seed_lo),
+                            seed_hi=cutlass.Uint32(dropout_seed_hi),
+                            transpose=True,
+                        )
                     utils.cvt_f16(tSrS_cur, tSrP_r2t[None, stage, 0, 0])
                     if const_expr(stage == 0):
                         cute.arch.fence_view_async_tmem_load()
@@ -3143,7 +3192,8 @@ class FlashAttentionBackwardSm100:
                 pipeline_LSE.consumer_release(consumer_state_LSE)
                 consumer_state_LSE.advance()
                 # ---------------------------------------------
-                # dS.T = P.T * (dP.T - D)
+                # dS.T = P_drop.T * dP.T - P.T * D  (dropout)
+                # dS.T = P.T * (dP.T - D)           (no dropout)
                 # ---------------------------------------------
                 pipeline_dPsum.consumer_wait(consumer_state_dPsum)
                 pipeline_dP.consumer_wait(consumer_state_S_P_dP)
@@ -3166,6 +3216,8 @@ class FlashAttentionBackwardSm100:
                         cute.autovec_copy(tSsdPsum_cur, tSrdPsum)
                     else:
                         tSrdPsum = tSsdPsum_cur[lane_idx]
+                    if cutlass.const_expr(self.is_dropout):
+                        tSrP_pre_cur = tSrP_pre_drop[None, stage, 0, 0]
                     for v in cutlass.range_constexpr(cute.size(tdPrdP_t2r, mode=[0]) // 2):
                         if const_expr(not self.shuffle_dPsum):
                             dPsum_pair = (tSrdPsum[2 * v], tSrdPsum[2 * v + 1])
@@ -3174,15 +3226,35 @@ class FlashAttentionBackwardSm100:
                                 utils.shuffle_sync(tSrdPsum, offset=2 * v),
                                 utils.shuffle_sync(tSrdPsum, offset=2 * v + 1),
                             )
-                        tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1] = (
-                            quack.activation.sub_packed_f32x2(
-                                (tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1]), dPsum_pair
+                        if cutlass.const_expr(self.is_dropout):
+                            # tmp1 = P_drop * dP
+                            tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1] = cute.arch.mul_packed_f32x2(
+                                (tSrS_cur[2 * v], tSrS_cur[2 * v + 1]),
+                                (tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1]),
                             )
-                        )
-                        tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1] = cute.arch.mul_packed_f32x2(
-                            (tSrS_cur[2 * v], tSrS_cur[2 * v + 1]),
-                            (tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1]),
-                        )
+                            # tmp2 = P * D
+                            p_d_0, p_d_1 = cute.arch.mul_packed_f32x2(
+                                (tSrP_pre_cur[2 * v], tSrP_pre_cur[2 * v + 1]),
+                                dPsum_pair,
+                            )
+                            # dS = P_drop * dP - P * D
+                            tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1] = (
+                                quack.activation.sub_packed_f32x2(
+                                    (tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1]),
+                                    (p_d_0, p_d_1),
+                                )
+                            )
+                        else:
+                            # Non-dropout: dS = P * (dP - D)
+                            tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1] = (
+                                quack.activation.sub_packed_f32x2(
+                                    (tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1]), dPsum_pair
+                                )
+                            )
+                            tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1] = cute.arch.mul_packed_f32x2(
+                                (tSrS_cur[2 * v], tSrS_cur[2 * v + 1]),
+                                (tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1]),
+                            )
 
                     if const_expr(self.score_mod_bwd is not None):
                         tSrS_pre_cur = tSrS_pre[None, stage, 0, 0]

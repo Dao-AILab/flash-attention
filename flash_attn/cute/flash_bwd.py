@@ -18,6 +18,7 @@ from quack import layout_utils
 from flash_attn.cute import ampere_helpers as sm80_utils
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import utils
+from flash_attn.cute.dropout import apply_dropout_mask, apply_dropout_bwd_fused
 from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from quack.cute_dsl_utils import ParamsBase
@@ -48,6 +49,7 @@ class FlashAttentionBackwardSm80:
         V_in_regs: bool = False,
         score_mod: cutlass.Constexpr | None = None,
         score_mod_bwd: cutlass.Constexpr | None = None,
+        p_dropout: float = 0.0,
     ):
         """Initializes the configuration for a flash attention v2 kernel.
 
@@ -64,6 +66,10 @@ class FlashAttentionBackwardSm80:
         :type num_threads: int
         :param is_causal: is causal
         """
+        self.p_dropout = p_dropout
+        self.is_dropout = p_dropout > 0.0
+        self.p_keep_uint8 = int(255 * (1.0 - p_dropout)) if p_dropout > 0 else 255
+        self.rp_dropout = 1.0 / (1.0 - p_dropout) if 0 < p_dropout < 1.0 else 1.0
         self.dtype = dtype
         # padding head_dim to a multiple of 16 as k_block_size
         hdim_multiple_of = 32
@@ -388,6 +394,8 @@ class FlashAttentionBackwardSm80:
         mdV_semaphore: Optional[cute.Tensor] = None,
         aux_tensors: Optional[list] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        dropout_seed_lo: Optional[int] = None,
+        dropout_seed_hi: Optional[int] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -433,7 +441,13 @@ class FlashAttentionBackwardSm80:
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
         grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
 
-        softmax_scale_log2, softmax_scale = utils.compute_softmax_scale_log2(softmax_scale, self.score_mod)
+        # Compute softmax_scale_log2 inline to avoid None return value that
+        # the DSL compiler cannot handle (compute_softmax_scale_log2 returns
+        # softmax_scale=None when score_mod is absent, but __call__ is traced).
+        if cutlass.const_expr(self.score_mod is None):
+            softmax_scale_log2 = softmax_scale * utils.LOG2_E
+        else:
+            softmax_scale_log2 = Float32(utils.LOG2_E)
         self.kernel(
             mQ,
             mK,
@@ -469,6 +483,9 @@ class FlashAttentionBackwardSm80:
             SharedStorage,
             tile_sched_params,
             TileScheduler,
+            Int32(cute.size(mQ.shape[2])) if cutlass.const_expr(self.is_dropout) else None,
+            Int32(dropout_seed_lo) if dropout_seed_lo is not None and self.is_dropout else None,
+            Int32(dropout_seed_hi) if dropout_seed_hi is not None and self.is_dropout else None,
         ).launch(
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
@@ -513,6 +530,9 @@ class FlashAttentionBackwardSm80:
         SharedStorage: cutlass.Constexpr,
         tile_sched_params: ParamsBase,
         TileScheduler: cutlass.Constexpr[Callable],
+        dropout_nheads: Optional[Int32] = None,
+        dropout_seed_lo: Optional[Int32] = None,
+        dropout_seed_hi: Optional[Int32] = None,
     ):
         # Thread index, block index
         tidx, _, _ = cute.arch.thread_idx()
@@ -771,6 +791,26 @@ class FlashAttentionBackwardSm80:
                 tdOgdO, tdOsdO, tdOcdO, t0dOcdO, tdOpdO,
                 tLSEgdPsum, tLSEsdPsum, tLSEcLSE, seqlen=seqlen.seqlen_q
             )
+            # Dropout closure — bind n_block (outer loop), m_block passed at call time
+            dropout_fn = None
+            dropout_bwd_fn = None
+            if cutlass.const_expr(self.is_dropout):
+                dropout_common_args = dict(
+                    batch_idx=batch_idx,
+                    head_idx=head_idx,
+                    nheads=dropout_nheads,
+                    n_block=n_block,
+                    tile_m=self.m_block_size,
+                    tile_n=self.n_block_size,
+                    num_warps_m=self.num_threads // 32,
+                    p_keep_uint8=self.p_keep_uint8,
+                    rp_dropout=Float32(self.rp_dropout),
+                    seed_lo=cutlass.Uint32(dropout_seed_lo),
+                    seed_hi=cutlass.Uint32(dropout_seed_hi),
+                )
+                dropout_fn = partial(apply_dropout_mask, **dropout_common_args)
+                dropout_bwd_fn = partial(apply_dropout_bwd_fused, **dropout_common_args)
+
             compute_one_m_block = partial(
                 self.compute_one_m_block, mma_params=mma_params,
                 smem_copy_params=smem_copy_params, gmem_copy_params=gmem_copy_params,
@@ -778,6 +818,8 @@ class FlashAttentionBackwardSm80:
                 m_block_max=m_block_max,
                 softmax_scale=softmax_scale,
                 softmax_scale_log2=softmax_scale_log2,
+                dropout_fn=dropout_fn,
+                dropout_bwd_fn=dropout_bwd_fn,
             )
 
             # ///////////////////////////////////////////////////////////////////////////////
@@ -868,6 +910,8 @@ class FlashAttentionBackwardSm80:
         softmax_scale: cutlass.Float32,
         softmax_scale_log2: cutlass.Float32,
         mask_fn: Optional[Callable] = None,
+        dropout_fn: Optional[Callable] = None,
+        dropout_bwd_fn: Optional[Callable] = None,
     ):
         def load_Q_next():
             m_block_next = m_block + (self.num_stages_Q - 1 if cutlass.const_expr(self.num_stages_Q > 1) else 1)
@@ -919,9 +963,7 @@ class FlashAttentionBackwardSm80:
         assert cute.size(acc_S_mn, mode=[0]) == cute.size(tLSErLSE)
         for r in cutlass.range(cute.size(acc_S_mn, mode=[0]), unroll_full=True):
             acc_S_mn[r, None].store(cute.math.exp2(acc_S_mn[r, None].load() * softmax_scale_log2 - tLSErLSE[r], fastmath=True))
-        # if cute.arch.thread_idx()[0] == 0 and cute.arch.block_idx()[0] == bidx: cute.print_tensor(acc_S_mn)
-
-        # MMA dP
+        # MMA dP (computed before dropout so we can fuse mask + dS)
         acc_dP = cute.make_fragment(acc_shape_SdP, cutlass.Float32)
         acc_dP.fill(0.0)
         cute.arch.cp_async_wait_group(1 if cutlass.const_expr(self.num_stages_dO > 1) else 0)
@@ -938,18 +980,23 @@ class FlashAttentionBackwardSm80:
         cute.autovec_copy(
             smem_copy_params.tSsdPsumMma[None, smem_pipe_read_do if cutlass.const_expr(self.num_stages_dO > 1) else 0], tLSErdPsum
         )
-        acc_dP_mn = layout_utils.reshape_acc_to_mn(acc_dP)
-        # if cute.arch.thread_idx()[0] == 0 and cute.arch.block_idx()[0] == bidx: cute.print_tensor(acc_dP_mn)
-        assert cute.size(acc_dP_mn, mode=[0]) == cute.size(tLSErdPsum)
-        for r in cutlass.range(cute.size(acc_dP_mn, mode=[0]), unroll_full=True):
-            grad_val = acc_S_mn[r, None].load() * (acc_dP_mn[r, None].load() - tLSErdPsum[r])
-            if cutlass.const_expr(self.score_mod_bwd is not None):
-                grad_val = self.score_mod_bwd(
-                    grad_val,
-                    acc_S_pre_mn[r, None].load() * softmax_scale,
-                    0, 0, 0, 0, None, [],
-                )
-            acc_dP_mn[r, None].store(grad_val)
+        if cutlass.const_expr(dropout_bwd_fn is not None):
+            # Fused: generate Philox mask + compute dS + P_drop in one pass.
+            # dS = P * (keep*rp*dP - D), P_drop = P * keep*rp
+            # acc_S: P → P_drop, acc_dP: dP → dS
+            dropout_bwd_fn(acc_S=acc_S, acc_dP=acc_dP, tLSErdPsum=tLSErdPsum, m_block=m_block)
+        else:
+            acc_dP_mn = layout_utils.reshape_acc_to_mn(acc_dP)
+            assert cute.size(acc_dP_mn, mode=[0]) == cute.size(tLSErdPsum)
+            for r in cutlass.range(cute.size(acc_dP_mn, mode=[0]), unroll_full=True):
+                grad_val = acc_S_mn[r, None].load() * (acc_dP_mn[r, None].load() - tLSErdPsum[r])
+                if cutlass.const_expr(self.score_mod_bwd is not None):
+                    grad_val = self.score_mod_bwd(
+                        grad_val,
+                        acc_S_pre_mn[r, None].load() * softmax_scale,
+                        0, 0, 0, 0, None, [],
+                    )
+                acc_dP_mn[r, None].store(grad_val)
         # if cute.arch.thread_idx()[0] == 0 and cute.arch.block_idx()[0] == bidx: cute.print_tensor(acc_dP_mn)
         rP = cute.make_fragment_like(acc_S, self.dtype)
         rP.store(acc_S.load().to(self.dtype))

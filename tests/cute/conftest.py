@@ -1,8 +1,21 @@
 import os
+import sys
 import subprocess
 import logging
 import tempfile
 import json
+
+# Stub out FA2/FA3 C extensions if they aren't compiled for this device.
+# The CuTe DSL kernels (flash_attn.cute.*) don't use these C extensions,
+# but importing flash_attn.cute.interface triggers flash_attn/__init__.py
+# which tries to import them. On devices where only the CuTe DSL package
+# is installed (e.g. SM121a / DGX Spark), these modules don't exist.
+for _mod in ("flash_attn_2_cuda", "flash_attn_3_cuda"):
+    if _mod not in sys.modules:
+        try:
+            __import__(_mod)
+        except ImportError:
+            sys.modules[_mod] = type(sys)(_mod)
 import time
 from pathlib import Path
 from getpass import getuser
