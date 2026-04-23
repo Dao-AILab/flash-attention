@@ -268,11 +268,12 @@ def _resolve_causal_local_window(causal, window_size_left, window_size_right, ma
     """
     if mask_mod is not None:
         return False, False, window_size_left, window_size_right
-    if causal:
-        window_size_right = 0
-    if window_size_left is not None and window_size_right is not None and window_size_left + window_size_right < 0:
+    if (window_size_left is not None and window_size_right is not None
+            and window_size_left < 0 and window_size_right < 0):
         window_size_left = None
         window_size_right = None
+    if causal:
+        window_size_right = 0
     if window_size_left is not None or window_size_right is not None:
         if window_size_left is None and window_size_right == 0:
             causal, local = True, False
