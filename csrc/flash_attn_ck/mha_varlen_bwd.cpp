@@ -19,7 +19,9 @@ fmha_bwd_traits get_ck_fmha_varlen_bwd_traits(const mask_info &mask,
                                               int nhead_k,
                                               bool has_dropout,
                                               bool enable_alibi,
-                                              bool deterministic)
+                                              bool deterministic,
+                                              const int* seqstart_qs,
+                                              const int* seqstart_ks)
 {
     return fmha_bwd_traits{seqlen_q,
                            seqlen_k,
@@ -37,7 +39,9 @@ fmha_bwd_traits get_ck_fmha_varlen_bwd_traits(const mask_info &mask,
                            false,    // has_dbias
                            has_dropout,
                            false, // s_randval
-                           deterministic};
+                           deterministic,
+                           seqstart_qs,
+                           seqstart_ks};
 }
 fmha_bwd_args get_ck_fmha_varlen_bwd_args(const mask_info &mask,
                                           // sizes
@@ -57,7 +61,7 @@ fmha_bwd_args get_ck_fmha_varlen_bwd_args(const mask_info &mask,
                                           const at::Tensor out,
                                           const at::Tensor softmax_lse,
                                           const at::Tensor dout,
-                                          at::Tensor dq_acc,
+                                          void *workspace_ptr,
                                           at::Tensor d,
                                           at::Tensor dq,
                                           at::Tensor dk,
@@ -117,12 +121,6 @@ fmha_bwd_args get_ck_fmha_varlen_bwd_args(const mask_info &mask,
     ck_tile::index_t stride_dv = dv.stride(0);
     ck_tile::index_t nhead_stride_dv = dv.stride(1);
 
-    // dq_acc: (nheads, split, total_q, hdim)
-    ck_tile::long_index_t batch_stride_dq_acc = 0;
-    ck_tile::long_index_t nhead_stride_dq_acc = dq_acc.stride(0);
-    ck_tile::index_t split_stride_dq_acc = dq_acc.stride(1);
-    ck_tile::index_t stride_dq_acc = dq_acc.stride(2);
-
     float p_undrop = 1.0 - p_dropout;
 
     void *alibi_slopes_ptr = nullptr;
@@ -151,7 +149,7 @@ fmha_bwd_args get_ck_fmha_varlen_bwd_args(const mask_info &mask,
                          dk.data_ptr(),
                          dv.data_ptr(),
                          nullptr, // dbias
-                         dq_acc.data_ptr(), // dq_acc
+                         workspace_ptr,
                          nullptr, // sink_ptr
                          nullptr, // d_sink_ptr
                          seqlens_q.data_ptr(), // seqstart_q_ptr
@@ -177,7 +175,6 @@ fmha_bwd_args get_ck_fmha_varlen_bwd_args(const mask_info &mask,
                          stride_o,
                          0, // stride_randval
                          stride_do,
-                         stride_dq_acc,
                          stride_dq,
                          stride_dk,
                          stride_dv,
@@ -190,7 +187,6 @@ fmha_bwd_args get_ck_fmha_varlen_bwd_args(const mask_info &mask,
                          0, // nhead_stride_randval
                          nhead_stride_do,
                          nhead_stride_lse,
-                         nhead_stride_dq_acc,
                          nhead_stride_dq,
                          nhead_stride_dk,
                          nhead_stride_dv,
@@ -203,12 +199,10 @@ fmha_bwd_args get_ck_fmha_varlen_bwd_args(const mask_info &mask,
                          0, // batch_stride_randval
                          batch_stride_do,
                          batch_stride_lse,
-                         batch_stride_dq_acc,
                          batch_stride_dq,
                          batch_stride_dk,
                          batch_stride_dv,
                          0  , // batch_stride_dbias, FA without dbias
-                         split_stride_dq_acc,
                          mask.left,
                          mask.right,
                          static_cast<ck_tile::index_t>(mask.type),
@@ -345,6 +339,11 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
         dv = torch::empty_like(v);
     }
 
+    // seqstart_qs/ks are dereferenced on the HOST inside fmha_bwd_launcher constructor
+    // (to compute workspace sizes), so we must use host copies.
+    at::Tensor cu_seqlens_q_host = cu_seqlens_q.cpu();
+    at::Tensor cu_seqlens_k_host = cu_seqlens_k.cpu();
+
     const auto traits = get_ck_fmha_varlen_bwd_traits(
         mask,
         q_dtype_str,
@@ -358,9 +357,10 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
         num_heads_k,
         is_dropout,
         alibi_slopes_.has_value(),
-        deterministic);
+        deterministic,
+        reinterpret_cast<const int*>(cu_seqlens_q_host.data_ptr()),
+        reinterpret_cast<const int*>(cu_seqlens_k_host.data_ptr()));
     fmha_bwd_launcher launcher(traits);
-    const ck_tile::index_t nsplits = launcher.dq_acc_splits;
 
     at::cuda::CUDAGuard device_guard{q.device()};
 
@@ -369,7 +369,16 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
         flash::check_gfx1x_bwd_supported(deterministic);
     }
     auto softmax_d = torch::empty({batch_size, num_heads, max_seqlen_q}, opts.dtype(at::kFloat));
-    at::Tensor dq_accum  = torch::zeros({num_heads, nsplits, total_q, head_size}, opts.dtype(at::kFloat));
+
+    // Allocate device workspace
+    at::Tensor workspace;
+    void *workspace_ptr = nullptr;
+    if (launcher.workspace_size > 0) {
+        workspace = torch::empty({static_cast<int64_t>(launcher.workspace_size)},
+                                 opts.dtype(at::kByte));
+        workspace_ptr = workspace.data_ptr();
+        launcher.prepare_workspace(workspace_ptr);
+    }
 
     at::Tensor dk_expanded, dv_expanded;
     if (num_heads_k != num_heads) {  // MQA / GQA
@@ -430,7 +439,7 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
                 out,
                 softmax_lse,
                 dout,
-                dq_accum,
+                workspace_ptr,
                 softmax_d,
                 dq,
                 dk_expanded,
@@ -439,7 +448,7 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
                 p_dropout,
                 drop_seed_offset);
 
-        float t = fmha_bwd(traits, args, stream_config);
+        float t = launcher.run(args, stream_config);
         TORCH_CHECK(t >= 0, "invalid argument for fmha_bwd");
     } else {
         // If seqlen_q == 0, then we have an empty tensor. We need to set the output to 0.
