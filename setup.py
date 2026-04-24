@@ -623,12 +623,17 @@ class NinjaBuildExtension(BuildExtension):
 
             # calculate the maximum allowed NUM_JOBS based on free memory
             free_memory_gb = psutil.virtual_memory().available / (1024 ** 3)  # free memory in GB
+            # Reserve memory for OS, kernel, and other processes:
+            # at least 16 GB or 15% of free memory, whichever is larger.
+            reserved_memory_gb = max(16, free_memory_gb * 0.15)
+            usable_memory_gb = max(0, free_memory_gb - reserved_memory_gb)
             # Assume worst-case peak observed memory usage of ~5GB per NVCC thread.
-            # Limit: peak_threads = max_jobs * nvcc_threads and peak_threads * 5GB <= free_memory.
-            max_num_jobs_memory = max(1, int(free_memory_gb / (5 * nvcc_threads)))
+            # Limit: peak_threads = max_jobs * nvcc_threads and peak_threads * 5GB <= usable_memory.
+            max_num_jobs_memory = max(1, int(usable_memory_gb / (5 * nvcc_threads)))
 
             # pick lower value of jobs based on cores vs memory metric to minimize oom and swap usage during compilation
-            max_jobs = max(1, min(max_num_jobs_cores, max_num_jobs_memory))
+            # Cap at 32 to avoid diminishing returns from extreme parallelism on high-memory machines.
+            max_jobs = max(1, min(max_num_jobs_cores, max_num_jobs_memory, 32))
             print(
                 f"Auto set MAX_JOBS to `{max_jobs}`, NVCC_THREADS to `{nvcc_threads}`. "
                 "If you see memory pressure, please use a lower `MAX_JOBS=N` or `NVCC_THREADS=N` value."
