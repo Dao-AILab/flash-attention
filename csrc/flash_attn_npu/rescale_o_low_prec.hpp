@@ -19,15 +19,44 @@
 
 /**
  * @file rescale_o_low_prec.hpp
- * @brief Atlas A2平台的低精度输出重缩放块级Epilogue实现
+ * @brief Atlas A2平台的半精度(half)输出重缩放块级Epilogue实现
  *
- * 该文件实现了Flash Attention中针对Atlas A2平台优化的低精度输出重缩放块级Epilogue，
- * 主要负责对注意力计算的最终结果进行后处理，包括：
- * 1. 对PV矩阵乘法(Attn*V)的输出进行缩放
- * 2. 应用LSE(对数求和指数)进行数值稳定性处理
- * 3. 转换到目标输出精度并写入全局内存
+ * 本文件实现了Flash Attention推理中针对Atlas A2平台优化的半精度输出重缩放块级Epilogue，
+ * 是Flash Attention计算流水线的最后阶段，负责将PV矩阵乘法的输出转换为最终的注意力输出。
  *
- * 该实现使用half精度进行中间计算，以提高性能并减少内存带宽需求，同时保持足够的计算精度。
+ * == 主要实现的算法 ==
+ * 与rescale_o.hpp（单精度版本）实现相同的输出重缩放算法，但中间计算使用half精度：
+ *   1. 累加修正: O = O * dm + O_current（dm = exp(old_max - new_max)）
+ *   2. 归一化: O = O / gl（最后一个stack tile）
+ *   3. LSE计算: LSE = ln(gl) + gm（可选）
+ *
+ * == 与rescale_o.hpp（单精度版本）的区别 ==
+ * - 中间计算使用half精度而非float，减少内存占用和计算开销
+ * - 不需要float->half的降精度转换步骤（因为已经是half精度）
+ * - 性能更高但数值精度略低，适用于对精度要求不高的推理场景
+ * - UB内存布局不同：loUbTensor和goUbTensor直接存储half类型数据
+ *
+ * == 性能优化考量 ==
+ * 半精度版本的主要优势：
+ * - UB空间占用减半，可以处理更大的分块
+ * - 向量操作吞吐量翻倍（相同带宽下可处理2倍元素）
+ * - 减少GM与UB之间的数据传输量
+ * 但需要注意：
+ * - 半精度的数值范围较小（最大65504），可能溢出
+ * - 累加精度较低，长序列可能导致误差累积
+ *
+ * == 依赖关系 ==
+ * - catlass/catlass.hpp: Catlass库核心头文件
+ * - catlass/arch/resource.hpp: 硬件资源管理
+ * - catlass/epilogue/dispatch_policy.hpp: Epilogue调度策略
+ * - catlass/epilogue/tile/tile_copy.hpp: 分块数据拷贝操作
+ * - catlass/gemm_coord.hpp: 矩阵坐标系统
+ * - catlass/matrix_coord.hpp: 矩阵坐标辅助工具
+ * - fa_block.h: Flash Attention分块参数定义
+ *
+ * == 使用场景 ==
+ * 本文件用于Flash Attention推理场景的输出后处理阶段，当中间计算精度为half时使用。
+ * 典型调用路径: mha_fwd_kvcache.cpp -> FAInferKernel -> EpilogueRescaleO -> 本文件
  */
 
 // Catlass库核心头文件
@@ -41,12 +70,46 @@
 // 自定义块结构头文件
 #include "fa_block.h"
 
+/**
+ * @namespace Catlass::Epilogue::Block
+ * @brief Catlass库中Epilogue（收尾操作）的块级实现命名空间
+ *
+ * 该命名空间包含Flash Attention计算流水线中矩阵乘法后的各种后处理操作的块级实现，
+ * 包括在线Softmax计算和输出重缩放。
+ */
 namespace Catlass::Epilogue::Block {
     /**
-     * @brief 低精度输出重缩放的块级Epilogue实现
+     * @brief 半精度输出重缩放的块级Epilogue实现（RescaleO Low Precision）
      *
-     * 专门为Atlas A2平台优化，使用half精度进行中间计算，以提高Flash Attention的性能和效率。
-     * 该类实现了Flash Attention的最后阶段，负责将注意力权重与值矩阵的乘积转换为最终输出。
+     * 专门为Atlas A2平台优化的半精度输出重缩放Epilogue实现，用于Flash Attention推理的
+     * 最后阶段。负责将PV矩阵乘法的输出O_tmp转换为最终的注意力输出O。
+     *
+     * == 与rescale_o.hpp（单精度版本）的区别 ==
+     * 1. 中间计算使用half精度而非float，减少内存占用和计算开销
+     * 2. 不需要float->half的降精度转换步骤（因为已经是half精度）
+     * 3. UB空间占用减半，可以处理更大的分块
+     * 4. 性能更高但数值精度略低
+     *
+     * == UB内存布局 ==
+     * - loUbTensor: 当前stack tile的PV输出（half类型，从GM加载）
+     * - goUbTensor: 全局输出（half类型，累加结果）
+     * - tvUbTensor: 临时向量（half类型，用于广播dm/gl）
+     * - dmUbTensor: 修正因子（half类型，来自OnlineSoftmax）
+     * - glUbTensor: 全局行求和（half类型，来自OnlineSoftmax）
+     *
+     * == 注意事项 ==
+     * - half精度的数值范围较小（最大65504），长序列可能导致溢出
+     * - 累加精度较低，长序列可能导致误差累积
+     * - 适用于对精度要求不高的推理场景
+     *
+     * @tparam OutputType_ 输出类型和布局，包含元素类型（通常为half/bfloat16）和矩阵布局
+     * @tparam InputType_ 输入类型和布局，包含元素类型（half）和矩阵布局
+     * @tparam UpdateType_ 更新类型和布局，包含元素类型（half）和矩阵布局
+     *         - Update矩阵是历史累加输出O，从全局内存加载
+     * @tparam LseType_ LSE类型和布局，包含元素类型（float）和矩阵布局
+     * @tparam LSE_MODE_ LSE计算模式:
+     *         - LseModeT::NONE: 不计算LSE
+     *         - LseModeT::OUT_ONLY: 计算并输出LSE值（LSE = ln(gl) + gm）
      */
 
 template <
@@ -283,29 +346,50 @@ public:
      * @param epiTokenNum 尾随token的数量
      * @param integralHeadNum 完整头的数量
      */
-    __aicore__ inline
-    void SubCoreCompute(
-        AscendC::GlobalTensor<ElementOutput> gOutput,      ///< 全局内存输出张量
-        AscendC::GlobalTensor<ElementInput> gInput,        ///< 全局内存输入张量
-        AscendC::GlobalTensor<ElementUpdate> gUpdate,      ///< 全局内存更新张量
-        AscendC::GlobalTensor<ElementLse> gLse,            ///< 全局内存LSE张量
-        const LayoutOutput &layoutOutput,                  ///< 输出布局
-        const LayoutInput &layoutInput,                    ///< 输入布局
-        const LayoutUpdate &layoutUpdate,                  ///< 更新布局
-        const LayoutLse &layoutLse,                        ///< LSE布局
-        uint32_t qNThisSubBlock,                           ///< 当前子块的查询头数量
-        uint32_t qSThisSubBlock,                           ///< 当前子块的查询序列长度
-        uint32_t totalRowNum,                              ///< 总行数
-        uint32_t isFirstStackTile,                         ///< 是否为第一个堆叠tile
-        uint32_t isLastStackTile,                          ///< 是否为最后一个堆叠tile
-        uint32_t curStackTileMod,                          ///< 当前堆叠tile的模
-        uint32_t needRowLoop,                              ///< 是否需要行循环
-        uint32_t isLastRowLoop,                            ///< 是否为最后一个行循环
-        uint32_t rowOffsetLoop,                            ///< 行循环偏移
-        uint32_t proTokenIdx,                              ///< 前导token的索引
-        uint32_t proTokenNum,                              ///< 前导token的数量
-        uint32_t epiTokenNum,                              ///< 尾随token的数量
-        uint32_t integralHeadNum)                          ///< 完整头的数量
+    /**
+     * @brief 半精度输出重缩放子核计算核心函数
+     *
+     * 与rescale_o.hpp中的SubCoreCompute实现相同的算法逻辑，但使用half精度。
+     *
+     * == 与float版本SubCoreCompute的区别 ==
+     * 1. 所有中间张量使用half类型而非float
+     *    - loUbTensor/goUbTensor: half而非float，UB空间减半
+     *    - Brcb使用uint16_t重解释而非uint32_t
+     * 2. 向量粒度为HALF_VECTOR_SIZE(128)而非FLOAT_VECTOR_SIZE(64)
+     *    - Mul/Div循环步长为128个half元素
+     * 3. 对齐使用HALF_BLOCK_SIZE(16)而非FLOAT_BLOCK_SIZE(8)
+     * 4. 不需要float->half降精度转换（goUbTensor直接就是half）
+     * 5. LSE计算需要half->float升精度转换（LSE需要float精度保证数值稳定性）
+     *
+     * == 性能优化技巧 ==
+     * - half类型向量操作吞吐量是float的2倍
+     * - Brcb广播: 将1D的dm/gl广播为2D矩阵，避免逐行复制
+     * - 逐向量Mul/Div: srcBStride=0，每行复用同一个广播值
+     * - 事件驱动流水线: 通过HardEvent实现GM<->UB数据传输与向量计算的并行
+     * - LSE计算: 先用half计算ln和add，再Cast为float输出（平衡精度和性能）
+     *
+     * @param gOutput           全局输出张量
+     * @param gInput            全局输入张量（PV输出O_tmp）
+     * @param gUpdate           全局更新张量（历史累加输出O）
+     * @param gLse              全局LSE张量
+     * @param layoutOutput      输出布局
+     * @param layoutInput       输入布局
+     * @param layoutUpdate      更新布局
+     * @param layoutLse         LSE布局
+     * @param qNThisSubBlock    当前子块的查询头数
+     * @param qSThisSubBlock    当前子块的查询序列长度
+     * @param totalRowNum       总行数
+     * @param isFirstStackTile  是否为第一个stack tile
+     * @param isLastStackTile   是否为最后一个stack tile
+     * @param curStackTileMod   当前stack tile的模值
+     * @param needRowLoop       是否需要行循环
+     * @param isLastRowLoop     是否为最后一个行循环
+     * @param rowOffsetLoop     行循环偏移
+     * @param proTokenIdx       前导标记索引
+     * @param proTokenNum       前导标记数量
+     * @param epiTokenNum       尾随标记数量
+     * @param integralHeadNum   整数头部数量
+     */
     {
         // 获取当前计算块的参数
         uint32_t curRowNum = layoutInput.shape(0);         ///< 当前行数
@@ -569,25 +653,49 @@ public:
     }
 
     /**
-     * @brief 执行入口函数，协调整个输出重缩放Epilogue过程
+     * @brief 半精度输出重缩放核心操作符
      *
-     * 该函数负责协调整个输出重缩放Epilogue的执行流程，包括分块处理、
-     * 子块调度和核心计算调用。它将输入数据分块并分发给SubCoreCompute函数处理。
+     * 执行半精度输出重缩放算法的核心计算流程，将PV矩阵乘法的输出O_tmp转换为最终注意力输出O。
+     * 该函数是RescaleO模块的入口点，由FAInferKernel在每个stack tile上调用。
      *
-     * @param gOutput 全局输出张量
-     * @param gInput 全局输入张量（通常是PV矩阵乘法的输出）
-     * @param gUpdate 全局更新张量（用于累加计算）
-     * @param gLse 全局LSE张量（对数求和指数）
-     * @param layoutOutput 输出布局
-     * @param layoutInput 输入布局
-     * @param layoutUpdate 更新布局
-     * @param layoutLse LSE布局
-     * @param actualBlockShape 实际块形状
-     * @param qSBlockSize 查询序列块大小
-     * @param qNBlockSize 查询头块大小
-     * @param isFirstStackTile 是否为第一个堆叠瓦片
-     * @param isLastStackTile 是否为最后一个堆叠瓦片
-     * @param curStackTileMod 当前堆叠瓦片模块
+     * == 与rescale_o.hpp中operator()的区别 ==
+     * 1. 中间计算使用half精度而非float
+     * 2. 不需要float->half的降精度转换步骤
+     * 3. UB空间占用减半，可以处理更大的分块
+     *
+     * == 算法流程 ==
+     * 对于每个stack tile，执行以下步骤：
+     * 1. 分块处理: 将行数按UB容量分为多个tile
+     * 2. 子块并行: 将每个tile的行数分为两个子块
+     * 3. 核心计算（SubCoreCompute）:
+     *    a) 从GM加载当前PV输出O_tmp到UB（loUbTensor）
+     *    b) 如果不是第一个stack tile:
+     *       - 从GM加载历史累加输出O到UB（goUbTensor）
+     *       - 广播修正因子dm，执行 O = O * dm + O_tmp
+     *    c) 如果是第一个stack tile:
+     *       - 直接将O_tmp复制到goUbTensor
+     *    d) 如果是最后一个stack tile:
+     *       - 广播全局行求和gl，执行 O = O / gl（归一化）
+     *       - 可选计算LSE = ln(gl) + gm
+     *    e) 将goUbTensor写回GM（无需降精度）
+     *
+     * @param gOutput           全局输出张量（最终注意力输出O，half/bfloat16精度）
+     * @param gInput            全局输入张量（PV矩阵乘法的输出O_tmp，half精度）
+     * @param gUpdate           全局更新张量（历史累加输出O，half精度）
+     * @param gLse              全局LSE张量（对数求和指数，float精度）
+     * @param layoutOutput      输出布局信息
+     * @param layoutInput       输入布局信息
+     * @param layoutUpdate      更新布局信息
+     * @param layoutLse         LSE布局信息
+     * @param actualBlockShape  实际块形状（M/N维度大小）
+     * @param qSBlockSize       Q的S维度块大小（分组注意力头的组数）
+     * @param qNBlockSize       Q的N维度块大小（每组内的token数）
+     * @param isFirstStackTile  是否是第一个stack tile（1=是，0=否）
+     * @param isLastStackTile   是否是最后一个stack tile（1=是，0=否）
+     * @param curStackTileMod   当前stack tile的模值
+     *
+     * @note 第一个stack tile不需要计算修正因子dm
+     * @note 最后一个stack tile需要执行归一化 O = O / gl
      */
     __aicore__ inline
     void operator()(

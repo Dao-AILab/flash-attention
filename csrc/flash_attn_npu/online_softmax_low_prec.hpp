@@ -16,6 +16,53 @@
 #ifndef EPILOGUE_BLOCK_BLOCK_EPILOGUE_ONLINE_SOFTMAX_LOW_PREC_HPP_T
 #define EPILOGUE_BLOCK_BLOCK_EPILOGUE_ONLINE_SOFTMAX_LOW_PREC_HPP_T
 
+/**
+ * @file online_softmax_low_prec.hpp
+ * @brief Atlas A2平台的半精度(half)在线Softmax块级Epilogue实现
+ *
+ * 本文件实现了Flash Attention算法中针对Atlas A2平台优化的半精度在线Softmax块级Epilogue，
+ * 是Flash Attention推理计算流水线中QK矩阵乘法之后的核心后处理模块。
+ *
+ * == 主要实现的算法 ==
+ * 与online_softmax.hpp（单精度版本）实现相同的在线Softmax算法，但中间计算使用half精度：
+ *   1. 分块处理KV序列，每次处理一个stack tile
+ *   2. 维护运行时的行最大值（running max）和行求和（running sum）
+ *   3. 每处理一个新的stack tile时，通过指数修正因子更新历史累加结果
+ *   4. 最终通过全局行求和归一化得到Softmax输出
+ *
+ * == 与online_softmax.hpp（单精度版本）的区别 ==
+ * - 中间计算使用half精度而非float，减少内存占用和计算开销
+ * - S矩阵从L0C（float）加载到UB后立即降精度为half
+ * - P矩阵直接以half精度计算和输出，无需额外的降精度步骤
+ * - UB空间占用减半，可以处理更大的分块
+ * - 归约策略不同：使用WholeReduceMax/WholeReduceSum而非BlockReduceMax/BlockReduceSum
+ *   （half类型的BlockReduce硬件支持有限，WholeReduce更高效）
+ *
+ * == 性能优化考量 ==
+ * 半精度版本的主要优势：
+ * - UB空间占用减半，可以处理更大的分块
+ * - 向量操作吞吐量翻倍（相同带宽下可处理2倍元素）
+ * - 减少GM与UB之间的数据传输量
+ * 但需要注意：
+ * - 半精度的数值范围较小（最大65504），Softmax前需要充分缩放
+ * - 累加精度较低，长序列可能导致误差累积
+ * - exp函数在half精度下的精度损失
+ *
+ * == 依赖关系 ==
+ * - catlass/catlass.hpp: Catlass库核心头文件
+ * - catlass/arch/cross_core_sync.hpp: 跨核心同步原语
+ * - catlass/arch/resource.hpp: 硬件资源管理
+ * - catlass/epilogue/dispatch_policy.hpp: Epilogue调度策略
+ * - catlass/epilogue/tile/tile_copy.hpp: 分块数据拷贝操作
+ * - catlass/gemm_coord.hpp: 矩阵坐标系统
+ * - catlass/matrix_coord.hpp: 矩阵坐标辅助工具
+ * - fa_block.h: Flash Attention分块参数定义
+ *
+ * == 使用场景 ==
+ * 本文件用于Flash Attention推理场景，当中间计算精度为half（半精度）时使用。
+ * 典型调用路径: mha_fwd_kvcache.cpp -> FAInferKernel -> EpilogueOnlineSoftmax -> 本文件
+ */
+
 // Catlass库核心头文件
 #include "catlass/catlass.hpp"
 #include "catlass/arch/cross_core_sync.hpp"
@@ -28,28 +75,50 @@
 // 自定义块结构头文件
 #include "fa_block.h"
 
+/**
+ * @namespace Catlass::Epilogue::Block
+ * @brief Catlass库中Epilogue（收尾操作）的块级实现命名空间
+ *
+ * 该命名空间包含Flash Attention计算流水线中矩阵乘法后的各种后处理操作的块级实现，
+ * 包括在线Softmax计算和输出重缩放。
+ */
 namespace Catlass::Epilogue::Block {
     /**
-     * @file online_softmax_low_prec.hpp
-     * @brief Atlas A2平台的低精度在线Softmax块级Epilogue实现
-     * 
-     * 该文件定义了针对Atlas A2平台优化的低精度在线Softmax块级Epilogue实现，
-     * 主要用于Transformer模型中的注意力机制计算。实现了高效的半精度(half)Softmax计算，
-     * 包括数据重缩放、掩码处理、行最大值计算、行求和、指数计算等核心功能，
-     * 充分利用了Atlas A2架构的UB内存和向量计算能力。
-     */
-
-    /**
-     * @brief 低精度在线Softmax的块级Epilogue实现类模板
-     * 
-     * 该类负责在矩阵乘法完成后执行在线Softmax操作，包括数据重缩放、掩码处理、
-     * Softmax计算和结果输出。专门为Atlas A2平台优化，使用半精度(half)数据类型，
-     * 支持多种LSE（对数求和指数）计算模式。
-     * 
-     * @tparam OutputType_ 输出类型和布局，包含元素类型和矩阵布局信息
-     * @tparam InputType_ 输入类型和布局，包含元素类型和矩阵布局信息
-     * @tparam MaskType_ 掩码类型和布局，包含元素类型和矩阵布局信息
-     * @tparam LSE_MODE_ LSE（对数求和指数）计算模式，控制是否计算和输出LSE值
+     * @brief 半精度在线Softmax的块级Epilogue实现类模板
+     *
+     * 该类是Flash Attention推理中半精度在线Softmax计算的核心实现，负责在QK矩阵乘法完成后
+     * 执行Softmax归一化操作。采用"在线"（online）计算策略，即分块处理KV序列，
+     * 逐步维护行最大值和行求和，避免一次性加载完整的注意力矩阵。
+     *
+     * == 与online_softmax.hpp（单精度版本）的设计差异 ==
+     * 1. 数据类型: 所有中间计算使用half而非float
+     * 2. 归约策略: 使用WholeReduceMax/WholeReduceSum而非BlockReduceMax/BlockReduceSum
+     *    - half类型的BlockReduce硬件支持有限，WholeReduce更高效
+     *    - WholeReduceMax直接将整行归约为一个最大值，无需多级归约
+     * 3. UB内存布局: 由于half占用空间减半，可以存储更多元素
+     *    - lsUbTensor可存储MAX_UB_S_ELEM_NUM=16384个half元素（vs float版本的8192）
+     *    - lpUbTensor与lsUbTensor共享空间，通过乒乓缓冲交替使用
+     *
+     * == UB内存布局 ==
+     * - lsUbTensor [0, 2*16KB): 输入S矩阵数据（half类型，支持乒乓缓冲）
+     * - computeUbTensor [2*16KB, 4*16KB): 计算中间结果（half类型）
+     * - lpUbTensor [4*16KB, 6*16KB): 输出P矩阵数据（half类型，支持乒乓缓冲）
+     * - maskUbTensor16 [0, ...): 掩码数据（half类型）
+     * - maskUbTensor [11*16KB, ...): 掩码数据（原始类型）
+     * - tvUbTensor [10*16KB, 10*16KB+8*1KB): 临时向量，用于广播和归约中间结果
+     * - lmUbTensor [10*16KB+8*1KB, ...): 本地行最大值（当前stack tile）
+     * - hmUbTensor [10*16KB+9*1KB, ...): 历史行最大值（max(lm, gm)）
+     * - gmUbTensor [10*16KB+10*1KB, ...): 全局行最大值（跨stack tile的运行最大值）
+     * - llUbTensor [10*16KB+11*1KB, ...): 本地行求和（当前stack tile）
+     * - glUbTensor [10*16KB+12*1KB, ...): 全局行求和（跨stack tile的运行求和）
+     * - dmUbTensor [10*16KB+13*1KB, ...): 修正因子 exp(old_max - new_max)
+     *
+     * @tparam OutputType_ 输出类型和布局，包含元素类型（通常为half/bfloat16）和矩阵布局信息
+     * @tparam InputType_ 输入类型和布局，包含元素类型（float）和矩阵布局信息
+     * @tparam MaskType_ 掩码类型和布局，包含元素类型（通常为int8/uint8）和矩阵布局信息
+     * @tparam LSE_MODE_ LSE（Log-Sum-Exp）计算模式:
+     *                   - LseModeT::NONE: 不计算LSE
+     *                   - LseModeT::OUT_ONLY: 计算并输出LSE值
      */
 
 template <
@@ -271,16 +340,33 @@ public:
     }
 
     /**
-     * @brief 计算TAIL TILE（剩余元素）的行求和
-     * 
-     * 对尾部分块（非完整512元素）进行行求和操作，处理边界情况
-     * 
-     * @param srcUb 源UB张量，存储输入数据
-     * @param rowsumUb 行求和结果UB张量
-     * @param tvUbTensor 临时变量UB张量
-     * @param numRowsRound 行数（已对齐）
-     * @param numElems 元素数量
-     * @param numElemsAligned 元素数量（已对齐）
+     * @brief 计算尾部分块（TAIL TILE）的行求和（half精度版本）
+     *
+     * 对列数不等于512或256的尾部分块进行行求和计算。采用WholeReduceSum + Add的
+     * 混合策略，与online_softmax.hpp中的float版本采用不同的归约策略。
+     *
+     * == 与online_softmax.hpp中行求和的区别 ==
+     * - float版本使用BlockReduceSum进行多级归约
+     * - half版本使用WholeReduceSum + Add的混合策略
+     *   - half类型的BlockReduceSum硬件支持有限，WholeReduceSum更高效
+     *
+     * == 处理流程 ==
+     * 1. 如果numElems <= HALF_VECTOR_SIZE(128):
+     *    - 直接使用WholeReduceSum归约
+     * 2. 如果numElems > HALF_VECTOR_SIZE:
+     *    a) 循环将相邻向量组相加: srcUb[0] += srcUb[vmaxIdx*128]
+     *    b) 处理尾部非对齐元素: srcUb[0] += srcUb[tail]（使用掩码）
+     *    c) 对合并后的结果进行WholeReduceSum归约
+     *
+     * @param srcUb       源UB张量，存储输入的注意力概率矩阵P（half类型）
+     * @param rowsumUb    行求和结果UB张量（half类型）
+     * @param tvUbTensor  临时变量UB张量（本函数未使用，保留接口一致性）
+     * @param numRowsRound 行数（已对齐到BLOCK_SIZE=16的倍数）
+     * @param numElems    实际元素数量（每行的列数，不一定是128的倍数）
+     * @param numElemsAligned 对齐后的元素数量（向上对齐到BLOCK_SIZE=16的倍数）
+     *
+     * @note 算法复杂度: O(numRowsRound * numElemsAligned / HALF_VECTOR_SIZE)
+     * @note Add操作会原地修改srcUb的数据，将多个向量组合并到第一个向量组
      */
     __aicore__ inline
     void RowsumTAILTILE(const AscendC::LocalTensor<half> &srcUb, const AscendC::LocalTensor<half> &rowsumUb,
@@ -338,33 +424,66 @@ public:
     }
 
     /**
-     * @brief 计算尾部分块的行最大值
-     * 
-     * 对于元素数量小于等于512的尾部分块，计算每行的最大值。支持向量级掩码处理以
-     * 处理非对齐的元素数量。
-     * 
-     * @param srcUb 输入数据的UB张量
-     * @param rowmaxUb 输出行最大值的UB张量
-     * @param tvUbTensor 临时变量UB张量（未使用）
-     * @param numRowsRound 行数（已对齐到向量大小）
-     * @param numElems 实际元素数量
-     * @param numElemsAligned 对齐后的元素数量
+     * @brief 计算尾部分块（TAIL TILE）的行最大值（half精度版本）
+     *
+     * 对列数不等于512或256的尾部分块进行行最大值计算。采用WholeReduceMax + Max的
+     * 混合策略，与online_softmax.hpp中的float版本采用不同的归约策略。
+     *
+     * == 与online_softmax.hpp中RowmaxTAILTILE的区别 ==
+     * 1. float版本使用BlockReduceMax进行多级归约，half版本使用WholeReduceMax + Max
+     *    - half类型的BlockReduceMax硬件支持有限，WholeReduceMax更高效
+     *    - WholeReduceMax直接将整行归约为一个最大值，但要求行长度不超过向量大小
+     * 2. half版本需要先将第一个向量组复制到临时存储，再逐一与剩余向量组取Max
+     *    - 因为WholeReduceMax会原地修改输入，需要保留原始数据
+     * 3. half版本使用DataCopy复制初始数据，float版本使用BlockReduceMax归约初始数据
+     *
+     * == 处理流程 ==
+     * 1. 如果numElems <= HALF_VECTOR_SIZE(128):
+     *    - 直接使用WholeReduceMax归约，设置向量掩码处理非对齐元素
+     * 2. 如果numElems > HALF_VECTOR_SIZE:
+     *    a) 将第一个HALF_VECTOR_SIZE(128)个元素复制到lsUbTensor
+     *    b) 循环与剩余的完整向量组取Max: lsUbTensor = max(lsUbTensor, srcUb[vmaxIdx*128])
+     *    c) 处理尾部非对齐元素: lsUbTensor = max(lsUbTensor, srcUb[tail])
+     *    d) 对lsUbTensor进行WholeReduceMax归约得到每行最大值
+     *
+     * @param srcUb       源UB张量，存储输入的注意力分数矩阵S（half类型）
+     * @param rowmaxUb    行最大值结果UB张量（half类型）
+     * @param tvUbTensor  临时变量UB张量（本函数未使用，保留接口一致性）
+     * @param numRowsRound 行数（已对齐到BLOCK_SIZE=16的倍数）
+     * @param numElems    实际元素数量（每行的列数，不一定是128的倍数）
+     * @param numElemsAligned 对齐后的元素数量（向上对齐到BLOCK_SIZE=16的倍数）
+     *
+     * @note 算法复杂度: O(numRowsRound * numElemsAligned / HALF_VECTOR_SIZE)
+     * @note WholeReduceMax会消耗输入数据，因此需要先复制到临时存储再归约
      */
     __aicore__ inline
     void RowmaxTAILTILE(const AscendC::LocalTensor<half> &srcUb, const AscendC::LocalTensor<half> &rowmaxUb,
         const AscendC::LocalTensor<half> &tvUbTensor, uint32_t numRowsRound, uint32_t numElems,
         uint32_t numElemsAligned)
     {
+        // 情况1: 元素数量不超过一个向量大小(128个half元素)
+        // 直接使用WholeReduceMax归约，无需分步处理
         if (numElems <= HALF_VECTOR_SIZE) {
-            // 元素数量小于等于向量大小，直接进行归约
-            SetVecMask(numElems);  // 设置向量掩码，处理非对齐元素
+            // 设置向量掩码，只对有效的numElems个元素进行归约
+            // 当numElems不是BLOCK_SIZE(16)的倍数时，掩码确保不处理无效元素
+            SetVecMask(numElems);
+            // WholeReduceMax: 将每行的numElems个元素归约为1个最大值
+            // ORDER_ONLY_VALUE表示只输出值，不输出索引
             AscendC::WholeReduceMax<half, false>(
                 rowmaxUb, srcUb, (int32_t)0, numRowsRound, 1, 1,
                 numElemsAligned / BLOCK_SIZE, AscendC::ReduceOrder::ORDER_ONLY_VALUE);
-            AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);  // 恢复全1掩码
+            // 恢复全1掩码，确保后续操作不受影响
+            AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
         } else {
-            // 元素数量大于向量大小，分步计算最大值
-            // 首先复制第一组向量到临时存储
+            // 情况2: 元素数量超过一个向量大小(128个half元素)
+            // 需要分步处理：先逐向量组取Max，再最终归约
+
+            // 步骤1: 将第一个HALF_VECTOR_SIZE(128)个元素复制到临时存储lsUbTensor
+            // DataCopyParams参数:
+            //   - numRowsRound: 复制的行数
+            //   - HALF_VECTOR_SIZE / BLOCK_SIZE: 每行复制的块数(128/16=8块)
+            //   - (numElemsAligned - HALF_VECTOR_SIZE) / BLOCK_SIZE: 源行间距(跳过已复制的部分)
+            //   - (numElemsAligned - HALF_VECTOR_SIZE) / BLOCK_SIZE: 目标行间距(同上)
             AscendC::DataCopy(
                 lsUbTensor,
                 srcUb,
@@ -373,31 +492,36 @@ public:
                     HALF_VECTOR_SIZE / BLOCK_SIZE,
                     (numElemsAligned - HALF_VECTOR_SIZE) / BLOCK_SIZE,
                     (numElemsAligned - HALF_VECTOR_SIZE) / BLOCK_SIZE));
-            AscendC::PipeBarrier<PIPE_V>();  // 向量管道同步
-            
-            // 循环与剩余向量组计算最大值
+            AscendC::PipeBarrier<PIPE_V>();
+
+            // 步骤2: 循环与剩余的完整向量组取Max
+            // lsUbTensor = max(lsUbTensor, srcUb[vmaxIdx * HALF_VECTOR_SIZE])
+            // 每次迭代将当前最大值与下一个向量组比较，更新最大值
             for (uint32_t vmaxIdx = 1; vmaxIdx < numElems / HALF_VECTOR_SIZE; vmaxIdx++) {
                 AscendC::Max<half, false>(
                     lsUbTensor,
-                    lsUbTensor,  // 输入和输出都是临时存储，保存当前最大值
-                    srcUb[vmaxIdx * HALF_VECTOR_SIZE],  // 当前处理的向量组
+                    lsUbTensor,  // 输入和输出都是临时存储，原地更新最大值
+                    srcUb[vmaxIdx * HALF_VECTOR_SIZE],  // 当前处理的向量组起始位置
                     (uint64_t)0,
                     numRowsRound,
+                    // BinaryRepeatParams: (repeatM, repeatN, repeatK, srcStrideA, srcStrideB, dstStride)
+                    // stride = numElemsAligned / BLOCK_SIZE，即每行的块数
                     AscendC::BinaryRepeatParams(
                         1, 1, 1,
                         numElemsAligned / BLOCK_SIZE,
                         numElemsAligned / BLOCK_SIZE,
                         numElemsAligned / BLOCK_SIZE));
-                AscendC::PipeBarrier<PIPE_V>();  // 向量管道同步
+                AscendC::PipeBarrier<PIPE_V>();
             }
-            
-            // 处理剩余的非对齐元素
+
+            // 步骤3: 处理尾部非对齐元素（numElems不是HALF_VECTOR_SIZE的整数倍）
             if (numElems % HALF_VECTOR_SIZE > 0) {
-                SetVecMask(numElems % HALF_VECTOR_SIZE);  // 设置向量掩码
+                // 设置向量掩码，只对有效的尾部元素取Max
+                SetVecMask(numElems % HALF_VECTOR_SIZE);
                 AscendC::Max<half, false>(
                     lsUbTensor,
                     lsUbTensor,
-                    srcUb[numElems / HALF_VECTOR_SIZE * HALF_VECTOR_SIZE],  // 剩余元素起始位置
+                    srcUb[numElems / HALF_VECTOR_SIZE * HALF_VECTOR_SIZE],  // 尾部元素起始位置
                     (uint64_t)0,
                     numRowsRound,
                     AscendC::BinaryRepeatParams(
@@ -405,16 +529,18 @@ public:
                         numElemsAligned / BLOCK_SIZE,
                         numElemsAligned / BLOCK_SIZE,
                         numElemsAligned / BLOCK_SIZE));
-                AscendC::PipeBarrier<PIPE_V>();  // 向量管道同步
-                AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);  // 恢复全1掩码
+                AscendC::PipeBarrier<PIPE_V>();
+                // 恢复全1掩码
+                AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
             }
-            
-            // 对临时存储中的中间结果进行最终归约，得到每行最大值
+
+            // 步骤4: 对临时存储中的中间结果进行最终归约
+            // lsUbTensor中每行有HALF_VECTOR_SIZE(128)个元素，归约为1个最大值
             AscendC::WholeReduceMax<half, false>(
                 rowmaxUb, lsUbTensor, (int32_t)0, numRowsRound, 1, 1,
                 numElemsAligned / BLOCK_SIZE, AscendC::ReduceOrder::ORDER_ONLY_VALUE);
         }
-        AscendC::PipeBarrier<PIPE_V>();  // 向量管道同步
+        AscendC::PipeBarrier<PIPE_V>();
     }
 
     /**
@@ -679,122 +805,150 @@ public:
      * @param rowOffset 行偏移量
      * @param isFirstStackTile 是否为第一个堆叠块
      */
+    /**
+     * @brief 更新全局行最大值并计算修正因子（half精度版本）
+     *
+     * 与online_softmax.hpp中的UpdateGlobalRowMax实现相同的算法逻辑，
+     * 但使用half精度进行中间计算。关键区别：
+     * - DataCopy步长使用BLOCK_SIZE(16)而非FLOAT_BLOCK_SIZE(8)，
+     *   因为half类型1个block=16个元素=32字节
+     * - Max/Sub/Exp操作使用half类型指令
+     *
+     * == 性能优化技巧 ==
+     * - half类型步长为BLOCK_SIZE(16)，float类型步长为FLOAT_BLOCK_SIZE(8)
+     *   因为half占2字节，相同32字节块大小可容纳16个half元素
+     * - BinaryRepeatParams(1,1,1,8,8,8)中步长8块=8*16=128个half元素=HALF_VECTOR_SIZE
+     *   这与float版本中步长8块=8*8=64个float元素=FLOAT_VECTOR_SIZE对应
+     *
+     * @param rowNumCurLoop      当前行数
+     * @param rowNumCurLoopRound 当前行数（已对齐到BLOCK_SIZE=16）
+     * @param columnNum          实际列数
+     * @param columnNumRound     对齐后的列数
+     * @param dmUbOffsetCurCycle 修正因子dm在UB中的偏移
+     * @param rowOffset          行偏移
+     * @param isFirstStackTile   是否是第一个stack tile
+     */
     __aicore__ inline
     void UpdateGlobalRowMax(uint32_t rowNumCurLoop, uint32_t rowNumCurLoopRound, uint32_t columnNum,
         uint32_t columnNumRound, uint32_t dmUbOffsetCurCycle, uint32_t rowOffset, uint32_t isFirstStackTile)
     {
         if (isFirstStackTile) {
-            // 第一个堆叠块，直接将本地最大值复制到历史最大值
+            // 第一个stack tile: hm = lm，无需计算dm
             AscendC::DataCopy(
-                hmUbTensor[rowOffset],  // 目标历史最大值UB张量
-                lmUbTensor[rowOffset],  // 源本地最大值UB张量
+                hmUbTensor[rowOffset],
+                lmUbTensor[rowOffset],
                 AscendC::DataCopyParams(1, rowNumCurLoopRound / BLOCK_SIZE, 0, 0));
-            AscendC::PipeBarrier<PIPE_V>();  // 向量管道同步
+            AscendC::PipeBarrier<PIPE_V>();
         } else {
-            // 不是第一个堆叠块，计算新的最大值
-            SetVecMask(rowNumCurLoop);  // 设置向量掩码
-            
-            // 计算本地最大值和全局最大值的最大值：hm = vmax(lm, gm)
+            SetVecMask(rowNumCurLoop);
+            // hm = max(lm, gm): 取本地最大值和历史全局最大值的较大者
             AscendC::Max<half, false>(
-                hmUbTensor[rowOffset],  // 输出历史最大值
-                lmUbTensor[rowOffset],  // 输入本地最大值
-                gmUbTensor[rowOffset],  // 输入全局最大值
+                hmUbTensor[rowOffset],
+                lmUbTensor[rowOffset],
+                gmUbTensor[rowOffset],
                 (uint64_t)0,
                 1,
                 AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
-
-            AscendC::PipeBarrier<PIPE_V>();  // 向量管道同步
-            
-            // 计算差值：dm = gm - hm
+            AscendC::PipeBarrier<PIPE_V>();
+            // dm = gm - hm: 计算修正因子的指数部分（结果 <= 0）
             AscendC::Sub<half, false>(
-                dmUbTensor[dmUbOffsetCurCycle],  // 输出差值UB张量
-                gmUbTensor[rowOffset],           // 输入全局最大值
-                hmUbTensor[rowOffset],           // 输入历史最大值
+                dmUbTensor[dmUbOffsetCurCycle],
+                gmUbTensor[rowOffset],
+                hmUbTensor[rowOffset],
                 (uint64_t)0,
                 1,
                 AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
-            AscendC::PipeBarrier<PIPE_V>();  // 向量管道同步
-            
-            // 计算指数：dm = exp(dm)
+            AscendC::PipeBarrier<PIPE_V>();
+            // dm = exp(dm): 计算修正因子
             AscendC::Exp<half, false>(dmUbTensor[dmUbOffsetCurCycle],
                 dmUbTensor[dmUbOffsetCurCycle],
                 (uint64_t)0,
                 1,
                 AscendC::UnaryRepeatParams(1, 1, 8, 8));
         }
-        AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);  // 恢复全1掩码
-        AscendC::PipeBarrier<PIPE_V>();  // 向量管道同步
-        
-        // 更新全局最大值：gm = hm
+        AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
+        AscendC::PipeBarrier<PIPE_V>();
+        // gm = hm: 更新全局最大值
         AscendC::DataCopy(gmUbTensor[rowOffset],
             hmUbTensor[rowOffset],
             AscendC::DataCopyParams(1, rowNumCurLoopRound / BLOCK_SIZE, 0, 0));
-        AscendC::PipeBarrier<PIPE_V>();  // 向量管道同步
+        AscendC::PipeBarrier<PIPE_V>();
     }
 
     /**
-     * @brief 计算指数值
-     * 
-     * 执行Softmax计算中的指数部分：
-     * 1. 将每行最大值广播到与输入数据相同的形状
-     * 2. 从输入数据中减去每行最大值，避免数值溢出
-     * 3. 对结果计算指数
-     * 
-     * @param sUbOffset UB中的起始偏移量（未使用）
-     * @param rowNumCurLoop 当前循环处理的行数
-     * @param rowNumCurLoopRound 当前循环处理的行数（已对齐到块大小）
-     * @param columnNum 实际列数
-     * @param columnNumRound 对齐后的列数
-     * @param rowOffset 行偏移量
+     * @brief 计算指数值 P = exp(S - hm)（half精度版本）
+     *
+     * 与online_softmax.hpp中的CalcExp实现相同的算法逻辑，但使用half精度。
+     *
+     * == 与float版本CalcExp的区别 ==
+     * 1. 操作对象为computeUbTensor而非lsUbTensor
+     *    - float版本直接在lsUbTensor上原地操作（S -> S-hm -> exp(S-hm)）
+     *    - half版本使用独立的computeUbTensor，因为S需要保留供后续使用
+     * 2. 向量粒度为HALF_VECTOR_SIZE(128)而非FLOAT_VECTOR_SIZE(64)
+     *    - half类型向量宽度是float的2倍（256字节/2字节=128个元素）
+     * 3. Brcb使用uint16_t重解释而非uint32_t
+     *    - half占2字节，需要用uint16_t进行重解释
+     *
+     * == 性能优化技巧 ==
+     * - Brcb广播: 将每行1个hm值复制到8个half的位置（1个block=16个half=32字节）
+     * - 逐向量Sub: 每次处理HALF_VECTOR_SIZE(128)个half元素，比float版本多1倍吞吐
+     * - srcBStride=0: 广播值的步长为0，每行复用同一个tvUbTensor
+     * - Exp批量操作: 一次处理整个矩阵，利用half向量的2倍吞吐量
+     *
+     * @param sUbOffset         S矩阵在UB中的偏移（本函数未使用，保留接口一致性）
+     * @param rowNumCurLoop     当前行数
+     * @param rowNumCurLoopRound 对齐后的行数
+     * @param columnNum         实际列数
+     * @param columnNumRound    对齐后的列数
+     * @param rowOffset         行偏移（在hmUbTensor中的起始位置）
      */
     __aicore__ inline
     void CalcExp(uint32_t sUbOffset, uint32_t rowNumCurLoop, uint32_t rowNumCurLoopRound, uint32_t columnNum,
         uint32_t columnNumRound, uint32_t rowOffset)
     {
-        // 将每行最大值广播到与输入数据相同的形状：hm_block = expand_to_block(hm)
+        // 步骤1: 广播行最大值hm到tvUbTensor
+        // Brcb将每个half值复制到16个half的位置（1个block=16个half=32字节）
         AscendC::Brcb(
-            tvUbTensor.template ReinterpretCast<uint16_t>(),  // 输出广播结果
-            hmUbTensor[rowOffset].template ReinterpretCast<uint16_t>(),  // 输入最大值
+            tvUbTensor.template ReinterpretCast<uint16_t>(),
+            hmUbTensor[rowOffset].template ReinterpretCast<uint16_t>(),
             rowNumCurLoopRound / FLOAT_BLOCK_SIZE,
             AscendC::BrcbRepeatParams(1, 8));
-        AscendC::PipeBarrier<PIPE_V>();  // 向量管道同步
-        
-        // 从输入数据中减去每行最大值：ls = ls - hm_block
-        // 处理对齐的向量组
+        AscendC::PipeBarrier<PIPE_V>();
+        // 步骤2: S = S - hm_broadcast（逐向量减法）
+        // 按HALF_VECTOR_SIZE(128)为粒度循环处理每一列块
         for (uint32_t subIdx = 0; subIdx < columnNum / HALF_VECTOR_SIZE; ++subIdx) {
             AscendC::Sub<half, false>(
-                computeUbTensor[subIdx * HALF_VECTOR_SIZE],  // 输出张量
-                computeUbTensor[subIdx * HALF_VECTOR_SIZE],  // 输入张量
-                tvUbTensor,  // 广播后的最大值张量
+                computeUbTensor[subIdx * HALF_VECTOR_SIZE],
+                computeUbTensor[subIdx * HALF_VECTOR_SIZE],
+                tvUbTensor,
                 (uint64_t)0,
                 rowNumCurLoop,
+                // BinaryRepeatParams: srcBStride=1块=16个half，表示tvUbTensor每行步进16个half
                 AscendC::BinaryRepeatParams(
                     1, 1, 0, columnNumRound / BLOCK_SIZE, columnNumRound / BLOCK_SIZE, 1));
         }
-        
-        // 处理剩余的非对齐元素
+        // 处理尾部非对齐元素
         if (columnNum % HALF_VECTOR_SIZE > 0) {
-            SetVecMask(columnNum % HALF_VECTOR_SIZE);  // 设置向量掩码
+            SetVecMask(columnNum % HALF_VECTOR_SIZE);
             AscendC::Sub<half, false>(
-                computeUbTensor[columnNum / HALF_VECTOR_SIZE * HALF_VECTOR_SIZE],  // 剩余元素起始位置
+                computeUbTensor[columnNum / HALF_VECTOR_SIZE * HALF_VECTOR_SIZE],
                 computeUbTensor[columnNum / HALF_VECTOR_SIZE * HALF_VECTOR_SIZE],
                 tvUbTensor,
                 (uint64_t)0,
                 rowNumCurLoop,
                 AscendC::BinaryRepeatParams(
                     1, 1, 0, columnNumRound / BLOCK_SIZE, columnNumRound / BLOCK_SIZE, 1));
-            AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);  // 恢复全1掩码
+            AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
         }
-        AscendC::PipeBarrier<PIPE_V>();  // 向量管道同步
-        
-        // 计算指数：ls = exp(ls)
+        AscendC::PipeBarrier<PIPE_V>();
+        // 步骤3: P = exp(S)，对整个矩阵执行指数运算
         AscendC::Exp<half, false>(
-            computeUbTensor,  // 输出张量
-            computeUbTensor,  // 输入张量
+            computeUbTensor,
+            computeUbTensor,
             (uint64_t)0,
-            (rowNumCurLoop * columnNumRound + HALF_VECTOR_SIZE - 1) / HALF_VECTOR_SIZE,  // 向量数量
+            (rowNumCurLoop * columnNumRound + HALF_VECTOR_SIZE - 1) / HALF_VECTOR_SIZE,
             AscendC::UnaryRepeatParams(1, 1, 8, 8));
-        AscendC::PipeBarrier<PIPE_V>();  // 向量管道同步
+        AscendC::PipeBarrier<PIPE_V>();
     }
 
     /**
@@ -1017,21 +1171,44 @@ public:
     }
 
     /**
-     * @brief 无掩码版本的Softmax计算入口
-     * 
-     * 执行无掩码的在线Softmax计算，处理输入数据并生成输出结果。
-     * 使用分块和循环处理大型张量，通过乒乓缓冲机制提高性能。
-     * 
-     * @param gOutput 全局内存中的输出张量
-     * @param gInput 全局内存中的输入张量
-     * @param layoutOutput 输出数据的布局
-     * @param layoutInput 输入数据的布局
-     * @param actualBlockShape 实际块形状
-     * @param isFirstStackTile 是否为第一个堆叠块
-     * @param isLastNoMaskStackTile 是否为最后一个无掩码堆叠块（未使用）
-     * @param qSBlockSize 查询序列块大小
-     * @param qNBlockSize 查询头数量块大小
-     * @param curStackTileMod 当前堆叠块的模
+     * @brief 半精度在线Softmax核心操作符（无掩码版本）
+     *
+     * 执行半精度在线Softmax算法的核心计算流程，处理一个stack tile的注意力分数。
+     * 该函数是OnlineSoftmax模块的入口点，由FAInferKernel在每个stack tile上调用。
+     *
+     * == 与online_softmax.hpp中operator()的区别 ==
+     * 1. 输入数据类型为half而非float
+     * 2. 中间计算使用half精度
+     * 3. 归约策略使用WholeReduceMax/WholeReduceSum而非BlockReduceMax/BlockReduceSum
+     *
+     * == 算法流程 ==
+     * 对于每个stack tile，执行以下步骤：
+     * 1. 从全局内存加载注意力分数S到UB（CopyInputGmToUb）
+     * 2. 计算本地行最大值lm（CalcLocalRowMax → RowmaxTAILTILE）
+     * 3. 更新全局行最大值gm，计算修正因子dm（UpdateGlobalRowMax）
+     * 4. 计算指数值P = exp(S - gm)（CalcExp）
+     * 5. 计算本地行求和ll（CalcLocalRowSum）
+     * 6. 将P矩阵写回全局内存（CopyPUbToGm）
+     * 7. 更新全局行求和gl（UpdateGlobalRowSum）
+     *
+     * == 子块并行 ==
+     * 当subBlockNum > 1时，将行数分为两个子块并行处理：
+     * - 子块0处理前半部分行
+     * - 子块1处理后半部分行
+     *
+     * @param gOutput              输出全局内存张量（P矩阵，Softmax概率值）
+     * @param gInput               输入全局内存张量（S矩阵，注意力分数，half类型）
+     * @param layoutOutput         输出布局信息
+     * @param layoutInput          输入布局信息
+     * @param actualBlockShape     实际块形状（M/N/K维度）
+     * @param isFirstStackTile     是否是第一个stack tile（1=是，0=否）
+     * @param isLastNoMaskStackTile 是否是最后一个无掩码stack tile（1=是，0=否）
+     * @param qSBlockSize          Q的S维度块大小（分组注意力头的组数）
+     * @param qNBlockSize          Q的N维度块大小（每组内的token数）
+     * @param curStackTileMod      当前stack tile的模值
+     *
+     * @note 第一个stack tile不需要计算修正因子dm
+     * @note 最后一个stack tile后需要执行归一化（在RescaleO中完成）
      */
     __aicore__ inline
     void operator()(AscendC::GlobalTensor<ElementOutput> gOutput, AscendC::GlobalTensor<half> gInput,

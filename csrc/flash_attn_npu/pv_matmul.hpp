@@ -1,6 +1,46 @@
 #ifndef CATLASS_GEMM_BLOCK_MMAD_PV_HPP_T
 #define CATLASS_GEMM_BLOCK_MMAD_PV_HPP_T
 
+/**
+ * @file pv_matmul.hpp
+ * @brief Atlas A2平台Flash Attention推理中P-V矩阵乘法的块级实现
+ *
+ * 本文件实现了Flash Attention推理计算中第二个矩阵乘法步骤：P * V（注意力权重与值的乘法），
+ * 生成注意力输出矩阵O_tmp。这是Flash Attention算法的最终GEMM步骤。
+ *
+ * == 主要实现的算法 ==
+ * 实现了分块矩阵乘法（Tiled GEMM），将P*V计算分解为适配昇腾NPU多级缓存的小块计算。
+ * 与QK矩阵乘法的关键区别：
+ *   1. A矩阵（P/注意力权重）需要从全局内存逐块加载，因为P是Softmax的输出
+ *   2. B矩阵（V/值）一次性加载到L1缓存，因为V在整个序列处理中不变
+ *   3. 需要等待Softmax计算完成（通过CrossCoreFlag同步）后才能开始加载P
+ *   4. 结果O_tmp需要经过RescaleO后处理才能得到最终输出O
+ *
+ * == 数据流 ==
+ *   Softmax输出P -> GM -> L1(A) -> L0(A) \
+ *                                           -> L0(C) -> GM (O_tmp) -> RescaleO -> O
+ *   V矩阵      -> GM -> L1(B) -> L0(B) /
+ *
+ * == 与qk_matmul.hpp的区别 ==
+ * - QK: Q一次性加载到L1，K按序列分块加载；PV: V一次性加载到L1，P按序列分块加载
+ * - QK: 输出S直接给Softmax使用；PV: 输出O_tmp需要经过RescaleO后处理
+ * - QK: 不需要跨核同步；PV: 需要等待Softmax完成（CrossCoreFlag同步）
+ * - QK: B矩阵(K)支持乒乓缓冲；PV: A矩阵(P)支持乒乓缓冲
+ *
+ * == 依赖关系 ==
+ * - catlass/catlass.hpp: Catlass库核心头文件
+ * - catlass/arch/resource.hpp: 硬件资源管理
+ * - catlass/gemm/dispatch_policy.hpp: GEMM调度策略
+ * - catlass/gemm/helper.hpp: GEMM辅助工具
+ * - catlass/gemm/tile/tile_copy.hpp: 分块数据拷贝操作
+ * - catlass/gemm/tile/tile_mmad.hpp: 分块矩阵乘法操作
+ * - fa_block.h: Flash Attention分块参数定义
+ *
+ * == 使用场景 ==
+ * 本文件用于Flash Attention推理场景中的PV矩阵乘法步骤。
+ * 典型调用路径: mha_fwd_kvcache.cpp -> FAInferKernel -> BlockMmadPV -> 本文件
+ */
+
 #include "catlass/catlass.hpp"
 #include "catlass/arch/resource.hpp"
 #include "catlass/coord.hpp"
@@ -11,26 +51,57 @@
 #include "catlass/gemm/tile/tile_mmad.hpp"
 #include "fa_block.h"
 
+/**
+ * @namespace Catlass::Gemm::Block
+ * @brief Catlass库中GEMM（通用矩阵乘法）的块级实现命名空间
+ *
+ * 该命名空间包含Flash Attention计算流水线中两个矩阵乘法步骤的块级实现：
+ * - QK矩阵乘法（qk_matmul.hpp）: 计算 Q * K^T 得到注意力分数S
+ * - PV矩阵乘法（pv_matmul.hpp）: 计算 P * V 得到注意力输出O_tmp
+ */
 namespace Catlass::Gemm::Block {
 
 /**
- * @brief Flash Attention推理中P-V矩阵乘法的块级实现
+ * @brief P-V矩阵乘法的块级矩阵乘法实现（BlockMmadPV）
  *
- * 该类实现了Flash Attention中P(注意力权重)与V(值)矩阵的块级乘法，
- * 是Flash Attention计算流程的第二个矩阵乘法步骤(Attn*V)。
- * 专门针对Atlas A2平台进行了优化，采用了多级缓存分块和双缓冲技术
- * 以提高内存访问效率和计算性能。
+ * 为Atlas A2架构实现的P-V矩阵乘法块级操作，用于Flash Attention推理计算中的P*V步骤。
+ * 计算注意力权重矩阵P与值矩阵V的乘积，生成注意力输出矩阵O_tmp。
  *
- * @tparam PAGED_CACHE_FLAG_ 是否启用页缓存机制
- * @tparam ENABLE_UNIT_FLAG_ 是否启用单元级优化
- * @tparam L1TileShape_ L1缓存级别的分块形状
- * @tparam L0TileShape_ L0缓存级别的分块形状
- * @tparam AType_ 矩阵A的数据类型和布局
- * @tparam BType_ 矩阵B的数据类型和布局
- * @tparam CType_ 矩阵C(输出)的数据类型和布局
- * @tparam BiasType_ 偏置数据类型
- * @tparam TileCopy_ 分块拷贝策略类型
- * @tparam TileMmad_ 分块矩阵乘法操作类型
+ * == 设计思路 ==
+ * 在Flash Attention推理中，P*V的计算特点：
+ * - P矩阵（注意力权重）是Softmax的输出，需要逐块从全局内存加载
+ * - V矩阵（值向量）与K矩阵共享KV缓存，可以一次性加载到L1缓存
+ * - 输出O_tmp矩阵（token数量 × 嵌入维度），需要经过RescaleO后处理
+ *
+ * == 与BlockMmadQK的对称设计 ==
+ * - QK: Q一次性加载到L1(A)，K按序列分块加载到L1(B)
+ * - PV: V一次性加载到L1(B)，P按序列分块加载到L1(A)
+ * 这种对称设计使得两个GEMM步骤可以复用相同的数据流和同步机制。
+ *
+ * == 多级缓存分块策略 ==
+ * - L1级: 将P矩阵的K维度（序列长度方向）分为多个L1块
+ *   - 每个L1块包含kL1Size个token的P向量
+ * - L0级: 将M维度（token方向）和K维度（嵌入维度方向）进一步细分
+ *
+ * == 跨核同步 ==
+ * PV矩阵乘法需要等待Softmax计算完成后才能开始加载P矩阵。
+ * 使用CrossCoreFlag进行跨核同步：
+ * - Softmax完成后设置flag
+ * - PV加载前等待flag
+ * - 确保P矩阵数据已写入全局内存
+ *
+ * @tparam PAGED_CACHE_FLAG_ 是否启用分页缓存模式
+ *         - true: 使用blockTable索引KV缓存，支持PagedAttention
+ *         - false: 使用连续内存布局，直接偏移访问KV缓存
+ * @tparam ENABLE_UNIT_FLAG_ 是否启用单元测试模式
+ * @tparam L1TileShape_ L1缓存的分块形状，定义L1级分块的M/K/N维度大小
+ * @tparam L0TileShape_ L0缓存的分块形状，定义L0级分块的M/K/N维度大小
+ * @tparam AType_ A矩阵（P矩阵）的类型和布局，包含元素类型和矩阵布局信息
+ * @tparam BType_ B矩阵（V矩阵）的类型和布局，包含元素类型和矩阵布局信息
+ * @tparam CType_ C矩阵（O_tmp矩阵）的类型和布局，包含元素类型和矩阵布局信息
+ * @tparam BiasType_ 偏置类型，Flash Attention中通常不使用偏置
+ * @tparam TileCopy_ 分块数据拷贝策略，定义GM<->L1<->L0的数据搬移方式
+ * @tparam TileMmad_ 分块矩阵乘法策略，定义L0级矩阵乘法的执行方式
  */
 template <
     bool PAGED_CACHE_FLAG_,
@@ -242,26 +313,51 @@ public:
     }
 
     /**
-     * @brief 核心操作符：执行块矩阵乘法
+     * @brief P-V矩阵乘法核心操作符
      *
-     * 这是类的核心方法，实现了完整的P-V矩阵乘法逻辑。
-     * 支持页缓存和非页缓存两种模式，采用多级缓存分块和双缓冲技术优化性能。
+     * 实现Flash Attention推理中P*V矩阵乘法的核心逻辑。采用三级循环结构
+     * （K维度L1循环 → M维度L0循环 → N维度L0循环）和双缓冲机制实现高效的流水线执行。
      *
-     * @param gA 全局内存中的矩阵A张量（注意力权重P）
-     * @param gB 全局内存中的矩阵B张量（值矩阵V）
-     * @param gC 全局内存中的矩阵C张量（输出结果）
-     * @param gBlockTable 全局块表张量，用于页缓存模式
-     * @param layoutA 矩阵A的布局
-     * @param layoutB 矩阵B的布局
-     * @param layoutC 矩阵C的布局
-     * @param actualOriShape 实际原始形状
-     * @param nIdx N维度索引
-     * @param nLoop N维度循环次数
-     * @param blockSize 块大小
-     * @param kvSeqlen KV序列长度
-     * @param strideKV KV缓存步长
-     * @param blockStackNum 块堆叠数量
-     * @param softmaxFlag 跨核软max标志
+     * == 与BlockMmadQK的对称设计 ==
+     * - QK: Q一次性加载到L1(A)，K按序列分块加载到L1(B)
+     * - PV: V一次性加载到L1(B)，P按序列分块加载到L1(A)
+     * 这种对称设计使得两个GEMM步骤可以复用相同的数据流和同步机制。
+     *
+     * == 算法流程 ==
+     * 1. 加载V矩阵到L1缓存（loadVGM）
+     * 2. K维度L1循环：按序列长度方向分块加载P矩阵
+     *    a) 等待Softmax完成（CrossCoreFlag同步）
+     *    b) 从GM加载P矩阵的一个L1块到L1缓存（乒乓缓冲）
+     *    c) M维度L0循环：按token方向分块
+     *       i) 从L1加载P矩阵的一个L0块到L0A缓存
+     *       ii) N维度L0循环：按嵌入维度方向分块
+     *           - 从L1加载V矩阵的一个L0块到L0B缓存
+     *           - 执行L0级矩阵乘法（tileMmad）
+     *       iii) 将L0C结果写回全局内存
+     *    d) 更新P矩阵的全局内存偏移
+     *
+     * == 跨核同步 ==
+     * PV矩阵乘法需要等待Softmax计算完成后才能开始加载P矩阵：
+     * - softmaxFlag.Wait(): 等待Softmax完成
+     * - softmaxFlag.Reset(): 重置flag，为下一个stack tile做准备
+     *
+     * @param gA             全局内存中的A矩阵（P矩阵/注意力权重）张量
+     * @param gB             全局内存中的B矩阵（V矩阵/值向量）张量
+     * @param gC             全局内存中的C矩阵（O_tmp矩阵/输出）张量
+     * @param gBlockTable    块表张量（仅分页缓存模式使用）
+     * @param layoutA        A矩阵的布局信息
+     * @param layoutB        B矩阵的布局信息
+     * @param layoutC        C矩阵的布局信息
+     * @param actualOriShape 实际原始形状（M/N/K维度大小）
+     * @param nIdx           当前N维度索引（引用，会被更新）
+     * @param nLoop          N维度总循环次数（引用，会被更新）
+     * @param blockSize      KV缓存的块大小（仅分页缓存模式使用）
+     * @param kvSeqlen       KV序列长度
+     * @param strideKV       KV缓存的步长
+     * @param blockStackNum  块堆叠数量
+     * @param softmaxFlag    跨核同步标志，用于等待Softmax完成
+     *
+     * @note 算法复杂度: O(M * N * K) 矩阵乘法
      */
     __aicore__ inline
     void operator()(
@@ -331,11 +427,17 @@ public:
         // 等待事件0完成
         AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(EVENT_ID0);
         // 等待跨核同步信号（来自softmax阶段）
+        // 性能优化: V矩阵加载与Softmax计算并行执行
+        // V加载完成后等待Softmax完成，确保P矩阵数据已写入GM
         Arch::CrossCoreWaitFlag(softmaxFlag);
 
         // 计算三级循环的次数
+        // PV矩阵乘法的循环结构与QK不同：
+        // - QK: N(序列)外层 -> M(token)中层 -> K(嵌入)内层
+        // - PV: N(嵌入)外层 -> M(token)中层 -> K(序列)中层 -> K(嵌入)内层
+        // 这种差异是因为P矩阵需要按序列方向逐块加载（K维度）
         uint32_t mL1Loop = CeilDiv(rowNum, L1TileShape::M);     // M维度L1分块循环次数
-        uint32_t kL1Loop = CeilDiv(stackSeqTile, l1KDynamic);   // K维度L1分块循环次数
+        uint32_t kL1Loop = CeilDiv(stackSeqTile, l1KDynamic);   // K维度L1分块循环次数（按序列长度方向）
         uint32_t nL1Loop = CeilDiv(embed, L0TileShape::N);      // N维度L1分块循环次数
 
         // 外层循环：遍历嵌入维度（N维度）的L1分块

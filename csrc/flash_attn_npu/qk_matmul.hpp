@@ -17,6 +17,47 @@
 #ifndef CATLASS_GEMM_BLOCK_MMAD_QK_HPP_T
 #define CATLASS_GEMM_BLOCK_MMAD_QK_HPP_T
 
+/**
+ * @file qk_matmul.hpp
+ * @brief Atlas A2平台Flash Attention推理中Q-K矩阵乘法的块级实现
+ *
+ * 本文件实现了Flash Attention推理计算中第一个矩阵乘法步骤：Q * K^T（查询与键的乘法），
+ * 生成注意力分数矩阵S。这是Flash Attention算法的核心计算之一。
+ *
+ * == 主要实现的算法 ==
+ * 实现了分块矩阵乘法（Tiled GEMM），将大规模的Q*K^T计算分解为适配昇腾NPU多级缓存
+ * 层次结构的小块计算。核心算法流程：
+ *   1. 将Q矩阵一次性加载到L1缓存（loadQGM）
+ *   2. 将K矩阵按KV序列分块加载到L1缓存（支持普通模式和分页缓存模式）
+ *   3. 在L0缓存中执行分块矩阵乘法（tileMmad）
+ *   4. 将结果C（注意力分数S）从L0缓存写回全局内存
+ *
+ * == 分页缓存（Paged Cache）支持 ==
+ * 当PAGED_CACHE_FLAG_为true时，K矩阵的加载使用分页缓存机制：
+ * - KV缓存按固定大小的块（block）组织，通过块表（block table）索引
+ * - 支持非连续的KV缓存布局，适配vLLM等推理框架的PagedAttention机制
+ * - 块内偏移（blockStartOffset）跟踪当前处理位置
+ *
+ * == 多级缓存分块策略 ==
+ * - L1分块: 将K矩阵的N维度（序列长度方向）分为多个L1块
+ * - L0分块: 将M维度（token方向）和K维度（嵌入维度方向）进一步细分
+ * - 乒乓缓冲: L1/L0缓存均使用双缓冲技术，实现计算与数据搬移的流水线重叠
+ *
+ * == 依赖关系 ==
+ * - catlass/catlass.hpp: Catlass库核心头文件
+ * - catlass/arch/resource.hpp: 硬件资源管理
+ * - catlass/gemm/dispatch_policy.hpp: GEMM调度策略
+ * - catlass/gemm/helper.hpp: GEMM辅助工具（对齐、累加器类型选择）
+ * - catlass/gemm/tile/tile_copy.hpp: 分块数据拷贝操作
+ * - catlass/gemm/tile/tile_mmad.hpp: 分块矩阵乘法操作
+ * - fa_block.h: Flash Attention分块参数定义
+ *
+ * == 使用场景 ==
+ * 本文件用于Flash Attention推理场景中的QK矩阵乘法步骤。
+ * 典型调用路径: mha_fwd_kvcache.cpp -> FAInferKernel -> BlockMmadQK -> 本文件
+ * 与pv_matmul.hpp（PV矩阵乘法）配合，构成Flash Attention的两个GEMM步骤。
+ */
+
 #include "catlass/catlass.hpp"
 #include "catlass/arch/resource.hpp"
 #include "catlass/coord.hpp"
@@ -27,23 +68,63 @@
 #include "catlass/gemm/tile/tile_mmad.hpp"
 #include "fa_block.h"
 
+/**
+ * @namespace Catlass::Gemm::Block
+ * @brief Catlass库中GEMM（通用矩阵乘法）的块级实现命名空间
+ *
+ * 该命名空间包含Flash Attention计算流水线中两个矩阵乘法步骤的块级实现：
+ * - QK矩阵乘法（qk_matmul.hpp）: 计算 Q * K^T 得到注意力分数S
+ * - PV矩阵乘法（pv_matmul.hpp）: 计算 P * V 得到注意力输出O
+ *
+ * "块级"（Block）意味着这些实现将大规模矩阵乘法分解为适配硬件缓存层次的小块，
+ * 通过精心设计的多级循环、乒乓缓冲和事件同步实现高效的流水线执行。
+ */
 namespace Catlass::Gemm::Block {
 
 /**
- * @brief Q-K矩阵乘法的块级矩阵乘法实现
- * 
- * 为Atlas A2架构实现的Q-K矩阵乘法块级操作，用于FlashAttention计算中的Q*K^T步骤。
- * 
- * @tparam PAGED_CACHE_FLAG_ 分页缓存标志
- * @tparam ENABLE_UNIT_FLAG_ 启用单元标志
- * @tparam L1TileShape_ L1缓存的分块形状
- * @tparam L0TileShape_ L0缓存的分块形状
- * @tparam AType_ A矩阵类型（查询矩阵Q）
- * @tparam BType_ B矩阵类型（键矩阵K）
- * @tparam CType_ C矩阵类型（输出矩阵）
- * @tparam BiasType_ 偏置类型
- * @tparam TileCopy_ 分块复制策略
- * @tparam TileMmad_ 分块矩阵乘法策略
+ * @brief Q-K矩阵乘法的块级矩阵乘法实现（BlockMmadQK）
+ *
+ * 为Atlas A2架构实现的Q-K矩阵乘法块级操作，用于Flash Attention推理计算中的Q*K^T步骤。
+ * 计算查询矩阵Q与键矩阵K的转置的乘积，生成注意力分数矩阵S。
+ *
+ * == 设计思路 ==
+ * 在Flash Attention推理中，Q*K^T的计算特点：
+ * - Q矩阵较小（新产生的token数量 × 嵌入维度），可以一次性加载到L1缓存
+ * - K矩阵较大（KV缓存序列长度 × 嵌入维度），需要按序列长度方向分块加载
+ * - 输出S矩阵（token数量 × 序列长度），需要逐块写回全局内存供Softmax使用
+ *
+ * == 多级缓存分块策略 ==
+ * - L1级: 将K矩阵的N维度（序列长度方向）分为多个L1块
+ *   - 每个L1块包含kL1Size个token的K向量
+ * - L0级: 将M维度（token方向）和K维度（嵌入维度方向）进一步细分
+ *   - 每个L0块包含mL0Size个token × kL0Size个嵌入维度
+ *
+ * == 乒乓缓冲策略 ==
+ * - L1 KV乒乓: 使用两个L1缓冲区交替加载K矩阵数据
+ *   - 当一个缓冲区在进行L0计算时，另一个缓冲区在从GM加载新数据
+ *   - 通过硬件事件（HardEvent）同步两个缓冲区的使用
+ * - L0 AB乒乓: 使用两套L0缓冲区交替加载A和B矩阵数据
+ *
+ * == 分页缓存支持 ==
+ * 当PAGED_CACHE_FLAG_为true时，K矩阵的加载使用分页缓存机制：
+ * - KV缓存按固定大小的块（block）组织，通过blockTable索引
+ * - blockTable[blockIdx]指向物理块号，支持非连续内存布局
+ * - blockStartOffset跟踪当前处理位置在块内的偏移
+ *
+ * @tparam PAGED_CACHE_FLAG_ 是否启用分页缓存模式
+ *         - true: 使用blockTable索引KV缓存，支持PagedAttention
+ *         - false: 使用连续内存布局，直接偏移访问KV缓存
+ * @tparam ENABLE_UNIT_FLAG_ 是否启用单元测试模式
+ *         - true: 启用单元测试标志，用于调试和验证
+ *         - false: 正常运行模式
+ * @tparam L1TileShape_ L1缓存的分块形状，定义L1级分块的M/K/N维度大小
+ * @tparam L0TileShape_ L0缓存的分块形状，定义L0级分块的M/K/N维度大小
+ * @tparam AType_ A矩阵（Q矩阵）的类型和布局，包含元素类型和矩阵布局信息
+ * @tparam BType_ B矩阵（K矩阵）的类型和布局，包含元素类型和矩阵布局信息
+ * @tparam CType_ C矩阵（S矩阵）的类型和布局，包含元素类型和矩阵布局信息
+ * @tparam BiasType_ 偏置类型，Flash Attention中通常不使用偏置
+ * @tparam TileCopy_ 分块数据拷贝策略，定义GM<->L1<->L0的数据搬移方式
+ * @tparam TileMmad_ 分块矩阵乘法策略，定义L0级矩阵乘法的执行方式
  */
 template <
     bool PAGED_CACHE_FLAG_,      ///< 分页缓存标志
@@ -160,15 +241,29 @@ public:
     ~BlockMmad() {}
 
     /**
-     * @brief 从全局内存加载查询矩阵Q到L1缓存
-     * 
-     * 该函数将查询矩阵Q从全局内存加载到L1缓存中，支持分组查询头的处理。
-     * 
-     * @param gA 全局内存中的A矩阵（Q）
-     * @param layoutA A矩阵的布局
-     * @param rowNum 行数（token数量）
-     * @param singleGroupHeads 单组头数
-     * @param qHeads 查询头数
+     * @brief 从全局内存加载Q矩阵到L1缓存
+     *
+     * 将查询矩阵Q从全局内存（GM）一次性加载到L1缓存中。Q矩阵在Flash Attention推理中
+     * 通常较小（新产生的token数量 × 嵌入维度），可以完整放入L1缓存。
+     *
+     * == 数据搬移量 ==
+     * 搬移数据量 = rowNumRound * qHeads * embed * sizeof(ElementA)
+     * 其中 rowNumRound 是向上对齐到L1AAlignHelper::M_ALIGNED的行数
+     *
+     * == 加载策略 ==
+     * Q矩阵按分组注意力头（Grouped Query Attention）的方式组织：
+     * - 每组包含 singleGroupHeads 个注意力头
+     * - 每组有 tokenNumPerGroup = rowNum / singleGroupHeads 个token
+     * - 数据按 [tokenNumPerGroup, qHeads * embed] 的布局复制到L1
+     *
+     * @param gA               源全局内存张量，存储查询矩阵Q
+     * @param layoutA          Q矩阵的布局信息，包含形状和步长
+     * @param rowNum           行数（token数量），即Q矩阵的M维度
+     * @param singleGroupHeads 单组注意力头数，用于GQA分组
+     * @param qHeads           查询头总数，即Q矩阵的注意力头数量
+     *
+     * @note 数据搬移后通过SetFlag/WaitFlag确保DMA传输完成
+     * @note 算法复杂度: O(rowNum * qHeads * embed) 数据搬移
      */
     __aicore__ inline
     void loadQGM(
@@ -314,22 +409,50 @@ public:
 
     /**
      * @brief 核心操作符：执行Q-K矩阵乘法
-     * 
-     * 实现Q-K矩阵乘法的核心逻辑，支持普通模式和分页缓存模式，采用三级循环结构（N/M/K维度）
-     * 和双缓冲机制以提高性能。
-     * 
-     * @param gA 全局内存中的A矩阵（Q）
-     * @param gB 全局内存中的B矩阵（K）
-     * @param gC 全局内存中的C矩阵（输出）
-     * @param gBlockTable 块表（用于分页缓存模式）
-     * @param layoutA A矩阵的布局
-     * @param layoutB B矩阵的布局
-     * @param layoutC C矩阵的布局
-     * @param actualOriShape 实际原始形状
-     * @param nIdx N维度索引
-     * @param nLoop N维度循环次数
-     * @param blockSize 块大小
-     * @param strideKV KV的步长
+     *
+     * 实现Flash Attention推理中Q*K^T矩阵乘法的核心逻辑。采用三级循环结构
+     * （N维度L1循环 → M维度L0循环 → K维度L0循环）和双缓冲机制实现高效的流水线执行。
+     *
+     * == 算法流程 ==
+     * 1. 加载Q矩阵到L1缓存（loadQGM，在外部调用）
+     * 2. N维度L1循环：按序列长度方向分块加载K矩阵
+     *    a) 计算当前L1块的实际形状（处理最后一个不完整的块）
+     *    b) 从GM加载K矩阵的一个L1块到L1缓存（乒乓缓冲）
+     *    c) M维度L0循环：按token方向分块加载Q矩阵
+     *       i) 从L1加载Q矩阵的一个L0块到L0A缓存
+     *       ii) K维度L0循环：按嵌入维度方向分块
+     *           - 从L1加载K矩阵的一个L0块到L0B缓存
+     *           - 执行L0级矩阵乘法（tileMmad）
+     *       iii) 将L0C结果写回全局内存
+     *    d) 更新K矩阵的全局内存偏移
+     *
+     * == 乒乓缓冲同步机制 ==
+     * - l1KvPingPongFlag: L1 KV乒乓缓冲区同步标志
+     *   - WaitFlag: 等待缓冲区空闲（可以写入新数据）
+     *   - SetFlag: 标记缓冲区已占用（数据已写入，可以开始计算）
+     * - l0AbPingPongFlag: L0 AB乒乓缓冲区同步标志
+     *   - 用于L0A和L0B缓冲区的读写同步
+     *
+     * == 分页缓存模式 ==
+     * 当PAGED_CACHE_FLAG_为true时，K矩阵的加载使用分页缓存机制：
+     * - 通过blockTable索引物理块号，支持非连续内存布局
+     * - 块内偏移（blockStartOffset）跟踪当前处理位置
+     * - 当一个块处理完成后，自动切换到下一个物理块
+     *
+     * @param gA             全局内存中的A矩阵（Q矩阵）张量
+     * @param gB             全局内存中的B矩阵（K矩阵）张量
+     * @param gC             全局内存中的C矩阵（S矩阵/输出）张量
+     * @param gBlockTable    块表张量（仅分页缓存模式使用），映射逻辑块到物理块
+     * @param layoutA        A矩阵的布局信息
+     * @param layoutB        B矩阵的布局信息
+     * @param layoutC        C矩阵的布局信息（必须为RowMajor）
+     * @param actualOriShape 实际原始形状（M/N/K维度大小）
+     * @param nIdx           当前N维度索引（在多核并行中的位置）
+     * @param nLoop          N维度总循环次数（多核并行时的总块数）
+     * @param blockSize      KV缓存的块大小（仅分页缓存模式使用）
+     * @param strideKV       KV缓存的步长（相邻token之间的地址偏移）
+     *
+     * @note 算法复杂度: O(M * N * K) 矩阵乘法，通过分块和乒乓缓冲优化实际执行效率
      */
     __aicore__ inline
     void operator()(AscendC::GlobalTensor<ElementA> gA,
@@ -365,6 +488,8 @@ public:
         }
         
         // N维度L1循环：处理序列长度方向的分块
+        // 性能优化: L1级循环是外层循环，每次迭代加载K矩阵的一个L1块
+        // 通过乒乓缓冲，当前L1块的计算与下一个L1块的加载可以并行
         for (uint32_t nL1Idx = 0; nL1Idx < nL1Loop; ++nL1Idx) {
             uint32_t mActual = actualShape.m();  ///< M维度实际大小
             uint32_t kActual = actualShape.k();  ///< K维度实际大小
@@ -437,8 +562,10 @@ public:
                 AscendC::SetFlag<AscendC::HardEvent::MTE2_MTE1>(l1KvPingPongFlag);
             }
             // M维度L0循环：处理token数量方向的分块
+            // 性能优化: M维度循环是中间层循环，每次迭代加载Q矩阵的一个L0块
             uint32_t mL0Loop = CeilDiv(mActual, L0TileShape::M);
             // K维度L0循环：处理嵌入维度方向的分块
+            // 性能优化: K维度循环是最内层循环，累加多个K分块的结果
             uint32_t kL0Loop = CeilDiv(kActual, L0TileShape::K);
             
             // M维度L0循环
@@ -446,7 +573,7 @@ public:
                 // 计算当前M维度分块的实际大小（最后一块可能较小）
                 uint32_t mL0Actual = (mL0Idx < mL0Loop - 1U) ? L0TileShape::M : (mActual - mL0Idx * L0TileShape::M);
                 
-                // 等待L0 C乒乓缓冲区就绪
+                // 等待L0 C乒乓缓冲区就绪（确保上一次L0C写回GM完成）
                 AscendC::WaitFlag<AscendC::HardEvent::FIX_M>(l0CPingPongFlag);
                 
                 // K维度L0循环
@@ -454,41 +581,44 @@ public:
                     // 计算当前K维度分块的实际大小（最后一块可能较小）
                     uint32_t kL0Actual = (kL0Idx < kL0Loop - 1U) ? L0TileShape::K : (kActual - kL0Idx * L0TileShape::K);
 
-                    // 从L1加载A矩阵到L0缓存
+                    // 从L1加载A矩阵(Q)到L0缓存
                     LayoutAInL0 layoutAInL0 = LayoutAInL0::template MakeLayout<ElementA>(mL0Actual, kL0Actual);
                     MatrixCoord l1ATileCoord{mL0Idx * L0TileShape::M, kL0Idx * L0TileShape::K};
                     auto l1ATile = l1ATensor[layoutAInL1.GetOffset(l1ATileCoord)];
                     
-                    // 等待L0 AB乒乓缓冲区就绪，然后复制数据
+                    // 等待L0 AB乒乓缓冲区就绪，然后复制Q数据到L0A
                     AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(l0ABPingPongFlag);
                     copyL1ToL0A(l0ATensor[l0ABPingPongFlag], l1ATile, layoutAInL0, layoutAInL1);
 
-                    // 从L1加载B矩阵到L0缓存
+                    // 从L1加载B矩阵(K)到L0缓存
                     LayoutBInL0 layoutBInL0 = LayoutBInL0::template MakeLayout<ElementB>(kL0Actual, nActual);
                     MatrixCoord l1BTileCoord{kL0Idx * L0TileShape::K, 0};
                     auto l1BTile = l1BTensor[l1KvPingPongFlag][layoutBInL1.GetOffset(l1BTileCoord)];
                     
                     // 第一次迭代时等待L1 KV数据就绪
+                    // 性能优化: 只在第一次迭代等待，后续迭代L1数据已在后台加载
                     if ((mL0Idx == 0U) && (kL0Idx == 0U)) {
                         AscendC::WaitFlag<AscendC::HardEvent::MTE2_MTE1>(l1KvPingPongFlag);
                     }
                     
-                    // 等待L0 B乒乓缓冲区就绪，然后复制数据
+                    // 等待L0 B乒乓缓冲区就绪，然后复制K数据到L0B
                     AscendC::WaitFlag<AscendC::HardEvent::M_MTE1>(l0ABPingPongFlag + 2U);
                     copyL1ToL0B(l0BTensor[l0ABPingPongFlag], l1BTile, layoutBInL0, layoutBInL1);
                     
-                    // 最后一次迭代时标记L1 KV数据已使用
+                    // 最后一次迭代时标记L1 KV数据已使用，可以开始加载下一个L1块
+                    // 性能优化: 提前释放L1缓冲区，允许后台加载下一个L1块
                     if ((mL0Idx == mL0Loop - 1U) && (kL0Idx == kL0Loop - 1U)) {
                         AscendC::SetFlag<AscendC::HardEvent::MTE1_MTE2>(l1KvPingPongFlag);
                     }
 
-                    // 同步事件，确保数据复制完成
+                    // 同步事件，确保L1->L0数据复制完成
                     AscendC::SetFlag<AscendC::HardEvent::MTE1_M>(EVENT_ID0);
                     AscendC::WaitFlag<AscendC::HardEvent::MTE1_M>(EVENT_ID0);
                     
-                    // 执行矩阵乘法：只有第一次K维度迭代时初始化累加器
+                    // 执行矩阵乘法：只有第一次K维度迭代时初始化累加器（清零L0C）
+                    // 后续K维度迭代累加到L0C中
                     bool initMmad = (kL0Idx == 0U);
-                    // M维度向上对齐到块大小
+                    // M维度向上对齐到BLOCK_SIZE(16)，满足硬件MAD指令的对齐要求
                     uint32_t mL0Align = (mL0Actual + BLOCK_SIZE - 1U) / BLOCK_SIZE * BLOCK_SIZE;
                     tileMmad(l0CTensor[l0CPingPongFlag],
                         l0ATensor[l0ABPingPongFlag],
@@ -498,13 +628,13 @@ public:
                         kL0Actual,
                         initMmad);
                     
-                    // 标记L0 AB乒乓缓冲区已使用
+                    // 标记L0 AB乒乓缓冲区已使用，可以开始加载下一个L0块
                     AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(l0ABPingPongFlag);
                     AscendC::SetFlag<AscendC::HardEvent::M_MTE1>(l0ABPingPongFlag + 2U);
-                    // 切换L0 AB乒乓缓冲区标志
+                    // 切换L0 AB乒乓缓冲区标志（0<->1交替）
                     l0ABPingPongFlag = 1U - l0ABPingPongFlag;
                 }
-                // 同步事件，确保矩阵乘法完成
+                // 同步事件，确保矩阵乘法完成（L0C数据就绪）
                 AscendC::SetFlag<AscendC::HardEvent::M_FIX>(EVENT_ID0);
                 AscendC::WaitFlag<AscendC::HardEvent::M_FIX>(EVENT_ID0);
                 
@@ -514,12 +644,12 @@ public:
                 auto layoutInL0C = LayoutCInL0::MakeLayoutInL0C(MakeCoord(mL0Actual, nActual));
                 copyL0CToGm(gC[layoutC.GetOffset(gmCTileCoord)], l0CTensor[l0CPingPongFlag], layoutCTile, layoutInL0C);
                 
-                // 标记L0 C乒乓缓冲区已使用
+                // 标记L0 C乒乓缓冲区已使用，可以开始写回下一个L0C
                 AscendC::SetFlag<AscendC::HardEvent::FIX_M>(l0CPingPongFlag);
-                // 切换L0 C乒乓缓冲区标志
+                // 切换L0 C乒乓缓冲区标志（0<->1交替）
                 l0CPingPongFlag = 1U - l0CPingPongFlag;
             }
-            // 切换L1 KV乒乓缓冲区标志
+            // 切换L1 KV乒乓缓冲区标志（0<->1交替）
             l1KvPingPongFlag = 1U - l1KvPingPongFlag;
         }
     }

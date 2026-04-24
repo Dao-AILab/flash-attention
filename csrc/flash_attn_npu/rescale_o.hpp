@@ -16,6 +16,49 @@
 #ifndef CATLASS_EPILOGUE_BLOCK_BLOCK_EPILOGUE_RESCALE_O_NO_SPLIT_ROW_HPP_T
 #define CATLASS_EPILOGUE_BLOCK_BLOCK_EPILOGUE_RESCALE_O_NO_SPLIT_ROW_HPP_T
 
+/**
+ * @file rescale_o.hpp
+ * @brief Atlas A2平台的单精度(float)输出重缩放块级Epilogue实现
+ *
+ * 本文件实现了Flash Attention推理中针对Atlas A2平台优化的单精度输出重缩放块级Epilogue，
+ * 是Flash Attention计算流水线的最后阶段，负责将PV矩阵乘法的输出转换为最终的注意力输出。
+ *
+ * == 主要实现的算法 ==
+ * 实现了输出重缩放（Rescale O）算法，核心操作包括：
+ *   1. 累加修正: 对于非第一个stack tile，将历史输出O乘以修正因子dm后加上当前块输出
+ *      - O = O * dm + O_current （dm = exp(old_max - new_max)，来自OnlineSoftmax）
+ *   2. 归一化: 在最后一个stack tile，将累加输出除以全局行求和gl
+ *      - O = O / gl （gl是OnlineSoftmax维护的全局指数求和）
+ *   3. 精度转换: 将float精度的O转换为输出精度（half/bfloat16）
+ *   4. LSE计算: 可选地计算并输出对数求和指数（Log-Sum-Exp）
+ *      - LSE = ln(gl) + gm （gm是OnlineSoftmax维护的全局最大值）
+ *
+ * == 数据流 ==
+ *   PV输出(O_tmp) -> GM -> UB(lo) \
+ *                                   -> UB(go) -> 降精度 -> GM(O)
+ *   历史O(Update) -> GM -> UB(go) /
+ *   修正因子(dm)  -> UB(tv) -> 广播 -> 乘法
+ *   全局求和(gl)  -> UB(tv) -> 广播 -> 除法
+ *
+ * == 与rescale_o_low_prec.hpp的区别 ==
+ * - 本文件使用float精度进行中间计算，数值稳定性更好
+ * - low_prec版本使用half精度，性能更高但精度略低
+ * - 本文件需要额外的float->half降精度转换步骤
+ *
+ * == 依赖关系 ==
+ * - catlass/catlass.hpp: Catlass库核心头文件
+ * - catlass/arch/resource.hpp: 硬件资源管理
+ * - catlass/epilogue/dispatch_policy.hpp: Epilogue调度策略
+ * - catlass/epilogue/tile/tile_copy.hpp: 分块数据拷贝操作
+ * - catlass/gemm_coord.hpp: 矩阵坐标系统
+ * - catlass/matrix_coord.hpp: 矩阵坐标辅助工具
+ * - fa_block.h: Flash Attention分块参数定义
+ *
+ * == 使用场景 ==
+ * 本文件用于Flash Attention推理场景的输出后处理阶段。
+ * 典型调用路径: mha_fwd_kvcache.cpp -> FAInferKernel -> EpilogueRescaleO -> 本文件
+ */
+
 // Catlass库核心头文件
 #include "catlass/catlass.hpp"
 #include "catlass/arch/resource.hpp"
@@ -27,18 +70,56 @@
 // 自定义块结构头文件
 #include "fa_block.h"
 
+/**
+ * @namespace Catlass::Epilogue::Block
+ * @brief Catlass库中Epilogue（收尾操作）的块级实现命名空间
+ *
+ * 该命名空间包含Flash Attention计算流水线中矩阵乘法后的各种后处理操作的块级实现，
+ * 包括在线Softmax计算和输出重缩放。
+ */
 namespace Catlass::Epilogue::Block {
 /**
- * @brief FlashAttention输出重缩放的块级Epilogue实现
+ * @brief 单精度输出重缩放的块级Epilogue实现（RescaleO）
  *
- * 专门为Atlas A2平台优化的输出重缩放Epilogue实现，用于FlashAttention计算的最后阶段。
- * 该实现不分割行，使用float精度进行计算，支持LSE（对数求和指数）的多种计算模式。
+ * 专门为Atlas A2平台优化的单精度输出重缩放Epilogue实现，用于Flash Attention推理的
+ * 最后阶段。负责将PV矩阵乘法的输出O_tmp转换为最终的注意力输出O。
  *
- * @tparam OutputType_ 输出类型和布局
- * @tparam InputType_ 输入类型和布局
- * @tparam UpdateType_ 更新类型和布局
- * @tparam LseType_ LSE（对数求和指数）类型和布局
- * @tparam LSE_MODE_ LSE计算模式
+ * == 设计思路 ==
+ * 在Flash Attention的在线Softmax算法中，输出O的计算分为两步：
+ * 1. 累加修正: 对于每个stack tile，O = O * dm + O_current
+ *    - dm = exp(old_max - new_max) 是修正因子，来自OnlineSoftmax
+ *    - O_current 是当前stack tile的PV乘法输出
+ *    - O 是历史累加输出（第一个stack tile时O=0）
+ * 2. 归一化: 在最后一个stack tile，O = O / gl
+ *    - gl 是OnlineSoftmax维护的全局指数求和
+ *
+ * == 数据流 ==
+ *   PV输出(O_tmp) -> GM -> UB(lo) \
+ *                                   -> UB(go) -> 降精度 -> GM(O)
+ *   历史O(Update) -> GM -> UB(go) /
+ *   修正因子(dm)  -> UB(tv) -> Brcb广播 -> 乘法
+ *   全局求和(gl)  -> UB(tv) -> Brcb广播 -> 除法
+ *
+ * == UB内存布局 ==
+ * - loUbTensor: 当前stack tile的PV输出（float类型，从GM加载）
+ * - goUbTensor: 全局输出（float类型，累加结果）
+ * - tvUbTensor: 临时向量（float类型，用于广播dm/gl）
+ * - dmUbTensor: 修正因子（float类型，来自OnlineSoftmax）
+ * - glUbTensor: 全局行求和（float类型，来自OnlineSoftmax）
+ *
+ * == 与rescale_o_low_prec.hpp的区别 ==
+ * - 本文件使用float精度进行中间计算，数值稳定性更好
+ * - low_prec版本使用half精度，性能更高但精度略低
+ * - 本文件需要额外的float->half降精度转换步骤
+ *
+ * @tparam OutputType_ 输出类型和布局，包含元素类型（通常为half/bfloat16）和矩阵布局
+ * @tparam InputType_ 输入类型和布局，包含元素类型（float）和矩阵布局
+ * @tparam UpdateType_ 更新类型和布局，包含元素类型（float）和矩阵布局
+ *         - Update矩阵是历史累加输出O，从全局内存加载
+ * @tparam LseType_ LSE类型和布局，包含元素类型（float）和矩阵布局
+ * @tparam LSE_MODE_ LSE计算模式:
+ *         - LseModeT::NONE: 不计算LSE
+ *         - LseModeT::OUT_ONLY: 计算并输出LSE值（LSE = ln(gl) + gm）
  */
 template <
     class OutputType_,     ///< 输出类型和布局
@@ -235,58 +316,118 @@ public:
      * @param qNThisSubBlock 当前子块的查询头数
      * @param qSThisSubBlock 当前子块的查询序列长度
      */
+    /**
+     * @brief 单精度输出重缩放子核计算核心函数
+     *
+     * 执行输出重缩放的核心计算逻辑，处理一个子块的数据。根据stack tile的位置
+     * （第一个/中间/最后一个）执行不同的计算路径。
+     *
+     * == 计算流程 ==
+     * 路径1 - 非第一个stack tile (!isFirstStackTile):
+     *   a) 从GM加载当前PV输出O_tmp到loUbTensor（float精度）
+     *   b) 广播修正因子dm: Brcb将dm（每行1个值）广播为每行64个值存入tvUbTensor
+     *   c) 从GM加载历史累加输出O到goUbTensor32（float精度）
+     *   d) O = O * dm: 逐向量将历史输出乘以修正因子
+     *   e) O = O + O_tmp: 加上当前PV输出
+     *   合并: O = dm * O_old + O_tmp
+     *
+     * 路径2 - 第一个stack tile (isFirstStackTile):
+     *   O = O_tmp: 直接将PV输出复制到goUbTensor32
+     *
+     * 路径3 - 最后一个stack tile (isLastStackTile):
+     *   a) 广播全局行求和gl: Brcb将gl广播为每行64个值
+     *   b) O = O / gl: 逐向量除法完成归一化
+     *   c) 降精度: Cast将float的O转换为half/bfloat16
+     *   d) 写回GM: CopyOToGm将归一化后的O写回全局内存
+     *   e) 可选LSE计算: LSE = ln(gl) + gm
+     *
+     * == 性能优化技巧 ==
+     * - Brcb广播: 将1D的dm/gl广播为2D矩阵，避免逐行复制
+     * - 逐向量Mul/Div: srcBStride=0，每行复用同一个广播值，减少数据搬移
+     * - 事件驱动的流水线: 通过HardEvent实现GM<->UB数据传输与向量计算的并行
+     *   - EVENT_ID0: MTE2_V同步，确保数据加载完成后再计算
+     *   - EVENT_ID3: V_MTE2同步，确保计算完成后再加载新数据
+     *   - EVENT_ID6: MTE3_MTE2同步，确保上次写回GM完成后再加载新数据
+     * - 非最后一个stack tile时，将goUbTensor32写回GM的gUpdate供下一个stack tile使用
+     * - 最后一个stack tile才执行降精度和写回最终输出，减少中间转换开销
+     *
+     * @param gOutput           全局输出张量
+     * @param gInput            全局输入张量（PV输出O_tmp）
+     * @param gUpdate           全局更新张量（历史累加输出O）
+     * @param gLse              全局LSE张量
+     * @param layoutOutput      输出布局
+     * @param layoutInput       输入布局
+     * @param layoutUpdate      更新布局
+     * @param layoutLse         LSE布局
+     * @param qNThisSubBlock    当前子块的查询头数
+     * @param qSThisSubBlock    当前子块的查询序列长度
+     * @param totalRowNum       总行数
+     * @param isFirstStackTile  是否为第一个stack tile
+     * @param isLastStackTile   是否为最后一个stack tile
+     * @param curStackTileMod   当前stack tile的模值
+     * @param needRowLoop       是否需要行循环
+     * @param isLastRowLoop     是否为最后一个行循环
+     * @param rowOffsetLoop     行循环偏移
+     * @param proTokenIdx       前导标记索引
+     * @param proTokenNum       前导标记数量
+     * @param epiTokenNum       尾随标记数量
+     * @param integralHeadNum   整数头部数量
+     */
     __aicore__ inline
     void SubCoreCompute(
-        AscendC::GlobalTensor<ElementOutput> gOutput,      ///< 全局输出张量
-        AscendC::GlobalTensor<ElementInput> gInput,        ///< 全局输入张量
-        AscendC::GlobalTensor<ElementUpdate> gUpdate,      ///< 全局更新张量
-        AscendC::GlobalTensor<ElementLse> gLse,            ///< 全局LSE张量
-        const LayoutOutput &layoutOutput,                  ///< 输出布局
-        const LayoutInput &layoutInput,                    ///< 输入布局
-        const LayoutUpdate &layoutUpdate,                  ///< 更新布局
-        const LayoutLse &layoutLse,                        ///< LSE布局
-        uint32_t qNThisSubBlock,                           ///< 当前子块的查询头数
-        uint32_t qSThisSubBlock,                           ///< 当前子块的查询序列长度
-        uint32_t totalRowNum,                              // 总行数
-        uint32_t isFirstStackTile,                         // 是否为第一个堆叠瓦片
-        uint32_t isLastStackTile,                          // 是否为最后一个堆叠瓦片
-        uint32_t curStackTileMod,                          // 当前堆叠瓦片模块
-        uint32_t needRowLoop,                              // 是否需要行循环
-        uint32_t isLastRowLoop,                            // 是否为最后一个行循环
-        uint32_t rowOffsetLoop,                            // 行循环偏移
-        uint32_t proTokenIdx,                              // 前导标记索引
-        uint32_t proTokenNum,                              // 前导标记数量
-        uint32_t epiTokenNum,                              // 尾随标记数量
-        uint32_t integralHeadNum)                          // 整数头部数量
+        AscendC::GlobalTensor<ElementOutput> gOutput,
+        AscendC::GlobalTensor<ElementInput> gInput,
+        AscendC::GlobalTensor<ElementUpdate> gUpdate,
+        AscendC::GlobalTensor<ElementLse> gLse,
+        const LayoutOutput &layoutOutput,
+        const LayoutInput &layoutInput,
+        const LayoutUpdate &layoutUpdate,
+        const LayoutLse &layoutLse,
+        uint32_t qNThisSubBlock,
+        uint32_t qSThisSubBlock,
+        uint32_t totalRowNum,
+        uint32_t isFirstStackTile,
+        uint32_t isLastStackTile,
+        uint32_t curStackTileMod,
+        uint32_t needRowLoop,
+        uint32_t isLastRowLoop,
+        uint32_t rowOffsetLoop,
+        uint32_t proTokenIdx,
+        uint32_t proTokenNum,
+        uint32_t epiTokenNum,
+        uint32_t integralHeadNum)
     {
-        // 子核计算的核心函数，执行输出重缩放操作
-        
         // 计算各种尺寸参数
-        uint32_t curRowNum = layoutInput.shape(0);           // 当前行数
-        uint32_t embed = layoutInput.shape(1);               // 嵌入维度
-        uint32_t embedRound = layoutInput.stride(0);         // 嵌入步长（对齐后）
-        uint32_t curRowNumRound = RoundUp(curRowNum, FLOAT_BLOCK_SIZE);  // 当前行数（对齐后）
-        uint32_t qSBlockSize = layoutOutput.shape(0);        // 查询序列块大小
-        uint32_t oHiddenSize = layoutOutput.shape(1);        // 输出隐藏层大小
-        uint32_t qHeads = layoutLse.shape(1);                // 查询头数
-        uint32_t dmUbOffsetCurStackTile = curStackTileMod * MAX_ROW_NUM_SUB_CORE + rowOffsetLoop;  // 当前堆叠瓦片的DM UB偏移
+        uint32_t curRowNum = layoutInput.shape(0);
+        uint32_t embed = layoutInput.shape(1);
+        uint32_t embedRound = layoutInput.stride(0);         // 嵌入步长（对齐后，可能大于embed）
+        uint32_t curRowNumRound = RoundUp(curRowNum, FLOAT_BLOCK_SIZE);
+        uint32_t qSBlockSize = layoutOutput.shape(0);
+        uint32_t oHiddenSize = layoutOutput.shape(1);
+        uint32_t qHeads = layoutLse.shape(1);
+        // dm在UB中的偏移：根据stack tile索引和行偏移计算
+        uint32_t dmUbOffsetCurStackTile = curStackTileMod * MAX_ROW_NUM_SUB_CORE + rowOffsetLoop;
 
-        // 处理非第一个堆叠瓦片的情况
+        // ========== 路径1: 非第一个stack tile - 累加修正 ==========
         if (!isFirstStackTile) {
-            AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID3);  // 等待事件
-            // 从全局内存复制输入数据到本地UB
+            // 步骤1a: 从GM加载当前PV输出O_tmp到loUbTensor
+            AscendC::WaitFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID3);
             AscendC::DataCopy(
                 loUbTensor, gInput, AscendC::DataCopyParams(1, curRowNum * embedRound / FLOAT_BLOCK_SIZE, 0, 0));
-            AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);   // 设置事件
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
         }
-        AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID6);   // 等待事件6
+        // 等待上次GM写回完成（确保gUpdate/gInput的数据已写入）
+        AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID6);
         if (!isFirstStackTile) {
+            // 步骤1b: 广播修正因子dm到tvUbTensor
+            // Brcb将每行的dm值复制到8个float的位置，供后续逐向量Mul使用
             AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
             AscendC::Brcb(tvUbTensor.ReinterpretCast<uint32_t>(),
                 dmUbTensor[dmUbOffsetCurStackTile].ReinterpretCast<uint32_t>(),
                 curRowNumRound / FLOAT_BLOCK_SIZE,
                 AscendC::BrcbRepeatParams(1, 8));
             AscendC::PipeBarrier<PIPE_V>();
+            // 步骤1c: 从GM加载历史累加输出O到goUbTensor32
             if (needRowLoop) {
                 AscendC::DataCopy(
                     goUbTensor32, gUpdate,
@@ -294,7 +435,9 @@ public:
                 AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID1);
                 AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID1);
             }
-            // *** go = go * dm_block
+            // 步骤1d: O = O * dm（逐向量乘法）
+            // 按FLOAT_VECTOR_SIZE(64)为粒度循环处理每一列块
+            // srcBStride=1块表示tvUbTensor每行步进8个float（一个广播的dm值）
             AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
             for (uint32_t vmul_idx = 0; vmul_idx < embed / FLOAT_VECTOR_SIZE; ++vmul_idx) {
                 AscendC::Mul<float, false>(
@@ -306,6 +449,7 @@ public:
                     AscendC::BinaryRepeatParams(
                         1, 1, 0, embedRound / FLOAT_BLOCK_SIZE, embedRound / FLOAT_BLOCK_SIZE, 1));
             }
+            // 处理尾部非对齐元素
             if (embed % FLOAT_VECTOR_SIZE > 0) {
                 SetMask(embed % FLOAT_VECTOR_SIZE);
                 AscendC::Mul<float, false>(
@@ -319,8 +463,8 @@ public:
                 AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
             }
             AscendC::PipeBarrier<PIPE_V>();
+            // 步骤1e: O = O + O_tmp（加上当前PV输出）
             AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
-            // *** go = lo + go
             AscendC::Add<float, false>(
                 goUbTensor32,
                 goUbTensor32,
@@ -331,22 +475,24 @@ public:
             AscendC::PipeBarrier<PIPE_V>();
             AscendC::SetFlag<AscendC::HardEvent::V_MTE2>(EVENT_ID3);
         } else {
-            // *** go = lo
+            // ========== 路径2: 第一个stack tile - 直接复制 ==========
+            // O = O_tmp: 直接将PV输出加载到goUbTensor32
             AscendC::DataCopy(
                 goUbTensor32, gInput, AscendC::DataCopyParams(1, curRowNum * embedRound / FLOAT_BLOCK_SIZE, 0, 0));
             AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
             AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
         }
 
+        // ========== 路径3: 最后一个stack tile - 归一化和输出 ==========
         if (isLastStackTile) {
-            // *** gl_block = expand_to_block(gl)
+            // 步骤3a: 广播全局行求和gl到tvUbTensor
             AscendC::Brcb(
                 tvUbTensor.ReinterpretCast<uint32_t>(),
                 glUbTensor.ReinterpretCast<uint32_t>()[rowOffsetLoop],
                 curRowNumRound / FLOAT_BLOCK_SIZE,
                 AscendC::BrcbRepeatParams(1, 8));
             AscendC::PipeBarrier<PIPE_V>();
-            // *** go = go / gl_block
+            // 步骤3b: O = O / gl（逐向量除法，完成Softmax归一化）
             AscendC::SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
             for (uint32_t vdiv_idx = 0; vdiv_idx < embed / FLOAT_VECTOR_SIZE; ++vdiv_idx) {
                 AscendC::Div<float, false>(
@@ -358,6 +504,7 @@ public:
                     AscendC::BinaryRepeatParams(
                         1, 1, 0, embedRound / FLOAT_BLOCK_SIZE, embedRound / FLOAT_BLOCK_SIZE, 1));
             }
+            // 处理尾部非对齐元素
             if (embed % FLOAT_VECTOR_SIZE > 0) {
                 SetMask(embed % FLOAT_VECTOR_SIZE);
                 AscendC::Div<float, false>(
@@ -372,7 +519,7 @@ public:
             }
             AscendC::PipeBarrier<PIPE_V>();
 
-            // *** go = castfp32to16(go)
+            // 步骤3c: 降精度 float -> half/bfloat16
             if (std::is_same<ElementOutput, bfloat16_t>::value) {
                 AscendC::Cast<ElementOutput, float, false>(
                     goUbTensor16, goUbTensor32,
@@ -389,12 +536,14 @@ public:
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
 
-            // ***move O to GM
+            // 步骤3d: 将归一化后的O写回全局内存
             CopyOToGm(
                 gOutput, proTokenIdx, proTokenNum, epiTokenNum, integralHeadNum, qSThisSubBlock, embed, oHiddenSize);
+            // 步骤3e: 可选LSE计算: LSE = ln(gl) + gm
             if constexpr (LSE_MODE_ == LseModeT::OUT_ONLY) {
                 if (isLastRowLoop) {
                     AscendC::PipeBarrier<PIPE_V>();
+                    // lse = ln(gl): 计算全局行求和的自然对数
                     AscendC::Ln<float, false>(
                         lse32_ubuf_tensor,
                         glUbTensor,
@@ -402,6 +551,7 @@ public:
                         AscendC::UnaryRepeatParams(1, 1, 8, 8));
 
                     AscendC::PipeBarrier<PIPE_V>();
+                    // lse = lse + gm: 加上全局行最大值
                     AscendC::Add<float, false>(
                         lse32_ubuf_tensor,
                         lse32_ubuf_tensor,
@@ -410,7 +560,7 @@ public:
                         AscendC::BinaryRepeatParams(1, 1, 1, 8, 8, 8));
                     AscendC::PipeBarrier<PIPE_V>();
 
-                    // *** lse_block = expand_to_block(lse)
+                    // 广播LSE到tvUbTensor，然后写回GM
                     AscendC::Brcb(
                         tvUbTensor.ReinterpretCast<uint32_t>(),
                         lse32_ubuf_tensor.ReinterpretCast<uint32_t>(),
@@ -420,6 +570,7 @@ public:
                     AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID4);
                     AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID4);
                     
+                    // 将LSE写回全局内存，按GQA分组布局
                     if (qNThisSubBlock == 0U) {
                         AscendC::DataCopyPad(
                             gLse, tvUbTensor,
@@ -438,6 +589,7 @@ public:
                 }
             }
         } else if (needRowLoop) {
+            // 非最后一个stack tile: 将累加结果O写回GM供下一个stack tile使用
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID5);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID5);
             AscendC::DataCopy(
@@ -447,25 +599,49 @@ public:
     }
 
     /**
-     * @brief 执行入口函数，协调整个输出重缩放Epilogue过程
+     * @brief 输出重缩放核心操作符
      *
-     * 该函数负责协调整个输出重缩放Epilogue的执行流程，包括分块处理、
-     * 子块调度和核心计算调用。它将输入数据分块并分发给SubCoreCompute函数处理。
+     * 执行输出重缩放算法的核心计算流程，将PV矩阵乘法的输出O_tmp转换为最终注意力输出O。
+     * 该函数是RescaleO模块的入口点，由FAInferKernel在每个stack tile上调用。
      *
-     * @param gOutput 全局输出张量
-     * @param gInput 全局输入张量（通常是PV矩阵乘法的输出）
-     * @param gUpdate 全局更新张量（用于累加计算）
-     * @param gLse 全局LSE张量（对数求和指数）
-     * @param layoutOutput 输出布局
-     * @param layoutInput 输入布局
-     * @param layoutUpdate 更新布局
-     * @param layoutLse LSE布局
-     * @param actualBlockShape 实际块形状
-     * @param qSBlockSize 查询序列块大小
-     * @param qNBlockSize 查询头块大小
-     * @param isFirstStackTile 是否为第一个堆叠瓦片
-     * @param isLastStackTile 是否为最后一个堆叠瓦片
-     * @param curStackTileMod 当前堆叠瓦片模块
+     * == 算法流程 ==
+     * 对于每个stack tile，执行以下步骤：
+     * 1. 分块处理: 将行数按UB容量分为多个tile，每个tile处理一部分行
+     * 2. 子块并行: 将每个tile的行数分为两个子块，利用双子核并行处理
+     * 3. 核心计算（SubCoreCompute）:
+     *    a) 从GM加载当前PV输出O_tmp到UB（loUbTensor）
+     *    b) 如果不是第一个stack tile:
+     *       - 从GM加载历史累加输出O到UB（goUbTensor）
+     *       - 广播修正因子dm，执行 O = O * dm + O_tmp
+     *    c) 如果是第一个stack tile:
+     *       - 直接将O_tmp复制到goUbTensor
+     *    d) 如果是最后一个stack tile:
+     *       - 广播全局行求和gl，执行 O = O / gl（归一化）
+     *       - 可选计算LSE = ln(gl) + gm
+     *    e) 将goUbTensor降精度后写回GM
+     *
+     * == 子块并行策略 ==
+     * 当subBlockNum > 1时，将行数分为两个子块并行处理：
+     * - 子块0处理前半部分行
+     * - 子块1处理后半部分行
+     *
+     * @param gOutput           全局输出张量（最终注意力输出O，half/bfloat16精度）
+     * @param gInput            全局输入张量（PV矩阵乘法的输出O_tmp，float精度）
+     * @param gUpdate           全局更新张量（历史累加输出O，float精度）
+     * @param gLse              全局LSE张量（对数求和指数，float精度）
+     * @param layoutOutput      输出布局信息
+     * @param layoutInput       输入布局信息
+     * @param layoutUpdate      更新布局信息
+     * @param layoutLse         LSE布局信息
+     * @param actualBlockShape  实际块形状（M/N维度大小）
+     * @param qSBlockSize       Q的S维度块大小（分组注意力头的组数）
+     * @param qNBlockSize       Q的N维度块大小（每组内的token数）
+     * @param isFirstStackTile  是否是第一个stack tile（1=是，0=否）
+     * @param isLastStackTile   是否是最后一个stack tile（1=是，0=否）
+     * @param curStackTileMod   当前stack tile的模值
+     *
+     * @note 第一个stack tile不需要计算修正因子dm（因为没有历史结果需要调整）
+     * @note 最后一个stack tile需要执行归一化 O = O / gl
      */
     __aicore__ inline
     void operator()(
