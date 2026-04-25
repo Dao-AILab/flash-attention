@@ -511,6 +511,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
             cluster=self.cluster_shape_mnk,
             stream=stream,
             min_blocks_per_mp=1,
+            use_pdl=True,
         )
 
     #  GPU device kernel
@@ -844,6 +845,10 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         # ///////////////////////////////////////////////////////////////////////////////
         if warp_idx == self.load_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
+            # dq_kernel is launched with use_pdl=True so its prologue can overlap the
+            # bwd_preprocess epilogue.  Wait here before touching any preprocess outputs
+            # (lse, sum_OdO) to prevent the same race fixed in PR #2481 for sm90 bwd.
+            cute.arch.griddepcontrol_wait()
 
             while work_tile.is_valid_tile:
                 curr_block_coord = work_tile.tile_idx
