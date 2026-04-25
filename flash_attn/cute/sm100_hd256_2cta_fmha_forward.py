@@ -28,7 +28,7 @@ from flash_attn.cute.mask import (
     Sm100FusedMask as FusedMask,
 )
 from flash_attn.cute.tile_scheduler import SM100_TMEM_CAPACITY_COLUMNS
-from flash_attn.cute.flash_fwd_sm100 import DescaleTensors
+from flash_attn.cute.flash_fwd_sm100 import DescaleTensors, _TUNING_CONFIG
 from flash_attn.cute.utils import ex2_emulation_2
 
 
@@ -137,14 +137,14 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.tmem_o_offset = 256
         self.tmem_p_offset = self.tmem_s_offset
 
-        self.num_regs_softmax = 256
-        self.num_regs_correction = 160
-        self.num_regs_other = 32
-
-        # exp2 emulation tuning: trade SFU instructions for FMA pipeline
-        self.ex2_emu_freq = 4
-        self.ex2_emu_res = 3
-        self.ex2_emu_start_frg = 0
+        _tune_key = (True, is_causal, 256, False)  # hd256: always 2cta, no sm103 variant
+        _tune = _TUNING_CONFIG.get(_tune_key, {})
+        self.num_regs_softmax = _tune.get("num_regs_softmax", 256)
+        self.num_regs_correction = _tune.get("num_regs_correction", 160)
+        self.num_regs_other = 32  # fixed for hd256; not derived from 512 budget like other kernels
+        self.ex2_emu_freq = _tune.get("ex2_emu_freq", 4)
+        self.ex2_emu_res = _tune.get("ex2_emu_res", 3)
+        self.ex2_emu_start_frg = _tune.get("ex2_emu_start_frg", 0)
 
         self.buffer_align_bytes = 1024
 
