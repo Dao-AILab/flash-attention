@@ -175,6 +175,19 @@ def test_sm120_forward_validation_allows_varlen_pack_gqa_splitkv():
     )
 
 
+def test_sm120_forward_validation_allows_varlen_pack_gqa_splitkv_score_mod_aux_tensors():
+    _validate_sm120_fwd_support(
+        **_valid_sm120_kwargs(
+            is_varlen=True,
+            num_splits=2,
+            qhead_per_kvhead=4,
+            pack_gqa=True,
+            score_mod=object(),
+            aux_tensors=[object()],
+        )
+    )
+
+
 def test_sm120_forward_validation_allows_varlen_mask_mod_without_aux_tensors():
     _validate_sm120_fwd_support(**_valid_sm120_kwargs(is_varlen=True, mask_mod=object()))
 
@@ -1667,6 +1680,46 @@ def test_sm120_forward_varlen_splitkv_score_mod_aux_tensors_smoke(dtype, num_hea
         score_mod=score_mod_global_kv_bias,
         aux_tensors=[kv_bias],
         pack_gqa=False,
+        num_splits=2,
+    )
+    out_ref = _attention_ref_varlen_kv_bias(q, k, v, cu_seqlens_q, cu_seqlens_k, kv_bias)
+    out_no_bias = _attention_ref_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, False)
+    assert not torch.allclose(out_ref, out_no_bias)
+    torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] != 12,
+    reason="requires SM120 hardware",
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_sm120_forward_varlen_packed_gqa_splitkv_score_mod_aux_tensors_smoke(dtype):
+    torch.manual_seed(0)
+    q_lens = [17, 64, 129]
+    k_lens = [19, 63, 257]
+    cu_seqlens_q = torch.tensor(
+        [0, *torch.tensor(q_lens).cumsum(0).tolist()], device="cuda", dtype=torch.int32
+    )
+    cu_seqlens_k = torch.tensor(
+        [0, *torch.tensor(k_lens).cumsum(0).tolist()], device="cuda", dtype=torch.int32
+    )
+    q = torch.randn(sum(q_lens), 4, 64, device="cuda", dtype=dtype)
+    k = torch.randn(sum(k_lens), 1, 64, device="cuda", dtype=dtype)
+    v = torch.randn(sum(k_lens), 1, 64, device="cuda", dtype=dtype)
+    kv_bias = torch.randn(sum(k_lens), device="cuda", dtype=dtype)
+    out, _ = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max(q_lens),
+        max_seqlen_k=max(k_lens),
+        causal=False,
+        score_mod=score_mod_global_kv_bias,
+        aux_tensors=[kv_bias],
+        pack_gqa=True,
         num_splits=2,
     )
     out_ref = _attention_ref_varlen_kv_bias(q, k, v, cu_seqlens_q, cu_seqlens_k, kv_bias)
