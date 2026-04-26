@@ -353,10 +353,12 @@ def _validate_sm120_fwd_support(
                 page_table is not None
                 and has_seqused_k
                 and learnable_sink is None
-                and score_mod is None
                 and mask_mod is None
-                and aux_tensors is None
                 and block_sparse_tensors is None
+                and (
+                    (score_mod is None and aux_tensors is None)
+                    or (score_mod is not None and aux_tensors is not None)
+                )
             )
             if not (
                 supports_varlen_pack_gqa_splitkv
