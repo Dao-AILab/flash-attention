@@ -329,8 +329,6 @@ def _validate_sm120_fwd_support(
         raise NotImplementedError(f"{prefix} does not support block sparsity.")
 
     # Extension hooks not included in the first native SM120 slice.
-    if mask_mod is not None:
-        raise NotImplementedError(f"{prefix} does not support mask_mod.")
     if aux_tensors is not None:
         raise NotImplementedError(f"{prefix} does not support aux_tensors.")
     if learnable_sink is not None:

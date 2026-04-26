@@ -2,6 +2,7 @@ import pytest
 import torch
 
 from score_mod_definitions import score_mod_times_two
+from mask_mod_definitions import cute_mini_causal_mask
 
 from flash_attn.cute.arch_policy import get_forward_arch_policy
 from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80
@@ -65,7 +66,6 @@ def test_sm120_forward_policy_keeps_native_path_separate():
         ({"num_splits": 2}, "SplitKV"),
         ({"page_table": object()}, "paged KV"),
         ({"block_sparse_tensors": object()}, "block sparsity"),
-        ({"mask_mod": lambda *args: True}, "mask_mod"),
         ({"aux_tensors": [object()]}, "aux_tensors"),
         ({"learnable_sink": object()}, "learnable_sink"),
         ({"qv": object()}, "qv/MLA"),
@@ -183,6 +183,30 @@ def test_sm120_forward_dense_score_mod_smoke(dtype, causal):
         q, k, v, causal=causal, score_mod=score_mod_times_two, pack_gqa=False, num_splits=1
     )
     out_ref, _ = attention_ref(q * 2, k, v, causal=causal)
+    torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] != 12,
+    reason="requires SM120 hardware",
+)
+def test_sm120_forward_dense_mask_mod_smoke():
+    torch.manual_seed(0)
+    q = torch.randn(1, 129, 2, 64, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, 127, 2, 64, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(1, 127, 2, 64, device="cuda", dtype=torch.bfloat16)
+    out, _ = flash_attn_func(
+        q, k, v, causal=False, mask_mod=cute_mini_causal_mask, pack_gqa=False, num_splits=1
+    )
+
+    scores = torch.einsum("bthd,bshd->bhts", q.float() / (64**0.5), k.float())
+    q_idx = torch.arange(q.shape[1], device="cuda")[:, None]
+    kv_idx = torch.arange(k.shape[1], device="cuda")[None, :]
+    mask = (q_idx % 128) >= (kv_idx % 128)
+    scores = scores.masked_fill(~mask, float("-inf"))
+    attn = torch.softmax(scores, dim=-1).to(v.dtype)
+    out_ref = torch.einsum("bhts,bshd->bthd", attn, v)
     torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
 
 
