@@ -1,6 +1,8 @@
 import pytest
 import torch
 
+from score_mod_definitions import score_mod_times_two
+
 from flash_attn.cute.arch_policy import get_forward_arch_policy
 from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80
 from flash_attn.cute.flash_fwd_sm120 import FlashAttentionForwardSm120
@@ -63,7 +65,6 @@ def test_sm120_forward_policy_keeps_native_path_separate():
         ({"num_splits": 2}, "SplitKV"),
         ({"page_table": object()}, "paged KV"),
         ({"block_sparse_tensors": object()}, "block sparsity"),
-        ({"score_mod": lambda *args: args[0]}, "score_mod"),
         ({"mask_mod": lambda *args: True}, "mask_mod"),
         ({"aux_tensors": [object()]}, "aux_tensors"),
         ({"learnable_sink": object()}, "learnable_sink"),
@@ -163,6 +164,25 @@ def test_sm120_forward_dense_softcap_smoke(dtype, causal):
         q, k, v, causal=causal, softcap=softcap, pack_gqa=False, num_splits=1
     )
     out_ref, _ = attention_ref(q, k, v, causal=causal, softcap=softcap)
+    torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] != 12,
+    reason="requires SM120 hardware",
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("causal", [False, True])
+def test_sm120_forward_dense_score_mod_smoke(dtype, causal):
+    torch.manual_seed(0)
+    q = torch.randn(1, 129, 2, 64, device="cuda", dtype=dtype)
+    k = torch.randn(1, 127, 2, 64, device="cuda", dtype=dtype)
+    v = torch.randn(1, 127, 2, 64, device="cuda", dtype=dtype)
+    out, _ = flash_attn_func(
+        q, k, v, causal=causal, score_mod=score_mod_times_two, pack_gqa=False, num_splits=1
+    )
+    out_ref, _ = attention_ref(q * 2, k, v, causal=causal)
     torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
 
 
