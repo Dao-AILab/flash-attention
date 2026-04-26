@@ -573,6 +573,63 @@ def test_sm120_forward_dense_packed_gqa_splitkv_three_splits_smoke():
     torch.cuda.is_available() and torch.cuda.get_device_capability()[0] != 12,
     reason="requires SM120 hardware",
 )
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("num_heads_kv,pack_gqa", [(2, False), (1, True)])
+def test_sm120_forward_dense_gqa_splitkv_local_window_smoke(
+    causal, num_heads_kv, pack_gqa
+):
+    torch.manual_seed(0)
+    window_size = (48, 16)
+    q = torch.randn(1, 129, 4, 64, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, 257, num_heads_kv, 64, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(1, 257, num_heads_kv, 64, device="cuda", dtype=torch.bfloat16)
+    out, _ = flash_attn_func(
+        q,
+        k,
+        v,
+        causal=causal,
+        window_size=window_size,
+        pack_gqa=pack_gqa,
+        num_splits=2,
+    )
+    out_ref, _ = attention_ref(q, k, v, causal=causal, window_size=window_size)
+    torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] != 12,
+    reason="requires SM120 hardware",
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("num_heads_kv,pack_gqa", [(2, False), (1, True)])
+def test_sm120_forward_dense_gqa_splitkv_softcap_smoke(
+    dtype, causal, num_heads_kv, pack_gqa
+):
+    torch.manual_seed(0)
+    softcap = 15.0
+    q = torch.randn(1, 129, 4, 64, device="cuda", dtype=dtype) * softcap / 4
+    k = torch.randn(1, 257, num_heads_kv, 64, device="cuda", dtype=dtype)
+    v = torch.randn(1, 257, num_heads_kv, 64, device="cuda", dtype=dtype)
+    out, _ = flash_attn_func(
+        q,
+        k,
+        v,
+        causal=causal,
+        softcap=softcap,
+        pack_gqa=pack_gqa,
+        num_splits=2,
+    )
+    out_ref, _ = attention_ref(q, k, v, causal=causal, softcap=softcap)
+    torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] != 12,
+    reason="requires SM120 hardware",
+)
 def test_sm120_forward_dense_gqa_splitkv_three_splits_smoke():
     torch.manual_seed(0)
     q = torch.randn(1, 129, 4, 64, device="cuda", dtype=torch.float16)
