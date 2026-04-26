@@ -86,8 +86,12 @@ def test_sm120_forward_validation_rejects_out_of_scope_cases(overrides, message)
     "overrides, message",
     [
         ({"num_splits": 2, "pack_gqa": True}, "pack_gqa=False"),
-        ({"num_splits": 2, "page_table": object(), "has_seqused_k": True}, "paged KV"),
+        ({"num_splits": 2, "pack_gqa": True, "page_table": object(), "has_seqused_k": True}, "pack_gqa=False"),
         ({"num_splits": 2, "block_sparse_tensors": object()}, "block sparsity"),
+        (
+            {"num_splits": 2, "page_table": object(), "has_seqused_k": True, "block_sparse_tensors": object()},
+            "block sparsity",
+        ),
     ],
 )
 def test_sm120_forward_validation_rejects_splitkv_combinations(overrides, message):
@@ -541,6 +545,84 @@ def test_sm120_forward_paged_kv_smoke(page_size, causal, num_heads_q, num_heads_
     )
     out_ref = _attention_ref_paged(q, k, v, cache_seqlens, causal).reshape(
         batch_size * seqlen_q, num_heads_q, head_dim
+    )
+    torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] != 12,
+    reason="requires SM120 hardware",
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("num_heads_q,num_heads_kv", [(2, 2), (4, 2), (4, 1)])
+def test_sm120_forward_paged_kv_splitkv_smoke(
+    dtype, head_dim, causal, num_heads_q, num_heads_kv
+):
+    torch.manual_seed(0)
+    batch_size, seqlen_q, seqlen_k = 2, 129, 257
+    q = torch.randn(batch_size, seqlen_q, num_heads_q, head_dim, device="cuda", dtype=dtype)
+    k = torch.randn(batch_size, seqlen_k, num_heads_kv, head_dim, device="cuda", dtype=dtype)
+    v = torch.randn(batch_size, seqlen_k, num_heads_kv, head_dim, device="cuda", dtype=dtype)
+    cache_seqlens = torch.tensor([257, 193], device="cuda", dtype=torch.int32)
+    k_paged, v_paged, page_table = _make_paged_kv(k, v, page_size=64)
+    cu_seqlens_q = torch.arange(
+        0, (batch_size + 1) * seqlen_q, seqlen_q, device="cuda", dtype=torch.int32
+    )
+    out, _ = flash_attn_varlen_func(
+        q.reshape(batch_size * seqlen_q, num_heads_q, head_dim),
+        k_paged,
+        v_paged,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=None,
+        max_seqlen_q=seqlen_q,
+        max_seqlen_k=None,
+        seqused_k=cache_seqlens,
+        page_table=page_table,
+        causal=causal,
+        pack_gqa=False,
+        num_splits=2,
+    )
+    out_ref = _attention_ref_paged(q, k, v, cache_seqlens, causal).reshape(
+        batch_size * seqlen_q, num_heads_q, head_dim
+    )
+    torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] != 12,
+    reason="requires SM120 hardware",
+)
+def test_sm120_forward_paged_kv_splitkv_three_splits_smoke():
+    torch.manual_seed(0)
+    batch_size, seqlen_q, seqlen_k, head_dim = 2, 129, 257, 64
+    q = torch.randn(batch_size, seqlen_q, 4, head_dim, device="cuda", dtype=torch.float16)
+    k = torch.randn(batch_size, seqlen_k, 2, head_dim, device="cuda", dtype=torch.float16)
+    v = torch.randn(batch_size, seqlen_k, 2, head_dim, device="cuda", dtype=torch.float16)
+    cache_seqlens = torch.tensor([257, 193], device="cuda", dtype=torch.int32)
+    k_paged, v_paged, page_table = _make_paged_kv(k, v, page_size=64)
+    cu_seqlens_q = torch.arange(
+        0, (batch_size + 1) * seqlen_q, seqlen_q, device="cuda", dtype=torch.int32
+    )
+    out, _ = flash_attn_varlen_func(
+        q.reshape(batch_size * seqlen_q, 4, head_dim),
+        k_paged,
+        v_paged,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=None,
+        max_seqlen_q=seqlen_q,
+        max_seqlen_k=None,
+        seqused_k=cache_seqlens,
+        page_table=page_table,
+        causal=False,
+        pack_gqa=False,
+        num_splits=3,
+    )
+    out_ref = _attention_ref_paged(q, k, v, cache_seqlens, False).reshape(
+        batch_size * seqlen_q, 4, head_dim
     )
     torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
 

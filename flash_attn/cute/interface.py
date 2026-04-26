@@ -328,8 +328,6 @@ def _validate_sm120_fwd_support(
             raise NotImplementedError(f"{prefix} requires explicit num_splits >= 1.")
         if pack_gqa:
             raise NotImplementedError(f"{prefix} only supports SplitKV with pack_gqa=False.")
-        if page_table is not None:
-            raise NotImplementedError(f"{prefix} does not support SplitKV with paged KV.")
         if block_sparse_tensors is not None:
             raise NotImplementedError(f"{prefix} does not support SplitKV with block sparsity.")
     if page_table is not None and not has_seqused_k:
