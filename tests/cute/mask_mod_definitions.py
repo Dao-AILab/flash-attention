@@ -1,5 +1,3 @@
-from typing import Callable, Optional
-
 import random
 import math
 
@@ -181,6 +179,20 @@ def cute_ima_mask(
 # =============================================================================
 
 # TODO: Add varlen mask implementations here
+@cute.jit
+def cute_global_offset_mask(
+    batch: cute.TensorSSA,
+    head: cute.TensorSSA,
+    m_idx: cute.TensorSSA,
+    n_idx: cute.TensorSSA,
+    seqlen_info,
+    aux_tensors,
+) -> cute.TensorSSA:
+    q_idx_global = m_idx + seqlen_info.offset_q
+    kv_idx_global = n_idx + seqlen_info.offset_k
+    three = utils.scalar_to_ssa(3, cutlass.Int32)
+    one = utils.scalar_to_ssa(1, cutlass.Int32)
+    return (kv_idx_global % three) != ((q_idx_global + one) % three)
 
 
 # =============================================================================
@@ -246,6 +258,10 @@ def flex_ima_mask(b, h, q_idx, kv_idx, bias):
     return kv_idx >= bias[kv_idx]
 
 
+def flex_global_offset_mask(b, h, q_idx, kv_idx):
+    return (kv_idx % 3) != ((q_idx + 1) % 3)
+
+
 # =============================================================================
 # Utility functions
 # =============================================================================
@@ -286,6 +302,7 @@ STATIC_MASKS = {
     ),
     "document": (cute_document_mask, flex_document_mask),
     "ima": (cute_ima_mask, flex_ima_mask),
+    "global_offset": (cute_global_offset_mask, flex_global_offset_mask),
 }
 
 PARAMETERIZED_MASK_FACTORIES = {

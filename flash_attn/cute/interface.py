@@ -716,7 +716,7 @@ def _flash_attn_fwd(
     use_clc_scheduler = requested_use_clc_scheduler and not is_varlen_mha and not is_dense_noncausal
 
     if mask_mod is not None:
-        if is_varlen:
+        if is_varlen and aux_tensors is not None:
             raise NotImplementedError(
                 "mask_mod with aux_tensors is not yet supported for varlen sequences. This will be fixed in a future PR."
             )
@@ -2137,6 +2137,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         score_mod_bwd: Optional[Callable] = None,
         aux_tensors: Optional[list] = None,
         return_lse: bool = False,
+        mask_mod: Optional[Callable] = None,
     ):
         out, lse = _flash_attn_fwd(
             q,
@@ -2160,6 +2161,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             num_splits=num_splits,
             pack_gqa=pack_gqa,
             score_mod=score_mod,
+            mask_mod=mask_mod,
             aux_tensors=aux_tensors,
             return_lse=return_lse,
             gather_kv_indices=gather_kv_indices,
@@ -2186,6 +2188,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         ctx.return_lse = return_lse
         ctx.score_mod = score_mod
         ctx.score_mod_bwd = score_mod_bwd
+        ctx.mask_mod = mask_mod
         ctx.set_materialize_grads(False)
         return out, lse
 
@@ -2218,11 +2221,12 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             deterministic=ctx.deterministic,
             score_mod=ctx.score_mod,
             score_mod_bwd=ctx.score_mod_bwd,
+            mask_mod=ctx.mask_mod,
             aux_tensors=aux_tensors,
             dlse=dlse,
         )
 
-        return dq, dk, dv, *((None,) * 30)
+        return dq, dk, dv, *((None,) * 31)
 
 
 def flash_attn_func(
@@ -2302,6 +2306,7 @@ def flash_attn_varlen_func(
     score_mod: Optional[Callable] = None,
     aux_tensors: Optional[list] = None,
     return_lse: bool = False,
+    mask_mod: Optional[Callable] = None,
 ):
     """
     Explanation of some optional arguments:
@@ -2343,6 +2348,7 @@ def flash_attn_varlen_func(
         None,  # score_mod_bwd
         aux_tensors,
         return_lse,
+        mask_mod,
     )
 
 

@@ -7,7 +7,12 @@ from score_mod_definitions import (
     score_mod_global_kv_bias,
     score_mod_times_two,
 )
-from mask_mod_definitions import cute_document_mask, cute_ima_mask, cute_mini_causal_mask
+from mask_mod_definitions import (
+    cute_document_mask,
+    cute_global_offset_mask,
+    cute_ima_mask,
+    cute_mini_causal_mask,
+)
 
 from flash_attn.cute.arch_policy import get_forward_arch_policy
 from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80
@@ -117,6 +122,10 @@ def test_sm120_forward_validation_allows_varlen_score_mod_aux_tensors():
     _validate_sm120_fwd_support(
         **_valid_sm120_kwargs(is_varlen=True, score_mod=object(), aux_tensors=[object()])
     )
+
+
+def test_sm120_forward_validation_allows_varlen_mask_mod_without_aux_tensors():
+    _validate_sm120_fwd_support(**_valid_sm120_kwargs(is_varlen=True, mask_mod=object()))
 
 
 def test_sm120_forward_validation_allows_dense_learnable_sink():
@@ -637,6 +646,30 @@ def _attention_ref_varlen_kv_bias(q, k, v, cu_seqlens_q, cu_seqlens_k, kv_bias):
             "thd,shd->hts", q_slice.float() / (q_slice.shape[-1] ** 0.5), k_slice.float()
         )
         scores = scores + kv_bias[k_start:k_end].float().view(1, 1, -1)
+        attn = torch.softmax(scores, dim=-1).to(v_slice.dtype)
+        outs.append(torch.einsum("hts,shd->thd", attn, v_slice))
+    return torch.cat(outs, dim=0)
+
+
+def _attention_ref_varlen_global_offset_mask(q, k, v, cu_seqlens_q, cu_seqlens_k):
+    outs = []
+    for batch_idx in range(cu_seqlens_q.numel() - 1):
+        q_start, q_end = cu_seqlens_q[batch_idx : batch_idx + 2].tolist()
+        k_start, k_end = cu_seqlens_k[batch_idx : batch_idx + 2].tolist()
+        q_slice = q[q_start:q_end]
+        k_slice = k[k_start:k_end]
+        v_slice = v[k_start:k_end]
+        if q_slice.shape[1] != k_slice.shape[1]:
+            repeats = q_slice.shape[1] // k_slice.shape[1]
+            k_slice = k_slice.repeat_interleave(repeats, dim=1)
+            v_slice = v_slice.repeat_interleave(repeats, dim=1)
+        scores = torch.einsum(
+            "thd,shd->hts", q_slice.float() / (q_slice.shape[-1] ** 0.5), k_slice.float()
+        )
+        q_global = torch.arange(q_start, q_end, device=q.device)[:, None]
+        kv_global = torch.arange(k_start, k_end, device=k.device)[None, :]
+        mask = (kv_global % 3) != ((q_global + 1) % 3)
+        scores = scores.masked_fill(~mask.unsqueeze(0), float("-inf"))
         attn = torch.softmax(scores, dim=-1).to(v_slice.dtype)
         outs.append(torch.einsum("hts,shd->thd", attn, v_slice))
     return torch.cat(outs, dim=0)
@@ -1248,6 +1281,44 @@ def test_sm120_forward_varlen_score_mod_aux_tensors_smoke(dtype, num_heads_q, nu
     out_ref = _attention_ref_varlen_kv_bias(q, k, v, cu_seqlens_q, cu_seqlens_k, kv_bias)
     out_no_bias = _attention_ref_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, False)
     assert not torch.allclose(out_ref, out_no_bias)
+    torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] != 12,
+    reason="requires SM120 hardware",
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("num_heads_q,num_heads_kv,pack_gqa", [(2, 2, False), (4, 2, False), (4, 1, True)])
+def test_sm120_forward_varlen_mask_mod_smoke(dtype, num_heads_q, num_heads_kv, pack_gqa):
+    torch.manual_seed(0)
+    q_lens = [17, 64, 129]
+    k_lens = [19, 63, 127]
+    cu_seqlens_q = torch.tensor(
+        [0, *torch.tensor(q_lens).cumsum(0).tolist()], device="cuda", dtype=torch.int32
+    )
+    cu_seqlens_k = torch.tensor(
+        [0, *torch.tensor(k_lens).cumsum(0).tolist()], device="cuda", dtype=torch.int32
+    )
+    q = torch.randn(sum(q_lens), num_heads_q, 64, device="cuda", dtype=dtype)
+    k = torch.randn(sum(k_lens), num_heads_kv, 64, device="cuda", dtype=dtype)
+    v = torch.randn(sum(k_lens), num_heads_kv, 64, device="cuda", dtype=dtype)
+    out, _ = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max(q_lens),
+        max_seqlen_k=max(k_lens),
+        causal=False,
+        mask_mod=cute_global_offset_mask,
+        pack_gqa=pack_gqa,
+    )
+    out_ref = _attention_ref_varlen_global_offset_mask(q, k, v, cu_seqlens_q, cu_seqlens_k)
+    out_no_mask = _attention_ref_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, False)
+    assert not torch.allclose(out_ref, out_no_mask)
     torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
 
 
