@@ -822,7 +822,17 @@ def _flash_attn_fwd(
         disable_sparse_kv_bitmask,
         sm120_num_stages if arch // 10 == 12 else None,
         sm120_q_in_regs if arch // 10 == 12 else None,
+        "fwd_valid_tile_guard_v1",
         fa_logging.get_fa_log_level(),
+    )
+    dtype_name = dtype.__name__.lower()
+    compile_name_prefix = (
+        f"fa4_fwd_sm{arch}_dt{dtype_name}_hd{head_dim}_dv{head_dim_v}"
+        f"_qkv{qhead_per_kvhead}_c{int(causal)}_l{int(local)}"
+        f"_vq{int(cu_seqlens_q is not None or seqused_q is not None)}"
+        f"_vk{int(cu_seqlens_k is not None or seqused_k is not None)}"
+        f"_pt{int(page_table is not None)}_tm{tile_m}_tn{tile_n}"
+        f"_pg{int(pack_gqa)}_sp{int(is_split_kv)}"
     )
     window_size_left_arg = Int32(window_size_left) if window_size_left is not None else None
     window_size_right_arg = Int32(window_size_right) if window_size_right is not None else None
@@ -1055,6 +1065,7 @@ def _flash_attn_fwd(
                 window_size_left_arg,
                 window_size_right_arg,
                 current_stream,
+                _name_prefix=compile_name_prefix,
                 options="--enable-tvm-ffi",
             )
         else:
@@ -1080,7 +1091,11 @@ def _flash_attn_fwd(
             ]
             if arch // 10 in [10, 11]:
                 compile_args.insert(-3, descale_tensors_tensor)
-            _flash_attn_fwd.compile_cache[compile_key] = cute.compile(*compile_args, options="--enable-tvm-ffi")
+            _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
+                *compile_args,
+                _name_prefix=compile_name_prefix,
+                options="--enable-tvm-ffi",
+            )
 
     # In "fake mode", we will take torch fake tensors as input and the expected behaviors are:
     # - Use those fake metadata to populate compilation cache
