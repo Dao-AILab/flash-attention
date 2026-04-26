@@ -61,8 +61,8 @@ class PagedKVManager(ParamsBase):
         arch: cutlass.Constexpr[int] = 100,
     ):
         # SM100 transposes V in gmem to (dv, page_size, num_pages);
-        # SM90 keeps V as (page_size, dv, num_pages), same layout as K.
-        v_gmem_transposed = arch != 90
+        # SM90/SM120 keep V as (page_size, dv, num_pages), same layout as K.
+        v_gmem_transposed = arch not in (90, 120)
         universal_copy_bits = 128
         async_copy_elems = universal_copy_bits // dtype.width
         dtype_bytes = dtype.width // 8
@@ -86,7 +86,7 @@ class PagedKVManager(ParamsBase):
         val_layout = cute.make_layout((1, async_copy_elems))
         gmem_tiled_copy_KV = cute.make_tiled_copy_tv(atom_async_copy, thr_layout, val_layout)
         gmem_thr_copy_KV = gmem_tiled_copy_KV.get_slice(thread_idx)
-        page_entry_per_thread = n_block_size // num_threads
+        page_entry_per_thread = cute.ceil_div(n_block_size, num_threads)
 
         tPrPage = cute.make_rmem_tensor((page_entry_per_thread,), Int32)
         tPrPageOffset = cute.make_rmem_tensor((page_entry_per_thread,), Int32)
@@ -134,7 +134,7 @@ class PagedKVManager(ParamsBase):
 
     @cute.jit
     def load_page_table(self, n_block: Int32):
-        for i in cutlass.range(self.page_entry_per_thread, unroll=1):
+        for i in cutlass.range_constexpr(self.page_entry_per_thread):
             row = (
                 i * self.num_threads
                 + (self.thread_idx % self.gmem_threads_per_row)
@@ -160,7 +160,7 @@ class PagedKVManager(ParamsBase):
         # K is always (page_size, d, num_pages). V matches K when not transposed,
         # but is (dv, page_size, num_pages) when transposed (SM100).
         transposed = const_expr(K_or_V == "V" and self.v_gmem_transposed)
-        for i in cutlass.range(self.page_entry_per_thread, unroll=1):
+        for i in cutlass.range_constexpr(self.page_entry_per_thread):
             page = self.tPrPage[i]
             page_offset = self.tPrPageOffset[i]
             if const_expr(transposed):
@@ -175,11 +175,11 @@ class PagedKVManager(ParamsBase):
 
         tPrXPtr = self.compute_X_ptr(K_or_V)
 
-        if const_expr(self.arch == 90):
-            # SM90: sX is already stage-sliced by caller (sK[None, None, stage]).
+        if const_expr(self.arch in (90, 120)):
+            # SM90/SM120: sX is already stage-sliced by caller (sK[None, None, stage]).
             # Flatten hierarchical modes to get (n_block_size, head_dim).
             sX_pi = cute.group_modes(sX, 0, 1)
-            # SM90 does NOT transpose V here (it's transposed via utils.transpose_view before MMA)
+            # These paths do NOT transpose V here; caller uses a transposed smem view before MMA.
         else:
             # SM100: Finesse sX layout to be (M, N).
             sX_pi = cute.make_tensor(

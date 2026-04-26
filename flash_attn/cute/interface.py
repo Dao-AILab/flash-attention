@@ -300,6 +300,7 @@ def _validate_sm120_fwd_support(
     pack_gqa_was_explicit: bool,
     num_splits: int,
     page_table: Optional[torch.Tensor],
+    has_seqused_k: bool,
     block_sparse_tensors: Optional[BlockSparseTensorsTorch],
     tile_mn: Optional[Tuple[int, int]],
     num_stages: int,
@@ -323,8 +324,8 @@ def _validate_sm120_fwd_support(
     # Work decomposition and storage variants.
     if num_splits != 1:
         raise NotImplementedError(f"{prefix} does not support SplitKV.")
-    if page_table is not None:
-        raise NotImplementedError(f"{prefix} does not support paged KV.")
+    if page_table is not None and not has_seqused_k:
+        raise NotImplementedError(f"{prefix} requires seqused_k with paged KV.")
     if block_sparse_tensors is not None:
         raise NotImplementedError(f"{prefix} does not support block sparsity.")
 
@@ -609,6 +610,7 @@ def _flash_attn_fwd(
             pack_gqa_was_explicit=pack_gqa_was_explicit,
             num_splits=num_splits,
             page_table=page_table,
+            has_seqused_k=seqused_k is not None,
             block_sparse_tensors=block_sparse_tensors,
             tile_mn=tile_mn,
             num_stages=sm120_num_stages,
