@@ -131,6 +131,33 @@ def test_sm120_forward_validation_allows_dense_block_sparsity_pack_gqa_broadcast
     )
 
 
+def test_sm120_forward_validation_allows_dense_block_sparsity_learnable_sink():
+    _validate_sm120_fwd_support(
+        **_valid_sm120_kwargs(
+            mask_mod=object(),
+            block_sparse_tensors=object(),
+            learnable_sink=object(),
+        )
+    )
+
+
+def test_sm120_forward_validation_allows_dense_block_sparsity_pack_gqa_learnable_sink():
+    block_sparse_tensors = type(
+        "BlockSparseTestTensors",
+        (),
+        {"mask_block_cnt": torch.empty(1, 1, 1, dtype=torch.int32)},
+    )()
+    _validate_sm120_fwd_support(
+        **_valid_sm120_kwargs(
+            mask_mod=object(),
+            block_sparse_tensors=block_sparse_tensors,
+            learnable_sink=object(),
+            qhead_per_kvhead=4,
+            pack_gqa=True,
+        )
+    )
+
+
 @pytest.mark.parametrize(
     "overrides, message",
     [
@@ -149,9 +176,8 @@ def test_sm120_forward_validation_allows_dense_block_sparsity_pack_gqa_broadcast
             "broadcasted block sparsity",
         ),
         ({"mask_mod": None}, "mask_mod"),
-        ({"score_mod": object()}, "score/aux or sink"),
-        ({"aux_tensors": [object()]}, "score/aux or sink"),
-        ({"learnable_sink": object()}, "score/aux or sink"),
+        ({"score_mod": object()}, "score/aux"),
+        ({"aux_tensors": [object()]}, "score/aux"),
     ],
 )
 def test_sm120_forward_validation_rejects_block_sparsity_extensions(overrides, message):
@@ -507,7 +533,6 @@ def test_sm120_forward_validation_rejects_paged_pack_gqa_splitkv_extensions(over
             {"learnable_sink": object(), "num_splits": 2, "mask_mod": object()},
             "learnable_sink with SplitKV modifiers",
         ),
-        ({"learnable_sink": object(), "block_sparse_tensors": object()}, "block sparsity"),
     ],
 )
 def test_sm120_forward_validation_rejects_learnable_sink_combinations(overrides, message):
@@ -1050,6 +1075,19 @@ def _dense_kv_bias_sink_ref(q, k, v, kv_bias, learnable_sink):
     return _attention_from_scores_with_sink(scores, v, learnable_sink)
 
 
+def _mini_causal_mask_sink_ref(q, k, v, learnable_sink):
+    if q.shape[2] != k.shape[2]:
+        repeats = q.shape[2] // k.shape[2]
+        k = k.repeat_interleave(repeats, dim=2)
+        v = v.repeat_interleave(repeats, dim=2)
+    scores = torch.einsum("bthd,bshd->bhts", q.float() / (q.shape[-1] ** 0.5), k.float())
+    q_idx = torch.arange(q.shape[1], device=q.device)[:, None]
+    kv_idx = torch.arange(k.shape[1], device=k.device)[None, :]
+    mask = (q_idx % 128) >= (kv_idx % 128)
+    scores = scores.masked_fill(~mask, float("-inf"))
+    return _attention_from_scores_with_sink(scores, v, learnable_sink)
+
+
 def _document_mask_ref(q, k, v, doc_ids):
     q_doc = doc_ids[:, :, : q.shape[1]].unsqueeze(-1)
     k_doc = doc_ids[:, :, : k.shape[1]].unsqueeze(-2)
@@ -1109,6 +1147,15 @@ def _make_block_sparse_kwargs(mask_mod_flex, batch_size, num_heads, seqlen_q, se
     }
 
 
+def _make_empty_block_sparse_kwargs(mask_mod_flex, batch_size, num_heads, seqlen_q, seqlen_k):
+    kwargs = _make_block_sparse_kwargs(mask_mod_flex, batch_size, num_heads, seqlen_q, seqlen_k)
+    kwargs["mask_block_cnt"] = torch.zeros_like(kwargs["mask_block_cnt"])
+    kwargs["mask_block_idx"] = torch.zeros_like(kwargs["mask_block_idx"])
+    kwargs["full_block_cnt"] = torch.zeros_like(kwargs["full_block_cnt"])
+    kwargs["full_block_idx"] = torch.zeros_like(kwargs["full_block_idx"])
+    return kwargs
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.skipif(
     torch.cuda.is_available() and torch.cuda.get_device_capability()[0] != 12,
@@ -1140,6 +1187,88 @@ def test_sm120_forward_dense_block_sparse_smoke(num_heads_kv):
     )
     out_ref = _mini_causal_mask_ref(q, k, v)
     torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] != 12,
+    reason="requires SM120 hardware",
+)
+@pytest.mark.parametrize("pack_gqa", [False, True])
+def test_sm120_forward_dense_block_sparse_learnable_sink_smoke(pack_gqa):
+    torch.manual_seed(0)
+    batch_size, seqlen_q, seqlen_k, num_heads_q, head_dim = 1, 129, 257, 4, 64
+    num_heads_kv = 1 if pack_gqa else 2
+    q = torch.randn(batch_size, seqlen_q, num_heads_q, head_dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(batch_size, seqlen_k, num_heads_kv, head_dim, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(batch_size, seqlen_k, num_heads_kv, head_dim, device="cuda", dtype=torch.bfloat16)
+    learnable_sink = torch.randn(num_heads_q, device="cuda", dtype=torch.bfloat16)
+    _, mask_mod_flex = get_mask_pair("mini_causal")
+    block_sparse_kwargs = _make_block_sparse_kwargs(
+        mask_mod_flex,
+        batch_size,
+        1 if pack_gqa else num_heads_q,
+        seqlen_q,
+        seqlen_k,
+    )
+    out, lse = flash_attn_func(
+        q,
+        k,
+        v,
+        causal=False,
+        mask_mod=cute_mini_causal_mask,
+        learnable_sink=learnable_sink,
+        pack_gqa=pack_gqa,
+        return_lse=True,
+        **block_sparse_kwargs,
+    )
+    out_ref, lse_ref = _mini_causal_mask_sink_ref(q, k, v, learnable_sink)
+    torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(lse.float(), lse_ref, atol=5e-3, rtol=5e-3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] != 12,
+    reason="requires SM120 hardware",
+)
+@pytest.mark.parametrize("pack_gqa", [False, True])
+def test_sm120_forward_dense_block_sparse_learnable_sink_all_masked(pack_gqa):
+    torch.manual_seed(0)
+    batch_size, seqlen_q, seqlen_k, num_heads_q, head_dim = 2, 129, 127, 4, 64
+    num_heads_kv = 1 if pack_gqa else num_heads_q
+    q = torch.randn(
+        batch_size, seqlen_q, num_heads_q, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    k = torch.randn(
+        batch_size, seqlen_k, num_heads_kv, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    v = torch.randn_like(k)
+    learnable_sink = torch.randn(num_heads_q, device="cuda", dtype=torch.bfloat16)
+    _, mask_mod_flex = get_mask_pair("mini_causal")
+    block_sparse_kwargs = _make_empty_block_sparse_kwargs(
+        mask_mod_flex,
+        batch_size,
+        1 if pack_gqa else num_heads_q,
+        seqlen_q,
+        seqlen_k,
+    )
+
+    out, lse = flash_attn_func(
+        q,
+        k,
+        v,
+        causal=False,
+        mask_mod=cute_mini_causal_mask,
+        learnable_sink=learnable_sink,
+        pack_gqa=pack_gqa,
+        return_lse=True,
+        **block_sparse_kwargs,
+    )
+    expected_out = torch.zeros_like(out)
+    expected_lse = learnable_sink.float().view(1, num_heads_q, 1).expand_as(lse)
+    torch.testing.assert_close(out, expected_out, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(lse.float(), expected_lse, atol=5e-3, rtol=5e-3)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

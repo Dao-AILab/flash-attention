@@ -376,8 +376,8 @@ def _validate_sm120_fwd_support(
             )
         if mask_mod is None:
             raise NotImplementedError(f"{prefix} requires mask_mod with block sparsity.")
-        if score_mod is not None or aux_tensors is not None or learnable_sink is not None:
-            raise NotImplementedError(f"{prefix} does not support block sparsity with score/aux or sink.")
+        if score_mod is not None or aux_tensors is not None:
+            raise NotImplementedError(f"{prefix} does not support block sparsity with score/aux.")
 
     if aux_tensors is not None:
         if is_varlen and mask_mod is not None:

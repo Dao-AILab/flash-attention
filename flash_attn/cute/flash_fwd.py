@@ -34,6 +34,7 @@ from flash_attn.cute.pack_gqa import PackGQA, pack_gqa_layout
 from flash_attn.cute.paged_kv import PagedKVManager
 from flash_attn.cute.named_barrier import NamedBarrierFwd
 from flash_attn.cute.block_sparsity import BlockSparseTensors
+from flash_attn.cute.block_sparse_utils import sparse_tensor_m_block
 from flash_attn.cute.tile_scheduler import SingleTileScheduler, SingleTileVarlenScheduler, TileSchedulerArguments
 from cutlass.cute import FastDivmodDivisor
 
@@ -874,6 +875,7 @@ class FlashAttentionForwardWarpMma(FlashAttentionForwardBase):
             tile_sched_params,
             TileScheduler,
             learnable_sink,
+            blocksparse_tensors,
             aux_tensors,
             fastdiv_mods,
         ).launch(
@@ -916,6 +918,7 @@ class FlashAttentionForwardWarpMma(FlashAttentionForwardBase):
         tile_sched_params,
         TileScheduler: cutlass.Constexpr[Callable],
         learnable_sink: Optional[cute.Tensor] = None,
+        blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors=None,
         fastdiv_mods=None,
     ):
@@ -1177,20 +1180,22 @@ class FlashAttentionForwardWarpMma(FlashAttentionForwardBase):
             # read from smem_q to registers, then load V.
             # If !Q_in_regs, we load Q, load all stages of K & V, then (optionally) rotate Q.
             if const_expr(self.Q_in_regs):
+                assert blocksparse_tensors is None, "Block sparsity does not support Q_in_regs"
                 load_K(n_block, smem_pipe_write=0, need_predicates=True)
                 cute.arch.cp_async_commit_group()
                 preprocess_Q()
                 cute.arch.barrier()  # Make sure all threads have read smem_q before loading V
 
-            for stage in cutlass.range_constexpr(self.num_stages):
-                if const_expr(not self.Q_in_regs or stage > 0):
-                    if stage == 0 or n_block - stage >= 0:
-                        load_K(n_block - stage, smem_pipe_write=stage, need_predicates=stage == 0)
-                    cute.arch.cp_async_commit_group()
-                if const_expr(stage < self.num_stages - 1):
-                    if stage == 0 or n_block - stage >= 0:
-                        load_V(n_block - stage, smem_pipe_write=stage, need_predicates=stage == 0)
-                    cute.arch.cp_async_commit_group()
+            if const_expr(blocksparse_tensors is None):
+                for stage in cutlass.range_constexpr(self.num_stages):
+                    if const_expr(not self.Q_in_regs or stage > 0):
+                        if stage == 0 or n_block - stage >= 0:
+                            load_K(n_block - stage, smem_pipe_write=stage, need_predicates=stage == 0)
+                        cute.arch.cp_async_commit_group()
+                    if const_expr(stage < self.num_stages - 1):
+                        if stage == 0 or n_block - stage >= 0:
+                            load_V(n_block - stage, smem_pipe_write=stage, need_predicates=stage == 0)
+                        cute.arch.cp_async_commit_group()
             if const_expr(not self.Q_in_regs):
                 preprocess_Q()
 
@@ -1222,46 +1227,153 @@ class FlashAttentionForwardWarpMma(FlashAttentionForwardBase):
                 fastdiv_mods=fastdiv_mods if const_expr(self.mask_mod is not None) else None,
             )
 
-            # First iteration with seqlen masking
             smem_pipe_read = Int32(0)
             smem_pipe_write = Int32(self.num_stages - 1)
-            compute_one_n_block(
-                n_block,
-                smem_pipe_read,
-                smem_pipe_write,
-                is_first_n_block=True,
-                seqlen=seqlen,
-                mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=True),
-            )
-            smem_pipe_read = self.advance_pipeline(smem_pipe_read)
-            smem_pipe_write = self.advance_pipeline(smem_pipe_write)
-            # Next couple of iterations with causal masking
-            if const_expr(self.is_causal or self.is_local):
-                n_block_min_causal_local_mask = block_info.get_n_block_min_causal_local_mask(
-                    seqlen, m_block, n_block_min
+            if const_expr(blocksparse_tensors is not None):
+                assert self.num_stages == 1, "Block sparsity only supports one K/V stage"
+                mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx = blocksparse_tensors
+                m_block_sparse = sparse_tensor_m_block(
+                    m_block,
+                    self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+                    self.q_subtile_factor if self.q_subtile_factor is not None else 1,
                 )
-                for n_tile in cutlass.range(
-                    cutlass.max(n_block_max - 1 - n_block_min_causal_local_mask, 0), unroll=1
-                ):
-                    n_block = n_block_max - 2 - n_tile
+                curr_mask_block_cnt = mask_block_cnt[batch_size, num_head, m_block_sparse]
+                curr_mask_block_idx = mask_block_idx[batch_size, num_head, m_block_sparse, None]
+                curr_full_block_cnt = full_block_cnt[batch_size, num_head, m_block_sparse]
+                curr_full_block_idx = full_block_idx[batch_size, num_head, m_block_sparse, None]
+
+                if curr_mask_block_cnt > 0:
+                    n_block_sparse = curr_mask_block_idx[curr_mask_block_cnt - 1]
+                    load_K(n_block_sparse, smem_pipe_write=0, need_predicates=True)
+                    cute.arch.cp_async_commit_group()
                     compute_one_n_block(
-                        n_block,
+                        n_block_sparse,
                         smem_pipe_read,
                         smem_pipe_write,
                         seqlen=seqlen,
-                        mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=True),
+                        is_first_n_block=True,
+                        mask_fn=partial(
+                            mask_fn,
+                            mask_mod=self.mask_mod,
+                            mask_seqlen=True,
+                            fastdiv_mods=fastdiv_mods
+                            if const_expr(self.mask_mod is not None)
+                            else None,
+                        ),
+                        prefetch_next=False,
                     )
-                    smem_pipe_read = self.advance_pipeline(smem_pipe_read)
-                    smem_pipe_write = self.advance_pipeline(smem_pipe_write)
-            # The remaining iterations have no masking
-            for n_tile in cutlass.range(cutlass.max(n_block - n_block_min, 0), unroll=1):
+                    for i in cutlass.range(1, curr_mask_block_cnt, unroll=1):
+                        n_block_sparse = curr_mask_block_idx[curr_mask_block_cnt - 1 - i]
+                        load_K(n_block_sparse, smem_pipe_write=0, need_predicates=True)
+                        cute.arch.cp_async_commit_group()
+                        compute_one_n_block(
+                            n_block_sparse,
+                            smem_pipe_read,
+                            smem_pipe_write,
+                            seqlen=seqlen,
+                            is_first_n_block=False,
+                            mask_fn=partial(
+                                mask_fn,
+                                mask_mod=self.mask_mod,
+                                mask_seqlen=False,
+                                fastdiv_mods=fastdiv_mods
+                                if const_expr(self.mask_mod is not None)
+                                else None,
+                            ),
+                            prefetch_next=False,
+                        )
+
+                if curr_full_block_cnt > 0 and curr_mask_block_cnt == 0:
+                    n_block_sparse = curr_full_block_idx[curr_full_block_cnt - 1]
+                    load_K(n_block_sparse, smem_pipe_write=0, need_predicates=True)
+                    cute.arch.cp_async_commit_group()
+                    compute_one_n_block(
+                        n_block_sparse,
+                        smem_pipe_read,
+                        smem_pipe_write,
+                        seqlen=seqlen,
+                        is_first_n_block=True,
+                        mask_fn=partial(mask_fn, mask_mod=None, mask_seqlen=True),
+                        prefetch_next=False,
+                    )
+                    for i in cutlass.range(1, curr_full_block_cnt, unroll=1):
+                        n_block_sparse = curr_full_block_idx[curr_full_block_cnt - 1 - i]
+                        load_K(n_block_sparse, smem_pipe_write=0, need_predicates=True)
+                        cute.arch.cp_async_commit_group()
+                        compute_one_n_block(
+                            n_block_sparse,
+                            smem_pipe_read,
+                            smem_pipe_write,
+                            seqlen=seqlen,
+                            is_first_n_block=False,
+                            mask_fn=partial(mask_fn, mask_mod=None, mask_seqlen=False),
+                            prefetch_next=False,
+                        )
+                elif curr_full_block_cnt > 0:
+                    n_block_sparse = curr_full_block_idx[curr_full_block_cnt - 1]
+                    load_K(n_block_sparse, smem_pipe_write=0, need_predicates=True)
+                    cute.arch.cp_async_commit_group()
+                    compute_one_n_block(
+                        n_block_sparse,
+                        smem_pipe_read,
+                        smem_pipe_write,
+                        seqlen=seqlen,
+                        is_first_n_block=False,
+                        mask_fn=partial(mask_fn, mask_mod=None, mask_seqlen=True),
+                        prefetch_next=False,
+                    )
+                    for i in cutlass.range(1, curr_full_block_cnt, unroll=1):
+                        n_block_sparse = curr_full_block_idx[curr_full_block_cnt - 1 - i]
+                        load_K(n_block_sparse, smem_pipe_write=0, need_predicates=True)
+                        cute.arch.cp_async_commit_group()
+                        compute_one_n_block(
+                            n_block_sparse,
+                            smem_pipe_read,
+                            smem_pipe_write,
+                            seqlen=seqlen,
+                            is_first_n_block=False,
+                            mask_fn=partial(mask_fn, mask_mod=None, mask_seqlen=False),
+                            prefetch_next=False,
+                        )
+            else:
+                # First iteration with seqlen masking
                 compute_one_n_block(
-                    n_block - n_tile - 1, smem_pipe_read, smem_pipe_write,
-                    seqlen=seqlen, is_first_n_block=False,
-                    mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=False)
+                    n_block,
+                    smem_pipe_read,
+                    smem_pipe_write,
+                    is_first_n_block=True,
+                    seqlen=seqlen,
+                    mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=True),
                 )
                 smem_pipe_read = self.advance_pipeline(smem_pipe_read)
                 smem_pipe_write = self.advance_pipeline(smem_pipe_write)
+                # Next couple of iterations with causal masking
+                if const_expr(self.is_causal or self.is_local):
+                    n_block_min_causal_local_mask = block_info.get_n_block_min_causal_local_mask(
+                        seqlen, m_block, n_block_min
+                    )
+                    for n_tile in cutlass.range(
+                        cutlass.max(n_block_max - 1 - n_block_min_causal_local_mask, 0), unroll=1
+                    ):
+                        n_block = n_block_max - 2 - n_tile
+                        compute_one_n_block(
+                            n_block,
+                            smem_pipe_read,
+                            smem_pipe_write,
+                            seqlen=seqlen,
+                            mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=True),
+                        )
+                        smem_pipe_read = self.advance_pipeline(smem_pipe_read)
+                        smem_pipe_write = self.advance_pipeline(smem_pipe_write)
+                # The remaining iterations have no masking
+                for n_tile in cutlass.range(cutlass.max(n_block - n_block_min, 0), unroll=1):
+                    compute_one_n_block(
+                        n_block - n_tile - 1, smem_pipe_read, smem_pipe_write,
+                        seqlen=seqlen, is_first_n_block=False,
+                        mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=False)
+                    )
+                    smem_pipe_read = self.advance_pipeline(smem_pipe_read)
+                    smem_pipe_write = self.advance_pipeline(smem_pipe_write)
             # TODO: local
 
             sink_val = None
@@ -1342,6 +1454,7 @@ class FlashAttentionForwardWarpMma(FlashAttentionForwardBase):
         mask_fn: Optional[Callable] = None,
         is_first_n_block: cutlass.Constexpr = False,
         check_inf: cutlass.Constexpr = True,
+        prefetch_next: cutlass.Constexpr = True,
     ):
         """Compute one n_block of S/O.
 
@@ -1401,9 +1514,10 @@ class FlashAttentionForwardWarpMma(FlashAttentionForwardBase):
         smem_pipe_write = self.advance_pipeline(smem_pipe_write)
 
         def load_K_next():
-            if n_block - self.num_stages >= 0:
-                load_K(n_block - self.num_stages, smem_pipe_write, need_predicates=False)
-            cute.arch.cp_async_commit_group()
+            if const_expr(prefetch_next):
+                if n_block - self.num_stages >= 0:
+                    load_K(n_block - self.num_stages, smem_pipe_write, need_predicates=False)
+                cute.arch.cp_async_commit_group()
 
         # wait for smem tile V for O
         if const_expr(self.num_stages == 1):
