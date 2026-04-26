@@ -1,5 +1,6 @@
 import pytest
 import torch
+from torch.nn.attention.flex_attention import create_block_mask
 
 from score_mod_definitions import (
     score_mod_batch_bias,
@@ -12,6 +13,7 @@ from mask_mod_definitions import (
     cute_global_offset_mask,
     cute_ima_mask,
     cute_mini_causal_mask,
+    get_mask_pair,
 )
 
 from flash_attn.cute.arch_policy import get_forward_arch_policy
@@ -78,7 +80,6 @@ def test_sm120_forward_policy_keeps_native_path_separate():
         ({"head_dim": 64, "head_dim_v": 192}, "head_dim_v"),
         ({"num_splits": 0}, "explicit num_splits"),
         ({"page_table": object()}, "seqused_k"),
-        ({"block_sparse_tensors": object()}, "block sparsity"),
         ({"qv": object()}, "qv/MLA"),
         ({"tile_mn": (128, 192)}, "tile_mn"),
         ({"num_stages": 3}, "num_stages"),
@@ -103,6 +104,34 @@ def test_sm120_forward_validation_rejects_out_of_scope_cases(overrides, message)
 def test_sm120_forward_validation_rejects_splitkv_combinations(overrides, message):
     with pytest.raises(NotImplementedError, match=message):
         _validate_sm120_fwd_support(**_valid_sm120_kwargs(**overrides))
+
+
+def test_sm120_forward_validation_allows_dense_block_sparsity():
+    _validate_sm120_fwd_support(
+        **_valid_sm120_kwargs(
+            mask_mod=object(),
+            block_sparse_tensors=object(),
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        ({"is_varlen": True}, "varlen or paged KV"),
+        ({"page_table": object(), "has_seqused_k": True}, "varlen or paged KV"),
+        ({"pack_gqa": True, "qhead_per_kvhead": 4}, "pack_gqa"),
+        ({"mask_mod": None}, "mask_mod"),
+        ({"score_mod": object()}, "score/aux or sink"),
+        ({"aux_tensors": [object()]}, "score/aux or sink"),
+        ({"learnable_sink": object()}, "score/aux or sink"),
+    ],
+)
+def test_sm120_forward_validation_rejects_block_sparsity_extensions(overrides, message):
+    kwargs = dict(mask_mod=object(), block_sparse_tensors=object())
+    kwargs.update(overrides)
+    with pytest.raises(NotImplementedError, match=message):
+        _validate_sm120_fwd_support(**_valid_sm120_kwargs(**kwargs))
 
 
 @pytest.mark.parametrize("head_dim,head_dim_v", [(64, 128), (128, 64), (96, 64)])
@@ -1020,6 +1049,68 @@ def test_sm120_forward_dense_mask_mod_smoke():
         q, k, v, causal=False, mask_mod=cute_mini_causal_mask, pack_gqa=False, num_splits=1
     )
 
+    out_ref = _mini_causal_mask_ref(q, k, v)
+    torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
+
+
+def _make_block_sparse_kwargs(mask_mod_flex, batch_size, num_heads, seqlen_q, seqlen_k):
+    block_size = (64, 64)
+    block_mask = create_block_mask(
+        mask_mod_flex,
+        B=batch_size,
+        H=num_heads,
+        Q_LEN=seqlen_q,
+        KV_LEN=seqlen_k,
+        device="cuda",
+        BLOCK_SIZE=block_size,
+    )
+    (
+        _seq_q,
+        _seq_k,
+        mask_block_cnt,
+        mask_block_idx,
+        full_block_cnt,
+        full_block_idx,
+        *_,
+    ) = block_mask.as_tuple()
+    return {
+        "mask_block_cnt": mask_block_cnt,
+        "mask_block_idx": mask_block_idx,
+        "full_block_cnt": full_block_cnt,
+        "full_block_idx": full_block_idx,
+        "block_size": block_size,
+    }
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] != 12,
+    reason="requires SM120 hardware",
+)
+@pytest.mark.parametrize("num_heads_kv", [4, 2])
+def test_sm120_forward_dense_block_sparse_smoke(num_heads_kv):
+    torch.manual_seed(0)
+    batch_size, seqlen_q, seqlen_k, num_heads_q, head_dim = 1, 129, 257, 4, 64
+    q = torch.randn(batch_size, seqlen_q, num_heads_q, head_dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(batch_size, seqlen_k, num_heads_kv, head_dim, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(batch_size, seqlen_k, num_heads_kv, head_dim, device="cuda", dtype=torch.bfloat16)
+    _, mask_mod_flex = get_mask_pair("mini_causal")
+    block_sparse_kwargs = _make_block_sparse_kwargs(
+        mask_mod_flex,
+        batch_size,
+        num_heads_q,
+        seqlen_q,
+        seqlen_k,
+    )
+    out, _ = flash_attn_func(
+        q,
+        k,
+        v,
+        causal=False,
+        mask_mod=cute_mini_causal_mask,
+        pack_gqa=False,
+        **block_sparse_kwargs,
+    )
     out_ref = _mini_causal_mask_ref(q, k, v)
     torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
 
