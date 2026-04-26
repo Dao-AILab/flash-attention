@@ -349,7 +349,20 @@ def _validate_sm120_fwd_support(
                     or (score_mod is not None and aux_tensors is not None)
                 )
             )
-            if not (supports_varlen_pack_gqa_splitkv or supports_dense_pack_gqa_splitkv):
+            supports_paged_pack_gqa_splitkv = (
+                page_table is not None
+                and has_seqused_k
+                and learnable_sink is None
+                and score_mod is None
+                and mask_mod is None
+                and aux_tensors is None
+                and block_sparse_tensors is None
+            )
+            if not (
+                supports_varlen_pack_gqa_splitkv
+                or supports_dense_pack_gqa_splitkv
+                or supports_paged_pack_gqa_splitkv
+            ):
                 raise NotImplementedError(f"{prefix} only supports SplitKV with pack_gqa=False.")
         if block_sparse_tensors is not None:
             raise NotImplementedError(f"{prefix} does not support SplitKV with block sparsity.")

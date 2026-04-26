@@ -93,7 +93,6 @@ def test_sm120_forward_validation_rejects_out_of_scope_cases(overrides, message)
 @pytest.mark.parametrize(
     "overrides, message",
     [
-        ({"num_splits": 2, "pack_gqa": True, "page_table": object(), "has_seqused_k": True}, "pack_gqa=False"),
         ({"num_splits": 2, "block_sparse_tensors": object()}, "block sparsity"),
         (
             {"num_splits": 2, "page_table": object(), "has_seqused_k": True, "block_sparse_tensors": object()},
@@ -159,6 +158,18 @@ def test_sm120_forward_validation_allows_paged_kv_splitkv_score_mod_aux_tensors(
             has_seqused_k=True,
             score_mod=object(),
             aux_tensors=[object()],
+        )
+    )
+
+
+def test_sm120_forward_validation_allows_paged_kv_pack_gqa_splitkv():
+    _validate_sm120_fwd_support(
+        **_valid_sm120_kwargs(
+            num_splits=2,
+            page_table=object(),
+            has_seqused_k=True,
+            qhead_per_kvhead=4,
+            pack_gqa=True,
         )
     )
 
@@ -294,7 +305,6 @@ def test_sm120_forward_validation_rejects_aux_tensor_combinations(overrides, mes
         {"mask_mod": object()},
         {"aux_tensors": [object()]},
         {"learnable_sink": object()},
-        {"page_table": object(), "has_seqused_k": True},
     ],
 )
 def test_sm120_forward_validation_rejects_varlen_pack_gqa_splitkv_extensions(overrides):
@@ -311,13 +321,36 @@ def test_sm120_forward_validation_rejects_varlen_pack_gqa_splitkv_extensions(ove
         {"mask_mod": object()},
         {"aux_tensors": [object()]},
         {"learnable_sink": object()},
-        {"page_table": object(), "has_seqused_k": True},
     ],
 )
 def test_sm120_forward_validation_rejects_dense_pack_gqa_splitkv_extensions(overrides):
     kwargs = dict(is_varlen=False, num_splits=2, qhead_per_kvhead=4, pack_gqa=True)
     kwargs.update(overrides)
     with pytest.raises(NotImplementedError, match="pack_gqa=False"):
+        _validate_sm120_fwd_support(**_valid_sm120_kwargs(**kwargs))
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"score_mod": object(), "aux_tensors": [object()]},
+        {"score_mod": object()},
+        {"mask_mod": object()},
+        {"aux_tensors": [object()]},
+        {"learnable_sink": object()},
+        {"block_sparse_tensors": object()},
+    ],
+)
+def test_sm120_forward_validation_rejects_paged_pack_gqa_splitkv_extensions(overrides):
+    kwargs = dict(
+        num_splits=2,
+        page_table=object(),
+        has_seqused_k=True,
+        qhead_per_kvhead=4,
+        pack_gqa=True,
+    )
+    kwargs.update(overrides)
+    with pytest.raises(NotImplementedError, match="pack_gqa=False|block sparsity"):
         _validate_sm120_fwd_support(**_valid_sm120_kwargs(**kwargs))
 
 
@@ -1502,6 +1535,80 @@ def test_sm120_forward_paged_kv_splitkv_smoke(
     )
     out_ref = _attention_ref_paged(q, k, v, cache_seqlens, causal).reshape(
         batch_size * seqlen_q, num_heads_q, head_dim
+    )
+    torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] != 12,
+    reason="requires SM120 hardware",
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("causal", [False, True])
+def test_sm120_forward_paged_kv_packed_gqa_splitkv_smoke(dtype, causal):
+    torch.manual_seed(0)
+    batch_size, seqlen_q, seqlen_k, num_heads_q, num_heads_kv, head_dim = 2, 129, 257, 4, 1, 64
+    q = torch.randn(batch_size, seqlen_q, num_heads_q, head_dim, device="cuda", dtype=dtype)
+    k = torch.randn(batch_size, seqlen_k, num_heads_kv, head_dim, device="cuda", dtype=dtype)
+    v = torch.randn(batch_size, seqlen_k, num_heads_kv, head_dim, device="cuda", dtype=dtype)
+    cache_seqlens = torch.tensor([257, 193], device="cuda", dtype=torch.int32)
+    k_paged, v_paged, page_table = _make_paged_kv(k, v, page_size=64)
+    cu_seqlens_q = torch.arange(
+        0, (batch_size + 1) * seqlen_q, seqlen_q, device="cuda", dtype=torch.int32
+    )
+    out, _ = flash_attn_varlen_func(
+        q.reshape(batch_size * seqlen_q, num_heads_q, head_dim),
+        k_paged,
+        v_paged,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=None,
+        max_seqlen_q=seqlen_q,
+        max_seqlen_k=None,
+        seqused_k=cache_seqlens,
+        page_table=page_table,
+        causal=causal,
+        pack_gqa=True,
+        num_splits=2,
+    )
+    out_ref = _attention_ref_paged(q, k, v, cache_seqlens, causal).reshape(
+        batch_size * seqlen_q, num_heads_q, head_dim
+    )
+    torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] != 12,
+    reason="requires SM120 hardware",
+)
+def test_sm120_forward_paged_kv_packed_gqa_splitkv_three_splits_smoke():
+    torch.manual_seed(0)
+    batch_size, seqlen_q, seqlen_k, head_dim = 2, 129, 257, 64
+    q = torch.randn(batch_size, seqlen_q, 4, head_dim, device="cuda", dtype=torch.float16)
+    k = torch.randn(batch_size, seqlen_k, 1, head_dim, device="cuda", dtype=torch.float16)
+    v = torch.randn(batch_size, seqlen_k, 1, head_dim, device="cuda", dtype=torch.float16)
+    cache_seqlens = torch.tensor([257, 193], device="cuda", dtype=torch.int32)
+    k_paged, v_paged, page_table = _make_paged_kv(k, v, page_size=64)
+    cu_seqlens_q = torch.arange(
+        0, (batch_size + 1) * seqlen_q, seqlen_q, device="cuda", dtype=torch.int32
+    )
+    out, _ = flash_attn_varlen_func(
+        q.reshape(batch_size * seqlen_q, 4, head_dim),
+        k_paged,
+        v_paged,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=None,
+        max_seqlen_q=seqlen_q,
+        max_seqlen_k=None,
+        seqused_k=cache_seqlens,
+        page_table=page_table,
+        causal=False,
+        pack_gqa=True,
+        num_splits=3,
+    )
+    out_ref = _attention_ref_paged(q, k, v, cache_seqlens, False).reshape(
+        batch_size * seqlen_q, 4, head_dim
     )
     torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
 
