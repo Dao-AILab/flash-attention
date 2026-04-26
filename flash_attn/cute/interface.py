@@ -380,7 +380,7 @@ def _validate_sm120_fwd_support(
 
     if learnable_sink is not None:
         if num_splits != 1:
-            if score_mod is not None or mask_mod is not None or aux_tensors is not None:
+            if mask_mod is not None or (aux_tensors is not None and score_mod is None):
                 raise NotImplementedError(
                     f"{prefix} does not support learnable_sink with SplitKV modifiers."
                 )
