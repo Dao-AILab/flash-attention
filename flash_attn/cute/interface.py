@@ -329,8 +329,6 @@ def _validate_sm120_fwd_support(
         raise NotImplementedError(f"{prefix} does not support block sparsity.")
 
     # Extension hooks not included in the first native SM120 slice.
-    if softcap is not None:
-        raise NotImplementedError(f"{prefix} does not support softcap.")
     if score_mod is not None:
         raise NotImplementedError(f"{prefix} does not support score_mod.")
     if mask_mod is not None:

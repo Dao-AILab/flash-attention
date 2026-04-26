@@ -63,7 +63,6 @@ def test_sm120_forward_policy_keeps_native_path_separate():
         ({"num_splits": 2}, "SplitKV"),
         ({"page_table": object()}, "paged KV"),
         ({"block_sparse_tensors": object()}, "block sparsity"),
-        ({"softcap": 15.0}, "softcap"),
         ({"score_mod": lambda *args: args[0]}, "score_mod"),
         ({"mask_mod": lambda *args: True}, "mask_mod"),
         ({"aux_tensors": [object()]}, "aux_tensors"),
@@ -147,7 +146,29 @@ def test_sm120_forward_dense_local_window_smoke(window_size, causal):
     torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
 
 
-def _attention_ref_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, causal, window_size=(None, None)):
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] != 12,
+    reason="requires SM120 hardware",
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("causal", [False, True])
+def test_sm120_forward_dense_softcap_smoke(dtype, causal):
+    torch.manual_seed(0)
+    softcap = 15.0
+    q = torch.randn(1, 129, 2, 64, device="cuda", dtype=dtype) * softcap / 4
+    k = torch.randn(1, 127, 2, 64, device="cuda", dtype=dtype)
+    v = torch.randn(1, 127, 2, 64, device="cuda", dtype=dtype)
+    out, _ = flash_attn_func(
+        q, k, v, causal=causal, softcap=softcap, pack_gqa=False, num_splits=1
+    )
+    out_ref, _ = attention_ref(q, k, v, causal=causal, softcap=softcap)
+    torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
+
+
+def _attention_ref_varlen(
+    q, k, v, cu_seqlens_q, cu_seqlens_k, causal, window_size=(None, None), softcap=0.0
+):
     outs = []
     for batch_idx in range(cu_seqlens_q.numel() - 1):
         q_start, q_end = cu_seqlens_q[batch_idx : batch_idx + 2].tolist()
@@ -158,6 +179,7 @@ def _attention_ref_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, causal, window_si
             v[k_start:k_end].unsqueeze(0),
             causal=causal,
             window_size=window_size,
+            softcap=softcap,
         )
         outs.append(out.squeeze(0))
     return torch.cat(outs, dim=0)
@@ -192,6 +214,39 @@ def test_sm120_forward_varlen_dense_smoke(dtype, head_dim, causal):
         pack_gqa=False,
     )
     out_ref = _attention_ref_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, causal)
+    torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] != 12,
+    reason="requires SM120 hardware",
+)
+def test_sm120_forward_varlen_softcap_smoke():
+    torch.manual_seed(0)
+    softcap = 15.0
+    q_lens = [17, 64, 129]
+    k_lens = [19, 63, 127]
+    cu_seqlens_q = torch.tensor([0, *torch.tensor(q_lens).cumsum(0).tolist()], device="cuda", dtype=torch.int32)
+    cu_seqlens_k = torch.tensor([0, *torch.tensor(k_lens).cumsum(0).tolist()], device="cuda", dtype=torch.int32)
+    q = torch.randn(sum(q_lens), 2, 64, device="cuda", dtype=torch.bfloat16) * softcap / 4
+    k = torch.randn(sum(k_lens), 2, 64, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(sum(k_lens), 2, 64, device="cuda", dtype=torch.bfloat16)
+    out, _ = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max(q_lens),
+        max_seqlen_k=max(k_lens),
+        causal=True,
+        softcap=softcap,
+        pack_gqa=False,
+    )
+    out_ref_no_softcap = _attention_ref_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, True)
+    out_ref = _attention_ref_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, True, softcap=softcap)
+    assert not torch.allclose(out_ref, out_ref_no_softcap)
     torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
 
 
