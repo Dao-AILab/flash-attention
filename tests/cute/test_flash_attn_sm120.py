@@ -1,7 +1,12 @@
 import pytest
 import torch
 
-from score_mod_definitions import score_mod_batch_bias, score_mod_dual_buffer, score_mod_times_two
+from score_mod_definitions import (
+    score_mod_batch_bias,
+    score_mod_dual_buffer,
+    score_mod_global_kv_bias,
+    score_mod_times_two,
+)
 from mask_mod_definitions import cute_document_mask, cute_ima_mask, cute_mini_causal_mask
 
 from flash_attn.cute.arch_policy import get_forward_arch_policy
@@ -101,14 +106,29 @@ def test_sm120_forward_validation_allows_dense_aux_tensors():
     _validate_sm120_fwd_support(**_valid_sm120_kwargs(aux_tensors=[object()]))
 
 
+def test_sm120_forward_validation_allows_varlen_score_mod_aux_tensors():
+    _validate_sm120_fwd_support(
+        **_valid_sm120_kwargs(is_varlen=True, score_mod=object(), aux_tensors=[object()])
+    )
+
+
 def test_sm120_forward_validation_allows_dense_learnable_sink():
     _validate_sm120_fwd_support(**_valid_sm120_kwargs(learnable_sink=object()))
+
+
+def test_sm120_forward_validation_allows_varlen_learnable_sink():
+    _validate_sm120_fwd_support(
+        **_valid_sm120_kwargs(is_varlen=True, learnable_sink=object())
+    )
 
 
 @pytest.mark.parametrize(
     "overrides, message",
     [
-        ({"aux_tensors": [object()], "is_varlen": True}, "aux_tensors with varlen"),
+        (
+            {"aux_tensors": [object()], "is_varlen": True, "mask_mod": object()},
+            "aux_tensors with varlen mask_mod",
+        ),
         ({"aux_tensors": [object()], "num_splits": 2}, "aux_tensors with SplitKV"),
         (
             {"aux_tensors": [object()], "page_table": object(), "has_seqused_k": True},
@@ -125,7 +145,6 @@ def test_sm120_forward_validation_rejects_aux_tensor_combinations(overrides, mes
 @pytest.mark.parametrize(
     "overrides, message",
     [
-        ({"learnable_sink": object(), "is_varlen": True}, "learnable_sink with varlen"),
         ({"learnable_sink": object(), "num_splits": 2}, "learnable_sink with SplitKV"),
         (
             {"learnable_sink": object(), "page_table": object(), "has_seqused_k": True},
@@ -527,6 +546,58 @@ def _attention_ref_varlen(
             softcap=softcap,
         )
         outs.append(out.squeeze(0))
+    return torch.cat(outs, dim=0)
+
+
+def _attention_ref_varlen_with_lse(
+    q,
+    k,
+    v,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    causal,
+    window_size=(None, None),
+    softcap=0.0,
+    learnable_sink=None,
+):
+    outs = []
+    lses = []
+    for batch_idx in range(cu_seqlens_q.numel() - 1):
+        q_start, q_end = cu_seqlens_q[batch_idx : batch_idx + 2].tolist()
+        k_start, k_end = cu_seqlens_k[batch_idx : batch_idx + 2].tolist()
+        out, _, lse = attention_ref(
+            q[q_start:q_end].unsqueeze(0),
+            k[k_start:k_end].unsqueeze(0),
+            v[k_start:k_end].unsqueeze(0),
+            causal=causal,
+            window_size=window_size,
+            softcap=softcap,
+            learnable_sink=learnable_sink,
+            return_lse=True,
+        )
+        outs.append(out.squeeze(0))
+        lses.append(lse.squeeze(0))
+    return torch.cat(outs, dim=0), torch.cat(lses, dim=1)
+
+
+def _attention_ref_varlen_kv_bias(q, k, v, cu_seqlens_q, cu_seqlens_k, kv_bias):
+    outs = []
+    for batch_idx in range(cu_seqlens_q.numel() - 1):
+        q_start, q_end = cu_seqlens_q[batch_idx : batch_idx + 2].tolist()
+        k_start, k_end = cu_seqlens_k[batch_idx : batch_idx + 2].tolist()
+        q_slice = q[q_start:q_end]
+        k_slice = k[k_start:k_end]
+        v_slice = v[k_start:k_end]
+        if q_slice.shape[1] != k_slice.shape[1]:
+            repeats = q_slice.shape[1] // k_slice.shape[1]
+            k_slice = k_slice.repeat_interleave(repeats, dim=1)
+            v_slice = v_slice.repeat_interleave(repeats, dim=1)
+        scores = torch.einsum(
+            "thd,shd->hts", q_slice.float() / (q_slice.shape[-1] ** 0.5), k_slice.float()
+        )
+        scores = scores + kv_bias[k_start:k_end].float().view(1, 1, -1)
+        attn = torch.softmax(scores, dim=-1).to(v_slice.dtype)
+        outs.append(torch.einsum("hts,shd->thd", attn, v_slice))
     return torch.cat(outs, dim=0)
 
 
@@ -965,6 +1036,88 @@ def test_sm120_forward_varlen_softcap_smoke():
     out_ref_no_softcap = _attention_ref_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, True)
     out_ref = _attention_ref_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, True, softcap=softcap)
     assert not torch.allclose(out_ref, out_ref_no_softcap)
+    torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] != 12,
+    reason="requires SM120 hardware",
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("num_heads_q,num_heads_kv,pack_gqa", [(2, 2, False), (4, 2, False), (4, 1, True)])
+def test_sm120_forward_varlen_learnable_sink_smoke(dtype, causal, num_heads_q, num_heads_kv, pack_gqa):
+    torch.manual_seed(0)
+    q_lens = [17, 64, 129]
+    k_lens = [19, 63, 127]
+    cu_seqlens_q = torch.tensor(
+        [0, *torch.tensor(q_lens).cumsum(0).tolist()], device="cuda", dtype=torch.int32
+    )
+    cu_seqlens_k = torch.tensor(
+        [0, *torch.tensor(k_lens).cumsum(0).tolist()], device="cuda", dtype=torch.int32
+    )
+    q = torch.randn(sum(q_lens), num_heads_q, 64, device="cuda", dtype=dtype)
+    k = torch.randn(sum(k_lens), num_heads_kv, 64, device="cuda", dtype=dtype)
+    v = torch.randn(sum(k_lens), num_heads_kv, 64, device="cuda", dtype=dtype)
+    learnable_sink = torch.randn(num_heads_q, device="cuda", dtype=torch.bfloat16)
+    out, lse = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max(q_lens),
+        max_seqlen_k=max(k_lens),
+        causal=causal,
+        learnable_sink=learnable_sink,
+        pack_gqa=pack_gqa,
+        return_lse=True,
+    )
+    out_ref, lse_ref = _attention_ref_varlen_with_lse(
+        q, k, v, cu_seqlens_q, cu_seqlens_k, causal, learnable_sink=learnable_sink
+    )
+    torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(lse.float(), lse_ref.float(), atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] != 12,
+    reason="requires SM120 hardware",
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("num_heads_q,num_heads_kv,pack_gqa", [(2, 2, False), (4, 2, False), (4, 1, True)])
+def test_sm120_forward_varlen_score_mod_aux_tensors_smoke(dtype, num_heads_q, num_heads_kv, pack_gqa):
+    torch.manual_seed(0)
+    q_lens = [17, 64, 129]
+    k_lens = [19, 63, 127]
+    cu_seqlens_q = torch.tensor(
+        [0, *torch.tensor(q_lens).cumsum(0).tolist()], device="cuda", dtype=torch.int32
+    )
+    cu_seqlens_k = torch.tensor(
+        [0, *torch.tensor(k_lens).cumsum(0).tolist()], device="cuda", dtype=torch.int32
+    )
+    q = torch.randn(sum(q_lens), num_heads_q, 64, device="cuda", dtype=dtype)
+    k = torch.randn(sum(k_lens), num_heads_kv, 64, device="cuda", dtype=dtype)
+    v = torch.randn(sum(k_lens), num_heads_kv, 64, device="cuda", dtype=dtype)
+    kv_bias = torch.randn(sum(k_lens), device="cuda", dtype=dtype)
+    out, _ = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max(q_lens),
+        max_seqlen_k=max(k_lens),
+        causal=False,
+        score_mod=score_mod_global_kv_bias,
+        aux_tensors=[kv_bias],
+        pack_gqa=pack_gqa,
+    )
+    out_ref = _attention_ref_varlen_kv_bias(q, k, v, cu_seqlens_q, cu_seqlens_k, kv_bias)
+    out_no_bias = _attention_ref_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, False)
+    assert not torch.allclose(out_ref, out_no_bias)
     torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
 
 
