@@ -330,7 +330,6 @@ def _validate_sm120_fwd_support(
             supports_varlen_pack_gqa_splitkv = (
                 is_varlen
                 and page_table is None
-                and learnable_sink is None
                 and mask_mod is None
                 and block_sparse_tensors is None
                 and (
@@ -341,7 +340,6 @@ def _validate_sm120_fwd_support(
             supports_dense_pack_gqa_splitkv = (
                 not is_varlen
                 and page_table is None
-                and learnable_sink is None
                 and mask_mod is None
                 and block_sparse_tensors is None
                 and (
@@ -352,7 +350,6 @@ def _validate_sm120_fwd_support(
             supports_paged_pack_gqa_splitkv = (
                 page_table is not None
                 and has_seqused_k
-                and learnable_sink is None
                 and mask_mod is None
                 and block_sparse_tensors is None
                 and (
@@ -383,7 +380,10 @@ def _validate_sm120_fwd_support(
 
     if learnable_sink is not None:
         if num_splits != 1:
-            raise NotImplementedError(f"{prefix} does not support learnable_sink with SplitKV.")
+            if score_mod is not None or mask_mod is not None or aux_tensors is not None:
+                raise NotImplementedError(
+                    f"{prefix} does not support learnable_sink with SplitKV modifiers."
+                )
 
     # Extension hooks not included in the first native SM120 slice.
     if qv is not None:
@@ -877,6 +877,7 @@ def _flash_attn_fwd(
         sm120_q_in_regs if arch // 10 == 12 else None,
         "fwd_valid_tile_guard_v1",
         "fwd_varlen_splitkv_packgqa_store_v1" if is_varlen and is_split_kv and pack_gqa else None,
+        "fwd_splitkv_learnable_sink_v1" if is_split_kv and learnable_sink is not None else None,
         "fwd_sm120_splitkv_mha_v2" if arch // 10 == 12 else None,
         fa_logging.get_fa_log_level(),
     )

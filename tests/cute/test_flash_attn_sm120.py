@@ -274,6 +274,39 @@ def test_sm120_forward_validation_allows_paged_kv_pack_gqa_learnable_sink():
 
 
 @pytest.mark.parametrize(
+    "overrides",
+    [
+        {"num_splits": 2, "learnable_sink": object()},
+        {"num_splits": 2, "is_varlen": True, "learnable_sink": object()},
+        {
+            "num_splits": 2,
+            "page_table": object(),
+            "has_seqused_k": True,
+            "learnable_sink": object(),
+        },
+        {"num_splits": 2, "qhead_per_kvhead": 4, "pack_gqa": True, "learnable_sink": object()},
+        {
+            "num_splits": 2,
+            "is_varlen": True,
+            "qhead_per_kvhead": 4,
+            "pack_gqa": True,
+            "learnable_sink": object(),
+        },
+        {
+            "num_splits": 2,
+            "page_table": object(),
+            "has_seqused_k": True,
+            "qhead_per_kvhead": 4,
+            "pack_gqa": True,
+            "learnable_sink": object(),
+        },
+    ],
+)
+def test_sm120_forward_validation_allows_splitkv_learnable_sink(overrides):
+    _validate_sm120_fwd_support(**_valid_sm120_kwargs(**overrides))
+
+
+@pytest.mark.parametrize(
     "overrides, message",
     [
         (
@@ -318,7 +351,6 @@ def test_sm120_forward_validation_rejects_aux_tensor_combinations(overrides, mes
         {"score_mod": object()},
         {"mask_mod": object()},
         {"aux_tensors": [object()]},
-        {"learnable_sink": object()},
     ],
 )
 def test_sm120_forward_validation_rejects_varlen_pack_gqa_splitkv_extensions(overrides):
@@ -334,7 +366,6 @@ def test_sm120_forward_validation_rejects_varlen_pack_gqa_splitkv_extensions(ove
         {"score_mod": object()},
         {"mask_mod": object()},
         {"aux_tensors": [object()]},
-        {"learnable_sink": object()},
     ],
 )
 def test_sm120_forward_validation_rejects_dense_pack_gqa_splitkv_extensions(overrides):
@@ -350,7 +381,6 @@ def test_sm120_forward_validation_rejects_dense_pack_gqa_splitkv_extensions(over
         {"score_mod": object()},
         {"mask_mod": object()},
         {"aux_tensors": [object()]},
-        {"learnable_sink": object()},
         {"block_sparse_tensors": object()},
     ],
 )
@@ -370,7 +400,18 @@ def test_sm120_forward_validation_rejects_paged_pack_gqa_splitkv_extensions(over
 @pytest.mark.parametrize(
     "overrides, message",
     [
-        ({"learnable_sink": object(), "num_splits": 2}, "learnable_sink with SplitKV"),
+        (
+            {"learnable_sink": object(), "num_splits": 2, "score_mod": object()},
+            "learnable_sink with SplitKV modifiers",
+        ),
+        (
+            {"learnable_sink": object(), "num_splits": 2, "aux_tensors": [object()]},
+            "aux_tensors with SplitKV",
+        ),
+        (
+            {"learnable_sink": object(), "num_splits": 2, "mask_mod": object()},
+            "learnable_sink with SplitKV modifiers",
+        ),
         ({"learnable_sink": object(), "block_sparse_tensors": object()}, "block sparsity"),
     ],
 )
@@ -669,6 +710,37 @@ def test_sm120_forward_dense_learnable_sink_smoke(dtype, causal, num_heads_kv, p
         learnable_sink=learnable_sink,
         pack_gqa=pack_gqa,
         num_splits=1,
+        return_lse=True,
+    )
+    out_ref, _, lse_ref = attention_ref(
+        q, k, v, causal=causal, learnable_sink=learnable_sink, return_lse=True
+    )
+    torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(lse.float(), lse_ref.float(), atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] != 12,
+    reason="requires SM120 hardware",
+)
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("num_heads_q,num_heads_kv,pack_gqa", [(2, 2, False), (4, 1, True)])
+def test_sm120_forward_dense_splitkv_learnable_sink_smoke(causal, num_heads_q, num_heads_kv, pack_gqa):
+    torch.manual_seed(0)
+    batch_size, seqlen_q, seqlen_k, head_dim = 2, 129, 257, 64
+    q = torch.randn(batch_size, seqlen_q, num_heads_q, head_dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(batch_size, seqlen_k, num_heads_kv, head_dim, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(batch_size, seqlen_k, num_heads_kv, head_dim, device="cuda", dtype=torch.bfloat16)
+    learnable_sink = torch.randn(num_heads_q, device="cuda", dtype=torch.bfloat16)
+    out, lse = flash_attn_func(
+        q,
+        k,
+        v,
+        causal=causal,
+        learnable_sink=learnable_sink,
+        pack_gqa=pack_gqa,
+        num_splits=2,
         return_lse=True,
     )
     out_ref, _, lse_ref = attention_ref(
@@ -1403,6 +1475,55 @@ def test_sm120_forward_paged_kv_learnable_sink_smoke(dtype, causal, num_heads_q,
     torch.cuda.is_available() and torch.cuda.get_device_capability()[0] != 12,
     reason="requires SM120 hardware",
 )
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("num_heads_q,num_heads_kv,pack_gqa", [(2, 2, False), (4, 1, True)])
+def test_sm120_forward_paged_kv_splitkv_learnable_sink_smoke(causal, num_heads_q, num_heads_kv, pack_gqa):
+    torch.manual_seed(0)
+    batch_size, seqlen_q, seqlen_k, head_dim = 2, 129, 257, 64
+    q = torch.randn(batch_size, seqlen_q, num_heads_q, head_dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(batch_size, seqlen_k, num_heads_kv, head_dim, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(batch_size, seqlen_k, num_heads_kv, head_dim, device="cuda", dtype=torch.bfloat16)
+    cache_seqlens = torch.tensor([257, 193], device="cuda", dtype=torch.int32)
+    learnable_sink = torch.randn(num_heads_q, device="cuda", dtype=torch.bfloat16)
+    k_paged, v_paged, page_table = _make_paged_kv(k, v, page_size=64)
+    cu_seqlens_q = torch.arange(
+        0, (batch_size + 1) * seqlen_q, seqlen_q, device="cuda", dtype=torch.int32
+    )
+    out, lse = flash_attn_varlen_func(
+        q.reshape(batch_size * seqlen_q, num_heads_q, head_dim),
+        k_paged,
+        v_paged,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=None,
+        max_seqlen_q=seqlen_q,
+        max_seqlen_k=None,
+        seqused_k=cache_seqlens,
+        page_table=page_table,
+        causal=causal,
+        learnable_sink=learnable_sink,
+        pack_gqa=pack_gqa,
+        num_splits=2,
+        return_lse=True,
+    )
+    out_ref, lse_ref = _attention_ref_paged(
+        q,
+        k,
+        v,
+        cache_seqlens,
+        causal,
+        learnable_sink=learnable_sink,
+        return_lse=True,
+    )
+    out_ref = out_ref.reshape(batch_size * seqlen_q, num_heads_q, head_dim)
+    torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(lse.float(), lse_ref.float(), atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] != 12,
+    reason="requires SM120 hardware",
+)
 @pytest.mark.parametrize("feature", ["baseline", "learnable_sink", "score_mod_aux"])
 @pytest.mark.parametrize("causal", [False, True])
 def test_sm120_forward_paged_kv_pack_gqa_smoke(feature, causal):
@@ -1865,6 +1986,48 @@ def test_sm120_forward_varlen_learnable_sink_smoke(dtype, causal, num_heads_q, n
         causal=causal,
         learnable_sink=learnable_sink,
         pack_gqa=pack_gqa,
+        return_lse=True,
+    )
+    out_ref, lse_ref = _attention_ref_varlen_with_lse(
+        q, k, v, cu_seqlens_q, cu_seqlens_k, causal, learnable_sink=learnable_sink
+    )
+    torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
+    torch.testing.assert_close(lse.float(), lse_ref.float(), atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] != 12,
+    reason="requires SM120 hardware",
+)
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("num_heads_q,num_heads_kv,pack_gqa", [(2, 2, False), (4, 1, True)])
+def test_sm120_forward_varlen_splitkv_learnable_sink_smoke(causal, num_heads_q, num_heads_kv, pack_gqa):
+    torch.manual_seed(0)
+    q_lens = [17, 64, 129]
+    k_lens = [19, 63, 257]
+    cu_seqlens_q = torch.tensor(
+        [0, *torch.tensor(q_lens).cumsum(0).tolist()], device="cuda", dtype=torch.int32
+    )
+    cu_seqlens_k = torch.tensor(
+        [0, *torch.tensor(k_lens).cumsum(0).tolist()], device="cuda", dtype=torch.int32
+    )
+    q = torch.randn(sum(q_lens), num_heads_q, 64, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(sum(k_lens), num_heads_kv, 64, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(sum(k_lens), num_heads_kv, 64, device="cuda", dtype=torch.bfloat16)
+    learnable_sink = torch.randn(num_heads_q, device="cuda", dtype=torch.bfloat16)
+    out, lse = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max(q_lens),
+        max_seqlen_k=max(k_lens),
+        causal=causal,
+        learnable_sink=learnable_sink,
+        pack_gqa=pack_gqa,
+        num_splits=2,
         return_lse=True,
     )
     out_ref, lse_ref = _attention_ref_varlen_with_lse(
