@@ -338,7 +338,16 @@ def _validate_sm120_fwd_support(
                     or (score_mod is not None and aux_tensors is not None)
                 )
             )
-            if not supports_varlen_pack_gqa_splitkv:
+            supports_dense_pack_gqa_splitkv = (
+                not is_varlen
+                and page_table is None
+                and learnable_sink is None
+                and score_mod is None
+                and mask_mod is None
+                and aux_tensors is None
+                and block_sparse_tensors is None
+            )
+            if not (supports_varlen_pack_gqa_splitkv or supports_dense_pack_gqa_splitkv):
                 raise NotImplementedError(f"{prefix} only supports SplitKV with pack_gqa=False.")
         if block_sparse_tensors is not None:
             raise NotImplementedError(f"{prefix} does not support SplitKV with block sparsity.")
@@ -644,8 +653,8 @@ def _flash_attn_fwd(
             q_in_regs=sm120_q_in_regs,
         )
 
-    # TODO: fix GQA + SplitKV + non-varlen
-    if pack_gqa and num_splits != 1 and cu_seqlens_q is None:
+    # TODO: fix GQA + SplitKV + non-varlen outside the native SM120 path.
+    if arch // 10 != 12 and pack_gqa and num_splits != 1 and cu_seqlens_q is None:
         pack_gqa = False
     
     if pack_gqa and qv is not None and 128 % qhead_per_kvhead != 0:
