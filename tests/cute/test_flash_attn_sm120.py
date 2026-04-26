@@ -1,8 +1,8 @@
 import pytest
 import torch
 
-from score_mod_definitions import score_mod_times_two
-from mask_mod_definitions import cute_mini_causal_mask
+from score_mod_definitions import score_mod_batch_bias, score_mod_dual_buffer, score_mod_times_two
+from mask_mod_definitions import cute_document_mask, cute_ima_mask, cute_mini_causal_mask
 
 from flash_attn.cute.arch_policy import get_forward_arch_policy
 from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80
@@ -69,7 +69,6 @@ def test_sm120_forward_policy_keeps_native_path_separate():
         ({"num_splits": 0}, "explicit num_splits"),
         ({"page_table": object()}, "seqused_k"),
         ({"block_sparse_tensors": object()}, "block sparsity"),
-        ({"aux_tensors": [object()]}, "aux_tensors"),
         ({"learnable_sink": object()}, "learnable_sink"),
         ({"qv": object()}, "qv/MLA"),
         ({"tile_mn": (128, 192)}, "tile_mn"),
@@ -95,6 +94,27 @@ def test_sm120_forward_validation_rejects_out_of_scope_cases(overrides, message)
     ],
 )
 def test_sm120_forward_validation_rejects_splitkv_combinations(overrides, message):
+    with pytest.raises(NotImplementedError, match=message):
+        _validate_sm120_fwd_support(**_valid_sm120_kwargs(**overrides))
+
+
+def test_sm120_forward_validation_allows_dense_aux_tensors():
+    _validate_sm120_fwd_support(**_valid_sm120_kwargs(aux_tensors=[object()]))
+
+
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        ({"aux_tensors": [object()], "is_varlen": True}, "aux_tensors with varlen"),
+        ({"aux_tensors": [object()], "num_splits": 2}, "aux_tensors with SplitKV"),
+        (
+            {"aux_tensors": [object()], "page_table": object(), "has_seqused_k": True},
+            "aux_tensors with paged KV",
+        ),
+        ({"aux_tensors": [object()], "block_sparse_tensors": object()}, "block sparsity"),
+    ],
+)
+def test_sm120_forward_validation_rejects_aux_tensor_combinations(overrides, message):
     with pytest.raises(NotImplementedError, match=message):
         _validate_sm120_fwd_support(**_valid_sm120_kwargs(**overrides))
 
@@ -261,6 +281,46 @@ def test_sm120_forward_dense_score_mod_smoke(dtype, causal):
     torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] != 12,
+    reason="requires SM120 hardware",
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("num_heads_kv", [1, 2])
+@pytest.mark.parametrize("score_mod_name", ["batch_bias", "dual_buffer"])
+def test_sm120_forward_dense_score_mod_aux_tensors_smoke(dtype, num_heads_kv, score_mod_name):
+    torch.manual_seed(0)
+    batch_size, seqlen_q, seqlen_k, num_heads_q, head_dim = 2, 129, 127, 4, 64
+    q = torch.randn(batch_size, seqlen_q, num_heads_q, head_dim, device="cuda", dtype=dtype)
+    k = torch.randn(batch_size, seqlen_k, num_heads_kv, head_dim, device="cuda", dtype=dtype)
+    v = torch.randn(batch_size, seqlen_k, num_heads_kv, head_dim, device="cuda", dtype=dtype)
+    if score_mod_name == "batch_bias":
+        score_mod = score_mod_batch_bias
+        aux_tensors = [torch.randn(batch_size, device="cuda", dtype=dtype)]
+    elif score_mod_name == "dual_buffer":
+        score_mod = score_mod_dual_buffer
+        aux_tensors = [
+            torch.randn(num_heads_q, device="cuda", dtype=dtype),
+            torch.randn(seqlen_q, device="cuda", dtype=dtype),
+        ]
+    else:
+        raise AssertionError(f"Unexpected score_mod_name: {score_mod_name}")
+
+    out, _ = flash_attn_func(
+        q,
+        k,
+        v,
+        causal=False,
+        score_mod=score_mod,
+        aux_tensors=aux_tensors,
+        pack_gqa=False,
+        num_splits=1,
+    )
+    out_ref, _ = attention_ref(q, k, v, causal=False)
+    torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
+
+
 def _mini_causal_mask_ref(q, k, v):
     if q.shape[2] != k.shape[2]:
         repeats = q.shape[2] // k.shape[2]
@@ -273,6 +333,29 @@ def _mini_causal_mask_ref(q, k, v):
     scores = scores.masked_fill(~mask, float("-inf"))
     attn = torch.softmax(scores, dim=-1).to(v.dtype)
     return torch.einsum("bhts,bshd->bthd", attn, v)
+
+
+def _dense_mask_ref(q, k, v, mask):
+    if q.shape[2] != k.shape[2]:
+        repeats = q.shape[2] // k.shape[2]
+        k = k.repeat_interleave(repeats, dim=2)
+        v = v.repeat_interleave(repeats, dim=2)
+    scores = torch.einsum("bthd,bshd->bhts", q.float() / (q.shape[-1] ** 0.5), k.float())
+    scores = scores.masked_fill(~mask, float("-inf"))
+    attn = torch.softmax(scores, dim=-1).to(v.dtype)
+    return torch.einsum("bhts,bshd->bthd", attn, v)
+
+
+def _document_mask_ref(q, k, v, doc_ids):
+    q_doc = doc_ids[:, :, : q.shape[1]].unsqueeze(-1)
+    k_doc = doc_ids[:, :, : k.shape[1]].unsqueeze(-2)
+    return _dense_mask_ref(q, k, v, q_doc == k_doc)
+
+
+def _ima_mask_ref(q, k, v, threshold):
+    kv_idx = torch.arange(k.shape[1], device=k.device)
+    mask = (kv_idx >= threshold).view(1, 1, 1, k.shape[1])
+    return _dense_mask_ref(q, k, v, mask)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
@@ -290,6 +373,50 @@ def test_sm120_forward_dense_mask_mod_smoke():
     )
 
     out_ref = _mini_causal_mask_ref(q, k, v)
+    torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] != 12,
+    reason="requires SM120 hardware",
+)
+@pytest.mark.parametrize("num_heads_kv", [1, 2])
+@pytest.mark.parametrize("mask_mod_name", ["document", "ima"])
+def test_sm120_forward_dense_mask_mod_aux_tensors_smoke(num_heads_kv, mask_mod_name):
+    torch.manual_seed(0)
+    batch_size, seqlen_q, seqlen_k, num_heads_q, head_dim = 2, 129, 127, 4, 64
+    q = torch.randn(
+        batch_size, seqlen_q, num_heads_q, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    k = torch.randn(
+        batch_size, seqlen_k, num_heads_kv, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    v = torch.randn_like(k)
+    if mask_mod_name == "document":
+        mask_mod = cute_document_mask
+        doc_pattern = torch.arange(max(seqlen_q, seqlen_k), device="cuda", dtype=torch.int32) % 7
+        doc_ids = doc_pattern.view(1, 1, -1).expand(batch_size, num_heads_q, -1).contiguous()
+        aux_tensors = [doc_ids]
+        out_ref = _document_mask_ref(q, k, v, doc_ids)
+    elif mask_mod_name == "ima":
+        mask_mod = cute_ima_mask
+        threshold = torch.arange(seqlen_k, device="cuda", dtype=torch.int32) // 2
+        aux_tensors = [threshold]
+        out_ref = _ima_mask_ref(q, k, v, threshold)
+    else:
+        raise AssertionError(f"Unexpected mask_mod_name: {mask_mod_name}")
+
+    out, _ = flash_attn_func(
+        q,
+        k,
+        v,
+        causal=False,
+        mask_mod=mask_mod,
+        aux_tensors=aux_tensors,
+        pack_gqa=False,
+        num_splits=1,
+    )
     torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
 
 

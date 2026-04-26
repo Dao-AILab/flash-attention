@@ -335,9 +335,15 @@ def _validate_sm120_fwd_support(
     if block_sparse_tensors is not None:
         raise NotImplementedError(f"{prefix} does not support block sparsity.")
 
-    # Extension hooks not included in the first native SM120 slice.
     if aux_tensors is not None:
-        raise NotImplementedError(f"{prefix} does not support aux_tensors.")
+        if is_varlen:
+            raise NotImplementedError(f"{prefix} does not support aux_tensors with varlen.")
+        if num_splits != 1:
+            raise NotImplementedError(f"{prefix} does not support aux_tensors with SplitKV.")
+        if page_table is not None:
+            raise NotImplementedError(f"{prefix} does not support aux_tensors with paged KV.")
+
+    # Extension hooks not included in the first native SM120 slice.
     if learnable_sink is not None:
         raise NotImplementedError(f"{prefix} does not support learnable_sink.")
     if qv is not None:
