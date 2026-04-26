@@ -302,6 +302,8 @@ def _validate_sm120_fwd_support(
     page_table: Optional[torch.Tensor],
     block_sparse_tensors: Optional[BlockSparseTensorsTorch],
     tile_mn: Optional[Tuple[int, int]],
+    num_stages: int,
+    q_in_regs: bool,
 ) -> None:
     """Validate the intentionally small native SM120 FA4 forward surface."""
     prefix = "SM120 FA4 forward native tensor path"
@@ -342,6 +344,10 @@ def _validate_sm120_fwd_support(
             f"{prefix} only supports tile_mn in "
             "{(64, 64), (64, 128), (128, 64), (128, 128)}."
         )
+    if num_stages not in (1, 2):
+        raise NotImplementedError(f"{prefix} only supports num_stages in {{1, 2}}.")
+    if q_in_regs and num_stages != 1:
+        raise NotImplementedError(f"{prefix} only supports q_in_regs with num_stages=1.")
 
 def _flash_attn_fwd(
     q: torch.Tensor,
@@ -380,6 +386,8 @@ def _flash_attn_fwd(
     k_descale: Optional[torch.Tensor] = None,
     v_descale: Optional[torch.Tensor] = None,
     gather_kv_indices: Optional[torch.Tensor] = None,
+    _sm120_num_stages: Optional[int] = None,
+    _sm120_q_in_regs: Optional[bool] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for FlashAttention.
 
@@ -546,29 +554,8 @@ def _flash_attn_fwd(
         or seqused_k is not None
     )
 
-    if arch // 10 == 12:
-        if not pack_gqa_was_explicit:
-            pack_gqa = False
-        _validate_sm120_fwd_support(
-            dtype=q.dtype,
-            head_dim=head_dim,
-            head_dim_v=head_dim_v,
-            requires_grad=requires_grad,
-            is_varlen=is_varlen,
-            is_local=local,
-            softcap=softcap,
-            score_mod=score_mod,
-            mask_mod=mask_mod,
-            aux_tensors=aux_tensors,
-            learnable_sink=learnable_sink,
-            qv=qv,
-            pack_gqa=pack_gqa,
-            pack_gqa_was_explicit=pack_gqa_was_explicit,
-            num_splits=num_splits,
-            page_table=page_table,
-            block_sparse_tensors=block_sparse_tensors,
-            tile_mn=tile_mn,
-        )
+    if arch // 10 == 12 and not pack_gqa_was_explicit:
+        pack_gqa = False
 
     requested_use_clc_scheduler = utils._get_use_clc_scheduler_default()
     requested_disable_2cta = utils._get_disable_2cta_default()
@@ -597,6 +584,38 @@ def _flash_attn_fwd(
         mma_pv_is_rs = fwd_cfg.mma_pv_is_rs
     if intra_wg_overlap is None:
         intra_wg_overlap = fwd_cfg.intra_wg_overlap
+
+    sm120_num_stages = 1
+    sm120_q_in_regs = False
+    if _sm120_num_stages is not None or _sm120_q_in_regs is not None:
+        if arch // 10 != 12:
+            raise NotImplementedError("SM120 pipeline tuning overrides are only supported on SM120.")
+        sm120_num_stages = 1 if _sm120_num_stages is None else _sm120_num_stages
+        sm120_q_in_regs = False if _sm120_q_in_regs is None else _sm120_q_in_regs
+
+    if arch // 10 == 12:
+        _validate_sm120_fwd_support(
+            dtype=q.dtype,
+            head_dim=head_dim,
+            head_dim_v=head_dim_v,
+            requires_grad=requires_grad,
+            is_varlen=is_varlen,
+            is_local=local,
+            softcap=softcap,
+            score_mod=score_mod,
+            mask_mod=mask_mod,
+            aux_tensors=aux_tensors,
+            learnable_sink=learnable_sink,
+            qv=qv,
+            pack_gqa=pack_gqa,
+            pack_gqa_was_explicit=pack_gqa_was_explicit,
+            num_splits=num_splits,
+            page_table=page_table,
+            block_sparse_tensors=block_sparse_tensors,
+            tile_mn=tile_mn,
+            num_stages=sm120_num_stages,
+            q_in_regs=sm120_q_in_regs,
+        )
 
     # TODO: fix GQA + SplitKV + non-varlen
     if pack_gqa and num_splits != 1 and cu_seqlens_q is None:
@@ -801,6 +820,8 @@ def _flash_attn_fwd(
         gather_kv_length,
         sparse_kv,
         disable_sparse_kv_bitmask,
+        sm120_num_stages if arch // 10 == 12 else None,
+        sm120_q_in_regs if arch // 10 == 12 else None,
         fa_logging.get_fa_log_level(),
     )
     window_size_left_arg = Int32(window_size_left) if window_size_left is not None else None
@@ -982,15 +1003,16 @@ def _flash_attn_fwd(
                 head_dim_v,
                 tile_m,
                 tile_n,
-                1,
+                sm120_num_stages,
                 num_threads,
                 causal,
-                Q_in_regs=False,
+                Q_in_regs=sm120_q_in_regs,
             ):
                 raise NotImplementedError(
                     "SM120 FA4 forward native tensor path cannot implement "
                     f"dtype={q.dtype}, head_dim={head_dim}, head_dim_v={head_dim_v}, "
-                    f"tile_m={tile_m}, tile_n={tile_n}, num_threads={num_threads}."
+                    f"tile_m={tile_m}, tile_n={tile_n}, num_stages={sm120_num_stages}, "
+                    f"num_threads={num_threads}, q_in_regs={sm120_q_in_regs}."
                 )
             fa_fwd = FlashAttentionForwardSm120(
                 dtype,
@@ -1002,9 +1024,9 @@ def _flash_attn_fwd(
                 pack_gqa=pack_gqa,
                 tile_m=tile_m,
                 tile_n=tile_n,
-                num_stages=1,
+                num_stages=sm120_num_stages,
                 num_threads=num_threads,
-                Q_in_regs=False,
+                Q_in_regs=sm120_q_in_regs,
                 score_mod=score_mod,
                 mask_mod=mask_mod,
                 has_aux_tensors=aux_tensors is not None,

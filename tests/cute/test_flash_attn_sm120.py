@@ -35,6 +35,8 @@ def _valid_sm120_kwargs(**overrides):
         page_table=None,
         block_sparse_tensors=None,
         tile_mn=None,
+        num_stages=1,
+        q_in_regs=False,
     )
     kwargs.update(overrides)
     return kwargs
@@ -70,6 +72,8 @@ def test_sm120_forward_policy_keeps_native_path_separate():
         ({"learnable_sink": object()}, "learnable_sink"),
         ({"qv": object()}, "qv/MLA"),
         ({"tile_mn": (128, 192)}, "tile_mn"),
+        ({"num_stages": 3}, "num_stages"),
+        ({"num_stages": 2, "q_in_regs": True}, "q_in_regs"),
     ],
 )
 def test_sm120_forward_validation_rejects_out_of_scope_cases(overrides, message):

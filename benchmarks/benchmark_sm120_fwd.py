@@ -164,6 +164,8 @@ def make_fwd_fn(args, tensors, tile_mn):
             pack_gqa=pack_gqa,
             return_lse=False,
             out=tensors["out"],
+            _sm120_num_stages=args.num_stages,
+            _sm120_q_in_regs=args.q_in_regs,
         )[0]
 
     return fwd
@@ -244,7 +246,8 @@ def run_one(args, dtype: torch.dtype, tile_mn: tuple[int, int] | None) -> float 
         f"dtype={dtype} tile_mn={tile_label(tile_mn)} "
         f"{describe_shape(args, tensors)} "
         f"causal={args.causal} window=({args.window_left},{args.window_right}) "
-        f"softcap={args.softcap} pack_gqa={args.pack_gqa}"
+        f"softcap={args.softcap} pack_gqa={args.pack_gqa} "
+        f"num_stages={args.num_stages} q_in_regs={args.q_in_regs}"
     )
     if args.check:
         check_output(args, tensors, fwd())
@@ -317,6 +320,8 @@ def parse_args():
         help="Semicolon-separated tile overrides, e.g. 'auto;128x64;64x128'.",
     )
     parser.add_argument("--pack-gqa", choices=["auto", "true", "false"], default="auto")
+    parser.add_argument("--num-stages", type=int, choices=[1, 2], default=1)
+    parser.add_argument("--q-in-regs", action="store_true")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--repeats", type=int, default=10)
     parser.add_argument(
