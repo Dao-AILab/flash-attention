@@ -326,8 +326,6 @@ def _validate_sm120_fwd_support(
     if num_splits != 1:
         if num_splits < 1:
             raise NotImplementedError(f"{prefix} requires explicit num_splits >= 1.")
-        if qhead_per_kvhead != 1:
-            raise NotImplementedError(f"{prefix} only supports SplitKV for MHA.")
         if pack_gqa:
             raise NotImplementedError(f"{prefix} only supports SplitKV with pack_gqa=False.")
         if page_table is not None:
