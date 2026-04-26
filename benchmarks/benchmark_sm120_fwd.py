@@ -96,7 +96,63 @@ def make_varlen_lengths(seqlen: int, batch_size: int, mode: str) -> list[int]:
     raise ValueError(f"Unsupported varlen mode: {mode}")
 
 
+def make_paged_kv(k: torch.Tensor, v: torch.Tensor, page_size: int):
+    batch_size, seqlen_k, num_heads_kv, head_dim = k.shape
+    num_pages_per_seq = (seqlen_k + page_size - 1) // page_size
+    num_pages = batch_size * num_pages_per_seq
+    k_paged = torch.zeros(
+        num_pages, page_size, num_heads_kv, head_dim, device=k.device, dtype=k.dtype
+    )
+    v_paged = torch.zeros_like(k_paged)
+    page_table = torch.empty(
+        batch_size, num_pages_per_seq, device=k.device, dtype=torch.int32
+    )
+    for batch_idx in range(batch_size):
+        for page_idx in range(num_pages_per_seq):
+            global_page_idx = batch_idx * num_pages_per_seq + page_idx
+            page_table[batch_idx, page_idx] = global_page_idx
+            start = page_idx * page_size
+            end = min(start + page_size, seqlen_k)
+            if start < end:
+                k_paged[global_page_idx, : end - start] = k[batch_idx, start:end]
+                v_paged[global_page_idx, : end - start] = v[batch_idx, start:end]
+    return k_paged, v_paged, page_table
+
+
 def make_tensors(args, dtype: torch.dtype):
+    if args.paged_kv:
+        q_lens = (
+            make_varlen_lengths(args.seqlen_q, args.batch_size, args.varlen_mode)
+            if args.varlen
+            else [args.seqlen_q] * args.batch_size
+        )
+        k_lens = make_varlen_lengths(args.seqlen_k, args.batch_size, args.varlen_mode)
+        q = torch.randn(sum(q_lens), args.nheads, args.headdim, device="cuda", dtype=dtype)
+        k_ref = torch.randn(
+            args.batch_size,
+            args.seqlen_k,
+            args.nheads_kv,
+            args.headdim,
+            device="cuda",
+            dtype=dtype,
+        )
+        v_ref = torch.randn_like(k_ref)
+        k_paged, v_paged, page_table = make_paged_kv(k_ref, v_ref, args.page_size)
+        out = torch.empty_like(q)
+        return {
+            "q": q,
+            "k": k_paged,
+            "v": v_paged,
+            "out": out,
+            "k_ref": k_ref,
+            "v_ref": v_ref,
+            "cu_seqlens_q": make_cu_seqlens(q_lens),
+            "seqused_k": torch.tensor(k_lens, device="cuda", dtype=torch.int32),
+            "page_table": page_table,
+            "q_lens": q_lens,
+            "k_lens": k_lens,
+        }
+
     if args.varlen:
         q_lens = make_varlen_lengths(args.seqlen_q, args.batch_size, args.varlen_mode)
         k_lens = make_varlen_lengths(args.seqlen_k, args.batch_size, args.varlen_mode)
@@ -153,8 +209,10 @@ def make_fwd_fn(args, tensors, tile_mn):
             tensors["v"],
             cu_seqlens_q=tensors.get("cu_seqlens_q"),
             cu_seqlens_k=tensors.get("cu_seqlens_k"),
-            max_seqlen_q=args.seqlen_q if args.varlen else None,
-            max_seqlen_k=args.seqlen_k if args.varlen else None,
+            seqused_k=tensors.get("seqused_k"),
+            max_seqlen_q=args.seqlen_q if args.varlen or args.paged_kv else None,
+            max_seqlen_k=None if args.paged_kv else (args.seqlen_k if args.varlen else None),
+            page_table=tensors.get("page_table"),
             causal=args.causal,
             softcap=args.softcap,
             window_size_left=args.window_left,
@@ -169,6 +227,27 @@ def make_fwd_fn(args, tensors, tile_mn):
         )[0]
 
     return fwd
+
+
+def attention_ref_paged(args, tensors):
+    q = tensors["q"]
+    k = tensors["k_ref"]
+    v = tensors["v_ref"]
+    cu_seqlens_q = tensors["cu_seqlens_q"]
+    cache_seqlens = tensors["seqused_k"]
+    outs = []
+    for batch_idx, seqlen_k in enumerate(cache_seqlens.tolist()):
+        q_start, q_end = cu_seqlens_q[batch_idx : batch_idx + 2].tolist()
+        out, _ = attention_ref(
+            q[q_start:q_end].unsqueeze(0),
+            k[batch_idx : batch_idx + 1, :seqlen_k],
+            v[batch_idx : batch_idx + 1, :seqlen_k],
+            causal=args.causal,
+            window_size=(args.window_left, args.window_right),
+            softcap=args.softcap,
+        )
+        outs.append(out.squeeze(0))
+    return torch.cat(outs, dim=0)
 
 
 def attention_ref_varlen(args, tensors):
@@ -195,7 +274,9 @@ def attention_ref_varlen(args, tensors):
 
 def check_output(args, tensors, actual) -> None:
     window_size = (args.window_left, args.window_right)
-    if args.varlen:
+    if args.paged_kv:
+        expected = attention_ref_paged(args, tensors)
+    elif args.varlen:
         expected = attention_ref_varlen(args, tensors)
     else:
         expected, _ = attention_ref(
@@ -227,6 +308,12 @@ def tile_label(tile_mn: tuple[int, int] | None) -> str:
 
 
 def describe_shape(args, tensors) -> str:
+    if args.paged_kv:
+        return (
+            f"paged_kv page_size={args.page_size} q_lens={tensors['q_lens']} "
+            f"cache_seqlens={tensors['k_lens']} nheads={args.nheads} "
+            f"nheads_kv={args.nheads_kv} headdim={args.headdim}"
+        )
     if not args.varlen:
         return (
             f"batch={args.batch_size} seqlen_q={args.seqlen_q} seqlen_k={args.seqlen_k} "
@@ -313,6 +400,8 @@ def parse_args():
     parser.add_argument("--softcap", type=float, default=0.0)
     parser.add_argument("--varlen", action="store_true")
     parser.add_argument("--varlen-mode", choices=VARLEN_MODES, default="staggered")
+    parser.add_argument("--paged-kv", action="store_true")
+    parser.add_argument("--page-size", type=int, default=64)
     parser.add_argument(
         "--tile-mn",
         type=parse_tile_mns,
