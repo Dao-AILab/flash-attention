@@ -29,6 +29,7 @@ def _valid_sm120_kwargs(**overrides):
         aux_tensors=None,
         learnable_sink=None,
         qv=None,
+        qhead_per_kvhead=1,
         pack_gqa=False,
         pack_gqa_was_explicit=False,
         num_splits=1,
@@ -65,7 +66,7 @@ def test_sm120_forward_policy_keeps_native_path_separate():
         ({"requires_grad": True}, "forward-only"),
         ({"head_dim": 192, "head_dim_v": 192}, "head_dim"),
         ({"head_dim": 64, "head_dim_v": 128}, "head_dim == head_dim_v"),
-        ({"num_splits": 2}, "SplitKV"),
+        ({"num_splits": 0}, "explicit num_splits"),
         ({"page_table": object()}, "seqused_k"),
         ({"block_sparse_tensors": object()}, "block sparsity"),
         ({"aux_tensors": [object()]}, "aux_tensors"),
@@ -77,6 +78,20 @@ def test_sm120_forward_policy_keeps_native_path_separate():
     ],
 )
 def test_sm120_forward_validation_rejects_out_of_scope_cases(overrides, message):
+    with pytest.raises(NotImplementedError, match=message):
+        _validate_sm120_fwd_support(**_valid_sm120_kwargs(**overrides))
+
+
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        ({"num_splits": 2, "qhead_per_kvhead": 2}, "SplitKV for MHA"),
+        ({"num_splits": 2, "pack_gqa": True}, "pack_gqa=False"),
+        ({"num_splits": 2, "page_table": object(), "has_seqused_k": True}, "paged KV"),
+        ({"num_splits": 2, "block_sparse_tensors": object()}, "block sparsity"),
+    ],
+)
+def test_sm120_forward_validation_rejects_splitkv_combinations(overrides, message):
     with pytest.raises(NotImplementedError, match=message):
         _validate_sm120_fwd_support(**_valid_sm120_kwargs(**overrides))
 
@@ -121,6 +136,25 @@ def test_sm120_forward_dense_mha_tile_boundary_shapes(
     k = torch.randn(batch_size, seqlen_k, 2, head_dim, device="cuda", dtype=dtype)
     v = torch.randn(batch_size, seqlen_k, 2, head_dim, device="cuda", dtype=dtype)
     out, _ = flash_attn_func(q, k, v, causal=causal, pack_gqa=False, num_splits=1)
+    out_ref, _ = attention_ref(q, k, v, causal=causal)
+    torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] != 12,
+    reason="requires SM120 hardware",
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("num_splits", [2, 3])
+def test_sm120_forward_dense_mha_splitkv_smoke(dtype, head_dim, causal, num_splits):
+    torch.manual_seed(0)
+    q = torch.randn(1, 129, 2, head_dim, device="cuda", dtype=dtype)
+    k = torch.randn(1, 257, 2, head_dim, device="cuda", dtype=dtype)
+    v = torch.randn(1, 257, 2, head_dim, device="cuda", dtype=dtype)
+    out, _ = flash_attn_func(q, k, v, causal=causal, pack_gqa=False, num_splits=num_splits)
     out_ref, _ = attention_ref(q, k, v, causal=causal)
     torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
 
@@ -325,6 +359,43 @@ def test_sm120_forward_varlen_dense_smoke(dtype, head_dim, causal, num_heads_q, 
         max_seqlen_k=max(k_lens),
         causal=causal,
         pack_gqa=False,
+    )
+    out_ref = _attention_ref_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, causal)
+    torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] != 12,
+    reason="requires SM120 hardware",
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("causal", [False, True])
+def test_sm120_forward_varlen_mha_splitkv_smoke(dtype, head_dim, causal):
+    torch.manual_seed(0)
+    q_lens = [33, 97, 129]
+    k_lens = [65, 131, 257]
+    cu_seqlens_q = torch.tensor(
+        [0, *torch.tensor(q_lens).cumsum(0).tolist()], device="cuda", dtype=torch.int32
+    )
+    cu_seqlens_k = torch.tensor(
+        [0, *torch.tensor(k_lens).cumsum(0).tolist()], device="cuda", dtype=torch.int32
+    )
+    q = torch.randn(sum(q_lens), 2, head_dim, device="cuda", dtype=dtype)
+    k = torch.randn(sum(k_lens), 2, head_dim, device="cuda", dtype=dtype)
+    v = torch.randn(sum(k_lens), 2, head_dim, device="cuda", dtype=dtype)
+    out, _ = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max(q_lens),
+        max_seqlen_k=max(k_lens),
+        causal=causal,
+        pack_gqa=False,
+        num_splits=2,
     )
     out_ref = _attention_ref_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, causal)
     torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)

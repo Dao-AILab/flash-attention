@@ -296,6 +296,7 @@ def _validate_sm120_fwd_support(
     aux_tensors: Optional[list[torch.Tensor]],
     learnable_sink: Optional[torch.Tensor],
     qv: Optional[torch.Tensor],
+    qhead_per_kvhead: int,
     pack_gqa: bool,
     pack_gqa_was_explicit: bool,
     num_splits: int,
@@ -323,7 +324,16 @@ def _validate_sm120_fwd_support(
 
     # Work decomposition and storage variants.
     if num_splits != 1:
-        raise NotImplementedError(f"{prefix} does not support SplitKV.")
+        if num_splits < 1:
+            raise NotImplementedError(f"{prefix} requires explicit num_splits >= 1.")
+        if qhead_per_kvhead != 1:
+            raise NotImplementedError(f"{prefix} only supports SplitKV for MHA.")
+        if pack_gqa:
+            raise NotImplementedError(f"{prefix} only supports SplitKV with pack_gqa=False.")
+        if page_table is not None:
+            raise NotImplementedError(f"{prefix} does not support SplitKV with paged KV.")
+        if block_sparse_tensors is not None:
+            raise NotImplementedError(f"{prefix} does not support SplitKV with block sparsity.")
     if page_table is not None and not has_seqused_k:
         raise NotImplementedError(f"{prefix} requires seqused_k with paged KV.")
     if block_sparse_tensors is not None:
@@ -606,6 +616,7 @@ def _flash_attn_fwd(
             aux_tensors=aux_tensors,
             learnable_sink=learnable_sink,
             qv=qv,
+            qhead_per_kvhead=qhead_per_kvhead,
             pack_gqa=pack_gqa,
             pack_gqa_was_explicit=pack_gqa_was_explicit,
             num_splits=num_splits,
@@ -823,6 +834,7 @@ def _flash_attn_fwd(
         sm120_num_stages if arch // 10 == 12 else None,
         sm120_q_in_regs if arch // 10 == 12 else None,
         "fwd_valid_tile_guard_v1",
+        "fwd_sm120_splitkv_mha_v2" if arch // 10 == 12 else None,
         fa_logging.get_fa_log_level(),
     )
     dtype_name = dtype.__name__.lower()
@@ -1031,6 +1043,7 @@ def _flash_attn_fwd(
                 qhead_per_kvhead,
                 is_causal=causal,
                 is_local=local,
+                is_split_kv=is_split_kv,
                 pack_gqa=pack_gqa,
                 tile_m=tile_m,
                 tile_n=tile_n,
