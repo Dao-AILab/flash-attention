@@ -130,6 +130,29 @@ def test_sm120_forward_validation_allows_splitkv_score_mod_aux_tensors():
     )
 
 
+def test_sm120_forward_validation_allows_paged_kv_score_mod_aux_tensors():
+    _validate_sm120_fwd_support(
+        **_valid_sm120_kwargs(
+            page_table=object(),
+            has_seqused_k=True,
+            score_mod=object(),
+            aux_tensors=[object()],
+        )
+    )
+
+
+def test_sm120_forward_validation_allows_paged_kv_splitkv_score_mod_aux_tensors():
+    _validate_sm120_fwd_support(
+        **_valid_sm120_kwargs(
+            num_splits=2,
+            page_table=object(),
+            has_seqused_k=True,
+            score_mod=object(),
+            aux_tensors=[object()],
+        )
+    )
+
+
 def test_sm120_forward_validation_allows_varlen_mask_mod_without_aux_tensors():
     _validate_sm120_fwd_support(**_valid_sm120_kwargs(is_varlen=True, mask_mod=object()))
 
@@ -163,6 +186,16 @@ def test_sm120_forward_validation_allows_varlen_learnable_sink():
         ),
         (
             {"aux_tensors": [object()], "page_table": object(), "has_seqused_k": True},
+            "aux_tensors with paged KV",
+        ),
+        (
+            {
+                "aux_tensors": [object()],
+                "page_table": object(),
+                "has_seqused_k": True,
+                "score_mod": object(),
+                "mask_mod": object(),
+            },
             "aux_tensors with paged KV",
         ),
         ({"aux_tensors": [object()], "block_sparse_tensors": object()}, "block sparsity"),
@@ -771,6 +804,25 @@ def _attention_ref_paged(q, k, v, cache_seqlens, causal, window_size=(None, None
     return torch.cat(outs, dim=0)
 
 
+def _attention_ref_paged_kv_bias(q, k, v, cache_seqlens, kv_bias):
+    outs = []
+    for batch_idx, seqlen_k in enumerate(cache_seqlens.tolist()):
+        q_slice = q[batch_idx]
+        k_slice = k[batch_idx, :seqlen_k]
+        v_slice = v[batch_idx, :seqlen_k]
+        if q_slice.shape[1] != k_slice.shape[1]:
+            repeats = q_slice.shape[1] // k_slice.shape[1]
+            k_slice = k_slice.repeat_interleave(repeats, dim=1)
+            v_slice = v_slice.repeat_interleave(repeats, dim=1)
+        scores = torch.einsum(
+            "thd,shd->hts", q_slice.float() / (q_slice.shape[-1] ** 0.5), k_slice.float()
+        )
+        scores = scores + kv_bias[:seqlen_k].float().view(1, 1, -1)
+        attn = torch.softmax(scores, dim=-1).to(v_slice.dtype)
+        outs.append(torch.einsum("hts,shd->thd", attn, v_slice).unsqueeze(0))
+    return torch.cat(outs, dim=0)
+
+
 def _attention_ref_paged_varlen(
     q, k, v, cu_seqlens_q, cache_seqlens, causal, window_size=(None, None), softcap=0.0
 ):
@@ -1053,6 +1105,54 @@ def test_sm120_forward_paged_kv_unequal_head_dim_v_smoke():
     out_ref = _attention_ref_paged(q, k, v, cache_seqlens, False).reshape(
         batch_size * seqlen_q, 4, head_dim_v
     )
+    torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] != 12,
+    reason="requires SM120 hardware",
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("num_splits", [1, 2])
+@pytest.mark.parametrize("num_heads_q,num_heads_kv", [(2, 2), (4, 1)])
+def test_sm120_forward_paged_kv_score_mod_aux_tensors_smoke(
+    dtype, num_splits, num_heads_q, num_heads_kv
+):
+    torch.manual_seed(0)
+    batch_size, seqlen_q, seqlen_k, head_dim = 2, 129, 257, 64
+    q = torch.randn(batch_size, seqlen_q, num_heads_q, head_dim, device="cuda", dtype=dtype)
+    k = torch.randn(batch_size, seqlen_k, num_heads_kv, head_dim, device="cuda", dtype=dtype)
+    v = torch.randn(batch_size, seqlen_k, num_heads_kv, head_dim, device="cuda", dtype=dtype)
+    cache_seqlens = torch.tensor([257, 193], device="cuda", dtype=torch.int32)
+    kv_bias = torch.randn(seqlen_k, device="cuda", dtype=dtype)
+    k_paged, v_paged, page_table = _make_paged_kv(k, v, page_size=64)
+    cu_seqlens_q = torch.arange(
+        0, (batch_size + 1) * seqlen_q, seqlen_q, device="cuda", dtype=torch.int32
+    )
+    out, _ = flash_attn_varlen_func(
+        q.reshape(batch_size * seqlen_q, num_heads_q, head_dim),
+        k_paged,
+        v_paged,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=None,
+        max_seqlen_q=seqlen_q,
+        max_seqlen_k=None,
+        seqused_k=cache_seqlens,
+        page_table=page_table,
+        causal=False,
+        score_mod=score_mod_global_kv_bias,
+        aux_tensors=[kv_bias],
+        pack_gqa=False,
+        num_splits=num_splits,
+    )
+    out_ref = _attention_ref_paged_kv_bias(q, k, v, cache_seqlens, kv_bias).reshape(
+        batch_size * seqlen_q, num_heads_q, head_dim
+    )
+    out_no_bias = _attention_ref_paged(q, k, v, cache_seqlens, False).reshape(
+        batch_size * seqlen_q, num_heads_q, head_dim
+    )
+    assert not torch.allclose(out_ref, out_no_bias)
     torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
 
 

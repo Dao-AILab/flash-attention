@@ -340,7 +340,7 @@ def _validate_sm120_fwd_support(
             raise NotImplementedError(f"{prefix} does not support aux_tensors with varlen mask_mod.")
         if num_splits != 1 and (score_mod is None or mask_mod is not None):
             raise NotImplementedError(f"{prefix} does not support aux_tensors with SplitKV.")
-        if page_table is not None:
+        if page_table is not None and (score_mod is None or mask_mod is not None):
             raise NotImplementedError(f"{prefix} does not support aux_tensors with paged KV.")
 
     if learnable_sink is not None:
