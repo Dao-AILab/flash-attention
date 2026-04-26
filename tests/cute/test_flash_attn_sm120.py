@@ -4,7 +4,11 @@ import torch
 from flash_attn.cute.arch_policy import get_forward_arch_policy
 from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80
 from flash_attn.cute.flash_fwd_sm120 import FlashAttentionForwardSm120
-from flash_attn.cute.interface import _validate_sm120_fwd_support, flash_attn_func
+from flash_attn.cute.interface import (
+    _validate_sm120_fwd_support,
+    flash_attn_func,
+    flash_attn_varlen_func,
+)
 from flash_attn.cute.testing import attention_ref
 
 
@@ -53,7 +57,6 @@ def test_sm120_forward_policy_keeps_native_path_separate():
     [
         ({"dtype": torch.float32}, "only supports fp16 and bf16"),
         ({"requires_grad": True}, "forward-only"),
-        ({"is_varlen": True}, "fixed-length"),
         ({"head_dim": 192, "head_dim_v": 192}, "head_dim"),
         ({"head_dim": 64, "head_dim_v": 128}, "head_dim == head_dim_v"),
         ({"pack_gqa": True, "pack_gqa_was_explicit": True}, "packed GQA"),
@@ -141,6 +144,54 @@ def test_sm120_forward_dense_local_window_smoke(window_size, causal):
         q, k, v, causal=causal, window_size=window_size, pack_gqa=False, num_splits=1
     )
     out_ref, _ = attention_ref(q, k, v, causal=causal, window_size=window_size)
+    torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
+
+
+def _attention_ref_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, causal, window_size=(None, None)):
+    outs = []
+    for batch_idx in range(cu_seqlens_q.numel() - 1):
+        q_start, q_end = cu_seqlens_q[batch_idx : batch_idx + 2].tolist()
+        k_start, k_end = cu_seqlens_k[batch_idx : batch_idx + 2].tolist()
+        out, _ = attention_ref(
+            q[q_start:q_end].unsqueeze(0),
+            k[k_start:k_end].unsqueeze(0),
+            v[k_start:k_end].unsqueeze(0),
+            causal=causal,
+            window_size=window_size,
+        )
+        outs.append(out.squeeze(0))
+    return torch.cat(outs, dim=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] != 12,
+    reason="requires SM120 hardware",
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("causal", [False, True])
+def test_sm120_forward_varlen_dense_smoke(dtype, head_dim, causal):
+    torch.manual_seed(0)
+    q_lens = [17, 64, 129]
+    k_lens = [19, 63, 127]
+    cu_seqlens_q = torch.tensor([0, *torch.tensor(q_lens).cumsum(0).tolist()], device="cuda", dtype=torch.int32)
+    cu_seqlens_k = torch.tensor([0, *torch.tensor(k_lens).cumsum(0).tolist()], device="cuda", dtype=torch.int32)
+    q = torch.randn(sum(q_lens), 2, head_dim, device="cuda", dtype=dtype)
+    k = torch.randn(sum(k_lens), 2, head_dim, device="cuda", dtype=dtype)
+    v = torch.randn(sum(k_lens), 2, head_dim, device="cuda", dtype=dtype)
+    out, _ = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max(q_lens),
+        max_seqlen_k=max(k_lens),
+        causal=causal,
+        pack_gqa=False,
+    )
+    out_ref = _attention_ref_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, causal)
     torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
 
 

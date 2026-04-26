@@ -312,9 +312,6 @@ def _validate_sm120_fwd_support(
     if requires_grad:
         raise NotImplementedError(f"{prefix} is forward-only; backward is not supported.")
 
-    # Sequence and attention variants.
-    if is_varlen:
-        raise NotImplementedError(f"{prefix} only supports fixed-length dense tensors.")
     # Head dimensions and packing.
     if head_dim != head_dim_v:
         raise NotImplementedError(f"{prefix} requires head_dim == head_dim_v.")
@@ -2293,6 +2290,7 @@ def flash_attn_varlen_func(
         pack_gqa,
         deterministic,
         score_mod,
+        None,  # score_mod_bwd
         aux_tensors,
         return_lse,
     )
