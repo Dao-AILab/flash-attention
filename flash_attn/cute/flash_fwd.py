@@ -731,7 +731,9 @@ class FlashAttentionForwardWarpMma(FlashAttentionForwardBase):
         mQ/mK/mV/mO has same data types(supports fp16 and bf16) and same layout:
         (batch_size, seqlen_q, num_head, head_dim):(_, _, _, 1)
         """
-        assert learnable_sink is None, "Learnable sink is not supported in this kernel"
+        assert learnable_sink is None or self.forward_policy.name == "sm120", (
+            "Learnable sink is only supported in the SM120 warp-MMA kernel"
+        )
         self._check_type(
             *(t.element_type if t is not None else None for t in (mQ, mK, mV, mO, mLSE, mCuSeqlensQ, mCuSeqlensK, mSeqUsedQ, mSeqUsedK))
         )
@@ -834,6 +836,7 @@ class FlashAttentionForwardWarpMma(FlashAttentionForwardBase):
             SharedStorage,
             tile_sched_params,
             TileScheduler,
+            learnable_sink,
             aux_tensors,
             fastdiv_mods,
         ).launch(
@@ -875,6 +878,7 @@ class FlashAttentionForwardWarpMma(FlashAttentionForwardBase):
         SharedStorage: cutlass.Constexpr,
         tile_sched_params,
         TileScheduler: cutlass.Constexpr[Callable],
+        learnable_sink: Optional[cute.Tensor] = None,
         aux_tensors=None,
         fastdiv_mods=None,
     ):
@@ -1223,8 +1227,21 @@ class FlashAttentionForwardWarpMma(FlashAttentionForwardBase):
                 smem_pipe_write = self.advance_pipeline(smem_pipe_write)
             # TODO: local
 
+            sink_val = None
+            if const_expr(learnable_sink is not None):
+                if const_expr(not self.pack_gqa):
+                    sink_val = Float32(learnable_sink[num_head])
+                else:
+                    sink_val = cute.make_rmem_tensor_like(softmax.row_max, Float32)
+                    cS = cute.make_identity_tensor((self.tile_m, self.tile_n))
+                    tScS_mn = layout_utils.reshape_acc_to_mn(thr_mma_qk.partition_C(cS))
+                    for r in cutlass.range(cute.size(sink_val), unroll_full=True):
+                        row = m_block * self.tile_m + tScS_mn[r][0]
+                        q_head_idx = row % self.qhead_per_kvhead + num_head * self.qhead_per_kvhead
+                        sink_val[r] = Float32(learnable_sink[q_head_idx])
+
             # normalize acc_O by row_sum and calculate the lse
-            row_scale = softmax.finalize()
+            row_scale = softmax.finalize(sink_val=sink_val)
             softmax.rescale_O(acc_O, row_scale)
 
             # ///////////////////////////////////////////////////////////////////////////////
@@ -1248,17 +1265,18 @@ class FlashAttentionForwardWarpMma(FlashAttentionForwardBase):
                 batch_size,
                 split_idx,
             )
-            if empty_split:
-                self.store_empty_split_lse(
-                    mLSE,
-                    seqlen,
-                    tiled_mma_pv,
-                    tidx,
-                    m_block,
-                    num_head,
-                    batch_size,
-                    split_idx,
-                )
+            if const_expr(self.is_split_kv):
+                if empty_split:
+                    self.store_empty_split_lse(
+                        mLSE,
+                        seqlen,
+                        tiled_mma_pv,
+                        tidx,
+                        m_block,
+                        num_head,
+                        batch_size,
+                        split_idx,
+                    )
 
     @cute.jit
     def compute_one_n_block(

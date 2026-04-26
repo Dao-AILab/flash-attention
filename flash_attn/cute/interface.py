@@ -343,9 +343,15 @@ def _validate_sm120_fwd_support(
         if page_table is not None:
             raise NotImplementedError(f"{prefix} does not support aux_tensors with paged KV.")
 
-    # Extension hooks not included in the first native SM120 slice.
     if learnable_sink is not None:
-        raise NotImplementedError(f"{prefix} does not support learnable_sink.")
+        if is_varlen:
+            raise NotImplementedError(f"{prefix} does not support learnable_sink with varlen.")
+        if num_splits != 1:
+            raise NotImplementedError(f"{prefix} does not support learnable_sink with SplitKV.")
+        if page_table is not None:
+            raise NotImplementedError(f"{prefix} does not support learnable_sink with paged KV.")
+
+    # Extension hooks not included in the first native SM120 slice.
     if qv is not None:
         raise NotImplementedError(f"{prefix} does not support qv/MLA.")
 

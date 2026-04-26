@@ -134,6 +134,8 @@ class Softmax(ParamsBase):
             if cutlass.const_expr(sink_val is not None):
                 sink_val_cur = sink_val if not isinstance(sink_val, cute.Tensor) else sink_val[r]
                 LOG2_E = math.log2(math.e)
+                if row_max[r] == -Float32.inf:
+                    row_max[r] = sink_val_cur * LOG2_E / scale_log2
                 row_sum[r] += cute.math.exp2(
                     sink_val_cur * LOG2_E - row_max[r] * scale_log2, fastmath=True
                 )
