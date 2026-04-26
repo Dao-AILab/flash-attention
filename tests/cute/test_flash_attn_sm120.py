@@ -198,6 +198,19 @@ def test_sm120_forward_validation_allows_dense_pack_gqa_splitkv():
     )
 
 
+def test_sm120_forward_validation_allows_dense_pack_gqa_splitkv_score_mod_aux_tensors():
+    _validate_sm120_fwd_support(
+        **_valid_sm120_kwargs(
+            is_varlen=False,
+            num_splits=2,
+            qhead_per_kvhead=4,
+            pack_gqa=True,
+            score_mod=object(),
+            aux_tensors=[object()],
+        )
+    )
+
+
 def test_sm120_forward_validation_allows_varlen_mask_mod_without_aux_tensors():
     _validate_sm120_fwd_support(**_valid_sm120_kwargs(is_varlen=True, mask_mod=object()))
 
@@ -504,6 +517,34 @@ def test_sm120_forward_dense_splitkv_score_mod_aux_tensors_smoke(dtype, num_head
         score_mod=score_mod_global_kv_bias,
         aux_tensors=[kv_bias],
         pack_gqa=False,
+        num_splits=2,
+    )
+    out_ref = _dense_kv_bias_ref(q, k, v, kv_bias)
+    out_no_bias, _ = attention_ref(q, k, v, causal=False)
+    assert not torch.allclose(out_ref, out_no_bias)
+    torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] != 12,
+    reason="requires SM120 hardware",
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_sm120_forward_dense_packed_gqa_splitkv_score_mod_aux_tensors_smoke(dtype):
+    torch.manual_seed(0)
+    q = torch.randn(1, 129, 4, 64, device="cuda", dtype=dtype)
+    k = torch.randn(1, 257, 1, 64, device="cuda", dtype=dtype)
+    v = torch.randn(1, 257, 1, 64, device="cuda", dtype=dtype)
+    kv_bias = torch.randn(k.shape[1], device="cuda", dtype=dtype)
+    out, _ = flash_attn_func(
+        q,
+        k,
+        v,
+        causal=False,
+        score_mod=score_mod_global_kv_bias,
+        aux_tensors=[kv_bias],
+        pack_gqa=True,
         num_splits=2,
     )
     out_ref = _dense_kv_bias_ref(q, k, v, kv_bias)
