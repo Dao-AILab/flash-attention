@@ -346,8 +346,6 @@ def _validate_sm120_fwd_support(
     if learnable_sink is not None:
         if num_splits != 1:
             raise NotImplementedError(f"{prefix} does not support learnable_sink with SplitKV.")
-        if page_table is not None and pack_gqa:
-            raise NotImplementedError(f"{prefix} does not support learnable_sink with paged KV and pack_gqa.")
 
     # Extension hooks not included in the first native SM120 slice.
     if qv is not None:

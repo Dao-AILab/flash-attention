@@ -141,6 +141,17 @@ def test_sm120_forward_validation_allows_paged_kv_score_mod_aux_tensors():
     )
 
 
+def test_sm120_forward_validation_allows_paged_kv_pack_gqa():
+    _validate_sm120_fwd_support(
+        **_valid_sm120_kwargs(
+            page_table=object(),
+            has_seqused_k=True,
+            qhead_per_kvhead=4,
+            pack_gqa=True,
+        )
+    )
+
+
 def test_sm120_forward_validation_allows_paged_kv_splitkv_score_mod_aux_tensors():
     _validate_sm120_fwd_support(
         **_valid_sm120_kwargs(
@@ -174,6 +185,18 @@ def test_sm120_forward_validation_allows_paged_kv_learnable_sink():
             has_seqused_k=True,
             learnable_sink=object(),
             pack_gqa=False,
+        )
+    )
+
+
+def test_sm120_forward_validation_allows_paged_kv_pack_gqa_learnable_sink():
+    _validate_sm120_fwd_support(
+        **_valid_sm120_kwargs(
+            page_table=object(),
+            has_seqused_k=True,
+            qhead_per_kvhead=4,
+            pack_gqa=True,
+            learnable_sink=object(),
         )
     )
 
@@ -221,15 +244,6 @@ def test_sm120_forward_validation_rejects_aux_tensor_combinations(overrides, mes
     "overrides, message",
     [
         ({"learnable_sink": object(), "num_splits": 2}, "learnable_sink with SplitKV"),
-        (
-            {
-                "learnable_sink": object(),
-                "page_table": object(),
-                "has_seqused_k": True,
-                "pack_gqa": True,
-            },
-            "learnable_sink with paged KV and pack_gqa",
-        ),
         ({"learnable_sink": object(), "block_sparse_tensors": object()}, "block sparsity"),
     ],
 )
@@ -839,7 +853,7 @@ def _attention_ref_paged(
     return out
 
 
-def _attention_ref_paged_kv_bias(q, k, v, cache_seqlens, kv_bias):
+def _attention_ref_paged_kv_bias(q, k, v, cache_seqlens, kv_bias, causal=False):
     outs = []
     for batch_idx, seqlen_k in enumerate(cache_seqlens.tolist()):
         q_slice = q[batch_idx]
@@ -853,6 +867,11 @@ def _attention_ref_paged_kv_bias(q, k, v, cache_seqlens, kv_bias):
             "thd,shd->hts", q_slice.float() / (q_slice.shape[-1] ** 0.5), k_slice.float()
         )
         scores = scores + kv_bias[:seqlen_k].float().view(1, 1, -1)
+        if causal:
+            q_idx = torch.arange(q.shape[1], device=q.device)[:, None]
+            kv_idx = torch.arange(seqlen_k, device=k.device)[None, :]
+            offset = seqlen_k - q.shape[1]
+            scores = scores.masked_fill((kv_idx > q_idx + offset).unsqueeze(0), float("-inf"))
         attn = torch.softmax(scores, dim=-1).to(v_slice.dtype)
         outs.append(torch.einsum("hts,shd->thd", attn, v_slice).unsqueeze(0))
     return torch.cat(outs, dim=0)
@@ -1190,6 +1209,70 @@ def test_sm120_forward_paged_kv_learnable_sink_smoke(dtype, causal, num_heads_q,
     out_ref = out_ref.reshape(batch_size * seqlen_q, num_heads_q, head_dim)
     torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
     torch.testing.assert_close(lse.float(), lse_ref.float(), atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] != 12,
+    reason="requires SM120 hardware",
+)
+@pytest.mark.parametrize("feature", ["baseline", "learnable_sink", "score_mod_aux"])
+@pytest.mark.parametrize("causal", [False, True])
+def test_sm120_forward_paged_kv_pack_gqa_smoke(feature, causal):
+    torch.manual_seed(0)
+    batch_size, seqlen_q, seqlen_k, num_heads_q, num_heads_kv, head_dim = 2, 129, 257, 4, 1, 64
+    q = torch.randn(batch_size, seqlen_q, num_heads_q, head_dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(batch_size, seqlen_k, num_heads_kv, head_dim, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(batch_size, seqlen_k, num_heads_kv, head_dim, device="cuda", dtype=torch.bfloat16)
+    cache_seqlens = torch.tensor([257, 193], device="cuda", dtype=torch.int32)
+    k_paged, v_paged, page_table = _make_paged_kv(k, v, page_size=64)
+    cu_seqlens_q = torch.arange(
+        0, (batch_size + 1) * seqlen_q, seqlen_q, device="cuda", dtype=torch.int32
+    )
+    kwargs = {}
+    if feature == "learnable_sink":
+        learnable_sink = torch.randn(num_heads_q, device="cuda", dtype=torch.bfloat16)
+        kwargs["learnable_sink"] = learnable_sink
+        kwargs["return_lse"] = True
+        out_ref, lse_ref = _attention_ref_paged(
+            q,
+            k,
+            v,
+            cache_seqlens,
+            causal,
+            learnable_sink=learnable_sink,
+            return_lse=True,
+        )
+    elif feature == "score_mod_aux":
+        kv_bias = torch.randn(seqlen_k, device="cuda", dtype=torch.bfloat16)
+        kwargs["score_mod"] = score_mod_global_kv_bias
+        kwargs["aux_tensors"] = [kv_bias]
+        out_ref = _attention_ref_paged_kv_bias(q, k, v, cache_seqlens, kv_bias, causal)
+        out_no_bias = _attention_ref_paged(q, k, v, cache_seqlens, causal)
+        assert not torch.allclose(out_ref, out_no_bias)
+    elif feature == "baseline":
+        out_ref = _attention_ref_paged(q, k, v, cache_seqlens, causal)
+    else:
+        raise AssertionError(f"Unexpected feature: {feature}")
+
+    out, lse = flash_attn_varlen_func(
+        q.reshape(batch_size * seqlen_q, num_heads_q, head_dim),
+        k_paged,
+        v_paged,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=None,
+        max_seqlen_q=seqlen_q,
+        max_seqlen_k=None,
+        seqused_k=cache_seqlens,
+        page_table=page_table,
+        causal=causal,
+        pack_gqa=True,
+        **kwargs,
+    )
+    out_ref = out_ref.reshape(batch_size * seqlen_q, num_heads_q, head_dim)
+    torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
+    if feature == "learnable_sink":
+        torch.testing.assert_close(lse.float(), lse_ref.float(), atol=5e-2, rtol=5e-2)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
