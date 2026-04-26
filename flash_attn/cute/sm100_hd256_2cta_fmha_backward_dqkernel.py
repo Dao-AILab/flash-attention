@@ -1,5 +1,6 @@
 # Copyright (c) 2025, Siyu Wang, Shengbin Di, Yuxi Chi, Johnsonms, Linfeng Zheng, Haoyan Huang, Lanbo Li, Yun Zhong, Man Yuan, Minmin Sun, Yong Li, Wei Lin.
 
+from functools import partial
 from typing import Type, Tuple, Optional
 
 import cuda.bindings.driver as cuda
@@ -25,9 +26,9 @@ from flash_attn.cute.tile_scheduler import (
     Sm100FmhaClcDynamicTileScheduler as FmhaClcDynamicTileScheduler,
     Sm100FmhaClcDynamicTileSchedulerParams as FmhaClcDynamicTileSchedulerParams,
 )
-from flash_attn.cute.mask import (
-    Sm100FusedMask as FusedMask,
-)
+from flash_attn.cute.block_info import BlockInfo
+from flash_attn.cute.mask import AttentionMask
+from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.tile_scheduler import SM100_TMEM_CAPACITY_COLUMNS
 
 
@@ -1018,18 +1019,29 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                     # ((atom_v, rest_v), RestN, RestK)
                     tKTgKT = tKgK_dkl[None, None, None, mma_block_coord[2]]
 
-                    seqlen_kv_loop_start, seqlen_kv_loop_steps = (
-                        FusedMask.get_trip_start_count_via_block_info(
-                            mma_block_coord,
-                            self.qk_mma_tiler,
-                            seqlen_q,
-                            seqlen_k,
-                            self.is_causal,
-                            self.is_local,
-                            window_size_left,
-                            window_size_right,
-                        )
+                    seqlen_info = SeqlenInfoQK.create(
+                        batch_coord,
+                        mQ_qdl.shape[0],
+                        mK_kdl.shape[0],
+                        cum_seqlen_q,
+                        cum_seqlen_k,
+                        None,
+                        None,
+                        self.qk_mma_tiler[0],
+                        self.qk_mma_tiler[1],
                     )
+                    block_info = BlockInfo(
+                        self.qk_mma_tiler[0],
+                        self.qk_mma_tiler[1],
+                        self.is_causal,
+                        self.is_local,
+                        window_size_left=window_size_left,
+                        window_size_right=window_size_right,
+                    )
+                    seqlen_kv_loop_start, seqlen_kv_loop_end = block_info.get_n_block_min_max(
+                        seqlen_info, mma_block_coord[0], Int32(0), Int32(1)
+                    )
+                    seqlen_kv_loop_steps = seqlen_kv_loop_end - seqlen_kv_loop_start
                     # LSE
                     lse_handle = load_lse_producer.acquire_and_advance()
                     # 32 threads loading 128 values of 32b each
@@ -1048,22 +1060,17 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                             self.cta_tiler[0] * curr_block_coord[0]
                             + thread_idx * async_copy_num_elts
                         )
-                        if cute.elem_less(LSE_idx + i, seqlen_q):
-                            cute.copy(
-                                atom_async_copy,
-                                LSE_for_copy[None, LSE_idx + i, curr_block_coord[2]],
-                                sLSE_for_copy[
-                                    None,
-                                    thread_idx * async_copy_num_elts + i,
-                                    lse_handle.index,
-                                ],
-                            )
-                        else:
+                        # LSE/dPsum buffers are padded by preprocess. Copy padded rows too:
+                        # padded LSE is +inf, so invalid Q rows produce P = 0.
+                        cute.copy(
+                            atom_async_copy,
+                            LSE_for_copy[None, LSE_idx + i, curr_block_coord[2]],
                             sLSE_for_copy[
                                 None,
                                 thread_idx * async_copy_num_elts + i,
                                 lse_handle.index,
-                            ].fill(0.0)
+                            ],
+                        )
                     lse_handle.commit()
 
                     sum_odo_handle = load_sum_odo_producer.acquire_and_advance()
@@ -1074,22 +1081,15 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                             self.cta_tiler[0] * curr_block_coord[0]
                             + thread_idx * async_copy_num_elts
                         )
-                        if cute.elem_less(sum_OdO_idx + i, seqlen_q):
-                            cute.copy(
-                                atom_async_copy,
-                                sum_OdO_for_copy[None, sum_OdO_idx + i, curr_block_coord[2]],
-                                sSum_OdO_for_copy[
-                                    None,
-                                    thread_idx * async_copy_num_elts + i,
-                                    sum_odo_handle.index,
-                                ],
-                            )
-                        else:
+                        cute.copy(
+                            atom_async_copy,
+                            sum_OdO_for_copy[None, sum_OdO_idx + i, curr_block_coord[2]],
                             sSum_OdO_for_copy[
                                 None,
                                 thread_idx * async_copy_num_elts + i,
                                 sum_odo_handle.index,
-                            ].fill(0.0)
+                            ],
+                        )
                     sum_odo_handle.commit()
 
                     # Q
@@ -1183,18 +1183,29 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                         cuseqlen_k = cum_seqlen_k[batch_coord]
                         seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
 
-                    seqlen_kv_loop_start, seqlen_kv_loop_steps = (
-                        FusedMask.get_trip_start_count_via_block_info(
-                            mma_block_coord,
-                            self.qk_mma_tiler,
-                            seqlen_q,
-                            seqlen_k,
-                            self.is_causal,
-                            self.is_local,
-                            window_size_left,
-                            window_size_right,
-                        )
+                    seqlen_info = SeqlenInfoQK.create(
+                        batch_coord,
+                        mQ_qdl.shape[0],
+                        mK_kdl.shape[0],
+                        cum_seqlen_q,
+                        cum_seqlen_k,
+                        None,
+                        None,
+                        self.qk_mma_tiler[0],
+                        self.qk_mma_tiler[1],
                     )
+                    block_info = BlockInfo(
+                        self.qk_mma_tiler[0],
+                        self.qk_mma_tiler[1],
+                        self.is_causal,
+                        self.is_local,
+                        window_size_left=window_size_left,
+                        window_size_right=window_size_right,
+                    )
+                    seqlen_kv_loop_start, seqlen_kv_loop_end = block_info.get_n_block_min_max(
+                        seqlen_info, mma_block_coord[0], Int32(0), Int32(1)
+                    )
+                    seqlen_kv_loop_steps = seqlen_kv_loop_end - seqlen_kv_loop_start
 
                     cta_rank_in_cluster = cute.arch.make_warp_uniform(
                         cute.arch.block_idx_in_cluster()
@@ -1814,40 +1825,66 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                         cuseqlen_k = cum_seqlen_k[batch_coord]
                         seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
 
-                    start_count, trip_count = FusedMask.get_trip_start_count_via_block_info(
-                        mma_block_coord,
-                        self.qk_mma_tiler,
-                        seqlen_q,
-                        seqlen_k,
+                    seqlen_info = SeqlenInfoQK.create(
+                        batch_coord,
+                        mQ_qdl.shape[0],
+                        mK_kdl.shape[0],
+                        cum_seqlen_q,
+                        cum_seqlen_k,
+                        None,
+                        None,
+                        self.qk_mma_tiler[0],
+                        self.qk_mma_tiler[1],
+                    )
+                    mask = AttentionMask(
+                        self.qk_mma_tiler[0],
+                        self.qk_mma_tiler[1],
+                        seqlen_info,
+                        window_size_left=window_size_left,
+                        window_size_right=window_size_right,
+                    )
+                    shared_mask_kwargs = dict(
+                        m_block=mma_block_coord[0],
+                        thr_mma=qk_thr_mma,
+                        mask_local=self.is_local,
+                        batch_idx=batch_coord,
+                        head_idx=curr_block_coord[2][0],
+                        aux_tensors=None,
+                    )
+                    mask_fn = partial(
+                        mask.apply_mask_sm100,
+                        mask_mod=None,
+                        fastdiv_mods=(None, None),
+                        head_divmod=None,
+                        mask_causal=self.is_causal,
+                        **shared_mask_kwargs,
+                    )
+                    block_info = BlockInfo(
+                        self.qk_mma_tiler[0],
+                        self.qk_mma_tiler[1],
                         self.is_causal,
                         self.is_local,
-                        window_size_left,
-                        window_size_right,
+                        window_size_left=window_size_left,
+                        window_size_right=window_size_right,
                     )
-                    end_count = start_count + trip_count
+                    n_block_min, n_block_max = block_info.get_n_block_min_max(
+                        seqlen_info, mma_block_coord[0], Int32(0), Int32(1)
+                    )
                     if cutlass.const_expr(self.use_semantic_trip_range):
                         n_block_min_causal_local_mask, n_block_min_before_local_mask = (
-                            FusedMask.get_trip_mask_bounds_via_block_info(
-                                mma_block_coord,
-                                self.qk_mma_tiler,
-                                seqlen_q,
-                                seqlen_k,
-                                self.is_causal,
-                                self.is_local,
-                                window_size_left,
-                                window_size_right,
-                            )
+                            block_info.get_n_block_min_causal_local_mask(
+                                seqlen_info, mma_block_coord[0], n_block_min
+                            ),
+                            block_info.get_n_block_min_before_local_mask(
+                                seqlen_info, mma_block_coord[0], n_block_min
+                            ),
                         )
 
-                    cS_base = cute.make_identity_tensor(
-                        (self.qk_mma_tiler[0], self.qk_mma_tiler[1])
-                    )
+                    cS_base = cute.make_identity_tensor((self.qk_mma_tiler[0], self.qk_mma_tiler[1]))
                     cS = cute.domain_offset((mma_block_coord[0] * self.qk_mma_tiler[0], 0), cS_base)
                     tScS = qk_thr_mma.partition_C(cS)
 
-                    cdP_base = cute.make_identity_tensor(
-                        (self.dov_mma_tiler[0], self.dov_mma_tiler[1])
-                    )
+                    cdP_base = cute.make_identity_tensor((self.dov_mma_tiler[0], self.dov_mma_tiler[1]))
                     cdP = cute.domain_offset(
                         (mma_block_coord[0] * self.dov_mma_tiler[0], 0), cdP_base
                     )
@@ -1855,24 +1892,20 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
 
                     lse_handle = load_lse_consumer.wait_and_advance()
                     sum_odo_handle = load_sum_odo_consumer.wait_and_advance()
-                    for step in cutlass.range(start_count, end_count, 1, unroll=1):
-                        cS_iter = cute.domain_offset((0, step * self.qk_mma_tiler[1]), cS)
-                        tScS_iter = qk_thr_mma.partition_C(cS_iter)
-
-                        cdP_iter = cute.domain_offset((0, step * self.dov_mma_tiler[1]), cdP)
-
-                        tdPcdP_iter = dov_thr_mma.partition_C(cdP_iter)
-
+                    for n_tile in cutlass.range(n_block_max - n_block_min, unroll=1):
+                        n_block = n_block_min + n_tile
                         # Si, dPi -> dSi
                         if cutlass.const_expr(self.use_semantic_trip_range):
                             need_apply_mask = (
-                                step >= n_block_min_causal_local_mask
-                                or step < n_block_min_before_local_mask
+                                n_block >= n_block_min_causal_local_mask
+                                or n_block < n_block_min_before_local_mask
                             )
+                            mask_seqlen = False
                         else:
-                            need_apply_mask = step == end_count - 1
+                            need_apply_mask = n_block == n_block_max - 1
+                            mask_seqlen = True
                         mma_s_consumer, mma_dp_consumer, ds_mma_producer = self.compute_step(
-                            (need_apply_mask, window_size_left, window_size_right),
+                            (mask_fn, need_apply_mask, mask_seqlen),
                             (
                                 seqlen_q,
                                 seqlen_k,
@@ -1881,7 +1914,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                                 curr_block_coord[0],
                                 varlen,
                             ),
-                            (tStS, tScS_iter, tdPtdP, tdPcdP_iter, sLSE, sSum_OdO),
+                            (tStS, tScS, tdPtdP, tdPcdP, sLSE, sSum_OdO),
                             (
                                 mma_s_consumer,
                                 mma_dp_consumer,
@@ -1889,7 +1922,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                                 lse_handle,
                                 sum_odo_handle,
                             ),
-                            step,
+                            n_block,
                         )
                     lse_handle.release()
                     sum_odo_handle.release()
@@ -1910,7 +1943,6 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                     curr_block_coord[2],
                 )
                 batch_coord = curr_block_coord[2][1]
-                # cute.printf("batch_coord={}", batch_coord)
                 seqlen_q = mQ_qdl.shape[0]
                 seqlen_k = mK_kdl.shape[0]
                 continue_cond = False
@@ -2014,9 +2046,9 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         value_args: Tuple,
         tensor_args: Tuple,
         pipeline_args: Tuple,
-        step: Int32,
+        n_block: Int32,
     ) -> Tuple[Float32, Float32, pipeline.PipelineConsumer, pipeline.PipelineProducer]:
-        need_apply_mask, window_size_left, window_size_right = mask_args
+        mask_fn, need_apply_mask, mask_seqlen = mask_args
         seqlen_q, seqlen_k, scale_softmax, batch_coord, block_m_idx, varlen = value_args
         tStS, tScS, tdPtdP, tdPcdP, sLSE, sSum_OdO = tensor_args
         mma_s_consumer, mma_dp_consumer, ds_mma_producer, lse_handle, sum_odo_handle = pipeline_args
@@ -2039,16 +2071,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         cute.arch.fence_view_async_tmem_load()
         s_handle.release()
         if need_apply_mask:
-            FusedMask.apply_mask_via_causal_local(
-                tTMEM_LOADrS,
-                tTMEM_LOADcS,
-                seqlen_q,
-                seqlen_k,
-                self.use_semantic_trip_range,
-                self.is_causal,
-                self.is_local,
-                window_size_left,
-                window_size_right,
+            partial(mask_fn, thr_tmem_load=thr_load, mask_seqlen=mask_seqlen)(
+                tTMEM_LOADrS, n_block=n_block
             )
 
         log2_e = cutlass.Float32(math.log2(math.e))
