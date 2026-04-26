@@ -115,12 +115,39 @@ def test_sm120_forward_validation_allows_dense_block_sparsity():
     )
 
 
+def test_sm120_forward_validation_allows_dense_block_sparsity_pack_gqa_broadcast():
+    block_sparse_tensors = type(
+        "BlockSparseTestTensors",
+        (),
+        {"mask_block_cnt": torch.empty(1, 1, 1, dtype=torch.int32)},
+    )()
+    _validate_sm120_fwd_support(
+        **_valid_sm120_kwargs(
+            mask_mod=object(),
+            block_sparse_tensors=block_sparse_tensors,
+            qhead_per_kvhead=4,
+            pack_gqa=True,
+        )
+    )
+
+
 @pytest.mark.parametrize(
     "overrides, message",
     [
         ({"is_varlen": True}, "varlen or paged KV"),
         ({"page_table": object(), "has_seqused_k": True}, "varlen or paged KV"),
-        ({"pack_gqa": True, "qhead_per_kvhead": 4}, "pack_gqa"),
+        (
+            {
+                "pack_gqa": True,
+                "qhead_per_kvhead": 4,
+                "block_sparse_tensors": type(
+                    "BlockSparseTestTensors",
+                    (),
+                    {"mask_block_cnt": torch.empty(1, 4, 1, dtype=torch.int32)},
+                )(),
+            },
+            "broadcasted block sparsity",
+        ),
         ({"mask_mod": None}, "mask_mod"),
         ({"score_mod": object()}, "score/aux or sink"),
         ({"aux_tensors": [object()]}, "score/aux or sink"),
@@ -1109,6 +1136,38 @@ def test_sm120_forward_dense_block_sparse_smoke(num_heads_kv):
         causal=False,
         mask_mod=cute_mini_causal_mask,
         pack_gqa=False,
+        **block_sparse_kwargs,
+    )
+    out_ref = _mini_causal_mask_ref(q, k, v)
+    torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] != 12,
+    reason="requires SM120 hardware",
+)
+def test_sm120_forward_dense_block_sparse_pack_gqa_smoke():
+    torch.manual_seed(0)
+    batch_size, seqlen_q, seqlen_k, num_heads_q, num_heads_kv, head_dim = 1, 129, 257, 4, 1, 64
+    q = torch.randn(batch_size, seqlen_q, num_heads_q, head_dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(batch_size, seqlen_k, num_heads_kv, head_dim, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(batch_size, seqlen_k, num_heads_kv, head_dim, device="cuda", dtype=torch.bfloat16)
+    _, mask_mod_flex = get_mask_pair("mini_causal")
+    block_sparse_kwargs = _make_block_sparse_kwargs(
+        mask_mod_flex,
+        batch_size,
+        1,
+        seqlen_q,
+        seqlen_k,
+    )
+    out, _ = flash_attn_func(
+        q,
+        k,
+        v,
+        causal=False,
+        mask_mod=cute_mini_causal_mask,
+        pack_gqa=True,
         **block_sparse_kwargs,
     )
     out_ref = _mini_causal_mask_ref(q, k, v)

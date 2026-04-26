@@ -370,8 +370,10 @@ def _validate_sm120_fwd_support(
     if block_sparse_tensors is not None:
         if is_varlen or page_table is not None:
             raise NotImplementedError(f"{prefix} does not support block sparsity with varlen or paged KV.")
-        if pack_gqa:
-            raise NotImplementedError(f"{prefix} does not support block sparsity with pack_gqa.")
+        if pack_gqa and block_sparse_tensors.mask_block_cnt.shape[1] != 1:
+            raise NotImplementedError(
+                f"{prefix} requires broadcasted block sparsity metadata with pack_gqa."
+            )
         if mask_mod is None:
             raise NotImplementedError(f"{prefix} requires mask_mod with block sparsity.")
         if score_mod is not None or aux_tensors is not None or learnable_sink is not None:
