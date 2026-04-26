@@ -237,15 +237,16 @@ def _attention_ref_varlen(
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("head_dim", [64, 128])
 @pytest.mark.parametrize("causal", [False, True])
-def test_sm120_forward_varlen_dense_smoke(dtype, head_dim, causal):
+@pytest.mark.parametrize("num_heads_q,num_heads_kv", [(2, 2), (4, 2), (4, 1)])
+def test_sm120_forward_varlen_dense_smoke(dtype, head_dim, causal, num_heads_q, num_heads_kv):
     torch.manual_seed(0)
     q_lens = [17, 64, 129]
     k_lens = [19, 63, 127]
     cu_seqlens_q = torch.tensor([0, *torch.tensor(q_lens).cumsum(0).tolist()], device="cuda", dtype=torch.int32)
     cu_seqlens_k = torch.tensor([0, *torch.tensor(k_lens).cumsum(0).tolist()], device="cuda", dtype=torch.int32)
-    q = torch.randn(sum(q_lens), 2, head_dim, device="cuda", dtype=dtype)
-    k = torch.randn(sum(k_lens), 2, head_dim, device="cuda", dtype=dtype)
-    v = torch.randn(sum(k_lens), 2, head_dim, device="cuda", dtype=dtype)
+    q = torch.randn(sum(q_lens), num_heads_q, head_dim, device="cuda", dtype=dtype)
+    k = torch.randn(sum(k_lens), num_heads_kv, head_dim, device="cuda", dtype=dtype)
+    v = torch.randn(sum(k_lens), num_heads_kv, head_dim, device="cuda", dtype=dtype)
     out, _ = flash_attn_varlen_func(
         q,
         k,
@@ -258,6 +259,48 @@ def test_sm120_forward_varlen_dense_smoke(dtype, head_dim, causal):
         pack_gqa=False,
     )
     out_ref = _attention_ref_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, causal)
+    torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] != 12,
+    reason="requires SM120 hardware",
+)
+@pytest.mark.parametrize(
+    "window_size, score_mod",
+    [
+        ((32, 0), None),
+        ((48, 16), None),
+        ((None, None), score_mod_times_two),
+    ],
+)
+def test_sm120_forward_varlen_core_extensions_smoke(window_size, score_mod):
+    torch.manual_seed(0)
+    q_lens = [17, 64, 129]
+    k_lens = [19, 63, 127]
+    cu_seqlens_q = torch.tensor([0, *torch.tensor(q_lens).cumsum(0).tolist()], device="cuda", dtype=torch.int32)
+    cu_seqlens_k = torch.tensor([0, *torch.tensor(k_lens).cumsum(0).tolist()], device="cuda", dtype=torch.int32)
+    q = torch.randn(sum(q_lens), 2, 64, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(sum(k_lens), 2, 64, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(sum(k_lens), 2, 64, device="cuda", dtype=torch.bfloat16)
+    out, _ = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max(q_lens),
+        max_seqlen_k=max(k_lens),
+        causal=False,
+        window_size=window_size,
+        score_mod=score_mod,
+        pack_gqa=False,
+    )
+    q_ref = q * 2 if score_mod is score_mod_times_two else q
+    out_ref = _attention_ref_varlen(
+        q_ref, k, v, cu_seqlens_q, cu_seqlens_k, False, window_size=window_size
+    )
     torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
 
 
