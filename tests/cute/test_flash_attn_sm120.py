@@ -54,7 +54,6 @@ def test_sm120_forward_policy_keeps_native_path_separate():
         ({"dtype": torch.float32}, "only supports fp16 and bf16"),
         ({"requires_grad": True}, "forward-only"),
         ({"is_varlen": True}, "fixed-length"),
-        ({"is_local": True}, "local/window"),
         ({"head_dim": 192, "head_dim_v": 192}, "head_dim"),
         ({"head_dim": 64, "head_dim_v": 128}, "head_dim == head_dim_v"),
         ({"pack_gqa": True, "pack_gqa_was_explicit": True}, "packed GQA"),
@@ -116,6 +115,32 @@ def test_sm120_forward_dense_mha_tile_boundary_shapes(
     v = torch.randn(batch_size, seqlen_k, 2, head_dim, device="cuda", dtype=dtype)
     out, _ = flash_attn_func(q, k, v, causal=causal, pack_gqa=False, num_splits=1)
     out_ref, _ = attention_ref(q, k, v, causal=causal)
+    torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] != 12,
+    reason="requires SM120 hardware",
+)
+@pytest.mark.parametrize(
+    "window_size",
+    [
+        (32, 0),
+        (48, 16),
+        (None, 32),
+    ],
+)
+@pytest.mark.parametrize("causal", [False, True])
+def test_sm120_forward_dense_local_window_smoke(window_size, causal):
+    torch.manual_seed(0)
+    q = torch.randn(1, 129, 2, 64, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, 127, 2, 64, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(1, 127, 2, 64, device="cuda", dtype=torch.bfloat16)
+    out, _ = flash_attn_func(
+        q, k, v, causal=causal, window_size=window_size, pack_gqa=False, num_splits=1
+    )
+    out_ref, _ = attention_ref(q, k, v, causal=causal, window_size=window_size)
     torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
 
 

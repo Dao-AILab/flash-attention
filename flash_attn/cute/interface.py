@@ -315,9 +315,6 @@ def _validate_sm120_fwd_support(
     # Sequence and attention variants.
     if is_varlen:
         raise NotImplementedError(f"{prefix} only supports fixed-length dense tensors.")
-    if is_local:
-        raise NotImplementedError(f"{prefix} does not support local/window attention.")
-
     # Head dimensions and packing.
     if head_dim != head_dim_v:
         raise NotImplementedError(f"{prefix} requires head_dim == head_dim_v.")
@@ -815,6 +812,8 @@ def _flash_attn_fwd(
         disable_sparse_kv_bitmask,
         fa_logging.get_fa_log_level(),
     )
+    window_size_left_arg = Int32(window_size_left) if window_size_left is not None else None
+    window_size_right_arg = Int32(window_size_right) if window_size_right is not None else None
 
     if compile_key not in _flash_attn_fwd.compile_cache:
         (
@@ -1040,8 +1039,8 @@ def _flash_attn_fwd(
                 seqused_k_tensor,
                 gather_kv_indices_tensor,
                 page_table_tensor,
-                window_size_left,
-                window_size_right,
+                window_size_left_arg,
+                window_size_right_arg,
                 current_stream,
                 options="--enable-tvm-ffi",
             )
@@ -1059,8 +1058,8 @@ def _flash_attn_fwd(
                 seqused_q_tensor,
                 seqused_k_tensor,
                 page_table_tensor,
-                window_size_left,
-                window_size_right,
+                window_size_left_arg,
+                window_size_right_arg,
                 learnable_sink_tensor,
                 sparse_tensors,
                 cute_aux_tensors,
@@ -1104,8 +1103,8 @@ def _flash_attn_fwd(
                 seqused_k,
                 gather_kv_indices,
                 page_table,
-                window_size_left,
-                window_size_right,
+                window_size_left_arg,
+                window_size_right_arg,
             )
         else:
             call_args = [
@@ -1120,8 +1119,8 @@ def _flash_attn_fwd(
                 seqused_q,
                 seqused_k,
                 page_table,
-                window_size_left,
-                window_size_right,
+                window_size_left_arg,
+                window_size_right_arg,
                 learnable_sink,
             ]
             if arch // 10 in [10, 11]:
