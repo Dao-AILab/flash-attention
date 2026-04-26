@@ -16,16 +16,14 @@ DTYPES = {
     "bfloat16": torch.bfloat16,
 }
 
+VARLEN_MODES = ("full", "staggered")
+
 
 def parse_int_k(value: str) -> int:
     value = value.strip().lower()
     if value.endswith("k"):
         return int(value[:-1]) * 1024
     return int(value)
-
-
-def parse_csv_ints(value: str) -> list[int]:
-    return [parse_int_k(item) for item in value.split(",")]
 
 
 def parse_tile_mn(value: str) -> tuple[int, int] | None:
@@ -85,7 +83,38 @@ def preheat_gpu(duration_ms: int) -> None:
     torch.cuda.synchronize()
 
 
+def make_cu_seqlens(lengths: list[int]) -> torch.Tensor:
+    return torch.tensor([0, *torch.tensor(lengths).cumsum(0).tolist()], device="cuda", dtype=torch.int32)
+
+
+def make_varlen_lengths(seqlen: int, batch_size: int, mode: str) -> list[int]:
+    if mode == "full":
+        return [seqlen] * batch_size
+    if mode == "staggered":
+        step = max(1, seqlen // max(2, batch_size + 1))
+        return [max(1, seqlen - batch_idx * step) for batch_idx in range(batch_size)]
+    raise ValueError(f"Unsupported varlen mode: {mode}")
+
+
 def make_tensors(args, dtype: torch.dtype):
+    if args.varlen:
+        q_lens = make_varlen_lengths(args.seqlen_q, args.batch_size, args.varlen_mode)
+        k_lens = make_varlen_lengths(args.seqlen_k, args.batch_size, args.varlen_mode)
+        q = torch.randn(sum(q_lens), args.nheads, args.headdim, device="cuda", dtype=dtype)
+        k = torch.randn(sum(k_lens), args.nheads_kv, args.headdim, device="cuda", dtype=dtype)
+        v = torch.randn(sum(k_lens), args.nheads_kv, args.headdim, device="cuda", dtype=dtype)
+        out = torch.empty_like(q)
+        return {
+            "q": q,
+            "k": k,
+            "v": v,
+            "out": out,
+            "cu_seqlens_q": make_cu_seqlens(q_lens),
+            "cu_seqlens_k": make_cu_seqlens(k_lens),
+            "q_lens": q_lens,
+            "k_lens": k_lens,
+        }
+
     q = torch.randn(
         args.batch_size,
         args.seqlen_q,
@@ -111,17 +140,21 @@ def make_tensors(args, dtype: torch.dtype):
         dtype=dtype,
     )
     out = torch.empty_like(q)
-    return q, k, v, out
+    return {"q": q, "k": k, "v": v, "out": out}
 
 
-def make_fwd_fn(args, q, k, v, out, tile_mn):
+def make_fwd_fn(args, tensors, tile_mn):
     pack_gqa = None if args.pack_gqa == "auto" else args.pack_gqa == "true"
 
     def fwd():
         return _flash_attn_fwd(
-            q,
-            k,
-            v,
+            tensors["q"],
+            tensors["k"],
+            tensors["v"],
+            cu_seqlens_q=tensors.get("cu_seqlens_q"),
+            cu_seqlens_k=tensors.get("cu_seqlens_k"),
+            max_seqlen_q=args.seqlen_q if args.varlen else None,
+            max_seqlen_k=args.seqlen_k if args.varlen else None,
             causal=args.causal,
             softcap=args.softcap,
             window_size_left=args.window_left,
@@ -130,15 +163,47 @@ def make_fwd_fn(args, q, k, v, out, tile_mn):
             num_splits=1,
             pack_gqa=pack_gqa,
             return_lse=False,
-            out=out,
+            out=tensors["out"],
         )[0]
 
     return fwd
 
 
-def check_output(args, q, k, v, actual) -> None:
+def attention_ref_varlen(args, tensors):
+    q = tensors["q"]
+    k = tensors["k"]
+    v = tensors["v"]
+    cu_seqlens_q = tensors["cu_seqlens_q"]
+    cu_seqlens_k = tensors["cu_seqlens_k"]
+    outs = []
+    for batch_idx in range(args.batch_size):
+        q_start, q_end = cu_seqlens_q[batch_idx : batch_idx + 2].tolist()
+        k_start, k_end = cu_seqlens_k[batch_idx : batch_idx + 2].tolist()
+        out, _ = attention_ref(
+            q[q_start:q_end].unsqueeze(0),
+            k[k_start:k_end].unsqueeze(0),
+            v[k_start:k_end].unsqueeze(0),
+            causal=args.causal,
+            window_size=(args.window_left, args.window_right),
+            softcap=args.softcap,
+        )
+        outs.append(out.squeeze(0))
+    return torch.cat(outs, dim=0)
+
+
+def check_output(args, tensors, actual) -> None:
     window_size = (args.window_left, args.window_right)
-    expected, _ = attention_ref(q, k, v, causal=args.causal, window_size=window_size)
+    if args.varlen:
+        expected = attention_ref_varlen(args, tensors)
+    else:
+        expected, _ = attention_ref(
+            tensors["q"],
+            tensors["k"],
+            tensors["v"],
+            causal=args.causal,
+            window_size=window_size,
+            softcap=args.softcap,
+        )
     torch.testing.assert_close(actual, expected, atol=args.atol, rtol=args.rtol)
 
 
@@ -159,25 +224,36 @@ def tile_label(tile_mn: tuple[int, int] | None) -> str:
     return "auto" if tile_mn is None else f"{tile_mn[0]}x{tile_mn[1]}"
 
 
-def run_one(args, dtype: torch.dtype, tile_mn: tuple[int, int] | None) -> None:
-    q, k, v, out = make_tensors(args, dtype)
-    fwd = make_fwd_fn(args, q, k, v, out, tile_mn)
+def describe_shape(args, tensors) -> str:
+    if not args.varlen:
+        return (
+            f"batch={args.batch_size} seqlen_q={args.seqlen_q} seqlen_k={args.seqlen_k} "
+            f"nheads={args.nheads} nheads_kv={args.nheads_kv} headdim={args.headdim}"
+        )
+    return (
+        f"varlen_mode={args.varlen_mode} q_lens={tensors['q_lens']} k_lens={tensors['k_lens']} "
+        f"nheads={args.nheads} nheads_kv={args.nheads_kv} headdim={args.headdim}"
+    )
+
+
+def run_one(args, dtype: torch.dtype, tile_mn: tuple[int, int] | None) -> float | None:
+    tensors = make_tensors(args, dtype)
+    fwd = make_fwd_fn(args, tensors, tile_mn)
     print(
         "config "
         f"dtype={dtype} tile_mn={tile_label(tile_mn)} "
-        f"batch={args.batch_size} seqlen_q={args.seqlen_q} seqlen_k={args.seqlen_k} "
-        f"nheads={args.nheads} nheads_kv={args.nheads_kv} headdim={args.headdim} "
+        f"{describe_shape(args, tensors)} "
         f"causal={args.causal} window=({args.window_left},{args.window_right}) "
-        f"pack_gqa={args.pack_gqa}"
+        f"softcap={args.softcap} pack_gqa={args.pack_gqa}"
     )
     if args.check:
-        check_output(args, q, k, v, fwd())
+        check_output(args, tensors, fwd())
         torch.cuda.synchronize()
         print("  check=passed")
     if args.profile:
         profile_once(fwd, args.profile_warmup)
         print("  profile=completed")
-        return
+        return None
     ms, samples = benchmark_cuda_events(fwd, args.repeats, args.warmup, args.stat)
     nflops = flops(
         args.batch_size,
@@ -203,6 +279,19 @@ def run_one(args, dtype: torch.dtype, tile_mn: tuple[int, int] | None) -> None:
     print(f"  stat={args.stat} runtime={ms:.3f}ms")
     print(f"  samples_ms={[round(sample, 3) for sample in samples]}")
     print(f"  tflops={nflops / seconds / 1e12:.2f} tbps={nbytes / seconds / 1e12:.2f}")
+    return ms
+
+
+def print_round_summary(args, tile_mn: tuple[int, int] | None, round_ms: list[float]) -> None:
+    if len(round_ms) <= 1:
+        return
+    summary_ms = selected_stat(round_ms, args.stat)
+    ordered = sorted(round_ms)
+    median = selected_stat(round_ms, "median")
+    print(
+        f"summary tile_mn={tile_label(tile_mn)} rounds_ms={[round(ms, 3) for ms in round_ms]} "
+        f"best={ordered[0]:.3f}ms median={median:.3f}ms {args.stat}={summary_ms:.3f}ms"
+    )
 
 
 def parse_args():
@@ -219,6 +308,8 @@ def parse_args():
     parser.add_argument("--window-left", type=int, default=None)
     parser.add_argument("--window-right", type=int, default=None)
     parser.add_argument("--softcap", type=float, default=0.0)
+    parser.add_argument("--varlen", action="store_true")
+    parser.add_argument("--varlen-mode", choices=VARLEN_MODES, default="staggered")
     parser.add_argument(
         "--tile-mn",
         type=parse_tile_mns,
@@ -228,6 +319,12 @@ def parse_args():
     parser.add_argument("--pack-gqa", choices=["auto", "true", "false"], default="auto")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--repeats", type=int, default=10)
+    parser.add_argument(
+        "--rounds",
+        type=int,
+        default=1,
+        help="Repeat each full benchmark config this many times for noisy workstation GPUs.",
+    )
     parser.add_argument("--stat", choices=["min", "second-min", "median"], default="second-min")
     parser.add_argument("--preheat-ms", type=int, default=0)
     parser.add_argument("--check", action="store_true")
@@ -256,8 +353,13 @@ def main() -> None:
     print(f"device={torch.cuda.get_device_name()} capability={major}.{minor}")
     preheat_gpu(args.preheat_ms)
     for tile_mn in args.tile_mn:
+        round_ms = []
         try:
-            run_one(args, dtype, tile_mn)
+            for _ in range(args.rounds):
+                ms = run_one(args, dtype, tile_mn)
+                if ms is not None:
+                    round_ms.append(ms)
+            print_round_summary(args, tile_mn, round_ms)
         except Exception as exc:
             print(f"config dtype={dtype} tile_mn={tile_label(tile_mn)} failed: {exc}")
             if args.fail_fast:

@@ -186,6 +186,20 @@ def test_sm120_forward_dense_score_mod_smoke(dtype, causal):
     torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
 
 
+def _mini_causal_mask_ref(q, k, v):
+    if q.shape[2] != k.shape[2]:
+        repeats = q.shape[2] // k.shape[2]
+        k = k.repeat_interleave(repeats, dim=2)
+        v = v.repeat_interleave(repeats, dim=2)
+    scores = torch.einsum("bthd,bshd->bhts", q.float() / (q.shape[-1] ** 0.5), k.float())
+    q_idx = torch.arange(q.shape[1], device=q.device)[:, None]
+    kv_idx = torch.arange(k.shape[1], device=k.device)[None, :]
+    mask = (q_idx % 128) >= (kv_idx % 128)
+    scores = scores.masked_fill(~mask, float("-inf"))
+    attn = torch.softmax(scores, dim=-1).to(v.dtype)
+    return torch.einsum("bhts,bshd->bthd", attn, v)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.skipif(
     torch.cuda.is_available() and torch.cuda.get_device_capability()[0] != 12,
@@ -200,13 +214,7 @@ def test_sm120_forward_dense_mask_mod_smoke():
         q, k, v, causal=False, mask_mod=cute_mini_causal_mask, pack_gqa=False, num_splits=1
     )
 
-    scores = torch.einsum("bthd,bshd->bhts", q.float() / (64**0.5), k.float())
-    q_idx = torch.arange(q.shape[1], device="cuda")[:, None]
-    kv_idx = torch.arange(k.shape[1], device="cuda")[None, :]
-    mask = (q_idx % 128) >= (kv_idx % 128)
-    scores = scores.masked_fill(~mask, float("-inf"))
-    attn = torch.softmax(scores, dim=-1).to(v.dtype)
-    out_ref = torch.einsum("bhts,bshd->bthd", attn, v)
+    out_ref = _mini_causal_mask_ref(q, k, v)
     torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
 
 
@@ -235,7 +243,7 @@ def _attention_ref_varlen(
     reason="requires SM120 hardware",
 )
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.parametrize("head_dim", [64, 96, 128])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("num_heads_q,num_heads_kv", [(2, 2), (4, 2), (4, 1)])
 def test_sm120_forward_varlen_dense_smoke(dtype, head_dim, causal, num_heads_q, num_heads_kv):
@@ -361,4 +369,38 @@ def test_sm120_forward_dense_nonpacked_gqa_smoke(num_heads_kv, causal, pack_gqa)
         kwargs["pack_gqa"] = pack_gqa
     out, _ = flash_attn_func(q, k, v, causal=causal, **kwargs)
     out_ref, _ = attention_ref(q, k, v, causal=causal)
+    torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] != 12,
+    reason="requires SM120 hardware",
+)
+@pytest.mark.parametrize("num_heads_kv", [1, 2])
+@pytest.mark.parametrize("feature", ["local", "score_mod", "mask_mod"])
+def test_sm120_forward_dense_gqa_extensions_smoke(num_heads_kv, feature):
+    torch.manual_seed(0)
+    q = torch.randn(1, 129, 4, 64, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, 127, num_heads_kv, 64, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(1, 127, num_heads_kv, 64, device="cuda", dtype=torch.bfloat16)
+    kwargs = {"pack_gqa": False, "num_splits": 1}
+    ref_q = q
+    ref_kwargs = {}
+    if feature == "local":
+        kwargs["window_size"] = (48, 16)
+        ref_kwargs["window_size"] = (48, 16)
+    elif feature == "score_mod":
+        kwargs["score_mod"] = score_mod_times_two
+        ref_q = q * 2
+    elif feature == "mask_mod":
+        kwargs["mask_mod"] = cute_mini_causal_mask
+    else:
+        raise AssertionError(f"Unexpected feature: {feature}")
+
+    out, _ = flash_attn_func(q, k, v, causal=False, **kwargs)
+    if feature == "mask_mod":
+        out_ref = _mini_causal_mask_ref(q, k, v)
+    else:
+        out_ref, _ = attention_ref(ref_q, k, v, causal=False, **ref_kwargs)
     torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
