@@ -70,7 +70,7 @@ def get_forward_arch_policy(arch) -> ForwardArchPolicy:
             supports_wgmma=False,
             supports_warp_mma_f16bf16=True,
             supports_stmatrix_acc_store=False,
-            supports_pack_gqa=False,
+            supports_pack_gqa=True,
             native_tensor_only=True,
         )
     raise ValueError(f"Unsupported FA4 forward architecture: {arch}")

@@ -319,8 +319,6 @@ def _validate_sm120_fwd_support(
         raise NotImplementedError(f"{prefix} requires head_dim == head_dim_v.")
     if head_dim not in (64, 96, 128):
         raise NotImplementedError(f"{prefix} only supports head_dim in {{64, 96, 128}}.")
-    if pack_gqa and pack_gqa_was_explicit:
-        raise NotImplementedError(f"{prefix} does not support packed GQA/MQA.")
 
     # Work decomposition and storage variants.
     if num_splits != 1:

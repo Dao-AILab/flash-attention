@@ -53,7 +53,7 @@ def test_sm120_forward_policy_keeps_native_path_separate():
     assert not policy.supports_tcgen05
     assert not policy.supports_wgmma
     assert not policy.supports_stmatrix_acc_store
-    assert not policy.supports_pack_gqa
+    assert policy.supports_pack_gqa
     assert not issubclass(FlashAttentionForwardSm120, FlashAttentionForwardSm80)
 
 
@@ -64,7 +64,6 @@ def test_sm120_forward_policy_keeps_native_path_separate():
         ({"requires_grad": True}, "forward-only"),
         ({"head_dim": 192, "head_dim_v": 192}, "head_dim"),
         ({"head_dim": 64, "head_dim_v": 128}, "head_dim == head_dim_v"),
-        ({"pack_gqa": True, "pack_gqa_was_explicit": True}, "packed GQA"),
         ({"num_splits": 2}, "SplitKV"),
         ({"page_table": object()}, "paged KV"),
         ({"block_sparse_tensors": object()}, "block sparsity"),
@@ -358,12 +357,16 @@ def test_sm120_forward_varlen_softcap_smoke():
     "num_heads_kv, causal, pack_gqa",
     [
         (1, False, False),
+        (1, False, True),
         (2, False, False),
+        (2, False, True),
         (1, True, None),
+        (1, True, True),
         (2, True, None),
+        (2, True, True),
     ],
 )
-def test_sm120_forward_dense_nonpacked_gqa_smoke(num_heads_kv, causal, pack_gqa):
+def test_sm120_forward_dense_gqa_smoke(num_heads_kv, causal, pack_gqa):
     torch.manual_seed(0)
     q = torch.randn(1, 129, 4, 64, device="cuda", dtype=torch.float16)
     k = torch.randn(1, 127, num_heads_kv, 64, device="cuda", dtype=torch.float16)
@@ -388,7 +391,7 @@ def test_sm120_forward_dense_gqa_extensions_smoke(num_heads_kv, feature):
     q = torch.randn(1, 129, 4, 64, device="cuda", dtype=torch.bfloat16)
     k = torch.randn(1, 127, num_heads_kv, 64, device="cuda", dtype=torch.bfloat16)
     v = torch.randn(1, 127, num_heads_kv, 64, device="cuda", dtype=torch.bfloat16)
-    kwargs = {"pack_gqa": False, "num_splits": 1}
+    kwargs = {"pack_gqa": True, "num_splits": 1}
     ref_q = q
     ref_kwargs = {}
     if feature == "local":
@@ -407,4 +410,39 @@ def test_sm120_forward_dense_gqa_extensions_smoke(num_heads_kv, feature):
         out_ref = _mini_causal_mask_ref(q, k, v)
     else:
         out_ref, _ = attention_ref(ref_q, k, v, causal=False, **ref_kwargs)
+    torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] != 12,
+    reason="requires SM120 hardware",
+)
+@pytest.mark.parametrize("num_heads_q,num_heads_kv", [(4, 2), (4, 1)])
+@pytest.mark.parametrize("causal", [False, True])
+def test_sm120_forward_varlen_packed_gqa_smoke(num_heads_q, num_heads_kv, causal):
+    torch.manual_seed(0)
+    q_lens = [17, 64, 129]
+    k_lens = [19, 63, 127]
+    cu_seqlens_q = torch.tensor(
+        [0, *torch.tensor(q_lens).cumsum(0).tolist()], device="cuda", dtype=torch.int32
+    )
+    cu_seqlens_k = torch.tensor(
+        [0, *torch.tensor(k_lens).cumsum(0).tolist()], device="cuda", dtype=torch.int32
+    )
+    q = torch.randn(sum(q_lens), num_heads_q, 64, device="cuda", dtype=torch.float16)
+    k = torch.randn(sum(k_lens), num_heads_kv, 64, device="cuda", dtype=torch.float16)
+    v = torch.randn(sum(k_lens), num_heads_kv, 64, device="cuda", dtype=torch.float16)
+    out, _ = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max(q_lens),
+        max_seqlen_k=max(k_lens),
+        causal=causal,
+        pack_gqa=True,
+    )
+    out_ref = _attention_ref_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, causal)
     torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)

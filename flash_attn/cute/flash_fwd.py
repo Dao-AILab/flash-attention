@@ -30,7 +30,7 @@ from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.softmax import Softmax, apply_score_mod_inner
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
-from flash_attn.cute.pack_gqa import PackGQA
+from flash_attn.cute.pack_gqa import PackGQA, pack_gqa_layout
 from flash_attn.cute.named_barrier import NamedBarrierFwd
 from flash_attn.cute.block_sparsity import BlockSparseTensors
 from flash_attn.cute.tile_scheduler import SingleTileScheduler, SingleTileVarlenScheduler, TileSchedulerArguments
@@ -671,6 +671,12 @@ class FlashAttentionForwardWarpMma(FlashAttentionForwardBase):
         if const_expr(mLSE is not None):
             LSE_layout_transpose = [2, 1, 0] if const_expr(mCuSeqlensQ is None) else [1, 0]
             mLSE = cute.make_tensor(mLSE.iterator, cute.select(mLSE.layout, mode=LSE_layout_transpose))
+        if const_expr(self.pack_gqa):
+            nheads_kv = mK.shape[2]
+            mQ = pack_gqa_layout(mQ, self.qhead_per_kvhead, nheads_kv, head_idx=2)
+            mO = pack_gqa_layout(mO, self.qhead_per_kvhead, nheads_kv, head_idx=2)
+            if const_expr(mLSE is not None):
+                mLSE = pack_gqa_layout(mLSE, self.qhead_per_kvhead, nheads_kv, head_idx=1)
         # TileScheduler for varlen, simple grid for non-varlen
         if const_expr(mCuSeqlensQ is not None or mSeqUsedQ is not None):
             TileScheduler = SingleTileVarlenScheduler
@@ -681,17 +687,18 @@ class FlashAttentionForwardWarpMma(FlashAttentionForwardBase):
             if const_expr(mCuSeqlensQ is not None)
             else mQ.shape[3]
         )
+        q_extent = cute.size(mQ.shape[0]) if const_expr(self.pack_gqa) else mQ.shape[0]
         tile_sched_args = TileSchedulerArguments(
-            num_block=cute.ceil_div(mQ.shape[0], self.tile_m),
+            num_block=cute.ceil_div(q_extent, self.tile_m),
             num_head=cute.size(mQ.shape[2]),
             num_batch=num_batch,
             num_splits=1,
             seqlen_k=0,
             headdim=mQ.shape[1],
             headdim_v=mV.shape[1],
-            total_q=cute.size(mQ.shape[0])
+            total_q=q_extent
             if const_expr(mCuSeqlensQ is not None)
-            else cute.size(mQ.shape[0]) * cute.size(mQ.shape[3]),
+            else q_extent * cute.size(mQ.shape[3]),
             tile_shape_mn=(self.tile_m, self.tile_n),
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
             mCuSeqlensQ=mCuSeqlensQ,
@@ -789,9 +796,12 @@ class FlashAttentionForwardWarpMma(FlashAttentionForwardBase):
             window_size_right,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
         )
+        q_extent = cute.size(mQ.shape[0]) if const_expr(self.pack_gqa) else mQ.shape[0]
         seqlen = SeqlenInfoQK.create(
             batch_idx=batch_size,
-            seqlen_q_static=mQ.shape[0],
+            seqlen_q_static=q_extent // self.qhead_per_kvhead
+            if const_expr(self.pack_gqa)
+            else q_extent,
             seqlen_k_static=mK.shape[0],
             mCuSeqlensQ=mCuSeqlensQ,
             mCuSeqlensK=mCuSeqlensK,
@@ -811,8 +821,10 @@ class FlashAttentionForwardWarpMma(FlashAttentionForwardBase):
         blkQ_shape = (self.tile_m, self.tile_hdim)
         blkK_shape = (self.tile_n, self.tile_hdim)
         blkV_shape = (self.tile_n, self.tile_hdimv)
-        num_head_kv = num_head // self.qhead_per_kvhead
-        if const_expr(not seqlen.has_cu_seqlens_q):
+        num_head_kv = num_head if const_expr(self.pack_gqa) else num_head // self.qhead_per_kvhead
+        if const_expr(self.pack_gqa):
+            mQ_cur = seqlen.offset_batch_Q(mQ, batch_size, dim=3)[None, None, num_head]
+        elif const_expr(not seqlen.has_cu_seqlens_q):
             mQ_cur = mQ[None, None, num_head, batch_size]
         else:
             mQ_cur = cute.domain_offset((seqlen.offset_q, 0), mQ[None, None, num_head])
@@ -822,7 +834,8 @@ class FlashAttentionForwardWarpMma(FlashAttentionForwardBase):
         else:
             mK_cur = cute.domain_offset((seqlen.offset_k, 0), mK[None, None, num_head_kv])
             mV_cur = cute.domain_offset((seqlen.offset_k, 0), mV[None, None, num_head_kv])
-        gQ = cute.local_tile(mQ_cur, blkQ_shape, (m_block, 0))
+        if const_expr(not self.pack_gqa):
+            gQ = cute.local_tile(mQ_cur, blkQ_shape, (m_block, 0))
         gK = cute.local_tile(mK_cur, blkK_shape, (None, 0))
         gV = cute.local_tile(mV_cur, blkV_shape, (None, 0))
 
@@ -954,7 +967,15 @@ class FlashAttentionForwardWarpMma(FlashAttentionForwardBase):
         # ///////////////////////////////////////////////////////////////////////////////
         # Start async loads of the last mn-tile, where we take care of the mn residue
         gmem_thr_copy_Q = gmem_tiled_copy_Q.get_slice(tidx)
-        self.load_Q(gmem_thr_copy_Q, gQ, sQ, m_block, seqlen=seqlen.seqlen_q, headdim=mQ.shape[1])
+        if const_expr(self.pack_gqa):
+            pack_gqa = PackGQA(
+                self.tile_m, self.tile_hdim, self.check_hdim_oob, self.qhead_per_kvhead
+            )
+            pack_gqa.load_Q(mQ_cur, sQ, gmem_tiled_copy_Q, tidx, m_block, seqlen.seqlen_q)
+        else:
+            self.load_Q(
+                gmem_thr_copy_Q, gQ, sQ, m_block, seqlen=seqlen.seqlen_q, headdim=mQ.shape[1]
+            )
         cute.arch.cp_async_commit_group()
 
         def preprocess_Q():
