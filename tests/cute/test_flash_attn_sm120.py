@@ -164,6 +164,17 @@ def test_sm120_forward_validation_allows_paged_kv_splitkv_score_mod_aux_tensors(
     )
 
 
+def test_sm120_forward_validation_allows_varlen_pack_gqa_splitkv():
+    _validate_sm120_fwd_support(
+        **_valid_sm120_kwargs(
+            is_varlen=True,
+            num_splits=2,
+            qhead_per_kvhead=4,
+            pack_gqa=True,
+        )
+    )
+
+
 def test_sm120_forward_validation_allows_varlen_mask_mod_without_aux_tensors():
     _validate_sm120_fwd_support(**_valid_sm120_kwargs(is_varlen=True, mask_mod=object()))
 
@@ -238,6 +249,23 @@ def test_sm120_forward_validation_allows_paged_kv_pack_gqa_learnable_sink():
 def test_sm120_forward_validation_rejects_aux_tensor_combinations(overrides, message):
     with pytest.raises(NotImplementedError, match=message):
         _validate_sm120_fwd_support(**_valid_sm120_kwargs(**overrides))
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"score_mod": object()},
+        {"mask_mod": object()},
+        {"aux_tensors": [object()]},
+        {"learnable_sink": object()},
+        {"page_table": object(), "has_seqused_k": True},
+    ],
+)
+def test_sm120_forward_validation_rejects_varlen_pack_gqa_splitkv_extensions(overrides):
+    kwargs = dict(is_varlen=True, num_splits=2, qhead_per_kvhead=4, pack_gqa=True)
+    kwargs.update(overrides)
+    with pytest.raises(NotImplementedError, match="pack_gqa=False"):
+        _validate_sm120_fwd_support(**_valid_sm120_kwargs(**kwargs))
 
 
 @pytest.mark.parametrize(
@@ -1780,6 +1808,41 @@ def test_sm120_forward_varlen_packed_gqa_smoke(num_heads_q, num_heads_kv, causal
         max_seqlen_k=max(k_lens),
         causal=causal,
         pack_gqa=True,
+    )
+    out_ref = _attention_ref_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, causal)
+    torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] != 12,
+    reason="requires SM120 hardware",
+)
+@pytest.mark.parametrize("causal", [False, True])
+def test_sm120_forward_varlen_packed_gqa_splitkv_smoke(causal):
+    torch.manual_seed(0)
+    q_lens = [17, 64, 129]
+    k_lens = [19, 63, 257]
+    cu_seqlens_q = torch.tensor(
+        [0, *torch.tensor(q_lens).cumsum(0).tolist()], device="cuda", dtype=torch.int32
+    )
+    cu_seqlens_k = torch.tensor(
+        [0, *torch.tensor(k_lens).cumsum(0).tolist()], device="cuda", dtype=torch.int32
+    )
+    q = torch.randn(sum(q_lens), 4, 64, device="cuda", dtype=torch.float16)
+    k = torch.randn(sum(k_lens), 1, 64, device="cuda", dtype=torch.float16)
+    v = torch.randn(sum(k_lens), 1, 64, device="cuda", dtype=torch.float16)
+    out, _ = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max(q_lens),
+        max_seqlen_k=max(k_lens),
+        causal=causal,
+        pack_gqa=True,
+        num_splits=2,
     )
     out_ref = _attention_ref_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, causal)
     torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)

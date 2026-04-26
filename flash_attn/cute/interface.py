@@ -327,7 +327,17 @@ def _validate_sm120_fwd_support(
         if num_splits < 1:
             raise NotImplementedError(f"{prefix} requires explicit num_splits >= 1.")
         if pack_gqa:
-            raise NotImplementedError(f"{prefix} only supports SplitKV with pack_gqa=False.")
+            supports_varlen_pack_gqa_splitkv = (
+                is_varlen
+                and page_table is None
+                and aux_tensors is None
+                and learnable_sink is None
+                and score_mod is None
+                and mask_mod is None
+                and block_sparse_tensors is None
+            )
+            if not supports_varlen_pack_gqa_splitkv:
+                raise NotImplementedError(f"{prefix} only supports SplitKV with pack_gqa=False.")
         if block_sparse_tensors is not None:
             raise NotImplementedError(f"{prefix} does not support SplitKV with block sparsity.")
     if page_table is not None and not has_seqused_k:
@@ -838,6 +848,7 @@ def _flash_attn_fwd(
         sm120_num_stages if arch // 10 == 12 else None,
         sm120_q_in_regs if arch // 10 == 12 else None,
         "fwd_valid_tile_guard_v1",
+        "fwd_varlen_splitkv_packgqa_store_v1" if is_varlen and is_split_kv and pack_gqa else None,
         "fwd_sm120_splitkv_mha_v2" if arch // 10 == 12 else None,
         fa_logging.get_fa_log_level(),
     )

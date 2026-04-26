@@ -378,7 +378,12 @@ class FlashAttentionForwardBase:
                 if const_expr(not seqlen.has_cu_seqlens_q):
                     mLSE_cur = mLSE[None, head_idx, batch_idx, split_idx]
                 else:
-                    mLSE_cur = cute.domain_offset((seqlen.offset_q,), mLSE[None, head_idx, split_idx])
+                    q_offset = (
+                        (None, seqlen.offset_q)
+                        if const_expr(self.pack_gqa)
+                        else seqlen.offset_q
+                    )
+                    mLSE_cur = cute.domain_offset((q_offset,), mLSE[None, head_idx, split_idx])
             else:
                 mLSE_cur = seqlen.offset_batch_Q(mLSE, batch_idx, dim=2)[None, head_idx]
             if const_expr(not self.pack_gqa):
@@ -408,26 +413,43 @@ class FlashAttentionForwardBase:
             if const_expr(not seqlen.has_cu_seqlens_q):
                 mO_cur = mO[None, None, head_idx, batch_idx, split_idx]
             else:
-                mO_cur = cute.domain_offset((seqlen.offset_q, 0), mO[None, None, head_idx, split_idx])
-        else:
+                q_offset = (
+                    (None, seqlen.offset_q)
+                    if const_expr(self.pack_gqa)
+                    else seqlen.offset_q
+                )
+                mO_cur = cute.domain_offset((q_offset, 0), mO[None, None, head_idx, split_idx])
+        elif const_expr(not self.is_split_kv):
             mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3, ragged=ragged)[None, None, head_idx]
         # thr_mma = tiled_mma.get_slice(tidx)
         # taccOgO = thr_mma.partition_C(gO)
         # cute.autovec_copy(rO, taccOgO)
         # sync to make sure all smem stores are done
         if const_expr(self.is_split_kv):
-            gO = cute.local_tile(mO_cur, (self.tile_m, self.tile_hdimv), (m_block, 0))
-            thr_mma = tiled_mma.get_slice(tidx)
-            acc_O_mn = layout_utils.reshape_acc_to_mn(acc_O)
-            taccOgO = layout_utils.reshape_acc_to_mn(thr_mma.partition_C(gO))
-            taccOcO = layout_utils.reshape_acc_to_mn(thr_mma.partition_C(cO))
-            for m in cutlass.range(cute.size(acc_O_mn, mode=[0]), unroll_full=True):
-                for n in cutlass.range(cute.size(acc_O_mn, mode=[1]), unroll_full=True):
-                    if (
-                        taccOcO[m, n][0] < seqlen.seqlen_q - m_block * self.tile_m
-                        and taccOcO[m, n][1] < mO.shape[1]
-                    ):
-                        taccOgO[m, n] = acc_O_mn[m, n]
+            if const_expr(self.pack_gqa):
+                thr_mma = tiled_mma.get_slice(tidx)
+                acc_O_mn = layout_utils.reshape_acc_to_mn(acc_O)
+                taccOcO = layout_utils.reshape_acc_to_mn(thr_mma.partition_C(cO))
+                for m in cutlass.range(cute.size(acc_O_mn, mode=[0]), unroll_full=True):
+                    for n in cutlass.range(cute.size(acc_O_mn, mode=[1]), unroll_full=True):
+                        row = m_block * self.tile_m + taccOcO[m, n][0]
+                        q_idx = row // self.qhead_per_kvhead
+                        q_head_idx = row - q_idx * self.qhead_per_kvhead
+                        if row < seqlen.seqlen_q * self.qhead_per_kvhead and taccOcO[m, n][1] < mO.shape[1]:
+                            mO_cur[(q_head_idx, q_idx), taccOcO[m, n][1]] = acc_O_mn[m, n]
+            else:
+                gO = cute.local_tile(mO_cur, (self.tile_m, self.tile_hdimv), (m_block, 0))
+                thr_mma = tiled_mma.get_slice(tidx)
+                acc_O_mn = layout_utils.reshape_acc_to_mn(acc_O)
+                taccOgO = layout_utils.reshape_acc_to_mn(thr_mma.partition_C(gO))
+                taccOcO = layout_utils.reshape_acc_to_mn(thr_mma.partition_C(cO))
+                for m in cutlass.range(cute.size(acc_O_mn, mode=[0]), unroll_full=True):
+                    for n in cutlass.range(cute.size(acc_O_mn, mode=[1]), unroll_full=True):
+                        if (
+                            taccOcO[m, n][0] < seqlen.seqlen_q - m_block * self.tile_m
+                            and taccOcO[m, n][1] < mO.shape[1]
+                        ):
+                            taccOgO[m, n] = acc_O_mn[m, n]
         elif const_expr(self.use_tma_O):
             # ensure smem writes are visible to TMA
             cute.arch.fence_view_async_shared()
@@ -497,24 +519,39 @@ class FlashAttentionForwardBase:
             if const_expr(not seqlen.has_cu_seqlens_q):
                 mLSE_cur = mLSE[None, head_idx, batch_idx, split_idx]
             else:
-                mLSE_cur = cute.domain_offset((seqlen.offset_q,), mLSE[None, head_idx, split_idx])
-            gLSE = cute.local_tile(mLSE_cur, (self.tile_m,), (m_block,))
+                q_offset = (
+                    (None, seqlen.offset_q)
+                    if const_expr(self.pack_gqa)
+                    else seqlen.offset_q
+                )
+                mLSE_cur = cute.domain_offset((q_offset,), mLSE[None, head_idx, split_idx])
             cO = cute.make_identity_tensor((self.tile_m, self.tile_hdimv))
-            gLSE_expanded_layout = cute.append(
-                gLSE.layout, cute.make_layout((self.tile_hdimv,), stride=(0,))
-            )
-            gLSE_expanded = cute.make_tensor(gLSE.iterator, gLSE_expanded_layout)
             thr_mma = tiled_mma.get_slice(tidx)
-            taccOgLSE = layout_utils.reshape_acc_to_mn(thr_mma.partition_C(gLSE_expanded))
-            taccOcO = layout_utils.reshape_acc_to_mn(thr_mma.partition_C(cO))
-            t0accOcO = layout_utils.reshape_acc_to_mn(thr_mma.get_slice(0).partition_C(cO))
-            if taccOcO[0][1] == 0:
-                for m in cutlass.range(cute.size(taccOgLSE.shape[1]), unroll_full=True):
-                    if (
-                        t0accOcO[m, 0][0]
-                        < seqlen.seqlen_q - m_block * self.tile_m - taccOcO[0][0]
-                    ):
-                        taccOgLSE[m, 0] = -Float32.inf
+            if const_expr(self.pack_gqa):
+                taccOcO = thr_mma.partition_C(cO)
+                taccOcO_row = layout_utils.reshape_acc_to_mn(taccOcO)[None, 0]
+                rLSE = cute.make_rmem_tensor(cute.size(taccOcO_row), Float32)
+                rLSE.fill(-Float32.inf)
+                pack_gqa = PackGQA(
+                    self.tile_m, self.tile_hdimv, self.check_hdim_v_oob, self.qhead_per_kvhead
+                )
+                pack_gqa.store_LSE(mLSE_cur, rLSE, tiled_mma, tidx, m_block, seqlen.seqlen_q)
+            else:
+                gLSE = cute.local_tile(mLSE_cur, (self.tile_m,), (m_block,))
+                gLSE_expanded_layout = cute.append(
+                    gLSE.layout, cute.make_layout((self.tile_hdimv,), stride=(0,))
+                )
+                gLSE_expanded = cute.make_tensor(gLSE.iterator, gLSE_expanded_layout)
+                taccOgLSE = layout_utils.reshape_acc_to_mn(thr_mma.partition_C(gLSE_expanded))
+                taccOcO = layout_utils.reshape_acc_to_mn(thr_mma.partition_C(cO))
+                t0accOcO = layout_utils.reshape_acc_to_mn(thr_mma.get_slice(0).partition_C(cO))
+                if taccOcO[0][1] == 0:
+                    for m in cutlass.range(cute.size(taccOgLSE.shape[1]), unroll_full=True):
+                        if (
+                            t0accOcO[m, 0][0]
+                            < seqlen.seqlen_q - m_block * self.tile_m - taccOcO[0][0]
+                        ):
+                            taccOgLSE[m, 0] = -Float32.inf
 
     @cute.jit
     def advance_pipeline(self, pipeline_index):
