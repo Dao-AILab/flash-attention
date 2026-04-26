@@ -594,13 +594,9 @@ def _flash_attn_fwd(
     fwd_cfg = FwdConfig(128, 128, True, True)  # default
     if tile_mn is None:
         if arch // 10 == 12:
-            # SM120 tile sizes tuned for 99 KB SMEM capacity:
-            # D<=64:  128x128 → 48 KB (good occupancy)
-            # D>64:   128x64  → 64 KB (128x128 would use 96 KB, hurting occupancy)
-            if head_dim <= 64:
-                fwd_cfg = FwdConfig(128, 128, True, True)
-            else:
-                fwd_cfg = FwdConfig(128, 64, True, True)
+            # SM120 has a smaller SMEM/occupancy envelope than SM80. On RTX 5060,
+            # 64x64 is the best default across the dense fp16/bf16 baseline matrix.
+            fwd_cfg = FwdConfig(64, 64, True, True)
         elif arch // 10 == 8:
             fwd_cfg = FwdConfig(128, 64, True, True)  # SM80, should tune
         elif arch // 10 == 9:
