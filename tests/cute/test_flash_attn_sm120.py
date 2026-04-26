@@ -124,6 +124,12 @@ def test_sm120_forward_validation_allows_varlen_score_mod_aux_tensors():
     )
 
 
+def test_sm120_forward_validation_allows_splitkv_score_mod_aux_tensors():
+    _validate_sm120_fwd_support(
+        **_valid_sm120_kwargs(num_splits=2, score_mod=object(), aux_tensors=[object()])
+    )
+
+
 def test_sm120_forward_validation_allows_varlen_mask_mod_without_aux_tensors():
     _validate_sm120_fwd_support(**_valid_sm120_kwargs(is_varlen=True, mask_mod=object()))
 
@@ -146,6 +152,15 @@ def test_sm120_forward_validation_allows_varlen_learnable_sink():
             "aux_tensors with varlen mask_mod",
         ),
         ({"aux_tensors": [object()], "num_splits": 2}, "aux_tensors with SplitKV"),
+        (
+            {
+                "aux_tensors": [object()],
+                "num_splits": 2,
+                "score_mod": object(),
+                "mask_mod": object(),
+            },
+            "aux_tensors with SplitKV",
+        ),
         (
             {"aux_tensors": [object()], "page_table": object(), "has_seqused_k": True},
             "aux_tensors with paged KV",
@@ -310,6 +325,35 @@ def test_sm120_forward_dense_gqa_splitkv_three_splits_smoke():
     torch.cuda.is_available() and torch.cuda.get_device_capability()[0] != 12,
     reason="requires SM120 hardware",
 )
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("num_heads_q,num_heads_kv", [(2, 2), (4, 2)])
+def test_sm120_forward_dense_splitkv_score_mod_aux_tensors_smoke(dtype, num_heads_q, num_heads_kv):
+    torch.manual_seed(0)
+    q = torch.randn(1, 129, num_heads_q, 64, device="cuda", dtype=dtype)
+    k = torch.randn(1, 257, num_heads_kv, 64, device="cuda", dtype=dtype)
+    v = torch.randn(1, 257, num_heads_kv, 64, device="cuda", dtype=dtype)
+    kv_bias = torch.randn(k.shape[1], device="cuda", dtype=dtype)
+    out, _ = flash_attn_func(
+        q,
+        k,
+        v,
+        causal=False,
+        score_mod=score_mod_global_kv_bias,
+        aux_tensors=[kv_bias],
+        pack_gqa=False,
+        num_splits=2,
+    )
+    out_ref = _dense_kv_bias_ref(q, k, v, kv_bias)
+    out_no_bias, _ = attention_ref(q, k, v, causal=False)
+    assert not torch.allclose(out_ref, out_no_bias)
+    torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] != 12,
+    reason="requires SM120 hardware",
+)
 @pytest.mark.parametrize(
     "window_size",
     [
@@ -464,6 +508,17 @@ def _dense_mask_ref(q, k, v, mask):
         v = v.repeat_interleave(repeats, dim=2)
     scores = torch.einsum("bthd,bshd->bhts", q.float() / (q.shape[-1] ** 0.5), k.float())
     scores = scores.masked_fill(~mask, float("-inf"))
+    attn = torch.softmax(scores, dim=-1).to(v.dtype)
+    return torch.einsum("bhts,bshd->bthd", attn, v)
+
+
+def _dense_kv_bias_ref(q, k, v, kv_bias):
+    if q.shape[2] != k.shape[2]:
+        repeats = q.shape[2] // k.shape[2]
+        k = k.repeat_interleave(repeats, dim=2)
+        v = v.repeat_interleave(repeats, dim=2)
+    scores = torch.einsum("bthd,bshd->bhts", q.float() / (q.shape[-1] ** 0.5), k.float())
+    scores = scores + kv_bias.float().view(1, 1, 1, -1)
     attn = torch.softmax(scores, dim=-1).to(v.dtype)
     return torch.einsum("bhts,bshd->bthd", attn, v)
 
@@ -1277,6 +1332,47 @@ def test_sm120_forward_varlen_score_mod_aux_tensors_smoke(dtype, num_heads_q, nu
         score_mod=score_mod_global_kv_bias,
         aux_tensors=[kv_bias],
         pack_gqa=pack_gqa,
+    )
+    out_ref = _attention_ref_varlen_kv_bias(q, k, v, cu_seqlens_q, cu_seqlens_k, kv_bias)
+    out_no_bias = _attention_ref_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, False)
+    assert not torch.allclose(out_ref, out_no_bias)
+    torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] != 12,
+    reason="requires SM120 hardware",
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("num_heads_q,num_heads_kv", [(2, 2), (4, 2)])
+def test_sm120_forward_varlen_splitkv_score_mod_aux_tensors_smoke(dtype, num_heads_q, num_heads_kv):
+    torch.manual_seed(0)
+    q_lens = [17, 64, 129]
+    k_lens = [19, 63, 257]
+    cu_seqlens_q = torch.tensor(
+        [0, *torch.tensor(q_lens).cumsum(0).tolist()], device="cuda", dtype=torch.int32
+    )
+    cu_seqlens_k = torch.tensor(
+        [0, *torch.tensor(k_lens).cumsum(0).tolist()], device="cuda", dtype=torch.int32
+    )
+    q = torch.randn(sum(q_lens), num_heads_q, 64, device="cuda", dtype=dtype)
+    k = torch.randn(sum(k_lens), num_heads_kv, 64, device="cuda", dtype=dtype)
+    v = torch.randn(sum(k_lens), num_heads_kv, 64, device="cuda", dtype=dtype)
+    kv_bias = torch.randn(sum(k_lens), device="cuda", dtype=dtype)
+    out, _ = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max(q_lens),
+        max_seqlen_k=max(k_lens),
+        causal=False,
+        score_mod=score_mod_global_kv_bias,
+        aux_tensors=[kv_bias],
+        pack_gqa=False,
+        num_splits=2,
     )
     out_ref = _attention_ref_varlen_kv_bias(q, k, v, cu_seqlens_q, cu_seqlens_k, kv_bias)
     out_no_bias = _attention_ref_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, False)
