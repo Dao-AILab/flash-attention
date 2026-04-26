@@ -1,0 +1,146 @@
+import pytest
+import torch
+
+from flash_attn.cute.arch_policy import get_forward_arch_policy
+from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80
+from flash_attn.cute.flash_fwd_sm120 import FlashAttentionForwardSm120
+from flash_attn.cute.interface import _validate_sm120_fwd_support, flash_attn_func
+from flash_attn.cute.testing import attention_ref
+
+
+def _valid_sm120_kwargs(**overrides):
+    kwargs = dict(
+        dtype=torch.float16,
+        head_dim=64,
+        head_dim_v=64,
+        requires_grad=False,
+        is_varlen=False,
+        is_local=False,
+        softcap=None,
+        score_mod=None,
+        mask_mod=None,
+        aux_tensors=None,
+        learnable_sink=None,
+        qv=None,
+        pack_gqa=False,
+        pack_gqa_was_explicit=False,
+        num_splits=1,
+        page_table=None,
+        block_sparse_tensors=None,
+        tile_mn=None,
+    )
+    kwargs.update(overrides)
+    return kwargs
+
+
+def test_sm120_forward_policy_keeps_native_path_separate():
+    policy = get_forward_arch_policy(120)
+    assert policy.name == "sm120"
+    assert policy.smem_capacity_arch == "sm_120"
+    assert policy.native_tensor_only
+    assert policy.supports_warp_mma_f16bf16
+    assert not policy.supports_tma_o
+    assert not policy.supports_tmem
+    assert not policy.supports_tcgen05
+    assert not policy.supports_wgmma
+    assert not policy.supports_stmatrix_acc_store
+    assert not policy.supports_pack_gqa
+    assert not issubclass(FlashAttentionForwardSm120, FlashAttentionForwardSm80)
+
+
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        ({"dtype": torch.float32}, "only supports fp16 and bf16"),
+        ({"requires_grad": True}, "forward-only"),
+        ({"is_varlen": True}, "fixed-length"),
+        ({"is_local": True}, "local/window"),
+        ({"head_dim": 192, "head_dim_v": 192}, "head_dim"),
+        ({"head_dim": 64, "head_dim_v": 128}, "head_dim == head_dim_v"),
+        ({"pack_gqa": True, "pack_gqa_was_explicit": True}, "packed GQA"),
+        ({"num_splits": 2}, "SplitKV"),
+        ({"page_table": object()}, "paged KV"),
+        ({"block_sparse_tensors": object()}, "block sparsity"),
+        ({"softcap": 15.0}, "softcap"),
+        ({"score_mod": lambda *args: args[0]}, "score_mod"),
+        ({"mask_mod": lambda *args: True}, "mask_mod"),
+        ({"aux_tensors": [object()]}, "aux_tensors"),
+        ({"learnable_sink": object()}, "learnable_sink"),
+        ({"qv": object()}, "qv/MLA"),
+        ({"tile_mn": (128, 192)}, "tile_mn"),
+    ],
+)
+def test_sm120_forward_validation_rejects_out_of_scope_cases(overrides, message):
+    with pytest.raises(NotImplementedError, match=message):
+        _validate_sm120_fwd_support(**_valid_sm120_kwargs(**overrides))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] != 12,
+    reason="requires SM120 hardware",
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("head_dim", [64, 96, 128])
+@pytest.mark.parametrize("causal", [False, True])
+def test_sm120_forward_dense_mha_smoke(dtype, head_dim, causal):
+    torch.manual_seed(0)
+    q = torch.randn(1, 64, 2, head_dim, device="cuda", dtype=dtype)
+    k = torch.randn(1, 64, 2, head_dim, device="cuda", dtype=dtype)
+    v = torch.randn(1, 64, 2, head_dim, device="cuda", dtype=dtype)
+    out, _ = flash_attn_func(q, k, v, causal=causal, pack_gqa=False, num_splits=1)
+    out_ref, _ = attention_ref(q, k, v, causal=causal)
+    torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] != 12,
+    reason="requires SM120 hardware",
+)
+@pytest.mark.parametrize(
+    "batch_size, seqlen_q, seqlen_k, dtype, head_dim, causal",
+    [
+        (1, 127, 129, torch.float16, 64, False),
+        (1, 129, 127, torch.bfloat16, 64, True),
+        (2, 130, 257, torch.float16, 96, False),
+        (1, 257, 130, torch.bfloat16, 128, True),
+    ],
+)
+def test_sm120_forward_dense_mha_tile_boundary_shapes(
+    batch_size, seqlen_q, seqlen_k, dtype, head_dim, causal
+):
+    torch.manual_seed(0)
+    q = torch.randn(batch_size, seqlen_q, 2, head_dim, device="cuda", dtype=dtype)
+    k = torch.randn(batch_size, seqlen_k, 2, head_dim, device="cuda", dtype=dtype)
+    v = torch.randn(batch_size, seqlen_k, 2, head_dim, device="cuda", dtype=dtype)
+    out, _ = flash_attn_func(q, k, v, causal=causal, pack_gqa=False, num_splits=1)
+    out_ref, _ = attention_ref(q, k, v, causal=causal)
+    torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] != 12,
+    reason="requires SM120 hardware",
+)
+@pytest.mark.parametrize(
+    "num_heads_kv, causal, pack_gqa",
+    [
+        (1, False, False),
+        (2, False, False),
+        (1, True, None),
+        (2, True, None),
+    ],
+)
+def test_sm120_forward_dense_nonpacked_gqa_smoke(num_heads_kv, causal, pack_gqa):
+    torch.manual_seed(0)
+    q = torch.randn(1, 129, 4, 64, device="cuda", dtype=torch.float16)
+    k = torch.randn(1, 127, num_heads_kv, 64, device="cuda", dtype=torch.float16)
+    v = torch.randn(1, 127, num_heads_kv, 64, device="cuda", dtype=torch.float16)
+    kwargs = {"num_splits": 1}
+    if pack_gqa is not None:
+        kwargs["pack_gqa"] = pack_gqa
+    out, _ = flash_attn_func(q, k, v, causal=causal, **kwargs)
+    out_ref, _ = attention_ref(q, k, v, causal=causal)
+    torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)

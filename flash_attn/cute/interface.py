@@ -10,8 +10,6 @@ from typing import Optional, Tuple, Callable
 import torch
 
 
-import cuda.bindings.driver as cuda
-
 import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Float32
@@ -283,6 +281,80 @@ def _resolve_causal_local_window(causal, window_size_left, window_size_right, ma
         local = False
     return causal, local, window_size_left, window_size_right
 
+
+def _validate_sm120_fwd_support(
+    *,
+    dtype: torch.dtype,
+    head_dim: int,
+    head_dim_v: int,
+    requires_grad: bool,
+    is_varlen: bool,
+    is_local: bool,
+    softcap: Optional[float],
+    score_mod: Optional[Callable],
+    mask_mod: Optional[Callable],
+    aux_tensors: Optional[list[torch.Tensor]],
+    learnable_sink: Optional[torch.Tensor],
+    qv: Optional[torch.Tensor],
+    pack_gqa: bool,
+    pack_gqa_was_explicit: bool,
+    num_splits: int,
+    page_table: Optional[torch.Tensor],
+    block_sparse_tensors: Optional[BlockSparseTensorsTorch],
+    tile_mn: Optional[Tuple[int, int]],
+) -> None:
+    """Validate the intentionally small native SM120 FA4 forward surface."""
+    prefix = "SM120 FA4 forward native tensor path"
+
+    # Data type and autograd surface.
+    if dtype not in (torch.float16, torch.bfloat16):
+        raise NotImplementedError(f"{prefix} only supports fp16 and bf16 inputs.")
+    if requires_grad:
+        raise NotImplementedError(f"{prefix} is forward-only; backward is not supported.")
+
+    # Sequence and attention variants.
+    if is_varlen:
+        raise NotImplementedError(f"{prefix} only supports fixed-length dense tensors.")
+    if is_local:
+        raise NotImplementedError(f"{prefix} does not support local/window attention.")
+
+    # Head dimensions and packing.
+    if head_dim != head_dim_v:
+        raise NotImplementedError(f"{prefix} requires head_dim == head_dim_v.")
+    if head_dim not in (64, 96, 128):
+        raise NotImplementedError(f"{prefix} only supports head_dim in {{64, 96, 128}}.")
+    if pack_gqa and pack_gqa_was_explicit:
+        raise NotImplementedError(f"{prefix} does not support packed GQA/MQA.")
+
+    # Work decomposition and storage variants.
+    if num_splits != 1:
+        raise NotImplementedError(f"{prefix} does not support SplitKV.")
+    if page_table is not None:
+        raise NotImplementedError(f"{prefix} does not support paged KV.")
+    if block_sparse_tensors is not None:
+        raise NotImplementedError(f"{prefix} does not support block sparsity.")
+
+    # Extension hooks not included in the first native SM120 slice.
+    if softcap is not None:
+        raise NotImplementedError(f"{prefix} does not support softcap.")
+    if score_mod is not None:
+        raise NotImplementedError(f"{prefix} does not support score_mod.")
+    if mask_mod is not None:
+        raise NotImplementedError(f"{prefix} does not support mask_mod.")
+    if aux_tensors is not None:
+        raise NotImplementedError(f"{prefix} does not support aux_tensors.")
+    if learnable_sink is not None:
+        raise NotImplementedError(f"{prefix} does not support learnable_sink.")
+    if qv is not None:
+        raise NotImplementedError(f"{prefix} does not support qv/MLA.")
+
+    # Keep native SM120 tile coverage intentionally small until more shapes are validated.
+    if tile_mn is not None and tile_mn not in {(64, 64), (64, 128), (128, 64), (128, 128)}:
+        raise NotImplementedError(
+            f"{prefix} only supports tile_mn in "
+            "{(64, 64), (64, 128), (128, 64), (128, 128)}."
+        )
+
 def _flash_attn_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -426,6 +498,7 @@ def _flash_attn_fwd(
     if softcap == 0.0:
         softcap = None
     qhead_per_kvhead = num_head // num_head_kv
+    pack_gqa_was_explicit = pack_gqa is not None
     if pack_gqa is None:
         pack_gqa = qhead_per_kvhead > 1
 
@@ -477,6 +550,37 @@ def _flash_attn_fwd(
     causal, local, window_size_left, window_size_right = _resolve_causal_local_window(
         causal, window_size_left, window_size_right, mask_mod
     )
+
+    is_varlen = (
+        cu_seqlens_q is not None
+        or cu_seqlens_k is not None
+        or seqused_q is not None
+        or seqused_k is not None
+    )
+
+    if arch // 10 == 12:
+        if not pack_gqa_was_explicit:
+            pack_gqa = False
+        _validate_sm120_fwd_support(
+            dtype=q.dtype,
+            head_dim=head_dim,
+            head_dim_v=head_dim_v,
+            requires_grad=requires_grad,
+            is_varlen=is_varlen,
+            is_local=local,
+            softcap=softcap,
+            score_mod=score_mod,
+            mask_mod=mask_mod,
+            aux_tensors=aux_tensors,
+            learnable_sink=learnable_sink,
+            qv=qv,
+            pack_gqa=pack_gqa,
+            pack_gqa_was_explicit=pack_gqa_was_explicit,
+            num_splits=num_splits,
+            page_table=page_table,
+            block_sparse_tensors=block_sparse_tensors,
+            tile_mn=tile_mn,
+        )
 
     requested_use_clc_scheduler = utils._get_use_clc_scheduler_default()
     requested_disable_2cta = utils._get_disable_2cta_default()
@@ -583,13 +687,6 @@ def _flash_attn_fwd(
     # hash score and mask mods for compile cache
     score_mod_hash = utils.hash_callable(score_mod) if score_mod is not None else False
     mask_mod_hash = utils.hash_callable(mask_mod) if mask_mod is not None else False
-
-    is_varlen = (
-        cu_seqlens_q is not None
-        or cu_seqlens_k is not None
-        or seqused_q is not None
-        or seqused_k is not None
-    )
 
     # CLC regressed for varlen MHA and dense noncausal. Imbalanced varlen shapes
     # keep more K/V blocks in flight and hurt L2; dense noncausal mostly just
@@ -892,10 +989,23 @@ def _flash_attn_fwd(
                     use_clc_scheduler=requested_use_clc_scheduler,
                 )
         elif arch // 10 == 12:
-            # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
-            assert not use_block_sparsity, "Block sparsity not supported on SM 12.0"
-            assert page_table is None, "Paged KV not supported on SM 12.0 in this PR"
-            assert not is_split_kv, "SplitKV not supported on SM 12.0 in this PR"
+            # SM120 (Blackwell GeForce / DGX Spark): native warp-MMA tensor path.
+            if not FlashAttentionForwardSm120.can_implement(
+                dtype,
+                head_dim,
+                head_dim_v,
+                tile_m,
+                tile_n,
+                1,
+                num_threads,
+                causal,
+                Q_in_regs=False,
+            ):
+                raise NotImplementedError(
+                    "SM120 FA4 forward native tensor path cannot implement "
+                    f"dtype={q.dtype}, head_dim={head_dim}, head_dim_v={head_dim_v}, "
+                    f"tile_m={tile_m}, tile_n={tile_n}, num_threads={num_threads}."
+                )
             fa_fwd = FlashAttentionForwardSm120(
                 dtype,
                 head_dim,
@@ -1224,6 +1334,8 @@ def _flash_attn_bwd(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     arch = _get_device_arch()
     assert arch // 10 in [9, 10, 11, 12], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x, 12.x"
+    if arch // 10 == 12:
+        raise NotImplementedError("SM120 backward is not supported in FA4 CuTe yet.")
     sparse_q = None
     if block_sparse_tensors is not None and arch // 10 == 9:
         sparse_q = block_sparse_tensors.block_size[0] if block_sparse_tensors.block_size is not None else 128

@@ -7,23 +7,23 @@
 
 import math
 from types import SimpleNamespace
-from typing import Type, Callable, Optional, List
+from typing import Type, Callable, Optional
 from functools import partial
 
 import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Constexpr, Float32, Int32, const_expr, Boolean
+from cutlass import Float32, Int32, const_expr
 from cutlass.cute.nvgpu import cpasync, warp
 import cutlass.utils as utils_basic
-from cutlass.base_dsl.arch import Arch
 from cutlass.cutlass_dsl import BaseDSL
 
 from quack import copy_utils
 from quack import layout_utils
 
 from flash_attn.cute import ampere_helpers as sm80_utils
+from flash_attn.cute.arch_policy import get_forward_arch_policy
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import utils
 from flash_attn.cute.mask import AttentionMask
@@ -108,6 +108,7 @@ class FlashAttentionForwardBase:
                 "due to accumulator thread ownership pattern."
             )
         self.arch = BaseDSL._get_dsl().get_arch_enum()
+        self.forward_policy = get_forward_arch_policy(self.arch)
 
     @staticmethod
     def can_implement(
@@ -344,7 +345,11 @@ class FlashAttentionForwardBase:
         cute.arch.barrier(
             barrier_id=int(NamedBarrierFwd.Epilogue), number_of_threads=self.num_epilogue_threads
         )
-        smem_copy_atom_O = utils.get_smem_store_atom(self.arch.major * 10 + self.arch.minor, self.dtype)
+        smem_copy_atom_O = utils.get_smem_store_atom(
+            self.arch.major * 10 + self.arch.minor,
+            self.dtype,
+            use_stmatrix=self.forward_policy.supports_stmatrix_acc_store,
+        )
         smem_thr_copy_O = cute.make_tiled_copy_C(smem_copy_atom_O, tiled_mma).get_slice(tidx)
         taccOrO = smem_thr_copy_O.retile(rO)
         taccOsO = smem_thr_copy_O.partition_D(sO)
@@ -569,7 +574,7 @@ class FlashAttentionForwardBase:
             )
 
 
-class FlashAttentionForwardSm80(FlashAttentionForwardBase):
+class FlashAttentionForwardWarpMma(FlashAttentionForwardBase):
     def _get_smem_layout_atom(self):
         sQ_layout_atom = sm80_utils.get_smem_layout_atom(self.dtype, self.tile_hdim)
         sK_layout_atom = sQ_layout_atom
@@ -648,8 +653,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         self.num_producer_threads = self.num_threads
         self.num_Q_load_threads = self.num_threads
         self.num_epilogue_threads = self.num_threads
-        # self.use_tma_O = self.arch >= 90 and mCuSeqlensQ is None
-        self.use_tma_O = self.arch >= Arch.sm_90
+        self.use_tma_O = self.forward_policy.supports_tma_o
         self._setup_attributes()
         SharedStorage = self._get_shared_storage_cls()
         mQ, mK, mV, mO = [assume_tensor_aligned(t) for t in (mQ, mK, mV, mO)]
@@ -1219,6 +1223,10 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             constant_q_idx=None,
             qhead_per_kvhead=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
         )
+
+
+class FlashAttentionForwardSm80(FlashAttentionForwardWarpMma):
+    pass
 
 
 # SM90 forward pass moved to flash_fwd_sm90.py; re-export for backward compatibility

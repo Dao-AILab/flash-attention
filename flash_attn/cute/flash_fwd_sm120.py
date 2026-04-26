@@ -1,21 +1,17 @@
 # Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
 # SM120 (Blackwell GeForce / DGX Spark) forward pass.
 #
-# SM120 uses the same SM80-era MMA instructions (mma.sync.aligned.m16n8k16) but has
-# a smaller shared memory capacity (99 KB vs 163 KB on SM80). This module subclasses
-# FlashAttentionForwardSm80 and overrides the SMEM capacity check accordingly.
+# SM120 uses native Blackwell GeForce warp-MMA tensor support.  It shares the
+# generic warp-MMA implementation, but its feature policy stays separate from
+# SM80/SM90/SM100 so TMA, TMEM, and accumulator-store choices are explicit.
 
 import cutlass
 import cutlass.utils as utils_basic
 
-from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80
+from flash_attn.cute.flash_fwd import FlashAttentionForwardWarpMma
 
 
-class FlashAttentionForwardSm120(FlashAttentionForwardSm80):
-    # Keep arch = 80 to use CpAsync code paths (no TMA for output).
-    # The compilation target is determined by the GPU at compile time, not this field.
-    arch = 80
-
+class FlashAttentionForwardSm120(FlashAttentionForwardWarpMma):
     @staticmethod
     def can_implement(
         dtype,
@@ -28,10 +24,7 @@ class FlashAttentionForwardSm120(FlashAttentionForwardSm80):
         is_causal,
         Q_in_regs=False,
     ) -> bool:
-        """Check if the kernel can be implemented on SM120.
-
-        Same logic as SM80 but uses SM120's shared memory capacity (99 KB).
-        """
+        """Check whether this native SM120 warp-MMA configuration fits."""
         if dtype not in [cutlass.Float16, cutlass.BFloat16]:
             return False
         if head_dim % 8 != 0:
