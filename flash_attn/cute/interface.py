@@ -2146,6 +2146,7 @@ def flash_attn_varlen_func(
     pack_gqa: Optional[bool] = None,
     deterministic: bool = False,
     score_mod: Optional[Callable] = None,
+    score_mod_bwd: Optional[Callable] = None,
     aux_tensors: Optional[list] = None,
     return_lse: bool = False,
 ):
@@ -2159,7 +2160,7 @@ def flash_attn_varlen_func(
     gather_kv_indices: a tensor of shape (batch, seqlen_q, gather_kv_length) or
         (total_q, gather_kv_length) if there is cu_seqlens_q.
         Currently, only used for topk sparsity with MLA absorption kernel.
-    
+
     min_seqlen_k: for varlen, specifies the minimum kv sequence length for any batch.
         Used with gather_kv_indices to determine if we need oob masking.
     """
@@ -2186,6 +2187,7 @@ def flash_attn_varlen_func(
         pack_gqa,
         deterministic,
         score_mod,
+        score_mod_bwd,
         aux_tensors,
         return_lse,
     )
