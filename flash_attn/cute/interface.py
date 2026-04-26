@@ -317,10 +317,10 @@ def _validate_sm120_fwd_support(
         raise NotImplementedError(f"{prefix} is forward-only; backward is not supported.")
 
     # Head dimensions and packing.
-    if head_dim != head_dim_v:
-        raise NotImplementedError(f"{prefix} requires head_dim == head_dim_v.")
     if head_dim not in (64, 96, 128):
         raise NotImplementedError(f"{prefix} only supports head_dim in {{64, 96, 128}}.")
+    if head_dim_v not in (64, 96, 128):
+        raise NotImplementedError(f"{prefix} only supports head_dim_v in {{64, 96, 128}}.")
 
     # Work decomposition and storage variants.
     if num_splits != 1:

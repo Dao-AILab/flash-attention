@@ -70,7 +70,7 @@ def test_sm120_forward_policy_keeps_native_path_separate():
         ({"dtype": torch.float32}, "only supports fp16 and bf16"),
         ({"requires_grad": True}, "forward-only"),
         ({"head_dim": 192, "head_dim_v": 192}, "head_dim"),
-        ({"head_dim": 64, "head_dim_v": 128}, "head_dim == head_dim_v"),
+        ({"head_dim": 64, "head_dim_v": 192}, "head_dim_v"),
         ({"num_splits": 0}, "explicit num_splits"),
         ({"page_table": object()}, "seqused_k"),
         ({"block_sparse_tensors": object()}, "block sparsity"),
@@ -100,6 +100,13 @@ def test_sm120_forward_validation_rejects_out_of_scope_cases(overrides, message)
 def test_sm120_forward_validation_rejects_splitkv_combinations(overrides, message):
     with pytest.raises(NotImplementedError, match=message):
         _validate_sm120_fwd_support(**_valid_sm120_kwargs(**overrides))
+
+
+@pytest.mark.parametrize("head_dim,head_dim_v", [(64, 128), (128, 64), (96, 64)])
+def test_sm120_forward_validation_allows_unequal_head_dim_v(head_dim, head_dim_v):
+    _validate_sm120_fwd_support(
+        **_valid_sm120_kwargs(head_dim=head_dim, head_dim_v=head_dim_v)
+    )
 
 
 def test_sm120_forward_validation_allows_dense_aux_tensors():
@@ -199,6 +206,40 @@ def test_sm120_forward_dense_mha_tile_boundary_shapes(
     v = torch.randn(batch_size, seqlen_k, 2, head_dim, device="cuda", dtype=dtype)
     out, _ = flash_attn_func(q, k, v, causal=causal, pack_gqa=False, num_splits=1)
     out_ref, _ = attention_ref(q, k, v, causal=causal)
+    torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] != 12,
+    reason="requires SM120 hardware",
+)
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("head_dim,head_dim_v", [(64, 128), (128, 64), (96, 64)])
+@pytest.mark.parametrize("causal", [False, True])
+def test_sm120_forward_dense_mha_unequal_head_dim_v_smoke(dtype, head_dim, head_dim_v, causal):
+    torch.manual_seed(0)
+    q = torch.randn(1, 129, 2, head_dim, device="cuda", dtype=dtype)
+    k = torch.randn(1, 127, 2, head_dim, device="cuda", dtype=dtype)
+    v = torch.randn(1, 127, 2, head_dim_v, device="cuda", dtype=dtype)
+    out, _ = flash_attn_func(q, k, v, causal=causal, pack_gqa=False, num_splits=1)
+    out_ref, _ = attention_ref(q, k, v, causal=causal)
+    torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] != 12,
+    reason="requires SM120 hardware",
+)
+@pytest.mark.parametrize("pack_gqa", [False, True])
+def test_sm120_forward_dense_gqa_unequal_head_dim_v_smoke(pack_gqa):
+    torch.manual_seed(0)
+    q = torch.randn(1, 129, 4, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, 127, 1, 128, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(1, 127, 1, 64, device="cuda", dtype=torch.bfloat16)
+    out, _ = flash_attn_func(q, k, v, causal=False, pack_gqa=pack_gqa, num_splits=1)
+    out_ref, _ = attention_ref(q, k, v, causal=False)
     torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
 
 
@@ -603,12 +644,15 @@ def _attention_ref_varlen_kv_bias(q, k, v, cu_seqlens_q, cu_seqlens_k, kv_bias):
 
 def _make_paged_kv(k, v, page_size):
     batch_size, seqlen_k, num_heads_kv, head_dim = k.shape
+    head_dim_v = v.shape[-1]
     num_pages_per_seq = (seqlen_k + page_size - 1) // page_size
     num_pages = batch_size * num_pages_per_seq
     k_paged = torch.zeros(
         num_pages, page_size, num_heads_kv, head_dim, device=k.device, dtype=k.dtype
     )
-    v_paged = torch.zeros_like(k_paged)
+    v_paged = torch.zeros(
+        num_pages, page_size, num_heads_kv, head_dim_v, device=v.device, dtype=v.dtype
+    )
     page_table = torch.empty(
         batch_size, num_pages_per_seq, device=k.device, dtype=torch.int32
     )
@@ -675,6 +719,41 @@ def test_sm120_forward_varlen_dense_smoke(dtype, head_dim, causal, num_heads_q, 
     q = torch.randn(sum(q_lens), num_heads_q, head_dim, device="cuda", dtype=dtype)
     k = torch.randn(sum(k_lens), num_heads_kv, head_dim, device="cuda", dtype=dtype)
     v = torch.randn(sum(k_lens), num_heads_kv, head_dim, device="cuda", dtype=dtype)
+    out, _ = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max(q_lens),
+        max_seqlen_k=max(k_lens),
+        causal=causal,
+        pack_gqa=False,
+    )
+    out_ref = _attention_ref_varlen(q, k, v, cu_seqlens_q, cu_seqlens_k, causal)
+    torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] != 12,
+    reason="requires SM120 hardware",
+)
+@pytest.mark.parametrize("head_dim,head_dim_v", [(128, 64), (64, 128)])
+@pytest.mark.parametrize("causal", [False, True])
+def test_sm120_forward_varlen_unequal_head_dim_v_smoke(head_dim, head_dim_v, causal):
+    torch.manual_seed(0)
+    q_lens = [17, 64, 129]
+    k_lens = [19, 63, 127]
+    cu_seqlens_q = torch.tensor(
+        [0, *torch.tensor(q_lens).cumsum(0).tolist()], device="cuda", dtype=torch.int32
+    )
+    cu_seqlens_k = torch.tensor(
+        [0, *torch.tensor(k_lens).cumsum(0).tolist()], device="cuda", dtype=torch.int32
+    )
+    q = torch.randn(sum(q_lens), 2, head_dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(sum(k_lens), 2, head_dim, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(sum(k_lens), 2, head_dim_v, device="cuda", dtype=torch.bfloat16)
     out, _ = flash_attn_varlen_func(
         q,
         k,
@@ -768,6 +847,22 @@ def test_sm120_forward_varlen_gqa_splitkv_smoke(causal, num_heads_kv):
     torch.cuda.is_available() and torch.cuda.get_device_capability()[0] != 12,
     reason="requires SM120 hardware",
 )
+@pytest.mark.parametrize("head_dim,head_dim_v", [(128, 64), (64, 128)])
+def test_sm120_forward_dense_mha_splitkv_unequal_head_dim_v_smoke(head_dim, head_dim_v):
+    torch.manual_seed(0)
+    q = torch.randn(1, 129, 2, head_dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, 257, 2, head_dim, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(1, 257, 2, head_dim_v, device="cuda", dtype=torch.bfloat16)
+    out, _ = flash_attn_func(q, k, v, causal=False, pack_gqa=False, num_splits=2)
+    out_ref, _ = attention_ref(q, k, v, causal=False)
+    torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] != 12,
+    reason="requires SM120 hardware",
+)
 @pytest.mark.parametrize("causal", [False, True])
 def test_sm120_forward_paged_kv_varlen_q_smoke(causal):
     torch.manual_seed(0)
@@ -834,6 +929,41 @@ def test_sm120_forward_paged_kv_smoke(page_size, causal, num_heads_q, num_heads_
     )
     out_ref = _attention_ref_paged(q, k, v, cache_seqlens, causal).reshape(
         batch_size * seqlen_q, num_heads_q, head_dim
+    )
+    torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] != 12,
+    reason="requires SM120 hardware",
+)
+def test_sm120_forward_paged_kv_unequal_head_dim_v_smoke():
+    torch.manual_seed(0)
+    batch_size, seqlen_q, seqlen_k, head_dim, head_dim_v = 2, 129, 257, 128, 64
+    q = torch.randn(batch_size, seqlen_q, 4, head_dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(batch_size, seqlen_k, 1, head_dim, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(batch_size, seqlen_k, 1, head_dim_v, device="cuda", dtype=torch.bfloat16)
+    cache_seqlens = torch.tensor([257, 193], device="cuda", dtype=torch.int32)
+    k_paged, v_paged, page_table = _make_paged_kv(k, v, page_size=64)
+    cu_seqlens_q = torch.arange(
+        0, (batch_size + 1) * seqlen_q, seqlen_q, device="cuda", dtype=torch.int32
+    )
+    out, _ = flash_attn_varlen_func(
+        q.reshape(batch_size * seqlen_q, 4, head_dim),
+        k_paged,
+        v_paged,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=None,
+        max_seqlen_q=seqlen_q,
+        max_seqlen_k=None,
+        seqused_k=cache_seqlens,
+        page_table=page_table,
+        causal=False,
+        pack_gqa=False,
+    )
+    out_ref = _attention_ref_paged(q, k, v, cache_seqlens, False).reshape(
+        batch_size * seqlen_q, 4, head_dim_v
     )
     torch.testing.assert_close(out, out_ref, atol=5e-2, rtol=5e-2)
 
