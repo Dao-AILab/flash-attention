@@ -1821,24 +1821,19 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         )
         sLSE_for_copy = cute.flat_divide(sLSE, (1,))
         LSE_for_copy = cute.flat_divide(LSE, (1,))
+        # Warp-coalesced: at each i, lane T accesses index `T + i*W` (stride-1
+        # across the warp) instead of `T*N + i` (stride-N across the warp).
         for i in cutlass.range_constexpr(async_copy_num_elts):
-            LSE_idx = self.tile_shape_Q * iter_index + thread_idx * async_copy_num_elts
-            if cute.elem_less(LSE_idx + i, problem_shape[0]):
+            LSE_idx = self.tile_shape_Q * iter_index + thread_idx + i * self.threads_per_warp
+            sLSE_idx = thread_idx + i * self.threads_per_warp
+            if cute.elem_less(LSE_idx, problem_shape[0]):
                 cute.copy(
                     atom_async_copy,
-                    LSE_for_copy[None, LSE_idx + i, (blk_coord_h, blk_coord_b)],
-                    sLSE_for_copy[
-                        None,
-                        thread_idx * async_copy_num_elts + i,
-                        lse_handle.index,
-                    ],
+                    LSE_for_copy[None, LSE_idx, (blk_coord_h, blk_coord_b)],
+                    sLSE_for_copy[None, sLSE_idx, lse_handle.index],
                 )
             else:
-                sLSE_for_copy[
-                    None,
-                    thread_idx * async_copy_num_elts + i,
-                    lse_handle.index,
-                ].fill(0.0)
+                sLSE_for_copy[None, sLSE_idx, lse_handle.index].fill(0.0)
         lse_handle.commit()
 
         v_handle = load_mma_V_producer.acquire_and_advance()
@@ -1861,23 +1856,16 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         sSum_OdO_for_copy = cute.flat_divide(sSum_OdO, (1,))
         sum_OdO_for_copy = cute.flat_divide(sum_OdO, (1,))
         for i in cutlass.range_constexpr(async_copy_num_elts):
-            sum_OdO_idx = self.tile_shape_Q * iter_index + thread_idx * async_copy_num_elts
-            if cute.elem_less(sum_OdO_idx + i, problem_shape[0]):
+            sum_OdO_idx = self.tile_shape_Q * iter_index + thread_idx + i * self.threads_per_warp
+            sSum_OdO_idx = thread_idx + i * self.threads_per_warp
+            if cute.elem_less(sum_OdO_idx, problem_shape[0]):
                 cute.copy(
                     atom_async_copy,
-                    sum_OdO_for_copy[None, sum_OdO_idx + i, (blk_coord_h, blk_coord_b)],
-                    sSum_OdO_for_copy[
-                        None,
-                        thread_idx * async_copy_num_elts + i,
-                        sum_odo_handle.index,
-                    ],
+                    sum_OdO_for_copy[None, sum_OdO_idx, (blk_coord_h, blk_coord_b)],
+                    sSum_OdO_for_copy[None, sSum_OdO_idx, sum_odo_handle.index],
                 )
             else:
-                sSum_OdO_for_copy[
-                    None,
-                    thread_idx * async_copy_num_elts + i,
-                    sum_odo_handle.index,
-                ].fill(0.0)
+                sSum_OdO_for_copy[None, sSum_OdO_idx, sum_odo_handle.index].fill(0.0)
         sum_odo_handle.commit()
 
         dot_handle = load_mma_dOT_producer.acquire_and_advance()
@@ -1917,23 +1905,16 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             sLSE_for_copy = cute.flat_divide(sLSE, (1,))
             LSE_for_copy = cute.flat_divide(LSE, (1,))
             for i in cutlass.range_constexpr(async_copy_num_elts):
-                LSE_idx = self.tile_shape_Q * iter_index + thread_idx * async_copy_num_elts
-                if cute.elem_less(LSE_idx + i, problem_shape[0]):
+                LSE_idx = self.tile_shape_Q * iter_index + thread_idx + i * self.threads_per_warp
+                sLSE_idx = thread_idx + i * self.threads_per_warp
+                if cute.elem_less(LSE_idx, problem_shape[0]):
                     cute.copy(
                         atom_async_copy,
-                        LSE_for_copy[None, LSE_idx + i, (blk_coord_h, blk_coord_b)],
-                        sLSE_for_copy[
-                            None,
-                            thread_idx * async_copy_num_elts + i,
-                            lse_handle.index,
-                        ],
+                        LSE_for_copy[None, LSE_idx, (blk_coord_h, blk_coord_b)],
+                        sLSE_for_copy[None, sLSE_idx, lse_handle.index],
                     )
                 else:
-                    sLSE_for_copy[
-                        None,
-                        thread_idx * async_copy_num_elts + i,
-                        lse_handle.index,
-                    ].fill(0.0)
+                    sLSE_for_copy[None, sLSE_idx, lse_handle.index].fill(0.0)
             lse_handle.commit()
 
             do_handle = load_mma_dO_producer.acquire_and_advance()
@@ -1948,23 +1929,18 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             sSum_OdO_for_copy = cute.flat_divide(sSum_OdO, (1,))
             sum_OdO_for_copy = cute.flat_divide(sum_OdO, (1,))
             for i in cutlass.range_constexpr(async_copy_num_elts):
-                sum_OdO_idx = self.tile_shape_Q * iter_index + thread_idx * async_copy_num_elts
-                if cute.elem_less(sum_OdO_idx + i, problem_shape[0]):
+                sum_OdO_idx = (
+                    self.tile_shape_Q * iter_index + thread_idx + i * self.threads_per_warp
+                )
+                sSum_OdO_idx = thread_idx + i * self.threads_per_warp
+                if cute.elem_less(sum_OdO_idx, problem_shape[0]):
                     cute.copy(
                         atom_async_copy,
-                        sum_OdO_for_copy[None, sum_OdO_idx + i, (blk_coord_h, blk_coord_b)],
-                        sSum_OdO_for_copy[
-                            None,
-                            thread_idx * async_copy_num_elts + i,
-                            sum_odo_handle.index,
-                        ],
+                        sum_OdO_for_copy[None, sum_OdO_idx, (blk_coord_h, blk_coord_b)],
+                        sSum_OdO_for_copy[None, sSum_OdO_idx, sum_odo_handle.index],
                     )
                 else:
-                    sSum_OdO_for_copy[
-                        None,
-                        thread_idx * async_copy_num_elts + i,
-                        sum_odo_handle.index,
-                    ].fill(0.0)
+                    sSum_OdO_for_copy[None, sSum_OdO_idx, sum_odo_handle.index].fill(0.0)
             sum_odo_handle.commit()
 
             dot_handle = load_mma_dOT_producer.acquire_and_advance()
