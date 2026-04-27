@@ -426,8 +426,9 @@ def _run_mask_test(
             pack_gqa=pack_gqa,
             mask_mod=mask_mod_cute,
             aux_tensors=aux_tensors_arg,
+            block_sparse_tensors=block_sparse_mask_fwd,
+            block_sparse_tensors_bwd=block_sparse_mask_bwd,
             return_lse=True,
-            **bs_kwargs,
         )
     else:
         out_tuple = _flash_attn_fwd(

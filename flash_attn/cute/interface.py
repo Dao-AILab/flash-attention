@@ -1874,23 +1874,10 @@ class FlashAttnFunc(torch.autograd.Function):
         score_mod_bwd: Optional[Callable] = None,
         mask_mod: Optional[Callable] = None,
         aux_tensors: Optional[list] = None,
-        full_block_cnt: Optional[torch.Tensor] = None,
-        full_block_idx: Optional[torch.Tensor] = None,
-        mask_block_cnt: Optional[torch.Tensor] = None,
-        mask_block_idx: Optional[torch.Tensor] = None,
-        block_size: Optional[Tuple[int, int]] = None,
+        block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
+        block_sparse_tensors_bwd: Optional[BlockSparseTensorsTorch] = None,
         return_lse: bool = False,
     ):
-        # Only create block sparse tensors if at least one block sparse parameter is provided
-        block_sparse_tensors = None
-        if any(t is not None for t in [full_block_cnt, full_block_idx, mask_block_cnt, mask_block_idx]):
-            block_sparse_tensors = BlockSparseTensorsTorch(
-                full_block_cnt=full_block_cnt,
-                full_block_idx=full_block_idx,
-                mask_block_cnt=mask_block_cnt,
-                mask_block_idx=mask_block_idx,
-                block_size=block_size,
-            )
         out, lse = _flash_attn_fwd(
             q,
             k,
@@ -1921,6 +1908,7 @@ class FlashAttnFunc(torch.autograd.Function):
         ctx.score_mod = score_mod 
         ctx.score_mod_bwd = score_mod_bwd 
         ctx.mask_mod = mask_mod
+        ctx.block_sparse_tensors_bwd = block_sparse_tensors_bwd
         ctx.set_materialize_grads(False)
         return out, lse
 
@@ -1949,6 +1937,7 @@ class FlashAttnFunc(torch.autograd.Function):
             score_mod_bwd=ctx.score_mod_bwd,
             mask_mod=ctx.mask_mod,
             aux_tensors=aux_tensors,
+            block_sparse_tensors=ctx.block_sparse_tensors_bwd,
             dlse=dlse,
         )
         return dq, dk, dv, *((None,) * 30)  # Extra Nones is fine
@@ -2089,11 +2078,8 @@ def flash_attn_func(
     score_mod_bwd: Optional[Callable] = None,
     mask_mod: Optional[Callable] = None,
     aux_tensors: Optional[list] = None,
-    full_block_cnt: Optional[torch.Tensor] = None,
-    full_block_idx: Optional[torch.Tensor] = None,
-    mask_block_cnt: Optional[torch.Tensor] = None,
-    mask_block_idx: Optional[torch.Tensor] = None,
-    block_size: Optional[Tuple[int, int]] = None,
+    block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
+    block_sparse_tensors_bwd: Optional[BlockSparseTensorsTorch] = None,
     return_lse: bool = False,
 ):
     return FlashAttnFunc.apply(
@@ -2114,11 +2100,8 @@ def flash_attn_func(
         score_mod_bwd,
         mask_mod,
         aux_tensors,
-        full_block_cnt,
-        full_block_idx,
-        mask_block_cnt,
-        mask_block_idx,
-        block_size,
+        block_sparse_tensors,
+        block_sparse_tensors_bwd,
         return_lse,
     )
 
