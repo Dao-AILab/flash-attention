@@ -729,6 +729,8 @@ def handle_block_sparse_empty_tile_correction_sm100(
 
         if const_expr(gmem_tiled_copy_O is None):
             pipeline_o_epi.producer_acquire_w_index_phase(stage, corr_epi_producer_phase)
+
+        gO_stage = gO[None, None, stage] if const_expr(gO is not None) else None
         correction_epilogue(
             thr_mma_pv,
             tOtO[None, None, None, stage],
@@ -739,7 +741,7 @@ def handle_block_sparse_empty_tile_correction_sm100(
             Float32(0.0),  # zero scale ensures empty tile writes zeros into staged outputs
             sO[None, None, stage],
             mO_cur,
-            gO[None, None, stage],
+            gO_stage,
             gmem_tiled_copy_O,
         )
         if const_expr(gmem_tiled_copy_O is None):
