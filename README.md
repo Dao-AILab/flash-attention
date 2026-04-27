@@ -544,6 +544,27 @@ To run the tests:
 ```sh
 pytest -q -s tests/test_flash_attn.py
 ```
+
+### Parallel compile/prewarm to speed up testing
+
+Use `-n auto` mainly for FakeTensor compile/prewarm runs. This keeps CPU cores busy
+compiling independent CuTe DSL specializations and populates the persistent cache.
+For real GPU execution, prefer serial pytest on a single GPU; multiple xdist workers
+can contend for the same GPU and make runs slower or noisier.
+
+```
+# Parallel compile/prewarm pass for the main FA4 forward tests.
+# This is useful on any supported architecture when many kernel specializations need compiling.
+FLASH_ATTENTION_FAKE_TENSOR=1 FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1 \
+pytest -n auto -x tests/cute/test_flash_attn.py
+```
+
+This needs pytest-xdist.
+
+```sh
+pip install pytest-xdist
+```
+
 ## When you encounter issues
 
 This new release of FlashAttention-2 has been tested on several GPT-style
