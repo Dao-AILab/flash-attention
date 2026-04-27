@@ -21,6 +21,8 @@ from quack.cute_dsl_utils import ParamsBase
 
 import flash_attn.cute.utils as utils
 from flash_attn.cute.fast_math import clz
+from flash_attn.cute.fa_logging import fa_printf
+from flash_attn.cute.utils import smid
 
 
 class SchedulingMode(IntEnum):
@@ -575,6 +577,18 @@ class SingleTileLPTScheduler:
         if const_expr(params.lpt):
             block = params.num_block - 1 - block
         is_valid = self._tile_idx < params.total_blocks
+        if is_valid and cute.arch.thread_idx()[0] == 0:
+            fa_printf(
+                3,
+                "[STATIC] query sm={} cta={} (m_blk={},h={},b={},s={}) valid={}\n",
+                smid(),
+                cute.arch.block_idx()[0],
+                Int32(block),
+                Int32(head_idx),
+                Int32(batch_idx),
+                Int32(self._split_idx),
+                is_valid,
+            )
         return WorkTileInfo(
             (Int32(block), Int32(head_idx), Int32(batch_idx), Int32(self._split_idx)), is_valid
         )
