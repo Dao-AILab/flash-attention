@@ -548,6 +548,51 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         self.tma_copy_V_bytes = cute.size_in_bytes(V.element_type, V_smem_layout) * atom_thr_size
         self.tma_copy_dO_bytes = cute.size_in_bytes(dO.element_type, dO_smem_layout) * atom_thr_size
 
+        # Variant 3a epilogue: TMA store atoms (S2G) for dK / dV.
+        # Each compute warp group owns half the hd_v output via split_wg, so
+        # the per-WG epi tile is (cta_tiler[1], cta_tiler[2] / num_compute_wgs).
+        # SMEM staging will alias onto sP+sdST in subsequent commits; for now
+        # the atoms and layouts are built and threaded through but unused.
+        tma_store_op = cpasync.CopyBulkTensorTileS2GOp()
+        num_compute_wgs = self.num_compute_warps // 4
+        # Variant 3a Path 2: CTA-shared epilogue SMEM. epi_tile is (M, gcd(128B, ...))
+        # = (M, 64) for bf16 hd=256. Total stages = num_compute_wgs * num_epi_stages
+        # = 4 stages of (64, 64), virtually a per-CTA (64, 256) buffer aliased onto
+        # sP+sdST. Both warp-groups cooperatively populate this buffer; TMA fires
+        # one (64, 64) box per stage to the corresponding (64, 64) GMEM slice.
+        epi_cols_dKV = math.gcd(
+            128 // (dK.element_type.width // 8), self.cta_tiler[2] // num_compute_wgs
+        )
+        num_epi_stages_dKV = (self.cta_tiler[2] // num_compute_wgs) // epi_cols_dKV
+        epi_tile_dKV = (self.cta_tiler[1], epi_cols_dKV)
+        total_epi_stages = num_compute_wgs * num_epi_stages_dKV
+        dK_layout_enum = utils.LayoutEnum.from_tensor(dK)
+        dV_layout_enum = utils.LayoutEnum.from_tensor(dV)
+        sdK_epi_layout = sm100_utils.make_smem_layout_epi(
+            dK.element_type,
+            dK_layout_enum,
+            epi_tile_dKV,
+            total_epi_stages,
+        )
+        sdV_epi_layout = sm100_utils.make_smem_layout_epi(
+            dV.element_type,
+            dV_layout_enum,
+            epi_tile_dKV,
+            total_epi_stages,
+        )
+        tma_atom_dK, tma_tensor_dK = cpasync.make_tiled_tma_atom(
+            tma_store_op,
+            dK,
+            cute.select(sdK_epi_layout, mode=[0, 1]),
+            epi_tile_dKV,
+        )
+        tma_atom_dV, tma_tensor_dV = cpasync.make_tiled_tma_atom(
+            tma_store_op,
+            dV,
+            cute.select(sdV_epi_layout, mode=[0, 1]),
+            epi_tile_dKV,
+        )
+
         @cute.struct
         class SharedStorage:
             # Pipeline barriers
@@ -674,6 +719,10 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             tma_tensor_dOT,
             dK,
             dV,
+            tma_atom_dK,
+            tma_tensor_dK,
+            tma_atom_dV,
+            tma_tensor_dV,
             scaled_LSE,
             scale_softmax,
             sum_OdO,
@@ -692,6 +741,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             P_smem_layout_staged,
             LSE_smem_layout,
             sum_OdO_smem_layout,
+            sdK_epi_layout,
+            sdV_epi_layout,
             self.tile_sched_params,
         ).launch(
             grid=bwd_grid,
@@ -725,6 +776,10 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         dOT_in: cute.Tensor,
         dK: cute.Tensor,
         dV: cute.Tensor,
+        tma_atom_dK: cute.CopyAtom,
+        dK_tma: cute.Tensor,
+        tma_atom_dV: cute.CopyAtom,
+        dV_tma: cute.Tensor,
         LSE: cute.Tensor,
         scale_softmax: cutlass.Float32,
         sum_OdO: cute.Tensor,
@@ -743,6 +798,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         P_smem_layout_staged: cute.ComposedLayout,
         LSE_smem_layout: cute.Layout,
         sum_OdO_smem_layout: cute.Layout,
+        sdK_epi_layout: cute.ComposedLayout,
+        sdV_epi_layout: cute.ComposedLayout,
         tile_sched_params: FmhaStaticTileSchedulerParams | FmhaClcDynamicTileSchedulerParams,
     ):
         """Core CuTeDSL backward kernel."""
@@ -1359,6 +1416,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                             sP,
                             sLSE,
                             sdST,
+                            sdOT,
                             sSum_OdO,
                             dK,
                             dV,
@@ -1390,6 +1448,12 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                             varlen,
                             sK,
                             seqlen_k_cur_batch,
+                            tma_atom_dK,
+                            dK_tma,
+                            tma_atom_dV,
+                            dV_tma,
+                            sdK_epi_layout,
+                            sdV_epi_layout,
                         )
                         cute.arch.barrier(
                             barrier_id=self.epilogue_sync_bar_id,
@@ -1552,6 +1616,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                     sP,
                     sLSE,
                     sdST,
+                    sdOT,
                     sSum_OdO,
                     dK,
                     dV,
@@ -1583,6 +1648,12 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                     varlen,
                     sK,
                     seqlen_k_cur_batch,
+                    tma_atom_dK,
+                    dK_tma,
+                    tma_atom_dV,
+                    dV_tma,
+                    sdK_epi_layout,
+                    sdV_epi_layout,
                 )
 
                 cute.arch.barrier(
@@ -2355,6 +2426,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         sLSE: cute.Tensor,
         # sdS: cute.Tensor,
         sdST: cute.Tensor,
+        sdOT: cute.Tensor,
         sSum_OdO: cute.Tensor,
         dK: cute.Tensor,
         dV: cute.Tensor,
@@ -2386,6 +2458,12 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         varlen: bool,
         sK: cute.Tensor,
         problem_shape_k_cur_batch: Int32,
+        tma_atom_dK: cute.CopyAtom,
+        dK_tma: cute.Tensor,
+        tma_atom_dV: cute.CopyAtom,
+        dV_tma: cute.Tensor,
+        sdK_epi_layout: cute.ComposedLayout,
+        sdV_epi_layout: cute.ComposedLayout,
     ):
         """CuTeDSL kernel for recomputing softmax and producing dk and dv."""
         tidx, _, _ = cute.arch.thread_idx()
@@ -2625,6 +2703,15 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             mma_compute_dKdV_producer,
             mma_compute_dKdV_consumer,
             problem_shape_k_cur_batch,
+            tma_atom_dK,
+            dK_tma,
+            tma_atom_dV,
+            dV_tma,
+            sdK_epi_layout,
+            sdV_epi_layout,
+            varlen,
+            sdOT,
+            sP,
         )
 
         if not cutlass.const_expr(self.use_clc_scheduler):
@@ -2736,8 +2823,28 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         mma_compute_dKdV_producer,
         mma_compute_dKdV_consumer,
         problem_shape_k_cur_batch: Int32,
+        tma_atom_dK: cute.CopyAtom,
+        dK_tma: cute.Tensor,
+        tma_atom_dV: cute.CopyAtom,
+        dV_tma: cute.Tensor,
+        sdK_epi_layout: cute.ComposedLayout,
+        sdV_epi_layout: cute.ComposedLayout,
+        varlen: bool,
+        sdOT: cute.Tensor,
+        sP: cute.Tensor,
     ):
-        """Epilogue phase to store result from tensor memory to register, then global memory."""
+        """Variant 3a (5/5) Path 2: CTA-shared SMEM with cooperative WG writes + TMA bulk store.
+
+        Both warp-groups cooperatively populate a per-CTA (64, 256) virtual SMEM
+        buffer (4 stages of (64, 64) aliased onto sP+sdST). Per-thread t2r N
+        coverage is interleaved across the full hd=256, so per-WG TMA is not
+        viable — instead we treat SMEM as one shared per-CTA buffer and let
+        each thread's `self.store`-equivalent write into it via a (64, 256)
+        virtual tensor whose N axis maps (n%64, n//64) → (N_within, stage).
+        After an inter-WG barrier (256 threads), the leader warp fires 4 TMA
+        bulk stores, one per stage, to the corresponding (64, 64) GMEM slice.
+        Varlen falls back to per-thread self.store as in flash_bwd_sm100.py.
+        """
         tidx, _, _ = cute.arch.thread_idx()
         _, K, D, HB = problem_shape
         _, blk_coord_k, _, blk_coord_batch = blk_coord
@@ -2765,12 +2872,41 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         num_warp_groups = self.num_compute_warps // 4
         dp_idx = tidx % 128
         wg_idx = (tidx % (self.num_compute_warps * self.threads_per_warp)) // 128
+        leader_warp = (cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4) == 0
+
+        # Path 2 SMEM staging. dV stages through sdOT (already-consumed by the
+        # dV MMA before the dV epilogue begins). dK stages through sP+sdST
+        # (dead after dK MMA completes, before dK epilogue runs).
+        s_epi_dK = cute.make_tensor(
+            cute.recast_ptr(sP.iterator, sdK_epi_layout.inner, dK.element_type),
+            sdK_epi_layout.outer,
+        )
+        s_epi_dV = cute.make_tensor(
+            cute.recast_ptr(sdOT.iterator, sdV_epi_layout.inner, dV.element_type),
+            sdV_epi_layout.outer,
+        )
+
+        # Compile-time: stage tile shape and number of stages.
+        epi_cols_dKV = math.gcd(
+            128 // (dV.element_type.width // 8), self.cta_tiler[2] // num_warp_groups
+        )
+        num_epi_stages_dKV = (self.cta_tiler[2] // num_warp_groups) // epi_cols_dKV
+        total_epi_stages = num_warp_groups * num_epi_stages_dKV
+        epi_tile_dKV = (self.cta_tiler[1], epi_cols_dKV)
+
+        # Local (M, N) coord tensor for SMEM indexing (no global domain offset
+        # — cdK/cdV are domain-offset by blk_coord_k * tile_shape_K to match
+        # the GMEM destination, but the SMEM indexing must be per-CTA-local).
+        cdV_local = cute.make_identity_tensor((self.cta_tiler[1], self.cta_tiler[2]))
+        cdK_local = cdV_local
 
         tiled_t2r_dK = tcgen05.make_tmem_copy(load_op, tdKtdK)
         thread_t2r_dK = tiled_t2r_dK.get_slice(dp_idx)
 
         tTR_cdK = thread_t2r_dK.partition_D(cdK)
         tTR_cdK = split_wg(tTR_cdK, num_warp_groups, wg_idx)
+        tTR_cdK_local = thread_t2r_dK.partition_D(cdK_local)
+        tTR_cdK_local = split_wg(tTR_cdK_local, num_warp_groups, wg_idx)
         tTR_gdK = thread_t2r_dK.partition_D(gdK)
         tTR_gdK = split_wg(tTR_gdK, num_warp_groups, wg_idx)
         tTR_rdK = cute.make_rmem_tensor(tTR_cdK.shape, self.acc_dtype)
@@ -2797,17 +2933,80 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
 
         tTR_cdV = thread_t2r_dV.partition_D(cdV)
         tTR_cdV = split_wg(tTR_cdV, num_warp_groups, wg_idx)
+        tTR_cdV_local = thread_t2r_dV.partition_D(cdV_local)
+        tTR_cdV_local = split_wg(tTR_cdV_local, num_warp_groups, wg_idx)
         tTR_gdV = thread_t2r_dV.partition_D(gdV)
         tTR_gdV = split_wg(tTR_gdV, num_warp_groups, wg_idx)
         tTR_rdV = cute.make_rmem_tensor(tTR_cdV.shape, self.acc_dtype)
         tTR_tdV = thread_t2r_dV.partition_S(tdVtdV)
         tTR_tdV = split_wg(tTR_tdV, num_warp_groups, wg_idx)
 
+        # GMEM destinations for the multi-stage TMA path (gated on not-varlen).
+        if cutlass.const_expr(not varlen):
+            mdV_tma_3d = cute.make_tensor(
+                dV_tma.iterator,
+                cute.make_layout((K, self.cta_tiler[2], HB), stride=dV_tma.stride),
+            )
+            mdV_tma_cur = mdV_tma_3d[None, None, blk_coord_batch]
+            gdV_tma = cute.local_tile(
+                mdV_tma_cur, (self.cta_tiler[1], self.cta_tiler[2]), (blk_coord_k, 0)
+            )
+            gdV_tma_epi = cute.local_tile(gdV_tma, epi_tile_dKV, (0, None))
+
+            mdK_tma_3d = cute.make_tensor(
+                dK_tma.iterator,
+                cute.make_layout((K, self.cta_tiler[2], HB), stride=dK_tma.stride),
+            )
+            mdK_tma_cur = mdK_tma_3d[None, None, blk_coord_batch]
+            gdK_tma = cute.local_tile(
+                mdK_tma_cur, (self.cta_tiler[1], self.cta_tiler[2]), (blk_coord_k, 0)
+            )
+            gdK_tma_epi = cute.local_tile(gdK_tma, epi_tile_dKV, (0, None))
+
+        cta_threads = self.num_compute_warps * self.threads_per_warp
+
         dkdv_handle = mma_compute_dKdV_consumer.wait_and_advance()
 
         if blk_coord_k * self.tile_shape_K < problem_shape_k_cur_batch:
             cute.copy(tiled_t2r_dV, tTR_tdV, tTR_rdV)
-            self.store(tTR_gdV, tTR_rdV, tTR_cdV, (K, D))
+            tTR_rdV_cast = cute.make_rmem_tensor(tTR_rdV.shape, dV.element_type)
+            tTR_rdV_cast.store(tTR_rdV.load().to(dV.element_type))
+
+            if cutlass.const_expr(not varlen):
+                # reg -> SMEM via per-element indexed stores using tTR_cdV's
+                # per-thread (M, N) coords. (M, N) is per-CTA cdV space (M=0..63,
+                # N=0..255). We map N=(n%epi_cols, n//epi_cols) → (N_within, stage)
+                # of the 3D s_epi_dV tensor.
+                for _i in cutlass.range_constexpr(cute.size(tTR_cdV_local, mode=[2])):
+                    for _j in cutlass.range_constexpr(cute.size(tTR_cdV_local[None, 0, _i])):
+                        c = tTR_cdV_local[None, 0, _i][_j]
+                        m_pos = c[0]
+                        n_pos = c[1]
+                        stage_pos = n_pos // epi_cols_dKV
+                        n_within_pos = n_pos % epi_cols_dKV
+                        v = tTR_rdV_cast[None, 0, _i][_j]
+                        s_epi_dV[m_pos, n_within_pos, stage_pos] = v
+                cute.arch.fence_view_async_shared()
+                # Inter-WG barrier — both warp-groups must finish their writes
+                # before the leader warp reads SMEM via TMA.
+                cute.arch.barrier(barrier_id=5, number_of_threads=cta_threads)
+                # TMA bulk store, one (64, 64) box per stage.
+                if leader_warp and wg_idx == 0:
+                    for _stage in cutlass.range_constexpr(total_epi_stages):
+                        sdV_stage = s_epi_dV[None, None, _stage]
+                        gdV_stage = gdV_tma_epi[None, None, _stage]
+                        td_sdV, td_gdV = cpasync.tma_partition(
+                            tma_atom_dV,
+                            0,
+                            cute.make_layout(1),
+                            cute.group_modes(sdV_stage, 0, 2),
+                            cute.group_modes(gdV_stage, 0, 2),
+                        )
+                        cute.copy(tma_atom_dV, td_sdV, td_gdV)
+                        cute.arch.cp_async_bulk_commit_group()
+                cute.arch.cp_async_bulk_wait_group(0, read=True)
+            else:
+                self.store(tTR_gdV, tTR_rdV, tTR_cdV, (K, D))
 
         cute.arch.fence_view_async_tmem_load()
         dkdv_handle.release()
@@ -2820,7 +3019,37 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             for i in cutlass.range(cute.size(tTR_rdK), unroll_full=True):
                 tTR_rdK[i] = scale_softmax * tTR_rdK[i]
 
-            self.store(tTR_gdK, tTR_rdK, tTR_cdK, (K, D))
+            tTR_rdK_cast = cute.make_rmem_tensor(tTR_rdK.shape, dK.element_type)
+            tTR_rdK_cast.store(tTR_rdK.load().to(dK.element_type))
+
+            if cutlass.const_expr(not varlen):
+                for _i in cutlass.range_constexpr(cute.size(tTR_cdK_local, mode=[2])):
+                    for _j in cutlass.range_constexpr(cute.size(tTR_cdK_local[None, 0, _i])):
+                        c = tTR_cdK_local[None, 0, _i][_j]
+                        m_pos = c[0]
+                        n_pos = c[1]
+                        stage_pos = n_pos // epi_cols_dKV
+                        n_within_pos = n_pos % epi_cols_dKV
+                        v = tTR_rdK_cast[None, 0, _i][_j]
+                        s_epi_dK[m_pos, n_within_pos, stage_pos] = v
+                cute.arch.fence_view_async_shared()
+                cute.arch.barrier(barrier_id=6, number_of_threads=cta_threads)
+                if leader_warp and wg_idx == 0:
+                    for _stage in cutlass.range_constexpr(total_epi_stages):
+                        sdK_stage = s_epi_dK[None, None, _stage]
+                        gdK_stage = gdK_tma_epi[None, None, _stage]
+                        td_sdK, td_gdK = cpasync.tma_partition(
+                            tma_atom_dK,
+                            0,
+                            cute.make_layout(1),
+                            cute.group_modes(sdK_stage, 0, 2),
+                            cute.group_modes(gdK_stage, 0, 2),
+                        )
+                        cute.copy(tma_atom_dK, td_sdK, td_gdK)
+                        cute.arch.cp_async_bulk_commit_group()
+                cute.arch.cp_async_bulk_wait_group(0, read=True)
+            else:
+                self.store(tTR_gdK, tTR_rdK, tTR_cdK, (K, D))
 
         cute.arch.fence_view_async_tmem_load()
         dkdv_handle.release()
