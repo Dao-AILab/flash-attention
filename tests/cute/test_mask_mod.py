@@ -407,15 +407,7 @@ def _run_mask_test(
         q_ag = tensors["q"].detach().requires_grad_(True)
         k_ag = tensors["k"].detach().requires_grad_(True)
         v_ag = tensors["v"].detach().requires_grad_(True)
-        bs_kwargs = {}
-        if block_sparse_mask_fwd is not None:
-            bs_kwargs = dict(
-                mask_block_cnt=block_sparse_mask_fwd.mask_block_cnt,
-                mask_block_idx=block_sparse_mask_fwd.mask_block_idx,
-                full_block_cnt=block_sparse_mask_fwd.full_block_cnt,
-                full_block_idx=block_sparse_mask_fwd.full_block_idx,
-                block_size=block_sparse_mask_fwd.block_size,
-            )
+
         out_cute, lse_cute = flash_attn_func(
             q_ag,
             k_ag,
