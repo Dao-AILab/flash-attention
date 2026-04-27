@@ -1320,7 +1320,7 @@ def _flash_attn_bwd(
     else:
         batch_size = cu_seqlens_q.shape[0] - 1
         total_q = q.shape[0]
-        seqlen_q = max_seqlen_q if max_seqlen_q is not None else total_q
+        seqlen_q = int(max_seqlen_q) if max_seqlen_q is not None else total_q
 
     if cu_seqlens_k is None:
         batch_size, seqlen_k = k.shape[:2]
@@ -1328,7 +1328,7 @@ def _flash_attn_bwd(
     else:
         batch_size = cu_seqlens_k.shape[0] - 1
         total_k = k.shape[0]
-        seqlen_k = max_seqlen_k if max_seqlen_k is not None else total_k
+        seqlen_k = int(max_seqlen_k) if max_seqlen_k is not None else total_k
 
     num_head_kv = k.shape[-2]
 
