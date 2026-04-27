@@ -1819,7 +1819,7 @@ def test_flash_attn_invalid_head_dim(head_dim):
 @pytest.mark.parametrize("nheads", [16, 128])
 @pytest.mark.parametrize("kv_sparsity", [False, True])
 # @pytest.mark.parametrize("kv_sparsity", [True])
-@pytest.mark.parametrize("gather_kv_length", [2048])
+@pytest.mark.parametrize("gather_kv_length", [1024, 2048])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -1846,6 +1846,7 @@ def test_flash_attn_invalid_head_dim(head_dim):
         (1024, 1023),
         (2048, 2048),
         (1, 8192),
+        (4096, 4096),
     ],
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(128, 128)])
@@ -1886,7 +1887,7 @@ def test_flash_attn_mla_absorbed(
     torch.cuda.synchronize()
     batch_size = 9 if seqlen_k <= 2048 else 2
     # batch_size = 2
-    nheads = 128
+    # nheads = 128
     nheads_kv = nheads if mha_type == "mha" else (8 if mha_type == "gqa" else 1)
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
     dv_vals = [512]
@@ -2043,6 +2044,7 @@ def test_flash_attn_mla_absorbed(
             assert (out - out_ref).abs().max().item() <= rtol * (
                 out_pt - out_ref
             ).abs().max().item() + fwd_atol
+            assert not torch.isnan(lse).any(), "LSE contains NaN"
 
             repeats = 1000
             for iter in range(repeats):
@@ -2078,10 +2080,11 @@ def test_flash_attn_mla_absorbed(
 @pytest.mark.parametrize("local_enum", [0])
 @pytest.mark.parametrize("causal", [False, True])
 # @pytest.mark.parametrize("causal", [False])
+# @pytest.mark.parametrize("add_unused_qkv", [False, True])
 @pytest.mark.parametrize("add_unused_qkv", [False])
 @pytest.mark.parametrize("kv_sparsity", [False, True])
 # @pytest.mark.parametrize("kv_sparsity", [False])
-@pytest.mark.parametrize("gather_kv_length", [2048])
+@pytest.mark.parametrize("gather_kv_length", [1024, 2048])
 @pytest.mark.parametrize("d", [64])
 @pytest.mark.parametrize("nheads", [16, 128])
 # @pytest.mark.parametrize("nheads", [128])
@@ -2435,6 +2438,10 @@ def test_flash_attn_mla_absorbed_varlen(
             assert (out_cmp - out_ref_cmp).abs().max().item() <= rtol * (
                 out_pt_cmp - out_ref_cmp
             ).abs().max().item() + fwd_atol
+            # LSE sanity: only valid positions (packed unpad path; padded path
+            # can legitimately contain uninit tail beyond seqused_q).
+            if unpad_q:
+                assert not torch.isnan(lse).any(), "LSE contains NaN"
 
             repeats = 1000
             for iter in range(repeats):
