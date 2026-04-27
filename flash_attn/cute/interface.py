@@ -715,7 +715,7 @@ def _flash_attn_fwd(
         q_subtile_factor,
         mma_pv_is_rs,
         intra_wg_overlap,
-        requested_use_clc_scheduler,
+        use_clc_scheduler,
         qv is not None,
         gather_kv_length,
         sparse_kv,
@@ -889,7 +889,7 @@ def _flash_attn_fwd(
                     is_varlen_q=cu_seqlens_q is not None or seqused_q is not None,
                     q_subtile_factor=q_subtile_factor,
                     use_2cta_instrs=use_2cta_instrs,
-                    use_clc_scheduler=requested_use_clc_scheduler,
+                    use_clc_scheduler=use_clc_scheduler,
                 )
         elif arch // 10 == 12:
             # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
