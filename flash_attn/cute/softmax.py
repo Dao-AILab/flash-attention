@@ -434,7 +434,7 @@ def apply_score_mod_inner(
     q_idx_vec = cute.make_rmem_tensor(vec_size, cutlass.Int32)
 
     # For Pack-GQA with non-constant q_idx, we need per-element head indices
-    # since a thread my process multiple query head indices
+    # since a thread may process multiple query head indices
     if cutlass.const_expr(qhead_per_kvhead > 1 and constant_q_idx is None):
         head_idx_vec = cute.make_rmem_tensor(vec_size, cutlass.Int32)
 

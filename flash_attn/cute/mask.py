@@ -563,7 +563,7 @@ class AttentionMask:
         """
         Backward pass: mask S = K @ Q.T where n_block tiles seqlen_k and m_block tiles seqlen_q.
 
-        Coordinate conventio:
+        Coordinate convention:
         - ROW corresponds to Q (m_block)
         - COL corresponds to KV (n_block)
 
