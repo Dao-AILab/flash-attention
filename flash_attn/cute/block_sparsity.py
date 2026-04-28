@@ -19,26 +19,46 @@ class BlockSparseTensors(NamedTuple):
     mask_block_idx: cute.Tensor
     full_block_cnt: cute.Tensor | None
     full_block_idx: cute.Tensor | None
-    dq_write_order: cute.Tensor | None = None
-    dq_write_order_full: cute.Tensor | None = None
+    # Deterministic dQ metadata.
+    dq_write_order: cute.Tensor | None = None  # per sparse m-block semaphore rank
+    dq_write_order_full: cute.Tensor | None = None  # full-block semaphore rank
+    dq_kv_order: cute.Tensor | None = None  # scheduler rank -> n-block
 
     def __new_from_mlir_values__(self, values):
         if len(values) == 2:
-            values = (*values, None, None, None, None)
+            values = (*values, None, None, None, None, None)
         elif len(values) == 4:
-            values = (*values, None, None)
+            values = (*values, None, None, None)
+        elif len(values) == 6:
+            values = (*values, None)
         return BlockSparseTensors(*values)
 
 
 class BlockSparseTensorsTorch(NamedTuple):
+    """Torch-side block-sparse metadata.
+
+    `dq_kv_order` selects the deterministic dQ scheduler: `False` for builtin
+    ascending n-block order, `True` for builtin descending/SPT order, or a tensor
+    mapping scheduler rank to n-block.
+    """
+
     mask_block_cnt: torch.Tensor
     mask_block_idx: torch.Tensor
     full_block_cnt: torch.Tensor | None = None
     full_block_idx: torch.Tensor | None = None
     block_size: tuple[int, int] | None = None
-    dq_write_order: torch.Tensor | None = None
-    dq_write_order_full: torch.Tensor | None = None
-    spt: bool | None = None
+    # Deterministic dQ metadata.
+    dq_write_order: torch.Tensor | None = None  # per sparse m-block semaphore rank
+    dq_write_order_full: torch.Tensor | None = None  # full-block semaphore rank
+    dq_kv_order: torch.Tensor | bool | None = None
+
+
+def _check_dq_kv_order_shape(
+    dq_kv_order: torch.Tensor,
+    expected_shape: tuple[int, int, int],
+) -> None:
+    if tuple(dq_kv_order.shape) != expected_shape:
+        raise ValueError(f"dq_kv_order must have shape {expected_shape}")
 
 
 def _ordered_to_dense_simple(
@@ -78,7 +98,7 @@ def compute_dq_write_order(
     bwd_mask_idx: torch.Tensor,
     bwd_full_cnt: torch.Tensor | None,
     bwd_full_idx: torch.Tensor | None,
-    spt: bool = False,
+    dq_kv_order: torch.Tensor | bool | None = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     """Compute dQ write-order metadata for deterministic block-sparse backward.
 
@@ -86,8 +106,8 @@ def compute_dq_write_order(
     lock value: the rank of n_block in the combined (partial + full) sorted
     contributor list for the target m_block.
 
-    Lock values are assigned in ascending n_block order (or descending if spt=True)
-    to guarantee deadlock-freedom with the CTA scheduling order.
+    Lock values are assigned in the scheduler order encoded by dq_kv_order to
+    guarantee deadlock-freedom with the CTA scheduling order.
 
     Args:
         fwd_mask_cnt: [B, H, num_m_blocks] partial contributor counts per m_block
@@ -98,7 +118,8 @@ def compute_dq_write_order(
         bwd_mask_idx: [B, H, num_n_blocks, max_q] partial iteration m_block indices
         bwd_full_cnt: [B, H, num_n_blocks] full iteration counts per n_block (optional)
         bwd_full_idx: [B, H, num_n_blocks, max_q] full iteration m_block indices (optional)
-        spt: if True, reverse ordering (highest n_block gets lock_value=0)
+        dq_kv_order: bool selects builtin monotonic order (False=ascending, True=descending/spt),
+            or an explicit [B, H, num_n_blocks] scheduler order tensor.
 
     Returns:
         (dq_write_order, dq_write_order_full): tensors parallel to bwd_mask_idx
@@ -117,12 +138,25 @@ def compute_dq_write_order(
     else:
         dense = dense_partial
 
-    cumsum = dense.cumsum(dim=-1)
-    rank_table = (cumsum - dense).to(torch.int32)
+    if isinstance(dq_kv_order, torch.Tensor):
+        _check_dq_kv_order_shape(dq_kv_order, (B, H, num_n))
+        # Convert the explicit scheduler order into compact per-m-block semaphore ranks.
+        rank_by_n = torch.empty_like(dq_kv_order)
+        schedule_rank = torch.arange(num_n, device=device, dtype=torch.int32)[
+            None, None, :
+        ].expand_as(dq_kv_order)
+        rank_by_n.scatter_(-1, dq_kv_order.long(), schedule_rank)
+        rank_table = rank_by_n[:, :, None, :].expand_as(dense).clone()
+        rank_table = rank_table.masked_fill(dense == 0, num_n)
+        rank_table = torch.argsort(torch.argsort(rank_table, dim=-1), dim=-1).to(torch.int32)
+    else:
+        # cumsum gives each contributing n-block its ascending dense rank for the m-block.
+        cumsum = dense.cumsum(dim=-1)
+        rank_table = (cumsum - dense).to(torch.int32)
 
-    if spt:
-        total_per_m = cumsum[:, :, :, -1:]
-        rank_table = (total_per_m - 1 - rank_table).to(torch.int32)
+        if dq_kv_order:
+            total_per_m = cumsum[:, :, :, -1:]
+            rank_table = (total_per_m - 1 - rank_table).to(torch.int32)
 
     def _gather_write_order(bwd_idx, bwd_cnt):
         b_i = torch.arange(B, device=device)[:, None, None, None].expand_as(bwd_idx)
@@ -142,7 +176,7 @@ def compute_dq_write_order(
 
 def compute_dq_write_order_from_block_mask(
     block_mask,
-    spt: bool = False,
+    dq_kv_order: torch.Tensor | bool | None = False,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
     (
         _seq_q,
@@ -166,7 +200,7 @@ def compute_dq_write_order_from_block_mask(
         q_mask_idx,
         full_q_cnt,
         full_q_idx,
-        spt=spt,
+        dq_kv_order=dq_kv_order,
     )
 
 
@@ -450,11 +484,22 @@ def normalize_block_sparse_tensors(
         hint,
         mask_cnt.device,
     )
-    spt = tensors.spt
-    if spt is not None and not isinstance(spt, bool):
-        raise ValueError("spt must be a bool when provided")
-    if spt is not None and dq_write_order is None:
-        raise ValueError("spt requires dq_write_order to be provided")
+    if isinstance(tensors.dq_kv_order, bool):
+        dq_kv_order = tensors.dq_kv_order
+    else:
+        if (
+            tensors.dq_kv_order is not None
+            and tensors.dq_kv_order.shape[-1] != expected_count_shape[-1]
+        ):
+            raise ValueError(f"dq_kv_order must have shape {expected_count_shape}")
+        dq_kv_order = _check_and_expand_metadata_tensor(
+            "dq_kv_order",
+            tensors.dq_kv_order,
+            expected_count_shape,
+            context,
+            hint,
+            mask_cnt.device,
+        )
 
     return BlockSparseTensorsTorch(
         mask_block_cnt=mask_cnt,
@@ -464,7 +509,7 @@ def normalize_block_sparse_tensors(
         block_size=tensors.block_size,
         dq_write_order=dq_write_order,
         dq_write_order_full=dq_write_order_full,
-        spt=spt,
+        dq_kv_order=dq_kv_order,
     )
 
 
@@ -498,9 +543,12 @@ def get_block_sparse_broadcast_pattern(
         tensors.full_block_idx,
         tensors.dq_write_order,
         tensors.dq_write_order_full,
+        tensors.dq_kv_order,
     ):
-        if tensor is not None:
+        if isinstance(tensor, torch.Tensor):
             patterns.append(get_broadcast_dims(tensor))
+        elif tensor is not None:
+            patterns.append(None)
         else:
             patterns.append(None)
     return tuple(patterns)
@@ -550,6 +598,28 @@ def normalize_block_sparse_config(
         get_block_sparse_broadcast_pattern(normalized_tensors),
         q_subtile_factor,
     )
+
+
+def get_deterministic_bwd_spt(normalized_tensors: BlockSparseTensorsTorch) -> bool:
+    """Validate deterministic dQ metadata and return the kernel's spt mode."""
+    if normalized_tensors.dq_write_order is None:
+        raise ValueError(
+            "deterministic block-sparse backward requires dq_write_order in block_sparse_tensors"
+        )
+    if (
+        normalized_tensors.full_block_cnt is not None
+        and normalized_tensors.dq_write_order_full is None
+    ):
+        raise ValueError(
+            "deterministic block-sparse backward requires dq_write_order_full when full blocks are present"
+        )
+    if normalized_tensors.dq_kv_order is None:
+        raise ValueError(
+            "deterministic block-sparse backward requires block_sparse_tensors.dq_kv_order"
+        )
+    if isinstance(normalized_tensors.dq_kv_order, bool):
+        return normalized_tensors.dq_kv_order
+    return False
 
 
 def normalize_block_sparse_config_bwd(
@@ -621,6 +691,16 @@ def to_cute_block_sparse_tensors(
         else None
         for t in (tensors.dq_write_order, tensors.dq_write_order_full)
     ]
+    dq_kv_order_tensor = (
+        to_cute_tensor(
+            tensors.dq_kv_order,
+            assumed_align=4,
+            leading_dim=-1,
+            enable_tvm_ffi=enable_tvm_ffi,
+        )
+        if isinstance(tensors.dq_kv_order, torch.Tensor)
+        else None
+    )
 
     return BlockSparseTensors(
         mask_block_cnt_tensor,
@@ -629,6 +709,7 @@ def to_cute_block_sparse_tensors(
         full_block_idx_tensor,
         dq_write_order_tensor,
         dq_write_order_full_tensor,
+        dq_kv_order_tensor,
     )
 
 
