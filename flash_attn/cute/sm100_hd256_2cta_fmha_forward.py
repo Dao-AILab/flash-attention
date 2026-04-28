@@ -28,7 +28,8 @@ from flash_attn.cute.mask import (
     Sm100FusedMask as FusedMask,
 )
 from flash_attn.cute.tile_scheduler import SM100_TMEM_CAPACITY_COLUMNS
-from flash_attn.cute.flash_fwd_sm100 import DescaleTensors
+from flash_attn.cute.flash_fwd_sm100 import DescaleTensors, _TUNING_CONFIG
+from flash_attn.cute.utils import ex2_emulation_2
 
 
 class BlackwellFusedMultiHeadAttentionForward:
@@ -136,9 +137,14 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.tmem_o_offset = 256
         self.tmem_p_offset = self.tmem_s_offset
 
-        self.num_regs_softmax = 256
-        self.num_regs_correction = 160
-        self.num_regs_other = 32
+        _tune_key = (True, is_causal, 256, False)  # hd256: always 2cta, no sm103 variant
+        _tune = _TUNING_CONFIG.get(_tune_key, {})
+        self.num_regs_softmax = _tune.get("num_regs_softmax", 256)
+        self.num_regs_correction = _tune.get("num_regs_correction", 160)
+        self.num_regs_other = 32  # fixed for hd256; not derived from 512 budget like other kernels
+        self.ex2_emu_freq = _tune.get("ex2_emu_freq", 4)
+        self.ex2_emu_res = _tune.get("ex2_emu_res", 3)
+        self.ex2_emu_start_frg = _tune.get("ex2_emu_start_frg", 0)
 
         self.buffer_align_bytes = 1024
 
@@ -1477,19 +1483,44 @@ class BlackwellFusedMultiHeadAttentionForward:
 
         scale = scale_softmax_log2
         minus_row_max_scale = (0.0 - row_max_safe) * scale
-        tTMEM_STORErP = cute.make_rmem_tensor(tTMEM_LOADrS.shape, self.q_dtype)
-        for k in range(0, cute.size(tTMEM_LOADrS), 2):
-            tTMEM_LOADrS[k], tTMEM_LOADrS[k + 1] = cute.arch.fma_packed_f32x2(
-                (tTMEM_LOADrS[k], tTMEM_LOADrS[k + 1]),
-                (scale, scale),
-                (minus_row_max_scale, minus_row_max_scale),
-            )
-            tTMEM_LOADrS[k] = cute.math.exp2(tTMEM_LOADrS[k], fastmath=True)
-            tTMEM_LOADrS[k + 1] = cute.math.exp2(tTMEM_LOADrS[k + 1], fastmath=True)
-        s_vec = tTMEM_LOADrS.load()
-        tTMEM_STORErP.store(s_vec.to(self.q_dtype))
-
+        # Acquire P write slot early — overlaps any pipeline stall with exp2 compute
         p_handle = p_mma_producer.acquire_and_advance()
+        # Fragment-based FMA + exp2 + bf16 conversion
+        # Trades SFU for FMA via polynomial emulation on a fraction of elements
+        ex2_frg_tile = 32
+        ex2_frg_cnt = cute.size(tTMEM_LOADrS) // ex2_frg_tile
+        tTMEM_LOADrS_ex2 = cute.logical_divide(tTMEM_LOADrS, cute.make_layout(ex2_frg_tile))
+        tTMEM_STORErP = cute.make_rmem_tensor(tTMEM_LOADrS.shape, self.q_dtype)
+        tTMEM_STORErP_ex2 = cute.logical_divide(tTMEM_STORErP, cute.make_layout(ex2_frg_tile))
+        for j in cutlass.range_constexpr(ex2_frg_cnt):
+            for k in cutlass.range_constexpr(0, ex2_frg_tile, 2):
+                tTMEM_LOADrS_ex2[k, j], tTMEM_LOADrS_ex2[k + 1, j] = cute.arch.fma_packed_f32x2(
+                    (tTMEM_LOADrS_ex2[k, j], tTMEM_LOADrS_ex2[k + 1, j]),
+                    (scale, scale),
+                    (minus_row_max_scale, minus_row_max_scale),
+                )
+                if cutlass.const_expr(self.ex2_emu_freq == 0):
+                    tTMEM_LOADrS_ex2[k, j] = cute.math.exp2(tTMEM_LOADrS_ex2[k, j], fastmath=True)
+                    tTMEM_LOADrS_ex2[k + 1, j] = cute.math.exp2(
+                        tTMEM_LOADrS_ex2[k + 1, j], fastmath=True
+                    )
+                else:
+                    if cutlass.const_expr(
+                        k % self.ex2_emu_freq < self.ex2_emu_freq - self.ex2_emu_res
+                        or j >= ex2_frg_cnt - 1
+                        or j < self.ex2_emu_start_frg
+                    ):
+                        tTMEM_LOADrS_ex2[k, j] = cute.math.exp2(
+                            tTMEM_LOADrS_ex2[k, j], fastmath=True
+                        )
+                        tTMEM_LOADrS_ex2[k + 1, j] = cute.math.exp2(
+                            tTMEM_LOADrS_ex2[k + 1, j], fastmath=True
+                        )
+                    else:
+                        tTMEM_LOADrS_ex2[k, j], tTMEM_LOADrS_ex2[k + 1, j] = ex2_emulation_2(
+                            tTMEM_LOADrS_ex2[k, j], tTMEM_LOADrS_ex2[k + 1, j]
+                        )
+            tTMEM_STORErP_ex2[None, j].store(tTMEM_LOADrS_ex2[None, j].load().to(self.q_dtype))
         tmem_store_atom = cute.make_copy_atom(
             tcgen05.St32x32bOp(tcgen05.Repetition(32)), self.qk_acc_dtype
         )
