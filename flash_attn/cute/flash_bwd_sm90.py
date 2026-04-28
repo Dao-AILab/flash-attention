@@ -1,4 +1,3 @@
-from inspect import signature
 import math
 from typing import Callable, Optional, Type
 from functools import partial
@@ -41,12 +40,6 @@ from flash_attn.cute.block_sparse_utils import (
     consume_block_sparse_mma_bwd_sm90,
     dQaccum_store_block_sparse_bwd_sm90,
 )
-
-
-_get_smem_store_C = copy_utils.get_smem_store_C
-if "arch" not in signature(_get_smem_store_C).parameters:
-    def _get_smem_store_C(tiled_mma, sC, tidx, _arch, _fn=_get_smem_store_C, **kwargs):
-        return _fn(tiled_mma, sC, tidx, **kwargs)
 
 
 class FlashAttentionBackwardSm90:
@@ -1203,21 +1196,19 @@ class FlashAttentionBackwardSm90:
         mms_PdS = self.tile_n // (self.num_wg_mma // self.AtomLayoutMSdP)
         if const_expr(sP is not None):
             sP_cpy = sP if const_expr(not self.SdP_swapAB) else sPt
-            copy_P_r2s, _, _ = _get_smem_store_C(
+            copy_P_r2s, _, _ = copy_utils.get_smem_store_C(
                 tiled_mma_SdP,
                 sP_cpy,
                 tidx,
-                self.arch,
                 transpose=self.SdP_swapAB,
                 position_independent=True,
                 major_mode_size=mms_PdS,
             )
         sdS_cpy = sdS if const_expr(not self.SdP_swapAB) else sdSt
-        copy_dS_r2s, _, _ = _get_smem_store_C(
+        copy_dS_r2s, _, _ = copy_utils.get_smem_store_C(
             tiled_mma_SdP,
             sdS_cpy,
             tidx,
-            self.arch,
             transpose=self.SdP_swapAB,
             position_independent=True,
             major_mode_size=mms_PdS,
@@ -1647,19 +1638,17 @@ class FlashAttentionBackwardSm90:
             )
             sdV = sV if const_expr(not self.dKV_swapAB) else layout_utils.transpose_view(sV)
             sdK = sK if const_expr(not self.dKV_swapAB) else layout_utils.transpose_view(sK)
-            copy_dV_r2s, _, _ = _get_smem_store_C(
+            copy_dV_r2s, _, _ = copy_utils.get_smem_store_C(
                 tiled_mma_dV,
                 sdV,
                 tidx,
-                self.arch,
                 transpose=self.dKV_swapAB,
                 position_independent=True,
             )
-            copy_dK_r2s, _, _ = _get_smem_store_C(
+            copy_dK_r2s, _, _ = copy_utils.get_smem_store_C(
                 tiled_mma_dK,
                 sdK,
                 tidx,
-                self.arch,
                 transpose=self.dKV_swapAB,
                 position_independent=True,
             )
