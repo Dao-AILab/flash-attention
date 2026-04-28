@@ -1750,7 +1750,7 @@ class FlashAttentionBackwardSm100:
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
-            n_block, head_idx, batch_idx, _ = work_tile.tile_idx
+            n_block, head_idx, batch_idx = self._scheduled_tile_idx(work_tile, blocksparse_tensors)
             seqlen = SeqlenInfoCls(batch_idx)
             m_block_min, m_block_max = block_info.get_m_block_min_max(
                 seqlen, n_block // self.cluster_shape_mnk[0]
@@ -2356,7 +2356,7 @@ class FlashAttentionBackwardSm100:
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
-            n_block, head_idx, batch_idx, _ = work_tile.tile_idx
+            n_block, head_idx, batch_idx = self._scheduled_tile_idx(work_tile, blocksparse_tensors)
             seqlen = SeqlenInfoCls(batch_idx)  # must be seqlen_k
             m_block_min, m_block_max = block_info.get_m_block_min_max(
                 seqlen, n_block // self.cluster_shape_mnk[0]
@@ -2970,7 +2970,7 @@ class FlashAttentionBackwardSm100:
         tile_scheduler = TileSchedulerCls()
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
-            n_block, head_idx, batch_idx, _ = work_tile.tile_idx
+            n_block, head_idx, batch_idx = self._scheduled_tile_idx(work_tile, blocksparse_tensors)
             seqlen = SeqlenInfoCls(batch_idx)
             m_block_min, m_block_max = block_info.get_m_block_min_max(
                 seqlen, n_block // self.cluster_shape_mnk[0]
@@ -3421,6 +3421,25 @@ class FlashAttentionBackwardSm100:
             work_tile = tile_scheduler.get_current_work()
 
     @cute.jit
+    def _scheduled_tile_idx(
+        self,
+        work_tile,
+        blocksparse_tensors: Optional[BlockSparseTensors],
+    ):
+        """Return scheduler coordinates after applying explicit block-sparse dQ order.
+
+        Keep this remap in the kernel rather than in the generic scheduler because it depends
+        on optional block-sparse metadata, while the scheduler still owns the dense rank used
+        for work distribution and deadlock-free lock ordering.
+        """
+        n_block, head_idx, batch_idx, _ = work_tile.tile_idx
+        if const_expr(self.deterministic and self.use_block_sparsity):
+            assert blocksparse_tensors is not None
+            if const_expr(blocksparse_tensors.dq_kv_order is not None):
+                n_block = blocksparse_tensors.dq_kv_order[batch_idx, head_idx, n_block]
+        return n_block, head_idx, batch_idx
+
+    @cute.jit
     def _dq_semaphore_lock_value(
         self,
         iter_idx: Int32,
@@ -3507,7 +3526,7 @@ class FlashAttentionBackwardSm100:
             pipeline.PipelineUserType.Producer, self.sdQaccum_stage
         )
         while work_tile.is_valid_tile:
-            n_block, head_idx, batch_idx, _ = work_tile.tile_idx
+            n_block, head_idx, batch_idx = self._scheduled_tile_idx(work_tile, blocksparse_tensors)
             n_block_cta_group = n_block // self.cta_group_size  # for 2cta
             seqlen = SeqlenInfoCls(batch_idx)
             m_block_min, m_block_max = block_info.get_m_block_min_max(seqlen, n_block_cta_group)
