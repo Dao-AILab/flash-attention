@@ -2542,3 +2542,103 @@ def test_flash_attn_seqlen_k_zero(seqlen_q, d, causal):
     if lse is not None:
         assert torch.all(torch.isinf(lse) & (lse < 0)).item(), \
             f"Expected all -inf LSE when seqlen_k=0, got: {lse}"
+
+
+# ---------------------------------------------------------------------------
+# Regression test (#2503): empty Q workload must not crash with ZeroDivisionError
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        # (batch_size, seqlen_q) — the product drives num_splits_heuristic's divisor.
+        (2, 0),  # seqlen_q == 0 (common in CUDA graph padding)
+        (0, 64), # batch_size == 0 (empty microbatch)
+    ],
+)
+@pytest.mark.parametrize("causal", [False, True])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_empty_q_dense(shape, causal):
+    """Dense (non-varlen) path must not raise ZeroDivisionError when Q is empty.
+
+    num_splits_heuristic divides num_SMs by total_mblocks = batch_size * num_head_kv
+    * num_m_blocks. When seqlen_q == 0 or batch_size == 0, total_mblocks collapses
+    to 0 and the division crashes. The existing seqlen_k == 0 early-exit does not
+    cover this case. Regression for
+    https://github.com/Dao-AILab/flash-attention/issues/2503.
+    """
+    batch_size, seqlen_q = shape
+    device = "cuda"
+    dtype = torch.bfloat16
+    d = 128
+    nheads = 16
+    nheads_kv = 16
+    # Pick seqlen_k large enough that num_n_blocks > 4 so the heuristic's own
+    # `num_n_blocks <= 4` early-return does not mask the bug.
+    seqlen_k = 4096
+
+    torch.manual_seed(0)
+
+    q = torch.empty(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
+    k = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype)
+    v = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype)
+
+    out, lse = flash_attn_func(q, k, v, causal=causal)
+
+    if is_fake_mode():
+        return
+
+    assert out.shape == (batch_size, seqlen_q, nheads, d), \
+        f"Unexpected output shape: {out.shape}"
+    # With zero elements these are vacuously true, but we still want to assert
+    # the function returned cleanly rather than erroring out.
+    assert out.numel() == 0
+    if lse is not None:
+        assert lse.numel() == 0
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_empty_q_varlen(causal):
+    """Varlen path must not raise ZeroDivisionError when total_q == 0.
+
+    Parallels test_flash_attn_empty_q_dense for the cu_seqlens_q path, where
+    total_q = q.shape[0] feeds into total_mblocks. Regression for
+    https://github.com/Dao-AILab/flash-attention/issues/2503.
+    """
+    device = "cuda"
+    dtype = torch.bfloat16
+    d = 128
+    nheads = 16
+    nheads_kv = 16
+    batch_size = 2
+    seqlen_k_per_batch = 2048
+
+    torch.manual_seed(0)
+
+    # All zero-length Q sequences — total_q == 0 while cu_seqlens_q is well-formed.
+    cu_seqlens_q = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+    cu_seqlens_k = torch.tensor(
+        [0, seqlen_k_per_batch, 2 * seqlen_k_per_batch],
+        dtype=torch.int32, device=device,
+    )
+    total_k = int(cu_seqlens_k[-1].item())
+
+    q = torch.empty(0, nheads, d, device=device, dtype=dtype)
+    k = torch.randn(total_k, nheads_kv, d, device=device, dtype=dtype)
+    v = torch.randn(total_k, nheads_kv, d, device=device, dtype=dtype)
+
+    out, lse = flash_attn_varlen_func(
+        q, k, v,
+        cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=0, max_seqlen_k=seqlen_k_per_batch,
+        causal=causal,
+    )
+
+    if is_fake_mode():
+        return
+
+    assert out.shape == (0, nheads, d), f"Unexpected output shape: {out.shape}"
+    assert out.numel() == 0
+    if lse is not None:
+        assert lse.numel() == 0
