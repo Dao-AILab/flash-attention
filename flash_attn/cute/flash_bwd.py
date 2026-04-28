@@ -65,7 +65,8 @@ class FlashAttentionBackwardSm80:
         :param is_causal: is causal
         """
         self.dtype = dtype
-        # padding head_dim to a multiple of 16 as k_block_size
+        # padding head_dim to a multiple of 32 (stricter than fwd's 16) due to
+        # backward kernel register layout requirements for dQ/dK/dV accumulation
         hdim_multiple_of = 32
         self.head_dim_padded = int(math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of)
         head_dim_v = head_dim_v if head_dim_v is not None else head_dim

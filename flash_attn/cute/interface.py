@@ -89,7 +89,7 @@ def _get_device_arch():
 def _validate_head_dims(head_dim: int, head_dim_v: int, compute_capability: int, alignment: int) -> None:
     """Validate head dimension constraints based on compute capability."""
     is_deepseek_shape = head_dim == 192 and head_dim_v == 128
-    is_deepseek_mla_absorbed_shape = head_dim == 64  and head_dim_v == 512
+    is_deepseek_mla_absorbed_shape = head_dim == 64 and head_dim_v == 512
     is_dedicate_kernel_shape = head_dim == 256 and head_dim_v == 256
     is_standard_range = 8 <= head_dim <= 128 and 8 <= head_dim_v <= 128
 
@@ -715,7 +715,7 @@ def _flash_attn_fwd(
         q_subtile_factor,
         mma_pv_is_rs,
         intra_wg_overlap,
-        requested_use_clc_scheduler,
+        use_clc_scheduler,
         qv is not None,
         gather_kv_length,
         sparse_kv,
@@ -889,7 +889,7 @@ def _flash_attn_fwd(
                     is_varlen_q=cu_seqlens_q is not None or seqused_q is not None,
                     q_subtile_factor=q_subtile_factor,
                     use_2cta_instrs=use_2cta_instrs,
-                    use_clc_scheduler=requested_use_clc_scheduler,
+                    use_clc_scheduler=use_clc_scheduler,
                 )
         elif arch // 10 == 12:
             # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
@@ -1874,23 +1874,10 @@ class FlashAttnFunc(torch.autograd.Function):
         score_mod_bwd: Optional[Callable] = None,
         mask_mod: Optional[Callable] = None,
         aux_tensors: Optional[list] = None,
-        full_block_cnt: Optional[torch.Tensor] = None,
-        full_block_idx: Optional[torch.Tensor] = None,
-        mask_block_cnt: Optional[torch.Tensor] = None,
-        mask_block_idx: Optional[torch.Tensor] = None,
-        block_size: Optional[Tuple[int, int]] = None,
+        block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
+        block_sparse_tensors_bwd: Optional[BlockSparseTensorsTorch] = None,
         return_lse: bool = False,
     ):
-        # Only create block sparse tensors if at least one block sparse parameter is provided
-        block_sparse_tensors = None
-        if any(t is not None for t in [full_block_cnt, full_block_idx, mask_block_cnt, mask_block_idx]):
-            block_sparse_tensors = BlockSparseTensorsTorch(
-                full_block_cnt=full_block_cnt,
-                full_block_idx=full_block_idx,
-                mask_block_cnt=mask_block_cnt,
-                mask_block_idx=mask_block_idx,
-                block_size=block_size,
-            )
         out, lse = _flash_attn_fwd(
             q,
             k,
@@ -1921,6 +1908,7 @@ class FlashAttnFunc(torch.autograd.Function):
         ctx.score_mod = score_mod 
         ctx.score_mod_bwd = score_mod_bwd 
         ctx.mask_mod = mask_mod
+        ctx.block_sparse_tensors_bwd = block_sparse_tensors_bwd
         ctx.set_materialize_grads(False)
         return out, lse
 
@@ -1949,6 +1937,7 @@ class FlashAttnFunc(torch.autograd.Function):
             score_mod_bwd=ctx.score_mod_bwd,
             mask_mod=ctx.mask_mod,
             aux_tensors=aux_tensors,
+            block_sparse_tensors=ctx.block_sparse_tensors_bwd,
             dlse=dlse,
         )
         return dq, dk, dv, *((None,) * 30)  # Extra Nones is fine
@@ -2089,11 +2078,8 @@ def flash_attn_func(
     score_mod_bwd: Optional[Callable] = None,
     mask_mod: Optional[Callable] = None,
     aux_tensors: Optional[list] = None,
-    full_block_cnt: Optional[torch.Tensor] = None,
-    full_block_idx: Optional[torch.Tensor] = None,
-    mask_block_cnt: Optional[torch.Tensor] = None,
-    mask_block_idx: Optional[torch.Tensor] = None,
-    block_size: Optional[Tuple[int, int]] = None,
+    block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
+    block_sparse_tensors_bwd: Optional[BlockSparseTensorsTorch] = None,
     return_lse: bool = False,
 ):
     return FlashAttnFunc.apply(
@@ -2114,11 +2100,8 @@ def flash_attn_func(
         score_mod_bwd,
         mask_mod,
         aux_tensors,
-        full_block_cnt,
-        full_block_idx,
-        mask_block_cnt,
-        mask_block_idx,
-        block_size,
+        block_sparse_tensors,
+        block_sparse_tensors_bwd,
         return_lse,
     )
 
