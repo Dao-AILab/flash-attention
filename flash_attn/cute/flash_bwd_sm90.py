@@ -1200,7 +1200,6 @@ class FlashAttentionBackwardSm90:
                 tiled_mma_SdP,
                 sP_cpy,
                 tidx,
-                self.arch,
                 transpose=self.SdP_swapAB,
                 position_independent=True,
                 major_mode_size=mms_PdS,
@@ -1210,7 +1209,6 @@ class FlashAttentionBackwardSm90:
             tiled_mma_SdP,
             sdS_cpy,
             tidx,
-            self.arch,
             transpose=self.SdP_swapAB,
             position_independent=True,
             major_mode_size=mms_PdS,
@@ -1644,7 +1642,6 @@ class FlashAttentionBackwardSm90:
                 tiled_mma_dV,
                 sdV,
                 tidx,
-                self.arch,
                 transpose=self.dKV_swapAB,
                 position_independent=True,
             )
@@ -1652,7 +1649,6 @@ class FlashAttentionBackwardSm90:
                 tiled_mma_dK,
                 sdK,
                 tidx,
-                self.arch,
                 transpose=self.dKV_swapAB,
                 position_independent=True,
             )
