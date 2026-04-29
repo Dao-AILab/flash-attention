@@ -211,3 +211,19 @@ class TestHashCallableIntegration:
         assert call_count[0] == 0, f"getsource was called {call_count[0]} times"
         assert hash1 == hash2 == hash3 == "inductor-generated-hash"
 
+
+class TestNvvmAtomicRmwCompat:
+    """Tests for CUTLASS DSL atomicrmw signature compatibility."""
+
+    def test_detects_atomicrmw_result_type_argument(self):
+        def atomicrmw_with_res(res, op, ptr, a, *, b=None, loc=None, ip=None):
+            return res, op, ptr, a, b, loc, ip
+
+        assert cute_utils._nvvm_atomicrmw_accepts_res(atomicrmw_with_res)
+
+    def test_detects_atomicrmw_without_result_type_argument(self):
+        def atomicrmw_without_res(op, ptr, a, *, b=None, loc=None, ip=None):
+            return op, ptr, a, b, loc, ip
+
+        assert not cute_utils._nvvm_atomicrmw_accepts_res(atomicrmw_without_res)
+
