@@ -435,6 +435,24 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         self.tma_copy_v_bytes = v_copy_size * cute.size(qk_tiled_mma.thr_id.shape)
         self.tma_copy_kt_bytes = kt_copy_size * cute.size(qk_tiled_mma.thr_id.shape)
 
+        # dQ epilogue TMA store. Use a single (M, 64) SMEM stage and rotate it
+        # across the hd=256 N dimension to stay within the SMEM budget.
+        tma_store_op = cpasync.CopyBulkTensorTileS2GOp()
+        epi_cols_dQ = math.gcd(128 // (dq.element_type.width // 8), self.epi_tile[1])
+        epi_tile_dQ = (self.epi_tile[0], epi_cols_dQ)
+        sdQ_epi_layout = sm100_utils.make_smem_layout_epi(
+            dq.element_type,
+            self.dq_layout,
+            epi_tile_dQ,
+            1,
+        )
+        tma_atom_dQ, tma_tensor_dQ = cpasync.make_tiled_tma_atom(
+            tma_store_op,
+            dq,
+            cute.select(sdQ_epi_layout, mode=[0, 1]),
+            epi_tile_dQ,
+        )
+
         @cute.struct
         class SharedStorage:
             # TMA G2S load barriers: LOAD warp (producer) -> MMA warp (consumer)
@@ -487,6 +505,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
             tma_tensor_do,
             tma_atom_kt,
             tma_tensor_kt,
+            tma_atom_dQ,
+            tma_tensor_dQ,
             lse,
             sum_odo,
             dq,
@@ -502,6 +522,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
             do_smem_layout_staged,
             kt_smem_layout_staged,
             ds_tmem_layout,
+            sdQ_epi_layout,
             lse_smem_layout,
             sum_odo_smem_layout,
             self.tile_sched_params,
@@ -530,6 +551,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         mdO_qdl: cute.Tensor,
         tma_atom_kt: cute.CopyAtom,
         mK_dkl: cute.Tensor,
+        tma_atom_dQ: cute.CopyAtom,
+        mdQ_tma: cute.Tensor,
         mLSE: cute.Tensor,
         mSum_OdO: cute.Tensor,
         mdQ_qdl: cute.Tensor,
@@ -545,6 +568,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         do_smem_layout_staged: cute.ComposedLayout,
         kt_smem_layout_staged: cute.ComposedLayout,
         ds_tmem_layout_staged: cute.ComposedLayout,
+        sdQ_epi_layout: cute.ComposedLayout,
         lse_smem_layout: cute.Layout,
         sum_odo_smem_layout: cute.Layout,
         tile_sched_params: FmhaStaticTileSchedulerParams | FmhaClcDynamicTileSchedulerParams,
@@ -569,6 +593,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_v)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_do)
             cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_kt)
+            cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_dQ)
 
         bidx, bidy, bidz = cute.arch.block_idx()
         tidx, _, _ = cute.arch.thread_idx()
@@ -784,6 +809,14 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
             element_type=self.acc_dtype,
             layout=sum_odo_smem_layout,
             byte_alignment=128,
+        )
+        # Alias the dQ TMA epilogue staging buffer onto sdO.  A standalone
+        # (128, 64) bf16 allocation exceeds B200's per-block SMEM limit for
+        # this kernel, while sdO is no longer needed by the epilogue warp once
+        # the dQ accumulator is ready to store.
+        s_epi_dQ = cute.make_tensor(
+            cute.recast_ptr(sdO.iterator, sdQ_epi_layout.inner, self.dq_dtype),
+            sdQ_epi_layout.outer,
         )
         qk_thr_mma = qk_tiled_mma.get_slice(mma_tile_coord_v)  # default 1sm
         dov_thr_mma = dov_tiled_mma.get_slice(mma_tile_coord_v)  # default 1sm
@@ -1919,12 +1952,21 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
 
                     gdQ_staged = gdQ_qdl[None, None, curr_block_coord[0], None, curr_block_coord[2]]
                     cdQ_staged = cdQ_qdl[None, None, curr_block_coord[0], None, curr_block_coord[2]]
+                    gdQ_tma_staged = gdQ_staged
+                    if cutlass.const_expr(not varlen):
+                        gdQ_tma_qdl = cute.flat_divide(
+                            mdQ_tma, cute.select(self.dsk_block_tiler, mode=[0, 1])
+                        )
+                        gdQ_tma_staged = gdQ_tma_qdl[
+                            None, None, curr_block_coord[0], None, curr_block_coord[2]
+                        ]
 
                     # dQ TMEM to GMEM
                     mma_dq_consumer = self.dQ_epilogue(
                         (seqlen_q, cuseqlen_q, mQ_qdl.shape[0], batch_coord),
                         (mma_dq_consumer, gdQ_staged, cdQ_staged, tdQtdQ_staged),
                         self.epi_tile,
+                        (tma_atom_dQ, gdQ_tma_staged, s_epi_dQ, varlen),
                     )
                 work_tile = tile_sched.advance_to_next_work()
             # NOTE: tmem.free() moved to kernel end to enable cluster-wide sync
@@ -2103,14 +2145,21 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         value_args: Tuple,
         dq_args: Tuple,
         epi_tile: cute.Tile,
+        tma_args: Tuple,
     ) -> Tuple[pipeline.PipelineConsumer, pipeline.PipelineProducer]:
         seqlen_q, cuseqlen_q, total_q, batch_coord = value_args
         (mma_dq_consumer, gdQ_staged, cdQ_staged, tdQtdQ_staged) = dq_args
+        tma_atom_dQ, gdQ_tma_staged, s_epi_dQ, varlen = tma_args
         dq_handle = mma_dq_consumer.wait_and_advance()
         tidx, _, _ = cute.arch.thread_idx()
         bidx, bidy, bidz = cute.arch.block_idx()
         cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         cute.arch.fence_view_async_shared()
+
+        epi_cols_dQ = math.gcd(128 // (self.dq_dtype.width // 8), epi_tile[1])
+        num_epi_stages_dQ = epi_tile[1] // epi_cols_dQ
+        epi_tile_dQ = (epi_tile[0], epi_cols_dQ)
+        leader_warp = (cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4) == 0
 
         for iter in cutlass.range(self.iterations_dsk):
             gdQ = gdQ_staged[None, None, iter]
@@ -2119,6 +2168,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
             tdQtdQ_epi = cute.zipped_divide(tdQtdQ, epi_tile)
             cdQ_epi = cute.zipped_divide(cdQ, epi_tile)
             gdQ_epi = cute.zipped_divide(gdQ, epi_tile)
+            cdQ_local = cute.make_identity_tensor(epi_tile)
+            cdQ_local_epi = cute.zipped_divide(cdQ_local, epi_tile)
             tidx, _, _ = cute.arch.thread_idx()
             thread_idx = tidx % (self.threads_per_warp * len(self.epilogue_warp_ids))
             tmem_copy_atom = cute.make_copy_atom(
@@ -2129,17 +2180,58 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
             tTMEM_LOADtdQ = thr_tmem_load.partition_S(tdQtdQ_epi)
             tTMEM_LOADgdQ = thr_tmem_load.partition_D(gdQ_epi)
             tTMEM_LOADcdQ = thr_tmem_load.partition_D(cdQ_epi)
+            tTMEM_LOADcdQ_local = thr_tmem_load.partition_D(cdQ_local_epi)
 
-            for i in cutlass.range(cute.size(tTMEM_LOADtdQ, mode=[1]), unroll_full=True):
-                tTMEM_LOADtdQ_i = tTMEM_LOADtdQ[None, i, 0]
-                tTMEM_LOADgdQ_i = tTMEM_LOADgdQ[None, i, 0]
-                tTMEM_LOADcdQ_i = tTMEM_LOADcdQ[None, i, 0]
-                tTMrdQ = cute.make_rmem_tensor(tTMEM_LOADcdQ[None, 0, i].shape, self.acc_dtype)
-                cute.copy(tiled_tmem_load, tTMEM_LOADtdQ_i, tTMrdQ)
-                tSMrdQ = cute.make_rmem_tensor(tTMrdQ.shape, self.q_dtype)
-                dq_vec = tTMrdQ.load()
-                tSMrdQ.store(dq_vec.to(self.q_dtype))
-                if cute.elem_less(tTMEM_LOADcdQ_i[0][0], seqlen_q):
-                    cute.autovec_copy(tSMrdQ, tTMEM_LOADgdQ_i)
+            if cutlass.const_expr(not varlen):
+                gdQ_tma = gdQ_tma_staged[None, None, iter]
+                gdQ_tma_epi = cute.local_tile(gdQ_tma, epi_tile_dQ, (0, None))
+                sdQ_stage = s_epi_dQ[None, None, 0]
+
+                for stage_k in cutlass.range_constexpr(num_epi_stages_dQ):
+                    for i in cutlass.range(cute.size(tTMEM_LOADtdQ, mode=[1]), unroll_full=True):
+                        tTMEM_LOADtdQ_i = tTMEM_LOADtdQ[None, i, 0]
+                        tTMEM_LOADcdQ_i_local = tTMEM_LOADcdQ_local[None, i, 0]
+                        tTMrdQ = cute.make_rmem_tensor(tTMEM_LOADcdQ_i_local.shape, self.acc_dtype)
+                        cute.copy(tiled_tmem_load, tTMEM_LOADtdQ_i, tTMrdQ)
+                        tSMrdQ = cute.make_rmem_tensor(tTMrdQ.shape, self.q_dtype)
+                        dq_vec = tTMrdQ.load()
+                        tSMrdQ.store(dq_vec.to(self.q_dtype))
+                        for j in cutlass.range_constexpr(cute.size(tTMEM_LOADcdQ_i_local)):
+                            c = tTMEM_LOADcdQ_i_local[j]
+                            m_pos = c[0]
+                            n_pos = c[1]
+                            if n_pos // epi_cols_dQ == stage_k:
+                                s_epi_dQ[m_pos, n_pos % epi_cols_dQ, 0] = tSMrdQ[j]
+
+                    cute.arch.fence_view_async_shared()
+                    cute.arch.barrier(barrier_id=3, number_of_threads=128)
+
+                    if leader_warp:
+                        gdQ_stage = gdQ_tma_epi[None, None, stage_k]
+                        td_sdQ, td_gdQ = cpasync.tma_partition(
+                            tma_atom_dQ,
+                            0,
+                            cute.make_layout(1),
+                            cute.group_modes(sdQ_stage, 0, 2),
+                            cute.group_modes(gdQ_stage, 0, 2),
+                        )
+                        cute.copy(tma_atom_dQ, td_sdQ, td_gdQ)
+                        cute.arch.cp_async_bulk_commit_group()
+                        cute.arch.cp_async_bulk_wait_group(0, read=True)
+                    # Non-issuing threads must not rotate the SMEM buffer
+                    # until the leader warp's TMA read has completed.
+                    cute.arch.barrier(barrier_id=3, number_of_threads=128)
+            else:
+                for i in cutlass.range(cute.size(tTMEM_LOADtdQ, mode=[1]), unroll_full=True):
+                    tTMEM_LOADtdQ_i = tTMEM_LOADtdQ[None, i, 0]
+                    tTMEM_LOADgdQ_i = tTMEM_LOADgdQ[None, i, 0]
+                    tTMEM_LOADcdQ_i = tTMEM_LOADcdQ[None, i, 0]
+                    tTMrdQ = cute.make_rmem_tensor(tTMEM_LOADcdQ[None, 0, i].shape, self.acc_dtype)
+                    cute.copy(tiled_tmem_load, tTMEM_LOADtdQ_i, tTMrdQ)
+                    tSMrdQ = cute.make_rmem_tensor(tTMrdQ.shape, self.q_dtype)
+                    dq_vec = tTMrdQ.load()
+                    tSMrdQ.store(dq_vec.to(self.q_dtype))
+                    if cute.elem_less(tTMEM_LOADcdQ_i[0][0], seqlen_q):
+                        cute.autovec_copy(tSMrdQ, tTMEM_LOADgdQ_i)
         dq_handle.release()
         return mma_dq_consumer
