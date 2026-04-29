@@ -1001,12 +1001,8 @@ class FlashAttentionForwardSm100:
         else:
             sO = cute.make_tensor(cute.recast_ptr(sQ.iterator, sO_layout.inner, self.o_dtype), sO_layout.outer)
 
-        # sScale stores per-(thread, stage) softmax stats. Encode the structure
-        # in a 3-mode CuTe layout (M_BLOCK, Q_STAGE, FIELD) so accesses are
-        # natural multi-dim coords (sScale[tidx, stage, 0]=row_sum,
-        # sScale[tidx, stage, 1]=row_max) instead of hand-rolled offset math.
-        # Default col-major strides give (1, m_block_size, q_stage*m_block_size),
-        # i.e. identical flat memory layout to the prior 1-D allocation.
+        # sScale: per-(thread, stage) softmax stats as (M_BLOCK, Q_STAGE, FIELD);
+        # FIELD 0 = row_sum, 1 = row_max. Col-major strides match the prior 1-D layout.
         sScale = storage.sScale.get_tensor(
             cute.make_layout((self.m_block_size, self.q_stage, 2))
         )
