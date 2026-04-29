@@ -726,15 +726,29 @@ def _flash_attn_fwd(
 
     # Precompute cumulative tile counts so SingleTileVarlenScheduler can
     # binary-search instead of doing per-CTA O(num_batch) linear scans.
-    # See _compute_tile_cumsum and tile_scheduler._varlen_coord_map.
-    # The hd=256 dedicated kernel uses Sm100FmhaStaticTileScheduler, not
-    # SingleTileVarlenScheduler, so it doesn't take an mTileCumsum argument.
+    # Must match the kernel-side _get_num_m_blocks formula:
+    #   - SM80/90/120 fwd: tile_shape_mn[0] = tile_m, cluster=1
+    #   - SM100 fwd:       tile_shape_mn[0] = q_stage * tile_m, cluster=1
+    #   - SM100 MLA fwd:   tile_shape_mn[0] = 64, cluster=2 (effective 128)
+    # hd=256 uses a different scheduler and skips the mTileCumsum slot.
+    if use_dedicated_hd256_kernel:
+        scheduler_tile_m, scheduler_cluster_m = None, None
+    elif qv is not None:
+        scheduler_tile_m, scheduler_cluster_m = 64, 2  # MLA
+    else:
+        scheduler_tile_m, scheduler_cluster_m = m_block_size_effective, 1
+    # SM90/100/110/MLA reshape mQ via pack_gqa_layout when pack_gqa is on,
+    # so scheduler num_head becomes num_head_kv. SM80/120 don't reshape and
+    # keep num_head = num_head_q (per-Q-head packgqa is handled internally
+    # by PackGQA at load/store time).
+    kernel_reshapes_mQ = qv is not None or arch // 10 in [9, 10, 11]
+    scheduler_num_head = num_head_kv if (pack_gqa and kernel_reshapes_mQ) else num_head
     tile_cumsum_q = (
         None if use_dedicated_hd256_kernel
         else _compute_tile_cumsum(
-            cu_seqlens_q, seqused_q, num_head, tile_m,
+            cu_seqlens_q, seqused_q, scheduler_num_head, scheduler_tile_m,
             qhead_per_kvhead=qhead_per_kvhead, pack_gqa=pack_gqa,
-            cluster_shape_m=1,  # varlen forbids use_2cta_instrs => cluster_shape_m == 1
+            cluster_shape_m=scheduler_cluster_m,
             device=device,
         )
     )
@@ -1245,12 +1259,13 @@ def _bwd_postprocess_convert(
     use_2cta_instrs=False, cluster_size=1,
 ):
     """Backward postprocess: convert float32 accumulator to bf16/fp16 output."""
-    # Whichever side the caller passes (Q for dQ-postprocess, K for dK/dV).
-    # output shape is (total, num_head, hdim) when varlen.
+    # cluster_size is the bwd MAIN kernel's cluster (used by postprocess only
+    # for SeqlenInfoQK boundary clamping). The postprocess scheduler itself
+    # iterates per tile_m with cluster=1, so the host cumsum uses 1 here.
     tile_cumsum_post = _compute_tile_cumsum(
         cu_seqlens, seqused, num_head=output.shape[1] if (cu_seqlens is not None or seqused is not None) else output.shape[2],
         tile_size=block_size,
-        cluster_shape_m=cluster_size,
+        cluster_shape_m=1,
         device=output.device,
     )
     compile_key = (
