@@ -164,6 +164,11 @@ class TileSchedulerArguments(ParamsBase):
     is_split_kv: cutlass.Constexpr[bool] = False
     head_swizzle: cutlass.Constexpr[bool] = False
     use_cluster_idx: cutlass.Constexpr[bool] = False
+    # Optional precomputed cumulative tile counts per batch, length num_batch + 1,
+    # int32, where mTileCumsum[b] = sum_{i<b} (num_m_blocks(i) * num_head). When
+    # provided, SingleTileVarlenScheduler binary-searches it to skip the per-CTA
+    # linear scan over batches; otherwise it falls back to the original O(N) scan.
+    mTileCumsum: Optional[cute.Tensor] = None
 
 
 class SingleTileScheduler:
@@ -785,6 +790,7 @@ class SingleTileVarlenScheduler:
         head_swizzle: cutlass.Constexpr[bool] = False
         cluster_shape_m: cutlass.Constexpr[int] = 1
         scheduling_mode: cutlass.Constexpr[SchedulingMode] = SchedulingMode.STATIC
+        mTileCumsum: Optional[cute.Tensor] = None
 
         @staticmethod
         @cute.jit
@@ -831,6 +837,7 @@ class SingleTileVarlenScheduler:
                 head_swizzle=args.head_swizzle,
                 cluster_shape_m=args.cluster_shape_mn[0],
                 scheduling_mode=scheduling_mode,
+                mTileCumsum=args.mTileCumsum,
             )
 
     def __init__(
@@ -933,20 +940,49 @@ class SingleTileVarlenScheduler:
 
     @cute.jit
     def _varlen_coord_map(self) -> WorkTileInfo:
-        """Map self._tile_idx to (block, head, batch) via warp-level prefix sums."""
+        """Map self._tile_idx to (block, head, batch).
+
+        When params.mTileCumsum is provided, binary-search it to land on the
+        right group of 31 batches in O(log num_batch); otherwise fall back to
+        the original linear scan from batch 0 (O(num_batch / 31) per CTA, i.e.
+        O(num_batch^2) work across the launched grid).
+        Either way, the in-group warp prefix-sum scan that follows is identical.
+        """
         params = self.params
         lane_idx = cute.arch.lane_idx()
-        num_m_blocks = self._get_num_m_blocks(lane_idx, bidb_start=0)
+        next_tile_idx = self._tile_idx // params.cluster_shape_m
+        # Lane (WARP_SIZE - 1) does the boundary cu_seqlens read for lane (WARP_SIZE - 2)
+        # via shuffle_sync_down, so each warp consumes WARP_SIZE - 1 batches per pass.
+        group_size = cute.arch.WARP_SIZE - 1
+
+        if cutlass.const_expr(params.mTileCumsum is not None):
+            # mTileCumsum has length num_batch + 1; mTileCumsum[b] is the start tile
+            # of batch b. lower_bound: smallest lo with mTileCumsum[lo + 1] > next_tile_idx.
+            lo = Int32(0)
+            hi = params.num_batch
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if params.mTileCumsum[mid + 1] <= next_tile_idx:
+                    lo = mid + 1
+                else:
+                    hi = mid
+            # Snap down to a group boundary so the in-group scan below picks up the
+            # same state the linear scan would have reached at this point.
+            batch_idx = (lo // group_size) * group_size
+            group_end_tile = params.mTileCumsum[batch_idx]
+        else:
+            batch_idx = Int32(0)
+            group_end_tile = Int32(0)
+
+        block, head_idx = Int32(0), Int32(0)
+        num_m_blocks = self._get_num_m_blocks(lane_idx, bidb_start=batch_idx)
         num_m_blocks_cumulative = utils.warp_prefix_sum(num_m_blocks, lane_idx)
-        # Total number of blocks for the next 31 batches
+        # Total number of blocks for the next group of batches starting at batch_idx
         m_blocks_in_group = cute.arch.shuffle_sync(num_m_blocks_cumulative, cute.arch.WARP_SIZE - 1)
         # Same for all lanes
-        group_end_tile = m_blocks_in_group * params.num_head
-        # if cute.arch.thread_idx()[0] == 128 + 31: cute.printf("SingleTileVarlenScheduler: tile_idx=%d, group_end_tile = %d, num_m_blocks=%d, num_m_blocks_cumulative = %d, m_blocks_in_group = %d", self._tile_idx, group_end_tile, num_m_blocks, num_m_blocks_cumulative, m_blocks_in_group)
-        block, head_idx, batch_idx = Int32(0), Int32(0), Int32(0)
-        next_tile_idx = self._tile_idx // params.cluster_shape_m
+        group_end_tile += m_blocks_in_group * params.num_head
         while group_end_tile <= next_tile_idx:
-            batch_idx += cute.arch.WARP_SIZE - 1
+            batch_idx += group_size
             if batch_idx >= params.num_batch:
                 batch_idx = Int32(params.num_batch)
                 group_end_tile = next_tile_idx + 1
@@ -962,7 +998,6 @@ class SingleTileVarlenScheduler:
             block, head_idx, batch_idx = Int32(0), Int32(0), Int32(params.num_batch)
         else:
             group_start_tile = group_end_tile - m_blocks_in_group * params.num_head
-            # if cute.arch.thread_idx()[0] == 128 + 31: cute.printf("SingleTileVarlenScheduler: tile_idx=%d, group_end_tile = %d, num_m_blocks=%d, batch_idx = %d", self._tile_idx, group_end_tile, num_m_blocks, batch_idx)
             # The next problem to process is the first one that does not have ending tile position
             # that is greater than or equal to tile index.
             batch_idx_in_group = cute.arch.popc(
@@ -1027,7 +1062,6 @@ class SingleTileVarlenScheduler:
             if cutlass.const_expr(params.cluster_shape_m > 1):
                 bidx_in_cluster = cute.arch.block_in_cluster_idx()
                 block = block * params.cluster_shape_m + bidx_in_cluster[0]
-        # if cute.arch.thread_idx()[0] == 128: cute.printf("SingleTileVarlenScheduler: tile_idx=%d, batch_idx=%d, head_idx=%d, block=%d, is_valid = %d", self._tile_idx, batch_idx, head_idx, block, is_valid)
         split_idx = self._split_idx if const_expr(params.is_split_kv) else Int32(0)
         return WorkTileInfo((Int32(block), Int32(head_idx), Int32(batch_idx), split_idx), is_valid)
 
