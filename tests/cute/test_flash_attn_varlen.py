@@ -489,3 +489,224 @@ def test_varlen_high_batch_skewed_correctness():
         assert_close(q_pkd.grad, dq_ref_pkd, "dq ")
         assert_close(k_pkd.grad, dk_ref_pkd, "dk ")
         assert_close(v_pkd.grad, dv_ref_pkd, "dv ")
+
+
+# Regression coverage for the binary-search path in SingleTileVarlenScheduler.
+# The cumsum-on path only kicks in at num_batch >= 32; multi-m_block per batch
+# (seqlen > tile_m) is needed to distinguish a wrong snap from a correct one.
+# Parametrize for:
+#   - B >= 63 + multi-m_block: q_stage cumsum miscomputation
+#   - GQA/MQA: pack_gqa head-count remap (num_head_kv vs num_head_q)
+#   - D in {64, 128}: different q_stage paths on SM100
+@pytest.mark.parametrize("B", [63, 128])
+@pytest.mark.parametrize("seq_len", [512, 2048])
+@pytest.mark.parametrize("mha_type", ["mha", "gqa", "mqa"])
+@pytest.mark.parametrize("D", [64, 128])
+@pytest.mark.parametrize("causal", [False, True])
+def test_varlen_scheduler_binary_search_correctness(B, seq_len, mha_type, D, causal):
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    cap_major, _ = torch.cuda.get_device_capability()
+    if cap_major < 8:
+        pytest.skip("FA4 requires SM80+")
+
+    H_q = 8
+    if mha_type == "mha":
+        H_kv = H_q
+    elif mha_type == "gqa":
+        H_kv = 2
+    else:  # mqa
+        H_kv = 1
+    dtype = torch.bfloat16
+    device = torch.device("cuda:0")
+    seed = 4242
+
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    seqlens = torch.full((B,), seq_len, dtype=torch.int32)
+    # Vary a few of the seqlens slightly so we exercise the multi-m_block path
+    # without making num_m_blocks identical for every batch.
+    perturbation = torch.randint(0, 64, (B,), generator=g, dtype=torch.int32)
+    seqlens = (seqlens - perturbation).clamp_min(1)
+    total = int(seqlens.sum().item())
+    cu = torch.zeros(B + 1, dtype=torch.int32, device=device)
+    cu[1:] = seqlens.to(dtype=torch.int32, device=device).cumsum(0)
+
+    torch.manual_seed(seed)
+    q = (torch.randn(total, H_q, D, dtype=dtype, device=device) * 0.1)
+    k = (torch.randn(total, H_kv, D, dtype=dtype, device=device) * 0.1)
+    v = (torch.randn(total, H_kv, D, dtype=dtype, device=device) * 0.1)
+
+    out_fa = flash_attn_varlen_func(
+        q, k, v,
+        cu_seqlens_q=cu, cu_seqlens_k=cu,
+        max_seqlen_q=seq_len, max_seqlen_k=seq_len,
+        causal=causal,
+    )
+    if isinstance(out_fa, tuple):
+        out_fa = out_fa[0]
+
+    # Reference: pad to (B, max_len, H, D), use SDPA, gather valid tokens back.
+    max_len = seq_len
+    q_pad = torch.zeros(B, max_len, H_q, D, dtype=dtype, device=device)
+    k_pad = torch.zeros(B, max_len, H_kv, D, dtype=dtype, device=device)
+    v_pad = torch.zeros(B, max_len, H_kv, D, dtype=dtype, device=device)
+    offset = 0
+    for i, sl in enumerate(seqlens.tolist()):
+        q_pad[i, :sl] = q[offset:offset + sl]
+        k_pad[i, :sl] = k[offset:offset + sl]
+        v_pad[i, :sl] = v[offset:offset + sl]
+        offset += sl
+
+    sdpa_mask = torch.zeros(B, 1, max_len, max_len, dtype=torch.bool, device=device)
+    causal_tri = torch.ones(max_len, max_len, dtype=torch.bool, device=device).tril()
+    for i, sl in enumerate(seqlens.tolist()):
+        if causal:
+            sdpa_mask[i, 0, :sl, :sl] = causal_tri[:sl, :sl]
+        else:
+            sdpa_mask[i, 0, :sl, :sl] = True
+    out_ref = F.scaled_dot_product_attention(
+        q_pad.transpose(1, 2), k_pad.transpose(1, 2), v_pad.transpose(1, 2),
+        attn_mask=sdpa_mask, enable_gqa=(H_q != H_kv),
+    ).transpose(1, 2)
+    out_ref_pkd = torch.zeros_like(out_fa)
+    offset = 0
+    for i, sl in enumerate(seqlens.tolist()):
+        out_ref_pkd[offset:offset + sl] = out_ref[i, :sl]
+        offset += sl
+
+    a_f, b_f = out_fa.float(), out_ref_pkd.float()
+    if torch.allclose(a_f, b_f, atol=3e-2, rtol=3e-2):
+        return
+    diff = (a_f - b_f).abs()
+    max_abs = diff.max().item()
+    # Per-batch breakdown — q_stage miscomputation makes batch 62+ diverge.
+    per_batch_max = []
+    offset = 0
+    for i, sl in enumerate(seqlens.tolist()):
+        d = (out_fa[offset:offset + sl].float()
+             - out_ref_pkd[offset:offset + sl].float()).abs().max().item()
+        per_batch_max.append((i, d))
+        offset += sl
+    bad = [(i, d) for i, d in per_batch_max if d > 3e-2]
+    print(f"  bad batches (max_abs > 3e-2): count={len(bad)} first={bad[:5]} last={bad[-5:]}")
+    raise AssertionError(
+        f"B={B} seq_len={seq_len} mha={mha_type} D={D} causal={causal}: "
+        f"fwd disagrees with SDPA, max_abs={max_abs}"
+    )
+
+
+# Bwd scheduler regression. Bwd parallelizes over K blocks, so the host cumsum
+# is built from cu_seqlens_k with n_block_size and (on SM100, hd>=128) the bwd
+# scheduler's cluster_shape_m is 2 — host cumsum must divide by 2 to match.
+# High B + multi-m_block exercises the cumsum-on path.
+@pytest.mark.parametrize("B", [63, 128])
+@pytest.mark.parametrize("seq_len", [512, 2048])
+@pytest.mark.parametrize("mha_type", ["mha", "gqa", "mqa"])
+@pytest.mark.parametrize("causal", [False, True])
+def test_varlen_scheduler_binary_search_correctness_bwd(B, seq_len, mha_type, causal):
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    cap_major, _ = torch.cuda.get_device_capability()
+    if cap_major < 9:
+        pytest.skip("FA4 backward requires SM90+")
+
+    H_q = 8
+    if mha_type == "mha":
+        H_kv = H_q
+    elif mha_type == "gqa":
+        H_kv = 2
+    else:  # mqa
+        H_kv = 1
+    D = 128
+    dtype = torch.bfloat16
+    device = torch.device("cuda:0")
+    seed = 9090
+
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    seqlens = torch.full((B,), seq_len, dtype=torch.int32)
+    perturbation = torch.randint(0, 64, (B,), generator=g, dtype=torch.int32)
+    seqlens = (seqlens - perturbation).clamp_min(1)
+    total = int(seqlens.sum().item())
+    cu = torch.zeros(B + 1, dtype=torch.int32, device=device)
+    cu[1:] = seqlens.to(dtype=torch.int32, device=device).cumsum(0)
+
+    torch.manual_seed(seed)
+    q = (torch.randn(total, H_q, D, dtype=dtype, device=device) * 0.1).requires_grad_(True)
+    k = (torch.randn(total, H_kv, D, dtype=dtype, device=device) * 0.1).requires_grad_(True)
+    v = (torch.randn(total, H_kv, D, dtype=dtype, device=device) * 0.1).requires_grad_(True)
+
+    out_fa = flash_attn_varlen_func(
+        q, k, v,
+        cu_seqlens_q=cu, cu_seqlens_k=cu,
+        max_seqlen_q=seq_len, max_seqlen_k=seq_len,
+        causal=causal,
+    )
+    if isinstance(out_fa, tuple):
+        out_fa = out_fa[0]
+
+    g_out = torch.randn_like(out_fa)
+    out_fa.backward(g_out)
+
+    # Reference via SDPA on padded tensors.
+    max_len = seq_len
+    q_pad = torch.zeros(B, max_len, H_q, D, dtype=dtype, device=device)
+    k_pad = torch.zeros(B, max_len, H_kv, D, dtype=dtype, device=device)
+    v_pad = torch.zeros(B, max_len, H_kv, D, dtype=dtype, device=device)
+    g_pad = torch.zeros(B, max_len, H_q, D, dtype=dtype, device=device)
+    offset = 0
+    for i, sl in enumerate(seqlens.tolist()):
+        q_pad[i, :sl] = q.detach()[offset:offset + sl]
+        k_pad[i, :sl] = k.detach()[offset:offset + sl]
+        v_pad[i, :sl] = v.detach()[offset:offset + sl]
+        g_pad[i, :sl] = g_out[offset:offset + sl]
+        offset += sl
+    q_pad.requires_grad_(True); k_pad.requires_grad_(True); v_pad.requires_grad_(True)
+
+    sdpa_mask = torch.zeros(B, 1, max_len, max_len, dtype=torch.bool, device=device)
+    causal_tri = torch.ones(max_len, max_len, dtype=torch.bool, device=device).tril()
+    for i, sl in enumerate(seqlens.tolist()):
+        if causal:
+            sdpa_mask[i, 0, :sl, :sl] = causal_tri[:sl, :sl]
+        else:
+            sdpa_mask[i, 0, :sl, :sl] = True
+    out_ref = F.scaled_dot_product_attention(
+        q_pad.transpose(1, 2), k_pad.transpose(1, 2), v_pad.transpose(1, 2),
+        attn_mask=sdpa_mask, enable_gqa=(H_q != H_kv),
+    ).transpose(1, 2)
+    out_ref.backward(g_pad)
+
+    def gather(grad_pad):
+        out = torch.zeros_like(grad_pad[:0].reshape(0, *grad_pad.shape[2:]))
+        out = torch.empty(total, *grad_pad.shape[2:], dtype=grad_pad.dtype, device=grad_pad.device)
+        offset = 0
+        for i, sl in enumerate(seqlens.tolist()):
+            out[offset:offset + sl] = grad_pad[i, :sl]
+            offset += sl
+        return out
+
+    dq_ref = gather(q_pad.grad)
+    dk_ref = gather(k_pad.grad)
+    dv_ref = gather(v_pad.grad)
+
+    # Mirror the existing test_varlen tolerance: torch.allclose(atol=3e-2, rtol=3e-2).
+    # Strict abs-max would over-trigger on causal+GQA dv where reference values
+    # near zero amplify bf16 atomic-add non-determinism (FA4 paper §3.2.4).
+    def assert_close(a, b, name, atol=3e-2, rtol=3e-2):
+        a_f, b_f = a.float(), b.float()
+        if torch.allclose(a_f, b_f, atol=atol, rtol=rtol):
+            return
+        diff = (a_f - b_f).abs()
+        max_abs = diff.max().item()
+        # Find the worst offender to make failure messages self-explanatory.
+        bad = diff > (atol + rtol * b_f.abs())
+        n_bad = int(bad.sum().item())
+        n_total = bad.numel()
+        raise AssertionError(
+            f"B={B} seq_len={seq_len} mha={mha_type} causal={causal}: "
+            f"{name} disagrees with SDPA, max_abs={max_abs:.4g}, "
+            f"{n_bad}/{n_total} elements outside tol"
+        )
+
+    assert_close(q.grad, dq_ref, "dq")
+    assert_close(k.grad, dk_ref, "dk")
+    assert_close(v.grad, dv_ref, "dv")
