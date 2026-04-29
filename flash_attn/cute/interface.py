@@ -36,6 +36,9 @@ from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80
 from flash_attn.cute.flash_fwd_sm90 import FlashAttentionForwardSm90
 from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100, DescaleTensors
 from flash_attn.cute.flash_fwd_sm120 import FlashAttentionForwardSm120
+from flash_attn.cute.flash_fwd_sm120_tma_optimized import (
+    FlashAttentionForwardSm120TMAOptimized,
+)
 from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
 from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
 from flash_attn.cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
@@ -483,20 +486,17 @@ def _flash_attn_fwd(
 
     current_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
-    # SM80/SM120: uses SM80 MMA, 128 threads (4 warps)
-    if arch // 10 in [8, 12]:
+    # SM80 path uses 128 threads (4 warps); optimized SM120 path uses 160.
+    if arch // 10 == 8:
         num_threads = 128
+    elif arch // 10 == 12:
+        num_threads = 160
 
     fwd_cfg = FwdConfig(128, 128, True, True)  # default
     if tile_mn is None:
         if arch // 10 == 12:
-            # SM120 tile sizes tuned for 99 KB SMEM capacity:
-            # D<=64:  128x128 → 48 KB (good occupancy)
-            # D>64:   128x64  → 64 KB (128x128 would use 96 KB, hurting occupancy)
-            if head_dim <= 64:
-                fwd_cfg = FwdConfig(128, 128, True, True)
-            else:
-                fwd_cfg = FwdConfig(128, 64, True, True)
+            # Use the validated optimized-SM120 configuration by default.
+            fwd_cfg = FwdConfig(64, 64, True, True)
         elif arch // 10 == 8:
             fwd_cfg = FwdConfig(128, 64, True, True)  # SM80, should tune
         elif arch // 10 == 9:
@@ -892,11 +892,11 @@ def _flash_attn_fwd(
                     use_clc_scheduler=use_clc_scheduler,
                 )
         elif arch // 10 == 12:
-            # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
+            # SM120 optimized TMA forward.
             assert not use_block_sparsity, "Block sparsity not supported on SM 12.0"
             assert page_table is None, "Paged KV not supported on SM 12.0 in this PR"
             assert not is_split_kv, "SplitKV not supported on SM 12.0 in this PR"
-            fa_fwd = FlashAttentionForwardSm120(
+            fa_fwd = FlashAttentionForwardSm120TMAOptimized(
                 dtype,
                 head_dim,
                 head_dim_v,
@@ -906,9 +906,9 @@ def _flash_attn_fwd(
                 pack_gqa=pack_gqa,
                 tile_m=tile_m,
                 tile_n=tile_n,
-                num_stages=1,
+                num_stages=2,
                 num_threads=num_threads,
-                Q_in_regs=False,
+                use_tma_Q=True,
                 score_mod=score_mod,
                 mask_mod=mask_mod,
                 has_aux_tensors=aux_tensors is not None,
@@ -1235,6 +1235,7 @@ def _flash_attn_bwd(
     causal, local, window_size_left, window_size_right = _resolve_causal_local_window(
         causal, window_size_left, window_size_right
     )
+    dQ_single_wg = False
 
     if arch // 10 == 12:
         # SM120: uses SM80 MMA with 99 KB SMEM, 128 threads (4 warps).
