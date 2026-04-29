@@ -299,3 +299,74 @@ def _stats(name, a, b, atol, rtol):
     mean_rel = (diff.abs().mean() / b.abs().clamp_min(1e-6).mean().item())
     print(f"{name}: mean_abs={mean_abs:.4e}, mean_rel={mean_rel:.4e}, sum_fa={a.sum()}, sum_ref={b.sum()}")
     return mean_abs < atol and mean_rel < rtol
+
+
+# ---------------------------------------------------------------------------
+# Scheduler scaling regression test
+# ---------------------------------------------------------------------------
+#
+# Guards against re-introduction of the O(N^2) scheduling overhead in
+# SingleTileVarlenScheduler that was fixed by precomputing per-batch tile
+# counts and binary-searching them in the kernel. With the fix, per-CTA
+# scheduling work is O(log N), so total scheduling cost grows linearly in N
+# and the per-sequence forward time is roughly flat. Without the fix, total
+# scheduling cost grows as O(N^2) and the per-sequence time grows linearly
+# in N (~16x ratio between N=8192 and N=128 at seq_len=64 in measurements).
+#
+# The 2x ceiling is tight but tolerates the noise from L2 effects and from
+# the smallest N having a slightly elevated per-seq cost (warmup, low
+# occupancy). With the fix the observed ratio is ~1; without it, ~16.
+#
+# Marked @pytest.mark.slow so it doesn't slow the default test sweep.
+@pytest.mark.slow
+def test_varlen_scheduler_scaling():
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    cap_major, _ = torch.cuda.get_device_capability()
+    if cap_major < 8:
+        pytest.skip("FA4 requires SM80+")
+
+    seq_len = 64
+    num_heads = 8
+    head_dim = 128
+    dtype = torch.bfloat16
+    device = torch.device("cuda:0")
+    num_seqs_sweep = [128, 512, 2048, 8192]
+
+    def bench_fwd(num_seqs):
+        total = num_seqs * seq_len
+        cu = torch.arange(0, total + 1, seq_len, dtype=torch.int32, device=device)
+        q = torch.randn(total, num_heads, head_dim, dtype=dtype, device=device) * 0.1
+        k = torch.randn(total, num_heads, head_dim, dtype=dtype, device=device) * 0.1
+        v = torch.randn(total, num_heads, head_dim, dtype=dtype, device=device) * 0.1
+
+        def fwd():
+            flash_attn_varlen_func(q, k, v,
+                                   cu_seqlens_q=cu, cu_seqlens_k=cu,
+                                   max_seqlen_q=seq_len, max_seqlen_k=seq_len)
+
+        for _ in range(3):
+            fwd()
+        torch.cuda.synchronize()
+        starts = [torch.cuda.Event(enable_timing=True) for _ in range(10)]
+        ends = [torch.cuda.Event(enable_timing=True) for _ in range(10)]
+        for s, e in zip(starts, ends):
+            s.record(); fwd(); e.record()
+        torch.cuda.synchronize()
+        return sum(s.elapsed_time(e) for s, e in zip(starts, ends)) / 10
+
+    per_seq_us = {}
+    for n in num_seqs_sweep:
+        ms = bench_fwd(n)
+        per_seq_us[n] = ms * 1000.0 / n
+        print(f"  N={n:>5d}  fwd_total={ms:7.3f} ms  per_seq={per_seq_us[n]:.3f} us")
+
+    ratio = per_seq_us[8192] / per_seq_us[128]
+    print(f"  per_seq[8192] / per_seq[128] = {ratio:.2f}x (expect ~1, fail at >2)")
+    assert ratio < 2.0, (
+        f"varlen scheduler appears to scale super-linearly: "
+        f"per_seq_us at N=8192 is {ratio:.2f}x larger than at N=128 "
+        f"(per_seq_us = {per_seq_us}). "
+        f"Did the SingleTileVarlenScheduler.mTileCumsum binary-search regress?"
+    )
+
