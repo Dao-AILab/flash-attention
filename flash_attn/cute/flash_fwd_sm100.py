@@ -1005,7 +1005,11 @@ class FlashAttentionForwardSm100:
         else:
             sO = cute.make_tensor(cute.recast_ptr(sQ.iterator, sO_layout.inner, self.o_dtype), sO_layout.outer)
 
-        sScale = storage.sScale.get_tensor(cute.make_layout(self.q_stage * self.m_block_size * 2))
+        # sScale: per-(thread, stage) softmax stats as (M_BLOCK, Q_STAGE, FIELD);
+        # FIELD 0 = row_sum, 1 = row_max. Col-major strides match the prior 1-D layout.
+        sScale = storage.sScale.get_tensor(
+            cute.make_layout((self.m_block_size, self.q_stage, 2))
+        )
 
         thr_mma_qk = tiled_mma_qk.get_slice(mma_tile_coord_v)
         thr_mma_pv = tiled_mma_pv.get_slice(mma_tile_coord_v)
@@ -2074,11 +2078,9 @@ class FlashAttentionForwardSm100:
                     self.q_subtile_factor if self.q_subtile_factor is not None else 1,
                 )
                 if not empty_tile:
-                    sScale[tidx + stage * self.m_block_size] = softmax.row_sum[0]
+                    sScale[tidx, stage, 0] = softmax.row_sum[0]
                     if const_expr(mLSE is not None or learnable_sink is not None):
-                        sScale[
-                            tidx + stage * self.m_block_size + self.q_stage * self.m_block_size
-                        ] = softmax.row_max[0]
+                        sScale[tidx, stage, 1] = softmax.row_max[0]
                     # if tidx == 0:
                     #     cute.printf("softmax row sum stage %d: %f, row_max = %f\n", stage, softmax.row_sum[0], softmax.row_max[0])
                     # See block_sparse_utils.py NOTE [SM100 block-sparse empty tiles: mbarrier contract].
@@ -2145,11 +2147,9 @@ class FlashAttentionForwardSm100:
                             # Now that we no longer already have the 1st iteration, need mask_seqlen=True here
 
                     # Dense path always writes scale / signals
-                    sScale[tidx + stage * self.m_block_size] = softmax.row_sum[0]
+                    sScale[tidx, stage, 0] = softmax.row_sum[0]
                     if const_expr(mLSE is not None or learnable_sink is not None):
-                        sScale[
-                            tidx + stage * self.m_block_size + self.q_stage * self.m_block_size
-                        ] = softmax.row_max[0]
+                        sScale[tidx, stage, 1] = softmax.row_max[0]
                     # pipeline_sm_stats.producer_commit_w_index(stage)
                     sm_stats_barrier.arrive_w_index(index=stage * 4 + warp_idx)
 
@@ -2270,7 +2270,7 @@ class FlashAttentionForwardSm100:
             # cute.copy(thr_tmem_store_scale, tSrScale_r2t, tStScale_r2t)
             # cute.arch.fence_view_async_tmem_store()
             thread_idx = thr_tmem_load.thr_idx
-            sScale[thread_idx + stage * self.m_block_size] = acc_scale
+            sScale[thread_idx, stage, 0] = acc_scale
             # if thread_idx == 0: cute.printf("softmax acc_scale stage %d: %f, row_max = %f\n", stage, acc_scale, row_max)
         # Notify correction wg that row_max is ready
         # pipeline_sm_stats.producer_commit_w_index(stage)
@@ -2441,7 +2441,7 @@ class FlashAttentionForwardSm100:
                         # cute.copy(tiled_tmem_load_vec, tStScales_t2r[stage], tSrScale_t2r)
                         # cute.arch.fence_view_async_tmem_load()
                         # scale = tSrScale_t2r[0]
-                        scale = sScale[tidx + stage * self.m_block_size]
+                        scale = sScale[tidx, stage, 0]
                         should_rescale = cute.arch.vote_ballot_sync(scale < 1.0) != 0
                         # should_rescale = True
                         # if tidx == 0: cute.printf("Correction scale i = %d, for stage %d: %f, should_rescale = %d\n", i, stage, scale, should_rescale)
@@ -2479,9 +2479,9 @@ class FlashAttentionForwardSm100:
                     # cute.copy(tiled_tmem_load_vec, tStScales_t2r[stage], tSrScale_t2r)
                     # cute.arch.fence_view_async_tmem_load()
                     # scale = tSrScale_t2r[0]
-                    row_sum = sScale[tidx + stage * self.m_block_size]
+                    row_sum = sScale[tidx, stage, 0]
                     if const_expr(mLSE is not None or learnable_sink is not None):
-                        row_max = sScale[tidx + stage * self.m_block_size + self.q_stage * self.m_block_size]
+                        row_max = sScale[tidx, stage, 1]
                     else:
                         row_max = None
                     pipeline_sm_stats.consumer_release_w_index(stage)

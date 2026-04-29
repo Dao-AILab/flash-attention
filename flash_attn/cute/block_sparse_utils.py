@@ -715,10 +715,9 @@ def handle_block_sparse_empty_tile_correction_sm100(
                         fastmath=True,
                     )
         if tidx < m_block_size:
-            scale_row_idx = tidx + stage * m_block_size
-            sScale[scale_row_idx] = row_sum_value
+            sScale[tidx, stage, 0] = row_sum_value
             if const_expr(mLSE is not None or learnable_sink is not None):
-                sScale[scale_row_idx + q_stage * m_block_size] = row_max_value
+                sScale[tidx, stage, 1] = row_max_value
         acc_flag = row_sum_value == Float32(0.0) or row_sum_value != row_sum_value
         stats[stage] = (row_sum_value, row_max_value, acc_flag)
 
