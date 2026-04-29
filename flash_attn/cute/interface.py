@@ -538,6 +538,10 @@ def _flash_attn_fwd(
     if num_splits < 1:
         num_splits = num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, 128)
 
+    # SM120 does not support SplitKV in this kernel variant
+    if arch // 10 == 12 and num_splits > 1:
+        num_splits = 1
+
     # SplitKV uses float32 partial output, which doubles the O buffer size
     # in shared memory, causing OOM for diff-headdim (192, 128)
     if arch // 10 in [10, 11] and head_dim != head_dim_v and num_splits > 1:
@@ -893,9 +897,7 @@ def _flash_attn_fwd(
                 )
         elif arch // 10 == 12:
             # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
-            assert not use_block_sparsity, "Block sparsity not supported on SM 12.0"
             assert page_table is None, "Paged KV not supported on SM 12.0 in this PR"
-            assert not is_split_kv, "SplitKV not supported on SM 12.0 in this PR"
             fa_fwd = FlashAttentionForwardSm120(
                 dtype,
                 head_dim,
