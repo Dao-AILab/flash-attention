@@ -654,7 +654,8 @@ def handle_block_sparse_empty_tile_correction_sm100(
     head_idx: Int32,
     batch_idx: Int32,
     split_idx: Int32,
-    sScale: cute.Tensor,
+    sScaleSum: cute.Tensor,  # (m_block_size, q_stage) — softmax row_sum view
+    sScaleMax: cute.Tensor,  # (m_block_size, q_stage) — softmax row_max view
     stats: list,
     correction_epilogue: Callable,
     thr_mma_pv: cute.core.ThrMma,
@@ -715,9 +716,9 @@ def handle_block_sparse_empty_tile_correction_sm100(
                         fastmath=True,
                     )
         if tidx < m_block_size:
-            sScale[tidx, stage, 0] = row_sum_value
+            sScaleSum[tidx, stage] = row_sum_value
             if const_expr(mLSE is not None or learnable_sink is not None):
-                sScale[tidx, stage, 1] = row_max_value
+                sScaleMax[tidx, stage] = row_max_value
         acc_flag = row_sum_value == Float32(0.0) or row_sum_value != row_sum_value
         stats[stage] = (row_sum_value, row_max_value, acc_flag)
 
