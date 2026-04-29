@@ -370,3 +370,122 @@ def test_varlen_scheduler_scaling():
         f"Did the SingleTileVarlenScheduler.mTileCumsum binary-search regress?"
     )
 
+
+# ---------------------------------------------------------------------------
+# High-batch-count correctness with skewed seqlens
+# ---------------------------------------------------------------------------
+#
+# The default test_varlen sweep tops out at B=20. The scheduler patch matters
+# at high batch counts that *also* vary in seqlen (the pathological case is
+# many short sequences). This stress test runs forward at B=1024 with a wide
+# random length distribution and checks the output against PyTorch SDPA on a
+# padded reference.
+#
+# Backward uses MHA (Hkv=Hq) to sidestep the inter-Q-head atomic-add
+# non-determinism on dK/dV that the FA4 backward exhibits for GQA/MQA.
+# Paper §3.2.4 ("Deterministic backward pass") describes this; it's
+# pre-existing in the bwd kernel, unchanged by the scheduler patch.
+@pytest.mark.slow
+def test_varlen_high_batch_skewed_correctness():
+    if not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    cap_major, _ = torch.cuda.get_device_capability()
+    if cap_major < 8:
+        pytest.skip("FA4 requires SM80+")
+    # SM80 backward varlen is gated off in interface.py (asserts SM90+).
+    test_backward = cap_major >= 9
+
+    B = 1024
+    H = 8
+    D = 128
+    min_len = 1
+    max_len = 128
+    dtype = torch.bfloat16
+    device = torch.device("cuda:0")
+    seed = 12345
+
+    g = torch.Generator(device="cpu").manual_seed(seed)
+    seqlens = torch.randint(min_len, max_len + 1, (B,), generator=g)
+    total = int(seqlens.sum().item())
+    cu = torch.zeros(B + 1, dtype=torch.int32, device=device)
+    cu[1:] = seqlens.to(dtype=torch.int32, device=device).cumsum(0)
+
+    torch.manual_seed(seed)
+    q_pkd = (torch.randn(total, H, D, dtype=dtype, device=device) * 0.1).requires_grad_(True)
+    k_pkd = (torch.randn(total, H, D, dtype=dtype, device=device) * 0.1).requires_grad_(True)
+    v_pkd = (torch.randn(total, H, D, dtype=dtype, device=device) * 0.1).requires_grad_(True)
+
+    out_fa = flash_attn_varlen_func(
+        q_pkd, k_pkd, v_pkd,
+        cu_seqlens_q=cu, cu_seqlens_k=cu,
+        max_seqlen_q=max_len, max_seqlen_k=max_len,
+    )
+    if isinstance(out_fa, tuple):
+        out_fa = out_fa[0]
+
+    g_out = torch.randn_like(out_fa)
+    if test_backward:
+        out_fa.backward(g_out)
+
+    # Reference: pad to (B, max_len, H, D), use SDPA with bool mask, gather valid tokens back.
+    q_pad = torch.zeros(B, max_len, H, D, dtype=dtype, device=device)
+    k_pad = torch.zeros(B, max_len, H, D, dtype=dtype, device=device)
+    v_pad = torch.zeros(B, max_len, H, D, dtype=dtype, device=device)
+    g_pad = torch.zeros(B, max_len, H, D, dtype=dtype, device=device)
+    offset = 0
+    for i, sl in enumerate(seqlens.tolist()):
+        q_pad[i, :sl] = q_pkd.detach()[offset:offset + sl]
+        k_pad[i, :sl] = k_pkd.detach()[offset:offset + sl]
+        v_pad[i, :sl] = v_pkd.detach()[offset:offset + sl]
+        g_pad[i, :sl] = g_out[offset:offset + sl]
+        offset += sl
+
+    q_pad = q_pad.requires_grad_(test_backward)
+    k_pad = k_pad.requires_grad_(test_backward)
+    v_pad = v_pad.requires_grad_(test_backward)
+    sdpa_mask = torch.zeros(B, 1, max_len, max_len, dtype=torch.bool, device=device)
+    for i, sl in enumerate(seqlens.tolist()):
+        sdpa_mask[i, 0, :sl, :sl] = True
+
+    out_ref = F.scaled_dot_product_attention(
+        q_pad.transpose(1, 2), k_pad.transpose(1, 2), v_pad.transpose(1, 2),
+        attn_mask=sdpa_mask,
+    ).transpose(1, 2)
+    if test_backward:
+        out_ref.backward(g_pad)
+
+    # Pack reference back to (total, H, D) layout for comparison
+    out_ref_pkd = torch.zeros_like(out_fa)
+    offset = 0
+    for i, sl in enumerate(seqlens.tolist()):
+        out_ref_pkd[offset:offset + sl] = out_ref[i, :sl]
+        offset += sl
+    if test_backward:
+        dq_ref_pkd = torch.zeros_like(q_pkd)
+        dk_ref_pkd = torch.zeros_like(k_pkd)
+        dv_ref_pkd = torch.zeros_like(v_pkd)
+        offset = 0
+        for i, sl in enumerate(seqlens.tolist()):
+            dq_ref_pkd[offset:offset + sl] = q_pad.grad[i, :sl]
+            dk_ref_pkd[offset:offset + sl] = k_pad.grad[i, :sl]
+            dv_ref_pkd[offset:offset + sl] = v_pad.grad[i, :sl]
+            offset += sl
+
+    # Tolerances mirror test_varlen (bf16 cross-impl): atol/rtol = 3e-2.
+    def assert_close(a, b, name):
+        diff = (a.float() - b.float()).abs()
+        max_abs = diff.max().item()
+        mean_rel = (diff.mean() / b.float().abs().clamp_min(1e-6).mean()).item()
+        print(f"  {name}: max_abs={max_abs:.3e} mean_rel={mean_rel:.3e}")
+        assert max_abs < 3e-2 and mean_rel < 3e-2, (
+            f"{name} disagrees with SDPA: max_abs={max_abs}, mean_rel={mean_rel}"
+        )
+
+    print(f"  B={B} total_tokens={total} (mean {total/B:.1f}, "
+          f"min {seqlens.min().item()}, max {seqlens.max().item()})  "
+          f"test_backward={test_backward}")
+    assert_close(out_fa, out_ref_pkd, "fwd")
+    if test_backward:
+        assert_close(q_pkd.grad, dq_ref_pkd, "dq ")
+        assert_close(k_pkd.grad, dk_ref_pkd, "dk ")
+        assert_close(v_pkd.grad, dv_ref_pkd, "dv ")
