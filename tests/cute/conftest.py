@@ -30,6 +30,11 @@ def _get_gpu_ids():
 
 
 def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "slow: marks tests that take a long time to run (deselect with '-m \"not slow\"')",
+    )
+
     tmp = Path(tempfile.gettempdir()) / getuser() / "flash_attention_tests"
     tmp.mkdir(parents=True, exist_ok=True)
 
