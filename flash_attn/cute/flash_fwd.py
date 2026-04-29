@@ -656,17 +656,12 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         # Layout permutation: 4D non-varlen vs 3D varlen
         QO_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
         KV_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensK is None) else [0, 2, 1]
-        mQ, mO = [
-            cute.make_tensor(t.iterator, cute.select(t.layout, mode=QO_layout_transpose))
-            for t in (mQ, mO)
-        ]
-        mK, mV = [
-            cute.make_tensor(t.iterator, cute.select(t.layout, mode=KV_layout_transpose))
-            for t in (mK, mV)
-        ]
+        mQ, mO = [layout_utils.select(t, QO_layout_transpose) for t in (mQ, mO)]
+        mK, mV = [layout_utils.select(t, KV_layout_transpose) for t in (mK, mV)]
+        self.use_block_sparsity = const_expr(blocksparse_tensors is not None)
         if const_expr(mLSE is not None):
             LSE_layout_transpose = [2, 1, 0] if const_expr(mCuSeqlensQ is None) else [1, 0]
-            mLSE = cute.make_tensor(mLSE.iterator, cute.select(mLSE.layout, mode=LSE_layout_transpose))
+            mLSE = layout_utils.select(mLSE, LSE_layout_transpose)
         # TileScheduler for varlen, simple grid for non-varlen
         if const_expr(mCuSeqlensQ is not None or mSeqUsedQ is not None):
             TileScheduler = SingleTileVarlenScheduler
@@ -773,7 +768,6 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
 
         tile_scheduler = TileScheduler.create(tile_sched_params)
         work_tile = tile_scheduler.initial_work_tile_info()
-        m_block, num_head, batch_size, _ = work_tile.tile_idx
 
         block_info = BlockInfo(
             self.tile_m,
@@ -785,294 +779,301 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             window_size_right,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
         )
-        seqlen = SeqlenInfoQK.create(
-            batch_idx=batch_size,
-            seqlen_q_static=mQ.shape[0],
-            seqlen_k_static=mK.shape[0],
-            mCuSeqlensQ=mCuSeqlensQ,
-            mCuSeqlensK=mCuSeqlensK,
-            mSeqUsedQ=mSeqUsedQ,
-            mSeqUsedK=mSeqUsedK,
-        )
-        n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
-        # For varlen, wasted grid tiles (where batch_idx >= num_batch) will have
-        # seqlen_q=seqlen_k=0 and n_block_max=0.  Clamp to 0 so we don't use a
-        # negative block index for K/V loads; the load/store predicates already
-        # guard all memory accesses when seqlen is 0.
-        n_block = cutlass.max(n_block_max - 1, 0)
 
-        # ///////////////////////////////////////////////////////////////////////////////
-        # Get the appropriate tiles for this thread block.
-        # ///////////////////////////////////////////////////////////////////////////////
-        blkQ_shape = (self.tile_m, self.tile_hdim)
-        blkK_shape = (self.tile_n, self.tile_hdim)
-        blkV_shape = (self.tile_n, self.tile_hdimv)
-        num_head_kv = num_head // self.qhead_per_kvhead
-        if const_expr(not seqlen.has_cu_seqlens_q):
-            mQ_cur = mQ[None, None, num_head, batch_size]
-        else:
-            mQ_cur = cute.domain_offset((seqlen.offset_q, 0), mQ[None, None, num_head])
-        if const_expr(not seqlen.has_cu_seqlens_k):
-            mK_cur = mK[None, None, num_head_kv, batch_size]
-            mV_cur = mV[None, None, num_head_kv, batch_size]
-        else:
-            mK_cur = cute.domain_offset((seqlen.offset_k, 0), mK[None, None, num_head_kv])
-            mV_cur = cute.domain_offset((seqlen.offset_k, 0), mV[None, None, num_head_kv])
-        gQ = cute.local_tile(mQ_cur, blkQ_shape, (m_block, 0))
-        gK = cute.local_tile(mK_cur, blkK_shape, (None, 0))
-        gV = cute.local_tile(mV_cur, blkV_shape, (None, 0))
+        while work_tile.is_valid_tile:
+            m_block, num_head, batch_size, _ = work_tile.tile_idx
 
-        # ///////////////////////////////////////////////////////////////////////////////
-        # Get shared memory buffer
-        # ///////////////////////////////////////////////////////////////////////////////
-        smem = cutlass.utils.SmemAllocator()
-        storage = smem.allocate(SharedStorage)
-        sQ = storage.sQ.get_tensor(sQ_layout)
-        sK = storage.sK.get_tensor(sK_layout)
-        if const_expr(not self.Q_in_regs):
-            sV = storage.sV.get_tensor(sV_layout)
-        else:
-            sV = cute.make_tensor(cute.recast_ptr(sQ.iterator, dtype=self.dtype), sV_layout)
-        # Transpose view of V to tensor with layout (head_dim_v, tile_n) for tiled mma
-        sVt = layout_utils.transpose_view(sV)
-
-        gmem_thr_copy_K = gmem_tiled_copy_K.get_slice(tidx)
-        gmem_thr_copy_V = gmem_tiled_copy_V.get_slice(tidx)
-        # (CPY_Atom, CPY_N, CPY_K, n_block)
-        tKsK, tKgK = gmem_thr_copy_K.partition_D(sK), gmem_thr_copy_K.partition_S(gK)
-        # (CPY_Atom, CPY_N, CPY_K, n_block)
-        tVsV, tVgV = gmem_thr_copy_V.partition_D(sV), gmem_thr_copy_V.partition_S(gV)
-
-        # ///////////////////////////////////////////////////////////////////////////////
-        # Tile MMA compute thread partitions and allocate accumulators
-        # ///////////////////////////////////////////////////////////////////////////////
-        thr_mma_qk = tiled_mma_qk.get_slice(tidx)
-        thr_mma_pv = tiled_mma_pv.get_slice(tidx)
-        tSrQ = thr_mma_qk.make_fragment_A(thr_mma_qk.partition_A(sQ))
-        tSrK = thr_mma_qk.make_fragment_B(thr_mma_qk.partition_B(sK[None, None, 0]))
-        tOrVt = thr_mma_pv.make_fragment_B(thr_mma_pv.partition_B(sVt[None, None, 0]))
-        acc_shape_O = thr_mma_pv.partition_shape_C((self.tile_m, self.tile_hdimv))
-        acc_O = cute.make_fragment(acc_shape_O, Float32)
-        acc_O.fill(0.0)
-
-        # ///////////////////////////////////////////////////////////////////////////////
-        # Smem copy atom tiling
-        # ///////////////////////////////////////////////////////////////////////////////
-        smem_copy_atom_QK = cute.make_copy_atom(
-            warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4),
-            self.dtype,
-        )
-        smem_copy_atom_V = cute.make_copy_atom(
-            warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=4),
-            self.dtype,
-        )
-        smem_thr_copy_Q = utils.make_tiled_copy_A(smem_copy_atom_QK, tiled_mma_qk).get_slice(tidx)
-        smem_thr_copy_K = utils.make_tiled_copy_B(smem_copy_atom_QK, tiled_mma_qk).get_slice(tidx)
-        smem_thr_copy_V = utils.make_tiled_copy_B(smem_copy_atom_V, tiled_mma_pv).get_slice(tidx)
-
-        tSsQ = smem_thr_copy_Q.partition_S(sQ)
-        tSsK = smem_thr_copy_K.partition_S(sK)
-        tOsVt = smem_thr_copy_V.partition_S(sVt)
-
-        # ///////////////////////////////////////////////////////////////////////////////
-        # Predicate: Mark indices that need to copy when problem_shape isn't a multiple
-        # of tile_shape
-        # ///////////////////////////////////////////////////////////////////////////////
-        # Construct identity layout for KV
-        cK = cute.make_identity_tensor((self.tile_n, self.tile_hdim))
-        tKcK = gmem_thr_copy_K.partition_S(cK)
-        t0KcK = gmem_thr_copy_K.get_slice(0).partition_S(cK)
-        if const_expr(self.tile_hdim == self.tile_hdimv):
-            tVcV = tKcK
-            t0VcV = t0KcK
-        else:
-            cV = cute.make_identity_tensor((self.tile_n, self.tile_hdimv))
-            tVcV = gmem_thr_copy_V.partition_S(cV)
-            t0VcV = gmem_thr_copy_V.get_slice(0).partition_S(cV)
-        # Allocate predicate tensors for m and n, here we only allocate the tile of k, and
-        # use "if" on the mn dimension.
-        # This is to reduce register pressure and gets 2-3% performance gain.
-        tKpK = utils.predicate_k(tKcK, limit=mK.shape[1])
-        if const_expr(self.same_hdim_kv):
-            tVpV = tKpK
-        else:
-            tVpV = utils.predicate_k(tVcV, limit=mV.shape[1])
-
-        # shape: (atom_v_m * rest_m)
-        softmax = Softmax.create(
-            softmax_scale_log2,
-            num_rows=acc_O.shape[0][0] * acc_O.shape[1],
-            softmax_scale=softmax_scale,
-        )
-        softmax.reset()
-
-        # group parameters for compute_one_n_block
-        mma_params = SimpleNamespace(
-            thr_mma_qk=thr_mma_qk,
-            thr_mma_pv=thr_mma_pv,
-            tSrQ=tSrQ,
-            tSrK=tSrK,
-            tOrVt=tOrVt,
-            acc_O=acc_O,
-        )
-        smem_copy_params = SimpleNamespace(
-            smem_thr_copy_Q=smem_thr_copy_Q,
-            smem_thr_copy_K=smem_thr_copy_K,
-            smem_thr_copy_V=smem_thr_copy_V,
-            tSsQ=tSsQ,
-            tSsK=tSsK,
-            tOsVt=tOsVt,
-        )
-        load_K = partial(
-            self.load_K, gmem_tiled_copy_K, tKgK, tKsK, tKcK, t0KcK, tKpK, seqlen=seqlen.seqlen_k
-        )
-        load_V = partial(
-            self.load_V, gmem_tiled_copy_V, tVgV, tVsV, tVcV, t0VcV, tVpV, seqlen=seqlen.seqlen_k
-        )
-
-        compute_one_n_block = partial(
-            self.compute_one_n_block,
-            mma_params=mma_params,
-            smem_copy_params=smem_copy_params,
-            softmax=softmax,
-            load_K=load_K,
-            load_V=load_V,
-            score_mod=self.score_mod,
-            batch_idx=batch_size,
-            head_idx=num_head,
-            m_block=m_block,
-            aux_tensors=aux_tensors,
-            fastdiv_mods=fastdiv_mods,
-        )
-
-        # ///////////////////////////////////////////////////////////////////////////////
-        # Prologue
-        # ///////////////////////////////////////////////////////////////////////////////
-        # Start async loads of the last mn-tile, where we take care of the mn residue
-        gmem_thr_copy_Q = gmem_tiled_copy_Q.get_slice(tidx)
-        self.load_Q(gmem_thr_copy_Q, gQ, sQ, m_block, seqlen=seqlen.seqlen_q, headdim=mQ.shape[1])
-        cute.arch.cp_async_commit_group()
-
-        def preprocess_Q():
-            cute.arch.cp_async_wait_group(self.num_stages * 2 - 1)
-            if const_expr(self.Q_in_regs):
-                cute.arch.barrier()
-                tSrQ_copy_view = smem_thr_copy_Q.retile(tSrQ)
-                cute.copy(smem_thr_copy_Q, tSsQ, tSrQ_copy_view)
-
-        # If Q_in_regs, we load Q, then load 1 stage of K, then (optionally) rotate Q and
-        # read from smem_q to registers, then load V.
-        # If !Q_in_regs, we load Q, load all stages of K & V, then (optionally) rotate Q.
-        if const_expr(self.Q_in_regs):
-            load_K(n_block, smem_pipe_write=0, need_predicates=True)
-            cute.arch.cp_async_commit_group()
-            preprocess_Q()
-            cute.arch.barrier()  # Make sure all threads have read smem_q before loading V
-
-        for stage in cutlass.range_constexpr(self.num_stages):
-            if const_expr(not self.Q_in_regs or stage > 0):
-                if stage == 0 or n_block - stage >= 0:
-                    load_K(n_block - stage, smem_pipe_write=stage, need_predicates=stage == 0)
-                cute.arch.cp_async_commit_group()
-            if const_expr(stage < self.num_stages - 1):
-                if stage == 0 or n_block - stage >= 0:
-                    load_V(n_block - stage, smem_pipe_write=stage, need_predicates=stage == 0)
-                cute.arch.cp_async_commit_group()
-        if const_expr(not self.Q_in_regs):
-            preprocess_Q()
-
-        # ///////////////////////////////////////////////////////////////////////////////
-        # Mainloop
-        # ///////////////////////////////////////////////////////////////////////////////
-        # Start processing of the first n-block.
-        # For performance reason, we separate out two kinds of iterations:
-        # those that need masking on S, and those that don't.
-        # We need masking on S for the very last block when K and V has length not multiple of tile_n.
-        # We also need masking on S if it's causal, for the last several blocks.
-        mask = AttentionMask(
-            self.tile_m,
-            self.tile_n,
-            seqlen,
-            window_size_left,
-            window_size_right,
-            self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
-        )
-        mask_fn = partial(
-            mask.apply_mask,
-            batch_idx=batch_size,
-            head_idx=num_head,
-            m_block=m_block,
-            thr_mma=thr_mma_qk,
-            mask_causal=self.is_causal,
-            mask_local=self.is_local,
-            aux_tensors=aux_tensors,
-            fastdiv_mods=fastdiv_mods if const_expr(self.mask_mod is not None) else None,
-        )
-
-        # First iteration with seqlen masking
-        smem_pipe_read = Int32(0)
-        smem_pipe_write = Int32(self.num_stages - 1)
-        compute_one_n_block(
-            n_block,
-            smem_pipe_read,
-            smem_pipe_write,
-            is_first_n_block=True,
-            seqlen=seqlen,
-            mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=True),
-        )
-        smem_pipe_read = self.advance_pipeline(smem_pipe_read)
-        smem_pipe_write = self.advance_pipeline(smem_pipe_write)
-        # Next couple of iterations with causal masking
-        if const_expr(self.is_causal or self.is_local):
-            n_block_min_causal_local_mask = block_info.get_n_block_min_causal_local_mask(
-                seqlen, m_block, n_block_min
+            seqlen = SeqlenInfoQK.create(
+                batch_idx=batch_size,
+                seqlen_q_static=mQ.shape[0],
+                seqlen_k_static=mK.shape[0],
+                mCuSeqlensQ=mCuSeqlensQ,
+                mCuSeqlensK=mCuSeqlensK,
+                mSeqUsedQ=mSeqUsedQ,
+                mSeqUsedK=mSeqUsedK,
             )
-            for n_tile in cutlass.range(n_block_max - 1 - n_block_min_causal_local_mask, unroll=1):
-                n_block = n_block_max - 2 - n_tile
-                compute_one_n_block(
-                    n_block,
-                    smem_pipe_read,
-                    smem_pipe_write,
-                    seqlen=seqlen,
-                    mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=True),
-                )
-                smem_pipe_read = self.advance_pipeline(smem_pipe_read)
-                smem_pipe_write = self.advance_pipeline(smem_pipe_write)
-        # The remaining iterations have no masking
-        for n_tile in cutlass.range(n_block, unroll=1):
+            n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
+            # For varlen, wasted grid tiles (where batch_idx >= num_batch) will have
+            # seqlen_q=seqlen_k=0 and n_block_max=0.  Clamp to 0 so we don't use a
+            # negative block index for K/V loads; the load/store predicates already
+            # guard all memory accesses when seqlen is 0.
+            n_block = cutlass.max(n_block_max - 1, 0)
+
+            # ///////////////////////////////////////////////////////////////////////////////
+            # Get the appropriate tiles for this thread block.
+            # ///////////////////////////////////////////////////////////////////////////////
+            blkQ_shape = (self.tile_m, self.tile_hdim)
+            blkK_shape = (self.tile_n, self.tile_hdim)
+            blkV_shape = (self.tile_n, self.tile_hdimv)
+            num_head_kv = num_head // self.qhead_per_kvhead
+            if const_expr(not seqlen.has_cu_seqlens_q):
+                mQ_cur = mQ[None, None, num_head, batch_size]
+            else:
+                mQ_cur = cute.domain_offset((seqlen.offset_q, 0), mQ[None, None, num_head])
+            if const_expr(not seqlen.has_cu_seqlens_k):
+                mK_cur = mK[None, None, num_head_kv, batch_size]
+                mV_cur = mV[None, None, num_head_kv, batch_size]
+            else:
+                mK_cur = cute.domain_offset((seqlen.offset_k, 0), mK[None, None, num_head_kv])
+                mV_cur = cute.domain_offset((seqlen.offset_k, 0), mV[None, None, num_head_kv])
+            gQ = cute.local_tile(mQ_cur, blkQ_shape, (m_block, 0))
+            gK = cute.local_tile(mK_cur, blkK_shape, (None, 0))
+            gV = cute.local_tile(mV_cur, blkV_shape, (None, 0))
+
+            # ///////////////////////////////////////////////////////////////////////////////
+            # Get shared memory buffer
+            # ///////////////////////////////////////////////////////////////////////////////
+            smem = cutlass.utils.SmemAllocator()
+            storage = smem.allocate(SharedStorage)
+            sQ = storage.sQ.get_tensor(sQ_layout)
+            sK = storage.sK.get_tensor(sK_layout)
+            if const_expr(not self.Q_in_regs):
+                sV = storage.sV.get_tensor(sV_layout)
+            else:
+                sV = cute.make_tensor(cute.recast_ptr(sQ.iterator, dtype=self.dtype), sV_layout)
+            # Transpose view of V to tensor with layout (head_dim_v, tile_n) for tiled mma
+            sVt = layout_utils.transpose_view(sV)
+
+            gmem_thr_copy_K = gmem_tiled_copy_K.get_slice(tidx)
+            gmem_thr_copy_V = gmem_tiled_copy_V.get_slice(tidx)
+            # (CPY_Atom, CPY_N, CPY_K, n_block)
+            tKsK, tKgK = gmem_thr_copy_K.partition_D(sK), gmem_thr_copy_K.partition_S(gK)
+            # (CPY_Atom, CPY_N, CPY_K, n_block)
+            tVsV, tVgV = gmem_thr_copy_V.partition_D(sV), gmem_thr_copy_V.partition_S(gV)
+
+            # ///////////////////////////////////////////////////////////////////////////////
+            # Tile MMA compute thread partitions and allocate accumulators
+            # ///////////////////////////////////////////////////////////////////////////////
+            thr_mma_qk = tiled_mma_qk.get_slice(tidx)
+            thr_mma_pv = tiled_mma_pv.get_slice(tidx)
+            tSrQ = thr_mma_qk.make_fragment_A(thr_mma_qk.partition_A(sQ))
+            tSrK = thr_mma_qk.make_fragment_B(thr_mma_qk.partition_B(sK[None, None, 0]))
+            tOrVt = thr_mma_pv.make_fragment_B(thr_mma_pv.partition_B(sVt[None, None, 0]))
+            acc_shape_O = thr_mma_pv.partition_shape_C((self.tile_m, self.tile_hdimv))
+            acc_O = cute.make_fragment(acc_shape_O, Float32)
+            acc_O.fill(0.0)
+
+            # ///////////////////////////////////////////////////////////////////////////////
+            # Smem copy atom tiling
+            # ///////////////////////////////////////////////////////////////////////////////
+            smem_copy_atom_QK = cute.make_copy_atom(
+                warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4),
+                self.dtype,
+            )
+            smem_copy_atom_V = cute.make_copy_atom(
+                warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=4),
+                self.dtype,
+            )
+            smem_thr_copy_Q = utils.make_tiled_copy_A(smem_copy_atom_QK, tiled_mma_qk).get_slice(tidx)
+            smem_thr_copy_K = utils.make_tiled_copy_B(smem_copy_atom_QK, tiled_mma_qk).get_slice(tidx)
+            smem_thr_copy_V = utils.make_tiled_copy_B(smem_copy_atom_V, tiled_mma_pv).get_slice(tidx)
+
+            tSsQ = smem_thr_copy_Q.partition_S(sQ)
+            tSsK = smem_thr_copy_K.partition_S(sK)
+            tOsVt = smem_thr_copy_V.partition_S(sVt)
+
+            # ///////////////////////////////////////////////////////////////////////////////
+            # Predicate: Mark indices that need to copy when problem_shape isn't a multiple
+            # of tile_shape
+            # ///////////////////////////////////////////////////////////////////////////////
+            # Construct identity layout for KV
+            cK = cute.make_identity_tensor((self.tile_n, self.tile_hdim))
+            tKcK = gmem_thr_copy_K.partition_S(cK)
+            t0KcK = gmem_thr_copy_K.get_slice(0).partition_S(cK)
+            if const_expr(self.tile_hdim == self.tile_hdimv):
+                tVcV = tKcK
+                t0VcV = t0KcK
+            else:
+                cV = cute.make_identity_tensor((self.tile_n, self.tile_hdimv))
+                tVcV = gmem_thr_copy_V.partition_S(cV)
+                t0VcV = gmem_thr_copy_V.get_slice(0).partition_S(cV)
+            # Allocate predicate tensors for m and n, here we only allocate the tile of k, and
+            # use "if" on the mn dimension.
+            # This is to reduce register pressure and gets 2-3% performance gain.
+            tKpK = utils.predicate_k(tKcK, limit=mK.shape[1])
+            if const_expr(self.same_hdim_kv):
+                tVpV = tKpK
+            else:
+                tVpV = utils.predicate_k(tVcV, limit=mV.shape[1])
+
+            # shape: (atom_v_m * rest_m)
+            softmax = Softmax.create(
+                softmax_scale_log2,
+                num_rows=acc_O.shape[0][0] * acc_O.shape[1],
+                softmax_scale=softmax_scale,
+            )
+            softmax.reset()
+
+            # group parameters for compute_one_n_block
+            mma_params = SimpleNamespace(
+                thr_mma_qk=thr_mma_qk,
+                thr_mma_pv=thr_mma_pv,
+                tSrQ=tSrQ,
+                tSrK=tSrK,
+                tOrVt=tOrVt,
+                acc_O=acc_O,
+            )
+            smem_copy_params = SimpleNamespace(
+                smem_thr_copy_Q=smem_thr_copy_Q,
+                smem_thr_copy_K=smem_thr_copy_K,
+                smem_thr_copy_V=smem_thr_copy_V,
+                tSsQ=tSsQ,
+                tSsK=tSsK,
+                tOsVt=tOsVt,
+            )
+            load_K = partial(
+                self.load_K, gmem_tiled_copy_K, tKgK, tKsK, tKcK, t0KcK, tKpK, seqlen=seqlen.seqlen_k
+            )
+            load_V = partial(
+                self.load_V, gmem_tiled_copy_V, tVgV, tVsV, tVcV, t0VcV, tVpV, seqlen=seqlen.seqlen_k
+        )
+
+            compute_one_n_block = partial(
+                self.compute_one_n_block,
+                mma_params=mma_params,
+                smem_copy_params=smem_copy_params,
+                softmax=softmax,
+                load_K=load_K,
+                load_V=load_V,
+                score_mod=self.score_mod,
+                batch_idx=batch_size,
+                head_idx=num_head,
+                m_block=m_block,
+                aux_tensors=aux_tensors,
+                fastdiv_mods=fastdiv_mods,
+            )
+
+            # ///////////////////////////////////////////////////////////////////////////////
+            # Prologue
+            # ///////////////////////////////////////////////////////////////////////////////
+            # Start async loads of the last mn-tile, where we take care of the mn residue
+            gmem_thr_copy_Q = gmem_tiled_copy_Q.get_slice(tidx)
+            self.load_Q(gmem_thr_copy_Q, gQ, sQ, m_block, seqlen=seqlen.seqlen_q, headdim=mQ.shape[1])
+            cute.arch.cp_async_commit_group()
+
+            def preprocess_Q():
+                cute.arch.cp_async_wait_group(self.num_stages * 2 - 1)
+                if const_expr(self.Q_in_regs):
+                    cute.arch.barrier()
+                    tSrQ_copy_view = smem_thr_copy_Q.retile(tSrQ)
+                    cute.copy(smem_thr_copy_Q, tSsQ, tSrQ_copy_view)
+
+            # If Q_in_regs, we load Q, then load 1 stage of K, then (optionally) rotate Q and
+            # read from smem_q to registers, then load V.
+            # If !Q_in_regs, we load Q, load all stages of K & V, then (optionally) rotate Q.
+            if const_expr(self.Q_in_regs):
+                load_K(n_block, smem_pipe_write=0, need_predicates=True)
+                cute.arch.cp_async_commit_group()
+                preprocess_Q()
+                cute.arch.barrier()  # Make sure all threads have read smem_q before loading V
+
+            for stage in cutlass.range_constexpr(self.num_stages):
+                if const_expr(not self.Q_in_regs or stage > 0):
+                    if stage == 0 or n_block - stage >= 0:
+                        load_K(n_block - stage, smem_pipe_write=stage, need_predicates=stage == 0)
+                    cute.arch.cp_async_commit_group()
+                if const_expr(stage < self.num_stages - 1):
+                    if stage == 0 or n_block - stage >= 0:
+                        load_V(n_block - stage, smem_pipe_write=stage, need_predicates=stage == 0)
+                    cute.arch.cp_async_commit_group()
+            if const_expr(not self.Q_in_regs):
+                preprocess_Q()
+
+            # ///////////////////////////////////////////////////////////////////////////////
+            # Mainloop
+            # ///////////////////////////////////////////////////////////////////////////////
+            # Start processing of the first n-block.
+            # For performance reason, we separate out two kinds of iterations:
+            # those that need masking on S, and those that don't.
+            # We need masking on S for the very last block when K and V has length not multiple of tile_n.
+            # We also need masking on S if it's causal, for the last several blocks.
+            mask = AttentionMask(
+                self.tile_m,
+                self.tile_n,
+                seqlen,
+                window_size_left,
+                window_size_right,
+                self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+            )
+            mask_fn = partial(
+                mask.apply_mask,
+                batch_idx=batch_size,
+                head_idx=num_head,
+                m_block=m_block,
+                thr_mma=thr_mma_qk,
+                mask_causal=self.is_causal,
+                mask_local=self.is_local,
+                aux_tensors=aux_tensors,
+                fastdiv_mods=fastdiv_mods if const_expr(self.mask_mod is not None) else None,
+            )
+
+            # First iteration with seqlen masking
+            smem_pipe_read = Int32(0)
+            smem_pipe_write = Int32(self.num_stages - 1)
             compute_one_n_block(
-                n_block - n_tile - 1, smem_pipe_read, smem_pipe_write,
-                seqlen=seqlen, is_first_n_block=False,
-                mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=False)
+                n_block,
+                smem_pipe_read,
+                smem_pipe_write,
+                is_first_n_block=True,
+                seqlen=seqlen,
+                mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=True),
             )
             smem_pipe_read = self.advance_pipeline(smem_pipe_read)
             smem_pipe_write = self.advance_pipeline(smem_pipe_write)
-        # TODO: local
+            # Next couple of iterations with causal masking
+            if const_expr(self.is_causal or self.is_local):
+                n_block_min_causal_local_mask = block_info.get_n_block_min_causal_local_mask(
+                    seqlen, m_block, n_block_min
+                )
+                for n_tile in cutlass.range(n_block_max - 1 - n_block_min_causal_local_mask, unroll=1):
+                    n_block = n_block_max - 2 - n_tile
+                    compute_one_n_block(
+                        n_block,
+                        smem_pipe_read,
+                        smem_pipe_write,
+                        seqlen=seqlen,
+                        mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=True),
+                    )
+                    smem_pipe_read = self.advance_pipeline(smem_pipe_read)
+                    smem_pipe_write = self.advance_pipeline(smem_pipe_write)
+            # The remaining iterations have no masking
+            for n_tile in cutlass.range(n_block, unroll=1):
+                compute_one_n_block(
+                    n_block - n_tile - 1, smem_pipe_read, smem_pipe_write,
+                    seqlen=seqlen, is_first_n_block=False,
+                    mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=False)
+                )
+                smem_pipe_read = self.advance_pipeline(smem_pipe_read)
+                smem_pipe_write = self.advance_pipeline(smem_pipe_write)
+            # TODO: local
 
-        # normalize acc_O by row_sum and calculate the lse
-        row_scale = softmax.finalize()
-        softmax.rescale_O(acc_O, row_scale)
+            # normalize acc_O by row_sum and calculate the lse
+            row_scale = softmax.finalize()
+            softmax.rescale_O(acc_O, row_scale)
 
-        # ///////////////////////////////////////////////////////////////////////////////
-        # Epilogue
-        # ///////////////////////////////////////////////////////////////////////////////
-        # reuse sQ's data iterator
-        sO = cute.make_tensor(sQ.iterator, sO_layout)
-        self.epilogue(
-            acc_O,
-            softmax.row_sum,
-            mO,
-            mLSE,
-            sO,
-            seqlen,
-            gmem_tiled_copy_O,
-            None,
-            tiled_mma_pv,
-            tidx,
-            m_block,
-            num_head,
-            batch_size,
-        )
+            # ///////////////////////////////////////////////////////////////////////////////
+            # Epilogue
+            # ///////////////////////////////////////////////////////////////////////////////
+            # reuse sQ's data iterator
+            sO = cute.make_tensor(sQ.iterator, sO_layout)
+            self.epilogue(
+                acc_O,
+                softmax.row_sum,
+                mO,
+                mLSE,
+                sO,
+                seqlen,
+                gmem_tiled_copy_O,
+                None,
+                tiled_mma_pv,
+                tidx,
+                m_block,
+                num_head,
+                batch_size,
+            )
+
+            tile_scheduler.advance_to_next_work()
+            work_tile = tile_scheduler.get_current_work()
 
     @cute.jit
     def compute_one_n_block(
