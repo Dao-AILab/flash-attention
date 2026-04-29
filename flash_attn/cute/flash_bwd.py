@@ -382,6 +382,7 @@ class FlashAttentionBackwardSm80:
         mCuSeqlensK: Optional[cute.Tensor] = None,
         mSeqUsedQ: Optional[cute.Tensor] = None,
         mSeqUsedK: Optional[cute.Tensor] = None,
+        mTileCumsum: Optional[cute.Tensor] = None,  # int32, (num_batch + 1,); see TileSchedulerArguments
         window_size_left: Int32 | int | None = None,
         window_size_right: Int32 | int | None = None,
         mdQ_semaphore: Optional[cute.Tensor] = None,
@@ -429,6 +430,7 @@ class FlashAttentionBackwardSm80:
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if cutlass.const_expr(self.pack_gqa) else 1,
             mCuSeqlensQ=mCuSeqlensK,
             mSeqUsedQ=mSeqUsedK,
+            mTileCumsum=mTileCumsum,
         )
 
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
