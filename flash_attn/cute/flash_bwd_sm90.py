@@ -402,6 +402,15 @@ class FlashAttentionBackwardSm90:
         if const_expr(self.deterministic):
             assert mdQ_semaphore is not None
             mdQ_semaphore = layout_utils.select(mdQ_semaphore, mode=[2, 3, 1, 0])
+        if const_expr(self.deterministic and self.qhead_per_kvhead > 1):
+            assert mdK_semaphore is not None
+            assert mdV_semaphore is not None
+            mdK_semaphore, mdV_semaphore = [
+                layout_utils.select(t, mode=[2, 3, 1, 0]) for t in (mdK_semaphore, mdV_semaphore)
+            ]
+        else:
+            mdK_semaphore = None
+            mdV_semaphore = None
 
         self.num_mma_threads = tiled_mma_SdP.size
         assert self.num_mma_threads + 128 == self.num_threads
@@ -598,6 +607,8 @@ class FlashAttentionBackwardSm90:
             blocksparse_tensors,
             qhead_per_kvhead_divmod,
             mdQ_semaphore,
+            mdK_semaphore,
+            mdV_semaphore,
             window_size_left,
             window_size_right,
         ).launch(
@@ -651,6 +662,8 @@ class FlashAttentionBackwardSm90:
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         qhead_per_kvhead_divmod: Optional[FastDivmodDivisor] = None,
         mdQ_semaphore: Optional[cute.Tensor] = None,
+        mdK_semaphore: Optional[cute.Tensor] = None,
+        mdV_semaphore: Optional[cute.Tensor] = None,
         window_size_left: Optional[Int32] = None,
         window_size_right: Optional[Int32] = None,
     ):
@@ -787,6 +800,8 @@ class FlashAttentionBackwardSm90:
                 tiled_mma_dQ,
                 mdK,
                 mdV,
+                mdK_semaphore,
+                mdV_semaphore,
                 mdQaccum,
                 sQ,
                 sK,
@@ -1092,6 +1107,8 @@ class FlashAttentionBackwardSm90:
         tiled_mma_dQ: cute.TiledMma,
         mdK: cute.Tensor,
         mdV: cute.Tensor,
+        mdK_semaphore: Optional[cute.Tensor],
+        mdV_semaphore: Optional[cute.Tensor],
         mdQaccum: cute.Tensor,
         sQ: cute.Tensor,
         sK: cute.Tensor,
@@ -1388,6 +1405,8 @@ class FlashAttentionBackwardSm90:
                     head_idx,
                     batch_idx,
                     qhead_per_kvhead_divmod,
+                    mdK_semaphore,
+                    mdV_semaphore,
                 )
             else:
                 # KV tile with zero Q blocks produces no dK/dV; write zeros.
@@ -1411,6 +1430,8 @@ class FlashAttentionBackwardSm90:
                         head_idx,
                         batch_idx,
                         qhead_per_kvhead_divmod,
+                        mdK_semaphore,
+                        mdV_semaphore,
                     )
 
             tile_scheduler.advance_to_next_work()
@@ -1615,6 +1636,8 @@ class FlashAttentionBackwardSm90:
         head_idx: Int32,
         batch_idx: Int32,
         qhead_per_kvhead_divmod: Optional[FastDivmodDivisor] = None,
+        mdK_semaphore: Optional[cute.Tensor] = None,
+        mdV_semaphore: Optional[cute.Tensor] = None,
     ):
         epi_barrier = cutlass.pipeline.NamedBarrier(
             barrier_id=int(NamedBarrierBwd.Epilogue), num_threads=self.num_mma_threads
@@ -1669,11 +1692,18 @@ class FlashAttentionBackwardSm90:
                 store_dK()
                 cute.arch.cp_async_bulk_commit_group()
         else:
+            deterministic_KV = self.deterministic and self.qhead_per_kvhead > 1
             sdKaccum_shape0 = self.tile_n * self.tile_hdim // self.num_wg_mma
             sdVaccum_shape0 = self.tile_n * self.tile_hdimv // self.num_wg_mma
             sdKaccum_layout = cute.make_layout((sdKaccum_shape0, self.num_wg_mma))
             sdVaccum_layout = cute.make_layout((sdVaccum_shape0, self.num_wg_mma))
             head_idx_kv = head_idx // qhead_per_kvhead_divmod
+            if const_expr(deterministic_KV):
+                assert mdK_semaphore is not None
+                assert mdV_semaphore is not None
+                mdK_semaphore_cur = mdK_semaphore[n_block, None, head_idx_kv, batch_idx]
+                mdV_semaphore_cur = mdV_semaphore[n_block, None, head_idx_kv, batch_idx]
+                lock_value = head_idx % self.qhead_per_kvhead
             mdKaccum_cur = seqlen.offset_batch_K(
                 mdK, batch_idx, dim=2, padded=True, multiple=self.tile_hdim
             )[None, head_idx_kv]
@@ -1697,7 +1727,10 @@ class FlashAttentionBackwardSm90:
             tdKsdKaccum = thr_copy_dKVaccum_r2s.partition_D(sdKaccum)
             tdVsdVaccum = thr_copy_dKVaccum_r2s.partition_D(sdVaccum)
 
-            cute.arch.cp_async_bulk_wait_group(0, read=True)
+            read_flag = const_expr(not deterministic_KV)
+            cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
+            if const_expr(deterministic_KV):
+                barrier.wait_eq(mdK_semaphore_cur.iterator, tidx, 0, lock_value)
             epi_barrier.arrive_and_wait()
             tdKrdKaccum_flat = cute.make_tensor(acc_dK.iterator, tdKsdKaccum.shape)
             cute.autovec_copy(tdKrdKaccum_flat, tdKsdKaccum)
@@ -1713,7 +1746,10 @@ class FlashAttentionBackwardSm90:
                         )
                 cute.arch.cp_async_bulk_commit_group()
 
-            cute.arch.cp_async_bulk_wait_group(0, read=True)
+            cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
+            if const_expr(deterministic_KV):
+                barrier.arrive_inc(mdK_semaphore_cur.iterator, tidx, 0, 1)
+                barrier.wait_eq(mdV_semaphore_cur.iterator, tidx, 0, lock_value)
             epi_barrier.arrive_and_wait()
             tdVrdVaccum_flat = cute.make_tensor(acc_dV.iterator, tdVsdVaccum.shape)
             cute.autovec_copy(tdVrdVaccum_flat, tdVsdVaccum)
@@ -1728,6 +1764,9 @@ class FlashAttentionBackwardSm90:
                             self.tma_copy_bytes["dVacc"] // self.num_wg_mma,
                         )
                 cute.arch.cp_async_bulk_commit_group()
+            if const_expr(deterministic_KV):
+                cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
+                barrier.arrive_inc(mdV_semaphore_cur.iterator, tidx, 0, 1)
 
     @cute.jit
     def dQaccum_store(
