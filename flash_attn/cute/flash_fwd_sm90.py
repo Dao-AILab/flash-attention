@@ -1012,6 +1012,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             smem_copy_params=smem_copy_params,
             check_inf=True,
             scores_scale=scores_scale,
+            sV=sV,
         )
 
         process_first_half_block = partial(
@@ -1031,6 +1032,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             scores_scale=scores_scale,
             softmax=softmax,
             acc_O=acc_O,
+            sV=sV,
         )
         while work_tile.is_valid_tile:
             # if work_tile.is_valid_tile:
@@ -1174,6 +1176,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     kv_consumer_state = process_last_half_block(
                         kv_consumer_state=kv_consumer_state,
                         zero_init=not O_should_accumulate,
+                        seqlen_in_block_v=seqlen.seqlen_k - n_block_min * self.tile_n,
                     )
                     O_should_accumulate = True
                 else:
@@ -1321,6 +1324,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         scores_scale: Optional[cute.Tensor] = None,
         softmax: Optional[Softmax] = None,
         acc_O: Optional[cute.Tensor] = None,
+        sV: Optional[cute.Tensor] = None,
+        seqlen_in_block_v: Optional[Int32] = None,
     ):
         """Processes the final PV GEMM when using intra-warpgroup-overlap"""
 
@@ -1329,6 +1334,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             softmax.rescale_O(acc_O, scores_scale)
 
         pipeline_v.consumer_wait(kv_consumer_state, pipeline_v.consumer_try_wait(kv_consumer_state))
+        # Zero V smem rows beyond seqlen_k to prevent 0*NaN=NaN in PV GEMM.
+        # TMA loads the full tile even when seqlen_k is not a tile multiple.
+        if const_expr(sV is not None and seqlen_in_block_v is not None):
+            if seqlen_in_block_v < self.tile_n:
+                self.zero_partial_V_smem(sV, kv_consumer_state.index, seqlen_in_block_v)
         mma_pv_fn(B_idx=kv_consumer_state.index, zero_init=zero_init, wg_wait=0)
         pipeline_v.consumer_release(kv_consumer_state)
         kv_consumer_state.advance()
@@ -1353,6 +1363,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mask_fn: Optional[Callable] = None,
         is_first_n_block: cutlass.Constexpr = False,
         check_inf: cutlass.Constexpr = True,
+        sV: Optional[cute.Tensor] = None,
     ):
         pipeline_k.consumer_wait(smem_pipe_read, pipeline_k.consumer_try_wait(smem_pipe_read))
         # S = Q @ K.T
@@ -1390,6 +1401,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             cute.arch.sync_warp()  # Only need syncwarp since each warp is using its own P values for MmaPV
         pipeline_v.consumer_wait(smem_pipe_read, pipeline_v.consumer_try_wait(smem_pipe_read))
         self.warp_scheduler_barrier_sync()
+        # Zero V smem rows beyond seqlen_k to prevent 0*NaN=NaN in PV GEMM.
+        # Only needed for the first (highest-index) n_block, which may be partial.
+        if const_expr(is_first_n_block and sV is not None):
+            seqlen_in_block = seqlen.seqlen_k - n_block * self.tile_n
+            if seqlen_in_block < self.tile_n:
+                self.zero_partial_V_smem(sV, smem_pipe_read.index, seqlen_in_block)
         # O += P @ V
         mma_pv_fn(B_idx=smem_pipe_read.index, wg_wait=0)
         pipeline_v.consumer_release(smem_pipe_read)
@@ -1414,6 +1431,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         score_mod_fn: Optional[Callable] = None,
         mask_fn: Optional[Callable] = None,
         check_inf: cutlass.Constexpr = True,
+        sV: Optional[cute.Tensor] = None,
     ):
         smem_pipe_read_v = smem_pipe_read.clone()
         smem_pipe_read.advance()
@@ -1425,6 +1443,13 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         if const_expr(self.rescale_O_before_gemm):
             softmax.rescale_O(acc_O, scores_scale)
         pipeline_v.consumer_wait(smem_pipe_read_v, pipeline_v.consumer_try_wait(smem_pipe_read_v))
+        # Zero V smem rows beyond seqlen_k to prevent 0*NaN=NaN in PV GEMM.
+        # In the overlap path, V for block (n_block+1) is consumed here. That block
+        # is the partial last V block when seqlen_k is not a tile_n multiple.
+        if const_expr(sV is not None):
+            seqlen_in_block_v = seqlen.seqlen_k - (n_block + 1) * self.tile_n
+            if seqlen_in_block_v < self.tile_n:
+                self.zero_partial_V_smem(sV, smem_pipe_read_v.index, seqlen_in_block_v)
         # O += P @ V
         mma_pv_fn(B_idx=smem_pipe_read_v.index, wg_wait=-1)
         self.warp_scheduler_barrier_arrive()
@@ -1464,6 +1489,30 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             cute.arch.fence_view_async_shared()
             cute.arch.sync_warp()  # Only need syncwarp since each warp is using its own P values for MmaPV
         return smem_pipe_read
+
+    @cute.jit
+    def zero_partial_V_smem(self, sV: cute.Tensor, stage_idx: Int32, seqlen_in_block: Int32):
+        """Zero V smem rows [seqlen_in_block, tile_n) for the given pipeline stage.
+
+        TMA loads a full tile_n-row block even when seqlen_k is not a multiple of
+        tile_n. Rows beyond seqlen_k may contain NaN from an uninitialized KV cache.
+        WGMMA propagates these NaN values (0 * NaN = NaN, IEEE 754) even though the
+        corresponding P values are zero after masking. This method overwrites those
+        rows with zeros before the PV GEMM so WGMMA sees 0 * 0 = 0 instead.
+
+        Called after pipeline_v.consumer_wait() and before mma_pv_fn(). The
+        wgmma.fence.before_group.sync.aligned inside mma_pv_fn ensures all stores
+        performed here are visible to subsequent WGMMA instructions.
+        """
+        tidx_in_wg = cute.arch.thread_idx()[0] % self.num_threads_per_warp_group
+        sV_stage = sV[None, None, stage_idx]
+        for row_off in cutlass.range_constexpr(
+            (self.tile_n + self.num_threads_per_warp_group - 1) // self.num_threads_per_warp_group
+        ):
+            n = row_off * self.num_threads_per_warp_group + tidx_in_wg
+            if n >= seqlen_in_block and n < self.tile_n:
+                for h in cutlass.range_constexpr(self.tile_hdimv):
+                    sV_stage[n, h] = self.dtype(0)
 
     @cute.jit
     def mma_init(self):

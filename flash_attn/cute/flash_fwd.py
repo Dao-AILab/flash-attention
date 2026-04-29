@@ -17,7 +17,6 @@ import cutlass.cute as cute
 from cutlass import Constexpr, Float32, Int32, const_expr, Boolean
 from cutlass.cute.nvgpu import cpasync, warp
 import cutlass.utils as utils_basic
-from cutlass.base_dsl.arch import Arch
 from cutlass.cutlass_dsl import BaseDSL
 
 from quack import copy_utils
@@ -648,8 +647,10 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         self.num_producer_threads = self.num_threads
         self.num_Q_load_threads = self.num_threads
         self.num_epilogue_threads = self.num_threads
-        # self.use_tma_O = self.arch >= 90 and mCuSeqlensQ is None
-        self.use_tma_O = self.arch >= Arch.sm_90
+        # Sm80 path always uses the cpasync/universal epilogue for O. `self.arch` is the runtime
+        # GPU (e.g. sm_120 on RTX 5090), not the kernel family; comparing to sm_90 incorrectly
+        # enables TMA-O and hits tma_atom_O=None (Dao-AILab/flash-attention#2386).
+        self.use_tma_O = False
         self._setup_attributes()
         SharedStorage = self._get_shared_storage_cls()
         mQ, mK, mV, mO = [assume_tensor_aligned(t) for t in (mQ, mK, mV, mO)]
