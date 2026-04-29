@@ -7,14 +7,18 @@
 
 import cutlass
 import cutlass.utils as utils_basic
+from cutlass.base_dsl.arch import Arch
 
 from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80
 
 
 class FlashAttentionForwardSm120(FlashAttentionForwardSm80):
-    # Keep arch = 80 to use CpAsync code paths (no TMA for output).
-    # The compilation target is determined by the GPU at compile time, not this field.
-    arch = 80
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Override arch to sm_80 so that __call__ uses CpAsync (not TMA) for the O epilogue.
+        # BaseDSL._get_dsl().get_arch_enum() returns the real GPU arch (sm_121a on DGX Spark),
+        # but SM120 must use the SM80 epilogue path (no TMA-O support in this kernel variant).
+        self.arch = Arch.sm_80
 
     @staticmethod
     def can_implement(
@@ -31,6 +35,8 @@ class FlashAttentionForwardSm120(FlashAttentionForwardSm80):
         """Check if the kernel can be implemented on SM120.
 
         Same logic as SM80 but uses SM120's shared memory capacity (99 KB).
+        For split-KV, FP32 partials are written directly from MMA accumulators
+        to GMEM (no SMEM round-trip), so sO doesn't affect SMEM budget.
         """
         if dtype not in [cutlass.Float16, cutlass.BFloat16]:
             return False
