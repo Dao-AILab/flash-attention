@@ -217,6 +217,17 @@ def validate_and_update_archs(archs):
 cmdclass = {}
 ext_modules = []
 
+try:
+    import ninja  # noqa: F401
+except ImportError:
+    warnings.warn(
+        "The 'ninja' package is not installed. Without ninja, the FlashAttention CUDA extension "
+        "build will fall back to a single-threaded compile and can take a very long time. "
+        "Install ninja with: pip install ninja",
+        UserWarning,
+        stacklevel=1,
+    )
+
 # We want this even if SKIP_CUDA_BUILD because when we run python setup.py sdist we want the .hpp
 # files included in the source distribution, in case the user compiles from source.
 if IS_ROCM:
@@ -255,8 +266,10 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
     check_if_cuda_home_none("flash_attn")
     # Check, if CUDA11 is installed for compute capability 8.0
     cc_flag = []
+    cuda_bare_metal_version = None
     if CUDA_HOME is not None:
         _, bare_metal_version = get_cuda_bare_metal_version(CUDA_HOME)
+        cuda_bare_metal_version = bare_metal_version
         if bare_metal_version < Version("11.7"):
             raise RuntimeError(
                 "FlashAttention is only supported on CUDA 11.7 and above.  "
@@ -300,6 +313,10 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
     if sys.platform == "win32" and os.getenv('DISTUTILS_USE_SDK') == '1':
         nvcc_flags.extend(["-Xcompiler", "/Zc:__cplusplus"])
         compiler_c17_flag=["-O2", "/std:c++17", "/Zc:__cplusplus"]
+        # CUDA 13+ CCCL headers require MSVC's conforming preprocessor (see Dao-AILab/flash-attention#2395).
+        if cuda_bare_metal_version is not None and cuda_bare_metal_version >= Version("13.0"):
+            nvcc_flags.extend(["-Xcompiler", "/Zc:preprocessor"])
+            compiler_c17_flag = compiler_c17_flag + ["/Zc:preprocessor"]
 
     ext_modules.append(
         CUDAExtension(
