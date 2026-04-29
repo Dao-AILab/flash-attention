@@ -58,8 +58,22 @@ pytest -q -s test_flash_attn.py
 ```
 Once the package is installed, you can import it as follows:
 ```python
-import flash_attn_interface
+from flash_attn_3 import flash_attn_interface
 flash_attn_interface.flash_attn_func()
+```
+
+To install using `uv`, in your `pyproject.toml`:
+
+```toml
+dependencies = [
+    "flash-attn-3"
+]
+
+[tool.uv]
+no-build-isolation = true
+
+[tool.uv.sources]
+flash-attn-3 = { git = "https://github.com/Dao-AILab/flash-attention", subdirectory = "hopper" }
 ```
 
 ## FlashAttention-4 (CuTeDSL)
