@@ -8,6 +8,10 @@ FlashAttention-4 (FA4) — fast, memory-efficient exact attention kernels writte
 
 The repository also contains older generations (FA2 in top-level `csrc/`, FA3 in `hopper/`) but active development is on FA4 in `flash_attn/cute/`.
 
+## Agent Scratch Space
+
+Use `agent_space/` for project-local scratch work such as lab notes, profiling outputs, temporary repro scripts, and experiment artifacts. Treat it as disposable workspace rather than product code.
+
 ## Build & Install
 
 ```bash
@@ -16,7 +20,7 @@ pip install flash-attn-4
 pip install -e "flash_attn/cute[dev]"
 ```
 
-Dependencies: `nvidia-cutlass-dsl>=4.4.1`, `torch`, `einops`, `apache-tvm-ffi`, `quack-kernels>=0.2.10`.
+Dependencies: `nvidia-cutlass-dsl>=4.4.1`, `torch`, `einops`, `apache-tvm-ffi`, `quack-kernels>=0.4.0`.
 
 ## Running Tests
 
@@ -124,7 +128,7 @@ Env vars: `CUTE_CUBIN_PATH` (dump CUBIN/SASS), `CUTE_DSL_KEEP_PTX=1` (inspect PT
 
 ## Debugging GPU Kernels
 
-See `AI/DEBUG_2CTA.md` for kernel hang/deadlock debugging (printf bisection, pipeline barrier analysis, 2CTA pitfalls). See `AI/RACECHECK_TMA_HAZARD.md` for `compute-sanitizer` false positives with `cp.async.bulk`.
+See `AI/DEBUG_2CTA.md` for kernel hang/deadlock debugging (printf bisection, pipeline barrier analysis, 2CTA pitfalls). See `AI/RACECHECK_TMA_HAZARD.md` for `compute-sanitizer` false positives with `cp.async.bulk`. See `AI/CLC_TRACE_DEBUG.md` for visualization of CLC scheduling.
 
 Key tools:
 - `cute.printf` with thread guards (`tidx % 32 == 0`, `elect_one()`) for targeted output

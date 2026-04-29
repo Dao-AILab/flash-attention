@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32
+from cutlass import Float32, Boolean
 
 from quack import layout_utils
 import flash_attn.cute.utils as utils
@@ -169,12 +169,14 @@ class Softmax(ParamsBase):
 @dataclass
 class SoftmaxSm100(Softmax):
     rescale_threshold: cutlass.Constexpr[float] = 0.0
+    max_offset: cutlass.Constexpr[int] = 0
 
     @staticmethod
     def create(
         scale_log2: Float32,
         rescale_threshold: cutlass.Constexpr[float] = 0.0,
         softmax_scale: Float32 | None = None,
+        max_offset: cutlass.Constexpr[int] = 0,
     ):
         num_rows = 1
         arch = 100
@@ -188,7 +190,39 @@ class SoftmaxSm100(Softmax):
             arch,
             softmax_scale,
             rescale_threshold=rescale_threshold,
+            max_offset=max_offset,
         )
+
+    @cute.jit
+    def compute_row_max_local(self, acc_S_row: cute.TensorSSA, is_first: Boolean) -> Float32:
+        if cutlass.const_expr(is_first):
+            row_max_new = self._compute_row_max(acc_S_row)
+        else:
+            row_max_old = self.row_max[0]
+            row_max_new = self._compute_row_max(acc_S_row, init_val=row_max_old)
+        return row_max_new
+
+    @cute.jit
+    def update_row_max_from_local(
+        self,
+        row_max_new: Float32,
+        is_first: Boolean,
+    ) -> Tuple[Float32, Float32]:
+        if cutlass.const_expr(is_first):
+            row_max_safe = row_max_new if row_max_new != -cutlass.Float32.inf else 0.0
+            acc_scale = 0.0
+        else:
+            row_max_old = self.row_max[0]
+            row_max_safe = row_max_new if row_max_new != -cutlass.Float32.inf else 0.0
+            acc_scale_ = (row_max_old - row_max_safe) * self.scale_log2
+            acc_scale = cute.math.exp2(acc_scale_)
+            if cutlass.const_expr(self.rescale_threshold > 0.0):
+                if acc_scale_ >= -self.rescale_threshold:
+                    row_max_new = row_max_old
+                    row_max_safe = row_max_old
+                    acc_scale = 1.0
+        self.row_max[0] = row_max_new
+        return row_max_safe, acc_scale
 
     @cute.jit
     def update_row_max(self, acc_S_row: cute.TensorSSA, is_first: int) -> Tuple[Float32, Float32]:
@@ -227,11 +261,13 @@ class SoftmaxSm100(Softmax):
     ):
         assert cute.size(acc_S_row.shape) % 2 == 0, "acc_S_row must have an even number of elements"
         row_max_scaled = row_max * self.scale_log2
+        max_offset = Float32(self.max_offset)
+        bias = max_offset - row_max_scaled
         for i in cutlass.range(0, cute.size(acc_S_row.shape), 2, unroll_full=True):
             acc_S_row[i], acc_S_row[i + 1] = cute.arch.fma_packed_f32x2(
                 (acc_S_row[i], acc_S_row[i + 1]),
                 (self.scale_log2, self.scale_log2),
-                (-row_max_scaled, -row_max_scaled),
+                (bias, bias),
             )
 
     @cute.jit
@@ -398,7 +434,7 @@ def apply_score_mod_inner(
     q_idx_vec = cute.make_rmem_tensor(vec_size, cutlass.Int32)
 
     # For Pack-GQA with non-constant q_idx, we need per-element head indices
-    # since a thread my process multiple query head indices
+    # since a thread may process multiple query head indices
     if cutlass.const_expr(qhead_per_kvhead > 1 and constant_q_idx is None):
         head_idx_vec = cute.make_rmem_tensor(vec_size, cutlass.Int32)
 

@@ -4,6 +4,7 @@ import math
 import hashlib
 import inspect
 import os
+from functools import partial
 from typing import Type, Callable, Optional, Tuple, overload
 
 import cutlass
@@ -60,12 +61,33 @@ _fa_clc_enabled: bool = os.environ.get("FA_CLC", "0") == "1"
 _fa_disable_2cta_enabled: bool = os.environ.get("FA_DISABLE_2CTA", "0") == "1"
 
 
+def _is_cuda_12() -> bool:
+    """Check if the CUDA toolkit version is 12.x.
+
+    2CTA forward non-causal has a codegen regression on CUDA 12 that causes
+    ~18% slowdown compared to 1CTA. This is fixed in CUDA 13.x.
+    """
+    try:
+        import torch
+
+        cuda_version = torch.version.cuda
+        if cuda_version is not None:
+            major = cuda_version.split(".")[0]
+            return int(major) == 12
+    except Exception:
+        pass
+    return False
+
+
+_fa_disable_2cta_cuda12: bool = _is_cuda_12()
+
+
 def _get_use_clc_scheduler_default() -> bool:
     return _fa_clc_enabled
 
 
 def _get_disable_2cta_default() -> bool:
-    return _fa_disable_2cta_enabled
+    return _fa_disable_2cta_enabled or _fa_disable_2cta_cuda12
 
 
 def _compute_base_hash(func: Callable) -> str:
@@ -126,14 +148,26 @@ def hash_callable(
 
 
 def create_softcap_scoremod(softcap_val):
-    inv_softcap = 1.0 / softcap_val
-
     @cute.jit
-    def scoremod_premask_fn(acc_S_SSA, batch_idx, head_idx, q_idx, kv_idx, aux_tensors):
-        scores = acc_S_SSA * inv_softcap
-        return scores * cute.math.tanh(scores, fastmath=True)
+    def scoremod_premask_fn(
+        acc_S_SSA, batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors
+    ):
+        scores = acc_S_SSA / softcap_val
+        return softcap_val * cute.math.tanh(scores, fastmath=True)
 
     return scoremod_premask_fn
+
+
+def create_softcap_scoremod_bwd(softcap_val):
+    @cute.jit
+    def scoremod_bwd_fn(
+        grad_out_SSA, score_SSA, batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors
+    ):
+        scores = score_SSA / softcap_val
+        tanh_scores = cute.math.tanh(scores, fastmath=True)
+        return grad_out_SSA * (1.0 - tanh_scores * tanh_scores)
+
+    return scoremod_bwd_fn
 
 
 LOG2_E = math.log2(math.e)
@@ -178,6 +212,34 @@ def convert_from_dlpack(x, leading_dim, alignment=16, divisibility=1) -> cute.Te
             mode=leading_dim, stride_order=x.dim_order(), divisibility=divisibility
         )
     )
+
+
+def convert_from_dlpack_compact_dynamic(
+    x,
+    *,
+    dynamic_modes: tuple[int, ...],
+    alignment: int = 16,
+    stride_order=None,
+    divisibility: int = 1,
+    enable_tvm_ffi: bool = False,
+) -> cute.Tensor:
+    """Convert via DLPack and mark selected compact dimensions as dynamic."""
+    if isinstance(dynamic_modes, int):
+        dynamic_modes = (dynamic_modes,)
+    if stride_order is None:
+        stride_order = x.dim_order()
+    t = (
+        from_dlpack(x, assumed_align=alignment, enable_tvm_ffi=True)
+        if enable_tvm_ffi
+        else from_dlpack(x, assumed_align=alignment)
+    )
+    for mode in dynamic_modes:
+        t = t.mark_compact_shape_dynamic(
+            mode=mode,
+            stride_order=stride_order,
+            divisibility=divisibility,
+        )
+    return t
 
 
 def convert_from_dlpack_leading_static(
@@ -785,6 +847,92 @@ def domain_offset_aligned(
         assumed_align=tensor.iterator.alignment,
     )
     return cute.make_tensor(new_ptr, tensor.layout)
+
+
+@dsl_user_op
+def warp_reduction(
+    val: cute.Numeric, op: Callable, *, threads_in_group: int = 32, loc=None, ip=None
+) -> cute.Numeric:
+    """Warp-wide reduction helper for a custom binary op."""
+    offset = threads_in_group // 2
+    while offset > 0:
+        val = op(
+            val,
+            cute.arch.shuffle_sync_bfly(
+                val, offset=offset, mask=-1, mask_and_clamp=31, loc=loc, ip=ip
+            ),
+        )
+        offset //= 2
+    return val
+
+
+warp_reduction_max = partial(
+    warp_reduction, op=lambda x, y: fmax(x, y) if isinstance(x, Float32) else max(x, y)
+)
+warp_reduction_sum = partial(warp_reduction, op=lambda x, y: x + y)  # noqa: FURB118
+
+
+@dsl_user_op
+def make_cotiled_copy(
+    atom: cute.CopyAtom, atom_layout_tv: cute.Layout, data_layout: cute.Layout, *, loc=None, ip=None
+) -> cute.TiledCopy:
+    """Compatibility wrapper for deprecated CuTeDSL `make_cotiled_copy`."""
+    assert cute.is_static(atom_layout_tv.type), "atom_layout_tv must be static"
+    assert cute.is_static(data_layout.type), "data_layout must be static"
+
+    inv_layout_ = cute.left_inverse(data_layout, loc=loc, ip=ip)
+    inv_data_layout = cute.make_layout(
+        (inv_layout_.shape, (1)), stride=(inv_layout_.stride, (0)), loc=loc, ip=ip
+    )
+    layout_tv_data = cute.composition(inv_data_layout, atom_layout_tv, loc=loc, ip=ip)
+
+    atom_layout_v_to_check = cute.coalesce(
+        cute.make_layout(atom_layout_tv.shape[1], stride=atom_layout_tv.stride[1], loc=loc, ip=ip),
+        loc=loc,
+        ip=ip,
+    )
+    data_layout_v_to_check = cute.coalesce(
+        cute.composition(
+            data_layout,
+            cute.make_layout(
+                layout_tv_data.shape[1], stride=layout_tv_data.stride[1], loc=loc, ip=ip
+            ),
+            loc=loc,
+            ip=ip,
+        ),
+        loc=loc,
+        ip=ip,
+    )
+    assert data_layout_v_to_check == atom_layout_v_to_check, (
+        "the memory pointed to by atom_layout_tv does not exist in the data_layout."
+    )
+
+    flat_data_shape = cute.product_each(data_layout.shape, loc=loc, ip=ip)
+    tiler = tuple(
+        cute.filter(
+            cute.composition(
+                cute.make_layout(
+                    flat_data_shape,
+                    stride=tuple(0 if j != i else 1 for j in range(cute.rank(flat_data_shape))),
+                    loc=loc,
+                    ip=ip,
+                ),
+                layout_tv_data,
+                loc=loc,
+                ip=ip,
+            ),
+            loc=loc,
+            ip=ip,
+        )
+        for i in range(cute.rank(flat_data_shape))
+    )
+    tile2data = cute.composition(
+        cute.make_layout(flat_data_shape, loc=loc, ip=ip), tiler, loc=loc, ip=ip
+    )
+    layout_tv = cute.composition(
+        cute.left_inverse(tile2data, loc=loc, ip=ip), layout_tv_data, loc=loc, ip=ip
+    )
+    return cute.make_tiled_copy(atom, layout_tv, tiler, loc=loc, ip=ip)
 
 
 @cute.jit

@@ -22,7 +22,7 @@ import cutlass.cute as cute
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 import torch.nn.functional as F
 
-from flash_attn.cute.interface import _flash_attn_fwd, _flash_attn_bwd
+from flash_attn.cute.interface import _flash_attn_fwd, _flash_attn_bwd, flash_attn_func
 from flash_attn.cute.block_sparsity import (
     BlockSparseTensorsTorch,
     fast_sampling,
@@ -253,6 +253,7 @@ def _run_mask_test(
     tile_n,
     use_block_sparsity,
     needs_backward=False,
+    use_autograd=False,
 ):
     torch.manual_seed(42)
 
@@ -403,35 +404,55 @@ def _run_mask_test(
         else None
     )
 
-    out_tuple = _flash_attn_fwd(
-        q=tensors["q"],
-        k=tensors["k"],
-        v=tensors["v"],
-        out=tensors["out"],
-        lse=tensors["lse"],
-        cu_seqlens_q=None,
-        cu_seqlens_k=None,
-        seqused_q=None,
-        seqused_k=None,
-        page_table=None,
-        softmax_scale=softmax_scale,
-        causal=causal,
-        softcap=None,
-        window_size_left=window_left,
-        window_size_right=window_right,
-        learnable_sink=None,
-        tile_mn=(tile_m, tile_n),
-        pack_gqa=pack_gqa,
-        _arch=None,
-        score_mod=None,
-        mask_mod=mask_mod_cute,
-        block_sparse_tensors=block_sparse_mask_fwd,
-        return_lse=True,
-        aux_tensors=aux_tensors_arg,
-    )
+    if use_autograd:
+        q_ag = tensors["q"].detach().requires_grad_(True)
+        k_ag = tensors["k"].detach().requires_grad_(True)
+        v_ag = tensors["v"].detach().requires_grad_(True)
 
-    out_cute = out_tuple[0]
-    lse_cute = out_tuple[1]
+        out_cute, lse_cute = flash_attn_func(
+            q_ag,
+            k_ag,
+            v_ag,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=(window_left, window_right),
+            pack_gqa=pack_gqa,
+            mask_mod=mask_mod_cute,
+            aux_tensors=aux_tensors_arg,
+            block_sparse_tensors=block_sparse_mask_fwd,
+            block_sparse_tensors_bwd=block_sparse_mask_bwd,
+            return_lse=True,
+        )
+    else:
+        out_tuple = _flash_attn_fwd(
+            q=tensors["q"],
+            k=tensors["k"],
+            v=tensors["v"],
+            out=tensors["out"],
+            lse=tensors["lse"],
+            cu_seqlens_q=None,
+            cu_seqlens_k=None,
+            seqused_q=None,
+            seqused_k=None,
+            page_table=None,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            softcap=None,
+            window_size_left=window_left,
+            window_size_right=window_right,
+            learnable_sink=None,
+            tile_mn=(tile_m, tile_n),
+            pack_gqa=pack_gqa,
+            _arch=None,
+            score_mod=None,
+            mask_mod=mask_mod_cute,
+            block_sparse_tensors=block_sparse_mask_fwd,
+            return_lse=True,
+            aux_tensors=aux_tensors_arg,
+        )
+
+        out_cute = out_tuple[0]
+        lse_cute = out_tuple[1]
     tensors_fp32 = {
         k: v.float() if v.dtype in [torch.float16, torch.bfloat16] else v
         for k, v in tensors.items()
@@ -489,11 +510,16 @@ def _run_mask_test(
             device="cuda", BLOCK_SIZE=(tile_m, tile_n),
         )
 
-        dq_cute, dk_cute, dv_cute = run_cute_mask_bwd(
-            q, k, v, out_cute, lse_cute, grad_out, mask_mod_cute,
-            block_sparse_mask_bwd=block_sparse_mask_bwd, tile_m=tile_m, tile_n=tile_n,
-            aux_tensors=aux_tensors_arg,
-        )
+        if use_autograd:
+            dq_cute, dk_cute, dv_cute = torch.autograd.grad(
+                out_cute, (q_ag, k_ag, v_ag), grad_out
+            )
+        else:
+            dq_cute, dk_cute, dv_cute = run_cute_mask_bwd(
+                q, k, v, out_cute, lse_cute, grad_out, mask_mod_cute,
+                block_sparse_mask_bwd=block_sparse_mask_bwd, tile_m=tile_m, tile_n=tile_n,
+                aux_tensors=aux_tensors_arg,
+            )
         _, dq_ref_fp32, dk_ref_fp32, dv_ref_fp32 = run_flex_reference_bwd(
             q, k, v, flex_block_mask, grad_out, dtype=torch.float32
         )
@@ -761,8 +787,9 @@ def test_static_masks(
     ],
 )
 @pytest.mark.parametrize("tile_m,tile_n", [(128, 128), (128, 112), (64, 128)])
+@pytest.mark.parametrize("use_autograd", [True, False])
 def test_parameterized_masks(
-    seqlen_q, seqlen_k, nheads, kv_mode, headdim, dtype, use_block_sparsity, mask_name, window_size, tile_m, tile_n
+    seqlen_q, seqlen_k, nheads, kv_mode, headdim, dtype, use_block_sparsity, mask_name, window_size, tile_m, tile_n, use_autograd,
 ):
     """Test parameterized masks that require recompilation per seqlen pair.
 
@@ -791,6 +818,7 @@ def test_parameterized_masks(
         tile_n=tile_n,
         use_block_sparsity=use_block_sparsity,
         needs_backward=True,
+        use_autograd=use_autograd,
     )
 
 

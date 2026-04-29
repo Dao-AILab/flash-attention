@@ -5,7 +5,12 @@ import cutlass.cute as cute
 from cutlass._mlir.dialects import math as mlir_math
 import operator
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
-from flash_attn.cute.interface import _flash_attn_fwd, _flash_attn_bwd, _tile_size_bwd_sm90
+from flash_attn.cute.interface import (
+    flash_attn_func,
+    _flash_attn_fwd,
+    _flash_attn_bwd,
+    _tile_size_bwd_sm90,
+)
 from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch
 
 COMPUTE_CAPABILITY = torch.cuda.get_device_capability()[0]
@@ -753,37 +758,55 @@ BWD_TEST_PAIRS_PACK_GQA = [
 
 
 def run_cute_flash_bwd(
-    q, k, v, cute_score_mod, cute_score_mod_bwd, aux_tensors=None, pack_gqa=False
+    q, k, v, cute_score_mod, cute_score_mod_bwd, aux_tensors=None, pack_gqa=False, use_autograd=True,
 ):
     """Run flash attention forward + backward with score_mod."""
     q_t = q.transpose(1, 2)
     k_t = k.transpose(1, 2)
     v_t = v.transpose(1, 2)
 
-    out, lse = _flash_attn_fwd(
-        q_t,
-        k_t,
-        v_t,
-        return_lse=True,
-        score_mod=cute_score_mod,
-        aux_tensors=aux_tensors,
-        pack_gqa=pack_gqa,
-    )
+    if use_autograd:
+        q_t = q_t.detach().requires_grad_(True)
+        k_t = k_t.detach().requires_grad_(True)
+        v_t = v_t.detach().requires_grad_(True)
+        out, lse = flash_attn_func(
+            q_t, 
+            k_t, 
+            v_t, 
+            score_mod=cute_score_mod,
+            score_mod_bwd=cute_score_mod_bwd,
+            aux_tensors=aux_tensors,
+            pack_gqa=pack_gqa,
+        )
 
-    grad_out = torch.randn_like(out)
+        grad_out = torch.randn_like(out)
 
-    dq, dk, dv = _flash_attn_bwd(
-        q_t,
-        k_t,
-        v_t,
-        out,
-        grad_out,
-        lse,
-        score_mod=cute_score_mod,
-        score_mod_bwd=cute_score_mod_bwd,
-        aux_tensors=aux_tensors,
-        pack_gqa=pack_gqa,
-    )
+        dq, dk, dv = torch.autograd.grad(out, (q_t, k_t, v_t), grad_out)
+    else:
+        out, lse = _flash_attn_fwd(
+            q_t,
+            k_t,
+            v_t,
+            return_lse=True,
+            score_mod=cute_score_mod,
+            aux_tensors=aux_tensors,
+            pack_gqa=pack_gqa,
+        )
+
+        grad_out = torch.randn_like(out)
+
+        dq, dk, dv = _flash_attn_bwd(
+            q_t,
+            k_t,
+            v_t,
+            out,
+            grad_out,
+            lse,
+            score_mod=cute_score_mod,
+            score_mod_bwd=cute_score_mod_bwd,
+            aux_tensors=aux_tensors,
+            pack_gqa=pack_gqa,
+        )
 
     return (
         out.transpose(1, 2),
@@ -982,7 +1005,8 @@ def test_sm90_block_sparse_score_mod_backward_with_dq_swapab():
 @pytest.mark.parametrize("dim", [64, 128])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("score_mod_triple", BWD_TEST_PAIRS)
-def test_cute_vs_flex_attention_backward(seqlen_q, seqlen_kv, dim, dtype, score_mod_triple):
+@pytest.mark.parametrize("use_autograd", [True, False])
+def test_cute_vs_flex_attention_backward(seqlen_q, seqlen_kv, dim, dtype, score_mod_triple, use_autograd):
     """Test backward pass with score_mod against flex_attention reference."""
     if COMPUTE_CAPABILITY == 9 and dim == 64:
         pytest.skip("head_dim=64 not supported on SM90 for backward")
@@ -994,7 +1018,7 @@ def test_cute_vs_flex_attention_backward(seqlen_q, seqlen_kv, dim, dtype, score_
         seqlen_q=seqlen_q, seqlen_kv=seqlen_kv, num_heads=4, dim=dim, dtype=dtype
     )
 
-    out_cute, grad_out, dq_cute, dk_cute, dv_cute = run_cute_flash_bwd(q, k, v, cute_fwd, cute_bwd)
+    out_cute, grad_out, dq_cute, dk_cute, dv_cute = run_cute_flash_bwd(q, k, v, cute_fwd, cute_bwd, use_autograd=use_autograd)
     out_ref_fp32, dq_ref_fp32, dk_ref_fp32, dv_ref_fp32 = run_flex_reference_bwd(
         q, k, v, eager_ref, grad_out, dtype=torch.float32
     )
