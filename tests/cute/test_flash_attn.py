@@ -1571,6 +1571,64 @@ def test_flash_attn_bwd_preallocated_outputs(seqlen_q, seqlen_k, d, causal, dtyp
     assert torch.allclose(dv, dv_ref, atol=1e-5, rtol=1e-5)
 
 
+@pytest.mark.parametrize("head_dim,head_dim_v", [(104, 104), (128, 104)])
+def test_flash_attn_bwd_preprocess_varlen_head_dim_v_not_multiple_of_32(
+    head_dim, head_dim_v
+):
+    import cutlass
+
+    from flash_attn.cute.interface import _bwd_preprocess
+
+    device = "cuda"
+    dtype = torch.bfloat16
+    torch.random.manual_seed(42)
+    seqlens = [128, 128]
+    total_seqlen = sum(seqlens)
+    nheads = 4
+    m_block_size = 128
+    cu_seqlens = torch.tensor(
+        [0, seqlens[0], total_seqlen], device=device, dtype=torch.int32
+    )
+    total_seqlen_padded = (
+        (total_seqlen + cu_seqlens.shape[0] * m_block_size - 1)
+        // m_block_size
+        * m_block_size
+    )
+    head_dim_rounded = (head_dim + 31) // 32 * 32
+
+    out = torch.randn(total_seqlen, nheads, head_dim_v, device=device, dtype=dtype)
+    dout = torch.randn_like(out)
+    dpsum = torch.empty(nheads, total_seqlen_padded, device=device, dtype=torch.float32)
+    lse = torch.randn(nheads, total_seqlen, device=device, dtype=torch.float32)
+    lse_log2 = torch.empty(nheads, total_seqlen_padded, device=device, dtype=torch.float32)
+    dq_accum = torch.empty(
+        nheads,
+        total_seqlen_padded * head_dim_rounded,
+        device=device,
+        dtype=torch.float32,
+    )
+
+    _bwd_preprocess(
+        out,
+        dout,
+        dpsum,
+        lse,
+        lse_log2,
+        dq_accum,
+        cu_seqlens_q=cu_seqlens,
+        seqused_q=None,
+        dlse=None,
+        dtype=cutlass.BFloat16,
+        head_dim=head_dim,
+        head_dim_v=head_dim_v,
+        m_block_size=m_block_size,
+    )
+    torch.cuda.synchronize()
+
+    assert torch.isfinite(dpsum[:, :total_seqlen]).all()
+    assert dq_accum.abs().max().item() == 0.0
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("d", [64, 128])
