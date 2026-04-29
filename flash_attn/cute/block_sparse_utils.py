@@ -188,7 +188,7 @@ def produce_block_sparse_loads(
             must be converted to unpacked for sparse tensor indexing.
     """
 
-    mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx = blocksparse_tensors
+    mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx, *_ = blocksparse_tensors
 
     m_block_sparse = sparse_tensor_m_block(m_block, qhead_per_kvhead, q_subtile_factor)
 
@@ -332,7 +332,7 @@ def consume_block_sparse_loads(
             must be converted to unpacked for sparse tensor indexing.
     """
 
-    mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx = blocksparse_tensors
+    mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx, *_ = blocksparse_tensors
 
     m_block_sparse = sparse_tensor_m_block(m_block, qhead_per_kvhead, q_subtile_factor)
 
@@ -552,7 +552,7 @@ def produce_block_sparse_loads_sm100(
     """
     m_block_sparse = sparse_tensor_m_block(m_block, qhead_per_kvhead, q_subtile_factor)
 
-    mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx = blocksparse_tensors
+    mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx, *_ = blocksparse_tensors
 
     curr_mask_block_cnt = mask_block_cnt[batch_idx, head_idx, m_block_sparse]
     curr_mask_block_idx = mask_block_idx[batch_idx, head_idx, m_block_sparse, None]
@@ -629,7 +629,7 @@ def get_total_block_count(
 ):
     m_block_sparse = sparse_tensor_m_block(m_block, qhead_per_kvhead, q_subtile_factor)
 
-    mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx = blocksparse_tensors
+    mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx, *_ = blocksparse_tensors
     if const_expr(full_block_cnt is not None):
         return (
             mask_block_cnt[batch_idx, head_idx, m_block_sparse]
@@ -780,7 +780,7 @@ def softmax_block_sparse_sm100(
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
     m_block_sparse = sparse_tensor_m_block(m_block, qhead_per_kvhead, q_subtile_factor)
 
-    mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx = blocksparse_tensors
+    mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx, *_ = blocksparse_tensors
 
     curr_mask_block_cnt = mask_block_cnt[batch_idx, head_idx, m_block_sparse]
     curr_mask_block_idx = mask_block_idx[batch_idx, head_idx, m_block_sparse, None]
@@ -795,8 +795,6 @@ def softmax_block_sparse_sm100(
     total_block_cnt = curr_mask_block_cnt + curr_full_block_cnt
 
     if total_block_cnt == 0:
-        # See NOTE [SM100 block-sparse empty tiles: mbarrier contract].
-        # pipeline_sm_stats.producer_commit_w_index(stage_idx)
         sm_stats_barrier.arrive_w_index(index=stage_idx * 4 + warp_idx)
     else:
         if curr_mask_block_cnt > 0:
@@ -907,7 +905,7 @@ def get_total_q_block_count_bwd(
     m_block_max: int = 0,
 ):
     """Count total tile iterations for given n_block (KV tile) in backward."""
-    q_block_cnt, _, full_block_cnt, _ = blocksparse_tensors
+    q_block_cnt, _, full_block_cnt, _, *_ = blocksparse_tensors
     total = q_block_cnt[batch_idx, head_idx, n_block]
     if const_expr(full_block_cnt is not None):
         total = total + full_block_cnt[batch_idx, head_idx, n_block]
@@ -1051,7 +1049,7 @@ def get_block_sparse_iteration_info_bwd(
 
     Returns (curr_q_cnt, curr_q_idx, curr_full_cnt, curr_full_idx, total_count).
     """
-    q_cnt, q_idx, full_cnt, full_idx = blocksparse_tensors
+    q_cnt, q_idx, full_cnt, full_idx, *_ = blocksparse_tensors
     curr_q_cnt = q_cnt[batch_idx, head_idx, n_block]
     curr_q_idx = q_idx[batch_idx, head_idx, n_block, None]
 
@@ -1175,7 +1173,7 @@ def produce_block_sparse_q_loads_bwd_sm90(
 
     Returns updated (producer_state_Q, producer_state_dO).
     """
-    q_cnt, q_idx, full_cnt, full_idx = blocksparse_tensors
+    q_cnt, q_idx, full_cnt, full_idx, *_ = blocksparse_tensors
     curr_q_cnt = q_cnt[batch_idx, head_idx, n_block]
     curr_q_idx = q_idx[batch_idx, head_idx, n_block, None]
 
@@ -1270,7 +1268,7 @@ def consume_block_sparse_mma_bwd_sm90(
 
     Returns updated (consumer_state_Q, consumer_state_dO).
     """
-    q_cnt, q_idx, full_cnt, full_idx = blocksparse_tensors
+    q_cnt, q_idx, full_cnt, full_idx, *_ = blocksparse_tensors
     curr_q_cnt = q_cnt[batch_idx, head_idx, n_block]
     curr_q_idx = q_idx[batch_idx, head_idx, n_block, None]
 
@@ -1396,7 +1394,7 @@ def dQaccum_store_block_sparse_bwd_sm90(
 
     Iterates partial blocks first, then full blocks, matching producer/consumer order.
     """
-    q_cnt, q_idx, full_cnt, full_idx = blocksparse_tensors
+    q_cnt, q_idx, full_cnt, full_idx, *_ = blocksparse_tensors
     curr_q_cnt = q_cnt[batch_idx, head_idx, n_block]
     curr_q_idx = q_idx[batch_idx, head_idx, n_block, None]
 
