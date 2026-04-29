@@ -8,6 +8,7 @@ import re
 import ast
 import glob
 import shutil
+import tempfile
 from pathlib import Path
 from typing import Literal, Optional
 from packaging.version import parse, Version
@@ -610,6 +611,47 @@ class CachedWheelsCommand(_bdist_wheel):
             super().run()
 
 
+def _find_lld_link():
+    if ROCM_HOME:
+        candidate = os.path.join(ROCM_HOME, 'lib', 'llvm', 'bin', 'lld-link.exe')
+        if os.path.isfile(candidate):
+            return candidate
+    for p in os.environ.get('PATH', '').split(os.pathsep):
+        candidate = os.path.join(p, 'lld-link.exe')
+        if os.path.isfile(candidate):
+            return candidate
+    return None
+
+
+def _write_link_rsp_and_spawn(original_spawn):
+    _lld_link = _find_lld_link()
+
+    def spawn(cmd):
+        if len(cmd) > 0 and 'link.exe' in os.path.basename(cmd[0]):
+            if _lld_link:
+                cmd[0] = _lld_link
+            rsp_path = None
+            for i, arg in enumerate(cmd):
+                if arg.startswith('/OUT:') or arg.startswith('/out:'):
+                    rsp_path = arg.split(':', 1)[1] + '.rsp'
+                    break
+            if rsp_path is None:
+                rsp_path = os.path.join(tempfile.gettempdir(), 'flash_attn_link.rsp')
+
+            obj_args = [a for a in cmd[1:] if a.endswith('.obj')]
+            other_args = [a for a in cmd[1:] if not a.endswith('.obj')]
+
+            if obj_args:
+                with open(rsp_path, 'w') as f:
+                    f.write('\n'.join(obj_args))
+                new_cmd = [cmd[0], f'@{rsp_path}'] + other_args
+                print(f"Link RSP: {rsp_path} ({len(obj_args)} objects, cmd reduced from {len(' '.join(cmd))} to {len(' '.join(new_cmd))} chars)")
+                cmd = new_cmd
+
+        return original_spawn(cmd)
+    return spawn
+
+
 class NinjaBuildExtension(BuildExtension):
     def __init__(self, *args, **kwargs) -> None:
         # do not override env MAX_JOBS if already exists
@@ -637,13 +679,24 @@ class NinjaBuildExtension(BuildExtension):
 
         super().__init__(*args, **kwargs)
 
+    def build_extensions(self):
+        if IS_ROCM and ROCM_BACKEND == "ck" and sys.platform == 'win32':
+            original_spawn = self.compiler.spawn
+            self.compiler.spawn = _write_link_rsp_and_spawn(original_spawn)
+            try:
+                super().build_extensions()
+            finally:
+                self.compiler.spawn = original_spawn
+        else:
+            super().build_extensions()
+
 
 # Build install_requires based on platform
 if ROCM_BACKEND == "triton":
     # Note: torch is excluded because pip resolves it to CUDA PyTorch from PyPI, overwriting any pre-installed ROCm PyTorch. Users must have torch installed.
     install_requires = [
         "einops",
-        "triton==3.5.1",
+        "triton==3.5.1" if sys.platform != "win32" else "triton-windows",
     ]
 else:
     install_requires = [
