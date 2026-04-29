@@ -162,7 +162,7 @@ def benchmark_cute_block_sparsity(
             blocksparse_tensors,
             config.seqlen_q,
             config.seqlen_k,
-            config.aux_tensors_cute,
+            aux_tensors=config.aux_tensors_cute,
         )
 
         def generate_tensors():

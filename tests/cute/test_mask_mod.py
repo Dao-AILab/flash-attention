@@ -293,10 +293,11 @@ def _run_mask_test(
         doc_ids = random_doc_id_tensor(nheads, batch_size, doc_len, device="cuda").to(
             dtype=torch.int32, device="cuda"
         )
-        original_flex_mask = mask_mod_flex
+        doc_ids.__leading_dim__ = 2 
+        doc_row = doc_ids[0, 0]  # (doc_len,); batch_size=1, all heads identical
 
-        def mask_mod_flex(b, h, q_idx, kv_idx, doc_ids=doc_ids):
-            return original_flex_mask(b, h, q_idx, kv_idx, doc_ids)
+        def mask_mod_flex(b, h, q_idx, kv_idx):
+            return doc_row[q_idx] == doc_row[kv_idx]
 
         aux_tensors_arg = [doc_ids]
     elif mask_name == "ima":

@@ -55,6 +55,7 @@ from flash_attn.cute.block_sparsity import (
     to_cute_block_sparse_tensors,
     normalize_block_sparse_config,
     normalize_block_sparse_config_bwd,
+    get_block_sparse_broadcast_pattern,
 )
 
 def _parse_arch_str(arch_str):
@@ -312,6 +313,8 @@ def _flash_attn_fwd(
     score_mod: Optional[Callable] = None,
     mask_mod: Optional[Callable] = None,
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
+    cu_total_m_blocks: Optional[torch.Tensor] = None,
+    cu_total_n_blocks: Optional[torch.Tensor] = None,
     return_lse: bool = False,
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
@@ -598,45 +601,61 @@ def _flash_attn_fwd(
     is_dense_noncausal = not is_varlen and not causal and not local
     use_clc_scheduler = requested_use_clc_scheduler and not is_varlen_mha and not is_dense_noncausal
 
-    if mask_mod is not None:
-        if is_varlen:
-            raise NotImplementedError(
-                "mask_mod with aux_tensors is not yet supported for varlen sequences. This will be fixed in a future PR."
-            )
-
     if use_block_sparsity:
-        if is_varlen:
-            raise NotImplementedError(
-                "Block sparsity is not yet supported for varlen sequences. This will be fixed in a future PR."
-            )
         # NB: pack_gqa requires block sparse head dim == 1 (broadcasted)
-        if pack_gqa and block_sparse_tensors.mask_block_cnt.shape[1] != 1:
+        head_dim_idx = 0 if block_sparse_tensors.mask_block_cnt.ndim == 2 else 1
+        if pack_gqa and block_sparse_tensors.mask_block_cnt.shape[head_dim_idx] != 1:
             pack_gqa = False
         if is_split_kv:
             raise NotImplementedError(
                 "Block sparsity is not yet supported with SplitKV. TODO: partition sparse block lists per split."
             )
+        if cu_seqlens_q is not None:
+            assert cu_total_m_blocks is not None, "Varlen block sparsity requires cu_total_m_blocks."
 
     # See get_broadcast_dims for why this is needed in compile key
     block_sparse_broadcast_pattern = None
     normalized_block_sparse_tensors = None
     q_subtile_factor = None
     if block_sparse_tensors is not None:
-        if seqlen_q is None:
-            raise ValueError("Block sparsity requires fixed-length sequences (seqlen_q must be known).")
-        (
-            normalized_block_sparse_tensors,
-            block_sparse_broadcast_pattern,
-            q_subtile_factor,
-        ) = normalize_block_sparse_config(
-            block_sparse_tensors,
-            batch_size=batch_size,
-            num_head=num_head,
-            seqlen_q=seqlen_q,
-            seqlen_k=seqlen_k,
-            block_size=(tile_m, tile_n),
-            q_stage=q_stage,
-        )
+        if cu_seqlens_q is not None:
+            cnt = block_sparse_tensors.mask_block_cnt
+            if cnt.ndim != 2:
+                raise ValueError("Varlen block sparse tensors must be 2D [H, total_m].")
+            if cnt.shape[0] not in (1, num_head):
+                raise ValueError(
+                    f"Varlen block sparse head dim must be 1 or {num_head}, got {cnt.shape[0]}."
+                )
+            if cnt.shape[0] == 1 and num_head > 1:
+                # Expand head-1 tensors to (num_head, ...) with stride-0 head dim so
+                # get_broadcast_dims correctly detects the broadcast.
+                def _expand_head(t):
+                    return t.expand(num_head, -1) if t is not None else None
+                normalized_block_sparse_tensors = BlockSparseTensorsTorch(
+                    mask_block_cnt=_expand_head(block_sparse_tensors.mask_block_cnt),
+                    mask_block_idx=_expand_head(block_sparse_tensors.mask_block_idx),
+                    full_block_cnt=_expand_head(block_sparse_tensors.full_block_cnt),
+                    full_block_idx=_expand_head(block_sparse_tensors.full_block_idx),
+                    block_size=block_sparse_tensors.block_size,
+                )
+            else:
+                normalized_block_sparse_tensors = block_sparse_tensors
+            q_subtile_factor = 1
+            block_sparse_broadcast_pattern = get_block_sparse_broadcast_pattern(normalized_block_sparse_tensors)
+        else:
+            (
+                normalized_block_sparse_tensors,
+                block_sparse_broadcast_pattern,
+                q_subtile_factor,
+            ) = normalize_block_sparse_config(
+                block_sparse_tensors,
+                batch_size=batch_size,
+                num_head=num_head,
+                seqlen_q=seqlen_q,
+                seqlen_k=seqlen_k,
+                block_size=(tile_m, tile_n),
+                q_stage=q_stage,
+            )
     if aux_tensors is not None:
         aux_tensor_metadata = get_aux_tensor_metadata(aux_tensors)
     else:
@@ -703,6 +722,8 @@ def _flash_attn_fwd(
         q_descale is not None,
         k_descale is not None,
         v_descale is not None,
+        cu_total_m_blocks is None,
+        cu_total_n_blocks is None,
         tile_m,
         tile_n,
         q_stage,
@@ -730,11 +751,13 @@ def _flash_attn_fwd(
             seqused_q_tensor,
             seqused_k_tensor,
             learnable_sink_tensor,
+            cu_total_m_blocks_tensor,
+            cu_total_n_blocks_tensor,
         ) = [
             to_cute_tensor(t, assumed_align=4, leading_dim=0)
             if t is not None
             else None
-            for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, learnable_sink)
+            for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, learnable_sink, cu_total_m_blocks, cu_total_n_blocks)
         ]
         page_table_tensor = (
             to_cute_tensor(page_table, assumed_align=4, leading_dim=1)
@@ -956,13 +979,19 @@ def _flash_attn_fwd(
                 window_size_left,
                 window_size_right,
                 learnable_sink_tensor,
-                sparse_tensors,
-                cute_aux_tensors,
-                current_stream,
             ]
             if arch // 10 in [10, 11]:
-                compile_args.insert(-3, descale_tensors_tensor)
-            _flash_attn_fwd.compile_cache[compile_key] = cute.compile(*compile_args, options="--enable-tvm-ffi")
+                compile_args.append(descale_tensors_tensor)
+            compile_args.extend([
+                sparse_tensors,
+                cu_total_m_blocks_tensor,
+                cu_total_n_blocks_tensor,
+                cute_aux_tensors,
+            ])
+            compile_args.append(current_stream)
+            _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
+                *compile_args, options="--enable-tvm-ffi"
+            )
 
     # In "fake mode", we will take torch fake tensors as input and the expected behaviors are:
     # - Use those fake metadata to populate compilation cache
@@ -1022,6 +1051,8 @@ def _flash_attn_fwd(
                 call_args.append(descale_tensors)
             call_args.extend([
                 normalized_block_sparse_tensors[:4] if normalized_block_sparse_tensors is not None else None,
+                cu_total_m_blocks,
+                cu_total_n_blocks,
                 aux_tensors,
             ])
             _flash_attn_fwd.compile_cache[compile_key](*call_args)
@@ -1970,6 +2001,10 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         deterministic: bool = False,
         score_mod: Optional[Callable] = None,
         score_mod_bwd: Optional[Callable] = None,
+        mask_mod: Optional[Callable] = None,
+        block_sparse_tensors: Optional[list] = None,
+        cu_total_m_blocks: Optional[torch.Tensor] = None,
+        cu_total_n_blocks: Optional[torch.Tensor] = None,
         aux_tensors: Optional[list] = None,
         return_lse: bool = False,
     ):
@@ -1995,6 +2030,10 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             num_splits=num_splits,
             pack_gqa=pack_gqa,
             score_mod=score_mod,
+            mask_mod=mask_mod,
+            block_sparse_tensors=block_sparse_tensors,
+            cu_total_m_blocks=cu_total_m_blocks,
+            cu_total_n_blocks=cu_total_n_blocks,
             aux_tensors=aux_tensors,
             return_lse=return_lse,
             gather_kv_indices=gather_kv_indices,
@@ -2130,6 +2169,10 @@ def flash_attn_varlen_func(
     deterministic: bool = False,
     score_mod: Optional[Callable] = None,
     score_mod_bwd: Optional[Callable] = None,
+    mask_mod: Optional[Callable] = None,
+    block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
+    cu_total_m_blocks: Optional[torch.Tensor] = None,
+    cu_total_n_blocks: Optional[torch.Tensor] = None,
     aux_tensors: Optional[list] = None,
     return_lse: bool = False,
 ):
@@ -2171,6 +2214,10 @@ def flash_attn_varlen_func(
         deterministic,
         score_mod,
         score_mod_bwd,
+        mask_mod,
+        block_sparse_tensors,
+        cu_total_m_blocks,
+        cu_total_n_blocks,
         aux_tensors,
         return_lse,
     )

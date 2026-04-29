@@ -630,6 +630,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         window_size_right: Optional[Int32] = None,
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        mCuTotalMBlocks: Optional[cute.Tensor] = None,
+        mCuTotalNBlocks: Optional[cute.Tensor] = None,
         aux_tensors=None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
@@ -708,6 +710,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             mCuSeqlensK,
             mSeqUsedQ,
             mSeqUsedK,
+            mCuTotalMBlocks,
+            mCuTotalNBlocks,
             softmax_scale_log2,
             softmax_scale,
             window_size_left,
@@ -747,6 +751,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         mCuSeqlensK: Optional[cute.Tensor],
         mSeqUsedQ: Optional[cute.Tensor],
         mSeqUsedK: Optional[cute.Tensor],
+        mCuTotalMBlocks: Optional[cute.Tensor],
+        mCuTotalNBlocks: Optional[cute.Tensor],
         softmax_scale_log2: Float32,
         softmax_scale: Optional[Float32],
         window_size_left: Optional[Int32],
@@ -793,6 +799,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             mCuSeqlensK=mCuSeqlensK,
             mSeqUsedQ=mSeqUsedQ,
             mSeqUsedK=mSeqUsedK,
+            mCuTotalMBlocks=mCuTotalMBlocks,
+            mCuTotalNBlocks=mCuTotalNBlocks,
         )
         n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
         # For varlen, wasted grid tiles (where batch_idx >= num_batch) will have
