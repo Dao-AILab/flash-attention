@@ -53,7 +53,10 @@ def round_up_headdim(head_size: int) -> int:
     if not CONFIG["build_flags"]["FLASHATTENTION_DISABLE_HDIM256"]:
         if head_size <= 256:
             return 256
-    return 256
+    if not CONFIG["build_flags"].get("FLASHATTENTION_DISABLE_HDIM512", True):
+        if head_size <= 512:
+            return 512
+    return 512
 
 
 @torch.library.custom_op("flash_attn_3::_flash_attn_forward", mutates_args=(), device_types="cuda")

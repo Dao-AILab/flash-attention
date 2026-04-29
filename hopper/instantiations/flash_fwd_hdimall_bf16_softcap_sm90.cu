@@ -7,3 +7,4 @@
 #include "flash_fwd_hdim128_bf16_softcap_sm90.cu"
 #include "flash_fwd_hdim192_bf16_softcap_sm90.cu"
 #include "flash_fwd_hdim256_bf16_softcap_sm90.cu"
+#include "flash_fwd_hdim512_bf16_softcap_sm90.cu"

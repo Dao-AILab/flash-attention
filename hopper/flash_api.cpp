@@ -291,6 +291,14 @@ void run_mha_fwd_constexpr(Flash_fwd_params &params, cudaStream_t stream) {
             #ifndef FLASHATTENTION_DISABLE_HDIM256
             if (params.d <= 256) { return run_mha_fwd_<Arch, cutlass::bfloat16_t, 256, 256, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream); }
             #endif
+            #ifndef FLASHATTENTION_DISABLE_HDIM512
+            if (params.d <= 512) {
+                if constexpr (Arch == 90 && !PagedKVNonTMA) {
+                    return run_mha_fwd_<90, cutlass::bfloat16_t, 512, 512, Split, false, Has_softcap, PackGQA>(params, stream);
+                }
+                STD_TORCH_CHECK(!PagedKVNonTMA, "FlashAttention forward with head_dim 512 does not support PagedKV non-TMA. Use pagedkv_tma=True or non-paged KV.");
+            }
+            #endif
         } else {
             #ifndef FLASHATTENTION_DISABLE_FP16
             #ifndef FLASHATTENTION_DISABLE_HDIM64
@@ -327,6 +335,14 @@ void run_mha_fwd_constexpr(Flash_fwd_params &params, cudaStream_t stream) {
             #endif
             #ifndef FLASHATTENTION_DISABLE_HDIM256
             if (params.d <= 256) { return run_mha_fwd_<Arch, cutlass::half_t, 256, 256, Split, PagedKVNonTMA, Has_softcap, PackGQA>(params, stream); }
+            #endif
+            #ifndef FLASHATTENTION_DISABLE_HDIM512
+            if (params.d <= 512) {
+                if constexpr (Arch == 90 && !PagedKVNonTMA) {
+                    return run_mha_fwd_<90, cutlass::half_t, 512, 512, Split, false, Has_softcap, PackGQA>(params, stream);
+                }
+                STD_TORCH_CHECK(!PagedKVNonTMA, "FlashAttention forward with head_dim 512 does not support PagedKV non-TMA. Use pagedkv_tma=True or non-paged KV.");
+            }
             #endif
             #else
             TORCH_CHECK(false, "This flash attention build does not support FP16.");
@@ -471,6 +487,9 @@ inline int get_num_splits(Flash_fwd_params const& params) {
 }
 
 inline int get_max_headdim() {
+    #ifndef FLASHATTENTION_DISABLE_HDIM512
+    return 512;
+    #endif
     #ifndef FLASHATTENTION_DISABLE_HDIM256
     return 256;
     #endif
@@ -505,7 +524,10 @@ inline int round_up_headdim(int head_size) {
     #ifndef FLASHATTENTION_DISABLE_HDIM256
     if (head_size <= 256) { return 256; }
     #endif
-    return 256;
+    #ifndef FLASHATTENTION_DISABLE_HDIM512
+    if (head_size <= 512) { return 512; }
+    #endif
+    return 512;
 }
 
 inline int round_up_headdimv(int head_size) {
