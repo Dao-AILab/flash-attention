@@ -1236,6 +1236,7 @@ def _flash_attn_bwd(
         causal, window_size_left, window_size_right
     )
 
+    dQ_single_wg = False
     if arch // 10 == 12:
         # SM120: uses SM80 MMA with 99 KB SMEM, 128 threads (4 warps).
         m_block_size = 64
