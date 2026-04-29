@@ -1002,16 +1002,14 @@ class FlashAttentionForwardSm100:
             sO = cute.make_tensor(cute.recast_ptr(sQ.iterator, sO_layout.inner, self.o_dtype), sO_layout.outer)
 
         # sScale stores per-(thread, stage) softmax stats. Encode the structure
-        # in a 3-mode CuTe layout (M_BLOCK, Q_STAGE, FIELD), then slice into two
-        # named per-field views so consumers index by (tidx, stage) instead of
-        # repeating offset arithmetic OR carrying a magic 0/1 field index.
+        # in a 3-mode CuTe layout (M_BLOCK, Q_STAGE, FIELD) so accesses are
+        # natural multi-dim coords (sScale[tidx, stage, 0]=row_sum,
+        # sScale[tidx, stage, 1]=row_max) instead of hand-rolled offset math.
         # Default col-major strides give (1, m_block_size, q_stage*m_block_size),
         # i.e. identical flat memory layout to the prior 1-D allocation.
-        sScale3d = storage.sScale.get_tensor(
+        sScale = storage.sScale.get_tensor(
             cute.make_layout((self.m_block_size, self.q_stage, 2))
         )
-        sScaleSum = sScale3d[None, None, 0]  # (m_block_size, q_stage) row_sum view
-        sScaleMax = sScale3d[None, None, 1]  # (m_block_size, q_stage) row_max view
 
         thr_mma_qk = tiled_mma_qk.get_slice(mma_tile_coord_v)
         thr_mma_pv = tiled_mma_pv.get_slice(mma_tile_coord_v)
@@ -1228,8 +1226,7 @@ class FlashAttentionForwardSm100:
                 softmax_scale=softmax_scale,
                 descale_tensors=descale_tensors,
                 thr_mma_qk=thr_mma_qk,
-                sScaleSum=sScaleSum,
-                sScaleMax=sScaleMax,
+                sScale=sScale,
                 mLSE=mLSE,
                 pipeline_s_p_o=pipeline_s_p_o,
                 pipeline_p_lastsplit=pipeline_p_lastsplit,
@@ -1273,8 +1270,7 @@ class FlashAttentionForwardSm100:
                 thr_mma_pv,
                 tStS,
                 tOtO,
-                sScaleSum,
-                sScaleMax,
+                sScale,
                 mO,
                 mLSE,
                 sO,
@@ -1843,8 +1839,7 @@ class FlashAttentionForwardSm100:
         descale_tensors: Optional[DescaleTensors],
         thr_mma_qk: cute.core.ThrMma,
         tStS: cute.Tensor,  # ((TILE_M, TILE_N), 1, 1, q_stage)
-        sScaleSum: cute.Tensor,  # (m_block_size, q_stage) — softmax row_sum view
-        sScaleMax: cute.Tensor,  # (m_block_size, q_stage) — softmax row_max view
+        sScale: cute.Tensor,
         mLSE: Optional[cute.Tensor],
         pipeline_s_p_o: pipeline.PipelineAsync,
         pipeline_p_lastsplit: pipeline.PipelineAsync,
@@ -2033,7 +2028,7 @@ class FlashAttentionForwardSm100:
                 tStS_t2r=tStS_t2r,
                 tStScale_r2t=tStScale_r2t,
                 tStP_r2t=tStP_r2t,
-                sScaleSum=sScaleSum,
+                sScale=sScale,
                 stage=stage,
                 batch_idx=batch_idx,
                 head_idx=head_idx,
@@ -2083,9 +2078,9 @@ class FlashAttentionForwardSm100:
                     self.q_subtile_factor if self.q_subtile_factor is not None else 1,
                 )
                 if not empty_tile:
-                    sScaleSum[tidx, stage] = softmax.row_sum[0]
+                    sScale[tidx, stage, 0] = softmax.row_sum[0]
                     if const_expr(mLSE is not None or learnable_sink is not None):
-                        sScaleMax[tidx, stage] = softmax.row_max[0]
+                        sScale[tidx, stage, 1] = softmax.row_max[0]
                     # if tidx == 0:
                     #     cute.printf("softmax row sum stage %d: %f, row_max = %f\n", stage, softmax.row_sum[0], softmax.row_max[0])
                     # See block_sparse_utils.py NOTE [SM100 block-sparse empty tiles: mbarrier contract].
@@ -2152,9 +2147,9 @@ class FlashAttentionForwardSm100:
                             # Now that we no longer already have the 1st iteration, need mask_seqlen=True here
 
                     # Dense path always writes scale / signals
-                    sScaleSum[tidx, stage] = softmax.row_sum[0]
+                    sScale[tidx, stage, 0] = softmax.row_sum[0]
                     if const_expr(mLSE is not None or learnable_sink is not None):
-                        sScaleMax[tidx, stage] = softmax.row_max[0]
+                        sScale[tidx, stage, 1] = softmax.row_max[0]
                     # pipeline_sm_stats.producer_commit_w_index(stage)
                     sm_stats_barrier.arrive_w_index(index=stage * 4 + warp_idx)
 
@@ -2208,7 +2203,7 @@ class FlashAttentionForwardSm100:
         tStS_t2r: cute.Tensor,
         tStScale_r2t: cute.Tensor,
         tStP_r2t: cute.Tensor,
-        sScaleSum: cute.Tensor,  # (m_block_size, q_stage) — softmax row_sum view
+        sScale: cute.Tensor,
         stage: int | Int32,
         batch_idx: Int32,
         head_idx: Int32,
@@ -2275,7 +2270,7 @@ class FlashAttentionForwardSm100:
             # cute.copy(thr_tmem_store_scale, tSrScale_r2t, tStScale_r2t)
             # cute.arch.fence_view_async_tmem_store()
             thread_idx = thr_tmem_load.thr_idx
-            sScaleSum[thread_idx, stage] = acc_scale
+            sScale[thread_idx, stage, 0] = acc_scale
             # if thread_idx == 0: cute.printf("softmax acc_scale stage %d: %f, row_max = %f\n", stage, acc_scale, row_max)
         # Notify correction wg that row_max is ready
         # pipeline_sm_stats.producer_commit_w_index(stage)
@@ -2332,8 +2327,7 @@ class FlashAttentionForwardSm100:
         thr_mma_pv: cute.core.ThrMma,
         tStS: cute.Tensor,
         tOtO: cute.Tensor,
-        sScaleSum: cute.Tensor,  # (m_block_size, q_stage) — softmax row_sum view
-        sScaleMax: cute.Tensor,  # (m_block_size, q_stage) — softmax row_max view
+        sScale: cute.Tensor,
         mO: cute.Tensor,
         mLSE: cute.Tensor,
         sO: cute.Tensor,
@@ -2447,7 +2441,7 @@ class FlashAttentionForwardSm100:
                         # cute.copy(tiled_tmem_load_vec, tStScales_t2r[stage], tSrScale_t2r)
                         # cute.arch.fence_view_async_tmem_load()
                         # scale = tSrScale_t2r[0]
-                        scale = sScaleSum[tidx, stage]
+                        scale = sScale[tidx, stage, 0]
                         should_rescale = cute.arch.vote_ballot_sync(scale < 1.0) != 0
                         # should_rescale = True
                         # if tidx == 0: cute.printf("Correction scale i = %d, for stage %d: %f, should_rescale = %d\n", i, stage, scale, should_rescale)
@@ -2485,9 +2479,9 @@ class FlashAttentionForwardSm100:
                     # cute.copy(tiled_tmem_load_vec, tStScales_t2r[stage], tSrScale_t2r)
                     # cute.arch.fence_view_async_tmem_load()
                     # scale = tSrScale_t2r[0]
-                    row_sum = sScaleSum[tidx, stage]
+                    row_sum = sScale[tidx, stage, 0]
                     if const_expr(mLSE is not None or learnable_sink is not None):
-                        row_max = sScaleMax[tidx, stage]
+                        row_max = sScale[tidx, stage, 1]
                     else:
                         row_max = None
                     pipeline_sm_stats.consumer_release_w_index(stage)
@@ -2558,8 +2552,7 @@ class FlashAttentionForwardSm100:
                         head_idx,
                         batch_idx,
                         split_idx,
-                        sScaleSum,
-                        sScaleMax,
+                        sScale,
                         stats,
                         self.correction_epilogue,
                         thr_mma_pv,
