@@ -2973,38 +2973,41 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             tTR_rdV_cast.store(tTR_rdV.load().to(dV.element_type))
 
             if cutlass.const_expr(not varlen):
-                # reg -> SMEM via per-element indexed stores using tTR_cdV's
-                # per-thread (M, N) coords. (M, N) is per-CTA cdV space (M=0..63,
-                # N=0..255). We map N=(n%epi_cols, n//epi_cols) → (N_within, stage)
-                # of the 3D s_epi_dV tensor.
-                for _i in cutlass.range_constexpr(cute.size(tTR_cdV_local, mode=[2])):
-                    for _j in cutlass.range_constexpr(cute.size(tTR_cdV_local[None, 0, _i])):
-                        c = tTR_cdV_local[None, 0, _i][_j]
-                        m_pos = c[0]
-                        n_pos = c[1]
-                        stage_pos = n_pos // epi_cols_dKV
-                        n_within_pos = n_pos % epi_cols_dKV
-                        v = tTR_rdV_cast[None, 0, _i][_j]
-                        s_epi_dV[m_pos, n_within_pos, stage_pos] = v
-                cute.arch.fence_view_async_shared()
-                # Inter-WG barrier — both warp-groups must finish their writes
-                # before the leader warp reads SMEM via TMA.
-                cute.arch.barrier(barrier_id=5, number_of_threads=cta_threads)
-                # TMA bulk store, one (64, 64) box per stage.
-                if leader_warp and wg_idx == 0:
-                    for _stage in cutlass.range_constexpr(total_epi_stages):
-                        sdV_stage = s_epi_dV[None, None, _stage]
-                        gdV_stage = gdV_tma_epi[None, None, _stage]
-                        td_sdV, td_gdV = cpasync.tma_partition(
-                            tma_atom_dV,
-                            0,
-                            cute.make_layout(1),
-                            cute.group_modes(sdV_stage, 0, 2),
-                            cute.group_modes(gdV_stage, 0, 2),
-                        )
-                        cute.copy(tma_atom_dV, td_sdV, td_gdV)
-                        cute.arch.cp_async_bulk_commit_group()
-                cute.arch.cp_async_bulk_wait_group(0, read=True)
+                if (blk_coord_k + 1) * self.tile_shape_K <= problem_shape_k_cur_batch:
+                    # reg -> SMEM via per-element indexed stores using tTR_cdV's
+                    # per-thread (M, N) coords. (M, N) is per-CTA cdV space (M=0..63,
+                    # N=0..255). We map N=(n%epi_cols, n//epi_cols) → (N_within, stage)
+                    # of the 3D s_epi_dV tensor.
+                    for _i in cutlass.range_constexpr(cute.size(tTR_cdV_local, mode=[2])):
+                        for _j in cutlass.range_constexpr(cute.size(tTR_cdV_local[None, 0, _i])):
+                            c = tTR_cdV_local[None, 0, _i][_j]
+                            m_pos = c[0]
+                            n_pos = c[1]
+                            stage_pos = n_pos // epi_cols_dKV
+                            n_within_pos = n_pos % epi_cols_dKV
+                            v = tTR_rdV_cast[None, 0, _i][_j]
+                            s_epi_dV[m_pos, n_within_pos, stage_pos] = v
+                    cute.arch.fence_view_async_shared()
+                    # Inter-WG barrier — both warp-groups must finish their writes
+                    # before the leader warp reads SMEM via TMA.
+                    cute.arch.barrier(barrier_id=5, number_of_threads=cta_threads)
+                    # TMA bulk store, one (64, 64) box per stage.
+                    if leader_warp and wg_idx == 0:
+                        for _stage in cutlass.range_constexpr(total_epi_stages):
+                            sdV_stage = s_epi_dV[None, None, _stage]
+                            gdV_stage = gdV_tma_epi[None, None, _stage]
+                            td_sdV, td_gdV = cpasync.tma_partition(
+                                tma_atom_dV,
+                                0,
+                                cute.make_layout(1),
+                                cute.group_modes(sdV_stage, 0, 2),
+                                cute.group_modes(gdV_stage, 0, 2),
+                            )
+                            cute.copy(tma_atom_dV, td_sdV, td_gdV)
+                            cute.arch.cp_async_bulk_commit_group()
+                    cute.arch.cp_async_bulk_wait_group(0, read=True)
+                else:
+                    self.store(tTR_gdV, tTR_rdV, tTR_cdV, (K, D))
             else:
                 self.store(tTR_gdV, tTR_rdV, tTR_cdV, (K, D))
 
@@ -3023,31 +3026,34 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             tTR_rdK_cast.store(tTR_rdK.load().to(dK.element_type))
 
             if cutlass.const_expr(not varlen):
-                for _i in cutlass.range_constexpr(cute.size(tTR_cdK_local, mode=[2])):
-                    for _j in cutlass.range_constexpr(cute.size(tTR_cdK_local[None, 0, _i])):
-                        c = tTR_cdK_local[None, 0, _i][_j]
-                        m_pos = c[0]
-                        n_pos = c[1]
-                        stage_pos = n_pos // epi_cols_dKV
-                        n_within_pos = n_pos % epi_cols_dKV
-                        v = tTR_rdK_cast[None, 0, _i][_j]
-                        s_epi_dK[m_pos, n_within_pos, stage_pos] = v
-                cute.arch.fence_view_async_shared()
-                cute.arch.barrier(barrier_id=6, number_of_threads=cta_threads)
-                if leader_warp and wg_idx == 0:
-                    for _stage in cutlass.range_constexpr(total_epi_stages):
-                        sdK_stage = s_epi_dK[None, None, _stage]
-                        gdK_stage = gdK_tma_epi[None, None, _stage]
-                        td_sdK, td_gdK = cpasync.tma_partition(
-                            tma_atom_dK,
-                            0,
-                            cute.make_layout(1),
-                            cute.group_modes(sdK_stage, 0, 2),
-                            cute.group_modes(gdK_stage, 0, 2),
-                        )
-                        cute.copy(tma_atom_dK, td_sdK, td_gdK)
-                        cute.arch.cp_async_bulk_commit_group()
-                cute.arch.cp_async_bulk_wait_group(0, read=True)
+                if (blk_coord_k + 1) * self.tile_shape_K <= problem_shape_k_cur_batch:
+                    for _i in cutlass.range_constexpr(cute.size(tTR_cdK_local, mode=[2])):
+                        for _j in cutlass.range_constexpr(cute.size(tTR_cdK_local[None, 0, _i])):
+                            c = tTR_cdK_local[None, 0, _i][_j]
+                            m_pos = c[0]
+                            n_pos = c[1]
+                            stage_pos = n_pos // epi_cols_dKV
+                            n_within_pos = n_pos % epi_cols_dKV
+                            v = tTR_rdK_cast[None, 0, _i][_j]
+                            s_epi_dK[m_pos, n_within_pos, stage_pos] = v
+                    cute.arch.fence_view_async_shared()
+                    cute.arch.barrier(barrier_id=6, number_of_threads=cta_threads)
+                    if leader_warp and wg_idx == 0:
+                        for _stage in cutlass.range_constexpr(total_epi_stages):
+                            sdK_stage = s_epi_dK[None, None, _stage]
+                            gdK_stage = gdK_tma_epi[None, None, _stage]
+                            td_sdK, td_gdK = cpasync.tma_partition(
+                                tma_atom_dK,
+                                0,
+                                cute.make_layout(1),
+                                cute.group_modes(sdK_stage, 0, 2),
+                                cute.group_modes(gdK_stage, 0, 2),
+                            )
+                            cute.copy(tma_atom_dK, td_sdK, td_gdK)
+                            cute.arch.cp_async_bulk_commit_group()
+                    cute.arch.cp_async_bulk_wait_group(0, read=True)
+                else:
+                    self.store(tTR_gdK, tTR_rdK, tTR_cdK, (K, D))
             else:
                 self.store(tTR_gdK, tTR_rdK, tTR_cdK, (K, D))
 

@@ -1962,11 +1962,12 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                         ]
 
                     # dQ TMEM to GMEM
+                    tile_q_start = curr_block_coord[0] * self.cta_tiler[0]
                     mma_dq_consumer = self.dQ_epilogue(
                         (seqlen_q, cuseqlen_q, mQ_qdl.shape[0], batch_coord),
                         (mma_dq_consumer, gdQ_staged, cdQ_staged, tdQtdQ_staged),
                         self.epi_tile,
-                        (tma_atom_dQ, gdQ_tma_staged, s_epi_dQ, varlen),
+                        (tma_atom_dQ, gdQ_tma_staged, s_epi_dQ, varlen, tile_q_start),
                     )
                 work_tile = tile_sched.advance_to_next_work()
             # NOTE: tmem.free() moved to kernel end to enable cluster-wide sync
@@ -2149,7 +2150,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
     ) -> Tuple[pipeline.PipelineConsumer, pipeline.PipelineProducer]:
         seqlen_q, cuseqlen_q, total_q, batch_coord = value_args
         (mma_dq_consumer, gdQ_staged, cdQ_staged, tdQtdQ_staged) = dq_args
-        tma_atom_dQ, gdQ_tma_staged, s_epi_dQ, varlen = tma_args
+        tma_atom_dQ, gdQ_tma_staged, s_epi_dQ, varlen, tile_q_start = tma_args
         dq_handle = mma_dq_consumer.wait_and_advance()
         tidx, _, _ = cute.arch.thread_idx()
         bidx, bidy, bidz = cute.arch.block_idx()
@@ -2182,45 +2183,65 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
             tTMEM_LOADcdQ = thr_tmem_load.partition_D(cdQ_epi)
             tTMEM_LOADcdQ_local = thr_tmem_load.partition_D(cdQ_local_epi)
 
+            full_q_tile = tile_q_start + (iter + 1) * epi_tile[0] <= seqlen_q
             if cutlass.const_expr(not varlen):
-                gdQ_tma = gdQ_tma_staged[None, None, iter]
-                gdQ_tma_epi = cute.local_tile(gdQ_tma, epi_tile_dQ, (0, None))
-                sdQ_stage = s_epi_dQ[None, None, 0]
+                if full_q_tile:
+                    gdQ_tma = gdQ_tma_staged[None, None, iter]
+                    gdQ_tma_epi = cute.local_tile(gdQ_tma, epi_tile_dQ, (0, None))
+                    sdQ_stage = s_epi_dQ[None, None, 0]
 
-                for stage_k in cutlass.range_constexpr(num_epi_stages_dQ):
+                    for stage_k in cutlass.range_constexpr(num_epi_stages_dQ):
+                        for i in cutlass.range(
+                            cute.size(tTMEM_LOADtdQ, mode=[1]), unroll_full=True
+                        ):
+                            tTMEM_LOADtdQ_i = tTMEM_LOADtdQ[None, i, 0]
+                            tTMEM_LOADcdQ_i_local = tTMEM_LOADcdQ_local[None, i, 0]
+                            tTMrdQ = cute.make_rmem_tensor(
+                                tTMEM_LOADcdQ_i_local.shape, self.acc_dtype
+                            )
+                            cute.copy(tiled_tmem_load, tTMEM_LOADtdQ_i, tTMrdQ)
+                            tSMrdQ = cute.make_rmem_tensor(tTMrdQ.shape, self.q_dtype)
+                            dq_vec = tTMrdQ.load()
+                            tSMrdQ.store(dq_vec.to(self.q_dtype))
+                            for j in cutlass.range_constexpr(cute.size(tTMEM_LOADcdQ_i_local)):
+                                c = tTMEM_LOADcdQ_i_local[j]
+                                m_pos = c[0]
+                                n_pos = c[1]
+                                if n_pos // epi_cols_dQ == stage_k:
+                                    s_epi_dQ[m_pos, n_pos % epi_cols_dQ, 0] = tSMrdQ[j]
+
+                        cute.arch.fence_view_async_shared()
+                        cute.arch.barrier(barrier_id=3, number_of_threads=128)
+
+                        if leader_warp:
+                            gdQ_stage = gdQ_tma_epi[None, None, stage_k]
+                            td_sdQ, td_gdQ = cpasync.tma_partition(
+                                tma_atom_dQ,
+                                0,
+                                cute.make_layout(1),
+                                cute.group_modes(sdQ_stage, 0, 2),
+                                cute.group_modes(gdQ_stage, 0, 2),
+                            )
+                            cute.copy(tma_atom_dQ, td_sdQ, td_gdQ)
+                            cute.arch.cp_async_bulk_commit_group()
+                            cute.arch.cp_async_bulk_wait_group(0, read=True)
+                        # Non-issuing threads must not rotate the SMEM buffer
+                        # until the leader warp's TMA read has completed.
+                        cute.arch.barrier(barrier_id=3, number_of_threads=128)
+                else:
                     for i in cutlass.range(cute.size(tTMEM_LOADtdQ, mode=[1]), unroll_full=True):
                         tTMEM_LOADtdQ_i = tTMEM_LOADtdQ[None, i, 0]
-                        tTMEM_LOADcdQ_i_local = tTMEM_LOADcdQ_local[None, i, 0]
-                        tTMrdQ = cute.make_rmem_tensor(tTMEM_LOADcdQ_i_local.shape, self.acc_dtype)
+                        tTMEM_LOADgdQ_i = tTMEM_LOADgdQ[None, i, 0]
+                        tTMEM_LOADcdQ_i = tTMEM_LOADcdQ[None, i, 0]
+                        tTMrdQ = cute.make_rmem_tensor(
+                            tTMEM_LOADcdQ[None, 0, i].shape, self.acc_dtype
+                        )
                         cute.copy(tiled_tmem_load, tTMEM_LOADtdQ_i, tTMrdQ)
                         tSMrdQ = cute.make_rmem_tensor(tTMrdQ.shape, self.q_dtype)
                         dq_vec = tTMrdQ.load()
                         tSMrdQ.store(dq_vec.to(self.q_dtype))
-                        for j in cutlass.range_constexpr(cute.size(tTMEM_LOADcdQ_i_local)):
-                            c = tTMEM_LOADcdQ_i_local[j]
-                            m_pos = c[0]
-                            n_pos = c[1]
-                            if n_pos // epi_cols_dQ == stage_k:
-                                s_epi_dQ[m_pos, n_pos % epi_cols_dQ, 0] = tSMrdQ[j]
-
-                    cute.arch.fence_view_async_shared()
-                    cute.arch.barrier(barrier_id=3, number_of_threads=128)
-
-                    if leader_warp:
-                        gdQ_stage = gdQ_tma_epi[None, None, stage_k]
-                        td_sdQ, td_gdQ = cpasync.tma_partition(
-                            tma_atom_dQ,
-                            0,
-                            cute.make_layout(1),
-                            cute.group_modes(sdQ_stage, 0, 2),
-                            cute.group_modes(gdQ_stage, 0, 2),
-                        )
-                        cute.copy(tma_atom_dQ, td_sdQ, td_gdQ)
-                        cute.arch.cp_async_bulk_commit_group()
-                        cute.arch.cp_async_bulk_wait_group(0, read=True)
-                    # Non-issuing threads must not rotate the SMEM buffer
-                    # until the leader warp's TMA read has completed.
-                    cute.arch.barrier(barrier_id=3, number_of_threads=128)
+                        if cute.elem_less(tTMEM_LOADcdQ_i[0][0], seqlen_q):
+                            cute.autovec_copy(tSMrdQ, tTMEM_LOADgdQ_i)
             else:
                 for i in cutlass.range(cute.size(tTMEM_LOADtdQ, mode=[1]), unroll_full=True):
                     tTMEM_LOADtdQ_i = tTMEM_LOADtdQ[None, i, 0]
