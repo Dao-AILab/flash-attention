@@ -283,6 +283,50 @@ def _resolve_causal_local_window(causal, window_size_left, window_size_right, ma
         local = False
     return causal, local, window_size_left, window_size_right
 
+def _compute_tile_cumsum(
+    cu_seqlens: Optional[torch.Tensor],
+    seqused: Optional[torch.Tensor],
+    num_head: int,
+    tile_size: int,
+    *,
+    qhead_per_kvhead: int = 1,
+    pack_gqa: bool = False,
+    cluster_shape_m: int = 1,
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    """Precompute per-batch cumulative tile counts for SingleTileVarlenScheduler.
+
+    Returns an int32 tensor of length ``num_batch + 1`` whose entry ``b`` is
+    ``sum_{i<b} (num_m_blocks(i) * num_head)``, matching the kernel-side
+    ``_get_num_m_blocks`` formula in ``tile_scheduler.py`` exactly. The kernel
+    binary-searches this tensor to skip the per-CTA linear scan over batches.
+
+    Returns ``None`` when neither ``cu_seqlens`` nor ``seqused`` is provided
+    (i.e., the dense path), in which case the kernel's scheduler falls back to
+    its original linear scan (which only fires on varlen anyway).
+
+    Notes:
+      - ``pack_gqa`` only applies on the forward path; backward kernels do not
+        scale seqlens by ``qhead_per_kvhead``.
+      - ``cluster_shape_m > 1`` is currently unreachable in varlen
+        (``use_2cta_instrs`` requires non-varlen), but the formula mirrors the
+        kernel's ``ceil_div(ceil_div(seqlen, tile), cluster_m)`` to stay
+        correct if that constraint is ever relaxed.
+    """
+    if cu_seqlens is None and seqused is None:
+        return None
+    seqlens = (cu_seqlens[1:] - cu_seqlens[:-1]) if seqused is None else seqused
+    if pack_gqa and qhead_per_kvhead > 1:
+        seqlens = seqlens * qhead_per_kvhead
+    num_blocks = (seqlens + tile_size - 1) // tile_size
+    if cluster_shape_m > 1:
+        num_blocks = (num_blocks + cluster_shape_m - 1) // cluster_shape_m
+    tiles_per_batch = num_blocks * num_head
+    out = torch.zeros(tiles_per_batch.shape[0] + 1, dtype=torch.int32, device=device)
+    out[1:] = tiles_per_batch.to(torch.int32).cumsum(0)
+    return out
+
+
 def _flash_attn_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -680,6 +724,21 @@ def _flash_attn_fwd(
         sparse_kv = None
         disable_sparse_kv_bitmask = None
 
+    # Precompute cumulative tile counts so SingleTileVarlenScheduler can
+    # binary-search instead of doing per-CTA O(num_batch) linear scans.
+    # See _compute_tile_cumsum and tile_scheduler._varlen_coord_map.
+    # The hd=256 dedicated kernel uses Sm100FmhaStaticTileScheduler, not
+    # SingleTileVarlenScheduler, so it doesn't take an mTileCumsum argument.
+    tile_cumsum_q = (
+        None if use_dedicated_hd256_kernel
+        else _compute_tile_cumsum(
+            cu_seqlens_q, seqused_q, num_head, tile_m,
+            qhead_per_kvhead=qhead_per_kvhead, pack_gqa=pack_gqa,
+            cluster_shape_m=1,  # varlen forbids use_2cta_instrs => cluster_shape_m == 1
+            device=device,
+        )
+    )
+
     compile_key = (
         dtype,
         head_dim,
@@ -721,6 +780,7 @@ def _flash_attn_fwd(
         sparse_kv,
         disable_sparse_kv_bitmask,
         fa_logging.get_fa_log_level(),
+        tile_cumsum_q is not None,
     )
 
     if compile_key not in _flash_attn_fwd.compile_cache:
@@ -730,11 +790,12 @@ def _flash_attn_fwd(
             seqused_q_tensor,
             seqused_k_tensor,
             learnable_sink_tensor,
+            tile_cumsum_q_tensor,
         ) = [
             to_cute_tensor(t, assumed_align=4, leading_dim=0)
             if t is not None
             else None
-            for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, learnable_sink)
+            for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, learnable_sink, tile_cumsum_q)
         ]
         page_table_tensor = (
             to_cute_tensor(page_table, assumed_align=4, leading_dim=1)
@@ -932,6 +993,7 @@ def _flash_attn_fwd(
                 cu_seqlens_k_tensor,
                 seqused_q_tensor,
                 seqused_k_tensor,
+                tile_cumsum_q_tensor,
                 gather_kv_indices_tensor,
                 page_table_tensor,
                 window_size_left,
@@ -960,6 +1022,9 @@ def _flash_attn_fwd(
                 cute_aux_tensors,
                 current_stream,
             ]
+            # hd=256 uses Sm100FmhaStaticTileScheduler (no mTileCumsum slot).
+            if not use_dedicated_hd256_kernel:
+                compile_args.insert(11, tile_cumsum_q_tensor)
             if arch // 10 in [10, 11]:
                 compile_args.insert(-3, descale_tensors_tensor)
             _flash_attn_fwd.compile_cache[compile_key] = cute.compile(*compile_args, options="--enable-tvm-ffi")
@@ -996,6 +1061,7 @@ def _flash_attn_fwd(
                 cu_seqlens_k,
                 seqused_q,
                 seqused_k,
+                tile_cumsum_q,
                 gather_kv_indices,
                 page_table,
                 window_size_left,
@@ -1018,6 +1084,9 @@ def _flash_attn_fwd(
                 window_size_right,
                 learnable_sink,
             ]
+            # Mirror compile_args: skip mTileCumsum slot for hd=256.
+            if not use_dedicated_hd256_kernel:
+                call_args.insert(10, tile_cumsum_q)
             if arch // 10 in [10, 11]:
                 call_args.append(descale_tensors)
             call_args.extend([
@@ -1086,7 +1155,7 @@ def make_fake_bwd_tensors(dtype, has_gqa, varlen_q, varlen_k):
 
 def _compile_bwd_preprocess(
     dtype, head_dim, head_dim_v, m_block_size, has_cuseqlens_q, has_seqused_q, has_dlse, has_dq_accum,
-    use_padded_offsets,
+    use_padded_offsets, has_tile_cumsum,
 ):
     """Compile bwd preprocess kernel using cute fake tensors (no real GPU tensors needed)."""
     mQ, mK, mV, mO, mdO, mdQ, mdK, mdV, mLSE, mLSElog2, mPdPsum, mdQaccum, mdKaccum, mdVaccum = make_fake_bwd_tensors(
@@ -1098,11 +1167,13 @@ def _compile_bwd_preprocess(
     mSequsedQ = fake_tensor(Int32, (batch,), divisibility=1) if has_seqused_q else None
     mdLSE = fake_tensor(Float32, mLSE.shape, divisibility=1) if has_dlse else None
     mdQaccum = mdQaccum if has_dq_accum else None
+    mTileCumsum = fake_tensor(Int32, (batchp1,), divisibility=1) if has_tile_cumsum else None
     fa_bwd_pre = FlashAttentionBackwardPreprocess(
         dtype, head_dim, head_dim_v, m_block_size, use_padded_offsets=use_padded_offsets
     )
     return cute.compile(
         fa_bwd_pre, mO, mdO, mPdPsum, mLSE, mLSElog2, mdQaccum, mCuSeqlensQ, mSequsedQ, mdLSE,
+        mTileCumsum,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--enable-tvm-ffi",
     )
@@ -1116,15 +1187,22 @@ def _bwd_preprocess(
 ):
     """Backward preprocess: compute (o * dout).sum(dim=-1) - dLSE, lse * log2_e, and zero out dq_accum."""
     is_varlen = cu_seqlens_q is not None
+    # Q-side cumsum: bwd preprocess iterates over m_blocks per batch.
+    # No pack_gqa multiplier here (preprocess is per-(batch, head, m_block)).
+    tile_cumsum_pre = _compute_tile_cumsum(
+        cu_seqlens_q, seqused_q, num_head=out.shape[1] if is_varlen else out.shape[2],
+        tile_size=m_block_size, device=out.device,
+    )
     compile_key = (
-        dtype, head_dim, head_dim_v, m_block_size, is_varlen, seqused_q is not None, dlse is not None, dq_accum is not None,
-        use_padded_offsets,
+        dtype, head_dim, head_dim_v, m_block_size, is_varlen, seqused_q is not None, dlse is not None,
+        dq_accum is not None, use_padded_offsets, tile_cumsum_pre is not None,
     )
     if compile_key not in _bwd_preprocess.compile_cache:
         _bwd_preprocess.compile_cache[compile_key] = _compile_bwd_preprocess(*compile_key)
     if not is_fake_mode():
         _bwd_preprocess.compile_cache[compile_key](
-            out, dout, dpsum, lse, lse_log2, dq_accum, cu_seqlens_q, seqused_q, dlse
+            out, dout, dpsum, lse, lse_log2, dq_accum, cu_seqlens_q, seqused_q, dlse,
+            tile_cumsum_pre,
         )
 
 
@@ -1135,6 +1213,7 @@ def _compile_bwd_postprocess(
     dtype, hdim, block_size, num_threads, atom_layout, swap_ab,
     has_cuseqlens_q, has_seqused_q,
     use_2cta_instrs, cluster_size, arch,
+    has_tile_cumsum,
 ):
     """Compile bwd postprocess kernel using cute fake tensors."""
     mQ, mK, mV, mO, mdO, mdQ, mdK, mdV, mLSE, mLSElog2, mPdPsum, mdQaccum, mdKaccum, mdVaccum = make_fake_bwd_tensors(
@@ -1144,6 +1223,7 @@ def _compile_bwd_postprocess(
     batchp1 = cute.sym_int()
     mCuSeqlensQ = fake_tensor(Int32, (batchp1,), divisibility=1) if has_cuseqlens_q else None
     mSeqUsedQ = fake_tensor(Int32, (batch,), divisibility=1) if has_seqused_q else None
+    mTileCumsum = fake_tensor(Int32, (batchp1,), divisibility=1) if has_tile_cumsum else None
     fa_bwd_post = FlashAttentionBackwardPostprocess(
         dtype, hdim, arch, block_size, num_threads, atom_layout, swap_ab,
         use_2cta_instrs=use_2cta_instrs,
@@ -1151,6 +1231,7 @@ def _compile_bwd_postprocess(
     )
     return cute.compile(
         fa_bwd_post, mdQaccum, mdQ, Float32(0.0), mCuSeqlensQ, mSeqUsedQ,
+        mTileCumsum,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--enable-tvm-ffi",
     )
@@ -1164,16 +1245,26 @@ def _bwd_postprocess_convert(
     use_2cta_instrs=False, cluster_size=1,
 ):
     """Backward postprocess: convert float32 accumulator to bf16/fp16 output."""
+    # Whichever side the caller passes (Q for dQ-postprocess, K for dK/dV).
+    # output shape is (total, num_head, hdim) when varlen.
+    tile_cumsum_post = _compute_tile_cumsum(
+        cu_seqlens, seqused, num_head=output.shape[1] if (cu_seqlens is not None or seqused is not None) else output.shape[2],
+        tile_size=block_size,
+        cluster_shape_m=cluster_size,
+        device=output.device,
+    )
     compile_key = (
         dtype, hdim, block_size, num_threads, atom_layout, swap_ab,
         cu_seqlens is not None, seqused is not None,
         use_2cta_instrs, cluster_size, arch,
+        tile_cumsum_post is not None,
     )
     if compile_key not in _bwd_postprocess_convert.compile_cache:
         _bwd_postprocess_convert.compile_cache[compile_key] = _compile_bwd_postprocess(*compile_key)
     if not is_fake_mode():
         _bwd_postprocess_convert.compile_cache[compile_key](
             accum, output, scale, cu_seqlens, seqused,
+            tile_cumsum_post,
         )
 
 
@@ -1550,6 +1641,20 @@ def _flash_attn_bwd(
             subtile_factor=subtile_factor,
         )
 
+    # Backward iterates over K blocks (parallelizes the outer loop across N CTAs),
+    # so the scheduler cumsum is built from K seqlens with n_block_size, and uses
+    # num_head_q (the bwd scheduler iterates over query heads, see flash_bwd_sm*.py).
+    # No pack_gqa multiplier on backward. The hd=256 dedicated backward uses
+    # Sm100Fmha*TileScheduler (no mTileCumsum slot), so skip cumsum for that path.
+    tile_cumsum_k = (
+        None if use_dedicated_hd256_kernel
+        else _compute_tile_cumsum(
+            cu_seqlens_k, seqused_k, num_head=num_head, tile_size=n_block_size,
+            cluster_shape_m=cluster_size if arch // 10 in [10, 11] else 1,
+            device=device,
+        )
+    )
+
     if arch // 10 in [8, 9, 12]:
         compile_key = (
             arch,
@@ -1592,6 +1697,7 @@ def _flash_attn_bwd(
             # Prevent TVM stride poisoning when only one block is present.
             (seqlen_q_rounded // m_block_size == 1),
             (seqlen_k_rounded // n_block_size == 1),
+            tile_cumsum_k is not None,
         )
     else:
         compile_key = (
@@ -1627,6 +1733,7 @@ def _flash_attn_bwd(
             # Prevent TVM stride poisoning when only one block is present.
             (seqlen_q_rounded // m_block_size == 1),
             (seqlen_k_rounded // n_block_size == 1),
+            tile_cumsum_k is not None,
         )
 
     if compile_key not in _flash_attn_bwd.compile_cache:
@@ -1639,9 +1746,9 @@ def _flash_attn_bwd(
             dk_accum_tensor, dv_accum_tensor = [
                 to_cute_tensor(t) for t in (dk_accum, dv_accum)
             ]
-        cu_seqlens_q_tensor, cu_seqlens_k_tensor, seqused_q_tensor, seqused_k_tensor = [
+        cu_seqlens_q_tensor, cu_seqlens_k_tensor, seqused_q_tensor, seqused_k_tensor, tile_cumsum_k_tensor = [
             to_cute_tensor(t, assumed_align=4) if t is not None else None
-            for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
+            for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, tile_cumsum_k)
         ]
         dQ_semaphore_tensor, dK_semaphore_tensor, dV_semaphore_tensor = [
             utils.convert_from_dlpack_leading_static(t.detach(), leading_dim=3, alignment=4, stride_order=t.dim_order())
@@ -1759,7 +1866,7 @@ def _flash_attn_bwd(
         dq_accum_tensor = dq_tensor if use_dedicated_hd256_kernel else dq_accum_tensor
 
         # TODO: check @can_implement
-        _flash_attn_bwd.compile_cache[compile_key] = cute.compile(
+        compile_args = [
             fa_bwd_obj,
             q_tensor,
             k_tensor,
@@ -1783,11 +1890,14 @@ def _flash_attn_bwd(
             cute_aux_tensors,
             sparse_tensors_compile,
             current_stream,
-            options="--enable-tvm-ffi",
-        )
+        ]
+        # hd=256 backward uses Sm100Fmha*TileScheduler (no mTileCumsum slot).
+        if not use_dedicated_hd256_kernel:
+            compile_args.insert(15, tile_cumsum_k_tensor)
+        _flash_attn_bwd.compile_cache[compile_key] = cute.compile(*compile_args, options="--enable-tvm-ffi")
     if not is_fake_mode():
         dq_accum = dq if use_dedicated_hd256_kernel else dq_accum
-        _flash_attn_bwd.compile_cache[compile_key](
+        call_args = [
             q.detach(),
             k.detach(),
             v.detach(),
@@ -1809,7 +1919,10 @@ def _flash_attn_bwd(
             dV_semaphore,
             aux_tensors,
             normalized_block_sparse_tensors[:4] if normalized_block_sparse_tensors is not None else None,
-        )
+        ]
+        if not use_dedicated_hd256_kernel:
+            call_args.insert(14, tile_cumsum_k)
+        _flash_attn_bwd.compile_cache[compile_key](*call_args)
     # Postprocess: convert dq_accum from float32 to dq in bf16/fp16
     # hd=256 2CTA backward has its own internal postprocess, skip here.
     if not use_dedicated_hd256_kernel:
