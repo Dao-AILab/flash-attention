@@ -1,5 +1,5 @@
 # mask_mod varlen test script
-# Forward-only, no block sparsity (block sparsity will be added later)
+# Forward-only 
 #
 # Since flex_attention doesn't support varlen natively, we compare
 # results sequence-by-sequence: run the kernel with cu_seqlens (packed),
