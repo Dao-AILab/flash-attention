@@ -719,11 +719,11 @@ def _flash_attn_fwd(
         window_size_left is not None,
         window_size_right is not None,
         learnable_sink is not None,
-        cu_total_m_blocks is None,
-        cu_total_n_blocks is None,
         q_descale is not None,
         k_descale is not None,
         v_descale is not None,
+        cu_total_m_blocks is None,
+        cu_total_n_blocks is None,
         tile_m,
         tile_n,
         q_stage,
@@ -979,15 +979,19 @@ def _flash_attn_fwd(
                 window_size_left,
                 window_size_right,
                 learnable_sink_tensor,
+            ]
+            if arch // 10 in [10, 11]:
+                compile_args.append(descale_tensors_tensor)
+            compile_args.extend([
                 sparse_tensors,
                 cu_total_m_blocks_tensor,
                 cu_total_n_blocks_tensor,
                 cute_aux_tensors,
-                current_stream,
-            ]
-            if arch // 10 in [10, 11]:
-                compile_args.insert(-3, descale_tensors_tensor)
-            _flash_attn_fwd.compile_cache[compile_key] = cute.compile(*compile_args, options="--enable-tvm-ffi")
+            ])
+            compile_args.append(current_stream)
+            _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
+                *compile_args, options="--enable-tvm-ffi"
+            )
 
     # In "fake mode", we will take torch fake tensors as input and the expected behaviors are:
     # - Use those fake metadata to populate compilation cache
