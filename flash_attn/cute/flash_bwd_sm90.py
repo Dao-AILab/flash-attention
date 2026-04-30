@@ -350,7 +350,6 @@ class FlashAttentionBackwardSm90:
         mCuSeqlensK: Optional[cute.Tensor] = None,
         mSeqUsedQ: Optional[cute.Tensor] = None,
         mSeqUsedK: Optional[cute.Tensor] = None,
-        softcap: Float32 | float | None = None,
         window_size_left: Int32 | int | None = None,
         window_size_right: Int32 | int | None = None,
         mdQ_semaphore: Optional[cute.Tensor] = None,
@@ -1201,7 +1200,6 @@ class FlashAttentionBackwardSm90:
                 tiled_mma_SdP,
                 sP_cpy,
                 tidx,
-                self.arch,
                 transpose=self.SdP_swapAB,
                 position_independent=True,
                 major_mode_size=mms_PdS,
@@ -1211,7 +1209,6 @@ class FlashAttentionBackwardSm90:
             tiled_mma_SdP,
             sdS_cpy,
             tidx,
-            self.arch,
             transpose=self.SdP_swapAB,
             position_independent=True,
             major_mode_size=mms_PdS,
@@ -1645,7 +1642,6 @@ class FlashAttentionBackwardSm90:
                 tiled_mma_dV,
                 sdV,
                 tidx,
-                self.arch,
                 transpose=self.dKV_swapAB,
                 position_independent=True,
             )
@@ -1653,7 +1649,6 @@ class FlashAttentionBackwardSm90:
                 tiled_mma_dK,
                 sdK,
                 tidx,
-                self.arch,
                 transpose=self.dKV_swapAB,
                 position_independent=True,
             )
@@ -1865,7 +1860,7 @@ class FlashAttentionBackwardSm90:
                         gdQaccum,
                         subtile_factor=self.subtile_factor,
                         m_block_max=m_block_max,
-                        num_mma_warp_groups=self.num_wg_mma,
+                        num_dQ_warp_groups=self.num_wg_dQ,
                         num_threads_per_warp_group=self.num_threads_per_warp_group,
                         tma_copy_bytes_dQ=self.tma_copy_bytes["dQ"],
                     )

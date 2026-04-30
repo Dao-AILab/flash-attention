@@ -4,8 +4,14 @@ import cutlass
 import cutlass.cute as cute
 from cutlass._mlir.dialects import math as mlir_math
 import operator
-from torch.nn.attention.flex_attention import flex_attention
-from flash_attn.cute.interface import _flash_attn_fwd, _flash_attn_bwd
+from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+from flash_attn.cute.interface import (
+    flash_attn_func,
+    _flash_attn_fwd,
+    _flash_attn_bwd,
+    _tile_size_bwd_sm90,
+)
+from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch
 
 COMPUTE_CAPABILITY = torch.cuda.get_device_capability()[0]
 
@@ -752,37 +758,55 @@ BWD_TEST_PAIRS_PACK_GQA = [
 
 
 def run_cute_flash_bwd(
-    q, k, v, cute_score_mod, cute_score_mod_bwd, aux_tensors=None, pack_gqa=False
+    q, k, v, cute_score_mod, cute_score_mod_bwd, aux_tensors=None, pack_gqa=False, use_autograd=True,
 ):
     """Run flash attention forward + backward with score_mod."""
     q_t = q.transpose(1, 2)
     k_t = k.transpose(1, 2)
     v_t = v.transpose(1, 2)
 
-    out, lse = _flash_attn_fwd(
-        q_t,
-        k_t,
-        v_t,
-        return_lse=True,
-        score_mod=cute_score_mod,
-        aux_tensors=aux_tensors,
-        pack_gqa=pack_gqa,
-    )
+    if use_autograd:
+        q_t = q_t.detach().requires_grad_(True)
+        k_t = k_t.detach().requires_grad_(True)
+        v_t = v_t.detach().requires_grad_(True)
+        out, lse = flash_attn_func(
+            q_t, 
+            k_t, 
+            v_t, 
+            score_mod=cute_score_mod,
+            score_mod_bwd=cute_score_mod_bwd,
+            aux_tensors=aux_tensors,
+            pack_gqa=pack_gqa,
+        )
 
-    grad_out = torch.randn_like(out)
+        grad_out = torch.randn_like(out)
 
-    dq, dk, dv = _flash_attn_bwd(
-        q_t,
-        k_t,
-        v_t,
-        out,
-        grad_out,
-        lse,
-        score_mod=cute_score_mod,
-        score_mod_bwd=cute_score_mod_bwd,
-        aux_tensors=aux_tensors,
-        pack_gqa=pack_gqa,
-    )
+        dq, dk, dv = torch.autograd.grad(out, (q_t, k_t, v_t), grad_out)
+    else:
+        out, lse = _flash_attn_fwd(
+            q_t,
+            k_t,
+            v_t,
+            return_lse=True,
+            score_mod=cute_score_mod,
+            aux_tensors=aux_tensors,
+            pack_gqa=pack_gqa,
+        )
+
+        grad_out = torch.randn_like(out)
+
+        dq, dk, dv = _flash_attn_bwd(
+            q_t,
+            k_t,
+            v_t,
+            out,
+            grad_out,
+            lse,
+            score_mod=cute_score_mod,
+            score_mod_bwd=cute_score_mod_bwd,
+            aux_tensors=aux_tensors,
+            pack_gqa=pack_gqa,
+        )
 
     return (
         out.transpose(1, 2),
@@ -812,6 +836,158 @@ def run_flex_reference_bwd(q, k, v, eager_score_mod, grad_out, dtype=None):
     return out, dq, dk, dv
 
 
+@pytest.mark.skipif(COMPUTE_CAPABILITY != 9, reason="SM90-only test")
+def test_sm90_block_sparse_score_mod_backward_with_dq_swapab():
+    torch.random.manual_seed(42)
+
+    batch_size = 1
+    num_heads = 4
+    seqlen_q = 640
+    seqlen_kv = 640
+    dim = 128
+    block_size_q = 640
+    block_size_kv = 128
+    dtype = torch.bfloat16
+
+    cfg = _tile_size_bwd_sm90(
+        dim,
+        dim,
+        causal=False,
+        local=False,
+        sparse_block_size_q=block_size_q,
+    )
+    assert cfg.m_block_size == 80
+    assert cfg.dQ_swapAB
+
+    q, k, v = create_tensors(
+        batch_size=batch_size,
+        num_heads=num_heads,
+        seqlen_q=seqlen_q,
+        seqlen_kv=seqlen_kv,
+        dim=dim,
+        dtype=dtype,
+    )
+
+    def prefix_visible(batch, head, q_idx, kv_idx):
+        return kv_idx < 3 * block_size_kv
+
+    block_mask = create_block_mask(
+        prefix_visible,
+        B=batch_size,
+        H=num_heads,
+        Q_LEN=seqlen_q,
+        KV_LEN=seqlen_kv,
+        device=q.device,
+        BLOCK_SIZE=(block_size_q, block_size_kv),
+    )
+    (
+        _seq_q,
+        _seq_k,
+        kv_mask_cnt,
+        kv_mask_idx,
+        full_kv_cnt,
+        full_kv_idx,
+        q_mask_cnt,
+        q_mask_idx,
+        full_q_cnt,
+        full_q_idx,
+        *_,
+    ) = block_mask.as_tuple()
+
+    block_sparse_fwd = BlockSparseTensorsTorch(
+        mask_block_cnt=kv_mask_cnt,
+        mask_block_idx=kv_mask_idx,
+        full_block_cnt=full_kv_cnt,
+        full_block_idx=full_kv_idx,
+        block_size=(block_size_q, block_size_kv),
+    )
+    block_sparse_bwd = BlockSparseTensorsTorch(
+        mask_block_cnt=q_mask_cnt,
+        mask_block_idx=q_mask_idx,
+        full_block_cnt=full_q_cnt,
+        full_block_idx=full_q_idx,
+        block_size=(block_size_q, block_size_kv),
+    )
+
+    q_t = q.transpose(1, 2)
+    k_t = k.transpose(1, 2)
+    v_t = v.transpose(1, 2)
+    out, lse = _flash_attn_fwd(
+        q_t,
+        k_t,
+        v_t,
+        return_lse=True,
+        score_mod=score_mod_squared,
+        block_sparse_tensors=block_sparse_fwd,
+    )
+    grad_out = torch.randn_like(out)
+    dq, dk, dv = _flash_attn_bwd(
+        q_t,
+        k_t,
+        v_t,
+        out,
+        grad_out,
+        lse,
+        score_mod=score_mod_squared,
+        score_mod_bwd=score_mod_bwd_squared,
+        block_sparse_tensors=block_sparse_bwd,
+    )
+
+    def run_flex_block_sparse_score_mod_ref(q_ref, k_ref, v_ref, grad_out_ref, ref_dtype=None):
+        if ref_dtype is not None:
+            q_ref = q_ref.to(ref_dtype).requires_grad_(True)
+            k_ref = k_ref.to(ref_dtype).requires_grad_(True)
+            v_ref = v_ref.to(ref_dtype).requires_grad_(True)
+            grad_out_ref = grad_out_ref.to(ref_dtype)
+        else:
+            q_ref = q_ref.requires_grad_(True)
+            k_ref = k_ref.requires_grad_(True)
+            v_ref = v_ref.requires_grad_(True)
+
+        compiled_flex = torch.compile(flex_attention)
+        out_ref = compiled_flex(
+            q_ref,
+            k_ref,
+            v_ref,
+            block_mask=block_mask,
+            score_mod=score_squared_eager,
+            enable_gqa=False,
+        )
+        dq_ref, dk_ref, dv_ref = torch.autograd.grad(out_ref, (q_ref, k_ref, v_ref), grad_out_ref)
+        return out_ref, dq_ref, dk_ref, dv_ref
+
+    out_ref_fp32, dq_ref_fp32, dk_ref_fp32, dv_ref_fp32 = run_flex_block_sparse_score_mod_ref(
+        q, k, v, grad_out.transpose(1, 2), ref_dtype=torch.float32
+    )
+    out_pt, dq_pt, dk_pt, dv_pt = run_flex_block_sparse_score_mod_ref(
+        q, k, v, grad_out.transpose(1, 2)
+    )
+
+    rtol = 2
+    out_atol = 2 * (out_ref_fp32 + 0.3 - 0.3 - out_ref_fp32).abs().max().item()
+    dq_atol = 2 * (dq_ref_fp32 + 0.3 - 0.3 - dq_ref_fp32).abs().max().item()
+    dk_atol = 2 * (dk_ref_fp32 + 0.3 - 0.3 - dk_ref_fp32).abs().max().item()
+    dv_atol = 2 * (dv_ref_fp32 + 0.3 - 0.3 - dv_ref_fp32).abs().max().item()
+
+    out_ref = out_ref_fp32.to(dtype)
+    dq_ref = dq_ref_fp32.to(dtype)
+    dk_ref = dk_ref_fp32.to(dtype)
+    dv_ref = dv_ref_fp32.to(dtype)
+
+    assert (out.transpose(1, 2) - out_ref).abs().max().item() <= rtol * (
+        out_pt - out_ref
+    ).abs().max().item() + out_atol
+    assert (dq.transpose(1, 2) - dq_ref).abs().max().item() <= rtol * (
+        dq_pt - dq_ref
+    ).abs().max().item() + dq_atol
+    assert (dk.transpose(1, 2) - dk_ref).abs().max().item() <= rtol * (
+        dk_pt - dk_ref
+    ).abs().max().item() + dk_atol
+    assert (dv.transpose(1, 2) - dv_ref).abs().max().item() <= rtol * (
+        dv_pt - dv_ref
+    ).abs().max().item() + dv_atol
+
+
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_kv",
     [
@@ -829,7 +1005,8 @@ def run_flex_reference_bwd(q, k, v, eager_score_mod, grad_out, dtype=None):
 @pytest.mark.parametrize("dim", [64, 128])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("score_mod_triple", BWD_TEST_PAIRS)
-def test_cute_vs_flex_attention_backward(seqlen_q, seqlen_kv, dim, dtype, score_mod_triple):
+@pytest.mark.parametrize("use_autograd", [True, False])
+def test_cute_vs_flex_attention_backward(seqlen_q, seqlen_kv, dim, dtype, score_mod_triple, use_autograd):
     """Test backward pass with score_mod against flex_attention reference."""
     if COMPUTE_CAPABILITY == 9 and dim == 64:
         pytest.skip("head_dim=64 not supported on SM90 for backward")
@@ -841,7 +1018,7 @@ def test_cute_vs_flex_attention_backward(seqlen_q, seqlen_kv, dim, dtype, score_
         seqlen_q=seqlen_q, seqlen_kv=seqlen_kv, num_heads=4, dim=dim, dtype=dtype
     )
 
-    out_cute, grad_out, dq_cute, dk_cute, dv_cute = run_cute_flash_bwd(q, k, v, cute_fwd, cute_bwd)
+    out_cute, grad_out, dq_cute, dk_cute, dv_cute = run_cute_flash_bwd(q, k, v, cute_fwd, cute_bwd, use_autograd=use_autograd)
     out_ref_fp32, dq_ref_fp32, dk_ref_fp32, dv_ref_fp32 = run_flex_reference_bwd(
         q, k, v, eager_ref, grad_out, dtype=torch.float32
     )

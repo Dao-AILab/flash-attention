@@ -667,6 +667,8 @@ def handle_block_sparse_empty_tile_correction_sm100(
     o_corr_consumer_phase: Int32,
     corr_epi_producer_phase: Int32,
     softmax_scale_log2: Float32,
+    max_offset: Float32,
+    max_offset_scale: Float32,
     mO_cur: Optional[cute.Tensor] = None,
     gO: Optional[cute.Tensor] = None,
     gmem_tiled_copy_O: Optional[cute.TiledCopy] = None,
@@ -706,10 +708,11 @@ def handle_block_sparse_empty_tile_correction_sm100(
             if sink_val != -Float32.inf and (const_expr(not is_split_kv) or split_idx == 0):
                 if row_max_value == -Float32.inf:
                     row_max_value = sink_val * (LOG2_E / softmax_scale_log2)
-                    row_sum_value = Float32(1.0)
+                    row_sum_value = max_offset_scale
                 else:
                     row_sum_value = row_sum_value + cute.math.exp2(
-                        sink_val * LOG2_E - row_max_value * softmax_scale_log2, fastmath=True
+                        sink_val * LOG2_E - row_max_value * softmax_scale_log2 + max_offset,
+                        fastmath=True,
                     )
         if tidx < m_block_size:
             scale_row_idx = tidx + stage * m_block_size
@@ -726,6 +729,8 @@ def handle_block_sparse_empty_tile_correction_sm100(
 
         if const_expr(gmem_tiled_copy_O is None):
             pipeline_o_epi.producer_acquire_w_index_phase(stage, corr_epi_producer_phase)
+
+        gO_stage = gO[None, None, stage] if const_expr(gO is not None) else None
         correction_epilogue(
             thr_mma_pv,
             tOtO[None, None, None, stage],
@@ -736,7 +741,7 @@ def handle_block_sparse_empty_tile_correction_sm100(
             Float32(0.0),  # zero scale ensures empty tile writes zeros into staged outputs
             sO[None, None, stage],
             mO_cur,
-            gO[None, None, stage],
+            gO_stage,
             gmem_tiled_copy_O,
         )
         if const_expr(gmem_tiled_copy_O is None):
@@ -1348,18 +1353,18 @@ def _store_one_dQaccum_sm90(
     m_block,
     sdQaccum: cute.Tensor,
     gdQaccum: cute.Tensor,
-    num_mma_warp_groups: cutlass.Constexpr,
+    num_dQ_warp_groups: cutlass.Constexpr,
     num_threads_per_warp_group: cutlass.Constexpr,
     tma_copy_bytes_dQ,
 ):
     """Store dQaccum for a single m_block."""
-    for warp_group_idx in cutlass.range_constexpr(num_mma_warp_groups):
-        cute.arch.cp_async_bulk_wait_group(num_mma_warp_groups - 1 - warp_group_idx, read=True)
+    for warp_group_idx in cutlass.range_constexpr(num_dQ_warp_groups):
+        cute.arch.cp_async_bulk_wait_group(num_dQ_warp_groups - 1 - warp_group_idx, read=True)
         cute.arch.barrier_arrive(
             barrier_id=int(NamedBarrierBwd.dQEmptyWG0) + warp_group_idx,
             number_of_threads=num_threads_per_warp_group + cute.arch.WARP_SIZE,
         )
-    for warp_group_idx in cutlass.range_constexpr(num_mma_warp_groups):
+    for warp_group_idx in cutlass.range_constexpr(num_dQ_warp_groups):
         cute.arch.barrier(
             barrier_id=int(NamedBarrierBwd.dQFullWG0) + warp_group_idx,
             number_of_threads=num_threads_per_warp_group + cute.arch.WARP_SIZE,
@@ -1383,7 +1388,7 @@ def dQaccum_store_block_sparse_bwd_sm90(
     gdQaccum: cute.Tensor,
     subtile_factor: cutlass.Constexpr,
     m_block_max: int,
-    num_mma_warp_groups: cutlass.Constexpr,
+    num_dQ_warp_groups: cutlass.Constexpr,
     num_threads_per_warp_group: cutlass.Constexpr,
     tma_copy_bytes_dQ,
 ):
@@ -1412,7 +1417,7 @@ def dQaccum_store_block_sparse_bwd_sm90(
                 m_block,
                 sdQaccum,
                 gdQaccum,
-                num_mma_warp_groups,
+                num_dQ_warp_groups,
                 num_threads_per_warp_group,
                 tma_copy_bytes_dQ,
             )
@@ -1428,7 +1433,7 @@ def dQaccum_store_block_sparse_bwd_sm90(
                     m_block,
                     sdQaccum,
                     gdQaccum,
-                    num_mma_warp_groups,
+                    num_dQ_warp_groups,
                     num_threads_per_warp_group,
                     tma_copy_bytes_dQ,
                 )

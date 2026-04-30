@@ -27,7 +27,7 @@ from flash_attn.cute import ampere_helpers as sm80_utils
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import utils
 from flash_attn.cute.mask import AttentionMask
-from flash_attn.cute.softmax import Softmax
+from flash_attn.cute.softmax import Softmax, apply_score_mod_inner
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute.pack_gqa import PackGQA
@@ -1179,8 +1179,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                 m_block,
                 acc_S,
                 n_block,
-                seqlen,
                 softmax_scale=softmax.softmax_scale,
+                seqlen=seqlen,
                 aux_tensors=aux_tensors,
                 fastdiv_mods=fastdiv_mods,
             )
@@ -1219,6 +1219,40 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         )
         # if const_expr(self.num_stages > 1):
         #     load_K_next()
+    @cute.jit
+    def apply_score_mod(
+        self,
+        thr_mma_qk,
+        batch_idx,
+        head_idx,
+        m_block,
+        acc_S,
+        n_block,
+        softmax_scale,
+        seqlen,
+        aux_tensors: Optional[list] = None,
+        fastdiv_mods=None,
+    ):
+        # Prepare index tensor
+        cS = cute.make_identity_tensor((self.tile_m, self.tile_n))
+        cS = cute.domain_offset((m_block * self.tile_m, n_block * self.tile_n), cS)
+        tScS = thr_mma_qk.partition_C(cS)
+
+        apply_score_mod_inner(
+            acc_S,
+            tScS,
+            self.score_mod,
+            batch_idx,
+            head_idx,
+            softmax_scale,
+            self.vec_size,
+            self.qk_acc_dtype,
+            aux_tensors,
+            fastdiv_mods,
+            seqlen_info=seqlen,
+            constant_q_idx=None,
+            qhead_per_kvhead=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+        )
 
 
 # SM90 forward pass moved to flash_fwd_sm90.py; re-export for backward compatibility
