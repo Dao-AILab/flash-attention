@@ -783,7 +783,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             False,  # is_split_kv
             window_size_left,
             window_size_right,
-            qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+            qhead_per_kvhead_packgqa=1,  # SM80 forward never calls pack_gqa_layout (rows are not packed)
         )
         seqlen = SeqlenInfoQK.create(
             batch_idx=batch_size,
@@ -995,7 +995,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             seqlen,
             window_size_left,
             window_size_right,
-            self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+            1,  # SM80 forward never calls pack_gqa_layout (rows are not packed)
         )
         mask_fn = partial(
             mask.apply_mask,
