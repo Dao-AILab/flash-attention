@@ -40,7 +40,8 @@ mha_varlen_fwd(at::Tensor &q,                               // total_q x num_hea
                int window_size_right,
                const float softcap,
                const bool return_softmax,
-               std::optional<at::Generator> gen_);
+               std::optional<at::Generator> gen_,
+               int num_splits = 0);
 
 std::vector<at::Tensor>
 mha_bwd(const at::Tensor &dout,                   // batch_size x seqlen_q x num_heads, x multiple_of(head_size_og, 8)
