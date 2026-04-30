@@ -293,15 +293,10 @@ class BlackwellFusedMultiHeadAttentionForward:
         )
         q = cute.make_tensor(q_tensor.iterator, q_layout)
         if cutlass.const_expr(mPageTable is not None):
-            # Paged KV uses the same TMA load path as dense KV. Each page is
-            # presented as one tile_n=128 tile; logical KV blocks are remapped
-            # to physical page indices through the page table at load time.
-            # k_tensor layout (from interface.py): (num_pages, page_size, h_k, d)
+            # Paged: K layout (num_pages, page_size, h_k, d); page_table maps kv_coord→physical page.
             num_pages = k_tensor.shape[0]
             page_size = k_tensor.shape[1]
             page_size64 = Int64(page_size)
-            # For paged mode, the per-sequence max_seqlen_k is pages_per_seq * page_size.
-            # Overrides the inferred s_k from dense K shape (which would be page_size here).
             max_seqlen_k_paged = Int32(mPageTable.shape[1] * page_size)
             k_paged_layout = cute.make_layout(
                 (page_size, d, h_k, num_pages),
@@ -313,7 +308,6 @@ class BlackwellFusedMultiHeadAttentionForward:
                 stride=(1, d64 * h_k64, d64, page_size64 * d64 * h_k64),
             )
             v = cute.make_tensor(v_tensor.iterator, v_paged_layout)
-            # page_table: (b, max_num_pages_per_seq)
             page_table_layout = cute.make_layout(
                 (b, mPageTable.shape[1]),
                 stride=(Int64(mPageTable.shape[1]), 1),
@@ -859,8 +853,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                         cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape
                     )
                     if cutlass.const_expr(mPageTable is None):
-                        # Dense path: K/V have ((h_r, h_k), b) nested batch mode; resolve
-                        # batch via domain_offset, then index by mma_block_coord[2] (batch).
+                        # Dense path: domain_offset K/V by batch block, select batch via mma_block_coord[2].
                         mK_kdl_ = cute.domain_offset(
                             cute.select(block_offset, mode=[1, 2, 3]), mK_kdl
                         )
@@ -893,12 +886,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                         tKgK = tKgK_kdl[None, None, None, mma_block_coord[2]]
                         tVgV = tVgV_dkl[None, None, None, mma_block_coord[2]]
                     else:
-                        # Paged path: K/V have (page_size, d, h_k, num_pages) layout. Fix
-                        # h_k via direct slicing (no batch-offset), keep num_pages as the
-                        # outer mode so each TMA load can select a page via page_idx.
-                        # curr_block_coord[2][0] is the flat q-head index (0..nheads_q-1).
-                        # Map to KV head via integer divide (contiguous GQA grouping, matches
-                        # flash_fwd_sm100 convention). Modulo would alias heads for GQA.
+                        # Paged path: slice K/V by KV head, keep num_pages dim for page_idx-based TMA.
                         head_kv_coord = curr_block_coord[2][0] // self.qhead_per_kvhead
                         mK_kdl_ = mK_kdl[None, None, head_kv_coord, None]
                         mV_dkl_ = mV_dkl[None, None, head_kv_coord, None]
@@ -952,12 +940,6 @@ class BlackwellFusedMultiHeadAttentionForward:
                             tma_bar_ptr=q_handle.barrier,
                         )
 
-                    # TMA load path for K and V tiles.
-                    # Dense:  tKgK[None, kv_coord, iter]       — kv_coord selects the seqlen block
-                    # Paged:  tKgK[None, 0, iter, k_page_idx]  — page_idx selects the physical page,
-                    #         iter selects the 128-wide k-subtile (mode 2), block is always 0 (mode 1)
-                    #         since each page IS one tile_n block. V follows the same pattern with
-                    #         transposed mode order.
                     # K0
                     kv_coord = seqlen_kv_loop_start
                     k_page_idx = (

@@ -171,12 +171,7 @@ class PagedKVManager(ParamsBase):
 
     @cute.jit
     def _flatten_smem_sm100(self, sX: cute.Tensor, K_or_V: str):
-        """Flatten hierarchical SM100 smem layout to 2D and transpose V.
-
-        SM100 smem has shape ((a, b), cta_split, k_dim). This flattens to
-        (a, (b, k_dim)) by dropping mode 1 (the 2CTA split), then transposes
-        V to match its transposed gmem layout (d, page_size).
-        """
+        """Flatten SM100 smem ((a,b), cta_split, k) to (a,(b,k)); transpose V to (d,page_size)."""
         sX_pi = cute.make_tensor(
             sX.iterator,
             cute.make_layout(

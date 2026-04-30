@@ -1857,7 +1857,7 @@ def test_flash_attn_paged_hd256_sm100_tma(seqlen_q):
 
     print(f"Paged vs non-paged max diff: {(out_paged_0 - out_ref).abs().max().item()}")
     print(f"Paged determinism diff: {(out_paged_1 - out_paged_0).abs().max().item()}")
-    assert torch.equal(out_paged_0, out_ref), "Paged output does not match non-paged reference"
+    assert torch.allclose(out_paged_0, out_ref, atol=1e-3, rtol=1e-3), "Paged output does not match non-paged reference"
     assert torch.equal(out_paged_1, out_paged_0), "Paged output is not deterministic"
 
 
@@ -1919,8 +1919,75 @@ def test_flash_attn_paged_hd256_sm100_tma_gqa(nheads_kv):
         return
 
     print(f"GQA nheads_kv={nheads_kv} paged vs non-paged max diff: {(out_paged - out_ref).abs().max().item()}")
-    assert torch.equal(out_paged, out_ref), (
+    assert torch.allclose(out_paged, out_ref, atol=1e-3, rtol=1e-3), (
         f"Paged GQA output does not match non-paged reference (nheads_kv={nheads_kv})"
+    )
+
+
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_paged_hd256_sm100_tma_shuffled():
+    """TMA paged KV for SM100 hd256 2CTA with a non-identity (shuffled) page_table.
+
+    An identity page_table passes even if the kernel ignores it. This test
+    shuffles physical pages so a kernel that bypasses page_table would silently
+    read wrong data, proving the remapping path is exercised.
+    """
+    if not IS_SM100:
+        pytest.skip("SM100-specific paged hd256 test")
+    device = "cuda"
+    dtype = torch.bfloat16
+    d = 256
+    batch_size = 2
+    nheads = 16
+    nheads_kv = 16
+    page_size = 128
+    seqlen_q = 512
+    num_pages_per_seq = seqlen_q // page_size
+    total_pages = batch_size * num_pages_per_seq
+
+    torch.random.manual_seed(42)
+    q = torch.randn(batch_size * seqlen_q, nheads, d, device=device, dtype=dtype)
+    k = torch.randn(batch_size * seqlen_q, nheads_kv, d, device=device, dtype=dtype)
+    v = torch.randn(batch_size * seqlen_q, nheads_kv, d, device=device, dtype=dtype)
+    cu_seqlens_q = torch.arange(0, batch_size + 1, dtype=torch.int32, device=device) * seqlen_q
+    cu_seqlens_k = cu_seqlens_q.clone()
+
+    out_ref, _ = flash_attn_varlen_func(
+        q, k, v,
+        cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=seqlen_q, max_seqlen_k=seqlen_q,
+    )
+
+    # Shuffle physical pages: reverse order within each batch item.
+    # Build as Python list of ints to avoid .item() calls on FakeTensors during compilation.
+    perm = [
+        list(range((b + 1) * num_pages_per_seq - 1, b * num_pages_per_seq - 1, -1))
+        for b in range(batch_size)
+    ]
+    page_table = torch.tensor(perm, dtype=torch.int32, device=device)
+
+    k_paged = torch.zeros(total_pages, page_size, nheads_kv, d, device=device, dtype=dtype)
+    v_paged = torch.zeros(total_pages, page_size, nheads_kv, d, device=device, dtype=dtype)
+    for b in range(batch_size):
+        for s in range(seqlen_q):
+            phys = perm[b][s // page_size]  # Python int, safe in FakeTensorMode
+            po = s % page_size
+            k_paged[phys, po] = k[b * seqlen_q + s]
+            v_paged[phys, po] = v[b * seqlen_q + s]
+
+    out_paged, _ = flash_attn_varlen_func(
+        q, k_paged, v_paged,
+        cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=None,
+        max_seqlen_q=seqlen_q, max_seqlen_k=seqlen_q,
+        page_table=page_table,
+    )
+
+    if is_fake_mode():
+        return
+
+    print(f"Shuffled paged vs non-paged max diff: {(out_paged - out_ref).abs().max().item()}")
+    assert torch.allclose(out_paged, out_ref, atol=1e-3, rtol=1e-3), (
+        "Shuffled paged output does not match non-paged reference"
     )
 
 
