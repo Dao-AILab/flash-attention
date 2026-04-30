@@ -59,7 +59,7 @@ for seqlen in [s * 1024 for s in [1, 2, 4, 8, 16, 32, 64]]:
     for page_size in page_sizes:
         if page_size is None:
             # Non-paged baseline
-            fn = lambda: flash_attn_varlen_func(
+            fn = lambda: flash_attn_varlen_func(  # noqa: E731
                 q, k, v, qv=qv,
                 cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
                 max_seqlen_q=seqlen_q, max_seqlen_k=seqlen,
@@ -85,7 +85,7 @@ for seqlen in [s * 1024 for s in [1, 2, 4, 8, 16, 32, 64]]:
                     page_table[b, p] = page_idx
             seqused_k = torch.full((batch_size,), seqlen, dtype=torch.int32, device=device)
 
-            fn = lambda kp=k_paged, vp=v_paged, pt=page_table, su=seqused_k: flash_attn_varlen_func(
+            fn = lambda kp=k_paged, vp=v_paged, pt=page_table, su=seqused_k: flash_attn_varlen_func(  # noqa: E731
                 q, kp, vp, qv=qv,
                 cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=None,
                 max_seqlen_q=seqlen_q, max_seqlen_k=None,

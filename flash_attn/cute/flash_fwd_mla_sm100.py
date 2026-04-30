@@ -1738,15 +1738,21 @@ class FlashAttentionMLAForwardSm100:
                 #   prologue(K,V0,V1) + mainloop×(N-1)(K,V0,V1,Vt0,Vt1) + epilogue(Vt0,Vt1)
                 n_block_first = n_block_max - 1
                 n_block = n_block_first
+                # Clamp to 0 when num_n_blocks == 0 (empty tile) so that
+                # load_page_table never receives a negative n_block.  paged_kv.py's
+                # validity check (0 <= row_idx < seqlen_k) then marks every entry
+                # invalid, falling back to page 0; the consumer's mask_seqlen=True
+                # zeroes the result.
+                safe_n_block_first = n_block_first if num_n_blocks > 0 else 0
 
                 # ==== Prologue ====
                 # load_page_table must be called directly in loop body, not inside
                 # cpasync_paged_load_KV, to avoid MLIR SSA region crossing errors.
-                paged_kv_K.load_page_table(n_block_first)
+                paged_kv_K.load_page_table(safe_n_block_first)
                 producer_state_K = load_K(n_block_first, producer_state_K)
-                paged_kv_V0.load_page_table(n_block_first)
+                paged_kv_V0.load_page_table(safe_n_block_first)
                 producer_state_V0 = load_V0(n_block_first, producer_state_V0)
-                paged_kv_V1.load_page_table(n_block_first)
+                paged_kv_V1.load_page_table(safe_n_block_first)
                 producer_state_V1 = load_V1(n_block_first, producer_state_V1)
 
                 if const_expr(self.use_tma_O and self.overlap_sO_sV):
@@ -2192,8 +2198,13 @@ class FlashAttentionMLAForwardSm100:
             if const_expr(self.use_tma_KV):
                 # ==== Prologue ====
                 n_block_first = n_block_max - 1
+                # Clamp to 0 when num_n_blocks == 0 (empty tile) to avoid a
+                # negative index into the page table.  The consumer's first
+                # iteration carries mask_seqlen=True which zeroes the output,
+                # so the garbage data loaded from page 0 is never used.
+                safe_n_block_first = n_block_first if num_n_blocks > 0 else 0
                 page_idx = (
-                    mPageTable[batch_idx, n_block_first]
+                    mPageTable[batch_idx, safe_n_block_first]
                     if const_expr(mPageTable is not None)
                     else None
                 )

@@ -147,7 +147,7 @@ class PagedKVManager(ParamsBase):
 
             is_valid = (
                 (i + 1) * self.num_threads <= self.n_block_size or row < self.n_block_size
-            ) and row_idx < self.seqlen_k
+            ) and 0 <= row_idx < self.seqlen_k
             page = self.mPageTable[page_idx] if is_valid else 0
 
             self.tPrPage[i] = page
