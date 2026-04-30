@@ -261,3 +261,34 @@ class PackGQA:
                         mO_cur_copy[None, ki],
                         pred=tOpO[None, m, k] if cutlass.const_expr(self.check_hdim_oob) else None,
                     )
+
+    @cute.jit
+    def store_O_splitkv(
+        self,
+        mO: cute.Tensor,
+        acc_O: cute.Tensor,
+        tiled_mma: cute.TiledMma,
+        tidx: cutlass.Int32,
+        block: cutlass.Int32,
+        seqlen: cutlass.Int32,
+        head_idx_kv: cutlass.Int32,
+    ):
+        # Writing acc_O directly to gmem for packgqa + splitkv in sm90
+        thr_mma = tiled_mma.get_slice(tidx)
+        cO = cute.make_identity_tensor((self.m_block_size, self.head_dim_padded))
+        taccOcO = layout_utils.reshape_acc_to_mn(thr_mma.partition_C(cO))
+        t0accOcO = layout_utils.reshape_acc_to_mn(thr_mma.get_slice(0).partition_C(cO))
+        taccOrO = layout_utils.reshape_acc_to_mn(acc_O)
+        for r in cutlass.range_constexpr(cute.size(taccOrO.shape[0])):
+            if (
+                t0accOcO[r, 0][0]
+                < seqlen * self.qhead_per_kvhead - block * self.m_block_size - taccOcO[0][0]
+            ):
+                row = taccOcO[r, 0][0]
+                packed_idx = block * self.m_block_size + row
+                m_idx = packed_idx // self.qhead_per_kvhead
+                h_idx = packed_idx - m_idx * self.qhead_per_kvhead
+                for c in cutlass.range_constexpr(cute.size(taccOrO.shape[1])):
+                    col = taccOcO[r, c][1]
+                    if cutlass.const_expr(not self.check_hdim_oob) or col < mO.shape[1]:
+                        mO[(h_idx, m_idx), col, head_idx_kv] = taccOrO[r, c]
