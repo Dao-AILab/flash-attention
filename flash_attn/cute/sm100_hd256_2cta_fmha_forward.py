@@ -958,14 +958,20 @@ class BlackwellFusedMultiHeadAttentionForward:
                             tma_bar_ptr=k_handle.barrier,
                         )
                     kv_coord += 1
+                    # v_page_idx_prev carries K[i-1]'s page index for use as V[i-1]'s page
+                    # (K and V for the same KV block share the same physical page).
+                    # Also serves as the Vend page index when seqlen_kv_loop_steps == 1.
+                    v_page_idx_prev = (
+                        k_page_idx if cutlass.const_expr(mPageTable is not None) else None
+                    )
+                    # Prefetch K1 page after K0 TMA dispatch to hide L2 latency.
+                    if cutlass.const_expr(mPageTable is not None):
+                        if seqlen_kv_loop_steps > 1:
+                            k_page_idx = mPageTable[batch_coord, kv_coord]
 
                     for i in cutlass.range(1, seqlen_kv_loop_steps, 1, unroll=1):
-                        # Ki
-                        k_page_idx = (
-                            mPageTable[batch_coord, kv_coord]
-                            if cutlass.const_expr(mPageTable is not None)
-                            else None
-                        )
+                        # Ki: k_page_idx was prefetched at end of previous iteration
+                        # (or in the prologue for i==1); L2 latency already hidden.
                         for iter in cutlass.range(self.iterations_qk, unroll=1):
                             k_handle = load_kv_producer.acquire_and_advance()
                             cute.copy(
@@ -976,36 +982,33 @@ class BlackwellFusedMultiHeadAttentionForward:
                                 tKsK[None, k_handle.index],
                                 tma_bar_ptr=k_handle.barrier,
                             )
-                        # Vi-1
-                        v_page_idx = (
-                            mPageTable[batch_coord, kv_coord - 1]
-                            if cutlass.const_expr(mPageTable is not None)
-                            else None
-                        )
+                        # Vi-1: reuse v_page_idx_prev (= K[i-1]'s page), no extra GMEM read.
                         for iter in cutlass.range(self.iterations_pv, unroll=1):
                             v_handle = load_kv_producer.acquire_and_advance()
                             cute.copy(
                                 tma_atom_v,
                                 tVgV[None, iter, kv_coord - 1]
                                 if cutlass.const_expr(mPageTable is None)
-                                else tVgV[None, iter, 0, v_page_idx],
+                                else tVgV[None, iter, 0, v_page_idx_prev],
                                 tVsV[None, v_handle.index],
                                 tma_bar_ptr=v_handle.barrier,
                             )
+                        v_page_idx_prev = (
+                            k_page_idx if cutlass.const_expr(mPageTable is not None) else None
+                        )
                         kv_coord += 1
-                    # Vend
-                    v_page_idx = (
-                        mPageTable[batch_coord, seqlen_kv_loop_end - 1]
-                        if cutlass.const_expr(mPageTable is not None)
-                        else None
-                    )
+                        # Prefetch next K page while V TMA is in flight.
+                        if cutlass.const_expr(mPageTable is not None):
+                            if kv_coord < seqlen_kv_loop_end:
+                                k_page_idx = mPageTable[batch_coord, kv_coord]
+                    # Vend: reuse v_page_idx_prev (= K[end-1]'s page), no extra GMEM read.
                     for iter in cutlass.range(self.iterations_pv, unroll=1):
                         v_handle = load_kv_producer.acquire_and_advance()
                         cute.copy(
                             tma_atom_v,
                             tVgV[None, iter, seqlen_kv_loop_end - 1]
                             if cutlass.const_expr(mPageTable is None)
-                            else tVgV[None, iter, 0, v_page_idx],
+                            else tVgV[None, iter, 0, v_page_idx_prev],
                             tVsV[None, v_handle.index],
                             tma_bar_ptr=v_handle.barrier,
                         )
