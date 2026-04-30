@@ -11,6 +11,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int64, Int32, Uint32, Boolean, const_expr
+from cutlass.cute import FastDivmodDivisor
 import cutlass.pipeline as pipeline
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.cute.runtime import from_dlpack
@@ -20,6 +21,8 @@ from cutlass.utils import ClcDynamicPersistentTileScheduler
 from quack import copy_utils
 
 from flash_attn.cute.pack_gqa import pack_gqa_layout, make_packgqa_tiled_tma_atom
+from flash_attn.cute.paged_kv import PagedKVManager
+from flash_attn.cute import utils
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute.mask import AttentionMask
@@ -370,9 +373,6 @@ class FlashAttentionMLAForwardSm100:
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
-        # ==== asserts for unimplemented features ====
-        assert mPageTable is None, "page table tbd for MLA"
-
         # ==== dtype info ====
         self.dtype_Q = mQ.element_type
         self.dtype_K = mK.element_type
@@ -610,7 +610,9 @@ class FlashAttentionMLAForwardSm100:
             if const_expr(mCuSeqlensQ is None)
             else cute.size(mCuSeqlensQ.shape[0] - 1),
             num_splits=1,  # todo: split_kv
-            seqlen_k=cute.size(mK.shape[0]),  # todo: page table
+            seqlen_k=cute.size(mK.shape[0])
+            if const_expr(mPageTable is None)
+            else cute.size(mK.shape[0]) * cute.size(mPageTable.shape[1]),
             headdim=self.hdim,
             headdim_v=self.hdimv,
             total_q=cute.size(mQ.shape[0])
@@ -709,6 +711,7 @@ class FlashAttentionMLAForwardSm100:
             topk_length_dynamic,
             tile_sched_params,
             SharedStorage,
+            mPageTable,
         ).launch(
             grid=grid_dim,
             block=(
@@ -767,6 +770,7 @@ class FlashAttentionMLAForwardSm100:
         topk_length_dynamic: Optional[Int32],
         tile_sched_params: ParamsBase,
         SharedStorage: cutlass.Constexpr[Callable],
+        mPageTable: Optional[cute.Tensor] = None,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         cta_layout_vmnk = cute.tiled_divide(
@@ -936,7 +940,9 @@ class FlashAttentionMLAForwardSm100:
         SeqlenInfoCls = partial(
             SeqlenInfoQK.create,
             seqlen_q_static=mQ.shape[0] if const_expr(not self.pack_gqa) else mQ.shape[0][1],
-            seqlen_k_static=mK.shape[0],
+            seqlen_k_static=mK.shape[0]
+            if const_expr(mPageTable is None)
+            else mK.shape[0] * mPageTable.shape[1],
             tile_m=self.cta_tile_m,
             tile_n=self.tile_n,
             mCuSeqlensQ=mCuSeqlensQ,
@@ -1054,6 +1060,7 @@ class FlashAttentionMLAForwardSm100:
                     block_info,
                     SeqlenInfoCls,
                     tile_scheduler=tile_scheduler,
+                    mPageTable=mPageTable,
                 )
 
         if warp_idx == self.load_warp_id:
@@ -1098,6 +1105,7 @@ class FlashAttentionMLAForwardSm100:
                 block_info,
                 SeqlenInfoCls,
                 tile_scheduler=tile_scheduler,
+                mPageTable=mPageTable,
             )
 
         if warp_idx == self.mma_warp_id:
@@ -1331,6 +1339,7 @@ class FlashAttentionMLAForwardSm100:
         pipeline_cpasync.consumer_wait(consumer_state)
         with cute.arch.elect_one():
             pipeline_mma.producer_commit(producer_state)
+        pipeline_cpasync.consumer_release(consumer_state)
         consumer_state.advance()
         producer_state.advance()
         return consumer_state, producer_state
@@ -1362,14 +1371,14 @@ class FlashAttentionMLAForwardSm100:
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
         tile_scheduler: TileSchedulerProtocol,
+        mPageTable: Optional[cute.Tensor] = None,
     ):
         # ==== cpasync load warpgroup ====
         # Description: loads tiles of K, V, V0, V1 from gmem to smem using cpasync
         # produces: K, V, V0, V1, bitmask
         # consumes: -
 
-        # TODO: use cpasync for non-topk paged attn
-        assert sBitmask is not None, "cpasync load meant to be used with topk gather"
+        # cpasync load is used for both topk gather and paged KV with page_size != tile_n
         cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         tidx = cute.arch.thread_idx()[0] % self.num_cpasync_load_threads
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % (
@@ -1388,7 +1397,7 @@ class FlashAttentionMLAForwardSm100:
         producer_state_V1 = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Producer, stages=self.num_stages_Vi
         )
-        if const_expr(not self.disable_bitmask):
+        if const_expr(self.is_topk_gather and not self.disable_bitmask):
             producer_state_bitmask = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer,
                 stages=self.num_stages_bitmask,
@@ -1417,164 +1426,360 @@ class FlashAttentionMLAForwardSm100:
             num_n_blocks = n_block_max - n_block_min
             num_n_block_groups = cute.ceil_div(num_n_blocks, self.num_stages_S)
 
-            # cluster_m_block == m_idx under MQA 128 assumption
-            m_idx = cluster_m_block
-            if const_expr(not seqlen.has_cu_seqlens_q):
-                mIndexTopk_cur = mIndexTopk[None, m_idx, batch_idx]
-            else:
-                offset_q = seqlen.offset_q
-                mIndexTopk_cur = mIndexTopk[None, m_idx + offset_q]
+            if const_expr(self.is_topk_gather):
+                # ==== Topk gather path ====
+                # cluster_m_block == m_idx under MQA 128 assumption
+                m_idx = cluster_m_block
+                if const_expr(not seqlen.has_cu_seqlens_q):
+                    mIndexTopk_cur = mIndexTopk[None, m_idx, batch_idx]
+                else:
+                    offset_q = seqlen.offset_q
+                    mIndexTopk_cur = mIndexTopk[None, m_idx + offset_q]
 
-            if const_expr(self.is_causal):
-                seqlen_k_limit = m_idx + 1 + seqlen.seqlen_k - seqlen.seqlen_q
-            else:
-                seqlen_k_limit = seqlen.seqlen_k
-            cpasync_gather_kv_manager = CpasyncGatherKVManager.create(
-                mIndexTopk_cur,
-                sBitmask,
-                cta_rank_in_cluster,
-                tidx,
-                warp_idx,
-                self.topk_length,
-                seqlen_k_limit,
-                self.tile_n,
-                self.hdim,
-                self.hdimv,
-                self.num_hdimv_splits,
-                self.num_cpasync_load_threads,
-                mK.element_type,
-                self.cta_group_size,
-                pipeline_bitmask,
-                self.num_stages_bitmask,
-                self.cpasync_barrier,
-                self.disable_bitmask,
-            )
-
-            # (seqlen_k, hdim) or (seqlen_k, hdimv//2)
-            mK_cur = seqlen.offset_batch_K(mK, batch_idx, dim=3)[None, None, head_idx_kv]
-            mV0_cur = seqlen.offset_batch_K(mV0, batch_idx, dim=3)[None, None, head_idx_kv]
-            mV1_cur = seqlen.offset_batch_K(mV1, batch_idx, dim=3)[None, None, head_idx_kv]
-            # (hdimv//2, seqlen_k)
-            if const_expr(not seqlen.has_cu_seqlens_k):
-                mVt0_cur = mVt0[None, None, head_idx_kv, batch_idx]
-                mVt1_cur = mVt1[None, None, head_idx_kv, batch_idx]
-            else:
-                mVt0_cur = cute.domain_offset((0, seqlen.offset_k), mVt0[None, None, head_idx_kv])
-                mVt1_cur = cute.domain_offset((0, seqlen.offset_k), mVt1[None, None, head_idx_kv])
-            # (hdimv//4, seqlen_k)
-            hdimv_split_per_cta = self.hdimv // self.num_hdimv_splits // self.cta_group_size
-            mVt0_cur = cute.tiled_divide(mVt0_cur, (hdimv_split_per_cta,))[
-                None, cta_rank_in_cluster, None
-            ]
-            mVt1_cur = cute.tiled_divide(mVt1_cur, (hdimv_split_per_cta,))[
-                None, cta_rank_in_cluster, None
-            ]
-
-            load_K = partial(
-                self.cpasync_gather_load_KV,
-                cpasync_gather_kv_manager,
-                pipeline_K,
-                pipeline_K_cpasync,
-                sK,
-                False,
-                "K",
-                mK_cur,
-            )
-            load_V0 = partial(
-                self.cpasync_gather_load_KV,
-                cpasync_gather_kv_manager,
-                pipeline_V0,
-                pipeline_V0_cpasync,
-                sV0,
-                False,
-                "V",
-                mV0_cur,
-            )
-            load_V1 = partial(
-                self.cpasync_gather_load_KV,
-                cpasync_gather_kv_manager,
-                pipeline_V1,
-                pipeline_V1_cpasync,
-                sV1,
-                False,
-                "V",
-                mV1_cur,
-            )
-            load_Vt0 = partial(
-                self.cpasync_gather_load_KV,
-                cpasync_gather_kv_manager,
-                pipeline_V0,
-                pipeline_V0_cpasync,
-                sVt0,
-                True,
-                "V",
-                mVt0_cur,
-            )
-            load_Vt1 = partial(
-                self.cpasync_gather_load_KV,
-                cpasync_gather_kv_manager,
-                pipeline_V1,
-                pipeline_V1_cpasync,
-                sVt1,
-                True,
-                "V",
-                mVt1_cur,
-            )
-
-            # gather KV path processes n_blocks in increasing order
-            n_block = 0
-
-            # ==== Prologue ====
-            # K, V0, V1
-            cpasync_gather_kv_manager.load_index_topk(n_block, transpose=False)
-            producer_state_K = load_K(producer_state_K)
-            producer_state_V0 = load_V0(producer_state_V0)
-            producer_state_V1 = load_V1(producer_state_V1)
-            if const_expr(not self.disable_bitmask):
-                producer_state_bitmask = cpasync_gather_kv_manager.compute_bitmask(
-                    producer_state_bitmask
+                if const_expr(self.is_causal):
+                    seqlen_k_limit = m_idx + 1 + seqlen.seqlen_k - seqlen.seqlen_q
+                else:
+                    seqlen_k_limit = seqlen.seqlen_k
+                cpasync_gather_kv_manager = CpasyncGatherKVManager.create(
+                    mIndexTopk_cur,
+                    sBitmask,
+                    cta_rank_in_cluster,
+                    tidx,
+                    warp_idx,
+                    self.topk_length,
+                    seqlen_k_limit,
+                    self.tile_n,
+                    self.hdim,
+                    self.hdimv,
+                    self.num_hdimv_splits,
+                    self.num_cpasync_load_threads,
+                    mK.element_type,
+                    self.cta_group_size,
+                    pipeline_bitmask,
+                    self.num_stages_bitmask,
+                    self.cpasync_barrier,
+                    self.disable_bitmask,
                 )
 
-            if const_expr(self.use_tma_O and self.overlap_sO_sV):
-                cute.arch.mbarrier_wait(sO_empty_mbar_ptr, phase=producer_phase_O)
-                producer_phase_O ^= 1
+                # (seqlen_k, hdim) or (seqlen_k, hdimv//2)
+                mK_cur = seqlen.offset_batch_K(mK, batch_idx, dim=3)[None, None, head_idx_kv]
+                mV0_cur = seqlen.offset_batch_K(mV0, batch_idx, dim=3)[None, None, head_idx_kv]
+                mV1_cur = seqlen.offset_batch_K(mV1, batch_idx, dim=3)[None, None, head_idx_kv]
+                # (hdimv//2, seqlen_k)
+                if const_expr(not seqlen.has_cu_seqlens_k):
+                    mVt0_cur = mVt0[None, None, head_idx_kv, batch_idx]
+                    mVt1_cur = mVt1[None, None, head_idx_kv, batch_idx]
+                else:
+                    mVt0_cur = cute.domain_offset(
+                        (0, seqlen.offset_k), mVt0[None, None, head_idx_kv]
+                    )
+                    mVt1_cur = cute.domain_offset(
+                        (0, seqlen.offset_k), mVt1[None, None, head_idx_kv]
+                    )
+                # (hdimv//4, seqlen_k)
+                hdimv_split_per_cta = self.hdimv // self.num_hdimv_splits // self.cta_group_size
+                mVt0_cur = cute.tiled_divide(mVt0_cur, (hdimv_split_per_cta,))[
+                    None, cta_rank_in_cluster, None
+                ]
+                mVt1_cur = cute.tiled_divide(mVt1_cur, (hdimv_split_per_cta,))[
+                    None, cta_rank_in_cluster, None
+                ]
 
-            # ==== Mainloop ====
-            for n_block_group in cutlass.range(num_n_block_groups - 1, unroll=1):
+                load_K = partial(
+                    self.cpasync_gather_load_KV,
+                    cpasync_gather_kv_manager,
+                    pipeline_K,
+                    pipeline_K_cpasync,
+                    sK,
+                    False,
+                    "K",
+                    mK_cur,
+                )
+                load_V0 = partial(
+                    self.cpasync_gather_load_KV,
+                    cpasync_gather_kv_manager,
+                    pipeline_V0,
+                    pipeline_V0_cpasync,
+                    sV0,
+                    False,
+                    "V",
+                    mV0_cur,
+                )
+                load_V1 = partial(
+                    self.cpasync_gather_load_KV,
+                    cpasync_gather_kv_manager,
+                    pipeline_V1,
+                    pipeline_V1_cpasync,
+                    sV1,
+                    False,
+                    "V",
+                    mV1_cur,
+                )
+                load_Vt0 = partial(
+                    self.cpasync_gather_load_KV,
+                    cpasync_gather_kv_manager,
+                    pipeline_V0,
+                    pipeline_V0_cpasync,
+                    sVt0,
+                    True,
+                    "V",
+                    mVt0_cur,
+                )
+                load_Vt1 = partial(
+                    self.cpasync_gather_load_KV,
+                    cpasync_gather_kv_manager,
+                    pipeline_V1,
+                    pipeline_V1_cpasync,
+                    sVt1,
+                    True,
+                    "V",
+                    mVt1_cur,
+                )
+
+                # gather KV path processes n_blocks in increasing order
+                n_block = 0
+
+                # ==== Prologue ====
+                # K, V0, V1
+                cpasync_gather_kv_manager.load_index_topk(n_block, transpose=False)
+                producer_state_K = load_K(producer_state_K)
+                producer_state_V0 = load_V0(producer_state_V0)
+                producer_state_V1 = load_V1(producer_state_V1)
+                if const_expr(not self.disable_bitmask):
+                    producer_state_bitmask = cpasync_gather_kv_manager.compute_bitmask(
+                        producer_state_bitmask
+                    )
+
+                if const_expr(self.use_tma_O and self.overlap_sO_sV):
+                    cute.arch.mbarrier_wait(sO_empty_mbar_ptr, phase=producer_phase_O)
+                    producer_phase_O ^= 1
+
+                # ==== Mainloop ====
+                for n_block_group in cutlass.range(num_n_block_groups - 1, unroll=1):
+                    for stage in cutlass.range_constexpr(self.num_stages_S):
+                        n_block = n_block_group * self.num_stages_S + stage
+                        # K, V0, V1
+                        cpasync_gather_kv_manager.load_index_topk(n_block + 1, transpose=False)
+                        producer_state_K = load_K(producer_state_K)
+                        producer_state_V0 = load_V0(producer_state_V0)
+                        producer_state_V1 = load_V1(producer_state_V1)
+                        if const_expr(not self.disable_bitmask):
+                            producer_state_bitmask = cpasync_gather_kv_manager.compute_bitmask(
+                                producer_state_bitmask
+                            )
+                        # Vt0, Vt1
+                        cpasync_gather_kv_manager.load_index_topk(n_block, transpose=True)
+                        producer_state_V0 = load_Vt0(producer_state_V0)
+                        producer_state_V1 = load_Vt1(producer_state_V1)
+
+                # ==== Epilogue ====
                 for stage in cutlass.range_constexpr(self.num_stages_S):
-                    n_block = n_block_group * self.num_stages_S + stage
-                    # K, V0, V1
-                    cpasync_gather_kv_manager.load_index_topk(n_block + 1, transpose=False)
-                    producer_state_K = load_K(producer_state_K)
-                    producer_state_V0 = load_V0(producer_state_V0)
-                    producer_state_V1 = load_V1(producer_state_V1)
-                    if const_expr(not self.disable_bitmask):
-                        producer_state_bitmask = cpasync_gather_kv_manager.compute_bitmask(
-                            producer_state_bitmask
-                        )
+                    n_block = (num_n_block_groups - 1) * self.num_stages_S + stage
+                    if const_expr(stage == 0):
+                        # K, V0, V1
+                        cpasync_gather_kv_manager.load_index_topk(n_block + 1, transpose=False)
+                        producer_state_K = load_K(producer_state_K)
+                        producer_state_V0 = load_V0(producer_state_V0)
+                        producer_state_V1 = load_V1(producer_state_V1)
+                        if const_expr(not self.disable_bitmask):
+                            producer_state_bitmask = cpasync_gather_kv_manager.compute_bitmask(
+                                producer_state_bitmask
+                            )
+
                     # Vt0, Vt1
                     cpasync_gather_kv_manager.load_index_topk(n_block, transpose=True)
                     producer_state_V0 = load_Vt0(producer_state_V0)
                     producer_state_V1 = load_Vt1(producer_state_V1)
 
-            # ==== Epilogue ====
-            for stage in cutlass.range_constexpr(self.num_stages_S):
-                n_block = (num_n_block_groups - 1) * self.num_stages_S + stage
-                if const_expr(stage == 0):
-                    # K, V0, V1
-                    cpasync_gather_kv_manager.load_index_topk(n_block + 1, transpose=False)
-                    producer_state_K = load_K(producer_state_K)
-                    producer_state_V0 = load_V0(producer_state_V0)
-                    producer_state_V1 = load_V1(producer_state_V1)
-                    if const_expr(not self.disable_bitmask):
-                        producer_state_bitmask = cpasync_gather_kv_manager.compute_bitmask(
-                            producer_state_bitmask
-                        )
+            else:
+                # ==== Paged KV cp.async path (page_size != tile_n) ====
+                page_size_divmod = FastDivmodDivisor(cute.size(mK.shape[0]))
+                hdimv_split = self.hdimv // self.num_hdimv_splits
+                hdimv_split_per_cta = hdimv_split // self.cta_group_size
 
-                # Vt0, Vt1
-                cpasync_gather_kv_manager.load_index_topk(n_block, transpose=True)
-                producer_state_V0 = load_Vt0(producer_state_V0)
-                producer_state_V1 = load_Vt1(producer_state_V1)
+                # CTA-split Vt: (dv/2, page_size, h_k, num_pages) -> (dv/4, page_size, h_k, num_pages)
+                # Use domain_offset + make_tensor to get a flat-shaped tensor for PagedKVManager
+                mVt0_off = cute.domain_offset(
+                    (cta_rank_in_cluster * hdimv_split_per_cta, 0, 0, 0), mVt0
+                )
+                mVt0_cta = cute.make_tensor(
+                    mVt0_off.iterator,
+                    cute.make_layout(
+                        (hdimv_split_per_cta, mVt0.shape[1], mVt0.shape[2], mVt0.shape[3]),
+                        stride=mVt0.layout.stride,
+                    ),
+                )
+                mVt1_off = cute.domain_offset(
+                    (cta_rank_in_cluster * hdimv_split_per_cta, 0, 0, 0), mVt1
+                )
+                mVt1_cta = cute.make_tensor(
+                    mVt1_off.iterator,
+                    cute.make_layout(
+                        (hdimv_split_per_cta, mVt1.shape[1], mVt1.shape[2], mVt1.shape[3]),
+                        stride=mVt1.layout.stride,
+                    ),
+                )
+
+                # PagedKVManager for K (hdim=64): uses "K" mode only
+                paged_kv_K = PagedKVManager.create(
+                    mPageTable,
+                    mK,
+                    mK,
+                    page_size_divmod,
+                    batch_idx,
+                    head_idx_kv,
+                    tidx,
+                    seqlen.seqlen_k,
+                    0,
+                    self.tile_n,
+                    self.hdim,
+                    self.hdim,
+                    self.num_cpasync_load_threads,
+                    mK.element_type,
+                    arch=100,
+                )
+                # PagedKVManager for V0/Vt0: "K" mode → V0 (non-transposed), "V" mode → Vt0 (transposed)
+                paged_kv_V0 = PagedKVManager.create(
+                    mPageTable,
+                    mV0,
+                    mVt0_cta,
+                    page_size_divmod,
+                    batch_idx,
+                    head_idx_kv,
+                    tidx,
+                    seqlen.seqlen_k,
+                    0,
+                    self.tile_n,
+                    hdimv_split,
+                    hdimv_split_per_cta,
+                    self.num_cpasync_load_threads,
+                    mV0.element_type,
+                    arch=100,
+                )
+                # PagedKVManager for V1/Vt1: "K" mode → V1, "V" mode → Vt1
+                paged_kv_V1 = PagedKVManager.create(
+                    mPageTable,
+                    mV1,
+                    mVt1_cta,
+                    page_size_divmod,
+                    batch_idx,
+                    head_idx_kv,
+                    tidx,
+                    seqlen.seqlen_k,
+                    0,
+                    self.tile_n,
+                    hdimv_split,
+                    hdimv_split_per_cta,
+                    self.num_cpasync_load_threads,
+                    mV1.element_type,
+                    arch=100,
+                )
+
+                load_K = partial(
+                    self.cpasync_paged_load_KV,
+                    paged_kv_K,
+                    pipeline_K,
+                    pipeline_K_cpasync,
+                    sK,
+                    False,
+                    "K",
+                    cta_rank_in_cluster,
+                )
+                load_V0 = partial(
+                    self.cpasync_paged_load_KV,
+                    paged_kv_V0,
+                    pipeline_V0,
+                    pipeline_V0_cpasync,
+                    sV0,
+                    False,
+                    "K",
+                    cta_rank_in_cluster,
+                )
+                load_V1 = partial(
+                    self.cpasync_paged_load_KV,
+                    paged_kv_V1,
+                    pipeline_V1,
+                    pipeline_V1_cpasync,
+                    sV1,
+                    False,
+                    "K",
+                    cta_rank_in_cluster,
+                )
+                load_Vt0 = partial(
+                    self.cpasync_paged_load_KV,
+                    paged_kv_V0,
+                    pipeline_V0,
+                    pipeline_V0_cpasync,
+                    sVt0,
+                    True,
+                    "V",
+                    cta_rank_in_cluster,
+                )
+                load_Vt1 = partial(
+                    self.cpasync_paged_load_KV,
+                    paged_kv_V1,
+                    pipeline_V1,
+                    pipeline_V1_cpasync,
+                    sVt1,
+                    True,
+                    "V",
+                    cta_rank_in_cluster,
+                )
+
+                # Paged path must follow the same descending n_block order as the
+                # MLA TMA path (`n_block_max - 1` down to `n_block_min`). The MMA
+                # mainloop consumes KV tiles in that order, so ascending order
+                # produces multi-block numerical mismatches even when commit counts
+                # are otherwise correct.
+                #
+                # Pipeline commit counts must still match the relay exactly:
+                #   K = N, V0 = 2N, V1 = 2N  (N = num_n_blocks)
+                # This loop structure mirrors the relay's:
+                #   prologue(K,V0,V1) + mainloop×(N-1)(K,V0,V1,Vt0,Vt1) + epilogue(Vt0,Vt1)
+                n_block_first = n_block_max - 1
+                n_block = n_block_first
+                # Clamp to 0 when num_n_blocks == 0 (empty tile) so that
+                # load_page_table never receives a negative n_block.  paged_kv.py's
+                # validity check (0 <= row_idx < seqlen_k) then marks every entry
+                # invalid, falling back to page 0; the consumer's mask_seqlen=True
+                # zeroes the result.
+                safe_n_block_first = n_block_first if num_n_blocks > 0 else 0
+
+                # ==== Prologue ====
+                # load_page_table must be called directly in loop body, not inside
+                # cpasync_paged_load_KV, to avoid MLIR SSA region crossing errors.
+                paged_kv_K.load_page_table(safe_n_block_first)
+                producer_state_K = load_K(n_block_first, producer_state_K)
+                paged_kv_V0.load_page_table(safe_n_block_first)
+                producer_state_V0 = load_V0(n_block_first, producer_state_V0)
+                paged_kv_V1.load_page_table(safe_n_block_first)
+                producer_state_V1 = load_V1(n_block_first, producer_state_V1)
+
+                if const_expr(self.use_tma_O and self.overlap_sO_sV):
+                    cute.arch.mbarrier_wait(sO_empty_mbar_ptr, phase=producer_phase_O)
+                    producer_phase_O ^= 1
+
+                # ==== Mainloop ====
+                for n_idx in cutlass.range(num_n_blocks - 1, unroll=2):
+                    n_block = n_block_first - n_idx
+                    # K, V0, V1 for next block in descending order
+                    paged_kv_K.load_page_table(n_block - 1)
+                    producer_state_K = load_K(n_block - 1, producer_state_K)
+                    paged_kv_V0.load_page_table(n_block - 1)
+                    producer_state_V0 = load_V0(n_block - 1, producer_state_V0)
+                    paged_kv_V1.load_page_table(n_block - 1)
+                    producer_state_V1 = load_V1(n_block - 1, producer_state_V1)
+                    # Vt0, Vt1 for current block
+                    paged_kv_V0.load_page_table(n_block)
+                    producer_state_V0 = load_Vt0(n_block, producer_state_V0)
+                    paged_kv_V1.load_page_table(n_block)
+                    producer_state_V1 = load_Vt1(n_block, producer_state_V1)
+
+                # ==== Epilogue ====
+                paged_kv_V0.load_page_table(n_block_min)
+                producer_state_V0 = load_Vt0(n_block_min, producer_state_V0)
+                paged_kv_V1.load_page_table(n_block_min)
+                producer_state_V1 = load_Vt1(n_block_min, producer_state_V1)
 
             # Advance to next tile
             work_tile = tile_scheduler.advance_to_next_work()
@@ -1582,7 +1787,7 @@ class FlashAttentionMLAForwardSm100:
         pipeline_K_cpasync.producer_tail(producer_state_K)
         pipeline_V0_cpasync.producer_tail(producer_state_V0)
         pipeline_V1_cpasync.producer_tail(producer_state_V1)
-        if const_expr(not self.disable_bitmask):
+        if const_expr(self.is_topk_gather and not self.disable_bitmask):
             pipeline_bitmask.producer_tail(producer_state_bitmask)
 
     @cute.jit
@@ -1600,6 +1805,104 @@ class FlashAttentionMLAForwardSm100:
         stage, phase = producer_state.index, producer_state.phase
         pipeline_mma.producer_acquire(producer_state)
         cpasync_gather_kv_manager.load_X(mX, sX[None, None, None, stage], transpose, K_or_V)
+        cute.arch.cp_async_commit_group()
+        pipeline_cpasync.sync_object_full.arrive_cp_async_mbarrier(stage)
+        producer_state.advance()
+        return producer_state
+
+    @cute.jit
+    def cpasync_paged_load_KV(
+        self,
+        paged_kv_manager: PagedKVManager,
+        pipeline_mma: pipeline.PipelineAsyncUmma,
+        pipeline_cpasync: pipeline.PipelineAsync,
+        sX: cute.Tensor,
+        transpose: bool,
+        K_or_V: str,
+        cta_rank_in_cluster: Int32,
+        n_block: Int32,
+        producer_state: pipeline.PipelineState,
+    ):
+        """Load one tile of K or V from paged gmem to smem using cp.async.
+
+        Uses PagedKVManager for page table lookups and pointer computation,
+        with smem reshaping via cute.composition (same approach as CpasyncGatherKVManager).
+
+        For non-transposed tensors (K, V0, V1): K_or_V="K", transpose=False
+        For transposed tensors (Vt0, Vt1):      K_or_V="V", transpose=True
+        """
+        stage = producer_state.index
+        pipeline_mma.producer_acquire(producer_state)
+
+        # NOTE: load_page_table() must be called by the caller BEFORE this method.
+        # Calling it here (through a @cute.jit boundary) causes MLIR SSA verification
+        # errors because the rmem tensor writes inside load_page_table's dynamic
+        # cutlass.range loop cross region boundaries. This matches the SM90/SM100
+        # pattern where load_page_table is called directly in the loop body.
+
+        # Compute row pointers from cached page table entries
+        tPrXPtr = paged_kv_manager.compute_X_ptr(K_or_V)
+
+        # Reshape smem to flat 2D using composition (matches CpasyncGatherKVManager.load_X)
+        head_dim = (
+            paged_kv_manager.head_dim_v_padded
+            if const_expr(K_or_V == "V")
+            else paged_kv_manager.head_dim_padded
+        )
+        cta_tile_n = self.tile_n if const_expr(transpose) else self.tile_n // self.cta_group_size
+        order = (1, 0) if const_expr(transpose) else (0, 1)
+
+        sX_stage = sX[None, None, None, stage]
+        sX_nd_layout = cute.make_ordered_layout((cta_tile_n, head_dim), order=order)
+        sX_nd = cute.composition(sX_stage, sX_nd_layout)
+
+        cX = cute.make_identity_tensor((cta_tile_n, head_dim))
+        tXsX = paged_kv_manager.gmem_thr_copy_KV.partition_D(sX_nd)
+        tXcX = paged_kv_manager.gmem_thr_copy_KV.partition_S(cX)
+        tXc0X = paged_kv_manager.gmem_thr_copy_KV.get_slice(0).partition_S(cX)
+
+        seqlenk_row_limit = (
+            paged_kv_manager.seqlen_k - n_block * self.tile_n - tXcX[0][0] if n_block >= 0 else 0
+        )
+
+        if const_expr(not transpose):
+            offset = cta_rank_in_cluster * (
+                paged_kv_manager.gmem_threads_per_row // self.cta_group_size
+            )
+        else:
+            offset = 0
+
+        for m in cutlass.range_constexpr(cute.size(tXsX, mode=[1])):
+            row_valid = tXc0X[0, m, 0][0] < seqlenk_row_limit
+            should_load = cute.make_fragment_like(tXsX[(0, None), m, 0], cute.Boolean)
+            should_load.fill(row_valid)
+
+            x_ptr_i64 = utils.shuffle_sync(
+                tPrXPtr[m // paged_kv_manager.gmem_threads_per_row],
+                (m + offset) % paged_kv_manager.gmem_threads_per_row,
+                width=paged_kv_manager.gmem_threads_per_row,
+            )
+            x_gmem_ptr = cute.make_ptr(
+                paged_kv_manager.mK_paged.element_type,
+                x_ptr_i64,
+                cute.AddressSpace.gmem,
+                assumed_align=16,
+            )
+            mX_cur = cute.make_tensor(x_gmem_ptr, cute.make_layout((head_dim,)))
+            mX_cur_copy = cute.tiled_divide(mX_cur, (paged_kv_manager.async_copy_elems,))
+
+            for k in cutlass.range_constexpr(cute.size(tXsX, mode=[2])):
+                ki = tXcX[0, 0, k][1] // paged_kv_manager.async_copy_elems
+                mX_cur_copy_ki = mX_cur_copy[None, ki]
+                tXsX_k = tXsX[None, m, k]
+                mX_cur_copy_ki = cute.make_tensor(mX_cur_copy_ki.iterator, tXsX_k.layout)
+                cute.copy(
+                    paged_kv_manager.gmem_tiled_copy_KV,
+                    mX_cur_copy_ki,
+                    tXsX_k,
+                    pred=should_load,
+                )
+
         cute.arch.cp_async_commit_group()
         pipeline_cpasync.sync_object_full.arrive_cp_async_mbarrier(stage)
         producer_state.advance()
@@ -1646,6 +1949,7 @@ class FlashAttentionMLAForwardSm100:
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
         tile_scheduler: TileSchedulerProtocol,
+        mPageTable: Optional[cute.Tensor] = None,
     ):
         # ==== Load warp ====
         # Description: loads tiles of Q, Qv, K, V, V0, V1 from gmem to smem using TMA
@@ -1758,48 +2062,86 @@ class FlashAttentionMLAForwardSm100:
             )
 
             if const_expr(self.use_tma_KV):
-                # (seqlen_k, hdim) or (seqlen_k, hdimv//2)
-                mK_cur = seqlen.offset_batch_K(mK, batch_idx, dim=3)[None, None, head_idx_kv]
-                mVs_cur = [
-                    seqlen.offset_batch_K(mVs[split], batch_idx, dim=3)[None, None, head_idx_kv]
-                    for split in range(self.num_hdimv_splits)
-                ]
-                # (hdimv//2, seqlen_k)
-                if const_expr(not seqlen.has_cu_seqlens_k):
-                    mVts_cur = [
-                        mVts[split][None, None, head_idx_kv, batch_idx]
+                if const_expr(mPageTable is None):
+                    # Non-paged: select batch, tile over seqlen_k
+                    # (seqlen_k, hdim) or (seqlen_k, hdimv//2)
+                    mK_cur = seqlen.offset_batch_K(mK, batch_idx, dim=3)[None, None, head_idx_kv]
+                    mVs_cur = [
+                        seqlen.offset_batch_K(mVs[split], batch_idx, dim=3)[None, None, head_idx_kv]
                         for split in range(self.num_hdimv_splits)
                     ]
-                else:
-                    mVts_cur = [
-                        cute.domain_offset(
-                            (0, seqlen.offset_k), mVts[split][None, None, head_idx_kv]
+                    # (hdimv//2, seqlen_k)
+                    if const_expr(not seqlen.has_cu_seqlens_k):
+                        mVts_cur = [
+                            mVts[split][None, None, head_idx_kv, batch_idx]
+                            for split in range(self.num_hdimv_splits)
+                        ]
+                    else:
+                        mVts_cur = [
+                            cute.domain_offset(
+                                (0, seqlen.offset_k), mVts[split][None, None, head_idx_kv]
+                            )
+                            for split in range(self.num_hdimv_splits)
+                        ]
+                    # (tile_n, hdim or hdimv//2, num_n_blocks)
+                    gK = cute.local_tile(
+                        mK_cur,
+                        (self.mma_tiler_QK[1], self.mma_tiler_QK[2]),
+                        (None, 0),
+                    )
+                    gVs = [
+                        cute.local_tile(
+                            mVs_cur[split],
+                            (self.mma_tiler_QviVi[1], self.mma_tiler_QviVi[2]),
+                            (None, 0),
                         )
                         for split in range(self.num_hdimv_splits)
                     ]
-                # (tile_n, hdim or hdimv//2, num_n_blocks)
-                gK = cute.local_tile(
-                    mK_cur,
-                    (self.mma_tiler_QK[1], self.mma_tiler_QK[2]),
-                    (None, 0),
-                )
-                gVs = [
-                    cute.local_tile(
-                        mVs_cur[split],
-                        (self.mma_tiler_QviVi[1], self.mma_tiler_QviVi[2]),
-                        (None, 0),
+                    # (hdim or hdimv//2, tile_n, num_n_blocks)
+                    gVts = [
+                        cute.local_tile(
+                            mVts_cur[split],
+                            (self.mma_tiler_PVti[1], self.mma_tiler_PVti[2]),
+                            (0, None),
+                        )
+                        for split in range(self.num_hdimv_splits)
+                    ]
+                else:
+                    # Paged KV: keep pages dim, index by page_idx at load time
+                    # (page_size, hdim, num_pages) or (page_size, hdimv//2, num_pages)
+                    mK_cur = mK[None, None, head_idx_kv, None]
+                    mVs_cur = [
+                        mVs[split][None, None, head_idx_kv, None]
+                        for split in range(self.num_hdimv_splits)
+                    ]
+                    # (hdimv//2, page_size, num_pages)
+                    mVts_cur = [
+                        mVts[split][None, None, head_idx_kv, None]
+                        for split in range(self.num_hdimv_splits)
+                    ]
+                    # (tile_n, hdim or hdimv//2, 1, num_pages)
+                    gK = cute.local_tile(
+                        mK_cur,
+                        (self.mma_tiler_QK[1], self.mma_tiler_QK[2]),
+                        (None, 0, None),
                     )
-                    for split in range(self.num_hdimv_splits)
-                ]
-                # (hdim or hdimv//2, tile_n, num_n_blocks)
-                gVts = [
-                    cute.local_tile(
-                        mVts_cur[split],
-                        (self.mma_tiler_PVti[1], self.mma_tiler_PVti[2]),
-                        (0, None),
-                    )
-                    for split in range(self.num_hdimv_splits)
-                ]
+                    gVs = [
+                        cute.local_tile(
+                            mVs_cur[split],
+                            (self.mma_tiler_QviVi[1], self.mma_tiler_QviVi[2]),
+                            (None, 0, None),
+                        )
+                        for split in range(self.num_hdimv_splits)
+                    ]
+                    # (hdim or hdimv//2, tile_n, 1, num_pages)
+                    gVts = [
+                        cute.local_tile(
+                            mVts_cur[split],
+                            (self.mma_tiler_PVti[1], self.mma_tiler_PVti[2]),
+                            (0, None, None),
+                        )
+                        for split in range(self.num_hdimv_splits)
+                    ]
                 tSgK = thr_mma_QK.partition_B(gK)
                 tSgVs = [
                     thr_mma_QviVi.partition_B(gVs[split]) for split in range(self.num_hdimv_splits)
@@ -1856,11 +2198,27 @@ class FlashAttentionMLAForwardSm100:
             if const_expr(self.use_tma_KV):
                 # ==== Prologue ====
                 n_block_first = n_block_max - 1
+                # Clamp to 0 when num_n_blocks == 0 (empty tile) to avoid a
+                # negative index into the page table.  The consumer's first
+                # iteration carries mask_seqlen=True which zeroes the output,
+                # so the garbage data loaded from page 0 is never used.
+                safe_n_block_first = n_block_first if num_n_blocks > 0 else 0
+                page_idx = (
+                    mPageTable[batch_idx, safe_n_block_first]
+                    if const_expr(mPageTable is not None)
+                    else None
+                )
                 # copy K gmem -> smem
-                producer_state_K = load_K(producer_state_K, n_block=n_block_first)
+                producer_state_K = load_K(
+                    producer_state_K, n_block=n_block_first, page_idx=page_idx
+                )
                 # copy Vi gmem -> smem
-                producer_state_V0 = load_V(producer_state_V0, n_block=n_block_first, split=0)
-                producer_state_V1 = load_V(producer_state_V1, n_block=n_block_first, split=1)
+                producer_state_V0 = load_V(
+                    producer_state_V0, n_block=n_block_first, split=0, page_idx=page_idx
+                )
+                producer_state_V1 = load_V(
+                    producer_state_V1, n_block=n_block_first, split=1, page_idx=page_idx
+                )
 
                 if const_expr(self.use_tma_O and self.overlap_sO_sV):
                     cute.arch.mbarrier_wait(sO_empty_mbar_ptr, phase=producer_phase_O)
@@ -1870,28 +2228,68 @@ class FlashAttentionMLAForwardSm100:
                 for n_block_group in cutlass.range(num_n_block_groups - 1, unroll=1):
                     for stage in cutlass.range_constexpr(self.num_stages_S):
                         n_block = n_block_max - 1 - n_block_group * self.num_stages_S - stage
+                        page_idx_next = (
+                            mPageTable[batch_idx, n_block - 1]
+                            if const_expr(mPageTable is not None)
+                            else None
+                        )
+                        page_idx_cur = (
+                            mPageTable[batch_idx, n_block]
+                            if const_expr(mPageTable is not None)
+                            else None
+                        )
                         # copy K gmem -> smem
-                        producer_state_K = load_K(producer_state_K, n_block=n_block - 1)
+                        producer_state_K = load_K(
+                            producer_state_K, n_block=n_block - 1, page_idx=page_idx_next
+                        )
                         # copy Vi gmem -> smem
-                        producer_state_V0 = load_V(producer_state_V0, n_block=n_block - 1, split=0)
-                        producer_state_V1 = load_V(producer_state_V1, n_block=n_block - 1, split=1)
+                        producer_state_V0 = load_V(
+                            producer_state_V0, n_block=n_block - 1, split=0, page_idx=page_idx_next
+                        )
+                        producer_state_V1 = load_V(
+                            producer_state_V1, n_block=n_block - 1, split=1, page_idx=page_idx_next
+                        )
                         # copy Vti gmem -> smem
-                        producer_state_V0 = load_Vt(producer_state_V0, n_block=n_block, split=0)
-                        producer_state_V1 = load_Vt(producer_state_V1, n_block=n_block, split=1)
+                        producer_state_V0 = load_Vt(
+                            producer_state_V0, n_block=n_block, split=0, page_idx=page_idx_cur
+                        )
+                        producer_state_V1 = load_Vt(
+                            producer_state_V1, n_block=n_block, split=1, page_idx=page_idx_cur
+                        )
 
                 # ==== Epilogue ====
                 num_final_n_blocks = self.num_stages_S if even_n_blocks else self.num_stages_S - 1
                 for stage in cutlass.range(num_final_n_blocks, unroll_full=True):
                     n_block = num_final_n_blocks - 1 - stage
                     if n_block > 0:
+                        page_idx_next = (
+                            mPageTable[batch_idx, n_block - 1]
+                            if const_expr(mPageTable is not None)
+                            else None
+                        )
                         # copy K gmem -> smem
-                        producer_state_K = load_K(producer_state_K, n_block=n_block - 1)
+                        producer_state_K = load_K(
+                            producer_state_K, n_block=n_block - 1, page_idx=page_idx_next
+                        )
                         # copy Vi gmem -> smem
-                        producer_state_V0 = load_V(producer_state_V0, n_block=n_block - 1, split=0)
-                        producer_state_V1 = load_V(producer_state_V1, n_block=n_block - 1, split=1)
+                        producer_state_V0 = load_V(
+                            producer_state_V0, n_block=n_block - 1, split=0, page_idx=page_idx_next
+                        )
+                        producer_state_V1 = load_V(
+                            producer_state_V1, n_block=n_block - 1, split=1, page_idx=page_idx_next
+                        )
+                    page_idx_cur = (
+                        mPageTable[batch_idx, n_block]
+                        if const_expr(mPageTable is not None)
+                        else None
+                    )
                     # copy Vti gmem -> smem
-                    producer_state_V0 = load_Vt(producer_state_V0, n_block=n_block, split=0)
-                    producer_state_V1 = load_Vt(producer_state_V1, n_block=n_block, split=1)
+                    producer_state_V0 = load_Vt(
+                        producer_state_V0, n_block=n_block, split=0, page_idx=page_idx_cur
+                    )
+                    producer_state_V1 = load_Vt(
+                        producer_state_V1, n_block=n_block, split=1, page_idx=page_idx_cur
+                    )
 
             # Advance to next tile
             work_tile = tile_scheduler.advance_to_next_work()
@@ -1914,6 +2312,7 @@ class FlashAttentionMLAForwardSm100:
         producer_state: pipeline.PipelineState,
         n_block: Optional[Int32] = None,
         split: Optional[Int32] = None,
+        page_idx: Optional[Int32] = None,
     ):
         stage = producer_state.index
         if const_expr(split is not None):
@@ -1922,7 +2321,10 @@ class FlashAttentionMLAForwardSm100:
             tXsX = tXsX[split]
             load_pipeline = load_pipeline[split]
         if const_expr(n_block is not None):
-            tXgX = tXgX[(None, n_block)]
+            if const_expr(page_idx is not None):
+                tXgX = tXgX[(None, 0, page_idx)]
+            else:
+                tXgX = tXgX[(None, n_block)]
         tXsX = tXsX[(None, stage)]
 
         load_pipeline.producer_acquire(producer_state)

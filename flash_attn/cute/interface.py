@@ -648,12 +648,14 @@ def _flash_attn_fwd(
         assert qv.shape[-1] == head_dim_v
         assert head_dim == 64 and head_dim_v == 512, "only support MLA weight absorbed shape with qv"
         assert not local, "local not yet supported with qv"
-        assert page_table is None, "page table not yet supported with qv"
         assert q_descale is None and k_descale is None and v_descale is None, (
             "q_descale/k_descale/v_descale are not yet supported with qv"
         )
-
         assert not is_split_kv, "split kv not supported with qv"
+        if page_table is not None:
+            page_size = k.shape[1]
+            assert gather_kv_indices is None, "paged KV + topk sparsity not yet supported together"
+            assert seqused_k is not None, "seqused_k required for paged KV with MLA"
         assert learnable_sink is None
         assert softcap is None
         assert score_mod is None
@@ -836,9 +838,10 @@ def _flash_attn_fwd(
             )
         elif arch // 10 in [10, 11]:
             if qv is not None:
+                paged_kv_cpasync = page_table is not None and page_size != 128
                 fa_fwd = FlashAttentionMLAForwardSm100(
                     is_causal=causal,
-                    use_cpasync_load_KV=sparse_kv,
+                    use_cpasync_load_KV=sparse_kv or paged_kv_cpasync,
                     topk_length=gather_kv_length,
                     is_topk_gather=sparse_kv,
                     pack_gqa=pack_gqa,
