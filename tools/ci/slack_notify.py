@@ -163,7 +163,7 @@ def build_message(records: list[dict]) -> str:
         if has_avg:
             hdr += f"  {avg_label:>7}"
         sep = "─" * len(hdr)
-        rows = [f"```\n{hdr}", sep]
+        table_lines = [hdr, sep]
 
         for k in sorted(keys, key=lambda x: (x[0], x[1], x[2], x[3])):
             direction, hdim, hdim_v, seqlen_kv, seqlen_q, causal, _ = k
@@ -185,10 +185,9 @@ def build_message(records: list[dict]) -> str:
             elif has_avg:
                 row += f"  {'n/a':>7}"
 
-            rows.append(row)
+            table_lines.append(row)
 
-        rows.append("```")
-        lines.extend(rows)
+        lines.extend(f"> `{line}`" for line in table_lines)
         lines.append("")
 
     if regressions:
