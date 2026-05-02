@@ -334,6 +334,8 @@ def parse_args():
                         help='Warmup iterations (default: 5)')
     parser.add_argument('--rep', type=int, default=10,
                         help='Repetitions per benchmark (default: 10)')
+    parser.add_argument('--json-output', type=str, default=None,
+                        help='Write results as JSON to this file (appends to existing list)')
     return parser.parse_args()
 
 
@@ -366,6 +368,7 @@ def main():
     # Parse fwd/bwd: if neither specified, do fwd only
     has_forward = args.fwd or not args.bwd
     has_backward = args.bwd
+    json_results = []  # collected when --json-output is set
 
     # Parse causal
     if args.causal == 'true':
@@ -561,11 +564,34 @@ def main():
                         bw_str = f"/{bw_pct:.1f}%" if bw_pct is not None else ""
                         cell = f"{ms:.2f}/{tflops:.0f}/{mfu:.1f}%/{tbs:.2f}{bw_str}"
                     else:
+                        mfu = bw_pct = None
                         cell = f"{ms:.2f}/{tflops:.0f}"
                     row += f" {cell:>{col_w}}"
+                    if args.json_output is not None:
+                        json_results.append({
+                            "direction": direction.lower(),
+                            "backend": b,
+                            "hdim": headdim, "hdim_v": headdim_v,
+                            "causal": causal,
+                            "seqlen_q": seqlen_q, "seqlen_kv": seqlen,
+                            "batch": batch_size,
+                            "nheads": nheads, "nheads_kv": nheads_kv,
+                            "gather_kv": gather_kv_eff,
+                            "ms": round(ms, 4),
+                            "tflops": round(tflops, 2),
+                            "tbs": round(tbs, 3),
+                            "mfu_pct": round(mfu, 2) if mfu is not None else None,
+                            "bw_pct": round(bw_pct, 2) if bw_pct is not None else None,
+                        })
                 else:
                     row += f" {'—':>{col_w}}"
             print(row)
+
+    if args.json_output is not None:
+        import json as _json
+        with open(args.json_output, "w") as _f:
+            _json.dump(json_results, _f, separators=(",", ":"))
+            _f.write("\n")
 
 
 if __name__ == '__main__':
