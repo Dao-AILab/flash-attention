@@ -26,35 +26,33 @@ class Step:
 
 # ── GPU helpers ───────────────────────────────────────────────────────────────
 
-def parse_free_gpu_indices(nvidia_smi_output: str, min_free_memory_mb: int) -> list[str]:
+def read_idle_gpu_indices(max_used_memory_mb: int = 1000) -> list[str]:
+    """Return indices of GPUs that are truly idle: utilization==0 and only driver memory used."""
+    result = subprocess.run(
+        ["nvidia-smi", "--query-gpu=index,utilization.gpu,memory.used",
+         "--format=csv,noheader,nounits"],
+        check=True, capture_output=True, text=True,
+    )
     indices: list[str] = []
-    for raw_line in nvidia_smi_output.splitlines():
+    for raw_line in result.stdout.splitlines():
         line = raw_line.strip()
         if not line:
             continue
-        try:
-            index, free_memory = [part.strip() for part in line.split(",", maxsplit=1)]
-            if int(free_memory) >= min_free_memory_mb:
-                indices.append(index)
-        except ValueError as exc:
-            raise ValueError(f"Unexpected nvidia-smi output line: {raw_line!r}") from exc
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) != 3:
+            raise ValueError(f"Unexpected nvidia-smi output: {raw_line!r}")
+        idx, util, mem_used = parts[0], int(parts[1]), int(parts[2])
+        if util == 0 and mem_used <= max_used_memory_mb:
+            indices.append(idx)
     return indices
 
 
-def select_visible_devices(free_gpu_indices: list[str], use_all_free_gpus: bool) -> str:
-    if not free_gpu_indices:
-        raise ValueError("No GPUs satisfy the free-memory threshold")
+def select_visible_devices(idle_gpu_indices: list[str], use_all_free_gpus: bool) -> str:
+    if not idle_gpu_indices:
+        raise ValueError("No idle GPUs available")
     if use_all_free_gpus:
-        return ",".join(free_gpu_indices)
-    return free_gpu_indices[0]
-
-
-def read_free_gpu_indices(min_free_memory_mb: int) -> list[str]:
-    result = subprocess.run(
-        ["nvidia-smi", "--query-gpu=index,memory.free", "--format=csv,noheader,nounits"],
-        check=True, capture_output=True, text=True,
-    )
-    return parse_free_gpu_indices(result.stdout, min_free_memory_mb)
+        return ",".join(idle_gpu_indices)
+    return idle_gpu_indices[0]
 
 
 # ── Step plan ─────────────────────────────────────────────────────────────────
@@ -138,7 +136,8 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--compile-workers", type=int, default=1)
     parser.add_argument("--run-workers", type=int, default=0,
                         help="xdist workers for Pass 2 (default: 0 = one per free GPU)")
-    parser.add_argument("--min-free-memory-mb", type=int, default=40000)
+    parser.add_argument("--max-used-memory-mb", type=int, default=1000,
+                        help="GPU is considered idle if memory.used <= this value (default: 1000 MB)")
     parser.add_argument("--use-all-free-gpus", action="store_true")
     parser.add_argument("--skip-benchmark", action="store_true")
     return parser
@@ -152,11 +151,11 @@ def main() -> None:
         raise SystemExit("FA4_SIF is not set — provide --sif or set the FA4_SIF env var.")
     print(f"Using SIF: {args.sif}")
 
-    free_gpu_indices = read_free_gpu_indices(args.min_free_memory_mb)
-    test_visible_devices = select_visible_devices(free_gpu_indices, args.use_all_free_gpus)
-    benchmark_visible_devices = free_gpu_indices[0]
-    run_workers = args.run_workers or len(free_gpu_indices)
-    print(f"Free GPUs: {free_gpu_indices}")
+    idle_gpu_indices = read_idle_gpu_indices(args.max_used_memory_mb)
+    test_visible_devices = select_visible_devices(idle_gpu_indices, args.use_all_free_gpus)
+    benchmark_visible_devices = idle_gpu_indices[0]
+    run_workers = args.run_workers or len(idle_gpu_indices)
+    print(f"Idle GPUs: {idle_gpu_indices}")
     print(f"Running tests on: {test_visible_devices} ({run_workers} workers)")
 
     base_env = {**os.environ, "FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED": "1"}
