@@ -120,6 +120,8 @@ def build_message(records: list[dict]) -> str:
     date = today.get("date", "?")
     sha = today.get("sha", "?")
     gpu_name = today.get("gpu", {}).get("name", "?")
+    clock_mhz = today.get("clock_mhz")
+    clock_str = f" | :lock: {clock_mhz} MHz" if clock_mhz else " | :warning: clocks unknown"
 
     today_vals = index_results(today)
     yday_vals = index_results(yesterday) if yesterday else {}
@@ -134,7 +136,7 @@ def build_message(records: list[dict]) -> str:
     link = (f" | <{run_url}/{repo}/actions/runs/{run_id}|View run>"
             if repo and run_id else "")
 
-    lines = [f":bar_chart: *FA4 Nightly* — {date} | {gpu_name} | `{sha}`{link}"]
+    lines = [f":bar_chart: *FA4 Nightly* — {date} | {gpu_name}{clock_str} | `{sha}`{link}"]
     lines.append(f"_{n_days}-run window: {date_range}_\n")
 
     has_yday = bool(yday_vals)

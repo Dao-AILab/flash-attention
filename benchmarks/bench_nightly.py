@@ -107,30 +107,33 @@ def _query_clocks() -> tuple[Optional[str], Optional[str]]:
     return (fields[0], fields[1]) if len(fields) >= 2 else (None, None)
 
 
-def setup_clocks(lock: bool) -> None:
+def setup_clocks(lock: bool) -> Optional[str]:
+    """Lock clocks if requested. Returns the locked frequency string (MHz) or None."""
     cur, max_clk = _query_clocks()
     if cur is None:
         print("WARNING: could not query GPU clocks")
-        return
+        return None
     if not lock:
         if cur != max_clk:
             print(f"WARNING: clocks not locked ({cur}/{max_clk} MHz) — results may vary")
-        return
+        return cur
     if cur == max_clk:
         print(f"GPU clocks already at max ({max_clk} MHz).")
-        return
+        return max_clk
     try:
         r = subprocess.run(_nvidia_smi_cmd("--lock-gpu-clocks", max_clk),
                            capture_output=True, text=True)
     except OSError as e:
         print(f"WARNING: could not lock clocks ({e})")
-        return
+        return cur
     if r.returncode == 0:
         print(f"Locked GPU clocks to {max_clk} MHz.")
         atexit.register(lambda: subprocess.run(
             _nvidia_smi_cmd("--reset-gpu-clocks"), capture_output=True))
+        return max_clk
     else:
         print(f"WARNING: clock lock failed ({r.stderr.strip()})")
+        return cur
 
 
 # ── GPU / git metadata ────────────────────────────────────────────────────────
@@ -188,7 +191,7 @@ def main() -> None:
 
     gpu = get_gpu_info()
     print(f"GPU: {gpu['name']} ({gpu['arch']})")
-    setup_clocks(args.lock_clocks)
+    clock_mhz = setup_clocks(args.lock_clocks)
 
     selected = set(args.groups.split(",")) if args.groups else None
     all_results = []
@@ -203,6 +206,7 @@ def main() -> None:
         "date": datetime.date.today().isoformat(),
         "sha": get_git_sha(),
         "gpu": gpu,
+        "clock_mhz": clock_mhz,
         "hostname": socket.gethostname(),
         "results": all_results,
     }
