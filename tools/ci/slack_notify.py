@@ -127,7 +127,7 @@ def build_message(records: list[dict]) -> str:
     # Table header
     has_yday = bool(yday_vals)
     has_avg = bool(avg_7d)
-    hdr = f"{'dir':<4} {'hdim':>5} {'seqlen':>7} {'csl':>3}  {'TFLOPS':>7}"
+    hdr = f"{'dir':<4} {'hdim':>8} {'sq':>6} {'skv':>6} {'csl':>3} {'grp':<12}  {'TFLOPS':>7}"
     if has_yday:
         hdr += f"  {'vs yday':>7}"
     if has_avg:
@@ -135,11 +135,12 @@ def build_message(records: list[dict]) -> str:
     rows = [f"```\n{hdr}", "-" * len(hdr)]
 
     regressions = []
-    for k in sorted(today_vals, key=lambda x: (x[0], x[1], x[2])):
-        direction, hdim, seqlen, causal = k
+    for k in sorted(today_vals, key=lambda x: (x[6], x[0], x[1], x[2], x[3])):
+        direction, hdim, hdim_v, seqlen_kv, seqlen_q, causal, group = k
         val = today_vals[k]
+        hdim_str = str(hdim) if hdim == hdim_v else f"{hdim}-{hdim_v}"
         causal_str = "T" if causal else "F"
-        row = f"{direction:<4} {hdim:>5} {seqlen:>7} {causal_str:>3}  {val:>7.1f}"
+        row = f"{direction:<4} {hdim_str:>8} {seqlen_q:>6} {seqlen_kv:>6} {causal_str:>3} {group:<12}  {val:>7.1f}"
 
         if has_yday and k in yday_vals:
             row += f"  {delta_str(val, yday_vals[k]):>7}"
@@ -161,9 +162,11 @@ def build_message(records: list[dict]) -> str:
 
     if regressions:
         lines.append(f"\n:warning: *Regressions (>{REGRESSION_THRESHOLD*100:.0f}% below {n_days-1}d avg):*")
-        for (direction, hdim, seqlen, causal), val, avg in regressions:
+        for k, val, avg in regressions:
+            direction, hdim, hdim_v, seqlen_kv, seqlen_q, causal, group = k
+            hdim_str = str(hdim) if hdim == hdim_v else f"{hdim}-{hdim_v}"
             drop = (avg - val) / avg * 100
-            lines.append(f"  • {direction} hdim={hdim} seqlen={seqlen} causal={causal}: "
+            lines.append(f"  • [{group}] {direction} hdim={hdim_str} sq={seqlen_q} skv={seqlen_kv} causal={causal}: "
                           f"{avg:.1f} → {val:.1f} TFLOPS (*-{drop:.1f}%*)")
     else:
         lines.append("\n:white_check_mark: No regressions detected.")
