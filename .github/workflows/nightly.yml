@@ -96,18 +96,28 @@ jobs:
           find "$CI_WORK_DIR" -maxdepth 1 -name "*.sif" ! -name "$(basename "$SIF")" -delete
           echo "FA4_SIF=$SIF" >> "$GITHUB_ENV"
 
+      - name: Lock GPU clocks
+        run: |
+          MAX_CLK=$(nvidia-smi --query-gpu=clocks.max.graphics --format=csv,noheader,nounits | head -1 | tr -d ' ')
+          echo "Locking GPU clocks to ${MAX_CLK} MHz"
+          sudo nvidia-smi --lock-gpu-clocks="$MAX_CLK"
+
       - name: Run canonical benchmark
         run: |
           RESULT_FILE="$RUNNER_TEMP/bench_results.json"
           echo "RESULT_FILE=$RESULT_FILE" >> "$GITHUB_ENV"
 
           INSTALL="uv pip install --system --break-system-packages --no-deps -q -e $GITHUB_WORKSPACE/flash_attn/cute"
-          BENCH="cd /tmp && python3 $GITHUB_WORKSPACE/benchmarks/bench_nightly.py --output $RESULT_FILE"
+          BENCH="cd /tmp && python3 $GITHUB_WORKSPACE/benchmarks/bench_nightly.py --no-lock-clocks --output $RESULT_FILE"
 
           apptainer exec --nv --writable-tmpfs \
             --bind "$CI_WORK_DIR" \
             --bind "$RUNNER_TEMP" \
             "$FA4_SIF" bash -c "$INSTALL && $BENCH"
+
+      - name: Reset GPU clocks
+        if: always()
+        run: sudo nvidia-smi --reset-gpu-clocks
 
       - name: Push results to benchmark-data branch
         run: |
