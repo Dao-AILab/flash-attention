@@ -95,20 +95,27 @@ def delta_str(now: float, ref: float) -> str:
 
 # ── Message builder ───────────────────────────────────────────────────────────
 
+GROUP_ORDER = ["mha", "mla_decode", "mla_prefill", "deepseek"]
+GROUP_LABELS = {
+    "mha":        ":zap: MHA — fwd + bwd",
+    "mla_decode": ":robot_face: MLA Decode — fwd",
+    "mla_prefill":":robot_face: MLA Prefill — fwd",
+    "deepseek":   ":ocean: DeepSeek — fwd",
+}
+
+
 def build_message(records: list[dict]) -> str:
     if not records:
         return "FA4 Nightly: no benchmark history found."
 
-    # Use same-GPU records only (filter by arch)
     latest = records[-1]
     arch = latest.get("gpu", {}).get("arch", "")
     same_gpu = [r for r in records if r.get("gpu", {}).get("arch") == arch]
 
-    # Window = up to last HISTORY_WINDOW runs on this GPU
     window = same_gpu[-HISTORY_WINDOW:]
     today = window[-1]
     yesterday = window[-2] if len(window) >= 2 else None
-    prior = window[:-1]  # everything before today
+    prior = window[:-1]
 
     date = today.get("date", "?")
     sha = today.get("sha", "?")
@@ -121,47 +128,71 @@ def build_message(records: list[dict]) -> str:
     date_range = f"{window[0].get('date','?')} → {date}" if len(window) > 1 else date
     n_days = len(window)
 
-    lines = [f"*FA4 Nightly* | {date} | {gpu_name} | `{sha}`"]
+    run_url = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
+    repo = os.environ.get("GITHUB_REPOSITORY", "")
+    run_id = os.environ.get("GITHUB_RUN_ID", "")
+    link = (f" | <{run_url}/{repo}/actions/runs/{run_id}|View run>"
+            if repo and run_id else "")
+
+    lines = [f":bar_chart: *FA4 Nightly* — {date} | {gpu_name} | `{sha}`{link}"]
     lines.append(f"_{n_days}-run window: {date_range}_\n")
 
-    # Table header
     has_yday = bool(yday_vals)
     has_avg = bool(avg_7d)
-    hdr = f"{'dir':<4} {'hdim':>8} {'sq':>6} {'skv':>6} {'csl':>3} {'grp':<12}  {'TFLOPS':>7}"
-    if has_yday:
-        hdr += f"  {'vs yday':>7}"
-    if has_avg:
-        hdr += f"  {f'vs {n_days-1}d-avg':>10}"
-    rows = [f"```\n{hdr}", "-" * len(hdr)]
+    avg_label = f"vs {n_days-1}d"
+
+    # Bucket keys by group
+    from collections import defaultdict
+    by_group: dict[str, list] = defaultdict(list)
+    for k in today_vals:
+        by_group[k[6]].append(k)
 
     regressions = []
-    for k in sorted(today_vals, key=lambda x: (x[6], x[0], x[1], x[2], x[3])):
-        direction, hdim, hdim_v, seqlen_kv, seqlen_q, causal, group = k
-        val = today_vals[k]
-        hdim_str = str(hdim) if hdim == hdim_v else f"{hdim}-{hdim_v}"
-        causal_str = "T" if causal else "F"
-        row = f"{direction:<4} {hdim_str:>8} {seqlen_q:>6} {seqlen_kv:>6} {causal_str:>3} {group:<12}  {val:>7.1f}"
 
-        if has_yday and k in yday_vals:
-            row += f"  {delta_str(val, yday_vals[k]):>7}"
-        elif has_yday:
-            row += f"  {'n/a':>7}"
+    for group in GROUP_ORDER:
+        keys = by_group.get(group)
+        if not keys:
+            continue
 
-        avg = avg_7d.get(k)
-        if has_avg and avg is not None:
-            row += f"  {delta_str(val, avg):>10}"
-            if (avg - val) / avg > REGRESSION_THRESHOLD:
-                regressions.append((k, val, avg))
-        elif has_avg:
-            row += f"  {'n/a':>10}"
+        label = GROUP_LABELS.get(group, group)
+        lines.append(f"*{label}*")
 
-        rows.append(row)
+        hdr = f"{'dir':<4} {'hdim':>8} {'sq':>6} {'skv':>6} {'csl':>3}  {'TFLOPS':>7}"
+        if has_yday:
+            hdr += f"  {'vs yday':>7}"
+        if has_avg:
+            hdr += f"  {avg_label:>7}"
+        sep = "─" * len(hdr)
+        rows = [f"```\n{hdr}", sep]
 
-    rows.append("```")
-    lines.extend(rows)
+        for k in sorted(keys, key=lambda x: (x[0], x[1], x[2], x[3])):
+            direction, hdim, hdim_v, seqlen_kv, seqlen_q, causal, _ = k
+            val = today_vals[k]
+            hdim_str = str(hdim) if hdim == hdim_v else f"{hdim}-{hdim_v}"
+            causal_str = "T" if causal else "F"
+            row = f"{direction:<4} {hdim_str:>8} {seqlen_q:>6} {seqlen_kv:>6} {causal_str:>3}  {val:>7.1f}"
+
+            if has_yday and k in yday_vals:
+                row += f"  {delta_str(val, yday_vals[k]):>7}"
+            elif has_yday:
+                row += f"  {'n/a':>7}"
+
+            avg = avg_7d.get(k)
+            if has_avg and avg is not None:
+                row += f"  {delta_str(val, avg):>7}"
+                if (avg - val) / avg > REGRESSION_THRESHOLD:
+                    regressions.append((k, val, avg))
+            elif has_avg:
+                row += f"  {'n/a':>7}"
+
+            rows.append(row)
+
+        rows.append("```")
+        lines.extend(rows)
+        lines.append("")
 
     if regressions:
-        lines.append(f"\n:warning: *Regressions (>{REGRESSION_THRESHOLD*100:.0f}% below {n_days-1}d avg):*")
+        lines.append(f":warning: *Regressions (>{REGRESSION_THRESHOLD*100:.0f}% below {n_days-1}d avg):*")
         for k, val, avg in regressions:
             direction, hdim, hdim_v, seqlen_kv, seqlen_q, causal, group = k
             hdim_str = str(hdim) if hdim == hdim_v else f"{hdim}-{hdim_v}"
@@ -169,7 +200,7 @@ def build_message(records: list[dict]) -> str:
             lines.append(f"  • [{group}] {direction} hdim={hdim_str} sq={seqlen_q} skv={seqlen_kv} causal={causal}: "
                           f"{avg:.1f} → {val:.1f} TFLOPS (*-{drop:.1f}%*)")
     else:
-        lines.append("\n:white_check_mark: No regressions detected.")
+        lines.append(":white_check_mark: No regressions detected.")
 
     return "\n".join(lines)
 
