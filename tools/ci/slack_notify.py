@@ -189,7 +189,7 @@ def build_message(records: list[dict]) -> str:
 
             table_lines.append(row)
 
-        lines.extend(f"> `{line}`" for line in table_lines)
+        lines.append("```\n" + "\n".join(table_lines) + "\n```")
         lines.append("")
 
     if regressions:
