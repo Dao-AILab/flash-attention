@@ -48,8 +48,12 @@ def setup_worktree(worktree_path: Path) -> None:
         run(["git", "fetch", "origin", f"{BRANCH}:{BRANCH}"], check=False)
         run(["git", "worktree", "add", str(worktree_path), BRANCH])
     else:
-        # Orphan branch — no history, no files
-        run(["git", "worktree", "add", "--orphan", "-b", BRANCH, str(worktree_path)])
+        # --orphan on git-worktree requires Git 2.36+; use detach + checkout instead
+        run(["git", "worktree", "add", "--detach", str(worktree_path)])
+        subprocess.run(["git", "checkout", "--orphan", BRANCH],
+                       check=True, cwd=worktree_path)
+        subprocess.run(["git", "rm", "-rf", "."],
+                       check=False, cwd=worktree_path)
 
 
 def push_result(result_path: Path, dry_run: bool) -> None:
