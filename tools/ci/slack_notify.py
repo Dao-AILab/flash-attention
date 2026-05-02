@@ -141,7 +141,6 @@ def build_message(records: list[dict]) -> str:
 
     has_yday = bool(yday_vals)
     has_avg = bool(avg_7d)
-    avg_label = f"vs {n_days-1}d"
 
     # Bucket keys by group
     from collections import defaultdict
@@ -159,11 +158,11 @@ def build_message(records: list[dict]) -> str:
         label = GROUP_LABELS.get(group, group)
         lines.append(f"*{label}*")
 
-        hdr = f"{'dir':<4} {'hdim':>8} {'sq':>6} {'skv':>6} {'csl':>3}  {'TFLOPS':>7}"
+        hdr = f"{'op':<4} {'hdim':>8} {'seqlen_q':>8} {'seqlen_kv':>9} {'causal':>6}  {'TFLOPS':>7}"
         if has_yday:
-            hdr += f"  {'vs yday':>7}"
+            hdr += f"  {'Δ yday':>7}"
         if has_avg:
-            hdr += f"  {avg_label:>7}"
+            hdr += f"  {f'Δ {n_days-1}d-avg':>9}"
         sep = "─" * len(hdr)
         table_lines = [hdr, sep]
 
@@ -171,8 +170,8 @@ def build_message(records: list[dict]) -> str:
             direction, hdim, hdim_v, seqlen_kv, seqlen_q, causal, _ = k
             val = today_vals[k]
             hdim_str = str(hdim) if hdim == hdim_v else f"{hdim}-{hdim_v}"
-            causal_str = "T" if causal else "F"
-            row = f"{direction:<4} {hdim_str:>8} {seqlen_q:>6} {seqlen_kv:>6} {causal_str:>3}  {val:>7.1f}"
+            causal_str = "True" if causal else "False"
+            row = f"{direction:<4} {hdim_str:>8} {seqlen_q:>8} {seqlen_kv:>9} {causal_str:>6}  {val:>7.1f}"
 
             if has_yday and k in yday_vals:
                 row += f"  {delta_str(val, yday_vals[k]):>7}"
@@ -181,15 +180,15 @@ def build_message(records: list[dict]) -> str:
 
             avg = avg_7d.get(k)
             if has_avg and avg is not None:
-                row += f"  {delta_str(val, avg):>7}"
+                row += f"  {delta_str(val, avg):>9}"
                 if (avg - val) / avg > REGRESSION_THRESHOLD:
                     regressions.append((k, val, avg))
             elif has_avg:
-                row += f"  {'n/a':>7}"
+                row += f"  {'n/a':>9}"
 
             table_lines.append(row)
 
-        lines.extend(f"> `{line}`" for line in table_lines)
+        lines.append("```\n" + "\n".join(table_lines) + "\n```")
         lines.append("")
 
     if regressions:

@@ -110,13 +110,20 @@ def _query_clocks() -> tuple[Optional[str], Optional[str]]:
 def setup_clocks(lock: bool) -> Optional[str]:
     """Lock clocks if requested. Returns the locked frequency string (MHz) or None."""
     cur, max_clk = _query_clocks()
-    if cur is None:
-        print("WARNING: could not query GPU clocks")
-        return None
     if not lock:
+        env_clk = os.environ.get("LOCKED_CLOCK_MHZ")
+        if env_clk:
+            print(f"GPU clocks locked externally at {env_clk} MHz")
+            return env_clk
+        if cur is None:
+            print("WARNING: could not query GPU clocks")
+            return None
         if cur != max_clk:
             print(f"WARNING: clocks not locked ({cur}/{max_clk} MHz) — results may vary")
         return cur
+    if cur is None:
+        print("WARNING: could not query GPU clocks")
+        return None
     if cur == max_clk:
         print(f"GPU clocks already at max ({max_clk} MHz).")
         return max_clk
