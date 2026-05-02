@@ -64,4 +64,5 @@ runs:
         python3 "$GITHUB_WORKSPACE/tools/ci/run_fa4_ci.py" \
           --repo-root "$GITHUB_WORKSPACE" \
           --test-filter "${{ inputs.test-filter }}" \
-          --compile-workers "${{ inputs.compile-workers }}"
+          --compile-workers "${{ inputs.compile-workers }}" \
+          --use-all-free-gpus

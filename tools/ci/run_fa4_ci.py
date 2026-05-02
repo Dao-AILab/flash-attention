@@ -136,7 +136,8 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--test-target", default=DEFAULT_TEST_TARGET)
     parser.add_argument("--test-filter", default=DEFAULT_TEST_FILTER)
     parser.add_argument("--compile-workers", type=int, default=1)
-    parser.add_argument("--run-workers", type=int, default=1)
+    parser.add_argument("--run-workers", type=int, default=0,
+                        help="xdist workers for Pass 2 (default: 0 = one per free GPU)")
     parser.add_argument("--min-free-memory-mb", type=int, default=40000)
     parser.add_argument("--use-all-free-gpus", action="store_true")
     parser.add_argument("--skip-benchmark", action="store_true")
@@ -154,7 +155,9 @@ def main() -> None:
     free_gpu_indices = read_free_gpu_indices(args.min_free_memory_mb)
     test_visible_devices = select_visible_devices(free_gpu_indices, args.use_all_free_gpus)
     benchmark_visible_devices = free_gpu_indices[0]
-    print(f"Running tests on GPUs: {test_visible_devices}")
+    run_workers = args.run_workers or len(free_gpu_indices)
+    print(f"Free GPUs: {free_gpu_indices}")
+    print(f"Running tests on: {test_visible_devices} ({run_workers} workers)")
 
     base_env = {**os.environ, "FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED": "1"}
     work_dir = os.environ.get("CI_WORK_DIR", f"/scratch/user/{os.environ.get('USER', 'user')}")
@@ -163,7 +166,7 @@ def main() -> None:
         test_target=args.test_target,
         test_filter=args.test_filter,
         compile_workers=args.compile_workers,
-        run_workers=args.run_workers,
+        run_workers=run_workers,
         test_visible_devices=test_visible_devices,
         benchmark_visible_devices=benchmark_visible_devices,
         skip_benchmark=args.skip_benchmark,
