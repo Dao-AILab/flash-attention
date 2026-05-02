@@ -49,6 +49,7 @@ jobs:
           compile-workers: "64"
           fa4_image_cu129: ${{ env.FA4_IMAGE_CU129 }}
           fa4_image_cu130: ${{ env.FA4_IMAGE_CU130 }}
+          slack-webhook-url: ${{ secrets.FA4_NIGHTLY_SLACK_WEBHOOK }}
 
   # ── Canonical benchmark + result tracking ───────────────────────────────────
   benchmark:
