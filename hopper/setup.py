@@ -703,9 +703,9 @@ class CachedWheelsCommand(_bdist_wheel):
             # If the wheel could not be downloaded, build from source
             super().run()
 
-# Get the PyTorch version as a tuple of numbers 
-torch_version_str = torch.__version__.split('+')[0]
-torch_major_minor = tuple(map(int, torch_version_str.split('.')[:2]))
+# Get the PyTorch version using packaging.version for robust PEP 440 parsing
+torch_version = parse(torch.__version__)
+torch_major_minor = (torch_version.major, torch_version.minor)
 
 # Determine the minimum Python version supported by this PyTorch
 if torch_major_minor >= (2, 11):
