@@ -101,6 +101,7 @@ jobs:
           MAX_CLK=$(nvidia-smi --query-gpu=clocks.max.graphics --format=csv,noheader,nounits | head -1 | tr -d ' ')
           echo "Locking GPU clocks to ${MAX_CLK} MHz"
           sudo nvidia-smi --lock-gpu-clocks="$MAX_CLK"
+          echo "LOCKED_CLOCK_MHZ=$MAX_CLK" >> "$GITHUB_ENV"
 
       - name: Run canonical benchmark
         run: |
@@ -111,6 +112,7 @@ jobs:
           BENCH="cd /tmp && python3 $GITHUB_WORKSPACE/benchmarks/bench_nightly.py --no-lock-clocks --output $RESULT_FILE"
 
           apptainer exec --nv --writable-tmpfs \
+            --env LOCKED_CLOCK_MHZ="$LOCKED_CLOCK_MHZ" \
             --bind "$CI_WORK_DIR" \
             --bind "$RUNNER_TEMP" \
             "$FA4_SIF" bash -c "$INSTALL && $BENCH"
