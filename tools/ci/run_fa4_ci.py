@@ -7,9 +7,12 @@ Requires FA4_SIF (path to the .sif image) to be set, either via env var or --sif
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shlex
 import subprocess
+import time
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -53,6 +56,58 @@ def select_visible_devices(idle_gpu_indices: list[str], use_all_free_gpus: bool)
     if use_all_free_gpus:
         return ",".join(idle_gpu_indices)
     return idle_gpu_indices[0]
+
+
+def post_slack(webhook_url: str, text: str) -> None:
+    if not webhook_url:
+        return
+    try:
+        data = json.dumps({"text": text}).encode()
+        req = urllib.request.Request(webhook_url, data=data,
+                                     headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=10)
+    except Exception as e:
+        print(f"WARNING: Slack notification failed: {e}")
+
+
+def wait_for_idle_gpus(
+    max_used_memory_mb: int,
+    poll_interval_s: int,
+    timeout_s: int,
+    webhook_url: str,
+) -> list[str]:
+    """Poll until at least one GPU is idle or timeout expires. Returns idle GPU indices."""
+    deadline = time.monotonic() + timeout_s
+    first_check = True
+    while True:
+        indices = read_idle_gpu_indices(max_used_memory_mb)
+        if indices:
+            if not first_check:
+                print(f"Idle GPUs available: {indices}")
+            return indices
+
+        remaining = int(deadline - time.monotonic())
+        if remaining <= 0:
+            hostname = os.environ.get("RUNNER_NAME", os.uname().nodename)
+            run_url = ""
+            repo = os.environ.get("GITHUB_REPOSITORY", "")
+            run_id = os.environ.get("GITHUB_RUN_ID", "")
+            server = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
+            if repo and run_id:
+                run_url = f" | <{server}/{repo}/actions/runs/{run_id}|View run>"
+            post_slack(
+                webhook_url,
+                f":warning: *FA4 Nightly skipped* — no idle GPUs on `{hostname}` "
+                f"after {timeout_s // 60} min{run_url}",
+            )
+            raise SystemExit(f"No idle GPUs after {timeout_s // 60} min — aborting.")
+
+        if first_check:
+            print(f"No idle GPUs found. Waiting up to {timeout_s // 60} min "
+                  f"(polling every {poll_interval_s // 60} min)...")
+            first_check = False
+        print(f"  still waiting... {remaining // 60} min remaining")
+        time.sleep(poll_interval_s)
 
 
 # ── Step plan ─────────────────────────────────────────────────────────────────
@@ -138,6 +193,10 @@ def make_parser() -> argparse.ArgumentParser:
                         help="xdist workers for Pass 2 (default: 0 = one per free GPU)")
     parser.add_argument("--max-used-memory-mb", type=int, default=1000,
                         help="GPU is considered idle if memory.used <= this value (default: 1000 MB)")
+    parser.add_argument("--gpu-wait-timeout-min", type=int, default=60,
+                        help="Minutes to wait for an idle GPU before giving up (default: 60)")
+    parser.add_argument("--gpu-poll-interval-min", type=int, default=5,
+                        help="Minutes between idle-GPU polls (default: 5)")
     parser.add_argument("--use-all-free-gpus", action="store_true")
     parser.add_argument("--skip-benchmark", action="store_true")
     return parser
@@ -151,7 +210,13 @@ def main() -> None:
         raise SystemExit("FA4_SIF is not set — provide --sif or set the FA4_SIF env var.")
     print(f"Using SIF: {args.sif}")
 
-    idle_gpu_indices = read_idle_gpu_indices(args.max_used_memory_mb)
+    webhook_url = os.environ.get("SLACK_WEBHOOK_URL", "")
+    idle_gpu_indices = wait_for_idle_gpus(
+        max_used_memory_mb=args.max_used_memory_mb,
+        poll_interval_s=args.gpu_poll_interval_min * 60,
+        timeout_s=args.gpu_wait_timeout_min * 60,
+        webhook_url=webhook_url,
+    )
     test_visible_devices = select_visible_devices(idle_gpu_indices, args.use_all_free_gpus)
     benchmark_visible_devices = idle_gpu_indices[0]
     run_workers = args.run_workers or len(idle_gpu_indices)
