@@ -703,6 +703,21 @@ class CachedWheelsCommand(_bdist_wheel):
             # If the wheel could not be downloaded, build from source
             super().run()
 
+# Get the PyTorch version as a tuple of numbers 
+torch_version_str = torch.__version__.split('+')[0]
+torch_major_minor = tuple(map(int, torch_version_str.split('.')[:2]))
+
+# Determine the minimum Python version supported by this PyTorch
+if torch_major_minor >= (2, 11):
+    # PyTorch 2.11 and newer require Python 3.10+
+    dynamic_abi_tag = "cp310"
+else:
+    # Older PyTorch versions support Python 3.9
+    dynamic_abi_tag = "cp39"
+
+# Create the dynamic options dictionary that will be passed to setup()
+dynamic_options = {"bdist_wheel": {"py_limited_api": dynamic_abi_tag}}
+
 setup(
     name=PACKAGE_NAME,
     version=get_package_version(),
@@ -739,4 +754,5 @@ setup(
         "packaging",
         "ninja",
     ],
+    options=dynamic_options,
 )
