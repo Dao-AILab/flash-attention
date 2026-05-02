@@ -159,7 +159,7 @@ def build_message(records: list[dict]) -> str:
         label = GROUP_LABELS.get(group, group)
         lines.append(f"*{label}*")
 
-        hdr = f"{'dir':<4} {'hdim':>8} {'sq':>6} {'skv':>6} {'csl':>3}  {'TFLOPS':>7}"
+        hdr = f"{'op':<4} {'hdim':>8} {'seqlen_q':>8} {'seqlen_kv':>9} {'causal':>6}  {'TFLOPS':>7}"
         if has_yday:
             hdr += f"  {'vs yday':>7}"
         if has_avg:
@@ -171,8 +171,8 @@ def build_message(records: list[dict]) -> str:
             direction, hdim, hdim_v, seqlen_kv, seqlen_q, causal, _ = k
             val = today_vals[k]
             hdim_str = str(hdim) if hdim == hdim_v else f"{hdim}-{hdim_v}"
-            causal_str = "T" if causal else "F"
-            row = f"{direction:<4} {hdim_str:>8} {seqlen_q:>6} {seqlen_kv:>6} {causal_str:>3}  {val:>7.1f}"
+            causal_str = "True" if causal else "False"
+            row = f"{direction:<4} {hdim_str:>8} {seqlen_q:>8} {seqlen_kv:>9} {causal_str:>6}  {val:>7.1f}"
 
             if has_yday and k in yday_vals:
                 row += f"  {delta_str(val, yday_vals[k]):>7}"
