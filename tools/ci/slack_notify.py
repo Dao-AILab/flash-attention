@@ -18,6 +18,7 @@ import statistics
 import subprocess
 import sys
 import urllib.request
+from collections import defaultdict
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -26,6 +27,14 @@ HISTORY_FILE = "benchmark_history.jsonl"
 
 HISTORY_WINDOW = 7          # records to load
 REGRESSION_THRESHOLD = 0.02  # alert if today < 7d-avg by more than 2%
+
+GROUP_ORDER = ["mha", "mla_decode", "mla_prefill", "deepseek"]
+GROUP_LABELS = {
+    "mha":         ":zap: MHA — fwd + bwd",
+    "mla_decode":  ":robot_face: MLA Decode — fwd",
+    "mla_prefill": ":robot_face: MLA Prefill — fwd",
+    "deepseek":    ":ocean: DeepSeek — fwd",
+}
 
 
 # ── History loading ───────────────────────────────────────────────────────────
@@ -67,7 +76,6 @@ def cfg_key(r: dict) -> tuple:
 
 
 def index_results(record: dict) -> dict[tuple, float]:
-    """Return {cfg_key: tflops} for a single benchmark record."""
     return {
         cfg_key(r): r["tflops"]
         for r in record.get("results", [])
@@ -76,8 +84,6 @@ def index_results(record: dict) -> dict[tuple, float]:
 
 
 def compute_7d_avg(window: list[dict]) -> dict[tuple, float]:
-    """Mean tflops per config across a list of records."""
-    from collections import defaultdict
     buckets: dict[tuple, list[float]] = defaultdict(list)
     for rec in window:
         for k, v in index_results(rec).items():
@@ -93,20 +99,12 @@ def delta_str(now: float, ref: float) -> str:
     return f"{sign}{pct:.1f}%"
 
 
-# ── Message builder ───────────────────────────────────────────────────────────
+# ── Report builder ────────────────────────────────────────────────────────────
 
-GROUP_ORDER = ["mha", "mla_decode", "mla_prefill", "deepseek"]
-GROUP_LABELS = {
-    "mha":        ":zap: MHA — fwd + bwd",
-    "mla_decode": ":robot_face: MLA Decode — fwd",
-    "mla_prefill":":robot_face: MLA Prefill — fwd",
-    "deepseek":   ":ocean: DeepSeek — fwd",
-}
-
-
-def build_message(records: list[dict]) -> str:
+def _prepare_report(records: list[dict]) -> dict | None:
+    """Compute everything needed to render the message. Returns None if no data."""
     if not records:
-        return "FA4 Nightly: no benchmark history found."
+        return None
 
     latest = records[-1]
     arch = latest.get("gpu", {}).get("arch", "")
@@ -121,7 +119,7 @@ def build_message(records: list[dict]) -> str:
     sha = today.get("sha", "?")
     gpu_name = today.get("gpu", {}).get("name", "?")
     clock_mhz = today.get("clock_mhz")
-    clock_str = f" | :lock: {clock_mhz} MHz" if clock_mhz else " | :warning: clocks unknown"
+    clock_str = f":lock: {clock_mhz} MHz" if clock_mhz else ":warning: clocks unknown"
 
     today_vals = index_results(today)
     yday_vals = index_results(yesterday) if yesterday else {}
@@ -136,48 +134,36 @@ def build_message(records: list[dict]) -> str:
     link = (f" | <{run_url}/{repo}/actions/runs/{run_id}|View run>"
             if repo and run_id else "")
 
-    lines = [f":bar_chart: *FA4 Nightly* — {date} | {gpu_name}{clock_str} | `{sha}`{link}"]
-    lines.append(f"_{n_days}-run window: {date_range}_\n")
-
     has_yday = bool(yday_vals)
     has_avg = bool(avg_7d)
 
-    # Bucket keys by group
-    from collections import defaultdict
     by_group: dict[str, list] = defaultdict(list)
     for k in today_vals:
         by_group[k[6]].append(k)
 
+    # Build per-group table text and collect regressions
+    groups = []
     regressions = []
-
     for group in GROUP_ORDER:
         keys = by_group.get(group)
         if not keys:
             continue
-
         label = GROUP_LABELS.get(group, group)
-        lines.append(f"*{label}*")
-
         hdr = f"{'op':<4} {'hdim':>8} {'seqlen_q':>8} {'seqlen_kv':>9} {'causal':>6}  {'TFLOPS':>7}"
         if has_yday:
             hdr += f"  {'Δ yday':>7}"
         if has_avg:
             hdr += f"  {f'Δ {n_days-1}d-avg':>9}"
-        sep = "─" * len(hdr)
-        table_lines = [hdr, sep]
-
+        table_lines = [hdr, "─" * len(hdr)]
         for k in sorted(keys, key=lambda x: (x[0], x[1], x[2], x[3])):
             direction, hdim, hdim_v, seqlen_kv, seqlen_q, causal, _ = k
             val = today_vals[k]
             hdim_str = str(hdim) if hdim == hdim_v else f"{hdim}-{hdim_v}"
-            causal_str = "True" if causal else "False"
-            row = f"{direction:<4} {hdim_str:>8} {seqlen_q:>8} {seqlen_kv:>9} {causal_str:>6}  {val:>7.1f}"
-
+            row = f"{direction:<4} {hdim_str:>8} {seqlen_q:>8} {seqlen_kv:>9} {str(causal):>6}  {val:>7.1f}"
             if has_yday and k in yday_vals:
                 row += f"  {delta_str(val, yday_vals[k]):>7}"
             elif has_yday:
                 row += f"  {'n/a':>7}"
-
             avg = avg_7d.get(k)
             if has_avg and avg is not None:
                 row += f"  {delta_str(val, avg):>9}"
@@ -185,33 +171,95 @@ def build_message(records: list[dict]) -> str:
                     regressions.append((k, val, avg))
             elif has_avg:
                 row += f"  {'n/a':>9}"
-
             table_lines.append(row)
-
-        lines.append("```\n" + "\n".join(table_lines) + "\n```")
-        lines.append("")
+        groups.append((label, "\n".join(table_lines)))
 
     if regressions:
-        lines.append(f":warning: *Regressions (>{REGRESSION_THRESHOLD*100:.0f}% below {n_days-1}d avg):*")
+        reg_lines = [f":warning: *Regressions (>{REGRESSION_THRESHOLD*100:.0f}% below {n_days-1}d avg):*"]
         for k, val, avg in regressions:
             direction, hdim, hdim_v, seqlen_kv, seqlen_q, causal, group = k
             hdim_str = str(hdim) if hdim == hdim_v else f"{hdim}-{hdim_v}"
             drop = (avg - val) / avg * 100
-            lines.append(f"  • [{group}] {direction} hdim={hdim_str} sq={seqlen_q} skv={seqlen_kv} causal={causal}: "
-                          f"{avg:.1f} → {val:.1f} TFLOPS (*-{drop:.1f}%*)")
+            reg_lines.append(
+                f"  • [{group}] {direction} hdim={hdim_str} seqlen_q={seqlen_q} "
+                f"seqlen_kv={seqlen_kv} causal={causal}: "
+                f"{avg:.1f} → {val:.1f} TFLOPS (*-{drop:.1f}%*)"
+            )
+        regression_text = "\n".join(reg_lines)
     else:
-        lines.append(":white_check_mark: No regressions detected.")
+        regression_text = ":white_check_mark: No regressions detected."
 
+    return dict(
+        header=f":bar_chart: *FA4 Nightly* — {date} | {gpu_name} | {clock_str} | `{sha}`{link}",
+        window_line=f"_{n_days}-run window: {date_range}_",
+        groups=groups,
+        regression_text=regression_text,
+        date=date, gpu_name=gpu_name,
+    )
+
+
+# ── Slack payload (Block Kit) ─────────────────────────────────────────────────
+
+def build_payload(records: list[dict]) -> dict:
+    """Build Slack Block Kit payload. Uses rich_text_preformatted for compact monospace tables."""
+    report = _prepare_report(records)
+    if report is None:
+        return {"text": "FA4 Nightly: no benchmark history found."}
+
+    blocks = []
+    blocks.append({
+        "type": "section",
+        "text": {"type": "mrkdwn", "text": report["header"] + "\n" + report["window_line"]},
+    })
+
+    for label, table_text in report["groups"]:
+        blocks.append({
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"*{label}*"},
+        })
+        blocks.append({
+            "type": "rich_text",
+            "elements": [{
+                "type": "rich_text_preformatted",
+                "elements": [{"type": "text", "text": table_text}],
+            }],
+        })
+
+    blocks.append({
+        "type": "section",
+        "text": {"type": "mrkdwn", "text": report["regression_text"]},
+    })
+
+    return {
+        "text": f"FA4 Nightly {report['date']} | {report['gpu_name']}",  # notification fallback
+        "blocks": blocks,
+    }
+
+
+# ── Dry-run text (terminal preview) ──────────────────────────────────────────
+
+def build_message(records: list[dict]) -> str:
+    """Plain-text version for --dry-run."""
+    report = _prepare_report(records)
+    if report is None:
+        return "FA4 Nightly: no benchmark history found."
+
+    lines = [report["header"], report["window_line"], ""]
+    for label, table_text in report["groups"]:
+        lines.append(f"*{label}*")
+        lines.append(table_text)
+        lines.append("")
+    lines.append(report["regression_text"])
     return "\n".join(lines)
 
 
 # ── Slack posting ─────────────────────────────────────────────────────────────
 
-def post_to_slack(webhook_url: str, message: str) -> None:
-    payload = json.dumps({"text": message}).encode()
+def post_to_slack(webhook_url: str, payload: dict) -> None:
+    data = json.dumps(payload).encode()
     req = urllib.request.Request(
         webhook_url,
-        data=payload,
+        data=data,
         headers={"Content-Type": "application/json"},
         method="POST",
     )
@@ -239,19 +287,16 @@ def main() -> None:
                        capture_output=True)
         records = fetch_history_from_branch()
 
-    # Keep only the last HISTORY_WINDOW records
     records = records[-HISTORY_WINDOW:]
 
-    message = build_message(records)
-
     if args.dry_run:
-        print(message)
+        print(build_message(records))
         return
 
     webhook_url = os.environ.get("SLACK_WEBHOOK_URL", "")
     if not webhook_url:
         sys.exit("SLACK_WEBHOOK_URL is not set")
-    post_to_slack(webhook_url, message)
+    post_to_slack(webhook_url, build_payload(records))
     print("Posted to Slack.")
 
 
