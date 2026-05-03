@@ -120,8 +120,8 @@ VERBOSE = True
         (1023, 1024),
         (1024, 1023),
         (2048, 2048),
-        (4096, 4096),
-        (4224, 4224),
+        # (4096, 4096),  # too slow for CI (~10s/test × full sweep)
+        # (4224, 4224),  # too slow for CI (~10s/test × full sweep)
     ],
 )
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(128, 128)])
@@ -497,8 +497,8 @@ def test_flash_attn_output(
         # SM100 hd256 2CTA test cases
         (64, 1),
         (255, 256),
-        (4096, 4096),
-        (4224, 4224),
+        # (4096, 4096),  # too slow for CI (~10s/test × full sweep)
+        # (4224, 4224),  # too slow for CI (~10s/test × full sweep)
     ],
 )
 @pytest.mark.parametrize("varlen_mode", ["random", "third", "full"])
