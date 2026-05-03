@@ -13,6 +13,10 @@ on:
         description: "Skip benchmark, run tests only"
         type: boolean
         default: false
+      skip_compile:
+        description: "Skip Pass 1 kernel compilation (use cached kernels from a prior run)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write  # needed to push benchmark-data branch
@@ -47,6 +51,7 @@ jobs:
           # No test filter — run the full suite
           test-filter: ""
           compile-workers: "64"
+          skip-compile: ${{ inputs.skip_compile && 'true' || 'false' }}
           fa4_image_cu129: ${{ env.FA4_IMAGE_CU129 }}
           fa4_image_cu130: ${{ env.FA4_IMAGE_CU130 }}
           slack-webhook-url: ${{ secrets.FA4_NIGHTLY_SLACK_WEBHOOK }}
