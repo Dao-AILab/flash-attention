@@ -848,6 +848,8 @@ def test_flash_attn_varlen_output(
                 pytest.xfail("hdim > 192 backward: SM90 not supported yet")
             if d != dv and mha_type != "mha" and IS_SM90:
                 pytest.xfail("SM90 GQA bwd currently requires headdim == headdim_v")
+            if d == 192 and IS_SM100 and softcap > 0.0:
+                pytest.skip("SM100 head_dim=192 2CTA backward does not support softcap yet")
             g_unpad = torch.randn_like(out_unpad)
             # do_o = ((g_unpad.float() * out_unpad.float()).sum(-1)).transpose(-1, -2)
             # import flash_attn_3_cuda
