@@ -29,7 +29,7 @@ class Step:
 
 # ── GPU helpers ───────────────────────────────────────────────────────────────
 
-def read_idle_gpu_indices(max_used_memory_mb: int = 1000) -> list[str]:
+def read_idle_gpu_indices(max_used_memory_mb: int = 8000) -> list[str]:
     """Return indices of GPUs that are truly idle: utilization==0 and only driver memory used."""
     result = subprocess.run(
         ["nvidia-smi", "--query-gpu=index,utilization.gpu,memory.used",
@@ -191,8 +191,8 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--compile-workers", type=int, default=1)
     parser.add_argument("--run-workers", type=int, default=0,
                         help="xdist workers for Pass 2 (default: 0 = one per free GPU)")
-    parser.add_argument("--max-used-memory-mb", type=int, default=1000,
-                        help="GPU is considered idle if memory.used <= this value (default: 1000 MB)")
+    parser.add_argument("--max-used-memory-mb", type=int, default=8000,
+                        help="GPU is considered idle if memory.used <= this value (default: 8000 MB)")
     parser.add_argument("--gpu-wait-timeout-min", type=int, default=60,
                         help="Minutes to wait for an idle GPU before giving up (default: 60)")
     parser.add_argument("--gpu-poll-interval-min", type=int, default=5,

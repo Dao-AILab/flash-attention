@@ -48,13 +48,25 @@ def pytest_configure(config):
     cached_gpu_ids = tmp / "gpu_ids.json"
     if worker_num == 0:
         gpu_ids = _get_gpu_ids()
-        with cached_gpu_ids.open(mode="w") as f:
+        # Atomic write: write to a temp file then rename so other workers never
+        # read a partially-written or truncated file.
+        tmp_file = cached_gpu_ids.with_suffix(".tmp")
+        with tmp_file.open(mode="w") as f:
             json.dump(gpu_ids, f)
+        tmp_file.replace(cached_gpu_ids)
     else:
         while not cached_gpu_ids.exists():
             time.sleep(1)
-        with cached_gpu_ids.open() as f:
-            gpu_ids = json.load(f)
+        # Retry on JSONDecodeError in case we race with the rename.
+        for _ in range(10):
+            try:
+                with cached_gpu_ids.open() as f:
+                    gpu_ids = json.load(f)
+                break
+            except (json.JSONDecodeError, OSError):
+                time.sleep(0.2)
+        else:
+            gpu_ids = _get_gpu_ids()
 
     os.environ["CUDA_VISIBLE_DEVICES"] = gpu_ids[worker_num % len(gpu_ids)]
 
