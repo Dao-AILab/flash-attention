@@ -34,12 +34,17 @@ from flash_attn.cute.interface import (
     _flash_attn_bwd,
 )
 
+_OOM_ERRORS = (torch.OutOfMemoryError,)
+if hasattr(torch, "AcceleratorError"):
+    _OOM_ERRORS = _OOM_ERRORS + (torch.AcceleratorError,)
+
+
 def retry_on_oom(func):
     @wraps(func)
     def wrapper(*args, **kwargs):
         try:
             return func(*args, **kwargs)
-        except torch.OutOfMemoryError as e:
+        except _OOM_ERRORS as e:
             if "out of memory" in str(e).lower():
                 if hasattr(_flash_attn_fwd, "compile_cache"):
                     _flash_attn_fwd.compile_cache.clear()
