@@ -120,24 +120,25 @@ def build_step_plan(
     test_visible_devices: str,
     benchmark_visible_devices: str,
     skip_benchmark: bool,
+    skip_compile: bool = False,
 ) -> list[Step]:
     pytest_base = ["python3", "-m", "pytest", test_target, *(["-k", test_filter] if test_filter else [])]
 
-    steps = [
-        Step(
+    steps = []
+    if not skip_compile:
+        steps.append(Step(
             name="Pass 1: compile kernels (no GPU memory)",
             command=[*pytest_base, "-n", str(compile_workers), "-x"],
             extra_env={"FLASH_ATTENTION_FAKE_TENSOR": "1"},
-        ),
-        Step(
-            name="Pass 2: run tests on GPU",
-            command=[*pytest_base, "-n", str(run_workers), "-x"],
-            extra_env={
-                "FLASH_ATTENTION_FAKE_TENSOR": "0",
-                "CUDA_VISIBLE_DEVICES": test_visible_devices,
-            },
-        ),
-    ]
+        ))
+    steps.append(Step(
+        name="Pass 2: run tests on GPU",
+        command=[*pytest_base, "-n", str(run_workers), "-x"],
+        extra_env={
+            "FLASH_ATTENTION_FAKE_TENSOR": "0",
+            "CUDA_VISIBLE_DEVICES": test_visible_devices,
+        },
+    ))
     if not skip_benchmark:
         steps.append(Step(
             name="Benchmark (FA4 fwd, hdim=128, causal=both, seqlen=1K-32K)",
@@ -199,6 +200,8 @@ def make_parser() -> argparse.ArgumentParser:
                         help="Minutes between idle-GPU polls (default: 5)")
     parser.add_argument("--use-all-free-gpus", action="store_true")
     parser.add_argument("--skip-benchmark", action="store_true")
+    parser.add_argument("--skip-compile", action="store_true",
+                        help="Skip Pass 1 (kernel compilation); use cached kernels from a prior run")
     return parser
 
 
@@ -234,6 +237,7 @@ def main() -> None:
         test_visible_devices=test_visible_devices,
         benchmark_visible_devices=benchmark_visible_devices,
         skip_benchmark=args.skip_benchmark,
+        skip_compile=args.skip_compile,
     ):
         run_step(step, repo_root=repo_root, base_env=base_env, sif=args.sif, work_dir=work_dir)
 
