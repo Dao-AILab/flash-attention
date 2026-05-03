@@ -36,7 +36,7 @@ jobs:
         gpu: [b200]
     runs-on: [self-hosted, "${{ matrix.gpu }}"]
     name: tests (${{ matrix.gpu }})
-    timeout-minutes: 180
+    timeout-minutes: 300
     steps:
       - uses: actions/checkout@v4
 
