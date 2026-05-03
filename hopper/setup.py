@@ -13,6 +13,7 @@ import platform
 import sysconfig
 import tarfile
 import itertools
+import importlib.metadata
 
 from setuptools import setup, find_packages
 import subprocess
@@ -703,17 +704,22 @@ class CachedWheelsCommand(_bdist_wheel):
             # If the wheel could not be downloaded, build from source
             super().run()
 
-# Get the PyTorch version using packaging.version for robust PEP 440 parsing
-torch_version = parse(torch.__version__)
-torch_major_minor = (torch_version.major, torch_version.minor)
+# Fallbacks in case metadata is missing
+dynamic_abi_tag = "cp39"
+dynamic_python_requires = ">=3.9"
 
-# Determine the minimum Python version supported by this PyTorch
-if torch_major_minor >= (2, 11):
-    # PyTorch 2.11 and newer require Python 3.10+
-    dynamic_abi_tag = "cp310"
-else:
-    # Older PyTorch versions support Python 3.9
-    dynamic_abi_tag = "cp39"
+try:
+    # Derive minimum Python version from installed torch distribution metadata
+    torch_requires_python = importlib.metadata.metadata("torch").get("Requires-Python", "")
+    
+    # Extract the minor version from strings like ">=3.10.0" or ">=3.9"
+    match = re.search(r'3\.(\d+)', torch_requires_python)
+    if match:
+        minor_version = match.group(1)
+        dynamic_abi_tag = f"cp3{minor_version}"
+        dynamic_python_requires = f">=3.{minor_version}"
+except Exception:
+    pass # Sets cp39
 
 # Create the dynamic options dictionary that will be passed to setup()
 dynamic_options = {"bdist_wheel": {"py_limited_api": dynamic_abi_tag}}
@@ -747,7 +753,7 @@ setup(
     else {
         "bdist_wheel": CachedWheelsCommand,
     },
-    python_requires=">=3.8",
+    python_requires=dynamic_python_requires,
     install_requires=[
         "torch",
         "einops",
