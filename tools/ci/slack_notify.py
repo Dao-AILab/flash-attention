@@ -186,6 +186,12 @@ def _prepare_report(records: list[dict]) -> dict | None:
                 f"{avg:.1f} → {val:.1f} TFLOPS (*-{drop:.1f}%*)"
             )
         regression_text = "\n".join(reg_lines)
+        # Slack section blocks have a 3000-char limit; truncate if needed.
+        if len(regression_text) > 2900:
+            cutoff = regression_text.rfind("\n", 0, 2900)
+            n_shown = regression_text[:cutoff].count("\n")  # header line + entries
+            n_hidden = len(regressions) - (n_shown - 1)
+            regression_text = regression_text[:cutoff] + f"\n  … and {n_hidden} more"
     else:
         regression_text = ":white_check_mark: No regressions detected."
 
