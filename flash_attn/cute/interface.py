@@ -44,6 +44,7 @@ from flash_attn.cute.flash_bwd_sm120 import FlashAttentionBackwardSm120
 from flash_attn.cute.flash_bwd_postprocess import FlashAttentionBackwardPostprocess
 from flash_attn.cute.flash_fwd_combine import FlashAttentionForwardCombine
 from flash_attn.cute.flash_fwd_mla_sm100 import FlashAttentionMLAForwardSm100
+from flash_attn.cute.prepare_scheduler import FlashPrepareScheduler, SchedulerMetadataTensorsTorch
 
 # SM100 head_dim=256 2CTA kernel imports
 from flash_attn.cute.sm100_hd256_2cta_fmha_forward import BlackwellFusedMultiHeadAttentionForward
@@ -326,6 +327,10 @@ def _flash_attn_fwd(
     k_descale: Optional[torch.Tensor] = None,
     v_descale: Optional[torch.Tensor] = None,
     gather_kv_indices: Optional[torch.Tensor] = None,
+    scheduler_metadata: Optional[SchedulerMetadataTensorsTorch] = None,
+    seqlen_k_per_split: Optional[int] = None,
+    disable_scheduler_metadata: bool = False,
+    zfill_padded_output: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for FlashAttention.
 
@@ -675,6 +680,61 @@ def _flash_attn_fwd(
         sparse_kv = None
         disable_sparse_kv_bitmask = None
 
+
+    reuse_scheduler_metadata = scheduler_metadata is not None
+    is_varlen_q = cu_seqlens_q is not None or seqused_q is not None
+    if is_split_kv and is_varlen_q and scheduler_metadata is None and not disable_scheduler_metadata:
+        scheduler_metadata = get_scheduler_metadata(
+            num_batch=batch_size,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            nheads=num_head,
+            nheads_kv=num_head_kv,
+            headdim=head_dim,
+            num_splits=num_splits,
+            tile_m=tile_m,
+            tile_n=tile_n,
+            headdim_v=head_dim_v,
+            pack_gqa=pack_gqa,
+            causal=causal,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            seqused_q=seqused_q,
+            seqused_k=seqused_k,
+            seqlen_k_per_split=seqlen_k_per_split,
+        )
+
+    has_scheduler_metadata = scheduler_metadata is not None and not disable_scheduler_metadata
+    if has_scheduler_metadata:
+        (
+            num_m_blocks,
+            num_splits_dynamic,
+            varlen_batch_idx,
+            num_nheads_in_l2,
+            tile_count_semaphore,
+        ) = scheduler_metadata 
+        assert all(
+            t is None or t.is_cuda 
+            for t in scheduler_metadata
+        ), "scheduler metadata must be on CUDA device"
+        assert all(
+            t is None or t.shape == (batch_size,)
+            for t in (
+                num_m_blocks,
+                num_splits_dynamic,
+                varlen_batch_idx,
+                num_nheads_in_l2,
+            )
+        ), "these scheduler metadata tensors must have shape (batch_size,)"
+        if tile_count_semaphore is not None:
+            assert tile_count_semaphore.shape == (1,), "semaphore must have size 1"
+    else:
+        num_m_blocks = None 
+        num_splits_dynamic = None 
+        varlen_batch_idx = None 
+        num_nheads_in_l2 = None 
+        tile_count_semaphore = None 
+
     compile_key = (
         dtype,
         head_dim,
@@ -713,6 +773,12 @@ def _flash_attn_fwd(
         mma_pv_is_rs,
         intra_wg_overlap,
         use_clc_scheduler,
+        has_scheduler_metadata,
+        num_m_blocks is not None,
+        num_splits_dynamic is not None,
+        varlen_batch_idx is not None,
+        num_nheads_in_l2 is not None,
+        tile_count_semaphore is not None,
         qv is not None,
         gather_kv_length,
         sparse_kv,
@@ -783,6 +849,27 @@ def _flash_attn_fwd(
         aux_tensor_metadata = None
         if aux_tensors is not None:
             cute_aux_tensors = [to_cute_aux_tensor(buf) for buf in aux_tensors]
+
+        num_splits_dynamic_tensor = (
+            to_cute_tensor(num_splits_dynamic, assumed_align=4, leading_dim=0)
+            if num_splits_dynamic is not None else None
+        )
+        tile_count_semaphore_tensor = (
+            to_cute_tensor(tile_count_semaphore, assumed_align=4, leading_dim=0)
+            if tile_count_semaphore is not None else None
+        )
+        num_m_blocks_tensor = (
+            to_cute_tensor(num_m_blocks, assumed_align=4, leading_dim=0)
+            if num_m_blocks is not None else None
+        )
+        varlen_batch_idx_tensor = (
+            to_cute_tensor(varlen_batch_idx, assumed_align=4, leading_dim=0)
+            if varlen_batch_idx is not None else None
+        )
+        num_nheads_in_l2_tensor = (
+            to_cute_tensor(num_nheads_in_l2, assumed_align=4, leading_dim=0)
+            if num_nheads_in_l2 is not None else None
+        )
 
         qv_tensor = to_cute_tensor(qv) if qv is not None else None
         gather_kv_indices_tensor = to_cute_tensor(gather_kv_indices) if gather_kv_indices is not None else None
@@ -904,6 +991,7 @@ def _flash_attn_fwd(
                     q_subtile_factor=q_subtile_factor,
                     use_2cta_instrs=use_2cta_instrs,
                     use_clc_scheduler=use_clc_scheduler,
+                    has_tile_count_semaphore=tile_count_semaphore is not None,
                 )
         elif arch // 10 == 12:
             # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
@@ -970,17 +1058,19 @@ def _flash_attn_fwd(
                 window_size_left,
                 window_size_right,
                 learnable_sink_tensor,
-            ]
-            if arch // 10 in [10, 11]:
-                compile_args.append(descale_tensors_tensor)
-            compile_args.extend([
                 sparse_tensors,
                 cute_aux_tensors,
-            ])
-            compile_args.append(current_stream)
-            _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
-                *compile_args, options="--enable-tvm-ffi"
-            )
+                num_splits_dynamic_tensor,
+                tile_count_semaphore_tensor,
+                num_m_blocks_tensor,
+                varlen_batch_idx_tensor,
+                num_nheads_in_l2_tensor,
+                max_seqlen_q,
+                current_stream,
+            ]
+            if arch // 10 in [10, 11]:
+                compile_args.insert(-9, descale_tensors_tensor)
+            _flash_attn_fwd.compile_cache[compile_key] = cute.compile(*compile_args, options="--enable-tvm-ffi")
 
     if not is_fake_mode():
         q_call, k_call, v_call = q.detach(), k.detach(), v.detach()
@@ -1048,6 +1138,12 @@ def _flash_attn_fwd(
                 if normalized_block_sparse_tensors is not None
                 else None,
                 aux_tensors,
+                num_splits_dynamic,
+                tile_count_semaphore,
+                num_m_blocks,
+                varlen_batch_idx,
+                num_nheads_in_l2,
+                max_seqlen_q,
             ])
             _flash_attn_fwd.compile_cache[compile_key](*call_args)
     if is_split_kv:
@@ -1058,7 +1154,11 @@ def _flash_attn_fwd(
             lse.transpose(-1, -2) if lse is not None else None,
             cu_seqlens_q,
             seqused_q,
+            num_splits_dynamic_ptr=num_splits_dynamic if has_scheduler_metadata else None,
+            varlen_batch_idx=varlen_batch_idx if has_scheduler_metadata else None,
         )
+    if reuse_scheduler_metadata and tile_count_semaphore is not None:
+        tile_count_semaphore.zero_()
     return out, lse
 
 
@@ -2036,6 +2136,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         block_sparse_tensors: Optional[list] = None,
         aux_tensors: Optional[list] = None,
         return_lse: bool = False,
+        scheduler_metadata: Optional["SchedulerMetadataTensorsTorch"] = None,
+        seqlen_k_per_split: Optional[int] = None,
+        disable_scheduler_metadata: bool = False,
     ):
         out, lse = _flash_attn_fwd(
             q,
@@ -2064,6 +2167,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             aux_tensors=aux_tensors,
             return_lse=return_lse,
             gather_kv_indices=gather_kv_indices,
+            scheduler_metadata=scheduler_metadata,
+            seqlen_k_per_split=seqlen_k_per_split,
+            disable_scheduler_metadata=disable_scheduler_metadata,
         )
         ctx.save_for_backward(
             q,
@@ -2200,6 +2306,9 @@ def flash_attn_varlen_func(
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     aux_tensors: Optional[list] = None,
     return_lse: bool = False,
+    scheduler_metadata: Optional[SchedulerMetadataTensorsTorch] = None,
+    seqlen_k_per_split: Optional[int] = None,
+    disable_scheduler_metadata: bool = False,
 ):
     """
     Explanation of some optional arguments:
@@ -2243,12 +2352,16 @@ def flash_attn_varlen_func(
         block_sparse_tensors,
         aux_tensors,
         return_lse,
+        scheduler_metadata,
+        seqlen_k_per_split,
+        disable_scheduler_metadata,
     )
 
 
 def _compile_fwd_combine(
     dtype, dtype_partial, head_dim, tile_m, k_block_size, log_max_splits,
     has_cu_seqlens, has_seqused, has_lse, has_varlen_batch_idx,
+    has_num_splits_dynamic, has_semaphore_to_reset,
 ):
     """Compile fwd combine kernel using cute fake tensors (no real GPU tensors needed)."""
     sym = cute.sym_int
@@ -2290,9 +2403,9 @@ def _compile_fwd_combine(
     batchp1 = sym()
     mCuSeqlens = fake_tensor(Int32, (batchp1,), divisibility=1) if has_cu_seqlens else None
     mSeqused = fake_tensor(Int32, (batch_for_1d,), divisibility=1) if has_seqused else None
-    mNumSplitsDynamic = None  # Not parametrized in compile_key
+    mNumSplitsDynamic = fake_tensor(Int32, (batch_for_1d,), divisibility=1) if has_num_splits_dynamic else None
     mVarlenBatchIdx = fake_tensor(Int32, (batch_for_1d,), divisibility=1) if has_varlen_batch_idx else None
-    mSemaphore = None  # Not parametrized in compile_key
+    mSemaphore = fake_tensor(Int32, (1,), divisibility=1) if has_semaphore_to_reset else None
 
     return cute.compile(
         fa_combine,
@@ -2381,6 +2494,8 @@ def _flash_attn_fwd_combine(
         seqused is not None,
         lse is not None,
         varlen_batch_idx is not None,
+        num_splits_dynamic_ptr is not None,
+        semaphore_to_reset is not None,
     )
     if compile_key not in _flash_attn_fwd_combine.compile_cache:
         _flash_attn_fwd_combine.compile_cache[compile_key] = _compile_fwd_combine(
@@ -2484,3 +2599,189 @@ def flash_attn_combine(
         varlen_batch_idx=varlen_batch_idx,
     )
     return out, lse
+
+
+def get_scheduler_metadata(
+    num_batch: int,
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    nheads: int,
+    nheads_kv: int,
+    headdim: int,
+    num_splits: int,
+    tile_m: int,
+    tile_n: int,
+    headdim_v: Optional[int] = None,
+    pack_gqa: Optional[bool] = False,
+    causal: bool = False,
+    enable_pdl: bool = False,
+    sort: bool = False,
+    seqlen_k_new: int = 0,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k: Optional[torch.Tensor] = None,
+    cu_seqlens_k_new: Optional[torch.Tensor] = None,
+    seqused_q: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
+    leftpad_k: Optional[torch.Tensor] = None,
+    seqlen_k_per_split: Optional[int] = None,
+    zfill_padded_output: bool = True,
+) -> SchedulerMetadataTensorsTorch:
+    device = None
+    for t in [cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k]:
+        if t is not None:
+            device = t.device
+            break
+    if device is None:
+        raise ValueError(
+            "At least one of cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k must be provided on device"
+        )
+    if headdim_v is None:
+        headdim_v = headdim
+
+    # Override enable_pdl (not supported yet)
+    enable_pdl = False
+
+    # Override sort (not supported yet)
+    sort = False
+
+    if seqlen_k_per_split is not None:
+        assert seqlen_k_per_split % tile_n == 0, "seqlen per split must be divisible by tile_n"
+        n_blocks_per_split = seqlen_k_per_split // tile_n
+    else:
+        n_blocks_per_split = None
+
+    # Allocate metadata torch tensors
+    num_m_blocks = torch.empty(num_batch, dtype=torch.int32, device=device)
+    num_splits_dynamic = torch.empty(num_batch, dtype=torch.int32, device=device)
+    varlen_batch_idx = torch.empty(num_batch, dtype=torch.int32, device=device) if sort else None
+    num_nheads_in_l2 = torch.empty(num_batch, dtype=torch.int32, device=device) if causal else None
+    tile_count_semaphore = torch.empty(1, dtype=torch.int32, device=device)
+
+    # Compute num_warps based on num_batch (capped at 32)
+    num_warps = min((num_batch + 30) // 31, 32)
+    # Round up to the nearest power of 2
+    num_warps = 1 << (num_warps - 1).bit_length()
+
+    cache_key = (
+        num_warps,
+        tile_m,
+        tile_n,
+        nheads,
+        nheads_kv,
+        headdim,
+        headdim_v,
+        causal,
+        pack_gqa,
+        enable_pdl,
+        sort,
+        cu_seqlens_q is not None,
+        cu_seqlens_k is not None,
+        cu_seqlens_k_new is not None,
+        seqused_q is not None,
+        seqused_k is not None,
+        leftpad_k is not None,
+        num_m_blocks is not None,
+        num_splits_dynamic is not None,
+        varlen_batch_idx is not None,
+        num_nheads_in_l2 is not None,
+        tile_count_semaphore is not None,
+        n_blocks_per_split is not None,
+        zfill_padded_output,
+    )
+
+    if cache_key not in get_scheduler_metadata.compile_cache:
+        (
+            num_m_blocks_cute,
+            num_splits_dynamic_cute,
+            varlen_batch_idx_cute,
+            num_nheads_in_l2_cute,
+            tile_count_semaphore_cute,
+            cu_seqlens_q_cute,
+            cu_seqlens_k_cute,
+            cu_seqlens_k_new_cute,
+            seqused_q_cute,
+            seqused_k_cute,
+            leftpad_k_cute,
+        ) = [
+            to_cute_tensor(t, assumed_align=4) if t is not None else None
+            for t in (
+                num_m_blocks,
+                num_splits_dynamic,
+                varlen_batch_idx,
+                num_nheads_in_l2,
+                tile_count_semaphore,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                cu_seqlens_k_new,
+                seqused_q,
+                seqused_k,
+                leftpad_k,
+            )
+        ]
+        scheduler = FlashPrepareScheduler(
+            num_warps,
+            tile_m,
+            tile_n,
+            nheads,
+            nheads_kv,
+            headdim,
+            headdim_v,
+            causal,
+            packgqa=pack_gqa,
+            sort=sort,
+            zfill_padded_output=zfill_padded_output,
+        )
+        get_scheduler_metadata.compile_cache[cache_key] = cute.compile(
+            scheduler,
+            max_seqlen_q,
+            max_seqlen_k,
+            seqlen_k_new,
+            cu_seqlens_q_cute,
+            cu_seqlens_k_cute,
+            cu_seqlens_k_new_cute,
+            seqused_q_cute,
+            seqused_k_cute,
+            leftpad_k_cute,
+            num_batch,
+            num_splits,
+            tile_count_semaphore_cute,
+            num_m_blocks_cute,
+            num_splits_dynamic_cute,
+            varlen_batch_idx_cute,
+            num_nheads_in_l2_cute,
+            n_blocks_per_split,
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+            options="--enable-tvm-ffi",
+        )
+
+    if not is_fake_mode():
+        get_scheduler_metadata.compile_cache[cache_key](
+            max_seqlen_q,
+            max_seqlen_k,
+            seqlen_k_new,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            cu_seqlens_k_new,
+            seqused_q,
+            seqused_k,
+            leftpad_k,
+            num_batch,
+            num_splits,
+            tile_count_semaphore,
+            num_m_blocks,
+            num_splits_dynamic,
+            varlen_batch_idx,
+            num_nheads_in_l2,
+            n_blocks_per_split,
+        )
+
+        return SchedulerMetadataTensorsTorch(
+            num_m_blocks_ptr=num_m_blocks,
+            num_splits_dynamic_ptr=num_splits_dynamic,
+            varlen_batch_idx_ptr=varlen_batch_idx,
+            num_nheads_in_l2_ptr=num_nheads_in_l2,
+            tile_count_semaphore=tile_count_semaphore,
+        )
+
+
+get_scheduler_metadata.compile_cache = get_jit_cache("scheduler_metadata")

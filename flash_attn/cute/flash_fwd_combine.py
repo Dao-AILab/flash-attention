@@ -394,8 +394,9 @@ class FlashAttentionForwardCombine:
         num_head = mO_partial.shape[3]
         max_idx = seqlen * num_head
 
-        # Early exit for single split if dynamic
-        if (const_expr(num_splits_dynamic_ptr is None) or num_splits > 1) and (
+        # TODO: early exit for single split if dynamic — for now always merge so the
+        # num_splits_dynamic == 1 case still writes mO from mO_partial[0].
+        if (const_expr(num_splits_dynamic_ptr is None) or num_splits > 0) and (
             const_expr(not varlen) or m_block * self.tile_m < max_idx
         ):
             # Wait for dependent grids (e.g., the main attention kernel that produces O_partial/LSE_partial)
