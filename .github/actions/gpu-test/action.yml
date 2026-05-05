@@ -10,6 +10,10 @@ inputs:
     description: parallel workers for Pass 1 kernel compilation
     required: false
     default: "64"
+  skip-compile:
+    description: skip Pass 1 kernel compilation and use cached kernels from a prior run
+    required: false
+    default: "false"
   slack-webhook-url:
     description: Slack webhook URL for no-idle-GPU notifications
     required: false
@@ -71,4 +75,5 @@ runs:
           --repo-root "$GITHUB_WORKSPACE" \
           --test-filter "${{ inputs.test-filter }}" \
           --compile-workers "${{ inputs.compile-workers }}" \
-          --use-all-free-gpus
+          --use-all-free-gpus \
+          ${{ inputs.skip-compile == 'true' && '--skip-compile' || '' }}

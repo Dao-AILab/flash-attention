@@ -7,6 +7,8 @@ import time
 from pathlib import Path
 from getpass import getuser
 
+_test_start_times: dict[str, float] = {}
+
 
 def _get_gpu_ids():
     visible = os.environ.get("CUDA_VISIBLE_DEVICES")
@@ -69,6 +71,26 @@ def pytest_configure(config):
             gpu_ids = _get_gpu_ids()
 
     os.environ["CUDA_VISIBLE_DEVICES"] = gpu_ids[worker_num % len(gpu_ids)]
+
+_SLOW_THRESHOLD_S = 30.0
+
+
+def pytest_runtest_logstart(nodeid, location):
+    _test_start_times[nodeid] = time.monotonic()
+    logging.info(f"[START] {nodeid}")
+
+
+def pytest_runtest_logreport(report):
+    if report.when != "call":
+        return
+    start = _test_start_times.pop(report.nodeid, None)
+    duration = (time.monotonic() - start) if start is not None else report.duration
+    status = "PASSED" if report.passed else ("FAILED" if report.failed else "SKIPPED")
+    msg = f"[TEST] {status} {duration:.1f}s {report.nodeid}"
+    logging.info(msg)
+    if report.failed or duration >= _SLOW_THRESHOLD_S:
+        print(msg, flush=True)
+
 
 def pytest_collection_finish(session):
     if not session.config.option.collectonly:
