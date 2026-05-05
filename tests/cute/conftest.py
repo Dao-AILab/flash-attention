@@ -72,8 +72,12 @@ def pytest_configure(config):
 
     os.environ["CUDA_VISIBLE_DEVICES"] = gpu_ids[worker_num % len(gpu_ids)]
 
+_SLOW_THRESHOLD_S = 30.0
+
+
 def pytest_runtest_logstart(nodeid, location):
     _test_start_times[nodeid] = time.monotonic()
+    logging.info(f"[START] {nodeid}")
 
 
 def pytest_runtest_logreport(report):
@@ -83,8 +87,9 @@ def pytest_runtest_logreport(report):
     duration = (time.monotonic() - start) if start is not None else report.duration
     status = "PASSED" if report.passed else ("FAILED" if report.failed else "SKIPPED")
     msg = f"[TEST] {status} {duration:.1f}s {report.nodeid}"
-    print(msg, flush=True)
     logging.info(msg)
+    if report.failed or duration >= _SLOW_THRESHOLD_S:
+        print(msg, flush=True)
 
 
 def pytest_collection_finish(session):
