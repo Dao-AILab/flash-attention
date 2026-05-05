@@ -2258,6 +2258,42 @@ def test_dq_write_order_document_mask(seqlen_q, seqlen_k, spt):
     _run_write_order_test(doc_mask, seqlen_q, seqlen_k, block_size=128, B=B, H=H, spt=spt)
 
 
+@pytest.mark.skipif(COMPUTE_CAPABILITY not in (10, 11), reason="SM100/SM110 SplitKV forward only")
+def test_pack_gqa_splitkv_causal_fixed_len_matches_reference():
+    torch.manual_seed(456)
+    batch_size = 1
+    nheads = 8
+    nheads_kv = 2
+    seqlen_q = 257
+    seqlen_k = 513
+    headdim = 64
+    dtype = torch.bfloat16
+
+    mask_mod_cute, mask_mod_flex = get_mask_pair("causal", seqlen_q=seqlen_q, seqlen_k=seqlen_k)
+    tensors = create_tensors(
+        batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, headdim, headdim, dtype
+    )
+    out_split, _ = _flash_attn_fwd(
+        q=tensors["q"],
+        k=tensors["k"],
+        v=tensors["v"],
+        out=tensors["out"].clone(),
+        lse=tensors["lse"].clone(),
+        softmax_scale=1.0 / math.sqrt(headdim),
+        causal=True,
+        pack_gqa=True,
+        num_splits=16,
+        return_lse=True,
+    )
+
+    out_ref = compute_reference_flex_attn(tensors, mask_mod_flex)
+    out_ref_fp32 = compute_reference_flex_attn(
+        {name: tensor.float() for name, tensor in tensors.items()},
+        mask_mod_flex,
+    )
+    assert_fwd_matches_reference(out_split, out_ref_fp32, out_ref)
+
+
 @pytest.mark.skipif(COMPUTE_CAPABILITY not in (10, 11), reason="SM100/SM110 SplitKV block sparse forward only")
 def test_block_sparse_splitkv_matches_unsplit():
     torch.manual_seed(123)
