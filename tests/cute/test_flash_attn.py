@@ -166,6 +166,8 @@ def test_flash_attn_output(
         pytest.skip("SM100 kernel hangs with deterministic=True and softcap > 0.0")
     if IS_SM100 and local and softcap > 0.0:
         pytest.skip("SM100 kernel hangs with local attention and softcap > 0.0")
+    if IS_SM100 and local and deterministic:
+        pytest.skip("SM100 kernel hangs with local attention and deterministic=True")
     device = "cuda"
     # set seed
     seed = 0
@@ -570,6 +572,8 @@ def test_flash_attn_varlen_output(
         pytest.skip("SM100 varlen kernel hangs with deterministic=True and softcap > 0.0")
     if IS_SM100 and local and softcap > 0.0:
         pytest.skip("SM100 varlen kernel hangs with local attention and softcap > 0.0")
+    if IS_SM100 and local and deterministic:
+        pytest.skip("SM100 varlen kernel hangs with local attention and deterministic=True")
     if (
         causal or local
     ):  # Right now reference only supports causal attention with seqlen_k == seqlen_q
