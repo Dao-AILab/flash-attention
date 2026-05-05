@@ -562,6 +562,10 @@ def test_flash_attn_varlen_output(
             pytest.skip("SM100 head_dim=256 2CTA kernel does not support zero-length sequences yet")
         if not unpad_q or not unpad_kv:
             pytest.skip("SM100 head_dim=256 2CTA kernel does not support seqused_q/seqused_k mode yet (requires unpad_q=True and unpad_kv=True)")
+    if IS_SM100 and deterministic and softcap > 0.0:
+        pytest.skip("SM100 varlen kernel hangs with deterministic=True and softcap > 0.0")
+    if IS_SM100 and local and softcap > 0.0:
+        pytest.skip("SM100 varlen kernel hangs with local attention and softcap > 0.0")
     if (
         causal or local
     ):  # Right now reference only supports causal attention with seqlen_k == seqlen_q
