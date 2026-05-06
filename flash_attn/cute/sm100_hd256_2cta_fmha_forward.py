@@ -1,6 +1,7 @@
 # Copyright (c) 2025, Siyu Wang, Shengbin Di, Yuxi Chi, Johnsonms, Linfeng Zheng, Haoyan Huang, Lanbo Li, Yun Zhong, Man Yuan, Minmin Sun, Yong Li, Wei Lin.
 
 import math
+from functools import partial
 from typing import Tuple, Optional
 
 import cuda.bindings.driver as cuda
@@ -24,9 +25,9 @@ from flash_attn.cute.tile_scheduler import (
     Sm100FmhaClcDynamicTileScheduler as FmhaClcDynamicTileScheduler,
     Sm100FmhaClcDynamicTileSchedulerParams as FmhaClcDynamicTileSchedulerParams,
 )
-from flash_attn.cute.mask import (
-    Sm100FusedMask as FusedMask,
-)
+from flash_attn.cute.block_info import BlockInfo
+from flash_attn.cute.mask import AttentionMask
+from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.tile_scheduler import SM100_TMEM_CAPACITY_COLUMNS
 from flash_attn.cute.flash_fwd_sm100 import DescaleTensors, _TUNING_CONFIG
 from flash_attn.cute.utils import ex2_emulation_2
@@ -923,19 +924,29 @@ class BlackwellFusedMultiHeadAttentionForward:
                     # ((atom_v, rest_v), RestK)
                     tQgQ = tQgQ_qdl[None, mma_block_coord[0], None, mma_block_coord[2]]
 
-                    seqlen_kv_loop_start, seqlen_kv_loop_steps = (
-                        FusedMask.get_trip_start_count_via_block_info(
-                            mma_block_coord,
-                            self.qk_mma_tiler,
-                            seqlen_q,
-                            seqlen_k,
-                            self.is_causal,
-                            self.is_local,
-                            window_size_left,
-                            window_size_right,
-                        )
+                    seqlen_info = SeqlenInfoQK.create(
+                        batch_coord,
+                        mQ_qdl.shape[0],
+                        mK_kdl.shape[0],
+                        cum_seqlen_q,
+                        cum_seqlen_k,
+                        None,
+                        None,
+                        self.qk_mma_tiler[0],
+                        self.qk_mma_tiler[1],
                     )
-                    seqlen_kv_loop_end = seqlen_kv_loop_start + seqlen_kv_loop_steps
+                    block_info = BlockInfo(
+                        self.qk_mma_tiler[0],
+                        self.qk_mma_tiler[1],
+                        self.is_causal,
+                        self.is_local,
+                        window_size_left=window_size_left,
+                        window_size_right=window_size_right,
+                    )
+                    seqlen_kv_loop_start, seqlen_kv_loop_end = block_info.get_n_block_min_max(
+                        seqlen_info, mma_block_coord[0], Int32(0), Int32(1)
+                    )
+                    seqlen_kv_loop_steps = seqlen_kv_loop_end - seqlen_kv_loop_start
                     # Q
                     for iter in cutlass.range(self.iterations_qk, unroll=1):
                         q_handle = load_q_producer.acquire_and_advance()
@@ -1057,19 +1068,29 @@ class BlackwellFusedMultiHeadAttentionForward:
                         cuseqlen_k = cum_seqlen_k[batch_coord]
                         seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
 
-                    seqlen_kv_loop_start, seqlen_kv_loop_steps = (
-                        FusedMask.get_trip_start_count_via_block_info(
-                            mma_block_coord,
-                            self.qk_mma_tiler,
-                            seqlen_q,
-                            seqlen_k,
-                            self.is_causal,
-                            self.is_local,
-                            window_size_left,
-                            window_size_right,
-                        )
+                    seqlen_info = SeqlenInfoQK.create(
+                        batch_coord,
+                        mQ_qdl.shape[0],
+                        mK_kdl.shape[0],
+                        cum_seqlen_q,
+                        cum_seqlen_k,
+                        None,
+                        None,
+                        self.qk_mma_tiler[0],
+                        self.qk_mma_tiler[1],
                     )
-                    seqlen_kv_loop_end = seqlen_kv_loop_start + seqlen_kv_loop_steps
+                    block_info = BlockInfo(
+                        self.qk_mma_tiler[0],
+                        self.qk_mma_tiler[1],
+                        self.is_causal,
+                        self.is_local,
+                        window_size_left=window_size_left,
+                        window_size_right=window_size_right,
+                    )
+                    seqlen_kv_loop_start, seqlen_kv_loop_end = block_info.get_n_block_min_max(
+                        seqlen_info, mma_block_coord[0], Int32(0), Int32(1)
+                    )
+                    seqlen_kv_loop_steps = seqlen_kv_loop_end - seqlen_kv_loop_start
 
                     cta_rank_in_cluster = cute.arch.make_warp_uniform(
                         cute.arch.block_idx_in_cluster()
@@ -1308,71 +1329,98 @@ class BlackwellFusedMultiHeadAttentionForward:
                         cuseqlen_k = cum_seqlen_k[batch_coord]
                         seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
 
+                    seqlen_info = SeqlenInfoQK.create(
+                        batch_coord,
+                        mQ_qdl.shape[0],
+                        mK_kdl.shape[0],
+                        cum_seqlen_q,
+                        cum_seqlen_k,
+                        None,
+                        None,
+                        self.qk_mma_tiler[0],
+                        self.qk_mma_tiler[1],
+                    )
+                    mask = AttentionMask(
+                        self.qk_mma_tiler[0],
+                        self.qk_mma_tiler[1],
+                        seqlen_info,
+                        window_size_left=window_size_left,
+                        window_size_right=window_size_right,
+                    )
+                    shared_mask_kwargs = dict(
+                        m_block=mma_block_coord[0],
+                        thr_mma=qk_thr_mma,
+                        mask_causal=self.is_causal,
+                        mask_local=self.is_local,
+                        batch_idx=batch_coord,
+                        head_idx=curr_block_coord[2][0],
+                        aux_tensors=None,
+                    )
+                    mask_fn = partial(
+                        mask.apply_mask_sm100,
+                        mask_mod=None,
+                        fastdiv_mods=(None, None),
+                        head_divmod=None,
+                        **shared_mask_kwargs,
+                    )
+
                     row_max = -Float32.inf
                     row_max_prev = -Float32.inf
                     row_sum = 0.0
-
-                    start_count, trip_count = FusedMask.get_trip_start_count_via_block_info(
-                        mma_block_coord,
-                        self.qk_mma_tiler,
-                        seqlen_q,
-                        seqlen_k,
+                    block_info = BlockInfo(
+                        self.qk_mma_tiler[0],
+                        self.qk_mma_tiler[1],
                         self.is_causal,
                         self.is_local,
-                        window_size_left,
-                        window_size_right,
+                        window_size_left=window_size_left,
+                        window_size_right=window_size_right,
                     )
-                    end_count = start_count + trip_count
-                    if cutlass.const_expr(self.use_semantic_trip_range):
-                        n_block_min_causal_local_mask, n_block_min_before_local_mask = (
-                            FusedMask.get_trip_mask_bounds_via_block_info(
-                                mma_block_coord,
-                                self.qk_mma_tiler,
-                                seqlen_q,
-                                seqlen_k,
-                                self.is_causal,
-                                self.is_local,
-                                window_size_left,
-                                window_size_right,
-                            )
-                        )
-                    cS_base = cute.make_identity_tensor(
-                        (self.qk_mma_tiler[0], self.qk_mma_tiler[1])
+                    n_block_min, n_block_max = block_info.get_n_block_min_max(
+                        seqlen_info, mma_block_coord[0], Int32(0), Int32(1)
                     )
-                    cS = cute.domain_offset((mma_block_coord[0] * self.qk_mma_tiler[0], 0), cS_base)
+                    cS = cute.make_identity_tensor((self.qk_mma_tiler[0], self.qk_mma_tiler[1]))
                     tScS = qk_thr_mma.partition_C(cS)
 
-                    for step in cutlass.range(start_count, end_count, 1, unroll=1):
-                        cS_iter = cute.domain_offset((0, step * self.qk_mma_tiler[1]), cS)
-                        tScS_iter = qk_thr_mma.partition_C(cS_iter)
+                    if n_block_max > n_block_min:
                         if cutlass.const_expr(self.use_semantic_trip_range):
-                            need_apply_mask = (
-                                step >= n_block_min_causal_local_mask
-                                or step < n_block_min_before_local_mask
+                            n_block_min_causal_local_mask = block_info.get_n_block_min_causal_local_mask(
+                                seqlen_info, mma_block_coord[0], n_block_min
                             )
-                        else:
-                            # Residual path only needs seqlen masking on the last K tile.
-                            need_apply_mask = step == end_count - 1
-                        # Si -> Pi
-                        (
-                            row_max,
-                            row_sum,
-                            mma_s_consumer,
-                            p_mma_producer,
-                            s_corr_producer,
-                        ) = self.softmax_step(
-                            (need_apply_mask, window_size_left, window_size_right),
+                            n_block_min_before_local_mask = block_info.get_n_block_min_before_local_mask(
+                                seqlen_info, mma_block_coord[0], n_block_min
+                            )
+                        for n_tile in cutlass.range(n_block_max - n_block_min, unroll=1):
+                            n_block = n_block_min + n_tile
+                            if cutlass.const_expr(self.use_semantic_trip_range):
+                                need_apply_mask = (
+                                    n_block >= n_block_min_causal_local_mask
+                                    or n_block < n_block_min_before_local_mask
+                                )
+                                mask_seqlen = False
+                            else:
+                                # Residual path only needs seqlen masking on the last K tile.
+                                need_apply_mask = n_block == n_block_max - 1
+                                mask_seqlen = True
                             (
-                                row_max_prev,
+                                row_max,
                                 row_sum,
-                                seqlen_q,
-                                seqlen_k,
-                                scale_softmax_log2,
-                            ),
-                            (tStS, tScS_iter),
-                            (mma_s_consumer, p_mma_producer, s_corr_producer),
-                        )
-                        row_max_prev = row_max
+                                mma_s_consumer,
+                                p_mma_producer,
+                                s_corr_producer,
+                            ) = self.softmax_step(
+                                (mask_fn, need_apply_mask, mask_seqlen),
+                                (
+                                    row_max_prev,
+                                    row_sum,
+                                    seqlen_q,
+                                    seqlen_k,
+                                    n_block,
+                                    scale_softmax_log2,
+                                ),
+                                (tStS, tScS),
+                                (mma_s_consumer, p_mma_producer, s_corr_producer),
+                            )
+                            row_max_prev = row_max
                     sum_producer = self.store_sum_max(
                         row_max,
                         mLSE,
@@ -1444,16 +1492,29 @@ class BlackwellFusedMultiHeadAttentionForward:
                         cute.select(self.pv_block_tiler, mode=[0, 1]),
                     )
 
-                    _, seqlen_kv_loop_steps = FusedMask.get_trip_start_count_via_block_info(
-                        mma_block_coord,
-                        self.qk_mma_tiler,
-                        seqlen_q,
-                        seqlen_k,
+                    seqlen_info = SeqlenInfoQK.create(
+                        batch_coord,
+                        mQ_qdl.shape[0],
+                        mK_kdl.shape[0],
+                        cum_seqlen_q,
+                        cum_seqlen_k,
+                        None,
+                        None,
+                        self.qk_mma_tiler[0],
+                        self.qk_mma_tiler[1],
+                    )
+                    block_info = BlockInfo(
+                        self.qk_mma_tiler[0],
+                        self.qk_mma_tiler[1],
                         self.is_causal,
                         self.is_local,
-                        window_size_left,
-                        window_size_right,
+                        window_size_left=window_size_left,
+                        window_size_right=window_size_right,
                     )
+                    n_block_min, n_block_max = block_info.get_n_block_min_max(
+                        seqlen_info, mma_block_coord[0], Int32(0), Int32(1)
+                    )
+                    seqlen_kv_loop_steps = n_block_max - n_block_min
                     gO_staged = gO_qdl[None, None, curr_block_coord[0], None, curr_block_coord[2]]
                     cO_staged = cO_qdl[None, None, curr_block_coord[0], None, curr_block_coord[2]]
                     cS = cute.make_identity_tensor((self.qk_mma_tiler[0], self.qk_mma_tiler[1]))
@@ -1524,8 +1585,8 @@ class BlackwellFusedMultiHeadAttentionForward:
         tensor_args: Tuple,
         pipeline_args: Tuple,
     ) -> Tuple[Float32, Float32, pipeline.PipelineConsumer, pipeline.PipelineProducer]:
-        need_apply_mask, window_size_left, window_size_right = mask_args
-        row_max, row_sum, seqlen_q, seqlen_k, scale_softmax_log2 = value_args
+        mask_fn, need_apply_mask, mask_seqlen = mask_args
+        row_max, row_sum, seqlen_q, seqlen_k, n_block, scale_softmax_log2 = value_args
         tStS, tScS = tensor_args
         mma_s_consumer, p_mma_producer, s_corr_producer = pipeline_args
         tidx, _, _ = cute.arch.thread_idx()
@@ -1546,17 +1607,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         cute.arch.fence_view_async_tmem_load()
         s_handle.release()
         if need_apply_mask:
-            FusedMask.apply_mask_via_causal_local(
-                tTMEM_LOADrS,
-                tTMEM_LOADcS,
-                seqlen_q,
-                seqlen_k,
-                self.use_semantic_trip_range,
-                self.is_causal,
-                self.is_local,
-                window_size_left,
-                window_size_right,
-            )
+            partial(mask_fn, thr_tmem_load=thr_load, mask_seqlen=mask_seqlen)(tTMEM_LOADrS, n_block=n_block)
         old_row_max = row_max
         row_max = tTMEM_LOADrS.load().reduce(cute.ReductionOp.MAX, row_max, 0)
         row_max_safe = row_max
