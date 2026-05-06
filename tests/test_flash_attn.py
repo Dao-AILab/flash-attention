@@ -16,6 +16,7 @@ from flash_attn import (
 from flash_attn.bert_padding import pad_input, unpad_input
 from flash_attn.flash_attn_interface import _get_block_size_n
 from flash_attn.layers.rotary import apply_rotary_emb
+from flash_attn.flash_attn_interface import _flash_attn_varlen_forward
 
 MAX_HEADDIM_SM8x = 192
 
@@ -2525,59 +2526,93 @@ def test_flash_attn_varlen_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, caus
         assert torch.equal(dq, dq0)
 
 
+@pytest.mark.parametrize("num_splits", [0, 1, 2, 4])
+@pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_flash_attn_varlen_paged_kv_num_splits(dtype):
-    """Passing num_splits=0 explicitly should be bitwise identical to not passing it (default)."""
-    from flash_attn.flash_attn_interface import _flash_attn_varlen_forward
+def test_flash_attn_varlen_paged_kv_splitkv(num_splits, causal, dtype):
+    """Varlen + paged KV + split KV with max_seqlen_q > 1 and varying actual seqlens.
+
+    Reference is non-paged varlen using the standard kernel (no split KV).
+    Test scatters the same K/V into pages and runs paged varlen with split KV.
+    """
 
     device = "cuda"
     num_heads, num_heads_k, head_dim = 4, 2, 64
     page_block_size = 256
     scale = head_dim ** -0.5
 
-    batch_size = 2
-    kv_lens = [512, 1024]
+    q_lens = [17, 64, 31]
+    kv_lens = [512, 1024, 256]
+    batch_size = len(q_lens)
+    max_seqlen_q = max(q_lens)
     max_seqlen_k = max(kv_lens)
+    total_q = sum(q_lens)
+    total_k = sum(kv_lens)
 
+    q = torch.randn(total_q, num_heads, head_dim, device=device, dtype=dtype)
+    k = torch.randn(total_k, num_heads_k, head_dim, device=device, dtype=dtype)
+    v = torch.randn(total_k, num_heads_k, head_dim, device=device, dtype=dtype)
+
+    cu_seqlens_q = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+    cu_seqlens_k = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+    for i in range(batch_size):
+        cu_seqlens_q[i + 1] = cu_seqlens_q[i] + q_lens[i]
+        cu_seqlens_k[i + 1] = cu_seqlens_k[i] + kv_lens[i]
+
+    # Reference: non-paged varlen, standard kernel
+    out_ref, lse_ref, _, _ = _flash_attn_varlen_forward(
+        q, k, v, cu_seqlens_q, cu_seqlens_k,
+        max_seqlen_q, max_seqlen_k, 0.0, scale,
+        causal=causal, window_size_left=-1, window_size_right=0,
+    )
+    assert not out_ref.isnan().any(), "reference produced NaN"
+
+    # Scatter contiguous K/V into paged layout
     max_blocks_per_seq = max(
         (s + page_block_size - 1) // page_block_size for s in kv_lens
     )
     total_blocks = batch_size * max_blocks_per_seq
-    k_cache = torch.randn(
+    k_cache = torch.zeros(
         total_blocks, page_block_size, num_heads_k, head_dim,
         device=device, dtype=dtype,
     )
-    v_cache = torch.randn(
+    v_cache = torch.zeros(
         total_blocks, page_block_size, num_heads_k, head_dim,
         device=device, dtype=dtype,
     )
-
     block_table = rearrange(
         torch.randperm(total_blocks, dtype=torch.int32, device=device),
         "(b nblocks) -> b nblocks",
         b=batch_size,
     )
+    for b in range(batch_size):
+        k_start = cu_seqlens_k[b].item()
+        for j in range(0, kv_lens[b], page_block_size):
+            page_idx = block_table[b, j // page_block_size].item()
+            chunk = min(page_block_size, kv_lens[b] - j)
+            k_cache[page_idx, :chunk] = k[k_start + j : k_start + j + chunk]
+            v_cache[page_idx, :chunk] = v[k_start + j : k_start + j + chunk]
 
-    q = torch.randn(batch_size, num_heads, head_dim, device=device, dtype=dtype)
-    cu_seqlens_q = torch.arange(batch_size + 1, dtype=torch.int32, device=device)
     seqused_k = torch.tensor(kv_lens, dtype=torch.int32, device=device)
-    cu_seqlens_k = torch.nn.functional.pad(seqused_k.cumsum(0), (1, 0)).to(torch.int32)
 
-    fwd_kwargs = dict(
-        cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
-        max_seqlen_q=1, max_seqlen_k=max_seqlen_k,
-        dropout_p=0.0, softmax_scale=scale,
-        causal=False, window_size_left=-1, window_size_right=0,
+    # Test: paged varlen with split KV
+    out_test, lse_test, _, _ = _flash_attn_varlen_forward(
+        q, k_cache, v_cache, cu_seqlens_q, cu_seqlens_k,
+        max_seqlen_q, max_seqlen_k, 0.0, scale,
+        causal=causal, window_size_left=-1, window_size_right=0,
         block_table=block_table, seqused_k=seqused_k,
+        num_splits=num_splits,
     )
-
-    out_default = _flash_attn_varlen_forward(q, k_cache, v_cache, **fwd_kwargs)[0]
-    out_explicit = _flash_attn_varlen_forward(q, k_cache, v_cache, **fwd_kwargs, num_splits=0)[0]
-
-    assert not out_default.isnan().any(), "default num_splits produced NaN"
-    assert torch.equal(out_default, out_explicit), (
-        f"default vs num_splits=0 differ: max diff {(out_default - out_explicit).abs().max().item()}"
-    )
-
-    with pytest.raises(RuntimeError, match="num_splits > 1 is not supported"):
-        _flash_attn_varlen_forward(q, k_cache, v_cache, **fwd_kwargs, num_splits=2)
+    assert not out_test.isnan().any(), f"num_splits={num_splits} produced NaN"
+    if num_splits == 1:
+        assert torch.equal(out_test, out_ref), (
+            f"num_splits=1 should be bitwise identical to non-paged reference, "
+            f"max diff: {(out_test - out_ref).abs().max().item()}"
+        )
+        assert torch.equal(lse_test, lse_ref), (
+            f"num_splits=1 LSE should be bitwise identical, "
+            f"max diff: {(lse_test - lse_ref).abs().max().item()}"
+        )
+    else:
+        torch.testing.assert_close(out_test, out_ref, rtol=5e-3, atol=5e-3)
+        torch.testing.assert_close(lse_test, lse_ref, rtol=5e-3, atol=5e-3)

@@ -1200,7 +1200,18 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
         if (params.unpadded_lse) {
             const index_t lse_offset = row_offset_lse + tidx / kRowsPerLoadTranspose;
             if (lse_offset < lse_size) {
-                gLSE_unpadded(lse_offset) = lse_logsum;
+                if (params.cu_seqlens_q != nullptr) {
+                    const int batch_idx = lse_offset / (params.h * params.seqlen_q);
+                    const int head_idx = (lse_offset - batch_idx * (params.h * params.seqlen_q)) / params.seqlen_q;
+                    const int row = lse_offset - batch_idx * (params.h * params.seqlen_q) - head_idx * params.seqlen_q;
+                    const int actual_seqlen_q = params.cu_seqlens_q[batch_idx + 1] - params.cu_seqlens_q[batch_idx];
+                    if (row < actual_seqlen_q) {
+                        const index_t lse_addr = head_idx * index_t(params.total_q) + params.cu_seqlens_q[batch_idx] + row;
+                        reinterpret_cast<ElementAccum *>(params.softmax_lse_ptr)[lse_addr] = lse_logsum;
+                    }
+                } else {
+                    gLSE_unpadded(lse_offset) = lse_logsum;
+                }
             }
         } else {
             gLSE(tidx / kRowsPerLoadTranspose) = lse_logsum;
@@ -1273,7 +1284,14 @@ inline __device__ void combine_attn_seqk_parallel(const Params &params) {
             const int head_idx = (idx - batch_idx * (params.h * params.seqlen_q)) / params.seqlen_q;
             // The index to the rows of Q
             const int row = idx - batch_idx * (params.h * params.seqlen_q) - head_idx * params.seqlen_q;
-            auto o_ptr = reinterpret_cast<Element *>(params.o_ptr) + batch_idx * params.o_batch_stride
+            if (params.cu_seqlens_q != nullptr) {
+                const int actual_seqlen_q = params.cu_seqlens_q[batch_idx + 1] - params.cu_seqlens_q[batch_idx];
+                if (row >= actual_seqlen_q) continue;
+            }
+            const index_t batch_offset = params.cu_seqlens_q == nullptr
+                ? batch_idx * params.o_batch_stride
+                : index_t(params.cu_seqlens_q[batch_idx]) * params.o_row_stride;
+            auto o_ptr = reinterpret_cast<Element *>(params.o_ptr) + batch_offset
                 + head_idx * params.o_head_stride + row * params.o_row_stride;
             #pragma unroll
             for (int k = 0; k < size<2>(rO); ++k) {
