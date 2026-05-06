@@ -72,7 +72,7 @@ class SeqlenInfoQK:
     seqlen_q: Int32
     seqlen_k: Int32
     m_block_offset: Int32
-    n_block_offset: Int32
+    block_idx_offset: Int32
     num_n_blocks: Int32
     has_cu_seqlens_q: cutlass.Constexpr[bool]
     has_cu_seqlens_k: cutlass.Constexpr[bool]
@@ -89,7 +89,7 @@ class SeqlenInfoQK:
         mSeqUsedQ: Optional[cute.Tensor] = None,
         mSeqUsedK: Optional[cute.Tensor] = None,
         mCuTotalMBlocks: Optional[cute.Tensor] = None,
-        mCuTotalNBlocks: Optional[cute.Tensor] = None,
+        mCuBlockIdxOffsets: Optional[cute.Tensor] = None,
         tile_m: cutlass.Constexpr[Int32] = 128,
         tile_n: cutlass.Constexpr[Int32] = 128,
     ):
@@ -123,10 +123,11 @@ class SeqlenInfoQK:
             )
         m_block_offset = 0 if const_expr(mCuTotalMBlocks is None) else mCuTotalMBlocks[batch_idx]
         num_n_blocks = (seqlen_k + tile_n - 1) // tile_n
-        if const_expr(mCuTotalNBlocks is not None):
-            n_block_offset = mCuTotalNBlocks[batch_idx]
-        else:
-            n_block_offset = m_block_offset * num_n_blocks
+        block_idx_offset = (
+            mCuBlockIdxOffsets[batch_idx]
+            if const_expr(mCuBlockIdxOffsets is not None)
+            else m_block_offset * num_n_blocks
+        )
         return SeqlenInfoQK(
             offset_q,
             offset_k,
@@ -135,7 +136,7 @@ class SeqlenInfoQK:
             seqlen_q,
             seqlen_k,
             m_block_offset,
-            n_block_offset,
+            block_idx_offset,
             num_n_blocks,
             has_cu_seqlens_q=mCuSeqlensQ is not None,
             has_cu_seqlens_k=mCuSeqlensK is not None,

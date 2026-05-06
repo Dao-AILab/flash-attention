@@ -487,7 +487,7 @@ def _compare_block_sparsity_varlen(
     full_block_cnt,
     full_block_idx,
     cu_total_m_blocks,
-    cu_total_n_blocks,
+    cu_block_idx_offsets,
     seqlens_q,
     seqlens_k,
     nheads,
@@ -499,7 +499,7 @@ def _compare_block_sparsity_varlen(
     """Compare varlen block sparsity against per-sequence fixed-length references."""
     batch_size = len(seqlens_q)
     cu_m = cu_total_m_blocks.cpu().tolist()
-    cu_n = cu_total_n_blocks.cpu().tolist()
+    cu_n = cu_block_idx_offsets.cpu().tolist()
 
     for b in range(batch_size):
         sq, sk = seqlens_q[b], seqlens_k[b]
@@ -627,7 +627,7 @@ def _generate_varlen_inputs(
         seqlens_k: list of per-batch key sequence lengths
         tile_m, tile_n: tile sizes
     Returns:
-        cu_seqlens_q, cu_seqlens_k, cu_total_m_blocks, cu_total_n_blocks
+        cu_seqlens_q, cu_seqlens_k, cu_total_m_blocks, cu_block_idx_offsets
     """
     batch_size = len(seqlens_q)
     assert len(seqlens_k) == batch_size
@@ -635,7 +635,7 @@ def _generate_varlen_inputs(
     cu_seqlens_q = [0]
     cu_seqlens_k = [0]
     cu_total_m_blocks = [0]
-    cu_total_n_blocks = [0]
+    cu_block_idx_offsets = [0]
 
     for b in range(batch_size):
         cu_seqlens_q.append(cu_seqlens_q[-1] + seqlens_q[b])
@@ -643,13 +643,13 @@ def _generate_varlen_inputs(
         num_m = (seqlens_q[b] + tile_m - 1) // tile_m
         num_n = (seqlens_k[b] + tile_n - 1) // tile_n
         cu_total_m_blocks.append(cu_total_m_blocks[-1] + num_m)
-        cu_total_n_blocks.append(cu_total_n_blocks[-1] + num_m * num_n)
+        cu_block_idx_offsets.append(cu_block_idx_offsets[-1] + num_m * num_n)
 
     return (
         torch.tensor(cu_seqlens_q, device=device, dtype=torch.int32),
         torch.tensor(cu_seqlens_k, device=device, dtype=torch.int32),
         torch.tensor(cu_total_m_blocks, device=device, dtype=torch.int32),
-        torch.tensor(cu_total_n_blocks, device=device, dtype=torch.int32),
+        torch.tensor(cu_block_idx_offsets, device=device, dtype=torch.int32),
     )
 
 
@@ -674,7 +674,7 @@ def _call_compute_block_sparsity_varlen(
         mask_name, seqlen_q=max_seqlen_q, seqlen_k=max_seqlen_k, window_size=window_size
     )
 
-    cu_seqlens_q, cu_seqlens_k, cu_total_m_blocks, cu_total_n_blocks = (
+    cu_seqlens_q, cu_seqlens_k, cu_total_m_blocks, cu_block_idx_offsets = (
         _generate_varlen_inputs(seqlens_q, seqlens_k, tile_m, tile_n)
     )
 
@@ -691,7 +691,7 @@ def _call_compute_block_sparsity_varlen(
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_k=cu_seqlens_k,
         cu_total_m_blocks=cu_total_m_blocks,
-        cu_total_n_blocks=cu_total_n_blocks,
+        cu_block_idx_offsets=cu_block_idx_offsets,
         use_fast_sampling=use_fast_sampling,
     )
     mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx, *_ = torch_tensors
@@ -701,7 +701,7 @@ def _call_compute_block_sparsity_varlen(
         full_block_cnt,
         full_block_idx,
         cu_total_m_blocks,
-        cu_total_n_blocks,
+        cu_block_idx_offsets,
     )
 
 
@@ -717,7 +717,7 @@ def test_varlen(seqlens_q, seqlens_k, tile_m, tile_n, nheads, mask_name):
         full_block_cnt,
         full_block_idx,
         cu_total_m_blocks,
-        cu_total_n_blocks,
+        cu_block_idx_offsets,
     ) = _call_compute_block_sparsity_varlen(
         seqlens_q, seqlens_k, nheads, tile_m, tile_n, mask_name
     )
@@ -728,7 +728,7 @@ def test_varlen(seqlens_q, seqlens_k, tile_m, tile_n, nheads, mask_name):
         full_block_cnt,
         full_block_idx,
         cu_total_m_blocks,
-        cu_total_n_blocks,
+        cu_block_idx_offsets,
         seqlens_q,
         seqlens_k,
         nheads,
@@ -769,7 +769,7 @@ def test_varlen_parameterized_masks(
         full_block_cnt,
         full_block_idx,
         cu_total_m_blocks,
-        cu_total_n_blocks,
+        cu_block_idx_offsets,
     ) = _call_compute_block_sparsity_varlen(
         seqlens_q, seqlens_k, nheads, tile_m, tile_n, mask_name, window_size=window_size
     )
@@ -780,7 +780,7 @@ def test_varlen_parameterized_masks(
         full_block_cnt,
         full_block_idx,
         cu_total_m_blocks,
-        cu_total_n_blocks,
+        cu_block_idx_offsets,
         seqlens_q,
         seqlens_k,
         nheads,
@@ -817,7 +817,7 @@ def test_varlen_matches_fixed_length(nheads, tile_m, tile_n):
         vl_full_cnt,
         vl_full_idx,
         cu_total_m_blocks,
-        cu_total_n_blocks,
+        cu_block_idx_offsets,
     ) = _call_compute_block_sparsity_varlen(
         seqlens_q, seqlens_k, nheads, tile_m, tile_n, mask_name
     )
@@ -825,7 +825,7 @@ def test_varlen_matches_fixed_length(nheads, tile_m, tile_n):
     num_m = (seqlen_q + tile_m - 1) // tile_m
     num_n = (seqlen_k + tile_n - 1) // tile_n
     cu_m = cu_total_m_blocks.cpu().tolist()
-    cu_n = cu_total_n_blocks.cpu().tolist()
+    cu_n = cu_block_idx_offsets.cpu().tolist()
 
     for b in range(batch_size):
         for h in range(nheads):

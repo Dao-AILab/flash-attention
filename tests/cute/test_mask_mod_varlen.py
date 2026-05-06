@@ -631,7 +631,8 @@ def _make_block_sparse_tensors(
     seqused_k=None,
     aux_tensors=None,
 ):
-    """Compute block sparse tensors, returning (tensors, cu_total_m_blocks, cu_total_n_blocks)."""
+    """Compute block sparse tensors. cu_total_m_blocks / cu_block_idx_offsets are
+    populated on the returned BlockSparseTensorsTorch."""
     batch_size = len(seqlens_q)
     max_seqlen_q = max(seqlens_q)
     max_seqlen_k = max(seqlens_k)
@@ -645,21 +646,21 @@ def _make_block_sparse_tensors(
             cu_total_m_blocks_list, dtype=torch.int32, device=device
         )
 
-        cu_total_n_blocks = None
+        cu_block_idx_offsets = None
         if cu_seqlens_k is not None or seqused_k is not None:
-            cu_total_n_blocks_list = [0]
+            cu_block_idx_offsets_list = [0]
             for batch_idx in range(batch_size):
                 num_m_blocks = (seqlens_q[batch_idx] + tile_m - 1) // tile_m
                 num_n_blocks = (seqlens_k[batch_idx] + tile_n - 1) // tile_n
-                cu_total_n_blocks_list.append(
-                    cu_total_n_blocks_list[-1] + num_m_blocks * num_n_blocks
+                cu_block_idx_offsets_list.append(
+                    cu_block_idx_offsets_list[-1] + num_m_blocks * num_n_blocks
                 )
-            cu_total_n_blocks = torch.tensor(
-                cu_total_n_blocks_list, dtype=torch.int32, device=device
+            cu_block_idx_offsets = torch.tensor(
+                cu_block_idx_offsets_list, dtype=torch.int32, device=device
             )
     else:
         cu_total_m_blocks = None
-        cu_total_n_blocks = None
+        cu_block_idx_offsets = None
 
     block_sparse_tensors = compute_block_sparsity(
         tile_m=tile_m,
@@ -674,10 +675,10 @@ def _make_block_sparse_tensors(
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_k=cu_seqlens_k,
         cu_total_m_blocks=cu_total_m_blocks,
-        cu_total_n_blocks=cu_total_n_blocks,
+        cu_block_idx_offsets=cu_block_idx_offsets,
         seqused_k=seqused_k,
     )
-    return block_sparse_tensors, cu_total_m_blocks, cu_total_n_blocks
+    return block_sparse_tensors
 
 
 def _run_fwd(
@@ -689,8 +690,6 @@ def _run_fwd(
     cu_seqlens_k=None,
     seqused_k=None,
     block_sparse_tensors=None,
-    cu_total_m_blocks=None,
-    cu_total_n_blocks=None,
     aux_tensors=None,
 ):
     out = torch.empty_like(q)
@@ -717,8 +716,6 @@ def _run_fwd(
         score_mod=None,
         mask_mod=mask_mod,
         block_sparse_tensors=block_sparse_tensors,
-        cu_total_m_blocks=cu_total_m_blocks,
-        cu_total_n_blocks=cu_total_n_blocks,
         return_lse=False,
         aux_tensors=aux_tensors,
     )[0]
@@ -851,20 +848,18 @@ def test_varlen_block_sparse(
         mask_mod = get_mask_pair(mask_name)[0]
 
     num_heads_sparse = 1 if head_broadcast else num_heads
-    block_sparse_tensors, cu_total_m_blocks, cu_total_n_blocks = (
-        _make_block_sparse_tensors(
-            mask_mod=mask_mod,
-            seqlens_q=seqlens_q,
-            seqlens_k=seqlens_k,
-            num_heads=num_heads_sparse,
-            tile_m=tile_m,
-            tile_n=tile_n,
-            device=device,
-            cu_seqlens_q=cu_seqlens_q,
-            cu_seqlens_k=cu_seqlens_k,
-            seqused_k=seqused_k,
-            aux_tensors=aux_tensors,
-        )
+    block_sparse_tensors = _make_block_sparse_tensors(
+        mask_mod=mask_mod,
+        seqlens_q=seqlens_q,
+        seqlens_k=seqlens_k,
+        num_heads=num_heads_sparse,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        device=device,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        seqused_k=seqused_k,
+        aux_tensors=aux_tensors,
     )
 
     out_with_block_sparsity = _run_fwd(
@@ -876,8 +871,6 @@ def test_varlen_block_sparse(
         cu_seqlens_k=cu_seqlens_k,
         seqused_k=seqused_k,
         block_sparse_tensors=block_sparse_tensors,
-        cu_total_m_blocks=cu_total_m_blocks,
-        cu_total_n_blocks=cu_total_n_blocks,
         aux_tensors=aux_tensors,
     )
     out_no_block_sparsity = _run_fwd(

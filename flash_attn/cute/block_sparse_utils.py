@@ -21,6 +21,50 @@ from flash_attn.cute.seqlen_info import SeqlenInfoQK
 
 
 @cute.jit
+def _get_curr_blocksparse_tensors_varlen(
+    head_idx: cutlass.Int32,
+    m_block: cutlass.Int32,
+    blocksparse_tensors: BlockSparseTensors,
+    seqlen_info: SeqlenInfoQK,
+) -> Tuple[cutlass.Int32, cute.Tensor, cutlass.Int32, Optional[cute.Tensor]]:
+    """Varlen path: tensors are 2D [nheads, total_m_blocks] / [nheads, total_n_blocks]."""
+    mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx, *_ = blocksparse_tensors
+    curr_m_block = seqlen_info.m_block_offset + m_block
+    curr_block_idx_offset = seqlen_info.block_idx_offset + m_block * seqlen_info.num_n_blocks
+    curr_mask_block_cnt = mask_block_cnt[head_idx, curr_m_block]
+    curr_mask_block_idx = cute.domain_offset(curr_block_idx_offset, mask_block_idx[head_idx, None])
+    if const_expr(full_block_cnt is not None):
+        curr_full_block_cnt = full_block_cnt[head_idx, curr_m_block]
+        curr_full_block_idx = cute.domain_offset(
+            curr_block_idx_offset, full_block_idx[head_idx, None]
+        )
+    else:
+        curr_full_block_cnt = Int32(0)
+        curr_full_block_idx = None
+    return (curr_mask_block_cnt, curr_mask_block_idx, curr_full_block_cnt, curr_full_block_idx)
+
+
+@cute.jit
+def _get_curr_blocksparse_tensors(
+    batch_idx: cutlass.Int32,
+    head_idx: cutlass.Int32,
+    m_block: cutlass.Int32,
+    blocksparse_tensors: BlockSparseTensors,
+) -> Tuple[cutlass.Int32, cute.Tensor, cutlass.Int32, Optional[cute.Tensor]]:
+    """Fixed-length path: tensors are 4D [batch, nheads, m_block, n_block]."""
+    mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx, *_ = blocksparse_tensors
+    curr_mask_block_cnt = mask_block_cnt[batch_idx, head_idx, m_block]
+    curr_mask_block_idx = mask_block_idx[batch_idx, head_idx, m_block, None]
+    if const_expr(full_block_cnt is not None):
+        curr_full_block_cnt = full_block_cnt[batch_idx, head_idx, m_block]
+        curr_full_block_idx = full_block_idx[batch_idx, head_idx, m_block, None]
+    else:
+        curr_full_block_cnt = Int32(0)
+        curr_full_block_idx = None
+    return (curr_mask_block_cnt, curr_mask_block_idx, curr_full_block_cnt, curr_full_block_idx)
+
+
+@cute.jit
 def get_curr_blocksparse_tensors(
     batch_idx: cutlass.Int32,
     head_idx: cutlass.Int32,
@@ -28,37 +72,12 @@ def get_curr_blocksparse_tensors(
     blocksparse_tensors: BlockSparseTensors,
     seqlen_info: SeqlenInfoQK,
 ) -> Tuple[cutlass.Int32, cute.Tensor, cutlass.Int32, Optional[cute.Tensor]]:
-    mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx, *_ = blocksparse_tensors
-    if const_expr(len(mask_block_cnt.shape) == 2):
-        # In the case where we are varlen_q, blocksparse tensors have shape
-        # [nheads, total_m_block] and [nheads, total_n_block]
-        m_block_offset = seqlen_info.m_block_offset
-        n_block_offset = seqlen_info.n_block_offset
-        curr_m_block = m_block_offset + m_block
-        curr_n_block_offset = n_block_offset + m_block * seqlen_info.num_n_blocks
-        curr_mask_block_cnt = mask_block_cnt[head_idx, curr_m_block]
-        curr_mask_block_idx = cute.domain_offset(
-            curr_n_block_offset, mask_block_idx[head_idx, None]
+    """Extract head, m_block, and batch-local blocksparsity data from blocksparse_tensors"""
+    if const_expr(len(blocksparse_tensors.mask_block_cnt.shape) == 2):
+        return _get_curr_blocksparse_tensors_varlen(
+            head_idx, m_block, blocksparse_tensors, seqlen_info
         )
-        if const_expr(full_block_cnt is not None):
-            curr_full_block_cnt = full_block_cnt[head_idx, curr_m_block]
-            curr_full_block_idx = cute.domain_offset(
-                curr_n_block_offset, full_block_idx[head_idx, None]
-            )
-        else:
-            curr_full_block_cnt = Int32(0)
-            curr_full_block_idx = None
-    else:
-        curr_mask_block_cnt = mask_block_cnt[batch_idx, head_idx, m_block]
-        curr_mask_block_idx = mask_block_idx[batch_idx, head_idx, m_block, None]
-        if const_expr(full_block_cnt is not None):
-            curr_full_block_cnt = full_block_cnt[batch_idx, head_idx, m_block]
-            curr_full_block_idx = full_block_idx[batch_idx, head_idx, m_block, None]
-        else:
-            curr_full_block_cnt = Int32(0)
-            curr_full_block_idx = None
-
-    return (curr_mask_block_cnt, curr_mask_block_idx, curr_full_block_cnt, curr_full_block_idx)
+    return _get_curr_blocksparse_tensors(batch_idx, head_idx, m_block, blocksparse_tensors)
 
 
 # NOTE [SM100 block-sparse empty tiles: mbarrier contract]
