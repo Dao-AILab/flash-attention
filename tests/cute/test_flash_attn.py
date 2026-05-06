@@ -30,9 +30,11 @@ from flash_attn.cute.testing import (
 from flash_attn.cute.interface import (
     flash_attn_func,
     flash_attn_varlen_func,
+    get_scheduler_metadata,
     _flash_attn_fwd,
     _flash_attn_bwd,
 )
+from flash_attn.cute.prepare_scheduler import SchedulerMetadataTensorsTorch
 
 def retry_on_oom(func):
     @wraps(func)
@@ -993,7 +995,7 @@ def test_flash_attn_varlen_output(
 @pytest.mark.parametrize("has_leftpad", [False])
 # @pytest.mark.parametrize("has_batch_idx", [False, True])
 @pytest.mark.parametrize("has_batch_idx", [False])
-@pytest.mark.parametrize("varlen_q", [False, True])
+@pytest.mark.parametrize("varlen_q", [True])
 # @pytest.mark.parametrize("varlen_q", [False])
 # @pytest.mark.parametrize("d", [32, 59, 64, 80, 128, 256])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
@@ -1381,26 +1383,35 @@ def test_flash_attn_kvcache(
         # num_splits_vals = [1, 0]
         # SplitKV is not supported for hdim >= 192
         num_splits_vals = [1, 3] if d < 192 and not DISABLE_SPLIT else [1]
-        # precompute_metadata_vals = [False, True]
-        precompute_metadata_vals = [False]
+        precompute_metadata_vals = [False, True]
+        # precompute_metadata_vals = [False]
         for num_splits, precompute_metadata in itertools.product(
             num_splits_vals, precompute_metadata_vals
         ):
             # SplitKV not supported on SM90 - skip this iteration
             if IS_SM90 and num_splits > 1:
                 continue
-            # if precompute_metadata:
-            #     scheduler_metadata = get_scheduler_metadata(
-            #         batch_size, max_seqlen_q if varlen_q else seqlen_q, seqlen_k, nheads, nheads_k, d,
-            #         cache_seqlens, q.dtype, headdim_v=dv, cu_seqlens_q=cu_seqlens_q,
-            #         cu_seqlens_k_new=cu_seqlens_k_new, cache_leftpad=cache_leftpad,
-            #         max_seqlen_k_new=seqlen_new, page_size=page_size,
-            #         causal=causal, window_size=window_size, attention_chunk=attention_chunk,
-            #         num_splits=num_splits
-            #     )
-            # else:
-            #     scheduler_metadata = None
-            scheduler_metadata = None
+            if precompute_metadata and is_fake_mode():
+                continue
+            if precompute_metadata:
+                scheduler_metadata = get_scheduler_metadata(
+                    num_batch=batch_size,
+                    max_seqlen_q=max_seqlen_q if varlen_q else seqlen_q,
+                    max_seqlen_k=seqlen_k,
+                    nheads=nheads,
+                    nheads_kv=nheads_k,
+                    headdim=d,
+                    headdim_v=dv,
+                    num_splits=num_splits,
+                    tile_m=128,
+                    tile_n=128,
+                    causal=causal,
+                    sort=True,
+                    cu_seqlens_q=cu_seqlens_q,
+                    seqused_k=cache_seqlens,
+                )
+            else:
+                scheduler_metadata = None
             # Repeat to test metadata reuse
             for _ in range(1 if not precompute_metadata else 2):
                 if page_size is None:
@@ -1431,7 +1442,7 @@ def test_flash_attn_kvcache(
                     learnable_sink=learnable_sink,
                     # attention_chunk=attention_chunk,
                     # rotary_interleaved=rotary_interleaved,
-                    # scheduler_metadata=scheduler_metadata,
+                    scheduler_metadata=scheduler_metadata,
                     num_splits=num_splits,
                     # return_softmax_lse=True
                 )

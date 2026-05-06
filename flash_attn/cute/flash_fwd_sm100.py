@@ -400,7 +400,6 @@ class FlashAttentionForwardSm100:
         aux_tensors: Optional[list] = None,
         num_splits_dynamic_ptr: Optional[cute.Tensor] = None,
         tile_count_semaphore: Optional[cute.Tensor] = None,
-        num_m_blocks_ptr: Optional[cute.Tensor] = None,
         varlen_batch_idx_ptr: Optional[cute.Tensor] = None,
         num_nheads_in_l2_ptr: Optional[cute.Tensor] = None,
         max_seqlen_q: Int32 | int | None = None,
@@ -689,7 +688,6 @@ class FlashAttentionForwardSm100:
             cluster_shape_mn=self.cluster_shape_mn,
             use_cluster_idx=not self.is_persistent and self.cta_group_size > 1,
             num_splits_dynamic_ptr=num_splits_dynamic_ptr,
-            num_m_blocks_ptr=num_m_blocks_ptr,
             varlen_batch_idx_ptr=varlen_batch_idx_ptr,
             num_nheads_in_l2_ptr=num_nheads_in_l2_ptr,
             tile_count_semaphore=tile_count_semaphore.iterator if tile_count_semaphore is not None else None,
@@ -810,7 +808,6 @@ class FlashAttentionForwardSm100:
             num_splits,
             num_splits_dynamic_ptr,
             tile_count_semaphore,
-            num_m_blocks_ptr,
             varlen_batch_idx_ptr,
             num_nheads_in_l2_ptr,
             aux_tensors,
@@ -862,7 +859,6 @@ class FlashAttentionForwardSm100:
         num_splits: Int32,
         num_splits_dynamic_ptr: Optional[cute.Tensor] = None,
         tile_count_semaphore: Optional[cute.Tensor] = None,
-        num_m_blocks_ptr: Optional[cute.Tensor] = None,
         varlen_batch_idx_ptr: Optional[cute.Tensor] = None,
         num_nheads_in_l2_ptr: Optional[cute.Tensor] = None,
         aux_tensors: Optional[list] = None,
@@ -3064,18 +3060,11 @@ class FlashAttentionForwardSm100:
         self,
         tile_scheduler: TileSchedulerProtocol,
     ):
-        if const_expr(self.dynamic_persistent):
-            work_tile, group_start_tile = tile_scheduler.initial_sched_state()
-            batch_idx = Int32(work_tile.tile_idx[2])
-            while work_tile.is_valid_tile:
-                group_start_tile = tile_scheduler.prefetch_next_work(batch_idx, group_start_tile)
-                work_tile = tile_scheduler.advance_to_next_work()
-                batch_idx = Int32(work_tile.tile_idx[2])
-        else:
-            work_tile = tile_scheduler.initial_work_tile_info()
-            while work_tile.is_valid_tile:
-                tile_scheduler.prefetch_next_work()
-                work_tile = tile_scheduler.advance_to_next_work()
+        work_tile = tile_scheduler.initial_work_tile_info()
+        while work_tile.is_valid_tile:
+            tile_scheduler.prefetch_next_work()
+            work_tile = tile_scheduler.advance_to_next_work()
+            if const_expr(self.use_clc_scheduler):
                 if cute.arch.thread_idx()[0] == self.scheduler_warp_id * cute.arch.WARP_SIZE:
                     fa_printf(
                         3,

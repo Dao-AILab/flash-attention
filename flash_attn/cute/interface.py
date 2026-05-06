@@ -683,7 +683,17 @@ def _flash_attn_fwd(
 
     reuse_scheduler_metadata = scheduler_metadata is not None
     is_varlen_q = cu_seqlens_q is not None or seqused_q is not None
-    if is_split_kv and is_varlen_q and scheduler_metadata is None and not disable_scheduler_metadata:
+    if use_dedicated_hd256_kernel:
+        # The hd=256 2CTA fwd kernel does not support the dynamic-persistent scheduler.
+        scheduler_metadata = None
+        reuse_scheduler_metadata = False
+    if (
+        is_split_kv
+        and is_varlen_q
+        and scheduler_metadata is None
+        and not disable_scheduler_metadata
+        and not use_dedicated_hd256_kernel
+    ):
         scheduler_metadata = get_scheduler_metadata(
             num_batch=batch_size,
             max_seqlen_q=max_seqlen_q,
@@ -712,9 +722,9 @@ def _flash_attn_fwd(
             varlen_batch_idx,
             num_nheads_in_l2,
             tile_count_semaphore,
-        ) = scheduler_metadata 
+        ) = scheduler_metadata
         assert all(
-            t is None or t.is_cuda 
+            t is None or t.is_cuda
             for t in scheduler_metadata
         ), "scheduler metadata must be on CUDA device"
         assert all(
@@ -729,11 +739,11 @@ def _flash_attn_fwd(
         if tile_count_semaphore is not None:
             assert tile_count_semaphore.shape == (1,), "semaphore must have size 1"
     else:
-        num_m_blocks = None 
-        num_splits_dynamic = None 
-        varlen_batch_idx = None 
-        num_nheads_in_l2 = None 
-        tile_count_semaphore = None 
+        num_m_blocks = None
+        num_splits_dynamic = None
+        varlen_batch_idx = None
+        num_nheads_in_l2 = None
+        tile_count_semaphore = None
 
     compile_key = (
         dtype,
@@ -773,7 +783,6 @@ def _flash_attn_fwd(
         mma_pv_is_rs,
         intra_wg_overlap,
         use_clc_scheduler,
-        has_scheduler_metadata,
         num_m_blocks is not None,
         num_splits_dynamic is not None,
         varlen_batch_idx is not None,
@@ -967,9 +976,7 @@ def _flash_attn_fwd(
                     else FlashAttentionForwardSm100
                 )
 
-                fa_fwd = flash_fwd_obj_cls(
-                    head_dim,
-                    head_dim_v,
+                fa_fwd_kwargs = dict(
                     qhead_per_kvhead=qhead_per_kvhead,
                     is_causal=causal,
                     is_local=local,
@@ -991,8 +998,10 @@ def _flash_attn_fwd(
                     q_subtile_factor=q_subtile_factor,
                     use_2cta_instrs=use_2cta_instrs,
                     use_clc_scheduler=use_clc_scheduler,
-                    has_tile_count_semaphore=tile_count_semaphore is not None,
                 )
+                if not use_dedicated_hd256_kernel:
+                    fa_fwd_kwargs["has_tile_count_semaphore"] = tile_count_semaphore is not None
+                fa_fwd = flash_fwd_obj_cls(head_dim, head_dim_v, **fa_fwd_kwargs)
         elif arch // 10 == 12:
             # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
             assert not use_block_sparsity, "Block sparsity not supported on SM 12.0"
@@ -1058,18 +1067,26 @@ def _flash_attn_fwd(
                 window_size_left,
                 window_size_right,
                 learnable_sink_tensor,
-                sparse_tensors,
-                cute_aux_tensors,
-                num_splits_dynamic_tensor,
-                tile_count_semaphore_tensor,
-                num_m_blocks_tensor,
-                varlen_batch_idx_tensor,
-                num_nheads_in_l2_tensor,
-                max_seqlen_q,
-                current_stream,
             ]
             if arch // 10 in [10, 11]:
-                compile_args.insert(-9, descale_tensors_tensor)
+                compile_args.append(descale_tensors_tensor)
+            compile_args.extend([
+                sparse_tensors,
+                cute_aux_tensors,
+            ])
+            if not use_dedicated_hd256_kernel:
+                compile_args.extend([
+                    num_splits_dynamic_tensor,
+                    tile_count_semaphore_tensor,
+                ])
+                if arch // 10 == 9:
+                    compile_args.append(num_m_blocks_tensor)
+                compile_args.extend([
+                    varlen_batch_idx_tensor,
+                    num_nheads_in_l2_tensor,
+                    max_seqlen_q,
+                ])
+            compile_args.append(current_stream)
             _flash_attn_fwd.compile_cache[compile_key] = cute.compile(*compile_args, options="--enable-tvm-ffi")
 
     if not is_fake_mode():
@@ -1138,13 +1155,19 @@ def _flash_attn_fwd(
                 if normalized_block_sparse_tensors is not None
                 else None,
                 aux_tensors,
-                num_splits_dynamic,
-                tile_count_semaphore,
-                num_m_blocks,
-                varlen_batch_idx,
-                num_nheads_in_l2,
-                max_seqlen_q,
             ])
+            if not use_dedicated_hd256_kernel:
+                call_args.extend([
+                    num_splits_dynamic,
+                    tile_count_semaphore,
+                ])
+                if arch // 10 == 9:
+                    call_args.append(num_m_blocks)
+                call_args.extend([
+                    varlen_batch_idx,
+                    num_nheads_in_l2,
+                    max_seqlen_q,
+                ])
             _flash_attn_fwd.compile_cache[compile_key](*call_args)
     if is_split_kv:
         _flash_attn_fwd_combine(

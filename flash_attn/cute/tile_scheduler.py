@@ -212,10 +212,6 @@ class TileSchedulerProtocol(Protocol):
     2. Work distribution: how to get the next tile (static grid-stride vs dynamic)
     """
 
-    def get_current_work(self) -> WorkTileInfo:
-        """Get the current work tile coordinates."""
-        ...
-
     def initial_work_tile_info(self) -> WorkTileInfo:
         """Get the initial work tile for this CTA."""
         ...
@@ -1267,12 +1263,16 @@ class DynamicPersistentVarlenScheduler:
         self,
         params: Params,
         ctx: SchedulerState,
+        bidb_start: Int32,
+        group_start_tile: Int32,
         *,
         loc=None,
         ip=None,
     ):
         self.params = params
         self._ctx = ctx
+        self._bidb_start = bidb_start
+        self._group_start_tile = group_start_tile
         self._loc = loc
         self._ip = ip
 
@@ -1290,6 +1290,7 @@ class DynamicPersistentVarlenScheduler:
         return DynamicPersistentVarlenScheduler.Params.create(args, loc=loc, ip=ip)
 
     @staticmethod
+    @cute.jit
     def create(
         params: Params,
         ctx: SchedulerState,
@@ -1297,7 +1298,7 @@ class DynamicPersistentVarlenScheduler:
         loc=None,
         ip=None,
     ) -> "DynamicPersistentVarlenScheduler":
-        return DynamicPersistentVarlenScheduler(params, ctx, loc=loc, ip=ip)
+        return DynamicPersistentVarlenScheduler(params, ctx, Int32(0), Int32(0), loc=loc, ip=ip)
 
     # called by host
     @staticmethod
@@ -1322,12 +1323,6 @@ class DynamicPersistentVarlenScheduler:
         params = self.params
         batch_idx = lane + bidb_start
         if cutlass.const_expr(params.varlen_batch_idx_ptr is not None):
-            if cutlass.const_expr(params.num_m_blocks_ptr is not None):
-                # num_m_blocks is at virtual idx (prepare_scheduler writes by vbidx)
-                n = Int32(0)
-                if batch_idx < params.num_batch and lane < cute.arch.WARP_SIZE - 1:
-                    n = params.num_m_blocks_ptr[batch_idx]
-                return n
             seqlen = Int32(0)
             if batch_idx < params.num_batch and lane < cute.arch.WARP_SIZE - 1:
                 real_batch_idx = params.varlen_batch_idx_ptr[batch_idx]
@@ -1339,11 +1334,6 @@ class DynamicPersistentVarlenScheduler:
                 if batch_idx < params.num_batch and lane < cute.arch.WARP_SIZE - 1
                 else Int32(0)
             )
-        if cutlass.const_expr(params.num_m_blocks_ptr is not None):
-            n = Int32(0)
-            if batch_idx < params.num_batch and lane < cute.arch.WARP_SIZE - 1:
-                n = params.num_m_blocks_ptr[batch_idx]
-            return n
         if cutlass.const_expr(params.mSeqUsedQ is not None):
             seqlen = Int32(0)
             if batch_idx < params.num_batch:
@@ -1515,7 +1505,7 @@ class DynamicPersistentVarlenScheduler:
         )
 
     @cute.jit
-    def prefetch_next_work(self, batch_idx, tile_idx, *, loc=None, ip=None):
+    def prefetch_next_work(self, *, loc=None, ip=None):
         ctx = self._ctx
         next_tile_idx = Int32(0)
         if cute.arch.lane_idx() == 0:
@@ -1524,14 +1514,19 @@ class DynamicPersistentVarlenScheduler:
                 self.params.tile_count_semaphore,
             )
         next_tile_idx = cute.arch.shuffle_sync(next_tile_idx, 0)
-        work_info, new_tile_idx = self.get_current_work(next_tile_idx, batch_idx, tile_idx)
+        work_info, new_group_start_tile = self.get_current_work(
+            next_tile_idx, self._bidb_start, self._group_start_tile
+        )
+        # Advance scan state so the next prefetch resumes from this tile's batch
+        # group instead of restarting at batch 0.
+        self._bidb_start = Int32(work_info.tile_idx[2])
+        self._group_start_tile = new_group_start_tile
         ctx.producer_acquire()
         with cute.arch.elect_one():
             block, head_idx, batch_idx, split_idx = work_info.tile_idx
             ctx.write_work_info(block, head_idx, batch_idx, split_idx)
             ctx.producer_commit()
         ctx.advance_producer_state()
-        return new_tile_idx
 
     @cute.jit
     def advance_to_next_work(self, *, loc=None, ip=None) -> WorkTileInfo:
@@ -1549,21 +1544,17 @@ class DynamicPersistentVarlenScheduler:
     @cute.jit
     def initial_work_tile_info(self, *, loc=None, ip=None) -> WorkTileInfo:
         cta_tile_idx, _, _ = cute.arch.block_idx()
-        work_info, _ = self.get_current_work(cta_tile_idx, Int32(0), Int32(0))
+        work_info, new_group_start_tile = self.get_current_work(cta_tile_idx, Int32(0), Int32(0))
+        self._bidb_start = Int32(work_info.tile_idx[2])
+        self._group_start_tile = new_group_start_tile
         return work_info
-
-    @cute.jit
-    def initial_sched_state(self, *, loc=None, ip=None):
-        cta_tile_idx, _, _ = cute.arch.block_idx()
-        work_info, group_start_tile = self.get_current_work(cta_tile_idx, Int32(0), Int32(0))
-        return work_info, group_start_tile
 
     def producer_tail(self, *, loc=None, ip=None):
         self._ctx.producer_tail(loc=loc, ip=ip)
 
     def __extract_mlir_values__(self):
         values, self._values_pos = [], []
-        for obj in [self.params, self._ctx]:
+        for obj in [self.params, self._ctx, self._bidb_start, self._group_start_tile]:
             obj_values = cutlass.extract_mlir_values(obj)
             values += obj_values
             self._values_pos.append(len(obj_values))
@@ -1571,7 +1562,10 @@ class DynamicPersistentVarlenScheduler:
 
     def __new_from_mlir_values__(self, values):
         obj_list = []
-        for obj, n_items in zip([self.params, self._ctx], self._values_pos):
+        for obj, n_items in zip(
+            [self.params, self._ctx, self._bidb_start, self._group_start_tile],
+            self._values_pos,
+        ):
             obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
             values = values[n_items:]
         return DynamicPersistentVarlenScheduler(*(tuple(obj_list)), loc=self._loc)
