@@ -1057,7 +1057,9 @@ class FlashAttentionForwardSm100:
                 blocksparse_tensors.cu_total_m_blocks if blocksparse_tensors is not None else None
             ),
             mCuBlockIdxOffsets=(
-                blocksparse_tensors.cu_block_idx_offsets if blocksparse_tensors is not None else None
+                blocksparse_tensors.cu_block_idx_offsets
+                if blocksparse_tensors is not None
+                else None
             ),
         )
         AttentionMaskCls = partial(
