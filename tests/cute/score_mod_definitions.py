@@ -16,7 +16,9 @@ def score_mod_identity(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_t
 
 
 @cute.jit
-def score_mod_identity_vectorized(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+def score_mod_identity_vectorized(
+    tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors
+):
     return tSrS_ssa
 
 
@@ -27,7 +29,9 @@ def score_mod_causal(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_ten
 
 
 @cute.jit
-def score_mod_causal_vectorized(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+def score_mod_causal_vectorized(
+    tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors
+):
     mask = cute.make_rmem_tensor(kv_idx.shape, dtype=cutlass.Boolean)
     kv_idx0 = kv_idx[0]
     q_idx0 = q_idx[0]
@@ -45,7 +49,9 @@ def score_mod_rel_bias(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_t
 
 
 @cute.jit
-def score_mod_rel_bias_vectorized(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+def score_mod_rel_bias_vectorized(
+    tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors
+):
     q_idx0 = q_idx[0]
     kv_idx0 = kv_idx[0]
     diff0 = q_idx0 - kv_idx0
@@ -56,8 +62,27 @@ def score_mod_rel_bias_vectorized(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_
     return tSrS_ssa + abs_diff.load().to(cutlass.Float32)
 
 
+REL_BIAS_CLAMP = 256
+
+
 @cute.jit
-def score_mod_rel_bias_x2(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+def score_mod_rel_bias_clamped(
+    tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors
+):
+    diff = q_idx - kv_idx
+    abs_diff = cute.TensorSSA(mlir_math.absi(diff), diff.shape, diff.dtype)
+    capped = cute.where(
+        operator.le(abs_diff, cute.full_like(abs_diff, REL_BIAS_CLAMP)),
+        abs_diff,
+        cute.full_like(abs_diff, REL_BIAS_CLAMP),
+    )
+    return tSrS_ssa + capped.to(cutlass.Float32)
+
+
+@cute.jit
+def score_mod_rel_bias_x2(
+    tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors
+):
     diff = q_idx - kv_idx
     abs_diff = cute.TensorSSA(mlir_math.absi(diff), diff.shape, diff.dtype)
     scaled = abs_diff * cute.full_like(abs_diff, 2)
@@ -79,10 +104,14 @@ def score_mod_rel_bias_x2_vectorized(
 
 
 @cute.jit
-def score_mod_times_two(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+def score_mod_times_two(
+    tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors
+):
     return tSrS_ssa * cute.full_like(tSrS_ssa, 2)
 
+
 score_mod_times_two_vectorized = score_mod_times_two
+
 
 @cute.jit
 def score_mod_alibi(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
@@ -93,11 +122,16 @@ def score_mod_alibi(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tens
         * cute.full_like(score, 0.125 * 0.6931471805599453 * 1.4426950408889634)
     )
     diff = q_idx - kv_idx
-    abs_diff = cute.TensorSSA(mlir_math.absi(diff), diff.shape, diff.dtype).to(cutlass.Float32)
+    abs_diff = cute.TensorSSA(mlir_math.absi(diff), diff.shape, diff.dtype).to(
+        cutlass.Float32
+    )
     return score - slope * abs_diff
 
+
 @cute.jit
-def score_mod_alibi_vectorized(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+def score_mod_alibi_vectorized(
+    tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors
+):
     score = tSrS_ssa.to(cutlass.Float32)
     slope_exp = (h_idx + cute.full_like(h_idx, 1)) * cute.full_like(h_idx, -8)
     slope = cute.math.exp2(
@@ -113,7 +147,9 @@ def score_mod_alibi_vectorized(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_inf
 
 
 @cute.jit
-def score_mod_sliding_window(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+def score_mod_sliding_window(
+    tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors
+):
     diff = q_idx - kv_idx
     abs_diff = cute.TensorSSA(mlir_math.absi(diff), diff.shape, diff.dtype)
     mask = operator.le(abs_diff, cute.full_like(abs_diff, 256))
@@ -121,7 +157,9 @@ def score_mod_sliding_window(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info,
 
 
 @cute.jit
-def score_mod_block_diagonal(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+def score_mod_block_diagonal(
+    tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors
+):
     q_block = q_idx // 64
     kv_block = kv_idx // 64
     mask = operator.eq(q_block, kv_block)
@@ -129,14 +167,18 @@ def score_mod_block_diagonal(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info,
 
 
 @cute.jit
-def score_mod_causal_v2(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+def score_mod_causal_v2(
+    tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors
+):
     diff = q_idx - kv_idx
     mask = operator.ge(diff, cute.full_like(diff, 0))
     return cute.where(mask, tSrS_ssa, cute.full_like(tSrS_ssa, float("-inf")))
 
 
 @cute.jit
-def score_mod_batch_bias(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+def score_mod_batch_bias(
+    tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors
+):
     batch_bias = aux_tensors[0]
     dtype = batch_bias.element_type
     b_frag = cute.make_rmem_tensor(1, cutlass.Int32)
@@ -146,8 +188,11 @@ def score_mod_batch_bias(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux
     bias_val = (bias_frag.load()).to(cutlass.Float32)
     return tSrS_ssa + bias_val
 
+
 @cute.jit
-def score_mod_batch_bias_vectorized(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+def score_mod_batch_bias_vectorized(
+    tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors
+):
     batch_bias = aux_tensors[0]
     dtype = batch_bias.element_type
     b_idx0 = b_idx[0]
@@ -158,7 +203,9 @@ def score_mod_batch_bias_vectorized(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqle
 
 
 @cute.jit
-def score_mod_dual_buffer(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+def score_mod_dual_buffer(
+    tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors
+):
     head_bias = aux_tensors[0]
     pos_bias = aux_tensors[1]
     dtype = head_bias.element_type
@@ -177,8 +224,17 @@ def score_mod_dual_buffer(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, au
 
     return tSrS_ssa + head_val + pos_val
 
+
 @cute.jit
-def score_mod_dual_buffer_vectorized(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+def score_mod_squared(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+    """Forward: score ** 2."""
+    return tSrS_ssa * tSrS_ssa
+
+
+@cute.jit
+def score_mod_dual_buffer_vectorized(
+    tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors
+):
     head_bias = aux_tensors[0]
     pos_bias = aux_tensors[1]
     dtype = head_bias.element_type
@@ -310,6 +366,7 @@ def score_mod_global_logical_rel_plus_kv_bias(
 
 # "Stress tests" - score_mods with complex global index usage
 
+
 @cute.jit
 def score_mod_stress_complex_arithmetic(
     tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors
@@ -360,12 +417,16 @@ def score_mod_stress_conditional_mask(
 
     global_diff = q_idx_global - kv_idx_global
     is_nearby = operator.le(
-        cute.TensorSSA(mlir_math.absi(global_diff), global_diff.shape, global_diff.dtype),
+        cute.TensorSSA(
+            mlir_math.absi(global_diff), global_diff.shape, global_diff.dtype
+        ),
         cute.full_like(global_diff, 512),
     )
 
     both_conditions = is_causal & is_nearby
-    return cute.where(both_conditions, tSrS_ssa + bias_val, cute.full_like(tSrS_ssa, float("-inf")))
+    return cute.where(
+        both_conditions, tSrS_ssa + bias_val, cute.full_like(tSrS_ssa, float("-inf"))
+    )
 
 
 @cute.jit
@@ -411,7 +472,9 @@ def score_mod_stress_multi_buffer(
 
     rel_idx = q_idx - kv_idx + cute.full_like(q_idx, 512)
     rel_idx_clamped = cute.where(
-        operator.lt(rel_idx, cute.full_like(rel_idx, 0)), cute.full_like(rel_idx, 0), rel_idx
+        operator.lt(rel_idx, cute.full_like(rel_idx, 0)),
+        cute.full_like(rel_idx, 0),
+        rel_idx,
     )
     rel_idx_clamped = cute.where(
         operator.gt(rel_idx_clamped, cute.full_like(rel_idx_clamped, 1024)),
@@ -424,7 +487,13 @@ def score_mod_stress_multi_buffer(
     rps_frag[0] = rel_pos_scale[ri_frag[0]]
     rps_val = (rps_frag.load()).to(cutlass.Float32)
 
-    return tSrS_ssa * hs_val + bb_val + qpb_val + kvpb_val + rps_val * cute.full_like(tSrS_ssa, 0.1)
+    return (
+        tSrS_ssa * hs_val
+        + bb_val
+        + qpb_val
+        + kvpb_val
+        + rps_val * cute.full_like(tSrS_ssa, 0.1)
+    )
 
 
 @cute.jit
@@ -499,6 +568,10 @@ def rel_bias_eager(score, b, h, q_idx, kv_idx):
     return score + torch.abs(q_idx - kv_idx)
 
 
+def rel_bias_clamped_eager(score, b, h, q_idx, kv_idx):
+    return score + torch.clamp(torch.abs(q_idx - kv_idx), max=REL_BIAS_CLAMP)
+
+
 def rel_bias_x2_eager(score, b, h, q_idx, kv_idx):
     return score + 2 * torch.abs(q_idx - kv_idx)
 
@@ -524,6 +597,10 @@ def causal_v2_eager(score, b, h, q_idx, kv_idx):
     return torch.where(q_idx - kv_idx >= 0, score, float("-inf"))
 
 
+def squared_eager(score, b, h, q_idx, kv_idx):
+    return score * score
+
+
 def batch_bias_factory(bias_tensor):
     def mod(score, b, h, q_idx, kv_idx):
         return score + bias_tensor[b]
@@ -542,31 +619,33 @@ def packed_kv_bias_factory(bias_tensor, cu_seqlens_k):
     def mod(score, b, h, q_idx, kv_idx):
         # Calculate valid length for this sequence
         start = cu_seqlens_k[b]
-        seq_len = cu_seqlens_k[b+1] - start
+        seq_len = cu_seqlens_k[b + 1] - start
 
         # Clamp kv_idx.
         safe_kv_idx = torch.clamp(kv_idx, max=seq_len - 1)
 
         return score + bias_tensor[start + safe_kv_idx]
+
     return mod
 
 
 def packed_q_bias_factory(bias_tensor, cu_seqlens_q):
     def mod(score, b, h, q_idx, kv_idx):
         start = cu_seqlens_q[b]
-        seq_len = cu_seqlens_q[b+1] - start
+        seq_len = cu_seqlens_q[b + 1] - start
 
         # Clamp q_idx
         safe_q_idx = torch.clamp(q_idx, max=seq_len - 1)
 
         return score + bias_tensor[start + safe_q_idx]
+
     return mod
 
 
 def packed_rel_plus_kv_bias_factory(bias_tensor, cu_seqlens_k):
     def mod(score, b, h, q_idx, kv_idx):
         start = cu_seqlens_k[b]
-        seq_len = cu_seqlens_k[b+1] - start
+        seq_len = cu_seqlens_k[b + 1] - start
 
         # Clamp kv_idx
         safe_kv_idx = torch.clamp(kv_idx, max=seq_len - 1)
@@ -581,12 +660,12 @@ def packed_q_and_kv_bias_factory(q_bias, kv_bias, cu_seqlens_q, cu_seqlens_k):
     def mod(score, b, h, q_idx, kv_idx):
         # Handle Q bounds
         q_start = cu_seqlens_q[b]
-        q_len = cu_seqlens_q[b+1] - q_start
+        q_len = cu_seqlens_q[b + 1] - q_start
         safe_q_idx = torch.clamp(q_idx, max=q_len - 1)
 
         # Handle KV bounds
         kv_start = cu_seqlens_k[b]
-        kv_len = cu_seqlens_k[b+1] - kv_start
+        kv_len = cu_seqlens_k[b + 1] - kv_start
         safe_kv_idx = torch.clamp(kv_idx, max=kv_len - 1)
 
         return score + q_bias[q_start + safe_q_idx] + kv_bias[kv_start + safe_kv_idx]
@@ -667,9 +746,128 @@ def stress_xor_pattern_factory(token_bias, cu_seqlens_q, cu_seqlens_k):
 
     return mod
 
+
 def debug_global_idx_factory(bias, cu_seqlens_k):
     offsets = cu_seqlens_k.tolist()
+
     def mod(score, b, h, q_idx, kv_idx):
         global_kv = offsets[b] + kv_idx
         return score + global_kv.float() * 0.001
+
+    return mod
+
+
+# =============================================================================
+# Backward score_mod functions
+# Signature: (grad, score, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors)
+# =============================================================================
+
+
+@cute.jit
+def score_mod_bwd_identity(
+    grad, score, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors
+):
+    return grad
+
+
+@cute.jit
+def score_mod_bwd_times_two(
+    grad, score, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors
+):
+    """Backward for score_mod_times_two: d(score*2)/d(score) = 2."""
+    return grad * cute.full_like(grad, 2.0)
+
+
+@cute.jit
+def score_mod_bwd_rel_bias(
+    grad, score, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors
+):
+    """Backward for score_mod_rel_bias: d(score + |q-kv|)/d(score) = 1."""
+    return grad
+
+
+@cute.jit
+def score_mod_bwd_rel_bias_clamped(
+    grad, score, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors
+):
+    """Backward for score_mod_rel_bias_clamped: d(score + min(|q-kv|, C))/dscore = 1."""
+    return grad
+
+
+@cute.jit
+def score_mod_bwd_causal(
+    grad, score, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors
+):
+    """Backward for causal masking: d(where(mask, score, -inf))/d(score) = where(mask, 1, 0).
+
+    At unmasked positions (q_idx >= kv_idx), grad passes through.
+    At masked positions (q_idx < kv_idx), the kernel already zeros grad because P=0.
+    """
+    return grad
+
+
+@cute.jit
+def score_mod_bwd_squared(
+    grad, score, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors
+):
+    """Backward for score_mod_squared: d(score**2)/d(score) = 2*score."""
+    return grad * cute.full_like(grad, 2.0) * score
+
+
+@cute.jit
+def score_mod_bwd_dual_buffer(
+    grad, score, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors
+):
+    """Backward for score_mod_dual_buffer: d(score + head_bias[h] + pos_bias[q])/d(score) = 1."""
+    return grad
+
+
+# -----------------------------------------------------------------------------
+# Example: bwd that needs grad, score, and a global-indexed aux read.
+# Forward: scale[global_kv] * score**2.
+# Backward: d/dscore = 2 * score * scale[global_kv]
+# -----------------------------------------------------------------------------
+
+
+@cute.jit
+def score_mod_scaled_squared(
+    tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors
+):
+    """Forward: scale[global_kv_idx] * score**2."""
+    offset_k = seqlen_info.offset_k
+    kv_idx_global = kv_idx + offset_k
+    scale = aux_tensors[0]
+    dtype = scale.element_type
+    kv_frag = cute.make_fragment(1, cutlass.Int32)
+    kv_frag.store(kv_idx_global)
+    scale_frag = cute.make_fragment(1, dtype)
+    scale_frag[0] = scale[kv_frag[0]]
+    scale_val = (scale_frag.load()).to(cutlass.Float32)
+    return scale_val * tSrS_ssa * tSrS_ssa
+
+
+@cute.jit
+def score_mod_bwd_scaled_squared(
+    grad, score, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors
+):
+    """Backward for score_mod_scaled_squared: d(scale[g_kv]*score**2)/dscore = 2*scale[g_kv]*score."""
+    offset_k = seqlen_info.offset_k
+    kv_idx_global = kv_idx + offset_k
+    scale = aux_tensors[0]
+    dtype = scale.element_type
+    kv_frag = cute.make_fragment(1, cutlass.Int32)
+    kv_frag.store(kv_idx_global)
+    scale_frag = cute.make_fragment(1, dtype)
+    scale_frag[0] = scale[kv_frag[0]]
+    scale_val = (scale_frag.load()).to(cutlass.Float32)
+    return grad * cute.full_like(grad, 2.0) * scale_val * score
+
+
+def scaled_squared_factory(scale_tensor, cu_seqlens_k):
+    """Eager reference for score_mod_scaled_squared (varlen: cu_seqlens_k provides offsets)."""
+
+    def mod(score, b, h, q_idx, kv_idx):
+        kv_global = cu_seqlens_k[b] + kv_idx
+        return scale_tensor[kv_global] * score * score
+
     return mod

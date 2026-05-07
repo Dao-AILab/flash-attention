@@ -52,6 +52,16 @@ from score_mod_definitions import (
     causal_v2_eager as causal_mask_v2_eager,
     batch_bias_factory as batch_bias,
     dual_buffer_factory as dual_buffer_bias,
+    squared_eager as score_squared_eager,
+)  # isort: split
+from score_mod_definitions import (
+    # Backward score mods
+    score_mod_squared,
+    score_mod_bwd_identity,
+    score_mod_bwd_times_two as score_mod_bwd_5,
+    score_mod_bwd_rel_bias as score_mod_bwd_3,
+    score_mod_bwd_causal,
+    score_mod_bwd_squared,
 )
 
 COMPUTE_CAPABILITY = torch.cuda.get_device_capability()[0]
@@ -694,49 +704,6 @@ def test_score_mod_with_paged_kvcache_aux_tensors(
     assert cute_error <= rtol * pt_error + fwd_atol, (
         f"CuTE error {cute_error:.2e} exceeds {rtol}x PyTorch error {pt_error:.2e} + {fwd_atol:.2e}"
     )
-
-
-@cute.jit
-def score_mod_bwd_5(grad, score, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
-    """Backward for score_mod_5 (times_two): d(score*2)/d(score) = 2."""
-    return grad * cute.full_like(grad, 2.0)
-
-
-@cute.jit
-def score_mod_bwd_3(grad, score, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
-    """Backward for score_mod_3 (relative_bias): d(score + |q-kv|)/d(score) = 1."""
-    return grad
-
-
-@cute.jit
-def score_mod_bwd_identity(grad, score, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
-    return grad
-
-
-@cute.jit
-def score_mod_bwd_causal(grad, score, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
-    """Backward for causal masking: d(where(mask, score, -inf))/d(score) = where(mask, 1, 0).
-
-    At unmasked positions (q_idx >= kv_idx), grad passes through.
-    At masked positions (q_idx < kv_idx), the kernel already zeros grad because P=0.
-    """
-    return grad
-
-
-@cute.jit
-def score_mod_squared(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
-    """Forward: score ** 2."""
-    return tSrS_ssa * tSrS_ssa
-
-
-@cute.jit
-def score_mod_bwd_squared(grad, score, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
-    """Backward for score**2: d(score**2)/d(score) = 2*score."""
-    return grad * cute.full_like(grad, 2.0) * score
-
-
-def score_squared_eager(score, b, h, q_idx, kv_idx):
-    return score * score
 
 
 BWD_TEST_PAIRS = [
