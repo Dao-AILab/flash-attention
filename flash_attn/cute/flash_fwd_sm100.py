@@ -722,6 +722,10 @@ class FlashAttentionForwardSm100:
         self.use_block_sparsity = cutlass.const_expr(blocksparse_tensors is not None)
         if cutlass.const_expr(self.use_block_sparsity and mPageTable is not None):
             raise NotImplementedError("Block sparsity + paged KV not supported on SM100")
+        if cutlass.const_expr(self.use_block_sparsity and self.is_varlen_q):
+            assert const_expr(blocksparse_tensors.cu_total_m_blocks is not None), (
+                "blocksparse_tensors.cu_total_m_blocks must be provided for varlen blocksparsity"
+            )
 
         # Launch the kernel synchronously
         self.kernel(
@@ -1049,6 +1053,12 @@ class FlashAttentionForwardSm100:
             mCuSeqlensK=mCuSeqlensK,
             mSeqUsedQ=mSeqUsedQ,
             mSeqUsedK=mSeqUsedK,
+            mCuTotalMBlocks=(
+                blocksparse_tensors.cu_total_m_blocks if blocksparse_tensors is not None else None
+            ),
+            mCuBlockIdxOffsets=(
+                blocksparse_tensors.cu_block_idx_offsets if blocksparse_tensors is not None else None
+            ),
         )
         AttentionMaskCls = partial(
             AttentionMask,
@@ -1488,6 +1498,7 @@ class FlashAttentionForwardSm100:
                     batch_idx,
                     head_idx,
                     m_block,
+                    seqlen,
                     kv_producer_state,
                     load_Q,
                     load_K,
@@ -1637,6 +1648,7 @@ class FlashAttentionForwardSm100:
                     m_block,
                     self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
                     self.q_subtile_factor if self.q_subtile_factor is not None else 1,
+                    seqlen_info=seqlen,
                 )
                 process_tile = block_iter_count > Int32(0)
             else:
@@ -2003,6 +2015,7 @@ class FlashAttentionForwardSm100:
                     m_block,
                     self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
                     self.q_subtile_factor if self.q_subtile_factor is not None else 1,
+                    seqlen_info=seqlen,
                 )
                 has_work = tile_block_count > Int32(0)
             else:
@@ -2058,6 +2071,7 @@ class FlashAttentionForwardSm100:
                     batch_idx,
                     head_idx,
                     m_block,
+                    seqlen,
                     softmax_step,
                     mask_fn,
                     mask_fn_none,
@@ -2415,6 +2429,7 @@ class FlashAttentionForwardSm100:
                     m_block,
                     self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
                     self.q_subtile_factor if self.q_subtile_factor is not None else 1,
+                    seqlen_info=seqlen,
                 )
                 has_work = total_block_count > Int32(0)
             else:
