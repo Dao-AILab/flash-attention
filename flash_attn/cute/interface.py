@@ -1421,9 +1421,6 @@ def _flash_attn_bwd(
         score_mod_bwd = utils.create_softcap_scoremod_bwd(softcap)
     elif score_mod is not None:
         assert score_mod_bwd is not None, "score_mod_bwd is required when score_mod is provided"
-        assert cu_seqlens_q is None and cu_seqlens_k is None, (
-            "varlen + score_mod not supported in bwd yet"
-        )
         if arch // 10 == 8:
             raise NotImplementedError("Custom user-provided score_mod is not supported on SM8x architectures.")
 
