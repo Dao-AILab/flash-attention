@@ -1020,15 +1020,15 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                     tKTgKT = tKgK_dkl[None, None, None, mma_block_coord[2]]
 
                     seqlen_info = SeqlenInfoQK.create(
-                        batch_coord,
-                        mQ_qdl.shape[0],
-                        mK_kdl.shape[0],
-                        cum_seqlen_q,
-                        cum_seqlen_k,
-                        None,
-                        None,
-                        self.qk_mma_tiler[0],
-                        self.qk_mma_tiler[1],
+                        batch_idx=batch_coord,
+                        seqlen_q_static=mQ_qdl.shape[0],
+                        seqlen_k_static=mK_kdl.shape[0],
+                        mCuSeqlensQ=cum_seqlen_q,
+                        mCuSeqlensK=cum_seqlen_k,
+                        mSeqUsedQ=None,
+                        mSeqUsedK=None,
+                        tile_m=self.qk_mma_tiler[0],
+                        tile_n=self.qk_mma_tiler[1],
                     )
                     block_info = BlockInfo(
                         self.qk_mma_tiler[0],
@@ -1184,15 +1184,15 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                         seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
 
                     seqlen_info = SeqlenInfoQK.create(
-                        batch_coord,
-                        mQ_qdl.shape[0],
-                        mK_kdl.shape[0],
-                        cum_seqlen_q,
-                        cum_seqlen_k,
-                        None,
-                        None,
-                        self.qk_mma_tiler[0],
-                        self.qk_mma_tiler[1],
+                        batch_idx=batch_coord,
+                        seqlen_q_static=mQ_qdl.shape[0],
+                        seqlen_k_static=mK_kdl.shape[0],
+                        mCuSeqlensQ=cum_seqlen_q,
+                        mCuSeqlensK=cum_seqlen_k,
+                        mSeqUsedQ=None,
+                        mSeqUsedK=None,
+                        tile_m=self.qk_mma_tiler[0],
+                        tile_n=self.qk_mma_tiler[1],
                     )
                     block_info = BlockInfo(
                         self.qk_mma_tiler[0],
@@ -1826,15 +1826,15 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                         seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
 
                     seqlen_info = SeqlenInfoQK.create(
-                        batch_coord,
-                        mQ_qdl.shape[0],
-                        mK_kdl.shape[0],
-                        cum_seqlen_q,
-                        cum_seqlen_k,
-                        None,
-                        None,
-                        self.qk_mma_tiler[0],
-                        self.qk_mma_tiler[1],
+                        batch_idx=batch_coord,
+                        seqlen_q_static=mQ_qdl.shape[0],
+                        seqlen_k_static=mK_kdl.shape[0],
+                        mCuSeqlensQ=cum_seqlen_q,
+                        mCuSeqlensK=cum_seqlen_k,
+                        mSeqUsedQ=None,
+                        mSeqUsedK=None,
+                        tile_m=self.qk_mma_tiler[0],
+                        tile_n=self.qk_mma_tiler[1],
                     )
                     mask = AttentionMask(
                         self.qk_mma_tiler[0],
