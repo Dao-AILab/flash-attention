@@ -718,6 +718,7 @@ class FlashAttentionMLAForwardSm100:
             ),
             cluster=self.cluster_shape_mnk,
             smem=SharedStorage.size_in_bytes(),
+            stream=stream,
         )
 
     @cute.kernel

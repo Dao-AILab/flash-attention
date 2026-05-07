@@ -137,3 +137,20 @@ class BlockInfo:
             n_idx = m_idx_max + seqlen_info.seqlen_k - seqlen_info.seqlen_q
             n_idx_left = n_idx - self.window_size_left
             return cutlass.max(n_block_min, cute.ceil_div(n_idx_left, self.tile_n))
+
+    @cute.jit
+    def get_n_block_max_for_m_block(
+        self,
+        seqlen_info: SeqlenInfoQK,
+        m_block: Int32,
+        n_block_global_max: Int32,
+    ) -> Int32:
+        if const_expr(self.is_causal or self.window_size_right is not None):
+            m_idx_max = (m_block + 1) * self.tile_m
+            if const_expr(self.qhead_per_kvhead_packgqa > 1):
+                m_idx_max = cute.ceil_div(m_idx_max, self.qhead_per_kvhead_packgqa)
+            n_idx_right = m_idx_max + seqlen_info.seqlen_k - seqlen_info.seqlen_q
+            if const_expr(self.window_size_right is not None):
+                n_idx_right += self.window_size_right
+            return min(n_block_global_max, cute.ceil_div(n_idx_right, self.tile_n))
+        return n_block_global_max

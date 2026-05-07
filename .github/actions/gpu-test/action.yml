@@ -45,10 +45,10 @@ runs:
         PULL_REF=$(echo "$FA4_IMAGE" | sed 's/:[^@]*@/@/')
         echo "PULL_REF=$PULL_REF"
         echo "SIF=$SIF"
-        mkdir -p "$CI_WORK_DIR/apptainer_tmp" "$CI_WORK_DIR/apptainer_cache"
+        mkdir -p "$CI_WORK_DIR/apptainer_cache" /tmp/apptainer_tmp
         if [ ! -f "$SIF" ]; then
           echo "Pulling $PULL_REF → $SIF"
-          APPTAINER_TMPDIR="$CI_WORK_DIR/apptainer_tmp" \
+          APPTAINER_TMPDIR="/tmp/apptainer_tmp" \
           APPTAINER_CACHEDIR="$CI_WORK_DIR/apptainer_cache" \
           apptainer pull "$SIF" "docker://$PULL_REF"
         else

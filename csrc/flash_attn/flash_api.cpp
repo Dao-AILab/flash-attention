@@ -532,7 +532,8 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
                int window_size_right,
                const float softcap,
                const bool return_softmax,
-               std::optional<at::Generator> gen_) {
+               std::optional<at::Generator> gen_,
+               int num_splits = 0) {
 
     // Otherwise the kernel will be launched from cuda:0 device
     at::cuda::CUDAGuard device_guard{q.device()};
@@ -697,12 +698,11 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     params.page_block_size = page_block_size;
     // Keep references to these tensors to extend their lifetime
     at::Tensor softmax_lse_accum, out_accum;
-    if (seqlenq_ngroups_swapped) {
-        // Only apply split-k for decoding
+    if (paged_KV || seqlenq_ngroups_swapped) {
         std::tie(softmax_lse_accum, out_accum) =
             set_params_splitkv(params, batch_size, num_heads, head_size,
                                max_seqlen_k, max_seqlen_q, head_size_rounded,
-                               p_dropout, /*num_splits*/ 0, get_num_sm(get_current_device()), opts);
+                               p_dropout, num_splits, get_num_sm(get_current_device()), opts);
     }
 
     if (leftpad_k_.has_value()) {

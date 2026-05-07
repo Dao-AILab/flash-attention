@@ -553,6 +553,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             mCuSeqlensK=mCuSeqlensK,
             mSeqUsedQ=mSeqUsedQ,
             mSeqUsedK=mSeqUsedK,
+            mCuTotalMBlocks=(
+                blocksparse_tensors.cu_total_m_blocks if blocksparse_tensors is not None else None
+            ),
+            mCuBlockIdxOffsets=(
+                blocksparse_tensors.cu_block_idx_offsets if blocksparse_tensors is not None else None
+            ),
             # Don't need to pass in tile_mn because we won't access offset_padded
         )
         AttentionMaskCls = partial(
