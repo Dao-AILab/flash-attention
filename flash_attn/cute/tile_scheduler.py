@@ -263,7 +263,7 @@ class TileSchedulerArguments(ParamsBase):
     use_cluster_idx: cutlass.Constexpr[bool] = False
     num_splits_dynamic_ptr: Optional[cute.Tensor] = None
     num_m_blocks_ptr: Optional[cute.Tensor] = None
-    varlen_batch_idx_ptr: Optional[cute.Tensor] = None
+    virtual_batch_idx_ptr: Optional[cute.Tensor] = None
     num_nheads_in_l2_ptr: Optional[cute.Tensor] = None
     tile_count_semaphore: Optional[cute.Pointer] = None
     persistent_cta_multiplier: cutlass.Constexpr[int] = 1
@@ -1222,7 +1222,7 @@ class DynamicPersistentVarlenScheduler:
         is_split_kv: cutlass.Constexpr[bool] = False
         num_splits_dynamic_ptr: Optional[cute.Tensor] = None
         num_m_blocks_ptr: Optional[cute.Tensor] = None
-        varlen_batch_idx_ptr: Optional[cute.Tensor] = None
+        virtual_batch_idx_ptr: Optional[cute.Tensor] = None
         num_nheads_in_l2_ptr: Optional[cute.Tensor] = None
         tile_count_semaphore: Optional[cute.Pointer] = None
         persistent_cta_multiplier: cutlass.Constexpr[int] = 1
@@ -1253,7 +1253,7 @@ class DynamicPersistentVarlenScheduler:
                 is_split_kv=args.is_split_kv,
                 num_splits_dynamic_ptr=args.num_splits_dynamic_ptr,
                 num_m_blocks_ptr=args.num_m_blocks_ptr,
-                varlen_batch_idx_ptr=args.varlen_batch_idx_ptr,
+                virtual_batch_idx_ptr=args.virtual_batch_idx_ptr,
                 num_nheads_in_l2_ptr=args.num_nheads_in_l2_ptr,
                 tile_count_semaphore=args.tile_count_semaphore,
                 persistent_cta_multiplier=args.persistent_cta_multiplier,
@@ -1322,10 +1322,10 @@ class DynamicPersistentVarlenScheduler:
     def _get_num_m_blocks(self, lane: Int32, bidb_start: Int32) -> Int32:
         params = self.params
         batch_idx = lane + bidb_start
-        if cutlass.const_expr(params.varlen_batch_idx_ptr is not None):
+        if cutlass.const_expr(params.virtual_batch_idx_ptr is not None):
             seqlen = Int32(0)
             if batch_idx < params.num_batch and lane < cute.arch.WARP_SIZE - 1:
-                real_batch_idx = params.varlen_batch_idx_ptr[batch_idx]
+                real_batch_idx = params.virtual_batch_idx_ptr[batch_idx]
                 seqlen = params.mCuSeqlensQ[real_batch_idx + 1] - params.mCuSeqlensQ[real_batch_idx]
             if cutlass.const_expr(params.qhead_per_kvhead_packgqa > 1):
                 seqlen *= params.qhead_per_kvhead_packgqa
@@ -1493,9 +1493,9 @@ class DynamicPersistentVarlenScheduler:
         if const_expr(params.is_split_kv and params.num_splits_dynamic_ptr is not None):
             if is_valid:
                 split_idx = split_idx | (num_splits << 16)
-        if const_expr(params.varlen_batch_idx_ptr is not None):
+        if const_expr(params.virtual_batch_idx_ptr is not None):
             if is_valid:
-                batch_idx = params.varlen_batch_idx_ptr[batch_idx]
+                batch_idx = params.virtual_batch_idx_ptr[batch_idx]
 
         return (
             WorkTileInfo(

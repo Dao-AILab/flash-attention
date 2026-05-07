@@ -18,7 +18,7 @@ class SchedulerMetadataTensorsTorch(NamedTuple):
     # tensors of shape (batch)
     num_m_blocks_ptr: Optional[torch.Tensor]
     num_splits_dynamic_ptr: Optional[torch.Tensor]
-    varlen_batch_idx_ptr: Optional[torch.Tensor]
+    virtual_batch_idx_ptr: Optional[torch.Tensor]
     num_nheads_in_l2_ptr: Optional[torch.Tensor]
     # tensor of shape (1)
     tile_count_semaphore: Optional[torch.Tensor]
@@ -96,7 +96,7 @@ class FlashPrepareScheduler:
         tile_count_semaphore: Optional[cute.Tensor],
         num_m_blocks_ptr: Optional[cute.Tensor],
         num_splits_dynamic_ptr: Optional[cute.Tensor],
-        varlen_batch_idx_ptr: Optional[cute.Tensor],
+        virtual_batch_idx_ptr: Optional[cute.Tensor],
         num_nheads_in_l2_ptr: Optional[cute.Tensor],
         n_blocks_per_split: Optional[int],  # overrides heuristic
         stream: cuda.CUstream,
@@ -134,7 +134,7 @@ class FlashPrepareScheduler:
             tile_count_semaphore,
             num_m_blocks_ptr,
             num_splits_dynamic_ptr,
-            varlen_batch_idx_ptr,
+            virtual_batch_idx_ptr,
             num_nheads_in_l2_ptr,
             n_blocks_per_split,
         ).launch(
@@ -164,7 +164,7 @@ class FlashPrepareScheduler:
         tile_count_semaphore: Optional[cute.Tensor],
         num_m_blocks_ptr: Optional[cute.Tensor],
         num_splits_dynamic_ptr: Optional[cute.Tensor],
-        varlen_batch_idx_ptr: Optional[cute.Tensor],
+        virtual_batch_idx_ptr: Optional[cute.Tensor],
         num_nheads_in_l2_ptr: Optional[cute.Tensor],
         n_blocks_per_split: Optional[Int32],
     ):
