@@ -389,6 +389,7 @@ class FlashAttentionBackwardSm80:
         mdV_semaphore: Optional[cute.Tensor] = None,
         aux_tensors: Optional[list] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        mChunkSize: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -470,6 +471,7 @@ class FlashAttentionBackwardSm80:
             SharedStorage,
             tile_sched_params,
             TileScheduler,
+            mChunkSize,
         ).launch(
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
@@ -514,6 +516,7 @@ class FlashAttentionBackwardSm80:
         SharedStorage: cutlass.Constexpr,
         tile_sched_params: ParamsBase,
         TileScheduler: cutlass.Constexpr[Callable],
+        mChunkSize: Optional[cute.Tensor] = None,
     ):
         # Thread index, block index
         tidx, _, _ = cute.arch.thread_idx()
@@ -532,6 +535,7 @@ class FlashAttentionBackwardSm80:
                 mCuSeqlensK=mCuSeqlensK,
                 mSeqUsedQ=mSeqUsedQ,
                 mSeqUsedK=mSeqUsedK,
+                mChunkSize=mChunkSize,
                 tile_m=self.m_block_size,
                 tile_n=self.n_block_size,
             )

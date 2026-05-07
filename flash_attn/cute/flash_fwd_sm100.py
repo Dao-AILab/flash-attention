@@ -374,6 +374,7 @@ class FlashAttentionForwardSm100:
         descale_tensors: Optional[DescaleTensors] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors: Optional[list] = None,
+        mChunkSize: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -764,6 +765,7 @@ class FlashAttentionForwardSm100:
             aux_tensors,
             fastdiv_mods,
             head_divmod,
+            mChunkSize,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -811,6 +813,7 @@ class FlashAttentionForwardSm100:
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
         head_divmod=None,
+        mChunkSize: Optional[cute.Tensor] = None,
     ):
         """The device kernel implementation of the Fused Multi-Head Attention.
 
@@ -1059,6 +1062,7 @@ class FlashAttentionForwardSm100:
             mCuBlockIdxOffsets=(
                 blocksparse_tensors.cu_block_idx_offsets if blocksparse_tensors is not None else None
             ),
+            mChunkSize=mChunkSize,
         )
         AttentionMaskCls = partial(
             AttentionMask,

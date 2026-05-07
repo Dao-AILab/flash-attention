@@ -35,6 +35,8 @@ class BlockInfo:
                 m_idx_max = cute.ceil_div(m_idx_max, self.qhead_per_kvhead_packgqa)
             n_idx = m_idx_max + seqlen_info.seqlen_k - seqlen_info.seqlen_q
             n_idx_right = n_idx if const_expr(self.is_causal) else n_idx + self.window_size_right
+            if const_expr(self.is_causal and seqlen_info.has_chunk_size):
+                n_idx_right = ((n_idx - 1) // seqlen_info.chunk_size + 1) * seqlen_info.chunk_size
             n_block_max = min(n_block_max, cute.ceil_div(n_idx_right, self.tile_n))
         n_block_min = 0
         if const_expr(self.is_local and self.window_size_left is not None):
@@ -62,6 +64,17 @@ class BlockInfo:
             n_idx_min = n_block * self.tile_n
             m_idx = n_idx_min + seqlen_info.seqlen_q - seqlen_info.seqlen_k
             m_idx_right = m_idx if const_expr(self.is_causal) else m_idx - self.window_size_right
+            if const_expr(self.is_causal and seqlen_info.has_chunk_size):
+                # Chunk attention semantics (chunk_mask[q, k] = ((q + kq_diff) // cs + 1) * cs > k).
+                # The smallest valid q for a given KV block is chunk_start(n_idx_min) - kq_diff,
+                # i.e. chunk_start of the KV index itself (not of n_idx_min - kq_diff). Computing
+                # chunk_start on m_idx = n_idx_min - kq_diff is only equivalent when kq_diff is
+                # a multiple of chunk_size; otherwise the result can be off and even skip valid
+                # m_blocks when kq_diff < 0. Compute chunk_start on n_idx_min and subtract kq_diff.
+                m_idx_right = (
+                    (n_idx_min // seqlen_info.chunk_size) * seqlen_info.chunk_size
+                    + seqlen_info.seqlen_q - seqlen_info.seqlen_k
+                )
             m_block_min = max(m_block_min, m_idx_right // self.tile_m)
         if const_expr(self.is_local and self.window_size_left is not None):
             n_idx_max = (n_block + 1) * self.tile_n

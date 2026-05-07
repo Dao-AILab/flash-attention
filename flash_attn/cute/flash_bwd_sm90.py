@@ -357,6 +357,7 @@ class FlashAttentionBackwardSm90:
         mdV_semaphore: Optional[cute.Tensor] = None,
         aux_tensors: Optional[list] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        mChunkSize: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -611,6 +612,7 @@ class FlashAttentionBackwardSm90:
             mdV_semaphore,
             window_size_left,
             window_size_right,
+            mChunkSize,
         ).launch(
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
@@ -666,6 +668,7 @@ class FlashAttentionBackwardSm90:
         mdV_semaphore: Optional[cute.Tensor] = None,
         window_size_left: Optional[Int32] = None,
         window_size_right: Optional[Int32] = None,
+        mChunkSize: Optional[cute.Tensor] = None,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
@@ -739,6 +742,7 @@ class FlashAttentionBackwardSm90:
             mCuSeqlensK=mCuSeqlensK,
             mSeqUsedQ=mSeqUsedQ,
             mSeqUsedK=mSeqUsedK,
+            mChunkSize=mChunkSize,
             tile_m=self.tile_m,
             tile_n=self.tile_n,
         )
