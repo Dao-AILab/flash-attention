@@ -187,7 +187,6 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         s_q64 = Int64(s_q)
         s_k64 = Int64(s_k)
         s_lse64 = Int64(s_lse)
-        d64 = cute.assume(Int64(d), divby=128)
         h_r64 = Int64(h_r)
         h_k64 = Int64(h_k)
         b64 = Int64(b)
@@ -196,39 +195,72 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         # `cuseqlen_*` offsets stays within the tensor domain.
         s_q_total = q_tensor.shape[1] if cum_seqlen_q is not None else s_q64
         s_k_total = k_tensor.shape[1] if cum_seqlen_k is not None else s_k64
-        stride_b_qo = h_r64 * h_k64 * s_q64 * d64 if cum_seqlen_q is None else 0
-        stride_b_kv = h_k64 * s_k64 * d64 if cum_seqlen_k is None else 0
         b_lse = b64 if cum_seqlen_q is None else 1
         stride_b_lse = h_r64 * h_k64 * s_lse64 if cum_seqlen_q is None else 0
 
         # (s, d, ((h_r, h_k), b))
         q_layout = cute.make_layout(
             (s_q_total, d, ((h_r, h_k), b)),
-            stride=(d64 * h_r64 * h_k64, 1, ((d64, d64 * h_r64), stride_b_qo)),
+            stride=(
+                cute.assume(q_tensor.stride[1], divby=64),
+                q_tensor.stride[4],
+                (
+                    (q_tensor.stride[3], q_tensor.stride[2]),
+                    0 if cum_seqlen_q is not None else cute.assume(q_tensor.stride[0], divby=64),
+                ),
+            ),
         )
         q = cute.make_tensor(q_tensor.iterator, q_layout)
         # (s, d, ((h_r, h_k), b))
         do_layout = cute.make_layout(
             (s_q_total, d, ((h_r, h_k), b)),
-            stride=(d64 * h_r64 * h_k64, 1, ((d64, d64 * h_r64), stride_b_qo)),
+            stride=(
+                cute.assume(do_tensor.stride[1], divby=64),
+                do_tensor.stride[4],
+                (
+                    (do_tensor.stride[3], do_tensor.stride[2]),
+                    0 if cum_seqlen_q is not None else cute.assume(do_tensor.stride[0], divby=64),
+                ),
+            ),
         )
         do = cute.make_tensor(do_tensor.iterator, do_layout)
         # (s, d, ((h_r, h_k), b)), 0-stride for h_r to broadcast
         k_layout = cute.make_layout(
             (s_k_total, d, ((h_r, h_k), b)),
-            stride=(d64 * h_k64, 1, ((0, d64), stride_b_kv)),
+            stride=(
+                cute.assume(k_tensor.stride[1], divby=64),
+                k_tensor.stride[4],
+                (
+                    (0, k_tensor.stride[2]),
+                    0 if cum_seqlen_k is not None else cute.assume(k_tensor.stride[0], divby=64),
+                ),
+            ),
         )
         k = cute.make_tensor(k_tensor.iterator, k_layout)
         # (d, s, ((h_r, h_k), b)), 0-stride for h_r to broadcast
         kt_layout = cute.make_layout(
             (d, s_k_total, ((h_r, h_k), b)),
-            stride=(1, d64 * h_k64, ((0, d64), stride_b_kv)),
+            stride=(
+                k_tensor.stride[4],
+                cute.assume(k_tensor.stride[1], divby=64),
+                (
+                    (0, k_tensor.stride[2]),
+                    0 if cum_seqlen_k is not None else cute.assume(k_tensor.stride[0], divby=64),
+                ),
+            ),
         )
         kt = cute.make_tensor(k_tensor.iterator, kt_layout)
         # (s, d, ((h_r, h_k), b)), 0-stride for h_r to broadcast
         v_layout = cute.make_layout(
             (s_k_total, d, ((h_r, h_k), b)),
-            stride=(d64 * h_k64, 1, ((0, d64), stride_b_kv)),
+            stride=(
+                cute.assume(v_tensor.stride[1], divby=64),
+                v_tensor.stride[4],
+                (
+                    (0, v_tensor.stride[2]),
+                    0 if cum_seqlen_k is not None else cute.assume(v_tensor.stride[0], divby=64),
+                ),
+            ),
         )
         v = cute.make_tensor(v_tensor.iterator, v_layout)
         # (s, ((h_r, h_k), b))
@@ -242,7 +274,14 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         # (s, d, ((h_r, h_k), b))
         dq_layout = cute.make_layout(
             (s_q_total, d, ((h_r, h_k), b)),
-            stride=(d64 * h_r64 * h_k64, 1, ((d64, d64 * h_r64), stride_b_qo)),
+            stride=(
+                cute.assume(dq_tensor.stride[1], divby=64),
+                dq_tensor.stride[4],
+                (
+                    (dq_tensor.stride[3], dq_tensor.stride[2]),
+                    0 if cum_seqlen_q is not None else cute.assume(dq_tensor.stride[0], divby=64),
+                ),
+            ),
         )
         dq = cute.make_tensor(dq_tensor.iterator, dq_layout)
 
