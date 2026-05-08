@@ -1433,6 +1433,7 @@ def _flash_attn_bwd(
         use_2cta_instrs = (
             head_dim >= 128
             and not requested_disable_2cta
+            and softcap == 0.0
             and block_sparse_bwd_supports_2cta(block_sparse_tensors, n_block_size)
         )
         if block_sparse_tensors is not None and head_dim == 192 and not use_2cta_instrs:
