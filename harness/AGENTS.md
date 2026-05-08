@@ -23,7 +23,7 @@ Auto-invoke based on "When to Use" conditions.
 | [test](skills/test.md) | UT execution policy, fail-fast monitoring, rerun loop |
 | [hang_detect_fix](skills/hang_detect_fix.md) | Hang detection, kill policy, cuda-gdb debug workflow |
 | [benchmark](skills/benchmark.md) | Benchmark gate, previous-run comparison, regression handling, SASS export |
-| [refactor](skills/refactor.md) | Refactor requirements, target files, code-level alignment, HD256 kernels |
+| [refactor](skills/refactor.md) | Refactor requirements, target files, merge-ready code-level alignment, HD256 kernels |
 | [commit](skills/commit.md) | Commit checks, allowed files, feature exception, git identity |
 
 ## Commands
@@ -41,7 +41,7 @@ Auto-invoke based on "When to Use" conditions.
 | User Intent | Load | Rule |
 | ----------- | ---- | ---- |
 | Environment, editable, FA4 import path | `skills/environment.md` | Use repo-local `flash_attn/cute`; never patch `flash_attn/__init__.py`. |
-| Refactor, align, target file | `skills/workflow.md` + `skills/refactor.md` | Follow workflow gates and refactor edit allowlist. |
+| Refactor, align, target file | `skills/workflow.md` + `skills/refactor.md` | Follow workflow gates, refactor edit allowlist, and merge-ready target alignment. |
 | UT, correctness, precision test | `skills/test.md` + `commands/test.md` | Use monitored `/test`; do not call raw pytest from memory. |
 | Hang, stuck UT, GPU 100% | `skills/hang_detect_fix.md` + `commands/hang_detect_fix.md` | Kill broad UT, reproduce case, capture cuda-gdb diagnostics. |
 | Benchmark or performance gate | `skills/benchmark.md` + `commands/benchmark.md` | Run benchmark only after UT passes; block systemic regression. |
