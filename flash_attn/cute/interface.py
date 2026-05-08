@@ -1365,6 +1365,7 @@ def _flash_attn_bwd(
         disable_2cta = (
             requested_disable_2cta
             or block_sparse_tensors is not None
+            or softcap != 0.0
         )
         cluster_size = 2 if head_dim >= 128 and not disable_2cta else 1
         use_2cta_instrs = cluster_size==2
