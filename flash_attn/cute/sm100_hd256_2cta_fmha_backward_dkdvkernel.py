@@ -244,12 +244,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                     cute.assume(Q.stride[1], divby=64),
                     Q.stride[4],
                     (
-                        (Q.shape[4], Q.shape[4] * Q.shape[3]),
-                        (
-                            0
-                            if varlen
-                            else cute.assume(Q.shape[1] * Q.shape[4] * h_r * h_k, divby=64)
-                        ),
+                        (Q.stride[3], Q.stride[2]),
+                        0 if cumulative_s_q is not None else cute.assume(Q.stride[0], divby=64),
                     ),
                 ),
             ),
@@ -263,8 +259,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                     cute.assume(K.stride[1], divby=64),
                     K.stride[4],
                     (
-                        (0, K.shape[4]),
-                        (0 if varlen else cute.assume(K.shape[1] * K.shape[4] * 1 * h_k, divby=64)),
+                        (0, K.stride[2]),
+                        0 if cumulative_s_k is not None else cute.assume(K.stride[0], divby=64),
                     ),
                 ),
             ),
@@ -278,8 +274,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                     cute.assume(V.stride[1], divby=64),
                     V.stride[4],
                     (
-                        (0, V.shape[4]),
-                        (0 if varlen else cute.assume(V.shape[1] * V.shape[4] * 1 * h_k, divby=64)),
+                        (0, V.stride[2]),
+                        0 if cumulative_s_k is not None else cute.assume(V.stride[0], divby=64),
                     ),
                 ),
             ),
@@ -296,10 +292,49 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 ),
             ),
         )
-        dK = cute.make_tensor(dK.iterator, K.layout)
-        dV = cute.make_tensor(dV.iterator, V.layout)
+        dK = cute.make_tensor(
+            dK.iterator,
+            cute.make_layout(
+                (dK.shape[1], dK.shape[4], hb),
+                stride=(
+                    cute.assume(dK.stride[1], divby=64),
+                    dK.stride[4],
+                    (
+                        (0, dK.stride[2]),
+                        0 if cumulative_s_k is not None else cute.assume(dK.stride[0], divby=64),
+                    ),
+                ),
+            ),
+        )
+        dV = cute.make_tensor(
+            dV.iterator,
+            cute.make_layout(
+                (dV.shape[1], dV.shape[4], hb),
+                stride=(
+                    cute.assume(dV.stride[1], divby=64),
+                    dV.stride[4],
+                    (
+                        (0, dV.stride[2]),
+                        0 if cumulative_s_k is not None else cute.assume(dV.stride[0], divby=64),
+                    ),
+                ),
+            ),
+        )
         # (s, d, ((h_r, h_k), b))
-        dO = cute.make_tensor(dO.iterator, Q.layout)
+        dO = cute.make_tensor(
+            dO.iterator,
+            cute.make_layout(
+                (dO.shape[1], dO.shape[4], hb),
+                stride=(
+                    cute.assume(dO.stride[1], divby=64),
+                    dO.stride[4],
+                    (
+                        (dO.stride[3], dO.stride[2]),
+                        0 if cumulative_s_q is not None else cute.assume(dO.stride[0], divby=64),
+                    ),
+                ),
+            ),
+        )
 
         # (s, d, ((h_r, h_k), b)) -> (d, s, ((h_r, h_k), b))
         dOT = cute.make_tensor(
