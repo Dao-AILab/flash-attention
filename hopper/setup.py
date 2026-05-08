@@ -602,7 +602,6 @@ if not SKIP_CUDA_BUILD:
       
     if major >= 2 and minor >= 9:
         flash_api_source = "flash_api_stable.cpp"
-        # Use the environment variable if provided, otherwise default to 2.9 hex
         stable_args = ["-DTORCH_TARGET_VERSION=0x0209000000000000"]
     else:
         flash_api_source = "flash_api.cpp"
