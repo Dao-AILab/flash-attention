@@ -3432,13 +3432,10 @@ class FlashAttentionBackwardSm100:
         seqlen,
         m_block: Int32,
         n_block: Int32,
-        n_block_global_max: Int32,
     ) -> Int32:
         lock_value = n_block
         if const_expr(self.spt):
-            n_block_max_for_m_block = block_info.get_n_block_max_for_m_block(
-                seqlen, m_block, n_block_global_max
-            )
+            n_block_max_for_m_block = block_info.get_n_block_max_for_m_block(seqlen, m_block)
             lock_value = n_block_max_for_m_block - 1 - n_block
         if const_expr(self.use_block_sparsity):
             assert blocksparse_tensors is not None
@@ -3528,7 +3525,6 @@ class FlashAttentionBackwardSm100:
                 mdQ_semaphore_cur = mdQ_semaphore[None, None, head_idx, batch_idx]
 
             delay_semaphore_release = not self.tile_hdim == 192 and not self.use_block_sparsity
-            n_block_global_max = cute.ceil_div(seqlen.seqlen_k, self.tile_n)
 
             curr_q_cnt = Int32(0)
             curr_q_idx = None
@@ -3627,7 +3623,6 @@ class FlashAttentionBackwardSm100:
                                 seqlen,
                                 m_block,
                                 n_block_cta_group,
-                                n_block_global_max,
                             )
                             barrier.wait_eq(
                                 mdQ_semaphore_cur[(m_block, None)].iterator,
