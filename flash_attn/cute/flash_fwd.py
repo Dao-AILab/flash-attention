@@ -649,7 +649,12 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         self.num_Q_load_threads = self.num_threads
         self.num_epilogue_threads = self.num_threads
         # self.use_tma_O = self.arch >= 90 and mCuSeqlensQ is None
-        self.use_tma_O = self.arch >= Arch.sm_90
+        # The SM80 base class never constructs tma_atom_O (it passes None to
+        # self.epilogue), so use_tma_O must stay False regardless of self.arch.
+        # FlashAttentionForwardSm120 inherits this class but self.arch is read
+        # from the DSL (= sm_120) in __init__, so without this the >= sm_90
+        # branch would crash in tma_get_copy_fn on consumer Blackwell.
+        self.use_tma_O = False
         self._setup_attributes()
         SharedStorage = self._get_shared_storage_cls()
         mQ, mK, mV, mO = [assume_tensor_aligned(t) for t in (mQ, mK, mV, mO)]
