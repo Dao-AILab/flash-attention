@@ -102,9 +102,15 @@ class FlashAttentionForwardBase:
         self.vec_size: cutlass.Constexpr = getattr(
             score_mod, "__vec_size__", 1 if cutlass.const_expr(has_aux_tensors) else 2
         )
+        mask_mod_vec_size = getattr(mask_mod, "__vec_size__", 1)
         if self.vec_size > 2:
             raise ValueError(
                 f"score_mod vec_size {self.vec_size} not supported on Sm80/90/120 "
+                "due to accumulator thread ownership pattern."
+            )
+        if mask_mod_vec_size > 2:
+            raise ValueError(
+                f"mask_mod vec_size {mask_mod_vec_size} not supported on Sm80/90/120 "
                 "due to accumulator thread ownership pattern."
             )
         self.arch = BaseDSL._get_dsl().get_arch_enum()

@@ -1,15 +1,11 @@
-from typing import Callable, Optional
-
-import random
 import math
+import random
 
 import cutlass
 import cutlass.cute as cute
 import torch
-
 from flash_attn.cute import utils
 from flash_attn.cute.block_sparsity import fast_sampling
-
 
 # =============================================================================
 # CuTe mask_mod functions (for kernel compilation)
@@ -521,11 +517,7 @@ PARAMETERIZED_MASK_FACTORIES = {
 
 
 def get_mask_pair(mask_name, seqlen_q=None, seqlen_k=None, window_size=None):
-    """Get (cute_mask, flex_mask) pair for the given mask name.
-
-    For static masks, seqlen info is not needed.
-    For parameterized masks, seqlen_q and seqlen_k are required.
-    """
+    """Get (cute_mask, flex_mask) pair for the given mask name."""
     if mask_name in STATIC_MASKS:
         return STATIC_MASKS[mask_name]
 
@@ -533,9 +525,7 @@ def get_mask_pair(mask_name, seqlen_q=None, seqlen_k=None, window_size=None):
         raise ValueError(f"Unknown mask: {mask_name}")
 
     if seqlen_q is None or seqlen_k is None:
-        raise ValueError(
-            f"Parameterized mask '{mask_name}' requires seqlen_q and seqlen_k"
-        )
+        raise ValueError(f"Parameterized mask '{mask_name}' requires seqlen_q and seqlen_k")
 
     cute_factory, flex_factory = PARAMETERIZED_MASK_FACTORIES[mask_name]
     offset = seqlen_k - seqlen_q
@@ -543,13 +533,12 @@ def get_mask_pair(mask_name, seqlen_q=None, seqlen_k=None, window_size=None):
     if mask_name == "sliding_window":
         if window_size is None:
             raise ValueError("sliding_window mask requires window_size parameter")
-        cute_mask = cute_factory(window_size, window_size, offset)
-        flex_mask = flex_factory(window_size, window_size, offset)
-    else:
-        cute_mask = cute_factory(offset)
-        flex_mask = flex_factory(offset)
+        return (
+            cute_factory(window_size, window_size, offset),
+            flex_factory(window_size, window_size, offset),
+        )
 
-    return cute_mask, flex_mask
+    return cute_factory(offset), flex_factory(offset)
 
 
 if __name__ == "__main__":
