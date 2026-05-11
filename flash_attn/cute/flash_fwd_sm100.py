@@ -1809,6 +1809,10 @@ class FlashAttentionForwardSm100:
                         self.gemm_P_q1_lane(
                             pv_mma_op, lane_cur, tOrP, loop_tOrVi, loop_sV_cur, not O_should_accumulate
                         )
+                        # q1 ping-pong issues QK for the next lane before this PV. That means
+                        # the next softmax/correction can observe S-ready before PV has finished,
+                        # so correction must wait on an explicit O-full signal even with one O slot.
+                        pipeline_o_acc.producer_commit_w_index(0)
                         pipeline_kv.consumer_release(mma_kv_release_state)
                         O_should_accumulate = True
 
@@ -2852,6 +2856,9 @@ class FlashAttentionForwardSm100:
                         )
                         sm_stats_barrier.arrive_and_wait_w_index(index=stats_stage * 4 + warp_idx)
                         scale = sScale[tidx + stats_stage * self.m_block_size]
+                        if const_expr(self.decode_q1_sp_pingpong and not self.use_block_sparsity):
+                            pipeline_o_acc.consumer_wait_w_index_phase(o_stage, o_corr_consumer_phase)
+                            o_corr_consumer_phase ^= 1
                         should_rescale = cute.arch.vote_ballot_sync(scale < 1.0) != 0
                         if should_rescale:
                             self.correction_rescale(thr_mma_pv, tOtO[None, None, None, o_stage], tidx, scale)
