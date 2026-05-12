@@ -1,7 +1,7 @@
 import pytest
 import torch
 from torch.nn.attention.flex_attention import flex_attention
-from flash_attn.cute.interface import _flash_attn_fwd
+from flash_attn.cute.interface import _flash_attn_fwd, _flash_attn_bwd
 from test_score_mod import _generate_block_kvcache
 from score_mod_definitions import (
     # TensorSSA-based score mods
@@ -62,6 +62,22 @@ from score_mod_definitions import (
     stress_global_offset_factory,
     stress_xor_pattern_factory,
     debug_global_idx_factory,
+)  # isort: split
+from score_mod_definitions import (
+    # Forward + backward score mods used in bwd tests
+    score_mod_squared,
+    score_mod_scaled_squared,
+    score_mod_rel_bias_clamped,
+    score_mod_bwd_identity,
+    score_mod_bwd_times_two,
+    score_mod_bwd_rel_bias_clamped,
+    score_mod_bwd_causal,
+    score_mod_bwd_squared,
+    score_mod_bwd_dual_buffer,
+    score_mod_bwd_scaled_squared,
+    squared_eager,
+    rel_bias_clamped_eager,
+    scaled_squared_factory,
 )
 
 IS_SM90 = torch.cuda.get_device_capability()[0] == 9
@@ -512,6 +528,7 @@ def test_varlen_with_score_mod(
         cu_seqlens_q=cu_seqlens_q if varlen_q else None,
     )
 
+
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("varlen_q", [True, False])
 @pytest.mark.parametrize("varlen_k", [True, False])
@@ -592,6 +609,7 @@ def test_varlen_with_score_mod_vectorized(
             cu_seqlens_k=cu_seqlens_k,
         )
         assert torch.equal(out, out_ref)
+
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("varlen_q", [True, False])
@@ -1154,6 +1172,313 @@ def test_varlen_score_mod_with_paged_kvcache_global(
         seqlens_q=seqlens_q,
         cu_seqlens_q=cu_seqlens_q,
     )
+
+
+# =============================================================================
+# Backward tests
+# =============================================================================
+
+# (cute_fwd, cute_bwd, eager_ref_or_factory, aux_type)
+# aux_type: None or "dual_buffer"
+BWD_TEST_PAIRS = [
+    (score_mod_times_two, score_mod_bwd_times_two, times_two_eager, None),
+    (score_mod_rel_bias_clamped, score_mod_bwd_rel_bias_clamped, rel_bias_clamped_eager, None),
+    (score_mod_squared, score_mod_bwd_squared, squared_eager, None),
+    (score_mod_causal, score_mod_bwd_causal, causal_eager, None),
+    (
+        score_mod_dual_buffer,
+        score_mod_bwd_dual_buffer,
+        dual_buffer_factory,
+        "dual_buffer",
+    ),
+]
+
+# (cute_fwd, cute_bwd, eager_factory, aux_type, requires_global)
+BWD_TEST_PAIRS_WITH_GLOBAL = [
+    (
+        score_mod_scaled_squared,
+        score_mod_bwd_scaled_squared,
+        scaled_squared_factory,
+        "kv",
+        "kv",
+    ),
+]
+
+BWD_SEQLEN_CONFIGS = SEQLEN_CONFIGS
+
+
+def run_cute_flash_bwd_varlen(
+    q,
+    k,
+    v,
+    cute_score_mod,
+    cute_score_mod_bwd,
+    cu_seqlens_q,
+    cu_seqlens_k,
+    aux_tensors=None,
+    pack_gqa=False,
+):
+    """Forward + backward via _flash_attn_fwd / _flash_attn_bwd directly (no autograd).
+
+    Mirrors run_cute_flash_bwd(use_autograd=False) in test_score_mod.py. Inputs are
+    already in packed varlen layout (total, num_heads, head_dim) so no transpose.
+    """
+    out, lse = _flash_attn_fwd(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        return_lse=True,
+        score_mod=cute_score_mod,
+        aux_tensors=aux_tensors,
+        pack_gqa=pack_gqa,
+    )
+    grad_out = torch.randn_like(out)
+    dq, dk, dv = _flash_attn_bwd(
+        q,
+        k,
+        v,
+        out,
+        grad_out,
+        lse,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        score_mod=cute_score_mod,
+        score_mod_bwd=cute_score_mod_bwd,
+        aux_tensors=aux_tensors,
+        pack_gqa=pack_gqa,
+    )
+    return out, grad_out, dq, dk, dv
+
+
+def run_flex_varlen_ref_bwd(
+    q, k, v, cu_seqlens_q, cu_seqlens_k, eager_score_mod, grad_out, dtype=None
+):
+    """Per-sequence flex_attention fwd+bwd; concatenates results in packed layout.
+
+    Uses eager flex_attention (not torch.compile). The compiled path caches
+    artifacts globally and silently produces wrong fp32 gradients across calls
+    with different seqlens, so the reference must stay uncompiled.
+    """
+    num_batches = len(cu_seqlens_q) - 1
+    out_chunks, dq_chunks, dk_chunks, dv_chunks = [], [], [], []
+
+    for i in range(num_batches):
+        q_slice = q[cu_seqlens_q[i] : cu_seqlens_q[i + 1]].unsqueeze(0).transpose(1, 2)
+        k_slice = k[cu_seqlens_k[i] : cu_seqlens_k[i + 1]].unsqueeze(0).transpose(1, 2)
+        v_slice = v[cu_seqlens_k[i] : cu_seqlens_k[i + 1]].unsqueeze(0).transpose(1, 2)
+        go_slice = (
+            grad_out[cu_seqlens_q[i] : cu_seqlens_q[i + 1]].unsqueeze(0).transpose(1, 2)
+        )
+
+        if dtype is not None:
+            q_slice = q_slice.to(dtype)
+            k_slice = k_slice.to(dtype)
+            v_slice = v_slice.to(dtype)
+            go_slice = go_slice.to(dtype)
+
+        q_slice = q_slice.detach().requires_grad_(True)
+        k_slice = k_slice.detach().requires_grad_(True)
+        v_slice = v_slice.detach().requires_grad_(True)
+
+        def wrapped_mod(score, b, h, q_idx, kv_idx, _i=i):
+            return eager_score_mod(score, _i, h, q_idx, kv_idx)
+
+        out = flex_attention(
+            q_slice,
+            k_slice,
+            v_slice,
+            score_mod=wrapped_mod,
+            enable_gqa=q_slice.shape[1] != k_slice.shape[1],
+        )
+        dq, dk, dv = torch.autograd.grad(out, (q_slice, k_slice, v_slice), go_slice)
+
+        out_chunks.append(out.transpose(1, 2).squeeze(0))
+        dq_chunks.append(dq.transpose(1, 2).squeeze(0))
+        dk_chunks.append(dk.transpose(1, 2).squeeze(0))
+        dv_chunks.append(dv.transpose(1, 2).squeeze(0))
+
+    return (
+        torch.cat(out_chunks, dim=0),
+        torch.cat(dq_chunks, dim=0),
+        torch.cat(dk_chunks, dim=0),
+        torch.cat(dv_chunks, dim=0),
+    )
+
+
+def _check_grad(name, cute_grad, ref_fp32, pt_grad, dtype, rtol=3, extra=1e-3):
+    import os
+    if os.environ.get("DUMP_GRADS"):
+        torch.save({"cute": cute_grad.detach().cpu(), "ref_fp32": ref_fp32.detach().cpu(),
+                    "pt": pt_grad.detach().cpu()}, f"/tmp/grads_{name}.pt")
+    assert not torch.isnan(cute_grad).any(), f"{name} contains NaN"
+    atol = 2 * (ref_fp32 + 0.3 - 0.3 - ref_fp32).abs().max().item() + extra
+    ref = ref_fp32.to(dtype)
+    pt_err = (pt_grad - ref).abs().max().item()
+    cute_err = (cute_grad - ref).abs().max().item()
+    print(f"  {name}: PT err={pt_err:.2e}, CuTE err={cute_err:.2e}, atol={atol:.2e}")
+    assert cute_err <= rtol * pt_err + atol, (
+        f"{name} CuTE err {cute_err:.2e} exceeds {rtol}*PT err {pt_err:.2e} + {atol:.2e}"
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("dim", [64, 128])
+@pytest.mark.parametrize("seqlens_q,seqlens_k", BWD_SEQLEN_CONFIGS)
+@pytest.mark.parametrize("score_mod_tuple", BWD_TEST_PAIRS)
+def test_varlen_score_mod_backward(seqlens_q, seqlens_k, dim, dtype, score_mod_tuple):
+    """Varlen backward with score_mod (no global indices in bwd)."""
+    if IS_SM90 and dim == 64:
+        pytest.skip("head_dim=64 not supported on SM90 for backward")
+
+    torch.random.manual_seed(42)
+    cute_fwd, cute_bwd, eager_factory, aux_type = score_mod_tuple
+
+    num_heads = 4
+    batch_size = len(seqlens_q)
+    total_q = sum(seqlens_q)
+    total_k = sum(seqlens_k)
+
+    q = torch.randn(total_q, num_heads, dim, device="cuda", dtype=dtype)
+    k = torch.randn(total_k, num_heads, dim, device="cuda", dtype=dtype)
+    v = torch.randn(total_k, num_heads, dim, device="cuda", dtype=dtype)
+    cu_seqlens_q = torch.tensor(
+        [0] + list(torch.tensor(seqlens_q).cumsum(0).tolist()),
+        device="cuda",
+        dtype=torch.int32,
+    )
+    cu_seqlens_k = torch.tensor(
+        [0] + list(torch.tensor(seqlens_k).cumsum(0).tolist()),
+        device="cuda",
+        dtype=torch.int32,
+    )
+
+    aux_tensors = None
+    if aux_type == "dual_buffer":
+        max_seqlen_q = max(seqlens_q)
+        head_bias = torch.randn(num_heads, device="cuda", dtype=dtype) * 0.2
+        pos_bias = torch.arange(max_seqlen_q, device="cuda", dtype=dtype) * 0.01
+        aux_tensors = [head_bias, pos_bias]
+        eager_score_mod = eager_factory(head_bias, pos_bias)
+    else:
+        eager_score_mod = eager_factory
+
+    out_cute, grad_out, dq_cute, dk_cute, dv_cute = run_cute_flash_bwd_varlen(
+        q,
+        k,
+        v,
+        cute_fwd,
+        cute_bwd,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        aux_tensors=aux_tensors,
+    )
+
+    _, dq_ref_fp32, dk_ref_fp32, dv_ref_fp32 = run_flex_varlen_ref_bwd(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        eager_score_mod,
+        grad_out,
+        dtype=torch.float32,
+    )
+    _, dq_pt, dk_pt, dv_pt = run_flex_varlen_ref_bwd(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        eager_score_mod,
+        grad_out,
+        dtype=dtype,
+    )
+
+    print(f"\nVarlen backward for {cute_fwd.__name__} ({batch_size=} {dtype=} {dim=}):")
+    _check_grad("dQ", dq_cute, dq_ref_fp32, dq_pt, dtype)
+    _check_grad("dK", dk_cute, dk_ref_fp32, dk_pt, dtype)
+    _check_grad("dV", dv_cute, dv_ref_fp32, dv_pt, dtype)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("dim", [64, 128])
+@pytest.mark.parametrize("seqlens_q,seqlens_k", BWD_SEQLEN_CONFIGS)
+@pytest.mark.parametrize("score_mod_tuple", BWD_TEST_PAIRS_WITH_GLOBAL)
+def test_varlen_score_mod_backward_with_global(
+    seqlens_q, seqlens_k, dim, dtype, score_mod_tuple
+):
+    """Varlen backward with a score_mod whose bwd reads aux at global indices.
+
+    Forward: scale[global_kv] * score**2.
+    Backward: 2 * scale[global_kv] * score * grad — needs all of grad, score, and
+    a global-indexed aux read.
+    """
+    if IS_SM90 and dim == 64:
+        pytest.skip("head_dim=64 not supported on SM90 for backward")
+
+    torch.random.manual_seed(42)
+    cute_fwd, cute_bwd, eager_factory, aux_type, requires_global = score_mod_tuple
+
+    num_heads = 4
+    total_q = sum(seqlens_q)
+    total_k = sum(seqlens_k)
+
+    q = torch.randn(total_q, num_heads, dim, device="cuda", dtype=dtype)
+    k = torch.randn(total_k, num_heads, dim, device="cuda", dtype=dtype)
+    v = torch.randn(total_k, num_heads, dim, device="cuda", dtype=dtype)
+    cu_seqlens_q = torch.tensor(
+        [0] + list(torch.tensor(seqlens_q).cumsum(0).tolist()),
+        device="cuda",
+        dtype=torch.int32,
+    )
+    cu_seqlens_k = torch.tensor(
+        [0] + list(torch.tensor(seqlens_k).cumsum(0).tolist()),
+        device="cuda",
+        dtype=torch.int32,
+    )
+
+    scale_tensor = torch.randn(total_k, device="cuda", dtype=dtype) * 0.1 + 1.0
+    aux_tensors = [scale_tensor]
+    eager_score_mod = eager_factory(scale_tensor, cu_seqlens_k)
+
+    out_cute, grad_out, dq_cute, dk_cute, dv_cute = run_cute_flash_bwd_varlen(
+        q,
+        k,
+        v,
+        cute_fwd,
+        cute_bwd,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        aux_tensors=aux_tensors,
+    )
+
+    _, dq_ref_fp32, dk_ref_fp32, dv_ref_fp32 = run_flex_varlen_ref_bwd(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        eager_score_mod,
+        grad_out,
+        dtype=torch.float32,
+    )
+    _, dq_pt, dk_pt, dv_pt = run_flex_varlen_ref_bwd(
+        q,
+        k,
+        v,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        eager_score_mod,
+        grad_out,
+        dtype=dtype,
+    )
+
+    print(f"\nVarlen backward (global) for {cute_fwd.__name__} ({dtype=} {dim=}):")
+    _check_grad("dQ", dq_cute, dq_ref_fp32, dq_pt, dtype)
+    _check_grad("dK", dk_cute, dk_ref_fp32, dk_pt, dtype)
+    _check_grad("dV", dv_cute, dv_ref_fp32, dv_pt, dtype)
 
 
 if __name__ == "__main__":
