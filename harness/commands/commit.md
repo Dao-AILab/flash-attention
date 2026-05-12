@@ -36,6 +36,7 @@ Commit command with harness scope checks.
 | File |
 | ---- |
 | `flash_attn/cute/sm100_hd256_2cta_fmha_forward.py` |
+| `flash_attn/cute/sm100_hd256_2cta_fmha_backward.py` |
 | `flash_attn/cute/sm100_hd256_2cta_fmha_backward_dqkernel.py` |
 | `flash_attn/cute/sm100_hd256_2cta_fmha_backward_dkdvkernel.py` |
 

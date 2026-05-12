@@ -52,9 +52,10 @@ Strict merge-ready code-level and architecture-level alignment for CuteDSL
 | Type | Files |
 | ---- | ----- |
 | Editable | `../flash_attn/cute/sm100_hd256_2cta_fmha_forward.py` |
+| Editable | `../flash_attn/cute/sm100_hd256_2cta_fmha_backward.py` |
 | Editable | `../flash_attn/cute/sm100_hd256_2cta_fmha_backward_dqkernel.py` |
 | Editable | `../flash_attn/cute/sm100_hd256_2cta_fmha_backward_dkdvkernel.py` |
-| Read-only | All other files, including target files, tests, harness files, shared CuteDSL files, generated files, and `../flash_attn/cute/sm100_hd256_2cta_fmha_backward.py` |
+| Read-only | All other files, including target files, tests, harness files, shared CuteDSL files, and generated files |
 
 If refactor needs any read-only file edit, stop and ask for explicit approval.
 

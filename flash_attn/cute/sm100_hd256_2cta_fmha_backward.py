@@ -151,6 +151,7 @@ class BlackwellFusedMultiHeadAttentionBackward:
 
         self.acc_dtype = cutlass.Float32
         self.is_causal = is_causal
+        self.is_local = is_local
         self.window_size_left = (
             None if (window_size_left is None or window_size_left < 0) else window_size_left
         )
@@ -174,12 +175,23 @@ class BlackwellFusedMultiHeadAttentionBackward:
             use_clc_scheduler=self.use_clc_scheduler,
         )
         self.dkdv_kernel = BlackwellFusedMultiHeadAttentionBackwardDKDVKernel(
-            self.acc_dtype,
-            (self.tile_m_dkdv, self.tile_n_dkdv, 256),
-            self.is_causal,
-            self.window_size_left,
-            self.window_size_right,
-            use_clc_scheduler=self.use_clc_scheduler,
+            head_dim,
+            head_dim_v,
+            is_causal=self.is_causal,
+            is_local=self.is_local,
+            qhead_per_kvhead=qhead_per_kvhead,
+            tile_m=self.tile_m_dkdv,
+            tile_n=self.tile_n_dkdv,
+            is_persistent=False,
+            deterministic=deterministic,
+            spt=None,
+            cluster_size=cluster_size,
+            use_2cta_instrs=use_2cta_instrs,
+            score_mod=score_mod,
+            score_mod_bwd=score_mod_bwd,
+            mask_mod=mask_mod,
+            has_aux_tensors=has_aux_tensors,
+            subtile_factor=subtile_factor,
         )
 
     @cute.jit
@@ -212,9 +224,6 @@ class BlackwellFusedMultiHeadAttentionBackward:
         assert seqused_q is None and seqused_k is None, (
             "SM100 backward with head_dim=256 does not support seqused_q/seqused_k"
         )
-        assert window_size_left is None and window_size_right is None, (
-            "SM100 backward with head_dim=256 uses constructor-provided window sizes"
-        )
         assert dQ_semaphore is None and dK_semaphore is None and dV_semaphore is None, (
             "SM100 backward with head_dim=256 does not use semaphores"
         )
@@ -228,6 +237,9 @@ class BlackwellFusedMultiHeadAttentionBackward:
             "SM100 backward with head_dim=256 expects dQ tensor at dQ_accum slot"
         )
         dQ = dQ_accum
+        mQ, mK, mV = Q, K, V
+        mdO, mLSE, mdPsum = dO, lse_log2, dpsum
+        mdK, mdV = dK, dV
         varlen = cumulative_s_q is not None or cumulative_s_k is not None
         q_rank = cute.rank(Q.layout)
         k_rank = cute.rank(K.layout)
@@ -276,16 +288,18 @@ class BlackwellFusedMultiHeadAttentionBackward:
             stream,
         )
         self.dkdv_kernel(
-            Q,
-            K,
-            V,
-            dK,
-            dV,
-            dO,
-            scaled_LSE,
-            sum_OdO,
-            cumulative_s_q,
-            cumulative_s_k,
+            mQ,
+            mK,
+            mV,
+            mdO,
+            mLSE,
+            mdPsum,
+            mdK,
+            mdV,
             scale_softmax,
-            stream,
+            mCuSeqlensQ=cumulative_s_q,
+            mCuSeqlensK=cumulative_s_k,
+            window_size_left=window_size_left,
+            window_size_right=window_size_right,
+            stream=stream,
         )
