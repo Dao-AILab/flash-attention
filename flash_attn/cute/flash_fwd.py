@@ -1012,6 +1012,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             mask_causal=self.is_causal,
             mask_local=self.is_local,
             aux_tensors=aux_tensors,
+            vec_size=self.mask_vec_size,
             fastdiv_mods=fastdiv_mods if const_expr(self.mask_mod is not None) else None,
         )
 
@@ -1217,7 +1218,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             batch_idx,
             head_idx,
             softmax_scale,
-            self.vec_size,
+            self.score_vec_size,
             self.qk_acc_dtype,
             aux_tensors,
             fastdiv_mods,
