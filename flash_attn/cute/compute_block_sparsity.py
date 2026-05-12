@@ -18,7 +18,7 @@ from flash_attn.cute.cute_dsl_utils import (
     get_aux_tensor_metadata,
     to_cute_aux_tensor,
 )
-from flash_attn.cute.utils import hash_callable, scalar_to_ssa, ssa_to_scalar
+from flash_attn.cute.utils import hash_callable, scalar_to_ssa, ssa_to_scalar, batch_search
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 
 
@@ -161,16 +161,7 @@ class BlockSparsityKernel:
             m_block, head_idx, batch_idx = cute.arch.block_idx()
         else:
             global_m_block, head_idx, _ = cute.arch.block_idx()
-            # Binary search over cu_total_m_blocks to find batch_idx
-            lo = Int32(0)
-            hi = batch_size
-            while lo < hi:
-                mid = (lo + hi) // 2
-                if mCuTotalMBlocks[mid + 1] <= global_m_block:
-                    lo = mid + 1
-                else:
-                    hi = mid
-            batch_idx = lo
+            batch_idx = batch_search(global_m_block, mCuTotalMBlocks)   
             m_block = global_m_block - mCuTotalMBlocks[batch_idx]
 
         seqlen = SeqlenInfoCls(batch_idx)

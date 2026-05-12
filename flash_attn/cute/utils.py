@@ -949,3 +949,20 @@ def scalar_to_ssa(a: cute.Numeric, dtype) -> cute.TensorSSA:
 def ssa_to_scalar(val):
     """Could inline but nice for reflecting the above api"""
     return val[0]
+
+
+@cute.jit
+def batch_search(token: Int32, cu_seqlens: cute.Tensor) -> Int32:
+    """Binary search to determine batch from packed token"""
+    batch_size = cute.size(cu_seqlens) - 1
+    lo = Int32(0)
+    hi = batch_size
+
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if cu_seqlens[mid + 1] <= token:
+            lo = mid + 1
+        else:
+            hi = mid
+
+    return lo
