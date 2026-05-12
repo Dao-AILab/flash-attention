@@ -127,7 +127,7 @@ class FlashAttentionForwardSm100:
         m_block_size: int = 128,
         n_block_size: int = 128,
         q_stage: cutlass.Constexpr[int] = 2,
-        is_persistent: bool = True,
+        is_static_persistent: bool = True,
         score_mod: cutlass.Constexpr | None = None,
         mask_mod: cutlass.Constexpr | None = None,
         has_aux_tensors: cutlass.Constexpr = False,
@@ -178,7 +178,7 @@ class FlashAttentionForwardSm100:
         self.qk_acc_dtype = Float32
         self.pv_acc_dtype = Float32
         self.cluster_shape_mn = (2, 1) if self.use_2cta_instrs else (1, 1)
-        self.is_persistent = is_persistent
+        self.is_static_persistent = is_static_persistent
         self.is_causal = is_causal
         self.is_local = is_local
         self.is_varlen_q = is_varlen_q
@@ -195,15 +195,7 @@ class FlashAttentionForwardSm100:
         self.vec_size: cutlass.Constexpr = getattr(
             score_mod, "__vec_size__", 1 if cutlass.const_expr(has_aux_tensors) else 2
         )
-        self.dynamic_persistent = has_tile_count_semaphore and is_varlen_q
-        if self.dynamic_persistent:
-            self.is_persistent = True
-            assert not use_clc_scheduler, (
-                "use_clc_scheduler and dynamic_persistent (varlen + tile_count_semaphore) "
-                "are not currently composable; pick one. TODO: future revision could let "
-                "DynamicPersistentVarlenScheduler use CLC for tile distribution while "
-                "keeping prepare_scheduler's per-batch num_splits and LPT batch-sort."
-            )
+
         # Does S1 need to wait for S0 to finish
         # self.s0_s1_barrier = self.head_dim_padded in [64, 96] and (not self.is_causal and not self.is_local)
         is_sm103 = self.arch >= Arch.sm_103 and self.arch <= Arch.sm_103f
@@ -221,12 +213,15 @@ class FlashAttentionForwardSm100:
             "Paged KV does not support irregular head dim"
         )
 
+        self.use_clc_scheduler = use_clc_scheduler
+        self.dynamic_persistent = (has_tile_count_semaphore and is_varlen_q) or use_clc_scheduler
         # ClC does not compose with these other features, so disable even if requested
         self.use_clc_scheduler = (
             use_clc_scheduler
             and self.use_tma_KV
-            and not self.overlap_sO_sQ
         )
+        self.static_persistent = is_static_persistent 
+        self.is_persistent = self.dynamic_persistent or self.static_persistent
         self.sched_stages = 1
         if self.use_clc_scheduler:
             assert self.cluster_shape_mn[1] == 1, f"CLC requires cluster N == 1: {self.cluster_shape_mn}"
@@ -242,13 +237,13 @@ class FlashAttentionForwardSm100:
         )
 
         if is_varlen_q:
-            if self.dynamic_persistent:
+            if self.dynamic_persistent and not self.use_clc_scheduler:
                 self.TileScheduler = DynamicPersistentVarlenScheduler
             else:
                 self.TileScheduler = SingleTileVarlenScheduler
         elif self.is_causal or self.is_local or self.use_clc_scheduler:
             self.TileScheduler = SingleTileLPTScheduler
-        elif self.is_persistent:
+        elif self.static_persistent:
             self.TileScheduler = StaticPersistentTileScheduler
         else:
             self.TileScheduler = SingleTileScheduler
@@ -295,10 +290,7 @@ class FlashAttentionForwardSm100:
         elif self.is_varlen_q: # fallback
             self.epilogue_warp_ids = (13, 14)
 
-        self.scheduler_warp_id = (
-            self.empty_warp_ids[0]
-            if (self.use_clc_scheduler or self.dynamic_persistent) else None
-        )
+        self.scheduler_warp_id = self.empty_warp_ids[0] if self.dynamic_persistent else None
 
         self.tmem_s_offset = [0, self.n_block_size]  # e.g., 0, 128
         self.tmem_o_offset = [

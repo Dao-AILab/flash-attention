@@ -197,7 +197,7 @@ class FlashAttentionForwardCombine:
         cu_seqlens: Optional[cute.Tensor] = None,
         seqused: Optional[cute.Tensor] = None,
         num_splits_dynamic_ptr: Optional[cute.Tensor] = None,
-        varlen_batch_idx: Optional[cute.Tensor] = None,
+        virtual_batch_idx: Optional[cute.Tensor] = None,
         semaphore_to_reset: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
@@ -301,7 +301,7 @@ class FlashAttentionForwardCombine:
             cu_seqlens,
             seqused,
             num_splits_dynamic_ptr,
-            varlen_batch_idx,
+            virtual_batch_idx,
             semaphore_to_reset,
             SharedStorage,
             self.smem_layout_lse,
@@ -330,7 +330,7 @@ class FlashAttentionForwardCombine:
         cu_seqlens: Optional[cute.Tensor],
         seqused: Optional[cute.Tensor],
         num_splits_dynamic_ptr: Optional[cute.Tensor],
-        varlen_batch_idx: Optional[cute.Tensor],
+        virtual_batch_idx: Optional[cute.Tensor],
         semaphore_to_reset: Optional[cute.Tensor],
         SharedStorage: cutlass.Constexpr,
         smem_layout_lse: cute.Layout | cute.ComposedLayout,
@@ -349,8 +349,8 @@ class FlashAttentionForwardCombine:
 
         # Map virtual batch index to real batch index (for persistent tile schedulers)
         batch_idx = (
-            varlen_batch_idx[maybe_virtual_batch]
-            if const_expr(varlen_batch_idx is not None)
+            virtual_batch_idx[maybe_virtual_batch]
+            if const_expr(virtual_batch_idx is not None)
             else maybe_virtual_batch
         )
 
@@ -365,6 +365,7 @@ class FlashAttentionForwardCombine:
 
         # Handle semaphore reset — wait for dependent grids first
         if const_expr(semaphore_to_reset is not None):
+            # maybe handle on first CTA?
             if (
                 tidx == 0
                 and m_block == cute.arch.grid_dim()[0] - 1

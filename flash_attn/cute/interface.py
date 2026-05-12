@@ -985,7 +985,7 @@ def _flash_attn_fwd(
                     m_block_size=tile_m,
                     n_block_size=tile_n,
                     q_stage=q_stage,
-                    is_persistent=not causal
+                    is_static_persistent=not causal
                         and not local
                         and cu_seqlens_q is None
                         and seqused_q is None
@@ -1181,6 +1181,7 @@ def _flash_attn_fwd(
             virtual_batch_idx=virtual_batch_idx if has_scheduler_metadata else None,
         )
     if reuse_scheduler_metadata and tile_count_semaphore is not None:
+        # combine kernel does this for us
         tile_count_semaphore.zero_()
     return out, lse
 

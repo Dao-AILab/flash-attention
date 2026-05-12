@@ -46,7 +46,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         m_block_size: int = 128,
         n_block_size: int = 128,
         q_stage: int = 2,
-        is_persistent: bool = True,
+        is_static_persistent: bool = True,
         score_mod=None,
         mask_mod=None,
         has_aux_tensors: bool = False,
@@ -54,6 +54,8 @@ class BlackwellFusedMultiHeadAttentionForward:
         is_varlen_q: bool = False,
         use_2cta_instrs: bool = False,
         use_clc_scheduler: bool = False,
+        has_tile_count_semaphore: bool = False,
+        seqlen_k_per_split: Optional[int] = None,
     ):
         head_dim_v = head_dim if head_dim_v is None else head_dim_v
         assert head_dim == 256 and head_dim_v == 256, (
