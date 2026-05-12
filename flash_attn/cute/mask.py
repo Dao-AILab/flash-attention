@@ -457,7 +457,11 @@ class AttentionMask:
                     )
 
         elif const_expr(not mask_causal and not mask_local and mask_mod is not None):
-            # Block sparse case w/ mask_mod
+            # FlexAttention case w/ mask_mod, gated on `mask_mod.__vec_size__`:
+            #   vec_size == 1:  scalar eval, returns Boolean.
+            #   vec_size <= 32: returns shape-(1,) Uint32 fragment, bit i = lane i.
+            #   vec_size  > 32: returns shape-(vec_size//32,) Uint32 fragment, bit i of
+            #                   element k = lane (k*32 + i).
             has_fastdiv = const_expr(
                 fastdiv_mods is not None
                 and fastdiv_mods[0] is not None
@@ -466,65 +470,150 @@ class AttentionMask:
             batch_idx_ssa = utils.scalar_to_ssa(batch_idx, cutlass.Int32)
 
             ncol = const_expr(cute.size(tScS_t2r.shape))
-            # vectorized mask_mod application happens in two stages:
-            #   1: evaluation, where a Uint32 fragment bitmask is populated 
-            #   2: application, where it is applied to compile down to r2p 
-            #
-            # evaluation
-            num_mask_vals = (ncol + 32 - 1) // 32 
-            mask = cute.make_rmem_tensor(num_mask_vals, dtype=cutlass.Uint32)
-            mask.fill(cutlass.Uint32(0))
-            for s in cutlass.range_constexpr(cute.ceil_div(ncol, vec_size)):
-                i = s * vec_size
-                row_coord = tScS_t2r[i][0] if not self.swap_AB else tScS_t2r[i][1]
-                col_coord = tScS_t2r[i][1] if not self.swap_AB else tScS_t2r[i][0]
-                global_row = row_coord + m_block * self.tile_m
-                global_col = col_coord + n_block * self.tile_n
+            assert vec_size % 32 == 0 or 32 % vec_size == 0, (
+                "vec_size must divide 32 or be a multiple of 32"
+            )
 
-                if const_expr(self.qhead_per_kvhead_packgqa != 1):
-                    assert head_divmod is not None
-                    mask_row, head_offset = divmod(global_row, head_divmod)
-                    head_idx_for_mod = head_idx * self.qhead_per_kvhead_packgqa + head_offset
-                else:
-                    head_idx_for_mod = head_idx
-                    mask_row = global_row
+            if const_expr(vec_size == 1):
+                for i in cutlass.range_constexpr(ncol):
+                    row_coord = tScS_t2r[i][0] if not self.swap_AB else tScS_t2r[i][1]
+                    col_coord = tScS_t2r[i][1] if not self.swap_AB else tScS_t2r[i][0]
+                    global_row = row_coord + m_block * self.tile_m
+                    global_col = col_coord + n_block * self.tile_n
 
-                mask_row_for_mod = mask_row
-                if const_expr(has_fastdiv and aux_tensors is not None):
-                    if check_q_boundary:
-                        _, mask_row_for_mod = divmod(mask_row, fastdiv_mods[0])
-                global_col_for_mod = global_col
-                if const_expr(has_fastdiv and mask_seqlen and aux_tensors is not None):
-                    _, global_col_for_mod = divmod(global_col, fastdiv_mods[1])
+                    if const_expr(self.qhead_per_kvhead_packgqa != 1):
+                        assert head_divmod is not None
+                        mask_row, head_offset = divmod(global_row, head_divmod)
+                        head_idx_for_mod = head_idx * self.qhead_per_kvhead_packgqa + head_offset
+                    else:
+                        head_idx_for_mod = head_idx
+                        mask_row = global_row
 
-                head_idx_ssa = utils.scalar_to_ssa(head_idx_for_mod, cutlass.Int32)
-                mask_row_ssa = utils.scalar_to_ssa(mask_row_for_mod, cutlass.Int32)
-                kv_idx_ssa = utils.scalar_to_ssa(global_col_for_mod, cutlass.Int32)
-                mask_value = mask_mod(
-                    batch_idx_ssa,
-                    head_idx_ssa,
-                    mask_row_ssa,
-                    kv_idx_ssa,
-                    self.seqlen_info,
-                    aux_tensors,
-                )
-                for j in cutlass.range_constexpr(min(vec_size, ncol - i)):
-                    idx = j // 32 
-                    cond = cutlass.Boolean(mask_value[idx] & (cutlass.Uint32(1) << j))
-                    col = i + j
+                    mask_row_for_mod = mask_row
+                    if const_expr(has_fastdiv and aux_tensors is not None):
+                        if check_q_boundary:
+                            _, mask_row_for_mod = divmod(mask_row, fastdiv_mods[0])
+                    global_col_for_mod = global_col
+                    if const_expr(has_fastdiv and mask_seqlen and aux_tensors is not None):
+                        _, global_col_for_mod = divmod(global_col, fastdiv_mods[1])
+
+                    head_idx_ssa = utils.scalar_to_ssa(head_idx_for_mod, cutlass.Int32)
+                    mask_row_ssa = utils.scalar_to_ssa(mask_row_for_mod, cutlass.Int32)
+                    kv_idx_ssa = utils.scalar_to_ssa(global_col_for_mod, cutlass.Int32)
+                    mask_value = mask_mod(
+                        batch_idx_ssa,
+                        head_idx_ssa,
+                        mask_row_ssa,
+                        kv_idx_ssa,
+                        self.seqlen_info,
+                        aux_tensors,
+                    )
+                    cond = cutlass.Boolean(utils.ssa_to_scalar(mask_value))
+                    acc_S[i] = acc_S[i] if cond else -Float32.inf
                     if const_expr(mask_seqlen):
-                        cond = cond & cutlass.Boolean(global_col < self.seqlen_k)
+                        acc_S[i] = -Float32.inf if global_col >= self.seqlen_k else acc_S[i]
                     if check_q_boundary:
-                        cond = cond & cutlass.Boolean(mask_row < self.seqlen_q)
+                        acc_S[i] = -Float32.inf if mask_row >= self.seqlen_q else acc_S[i]
+            else:
+                # Each mask_mod call evaluates `vec_size` elements; each mask_val is a
+                # Uint32 packing the result for 32 elems. Process ncol in apply-steps
+                # of max(vec_size, 32) elems: each step issues `calls_per_apply`
+                # mask_mod calls, assembles `mask_vals_per_apply` packed Uint32
+                # mask_vals, and applies each to acc_S, compiling down to R2P.
+                mask_vals_per_apply = const_expr(max(1, vec_size // 32))
+                calls_per_apply = const_expr(max(1, 32 // vec_size))
+                n_calls = const_expr(cute.ceil_div(ncol, vec_size))
+                mask_vals = cute.make_rmem_tensor(mask_vals_per_apply, dtype=cutlass.Uint32)
+                for s in cutlass.range_constexpr(n_calls):
+                    if const_expr(s % calls_per_apply == 0):
+                        for c in cutlass.range_constexpr(mask_vals_per_apply):
+                            mask_vals[c] = cutlass.Uint32(0)
+                    i = s * vec_size
+                    row_coord = tScS_t2r[i][0] if not self.swap_AB else tScS_t2r[i][1]
+                    col_coord = tScS_t2r[i][1] if not self.swap_AB else tScS_t2r[i][0]
+                    global_row = row_coord + m_block * self.tile_m
+                    global_col = col_coord + n_block * self.tile_n
+                    if const_expr(self.qhead_per_kvhead_packgqa != 1):
+                        assert head_divmod is not None
+                        mask_row, head_offset = divmod(global_row, head_divmod)
+                        head_idx_for_mod = head_idx * self.qhead_per_kvhead_packgqa + head_offset
+                    else:
+                        head_idx_for_mod = head_idx
+                        mask_row = global_row
+                    mask_row_for_mod = mask_row
+                    if const_expr(has_fastdiv and aux_tensors is not None):
+                        if check_q_boundary:
+                            _, mask_row_for_mod = divmod(mask_row, fastdiv_mods[0])
 
-                    # set bit i if cond 
-                    val = col // 32 
-                    bit = col % 32 
-                    if cond: 
-                        mask[val] = mask[val] | (cutlass.Uint32(1) << bit)
+                    head_idx_ssa = utils.scalar_to_ssa(
+                        head_idx_for_mod, cutlass.Int32
+                    ).broadcast_to((vec_size,))
+                    mask_row_ssa = utils.scalar_to_ssa(
+                        mask_row_for_mod, cutlass.Int32
+                    ).broadcast_to((vec_size,))
+                    batch_idx_ssa_call = batch_idx_ssa.broadcast_to((vec_size,))
+                    kv_idx_vec = cute.make_rmem_tensor(vec_size, cutlass.Int32)
 
-            # mask application 
-            mask_mod_r2p(acc_S, mask)
+                    # ---- populate kv_idx_ssa ----
+                    for j in cutlass.range_constexpr(min(vec_size, ncol - i)):
+                        col_j_coord = tScS_t2r[i + j][1] if not self.swap_AB else tScS_t2r[i + j][0]
+                        col_j_global = col_j_coord + n_block * self.tile_n
+                        col_j_for_mod = col_j_global
+                        if const_expr(has_fastdiv and mask_seqlen and aux_tensors is not None):
+                            _, col_j_for_mod = divmod(col_j_global, fastdiv_mods[1])
+                        kv_idx_vec[j] = col_j_for_mod
+                    kv_idx_ssa = kv_idx_vec.load()
+
+                    # ---- evaluate ----
+                    mask_value = mask_mod(
+                        batch_idx_ssa_call,
+                        head_idx_ssa,
+                        mask_row_ssa,
+                        kv_idx_ssa,
+                        self.seqlen_info,
+                        aux_tensors,
+                    )
+
+                    # ---- handle bounds checking ----
+                    bit_offset = const_expr((s % calls_per_apply) * vec_size)
+                    seqlen_thresh_call = (
+                        self.seqlen_k - global_col
+                        if const_expr(mask_seqlen)
+                        else cutlass.Int32(0)
+                    )
+                    q_in_bounds = (
+                        mask_row < self.seqlen_q
+                        if check_q_boundary
+                        else cutlass.Boolean(True)
+                    )
+                    for c in cutlass.range_constexpr(mask_vals_per_apply):
+                        mask_val = mask_value[c]
+                        if const_expr(mask_seqlen):
+                            local_thresh = seqlen_thresh_call - c * 32
+                            m_shift = max(cutlass.Int32(32) - local_thresh, cutlass.Int32(0))
+                            seqlen_keep = utils.shr_u32(
+                                cutlass.Uint32(0xFFFFFFFF), cutlass.Uint32(m_shift)
+                            )
+                            mask_val = mask_val & seqlen_keep
+                        if check_q_boundary:
+                            mask_val = mask_val if q_in_bounds else cutlass.Uint32(0)
+                        mask_vals[c] = mask_vals[c] | (mask_val << bit_offset)
+                    
+                    # ---- vectorized application (compiles down to r2p) ----
+                    is_last_in_apply = const_expr(s % calls_per_apply == calls_per_apply - 1)
+                    is_last_overall = const_expr(s == n_calls - 1)
+                    if const_expr(is_last_in_apply or is_last_overall):
+                        apply_idx = s // calls_per_apply
+                        for c in cutlass.range_constexpr(mask_vals_per_apply):
+                            col_base = (apply_idx * mask_vals_per_apply + c) * 32
+                            if const_expr(col_base >= ncol):
+                                break
+                            n_cols = const_expr(min(32, ncol - col_base))
+                            mask_val = mask_vals[c]
+                            for k in cutlass.range_constexpr(n_cols):
+                                col = col_base + k
+                                cond = cutlass.Boolean(mask_val & (cutlass.Uint32(1) << k))
+                                acc_S[col] = acc_S[col] if cond else -Float32.inf
 
         else:  # Causal or local
             causal_row_offset = self.seqlen_k - n_block * self.tile_n - self.seqlen_q

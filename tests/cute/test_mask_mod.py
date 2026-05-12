@@ -32,7 +32,13 @@ from flash_attn.cute.block_sparsity import (
 )
 from flash_attn.cute.cache_utils import get_jit_cache
 from flash_attn.cute import utils
-from mask_mod_definitions import get_mask_pair, random_doc_id_tensor
+from mask_mod_definitions import (
+    get_mask_pair,
+    get_vec_mask,
+    random_doc_id_tensor,
+    EXTRA_SCALAR_MASKS,
+    make_packed_mask_aux_tensor,
+)
 COMPUTE_CAPABILITY = torch.cuda.get_device_capability()[0]
 
 
@@ -826,6 +832,121 @@ def test_parameterized_masks(
         needs_backward=True,
         use_autograd=use_autograd,
     )
+
+
+# =============================================================================
+# Vectorized mask_mod equality tests
+# Pattern: scalar mask is reference; vec mask at multiple __vec_size__ values
+# must produce bit-identical output.
+# =============================================================================
+
+# (mask_name, window_size, needs_aux)
+VEC_MASK_TEST_CASES = [
+    ("causal", None, False),
+    ("block_causal", None, False),
+    ("sliding_window", 128, False),
+    ("block_diagonal", None, False),
+    ("prefix_lm", None, False),
+    ("packed_aux", None, True),
+]
+
+# vec_size > 32 only supported by packed_aux (other vec mods return shape-(1,) Uint32).
+VEC_MASK_SIZES_TO_CHECK_EQUALITY = (
+    [2, 8, 32, 128] if COMPUTE_CAPABILITY == 10 else [2, 8, 32]
+)
+
+
+def _run_mask_mod_only(q, k, v, mask_mod, aux_tensors, pack_gqa):
+    out = torch.empty_like(q)
+    _flash_attn_fwd(
+        q=q,
+        k=k,
+        v=v,
+        out=out,
+        lse=None,
+        cu_seqlens_q=None,
+        cu_seqlens_k=None,
+        seqused_q=None,
+        seqused_k=None,
+        page_table=None,
+        softmax_scale=1.0 / math.sqrt(q.shape[-1]),
+        causal=False,
+        softcap=None,
+        window_size_left=-1,
+        window_size_right=-1,
+        learnable_sink=None,
+        tile_mn=(128, 128),
+        pack_gqa=pack_gqa,
+        _arch=None,
+        score_mod=None,
+        mask_mod=mask_mod,
+        block_sparse_tensors=None,
+        return_lse=False,
+        aux_tensors=aux_tensors,
+    )
+    return out
+
+
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_k",
+    [(128, 128), (256, 256), (113, 203), (256, 512), (1024, 1024)],
+)
+@pytest.mark.parametrize("qhead_per_kvhead,num_kv_heads", [(1, 4), (4, 2)])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("mask_case", VEC_MASK_TEST_CASES)
+def test_cute_mask_mod_vectorized(
+    seqlen_q, seqlen_k, qhead_per_kvhead, num_kv_heads, dtype, mask_case
+):
+    """Tests equality between scalar and vectorized versions of mask mods."""
+    mask_name, window_size, needs_aux = mask_case
+    torch.manual_seed(42)
+
+    num_heads = num_kv_heads * qhead_per_kvhead
+    pack_gqa = qhead_per_kvhead > 1
+    head_dim = 128
+    batch_size = 2
+
+    q = torch.randn(
+        batch_size, seqlen_q, num_heads, head_dim, device="cuda", dtype=dtype
+    )
+    k = torch.randn(
+        batch_size, seqlen_k, num_kv_heads, head_dim, device="cuda", dtype=dtype
+    )
+    v = torch.randn(
+        batch_size, seqlen_k, num_kv_heads, head_dim, device="cuda", dtype=dtype
+    )
+
+    if needs_aux:
+        aux_tensors = [make_packed_mask_aux_tensor(batch_size, seqlen_q, seqlen_k)]
+        scalar_mod = EXTRA_SCALAR_MASKS[mask_name]
+    else:
+        aux_tensors = None
+        scalar_mod, _ = get_mask_pair(
+            mask_name,
+            seqlen_q=seqlen_q,
+            seqlen_k=seqlen_k,
+            window_size=window_size,
+        )
+
+    out_ref = _run_mask_mod_only(q, k, v, scalar_mod, aux_tensors, pack_gqa)
+
+    for vec_size in VEC_MASK_SIZES_TO_CHECK_EQUALITY:
+        if vec_size > 32 and mask_name != "packed_aux":
+            continue
+        vec_mod = get_vec_mask(
+            mask_name,
+            seqlen_q=seqlen_q,
+            seqlen_k=seqlen_k,
+            window_size=window_size,
+            vec_size=vec_size,
+        )
+        if vec_mod is None:
+            pytest.skip(f"no vec mask for {mask_name}")
+        vec_mod.__vec_size__ = vec_size
+        out = _run_mask_mod_only(q, k, v, vec_mod, aux_tensors, pack_gqa)
+        assert torch.equal(out, out_ref), (
+            f"{mask_name} vec_size={vec_size}: output mismatch vs scalar reference"
+        )
 
 
 def test_sm100_block_sparse_sink_all_masked():
