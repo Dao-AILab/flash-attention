@@ -888,6 +888,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                             batch_idx,
                             head_idx,
                             m_block,
+                            seqlen,
                             kv_producer_state,
                             tma_load_K_fn,
                             tma_load_V_fn,
