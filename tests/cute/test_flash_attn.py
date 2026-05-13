@@ -763,9 +763,14 @@ def test_flash_attn_varlen_output(
         # num_splits_vals = [1, 3]
         # SplitKV is not supported for hdim >= 192
         num_splits_vals = [1, 3] if d < 192 and not DISABLE_SPLIT and not TEST_BWD_ONLY else [1]
-        for pack_gqa, num_splits in itertools.product(pack_gqa_vals, num_splits_vals):
+        precompute_metadata_vals = [False, True]
+        for pack_gqa, num_splits, precompute_metadata in itertools.product(
+            pack_gqa_vals, num_splits_vals, precompute_metadata_vals
+        ):
             # SplitKV not supported on SM90 - skip this iteration
             if IS_SM90 and num_splits > 1:
+                continue
+            if precompute_metadata and is_fake_mode():
                 continue
             # TODO(wangsiyu): SM100 head_dim=256 2CTA kernel does not support pack_gqa yet.
             # pack_gqa=None means auto-enable for GQA/MQA (qhead_per_kvhead > 1)
@@ -775,56 +780,79 @@ def test_flash_attn_varlen_output(
                     continue
                 if pack_gqa is None and mha_type != "mha":
                     continue
-            out_unpad, lse = flash_attn_varlen_func(
-                q_unpad if unpad_q else q,
-                k_unpad if unpad_kv else k,
-                v_unpad if unpad_kv else v,
-                cu_seqlens_q=cu_seqlens_q if unpad_q else None,
-                cu_seqlens_k=cu_seqlens_k if unpad_kv else None,
-                max_seqlen_q=seqlen_q,
-                max_seqlen_k=seqlen_k,
-                seqused_q=seqused_q if not unpad_q else None,
-                seqused_k=seqused_k if not unpad_kv else None,
-                causal=causal,
-                # qv=qv_unpad,
-                # q_descale=q_descale,
-                # k_descale=k_descale, v_descale=v_descale,
-                window_size=window_size,
-                # attention_chunk=attention_chunk,
-                learnable_sink=learnable_sink,
-                softcap=softcap,
-                num_splits=num_splits,
-                pack_gqa=pack_gqa,
-                deterministic=deterministic,
-            )
-            out = output_pad_fn(out_unpad) if unpad_q else out_unpad
-            if is_fake_mode():
-                # no more flash_attn cutedsl calls for the rest of the loop
-                # skip data-dependent postprocessing
-                continue
-            if query_unused_mask is not None:
-                out.masked_fill_(q_zero_masking, 0.0)
-            # When unpad_q=False with seqused_q, the kernel doesn't write positions
-            # beyond seqused_q, so those contain uninitialized values. Mask them out
-            # before comparing.
-            out_cmp, out_ref_cmp, out_pt_cmp = out, out_ref, out_pt
-            if not unpad_q and seqused_q is not None:
-                seqused_mask = torch.arange(seqlen_q, device=device)[None, :] < seqused_q[:, None]
-                seqused_mask = rearrange(seqused_mask, "b s -> b s 1 1")
-                out_cmp = out.clone().masked_fill_(~seqused_mask, 0.0)
-                out_ref_cmp = out_ref.clone().masked_fill_(~seqused_mask, 0.0)
-                out_pt_cmp = out_pt.clone().masked_fill_(~seqused_mask, 0.0)
-            print(f"Output max diff: {(out_cmp - out_ref_cmp).abs().max().item()}")
-            print(f"Output mean diff: {(out_cmp - out_ref_cmp).abs().mean().item()}")
-            # if not causal:
-            #     print(f"LSE max diff: {(lse - lse_ref).abs().max().item()}")
-            # breakpoint()
+            if precompute_metadata:
+                scheduler_metadata = get_scheduler_metadata(
+                    num_batch=batch_size,
+                    max_seqlen_q=seqlen_q,
+                    max_seqlen_k=seqlen_k,
+                    nheads=nheads,
+                    nheads_kv=nheads_kv,
+                    headdim=d,
+                    headdim_v=dv,
+                    num_splits=num_splits,
+                    tile_m=128,
+                    tile_n=128,
+                    causal=causal,
+                    cu_seqlens_q=cu_seqlens_q if unpad_q else None,
+                    cu_seqlens_k=cu_seqlens_k if unpad_kv else None,
+                    seqused_q=seqused_q if not unpad_q else None,
+                    seqused_k=seqused_k if not unpad_kv else None,
+                )
+            else:
+                scheduler_metadata = None
+            # Repeat to exercise metadata reuse across calls.
+            for _ in range(1 if not precompute_metadata else 2):
+                out_unpad, lse = flash_attn_varlen_func(
+                    q_unpad if unpad_q else q,
+                    k_unpad if unpad_kv else k,
+                    v_unpad if unpad_kv else v,
+                    cu_seqlens_q=cu_seqlens_q if unpad_q else None,
+                    cu_seqlens_k=cu_seqlens_k if unpad_kv else None,
+                    max_seqlen_q=seqlen_q,
+                    max_seqlen_k=seqlen_k,
+                    seqused_q=seqused_q if not unpad_q else None,
+                    seqused_k=seqused_k if not unpad_kv else None,
+                    causal=causal,
+                    # qv=qv_unpad,
+                    # q_descale=q_descale,
+                    # k_descale=k_descale, v_descale=v_descale,
+                    window_size=window_size,
+                    # attention_chunk=attention_chunk,
+                    learnable_sink=learnable_sink,
+                    softcap=softcap,
+                    scheduler_metadata=scheduler_metadata,
+                    num_splits=num_splits,
+                    pack_gqa=pack_gqa,
+                    deterministic=deterministic,
+                )
+                out = output_pad_fn(out_unpad) if unpad_q else out_unpad
+                if is_fake_mode():
+                    # no more flash_attn cutedsl calls for the rest of the loop
+                    # skip data-dependent postprocessing
+                    continue
+                if query_unused_mask is not None:
+                    out.masked_fill_(q_zero_masking, 0.0)
+                # When unpad_q=False with seqused_q, the kernel doesn't write positions
+                # beyond seqused_q, so those contain uninitialized values. Mask them out
+                # before comparing.
+                out_cmp, out_ref_cmp, out_pt_cmp = out, out_ref, out_pt
+                if not unpad_q and seqused_q is not None:
+                    seqused_mask = torch.arange(seqlen_q, device=device)[None, :] < seqused_q[:, None]
+                    seqused_mask = rearrange(seqused_mask, "b s -> b s 1 1")
+                    out_cmp = out.clone().masked_fill_(~seqused_mask, 0.0)
+                    out_ref_cmp = out_ref.clone().masked_fill_(~seqused_mask, 0.0)
+                    out_pt_cmp = out_pt.clone().masked_fill_(~seqused_mask, 0.0)
+                print(f"Output max diff: {(out_cmp - out_ref_cmp).abs().max().item()}")
+                print(f"Output mean diff: {(out_cmp - out_ref_cmp).abs().mean().item()}")
+                # if not causal:
+                #     print(f"LSE max diff: {(lse - lse_ref).abs().max().item()}")
+                # breakpoint()
 
-            # Check that FlashAttention's numerical error is at most 3x the numerical error
-            # of a Pytorch implementation.
-            assert (out_cmp - out_ref_cmp).abs().max().item() <= rtol * (
-                out_pt_cmp - out_ref_cmp
-            ).abs().max().item() + fwd_atol
+                # Check that FlashAttention's numerical error is at most 3x the numerical error
+                # of a Pytorch implementation.
+                assert (out_cmp - out_ref_cmp).abs().max().item() <= rtol * (
+                    out_pt_cmp - out_ref_cmp
+                ).abs().max().item() + fwd_atol
 
         if (
             dtype != torch.float8_e4m3fn

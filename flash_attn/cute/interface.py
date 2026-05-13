@@ -541,6 +541,7 @@ def _flash_attn_fwd(
         q_stage = 1
 
     m_block_size_effective = q_stage * tile_m
+    max_m_blocks_leq_one = seqlen_q_packgqa <= m_block_size_effective
     seqlen_k_loaded = max_seqlen_k if not local else max(0, min(max_seqlen_k, (window_size_right or max_seqlen_k) + (window_size_left or max_seqlen_k) + 1 + tile_m))
     num_m_blocks = (seqlen_q_packgqa + m_block_size_effective - 1) // m_block_size_effective
     total_mblocks = batch_size * num_head_kv * num_m_blocks
@@ -745,6 +746,14 @@ def _flash_attn_fwd(
         num_nheads_in_l2 = None
         tile_count_semaphore = None
 
+    is_static_persistent = (
+        not causal
+        and not local
+        and cu_seqlens_q is None
+        and seqused_q is None
+        and not is_split_kv
+    ) or (max_m_blocks_leq_one and not is_split_kv)
+
     compile_key = (
         dtype,
         head_dim,
@@ -788,6 +797,7 @@ def _flash_attn_fwd(
         virtual_batch_idx is not None,
         num_nheads_in_l2 is not None,
         tile_count_semaphore is not None,
+        is_static_persistent,
         qv is not None,
         gather_kv_length,
         sparse_kv,
@@ -985,11 +995,7 @@ def _flash_attn_fwd(
                     m_block_size=tile_m,
                     n_block_size=tile_n,
                     q_stage=q_stage,
-                    is_static_persistent=not causal
-                        and not local
-                        and cu_seqlens_q is None
-                        and seqused_q is None
-                        and not is_split_kv,
+                    is_static_persistent=is_static_persistent,
                     score_mod=score_mod,
                     mask_mod=mask_mod,
                     has_aux_tensors=aux_tensors is not None,

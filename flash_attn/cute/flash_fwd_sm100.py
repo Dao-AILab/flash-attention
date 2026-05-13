@@ -220,8 +220,7 @@ class FlashAttentionForwardSm100:
             use_clc_scheduler
             and self.use_tma_KV
         )
-        self.static_persistent = is_static_persistent 
-        self.is_persistent = self.dynamic_persistent or self.static_persistent
+        self.is_persistent = self.dynamic_persistent or self.is_static_persistent
         self.sched_stages = 1
         if self.use_clc_scheduler:
             assert self.cluster_shape_mn[1] == 1, f"CLC requires cluster N == 1: {self.cluster_shape_mn}"
@@ -236,14 +235,19 @@ class FlashAttentionForwardSm100:
             else SchedulingMode.STATIC
         )
 
+        self.use_varlen_scheduler = False
         if is_varlen_q:
             if self.dynamic_persistent and not self.use_clc_scheduler:
+                self.use_varlen_scheduler = True
                 self.TileScheduler = DynamicPersistentVarlenScheduler
+            elif self.is_static_persistent:
+                self.TileScheduler = StaticPersistentTileScheduler
             else:
+                self.use_varlen_scheduler = True
                 self.TileScheduler = SingleTileVarlenScheduler
         elif self.is_causal or self.is_local or self.use_clc_scheduler:
             self.TileScheduler = SingleTileLPTScheduler
-        elif self.static_persistent:
+        elif self.is_static_persistent:
             self.TileScheduler = StaticPersistentTileScheduler
         else:
             self.TileScheduler = SingleTileScheduler
@@ -1545,11 +1549,15 @@ class FlashAttentionForwardSm100:
 
             if const_expr(not self.use_block_sparsity):
                 n_block_min, n_block_max = block_info.get_n_block_min_max(
-                    seqlen, m_block, split_idx=split_idx, batch_idx=batch_idx, num_splits=num_splits,
+                    seqlen,
+                    m_block,
+                    split_idx=split_idx,
+                    batch_idx=batch_idx,
+                    num_splits=num_splits,
                 )
                 if const_expr(self.is_split_kv and block_info.num_splits_dynamic_ptr is not None):
                     split_idx = split_idx & 0xFFFF
-                if const_expr(not self.is_split_kv) or n_block_min < n_block_max:
+                if self.process_work_tile(seqlen, n_block_min, n_block_max):
                     n_block_first = n_block_max - 1 if n_block_max > 0 else 0
                     page_idx = (
                         mPageTable[batch_idx, n_block_first]
@@ -1755,15 +1763,14 @@ class FlashAttentionForwardSm100:
                 process_tile = block_iter_count > Int32(0)
             else:
                 n_block_min, n_block_max = block_info.get_n_block_min_max(
-                seqlen, m_block, split_idx=split_idx, batch_idx=batch_idx, num_splits=num_splits,
-            )
-                if const_expr(self.is_split_kv and block_info.num_splits_dynamic_ptr is not None):
-                    split_idx = split_idx & 0xFFFF
+                    seqlen,
+                    m_block,
+                    split_idx=split_idx,
+                    batch_idx=batch_idx,
+                    num_splits=num_splits,
+                )
                 block_iter_count = n_block_max - n_block_min
-                if const_expr(not self.is_split_kv):
-                    process_tile = True
-                else:
-                    process_tile = n_block_min < n_block_max
+                process_tile = self.process_work_tile(seqlen, n_block_min, n_block_max)
 
             if process_tile and is_leader_cta:
                 for stage in cutlass.range_constexpr(self.q_stage):
@@ -2132,7 +2139,7 @@ class FlashAttentionForwardSm100:
                 has_work = tile_block_count > Int32(0)
             else:
                 tile_block_count = n_block_max - n_block_min
-                has_work = const_expr(not self.is_split_kv) or tile_block_count > Int32(0)
+                has_work = self.process_work_tile(seqlen, n_block_min, n_block_max)
 
             softmax_step = partial(
                 self.softmax_step,
@@ -2213,7 +2220,7 @@ class FlashAttentionForwardSm100:
                     sm_stats_barrier.arrive_w_index(index=stage * 4 + warp_idx)
                     # if tidx == 0: cute.printf("softmax row sum stage %d: %f\n", stage, softmax.row_sum[0])
             else:
-                if const_expr(not self.is_split_kv) or tile_block_count > Int32(0):
+                if has_work:
                     mma_si_consumer_phase, sm_stats_producer_phase, s0_s1_sequence_phase = softmax_step(
                         mma_si_consumer_phase,
                         sm_stats_producer_phase,
@@ -2558,7 +2565,7 @@ class FlashAttentionForwardSm100:
                 has_work = total_block_count > Int32(0)
             else:
                 total_block_count = n_block_max - n_block_min
-                has_work = const_expr(not self.is_split_kv) or total_block_count > Int32(0)
+                has_work = self.process_work_tile(seqlen, n_block_min, n_block_max)
 
             if has_work:
                 # Ignore first signal from softmax as no correction is required
@@ -2988,9 +2995,8 @@ class FlashAttentionForwardSm100:
             )
             if const_expr(self.is_split_kv and block_info.num_splits_dynamic_ptr is not None):
                 split_idx = split_idx & 0xFFFF
-            has_work = const_expr(self.use_block_sparsity or not self.is_split_kv) or n_block_min < n_block_max
 
-            if has_work:
+            if self.process_work_tile(seqlen, n_block_min, n_block_max):
                 if const_expr(self.is_split_kv):
                     mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3)[None, None, head_idx, split_idx]
                 else:
@@ -3262,3 +3268,18 @@ class FlashAttentionForwardSm100:
             constant_q_idx=q_idx_logical,
             qhead_per_kvhead=self.qhead_per_kvhead if cutlass.const_expr(self.pack_gqa) else 1,
         )
+
+    @cute.jit
+    def process_work_tile(
+        self,
+        seqlen_info: SeqlenInfoQK,
+        n_block_min: Int32,
+        n_block_max: Int32,
+    ):
+        is_varlen_q = seqlen_info.has_cu_seqlens_q or seqlen_info.has_seqused_q
+        process_work_tile_k = const_expr(not self.is_split_kv) or n_block_min < n_block_max
+        if const_expr(is_varlen_q and not self.use_varlen_scheduler):
+            process_work_tile_q = seqlen_info.seqlen_q > 0
+        else:
+            process_work_tile_q = True
+        return process_work_tile_k and process_work_tile_q

@@ -243,7 +243,7 @@ def make_varlen_setup(*, clc: bool, prep: str):
 # fmt: off
 MODES = [
     ("dense",        setup_dense),
-    ("static",       make_varlen_setup(clc=False, prep="none")),
+    ("single-tile",  make_varlen_setup(clc=False, prep="none")),
     ("clc",          make_varlen_setup(clc=True,  prep="none")),
     ("clc-prep",     make_varlen_setup(clc=True,  prep="precompute")),
     ("dynamic-prep", make_varlen_setup(clc=False, prep="precompute")),
@@ -368,7 +368,7 @@ def main():
         ("mode", 14),
         ("mean_us", 10),
         ("tok/us", 9),
-        ("rel_static", 11),
+        ("rel_st", 7),
         ("rel_clc", 9),
     ]
     widths = [w for _, w in cols]
@@ -424,14 +424,14 @@ def main():
                 None if samples is None else sum(samples) / len(samples) * 1e3
             )
 
-        static_us = results.get("static")
+        single_tile_us = results.get("single-tile")
         clc_us = results.get("clc")
         for cli, _ in selected_modes:
             us = results.get(cli)
             if us is None:
                 continue
             tok_per_us = (total_q / us) if us > 0 else 0.0
-            rel_st = f"{static_us / us:.3f}" if static_us else "-"
+            rel_st = f"{single_tile_us / us:.3f}" if single_tile_us else "-"
             rel_cl = f"{clc_us / us:.3f}" if clc_us else "-"
             print(
                 _format_row(
