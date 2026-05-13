@@ -31,6 +31,7 @@ from flash_attn.cute import utils
 from flash_attn.cute import fa_logging
 from flash_attn.cute.cute_dsl_utils import (
     to_cute_tensor, to_cute_aux_tensor, get_aux_tensor_metadata, get_broadcast_dims,
+    make_kernel_name, set_kernel_name, short_kernel_symbols, compile_key_hash,
 )
 from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80
 from flash_attn.cute.flash_fwd_sm90 import FlashAttentionForwardSm90
@@ -283,6 +284,100 @@ def _resolve_causal_local_window(causal, window_size_left, window_size_right, ma
     else:
         local = False
     return causal, local, window_size_left, window_size_right
+
+def _build_fwd_compile_key_and_name(
+    *,
+    dtype, head_dim, head_dim_v, qhead_per_kvhead,
+    causal, local,
+    score_mod, score_mod_hash, mask_mod, mask_mod_hash,
+    use_block_sparsity, block_sparse_broadcast_pattern, block_sparse_tensors,
+    aux_tensor_metadata, lse,
+    cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k,
+    page_table, page_size,
+    window_size_left, window_size_right, learnable_sink,
+    q_descale, k_descale, v_descale,
+    tile_m, tile_n, q_stage, num_threads,
+    is_split_kv, pack_gqa, arch, use_2cta_instrs,
+    q_subtile_factor, mma_pv_is_rs, intra_wg_overlap, use_clc_scheduler,
+    qv, gather_kv_length, sparse_kv, disable_sparse_kv_bitmask,
+    fa_log_level,
+):
+    """Build the fwd ``compile_key`` tuple and the readable kernel name in one shot.
+
+    Both share most inputs, so this avoids restating each field at the call
+    site. Returns ``(compile_key_tuple, kernel_name_str)``.
+    """
+    compile_key = (
+        dtype,
+        head_dim,
+        head_dim_v,
+        qhead_per_kvhead,
+        causal,
+        score_mod_hash,
+        mask_mod_hash,
+        use_block_sparsity,
+        block_sparse_broadcast_pattern,
+        aux_tensor_metadata,
+        lse is None,
+        cu_seqlens_q is None,
+        cu_seqlens_k is None,
+        seqused_q is None,
+        seqused_k is None,
+        page_table is not None,
+        window_size_left is not None,
+        window_size_right is not None,
+        learnable_sink is not None,
+        q_descale is not None,
+        k_descale is not None,
+        v_descale is not None,
+        block_sparse_tensors is None or block_sparse_tensors.cu_total_m_blocks is None,
+        block_sparse_tensors is None or block_sparse_tensors.cu_block_idx_offsets is None,
+        tile_m,
+        tile_n,
+        q_stage,
+        num_threads,
+        is_split_kv,
+        pack_gqa,
+        arch,
+        page_size not in [None, tile_n],  # paged KV non-TMA
+        use_2cta_instrs,
+        q_subtile_factor,
+        mma_pv_is_rs,
+        intra_wg_overlap,
+        use_clc_scheduler,
+        qv is not None,
+        gather_kv_length,
+        sparse_kv,
+        disable_sparse_kv_bitmask,
+        fa_log_level,
+    )
+    name = make_kernel_name(
+        "flash_fwd",
+        arch=arch, dtype=dtype,
+        head_dim=head_dim, head_dim_v=head_dim_v, qhead_per_kvhead=qhead_per_kvhead,
+        tile_m=tile_m, tile_n=tile_n, q_stage=q_stage, num_threads=num_threads,
+        q_subtile_factor=q_subtile_factor,
+        causal=causal, local=local,
+        varlen=cu_seqlens_q is not None or seqused_q is not None,
+        paged=page_table is not None,
+        paged_non_tma=page_size not in [None, tile_n],
+        split_kv=is_split_kv, pack_gqa=pack_gqa, use_2cta=use_2cta_instrs,
+        use_clc=use_clc_scheduler,
+        mma_pv_is_rs=mma_pv_is_rs, intra_wg_overlap=intra_wg_overlap,
+        no_lse=lse is None,
+        has_score_mod=score_mod is not None,
+        has_mask_mod=mask_mod is not None,
+        has_block_sparsity=use_block_sparsity,
+        has_learnable_sink=learnable_sink is not None,
+        has_qv=qv is not None,
+        has_descale=(
+            q_descale is not None or k_descale is not None or v_descale is not None
+        ),
+        has_aux=bool(aux_tensor_metadata),
+        key_hash=compile_key_hash(compile_key),
+    )
+    return compile_key, name
+
 
 def _flash_attn_fwd(
     q: torch.Tensor,
@@ -674,49 +769,51 @@ def _flash_attn_fwd(
         sparse_kv = None
         disable_sparse_kv_bitmask = None
 
-    compile_key = (
-        dtype,
-        head_dim,
-        head_dim_v,
-        qhead_per_kvhead,
-        causal,
-        score_mod_hash,
-        mask_mod_hash,
-        use_block_sparsity,
-        block_sparse_broadcast_pattern,
-        aux_tensor_metadata,
-        lse is None,
-        cu_seqlens_q is None,
-        cu_seqlens_k is None,
-        seqused_q is None,
-        seqused_k is None,
-        page_table is not None,
-        window_size_left is not None,
-        window_size_right is not None,
-        learnable_sink is not None,
-        q_descale is not None,
-        k_descale is not None,
-        v_descale is not None,
-        block_sparse_tensors is None or block_sparse_tensors.cu_total_m_blocks is None,
-        block_sparse_tensors is None or block_sparse_tensors.cu_block_idx_offsets is None,
-        tile_m,
-        tile_n,
-        q_stage,
-        num_threads,
-        is_split_kv,
-        pack_gqa,
-        arch,
-        page_size not in [None, tile_n],  # paged KV non-TMA
-        use_2cta_instrs,
-        q_subtile_factor,
-        mma_pv_is_rs,
-        intra_wg_overlap,
-        use_clc_scheduler,
-        qv is not None,
-        gather_kv_length,
-        sparse_kv,
-        disable_sparse_kv_bitmask,
-        fa_logging.get_fa_log_level(),
+    compile_key, _readable_name = _build_fwd_compile_key_and_name(
+        dtype=dtype,
+        head_dim=head_dim,
+        head_dim_v=head_dim_v,
+        qhead_per_kvhead=qhead_per_kvhead,
+        causal=causal,
+        local=local,
+        score_mod=score_mod,
+        score_mod_hash=score_mod_hash,
+        mask_mod=mask_mod,
+        mask_mod_hash=mask_mod_hash,
+        use_block_sparsity=use_block_sparsity,
+        block_sparse_broadcast_pattern=block_sparse_broadcast_pattern,
+        block_sparse_tensors=block_sparse_tensors,
+        aux_tensor_metadata=aux_tensor_metadata,
+        lse=lse,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        seqused_q=seqused_q,
+        seqused_k=seqused_k,
+        page_table=page_table,
+        page_size=page_size,
+        window_size_left=window_size_left,
+        window_size_right=window_size_right,
+        learnable_sink=learnable_sink,
+        q_descale=q_descale,
+        k_descale=k_descale,
+        v_descale=v_descale,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        q_stage=q_stage,
+        num_threads=num_threads,
+        is_split_kv=is_split_kv,
+        pack_gqa=pack_gqa,
+        arch=arch,
+        use_2cta_instrs=use_2cta_instrs,
+        q_subtile_factor=q_subtile_factor,
+        mma_pv_is_rs=mma_pv_is_rs,
+        intra_wg_overlap=intra_wg_overlap,
+        use_clc_scheduler=use_clc_scheduler,
+        qv=qv,
+        gather_kv_length=gather_kv_length,
+        sparse_kv=sparse_kv,
+        disable_sparse_kv_bitmask=disable_sparse_kv_bitmask,
+        fa_log_level=fa_logging.get_fa_log_level(),
     )
 
     if compile_key not in _flash_attn_fwd.compile_cache:
@@ -931,8 +1028,14 @@ def _flash_attn_fwd(
                 f"Unsupported compute capability: {arch}. Supported: 8.x, 9.x, 10.x, 11.x, 12.x"
             )
         # TODO: check @can_implement
+        # Stamp the readable symbol built above onto the @cute.jit __call__
+        # and the @cute.kernel device entry so the name shows up in
+        # CUBIN/SASS/nsys/ncu output.
+        set_kernel_name(type(fa_fwd).__call__, _readable_name)
+        if hasattr(type(fa_fwd), "kernel"):
+            set_kernel_name(type(fa_fwd).kernel, _readable_name)
         if qv is not None:
-            _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
+            compile_args = [
                 fa_fwd,
                 q_tensor,
                 qv_tensor,
@@ -950,8 +1053,7 @@ def _flash_attn_fwd(
                 window_size_left,
                 window_size_right,
                 current_stream,
-                options="--enable-tvm-ffi",
-            )
+            ]
         else:
             compile_args = [
                 fa_fwd,
@@ -972,11 +1074,9 @@ def _flash_attn_fwd(
             ]
             if arch // 10 in [10, 11]:
                 compile_args.append(descale_tensors_tensor)
-            compile_args.extend([
-                sparse_tensors,
-                cute_aux_tensors,
-            ])
+            compile_args.extend([sparse_tensors, cute_aux_tensors])
             compile_args.append(current_stream)
+        with short_kernel_symbols():
             _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
                 *compile_args, options="--enable-tvm-ffi"
             )

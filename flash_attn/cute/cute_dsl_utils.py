@@ -2,6 +2,7 @@
 
 from typing import Tuple
 from functools import lru_cache
+from contextlib import contextmanager
 
 import torch
 
@@ -14,6 +15,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cutlass_dsl import NumericMeta
 from cutlass.cute.runtime import from_dlpack
+
 
 StaticTypes = (cutlass.Constexpr, NumericMeta, int, bool, str, float, type(None))
 
@@ -119,6 +121,166 @@ def get_broadcast_dims(tensor: torch.Tensor) -> Tuple[bool, ...]:
     patterns are not interchangeable.
     """
     return tuple(s == 0 for s in tensor.stride())
+
+
+_TORCH_DTYPE_SHORT = {
+    torch.float16: "f16",
+    torch.bfloat16: "bf16",
+    torch.float32: "f32",
+    torch.float8_e4m3fn: "e4m3",
+    torch.float8_e5m2: "e5m2",
+}
+
+
+def _short_dtype(dt):
+    if dt in _TORCH_DTYPE_SHORT:
+        return _TORCH_DTYPE_SHORT[dt]
+    return str(dt).replace("torch.", "").replace(".", "_")
+
+
+def compile_key_hash(key, nbytes=4):
+    """Stable short hex hash of a compile_key tuple.
+
+    Used as a disambiguation suffix on a kernel symbol so two configs that
+    share display fields still get distinct names in nsys/ncu.
+    """
+    import hashlib
+
+    return hashlib.blake2b(repr(key).encode(), digest_size=nbytes).hexdigest()
+
+
+def make_kernel_name(
+    prefix,
+    *,
+    arch=None,
+    dtype=None,
+    head_dim=None,
+    head_dim_v=None,
+    qhead_per_kvhead=None,
+    tile_m=None,
+    tile_n=None,
+    q_stage=None,
+    num_threads=None,
+    q_subtile_factor=None,
+    causal=False,
+    local=False,
+    varlen=False,
+    paged=False,
+    paged_non_tma=False,
+    split_kv=False,
+    pack_gqa=False,
+    use_2cta=False,
+    use_clc=False,
+    mma_pv_is_rs=False,
+    intra_wg_overlap=False,
+    no_lse=False,
+    has_score_mod=False,
+    has_mask_mod=False,
+    has_block_sparsity=False,
+    has_learnable_sink=False,
+    has_qv=False,
+    has_descale=False,
+    has_aux=False,
+    key_hash=None,
+):
+    """Build a short, readable kernel symbol from compile-key fields.
+
+    Each behavior/feature flag becomes its own underscore-delimited token so
+    the symbol is grep-friendly (e.g. ``_causal_``, ``_pack_gqa_``). Pass
+    ``key_hash=compile_key_hash(compile_key)`` to guarantee uniqueness across
+    configs that otherwise share display fields. Designed for use with
+    :func:`set_kernel_name` so the result shows up in CUBIN/SASS/nsys/ncu.
+    """
+    parts = [prefix]
+    if arch is not None:
+        parts.append(f"sm{arch}")
+    if dtype is not None:
+        parts.append(_short_dtype(dtype))
+    if head_dim is not None:
+        if head_dim_v in (None, head_dim):
+            parts.append(f"d{head_dim}")
+        else:
+            parts.append(f"d{head_dim}x{head_dim_v}")
+    if qhead_per_kvhead and qhead_per_kvhead > 1:
+        parts.append(f"gqa{qhead_per_kvhead}")
+    if tile_m and tile_n:
+        parts.append(f"t{tile_m}x{tile_n}")
+    if q_stage is not None and q_stage != 1:
+        parts.append(f"qs{q_stage}")
+    if num_threads is not None:
+        parts.append(f"th{num_threads}")
+    if q_subtile_factor is not None and q_subtile_factor != 1:
+        parts.append(f"qsub{q_subtile_factor}")
+    for cond, tag in (
+        (causal, "causal"),
+        (local, "local"),
+        (varlen, "varlen"),
+        (paged, "paged"),
+        (paged_non_tma, "paged_non_tma"),
+        (split_kv, "splitkv"),
+        (pack_gqa, "pack_gqa"),
+        (use_2cta, "2cta"),
+        (use_clc, "clc"),
+        (mma_pv_is_rs, "pv_rs"),
+        (intra_wg_overlap, "wg_overlap"),
+        (no_lse, "no_lse"),
+        (has_score_mod, "score_mod"),
+        (has_mask_mod, "mask_mod"),
+        (has_block_sparsity, "blksparse"),
+        (has_learnable_sink, "sink"),
+        (has_qv, "qv"),
+        (has_descale, "descale"),
+        (has_aux, "aux"),
+    ):
+        if cond:
+            parts.append(tag)
+    if key_hash:
+        parts.append(f"h{key_hash}")
+    return "_".join(parts)
+
+
+@contextmanager
+def short_kernel_symbols():
+    """Disable CuTeDSL's automatic arg-type mangling for the duration.
+
+    The default ``mangle_name`` appends a long, hard-to-read trailer derived
+    from each argument's type/value (e.g. ``_tensor0000o11101213_..._None_None``).
+    Inside this context manager that mangling becomes a no-op, so kernel
+    symbols collapse to ``<prefix>_kernel_<idx>`` and the readable prefix set
+    via :func:`set_kernel_name` is the only descriptive part.
+    """
+    from cutlass.base_dsl.dsl import BaseDSL
+
+    original = BaseDSL.mangle_name
+
+    def _passthrough(self, function_name, args, sig):  # noqa: ARG001
+        return function_name
+
+    BaseDSL.mangle_name = _passthrough
+    try:
+        yield
+    finally:
+        BaseDSL.mangle_name = original
+
+
+def set_kernel_name(callable_obj, name):
+    """Stamp ``name`` as the symbol prefix for a @cute.jit callable.
+
+    Accepts a bare @cute.jit function, a bound method (e.g. ``fa_fwd.__call__``),
+    or a class-level function (e.g. ``Cls.__call__``). Returns True on success.
+
+    The CuTeDSL @cute.jit wrapper exposes ``set_name_prefix`` which causes the
+    generated MLIR/PTX kernel symbol to be prefixed with ``name``. Setting this
+    just before ``cute.compile(...)`` gives CUBIN/SASS/nsys a readable name.
+    """
+    fn = callable_obj
+    if hasattr(fn, "__func__"):  # unwrap bound method
+        fn = fn.__func__
+    setter = getattr(fn, "set_name_prefix", None)
+    if setter is None:
+        return False
+    setter(name)
+    return True
 
 
 # credit: monellz (https://github.com/NVIDIA/cutlass/issues/2658#issuecomment-3630564264)
