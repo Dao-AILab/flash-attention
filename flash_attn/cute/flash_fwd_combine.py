@@ -365,7 +365,6 @@ class FlashAttentionForwardCombine:
 
         # Handle semaphore reset — wait for dependent grids first
         if const_expr(semaphore_to_reset is not None):
-            # maybe handle on first CTA?
             if (
                 tidx == 0
                 and m_block == cute.arch.grid_dim()[0] - 1

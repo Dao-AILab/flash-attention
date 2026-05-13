@@ -34,7 +34,6 @@ from flash_attn.cute.interface import (
     _flash_attn_fwd,
     _flash_attn_bwd,
 )
-from flash_attn.cute.prepare_scheduler import SchedulerMetadataTensorsTorch
 
 def retry_on_oom(func):
     @wraps(func)
@@ -995,7 +994,7 @@ def test_flash_attn_varlen_output(
 @pytest.mark.parametrize("has_leftpad", [False])
 # @pytest.mark.parametrize("has_batch_idx", [False, True])
 @pytest.mark.parametrize("has_batch_idx", [False])
-@pytest.mark.parametrize("varlen_q", [True])
+@pytest.mark.parametrize("varlen_q", [False, True])
 # @pytest.mark.parametrize("varlen_q", [False])
 # @pytest.mark.parametrize("d", [32, 59, 64, 80, 128, 256])
 # @pytest.mark.parametrize("d", [32, 64, 96, 128, 160, 192, 224, 256])
