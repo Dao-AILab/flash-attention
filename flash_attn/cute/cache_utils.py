@@ -16,6 +16,7 @@ import ctypes
 import cutlass
 import cutlass.cute as cute
 import tvm_ffi
+import torch
 from cutlass.cutlass_dsl import JitCompiledFunction
 from flash_attn.cute.fa_logging import fa_log
 
@@ -29,6 +30,26 @@ for _lib_path in cute.runtime.find_runtime_libraries(enable_tvm_ffi=False):
 
 CompileKeyType: TypeAlias = tuple[Hashable, ...]
 CallableFunction: TypeAlias = JitCompiledFunction | tvm_ffi.Function
+
+
+def _normalize_compile_key(key: CompileKeyType) -> CompileKeyType:
+    """Normalize scalar tensors in compile keys.
+
+    CuTeDSL compile keys are compared and hashed on the Python side.  A scalar
+    tensor in the key would otherwise compare by object identity, so two keys
+    with the same scalar value but produced by different layers would miss the
+    in-memory and persistent JIT caches.
+    """
+
+    def normalize(x):
+        if isinstance(x, torch.Tensor) and x.ndim == 0:
+            return x.item()
+        if isinstance(x, tuple):
+            return tuple(normalize(v) for v in x)
+        return x
+
+    return tuple(normalize(v) for v in key)
+
 
 # Enable cache via `FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1`
 CUTE_DSL_CACHE_ENABLED: bool = os.getenv("FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED", "0") == "1"
@@ -155,13 +176,13 @@ class JITCache:
         self.cache: dict[CompileKeyType, CallableFunction] = {}
 
     def __setitem__(self, key: CompileKeyType, fn: JitCompiledFunction) -> None:
-        self.cache[key] = fn
+        self.cache[_normalize_compile_key(key)] = fn
 
     def __getitem__(self, key: CompileKeyType) -> CallableFunction:
-        return self.cache[key]
+        return self.cache[_normalize_compile_key(key)]
 
     def __contains__(self, key: CompileKeyType) -> bool:
-        return key in self.cache
+        return _normalize_compile_key(key) in self.cache
 
     def clear(self) -> None:
         """
@@ -246,7 +267,7 @@ class JITPersistentCache(JITCache):
             fa_log(1, f"Successfully exported compiled function to disk: {obj_path}")
 
     def _key_to_hash(self, key: CompileKeyType) -> str:
-        return hashlib.sha256(pickle.dumps(key)).hexdigest()
+        return hashlib.sha256(pickle.dumps(_normalize_compile_key(key))).hexdigest()
 
     def _lock_path(self, sha256_hex: str) -> Path:
         return self.cache_path / f"{sha256_hex}.lock"
