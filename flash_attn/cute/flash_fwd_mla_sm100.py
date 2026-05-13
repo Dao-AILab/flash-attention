@@ -2166,7 +2166,7 @@ class FlashAttentionMLAForwardSm100:
 
         use_ptx_gemm_QK = not self.is_topk_gather
         use_ptx_gemm_QvV = not self.is_topk_gather
-        use_ptx_gemm_PVt = False
+        use_ptx_gemm_PVt = not self.is_topk_gather
 
         # Operands for S = Q @ K^T
         if const_expr(self.has_qk):
@@ -3671,7 +3671,7 @@ def benchmark_mla_kernel(
 if __name__ == "__main__":
     run_test = True
     run_benchmark = True
-    gather_kv = False
+    gather_kv = True
     is_causal = False
     pack_gqa = True
     topk_length = 2048
@@ -3679,7 +3679,7 @@ if __name__ == "__main__":
     varlen_k = False
     disable_bitmask = False
     validate = True
-    has_qk = False
+    has_qk = True
 
     if run_test:
         if not gather_kv:
@@ -3737,12 +3737,12 @@ if __name__ == "__main__":
             seqlen_q_benchmark_values = [1]
             seqlen_k_benchmark_values = [8192 * 2]
             nheads_benchmark_values = [128]
-            batch_benchmark_values = [512]
+            batch_benchmark_values = [128]
         else:
             seqlen_q_benchmark_values = [1]
             seqlen_k_benchmark_values = [8192]
             nheads_benchmark_values = [128]
-            batch_benchmark_values = [256]
+            batch_benchmark_values = [128]
         # seqlen_q_benchmark_values = [4096]
         # seqlen_k_benchmark_values = [4096]
         # nheads_benchmark_values = [16]
