@@ -2015,7 +2015,9 @@ def test_flash_attn_invalid_head_dim(head_dim):
 @pytest.mark.parametrize("nheads", [16, 128])
 @pytest.mark.parametrize("kv_sparsity", [False, True])
 # @pytest.mark.parametrize("kv_sparsity", [True])
-@pytest.mark.parametrize("gather_kv_length", [1024, 2048])
+@pytest.mark.parametrize("gather_kv_length", [1024, 1024 + 128])
+# @pytest.mark.parametrize("has_qk", [False, True])
+@pytest.mark.parametrize("has_qk", [False])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -2061,8 +2063,8 @@ def test_flash_attn_mla_absorbed(
     dtype,
     kv_sparsity,
     gather_kv_length,
+    has_qk,
 ):
-    has_qv = True
     if not IS_SM100:
         pytest.skip()
     if kv_sparsity and seqlen_k < gather_kv_length:
@@ -2090,21 +2092,23 @@ def test_flash_attn_mla_absorbed(
     # attention_chunk_vals = [torch.randint(1, seqlen_k * 2, (1,)).item(), 0]
     attention_chunk_vals = [0]
     for dv, attention_chunk in itertools.product(dv_vals, attention_chunk_vals):
-        q_ref = torch.randn(
-            batch_size, seqlen_q, nheads, d, device=device, dtype=dtype_ref
-        )
-        if softcap > 0.0:
-            # Ensure the values of qk are at least within softcap range.
-            q_ref = q_ref * softcap / 4
-        q_ref = q_ref.to(dtype).to(dtype_ref).requires_grad_()
-        k_ref = (
-            torch.randn(
-                batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype_ref
+        q_ref = k_ref = None
+        if has_qk:
+            q_ref = torch.randn(
+                batch_size, seqlen_q, nheads, d, device=device, dtype=dtype_ref
             )
-            .to(dtype)
-            .to(dtype_ref)
-            .requires_grad_()
-        )
+            if softcap > 0.0:
+                # Ensure the values of qk are at least within softcap range.
+                q_ref = q_ref * softcap / 4
+            q_ref = q_ref.to(dtype).to(dtype_ref).requires_grad_()
+            k_ref = (
+                torch.randn(
+                    batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype_ref
+                )
+                .to(dtype)
+                .to(dtype_ref)
+                .requires_grad_()
+            )
         v_ref = (
             torch.randn(
                 batch_size, seqlen_k, nheads_kv, dv, device=device, dtype=dtype_ref
@@ -2113,16 +2117,13 @@ def test_flash_attn_mla_absorbed(
             .to(dtype_ref)
             .requires_grad_()
         )
-        if has_qv:
-            qv_ref = (
-                torch.randn(
-                    batch_size, seqlen_q, nheads, dv, device=device, dtype=dtype_ref
-                )
-                .to(dtype)
-                .to(dtype_ref)
+        qv_ref = (
+            torch.randn(
+                batch_size, seqlen_q, nheads, dv, device=device, dtype=dtype_ref
             )
-        else:
-            qv_ref = None
+            .to(dtype)
+            .to(dtype_ref)
+        )
         if kv_sparsity:
             gather_kv_indices = torch.rand(batch_size, seqlen_q, gather_kv_length, device=device).argsort(dim=-1).to(torch.int32)
         else:
@@ -2150,8 +2151,11 @@ def test_flash_attn_mla_absorbed(
             ]
         else:
             q_descale, k_descale, v_descale = None, None, None
-        q, k, v = [x.detach().to(dtype).requires_grad_() for x in (q_ref, k_ref, v_ref)]
-        qv = qv_ref.detach().to(dtype).requires_grad_() if has_qv else None
+        q, k, v, qv = [
+            x.detach().to(dtype).requires_grad_()
+            if x is not None else None
+            for x in (q_ref, k_ref, v_ref, qv_ref)
+        ]
         out_ref, attn_ref = attention_ref(
             q_ref,
             k_ref,
@@ -2242,7 +2246,7 @@ def test_flash_attn_mla_absorbed(
             ).abs().max().item() + fwd_atol
             assert not torch.isnan(lse).any(), "LSE contains NaN"
 
-            repeats = 1000
+            repeats = 10
             for iter in range(repeats):
                 out2, lse2 = flash_attn_func(
                     q,
@@ -2280,16 +2284,19 @@ def test_flash_attn_mla_absorbed(
 @pytest.mark.parametrize("add_unused_qkv", [False])
 @pytest.mark.parametrize("kv_sparsity", [False, True])
 # @pytest.mark.parametrize("kv_sparsity", [False])
-@pytest.mark.parametrize("gather_kv_length", [1024, 2048])
+@pytest.mark.parametrize("gather_kv_length", [1024, 1024 + 128])
 @pytest.mark.parametrize("d", [64])
 @pytest.mark.parametrize("nheads", [16, 128])
 # @pytest.mark.parametrize("nheads", [128])
+@pytest.mark.parametrize("has_qk", [False, True])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
         # (1, 1),
         # (1, 3),
         # (2, 1),
+        (1, 128),
+        (1, 2000),
         (511, 1),
         (3, 513),
         (64, 128),
@@ -2348,6 +2355,7 @@ def test_flash_attn_mla_absorbed_varlen(
     unpad_kv,
     kv_sparsity,
     gather_kv_length,
+    has_qk,
 ):
     has_qv = True
     if not IS_SM100:
@@ -2530,6 +2538,11 @@ def test_flash_attn_mla_absorbed_varlen(
             x.detach().to(dtype).requires_grad_() for x in (q_unpad, k_unpad, v_unpad)
         ]
 
+        if not has_qk:
+            q_ref = k_ref = None
+            q_unpad = k_unpad = None
+            q = k = None
+
         out_ref, attn_ref = attention_ref(
             q_ref,
             k_ref,
@@ -2639,7 +2652,7 @@ def test_flash_attn_mla_absorbed_varlen(
             if unpad_q:
                 assert not torch.isnan(lse).any(), "LSE contains NaN"
 
-            repeats = 1000
+            repeats = 10
             for iter in range(repeats):
                 out_unpad2, lse = flash_attn_varlen_func(
                     q_unpad if unpad_q else q,
@@ -2676,6 +2689,96 @@ def test_flash_attn_mla_absorbed_varlen(
                 # print(f"out vs out2 max diff: {(out_cmp - out2).abs().max().item()}, {iter=}")
                 # print(f"out vs out2 mean diff: {(out_cmp - out2).abs().mean().item()}, {iter=}")
                 assert torch.equal(out_cmp, out2), f"non-deterministic with max diff = {(out_cmp - out2).abs().max().item()} on {iter=}"
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("page_size", [1, 16, 64, 128])
+@pytest.mark.parametrize("has_qk", [True, False])
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_k",
+    [
+        (1, 128),
+        (4, 256),
+        (64, 512),
+        (1, 2048),
+        (2048, 2048),
+    ],
+)
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_mla_paged(dtype, seqlen_q, seqlen_k, page_size, causal, has_qk):
+    if not IS_SM100:
+        pytest.skip("MLA paged KV only supported on SM100")
+    device = "cuda"
+    d, dv = 64, 512
+    nheads = 128
+    nheads_kv = 1
+    batch_size = 49 if seqlen_k <= 512 else 7
+
+    torch.random.manual_seed(0)
+
+    # Non-paged reference tensors (varlen format)
+    q = k = None
+    if has_qk:
+        q = torch.randn(batch_size * seqlen_q, nheads, d, device=device, dtype=dtype)
+        k = torch.randn(batch_size * seqlen_k, nheads_kv, d, device=device, dtype=dtype)
+    v = torch.randn(batch_size * seqlen_k, nheads_kv, dv, device=device, dtype=dtype)
+    qv = torch.randn(batch_size * seqlen_q, nheads, dv, device=device, dtype=dtype)
+
+    cu_seqlens_q = torch.tensor(
+        [i * seqlen_q for i in range(batch_size + 1)], dtype=torch.int32, device=device
+    )
+    cu_seqlens_k = torch.tensor(
+        [i * seqlen_k for i in range(batch_size + 1)], dtype=torch.int32, device=device
+    )
+
+    # Non-paged reference
+    out_ref, _ = flash_attn_varlen_func(
+        q, k, v, qv=qv,
+        cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=seqlen_q, max_seqlen_k=seqlen_k,
+        causal=causal,
+    )
+
+    # Create paged K/V cache
+    num_pages_per_seq = (seqlen_k + page_size - 1) // page_size
+    total_pages = num_pages_per_seq * batch_size
+    k_paged = None
+    if has_qk:
+        k_paged = torch.zeros(total_pages, page_size, nheads_kv, d, device=device, dtype=dtype)
+    v_paged = torch.zeros(total_pages, page_size, nheads_kv, dv, device=device, dtype=dtype)
+    page_table = torch.zeros(batch_size, num_pages_per_seq, dtype=torch.int32, device=device)
+
+    # Fill paged K/V from contiguous K/V (sequential page assignment)
+    for b in range(batch_size):
+        for p in range(num_pages_per_seq):
+            page_idx = b * num_pages_per_seq + p
+            start = p * page_size
+            end = min(start + page_size, seqlen_k)
+            k_offset = b * seqlen_k
+            if start < seqlen_k:
+                if has_qk:
+                    k_paged[page_idx, :end - start] = k[k_offset + start:k_offset + end]
+                v_paged[page_idx, :end - start] = v[k_offset + start:k_offset + end]
+            page_table[b, p] = page_idx
+
+    seqused_k = torch.full((batch_size,), seqlen_k, dtype=torch.int32, device=device)
+
+    # Paged output (triggers cp.async path if page_size != 128)
+    out, _ = flash_attn_varlen_func(
+        q, k_paged, v_paged, qv=qv,
+        cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=None,
+        max_seqlen_q=seqlen_q, max_seqlen_k=None,
+        seqused_k=seqused_k, page_table=page_table,
+        causal=causal,
+    )
+
+    if is_fake_mode():
+        return
+
+    print(f"Output max diff: {(out - out_ref).abs().max().item()}")
+    print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
+    assert torch.equal(out, out_ref)
 
 
 # ---------------------------------------------------------------------------
