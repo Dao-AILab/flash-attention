@@ -240,7 +240,7 @@ class FlashAttentionForwardSm100:
             if self.dynamic_persistent and not self.use_clc_scheduler:
                 self.use_varlen_scheduler = True
                 self.TileScheduler = DynamicPersistentVarlenScheduler
-            elif self.is_static_persistent:
+            elif self.is_static_persistent and not self.use_clc_scheduler:
                 self.TileScheduler = StaticPersistentTileScheduler
             else:
                 self.use_varlen_scheduler = True
