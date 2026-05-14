@@ -29,7 +29,8 @@ python3 harness/harness/benchmark/bench_sm100_hd256.py --compare-baseline --nhea
 | Requirement | Command Or Setting |
 | ----------- | ------------------ |
 | Editable CuteDSL package | `python3 -m pip install --no-deps -e flash_attn/cute` |
-| Repo-local imports | Wrapper exports `PYTHONPATH=$REPO:$PYTHONPATH`. |
+| FA4 import routing | Wrapper runs from `/tmp` and verifies editable `flash_attn.cute.interface`. |
+| Benchmark helper imports | Benchmark script must not import FA2 benchmark helpers that require root `flash_attn`. |
 | Do not modify | Do not edit `flash_attn/__init__.py` for benchmark import routing. |
 
 ## Files
@@ -48,6 +49,10 @@ python3 harness/harness/benchmark/bench_sm100_hd256.py --compare-baseline --nhea
 | `harness/harness/logs/benchmark/current/` | Current benchmark run logs and report. |
 | `harness/harness/logs/benchmark/previous/` | Previous benchmark run logs used for comparison. |
 | `harness/harness/logs/benchmark/current/benchmark_report.md` | Median comparison and regression decision. |
+
+Each benchmark run prints the same source stamp used by UT: package versions
+plus path/SHA/mtime for key CuteDSL modules. Check the beginning of `run_*.log`
+to prove the benchmark used the latest working-tree kernel files.
 
 Only current and previous benchmark generations are retained.
 

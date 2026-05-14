@@ -1,7 +1,7 @@
 # Copyright (c) 2025, Siyu Wang, Shengbin Di, Yuxi Chi, Johnsonms, Linfeng Zheng, Haoyan Huang, Lanbo Li, Yun Zhong, Man Yuan, Minmin Sun, Yong Li, Wei Lin.
 
 from functools import partial
-from typing import Type, Tuple, Optional
+from typing import Optional, Tuple
 
 import cuda.bindings.driver as cuda
 
@@ -10,138 +10,223 @@ import cutlass
 import cutlass.cute as cute
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
 from cutlass.cute.nvgpu import cpasync
-import cutlass.utils as utils
-import cutlass.pipeline as pipeline
-import cutlass.utils.blackwell_helpers as sm100_utils
+from cutlass import const_expr
+import cutlass.utils as cutlass_utils
+from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
+from flash_attn.cute.blackwell_helpers import gemm_w_idx
+from flash_attn.cute import pipeline
+from flash_attn.cute import copy_utils
+from flash_attn.cute import utils
+import cutlass.utils.blackwell_helpers as sm100_utils_basic
 from cutlass.cute.typing import Int32, Int64, Float32
+import quack.activation
+from quack import layout_utils
 
 from cutlass.utils import ClcDynamicPersistentTileScheduler
 from flash_attn.cute.tile_scheduler import (
     ClcState,
+    TileSchedulerArguments,
+    SingleTileScheduler,
+    SingleTileVarlenScheduler,
+    SingleTileLPTBwdScheduler,
     compute_sm100_fmha_grid as compute_grid,
     compute_sm100_fmha_grid_clc as compute_grid_clc,
-    make_sm100_thread_cooperative_group as make_thread_cooperative_group,
     Sm100FmhaStaticTileScheduler as FmhaStaticTileScheduler,
     Sm100FmhaStaticTileSchedulerParams as FmhaStaticTileSchedulerParams,
     Sm100FmhaClcDynamicTileScheduler as FmhaClcDynamicTileScheduler,
     Sm100FmhaClcDynamicTileSchedulerParams as FmhaClcDynamicTileSchedulerParams,
 )
 from flash_attn.cute.block_info import BlockInfo
+from flash_attn.cute.block_sparsity import BlockSparseTensors
 from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
-from flash_attn.cute.tile_scheduler import SM100_TMEM_CAPACITY_COLUMNS
 
 
 class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
     def __init__(
         self,
-        acc_dtype: Type[cutlass.Numeric],
-        mma_tiler: Tuple[int, int, int],
-        is_causal: bool,
-        window_size_left: int | None,
-        window_size_right: int | None,
-        is_persistent: bool,
-        split_head: bool,
-        use_clc_scheduler: bool = False,
+        head_dim: int,
+        head_dim_v: Optional[int] = None,
+        is_causal: bool = False,
+        is_local: bool = False,
+        qhead_per_kvhead: cutlass.Constexpr[int] = 1,
+        tile_m: int = 128,
+        tile_n: int = 128,
+        is_persistent: bool = False,
+        deterministic: bool = False,
+        spt: Optional[bool] = None,
+        cluster_size: int = 2,
+        use_2cta_instrs: bool = True,
+        score_mod: cutlass.Constexpr | None = None,
+        score_mod_bwd: cutlass.Constexpr | None = None,
+        mask_mod: cutlass.Constexpr | None = None,
+        has_aux_tensors: cutlass.Constexpr = False,
+        subtile_factor: cutlass.Constexpr[int] = 1,
     ):
-        self.acc_dtype = acc_dtype
-        self.mma_tiler = mma_tiler
-        self.is_causal = is_causal
-        self.window_size_left = window_size_left
-        # Keep original behavior (known-good in this repo)
-        window_size_left = (
-            None
-            if (window_size_left is None or window_size_left < 0)
-            else cutlass.Int32(window_size_left)
-        )
-        window_size_right = (
-            None
-            if (window_size_right is None or window_size_right < 0)
-            else cutlass.Int32(window_size_right)
-        )
-        self.window_size_left = None if self.is_causal else window_size_left
-        self.window_size_right = cutlass.Int32(0) if self.is_causal else window_size_right
-        self.is_local = (not self.is_causal) and (
-            self.window_size_left is not None or self.window_size_right is not None
-        )
-        assert mma_tiler[0] == 128 and mma_tiler[1] == 128, "Only 128x128 tile impl is supported"
-        assert mma_tiler[2] == 256, "Only 256 is supported for 128x128 tile impl"
-        self.cta_tiler = (
-            mma_tiler[0],
-            mma_tiler[1],
-            mma_tiler[2],
-        )
-        self.qk_mma_tiler = (
-            2 * mma_tiler[0],
-            mma_tiler[1],
-            min(self.cta_tiler[2], 128) if split_head else self.cta_tiler[2],
-        )
-        self.dov_mma_tiler = self.qk_mma_tiler
-        self.dsk_mma_tiler = (
-            2 * mma_tiler[0],
-            min(self.cta_tiler[2], 128) if split_head else self.cta_tiler[2],
-            mma_tiler[1],
-        )
+        # padding head_dim to a multiple of 16 as k_block_size
+        hdim_multiple_of = 16
+        self.head_dim_padded = int(math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of)
+        head_dim_v = head_dim_v if head_dim_v is not None else head_dim
+        self.same_hdim_kv = head_dim == head_dim_v
+        self.head_dim_v_padded = int(math.ceil(head_dim_v / hdim_multiple_of) * hdim_multiple_of)
+        self.same_hdim_kv_padded = self.head_dim_padded == self.head_dim_v_padded
+        self.check_hdim_oob = head_dim != self.head_dim_padded
+        self.check_hdim_v_oob = head_dim_v != self.head_dim_v_padded
+        self.m_block_size = tile_m
+        self.n_block_size = tile_n
+        self.q_stage = 1
+        assert self.q_stage in [1, 2]
+        self.use_2cta_instrs = use_2cta_instrs
 
+        assert head_dim == 256
+        assert head_dim_v == 256
+        assert self.head_dim_padded == 256
+        assert self.head_dim_v_padded == 256
+        assert self.m_block_size == 128 and self.n_block_size == 128, "Only 128x128 tile impl is supported"
+        assert not is_persistent
+        assert not deterministic
+        assert cluster_size == 2
+        assert self.use_2cta_instrs
+        assert score_mod is None
+        assert score_mod_bwd is None
+        assert mask_mod is None
+        assert not has_aux_tensors
+
+        self.cta_group_size = 2 if self.use_2cta_instrs else 1
+        # cta_tiler M includes only 1 CTA, the scheduler will take into account the cluster shape
+        self.cta_tiler = (self.q_stage * self.m_block_size, self.n_block_size, self.head_dim_padded)
+        # With 2CTA, the MMA tiler M covers both CTAs, so it's cta_group_size * m_block_size.
+        # Each CTA owns m_block_size rows; the 2CTA MMA instruction spans both.
+        self.mma_tiler_qk = (
+            self.cta_group_size * self.m_block_size,
+            self.n_block_size,
+            self.head_dim_padded,
+        )
+        # dP = dO @ V.T
+        self.mma_tiler_dov = (
+            self.cta_group_size * self.m_block_size,
+            self.n_block_size,
+            self.head_dim_v_padded,
+        )
+        # dQ = dS @ K
+        self.mma_tiler_dsk = (
+            self.cta_group_size * self.m_block_size,
+            self.head_dim_padded,
+            self.n_block_size,
+        )
+        self.qk_acc_dtype = Float32
+        self.dov_acc_dtype = Float32
+        self.dsk_acc_dtype = Float32
+        self.acc_dtype = Float32
+        self.cluster_shape_mn = (2, 1) if self.use_2cta_instrs else (1, 1)
+        self.is_persistent = is_persistent
+        self.is_causal = is_causal
+        self.is_local = is_local
+        self.use_correction_warps_for_epi = False
+        self.qhead_per_kvhead = qhead_per_kvhead
+        self.is_split_kv = False
+        self.pack_gqa = False
+        self.q_subtile_factor = None
+        assert not (self.is_split_kv and self.head_dim_v_padded >= 192), (
+            "SplitKV is not supported for hdim >= 192"
+        )
+        self.score_mod = score_mod
+        self.score_mod_bwd = score_mod_bwd
+        self.mask_mod = mask_mod
+        self.vec_size: cutlass.Constexpr = getattr(
+            score_mod, "__vec_size__", 1 if cutlass.const_expr(has_aux_tensors) else 2
+        )
+        self.s0_s1_barrier = False
+        self.overlap_sO_sQ = False
+        self.use_clc_scheduler = False
+        self.sched_stages = 1
+        self.shuffle_LSE = False
+        self.shuffle_dPsum = False
+
+        self.head_dim = head_dim
+        self.head_dim_v = head_dim_v
+        self.deterministic = deterministic
+        self.spt = spt
+        self.cluster_size = cluster_size
+        self.has_aux_tensors = has_aux_tensors
+        self.subtile_factor = subtile_factor
+        self.window_size_left = None
+        self.window_size_right = cutlass.Int32(0) if self.is_causal else None
+
+        self.tile_m = self.m_block_size
+        self.tile_n = self.n_block_size
+        self.tile_hdim = self.head_dim_padded
+        self.tile_hdimv = self.head_dim_v_padded
+        self.mma_tiler = self.cta_tiler
+        self.qk_mma_tiler = self.mma_tiler_qk
+        self.dov_mma_tiler = self.mma_tiler_dov
+        self.dsk_mma_tiler = self.mma_tiler_dsk
         self.dsk_block_tiler = (
             self.dsk_mma_tiler[0] // 2,
             self.dsk_mma_tiler[1],
             self.dsk_mma_tiler[2],
         )
-        self.iterations_qk = self.cta_tiler[2] // self.qk_mma_tiler[2]
-        self.iterations_dov = self.cta_tiler[2] // self.dov_mma_tiler[2]
-        self.iterations_dsk = self.cta_tiler[2] // self.dsk_mma_tiler[1]
-        self.cluster_shape_mn = (2, 1)
         self.tmem_warp_shape_mn = (4, 1)
-        self.is_persistent = is_persistent
-        self.use_clc_scheduler = use_clc_scheduler
         self.use_semantic_trip_range = self.is_causal or self.is_local
 
-        self.compute_warp_ids = (0, 1, 2, 3)
-        self.epilogue_warp_ids = (4, 5, 6, 7)
+        # Warp layout (HD256 dQ-only): 12 warps -> 384 threads
+        self.compute_warp_ids = (0, 1, 2, 3)  # 4 warps
         self.mma_warp_id = 8
         self.load_warp_id = 9
-        self.empty_warp_id = (10, 11)
-        self.sched_warp_id = self.empty_warp_id[0] if use_clc_scheduler else None
-        self.tmem_alloc_cols = SM100_TMEM_CAPACITY_COLUMNS
+        self.empty_warp_id = (4, 5, 6, 7, 10, 11)
+        self.softmax0_warp_ids = self.compute_warp_ids
+        self.softmax1_warp_ids = ()
+        self.correction_warp_ids = ()
+        self.load_warp_ids = (self.load_warp_id,)
+        self.empty_warp_ids = self.empty_warp_id
+        self.sched_warp_id = self.empty_warp_id[0] if self.use_clc_scheduler else None
+        self.tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols("sm_100")
         self.num_compute_warps = len(self.compute_warp_ids)
 
         self.cta_sync_bar_id = 0
         self.tmem_alloc_sync_bar_id = 1
         self.compute_sync_bar_id = 2
+        self.epilogue_sync_bar_id = 3
 
-        self.threads_per_warp = 32
+        self.threads_per_warp = cute.arch.WARP_SIZE
         self.threads_per_cta = self.threads_per_warp * len(
             (
-                *self.compute_warp_ids,  # this is to get a round num threads
-                *self.epilogue_warp_ids,
+                *self.compute_warp_ids,
                 self.mma_warp_id,
                 self.load_warp_id,
                 *self.empty_warp_id,
             )
         )
 
-        self.tmem_alloc_barrier = pipeline.NamedBarrier(
-            barrier_id=1,
-            num_threads=self.threads_per_cta,
+        self.tmem_alloc_barrier = cutlass.pipeline.NamedBarrier(
+            barrier_id=self.tmem_alloc_sync_bar_id,
+            num_threads=cute.arch.WARP_SIZE * len((self.mma_warp_id, *self.compute_warp_ids)),
         )
 
-        self.tmem_s_offset = 0
-        self.tmem_dp_offset = 128
-        self.tmem_dq_offset = 256
+        self.tmem_s_offset = [0, self.n_block_size]  # e.g., 0, 128
+        self.tmem_dq_offset = self.tmem_s_offset[-1] + self.n_block_size  # e.g., 256
+        self.tmem_total = self.tmem_dq_offset + self.head_dim_padded
+        assert self.tmem_total <= self.tmem_alloc_cols
+        self.tmem_s_to_dp_offset = self.n_block_size
+        self.tmem_dp_offset = self.tmem_s_offset[0] + self.tmem_s_to_dp_offset
 
         self.num_regs_compute = 256
-        self.num_regs_epilogue = 160
         self.num_regs_other = 32
 
         self.buffer_align_bytes = 1024
 
     def _setup_attributes(self):
-        self.q_stage = self.iterations_qk
-        self.k_stage = self.iterations_qk
-        self.do_stage = self.iterations_dov
-        self.v_stage = self.iterations_dov
+        """Set up pipeline stages for the HD256 dQ kernel."""
+
+        self.q_stage = 1
+        self.k_stage = 1
+        self.do_stage = 1
+        self.v_stage = 1
         self.kt_stage = 1
+        self.Q_stage = self.q_stage
+        self.dO_stage = self.do_stage
+        self.single_stage = 1
+
         self.qk_acc_stage = 1
         self.dov_acc_stage = 1
         self.dsk_acc_stage = 1
@@ -152,383 +237,427 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
             self.num_clc_stage = 1
             self.num_clc_response_bytes = 16
 
-    @cute.jit
-    def __call__(
-        self,
-        q_tensor: cute.Tensor,
-        k_tensor: cute.Tensor,
-        v_tensor: cute.Tensor,
-        dq_tensor: cute.Tensor,
-        do_tensor: cute.Tensor,
-        lse_tensor: cute.Tensor,
-        sum_odo_tensor: cute.Tensor,
-        cum_seqlen_q: Optional[cute.Tensor],
-        cum_seqlen_k: Optional[cute.Tensor],
-        scale_softmax: cutlass.Float32,
-        stream: cuda.CUstream,
-    ):
-        varlen = cum_seqlen_q is not None or cum_seqlen_k is not None
-        # Infer shape metadata from normalized 5D tensors (B, S, H_k, H_r, D),
-        # similar to the dedicated hd256 forward path.
-        s_q = q_tensor.shape[1]
-        s_k = k_tensor.shape[1]
-        d = q_tensor.shape[4]
-        h_k = q_tensor.shape[2]
-        h_r = q_tensor.shape[3]
-        if cutlass.const_expr(cum_seqlen_q is not None):
-            b = cum_seqlen_q.shape[0] - 1
-        elif cutlass.const_expr(cum_seqlen_k is not None):
-            b = cum_seqlen_k.shape[0] - 1
-        else:
-            b = q_tensor.shape[0]
-        # `lse_tensor` / `sum_odo_tensor` are preallocated FP32 buffers (lse_log2 / dpsum)
-        # whose sequence dimension is padded (rounded up) by the caller.
-        # Use their leading dimension as the LSE length to ensure correct batch strides.
-        s_lse = lse_tensor.shape[0]
-        s_q64 = Int64(s_q)
-        s_k64 = Int64(s_k)
-        s_lse64 = Int64(s_lse)
-        d64 = cute.assume(Int64(d), divby=128)
-        h_r64 = Int64(h_r)
-        h_k64 = Int64(h_k)
-        b64 = Int64(b)
-        # Packed-varlen representation uses batch-dim = 1 and sequence-dim = total_{q,k}.
-        # Keep the *physical* sequence extent in the tensor layouts so that applying
-        # `cuseqlen_*` offsets stays within the tensor domain.
-        s_q_total = q_tensor.shape[1] if cum_seqlen_q is not None else s_q64
-        s_k_total = k_tensor.shape[1] if cum_seqlen_k is not None else s_k64
-        stride_b_qo = h_r64 * h_k64 * s_q64 * d64 if cum_seqlen_q is None else 0
-        stride_b_kv = h_k64 * s_k64 * d64 if cum_seqlen_k is None else 0
-        b_lse = b64 if cum_seqlen_q is None else 1
-        stride_b_lse = h_r64 * h_k64 * s_lse64 if cum_seqlen_q is None else 0
+    def _get_tiled_mma(self):
+        self.cta_group = tcgen05.CtaGroup.TWO
 
-        # (s, d, ((h_r, h_k), b))
-        q_layout = cute.make_layout(
-            (s_q_total, d, ((h_r, h_k), b)),
-            stride=(d64 * h_r64 * h_k64, 1, ((d64, d64 * h_r64), stride_b_qo)),
-        )
-        q = cute.make_tensor(q_tensor.iterator, q_layout)
-        # (s, d, ((h_r, h_k), b))
-        do_layout = cute.make_layout(
-            (s_q_total, d, ((h_r, h_k), b)),
-            stride=(d64 * h_r64 * h_k64, 1, ((d64, d64 * h_r64), stride_b_qo)),
-        )
-        do = cute.make_tensor(do_tensor.iterator, do_layout)
-        # (s, d, ((h_r, h_k), b)), 0-stride for h_r to broadcast
-        k_layout = cute.make_layout(
-            (s_k_total, d, ((h_r, h_k), b)),
-            stride=(d64 * h_k64, 1, ((0, d64), stride_b_kv)),
-        )
-        k = cute.make_tensor(k_tensor.iterator, k_layout)
-        # (d, s, ((h_r, h_k), b)), 0-stride for h_r to broadcast
-        kt_layout = cute.make_layout(
-            (d, s_k_total, ((h_r, h_k), b)),
-            stride=(1, d64 * h_k64, ((0, d64), stride_b_kv)),
-        )
-        kt = cute.make_tensor(k_tensor.iterator, kt_layout)
-        # (s, d, ((h_r, h_k), b)), 0-stride for h_r to broadcast
-        v_layout = cute.make_layout(
-            (s_k_total, d, ((h_r, h_k), b)),
-            stride=(d64 * h_k64, 1, ((0, d64), stride_b_kv)),
-        )
-        v = cute.make_tensor(v_tensor.iterator, v_layout)
-        # (s, ((h_r, h_k), b))
-        lse = cute.make_tensor(lse_tensor.iterator, lse_tensor.layout)
-        # (s, ((h_r, h_k), b))
-        sum_odo_layout = cute.make_layout(
-            (s_lse64, ((h_r, h_k), b_lse)),
-            stride=(1, ((s_lse64, h_r64 * s_lse64), stride_b_lse)),
-        )
-        sum_odo = cute.make_tensor(sum_odo_tensor.iterator, sum_odo_layout)
-        # (s, d, ((h_r, h_k), b))
-        dq_layout = cute.make_layout(
-            (s_q_total, d, ((h_r, h_k), b)),
-            stride=(d64 * h_r64 * h_k64, 1, ((d64, d64 * h_r64), stride_b_qo)),
-        )
-        dq = cute.make_tensor(dq_tensor.iterator, dq_layout)
-
-        # setup static attributes before smem/grid/tma computation
-        self.q_dtype = q.element_type
-        self.k_dtype = k.element_type
-        self.v_dtype = v.element_type
-        self.do_dtype = do.element_type
-        self.dq_dtype = dq.element_type
-        self.tilePlikeFP32 = self.qk_mma_tiler[1] // Float32.width * self.q_dtype.width
-
-        if cutlass.const_expr(self.use_clc_scheduler):
-            self.tile_sched_params, grid = compute_grid_clc(
-                (s_q, dq.shape[1], dq.shape[2]) if cum_seqlen_q is not None else dq.shape,
-                self.cta_tiler,
-                (*self.cluster_shape_mn, 1),
-            )
-        else:
-            self.tile_sched_params, grid = compute_grid(
-                (s_q, dq.shape[1], dq.shape[2]) if cum_seqlen_q is not None else dq.shape,
-                self.cta_tiler,
-                self.is_persistent,
-            )
-
-        self.q_major_mode = utils.LayoutEnum.from_tensor(q).mma_major_mode()
-        self.do_major_mode = utils.LayoutEnum.from_tensor(do).mma_major_mode()
-        self.k_major_mode = utils.LayoutEnum.from_tensor(k).mma_major_mode()
-        self.v_major_mode = utils.LayoutEnum.from_tensor(v).mma_major_mode()
-        self.dq_layout = utils.LayoutEnum.from_tensor(dq)
-
-        if cutlass.const_expr(self.q_major_mode != tcgen05.OperandMajorMode.K):
-            raise RuntimeError("The layout of q is not supported")
-        if cutlass.const_expr(self.k_major_mode != tcgen05.OperandMajorMode.K):
-            raise RuntimeError("The layout of k is not supported")
-        if cutlass.const_expr(self.v_major_mode != tcgen05.OperandMajorMode.K):
-            raise RuntimeError("The layout of v is not supported")
-        if cutlass.const_expr(self.do_major_mode != tcgen05.OperandMajorMode.K):
-            raise RuntimeError("The layout of v is not supported")
-
-        # check type consistency
-        if cutlass.const_expr(self.q_dtype != self.k_dtype):
-            raise TypeError(f"Type mismatch: {self.q_dtype} != {self.k_dtype}")
-        if cutlass.const_expr(self.q_dtype != self.v_dtype):
-            raise TypeError(f"Type mismatch: {self.q_dtype} != {self.v_dtype}")
-        if cutlass.const_expr(self.q_dtype != self.do_dtype):
-            raise TypeError(f"Type mismatch: {self.q_dtype} != {self.do_dtype}")
-
-        self._setup_attributes()
-
-        cta_group = tcgen05.CtaGroup.TWO
-        # the intermediate tensor p is from tmem & k-major
-        ds_source = tcgen05.OperandSource.TMEM
-        ds_major_mode = tcgen05.OperandMajorMode.K
-        k_trans_major_mode = tcgen05.OperandMajorMode.MN
-        qk_tiled_mma = sm100_utils.make_trivial_tiled_mma(
+        # S = Q @ K.T
+        tiled_mma_S = sm100_utils_basic.make_trivial_tiled_mma(
             self.q_dtype,
-            self.q_major_mode,
-            self.k_major_mode,
+            tcgen05.OperandMajorMode.K,
+            tcgen05.OperandMajorMode.K,
             self.acc_dtype,
-            cta_group,
+            self.cta_group,
             self.qk_mma_tiler[:2],
         )
-        dov_tiled_mma = sm100_utils.make_trivial_tiled_mma(
+        # dP = dO @ V.T
+        tiled_mma_dP = sm100_utils_basic.make_trivial_tiled_mma(
             self.do_dtype,
-            self.do_major_mode,
-            self.v_major_mode,
+            tcgen05.OperandMajorMode.K,
+            tcgen05.OperandMajorMode.K,
             self.acc_dtype,
-            cta_group,
+            self.cta_group,
             self.dov_mma_tiler[:2],
         )
-        dsk_tiled_mma = sm100_utils.make_trivial_tiled_mma(
-            self.q_dtype,
-            ds_major_mode,
-            k_trans_major_mode,
+        # dQ = dS @ K. HD256 2CTA keeps dS as TMEM A and K.T as MN-major B;
+        # this is the intentional swapAB divergence from flash_bwd_sm100.py.
+        tiled_mma_dQ = sm100_utils_basic.make_trivial_tiled_mma(
+            self.k_dtype,
+            tcgen05.OperandMajorMode.K,
+            tcgen05.OperandMajorMode.MN,
             self.acc_dtype,
-            cta_group,
+            self.cta_group,
             self.dsk_mma_tiler[:2],
-            ds_source,
+            a_source=tcgen05.OperandSource.TMEM,
         )
+        return tiled_mma_S, tiled_mma_dP, tiled_mma_dQ
 
-        self.cluster_shape_mnk = (*self.cluster_shape_mn, 1)
-        self.cluster_layout_vmnk = cute.tiled_divide(
-            cute.make_layout(self.cluster_shape_mnk),
-            (qk_tiled_mma.thr_id.shape,),
-        )
-
-        self.epi_tile = self.dsk_block_tiler[:2]
-
-        q_smem_layout_staged = sm100_utils.make_smem_layout_a(
-            qk_tiled_mma,
+    def _setup_smem_layout(self):
+        # S = Q @ K.T
+        self.sQ_layout = sm100_utils_basic.make_smem_layout_a(
+            self.tiled_mma_S,
             self.qk_mma_tiler,
             self.q_dtype,
             self.q_stage,
         )
-        k_smem_layout_staged = sm100_utils.make_smem_layout_b(
-            qk_tiled_mma,
+        self.sK_layout = sm100_utils_basic.make_smem_layout_b(
+            self.tiled_mma_S,
             self.qk_mma_tiler,
             self.k_dtype,
             self.k_stage,
         )
-        do_smem_layout_staged = sm100_utils.make_smem_layout_a(
-            dov_tiled_mma,
+
+        # dP = dO @ V.T
+        self.sdO_layout = sm100_utils_basic.make_smem_layout_a(
+            self.tiled_mma_dP,
             self.dov_mma_tiler,
             self.do_dtype,
             self.do_stage,
         )
-        v_smem_layout_staged = sm100_utils.make_smem_layout_b(
-            dov_tiled_mma,
+        self.sV_layout = sm100_utils_basic.make_smem_layout_b(
+            self.tiled_mma_dP,
             self.dov_mma_tiler,
             self.v_dtype,
             self.v_stage,
         )
-        ds_tmem_layout_staged = sm100_utils.make_smem_layout_a(
-            dsk_tiled_mma,
+
+        # dQ = dS @ K
+        tdS_layout = sm100_utils_basic.make_smem_layout_a(
+            self.tiled_mma_dQ,
             self.dsk_mma_tiler,
             self.q_dtype,
             self.qk_acc_stage,
         )
-        ds_tmem_layout = cute.select(ds_tmem_layout_staged, mode=[0, 1, 2])
-        kt_smem_layout_staged = sm100_utils.make_smem_layout_b(
-            dsk_tiled_mma,
+        self.tdS_layout = cute.slice_(tdS_layout, (None, None, None, 0))
+        self.sKt_layout = sm100_utils_basic.make_smem_layout_b(
+            self.tiled_mma_dQ,
             self.dsk_mma_tiler,
             self.k_dtype,
             self.dsk_acc_stage,
         )
 
-        # TMA load for Q
-        tma_load_op = cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp(cta_group)
+        self.sLSE_layout = cute.make_layout((self.cta_tiler[0], self.load_compute_LSE_stage))
+        self.sdPsum_layout = cute.make_layout(
+            (self.cta_tiler[0], self.load_compute_sum_OdO_stage)
+        )
 
-        q_smem_layout = cute.select(q_smem_layout_staged, mode=[0, 1, 2])
-        tma_atom_q, tma_tensor_q = cute.nvgpu.make_tiled_tma_atom_A(
-            tma_load_op,
-            q,
-            q_smem_layout,
-            self.qk_mma_tiler,
-            qk_tiled_mma,
-            self.cluster_layout_vmnk.shape,
+        self.epi_cols_dQ = math.gcd(128 // (self.dq_dtype.width // 8), self.epi_tile[1])
+        self.epi_tile_dQ = (self.epi_tile[0], self.epi_cols_dQ)
+        self.num_epi_stages_dQ = max(1, self.tile_hdim // self.epi_tile_dQ[1])
+        self.sdQ_epi_layout = sm100_utils_basic.make_smem_layout_epi(
+            self.dq_dtype,
+            self.dq_layout,
+            self.epi_tile_dQ,
+            1,
         )
-        # TMA load for K
-        k_smem_layout = cute.select(k_smem_layout_staged, mode=[0, 1, 2])
-        tma_atom_k, tma_tensor_k = cute.nvgpu.make_tiled_tma_atom_B(
-            tma_load_op,
-            k,
-            k_smem_layout,
-            self.qk_mma_tiler,
-            qk_tiled_mma,
-            self.cluster_layout_vmnk.shape,
-        )
-        # TMA load for dO
-        do_smem_layout = cute.select(do_smem_layout_staged, mode=[0, 1, 2])
-        tma_atom_do, tma_tensor_do = cute.nvgpu.make_tiled_tma_atom_A(
-            tma_load_op,
-            do,
-            do_smem_layout,
-            self.dov_mma_tiler,
-            dov_tiled_mma,
-            self.cluster_layout_vmnk.shape,
-        )
-        # TMA load for V
-        v_smem_layout = cute.select(v_smem_layout_staged, mode=[0, 1, 2])
-        tma_atom_v, tma_tensor_v = cute.nvgpu.make_tiled_tma_atom_B(
-            tma_load_op,
-            v,
-            v_smem_layout,
-            self.dov_mma_tiler,
-            dov_tiled_mma,
-            self.cluster_layout_vmnk.shape,
-        )
-        # TMA load for KT
-        kt_smem_layout = cute.select(kt_smem_layout_staged, mode=[0, 1, 2])
-        tma_atom_kt, tma_tensor_kt = cute.nvgpu.make_tiled_tma_atom_B(
-            tma_load_op,
-            kt,
-            kt_smem_layout,
-            self.dsk_mma_tiler,
-            dsk_tiled_mma,
-            self.cluster_layout_vmnk.shape,
-        )
-        lse_smem_layout = cute.make_layout((self.cta_tiler[0], self.load_compute_LSE_stage))
-        sum_odo_smem_layout = cute.make_layout((self.cta_tiler[0], self.load_compute_sum_OdO_stage))
 
-        q_copy_size = cute.size_in_bytes(self.q_dtype, q_smem_layout)
-        k_copy_size = cute.size_in_bytes(self.k_dtype, k_smem_layout)
-        do_copy_size = cute.size_in_bytes(self.do_dtype, do_smem_layout)
-        v_copy_size = cute.size_in_bytes(self.v_dtype, v_smem_layout)
-        kt_copy_size = cute.size_in_bytes(self.k_dtype, kt_smem_layout)
-        self.tma_copy_q_bytes = q_copy_size * cute.size(qk_tiled_mma.thr_id.shape)
-        self.tma_copy_k_bytes = k_copy_size * cute.size(qk_tiled_mma.thr_id.shape)
-        self.tma_copy_do_bytes = do_copy_size * cute.size(qk_tiled_mma.thr_id.shape)
-        self.tma_copy_v_bytes = v_copy_size * cute.size(qk_tiled_mma.thr_id.shape)
-        self.tma_copy_kt_bytes = kt_copy_size * cute.size(qk_tiled_mma.thr_id.shape)
+    @cute.jit
+    def __call__(
+        self,
+        mQ: cute.Tensor,
+        mK: cute.Tensor,
+        mV: cute.Tensor,
+        mdO: cute.Tensor,
+        mLSE: cute.Tensor,
+        mdPsum: cute.Tensor,
+        mdQaccum: cute.Tensor,
+        softmax_scale: Float32,
+        mCuSeqlensQ: Optional[cute.Tensor] = None,
+        mCuSeqlensK: Optional[cute.Tensor] = None,
+        mSeqUsedQ: Optional[cute.Tensor] = None,
+        mSeqUsedK: Optional[cute.Tensor] = None,
+        window_size_left: Int32 | int | None = None,
+        window_size_right: Int32 | int | None = None,
+        mdQ_semaphore: Optional[cute.Tensor] = None,
+        mdK_semaphore: Optional[cute.Tensor] = None,
+        mdV_semaphore: Optional[cute.Tensor] = None,
+        aux_tensors: Optional[list] = None,
+        # Block-sparse tensors (Q direction - for iterating m_blocks per n_block):
+        blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
+        stream: cuda.CUstream = None,
+    ):
+        assert mSeqUsedQ is None
+        assert mSeqUsedK is None
+        assert mdQ_semaphore is None
+        assert mdK_semaphore is None
+        assert mdV_semaphore is None
+        assert aux_tensors is None
+        assert blocksparse_tensors is None
+
+        self.q_dtype = mQ.element_type
+        self.k_dtype = mK.element_type
+        self.v_dtype = mV.element_type
+        self.do_dtype = mdO.element_type
+        self.lse_dtype = mLSE.element_type
+        self.dpsum_dtype = mdPsum.element_type
+        self.dq_dtype = mdQaccum.element_type
+        self.ds_dtype = self.q_dtype
+
+        self.is_varlen_k = mCuSeqlensK is not None or mSeqUsedK is not None
+        self.is_varlen_q = mCuSeqlensQ is not None or mSeqUsedQ is not None
+
+        mdQaccum = assume_tensor_aligned(mdQaccum)
+
+        # (b, s, n, h) --> (s, h, n, b) or (t, n, h) -> (t, h, n)
+        Q_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
+        mQ, mdO, mdQaccum = [
+            layout_utils.select(t, mode=Q_layout_transpose) for t in (mQ, mdO, mdQaccum)
+        ]
+
+        KV_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensK is None) else [0, 2, 1]
+        mK, mV = [layout_utils.select(t, mode=KV_layout_transpose) for t in (mK, mV)]
+
+        # (b, n, s) --> (s, n, b) or (n, t) --> (t, n)
+        LSE_dPsum_transpose = [2, 1, 0] if const_expr(mCuSeqlensQ is None) else [1, 0]
+        mLSE, mdPsum = [
+            layout_utils.select(t, mode=LSE_dPsum_transpose) for t in (mLSE, mdPsum)
+        ]
+        mdQ = mdQaccum
+        self.dq_layout = cutlass_utils.LayoutEnum.from_tensor(mdQ)
+
+        if const_expr(self.q_dtype != self.k_dtype):
+            raise TypeError(f"Type mismatch: {self.q_dtype} != {self.k_dtype}")
+        if const_expr(self.q_dtype != self.v_dtype):
+            raise TypeError(f"Type mismatch: {self.q_dtype} != {self.v_dtype}")
+        if const_expr(self.q_dtype != self.do_dtype):
+            raise TypeError(f"Type mismatch: {self.q_dtype} != {self.do_dtype}")
+
+        # Transposes for 2-CTA K paths (K follows K seqlens)
+        transpose_sh_k = [1, 0, 2, 3] if const_expr(mCuSeqlensK is None) else [1, 0, 2]
+
+        self.epi_tile = self.dsk_block_tiler[:2]
+
+        self._setup_attributes()
+        (
+            self.tiled_mma_S,
+            self.tiled_mma_dP,
+            self.tiled_mma_dQ
+        ) = self._get_tiled_mma()
+        self._setup_smem_layout()
+        self.dQ_reduce_ncol = self.epi_tile_dQ[1]
+
+        self.cluster_shape_mnk = (*self.cluster_shape_mn, 1)
+        self.cluster_layout_vmnk = cute.tiled_divide(
+            cute.make_layout(self.cluster_shape_mnk),
+            (self.tiled_mma_S.thr_id.shape,),
+        )
+        self.num_mcast_ctas_b = cute.size(self.cluster_layout_vmnk.shape[1])
+        self.is_q_do_mcast = self.num_mcast_ctas_b > 1
 
         # dQ epilogue TMA store. Use a single (M, 64) SMEM stage and rotate it
         # across the hd=256 N dimension to stay within the SMEM budget.
-        tma_store_op = cpasync.CopyBulkTensorTileS2GOp()
-        epi_cols_dQ = math.gcd(128 // (dq.element_type.width // 8), self.epi_tile[1])
-        epi_tile_dQ = (self.epi_tile[0], epi_cols_dQ)
-        sdQ_epi_layout = sm100_utils.make_smem_layout_epi(
-            dq.element_type,
-            self.dq_layout,
-            epi_tile_dQ,
-            1,
+        tma_copy_op_dQ = cpasync.CopyBulkTensorTileS2GOp()
+        tma_atom_dQ, mdQ_tma = cpasync.make_tiled_tma_atom(
+            tma_copy_op_dQ,
+            mdQ,
+            cute.select(self.sdQ_epi_layout, mode=[0, 1]),
+            self.epi_tile_dQ,
         )
-        tma_atom_dQ, tma_tensor_dQ = cpasync.make_tiled_tma_atom(
-            tma_store_op,
-            dq,
-            cute.select(sdQ_epi_layout, mode=[0, 1]),
-            epi_tile_dQ,
+        thr_layout_r2s_dQ = cute.make_ordered_layout((128, 1), order=(1, 0))  # 128 threads
+        val_layout_r2s_dQ = cute.make_ordered_layout(
+            (1, 128 // self.dq_dtype.width), order=(1, 0)
+        )  # 4 or 8 vals for 16 byte store
+        copy_atom_r2s_dQ = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            self.dq_dtype,
+            num_bits_per_copy=128,
         )
+        tiled_copy_r2s_dQ = cute.make_tiled_copy_tv(
+            copy_atom_r2s_dQ, thr_layout_r2s_dQ, val_layout_r2s_dQ
+        )
+
+        tma_load_op = cpasync.CopyBulkTensorTileG2SOp(self.cta_group)
+        # S = Q @ K.T
+        tma_atom_Q, tma_tensor_Q = cute.nvgpu.make_tiled_tma_atom_A(
+            tma_load_op,
+            mQ,
+            cute.select(self.sQ_layout, mode=[0, 1, 2]),
+            self.qk_mma_tiler,
+            self.tiled_mma_S,
+            self.cluster_layout_vmnk.shape,
+        )
+        tma_atom_dO, tma_tensor_do = cute.nvgpu.make_tiled_tma_atom_A(
+            tma_load_op,
+            mdO,
+            cute.select(self.sdO_layout, mode=[0, 1, 2]),
+            self.dov_mma_tiler,
+            self.tiled_mma_dP,
+            self.cluster_layout_vmnk.shape,
+        )
+
+        # ------------------------------------------------------------
+        # 2-CTA
+        # ------------------------------------------------------------
+        K_tma_op = sm100_utils_basic.cluster_shape_to_tma_atom_B(
+            self.cluster_shape_mnk, self.tiled_mma_S.thr_id
+        )
+        tma_atom_K, tma_tensor_K = cute.nvgpu.make_tiled_tma_atom_B(
+            K_tma_op,
+            mK,
+            cute.select(self.sK_layout, mode=[0, 1, 2]),
+            self.qk_mma_tiler,
+            self.tiled_mma_S,
+            self.cluster_layout_vmnk.shape,
+        )
+        V_tma_op = sm100_utils_basic.cluster_shape_to_tma_atom_B(
+            self.cluster_shape_mnk, self.tiled_mma_dP.thr_id
+        )
+        tma_atom_V, tma_tensor_V = cute.nvgpu.make_tiled_tma_atom_B(
+            V_tma_op,
+            mV,
+            cute.select(self.sV_layout, mode=[0, 1, 2]),
+            self.dov_mma_tiler,
+            self.tiled_mma_dP,
+            self.cluster_layout_vmnk.shape,
+        )
+        Kt_tma_op = sm100_utils_basic.cluster_shape_to_tma_atom_B(
+            self.cluster_shape_mnk, self.tiled_mma_dQ.thr_id
+        )
+        tma_atom_Kt, tma_tensor_Kt = cute.nvgpu.make_tiled_tma_atom_B(
+            Kt_tma_op,
+            layout_utils.select(mK, mode=transpose_sh_k),
+            cute.select(self.sKt_layout, mode=[0, 1, 2]),
+            self.mma_tiler_dsk,
+            self.tiled_mma_dQ,
+            self.cluster_layout_vmnk.shape,
+        )
+
+        self.tma_copy_bytes = {
+            name: self.cta_group_size
+            * cute.size_in_bytes(mX.element_type, cute.select(layout, mode=[0, 1, 2]))
+            for name, mX, layout in [
+                ("Q", mQ, self.sQ_layout),
+                ("K", mK, self.sK_layout),
+                ("V", mV, self.sV_layout),
+                ("dO", mdO, self.sdO_layout),
+                ("Kt", layout_utils.select(mK, mode=transpose_sh_k), self.sKt_layout),
+            ]
+        }
+        self.tma_copy_bytes["LSE"] = self.tile_m * Float32.width // 8
+        self.tma_copy_bytes["dPsum"] = self.tile_m * Float32.width // 8
+        self.tma_copy_bytes["dQ"] = self.tile_m * self.dQ_reduce_ncol * Float32.width // 8
+
+        # TileScheduler = SingleTileScheduler
+        if const_expr(self.is_varlen_q):
+            TileScheduler = SingleTileVarlenScheduler
+        elif const_expr(self.deterministic):
+            TileScheduler = SingleTileLPTBwdScheduler
+        else:
+            TileScheduler = SingleTileScheduler
+
+        tile_sched_args = TileSchedulerArguments(
+            cute.ceil_div(cute.size(mQ.shape[0]), self.cta_tiler[0]),  # num_blocks
+            cute.size(mQ.shape[2]),  # num_heads = num_query_heads
+            cute.size(mQ.shape[3])
+            if const_expr(mCuSeqlensQ is None)
+            else cute.size(mCuSeqlensQ.shape[0] - 1),  # num_batches
+            1,  # num_splits
+            cute.size(mQ.shape[0]),  # pass seqlen_q or total_q for seqlen_k
+            mQ.shape[1],  # headdim
+            mV.shape[1],  # headdim_v
+            total_q=cute.size(mQ.shape[0])  # pass total_k for total_q
+            if const_expr(mCuSeqlensQ is not None)
+            else cute.size(mQ.shape[0]) * cute.size(mQ.shape[3]),
+            tile_shape_mn=self.cta_tiler[:2],  # (tile_n, tile_m)
+            cluster_shape_mn=self.cluster_shape_mnk[:2],
+            mCuSeqlensQ=mCuSeqlensQ,
+            mSeqUsedQ=mSeqUsedQ,
+            qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,  # pack_gqa disabled for bwd
+            element_size=self.k_dtype.width // 8,
+            is_persistent=self.is_persistent,  # persistent mode not tested
+            lpt=self.is_causal or self.is_local,
+            use_cluster_idx=False,
+        )
+
+        tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
+        self.tile_scheduler_cls = TileScheduler
+        grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
 
         @cute.struct
         class SharedStorage:
-            # TMA G2S load barriers: LOAD warp (producer) -> MMA warp (consumer)
-            load_q_mbar_ptr: cute.struct.MemRange[
-                Int64, self.q_stage * 2
-            ]  # load_q_{producer,consumer}
-            load_do_mbar_ptr: cute.struct.MemRange[
-                Int64, self.do_stage * 2
-            ]  # load_do_{producer,consumer}
-            load_k_mbar_ptr: cute.struct.MemRange[
-                Int64, self.k_stage * 2
-            ]  # load_k_{producer,consumer}
-            load_kt_mbar_ptr: cute.struct.MemRange[
-                Int64, self.kt_stage * 2
-            ]  # load_kt_{producer,consumer}
-            load_v_mbar_ptr: cute.struct.MemRange[
-                Int64, self.v_stage * 2
-            ]  # load_v_{producer,consumer}
-            mma_s_mbar_ptr: cute.struct.MemRange[Int64, self.qk_acc_stage * 2]
-            mma_dp_mbar_ptr: cute.struct.MemRange[Int64, self.dov_acc_stage * 2]
-            mma_dq_mbar_ptr: cute.struct.MemRange[Int64, self.epi_stage * 2]
-            ds_mma_mbar_ptr: cute.struct.MemRange[Int64, self.dsk_acc_stage * 2]
-            lse_mbar_ptr: cute.struct.MemRange[cutlass.Int64, self.load_compute_LSE_stage * 2]
-            sum_odo_mbar_ptr: cute.struct.MemRange[
-                cutlass.Int64, self.load_compute_sum_OdO_stage * 2
+            Q_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.q_stage]
+            dO_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.do_stage]
+            LSE_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.load_compute_LSE_stage]
+            dPsum_mbar_ptr: cute.struct.MemRange[
+                cutlass.Int64, 2 * self.load_compute_sum_OdO_stage
             ]
-            # A CTA-wide "TMEM lifetime" barrier used to safely deallocate TMEM after all users finish.
-            tmem_dealloc_mbar_ptr: Int64
-            # Tmem holding buffer
+            S_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.qk_acc_stage]
+            dP_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.dov_acc_stage]
+            dS_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.dsk_acc_stage]
+            dQ_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.epi_stage]
             tmem_holding_buf: Int32
-            # CLC pipeline barriers and response buffer
-            clc_mbar_ptr: cute.struct.MemRange[Int64, 2]
+            tmem_dealloc_mbar_ptr: cutlass.Int64
+
+            # 2-CTA
+            K_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.k_stage]
+            Kt_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.kt_stage]
+            V_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.v_stage]
+
+            clc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
             clc_response: cute.struct.MemRange[Int32, 4]
+
+            sQ: cute.struct.Align[
+                cute.struct.MemRange[self.q_dtype, cute.cosize(self.sQ_layout)],
+                self.buffer_align_bytes,
+            ]
+            sK: cute.struct.Align[
+                cute.struct.MemRange[self.k_dtype, cute.cosize(self.sK_layout)],
+                self.buffer_align_bytes,
+            ]
+            sV: cute.struct.Align[
+                cute.struct.MemRange[self.v_dtype, cute.cosize(self.sV_layout)],
+                self.buffer_align_bytes,
+            ]
+            sdO: cute.struct.Align[
+                cute.struct.MemRange[self.do_dtype, cute.cosize(self.sdO_layout)],
+                self.buffer_align_bytes,
+            ]
+            sKt: cute.struct.Align[
+                cute.struct.MemRange[self.k_dtype, cute.cosize(self.sKt_layout)],
+                self.buffer_align_bytes,
+            ]
+            sLSE: cute.struct.Align[
+                cute.struct.MemRange[self.lse_dtype, cute.cosize(self.sLSE_layout)],
+                128,
+            ]
+            sdPsum: cute.struct.Align[
+                cute.struct.MemRange[self.dpsum_dtype, cute.cosize(self.sdPsum_layout)],
+                128,
+            ]
 
         self.shared_storage = SharedStorage
 
-        grid = cute.round_up(grid, self.cluster_shape_mnk)
+        LOG2_E = math.log2(math.e)
+        if const_expr(self.score_mod is None):
+            # Without score_mod: bake scale into log2
+            softmax_scale_log2 = softmax_scale * LOG2_E
+        else:
+            # With score_mod: score_mod applied to S * softmax_scale, then use LOG2_E only
+            softmax_scale_log2 = LOG2_E
+
+        if const_expr(window_size_left is not None):
+            window_size_left = Int32(window_size_left)
+        if const_expr(window_size_right is not None):
+            window_size_right = Int32(window_size_right)
+
         # Launch the kernel synchronously
         self.kernel(
-            qk_tiled_mma,
-            dov_tiled_mma,
-            dsk_tiled_mma,
-            tma_atom_q,
-            tma_tensor_q,
-            tma_atom_k,
-            tma_tensor_k,
-            tma_atom_v,
-            tma_tensor_v,
-            tma_atom_do,
+            tma_tensor_Q,
+            tma_tensor_K,
+            tma_tensor_Kt,
+            tma_tensor_V,
+            mLSE,
+            mdPsum,
             tma_tensor_do,
-            tma_atom_kt,
-            tma_tensor_kt,
+            mdQ,
+            mdQ_tma,
+            mCuSeqlensQ,
+            mCuSeqlensK,
+            tma_atom_Q,
+            tma_atom_K,
+            tma_atom_Kt,
+            tma_atom_V,
+            tma_atom_dO,
             tma_atom_dQ,
-            tma_tensor_dQ,
-            lse,
-            sum_odo,
-            dq,
-            cum_seqlen_q,
-            cum_seqlen_k,
-            scale_softmax,
-            self.window_size_left,
-            self.window_size_right,
-            self.cluster_layout_vmnk,
-            q_smem_layout_staged,
-            k_smem_layout_staged,
-            v_smem_layout_staged,
-            do_smem_layout_staged,
-            kt_smem_layout_staged,
-            ds_tmem_layout,
-            sdQ_epi_layout,
-            lse_smem_layout,
-            sum_odo_smem_layout,
-            self.tile_sched_params,
+            self.sQ_layout,
+            self.sK_layout,
+            self.sKt_layout,
+            self.sV_layout,
+            self.sLSE_layout,
+            self.sdPsum_layout,
+            self.sdO_layout,
+            self.tdS_layout,
+            self.sdQ_epi_layout,
+            self.tiled_mma_S,
+            self.tiled_mma_dP,
+            self.tiled_mma_dQ,
+            tiled_copy_r2s_dQ,
+            softmax_scale,
+            window_size_left,
+            window_size_right,
+            tile_sched_params,
         ).launch(
-            grid=grid,
+            grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
             cluster=self.cluster_shape_mnk,
             stream=stream,
@@ -539,1723 +668,1472 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
     @cute.kernel
     def kernel(
         self,
-        qk_tiled_mma: cute.TiledMma,
-        dov_tiled_mma: cute.TiledMma,
-        dsk_tiled_mma: cute.TiledMma,
-        tma_atom_q: cute.CopyAtom,
-        mQ_qdl: cute.Tensor,
-        tma_atom_k: cute.CopyAtom,
-        mK_kdl: cute.Tensor,
-        tma_atom_v: cute.CopyAtom,
-        mV_dkl: cute.Tensor,
-        tma_atom_do: cute.CopyAtom,
-        mdO_qdl: cute.Tensor,
-        tma_atom_kt: cute.CopyAtom,
-        mK_dkl: cute.Tensor,
-        tma_atom_dQ: cute.CopyAtom,
-        mdQ_tma: cute.Tensor,
+        mQ: cute.Tensor,
+        mK: cute.Tensor,
+        mKt: cute.Tensor,
+        mV: cute.Tensor,
         mLSE: cute.Tensor,
-        mSum_OdO: cute.Tensor,
-        mdQ_qdl: cute.Tensor,
-        cum_seqlen_q: Optional[cute.Tensor],
-        cum_seqlen_k: Optional[cute.Tensor],
+        mdPsum: cute.Tensor,
+        mdO: cute.Tensor,
+        mdQ: cute.Tensor,
+        mdQ_tma: cute.Tensor,
+        mCuSeqlensQ: Optional[cute.Tensor],
+        mCuSeqlensK: Optional[cute.Tensor],
+        tma_atom_Q: cute.CopyAtom,
+        tma_atom_K: cute.CopyAtom,
+        tma_atom_Kt: cute.CopyAtom,
+        tma_atom_V: cute.CopyAtom,
+        tma_atom_dO: cute.CopyAtom,
+        tma_atom_dQ: cute.CopyAtom,
+        sQ_layout: cute.ComposedLayout,
+        sK_layout: cute.ComposedLayout,
+        sKt_layout: cute.ComposedLayout,
+        sV_layout: cute.ComposedLayout,
+        sLSE_layout: cute.Layout,
+        sdPsum_layout: cute.Layout,
+        sdO_layout: cute.ComposedLayout,
+        tdS_layout: cute.ComposedLayout,
+        sdQ_epi_layout: cute.ComposedLayout,
+        tiled_mma_S: cute.TiledMma,
+        tiled_mma_dP: cute.TiledMma,
+        tiled_mma_dQ: cute.TiledMma,
+        tiled_copy_r2s_dQ: cute.TiledCopy,
         scale_softmax: Float32,
         window_size_left: Optional[Int32],
         window_size_right: Optional[Int32],
-        cluster_layout_vmnk: cute.Layout,
-        q_smem_layout_staged: cute.ComposedLayout,
-        k_smem_layout_staged: cute.ComposedLayout,
-        v_smem_layout_staged: cute.ComposedLayout,
-        do_smem_layout_staged: cute.ComposedLayout,
-        kt_smem_layout_staged: cute.ComposedLayout,
-        ds_tmem_layout_staged: cute.ComposedLayout,
-        sdQ_epi_layout: cute.ComposedLayout,
-        lse_smem_layout: cute.Layout,
-        sum_odo_smem_layout: cute.Layout,
-        tile_sched_params: FmhaStaticTileSchedulerParams | FmhaClcDynamicTileSchedulerParams,
+        tile_sched_params: SingleTileScheduler.Params
+        | SingleTileVarlenScheduler.Params
+        | SingleTileLPTBwdScheduler.Params,
     ):
-        # llvm.inline_asm(
-        #     None,
-        #     [],
-        #     '.pragma "global knob CommonIntoMultiBlockLoop=1";',
-        #     "",
-        #     has_side_effects=True,
-        #     is_align_stack=False,
-        #     asm_dialect=llvm.AsmDialect.AD_ATT,
-        # )
-
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-        #
-        # Prefetch tma desc
-        #
-        if warp_idx == self.load_warp_id:
-            cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_q)
-            cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_k)
-            cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_v)
-            cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_do)
-            cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_kt)
-            cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_dQ)
-
-        bidx, bidy, bidz = cute.arch.block_idx()
+        bidx, _, _ = cute.arch.block_idx()
         tidx, _, _ = cute.arch.thread_idx()
-        varlen = cum_seqlen_q is not None or cum_seqlen_k is not None
-        mma_tile_coord_v = bidx % cute.size(qk_tiled_mma.thr_id.shape)
+        mma_tile_coord_v = bidx % self.cta_group_size
+        is_leader_cta = mma_tile_coord_v == 0
         cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+
+        # Prefetch tma descriptor
+        if warp_idx == self.load_warp_id:
+            with cute.arch.elect_one():
+                cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_Q)
+                cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_K)
+                cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_V)
+                cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_dO)
+                cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_Kt)
+                cute.nvgpu.cpasync.prefetch_descriptor(tma_atom_dQ)
+
+        cluster_layout_vmnk = cute.tiled_divide(
+            cute.make_layout(self.cluster_shape_mnk),
+            (tiled_mma_S.thr_id.shape,),
+        )
         block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(cta_rank_in_cluster)
 
         # Alloc
-        smem = utils.SmemAllocator()
+        smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
+        clc = None
 
-        load_q_producer, load_q_consumer = pipeline.PipelineTmaUmma.create(
-            num_stages=self.q_stage,
-            producer_group=make_thread_cooperative_group(len([self.load_warp_id])),
-            consumer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
-            tx_count=self.tma_copy_q_bytes,
-            barrier_storage=storage.load_q_mbar_ptr.data_ptr(),
-            cta_layout_vmnk=cluster_layout_vmnk,
-            defer_sync=True,
-        ).make_participants()
-        load_k_producer, load_k_consumer = pipeline.PipelineTmaUmma.create(
-            num_stages=self.k_stage,
-            producer_group=make_thread_cooperative_group(len([self.load_warp_id])),
-            consumer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
-            tx_count=self.tma_copy_k_bytes,
-            barrier_storage=storage.load_k_mbar_ptr.data_ptr(),
-            cta_layout_vmnk=cluster_layout_vmnk,
-            defer_sync=True,
-        ).make_participants()
-        load_v_producer, load_v_consumer = pipeline.PipelineTmaUmma.create(
-            num_stages=self.v_stage,
-            producer_group=make_thread_cooperative_group(len([self.load_warp_id])),
-            consumer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
-            tx_count=self.tma_copy_v_bytes,
-            barrier_storage=storage.load_v_mbar_ptr.data_ptr(),
-            cta_layout_vmnk=cluster_layout_vmnk,
-            defer_sync=True,
-        ).make_participants()
-        load_do_producer, load_do_consumer = pipeline.PipelineTmaUmma.create(
-            num_stages=self.do_stage,
-            producer_group=make_thread_cooperative_group(len([self.load_warp_id])),
-            consumer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
-            tx_count=self.tma_copy_do_bytes,
-            barrier_storage=storage.load_do_mbar_ptr.data_ptr(),
-            cta_layout_vmnk=cluster_layout_vmnk,
-            defer_sync=True,
-        ).make_participants()
-        load_kt_producer, load_kt_consumer = pipeline.PipelineTmaUmma.create(
-            num_stages=self.kt_stage,
-            producer_group=make_thread_cooperative_group(len([self.load_warp_id])),
-            consumer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
-            tx_count=self.tma_copy_kt_bytes,
-            barrier_storage=storage.load_kt_mbar_ptr.data_ptr(),
-            cta_layout_vmnk=cluster_layout_vmnk,
-            defer_sync=True,
-        ).make_participants()
-        mma_s_producer, mma_s_consumer = pipeline.PipelineUmmaAsync.create(
-            num_stages=self.qk_acc_stage,
-            producer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
-            consumer_group=make_thread_cooperative_group(
-                len(self.compute_warp_ids) * self.threads_per_warp * self.cluster_shape_mnk[0],
-            ),
-            barrier_storage=storage.mma_s_mbar_ptr.data_ptr(),
-            cta_layout_vmnk=cluster_layout_vmnk,
-            defer_sync=True,
-        ).make_participants()
-        mma_dp_producer, mma_dp_consumer = pipeline.PipelineUmmaAsync.create(
-            num_stages=self.dov_acc_stage,
-            producer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
-            consumer_group=make_thread_cooperative_group(
-                len(self.compute_warp_ids) * self.threads_per_warp * self.cluster_shape_mnk[0],
-            ),
-            barrier_storage=storage.mma_dp_mbar_ptr.data_ptr(),
-            cta_layout_vmnk=cluster_layout_vmnk,
-            defer_sync=True,
-        ).make_participants()
-        ds_mma_producer, ds_mma_consumer = pipeline.PipelineAsyncUmma.create(
-            num_stages=self.dsk_acc_stage,
-            producer_group=make_thread_cooperative_group(
-                len(self.compute_warp_ids) * self.threads_per_warp * self.cluster_shape_mnk[0],
-            ),
-            consumer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
-            barrier_storage=storage.ds_mma_mbar_ptr.data_ptr(),
-            cta_layout_vmnk=cluster_layout_vmnk,
-            defer_sync=True,
-        ).make_participants()
-        mma_dq_producer, mma_dq_consumer = pipeline.PipelineUmmaAsync.create(
-            num_stages=self.epi_stage,
-            producer_group=make_thread_cooperative_group(len([self.mma_warp_id])),
-            consumer_group=make_thread_cooperative_group(
-                len(self.epilogue_warp_ids) * self.threads_per_warp * self.cluster_shape_mnk[0],
-            ),
-            barrier_storage=storage.mma_dq_mbar_ptr.data_ptr(),
-            cta_layout_vmnk=cluster_layout_vmnk,
-            defer_sync=True,
-        ).make_participants()
-
-        load_lse_producer, load_lse_consumer = pipeline.PipelineCpAsync.create(
-            num_stages=self.load_compute_LSE_stage,
-            producer_group=make_thread_cooperative_group(self.threads_per_warp),
-            consumer_group=make_thread_cooperative_group(
-                self.threads_per_warp * self.num_compute_warps
-            ),
-            barrier_storage=storage.lse_mbar_ptr.data_ptr(),
-        ).make_participants()
-        load_sum_odo_producer, load_sum_odo_consumer = pipeline.PipelineCpAsync.create(
-            num_stages=self.load_compute_sum_OdO_stage,
-            producer_group=make_thread_cooperative_group(self.threads_per_warp),
-            consumer_group=make_thread_cooperative_group(
-                self.threads_per_warp * self.num_compute_warps
-            ),
-            barrier_storage=storage.sum_odo_mbar_ptr.data_ptr(),
-        ).make_participants()
-
-        # Tensor memory dealloc barrier init
-        tmem = utils.TmemAllocator(
+        tmem = cutlass.utils.TmemAllocator(
             storage.tmem_holding_buf,
             barrier_for_retrieve=self.tmem_alloc_barrier,
-            allocator_warp_id=self.epilogue_warp_ids[0],
+            allocator_warp_id=self.mma_warp_id,
             is_two_cta=True,
             two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr,
         )
-        tmem.allocate(self.tmem_alloc_cols)
-        tmem.wait_for_alloc()
-        tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
 
-        # Initialize CLC state if using dynamic scheduler
-        if cutlass.const_expr(self.use_clc_scheduler):
-            clc_pipeline_producer_group = pipeline.CooperativeGroup(pipeline.Agent.Thread)
-            cluster_size = cute.size(self.cluster_shape_mnk)
-            num_clc_consumer_threads = self.threads_per_warp * (
-                1  # sched_warp (CTA 0 only)
-                + cluster_size
-                * (
-                    len(self.compute_warp_ids)
-                    + len(self.epilogue_warp_ids)
-                    + 1  # mma_warp
-                    + 1  # load_warp
-                )
-            )
-            clc_pipeline_consumer_group = pipeline.CooperativeGroup(
-                pipeline.Agent.Thread, num_clc_consumer_threads
-            )
-            clc_response_ptr = storage.clc_response.data_ptr()
-            clc = ClcState.create(
-                hw_scheduler=ClcDynamicPersistentTileScheduler.create(
-                    self.tile_sched_params.clc_hw_params(),
-                    cute.arch.block_idx(),
-                    cute.arch.grid_dim(),
-                    clc_response_ptr,
-                ),
-                pipeline=pipeline.PipelineClcFetchAsync.create(
-                    barrier_storage=storage.clc_mbar_ptr.data_ptr(),
-                    num_stages=self.num_clc_stage,
-                    producer_group=clc_pipeline_producer_group,
-                    consumer_group=clc_pipeline_consumer_group,
-                    tx_count=self.num_clc_response_bytes,
-                    cta_layout_vmnk=cluster_layout_vmnk,
-                    defer_sync=True,
-                ),
-                consumer_state=pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Consumer, self.num_clc_stage
-                ),
-                producer_state=pipeline.make_pipeline_state(
-                    pipeline.PipelineUserType.Producer, self.num_clc_stage
-                ),
-            )
-        else:
-            clc = None
-            clc_response_ptr = None
+        # UMMA producers and AsyncThread consumers
+        pipeline_producer_group_MMA_AsyncThread = cutlass.pipeline.CooperativeGroup(
+            cutlass.pipeline.Agent.Thread, len([self.mma_warp_id])
+        )
+        pipeline_consumer_group_MMA_AsyncThread = cutlass.pipeline.CooperativeGroup(
+            cutlass.pipeline.Agent.Thread,
+            len(self.compute_warp_ids) * self.threads_per_warp * self.cluster_shape_mnk[0],
+        )
+
+        pipeline_S_P = cutlass.pipeline.PipelineUmmaAsync.create(
+            num_stages=self.qk_acc_stage,
+            producer_group=pipeline_producer_group_MMA_AsyncThread,
+            consumer_group=pipeline_consumer_group_MMA_AsyncThread,
+            barrier_storage=storage.S_mbar_ptr.data_ptr(),
+            cta_layout_vmnk=cluster_layout_vmnk,
+            defer_sync=True,
+        )
+
+        pipeline_dP = cutlass.pipeline.PipelineUmmaAsync.create(
+            num_stages=self.dov_acc_stage,
+            producer_group=pipeline_producer_group_MMA_AsyncThread,
+            consumer_group=pipeline_consumer_group_MMA_AsyncThread,
+            barrier_storage=storage.dP_mbar_ptr.data_ptr(),
+            cta_layout_vmnk=cluster_layout_vmnk,
+            defer_sync=True,
+        )
+
+        pipeline_consumer_group_MMA_AsyncThread_dQ = cutlass.pipeline.CooperativeGroup(
+            cutlass.pipeline.Agent.Thread,
+            len(self.compute_warp_ids) * self.cluster_shape_mnk[0],
+        )
+
+        pipeline_dQ = cutlass.pipeline.PipelineUmmaAsync.create(
+            num_stages=self.epi_stage,
+            producer_group=pipeline_producer_group_MMA_AsyncThread,
+            consumer_group=pipeline_consumer_group_MMA_AsyncThread_dQ,
+            barrier_storage=storage.dQ_mbar_ptr.data_ptr(),
+            cta_layout_vmnk=cluster_layout_vmnk,
+            defer_sync=True,
+        )
+
+        # AsyncThread producers and UMMA consumers
+        # Only 1 thread per warp will signal
+        pipeline_PdS_producer_group = cutlass.pipeline.CooperativeGroup(
+            cutlass.pipeline.Agent.Thread,
+            len(self.compute_warp_ids) * self.threads_per_warp * self.cluster_shape_mnk[0],
+        )  # Compute
+        pipeline_PdS_consumer_group = cutlass.pipeline.CooperativeGroup(
+            cutlass.pipeline.Agent.Thread, len([self.mma_warp_id])
+        )  # MMA
+        pipeline_dS = cutlass.pipeline.PipelineAsyncUmma.create(
+            num_stages=self.dsk_acc_stage,
+            producer_group=pipeline_PdS_producer_group,
+            consumer_group=pipeline_PdS_consumer_group,
+            barrier_storage=storage.dS_mbar_ptr.data_ptr(),
+            cta_layout_vmnk=cluster_layout_vmnk,
+            defer_sync=True,
+        )
+
+        # TMA producer and UMMA consumers
+        pipeline_producer_group = cutlass.pipeline.CooperativeGroup(
+            cutlass.pipeline.Agent.Thread, len([self.load_warp_id])
+        )
+        # The arrive count is the number of mcast size
+        pipeline_consumer_group = cutlass.pipeline.CooperativeGroup(
+            cutlass.pipeline.Agent.Thread, len([self.mma_warp_id]) * self.num_mcast_ctas_b
+        )
+        pipeline_consumer_group_compute = cutlass.pipeline.CooperativeGroup(
+            cutlass.pipeline.Agent.Thread,
+            len(self.compute_warp_ids) * 1,
+        )
+        pipeline_LSE = cutlass.pipeline.PipelineTmaAsync.create(
+            barrier_storage=storage.LSE_mbar_ptr.data_ptr(),
+            num_stages=self.Q_stage,
+            producer_group=pipeline_producer_group,
+            consumer_group=pipeline_consumer_group_compute,
+            tx_count=self.tma_copy_bytes["LSE"],
+            defer_sync=True,
+        )
+        pipeline_dPsum = cutlass.pipeline.PipelineTmaAsync.create(
+            barrier_storage=storage.dPsum_mbar_ptr.data_ptr(),
+            num_stages=self.dO_stage,
+            producer_group=pipeline_producer_group,
+            consumer_group=pipeline_consumer_group_compute,
+            tx_count=self.tma_copy_bytes["dPsum"],
+            defer_sync=True,
+        )
+
+        pipeline_Q = pipeline.PipelineTmaUmma.create(
+            barrier_storage=storage.Q_mbar_ptr.data_ptr(),
+            num_stages=self.Q_stage,
+            producer_group=pipeline_producer_group,
+            consumer_group=pipeline_consumer_group,
+            tx_count=self.tma_copy_bytes["Q"],
+            cta_layout_vmnk=cluster_layout_vmnk,
+            defer_sync=True,
+        )
+
+        pipeline_K = pipeline.PipelineTmaUmma.create(
+            barrier_storage=storage.K_mbar_ptr.data_ptr(),
+            num_stages=self.k_stage,
+            producer_group=pipeline_producer_group,
+            consumer_group=pipeline_consumer_group,
+            tx_count=self.tma_copy_bytes["K"],
+            cta_layout_vmnk=cluster_layout_vmnk,
+            defer_sync=True,
+        )
+
+        pipeline_V = pipeline.PipelineTmaUmma.create(
+            barrier_storage=storage.V_mbar_ptr.data_ptr(),
+            num_stages=self.v_stage,
+            producer_group=pipeline_producer_group,
+            consumer_group=pipeline_consumer_group,
+            tx_count=self.tma_copy_bytes["V"],
+            cta_layout_vmnk=cluster_layout_vmnk,
+            defer_sync=True,
+        )
+
+        pipeline_Kt = pipeline.PipelineTmaUmma.create(
+            barrier_storage=storage.Kt_mbar_ptr.data_ptr(),
+            num_stages=self.single_stage,
+            producer_group=pipeline_producer_group,
+            consumer_group=pipeline_consumer_group,
+            tx_count=self.tma_copy_bytes["K"],
+            cta_layout_vmnk=cluster_layout_vmnk,
+            defer_sync=True,
+        )
+
+        pipeline_dO = pipeline.PipelineTmaUmma.create(
+            barrier_storage=storage.dO_mbar_ptr.data_ptr(),
+            num_stages=self.dO_stage,
+            producer_group=pipeline_producer_group,
+            consumer_group=pipeline_consumer_group,
+            tx_count=self.tma_copy_bytes["dO"],
+            cta_layout_vmnk=cluster_layout_vmnk,
+            defer_sync=False,
+        )
 
         # Cluster arrive after barrier init
-        pipeline.pipeline_init_arrive(cluster_shape_mn=cluster_layout_vmnk, is_relaxed=True)
+        cutlass.pipeline.pipeline_init_arrive(cluster_shape_mn=cluster_layout_vmnk, is_relaxed=True)
 
-        sQ = smem.allocate_tensor(
-            element_type=self.q_dtype,
-            layout=q_smem_layout_staged.outer,
-            swizzle=q_smem_layout_staged.inner,
-            byte_alignment=128,
+        sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner, dtype=self.q_dtype)
+        sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
+        sV = storage.sV.get_tensor(sV_layout.outer, swizzle=sV_layout.inner)
+        sdO = storage.sdO.get_tensor(
+            sdO_layout.outer, swizzle=sdO_layout.inner, dtype=self.do_dtype
         )
-        sK = smem.allocate_tensor(
-            element_type=self.k_dtype,
-            layout=k_smem_layout_staged.outer,
-            swizzle=k_smem_layout_staged.inner,
-            byte_alignment=128,
-        )
-        # K and V now use separate memory since we removed the transform stage
-        sV = smem.allocate_tensor(
-            element_type=self.v_dtype,
-            layout=v_smem_layout_staged.outer,
-            swizzle=v_smem_layout_staged.inner,
-            byte_alignment=128,
-        )
-        sdO = smem.allocate_tensor(
-            element_type=self.do_dtype,
-            layout=do_smem_layout_staged.outer,
-            swizzle=do_smem_layout_staged.inner,
-            byte_alignment=128,
-        )
-        sKT = smem.allocate_tensor(
-            element_type=self.k_dtype,
-            layout=kt_smem_layout_staged.outer,
-            swizzle=kt_smem_layout_staged.inner,
-            byte_alignment=128,
-        )
-        sLSE = smem.allocate_tensor(
-            element_type=self.acc_dtype,
-            layout=lse_smem_layout,
-            byte_alignment=128,
-        )
-        sSum_OdO = smem.allocate_tensor(
-            element_type=self.acc_dtype,
-            layout=sum_odo_smem_layout,
-            byte_alignment=128,
-        )
+        sKT = storage.sKt.get_tensor(sKt_layout.outer, swizzle=sKt_layout.inner)
+        sLSE = storage.sLSE.get_tensor(sLSE_layout)
+        sdPsum = storage.sdPsum.get_tensor(sdPsum_layout)
         # Alias the dQ TMA epilogue staging buffer onto sdO.  A standalone
         # (128, 64) bf16 allocation exceeds B200's per-block SMEM limit for
-        # this kernel, while sdO is no longer needed by the epilogue warp once
-        # the dQ accumulator is ready to store.
-        s_epi_dQ = cute.make_tensor(
+        # this kernel, while sdO is no longer needed once the dQ accumulator
+        # is ready to store.
+        sdQ = cute.make_tensor(
             cute.recast_ptr(sdO.iterator, sdQ_epi_layout.inner, self.dq_dtype),
             sdQ_epi_layout.outer,
         )
-        qk_thr_mma = qk_tiled_mma.get_slice(mma_tile_coord_v)  # default 1sm
-        dov_thr_mma = dov_tiled_mma.get_slice(mma_tile_coord_v)  # default 1sm
-        dsk_thr_mma = dsk_tiled_mma.get_slice(mma_tile_coord_v)  # default 1sm
-        tSrQ = qk_thr_mma.make_fragment_A(sQ)
-        tSrK = qk_thr_mma.make_fragment_B(sK)
-        tdPrdO = dov_thr_mma.make_fragment_A(sdO)
-        tdPrV = dov_thr_mma.make_fragment_B(sV)
-        tdQrKT = dsk_thr_mma.make_fragment_B(sKT)
-        qk_acc_shape = qk_thr_mma.partition_shape_C((self.qk_mma_tiler[0], self.qk_mma_tiler[1]))
-        tStS = qk_thr_mma.make_fragment_C(cute.append(qk_acc_shape, self.qk_acc_stage))
-        dov_acc_shape = dov_thr_mma.partition_shape_C(
+
+        # TMEM
+        # This is a fake tensor, by right need to retrieve tmem_ptr. But we know that we always
+        # request 512 columns of tmem, so we know that it starts at 0.
+        tmem_ptr = cute.make_ptr(Float32, 0, mem_space=cute.AddressSpace.tmem, assumed_align=16)
+
+        thr_mma_S = tiled_mma_S.get_slice(mma_tile_coord_v)  # default 1sm
+        thr_mma_dP = tiled_mma_dP.get_slice(mma_tile_coord_v)  # default 1sm
+        thr_mma_dQ = tiled_mma_dQ.get_slice(mma_tile_coord_v)  # default 1sm
+        qk_acc_shape = thr_mma_S.partition_shape_C((self.qk_mma_tiler[0], self.qk_mma_tiler[1]))
+        tStS = thr_mma_S.make_fragment_C(cute.append(qk_acc_shape, self.qk_acc_stage))
+        dov_acc_shape = thr_mma_dP.partition_shape_C(
             (self.dov_mma_tiler[0], self.dov_mma_tiler[1])
         )
-        tdPtdP = dov_thr_mma.make_fragment_C(cute.append(dov_acc_shape, self.dov_acc_stage))
-        dsk_acc_shape = dsk_thr_mma.partition_shape_C(
+        tdPtdP = thr_mma_dP.make_fragment_C(cute.append(dov_acc_shape, self.dov_acc_stage))
+        dsk_acc_shape = thr_mma_dQ.partition_shape_C(
             (self.dsk_mma_tiler[0], self.dsk_mma_tiler[1])
         )
-        tdQtdQ = dsk_thr_mma.make_fragment_C(dsk_acc_shape)
-        tdQtdQ_layout = cute.append(
-            tdQtdQ.layout,
-            cute.make_layout(
-                self.iterations_dsk,
-                stride=self.dsk_mma_tiler[1] // self.tmem_warp_shape_mn[1],
-            ),
-        )
-        tStS = cute.make_tensor(tStS.iterator + self.tmem_s_offset, tStS.layout)
+        tdQtdQ = thr_mma_dQ.make_fragment_C(dsk_acc_shape)
+        tStS = cute.make_tensor(tStS.iterator + self.tmem_s_offset[0], tStS.layout)
         tdPtdP = cute.make_tensor(tdPtdP.iterator + self.tmem_dp_offset, tdPtdP.layout)
-        tdQtdQ_staged = cute.make_tensor(tdQtdQ.iterator + self.tmem_dq_offset, tdQtdQ_layout)
+        tdQtdQ = cute.make_tensor(tdQtdQ.iterator + self.tmem_dq_offset, tdQtdQ.layout)
 
-        # ///////////////////////////////////////////////////////////////////////////////
+        block_info = BlockInfo(
+            self.qk_mma_tiler[0],
+            self.qk_mma_tiler[1],
+            self.is_causal,
+            self.is_local,
+            False,  # is_split_kv
+            window_size_left,
+            window_size_right,
+            qhead_per_kvhead_packgqa=1,
+        )
+
+        SeqlenInfoCls = partial(
+            SeqlenInfoQK.create,
+            seqlen_q_static=mQ.shape[0],
+            seqlen_k_static=mK.shape[0],
+            mCuSeqlensQ=mCuSeqlensQ,
+            mCuSeqlensK=mCuSeqlensK,
+            mSeqUsedQ=None,
+            mSeqUsedK=None,
+            tile_m=self.cta_tiler[0],
+            tile_n=self.cta_tiler[1],
+        )
+        TileSchedulerCls = partial(self.tile_scheduler_cls.create, tile_sched_params)
+
+        AttentionMaskCls = partial(
+            AttentionMask,
+            self.tile_m,
+            self.tile_n * self.cta_group_size,
+            swap_AB=True,
+            window_size_left=window_size_left,
+            window_size_right=window_size_right,
+        )
+
         #  EMPTY
-        # ///////////////////////////////////////////////////////////////////////////////
+        # (4, 5, 6, 7, 10, 11)
         for _i in cutlass.range_constexpr(len(self.empty_warp_id)):
             if warp_idx == self.empty_warp_id[_i]:
-                cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
-
-        if cutlass.const_expr(self.use_clc_scheduler):
-            tile_sched = FmhaClcDynamicTileScheduler.create(
-                tile_sched_params,
-                cute.arch.block_idx(),
-                cute.arch.grid_dim(),
-                clc_response_ptr,
-                clc,
-            )
-        else:
-            blk_idx = cute.arch.block_idx()
-            tile_sched = FmhaStaticTileScheduler(
-                tile_sched_params, blk_idx[0], blk_idx, cute.arch.grid_dim()
-            )
-        work_tile = tile_sched.initial_work_tile_info()
+                cute.arch.setmaxregister_decrease(self.num_regs_other)
 
         # Cluster wait
-        pipeline.pipeline_init_wait(cluster_shape_mn=cluster_layout_vmnk)
+        cutlass.pipeline.pipeline_init_wait(cluster_shape_mn=cluster_layout_vmnk)
 
-        # ///////////////////////////////////////////////////////////////////////////////
         #  LOAD
-        # ///////////////////////////////////////////////////////////////////////////////
+        # (9)
         if warp_idx == self.load_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
+            cute.arch.setmaxregister_decrease(self.num_regs_other)
+            self.load(
+                tiled_mma_S,
+                thr_mma_S,
+                thr_mma_dP,
+                thr_mma_dQ,
+                mQ,
+                mK,
+                mKt,
+                mV,
+                mdO,
+                mLSE,
+                mdPsum,
+                cluster_layout_vmnk,
+                block_info,
+                SeqlenInfoCls,
+                TileSchedulerCls,
+                sQ,
+                sK,
+                sKT,
+                sV,
+                sdO,
+                sLSE,
+                sdPsum,
+                tma_atom_Q,
+                tma_atom_K,
+                tma_atom_Kt,
+                tma_atom_V,
+                tma_atom_dO,
+                pipeline_Q,
+                pipeline_K,
+                pipeline_Kt,
+                pipeline_V,
+                pipeline_dO,
+                pipeline_LSE,
+                pipeline_dPsum,
+            )
 
-            while work_tile.is_valid_tile:
-                curr_block_coord = work_tile.tile_idx
-                mma_block_coord = (
-                    curr_block_coord[0] // cute.size(qk_tiled_mma.thr_id.shape),
-                    curr_block_coord[1],
-                    curr_block_coord[2],
-                )
-                continue_cond = False
-                batch_coord = curr_block_coord[2][1]
-                seqlen_q = mQ_qdl.shape[0]
-                seqlen_k = mK_kdl.shape[0]
-                cuseqlen_q = Int32(0)
-                cuseqlen_k = Int32(0)
-                block_offset = (
-                    Int32(0),
-                    Int32(0),
-                    Int32(0),
-                    ((Int32(0), Int32(0)), Int32(0)),
-                )
-                if cutlass.const_expr(cum_seqlen_q is not None):
-                    cuseqlen_q = cum_seqlen_q[batch_coord]
-                    seqlen_q = cum_seqlen_q[batch_coord + 1] - cuseqlen_q
-                    if cutlass.const_expr(cum_seqlen_k is not None):
-                        cuseqlen_k = cum_seqlen_k[batch_coord]
-                        seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
-                    block_offset = (
-                        cuseqlen_q,
-                        cuseqlen_k,
-                        Int32(0),
-                        ((Int32(0), Int32(0)), Int32(0)),
-                    )
-                    continue_cond = not FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
-                        self.qk_mma_tiler[0],
-                        mma_block_coord[0],
-                        seqlen_q,
-                    )
-                if not continue_cond:
-                    mQ_qdl_ = cute.domain_offset(cute.select(block_offset, mode=[0, 2, 3]), mQ_qdl)
-                    mK_kdl_ = cute.domain_offset(cute.select(block_offset, mode=[1, 2, 3]), mK_kdl)
-                    mdO_qdl_ = cute.domain_offset(
-                        cute.select(block_offset, mode=[0, 2, 3]), mdO_qdl
-                    )
-                    mV_dkl_ = cute.domain_offset(cute.select(block_offset, mode=[1, 2, 3]), mV_dkl)
-                    mK_dkl_ = cute.domain_offset(cute.select(block_offset, mode=[2, 1, 3]), mK_dkl)
-                    block_offset_stats = block_offset
-                    if cutlass.const_expr(cum_seqlen_q is not None):
-                        cuseqlen_q_stats = cute.assume(
-                            (cuseqlen_q + batch_coord * self.cta_tiler[0])
-                            // self.cta_tiler[0]
-                            * self.cta_tiler[0],
-                            divby=self.cta_tiler[0],
-                        )
-                        block_offset_stats = (
-                            cuseqlen_q_stats,
-                            block_offset[1],
-                            block_offset[2],
-                            block_offset[3],
-                        )
-                    LSE = cute.domain_offset(cute.select(block_offset_stats, mode=[0, 3]), mLSE)
-                    sum_OdO = cute.domain_offset(
-                        cute.select(block_offset_stats, mode=[0, 3]), mSum_OdO
-                    )
-
-                    # Local tile partition global tensors
-                    q_cta_layout = cute.make_layout(
-                        cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape
-                    )
-                    # (bM, bK, loopM, loopK, loopL)
-                    gQ_qdl = cute.flat_divide(mQ_qdl_, cute.select(self.qk_mma_tiler, mode=[0, 2]))
-                    tSgQ_qdl = qk_thr_mma.partition_A(gQ_qdl)
-                    tQsQ, tQgQ_qdl = cute.nvgpu.cpasync.tma_partition(
-                        tma_atom_q,
-                        block_in_cluster_coord_vmnk[2],
-                        q_cta_layout,
-                        cute.group_modes(sQ, 0, 3),
-                        cute.group_modes(tSgQ_qdl, 0, 3),
-                    )
-                    k_cta_layout = cute.make_layout(
-                        cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape
-                    )
-                    gK_kdl = cute.flat_divide(mK_kdl_, cute.select(self.qk_mma_tiler, mode=[1, 2]))
-                    tSgK_kdl = qk_thr_mma.partition_B(gK_kdl)
-                    tKsK, tKgK_kdl = cute.nvgpu.cpasync.tma_partition(
-                        tma_atom_k,
-                        block_in_cluster_coord_vmnk[1],
-                        k_cta_layout,
-                        cute.group_modes(sK, 0, 3),
-                        cute.group_modes(tSgK_kdl, 0, 3),
-                    )
-                    do_cta_layout = cute.make_layout(
-                        cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape
-                    )
-                    # (bM, bK, loopM, loopK, loopL)
-                    gdO_qdl = cute.flat_divide(
-                        mdO_qdl_, cute.select(self.dov_mma_tiler, mode=[0, 2])
-                    )
-                    tdPgdO_qdl = dov_thr_mma.partition_A(gdO_qdl)
-                    tdOsdO, tdOgdO_qdl = cute.nvgpu.cpasync.tma_partition(
-                        tma_atom_do,
-                        block_in_cluster_coord_vmnk[2],
-                        do_cta_layout,
-                        cute.group_modes(sdO, 0, 3),
-                        cute.group_modes(tdPgdO_qdl, 0, 3),
-                    )
-                    v_cta_layout = cute.make_layout(
-                        cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape
-                    )
-                    gV_dkl = cute.flat_divide(mV_dkl_, cute.select(self.dov_mma_tiler, mode=[1, 2]))
-                    tSgV_dkl = dov_thr_mma.partition_B(gV_dkl)
-                    tVsV, tVgV_dkl = cute.nvgpu.cpasync.tma_partition(
-                        tma_atom_v,
-                        block_in_cluster_coord_vmnk[1],
-                        v_cta_layout,
-                        cute.group_modes(sV, 0, 3),
-                        cute.group_modes(tSgV_dkl, 0, 3),
-                    )
-                    # kt layout
-                    kt_cta_layout = cute.make_layout(
-                        cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape
-                    )
-                    gK_dkl = cute.flat_divide(mK_dkl_, cute.select(self.dsk_mma_tiler, mode=[1, 2]))
-                    tdQgK_dkl = dsk_thr_mma.partition_B(gK_dkl)
-                    tKTsKT, tKgK_dkl = cute.nvgpu.cpasync.tma_partition(
-                        tma_atom_kt,
-                        block_in_cluster_coord_vmnk[1],
-                        kt_cta_layout,
-                        cute.group_modes(sKT, 0, 3),
-                        cute.group_modes(tdQgK_dkl, 0, 3),
-                    )
-                    # ((atom_v, rest_v), RestK)
-                    tQgQ = tQgQ_qdl[None, mma_block_coord[0], None, mma_block_coord[2]]
-                    # ((atom_v, rest_v), RestK)
-                    tdOgdO = tdOgdO_qdl[None, mma_block_coord[0], None, mma_block_coord[2]]
-                    # ((atom_v, rest_v), RestN, RestK)
-                    tKgK = tKgK_kdl[None, None, None, mma_block_coord[2]]
-                    # ((atom_v, rest_v), RestN, RestK)
-                    tVgV = tVgV_dkl[None, None, None, mma_block_coord[2]]
-                    # ((atom_v, rest_v), RestN, RestK)
-                    tKTgKT = tKgK_dkl[None, None, None, mma_block_coord[2]]
-
-                    seqlen_info = SeqlenInfoQK.create(
-                        batch_idx=batch_coord,
-                        seqlen_q_static=mQ_qdl.shape[0],
-                        seqlen_k_static=mK_kdl.shape[0],
-                        mCuSeqlensQ=cum_seqlen_q,
-                        mCuSeqlensK=cum_seqlen_k,
-                        mSeqUsedQ=None,
-                        mSeqUsedK=None,
-                        tile_m=self.qk_mma_tiler[0],
-                        tile_n=self.qk_mma_tiler[1],
-                    )
-                    block_info = BlockInfo(
-                        self.qk_mma_tiler[0],
-                        self.qk_mma_tiler[1],
-                        self.is_causal,
-                        self.is_local,
-                        window_size_left=window_size_left,
-                        window_size_right=window_size_right,
-                    )
-                    seqlen_kv_loop_start, seqlen_kv_loop_end = block_info.get_n_block_min_max(
-                        seqlen_info, mma_block_coord[0], Int32(0), Int32(1)
-                    )
-                    seqlen_kv_loop_steps = seqlen_kv_loop_end - seqlen_kv_loop_start
-                    # LSE
-                    lse_handle = load_lse_producer.acquire_and_advance()
-                    # 32 threads loading 128 values of 32b each
-                    # so 4*32b = 128b
-                    thread_idx = tidx % self.threads_per_warp
-                    async_copy_num_elts = sLSE.shape[0] // self.threads_per_warp
-                    atom_async_copy = cute.make_copy_atom(
-                        cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.ALWAYS),
-                        self.acc_dtype,
-                        num_bits_per_copy=self.acc_dtype.width,
-                    )
-                    sLSE_for_copy = cute.flat_divide(sLSE, (1,))
-                    LSE_for_copy = cute.flat_divide(LSE, (1,))
-                    for i in cutlass.range_constexpr(async_copy_num_elts):
-                        LSE_idx = (
-                            self.cta_tiler[0] * curr_block_coord[0]
-                            + thread_idx * async_copy_num_elts
-                        )
-                        # LSE/dPsum buffers are padded by preprocess. Copy padded rows too:
-                        # padded LSE is +inf, so invalid Q rows produce P = 0.
-                        cute.copy(
-                            atom_async_copy,
-                            LSE_for_copy[None, LSE_idx + i, curr_block_coord[2]],
-                            sLSE_for_copy[
-                                None,
-                                thread_idx * async_copy_num_elts + i,
-                                lse_handle.index,
-                            ],
-                        )
-                    lse_handle.commit()
-
-                    sum_odo_handle = load_sum_odo_producer.acquire_and_advance()
-                    sSum_OdO_for_copy = cute.flat_divide(sSum_OdO, (1,))
-                    sum_OdO_for_copy = cute.flat_divide(sum_OdO, (1,))
-                    for i in cutlass.range_constexpr(async_copy_num_elts):
-                        sum_OdO_idx = (
-                            self.cta_tiler[0] * curr_block_coord[0]
-                            + thread_idx * async_copy_num_elts
-                        )
-                        cute.copy(
-                            atom_async_copy,
-                            sum_OdO_for_copy[None, sum_OdO_idx + i, curr_block_coord[2]],
-                            sSum_OdO_for_copy[
-                                None,
-                                thread_idx * async_copy_num_elts + i,
-                                sum_odo_handle.index,
-                            ],
-                        )
-                    sum_odo_handle.commit()
-
-                    # Q
-                    for iter in cutlass.range(self.iterations_qk, unroll=1):
-                        q_handle = load_q_producer.acquire_and_advance()
-                        cute.copy(
-                            tma_atom_q,
-                            tQgQ[None, iter],
-                            tQsQ[None, q_handle.index],
-                            tma_bar_ptr=q_handle.barrier,
-                        )
-                    # dO
-                    for iter in cutlass.range(self.iterations_dov, unroll=1):
-                        do_handle = load_do_producer.acquire_and_advance()
-                        cute.copy(
-                            tma_atom_do,
-                            tdOgdO[None, iter],
-                            tdOsdO[None, do_handle.index],
-                            tma_bar_ptr=do_handle.barrier,
-                        )
-
-                    kv_coord = seqlen_kv_loop_start
-                    for i in cutlass.range(0, seqlen_kv_loop_steps, 1, unroll=1):
-                        # Ki
-                        for iter in cutlass.range(self.iterations_qk, unroll=1):
-                            k_handle = load_k_producer.acquire_and_advance()
-                            cute.copy(
-                                tma_atom_k,
-                                tKgK[None, kv_coord, iter],
-                                tKsK[None, k_handle.index],
-                                tma_bar_ptr=k_handle.barrier,
-                            )
-                        # Vi
-                        for iter in cutlass.range(self.iterations_dov, unroll=1):
-                            v_handle = load_v_producer.acquire_and_advance()
-                            cute.copy(
-                                tma_atom_v,
-                                tVgV[None, kv_coord, iter],
-                                tVsV[None, v_handle.index],
-                                tma_bar_ptr=v_handle.barrier,
-                            )
-                        # KTi
-                        for iter in cutlass.range(self.iterations_dsk, unroll=1):
-                            kt_handle = load_kt_producer.acquire_and_advance()
-                            cute.copy(
-                                tma_atom_kt,
-                                tKTgKT[None, iter, kv_coord],
-                                tKTsKT[None, kt_handle.index],
-                                tma_bar_ptr=kt_handle.barrier,
-                            )
-                        kv_coord += 1
-
-                work_tile = tile_sched.advance_to_next_work()
-                # End of persistent scheduler loop
-            load_k_producer.tail()
-            load_v_producer.tail()
-            load_kt_producer.tail()
-            load_q_producer.tail()
-            load_do_producer.tail()
-            load_lse_producer.tail()
-            load_sum_odo_producer.tail()
-
-        # ///////////////////////////////////////////////////////////////////////////////
         #  MMA
-        # ///////////////////////////////////////////////////////////////////////////////
+        # (8)
         if warp_idx == self.mma_warp_id:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
+            cute.arch.setmaxregister_decrease(self.num_regs_other)
 
-            while work_tile.is_valid_tile:
-                curr_block_coord = work_tile.tile_idx
-                mma_block_coord = (
-                    curr_block_coord[0] // cute.size(qk_tiled_mma.thr_id.shape),
-                    curr_block_coord[1],
-                    curr_block_coord[2],
-                )
-                continue_cond = False
-                seqlen_q = mQ_qdl.shape[0]
-                seqlen_k = mK_kdl.shape[0]
-                batch_coord = curr_block_coord[2][1]
-                if cutlass.const_expr(cum_seqlen_q is not None):
-                    cuseqlen_q = cum_seqlen_q[batch_coord]
-                    seqlen_q = cum_seqlen_q[batch_coord + 1] - cuseqlen_q
-                    continue_cond = not FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
-                        self.qk_mma_tiler[0],
-                        mma_block_coord[0],
-                        seqlen_q,
-                    )
+            # Alloc tmem buffer
+            tmem.allocate(self.tmem_alloc_cols)
+            tmem.wait_for_alloc()
+            tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
 
-                if not continue_cond:
-                    if cutlass.const_expr(cum_seqlen_k is not None):
-                        cuseqlen_k = cum_seqlen_k[batch_coord]
-                        seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
+            self.mma(
+                tiled_mma_S,
+                tiled_mma_dP,
+                tiled_mma_dQ,
+                sQ,
+                sK,
+                sKT,
+                sV,
+                sdO,
+                tStS,
+                tdPtdP,
+                tdQtdQ,
+                tdS_layout,
+                pipeline_Q,
+                pipeline_K,
+                pipeline_V,
+                pipeline_dO,
+                pipeline_Kt,
+                pipeline_S_P,
+                pipeline_dP,
+                pipeline_dS,
+                pipeline_dQ,
+                block_info,
+                SeqlenInfoCls,
+                TileSchedulerCls,
+            )
+            # Dealloc the tensor memory buffer
+            tmem.relinquish_alloc_permit()
+            self.tmem_alloc_barrier.arrive_and_wait()
+            tmem.free(tmem_ptr)
 
-                    seqlen_info = SeqlenInfoQK.create(
-                        batch_idx=batch_coord,
-                        seqlen_q_static=mQ_qdl.shape[0],
-                        seqlen_k_static=mK_kdl.shape[0],
-                        mCuSeqlensQ=cum_seqlen_q,
-                        mCuSeqlensK=cum_seqlen_k,
-                        mSeqUsedQ=None,
-                        mSeqUsedK=None,
-                        tile_m=self.qk_mma_tiler[0],
-                        tile_n=self.qk_mma_tiler[1],
-                    )
-                    block_info = BlockInfo(
-                        self.qk_mma_tiler[0],
-                        self.qk_mma_tiler[1],
-                        self.is_causal,
-                        self.is_local,
-                        window_size_left=window_size_left,
-                        window_size_right=window_size_right,
-                    )
-                    seqlen_kv_loop_start, seqlen_kv_loop_end = block_info.get_n_block_min_max(
-                        seqlen_info, mma_block_coord[0], Int32(0), Int32(1)
-                    )
-                    seqlen_kv_loop_steps = seqlen_kv_loop_end - seqlen_kv_loop_start
-
-                    cta_rank_in_cluster = cute.arch.make_warp_uniform(
-                        cute.arch.block_idx_in_cluster()
-                    )
-                    is_leader_cta = cta_rank_in_cluster % 2 == 0
-                    # dq_handle = mma_dq_producer.acquire_and_advance()
-                    load_q_releaser = load_q_consumer.clone()
-                    load_do_releaser = load_do_consumer.clone()
-                    dsk_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
-
-                    num_innerloop = 8
-
-                    if is_leader_cta:
-                        dq_handle = mma_dq_producer.acquire_and_advance()
-                        if seqlen_kv_loop_steps > 1:
-                            # QK0
-                            s_handle = mma_s_producer.acquire_and_advance()
-                            tStS_slice = tStS[None, None, None, s_handle.index]
-                            qk_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
-                            for iter in cutlass.range(self.iterations_qk, unroll=1):
-                                load_q_consumer.wait_and_advance()
-                                tSrQ_slice = tSrQ[None, None, None, iter]
-
-                                k_handle = load_k_consumer.wait_and_advance()
-                                tSrK_trans_slice = tSrK[None, None, None, k_handle.index]
-                                num_kphases = cute.size(tSrQ_slice, mode=[2])
-                                if cutlass.const_expr(num_kphases % num_innerloop == 0):
-                                    num_outer_iter = num_kphases // num_innerloop
-                                    for outer_iter in cutlass.range(num_outer_iter, unroll=1):
-                                        for kphase_idx in cutlass.range(
-                                            num_innerloop, unroll_full=True
-                                        ):
-                                            kphase_coord = (
-                                                None,
-                                                None,
-                                                outer_iter * num_innerloop + kphase_idx,
-                                            )
-                                            cute.gemm(
-                                                qk_tiled_mma,
-                                                tStS_slice,
-                                                tSrQ_slice[kphase_coord],
-                                                tSrK_trans_slice[kphase_coord],
-                                                tStS_slice,
-                                            )
-                                            qk_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
-                                else:
-                                    for kphase_idx in cutlass.range(num_kphases, unroll_full=True):
-                                        kphase_coord = (None, None, kphase_idx)
-                                        cute.gemm(
-                                            qk_tiled_mma,
-                                            tStS_slice,
-                                            tSrQ_slice[kphase_coord],
-                                            tSrK_trans_slice[kphase_coord],
-                                            tStS_slice,
-                                        )
-                                        qk_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
-                                k_handle.release()
-                            cute.arch.fence_view_async_tmem_store()
-                            s_handle.commit()
-
-                            # dOV0
-                            dp_handle = mma_dp_producer.acquire_and_advance()
-                            tdPtdP_slice = tdPtdP[None, None, None, dp_handle.index]
-                            dov_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
-                            for iter in cutlass.range(self.iterations_dov, unroll=1):
-                                load_do_consumer.wait_and_advance()
-                                tdPrdO_slice = tdPrdO[None, None, None, iter]
-                                v_handle = load_v_consumer.wait_and_advance()
-                                tdPrV_trans_slice = tdPrV[None, None, None, v_handle.index]
-                                num_kphases = cute.size(tdPrdO_slice, mode=[2])
-                                if cutlass.const_expr(num_kphases % num_innerloop == 0):
-                                    num_outer_iter = num_kphases // num_innerloop
-                                    for outer_iter in cutlass.range(num_outer_iter, unroll=1):
-                                        for kphase_idx in cutlass.range(
-                                            num_innerloop, unroll_full=True
-                                        ):
-                                            kphase_coord = (
-                                                None,
-                                                None,
-                                                outer_iter * num_innerloop + kphase_idx,
-                                            )
-                                            cute.gemm(
-                                                dov_tiled_mma,
-                                                tdPtdP_slice,
-                                                tdPrdO_slice[kphase_coord],
-                                                tdPrV_trans_slice[kphase_coord],
-                                                tdPtdP_slice,
-                                            )
-                                            dov_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
-                                else:
-                                    for kphase_idx in cutlass.range(num_kphases, unroll_full=True):
-                                        kphase_coord = (None, None, kphase_idx)
-                                        cute.gemm(
-                                            dov_tiled_mma,
-                                            tdPtdP_slice,
-                                            tdPrdO_slice[kphase_coord],
-                                            tdPrV_trans_slice[kphase_coord],
-                                            tdPtdP_slice,
-                                        )
-                                        dov_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
-                                v_handle.release()
-                            cute.arch.fence_view_async_tmem_store()
-                            dp_handle.commit()
-
-                            for i in cutlass.range(1, seqlen_kv_loop_steps - 1, 1, unroll=1):
-                                # QKi
-                                s_handle = mma_s_producer.acquire_and_advance()
-
-                                tStS_slice = tStS[None, None, None, s_handle.index]
-                                qk_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
-                                for iter in cutlass.range(self.iterations_qk, unroll=1):
-                                    tSrQ_slice = tSrQ[None, None, None, iter]
-                                    k_handle = load_k_consumer.wait_and_advance()
-                                    tSrK_trans_slice = tSrK[None, None, None, k_handle.index]
-                                    num_kphases = cute.size(tSrQ_slice, mode=[2])
-                                    if cutlass.const_expr(num_kphases % num_innerloop == 0):
-                                        num_outer_iter = num_kphases // num_innerloop
-                                        for outer_iter in cutlass.range(num_outer_iter, unroll=1):
-                                            for kphase_idx in cutlass.range(
-                                                num_innerloop, unroll_full=True
-                                            ):
-                                                kphase_coord = (
-                                                    None,
-                                                    None,
-                                                    outer_iter * num_innerloop + kphase_idx,
-                                                )
-                                                cute.gemm(
-                                                    qk_tiled_mma,
-                                                    tStS_slice,
-                                                    tSrQ_slice[kphase_coord],
-                                                    tSrK_trans_slice[kphase_coord],
-                                                    tStS_slice,
-                                                )
-                                                qk_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
-                                    else:
-                                        for kphase_idx in cutlass.range(
-                                            num_kphases, unroll_full=True
-                                        ):
-                                            kphase_coord = (None, None, kphase_idx)
-                                            cute.gemm(
-                                                qk_tiled_mma,
-                                                tStS_slice,
-                                                tSrQ_slice[kphase_coord],
-                                                tSrK_trans_slice[kphase_coord],
-                                                tStS_slice,
-                                            )
-                                            qk_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
-                                    k_handle.release()
-                                s_handle.commit()
-
-                                # dSKTi
-                                ds_handle = ds_mma_consumer.wait_and_advance()
-                                dsk_whether_acc = dsk_tiled_mma.get(tcgen05.Field.ACCUMULATE)
-                                for iter in cutlass.range(self.iterations_dsk, unroll=1):
-                                    kt_handle = load_kt_consumer.wait_and_advance()
-                                    dsk_tiled_mma.set(tcgen05.Field.ACCUMULATE, dsk_whether_acc)
-                                    tdQtdQ_slice = tdQtdQ_staged[None, None, None, iter]
-                                    tdStdS_slice = tdPtdP[None, None, None, ds_handle.index]
-                                    tdS = cute.make_tensor(
-                                        tdStdS_slice.iterator, ds_tmem_layout_staged.outer
-                                    )
-                                    tdQrdS = dsk_thr_mma.make_fragment_A(tdS)
-                                    tdQrdS_slice = cute.make_tensor(
-                                        cute.recast_ptr(tdStdS_slice.iterator, dtype=self.q_dtype),
-                                        tdQrdS.layout,
-                                    )
-
-                                    tdQrKT_slice = tdQrKT[None, None, None, kt_handle.index]
-                                    num_kphases = cute.size(tdQrKT_slice, mode=[2])
-                                    if cutlass.const_expr(num_kphases % num_innerloop == 0):
-                                        num_outer_iter = num_kphases // num_innerloop
-                                        for outer_iter in cutlass.range(num_outer_iter, unroll=1):
-                                            for kphase_idx in cutlass.range(
-                                                num_innerloop, unroll_full=True
-                                            ):
-                                                kphase_coord = (
-                                                    None,
-                                                    None,
-                                                    outer_iter * num_innerloop + kphase_idx,
-                                                )
-                                                cute.gemm(
-                                                    dsk_tiled_mma,
-                                                    tdQtdQ_slice,
-                                                    tdQrdS_slice[kphase_coord],
-                                                    tdQrKT_slice[kphase_coord],
-                                                    tdQtdQ_slice,
-                                                )
-                                                dsk_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
-                                    else:
-                                        for kphase_idx in cutlass.range(
-                                            num_kphases, unroll_full=True
-                                        ):
-                                            kphase_coord = (None, None, kphase_idx)
-                                            cute.gemm(
-                                                dsk_tiled_mma,
-                                                tdQtdQ_slice,
-                                                tdQrdS_slice[kphase_coord],
-                                                tdQrKT_slice[kphase_coord],
-                                                tdQtdQ_slice,
-                                            )
-                                            dsk_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
-                                    kt_handle.release()
-                                ds_handle.release()
-
-                                # dOVi
-                                dp_handle = mma_dp_producer.acquire_and_advance()
-                                tdPtdP_slice = tdPtdP[None, None, None, dp_handle.index]
-                                dov_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
-                                for iter in cutlass.range(self.iterations_dov, unroll=1):
-                                    tdPrdO_slice = tdPrdO[None, None, None, iter]
-                                    v_handle = load_v_consumer.wait_and_advance()
-                                    tdPrV_trans_slice = tdPrV[None, None, None, v_handle.index]
-                                    num_kphases = cute.size(tdPrdO_slice, mode=[2])
-                                    if cutlass.const_expr(num_kphases % num_innerloop == 0):
-                                        num_outer_iter = num_kphases // num_innerloop
-                                        for outer_iter in cutlass.range(num_outer_iter, unroll=1):
-                                            for kphase_idx in cutlass.range(
-                                                num_innerloop, unroll_full=True
-                                            ):
-                                                kphase_coord = (
-                                                    None,
-                                                    None,
-                                                    outer_iter * num_innerloop + kphase_idx,
-                                                )
-                                                cute.gemm(
-                                                    dov_tiled_mma,
-                                                    tdPtdP_slice,
-                                                    tdPrdO_slice[kphase_coord],
-                                                    tdPrV_trans_slice[kphase_coord],
-                                                    tdPtdP_slice,
-                                                )
-                                                dov_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
-                                    else:
-                                        for kphase_idx in cutlass.range(
-                                            num_kphases, unroll_full=True
-                                        ):
-                                            kphase_coord = (None, None, kphase_idx)
-                                            cute.gemm(
-                                                dov_tiled_mma,
-                                                tdPtdP_slice,
-                                                tdPrdO_slice[kphase_coord],
-                                                tdPrV_trans_slice[kphase_coord],
-                                                tdPtdP_slice,
-                                            )
-                                            dov_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
-                                    v_handle.release()
-                                dp_handle.commit()
-
-                            # QKend
-                            s_handle = mma_s_producer.acquire_and_advance()
-                            tStS_slice = tStS[None, None, None, s_handle.index]
-                            qk_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
-                            for iter in cutlass.range(self.iterations_qk, unroll=1):
-                                tSrQ_slice = tSrQ[None, None, None, iter]
-                                k_handle = load_k_consumer.wait_and_advance()
-
-                                tSrK_trans_slice = tSrK[None, None, None, k_handle.index]
-
-                                num_kphases = cute.size(tSrQ_slice, mode=[2])
-                                if cutlass.const_expr(num_kphases % num_innerloop == 0):
-                                    num_outer_iter = num_kphases // num_innerloop
-                                    for outer_iter in cutlass.range(num_outer_iter, unroll=1):
-                                        for kphase_idx in cutlass.range(
-                                            num_innerloop, unroll_full=True
-                                        ):
-                                            kphase_coord = (
-                                                None,
-                                                None,
-                                                outer_iter * num_innerloop + kphase_idx,
-                                            )
-                                            cute.gemm(
-                                                qk_tiled_mma,
-                                                tStS_slice,
-                                                tSrQ_slice[kphase_coord],
-                                                tSrK_trans_slice[kphase_coord],
-                                                tStS_slice,
-                                            )
-                                            qk_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
-                                else:
-                                    for kphase_idx in cutlass.range(num_kphases, unroll_full=True):
-                                        kphase_coord = (None, None, kphase_idx)
-                                        cute.gemm(
-                                            qk_tiled_mma,
-                                            tStS_slice,
-                                            tSrQ_slice[kphase_coord],
-                                            tSrK_trans_slice[kphase_coord],
-                                            tStS_slice,
-                                        )
-                                        qk_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
-                                k_handle.release()
-                                load_q_releaser.release()
-                                load_q_releaser.advance()
-                            s_handle.commit()
-
-                            # dSKTend - 1
-                            ds_handle = ds_mma_consumer.wait_and_advance()
-                            dsk_whether_acc = dsk_tiled_mma.get(tcgen05.Field.ACCUMULATE)
-                            for iter in cutlass.range(self.iterations_dsk, unroll=1):
-                                kt_handle = load_kt_consumer.wait_and_advance()
-                                dsk_tiled_mma.set(tcgen05.Field.ACCUMULATE, dsk_whether_acc)
-                                tdQtdQ_slice = tdQtdQ_staged[None, None, None, iter]
-                                tdStdS_slice = tdPtdP[None, None, None, ds_handle.index]
-                                tdS = cute.make_tensor(
-                                    tdStdS_slice.iterator, ds_tmem_layout_staged.outer
-                                )
-                                tdQrdS = dsk_thr_mma.make_fragment_A(tdS)
-                                tdQrdS_slice = cute.make_tensor(
-                                    cute.recast_ptr(tdStdS_slice.iterator, dtype=self.q_dtype),
-                                    tdQrdS.layout,
-                                )
-
-                                tdQrKT_slice = tdQrKT[None, None, None, kt_handle.index]
-                                num_kphases = cute.size(tdQrKT_slice, mode=[2])
-                                if cutlass.const_expr(num_kphases % num_innerloop == 0):
-                                    num_outer_iter = num_kphases // num_innerloop
-                                    for outer_iter in cutlass.range(num_outer_iter, unroll=1):
-                                        for kphase_idx in cutlass.range(
-                                            num_innerloop, unroll_full=True
-                                        ):
-                                            kphase_coord = (
-                                                None,
-                                                None,
-                                                outer_iter * num_innerloop + kphase_idx,
-                                            )
-                                            cute.gemm(
-                                                dsk_tiled_mma,
-                                                tdQtdQ_slice,
-                                                tdQrdS_slice[kphase_coord],
-                                                tdQrKT_slice[kphase_coord],
-                                                tdQtdQ_slice,
-                                            )
-                                            dsk_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
-                                else:
-                                    for kphase_idx in cutlass.range(num_kphases, unroll_full=True):
-                                        kphase_coord = (None, None, kphase_idx)
-                                        cute.gemm(
-                                            dsk_tiled_mma,
-                                            tdQtdQ_slice,
-                                            tdQrdS_slice[kphase_coord],
-                                            tdQrKT_slice[kphase_coord],
-                                            tdQtdQ_slice,
-                                        )
-                                        dsk_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
-                                kt_handle.release()
-                            ds_handle.release()
-
-                            # dOVend
-                            dp_handle = mma_dp_producer.acquire_and_advance()
-                            tdPtdP_slice = tdPtdP[None, None, None, dp_handle.index]
-                            dov_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
-                            for iter in cutlass.range(self.iterations_dov, unroll=1):
-                                tdPrdO_slice = tdPrdO[None, None, None, iter]
-                                v_handle = load_v_consumer.wait_and_advance()
-                                tdPrV_trans_slice = tdPrV[None, None, None, v_handle.index]
-                                num_kphases = cute.size(tdPrdO_slice, mode=[2])
-                                if cutlass.const_expr(num_kphases % num_innerloop == 0):
-                                    num_outer_iter = num_kphases // num_innerloop
-                                    for outer_iter in cutlass.range(num_outer_iter, unroll=1):
-                                        for kphase_idx in cutlass.range(
-                                            num_innerloop, unroll_full=True
-                                        ):
-                                            kphase_coord = (
-                                                None,
-                                                None,
-                                                outer_iter * num_innerloop + kphase_idx,
-                                            )
-                                            cute.gemm(
-                                                dov_tiled_mma,
-                                                tdPtdP_slice,
-                                                tdPrdO_slice[kphase_coord],
-                                                tdPrV_trans_slice[kphase_coord],
-                                                tdPtdP_slice,
-                                            )
-                                            dov_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
-                                else:
-                                    for kphase_idx in cutlass.range(num_kphases, unroll_full=True):
-                                        kphase_coord = (None, None, kphase_idx)
-                                        cute.gemm(
-                                            dov_tiled_mma,
-                                            tdPtdP_slice,
-                                            tdPrdO_slice[kphase_coord],
-                                            tdPrV_trans_slice[kphase_coord],
-                                            tdPtdP_slice,
-                                        )
-                                        dov_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
-                                v_handle.release()
-                                load_do_releaser.release()
-                                load_do_releaser.advance()
-                            dp_handle.commit()
-                            # dSKTend
-                            ds_handle = ds_mma_consumer.wait_and_advance()
-                            dsk_whether_acc = dsk_tiled_mma.get(tcgen05.Field.ACCUMULATE)
-                            for iter in cutlass.range(self.iterations_dsk, unroll=1):
-                                kt_handle = load_kt_consumer.wait_and_advance()
-                                dsk_tiled_mma.set(tcgen05.Field.ACCUMULATE, dsk_whether_acc)
-                                tdQtdQ_slice = tdQtdQ_staged[None, None, None, iter]
-                                tdStdS_slice = tdPtdP[None, None, None, ds_handle.index]
-                                tdS = cute.make_tensor(
-                                    tdStdS_slice.iterator, ds_tmem_layout_staged.outer
-                                )
-                                tdQrdS = dsk_thr_mma.make_fragment_A(tdS)
-                                tdQrdS_slice = cute.make_tensor(
-                                    cute.recast_ptr(tdStdS_slice.iterator, dtype=self.q_dtype),
-                                    tdQrdS.layout,
-                                )
-
-                                tdQrKT_slice = tdQrKT[None, None, None, kt_handle.index]
-                                num_kphases = cute.size(tdQrKT_slice, mode=[2])
-                                if cutlass.const_expr(num_kphases % num_innerloop == 0):
-                                    num_outer_iter = num_kphases // num_innerloop
-                                    for outer_iter in cutlass.range(num_outer_iter, unroll=1):
-                                        for kphase_idx in cutlass.range(
-                                            num_innerloop, unroll_full=True
-                                        ):
-                                            kphase_coord = (
-                                                None,
-                                                None,
-                                                outer_iter * num_innerloop + kphase_idx,
-                                            )
-                                            cute.gemm(
-                                                dsk_tiled_mma,
-                                                tdQtdQ_slice,
-                                                tdQrdS_slice[kphase_coord],
-                                                tdQrKT_slice[kphase_coord],
-                                                tdQtdQ_slice,
-                                            )
-                                            dsk_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
-                                else:
-                                    for kphase_idx in cutlass.range(num_kphases, unroll_full=True):
-                                        kphase_coord = (None, None, kphase_idx)
-                                        cute.gemm(
-                                            dsk_tiled_mma,
-                                            tdQtdQ_slice,
-                                            tdQrdS_slice[kphase_coord],
-                                            tdQrKT_slice[kphase_coord],
-                                            tdQtdQ_slice,
-                                        )
-                                        dsk_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
-                                kt_handle.release()
-                            ds_handle.release()
-                        else:
-                            # QK0
-                            s_handle = mma_s_producer.acquire_and_advance()
-                            tStS_slice = tStS[None, None, None, s_handle.index]
-                            qk_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
-
-                            for iter in cutlass.range(self.iterations_qk, unroll=1):
-                                load_q_consumer.wait_and_advance()
-                                tSrQ_slice = tSrQ[None, None, None, iter]
-                                k_handle = load_k_consumer.wait_and_advance()
-                                tSrK_trans_slice = tSrK[None, None, None, k_handle.index]
-                                num_kphases = cute.size(tSrQ_slice, mode=[2])
-                                if cutlass.const_expr(num_kphases % num_innerloop == 0):
-                                    num_outer_iter = num_kphases // num_innerloop
-                                    for outer_iter in cutlass.range(num_outer_iter, unroll=1):
-                                        for kphase_idx in cutlass.range(
-                                            num_innerloop, unroll_full=True
-                                        ):
-                                            kphase_coord = (
-                                                None,
-                                                None,
-                                                outer_iter * num_innerloop + kphase_idx,
-                                            )
-                                            cute.gemm(
-                                                qk_tiled_mma,
-                                                tStS_slice,
-                                                tSrQ_slice[kphase_coord],
-                                                tSrK_trans_slice[kphase_coord],
-                                                tStS_slice,
-                                            )
-                                            qk_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
-                                else:
-                                    for kphase_idx in cutlass.range(num_kphases, unroll_full=True):
-                                        kphase_coord = (None, None, kphase_idx)
-                                        cute.gemm(
-                                            qk_tiled_mma,
-                                            tStS_slice,
-                                            tSrQ_slice[kphase_coord],
-                                            tSrK_trans_slice[kphase_coord],
-                                            tStS_slice,
-                                        )
-                                        qk_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
-                                k_handle.release()
-                                load_q_releaser.release()
-                                load_q_releaser.advance()
-                            s_handle.commit()
-
-                            # dOV0
-                            dp_handle = mma_dp_producer.acquire_and_advance()
-                            tdPtdP_slice = tdPtdP[None, None, None, dp_handle.index]
-                            dov_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
-                            for iter in cutlass.range(self.iterations_dov, unroll=1):
-                                load_do_consumer.wait_and_advance()
-                                tdPrdO_slice = tdPrdO[None, None, None, iter]
-                                v_handle = load_v_consumer.wait_and_advance()
-                                tdPrV_trans_slice = tdPrV[None, None, None, v_handle.index]
-                                num_kphases = cute.size(tdPrdO_slice, mode=[2])
-                                if cutlass.const_expr(num_kphases % num_innerloop == 0):
-                                    num_outer_iter = num_kphases // num_innerloop
-                                    for outer_iter in cutlass.range(num_outer_iter, unroll=1):
-                                        for kphase_idx in cutlass.range(
-                                            num_innerloop, unroll_full=True
-                                        ):
-                                            kphase_coord = (
-                                                None,
-                                                None,
-                                                outer_iter * num_innerloop + kphase_idx,
-                                            )
-                                            cute.gemm(
-                                                dov_tiled_mma,
-                                                tdPtdP_slice,
-                                                tdPrdO_slice[kphase_coord],
-                                                tdPrV_trans_slice[kphase_coord],
-                                                tdPtdP_slice,
-                                            )
-                                            dov_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
-                                else:
-                                    for kphase_idx in cutlass.range(num_kphases, unroll_full=True):
-                                        kphase_coord = (None, None, kphase_idx)
-                                        cute.gemm(
-                                            dov_tiled_mma,
-                                            tdPtdP_slice,
-                                            tdPrdO_slice[kphase_coord],
-                                            tdPrV_trans_slice[kphase_coord],
-                                            tdPtdP_slice,
-                                        )
-                                        dov_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
-                                v_handle.release()
-                                load_do_releaser.release()
-                                load_do_releaser.advance()
-                            dp_handle.commit()
-
-                            # dSKT0
-                            ds_handle = ds_mma_consumer.wait_and_advance()
-                            dsk_whether_acc = dsk_tiled_mma.get(tcgen05.Field.ACCUMULATE)
-                            for iter in cutlass.range(self.iterations_dsk, unroll=1):
-                                kt_handle = load_kt_consumer.wait_and_advance()
-                                dsk_tiled_mma.set(tcgen05.Field.ACCUMULATE, dsk_whether_acc)
-                                tdQtdQ_slice = tdQtdQ_staged[None, None, None, iter]
-                                tdStdS_slice = tdPtdP[None, None, None, ds_handle.index]
-                                tdS = cute.make_tensor(
-                                    tdStdS_slice.iterator, ds_tmem_layout_staged.outer
-                                )
-                                tdQrdS = dsk_thr_mma.make_fragment_A(tdS)
-                                tdQrdS_slice = cute.make_tensor(
-                                    cute.recast_ptr(tdStdS_slice.iterator, dtype=self.q_dtype),
-                                    tdQrdS.layout,
-                                )
-
-                                tdQrKT_slice = tdQrKT[None, None, None, kt_handle.index]
-                                num_kphases = cute.size(tdQrKT_slice, mode=[2])
-                                if cutlass.const_expr(num_kphases % num_innerloop == 0):
-                                    num_outer_iter = num_kphases // num_innerloop
-                                    for outer_iter in cutlass.range(num_outer_iter, unroll=1):
-                                        for kphase_idx in cutlass.range(
-                                            num_innerloop, unroll_full=True
-                                        ):
-                                            kphase_coord = (
-                                                None,
-                                                None,
-                                                outer_iter * num_innerloop + kphase_idx,
-                                            )
-                                            cute.gemm(
-                                                dsk_tiled_mma,
-                                                tdQtdQ_slice,
-                                                tdQrdS_slice[kphase_coord],
-                                                tdQrKT_slice[kphase_coord],
-                                                tdQtdQ_slice,
-                                            )
-                                            dsk_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
-                                else:
-                                    for kphase_idx in cutlass.range(num_kphases, unroll_full=True):
-                                        kphase_coord = (None, None, kphase_idx)
-                                        cute.gemm(
-                                            dsk_tiled_mma,
-                                            tdQtdQ_slice,
-                                            tdQrdS_slice[kphase_coord],
-                                            tdQrKT_slice[kphase_coord],
-                                            tdQtdQ_slice,
-                                        )
-                                        dsk_tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
-                                kt_handle.release()
-                            ds_handle.release()
-                        dq_handle.commit()
-                work_tile = tile_sched.advance_to_next_work()
-            # End of persistent scheduler loop
-            mma_s_producer.tail()
-            mma_dp_producer.tail()
-            mma_dq_producer.tail()
-
-        # Softmax and dSoftmax warp
+        # Compute
+        # (0, 1, 2, 3) --> 4 warps
         if warp_idx >= self.compute_warp_ids[0] and warp_idx <= self.compute_warp_ids[-1]:
-            # increase register after decreasing
-            cute.arch.warpgroup_reg_alloc(self.num_regs_compute)
-            while work_tile.is_valid_tile:
-                curr_block_coord = work_tile.tile_idx
-                mma_block_coord = (
-                    curr_block_coord[0] // cute.size(qk_tiled_mma.thr_id.shape),
-                    curr_block_coord[1],
-                    curr_block_coord[2],
-                )
-                batch_coord = curr_block_coord[2][1]
-                continue_cond = False
-                seqlen_q = mQ_qdl.shape[0]
-                seqlen_k = mK_kdl.shape[0]
-                cuseqlen_q = Int32(0)
-                if cutlass.const_expr(cum_seqlen_q is not None):
-                    cuseqlen_q = cum_seqlen_q[batch_coord]
-                    seqlen_q = cum_seqlen_q[batch_coord + 1] - cuseqlen_q
-                    continue_cond = not FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
-                        self.qk_mma_tiler[0],
-                        mma_block_coord[0],
-                        seqlen_q,
-                    )
-                if not continue_cond:
-                    if cutlass.const_expr(cum_seqlen_k is not None):
-                        cuseqlen_k = cum_seqlen_k[batch_coord]
-                        seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
-
-                    seqlen_info = SeqlenInfoQK.create(
-                        batch_idx=batch_coord,
-                        seqlen_q_static=mQ_qdl.shape[0],
-                        seqlen_k_static=mK_kdl.shape[0],
-                        mCuSeqlensQ=cum_seqlen_q,
-                        mCuSeqlensK=cum_seqlen_k,
-                        mSeqUsedQ=None,
-                        mSeqUsedK=None,
-                        tile_m=self.qk_mma_tiler[0],
-                        tile_n=self.qk_mma_tiler[1],
-                    )
-                    mask = AttentionMask(
-                        self.qk_mma_tiler[0],
-                        self.qk_mma_tiler[1],
-                        seqlen_info,
-                        window_size_left=window_size_left,
-                        window_size_right=window_size_right,
-                    )
-                    shared_mask_kwargs = dict(
-                        m_block=mma_block_coord[0],
-                        thr_mma=qk_thr_mma,
-                        mask_local=self.is_local,
-                        batch_idx=batch_coord,
-                        head_idx=curr_block_coord[2][0],
-                        aux_tensors=None,
-                    )
-                    mask_fn = partial(
-                        mask.apply_mask_sm100,
-                        mask_mod=None,
-                        fastdiv_mods=(None, None),
-                        head_divmod=None,
-                        mask_causal=self.is_causal,
-                        **shared_mask_kwargs,
-                    )
-                    block_info = BlockInfo(
-                        self.qk_mma_tiler[0],
-                        self.qk_mma_tiler[1],
-                        self.is_causal,
-                        self.is_local,
-                        window_size_left=window_size_left,
-                        window_size_right=window_size_right,
-                    )
-                    n_block_min, n_block_max = block_info.get_n_block_min_max(
-                        seqlen_info, mma_block_coord[0], Int32(0), Int32(1)
-                    )
-                    if cutlass.const_expr(self.use_semantic_trip_range):
-                        n_block_min_causal_local_mask, n_block_min_before_local_mask = (
-                            block_info.get_n_block_min_causal_local_mask(
-                                seqlen_info, mma_block_coord[0], n_block_min
-                            ),
-                            block_info.get_n_block_min_before_local_mask(
-                                seqlen_info, mma_block_coord[0], n_block_min
-                            ),
-                        )
-
-                    cS_base = cute.make_identity_tensor((self.qk_mma_tiler[0], self.qk_mma_tiler[1]))
-                    cS = cute.domain_offset((mma_block_coord[0] * self.qk_mma_tiler[0], 0), cS_base)
-                    tScS = qk_thr_mma.partition_C(cS)
-
-                    cdP_base = cute.make_identity_tensor((self.dov_mma_tiler[0], self.dov_mma_tiler[1]))
-                    cdP = cute.domain_offset(
-                        (mma_block_coord[0] * self.dov_mma_tiler[0], 0), cdP_base
-                    )
-                    tdPcdP = dov_thr_mma.partition_C(cdP)
-
-                    lse_handle = load_lse_consumer.wait_and_advance()
-                    sum_odo_handle = load_sum_odo_consumer.wait_and_advance()
-                    for n_tile in cutlass.range(n_block_max - n_block_min, unroll=1):
-                        n_block = n_block_min + n_tile
-                        # Si, dPi -> dSi
-                        if cutlass.const_expr(self.use_semantic_trip_range):
-                            need_apply_mask = (
-                                n_block >= n_block_min_causal_local_mask
-                                or n_block < n_block_min_before_local_mask
-                            )
-                            mask_seqlen = False
-                        else:
-                            need_apply_mask = n_block == n_block_max - 1
-                            mask_seqlen = True
-                        mma_s_consumer, mma_dp_consumer, ds_mma_producer = self.compute_step(
-                            (mask_fn, need_apply_mask, mask_seqlen),
-                            (
-                                seqlen_q,
-                                seqlen_k,
-                                scale_softmax,
-                                batch_coord,
-                                curr_block_coord[0],
-                                varlen,
-                            ),
-                            (tStS, tScS, tdPtdP, tdPcdP, sLSE, sSum_OdO),
-                            (
-                                mma_s_consumer,
-                                mma_dp_consumer,
-                                ds_mma_producer,
-                                lse_handle,
-                                sum_odo_handle,
-                            ),
-                            n_block,
-                        )
-                    lse_handle.release()
-                    sum_odo_handle.release()
-                work_tile = tile_sched.advance_to_next_work()
-            ds_mma_producer.tail()
-
-        # ///////////////////////////////////////////////////////////////////////////////
-        #  Epilogue
-        # ///////////////////////////////////////////////////////////////////////////////
-        if warp_idx >= self.epilogue_warp_ids[0] and warp_idx <= self.epilogue_warp_ids[-1]:
-            cute.arch.warpgroup_reg_dealloc(self.num_regs_epilogue)
-
-            while work_tile.is_valid_tile:
-                curr_block_coord = work_tile.tile_idx
-                mma_block_coord = (
-                    curr_block_coord[0] // cute.size(qk_tiled_mma.thr_id.shape),
-                    curr_block_coord[1],
-                    curr_block_coord[2],
-                )
-                batch_coord = curr_block_coord[2][1]
-                seqlen_q = mQ_qdl.shape[0]
-                seqlen_k = mK_kdl.shape[0]
-                continue_cond = False
-                cuseqlen_q = Int32(0)
-                if cutlass.const_expr(cum_seqlen_q is not None):
-                    cuseqlen_q = cum_seqlen_q[batch_coord]
-                    seqlen_q = cum_seqlen_q[batch_coord + 1] - cuseqlen_q
-                    continue_cond = not FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
-                        self.qk_mma_tiler[0],
-                        mma_block_coord[0],
-                        seqlen_q,
-                    )
-
-                if not continue_cond:
-                    if cutlass.const_expr(cum_seqlen_k is not None):
-                        cuseqlen_k = cum_seqlen_k[batch_coord]
-                        seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
-
-                    mdQ_qdl_eff = mdQ_qdl
-                    if cutlass.const_expr(cum_seqlen_q is not None):
-                        block_offset_dQ = (
-                            cuseqlen_q,
-                            Int32(0),
-                            Int32(0),
-                            ((Int32(0), Int32(0)), Int32(0)),
-                        )
-                        mdQ_qdl_eff = cute.domain_offset(
-                            cute.select(block_offset_dQ, mode=[0, 2, 3]), mdQ_qdl
-                        )
-
-                    # (bM, bN, loopM, loopN, loopL)
-                    gdQ_qdl = cute.flat_divide(
-                        mdQ_qdl_eff, cute.select(self.dsk_block_tiler, mode=[0, 1])
-                    )
-                    cdQ_qdl = cute.flat_divide(
-                        cute.make_identity_tensor(mdQ_qdl_eff.shape),
-                        cute.select(self.dsk_block_tiler, mode=[0, 1]),
-                    )
-
-                    gdQ_staged = gdQ_qdl[None, None, curr_block_coord[0], None, curr_block_coord[2]]
-                    cdQ_staged = cdQ_qdl[None, None, curr_block_coord[0], None, curr_block_coord[2]]
-                    gdQ_tma_staged = gdQ_staged
-                    if cutlass.const_expr(not varlen):
-                        gdQ_tma_qdl = cute.flat_divide(
-                            mdQ_tma, cute.select(self.dsk_block_tiler, mode=[0, 1])
-                        )
-                        gdQ_tma_staged = gdQ_tma_qdl[
-                            None, None, curr_block_coord[0], None, curr_block_coord[2]
-                        ]
-
-                    # dQ TMEM to GMEM
-                    mma_dq_consumer = self.dQ_epilogue(
-                        (seqlen_q, cuseqlen_q, mQ_qdl.shape[0], batch_coord),
-                        (mma_dq_consumer, gdQ_staged, cdQ_staged, tdQtdQ_staged),
-                        self.epi_tile,
-                        (tma_atom_dQ, gdQ_tma_staged, s_epi_dQ, varlen),
-                    )
-                work_tile = tile_sched.advance_to_next_work()
-            # NOTE: tmem.free() moved to kernel end to enable cluster-wide sync
-
-        # ///////////////////////////////////////////////////////////////////////////////
-        #  Scheduler Warp (only for CLC dynamic scheduler)
-        # ///////////////////////////////////////////////////////////////////////////////
-        if cutlass.const_expr(self.use_clc_scheduler):
-            is_first_cta_in_cluster = cta_rank_in_cluster == 0
-
-            if warp_idx == self.sched_warp_id and is_first_cta_in_cluster:
-                cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
-                while work_tile.is_valid_tile:
-                    tile_sched.prefetch_next_work()
-                    work_tile = tile_sched.advance_to_next_work()
-                tile_sched.producer_tail()
-
-        # ///////////////////////////////////////////////////////////////////////////////
-        #  Empty warps reg dealloc
-        # ///////////////////////////////////////////////////////////////////////////////
-        if cutlass.const_expr(self.use_clc_scheduler):
-            if warp_idx > self.load_warp_id:
-                if not (warp_idx == self.sched_warp_id and is_first_cta_in_cluster):
-                    cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
-        else:
-            if warp_idx > self.load_warp_id:
-                cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
-
-        # ///////////////////////////////////////////////////////////////////////////////
-        #  Cooperative TMEM Deallocation (2CTA)
-        # ///////////////////////////////////////////////////////////////////////////////
-        # All warps (including scheduler) have finished by this point.
-        # Cluster-wide sync ensures both CTAs reach here before dealloc.
-        cute.arch.cluster_arrive()
-        cute.arch.cluster_wait()
-        tmem.relinquish_alloc_permit()
-        tmem.free(tmem_ptr)
+            cute.arch.setmaxregister_increase(self.num_regs_compute)
+            tmem.wait_for_alloc()
+            tmem.retrieve_ptr(self.acc_dtype)
+            self.compute_loop(
+                tiled_mma_S,
+                thr_mma_S,
+                thr_mma_dP,
+                thr_mma_dQ,
+                scale_softmax,
+                tStS,
+                tdPtdP,
+                tdQtdQ,
+                mdQ,
+                mdQ_tma,
+                sdQ,
+                tma_atom_dQ,
+                tiled_copy_r2s_dQ,
+                sLSE,
+                sdPsum,
+                pipeline_S_P,
+                pipeline_dP,
+                pipeline_dS,
+                pipeline_dQ,
+                pipeline_LSE,
+                pipeline_dPsum,
+                block_info,
+                SeqlenInfoCls,
+                TileSchedulerCls,
+            )
+            self.tmem_alloc_barrier.arrive()
 
         return
 
     @cute.jit
-    def compute_step(
+    def load(
         self,
-        mask_args: Tuple,
-        value_args: Tuple,
-        tensor_args: Tuple,
-        pipeline_args: Tuple,
-        n_block: Int32,
-    ) -> Tuple[Float32, Float32, pipeline.PipelineConsumer, pipeline.PipelineProducer]:
-        mask_fn, need_apply_mask, mask_seqlen = mask_args
-        seqlen_q, seqlen_k, scale_softmax, batch_coord, block_m_idx, varlen = value_args
-        tStS, tScS, tdPtdP, tdPcdP, sLSE, sSum_OdO = tensor_args
-        mma_s_consumer, mma_dp_consumer, ds_mma_producer, lse_handle, sum_odo_handle = pipeline_args
+        tiled_mma_S,
+        thr_mma_S,
+        thr_mma_dP,
+        thr_mma_dQ,
+        mQ,
+        mK,
+        mKt,
+        mV,
+        mdO,
+        mLSE,
+        mdPsum,
+        cluster_layout_vmnk,
+        block_info,
+        SeqlenInfoCls,
+        TileSchedulerCls,
+        sQ,
+        sK,
+        sKT,
+        sV,
+        sdO,
+        sLSE,
+        sdPsum,
+        tma_atom_Q,
+        tma_atom_K,
+        tma_atom_Kt,
+        tma_atom_V,
+        tma_atom_dO,
+        pipeline_Q,
+        pipeline_K,
+        pipeline_Kt,
+        pipeline_V,
+        pipeline_dO,
+        pipeline_LSE,
+        pipeline_dPsum,
+    ):
+        producer_state_Q = cutlass.pipeline.make_pipeline_state(
+            cutlass.pipeline.PipelineUserType.Producer, self.Q_stage
+        )
+        producer_state_K = cutlass.pipeline.make_pipeline_state(
+            cutlass.pipeline.PipelineUserType.Producer, self.k_stage
+        )
+        producer_state_Kt = cutlass.pipeline.make_pipeline_state(
+            cutlass.pipeline.PipelineUserType.Producer, self.single_stage
+        )
+        producer_state_V = cutlass.pipeline.make_pipeline_state(
+            cutlass.pipeline.PipelineUserType.Producer, self.v_stage
+        )
+        producer_state_dO = cutlass.pipeline.make_pipeline_state(
+            cutlass.pipeline.PipelineUserType.Producer, self.dO_stage
+        )
+        producer_state_LSE = cutlass.pipeline.make_pipeline_state(
+            cutlass.pipeline.PipelineUserType.Producer, self.load_compute_LSE_stage
+        )
+        producer_state_dPsum = cutlass.pipeline.make_pipeline_state(
+            cutlass.pipeline.PipelineUserType.Producer, self.load_compute_sum_OdO_stage
+        )
 
-        bidx = block_m_idx
+        cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+        block_in_cluster_coord_vmnk = cluster_layout_vmnk.get_flat_coord(cta_rank_in_cluster)
+        q_do_mcast_mask = None
+        if const_expr(self.is_q_do_mcast):
+            q_do_mcast_mask = cpasync.create_tma_multicast_mask(
+                cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=1
+            )
         tidx, _, _ = cute.arch.thread_idx()
-        thread_idx = tidx % (self.threads_per_warp * len(self.compute_warp_ids))
-        s_handle = mma_s_consumer.wait_and_advance()
-        tStS_slice = tStS[(None, None), 0, 0, s_handle.index]
-        tScS_slice = tScS[(None, None), 0, 0]
-        tmem_load_atom = cute.make_copy_atom(
-            tcgen05.Ld32x32bOp(tcgen05.Repetition(16)), self.acc_dtype
-        )
-        tmem_tiled_load = tcgen05.make_tmem_copy(tmem_load_atom, tStS_slice)
-        thr_load = tmem_tiled_load.get_slice(thread_idx)
-        tTMEM_LOADtS = thr_load.partition_S(tStS_slice)
-        tTMEM_LOADcS = thr_load.partition_D(tScS_slice)
-        tTMEM_LOADrS = cute.make_rmem_tensor(tTMEM_LOADcS.shape, self.acc_dtype)
-        cute.copy(tmem_tiled_load, tTMEM_LOADtS, tTMEM_LOADrS)
-        cute.arch.fence_view_async_tmem_load()
-        s_handle.release()
-        if need_apply_mask:
-            partial(mask_fn, thr_tmem_load=thr_load, mask_seqlen=mask_seqlen)(
-                tTMEM_LOADrS, n_block=n_block
+
+        tile_scheduler = TileSchedulerCls()
+        work_tile = tile_scheduler.initial_work_tile_info()
+
+        while work_tile.is_valid_tile:
+            m_block, head_idx, batch_idx, _ = work_tile.tile_idx
+            head_idx_kv = head_idx // self.qhead_per_kvhead
+            m_block_cta_group = m_block // self.cta_group_size
+            seqlen = SeqlenInfoCls(batch_idx)
+            n_block_min, n_block_max = block_info.get_n_block_min_max(
+                seqlen, m_block_cta_group, Int32(0), Int32(1)
             )
 
-        log2_e = cutlass.Float32(math.log2(math.e))
-        softmax_scale_log2_e = scale_softmax * log2_e
-        tTMEM_STORErP = cute.make_rmem_tensor(tTMEM_LOADrS.shape, self.q_dtype)
-        for k in cutlass.range(0, cute.size(tTMEM_LOADrS), 2, unroll_full=True):
-            lse = (
-                -sLSE[
-                    cute.get(tTMEM_LOADcS[k], mode=[0]) - bidx * self.cta_tiler[0],
-                    lse_handle.index,
-                ],
-                -sLSE[
-                    cute.get(tTMEM_LOADcS[k + 1], mode=[0]) - bidx * self.cta_tiler[0],
-                    lse_handle.index,
-                ],
-            )
-            tTMEM_LOADrS[k], tTMEM_LOADrS[k + 1] = cute.arch.fma_packed_f32x2(
-                (tTMEM_LOADrS[k], tTMEM_LOADrS[k + 1]),
-                (softmax_scale_log2_e, softmax_scale_log2_e),
-                lse,
-            )
-            tTMEM_LOADrS[k] = cute.math.exp2(tTMEM_LOADrS[k], fastmath=True)
-            tTMEM_LOADrS[k + 1] = cute.math.exp2(tTMEM_LOADrS[k + 1], fastmath=True)
-
-        dp_handle = mma_dp_consumer.wait_and_advance()
-        tdPtdP_slice = tdPtdP[(None, None), 0, 0, dp_handle.index]
-        tdPcdP_slice = tdPcdP[(None, None), 0, 0]
-        thr_load = tmem_tiled_load.get_slice(thread_idx)
-        tTMEM_LOADtdP = thr_load.partition_S(tdPtdP_slice)
-        tTMEM_LOADcdP = thr_load.partition_D(tdPcdP_slice)
-        tTMEM_LOADrdP = cute.make_rmem_tensor(tTMEM_LOADcdP.shape, self.acc_dtype)
-        cute.copy(tmem_tiled_load, tTMEM_LOADtdP, tTMEM_LOADrdP)
-        cute.arch.fence_view_async_tmem_load()
-        dp_handle.release()
-        tTMEM_STORErdP = cute.make_rmem_tensor(tTMEM_LOADrdP.shape, self.q_dtype)
-
-        for k in cutlass.range(0, cute.size(tTMEM_LOADrdP), 2, unroll_full=True):
-            dpsum_0 = -sSum_OdO[
-                cute.get(tTMEM_LOADcdP[k], mode=[0]) - bidx * self.cta_tiler[0],
-                sum_odo_handle.index,
+            # GMEM tensors (varlen-aware)
+            mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, head_idx]
+            mK_cur = seqlen.offset_batch_K(mK, batch_idx, dim=3)[None, None, head_idx_kv]
+            mV_cur = seqlen.offset_batch_K(mV, batch_idx, dim=3)[None, None, head_idx_kv]
+            mdO_cur = seqlen.offset_batch_Q(mdO, batch_idx, dim=3)[None, None, head_idx]
+            mLSE_cur = seqlen.offset_batch_Q(mLSE, batch_idx, dim=2, padded=True)[
+                None, head_idx
             ]
-            dpsum_1 = -sSum_OdO[
-                cute.get(tTMEM_LOADcdP[k + 1], mode=[0]) - bidx * self.cta_tiler[0],
-                sum_odo_handle.index,
+            mdPsum_cur = seqlen.offset_batch_Q(mdPsum, batch_idx, dim=2, padded=True)[
+                None, head_idx
             ]
-            if cutlass.const_expr(varlen):
-                if not cute.elem_less(cute.get(tTMEM_LOADcdP[k], mode=[0]), seqlen_q):
-                    dpsum_0 = 0.0
-                if not cute.elem_less(cute.get(tTMEM_LOADcdP[k + 1], mode=[0]), seqlen_q):
-                    dpsum_1 = 0.0
-            tTMEM_LOADrdP[k], tTMEM_LOADrdP[k + 1] = cute.arch.add_packed_f32x2(
-                (tTMEM_LOADrdP[k], tTMEM_LOADrdP[k + 1]),
-                (dpsum_0, dpsum_1),
-            )
-            tTMEM_LOADrdP[k], tTMEM_LOADrdP[k + 1] = cute.arch.mul_packed_f32x2(
-                (tTMEM_LOADrdP[k], tTMEM_LOADrdP[k + 1]), (tTMEM_LOADrS[k], tTMEM_LOADrS[k + 1])
-            )
-            tTMEM_LOADrdP[k], tTMEM_LOADrdP[k + 1] = cute.arch.mul_packed_f32x2(
-                (tTMEM_LOADrdP[k], tTMEM_LOADrdP[k + 1]), (scale_softmax, scale_softmax)
-            )
-        dp_vec = tTMEM_LOADrdP.load()
-        tTMEM_STORErdP.store(dp_vec.to(self.q_dtype))
+            gLSE = cute.local_tile(mLSE_cur, (self.tile_m,), (None,))
+            gdPsum = cute.local_tile(mdPsum_cur, (self.tile_m,), (None,))
+            if cutlass.const_expr(not seqlen.has_cu_seqlens_k):
+                mKt_cur = mKt[None, None, head_idx_kv, batch_idx]
+            else:
+                mKt_cur = cute.domain_offset((0, seqlen.offset_k, 0), mKt)[
+                    None, None, head_idx_kv
+                ]
 
-        ds_handle = ds_mma_producer.acquire_and_advance()
-        tmem_store_atom = cute.make_copy_atom(
-            tcgen05.St32x32bOp(tcgen05.Repetition(32)), self.acc_dtype
-        )
-        tilePlikeFP32 = tdPtdP_slice.shape[1] // Float32.width * self.q_dtype.width
-        tdPtdP_dS_layout = cute.composition(
-            tdPtdP_slice.layout, cute.make_layout((tdPtdP_slice.shape[0], tilePlikeFP32))
-        )
-        tdPtdP_dS = cute.make_tensor(tdPtdP_slice.iterator, tdPtdP_dS_layout)
-        tdPcdP_dS_layout = cute.composition(
-            tdPcdP_slice.layout, cute.make_layout((tdPcdP_slice.shape[0], tilePlikeFP32))
-        )
-        tdPcdP_dS = cute.make_tensor(tdPcdP_slice.iterator, tdPcdP_dS_layout)
-        tmem_tiled_store = tcgen05.make_tmem_copy(tmem_store_atom, tdPtdP_dS)
+            # (1) S = Q @ K.T
+            gQ = cute.local_tile(
+                mQ_cur, cute.select(self.qk_mma_tiler, mode=[0, 2]), (m_block_cta_group, 0)
+            )
+            tSgQ = thr_mma_S.partition_A(gQ)
 
-        thr_store = tmem_tiled_store.get_slice(thread_idx)
-        tTMEM_STOREtdS = thr_store.partition_D(tdPtdP_dS)
-        tTMEM_STOREcdP = thr_store.partition_S(tdPcdP_dS)
-        tTMEM_STORErdS_ = cute.make_tensor(
-            cute.recast_ptr(tTMEM_STORErdP.iterator, dtype=self.acc_dtype),
-            tTMEM_STOREcdP.shape,
-        )
-        cute.copy(tmem_tiled_store, tTMEM_STORErdS_, tTMEM_STOREtdS)
-        cute.arch.fence_view_async_tmem_store()
-        ds_handle.commit()
-        return mma_s_consumer, mma_dp_consumer, ds_mma_producer
+            a_cta_layout = cute.make_layout(cute.slice_(cluster_layout_vmnk, (0, 0, None, 0)).shape)
+            load_Q, _, _ = copy_utils.tma_get_copy_fn(
+                tma_atom_Q,
+                cta_coord=block_in_cluster_coord_vmnk[2],
+                cta_layout=a_cta_layout,
+                src_tensor=tSgQ,
+                dst_tensor=sQ,
+                mcast_mask=q_do_mcast_mask,
+                single_stage=True,
+            )
+
+            gK = cute.local_tile(
+                mK_cur, cute.select(self.qk_mma_tiler, mode=[1, 2]), (None, 0)
+            )
+            tSgK = thr_mma_S.partition_B(gK)
+
+            b_cta_layout = cute.make_layout(cute.slice_(cluster_layout_vmnk, (0, None, 0, 0)).shape)
+            load_K, _, _ = copy_utils.tma_get_copy_fn(
+                tma_atom_K,
+                cta_coord=block_in_cluster_coord_vmnk[1],
+                cta_layout=b_cta_layout,
+                src_tensor=tSgK,
+                dst_tensor=sK,
+            )
+            load_K = copy_utils.tma_producer_copy_fn(load_K, pipeline_K)
+
+            # (2) dP = dO @ V.T
+            gdO = cute.local_tile(
+                mdO_cur, cute.select(self.dov_mma_tiler, mode=[0, 2]), (m_block_cta_group, 0)
+            )
+            tdPgdO = thr_mma_dP.partition_A(gdO)
+
+            load_dO, _, _ = copy_utils.tma_get_copy_fn(
+                tma_atom_dO,
+                cta_coord=block_in_cluster_coord_vmnk[2],
+                cta_layout=a_cta_layout,
+                src_tensor=tdPgdO,
+                dst_tensor=sdO,
+                mcast_mask=q_do_mcast_mask,
+                single_stage=True,
+            )
+
+            gV = cute.local_tile(
+                mV_cur, cute.select(self.dov_mma_tiler, mode=[1, 2]), (None, 0)
+            )
+            tSgV = thr_mma_dP.partition_B(gV)
+
+            load_V, _, _ = copy_utils.tma_get_copy_fn(
+                tma_atom_V,
+                cta_coord=block_in_cluster_coord_vmnk[1],
+                cta_layout=b_cta_layout,
+                src_tensor=tSgV,
+                dst_tensor=sV,
+            )
+            load_V = copy_utils.tma_producer_copy_fn(load_V, pipeline_V)
+
+            # (3) dQ = dS @ K
+            gKt = cute.local_tile(
+                mKt_cur, cute.select(self.dsk_mma_tiler, mode=[1, 2]), (0, None)
+            )
+            tdQgK = thr_mma_dQ.partition_B(gKt)
+
+            load_Kt, _, _ = copy_utils.tma_get_copy_fn(
+                tma_atom_Kt,
+                cta_coord=block_in_cluster_coord_vmnk[1],
+                cta_layout=b_cta_layout,
+                src_tensor=tdQgK,
+                dst_tensor=sKT,
+            )
+            load_Kt = copy_utils.tma_producer_copy_fn(load_Kt, pipeline_Kt)
+
+            copy_atom_stats = cute.make_copy_atom(cpasync.CopyBulkG2SOp(), Float32)
+            copy_stats = partial(cute.copy, copy_atom_stats)
+
+            process_tile = (
+                const_expr(not self.is_local and not self.is_varlen_q and not self.is_varlen_k)
+                or n_block_min < n_block_max
+            )
+
+            if process_tile:
+                first_n_block = n_block_min
+
+                #### Prologue ####
+                # Q (for S)
+                pipeline_Q.producer_acquire(producer_state_Q)
+                load_Q(tma_bar_ptr=pipeline_Q.producer_get_barrier(producer_state_Q))
+                pipeline_Q.producer_commit(producer_state_Q)
+                producer_state_Q.advance()
+
+                # K (for S)
+                pipeline_K.producer_acquire(producer_state_K)
+                load_K(first_n_block, producer_state=producer_state_K)
+                pipeline_K.producer_commit(producer_state_K)
+                producer_state_K.advance()
+
+                # LSE
+                pipeline_LSE.producer_acquire(producer_state_LSE)
+                with cute.arch.elect_one():
+                    copy_stats(
+                        gLSE[None, m_block],
+                        sLSE[None, producer_state_LSE.index],
+                        mbar_ptr=pipeline_LSE.producer_get_barrier(producer_state_LSE),
+                    )
+                producer_state_LSE.advance()
+
+                # dO (for dP)
+                pipeline_dO.producer_acquire(producer_state_dO)
+                load_dO(tma_bar_ptr=pipeline_dO.producer_get_barrier(producer_state_dO))
+                pipeline_dO.producer_commit(producer_state_dO)
+                producer_state_dO.advance()
+
+                # V (for dP)
+                pipeline_V.producer_acquire(producer_state_V)
+                load_V(first_n_block, producer_state=producer_state_V)
+                pipeline_V.producer_commit(producer_state_V)
+                producer_state_V.advance()
+
+                # dPsum
+                pipeline_dPsum.producer_acquire(producer_state_dPsum)
+                with cute.arch.elect_one():
+                    copy_stats(
+                        gdPsum[None, m_block],
+                        sdPsum[None, producer_state_dPsum.index],
+                        mbar_ptr=pipeline_dPsum.producer_get_barrier(producer_state_dPsum),
+                    )
+                producer_state_dPsum.advance()
+
+                # Kt (for dQ)
+                pipeline_Kt.producer_acquire(producer_state_Kt)
+                load_Kt(first_n_block, producer_state=producer_state_Kt)
+                pipeline_Kt.producer_commit(producer_state_Kt)
+                producer_state_Kt.advance()
+
+                #### Main Loop ####
+                for n_block in cutlass.range(n_block_min + 1, n_block_max, unroll=1):
+                    # K (for S)
+                    pipeline_K.producer_acquire(producer_state_K)
+                    load_K(n_block, producer_state=producer_state_K)
+                    pipeline_K.producer_commit(producer_state_K)
+                    producer_state_K.advance()
+
+                    # LSE
+                    pipeline_LSE.producer_acquire(producer_state_LSE)
+                    with cute.arch.elect_one():
+                        copy_stats(
+                            gLSE[None, m_block],
+                            sLSE[None, producer_state_LSE.index],
+                            mbar_ptr=pipeline_LSE.producer_get_barrier(producer_state_LSE),
+                        )
+                    producer_state_LSE.advance()
+
+                    # V (for dP)
+                    pipeline_V.producer_acquire(producer_state_V)
+                    load_V(n_block, producer_state=producer_state_V)
+                    pipeline_V.producer_commit(producer_state_V)
+                    producer_state_V.advance()
+
+                    # dPsum
+                    pipeline_dPsum.producer_acquire(producer_state_dPsum)
+                    with cute.arch.elect_one():
+                        copy_stats(
+                            gdPsum[None, m_block],
+                            sdPsum[None, producer_state_dPsum.index],
+                            mbar_ptr=pipeline_dPsum.producer_get_barrier(
+                                producer_state_dPsum
+                            ),
+                        )
+                    producer_state_dPsum.advance()
+
+                    # Kt (for dQ)
+                    pipeline_Kt.producer_acquire(producer_state_Kt)
+                    load_Kt(n_block, producer_state=producer_state_Kt)
+                    pipeline_Kt.producer_commit(producer_state_Kt)
+                    producer_state_Kt.advance()
+
+            tile_scheduler.prefetch_next_work()
+            tile_scheduler.advance_to_next_work()
+            work_tile = tile_scheduler.get_current_work()
+            # End of persistent scheduler loop
+        pipeline_K.producer_tail(producer_state_K)
+        pipeline_V.producer_tail(producer_state_V)
+        pipeline_Kt.producer_tail(producer_state_Kt)
+        pipeline_Q.producer_tail(producer_state_Q)
+        pipeline_dO.producer_tail(producer_state_dO)
+        pipeline_LSE.producer_tail(producer_state_LSE)
+        pipeline_dPsum.producer_tail(producer_state_dPsum)
+
 
     @cute.jit
-    def dQ_epilogue(
+    def mma(
         self,
-        value_args: Tuple,
-        dq_args: Tuple,
-        epi_tile: cute.Tile,
-        tma_args: Tuple,
-    ) -> Tuple[pipeline.PipelineConsumer, pipeline.PipelineProducer]:
-        seqlen_q, cuseqlen_q, total_q, batch_coord = value_args
-        (mma_dq_consumer, gdQ_staged, cdQ_staged, tdQtdQ_staged) = dq_args
-        tma_atom_dQ, gdQ_tma_staged, s_epi_dQ, varlen = tma_args
-        dq_handle = mma_dq_consumer.wait_and_advance()
-        tidx, _, _ = cute.arch.thread_idx()
-        bidx, bidy, bidz = cute.arch.block_idx()
-        cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
-        cute.arch.fence_view_async_shared()
+        tiled_mma_S,
+        tiled_mma_dP,
+        tiled_mma_dQ,
+        sQ,
+        sK,
+        sKT,
+        sV,
+        sdO,
+        tStS,
+        tdPtdP,
+        tdQtdQ,
+        tdS_layout,
+        pipeline_Q,
+        pipeline_K,
+        pipeline_V,
+        pipeline_dO,
+        pipeline_Kt,
+        pipeline_S_P,
+        pipeline_dP,
+        pipeline_dS,
+        pipeline_dQ,
+        block_info,
+        SeqlenInfoCls,
+        TileSchedulerCls,
+    ):
+        # [2025-10-21] For reasons I don't understand, putting these partitioning in the main
+        # kernel (before warp specialization) is a lot slower tha putting them here.
+        # Partition smem / tmem tensors
+        bidx, _, _ = cute.arch.block_idx()
+        mma_tile_coord_v = bidx % self.cta_group_size
+        thr_mma_S = tiled_mma_S.get_slice(mma_tile_coord_v)
+        thr_mma_dP = tiled_mma_dP.get_slice(mma_tile_coord_v)
+        thr_mma_dQ = tiled_mma_dQ.get_slice(mma_tile_coord_v)
+        # S = Q @ K.T
+        tSrQ = thr_mma_S.make_fragment_A(sQ)[None, None, None, 0]
+        tSrK = thr_mma_S.make_fragment_B(sK)
+        # dP = dO @ V.T
+        tdPrdO = thr_mma_dP.make_fragment_A(sdO)[None, None, None, 0]
+        tdPrV = thr_mma_dP.make_fragment_B(sV)
+        # dQ = dS @ K
+        tdQrKT = thr_mma_dQ.make_fragment_B(sKT)
 
-        epi_cols_dQ = math.gcd(128 // (self.dq_dtype.width // 8), epi_tile[1])
-        num_epi_stages_dQ = epi_tile[1] // epi_cols_dQ
-        epi_tile_dQ = (epi_tile[0], epi_cols_dQ)
+        mma_qk_fn = partial(
+            gemm_w_idx,
+            tiled_mma_S,
+            tStS[None, None, None, 0],
+            tSrQ,
+            tSrK,
+            zero_init=True,
+            num_unroll_groups=2,
+        )
+        mma_dov_fn = partial(
+            gemm_w_idx,
+            tiled_mma_dP,
+            tdPtdP[None, None, None, 0],
+            tdPrdO,
+            tdPrV,
+            zero_init=True,
+            num_unroll_groups=2,
+        )
+        num_unroll_groups = 2 if const_expr(self.use_2cta_instrs) else 1
+        mma_dsk_fn = partial(
+            gemm_w_idx,
+            tiled_mma_dQ,
+            tCrB=tdQrKT,
+            num_unroll_groups=num_unroll_groups,
+        )
+
+        consumer_state_Q = cutlass.pipeline.make_pipeline_state(
+            cutlass.pipeline.PipelineUserType.Consumer, self.Q_stage
+        )
+        consumer_state_K = cutlass.pipeline.make_pipeline_state(
+            cutlass.pipeline.PipelineUserType.Consumer, self.single_stage
+        )
+        consumer_state_V = cutlass.pipeline.make_pipeline_state(
+            cutlass.pipeline.PipelineUserType.Consumer, self.single_stage
+        )
+        consumer_state_dO = cutlass.pipeline.make_pipeline_state(
+            cutlass.pipeline.PipelineUserType.Consumer, self.dO_stage
+        )
+        consumer_state_Kt = cutlass.pipeline.make_pipeline_state(
+            cutlass.pipeline.PipelineUserType.Consumer, self.single_stage
+        )
+        producer_phase_acc = Int32(1)  # For S and dP
+        producer_phase_dQ = Int32(1)
+        consumer_state_dS = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Consumer, self.dsk_acc_stage
+        )
+        cta_group = pipeline_S_P.cta_group
+
+        tile_scheduler = TileSchedulerCls()
+        work_tile = tile_scheduler.initial_work_tile_info()
+        while work_tile.is_valid_tile:
+            n_block, head_idx, batch_idx, _ = work_tile.tile_idx
+            n_block_cta_group = n_block // cute.size(tiled_mma_S.thr_id.shape)
+            seqlen = SeqlenInfoCls(batch_idx)
+            n_block_min, n_block_max = block_info.get_n_block_min_max(
+                seqlen, n_block_cta_group, Int32(0), Int32(1)
+            )
+            block_iter_count = n_block_max - n_block_min
+            process_tile = (
+                const_expr(not self.is_local and not self.is_varlen_q and not self.is_varlen_k)
+                or (
+                    n_block_cta_group < cute.ceil_div(seqlen.seqlen_q, self.qk_mma_tiler[0])
+                    and n_block_min < n_block_max
+                )
+            )
+
+            cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+            is_leader_cta = cta_rank_in_cluster % 2 == 0
+
+            if is_leader_cta and process_tile:
+                consumer_state_Q_releaser = consumer_state_Q.clone()
+                consumer_state_dO_releaser = consumer_state_dO.clone()
+                accumulate_dQ = False
+
+                pipeline_dQ.sync_object_empty.wait(0, producer_phase_dQ)
+
+                # -----------------------------------------------------------
+                ###### Prologue
+                # -----------------------------------------------------------
+                # 1. S  = Q @ K.T
+                # 2. dP = dO @ V.T
+
+                # 1) S = Q @ K.T
+                pipeline_Q.consumer_wait(consumer_state_Q)
+                consumer_state_Q.advance()
+                pipeline_K.consumer_wait(consumer_state_K)
+                pipeline_S_P.sync_object_empty.wait(0, producer_phase_acc)
+                mma_qk_fn(B_idx=consumer_state_K.index)
+                pipeline_S_P.sync_object_full.arrive(0, pipeline_S_P.producer_mask, cta_group)
+                pipeline_K.consumer_release(consumer_state_K)
+                consumer_state_K.advance()
+
+                # 2) dP = dO @ V.T
+                pipeline_dO.consumer_wait(consumer_state_dO)
+                consumer_state_dO.advance()
+                pipeline_V.consumer_wait(consumer_state_V)
+                pipeline_dP.sync_object_empty.wait(0, producer_phase_acc)
+                mma_dov_fn(B_idx=consumer_state_V.index)
+                pipeline_dP.sync_object_full.arrive(0, pipeline_dP.producer_mask, cta_group)
+                pipeline_V.consumer_release(consumer_state_V)
+                consumer_state_V.advance()
+                producer_phase_acc ^= 1
+
+                # -----------------------------------------------------------
+                ###### Main Loop
+                # -----------------------------------------------------------
+                # 1. S  = Q    @ K.T  (next)
+                # 2. dQ = dS   @ K    (cur)
+                # 3. dP = dO   @ V.T  (next)
+
+                main_loop_iters = block_iter_count - 1
+                for _ in cutlass.range(main_loop_iters, unroll=1):
+                    # (1) S = Q @ K.T (next)
+                    pipeline_K.consumer_wait(consumer_state_K)
+                    pipeline_S_P.sync_object_empty.wait(0, producer_phase_acc)
+                    mma_qk_fn(B_idx=consumer_state_K.index)
+                    pipeline_S_P.sync_object_full.arrive(0, pipeline_S_P.producer_mask, cta_group)
+                    pipeline_K.consumer_release(consumer_state_K)
+                    consumer_state_K.advance()
+
+                    # (2) dQ += dS @ K (cur)
+                    pipeline_dS.consumer_wait(consumer_state_dS)
+                    pipeline_Kt.consumer_wait(consumer_state_Kt)
+                    tdStdS = tdPtdP[None, None, None, consumer_state_dS.index]
+                    tdS = cute.make_tensor(tdStdS.iterator, tdS_layout.outer)
+                    tdQrdS = thr_mma_dQ.make_fragment_A(tdS)
+                    tdQrdS = cute.make_tensor(
+                        cute.recast_ptr(tdStdS.iterator, dtype=self.q_dtype),
+                        tdQrdS.layout,
+                    )
+                    mma_dsk_fn(
+                        tdQtdQ,
+                        tdQrdS,
+                        B_idx=consumer_state_Kt.index,
+                        zero_init=not accumulate_dQ,
+                    )
+                    accumulate_dQ = True
+                    pipeline_Kt.consumer_release(consumer_state_Kt)
+                    consumer_state_Kt.advance()
+                    pipeline_dS.consumer_release(consumer_state_dS)
+                    consumer_state_dS.advance()
+
+                    # (3) dP = dO @ V.T (next)
+                    pipeline_V.consumer_wait(consumer_state_V)
+                    pipeline_dP.sync_object_empty.wait(0, producer_phase_acc)
+                    mma_dov_fn(B_idx=consumer_state_V.index)
+                    pipeline_dP.sync_object_full.arrive(0, pipeline_dP.producer_mask, cta_group)
+                    pipeline_V.consumer_release(consumer_state_V)
+                    consumer_state_V.advance()
+                    producer_phase_acc ^= 1
+
+                # Release Q / dO after the final S and dP that reuse them are issued.
+                pipeline_Q.consumer_release(consumer_state_Q_releaser)
+                consumer_state_Q_releaser.advance()
+                pipeline_dO.consumer_release(consumer_state_dO_releaser)
+                consumer_state_dO_releaser.advance()
+
+                # -----------------------------------------------------------
+                # Tail: remaining dQ
+                # -----------------------------------------------------------
+                pipeline_dS.consumer_wait(consumer_state_dS)
+                pipeline_Kt.consumer_wait(consumer_state_Kt)
+                tdStdS = tdPtdP[None, None, None, consumer_state_dS.index]
+                tdS = cute.make_tensor(tdStdS.iterator, tdS_layout.outer)
+                tdQrdS = thr_mma_dQ.make_fragment_A(tdS)
+                tdQrdS = cute.make_tensor(
+                    cute.recast_ptr(tdStdS.iterator, dtype=self.q_dtype),
+                    tdQrdS.layout,
+                )
+                mma_dsk_fn(
+                    tdQtdQ,
+                    tdQrdS,
+                    B_idx=consumer_state_Kt.index,
+                    zero_init=not accumulate_dQ,
+                )
+                pipeline_dQ.sync_object_full.arrive(0, pipeline_dQ.producer_mask, cta_group)
+                producer_phase_dQ ^= 1
+                pipeline_Kt.consumer_release(consumer_state_Kt)
+                consumer_state_Kt.advance()
+                pipeline_dS.consumer_release(consumer_state_dS)
+                consumer_state_dS.advance()
+
+            tile_scheduler.advance_to_next_work()
+            work_tile = tile_scheduler.get_current_work()
+        # End of persistent scheduler loop
+
+    @cute.jit
+    def split_wg(
+        self,
+        t: cute.Tensor,
+        wg_idx: cutlass.Int32,
+        num_wg: cutlass.Constexpr[int],
+    ):
+        reduced_shape = cute.product_each(t.shape)
+        rank = len(reduced_shape)
+        if const_expr(reduced_shape[1] > 1):
+            assert rank >= 2, "Need rank >= 2 for t in split_wg"
+            t = cute.logical_divide(t, (reduced_shape[0], reduced_shape[1] // num_wg))
+            coord = (None, (None, wg_idx)) + (None,) * (rank - 2)
+        else:
+            assert rank >= 3, "Need rank >= 3 for t in split_wg"
+            if const_expr(rank == 3):
+                t = cute.logical_divide(
+                    t, (reduced_shape[0], reduced_shape[1], reduced_shape[2] // num_wg)
+                )
+                coord = (
+                    None,
+                    None,
+                    (None, wg_idx),
+                ) + (None,) * (rank - 3)
+            else:
+                t = cute.logical_divide(
+                    t,
+                    (
+                        reduced_shape[0],
+                        reduced_shape[1],
+                        reduced_shape[2],
+                        reduced_shape[3] // num_wg,
+                    ),
+                )
+                coord = (
+                    None,
+                    None,
+                    None,
+                    (None, wg_idx),
+                ) + (None,) * (rank - 4)
+        return t[coord]
+
+
+    @cute.jit
+    def compute_loop(
+        self,
+        tiled_mma_S,
+        thr_mma_S,
+        thr_mma_dP,
+        thr_mma_dQ,
+        scale_softmax,
+        tStS,
+        tdPtdP,
+        tdQtdQ,
+        mdQ,
+        mdQ_tma,
+        sdQ,
+        tma_atom_dQ,
+        tiled_copy_r2s_dQ,
+        sLSE,
+        sdPsum,
+        pipeline_S_P,
+        pipeline_dP,
+        pipeline_dS,
+        pipeline_dQ,
+        pipeline_LSE,
+        pipeline_dPsum,
+        block_info,
+        SeqlenInfoCls,
+        TileSchedulerCls,
+    ):
+        # This dQ kernel computes S = Q @ K.T, so accumulator coordinates are (q, k).
+        # Keep LSE/dPsum indexed by q; flash_bwd_sm100.py transposes these views because
+        # its main loop computes S.T = K @ Q.T.
+        sLSE_2D = cute.make_tensor(
+            sLSE.iterator,
+            cute.make_layout(
+                (self.tile_m, self.tile_n, self.Q_stage),
+                stride=(1, 0, cute.round_up(self.tile_m, 64)),
+            ),
+        )
+        sdPsum_2D = cute.make_tensor(
+            sdPsum.iterator,
+            cute.make_layout(
+                (self.tile_m, self.tile_n, self.dO_stage),
+                stride=(1, 0, cute.round_up(self.tile_m, 64)),
+            ),
+        )
+
+        # tix: [128...384] 8 warps
+        tidx = cute.arch.thread_idx()[0] % (cute.arch.WARP_SIZE * len(self.compute_warp_ids))
+        num_wg = len(self.compute_warp_ids) // 4
+        cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+        cta_rank_offset = cta_rank_in_cluster * self.cta_tiler[0]
+        # Stats SMEM is CTA-local, while 2CTA MMA C coordinates cover both CTA rows.
+        sLSE_2D = cute.domain_offset((Int32(0) - cta_rank_offset, Int32(0), Int32(0)), sLSE_2D)
+        sdPsum_2D = cute.domain_offset(
+            (Int32(0) - cta_rank_offset, Int32(0), Int32(0)), sdPsum_2D
+        )
+
+        tileP_f32_like = self.cta_tiler[1] // 32 * self.v_dtype.width
+        # tdS overlaps with tdP in TMEM. dQ-only does not materialize P in TMEM.
+        tScS = thr_mma_S.partition_C(cute.make_identity_tensor(self.qk_mma_tiler[:2]))
+        tdPtdS = cute.composition(tdPtdP, (cute.make_layout((self.tile_n, tileP_f32_like)), 1, 1))
+        tdPcdP = thr_mma_dP.partition_C(cute.make_identity_tensor(self.dov_mma_tiler[:2]))
+        tdPcdS = cute.composition(tdPcdP, (cute.make_layout((self.tile_n, tileP_f32_like)), 1, 1))
+
+        # 2-CTA assumes: repetition should always be 32 & 16.
+        tmem_load_atom = cute.make_copy_atom(
+            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), Float32
+        )
+        tmem_store_atom = cute.make_copy_atom(
+            tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(16)), Float32
+        )
+
+        # tmem -> rmem
+        thr_copy_t2r = copy_utils.make_tmem_copy(tmem_load_atom, num_wg).get_slice(tidx)
+        tStS_t2r = thr_copy_t2r.partition_S(tStS)
+        tdPtdP_t2r = thr_copy_t2r.partition_S(tdPtdP)
+        tScS_t2r = thr_copy_t2r.partition_D(tScS)
+        t0ScS_t2r = thr_copy_t2r.get_slice(0).partition_D(tScS)
+        tSsLSE = thr_copy_t2r.partition_D(thr_mma_S.partition_C(sLSE_2D))
+        tSsdPsum = thr_copy_t2r.partition_D(thr_mma_dP.partition_C(sdPsum_2D))
+        # rmem -> tmem
+        thr_copy_r2t = copy_utils.make_tmem_copy(tmem_store_atom, num_wg).get_slice(tidx)
+        tdPcdS_r2t = thr_copy_r2t.partition_S(tdPcdS)
+        tdPtdS_r2t = thr_copy_r2t.partition_D(tdPtdS)
+
+        consumer_state_S_P = pipeline.make_pipeline_state(
+            cutlass.pipeline.PipelineUserType.Consumer, self.qk_acc_stage
+        )
+        consumer_state_dP = pipeline.make_pipeline_state(
+            cutlass.pipeline.PipelineUserType.Consumer, self.dov_acc_stage
+        )
+        producer_state_dS = pipeline.make_pipeline_state(
+            cutlass.pipeline.PipelineUserType.Producer, self.dsk_acc_stage
+        )
+        consumer_state_dQ = cutlass.pipeline.make_pipeline_state(
+            cutlass.pipeline.PipelineUserType.Consumer, self.epi_stage
+        )
+        consumer_state_LSE = cutlass.pipeline.make_pipeline_state(
+            cutlass.pipeline.PipelineUserType.Consumer, self.Q_stage
+        )
+        consumer_state_dPsum = pipeline.make_pipeline_state(
+            cutlass.pipeline.PipelineUserType.Consumer, self.dO_stage
+        )
+        softmax_scale_log2 = scale_softmax * cutlass.Float32(math.log2(math.e))
+
+        tile_scheduler = TileSchedulerCls()
+        work_tile = tile_scheduler.initial_work_tile_info()
+        while work_tile.is_valid_tile:
+            m_block, head_idx, batch_idx, _ = work_tile.tile_idx
+            m_block_cta_group = m_block // cute.size(tiled_mma_S.thr_id.shape)
+            seqlen = SeqlenInfoCls(batch_idx)
+            seqlen_q = seqlen.seqlen_q
+            n_block_min, n_block_max = block_info.get_n_block_min_max(
+                seqlen, m_block_cta_group, Int32(0), Int32(1)
+            )
+            mask = AttentionMask(
+                self.qk_mma_tiler[0],
+                self.qk_mma_tiler[1],
+                seqlen,
+                window_size_left=block_info.window_size_left,
+                window_size_right=block_info.window_size_right,
+            )
+            mask_fn = partial(
+                mask.apply_mask_sm100,
+                m_block=m_block_cta_group,
+                thr_mma=thr_mma_S,
+                mask_seqlen=True,
+                mask_causal=self.is_causal,
+                mask_local=self.is_local,
+                mask_mod=None,
+                batch_idx=batch_idx,
+                head_idx=head_idx,
+                aux_tensors=None,
+                fastdiv_mods=(None, None),
+                head_divmod=None,
+                r2p=True,
+                rBitmask=None,
+            )
+
+            prefetch_LSE = False
+            loop_count = n_block_max - n_block_min
+            process_tile = (
+                const_expr(not self.is_local and not self.is_varlen_q and not self.is_varlen_k)
+                or n_block_min < n_block_max
+            )
+
+            # Mainloop
+            for iter_idx in cutlass.range(loop_count, unroll=1):
+                n_block = n_block_min + iter_idx
+
+                # S = Q @ K.T in this kernel, so S/dP accumulator coordinates are (q, k).
+                # flash_bwd_sm100.py consumes S.T as (k, q); do not transpose the row-indexed
+                # LSE/dPsum path when mirroring its loop structure here.
+                # ---------------------------------------------
+                #### P = exp(S - LSE)
+                # ---------------------------------------------
+                pipeline_LSE.consumer_wait(consumer_state_LSE)
+                tSrLSE_s2r = cute.make_fragment(tScS_t2r[None, 0, 0, 0].shape, Float32)
+                if const_expr(prefetch_LSE and not self.shuffle_LSE):
+                    cute.autovec_copy(
+                        tSsLSE[None, 0, 0, 0, consumer_state_LSE.index], tSrLSE_s2r
+                    )
+
+                pipeline_S_P.consumer_wait(consumer_state_S_P)
+                tSrS_t2r = cute.make_fragment(tScS_t2r.shape, Float32)
+                cute.copy(
+                    thr_copy_t2r,
+                    tStS_t2r[None, None, None, None, consumer_state_S_P.index],
+                    tSrS_t2r,
+                )
+                cute.arch.fence_view_async_tmem_load()
+                pipeline_S_P.consumer_release(consumer_state_S_P)
+                consumer_state_S_P.advance()
+                check_q_boundary = (m_block_cta_group + 1) * self.qk_mma_tiler[0] > seqlen_q
+                mask_fn(
+                    tSrS_t2r,
+                    n_block=n_block,
+                    thr_tmem_load=thr_copy_t2r,
+                    check_q_boundary=check_q_boundary,
+                )
+                num_stages = cute.size(tScS_t2r, mode=[1])
+                lane_idx = cute.arch.lane_idx()
+                for stage in cutlass.range_constexpr(num_stages):
+                    tSrS_cur = tSrS_t2r[None, stage, 0, 0]
+                    tSsLSE_cur = tSsLSE[None, stage, 0, 0, consumer_state_LSE.index]
+                    if const_expr(not self.shuffle_LSE):
+                        if const_expr(stage > 0 or not prefetch_LSE):
+                            cute.autovec_copy(tSsLSE_cur, tSrLSE_s2r)
+                        tSrLSE = tSrLSE_s2r
+                    else:
+                        tSrLSE = tSsLSE_cur[lane_idx]
+                    for v in cutlass.range_constexpr(cute.size(tSrS_t2r, mode=[0]) // 2):
+                        if const_expr(not self.shuffle_LSE):
+                            lse_pair = (tSrLSE[2 * v], tSrLSE[2 * v + 1])
+                        else:
+                            lse_pair = (
+                                utils.shuffle_sync(tSrLSE, offset=2 * v),
+                                utils.shuffle_sync(tSrLSE, offset=2 * v + 1),
+                            )
+                        tSrS_cur[2 * v], tSrS_cur[2 * v + 1] = cute.arch.fma_packed_f32x2(
+                            (tSrS_cur[2 * v], tSrS_cur[2 * v + 1]),
+                            (softmax_scale_log2, softmax_scale_log2),
+                            (-lse_pair[0], -lse_pair[1]),
+                        )
+                        tSrS_cur[2 * v] = cute.math.exp2(tSrS_cur[2 * v], fastmath=True)
+                        tSrS_cur[2 * v + 1] = cute.math.exp2(tSrS_cur[2 * v + 1], fastmath=True)
+                pipeline_LSE.consumer_release(consumer_state_LSE)
+                consumer_state_LSE.advance()
+
+                # ---------------------------------------------
+                #### dS = P * (dP - dPsum)
+                # ---------------------------------------------
+                pipeline_dPsum.consumer_wait(consumer_state_dPsum)
+                pipeline_dP.consumer_wait(consumer_state_dP)
+                pipeline_dS.producer_acquire(producer_state_dS)
+
+                for stage in cutlass.range_constexpr(num_stages):
+                    tdPrdP_t2r = cute.make_fragment(tScS_t2r[None, 0, None, None].shape, Float32)
+                    cute.copy(
+                        thr_copy_t2r,
+                        tdPtdP_t2r[None, stage, None, None, consumer_state_dP.index],
+                        tdPrdP_t2r,
+                    )
+                    cute.arch.fence_view_async_tmem_load()
+                    tdPrdP_cur = tdPrdP_t2r[None, 0, 0]
+                    tSrS_cur = tSrS_t2r[None, stage, 0, 0]
+                    tSsdPsum_cur = tSsdPsum[None, stage, 0, 0, consumer_state_dPsum.index]
+                    if const_expr(not self.shuffle_dPsum):
+                        tSrdPsum = cute.make_fragment_like(tSsdPsum_cur, Float32)
+                        cute.autovec_copy(tSsdPsum_cur, tSrdPsum)
+                    else:
+                        tSrdPsum = tSsdPsum_cur[lane_idx]
+                    for v in cutlass.range_constexpr(cute.size(tdPrdP_t2r, mode=[0]) // 2):
+                        if const_expr(not self.shuffle_dPsum):
+                            dPsum_pair = (tSrdPsum[2 * v], tSrdPsum[2 * v + 1])
+                        else:
+                            dPsum_pair = (
+                                utils.shuffle_sync(tSrdPsum, offset=2 * v),
+                                utils.shuffle_sync(tSrdPsum, offset=2 * v + 1),
+                            )
+                        tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1] = (
+                            quack.activation.sub_packed_f32x2(
+                                (tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1]), dPsum_pair
+                            )
+                        )
+                        tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1] = cute.arch.mul_packed_f32x2(
+                            (tSrS_cur[2 * v], tSrS_cur[2 * v + 1]),
+                            (tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1]),
+                        )
+                        tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1] = cute.arch.mul_packed_f32x2(
+                            (tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1]),
+                            (scale_softmax, scale_softmax),
+                        )
+
+                    tdPrdS_cvt = cute.make_fragment_like(tdPrdP_cur, self.ds_dtype)
+                    utils.cvt_f16(tdPrdP_cur, tdPrdS_cvt)
+                    tdPrdS_r2t = cute.recast_tensor(tdPrdS_cvt, Float32)
+                    cute.copy(thr_copy_r2t, tdPrdS_r2t, tdPtdS_r2t[None, stage, 0, 0])
+                cute.arch.fence_view_async_tmem_store()
+                pipeline_dP.consumer_release(consumer_state_dP)
+                consumer_state_dP.advance()
+                pipeline_dS.producer_commit(producer_state_dS)
+                producer_state_dS.advance()
+                pipeline_dPsum.consumer_release(consumer_state_dPsum)
+                consumer_state_dPsum.advance()
+
+            # Epilogue
+            if process_tile:
+                if const_expr(not seqlen.has_cu_seqlens_q):
+                    thr_copy_r2s_dQ = tiled_copy_r2s_dQ.get_slice(tidx)
+                    consumer_state_dQ = self.epilogue_dQ_tma(
+                        tidx,
+                        batch_idx,
+                        head_idx,
+                        m_block,
+                        seqlen,
+                        thr_mma_dQ,
+                        tdQtdQ,
+                        mdQ_tma,
+                        sdQ,
+                        tma_atom_dQ,
+                        thr_copy_r2s_dQ,
+                        pipeline_dQ,
+                        consumer_state_dQ,
+                        None,  # Don't scale
+                        self.epilogue_sync_bar_id,
+                        None,
+                    )
+                else:
+                    consumer_state_dQ = self.epilogue_dQ(
+                        tidx,
+                        batch_idx,
+                        head_idx,
+                        m_block,
+                        seqlen,
+                        thr_mma_dQ,
+                        tdQtdQ,
+                        mdQ,
+                        pipeline_dQ,
+                        consumer_state_dQ,
+                    )
+            tile_scheduler.advance_to_next_work()
+            work_tile = tile_scheduler.get_current_work()
+        pipeline_dS.producer_tail(producer_state_dS)
+
+    @cute.jit
+    def epilogue_dQ_tma(
+        self,
+        tidx: Int32,
+        batch_idx: Int32,
+        head_idx: Int32,
+        m_block: Int32,
+        seqlen,
+        thr_mma: cute.core.ThrMma,
+        tdQtdQ: cute.Tensor,
+        mdQ: cute.Tensor,
+        sdQ: cute.Tensor,
+        tma_atom_dQ: cute.CopyAtom,
+        thr_copy_r2s_dQ: cute.TiledCopy,
+        pipeline_dQ,
+        consumer_state_dQ,
+        scale: Optional[Float32],
+        barrier_id: Int32,
+        mdQ_semaphore: Optional[cute.Tensor],
+    ) -> cutlass.pipeline.PipelineState:
+        tile_hdim = self.tile_hdim
+        dtype = self.dq_dtype
+        epi_tile = self.epi_tile_dQ
+        num_compute_threads = cute.arch.WARP_SIZE * len(self.compute_warp_ids)
+        wg_idx = (cute.arch.thread_idx()[0] % num_compute_threads) // 128
+        num_wg = num_compute_threads // 128
         leader_warp = (cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4) == 0
 
-        for iter in cutlass.range(self.iterations_dsk):
-            gdQ = gdQ_staged[None, None, iter]
-            cdQ = cdQ_staged[None, None, iter]
-            tdQtdQ = tdQtdQ_staged[(None, None), 0, 0, iter]
-            tdQtdQ_epi = cute.zipped_divide(tdQtdQ, epi_tile)
-            cdQ_epi = cute.zipped_divide(cdQ, epi_tile)
-            gdQ_epi = cute.zipped_divide(gdQ, epi_tile)
-            cdQ_local = cute.make_identity_tensor(epi_tile)
-            cdQ_local_epi = cute.zipped_divide(cdQ_local, epi_tile)
-            tidx, _, _ = cute.arch.thread_idx()
-            thread_idx = tidx % (self.threads_per_warp * len(self.epilogue_warp_ids))
-            tmem_copy_atom = cute.make_copy_atom(
-                tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), self.acc_dtype
+        assert scale is None
+        assert mdQ_semaphore is None
+
+        sdQ = sdQ[None, None, wg_idx]  # (tile_m, 64) for bf16
+
+        # (8, tile_m / 128, 64 / 8) = (8, 1, 8)
+        tdQsdQ_r2s = thr_copy_r2s_dQ.partition_D(sdQ)
+
+        assert not seqlen.has_cu_seqlens_q, "varlen uses non tma store path"
+        mdQ_cur = mdQ[None, None, head_idx, batch_idx]  # (seqlen, hdim)
+        gdQ_p = cute.local_tile(mdQ_cur, (self.tile_m, tile_hdim), (m_block, 0))
+        gdQ = self.split_wg(gdQ_p, wg_idx, num_wg)  # (tile_m, hdim)
+        gdQ_epi = cute.local_tile(gdQ, epi_tile, (0, None))  # (tile_m, 64, epi_stage)
+
+        tdQsdQ, tdQgdQ = cpasync.tma_partition(
+            tma_atom_dQ,
+            0,  # no multicast
+            cute.make_layout(1),
+            cute.group_modes(sdQ, 0, 2),
+            cute.group_modes(gdQ_epi, 0, 2),
+        )  # (TMA) and (TMA, EPI_STAGE)
+        assert len(tdQsdQ.shape) == 1, "Wrong rank for SMEM fragment tdQsdQ"
+        assert len(tdQgdQ.shape) == 2, "Wrong rank for GMEM fragment tdQgdQ"
+        num_epi_stages = cute.size(tdQgdQ.shape[1])
+        assert num_epi_stages == self.num_epi_stages_dQ, "Epi stage calculation is wrong (Q)"
+
+        tmem_load_atom = cute.make_copy_atom(
+            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(self.dQ_reduce_ncol)), Float32
+        )
+
+        read_flag = const_expr(True)
+
+        pipeline_dQ.consumer_wait(consumer_state_dQ)
+
+        for epi_stage in cutlass.range_constexpr(num_epi_stages):
+            # TMEM -> RMEM -- setup
+            thr_copy_t2r = tcgen05.make_tmem_copy(tmem_load_atom, tdQtdQ).get_slice(tidx)
+            tdQtdQ_t2r_p = thr_copy_t2r.partition_S(tdQtdQ)
+            tdQtdQ_t2r = self.split_wg(tdQtdQ_t2r_p, wg_idx, num_wg)[None, None, 0, 0]
+            if const_expr(num_epi_stages > 1):
+                tdQtdQ_t2r = tdQtdQ_t2r[None, epi_stage]
+
+            cdQ = cute.make_identity_tensor((self.tile_m, tile_hdim))
+            tdQcdQ = thr_mma.partition_C(cdQ)
+            tdQcdQ_t2r_p = thr_copy_t2r.partition_D(tdQcdQ)
+            tdQcdQ_t2r = self.split_wg(tdQcdQ_t2r_p, wg_idx, num_wg)[None, None, 0, 0]
+            if const_expr(num_epi_stages > 1):
+                tdQcdQ_t2r = tdQcdQ_t2r[None, epi_stage]
+
+            tdQrdQ_t2r = cute.make_fragment(tdQcdQ_t2r.shape, Float32)
+
+            assert cute.size(tdQrdQ_t2r) == cute.size(tdQtdQ_t2r) // cute.arch.WARP_SIZE, (
+                "RMEM<->TMEM fragment size mismatch"
             )
-            tiled_tmem_load = tcgen05.make_tmem_copy(tmem_copy_atom, tdQtdQ_epi)
-            thr_tmem_load = tiled_tmem_load.get_slice(thread_idx)
-            tTMEM_LOADtdQ = thr_tmem_load.partition_S(tdQtdQ_epi)
-            tTMEM_LOADgdQ = thr_tmem_load.partition_D(gdQ_epi)
-            tTMEM_LOADcdQ = thr_tmem_load.partition_D(cdQ_epi)
-            tTMEM_LOADcdQ_local = thr_tmem_load.partition_D(cdQ_local_epi)
 
-            if cutlass.const_expr(not varlen):
-                gdQ_tma = gdQ_tma_staged[None, None, iter]
-                gdQ_tma_epi = cute.local_tile(gdQ_tma, epi_tile_dQ, (0, None))
-                sdQ_stage = s_epi_dQ[None, None, 0]
+            # TMEM -> RMEM -- copy and fence
+            cute.copy(thr_copy_t2r, tdQtdQ_t2r, tdQrdQ_t2r)
+            cute.arch.fence_view_async_tmem_load()
 
-                for stage_k in cutlass.range_constexpr(num_epi_stages_dQ):
-                    for i in cutlass.range(cute.size(tTMEM_LOADtdQ, mode=[1]), unroll_full=True):
-                        tTMEM_LOADtdQ_i = tTMEM_LOADtdQ[None, i, 0]
-                        tTMEM_LOADcdQ_i_local = tTMEM_LOADcdQ_local[None, i, 0]
-                        tTMrdQ = cute.make_rmem_tensor(tTMEM_LOADcdQ_i_local.shape, self.acc_dtype)
-                        cute.copy(tiled_tmem_load, tTMEM_LOADtdQ_i, tTMrdQ)
-                        tSMrdQ = cute.make_rmem_tensor(tTMrdQ.shape, self.q_dtype)
-                        dq_vec = tTMrdQ.load()
-                        tSMrdQ.store(dq_vec.to(self.q_dtype))
-                        for j in cutlass.range_constexpr(cute.size(tTMEM_LOADcdQ_i_local)):
-                            c = tTMEM_LOADcdQ_i_local[j]
-                            m_pos = c[0]
-                            n_pos = c[1]
-                            if n_pos // epi_cols_dQ == stage_k:
-                                s_epi_dQ[m_pos, n_pos % epi_cols_dQ, 0] = tSMrdQ[j]
+            # RMEM -- convert
+            tdQrdQ = cute.make_fragment(tdQrdQ_t2r.shape, dtype)  # (64 columns)
+            tdQrdQ.store(tdQrdQ_t2r.load().to(dtype))
 
-                    cute.arch.fence_view_async_shared()
-                    cute.arch.barrier(barrier_id=3, number_of_threads=128)
+            # RMEM -> SMEM -- copy, fence and barrier
+            tdQrdQ_r2s = cute.make_tensor(tdQrdQ.iterator, tdQsdQ_r2s.shape)
+            cute.copy(thr_copy_r2s_dQ, tdQrdQ_r2s, tdQsdQ_r2s)
+            cute.arch.fence_view_async_shared()
+            cute.arch.barrier(barrier_id=barrier_id + wg_idx, number_of_threads=128)
 
-                    if leader_warp:
-                        gdQ_stage = gdQ_tma_epi[None, None, stage_k]
-                        td_sdQ, td_gdQ = cpasync.tma_partition(
-                            tma_atom_dQ,
-                            0,
-                            cute.make_layout(1),
-                            cute.group_modes(sdQ_stage, 0, 2),
-                            cute.group_modes(gdQ_stage, 0, 2),
-                        )
-                        cute.copy(tma_atom_dQ, td_sdQ, td_gdQ)
-                        cute.arch.cp_async_bulk_commit_group()
-                        cute.arch.cp_async_bulk_wait_group(0, read=True)
-                    # Non-issuing threads must not rotate the SMEM buffer
-                    # until the leader warp's TMA read has completed.
-                    cute.arch.barrier(barrier_id=3, number_of_threads=128)
-            else:
-                for i in cutlass.range(cute.size(tTMEM_LOADtdQ, mode=[1]), unroll_full=True):
-                    tTMEM_LOADtdQ_i = tTMEM_LOADtdQ[None, i, 0]
-                    tTMEM_LOADgdQ_i = tTMEM_LOADgdQ[None, i, 0]
-                    tTMEM_LOADcdQ_i = tTMEM_LOADcdQ[None, i, 0]
-                    tTMrdQ = cute.make_rmem_tensor(tTMEM_LOADcdQ[None, 0, i].shape, self.acc_dtype)
-                    cute.copy(tiled_tmem_load, tTMEM_LOADtdQ_i, tTMrdQ)
-                    tSMrdQ = cute.make_rmem_tensor(tTMrdQ.shape, self.q_dtype)
-                    dq_vec = tTMrdQ.load()
-                    tSMrdQ.store(dq_vec.to(self.q_dtype))
-                    if cute.elem_less(tTMEM_LOADcdQ_i[0][0], seqlen_q):
-                        cute.autovec_copy(tSMrdQ, tTMEM_LOADgdQ_i)
-        dq_handle.release()
-        return mma_dq_consumer
+            # SMEM -> GMEM
+            if leader_warp:
+                cute.copy(tma_atom_dQ, tdQsdQ, tdQgdQ[None, epi_stage])
+                if const_expr(epi_stage < num_epi_stages - 1):
+                    cute.arch.cp_async_bulk_commit_group()
+                    cute.arch.cp_async_bulk_wait_group(0, read=read_flag)
+                cute.arch.barrier_arrive(
+                    barrier_id=barrier_id + wg_idx, number_of_threads=128 + cute.arch.WARP_SIZE
+                )
+
+            # Barrier since all warps need to wait for SMEM to be freed
+            cute.arch.fence_view_async_shared()
+            cute.arch.barrier(
+                barrier_id=barrier_id + wg_idx, number_of_threads=128 + cute.arch.WARP_SIZE
+            )
+
+        cute.arch.sync_warp()
+        with cute.arch.elect_one():
+            pipeline_dQ.consumer_release(consumer_state_dQ)
+        consumer_state_dQ.advance()
+        return consumer_state_dQ
+
+    @cute.jit
+    def epilogue_dQ(
+        self,
+        tidx: Int32,
+        batch_idx: Int32,
+        head_idx: Int32,
+        m_block: Int32,
+        seqlen,
+        thr_mma: cute.core.ThrMma,
+        tdQtdQ: cute.Tensor,
+        mdQ: cute.Tensor,
+        pipeline_dQ,
+        consumer_state_dQ,
+    ) -> cutlass.pipeline.PipelineState:
+        num_compute_threads = cute.arch.WARP_SIZE * len(self.compute_warp_ids)
+        wg_idx = (cute.arch.thread_idx()[0] % num_compute_threads) // 128
+        thread_idx = tidx % 128
+        epi_tile = self.epi_tile
+        mdQ_cur = seqlen.offset_batch_Q(mdQ, batch_idx, dim=3)[None, None, head_idx]
+        gdQ = cute.local_tile(
+            mdQ_cur, cute.select(self.dsk_block_tiler, mode=[0, 1]), (m_block, 0)
+        )
+        cdQ = cute.local_tile(
+            cute.make_identity_tensor(mdQ_cur.shape),
+            cute.select(self.dsk_block_tiler, mode=[0, 1]),
+            (m_block, 0),
+        )
+        tdQtdQ = tdQtdQ[(None, None), 0, 0]
+        tdQtdQ_epi = cute.zipped_divide(tdQtdQ, epi_tile)
+        gdQ_epi = cute.zipped_divide(gdQ, epi_tile)
+        cdQ_epi = cute.zipped_divide(cdQ, epi_tile)
+
+        tmem_load_atom = cute.make_copy_atom(
+            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), Float32
+        )
+        thr_copy_t2r = tcgen05.make_tmem_copy(tmem_load_atom, tdQtdQ_epi).get_slice(thread_idx)
+        tdQtdQ_t2r = thr_copy_t2r.partition_S(tdQtdQ_epi)
+        tdQgdQ_t2r = thr_copy_t2r.partition_D(gdQ_epi)
+        tdQcdQ_t2r = thr_copy_t2r.partition_D(cdQ_epi)
+
+        pipeline_dQ.consumer_wait(consumer_state_dQ)
+
+        for epi_stage in cutlass.range(cute.size(tdQtdQ_t2r, mode=[1]), unroll_full=True):
+            # TMEM -> RMEM -- copy and fence
+            tdQtdQ_t2r_cur = tdQtdQ_t2r[None, epi_stage, 0]
+            tdQgdQ_t2r_cur = tdQgdQ_t2r[None, epi_stage, 0]
+            tdQcdQ_t2r_cur = tdQcdQ_t2r[None, epi_stage, 0]
+            tdQrdQ_t2r = cute.make_fragment(tdQcdQ_t2r_cur.shape, Float32)
+            cute.copy(thr_copy_t2r, tdQtdQ_t2r_cur, tdQrdQ_t2r)
+            cute.arch.fence_view_async_tmem_load()
+
+            # RMEM -> GMEM
+            tdQrdQ = cute.make_fragment(tdQrdQ_t2r.shape, self.dq_dtype)
+            tdQrdQ.store(tdQrdQ_t2r.load().to(self.dq_dtype))
+            if cute.elem_less(tdQcdQ_t2r_cur[0][0], seqlen.seqlen_q):
+                cute.autovec_copy(tdQrdQ, tdQgdQ_t2r_cur)
+
+        cute.arch.sync_warp()
+        with cute.arch.elect_one():
+            pipeline_dQ.consumer_release(consumer_state_dQ)
+        consumer_state_dQ.advance()
+        return consumer_state_dQ

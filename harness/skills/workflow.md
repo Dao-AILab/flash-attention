@@ -56,7 +56,9 @@ Overall development gate for CuteDSL HD256 work.
 | No tiny-step plans | A step must represent a coherent architectural layer. |
 | No raw UT gate | Use `test.md`; it owns UT selection, fail-fast, and hang detection. |
 | No benchmark-before-UT | Benchmark runs after UT passes. |
-| No skipped benchmark | Performance-sensitive work cannot lock without `benchmark.md`. |
+| No skipped benchmark | Performance-sensitive work cannot lock without a completed `benchmark.md` run after the latest UT pass. |
+| No implicit lock | After UT and benchmark, explicitly decide whether W4 passed before W5/W6. |
 | No unlocked continuation | If UT fails or benchmark regresses, fix or roll back before the next step. |
 | No commit-before-lock | Commit only after the current step is locked. |
+| Split harness commit | If kernel/source changes and `harness/` changes both exist, commit kernel/source and harness in separate commits. |
 | Unknown command | Stop and load or create the matching command doc under `../commands/`. |

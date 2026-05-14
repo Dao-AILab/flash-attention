@@ -115,6 +115,7 @@ def main() -> int:
                 old_log.unlink()
         proc = run(cmd)
         start = time.monotonic()
+        last_progress = start
         offsets: dict[Path, int] = {}
         gpu_100_streak = 0
         collected = ""
@@ -127,6 +128,7 @@ def main() -> int:
                     log.write(line)
                     log.flush()
                     collected += line
+                    last_progress = time.monotonic()
                     if FAIL_RE.search(line):
                         note("failure detected in command output; killing UT process group")
                         kill_process_group(proc)
@@ -138,6 +140,7 @@ def main() -> int:
                 chunk = read_new(path, offsets)
                 if chunk:
                     collected += "\n" + chunk
+                    last_progress = time.monotonic()
                     if FAIL_RE.search(chunk):
                         cases = extract_cases(collected)
                         failure_cases.write_text(
@@ -154,7 +157,9 @@ def main() -> int:
             if args.preflight_only and proc.poll() is not None:
                 return proc.returncode or 0
 
-            elapsed = time.monotonic() - start
+            now = time.monotonic()
+            elapsed = now - start
+            idle = now - last_progress
             util = gpu_util()
             if util == 100:
                 gpu_100_streak += 1
@@ -162,12 +167,13 @@ def main() -> int:
                 gpu_100_streak = 0
 
             if (
-                elapsed >= args.hang_seconds
+                idle >= args.hang_seconds
                 and gpu_100_streak >= args.gpu_100_samples
                 and proc.poll() is None
             ):
                 msg = (
                     f"hang detected: elapsed={elapsed:.1f}s, "
+                    f"idle={idle:.1f}s, "
                     f"gpu_util=100 for {gpu_100_streak} samples"
                 )
                 hang_report.write_text(

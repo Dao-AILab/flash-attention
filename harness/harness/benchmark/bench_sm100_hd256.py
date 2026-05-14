@@ -46,12 +46,33 @@ import torch.nn.functional as F
 
 from flash_attn.cute.interface import _flash_attn_fwd, _flash_attn_bwd
 
-try:
-    # Preferred location in this repo.
-    from benchmarks.benchmark_attn import get_peak_flops
-except ModuleNotFoundError:
-    # Fallback for older layouts.
-    from hopper.benchmark_attn import get_peak_flops
+def get_peak_flops(device_index: int = 0, dtype: torch.dtype = torch.bfloat16) -> float | None:
+    """Return peak dense FLOPS for the current GPU without importing FA2 helpers."""
+    peak_bf16_flops = {
+        "A100": 312e12,
+        "A6000": 309.7e12,
+        "L40S": 362e12,
+        "H100 SXM": 989e12,
+        "H100 NVL": 835e12,
+        "H100 PCIe": 756e12,
+        "H200": 989e12,
+        "H20": 148e12,
+        "GB200": 2.5e15,
+        "GB300": 2.5e15,
+        "B300": 2.25e15,
+        "B200": 2.25e15,
+    }
+    device_name = torch.cuda.get_device_name(device_index)
+    peak = None
+    for key in sorted(peak_bf16_flops, key=len, reverse=True):
+        if key.lower() in device_name.lower():
+            peak = peak_bf16_flops[key]
+            break
+    if peak is None:
+        return None
+    if dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+        peak *= 2
+    return peak
 
 
 @contextlib.contextmanager
@@ -547,4 +568,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

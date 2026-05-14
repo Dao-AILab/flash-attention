@@ -19,6 +19,7 @@ LOGDIR="$HARNESS_ROOT/logs/test"
 TEST_FILE="$REPO/tests/cute/test_flash_attn.py"
 VARLEN_TEST_FILE="$REPO/tests/cute/test_flash_attn_varlen.py"
 PREFLIGHT_ONLY=0
+PYTEST_IMPORT_ARGS=(--import-mode=importlib --rootdir="$REPO")
 
 if [[ "${1:-}" == "--preflight-only" ]]; then
     PREFLIGHT_ONLY=1
@@ -27,21 +28,92 @@ fi
 mkdir -p "$LOGDIR"
 
 run_preflight() {
-    (cd "$REPO" && python3 - <<'PY'
+    (cd /tmp && REPO="$REPO" python3 - <<'PY'
+import hashlib
+import importlib.metadata as md
+import os
 import re
+import subprocess
+import sys
 from pathlib import Path
 
 import flash_attn
+import flash_attn.cute.interface as interface
+import flash_attn.cute.pipeline as pipeline
 import flash_attn.cute.flash_fwd as flash_fwd
+import flash_attn.cute.sm100_hd256_2cta_fmha_backward as bwd
+import flash_attn.cute.sm100_hd256_2cta_fmha_backward_dkdvkernel as dkdv
+import flash_attn.cute.sm100_hd256_2cta_fmha_backward_dqkernel as dq
 
 print(f"[preflight] flash_attn={flash_attn.__file__}")
+print(f"[preflight] flash_attn.__path__={list(getattr(flash_attn, '__path__', []))}")
 print(f"[preflight] flash_attn.cute.flash_fwd={flash_fwd.__file__}")
 
+repo = Path(os.environ["REPO"])
+print(f"[preflight] repo={repo}")
+print(f"[preflight] cwd={Path.cwd()}")
+print(f"[preflight] sys.path[0]={sys.path[0]!r}")
+for pkg in [
+    "flash-attn-4",
+    "nvidia-cutlass-dsl",
+    "nvidia-cutlass-dsl-libs-base",
+    "quack-kernels",
+]:
+    try:
+        print(f"[preflight] package {pkg}={md.version(pkg)}")
+    except md.PackageNotFoundError:
+        print(f"[preflight] package {pkg}=NOT_INSTALLED")
+
+try:
+    git_head = subprocess.check_output(
+        ["git", "-C", str(repo), "rev-parse", "--short", "HEAD"],
+        text=True,
+    ).strip()
+except Exception as exc:
+    git_head = f"UNKNOWN:{exc}"
+print(f"[preflight] git_head={git_head}")
+
+try:
+    dirty = subprocess.check_output(
+        ["git", "-C", str(repo), "status", "--short"],
+        text=True,
+    ).splitlines()
+except Exception as exc:
+    dirty = [f"UNKNOWN:{exc}"]
+print(f"[preflight] git_dirty_count={len(dirty)}")
+for line in dirty[:40]:
+    print(f"[preflight] git_dirty {line}")
+
+def stamp(label: str, path: Path) -> None:
+    path = path.resolve()
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+    stat = path.stat()
+    under_repo = repo in path.parents or path == repo
+    print(
+        f"[source] {label} path={path} under_repo={under_repo} "
+        f"sha256={digest} mtime_ns={stat.st_mtime_ns} size={stat.st_size}"
+    )
+
+for label, module in [
+    ("interface", interface),
+    ("pipeline", pipeline),
+    ("flash_fwd", flash_fwd),
+    ("sm100_hd256_bwd", bwd),
+    ("sm100_hd256_dkdv", dkdv),
+    ("sm100_hd256_dq", dq),
+]:
+    stamp(label, Path(module.__file__))
+
 targets = [
-    (Path("tests/cute/test_flash_attn.py"), "test_flash_attn_output", "d"),
-    (Path("tests/cute/test_flash_attn.py"), "test_flash_attn_varlen_output", "d"),
-    (Path("tests/cute/test_flash_attn_varlen.py"), "test_varlen", "D"),
+    (repo / "tests/cute/test_flash_attn.py", "test_flash_attn_output", "d"),
+    (repo / "tests/cute/test_flash_attn.py", "test_flash_attn_varlen_output", "d"),
+    (repo / "tests/cute/test_flash_attn_varlen.py", "test_varlen", "D"),
 ]
+for label, path in [
+    ("test_flash_attn", targets[0][0]),
+    ("test_flash_attn_varlen", targets[2][0]),
+]:
+    stamp(label, path)
 
 def ensure_hd256_only(path: Path, func_name: str, param_name: str) -> bool:
     text = path.read_text()
@@ -93,7 +165,7 @@ if [[ "$PREFLIGHT_ONLY" -eq 1 ]]; then
 fi
 
 PYTEST_XDIST_ARGS=()
-if cd "$REPO" && python3 -m pytest --help 2>/dev/null | grep -q -- "--numprocesses"; then
+if cd /tmp && python3 -m pytest --help 2>/dev/null | grep -q -- "--numprocesses"; then
     PYTEST_XDIST_ARGS=(-n 0)
 fi
 
@@ -106,7 +178,7 @@ run_test_group() {
     local logfile="$2"
     shift 2
     echo "[$(date '+%H:%M:%S')] START  $name -> $logfile"
-    if cd "$REPO" && python3 -m pytest -v -s "${PYTEST_XDIST_ARGS[@]}" --tb=long "$@" > "$logfile" 2>&1; then
+    if cd /tmp && python3 -m pytest -v -s "${PYTEST_IMPORT_ARGS[@]}" "${PYTEST_XDIST_ARGS[@]}" --tb=long "$@" > "$logfile" 2>&1; then
         results+=("PASS  $name")
         ((pass++))
     else

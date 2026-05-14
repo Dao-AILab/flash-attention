@@ -28,6 +28,7 @@ Commit gate for CuteDSL HD256 harness work.
 | ----------- | ------------- | ---------- |
 | Refactor default | Only the HD256 refactor files below | Forbidden |
 | Feature | Explicitly staged feature files | Allowed only for new Feature work |
+| Harness | Only `harness/` files | Forbidden |
 
 ## Refactor Allowlist
 
@@ -45,5 +46,6 @@ Commit gate for CuteDSL HD256 harness work.
 | No test commit by default | Do not commit `tests/` unless commit type is explicitly Feature. |
 | Refactor commit scope | Do not commit files outside the HD256 refactor allowlist. |
 | Feature exception | Tests may be committed only when the user explicitly says the change is a new Feature. |
+| Harness split | Commit `harness/` changes separately from kernel/source changes. |
 | Identity | If current system user or git user is `wangsiyu` or `siyu.wsy`, set local git identity to `wangsiyu <siyu.wsy@gmail.com>`. |
 | Command handoff | Use `../commands/commit.md`; do not hand-roll commit commands. |

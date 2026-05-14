@@ -31,6 +31,7 @@ Auto-invoke based on "When to Use" conditions.
 | Command | File | Description |
 | ------- | ---- | ----------- |
 | `/test` | [commands/test.md](commands/test.md) | Run monitored UT with fail-fast and hang detection |
+| `/environment` | [commands/environment.md](commands/environment.md) | Reset and install repo-local CuteDSL FA4 editable runtime |
 | `/hang_detect_fix` | [commands/hang_detect_fix.md](commands/hang_detect_fix.md) | Capture cuda-gdb hang diagnostics for a reproduced hang |
 | `/benchmark` | [commands/benchmark.md](commands/benchmark.md) | Run repeated HD256 benchmark and compare with previous run |
 | `/wheel` | [commands/wheel.md](commands/wheel.md) | Build only the repo-local `flash_attn/cute` FA4 wheel into `dist/` |
@@ -40,7 +41,7 @@ Auto-invoke based on "When to Use" conditions.
 
 | User Intent | Load | Rule |
 | ----------- | ---- | ---- |
-| Environment, editable, FA4 import path | `skills/environment.md` | Use repo-local `flash_attn/cute`; never patch `flash_attn/__init__.py`. |
+| Environment, editable, FA4 import path | `skills/environment.md` + `commands/environment.md` | Use repo-local `flash_attn/cute`; never patch `flash_attn/__init__.py`. |
 | Refactor, align, target file | `skills/workflow.md` + `skills/refactor.md` | Follow workflow gates, refactor edit allowlist, and merge-ready target alignment. |
 | UT, correctness, precision test | `skills/test.md` + `commands/test.md` | Use monitored `/test`; do not call raw pytest from memory. |
 | Hang, stuck UT, GPU 100% | `skills/hang_detect_fix.md` + `commands/hang_detect_fix.md` | Kill broad UT, reproduce case, capture cuda-gdb diagnostics. |

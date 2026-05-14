@@ -20,6 +20,7 @@ usage() {
     cat <<'EOF'
 Usage:
   bash harness/harness/commit/commit.sh --type refactor -m "message"
+  bash harness/harness/commit/commit.sh --type harness -m "message"
   bash harness/harness/commit/commit.sh --type feature -m "message"
   bash harness/harness/commit/commit.sh --type refactor --dry-run -m "message"
 EOF
@@ -51,8 +52,8 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ "$TYPE" != "refactor" && "$TYPE" != "feature" ]]; then
-    echo "[commit] --type must be refactor or feature" >&2
+if [[ "$TYPE" != "refactor" && "$TYPE" != "harness" && "$TYPE" != "feature" ]]; then
+    echo "[commit] --type must be refactor, harness, or feature" >&2
     exit 2
 fi
 
@@ -105,6 +106,21 @@ check_refactor_staged_scope() {
     done < <(git diff --cached --name-only)
 }
 
+check_harness_staged_scope() {
+    local path
+    while IFS= read -r path; do
+        [[ -z "$path" ]] && continue
+        if [[ "$path" == tests/* ]]; then
+            echo "[commit] tests are forbidden in harness commits: $path" >&2
+            return 1
+        fi
+        if [[ "$path" != harness/* ]]; then
+            echo "[commit] file outside harness scope is staged: $path" >&2
+            return 1
+        fi
+    done < <(git diff --cached --name-only)
+}
+
 configure_identity_if_needed
 
 if [[ "$TYPE" == "refactor" ]]; then
@@ -115,6 +131,14 @@ if [[ "$TYPE" == "refactor" ]]; then
         git add -- "${ALLOWED_REFACTOR_FILES[@]}"
     fi
     check_refactor_staged_scope
+elif [[ "$TYPE" == "harness" ]]; then
+    check_harness_staged_scope
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        echo "[commit] dry-run: would stage harness files"
+    else
+        git add -- harness
+    fi
+    check_harness_staged_scope
 else
     if [[ "$DRY_RUN" -eq 1 ]]; then
         echo "[commit] dry-run: feature mode uses existing staged files"

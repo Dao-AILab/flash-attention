@@ -14,6 +14,7 @@ Commit command with harness scope checks.
 | Mode | Command |
 | ---- | ------- |
 | Refactor commit | `bash harness/harness/commit/commit.sh --type refactor -m "message"` |
+| Harness commit | `bash harness/harness/commit/commit.sh --type harness -m "message"` |
 | Feature commit | `bash harness/harness/commit/commit.sh --type feature -m "message"` |
 | Dry run | `bash harness/harness/commit/commit.sh --type refactor --dry-run -m "message"` |
 
@@ -22,7 +23,11 @@ Commit command with harness scope checks.
 | Type | Staging Behavior | Scope Check |
 | ---- | ---------------- | ----------- |
 | `refactor` | Script stages only the three allowed HD256 kernel files. | Fails if staged files include anything else or any `tests/` path. |
+| `harness` | Script stages only `harness/` files. | Fails if staged files include anything outside `harness/` or any `tests/` path. |
 | `feature` | Script does not auto-stage. Caller must stage intended files first. | Tests are allowed only in this explicit mode. |
+
+If both kernel/source and harness files changed in one task, run separate
+commits. Never mix `harness/` changes into the refactor commit.
 
 ## Identity
 

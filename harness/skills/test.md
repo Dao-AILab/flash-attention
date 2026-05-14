@@ -32,7 +32,7 @@ UT policy for CuteDSL HD256 validation.
 | UT failed detected in logs | Immediately stop the full UT run. |
 | After failure stop | Reproduce the failing case, fix the bug, rerun `/test`. |
 | Repeated failure | Repeat reproduce-fix-rerun until all UT pass. |
-| Potential hang | Follow `hang_detect_fix.md`. |
+| Potential hang | Confirm there has been no command or UT-log progress before following `hang_detect_fix.md`. |
 
 ## Hard Rules
 
@@ -40,5 +40,6 @@ UT policy for CuteDSL HD256 validation.
 | ---- | ----------- |
 | No dead waiting | Do not wait indefinitely after failed logs or hang signal. |
 | Fail fast | Kill the running UT process group when failure is detected. |
+| Hang means idle | GPU 100% with continuing pytest log progress is not a hang. |
 | Fix before rerun | Rerun only after investigating and attempting a fix. |
 | Command handoff | Monitoring must be triggered through `../commands/test.md`. |

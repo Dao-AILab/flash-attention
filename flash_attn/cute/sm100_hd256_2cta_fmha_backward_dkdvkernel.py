@@ -19,13 +19,13 @@ import cutlass.cute as cute
 from cutlass import Float32, const_expr
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.utils import LayoutEnum
-import cutlass.pipeline as pipeline
 import cutlass.utils.blackwell_helpers as sm100_utils
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
 from cutlass.cute.typing import Int32
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 from flash_attn.cute import copy_utils
+from flash_attn.cute import pipeline
 from flash_attn.cute import utils
 from quack import layout_utils
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
@@ -162,7 +162,6 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             )
         )
 
-        self.cta_sync_bar_id = 0
         self.tmem_alloc_sync_bar_id = int(NamedBarrierBwdSm100.TmemPtr)
         self.epilogue_sync_bar_id = int(NamedBarrierBwdSm100.EpilogueWG1)
         # NamedBarrier
@@ -770,15 +769,23 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
     ):
         """Core CuTeDSL backward kernel."""
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
+        bidx, _, _ = cute.arch.block_idx()
+        mma_tile_coord_v = bidx % self.cta_group_size
+        is_leader_cta = mma_tile_coord_v == 0
+        cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         varlen = mCuSeqlensQ is not None or mCuSeqlensK is not None
 
+        # Prefetch tma descriptor
         if warp_idx == self.load_warp_id:
-            cpasync.prefetch_descriptor(tma_atom_K)
-            cpasync.prefetch_descriptor(tma_atom_Q)
-            cpasync.prefetch_descriptor(tma_atom_Qt)
-            cpasync.prefetch_descriptor(tma_atom_V)
-            cpasync.prefetch_descriptor(tma_atom_dO)
-            cpasync.prefetch_descriptor(tma_atom_dOt)
+            with cute.arch.elect_one():
+                cpasync.prefetch_descriptor(tma_atom_Q)
+                if const_expr(tma_atom_Qt is not None):
+                    cpasync.prefetch_descriptor(tma_atom_Qt)
+                cpasync.prefetch_descriptor(tma_atom_K)
+                cpasync.prefetch_descriptor(tma_atom_V)
+                cpasync.prefetch_descriptor(tma_atom_dO)
+                if const_expr(tma_atom_dOt is not None):
+                    cpasync.prefetch_descriptor(tma_atom_dOt)
 
         cluster_layout_vmnk = cute.tiled_divide(
             cute.make_layout(self.cluster_shape_mnk),
@@ -791,7 +798,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
 
         tmem_alloc_barrier = cutlass.pipeline.NamedBarrier(
             barrier_id=int(NamedBarrierBwdSm100.TmemPtr),
-            num_threads=self.threads_per_cta,
+            num_threads=cute.arch.WARP_SIZE
+            * len((self.mma_warp_id, *self.compute_warp_ids, *self.reduce_warp_ids)),
         )
         tmem = cutlass.utils.TmemAllocator(
             storage.tmem_holding_buf,
@@ -887,7 +895,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             tx_count=self.tma_copy_bytes["dPsum"],
             defer_sync=True,
         )
-        pipeline_Q = cutlass.pipeline.PipelineTmaUmma.create(
+        pipeline_Q = pipeline.PipelineTmaUmma.create(
             num_stages=self.Q_stage,
             producer_group=pipeline_producer_group,
             consumer_group=pipeline_consumer_group,
@@ -896,7 +904,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             cta_layout_vmnk=cluster_layout_vmnk,
             defer_sync=True,
         )
-        pipeline_K = cutlass.pipeline.PipelineTmaUmma.create(
+        pipeline_K = pipeline.PipelineTmaUmma.create(
             num_stages=self.single_stage,
             producer_group=pipeline_producer_group,
             consumer_group=pipeline_consumer_group,
@@ -905,7 +913,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             cta_layout_vmnk=cluster_layout_vmnk,
             defer_sync=True,
         )
-        pipeline_V = cutlass.pipeline.PipelineTmaUmma.create(
+        pipeline_V = pipeline.PipelineTmaUmma.create(
             num_stages=self.single_stage,
             producer_group=pipeline_producer_group,
             consumer_group=pipeline_consumer_group,
@@ -914,7 +922,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             cta_layout_vmnk=cluster_layout_vmnk,
             defer_sync=True,
         )
-        pipeline_Qt = cutlass.pipeline.PipelineTmaUmma.create(
+        pipeline_Qt = pipeline.PipelineTmaUmma.create(
             num_stages=self.Q_stage,
             producer_group=pipeline_producer_group,
             consumer_group=pipeline_consumer_group,
@@ -923,7 +931,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             cta_layout_vmnk=cluster_layout_vmnk,
             defer_sync=True,
         )
-        pipeline_dO = cutlass.pipeline.PipelineTmaUmma.create(
+        pipeline_dO = pipeline.PipelineTmaUmma.create(
             num_stages=self.dO_stage,
             producer_group=pipeline_producer_group,
             consumer_group=pipeline_consumer_group,
@@ -932,8 +940,6 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             cta_layout_vmnk=cluster_layout_vmnk,
             defer_sync=False,
         )
-
-        cute.arch.barrier(barrier_id=self.cta_sync_bar_id, number_of_threads=self.threads_per_cta)
 
         # setup mma
         sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner)
@@ -959,15 +965,10 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             sdOt_layout.outer, swizzle=sdOt_layout.inner
         )
 
-        tmem.allocate(self.tmem_alloc_cols)
-
-        # Wait for tmem allocation and retrieve the pointer.
-        tmem.wait_for_alloc()
-        tmem_ptr = tmem.retrieve_ptr(self.acc_dtype)
-
-        # Cluster arrive after barrier init
-        # is_relaxed=False has memory consistency guarantee
-        pipeline_init_arrive(cluster_shape_mn=cluster_layout_vmnk, is_relaxed=False)
+        # TMEM
+        # This is a fake tensor, by right need to retrieve tmem_ptr. But we know that we always
+        # request 512 columns of tmem, so we know that it starts at 0.
+        tmem_ptr = cute.make_ptr(Float32, 0, mem_space=cute.AddressSpace.tmem, assumed_align=16)
 
         blk_coord_k, _, _ = cute.arch.block_idx()
         mma_tile_coord_v = blk_coord_k % self.cta_group_size
@@ -1031,10 +1032,6 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             window_size_right=window_size_right,
         )
 
-        # get the current batch problem shape
-        # Cluster wait
-        pipeline_init_wait(cluster_shape_mn=cluster_layout_vmnk)
-
         #  EMPTY
         # (15)
         if warp_idx == self.empty_warp_id:
@@ -1097,6 +1094,12 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         # (12)
         if warp_idx == self.mma_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_mma)
+
+            # Alloc tmem buffer
+            tmem.allocate(self.tmem_alloc_cols)
+            tmem.wait_for_alloc()
+            tmem_ptr = tmem.retrieve_ptr(Float32)
+
             self.mma(
                 tiled_mma_S,
                 tiled_mma_dP,
@@ -1130,10 +1133,18 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 is_leader_cta,
             )
 
+            # Dealloc the tensor memory buffer
+            tmem.relinquish_alloc_permit()
+            tmem_alloc_barrier.arrive_and_wait()
+            tmem.free(tmem_ptr)
+
+
         # Compute
         # (4, 5, 6, 7, 8, 9, 10, 11) --> 8 warps
         if warp_idx >= self.compute_warp_ids[0] and warp_idx <= self.compute_warp_ids[-1]:
             cute.arch.setmaxregister_increase(self.num_regs_compute)
+            tmem.wait_for_alloc()
+            tmem_ptr = tmem.retrieve_ptr(Float32)
             self.compute_loop(
                 thr_mma_S,
                 thr_mma_dP,
@@ -1173,16 +1184,16 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 sdV_layout,
                 sdK_layout,
             )
+            tmem_alloc_barrier.arrive()
+
 
         # Reduce
         # (0, 1, 2, 3) - dQ placeholder disabled for the dK/dV-only kernel.
         if warp_idx >= self.reduce_warp_ids[0] and warp_idx <= self.reduce_warp_ids[-1]:
             cute.arch.setmaxregister_increase(self.num_regs_reduce)
-
-        cute.arch.cluster_arrive()
-        cute.arch.cluster_wait()
-        tmem.relinquish_alloc_permit()
-        tmem.free(tmem_ptr)
+            tmem.wait_for_alloc()
+            tmem_ptr = tmem.retrieve_ptr(Float32)
+            tmem_alloc_barrier.arrive()
 
     @cute.jit
     def load(

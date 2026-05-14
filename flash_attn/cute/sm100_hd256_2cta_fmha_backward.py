@@ -165,14 +165,23 @@ class BlackwellFusedMultiHeadAttentionBackward:
         self.use_clc_scheduler = use_clc_scheduler
 
         self.dq_kernel = BlackwellFusedMultiHeadAttentionBackwardDQKernel(
-            self.acc_dtype,
-            (self.tile_m_dq, self.tile_n_dq, 256),
-            self.is_causal,
-            self.window_size_left,
-            self.window_size_right,
-            False,  # is_persistent
-            False,  # split_head
-            use_clc_scheduler=self.use_clc_scheduler,
+            head_dim,
+            head_dim_v,
+            is_causal=self.is_causal,
+            is_local=self.is_local,
+            qhead_per_kvhead=qhead_per_kvhead,
+            tile_m=self.tile_m_dq,
+            tile_n=self.tile_n_dq,
+            is_persistent=False,
+            deterministic=deterministic,
+            spt=None,
+            cluster_size=2,
+            use_2cta_instrs=use_2cta_instrs,
+            score_mod=score_mod,
+            score_mod_bwd=score_mod_bwd,
+            mask_mod=mask_mod,
+            has_aux_tensors=has_aux_tensors,
+            subtile_factor=subtile_factor,
         )
         self.dkdv_kernel = BlackwellFusedMultiHeadAttentionBackwardDKDVKernel(
             head_dim,
@@ -275,17 +284,22 @@ class BlackwellFusedMultiHeadAttentionBackward:
 
         # Keep original order: dQ first, then dKdV.
         self.dq_kernel(
-            Q,
-            K,
-            V,
-            dQ,
-            dO,
-            scaled_LSE,
-            sum_OdO,
-            cumulative_s_q,
-            cumulative_s_k,
+            mQ,
+            mK,
+            mV,
+            mdO,
+            mLSE,
+            mdPsum,
+            dQ_accum,
             scale_softmax,
-            stream,
+            mCuSeqlensQ=cumulative_s_q,
+            mCuSeqlensK=cumulative_s_k,
+            window_size_left=window_size_left,
+            window_size_right=window_size_right,
+            mdQ_semaphore=dQ_semaphore,
+            mdK_semaphore=dK_semaphore,
+            mdV_semaphore=dV_semaphore,
+            stream=stream,
         )
         self.dkdv_kernel(
             mQ,

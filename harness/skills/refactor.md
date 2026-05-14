@@ -78,6 +78,7 @@ If refactor needs any read-only file edit, stop and ask for explicit approval.
 | Preservation | Preserve APIs, tensor layouts, launch contracts, numerical behavior, and shape constraints unless explicitly changed. |
 | Divergence | Keep HD256-specific differences explicit; comment only when non-obvious. |
 | Purity | Do not mix feature completion into pure refactor unless explicitly requested. |
+| Helper reuse | Prefer existing `flash_attn/cute` helper APIs and target-file helper style over raw CUTLASS/CuTe calls. For SM100 bwd alignment, follow target conventions such as `sm100_utils_basic` and `cute.slice_` unless an HD256-only constraint requires a local divergence. |
 
 ## Merge-Ready Requirements
 
@@ -86,6 +87,7 @@ If refactor needs any read-only file edit, stop and ask for explicit approval.
 | Naming | Prefer the target file's names for matching roles, helpers, tensors, pipeline states, flags, and variables. Rename HD256-only names unless the old name describes a real specialization. |
 | Function signatures | Matching responsibilities should keep target-like function names, parameter order, grouping, defaults, and annotations. Extra HD256-only parameters should be appended or grouped after target-equivalent parameters. |
 | Softmax and dS | Keep mask order, `softmax_scale_log2` flow, LSE/dPsum handling, P generation, dS generation, and score/mask hooks as close to the target implementation as supported by HD256 constraints. |
+| Helper style | Do not introduce alternative helper names or raw helper flows when the target already uses a repo-local helper. Match the target's helper alias, wrapper, and layout slicing style first; document any remaining HD256-specific difference. |
 | Formatting | Keep section order, spacing, comments, and local layout close to the target where code is equivalent. Formatting differences must not hide semantic differences. |
 | Merge delta | The eventual diff against the target should read like an HD256 specialization. Every remaining divergence must be attributable to an HD256-only constraint or explicit unsupported feature. |
 | Analysis | Before editing, list target-equivalent names/signatures/flows and the exact HD256 divergences that will remain after the step. |

@@ -17,7 +17,7 @@ fi
 
 CMD=(
     python3
-    harness/harness/benchmark/bench_sm100_hd256.py
+    "$REPO/harness/harness/benchmark/bench_sm100_hd256.py"
     --compare-baseline
     --nheads 16
     --nheads-kv 16
@@ -43,18 +43,70 @@ fi
 mkdir -p "$CURRENT_DIR"
 
 (
-    cd "$REPO"
-    export PYTHONPATH="$REPO${PYTHONPATH:+:$PYTHONPATH}"
-    python3 - <<'PY'
+    cd /tmp
+    REPO="$REPO" python3 - <<'PY'
+import hashlib
+import importlib.metadata as md
+import os
+import subprocess
+import sys
 from pathlib import Path
 import flash_attn.cute.interface as interface
+import flash_attn.cute.pipeline as pipeline
+import flash_attn.cute.flash_fwd as flash_fwd
+import flash_attn.cute.sm100_hd256_2cta_fmha_backward as bwd
+import flash_attn.cute.sm100_hd256_2cta_fmha_backward_dkdvkernel as dkdv
+import flash_attn.cute.sm100_hd256_2cta_fmha_backward_dqkernel as dq
 
-repo = Path.cwd().resolve()
+repo = Path(os.environ["REPO"]).resolve()
 interface_path = Path(interface.__file__).resolve()
 expected = repo / "flash_attn" / "cute" / "interface.py"
 print(f"[benchmark] flash_attn.cute.interface={interface_path}")
 if interface_path != expected:
     raise SystemExit(f"benchmark must use repo-local CuteDSL interface: expected {expected}")
+
+print(f"[benchmark] repo={repo}")
+print(f"[benchmark] cwd={Path.cwd()}")
+print(f"[benchmark] sys.path[0]={sys.path[0]!r}")
+for pkg in [
+    "flash-attn-4",
+    "nvidia-cutlass-dsl",
+    "nvidia-cutlass-dsl-libs-base",
+    "quack-kernels",
+]:
+    try:
+        print(f"[benchmark] package {pkg}={md.version(pkg)}")
+    except md.PackageNotFoundError:
+        print(f"[benchmark] package {pkg}=NOT_INSTALLED")
+
+try:
+    git_head = subprocess.check_output(
+        ["git", "-C", str(repo), "rev-parse", "--short", "HEAD"],
+        text=True,
+    ).strip()
+except Exception as exc:
+    git_head = f"UNKNOWN:{exc}"
+print(f"[benchmark] git_head={git_head}")
+
+def stamp(label: str, path: Path) -> None:
+    path = path.resolve()
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+    stat = path.stat()
+    under_repo = repo in path.parents or path == repo
+    print(
+        f"[source] {label} path={path} under_repo={under_repo} "
+        f"sha256={digest} mtime_ns={stat.st_mtime_ns} size={stat.st_size}"
+    )
+
+for label, module in [
+    ("interface", interface),
+    ("pipeline", pipeline),
+    ("flash_fwd", flash_fwd),
+    ("sm100_hd256_bwd", bwd),
+    ("sm100_hd256_dkdv", dkdv),
+    ("sm100_hd256_dq", dq),
+]:
+    stamp(label, Path(module.__file__))
 PY
     for i in $(seq 1 "$RUNS"); do
         log="$CURRENT_DIR/run_${i}.log"

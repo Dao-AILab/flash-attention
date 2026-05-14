@@ -32,6 +32,7 @@ Performance gate for CuteDSL HD256 work.
 | B3 Rotate | Keep only current run and previous run for comparison. |
 | B4 Compare | Compare current repeated-run medians against previous repeated-run medians. |
 | B5 Decide | This round passes only if no systemic performance regression is detected. |
+| B6 Commit handoff | Return to `workflow.md` W5/W6 only after B5 passes. |
 
 ## Regression Policy
 
@@ -47,6 +48,7 @@ Performance gate for CuteDSL HD256 work.
 | Rule | Requirement |
 | ---- | ----------- |
 | No skipped benchmark | Benchmark is mandatory after UT passes for performance-sensitive work. |
+| Latest UT only | Benchmark must run after the latest successful UT, not before it. |
 | No benchmark regression | Code cannot pass this round with systemic performance regression. |
 | No rollback-to-pass | Do not skip benchmark or revert code just to pass this round; diagnose and optimize until performance recovers. |
 | Command handoff | Use `../commands/benchmark.md`; benchmark scripts live under `../harness/benchmark/`. |
