@@ -43,6 +43,22 @@ class _BoundedMaskModCache:
 
 
 WRAPPED_MASK_MOD_CACHE = _BoundedMaskModCache(maxsize=10)
+BWD_TIMING_ENABLED = False
+BWD_TIMING_EVENTS: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
+
+
+def enable_bwd_timing(enabled: bool, clear: bool = True):
+    global BWD_TIMING_ENABLED
+    BWD_TIMING_ENABLED = enabled
+    if clear:
+        BWD_TIMING_EVENTS.clear()
+
+
+def pop_bwd_times_ms() -> list[float]:
+    torch.cuda.synchronize()
+    times = [start.elapsed_time(end) for start, end in BWD_TIMING_EVENTS]
+    BWD_TIMING_EVENTS.clear()
+    return times
 
 
 def _make_cell(value):
@@ -224,6 +240,10 @@ class FlexAttnFunc(torch.autograd.Function):
             dq_write_order_full=None if ctx.dq_write_order is None else ctx.dq_write_order[1],
             spt=False if ctx.dq_write_order is not None else None,
         )
+        if BWD_TIMING_ENABLED:
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
         dq_t, dk_t, dv_t = _flash_attn_bwd(
             q.transpose(1, 2),
             k.transpose(1, 2),
@@ -238,6 +258,9 @@ class FlexAttnFunc(torch.autograd.Function):
             dlse=dlse if ctx.return_lse else None,
             deterministic=ctx.deterministic,
         )
+        if BWD_TIMING_ENABLED:
+            end.record()
+            BWD_TIMING_EVENTS.append((start, end))
         return (
             dq_t.transpose(1, 2),
             dk_t.transpose(1, 2),
@@ -304,6 +327,8 @@ class BenchResult:
     case: Case
     nondeter_ms: float
     deter_ms: float
+    nondeter_bwd_ms: float
+    deter_bwd_ms: float
     diff: DiffStats
 
 
@@ -379,19 +404,42 @@ def bench_ms(fn, warmup: int, iters: int) -> float:
     return start.elapsed_time(end) / iters
 
 
+def bench_ms_with_bwd_timing(fn, warmup: int, iters: int) -> tuple[float, float]:
+    enable_bwd_timing(False, clear=True)
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+
+    enable_bwd_timing(True, clear=True)
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    try:
+        for _ in range(iters):
+            fn()
+        end.record()
+        torch.cuda.synchronize()
+        e2e_ms = start.elapsed_time(end) / iters
+        bwd_times = pop_bwd_times_ms()
+        bwd_ms = sum(bwd_times) / len(bwd_times) if bwd_times else float("nan")
+        return e2e_ms, bwd_ms
+    finally:
+        enable_bwd_timing(False, clear=True)
+
+
 def compare_case(case: Case, seed: int, warmup: int, iters: int) -> BenchResult:
     q, k, v, dout = make_qkv(case, seed)
     block_mask = make_block_mask(case.s)
     nondeter = run_backward(q, k, v, block_mask, dout, deterministic=False)
     deter = run_backward(q, k, v, block_mask, dout, deterministic=True)
     diff = grad_diff_stats(deter, nondeter)
-    nondeter_ms = bench_ms(
+    nondeter_ms, nondeter_bwd_ms = bench_ms_with_bwd_timing(
         lambda: run_backward(q, k, v, block_mask, dout, deterministic=False), warmup, iters
     )
-    deter_ms = bench_ms(
+    deter_ms, deter_bwd_ms = bench_ms_with_bwd_timing(
         lambda: run_backward(q, k, v, block_mask, dout, deterministic=True), warmup, iters
     )
-    return BenchResult(case, nondeter_ms, deter_ms, diff)
+    return BenchResult(case, nondeter_ms, deter_ms, nondeter_bwd_ms, deter_bwd_ms, diff)
 
 
 def fixed_cases(max_seqlen: int = max(SEQ_LENS)) -> list[Case]:
@@ -447,16 +495,18 @@ def main(argv: list[str] | None = None):
     print()
     print("DETER vs NON-DETER fwd+bwd e2e")
     print(
-        "case                         non_deter_ms  deter_ms  slowdown  "
+        "case                         non_e2e  deter_e2e  e2e_x  non_bwd  deter_bwd  bwd_x  "
         "dQ(max/mean)       dK(max/mean)       dV(max/mean)"
     )
     for i, case in enumerate(fixed):
         result = compare_case(case, seed=args.seed + 1000 + i, warmup=args.warmup, iters=args.iters)
-        slowdown = result.deter_ms / result.nondeter_ms
+        e2e_slowdown = result.deter_ms / result.nondeter_ms
+        bwd_slowdown = result.deter_bwd_ms / result.nondeter_bwd_ms
         d = result.diff
         print(
-            f"{case.name:28s} {result.nondeter_ms:11.3f} {result.deter_ms:9.3f} "
-            f"{slowdown:8.3f}x  "
+            f"{case.name:28s} {result.nondeter_ms:8.3f} {result.deter_ms:10.3f} "
+            f"{e2e_slowdown:6.2f}x {result.nondeter_bwd_ms:8.3f} "
+            f"{result.deter_bwd_ms:10.3f} {bwd_slowdown:6.2f}x  "
             f"{d.dq_max:.3e}/{d.dq_mean:.3e}  "
             f"{d.dk_max:.3e}/{d.dk_mean:.3e}  "
             f"{d.dv_max:.3e}/{d.dv_mean:.3e}"
