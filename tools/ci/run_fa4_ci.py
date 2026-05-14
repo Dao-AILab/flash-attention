@@ -7,9 +7,12 @@ Requires FA4_SIF (path to the .sif image) to be set, either via env var or --sif
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shlex
 import subprocess
+import time
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -26,35 +29,85 @@ class Step:
 
 # ── GPU helpers ───────────────────────────────────────────────────────────────
 
-def parse_free_gpu_indices(nvidia_smi_output: str, min_free_memory_mb: int) -> list[str]:
+def read_idle_gpu_indices(max_used_memory_mb: int = 8000) -> list[str]:
+    """Return indices of GPUs that are truly idle: utilization==0 and only driver memory used."""
+    result = subprocess.run(
+        ["nvidia-smi", "--query-gpu=index,utilization.gpu,memory.used",
+         "--format=csv,noheader,nounits"],
+        check=True, capture_output=True, text=True,
+    )
     indices: list[str] = []
-    for raw_line in nvidia_smi_output.splitlines():
+    for raw_line in result.stdout.splitlines():
         line = raw_line.strip()
         if not line:
             continue
-        try:
-            index, free_memory = [part.strip() for part in line.split(",", maxsplit=1)]
-            if int(free_memory) >= min_free_memory_mb:
-                indices.append(index)
-        except ValueError as exc:
-            raise ValueError(f"Unexpected nvidia-smi output line: {raw_line!r}") from exc
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) != 3:
+            raise ValueError(f"Unexpected nvidia-smi output: {raw_line!r}")
+        idx, util, mem_used = parts[0], int(parts[1]), int(parts[2])
+        if util == 0 and mem_used <= max_used_memory_mb:
+            indices.append(idx)
     return indices
 
 
-def select_visible_devices(free_gpu_indices: list[str], use_all_free_gpus: bool) -> str:
-    if not free_gpu_indices:
-        raise ValueError("No GPUs satisfy the free-memory threshold")
+def select_visible_devices(idle_gpu_indices: list[str], use_all_free_gpus: bool) -> str:
+    if not idle_gpu_indices:
+        raise ValueError("No idle GPUs available")
     if use_all_free_gpus:
-        return ",".join(free_gpu_indices)
-    return free_gpu_indices[0]
+        return ",".join(idle_gpu_indices)
+    return idle_gpu_indices[0]
 
 
-def read_free_gpu_indices(min_free_memory_mb: int) -> list[str]:
-    result = subprocess.run(
-        ["nvidia-smi", "--query-gpu=index,memory.free", "--format=csv,noheader,nounits"],
-        check=True, capture_output=True, text=True,
-    )
-    return parse_free_gpu_indices(result.stdout, min_free_memory_mb)
+def post_slack(webhook_url: str, text: str) -> None:
+    if not webhook_url:
+        return
+    try:
+        data = json.dumps({"text": text}).encode()
+        req = urllib.request.Request(webhook_url, data=data,
+                                     headers={"Content-Type": "application/json"})
+        urllib.request.urlopen(req, timeout=10)
+    except Exception as e:
+        print(f"WARNING: Slack notification failed: {e}")
+
+
+def wait_for_idle_gpus(
+    max_used_memory_mb: int,
+    poll_interval_s: int,
+    timeout_s: int,
+    webhook_url: str,
+) -> list[str]:
+    """Poll until at least one GPU is idle or timeout expires. Returns idle GPU indices."""
+    deadline = time.monotonic() + timeout_s
+    first_check = True
+    while True:
+        indices = read_idle_gpu_indices(max_used_memory_mb)
+        if indices:
+            if not first_check:
+                print(f"Idle GPUs available: {indices}")
+            return indices
+
+        remaining = int(deadline - time.monotonic())
+        if remaining <= 0:
+            hostname = os.environ.get("RUNNER_NAME", os.uname().nodename)
+            run_url = ""
+            repo = os.environ.get("GITHUB_REPOSITORY", "")
+            run_id = os.environ.get("GITHUB_RUN_ID", "")
+            server = os.environ.get("GITHUB_SERVER_URL", "https://github.com")
+            if repo and run_id:
+                run_url = f" | <{server}/{repo}/actions/runs/{run_id}|View run>"
+            post_slack(
+                webhook_url,
+                f":warning: *FA4 Nightly skipped* — no idle GPUs on `{hostname}` "
+                f"after {timeout_s // 60} min{run_url}",
+            )
+            raise SystemExit(f"No idle GPUs after {timeout_s // 60} min — aborting.")
+
+        if first_check:
+            print(f"No idle GPUs found. Waiting up to {timeout_s // 60} min "
+                  f"(polling every {poll_interval_s // 60} min)...")
+            first_check = False
+        print(f"  still waiting... {remaining // 60} min remaining")
+        time.sleep(poll_interval_s)
 
 
 # ── Step plan ─────────────────────────────────────────────────────────────────
@@ -67,24 +120,25 @@ def build_step_plan(
     test_visible_devices: str,
     benchmark_visible_devices: str,
     skip_benchmark: bool,
+    skip_compile: bool = False,
 ) -> list[Step]:
     pytest_base = ["python3", "-m", "pytest", test_target, *(["-k", test_filter] if test_filter else [])]
 
-    steps = [
-        Step(
+    steps = []
+    if not skip_compile:
+        steps.append(Step(
             name="Pass 1: compile kernels (no GPU memory)",
             command=[*pytest_base, "-n", str(compile_workers), "-x"],
             extra_env={"FLASH_ATTENTION_FAKE_TENSOR": "1"},
-        ),
-        Step(
-            name="Pass 2: run tests on GPU",
-            command=[*pytest_base, "-n", str(run_workers), "-x"],
-            extra_env={
-                "FLASH_ATTENTION_FAKE_TENSOR": "0",
-                "CUDA_VISIBLE_DEVICES": test_visible_devices,
-            },
-        ),
-    ]
+        ))
+    steps.append(Step(
+        name="Pass 2: run tests on GPU",
+        command=[*pytest_base, "-n", str(run_workers), "-x"],
+        extra_env={
+            "FLASH_ATTENTION_FAKE_TENSOR": "0",
+            "CUDA_VISIBLE_DEVICES": test_visible_devices,
+        },
+    ))
     if not skip_benchmark:
         steps.append(Step(
             name="Benchmark (FA4 fwd, hdim=128, causal=both, seqlen=1K-32K)",
@@ -136,10 +190,18 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--test-target", default=DEFAULT_TEST_TARGET)
     parser.add_argument("--test-filter", default=DEFAULT_TEST_FILTER)
     parser.add_argument("--compile-workers", type=int, default=1)
-    parser.add_argument("--run-workers", type=int, default=1)
-    parser.add_argument("--min-free-memory-mb", type=int, default=40000)
+    parser.add_argument("--run-workers", type=int, default=0,
+                        help="xdist workers for Pass 2 (default: 0 = one per free GPU)")
+    parser.add_argument("--max-used-memory-mb", type=int, default=8000,
+                        help="GPU is considered idle if memory.used <= this value (default: 8000 MB)")
+    parser.add_argument("--gpu-wait-timeout-min", type=int, default=60,
+                        help="Minutes to wait for an idle GPU before giving up (default: 60)")
+    parser.add_argument("--gpu-poll-interval-min", type=int, default=5,
+                        help="Minutes between idle-GPU polls (default: 5)")
     parser.add_argument("--use-all-free-gpus", action="store_true")
     parser.add_argument("--skip-benchmark", action="store_true")
+    parser.add_argument("--skip-compile", action="store_true",
+                        help="Skip Pass 1 (kernel compilation); use cached kernels from a prior run")
     return parser
 
 
@@ -151,10 +213,18 @@ def main() -> None:
         raise SystemExit("FA4_SIF is not set — provide --sif or set the FA4_SIF env var.")
     print(f"Using SIF: {args.sif}")
 
-    free_gpu_indices = read_free_gpu_indices(args.min_free_memory_mb)
-    test_visible_devices = select_visible_devices(free_gpu_indices, args.use_all_free_gpus)
-    benchmark_visible_devices = free_gpu_indices[0]
-    print(f"Running tests on GPUs: {test_visible_devices}")
+    webhook_url = os.environ.get("SLACK_WEBHOOK_URL", "")
+    idle_gpu_indices = wait_for_idle_gpus(
+        max_used_memory_mb=args.max_used_memory_mb,
+        poll_interval_s=args.gpu_poll_interval_min * 60,
+        timeout_s=args.gpu_wait_timeout_min * 60,
+        webhook_url=webhook_url,
+    )
+    test_visible_devices = select_visible_devices(idle_gpu_indices, args.use_all_free_gpus)
+    benchmark_visible_devices = idle_gpu_indices[0]
+    run_workers = args.run_workers or len(idle_gpu_indices)
+    print(f"Idle GPUs: {idle_gpu_indices}")
+    print(f"Running tests on: {test_visible_devices} ({run_workers} workers)")
 
     base_env = {**os.environ, "FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED": "1"}
     work_dir = os.environ.get("CI_WORK_DIR", f"/scratch/user/{os.environ.get('USER', 'user')}")
@@ -163,10 +233,11 @@ def main() -> None:
         test_target=args.test_target,
         test_filter=args.test_filter,
         compile_workers=args.compile_workers,
-        run_workers=args.run_workers,
+        run_workers=run_workers,
         test_visible_devices=test_visible_devices,
         benchmark_visible_devices=benchmark_visible_devices,
         skip_benchmark=args.skip_benchmark,
+        skip_compile=args.skip_compile,
     ):
         run_step(step, repo_root=repo_root, base_env=base_env, sif=args.sif, work_dir=work_dir)
 

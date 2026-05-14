@@ -1,0 +1,163 @@
+name: Nightly
+
+on:
+  schedule:
+    - cron: "0 8 * * *"  # 08:00 UTC = midnight PST
+  workflow_dispatch:
+    inputs:
+      skip_tests:
+        description: "Skip tests, run benchmark only"
+        type: boolean
+        default: false
+      skip_benchmark:
+        description: "Skip benchmark, run tests only"
+        type: boolean
+        default: false
+      skip_compile:
+        description: "Skip Pass 1 kernel compilation (use cached kernels from a prior run)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write  # needed to push benchmark-data branch
+
+env:
+  CI_WORK_DIR: ${{ vars.CI_WORK_DIR || format('/scratch/user/{0}', github.actor) }}
+  FA4_IMAGE_CU129: "togethercomputer/training-performance:flash-attn-cu12.9-26.03.25@sha256:304a5c3d2b3a75b151cd2a964cd26d444e0d8b5686d63943df13378c9705f943"
+  FA4_IMAGE_CU130: "togethercomputer/training-performance:flash-attn-cu13.0-26.04.01@sha256:56e50b056eb4d671410846c3483e843ee7bd0f5b13cb45b6f0d7eb8bd27694a5"
+
+jobs:
+  # ── Full test suite ─────────────────────────────────────────────────────────
+  tests:
+    if: ${{ !inputs.skip_tests }}
+    strategy:
+      fail-fast: false
+      matrix:
+        gpu: [b200]
+    runs-on: [self-hosted, "${{ matrix.gpu }}"]
+    name: tests (${{ matrix.gpu }})
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - uses: ./.github/actions/gpu-test
+        with:
+          # No test filter — run the full suite
+          test-filter: ""
+          compile-workers: "64"
+          skip-compile: ${{ inputs.skip_compile && 'true' || 'false' }}
+          fa4_image_cu129: ${{ env.FA4_IMAGE_CU129 }}
+          fa4_image_cu130: ${{ env.FA4_IMAGE_CU130 }}
+          slack-webhook-url: ${{ secrets.FA4_NIGHTLY_SLACK_WEBHOOK }}
+
+  # ── Canonical benchmark + result tracking ───────────────────────────────────
+  benchmark:
+    if: ${{ !inputs.skip_benchmark }}
+    strategy:
+      fail-fast: false
+      matrix:
+        gpu: [b200]
+    runs-on: [self-hosted, "${{ matrix.gpu }}"]
+    name: benchmark (${{ matrix.gpu }})
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # needed for git show on benchmark-data branch
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Select FA4 image
+        run: |
+          CUDA_VER=$(nvidia-smi | grep -oP "CUDA Version: \K[0-9]+\.[0-9]+")
+          CUDA_MAJOR=$(echo "$CUDA_VER" | cut -d. -f1)
+          if [ "$CUDA_MAJOR" -ge 13 ]; then
+            echo "FA4_IMAGE=${{ env.FA4_IMAGE_CU130 }}" >> "$GITHUB_ENV"
+          else
+            echo "FA4_IMAGE=${{ env.FA4_IMAGE_CU129 }}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Pull FA4 SIF
+        run: |
+          CI_WORK_DIR="${CI_WORK_DIR:-/scratch/user/$USER}"
+          TAG=$(echo "$FA4_IMAGE" | tr '/: ' '---')
+          SIF="$CI_WORK_DIR/${TAG}.sif"
+          PULL_REF=$(echo "$FA4_IMAGE" | sed 's/:[^@]*@/@/')
+          mkdir -p "$CI_WORK_DIR/apptainer_cache" /tmp/apptainer_tmp
+          if [ ! -f "$SIF" ]; then
+            APPTAINER_TMPDIR="/tmp/apptainer_tmp" \
+            APPTAINER_CACHEDIR="$CI_WORK_DIR/apptainer_cache" \
+            apptainer pull "$SIF" "docker://$PULL_REF"
+          fi
+          find "$CI_WORK_DIR" -maxdepth 1 -name "*.sif" ! -name "$(basename "$SIF")" -delete
+          echo "FA4_SIF=$SIF" >> "$GITHUB_ENV"
+
+      - name: Lock GPU clocks
+        run: |
+          MAX_CLK=$(nvidia-smi --query-gpu=clocks.max.graphics --format=csv,noheader,nounits | head -1 | tr -d ' ')
+          echo "Locking GPU clocks to ${MAX_CLK} MHz"
+          sudo nvidia-smi --lock-gpu-clocks="$MAX_CLK"
+          echo "LOCKED_CLOCK_MHZ=$MAX_CLK" >> "$GITHUB_ENV"
+
+      - name: Run canonical benchmark
+        run: |
+          RESULT_FILE="$RUNNER_TEMP/bench_results.json"
+          echo "RESULT_FILE=$RESULT_FILE" >> "$GITHUB_ENV"
+
+          INSTALL="uv pip install --system --break-system-packages --no-deps -q -e $GITHUB_WORKSPACE/flash_attn/cute"
+          BENCH="cd /tmp && python3 $GITHUB_WORKSPACE/benchmarks/bench_nightly.py --no-lock-clocks --output $RESULT_FILE"
+
+          apptainer exec --nv --writable-tmpfs \
+            --env LOCKED_CLOCK_MHZ="$LOCKED_CLOCK_MHZ" \
+            --bind "$CI_WORK_DIR" \
+            --bind "$RUNNER_TEMP" \
+            "$FA4_SIF" bash -c "$INSTALL && $BENCH"
+
+      - name: Reset GPU clocks
+        if: always()
+        run: sudo nvidia-smi --reset-gpu-clocks
+
+      - name: Push results to benchmark-data branch
+        run: |
+          git config user.email "nightly@together.ai"
+          git config user.name "FA4 Nightly"
+          python3 tools/ci/push_results.py --result "$RESULT_FILE"
+
+      - name: Post Slack summary
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.FA4_NIGHTLY_SLACK_WEBHOOK }}
+        run: |
+          git fetch origin benchmark-data 2>/dev/null || true
+          python3 tools/ci/slack_notify.py
+
+  # ── Notify on test failure ───────────────────────────────────────────────────
+  notify-failure:
+    needs: [tests, benchmark]
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Post failure to Slack
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.FA4_NIGHTLY_SLACK_WEBHOOK }}
+        run: |
+          python3 - <<'EOF'
+          import json, os, urllib.request
+          url = os.environ["SLACK_WEBHOOK_URL"]
+          sha = os.environ.get("GITHUB_SHA", "?")[:7]
+          run_url = f"https://github.com/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}"
+          msg = f":red_circle: *FA4 Nightly FAILED* | `{sha}` | <{run_url}|View run>"
+          req = urllib.request.Request(url, json.dumps({"text": msg}).encode(),
+                                        headers={"Content-Type": "application/json"})
+          urllib.request.urlopen(req, timeout=10)
+          EOF

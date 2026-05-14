@@ -177,7 +177,9 @@ class JITPersistentCache(JITCache):
     """
 
     EXPORT_FUNCTION_PREFIX = "func"
-    LOCK_TIMEOUT_SECONDS = 15
+    # 64 workers can queue on the same lock; budget 5s write + 64×0.2s poll ≈ 18s minimum.
+    # Use 300s to handle busy NFS/parallel-fs scenarios without false timeouts.
+    LOCK_TIMEOUT_SECONDS = 300
 
     def __init__(self, cache_path: Path):
         super().__init__()

@@ -10,6 +10,14 @@ inputs:
     description: parallel workers for Pass 1 kernel compilation
     required: false
     default: "64"
+  skip-compile:
+    description: skip Pass 1 kernel compilation and use cached kernels from a prior run
+    required: false
+    default: "false"
+  slack-webhook-url:
+    description: Slack webhook URL for no-idle-GPU notifications
+    required: false
+    default: ""
   fa4_image_cu129:
     description: Docker image for CUDA 12.9 (used when driver does not support CUDA 13.0)
     required: true
@@ -60,8 +68,12 @@ runs:
 
     - name: Compile and run tests
       shell: bash
+      env:
+        SLACK_WEBHOOK_URL: ${{ inputs.slack-webhook-url }}
       run: |
         python3 "$GITHUB_WORKSPACE/tools/ci/run_fa4_ci.py" \
           --repo-root "$GITHUB_WORKSPACE" \
           --test-filter "${{ inputs.test-filter }}" \
-          --compile-workers "${{ inputs.compile-workers }}"
+          --compile-workers "${{ inputs.compile-workers }}" \
+          --use-all-free-gpus \
+          ${{ inputs.skip-compile == 'true' && '--skip-compile' || '' }}
