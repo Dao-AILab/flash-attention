@@ -952,15 +952,15 @@ def ssa_to_scalar(val):
 
 
 @cute.jit
-def batch_search(token: Int32, cu_seqlens: cute.Tensor) -> Int32:
-    """Binary search to determine batch from packed token"""
-    batch_size = cute.size(cu_seqlens) - 1
+def get_batch_from_cu_tensor(idx: Int32, cu_tensor: cute.Tensor) -> Int32:
+    """Binary search to determine batch from packed index in a cumulative tensor"""
+    batch_size = cute.size(cu_tensor) - 1
     lo = Int32(0)
     hi = batch_size
 
     while lo < hi:
         mid = (lo + hi) // 2
-        if cu_seqlens[mid + 1] <= token:
+        if cu_tensor[mid + 1] <= idx:
             lo = mid + 1
         else:
             hi = mid
