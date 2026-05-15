@@ -1436,13 +1436,20 @@ class FlashAttentionForwardSm100:
                 )
                 tCtSFKs = [cute.make_tensor(sfk_tmem_ptrs[stage], tCtSFK_layout)
                            for stage in range(self.q_stage)]
-                # S2T copy partitions
-                s2t_copy_sfq, s2t_src_sfq, s2t_dst_sfq = self.mainloop_s2t_copy_and_partition(
-                    sSFQ, tCtSFQs[0]
-                )
-                s2t_copy_sfk, s2t_src_sfk, s2t_dst_sfk = self.mainloop_s2t_copy_and_partition(
-                    sSFK, tCtSFKs[0]
-                )
+                # S2T copy partitions (per Q-stage for different TMEM offsets)
+                s2t_sfq_staged = [
+                    self.mainloop_s2t_copy_and_partition(sSFQ, tCtSFQs[stage])
+                    for stage in range(self.q_stage)
+                ]
+                s2t_sfk_staged = [
+                    self.mainloop_s2t_copy_and_partition(sSFK, tCtSFKs[stage])
+                    for stage in range(self.q_stage)
+                ]
+                # Use first stage's copy op (same for all stages)
+                s2t_copy_sfq = s2t_sfq_staged[0][0]
+                s2t_src_sfq = s2t_sfq_staged[0][1]
+                s2t_copy_sfk = s2t_sfk_staged[0][0]
+                s2t_src_sfk = s2t_sfk_staged[0][1]
             self.mma(
                 tiled_mma_qk,
                 tiled_mma_pv,
@@ -1467,12 +1474,8 @@ class FlashAttentionForwardSm100:
                 sSFK=sSFK,
                 tCtSFQs=tCtSFQs,
                 tCtSFKs=tCtSFKs,
-                s2t_copy_sfq=s2t_copy_sfq,
-                s2t_src_sfq=s2t_src_sfq,
-                s2t_dst_sfq=s2t_dst_sfq,
-                s2t_copy_sfk=s2t_copy_sfk,
-                s2t_src_sfk=s2t_src_sfk,
-                s2t_dst_sfk=s2t_dst_sfk,
+                s2t_sfq_staged=s2t_sfq_staged,
+                s2t_sfk_staged=s2t_sfk_staged,
             )
             # Dealloc the tensor memory buffer
             tmem.relinquish_alloc_permit()
@@ -1873,12 +1876,8 @@ class FlashAttentionForwardSm100:
         sSFK: Optional[cute.Tensor] = None,
         tCtSFQs=None,
         tCtSFKs=None,
-        s2t_copy_sfq=None,
-        s2t_src_sfq=None,
-        s2t_dst_sfq=None,
-        s2t_copy_sfk=None,
-        s2t_src_sfk=None,
-        s2t_dst_sfk=None,
+        s2t_sfq_staged=None,
+        s2t_sfk_staged=None,
     ):
         tSrQ = tiled_mma_qk.make_fragment_A(sQ)
         tSrK = tiled_mma_qk.make_fragment_B(sK)
@@ -2023,9 +2022,11 @@ class FlashAttentionForwardSm100:
                     if const_expr(self.block_scaled_qk):
                         # S2T copy: SF from SMEM → TMEM before block-scaled gemm
                         sm100_utils.tcgen05_after_thread_sync()
-                        if const_expr(s2t_copy_sfq is not None):
-                            cute.copy(s2t_copy_sfq, s2t_src_sfq[None, None, None, None, stage], s2t_dst_sfq)
-                            cute.copy(s2t_copy_sfk, s2t_src_sfk[None, None, None, None, Ki_index], s2t_dst_sfk)
+                        if const_expr(s2t_sfq_staged is not None):
+                            _s2t_q_copy, _s2t_q_src, _s2t_q_dst = s2t_sfq_staged[stage]
+                            _s2t_k_copy, _s2t_k_src, _s2t_k_dst = s2t_sfk_staged[stage]
+                            cute.copy(_s2t_q_copy, _s2t_q_src[None, None, None, None, stage], _s2t_q_dst)
+                            cute.copy(_s2t_k_copy, _s2t_k_src[None, None, None, None, Ki_index], _s2t_k_dst)
                         gemm_Si[stage](
                             tCrB=tSrKi,
                             tScaleB=tCtSFKs[stage],
