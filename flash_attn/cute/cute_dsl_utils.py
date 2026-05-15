@@ -73,6 +73,13 @@ def to_cute_tensor(t, assumed_align=16, leading_dim=-1, fully_dynamic=False, ena
         tensor.element_type = (
             cutlass.Float8E4M3FN if t.dtype == torch.float8_e4m3fn else cutlass.Float8E5M2
         )
+    elif hasattr(torch, "float4_e2m1fn_x2") and t.dtype == torch.float4_e2m1fn_x2:
+        tensor = from_dlpack(
+            t.view(torch.uint8).detach(),
+            assumed_align=assumed_align,
+            enable_tvm_ffi=enable_tvm_ffi,
+        )
+        tensor.element_type = cutlass.Float4E2M1FN
     else:
         tensor = from_dlpack(t.detach(), assumed_align=assumed_align, enable_tvm_ffi=enable_tvm_ffi)
     if fully_dynamic:

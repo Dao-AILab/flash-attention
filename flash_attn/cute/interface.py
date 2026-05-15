@@ -682,6 +682,21 @@ def _flash_attn_fwd(
         sparse_kv = None
         disable_sparse_kv_bitmask = None
 
+    # Pre-compute block-scaled params for compile key
+    _sf_vec_size = None
+    _sf_dtype = None
+    if mSFQ is not None:
+        import cutlass as _cutlass
+        if hasattr(torch, "float4_e2m1fn_x2") and q.dtype == torch.float4_e2m1fn_x2:
+            _sf_vec_size = 16
+            _sf_dtype = _cutlass.Float8E4M3FN
+        elif q.dtype in (torch.int8, torch.uint8) and q.shape[-1] == head_dim // 2:
+            _sf_vec_size = 16
+            _sf_dtype = _cutlass.Float8E4M3FN
+        elif q.dtype in (torch.int8, torch.uint8, torch.float8_e4m3fn):
+            _sf_vec_size = 32
+            _sf_dtype = _cutlass.Float8E8M0FNU
+
     compile_key = (
         dtype,
         head_dim,
@@ -725,6 +740,8 @@ def _flash_attn_fwd(
         sparse_kv,
         disable_sparse_kv_bitmask,
         fa_logging.get_fa_log_level(),
+        mSFQ is not None,
+        _sf_vec_size if mSFQ is not None else None,
     )
 
     if compile_key not in _flash_attn_fwd.compile_cache:
@@ -782,10 +799,10 @@ def _flash_attn_fwd(
             else None
         )
 
-        # Block-scaled SF tensors
-        mSFQ_tensor = to_cute_tensor(mSFQ, assumed_align=4) if mSFQ is not None else None
-        mSFK_tensor = to_cute_tensor(mSFK, assumed_align=4) if mSFK is not None else None
-        mSFV_tensor = to_cute_tensor(mSFV, assumed_align=4) if mSFV is not None else None
+        # Block-scaled SF tensors (caller provides in BlockScaledBasicChunk layout)
+        mSFQ_tensor = to_cute_tensor(mSFQ, leading_dim=3, assumed_align=16) if mSFQ is not None else None
+        mSFK_tensor = to_cute_tensor(mSFK, leading_dim=3, assumed_align=16) if mSFK is not None else None
+        mSFV_tensor = to_cute_tensor(mSFV, leading_dim=3, assumed_align=16) if mSFV is not None else None
 
         sparse_tensors = None
         if normalized_block_sparse_tensors is not None:
@@ -892,21 +909,7 @@ def _flash_attn_fwd(
                     else FlashAttentionForwardSm100
                 )
 
-                # Determine block-scaled params from SF tensors
-                _sf_vec_size = None
-                _sf_dtype = None
                 if mSFQ is not None:
-                    import cutlass as _cutlass
-                    # Infer sf_vec_size from Q shape vs SFQ shape
-                    # Q: (b, s, h, d), SFQ has SF layout — detect from ratio
-                    # For now use heuristic: NVFP4 if Q is int8 with 4-bit packing
-                    if q.dtype == torch.int8 and q.shape[-1] == head_dim // 2:
-                        _sf_vec_size = 16  # NVFP4
-                        _sf_dtype = _cutlass.Float8E4M3FN
-                    elif q.dtype == torch.int8:
-                        _sf_vec_size = 32  # MXFP8
-                        _sf_dtype = _cutlass.Float8E8M0FNU
-                    # Block-scaled: disable 2CTA and CLC
                     use_2cta_instrs = False
                     use_clc_scheduler = False
 
@@ -1083,6 +1086,8 @@ def _flash_attn_fwd(
                 else None,
                 aux_tensors,
             ])
+            if arch // 10 in [10, 11]:
+                call_args.extend([mSFQ, mSFK, mSFV])
             _flash_attn_fwd.compile_cache[compile_key](*call_args)
     if is_split_kv:
         _flash_attn_fwd_combine(

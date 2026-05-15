@@ -372,7 +372,11 @@ class FlashAttentionForwardSm100:
             # For hdim 192,128, we can fit 3 stages if we use uneven_kv_smem
              kv_stage = 3
         self.kv_stage = kv_stage
-        # print("kv_stage", self.kv_stage)
+        # Block-scaled: cap KV pipeline depth for FP8 PV
+        if self.block_scaled_qk and self.v_dtype.width == 8:
+            fp8_pv_kv_stage_cap = 4 if self.head_dim_v_padded >= 128 else 0
+            if fp8_pv_kv_stage_cap > 0:
+                self.kv_stage = min(self.kv_stage, fp8_pv_kv_stage_cap)
         self.s_stage = 2
         assert self.s_stage >= self.q_stage
         # For hdim 192,128 1CTA, we don't have enough smem to store all 3 stages of KV:
@@ -501,6 +505,14 @@ class FlashAttentionForwardSm100:
                 self.pack_gqa and self.head_dim_padded > 64 and not self.is_causal and not self.is_local
             ):
                 self.ex2_emu_freq = 32 if mCuSeqlensQ is not None or mSeqUsedQ is not None else self._tune.get("ex2_emu_freq", 10)
+        # Block-scaled FP8 PV: apply dedicated tuning when V is FP8
+        if const_expr(self.block_scaled_qk and self.v_dtype.width == 8):
+            _bs_fp8_key = (self.is_causal, self.head_dim_padded, self.sf_vec_size)
+            _bs_fp8_tune = _BLOCK_SCALED_FP8PV_TUNING_CONFIG.get(_bs_fp8_key, {})
+            if const_expr("ex2_emu_freq" in _bs_fp8_tune):
+                self.ex2_emu_freq = _bs_fp8_tune["ex2_emu_freq"]
+                self.ex2_emu_start_frg = _bs_fp8_tune.get("ex2_emu_start_frg", self.ex2_emu_start_frg)
+                self.enable_ex2_emu = True
 
         cta_group = tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
         q_major_mode = tcgen05.OperandMajorMode.K
