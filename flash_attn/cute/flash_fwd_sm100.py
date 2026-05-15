@@ -98,6 +98,24 @@ _FP8_SMALL_HDIM_REGS = {
     False: {"num_regs_softmax": 168, "num_regs_correction": 96, "num_regs_other": 80},
     True: {"num_regs_softmax": 152, "num_regs_correction": 96, "num_regs_other": 112},
 }
+# Block-scaled QK tuning: (is_causal, head_dim_padded, sf_vec_size)
+_BLOCK_SCALED_TUNING_CONFIG = {
+    # NVFP4 (sf_vec_size=16) + BF16 PV
+    (False, 128, 16): {"ex2_emu_freq": 16, "ex2_emu_start_frg": 1, "num_regs_softmax": 192, "num_regs_correction": 80},
+    (True, 128, 16):  {"ex2_emu_freq": 16, "ex2_emu_start_frg": 1, "num_regs_softmax": 192, "num_regs_correction": 80},
+}
+_BLOCK_SCALED_FP8PV_TUNING_CONFIG = {
+    # NVFP4 (sf_vec_size=16) + FP8 PV
+    (False, 128, 16): {"ex2_emu_freq": 9, "ex2_emu_start_frg": 0},
+    (True, 128, 16):  {"ex2_emu_freq": 9, "ex2_emu_start_frg": 0},
+    (False, 64, 16):  {"ex2_emu_freq": 16, "ex2_emu_start_frg": 0},
+    (True, 64, 16):   {"ex2_emu_freq": 16, "ex2_emu_start_frg": 0},
+    # MXFP8 (sf_vec_size=32) + FP8 PV
+    (False, 128, 32): {"ex2_emu_freq": 10, "ex2_emu_start_frg": 0},
+    (True, 128, 32):  {"ex2_emu_freq": 10, "ex2_emu_start_frg": 0},
+    (False, 64, 32):  {"ex2_emu_freq": 10, "ex2_emu_start_frg": 0},
+    (True, 64, 32):   {"ex2_emu_freq": 10, "ex2_emu_start_frg": 0},
+}
 # === END TUNING KNOBS ===
 
 
@@ -134,6 +152,8 @@ class FlashAttentionForwardSm100:
         is_varlen_q: bool = False,
         use_2cta_instrs: bool = False,
         use_clc_scheduler: bool = False,
+        sf_vec_size: Optional[int] = None,
+        sf_dtype=None,
     ):
         self.use_tma_KV = not paged_kv_non_tma
         # self.dtype = dtype
@@ -311,6 +331,22 @@ class FlashAttentionForwardSm100:
                 self.num_regs_softmax = 184
                 self.num_regs_correction = 64
             self.num_regs_other = 512 - self.num_regs_softmax * 2 - self.num_regs_correction
+
+        # Block-scaled QK mode (NVFP4/MXFP8 with per-group scale factors)
+        self.block_scaled_qk = sf_vec_size is not None
+        self.sf_vec_size = sf_vec_size
+        self.sf_dtype = sf_dtype
+        if self.block_scaled_qk:
+            assert not self.use_2cta_instrs, "Block-scaled QK is 1-CTA only"
+            _bs_tune_key = (self.is_causal, self.head_dim_padded, self.sf_vec_size)
+            _bs_tune = _BLOCK_SCALED_TUNING_CONFIG.get(_bs_tune_key, {})
+            if _bs_tune:
+                self._tune = {**self._tune, **_bs_tune}
+                self.enable_ex2_emu = _bs_tune.get("ex2_emu_freq", 0) > 0
+                if "num_regs_softmax" in _bs_tune:
+                    self.num_regs_softmax = _bs_tune["num_regs_softmax"]
+                    self.num_regs_correction = _bs_tune["num_regs_correction"]
+                    self.num_regs_other = 512 - self.num_regs_softmax * 2 - self.num_regs_correction
 
         self.buffer_align_bytes = 1024
 
