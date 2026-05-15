@@ -60,6 +60,11 @@ class MaxShift(IntEnum):
     MaxShift32 = 3
 
 
+class ScaleFormat(IntEnum):
+    UE4M3 = 0
+    UE8M0 = 1
+
+
 # ---------------------------------------------------------------------------
 # CUTLASS-type → encoding helpers
 # ---------------------------------------------------------------------------
@@ -87,6 +92,8 @@ def to_UMMA_format(cutlass_type) -> int:
         return MXF8F6F4Format.E4M3
     if cutlass_type is cutlass.Float8E5M2:
         return MXF8F6F4Format.E5M2
+    if cutlass_type is cutlass.Float4E2M1FN:
+        return MXF8F6F4Format.E2M1
     raise TypeError(f"Unsupported CUTLASS scalar type for A/B: {cutlass_type!r}")
 
 
@@ -101,6 +108,17 @@ def to_C_format(cutlass_type) -> int:
     if cutlass_type is cutlass.Int32:
         return CFormat.S32
     raise TypeError(f"Unsupported CUTLASS scalar type for accumulator: {cutlass_type!r}")
+
+
+def to_ScaleFormat(cutlass_type) -> int:
+    """
+    Map a CUTLASS scalar class to the scale format encoding.
+    """
+    if cutlass_type is cutlass.Float8E4M3FN:
+        return ScaleFormat.UE4M3
+    elif cutlass_type is cutlass.Float8E8M0FNU:
+        return ScaleFormat.UE8M0
+    raise TypeError(f"Unsupported CUTLASS scalar type for scale factor: {cutlass_type!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -162,7 +180,73 @@ def make_instr_desc(
     return desc & 0xFFFF_FFFF  # ensure 32-bit result
 
 
+def make_instr_desc_block_scaled(
+    a_type,
+    b_type,
+    c_type,
+    sf_type,  # Scale factor type
+    M: int,
+    N: int,
+    a_major: Major,
+    b_major: Major,
+    a_neg: ScaleIn = ScaleIn.One,
+    b_neg: ScaleIn = ScaleIn.One,
+    is_sparse: bool = False,
+) -> int:
+    """
+    Build the 32-bit instruction descriptor for Blackwell block-scaled MMA.
+    All matrix/accumulator/scale factor **types must be CUTLASS scalar classes**.
+    """
+    # --- encode element formats -------------------------------------------------
+    a_fmt = int(to_UMMA_format(a_type))
+    b_fmt = int(to_UMMA_format(b_type))
+    sf_fmt = int(to_ScaleFormat(sf_type))
+
+    # --- range checks on M/N -----------------------------------------------------
+    if M not in (64, 128, 256):
+        raise ValueError("M must be 64, 128 or 256")
+    if N < 8 or N > 256 or (N & 7):
+        raise ValueError("N must be a multiple of 8 in the range 8...256")
+
+    m_dim = M >> 4  # 5-bit field
+    n_dim = N >> 3  # 6-bit field
+
+    # --- pack the bit-fields -----------------------------------------------------
+    desc = 0
+    desc |= (0                 & 0x3) << 0        # sparse_id2 (always 0 here)
+    desc |= (int(is_sparse)    & 0x1) << 2        # sparse_flag
+    desc |= (0                 & 0x1) << 3        # reserved
+    desc |= (0                 & 0x3) << 4        # b_sf_id
+    desc |= (0                 & 0x1) << 6        # reserved
+    desc |= (a_fmt             & 0x7) << 7        # a_format
+    desc |= (b_fmt             & 0x7) << 10       # b_format
+    desc |= (int(a_neg)        & 0x1) << 13       # a_negate
+    desc |= (int(b_neg)        & 0x1) << 14       # b_negate
+    desc |= (int(a_major)      & 0x1) << 15       # a_major
+    desc |= (int(b_major)      & 0x1) << 16       # b_major
+    desc |= (n_dim             & 0x3F) << 17      # n_dim (6 bits)
+    desc |= (sf_fmt            & 0x1) << 23       # scale_format
+    desc |= (m_dim             & 0x1F) << 24      # m_dim (5 bits)
+    desc |= (0                 & 0x3) << 29       # a_sf_id
+    desc |= (0                 & 0x1) << 31       # k_size
+
+    return desc & 0xFFFF_FFFF  # ensure 32-bit result
+
+
 def mma_op_to_idesc(op: cute.nvgpu.tcgen05.mma.MmaOp):
+    # Block-scaled tcgen05 ops carry sf_dtype / sf_vec_size. Use the block-scaled
+    # descriptor for both NVFP4 and MXFP8 variants.
+    if hasattr(op, "sf_dtype"):
+        return make_instr_desc_block_scaled(
+            op.a_dtype,
+            op.b_dtype,
+            op.acc_dtype,
+            op.sf_dtype,
+            op.shape_mnk[0],
+            op.shape_mnk[1],
+            Major.K if op.a_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K else Major.MN,
+            Major.K if op.b_major_mode == cute.nvgpu.tcgen05.mma.OperandMajorMode.K else Major.MN,
+        )
     return make_instr_desc(
         op.a_dtype,
         op.b_dtype,
