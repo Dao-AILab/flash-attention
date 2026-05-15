@@ -52,6 +52,7 @@ from flash_attn.cute.block_sparse_utils import (
 from flash_attn.cute.pack_gqa import PackGQA, pack_gqa_layout
 from flash_attn.cute import mma_sm100_desc as sm100_desc
 from flash_attn.cute import blackwell_helpers as sm100_utils
+import cutlass.utils.blockscaled_layout as blockscaled_utils
 from flash_attn.cute.named_barrier import NamedBarrierFwdSm100
 from cutlass.cute import FastDivmodDivisor
 from quack.cute_dsl_utils import ParamsBase
@@ -410,6 +411,9 @@ class FlashAttentionForwardSm100:
         descale_tensors: Optional[DescaleTensors] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors: Optional[list] = None,
+        mSFQ: Optional[cute.Tensor] = None,
+        mSFK: Optional[cute.Tensor] = None,
+        mSFV: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -461,7 +465,7 @@ class FlashAttentionForwardSm100:
         # check type consistency
         if const_expr(self.q_dtype != self.k_dtype):
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.k_dtype}")
-        if const_expr(self.q_dtype != self.v_dtype):
+        if const_expr(not self.block_scaled_qk and self.q_dtype != self.v_dtype):
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.v_dtype}")
         if const_expr(self.q_dtype.width == 8):
             paged_kv_non_tma = not self.use_tma_KV
@@ -506,14 +510,26 @@ class FlashAttentionForwardSm100:
         # the intermediate tensor p is from tmem & mK-major
         p_source = tcgen05.OperandSource.TMEM
         p_major_mode = tcgen05.OperandMajorMode.K
-        tiled_mma_qk = sm100_utils_basic.make_trivial_tiled_mma(
-            self.q_dtype,
-            q_major_mode,
-            k_major_mode,
-            self.qk_acc_dtype,
-            cta_group,
-            self.mma_tiler_qk[:2],
-        )
+        if const_expr(self.block_scaled_qk):
+            tiled_mma_qk = sm100_utils_basic.make_blockscaled_trivial_tiled_mma(
+                self.q_dtype,
+                q_major_mode,
+                k_major_mode,
+                self.qk_acc_dtype,
+                cta_group,
+                self.mma_tiler_qk[:2],
+                sf_dtype=self.sf_dtype,
+                sf_vec_size=self.sf_vec_size,
+            )
+        else:
+            tiled_mma_qk = sm100_utils_basic.make_trivial_tiled_mma(
+                self.q_dtype,
+                q_major_mode,
+                k_major_mode,
+                self.qk_acc_dtype,
+                cta_group,
+                self.mma_tiler_qk[:2],
+            )
         tiled_mma_pv = sm100_utils_basic.make_trivial_tiled_mma(
             self.v_dtype,
             p_major_mode,
@@ -547,6 +563,17 @@ class FlashAttentionForwardSm100:
         sO_layout = sm100_utils_basic.make_smem_layout_epi(
             self.o_dtype, self.o_layout, self.epi_tile, self.q_stage
         )
+        # Block-scaled SF SMEM layouts
+        if const_expr(self.block_scaled_qk):
+            sSFQ_layout = blockscaled_utils.make_smem_layout_sfa(
+                tiled_mma_qk, self.mma_tiler_qk, self.q_stage
+            )
+            sSFK_layout = blockscaled_utils.make_smem_layout_sfb(
+                tiled_mma_qk, self.mma_tiler_qk, self.kv_stage
+            )
+        else:
+            sSFQ_layout = None
+            sSFK_layout = None
         if const_expr(not self.same_hdim_kv_padded):
             # sK and sV are using the same physical smem so we need to adjust the stride so that they line up
             stride_sK = const_expr(
@@ -636,6 +663,34 @@ class FlashAttentionForwardSm100:
                 self.mma_tiler_pv,
                 tiled_mma_pv,
                 cta_layout_vmnk.shape,
+            )
+
+        # Block-scaled SF TMA atoms
+        tma_atom_SFQ = None
+        tma_atom_SFK = None
+        if const_expr(self.block_scaled_qk and mSFQ is not None):
+            tma_atom_SFQ, mSFQ = cute.nvgpu.make_tiled_tma_atom_A(
+                tma_load_op,
+                mSFQ,
+                cute.select(sSFQ_layout, mode=[0, 1, 2]),
+                self.mma_tiler_qk,
+                tiled_mma_qk,
+                cta_layout_vmnk.shape,
+            )
+            tma_atom_SFK, mSFK = cute.nvgpu.make_tiled_tma_atom_B(
+                tma_load_op,
+                mSFK,
+                cute.select(sSFK_layout, mode=[0, 1, 2]),
+                self.mma_tiler_qk,
+                tiled_mma_qk,
+                cta_layout_vmnk.shape,
+            )
+            # Add SF bytes to Q/K barriers
+            self.tma_copy_bytes["SFQ"] = cute.size_in_bytes(
+                mSFQ.element_type, cute.select(sSFQ_layout, mode=[0, 1, 2])
+            )
+            self.tma_copy_bytes["SFK"] = cute.size_in_bytes(
+                mSFK.element_type, cute.select(sSFK_layout, mode=[0, 1, 2])
             )
 
         self.num_epilogue_threads = cute.arch.WARP_SIZE * len(self.epilogue_warp_ids)
