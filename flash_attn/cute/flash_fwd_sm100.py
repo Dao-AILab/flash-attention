@@ -1203,10 +1203,8 @@ class FlashAttentionForwardSm100:
             sV = cute.make_tensor(cute.recast_ptr(sK.iterator, sV_layout.inner), sV_layout.outer)
         # SF tensors for block-scaled QK
         if const_expr(self.block_scaled_qk):
-            _sfq_raw = storage.sSFQ.get_tensor(cute.make_layout(cute.cosize(sSFQ_layout)))
-            sSFQ = cute.make_tensor(_sfq_raw.iterator, sSFQ_layout)
-            _sfk_raw = storage.sSFK.get_tensor(cute.make_layout(cute.cosize(sSFK_layout)))
-            sSFK = cute.make_tensor(_sfk_raw.iterator, sSFK_layout)
+            sSFQ = storage.sSFQ.get_tensor(sSFQ_layout)
+            sSFK = storage.sSFK.get_tensor(sSFK_layout)
         else:
             sSFQ = None
             sSFK = None
