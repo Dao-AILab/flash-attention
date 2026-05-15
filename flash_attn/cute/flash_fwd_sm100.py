@@ -762,8 +762,9 @@ class FlashAttentionForwardSm100:
                 cta_layout_vmnk.shape,
                 internal_type=cutlass.Int16,
             )
-            # TODO: SF TMA bytes will be added when SF loading is fixed
-            pass
+            self.tma_copy_bytes["K"] += cute.size_in_bytes(
+                mSFK.element_type, cute.select(sSFK_layout, mode=[0, 1, 2])
+            )
 
         self.num_epilogue_threads = cute.arch.WARP_SIZE * len(self.epilogue_warp_ids)
         if const_expr(self.use_tma_O):
@@ -880,11 +881,11 @@ class FlashAttentionForwardSm100:
                 ]
                 sSFQ: cute.struct.Align[
                     cute.struct.MemRange[self.sf_dtype, sfq_smem_size],
-                    128,
+                    self.buffer_align_bytes,
                 ]
                 sSFK: cute.struct.Align[
                     cute.struct.MemRange[self.sf_dtype, sfk_smem_size],
-                    128,
+                    self.buffer_align_bytes,
                 ]
 
         self.shared_storage = SharedStorage
@@ -1203,10 +1204,8 @@ class FlashAttentionForwardSm100:
         # preserve the exact rank structure of the staged SF layout.
         # get_tensor on MemRange can flatten modes, breaking TMA partition.
         if const_expr(self.block_scaled_qk):
-            _sfq_raw = storage.sSFQ.get_tensor(cute.make_layout(cute.cosize(sSFQ_layout)))
-            sSFQ = cute.make_tensor(_sfq_raw.iterator, sSFQ_layout)
-            _sfk_raw = storage.sSFK.get_tensor(cute.make_layout(cute.cosize(sSFK_layout)))
-            sSFK = cute.make_tensor(_sfk_raw.iterator, sSFK_layout)
+            sSFQ = storage.sSFQ.get_tensor(sSFQ_layout)
+            sSFK = storage.sSFK.get_tensor(sSFK_layout)
         else:
             sSFQ = None
             sSFK = None
@@ -1654,12 +1653,19 @@ class FlashAttentionForwardSm100:
             tSgK = thr_mma_qk.partition_B(gK)
             tOgV = thr_mma_pv.partition_B(gV)
             # SF partition for block-scaled QK (per-tile: needs head_idx_kv, batch_idx)
-            # TODO: SF TMA loading — cpasync.tma_partition shape mismatch
-            # The SMEM layout from make_smem_layout_sfb produces nested modes
-            # that don't match the TMA atom's expected flat partition.
-            # Need to investigate: use a separate flat SMEM layout for TMA,
-            # or port the FP4 kernel's exact SharedStorage/get_tensor approach.
-            pass
+            if const_expr(not seqlen.has_cu_seqlens_k):
+                sfk_cur = tma_tensor_sfk[None, None, head_idx_kv, batch_idx]
+                gSFK = cute.local_tile(sfk_cur, cute.select(self.mma_tiler_qk, mode=[1, 2]), (None, 0))
+            else:
+                sfk_cur = cute.domain_offset((seqlen.offset_k, 0), tma_tensor_sfk[None, None, head_idx_kv])
+                gSFK = cute.local_tile(sfk_cur, cute.select(self.mma_tiler_qk, mode=[1, 2]), (None, 0))
+            tSgSFK = thr_mma_qk.partition_B(gSFK)
+            tSFKsSFK, tSFKgSFK = cpasync.tma_partition(
+                tma_atom_SFK, 0, cute.make_layout(1),
+                cute.group_modes(sSFK, 0, 3),
+                cute.group_modes(tSgSFK, 0, 3),
+            )
+            tSFKgSFK = cute.filter_zeros(tSFKgSFK)
             if const_expr(self.use_tma_Q):
                 tiler_gQ = ((self.mma_tiler_qk[0] * self.q_stage), self.head_dim_padded)
                 gQ = cute.local_tile(mQ_cur, tiler_gQ, (m_block, 0))  # (128 * 2, 128)
@@ -1731,6 +1737,9 @@ class FlashAttentionForwardSm100:
                 sK,
                 pipeline_kv=pipeline_kv,
                 K_or_V="K",
+                tma_atom_SF=tma_atom_SFK if const_expr(self.block_scaled_qk) else None,
+                tSFgSF=tSFKgSFK if const_expr(self.block_scaled_qk) else None,
+                tSFsSF=tSFKsSFK if const_expr(self.block_scaled_qk) else None,
             )
             load_V = partial(
                 self.load_KV,
@@ -3316,6 +3325,9 @@ class FlashAttentionForwardSm100:
         K_or_V: Literal["K", "V"],
         page_idx: Optional[Int32] = None,
         extra_tx_count: Optional[Int32] = None,
+        tma_atom_SF: Optional[cute.CopyAtom] = None,
+        tSFgSF: Optional[cute.Tensor] = None,
+        tSFsSF: Optional[cute.Tensor] = None,
     ):
         assert K_or_V in ("K", "V")
         stage, phase = producer_state.index, producer_state.phase
@@ -3342,6 +3354,8 @@ class FlashAttentionForwardSm100:
             tXgX_cur = tXgX[None, block] if const_expr(page_idx is None) else tXgX[None, 0, page_idx]
             bar_ptr = pipeline_kv.producer_get_barrier(producer_state)
             cute.copy(tma_atom, tXgX_cur, tXsX_cur, tma_bar_ptr=bar_ptr)
+            if const_expr(tma_atom_SF is not None):
+                cute.copy(tma_atom_SF, tSFgSF[None, block], tSFsSF[None, stage], tma_bar_ptr=bar_ptr)
         else:
             assert paged_kv_manager is not None
             assert extra_tx_count is None
