@@ -876,12 +876,12 @@ class FlashAttentionForwardSm100:
                     self.buffer_align_bytes,
                 ]
                 sSFQ: cute.struct.Align[
-                    cute.struct.MemRange[cutlass.Uint8, cute.cosize(sSFQ_layout)],
-                    128,
+                    cute.struct.MemRange[self.sf_dtype, cute.cosize(sSFQ_layout)],
+                    self.buffer_align_bytes,
                 ]
                 sSFK: cute.struct.Align[
-                    cute.struct.MemRange[cutlass.Uint8, cute.cosize(sSFK_layout)],
-                    128,
+                    cute.struct.MemRange[self.sf_dtype, cute.cosize(sSFK_layout)],
+                    self.buffer_align_bytes,
                 ]
 
         self.shared_storage = SharedStorage
