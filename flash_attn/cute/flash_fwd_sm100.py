@@ -339,6 +339,11 @@ class FlashAttentionForwardSm100:
         self.sf_dtype = sf_dtype
         if self.block_scaled_qk:
             assert not self.use_2cta_instrs, "Block-scaled QK is 1-CTA only"
+            self.mma_inst_bits_k = 256
+            if self.sf_vec_size == 16:
+                self.mma_inst_tile_k = self.head_dim_padded // (self.mma_inst_bits_k // 8 * 2)
+            else:
+                self.mma_inst_tile_k = self.head_dim_padded // (self.mma_inst_bits_k // 8)
             _bs_tune_key = (self.is_causal, self.head_dim_padded, self.sf_vec_size)
             _bs_tune = _BLOCK_SCALED_TUNING_CONFIG.get(_bs_tune_key, {})
             if _bs_tune:
@@ -682,11 +687,6 @@ class FlashAttentionForwardSm100:
         tma_tensor_sfq = None
         tma_tensor_sfk = None
         if const_expr(self.block_scaled_qk and mSFQ is not None):
-            mma_inst_bits_k = 256
-            if self.sf_vec_size == 16:
-                mma_inst_tile_k = self.head_dim_padded // (mma_inst_bits_k // 8 * 2)
-            else:
-                mma_inst_tile_k = self.head_dim_padded // (mma_inst_bits_k // 8)
             # Reshape SF global tensors with BlockScaledBasicChunk layout
             mK_shape = mK.shape
             sfk_layout = cute.tile_to_shape(
@@ -704,7 +704,7 @@ class FlashAttentionForwardSm100:
             mma_inst_shape_mnk_qk = (
                 self.mma_tiler_qk[0],
                 self.mma_tiler_qk[1],
-                mma_inst_bits_k // self.q_dtype.width,
+                self.mma_inst_bits_k // self.q_dtype.width,
             )
             mma_inst_shape_mnk_sfb = (
                 mma_inst_shape_mnk_qk[0] // self.cta_group_size,
@@ -714,7 +714,7 @@ class FlashAttentionForwardSm100:
             mma_tiler_sfb = (
                 mma_inst_shape_mnk_sfb[0],
                 mma_inst_shape_mnk_sfb[1],
-                mma_inst_shape_mnk_sfb[2] * mma_inst_tile_k,
+                mma_inst_shape_mnk_sfb[2] * self.mma_inst_tile_k,
             )
             tiled_mma_sfb = sm100_utils_basic.make_blockscaled_trivial_tiled_mma(
                 self.q_dtype,
@@ -752,7 +752,7 @@ class FlashAttentionForwardSm100:
             )
             mma_tiler_sfa = (
                 mma_inst_shape_mnk_sfa[0],
-                mma_inst_shape_mnk_sfa[2] * mma_inst_tile_k,
+                mma_inst_shape_mnk_sfa[2] * self.mma_inst_tile_k,
                 mma_inst_shape_mnk_sfa[1],
             )
             tiled_mma_sfa = sm100_utils_basic.make_blockscaled_trivial_tiled_mma(
