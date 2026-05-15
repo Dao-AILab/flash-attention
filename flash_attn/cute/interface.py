@@ -1046,6 +1046,9 @@ def _flash_attn_fwd(
             v_call = v_call.view(torch.uint8)
             if qv_call is not None:
                 qv_call = qv_call.view(torch.uint8)
+        if is_fp4:
+            q_call = q_call.view(torch.uint8)
+            k_call = k_call.view(torch.uint8)
         descale_tensors = (
             DescaleTensors(q_descale=q_descale, k_descale=k_descale, v_descale=v_descale)
             if q_descale is not None or k_descale is not None or v_descale is not None
