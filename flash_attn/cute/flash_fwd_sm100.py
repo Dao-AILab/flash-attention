@@ -1590,12 +1590,13 @@ class FlashAttentionForwardSm100:
                     sfk_cur = cute.domain_offset((seqlen.offset_k, 0), tma_tensor_sfk[None, None, head_idx_kv])
                     gSFK = cute.local_tile(sfk_cur, cute.select(self.mma_tiler_qk, mode=[1, 2]), (None, 0))
                 tSgSFK = thr_mma_qk.partition_B(gSFK)
+                sfk_rank = cute.rank(sSFK.shape)
                 tSFKsSFK, tSFKgSFK = cpasync.tma_partition(
                     tma_atom_SFK,
                     0,
                     cute.make_layout(1),
-                    cute.group_modes(sSFK, 0, 3),
-                    cute.group_modes(tSgSFK, 0, 3),
+                    cute.group_modes(sSFK, 0, sfk_rank - 1),
+                    cute.group_modes(tSgSFK, 0, sfk_rank - 1),
                 )
                 tSFKgSFK = cute.filter_zeros(tSFKgSFK)
             if const_expr(self.use_tma_Q):
@@ -3272,7 +3273,7 @@ class FlashAttentionForwardSm100:
             bar_ptr = pipeline_kv.producer_get_barrier(producer_state)
             cute.copy(tma_atom, tXgX_cur, tXsX_cur, tma_bar_ptr=bar_ptr)
             # Issue SF TMA copy on same barrier (block-scaled QK)
-            if const_expr(tma_atom_SF is not None):
+            if const_expr(tma_atom_SF is not None and tSFgSF is not None):
                 tSFsSF_cur = tSFsSF[None, stage]
                 tSFgSF_cur = tSFgSF[None, block]
                 cute.copy(tma_atom_SF, tSFgSF_cur, tSFsSF_cur, tma_bar_ptr=bar_ptr)
