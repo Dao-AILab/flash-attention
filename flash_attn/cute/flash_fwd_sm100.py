@@ -1314,6 +1314,8 @@ class FlashAttentionForwardSm100:
                 SeqlenInfoCls,
                 blocksparse_tensors,
                 tile_scheduler=tile_scheduler,
+                sSFQ=sSFQ,
+                sSFK=sSFK,
             )
             # Dealloc the tensor memory buffer
             tmem.relinquish_alloc_permit()
@@ -1692,6 +1694,8 @@ class FlashAttentionForwardSm100:
         SeqlenInfoCls: Callable,
         blocksparse_tensors: Optional[BlockSparseTensors],
         tile_scheduler=None,
+        sSFQ: Optional[cute.Tensor] = None,
+        sSFK: Optional[cute.Tensor] = None,
     ):
         tSrQ = tiled_mma_qk.make_fragment_A(sQ)
         tSrK = tiled_mma_qk.make_fragment_B(sK)
@@ -1717,12 +1721,15 @@ class FlashAttentionForwardSm100:
         if const_expr(self.q_stage == 1):
             sQ_stage_stride = 0
         if const_expr(self.block_scaled_qk):
+            tSrSFQ = tiled_mma_qk.partition_SFA(sSFQ)
+            tSrSFK = tiled_mma_qk.partition_SFB(sSFK)
             gemm_Si = [
                 partial(
                     sm100_utils.gemm_blockscaled_generic,
                     tiled_mma_qk,
                     tStS[None, None, None, stage],
                     tCrA=tSrQ[None, None, None, stage],
+                    tScaleA=tSrSFQ[None, None, None, stage],
                     zero_init=True,
                 )
                 for stage in range(self.q_stage)
@@ -1832,11 +1839,15 @@ class FlashAttentionForwardSm100:
                     sK_cur = sK[None, None, None, Ki_index]
                     if const_expr(self.uneven_kv_smem):
                         sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
-                    # gemm_Si[stage](tCrB=tSrKi, sB=sK_cur)
-                    gemm_Si[stage](
-                        smem_desc_start_b=sm100_desc.make_smem_desc_start_addr(sK_cur.iterator)
-                    )
-                    # gemm_Si[stage](tCrB=tSrKi)
+                    if const_expr(self.block_scaled_qk):
+                        gemm_Si[stage](
+                            tCrB=tSrKi,
+                            tScaleB=tSrSFK[None, None, None, Ki_index],
+                        )
+                    else:
+                        gemm_Si[stage](
+                            smem_desc_start_b=sm100_desc.make_smem_desc_start_addr(sK_cur.iterator)
+                        )
                     # 4. release S0 / S1
                     pipeline_s_p_o.producer_commit_w_index(stage)
                 mma_q_consumer_phase ^= 1
@@ -1902,11 +1913,15 @@ class FlashAttentionForwardSm100:
                         sK_cur = sK[None, None, None, Ki_index]
                         if const_expr(self.uneven_kv_smem):
                             sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
-                        # gemm_Si[stage](tCrB=tSrK[None, None, None, Ki_index], sB=sK_cur)
-                        gemm_Si[stage](
-                            smem_desc_start_b=sm100_desc.make_smem_desc_start_addr(sK_cur.iterator)
-                        )
-                        # gemm_Si[stage](tCrB=tSrK[None, None, None, Ki_index])
+                        if const_expr(self.block_scaled_qk):
+                            gemm_Si[stage](
+                                tCrB=tSrK[None, None, None, Ki_index],
+                                tScaleB=tSrSFK[None, None, None, Ki_index],
+                            )
+                        else:
+                            gemm_Si[stage](
+                                smem_desc_start_b=sm100_desc.make_smem_desc_start_addr(sK_cur.iterator)
+                            )
                         # 3. release S0 / S1
                         pipeline_s_p_o.producer_commit_w_index(stage)
                         # End of GEMM_QK0i (Q0 * Ki -> S0)
