@@ -743,40 +743,17 @@ class FlashAttentionForwardSm100:
                 cluster_layout_sfb_vmnk.shape,
                 internal_type=cutlass.Int16,
             )
-            # SFQ TMA: similar setup for A operand
-            sfq_op = sm100_utils_basic.cluster_shape_to_tma_atom_SFA(
+            # SFQ TMA: uses main tiled_mma_qk (not separate SF MMA)
+            sfq_op = sm100_utils_basic.cluster_shape_to_tma_atom_A(
                 self.cluster_shape_mn, tiled_mma_qk.thr_id
-            )
-            mma_inst_shape_mnk_sfa = (
-                mma_inst_shape_mnk_qk[0] // self.cta_group_size,
-                cute.round_up(mma_inst_shape_mnk_qk[1], 128),
-                mma_inst_shape_mnk_qk[2],
-            )
-            mma_tiler_sfa = (
-                mma_inst_shape_mnk_sfa[0],
-                mma_inst_shape_mnk_sfa[2] * self.mma_inst_tile_k,
-                mma_inst_shape_mnk_sfa[1],
-            )
-            tiled_mma_sfa = sm100_utils_basic.make_blockscaled_trivial_tiled_mma(
-                self.q_dtype,
-                tcgen05.OperandMajorMode.K,
-                tcgen05.OperandMajorMode.K,
-                self.sf_dtype,
-                self.sf_vec_size,
-                tcgen05.CtaGroup.ONE,
-                mma_inst_shape_mnk_sfa[:2],
-            )
-            cluster_layout_sfa_vmnk = cute.tiled_divide(
-                cute.make_layout(self.cluster_shape_mnk),
-                (tiled_mma_sfa.thr_id.shape,),
             )
             tma_atom_SFQ, tma_tensor_sfq = cute.nvgpu.make_tiled_tma_atom_A(
                 sfq_op,
                 mSFQ,
                 cute.select(sSFQ_layout, mode=[0, 1, 2]),
-                mma_tiler_sfa,
-                tiled_mma_sfa,
-                cluster_layout_sfa_vmnk.shape,
+                self.mma_tiler_qk,
+                tiled_mma_qk,
+                cta_layout_vmnk.shape,
                 internal_type=cutlass.Int16,
             )
             # Add SF bytes to Q/K barriers
