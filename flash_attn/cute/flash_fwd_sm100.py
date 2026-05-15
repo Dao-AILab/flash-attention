@@ -870,6 +870,11 @@ class FlashAttentionForwardSm100:
                 self.buffer_align_bytes,
             ]
             if const_expr(self.block_scaled_qk):
+                # Block-scaled: K and V have different dtypes, can't alias
+                sV_separate: cute.struct.Align[
+                    cute.struct.MemRange[self.v_dtype, cute.cosize(sV_layout)],
+                    self.buffer_align_bytes,
+                ]
                 sSFQ: cute.struct.Align[
                     cute.struct.MemRange[cutlass.Uint8, cute.cosize(sSFQ_layout)],
                     128,
@@ -1185,8 +1190,11 @@ class FlashAttentionForwardSm100:
         # (MMA, MMA_K, MMA_D, PIPE)
         sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
         # (MMA, MMA_K, MMA_D, PIPE)
-        # Strip swizzle info to reuse smem
-        sV = cute.make_tensor(cute.recast_ptr(sK.iterator, sV_layout.inner), sV_layout.outer)
+        if const_expr(self.block_scaled_qk):
+            sV = storage.sV_separate.get_tensor(sV_layout.outer, swizzle=sV_layout.inner)
+        else:
+            # Strip swizzle info to reuse smem (K and V alias when same dtype)
+            sV = cute.make_tensor(cute.recast_ptr(sK.iterator, sV_layout.inner), sV_layout.outer)
         # SF tensors for block-scaled QK
         if const_expr(self.block_scaled_qk):
             sSFQ = storage.sSFQ.get_tensor(sSFQ_layout)
