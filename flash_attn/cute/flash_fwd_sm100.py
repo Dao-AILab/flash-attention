@@ -1669,9 +1669,6 @@ class FlashAttentionForwardSm100:
                 sK,
                 pipeline_kv=pipeline_kv,
                 K_or_V="K",
-                tma_atom_SF=tma_atom_SFK if const_expr(self.block_scaled_qk) else None,
-                tSFgSF=tSFKgSFK,
-                tSFsSF=tSFKsSFK,
             )
             load_V = partial(
                 self.load_KV,
@@ -3240,15 +3237,11 @@ class FlashAttentionForwardSm100:
         K_or_V: Literal["K", "V"],
         page_idx: Optional[Int32] = None,
         extra_tx_count: Optional[Int32] = None,
-        tma_atom_SF: Optional[cute.CopyAtom] = None,
-        tSFgSF: Optional[cute.Tensor] = None,
-        tSFsSF: Optional[cute.Tensor] = None,
     ):
         assert K_or_V in ("K", "V")
         stage, phase = producer_state.index, producer_state.phase
         extra_tx_count_kv = self.tma_copy_bytes[K_or_V] - self.tma_copy_bytes["K"]
-        if const_expr(self.block_scaled_qk and tma_atom_SF is not None):
-            extra_tx_count_kv += self.tma_copy_bytes.get("SFK", 0)
+        # SF tx_count handled separately (not via load_KV)
         extra_tx_count = (
             extra_tx_count_kv + (extra_tx_count if extra_tx_count is not None else 0) if const_expr(self.use_tma_KV)
             else None
@@ -3271,11 +3264,7 @@ class FlashAttentionForwardSm100:
             tXgX_cur = tXgX[None, block] if const_expr(page_idx is None) else tXgX[None, 0, page_idx]
             bar_ptr = pipeline_kv.producer_get_barrier(producer_state)
             cute.copy(tma_atom, tXgX_cur, tXsX_cur, tma_bar_ptr=bar_ptr)
-            # Issue SF TMA copy on same barrier (block-scaled QK)
-            if const_expr(tma_atom_SF is not None and tSFgSF is not None):
-                tSFsSF_cur = tSFsSF[None, stage]
-                tSFgSF_cur = tSFgSF[None, block]
-                cute.copy(tma_atom_SF, tSFgSF_cur, tSFsSF_cur, tma_bar_ptr=bar_ptr)
+            # SF TMA copy removed from load_KV — issued separately in per-tile loop
         else:
             assert paged_kv_manager is not None
             assert extra_tx_count is None
