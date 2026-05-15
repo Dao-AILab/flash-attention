@@ -1590,13 +1590,12 @@ class FlashAttentionForwardSm100:
                     sfk_cur = cute.domain_offset((seqlen.offset_k, 0), tma_tensor_sfk[None, None, head_idx_kv])
                     gSFK = cute.local_tile(sfk_cur, cute.select(self.mma_tiler_qk, mode=[1, 2]), (None, 0))
                 tSgSFK = thr_mma_qk.partition_B(gSFK)
-                sfk_rank = cute.rank(sSFK.shape)
                 tSFKsSFK, tSFKgSFK = cpasync.tma_partition(
                     tma_atom_SFK,
                     0,
                     cute.make_layout(1),
-                    cute.group_modes(sSFK, 0, sfk_rank - 1),
-                    cute.group_modes(tSgSFK, 0, sfk_rank - 1),
+                    cute.group_modes(sSFK, 0, 3),
+                    cute.group_modes(tSgSFK, 0, 3),
                 )
                 tSFKgSFK = cute.filter_zeros(tSFKgSFK)
             if const_expr(self.use_tma_Q):
