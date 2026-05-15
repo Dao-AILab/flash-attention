@@ -766,6 +766,10 @@ class FlashAttentionForwardSm100:
             self.tma_copy_bytes["K"] += cute.size_in_bytes(
                 mSFK.element_type, cute.select(_sfk_filtered, mode=list(range(cute.rank(_sfk_filtered) - 1)))
             )
+            _sfq_filtered = cute.filter_zeros(sSFQ_layout)
+            self.tma_copy_bytes["Q"] += cute.size_in_bytes(
+                mSFQ.element_type, cute.select(_sfq_filtered, mode=list(range(cute.rank(_sfq_filtered) - 1)))
+            )
 
         self.num_epilogue_threads = cute.arch.WARP_SIZE * len(self.epilogue_warp_ids)
         if const_expr(self.use_tma_O):
@@ -1682,7 +1686,22 @@ class FlashAttentionForwardSm100:
                 load_Q_fn, _, _ = copy_utils.tma_get_copy_fn(
                     tma_atom_Q, 0, cute.make_layout(1), tSgQ, sQ
                 )
-                load_Q = partial(self.load_Q, load_Q_fn, pipeline_q=pipeline_q, phase=q_producer_phase)
+                # SFQ TMA partition (rides on Q barrier)
+                load_SFQ_fn = None
+                if const_expr(self.block_scaled_qk and tma_atom_SFQ is not None):
+                    if const_expr(not seqlen.has_cu_seqlens_k):
+                        sfq_cur = tma_tensor_sfq[None, None, head_idx, batch_idx]
+                    else:
+                        sfq_cur = cute.domain_offset((seqlen.offset_q, 0), tma_tensor_sfq[None, None, head_idx])
+                    gSFQ = cute.local_tile(sfq_cur, cute.select(self.mma_tiler_qk, mode=[0, 2]), (None, 0))
+                    tSgSFQ = thr_mma_qk.partition_A(gSFQ)
+                    sSFQ_filtered = cute.filter_zeros(sSFQ)
+                    tSgSFQ_filtered = cute.filter_zeros(tSgSFQ)
+                    sfq_group_end = cute.rank(sSFQ_filtered.shape) - 1
+                    load_SFQ_fn, _, _ = copy_utils.tma_get_copy_fn(
+                        tma_atom_SFQ, 0, cute.make_layout(1), tSgSFQ_filtered, sSFQ_filtered, filter_zeros=True
+                    )
+                load_Q = partial(self.load_Q, load_Q_fn, pipeline_q=pipeline_q, phase=q_producer_phase, load_SFQ_fn=load_SFQ_fn)
             else:
                 assert gmem_tiled_copy_Q is not None
                 load_Q = partial(
@@ -3280,9 +3299,13 @@ class FlashAttentionForwardSm100:
         block: Int32,
         stage: int,
         phase: Int32,
+        load_SFQ_fn: Optional[Callable] = None,
     ):
         pipeline_q.producer_acquire_w_index_phase(stage, phase)
-        load_Q_fn(src_idx=block, dst_idx=stage, tma_bar_ptr=pipeline_q.sync_object_full.get_barrier(stage))
+        bar_ptr = pipeline_q.sync_object_full.get_barrier(stage)
+        load_Q_fn(src_idx=block, dst_idx=stage, tma_bar_ptr=bar_ptr)
+        if const_expr(load_SFQ_fn is not None):
+            load_SFQ_fn(src_idx=block, dst_idx=stage, tma_bar_ptr=bar_ptr)
 
     def load_Q_non_tma(
         self,
