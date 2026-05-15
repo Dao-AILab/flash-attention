@@ -1432,15 +1432,14 @@ class FlashAttentionForwardSm100:
                 )
                 tCtSFKs = [cute.make_tensor(sfk_tmem_ptrs[stage], tCtSFK_layout)
                            for stage in range(self.q_stage)]
-                # S2T copy partitions (per Q-stage for different TMEM offsets)
+                # S2T copy partitions — use stage 0 TMEM for all stages
+                # (the TMEM dest at stage 0 is overwritten each iteration anyway)
                 s2t_sfq_staged = [
-                    self.mainloop_s2t_copy_and_partition(sSFQ, tCtSFQs[stage])
-                    for stage in range(self.q_stage)
-                ]
+                    self.mainloop_s2t_copy_and_partition(sSFQ, tCtSFQs[0])
+                ] * self.q_stage
                 s2t_sfk_staged = [
-                    self.mainloop_s2t_copy_and_partition(sSFK, tCtSFKs[stage])
-                    for stage in range(self.q_stage)
-                ]
+                    self.mainloop_s2t_copy_and_partition(sSFK, tCtSFKs[0])
+                ] * self.q_stage
             self.mma(
                 tiled_mma_qk,
                 tiled_mma_pv,
