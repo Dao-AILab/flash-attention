@@ -233,7 +233,11 @@ def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q
 
 
 def maybe_contiguous(x):
-    return x.contiguous() if x is not None and x.stride(-1) != 1 else x
+    if x is None or x.stride(-1) == 1:
+        return x
+    if hasattr(torch, "float4_e2m1fn_x2") and x.dtype == torch.float4_e2m1fn_x2:
+        return x
+    return x.contiguous()
 
 
 def _validate_tensor(t, name, expected_shape, expected_dtype, expected_device):
@@ -250,6 +254,8 @@ torch2cute_dtype_map = {
     torch.float8_e4m3fn: cutlass.Float8E4M3FN,
     torch.float8_e5m2: cutlass.Float8E5M2,
 }
+if hasattr(torch, "float4_e2m1fn_x2"):
+    torch2cute_dtype_map[torch.float4_e2m1fn_x2] = cutlass.Float4E2M1FN
 
 
 def num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, max_splits):
@@ -346,6 +352,9 @@ def _flash_attn_fwd(
     q, k, v = [maybe_contiguous(t) for t in (q, k, v)]
     q_descale, k_descale, v_descale = [maybe_contiguous(t) for t in (q_descale, k_descale, v_descale)]
     num_head, head_dim = q.shape[-2:]
+    # FP4 packs 2 values per byte, so last dim is headdim/2
+    if hasattr(torch, "float4_e2m1fn_x2") and q.dtype == torch.float4_e2m1fn_x2:
+        head_dim = head_dim * 2
     if cu_seqlens_q is None:
         batch_size, seqlen_q = q.shape[:2]
         total_q = batch_size * seqlen_q
@@ -366,15 +375,16 @@ def _flash_attn_fwd(
         seqlen_k = k.shape[-3]
     num_head_kv = k.shape[-2]
     head_dim_v = v.shape[-1]
+    head_dim_k_physical = k.shape[-1]  # may be headdim/2 for FP4
     if cu_seqlens_k is None:
         if page_table is None:
-            assert k.shape == (batch_size, seqlen_k, num_head_kv, head_dim)
+            assert k.shape == (batch_size, seqlen_k, num_head_kv, head_dim_k_physical)
             assert v.shape == (batch_size, seqlen_k, num_head_kv, head_dim_v)
         else:
-            assert k.shape == (num_pages, page_size, num_head_kv, head_dim)
+            assert k.shape == (num_pages, page_size, num_head_kv, head_dim_k_physical)
             assert v.shape == (num_pages, page_size, num_head_kv, head_dim_v)
     else:
-        assert k.shape == (seqlen_k, num_head_kv, head_dim)
+        assert k.shape == (seqlen_k, num_head_kv, head_dim_k_physical)
         assert v.shape == (seqlen_k, num_head_kv, head_dim_v)
         assert cu_seqlens_k.shape == (batch_size + 1,), (
             "cu_seqlens_k must have shape (batch_size + 1,)"
@@ -390,10 +400,16 @@ def _flash_attn_fwd(
     assert seqused_k is None or seqused_k.shape == (batch_size,), (
         "seqused_k must have shape (batch_size,)"
     )
-    assert q.dtype in [torch.float16, torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2], (
-        "inputs must be float16, bfloat16, fp8 e4m3fn, or fp8 e5m2"
+    _allowed_dtypes = [torch.float16, torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2]
+    if hasattr(torch, "float4_e2m1fn_x2"):
+        _allowed_dtypes.append(torch.float4_e2m1fn_x2)
+    assert q.dtype in _allowed_dtypes, (
+        f"inputs must be float16, bfloat16, fp8, or fp4, got {q.dtype}"
     )
-    assert q.dtype == k.dtype == v.dtype, "inputs must have the same dtype"
+    if mSFQ is None:
+        assert q.dtype == k.dtype == v.dtype, "inputs must have the same dtype"
+    else:
+        assert q.dtype == k.dtype, "Q and K must have the same dtype for block-scaled attention"
     for t in [cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k]:
         if t is not None:
             assert t.dtype == torch.int32, (
@@ -441,7 +457,8 @@ def _flash_attn_fwd(
     is_fp8 = q.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
     if is_fp8 and (q.requires_grad or k.requires_grad or v.requires_grad):
         raise NotImplementedError("FA4 CuTe FP8 backward is not supported yet (forward-only).")
-    out_torch_dtype = torch.bfloat16 if is_fp8 else q.dtype
+    is_fp4 = hasattr(torch, "float4_e2m1fn_x2") and q.dtype == torch.float4_e2m1fn_x2
+    out_torch_dtype = torch.bfloat16 if (is_fp8 or is_fp4 or mSFQ is not None) else q.dtype
     device = q.device
     q_batch_seqlen_shape = (batch_size, seqlen_q) if cu_seqlens_q is None else (total_q,)
     lse_shape = (batch_size, num_head, seqlen_q) if cu_seqlens_q is None else (num_head, total_q)
