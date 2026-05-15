@@ -1803,15 +1803,13 @@ class FlashAttentionForwardSm100:
         if const_expr(self.q_stage == 1):
             sQ_stage_stride = 0
         if const_expr(self.block_scaled_qk):
-            tSrSFQ = tiled_mma_qk.partition_SFA(sSFQ)
-            tSrSFK = tiled_mma_qk.partition_SFB(sSFK)
             gemm_Si = [
                 partial(
                     sm100_utils.gemm_blockscaled_generic,
                     tiled_mma_qk,
                     tStS[None, None, None, stage],
                     tCrA=tSrQ[None, None, None, stage],
-                    tScaleA=tSrSFQ[None, None, None, stage],
+                    tScaleA=sSFQ[None, None, None, stage],
                     zero_init=True,
                 )
                 for stage in range(self.q_stage)
@@ -1924,7 +1922,7 @@ class FlashAttentionForwardSm100:
                     if const_expr(self.block_scaled_qk):
                         gemm_Si[stage](
                             tCrB=tSrKi,
-                            tScaleB=tSrSFK[None, None, None, Ki_index],
+                            tScaleB=sSFK[None, None, None, Ki_index],
                         )
                     else:
                         gemm_Si[stage](
@@ -1998,7 +1996,7 @@ class FlashAttentionForwardSm100:
                         if const_expr(self.block_scaled_qk):
                             gemm_Si[stage](
                                 tCrB=tSrK[None, None, None, Ki_index],
-                                tScaleB=tSrSFK[None, None, None, Ki_index],
+                                tScaleB=sSFK[None, None, None, Ki_index],
                             )
                         else:
                             gemm_Si[stage](
