@@ -871,11 +871,11 @@ class FlashAttentionForwardSm100:
             ]
             if const_expr(self.block_scaled_qk):
                 sSFQ: cute.struct.Align[
-                    cute.struct.MemRange[cutlass.UInt8, cute.cosize(sSFQ_layout)],
+                    cute.struct.MemRange[cutlass.Uint8, cute.cosize(sSFQ_layout)],
                     128,
                 ]
                 sSFK: cute.struct.Align[
-                    cute.struct.MemRange[cutlass.UInt8, cute.cosize(sSFK_layout)],
+                    cute.struct.MemRange[cutlass.Uint8, cute.cosize(sSFK_layout)],
                     128,
                 ]
 
@@ -992,8 +992,8 @@ class FlashAttentionForwardSm100:
         mSFK: Optional[cute.Tensor] = None,
         tma_atom_SFQ: Optional[cute.CopyAtom] = None,
         tma_atom_SFK: Optional[cute.CopyAtom] = None,
-        sSFQ_layout: Optional[cute.ComposedLayout] = None,
-        sSFK_layout: Optional[cute.ComposedLayout] = None,
+        sSFQ_layout=None,
+        sSFK_layout=None,
     ):
         """The device kernel implementation of the Fused Multi-Head Attention.
 
@@ -1189,8 +1189,8 @@ class FlashAttentionForwardSm100:
         sV = cute.make_tensor(cute.recast_ptr(sK.iterator, sV_layout.inner), sV_layout.outer)
         # SF tensors for block-scaled QK
         if const_expr(self.block_scaled_qk):
-            sSFQ = storage.sSFQ.get_tensor(sSFQ_layout.outer, swizzle=sSFQ_layout.inner)
-            sSFK = storage.sSFK.get_tensor(sSFK_layout.outer, swizzle=sSFK_layout.inner)
+            sSFQ = storage.sSFQ.get_tensor(sSFQ_layout)
+            sSFK = storage.sSFK.get_tensor(sSFK_layout)
         else:
             sSFQ = None
             sSFK = None
