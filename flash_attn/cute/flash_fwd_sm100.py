@@ -372,7 +372,13 @@ class FlashAttentionForwardSm100:
         smem_size_q_o = smem_size_q + smem_size_o if not self.overlap_sO_sQ else max(smem_size_q, smem_size_o)
         smem_size_k_per_stage = self.n_block_size * self.head_dim_padded * self.k_dtype.width // 8
         smem_size_v_per_stage = self.n_block_size * self.head_dim_v_padded * self.v_dtype.width // 8
-        smem_size_kv_per_stage = max(smem_size_k_per_stage, smem_size_v_per_stage) // self.cta_group_size
+        if self.block_scaled_qk:
+            # Block-scaled: K and V have different dtypes, can't alias
+            smem_size_kv_per_stage = (smem_size_k_per_stage + smem_size_v_per_stage) // self.cta_group_size
+            # Add SF SMEM overhead (~128 bytes per stage per SF)
+            smem_size_kv_per_stage += 256  # rough SF overhead
+        else:
+            smem_size_kv_per_stage = max(smem_size_k_per_stage, smem_size_v_per_stage) // self.cta_group_size
         kv_stage = (224 * 1024 - smem_size_q_o) // smem_size_kv_per_stage
         if self.head_dim_padded == 192 and self.head_dim_v_padded == 128 and kv_stage == 2:
             # For hdim 192,128, we can fit 3 stages if we use uneven_kv_smem
