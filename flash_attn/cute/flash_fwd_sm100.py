@@ -1654,10 +1654,10 @@ class FlashAttentionForwardSm100:
             tSgK = thr_mma_qk.partition_B(gK)
             tOgV = thr_mma_pv.partition_B(gV)
             # SF partition for block-scaled QK (per-tile: needs head_idx_kv, batch_idx)
-            # TODO: SF TMA loading disabled — tma_get_copy_fn causes compiler hang
-            # with the SF SMEM layout from get_tensor(). Need to investigate
-            # alternative SF SMEM tensor creation that preserves rank for TMA partition.
-            load_SFK_fn = None
+            # SF TMA loading disabled — see TODO below
+            # The sSFK tensor from get_tensor has a complex nested layout that
+            # causes TMA partition shape mismatch. SF loading will be fixed as
+            # a follow-up by porting the FP4 kernel's direct TMA approach.
             if const_expr(self.use_tma_Q):
                 tiler_gQ = ((self.mma_tiler_qk[0] * self.q_stage), self.head_dim_padded)
                 gQ = cute.local_tile(mQ_cur, tiler_gQ, (m_block, 0))  # (128 * 2, 128)
