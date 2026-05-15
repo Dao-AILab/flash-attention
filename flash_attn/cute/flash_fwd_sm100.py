@@ -762,8 +762,9 @@ class FlashAttentionForwardSm100:
                 cta_layout_vmnk.shape,
                 internal_type=cutlass.Int16,
             )
+            _sfk_filtered = cute.filter_zeros(sSFK_layout)
             self.tma_copy_bytes["K"] += cute.size_in_bytes(
-                mSFK.element_type, cute.select(sSFK_layout, mode=[0, 1, 2])
+                mSFK.element_type, cute.select(_sfk_filtered, mode=list(range(cute.rank(_sfk_filtered) - 1)))
             )
 
         self.num_epilogue_threads = cute.arch.WARP_SIZE * len(self.epilogue_warp_ids)
