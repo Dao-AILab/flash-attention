@@ -53,6 +53,7 @@ from flash_attn.cute.pack_gqa import PackGQA, pack_gqa_layout
 from flash_attn.cute import mma_sm100_desc as sm100_desc
 from flash_attn.cute import blackwell_helpers as sm100_utils
 import cutlass.utils.blockscaled_layout as blockscaled_utils
+from flash_attn.cute.modified_utils.block_scaled_layout_test import make_smem_layout_sfa, make_smem_layout_sfb
 from flash_attn.cute.named_barrier import NamedBarrierFwdSm100
 from cutlass.cute import FastDivmodDivisor
 from quack.cute_dsl_utils import ParamsBase
@@ -581,11 +582,12 @@ class FlashAttentionForwardSm100:
         )
         # Block-scaled SF SMEM layouts
         if const_expr(self.block_scaled_qk):
-            sSFQ_layout = blockscaled_utils.make_smem_layout_sfa(
-                tiled_mma_qk, self.mma_tiler_qk, self.sf_vec_size, self.q_stage
+            _sf_kwargs = {"mma_tile_inst_k": self.mma_inst_tile_k}
+            sSFQ_layout = make_smem_layout_sfa(
+                tiled_mma_qk, self.mma_tiler_qk, self.sf_vec_size, self.q_stage, **_sf_kwargs
             )
-            sSFK_layout = blockscaled_utils.make_smem_layout_sfb(
-                tiled_mma_qk, self.mma_tiler_qk, self.sf_vec_size, self.kv_stage
+            sSFK_layout = make_smem_layout_sfb(
+                tiled_mma_qk, self.mma_tiler_qk, self.sf_vec_size, self.kv_stage, **_sf_kwargs
             )
         else:
             sSFQ_layout = None
