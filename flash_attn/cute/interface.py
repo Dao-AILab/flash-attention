@@ -326,6 +326,9 @@ def _flash_attn_fwd(
     k_descale: Optional[torch.Tensor] = None,
     v_descale: Optional[torch.Tensor] = None,
     gather_kv_indices: Optional[torch.Tensor] = None,
+    mSFQ: Optional[torch.Tensor] = None,
+    mSFK: Optional[torch.Tensor] = None,
+    mSFV: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for FlashAttention.
 
@@ -884,6 +887,24 @@ def _flash_attn_fwd(
                     else FlashAttentionForwardSm100
                 )
 
+                # Determine block-scaled params from SF tensors
+                _sf_vec_size = None
+                _sf_dtype = None
+                if mSFQ is not None:
+                    import cutlass as _cutlass
+                    # Infer sf_vec_size from Q shape vs SFQ shape
+                    # Q: (b, s, h, d), SFQ has SF layout — detect from ratio
+                    # For now use heuristic: NVFP4 if Q is int8 with 4-bit packing
+                    if q.dtype == torch.int8 and q.shape[-1] == head_dim // 2:
+                        _sf_vec_size = 16  # NVFP4
+                        _sf_dtype = _cutlass.Float8E4M3FN
+                    elif q.dtype == torch.int8:
+                        _sf_vec_size = 32  # MXFP8
+                        _sf_dtype = _cutlass.Float8E8M0FNU
+                    # Block-scaled: disable 2CTA and CLC
+                    use_2cta_instrs = False
+                    use_clc_scheduler = False
+
                 fa_fwd = flash_fwd_obj_cls(
                     head_dim,
                     head_dim_v,
@@ -908,6 +929,8 @@ def _flash_attn_fwd(
                     q_subtile_factor=q_subtile_factor,
                     use_2cta_instrs=use_2cta_instrs,
                     use_clc_scheduler=use_clc_scheduler,
+                    sf_vec_size=_sf_vec_size,
+                    sf_dtype=_sf_dtype,
                 )
         elif arch // 10 == 12:
             # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
@@ -1943,6 +1966,9 @@ class FlashAttnFunc(torch.autograd.Function):
         block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
         block_sparse_tensors_bwd: Optional[BlockSparseTensorsTorch] = None,
         return_lse: bool = False,
+        mSFQ: Optional[torch.Tensor] = None,
+        mSFK: Optional[torch.Tensor] = None,
+        mSFV: Optional[torch.Tensor] = None,
     ):
         out, lse = _flash_attn_fwd(
             q,
@@ -1963,6 +1989,9 @@ class FlashAttnFunc(torch.autograd.Function):
             block_sparse_tensors=block_sparse_tensors,
             return_lse=return_lse,
             gather_kv_indices=gather_kv_indices,
+            mSFQ=mSFQ,
+            mSFK=mSFK,
+            mSFV=mSFV,
         )
         ctx.save_for_backward(q, k, v, out, lse, *(aux_tensors or ()))
         ctx.softmax_scale = softmax_scale
@@ -2176,6 +2205,9 @@ def flash_attn_func(
         block_sparse_tensors,
         block_sparse_tensors_bwd,
         return_lse,
+        mSFQ,
+        mSFK,
+        mSFV,
     )
 
 
