@@ -782,6 +782,11 @@ def _flash_attn_fwd(
             else None
         )
 
+        # Block-scaled SF tensors
+        mSFQ_tensor = to_cute_tensor(mSFQ, assumed_align=4) if mSFQ is not None else None
+        mSFK_tensor = to_cute_tensor(mSFK, assumed_align=4) if mSFK is not None else None
+        mSFV_tensor = to_cute_tensor(mSFV, assumed_align=4) if mSFV is not None else None
+
         sparse_tensors = None
         if normalized_block_sparse_tensors is not None:
             sparse_tensors = to_cute_block_sparse_tensors(normalized_block_sparse_tensors)
@@ -1004,6 +1009,8 @@ def _flash_attn_fwd(
                 sparse_tensors,
                 cute_aux_tensors,
             ])
+            if arch // 10 in [10, 11]:
+                compile_args.extend([mSFQ_tensor, mSFK_tensor, mSFV_tensor])
             compile_args.append(current_stream)
             _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
                 *compile_args, options="--enable-tvm-ffi"
