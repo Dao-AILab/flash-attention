@@ -1204,10 +1204,10 @@ class FlashAttentionForwardSm100:
         # preserve the exact rank structure of the staged SF layout.
         # get_tensor on MemRange can flatten modes, breaking TMA partition.
         if const_expr(self.block_scaled_qk):
-            _sfq_ptr = cute.recast_ptr(storage.sSFQ.get_tensor(cute.make_layout(1)).iterator, self.sf_dtype)
-            sSFQ = cute.make_tensor(_sfq_ptr, sSFQ_layout)
-            _sfk_ptr = cute.recast_ptr(storage.sSFK.get_tensor(cute.make_layout(1)).iterator, self.sf_dtype)
-            sSFK = cute.make_tensor(_sfk_ptr, sSFK_layout)
+            _sfq_raw = storage.sSFQ.get_tensor(cute.make_layout(1))
+            sSFQ = cute.make_tensor(_sfq_raw.iterator, sSFQ_layout)
+            _sfk_raw = storage.sSFK.get_tensor(cute.make_layout(1))
+            sSFK = cute.make_tensor(_sfk_raw.iterator, sSFK_layout)
         else:
             sSFQ = None
             sSFK = None
