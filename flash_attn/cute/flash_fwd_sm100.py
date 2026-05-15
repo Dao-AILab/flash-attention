@@ -935,8 +935,8 @@ class FlashAttentionForwardSm100:
             aux_tensors,
             fastdiv_mods,
             head_divmod,
-            mSFQ,
-            mSFK,
+            tma_tensor_sfq,
+            tma_tensor_sfk,
             tma_atom_SFQ,
             tma_atom_SFK,
             sSFQ_layout,
@@ -988,8 +988,8 @@ class FlashAttentionForwardSm100:
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
         head_divmod=None,
-        mSFQ: Optional[cute.Tensor] = None,
-        mSFK: Optional[cute.Tensor] = None,
+        tma_tensor_sfq: Optional[cute.Tensor] = None,
+        tma_tensor_sfk: Optional[cute.Tensor] = None,
         tma_atom_SFQ: Optional[cute.CopyAtom] = None,
         tma_atom_SFK: Optional[cute.CopyAtom] = None,
         sSFQ_layout=None,
@@ -1348,8 +1348,8 @@ class FlashAttentionForwardSm100:
                 SeqlenInfoCls,
                 blocksparse_tensors,
                 tile_scheduler=tile_scheduler,
-                mSFQ=mSFQ,
-                mSFK=mSFK,
+                tma_tensor_sfq=tma_tensor_sfq,
+                tma_tensor_sfk=tma_tensor_sfk,
                 tma_atom_SFQ=tma_atom_SFQ,
                 tma_atom_SFK=tma_atom_SFK,
                 sSFQ=sSFQ if const_expr(self.block_scaled_qk) else None,
@@ -1521,8 +1521,8 @@ class FlashAttentionForwardSm100:
         SeqlenInfoCls: Callable,
         blocksparse_tensors: Optional[BlockSparseTensors],
         tile_scheduler: TileSchedulerProtocol,
-        mSFQ: Optional[cute.Tensor] = None,
-        mSFK: Optional[cute.Tensor] = None,
+        tma_tensor_sfq: Optional[cute.Tensor] = None,
+        tma_tensor_sfk: Optional[cute.Tensor] = None,
         tma_atom_SFQ: Optional[cute.CopyAtom] = None,
         tma_atom_SFK: Optional[cute.CopyAtom] = None,
         sSFQ: Optional[cute.Tensor] = None,
@@ -1613,20 +1613,18 @@ class FlashAttentionForwardSm100:
                 )
                 # SF TMA partitions for block-scaled QK
                 if const_expr(self.block_scaled_qk and tma_atom_SFQ is not None):
-                    tSFQsSFQ, tSFQgSFQ = cpasync.tma_partition(
-                        tma_atom_SFQ,
-                        0,
-                        cute.make_layout(1),
-                        cute.group_modes(sSFQ, 0, 3),
-                        cute.group_modes(thr_mma_qk.partition_A(mSFQ), 0, 3),
+                    gSFK = cute.local_tile(
+                        tma_tensor_sfk, cute.select(self.mma_tiler_qk, mode=[1, 2]), (None, 0, None)
                     )
+                    tSgSFK = thr_mma_qk.partition_B(gSFK)
                     tSFKsSFK, tSFKgSFK = cpasync.tma_partition(
                         tma_atom_SFK,
                         0,
                         cute.make_layout(1),
                         cute.group_modes(sSFK, 0, 3),
-                        cute.group_modes(thr_mma_qk.partition_B(mSFK), 0, 3),
+                        cute.group_modes(tSgSFK, 0, 3),
                     )
+                    tSFKgSFK = cute.filter_zeros(tSFKgSFK)
                 paged_kv_manager = None
             else:
                 page_size = mK.shape[0]
@@ -1649,6 +1647,9 @@ class FlashAttentionForwardSm100:
                 tKsK, tKgK = None, None
                 tVsV, tVgV = None, None
 
+            _sf_tma_k = tma_atom_SFK if const_expr(self.block_scaled_qk and tma_atom_SFK is not None) else None
+            _sf_g_k = tSFKgSFK if const_expr(self.block_scaled_qk and tma_atom_SFK is not None) else None
+            _sf_s_k = tSFKsSFK if const_expr(self.block_scaled_qk and tma_atom_SFK is not None) else None
             load_K = partial(
                 self.load_KV,
                 tma_atom_K,
@@ -1658,9 +1659,9 @@ class FlashAttentionForwardSm100:
                 sK,
                 pipeline_kv=pipeline_kv,
                 K_or_V="K",
-                tma_atom_SF=tma_atom_SFK if const_expr(self.block_scaled_qk) else None,
-                tSFgSF=tSFKgSFK if const_expr(self.block_scaled_qk) else None,
-                tSFsSF=tSFKsSFK if const_expr(self.block_scaled_qk) else None,
+                tma_atom_SF=_sf_tma_k,
+                tSFgSF=_sf_g_k,
+                tSFsSF=_sf_s_k,
             )
             load_V = partial(
                 self.load_KV,
