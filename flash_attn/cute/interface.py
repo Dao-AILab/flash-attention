@@ -2151,7 +2151,18 @@ def flash_attn_func(
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     block_sparse_tensors_bwd: Optional[BlockSparseTensorsTorch] = None,
     return_lse: bool = False,
+    mSFQ: Optional[torch.Tensor] = None,
+    mSFK: Optional[torch.Tensor] = None,
+    mSFV: Optional[torch.Tensor] = None,
 ):
+    if mSFQ is not None:
+        from flash_attn.cute.flash_fwd_sm100_fp4 import flash_attn_blockscaled_fwd
+        return flash_attn_blockscaled_fwd(
+            q, k, v, mSFQ, mSFK, mSFV,
+            softmax_scale=softmax_scale,
+            causal=causal,
+            window_size=window_size,
+        )
     return FlashAttnFunc.apply(
         q,
         k,
