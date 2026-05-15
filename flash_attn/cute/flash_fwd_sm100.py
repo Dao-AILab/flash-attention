@@ -527,11 +527,10 @@ class FlashAttentionForwardSm100:
                 self.q_dtype,
                 q_major_mode,
                 k_major_mode,
-                self.qk_acc_dtype,
+                self.sf_dtype,
+                self.sf_vec_size,
                 cta_group,
                 self.mma_tiler_qk[:2],
-                sf_dtype=self.sf_dtype,
-                sf_vec_size=self.sf_vec_size,
             )
         else:
             tiled_mma_qk = sm100_utils_basic.make_trivial_tiled_mma(
@@ -578,10 +577,10 @@ class FlashAttentionForwardSm100:
         # Block-scaled SF SMEM layouts
         if const_expr(self.block_scaled_qk):
             sSFQ_layout = blockscaled_utils.make_smem_layout_sfa(
-                tiled_mma_qk, self.mma_tiler_qk, self.q_stage
+                tiled_mma_qk, self.mma_tiler_qk, self.sf_vec_size, self.q_stage
             )
             sSFK_layout = blockscaled_utils.make_smem_layout_sfb(
-                tiled_mma_qk, self.mma_tiler_qk, self.kv_stage
+                tiled_mma_qk, self.mma_tiler_qk, self.sf_vec_size, self.kv_stage
             )
         else:
             sSFQ_layout = None
@@ -680,28 +679,109 @@ class FlashAttentionForwardSm100:
         # Block-scaled SF TMA atoms
         tma_atom_SFQ = None
         tma_atom_SFK = None
+        tma_tensor_sfq = None
+        tma_tensor_sfk = None
         if const_expr(self.block_scaled_qk and mSFQ is not None):
-            tma_atom_SFQ, mSFQ = cute.nvgpu.make_tiled_tma_atom_A(
-                tma_load_op,
-                mSFQ,
-                cute.select(sSFQ_layout, mode=[0, 1, 2]),
-                self.mma_tiler_qk,
-                tiled_mma_qk,
-                cta_layout_vmnk.shape,
+            mma_inst_bits_k = 256
+            if self.sf_vec_size == 16:
+                mma_inst_tile_k = self.head_dim_padded // (mma_inst_bits_k // 8 * 2)
+            else:
+                mma_inst_tile_k = self.head_dim_padded // (mma_inst_bits_k // 8)
+            # Reshape SF global tensors with BlockScaledBasicChunk layout
+            mK_shape = mK.shape
+            sfk_layout = cute.tile_to_shape(
+                blockscaled_utils.BlockScaledBasicChunk(self.sf_vec_size).layout,
+                mK_shape, (2, 1, 3, 4)
             )
-            tma_atom_SFK, mSFK = cute.nvgpu.make_tiled_tma_atom_B(
-                tma_load_op,
+            mSFK = cute.make_tensor(mSFK.iterator, sfk_layout)
+            mQ_shape = mQ.shape
+            sfq_layout = cute.tile_to_shape(
+                blockscaled_utils.BlockScaledBasicChunk(self.sf_vec_size).layout,
+                mQ_shape, (2, 1, 3, 4)
+            )
+            mSFQ = cute.make_tensor(mSFQ.iterator, sfq_layout)
+            # SFK TMA: needs separate tiled_mma with SF-specific tiling
+            mma_inst_shape_mnk_qk = (
+                self.mma_tiler_qk[0],
+                self.mma_tiler_qk[1],
+                mma_inst_bits_k // self.q_dtype.width,
+            )
+            mma_inst_shape_mnk_sfb = (
+                mma_inst_shape_mnk_qk[0] // self.cta_group_size,
+                cute.round_up(mma_inst_shape_mnk_qk[1], 128),
+                mma_inst_shape_mnk_qk[2],
+            )
+            mma_tiler_sfb = (
+                mma_inst_shape_mnk_sfb[0],
+                mma_inst_shape_mnk_sfb[1],
+                mma_inst_shape_mnk_sfb[2] * mma_inst_tile_k,
+            )
+            tiled_mma_sfb = sm100_utils_basic.make_blockscaled_trivial_tiled_mma(
+                self.q_dtype,
+                tcgen05.OperandMajorMode.K,
+                tcgen05.OperandMajorMode.K,
+                self.sf_dtype,
+                self.sf_vec_size,
+                tcgen05.CtaGroup.ONE,
+                mma_inst_shape_mnk_sfb[:2],
+            )
+            sfk_op = sm100_utils_basic.cluster_shape_to_tma_atom_SFB(
+                self.cluster_shape_mn, tiled_mma_qk.thr_id
+            )
+            cluster_layout_sfb_vmnk = cute.tiled_divide(
+                cute.make_layout(self.cluster_shape_mnk),
+                (tiled_mma_sfb.thr_id.shape,),
+            )
+            tma_atom_SFK, tma_tensor_sfk = cute.nvgpu.make_tiled_tma_atom_B(
+                sfk_op,
                 mSFK,
                 cute.select(sSFK_layout, mode=[0, 1, 2]),
-                self.mma_tiler_qk,
-                tiled_mma_qk,
-                cta_layout_vmnk.shape,
+                mma_tiler_sfb,
+                tiled_mma_sfb,
+                cluster_layout_sfb_vmnk.shape,
+                internal_type=cutlass.Int16,
+            )
+            # SFQ TMA: similar setup for A operand
+            sfq_op = sm100_utils_basic.cluster_shape_to_tma_atom_SFA(
+                self.cluster_shape_mn, tiled_mma_qk.thr_id
+            )
+            mma_inst_shape_mnk_sfa = (
+                mma_inst_shape_mnk_qk[0] // self.cta_group_size,
+                cute.round_up(mma_inst_shape_mnk_qk[1], 128),
+                mma_inst_shape_mnk_qk[2],
+            )
+            mma_tiler_sfa = (
+                mma_inst_shape_mnk_sfa[0],
+                mma_inst_shape_mnk_sfa[2] * mma_inst_tile_k,
+                mma_inst_shape_mnk_sfa[1],
+            )
+            tiled_mma_sfa = sm100_utils_basic.make_blockscaled_trivial_tiled_mma(
+                self.q_dtype,
+                tcgen05.OperandMajorMode.K,
+                tcgen05.OperandMajorMode.K,
+                self.sf_dtype,
+                self.sf_vec_size,
+                tcgen05.CtaGroup.ONE,
+                mma_inst_shape_mnk_sfa[:2],
+            )
+            cluster_layout_sfa_vmnk = cute.tiled_divide(
+                cute.make_layout(self.cluster_shape_mnk),
+                (tiled_mma_sfa.thr_id.shape,),
+            )
+            tma_atom_SFQ, tma_tensor_sfq = cute.nvgpu.make_tiled_tma_atom_A(
+                sfq_op,
+                mSFQ,
+                cute.select(sSFQ_layout, mode=[0, 1, 2]),
+                mma_tiler_sfa,
+                tiled_mma_sfa,
+                cluster_layout_sfa_vmnk.shape,
+                internal_type=cutlass.Int16,
             )
             # Add SF bytes to Q/K barriers
-            self.tma_copy_bytes["SFQ"] = cute.size_in_bytes(
+            self.tma_copy_bytes["Q"] += cute.size_in_bytes(
                 mSFQ.element_type, cute.select(sSFQ_layout, mode=[0, 1, 2])
             )
-            self.tma_copy_bytes["SFK"] = cute.size_in_bytes(
+            self.tma_copy_bytes["K"] += cute.size_in_bytes(
                 mSFK.element_type, cute.select(sSFK_layout, mode=[0, 1, 2])
             )
 
