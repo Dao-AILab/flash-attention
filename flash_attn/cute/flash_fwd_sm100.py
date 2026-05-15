@@ -1388,12 +1388,8 @@ class FlashAttentionForwardSm100:
             # Block-scaled: setup TMEM SF tensors and S2T copy partitions
             tCtSFQs = [None] * self.q_stage
             tCtSFKs = [None] * self.q_stage
-            s2t_copy_sfq = None
-            s2t_src_sfq = None
-            s2t_dst_sfq = None
-            s2t_copy_sfk = None
-            s2t_src_sfk = None
-            s2t_dst_sfk = None
+            s2t_sfq_staged = None
+            s2t_sfk_staged = None
             if const_expr(self.block_scaled_qk and sSFQ is not None):
                 align = 16
                 # SFQ TMEM: stagger with S offsets
@@ -1445,11 +1441,6 @@ class FlashAttentionForwardSm100:
                     self.mainloop_s2t_copy_and_partition(sSFK, tCtSFKs[stage])
                     for stage in range(self.q_stage)
                 ]
-                # Use first stage's copy op (same for all stages)
-                s2t_copy_sfq = s2t_sfq_staged[0][0]
-                s2t_src_sfq = s2t_sfq_staged[0][1]
-                s2t_copy_sfk = s2t_sfk_staged[0][0]
-                s2t_src_sfk = s2t_sfk_staged[0][1]
             self.mma(
                 tiled_mma_qk,
                 tiled_mma_pv,
@@ -2102,9 +2093,11 @@ class FlashAttentionForwardSm100:
                             sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
                         if const_expr(self.block_scaled_qk):
                             sm100_utils.tcgen05_after_thread_sync()
-                            if const_expr(s2t_copy_sfq is not None):
-                                cute.copy(s2t_copy_sfq, s2t_src_sfq[None, None, None, None, stage], s2t_dst_sfq)
-                                cute.copy(s2t_copy_sfk, s2t_src_sfk[None, None, None, None, Ki_index], s2t_dst_sfk)
+                            if const_expr(s2t_sfq_staged is not None):
+                                _s2t_q_copy, _s2t_q_src, _s2t_q_dst = s2t_sfq_staged[stage]
+                                _s2t_k_copy, _s2t_k_src, _s2t_k_dst = s2t_sfk_staged[stage]
+                                cute.copy(_s2t_q_copy, _s2t_q_src[None, None, None, None, stage], _s2t_q_dst)
+                                cute.copy(_s2t_k_copy, _s2t_k_src[None, None, None, None, Ki_index], _s2t_k_dst)
                             gemm_Si[stage](
                                 tCrB=tSrK[None, None, None, Ki_index],
                                 tScaleB=tCtSFKs[stage],
