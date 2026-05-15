@@ -762,13 +762,8 @@ class FlashAttentionForwardSm100:
                 cta_layout_vmnk.shape,
                 internal_type=cutlass.Int16,
             )
-            # Add SF bytes to Q/K barriers
-            self.tma_copy_bytes["Q"] += cute.size_in_bytes(
-                mSFQ.element_type, cute.select(sSFQ_layout, mode=[0, 1, 2])
-            )
-            self.tma_copy_bytes["K"] += cute.size_in_bytes(
-                mSFK.element_type, cute.select(sSFK_layout, mode=[0, 1, 2])
-            )
+            # TODO: add SF TMA copies and re-enable tx_count
+            # For now SF is not loaded via TMA (S2T copies from uninitialized SMEM)
 
         self.num_epilogue_threads = cute.arch.WARP_SIZE * len(self.epilogue_warp_ids)
         if const_expr(self.use_tma_O):
