@@ -837,6 +837,8 @@ class FlashAttentionForwardSm100:
 
         clc_response_size = self.sched_stages * 4 if self.use_clc_scheduler else 0
         clc_mbar_size = self.sched_stages * 2 if self.use_clc_scheduler else 0
+        sfq_smem_size = cute.cosize(sSFQ_layout) if const_expr(self.block_scaled_qk) else 1
+        sfk_smem_size = cute.cosize(sSFK_layout) if const_expr(self.block_scaled_qk) else 1
 
         @cute.struct
         class SharedStorage:
@@ -882,11 +884,11 @@ class FlashAttentionForwardSm100:
                     self.buffer_align_bytes,
                 ]
                 sSFQ: cute.struct.Align[
-                    cute.struct.MemRange[self.sf_dtype, cute.cosize(sSFQ_layout)],
+                    cute.struct.MemRange[self.sf_dtype, sfq_smem_size],
                     128,
                 ]
                 sSFK: cute.struct.Align[
-                    cute.struct.MemRange[self.sf_dtype, cute.cosize(sSFK_layout)],
+                    cute.struct.MemRange[self.sf_dtype, sfk_smem_size],
                     128,
                 ]
 
@@ -1662,7 +1664,7 @@ class FlashAttentionForwardSm100:
                     gSFK = cute.local_tile(sfk_cur, cute.select(self.mma_tiler_qk, mode=[1, 2]), (None, 0))
                 tSgSFK = thr_mma_qk.partition_B(gSFK)
                 load_SFK_fn, _, _ = copy_utils.tma_get_copy_fn(
-                    tma_atom_SFK, 0, cute.make_layout(1), tSgSFK, sSFK
+                    tma_atom_SFK, 0, cute.make_layout(1), tSgSFK, sSFK, filter_zeros=True
                 )
             if const_expr(self.use_tma_Q):
                 tiler_gQ = ((self.mma_tiler_qk[0] * self.q_stage), self.head_dim_padded)
@@ -1735,6 +1737,7 @@ class FlashAttentionForwardSm100:
                 sK,
                 pipeline_kv=pipeline_kv,
                 K_or_V="K",
+                load_SF_fn=load_SFK_fn,
             )
             load_V = partial(
                 self.load_KV,
@@ -3320,6 +3323,7 @@ class FlashAttentionForwardSm100:
         K_or_V: Literal["K", "V"],
         page_idx: Optional[Int32] = None,
         extra_tx_count: Optional[Int32] = None,
+        load_SF_fn: Optional[Callable] = None,
     ):
         assert K_or_V in ("K", "V")
         stage, phase = producer_state.index, producer_state.phase
@@ -3346,6 +3350,8 @@ class FlashAttentionForwardSm100:
             tXgX_cur = tXgX[None, block] if const_expr(page_idx is None) else tXgX[None, 0, page_idx]
             bar_ptr = pipeline_kv.producer_get_barrier(producer_state)
             cute.copy(tma_atom, tXgX_cur, tXsX_cur, tma_bar_ptr=bar_ptr)
+            if const_expr(load_SF_fn is not None):
+                load_SF_fn(src_idx=block, dst_idx=stage, tma_bar_ptr=bar_ptr)
         else:
             assert paged_kv_manager is not None
             assert extra_tx_count is None
