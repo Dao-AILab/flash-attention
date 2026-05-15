@@ -3,7 +3,7 @@ from typing import Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, Boolean, const_expr
+from cutlass import Int32, Float32, Boolean, const_expr, Float8E4M3FN, Float8E5M2, Float4E2M1FN
 from cutlass.cute.nvgpu import tcgen05
 from cutlass._mlir.dialects import llvm
 
