@@ -1660,10 +1660,17 @@ class FlashAttentionForwardSm100:
                 sfk_cur = cute.domain_offset((seqlen.offset_k, 0), tma_tensor_sfk[None, None, head_idx_kv])
                 gSFK = cute.local_tile(sfk_cur, cute.select(self.mma_tiler_qk, mode=[1, 2]), (None, 0))
             tSgSFK = thr_mma_qk.partition_B(gSFK)
+            # Use a flat SMEM view for TMA partition (TMA loads raw bytes,
+            # the nested BlockScaledBasicChunk layout is only for S2T copy)
+            sfk_per_stage = self.n_block_size * self.head_dim_padded // self.sf_vec_size
+            sSFK_flat = cute.make_tensor(
+                sSFK[None, None, None, 0].iterator,
+                cute.make_layout((sfk_per_stage, self.kv_stage), stride=(1, sfk_per_stage))
+            )
             tSFKsSFK, tSFKgSFK = cpasync.tma_partition(
                 tma_atom_SFK, 0, cute.make_layout(1),
-                cute.group_modes(sSFK, 0, 3),
-                cute.group_modes(tSgSFK, 0, 3),
+                sSFK_flat,
+                cute.group_modes(tSgSFK, 0, cute.rank(tSgSFK.shape) - 1),
             )
             tSFKgSFK = cute.filter_zeros(tSFKgSFK)
             if const_expr(self.use_tma_Q):
