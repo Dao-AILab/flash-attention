@@ -1571,6 +1571,25 @@ class FlashAttentionForwardSm100:
                 )
             tSgK = thr_mma_qk.partition_B(gK)
             tOgV = thr_mma_pv.partition_B(gV)
+            # SF partition for block-scaled QK (per-tile: needs head_idx_kv, batch_idx)
+            tSFKsSFK = None
+            tSFKgSFK = None
+            if const_expr(self.block_scaled_qk and tma_atom_SFK is not None):
+                if const_expr(not seqlen.has_cu_seqlens_k):
+                    sfk_cur = tma_tensor_sfk[None, None, head_idx_kv, batch_idx]
+                    gSFK = cute.local_tile(sfk_cur, cute.select(self.mma_tiler_qk, mode=[1, 2]), (None, 0))
+                else:
+                    sfk_cur = cute.domain_offset((seqlen.offset_k, 0), tma_tensor_sfk[None, None, head_idx_kv])
+                    gSFK = cute.local_tile(sfk_cur, cute.select(self.mma_tiler_qk, mode=[1, 2]), (None, 0))
+                tSgSFK = thr_mma_qk.partition_B(gSFK)
+                tSFKsSFK, tSFKgSFK = cpasync.tma_partition(
+                    tma_atom_SFK,
+                    0,
+                    cute.make_layout(1),
+                    cute.group_modes(sSFK, 0, 3),
+                    cute.group_modes(tSgSFK, 0, 3),
+                )
+                tSFKgSFK = cute.filter_zeros(tSFKgSFK)
             if const_expr(self.use_tma_Q):
                 tiler_gQ = ((self.mma_tiler_qk[0] * self.q_stage), self.head_dim_padded)
                 gQ = cute.local_tile(mQ_cur, tiler_gQ, (m_block, 0))  # (128 * 2, 128)
@@ -1611,20 +1630,6 @@ class FlashAttentionForwardSm100:
                     cute.group_modes(sV, 0, 3),
                     cute.group_modes(tOgV, 0, 3),
                 )
-                # SF TMA partitions for block-scaled QK
-                if const_expr(self.block_scaled_qk and tma_atom_SFQ is not None):
-                    gSFK = cute.local_tile(
-                        tma_tensor_sfk, cute.select(self.mma_tiler_qk, mode=[1, 2]), (None, 0, None)
-                    )
-                    tSgSFK = thr_mma_qk.partition_B(gSFK)
-                    tSFKsSFK, tSFKgSFK = cpasync.tma_partition(
-                        tma_atom_SFK,
-                        0,
-                        cute.make_layout(1),
-                        cute.group_modes(sSFK, 0, 3),
-                        cute.group_modes(tSgSFK, 0, 3),
-                    )
-                    tSFKgSFK = cute.filter_zeros(tSFKgSFK)
                 paged_kv_manager = None
             else:
                 page_size = mK.shape[0]
@@ -1647,9 +1652,6 @@ class FlashAttentionForwardSm100:
                 tKsK, tKgK = None, None
                 tVsV, tVgV = None, None
 
-            _sf_tma_k = tma_atom_SFK if const_expr(self.block_scaled_qk and tma_atom_SFK is not None) else None
-            _sf_g_k = tSFKgSFK if const_expr(self.block_scaled_qk and tma_atom_SFK is not None) else None
-            _sf_s_k = tSFKsSFK if const_expr(self.block_scaled_qk and tma_atom_SFK is not None) else None
             load_K = partial(
                 self.load_KV,
                 tma_atom_K,
@@ -1659,9 +1661,9 @@ class FlashAttentionForwardSm100:
                 sK,
                 pipeline_kv=pipeline_kv,
                 K_or_V="K",
-                tma_atom_SF=_sf_tma_k,
-                tSFgSF=_sf_g_k,
-                tSFsSF=_sf_s_k,
+                tma_atom_SF=tma_atom_SFK if const_expr(self.block_scaled_qk) else None,
+                tSFgSF=tSFKgSFK,
+                tSFsSF=tSFKsSFK,
             )
             load_V = partial(
                 self.load_KV,
