@@ -798,6 +798,15 @@ class FlashAttentionForwardSm100:
                 cute.struct.MemRange[self.k_dtype, cute.cosize(sK_layout)],
                 self.buffer_align_bytes,
             ]
+            if const_expr(self.block_scaled_qk):
+                sSFQ: cute.struct.Align[
+                    cute.struct.MemRange[cutlass.UInt8, cute.cosize(sSFQ_layout)],
+                    128,
+                ]
+                sSFK: cute.struct.Align[
+                    cute.struct.MemRange[cutlass.UInt8, cute.cosize(sSFK_layout)],
+                    128,
+                ]
 
         self.shared_storage = SharedStorage
 
@@ -855,6 +864,12 @@ class FlashAttentionForwardSm100:
             aux_tensors,
             fastdiv_mods,
             head_divmod,
+            mSFQ,
+            mSFK,
+            tma_atom_SFQ,
+            tma_atom_SFK,
+            sSFQ_layout,
+            sSFK_layout,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -902,6 +917,12 @@ class FlashAttentionForwardSm100:
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
         head_divmod=None,
+        mSFQ: Optional[cute.Tensor] = None,
+        mSFK: Optional[cute.Tensor] = None,
+        tma_atom_SFQ: Optional[cute.CopyAtom] = None,
+        tma_atom_SFK: Optional[cute.CopyAtom] = None,
+        sSFQ_layout: Optional[cute.ComposedLayout] = None,
+        sSFK_layout: Optional[cute.ComposedLayout] = None,
     ):
         """The device kernel implementation of the Fused Multi-Head Attention.
 
@@ -1095,6 +1116,13 @@ class FlashAttentionForwardSm100:
         # (MMA, MMA_K, MMA_D, PIPE)
         # Strip swizzle info to reuse smem
         sV = cute.make_tensor(cute.recast_ptr(sK.iterator, sV_layout.inner), sV_layout.outer)
+        # SF tensors for block-scaled QK
+        if const_expr(self.block_scaled_qk):
+            sSFQ = storage.sSFQ.get_tensor(sSFQ_layout.outer, swizzle=sSFQ_layout.inner)
+            sSFK = storage.sSFK.get_tensor(sSFK_layout.outer, swizzle=sSFK_layout.inner)
+        else:
+            sSFQ = None
+            sSFK = None
         if const_expr(not self.overlap_sO_sQ):
             sO = storage.sO.get_tensor(sO_layout.outer, swizzle=sO_layout.inner)
         else:
@@ -1249,6 +1277,12 @@ class FlashAttentionForwardSm100:
                 SeqlenInfoCls,
                 blocksparse_tensors,
                 tile_scheduler=tile_scheduler,
+                mSFQ=mSFQ,
+                mSFK=mSFK,
+                tma_atom_SFQ=tma_atom_SFQ,
+                tma_atom_SFK=tma_atom_SFK,
+                sSFQ=sSFQ if const_expr(self.block_scaled_qk) else None,
+                sSFK=sSFK if const_expr(self.block_scaled_qk) else None,
             )
 
         # ///////////////////////////////////////////////////////////////////////////////
@@ -1414,6 +1448,12 @@ class FlashAttentionForwardSm100:
         SeqlenInfoCls: Callable,
         blocksparse_tensors: Optional[BlockSparseTensors],
         tile_scheduler: TileSchedulerProtocol,
+        mSFQ: Optional[cute.Tensor] = None,
+        mSFK: Optional[cute.Tensor] = None,
+        tma_atom_SFQ: Optional[cute.CopyAtom] = None,
+        tma_atom_SFK: Optional[cute.CopyAtom] = None,
+        sSFQ: Optional[cute.Tensor] = None,
+        sSFK: Optional[cute.Tensor] = None,
     ):
         num_load_threads = len(self.load_warp_ids) * cute.arch.WARP_SIZE
         tidx = cute.arch.thread_idx()[0] % num_load_threads
@@ -1498,6 +1538,22 @@ class FlashAttentionForwardSm100:
                     cute.group_modes(sV, 0, 3),
                     cute.group_modes(tOgV, 0, 3),
                 )
+                # SF TMA partitions for block-scaled QK
+                if const_expr(self.block_scaled_qk and tma_atom_SFQ is not None):
+                    tSFQsSFQ, tSFQgSFQ = cpasync.tma_partition(
+                        tma_atom_SFQ,
+                        0,
+                        cute.make_layout(1),
+                        cute.group_modes(sSFQ, 0, 3),
+                        cute.group_modes(thr_mma_qk.partition_A(mSFQ), 0, 3),
+                    )
+                    tSFKsSFK, tSFKgSFK = cpasync.tma_partition(
+                        tma_atom_SFK,
+                        0,
+                        cute.make_layout(1),
+                        cute.group_modes(sSFK, 0, 3),
+                        cute.group_modes(thr_mma_qk.partition_B(mSFK), 0, 3),
+                    )
                 paged_kv_manager = None
             else:
                 page_size = mK.shape[0]
@@ -1529,6 +1585,9 @@ class FlashAttentionForwardSm100:
                 sK,
                 pipeline_kv=pipeline_kv,
                 K_or_V="K",
+                tma_atom_SF=tma_atom_SFK if const_expr(self.block_scaled_qk) else None,
+                tSFgSF=tSFKgSFK if const_expr(self.block_scaled_qk) else None,
+                tSFsSF=tSFKsSFK if const_expr(self.block_scaled_qk) else None,
             )
             load_V = partial(
                 self.load_KV,
@@ -1657,29 +1716,33 @@ class FlashAttentionForwardSm100:
         sQ_stage_stride = (sQ.layout.stride[-1] * sQ.element_type.width // 8) >> 4
         if const_expr(self.q_stage == 1):
             sQ_stage_stride = 0
-        gemm_Si = [
-            partial(
-                # sm100_utils.gemm_ptx_precomputed,
-                # self.tmem_s_offset[stage],
-                # smem_desc_start_a=q_smem_start[stage],
-                # idesc=qk_mma_idesc,
-                # smem_desc_base_a=q_smem_base,
-                # smem_desc_base_b=k_smem_base,
-                # tCrA_layout=tSrQ[None, None, None, 0].layout,
-                sm100_utils.gemm_ptx_precomputed_varname,
-                self.tmem_s_offset[stage],
-                # idesc=qk_mma_idesc,
-                smem_desc_base_b=k_smem_base,
-                tCrB_layout=tSrK[None, None, None, 0].layout,
-                smem_var_name_prefix="fa_fwd_q_smem_desc",
-                idesc_var_name="fa_fwd_qk_mma_idesc",
-                kind=qk_mma_kind,
-                smem_offset=-sQ_stage_stride if stage == 0 else sQ_stage_stride,
-                zero_init=True,
-                cta_group=self.cta_group_size,
-            )
-            for stage in range(self.q_stage)
-        ]
+        if const_expr(self.block_scaled_qk):
+            gemm_Si = [
+                partial(
+                    sm100_utils.gemm_blockscaled_generic,
+                    tiled_mma_qk,
+                    tStS[None, None, None, stage],
+                    tCrA=tSrQ[None, None, None, stage],
+                    zero_init=True,
+                )
+                for stage in range(self.q_stage)
+            ]
+        else:
+            gemm_Si = [
+                partial(
+                    sm100_utils.gemm_ptx_precomputed_varname,
+                    self.tmem_s_offset[stage],
+                    smem_desc_base_b=k_smem_base,
+                    tCrB_layout=tSrK[None, None, None, 0].layout,
+                    smem_var_name_prefix="fa_fwd_q_smem_desc",
+                    idesc_var_name="fa_fwd_qk_mma_idesc",
+                    kind=qk_mma_kind,
+                    smem_offset=-sQ_stage_stride if stage == 0 else sQ_stage_stride,
+                    zero_init=True,
+                    cta_group=self.cta_group_size,
+                )
+                for stage in range(self.q_stage)
+            ]
         # gemm_Si = [
         #     partial(
         #         sm100_utils.gemm,
@@ -3082,10 +3145,15 @@ class FlashAttentionForwardSm100:
         K_or_V: Literal["K", "V"],
         page_idx: Optional[Int32] = None,
         extra_tx_count: Optional[Int32] = None,
+        tma_atom_SF: Optional[cute.CopyAtom] = None,
+        tSFgSF: Optional[cute.Tensor] = None,
+        tSFsSF: Optional[cute.Tensor] = None,
     ):
         assert K_or_V in ("K", "V")
         stage, phase = producer_state.index, producer_state.phase
         extra_tx_count_kv = self.tma_copy_bytes[K_or_V] - self.tma_copy_bytes["K"]
+        if const_expr(self.block_scaled_qk and tma_atom_SF is not None):
+            extra_tx_count_kv += self.tma_copy_bytes.get("SFK", 0)
         extra_tx_count = (
             extra_tx_count_kv + (extra_tx_count if extra_tx_count is not None else 0) if const_expr(self.use_tma_KV)
             else None
@@ -3106,7 +3174,13 @@ class FlashAttentionForwardSm100:
                 tXsX_cur = self.offset_kv_smem(tXsX_cur, stage, phase ^ 1)
             # Currently we assume that page_size == n_block_size so we index into tXgX with block = 0
             tXgX_cur = tXgX[None, block] if const_expr(page_idx is None) else tXgX[None, 0, page_idx]
-            cute.copy(tma_atom, tXgX_cur, tXsX_cur, tma_bar_ptr=pipeline_kv.producer_get_barrier(producer_state))
+            bar_ptr = pipeline_kv.producer_get_barrier(producer_state)
+            cute.copy(tma_atom, tXgX_cur, tXsX_cur, tma_bar_ptr=bar_ptr)
+            # Issue SF TMA copy on same barrier (block-scaled QK)
+            if const_expr(tma_atom_SF is not None):
+                tSFsSF_cur = tSFsSF[None, stage]
+                tSFgSF_cur = tSFgSF[None, block]
+                cute.copy(tma_atom_SF, tSFgSF_cur, tSFsSF_cur, tma_bar_ptr=bar_ptr)
         else:
             assert paged_kv_manager is not None
             assert extra_tx_count is None
