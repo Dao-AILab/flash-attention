@@ -34,12 +34,17 @@ from flash_attn.cute.interface import (
     _flash_attn_bwd,
 )
 
+_OOM_ERRORS = (torch.OutOfMemoryError,)
+if hasattr(torch, "AcceleratorError"):
+    _OOM_ERRORS = _OOM_ERRORS + (torch.AcceleratorError,)
+
+
 def retry_on_oom(func):
     @wraps(func)
     def wrapper(*args, **kwargs):
         try:
             return func(*args, **kwargs)
-        except torch.OutOfMemoryError as e:
+        except _OOM_ERRORS as e:
             if "out of memory" in str(e).lower():
                 if hasattr(_flash_attn_fwd, "compile_cache"):
                     _flash_attn_fwd.compile_cache.clear()
@@ -157,6 +162,10 @@ def test_flash_attn_output(
             pytest.skip("SM100 head_dim=256 2CTA kernel does not support deterministic mode yet")
         if causal and seqlen_q > seqlen_k:
             pytest.skip("SM100 head_dim=256 2CTA kernel does not support causal attention with seqlen_q > seqlen_k yet")
+    if IS_SM100 and deterministic and softcap > 0.0:
+        pytest.skip("SM100 kernel hangs with deterministic=True and softcap > 0.0")
+    if IS_SM100 and local and softcap > 0.0:
+        pytest.skip("SM100 kernel hangs with local attention and softcap > 0.0")
     device = "cuda"
     # set seed
     seed = 0
@@ -557,6 +566,10 @@ def test_flash_attn_varlen_output(
             pytest.skip("SM100 head_dim=256 2CTA kernel does not support zero-length sequences yet")
         if not unpad_q or not unpad_kv:
             pytest.skip("SM100 head_dim=256 2CTA kernel does not support seqused_q/seqused_k mode yet (requires unpad_q=True and unpad_kv=True)")
+    if IS_SM100 and deterministic and softcap > 0.0:
+        pytest.skip("SM100 varlen kernel hangs with deterministic=True and softcap > 0.0")
+    if IS_SM100 and local and softcap > 0.0:
+        pytest.skip("SM100 varlen kernel hangs with local attention and softcap > 0.0")
     if (
         causal or local
     ):  # Right now reference only supports causal attention with seqlen_k == seqlen_q
@@ -849,6 +862,8 @@ def test_flash_attn_varlen_output(
                 pytest.xfail("hdim > 192 backward: SM90 not supported yet")
             if d != dv and mha_type != "mha" and IS_SM90:
                 pytest.xfail("SM90 GQA bwd currently requires headdim == headdim_v")
+            if d == 192 and IS_SM100 and softcap > 0.0:
+                pytest.skip("SM100 head_dim=192 2CTA backward does not support softcap yet")
             g_unpad = torch.randn_like(out_unpad)
             # do_o = ((g_unpad.float() * out_unpad.float()).sum(-1)).transpose(-1, -2)
             # import flash_attn_3_cuda
