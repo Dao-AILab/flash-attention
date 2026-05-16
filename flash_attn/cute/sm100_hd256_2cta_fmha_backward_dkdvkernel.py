@@ -32,6 +32,7 @@ from flash_attn.cute.tile_scheduler import (
     Sm100FmhaStaticTileSchedulerParams as FmhaStaticTileSchedulerParams,
 )
 
+import flash_attn.cute.copy_utils as fa_copy_utils
 
 LAYOUT_RANK_CONSTANT = 3
 
@@ -2811,13 +2812,11 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             dK.iterator + mdK_offset,
             cute.make_layout((K, self.tile_shape_dQ_K, HB), stride=dK.stride),
         )
-        gdK = cute.local_tile(
-            mdK, (self.dSQ_mma_tiler[0], self.dSQ_mma_tiler[1]), (None, None, None)
-        )
+        gdK = cute.local_tile(mdK, (self.cta_tiler[1], self.cta_tiler[2]), (None, None, None))
         gdK = gdK[None, None, blk_coord_k, 0, blk_coord_batch]
         cdK = cute.domain_offset(
             (blk_coord_k * self.tile_shape_K, 0),
-            cute.make_identity_tensor((self.dSQ_mma_tiler[0], self.dSQ_mma_tiler[1])),
+            cute.make_identity_tensor((self.cta_tiler[1], self.cta_tiler[2])),
         )
 
         mdV_offset = cute.assume(blk_offset[1] * dV.stride[0], divby=64)
@@ -2825,24 +2824,41 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             dV.iterator + mdV_offset,
             cute.make_layout((K, self.tile_shape_dV_dO, HB), stride=dV.stride),
         )
-        gdV = cute.local_tile(
-            mdV, (self.PdO_mma_tiler[0], self.PdO_mma_tiler[1]), (None, None, None)
-        )
+        gdV = cute.local_tile(mdV, (self.cta_tiler[1], self.cta_tiler[2]), (None, None, None))
         gdV = gdV[None, None, blk_coord_k, 0, blk_coord_batch]
         cdV = cute.domain_offset(
             (blk_coord_k * self.tile_shape_K, 0),
-            cute.make_identity_tensor((self.PdO_mma_tiler[0], self.PdO_mma_tiler[1])),
+            cute.make_identity_tensor((self.cta_tiler[1], self.cta_tiler[2])),
         )
 
-        for i in cutlass.range(tidx * 8, cute.size(gdK), block_dim_x * 8):
-            if cute.elem_less(cdK[i], cute.select(problem_shape, mode=[1, 2])):
-                gdK_i = cute.make_tensor(gdK.iterator + cute.assume(i, divby=8), (8))
-                gdK_i.fill(0)
+        num_zero_epi_threads = 256
 
-        for i in cutlass.range(tidx * 8, cute.size(gdV), block_dim_x * 8):
-            if cute.elem_less(cdV[i], cute.select(problem_shape, mode=[1, 2])):
-                gdV_i = cute.make_tensor(gdV.iterator + cute.assume(i, divby=8), (8))
-                gdV_i.fill(0)
+        tiled_copy_r2g = fa_copy_utils.tiled_copy_2d(
+            dK.element_type, self.cta_tiler[2], num_zero_epi_threads
+        )
+
+        thr_copy_r2g = tiled_copy_r2g.get_slice(tidx)
+
+        tRG_gdK = thr_copy_r2g.partition_D(gdK)
+        tRG_cdK = thr_copy_r2g.partition_D(cdK)
+        tRG_gdV = thr_copy_r2g.partition_D(gdV)
+        tRG_cdV = thr_copy_r2g.partition_D(cdV)
+
+        zero_frg = cute.make_rmem_tensor_like(tRG_gdK[None, 0, None])
+        zero_frg.fill(dK.element_type(0.0))
+
+        # check we don't need zero fragment duplication
+        V_frg_size = cute.size(tRG_gdV[None, 0, None])
+        assert cute.size(zero_frg) == V_frg_size
+
+        if tidx < num_zero_epi_threads:
+            for n in cutlass.range(cute.size(tRG_gdK.shape[1]), unroll_full=True):
+                if cute.elem_less(tRG_cdK[0, n, 0][0], problem_shape[1]):
+                    cute.copy(tiled_copy_r2g, zero_frg, tRG_gdK[None, n, None])
+
+            for n in cutlass.range(cute.size(tRG_gdV.shape[1]), unroll_full=True):
+                if cute.elem_less(tRG_cdV[0, n, 0][0], problem_shape[1]):
+                    cute.copy(tiled_copy_r2g, zero_frg, tRG_gdV[None, n, None])
 
     @cute.jit
     def epilogue(
