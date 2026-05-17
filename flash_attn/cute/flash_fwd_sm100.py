@@ -595,6 +595,15 @@ class FlashAttentionForwardSm100:
             sSFK_layout = make_smem_layout_sfb(
                 tiled_mma_qk, self.mma_tiler_qk, self.sf_vec_size, self.kv_stage, **_sf_kwargs
             )
+            # Pre-compute TMEM layouts in __call__ (same JIT context as standalone)
+            _sfq_smem_single = cute.slice_(sSFQ_layout, (None, None, None, 0))
+            _sfk_smem_single = cute.slice_(sSFK_layout, (None, None, None, 0))
+            tCtSFQ_layout_precomp = blockscaled_utils.make_tmem_layout_sfa(
+                tiled_mma_qk, self.mma_tiler_qk, self.sf_vec_size, _sfq_smem_single
+            )
+            tCtSFK_layout_precomp = blockscaled_utils.make_tmem_layout_sfb(
+                tiled_mma_qk, self.mma_tiler_qk, self.sf_vec_size, _sfk_smem_single
+            )
         else:
             sSFQ_layout = None
             sSFK_layout = None
@@ -955,6 +964,8 @@ class FlashAttentionForwardSm100:
             tma_atom_SFK,
             sSFQ_layout,
             sSFK_layout,
+            tCtSFQ_layout_precomp if const_expr(self.block_scaled_qk) else None,
+            tCtSFK_layout_precomp if const_expr(self.block_scaled_qk) else None,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -1008,6 +1019,8 @@ class FlashAttentionForwardSm100:
         tma_atom_SFK: Optional[cute.CopyAtom] = None,
         sSFQ_layout=None,
         sSFK_layout=None,
+        tCtSFQ_layout_precomp=None,
+        tCtSFK_layout_precomp=None,
     ):
         """The device kernel implementation of the Fused Multi-Head Attention.
 
@@ -1391,7 +1404,7 @@ class FlashAttentionForwardSm100:
             s2t_sfq_staged = None
             s2t_sfk_staged = None
             if const_expr(self.block_scaled_qk and sSFQ is not None):
-                align = 16
+                align = self.buffer_align_bytes
                 # SFQ TMEM: stagger with S offsets
                 sfq_stage_order = tuple(
                     self.q_stage - 1 - stage for stage in range(self.q_stage)
@@ -1432,11 +1445,20 @@ class FlashAttentionForwardSm100:
                 )
                 tCtSFKs = [cute.make_tensor(sfk_tmem_ptrs[stage], tCtSFK_layout)
                            for stage in range(self.q_stage)]
-                # S2T copy disabled — make_s2t_copy fails with MLIR legalization
-                # error. The TMEM layout from make_tmem_layout_sfa/sfb doesn't
-                # match the Cp4x32x128bOp atom requirements. Need to investigate.
-                s2t_sfq_staged = None
-                s2t_sfk_staged = None
+                # Inline S2T setup (no method call)
+                _tCtSFQ_compact = cute.filter_zeros(tCtSFQs[0])
+                _s2t_atom = cute.make_copy_atom(
+                    tcgen05.Cp4x32x128bOp(tcgen05.CtaGroup.ONE),
+                    self.sf_dtype,
+                )
+                _s2t_tiled = tcgen05.make_s2t_copy(_s2t_atom, _tCtSFQ_compact)
+                _s2t_thr = _s2t_tiled.get_slice(0)
+                _tCsSFQ_compact = cute.filter_zeros(sSFQ)
+                _src_part = _s2t_thr.partition_S(_tCsSFQ_compact)
+                _src_desc = tcgen05.get_s2t_smem_desc_tensor(_s2t_tiled, _src_part)
+                _dst_part = _s2t_thr.partition_D(_tCtSFQ_compact)
+                s2t_sfq_staged = [(_s2t_tiled, _src_desc, _dst_part)] * self.q_stage
+                s2t_sfk_staged = [(_s2t_tiled, _src_desc, _dst_part)] * self.q_stage
             self.mma(
                 tiled_mma_qk,
                 tiled_mma_pv,
@@ -3475,7 +3497,6 @@ class FlashAttentionForwardSm100:
             qhead_per_kvhead=self.qhead_per_kvhead if cutlass.const_expr(self.pack_gqa) else 1,
         )
 
-    @cute.jit
     def mainloop_s2t_copy_and_partition(
         self,
         sSF: cute.Tensor,
