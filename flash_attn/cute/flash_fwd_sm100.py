@@ -1405,6 +1405,15 @@ class FlashAttentionForwardSm100:
             s2t_sfk_staged = None
             if const_expr(self.block_scaled_qk and sSFQ is not None):
                 align = self.buffer_align_bytes
+                # Compute SF SMEM layout LOCALLY (not from passed parameter)
+                # This avoids MLIR type info loss across kernel function boundary
+                _sf_kwargs = {"mma_tile_inst_k": self.mma_inst_tile_k}
+                _local_sfq_layout = make_smem_layout_sfa(
+                    tiled_mma_qk, self.mma_tiler_qk, self.sf_vec_size, self.q_stage, **_sf_kwargs
+                )
+                _local_sfk_layout = make_smem_layout_sfb(
+                    tiled_mma_qk, self.mma_tiler_qk, self.sf_vec_size, self.kv_stage, **_sf_kwargs
+                )
                 # SFQ TMEM: stagger with S offsets
                 sfq_stage_order = tuple(
                     self.q_stage - 1 - stage for stage in range(self.q_stage)
@@ -1426,7 +1435,7 @@ class FlashAttentionForwardSm100:
                     tiled_mma_qk,
                     self.mma_tiler_qk,
                     self.sf_vec_size,
-                    cute.slice_(sSFQ_layout, (None, None, None, 0)),
+                    cute.slice_(_local_sfq_layout, (None, None, None, 0)),
                 )
                 tCtSFQs = [cute.make_tensor(sfq_tmem_ptrs[stage], tCtSFQ_layout)
                            for stage in range(self.q_stage)]
@@ -1441,7 +1450,7 @@ class FlashAttentionForwardSm100:
                     tiled_mma_qk,
                     self.mma_tiler_qk,
                     self.sf_vec_size,
-                    cute.slice_(sSFK_layout, (None, None, None, 0)),
+                    cute.slice_(_local_sfk_layout, (None, None, None, 0)),
                 )
                 tCtSFKs = [cute.make_tensor(sfk_tmem_ptrs[stage], tCtSFK_layout)
                            for stage in range(self.q_stage)]
