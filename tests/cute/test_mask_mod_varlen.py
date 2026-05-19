@@ -618,6 +618,18 @@ def test_varlen_global_masks(seqlens_q, seqlens_k, mask_name):
 # =============================================================================
 
 
+@cute.jit
+def cute_all_true_mask(
+    batch: cute.TensorSSA,
+    head: cute.TensorSSA,
+    m_idx: cute.TensorSSA,
+    n_idx: cute.TensorSSA,
+    seqlen_info,
+    aux_tensors,
+) -> cute.TensorSSA:
+    return m_idx >= utils.scalar_to_ssa(0, cutlass.Int32)
+
+
 def _make_block_sparse_tensors(
     mask_mod,
     seqlens_q,
@@ -691,6 +703,7 @@ def _run_fwd(
     seqused_k=None,
     block_sparse_tensors=None,
     aux_tensors=None,
+    num_splits=1,
 ):
     out = torch.empty_like(q)
     return _flash_attn_fwd(
@@ -718,6 +731,7 @@ def _run_fwd(
         block_sparse_tensors=block_sparse_tensors,
         return_lse=False,
         aux_tensors=aux_tensors,
+        num_splits=num_splits,
     )[0]
 
 
@@ -889,6 +903,131 @@ def test_varlen_block_sparse(
     assert max_err <= 0.01, (
         f"block-sparse output differs from mask-mod-only by {max_err}"
     )
+
+
+VARLEN_BLOCK_SPARSE_SPLITKV_SEQLENS = [
+    ([128], [2048]),
+    ([96], [1536]),
+    ([128, 64], [2048, 1024]),
+    ([1, 128], [256, 2048]),
+]
+
+VARLEN_BLOCK_SPARSE_SPLITKV_MASKS = [
+    "all_true",
+    "causal",
+    "sliding_window",
+    "prefix_lm",
+    "block_diagonal",
+]
+
+
+def _get_splitkv_varlen_mask(mask_name, max_seqlen_q, max_seqlen_k):
+    match mask_name:
+        case "all_true":
+            return cute_all_true_mask
+        case "causal":
+            return get_mask_pair("causal", seqlen_q=max_seqlen_q, seqlen_k=max_seqlen_k)[0]
+        case "sliding_window":
+            return get_mask_pair(
+                "sliding_window",
+                seqlen_q=max_seqlen_q,
+                seqlen_k=max_seqlen_k,
+                window_size=512,
+            )[0]
+        case _:
+            return get_mask_pair(mask_name)[0]
+
+
+@pytest.mark.skipif(COMPUTE_CAPABILITY not in (10, 11), reason="SM100/SM110 SplitKV forward only")
+@pytest.mark.parametrize("use_seqused_k", [False, True])
+@pytest.mark.parametrize("mask_name", VARLEN_BLOCK_SPARSE_SPLITKV_MASKS)
+@pytest.mark.parametrize("seqlens_q,seqlens_k", VARLEN_BLOCK_SPARSE_SPLITKV_SEQLENS)
+def test_varlen_block_sparse_splitkv_matches_unsplit(seqlens_q, seqlens_k, mask_name, use_seqused_k):
+    """Varlen block-sparse SplitKV should match the unsplit block-sparse path."""
+    torch.manual_seed(123)
+    random.seed(123)
+    device = "cuda"
+    num_heads = 4
+    head_dim = 128
+    dtype = torch.bfloat16
+    sparse_tile_m = 256 if sum(seqlens_q) > 128 else 128
+    tile_n = 128
+    max_seqlen_q = max(seqlens_q)
+    max_seqlen_k = max(seqlens_k)
+
+    q = torch.randn(sum(seqlens_q), num_heads, head_dim, device=device, dtype=dtype)
+    cu_seqlens_q = torch.tensor(
+        [0] + list(torch.tensor(seqlens_q).cumsum(0).tolist()),
+        device=device,
+        dtype=torch.int32,
+    )
+    mask_mod = _get_splitkv_varlen_mask(mask_name, max_seqlen_q, max_seqlen_k)
+
+    if use_seqused_k:
+        k = torch.randn(
+            len(seqlens_k), max_seqlen_k, num_heads, head_dim, device=device, dtype=dtype
+        )
+        v = torch.randn_like(k)
+        cu_seqlens_k = None
+        seqused_k = torch.tensor(seqlens_k, dtype=torch.int32, device=device)
+    else:
+        k = torch.randn(sum(seqlens_k), num_heads, head_dim, device=device, dtype=dtype)
+        v = torch.randn_like(k)
+        cu_seqlens_k = torch.tensor(
+            [0] + list(torch.tensor(seqlens_k).cumsum(0).tolist()),
+            device=device,
+            dtype=torch.int32,
+        )
+        seqused_k = None
+
+    block_sparse_tensors = _make_block_sparse_tensors(
+        mask_mod=mask_mod,
+        seqlens_q=seqlens_q,
+        seqlens_k=seqlens_k,
+        num_heads=1,
+        tile_m=sparse_tile_m,
+        tile_n=tile_n,
+        device=device,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        seqused_k=seqused_k,
+    )
+
+    out_unsplit = _run_fwd(
+        q,
+        k,
+        v,
+        mask_mod,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        seqused_k=seqused_k,
+        block_sparse_tensors=block_sparse_tensors,
+    )
+    out_split = _run_fwd(
+        q,
+        k,
+        v,
+        mask_mod,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        seqused_k=seqused_k,
+        block_sparse_tensors=block_sparse_tensors,
+        num_splits=3,
+    )
+    out_no_block_sparsity = _run_fwd(
+        q,
+        k,
+        v,
+        mask_mod,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        seqused_k=seqused_k,
+    )
+
+    assert not torch.isnan(out_split).any(), "NaN in SplitKV block-sparse output"
+    assert torch.isfinite(out_split).all(), "Inf in SplitKV block-sparse output"
+    assert (out_unsplit - out_no_block_sparsity).abs().max().item() <= 0.01
+    assert (out_split - out_no_block_sparsity).abs().max().item() <= 0.01
 
 
 if __name__ == "__main__":

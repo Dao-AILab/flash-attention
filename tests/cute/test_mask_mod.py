@@ -2258,6 +2258,146 @@ def test_dq_write_order_document_mask(seqlen_q, seqlen_k, spt):
     _run_write_order_test(doc_mask, seqlen_q, seqlen_k, block_size=128, B=B, H=H, spt=spt)
 
 
+@pytest.mark.skipif(COMPUTE_CAPABILITY not in (10, 11), reason="SM100/SM110 SplitKV block sparse forward only")
+def test_block_sparse_splitkv_matches_unsplit():
+    torch.manual_seed(123)
+    batch_size = 1
+    nheads = 4
+    seqlen = 2048
+    headdim = 64
+    tile_m = 128
+    tile_n = 128
+    dtype = torch.bfloat16
+    sparse_tile_m = 2 * tile_m
+
+    mask_mod_cute, mask_mod_flex = get_mask_pair("causal", seqlen_q=seqlen, seqlen_k=seqlen)
+    tensors = create_tensors(
+        batch_size, seqlen, seqlen, nheads, nheads, headdim, headdim, dtype
+    )
+
+    bm = create_block_mask(
+        mask_mod_flex,
+        batch_size,
+        nheads,
+        seqlen,
+        seqlen,
+        device="cuda",
+        BLOCK_SIZE=(sparse_tile_m, tile_n),
+    )
+    (_, _, kv_mask_cnt, kv_mask_idx, full_kv_cnt, full_kv_idx, *_) = bm.as_tuple()
+    block_sparse_fwd = BlockSparseTensorsTorch(
+        mask_block_cnt=kv_mask_cnt,
+        mask_block_idx=kv_mask_idx,
+        full_block_cnt=full_kv_cnt,
+        full_block_idx=full_kv_idx,
+        block_size=(sparse_tile_m, tile_n),
+    )
+
+    out_unsplit, lse_unsplit = _flash_attn_fwd(
+        q=tensors["q"],
+        k=tensors["k"],
+        v=tensors["v"],
+        out=tensors["out"].clone(),
+        lse=tensors["lse"].clone(),
+        softmax_scale=1.0 / math.sqrt(headdim),
+        causal=False,
+        mask_mod=mask_mod_cute,
+        block_sparse_tensors=block_sparse_fwd,
+        num_splits=1,
+        return_lse=True,
+    )
+    out_split, lse_split = _flash_attn_fwd(
+        q=tensors["q"],
+        k=tensors["k"],
+        v=tensors["v"],
+        out=tensors["out"].clone(),
+        lse=tensors["lse"].clone(),
+        softmax_scale=1.0 / math.sqrt(headdim),
+        causal=False,
+        mask_mod=mask_mod_cute,
+        block_sparse_tensors=block_sparse_fwd,
+        num_splits=3,
+        return_lse=True,
+    )
+
+    out_ref = compute_reference_flex_attn(tensors, mask_mod_flex, block_size=(sparse_tile_m, tile_n))
+    out_ref_fp32 = compute_reference_flex_attn(
+        {name: tensor.float() for name, tensor in tensors.items()},
+        mask_mod_flex,
+        block_size=(sparse_tile_m, tile_n),
+    )
+
+    assert_fwd_matches_reference(out_split, out_ref_fp32, out_ref)
+    assert torch.allclose(lse_split, lse_unsplit, atol=2e-3, rtol=2e-3)
+
+
+@pytest.mark.skipif(COMPUTE_CAPABILITY not in (10, 11), reason="SM100/SM110 SplitKV block sparse forward only")
+def test_block_sparse_splitkv_oversplit_sparse_blocks():
+    torch.manual_seed(321)
+    batch_size = 1
+    nheads = 4
+    seqlen_q = 513
+    seqlen_k = 1024
+    headdim = 64
+    tile_m = 128
+    tile_n = 128
+    dtype = torch.bfloat16
+    sparse_tile_m = 2 * tile_m
+
+    mask_mod_cute, mask_mod_flex = get_mask_pair("block_diagonal", seqlen_q=seqlen_q, seqlen_k=seqlen_k)
+    tensors = create_tensors(
+        batch_size, seqlen_q, seqlen_k, nheads, nheads, headdim, headdim, dtype
+    )
+    bm = create_block_mask(
+        mask_mod_flex,
+        batch_size,
+        nheads,
+        seqlen_q,
+        seqlen_k,
+        device="cuda",
+        BLOCK_SIZE=(sparse_tile_m, tile_n),
+    )
+    (_, _, kv_mask_cnt, kv_mask_idx, full_kv_cnt, full_kv_idx, *_) = bm.as_tuple()
+    block_sparse_fwd = BlockSparseTensorsTorch(
+        mask_block_cnt=kv_mask_cnt,
+        mask_block_idx=kv_mask_idx,
+        full_block_cnt=full_kv_cnt,
+        full_block_idx=full_kv_idx,
+        block_size=(sparse_tile_m, tile_n),
+    )
+
+    out_unsplit, _ = _flash_attn_fwd(
+        q=tensors["q"],
+        k=tensors["k"],
+        v=tensors["v"],
+        out=tensors["out"].clone(),
+        lse=tensors["lse"].clone(),
+        softmax_scale=1.0 / math.sqrt(headdim),
+        causal=False,
+        mask_mod=mask_mod_cute,
+        block_sparse_tensors=block_sparse_fwd,
+        num_splits=1,
+        return_lse=True,
+    )
+    out_split, _ = _flash_attn_fwd(
+        q=tensors["q"],
+        k=tensors["k"],
+        v=tensors["v"],
+        out=tensors["out"].clone(),
+        lse=tensors["lse"].clone(),
+        softmax_scale=1.0 / math.sqrt(headdim),
+        causal=False,
+        mask_mod=mask_mod_cute,
+        block_sparse_tensors=block_sparse_fwd,
+        num_splits=8,
+        return_lse=True,
+    )
+
+    assert not torch.isnan(out_split).any()
+    assert torch.isfinite(out_split).all()
+    assert torch.allclose(out_split, out_unsplit, atol=4e-3, rtol=4e-3)
+
+
 def test_compact_block_sparse_indices():
     """Test that compact block sparse index tensors (idx.shape[3] < n_blocks) work correctly.
 
