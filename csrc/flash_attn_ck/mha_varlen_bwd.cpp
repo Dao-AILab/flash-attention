@@ -19,9 +19,7 @@ fmha_bwd_traits get_ck_fmha_varlen_bwd_traits(const mask_info &mask,
                                               int nhead_k,
                                               bool has_dropout,
                                               bool enable_alibi,
-                                              bool deterministic,
-                                              const int* seqstart_qs,
-                                              const int* seqstart_ks)
+                                              bool deterministic)
 {
     return fmha_bwd_traits{seqlen_q,
                            seqlen_k,
@@ -39,9 +37,7 @@ fmha_bwd_traits get_ck_fmha_varlen_bwd_traits(const mask_info &mask,
                            false,    // has_dbias
                            has_dropout,
                            false, // s_randval
-                           deterministic,
-                           seqstart_qs,
-                           seqstart_ks};
+                           deterministic};
 }
 fmha_bwd_args get_ck_fmha_varlen_bwd_args(const mask_info &mask,
                                           // sizes
@@ -339,11 +335,6 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
         dv = torch::empty_like(v);
     }
 
-    // seqstart_qs/ks are dereferenced on the HOST inside fmha_bwd_launcher constructor
-    // (to compute workspace sizes), so we must use host copies.
-    at::Tensor cu_seqlens_q_host = cu_seqlens_q.cpu();
-    at::Tensor cu_seqlens_k_host = cu_seqlens_k.cpu();
-
     const auto traits = get_ck_fmha_varlen_bwd_traits(
         mask,
         q_dtype_str,
@@ -357,9 +348,7 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
         num_heads_k,
         is_dropout,
         alibi_slopes_.has_value(),
-        deterministic,
-        reinterpret_cast<const int*>(cu_seqlens_q_host.data_ptr()),
-        reinterpret_cast<const int*>(cu_seqlens_k_host.data_ptr()));
+        deterministic);
     fmha_bwd_launcher launcher(traits);
 
     at::cuda::CUDAGuard device_guard{q.device()};
@@ -377,7 +366,23 @@ mha_varlen_bwd(const at::Tensor &dout,                   // total_q x num_heads 
         workspace = torch::empty({static_cast<int64_t>(launcher.workspace_size)},
                                  opts.dtype(at::kByte));
         workspace_ptr = workspace.data_ptr();
-        launcher.prepare_workspace(workspace_ptr);
+        // Pinned host buffer allocator backed by PyTorch's CachingHostAllocator.
+        // The returned shared_ptr owns the at::Tensor; the launcher keeps it
+        // alive via a stream-tail hipLaunchHostFunc keepalive so the buffer
+        // is not recycled while async D2H/H2D copies are still in flight.
+        auto pinned_host_alloc = [](size_t bytes) -> std::shared_ptr<void> {
+            auto t = std::make_shared<at::Tensor>(torch::empty(
+                {static_cast<int64_t>(bytes)},
+                torch::TensorOptions().dtype(at::kByte).device(at::kCPU).pinned_memory(true)));
+            return std::shared_ptr<void>(t, t->data_ptr());
+        };
+        ck_tile::stream_config prep_cfg{stream};
+        launcher.prepare_workspace_async(
+            workspace_ptr,
+            reinterpret_cast<const int*>(cu_seqlens_q.data_ptr()),
+            reinterpret_cast<const int*>(cu_seqlens_k.data_ptr()),
+            prep_cfg,
+            pinned_host_alloc);
     }
 
     at::Tensor dk_expanded, dv_expanded;

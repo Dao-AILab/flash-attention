@@ -349,7 +349,23 @@ mha_bwd(const at::Tensor &dout,                   // batch_size x seqlen_q x num
         workspace = torch::empty({static_cast<int64_t>(launcher.workspace_size)},
                                  opts.dtype(at::kByte));
         workspace_ptr = workspace.data_ptr();
-        launcher.prepare_workspace(workspace_ptr);
+        // Pinned host buffer allocator backed by PyTorch's CachingHostAllocator.
+        // The returned shared_ptr owns the at::Tensor; the launcher keeps it
+        // alive via a stream-tail hipLaunchHostFunc keepalive. Required when
+        // the launcher needs host-side workspace metadata (deterministic mode
+        // and/or non-trivial worker state); harmless when it doesn't.
+        auto pinned_host_alloc = [](size_t bytes) -> std::shared_ptr<void> {
+            auto t = std::make_shared<at::Tensor>(torch::empty(
+                {static_cast<int64_t>(bytes)},
+                torch::TensorOptions().dtype(at::kByte).device(at::kCPU).pinned_memory(true)));
+            return std::shared_ptr<void>(t, t->data_ptr());
+        };
+        ck_tile::stream_config prep_cfg{stream};
+        launcher.prepare_workspace_async(workspace_ptr,
+                                         /*seqstart_q_dev=*/nullptr,
+                                         /*seqstart_k_dev=*/nullptr,
+                                         prep_cfg,
+                                         pinned_host_alloc);
     }
 
     at::Tensor dk_expanded, dv_expanded;
