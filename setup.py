@@ -673,7 +673,7 @@ if ROCM_BACKEND == "triton":
     # Note: torch is excluded because pip resolves it to CUDA PyTorch from PyPI, overwriting any pre-installed ROCm PyTorch. Users must have torch installed.
     install_requires = [
         "einops",
-        "triton==3.5.1",
+        "triton==3.5.1" if sys.platform != "win32" else "triton-windows>=3.6.0",
     ]
 else:
     install_requires = [

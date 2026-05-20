@@ -29,6 +29,7 @@ from flash_attn.cute.mask import (
     Sm100FusedMask as FusedMask,
 )
 from flash_attn.cute.tile_scheduler import SM100_TMEM_CAPACITY_COLUMNS
+import flash_attn.cute.copy_utils as fa_copy_utils
 
 
 class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
@@ -187,7 +188,6 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         s_q64 = Int64(s_q)
         s_k64 = Int64(s_k)
         s_lse64 = Int64(s_lse)
-        d64 = cute.assume(Int64(d), divby=128)
         h_r64 = Int64(h_r)
         h_k64 = Int64(h_k)
         b64 = Int64(b)
@@ -196,39 +196,72 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         # `cuseqlen_*` offsets stays within the tensor domain.
         s_q_total = q_tensor.shape[1] if cum_seqlen_q is not None else s_q64
         s_k_total = k_tensor.shape[1] if cum_seqlen_k is not None else s_k64
-        stride_b_qo = h_r64 * h_k64 * s_q64 * d64 if cum_seqlen_q is None else 0
-        stride_b_kv = h_k64 * s_k64 * d64 if cum_seqlen_k is None else 0
         b_lse = b64 if cum_seqlen_q is None else 1
         stride_b_lse = h_r64 * h_k64 * s_lse64 if cum_seqlen_q is None else 0
 
         # (s, d, ((h_r, h_k), b))
         q_layout = cute.make_layout(
             (s_q_total, d, ((h_r, h_k), b)),
-            stride=(d64 * h_r64 * h_k64, 1, ((d64, d64 * h_r64), stride_b_qo)),
+            stride=(
+                cute.assume(q_tensor.stride[1], divby=64),
+                q_tensor.stride[4],
+                (
+                    (q_tensor.stride[3], q_tensor.stride[2]),
+                    0 if cum_seqlen_q is not None else cute.assume(q_tensor.stride[0], divby=64),
+                ),
+            ),
         )
         q = cute.make_tensor(q_tensor.iterator, q_layout)
         # (s, d, ((h_r, h_k), b))
         do_layout = cute.make_layout(
             (s_q_total, d, ((h_r, h_k), b)),
-            stride=(d64 * h_r64 * h_k64, 1, ((d64, d64 * h_r64), stride_b_qo)),
+            stride=(
+                cute.assume(do_tensor.stride[1], divby=64),
+                do_tensor.stride[4],
+                (
+                    (do_tensor.stride[3], do_tensor.stride[2]),
+                    0 if cum_seqlen_q is not None else cute.assume(do_tensor.stride[0], divby=64),
+                ),
+            ),
         )
         do = cute.make_tensor(do_tensor.iterator, do_layout)
         # (s, d, ((h_r, h_k), b)), 0-stride for h_r to broadcast
         k_layout = cute.make_layout(
             (s_k_total, d, ((h_r, h_k), b)),
-            stride=(d64 * h_k64, 1, ((0, d64), stride_b_kv)),
+            stride=(
+                cute.assume(k_tensor.stride[1], divby=64),
+                k_tensor.stride[4],
+                (
+                    (0, k_tensor.stride[2]),
+                    0 if cum_seqlen_k is not None else cute.assume(k_tensor.stride[0], divby=64),
+                ),
+            ),
         )
         k = cute.make_tensor(k_tensor.iterator, k_layout)
         # (d, s, ((h_r, h_k), b)), 0-stride for h_r to broadcast
         kt_layout = cute.make_layout(
             (d, s_k_total, ((h_r, h_k), b)),
-            stride=(1, d64 * h_k64, ((0, d64), stride_b_kv)),
+            stride=(
+                k_tensor.stride[4],
+                cute.assume(k_tensor.stride[1], divby=64),
+                (
+                    (0, k_tensor.stride[2]),
+                    0 if cum_seqlen_k is not None else cute.assume(k_tensor.stride[0], divby=64),
+                ),
+            ),
         )
         kt = cute.make_tensor(k_tensor.iterator, kt_layout)
         # (s, d, ((h_r, h_k), b)), 0-stride for h_r to broadcast
         v_layout = cute.make_layout(
             (s_k_total, d, ((h_r, h_k), b)),
-            stride=(d64 * h_k64, 1, ((0, d64), stride_b_kv)),
+            stride=(
+                cute.assume(v_tensor.stride[1], divby=64),
+                v_tensor.stride[4],
+                (
+                    (0, v_tensor.stride[2]),
+                    0 if cum_seqlen_k is not None else cute.assume(v_tensor.stride[0], divby=64),
+                ),
+            ),
         )
         v = cute.make_tensor(v_tensor.iterator, v_layout)
         # (s, ((h_r, h_k), b))
@@ -242,7 +275,14 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         # (s, d, ((h_r, h_k), b))
         dq_layout = cute.make_layout(
             (s_q_total, d, ((h_r, h_k), b)),
-            stride=(d64 * h_r64 * h_k64, 1, ((d64, d64 * h_r64), stride_b_qo)),
+            stride=(
+                cute.assume(dq_tensor.stride[1], divby=64),
+                dq_tensor.stride[4],
+                (
+                    (dq_tensor.stride[3], dq_tensor.stride[2]),
+                    0 if cum_seqlen_q is not None else cute.assume(dq_tensor.stride[0], divby=64),
+                ),
+            ),
         )
         dq = cute.make_tensor(dq_tensor.iterator, dq_layout)
 
@@ -885,36 +925,45 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                     curr_block_coord[1],
                     curr_block_coord[2],
                 )
-                continue_cond = False
                 batch_coord = curr_block_coord[2][1]
                 seqlen_q = mQ_qdl.shape[0]
                 seqlen_k = mK_kdl.shape[0]
                 cuseqlen_q = Int32(0)
                 cuseqlen_k = Int32(0)
-                block_offset = (
-                    Int32(0),
-                    Int32(0),
-                    Int32(0),
-                    ((Int32(0), Int32(0)), Int32(0)),
-                )
+                is_valid_q = True
                 if cutlass.const_expr(cum_seqlen_q is not None):
                     cuseqlen_q = cum_seqlen_q[batch_coord]
                     seqlen_q = cum_seqlen_q[batch_coord + 1] - cuseqlen_q
-                    if cutlass.const_expr(cum_seqlen_k is not None):
-                        cuseqlen_k = cum_seqlen_k[batch_coord]
-                        seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
+                    is_valid_q = FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
+                        self.qk_mma_tiler[0],
+                        mma_block_coord[0],
+                        seqlen_q,
+                    )
+                if cutlass.const_expr(cum_seqlen_k is not None):
+                    cuseqlen_k = cum_seqlen_k[batch_coord]
+                    seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
+                seqlen_kv_loop_start, seqlen_kv_loop_steps = (
+                    FusedMask.get_trip_start_count_via_block_info(
+                        mma_block_coord,
+                        self.qk_mma_tiler,
+                        seqlen_q,
+                        seqlen_k,
+                        self.is_causal,
+                        self.is_local,
+                        window_size_left,
+                        window_size_right,
+                    )
+                )
+                is_valid_k = seqlen_kv_loop_steps > 0
+                has_work = is_valid_q and is_valid_k
+
+                if has_work:
                     block_offset = (
                         cuseqlen_q,
                         cuseqlen_k,
                         Int32(0),
                         ((Int32(0), Int32(0)), Int32(0)),
                     )
-                    continue_cond = not FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
-                        self.qk_mma_tiler[0],
-                        mma_block_coord[0],
-                        seqlen_q,
-                    )
-                if not continue_cond:
                     mQ_qdl_ = cute.domain_offset(cute.select(block_offset, mode=[0, 2, 3]), mQ_qdl)
                     mK_kdl_ = cute.domain_offset(cute.select(block_offset, mode=[1, 2, 3]), mK_kdl)
                     mdO_qdl_ = cute.domain_offset(
@@ -1018,18 +1067,6 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                     # ((atom_v, rest_v), RestN, RestK)
                     tKTgKT = tKgK_dkl[None, None, None, mma_block_coord[2]]
 
-                    seqlen_kv_loop_start, seqlen_kv_loop_steps = (
-                        FusedMask.get_trip_start_count_via_block_info(
-                            mma_block_coord,
-                            self.qk_mma_tiler,
-                            seqlen_q,
-                            seqlen_k,
-                            self.is_causal,
-                            self.is_local,
-                            window_size_left,
-                            window_size_right,
-                        )
-                    )
                     # LSE
                     lse_handle = load_lse_producer.acquire_and_advance()
                     # 32 threads loading 128 values of 32b each
@@ -1158,6 +1195,9 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         if warp_idx == self.mma_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
 
+            cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+            is_leader_cta = cta_rank_in_cluster % 2 == 0
+
             while work_tile.is_valid_tile:
                 curr_block_coord = work_tile.tile_idx
                 mma_block_coord = (
@@ -1165,41 +1205,37 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                     curr_block_coord[1],
                     curr_block_coord[2],
                 )
-                continue_cond = False
                 seqlen_q = mQ_qdl.shape[0]
                 seqlen_k = mK_kdl.shape[0]
                 batch_coord = curr_block_coord[2][1]
+                is_valid_q = True
                 if cutlass.const_expr(cum_seqlen_q is not None):
                     cuseqlen_q = cum_seqlen_q[batch_coord]
                     seqlen_q = cum_seqlen_q[batch_coord + 1] - cuseqlen_q
-                    continue_cond = not FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
+                    is_valid_q = FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
                         self.qk_mma_tiler[0],
                         mma_block_coord[0],
                         seqlen_q,
                     )
-
-                if not continue_cond:
-                    if cutlass.const_expr(cum_seqlen_k is not None):
-                        cuseqlen_k = cum_seqlen_k[batch_coord]
-                        seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
-
-                    seqlen_kv_loop_start, seqlen_kv_loop_steps = (
-                        FusedMask.get_trip_start_count_via_block_info(
-                            mma_block_coord,
-                            self.qk_mma_tiler,
-                            seqlen_q,
-                            seqlen_k,
-                            self.is_causal,
-                            self.is_local,
-                            window_size_left,
-                            window_size_right,
-                        )
+                if cutlass.const_expr(cum_seqlen_k is not None):
+                    cuseqlen_k = cum_seqlen_k[batch_coord]
+                    seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
+                seqlen_kv_loop_start, seqlen_kv_loop_steps = (
+                    FusedMask.get_trip_start_count_via_block_info(
+                        mma_block_coord,
+                        self.qk_mma_tiler,
+                        seqlen_q,
+                        seqlen_k,
+                        self.is_causal,
+                        self.is_local,
+                        window_size_left,
+                        window_size_right,
                     )
+                )
+                is_valid_k = seqlen_kv_loop_steps > 0
+                has_work = is_valid_q and is_valid_k
 
-                    cta_rank_in_cluster = cute.arch.make_warp_uniform(
-                        cute.arch.block_idx_in_cluster()
-                    )
-                    is_leader_cta = cta_rank_in_cluster % 2 == 0
+                if has_work:
                     # dq_handle = mma_dq_producer.acquire_and_advance()
                     load_q_releaser = load_q_consumer.clone()
                     load_do_releaser = load_do_consumer.clone()
@@ -1797,33 +1833,35 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                     curr_block_coord[2],
                 )
                 batch_coord = curr_block_coord[2][1]
-                continue_cond = False
                 seqlen_q = mQ_qdl.shape[0]
                 seqlen_k = mK_kdl.shape[0]
                 cuseqlen_q = Int32(0)
+                is_valid_q = True
                 if cutlass.const_expr(cum_seqlen_q is not None):
                     cuseqlen_q = cum_seqlen_q[batch_coord]
                     seqlen_q = cum_seqlen_q[batch_coord + 1] - cuseqlen_q
-                    continue_cond = not FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
+                    is_valid_q = FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
                         self.qk_mma_tiler[0],
                         mma_block_coord[0],
                         seqlen_q,
                     )
-                if not continue_cond:
-                    if cutlass.const_expr(cum_seqlen_k is not None):
-                        cuseqlen_k = cum_seqlen_k[batch_coord]
-                        seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
+                if cutlass.const_expr(cum_seqlen_k is not None):
+                    cuseqlen_k = cum_seqlen_k[batch_coord]
+                    seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
+                start_count, trip_count = FusedMask.get_trip_start_count_via_block_info(
+                    mma_block_coord,
+                    self.qk_mma_tiler,
+                    seqlen_q,
+                    seqlen_k,
+                    self.is_causal,
+                    self.is_local,
+                    window_size_left,
+                    window_size_right,
+                )
+                is_valid_k = trip_count > 0
+                has_work = is_valid_q and is_valid_k
 
-                    start_count, trip_count = FusedMask.get_trip_start_count_via_block_info(
-                        mma_block_coord,
-                        self.qk_mma_tiler,
-                        seqlen_q,
-                        seqlen_k,
-                        self.is_causal,
-                        self.is_local,
-                        window_size_left,
-                        window_size_right,
-                    )
+                if has_work:
                     end_count = start_count + trip_count
                     if cutlass.const_expr(self.use_semantic_trip_range):
                         n_block_min_causal_local_mask, n_block_min_before_local_mask = (
@@ -1893,6 +1931,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                         )
                     lse_handle.release()
                     sum_odo_handle.release()
+
                 work_tile = tile_sched.advance_to_next_work()
             ds_mma_producer.tail()
 
@@ -1913,61 +1952,75 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                 # cute.printf("batch_coord={}", batch_coord)
                 seqlen_q = mQ_qdl.shape[0]
                 seqlen_k = mK_kdl.shape[0]
-                continue_cond = False
                 cuseqlen_q = Int32(0)
+                is_valid_q = True
                 if cutlass.const_expr(cum_seqlen_q is not None):
                     cuseqlen_q = cum_seqlen_q[batch_coord]
                     seqlen_q = cum_seqlen_q[batch_coord + 1] - cuseqlen_q
-                    continue_cond = not FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
+                    is_valid_q = FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
                         self.qk_mma_tiler[0],
                         mma_block_coord[0],
                         seqlen_q,
                     )
-
-                if not continue_cond:
-                    if cutlass.const_expr(cum_seqlen_k is not None):
-                        cuseqlen_k = cum_seqlen_k[batch_coord]
-                        seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
-
-                    mdQ_qdl_eff = mdQ_qdl
-                    if cutlass.const_expr(cum_seqlen_q is not None):
-                        block_offset_dQ = (
-                            cuseqlen_q,
-                            Int32(0),
-                            Int32(0),
-                            ((Int32(0), Int32(0)), Int32(0)),
-                        )
-                        mdQ_qdl_eff = cute.domain_offset(
-                            cute.select(block_offset_dQ, mode=[0, 2, 3]), mdQ_qdl
-                        )
-
-                    # (bM, bN, loopM, loopN, loopL)
-                    gdQ_qdl = cute.flat_divide(
-                        mdQ_qdl_eff, cute.select(self.dsk_block_tiler, mode=[0, 1])
+                if cutlass.const_expr(cum_seqlen_k is not None):
+                    cuseqlen_k = cum_seqlen_k[batch_coord]
+                    seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
+                seqlen_kv_loop_start, seqlen_kv_loop_steps = (
+                    FusedMask.get_trip_start_count_via_block_info(
+                        mma_block_coord,
+                        self.qk_mma_tiler,
+                        seqlen_q,
+                        seqlen_k,
+                        self.is_causal,
+                        self.is_local,
+                        window_size_left,
+                        window_size_right,
                     )
-                    cdQ_qdl = cute.flat_divide(
-                        cute.make_identity_tensor(mdQ_qdl_eff.shape),
-                        cute.select(self.dsk_block_tiler, mode=[0, 1]),
+                )
+                is_valid_k = seqlen_kv_loop_steps > 0
+                has_work = is_valid_q and is_valid_k
+
+                mdQ_qdl_eff = mdQ_qdl
+                if cutlass.const_expr(cum_seqlen_q is not None):
+                    block_offset_dQ = (cuseqlen_q,) + (None,) * 2
+                    mdQ_qdl_eff = cute.domain_offset(block_offset_dQ, mdQ_qdl)
+
+                # (bM, bN, loopM, loopN, loopL)
+                gdQ_qdl = cute.flat_divide(
+                    mdQ_qdl_eff, cute.select(self.dsk_block_tiler, mode=[0, 1])
+                )
+                cdQ_qdl = cute.flat_divide(
+                    cute.make_identity_tensor(mdQ_qdl_eff.shape),
+                    cute.select(self.dsk_block_tiler, mode=[0, 1]),
+                )
+
+                gdQ_staged = gdQ_qdl[None, None, curr_block_coord[0], None, curr_block_coord[2]]
+                cdQ_staged = cdQ_qdl[None, None, curr_block_coord[0], None, curr_block_coord[2]]
+                gdQ_tma_staged = gdQ_staged
+
+                if cutlass.const_expr(not varlen):
+                    gdQ_tma_qdl = cute.flat_divide(
+                        mdQ_tma, cute.select(self.dsk_block_tiler, mode=[0, 1])
                     )
+                    gdQ_tma_staged = gdQ_tma_qdl[
+                        None, None, curr_block_coord[0], None, curr_block_coord[2]
+                    ]
 
-                    gdQ_staged = gdQ_qdl[None, None, curr_block_coord[0], None, curr_block_coord[2]]
-                    cdQ_staged = cdQ_qdl[None, None, curr_block_coord[0], None, curr_block_coord[2]]
-                    gdQ_tma_staged = gdQ_staged
-                    if cutlass.const_expr(not varlen):
-                        gdQ_tma_qdl = cute.flat_divide(
-                            mdQ_tma, cute.select(self.dsk_block_tiler, mode=[0, 1])
-                        )
-                        gdQ_tma_staged = gdQ_tma_qdl[
-                            None, None, curr_block_coord[0], None, curr_block_coord[2]
-                        ]
-
+                if has_work:
                     # dQ TMEM to GMEM
                     mma_dq_consumer = self.dQ_epilogue(
-                        (seqlen_q, cuseqlen_q, mQ_qdl.shape[0], batch_coord),
+                        seqlen_q,
                         (mma_dq_consumer, gdQ_staged, cdQ_staged, tdQtdQ_staged),
                         self.epi_tile,
                         (tma_atom_dQ, gdQ_tma_staged, s_epi_dQ, varlen),
                     )
+                else:
+                    self.dQ_epilogue_write_zero(
+                        seqlen_q,
+                        gdQ_staged,
+                        cdQ_staged,
+                    )
+
                 work_tile = tile_sched.advance_to_next_work()
             # NOTE: tmem.free() moved to kernel end to enable cluster-wide sync
 
@@ -2142,12 +2195,11 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
     @cute.jit
     def dQ_epilogue(
         self,
-        value_args: Tuple,
+        seqlen_q: int,
         dq_args: Tuple,
         epi_tile: cute.Tile,
         tma_args: Tuple,
     ) -> Tuple[pipeline.PipelineConsumer, pipeline.PipelineProducer]:
-        seqlen_q, cuseqlen_q, total_q, batch_coord = value_args
         (mma_dq_consumer, gdQ_staged, cdQ_staged, tdQtdQ_staged) = dq_args
         tma_atom_dQ, gdQ_tma_staged, s_epi_dQ, varlen = tma_args
         dq_handle = mma_dq_consumer.wait_and_advance()
@@ -2235,3 +2287,31 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                         cute.autovec_copy(tSMrdQ, tTMEM_LOADgdQ_i)
         dq_handle.release()
         return mma_dq_consumer
+
+    @cute.jit
+    def dQ_epilogue_write_zero(
+        self,
+        seqlen_q,
+        gdQ_staged,
+        cdQ_staged,
+    ):
+        num_epi_threads = self.threads_per_warp * len(self.epilogue_warp_ids)
+        tidx = cute.arch.thread_idx()[0] % num_epi_threads
+
+        tiled_copy_r2g = fa_copy_utils.tiled_copy_2d(
+            self.dq_dtype, cute.size(gdQ_staged.shape[1]), num_epi_threads
+        )
+
+        thr_copy_r2g = tiled_copy_r2g.get_slice(tidx)
+        tdQgdQ_staged = thr_copy_r2g.partition_D(gdQ_staged)
+        tdQcdQ_staged = thr_copy_r2g.partition_D(cdQ_staged)
+
+        tdQrdQ = cute.make_rmem_tensor_like(tdQgdQ_staged[None, 0, None, 0])
+        tdQrdQ.fill(self.dq_dtype(0.0))
+
+        for iter in cutlass.range(self.iterations_dsk, unroll_full=True):
+            tdQgdQ = tdQgdQ_staged[None, None, None, iter]
+            tdQcdQ = tdQcdQ_staged[None, None, None, iter]
+            for m in cutlass.range(cute.size(tdQgdQ.shape[1]), unroll_full=True):
+                if cute.elem_less(tdQcdQ[0, m, 0][0], seqlen_q):
+                    cute.copy(tiled_copy_r2g, tdQrdQ, tdQgdQ[None, m, None])

@@ -1030,6 +1030,9 @@ class BlackwellFusedMultiHeadAttentionForward:
         if warp_idx == self.mma_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
 
+            cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+            is_leader_cta = cta_rank_in_cluster % 2 == 0
+
             while work_tile.is_valid_tile:
                 curr_block_coord = work_tile.tile_idx
                 mma_block_coord = (
@@ -1071,10 +1074,6 @@ class BlackwellFusedMultiHeadAttentionForward:
                     )
                     seqlen_kv_loop_end = seqlen_kv_loop_start + seqlen_kv_loop_steps
 
-                    cta_rank_in_cluster = cute.arch.make_warp_uniform(
-                        cute.arch.block_idx_in_cluster()
-                    )
-                    is_leader_cta = cta_rank_in_cluster % 2 == 0
                     load_q_releaser = load_q_consumer.clone()
                     pv_tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
                     if seqlen_kv_loop_steps > 1:
@@ -1323,6 +1322,11 @@ class BlackwellFusedMultiHeadAttentionForward:
                         window_size_right,
                     )
                     end_count = start_count + trip_count
+                    # require at least one softmax iteration for zero trip_count case;
+                    # rely on masking this iteration for correctness
+                    if end_count <= start_count:
+                        start_count = 0
+                        end_count = 1
                     if cutlass.const_expr(self.use_semantic_trip_range):
                         n_block_min_causal_local_mask, n_block_min_before_local_mask = (
                             FusedMask.get_trip_mask_bounds_via_block_info(
@@ -1349,6 +1353,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                             need_apply_mask = (
                                 step >= n_block_min_causal_local_mask
                                 or step < n_block_min_before_local_mask
+                                or step == end_count - 1
                             )
                         else:
                             # Residual path only needs seqlen masking on the last K tile.
@@ -1797,7 +1802,8 @@ class BlackwellFusedMultiHeadAttentionForward:
         row_sum = sSum[thread_idx]
         cute.arch.fence_view_async_shared()
         sum_handle.release()
-        scale = scale_output / row_sum
+        row_sum_is_zero_or_nan = row_sum == 0.0 or row_sum != row_sum
+        scale = scale_output / row_sum if not row_sum_is_zero_or_nan else 0.0
         o_handle = mma_o_consumer.wait_and_advance()
         for iter in cutlass.range(self.iterations_pv):
             gO = gO_staged[None, None, iter]
@@ -1855,6 +1861,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         sSum[thread_idx] = row_sum
         cute.arch.fence_view_async_shared()
         sum_handle.commit()
+        row_sum_is_zero_or_nan = row_sum == 0.0 or row_sum != row_sum
 
         if cutlass.const_expr(mLSE is not None):
             q_idx = current_block_coord[0] * self.cta_tiler[0] + tidx
@@ -1863,7 +1870,11 @@ class BlackwellFusedMultiHeadAttentionForward:
                 if cutlass.const_expr(cum_seqlen_q is not None)
                 else current_block_coord[2]
             )
-            lse_value = scale_softmax * row_max + cute.math.log(row_sum, fastmath=True)
+            lse_value = (
+                scale_softmax * row_max + cute.math.log(row_sum, fastmath=True)
+                if not row_sum_is_zero_or_nan
+                else -Float32.inf
+            )
             if cute.elem_less(q_idx, seqlen_q):
                 global_q_idx = (
                     q_idx + cuseqlen_q if cutlass.const_expr(cum_seqlen_q is not None) else q_idx
