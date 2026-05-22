@@ -12,27 +12,33 @@
 #   pytest test_mask_mod.py::test_parameterized_masks  # Run only slow tests
 #   pytest test_mask_mod.py                            # Run all tests
 
+import functools
 import math
+import random
 from unittest import mock
 
-import pytest
-import torch
 import cutlass
 import cutlass.cute as cute
-from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+import pytest
+import torch
 import torch.nn.functional as F
-
-from flash_attn.cute.interface import _flash_attn_fwd, _flash_attn_bwd, flash_attn_func
+from flash_attn.cute import utils
 from flash_attn.cute.block_sparsity import (
     BlockSparseTensorsTorch,
-    fast_sampling,
-    normalize_block_sparse_config,
     compute_dq_write_order,
     compute_dq_write_order_from_block_mask,
+    fast_sampling,
+    normalize_block_sparse_config,
 )
 from flash_attn.cute.cache_utils import get_jit_cache
-from flash_attn.cute import utils
-from mask_mod_definitions import get_mask_pair, random_doc_id_tensor
+from flash_attn.cute.interface import _flash_attn_bwd, _flash_attn_fwd, flash_attn_func
+from flash_attn.cute.mask import AttentionMask
+from mask_mod_definitions import (
+    get_mask_pair,
+    random_doc_id_tensor,
+)
+from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+
 COMPUTE_CAPABILITY = torch.cuda.get_device_capability()[0]
 
 
@@ -46,6 +52,7 @@ def reset_torch_state():
 
     torch._dynamo.reset()
     torch.cuda.empty_cache()
+
 
 def create_tensors(
     batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, headdim, headdim_v, dtype
@@ -180,6 +187,77 @@ def assert_bwd_matches_reference(
     assert cute_dv_err <= bwd_rtol * pt_dv_err + dv_atol, f"dV error too large: {cute_dv_err:.2e}"
 
 
+def run_mask_mod_forward(
+    tensors,
+    mask_mod,
+    pack_gqa,
+    aux_tensors=None,
+    tile_m=128,
+    tile_n=128,
+):
+    softmax_scale = 1.0 / math.sqrt(tensors["q"].shape[-1])
+    out, lse, *_ = _flash_attn_fwd(
+        q=tensors["q"],
+        k=tensors["k"],
+        v=tensors["v"],
+        out=torch.empty_like(tensors["out"]),
+        lse=torch.empty_like(tensors["lse"]),
+        cu_seqlens_q=None,
+        cu_seqlens_k=None,
+        seqused_q=None,
+        seqused_k=None,
+        page_table=None,
+        softmax_scale=softmax_scale,
+        causal=False,
+        softcap=None,
+        window_size_left=None,
+        window_size_right=None,
+        learnable_sink=None,
+        tile_mn=(tile_m, tile_n),
+        pack_gqa=pack_gqa,
+        _arch=None,
+        score_mod=None,
+        mask_mod=mask_mod,
+        block_sparse_tensors=None,
+        return_lse=True,
+        aux_tensors=aux_tensors,
+    )
+    return out, lse
+
+
+def copy_mask_mod(mask_mod):
+    @functools.wraps(mask_mod)
+    def wrapped(*args, **kwargs):
+        return mask_mod(*args, **kwargs)
+
+    for attr in ("__vec_size__", "__cute_hash__"):
+        if hasattr(mask_mod, attr):
+            setattr(wrapped, attr, getattr(mask_mod, attr))
+    return wrapped
+
+
+def _make_mask_aux_tensors(mask_name, batch_size, num_heads, seqlen_q, seqlen_k):
+    if mask_name == "document":
+        random.seed(42)
+        doc_len = max(seqlen_q, seqlen_k)
+        return [
+            random_doc_id_tensor(num_heads, batch_size, doc_len, device="cuda").to(
+                dtype=torch.int32, device="cuda"
+            )
+        ]
+    if mask_name == "ima":
+        bias_threshold = (seqlen_k // 4) * 3
+        return [
+            torch.full(
+                (seqlen_k,),
+                bias_threshold,
+                dtype=torch.int32,
+                device="cuda",
+            )
+        ]
+    return None
+
+
 def get_coarse_block_mask_pair(sparse_tile_m: int, tile_n: int, last_block: int):
     @fast_sampling
     @cute.jit
@@ -237,6 +315,21 @@ SEQLEN_PAIRS_SMOKE = [
     (113, 203),
     (1024, 1024),
     (128, 8192)
+]
+
+VEC_SIZES_TO_CHECK_EQUALITY = [1, 2, 32, 128]
+VECTOR_MASK_NAMES = [
+    "block_diagonal",
+    "mini_causal",
+    "prefix_lm",
+    "dilated_sliding_window",
+    "causal",
+    "block_causal",
+    "sliding_window",
+]
+VECTOR_MASK_SEQLEN_PAIRS = [
+    (128, 128),
+    (113, 203),
 ]
 
 
@@ -542,6 +635,159 @@ def _run_mask_test(
             dtype,
             min(seqlen_q, seqlen_k),
         )
+
+
+@pytest.mark.skipif(COMPUTE_CAPABILITY not in [9, 10], reason="Vector mask equality targets SM90/SM100")
+@pytest.mark.parametrize("mask_name", VECTOR_MASK_NAMES)
+@pytest.mark.parametrize("seqlen_q,seqlen_k", VECTOR_MASK_SEQLEN_PAIRS)
+@pytest.mark.parametrize("qhead_per_kvhead,num_kv_heads", [(1, 2), (4, 2)])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_vec_mask_mod_equality(
+    mask_name,
+    seqlen_q,
+    seqlen_k,
+    qhead_per_kvhead,
+    num_kv_heads,
+    dtype,
+):
+    torch.manual_seed(42)
+    random.seed(42)
+
+    num_heads = num_kv_heads * qhead_per_kvhead
+    pack_gqa = qhead_per_kvhead > 1
+    tensors = create_tensors(
+        batch_size=2,
+        seqlen_q=seqlen_q,
+        seqlen_k=seqlen_k,
+        nheads=num_heads,
+        nheads_kv=num_kv_heads,
+        headdim=128,
+        headdim_v=128,
+        dtype=dtype,
+    )
+    aux_tensors = _make_mask_aux_tensors(mask_name, 2, num_heads, seqlen_q, seqlen_k)
+
+    mask_kwargs = {"window_size": 64} if mask_name == "sliding_window" else {}
+    mask_mod_scalar, _ = get_mask_pair(
+        mask_name, seqlen_q=seqlen_q, seqlen_k=seqlen_k, **mask_kwargs
+    )
+    mask_mod_vectorized = copy_mask_mod(mask_mod_scalar)
+
+    out_scalar, lse_scalar = run_mask_mod_forward(
+        tensors,
+        mask_mod_scalar,
+        pack_gqa=pack_gqa,
+        aux_tensors=aux_tensors,
+    )
+
+    vec_sizes = VEC_SIZES_TO_CHECK_EQUALITY if COMPUTE_CAPABILITY == 10 else [1, 2]
+    for vec_size in vec_sizes:
+        mask_mod_vectorized.__vec_size__ = vec_size
+        out_vectorized, lse_vectorized = run_mask_mod_forward(
+            tensors,
+            mask_mod_vectorized,
+            pack_gqa=pack_gqa,
+            aux_tensors=aux_tensors,
+        )
+        assert torch.equal(out_vectorized, out_scalar)
+        assert torch.equal(lse_vectorized, lse_scalar)
+
+
+@pytest.mark.skipif(COMPUTE_CAPABILITY != 10, reason="SM100-only test")
+@pytest.mark.parametrize("vec_size", [1, 2, 4, 8, 16, 32])
+def test_sm100_mask_mod_vec_size_is_forwarded(vec_size):
+    from flash_attn.cute import flash_fwd_sm100
+
+    torch.manual_seed(42)
+    random.seed(42)
+
+    observed = {"init": [], "apply": []}
+    original_init = flash_fwd_sm100.FlashAttentionForwardSm100.__init__
+    original_apply_mask_sm100 = AttentionMask.apply_mask_sm100
+
+    def wrapped_init(self, *args, **kwargs):
+        result = original_init(self, *args, **kwargs)
+        observed["init"].append(self.mask_mod_vec_size)
+        return result
+
+    def wrapped_apply_mask_sm100(self, *args, **kwargs):
+        mask_mod = kwargs.get("mask_mod")
+        vec_size = getattr(mask_mod, "__vec_size__", 1) if mask_mod is not None else 1
+        observed["apply"].append(vec_size)
+        return original_apply_mask_sm100(self, *args, **kwargs)
+
+    mask_mod_vectorized, _ = get_mask_pair("block_diagonal", seqlen_q=128, seqlen_k=128)
+    mask_mod_vectorized = copy_mask_mod(mask_mod_vectorized)
+    mask_mod_vectorized.__vec_size__ = vec_size
+    tensors = create_tensors(
+        batch_size=1,
+        seqlen_q=128,
+        seqlen_k=128,
+        nheads=2,
+        nheads_kv=2,
+        headdim=128,
+        headdim_v=128,
+        dtype=torch.bfloat16,
+    )
+
+    compile_cache = _flash_attn_fwd.compile_cache
+    _flash_attn_fwd.compile_cache = get_jit_cache("test_mask_mod.vec_size_forwarded")
+    try:
+        with mock.patch.object(
+            flash_fwd_sm100.FlashAttentionForwardSm100,
+            "__init__",
+            wrapped_init,
+        ), mock.patch.object(
+            AttentionMask,
+            "apply_mask_sm100",
+            wrapped_apply_mask_sm100,
+        ):
+            run_mask_mod_forward(
+                tensors,
+                mask_mod_vectorized,
+                pack_gqa=False,
+            )
+    finally:
+        _flash_attn_fwd.compile_cache.clear()
+        _flash_attn_fwd.compile_cache = compile_cache
+
+    assert observed["init"] == [vec_size]
+    assert observed["apply"]
+    assert all(mask_vec_size == vec_size for mask_vec_size in observed["apply"])
+
+
+@pytest.mark.skipif(COMPUTE_CAPABILITY != 10, reason="SM100-only test")
+def test_mask_mod_vec_size_creates_distinct_compile_entries():
+    torch.manual_seed(42)
+    random.seed(42)
+
+    mask_mod_vectorized, _ = get_mask_pair("block_diagonal", seqlen_q=128, seqlen_k=128)
+    mask_mod_vectorized = copy_mask_mod(mask_mod_vectorized)
+    tensors = create_tensors(
+        batch_size=1,
+        seqlen_q=128,
+        seqlen_k=128,
+        nheads=2,
+        nheads_kv=2,
+        headdim=128,
+        headdim_v=128,
+        dtype=torch.bfloat16,
+    )
+
+    compile_cache = _flash_attn_fwd.compile_cache
+    _flash_attn_fwd.compile_cache = get_jit_cache("test_mask_mod.vec_size_cache")
+    try:
+        for vec_size in (1, 32):
+            mask_mod_vectorized.__vec_size__ = vec_size
+            run_mask_mod_forward(
+                tensors,
+                mask_mod_vectorized,
+                pack_gqa=False,
+            )
+        assert len(_flash_attn_fwd.compile_cache.cache) == 2
+    finally:
+        _flash_attn_fwd.compile_cache.clear()
+        _flash_attn_fwd.compile_cache = compile_cache
 
 
 def test_mask_mod_ima_partial_block():
@@ -1199,6 +1445,62 @@ def run_flex_reference_bwd(q, k, v, block_mask, grad_out, dtype=None):
         dk_ref.transpose(1, 2),
         dv_ref.transpose(1, 2),
     )
+
+
+@pytest.mark.skipif(COMPUTE_CAPABILITY not in [9, 10], reason="Vector mask backward targets SM90/SM100")
+@pytest.mark.parametrize("vec_size", [1, 2] if COMPUTE_CAPABILITY == 9 else [1, 2, 32])
+def test_vec_mask_mod_backward_equality(vec_size):
+    torch.manual_seed(42)
+    random.seed(42)
+
+    qhead_per_kvhead = 1
+    num_kv_heads = 2
+    num_heads = num_kv_heads * qhead_per_kvhead
+    tensors = create_tensors(
+        batch_size=2,
+        seqlen_q=128,
+        seqlen_k=128,
+        nheads=num_heads,
+        nheads_kv=num_kv_heads,
+        headdim=128,
+        headdim_v=128,
+        dtype=torch.bfloat16,
+    )
+    grad_out = torch.randn_like(tensors["out"])
+    mask_mod_scalar, _ = get_mask_pair("block_diagonal", seqlen_q=128, seqlen_k=128)
+    mask_mod_vectorized = copy_mask_mod(mask_mod_scalar)
+    out_scalar, lse_scalar = run_mask_mod_forward(tensors, mask_mod_scalar, pack_gqa=False)
+    dq_scalar, dk_scalar, dv_scalar = run_cute_mask_bwd(
+        tensors["q"],
+        tensors["k"],
+        tensors["v"],
+        out_scalar,
+        lse_scalar,
+        grad_out,
+        mask_mod_scalar,
+    )
+
+    mask_mod_vectorized.__vec_size__ = vec_size
+    out_vectorized, lse_vectorized = run_mask_mod_forward(
+        tensors,
+        mask_mod_vectorized,
+        pack_gqa=False,
+    )
+    dq_vectorized, dk_vectorized, dv_vectorized = run_cute_mask_bwd(
+        tensors["q"],
+        tensors["k"],
+        tensors["v"],
+        out_vectorized,
+        lse_vectorized,
+        grad_out,
+        mask_mod_vectorized,
+    )
+
+    assert torch.equal(out_vectorized, out_scalar)
+    assert torch.equal(lse_vectorized, lse_scalar)
+    assert torch.equal(dq_vectorized, dq_scalar)
+    assert torch.equal(dk_vectorized, dk_scalar)
+    assert torch.equal(dv_vectorized, dv_scalar)
 
 
 def test_sm90_block_sparse_bwd_mismatched_q_block_granularity_error_message():

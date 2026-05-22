@@ -178,6 +178,21 @@ class TestHashCallable:
         hash2 = hash_callable(func2)
         assert hash1 != hash2
 
+    def test_vec_size_affects_hash(self):
+        """Changing __vec_size__ should produce a distinct hash."""
+
+        def my_func():
+            return 42
+
+        hash_default = hash_callable(my_func)
+        my_func.__vec_size__ = 1
+        hash_vec1 = hash_callable(my_func)
+        my_func.__vec_size__ = 32
+        hash_vec32 = hash_callable(my_func)
+
+        assert hash_default != hash_vec1
+        assert hash_vec1 != hash_vec32
+
 
 class TestHashCallableIntegration:
     """Integration tests for hash_callable with flash attention."""
@@ -210,4 +225,3 @@ class TestHashCallableIntegration:
         # getsource should never be called because __cute_hash__ is set
         assert call_count[0] == 0, f"getsource was called {call_count[0]} times"
         assert hash1 == hash2 == hash3 == "inductor-generated-hash"
-

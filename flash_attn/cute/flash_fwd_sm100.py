@@ -188,6 +188,7 @@ class FlashAttentionForwardSm100:
         self.vec_size: cutlass.Constexpr = getattr(
             score_mod, "__vec_size__", 1 if cutlass.const_expr(has_aux_tensors) else 2
         )
+        self.mask_mod_vec_size: cutlass.Constexpr = getattr(mask_mod, "__vec_size__", 1)
         # Does S1 need to wait for S0 to finish
         # self.s0_s1_barrier = self.head_dim_padded in [64, 96] and (not self.is_causal and not self.is_local)
         is_sm103 = self.arch >= Arch.sm_103 and self.arch <= Arch.sm_103f
@@ -1976,10 +1977,9 @@ class FlashAttentionForwardSm100:
                     else FastDivmodDivisor(seqlen.seqlen_k),
                 )
 
-            mask_mod = self.mask_mod if const_expr(self.mask_mod is not None) else None
             mask_fn = partial(
                 mask.apply_mask_sm100,
-                mask_mod=mask_mod,
+                mask_mod=self.mask_mod,
                 fastdiv_mods=fastdiv_mods,
                 head_divmod=head_divmod,
                 **shared_mask_kwargs,
