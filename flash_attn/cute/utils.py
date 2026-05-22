@@ -949,3 +949,20 @@ def scalar_to_ssa(a: cute.Numeric, dtype) -> cute.TensorSSA:
 def ssa_to_scalar(val):
     """Could inline but nice for reflecting the above api"""
     return val[0]
+
+
+@cute.jit
+def get_batch_from_cu_tensor(idx: Int32, cu_tensor: cute.Tensor) -> Int32:
+    """Binary search to determine batch from packed index in a cumulative tensor"""
+    batch_size = cute.size(cu_tensor) - 1
+    lo = Int32(0)
+    hi = batch_size
+
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if cu_tensor[mid + 1] <= idx:
+            lo = mid + 1
+        else:
+            hi = mid
+
+    return lo

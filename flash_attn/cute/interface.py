@@ -256,6 +256,11 @@ def num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, max_splits):
     # If num_n_blocks is too small, use 1 split. For example, we never split for hdim = 128 and seqlen_k = 512.
     if num_n_blocks <= 4:
         return 1
+    # Avoid ZeroDivisionError when batch_size or seqlen_q is 0. The empty-Q
+    # early-exit in _flash_attn_fwd handles correctness for those shapes; this
+    # guard just keeps the heuristic safe if called in other contexts.
+    if total_mblocks == 0:
+        return 1
 
     # NOTE: We should revisit this heuristic after persistence is supported for split KV.
     # Sometimes, it's ideal to over-schedule splits for better efficiency.
@@ -455,7 +460,7 @@ def _flash_attn_fwd(
     elif lse is not None:
         _validate_tensor(lse, "lse", lse_shape, torch.float32, device)
 
-    if seqlen_k == 0:
+    if seqlen_k == 0 or total_q == 0:
         out.zero_()
         if lse is not None:
             lse.fill_(float("-inf"))
@@ -604,10 +609,6 @@ def _flash_attn_fwd(
         head_dim_idx = 0 if block_sparse_tensors.mask_block_cnt.ndim == 2 else 1
         if pack_gqa and block_sparse_tensors.mask_block_cnt.shape[head_dim_idx] != 1:
             pack_gqa = False
-        if is_split_kv:
-            raise NotImplementedError(
-                "Block sparsity is not yet supported with SplitKV. TODO: partition sparse block lists per split."
-            )
         if cu_seqlens_q is not None:
             assert block_sparse_tensors.cu_total_m_blocks is not None, (
                 "Varlen block sparsity requires block_sparse_tensors.cu_total_m_blocks."
