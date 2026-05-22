@@ -144,7 +144,7 @@ def hash_callable(
 
     hasher = hashlib.sha256(base_hash.encode())
 
-    for attr, val in zip(_MIXER_ATTRS, mixer_values):
+    for attr, val in zip(mixer_attrs, mixer_values):
         hasher.update(f"{attr}={val!r}".encode())
 
     return hasher.hexdigest()

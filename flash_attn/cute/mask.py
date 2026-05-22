@@ -103,29 +103,50 @@ def row_to_r2p_idx(x: Int32, num_rep: int, num_wg: int) -> Int32:
 
 
 @cute.jit
+def apply_packed_mask_chunk(
+    X: cute.Tensor,
+    chunk_idx: cutlass.Constexpr[int],
+    mask: Uint32,
+) -> None:
+    """Apply one 32-bit keep mask to one 32-column chunk.
+
+    The one-iteration chunk loop keeps the same lowering pattern as mask_r2p_lambda.
+    """
+    ncol = const_expr(cute.size(X.shape))
+    col_base = chunk_idx * MASK_R2P_CHUNK_SIZE
+    for s in cutlass.range_constexpr(1):
+        for i in cutlass.range_constexpr(
+            min(MASK_R2P_CHUNK_SIZE, ncol - col_base - s * MASK_R2P_CHUNK_SIZE)
+        ):
+            in_bound = cutlass.Boolean(mask & (Uint32(1) << i))
+            c = col_base + s * MASK_R2P_CHUNK_SIZE + i
+            X[c] = X[c] if in_bound else -Float32.inf
+
+
+@cute.jit
 def mask_mod_r2p(
     X: cute.Tensor,
     mask: cute.Tensor,
 ) -> None:
     """
-    Applies masks resulting from mask_mod callables to compile 
-    down to the r2p instruction. 
+    Applies masks resulting from mask_mod callables to compile
+    down to the r2p instruction.
     Args:
-        X: cute.Tensor, tensor to be masked 
-        mask: cute.Tensor, vector of Uint32 dtypes wide enough to cover 
-            width of X. 
-    
-    The mask is treated as bit-packed where low bits correspond to low 
+        X: cute.Tensor, tensor to be masked
+        mask: cute.Tensor, vector of Uint32 dtypes wide enough to cover
+            width of X.
+
+    The mask is treated as bit-packed where low bits correspond to low
     kv indices (i.e. further left in the scores matrix).
     """
     ncol = const_expr(cute.size(X.shape))
     width = 32
 
     for s in cutlass.range_constexpr(cute.ceil_div(ncol, width)):
-        val = mask[s] 
+        val = mask[s]
         for i in cutlass.range_constexpr(min(width, ncol - s * width)):
             cond = cutlass.Boolean(val & (1 << i))
-            col = s * width + i 
+            col = s * width + i
             X[col] = X[col] if cond else -Float32.inf
 
 
@@ -457,7 +478,7 @@ class AttentionMask:
                     )
 
         elif const_expr(not mask_causal and not mask_local and mask_mod is not None):
-            # FlexAttention case w/ mask_mod, gated on `mask_mod.__vec_size__`:
+            # FlexAttention mask_mod vectorization is gated on `mask_mod.__vec_size__`.
             #   vec_size == 1:  scalar eval, returns Boolean.
             #   vec_size <= 32: returns shape-(1,) Uint32 fragment, bit i = lane i.
             #   vec_size  > 32: returns shape-(vec_size//32,) Uint32 fragment, bit i of
@@ -577,17 +598,19 @@ class AttentionMask:
                     # ---- handle bounds checking ----
                     bit_offset = const_expr((s % calls_per_apply) * vec_size)
                     seqlen_thresh_call = (
-                        self.seqlen_k - global_col
-                        if const_expr(mask_seqlen)
-                        else cutlass.Int32(0)
+                        self.seqlen_k - global_col if const_expr(mask_seqlen) else cutlass.Int32(0)
                     )
                     q_in_bounds = (
-                        mask_row < self.seqlen_q
-                        if check_q_boundary
-                        else cutlass.Boolean(True)
+                        mask_row < self.seqlen_q if check_q_boundary else cutlass.Boolean(True)
                     )
                     for c in cutlass.range_constexpr(mask_vals_per_apply):
                         mask_val = mask_value[c]
+                        if const_expr(vec_size < 32):
+                            lane_keep = utils.shr_u32(
+                                cutlass.Uint32(0xFFFFFFFF),
+                                cutlass.Uint32(32 - vec_size),
+                            )
+                            mask_val = mask_val & lane_keep
                         if const_expr(mask_seqlen):
                             local_thresh = seqlen_thresh_call - c * 32
                             m_shift = max(cutlass.Int32(32) - local_thresh, cutlass.Int32(0))
@@ -598,22 +621,17 @@ class AttentionMask:
                         if check_q_boundary:
                             mask_val = mask_val if q_in_bounds else cutlass.Uint32(0)
                         mask_vals[c] = mask_vals[c] | (mask_val << bit_offset)
-                    
+
                     # ---- vectorized application (compiles down to r2p) ----
                     is_last_in_apply = const_expr(s % calls_per_apply == calls_per_apply - 1)
                     is_last_overall = const_expr(s == n_calls - 1)
                     if const_expr(is_last_in_apply or is_last_overall):
                         apply_idx = s // calls_per_apply
                         for c in cutlass.range_constexpr(mask_vals_per_apply):
-                            col_base = (apply_idx * mask_vals_per_apply + c) * 32
-                            if const_expr(col_base >= ncol):
-                                break
-                            n_cols = const_expr(min(32, ncol - col_base))
-                            mask_val = mask_vals[c]
-                            for k in cutlass.range_constexpr(n_cols):
-                                col = col_base + k
-                                cond = cutlass.Boolean(mask_val & (cutlass.Uint32(1) << k))
-                                acc_S[col] = acc_S[col] if cond else -Float32.inf
+                            chunk_idx = apply_idx * mask_vals_per_apply + c
+                            # Skip packed chunks that start past the accumulator fragment.
+                            if const_expr(chunk_idx * 32 < ncol):
+                                apply_packed_mask_chunk(acc_S, chunk_idx, mask_vals[c])
 
         else:  # Causal or local
             causal_row_offset = self.seqlen_k - n_block * self.tile_n - self.seqlen_q

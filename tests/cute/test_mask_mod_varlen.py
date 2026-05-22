@@ -632,10 +632,9 @@ VEC_MASK_TEST_CASES = [
     ("packed_aux", None, True),
 ]
 
-# vec_size > 32 only supported by packed_aux (other vec mods return shape-(1,) Uint32).
-VEC_MASK_SIZES_TO_CHECK_EQUALITY = (
-    [2, 8, 32, 128] if COMPUTE_CAPABILITY == 10 else [2, 8, 32]
-)
+# Vectorized mask_mod application is currently implemented for SM100/SM110 forward.
+# vec_size > 32 is only supported by packed_aux (other vec mods return shape-(1,) Uint32).
+VEC_MASK_SIZES_TO_CHECK_EQUALITY = [2, 8, 32, 128]
 
 
 def _run_varlen_mask_only(
@@ -677,6 +676,8 @@ def _run_varlen_mask_only(
 @pytest.mark.parametrize("mask_case", VEC_MASK_TEST_CASES)
 def test_varlen_mask_mod_vectorized(seqlens_q, seqlens_k, dtype, kv_mode, mask_case):
     """Tests equality between scalar and vectorized mask mods on varlen inputs."""
+    if COMPUTE_CAPABILITY not in (10, 11):
+        pytest.skip("vectorized mask_mod application is SM100/SM110-only")
     mask_name, window_size, needs_aux = mask_case
 
     if mask_name == "block_causal":

@@ -53,6 +53,7 @@ def reset_torch_state():
     torch._dynamo.reset()
     torch.cuda.empty_cache()
 
+
 def create_tensors(
     batch_size, seqlen_q, seqlen_k, nheads, nheads_kv, headdim, headdim_v, dtype
 ):
@@ -850,10 +851,9 @@ VEC_MASK_TEST_CASES = [
     ("packed_aux", None, True),
 ]
 
-# vec_size > 32 only supported by packed_aux (other vec mods return shape-(1,) Uint32).
-VEC_MASK_SIZES_TO_CHECK_EQUALITY = (
-    [2, 8, 32, 128] if COMPUTE_CAPABILITY == 10 else [2, 8, 32]
-)
+# Vectorized mask_mod application is currently implemented for SM100/SM110 forward.
+# vec_size > 32 is only supported by packed_aux (other vec mods return shape-(1,) Uint32).
+VEC_MASK_SIZES_TO_CHECK_EQUALITY = [2, 8, 32, 128]
 
 
 def _run_mask_mod_only(q, k, v, mask_mod, aux_tensors, pack_gqa):
@@ -898,6 +898,8 @@ def test_cute_mask_mod_vectorized(
     seqlen_q, seqlen_k, qhead_per_kvhead, num_kv_heads, dtype, mask_case
 ):
     """Tests equality between scalar and vectorized versions of mask mods."""
+    if COMPUTE_CAPABILITY not in (10, 11):
+        pytest.skip("vectorized mask_mod application is SM100/SM110-only")
     mask_name, window_size, needs_aux = mask_case
     torch.manual_seed(42)
 

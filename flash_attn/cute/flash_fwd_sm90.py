@@ -557,7 +557,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 blocksparse_tensors.cu_total_m_blocks if blocksparse_tensors is not None else None
             ),
             mCuBlockIdxOffsets=(
-                blocksparse_tensors.cu_block_idx_offsets if blocksparse_tensors is not None else None
+                blocksparse_tensors.cu_block_idx_offsets
+                if blocksparse_tensors is not None
+                else None
             ),
             # Don't need to pass in tile_mn because we won't access offset_padded
         )
@@ -1507,7 +1509,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             batch_idx,
             head_idx,
             softmax_scale,
-            self.vec_size,
+            self.score_vec_size,
             self.qk_acc_dtype,
             aux_tensors,
             fastdiv_mods,

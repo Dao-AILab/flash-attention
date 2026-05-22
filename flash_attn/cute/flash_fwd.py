@@ -108,7 +108,7 @@ class FlashAttentionForwardBase:
                 "due to accumulator thread ownership pattern."
             )
         self.mask_vec_size: cutlass.Constexpr = getattr(mask_mod, "__vec_size__", 1)
-        if self.mask_vec_size > 2:
+        if self.mask_vec_size > 1:
             raise ValueError(
                 f"mask_mod vec_size {self.mask_vec_size} not supported on Sm80/90/120 "
                 "due to accumulator thread ownership pattern."
@@ -1012,7 +1012,6 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             mask_causal=self.is_causal,
             mask_local=self.is_local,
             aux_tensors=aux_tensors,
-            vec_size=self.mask_vec_size,
             fastdiv_mods=fastdiv_mods if const_expr(self.mask_mod is not None) else None,
         )
 
