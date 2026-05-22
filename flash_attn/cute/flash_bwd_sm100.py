@@ -1010,6 +1010,16 @@ class FlashAttentionBackwardSm100:
             min_blocks_per_mp=1,
         )
 
+    def _generate_attention_mask_cls(self, window_size_left, window_size_right):
+        return partial(
+            AttentionMask,
+            self.tile_m,
+            self.tile_n * self.cta_group_size,
+            swap_AB=True,
+            window_size_left=window_size_left,
+            window_size_right=window_size_right,
+        )
+
     @cute.kernel
     def kernel(
         self,
@@ -1413,13 +1423,8 @@ class FlashAttentionBackwardSm100:
         )
         TileSchedulerCls = partial(self.tile_scheduler_cls.create, tile_sched_params)
 
-        AttentionMaskCls = partial(
-            AttentionMask,
-            self.tile_m,
-            self.tile_n * self.cta_group_size,
-            swap_AB=True,
-            window_size_left=window_size_left,
-            window_size_right=window_size_right,
+        AttentionMaskCls = self._generate_attention_mask_cls(
+            window_size_left, window_size_right
         )
         #  EMPTY
         # (15)

@@ -772,6 +772,18 @@ class FlashAttentionForwardSm100:
             min_blocks_per_mp=1,
         )
 
+    def _generate_attention_mask_cls(self, window_size_left, window_size_right):
+        return partial(
+            AttentionMask,
+            self.m_block_size,
+            self.n_block_size,
+            window_size_left=window_size_left,
+            window_size_right=window_size_right,
+            qhead_per_kvhead_packgqa=(
+                self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1
+            ),
+        )
+
     #  GPU device kernel
     @cute.kernel
     def kernel(
@@ -1060,13 +1072,8 @@ class FlashAttentionForwardSm100:
                 blocksparse_tensors.cu_block_idx_offsets if blocksparse_tensors is not None else None
             ),
         )
-        AttentionMaskCls = partial(
-            AttentionMask,
-            self.m_block_size,
-            self.n_block_size,
-            window_size_left=window_size_left,
-            window_size_right=window_size_right,
-            qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+        AttentionMaskCls = self._generate_attention_mask_cls(
+            window_size_left, window_size_right
         )
         # Cluster wait before tensor memory alloc
         pipeline_init_wait(cluster_shape_mn=cta_layout_vmnk)
