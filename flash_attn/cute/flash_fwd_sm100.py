@@ -52,10 +52,7 @@ from flash_attn.cute.block_sparse_utils import (
 from flash_attn.cute.pack_gqa import PackGQA, pack_gqa_layout
 from flash_attn.cute import mma_sm100_desc as sm100_desc
 from flash_attn.cute import blackwell_helpers as sm100_utils
-from flash_attn.cute.blackwell_helpers import (
-    BlockScaledBasicChunk, make_smem_layout_sfa, make_smem_layout_sfb,
-    make_tmem_layout_sfa, make_tmem_layout_sfb,
-)
+import cutlass.utils.blockscaled_layout as blockscaled_utils
 from flash_attn.cute.named_barrier import NamedBarrierFwdSm100
 from cutlass.cute import FastDivmodDivisor
 from quack.cute_dsl_utils import ParamsBase
@@ -590,21 +587,21 @@ class FlashAttentionForwardSm100:
         )
         # Block-scaled SF SMEM layouts
         if const_expr(self.block_scaled_qk):
-            sSFQ_layout = make_smem_layout_sfa(
+            sSFQ_layout = sm100_utils.make_smem_layout_sfa(
                 tiled_mma_qk, self.mma_tiler_qk, self.sf_vec_size, self.q_stage,
                 mma_tile_inst_k=self.mma_inst_tile_k,
             )
-            sSFK_layout = make_smem_layout_sfb(
+            sSFK_layout = sm100_utils.make_smem_layout_sfb(
                 tiled_mma_qk, self.mma_tiler_qk, self.sf_vec_size, self.kv_stage,
                 mma_tile_inst_k=self.mma_inst_tile_k,
             )
             # Pre-compute TMEM layouts in __call__ (same JIT context as standalone)
             _sfq_smem_single = cute.slice_(sSFQ_layout, (None, None, None, 0))
             _sfk_smem_single = cute.slice_(sSFK_layout, (None, None, None, 0))
-            tCtSFQ_layout_precomp = make_tmem_layout_sfa(
+            tCtSFQ_layout_precomp = blockscaled_utils.make_tmem_layout_sfa(
                 tiled_mma_qk, self.mma_tiler_qk, self.sf_vec_size, _sfq_smem_single
             )
-            tCtSFK_layout_precomp = make_tmem_layout_sfb(
+            tCtSFK_layout_precomp = blockscaled_utils.make_tmem_layout_sfb(
                 tiled_mma_qk, self.mma_tiler_qk, self.sf_vec_size, _sfk_smem_single
             )
         else:
@@ -710,13 +707,13 @@ class FlashAttentionForwardSm100:
             # Reshape SF global tensors with BlockScaledBasicChunk layout
             mK_shape = mK.shape
             sfk_layout = cute.tile_to_shape(
-                BlockScaledBasicChunk(self.sf_vec_size).layout,
+                sm100_utils.BlockScaledBasicChunk(self.sf_vec_size).layout,
                 mK_shape, (2, 1, 3, 4)
             )
             mSFK = cute.make_tensor(mSFK.iterator, sfk_layout)
             mQ_shape = mQ.shape
             sfq_layout = cute.tile_to_shape(
-                BlockScaledBasicChunk(self.sf_vec_size).layout,
+                sm100_utils.BlockScaledBasicChunk(self.sf_vec_size).layout,
                 mQ_shape, (2, 1, 3, 4)
             )
             mSFQ = cute.make_tensor(mSFQ.iterator, sfq_layout)
@@ -1408,11 +1405,11 @@ class FlashAttentionForwardSm100:
             s2t_sfk_staged = None
             if const_expr(self.block_scaled_qk and sSFQ is not None):
                 align = self.buffer_align_bytes
-                _local_sfq_layout = make_smem_layout_sfa(
+                _local_sfq_layout = sm100_utils.make_smem_layout_sfa(
                     tiled_mma_qk, self.mma_tiler_qk, self.sf_vec_size, self.q_stage,
                     mma_tile_inst_k=self.mma_inst_tile_k,
                 )
-                _local_sfk_layout = make_smem_layout_sfb(
+                _local_sfk_layout = sm100_utils.make_smem_layout_sfb(
                     tiled_mma_qk, self.mma_tiler_qk, self.sf_vec_size, self.kv_stage,
                     mma_tile_inst_k=self.mma_inst_tile_k,
                 )
@@ -1433,7 +1430,7 @@ class FlashAttentionForwardSm100:
                     cute.recast_ptr(sfq_tmem_ptrs_f32[stage], dtype=self.sf_dtype)
                     for stage in range(self.q_stage)
                 ]
-                tCtSFQ_layout = make_tmem_layout_sfa(
+                tCtSFQ_layout = blockscaled_utils.make_tmem_layout_sfa(
                     tiled_mma_qk,
                     self.mma_tiler_qk,
                     self.sf_vec_size,
@@ -1448,7 +1445,7 @@ class FlashAttentionForwardSm100:
                     cute.recast_ptr(sfq_tmem_ptrs_f32[stage] + sfq_tmem_cols, dtype=self.sf_dtype)
                     for stage in range(self.q_stage)
                 ]
-                tCtSFK_layout = make_tmem_layout_sfb(
+                tCtSFK_layout = blockscaled_utils.make_tmem_layout_sfb(
                     tiled_mma_qk,
                     self.mma_tiler_qk,
                     self.sf_vec_size,

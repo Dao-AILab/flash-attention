@@ -9,8 +9,6 @@ from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode
 from cutlass._mlir.dialects import llvm
-import cutlass._mlir.dialects.cute as _cute_ir
-import cutlass._mlir.dialects.cute_nvgpu as _cute_nvgpu_ir
 
 import flash_attn.cute.mma_sm100_desc as sm100_desc
 
@@ -1600,27 +1598,3 @@ def make_smem_layout_sfb(tiled_mma, mma_tiler_mnk, sf_vec_size, num_stages,
         smem_layout,
         cute.make_layout(num_stages, stride=cute.cosize(cute.filter_zeros(smem_layout))),
     )
-
-
-@dsl_user_op
-def make_tmem_layout_sfa(tiled_mma, mma_tiler_mnk, sf_vec_size, smem_layout,
-                         *, loc=None, ip=None):
-    """Build TMEM layout for SFA from its per-stage SMEM layout."""
-    atom_thr_size = cute.size(tiled_mma.thr_id.shape, loc=loc, ip=ip)
-    cta_tile_shape_m = mma_tiler_mnk[0] // atom_thr_size
-    sfa_layout_ty = _cute_nvgpu_ir.make_tmem_layout_sfa(
-        smem_layout, cta_tile_shape_m, atom_thr_size, sf_vec_size
-    )
-    return _cute_ir.static(sfa_layout_ty, loc=loc, ip=ip)
-
-
-@dsl_user_op
-def make_tmem_layout_sfb(tiled_mma, mma_tiler_mnk, sf_vec_size, smem_layout,
-                         *, loc=None, ip=None):
-    """Build TMEM layout for SFB from its per-stage SMEM layout."""
-    atom_thr_size = cute.size(tiled_mma.thr_id.shape, loc=loc, ip=ip)
-    cta_tile_shape_m = mma_tiler_mnk[0] // atom_thr_size
-    sfb_layout_ty = _cute_nvgpu_ir.make_tmem_layout_sfb(
-        smem_layout, cta_tile_shape_m, atom_thr_size, sf_vec_size
-    )
-    return _cute_ir.static(sfb_layout_ty, loc=loc, ip=ip)
