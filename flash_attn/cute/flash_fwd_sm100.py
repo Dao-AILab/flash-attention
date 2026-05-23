@@ -52,8 +52,10 @@ from flash_attn.cute.block_sparse_utils import (
 from flash_attn.cute.pack_gqa import PackGQA, pack_gqa_layout
 from flash_attn.cute import mma_sm100_desc as sm100_desc
 from flash_attn.cute import blackwell_helpers as sm100_utils
-import cutlass.utils.blockscaled_layout as blockscaled_utils
-from flash_attn.cute.blackwell_helpers import make_smem_layout_sfa, make_smem_layout_sfb
+from flash_attn.cute.blackwell_helpers import (
+    BlockScaledBasicChunk, make_smem_layout_sfa, make_smem_layout_sfb,
+    make_tmem_layout_sfa, make_tmem_layout_sfb,
+)
 from flash_attn.cute.named_barrier import NamedBarrierFwdSm100
 from cutlass.cute import FastDivmodDivisor
 from quack.cute_dsl_utils import ParamsBase
@@ -339,12 +341,12 @@ class FlashAttentionForwardSm100:
         self.sf_vec_size = sf_vec_size
         self.sf_dtype = sf_dtype
         if self.block_scaled_qk:
-            assert not self.use_2cta_instrs, "Block-scaled QK is 1-CTA only"
+            assert not self.use_2cta_instrs, "Block-scaled QK currently supports 1-CTA only"
             self.mma_inst_bits_k = 256
             if self.sf_vec_size == 16:
-                self.mma_inst_tile_k = self.head_dim_padded // (self.mma_inst_bits_k // 8 * 2)
+                self.mma_inst_tile_k = self.head_dim_padded // (self.mma_inst_bits_k // 4) # nvfp4
             else:
-                self.mma_inst_tile_k = self.head_dim_padded // (self.mma_inst_bits_k // 8)
+                self.mma_inst_tile_k = self.head_dim_padded // (self.mma_inst_bits_k // 8) # mxfp8
             _bs_tune_key = (self.is_causal, self.head_dim_padded, self.sf_vec_size)
             _bs_tune = _BLOCK_SCALED_TUNING_CONFIG.get(_bs_tune_key, {})
             if _bs_tune:
@@ -588,20 +590,21 @@ class FlashAttentionForwardSm100:
         )
         # Block-scaled SF SMEM layouts
         if const_expr(self.block_scaled_qk):
-            _sf_kwargs = {"mma_tile_inst_k": self.mma_inst_tile_k}
             sSFQ_layout = make_smem_layout_sfa(
-                tiled_mma_qk, self.mma_tiler_qk, self.sf_vec_size, self.q_stage, **_sf_kwargs
+                tiled_mma_qk, self.mma_tiler_qk, self.sf_vec_size, self.q_stage,
+                mma_tile_inst_k=self.mma_inst_tile_k,
             )
             sSFK_layout = make_smem_layout_sfb(
-                tiled_mma_qk, self.mma_tiler_qk, self.sf_vec_size, self.kv_stage, **_sf_kwargs
+                tiled_mma_qk, self.mma_tiler_qk, self.sf_vec_size, self.kv_stage,
+                mma_tile_inst_k=self.mma_inst_tile_k,
             )
             # Pre-compute TMEM layouts in __call__ (same JIT context as standalone)
             _sfq_smem_single = cute.slice_(sSFQ_layout, (None, None, None, 0))
             _sfk_smem_single = cute.slice_(sSFK_layout, (None, None, None, 0))
-            tCtSFQ_layout_precomp = blockscaled_utils.make_tmem_layout_sfa(
+            tCtSFQ_layout_precomp = make_tmem_layout_sfa(
                 tiled_mma_qk, self.mma_tiler_qk, self.sf_vec_size, _sfq_smem_single
             )
-            tCtSFK_layout_precomp = blockscaled_utils.make_tmem_layout_sfb(
+            tCtSFK_layout_precomp = make_tmem_layout_sfb(
                 tiled_mma_qk, self.mma_tiler_qk, self.sf_vec_size, _sfk_smem_single
             )
         else:
@@ -707,13 +710,13 @@ class FlashAttentionForwardSm100:
             # Reshape SF global tensors with BlockScaledBasicChunk layout
             mK_shape = mK.shape
             sfk_layout = cute.tile_to_shape(
-                blockscaled_utils.BlockScaledBasicChunk(self.sf_vec_size).layout,
+                BlockScaledBasicChunk(self.sf_vec_size).layout,
                 mK_shape, (2, 1, 3, 4)
             )
             mSFK = cute.make_tensor(mSFK.iterator, sfk_layout)
             mQ_shape = mQ.shape
             sfq_layout = cute.tile_to_shape(
-                blockscaled_utils.BlockScaledBasicChunk(self.sf_vec_size).layout,
+                BlockScaledBasicChunk(self.sf_vec_size).layout,
                 mQ_shape, (2, 1, 3, 4)
             )
             mSFQ = cute.make_tensor(mSFQ.iterator, sfq_layout)
@@ -1405,14 +1408,13 @@ class FlashAttentionForwardSm100:
             s2t_sfk_staged = None
             if const_expr(self.block_scaled_qk and sSFQ is not None):
                 align = self.buffer_align_bytes
-                # Compute SF SMEM layout LOCALLY (not from passed parameter)
-                # This avoids MLIR type info loss across kernel function boundary
-                _sf_kwargs = {"mma_tile_inst_k": self.mma_inst_tile_k}
                 _local_sfq_layout = make_smem_layout_sfa(
-                    tiled_mma_qk, self.mma_tiler_qk, self.sf_vec_size, self.q_stage, **_sf_kwargs
+                    tiled_mma_qk, self.mma_tiler_qk, self.sf_vec_size, self.q_stage,
+                    mma_tile_inst_k=self.mma_inst_tile_k,
                 )
                 _local_sfk_layout = make_smem_layout_sfb(
-                    tiled_mma_qk, self.mma_tiler_qk, self.sf_vec_size, self.kv_stage, **_sf_kwargs
+                    tiled_mma_qk, self.mma_tiler_qk, self.sf_vec_size, self.kv_stage,
+                    mma_tile_inst_k=self.mma_inst_tile_k,
                 )
                 # SFQ TMEM: stagger with S offsets
                 sfq_stage_order = tuple(
@@ -1431,7 +1433,7 @@ class FlashAttentionForwardSm100:
                     cute.recast_ptr(sfq_tmem_ptrs_f32[stage], dtype=self.sf_dtype)
                     for stage in range(self.q_stage)
                 ]
-                tCtSFQ_layout = blockscaled_utils.make_tmem_layout_sfa(
+                tCtSFQ_layout = make_tmem_layout_sfa(
                     tiled_mma_qk,
                     self.mma_tiler_qk,
                     self.sf_vec_size,
@@ -1446,7 +1448,7 @@ class FlashAttentionForwardSm100:
                     cute.recast_ptr(sfq_tmem_ptrs_f32[stage] + sfq_tmem_cols, dtype=self.sf_dtype)
                     for stage in range(self.q_stage)
                 ]
-                tCtSFK_layout = blockscaled_utils.make_tmem_layout_sfb(
+                tCtSFK_layout = make_tmem_layout_sfb(
                     tiled_mma_qk,
                     self.mma_tiler_qk,
                     self.sf_vec_size,
