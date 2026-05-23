@@ -727,7 +727,8 @@ def main(ab_dtype, sf_dtype, sf_vec_size, pv_mode="bf16", pv_fp8_dtype=cutlass.F
                 traceback.print_exc()
 
         if (i + 1) % 3 == 0:
-            time.sleep(1)
+            torch.cuda.synchronize()
+            time.sleep(2)
 
 if __name__ == "__main__":
     import argparse

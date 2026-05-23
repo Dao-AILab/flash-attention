@@ -4,8 +4,13 @@ from typing import Optional, Tuple
 import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Float32, Boolean, const_expr, Float8E4M3FN, Float8E5M2, Float4E2M1FN
+from dataclasses import dataclass, field
+from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.cute.nvgpu import tcgen05
+from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode
 from cutlass._mlir.dialects import llvm
+import cutlass._mlir.dialects.cute as _cute_ir
+import cutlass._mlir.dialects.cute_nvgpu as _cute_nvgpu_ir
 
 import flash_attn.cute.mma_sm100_desc as sm100_desc
 
@@ -1513,3 +1518,109 @@ def tcgen05_after_thread_sync():
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
     )
+
+
+# ---------------------------------------------------------------------------
+# Block-scaled SF (scale factor) SMEM/TMEM layout utilities
+#
+# These build the SMEM and TMEM layouts for block-scaled MMA scale factors
+# (SFA / SFB).  The layouts follow the tcgen05 BlockScaledBasicChunk atom
+# defined by the PTX ISA and are tiled to the CTA tile shape.
+#
+# The upstream cutlass.utils.blockscaled_layout helpers hard-code
+# mma_tile_inst_k=4.  This value depends on the number of K-tiles
+# per head: each MMA tile covers 256 bits in K, so NVFP4 (4-bit)
+# spans 64 elements → hdim 128 needs only 2 tiles (mma_tile_inst_k=2),
+# while MXFP8 (8-bit) spans 32 elements → hdim 128 needs 4 tiles.
+# These wrappers accept mma_tile_inst_k as a parameter.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class BlockScaledBasicChunk:
+    """Fixed scale-factor atom layout for tcgen05 block-scaled MMA ops.
+
+    See PTX docs: tcgen05-mma-scale-factor-a-layout-1x.
+    """
+    sf_vec_size: int
+    major_mode: OperandMajorMode = OperandMajorMode.K
+    _layout: cute.Layout = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        if self.major_mode == OperandMajorMode.K:
+            atom_shape = ((32, 4), (self.sf_vec_size, 4))
+            atom_stride = ((16, 4), (0, 1))
+        else:
+            atom_shape = ((self.sf_vec_size, 4), (32, 4))
+            atom_stride = ((0, 1), (16, 4))
+        object.__setattr__(
+            self, "_layout", cute.make_layout(atom_shape, stride=atom_stride)
+        )
+
+    @property
+    def layout(self) -> cute.Layout:
+        return self._layout
+
+
+@dsl_user_op
+def make_smem_layout_sfa(tiled_mma, mma_tiler_mnk, sf_vec_size, num_stages,
+                         *, loc=None, ip=None, mma_tile_inst_k=4):
+    """Build staged SMEM layout for SFA (Q-side scale factors)."""
+    sfa_tile_shape = (
+        mma_tiler_mnk[0] // cute.size(tiled_mma.thr_id.shape),
+        mma_tiler_mnk[2],
+    )
+    smem_layout = cute.tile_to_shape(
+        BlockScaledBasicChunk(sf_vec_size).layout, sfa_tile_shape, (2, 1),
+    )
+    sfa_tile_shape = cute.shape_div(sfa_tile_shape, (1, mma_tile_inst_k))
+    smem_layout = cute.tiled_divide(smem_layout, sfa_tile_shape)
+    smem_layout = cute.logical_divide(smem_layout, ((128, sf_vec_size),))
+    return cute.append(
+        smem_layout,
+        cute.make_layout(num_stages, stride=cute.cosize(cute.filter_zeros(smem_layout))),
+    )
+
+
+@dsl_user_op
+def make_smem_layout_sfb(tiled_mma, mma_tiler_mnk, sf_vec_size, num_stages,
+                         *, loc=None, ip=None, mma_tile_inst_k=4, atom_n=128):
+    """Build staged SMEM layout for SFB (K-side scale factors)."""
+    sfb_tile_shape = (
+        cute.round_up(mma_tiler_mnk[1], 128),
+        mma_tiler_mnk[2],
+    )
+    smem_layout = cute.tile_to_shape(
+        BlockScaledBasicChunk(sf_vec_size).layout, sfb_tile_shape, (2, 1),
+    )
+    sfb_tile_shape = cute.shape_div(sfb_tile_shape, (1, mma_tile_inst_k))
+    smem_layout = cute.tiled_divide(smem_layout, sfb_tile_shape)
+    smem_layout = cute.logical_divide(smem_layout, ((128, sf_vec_size),))
+    return cute.append(
+        smem_layout,
+        cute.make_layout(num_stages, stride=cute.cosize(cute.filter_zeros(smem_layout))),
+    )
+
+
+@dsl_user_op
+def make_tmem_layout_sfa(tiled_mma, mma_tiler_mnk, sf_vec_size, smem_layout,
+                         *, loc=None, ip=None):
+    """Build TMEM layout for SFA from its per-stage SMEM layout."""
+    atom_thr_size = cute.size(tiled_mma.thr_id.shape, loc=loc, ip=ip)
+    cta_tile_shape_m = mma_tiler_mnk[0] // atom_thr_size
+    sfa_layout_ty = _cute_nvgpu_ir.make_tmem_layout_sfa(
+        smem_layout, cta_tile_shape_m, atom_thr_size, sf_vec_size
+    )
+    return _cute_ir.static(sfa_layout_ty, loc=loc, ip=ip)
+
+
+@dsl_user_op
+def make_tmem_layout_sfb(tiled_mma, mma_tiler_mnk, sf_vec_size, smem_layout,
+                         *, loc=None, ip=None):
+    """Build TMEM layout for SFB from its per-stage SMEM layout."""
+    atom_thr_size = cute.size(tiled_mma.thr_id.shape, loc=loc, ip=ip)
+    cta_tile_shape_m = mma_tiler_mnk[0] // atom_thr_size
+    sfb_layout_ty = _cute_nvgpu_ir.make_tmem_layout_sfb(
+        smem_layout, cta_tile_shape_m, atom_thr_size, sf_vec_size
+    )
+    return _cute_ir.static(sfb_layout_ty, loc=loc, ip=ip)
