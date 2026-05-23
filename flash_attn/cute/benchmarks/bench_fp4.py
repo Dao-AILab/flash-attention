@@ -4,9 +4,8 @@ This benchmark tests FP4 attention kernels and compares them against
 the standard Python interface implementation.
 """
 
-import math
 import time
-from typing import NamedTuple, Optional, Tuple
+from typing import NamedTuple
 
 import torch
 import cutlass
@@ -15,9 +14,7 @@ import cutlass.torch as cutlass_torch
 from cutlass.cute.runtime import from_dlpack
 
 from flash_attn.cute.interface import flash_attn_func as flash_attn_func_python
-from flash_attn.cute.interface import flash_attn_varlen_func as flash_attn_varlen_func_python
 
-import numpy as np
 from triton.testing import do_bench
 
 
@@ -678,7 +675,7 @@ def main(ab_dtype, sf_dtype, sf_vec_size, pv_mode="bf16", pv_fp8_dtype=cutlass.F
             )
             force_fp4_t = force_fp4_out[0] if isinstance(force_fp4_out, tuple) else force_fp4_out
             ref_t = ref_out[0] if isinstance(ref_out, tuple) else ref_out
-            print(f"  force_fp4_impl bf16 test:")
+            print("  force_fp4_impl bf16 test:")
             print(f"    force_fp4[0,0,0,:4]: {force_fp4_t[0,0,0,:4]}")
             print(f"    ref[0,0,0,:4]:       {ref_t[0,0,0,:4]}")
             m_block_size_test = 128

@@ -3,7 +3,7 @@ from typing import Optional, Tuple
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, Float32, Boolean, const_expr, Float8E4M3FN, Float8E5M2, Float4E2M1FN
+from cutlass import Int32, Float32, Boolean, const_expr
 from dataclasses import dataclass, field
 from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.cute.nvgpu import tcgen05
@@ -1270,8 +1270,8 @@ def gemm_ptx_partial_fp4(
         ] + scale_A_addrs + scale_B_addrs
 
         k0_desc_setup = (
-            f"mov.b64 smem_desc_a, {{smem_desc_a_lo_start, smem_desc_a_hi}};\n\t"
-            f"mov.b64 smem_desc_b, {{smem_desc_b_lo_start, smem_desc_b_hi}};\n\t"
+            "mov.b64 smem_desc_a, {smem_desc_a_lo_start, smem_desc_a_hi};\n\t"
+            "mov.b64 smem_desc_b, {smem_desc_b_lo_start, smem_desc_b_hi};\n\t"
         )
         def _kk_desc_setup(kk):
             return (
