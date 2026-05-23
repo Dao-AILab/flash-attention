@@ -1262,17 +1262,22 @@ def gemm_ptx_partial_fp4(
         mma_inst_str = const_expr(_mma_inst_kind(op))
         sfa_op_base = 4
         sfb_op_base = 4 + num_k
-        input_args = [
-            Int32(cute.arch.make_warp_uniform(smem_desc_start_a_lo)).ir_value(),
-            Int32(cute.arch.make_warp_uniform(smem_desc_start_b_lo)).ir_value(),
-            Int32(not zero_init).ir_value(),
-            Int32(cute.arch.make_warp_uniform(acc_tmem_addr)).ir_value(),
-        ] + scale_A_addrs + scale_B_addrs
+        input_args = (
+            [
+                Int32(cute.arch.make_warp_uniform(smem_desc_start_a_lo)).ir_value(),
+                Int32(cute.arch.make_warp_uniform(smem_desc_start_b_lo)).ir_value(),
+                Int32(not zero_init).ir_value(),
+                Int32(cute.arch.make_warp_uniform(acc_tmem_addr)).ir_value(),
+            ]
+            + scale_A_addrs
+            + scale_B_addrs
+        )
 
         k0_desc_setup = (
             "mov.b64 smem_desc_a, {smem_desc_a_lo_start, smem_desc_a_hi};\n\t"
             "mov.b64 smem_desc_b, {smem_desc_b_lo_start, smem_desc_b_hi};\n\t"
         )
+
         def _kk_desc_setup(kk):
             return (
                 f"add.u32 smem_desc_a_lo, smem_desc_a_lo_start, {hex(offset_a[kk])};\n\t"
@@ -1280,6 +1285,7 @@ def gemm_ptx_partial_fp4(
                 f"mov.b64 smem_desc_a, {{smem_desc_a_lo, smem_desc_a_hi}};\n\t"
                 f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
             )
+
         def _mma_k_block(kk):
             pred = pred_str if kk == 0 else "1"
             desc_setup = k0_desc_setup if kk == 0 else _kk_desc_setup(kk)
@@ -1319,9 +1325,7 @@ def gemm_ptx_partial_fp4(
             "mov.b32 smem_desc_b_lo_start, $1;\n\t"
             f"mov.b32 smem_desc_a_hi, {hex(smem_desc_a_hi)};\n\t"
             f"mov.b32 smem_desc_b_hi, {hex(smem_desc_b_hi)};\n\t"
-            "setp.ne.b32 p, $2, 0;\n\t"
-            + "".join(_mma_k_block(k) for k in range(num_k))
-            + "}\n",
+            "setp.ne.b32 p, $2, 0;\n\t" + "".join(_mma_k_block(k) for k in range(num_k)) + "}\n",
             ",".join(["r"] * len(input_args)),
             has_side_effects=True,
             is_align_stack=False,
@@ -1398,7 +1402,11 @@ def gemm_ptx_partial_fp4(
                     1,
                     cute.size(tCrA.shape[2])
                     if const_expr(mbar_ptr is None)
-                    else (pre_mbar_tiles if const_expr(pre_mbar_tiles is not None) else cute.size(tCrA.shape[2]) // 4 * 3),
+                    else (
+                        pre_mbar_tiles
+                        if const_expr(pre_mbar_tiles is not None)
+                        else cute.size(tCrA.shape[2]) // 4 * 3
+                    ),
                 )
             )
             + mbar_wait_str
@@ -1409,7 +1417,15 @@ def gemm_ptx_partial_fp4(
                         f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
                         f"@leader_thread {mma_inst_str} [tmem_acc], [tmem_a + {hex(offset_a[k])}], smem_desc_b, idesc, [tmem_scale_a + {hex(offset_sfa[k])}], [tmem_scale_b + {hex(offset_sfb[k])}], 1;\n\t"
                     )
-                    for k in range(max(1, pre_mbar_tiles if const_expr(pre_mbar_tiles is not None) else cute.size(tCrA.shape[2]) // 4 * 3), cute.size(tCrA.shape[2]))
+                    for k in range(
+                        max(
+                            1,
+                            pre_mbar_tiles
+                            if const_expr(pre_mbar_tiles is not None)
+                            else cute.size(tCrA.shape[2]) // 4 * 3,
+                        ),
+                        cute.size(tCrA.shape[2]),
+                    )
                 )
                 if const_expr(mbar_ptr is not None)
                 else ""
@@ -1457,12 +1473,18 @@ def gemm_ptx_partial_fp8(
 
 # FP4 Quantization helper functions
 @cute.jit
-def packed_float_to_ue4m3(f0: Float32, f1: Float32, f2: Float32, f3: Float32, *, loc=None, ip=None) -> Int32:
+def packed_float_to_ue4m3(
+    f0: Float32, f1: Float32, f2: Float32, f3: Float32, *, loc=None, ip=None
+) -> Int32:
     """Convert 4 FP32 values to UE4M3 format packed in uint32_t"""
     out_uint32 = llvm.inline_asm(
         T.i32(),
-        [Float32(f0).ir_value(loc=loc, ip=ip), Float32(f1).ir_value(loc=loc, ip=ip),
-         Float32(f2).ir_value(loc=loc, ip=ip), Float32(f3).ir_value(loc=loc, ip=ip)],
+        [
+            Float32(f0).ir_value(loc=loc, ip=ip),
+            Float32(f1).ir_value(loc=loc, ip=ip),
+            Float32(f2).ir_value(loc=loc, ip=ip),
+            Float32(f3).ir_value(loc=loc, ip=ip),
+        ],
         "{\n\t"
         ".reg .b16 lo;\n\t"
         ".reg .b16 hi;\n\t"
@@ -1477,17 +1499,34 @@ def packed_float_to_ue4m3(f0: Float32, f1: Float32, f2: Float32, f3: Float32, *,
     )
     return Int32(out_uint32)
 
+
 @cute.jit
-def packed_float_to_e2m1(f0: Float32, f1: Float32, f2: Float32, f3: Float32,
-                         f4: Float32, f5: Float32, f6: Float32, f7: Float32,
-                         *, loc=None, ip=None) -> Int32:
+def packed_float_to_e2m1(
+    f0: Float32,
+    f1: Float32,
+    f2: Float32,
+    f3: Float32,
+    f4: Float32,
+    f5: Float32,
+    f6: Float32,
+    f7: Float32,
+    *,
+    loc=None,
+    ip=None,
+) -> Int32:
     """Convert 8 FP32 values to E2M1 format packed in uint32_t"""
     out_uint32 = llvm.inline_asm(
         T.i32(),
-        [Float32(f0).ir_value(loc=loc, ip=ip), Float32(f1).ir_value(loc=loc, ip=ip),
-         Float32(f2).ir_value(loc=loc, ip=ip), Float32(f3).ir_value(loc=loc, ip=ip),
-         Float32(f4).ir_value(loc=loc, ip=ip), Float32(f5).ir_value(loc=loc, ip=ip),
-         Float32(f6).ir_value(loc=loc, ip=ip), Float32(f7).ir_value(loc=loc, ip=ip)],
+        [
+            Float32(f0).ir_value(loc=loc, ip=ip),
+            Float32(f1).ir_value(loc=loc, ip=ip),
+            Float32(f2).ir_value(loc=loc, ip=ip),
+            Float32(f3).ir_value(loc=loc, ip=ip),
+            Float32(f4).ir_value(loc=loc, ip=ip),
+            Float32(f5).ir_value(loc=loc, ip=ip),
+            Float32(f6).ir_value(loc=loc, ip=ip),
+            Float32(f7).ir_value(loc=loc, ip=ip),
+        ],
         "{\n\t"
         ".reg .b8 byte0;\n\t"
         ".reg .b8 byte1;\n\t"
@@ -1505,6 +1544,7 @@ def packed_float_to_e2m1(f0: Float32, f1: Float32, f2: Float32, f3: Float32,
         asm_dialect=llvm.AsmDialect.AD_ATT,
     )
     return Int32(out_uint32)
+
 
 def tcgen05_after_thread_sync():
     llvm.inline_asm(
@@ -1540,6 +1580,7 @@ class BlockScaledBasicChunk:
 
     See PTX docs: tcgen05-mma-scale-factor-a-layout-1x.
     """
+
     sf_vec_size: int
     major_mode: OperandMajorMode = OperandMajorMode.K
     _layout: cute.Layout = field(init=False, repr=False)
@@ -1551,9 +1592,7 @@ class BlockScaledBasicChunk:
         else:
             atom_shape = ((self.sf_vec_size, 4), (32, 4))
             atom_stride = ((0, 1), (16, 4))
-        object.__setattr__(
-            self, "_layout", cute.make_layout(atom_shape, stride=atom_stride)
-        )
+        object.__setattr__(self, "_layout", cute.make_layout(atom_shape, stride=atom_stride))
 
     @property
     def layout(self) -> cute.Layout:
@@ -1561,15 +1600,18 @@ class BlockScaledBasicChunk:
 
 
 @dsl_user_op
-def make_smem_layout_sfa(tiled_mma, mma_tiler_mnk, sf_vec_size, num_stages,
-                         *, loc=None, ip=None, mma_tile_inst_k=4):
+def make_smem_layout_sfa(
+    tiled_mma, mma_tiler_mnk, sf_vec_size, num_stages, *, loc=None, ip=None, mma_tile_inst_k=4
+):
     """Build staged SMEM layout for SFA (Q-side scale factors)."""
     sfa_tile_shape = (
         mma_tiler_mnk[0] // cute.size(tiled_mma.thr_id.shape),
         mma_tiler_mnk[2],
     )
     smem_layout = cute.tile_to_shape(
-        BlockScaledBasicChunk(sf_vec_size).layout, sfa_tile_shape, (2, 1),
+        BlockScaledBasicChunk(sf_vec_size).layout,
+        sfa_tile_shape,
+        (2, 1),
     )
     sfa_tile_shape = cute.shape_div(sfa_tile_shape, (1, mma_tile_inst_k))
     smem_layout = cute.tiled_divide(smem_layout, sfa_tile_shape)
@@ -1581,15 +1623,26 @@ def make_smem_layout_sfa(tiled_mma, mma_tiler_mnk, sf_vec_size, num_stages,
 
 
 @dsl_user_op
-def make_smem_layout_sfb(tiled_mma, mma_tiler_mnk, sf_vec_size, num_stages,
-                         *, loc=None, ip=None, mma_tile_inst_k=4, atom_n=128):
+def make_smem_layout_sfb(
+    tiled_mma,
+    mma_tiler_mnk,
+    sf_vec_size,
+    num_stages,
+    *,
+    loc=None,
+    ip=None,
+    mma_tile_inst_k=4,
+    atom_n=128,
+):
     """Build staged SMEM layout for SFB (K-side scale factors)."""
     sfb_tile_shape = (
         cute.round_up(mma_tiler_mnk[1], 128),
         mma_tiler_mnk[2],
     )
     smem_layout = cute.tile_to_shape(
-        BlockScaledBasicChunk(sf_vec_size).layout, sfb_tile_shape, (2, 1),
+        BlockScaledBasicChunk(sf_vec_size).layout,
+        sfb_tile_shape,
+        (2, 1),
     )
     sfb_tile_shape = cute.shape_div(sfb_tile_shape, (1, mma_tile_inst_k))
     smem_layout = cute.tiled_divide(smem_layout, sfb_tile_shape)
