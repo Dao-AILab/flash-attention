@@ -562,7 +562,7 @@ def main(ab_dtype, sf_dtype, sf_vec_size, pv_mode="bf16", pv_fp8_dtype=cutlass.F
     # Fall back to cute_tensor_like for MXFP8 or FP4 PV (nvfp4_quantize only handles NVFP4).
     use_nvfp4 = (ab_dtype == cutlass.Float4E2M1FN and pv_mode != "fp4")
 
-    for batch_size, seqlen, nheads, headdim in configs:
+    for i, (batch_size, seqlen, nheads, headdim) in enumerate(configs):
         nheads_kv = nheads
         headdim_v = headdim
         seqlen_q = seqlen
@@ -725,6 +725,9 @@ def main(ab_dtype, sf_dtype, sf_vec_size, pv_mode="bf16", pv_fp8_dtype=cutlass.F
                     print(f"  m_block={mb} stage={stage}: fp4[0,{s},0,0]={fp4_t[0,s,0,0].item():.4f} ref={ref_t[0,s,0,0].item():.4f}")
                 import traceback
                 traceback.print_exc()
+
+        if (i + 1) % 3 == 0:
+            time.sleep(1)
 
 if __name__ == "__main__":
     import argparse
