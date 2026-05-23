@@ -5,6 +5,9 @@ __path__ = extend_path(__path__, __name__)
 
 __version__ = "2.8.4"
 
+# FA2 C extension (flash_attn_2_cuda) may not be installed when only
+# the FA4 CuTeDSL kernel is needed.  Guard the import so that
+# `from flash_attn.cute import flash_attn_func` works either way.
 try:
     from flash_attn.flash_attn_interface import (
         flash_attn_func,
