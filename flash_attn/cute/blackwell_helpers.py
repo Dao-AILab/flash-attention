@@ -5,12 +5,13 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, Float32, Boolean, const_expr
 from dataclasses import dataclass, field
-from cutlass.cutlass_dsl import dsl_user_op
+from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.nvgpu.tcgen05 import OperandMajorMode
 from cutlass._mlir.dialects import llvm
 
 import flash_attn.cute.mma_sm100_desc as sm100_desc
+from flash_attn.cute.utils import parse_swizzle_from_pointer
 
 
 def _tcgen05_mma_kind(op: cute.nvgpu.tcgen05.mma.MmaOp) -> str:
