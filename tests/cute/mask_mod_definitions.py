@@ -497,6 +497,262 @@ def make_global_windows(seqlens_q, device="cuda"):
 
 
 # =============================================================================
+# Vectorized mask_mod variants (return bit-packed Uint32)
+# =============================================================================
+#
+# Each variant receives shape-(vec_size,) Int32 SSAs and returns a shape-
+# (max(1, vec_size // 32),) Uint32 TensorSSA, where bit i of element k is the
+# mask for lane (k * 32 + i). Bodies assume lane i has idx[i] = idx[0] + i, so
+# they compute the packed Uint32(s) in O(1) via integer/bit arithmetic on the
+# chunk-base indices instead of evaluating per lane.
+
+
+@cute.jit
+def cute_causal_mask_vec(
+    batch: cute.TensorSSA,
+    head: cute.TensorSSA,
+    m_idx: cute.TensorSSA,
+    n_idx: cute.TensorSSA,
+    seqlen_info,
+    aux_tensors: None,
+) -> cute.TensorSSA:
+    offset = seqlen_info.seqlen_k - seqlen_info.seqlen_q
+    threshold = m_idx[0] + offset - n_idx[0] + cutlass.Int32(1)
+    m = max(cutlass.Int32(32) - threshold, cutlass.Int32(0))
+    result = cute.make_rmem_tensor(1, dtype=cutlass.Uint32)
+    result[0] = utils.shr_u32(cutlass.Uint32(0xFFFFFFFF), cutlass.Uint32(m))
+    return result.load()
+
+
+def get_cute_causal_mask_vec(offset: int):
+    return cute_causal_mask_vec
+
+
+def get_cute_sliding_window_mask_vec(window_left: int, window_right: int, offset: int):
+    @cute.jit
+    def _cute_sliding_window_mask_vec(
+        batch: cute.TensorSSA,
+        head: cute.TensorSSA,
+        m_idx: cute.TensorSSA,
+        n_idx: cute.TensorSSA,
+        seqlen_info,
+        aux_tensors,
+    ) -> cute.TensorSSA:
+        runtime_offset = seqlen_info.seqlen_k - seqlen_info.seqlen_q
+        center = m_idx[0] + runtime_offset
+        lo = center - cutlass.Int32(window_left) - n_idx[0]
+        hi_excl = center + cutlass.Int32(window_right) - n_idx[0] + cutlass.Int32(1)
+        m_below = max(cutlass.Int32(32) - hi_excl, cutlass.Int32(0))
+        below = utils.shr_u32(cutlass.Uint32(0xFFFFFFFF), cutlass.Uint32(m_below))
+        n_above = max(lo, cutlass.Int32(0))
+        above = utils.shl_u32(cutlass.Uint32(0xFFFFFFFF), cutlass.Uint32(n_above))
+        result = cute.make_rmem_tensor(1, dtype=cutlass.Uint32)
+        result[0] = below & above
+        return result.load()
+
+    return _cute_sliding_window_mask_vec
+
+
+@cute.jit
+def cute_block_diagonal_mask_vec(
+    batch: cute.TensorSSA,
+    head: cute.TensorSSA,
+    m_idx: cute.TensorSSA,
+    n_idx: cute.TensorSSA,
+    seqlen_info,
+    aux_tensors,
+) -> cute.TensorSSA:
+    block_size = cutlass.Int32(128)
+    block_m = m_idx[0] // block_size
+    lo = block_m * block_size - n_idx[0]
+    hi = (block_m + cutlass.Int32(1)) * block_size - n_idx[0]
+    m_below = max(cutlass.Int32(32) - hi, cutlass.Int32(0))
+    below = utils.shr_u32(cutlass.Uint32(0xFFFFFFFF), cutlass.Uint32(m_below))
+    n_above = max(lo, cutlass.Int32(0))
+    above = utils.shl_u32(cutlass.Uint32(0xFFFFFFFF), cutlass.Uint32(n_above))
+    result = cute.make_rmem_tensor(1, dtype=cutlass.Uint32)
+    result[0] = below & above
+    return result.load()
+
+
+@cute.jit
+def cute_prefix_lm_mask_vec(
+    batch: cute.TensorSSA,
+    head: cute.TensorSSA,
+    m_idx: cute.TensorSSA,
+    n_idx: cute.TensorSSA,
+    seqlen_info,
+    aux_tensors,
+) -> cute.TensorSSA:
+    prefix = cutlass.Int32(512)
+    hi_pref = prefix - n_idx[0]
+    m_below_pref = max(cutlass.Int32(32) - hi_pref, cutlass.Int32(0))
+    term1_below = utils.shr_u32(cutlass.Uint32(0xFFFFFFFF), cutlass.Uint32(m_below_pref))
+    row_in_prefix_mask = (
+        cutlass.Uint32(0xFFFFFFFF) if m_idx[0] < prefix else cutlass.Uint32(0)
+    )
+    term1 = term1_below & row_in_prefix_mask
+    hi_causal = m_idx[0] - n_idx[0] + cutlass.Int32(1)
+    m_below_causal = max(cutlass.Int32(32) - hi_causal, cutlass.Int32(0))
+    term2 = utils.shr_u32(cutlass.Uint32(0xFFFFFFFF), cutlass.Uint32(m_below_causal))
+    result = cute.make_rmem_tensor(1, dtype=cutlass.Uint32)
+    result[0] = term1 | term2
+    return result.load()
+
+
+# =============================================================================
+# Packed-bitmask aux tensor mod
+# =============================================================================
+# aux[0] is a (batch, max_seqlen_q, ceil(max_seqlen_k / 32)) Uint32 tensor where
+# bit k of packed[b, q, c] is the mask for (b, q, c*32 + k).
+
+
+@cute.jit
+def cute_packed_mask_aux(
+    batch: cute.TensorSSA,
+    head: cute.TensorSSA,
+    m_idx: cute.TensorSSA,
+    n_idx: cute.TensorSSA,
+    seqlen_info,
+    aux_tensors,
+) -> cute.TensorSSA:
+    packed = aux_tensors[0]
+    val = packed[batch[0], m_idx[0], n_idx[0] // cutlass.Int32(32)]
+    shift = cutlass.Uint32(n_idx[0] % cutlass.Int32(32))
+    bit_set = cutlass.Boolean(utils.shr_u32(val, shift) & cutlass.Uint32(1))
+    result = cute.make_rmem_tensor(n_idx.shape, dtype=cutlass.Boolean)
+    for j in cutlass.range_constexpr(cute.size(n_idx.shape)):
+        result[j] = bit_set
+    return result.load()
+
+
+def get_cute_packed_mask_aux_vec(vec_size: int):
+    """Vec packed-mask, specialized for `vec_size`. For vec_size > 32, requires
+    `aux_tensors[0].__assumed_align__ = 16` and num_words divisible by 4."""
+    if vec_size <= 32:
+
+        @cute.jit
+        def _mod(
+            batch: cute.TensorSSA,
+            head: cute.TensorSSA,
+            m_idx: cute.TensorSSA,
+            n_idx: cute.TensorSSA,
+            seqlen_info,
+            aux_tensors,
+        ) -> cute.TensorSSA:
+            packed = aux_tensors[0]
+            base = n_idx[0] // cutlass.Int32(32)
+            val = packed[batch[0], m_idx[0], base]
+            shift = cutlass.Uint32(n_idx[0] % cutlass.Int32(32))
+            result = cute.make_rmem_tensor(1, dtype=cutlass.Uint32)
+            result[0] = utils.shr_u32(val, shift)
+            return result.load()
+    else:
+        num_words = vec_size // 32
+
+        @cute.jit
+        def _mod(
+            batch: cute.TensorSSA,
+            head: cute.TensorSSA,
+            m_idx: cute.TensorSSA,
+            n_idx: cute.TensorSSA,
+            seqlen_info,
+            aux_tensors,
+        ) -> cute.TensorSSA:
+            packed = aux_tensors[0]
+            b_str, m_str, _ = packed.stride
+            packed_aligned = cute.make_tensor(
+                packed.iterator,
+                cute.make_layout(
+                    packed.shape,
+                    stride=(
+                        cute.assume(b_str, divby=4),
+                        cute.assume(m_str, divby=4),
+                        1,
+                    ),
+                ),
+            )
+            packed_row = packed_aligned[batch[0], m_idx[0], None]
+            packed_tiled = cute.flat_divide(packed_row, (num_words,))
+            base = n_idx[0] // cutlass.Int32(32)
+            packed_chunk = packed_tiled[None, base // cutlass.Int32(num_words)]
+            loaded = cute.make_rmem_tensor_like(packed_chunk)
+            cute.autovec_copy(packed_chunk, loaded)
+            result = cute.make_rmem_tensor(num_words, dtype=cutlass.Uint32)
+            for k in cutlass.range_constexpr(num_words):
+                result[k] = cutlass.Uint32(loaded[k])
+            return result.load()
+
+    return _mod
+
+
+def make_packed_mask_aux_tensor(
+    batch: int,
+    seqlen_q: int,
+    seqlen_k: int,
+    density: float = 0.5,
+    device="cuda",
+    seed: int = 0,
+):
+    """Random Uint32 bit-packed mask. num_words is rounded up to a multiple of 4
+    so each row is 16-byte aligned (LDG.E.128 requirement at vec_size=128)."""
+    g = torch.Generator(device=device).manual_seed(seed)
+    num_words = ((seqlen_k + 31) // 32 + 3) // 4 * 4
+    bools = (
+        torch.rand(batch, seqlen_q, num_words * 32, device=device, generator=g)
+        < density
+    )
+    bools = bools.reshape(batch, seqlen_q, num_words, 32)
+    powers = 1 << torch.arange(32, device=device, dtype=torch.int64)
+    packed = (bools.to(torch.int64) * powers).sum(-1).to(torch.uint32)
+    packed.__assumed_align__ = 16
+    return packed
+
+
+VEC_MASK_FACTORIES = {
+    "causal": ("factory", get_cute_causal_mask_vec),
+    "block_causal": ("factory", get_cute_causal_mask_vec),
+    "sliding_window": ("factory_window", get_cute_sliding_window_mask_vec),
+    "block_diagonal": ("static", cute_block_diagonal_mask_vec),
+    "prefix_lm": ("static", cute_prefix_lm_mask_vec),
+    "packed_aux": ("factory_vec_size", get_cute_packed_mask_aux_vec),
+}
+
+
+# Scalar mods for vec masks not in STATIC_MASKS / PARAMETERIZED_MASK_FACTORIES.
+EXTRA_SCALAR_MASKS = {
+    "packed_aux": cute_packed_mask_aux,
+}
+
+
+def get_vec_mask(
+    mask_name, seqlen_q=None, seqlen_k=None, window_size=None, vec_size=None
+):
+    """Return a vectorized cute mask callable for `mask_name`, or None if there
+    is no vec form. Caller sets `__vec_size__` on the returned callable.
+    `vec_size` is required for masks whose body specializes on it (packed_aux)."""
+    if mask_name not in VEC_MASK_FACTORIES:
+        return None
+    kind, obj = VEC_MASK_FACTORIES[mask_name]
+    if kind == "static":
+        return obj
+    if kind == "factory_vec_size":
+        if vec_size is None:
+            raise ValueError(f"{mask_name} vec mask requires vec_size")
+        return obj(vec_size)
+    offset = (
+        (seqlen_k - seqlen_q) if (seqlen_q is not None and seqlen_k is not None) else 0
+    )
+    if kind == "factory":
+        return obj(offset)
+    if kind == "factory_window":
+        if window_size is None:
+            raise ValueError("sliding_window vec mask requires window_size")
+        return obj(window_size, window_size, offset)
+    raise ValueError(f"unknown vec mask kind: {kind}")
+
+
+# =============================================================================
 # Mask registry and factory functions
 # =============================================================================
 
