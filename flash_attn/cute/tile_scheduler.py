@@ -39,27 +39,18 @@ class SchedulingMode(IntEnum):
 
 @dataclass
 class SchedulerState(ParamsBase):
-    """Owns the runtime state shared by CLC and dynamic persistent tile schedulers.
+    """Runtime state shared by CLC and dynamic persistent tile schedulers:
+    the async pipeline and its producer/consumer states.
 
-    Main kernel constructs this state because it owns the
-    response buffer / work_info smem, mbarrier storage, and launch geometry
-    needed to initialize the backend (CLC hardware scheduler or atomic-counter
-    work_info region) and the async pipeline. Individual tile schedulers then
-    consume this state and map the returned work tiles into their own logical
-    `WorkTileInfo` coordinates.
-
-    Tagged by `scheduling_mode`:
-    - CLC: `_hw_scheduler` is set; `prefetch_next_work` issues the HW query.
-    - DYNAMIC: `_work_info` is set; the scheduler class does its own
-      atomicAdd + warp-prefix-sum and writes via `write_work_info`.
+    Main kernels construct this via `create_clc` / `create_dynamic_persistent`,
+    which return the appropriate concrete state (`ClcSchedulerState` or
+    `DynamicPersistentSchedulerState`). Schedulers consume it through the
+    `ctx: SchedulerState | None` parameter on their `create(...)`.
     """
 
-    scheduling_mode: cutlass.Constexpr[SchedulingMode]
     _pipeline: cutlass.pipeline.PipelineAsync
     _consumer_state: PipelineState
     _producer_state: PipelineState
-    _hw_scheduler: Optional[ClcDynamicPersistentTileScheduler] = None
-    _work_info: Optional[cute.Tensor] = None
 
     @staticmethod
     def create_clc(
@@ -68,15 +59,8 @@ class SchedulerState(ParamsBase):
         pipeline: PipelineClcFetchAsync,
         consumer_state: PipelineState,
         producer_state: PipelineState,
-    ) -> "SchedulerState":
-        return SchedulerState(
-            SchedulingMode.CLC,
-            pipeline,
-            consumer_state,
-            producer_state,
-            hw_scheduler,
-            None,
-        )
+    ) -> "ClcSchedulerState":
+        return ClcSchedulerState(pipeline, consumer_state, producer_state, hw_scheduler)
 
     @staticmethod
     def create_dynamic_persistent(
@@ -85,17 +69,28 @@ class SchedulerState(ParamsBase):
         pipeline: cutlass.pipeline.PipelineAsync,
         consumer_state: PipelineState,
         producer_state: PipelineState,
-    ) -> "SchedulerState":
-        return SchedulerState(
-            SchedulingMode.DYNAMIC,
-            pipeline,
-            consumer_state,
-            producer_state,
-            None,
-            work_info,
-        )
+    ) -> "DynamicPersistentSchedulerState":
+        return DynamicPersistentSchedulerState(pipeline, consumer_state, producer_state, work_info)
 
-    # ---- CLC-mode ----
+    def consumer_wait(self, *, loc=None, ip=None):
+        self._pipeline.consumer_wait(self._consumer_state, loc=loc, ip=ip)
+
+    def consumer_release(self, *, loc=None, ip=None):
+        self._pipeline.consumer_release(self._consumer_state, loc=loc, ip=ip)
+        self._consumer_state.advance(loc=loc, ip=ip)
+
+    def advance_consumer_state(self, *, loc=None, ip=None):
+        self._consumer_state.advance(loc=loc, ip=ip)
+
+    def producer_tail(self, *, loc=None, ip=None):
+        self._pipeline.producer_tail(self._producer_state, loc=loc, ip=ip)
+
+
+@dataclass
+class ClcSchedulerState(SchedulerState):
+    """CLC-backed: `prefetch_next_work` issues the HW query."""
+
+    _hw_scheduler: ClcDynamicPersistentTileScheduler
 
     def initial_work_tile_info(self):
         return self._hw_scheduler.initial_work_tile_info()
@@ -109,7 +104,13 @@ class SchedulerState(ParamsBase):
         self._hw_scheduler.advance_to_next_work(mbarrier_addr, loc=loc, ip=ip)
         self._producer_state.advance(loc=loc, ip=ip)
 
-    # ---- Dynamic-persistent ----
+
+@dataclass
+class DynamicPersistentSchedulerState(SchedulerState):
+    """Semaphore-backed: the scheduler class drives atomicAdd + warp-prefix-sum
+    and writes the resolved work tile via `write_work_info`."""
+
+    _work_info: cute.Tensor
 
     def producer_acquire(self, *, loc=None, ip=None):
         self._pipeline.producer_acquire(self._producer_state, loc=loc, ip=ip)
@@ -126,69 +127,7 @@ class SchedulerState(ParamsBase):
         self._work_info[2] = batch
         self._work_info[3] = split
 
-    # ---- Common ----
 
-    def consumer_wait(self, *, loc=None, ip=None):
-        self._pipeline.consumer_wait(self._consumer_state, loc=loc, ip=ip)
-
-    def consumer_release(self, *, loc=None, ip=None):
-        self._pipeline.consumer_release(self._consumer_state, loc=loc, ip=ip)
-        self._consumer_state.advance(loc=loc, ip=ip)
-
-    def advance_consumer_state(self, *, loc=None, ip=None):
-        self._consumer_state.advance(loc=loc, ip=ip)
-
-    def producer_tail(self, *, loc=None, ip=None):
-        self._pipeline.producer_tail(self._producer_state, loc=loc, ip=ip)
-
-    def __extract_mlir_values__(self):
-        ordered = [
-            self.scheduling_mode,
-            self._pipeline,
-            self._consumer_state,
-            self._producer_state,
-            self._hw_scheduler,
-            self._work_info,
-        ]
-        values, self._values_pos = [], []
-        for obj in ordered:
-            if obj is None or isinstance(
-                obj, (cutlass.Constexpr, int, bool, str, float, type(None))
-            ):
-                self._values_pos.append(0)
-                continue
-            obj_values = cutlass.extract_mlir_values(obj)
-            values += obj_values
-            self._values_pos.append(len(obj_values))
-        return values
-
-    def __new_from_mlir_values__(self, values):
-        ordered = [
-            self.scheduling_mode,
-            self._pipeline,
-            self._consumer_state,
-            self._producer_state,
-            self._hw_scheduler,
-            self._work_info,
-        ]
-        rebuilt = []
-        for obj, n_items in zip(ordered, self._values_pos):
-            if n_items == 0:
-                rebuilt.append(obj)
-            else:
-                rebuilt.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
-                values = values[n_items:]
-        return SchedulerState(
-            scheduling_mode=rebuilt[0],
-            _pipeline=rebuilt[1],
-            _consumer_state=rebuilt[2],
-            _producer_state=rebuilt[3],
-            _hw_scheduler=rebuilt[4],
-            _work_info=rebuilt[5],
-        )
-
-
-# Deprecated alias; remove after downstream call sites are updated.
 ClcState = SchedulerState
 
 
@@ -898,68 +837,146 @@ class SingleTileLPTBwdScheduler:
         return self.__class__(*(tuple(obj_list)), loc=self._loc)
 
 
-class VarlenSchedulerBase:
-    """Base for varlen tile schedulers (SingleTileVarlenScheduler,
-    DynamicPersistentVarlenScheduler). Owns the shared per-batch m-block lookup
-    and the warp-prefix-sum search-and-decode of the work tile.
+@dataclass
+class VarlenDecoder(ParamsBase):
+    """Per-batch m-block lookup + warp-prefix-sum search-and-decode of the
+    varlen work tile. Composed into both `SingleTileVarlenScheduler.Params`
+    and `DynamicPersistentVarlenScheduler.Params`.
 
-    Subclasses must expose:
-      - self.params (ParamsBase) with the fields documented on each method.
-      - _get_num_splits(lane, bidb_start) -> Int32
+    `fold_splits_into_scan` controls whether the prefix-sum scan folds per-batch
+    `num_splits` into the per-batch tile count (DynamicPersistent) or always
+    counts only m_blocks (SingleTileVarlen, where splits are dispatched at the
+    grid level and resolved post-scan).
     """
 
+    num_head: Int32
+    num_batch: Int32
+    num_splits: Int32
+    max_kvblock_in_l2: Int32
+    tile_shape_mn: cutlass.Constexpr[Tuple[int, int]]
+    qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1
+    is_split_kv: cutlass.Constexpr[bool] = False
+    lpt: cutlass.Constexpr[bool] = False
+    head_swizzle: cutlass.Constexpr[bool] = False
+    cluster_shape_m: cutlass.Constexpr[int] = 1
+    fold_splits_into_scan: cutlass.Constexpr[bool] = False
+    scheduling_mode: cutlass.Constexpr[SchedulingMode] = SchedulingMode.STATIC
+    mCuSeqlensQ: Optional[cute.Tensor] = None
+    mSeqUsedQ: Optional[cute.Tensor] = None
+    num_m_blocks_ptr: Optional[cute.Tensor] = None
+    num_splits_dynamic_ptr: Optional[cute.Tensor] = None
+    virtual_batch_idx_ptr: Optional[cute.Tensor] = None
+    num_nheads_in_l2_ptr: Optional[cute.Tensor] = None
+    cu_total_m_blocks_ptr: Optional[cute.Tensor] = None
+    cu_total_splits_m_blocks_ptr: Optional[cute.Tensor] = None
+
+    @staticmethod
     @cute.jit
-    def _get_num_m_blocks(self, lane: Int32, bidb_start: Int32) -> Int32:
+    def create(
+        args: TileSchedulerArguments,
+        *,
+        fold_splits_into_scan: bool,
+        head_swizzle: bool = False,
+        cluster_shape_m: int = 1,
+        scheduling_mode: SchedulingMode = SchedulingMode.STATIC,
+        loc=None,
+        ip=None,
+    ) -> "VarlenDecoder":
+        size_l2 = 50 * 1024 * 1024  # 50 MB for K & V
+        # if backward, this is qdo block size
+        kv_block_size = (args.headdim + args.headdim_v) * args.element_size * args.tile_shape_mn[1]
+        # if backward, add dqaccum block size to calculate swizzle
+        if head_swizzle:
+            kv_block_size += args.headdim * 4 * args.tile_shape_mn[1]
+        max_kvblock_in_l2 = size_l2 // kv_block_size
+        return VarlenDecoder(
+            num_head=args.num_head,
+            num_batch=args.num_batch,
+            num_splits=args.num_splits,
+            max_kvblock_in_l2=max_kvblock_in_l2,
+            tile_shape_mn=args.tile_shape_mn,
+            qhead_per_kvhead_packgqa=args.qhead_per_kvhead_packgqa,
+            is_split_kv=args.is_split_kv,
+            lpt=args.lpt,
+            head_swizzle=head_swizzle,
+            cluster_shape_m=cluster_shape_m,
+            fold_splits_into_scan=fold_splits_into_scan,
+            scheduling_mode=scheduling_mode,
+            mCuSeqlensQ=args.mCuSeqlensQ,
+            mSeqUsedQ=args.mSeqUsedQ,
+            num_m_blocks_ptr=args.num_m_blocks_ptr,
+            num_splits_dynamic_ptr=args.num_splits_dynamic_ptr,
+            virtual_batch_idx_ptr=args.virtual_batch_idx_ptr,
+            num_nheads_in_l2_ptr=args.num_nheads_in_l2_ptr,
+            cu_total_m_blocks_ptr=args.cu_total_m_blocks_ptr,
+            cu_total_splits_m_blocks_ptr=args.cu_total_splits_m_blocks_ptr,
+        )
+
+    @cute.jit
+    def _num_m_blocks(self, lane: Int32, bidb_start: Int32) -> Int32:
         """Per-batch m-block count"""
-        params = self.params
-        cluster_shape_m = getattr(params, "cluster_shape_m", 1)
         batch_idx = lane + bidb_start
-        is_valid = batch_idx < params.num_batch and lane < cute.arch.WARP_SIZE - 1
-        if cutlass.const_expr(params.num_m_blocks_ptr is not None):
+        is_valid = batch_idx < self.num_batch and lane < cute.arch.WARP_SIZE - 1
+        if cutlass.const_expr(self.num_m_blocks_ptr is not None):
             num_m_blocks_raw = Int32(0)
             if is_valid:
-                if cutlass.const_expr(params.virtual_batch_idx_ptr is not None):
-                    real_batch_idx = params.virtual_batch_idx_ptr[batch_idx]
+                if cutlass.const_expr(self.virtual_batch_idx_ptr is not None):
+                    real_batch_idx = self.virtual_batch_idx_ptr[batch_idx]
                 else:
                     real_batch_idx = batch_idx
-                num_m_blocks_raw = Int32(params.num_m_blocks_ptr[real_batch_idx])
-            return cute.ceil_div(num_m_blocks_raw, cluster_shape_m) if is_valid else Int32(0)
-        if cutlass.const_expr(params.virtual_batch_idx_ptr is not None):
+                num_m_blocks_raw = Int32(self.num_m_blocks_ptr[real_batch_idx])
+            return cute.ceil_div(num_m_blocks_raw, self.cluster_shape_m) if is_valid else Int32(0)
+        if cutlass.const_expr(self.virtual_batch_idx_ptr is not None):
             seqlen = Int32(0)
             if is_valid:
-                real_batch_idx = params.virtual_batch_idx_ptr[batch_idx]
-                seqlen = (
-                    params.mCuSeqlensQ[real_batch_idx + 1]
-                    - params.mCuSeqlensQ[real_batch_idx]
-                )
-            if cutlass.const_expr(params.qhead_per_kvhead_packgqa > 1):
-                seqlen *= params.qhead_per_kvhead_packgqa
+                real_batch_idx = self.virtual_batch_idx_ptr[batch_idx]
+                seqlen = self.mCuSeqlensQ[real_batch_idx + 1] - self.mCuSeqlensQ[real_batch_idx]
+            if cutlass.const_expr(self.qhead_per_kvhead_packgqa > 1):
+                seqlen *= self.qhead_per_kvhead_packgqa
             return (
-                cute.ceil_div(cute.ceil_div(seqlen, params.tile_shape_mn[0]), cluster_shape_m)
+                cute.ceil_div(cute.ceil_div(seqlen, self.tile_shape_mn[0]), self.cluster_shape_m)
                 if is_valid
                 else Int32(0)
             )
-        if cutlass.const_expr(params.mSeqUsedQ is not None):
+        if cutlass.const_expr(self.mSeqUsedQ is not None):
             seqlen = Int32(0)
-            if batch_idx < params.num_batch:
-                seqlen = params.mSeqUsedQ[batch_idx]
+            if batch_idx < self.num_batch:
+                seqlen = self.mSeqUsedQ[batch_idx]
         else:
-            assert params.mCuSeqlensQ is not None
+            assert self.mCuSeqlensQ is not None
             cur_cu_seqlen = Int32(0)
-            if batch_idx <= params.num_batch:
-                cur_cu_seqlen = params.mCuSeqlensQ[batch_idx]
+            if batch_idx <= self.num_batch:
+                cur_cu_seqlen = self.mCuSeqlensQ[batch_idx]
             next_cu_seqlen = cute.arch.shuffle_sync_down(cur_cu_seqlen, offset=1)
             seqlen = next_cu_seqlen - cur_cu_seqlen
-        if cutlass.const_expr(params.qhead_per_kvhead_packgqa > 1):
-            seqlen *= params.qhead_per_kvhead_packgqa
+        if cutlass.const_expr(self.qhead_per_kvhead_packgqa > 1):
+            seqlen *= self.qhead_per_kvhead_packgqa
         return (
-            cute.ceil_div(cute.ceil_div(seqlen, params.tile_shape_mn[0]), cluster_shape_m)
+            cute.ceil_div(cute.ceil_div(seqlen, self.tile_shape_mn[0]), self.cluster_shape_m)
             if is_valid
             else Int32(0)
         )
 
     @cute.jit
-    def _varlen_coord_map(
+    def _num_splits(self, lane: Int32, bidb_start: Int32) -> Int32:
+        if cutlass.const_expr(not self.fold_splits_into_scan):
+            return Int32(1)
+        batch_idx = lane + bidb_start
+        is_valid = batch_idx < self.num_batch and lane < cute.arch.WARP_SIZE - 1
+        if cutlass.const_expr(not self.is_split_kv):
+            return Int32(1)
+        elif cutlass.const_expr(self.num_splits_dynamic_ptr is not None):
+            num_splits = Int32(0)
+            if is_valid:
+                if cutlass.const_expr(self.virtual_batch_idx_ptr is not None):
+                    batch_idx = self.virtual_batch_idx_ptr[batch_idx]
+                num_splits = self.num_splits_dynamic_ptr[batch_idx]
+            return num_splits
+        else:
+            return Int32(0) if not is_valid else self.num_splits
+
+    @cute.jit
+    def decode(
         self,
         next_tile_idx: Int32,
         bidb_start: Int32,
@@ -975,81 +992,58 @@ class VarlenSchedulerBase:
             - num_splits
             - group_start_tile
             - is_valid
-
-        self.params must expose:
-              - num_head: Int32
-              - num_batch: Int32
-              - tile_shape_mn: Constexpr[tuple]
-              - qhead_per_kvhead_packgqa: Constexpr[int]
-              - max_kvblock_in_l2: Int32
-              - is_split_kv: Constexpr[bool]
-              - lpt: Constexpr[bool]
-            Optionally:
-              - head_swizzle: Constexpr[bool] | None
-              - cluster_shape_m: Constexpr[int] | None
-              - num_nheads_in_l2_ptr: cute.Tensor | None
-              - virtual_batch_idx_ptr: cute.Tensor | None
         """
-        params = self.params
-        head_swizzle = getattr(params, "head_swizzle", False)
-        cluster_shape_m = getattr(params, "cluster_shape_m", 1)
-        num_nheads_in_l2_ptr = getattr(params, "num_nheads_in_l2_ptr", None)
-        virtual_batch_idx_ptr = getattr(params, "virtual_batch_idx_ptr", None)
-        cu_total_m_blocks_ptr = getattr(params, "cu_total_m_blocks_ptr", None)
-        cu_total_splits_m_blocks_ptr = getattr(params, "cu_total_splits_m_blocks_ptr", None)
-        scheduling_mode = getattr(params, "scheduling_mode", None)
-        if const_expr(params.is_split_kv):
-            cu_hint_ptr = cu_total_splits_m_blocks_ptr
+        if const_expr(self.is_split_kv):
+            cu_hint_ptr = self.cu_total_splits_m_blocks_ptr
         else:
-            cu_hint_ptr = cu_total_m_blocks_ptr
+            cu_hint_ptr = self.cu_total_m_blocks_ptr
         # Both SingleTileVarlen STATIC and CLC; not DynamicPersistent (where
         # warp-scan's _bidb_start resumption already amortizes per-call cost).
         use_cumsum_hint = const_expr(
-            cluster_shape_m == 1
+            self.cluster_shape_m == 1
             and cu_hint_ptr is not None
-            and (scheduling_mode == SchedulingMode.STATIC or scheduling_mode == SchedulingMode.CLC)
+            and (
+                self.scheduling_mode == SchedulingMode.STATIC
+                or self.scheduling_mode == SchedulingMode.CLC
+            )
         )
         if const_expr(use_cumsum_hint):
-            target = next_tile_idx // params.num_head
+            target = next_tile_idx // self.num_head
             lo = utils.get_batch_from_cu_tensor(target, cu_hint_ptr)
             group_size = Int32(cute.arch.WARP_SIZE - 1)
             bidb_start = (lo // group_size) * group_size
-            group_start_tile = cu_hint_ptr[bidb_start] * params.num_head
+            group_start_tile = cu_hint_ptr[bidb_start] * self.num_head
 
         lane_idx = cute.arch.lane_idx()
-        num_m_blocks = self._get_num_m_blocks(lane_idx, bidb_start=bidb_start)
-        num_splits = self._get_num_splits(lane_idx, bidb_start=bidb_start)
-        per_batch = (
-            num_m_blocks * num_splits if const_expr(params.is_split_kv) else num_m_blocks
-        )
+        num_m_blocks = self._num_m_blocks(lane_idx, bidb_start=bidb_start)
+        num_splits = self._num_splits(lane_idx, bidb_start=bidb_start)
+        per_batch = num_m_blocks * num_splits if const_expr(self.is_split_kv) else num_m_blocks
         cumulative = utils.warp_prefix_sum(per_batch, lane_idx)
         m_blocks_in_group = cute.arch.shuffle_sync(cumulative, cute.arch.WARP_SIZE - 1)
-        group_end_tile = m_blocks_in_group * params.num_head + group_start_tile
+        group_end_tile = m_blocks_in_group * self.num_head + group_start_tile
 
         batch_idx = bidb_start
         while group_end_tile <= next_tile_idx:
             batch_idx += cute.arch.WARP_SIZE - 1
-            if batch_idx >= params.num_batch:
-                batch_idx = Int32(params.num_batch)
+            if batch_idx >= self.num_batch:
+                batch_idx = Int32(self.num_batch)
                 group_end_tile = next_tile_idx + 1
             else:
-                num_m_blocks = self._get_num_m_blocks(lane_idx, bidb_start=batch_idx)
-                num_splits = self._get_num_splits(lane_idx, bidb_start=batch_idx)
+                num_m_blocks = self._num_m_blocks(lane_idx, bidb_start=batch_idx)
+                num_splits = self._num_splits(lane_idx, bidb_start=batch_idx)
                 per_batch = (
-                    num_m_blocks * num_splits
-                    if const_expr(params.is_split_kv)
-                    else num_m_blocks
+                    num_m_blocks * num_splits if const_expr(self.is_split_kv) else num_m_blocks
                 )
                 cumulative = utils.warp_prefix_sum(per_batch, lane_idx)
                 m_blocks_in_group = cute.arch.shuffle_sync(cumulative, cute.arch.WARP_SIZE - 1)
-                group_end_tile += m_blocks_in_group * params.num_head
+                group_end_tile += m_blocks_in_group * self.num_head
 
-        is_valid = batch_idx < params.num_batch
+        is_valid = batch_idx < self.num_batch
         if is_valid:
-            group_start_tile = group_end_tile - m_blocks_in_group * params.num_head
+            group_start_tile = group_end_tile - m_blocks_in_group * self.num_head
             batch_idx_in_group = cute.arch.popc(
                 cute.arch.vote_ballot_sync(
-                    group_start_tile + cumulative * params.num_head <= next_tile_idx
+                    group_start_tile + cumulative * self.num_head <= next_tile_idx
                 )
             )
             batch_idx += batch_idx_in_group
@@ -1058,58 +1052,58 @@ class VarlenSchedulerBase:
                 if batch_idx_in_group == 0
                 else cute.arch.shuffle_sync(cumulative, batch_idx_in_group - 1)
             )
-            group_start_tile += num_m_blocks_prev_lane * params.num_head
+            group_start_tile += num_m_blocks_prev_lane * self.num_head
             num_m_blocks = cute.arch.shuffle_sync(num_m_blocks, batch_idx_in_group)
-            if const_expr(params.is_split_kv):
+            if const_expr(self.is_split_kv):
                 num_splits = cute.arch.shuffle_sync(num_splits, batch_idx_in_group)
 
         block, head_idx, split_idx = Int32(0), Int32(0), Int32(0)
         if is_valid:
             mh_block = next_tile_idx - group_start_tile
 
-            if const_expr(params.lpt or head_swizzle):
+            if const_expr(self.lpt or self.head_swizzle):
                 # This is a version of the SingleTileLPTScheduler, complicated by the fact that
                 # the seqlen can vary per batch.
                 # TODO: is there any case where num_m_blocks is 0?
-                if const_expr(not params.is_split_kv) or num_splits == 1:
-                    if const_expr(num_nheads_in_l2_ptr is not None):
-                        if const_expr(virtual_batch_idx_ptr is not None):
+                if const_expr(not self.is_split_kv) or num_splits == 1:
+                    if const_expr(self.num_nheads_in_l2_ptr is not None):
+                        if const_expr(self.virtual_batch_idx_ptr is not None):
                             nheads_in_l2 = Int32(
-                                num_nheads_in_l2_ptr[virtual_batch_idx_ptr[batch_idx]]
+                                self.num_nheads_in_l2_ptr[self.virtual_batch_idx_ptr[batch_idx]]
                             )
                         else:
-                            nheads_in_l2 = Int32(num_nheads_in_l2_ptr[batch_idx])
+                            nheads_in_l2 = Int32(self.num_nheads_in_l2_ptr[batch_idx])
                     else:
                         # TODO: by right we should read the seqlen_kv but we're assuming seqlen_q == seqlen_k here
                         num_n_blocks = (
                             num_m_blocks
-                            * params.tile_shape_mn[0]
-                            * cluster_shape_m
-                            // params.qhead_per_kvhead_packgqa
-                            // params.tile_shape_mn[1]
+                            * self.tile_shape_mn[0]
+                            * self.cluster_shape_m
+                            // self.qhead_per_kvhead_packgqa
+                            // self.tile_shape_mn[1]
                         )
                         # Seems faster to have nheads_in_l2 be a power of 2
                         nheads_in_l2 = (
                             16
-                            if num_n_blocks * 16 <= params.max_kvblock_in_l2
+                            if num_n_blocks * 16 <= self.max_kvblock_in_l2
                             else (
                                 8
-                                if num_n_blocks * 8 <= params.max_kvblock_in_l2
+                                if num_n_blocks * 8 <= self.max_kvblock_in_l2
                                 else (
                                     4
-                                    if num_n_blocks * 4 <= params.max_kvblock_in_l2
-                                    else (2 if num_n_blocks * 2 <= params.max_kvblock_in_l2 else 1)
+                                    if num_n_blocks * 4 <= self.max_kvblock_in_l2
+                                    else (2 if num_n_blocks * 2 <= self.max_kvblock_in_l2 else 1)
                                 )
                             )
                         )
-                        nheads_in_l2 = min(nheads_in_l2, params.num_head)
+                        nheads_in_l2 = min(nheads_in_l2, self.num_head)
                     mh_in_l2 = nheads_in_l2 * num_m_blocks
                     section_idx = mh_block // mh_in_l2
                     l2_mod = mh_block - section_idx * mh_in_l2
                     nheads_in_this_section = (
                         nheads_in_l2
-                        if nheads_in_l2 * (section_idx + 1) <= params.num_head
-                        else params.num_head - section_idx * nheads_in_l2
+                        if nheads_in_l2 * (section_idx + 1) <= self.num_head
+                        else self.num_head - section_idx * nheads_in_l2
                     )
                     block = l2_mod // nheads_in_this_section
                     head_idx_residual = l2_mod - block * nheads_in_this_section
@@ -1119,47 +1113,30 @@ class VarlenSchedulerBase:
                     block = mh_block - head_split_idx * num_m_blocks
                     head_idx = head_split_idx // num_splits
                     split_idx = head_split_idx - head_idx * num_splits
-                if const_expr(params.lpt):
+                if const_expr(self.lpt):
                     block = num_m_blocks - 1 - block
             else:
                 head_split_idx = mh_block // num_m_blocks
                 block = mh_block - head_split_idx * num_m_blocks
-                if const_expr(params.is_split_kv):
+                if const_expr(self.is_split_kv):
                     head_idx = head_split_idx // num_splits
                     split_idx = head_split_idx - head_idx * num_splits
                 else:
                     head_idx = head_split_idx
 
-            if const_expr(cluster_shape_m > 1):
+            if const_expr(self.cluster_shape_m > 1):
                 bidx_in_cluster = cute.arch.block_in_cluster_idx()
-                block = block * cluster_shape_m + bidx_in_cluster[0]
+                block = block * self.cluster_shape_m + bidx_in_cluster[0]
 
         return block, head_idx, batch_idx, split_idx, num_splits, group_start_tile, is_valid
 
 
-class SingleTileVarlenScheduler(VarlenSchedulerBase):
+class SingleTileVarlenScheduler:
     @dataclass
     class Params(ParamsBase):
-        num_head: Int32
-        num_batch: Int32
         total_q: Int32
-        num_splits: Int32
-        max_kvblock_in_l2: Int32
-        tile_shape_mn: cutlass.Constexpr[Tuple[int, int]]
-        mCuSeqlensQ: Optional[cute.Tensor] = None
-        mSeqUsedQ: Optional[cute.Tensor] = None
-        qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1
-        lpt: cutlass.Constexpr[bool] = False
-        is_split_kv: cutlass.Constexpr[bool] = False
-        head_swizzle: cutlass.Constexpr[bool] = False
-        cluster_shape_m: cutlass.Constexpr[int] = 1
-        scheduling_mode: cutlass.Constexpr[SchedulingMode] = SchedulingMode.STATIC
-        num_splits_dynamic_ptr: Optional[cute.Tensor] = None
-        num_m_blocks_ptr: Optional[cute.Tensor] = None
-        virtual_batch_idx_ptr: Optional[cute.Tensor] = None
-        num_nheads_in_l2_ptr: Optional[cute.Tensor] = None
-        cu_total_m_blocks_ptr: Optional[cute.Tensor] = None
-        cu_total_splits_m_blocks_ptr: Optional[cute.Tensor] = None
+        scheduling_mode: cutlass.Constexpr[SchedulingMode]
+        decoder: VarlenDecoder
 
         @staticmethod
         @cute.jit
@@ -1173,15 +1150,6 @@ class SingleTileVarlenScheduler(VarlenSchedulerBase):
             assert scheduling_mode in (SchedulingMode.STATIC, SchedulingMode.CLC), (
                 f"Only STATIC and CLC are supported, got {scheduling_mode!r}"
             )
-            size_l2 = 50 * 1024 * 1024  # 50 MB for K & V
-            # if backward, this is qdo block size
-            kv_block_size = (
-                (args.headdim + args.headdim_v) * args.element_size * args.tile_shape_mn[1]
-            )
-            # if backward, add dqaccum block size to calculate swizzle
-            if args.head_swizzle:
-                kv_block_size += args.headdim * 4 * args.tile_shape_mn[1]
-            max_kvblock_in_l2 = size_l2 // kv_block_size
             assert args.mCuSeqlensQ is not None or args.mSeqUsedQ is not None, (
                 "At least one of mCuSeqlensQ or mSeqUsedQ must be provided"
             )
@@ -1191,27 +1159,19 @@ class SingleTileVarlenScheduler(VarlenSchedulerBase):
             assert scheduling_mode != SchedulingMode.CLC or args.cluster_shape_mn[0] == 1, (
                 "Varlen CLC currently requires cluster_shape_mn[0] == 1"
             )
-            return SingleTileVarlenScheduler.Params(
-                num_head=args.num_head,
-                num_batch=args.num_batch,
-                total_q=args.total_q,
-                num_splits=args.num_splits,
-                max_kvblock_in_l2=max_kvblock_in_l2,
-                tile_shape_mn=args.tile_shape_mn,
-                mCuSeqlensQ=args.mCuSeqlensQ,
-                mSeqUsedQ=args.mSeqUsedQ,
-                qhead_per_kvhead_packgqa=args.qhead_per_kvhead_packgqa,
-                lpt=args.lpt,
-                is_split_kv=args.is_split_kv,
+            decoder = VarlenDecoder.create(
+                args,
+                fold_splits_into_scan=False,
                 head_swizzle=args.head_swizzle,
                 cluster_shape_m=args.cluster_shape_mn[0],
                 scheduling_mode=scheduling_mode,
-                num_splits_dynamic_ptr=args.num_splits_dynamic_ptr,
-                num_m_blocks_ptr=args.num_m_blocks_ptr,
-                virtual_batch_idx_ptr=args.virtual_batch_idx_ptr,
-                num_nheads_in_l2_ptr=args.num_nheads_in_l2_ptr,
-                cu_total_m_blocks_ptr=args.cu_total_m_blocks_ptr,
-                cu_total_splits_m_blocks_ptr=args.cu_total_splits_m_blocks_ptr,
+                loc=loc,
+                ip=ip,
+            )
+            return SingleTileVarlenScheduler.Params(
+                total_q=args.total_q,
+                scheduling_mode=scheduling_mode,
+                decoder=decoder,
             )
 
     def __init__(
@@ -1260,7 +1220,7 @@ class SingleTileVarlenScheduler(VarlenSchedulerBase):
         if const_expr(params.scheduling_mode == SchedulingMode.CLC):
             block_idx = cute.arch.block_idx()
             split_idx = Int32(0)
-            if const_expr(params.is_split_kv):
+            if const_expr(params.decoder.is_split_kv):
                 split_idx = block_idx[1]
             return SingleTileVarlenScheduler(
                 params,
@@ -1281,35 +1241,29 @@ class SingleTileVarlenScheduler(VarlenSchedulerBase):
         loc=None,
         ip=None,
     ) -> Tuple[Int32, Int32, Int32]:
+        d = params.decoder
         total_blocks_max = (
-            params.total_q
-            + params.num_batch * (params.cluster_shape_m * params.tile_shape_mn[0] - 1)
-        ) // params.tile_shape_mn[0]
+            params.total_q + d.num_batch * (d.cluster_shape_m * d.tile_shape_mn[0] - 1)
+        ) // d.tile_shape_mn[0]
         # Round down to nearest multiple of cluster since odd excess is always padding.
-        total_blocks_max = total_blocks_max // params.cluster_shape_m * params.cluster_shape_m
-        return (total_blocks_max * params.num_head, params.num_splits, Int32(1))
-
-    @cute.jit
-    def _get_num_splits(self, lane: Int32, bidb_start: Int32) -> Int32:
-        return Int32(1)
+        total_blocks_max = total_blocks_max // d.cluster_shape_m * d.cluster_shape_m
+        return (total_blocks_max * d.num_head, d.num_splits, Int32(1))
 
     @cute.jit
     def _decode_work_tile(self) -> WorkTileInfo:
         """Map self._tile_idx to (block, head, batch, split) via warp-level prefix sums."""
-        params = self.params
-        next_tile_idx = self._tile_idx // params.cluster_shape_m
-        block, head_idx, batch_idx, _, _, _, is_valid = self._varlen_coord_map(
-            next_tile_idx, Int32(0), Int32(0)
-        )
+        d = self.params.decoder
+        next_tile_idx = self._tile_idx // d.cluster_shape_m
+        block, head_idx, batch_idx, _, _, _, is_valid = d.decode(next_tile_idx, Int32(0), Int32(0))
         is_valid = is_valid and self._is_first_block
-        split_idx = self._split_idx if const_expr(params.is_split_kv) else Int32(0)
-        if const_expr(params.virtual_batch_idx_ptr is not None):
+        split_idx = self._split_idx if const_expr(d.is_split_kv) else Int32(0)
+        if const_expr(d.virtual_batch_idx_ptr is not None):
             if is_valid:
-                batch_idx = params.virtual_batch_idx_ptr[batch_idx]
+                batch_idx = d.virtual_batch_idx_ptr[batch_idx]
         # Pack dynamic per-batch num_splits into high 16 bits of split_idx
-        if const_expr(params.is_split_kv and params.num_splits_dynamic_ptr is not None):
+        if const_expr(d.is_split_kv and d.num_splits_dynamic_ptr is not None):
             if is_valid:
-                num_splits = Int32(params.num_splits_dynamic_ptr[batch_idx])
+                num_splits = Int32(d.num_splits_dynamic_ptr[batch_idx])
                 split_idx = split_idx | (num_splits << 16)
         return WorkTileInfo(
             (Int32(block), Int32(head_idx), Int32(batch_idx), Int32(split_idx)),
@@ -1328,7 +1282,7 @@ class SingleTileVarlenScheduler(VarlenSchedulerBase):
             new_split_idx = Int32(0)
             if clc_work.is_valid_tile:
                 new_tile_idx = clc_work.tile_idx[0]
-                if const_expr(self.params.is_split_kv):
+                if const_expr(self.params.decoder.is_split_kv):
                     new_split_idx = clc_work.tile_idx[1]
             self._tile_idx = new_tile_idx
             self._split_idx = new_split_idx
@@ -1343,7 +1297,7 @@ class SingleTileVarlenScheduler(VarlenSchedulerBase):
             new_split_idx = Int32(0)
             if clc_work.is_valid_tile:
                 new_tile_idx = clc_work.tile_idx[0]
-                if const_expr(self.params.is_split_kv):
+                if const_expr(self.params.decoder.is_split_kv):
                     new_split_idx = clc_work.tile_idx[1]
             self._tile_idx = new_tile_idx
             self._split_idx = new_split_idx
@@ -1388,26 +1342,11 @@ class SingleTileVarlenScheduler(VarlenSchedulerBase):
         return self.__class__(*obj_list, loc=self._loc)
 
 
-class DynamicPersistentVarlenScheduler(VarlenSchedulerBase):
+class DynamicPersistentVarlenScheduler:
     @dataclass
     class Params(ParamsBase):
-        num_head: Int32
-        num_batch: Int32
         total_q: Int32
-        num_splits: Int32
-        max_kvblock_in_l2: Int32
-        tile_shape_mn: cutlass.Constexpr[Tuple[int, int]]
-        mCuSeqlensQ: Optional[cute.Tensor] = None
-        mSeqUsedQ: Optional[cute.Tensor] = None
-        qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1
-        lpt: cutlass.Constexpr[bool] = False
-        is_split_kv: cutlass.Constexpr[bool] = False
-        num_splits_dynamic_ptr: Optional[cute.Tensor] = None
-        num_m_blocks_ptr: Optional[cute.Tensor] = None
-        virtual_batch_idx_ptr: Optional[cute.Tensor] = None
-        num_nheads_in_l2_ptr: Optional[cute.Tensor] = None
-        cu_total_m_blocks_ptr: Optional[cute.Tensor] = None
-        cu_total_splits_m_blocks_ptr: Optional[cute.Tensor] = None
+        decoder: VarlenDecoder
         tile_count_semaphore: Optional[cute.Pointer] = None
         persistent_cta_multiplier: cutlass.Constexpr[int] = 1
 
@@ -1416,31 +1355,19 @@ class DynamicPersistentVarlenScheduler(VarlenSchedulerBase):
         def create(
             args: TileSchedulerArguments, *, loc=None, ip=None
         ) -> "DynamicPersistentVarlenScheduler.Params":
-            size_l2 = 50 * 1024 * 1024  # 50 MB for K & V
-            max_kvblock_in_l2 = size_l2 // (
-                (args.headdim + args.headdim_v) * args.element_size * args.tile_shape_mn[1]
-            )
             assert args.mCuSeqlensQ is not None or args.mSeqUsedQ is not None, (
                 "At least one of mCuSeqlensQ or mSeqUsedQ must be provided"
             )
+            decoder = VarlenDecoder.create(
+                args,
+                fold_splits_into_scan=True,
+                scheduling_mode=SchedulingMode.DYNAMIC,
+                loc=loc,
+                ip=ip,
+            )
             return DynamicPersistentVarlenScheduler.Params(
-                num_head=args.num_head,
-                num_batch=args.num_batch,
                 total_q=args.total_q,
-                num_splits=args.num_splits,
-                max_kvblock_in_l2=max_kvblock_in_l2,
-                tile_shape_mn=args.tile_shape_mn,
-                mCuSeqlensQ=args.mCuSeqlensQ,
-                mSeqUsedQ=args.mSeqUsedQ,
-                qhead_per_kvhead_packgqa=args.qhead_per_kvhead_packgqa,
-                lpt=args.lpt,
-                is_split_kv=args.is_split_kv,
-                num_splits_dynamic_ptr=args.num_splits_dynamic_ptr,
-                num_m_blocks_ptr=args.num_m_blocks_ptr,
-                virtual_batch_idx_ptr=args.virtual_batch_idx_ptr,
-                num_nheads_in_l2_ptr=args.num_nheads_in_l2_ptr,
-                cu_total_m_blocks_ptr=args.cu_total_m_blocks_ptr,
-                cu_total_splits_m_blocks_ptr=args.cu_total_splits_m_blocks_ptr,
+                decoder=decoder,
                 tile_count_semaphore=args.tile_count_semaphore,
                 persistent_cta_multiplier=args.persistent_cta_multiplier,
             )
@@ -1494,32 +1421,16 @@ class DynamicPersistentVarlenScheduler(VarlenSchedulerBase):
         loc=None,
         ip=None,
     ) -> Tuple[Int32, Int32, Int32]:
+        d = params.decoder
         total_blocks_max = (
-            params.total_q + params.num_batch * (params.tile_shape_mn[0] - 1)
-        ) // params.tile_shape_mn[0]
-        total_blocks = total_blocks_max * params.num_head * params.num_splits
+            params.total_q + d.num_batch * (d.tile_shape_mn[0] - 1)
+        ) // d.tile_shape_mn[0]
+        total_blocks = total_blocks_max * d.num_head * d.num_splits
         hardware_info = HardwareInfo()
         sm_count = (
             hardware_info.get_device_multiprocessor_count() * params.persistent_cta_multiplier
         )
         return (cutlass.min(sm_count, total_blocks), Int32(1), Int32(1))
-
-    @cute.jit
-    def _get_num_splits(self, lane: Int32, bidb_start: Int32) -> Int32:
-        params = self.params
-        batch_idx = lane + bidb_start
-        is_valid = batch_idx < params.num_batch and lane < cute.arch.WARP_SIZE - 1
-        if cutlass.const_expr(not params.is_split_kv):
-            return Int32(1)
-        elif cutlass.const_expr(params.num_splits_dynamic_ptr is not None):
-            num_splits = Int32(0)
-            if is_valid:
-                if cutlass.const_expr(params.virtual_batch_idx_ptr is not None):
-                    batch_idx = params.virtual_batch_idx_ptr[batch_idx]
-                num_splits = params.num_splits_dynamic_ptr[batch_idx]
-            return num_splits
-        else:
-            return Int32(0) if not is_valid else params.num_splits
 
     @cute.jit
     def get_current_work(
@@ -1531,16 +1442,16 @@ class DynamicPersistentVarlenScheduler(VarlenSchedulerBase):
         loc=None,
         ip=None,
     ) -> WorkTileInfo:
-        params = self.params
-        block, head_idx, batch_idx, split_idx, num_splits, group_start_tile, is_valid = (
-            self._varlen_coord_map(next_tile_idx, bidb_start, group_start_tile)
+        d = self.params.decoder
+        block, head_idx, batch_idx, split_idx, num_splits, group_start_tile, is_valid = d.decode(
+            next_tile_idx, bidb_start, group_start_tile
         )
-        if const_expr(params.is_split_kv and params.num_splits_dynamic_ptr is not None):
+        if const_expr(d.is_split_kv and d.num_splits_dynamic_ptr is not None):
             if is_valid:
                 split_idx = split_idx | (num_splits << 16)
-        if const_expr(params.virtual_batch_idx_ptr is not None):
+        if const_expr(d.virtual_batch_idx_ptr is not None):
             if is_valid:
-                batch_idx = params.virtual_batch_idx_ptr[batch_idx]
+                batch_idx = d.virtual_batch_idx_ptr[batch_idx]
         return (
             WorkTileInfo(
                 (Int32(block), Int32(head_idx), Int32(batch_idx), Int32(split_idx)),
@@ -1581,7 +1492,7 @@ class DynamicPersistentVarlenScheduler(VarlenSchedulerBase):
         head_idx = ctx._work_info[1]
         batch_idx = ctx._work_info[2]
         split_idx = ctx._work_info[3]
-        is_valid = batch_idx < self.params.num_batch
+        is_valid = batch_idx < self.params.decoder.num_batch
         work_info = WorkTileInfo((block, head_idx, batch_idx, split_idx), is_valid)
         ctx.consumer_release()
         return work_info
