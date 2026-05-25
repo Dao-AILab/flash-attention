@@ -22,6 +22,11 @@ class SchedulerMetadataTensorsTorch(NamedTuple):
     num_nheads_in_l2_ptr: Optional[torch.Tensor]
     # tensor of shape (1)
     tile_count_semaphore: Optional[torch.Tensor]
+    # tensors of shape (batch + 1)
+    # cu_total_m_blocks[b+1] = sum_{i<=b} num_m_blocks[i]
+    # cu_total_splits_m_blocks[b+1] = sum_{i<=b} num_m_blocks[i] * num_splits_dynamic[i]
+    cu_total_m_blocks_ptr: Optional[torch.Tensor] = None
+    cu_total_splits_m_blocks_ptr: Optional[torch.Tensor] = None
 
 
 class FlashPrepareScheduler:

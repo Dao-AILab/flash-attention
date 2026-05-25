@@ -176,6 +176,7 @@ def build_ctx(
         max_seqlen_k=max(seqlens_k) if seqlens_k else 0,
         causal=True,
         num_splits=num_splits,
+        pack_gqa=args.pack_gqa,
     )
 
 
@@ -191,9 +192,18 @@ def _make_meta(ctx):
         tile_m=128,
         tile_n=128,
         causal=ctx["causal"],
+        pack_gqa=ctx["pack_gqa"],
         cu_seqlens_q=ctx["cu_q"],
         cu_seqlens_k=ctx["cu_k"],
     )
+
+
+def _make_meta_no_semaphore(ctx):
+    """Like _make_meta but with tile_count_semaphore nulled out, so the FA kernel
+    selects SingleTileVarlenScheduler (STATIC) instead of DynamicPersistentVarlen.
+    Exercises the binary-search hint path on the scheduler that lacks resumption."""
+    m = _make_meta(ctx)
+    return m._replace(tile_count_semaphore=None)
 
 
 def setup_dense(ctx):
@@ -211,16 +221,22 @@ def setup_dense(ctx):
     )
 
 
-def make_varlen_setup(*, clc: bool, prep: str):
-    """`prep` is one of 'none', 'precompute', 'recompute'."""
+def make_varlen_setup(*, clc: bool, prep: str, no_semaphore: bool = False):
+    """`prep` is one of 'none', 'precompute', 'recompute'.
+
+    `no_semaphore=True` nulls out `tile_count_semaphore` in the metadata so the
+    FA kernel picks SingleTileVarlenScheduler (STATIC) instead of the auto-
+    selected DynamicPersistentVarlenScheduler. Use this to exercise the binary-
+    search hint path on the no-resumption scheduler that PR #2520 targets."""
     assert prep in ("none", "precompute", "recompute")
+    meta_fn = _make_meta_no_semaphore if no_semaphore else _make_meta
 
     def setup(ctx):
-        meta_precomputed = _make_meta(ctx) if prep == "precompute" else None
+        meta_precomputed = meta_fn(ctx) if prep == "precompute" else None
 
         def fn():
             fa_utils._fa_clc_enabled = clc
-            meta = _make_meta(ctx) if prep == "recompute" else meta_precomputed
+            meta = meta_fn(ctx) if prep == "recompute" else meta_precomputed
             return flash_attn_varlen_func(
                 ctx["q_unpad"],
                 ctx["k_unpad"],
@@ -233,6 +249,7 @@ def make_varlen_setup(*, clc: bool, prep: str):
                 num_splits=ctx["num_splits"],
                 scheduler_metadata=meta,
                 disable_scheduler_metadata=(prep == "none"),
+                pack_gqa=ctx["pack_gqa"],
             )
 
         return fn
@@ -244,6 +261,7 @@ def make_varlen_setup(*, clc: bool, prep: str):
 MODES = [
     ("dense",        setup_dense),
     ("single-tile",  make_varlen_setup(clc=False, prep="none")),
+    ("st-prep",      make_varlen_setup(clc=False, prep="precompute", no_semaphore=True)),
     ("clc",          make_varlen_setup(clc=True,  prep="none")),
     ("clc-prep",     make_varlen_setup(clc=True,  prep="precompute")),
     ("dynamic-prep", make_varlen_setup(clc=False, prep="precompute")),
@@ -304,6 +322,9 @@ def parse_args():
     p.add_argument("--headdim", type=int, default=128)
     p.add_argument("--nheads", type=int, default=16)
     p.add_argument("--nheads-kv", type=int, default=2)
+    p.add_argument("--pack-gqa", action="store_true", default=True,
+                   help="Force pack_gqa=True (default). --no-pack-gqa to disable.")
+    p.add_argument("--no-pack-gqa", dest="pack_gqa", action="store_false")
     p.add_argument("--seeds", type=int, default=3)
     p.add_argument("--warmup", type=int, default=2)
     p.add_argument("--rep", type=int, default=20)
@@ -368,6 +389,7 @@ def main():
         ("mode", 14),
         ("mean_us", 10),
         ("tok/us", 9),
+        ("tflops", 8),
         ("rel_st", 7),
         ("rel_clc", 9),
     ]
@@ -397,6 +419,28 @@ def main():
             seed=0,
         )
         total_q = sum(ref_ctx["seqlens_q"])
+        # Causal varlen attention FLOPs per batch:
+        #   per (head, query q in [0, sq)): 4 * d * effective_k where
+        #   effective_k = max(0, sk - sq + q + 1).
+        #   sum_q effective_k = sq*sk - sq*(sq-1)/2  (for sk >= sq; otherwise clamped).
+        total_flops = 0
+        for sq, sk in zip(ref_ctx["seqlens_q"], ref_ctx["seqlens_k"]):
+            if sq == 0 or sk == 0:
+                continue
+            if ref_ctx["causal"]:
+                # sum_{q=0}^{sq-1} max(0, sk - sq + q + 1)
+                shift = sk - sq
+                if shift >= 0:
+                    eff = sq * sk - sq * (sq - 1) // 2
+                else:
+                    # clamp to non-negative for queries near 0
+                    first_visible_q = -shift  # smallest q with sk - sq + q + 1 > 0 is q = sq - sk
+                    visible = sq - first_visible_q
+                    eff = visible * sk - visible * (visible - 1) // 2
+                eff = max(0, eff)
+            else:
+                eff = sq * sk
+            total_flops += 4 * args.headdim * args.nheads * eff
 
         for cli, setup in selected_modes:
             samples = []
@@ -431,6 +475,7 @@ def main():
             if us is None:
                 continue
             tok_per_us = (total_q / us) if us > 0 else 0.0
+            tflops = (total_flops / (us * 1e6)) if us > 0 else 0.0
             rel_st = f"{single_tile_us / us:.3f}" if single_tile_us else "-"
             rel_cl = f"{clc_us / us:.3f}" if clc_us else "-"
             print(
@@ -444,6 +489,7 @@ def main():
                         cli,
                         f"{us:.2f}",
                         f"{tok_per_us:.2f}",
+                        f"{tflops:.2f}",
                         rel_st,
                         rel_cl,
                     ],

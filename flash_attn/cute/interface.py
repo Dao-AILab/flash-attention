@@ -717,13 +717,11 @@ def _flash_attn_fwd(
 
     has_scheduler_metadata = scheduler_metadata is not None and not disable_scheduler_metadata
     if has_scheduler_metadata:
-        (
-            num_m_blocks,
-            num_splits_dynamic,
-            virtual_batch_idx,
-            num_nheads_in_l2,
-            tile_count_semaphore,
-        ) = scheduler_metadata
+        num_m_blocks = scheduler_metadata.num_m_blocks_ptr
+        num_splits_dynamic = scheduler_metadata.num_splits_dynamic_ptr
+        virtual_batch_idx = scheduler_metadata.virtual_batch_idx_ptr
+        num_nheads_in_l2 = scheduler_metadata.num_nheads_in_l2_ptr
+        tile_count_semaphore = scheduler_metadata.tile_count_semaphore
         assert all(
             t is None or t.is_cuda
             for t in scheduler_metadata
@@ -739,12 +737,39 @@ def _flash_attn_fwd(
         ), "these scheduler metadata tensors must have shape (batch_size,)"
         if tile_count_semaphore is not None:
             assert tile_count_semaphore.shape == (1,), "semaphore must have size 1"
+        # The kernel's _get_num_m_blocks uses tile_shape_mn[0] = q_stage * tile_m,
+        # so cu_total must be built with that effective tile. Rebuild here rather
+        # than trust scheduler_metadata.cu_total_*_ptr (which were computed with
+        # the user's tile_m and would mis-decode the CLC-exhausted sentinel).
+        if (
+            num_m_blocks is not None
+            and num_splits_dynamic is not None
+            and os.environ.get("FLASH_ATTENTION_DISABLE_BINARY_SEARCH", "0") != "1"
+        ):
+            num_m_blocks_eff = (num_m_blocks + q_stage - 1) // q_stage
+            num_splits_m_blocks_eff = num_m_blocks_eff * num_splits_dynamic
+            if virtual_batch_idx is not None:
+                order = virtual_batch_idx.long()
+                stacked = torch.stack(
+                    [num_m_blocks_eff[order], num_splits_m_blocks_eff[order]], dim=0
+                )
+            else:
+                stacked = torch.stack([num_m_blocks_eff, num_splits_m_blocks_eff], dim=0)
+            cum = torch.cumsum(stacked, dim=1, dtype=torch.int32)
+            padded = torch.nn.functional.pad(cum, (1, 0))
+            cu_total_m_blocks = padded[0]
+            cu_total_splits_m_blocks = padded[1]
+        else:
+            cu_total_m_blocks = None
+            cu_total_splits_m_blocks = None
     else:
         num_m_blocks = None
         num_splits_dynamic = None
         virtual_batch_idx = None
         num_nheads_in_l2 = None
         tile_count_semaphore = None
+        cu_total_m_blocks = None
+        cu_total_splits_m_blocks = None
 
     is_static_persistent = (
         not causal
@@ -797,6 +822,8 @@ def _flash_attn_fwd(
         virtual_batch_idx is not None,
         num_nheads_in_l2 is not None,
         tile_count_semaphore is not None,
+        cu_total_m_blocks is not None,
+        cu_total_splits_m_blocks is not None,
         is_static_persistent,
         qv is not None,
         gather_kv_length,
@@ -888,6 +915,14 @@ def _flash_attn_fwd(
         num_nheads_in_l2_tensor = (
             to_cute_tensor(num_nheads_in_l2, assumed_align=4, leading_dim=0)
             if num_nheads_in_l2 is not None else None
+        )
+        cu_total_m_blocks_tensor = (
+            to_cute_tensor(cu_total_m_blocks, assumed_align=4, leading_dim=0)
+            if cu_total_m_blocks is not None else None
+        )
+        cu_total_splits_m_blocks_tensor = (
+            to_cute_tensor(cu_total_splits_m_blocks, assumed_align=4, leading_dim=0)
+            if cu_total_splits_m_blocks is not None else None
         )
 
         qv_tensor = to_cute_tensor(qv) if qv is not None else None
@@ -1090,6 +1125,8 @@ def _flash_attn_fwd(
                 compile_args.extend([
                     virtual_batch_idx_tensor,
                     num_nheads_in_l2_tensor,
+                    cu_total_m_blocks_tensor,
+                    cu_total_splits_m_blocks_tensor,
                     max_seqlen_q,
                 ])
             compile_args.append(current_stream)
@@ -1172,6 +1209,8 @@ def _flash_attn_fwd(
                 call_args.extend([
                     virtual_batch_idx,
                     num_nheads_in_l2,
+                    cu_total_m_blocks,
+                    cu_total_splits_m_blocks,
                     max_seqlen_q,
                 ])
             _flash_attn_fwd.compile_cache[compile_key](*call_args)
@@ -2811,6 +2850,8 @@ def get_scheduler_metadata(
             virtual_batch_idx_ptr=virtual_batch_idx,
             num_nheads_in_l2_ptr=num_nheads_in_l2,
             tile_count_semaphore=tile_count_semaphore,
+            cu_total_m_blocks_ptr=None,
+            cu_total_splits_m_blocks_ptr=None,
         )
 
 

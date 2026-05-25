@@ -265,6 +265,8 @@ class TileSchedulerArguments(ParamsBase):
     num_m_blocks_ptr: Optional[cute.Tensor] = None
     virtual_batch_idx_ptr: Optional[cute.Tensor] = None
     num_nheads_in_l2_ptr: Optional[cute.Tensor] = None
+    cu_total_m_blocks_ptr: Optional[cute.Tensor] = None
+    cu_total_splits_m_blocks_ptr: Optional[cute.Tensor] = None
     tile_count_semaphore: Optional[cute.Pointer] = None
     persistent_cta_multiplier: cutlass.Constexpr[int] = 1
 
@@ -993,11 +995,33 @@ class VarlenSchedulerBase:
         cluster_shape_m = getattr(params, "cluster_shape_m", 1)
         num_nheads_in_l2_ptr = getattr(params, "num_nheads_in_l2_ptr", None)
         virtual_batch_idx_ptr = getattr(params, "virtual_batch_idx_ptr", None)
+        cu_total_m_blocks_ptr = getattr(params, "cu_total_m_blocks_ptr", None)
+        cu_total_splits_m_blocks_ptr = getattr(params, "cu_total_splits_m_blocks_ptr", None)
+        scheduling_mode = getattr(params, "scheduling_mode", None)
+        if const_expr(params.is_split_kv):
+            cu_hint_ptr = cu_total_splits_m_blocks_ptr
+        else:
+            cu_hint_ptr = cu_total_m_blocks_ptr
+        # Both SingleTileVarlen STATIC and CLC; not DynamicPersistent (where
+        # warp-scan's _bidb_start resumption already amortizes per-call cost).
+        use_cumsum_hint = const_expr(
+            cluster_shape_m == 1
+            and cu_hint_ptr is not None
+            and (scheduling_mode == SchedulingMode.STATIC or scheduling_mode == SchedulingMode.CLC)
+        )
+        if const_expr(use_cumsum_hint):
+            target = next_tile_idx // params.num_head
+            lo = utils.get_batch_from_cu_tensor(target, cu_hint_ptr)
+            group_size = Int32(cute.arch.WARP_SIZE - 1)
+            bidb_start = (lo // group_size) * group_size
+            group_start_tile = cu_hint_ptr[bidb_start] * params.num_head
 
         lane_idx = cute.arch.lane_idx()
         num_m_blocks = self._get_num_m_blocks(lane_idx, bidb_start=bidb_start)
         num_splits = self._get_num_splits(lane_idx, bidb_start=bidb_start)
-        per_batch = num_m_blocks * num_splits if const_expr(params.is_split_kv) else num_m_blocks
+        per_batch = (
+            num_m_blocks * num_splits if const_expr(params.is_split_kv) else num_m_blocks
+        )
         cumulative = utils.warp_prefix_sum(per_batch, lane_idx)
         m_blocks_in_group = cute.arch.shuffle_sync(cumulative, cute.arch.WARP_SIZE - 1)
         group_end_tile = m_blocks_in_group * params.num_head + group_start_tile
@@ -1012,14 +1036,15 @@ class VarlenSchedulerBase:
                 num_m_blocks = self._get_num_m_blocks(lane_idx, bidb_start=batch_idx)
                 num_splits = self._get_num_splits(lane_idx, bidb_start=batch_idx)
                 per_batch = (
-                    num_m_blocks * num_splits if const_expr(params.is_split_kv) else num_m_blocks
+                    num_m_blocks * num_splits
+                    if const_expr(params.is_split_kv)
+                    else num_m_blocks
                 )
                 cumulative = utils.warp_prefix_sum(per_batch, lane_idx)
                 m_blocks_in_group = cute.arch.shuffle_sync(cumulative, cute.arch.WARP_SIZE - 1)
                 group_end_tile += m_blocks_in_group * params.num_head
 
         is_valid = batch_idx < params.num_batch
-        block, head_idx, split_idx = Int32(0), Int32(0), Int32(0)
         if is_valid:
             group_start_tile = group_end_tile - m_blocks_in_group * params.num_head
             batch_idx_in_group = cute.arch.popc(
@@ -1037,6 +1062,9 @@ class VarlenSchedulerBase:
             num_m_blocks = cute.arch.shuffle_sync(num_m_blocks, batch_idx_in_group)
             if const_expr(params.is_split_kv):
                 num_splits = cute.arch.shuffle_sync(num_splits, batch_idx_in_group)
+
+        block, head_idx, split_idx = Int32(0), Int32(0), Int32(0)
+        if is_valid:
             mh_block = next_tile_idx - group_start_tile
 
             if const_expr(params.lpt or head_swizzle):
@@ -1046,7 +1074,9 @@ class VarlenSchedulerBase:
                 if const_expr(not params.is_split_kv) or num_splits == 1:
                     if const_expr(num_nheads_in_l2_ptr is not None):
                         if const_expr(virtual_batch_idx_ptr is not None):
-                            nheads_in_l2 = Int32(num_nheads_in_l2_ptr[virtual_batch_idx_ptr[batch_idx]])
+                            nheads_in_l2 = Int32(
+                                num_nheads_in_l2_ptr[virtual_batch_idx_ptr[batch_idx]]
+                            )
                         else:
                             nheads_in_l2 = Int32(num_nheads_in_l2_ptr[batch_idx])
                     else:
@@ -1128,6 +1158,8 @@ class SingleTileVarlenScheduler(VarlenSchedulerBase):
         num_m_blocks_ptr: Optional[cute.Tensor] = None
         virtual_batch_idx_ptr: Optional[cute.Tensor] = None
         num_nheads_in_l2_ptr: Optional[cute.Tensor] = None
+        cu_total_m_blocks_ptr: Optional[cute.Tensor] = None
+        cu_total_splits_m_blocks_ptr: Optional[cute.Tensor] = None
 
         @staticmethod
         @cute.jit
@@ -1178,6 +1210,8 @@ class SingleTileVarlenScheduler(VarlenSchedulerBase):
                 num_m_blocks_ptr=args.num_m_blocks_ptr,
                 virtual_batch_idx_ptr=args.virtual_batch_idx_ptr,
                 num_nheads_in_l2_ptr=args.num_nheads_in_l2_ptr,
+                cu_total_m_blocks_ptr=args.cu_total_m_blocks_ptr,
+                cu_total_splits_m_blocks_ptr=args.cu_total_splits_m_blocks_ptr,
             )
 
     def __init__(
@@ -1372,6 +1406,8 @@ class DynamicPersistentVarlenScheduler(VarlenSchedulerBase):
         num_m_blocks_ptr: Optional[cute.Tensor] = None
         virtual_batch_idx_ptr: Optional[cute.Tensor] = None
         num_nheads_in_l2_ptr: Optional[cute.Tensor] = None
+        cu_total_m_blocks_ptr: Optional[cute.Tensor] = None
+        cu_total_splits_m_blocks_ptr: Optional[cute.Tensor] = None
         tile_count_semaphore: Optional[cute.Pointer] = None
         persistent_cta_multiplier: cutlass.Constexpr[int] = 1
 
@@ -1403,6 +1439,8 @@ class DynamicPersistentVarlenScheduler(VarlenSchedulerBase):
                 num_m_blocks_ptr=args.num_m_blocks_ptr,
                 virtual_batch_idx_ptr=args.virtual_batch_idx_ptr,
                 num_nheads_in_l2_ptr=args.num_nheads_in_l2_ptr,
+                cu_total_m_blocks_ptr=args.cu_total_m_blocks_ptr,
+                cu_total_splits_m_blocks_ptr=args.cu_total_splits_m_blocks_ptr,
                 tile_count_semaphore=args.tile_count_semaphore,
                 persistent_cta_multiplier=args.persistent_cta_multiplier,
             )
