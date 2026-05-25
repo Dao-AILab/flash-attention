@@ -192,6 +192,10 @@ class FlashAttentionForwardSm100:
         self.mask_vec_size: cutlass.Constexpr = getattr(mask_mod, "__vec_size__", 1)
         # Does S1 need to wait for S0 to finish
         # self.s0_s1_barrier = self.head_dim_padded in [64, 96] and (not self.is_causal and not self.is_local)
+        # NOTE: is_family_of also matches any future sm_10x with x > 3 — intentional.
+        # The flag gates ex2 emulation; sm_103 (B300) has fast hardware ex2 and later
+        # Blackwell variants are assumed to inherit this, so forward-inclusion is correct
+        # despite the literal `is_sm103` name.
         is_sm103 = self.arch.is_family_of(Arch.sm_103f)
         self.is_sm103 = is_sm103
         # enable_ex2_emu is derived: True if tuning config has freq > 0, else fallback to default logic
