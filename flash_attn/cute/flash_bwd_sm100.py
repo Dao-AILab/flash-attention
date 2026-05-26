@@ -1423,9 +1423,7 @@ class FlashAttentionBackwardSm100:
         )
         TileSchedulerCls = partial(self.tile_scheduler_cls.create, tile_sched_params)
 
-        AttentionMaskCls = self._generate_attention_mask_cls(
-            window_size_left, window_size_right
-        )
+        AttentionMaskCls = self._generate_attention_mask_cls(window_size_left, window_size_right)
         #  EMPTY
         # (15)
         if warp_idx == self.empty_warp_id:
