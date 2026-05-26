@@ -456,6 +456,14 @@ def _flash_attn_fwd(
     if is_fp8 and (q.requires_grad or k.requires_grad or v.requires_grad):
         raise NotImplementedError("FA4 CuTe FP8 backward is not supported yet (forward-only).")
     is_fp4 = hasattr(torch, "float4_e2m1fn_x2") and q.dtype == torch.float4_e2m1fn_x2
+    # Packed FP4 (float4_e2m1fn_x2) stores 2 FP4 per byte, so torch's last dim is d//2.
+    # Pass the logical (b, s, h, d) shape so the kernel builds the tensor via make_ptr
+    # with the correct FP4 element count + strides (to_cute_tensor's uint8 view keeps
+    # d//2 and scrambles the scale-factor reshape).
+    _q_ptr_shape, _k_ptr_shape = (), ()
+    if is_fp4:
+        _q_ptr_shape = tuple(int(s) for s in (*q.shape[:-1], q.shape[-1] * 2))
+        _k_ptr_shape = tuple(int(s) for s in (*k.shape[:-1], k.shape[-1] * 2))
     out_torch_dtype = torch.bfloat16 if (is_fp8 or is_fp4 or mSFQ is not None) else q.dtype
     device = q.device
     q_batch_seqlen_shape = (batch_size, seqlen_q) if cu_seqlens_q is None else (total_q,)
@@ -757,6 +765,9 @@ def _flash_attn_fwd(
         fa_logging.get_fa_log_level(),
         mSFQ is not None,
         _sf_vec_size if mSFQ is not None else None,
+        # q/k_ptr_shape are baked into the compiled FP4 kernel, so they must key the cache.
+        _q_ptr_shape,
+        _k_ptr_shape,
     )
 
     if compile_key not in _flash_attn_fwd.compile_cache:
@@ -777,9 +788,17 @@ def _flash_attn_fwd(
             if page_table is not None
             else None
         )
-        q_tensor, k_tensor, v_tensor, o_tensor = [
-            to_cute_tensor(t) for t in (q, k, v, out if not is_split_kv else out_partial)
-        ]
+        if is_fp4:
+            from cutlass.cute.runtime import make_ptr as _make_ptr
+            q_tensor = _make_ptr(cutlass.Float4E2M1FN, q.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
+            k_tensor = _make_ptr(cutlass.Float4E2M1FN, k.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
+            v_tensor, o_tensor = [
+                to_cute_tensor(t) for t in (v, out if not is_split_kv else out_partial)
+            ]
+        else:
+            q_tensor, k_tensor, v_tensor, o_tensor = [
+                to_cute_tensor(t) for t in (q, k, v, out if not is_split_kv else out_partial)
+            ]
         if is_split_kv:
             lse_tensor = to_cute_tensor(lse_partial, assumed_align=4)
         elif lse is not None:
@@ -1029,6 +1048,7 @@ def _flash_attn_fwd(
             ])
             if arch // 10 in [10, 11]:
                 compile_args.extend([mSFQ_tensor, mSFK_tensor, mSFV_tensor])
+            compile_args.extend([_q_ptr_shape, _k_ptr_shape])
             compile_args.append(current_stream)
             _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
                 *compile_args, options="--enable-tvm-ffi"
@@ -1041,12 +1061,16 @@ def _flash_attn_fwd(
             # need uint8 workaround until we pin torch >= 2.11.0 where fp8 export is supported
             q_call = q_call.view(torch.uint8)
             k_call = k_call.view(torch.uint8)
-            v_call = v_call.view(torch.uint8)
             if qv_call is not None:
                 qv_call = qv_call.view(torch.uint8)
         if is_fp4:
-            q_call = q_call.view(torch.uint8)
-            k_call = k_call.view(torch.uint8)
+            from cutlass.cute.runtime import make_ptr as _make_ptr_rt
+            q_call = _make_ptr_rt(cutlass.Float4E2M1FN, q_call.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
+            k_call = _make_ptr_rt(cutlass.Float4E2M1FN, k_call.data_ptr(), cute.AddressSpace.gmem, assumed_align=16)
+        # V may be FP8 even when Q/K are FP4 (NVFP4 QK + FP8 PV); apply the uint8
+        # export workaround based on V's own dtype.
+        if v_call.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            v_call = v_call.view(torch.uint8)
         descale_tensors = (
             DescaleTensors(q_descale=q_descale, k_descale=k_descale, v_descale=v_descale)
             if q_descale is not None or k_descale is not None or v_descale is not None
@@ -1106,6 +1130,7 @@ def _flash_attn_fwd(
             ])
             if arch // 10 in [10, 11]:
                 call_args.extend([mSFQ, mSFK, mSFV])
+            call_args.extend([_q_ptr_shape, _k_ptr_shape])
             _flash_attn_fwd.compile_cache[compile_key](*call_args)
     if is_split_kv:
         _flash_attn_fwd_combine(
