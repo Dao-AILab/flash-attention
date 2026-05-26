@@ -468,6 +468,11 @@ class FlashAttentionForwardSm100:
         self.k_dtype = mK.element_type
         self.v_dtype = mV.element_type
         self.o_dtype = mO.element_type
+        # The split-P-arrive optimization (signal the PV MMA partway through the P
+        # store) races with the FP8 P store in the block-scaled path, producing NaN
+        # in scattered rows once there are many work tiles. Disable it for FP8 PV.
+        if const_expr(self.block_scaled_qk and self.v_dtype.width == 8):
+            self.split_P_arrive = 0
         mQ, mK, mV, mO = [assume_tensor_aligned(t) for t in (mQ, mK, mV, mO)]
         Q_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
         mQ = cute.make_tensor(mQ.iterator, cute.select(mQ.layout, mode=Q_layout_transpose))
