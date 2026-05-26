@@ -181,6 +181,13 @@ def build_ctx(
 
 
 def _make_meta(ctx):
+    tile_m = 128
+    qhead_per_kvhead = ctx["nheads"] // ctx["nheads_kv"]
+    arch = torch.cuda.get_device_capability()[0]
+    if arch == 10 and ctx["max_seqlen_q"] * qhead_per_kvhead > tile_m:
+        q_stage = 2
+    else:
+        q_stage = 1
     return get_scheduler_metadata(
         num_batch=ctx["batch"],
         max_seqlen_q=ctx["max_seqlen_q"],
@@ -189,12 +196,13 @@ def _make_meta(ctx):
         nheads_kv=ctx["nheads_kv"],
         headdim=ctx["headdim"],
         num_splits=ctx["num_splits"],
-        tile_m=128,
+        tile_m=tile_m,
         tile_n=128,
         causal=ctx["causal"],
         pack_gqa=ctx["pack_gqa"],
         cu_seqlens_q=ctx["cu_q"],
         cu_seqlens_k=ctx["cu_k"],
+        q_stage=q_stage,
     )
 
 
@@ -322,8 +330,12 @@ def parse_args():
     p.add_argument("--headdim", type=int, default=128)
     p.add_argument("--nheads", type=int, default=16)
     p.add_argument("--nheads-kv", type=int, default=2)
-    p.add_argument("--pack-gqa", action="store_true", default=True,
-                   help="Force pack_gqa=True (default). --no-pack-gqa to disable.")
+    p.add_argument(
+        "--pack-gqa",
+        action="store_true",
+        default=True,
+        help="Force pack_gqa=True (default). --no-pack-gqa to disable.",
+    )
     p.add_argument("--no-pack-gqa", dest="pack_gqa", action="store_false")
     p.add_argument("--seeds", type=int, default=3)
     p.add_argument("--warmup", type=int, default=2)
@@ -434,7 +446,9 @@ def main():
                     eff = sq * sk - sq * (sq - 1) // 2
                 else:
                     # clamp to non-negative for queries near 0
-                    first_visible_q = -shift  # smallest q with sk - sq + q + 1 > 0 is q = sq - sk
+                    first_visible_q = (
+                        -shift
+                    )  # smallest q with sk - sq + q + 1 > 0 is q = sq - sk
                     visible = sq - first_visible_q
                     eff = visible * sk - visible * (visible - 1) // 2
                 eff = max(0, eff)

@@ -994,6 +994,174 @@ def test_flash_attn_varlen_output(
             ).abs().max().item() + dv_atol
 
 
+@pytest.mark.parametrize(
+    "cumsum_mode", ["jit_cumsum", "metadata_cumsum_only", "metadata_full"]
+)
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("qhead_per_kvhead", [1, 4])
+@retry_on_oom
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_varlen_cumsum_metadata_paths(causal, cumsum_mode, qhead_per_kvhead):
+    """Exercise the cu_total_m_blocks fast paths end-to-end.
+
+    - "jit_cumsum": batch_size > 512 varlen, no scheduler_metadata. Triggers
+      the just-in-time host cumsum in _flash_attn_fwd and the hoisted Q/K
+      cumsum in _flash_attn_bwd.
+    - "metadata_cumsum_only": scheduler_metadata from get_scheduler_metadata
+      with num_splits=1 — skips the FlashPrepareScheduler kernel and returns
+      only cu_total_m_blocks. Fwd reads it from scheduler_metadata.
+    - "metadata_full": scheduler_metadata with num_splits>1 (SM100 only).
+      Runs the full prepare kernel and populates both cu_total tensors.
+    """
+    if cumsum_mode == "metadata_full" and (IS_SM90 or DISABLE_SPLIT):
+        pytest.skip("split-kv not yet implemented on SM90")
+    device = "cuda"
+    torch.manual_seed(0)
+    random.seed(0)
+
+    if cumsum_mode == "jit_cumsum":
+        batch_size = 600
+    else:
+        batch_size = 64
+    seqlen_q = seqlen_k = 64
+    nheads_kv = 4
+    nheads = nheads_kv * qhead_per_kvhead
+    d = dv = 128
+    dtype = torch.bfloat16
+    num_splits = 4 if cumsum_mode == "metadata_full" else 1
+
+    q_ref = torch.randn(
+        batch_size, seqlen_q, nheads, d, device=device, dtype=dtype
+    ).requires_grad_()
+    k_ref = torch.randn(
+        batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype
+    ).requires_grad_()
+    v_ref = torch.randn(
+        batch_size, seqlen_k, nheads_kv, dv, device=device, dtype=dtype
+    ).requires_grad_()
+    q, k, v = [x.detach().requires_grad_() for x in (q_ref, k_ref, v_ref)]
+
+    query_padding_mask = generate_random_padding_mask(
+        seqlen_q, batch_size, device, mode="third"
+    )
+    key_padding_mask = generate_random_padding_mask(
+        seqlen_k, batch_size, device, mode="third"
+    )
+    (
+        q_unpad,
+        k_unpad,
+        v_unpad,
+        _qv_unpad,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        _seqused_q,
+        _seqused_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        _q,
+        _k,
+        _v,
+        _qv,
+        output_pad_fn,
+        dq_pad_fn,
+        dk_pad_fn,
+    ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask, kvpacked=False)
+    q_unpad = q_unpad.detach().requires_grad_()
+    k_unpad = k_unpad.detach().requires_grad_()
+    v_unpad = v_unpad.detach().requires_grad_()
+
+    scheduler_metadata = None
+    if cumsum_mode != "jit_cumsum":
+        scheduler_metadata = get_scheduler_metadata(
+            num_batch=batch_size,
+            max_seqlen_q=max_seqlen_q,
+            max_seqlen_k=max_seqlen_k,
+            nheads=nheads,
+            nheads_kv=nheads_kv,
+            headdim=d,
+            headdim_v=dv,
+            num_splits=num_splits,
+            tile_m=128,
+            tile_n=128,
+            causal=causal,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+        )
+        if is_fake_mode():
+            return
+        assert scheduler_metadata.cu_total_m_blocks is not None
+        if cumsum_mode == "metadata_cumsum_only" and not causal:
+            # FlashPrepareScheduler is skipped only when num_splits == 1 and not causal and not sort.
+            assert scheduler_metadata.num_m_blocks_ptr is None
+            assert scheduler_metadata.tile_count_semaphore is None
+        if cumsum_mode == "metadata_full":
+            assert scheduler_metadata.num_m_blocks_ptr is not None
+            assert scheduler_metadata.cu_total_splits_m_blocks is not None
+
+    out_ref, _ = attention_ref(
+        q_ref, k_ref, v_ref, query_padding_mask, key_padding_mask, causal=causal
+    )
+    out_pt, _ = attention_ref(
+        q_ref,
+        k_ref,
+        v_ref,
+        query_padding_mask,
+        key_padding_mask,
+        causal=causal,
+        upcast=False,
+        reorder_ops=True,
+    )
+
+    out_unpad, _ = flash_attn_varlen_func(
+        q_unpad,
+        k_unpad,
+        v_unpad,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        causal=causal,
+        scheduler_metadata=scheduler_metadata,
+        num_splits=num_splits,
+    )
+    if is_fake_mode():
+        return
+    out = output_pad_fn(out_unpad)
+
+    fwd_atol = 2 * (out_ref + 0.3 - 0.3 - out_ref).abs().max().item()
+    assert (out - out_ref).abs().max().item() <= 2 * (
+        out_pt - out_ref
+    ).abs().max().item() + fwd_atol
+
+    if cumsum_mode == "metadata_full":
+        return  # split-kv bwd not supported
+
+    g_unpad = torch.randn_like(out_unpad)
+    dq_unpad, dk_unpad, dv_unpad = torch.autograd.grad(
+        out_unpad, (q_unpad, k_unpad, v_unpad), g_unpad
+    )
+    dq = dq_pad_fn(dq_unpad)
+    dk = dk_pad_fn(dk_unpad)
+    dv = dk_pad_fn(dv_unpad)
+    dq.masked_fill_(rearrange(~query_padding_mask, "b s -> b s 1 1"), 0.0)
+    dk.masked_fill_(rearrange(~key_padding_mask, "b s -> b s 1 1"), 0.0)
+    dv.masked_fill_(rearrange(~key_padding_mask, "b s -> b s 1 1"), 0.0)
+
+    g = output_pad_fn(g_unpad)
+    dq_ref, dk_ref, dv_ref = torch.autograd.grad(out_ref, (q_ref, k_ref, v_ref), g)
+    dq_pt, dk_pt, dv_pt = torch.autograd.grad(out_pt, (q_ref, k_ref, v_ref), g)
+
+    for name, x, x_ref, x_pt in [
+        ("dq", dq, dq_ref, dq_pt),
+        ("dk", dk, dk_ref, dk_pt),
+        ("dv", dv, dv_ref, dv_pt),
+    ]:
+        atol = 2 * (x_ref + 0.3 - 0.3 - x_ref).abs().max().item()
+        assert (x - x_ref).abs().max().item() <= 2 * (
+            x_pt - x_ref
+        ).abs().max().item() + atol, name
+
+
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 # @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])

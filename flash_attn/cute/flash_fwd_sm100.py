@@ -398,8 +398,8 @@ class FlashAttentionForwardSm100:
         tile_count_semaphore: Optional[cute.Tensor] = None,
         virtual_batch_idx_ptr: Optional[cute.Tensor] = None,
         num_nheads_in_l2_ptr: Optional[cute.Tensor] = None,
-        cu_total_m_blocks_ptr: Optional[cute.Tensor] = None,
-        cu_total_splits_m_blocks_ptr: Optional[cute.Tensor] = None,
+        mCuTotalMBlocks: Optional[cute.Tensor] = None,
+        mCuTotalSplitsMBlocks: Optional[cute.Tensor] = None,
         max_seqlen_q: Int32 | int | None = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
@@ -688,8 +688,8 @@ class FlashAttentionForwardSm100:
             num_splits_dynamic_ptr=num_splits_dynamic_ptr,
             virtual_batch_idx_ptr=virtual_batch_idx_ptr,
             num_nheads_in_l2_ptr=num_nheads_in_l2_ptr,
-            cu_total_m_blocks_ptr=cu_total_m_blocks_ptr,
-            cu_total_splits_m_blocks_ptr=cu_total_splits_m_blocks_ptr,
+            cu_total_m_blocks_ptr=mCuTotalMBlocks,
+            cu_total_splits_m_blocks_ptr=mCuTotalSplitsMBlocks,
             tile_count_semaphore=tile_count_semaphore.iterator if tile_count_semaphore is not None else None,
         )
         tile_sched_params = TileScheduler.to_underlying_arguments(
