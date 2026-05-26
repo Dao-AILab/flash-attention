@@ -2012,12 +2012,9 @@ def test_flash_attn_invalid_head_dim(head_dim):
 @pytest.mark.parametrize("causal", [False, True])
 # @pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("d", [64])
-@pytest.mark.parametrize("nheads", [16, 128])
 @pytest.mark.parametrize("kv_sparsity", [False, True])
 # @pytest.mark.parametrize("kv_sparsity", [True])
-@pytest.mark.parametrize("gather_kv_length", [1024, 1024 + 128])
-# @pytest.mark.parametrize("has_qk", [False, True])
-@pytest.mark.parametrize("has_qk", [False])
+@pytest.mark.parametrize("shared_kv", [False, True])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -2053,7 +2050,6 @@ def test_flash_attn_mla_absorbed(
     seqlen_q,
     seqlen_k,
     d,
-    nheads,
     causal,
     local_enum,
     softcap,
@@ -2062,20 +2058,16 @@ def test_flash_attn_mla_absorbed(
     mha_type,
     dtype,
     kv_sparsity,
-    gather_kv_length,
-    has_qk,
+    shared_kv,
 ):
+    dv = 512
     if not IS_SM100:
         pytest.skip()
-    if kv_sparsity and seqlen_k < gather_kv_length:
-        seqlen_k += gather_kv_length
     local = local_enum > 0
     if local and causal:
         pytest.skip()
     if local:
         pytest.xfail("mla absorbed: local not supported yet")
-    if kv_sparsity and nheads != 128:
-        pytest.skip()
     device = "cuda"
     # set seed
     seed = 0
@@ -2084,31 +2076,30 @@ def test_flash_attn_mla_absorbed(
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
     batch_size = 9 if seqlen_k <= 2048 else 2
-    # batch_size = 2
-    # nheads = 128
-    nheads_kv = nheads if mha_type == "mha" else (8 if mha_type == "gqa" else 1)
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
-    dv_vals = [512]
-    # attention_chunk_vals = [torch.randint(1, seqlen_k * 2, (1,)).item(), 0]
-    attention_chunk_vals = [0]
-    for dv, attention_chunk in itertools.product(dv_vals, attention_chunk_vals):
-        q_ref = k_ref = None
-        if has_qk:
-            q_ref = torch.randn(
-                batch_size, seqlen_q, nheads, d, device=device, dtype=dtype_ref
+    nheads_vals = [128] if kv_sparsity else [16, 128]
+    gather_kv_lengths = [1024, 1024 + 128] if kv_sparsity else [0]
+    seqlen_k_og = seqlen_k
+    for nheads, gather_kv_length in itertools.product(nheads_vals, gather_kv_lengths):
+        nheads_kv = nheads if mha_type == "mha" else (8 if mha_type == "gqa" else 1)
+        print(f"{batch_size=}, {nheads=}, {nheads_kv=}, {gather_kv_length=}")
+        if kv_sparsity and seqlen_k < gather_kv_length:
+            seqlen_k = seqlen_k_og + gather_kv_length
+        q_ref = torch.randn(
+            batch_size, seqlen_q, nheads, d, device=device, dtype=dtype_ref
+        )
+        if softcap > 0.0:
+            # Ensure the values of qk are at least within softcap range.
+            q_ref = q_ref * softcap / 4
+        q_ref = q_ref.to(dtype).to(dtype_ref).requires_grad_()
+        k_ref = (
+            torch.randn(
+                batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype_ref
             )
-            if softcap > 0.0:
-                # Ensure the values of qk are at least within softcap range.
-                q_ref = q_ref * softcap / 4
-            q_ref = q_ref.to(dtype).to(dtype_ref).requires_grad_()
-            k_ref = (
-                torch.randn(
-                    batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype_ref
-                )
-                .to(dtype)
-                .to(dtype_ref)
-                .requires_grad_()
-            )
+            .to(dtype)
+            .to(dtype_ref)
+            .requires_grad_()
+        )
         v_ref = (
             torch.randn(
                 batch_size, seqlen_k, nheads_kv, dv, device=device, dtype=dtype_ref
@@ -2156,19 +2147,19 @@ def test_flash_attn_mla_absorbed(
             if x is not None else None
             for x in (q_ref, k_ref, v_ref, qv_ref)
         ]
+        if shared_kv:
+            q, k, qv = qv, v, None
+            q_ref, k_ref, qv_ref = qv_ref, v_ref, None
         out_ref, attn_ref = attention_ref(
             q_ref,
             k_ref,
             v_ref,
-            None,
-            None,
             causal=causal,
             qv=qv_ref,
             q_descale=q_descale,
             k_descale=k_descale,
             v_descale=v_descale,
             window_size=window_size,
-            attention_chunk=attention_chunk,
             learnable_sink=learnable_sink,
             softcap=softcap,
             gather_kv_indices=gather_kv_indices,
@@ -2177,15 +2168,12 @@ def test_flash_attn_mla_absorbed(
             q_ref,
             k_ref,
             v_ref,
-            None,
-            None,
             causal=causal,
             qv=qv_ref,
             q_descale=q_descale,
             k_descale=k_descale,
             v_descale=v_descale,
             window_size=window_size,
-            attention_chunk=attention_chunk,
             learnable_sink=learnable_sink,
             softcap=softcap,
             upcast=False,
@@ -2284,11 +2272,8 @@ def test_flash_attn_mla_absorbed(
 @pytest.mark.parametrize("add_unused_qkv", [False])
 @pytest.mark.parametrize("kv_sparsity", [False, True])
 # @pytest.mark.parametrize("kv_sparsity", [False])
-@pytest.mark.parametrize("gather_kv_length", [1024, 1024 + 128])
 @pytest.mark.parametrize("d", [64])
-@pytest.mark.parametrize("nheads", [16, 128])
-# @pytest.mark.parametrize("nheads", [128])
-@pytest.mark.parametrize("has_qk", [False, True])
+@pytest.mark.parametrize("shared_kv", [False, True])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -2339,7 +2324,6 @@ def test_flash_attn_mla_absorbed_varlen(
     seqlen_q,
     seqlen_k,
     d,
-    nheads,
     add_unused_qkv,
     causal,
     local_enum,
@@ -2354,40 +2338,35 @@ def test_flash_attn_mla_absorbed_varlen(
     unpad_q,
     unpad_kv,
     kv_sparsity,
-    gather_kv_length,
-    has_qk,
+    shared_kv,
 ):
-    has_qv = True
+    has_qv, dv = True, 512
     if not IS_SM100:
         pytest.skip()
-    if kv_sparsity and seqlen_k < gather_kv_length:
-        seqlen_k += gather_kv_length
     local = local_enum > 0
     if local and causal:
         pytest.skip()
     if has_qv and local:
         pytest.xfail("has_qv: local not supported yet")
-    if kv_sparsity and nheads != 128:
-        pytest.skip()
-    seqlen_q_og = seqlen_q
-    seqlen_k_og = seqlen_k
-    if (
-        causal or local
-    ):  # Right now reference only supports causal attention with seqlen_k == seqlen_q
-        seqlen_q = max(seqlen_q_og, seqlen_k_og)
-        seqlen_k = max(seqlen_q_og, seqlen_k_og)
     device = "cuda"
     # set seed
     seed = seqlen_q + seqlen_k + d + int(causal) * 2 + int(local)
     random.seed(seed)
     torch.random.manual_seed(seed)
     batch_size = 7 if seqlen_q <= 512 else 3
-    nheads_kv = nheads if mha_type == "mha" else (8 if mha_type == "gqa" else 1)
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
-    dv_vals = [512]
-    # attention_chunk_vals = [torch.randint(1, seqlen_k * 2, (1,)).item(), 0] if seqlen_q <= seqlen_k else [0]
-    attention_chunk_vals = [0]
-    for dv, attention_chunk in itertools.product(dv_vals, attention_chunk_vals):
+    nheads_vals = [128] if kv_sparsity else [16, 128]
+    gather_kv_lengths = [1024, 1024 + 128] if kv_sparsity else [0]
+    seqlen_q_og, seqlen_k_og = seqlen_q, seqlen_k
+    for nheads, gather_kv_length in itertools.product(nheads_vals, gather_kv_lengths):
+        nheads_kv = nheads if mha_type == "mha" else (8 if mha_type == "gqa" else 1)
+        print(f"{batch_size=}, {nheads=}, {nheads_kv=}, {gather_kv_length=}")
+        if kv_sparsity and seqlen_k < gather_kv_length:
+            seqlen_k = seqlen_k_og + gather_kv_length
+        # varlen reference is set up to require this
+        if causal or local:
+            seqlen_q = max(seqlen_q_og, seqlen_k)
+            seqlen_k = seqlen_q
         q_ref = torch.randn(
             batch_size, seqlen_q, nheads, d, device=device, dtype=dtype_ref
         )
@@ -2485,10 +2464,8 @@ def test_flash_attn_mla_absorbed_varlen(
         key_padding_mask, key_unused_mask = _gen_unused_masks(
             key_padding_mask, add_unused_qkv, seqlen_k, batch_size, k.device
         )
-
         if causal or local:
             key_padding_mask = query_padding_mask
-
         (
             q_unpad,
             k_unpad,
@@ -2537,11 +2514,13 @@ def test_flash_attn_mla_absorbed_varlen(
         q_unpad, k_unpad, v_unpad = [
             x.detach().to(dtype).requires_grad_() for x in (q_unpad, k_unpad, v_unpad)
         ]
-
-        if not has_qk:
-            q_ref = k_ref = None
-            q_unpad = k_unpad = None
-            q = k = None
+        if shared_kv:
+            q, q_unpad = qv, qv_unpad
+            k, k_unpad = v, v_unpad
+            qv = qv_unpad = None
+            q_ref = qv_ref
+            k_ref = v_ref
+            qv_ref = None
 
         out_ref, attn_ref = attention_ref(
             q_ref,
@@ -2555,7 +2534,6 @@ def test_flash_attn_mla_absorbed_varlen(
             k_descale=k_descale,
             v_descale=v_descale,
             window_size=window_size,
-            attention_chunk=attention_chunk,
             learnable_sink=learnable_sink,
             softcap=softcap,
             gather_kv_indices=gather_kv_indices,
@@ -2572,7 +2550,6 @@ def test_flash_attn_mla_absorbed_varlen(
             k_descale=k_descale,
             v_descale=v_descale,
             window_size=window_size,
-            attention_chunk=attention_chunk,
             learnable_sink=learnable_sink,
             softcap=softcap,
             upcast=False,

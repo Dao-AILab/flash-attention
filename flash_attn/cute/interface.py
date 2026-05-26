@@ -1961,8 +1961,8 @@ class FlashAttnFunc(torch.autograd.Function):
     @staticmethod
     def forward(
         ctx,
-        q: Optional[torch.Tensor],
-        k: Optional[torch.Tensor],
+        q: torch.Tensor,
+        k: torch.Tensor,
         v: torch.Tensor,
         qv: Optional[torch.Tensor] = None,
         gather_kv_indices: Optional[torch.Tensor] = None,
@@ -1982,6 +1982,13 @@ class FlashAttnFunc(torch.autograd.Function):
         block_sparse_tensors_bwd: Optional[BlockSparseTensorsTorch] = None,
         return_lse: bool = False,
     ):
+        shared_kv = k is v
+        if shared_kv and v.shape[-1] == 512:
+            # specialize MLA attention formula
+            # O = softmax(Q @ K.T + Qv @ V.T) @ V
+            # by setting q, k to None
+            qv = q if qv is None else qv
+            q = k = None
         out, lse = _flash_attn_fwd(
             q,
             k,
@@ -2079,6 +2086,13 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         aux_tensors: Optional[list] = None,
         return_lse: bool = False,
     ):
+        shared_kv = k is v
+        if shared_kv and v.shape[-1] == 512:
+            # specialize MLA attention formula
+            # O = softmax(Q @ K.T + Qv @ V.T) @ V
+            # by setting q, k to None
+            qv = q if qv is None else qv
+            q = k = None
         out, lse = _flash_attn_fwd(
             q,
             k,
@@ -2169,8 +2183,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
 
 
 def flash_attn_func(
-    q: Optional[torch.Tensor],
-    k: Optional[torch.Tensor],
+    q: torch.Tensor,
+    k: torch.Tensor,
     v: torch.Tensor,
     qv: Optional[torch.Tensor] = None,
     gather_kv_indices: Optional[torch.Tensor] = None,
@@ -2215,8 +2229,8 @@ def flash_attn_func(
 
 
 def flash_attn_varlen_func(
-    q: Optional[torch.Tensor],
-    k: Optional[torch.Tensor],
+    q: torch.Tensor,
+    k: torch.Tensor,
     v: torch.Tensor,
     qv: Optional[torch.Tensor] = None,
     cu_seqlens_q: Optional[torch.Tensor] = None,
@@ -2244,18 +2258,32 @@ def flash_attn_varlen_func(
     return_lse: bool = False,
 ):
     """
-    Explanation of some optional arguments:
+    Tensor arguments:
+        q:  (total_q, nheads,   hdim)   or (batch, seqlen_q, nheads,   hdim)
+        k:  (total_k, nheads_k, hdim)   or (batch, seqlen_k, nheads_k, hdim)
+        v:  (total_k, nheads_k, hdim_v) or (batch, seqlen_k, nheads_k, hdim_v)
+        qv: (total_q, nheads,   hdim_v) or (batch, seqlen_q, nheads,   hdim_v)
+        cu_seqlens_q: (batch + 1)       or seqused_q: (batch)
+        cu_seqlens_k: (batch + 1)       or seqused_k: (batch)
+        gather_kv_indices: (total_q, gather_kv_length) or
+                           (batch, seqlen_q, gather_kv_length)
+        page_table: (batch, max_num_pages_per_seq)
+    
+    Return:
+       out: (total_q, nheads, hdim) or (batch, seqlen_q, nheads, hdim)
+       lse: (nheads, total_q)       or (batch, nheads, seqlen_q) if not has_qv (standard)
+            (total_q, nheads)       or (batch, seqlen_q, nheads) if has_qv
+
+    Explanation of some optional arguments & decisions:
 
     qv: we write the MLA weight absorbed formula as
         O = softmax(scale * (Q @ K.T + Qv @ V.T)) @ V
         where Q = q_pe, Qv = q_nope, K = pe_cache, V = kv_cache.
 
-        Q and K are optional arguments; if None is passed, then
-        O = softmax(scale * (Qv @ V.T)) @ V
+    lse return shape: with Qv, MQA with nheads at least divisible by 4 is typical,
+        so we arrange for nheads as the contiguous mode for better vectorization.
 
-    gather_kv_indices: a tensor of shape (batch, seqlen_q, gather_kv_length) or
-        (total_q, gather_kv_length) if there is cu_seqlens_q.
-        Currently, only used for topk sparsity with MLA absorption kernel.
+    gather_kv_indices: used for topk sparsity with MLA absorption kernel.
 
     min_seqlen_k: for varlen, specifies the minimum kv sequence length for any batch.
         Used with gather_kv_indices to determine if we need oob masking.
