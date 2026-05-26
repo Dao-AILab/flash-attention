@@ -604,6 +604,58 @@ def create_nvfp4_attention_tensors(
     return q_fp4, k_fp4, v_tensor, q_sf, k_sf, None, q_ref, k_ref, v_ref
 
 
+def create_mxfp8_attention_tensors(
+    batch,
+    seqlen_q,
+    seqlen_k,
+    nheads,
+    nheads_kv,
+    headdim,
+    headdim_v,
+    device="cuda",
+    dtype_gen=torch.bfloat16,
+    pv_mode="bf16",
+    pv_fp8_dtype=None,
+):
+    """Create MXFP8 (FP8 E4M3 QK + E8M0 SF, sf_vec_size=32) tensors with torch-native
+    FP8 conversion and uniform SF=1.0.
+
+    Avoids cute.testing.convert (cute_tensor_like), which fails with
+    cudaErrorInsufficientDriver in this environment. Uniform SF=1.0 matches the
+    investigation precision table's MXFP8 approach (cos ~0.9985).
+    """
+    sf_vec_size = 32
+    tile_m = 128
+    q_ref = torch.randn(batch, seqlen_q, nheads, headdim, device=device, dtype=torch.float32)
+    k_ref = torch.randn(batch, seqlen_k, nheads_kv, headdim, device=device, dtype=torch.float32)
+    v_ref = torch.randn(batch, seqlen_k, nheads_kv, headdim_v, device=device, dtype=torch.float32)
+
+    def _to_fp8_and_sf(ref, batch_, seqlen_, nheads_, headdim_):
+        fp8 = ref.to(dtype_gen).to(torch.float8_e4m3fn)  # (b, s, h, d), E4M3
+        rest_m = seqlen_ // tile_m
+        sf_k = headdim_ // sf_vec_size
+        rest_k = sf_k // 4
+        total_m = batch_ * rest_m
+        total_k = (nheads_ * sf_k) // 4
+        # Uniform E8M0 SF = 1.0 (byte 0x7F=127), in the same BlockScaledBasicChunk
+        # reshape/permute as the NVFP4 path so the kernel's SF reshape reads it correctly.
+        sf = torch.full((total_m, total_k, 32, 4, 4), 127, device=device, dtype=torch.uint8)
+        sf = sf.reshape(batch_, rest_m, nheads_, rest_k, 32, 4, 4)
+        sf = sf.permute(0, 2, 1, 3, 4, 5, 6).contiguous().permute(4, 5, 2, 6, 3, 1, 0)
+        return fp8, sf
+
+    q_fp8, q_sf = _to_fp8_and_sf(q_ref, batch, seqlen_q, nheads, headdim)
+    k_fp8, k_sf = _to_fp8_and_sf(k_ref, batch, seqlen_k, nheads_kv, headdim)
+
+    if pv_mode == "fp8":
+        _fp8 = pv_fp8_dtype or cutlass.Float8E4M3FN
+        _torch_fp8 = torch.float8_e4m3fn if _fp8 == cutlass.Float8E4M3FN else torch.float8_e5m2
+        v_tensor = v_ref.to(dtype_gen).to(_torch_fp8)
+    else:
+        v_tensor = v_ref.to(dtype_gen)
+    return q_fp8, k_fp8, v_tensor, q_sf, k_sf, None, q_ref, k_ref, v_ref
+
+
 def time_fwd(func, *args, repeats=10, verbose=True, desc="", **kwargs):
     """Time forward pass via triton.testing.do_bench.
 
@@ -674,9 +726,12 @@ def main(
     print(f"QK sf_vec_size: {sf_vec_size}")
     print("=" * 80)
 
-    # Use nvfp4_quantize for NVFP4 (proper per-block SF, cos>=0.99).
-    # Fall back to cute_tensor_like for MXFP8 or FP4 PV (nvfp4_quantize only handles NVFP4).
+    # Torch-native tensor creation for NVFP4 (flashinfer nvfp4_quantize, per-block SF)
+    # and MXFP8 (torch FP8 + uniform E8M0 SF). Both avoid cute_tensor_like /
+    # cute.testing.convert, which fails with cudaErrorInsufficientDriver in this env.
+    # FP4 PV still uses cute_tensor_like (block-scaled V).
     use_nvfp4 = ab_dtype == cutlass.Float4E2M1FN and pv_mode != "fp4"
+    use_mxfp8 = ab_dtype == cutlass.Float8E4M3FN and pv_mode != "fp4"
 
     for i, (batch_size, seqlen, nheads, headdim) in enumerate(configs):
         nheads_kv = nheads
@@ -689,6 +744,22 @@ def main(
         if use_nvfp4:
             (q_fp4, k_fp4, v_tensor, q_sf, k_sf, v_sf, q_ref, k_ref, v_ref) = (
                 create_nvfp4_attention_tensors(
+                    batch_size,
+                    seqlen_q,
+                    seqlen,
+                    nheads,
+                    nheads_kv,
+                    headdim,
+                    headdim_v,
+                    device,
+                    dtype_gen,
+                    pv_mode=pv_mode,
+                    pv_fp8_dtype=pv_fp8_dtype,
+                )
+            )
+        elif use_mxfp8:
+            (q_fp4, k_fp4, v_tensor, q_sf, k_sf, v_sf, q_ref, k_ref, v_ref) = (
+                create_mxfp8_attention_tensors(
                     batch_size,
                     seqlen_q,
                     seqlen,
