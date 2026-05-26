@@ -1134,6 +1134,7 @@ def get_scheduler_metadata(
     pack_gqa=None,   # Can be tuned for speed
     sm_margin=0,     # Can be tuned if some SMs are used for communication
 ):
+    _check_hopper_device(cache_seqlens.device)
     cache_seqlens = maybe_contiguous(cache_seqlens)
     if headdim_v is None:
         headdim_v = headdim

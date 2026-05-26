@@ -61,3 +61,19 @@ def test_hopper_kvcache_guard_rejects_sm120(monkeypatch):
     q, k_cache, v_cache = _make_qkv()
     with pytest.raises(RuntimeError, match=r"only supports Hopper GPUs \(SM90\)\. Got SM120\."):
         hopper_interface.flash_attn_with_kvcache(q, k_cache, v_cache)
+
+
+def test_hopper_scheduler_metadata_guard_rejects_sm120(monkeypatch):
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: (12, 0))
+
+    cache_seqlens = _FakeTensor()
+    with pytest.raises(RuntimeError, match=r"only supports Hopper GPUs \(SM90\)\. Got SM120\."):
+        hopper_interface.get_scheduler_metadata(
+            batch_size=1,
+            max_seqlen_q=1,
+            max_seqlen_k=1,
+            num_heads_q=1,
+            num_heads_kv=1,
+            headdim=64,
+            cache_seqlens=cache_seqlens,
+        )
