@@ -160,6 +160,19 @@ class TestHashCallable:
         assert call_tracker["sha256"] == 0, "sha256 should not be called"
         assert result == "wrapped-fast-hash"
 
+    def test_vec_size_affects_hash(self):
+        def mask_mod(_b, _h, q_idx, kv_idx):
+            return q_idx >= kv_idx
+
+        base_hash = hash_callable(mask_mod, set_cute_hash=False)
+        mask_mod.__vec_size__ = 16
+        vec16_hash = hash_callable(mask_mod, set_cute_hash=False)
+        mask_mod.__vec_size__ = 32
+        vec32_hash = hash_callable(mask_mod, set_cute_hash=False)
+
+        assert base_hash != vec16_hash
+        assert vec16_hash != vec32_hash
+
     def test_closure_values_affect_hash(self):
         """Functions with different closure values should have different hashes."""
         value1 = 10

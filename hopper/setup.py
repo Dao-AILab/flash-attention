@@ -732,12 +732,12 @@ setup(
     else {
         "bdist_wheel": CachedWheelsCommand,
     },
-    python_requires=">=3.8",
+    python_requires=">=3.10",
     install_requires=[
         "torch",
         "einops",
         "packaging",
         "ninja",
     ],
-    options={"bdist_wheel": {"py_limited_api": "cp39"}},
+    options={"bdist_wheel": {"py_limited_api": "cp310"}},
 )
