@@ -1,13 +1,13 @@
 # A reimplementation of https://github.com/Dao-AILab/flash-attention/blob/main/hopper/flash_prepare_scheduler.cu
 # from CUTLASS C++ to Cute-DSL.
 
-from typing import Tuple, Optional, Callable, List, NamedTuple
+from typing import Tuple, Optional, NamedTuple
 import operator
 import torch
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
-from cutlass import Boolean, Int32, const_expr, Constexpr, Float32
+from cutlass import Int32, const_expr, Float32
 from cutlass.cute import FastDivmodDivisor
 import flash_attn.cute.utils as utils
 

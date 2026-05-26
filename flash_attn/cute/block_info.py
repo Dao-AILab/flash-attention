@@ -19,9 +19,9 @@ class BlockInfo:
     window_size_left: Optional[Int32] = None
     window_size_right: Optional[Int32] = None
     qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1
-    num_splits: Int32 = 1 
-    num_splits_dynamic_ptr: Optional[cute.Tensor] = None 
-    num_n_blocks_per_split: Optional[cutlass.Constexpr[Int32]] = None 
+    num_splits: Int32 = 1
+    num_splits_dynamic_ptr: Optional[cute.Tensor] = None
+    num_n_blocks_per_split: Optional[cutlass.Constexpr[Int32]] = None
 
     @cute.jit
     def get_n_block_min_max(

@@ -298,9 +298,7 @@ class SingleTileScheduler:
         else:
             split_idx = Int32(0)
         # Pack dynamic per-batch num_splits into high 16 bits of split_idx
-        if const_expr(
-            self.params.is_split_kv and self.params.num_splits_dynamic_ptr is not None
-        ):
+        if const_expr(self.params.is_split_kv and self.params.num_splits_dynamic_ptr is not None):
             if is_valid:
                 num_splits = Int32(self.params.num_splits_dynamic_ptr[batch_idx])
                 split_idx = split_idx | (num_splits << 16)
@@ -464,7 +462,7 @@ class SingleTileLPTScheduler:
         scheduling_mode: cutlass.Constexpr[SchedulingMode] = SchedulingMode.STATIC
         lpt: cutlass.Constexpr[bool] = True
         use_cluster_idx: cutlass.Constexpr[bool] = True
-        num_splits_dynamic_ptr: Optional[cute.Tensor] = None 
+        num_splits_dynamic_ptr: Optional[cute.Tensor] = None
 
         @staticmethod
         @cute.jit
@@ -611,9 +609,7 @@ class SingleTileLPTScheduler:
             bidx_in_cluster = cute.arch.block_in_cluster_idx()
             block_idx = block_idx * self.params.cluster_shape_m + bidx_in_cluster[0]
         # Pack dynamic per-batch num_splits into high 16 bits of split_idx
-        if const_expr(
-            self.params.is_split_kv and self.params.num_splits_dynamic_ptr is not None
-        ):
+        if const_expr(self.params.is_split_kv and self.params.num_splits_dynamic_ptr is not None):
             if work.is_valid_tile:
                 num_splits = Int32(self.params.num_splits_dynamic_ptr[batch_idx])
                 split_idx = split_idx | (num_splits << 16)
