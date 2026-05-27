@@ -166,7 +166,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mCuSeqlensK: Optional[cute.Tensor] = None,
         mSeqUsedQ: Optional[cute.Tensor] = None,
         mSeqUsedK: Optional[cute.Tensor] = None,
-        mTileCumsum: Optional[
+        mCuTotalMBlocks: Optional[
             cute.Tensor
         ] = None,  # int32, (num_batch + 1,); see TileSchedulerArguments
         mPageTable: Optional[cute.Tensor] = None,  # (b_k, max_num_pages_per_seq)
@@ -344,7 +344,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             element_size=self.dtype.width // 8,
             is_persistent=False,
             lpt=self.is_causal or self.is_local,
-            mTileCumsum=mTileCumsum,
+            mCuTotalMBlocks=mCuTotalMBlocks,
         )
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
         grid_dim = TileScheduler.get_grid_shape(tile_sched_params)

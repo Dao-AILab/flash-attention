@@ -164,11 +164,12 @@ class TileSchedulerArguments(ParamsBase):
     is_split_kv: cutlass.Constexpr[bool] = False
     head_swizzle: cutlass.Constexpr[bool] = False
     use_cluster_idx: cutlass.Constexpr[bool] = False
-    # Optional precomputed cumulative tile counts per batch, length num_batch + 1,
-    # int32, where mTileCumsum[b] = sum_{i<b} (num_m_blocks(i) * num_head). When
-    # provided, SingleTileVarlenScheduler binary-searches it to skip the per-CTA
-    # linear scan over batches; otherwise it falls back to the original O(N) scan.
-    mTileCumsum: Optional[cute.Tensor] = None
+    # Optional precomputed cumulative m_block counts per batch, length
+    # num_batch + 1, int32, where mCuTotalMBlocks[b] = sum_{i<b} num_m_blocks(i).
+    # When provided, SingleTileVarlenScheduler binary-searches it (via
+    # utils.get_batch_from_cu_tensor) to find batch_idx in O(log N) instead of
+    # the per-CTA O(N) warp scan. Matches the convention from #2224.
+    mCuTotalMBlocks: Optional[cute.Tensor] = None
 
 
 class SingleTileScheduler:
@@ -790,7 +791,7 @@ class SingleTileVarlenScheduler:
         head_swizzle: cutlass.Constexpr[bool] = False
         cluster_shape_m: cutlass.Constexpr[int] = 1
         scheduling_mode: cutlass.Constexpr[SchedulingMode] = SchedulingMode.STATIC
-        mTileCumsum: Optional[cute.Tensor] = None
+        mCuTotalMBlocks: Optional[cute.Tensor] = None
 
         @staticmethod
         @cute.jit
@@ -837,7 +838,7 @@ class SingleTileVarlenScheduler:
                 head_swizzle=args.head_swizzle,
                 cluster_shape_m=args.cluster_shape_mn[0],
                 scheduling_mode=scheduling_mode,
-                mTileCumsum=args.mTileCumsum,
+                mCuTotalMBlocks=args.mCuTotalMBlocks,
             )
 
     def __init__(
@@ -942,34 +943,30 @@ class SingleTileVarlenScheduler:
     def _varlen_coord_map(self) -> WorkTileInfo:
         """Map self._tile_idx to (block, head, batch).
 
-        When params.mTileCumsum is provided, binary-search it to land on the
-        right group of 31 batches in O(log num_batch); otherwise fall back to
-        the original linear scan from batch 0 (O(num_batch / 31) per CTA, i.e.
-        O(num_batch^2) work across the launched grid).
-        Either way, the in-group warp prefix-sum scan that follows is identical.
+        When params.mCuTotalMBlocks is provided, do a lower-bound binary
+        search (via utils.get_batch_from_cu_tensor) to land on the right
+        group of 31 batches in O(log num_batch); otherwise fall back to
+        the original O(num_batch / 31) per-CTA warp prefix-sum scan from
+        batch 0. Either way, the in-group warp scan that follows is
+        identical — the cumsum just provides a starting hint that the
+        warp scan then refines to the exact batch.
         """
         params = self.params
         lane_idx = cute.arch.lane_idx()
         next_tile_idx = self._tile_idx // params.cluster_shape_m
-        # Lane (WARP_SIZE - 1) does the boundary cu_seqlens read for lane (WARP_SIZE - 2)
-        # via shuffle_sync_down, so each warp consumes WARP_SIZE - 1 batches per pass.
+        # Lane (WARP_SIZE - 1) does the boundary cu_seqlens read for lane
+        # (WARP_SIZE - 2) via shuffle_sync_down, so each warp consumes
+        # WARP_SIZE - 1 batches per pass.
         group_size = cute.arch.WARP_SIZE - 1
 
-        if cutlass.const_expr(params.mTileCumsum is not None):
-            # mTileCumsum has length num_batch + 1; mTileCumsum[b] is the start tile
-            # of batch b. lower_bound: smallest lo with mTileCumsum[lo + 1] > next_tile_idx.
-            lo = Int32(0)
-            hi = params.num_batch
-            while lo < hi:
-                mid = (lo + hi) // 2
-                if params.mTileCumsum[mid + 1] <= next_tile_idx:
-                    lo = mid + 1
-                else:
-                    hi = mid
-            # Snap down to a group boundary so the in-group scan below picks up the
-            # same state the linear scan would have reached at this point.
+        if cutlass.const_expr(params.mCuTotalMBlocks is not None):
+            # Use the cumsum as a hint to skip to the right group of 31
+            # batches; the in-group warp scan below then locates the exact
+            # batch starting from that group boundary.
+            target = next_tile_idx // params.num_head
+            lo = utils.get_batch_from_cu_tensor(target, params.mCuTotalMBlocks)
             batch_idx = (lo // group_size) * group_size
-            group_end_tile = params.mTileCumsum[batch_idx]
+            group_end_tile = params.mCuTotalMBlocks[batch_idx] * params.num_head
         else:
             batch_idx = Int32(0)
             group_end_tile = Int32(0)

@@ -367,7 +367,7 @@ def test_varlen_scheduler_scaling():
         f"varlen scheduler appears to scale super-linearly: "
         f"per_seq_us at N=8192 is {ratio:.2f}x larger than at N=128 "
         f"(per_seq_us = {per_seq_us}). "
-        f"Did the SingleTileVarlenScheduler.mTileCumsum binary-search regress?"
+        f"Did the SingleTileVarlenScheduler.mCuTotalMBlocks binary-search regress?"
     )
 
 

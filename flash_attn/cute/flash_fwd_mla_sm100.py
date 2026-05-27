@@ -361,7 +361,7 @@ class FlashAttentionMLAForwardSm100:
         mCuSeqlensK: Optional[cute.Tensor] = None,  # (b + 1)
         mSeqUsedQ: Optional[cute.Tensor] = None,  # (b)
         mSeqUsedK: Optional[cute.Tensor] = None,  # (b)
-        mTileCumsum: Optional[
+        mCuTotalMBlocks: Optional[
             cute.Tensor
         ] = None,  # int32, (num_batch + 1,); see TileSchedulerArguments
         mIndexTopk: Optional[
@@ -633,7 +633,7 @@ class FlashAttentionMLAForwardSm100:
             is_split_kv=False,
             cluster_shape_mn=self.cluster_shape_mn,
             use_cluster_idx=False,
-            mTileCumsum=mTileCumsum,
+            mCuTotalMBlocks=mCuTotalMBlocks,
         )
         tile_sched_params = TileScheduler.to_underlying_arguments(
             tile_sched_args, scheduling_mode=self.scheduling_mode

@@ -350,7 +350,7 @@ class FlashAttentionBackwardSm90:
         mCuSeqlensK: Optional[cute.Tensor] = None,
         mSeqUsedQ: Optional[cute.Tensor] = None,
         mSeqUsedK: Optional[cute.Tensor] = None,
-        mTileCumsum: Optional[
+        mCuTotalMBlocks: Optional[
             cute.Tensor
         ] = None,  # int32, (num_batch + 1,); see TileSchedulerArguments
         window_size_left: Int32 | int | None = None,
@@ -539,7 +539,7 @@ class FlashAttentionBackwardSm90:
             is_persistent=False,
             lpt=self.spt,
             head_swizzle=self.deterministic,
-            mTileCumsum=mTileCumsum,
+            mCuTotalMBlocks=mCuTotalMBlocks,
         )
 
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
