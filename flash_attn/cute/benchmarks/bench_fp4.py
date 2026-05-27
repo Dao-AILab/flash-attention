@@ -617,35 +617,35 @@ def create_mxfp8_attention_tensors(
     pv_mode="bf16",
     pv_fp8_dtype=None,
 ):
-    """Create MXFP8 (FP8 E4M3 QK + E8M0 SF, sf_vec_size=32) tensors with torch-native
-    FP8 conversion and uniform SF=1.0.
-
-    Avoids cute.testing.convert (cute_tensor_like), which fails with
-    cudaErrorInsufficientDriver in this environment. Uniform SF=1.0 matches the
-    investigation precision table's MXFP8 approach (cos ~0.9985).
+    """Create MXFP8 (FP8 E4M3 QK + E8M0 SF, sf_vec_size=32) tensors using
+    flashinfer's ``mxfp8_quantize`` with per-group adaptive scale factors
+    in BlockScaledBasicChunk (layout_128x4) format.
     """
+    from flashinfer.quantization import mxfp8_quantize, SfLayout
+
     sf_vec_size = 32
     tile_m = 128
+
     q_ref = torch.randn(batch, seqlen_q, nheads, headdim, device=device, dtype=torch.float32)
     k_ref = torch.randn(batch, seqlen_k, nheads_kv, headdim, device=device, dtype=torch.float32)
     v_ref = torch.randn(batch, seqlen_k, nheads_kv, headdim_v, device=device, dtype=torch.float32)
 
-    def _to_fp8_and_sf(ref, batch_, seqlen_, nheads_, headdim_):
-        fp8 = ref.to(dtype_gen).to(torch.float8_e4m3fn)  # (b, s, h, d), E4M3
+    def _quantize_and_reshape_sf(ref, batch_, seqlen_, nheads_, headdim_):
+        t2d = ref.to(dtype_gen).reshape(batch_ * seqlen_, nheads_ * headdim_)
+        fp8_data, sf_data = mxfp8_quantize(t2d, sf_swizzle_layout=SfLayout.layout_128x4)
+        fp8 = fp8_data.reshape(batch_, seqlen_, nheads_, headdim_)
         rest_m = seqlen_ // tile_m
         sf_k = headdim_ // sf_vec_size
         rest_k = sf_k // 4
         total_m = batch_ * rest_m
         total_k = (nheads_ * sf_k) // 4
-        # Uniform E8M0 SF = 1.0 (byte 0x7F=127), in the same BlockScaledBasicChunk
-        # reshape/permute as the NVFP4 path so the kernel's SF reshape reads it correctly.
-        sf = torch.full((total_m, total_k, 32, 4, 4), 127, device=device, dtype=torch.uint8)
+        sf = sf_data.reshape(total_m, total_k, 32, 4, 4)
         sf = sf.reshape(batch_, rest_m, nheads_, rest_k, 32, 4, 4)
         sf = sf.permute(0, 2, 1, 3, 4, 5, 6).contiguous().permute(4, 5, 2, 6, 3, 1, 0)
         return fp8, sf
 
-    q_fp8, q_sf = _to_fp8_and_sf(q_ref, batch, seqlen_q, nheads, headdim)
-    k_fp8, k_sf = _to_fp8_and_sf(k_ref, batch, seqlen_k, nheads_kv, headdim)
+    q_fp8, q_sf = _quantize_and_reshape_sf(q_ref, batch, seqlen_q, nheads, headdim)
+    k_fp8, k_sf = _quantize_and_reshape_sf(k_ref, batch, seqlen_k, nheads_kv, headdim)
 
     if pv_mode == "fp8":
         _fp8 = pv_fp8_dtype or cutlass.Float8E4M3FN
