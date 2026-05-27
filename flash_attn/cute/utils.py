@@ -4,6 +4,7 @@ import math
 import hashlib
 import inspect
 import os
+import re
 from functools import partial
 from typing import Type, Callable, Optional, Tuple, overload
 
@@ -243,6 +244,27 @@ def convert_from_dlpack_compact_dynamic(
             divisibility=divisibility,
         )
     return t
+
+
+def parse_swizzle_from_pointer(ptr: cute.Pointer) -> cute.Swizzle:
+    """Extract swizzle parameters from a pointer's swizzle_type.
+
+    The swizzle_type string has the form '!cute.swizzle<"S<b,m,s>">' where
+    b, m, s are the swizzle parameters (bits, base, shift).
+
+    Returns:
+        A cute.Swizzle object constructed from the extracted parameters
+
+    Raises:
+        ValueError: If the swizzle_type string cannot be parsed
+    """
+    swizzle_str = str(ptr.type.swizzle_type)
+    match = re.search(r"S<(\d+),(\d+),(\d+)>", swizzle_str)
+    if match:
+        b, m, s = int(match.group(1)), int(match.group(2)), int(match.group(3))
+        return cute.make_swizzle(b, m, s)
+    else:
+        raise ValueError(f"Could not parse swizzle_type: {swizzle_str}")
 
 
 def convert_from_dlpack_leading_static(
