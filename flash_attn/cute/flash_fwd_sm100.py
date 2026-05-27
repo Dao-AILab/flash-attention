@@ -1441,7 +1441,10 @@ class FlashAttentionForwardSm100:
                     tiled_mma_qk, self.mma_tiler_qk, self.sf_vec_size, self.kv_stage,
                     mma_tile_inst_k=self.mma_inst_tile_k,
                 )
-                # SFQ TMEM: stagger with S offsets
+                # SFQ TMEM: stagger with S offsets. SFQ for stage k at
+                # tmem_s_offset[q_stage-1-k] — lives in the OTHER stage's S region.
+                # The inline's sequential loop must ensure softmax finishes reading
+                # the opposite stage's S before S2T overwrites it.
                 sfq_stage_order = tuple(
                     self.q_stage - 1 - stage for stage in range(self.q_stage)
                 )
@@ -2038,6 +2041,7 @@ class FlashAttentionForwardSm100:
         # ]
 
         mma_q_consumer_phase = Int32(0)
+        sfqk_empty_phase = Int32(0)
         mma_kv_consumer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Consumer, self.kv_stage
         )
@@ -2090,7 +2094,14 @@ class FlashAttentionForwardSm100:
                     if const_expr(self.uneven_kv_smem):
                         sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
                     if const_expr(self.block_scaled_qk):
-                        # S2T copy: SF from SMEM → TMEM before block-scaled gemm
+                        # S2T copy: SF from SMEM → TMEM before block-scaled gemm.
+                        # Staggered SF placement puts SFQ[stage] in the OPPOSITE
+                        # stage's S region. For stage>0, wait for the softmax to
+                        # finish reading that S before overwriting it with SF.
+                        if const_expr(stage > 0):
+                            pipeline_s_p_o.sync_object_empty.wait(
+                                self.q_stage - 1 - stage, sfqk_empty_phase
+                            )
                         sm100_utils.tcgen05_after_thread_sync()
                         if const_expr(s2t_sfq_staged is not None):
                             _, _, _s2t_q_dst = s2t_sfq_staged[stage]
@@ -2171,6 +2182,10 @@ class FlashAttentionForwardSm100:
                         if const_expr(self.uneven_kv_smem):
                             sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
                         if const_expr(self.block_scaled_qk):
+                            if const_expr(stage > 0):
+                                pipeline_s_p_o.sync_object_empty.wait(
+                                    self.q_stage - 1 - stage, sfqk_empty_phase
+                                )
                             sm100_utils.tcgen05_after_thread_sync()
                             if const_expr(s2t_sfq_staged is not None):
                                 _, _, _s2t_q_dst = s2t_sfq_staged[stage]
