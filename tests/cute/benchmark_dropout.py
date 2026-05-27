@@ -138,9 +138,9 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="Benchmark FA4 dropout / no-dropout vs PyTorch SDPA cuDNN."
     )
-    p.add_argument("--headdim", type=csv_ints, default=[128],
+    p.add_argument("--headdim", type=csv_ints, default=[64, 128],
                    help="Head dim(s), comma-separated (default: 64,128)")
-    p.add_argument("--seqlen", type=csv_ints, default=[8192, 32768],
+    p.add_argument("--seqlen", type=csv_ints, default=[1024, 4096, 8192, 16384, 32768],
                    help="Seq length(s), comma-separated with k suffix (default: 1k,2k,4k,8k)")
     p.add_argument("--batch-size", type=int, default=None,
                    help="Batch size (default: total_seqlen // seqlen, min 1)")
@@ -148,7 +148,7 @@ def parse_args() -> argparse.Namespace:
                    help="Target total tokens per benchmark for autoscaling batch (default: 16k)")
     p.add_argument("--nheads", type=int, default=None,
                    help="# Q heads (default: 16 if hdim<=128 else 8)")
-    p.add_argument("--p-dropout", type=float, default=0.1,
+    p.add_argument("--p-dropout", type=float, default=0.125,
                    help="Dropout probability (default: 0.125 = 2/16, a cuDNN-friendly rate)")
     p.add_argument("--causal", type=str.lower, choices=["true", "false", "both"], default="both",
                    help="Causal mode (default: both)")
@@ -248,22 +248,25 @@ def main():
                 for short_name, full_label, setup_fn, _p in backends:
                     fwd_fn, bwd_fn = setup_fn(ctx)
                     if fwd_fn is not None and has_forward:
-                        time.sleep(0.5)
+                        # Pause so the GPU can clock back up before each measurement;
+                        # otherwise neighbouring kernels inherit the previous run's
+                        # thermal / DVFS state and the comparison is unfair.
+                        time.sleep(1.0)
                         print(f"Benchmarking {full_label} fwd, "
                               f"hdim={headdim}, seqlen={seqlen}, "
                               f"causal={causal}, batch={batch_size}, nheads={nheads}")
                         sec = do_bench(fwd_fn, warmup=args.warmup, rep=args.rep) * 1e-3
                         time_f[(cfg, short_name)] = sec
                     if bwd_fn is not None and has_backward:
-                        time.sleep(0.5)
+                        time.sleep(1.0)
                         print(f"Benchmarking {full_label} bwd, "
                               f"hdim={headdim}, seqlen={seqlen}, "
                               f"causal={causal}, batch={batch_size}, nheads={nheads}")
                         sec = do_bench(bwd_fn, warmup=args.warmup, rep=args.rep) * 1e-3
                         time_b[(cfg, short_name)] = sec
 
-    # ── Print results: one block per direction; two tables per block
-    # (latency in microseconds + throughput in TFLOPS + derived ratios).
+    # ── Print results: one combined table with latency (ms) and throughput
+    # (TFLOPS) per backend×direction cell.
     _render_results(
         time_f,
         time_b,
@@ -291,12 +294,13 @@ def _render_results(
 
     Each row corresponds to one ``(config × dropout)`` setting. The right
     half of the row is split into four backend×direction groups (each
-    showing ``μs`` and ``TFLOPS``):
+    showing ``ms`` and ``TFLOPS``):
 
-        FA4 fwd | FA4 bwd | cuDNN fwd | cuDNN bwd
+        FA4 fwd | cuDNN fwd | FA4 bwd | cuDNN bwd
 
-    With this layout, side-by-side comparison between FA4 and cuDNN under
-    the same workload is just reading across one line.
+    Forward columns are grouped together (and likewise for backward) so
+    that comparing FA4 against cuDNN within a single direction is just
+    glancing at two adjacent cells.
     """
     p_lbl = f"p={p_dropout:g}"
 
@@ -312,12 +316,15 @@ def _render_results(
     ]
 
     # ── Column layout ────────────────────────────────────────────────────────
-    # Each metric cell shows two numbers — latency (μs) and throughput
-    # (TFLOPS) — joined by " / ". Width 15 fits e.g. "1326.2 /  259.1".
+    # Each metric cell shows two numbers — latency (ms) and throughput
+    # (TFLOPS) — joined by " / ". Width 15 fits e.g. "  1.33 /  259.1".
     #
     # COL_SPECS: (key, top_label, bottom_label, width)
     # - top_label    : line-1 (column name or backend×direction group)
     # - bottom_label : line-2 (units; empty for config columns)
+    #
+    # Direction-major ordering: all fwd columns first, then all bwd columns,
+    # so FA4 ↔ cuDNN comparisons within a direction are visually adjacent.
     METRIC_W = 15
     COL_SPECS = [
         ("hdim",      "hdim",      "",              4),
@@ -326,10 +333,10 @@ def _render_results(
         ("seqlen",    "seqlen",    "",              6),
         ("nheads",    "nheads",    "",              6),
         ("dropout",   "dropout",   "",              8),
-        ("fa4_fwd",   "FA4 fwd",   "    μs / TFLOPS", METRIC_W),
-        ("fa4_bwd",   "FA4 bwd",   "    μs / TFLOPS", METRIC_W),
-        ("cudnn_fwd", "cuDNN fwd", "    μs / TFLOPS", METRIC_W),
-        ("cudnn_bwd", "cuDNN bwd", "    μs / TFLOPS", METRIC_W),
+        ("fa4_fwd",   "FA4 fwd",   "    ms / TFLOPS", METRIC_W),
+        ("cudnn_fwd", "cuDNN fwd", "    ms / TFLOPS", METRIC_W),
+        ("fa4_bwd",   "FA4 bwd",   "    ms / TFLOPS", METRIC_W),
+        ("cudnn_bwd", "cuDNN bwd", "    ms / TFLOPS", METRIC_W),
     ]
 
     def _row(values: dict) -> str:
@@ -346,12 +353,14 @@ def _render_results(
         return "+" + "+".join(char * (w + 2) for _, _, _, w in COL_SPECS) + "+"
 
     def _fmt_cell(t: float | None, flops_mult: float, nFLOPS: float) -> str:
-        # Each cell renders as "{us:>6.1f} / {tflops:>6.1f}" → 15 chars wide.
+        # Each cell renders as "{ms:>6.2f} / {tflops:>6.1f}" → 15 chars wide.
+        # 2 decimal places keep sub-millisecond kernels (e.g. 0.05 ms) legible
+        # while still fitting workloads up to ~999 ms in 6 chars.
         if t is None:
             return f"{'-':>6} / {'-':>6}"
-        us = t * 1e6
+        ms = t * 1e3
         tflops = flops_mult * nFLOPS / t * 1e-12
-        return f"{us:>6.1f} / {tflops:>6.1f}"
+        return f"{ms:>6.2f} / {tflops:>6.1f}"
 
     # ── Print ────────────────────────────────────────────────────────────────
     title_bits = []
@@ -361,7 +370,7 @@ def _render_results(
         title_bits.append("backward")
     title = (
         f" FA4 vs cuDNN dropout — {' + '.join(title_bits)} "
-        f"(one row per config × dropout; each cell = latency_μs / TFLOPS)"
+        f"(one row per config × dropout; each cell = latency_ms / TFLOPS)"
     )
     table_w = len(_sub_header_row())
     title_bar = "=" * max(table_w, len(title))
@@ -397,8 +406,8 @@ def _render_results(
                 "nheads":    nheads,
                 "dropout":   dropout_lbl,
                 "fa4_fwd":   _fmt_cell(fa4_f, 1.0, nFLOPS),
-                "fa4_bwd":   _fmt_cell(fa4_b, 2.5, nFLOPS),
                 "cudnn_fwd": _fmt_cell(cdn_f, 1.0, nFLOPS),
+                "fa4_bwd":   _fmt_cell(fa4_b, 2.5, nFLOPS),
                 "cudnn_bwd": _fmt_cell(cdn_b, 2.5, nFLOPS),
             }))
 
