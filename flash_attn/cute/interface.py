@@ -765,6 +765,8 @@ def _flash_attn_fwd(
         fa_logging.get_fa_log_level(),
         mSFQ is not None,
         _sf_vec_size if mSFQ is not None else None,
+        _sf_dtype if mSFQ is not None else None,
+        v.dtype if mSFQ is not None else None,
         # q/k_ptr_shape are baked into the compiled FP4 kernel, so they must key the cache.
         _q_ptr_shape,
         _k_ptr_shape,
