@@ -86,8 +86,11 @@ def _get_use_clc_scheduler_default() -> bool:
     return _fa_clc_enabled
 
 
-def _get_disable_2cta_default() -> bool:
-    return _fa_disable_2cta_enabled or _fa_disable_2cta_cuda12
+def _get_disable_2cta_default(is_fwd: bool = False) -> bool:
+    if is_fwd:
+        return _fa_disable_2cta_enabled or _fa_disable_2cta_cuda12
+    else:
+        return _fa_disable_2cta_enabled
 
 
 def _compute_base_hash(func: Callable) -> str:
@@ -141,7 +144,7 @@ def hash_callable(
 
     hasher = hashlib.sha256(base_hash.encode())
 
-    for attr, val in zip(_MIXER_ATTRS, mixer_values):
+    for attr, val in zip(mixer_attrs, mixer_values):
         hasher.update(f"{attr}={val!r}".encode())
 
     return hasher.hexdigest()
@@ -946,3 +949,20 @@ def scalar_to_ssa(a: cute.Numeric, dtype) -> cute.TensorSSA:
 def ssa_to_scalar(val):
     """Could inline but nice for reflecting the above api"""
     return val[0]
+
+
+@cute.jit
+def get_batch_from_cu_tensor(idx: Int32, cu_tensor: cute.Tensor) -> Int32:
+    """Binary search to determine batch from packed index in a cumulative tensor"""
+    batch_size = cute.size(cu_tensor) - 1
+    lo = Int32(0)
+    hi = batch_size
+
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if cu_tensor[mid + 1] <= idx:
+            lo = mid + 1
+        else:
+            hi = mid
+
+    return lo

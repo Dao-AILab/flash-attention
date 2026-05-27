@@ -2523,3 +2523,61 @@ def test_flash_attn_varlen_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, caus
         assert torch.equal(dv, dv0)
         assert torch.equal(dk, dk0)
         assert torch.equal(dq, dq0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_flash_attn_varlen_paged_kv_num_splits(dtype):
+    """Passing num_splits=0 explicitly should be bitwise identical to not passing it (default)."""
+    from flash_attn.flash_attn_interface import _flash_attn_varlen_forward
+
+    device = "cuda"
+    num_heads, num_heads_k, head_dim = 4, 2, 64
+    page_block_size = 256
+    scale = head_dim ** -0.5
+
+    batch_size = 2
+    kv_lens = [512, 1024]
+    max_seqlen_k = max(kv_lens)
+
+    max_blocks_per_seq = max(
+        (s + page_block_size - 1) // page_block_size for s in kv_lens
+    )
+    total_blocks = batch_size * max_blocks_per_seq
+    k_cache = torch.randn(
+        total_blocks, page_block_size, num_heads_k, head_dim,
+        device=device, dtype=dtype,
+    )
+    v_cache = torch.randn(
+        total_blocks, page_block_size, num_heads_k, head_dim,
+        device=device, dtype=dtype,
+    )
+
+    block_table = rearrange(
+        torch.randperm(total_blocks, dtype=torch.int32, device=device),
+        "(b nblocks) -> b nblocks",
+        b=batch_size,
+    )
+
+    q = torch.randn(batch_size, num_heads, head_dim, device=device, dtype=dtype)
+    cu_seqlens_q = torch.arange(batch_size + 1, dtype=torch.int32, device=device)
+    seqused_k = torch.tensor(kv_lens, dtype=torch.int32, device=device)
+    cu_seqlens_k = torch.nn.functional.pad(seqused_k.cumsum(0), (1, 0)).to(torch.int32)
+
+    fwd_kwargs = dict(
+        cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=1, max_seqlen_k=max_seqlen_k,
+        dropout_p=0.0, softmax_scale=scale,
+        causal=False, window_size_left=-1, window_size_right=0,
+        block_table=block_table, seqused_k=seqused_k,
+    )
+
+    out_default = _flash_attn_varlen_forward(q, k_cache, v_cache, **fwd_kwargs)[0]
+    out_explicit = _flash_attn_varlen_forward(q, k_cache, v_cache, **fwd_kwargs, num_splits=0)[0]
+
+    assert not out_default.isnan().any(), "default num_splits produced NaN"
+    assert torch.equal(out_default, out_explicit), (
+        f"default vs num_splits=0 differ: max diff {(out_default - out_explicit).abs().max().item()}"
+    )
+
+    with pytest.raises(RuntimeError, match="num_splits > 1 is not supported"):
+        _flash_attn_varlen_forward(q, k_cache, v_cache, **fwd_kwargs, num_splits=2)

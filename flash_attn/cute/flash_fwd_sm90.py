@@ -66,7 +66,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             "Paged KV does not support irregular head dim"
         )
         self.cluster_shape_mn = (1, 1)
-        assert self.arch >= Arch.sm_90 and self.arch <= Arch.sm_90a, "Only SM 9.x is supported"
+        assert self.arch.is_family_of(Arch.sm_90a), "Only SM 9.x is supported"
 
     def _get_smem_layout_atom(self):
         sQ_layout_atom = warpgroup.make_smem_layout_atom(
@@ -557,6 +557,14 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             mCuSeqlensK=mCuSeqlensK,
             mSeqUsedQ=mSeqUsedQ,
             mSeqUsedK=mSeqUsedK,
+            mCuTotalMBlocks=(
+                blocksparse_tensors.cu_total_m_blocks if blocksparse_tensors is not None else None
+            ),
+            mCuBlockIdxOffsets=(
+                blocksparse_tensors.cu_block_idx_offsets
+                if blocksparse_tensors is not None
+                else None
+            ),
             # Don't need to pass in tile_mn because we won't access offset_padded
         )
         AttentionMaskCls = partial(
@@ -886,6 +894,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                             batch_idx,
                             head_idx,
                             m_block,
+                            seqlen,
                             kv_producer_state,
                             tma_load_K_fn,
                             tma_load_V_fn,
@@ -1505,7 +1514,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             batch_idx,
             head_idx,
             softmax_scale,
-            self.vec_size,
+            self.score_vec_size,
             self.qk_acc_dtype,
             aux_tensors,
             fastdiv_mods,

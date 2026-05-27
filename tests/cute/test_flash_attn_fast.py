@@ -139,8 +139,8 @@ def test_flash_attn_varlen_output(seqlen, d, causal, mha_type, dtype):
 
     out_varlen, lse = flash_attn_varlen_func(
         q_varlen, k_varlen, v_varlen,
-        cu_seqlens, cu_seqlens,
-        seqlen, seqlen,
+        cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
+        max_seqlen_q=seqlen, max_seqlen_k=seqlen,
         causal=causal,
     )
 

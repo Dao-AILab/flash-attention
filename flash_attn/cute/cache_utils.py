@@ -30,7 +30,6 @@ for _lib_path in cute.runtime.find_runtime_libraries(enable_tvm_ffi=False):
 CompileKeyType: TypeAlias = tuple[Hashable, ...]
 CallableFunction: TypeAlias = JitCompiledFunction | tvm_ffi.Function
 
-
 # Enable cache via `FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1`
 CUTE_DSL_CACHE_ENABLED: bool = os.getenv("FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED", "0") == "1"
 

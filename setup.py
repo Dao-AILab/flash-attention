@@ -8,6 +8,7 @@ import re
 import ast
 import glob
 import shutil
+import tempfile
 from pathlib import Path
 from typing import Literal, Optional
 from packaging.version import parse, Version
@@ -637,13 +638,42 @@ class NinjaBuildExtension(BuildExtension):
 
         super().__init__(*args, **kwargs)
 
+    def build_extensions(self) -> None:
+        original_spawn = None
+        if sys.platform == "win32" and self.compiler.compiler_type == "msvc":
+            original_spawn = self.compiler.spawn
+
+            def spawn(cmd):
+                if not cmd or Path(str(cmd[0])).name.lower() != "link.exe":
+                    return original_spawn(cmd)
+                cmd = [str(arg) for arg in cmd]
+                if len(subprocess.list2cmdline(cmd)) <= 32767:
+                    return original_spawn(cmd)
+                # Temporary workaround adapted from https://github.com/pypa/distutils/pull/406
+                # until setuptools/distutils ships response-file handling for long MSVC links.
+                with tempfile.TemporaryDirectory() as tmpdir:
+                    rsp_path = Path(tmpdir) / "cmdline.txt"
+                    rsp_path.write_text(
+                        "\n".join(subprocess.list2cmdline([arg]) for arg in cmd[1:]) + "\n",
+                        encoding="ascii",
+                    )
+                    return original_spawn([cmd[0], f"@{rsp_path}"])
+
+            self.compiler.spawn = spawn
+
+        try:
+            super().build_extensions()
+        finally:
+            if original_spawn is not None:
+                self.compiler.spawn = original_spawn
+
 
 # Build install_requires based on platform
 if ROCM_BACKEND == "triton":
     # Note: torch is excluded because pip resolves it to CUDA PyTorch from PyPI, overwriting any pre-installed ROCm PyTorch. Users must have torch installed.
     install_requires = [
         "einops",
-        "triton==3.5.1",
+        "triton==3.5.1" if sys.platform != "win32" else "triton-windows>=3.6.0",
     ]
 else:
     install_requires = [

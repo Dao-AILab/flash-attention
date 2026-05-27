@@ -155,8 +155,6 @@ def test_flash_attn_output(
             pytest.skip("SM100 head_dim=256 2CTA kernel does not support softcap yet")
         if deterministic:
             pytest.skip("SM100 head_dim=256 2CTA kernel does not support deterministic mode yet")
-        if causal and seqlen_q > seqlen_k:
-            pytest.skip("SM100 head_dim=256 2CTA kernel does not support causal attention with seqlen_q > seqlen_k yet")
     device = "cuda"
     # set seed
     seed = 0
@@ -551,10 +549,6 @@ def test_flash_attn_varlen_output(
             pytest.skip("SM100 head_dim=256 2CTA kernel does not support softcap yet")
         if deterministic:
             pytest.skip("SM100 head_dim=256 2CTA kernel does not support deterministic mode yet")
-        if causal and seqlen_q > seqlen_k:
-            pytest.skip("SM100 head_dim=256 2CTA kernel does not support causal attention with seqlen_q > seqlen_k yet")
-        if zero_lengths_q or zero_lengths_k:
-            pytest.skip("SM100 head_dim=256 2CTA kernel does not support zero-length sequences yet")
         if not unpad_q or not unpad_kv:
             pytest.skip("SM100 head_dim=256 2CTA kernel does not support seqused_q/seqused_k mode yet (requires unpad_q=True and unpad_kv=True)")
     if (
@@ -842,6 +836,7 @@ def test_flash_attn_varlen_output(
                 or (IS_SM100 and d == 256 and dv == 256)
             )
             and not has_learnable_sink
+            and softcap == 0.0 # TODO: support softcap != 0.0 in varlen bwd
             # and False
         ):
             if d > 192 and IS_SM90:
@@ -1790,6 +1785,207 @@ def test_flash_attn_paged_deepseek(seqlen_q, page_size):
     assert torch.equal(out, out_ref)
 
 
+@pytest.mark.parametrize("seqlen_q", [128, 512, 2048])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_paged_hd256_sm100_tma(seqlen_q):
+    """TMA paged KV in the SM100 hd256 2CTA forward kernel.
+
+    Verifies paged KV (page_table + TMA) matches the non-paged varlen reference
+    and is deterministic across runs. page_size must equal tile_n=128.
+    """
+    if not IS_SM100:
+        pytest.skip("SM100-specific paged hd256 test")
+    device = "cuda"
+    dtype = torch.bfloat16
+    d = 256
+    batch_size = 2
+    nheads = 16
+    nheads_kv = 16
+    page_size = 128
+    assert seqlen_q % page_size == 0
+
+    torch.random.manual_seed(0)
+    q = torch.randn(batch_size * seqlen_q, nheads, d, device=device, dtype=dtype)
+    k = torch.randn(batch_size * seqlen_q, nheads_kv, d, device=device, dtype=dtype)
+    v = torch.randn(batch_size * seqlen_q, nheads_kv, d, device=device, dtype=dtype)
+    cu_seqlens_q = torch.arange(0, batch_size + 1, dtype=torch.int32, device=device) * seqlen_q
+    cu_seqlens_k = cu_seqlens_q.clone()
+
+    # Non-paged reference (varlen).
+    out_ref, _ = flash_attn_varlen_func(
+        q, k, v,
+        cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=seqlen_q, max_seqlen_k=seqlen_q,
+    )
+
+    # Repack into paged layout: (total_pages, page_size, nheads_kv, d).
+    num_pages_per_seq = seqlen_q // page_size
+    total_pages = batch_size * num_pages_per_seq
+    k_paged = torch.zeros(total_pages, page_size, nheads_kv, d, device=device, dtype=dtype)
+    v_paged = torch.zeros(total_pages, page_size, nheads_kv, d, device=device, dtype=dtype)
+    for b in range(batch_size):
+        for s in range(seqlen_q):
+            pi = b * num_pages_per_seq + s // page_size
+            po = s % page_size
+            k_paged[pi, po] = k[b * seqlen_q + s]
+            v_paged[pi, po] = v[b * seqlen_q + s]
+    page_table = torch.arange(total_pages, dtype=torch.int32, device=device).reshape(
+        batch_size, num_pages_per_seq
+    )
+
+    # Paged via hd256 2CTA TMA paged path — run twice for determinism.
+    out_paged_0, _ = flash_attn_varlen_func(
+        q, k_paged, v_paged,
+        cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=None,
+        max_seqlen_q=seqlen_q, max_seqlen_k=seqlen_q,
+        page_table=page_table,
+    )
+    out_paged_1, _ = flash_attn_varlen_func(
+        q, k_paged, v_paged,
+        cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=None,
+        max_seqlen_q=seqlen_q, max_seqlen_k=seqlen_q,
+        page_table=page_table,
+    )
+
+    if is_fake_mode():
+        return
+
+    print(f"Paged vs non-paged max diff: {(out_paged_0 - out_ref).abs().max().item()}")
+    print(f"Paged determinism diff: {(out_paged_1 - out_paged_0).abs().max().item()}")
+    assert torch.allclose(out_paged_0, out_ref, atol=1e-3, rtol=1e-3), "Paged output does not match non-paged reference"
+    assert torch.equal(out_paged_1, out_paged_0), "Paged output is not deterministic"
+
+
+@pytest.mark.parametrize("nheads_kv", [2, 4, 8])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_paged_hd256_sm100_tma_gqa(nheads_kv):
+    """TMA paged KV for SM100 hd256 2CTA with GQA (nheads_q > nheads_kv).
+
+    Exercises the head_kv_coord derivation for qhead_per_kvhead > 1 — the MHA
+    test passes by coincidence since modulo and integer division agree when
+    qhead_per_kvhead == 1.
+    """
+    if not IS_SM100:
+        pytest.skip("SM100-specific paged hd256 test")
+    device = "cuda"
+    dtype = torch.bfloat16
+    d = 256
+    batch_size = 2
+    nheads = 16
+    page_size = 128
+    seqlen_q = 512
+    assert nheads % nheads_kv == 0 and seqlen_q % page_size == 0
+
+    torch.random.manual_seed(0)
+    q = torch.randn(batch_size * seqlen_q, nheads, d, device=device, dtype=dtype)
+    k = torch.randn(batch_size * seqlen_q, nheads_kv, d, device=device, dtype=dtype)
+    v = torch.randn(batch_size * seqlen_q, nheads_kv, d, device=device, dtype=dtype)
+    cu_seqlens_q = torch.arange(0, batch_size + 1, dtype=torch.int32, device=device) * seqlen_q
+    cu_seqlens_k = cu_seqlens_q.clone()
+
+    out_ref, _ = flash_attn_varlen_func(
+        q, k, v,
+        cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=seqlen_q, max_seqlen_k=seqlen_q,
+    )
+
+    num_pages_per_seq = seqlen_q // page_size
+    total_pages = batch_size * num_pages_per_seq
+    k_paged = torch.zeros(total_pages, page_size, nheads_kv, d, device=device, dtype=dtype)
+    v_paged = torch.zeros(total_pages, page_size, nheads_kv, d, device=device, dtype=dtype)
+    for b in range(batch_size):
+        for s in range(seqlen_q):
+            pi = b * num_pages_per_seq + s // page_size
+            po = s % page_size
+            k_paged[pi, po] = k[b * seqlen_q + s]
+            v_paged[pi, po] = v[b * seqlen_q + s]
+    page_table = torch.arange(total_pages, dtype=torch.int32, device=device).reshape(
+        batch_size, num_pages_per_seq
+    )
+
+    out_paged, _ = flash_attn_varlen_func(
+        q, k_paged, v_paged,
+        cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=None,
+        max_seqlen_q=seqlen_q, max_seqlen_k=seqlen_q,
+        page_table=page_table,
+    )
+
+    if is_fake_mode():
+        return
+
+    print(f"GQA nheads_kv={nheads_kv} paged vs non-paged max diff: {(out_paged - out_ref).abs().max().item()}")
+    assert torch.allclose(out_paged, out_ref, atol=1e-3, rtol=1e-3), (
+        f"Paged GQA output does not match non-paged reference (nheads_kv={nheads_kv})"
+    )
+
+
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_paged_hd256_sm100_tma_shuffled():
+    """TMA paged KV for SM100 hd256 2CTA with a non-identity (shuffled) page_table.
+
+    An identity page_table passes even if the kernel ignores it. This test
+    shuffles physical pages so a kernel that bypasses page_table would silently
+    read wrong data, proving the remapping path is exercised.
+    """
+    if not IS_SM100:
+        pytest.skip("SM100-specific paged hd256 test")
+    device = "cuda"
+    dtype = torch.bfloat16
+    d = 256
+    batch_size = 2
+    nheads = 16
+    nheads_kv = 16
+    page_size = 128
+    seqlen_q = 512
+    num_pages_per_seq = seqlen_q // page_size
+    total_pages = batch_size * num_pages_per_seq
+
+    torch.random.manual_seed(42)
+    q = torch.randn(batch_size * seqlen_q, nheads, d, device=device, dtype=dtype)
+    k = torch.randn(batch_size * seqlen_q, nheads_kv, d, device=device, dtype=dtype)
+    v = torch.randn(batch_size * seqlen_q, nheads_kv, d, device=device, dtype=dtype)
+    cu_seqlens_q = torch.arange(0, batch_size + 1, dtype=torch.int32, device=device) * seqlen_q
+    cu_seqlens_k = cu_seqlens_q.clone()
+
+    out_ref, _ = flash_attn_varlen_func(
+        q, k, v,
+        cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=seqlen_q, max_seqlen_k=seqlen_q,
+    )
+
+    # Shuffle physical pages: reverse order within each batch item.
+    # Build as Python list of ints to avoid .item() calls on FakeTensors during compilation.
+    perm = [
+        list(range((b + 1) * num_pages_per_seq - 1, b * num_pages_per_seq - 1, -1))
+        for b in range(batch_size)
+    ]
+    page_table = torch.tensor(perm, dtype=torch.int32, device=device)
+
+    k_paged = torch.zeros(total_pages, page_size, nheads_kv, d, device=device, dtype=dtype)
+    v_paged = torch.zeros(total_pages, page_size, nheads_kv, d, device=device, dtype=dtype)
+    for b in range(batch_size):
+        for s in range(seqlen_q):
+            phys = perm[b][s // page_size]  # Python int, safe in FakeTensorMode
+            po = s % page_size
+            k_paged[phys, po] = k[b * seqlen_q + s]
+            v_paged[phys, po] = v[b * seqlen_q + s]
+
+    out_paged, _ = flash_attn_varlen_func(
+        q, k_paged, v_paged,
+        cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=None,
+        max_seqlen_q=seqlen_q, max_seqlen_k=seqlen_q,
+        page_table=page_table,
+    )
+
+    if is_fake_mode():
+        return
+
+    print(f"Shuffled paged vs non-paged max diff: {(out_paged - out_ref).abs().max().item()}")
+    assert torch.allclose(out_paged, out_ref, atol=1e-3, rtol=1e-3), (
+        "Shuffled paged output does not match non-paged reference"
+    )
+
+
 @pytest.mark.parametrize("head_dim", [4, 148, 288])
 def test_flash_attn_invalid_head_dim(head_dim):
     device = "cuda"
@@ -2542,3 +2738,103 @@ def test_flash_attn_seqlen_k_zero(seqlen_q, d, causal):
     if lse is not None:
         assert torch.all(torch.isinf(lse) & (lse < 0)).item(), \
             f"Expected all -inf LSE when seqlen_k=0, got: {lse}"
+
+
+# ---------------------------------------------------------------------------
+# Regression test (#2503): empty Q workload must not crash with ZeroDivisionError
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        # (batch_size, seqlen_q) — the product drives num_splits_heuristic's divisor.
+        (2, 0),  # seqlen_q == 0 (common in CUDA graph padding)
+        (0, 64), # batch_size == 0 (empty microbatch)
+    ],
+)
+@pytest.mark.parametrize("causal", [False, True])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_empty_q_dense(shape, causal):
+    """Dense (non-varlen) path must not raise ZeroDivisionError when Q is empty.
+
+    num_splits_heuristic divides num_SMs by total_mblocks = batch_size * num_head_kv
+    * num_m_blocks. When seqlen_q == 0 or batch_size == 0, total_mblocks collapses
+    to 0 and the division crashes. The existing seqlen_k == 0 early-exit does not
+    cover this case. Regression for
+    https://github.com/Dao-AILab/flash-attention/issues/2503.
+    """
+    batch_size, seqlen_q = shape
+    device = "cuda"
+    dtype = torch.bfloat16
+    d = 128
+    nheads = 16
+    nheads_kv = 16
+    # Pick seqlen_k large enough that num_n_blocks > 4 so the heuristic's own
+    # `num_n_blocks <= 4` early-return does not mask the bug.
+    seqlen_k = 4096
+
+    torch.manual_seed(0)
+
+    q = torch.empty(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
+    k = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype)
+    v = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype)
+
+    out, lse = flash_attn_func(q, k, v, causal=causal)
+
+    if is_fake_mode():
+        return
+
+    assert out.shape == (batch_size, seqlen_q, nheads, d), \
+        f"Unexpected output shape: {out.shape}"
+    # With zero elements these are vacuously true, but we still want to assert
+    # the function returned cleanly rather than erroring out.
+    assert out.numel() == 0
+    if lse is not None:
+        assert lse.numel() == 0
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_empty_q_varlen(causal):
+    """Varlen path must not raise ZeroDivisionError when total_q == 0.
+
+    Parallels test_flash_attn_empty_q_dense for the cu_seqlens_q path, where
+    total_q = q.shape[0] feeds into total_mblocks. Regression for
+    https://github.com/Dao-AILab/flash-attention/issues/2503.
+    """
+    device = "cuda"
+    dtype = torch.bfloat16
+    d = 128
+    nheads = 16
+    nheads_kv = 16
+    batch_size = 2
+    seqlen_k_per_batch = 2048
+
+    torch.manual_seed(0)
+
+    # All zero-length Q sequences — total_q == 0 while cu_seqlens_q is well-formed.
+    cu_seqlens_q = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+    cu_seqlens_k = torch.tensor(
+        [0, seqlen_k_per_batch, 2 * seqlen_k_per_batch],
+        dtype=torch.int32, device=device,
+    )
+    total_k = int(cu_seqlens_k[-1].item())
+
+    q = torch.empty(0, nheads, d, device=device, dtype=dtype)
+    k = torch.randn(total_k, nheads_kv, d, device=device, dtype=dtype)
+    v = torch.randn(total_k, nheads_kv, d, device=device, dtype=dtype)
+
+    out, lse = flash_attn_varlen_func(
+        q, k, v,
+        cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=0, max_seqlen_k=seqlen_k_per_batch,
+        causal=causal,
+    )
+
+    if is_fake_mode():
+        return
+
+    assert out.shape == (0, nheads, d), f"Unexpected output shape: {out.shape}"
+    assert out.numel() == 0
+    if lse is not None:
+        assert lse.numel() == 0

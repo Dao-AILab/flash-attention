@@ -159,7 +159,8 @@ class FlashAttentionForwardSm100:
         assert self.split_P_arrive % 32 == 0
         assert self.split_P_arrive < self.n_block_size
         self.arch = BaseDSL._get_dsl().get_arch_enum()
-        assert self.arch >= Arch.sm_100 and self.arch <= Arch.sm_110f, "Only SM 10.x and 11.x are supported"
+        assert self.arch.is_family_of(Arch.sm_100f) or self.arch.is_family_of(Arch.sm_110f), \
+            "Only SM 10.x and 11.x are supported"
 
         self.cta_group_size = 2 if self.use_2cta_instrs else 1
         # cta_tiler M includes only 1 CTA, the scheduler will take into account the cluster shape
@@ -185,12 +186,17 @@ class FlashAttentionForwardSm100:
         )
         self.score_mod = score_mod
         self.mask_mod = mask_mod
-        self.vec_size: cutlass.Constexpr = getattr(
+        self.score_vec_size: cutlass.Constexpr = getattr(
             score_mod, "__vec_size__", 1 if cutlass.const_expr(has_aux_tensors) else 2
         )
+        self.mask_vec_size: cutlass.Constexpr = getattr(mask_mod, "__vec_size__", 1)
         # Does S1 need to wait for S0 to finish
         # self.s0_s1_barrier = self.head_dim_padded in [64, 96] and (not self.is_causal and not self.is_local)
-        is_sm103 = self.arch >= Arch.sm_103 and self.arch <= Arch.sm_103f
+        # NOTE: is_family_of also matches any future sm_10x with x > 3 — intentional.
+        # The flag gates ex2 emulation; sm_103 (B300) has fast hardware ex2 and later
+        # Blackwell variants are assumed to inherit this, so forward-inclusion is correct
+        # despite the literal `is_sm103` name.
+        is_sm103 = self.arch.is_family_of(Arch.sm_103f)
         self.is_sm103 = is_sm103
         # enable_ex2_emu is derived: True if tuning config has freq > 0, else fallback to default logic
         _default_enable_ex2_emu = (self.head_dim_padded <= 128 or (self.head_dim_padded == 192 and self.use_2cta_instrs and not self.is_causal and not self.is_local)) and not is_sm103
@@ -724,6 +730,10 @@ class FlashAttentionForwardSm100:
         self.use_block_sparsity = cutlass.const_expr(blocksparse_tensors is not None)
         if cutlass.const_expr(self.use_block_sparsity and mPageTable is not None):
             raise NotImplementedError("Block sparsity + paged KV not supported on SM100")
+        if cutlass.const_expr(self.use_block_sparsity and self.is_varlen_q):
+            assert const_expr(blocksparse_tensors.cu_total_m_blocks is not None), (
+                "blocksparse_tensors.cu_total_m_blocks must be provided for varlen blocksparsity"
+            )
 
         # Launch the kernel synchronously
         self.kernel(
@@ -768,6 +778,18 @@ class FlashAttentionForwardSm100:
             cluster=self.cluster_shape_mnk if cute.size(self.cluster_shape_mnk) > 1 else None,
             stream=stream,
             min_blocks_per_mp=1,
+        )
+
+    def _generate_attention_mask_cls(self, window_size_left, window_size_right):
+        return partial(
+            AttentionMask,
+            self.m_block_size,
+            self.n_block_size,
+            window_size_left=window_size_left,
+            window_size_right=window_size_right,
+            qhead_per_kvhead_packgqa=(
+                self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1
+            ),
         )
 
     #  GPU device kernel
@@ -1051,14 +1073,15 @@ class FlashAttentionForwardSm100:
             mCuSeqlensK=mCuSeqlensK,
             mSeqUsedQ=mSeqUsedQ,
             mSeqUsedK=mSeqUsedK,
+            mCuTotalMBlocks=(
+                blocksparse_tensors.cu_total_m_blocks if blocksparse_tensors is not None else None
+            ),
+            mCuBlockIdxOffsets=(
+                blocksparse_tensors.cu_block_idx_offsets if blocksparse_tensors is not None else None
+            ),
         )
-        AttentionMaskCls = partial(
-            AttentionMask,
-            self.m_block_size,
-            self.n_block_size,
-            window_size_left=window_size_left,
-            window_size_right=window_size_right,
-            qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+        AttentionMaskCls = self._generate_attention_mask_cls(
+            window_size_left, window_size_right
         )
         # Cluster wait before tensor memory alloc
         pipeline_init_wait(cluster_shape_mn=cta_layout_vmnk)
@@ -1203,6 +1226,7 @@ class FlashAttentionForwardSm100:
                     num_splits,
                     SeqlenInfoCls,
                     mma_tile_coord_v,
+                    blocksparse_tensors=blocksparse_tensors,
                     tile_scheduler=tile_scheduler,
                 )
 
@@ -1490,6 +1514,9 @@ class FlashAttentionForwardSm100:
                     batch_idx,
                     head_idx,
                     m_block,
+                    seqlen,
+                    split_idx,
+                    num_splits,
                     kv_producer_state,
                     load_Q,
                     load_K,
@@ -1637,8 +1664,11 @@ class FlashAttentionForwardSm100:
                     batch_idx,
                     head_idx,
                     m_block,
+                    split_idx,
+                    num_splits,
                     self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
                     self.q_subtile_factor if self.q_subtile_factor is not None else 1,
+                    seqlen_info=seqlen,
                 )
                 process_tile = block_iter_count > Int32(0)
             else:
@@ -1933,6 +1963,7 @@ class FlashAttentionForwardSm100:
                 batch_idx=batch_idx,
                 head_idx=head_idx,
                 aux_tensors=aux_tensors,
+                vec_size=self.mask_vec_size,
             )
 
             # Recompute fastdiv_mods if necessary
@@ -2003,8 +2034,11 @@ class FlashAttentionForwardSm100:
                     batch_idx,
                     head_idx,
                     m_block,
+                    split_idx,
+                    num_splits,
                     self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
                     self.q_subtile_factor if self.q_subtile_factor is not None else 1,
+                    seqlen_info=seqlen,
                 )
                 has_work = tile_block_count > Int32(0)
             else:
@@ -2038,7 +2072,6 @@ class FlashAttentionForwardSm100:
             )
 
             if const_expr(self.use_block_sparsity) or has_work:
-                # See block_sparse_utils.py NOTE [SM100 block-sparse empty tiles: mbarrier contract].
                 pipeline_sm_stats.producer_acquire_w_index_phase(stage, sm_stats_producer_phase)
                 sm_stats_producer_phase ^= 1
 
@@ -2061,6 +2094,9 @@ class FlashAttentionForwardSm100:
                     batch_idx,
                     head_idx,
                     m_block,
+                    seqlen,
+                    split_idx,
+                    num_splits,
                     softmax_step,
                     mask_fn,
                     mask_fn_none,
@@ -2416,8 +2452,11 @@ class FlashAttentionForwardSm100:
                     batch_idx,
                     head_idx,
                     m_block,
+                    split_idx,
+                    num_splits,
                     self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
                     self.q_subtile_factor if self.q_subtile_factor is not None else 1,
+                    seqlen_info=seqlen,
                 )
                 has_work = total_block_count > Int32(0)
             else:
@@ -2829,6 +2868,7 @@ class FlashAttentionForwardSm100:
         num_splits: int,
         SeqlenInfoCls: Callable,
         mma_tile_coord_v: Int32 = 0,
+        blocksparse_tensors: Optional[BlockSparseTensors] = None,
         tile_scheduler=None,
     ):
         epi_consumer_phase = Int32(0)
@@ -2837,8 +2877,9 @@ class FlashAttentionForwardSm100:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
             n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
+            has_work = const_expr(self.use_block_sparsity or not self.is_split_kv) or n_block_min < n_block_max
 
-            if const_expr(not self.is_split_kv) or n_block_min < n_block_max:
+            if has_work:
                 if const_expr(self.is_split_kv):
                     mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3)[None, None, head_idx, split_idx]
                 else:
@@ -3095,7 +3136,7 @@ class FlashAttentionForwardSm100:
             batch_idx,
             head_idx,
             softmax.softmax_scale,
-            self.vec_size,
+            self.score_vec_size,
             self.qk_acc_dtype,
             aux_tensors,
             fastdiv_mods,
