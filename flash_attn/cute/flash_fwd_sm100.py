@@ -2041,7 +2041,6 @@ class FlashAttentionForwardSm100:
         # ]
 
         mma_q_consumer_phase = Int32(0)
-        sfqk_empty_phase = Int32(0)
         mma_kv_consumer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Consumer, self.kv_stage
         )
@@ -2095,12 +2094,12 @@ class FlashAttentionForwardSm100:
                         sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
                     if const_expr(self.block_scaled_qk):
                         # S2T copy: SF from SMEM → TMEM before block-scaled gemm.
-                        # Staggered SF placement puts SFQ[stage] in the OPPOSITE
-                        # stage's S region. For stage>0, wait for the softmax to
-                        # finish reading that S before overwriting it with SF.
+                        # Staggered SF placement puts SFQ[stage] at S[opposite].
+                        # Stage 0: S[1] unused in first iteration — no wait needed.
+                        # Stage 1: wait for softmax to finish reading S[0].
                         if const_expr(stage > 0):
                             pipeline_s_p_o.sync_object_empty.wait(
-                                self.q_stage - 1 - stage, sfqk_empty_phase
+                                self.q_stage - 1 - stage, P_full_O_rescaled_phase
                             )
                         sm100_utils.tcgen05_after_thread_sync()
                         if const_expr(s2t_sfq_staged is not None):
@@ -2182,10 +2181,14 @@ class FlashAttentionForwardSm100:
                         if const_expr(self.uneven_kv_smem):
                             sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
                         if const_expr(self.block_scaled_qk):
-                            if const_expr(stage > 0):
-                                pipeline_s_p_o.sync_object_empty.wait(
-                                    self.q_stage - 1 - stage, sfqk_empty_phase
-                                )
+                            # Wait for softmax to finish reading S[opposite] before
+                            # overwriting with SF. Stage 0 checks empty[1] (phase P),
+                            # stage 1 checks empty[0] (phase P^1: one extra release
+                            # from the new S[0] produced earlier in this iteration).
+                            _sfqk_phase = P_full_O_rescaled_phase if const_expr(stage == 0) else P_full_O_rescaled_phase ^ 1
+                            pipeline_s_p_o.sync_object_empty.wait(
+                                self.q_stage - 1 - stage, _sfqk_phase
+                            )
                             sm100_utils.tcgen05_after_thread_sync()
                             if const_expr(s2t_sfq_staged is not None):
                                 _, _, _s2t_q_dst = s2t_sfq_staged[stage]
