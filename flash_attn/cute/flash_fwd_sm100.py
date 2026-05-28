@@ -371,11 +371,13 @@ class FlashAttentionForwardSm100:
         smem_size_q_o = smem_size_q + smem_size_o if not self.overlap_sO_sQ else max(smem_size_q, smem_size_o)
         smem_size_k_per_stage = self.n_block_size * self.head_dim_padded * self.k_dtype.width // 8
         smem_size_v_per_stage = self.n_block_size * self.head_dim_v_padded * self.v_dtype.width // 8
+        self.k_aliases_v = False
         if self.block_scaled_qk:
-            # Block-scaled: K and V have different dtypes, can't alias
-            smem_size_kv_per_stage = (smem_size_k_per_stage + smem_size_v_per_stage) // self.cta_group_size
-            # Add SF SMEM overhead (~128 bytes per stage per SF)
-            smem_size_kv_per_stage += 256  # rough SF overhead
+            if self.k_aliases_v:
+                smem_size_kv_per_stage = max(smem_size_k_per_stage, smem_size_v_per_stage) // self.cta_group_size
+            else:
+                smem_size_kv_per_stage = (smem_size_k_per_stage + smem_size_v_per_stage) // self.cta_group_size
+            smem_size_kv_per_stage += 256  # SF SMEM overhead
         else:
             smem_size_kv_per_stage = max(smem_size_k_per_stage, smem_size_v_per_stage) // self.cta_group_size
         kv_stage = (224 * 1024 - smem_size_q_o) // smem_size_kv_per_stage
@@ -909,12 +911,10 @@ class FlashAttentionForwardSm100:
                 cute.struct.MemRange[self.q_dtype, sQ_size], self.buffer_align_bytes
             ]
             sK: cute.struct.Align[
-                # cute.cosize(sK_layout) is correct even in the case of self.uneven_kv_smem
-                cute.struct.MemRange[self.k_dtype, cute.cosize(sK_layout)],
-                self.buffer_align_bytes,
+                cute.struct.MemRange[self.k_dtype, 1] if const_expr(self.k_aliases_v) else cute.struct.MemRange[self.k_dtype, cute.cosize(sK_layout)],
+                1 if const_expr(self.k_aliases_v) else self.buffer_align_bytes,
             ]
             if const_expr(self.block_scaled_qk):
-                # Block-scaled: K and V have different dtypes, can't alias
                 sV_separate: cute.struct.Align[
                     cute.struct.MemRange[self.v_dtype, cute.cosize(sV_layout)],
                     self.buffer_align_bytes,
@@ -1236,12 +1236,21 @@ class FlashAttentionForwardSm100:
         # (MMA, MMA_Q, MMA_D, PIPE)
         sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner)
         # (MMA, MMA_K, MMA_D, PIPE)
-        sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
-        # (MMA, MMA_K, MMA_D, PIPE)
-        if const_expr(self.block_scaled_qk):
+        if const_expr(self.k_aliases_v):
+            # FP4 K + BF16 V: K aliases V's buffer (K is smaller, fits inside V's stage)
+            sV = storage.sV_separate.get_tensor(sV_layout.outer, swizzle=sV_layout.inner)
+            stride_sV = const_expr(max(sV_layout.outer.stride[-1], 0))
+            stride_sK_aligned = const_expr(stride_sV * self.v_dtype.width // self.k_dtype.width)
+            sK_outer_aligned = cute.make_layout(
+                sK_layout.outer.shape,
+                stride=(*sK_layout.outer.stride[:-1], stride_sK_aligned),
+            )
+            sK = storage.sV_separate.get_tensor(sK_outer_aligned, swizzle=sK_layout.inner, dtype=self.k_dtype)
+        elif const_expr(self.block_scaled_qk):
+            sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
             sV = storage.sV_separate.get_tensor(sV_layout.outer, swizzle=sV_layout.inner)
         else:
-            # Strip swizzle info to reuse smem (K and V alias when same dtype)
+            sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
             sV = cute.make_tensor(cute.recast_ptr(sK.iterator, sV_layout.inner), sV_layout.outer)
         # SF tensors for block-scaled QK
         # Use cute.make_tensor(ptr, layout) instead of get_tensor(layout) to
@@ -2093,14 +2102,6 @@ class FlashAttentionForwardSm100:
                     if const_expr(self.uneven_kv_smem):
                         sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
                     if const_expr(self.block_scaled_qk):
-                        # S2T copy: SF from SMEM → TMEM before block-scaled gemm.
-                        # Staggered SF placement puts SFQ[stage] at S[opposite].
-                        # Stage 0: S[1] unused in first iteration — no wait needed.
-                        # Stage 1: wait for softmax to finish reading S[0].
-                        if const_expr(stage > 0):
-                            pipeline_s_p_o.sync_object_empty.wait(
-                                self.q_stage - 1 - stage, P_full_O_rescaled_phase
-                            )
                         sm100_utils.tcgen05_after_thread_sync()
                         if const_expr(s2t_sfq_staged is not None):
                             _, _, _s2t_q_dst = s2t_sfq_staged[stage]
@@ -2181,14 +2182,6 @@ class FlashAttentionForwardSm100:
                         if const_expr(self.uneven_kv_smem):
                             sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
                         if const_expr(self.block_scaled_qk):
-                            # Wait for softmax to finish reading S[opposite] before
-                            # overwriting with SF. Stage 0 checks empty[1] (phase P),
-                            # stage 1 checks empty[0] (phase P^1: one extra release
-                            # from the new S[0] produced earlier in this iteration).
-                            _sfqk_phase = P_full_O_rescaled_phase if const_expr(stage == 0) else P_full_O_rescaled_phase ^ 1
-                            pipeline_s_p_o.sync_object_empty.wait(
-                                self.q_stage - 1 - stage, _sfqk_phase
-                            )
                             sm100_utils.tcgen05_after_thread_sync()
                             if const_expr(s2t_sfq_staged is not None):
                                 _, _, _s2t_q_dst = s2t_sfq_staged[stage]
@@ -2750,7 +2743,6 @@ class FlashAttentionForwardSm100:
         tSrP_r2t = cute.make_tensor(
             cute.recast_ptr(tSrP_r2t_f32.iterator, dtype=self.v_dtype), tSrS_t2r.layout
         )
-        # softmax.scale_apply_exp2_convert(tSrS_t2r, row_max, tSrP_r2t)
         softmax.apply_exp2_convert(
             tSrS_t2r,
             tSrP_r2t,
