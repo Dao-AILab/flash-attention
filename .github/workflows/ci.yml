@@ -9,7 +9,10 @@ permissions:
 
 env:
   CI_WORK_DIR: ${{ vars.CI_WORK_DIR || format('/scratch/user/{0}', github.actor) }}
-  FA4_TEST_FILTER: "1024-1024-128-True-0-0.0-False-False-False-mha-dtype0 or 1024-1024-128-False-0-0.0-False-False-False-mha-dtype0"
+  FA4_TEST_FILTER: >-
+    1024-1024-128-True-0-0.0-False-False-False-mha-dtype0
+    or 1024-1024-128-False-0-0.0-False-False-False-mha-dtype0
+    or test_flash_attn_ex2_emu_decode_prefill_consistency
 
 jobs:
   lint:

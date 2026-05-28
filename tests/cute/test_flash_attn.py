@@ -2882,3 +2882,64 @@ def test_flash_attn_empty_q_varlen(causal):
     assert out.numel() == 0
     if lse is not None:
         assert lse.numel() == 0
+
+
+@pytest.mark.parametrize("seqlen_k", [512, 1024])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_ex2_emu_decode_prefill_consistency(seqlen_k):
+    """Decode↔prefill must be bitwise consistent for MLA (192,128).
+
+    Regression test: paged decode (seqlen_q=1) vs non-paged prefill
+    (seqlen_q=full) for MLA shapes must produce identical outputs for the
+    last query position.
+    """
+    if IS_SM90:
+        pytest.skip("ex2_emu is SM100+ only")
+
+    device = "cuda"
+    dtype = torch.bfloat16
+    d, dv = 192, 128
+    nheads = nheads_kv = 16
+
+    torch.random.manual_seed(0)
+    q = torch.randn(seqlen_k, nheads, d, device=device, dtype=dtype)
+    k = torch.randn(seqlen_k, nheads_kv, d, device=device, dtype=dtype)
+    v = torch.randn(seqlen_k, nheads_kv, dv, device=device, dtype=dtype)
+
+    # Prefill: full sequence, non-paged, causal
+    cu = torch.tensor([0, seqlen_k], dtype=torch.int32, device=device)
+    out_prefill, _ = flash_attn_varlen_func(
+        q, k, v,
+        cu_seqlens_q=cu, cu_seqlens_k=cu,
+        max_seqlen_q=seqlen_k, max_seqlen_k=seqlen_k,
+        causal=True,
+    )
+
+    # Decode: seqlen_q=1 at last position, paged KV, causal
+    page_size = 128
+    num_pages = (seqlen_k + page_size - 1) // page_size
+    k_cache = torch.zeros(num_pages, page_size, nheads_kv, d, device=device, dtype=dtype)
+    v_cache = torch.zeros(num_pages, page_size, nheads_kv, dv, device=device, dtype=dtype)
+    for i in range(seqlen_k):
+        k_cache[i // page_size, i % page_size] = k[i]
+        v_cache[i // page_size, i % page_size] = v[i]
+    page_table = torch.arange(num_pages, dtype=torch.int32, device=device).unsqueeze(0)
+    cache_seqlens = torch.tensor([seqlen_k], dtype=torch.int32, device=device)
+
+    out_decode, _ = flash_attn_varlen_func(
+        q[-1:], k_cache, v_cache,
+        cu_seqlens_q=torch.tensor([0, 1], dtype=torch.int32, device=device),
+        cu_seqlens_k=None,
+        max_seqlen_q=1, max_seqlen_k=None,
+        seqused_k=cache_seqlens, page_table=page_table,
+        causal=True,
+    )
+
+    if is_fake_mode():
+        return
+
+    max_diff = (out_prefill[-1] - out_decode[0]).abs().max().item()
+    print(f"decode↔prefill max diff: {max_diff}")
+    assert torch.equal(out_prefill[-1], out_decode[0]), (
+        f"decode↔prefill diverged: max_diff={max_diff}."
+    )
