@@ -326,6 +326,7 @@ def _flash_attn_fwd(
     k_descale: Optional[torch.Tensor] = None,
     v_descale: Optional[torch.Tensor] = None,
     gather_kv_indices: Optional[torch.Tensor] = None,
+    enable_sm100_decode_q1_opt: bool = True,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for FlashAttention.
 
@@ -519,7 +520,7 @@ def _flash_attn_fwd(
     # TODO: fix GQA + SplitKV + non-varlen
     if pack_gqa and num_splits != 1 and cu_seqlens_q is None:
         pack_gqa = False
-    
+
     if pack_gqa and qv is not None and 128 % qhead_per_kvhead != 0:
         pack_gqa = False
 
@@ -528,7 +529,7 @@ def _flash_attn_fwd(
     if max_seqlen_k is None:
         max_seqlen_k = seqlen_k
     if cu_seqlens_k is None and seqused_k is None:
-        min_seqlen_k = seqlen_k 
+        min_seqlen_k = seqlen_k
     seqlen_q_packgqa = max_seqlen_q * qhead_per_kvhead
     if arch // 10 in [10, 11]:
         q_stage = 2 if seqlen_q_packgqa > tile_m else 1
@@ -717,6 +718,7 @@ def _flash_attn_fwd(
         gather_kv_length,
         sparse_kv,
         disable_sparse_kv_bitmask,
+        enable_sm100_decode_q1_opt,
         fa_logging.get_fa_log_level(),
     )
 
@@ -901,6 +903,7 @@ def _flash_attn_fwd(
                     has_aux_tensors=aux_tensors is not None,
                     paged_kv_non_tma=page_size not in [None, tile_n],
                     is_varlen_q=cu_seqlens_q is not None or seqused_q is not None,
+                    enable_sm100_decode_q1_opt=enable_sm100_decode_q1_opt,
                     q_subtile_factor=q_subtile_factor,
                     use_2cta_instrs=use_2cta_instrs,
                     use_clc_scheduler=use_clc_scheduler,
@@ -1939,6 +1942,7 @@ class FlashAttnFunc(torch.autograd.Function):
         block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
         block_sparse_tensors_bwd: Optional[BlockSparseTensorsTorch] = None,
         return_lse: bool = False,
+        enable_sm100_decode_q1_opt: bool = True,
     ):
         out, lse = _flash_attn_fwd(
             q,
@@ -1959,6 +1963,7 @@ class FlashAttnFunc(torch.autograd.Function):
             block_sparse_tensors=block_sparse_tensors,
             return_lse=return_lse,
             gather_kv_indices=gather_kv_indices,
+            enable_sm100_decode_q1_opt=enable_sm100_decode_q1_opt,
         )
         ctx.save_for_backward(q, k, v, out, lse, *(aux_tensors or ()))
         ctx.softmax_scale = softmax_scale
@@ -2036,6 +2041,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         block_sparse_tensors: Optional[list] = None,
         aux_tensors: Optional[list] = None,
         return_lse: bool = False,
+        enable_sm100_decode_q1_opt: bool = True,
     ):
         out, lse = _flash_attn_fwd(
             q,
@@ -2064,6 +2070,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             aux_tensors=aux_tensors,
             return_lse=return_lse,
             gather_kv_indices=gather_kv_indices,
+            enable_sm100_decode_q1_opt=enable_sm100_decode_q1_opt,
         )
         ctx.save_for_backward(
             q,
@@ -2147,6 +2154,7 @@ def flash_attn_func(
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     block_sparse_tensors_bwd: Optional[BlockSparseTensorsTorch] = None,
     return_lse: bool = False,
+    enable_sm100_decode_q1_opt: bool = True,
 ):
     return FlashAttnFunc.apply(
         q,
@@ -2169,6 +2177,7 @@ def flash_attn_func(
         block_sparse_tensors,
         block_sparse_tensors_bwd,
         return_lse,
+        enable_sm100_decode_q1_opt,
     )
 
 
@@ -2200,6 +2209,7 @@ def flash_attn_varlen_func(
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     aux_tensors: Optional[list] = None,
     return_lse: bool = False,
+    enable_sm100_decode_q1_opt: bool = True,
 ):
     """
     Explanation of some optional arguments:
@@ -2243,6 +2253,7 @@ def flash_attn_varlen_func(
         block_sparse_tensors,
         aux_tensors,
         return_lse,
+        enable_sm100_decode_q1_opt,
     )
 
 
