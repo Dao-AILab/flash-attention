@@ -687,6 +687,7 @@ def _flash_attn_fwd(
         and not causal
         and not local
         and not is_split_kv
+        and not want_fused  # decode (split) is non-2CTA; fused must match it -> non-2CTA for bitwise
         and cu_seqlens_q is None
         and seqused_q is None
         and not use_block_sparsity
