@@ -597,7 +597,10 @@ class FlashAttentionForwardCombine:
                             pa0, pa1 = cute.arch.mul_packed_f32x2((acc_row[k], acc_row[k + 1]), (a, a))
                             ps0, ps1 = cute.arch.mul_packed_f32x2((seg_row[k], seg_row[k + 1]), (b, b))
                             acc_row[k], acc_row[k + 1] = pa0 + ps0, pa1 + ps1
-                        s_run[m] = s_run[m] * a + b
+                        # Explicit non-FMA mul (mul_packed) + add, matching the fused in-kernel
+                        # merge's s_run accumulation exactly (bitwise inv_sum).
+                        _sa, _ = cute.arch.mul_packed_f32x2((s_run[m], Float32(0.0)), (a, a))
+                        s_run[m] = _sa + b
                         m_run[m] = m_new
 
             # Normalize: O = tOrO / s_run

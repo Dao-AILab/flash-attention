@@ -2666,7 +2666,12 @@ class FlashAttentionForwardSm100:
                             thr_mma_pv, tOacc[None, None, None, 0], tOtO[None, None, None, stage],
                             tidx, a, b, seg == 0,
                         )
-                        s_run = s_run * a + b
+                        # Explicit non-FMA mul (mul_packed) + add, matching the combine's
+                        # s_run accumulation exactly so inv_sum=1/s_run is bitwise-identical
+                        # (a scalar FMA-contraction mismatch here flips a bf16 element on
+                        # boundary-value rows).
+                        _sa, _ = cute.arch.mul_packed_f32x2((s_run, Float32(0.0)), (a, a))
+                        s_run = _sa + b
                         m_run = m_new
                         pipeline_s_p_o.consumer_release_w_index(stage)
                         if _is_last_seg:
