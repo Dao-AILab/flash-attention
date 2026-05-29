@@ -587,10 +587,16 @@ class FlashAttentionForwardCombine:
                         m_new = max(m_run[m], lse_s[m])
                         a = cute.math.exp2((m_run[m] - m_new) * LOG2_E, fastmath=True)
                         b = cute.math.exp2((lse_s[m] - m_new) * LOG2_E, fastmath=True)
-                        tOrO[None, m, None].store(
-                            tOrO[None, m, None].load() * a
-                            + tOrO_partial[None, m, None].load().to(Float32) * b
-                        )
+                        # Per-element acc*a + seg*b via separate f32 muls + add. The fused
+                        # in-kernel merge (correction_merge in flash_fwd_sm100.py) uses the
+                        # IDENTICAL op sequence so prefill (fused) == decode (gmem) bitwise.
+                        acc_row = tOrO[None, m, None]
+                        seg_row = cute.make_rmem_tensor_like(acc_row, Float32)
+                        seg_row.store(tOrO_partial[None, m, None].load().to(Float32))
+                        for k in cutlass.range(0, cute.size(acc_row), 2, unroll_full=True):
+                            pa0, pa1 = cute.arch.mul_packed_f32x2((acc_row[k], acc_row[k + 1]), (a, a))
+                            ps0, ps1 = cute.arch.mul_packed_f32x2((seg_row[k], seg_row[k + 1]), (b, b))
+                            acc_row[k], acc_row[k + 1] = pa0 + ps0, pa1 + ps1
                         s_run[m] = s_run[m] * a + b
                         m_run[m] = m_new
 
