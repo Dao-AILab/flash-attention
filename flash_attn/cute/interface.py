@@ -645,7 +645,34 @@ def _flash_attn_fwd(
         else:
             num_splits = 1
 
-    is_split_kv = num_splits > 1
+    # Fused prefill SplitKV (memory-efficient): one CTA per query tile internally segments
+    # the KV loop into n_blocks_per_split chunks and online-merges the per-segment partials
+    # in registers/tmem -- no gmem out_partial and no separate combine kernel. Bitwise-equal
+    # to the gmem split path (same streaming-merge order). Milestone 1 supports q_stage==1
+    # (free tmem for the running accumulator), dense (non-causal/non-local), same-headdim,
+    # non-varlen, non-paged, no mods/fp8/block-sparsity.
+    fused_split = (
+        os.environ.get("FLASH_ATTENTION_FUSED_SPLIT", "0") == "1"  # WIP: opt-in until kernel lands
+        and n_blocks_per_split is not None
+        and num_splits > 1
+        and arch // 10 in [10, 11]
+        and q_stage == 1
+        and not causal
+        and not local
+        and head_dim == head_dim_v
+        and cu_seqlens_q is None
+        and cu_seqlens_k is None
+        and page_table is None
+        and seqused_q is None
+        and seqused_k is None
+        and mask_mod is None
+        and score_mod is None
+        and not is_fp8
+        and not use_block_sparsity
+        and qv is None
+    )
+
+    is_split_kv = num_splits > 1 and not fused_split
     if is_split_kv:
         out_partial = torch.empty(num_splits, *q_batch_seqlen_shape, num_head, head_dim_v, dtype=torch.float32, device=device)
         lse_partial = torch.empty(num_splits, *lse_shape, dtype=torch.float32, device=device)
@@ -804,6 +831,7 @@ def _flash_attn_fwd(
         num_threads,
         is_split_kv,
         n_blocks_per_split is not None,  # fixed-size vs even-division split mode (compile-time branch)
+        fused_split,  # fused in-kernel segmented-combine prefill
         pack_gqa,
         arch,
         page_size not in [None, tile_n],  # paged KV non-TMA
@@ -1011,6 +1039,7 @@ def _flash_attn_fwd(
                     q_subtile_factor=q_subtile_factor,
                     use_2cta_instrs=use_2cta_instrs,
                     use_clc_scheduler=use_clc_scheduler,
+                    fused_split=fused_split,
                 )
         elif arch // 10 == 12:
             # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
