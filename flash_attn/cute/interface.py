@@ -601,8 +601,29 @@ def _flash_attn_fwd(
     if cu_seqlens_k is None and seqused_k is None:
         min_seqlen_k = seqlen_k 
     seqlen_q_packgqa = max_seqlen_q * qhead_per_kvhead
+    # Decide fused-prefill eligibility before q_stage so we can force q_stage=1 (the fused
+    # in-kernel merge keeps its running accumulator in the tmem columns that are only free
+    # at q_stage=1; q_stage=1 also handles large-Q prefill and matches decode's q_stage).
+    want_fused = (
+        os.environ.get("FLASH_ATTENTION_FUSED_SPLIT", "0") == "1"
+        and split_size is not None
+        and arch // 10 in [10, 11]
+        and not causal
+        and not local
+        and head_dim == head_dim_v
+        and cu_seqlens_q is None
+        and cu_seqlens_k is None
+        and page_table is None
+        and seqused_q is None
+        and seqused_k is None
+        and mask_mod is None
+        and score_mod is None
+        and not is_fp8
+        and not use_block_sparsity
+        and qv is None
+    )
     if arch // 10 in [10, 11]:
-        q_stage = 2 if seqlen_q_packgqa > tile_m else 1
+        q_stage = 1 if want_fused else (2 if seqlen_q_packgqa > tile_m else 1)
     else:
         q_stage = 1
 
@@ -651,26 +672,9 @@ def _flash_attn_fwd(
     # to the gmem split path (same streaming-merge order). Milestone 1 supports q_stage==1
     # (free tmem for the running accumulator), dense (non-causal/non-local), same-headdim,
     # non-varlen, non-paged, no mods/fp8/block-sparsity.
-    fused_split = (
-        os.environ.get("FLASH_ATTENTION_FUSED_SPLIT", "0") == "1"  # WIP: opt-in until kernel lands
-        and n_blocks_per_split is not None
-        and num_splits > 1
-        and arch // 10 in [10, 11]
-        and q_stage == 1
-        and not causal
-        and not local
-        and head_dim == head_dim_v
-        and cu_seqlens_q is None
-        and cu_seqlens_k is None
-        and page_table is None
-        and seqused_q is None
-        and seqused_k is None
-        and mask_mod is None
-        and score_mod is None
-        and not is_fp8
-        and not use_block_sparsity
-        and qv is None
-    )
+    # want_fused already captured the shape eligibility (and forced q_stage=1); engage the
+    # fused path only when splitting actually happens (>1 segment) and the size is fixed.
+    fused_split = want_fused and n_blocks_per_split is not None and num_splits > 1
 
     is_split_kv = num_splits > 1 and not fused_split
     if is_split_kv:
