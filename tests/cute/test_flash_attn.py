@@ -438,6 +438,50 @@ def test_flash_attn_output(
             ).abs().max().item() + dv_atol
 
 
+# Regression test for #2591: SMEM overflow at small head_dims on SM100. The main
+# test_flash_attn_output skips d < 64, but _validate_head_dims accepts head_dim >= 8
+# for sm_100/110, so this path needs coverage. Trigger requires
+# seqlen_q_packgqa > tile_m to push q_stage 1->2.
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("d", [8, 16, 32])
+@pytest.mark.parametrize("seqlen_q,seqlen_k", [(128, 128), (2048, 2048)])
+@retry_on_oom
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_small_head_dim(seqlen_q, seqlen_k, d, causal, dtype):
+    device = "cuda"
+    seed = 0
+    random.seed(seed)
+    torch.random.manual_seed(seed)
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    batch_size = 2
+    nheads = 2
+    nheads_kv = nheads
+    dtype_ref = dtype
+    q_ref = torch.randn(
+        batch_size, seqlen_q, nheads, d, device=device, dtype=dtype_ref
+    ).requires_grad_()
+    k_ref = torch.randn(
+        batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype_ref
+    ).requires_grad_()
+    v_ref = torch.randn(
+        batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype_ref
+    ).requires_grad_()
+    q, k, v = [x.detach().to(dtype).requires_grad_() for x in (q_ref, k_ref, v_ref)]
+    out_ref, _ = attention_ref(q_ref, k_ref, v_ref, None, None, causal=causal)
+    out_pt, _ = attention_ref(
+        q_ref, k_ref, v_ref, None, None, causal=causal, upcast=False, reorder_ops=True
+    )
+    out, _ = flash_attn_func(q, k, v, causal=causal)
+    if is_fake_mode():
+        return
+    fwd_atol = 2 * (out_ref + 0.3 - 0.3 - out_ref).abs().max().item()
+    assert (out - out_ref).abs().max().item() <= 2 * (
+        out_pt - out_ref
+    ).abs().max().item() + fwd_atol
+
+
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
@@ -2838,3 +2882,64 @@ def test_flash_attn_empty_q_varlen(causal):
     assert out.numel() == 0
     if lse is not None:
         assert lse.numel() == 0
+
+
+@pytest.mark.parametrize("seqlen_k", [512, 1024])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_ex2_emu_decode_prefill_consistency(seqlen_k):
+    """Decode↔prefill must be bitwise consistent for MLA (192,128).
+
+    Regression test: paged decode (seqlen_q=1) vs non-paged prefill
+    (seqlen_q=full) for MLA shapes must produce identical outputs for the
+    last query position.
+    """
+    if IS_SM90:
+        pytest.skip("ex2_emu is SM100+ only")
+
+    device = "cuda"
+    dtype = torch.bfloat16
+    d, dv = 192, 128
+    nheads = nheads_kv = 16
+
+    torch.random.manual_seed(0)
+    q = torch.randn(seqlen_k, nheads, d, device=device, dtype=dtype)
+    k = torch.randn(seqlen_k, nheads_kv, d, device=device, dtype=dtype)
+    v = torch.randn(seqlen_k, nheads_kv, dv, device=device, dtype=dtype)
+
+    # Prefill: full sequence, non-paged, causal
+    cu = torch.tensor([0, seqlen_k], dtype=torch.int32, device=device)
+    out_prefill, _ = flash_attn_varlen_func(
+        q, k, v,
+        cu_seqlens_q=cu, cu_seqlens_k=cu,
+        max_seqlen_q=seqlen_k, max_seqlen_k=seqlen_k,
+        causal=True,
+    )
+
+    # Decode: seqlen_q=1 at last position, paged KV, causal
+    page_size = 128
+    num_pages = (seqlen_k + page_size - 1) // page_size
+    k_cache = torch.zeros(num_pages, page_size, nheads_kv, d, device=device, dtype=dtype)
+    v_cache = torch.zeros(num_pages, page_size, nheads_kv, dv, device=device, dtype=dtype)
+    for i in range(seqlen_k):
+        k_cache[i // page_size, i % page_size] = k[i]
+        v_cache[i // page_size, i % page_size] = v[i]
+    page_table = torch.arange(num_pages, dtype=torch.int32, device=device).unsqueeze(0)
+    cache_seqlens = torch.tensor([seqlen_k], dtype=torch.int32, device=device)
+
+    out_decode, _ = flash_attn_varlen_func(
+        q[-1:], k_cache, v_cache,
+        cu_seqlens_q=torch.tensor([0, 1], dtype=torch.int32, device=device),
+        cu_seqlens_k=None,
+        max_seqlen_q=1, max_seqlen_k=None,
+        seqused_k=cache_seqlens, page_table=page_table,
+        causal=True,
+    )
+
+    if is_fake_mode():
+        return
+
+    max_diff = (out_prefill[-1] - out_decode[0]).abs().max().item()
+    print(f"decode↔prefill max diff: {max_diff}")
+    assert torch.equal(out_prefill[-1], out_decode[0]), (
+        f"decode↔prefill diverged: max_diff={max_diff}."
+    )
