@@ -134,6 +134,7 @@ class FlashAttentionForwardSm100:
         is_varlen_q: bool = False,
         use_2cta_instrs: bool = False,
         use_clc_scheduler: bool = False,
+        fused_split: bool = False,
     ):
         self.use_tma_KV = not paged_kv_non_tma
         # self.dtype = dtype
@@ -179,6 +180,11 @@ class FlashAttentionForwardSm100:
         self.use_correction_warps_for_epi = is_varlen_q
         self.qhead_per_kvhead = qhead_per_kvhead
         self.is_split_kv = is_split_kv
+        # Fused prefill SplitKV: one CTA per query tile internally segments the KV loop into
+        # n_blocks_per_split chunks and online-merges the per-segment partials in-kernel, so
+        # there are no gmem partials and no separate combine kernel. Milestone 1 supports
+        # q_stage==1 only (needs a free tmem column range for the running accumulator).
+        self.fused_split = fused_split
         self.pack_gqa = pack_gqa
         self.q_subtile_factor = q_subtile_factor
         assert not (self.is_split_kv and self.head_dim_v_padded >= 192), (
@@ -288,6 +294,13 @@ class FlashAttentionForwardSm100:
             for i in range(self.q_stage)
         ]  # e.g., 256, 384
         self.tmem_total = self.tmem_o_offset[-1] + self.head_dim_v_padded
+        # Fused prefill (M1): place the running merged-output accumulator Oacc_run in the
+        # free tmem columns after tmem_total. Only fits at q_stage==1 (q_stage==2 fills tmem).
+        self.tmem_oacc_offset = None
+        if self.fused_split:
+            assert self.q_stage == 1, "fused_split milestone 1 supports q_stage==1 only"
+            self.tmem_oacc_offset = self.tmem_total
+            self.tmem_total = self.tmem_oacc_offset + self.head_dim_v_padded
         assert self.tmem_total <= self.tmem_alloc_cols
         self.tmem_s_to_p_offset = self.n_block_size // 2
         self.tmem_p_offset = [
