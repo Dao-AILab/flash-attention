@@ -3,6 +3,7 @@
 
 import os
 import math
+import warnings
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Optional, Tuple, Callable
@@ -267,6 +268,37 @@ def num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, max_splits):
     return min(num_SMs // total_mblocks, max_splits, num_n_blocks)
 
 
+def split_size_to_num_splits(split_size, tile_n, num_n_blocks, max_splits=256):
+    """Convert a fixed split_size (in KV tokens) into (num_splits, n_blocks_per_split).
+
+    Each split covers exactly ``n_blocks_per_split`` tile_n-blocks (the last in-range
+    split takes the remainder), giving seqlen-invariant, tile-aligned split boundaries.
+    Because the boundaries are absolute KV positions (0, S, 2S, ...), prefill (len L) and
+    a later decode step (len L+t) partition the shared prefix [0, L) identically -- this
+    is what makes prefill<->decode bitwise consistent when both pass the same split_size.
+
+    If the implied split count exceeds ``max_splits`` (the combine-kernel cap), clamp
+    num_splits and fall back to even-division (n_blocks_per_split=None) so that the KV
+    tail beyond the last split is still covered (otherwise output would be silently wrong).
+    Returns n_blocks_per_split=None whenever splitting collapses to a single split.
+    """
+    n_blocks_per_split = max((split_size + tile_n - 1) // tile_n, 1)
+    derived = (num_n_blocks + n_blocks_per_split - 1) // n_blocks_per_split
+    num_splits = max(1, min(derived, max_splits))
+    if derived > max_splits:
+        warnings.warn(
+            f"split_size={split_size} (={n_blocks_per_split} KV blocks of {tile_n}) implies "
+            f"{derived} splits, exceeding the {max_splits} cap; clamping num_splits to "
+            f"{max_splits} and falling back to even-division (KV tail still covered, but "
+            f"splits are no longer exactly split_size).",
+            stacklevel=2,
+        )
+        n_blocks_per_split = None
+    if num_splits <= 1:
+        n_blocks_per_split = None
+    return num_splits, n_blocks_per_split
+
+
 def _resolve_causal_local_window(causal, window_size_left, window_size_right, mask_mod=None):
     """Resolve causal/local/window settings into canonical form.
 
@@ -313,6 +345,7 @@ def _flash_attn_fwd(
     intra_wg_overlap: Optional[bool] = None,
     num_threads: int = 384,
     num_splits: int = 1,
+    split_size: Optional[int] = None,
     pack_gqa: Optional[bool] = None,
     _arch: Optional[int] = None,
     score_mod: Optional[Callable] = None,
@@ -523,6 +556,24 @@ def _flash_attn_fwd(
     if pack_gqa and qv is not None and 128 % qhead_per_kvhead != 0:
         pack_gqa = False
 
+    # split_size: user-controlled, seqlen-invariant, tile-aligned KV split size (in tokens),
+    # mutually exclusive with an explicit num_splits>1. Only the SM100/110 SplitKV path
+    # supports it. The num_splits count is derived from split_size below, once tile_n and
+    # num_n_blocks are known.
+    if split_size is not None:
+        assert num_splits == 1, (
+            "Pass either num_splits or split_size, not both; split_size derives num_splits."
+        )
+        assert split_size > 0, "split_size must be a positive number of KV tokens"
+        if arch // 10 not in (10, 11):
+            raise NotImplementedError("split_size (SplitKV) is only supported on SM100/110")
+        if qv is not None:
+            raise NotImplementedError("split_size is not supported with qv")
+        if head_dim == 256 and head_dim_v == 256:
+            raise NotImplementedError("split_size is not supported with the head_dim=256 kernel")
+        if head_dim != head_dim_v and head_dim_v == 512:
+            raise NotImplementedError("split_size is not supported for diff-headdim with head_dim_v=512")
+
     if max_seqlen_q is None:
         max_seqlen_q = seqlen_q if cu_seqlens_q is None else total_q
     if max_seqlen_k is None:
@@ -544,9 +595,29 @@ def _flash_attn_fwd(
     if num_splits < 1:
         num_splits = num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, 128)
 
-    # SplitKV uses float32 partial output, which doubles the O buffer size
-    # in shared memory, causing OOM for diff-headdim (192, 128)
-    if arch // 10 in [10, 11] and head_dim != head_dim_v and num_splits > 1:
+    # Derive num_splits from a fixed split_size. n_blocks_per_split=None means the kernel
+    # uses regular even-division by num_splits; a non-None value pins each split to exactly
+    # that many tile_n-blocks. This is what enables prefill (seqlen_q>1) to split KV with
+    # the same boundaries as decode, so the two are bitwise consistent.
+    n_blocks_per_split = None
+    if split_size is not None:
+        # SplitKV's fp32 partial-O doubles SMEM and OOMs at tile_n=128 for diff-headdim
+        # shapes (e.g. MLA 192/128), so the kernel must use tile_n=64. Unlike the regular
+        # num_splits guard below -- which only shrinks tile_n once seqlen is large enough
+        # to split -- we pin tile_n for ALL sequence lengths here. Otherwise a short decode
+        # (tile_n=128) and a long prefill (tile_n=64) would tile the same token's KV
+        # differently and break bitwise decode<->prefill consistency across lengths.
+        if arch // 10 in [10, 11] and head_dim != head_dim_v and head_dim_v != 512:
+            tile_n = 64
+            num_n_blocks = (seqlen_k_loaded + tile_n - 1) // tile_n
+        num_splits, n_blocks_per_split = split_size_to_num_splits(split_size, tile_n, num_n_blocks)
+        # TODO: fix GQA + SplitKV + non-varlen (mirror of the guard above for the derived count)
+        if pack_gqa and num_splits != 1 and cu_seqlens_q is None:
+            pack_gqa = False
+    elif arch // 10 in [10, 11] and head_dim != head_dim_v and num_splits > 1:
+        # Regular num_splits path: shrink tile_n only once there are enough blocks to split,
+        # otherwise disable splitting. (split_size is handled above with a seqlen-invariant
+        # tile_n so it is intentionally excluded here.)
         if num_n_blocks >= 64 and head_dim_v != 512:
             tile_n = 64
             num_n_blocks = (seqlen_k_loaded + tile_n - 1) // tile_n
@@ -705,6 +776,7 @@ def _flash_attn_fwd(
         q_stage,
         num_threads,
         is_split_kv,
+        n_blocks_per_split is not None,  # fixed-size vs even-division split mode (compile-time branch)
         pack_gqa,
         arch,
         page_size not in [None, tile_n],  # paged KV non-TMA
@@ -973,6 +1045,8 @@ def _flash_attn_fwd(
             ]
             if arch // 10 in [10, 11]:
                 compile_args.append(descale_tensors_tensor)
+                if not use_dedicated_hd256_kernel:
+                    compile_args.append(n_blocks_per_split)
             compile_args.extend([
                 sparse_tensors,
                 cute_aux_tensors,
@@ -1034,6 +1108,8 @@ def _flash_attn_fwd(
             ]
             if arch // 10 in [10, 11]:
                 call_args.append(descale_tensors)
+                if not use_dedicated_hd256_kernel:
+                    call_args.append(n_blocks_per_split)
             call_args.extend([
                 (
                     normalized_block_sparse_tensors.mask_block_cnt,
@@ -1930,6 +2006,7 @@ class FlashAttnFunc(torch.autograd.Function):
         learnable_sink: Optional[torch.Tensor] = None,
         softcap: float = 0.0,
         num_splits: int = 1,
+        split_size: Optional[int] = None,
         pack_gqa: Optional[bool] = None,
         deterministic: bool = False,
         score_mod: Optional[Callable] = None,
@@ -1952,6 +2029,7 @@ class FlashAttnFunc(torch.autograd.Function):
             learnable_sink=learnable_sink,
             softcap=softcap,
             num_splits=num_splits,
+            split_size=split_size,
             pack_gqa=pack_gqa,
             score_mod=score_mod,
             mask_mod=mask_mod,
@@ -2028,6 +2106,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         learnable_sink: Optional[torch.Tensor] = None,
         softcap: float = 0.0,
         num_splits: int = 1,
+        split_size: Optional[int] = None,
         pack_gqa: Optional[bool] = None,
         deterministic: bool = False,
         score_mod: Optional[Callable] = None,
@@ -2057,6 +2136,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             learnable_sink=learnable_sink,
             softcap=softcap,
             num_splits=num_splits,
+            split_size=split_size,
             pack_gqa=pack_gqa,
             score_mod=score_mod,
             mask_mod=mask_mod,
@@ -2138,6 +2218,7 @@ def flash_attn_func(
     learnable_sink: Optional[torch.Tensor] = None,
     softcap: float = 0.0,
     num_splits: int = 1,
+    split_size: Optional[int] = None,
     pack_gqa: Optional[bool] = None,
     deterministic: bool = False,
     score_mod: Optional[Callable] = None,
@@ -2160,6 +2241,7 @@ def flash_attn_func(
         learnable_sink,
         softcap,
         num_splits,
+        split_size,
         pack_gqa,
         deterministic,
         score_mod,
@@ -2192,6 +2274,7 @@ def flash_attn_varlen_func(
     learnable_sink: Optional[torch.Tensor] = None,
     softcap: float = 0.0,
     num_splits: int = 1,
+    split_size: Optional[int] = None,
     pack_gqa: Optional[bool] = None,
     deterministic: bool = False,
     score_mod: Optional[Callable] = None,
@@ -2235,6 +2318,7 @@ def flash_attn_varlen_func(
         learnable_sink,
         softcap,
         num_splits,
+        split_size,
         pack_gqa,
         deterministic,
         score_mod,

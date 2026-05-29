@@ -381,6 +381,7 @@ class FlashAttentionForwardSm100:
         window_size_right: Int32 | int | None = None,
         learnable_sink: Optional[cute.Tensor] = None,
         descale_tensors: Optional[DescaleTensors] = None,
+        n_blocks_per_split: Int32 | int | None = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors: Optional[list] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
@@ -722,6 +723,7 @@ class FlashAttentionForwardSm100:
         softmax_scale_log2, softmax_scale = utils.compute_softmax_scale_log2(softmax_scale, self.score_mod)
         window_size_left = Int32(window_size_left) if window_size_left is not None else None
         window_size_right = Int32(window_size_right) if window_size_right is not None else None
+        n_blocks_per_split = Int32(n_blocks_per_split) if n_blocks_per_split is not None else None
         fastdiv_mods = utils.compute_fastdiv_mods(mQ, mK, self.qhead_per_kvhead, self.pack_gqa, aux_tensors, mPageTable)
 
         head_divmod = None
@@ -770,6 +772,7 @@ class FlashAttentionForwardSm100:
             tiled_mma_pv,
             tile_sched_params,
             num_splits,
+            n_blocks_per_split,
             aux_tensors,
             fastdiv_mods,
             head_divmod,
@@ -829,6 +832,7 @@ class FlashAttentionForwardSm100:
         tiled_mma_pv: cute.TiledMma,
         tile_sched_params: ParamsBase,
         num_splits: Int32,
+        n_blocks_per_split: Optional[Int32] = None,
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
         head_divmod=None,
@@ -1063,6 +1067,7 @@ class FlashAttentionForwardSm100:
             window_size_left,
             window_size_right,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+            n_blocks_per_split=n_blocks_per_split,
         )
         SeqlenInfoCls = partial(
             SeqlenInfoQK.create,
