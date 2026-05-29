@@ -1,20 +1,25 @@
 # Copyright (c) 2025, Tri Dao.
-"""Correctness tests for FA4 (CuTe SM100) dropout against FA2.
+"""Correctness tests for FA4 (CuTe SM100) varlen dropout against FA2 varlen.
 
-Layout & conventions follow ``tests/cute/test_flash_attn.py``:
+Layout & conventions:
 
-  * FA4's CuTe SM100 forward / backward kernels are the device under test.
-  * FA2 (the legacy CUDA build) is the bit-identical reference for the
-    dropout pattern when both are fed the same Philox seed/offset.
+  * FA4's CuTe SM100 ``flash_attn_varlen_func`` is the device under test.
+    Inputs are the standard packed ``(total_tokens, nheads, headdim)``
+    buffers with cumulative-sequence-length tensors.
+  * FA2 varlen (``_flash_attn_varlen_forward`` / ``_flash_attn_varlen_backward``)
+    is the bit-identical reference for the dropout pattern when both are fed
+    the same Philox seed/offset.
   * ``attention_ref`` is the upcast fp32 reference used to bound FA4's
-    numerical error.
+    numerical error; it accepts ``query_padding_mask`` / ``key_padding_mask``
+    so we can express the varlen valid region without unpacking.
 
 Both implementations share the FA2 Philox convention, so the per-element
-``dropout_mask`` returned by FA4 and ``S_dmask`` returned by FA2 must agree
-exactly in the valid (non-causal-masked) region. The forward output and the
-gradients ``dq / dk / dv`` are checked against fp32 reference with a tolerance
-scaled by FA2's own error against the same reference - this matches the
-standard FA2/FA4 comparison style used throughout the codebase.
+``dropout_mask`` returned by FA4 must agree exactly with
+``S_dmask >= 0`` returned by FA2 in the per-batch valid (non-padding,
+non-causal-masked) region. The forward output and the gradients
+``dq / dk / dv`` are checked against fp32 reference with a tolerance
+scaled by FA2's own error against the same reference — the standard
+FA2/FA4 comparison style used throughout the codebase.
 
 Run with::
 
@@ -25,16 +30,21 @@ import math
 
 import pytest
 import torch
-from einops import rearrange, repeat
 
-from flash_attn.cute.testing import attention_ref
-from flash_attn.cute.interface import flash_attn_func as fa4_flash_attn_func
-
-# Legacy FA2 entry points (always-on rng_state low-level API).
-from flash_attn.flash_attn_interface import (
-    _flash_attn_forward as fa2_flash_attn_forward,
-    _flash_attn_backward as fa2_flash_attn_backward,
+from flash_attn.cute.testing import (
+    attention_ref,
+    generate_qkv,
+    generate_random_padding_mask,
 )
+from flash_attn.cute.interface import flash_attn_varlen_func as fa4_varlen_func
+
+# Call the FA2 C++ kernels directly: the Python wrappers in
+# ``flash_attn.flash_attn_interface`` were authored against a newer FA2 ABI
+# that passes ``num_splits`` to ``varlen_fwd`` / ``varlen_bwd``, but the
+# legacy FA2 binary on this machine doesn't accept that arg. Going through
+# ``flash_attn_2_cuda`` directly keeps the test independent of the wrapper
+# evolution and matches what the wrapper would do internally.
+import flash_attn_2_cuda  # noqa: E402
 
 
 IS_SM100 = (
@@ -48,72 +58,114 @@ requires_sm100 = pytest.mark.skipif(
 )
 
 
-def _fa2_fwd_with_rng(q, k, v, causal, p_dropout, softmax_scale, seed, offset):
-    """Run FA2 forward with a controlled Philox state."""
+def _fa2_varlen_fwd_with_rng(
+    q, k, v, cu_q, cu_k, max_q, max_k,
+    causal, p_dropout, softmax_scale, seed, offset,
+):
+    """Run FA2 varlen forward with a controlled Philox state.
+
+    Bypasses ``_flash_attn_varlen_forward`` (which appends ``num_splits``);
+    the underlying C++ ``varlen_fwd`` here takes exactly 21 positional args.
+    Returns the same ``(out, lse, S_dmask, rng_state)`` tuple the wrapper
+    would.
+    """
     gen = torch.cuda.default_generators[torch.cuda.current_device()]
     gen.manual_seed(seed)
     gen.set_offset(offset)
-    out, lse, S_dmask, rng_state = fa2_flash_attn_forward(
+    out, lse, S_dmask, rng_state = flash_attn_2_cuda.varlen_fwd(
         q, k, v,
-        dropout_p=p_dropout,
-        softmax_scale=softmax_scale,
-        causal=causal,
-        window_size_left=-1,
-        window_size_right=-1,
-        softcap=0.0,
-        alibi_slopes=None,
-        return_softmax=True,
+        None,         # out (allocated by kernel)
+        cu_q, cu_k,
+        None,         # seqused_k
+        None,         # leftpad_k
+        None,         # block_table
+        None,         # alibi_slopes
+        max_q, max_k,
+        p_dropout, softmax_scale,
+        False,        # zero_tensors
+        causal,
+        -1, -1,       # window_size_{left,right}
+        0.0,          # softcap
+        True,         # return_softmax
+        None,         # generator (state is set above via gen.manual_seed)
     )
     return out, lse, S_dmask, rng_state
 
 
-def _fa2_bwd_with_rng(dout, q, k, v, out, lse, p_dropout, softmax_scale, causal, rng_state):
+def _fa2_varlen_bwd_with_rng(
+    dout, q, k, v, out, lse,
+    cu_q, cu_k, max_q, max_k,
+    p_dropout, softmax_scale, causal, rng_state,
+):
+    """Run FA2 varlen backward, again calling the C++ kernel directly so
+    the test is robust to wrapper-vs-binary version skew."""
     dq = torch.empty_like(q)
     dk = torch.empty_like(k)
     dv = torch.empty_like(v)
-    fa2_flash_attn_backward(
+    flash_attn_2_cuda.varlen_bwd(
         dout, q, k, v, out, lse,
         dq, dk, dv,
-        dropout_p=p_dropout,
-        softmax_scale=softmax_scale,
-        causal=causal,
-        window_size_left=-1,
-        window_size_right=-1,
-        softcap=0.0,
-        alibi_slopes=None,
-        deterministic=True,
-        rng_state=rng_state,
+        cu_q, cu_k,
+        None,         # alibi_slopes
+        max_q, max_k,
+        p_dropout, softmax_scale,
+        False,        # zero_tensors
+        causal,
+        -1, -1,       # window_size_{left,right}
+        0.0,          # softcap
+        True,         # deterministic
+        None,         # gen (rng_state replays Philox state)
+        rng_state,
     )
     return dq, dk, dv
 
 
-def _mask_match_rate(fa4_mask, fa2_S_dmask, causal):
-    """Compare dropout masks in the valid (non-causal-masked) region.
+def _varlen_valid_mask(seqlens_q, seqlens_k, max_q, max_k, causal, device):
+    """Boolean mask of shape ``(B, max_q, max_k)`` marking positions that the
+    kernels are expected to populate (the rest is left at the buffer's zero
+    initializer).
 
-    Returns (match_rate, total_count). FA4 mask: uint8 (b, h, sq, sk),
-    1 = kept, 0 = dropped. FA2 ``S_dmask``: bf16 (b, h, sq, sk),
-    >=0 = kept, <0 = dropped.
+    For batch element ``b``, a cell ``(q_idx, k_idx)`` is valid iff
+    ``q_idx < seqlens_q[b]`` AND ``k_idx < seqlens_k[b]`` AND
+    (if ``causal``) ``k_idx <= q_idx + (seqlens_k[b] - seqlens_q[b])``.
     """
-    fa2_keep = (fa2_S_dmask >= 0).to(torch.uint8)
-    b, h, sq, sk = fa4_mask.shape
-    fa2_keep = fa2_keep[:, :, :sq, :sk]
+    B = seqlens_q.numel()
+    q_idx = torch.arange(max_q, device=device).view(1, max_q, 1)
+    k_idx = torch.arange(max_k, device=device).view(1, 1, max_k)
+    sq = seqlens_q.view(B, 1, 1)
+    sk = seqlens_k.view(B, 1, 1)
+    valid = (q_idx < sq) & (k_idx < sk)
     if causal:
-        valid = torch.tril(
-            torch.ones(sq, sk, dtype=torch.bool, device=fa4_mask.device),
-            diagonal=sk - sq,
-        )
-        fa2_valid = fa2_keep[..., valid]
-        fa4_valid = fa4_mask[..., valid]
-    else:
-        fa2_valid = fa2_keep
-        fa4_valid = fa4_mask
-    match = (fa2_valid == fa4_valid).sum().item()
-    total = fa2_valid.numel()
+        offset = sk - sq  # bottom-right causal alignment
+        valid &= k_idx <= (q_idx + offset)
+    return valid  # (B, max_q, max_k) bool
+
+
+def _mask_match_rate_varlen(
+    fa4_mask, fa2_S_dmask, seqlens_q, seqlens_k, causal,
+):
+    """Bit-compare FA4 vs FA2 dropout decisions in the per-batch valid region.
+
+    ``fa4_mask``: uint8 ``(B, H, max_q, max_k)``, 1 = kept / 0 = dropped.
+    ``fa2_S_dmask``: bf16 ``(B, H, round_up_128(max_q), round_up_128(max_k))``;
+    decisions are ``>= 0`` for kept / ``< 0`` for dropped.
+    Padding-region cells outside per-batch seqlens are ignored on both sides
+    because the FA4 buffer is zero-initialised there and FA2 may leave
+    arbitrary values from the padded softmax stage.
+    """
+    B, H, max_q, max_k = fa4_mask.shape
+    fa2_keep = (fa2_S_dmask[:, :, :max_q, :max_k] >= 0).to(torch.uint8)
+    valid = _varlen_valid_mask(
+        seqlens_q, seqlens_k, max_q, max_k, causal, fa4_mask.device,
+    )  # (B, max_q, max_k)
+    valid_4d = valid.unsqueeze(1).expand(B, H, max_q, max_k)
+    match = ((fa4_mask == fa2_keep) & valid_4d).sum().item()
+    total = valid_4d.sum().item()
     return (match / max(total, 1)), total
 
 
 # ---------------------------------------------------------------------------
-# Forward + backward correctness: FA4 vs FA2 with identical Philox state
+# Forward + backward correctness: FA4 varlen vs FA2 varlen
 # ---------------------------------------------------------------------------
 
 @requires_sm100
@@ -127,37 +179,71 @@ def _mask_match_rate(fa4_mask, fa2_S_dmask, causal):
         (2, 128, 4),
         (2, 256, 4),
         (1, 512, 8),
+        (4, 192, 4),  # B=4 with jagged lengths exercises the per-row philox math
     ],
 )
-def test_flash_attn_dropout_output(batch, seqlen, nheads, d, p_dropout, causal, dtype):
-    """FA4 forward + backward with dropout vs FA2 with the same Philox state.
+def test_flash_attn_varlen_dropout_output(
+    batch, seqlen, nheads, d, p_dropout, causal, dtype,
+):
+    """FA4 varlen forward + backward with dropout vs FA2 varlen with the same
+    Philox state.
 
-    Asserts that:
-      1. The dropout decision per (batch, head, q_idx, k_idx) is *bit*-identical
-         to FA2 in the valid region.
-      2. The forward output ``out`` matches the fp32 reference to within a
+    Verifies:
+
+      1. The dropout decision per ``(batch, head, q_idx, k_idx)`` is
+         *bit*-identical to FA2 in the per-batch valid region.
+      2. The forward output ``out`` matches the fp32 reference within a
          tolerance proportional to FA2's own error against the same reference.
       3. The gradients ``dq``, ``dk``, ``dv`` match FA2 to within a tolerance
-         proportional to FA2's own error.
+         proportional to ``|FA2|`` (the standard FA2/FA4 comparison budget).
     """
     device = "cuda"
     torch.manual_seed(0)
     torch.cuda.manual_seed_all(0)
 
-    q_ref = torch.randn(batch, seqlen, nheads, d, device=device, dtype=dtype)
-    k_ref = torch.randn(batch, seqlen, nheads, d, device=device, dtype=dtype)
-    v_ref = torch.randn(batch, seqlen, nheads, d, device=device, dtype=dtype)
-    q = q_ref.detach().clone().requires_grad_()
-    k = k_ref.detach().clone().requires_grad_()
-    v = v_ref.detach().clone().requires_grad_()
+    # ── Dense (B, S, H, D) tensors + a varlen padding mask ────────────────
+    q_dense = torch.randn(batch, seqlen, nheads, d, device=device, dtype=dtype)
+    k_dense = torch.randn(batch, seqlen, nheads, d, device=device, dtype=dtype)
+    v_dense = torch.randn(batch, seqlen, nheads, d, device=device, dtype=dtype)
+
+    # Same padding mask for q and k so the comparison is symmetric.
+    padding_mask = generate_random_padding_mask(seqlen, batch, device, mode="random")
+
+    # ``generate_qkv`` packs into varlen ((total, h, d)) + builds cu_seqlens
+    # and an output_pad_fn that re-pads the FA4/FA2 outputs back to dense.
+    # Returns 17 items (q_u, k_u, v_u, qv_u, cu_q, cu_k, seqused_q, seqused_k,
+    # max_q, max_k, q_d, k_d, v_d, qv_d, output_pad_fn, dq_pad_fn, dk_pad_fn).
+    (
+        q_unpad, k_unpad, v_unpad, _qv_unpad,
+        cu_q, cu_k,
+        _seqused_q, _seqused_k,
+        max_q, max_k,
+        _q_d, _k_d, _v_d, _qv_d,
+        output_pad_fn, _dq_pad_fn, _dk_pad_fn,
+    ) = generate_qkv(
+        q_dense, k_dense, v_dense,
+        query_padding_mask=padding_mask,
+        key_padding_mask=padding_mask,
+    )
+    # Per-batch valid lengths needed for both the mask comparison and the
+    # causal carve-out inside the reference attention.
+    seqlens_q = (cu_q[1:] - cu_q[:-1]).to(torch.int64)
+    seqlens_k = (cu_k[1:] - cu_k[:-1]).to(torch.int64)
+
     softmax_scale = 1.0 / math.sqrt(d)
 
-    # FA4 with a known Philox seed/offset; this is the single source of truth
-    # for the dropout decisions in this test.
+    # ── FA4 varlen with controlled Philox ─────────────────────────────────
+    q_fa4 = q_unpad.detach().clone().requires_grad_()
+    k_fa4 = k_unpad.detach().clone().requires_grad_()
+    v_fa4 = v_unpad.detach().clone().requires_grad_()
     seed, offset = 42, 0
     rng = torch.tensor([seed, offset], dtype=torch.int64)
-    out4, lse4, rng4, mask4 = fa4_flash_attn_func(
-        q, k, v,
+    out_fa4_u, lse_fa4, rng4, mask_fa4 = fa4_varlen_func(
+        q_fa4, k_fa4, v_fa4,
+        cu_seqlens_q=cu_q,
+        cu_seqlens_k=cu_k,
+        max_seqlen_q=max_q,
+        max_seqlen_k=max_k,
         causal=causal,
         softmax_scale=softmax_scale,
         p_dropout=p_dropout,
@@ -166,40 +252,51 @@ def test_flash_attn_dropout_output(batch, seqlen, nheads, d, p_dropout, causal, 
         rng_state=rng,
     )
 
-    # FA2 with the same seed/offset (samples through the CUDA generator we
-    # seed manually).
-    q2 = q_ref.detach().clone().requires_grad_()
-    k2 = k_ref.detach().clone().requires_grad_()
-    v2 = v_ref.detach().clone().requires_grad_()
-    out2, lse2, S_dmask2, rng2 = _fa2_fwd_with_rng(
-        q2, k2, v2,
+    # ── FA2 varlen with the same Philox seed/offset ───────────────────────
+    q_fa2 = q_unpad.detach().clone().requires_grad_()
+    k_fa2 = k_unpad.detach().clone().requires_grad_()
+    v_fa2 = v_unpad.detach().clone().requires_grad_()
+    out_fa2_u, lse_fa2, S_dmask_fa2, rng2 = _fa2_varlen_fwd_with_rng(
+        q_fa2, k_fa2, v_fa2,
+        cu_q, cu_k, max_q, max_k,
         causal=causal,
         p_dropout=p_dropout,
         softmax_scale=softmax_scale,
-        seed=seed,
-        offset=offset,
+        seed=seed, offset=offset,
     )
 
-    # ----- 1. Bit-identical dropout mask in the valid region -------------
-    match_rate, total = _mask_match_rate(mask4, S_dmask2, causal)
+    # ── 1. Bit-identical dropout mask in the per-batch valid region ───────
+    match_rate, total = _mask_match_rate_varlen(
+        mask_fa4, S_dmask_fa2, seqlens_q, seqlens_k, causal,
+    )
     assert match_rate == 1.0, (
-        f"FA4/FA2 dropout masks diverge: match_rate={match_rate:.6f} "
-        f"({total} elements compared)"
+        f"FA4/FA2 varlen dropout masks diverge: match_rate={match_rate:.6f} "
+        f"({total} valid elements compared)"
     )
 
-    # ----- 2. Forward output vs fp32 reference -------------------------
-    # Use the FA4 mask as ground truth (>=1 = kept) and rerun attention in fp32.
-    dropout_mask_bool = mask4.to(torch.bool)
+    # ── 2. Forward output vs fp32 reference (dense, with padding masks) ───
+    # Use FA4's mask as ground truth and re-do attention in fp32.
+    # FA4 emits the mask at the kernel's logical ``(B, H, max_q, max_k)``
+    # extent; the dense reference expects ``(B, H, seqlen, seqlen)``. Pad
+    # with zeros on the right: those positions are also masked out by
+    # ``padding_mask`` inside ``attention_ref`` so the dropout decision in
+    # the padding region is a no-op.
+    B, H = mask_fa4.shape[:2]
+    dropout_mask_bool = torch.zeros(
+        B, H, seqlen, seqlen, dtype=torch.bool, device=device,
+    )
+    dropout_mask_bool[:, :, :max_q, :max_k] = mask_fa4.to(torch.bool)
+    out_fa4_pad = output_pad_fn(out_fa4_u)
     out_ref, _ = attention_ref(
-        q_ref, k_ref, v_ref,
-        None, None,
+        q_dense, k_dense, v_dense,
+        padding_mask, padding_mask,
         dropout_p=p_dropout,
         dropout_mask=dropout_mask_bool,
         causal=causal,
     )
     out_pt, _ = attention_ref(
-        q_ref, k_ref, v_ref,
-        None, None,
+        q_dense, k_dense, v_dense,
+        padding_mask, padding_mask,
         dropout_p=p_dropout,
         dropout_mask=dropout_mask_bool,
         causal=causal,
@@ -212,33 +309,34 @@ def test_flash_attn_dropout_output(batch, seqlen, nheads, d, p_dropout, causal, 
     # (``FA4_DROP_E2E_*`` knobs in softmax.py); this widens the tolerance
     # vs the standard FA4 path.
     rtol = 4
-    err_fa4 = (out4.float() - out_ref.float()).abs().max().item()
+    err_fa4 = (out_fa4_pad.float() - out_ref.float()).abs().max().item()
     err_pt = (out_pt - out_ref).abs().max().item()
     assert err_fa4 <= rtol * err_pt + fwd_atol, (
         f"FA4 fwd error {err_fa4:.4e} vs PT reference error {err_pt:.4e} "
         f"(atol={fwd_atol:.4e}, rtol={rtol})"
     )
 
-    # ----- 3. Backward correctness ------------------------------------
+    # ── 3. Backward correctness ──────────────────────────────────────────
     if d > 128:
-        # bwd path is not exercised here on hd>128 to keep this test focused
+        # Bwd path is not exercised here on hd>128 to keep this test focused
         # on the dropout-specific behaviour; the main test_flash_attn.py
         # covers the bwd kernel itself.
         return
 
-    dout = torch.randn_like(out4)
-    dq4, dk4, dv4 = torch.autograd.grad(out4, (q, k, v), dout)
+    dout_u = torch.randn_like(out_fa4_u)
+    dq4, dk4, dv4 = torch.autograd.grad(out_fa4_u, (q_fa4, k_fa4, v_fa4), dout_u)
 
-    dq2, dk2, dv2 = _fa2_bwd_with_rng(
-        dout, q2, k2, v2, out2, lse2,
+    dq2, dk2, dv2 = _fa2_varlen_bwd_with_rng(
+        dout_u, q_fa2, k_fa2, v_fa2, out_fa2_u, lse_fa2,
+        cu_q, cu_k, max_q, max_k,
         p_dropout=p_dropout,
         softmax_scale=softmax_scale,
         causal=causal,
         rng_state=rng2,
     )
 
-    # FA2 is the reference here (same Philox state, same algorithm); allow
-    # FA4 to be within a multiple of FA2's own bf16 error budget.
+    # Compare in unpadded (varlen) layout: cells outside the valid per-batch
+    # region carry undefined values for both kernels and are not compared.
     for name, g4, g2 in [("dq", dq4, dq2), ("dk", dk4, dk2), ("dv", dv4, dv2)]:
         max_ref = g2.float().abs().max().item()
         atol = 0.06 * max(max_ref, 1.0)
@@ -256,12 +354,12 @@ def test_flash_attn_dropout_output(batch, seqlen, nheads, d, p_dropout, causal, 
 @requires_sm100
 @pytest.mark.parametrize("p_dropout", [0.0, 0.1, 0.25])
 @pytest.mark.parametrize("d", [64, 128])
-def test_flash_attn_dropout_kept_fraction(p_dropout, d):
-    """Empirical kept-fraction of the FA4 dropout mask is close to ``1 - p``.
+def test_flash_attn_varlen_dropout_kept_fraction(p_dropout, d):
+    """Empirical kept-fraction of FA4's varlen dropout mask is close to ``1 - p``.
 
-    Non-causal only so every cell of the iterated tile is written; with causal
-    the kernel skips fully-masked tiles, leaving them at the buffer's zero
-    initialiser which would skew the global mean.
+    Non-causal so every cell in the per-batch valid region is written; with
+    causal the kernel skips fully-masked tiles, leaving them at the buffer's
+    zero initialiser which would skew the global mean.
     """
     device = "cuda"
     torch.manual_seed(0)
@@ -270,24 +368,50 @@ def test_flash_attn_dropout_kept_fraction(p_dropout, d):
     q = torch.randn(batch, seqlen, nheads, d, device=device, dtype=torch.bfloat16)
     k = torch.randn(batch, seqlen, nheads, d, device=device, dtype=torch.bfloat16)
     v = torch.randn(batch, seqlen, nheads, d, device=device, dtype=torch.bfloat16)
+    padding_mask = generate_random_padding_mask(seqlen, batch, device, mode="random")
+
+    (
+        q_u, k_u, v_u, _qv_u,
+        cu_q, cu_k,
+        _sq, _sk,
+        max_q, max_k,
+        *_unused,
+    ) = generate_qkv(
+        q, k, v,
+        query_padding_mask=padding_mask,
+        key_padding_mask=padding_mask,
+    )
 
     rng = torch.tensor([7, 0], dtype=torch.int64)
     if p_dropout == 0.0:
-        out, lse = fa4_flash_attn_func(
-            q, k, v, causal=False, p_dropout=0.0, return_lse=True,
+        out, lse = fa4_varlen_func(
+            q_u, k_u, v_u,
+            cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
+            max_seqlen_q=max_q, max_seqlen_k=max_k,
+            causal=False, p_dropout=0.0, return_lse=True,
         )
         assert out.isfinite().all().item()
         return
 
-    out, lse, _, mask = fa4_flash_attn_func(
-        q, k, v,
+    out, lse, _, mask = fa4_varlen_func(
+        q_u, k_u, v_u,
+        cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
+        max_seqlen_q=max_q, max_seqlen_k=max_k,
         causal=False,
         p_dropout=p_dropout,
         return_dropout_mask=True,
         return_lse=True,
         rng_state=rng,
     )
-    kept = mask.float().mean().item()
+    # Compute kept-fraction only over the per-batch valid (non-padding) region.
+    seqlens_q = (cu_q[1:] - cu_q[:-1]).to(torch.int64)
+    seqlens_k = (cu_k[1:] - cu_k[:-1]).to(torch.int64)
+    valid = _varlen_valid_mask(
+        seqlens_q, seqlens_k, max_q, max_k, causal=False, device=device,
+    )
+    B, H, _, _ = mask.shape
+    valid_4d = valid.unsqueeze(1).expand(B, H, max_q, max_k)
+    kept = (mask.bool() & valid_4d).sum().item() / valid_4d.sum().item()
     expected = 1.0 - p_dropout
     # ~2% slack accounts for finite-sample variance at this tensor size.
     assert abs(kept - expected) < 0.02, (
