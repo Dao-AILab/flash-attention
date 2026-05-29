@@ -624,12 +624,23 @@ class NinjaBuildExtension(BuildExtension):
 
             # calculate the maximum allowed NUM_JOBS based on free memory
             free_memory_gb = psutil.virtual_memory().available / (1024 ** 3)  # free memory in GB
+            # Reserve memory for the OS and other processes. Without this, the
+            # formula below could schedule enough nvcc threads to consume
+            # ~99% of free memory, leaving no headroom for OS/Docker/peak
+            # spikes from heavy CUTLASS template instantiations and triggering
+            # an unrecoverable OOM (kernel cannot run the OOM killer in time).
+            reserved_gb = max(16, free_memory_gb * 0.15)
+            usable_memory_gb = max(0, free_memory_gb - reserved_gb)
             # Assume worst-case peak observed memory usage of ~5GB per NVCC thread.
-            # Limit: peak_threads = max_jobs * nvcc_threads and peak_threads * 5GB <= free_memory.
-            max_num_jobs_memory = max(1, int(free_memory_gb / (5 * nvcc_threads)))
+            # Limit: peak_threads = max_jobs * nvcc_threads and peak_threads * 5GB <= usable_memory.
+            max_num_jobs_memory = max(1, int(usable_memory_gb / (5 * nvcc_threads)))
+
+            # Hard cap to avoid runaway parallelism: returns diminish past ~32 jobs
+            # and per-thread peak spikes become harder to bound on huge machines.
+            max_jobs_cap = 32
 
             # pick lower value of jobs based on cores vs memory metric to minimize oom and swap usage during compilation
-            max_jobs = max(1, min(max_num_jobs_cores, max_num_jobs_memory))
+            max_jobs = max(1, min(max_num_jobs_cores, max_num_jobs_memory, max_jobs_cap))
             print(
                 f"Auto set MAX_JOBS to `{max_jobs}`, NVCC_THREADS to `{nvcc_threads}`. "
                 "If you see memory pressure, please use a lower `MAX_JOBS=N` or `NVCC_THREADS=N` value."
