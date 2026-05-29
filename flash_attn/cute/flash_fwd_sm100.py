@@ -1059,6 +1059,11 @@ class FlashAttentionForwardSm100:
         pv_acc_shape = thr_mma_pv.partition_shape_C(self.mma_tiler_pv[:2])
         tOtO = thr_mma_pv.make_fragment_C(cute.append(pv_acc_shape, self.q_stage))
         tOtO = cute.make_tensor(tOtO.iterator + self.tmem_o_offset[0], tOtO.layout)
+        # Fused prefill: running merged-output accumulator in the free tmem columns.
+        tOacc = None
+        if const_expr(self.fused_split):
+            tOacc = thr_mma_pv.make_fragment_C(cute.append(pv_acc_shape, 1))
+            tOacc = cute.make_tensor(tOacc.iterator + self.tmem_oacc_offset, tOacc.layout)
         tP = cute.make_tensor(tStS.iterator, tP_layout.outer)
         tOrP = thr_mma_pv.make_fragment_A(tP)[None, None, None, 0]
         # Need to multiply by width ratio bc tP is in v_dtype but tmem offsets are in FP32
@@ -1076,7 +1081,9 @@ class FlashAttentionForwardSm100:
             self.cta_tiler[1],
             self.is_causal,
             self.is_local,
-            self.is_split_kv,
+            # Fused prefill uses the same fixed-size split-range math to carve segments;
+            # the kernel's self.is_split_kv stays False (normal output, no gmem partials).
+            self.is_split_kv or self.fused_split,
             window_size_left,
             window_size_right,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
@@ -1311,6 +1318,7 @@ class FlashAttentionForwardSm100:
                 thr_mma_pv,
                 tStS,
                 tOtO,
+                tOacc,
                 sScale,
                 mO,
                 mLSE,
@@ -2384,6 +2392,7 @@ class FlashAttentionForwardSm100:
         thr_mma_pv: cute.ThrMma,
         tStS: cute.Tensor,
         tOtO: cute.Tensor,
+        tOacc: Optional[cute.Tensor],
         sScale: cute.Tensor,
         mO: cute.Tensor,
         mLSE: cute.Tensor,
@@ -2735,6 +2744,54 @@ class FlashAttentionForwardSm100:
                 )
             tOtO_r2t_i = cute.make_tensor(tOtO_r2t.iterator + i * corr_tile_size, tOtO_r2t.layout)
             cute.copy(thr_tmem_store, tOrO_frg, tOtO_r2t_i)
+        cute.arch.fence_view_async_tmem_store()
+
+    @cute.jit
+    def correction_merge(
+        self,
+        thr_mma: cute.ThrMma,
+        tOacc: cute.Tensor,
+        tOseg: cute.Tensor,
+        tidx: Int32,
+        a: Float32,
+        scale_seg: Float32,
+    ):
+        """Online streaming merge of a segment partial into the running accumulator (fused
+        prefill SplitKV). Computes Oacc = Oacc * a + Oseg * scale_seg in tmem, where `a`
+        rescales the running accumulator to the new global max and `scale_seg` = (1/row_sum_seg)
+        * exp2(lse_seg - max_new) folds the segment's own normalization with its merge weight.
+        Mirrors correction_rescale's tmem load/store machinery; per-thread (per-row) scalars."""
+        tOcO = thr_mma.partition_C(cute.make_identity_tensor(self.mma_tiler_pv[:2]))
+        corr_tile_size = 16
+        tmem_load_atom = cute.make_copy_atom(
+            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(corr_tile_size)), self.pv_acc_dtype
+        )
+        tmem_store_atom = cute.make_copy_atom(
+            tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(corr_tile_size)), self.pv_acc_dtype
+        )
+        tOacc_i = cute.composition(tOacc, cute.make_layout((self.m_block_size, corr_tile_size)))
+        tOseg_i = cute.composition(tOseg, cute.make_layout((self.m_block_size, corr_tile_size)))
+        tOcO_i = cute.composition(tOcO, cute.make_layout((self.m_block_size, corr_tile_size)))
+        thr_tmem_load = tcgen05.make_tmem_copy(tmem_load_atom, tOacc_i).get_slice(tidx)
+        thr_tmem_store = tcgen05.make_tmem_copy(tmem_store_atom, tOacc_i).get_slice(tidx)
+        tOacc_t2r = thr_tmem_load.partition_S(tOacc_i)
+        tOseg_t2r = thr_tmem_load.partition_S(tOseg_i)
+        tOrO_t2r_shape = thr_tmem_load.partition_D(tOcO_i).shape
+        tOacc_r2t = thr_tmem_store.partition_D(tOacc_i)
+        frg_count = self.head_dim_v_padded // corr_tile_size
+        for i in cutlass.range_constexpr(frg_count):
+            acc_frg = cute.make_rmem_tensor(tOrO_t2r_shape, self.pv_acc_dtype)
+            seg_frg = cute.make_rmem_tensor(tOrO_t2r_shape, self.pv_acc_dtype)
+            tOacc_t2r_i = cute.make_tensor(tOacc_t2r.iterator + i * corr_tile_size, tOacc_t2r.layout)
+            tOseg_t2r_i = cute.make_tensor(tOseg_t2r.iterator + i * corr_tile_size, tOseg_t2r.layout)
+            cute.copy(thr_tmem_load, tOacc_t2r_i, acc_frg)
+            cute.copy(thr_tmem_load, tOseg_t2r_i, seg_frg)
+            for j in cutlass.range(0, cute.size(acc_frg), 2, unroll_full=True):
+                a0, a1 = cute.arch.mul_packed_f32x2((acc_frg[j], acc_frg[j + 1]), (a, a))
+                s0, s1 = cute.arch.mul_packed_f32x2((seg_frg[j], seg_frg[j + 1]), (scale_seg, scale_seg))
+                acc_frg[j], acc_frg[j + 1] = a0 + s0, a1 + s1
+            tOacc_r2t_i = cute.make_tensor(tOacc_r2t.iterator + i * corr_tile_size, tOacc_r2t.layout)
+            cute.copy(thr_tmem_store, acc_frg, tOacc_r2t_i)
         cute.arch.fence_view_async_tmem_store()
 
     @cute.jit
