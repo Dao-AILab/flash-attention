@@ -754,7 +754,7 @@ def handle_block_sparse_empty_tile_correction_sm100(
     sScale: cute.Tensor,
     stats: list,
     correction_epilogue: Callable,
-    thr_mma_pv: cute.core.ThrMma,
+    thr_mma_pv: cute.ThrMma,
     tOtO: cute.Tensor,
     sO: cute.Tensor,
     pipeline_sm_stats: cutlass.pipeline.PipelineAsync,
