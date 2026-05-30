@@ -3,7 +3,6 @@
 
 import os
 import math
-import warnings
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Optional, Tuple, Callable
@@ -271,23 +270,17 @@ def split_size_to_num_splits(split_size, tile_n, num_n_blocks, max_splits=256):
 
     Each split covers exactly ``n_blocks_per_split`` tile_n-blocks (last split takes the
     remainder) -> seqlen-invariant, tile-aligned boundaries at absolute KV positions, which
-    is what makes prefill<->decode bitwise consistent under the same split_size. If the
-    implied count exceeds ``max_splits`` (combine-kernel cap), clamp and fall back to
-    even-division (n_blocks_per_split=None) so the KV tail stays covered. Returns
+    is what makes prefill<->decode bitwise consistent under the same split_size. Returns
     n_blocks_per_split=None whenever splitting collapses to a single split.
     """
     n_blocks_per_split = max((split_size + tile_n - 1) // tile_n, 1)
     derived = (num_n_blocks + n_blocks_per_split - 1) // n_blocks_per_split
     num_splits = max(1, min(derived, max_splits))
     if derived > max_splits:
-        warnings.warn(
+        raise NotImplementedError(
             f"split_size={split_size} (={n_blocks_per_split} KV blocks of {tile_n}) implies "
-            f"{derived} splits, exceeding the {max_splits} cap; clamping num_splits to "
-            f"{max_splits} and falling back to even-division (KV tail still covered, but "
-            f"splits are no longer exactly split_size).",
-            stacklevel=2,
+            f"{derived} splits, exceeding the {max_splits} cap"
         )
-        n_blocks_per_split = None
     if num_splits <= 1:
         n_blocks_per_split = None
     return num_splits, n_blocks_per_split
@@ -353,6 +346,7 @@ def _flash_attn_fwd(
     k_descale: Optional[torch.Tensor] = None,
     v_descale: Optional[torch.Tensor] = None,
     gather_kv_indices: Optional[torch.Tensor] = None,
+    _disable_fused_split: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for FlashAttention.
 
@@ -581,6 +575,14 @@ def _flash_attn_fwd(
             "Pass either num_splits or split_size, not both; split_size derives num_splits."
         )
         assert split_size > 0, "split_size must be a positive number of KV tokens"
+        if use_block_sparsity:
+            # split_size promises absolute, seqlen-invariant KV boundaries (0, S, 2S, ...).
+            # The SM100 block-sparse path partitions the *block list* by count
+            # (ceil_div(block_count, num_splits) in split_block_range), not by KV position,
+            # so it cannot honor those fixed boundaries and the prefill<->decode bitwise
+            # guarantee would not hold. Reject the combination rather than silently giving a
+            # derived split count with the wrong semantics.
+            raise NotImplementedError("split_size is not supported with block sparsity")
         if arch // 10 not in (10, 11):
             raise NotImplementedError("split_size (SplitKV) is only supported on SM100/110")
         if qv is not None:
@@ -594,6 +596,23 @@ def _flash_attn_fwd(
         max_seqlen_q = seqlen_q if cu_seqlens_q is None else total_q
     if max_seqlen_k is None:
         max_seqlen_k = seqlen_k
+    if split_size is not None and max_seqlen_q > 1:
+        if local:
+            raise NotImplementedError("split_size prefill is not supported with local/window attention")
+        if int(math.ceil(head_dim_v / 16) * 16) > 128:
+            raise NotImplementedError("split_size prefill is not supported with head_dim_v > 128")
+        if (cu_seqlens_q is None) != (cu_seqlens_k is None):
+            raise NotImplementedError("split_size prefill requires matching q/k varlen mode")
+        if page_table is not None:
+            raise NotImplementedError("split_size prefill is not supported with paged KV")
+        if seqused_q is not None or seqused_k is not None:
+            raise NotImplementedError("split_size prefill is not supported with seqused_q/seqused_k")
+        if learnable_sink is not None:
+            raise NotImplementedError("split_size prefill is not supported with learnable_sink")
+        if mask_mod is not None or score_mod is not None:
+            raise NotImplementedError("split_size prefill is not supported with mask_mod/score_mod")
+        if is_fp8:
+            raise NotImplementedError("split_size prefill is not supported with fp8")
     if cu_seqlens_k is None and seqused_k is None:
         min_seqlen_k = seqlen_k 
     seqlen_q_packgqa = max_seqlen_q * qhead_per_kvhead
@@ -601,20 +620,14 @@ def _flash_attn_fwd(
     # in-kernel merge keeps its running accumulator in the tmem columns that are only free
     # at q_stage=1; q_stage=1 also handles large-Q prefill and matches decode's q_stage).
     want_fused = (
-        os.environ.get("FLASH_ATTENTION_FUSED_SPLIT", "0") == "1"
+        not _disable_fused_split
         and split_size is not None
         and arch // 10 in [10, 11]
-        and not causal
         and not local
-        and head_dim == head_dim_v
-        and cu_seqlens_q is None
-        and cu_seqlens_k is None
-        and page_table is None
-        and seqused_q is None
-        and seqused_k is None
-        and mask_mod is None
-        and score_mod is None
-        and not is_fp8
+        and max_seqlen_q is not None
+        and max_seqlen_q > 1
+        and max_seqlen_k is not None
+        and ((max_seqlen_k + tile_n - 1) // tile_n) > ((split_size + tile_n - 1) // tile_n)
         and not use_block_sparsity
         and qv is None
     )
@@ -666,8 +679,8 @@ def _flash_attn_fwd(
     # the KV loop into n_blocks_per_split chunks and online-merges the per-segment partials
     # in registers/tmem -- no gmem out_partial and no separate combine kernel. Bitwise-equal
     # to the gmem split path (same streaming-merge order). Milestone 1 supports q_stage==1
-    # (free tmem for the running accumulator), dense (non-causal/non-local), same-headdim,
-    # non-varlen, non-paged, no mods/fp8/block-sparsity.
+    # (free tmem for the running accumulator), dense (causal/non-causal, non-local),
+    # batched or varlen, non-paged, no mods/fp8/block-sparsity.
     # want_fused already captured the shape eligibility (and forced q_stage=1); engage the
     # fused path only when splitting actually happens (>1 segment) and the size is fixed.
     fused_split = want_fused and n_blocks_per_split is not None and num_splits > 1
@@ -683,7 +696,7 @@ def _flash_attn_fwd(
         and not causal
         and not local
         and not is_split_kv
-        and not want_fused  # decode (split) is non-2CTA; fused must match it -> non-2CTA for bitwise
+        and not want_fused  # split decode is non-2CTA; fused prefill must match it for bitwise
         and cu_seqlens_q is None
         and seqused_q is None
         and not use_block_sparsity
@@ -2073,7 +2086,6 @@ class FlashAttnFunc(torch.autograd.Function):
         learnable_sink: Optional[torch.Tensor] = None,
         softcap: float = 0.0,
         num_splits: int = 1,
-        split_size: Optional[int] = None,
         pack_gqa: Optional[bool] = None,
         deterministic: bool = False,
         score_mod: Optional[Callable] = None,
@@ -2083,6 +2095,9 @@ class FlashAttnFunc(torch.autograd.Function):
         block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
         block_sparse_tensors_bwd: Optional[BlockSparseTensorsTorch] = None,
         return_lse: bool = False,
+        # NB: split_size is appended at the end to preserve positional-argument
+        # compatibility for existing callers (num_splits -> pack_gqa -> ...).
+        split_size: Optional[int] = None,
     ):
         shared_kv = k is v
         if shared_kv and v.shape[-1] == 512:
@@ -2180,7 +2195,6 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         learnable_sink: Optional[torch.Tensor] = None,
         softcap: float = 0.0,
         num_splits: int = 1,
-        split_size: Optional[int] = None,
         pack_gqa: Optional[bool] = None,
         deterministic: bool = False,
         score_mod: Optional[Callable] = None,
@@ -2189,6 +2203,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         block_sparse_tensors: Optional[list] = None,
         aux_tensors: Optional[list] = None,
         return_lse: bool = False,
+        # NB: split_size is appended at the end to preserve positional-argument
+        # compatibility for existing callers (num_splits -> pack_gqa -> ...).
+        split_size: Optional[int] = None,
     ):
         shared_kv = k is v
         if shared_kv and v.shape[-1] == 512:
@@ -2299,7 +2316,6 @@ def flash_attn_func(
     learnable_sink: Optional[torch.Tensor] = None,
     softcap: float = 0.0,
     num_splits: int = 1,
-    split_size: Optional[int] = None,
     pack_gqa: Optional[bool] = None,
     deterministic: bool = False,
     score_mod: Optional[Callable] = None,
@@ -2309,6 +2325,9 @@ def flash_attn_func(
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     block_sparse_tensors_bwd: Optional[BlockSparseTensorsTorch] = None,
     return_lse: bool = False,
+    # Keyword-only and last so it cannot shift the meaning of existing positional args.
+    *,
+    split_size: Optional[int] = None,
 ):
     return FlashAttnFunc.apply(
         q,
@@ -2322,7 +2341,6 @@ def flash_attn_func(
         learnable_sink,
         softcap,
         num_splits,
-        split_size,
         pack_gqa,
         deterministic,
         score_mod,
@@ -2332,6 +2350,7 @@ def flash_attn_func(
         block_sparse_tensors,
         block_sparse_tensors_bwd,
         return_lse,
+        split_size,
     )
 
 
@@ -2355,7 +2374,6 @@ def flash_attn_varlen_func(
     learnable_sink: Optional[torch.Tensor] = None,
     softcap: float = 0.0,
     num_splits: int = 1,
-    split_size: Optional[int] = None,
     pack_gqa: Optional[bool] = None,
     deterministic: bool = False,
     score_mod: Optional[Callable] = None,
@@ -2364,6 +2382,9 @@ def flash_attn_varlen_func(
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     aux_tensors: Optional[list] = None,
     return_lse: bool = False,
+    # Keyword-only and last so it cannot shift the meaning of existing positional args.
+    *,
+    split_size: Optional[int] = None,
 ):
     """
     Tensor arguments:
@@ -2416,7 +2437,6 @@ def flash_attn_varlen_func(
         learnable_sink,
         softcap,
         num_splits,
-        split_size,
         pack_gqa,
         deterministic,
         score_mod,
@@ -2425,6 +2445,7 @@ def flash_attn_varlen_func(
         block_sparse_tensors,
         aux_tensors,
         return_lse,
+        split_size,
     )
 
 

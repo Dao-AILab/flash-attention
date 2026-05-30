@@ -2962,30 +2962,40 @@ def test_flash_attn_empty_q_varlen(causal):
     if lse is not None:
         assert lse.numel() == 0
 
+def _make_paged_kv(k, v, page_size=128):
+    seqlen, nheads_kv, d = k.shape
+    dv = v.shape[-1]
+    num_pages = (seqlen + page_size - 1) // page_size
+    k_cache = torch.zeros(num_pages, page_size, nheads_kv, d, device=k.device, dtype=k.dtype)
+    v_cache = torch.zeros(num_pages, page_size, nheads_kv, dv, device=v.device, dtype=v.dtype)
+    k_cache.view(num_pages * page_size, nheads_kv, d)[:seqlen] = k
+    v_cache.view(num_pages * page_size, nheads_kv, dv)[:seqlen] = v
+    page_table = torch.arange(num_pages, dtype=torch.int32, device=k.device).unsqueeze(0)
+    return k_cache, v_cache, page_table
 
-# (d, dv): MLA (192,128) and a regular same-head-dim (128,128) shape.
+
+def _decode_one(q, k_cache, v_cache, page_table, pos, split_size):
+    return flash_attn_varlen_func(
+        q[pos:pos + 1],
+        k_cache,
+        v_cache,
+        cu_seqlens_q=torch.tensor([0, 1], dtype=torch.int32, device=q.device),
+        cu_seqlens_k=None,
+        max_seqlen_q=1,
+        max_seqlen_k=None,
+        seqused_k=torch.tensor([pos + 1], dtype=torch.int32, device=q.device),
+        page_table=page_table,
+        causal=True,
+        split_size=split_size,
+    )[0]
+
+
 @pytest.mark.parametrize("d, dv", [(192, 128), (128, 128)])
-# split_size=None exercises the regular num_splits=1 path; a concrete value enables
-# flash decoding (SplitKV) on BOTH prefill and decode. For MLA (192,128) the
-# diff-headdim SMEM guard only lets splitting engage at larger seqlen, so we include
-# a large seqlen_k. Boundaries are seqlen-invariant, so prefill and decode partition
-# the shared KV identically and must stay bitwise equal.
-# seqlen capped at 16384 and split_size >= 256 here: prefill SplitKV allocates an
-# fp32 out_partial of (num_splits, total_q, nheads, dv), so num_splits*seqlen must
-# stay bounded to avoid OOM (smaller split_size at long seqlen is exercised by the
-# batch=1 correctness test instead).
 @pytest.mark.parametrize("split_size", [None, 256, 512, 1024])
 @pytest.mark.parametrize("seqlen_k", [1024, 8192, 16384])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_ex2_emu_decode_prefill_consistency(seqlen_k, split_size, d, dv):
-    """Decode↔prefill must be bitwise consistent, including under flash decoding.
-
-    Paged decode (seqlen_q=1) vs non-paged prefill (seqlen_q=full), causal, must
-    produce identical outputs for the last query position. When ``split_size`` is set,
-    SplitKV (flash decoding) is enabled on both sides with the same, seqlen-invariant
-    split boundaries -- so the two execute an identical float-op sequence and stay
-    bitwise equal.
-    """
+    """Paged decode and full causal prefill must match at the last token."""
     if IS_SM90:
         pytest.skip("ex2_emu is SM100+ only")
 
@@ -2998,7 +3008,6 @@ def test_flash_attn_ex2_emu_decode_prefill_consistency(seqlen_k, split_size, d, 
     k = torch.randn(seqlen_k, nheads_kv, d, device=device, dtype=dtype)
     v = torch.randn(seqlen_k, nheads_kv, dv, device=device, dtype=dtype)
 
-    # Prefill: full sequence, non-paged, causal
     cu = torch.tensor([0, seqlen_k], dtype=torch.int32, device=device)
     out_prefill, _ = flash_attn_varlen_func(
         q, k, v,
@@ -3008,32 +3017,15 @@ def test_flash_attn_ex2_emu_decode_prefill_consistency(seqlen_k, split_size, d, 
         split_size=split_size,
     )
 
-    # Decode: seqlen_q=1 at last position, paged KV, causal
-    page_size = 128
-    num_pages = (seqlen_k + page_size - 1) // page_size
-    k_cache = torch.zeros(num_pages, page_size, nheads_kv, d, device=device, dtype=dtype)
-    v_cache = torch.zeros(num_pages, page_size, nheads_kv, dv, device=device, dtype=dtype)
-    k_cache.view(num_pages * page_size, nheads_kv, d)[:seqlen_k] = k
-    v_cache.view(num_pages * page_size, nheads_kv, dv)[:seqlen_k] = v
-    page_table = torch.arange(num_pages, dtype=torch.int32, device=device).unsqueeze(0)
-    cache_seqlens = torch.tensor([seqlen_k], dtype=torch.int32, device=device)
-
-    out_decode, _ = flash_attn_varlen_func(
-        q[-1:], k_cache, v_cache,
-        cu_seqlens_q=torch.tensor([0, 1], dtype=torch.int32, device=device),
-        cu_seqlens_k=None,
-        max_seqlen_q=1, max_seqlen_k=None,
-        seqused_k=cache_seqlens, page_table=page_table,
-        causal=True,
-        split_size=split_size,
-    )
+    k_cache, v_cache, page_table = _make_paged_kv(k, v)
+    out_decode = _decode_one(q, k_cache, v_cache, page_table, seqlen_k - 1, split_size)
 
     if is_fake_mode():
         return
 
-    max_diff = (out_prefill[-1] - out_decode[0]).abs().max().item()
+    max_diff = (out_prefill[-1] - out_decode).abs().max().item()
     print(f"decode↔prefill max diff (d={d}, dv={dv}, seqlen_k={seqlen_k}, split_size={split_size}): {max_diff}")
-    assert torch.equal(out_prefill[-1], out_decode[0]), (
+    assert torch.equal(out_prefill[-1], out_decode), (
         f"decode↔prefill diverged: max_diff={max_diff} "
         f"(d={d}, dv={dv}, seqlen_k={seqlen_k}, split_size={split_size})."
     )
@@ -3077,33 +3069,115 @@ def test_flash_attn_split_size_correctness(seqlen, split_size, causal, d, dv):
     )
 
 
+@pytest.mark.parametrize("varlen", [False, True])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("d, dv", [(128, 128), (192, 128)])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_flash_attn_split_size_too_small_warns():
-    """split_size smaller than seqlen/256 must clamp to 256 splits, warn, and stay correct."""
+def test_flash_attn_fused_split_size_prefill_matches_gmem(varlen, causal, d, dv):
+    """Fused split prefill must preserve the existing gmem SplitKV result."""
     if IS_SM90:
         pytest.skip("SplitKV is SM100+ only")
 
     device = "cuda"
     dtype = torch.bfloat16
-    batch, nheads, d = 1, 4, 128
-    seqlen = 256 * 128 + 256  # > 256 blocks at tile_n=128 -> implied splits exceed the 256 cap
+    seqlens = [1024, 768] if varlen else [1024]
+    seqlen, nheads, split_size = max(seqlens), 4, 256
 
     torch.random.manual_seed(0)
-    q = torch.randn(batch, seqlen, nheads, d, device=device, dtype=dtype)
-    k = torch.randn(batch, seqlen, nheads, d, device=device, dtype=dtype)
-    v = torch.randn(batch, seqlen, nheads, d, device=device, dtype=dtype)
+    if varlen:
+        total_q = sum(seqlens)
+        q = torch.randn(total_q, nheads, d, device=device, dtype=dtype)
+        k = torch.randn(total_q, nheads, d, device=device, dtype=dtype)
+        v = torch.randn(total_q, nheads, dv, device=device, dtype=dtype)
+        cu = torch.tensor([0, *torch.tensor(seqlens).cumsum(0).tolist()], dtype=torch.int32, device=device)
+        kwargs = dict(cu_seqlens_q=cu, cu_seqlens_k=cu, max_seqlen_q=seqlen, max_seqlen_k=seqlen)
+        fwd = flash_attn_varlen_func
+    else:
+        q = torch.randn(1, seqlen, nheads, d, device=device, dtype=dtype)
+        k = torch.randn(1, seqlen, nheads, d, device=device, dtype=dtype)
+        v = torch.randn(1, seqlen, nheads, dv, device=device, dtype=dtype)
+        kwargs = {}
+        fwd = flash_attn_func
 
-    with pytest.warns(UserWarning, match="clamping num_splits"):
-        out_split, _ = flash_attn_func(q, k, v, causal=False, split_size=128)
-    out_ref, _ = flash_attn_func(q, k, v, causal=False, num_splits=1)
+    out_gmem, lse_gmem = _flash_attn_fwd(
+        q,
+        k,
+        v,
+        **kwargs,
+        causal=causal,
+        split_size=split_size,
+        return_lse=True,
+        _disable_fused_split=True,
+    )
+    out_fused, lse_fused = fwd(q, k, v, **kwargs, causal=causal, split_size=split_size, return_lse=True)
 
     if is_fake_mode():
         return
 
-    # Output must not be silently truncated despite the clamp.
-    max_diff = (out_split - out_ref).abs().max().item()
-    assert torch.allclose(out_split, out_ref, atol=2e-2, rtol=1e-2), (
-        f"clamped split_size dropped KV tail or diverged: max_diff={max_diff}."
+    max_diff = (out_fused - out_gmem).abs().max().item()
+    max_lse_diff = (lse_fused - lse_gmem).abs().max().item()
+    assert torch.equal(out_fused, out_gmem), (
+        f"fused split prefill diverged from gmem SplitKV: max_diff={max_diff} "
+        f"(varlen={varlen}, causal={causal}, d={d}, dv={dv})."
+    )
+    assert torch.equal(lse_fused, lse_gmem), (
+        f"fused split prefill LSE diverged from gmem SplitKV: max_lse_diff={max_lse_diff} "
+        f"(varlen={varlen}, causal={causal}, d={d}, dv={dv})."
+    )
+
+
+@pytest.mark.parametrize("varlen", [False, True])
+@pytest.mark.parametrize("d, dv", [(128, 128), (192, 128)])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_fused_split_size_prefill_matches_decode(varlen, d, dv):
+    """Automatic fused split prefill must match same-split flash decoding bitwise."""
+    if IS_SM90:
+        pytest.skip("SplitKV is SM100+ only")
+
+    device = "cuda"
+    dtype = torch.bfloat16
+    seqlen, nheads, split_size = 1024, 4, 256
+
+    torch.random.manual_seed(0)
+    q = torch.randn(seqlen, nheads, d, device=device, dtype=dtype)
+    k = torch.randn(seqlen, nheads, d, device=device, dtype=dtype)
+    v = torch.randn(seqlen, nheads, dv, device=device, dtype=dtype)
+    if varlen:
+        cu = torch.tensor([0, seqlen], dtype=torch.int32, device=device)
+        out_prefill, _ = flash_attn_varlen_func(
+            q, k, v,
+            cu_seqlens_q=cu, cu_seqlens_k=cu,
+            max_seqlen_q=seqlen, max_seqlen_k=seqlen,
+            causal=True,
+            split_size=split_size,
+        )
+    else:
+        out_prefill, _ = flash_attn_func(
+            q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0), causal=True, split_size=split_size
+        )
+        out_prefill = out_prefill[0]
+    k_cache, v_cache, page_table = _make_paged_kv(k, v)
+
+    if is_fake_mode():
+        return
+
+    positions = sorted({
+        split_size - 1,
+        split_size,
+        split_size + 1,
+        2 * split_size,
+        2 * split_size + 1,
+        seqlen - 1,
+    })
+    failures = []
+    for p in positions:
+        out_decode = _decode_one(q, k_cache, v_cache, page_table, p, split_size)
+        if not torch.equal(out_prefill[p], out_decode):
+            failures.append((p, (out_prefill[p] - out_decode).abs().max().item()))
+
+    assert not failures, (
+        f"fused split prefill diverged from same-split decode "
+        f"(varlen={varlen}, d={d}, dv={dv}, split_size={split_size}) at [p, max_diff]: {failures}"
     )
 
 
@@ -3145,13 +3219,7 @@ def test_flash_attn_split_size_autoregressive_consistency(seqlen_k, split_size, 
         split_size=split_size,
     )
 
-    # Paged KV cache holding the whole sequence; each decode step bounds it via seqused_k.
-    num_pages = (seqlen_k + page_size - 1) // page_size
-    k_cache = torch.zeros(num_pages, page_size, nheads_kv, d, device=device, dtype=dtype)
-    v_cache = torch.zeros(num_pages, page_size, nheads_kv, dv, device=device, dtype=dtype)
-    k_cache.view(num_pages * page_size, nheads_kv, d)[:seqlen_k] = k
-    v_cache.view(num_pages * page_size, nheads_kv, dv)[:seqlen_k] = v
-    page_table = torch.arange(num_pages, dtype=torch.int32, device=device).unsqueeze(0)
+    k_cache, v_cache, page_table = _make_paged_kv(k, v, page_size)
 
     if is_fake_mode():
         return
@@ -3167,18 +3235,9 @@ def test_flash_attn_split_size_autoregressive_consistency(seqlen_k, split_size, 
     positions = [p for p in positions if 0 <= p < seqlen_k]
     failures = []
     for p in positions:
-        cache_seqlens = torch.tensor([p + 1], dtype=torch.int32, device=device)
-        out_decode, _ = flash_attn_varlen_func(
-            q[p:p + 1], k_cache, v_cache,
-            cu_seqlens_q=torch.tensor([0, 1], dtype=torch.int32, device=device),
-            cu_seqlens_k=None,
-            max_seqlen_q=1, max_seqlen_k=None,
-            seqused_k=cache_seqlens, page_table=page_table,
-            causal=True,
-            split_size=split_size,
-        )
-        if not torch.equal(out_prefill[p], out_decode[0]):
-            md = (out_prefill[p] - out_decode[0]).abs().max().item()
+        out_decode = _decode_one(q, k_cache, v_cache, page_table, p, split_size)
+        if not torch.equal(out_prefill[p], out_decode):
+            md = (out_prefill[p] - out_decode).abs().max().item()
             failures.append((p, md))
 
     assert not failures, (
