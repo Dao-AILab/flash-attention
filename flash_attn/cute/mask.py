@@ -597,6 +597,7 @@ class AttentionMask:
         check_q_boundary: bool = False,
         r2p: bool = True,
         rBitmask: Optional[cute.Tensor] = None,
+        four_row_layout: cutlass.Constexpr[bool] = False,
     ) -> None:
         assert not (mask_causal and mask_local), "mask_causal and mask_local cannot be both True"
         acc_shape = (self.tile_m, self.tile_n)
@@ -623,7 +624,32 @@ class AttentionMask:
 
         elif const_expr(not mask_causal and not mask_local and mask_mod is None):
             if const_expr(mask_seqlen):
-                if const_expr(not r2p):
+                if const_expr(four_row_layout):
+                    # .16x256b 4-row seqlen-only mask: all 4 rows share the same
+                    # col_limit, so the bitmask is computed once per lane.
+                    lane_col_offset = tScS_t2r[0][1]
+                    col_limit_r2p = sm90_col_to_r2p_idx(
+                        seqlenk_col_limit - lane_col_offset
+                    )
+                    bitmask = r2p_bitmask_below(col_limit_r2p, 0)
+                    for r in cutlass.range_constexpr(4):
+                        am: cutlass.Constexpr[int] = r // 2
+                        i1: cutlass.Constexpr[int] = r % 2
+                        for idx in cutlass.range_constexpr(32):
+                            an: cutlass.Constexpr[int] = idx // 8
+                            res: cutlass.Constexpr[int] = idx % 8
+                            i2: cutlass.Constexpr[int] = res // 2
+                            i0: cutlass.Constexpr[int] = res % 2
+                            cell_idx: cutlass.Constexpr[int] = (
+                                am * 16 + an * 32 + i2 * 4 + i1 * 2 + i0
+                            )
+                            in_bound = cutlass.Boolean(
+                                bitmask & (Uint32(1) << idx)
+                            )
+                            acc_S[cell_idx] = (
+                                acc_S[cell_idx] if in_bound else -Float32.inf
+                            )
+                elif const_expr(not r2p):
                     for i in cutlass.range(cute.size(tScS_t2r.shape), unroll_full=True):
                         # if tScS_t2r[i][1] >= seqlenk_col_limit:
                         #     acc_S[i] = -Float32.inf
@@ -677,6 +703,104 @@ class AttentionMask:
 
         else:  # Causal or local
             causal_row_offset = self.seqlen_k - n_block * self.tile_n - self.seqlen_q
+            if const_expr(four_row_layout):
+                ncol = const_expr(cute.size(tScS_t2r.shape))
+                if const_expr(mask_causal):
+                    # R2P 4-row inline: per-row 32-bit bitmask + 32 cell preds.
+                    #
+                    # In the .16x256b warp layout, 32 lanes are arranged as 8
+                    # row-groups of 4 lanes. Within a row-group (4 lanes), each
+                    # lane has a 2-col offset (lane_in_group * 2) and the
+                    # 4 lanes share the same 4 rows. Different row-groups have
+                    # different rows.
+                    lane_col_offset = tScS_t2r[0][1]  # 0, 2, 4 or 6
+                    for r in cutlass.range_constexpr(4):
+                        am: cutlass.Constexpr[int] = r // 2
+                        i1: cutlass.Constexpr[int] = r % 2
+                        cell_idx_ref: cutlass.Constexpr[int] = am * 16 + i1 * 2
+
+                        cell_row_idx = tScS_t2r[cell_idx_ref][0] + m_block * self.tile_m
+                        if const_expr(self.qhead_per_kvhead_packgqa != 1):
+                            cell_row_idx = cell_row_idx // self.qhead_per_kvhead_packgqa
+                        col_limit_right_r = cell_row_idx + causal_row_offset + 1
+                        if const_expr(mask_seqlen):
+                            col_limit_right_r = cutlass.min(
+                                col_limit_right_r, seqlenk_col_limit
+                            )
+                        col_limit_r2p = sm90_col_to_r2p_idx(
+                            col_limit_right_r - lane_col_offset
+                        )
+                        bitmask = r2p_bitmask_below(col_limit_r2p, 0)
+                        for idx in cutlass.range_constexpr(32):
+                            an: cutlass.Constexpr[int] = idx // 8
+                            res: cutlass.Constexpr[int] = idx % 8
+                            i2: cutlass.Constexpr[int] = res // 2
+                            i0: cutlass.Constexpr[int] = res % 2
+                            cell_idx: cutlass.Constexpr[int] = (
+                                am * 16 + an * 32 + i2 * 4 + i1 * 2 + i0
+                            )
+                            in_bound = cutlass.Boolean(
+                                bitmask & (Uint32(1) << idx)
+                            )
+                            acc_S[cell_idx] = (
+                                acc_S[cell_idx] if in_bound else -Float32.inf
+                            )
+                else:
+                    # .16x256b 4-row R2P local (window) mask. Per-row 32-bit
+                    # bitmask combining right and left window boundaries, then
+                    # applied to 32 cells per row.
+                    lane_col_offset = tScS_t2r[0][1]  # 0, 2, 4 or 6
+                    for r in cutlass.range_constexpr(4):
+                        am: cutlass.Constexpr[int] = r // 2
+                        i1: cutlass.Constexpr[int] = r % 2
+                        cell_idx_ref: cutlass.Constexpr[int] = am * 16 + i1 * 2
+
+                        cell_row_idx = tScS_t2r[cell_idx_ref][0] + m_block * self.tile_m
+                        if const_expr(self.qhead_per_kvhead_packgqa != 1):
+                            cell_row_idx = cell_row_idx // self.qhead_per_kvhead_packgqa
+
+                        if const_expr(self.window_size_right is not None):
+                            col_limit_right_r = (
+                                cell_row_idx
+                                + causal_row_offset
+                                + 1
+                                + self.window_size_right
+                            )
+                        else:
+                            col_limit_right_r = self.tile_n
+                        if const_expr(mask_seqlen):
+                            col_limit_right_r = cutlass.min(
+                                col_limit_right_r, seqlenk_col_limit
+                            )
+                        col_limit_left_r = (
+                            cell_row_idx
+                            + causal_row_offset
+                            - self.window_size_left
+                            if const_expr(self.window_size_left is not None)
+                            else 0
+                        )
+                        col_limit_right_r2p = sm90_col_to_r2p_idx(
+                            col_limit_right_r - lane_col_offset
+                        )
+                        col_limit_left_r2p = sm90_col_to_r2p_idx(
+                            col_limit_left_r - lane_col_offset
+                        )
+                        bitmask = r2p_bitmask_below(col_limit_right_r2p, 0) & r2p_bitmask_above(col_limit_left_r2p, 0)
+                        for idx in cutlass.range_constexpr(32):
+                            an: cutlass.Constexpr[int] = idx // 8
+                            res: cutlass.Constexpr[int] = idx % 8
+                            i2: cutlass.Constexpr[int] = res // 2
+                            i0: cutlass.Constexpr[int] = res % 2
+                            cell_idx: cutlass.Constexpr[int] = (
+                                am * 16 + an * 32 + i2 * 4 + i1 * 2 + i0
+                            )
+                            in_bound = cutlass.Boolean(
+                                bitmask & (Uint32(1) << idx)
+                            )
+                            acc_S[cell_idx] = (
+                                acc_S[cell_idx] if in_bound else -Float32.inf
+                            )
+                return
             row_idx = tScS_t2r[0][0] + m_block * self.tile_m
             if const_expr(self.qhead_per_kvhead_packgqa != 1):
                 row_idx = row_idx // self.qhead_per_kvhead_packgqa

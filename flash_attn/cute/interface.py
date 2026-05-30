@@ -14,7 +14,7 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Int32, Float32
+from cutlass import Int32, Float32, Uint64
 from quack.compile_utils import make_fake_tensor as fake_tensor
 from flash_attn.cute.cache_utils import get_jit_cache
 from flash_attn.cute.testing import is_fake_mode
@@ -326,6 +326,9 @@ def _flash_attn_fwd(
     k_descale: Optional[torch.Tensor] = None,
     v_descale: Optional[torch.Tensor] = None,
     gather_kv_indices: Optional[torch.Tensor] = None,
+    p_dropout: float = 0.0,
+    return_dropout_mask: bool = False,
+    rng_state: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for FlashAttention.
 
@@ -675,6 +678,47 @@ def _flash_attn_fwd(
         sparse_kv = None
         disable_sparse_kv_bitmask = None
 
+    is_dropout = p_dropout > 0.0 and p_dropout < 1.0
+    has_dropout_mask = return_dropout_mask and is_dropout
+    if is_dropout:
+        assert arch // 10 in [10, 11], "p_dropout > 0 is only supported on SM100/SM110 (Blackwell)"
+        assert qv is None, "dropout is not supported with qv (MLA)"
+        assert not is_split_kv, "dropout is not supported with split-KV"
+        assert not use_block_sparsity, "dropout is not supported with block sparsity"
+        assert not use_dedicated_hd256_kernel, "dropout is not supported with hd=256 dedicated kernel"
+    dropout_mask = None
+    mask_row_stride = None
+    if has_dropout_mask:
+        dropout_mask = torch.zeros(
+            batch_size, num_head, max_seqlen_q, max_seqlen_k,
+            dtype=torch.uint8, device=device,
+        )
+        mask_row_stride = Int32(max_seqlen_k)
+
+    rng_seed_scalar = None
+    rng_offset_scalar = None
+    if is_fake_mode():
+        if is_dropout:
+            rng_seed_scalar = 42
+            rng_offset_scalar = 0
+        if rng_state is None and is_dropout:
+            rng_state = torch.zeros(2, dtype=torch.int64)
+    elif rng_state is None:
+        if is_dropout:
+            increment = batch_size * num_head * 32
+            gen = torch.cuda.default_generators[torch.cuda.current_device()]
+            rng_seed_scalar = gen.initial_seed()
+            rng_offset_scalar = gen.get_offset()
+            aligned_increment = ((increment + 3) // 4) * 4
+            gen.set_offset(rng_offset_scalar + aligned_increment)
+            rng_state = torch.tensor(
+                [rng_seed_scalar, rng_offset_scalar], dtype=torch.int64
+            )
+    else:
+        if is_dropout:
+            rng_seed_scalar = int(rng_state[0].item())
+            rng_offset_scalar = int(rng_state[1].item())
+
     compile_key = (
         dtype,
         head_dim,
@@ -718,6 +762,10 @@ def _flash_attn_fwd(
         sparse_kv,
         disable_sparse_kv_bitmask,
         fa_logging.get_fa_log_level(),
+        # Quantize p_dropout so that nearby values share the same compiled
+        # kernel; the kernel bakes a threshold from p_dropout at construction.
+        round(p_dropout, 6),
+        has_dropout_mask,
     )
 
     if compile_key not in _flash_attn_fwd.compile_cache:
@@ -783,6 +831,10 @@ def _flash_attn_fwd(
         aux_tensor_metadata = None
         if aux_tensors is not None:
             cute_aux_tensors = [to_cute_aux_tensor(buf) for buf in aux_tensors]
+
+        dropout_mask_tensor = (
+            to_cute_tensor(dropout_mask) if dropout_mask is not None else None
+        )
 
         qv_tensor = to_cute_tensor(qv) if qv is not None else None
         gather_kv_indices_tensor = to_cute_tensor(gather_kv_indices) if gather_kv_indices is not None else None
@@ -904,6 +956,7 @@ def _flash_attn_fwd(
                     q_subtile_factor=q_subtile_factor,
                     use_2cta_instrs=use_2cta_instrs,
                     use_clc_scheduler=use_clc_scheduler,
+                    dropout_rate=p_dropout,
                 )
         elif arch // 10 == 12:
             # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
@@ -977,6 +1030,16 @@ def _flash_attn_fwd(
                 sparse_tensors,
                 cute_aux_tensors,
             ])
+            if arch // 10 in [10, 11]:
+                # Dropout positional args (mRngState, rng_seed, rng_offset,
+                # mDropoutMask, mask_row_stride) only exist on SM100/SM110.
+                compile_args.extend([
+                    None,  # mRngState placeholder
+                    Uint64(rng_seed_scalar) if is_dropout else None,
+                    Uint64(rng_offset_scalar) if is_dropout else None,
+                    dropout_mask_tensor,
+                    mask_row_stride,
+                ])
             compile_args.append(current_stream)
             _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
                 *compile_args, options="--enable-tvm-ffi"
@@ -1049,6 +1112,16 @@ def _flash_attn_fwd(
                 else None,
                 aux_tensors,
             ])
+            if arch // 10 in [10, 11]:
+                # Dropout runtime args (mRngState, rng_seed, rng_offset,
+                # mDropoutMask, mask_row_stride) only exist on SM100/SM110.
+                call_args.extend([
+                    None,  # mRngState
+                    rng_seed_scalar if is_dropout else None,
+                    rng_offset_scalar if is_dropout else None,
+                    dropout_mask,
+                    int(max_seqlen_k) if has_dropout_mask else None,
+                ])
             _flash_attn_fwd.compile_cache[compile_key](*call_args)
     if is_split_kv:
         _flash_attn_fwd_combine(
@@ -1059,7 +1132,7 @@ def _flash_attn_fwd(
             cu_seqlens_q,
             seqused_q,
         )
-    return out, lse
+    return out, lse, rng_state, dropout_mask
 
 
 _flash_attn_fwd.compile_cache = get_jit_cache("fwd")
@@ -1246,6 +1319,8 @@ def _flash_attn_bwd(
     aux_tensors: Optional[list[torch.Tensor]] = None,
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     dlse: Optional[torch.Tensor] = None,
+    p_dropout: float = 0.0,
+    rng_state: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     arch = _get_device_arch()
     assert arch // 10 in [9, 10, 11, 12], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x, 12.x"
@@ -1599,6 +1674,22 @@ def _flash_attn_bwd(
     else:
         spt = (causal or local) and deterministic
 
+    is_dropout_bwd = p_dropout > 0.0 and p_dropout < 1.0
+    if is_dropout_bwd:
+        assert arch // 10 in [10, 11], "p_dropout > 0 backward is only supported on SM100/SM110 (Blackwell)"
+    bwd_rng_seed_scalar = None
+    bwd_rng_offset_scalar = None
+    if is_dropout_bwd:
+        if is_fake_mode():
+            bwd_rng_seed_scalar = 42
+            bwd_rng_offset_scalar = 0
+        else:
+            assert rng_state is not None, (
+                "rng_state is required for the backward pass when p_dropout > 0"
+            )
+            bwd_rng_seed_scalar = int(rng_state[0].item())
+            bwd_rng_offset_scalar = int(rng_state[1].item())
+
     if arch // 10 in [8, 9, 12]:
         compile_key = (
             arch,
@@ -1677,6 +1768,8 @@ def _flash_attn_bwd(
             # Prevent TVM stride poisoning when only one block is present.
             (seqlen_q_rounded // m_block_size == 1),
             (seqlen_k_rounded // n_block_size == 1),
+            # Same as fwd: bake p_dropout into the cache key.
+            round(p_dropout, 6),
         )
 
     if compile_key not in _flash_attn_bwd.compile_cache:
@@ -1801,6 +1894,7 @@ def _flash_attn_bwd(
                     mask_mod=mask_mod,
                     has_aux_tensors=aux_tensors is not None,
                     subtile_factor=subtile_factor,
+                    dropout_rate=p_dropout,
                 )
 
         # Block sparse tensors for backward use Q-direction indexing (transposed from forward).
@@ -1808,6 +1902,21 @@ def _flash_attn_bwd(
         if normalized_block_sparse_tensors is not None:
             sparse_tensors_compile = to_cute_block_sparse_tensors(normalized_block_sparse_tensors)
         dq_accum_tensor = dq_tensor if use_dedicated_hd256_kernel else dq_accum_tensor
+
+        # Dropout positional args (mRngState, rng_seed, rng_offset) only exist on
+        # SM100/SM110 backward kernels.
+        bwd_supports_dropout = arch // 10 in [10, 11] and not use_dedicated_hd256_kernel
+        if bwd_supports_dropout:
+            dropout_compile_args = (
+                None,  # mRngState placeholder
+                Uint64(bwd_rng_seed_scalar) if is_dropout_bwd else None,
+                Uint64(bwd_rng_offset_scalar) if is_dropout_bwd else None,
+            )
+        else:
+            assert not is_dropout_bwd, (
+                "Dropout backward is only supported on SM100/SM110 (Blackwell)"
+            )
+            dropout_compile_args = ()
 
         # TODO: check @can_implement
         _flash_attn_bwd.compile_cache[compile_key] = cute.compile(
@@ -1833,11 +1942,21 @@ def _flash_attn_bwd(
             dV_semaphore_tensor,
             cute_aux_tensors,
             sparse_tensors_compile,
+            *dropout_compile_args,
             current_stream,
             options="--enable-tvm-ffi",
         )
     if not is_fake_mode():
         dq_accum = dq if use_dedicated_hd256_kernel else dq_accum
+        bwd_supports_dropout = arch // 10 in [10, 11] and not use_dedicated_hd256_kernel
+        if bwd_supports_dropout:
+            dropout_runtime_args = (
+                None,  # mRngState
+                bwd_rng_seed_scalar if is_dropout_bwd else None,
+                bwd_rng_offset_scalar if is_dropout_bwd else None,
+            )
+        else:
+            dropout_runtime_args = ()
         _flash_attn_bwd.compile_cache[compile_key](
             q.detach(),
             k.detach(),
@@ -1871,6 +1990,7 @@ def _flash_attn_bwd(
             )
             if normalized_block_sparse_tensors is not None
             else None,
+            *dropout_runtime_args,
         )
     # Postprocess: convert dq_accum from float32 to dq in bf16/fp16
     # hd=256 2CTA backward has its own internal postprocess, skip here.
@@ -1939,8 +2059,11 @@ class FlashAttnFunc(torch.autograd.Function):
         block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
         block_sparse_tensors_bwd: Optional[BlockSparseTensorsTorch] = None,
         return_lse: bool = False,
+        p_dropout: float = 0.0,
+        return_dropout_mask: bool = False,
+        rng_state: Optional[torch.Tensor] = None,
     ):
-        out, lse = _flash_attn_fwd(
+        out, lse, rng_state, dropout_mask = _flash_attn_fwd(
             q,
             k,
             v,
@@ -1959,8 +2082,11 @@ class FlashAttnFunc(torch.autograd.Function):
             block_sparse_tensors=block_sparse_tensors,
             return_lse=return_lse,
             gather_kv_indices=gather_kv_indices,
+            p_dropout=p_dropout,
+            return_dropout_mask=return_dropout_mask,
+            rng_state=rng_state,
         )
-        ctx.save_for_backward(q, k, v, out, lse, *(aux_tensors or ()))
+        ctx.save_for_backward(q, k, v, out, lse, rng_state, *(aux_tensors or ()))
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size = window_size
@@ -1971,12 +2097,22 @@ class FlashAttnFunc(torch.autograd.Function):
         ctx.score_mod_bwd = score_mod_bwd 
         ctx.mask_mod = mask_mod
         ctx.block_sparse_tensors_bwd = block_sparse_tensors_bwd
+        ctx.p_dropout = p_dropout
+        ctx.return_dropout_mask = return_dropout_mask
         ctx.set_materialize_grads(False)
+        if return_dropout_mask:
+            return out, lse, rng_state, dropout_mask
         return out, lse
 
     @staticmethod
-    def backward(ctx, dout, dlse):
-        q, k, v, out, lse, *aux = ctx.saved_tensors
+    def backward(ctx, *grads):
+        # `grads` has the same length as the tuple we returned from forward.
+        # When return_dropout_mask=True we returned 4 tensors; otherwise 2.
+        if ctx.return_dropout_mask:
+            dout, dlse = grads[0], grads[1]
+        else:
+            dout, dlse = grads[0], grads[1]
+        q, k, v, out, lse, rng_state, *aux = ctx.saved_tensors
         aux_tensors = aux if aux else None
         if not ctx.return_lse:
             dlse = None
@@ -1998,6 +2134,8 @@ class FlashAttnFunc(torch.autograd.Function):
             score_mod=ctx.score_mod,
             score_mod_bwd=ctx.score_mod_bwd,
             mask_mod=ctx.mask_mod,
+            p_dropout=ctx.p_dropout,
+            rng_state=rng_state,
             aux_tensors=aux_tensors,
             block_sparse_tensors=ctx.block_sparse_tensors_bwd,
             dlse=dlse,
@@ -2036,8 +2174,11 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         block_sparse_tensors: Optional[list] = None,
         aux_tensors: Optional[list] = None,
         return_lse: bool = False,
+        p_dropout: float = 0.0,
+        return_dropout_mask: bool = False,
+        rng_state: Optional[torch.Tensor] = None,
     ):
-        out, lse = _flash_attn_fwd(
+        out, lse, rng_state, dropout_mask = _flash_attn_fwd(
             q,
             k,
             v,
@@ -2064,6 +2205,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             aux_tensors=aux_tensors,
             return_lse=return_lse,
             gather_kv_indices=gather_kv_indices,
+            p_dropout=p_dropout,
+            return_dropout_mask=return_dropout_mask,
+            rng_state=rng_state,
         )
         ctx.save_for_backward(
             q,
@@ -2075,6 +2219,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             cu_seqlens_k,
             seqused_q,
             seqused_k,
+            rng_state,
             *(aux_tensors or ()),
         )
         ctx.softmax_scale = softmax_scale
@@ -2087,12 +2232,19 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         ctx.return_lse = return_lse
         ctx.score_mod = score_mod
         ctx.score_mod_bwd = score_mod_bwd
+        ctx.p_dropout = p_dropout
+        ctx.return_dropout_mask = return_dropout_mask
         ctx.set_materialize_grads(False)
+        if return_dropout_mask:
+            return out, lse, rng_state, dropout_mask
         return out, lse
 
     @staticmethod
-    def backward(ctx, dout, dlse):
-        q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, *aux = ctx.saved_tensors
+    def backward(ctx, *grads):
+        # `grads` matches the tuple we returned: 4 entries when
+        # return_dropout_mask=True, 2 entries otherwise.
+        dout, dlse = grads[0], grads[1]
+        q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, rng_state, *aux = ctx.saved_tensors
         aux_tensors = aux if aux else None
         if not ctx.return_lse:
             dlse = None
@@ -2121,6 +2273,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             score_mod_bwd=ctx.score_mod_bwd,
             aux_tensors=aux_tensors,
             dlse=dlse,
+            p_dropout=ctx.p_dropout,
+            rng_state=rng_state,
         )
 
         return dq, dk, dv, *((None,) * 30)
@@ -2147,7 +2301,26 @@ def flash_attn_func(
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     block_sparse_tensors_bwd: Optional[BlockSparseTensorsTorch] = None,
     return_lse: bool = False,
+    p_dropout: float = 0.0,
+    return_dropout_mask: bool = False,
+    rng_state: Optional[torch.Tensor] = None,
 ):
+    """Run forward FlashAttention on SM100 (Blackwell) with optional dropout.
+
+    p_dropout (float): dropout probability in [0, 1). Only SM100/SM110 with
+        non-pack-gqa, non-paged-KV configs are supported. The varlen variant
+        of dropout lives on ``flash_attn_varlen_func``.
+    return_dropout_mask (bool): if True, also returns the dropout-mask tensor
+        of shape (batch, nheads, seqlen_q, seqlen_k) with uint8 entries
+        (1 = kept, 0 = dropped).
+    rng_state (torch.Tensor | None): optional int64 tensor of shape (2,) holding
+        [seed, offset]. If None and p_dropout > 0, it is sampled from the
+        active CUDA generator and advanced.
+
+    Returns:
+        (out, lse) if return_dropout_mask is False; otherwise
+        (out, lse, rng_state, dropout_mask). lse is None unless return_lse=True.
+    """
     return FlashAttnFunc.apply(
         q,
         k,
@@ -2169,6 +2342,9 @@ def flash_attn_func(
         block_sparse_tensors,
         block_sparse_tensors_bwd,
         return_lse,
+        p_dropout,
+        return_dropout_mask,
+        rng_state,
     )
 
 
@@ -2200,6 +2376,9 @@ def flash_attn_varlen_func(
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     aux_tensors: Optional[list] = None,
     return_lse: bool = False,
+    p_dropout: float = 0.0,
+    return_dropout_mask: bool = False,
+    rng_state: Optional[torch.Tensor] = None,
 ):
     """
     Explanation of some optional arguments:
@@ -2214,6 +2393,24 @@ def flash_attn_varlen_func(
 
     min_seqlen_k: for varlen, specifies the minimum kv sequence length for any batch.
         Used with gather_kv_indices to determine if we need oob masking.
+
+    p_dropout (float): dropout probability in [0, 1). Only SM100/SM110 with
+        non-pack-gqa, non-paged-KV configs are supported. The dropout mask is
+        FA2-compatible and the decisions are bit-identical to FA2 given the
+        same (seed, offset).
+    return_dropout_mask (bool): if True, also returns the dropout-mask tensor
+        of shape (batch, nheads, max_seqlen_q, max_seqlen_k) with uint8 entries
+        (1 = kept, 0 = dropped). Positions beyond per-batch seqlens are left as
+        the buffer's zero initializer.
+    rng_state (torch.Tensor | None): optional int64 tensor of shape (2,) holding
+        [seed, offset]. If None and p_dropout > 0, it is sampled from the active
+        CUDA generator and advanced. Returned with the output (when
+        return_dropout_mask=True) so the backward pass can replay Philox.
+
+    Returns:
+        (out, lse) if return_dropout_mask is False; otherwise
+        (out, lse, rng_state, dropout_mask). ``lse`` is None unless
+        return_lse=True.
     """
     return FlashAttnVarlenFunc.apply(
         q,
@@ -2243,6 +2440,9 @@ def flash_attn_varlen_func(
         block_sparse_tensors,
         aux_tensors,
         return_lse,
+        p_dropout,
+        return_dropout_mask,
+        rng_state,
     )
 
 
