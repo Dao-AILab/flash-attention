@@ -565,6 +565,14 @@ def _flash_attn_fwd(
             "Pass either num_splits or split_size, not both; split_size derives num_splits."
         )
         assert split_size > 0, "split_size must be a positive number of KV tokens"
+        if use_block_sparsity:
+            # split_size promises absolute, seqlen-invariant KV boundaries (0, S, 2S, ...).
+            # The SM100 block-sparse path partitions the *block list* by count
+            # (ceil_div(block_count, num_splits) in split_block_range), not by KV position,
+            # so it cannot honor those fixed boundaries and the prefill<->decode bitwise
+            # guarantee would not hold. Reject the combination rather than silently giving a
+            # derived split count with the wrong semantics.
+            raise NotImplementedError("split_size is not supported with block sparsity")
         if arch // 10 not in (10, 11):
             raise NotImplementedError("split_size (SplitKV) is only supported on SM100/110")
         if qv is not None:
@@ -2006,7 +2014,6 @@ class FlashAttnFunc(torch.autograd.Function):
         learnable_sink: Optional[torch.Tensor] = None,
         softcap: float = 0.0,
         num_splits: int = 1,
-        split_size: Optional[int] = None,
         pack_gqa: Optional[bool] = None,
         deterministic: bool = False,
         score_mod: Optional[Callable] = None,
@@ -2016,6 +2023,9 @@ class FlashAttnFunc(torch.autograd.Function):
         block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
         block_sparse_tensors_bwd: Optional[BlockSparseTensorsTorch] = None,
         return_lse: bool = False,
+        # NB: split_size is appended at the end to preserve positional-argument
+        # compatibility for existing callers (num_splits -> pack_gqa -> ...).
+        split_size: Optional[int] = None,
     ):
         out, lse = _flash_attn_fwd(
             q,
@@ -2106,7 +2116,6 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         learnable_sink: Optional[torch.Tensor] = None,
         softcap: float = 0.0,
         num_splits: int = 1,
-        split_size: Optional[int] = None,
         pack_gqa: Optional[bool] = None,
         deterministic: bool = False,
         score_mod: Optional[Callable] = None,
@@ -2115,6 +2124,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         block_sparse_tensors: Optional[list] = None,
         aux_tensors: Optional[list] = None,
         return_lse: bool = False,
+        # NB: split_size is appended at the end to preserve positional-argument
+        # compatibility for existing callers (num_splits -> pack_gqa -> ...).
+        split_size: Optional[int] = None,
     ):
         out, lse = _flash_attn_fwd(
             q,
@@ -2218,7 +2230,6 @@ def flash_attn_func(
     learnable_sink: Optional[torch.Tensor] = None,
     softcap: float = 0.0,
     num_splits: int = 1,
-    split_size: Optional[int] = None,
     pack_gqa: Optional[bool] = None,
     deterministic: bool = False,
     score_mod: Optional[Callable] = None,
@@ -2228,6 +2239,9 @@ def flash_attn_func(
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     block_sparse_tensors_bwd: Optional[BlockSparseTensorsTorch] = None,
     return_lse: bool = False,
+    # Keyword-only and last so it cannot shift the meaning of existing positional args.
+    *,
+    split_size: Optional[int] = None,
 ):
     return FlashAttnFunc.apply(
         q,
@@ -2241,7 +2255,6 @@ def flash_attn_func(
         learnable_sink,
         softcap,
         num_splits,
-        split_size,
         pack_gqa,
         deterministic,
         score_mod,
@@ -2251,6 +2264,7 @@ def flash_attn_func(
         block_sparse_tensors,
         block_sparse_tensors_bwd,
         return_lse,
+        split_size,
     )
 
 
@@ -2274,7 +2288,6 @@ def flash_attn_varlen_func(
     learnable_sink: Optional[torch.Tensor] = None,
     softcap: float = 0.0,
     num_splits: int = 1,
-    split_size: Optional[int] = None,
     pack_gqa: Optional[bool] = None,
     deterministic: bool = False,
     score_mod: Optional[Callable] = None,
@@ -2283,6 +2296,9 @@ def flash_attn_varlen_func(
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     aux_tensors: Optional[list] = None,
     return_lse: bool = False,
+    # Keyword-only and last so it cannot shift the meaning of existing positional args.
+    *,
+    split_size: Optional[int] = None,
 ):
     """
     Explanation of some optional arguments:
@@ -2318,7 +2334,6 @@ def flash_attn_varlen_func(
         learnable_sink,
         softcap,
         num_splits,
-        split_size,
         pack_gqa,
         deterministic,
         score_mod,
@@ -2327,6 +2342,7 @@ def flash_attn_varlen_func(
         block_sparse_tensors,
         aux_tensors,
         return_lse,
+        split_size,
     )
 
 
