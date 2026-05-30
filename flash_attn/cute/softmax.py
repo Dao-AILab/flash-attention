@@ -1591,15 +1591,15 @@ def apply_score_mod_bwd_inner(
         q_idx_pos = cutlass.const_expr(0)
         kv_idx_pos = cutlass.const_expr(1)
     n_vals = cutlass.const_expr(cute.size(grad_tensor.shape))
-    grad_vec = cute.make_fragment(vec_size, qk_acc_dtype)
-    score_vec = cute.make_fragment(vec_size, qk_acc_dtype)
-    kv_idx_vec = cute.make_fragment(vec_size, cutlass.Int32)
+    grad_vec = cute.make_rmem_tensor(vec_size, qk_acc_dtype)
+    score_vec = cute.make_rmem_tensor(vec_size, qk_acc_dtype)
+    kv_idx_vec = cute.make_rmem_tensor(vec_size, cutlass.Int32)
     batch_idx_ssa = utils.scalar_to_ssa(batch_idx, cutlass.Int32).broadcast_to((vec_size,))
-    q_idx_vec = cute.make_fragment(vec_size, cutlass.Int32)
+    q_idx_vec = cute.make_rmem_tensor(vec_size, cutlass.Int32)
 
     # For Pack-GQA with non-constant q_idx, we need per-element head indices
     if cutlass.const_expr(qhead_per_kvhead > 1 and constant_q_idx is None):
-        head_idx_vec = cute.make_fragment(vec_size, cutlass.Int32)
+        head_idx_vec = cute.make_rmem_tensor(vec_size, cutlass.Int32)
 
     for i in cutlass.range(0, n_vals, vec_size, unroll_full=True):
         for j in cutlass.range(vec_size, unroll_full=True):

@@ -858,7 +858,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         tSrK = thr_mma_qk.make_fragment_B(thr_mma_qk.partition_B(sK[None, None, 0]))
         tOrVt = thr_mma_pv.make_fragment_B(thr_mma_pv.partition_B(sVt[None, None, 0]))
         acc_shape_O = thr_mma_pv.partition_shape_C((self.tile_m, self.tile_hdimv))
-        acc_O = cute.make_fragment(acc_shape_O, Float32)
+        acc_O = cute.make_rmem_tensor(acc_shape_O, Float32)
         acc_O.fill(0.0)
 
         # ///////////////////////////////////////////////////////////////////////////////
@@ -1113,7 +1113,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             cute.arch.barrier()
 
         acc_shape_S = mma_params.thr_mma_qk.partition_shape_C((self.tile_m, self.tile_n))
-        acc_S = cute.make_fragment(acc_shape_S, Float32)
+        acc_S = cute.make_rmem_tensor(acc_shape_S, Float32)
         acc_S.fill(0.0)
         # wait for smem tile QK before mma calculation for S
         sync()
