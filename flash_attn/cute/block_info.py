@@ -53,15 +53,13 @@ class BlockInfo:
                 # Fixed-size mode: each split covers exactly n_blocks_per_split blocks.
                 num_n_blocks_per_split = self.n_blocks_per_split
             else:
-                # Regular even-division mode (unchanged behavior).
                 num_n_blocks_per_split = (
                     Int32(0)
                     if n_block_max <= n_block_min
                     else (n_block_max - n_block_min + num_splits - 1) // num_splits
                 )
-            split_start = n_block_min + split_idx * num_n_blocks_per_split
-            n_block_max = cutlass.min(split_start + num_n_blocks_per_split, n_block_max)
-            n_block_min = split_start
+            n_block_min = n_block_min + split_idx * num_n_blocks_per_split
+            n_block_max = cutlass.min(n_block_min + num_n_blocks_per_split, n_block_max)
         return n_block_min, n_block_max
 
     @cute.jit

@@ -1388,15 +1388,9 @@ class FlashAttentionForwardSm100:
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
-            if const_expr(self.fused_split):
-                _n_seg = cute.ceil_div(
-                    block_info.get_n_block_max_for_m_block(seqlen, m_block),
-                    block_info.n_blocks_per_split,
-                )
-                split_idx_eff, num_splits_eff = seg, _n_seg
-            else:
-                _n_seg = Int32(1)
-                split_idx_eff, num_splits_eff = split_idx, num_splits
+            _n_seg, split_idx_eff, num_splits_eff = self._seg_split_range(
+                block_info, seqlen, m_block, seg, split_idx, num_splits
+            )
             mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, head_idx]
 
             head_idx_kv = (
@@ -1701,15 +1695,9 @@ class FlashAttentionForwardSm100:
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
-            if const_expr(self.fused_split):
-                _n_seg = cute.ceil_div(
-                    block_info.get_n_block_max_for_m_block(seqlen, m_block),
-                    block_info.n_blocks_per_split,
-                )
-                split_idx_eff, num_splits_eff = seg, _n_seg
-            else:
-                _n_seg = Int32(1)
-                split_idx_eff, num_splits_eff = split_idx, num_splits
+            _n_seg, split_idx_eff, num_splits_eff = self._seg_split_range(
+                block_info, seqlen, m_block, seg, split_idx, num_splits
+            )
 
             block_iter_count = Int32(0)
             process_tile = False
@@ -1878,7 +1866,7 @@ class FlashAttentionForwardSm100:
                 mma_kv_consumer_state.advance()
                 # End of GEMM_PV1(i_end) (P1 * Vi_end -> O1)
 
-            # Advance to next tile (fused: stay on the tile until all segments are processed)
+            # Advance to next tile
             if const_expr(self.fused_split):
                 seg = seg + 1
                 _do_adv = seg >= _n_seg
@@ -2016,15 +2004,9 @@ class FlashAttentionForwardSm100:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             kv_head_idx = self._kv_head_idx(head_idx)
             seqlen = SeqlenInfoCls(batch_idx)
-            if const_expr(self.fused_split):
-                _n_seg = cute.ceil_div(
-                    block_info.get_n_block_max_for_m_block(seqlen, m_block),
-                    block_info.n_blocks_per_split,
-                )
-                split_idx_eff, num_splits_eff = seg, _n_seg
-            else:
-                _n_seg = Int32(1)
-                split_idx_eff, num_splits_eff = split_idx, num_splits
+            _n_seg, split_idx_eff, num_splits_eff = self._seg_split_range(
+                block_info, seqlen, m_block, seg, split_idx, num_splits
+            )
             n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx_eff, num_splits_eff)
 
             mask = AttentionMaskCls(seqlen)
@@ -2284,7 +2266,7 @@ class FlashAttentionForwardSm100:
             #     if tidx < seqlen.seqlen_q - (m_block * 2 + stage) * self.m_block_size:
             #         gLSE[tidx] = lse
 
-            # Advance to next tile (fused: stay on the tile until all segments are processed)
+            # Advance to next tile
             if const_expr(self.fused_split):
                 seg = seg + 1
                 _do_adv = seg >= _n_seg
@@ -2515,20 +2497,13 @@ class FlashAttentionForwardSm100:
                 Float32(256.0) if cutlass.const_expr(self.q_dtype.width == 8) else Float32(1.0)
             )
             seqlen = SeqlenInfoCls(batch_idx)
-            if const_expr(self.fused_split):
-                _n_seg = cute.ceil_div(
-                    block_info.get_n_block_max_for_m_block(seqlen, m_block),
-                    block_info.n_blocks_per_split,
-                )
-                split_idx_eff, num_splits_eff = seg, _n_seg
-                _is_last_seg = seg + 1 >= _n_seg
-                if seg == 0:
-                    m_run = -Float32.inf
-                    s_run = Float32(0.0)
-            else:
-                _n_seg = Int32(1)
-                split_idx_eff, num_splits_eff = split_idx, num_splits
-                _is_last_seg = True
+            _n_seg, split_idx_eff, num_splits_eff = self._seg_split_range(
+                block_info, seqlen, m_block, seg, split_idx, num_splits
+            )
+            _is_last_seg = seg + 1 >= _n_seg
+            if const_expr(self.fused_split) and seg == 0:
+                m_run = -Float32.inf  # reset running merge state at the first segment
+                s_run = Float32(0.0)
             n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx_eff, num_splits_eff)
 
             if const_expr(self.is_split_kv):
@@ -2808,7 +2783,7 @@ class FlashAttentionForwardSm100:
                             )
                             cute.make_tensor(lse_gmem_ptr, (1,))[0] = lse
 
-            # Advance to next tile (fused: stay on the tile until all segments are merged)
+            # Advance to next tile
             if const_expr(self.fused_split):
                 seg = seg + 1
                 _do_adv = seg >= _n_seg
@@ -2874,6 +2849,20 @@ class FlashAttentionForwardSm100:
             tOtO_r2t_i = cute.make_tensor(tOtO_r2t.iterator + i * corr_tile_size, tOtO_r2t.layout)
             cute.copy(thr_tmem_store, tOrO_frg, tOtO_r2t_i)
         cute.arch.fence_view_async_tmem_store()
+
+    @cute.jit
+    def _seg_split_range(self, block_info, seqlen, m_block, seg, split_idx, num_splits):
+        """Map the current per-tile segment to the (split_idx, num_splits) the block-range
+        math expects. Fused prefill carves the KV range into ceil(n_blocks / n_blocks_per_split)
+        segments; non-fused passes the scheduler's split through unchanged. Returns
+        (n_seg, split_idx_eff, num_splits_eff)."""
+        if const_expr(self.fused_split):
+            n_seg = cute.ceil_div(
+                block_info.get_n_block_max_for_m_block(seqlen, m_block),
+                block_info.n_blocks_per_split,
+            )
+            return n_seg, seg, n_seg
+        return Int32(1), split_idx, num_splits
 
     @cute.jit
     def correction_merge(

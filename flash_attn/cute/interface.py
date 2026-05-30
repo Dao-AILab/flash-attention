@@ -269,16 +269,12 @@ def num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, max_splits):
 def split_size_to_num_splits(split_size, tile_n, num_n_blocks, max_splits=256):
     """Convert a fixed split_size (in KV tokens) into (num_splits, n_blocks_per_split).
 
-    Each split covers exactly ``n_blocks_per_split`` tile_n-blocks (the last in-range
-    split takes the remainder), giving seqlen-invariant, tile-aligned split boundaries.
-    Because the boundaries are absolute KV positions (0, S, 2S, ...), prefill (len L) and
-    a later decode step (len L+t) partition the shared prefix [0, L) identically -- this
-    is what makes prefill<->decode bitwise consistent when both pass the same split_size.
-
-    If the implied split count exceeds ``max_splits`` (the combine-kernel cap), clamp
-    num_splits and fall back to even-division (n_blocks_per_split=None) so that the KV
-    tail beyond the last split is still covered (otherwise output would be silently wrong).
-    Returns n_blocks_per_split=None whenever splitting collapses to a single split.
+    Each split covers exactly ``n_blocks_per_split`` tile_n-blocks (last split takes the
+    remainder) -> seqlen-invariant, tile-aligned boundaries at absolute KV positions, which
+    is what makes prefill<->decode bitwise consistent under the same split_size. If the
+    implied count exceeds ``max_splits`` (combine-kernel cap), clamp and fall back to
+    even-division (n_blocks_per_split=None) so the KV tail stays covered. Returns
+    n_blocks_per_split=None whenever splitting collapses to a single split.
     """
     n_blocks_per_split = max((split_size + tile_n - 1) // tile_n, 1)
     derived = (num_n_blocks + n_blocks_per_split - 1) // n_blocks_per_split

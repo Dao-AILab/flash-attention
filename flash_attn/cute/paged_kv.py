@@ -86,10 +86,8 @@ class PagedKVManager(ParamsBase):
         val_layout = cute.make_layout((1, async_copy_elems))
         gmem_tiled_copy_KV = cute.make_tiled_copy_tv(atom_async_copy, thr_layout, val_layout)
         gmem_thr_copy_KV = gmem_tiled_copy_KV.get_slice(thread_idx)
-        # ceil_div (not floor): when n_block_size < num_threads (e.g. tile_n=64 for
-        # diff-headdim SplitKV with 128 load threads), floor would give 0 and create a
-        # zero-size page tensor. ceil_div yields >=1; threads with row >= n_block_size are
-        # masked by the is_valid guard in load_page_table.
+        # ceil_div (not floor): n_block_size < num_threads (e.g. tile_n=64, 128 load threads)
+        # would floor to a zero-size tensor; out-of-range rows are masked in load_page_table.
         page_entry_per_thread = cute.ceil_div(n_block_size, num_threads)
 
         tPrPage = cute.make_rmem_tensor((page_entry_per_thread,), Int32)
