@@ -161,9 +161,11 @@ class FlashAttentionBackwardSm90:
             return False
         if tile_n % 16 != 0:
             return False
-        if num_threads % 32 != 0:
-            return False
-        if (tile_m * 2) % num_threads != 0:
+        # num_threads includes one 128-thread producer warp group in addition to the
+        # MMA warp groups. The tuned SM90 configs use 384 total threads with tile_m
+        # values such as 64, 80, and 128, so the SM80-style tile_m divisibility check
+        # does not apply here. Require only a structurally valid warp-group count.
+        if num_threads < 256 or num_threads % 128 != 0:
             return False
         return True
 
