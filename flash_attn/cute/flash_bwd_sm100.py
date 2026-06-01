@@ -464,6 +464,7 @@ class FlashAttentionBackwardSm100:
         mdK_semaphore: Optional[cute.Tensor] = None,
         mdV_semaphore: Optional[cute.Tensor] = None,
         aux_tensors: Optional[list] = None,
+        aux_scalars: Optional[tuple] = None,
         # Block-sparse tensors (Q direction - for iterating m_blocks per n_block):
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
@@ -999,6 +1000,7 @@ class FlashAttentionBackwardSm100:
             window_size_right,
             tile_sched_params,
             aux_tensors,
+            aux_scalars,
             fastdiv_mods,
             blocksparse_tensors,
         ).launch(
@@ -1082,6 +1084,7 @@ class FlashAttentionBackwardSm100:
         window_size_right: Optional[Int32],
         tile_sched_params: ParamsBase,
         aux_tensors: Optional[list] = None,
+        aux_scalars: Optional[tuple] = None,
         fastdiv_mods=(None, None),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
     ):
@@ -1597,6 +1600,7 @@ class FlashAttentionBackwardSm100:
                 mdK_semaphore,
                 mdV_semaphore,
                 aux_tensors,
+                aux_scalars,
                 fastdiv_mods,
                 blocksparse_tensors,
             )
@@ -2758,6 +2762,7 @@ class FlashAttentionBackwardSm100:
         softmax_scale,
         seqlen_info,
         aux_tensors=None,
+        aux_scalars=None,
         fastdiv_mods=(None, None),
     ):
         """Apply forward score modification for SM100 backward pass."""
@@ -2777,6 +2782,7 @@ class FlashAttentionBackwardSm100:
             self.vec_size,
             self.qk_acc_dtype,
             aux_tensors,
+            aux_scalars,
             fastdiv_mods,
             seqlen_info,
             constant_q_idx=None,
@@ -2795,6 +2801,7 @@ class FlashAttentionBackwardSm100:
         softmax_scale,
         seqlen_info,
         aux_tensors=None,
+        aux_scalars=None,
         fastdiv_mods=(None, None),
     ):
         """Apply backward score modification (joint graph) for SM100."""
@@ -2809,6 +2816,7 @@ class FlashAttentionBackwardSm100:
             self.vec_size,
             self.qk_acc_dtype,
             aux_tensors,
+            aux_scalars,
             fastdiv_mods,
             seqlen_info,
             constant_q_idx=None,
@@ -2858,6 +2866,7 @@ class FlashAttentionBackwardSm100:
         mdK_semaphore: Optional[cute.Tensor],
         mdV_semaphore: Optional[cute.Tensor],
         aux_tensors: Optional[list] = None,
+        aux_scalars: Optional[tuple] = None,
         fastdiv_mods=(None, None),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
     ):
@@ -2993,6 +3002,7 @@ class FlashAttentionBackwardSm100:
                 batch_idx=batch_idx,
                 head_idx=head_idx,
                 aux_tensors=aux_tensors,
+                aux_scalars=aux_scalars,
                 fastdiv_mods=fastdiv_mods,
             )
 
@@ -3087,6 +3097,7 @@ class FlashAttentionBackwardSm100:
                         softmax_scale,
                         seqlen,
                         aux_tensors,
+                        aux_scalars,
                         fastdiv_mods,
                     )
 

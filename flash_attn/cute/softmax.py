@@ -15,6 +15,77 @@ from quack.cute_dsl_utils import ParamsBase
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 
 
+@cute.jit
+def call_score_mod(
+    score_mod: cutlass.Constexpr,
+    score,
+    batch_idx,
+    head_idx,
+    q_idx,
+    kv_idx,
+    seqlen_info,
+    aux_tensors,
+    aux_scalars,
+):
+    if cutlass.const_expr(aux_scalars is not None):
+        return score_mod(
+            score,
+            batch_idx,
+            head_idx,
+            q_idx=q_idx,
+            kv_idx=kv_idx,
+            seqlen_info=seqlen_info,
+            aux_tensors=aux_tensors,
+            aux_scalars=aux_scalars,
+        )
+    return score_mod(
+        score,
+        batch_idx,
+        head_idx,
+        q_idx=q_idx,
+        kv_idx=kv_idx,
+        seqlen_info=seqlen_info,
+        aux_tensors=aux_tensors,
+    )
+
+
+@cute.jit
+def call_score_mod_bwd(
+    score_mod_bwd: cutlass.Constexpr,
+    grad,
+    score,
+    batch_idx,
+    head_idx,
+    q_idx,
+    kv_idx,
+    seqlen_info,
+    aux_tensors,
+    aux_scalars,
+):
+    if cutlass.const_expr(aux_scalars is not None):
+        return score_mod_bwd(
+            grad,
+            score,
+            batch_idx,
+            head_idx,
+            q_idx=q_idx,
+            kv_idx=kv_idx,
+            seqlen_info=seqlen_info,
+            aux_tensors=aux_tensors,
+            aux_scalars=aux_scalars,
+        )
+    return score_mod_bwd(
+        grad,
+        score,
+        batch_idx,
+        head_idx,
+        q_idx=q_idx,
+        kv_idx=kv_idx,
+        seqlen_info=seqlen_info,
+        aux_tensors=aux_tensors,
+    )
+
+
 @dataclass
 class Softmax(ParamsBase):
     scale_log2: Float32
@@ -387,6 +458,7 @@ def apply_score_mod_inner(
     vec_size: cutlass.Constexpr,
     qk_acc_dtype: cutlass.Constexpr,
     aux_tensors,
+    aux_scalars,
     fastdiv_mods,
     seqlen_info: SeqlenInfoQK,
     constant_q_idx: cutlass.Constexpr,
@@ -405,6 +477,7 @@ def apply_score_mod_inner(
         vec_size: Vector size for processing elements
         qk_acc_dtype: Data type for accumulator
         aux_tensors: Optional aux_tensors for FlexAttention
+        aux_scalars: Optional runtime scalar captures for FlexAttention
         fastdiv_mods: Tuple of (seqlen_q_divmod, seqlen_k_divmod) for wrapping
         seqlen_info: Sequence length info
         constant_q_idx: If provided, use this constant for all q_idx values
@@ -490,14 +563,16 @@ def apply_score_mod_inner(
         if cutlass.const_expr(aux_tensors is not None):
             aux_args = aux_tensors
 
-        post_mod_scores = score_mod(
+        post_mod_scores = call_score_mod(
+            score_mod,
             score_ssa,
             batch_idx_ssa,
             head_idx_ssa,
-            q_idx=q_idx_ssa,
-            kv_idx=kv_idx_ssa,
-            seqlen_info=seqlen_info,
-            aux_tensors=aux_args,
+            q_idx_ssa,
+            kv_idx_ssa,
+            seqlen_info,
+            aux_args,
+            aux_scalars,
         )
 
         # Write back modified scores
@@ -518,6 +593,7 @@ def apply_score_mod_bwd_inner(
     vec_size: cutlass.Constexpr,
     qk_acc_dtype: cutlass.Constexpr,
     aux_tensors,
+    aux_scalars,
     fastdiv_mods,
     seqlen_info,
     constant_q_idx: cutlass.Constexpr,
@@ -537,6 +613,7 @@ def apply_score_mod_bwd_inner(
         vec_size: Vector size for processing elements
         qk_acc_dtype: Data type for accumulator
         aux_tensors: Optional aux_tensors for FlexAttention
+        aux_scalars: Optional runtime scalar captures for FlexAttention
         fastdiv_mods: Tuple of (seqlen_q_divmod, seqlen_k_divmod) for wrapping
         seqlen_info: Sequence length info
         constant_q_idx: If provided, use this constant for all q_idx values
@@ -612,15 +689,17 @@ def apply_score_mod_bwd_inner(
         if cutlass.const_expr(aux_tensors is not None):
             aux_args = aux_tensors
 
-        grad_out_ssa = score_mod_bwd(
+        grad_out_ssa = call_score_mod_bwd(
+            score_mod_bwd,
             grad_ssa,
             score_ssa,
             batch_idx_ssa,
             head_idx_ssa,
-            q_idx=q_idx_ssa,
-            kv_idx=kv_idx_ssa,
-            seqlen_info=seqlen_info,
-            aux_tensors=aux_args,
+            q_idx_ssa,
+            kv_idx_ssa,
+            seqlen_info,
+            aux_args,
+            aux_scalars,
         )
 
         grad_vec.store(grad_out_ssa)

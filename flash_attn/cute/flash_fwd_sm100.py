@@ -383,6 +383,7 @@ class FlashAttentionForwardSm100:
         descale_tensors: Optional[DescaleTensors] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors: Optional[list] = None,
+        aux_scalars: Optional[tuple] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -771,6 +772,7 @@ class FlashAttentionForwardSm100:
             tile_sched_params,
             num_splits,
             aux_tensors,
+            aux_scalars,
             fastdiv_mods,
             head_divmod,
         ).launch(
@@ -830,6 +832,7 @@ class FlashAttentionForwardSm100:
         tile_sched_params: ParamsBase,
         num_splits: Int32,
         aux_tensors: Optional[list] = None,
+        aux_scalars: Optional[tuple] = None,
         fastdiv_mods=(None, None),
         head_divmod=None,
     ):
@@ -1262,6 +1265,7 @@ class FlashAttentionForwardSm100:
                 SeqlenInfoCls=SeqlenInfoCls,
                 AttentionMaskCls=AttentionMaskCls,
                 aux_tensors=aux_tensors,
+                aux_scalars=aux_scalars,
                 fastdiv_mods=fastdiv_mods,
                 head_divmod=head_divmod,
                 blocksparse_tensors=blocksparse_tensors,
@@ -1881,6 +1885,7 @@ class FlashAttentionForwardSm100:
         SeqlenInfoCls: Callable,
         AttentionMaskCls: Callable,
         aux_tensors: Optional[list] = None,
+        aux_scalars: Optional[tuple] = None,
         fastdiv_mods=(None, None),
         head_divmod=None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
@@ -1964,6 +1969,7 @@ class FlashAttentionForwardSm100:
                 batch_idx=batch_idx,
                 head_idx=head_idx,
                 aux_tensors=aux_tensors,
+                aux_scalars=aux_scalars,
                 vec_size=self.mask_vec_size,
             )
 
@@ -2068,6 +2074,7 @@ class FlashAttentionForwardSm100:
                 m_block=(self.q_stage * m_block + stage) * self.cta_group_size,
                 seqlen=seqlen,
                 aux_tensors=aux_tensors,
+                aux_scalars=aux_scalars,
                 fastdiv_mods=fastdiv_mods,
                 head_divmod=head_divmod,
             )
@@ -2249,6 +2256,7 @@ class FlashAttentionForwardSm100:
         m_block: Int32,
         seqlen,
         aux_tensors: Optional[list] = None,
+        aux_scalars: Optional[tuple] = None,
         fastdiv_mods=(None, None),
         head_divmod=None,
         mask_fn: Optional[Callable] = None,
@@ -2295,6 +2303,7 @@ class FlashAttentionForwardSm100:
                 softmax,
                 seqlen,
                 aux_tensors,
+                aux_scalars,
                 fastdiv_mods,
                 head_divmod,
             )
@@ -3104,6 +3113,7 @@ class FlashAttentionForwardSm100:
         softmax,
         seqlen: SeqlenInfoQK,
         aux_tensors=None,
+        aux_scalars=None,
         fastdiv_mods=(None, None),
         head_divmod=None,
     ):
@@ -3140,6 +3150,7 @@ class FlashAttentionForwardSm100:
             self.score_vec_size,
             self.qk_acc_dtype,
             aux_tensors,
+            aux_scalars,
             fastdiv_mods,
             seqlen_info=seqlen,
             constant_q_idx=q_idx_logical,

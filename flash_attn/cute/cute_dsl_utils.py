@@ -113,6 +113,16 @@ def get_aux_tensor_metadata(aux_tensors):
     )
 
 
+def normalize_aux_scalars(aux_scalars):
+    """Return an immutable non-empty scalar capture tuple or None."""
+    return tuple(aux_scalars) if aux_scalars else None
+
+
+def get_aux_scalar_metadata(aux_scalars):
+    """Return value-independent scalar metadata for compile cache keys."""
+    return tuple(type(s) for s in aux_scalars)
+
+
 def get_broadcast_dims(tensor: torch.Tensor) -> Tuple[bool, ...]:
     """Return tuple of bools indicating which dims have stride=0 (broadcast).
 

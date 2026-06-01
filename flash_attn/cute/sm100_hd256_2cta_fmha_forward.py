@@ -180,6 +180,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         descale_tensors: Optional[DescaleTensors] = None,
         blocksparse_tensors: Optional[cute.Tensor] = None,
         aux_tensors: Optional[list] = None,
+        aux_scalars: Optional[tuple] = None,
         stream: cuda.CUstream = None,
     ):
         # Keep parity with FlashAttentionForwardSm100.__call__ interface.
@@ -194,6 +195,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             "SM100 forward with head_dim=256 does not support block sparsity"
         )
         assert aux_tensors is None, "SM100 forward with head_dim=256 does not support aux_tensors"
+        assert aux_scalars is None, "SM100 forward with head_dim=256 does not support aux_scalars"
         assert not self.is_local, (
             "SM100 forward with head_dim=256 does not support local attention yet"
         )

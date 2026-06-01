@@ -637,6 +637,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors=None,
+        aux_scalars=None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -733,6 +734,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             tile_sched_params,
             TileScheduler,
             aux_tensors,
+            aux_scalars,
             fastdiv_mods,
         ).launch(
             grid=grid_dim,
@@ -772,6 +774,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         tile_sched_params,
         TileScheduler: cutlass.Constexpr[Callable],
         aux_tensors=None,
+        aux_scalars=None,
         fastdiv_mods=None,
     ):
         # Thread index, block index
@@ -948,6 +951,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             head_idx=num_head,
             m_block=m_block,
             aux_tensors=aux_tensors,
+            aux_scalars=aux_scalars,
             fastdiv_mods=fastdiv_mods,
         )
 
@@ -1012,6 +1016,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             mask_causal=self.is_causal,
             mask_local=self.is_local,
             aux_tensors=aux_tensors,
+            aux_scalars=aux_scalars,
             fastdiv_mods=fastdiv_mods if const_expr(self.mask_mod is not None) else None,
         )
 
@@ -1097,6 +1102,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         m_block: cutlass.Int32,
         seqlen: SeqlenInfoQK,
         aux_tensors=None,
+        aux_scalars=None,
         fastdiv_mods=None,
         mask_fn: Optional[Callable] = None,
         is_first_n_block: cutlass.Constexpr = False,
@@ -1154,6 +1160,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                 softmax_scale=softmax.softmax_scale,
                 seqlen=seqlen,
                 aux_tensors=aux_tensors,
+                aux_scalars=aux_scalars,
                 fastdiv_mods=fastdiv_mods,
             )
 
@@ -1203,6 +1210,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         softmax_scale,
         seqlen,
         aux_tensors: Optional[list] = None,
+        aux_scalars: Optional[tuple] = None,
         fastdiv_mods=None,
     ):
         # Prepare index tensor
@@ -1220,6 +1228,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             self.score_vec_size,
             self.qk_acc_dtype,
             aux_tensors,
+            aux_scalars,
             fastdiv_mods,
             seqlen_info=seqlen,
             constant_q_idx=None,

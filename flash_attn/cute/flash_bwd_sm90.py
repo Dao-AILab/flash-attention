@@ -356,6 +356,7 @@ class FlashAttentionBackwardSm90:
         mdK_semaphore: Optional[cute.Tensor] = None,
         mdV_semaphore: Optional[cute.Tensor] = None,
         aux_tensors: Optional[list] = None,
+        aux_scalars: Optional[tuple] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
@@ -603,6 +604,7 @@ class FlashAttentionBackwardSm90:
             TileScheduler,
             SharedStorage,
             aux_tensors,
+            aux_scalars,
             fastdiv_mods,
             blocksparse_tensors,
             qhead_per_kvhead_divmod,
@@ -658,6 +660,7 @@ class FlashAttentionBackwardSm90:
         TileScheduler: cutlass.Constexpr[Callable],
         SharedStorage: cutlass.Constexpr[Callable],
         aux_tensors: Optional[list] = None,
+        aux_scalars: Optional[tuple] = None,
         fastdiv_mods=(None, None),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         qhead_per_kvhead_divmod: Optional[FastDivmodDivisor] = None,
@@ -825,6 +828,7 @@ class FlashAttentionBackwardSm90:
                 AttentionMaskCls,
                 TileSchedulerCls,
                 aux_tensors,
+                aux_scalars,
                 fastdiv_mods,
                 blocksparse_tensors,
                 qhead_per_kvhead_divmod,
@@ -1023,6 +1027,7 @@ class FlashAttentionBackwardSm90:
         softmax_scale,
         seqlen_info: SeqlenInfoQK,
         aux_tensors=None,
+        aux_scalars=None,
         fastdiv_mods=(None, None),
     ):
         # [NOTE] SdP_swapAB: swapAB transposes the tile, so use (n, m) indexing
@@ -1047,6 +1052,7 @@ class FlashAttentionBackwardSm90:
             self.vec_size,
             self.qk_acc_dtype,
             aux_tensors,
+            aux_scalars,
             fastdiv_mods,
             seqlen_info,
             constant_q_idx=None,
@@ -1067,6 +1073,7 @@ class FlashAttentionBackwardSm90:
         softmax_scale,
         seqlen_info: SeqlenInfoQK,
         aux_tensors=None,
+        aux_scalars=None,
         fastdiv_mods=(None, None),
     ):
         cS = cute.make_identity_tensor(
@@ -1091,6 +1098,7 @@ class FlashAttentionBackwardSm90:
             self.vec_size,
             self.qk_acc_dtype,
             aux_tensors,
+            aux_scalars,
             fastdiv_mods,
             seqlen_info,
             constant_q_idx=None,
@@ -1132,6 +1140,7 @@ class FlashAttentionBackwardSm90:
         AttentionMaskCls: Callable,
         TileSchedulerCls: Callable,
         aux_tensors: Optional[list] = None,
+        aux_scalars: Optional[tuple] = None,
         fastdiv_mods=(None, None),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         qhead_per_kvhead_divmod: Optional[FastDivmodDivisor] = None,
@@ -1261,6 +1270,7 @@ class FlashAttentionBackwardSm90:
             thr_mma_SdP=thr_mma_SdP,
             softmax_scale=softmax_scale,
             aux_tensors=aux_tensors,
+            aux_scalars=aux_scalars,
             fastdiv_mods=fastdiv_mods,
         )
         score_mod_bwd_fn = partial(
@@ -1268,6 +1278,7 @@ class FlashAttentionBackwardSm90:
             thr_mma_SdP=thr_mma_SdP,
             softmax_scale=softmax_scale,
             aux_tensors=aux_tensors,
+            aux_scalars=aux_scalars,
             fastdiv_mods=fastdiv_mods,
         )
 
@@ -1350,6 +1361,7 @@ class FlashAttentionBackwardSm90:
                         mask_local=self.is_local,
                         mask_mod=self.mask_mod,
                         aux_tensors=aux_tensors,
+                        aux_scalars=aux_scalars,
                         fastdiv_mods=fastdiv_mods,
                     )
                     dKV_accumulate = False
@@ -1383,6 +1395,7 @@ class FlashAttentionBackwardSm90:
                         subtile_factor=self.subtile_factor,
                         m_block_max=m_block_max,
                         aux_tensors=aux_tensors,
+                        aux_scalars=aux_scalars,
                         fastdiv_mods=fastdiv_mods,
                     )
 
