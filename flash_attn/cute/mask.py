@@ -19,6 +19,37 @@ MASK_R2P_CHUNK_SIZE: int = 32
 
 
 @cute.jit
+def call_mask_mod(
+    mask_mod: cutlass.Constexpr,
+    batch_idx,
+    head_idx,
+    q_idx,
+    kv_idx,
+    seqlen_info,
+    aux_tensors,
+    aux_scalars,
+):
+    if const_expr(aux_scalars is not None):
+        return mask_mod(
+            batch_idx,
+            head_idx,
+            q_idx,
+            kv_idx,
+            seqlen_info,
+            aux_tensors,
+            aux_scalars,
+        )
+    return mask_mod(
+        batch_idx,
+        head_idx,
+        q_idx,
+        kv_idx,
+        seqlen_info,
+        aux_tensors,
+    )
+
+
+@cute.jit
 def r2p_bitmask_below(limit: Int32, s: int) -> Uint32:
     """32-bit R2P bitmask keeping positions < limit (exclusive upper bound).
 
@@ -155,6 +186,7 @@ class AttentionMask:
         mask_local: cutlass.Constexpr[bool] = False,
         mask_mod: cutlass.Constexpr[Optional[Callable]] = None,
         aux_tensors: Optional[list] = None,
+        aux_scalars: Optional[tuple] = None,
         fastdiv_mods=(None, None),
     ) -> None:
         assert not (mask_causal and mask_local), "mask_causal and mask_local cannot be both True"
@@ -229,13 +261,15 @@ class AttentionMask:
                     head_idx_ssa = utils.scalar_to_ssa(head_idx_for_mod, cutlass.Int32)
                     q_idx_ssa = utils.scalar_to_ssa(row_for_mod, cutlass.Int32)
                     kv_idx_ssa = utils.scalar_to_ssa(col_for_mod, cutlass.Int32)
-                    mask_value = mask_mod(
+                    mask_value = call_mask_mod(
+                        mask_mod,
                         batch_idx_ssa,
                         head_idx_ssa,
                         q_idx_ssa,
                         kv_idx_ssa,
                         self.seqlen_info,
                         aux_tensors,
+                        aux_scalars,
                     )
                     cond = cutlass.Boolean(utils.ssa_to_scalar(mask_value))
                     if const_expr(mask_seqlen):
@@ -402,6 +436,7 @@ class AttentionMask:
         batch_idx: Int32,
         head_idx: Int32,
         aux_tensors: Optional[list] = None,
+        aux_scalars: Optional[tuple] = None,
         fastdiv_mods=(None, None),
         head_divmod=None,
         check_q_boundary: bool = False,
@@ -444,13 +479,15 @@ class AttentionMask:
             head_idx_ssa = utils.scalar_to_ssa(head_idx_for_mod, cutlass.Int32)
             mask_row_ssa = utils.scalar_to_ssa(mask_row_for_mod, cutlass.Int32)
             kv_idx_ssa = utils.scalar_to_ssa(global_col_for_mod, cutlass.Int32)
-            mask_value = mask_mod(
+            mask_value = call_mask_mod(
+                mask_mod,
                 batch_idx_ssa,
                 head_idx_ssa,
                 mask_row_ssa,
                 kv_idx_ssa,
                 self.seqlen_info,
                 aux_tensors,
+                aux_scalars,
             )
             cond = cutlass.Boolean(utils.ssa_to_scalar(mask_value))
             acc_S[i] = acc_S[i] if cond else -Float32.inf
@@ -472,6 +509,7 @@ class AttentionMask:
         head_idx: Int32,
         vec_size: cutlass.Constexpr[int],
         aux_tensors: Optional[list] = None,
+        aux_scalars: Optional[tuple] = None,
         fastdiv_mods=(None, None),
         head_divmod=None,
         check_q_boundary: bool = False,
@@ -536,13 +574,15 @@ class AttentionMask:
             kv_idx_ssa = kv_idx_vec.load()
 
             # mask_value is already bit-packed by the vectorized mask_mod.
-            mask_value = mask_mod(
+            mask_value = call_mask_mod(
+                mask_mod,
                 batch_idx_ssa_call,
                 head_idx_ssa,
                 mask_row_ssa,
                 kv_idx_ssa,
                 self.seqlen_info,
                 aux_tensors,
+                aux_scalars,
             )
 
             # For vec_size < 32, multiple mask_mod calls fill one R2P chunk.
@@ -591,6 +631,7 @@ class AttentionMask:
         batch_idx: Int32 = None,
         head_idx: Int32 = None,
         aux_tensors: Optional[list] = None,
+        aux_scalars: Optional[tuple] = None,
         fastdiv_mods=(None, None),
         head_divmod=None,
         vec_size: cutlass.Constexpr[int] = 1,
@@ -654,6 +695,7 @@ class AttentionMask:
                     batch_idx,
                     head_idx,
                     aux_tensors,
+                    aux_scalars,
                     fastdiv_mods,
                     head_divmod,
                     check_q_boundary,
@@ -670,6 +712,7 @@ class AttentionMask:
                     head_idx,
                     vec_size,
                     aux_tensors,
+                    aux_scalars,
                     fastdiv_mods,
                     head_divmod,
                     check_q_boundary,
@@ -753,6 +796,7 @@ class AttentionMask:
         batch_idx: Int32 = None,
         head_idx: Int32 = None,
         aux_tensors: Optional[list] = None,
+        aux_scalars: Optional[tuple] = None,
         fastdiv_mods=(None, None),
         is_full_block: bool = False,
         check_m_boundary: bool = True,
@@ -831,13 +875,15 @@ class AttentionMask:
                     q_idx_ssa = utils.scalar_to_ssa(q_idx_for_mod, cutlass.Int32)
                     kv_idx_ssa = utils.scalar_to_ssa(kv_idx_for_mod, cutlass.Int32)
 
-                    mask_value = mask_mod(
+                    mask_value = call_mask_mod(
+                        mask_mod,
                         batch_idx_ssa,
                         head_idx_ssa,
                         q_idx_ssa,
                         kv_idx_ssa,
                         self.seqlen_info,
                         aux_tensors,
+                        aux_scalars,
                     )
                     cond = cutlass.Boolean(utils.ssa_to_scalar(mask_value))
                     acc_S[i] = acc_S[i] if cond else -cutlass.Float32.inf

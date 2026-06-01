@@ -1364,6 +1364,7 @@ def consume_block_sparse_mma_bwd_sm90(
     subtile_factor: cutlass.Constexpr = 1,
     m_block_max: int = 0,
     aux_tensors=None,
+    aux_scalars=None,
     fastdiv_mods=(None, None),
 ):
     """SM90 backward block sparse MMA consumption with separate partial/full loops.
@@ -1397,6 +1398,7 @@ def consume_block_sparse_mma_bwd_sm90(
         mask_local=is_local,
         mask_mod=mask_mod,
         aux_tensors=aux_tensors,
+        aux_scalars=aux_scalars,
         fastdiv_mods=fastdiv_mods,
     )
 
@@ -1410,6 +1412,7 @@ def consume_block_sparse_mma_bwd_sm90(
         mask_causal=is_causal,
         mask_local=is_local,
         aux_tensors=aux_tensors,
+        aux_scalars=aux_scalars,
         fastdiv_mods=fastdiv_mods,
     )
 

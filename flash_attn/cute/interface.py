@@ -30,7 +30,12 @@ if os.environ.get("CUTE_DSL_PTXAS_PATH", None) is not None:
 from flash_attn.cute import utils
 from flash_attn.cute import fa_logging
 from flash_attn.cute.cute_dsl_utils import (
-    to_cute_tensor, to_cute_aux_tensor, get_aux_tensor_metadata, get_broadcast_dims,
+    get_aux_scalar_metadata,
+    get_aux_tensor_metadata,
+    get_broadcast_dims,
+    normalize_aux_scalars,
+    to_cute_aux_tensor,
+    to_cute_tensor,
 )
 from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80
 from flash_attn.cute.flash_fwd_sm90 import FlashAttentionForwardSm90
@@ -322,6 +327,7 @@ def _flash_attn_fwd(
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
     aux_tensors: Optional[list[torch.Tensor]] = None,
+    aux_scalars: Optional[tuple] = None,
     q_descale: Optional[torch.Tensor] = None,
     k_descale: Optional[torch.Tensor] = None,
     v_descale: Optional[torch.Tensor] = None,
@@ -339,7 +345,9 @@ def _flash_attn_fwd(
         out: Optional pre-allocated output tensor. If None, will be allocated internally.
         lse: Optional pre-allocated log-sum-exp tensor. If None, will be allocated when needed.
         aux_tensors: Some score_mods will want to read from global aux_tensors. This is how we thread them through to the inner kernel.
+        aux_scalars: Runtime scalar captures used by score_mod or mask_mod.
     """
+    aux_scalars = normalize_aux_scalars(aux_scalars)
     q, k, v, qv = [maybe_contiguous(t) for t in (q, k, v, qv)]
     assert q is not None or qv is not None
     assert v is not None
@@ -658,6 +666,7 @@ def _flash_attn_fwd(
         aux_tensor_metadata = get_aux_tensor_metadata(aux_tensors)
     else:
         aux_tensor_metadata = None
+    aux_scalar_metadata = get_aux_scalar_metadata(aux_scalars) if aux_scalars is not None else None
 
     if qv is not None:
         assert arch // 10 in [10, 11], "only support Blackwell arch with qv"
@@ -715,6 +724,7 @@ def _flash_attn_fwd(
         use_block_sparsity,
         block_sparse_broadcast_pattern,
         aux_tensor_metadata,
+        aux_scalar_metadata,
         lse is None,
         cu_seqlens_q is None,
         cu_seqlens_k is None,
@@ -1015,6 +1025,7 @@ def _flash_attn_fwd(
             compile_args.extend([
                 sparse_tensors,
                 cute_aux_tensors,
+                aux_scalars,
             ])
             compile_args.append(current_stream)
             _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
@@ -1090,6 +1101,7 @@ def _flash_attn_fwd(
                 if normalized_block_sparse_tensors is not None
                 else None,
                 aux_tensors,
+                aux_scalars,
             ])
             _flash_attn_fwd.compile_cache[compile_key](*call_args)
     if is_split_kv:
@@ -1286,9 +1298,11 @@ def _flash_attn_bwd(
     score_mod_bwd: Optional[Callable] = None,
     mask_mod: Optional[Callable] = None,
     aux_tensors: Optional[list[torch.Tensor]] = None,
+    aux_scalars: Optional[tuple] = None,
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     dlse: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    aux_scalars = normalize_aux_scalars(aux_scalars)
     arch = _get_device_arch()
     assert arch // 10 in [9, 10, 11, 12], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x, 12.x"
     sparse_q = None
@@ -1597,6 +1611,7 @@ def _flash_attn_bwd(
     score_mod_bwd_hash = utils.hash_callable(score_mod_bwd) if score_mod_bwd else False
     mask_mod_hash = utils.hash_callable(mask_mod) if mask_mod else False
     num_aux_tensors = len(aux_tensors) if aux_tensors else 0
+    aux_scalar_metadata = get_aux_scalar_metadata(aux_scalars) if aux_scalars is not None else None
     cute_aux_tensors = None
     if aux_tensors is not None:
         cute_aux_tensors = [to_cute_tensor(buf, assumed_align=None, fully_dynamic=True) for buf in aux_tensors]
@@ -1674,6 +1689,7 @@ def _flash_attn_bwd(
             score_mod_bwd_hash,
             mask_mod_hash,
             num_aux_tensors,
+            aux_scalar_metadata,
             use_block_sparsity,
             block_sparse_broadcast_pattern,
             get_broadcast_dims(q),
@@ -1706,6 +1722,7 @@ def _flash_attn_bwd(
             score_mod_bwd_hash,
             mask_mod_hash,
             num_aux_tensors,
+            aux_scalar_metadata,
             use_block_sparsity,
             block_sparse_broadcast_pattern,
             cu_seqlens_q is None,
@@ -1874,6 +1891,7 @@ def _flash_attn_bwd(
             dK_semaphore_tensor,
             dV_semaphore_tensor,
             cute_aux_tensors,
+            aux_scalars,
             sparse_tensors_compile,
             current_stream,
             options="--enable-tvm-ffi",
@@ -1901,6 +1919,7 @@ def _flash_attn_bwd(
             dK_semaphore,
             dV_semaphore,
             aux_tensors,
+            aux_scalars,
             (
                 normalized_block_sparse_tensors.mask_block_cnt,
                 normalized_block_sparse_tensors.mask_block_idx,
@@ -1978,10 +1997,12 @@ class FlashAttnFunc(torch.autograd.Function):
         score_mod_bwd: Optional[Callable] = None,
         mask_mod: Optional[Callable] = None,
         aux_tensors: Optional[list] = None,
+        aux_scalars: Optional[tuple] = None,
         block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
         block_sparse_tensors_bwd: Optional[BlockSparseTensorsTorch] = None,
         return_lse: bool = False,
     ):
+        aux_scalars = normalize_aux_scalars(aux_scalars)
         shared_kv = k is v
         if shared_kv and v.shape[-1] == 512:
             # specialize MLA attention formula
@@ -2005,6 +2026,7 @@ class FlashAttnFunc(torch.autograd.Function):
             score_mod=score_mod,
             mask_mod=mask_mod,
             aux_tensors=aux_tensors,
+            aux_scalars=aux_scalars,
             block_sparse_tensors=block_sparse_tensors,
             return_lse=return_lse,
             gather_kv_indices=gather_kv_indices,
@@ -2019,6 +2041,7 @@ class FlashAttnFunc(torch.autograd.Function):
         ctx.score_mod = score_mod 
         ctx.score_mod_bwd = score_mod_bwd 
         ctx.mask_mod = mask_mod
+        ctx.aux_scalars = aux_scalars
         ctx.block_sparse_tensors_bwd = block_sparse_tensors_bwd
         ctx.set_materialize_grads(False)
         return out, lse
@@ -2048,10 +2071,11 @@ class FlashAttnFunc(torch.autograd.Function):
             score_mod_bwd=ctx.score_mod_bwd,
             mask_mod=ctx.mask_mod,
             aux_tensors=aux_tensors,
+            aux_scalars=ctx.aux_scalars,
             block_sparse_tensors=ctx.block_sparse_tensors_bwd,
             dlse=dlse,
         )
-        return dq, dk, dv, *((None,) * 30)  # Extra Nones is fine
+        return dq, dk, dv, *((None,) * 31)
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -2084,8 +2108,10 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         mask_mod: Optional[Callable] = None,
         block_sparse_tensors: Optional[list] = None,
         aux_tensors: Optional[list] = None,
+        aux_scalars: Optional[tuple] = None,
         return_lse: bool = False,
     ):
+        aux_scalars = normalize_aux_scalars(aux_scalars)
         shared_kv = k is v
         if shared_kv and v.shape[-1] == 512:
             # specialize MLA attention formula
@@ -2118,6 +2144,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             mask_mod=mask_mod,
             block_sparse_tensors=block_sparse_tensors,
             aux_tensors=aux_tensors,
+            aux_scalars=aux_scalars,
             return_lse=return_lse,
             gather_kv_indices=gather_kv_indices,
         )
@@ -2143,6 +2170,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         ctx.return_lse = return_lse
         ctx.score_mod = score_mod
         ctx.score_mod_bwd = score_mod_bwd
+        ctx.mask_mod = mask_mod
+        ctx.aux_scalars = aux_scalars
         ctx.set_materialize_grads(False)
         return out, lse
 
@@ -2176,10 +2205,12 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             score_mod=ctx.score_mod,
             score_mod_bwd=ctx.score_mod_bwd,
             aux_tensors=aux_tensors,
+            aux_scalars=ctx.aux_scalars,
+            mask_mod=ctx.mask_mod,
             dlse=dlse,
         )
 
-        return dq, dk, dv, *((None,) * 30)
+        return dq, dk, dv, *((None,) * 31)
 
 
 def flash_attn_func(
@@ -2200,6 +2231,7 @@ def flash_attn_func(
     score_mod_bwd: Optional[Callable] = None,
     mask_mod: Optional[Callable] = None,
     aux_tensors: Optional[list] = None,
+    aux_scalars: Optional[tuple] = None,
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     block_sparse_tensors_bwd: Optional[BlockSparseTensorsTorch] = None,
     return_lse: bool = False,
@@ -2222,6 +2254,7 @@ def flash_attn_func(
         score_mod_bwd,
         mask_mod,
         aux_tensors,
+        aux_scalars,
         block_sparse_tensors,
         block_sparse_tensors_bwd,
         return_lse,
@@ -2255,6 +2288,7 @@ def flash_attn_varlen_func(
     mask_mod: Optional[Callable] = None,
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     aux_tensors: Optional[list] = None,
+    aux_scalars: Optional[tuple] = None,
     return_lse: bool = False,
 ):
     """
@@ -2315,6 +2349,7 @@ def flash_attn_varlen_func(
         mask_mod,
         block_sparse_tensors,
         aux_tensors,
+        aux_scalars,
         return_lse,
     )
 

@@ -172,6 +172,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors: Optional[list] = None,
+        aux_scalars: Optional[tuple] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -389,6 +390,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             TileScheduler,
             SharedStorage,
             aux_tensors,
+            aux_scalars,
             fastdiv_mods,
         ).launch(
             grid=grid_dim,
@@ -435,6 +437,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         TileScheduler: cutlass.Constexpr[Callable],
         SharedStorage: cutlass.Constexpr[Callable],
         aux_tensors=Optional[list[cute.Tensor]],
+        aux_scalars=None,
         fastdiv_mods=None,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -631,6 +634,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 TileSchedulerCls,
                 blocksparse_tensors,
                 aux_tensors,
+                aux_scalars,
                 fastdiv_mods,
             )
 
@@ -959,6 +963,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         TileSchedulerCls: Callable,
         blocksparse_tensors: Optional[BlockSparseTensors],
         aux_tensors: Optional[list],
+        aux_scalars: Optional[tuple],
         fastdiv_mods=None,
     ):
         warp_group_idx = cute.arch.make_warp_uniform(tidx // self.num_threads_per_warp_group)
@@ -1076,6 +1081,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 mask_causal=self.is_causal,
                 mask_local=self.is_local,
                 aux_tensors=aux_tensors,
+                aux_scalars=aux_scalars,
                 fastdiv_mods=fastdiv_mods,
             )
             score_mod_fn = None
@@ -1088,6 +1094,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     m_block,
                     softmax_scale=softmax_scale,
                     aux_tensors=aux_tensors,
+                    aux_scalars=aux_scalars,
                     fastdiv_mods=fastdiv_mods,
                 )
             mma_one_n_block = partial(
@@ -1496,6 +1503,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         softmax_scale,
         seqlen,
         aux_tensors: Optional[list] = None,
+        aux_scalars: Optional[tuple] = None,
         fastdiv_mods=None,
     ):
         # Prepare index tensor
@@ -1513,6 +1521,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             self.score_vec_size,
             self.qk_acc_dtype,
             aux_tensors,
+            aux_scalars,
             fastdiv_mods,
             seqlen_info=seqlen,
             constant_q_idx=None,

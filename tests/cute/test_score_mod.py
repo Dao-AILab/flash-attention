@@ -116,6 +116,18 @@ SEQLEN_CONFIGS = [
 VEC_SIZES_TO_CHECK_EQUALITY = [1, 2, 4] if COMPUTE_CAPABILITY == 10 else [1, 2]
 
 
+@cute.jit
+def scalar_scale_score(score, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors, aux_scalars):
+    return score * cute.full_like(score, cutlass.Float32(aux_scalars[0]))
+
+
+def scalar_scale_score_eager(scale: float):
+    def score_mod(score, b_idx, h_idx, q_idx, kv_idx):
+        return score * scale
+
+    return score_mod
+
+
 def create_tensors(
     batch_size=2, num_heads=4, seqlen_q=64, seqlen_kv=64, dim=128, dtype=torch.bfloat16
 ):
@@ -125,7 +137,9 @@ def create_tensors(
     return q, k, v
 
 
-def run_cute_flash(q, k, v, cute_score_mod, aux_tensors=None, pack_gqa=False) -> torch.Tensor:
+def run_cute_flash(
+    q, k, v, cute_score_mod, aux_tensors=None, aux_scalars=None, pack_gqa=False
+) -> torch.Tensor:
     q_transposed, k_transposed, v_transposed = map(lambda x: x.transpose(1, 2), (q, k, v))
     out = torch.empty_like(q_transposed)
     _flash_attn_fwd(
@@ -137,6 +151,7 @@ def run_cute_flash(q, k, v, cute_score_mod, aux_tensors=None, pack_gqa=False) ->
         out=out,
         lse=None,
         aux_tensors=aux_tensors,
+        aux_scalars=aux_scalars,
         pack_gqa=pack_gqa,
     )
     return out.transpose(1, 2)
@@ -1193,3 +1208,24 @@ def test_cute_vs_flex_attention_backward_pack_gqa(
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+@pytest.mark.parametrize("score_scale", [0.5, 1.25])
+def test_cute_score_mod_aux_scalars_matches_flex(score_scale):
+    torch.manual_seed(0)
+    q, k, v = create_tensors(batch_size=1, num_heads=4, seqlen_q=128, seqlen_kv=128, dim=64)
+    out_ref_fp32 = run_flex_reference(
+        q, k, v, scalar_scale_score_eager(score_scale), dtype=torch.float32
+    )
+    out_pt = run_flex_reference(q, k, v, scalar_scale_score_eager(score_scale))
+    out_cute = run_cute_flash(
+        q,
+        k,
+        v,
+        scalar_scale_score,
+        aux_scalars=[cutlass.Float32(score_scale)],
+    )
+    fwd_atol = 2 * (out_ref_fp32 + 0.3 - 0.3 - out_ref_fp32).abs().max().item()
+    pt_error = (out_pt - out_ref_fp32).abs().max().item()
+    cute_error = (out_cute - out_ref_fp32).abs().max().item()
+    assert cute_error <= 2 * pt_error + fwd_atol

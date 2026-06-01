@@ -19,6 +19,7 @@ from flash_attn.cute import ampere_helpers as sm80_utils
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import utils
 from flash_attn.cute.mask import AttentionMask
+from flash_attn.cute.softmax import call_score_mod, call_score_mod_bwd
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from quack.cute_dsl_utils import ParamsBase
 from flash_attn.cute.tile_scheduler import SingleTileScheduler, SingleTileVarlenScheduler, TileSchedulerArguments
@@ -388,6 +389,7 @@ class FlashAttentionBackwardSm80:
         mdK_semaphore: Optional[cute.Tensor] = None,
         mdV_semaphore: Optional[cute.Tensor] = None,
         aux_tensors: Optional[list] = None,
+        aux_scalars: Optional[tuple] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
@@ -907,9 +909,16 @@ class FlashAttentionBackwardSm80:
         if cutlass.const_expr(self.score_mod is not None):
             for r in cutlass.range(cute.size(acc_S_mn, mode=[0]), unroll_full=True):
                 acc_S_mn[r, None].store(
-                    self.score_mod(
+                    call_score_mod(
+                        self.score_mod,
                         acc_S_mn[r, None].load() * softmax_scale,
-                        0, 0, 0, 0, None, [],
+                        0,
+                        0,
+                        0,
+                        0,
+                        None,
+                        [],
+                        aux_scalars,
                     )
                 )
         if cutlass.const_expr(mask_fn is not None):
@@ -945,10 +954,17 @@ class FlashAttentionBackwardSm80:
         for r in cutlass.range(cute.size(acc_dP_mn, mode=[0]), unroll_full=True):
             grad_val = acc_S_mn[r, None].load() * (acc_dP_mn[r, None].load() - tLSErdPsum[r])
             if cutlass.const_expr(self.score_mod_bwd is not None):
-                grad_val = self.score_mod_bwd(
+                grad_val = call_score_mod_bwd(
+                    self.score_mod_bwd,
                     grad_val,
                     acc_S_pre_mn[r, None].load() * softmax_scale,
-                    0, 0, 0, 0, None, [],
+                    0,
+                    0,
+                    0,
+                    0,
+                    None,
+                    [],
+                    aux_scalars,
                 )
             acc_dP_mn[r, None].store(grad_val)
         # if cute.arch.thread_idx()[0] == 0 and cute.arch.block_idx()[0] == bidx: cute.print_tensor(acc_dP_mn)
