@@ -210,16 +210,30 @@ class FlashAttentionBackwardSm100:
         #    warpgroup from ~70M to ~1M.  Auto-gated on ``merge_exp_dropout_ds``.
         self.packed_dropout_fma = self.merge_exp_dropout_ds
         # 5. ``skip_drop_bits_pack``:
-        #    in GQA merged dropout, re-walk the SMEM mask in the dS apply step
-        #    instead of carrying packed bits across phases. Plain MHA stays on
-        #    the lower-spill packed-bit path. The two SMEM ld per stage hit L1
-        #    (just loaded the same words in the exp+dropout step) so the cost
-        #    is amortised, while we avoid the persistent ``_cached_mask_word``
-        #    and ``_prev_m_local`` regs that triggered spill at GQA=1.
+        #    in the merged dropout dS-apply step, re-walk the SMEM mask instead
+        #    of carrying a single packed-bit Uint32 (``drop_bits_local``) across
+        #    the exp and dS phases. Originally gated on GQA>=2, on the theory
+        #    that the carried ``_cached_mask_word`` / ``_prev_m_local`` regs
+        #    triggered spill. Direct ptxas + latency measurement refined this:
+        #
+        #      * hdim 64/96 (GQA>=2): the re-walk path costs *more* registers
+        #        (two uncached SMEM loads + duplicated address arithmetic per
+        #        pair) and roughly doubles the local-memory spill
+        #        (hdim64/gqa2/noncausal: 144 B -> 64 B; hdim96/gqa2: 136 B
+        #        -> 64 B when disabled). Here the dropout consumer warpgroup is
+        #        on the critical path, so removing the spill is a 6-12% bwd
+        #        latency win. -> use the packed-bit path (skip = False).
+        #      * hdim 128 (GQA>=2): bwd is MMA-bound and the consumer is off the
+        #        critical path, so the (smaller) spill reduction doesn't help;
+        #        the packed-bit path's cross-phase register dependency instead
+        #        costs ~2-3% latency. -> keep the re-walk path (skip = True).
+        #
+        #    GQA=1 always stays on the packed-bit path (unchanged).
         self.skip_drop_bits_pack = (
             self.merge_exp_dropout_ds
             and self.packed_dropout_fma
             and self.qhead_per_kvhead >= 2
+            and self.tile_hdim >= 128
         )
 
         self.reduce_warp_ids = (0, 1, 2, 3)
