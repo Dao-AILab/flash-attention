@@ -350,7 +350,13 @@ class FlashAttentionForwardBase:
         cute.arch.barrier(
             barrier_id=int(NamedBarrierFwd.Epilogue), number_of_threads=self.num_epilogue_threads
         )
-        smem_copy_atom_O = utils.get_smem_store_atom(self.arch.major * 10 + self.arch.minor, self.dtype)
+        # The SM80 base class uses mma.sync.aligned.m16n8k16. Its output
+        # register layout is NOT compatible with the SM90 stmatrix path that
+        # get_smem_store_atom picks for any arch >= 90. On consumer Blackwell
+        # self.arch comes from the DSL as sm_120, so this would silently
+        # scramble the rmem->smem transfer in the epilogue. Force the
+        # SM80-compatible universal copy here regardless of self.arch.
+        smem_copy_atom_O = utils.get_smem_store_atom(80, self.dtype)
         smem_thr_copy_O = cute.make_tiled_copy_C(smem_copy_atom_O, tiled_mma).get_slice(tidx)
         taccOrO = smem_thr_copy_O.retile(rO)
         taccOsO = smem_thr_copy_O.partition_D(sO)
@@ -655,7 +661,12 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         self.num_Q_load_threads = self.num_threads
         self.num_epilogue_threads = self.num_threads
         # self.use_tma_O = self.arch >= 90 and mCuSeqlensQ is None
-        self.use_tma_O = self.arch >= Arch.sm_90
+        # The SM80 base class never constructs tma_atom_O (it passes None to
+        # self.epilogue), so use_tma_O must stay False regardless of self.arch.
+        # FlashAttentionForwardSm120 inherits this class but self.arch is read
+        # from the DSL (= sm_120) in __init__, so without this the >= sm_90
+        # branch would crash in tma_get_copy_fn on consumer Blackwell.
+        self.use_tma_O = False
         self._setup_attributes()
         SharedStorage = self._get_shared_storage_cls()
         mQ, mK, mV, mO = [assume_tensor_aligned(t) for t in (mQ, mK, mV, mO)]
