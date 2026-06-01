@@ -34,6 +34,7 @@ from flash_attn.cute.pack_gqa import PackGQA
 from flash_attn.cute.named_barrier import NamedBarrierFwd
 from flash_attn.cute.block_sparsity import BlockSparseTensors
 from flash_attn.cute.tile_scheduler import SingleTileScheduler, SingleTileVarlenScheduler, TileSchedulerArguments
+from flash_attn.cute.utils import AuxData
 
 
 class FlashAttentionForwardBase:
@@ -636,7 +637,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         window_size_right: Optional[Int32] = None,
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
-        aux_tensors=None,
+        aux_data: AuxData = AuxData(),
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -702,7 +703,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
         grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
         softmax_scale_log2, softmax_scale = utils.compute_softmax_scale_log2(softmax_scale, self.score_mod)
-        fastdiv_mods = utils.compute_fastdiv_mods(mQ, mK, self.qhead_per_kvhead, self.pack_gqa, aux_tensors)
+        fastdiv_mods = utils.compute_fastdiv_mods(mQ, mK, self.qhead_per_kvhead, self.pack_gqa, aux_data.tensors)
 
         self.kernel(
             mQ,
@@ -732,7 +733,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             SharedStorage,
             tile_sched_params,
             TileScheduler,
-            aux_tensors,
+            aux_data,
             fastdiv_mods,
         ).launch(
             grid=grid_dim,
@@ -771,7 +772,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         SharedStorage: cutlass.Constexpr,
         tile_sched_params,
         TileScheduler: cutlass.Constexpr[Callable],
-        aux_tensors=None,
+        aux_data: AuxData = AuxData(),
         fastdiv_mods=None,
     ):
         # Thread index, block index
@@ -947,7 +948,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             batch_idx=batch_size,
             head_idx=num_head,
             m_block=m_block,
-            aux_tensors=aux_tensors,
+            aux_data=aux_data,
             fastdiv_mods=fastdiv_mods,
         )
 
@@ -1011,7 +1012,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             thr_mma=thr_mma_qk,
             mask_causal=self.is_causal,
             mask_local=self.is_local,
-            aux_tensors=aux_tensors,
+            aux_data=aux_data,
             fastdiv_mods=fastdiv_mods if const_expr(self.mask_mod is not None) else None,
         )
 
@@ -1096,7 +1097,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         head_idx: cutlass.Int32,
         m_block: cutlass.Int32,
         seqlen: SeqlenInfoQK,
-        aux_tensors=None,
+        aux_data: AuxData = AuxData(),
         fastdiv_mods=None,
         mask_fn: Optional[Callable] = None,
         is_first_n_block: cutlass.Constexpr = False,
@@ -1153,7 +1154,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                 n_block,
                 softmax_scale=softmax.softmax_scale,
                 seqlen=seqlen,
-                aux_tensors=aux_tensors,
+                aux_data=aux_data,
                 fastdiv_mods=fastdiv_mods,
             )
 
@@ -1202,7 +1203,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         n_block,
         softmax_scale,
         seqlen,
-        aux_tensors: Optional[list] = None,
+        aux_data: AuxData = AuxData(),
         fastdiv_mods=None,
     ):
         # Prepare index tensor
@@ -1219,7 +1220,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             softmax_scale,
             self.score_vec_size,
             self.qk_acc_dtype,
-            aux_tensors,
+            aux_data,
             fastdiv_mods,
             seqlen_info=seqlen,
             constant_q_idx=None,

@@ -19,10 +19,12 @@ from flash_attn.cute import ampere_helpers as sm80_utils
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import utils
 from flash_attn.cute.mask import AttentionMask
+from flash_attn.cute.softmax import call_score_mod, call_score_mod_bwd
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from quack.cute_dsl_utils import ParamsBase
 from flash_attn.cute.tile_scheduler import SingleTileScheduler, SingleTileVarlenScheduler, TileSchedulerArguments
 from flash_attn.cute.block_sparsity import BlockSparseTensors
+from flash_attn.cute.utils import AuxData
 
 
 class FlashAttentionBackwardSm80:
@@ -387,7 +389,7 @@ class FlashAttentionBackwardSm80:
         mdQ_semaphore: Optional[cute.Tensor] = None,
         mdK_semaphore: Optional[cute.Tensor] = None,
         mdV_semaphore: Optional[cute.Tensor] = None,
-        aux_tensors: Optional[list] = None,
+        aux_data: AuxData = AuxData(),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
@@ -470,6 +472,7 @@ class FlashAttentionBackwardSm80:
             SharedStorage,
             tile_sched_params,
             TileScheduler,
+            aux_data,
         ).launch(
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
@@ -514,6 +517,7 @@ class FlashAttentionBackwardSm80:
         SharedStorage: cutlass.Constexpr,
         tile_sched_params: ParamsBase,
         TileScheduler: cutlass.Constexpr[Callable],
+        aux_data: AuxData = AuxData(),
     ):
         # Thread index, block index
         tidx, _, _ = cute.arch.thread_idx()
@@ -779,6 +783,7 @@ class FlashAttentionBackwardSm80:
                 m_block_max=m_block_max,
                 softmax_scale=softmax_scale,
                 softmax_scale_log2=softmax_scale_log2,
+                aux_data=aux_data,
             )
 
             # ///////////////////////////////////////////////////////////////////////////////
@@ -868,6 +873,7 @@ class FlashAttentionBackwardSm80:
         m_block_max: cutlass.Int32,
         softmax_scale: cutlass.Float32,
         softmax_scale_log2: cutlass.Float32,
+        aux_data: AuxData = AuxData(),
         mask_fn: Optional[Callable] = None,
     ):
         def load_Q_next():
@@ -907,9 +913,15 @@ class FlashAttentionBackwardSm80:
         if cutlass.const_expr(self.score_mod is not None):
             for r in cutlass.range(cute.size(acc_S_mn, mode=[0]), unroll_full=True):
                 acc_S_mn[r, None].store(
-                    self.score_mod(
+                    call_score_mod(
+                        self.score_mod,
                         acc_S_mn[r, None].load() * softmax_scale,
-                        0, 0, 0, 0, None, [],
+                        0,
+                        0,
+                        0,
+                        0,
+                        None,
+                        aux_data,
                     )
                 )
         if cutlass.const_expr(mask_fn is not None):
@@ -945,10 +957,16 @@ class FlashAttentionBackwardSm80:
         for r in cutlass.range(cute.size(acc_dP_mn, mode=[0]), unroll_full=True):
             grad_val = acc_S_mn[r, None].load() * (acc_dP_mn[r, None].load() - tLSErdPsum[r])
             if cutlass.const_expr(self.score_mod_bwd is not None):
-                grad_val = self.score_mod_bwd(
+                grad_val = call_score_mod_bwd(
+                    self.score_mod_bwd,
                     grad_val,
                     acc_S_pre_mn[r, None].load() * softmax_scale,
-                    0, 0, 0, 0, None, [],
+                    0,
+                    0,
+                    0,
+                    0,
+                    None,
+                    aux_data,
                 )
             acc_dP_mn[r, None].store(grad_val)
         # if cute.arch.thread_idx()[0] == 0 and cute.arch.block_idx()[0] == bidx: cute.print_tensor(acc_dP_mn)

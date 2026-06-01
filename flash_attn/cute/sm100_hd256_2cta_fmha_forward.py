@@ -30,6 +30,7 @@ from flash_attn.cute.mask import (
 from flash_attn.cute.tile_scheduler import SM100_TMEM_CAPACITY_COLUMNS
 from flash_attn.cute.flash_fwd_sm100 import DescaleTensors, _TUNING_CONFIG
 from flash_attn.cute.utils import ex2_emulation_2
+from flash_attn.cute.utils import AuxData
 
 
 class BlackwellFusedMultiHeadAttentionForward:
@@ -179,7 +180,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         learnable_sink: Optional[cute.Tensor] = None,
         descale_tensors: Optional[DescaleTensors] = None,
         blocksparse_tensors: Optional[cute.Tensor] = None,
-        aux_tensors: Optional[list] = None,
+        aux_data: AuxData = AuxData(),
         stream: cuda.CUstream = None,
     ):
         # Keep parity with FlashAttentionForwardSm100.__call__ interface.
@@ -193,7 +194,12 @@ class BlackwellFusedMultiHeadAttentionForward:
         assert blocksparse_tensors is None, (
             "SM100 forward with head_dim=256 does not support block sparsity"
         )
-        assert aux_tensors is None, "SM100 forward with head_dim=256 does not support aux_tensors"
+        assert aux_data.tensors is None, (
+            "SM100 forward with head_dim=256 does not support aux_tensors"
+        )
+        assert aux_data.scalars is None, (
+            "SM100 forward with head_dim=256 does not support aux_scalars"
+        )
         assert not self.is_local, (
             "SM100 forward with head_dim=256 does not support local attention yet"
         )
