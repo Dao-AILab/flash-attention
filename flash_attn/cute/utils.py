@@ -276,7 +276,7 @@ def make_tiled_copy_B(
 
 
 def mma_make_fragment_A(
-    smem: cute.Tensor, thr_mma: cute.core.ThrMma, swapAB: cutlass.Constexpr[bool] = False
+    smem: cute.Tensor, thr_mma: cute.ThrMma, swapAB: cutlass.Constexpr[bool] = False
 ) -> cute.Tensor:
     if const_expr(swapAB):
         return mma_make_fragment_B(smem, thr_mma)
@@ -285,7 +285,7 @@ def mma_make_fragment_A(
 
 
 def mma_make_fragment_B(
-    smem: cute.Tensor, thr_mma: cute.core.ThrMma, swapAB: cutlass.Constexpr[bool] = False
+    smem: cute.Tensor, thr_mma: cute.ThrMma, swapAB: cutlass.Constexpr[bool] = False
 ) -> cute.Tensor:
     if const_expr(swapAB):
         return mma_make_fragment_A(smem, thr_mma)
@@ -316,7 +316,7 @@ def warp_reduce(
     width: cutlass.Constexpr[int] = cute.arch.WARP_SIZE,
 ) -> cute.TensorSSA | cute.Numeric:
     if const_expr(isinstance(val, cute.TensorSSA)):
-        res = cute.make_fragment(val.shape, val.dtype)
+        res = cute.make_rmem_tensor(val.shape, val.dtype)
         res.store(val)
         for i in cutlass.range_constexpr(cute.size(val.shape)):
             res[i] = warp_reduce(res[i], op, width)
@@ -382,7 +382,7 @@ def fmax_reduce(
         # if const_expr(init_val is None):
         #     init_val = -cutlass.Float32.if
         # return x.reduce(cute.ReductionOp.MAX, init_val, 0)
-        res = cute.make_fragment(x.shape, Float32)
+        res = cute.make_rmem_tensor(x.shape, Float32)
         res.store(x)
         # local_max = [res[0], res[1]]
         # for i in cutlass.range_constexpr(2, cute.size(x.shape), 2):
@@ -403,7 +403,7 @@ def fmax_reduce(
     else:
         # [2025-06-15] x.reduce only seems to use 50% 3-input max and 50% 2-input max
         # We instead force the 3-input max.
-        res = cute.make_fragment(x.shape, Float32)
+        res = cute.make_rmem_tensor(x.shape, Float32)
         res.store(x)
         local_max_0 = (
             fmax(init_val, res[0], res[1])
@@ -433,7 +433,7 @@ def fadd_reduce(
         if const_expr(init_val is None):
             init_val = Float32.zero
         return x.reduce(cute.ReductionOp.ADD, init_val, 0)
-        # res = cute.make_fragment(x.shape, Float32)
+        # res = cute.make_rmem_tensor(x.shape, Float32)
         # res.store(x)
         # local_sum = [res[0], res[1], res[2], res[3]]
         # for i in cutlass.range_constexpr(4, cute.size(x.shape), 4):
@@ -446,7 +446,7 @@ def fadd_reduce(
         # local_sum[0] += local_sum[2]
         # return local_sum[0] if const_expr(init_val is None) else local_sum[0] + init_val
     else:
-        res = cute.make_fragment(x.shape, Float32)
+        res = cute.make_rmem_tensor(x.shape, Float32)
         res.store(x)
         local_sum_0 = (
             cute.arch.add_packed_f32x2((init_val, 0.0), (res[0], res[1]))
@@ -503,7 +503,7 @@ def elem_pointer(x: cute.Tensor, coord: cute.Coord, *, loc=None, ip=None) -> cut
 @cute.jit
 def predicate_k(tAcA: cute.Tensor, limit: cutlass.Int32) -> cute.Tensor:
     # Only compute predicates for the "k" dimension. For the mn dimension, we will use "if"
-    tApA = cute.make_fragment(
+    tApA = cute.make_rmem_tensor(
         cute.make_layout(
             (cute.size(tAcA, mode=[0, 1]), cute.size(tAcA, mode=[1]), cute.size(tAcA, mode=[2])),
             stride=(cute.size(tAcA, mode=[2]), 0, 1),
@@ -676,7 +676,7 @@ def cvt_f16(src: cute.Tensor, dst_or_dtype):
     if const_expr(isinstance(dst_or_dtype, type)):
         # dtype variant: create new tensor and call the tensor variant
         dtype = dst_or_dtype
-        dst = cute.make_fragment(src.shape, dtype)
+        dst = cute.make_rmem_tensor(src.shape, dtype)
         cvt_f16(src, dst)
         return dst
     else:
@@ -948,7 +948,7 @@ def make_cotiled_copy(
 @cute.jit
 def scalar_to_ssa(a: cute.Numeric, dtype) -> cute.TensorSSA:
     """Convert a scalar to a cute TensorSSA of shape (1,) and given dtype"""
-    vec = cute.make_fragment(1, dtype)
+    vec = cute.make_rmem_tensor(1, dtype)
     vec[0] = a
     return vec.load()
 

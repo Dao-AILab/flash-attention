@@ -201,16 +201,16 @@ def cute_global_packed_doc_mask(
 
     offset_q = seqlen_info.offset_q
     m_global = m_idx + offset_q
-    m_frag = cute.make_fragment(1, cutlass.Int32)
+    m_frag = cute.make_rmem_tensor(1, cutlass.Int32)
     m_frag.store(m_global)
-    m_doc_frag = cute.make_fragment(1, cutlass.Int32)
+    m_doc_frag = cute.make_rmem_tensor(1, cutlass.Int32)
     m_doc_frag[0] = doc_ids_q[m_frag[0]]
 
     offset_k = seqlen_info.offset_k
     n_global = n_idx + offset_k
-    n_frag = cute.make_fragment(1, cutlass.Int32)
+    n_frag = cute.make_rmem_tensor(1, cutlass.Int32)
     n_frag.store(n_global)
-    n_doc_frag = cute.make_fragment(1, cutlass.Int32)
+    n_doc_frag = cute.make_rmem_tensor(1, cutlass.Int32)
     n_doc_frag[0] = doc_ids_k[n_frag[0]]
 
     m_doc = m_doc_frag.load()
@@ -237,9 +237,9 @@ def cute_global_ima_mask(
 
     offset_k = seqlen_info.offset_k
     n_global = n_idx + offset_k
-    n_frag = cute.make_fragment(1, cutlass.Int32)
+    n_frag = cute.make_rmem_tensor(1, cutlass.Int32)
     n_frag.store(n_global)
-    val_frag = cute.make_fragment(1, cutlass.Int32)
+    val_frag = cute.make_rmem_tensor(1, cutlass.Int32)
     val_frag[0] = thresholds[n_frag[0]]
     threshold = val_frag.load()
 
@@ -265,9 +265,9 @@ def cute_global_causal_window_mask(
 
     offset_q = seqlen_info.offset_q
     m_global = m_idx + offset_q
-    m_frag = cute.make_fragment(1, cutlass.Int32)
+    m_frag = cute.make_rmem_tensor(1, cutlass.Int32)
     m_frag.store(m_global)
-    win_frag = cute.make_fragment(1, cutlass.Int32)
+    win_frag = cute.make_rmem_tensor(1, cutlass.Int32)
     win_frag[0] = windows[m_frag[0]]
     window = win_frag.load()
 

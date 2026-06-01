@@ -1017,7 +1017,7 @@ class FlashAttentionBackwardSm90:
     def apply_score_mod(
         self,
         acc_S: cute.Tensor,
-        thr_mma_SdP: cute.core.ThrMma,
+        thr_mma_SdP: cute.ThrMma,
         batch_idx,
         head_idx,
         m_block,
@@ -1061,7 +1061,7 @@ class FlashAttentionBackwardSm90:
         self,
         grad_tensor: cute.Tensor,
         score_tensor: cute.Tensor,
-        thr_mma_SdP: cute.core.ThrMma,
+        thr_mma_SdP: cute.ThrMma,
         batch_idx,
         head_idx,
         m_block,
