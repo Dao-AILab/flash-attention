@@ -1,6 +1,7 @@
 # Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
 # [2025-07-04] Version in Cute-DSL, for Hopper and Blackwell. You'll need install nvidia-cutlass-dsl==4.2.0.
 
+from numpy._core.defchararray import zfill
 import os
 import math
 from dataclasses import dataclass
@@ -733,7 +734,7 @@ def _flash_attn_fwd(
         and not disable_scheduler_metadata
         and not use_dedicated_hd256_kernel
     ):
-        scheduler_metadata = get_scheduler_metadata(
+        scheduler_metadata = _get_scheduler_metadata(
             num_batch=batch_size,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
@@ -2759,7 +2760,7 @@ def flash_attn_combine(
     return out, lse
 
 
-def get_scheduler_metadata(
+def _get_scheduler_metadata(
     num_batch: int,
     max_seqlen_q: int,
     max_seqlen_k: int,
@@ -2849,7 +2850,7 @@ def get_scheduler_metadata(
             zfill_padded_output,
         )
 
-        if cache_key not in get_scheduler_metadata.compile_cache:
+        if cache_key not in _get_scheduler_metadata.compile_cache:
             (
                 num_m_blocks_cute,
                 num_splits_dynamic_cute,
@@ -2891,7 +2892,7 @@ def get_scheduler_metadata(
                 sort=sort,
                 zfill_padded_output=zfill_padded_output,
             )
-            get_scheduler_metadata.compile_cache[cache_key] = cute.compile(
+            _get_scheduler_metadata.compile_cache[cache_key] = cute.compile(
                 scheduler,
                 max_seqlen_q,
                 max_seqlen_k,
@@ -2915,7 +2916,7 @@ def get_scheduler_metadata(
             )
 
         if not is_fake_mode():
-            get_scheduler_metadata.compile_cache[cache_key](
+            _get_scheduler_metadata.compile_cache[cache_key](
                 max_seqlen_q,
                 max_seqlen_k,
                 seqlen_k_new,
@@ -2968,4 +2969,61 @@ def get_scheduler_metadata(
     )
 
 
-get_scheduler_metadata.compile_cache = get_jit_cache("scheduler_metadata")
+_get_scheduler_metadata.compile_cache = get_jit_cache("scheduler_metadata")
+
+
+def get_scheduler_metadata(
+    max_seqlen_q: int,
+    max_seqlen_k: int,
+    nheads: int,
+    nheads_kv: int,
+    headdim: int,
+    num_splits: int,
+    headdim_v: Optional[int] = None,
+    pack_gqa: Optional[int] = None,
+    causal: bool = False,
+    enable_pdl: bool = False,
+    sort: bool = False,
+    seqlen_k_new: int = 0,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k: Optional[torch.Tensor] = None,
+    cu_seqlens_k_new: Optional[torch.Tensor] = None,
+    seqused_q: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
+    leftpad_k: Optional[torch.Tensor] = None,
+    seqlen_k_per_split: Optional[int] = None,
+) -> SchedulerMetadataTensorsTorch:
+    """Public entrypoint for scheduler metadata computation"""
+    num_batch = cu_seqlens_q.shape[0] - 1 # TODO: ensure batch size consistent across tensors 
+
+    # TODO: get tile size and q stage from heuristic (same as fwd)
+    tile_m = 128
+    tile_n = 128
+    q_stage = 1
+
+    return _get_scheduler_metadata(
+        num_batch,
+        max_seqlen_q,
+        max_seqlen_k,
+        nheads,
+        nheads_kv,
+        headdim,
+        num_splits,
+        tile_m,
+        tile_n,
+        headdim_v=headdim_v,
+        pack_gqa=pack_gqa,
+        q_stage=q_stage,
+        causal=causal,
+        enable_pdl=enable_pdl,
+        sort=sort,
+        seqlen_k_new=seqlen_k_new,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        cu_seqlens_k_new=cu_seqlens_k_new,
+        seqused_q=seqused_q,
+        seqused_k=seqused_k,
+        leftpad_k=leftpad_k,
+        seqlen_k_per_split=seqlen_k_per_split,
+        zfill_padded_output=True,
+    )
