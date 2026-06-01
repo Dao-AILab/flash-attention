@@ -234,11 +234,14 @@ void run_mha_fwd_hdim128(Flash_fwd_params &params, cudaStream_t stream) {
     constexpr static int Headdim = 128;
     auto [cc_major, cc_minor] = get_compute_capability(get_current_device());
     bool is_sm8x = cc_major == 8 && cc_minor > 0;
+    bool is_sm12x = cc_major == 12 && cc_minor == 0;
     DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
         if constexpr(!Is_dropout) {
             // For sm86 or sm89, 64 x 64 is the fastest for causal (because it's square),
             // and 128 x 32 (48 KB smem) is the fastest for non-causal since we get 2 CTAs per SM.
-            if (is_sm8x) {
+            // sm_120 (RTX 50-series consumer Blackwell): same ~100 KB SMEM/SM, joins
+            // the sm_8x small-SMEM tile to get 2 blocks/SM (16.67% theoretical occupancy).
+            if (is_sm8x || is_sm12x) {
                 if constexpr(!Is_causal) {
                     run_flash_fwd<Flash_fwd_kernel_traits<Headdim, 128, 32, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
                 } else {
