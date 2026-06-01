@@ -82,13 +82,7 @@ class FlashAttentionBackwardSm100:
         assert self.tile_hdim <= 128 or (self.tile_hdim == 192 and self.tile_hdimv == 128)
         assert self.tile_hdimv <= 128
 
-        self.use_2cta_instrs = bool(
-            use_2cta_instrs
-            and cluster_size == 2
-            and score_mod is None
-            and score_mod_bwd is None
-            and mask_mod is None
-        )
+        self.use_2cta_instrs = bool(use_2cta_instrs and cluster_size == 2)
         self.cta_group_size = 2 if self.use_2cta_instrs else 1
 
         assert self.tile_hdim != 192 or self.use_2cta_instrs, "Must use 2CTA for hdim 192"
@@ -2761,9 +2755,15 @@ class FlashAttentionBackwardSm100:
         fastdiv_mods=(None, None),
     ):
         """Apply forward score modification for SM100 backward pass."""
-        # In bwd, S is computed as K @ Q.T so dimensions are (tile_n, tile_m)
-        cS = cute.make_identity_tensor((self.tile_n, self.tile_m))
-        cS = cute.domain_offset((n_block * self.tile_n, m_block * self.tile_m), cS)
+        # In bwd, S is computed as K @ Q.T so dimensions are (tile_n, tile_m).
+        # With 2CTA, partition_C must see the full cluster tile so each CTA 
+        # gets its own half of the tile.
+        cluster_tile_n = self.tile_n * self.cta_group_size
+        cluster_n_block = n_block // self.cta_group_size
+        cS = cute.make_identity_tensor((cluster_tile_n, self.tile_m))
+        cS = cute.domain_offset(
+            (cluster_n_block * cluster_tile_n, m_block * self.tile_m), cS
+        )
         tScS = thr_mma_S.partition_C(cS)
         tScS_idx = thr_copy_t2r.partition_D(tScS)
 
@@ -2979,13 +2979,13 @@ class FlashAttentionBackwardSm100:
                 seqlen, n_block // self.cluster_shape_mnk[0]
             )
             mask = AttentionMaskCls(seqlen)
-            n_block_for_cluster = n_block // self.cta_group_size
+            cluster_n_block = n_block // self.cta_group_size
             # TODO: condition mask_seqlen
             mask_fn = partial(
                 mask.apply_mask_sm100_transposed,
                 tScS_t2r=tScS_t2r,
                 t0ScS_t2r=t0ScS_t2r,
-                n_block=n_block_for_cluster,
+                n_block=cluster_n_block,
                 mask_seqlen=True,
                 mask_causal=self.is_causal,
                 mask_local=self.is_local,
@@ -3197,9 +3197,12 @@ class FlashAttentionBackwardSm100:
 
                     if const_expr(self.score_mod_bwd is not None):
                         tSrS_pre_cur = tSrS_pre[None, stage, 0, 0]
-                        cS_bwd = cute.make_identity_tensor((self.tile_n, self.tile_m))
+                        cluster_tile_n = self.tile_n * self.cta_group_size
+                        cluster_n_block = n_block // self.cta_group_size
+                        cS_bwd = cute.make_identity_tensor((cluster_tile_n, self.tile_m))
                         cS_bwd = cute.domain_offset(
-                            (n_block * self.tile_n, m_block * self.tile_m), cS_bwd
+                            (cluster_n_block * cluster_tile_n, m_block * self.tile_m),
+                            cS_bwd,
                         )
                         tScS_bwd = thr_mma_S.partition_C(cS_bwd)
                         tScS_idx_bwd = thr_copy_t2r.partition_D(tScS_bwd)
