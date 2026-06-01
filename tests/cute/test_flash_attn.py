@@ -826,7 +826,6 @@ def test_flash_attn_varlen_output(
                     continue
             if precompute_metadata:
                 scheduler_metadata = get_scheduler_metadata(
-                    num_batch=batch_size,
                     max_seqlen_q=seqlen_q,
                     max_seqlen_k=seqlen_k,
                     nheads=nheads,
@@ -834,8 +833,6 @@ def test_flash_attn_varlen_output(
                     headdim=d,
                     headdim_v=dv,
                     num_splits=num_splits,
-                    tile_m=128,
-                    tile_n=128,
                     causal=causal,
                     cu_seqlens_q=cu_seqlens_q if unpad_q else None,
                     cu_seqlens_k=cu_seqlens_k if unpad_kv else None,
@@ -1117,7 +1114,6 @@ def test_flash_attn_varlen_cumsum_metadata_paths(causal, cumsum_mode, qhead_per_
     scheduler_metadata = None
     if cumsum_mode != "jit_cumsum":
         scheduler_metadata = get_scheduler_metadata(
-            num_batch=batch_size,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_k=max_seqlen_k,
             nheads=nheads,
@@ -1125,8 +1121,6 @@ def test_flash_attn_varlen_cumsum_metadata_paths(causal, cumsum_mode, qhead_per_
             headdim=d,
             headdim_v=dv,
             num_splits=num_splits,
-            tile_m=128,
-            tile_n=128,
             causal=causal,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
@@ -1634,7 +1628,6 @@ def test_flash_attn_kvcache(
                 continue
             if precompute_metadata:
                 scheduler_metadata = get_scheduler_metadata(
-                    num_batch=batch_size,
                     max_seqlen_q=max_seqlen_q if varlen_q else seqlen_q,
                     max_seqlen_k=seqlen_k,
                     nheads=nheads,
@@ -1642,8 +1635,6 @@ def test_flash_attn_kvcache(
                     headdim=d,
                     headdim_v=dv,
                     num_splits=num_splits,
-                    tile_m=128,
-                    tile_n=128,
                     causal=causal,
                     sort=True,
                     cu_seqlens_q=cu_seqlens_q,

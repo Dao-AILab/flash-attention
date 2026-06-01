@@ -996,8 +996,7 @@ class VarlenDecoder(ParamsBase):
         # Both SingleTileVarlen STATIC and CLC; not DynamicPersistent (where
         # warp-scan's _bidb_start resumption already amortizes per-call cost).
         use_cumsum_hint = const_expr(
-            self.cluster_shape_m == 1
-            and cu_hint_ptr is not None
+            cu_hint_ptr is not None
             and (
                 self.scheduling_mode == SchedulingMode.STATIC
                 or self.scheduling_mode == SchedulingMode.CLC
