@@ -141,6 +141,14 @@ class AttentionMask:
     def seqlen_k(self) -> Int32:
         return self.seqlen_info.seqlen_k
 
+    @property
+    def has_chunk_size(self) -> bool:
+        return self.seqlen_info.has_chunk_size
+
+    @property
+    def chunk_size(self) -> Int32:
+        return self.seqlen_info.chunk_size
+
     @cute.jit
     def apply_mask(
         self,
@@ -278,6 +286,12 @@ class AttentionMask:
                                 mma_m_idx, r % threads_per_row, width=threads_per_row
                             )
                         col_limit_right = row_idx + causal_row_offset
+                        if const_expr(self.has_chunk_size):
+                            kq_diff = self.seqlen_k - self.seqlen_q
+                            base_offset = causal_row_offset - 1 - kq_diff
+                            aligned_row = row_idx + kq_diff
+                            chunk_boundary = (aligned_row // self.chunk_size + 1) * self.chunk_size
+                            col_limit_right = chunk_boundary + base_offset
                         if const_expr(mask_seqlen):
                             col_limit_right = cutlass.min(col_limit_right, seqlenk_col_limit)
                         if const_expr(not r2p):
@@ -350,12 +364,16 @@ class AttentionMask:
                 if const_expr(mask_causal):
                     for c in cutlass.range(cute.size(tScS_mn.shape[1]), unroll_full=True):
                         col0 = t0ScS_mn[0, c][COL]
-                        # If col0 is beyond the column limit, we want to mask out the entire
-                        # column, by setting row limit to be self.tile_m.
+                        causal_limit = col0 - causal_row_offset
+                        if const_expr(self.has_chunk_size):
+                            kq_diff = self.seqlen_k - self.seqlen_q
+                            abs_kv = col0 + thr_col_offset + n_block * self.tile_n
+                            chunk_start = (abs_kv // self.chunk_size) * self.chunk_size
+                            causal_limit = chunk_start - kq_diff - m_block * self.tile_m - thr_row_offset
                         row_limit_top = (
                             self.tile_m
                             if col0 >= seqlenk_col_limit and mask_seqlen
-                            else col0 - causal_row_offset
+                            else causal_limit
                         )
                         for r in cutlass.range(cute.size(tScS_mn.shape[0]), unroll_full=True):
                             acc_S_mn[r, c] = (
@@ -682,6 +700,12 @@ class AttentionMask:
                 row_idx = row_idx // self.qhead_per_kvhead_packgqa
             if const_expr(mask_causal):
                 col_limit_right = row_idx + causal_row_offset + 1
+                if const_expr(self.has_chunk_size):
+                    kq_diff = self.seqlen_k - self.seqlen_q
+                    base_offset = causal_row_offset - kq_diff
+                    aligned_row = row_idx + kq_diff
+                    chunk_boundary = (aligned_row // self.chunk_size + 1) * self.chunk_size
+                    col_limit_right = chunk_boundary + base_offset
                 if const_expr(mask_seqlen):
                     col_limit_right = cutlass.min(col_limit_right, seqlenk_col_limit)
                 # if cute.arch.thread_idx()[0] % 32 == 0:
@@ -863,6 +887,12 @@ class AttentionMask:
                 # if tidx < 32:
                 #     cute.printf("tidx = {}, {} {}, {} {}", tidx, tScS_t2r[0][0], tScS_t2r[0][1], tScS_t2r[1][0], tScS_t2r[1][1])
                 row_limit_top = causal_offset
+                if const_expr(self.has_chunk_size):
+                    col_idx = tScS_t2r[0][COL] + n_block * self.tile_n
+                    if const_expr(self.qhead_per_kvhead_packgqa != 1):
+                        col_idx = col_idx // self.qhead_per_kvhead_packgqa
+                    chunk_start = (col_idx // self.chunk_size) * self.chunk_size
+                    row_limit_top = causal_offset + chunk_start - col_idx
                 if const_expr(mask_seqlen):
                     # If col is beyond the column limit, we want to mask out the entire
                     # column, by setting row limit to be self.tile_m.

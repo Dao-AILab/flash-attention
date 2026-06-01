@@ -172,6 +172,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors: Optional[list] = None,
+        mChunkSize: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -390,6 +391,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             SharedStorage,
             aux_tensors,
             fastdiv_mods,
+            mChunkSize,
         ).launch(
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
@@ -436,6 +438,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         SharedStorage: cutlass.Constexpr[Callable],
         aux_tensors=Optional[list[cute.Tensor]],
         fastdiv_mods=None,
+        mChunkSize: Optional[cute.Tensor] = None,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         # Prefetch tma descriptor
@@ -561,6 +564,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 if blocksparse_tensors is not None
                 else None
             ),
+            mChunkSize=mChunkSize,
             # Don't need to pass in tile_mn because we won't access offset_padded
         )
         AttentionMaskCls = partial(

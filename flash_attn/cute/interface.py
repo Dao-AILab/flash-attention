@@ -326,6 +326,7 @@ def _flash_attn_fwd(
     k_descale: Optional[torch.Tensor] = None,
     v_descale: Optional[torch.Tensor] = None,
     gather_kv_indices: Optional[torch.Tensor] = None,
+    chunk_size: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for FlashAttention.
 
@@ -433,6 +434,7 @@ def _flash_attn_fwd(
                 seqused_k,
                 page_table,
                 learnable_sink,
+                chunk_size,
             )
         ), "inputs must be on CUDA device"
     arch = _get_device_arch() if _arch is None else _arch
@@ -749,6 +751,7 @@ def _flash_attn_fwd(
         gather_kv_length,
         sparse_kv,
         disable_sparse_kv_bitmask,
+        chunk_size is None,
         fa_logging.get_fa_log_level(),
     )
 
@@ -759,11 +762,12 @@ def _flash_attn_fwd(
             seqused_q_tensor,
             seqused_k_tensor,
             learnable_sink_tensor,
+            chunk_size_tensor,
         ) = [
             to_cute_tensor(t, assumed_align=4, leading_dim=0)
             if t is not None
             else None
-            for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, learnable_sink)
+            for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, learnable_sink, chunk_size)
         ]
         page_table_tensor = (
             to_cute_tensor(page_table, assumed_align=4, leading_dim=1)
@@ -1015,6 +1019,7 @@ def _flash_attn_fwd(
             compile_args.extend([
                 sparse_tensors,
                 cute_aux_tensors,
+                chunk_size_tensor,
             ])
             compile_args.append(current_stream)
             _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
@@ -1090,6 +1095,7 @@ def _flash_attn_fwd(
                 if normalized_block_sparse_tensors is not None
                 else None,
                 aux_tensors,
+                chunk_size,
             ])
             _flash_attn_fwd.compile_cache[compile_key](*call_args)
     if is_split_kv:
@@ -1288,6 +1294,7 @@ def _flash_attn_bwd(
     aux_tensors: Optional[list[torch.Tensor]] = None,
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     dlse: Optional[torch.Tensor] = None,
+    chunk_size: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     arch = _get_device_arch()
     assert arch // 10 in [9, 10, 11, 12], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x, 12.x"
@@ -1683,6 +1690,7 @@ def _flash_attn_bwd(
             # Prevent TVM stride poisoning when only one block is present.
             (seqlen_q_rounded // m_block_size == 1),
             (seqlen_k_rounded // n_block_size == 1),
+            chunk_size is None,
         )
     else:
         compile_key = (
@@ -1719,6 +1727,7 @@ def _flash_attn_bwd(
             # Prevent TVM stride poisoning when only one block is present.
             (seqlen_q_rounded // m_block_size == 1),
             (seqlen_k_rounded // n_block_size == 1),
+            chunk_size is None,
         )
 
     if compile_key not in _flash_attn_bwd.compile_cache:
@@ -1731,9 +1740,9 @@ def _flash_attn_bwd(
             dk_accum_tensor, dv_accum_tensor = [
                 to_cute_tensor(t) for t in (dk_accum, dv_accum)
             ]
-        cu_seqlens_q_tensor, cu_seqlens_k_tensor, seqused_q_tensor, seqused_k_tensor = [
+        cu_seqlens_q_tensor, cu_seqlens_k_tensor, seqused_q_tensor, seqused_k_tensor, chunk_size_tensor = [
             to_cute_tensor(t, assumed_align=4) if t is not None else None
-            for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
+            for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, chunk_size)
         ]
         dQ_semaphore_tensor, dK_semaphore_tensor, dV_semaphore_tensor = [
             utils.convert_from_dlpack_leading_static(t.detach(), leading_dim=3, alignment=4, stride_order=t.dim_order())
@@ -1875,6 +1884,7 @@ def _flash_attn_bwd(
             dV_semaphore_tensor,
             cute_aux_tensors,
             sparse_tensors_compile,
+            chunk_size_tensor,
             current_stream,
             options="--enable-tvm-ffi",
         )
@@ -1913,6 +1923,7 @@ def _flash_attn_bwd(
             )
             if normalized_block_sparse_tensors is not None
             else None,
+            chunk_size,
         )
     # Postprocess: convert dq_accum from float32 to dq in bf16/fp16
     # hd=256 2CTA backward has its own internal postprocess, skip here.
@@ -2085,6 +2096,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         block_sparse_tensors: Optional[list] = None,
         aux_tensors: Optional[list] = None,
         return_lse: bool = False,
+        chunk_size: Optional[torch.Tensor] = None,
     ):
         shared_kv = k is v
         if shared_kv and v.shape[-1] == 512:
@@ -2120,6 +2132,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             aux_tensors=aux_tensors,
             return_lse=return_lse,
             gather_kv_indices=gather_kv_indices,
+            chunk_size=chunk_size,
         )
         ctx.save_for_backward(
             q,
@@ -2131,6 +2144,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             cu_seqlens_k,
             seqused_q,
             seqused_k,
+            chunk_size,
             *(aux_tensors or ()),
         )
         ctx.softmax_scale = softmax_scale
@@ -2148,7 +2162,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, dlse):
-        q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, *aux = ctx.saved_tensors
+        q, k, v, out, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, chunk_size, *aux = ctx.saved_tensors
         aux_tensors = aux if aux else None
         if not ctx.return_lse:
             dlse = None
@@ -2177,9 +2191,10 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             score_mod_bwd=ctx.score_mod_bwd,
             aux_tensors=aux_tensors,
             dlse=dlse,
+            chunk_size=chunk_size,
         )
 
-        return dq, dk, dv, *((None,) * 30)
+        return dq, dk, dv, *((None,) * 31)
 
 
 def flash_attn_func(
@@ -2256,6 +2271,7 @@ def flash_attn_varlen_func(
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     aux_tensors: Optional[list] = None,
     return_lse: bool = False,
+    chunk_size: Optional[torch.Tensor] = None,
 ):
     """
     Tensor arguments:
@@ -2288,6 +2304,17 @@ def flash_attn_varlen_func(
     min_seqlen_k: for varlen, specifies the minimum kv sequence length for any batch.
         Used with gather_kv_indices to determine if we need oob masking.
     """
+    if -1 in window_size:
+        window_size = tuple(None if w == -1 else w for w in window_size)
+
+    if chunk_size is not None:
+        assert chunk_size.device == q.device, "Chunk attention requires chunk_size on the same device as q"
+        assert chunk_size.dtype == torch.int32, "chunk_size must be int32"
+        assert cu_seqlens_q is not None, "Chunk attention requires cu_seqlens_q"
+        assert len(cu_seqlens_q) - 1 == len(chunk_size), "Chunk size must match number of sequences"
+        assert causal, "Chunk attention only supports causal mode"
+        assert window_size == (None, None), "Chunk attention only supports global attention"
+
     return FlashAttnVarlenFunc.apply(
         q,
         k,
@@ -2316,6 +2343,7 @@ def flash_attn_varlen_func(
         block_sparse_tensors,
         aux_tensors,
         return_lse,
+        chunk_size,
     )
 
 
