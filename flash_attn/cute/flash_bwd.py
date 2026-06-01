@@ -426,7 +426,7 @@ class FlashAttentionBackwardSm80:
             headdim_v=mV.shape[2],
             total_q=mK.shape[0],
             tile_shape_mn=(self.n_block_size, self.m_block_size),
-            qhead_per_kvhead_packgqa=self.qhead_per_kvhead if cutlass.const_expr(self.pack_gqa) else 1,
+            qhead_per_kvhead_packgqa=1,  # SM80 bwd never calls pack_gqa_layout (rows are not packed)
             mCuSeqlensQ=mCuSeqlensK,
             mSeqUsedQ=mSeqUsedK,
         )
@@ -566,7 +566,7 @@ class FlashAttentionBackwardSm80:
                 mdO_cur = cute.domain_offset((seqlen.offset_q, 0), mdO[None, head_idx, None])
                 mdPsum_cur = cute.domain_offset((padded_offset_q,), mdPsum[head_idx, None])
                 mdQaccum_cur = cute.domain_offset((padded_offset_q * self.head_dim_padded,), mdQaccum[head_idx, None])
-            head_idx_kv = head_idx // self.qhead_per_kvhead if cutlass.const_expr(not self.pack_gqa) else head_idx
+            head_idx_kv = head_idx // self.qhead_per_kvhead  # SM80 bwd never packs
 
             if cutlass.const_expr(not seqlen.has_cu_seqlens_k):
                 mK_cur, mV_cur = [t[batch_idx, None, head_idx_kv, None] for t in (mK, mV)]
@@ -1056,7 +1056,7 @@ class FlashAttentionBackwardSm80:
         gmem_thr_copy_dV = gmem_tiled_copy_dV.get_slice(tidx)
 
         batch_idx = batch_size
-        head_idx_kv = num_head // self.qhead_per_kvhead if cutlass.const_expr(not self.pack_gqa) else num_head
+        head_idx_kv = num_head // self.qhead_per_kvhead  # SM80 bwd never packs
 
         if cutlass.const_expr(self.qhead_per_kvhead == 1):
             # Make sure all threads have finished reading K and V, otherwise we get racy dQ
@@ -1135,7 +1135,7 @@ class FlashAttentionBackwardSm80:
         else:  # qhead_per_kvhead > 1, do atomic add
             # For Sm90, we need to sync to avoid racy writes to smem_q
             # For Sm80, we don't need to sync since we're not touching smem
-            head_idx_kv = num_head // self.qhead_per_kvhead if cutlass.const_expr(not self.pack_gqa) else num_head
+            head_idx_kv = num_head // self.qhead_per_kvhead  # SM80 bwd never packs
 
             if cutlass.const_expr(not seqlen.has_cu_seqlens_k):
                 mdK_cur, mdV_cur = [t[batch_idx, head_idx_kv, None] for t in (mdK, mdV)]
