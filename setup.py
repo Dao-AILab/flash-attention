@@ -227,8 +227,11 @@ if IS_ROCM:
             assert os.path.isdir("third_party/aiter"), (
                 "third_party/aiter is missing, please use source distribution or git clone"
             )
+        aiter_env = os.environ.copy()
+        aiter_env.setdefault("AITER_TRITON_ONLY", "1")
         subprocess.run(
             [sys.executable, "-m", "pip", "install", "--no-build-isolation", "third_party/aiter"],
+            env=aiter_env,
             check=True,
         )
     elif ROCM_BACKEND == "ck":
@@ -673,7 +676,7 @@ if ROCM_BACKEND == "triton":
     # Note: torch is excluded because pip resolves it to CUDA PyTorch from PyPI, overwriting any pre-installed ROCm PyTorch. Users must have torch installed.
     install_requires = [
         "einops",
-        "triton==3.5.1" if sys.platform != "win32" else "triton-windows>=3.6.0",
+        "triton>=3.6.0" if sys.platform != "win32" else "triton-windows>=3.6.0",
     ]
 else:
     install_requires = [
