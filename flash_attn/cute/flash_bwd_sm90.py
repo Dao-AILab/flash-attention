@@ -357,6 +357,7 @@ class FlashAttentionBackwardSm90:
         mdV_semaphore: Optional[cute.Tensor] = None,
         aux_tensors: Optional[list] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        mCuTotalMBlocks: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -536,6 +537,7 @@ class FlashAttentionBackwardSm90:
             is_persistent=False,
             lpt=self.spt,
             head_swizzle=self.deterministic,
+            cu_total_m_blocks_ptr=mCuTotalMBlocks,
         )
 
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
