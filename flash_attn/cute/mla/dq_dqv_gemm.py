@@ -337,8 +337,13 @@ class dQdQvGemmKernel:
         sV_size = cute.cosize(sV_layout)
         sdQ_size = cute.cosize(sdQ_layout) if const_expr(self.compute_dQ) else 0
         sdQv_size = cute.cosize(sdQv_layout)
-        sK_sdQ_union_size = cutlass.max(sK_size, sdQ_size)
-        sdS_sdQv_union_size = cutlass.max(sdQv_size, sdS_size)
+        assert sdQ_size <= sK_size, f"require {sdQ_size=} <= {sK_size=}"
+        assert sdQv_size <= sV_size, f"require {sdQv_size=} <= {sV_size=}"
+
+        self.overlap_kv_epi = self.compute_dQ
+        if const_expr(self.overlap_kv_epi):
+            sdQ_size = 0
+            sdQv_size = 0
 
         @cute.struct
         class SharedStorage:
@@ -346,7 +351,6 @@ class dQdQvGemmKernel:
             mbar_ptr_KV: cute.struct.MemRange[cutlass.Int64, self.num_stages_KV * 2]
             mbar_ptr_dQ_dQv: cute.struct.MemRange[cutlass.Int64, self.num_stages_acc * 2]
             mbar_ptr_KV_cpasync: cute.struct.MemRange[cutlass.Int64, self.num_stages_KV * 2]
-            mbar_ptr_tma_epi: cute.struct.MemRange[cutlass.Int64, 2]
             mbar_ptr_load_kv_epi: cute.struct.MemRange[cutlass.Int64, 2]
             # Tmem holding buffer
             mbar_ptr_tmem_dealloc: cutlass.Int64
@@ -358,25 +362,25 @@ class dQdQvGemmKernel:
             clc_response_ptr: cute.struct.Align[cute.struct.MemRange[cutlass.Int32, 4], 16]
             # Smem tensors
             sdS: cute.struct.Align[
-                cute.struct.MemRange[self.ds_dtype, sdS_sdQv_union_size],
+                cute.struct.MemRange[self.ds_dtype, sdS_size],
                 self.buffer_align_bytes,
             ]
             sK: cute.struct.Align[
-                cute.struct.MemRange[self.kv_dtype, sK_sdQ_union_size],
+                cute.struct.MemRange[self.kv_dtype, sK_size],
                 self.buffer_align_bytes,
             ]
             sV: cute.struct.Align[
                 cute.struct.MemRange[self.kv_dtype, sV_size],
                 self.buffer_align_bytes,
             ]
-            # sdQ: cute.struct.Align[
-            #     cute.struct.MemRange[self.dq_dtype, sdQ_size],
-            #     self.buffer_align_bytes,
-            # ]
-            # sdQv: cute.struct.Align[
-            #     cute.struct.MemRange[self.dq_dtype, sdQv_size],
-            #     self.buffer_align_bytes,
-            # ]
+            sdQ: cute.struct.Align[
+                cute.struct.MemRange[self.dq_dtype, sdQ_size],
+                self.buffer_align_bytes,
+            ]
+            sdQv: cute.struct.Align[
+                cute.struct.MemRange[self.dq_dtype, sdQv_size],
+                self.buffer_align_bytes,
+            ]
 
         self.shared_storage = SharedStorage
 
@@ -391,7 +395,8 @@ class dQdQvGemmKernel:
         # this is undone in the kernel
         grid = (grid[2], grid[1], grid[0])
 
-        # cute.printf("grid: {}", grid)
+        # cute.printf("dQ/dQv grid: {}", grid)
+        # print("dQ/dQv SMEM: ", self.shared_storage.size_in_bytes())
         # ---- Launch the kernel synchronously ----
         self.kernel(
             tiled_mma_k if const_expr(self.compute_dQ) else None,
@@ -501,7 +506,7 @@ class dQdQvGemmKernel:
         )
         clc_consumer_group = ThreadCooperativeGroup(num_clc_consumer_threads)
         mma_warp = ThreadCooperativeGroup(1)
-        tma_warp = ThreadCooperativeGroup(2)
+        tma_warp = ThreadCooperativeGroup(cute.size(self.cluster_shape_mn))
         tma_warp_local = ThreadCooperativeGroup(1)
         epilogue_warps = ThreadCooperativeGroup(len(self.epilogue_warp_ids))
         load_warps = ThreadCooperativeGroup(len(self.kv_load_warp_ids))
@@ -542,20 +547,15 @@ class dQdQvGemmKernel:
             defer_sync=True,
         )
 
-        pipeline_tma_epi = pipeline.PipelineAsync.create(
-            barrier_storage=storage.mbar_ptr_tma_epi.data_ptr(),
-            num_stages=1,
-            producer_group=epilogue_warps,
-            consumer_group=tma_warp_local,
-            defer_sync=True,
-        )
-        pipeline_load_kv_epi = pipeline.PipelineAsync.create(
-            barrier_storage=storage.mbar_ptr_load_kv_epi.data_ptr(),
-            num_stages=1,
-            producer_group=epilogue_warps,
-            consumer_group=load_warps,
-            defer_sync=True,
-        )
+        pipeline_load_kv_epi = None
+        if const_expr(self.overlap_kv_epi):
+            pipeline_load_kv_epi = pipeline.PipelineAsync.create(
+                barrier_storage=storage.mbar_ptr_load_kv_epi.data_ptr(),
+                num_stages=1,
+                producer_group=epilogue_warps,
+                consumer_group=load_warps,
+                defer_sync=True,
+            )
 
         # ------------------------------------------------------------------ #
         # TMEM Allocation                                                    #
@@ -596,10 +596,12 @@ class dQdQvGemmKernel:
             sdQ = cute.make_tensor(
                 cute.recast_ptr(sK.iterator, sdQ_layout.inner, self.dq_dtype), sdQ_layout.outer
             )
-        # sdQv = storage.sdQv.get_tensor(sdQv_layout.outer, swizzle=sdQv_layout.inner)
-        sdQv = cute.make_tensor(
-            cute.recast_ptr(sdS.iterator, sdQv_layout.inner, self.dq_dtype), sdQv_layout.outer
-        )
+        if const_expr(not self.compute_dQ):
+            sdQv = storage.sdQv.get_tensor(sdQv_layout.outer, swizzle=sdQv_layout.inner)
+        else:
+            sdQv = cute.make_tensor(
+                cute.recast_ptr(sV.iterator, sdQv_layout.inner, self.dq_dtype), sdQv_layout.outer
+            )
 
         dS_full_mcast_mask = cpasync.create_tma_multicast_mask(
             cluster_layout_vmnk, block_in_cluster_coord_vmnk, mcast_mode=2
@@ -691,9 +693,6 @@ class dQdQvGemmKernel:
         if warp_idx == self.tma_warp_id:
             cute.arch.setmaxregister_decrease(self.num_regs_other)
 
-            tma_epi_consumer_state = pipeline.make_pipeline_state(
-                pipeline.PipelineUserType.Consumer, 1
-            )
             producer_state_dS = pipeline.make_pipeline_state(
                 pipeline.PipelineUserType.Producer, stages=self.num_stages_dS
             )
@@ -720,11 +719,6 @@ class dQdQvGemmKernel:
                     )
 
                     producer_state_dS.advance()
-
-                pipeline_tma_epi.consumer_wait(tma_epi_consumer_state)
-                with cute.arch.elect_one():
-                    pipeline_tma_epi.consumer_release(tma_epi_consumer_state)
-                tma_epi_consumer_state.advance()
 
                 # ---- Advance to next tile ----
                 pipeline_clc.consumer_wait(clc_consumer_state)
@@ -838,10 +832,11 @@ class dQdQvGemmKernel:
                             pipeline_KV.producer_commit(producer_state_KV)
                     producer_state_KV.advance()
 
-                pipeline_load_kv_epi.consumer_wait(load_epi_consumer_state)
-                with cute.arch.elect_one():
-                    pipeline_load_kv_epi.consumer_release(load_epi_consumer_state)
-                load_epi_consumer_state.advance()
+                if const_expr(self.overlap_kv_epi):
+                    pipeline_load_kv_epi.consumer_wait(load_epi_consumer_state)
+                    with cute.arch.elect_one():
+                        pipeline_load_kv_epi.consumer_release(load_epi_consumer_state)
+                    load_epi_consumer_state.advance()
 
                 # ---- Advance to next tile ----
                 pipeline_clc.consumer_wait(clc_consumer_state)
@@ -1090,6 +1085,7 @@ class dQdQvGemmKernel:
                     if not store_dQ:
                         tTR_dQvtAcc_mn = tTR_dQvtAcc[(None, None, None, subtile_idx)]
                         cute.copy(tiled_copy_dQv_t2r, tTR_dQvtAcc_mn, tTR_dQvrAcc)
+                        cute.arch.fence_view_async_tmem_load()
 
                         # convert to output dtype
                         tRS_rdQv.store(
@@ -1155,12 +1151,11 @@ class dQdQvGemmKernel:
                         epi_subtile_counter_v += 1
                         epi_subtile_counter_k += 1
 
-                pipeline_tma_epi.producer_acquire(load_epi_producer_state)
-                pipeline_load_kv_epi.producer_acquire(load_epi_producer_state)
-                with cute.arch.elect_one():
-                    pipeline_tma_epi.producer_commit(load_epi_producer_state)
-                    pipeline_load_kv_epi.producer_commit(load_epi_producer_state)
-                load_epi_producer_state.advance()
+                if const_expr(self.overlap_kv_epi):
+                    pipeline_load_kv_epi.producer_acquire(load_epi_producer_state)
+                    with cute.arch.elect_one():
+                        pipeline_load_kv_epi.producer_commit(load_epi_producer_state)
+                    load_epi_producer_state.advance()
 
                 with cute.arch.elect_one():
                     pipeline_dQ_dQv.consumer_release(acc_consumer_state)
