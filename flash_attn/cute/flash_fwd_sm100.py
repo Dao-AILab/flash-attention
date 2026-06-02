@@ -52,7 +52,6 @@ from flash_attn.cute.block_sparse_utils import (
 from flash_attn.cute.pack_gqa import PackGQA, pack_gqa_layout
 from flash_attn.cute import mma_sm100_desc as sm100_desc
 from flash_attn.cute import blackwell_helpers as sm100_utils
-import cutlass.utils.blockscaled_layout as blockscaled_utils
 from flash_attn.cute.named_barrier import NamedBarrierFwdSm100
 from cutlass.cute import FastDivmodDivisor
 from quack.cute_dsl_utils import ParamsBase
@@ -99,24 +98,6 @@ _FP8_SMALL_HDIM_REGS = {
     False: {"num_regs_softmax": 168, "num_regs_correction": 96, "num_regs_other": 80},
     True: {"num_regs_softmax": 152, "num_regs_correction": 96, "num_regs_other": 112},
 }
-# Block-scaled QK tuning: (is_causal, head_dim_padded, sf_vec_size)
-_BLOCK_SCALED_TUNING_CONFIG = {
-    # NVFP4 (sf_vec_size=16) + BF16 PV
-    (False, 128, 16): {"ex2_emu_freq": 16, "ex2_emu_start_frg": 1, "num_regs_softmax": 192, "num_regs_correction": 80},
-    (True, 128, 16):  {"ex2_emu_freq": 16, "ex2_emu_start_frg": 1, "num_regs_softmax": 192, "num_regs_correction": 80},
-}
-_BLOCK_SCALED_FP8PV_TUNING_CONFIG = {
-    # NVFP4 (sf_vec_size=16) + FP8 PV
-    (False, 128, 16): {"ex2_emu_freq": 9, "ex2_emu_start_frg": 0},
-    (True, 128, 16):  {"ex2_emu_freq": 9, "ex2_emu_start_frg": 0},
-    (False, 64, 16):  {"ex2_emu_freq": 16, "ex2_emu_start_frg": 0},
-    (True, 64, 16):   {"ex2_emu_freq": 16, "ex2_emu_start_frg": 0},
-    # MXFP8 (sf_vec_size=32) + FP8 PV
-    (False, 128, 32): {"ex2_emu_freq": 10, "ex2_emu_start_frg": 0},
-    (True, 128, 32):  {"ex2_emu_freq": 10, "ex2_emu_start_frg": 0},
-    (False, 64, 32):  {"ex2_emu_freq": 10, "ex2_emu_start_frg": 0},
-    (True, 64, 32):   {"ex2_emu_freq": 10, "ex2_emu_start_frg": 0},
-}
 # === END TUNING KNOBS ===
 
 
@@ -153,8 +134,6 @@ class FlashAttentionForwardSm100:
         is_varlen_q: bool = False,
         use_2cta_instrs: bool = False,
         use_clc_scheduler: bool = False,
-        sf_vec_size: Optional[int] = None,
-        sf_dtype=None,
     ):
         self.use_tma_KV = not paged_kv_non_tma
         # self.dtype = dtype
@@ -333,27 +312,6 @@ class FlashAttentionForwardSm100:
                 self.num_regs_correction = 64
             self.num_regs_other = 512 - self.num_regs_softmax * 2 - self.num_regs_correction
 
-        # Block-scaled QK mode (NVFP4/MXFP8 with per-group scale factors)
-        self.block_scaled_qk = sf_vec_size is not None
-        self.sf_vec_size = sf_vec_size
-        self.sf_dtype = sf_dtype
-        if self.block_scaled_qk:
-            assert not self.use_2cta_instrs, "Block-scaled QK currently supports 1-CTA only"
-            self.mma_inst_bits_k = 256
-            if self.sf_vec_size == 16:
-                self.mma_inst_tile_k = self.head_dim_padded // (self.mma_inst_bits_k // 4) # nvfp4
-            else:
-                self.mma_inst_tile_k = self.head_dim_padded // (self.mma_inst_bits_k // 8) # mxfp8
-            _bs_tune_key = (self.is_causal, self.head_dim_padded, self.sf_vec_size)
-            _bs_tune = _BLOCK_SCALED_TUNING_CONFIG.get(_bs_tune_key, {})
-            if _bs_tune:
-                self._tune = {**self._tune, **_bs_tune}
-                self.enable_ex2_emu = _bs_tune.get("ex2_emu_freq", 0) > 0
-                if "num_regs_softmax" in _bs_tune:
-                    self.num_regs_softmax = _bs_tune["num_regs_softmax"]
-                    self.num_regs_correction = _bs_tune["num_regs_correction"]
-                    self.num_regs_other = 512 - self.num_regs_softmax * 2 - self.num_regs_correction
-
         self.buffer_align_bytes = 1024
 
     def _setup_attributes(self):
@@ -371,25 +329,13 @@ class FlashAttentionForwardSm100:
         smem_size_q_o = smem_size_q + smem_size_o if not self.overlap_sO_sQ else max(smem_size_q, smem_size_o)
         smem_size_k_per_stage = self.n_block_size * self.head_dim_padded * self.k_dtype.width // 8
         smem_size_v_per_stage = self.n_block_size * self.head_dim_v_padded * self.v_dtype.width // 8
-        self.k_aliases_v = False
-        if self.block_scaled_qk:
-            if self.k_aliases_v:
-                smem_size_kv_per_stage = max(smem_size_k_per_stage, smem_size_v_per_stage) // self.cta_group_size
-            else:
-                smem_size_kv_per_stage = (smem_size_k_per_stage + smem_size_v_per_stage) // self.cta_group_size
-            smem_size_kv_per_stage += 256  # SF SMEM overhead
-        else:
-            smem_size_kv_per_stage = max(smem_size_k_per_stage, smem_size_v_per_stage) // self.cta_group_size
+        smem_size_kv_per_stage = max(smem_size_k_per_stage, smem_size_v_per_stage) // self.cta_group_size
         kv_stage = (224 * 1024 - smem_size_q_o) // smem_size_kv_per_stage
         if self.head_dim_padded == 192 and self.head_dim_v_padded == 128 and kv_stage == 2:
             # For hdim 192,128, we can fit 3 stages if we use uneven_kv_smem
              kv_stage = 3
         self.kv_stage = kv_stage
-        # Block-scaled: cap KV pipeline depth for FP8 PV
-        if self.block_scaled_qk and self.v_dtype.width == 8:
-            fp8_pv_kv_stage_cap = 4 if self.head_dim_v_padded >= 128 else 0
-            if fp8_pv_kv_stage_cap > 0:
-                self.kv_stage = min(self.kv_stage, fp8_pv_kv_stage_cap)
+        # print("kv_stage", self.kv_stage)
         self.s_stage = 2
         assert self.s_stage >= self.q_stage
         # For hdim 192,128 1CTA, we don't have enough smem to store all 3 stages of KV:
@@ -411,12 +357,13 @@ class FlashAttentionForwardSm100:
     @cute.jit
     def __call__(
         self,
-        mQ,  # cute.Tensor or cute.Pointer (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
-        mK,  # cute.Tensor or cute.Pointer (b_k, s_k, h_k, d) or (total_k, h_k, d) if cu_seqlens_k / (num_pages, page_size, h_k, d) if page_table
+        mQ: cute.Tensor,  # (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
+        mK: cute.Tensor,  # (b_k, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k or (num_pages, page_size, h_k, d) if there is page_table
         mV: cute.Tensor,  # (b_k, s_k, h_k, dv) or (total_k, h_k, dv) if there is cu_seqlens_k or (num_pages, page_size, h_k, dv) if there is page_table
         mO: cute.Tensor,  # (b, s_q, h, dv) or (total_q, h, dv) if there is cu_seqlens_q
         mLSE: Optional[cute.Tensor],
         softmax_scale: Float32,
+        stream: cuda.CUstream = None,
         mCuSeqlensQ: Optional[cute.Tensor] = None,
         mCuSeqlensK: Optional[cute.Tensor] = None,
         mSeqUsedQ: Optional[cute.Tensor] = None,
@@ -428,16 +375,6 @@ class FlashAttentionForwardSm100:
         descale_tensors: Optional[DescaleTensors] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors: Optional[list] = None,
-        mSFQ: Optional[cute.Tensor] = None,
-        mSFK: Optional[cute.Tensor] = None,
-        mSFV: Optional[cute.Tensor] = None,
-        # For packed FP4 Q/K passed as cute.Pointer: logical (b, s, h, d) shape so the
-        # kernel can build a tensor with correct FP4 element count and strides. The
-        # to_cute_tensor uint8 path otherwise yields a d//2 shape that scrambles SF.
-        q_ptr_shape: tuple = (),
-        k_ptr_shape: tuple = (),
-        # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
-        stream: cuda.CUstream = None,
     ):
         """Execute the Fused Multi-Head Attention operation on the provided tensors.
 
@@ -452,29 +389,11 @@ class FlashAttentionForwardSm100:
         5. Grid and work scheduling computation
         6. Kernel launch with appropriate parameters
         """
-        # Build Q/K tensors from pointer + logical shape (packed FP4 path). Avoids the
-        # to_cute_tensor uint8 d//2 shape that scrambles the scale-factor reshape.
-        if const_expr(len(q_ptr_shape) > 0):
-            q_iter = mQ.iterator if hasattr(mQ, "iterator") else mQ
-            k_iter = mK.iterator if hasattr(mK, "iterator") else mK
-            mQ = cute.make_tensor(
-                q_iter,
-                cute.make_ordered_layout(q_ptr_shape, order=tuple(range(len(q_ptr_shape) - 1, -1, -1))),
-            )
-            mK = cute.make_tensor(
-                k_iter,
-                cute.make_ordered_layout(k_ptr_shape, order=tuple(range(len(k_ptr_shape) - 1, -1, -1))),
-            )
         # setup static attributes before smem/grid/tma computation
         self.q_dtype = mQ.element_type
         self.k_dtype = mK.element_type
         self.v_dtype = mV.element_type
         self.o_dtype = mO.element_type
-        # The split-P-arrive optimization (signal the PV MMA partway through the P
-        # store) races with the FP8 P store in the block-scaled path, producing NaN
-        # in scattered rows once there are many work tiles. Disable it for FP8 PV.
-        if const_expr(self.block_scaled_qk and self.v_dtype.width == 8):
-            self.split_P_arrive = 0
         mQ, mK, mV, mO = [assume_tensor_aligned(t) for t in (mQ, mK, mV, mO)]
         Q_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
         mQ = cute.make_tensor(mQ.iterator, cute.select(mQ.layout, mode=Q_layout_transpose))
@@ -505,7 +424,7 @@ class FlashAttentionForwardSm100:
         # check type consistency
         if const_expr(self.q_dtype != self.k_dtype):
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.k_dtype}")
-        if const_expr(not self.block_scaled_qk and self.q_dtype != self.v_dtype):
+        if const_expr(self.q_dtype != self.v_dtype):
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.v_dtype}")
         if const_expr(self.q_dtype.width == 8):
             paged_kv_non_tma = not self.use_tma_KV
@@ -541,14 +460,6 @@ class FlashAttentionForwardSm100:
                 self.pack_gqa and self.head_dim_padded > 64 and not self.is_causal and not self.is_local
             ):
                 self.ex2_emu_freq = 32 if mCuSeqlensQ is not None or mSeqUsedQ is not None else self._tune.get("ex2_emu_freq", 10)
-        # Block-scaled FP8 PV: apply dedicated tuning when V is FP8
-        if const_expr(self.block_scaled_qk and self.v_dtype.width == 8):
-            _bs_fp8_key = (self.is_causal, self.head_dim_padded, self.sf_vec_size)
-            _bs_fp8_tune = _BLOCK_SCALED_FP8PV_TUNING_CONFIG.get(_bs_fp8_key, {})
-            if const_expr("ex2_emu_freq" in _bs_fp8_tune):
-                self.ex2_emu_freq = _bs_fp8_tune["ex2_emu_freq"]
-                self.ex2_emu_start_frg = _bs_fp8_tune.get("ex2_emu_start_frg", self.ex2_emu_start_frg)
-                self.enable_ex2_emu = True
 
         cta_group = tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
         q_major_mode = tcgen05.OperandMajorMode.K
@@ -558,25 +469,14 @@ class FlashAttentionForwardSm100:
         # the intermediate tensor p is from tmem & mK-major
         p_source = tcgen05.OperandSource.TMEM
         p_major_mode = tcgen05.OperandMajorMode.K
-        if const_expr(self.block_scaled_qk):
-            tiled_mma_qk = sm100_utils_basic.make_blockscaled_trivial_tiled_mma(
-                self.q_dtype,
-                q_major_mode,
-                k_major_mode,
-                self.sf_dtype,
-                self.sf_vec_size,
-                cta_group,
-                self.mma_tiler_qk[:2],
-            )
-        else:
-            tiled_mma_qk = sm100_utils_basic.make_trivial_tiled_mma(
-                self.q_dtype,
-                q_major_mode,
-                k_major_mode,
-                self.qk_acc_dtype,
-                cta_group,
-                self.mma_tiler_qk[:2],
-            )
+        tiled_mma_qk = sm100_utils_basic.make_trivial_tiled_mma(
+            self.q_dtype,
+            q_major_mode,
+            k_major_mode,
+            self.qk_acc_dtype,
+            cta_group,
+            self.mma_tiler_qk[:2],
+        )
         tiled_mma_pv = sm100_utils_basic.make_trivial_tiled_mma(
             self.v_dtype,
             p_major_mode,
@@ -610,28 +510,6 @@ class FlashAttentionForwardSm100:
         sO_layout = sm100_utils_basic.make_smem_layout_epi(
             self.o_dtype, self.o_layout, self.epi_tile, self.q_stage
         )
-        # Block-scaled SF SMEM layouts
-        if const_expr(self.block_scaled_qk):
-            sSFQ_layout = sm100_utils.make_smem_layout_sfa(
-                tiled_mma_qk, self.mma_tiler_qk, self.sf_vec_size, self.q_stage,
-                mma_tile_inst_k=self.mma_inst_tile_k,
-            )
-            sSFK_layout = sm100_utils.make_smem_layout_sfb(
-                tiled_mma_qk, self.mma_tiler_qk, self.sf_vec_size, self.kv_stage,
-                mma_tile_inst_k=self.mma_inst_tile_k,
-            )
-            # Pre-compute TMEM layouts in __call__ (same JIT context as standalone)
-            _sfq_smem_single = cute.slice_(sSFQ_layout, (None, None, None, 0))
-            _sfk_smem_single = cute.slice_(sSFK_layout, (None, None, None, 0))
-            tCtSFQ_layout_precomp = blockscaled_utils.make_tmem_layout_sfa(
-                tiled_mma_qk, self.mma_tiler_qk, self.sf_vec_size, _sfq_smem_single
-            )
-            tCtSFK_layout_precomp = blockscaled_utils.make_tmem_layout_sfb(
-                tiled_mma_qk, self.mma_tiler_qk, self.sf_vec_size, _sfk_smem_single
-            )
-        else:
-            sSFQ_layout = None
-            sSFK_layout = None
         if const_expr(not self.same_hdim_kv_padded):
             # sK and sV are using the same physical smem so we need to adjust the stride so that they line up
             stride_sK = const_expr(
@@ -682,11 +560,6 @@ class FlashAttentionForwardSm100:
         tma_load_op = cpasync.CopyBulkTensorTileG2SOp(cta_group)
         tma_store_op = cpasync.CopyBulkTensorTileS2GOp()
 
-        # Capture Q/K shapes BEFORE the TMA atoms reshape mQ/mK — the SF reshape
-        # below must use the original tensor shapes (matches the standalone kernel).
-        mQ_shape = mQ.shape
-        mK_shape = mK.shape
-
         if const_expr(self.use_tma_Q):
             tma_atom_Q, mQ = cute.nvgpu.make_tiled_tma_atom_A(
                 tma_load_op,
@@ -726,86 +599,6 @@ class FlashAttentionForwardSm100:
                 self.mma_tiler_pv,
                 tiled_mma_pv,
                 cta_layout_vmnk.shape,
-            )
-
-        # Block-scaled SF TMA atoms
-        tma_atom_SFQ = None
-        tma_atom_SFK = None
-        tma_tensor_sfq = None
-        tma_tensor_sfk = None
-        if const_expr(self.block_scaled_qk and mSFQ is not None):
-            # Reshape SF global tensors with BlockScaledBasicChunk layout
-            sfk_layout = cute.tile_to_shape(
-                sm100_utils.BlockScaledBasicChunk(self.sf_vec_size).layout,
-                mK_shape, (2, 1, 3, 4)
-            )
-            mSFK = cute.make_tensor(mSFK.iterator, sfk_layout)
-            sfq_layout = cute.tile_to_shape(
-                sm100_utils.BlockScaledBasicChunk(self.sf_vec_size).layout,
-                mQ_shape, (2, 1, 3, 4)
-            )
-            mSFQ = cute.make_tensor(mSFQ.iterator, sfq_layout)
-            # SFK TMA: needs separate tiled_mma with SF-specific tiling
-            mma_inst_shape_mnk_qk = (
-                self.mma_tiler_qk[0],
-                self.mma_tiler_qk[1],
-                self.mma_inst_bits_k // self.q_dtype.width,
-            )
-            mma_inst_shape_mnk_sfb = (
-                mma_inst_shape_mnk_qk[0] // self.cta_group_size,
-                cute.round_up(mma_inst_shape_mnk_qk[1], 128),
-                mma_inst_shape_mnk_qk[2],
-            )
-            mma_tiler_sfb = (
-                mma_inst_shape_mnk_sfb[0],
-                mma_inst_shape_mnk_sfb[1],
-                mma_inst_shape_mnk_sfb[2] * self.mma_inst_tile_k,
-            )
-            tiled_mma_sfb = sm100_utils_basic.make_blockscaled_trivial_tiled_mma(
-                self.q_dtype,
-                tcgen05.OperandMajorMode.K,
-                tcgen05.OperandMajorMode.K,
-                self.sf_dtype,
-                self.sf_vec_size,
-                tcgen05.CtaGroup.ONE,
-                mma_inst_shape_mnk_sfb[:2],
-            )
-            sfk_op = sm100_utils_basic.cluster_shape_to_tma_atom_SFB(
-                self.cluster_shape_mn, tiled_mma_qk.thr_id
-            )
-            cluster_layout_sfb_vmnk = cute.tiled_divide(
-                cute.make_layout(self.cluster_shape_mnk),
-                (tiled_mma_sfb.thr_id.shape,),
-            )
-            tma_atom_SFK, tma_tensor_sfk = cute.nvgpu.make_tiled_tma_atom_B(
-                sfk_op,
-                mSFK,
-                cute.select(sSFK_layout, mode=[0, 1, 2]),
-                mma_tiler_sfb,
-                tiled_mma_sfb,
-                cluster_layout_sfb_vmnk.shape,
-                internal_type=cutlass.Int16,
-            )
-            # SFQ TMA: uses main tiled_mma_qk (not separate SF MMA)
-            sfq_op = sm100_utils_basic.cluster_shape_to_tma_atom_A(
-                self.cluster_shape_mn, tiled_mma_qk.thr_id
-            )
-            tma_atom_SFQ, tma_tensor_sfq = cute.nvgpu.make_tiled_tma_atom_A(
-                sfq_op,
-                mSFQ,
-                cute.select(sSFQ_layout, mode=[0, 1, 2]),
-                self.mma_tiler_qk,
-                tiled_mma_qk,
-                cta_layout_vmnk.shape,
-                internal_type=cutlass.Int16,
-            )
-            _sfk_filtered = cute.filter_zeros(sSFK_layout)
-            self.tma_copy_bytes["K"] += cute.size_in_bytes(
-                mSFK.element_type, cute.select(_sfk_filtered, mode=list(range(cute.rank(_sfk_filtered) - 1)))
-            )
-            _sfq_filtered = cute.filter_zeros(sSFQ_layout)
-            self.tma_copy_bytes["Q"] += cute.size_in_bytes(
-                mSFQ.element_type, cute.select(_sfq_filtered, mode=list(range(cute.rank(_sfq_filtered) - 1)))
             )
 
         self.num_epilogue_threads = cute.arch.WARP_SIZE * len(self.epilogue_warp_ids)
@@ -875,8 +668,6 @@ class FlashAttentionForwardSm100:
 
         clc_response_size = self.sched_stages * 4 if self.use_clc_scheduler else 0
         clc_mbar_size = self.sched_stages * 2 if self.use_clc_scheduler else 0
-        sfq_smem_size = cute.cosize(sSFQ_layout) if const_expr(self.block_scaled_qk) else 1
-        sfk_smem_size = cute.cosize(sSFK_layout) if const_expr(self.block_scaled_qk) else 1
 
         @cute.struct
         class SharedStorage:
@@ -911,22 +702,10 @@ class FlashAttentionForwardSm100:
                 cute.struct.MemRange[self.q_dtype, sQ_size], self.buffer_align_bytes
             ]
             sK: cute.struct.Align[
-                cute.struct.MemRange[self.k_dtype, 1] if const_expr(self.k_aliases_v) else cute.struct.MemRange[self.k_dtype, cute.cosize(sK_layout)],
-                1 if const_expr(self.k_aliases_v) else self.buffer_align_bytes,
+                # cute.cosize(sK_layout) is correct even in the case of self.uneven_kv_smem
+                cute.struct.MemRange[self.k_dtype, cute.cosize(sK_layout)],
+                self.buffer_align_bytes,
             ]
-            if const_expr(self.block_scaled_qk):
-                sV_separate: cute.struct.Align[
-                    cute.struct.MemRange[self.v_dtype, cute.cosize(sV_layout)],
-                    self.buffer_align_bytes,
-                ]
-                sSFQ: cute.struct.Align[
-                    cute.struct.MemRange[self.sf_dtype, sfq_smem_size],
-                    self.buffer_align_bytes,
-                ]
-                sSFK: cute.struct.Align[
-                    cute.struct.MemRange[self.sf_dtype, sfk_smem_size],
-                    self.buffer_align_bytes,
-                ]
 
         self.shared_storage = SharedStorage
 
@@ -984,14 +763,6 @@ class FlashAttentionForwardSm100:
             aux_tensors,
             fastdiv_mods,
             head_divmod,
-            tma_tensor_sfq,
-            tma_tensor_sfk,
-            tma_atom_SFQ,
-            tma_atom_SFK,
-            sSFQ_layout,
-            sSFK_layout,
-            tCtSFQ_layout_precomp if const_expr(self.block_scaled_qk) else None,
-            tCtSFK_layout_precomp if const_expr(self.block_scaled_qk) else None,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -1039,14 +810,6 @@ class FlashAttentionForwardSm100:
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
         head_divmod=None,
-        tma_tensor_sfq: Optional[cute.Tensor] = None,
-        tma_tensor_sfk: Optional[cute.Tensor] = None,
-        tma_atom_SFQ: Optional[cute.CopyAtom] = None,
-        tma_atom_SFK: Optional[cute.CopyAtom] = None,
-        sSFQ_layout=None,
-        sSFK_layout=None,
-        tCtSFQ_layout_precomp=None,
-        tCtSFK_layout_precomp=None,
     ):
         """The device kernel implementation of the Fused Multi-Head Attention.
 
@@ -1236,32 +999,10 @@ class FlashAttentionForwardSm100:
         # (MMA, MMA_Q, MMA_D, PIPE)
         sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner)
         # (MMA, MMA_K, MMA_D, PIPE)
-        if const_expr(self.k_aliases_v):
-            # FP4 K + BF16 V: K aliases V's buffer (K is smaller, fits inside V's stage)
-            sV = storage.sV_separate.get_tensor(sV_layout.outer, swizzle=sV_layout.inner)
-            stride_sV = const_expr(max(sV_layout.outer.stride[-1], 0))
-            stride_sK_aligned = const_expr(stride_sV * self.v_dtype.width // self.k_dtype.width)
-            sK_outer_aligned = cute.make_layout(
-                sK_layout.outer.shape,
-                stride=(*sK_layout.outer.stride[:-1], stride_sK_aligned),
-            )
-            sK = storage.sV_separate.get_tensor(sK_outer_aligned, swizzle=sK_layout.inner, dtype=self.k_dtype)
-        elif const_expr(self.block_scaled_qk):
-            sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
-            sV = storage.sV_separate.get_tensor(sV_layout.outer, swizzle=sV_layout.inner)
-        else:
-            sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
-            sV = cute.make_tensor(cute.recast_ptr(sK.iterator, sV_layout.inner), sV_layout.outer)
-        # SF tensors for block-scaled QK
-        # Use cute.make_tensor(ptr, layout) instead of get_tensor(layout) to
-        # preserve the exact rank structure of the staged SF layout.
-        # get_tensor on MemRange can flatten modes, breaking TMA partition.
-        if const_expr(self.block_scaled_qk):
-            sSFQ = storage.sSFQ.get_tensor(sSFQ_layout)
-            sSFK = storage.sSFK.get_tensor(sSFK_layout)
-        else:
-            sSFQ = None
-            sSFK = None
+        sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
+        # (MMA, MMA_K, MMA_D, PIPE)
+        # Strip swizzle info to reuse smem
+        sV = cute.make_tensor(cute.recast_ptr(sK.iterator, sV_layout.inner), sV_layout.outer)
         if const_expr(not self.overlap_sO_sQ):
             sO = storage.sO.get_tensor(sO_layout.outer, swizzle=sO_layout.inner)
         else:
@@ -1416,12 +1157,6 @@ class FlashAttentionForwardSm100:
                 SeqlenInfoCls,
                 blocksparse_tensors,
                 tile_scheduler=tile_scheduler,
-                tma_tensor_sfq=tma_tensor_sfq,
-                tma_tensor_sfk=tma_tensor_sfk,
-                tma_atom_SFQ=tma_atom_SFQ,
-                tma_atom_SFK=tma_atom_SFK,
-                sSFQ=sSFQ if const_expr(self.block_scaled_qk) else None,
-                sSFK=sSFK if const_expr(self.block_scaled_qk) else None,
             )
 
         # ///////////////////////////////////////////////////////////////////////////////
@@ -1433,80 +1168,6 @@ class FlashAttentionForwardSm100:
             tmem.allocate(cute.arch.get_max_tmem_alloc_cols("sm_100"))
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.qk_acc_dtype)
-            # Block-scaled: setup TMEM SF tensors and S2T copy partitions
-            tCtSFQs = [None] * self.q_stage
-            tCtSFKs = [None] * self.q_stage
-            s2t_sfq_staged = None
-            s2t_sfk_staged = None
-            s2t_sfq_copy, s2t_sfq_src = None, None
-            s2t_sfk_copy, s2t_sfk_src = None, None
-            if const_expr(self.block_scaled_qk and sSFQ is not None):
-                align = self.buffer_align_bytes
-                _local_sfq_layout = sm100_utils.make_smem_layout_sfa(
-                    tiled_mma_qk, self.mma_tiler_qk, self.sf_vec_size, self.q_stage,
-                    mma_tile_inst_k=self.mma_inst_tile_k,
-                )
-                _local_sfk_layout = sm100_utils.make_smem_layout_sfb(
-                    tiled_mma_qk, self.mma_tiler_qk, self.sf_vec_size, self.kv_stage,
-                    mma_tile_inst_k=self.mma_inst_tile_k,
-                )
-                # SFQ TMEM: stagger with S offsets. SFQ for stage k at
-                # tmem_s_offset[q_stage-1-k] — lives in the OTHER stage's S region.
-                # The inline's sequential loop must ensure softmax finishes reading
-                # the opposite stage's S before S2T overwrites it.
-                sfq_stage_order = tuple(
-                    self.q_stage - 1 - stage for stage in range(self.q_stage)
-                )
-                sfq_tmem_ptrs_f32 = [
-                    cute.make_ptr(
-                        Float32,
-                        self.tmem_s_offset[sfq_stage_order[stage]],
-                        mem_space=cute.AddressSpace.tmem,
-                        assumed_align=align,
-                    )
-                    for stage in range(self.q_stage)
-                ]
-                sfq_tmem_ptrs = [
-                    cute.recast_ptr(sfq_tmem_ptrs_f32[stage], dtype=self.sf_dtype)
-                    for stage in range(self.q_stage)
-                ]
-                tCtSFQ_layout = blockscaled_utils.make_tmem_layout_sfa(
-                    tiled_mma_qk,
-                    self.mma_tiler_qk,
-                    self.sf_vec_size,
-                    cute.slice_(_local_sfq_layout, (None, None, None, 0)),
-                )
-                tCtSFQs = [cute.make_tensor(sfq_tmem_ptrs[stage], tCtSFQ_layout)
-                           for stage in range(self.q_stage)]
-                # SFK TMEM: offset from SFQ
-                sf_atom_mn = 32
-                sfq_tmem_cols = (self.mma_tiler_qk[0] // sf_atom_mn) * self.mma_inst_tile_k
-                sfk_tmem_ptrs = [
-                    cute.recast_ptr(sfq_tmem_ptrs_f32[stage] + sfq_tmem_cols, dtype=self.sf_dtype)
-                    for stage in range(self.q_stage)
-                ]
-                tCtSFK_layout = blockscaled_utils.make_tmem_layout_sfb(
-                    tiled_mma_qk,
-                    self.mma_tiler_qk,
-                    self.sf_vec_size,
-                    cute.slice_(_local_sfk_layout, (None, None, None, 0)),
-                )
-                tCtSFKs = [cute.make_tensor(sfk_tmem_ptrs[stage], tCtSFK_layout)
-                           for stage in range(self.q_stage)]
-                # Per-stage S2T partitions (per-stage TMEM dst). The tiled_copy and SMEM
-                # desc src are kept loop-invariant; re-extracting the tiled_copy from a
-                # per-stage list inside the mma scf.for makes it a loop-carried iter_arg
-                # that cutlass-dsl cannot legalize.
-                s2t_sfq_staged = [
-                    self.mainloop_s2t_copy_and_partition(sSFQ, tCtSFQs[stage])
-                    for stage in range(self.q_stage)
-                ]
-                s2t_sfk_staged = [
-                    self.mainloop_s2t_copy_and_partition(sSFK, tCtSFKs[stage])
-                    for stage in range(self.q_stage)
-                ]
-                s2t_sfq_copy, s2t_sfq_src, _ = s2t_sfq_staged[0]
-                s2t_sfk_copy, s2t_sfk_src, _ = s2t_sfk_staged[0]
             self.mma(
                 tiled_mma_qk,
                 tiled_mma_pv,
@@ -1527,16 +1188,6 @@ class FlashAttentionForwardSm100:
                 SeqlenInfoCls,
                 blocksparse_tensors,
                 tile_scheduler=tile_scheduler,
-                sSFQ=sSFQ,
-                sSFK=sSFK,
-                tCtSFQs=tCtSFQs,
-                tCtSFKs=tCtSFKs,
-                s2t_sfq_staged=s2t_sfq_staged,
-                s2t_sfk_staged=s2t_sfk_staged,
-                s2t_sfq_copy=s2t_sfq_copy,
-                s2t_sfq_src=s2t_sfq_src,
-                s2t_sfk_copy=s2t_sfk_copy,
-                s2t_sfk_src=s2t_sfk_src,
             )
             # Dealloc the tensor memory buffer
             tmem.relinquish_alloc_permit()
@@ -1671,12 +1322,6 @@ class FlashAttentionForwardSm100:
         SeqlenInfoCls: Callable,
         blocksparse_tensors: Optional[BlockSparseTensors],
         tile_scheduler: TileSchedulerProtocol,
-        tma_tensor_sfq: Optional[cute.Tensor] = None,
-        tma_tensor_sfk: Optional[cute.Tensor] = None,
-        tma_atom_SFQ: Optional[cute.CopyAtom] = None,
-        tma_atom_SFK: Optional[cute.CopyAtom] = None,
-        sSFQ: Optional[cute.Tensor] = None,
-        sSFK: Optional[cute.Tensor] = None,
     ):
         num_load_threads = len(self.load_warp_ids) * cute.arch.WARP_SIZE
         tidx = cute.arch.thread_idx()[0] % num_load_threads
@@ -1721,27 +1366,6 @@ class FlashAttentionForwardSm100:
                 )
             tSgK = thr_mma_qk.partition_B(gK)
             tOgV = thr_mma_pv.partition_B(gV)
-            # SF partition for block-scaled QK (per-tile: needs head_idx_kv, batch_idx)
-            tSFKsSFK, tSFKgSFK = None, None
-            if const_expr(self.block_scaled_qk):
-                if const_expr(not seqlen.has_cu_seqlens_k):
-                    sfk_cur = tma_tensor_sfk[None, None, head_idx_kv, batch_idx]
-                    gSFK = cute.local_tile(sfk_cur, cute.select(self.mma_tiler_qk, mode=[1, 2]), (None, 0))
-                else:
-                    sfk_cur = cute.domain_offset((seqlen.offset_k, 0), tma_tensor_sfk[None, None, head_idx_kv])
-                    gSFK = cute.local_tile(sfk_cur, cute.select(self.mma_tiler_qk, mode=[1, 2]), (None, 0))
-                tSgSFK = thr_mma_qk.partition_B(gSFK)
-                # filter_zeros on both sSFK and tSgSFK to remove zero-stride modes
-                # before grouping for TMA partition
-                sSFK_filtered = cute.filter_zeros(sSFK)
-                tSgSFK_filtered = cute.filter_zeros(tSgSFK)
-                sfk_group_end = cute.rank(sSFK_filtered.shape) - 1
-                tSFKsSFK, tSFKgSFK = cpasync.tma_partition(
-                    tma_atom_SFK, 0, cute.make_layout(1),
-                    cute.group_modes(sSFK_filtered, 0, sfk_group_end),
-                    cute.group_modes(tSgSFK_filtered, 0, sfk_group_end),
-                )
-                tSFKgSFK = cute.filter_zeros(tSFKgSFK)
             if const_expr(self.use_tma_Q):
                 tiler_gQ = ((self.mma_tiler_qk[0] * self.q_stage), self.head_dim_padded)
                 gQ = cute.local_tile(mQ_cur, tiler_gQ, (m_block, 0))  # (128 * 2, 128)
@@ -1752,19 +1376,7 @@ class FlashAttentionForwardSm100:
                 load_Q_fn, _, _ = copy_utils.tma_get_copy_fn(
                     tma_atom_Q, 0, cute.make_layout(1), tSgQ, sQ
                 )
-                # SFQ TMA partition (rides on Q barrier)
-                load_SFQ_fn = None
-                if const_expr(self.block_scaled_qk and tma_atom_SFQ is not None):
-                    if const_expr(not seqlen.has_cu_seqlens_k):
-                        sfq_cur = tma_tensor_sfq[None, None, head_idx, batch_idx]
-                    else:
-                        sfq_cur = cute.domain_offset((seqlen.offset_q, 0), tma_tensor_sfq[None, None, head_idx])
-                    gSFQ = cute.local_tile(sfq_cur, cute.select(self.mma_tiler_qk, mode=[0, 2]), (None, 0))
-                    tSgSFQ = thr_mma_qk.partition_A(gSFQ)
-                    load_SFQ_fn, _, _ = copy_utils.tma_get_copy_fn(
-                        tma_atom_SFQ, 0, cute.make_layout(1), tSgSFQ, sSFQ, filter_zeros=True
-                    )
-                load_Q = partial(self.load_Q, load_Q_fn, pipeline_q=pipeline_q, phase=q_producer_phase, load_SFQ_fn=load_SFQ_fn)
+                load_Q = partial(self.load_Q, load_Q_fn, pipeline_q=pipeline_q, phase=q_producer_phase)
             else:
                 assert gmem_tiled_copy_Q is not None
                 load_Q = partial(
@@ -1825,9 +1437,6 @@ class FlashAttentionForwardSm100:
                 sK,
                 pipeline_kv=pipeline_kv,
                 K_or_V="K",
-                tma_atom_SF=tma_atom_SFK if const_expr(self.block_scaled_qk) else None,
-                tSFgSF=tSFKgSFK if const_expr(self.block_scaled_qk) else None,
-                tSFsSF=tSFKsSFK if const_expr(self.block_scaled_qk) else None,
             )
             load_V = partial(
                 self.load_KV,
@@ -1857,11 +1466,11 @@ class FlashAttentionForwardSm100:
                         load_K(block=n_block_max - 1, producer_state=kv_producer_state, page_idx=page_idx)  # K0
                     # load_K(block=n_block_max - 1, producer_state=kv_producer_state, page_idx=page_idx, extra_tx_count=self.tma_copy_bytes["Q"])  # K0
                     if issue_q_for_this_warp:
-                        load_Q(block=0, stage=0, m_block=m_block)
+                        load_Q(block=0, stage=0)
                     if issue_kv_for_this_warp:
                         kv_producer_state.advance()
                     if const_expr(self.q_stage == 2) and issue_q_for_this_warp:
-                        load_Q(block=1, stage=1, m_block=m_block)
+                        load_Q(block=1, stage=1)
                     q_producer_phase ^= 1
                     if issue_kv_for_this_warp:
                         load_V(block=n_block_max - 1, producer_state=kv_producer_state, page_idx=page_idx)  # V0
@@ -1932,16 +1541,6 @@ class FlashAttentionForwardSm100:
         SeqlenInfoCls: Callable,
         blocksparse_tensors: Optional[BlockSparseTensors],
         tile_scheduler=None,
-        sSFQ: Optional[cute.Tensor] = None,
-        sSFK: Optional[cute.Tensor] = None,
-        tCtSFQs=None,
-        tCtSFKs=None,
-        s2t_sfq_staged=None,
-        s2t_sfk_staged=None,
-        s2t_sfq_copy=None,
-        s2t_sfq_src=None,
-        s2t_sfk_copy=None,
-        s2t_sfk_src=None,
     ):
         tSrQ = tiled_mma_qk.make_fragment_A(sQ)
         tSrK = tiled_mma_qk.make_fragment_B(sK)
@@ -1966,52 +1565,29 @@ class FlashAttentionForwardSm100:
         sQ_stage_stride = (sQ.layout.stride[-1] * sQ.element_type.width // 8) >> 4
         if const_expr(self.q_stage == 1):
             sQ_stage_stride = 0
-        if const_expr(self.block_scaled_qk):
-            if const_expr(self.q_dtype.width == 4):
-                # NVFP4: generic per-K SF addressing is wrong for 4-bit; use the
-                # inline-PTX FP4 path (matches the standalone kernel).
-                gemm_Si = [
-                    partial(
-                        sm100_utils.gemm_ptx_partial_fp4,
-                        qk_mma_op,
-                        self.tmem_s_offset[stage],
-                        tSrQ[None, None, None, stage],
-                        sA=sQ[None, None, None, stage],
-                        zero_init=True,
-                        tScaleA=tCtSFQs[stage],
-                        tScaleB=tCtSFKs[stage],
-                    )
-                    for stage in range(self.q_stage)
-                ]
-            else:
-                gemm_Si = [
-                    partial(
-                        sm100_utils.gemm_blockscaled_generic,
-                        tiled_mma_qk,
-                        tStS[None, None, None, stage],
-                        tCrA=tSrQ[None, None, None, stage],
-                        tScaleA=tCtSFQs[stage],
-                        tScaleB=tCtSFKs[stage],
-                        zero_init=True,
-                    )
-                    for stage in range(self.q_stage)
-                ]
-        else:
-            gemm_Si = [
-                partial(
-                    sm100_utils.gemm_ptx_precomputed_varname,
-                    self.tmem_s_offset[stage],
-                    smem_desc_base_b=k_smem_base,
-                    tCrB_layout=tSrK[None, None, None, 0].layout,
-                    smem_var_name_prefix="fa_fwd_q_smem_desc",
-                    idesc_var_name="fa_fwd_qk_mma_idesc",
-                    kind=qk_mma_kind,
-                    smem_offset=-sQ_stage_stride if stage == 0 else sQ_stage_stride,
-                    zero_init=True,
-                    cta_group=self.cta_group_size,
-                )
-                for stage in range(self.q_stage)
-            ]
+        gemm_Si = [
+            partial(
+                # sm100_utils.gemm_ptx_precomputed,
+                # self.tmem_s_offset[stage],
+                # smem_desc_start_a=q_smem_start[stage],
+                # idesc=qk_mma_idesc,
+                # smem_desc_base_a=q_smem_base,
+                # smem_desc_base_b=k_smem_base,
+                # tCrA_layout=tSrQ[None, None, None, 0].layout,
+                sm100_utils.gemm_ptx_precomputed_varname,
+                self.tmem_s_offset[stage],
+                # idesc=qk_mma_idesc,
+                smem_desc_base_b=k_smem_base,
+                tCrB_layout=tSrK[None, None, None, 0].layout,
+                smem_var_name_prefix="fa_fwd_q_smem_desc",
+                idesc_var_name="fa_fwd_qk_mma_idesc",
+                kind=qk_mma_kind,
+                smem_offset=-sQ_stage_stride if stage == 0 else sQ_stage_stride,
+                zero_init=True,
+                cta_group=self.cta_group_size,
+            )
+            for stage in range(self.q_stage)
+        ]
         # gemm_Si = [
         #     partial(
         #         sm100_utils.gemm,
@@ -2101,21 +1677,11 @@ class FlashAttentionForwardSm100:
                     sK_cur = sK[None, None, None, Ki_index]
                     if const_expr(self.uneven_kv_smem):
                         sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
-                    if const_expr(self.block_scaled_qk):
-                        sm100_utils.tcgen05_after_thread_sync()
-                        if const_expr(s2t_sfq_staged is not None):
-                            _, _, _s2t_q_dst = s2t_sfq_staged[stage]
-                            _, _, _s2t_k_dst = s2t_sfk_staged[stage]
-                            cute.copy(s2t_sfq_copy, s2t_sfq_src[None, None, None, None, stage], _s2t_q_dst)
-                            cute.copy(s2t_sfk_copy, s2t_sfk_src[None, None, None, None, Ki_index], _s2t_k_dst)
-                        if const_expr(self.q_dtype.width == 4):
-                            gemm_Si[stage](tCrB=tSrKi, sB=sK_cur)
-                        else:
-                            gemm_Si[stage](tCrB=tSrKi)
-                    else:
-                        gemm_Si[stage](
-                            smem_desc_start_b=sm100_desc.make_smem_desc_start_addr(sK_cur.iterator)
-                        )
+                    # gemm_Si[stage](tCrB=tSrKi, sB=sK_cur)
+                    gemm_Si[stage](
+                        smem_desc_start_b=sm100_desc.make_smem_desc_start_addr(sK_cur.iterator)
+                    )
+                    # gemm_Si[stage](tCrB=tSrKi)
                     # 4. release S0 / S1
                     pipeline_s_p_o.producer_commit_w_index(stage)
                 mma_q_consumer_phase ^= 1
@@ -2181,21 +1747,11 @@ class FlashAttentionForwardSm100:
                         sK_cur = sK[None, None, None, Ki_index]
                         if const_expr(self.uneven_kv_smem):
                             sK_cur = self.offset_kv_smem(sK_cur, Ki_index, Ki_phase)
-                        if const_expr(self.block_scaled_qk):
-                            sm100_utils.tcgen05_after_thread_sync()
-                            if const_expr(s2t_sfq_staged is not None):
-                                _, _, _s2t_q_dst = s2t_sfq_staged[stage]
-                                _, _, _s2t_k_dst = s2t_sfk_staged[stage]
-                                cute.copy(s2t_sfq_copy, s2t_sfq_src[None, None, None, None, stage], _s2t_q_dst)
-                                cute.copy(s2t_sfk_copy, s2t_sfk_src[None, None, None, None, Ki_index], _s2t_k_dst)
-                            if const_expr(self.q_dtype.width == 4):
-                                gemm_Si[stage](tCrB=tSrK[None, None, None, Ki_index], sB=sK_cur)
-                            else:
-                                gemm_Si[stage](tCrB=tSrK[None, None, None, Ki_index])
-                        else:
-                            gemm_Si[stage](
-                                smem_desc_start_b=sm100_desc.make_smem_desc_start_addr(sK_cur.iterator)
-                            )
+                        # gemm_Si[stage](tCrB=tSrK[None, None, None, Ki_index], sB=sK_cur)
+                        gemm_Si[stage](
+                            smem_desc_start_b=sm100_desc.make_smem_desc_start_addr(sK_cur.iterator)
+                        )
+                        # gemm_Si[stage](tCrB=tSrK[None, None, None, Ki_index])
                         # 3. release S0 / S1
                         pipeline_s_p_o.producer_commit_w_index(stage)
                         # End of GEMM_QK0i (Q0 * Ki -> S0)
@@ -2429,7 +1985,7 @@ class FlashAttentionForwardSm100:
 
             qk_descale, _ = self._load_effective_descales(descale_tensors, batch_idx, kv_head_idx)
 
-            max_offset = 8 if cutlass.const_expr(self.v_dtype.width == 8) else 0
+            max_offset = 8 if cutlass.const_expr(self.q_dtype.width == 8) else 0
             if const_expr(self.score_mod is None):
                 softmax_scale_log2_eff = softmax_scale_log2 * qk_descale
                 softmax_scale_eff = None
@@ -2741,8 +2297,9 @@ class FlashAttentionForwardSm100:
             thr_tmem_store.partition_S(cute.make_identity_tensor(tScP_shape)).shape, Float32
         )
         tSrP_r2t = cute.make_tensor(
-            cute.recast_ptr(tSrP_r2t_f32.iterator, dtype=self.v_dtype), tSrS_t2r.layout
+            cute.recast_ptr(tSrP_r2t_f32.iterator, dtype=self.q_dtype), tSrS_t2r.layout
         )
+        # softmax.scale_apply_exp2_convert(tSrS_t2r, row_max, tSrP_r2t)
         softmax.apply_exp2_convert(
             tSrS_t2r,
             tSrP_r2t,
@@ -2840,9 +2397,9 @@ class FlashAttentionForwardSm100:
             else:
                 softmax_scale_log2_eff = softmax_scale_log2
 
-            max_offset = Float32(8.0) if cutlass.const_expr(self.v_dtype.width == 8) else Float32(0.0)
+            max_offset = Float32(8.0) if cutlass.const_expr(self.q_dtype.width == 8) else Float32(0.0)
             max_offset_scale = (
-                Float32(256.0) if cutlass.const_expr(self.v_dtype.width == 8) else Float32(1.0)
+                Float32(256.0) if cutlass.const_expr(self.q_dtype.width == 8) else Float32(1.0)
             )
             seqlen = SeqlenInfoCls(batch_idx)
             n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
@@ -3382,16 +2939,9 @@ class FlashAttentionForwardSm100:
         block: Int32,
         stage: int,
         phase: Int32,
-        load_SFQ_fn: Optional[Callable] = None,
-        m_block: Int32 = 0,
     ):
         pipeline_q.producer_acquire_w_index_phase(stage, phase)
-        bar_ptr = pipeline_q.sync_object_full.get_barrier(stage)
-        load_Q_fn(src_idx=block, dst_idx=stage, tma_bar_ptr=bar_ptr)
-        if const_expr(load_SFQ_fn is not None):
-            # gQ is pre-sliced by m_block (src_idx=stage selects the q_stage), but gSFQ
-            # keeps the full seqlen, so SFQ needs the global m-block index here.
-            load_SFQ_fn(src_idx=self.q_stage * m_block + stage, dst_idx=stage, tma_bar_ptr=bar_ptr)
+        load_Q_fn(src_idx=block, dst_idx=stage, tma_bar_ptr=pipeline_q.sync_object_full.get_barrier(stage))
 
     def load_Q_non_tma(
         self,
@@ -3440,9 +2990,6 @@ class FlashAttentionForwardSm100:
         K_or_V: Literal["K", "V"],
         page_idx: Optional[Int32] = None,
         extra_tx_count: Optional[Int32] = None,
-        tma_atom_SF: Optional[cute.CopyAtom] = None,
-        tSFgSF: Optional[cute.Tensor] = None,
-        tSFsSF: Optional[cute.Tensor] = None,
     ):
         assert K_or_V in ("K", "V")
         stage, phase = producer_state.index, producer_state.phase
@@ -3467,10 +3014,7 @@ class FlashAttentionForwardSm100:
                 tXsX_cur = self.offset_kv_smem(tXsX_cur, stage, phase ^ 1)
             # Currently we assume that page_size == n_block_size so we index into tXgX with block = 0
             tXgX_cur = tXgX[None, block] if const_expr(page_idx is None) else tXgX[None, 0, page_idx]
-            bar_ptr = pipeline_kv.producer_get_barrier(producer_state)
-            cute.copy(tma_atom, tXgX_cur, tXsX_cur, tma_bar_ptr=bar_ptr)
-            if const_expr(tma_atom_SF is not None):
-                cute.copy(tma_atom_SF, tSFgSF[None, block], tSFsSF[None, stage], tma_bar_ptr=bar_ptr)
+            cute.copy(tma_atom, tXgX_cur, tXsX_cur, tma_bar_ptr=pipeline_kv.producer_get_barrier(producer_state))
         else:
             assert paged_kv_manager is not None
             assert extra_tx_count is None
@@ -3570,23 +3114,3 @@ class FlashAttentionForwardSm100:
             constant_q_idx=q_idx_logical,
             qhead_per_kvhead=self.qhead_per_kvhead if cutlass.const_expr(self.pack_gqa) else 1,
         )
-
-    def mainloop_s2t_copy_and_partition(
-        self,
-        sSF: cute.Tensor,
-        tSF: cute.Tensor,
-    ):
-        tCsSF_compact = cute.filter_zeros(sSF)
-        tCtSF_compact = cute.filter_zeros(tSF)
-        copy_atom_s2t = cute.make_copy_atom(
-            tcgen05.Cp4x32x128bOp(tcgen05.CtaGroup.ONE),
-            self.sf_dtype,
-        )
-        tiled_copy_s2t = tcgen05.make_s2t_copy(copy_atom_s2t, tCtSF_compact)
-        thr_copy_s2t = tiled_copy_s2t.get_slice(0)
-        tCsSF_compact_s2t_ = thr_copy_s2t.partition_S(tCsSF_compact)
-        tCsSF_compact_s2t = tcgen05.get_s2t_smem_desc_tensor(
-            tiled_copy_s2t, tCsSF_compact_s2t_
-        )
-        tCtSF_compact_s2t = thr_copy_s2t.partition_D(tCtSF_compact)
-        return tiled_copy_s2t, tCsSF_compact_s2t, tCtSF_compact_s2t

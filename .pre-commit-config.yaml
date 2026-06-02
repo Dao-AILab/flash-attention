@@ -10,7 +10,9 @@ repos:
             flash_bwd|
             flash_fwd|
             flash_fwd_sm100|
+            flash_fwd_sm100_fp4|
             interface|
+            cute_dsl_utils|
           )\.py$
       - id: ruff-format
         files: ^flash_attn/cute/.*\.py$

@@ -92,20 +92,14 @@ class Softmax(ParamsBase):
 
             if cutlass.const_expr(is_first):
                 row_max_cur_scaled = row_max_cur * scale_log2
-                acc_S_row_exp = cute.math.exp2(
-                    acc_S_row * scale_log2 - row_max_cur_scaled, fastmath=True
-                )
+                acc_S_row_exp = cute.arch.exp2(acc_S_row * scale_log2 - row_max_cur_scaled)
                 acc_S_row_sum = utils.fadd_reduce(acc_S_row_exp, init_val=None, arch=arch)
                 row_scale[r] = 1.0
             else:
                 row_max_cur_scaled = row_max_cur * scale_log2
-                acc_S_row_exp = cute.math.exp2(
-                    acc_S_row * scale_log2 - row_max_cur_scaled, fastmath=True
-                )
-                # row_scale[r] = cute.math.exp2(row_max_prev * self.scale_log2 - row_max_cur_scaled, fastmath=True)
-                row_scale[r] = cute.math.exp2(
-                    (row_max_prev - row_max_cur) * scale_log2, fastmath=True
-                )
+                acc_S_row_exp = cute.arch.exp2(acc_S_row * scale_log2 - row_max_cur_scaled)
+                # row_scale[r] = cute.math.exp2(row_max_prev * self.scale_log2 - row_max_cur_scaled)
+                row_scale[r] = cute.arch.exp2((row_max_prev - row_max_cur) * scale_log2)
                 acc_S_row_sum = utils.fadd_reduce(
                     acc_S_row_exp, init_val=row_sum[r] * row_scale[r], arch=arch
                 )
@@ -134,9 +128,7 @@ class Softmax(ParamsBase):
             if cutlass.const_expr(sink_val is not None):
                 sink_val_cur = sink_val if not isinstance(sink_val, cute.Tensor) else sink_val[r]
                 LOG2_E = math.log2(math.e)
-                row_sum[r] += cute.math.exp2(
-                    sink_val_cur * LOG2_E - row_max[r] * scale_log2, fastmath=True
-                )
+                row_sum[r] += cute.arch.exp2(sink_val_cur * LOG2_E - row_max[r] * scale_log2)
 
             # if row_sum is zero or nan, set acc_O_mn_row to 1.0
             acc_O_mn_row_is_zero_or_nan = row_sum[r] == 0.0 or row_sum[r] != row_sum[r]
@@ -224,7 +216,7 @@ class SoftmaxSm100(Softmax):
             row_max_old = self.row_max[0]
             row_max_safe = row_max_new if row_max_new != -cutlass.Float32.inf else 0.0
             acc_scale_ = (row_max_old - row_max_safe) * self.scale_log2
-            acc_scale = cute.math.exp2(acc_scale_, fastmath=True)
+            acc_scale = cute.arch.exp2(acc_scale_)
             if cutlass.const_expr(self.rescale_threshold > 0.0):
                 if acc_scale_ >= -self.rescale_threshold:
                     row_max_new = row_max_old
@@ -244,7 +236,7 @@ class SoftmaxSm100(Softmax):
             row_max_new = self._compute_row_max(acc_S_row, init_val=row_max_old)
             row_max_safe = row_max_new if row_max_new != -cutlass.Float32.inf else 0.0
             acc_scale_ = (row_max_old - row_max_safe) * self.scale_log2
-            acc_scale = cute.math.exp2(acc_scale_, fastmath=True)
+            acc_scale = cute.arch.exp2(acc_scale_)
             if cutlass.const_expr(self.rescale_threshold > 0.0):
                 if acc_scale_ >= -self.rescale_threshold:
                     row_max_new = row_max_old
@@ -285,6 +277,11 @@ class SoftmaxSm100(Softmax):
         acc_S_row: cute.Tensor,
         acc_S_row_converted: Optional[cute.Tensor] = None,
         converted_scale: cutlass.Constexpr[float] = 1.0,
+        e2e: cutlass.Constexpr[bool] = False,
+        e2e_freq: cutlass.Constexpr[int] = 16,
+        e2e_res: cutlass.Constexpr[int] = 4,
+        e2e_frg_limit: cutlass.Constexpr[int] = 1,
+        e2e_start_frg: cutlass.Constexpr[int] = 0,
         ex2_emu_freq: cutlass.Constexpr[int] = 0,
         ex2_emu_res: cutlass.Constexpr[int] = 4,
         ex2_emu_start_frg: cutlass.Constexpr[int] = 0,
@@ -295,30 +292,39 @@ class SoftmaxSm100(Softmax):
         frg_cnt = cute.size(acc_S_row) // frg_tile
         assert cute.size(acc_S_row) % frg_tile == 0
         acc_S_row_frg = cute.logical_divide(acc_S_row, cute.make_layout(frg_tile))
-        if cutlass.const_expr(acc_S_row_converted is not None):
-            acc_S_row_converted_frg = cute.logical_divide(
-                acc_S_row_converted, cute.make_layout(frg_tile)
-            )
         for j in cutlass.range_constexpr(frg_cnt):
             for k in cutlass.range_constexpr(0, cute.size(acc_S_row_frg, mode=[0]), 2):
-                if cutlass.const_expr(ex2_emu_freq == 0):
-                    acc_S_row_frg[k, j] = cute.math.exp2(acc_S_row_frg[k, j], fastmath=True)
-                    acc_S_row_frg[k + 1, j] = cute.math.exp2(acc_S_row_frg[k + 1, j], fastmath=True)
+                if cutlass.const_expr(not e2e and ex2_emu_freq == 0):
+                    acc_S_row_frg[k, j] = cute.arch.exp2(acc_S_row_frg[k, j])
+                    acc_S_row_frg[k + 1, j] = cute.arch.exp2(acc_S_row_frg[k + 1, j])
+                elif cutlass.const_expr(e2e):
+                    if cutlass.const_expr(
+                        k % e2e_freq < e2e_freq - e2e_res
+                        or j >= frg_cnt - e2e_frg_limit
+                        or j < e2e_start_frg
+                    ):
+                        acc_S_row_frg[k, j] = cute.arch.exp2(acc_S_row_frg[k, j])
+                        acc_S_row_frg[k + 1, j] = cute.arch.exp2(acc_S_row_frg[k + 1, j])
+                    else:
+                        acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = utils.ex2_emulation_2(
+                            acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j]
+                        )
                 else:
                     if cutlass.const_expr(
                         k % ex2_emu_freq < ex2_emu_freq - ex2_emu_res
                         or j >= frg_cnt - 1
                         or j < ex2_emu_start_frg
                     ):
-                        acc_S_row_frg[k, j] = cute.math.exp2(acc_S_row_frg[k, j], fastmath=True)
-                        acc_S_row_frg[k + 1, j] = cute.math.exp2(
-                            acc_S_row_frg[k + 1, j], fastmath=True
-                        )
+                        acc_S_row_frg[k, j] = cute.arch.exp2(acc_S_row_frg[k, j])
+                        acc_S_row_frg[k + 1, j] = cute.arch.exp2(acc_S_row_frg[k + 1, j])
                     else:
                         acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = utils.ex2_emulation_2(
                             acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j]
                         )
             if cutlass.const_expr(acc_S_row_converted is not None):
+                acc_S_row_converted_frg = cute.logical_divide(
+                    acc_S_row_converted, cute.make_layout(frg_tile)
+                )
                 converted_vals = acc_S_row_frg[None, j].load()
                 if cutlass.const_expr(converted_scale != 1.0):
                     converted_vals = converted_vals * converted_scale
@@ -348,8 +354,8 @@ class SoftmaxSm100(Softmax):
         #         (self.scale_log2, self.scale_log2),
         #         (minus_row_max_scaled, minus_row_max_scaled),
         #     )
-        #     acc_S_row[i] = cute.math.exp2(acc_S_row[i], fastmath=True, fastmath=True)
-        #     acc_S_row[i + 1] = cute.math.exp2(acc_S_row[i + 1], fastmath=True, fastmath=True)
+        #     acc_S_row[i] = cute.math.exp2(acc_S_row[i], fastmath=True)
+        #     acc_S_row[i + 1] = cute.math.exp2(acc_S_row[i + 1], fastmath=True)
 
         frg_tile = 32
         assert frg_tile % 2 == 0
@@ -368,10 +374,10 @@ class SoftmaxSm100(Softmax):
                 #         (minus_row_max_scaled, minus_row_max_scaled),
                 #     )
                 # )
-                # acc_S_row_frg[k, j] = cute.math.exp2(acc_S_row_frg[k, j], fastmath=True)
-                # acc_S_row_frg[k + 1, j] = cute.math.exp2(acc_S_row_frg[k + 1, j], fastmath=True)
-                acc_S_row_frg[k, j] = cute.math.exp2(acc_S_row_frg[k, j], fastmath=True)
-                acc_S_row_frg[k + 1, j] = cute.math.exp2(acc_S_row_frg[k + 1, j], fastmath=True)
+                # acc_S_row_frg[k, j] = cute.arch.exp2(acc_S_row_frg[k, j])
+                # acc_S_row_frg[k + 1, j] = cute.arch.exp2(acc_S_row_frg[k + 1, j])
+                acc_S_row_frg[k, j] = cute.arch.exp2(acc_S_row_frg[k, j])
+                acc_S_row_frg[k + 1, j] = cute.arch.exp2(acc_S_row_frg[k + 1, j])
             acc_S_row_converted_frg[None, j].store(
                 acc_S_row_frg[None, j].load().to(acc_S_row_converted.element_type)
             )

@@ -4,7 +4,6 @@ This benchmark tests FP4 attention kernels and compares them against
 the standard Python interface implementation.
 """
 
-import time
 from typing import NamedTuple
 
 import torch
@@ -507,13 +506,6 @@ def create_blockscaled_attention_tensors(
         torch.cuda.synchronize()
 
     if return_torch:
-        # For FP8 V: convert int8 backing to torch.float8_e4m3fn so interface recognizes it
-        if (
-            pv_mode == "fp8"
-            and v_torch_underlying is not None
-            and v_torch_underlying.dtype == torch.int8
-        ):
-            v_torch_underlying = v_torch_underlying.view(torch.float8_e4m3fn)
         return (
             q_torch_underlying,
             k_torch_underlying,
@@ -554,12 +546,7 @@ def create_nvfp4_attention_tensors(
     pv_mode="bf16",
     pv_fp8_dtype=None,
 ):
-    """Create block-scaled attention tensors using flashinfer's nvfp4_quantize.
-
-    Uses proper per-block adaptive scale factors (SF = amax/6 per sf_vec_size=16 block),
-    producing packed float4_e2m1fn_x2 Q/K with SF in BlockScaledBasicChunk MMA layout.
-    This matches production quantization and achieves cos >= 0.99 vs BF16.
-    """
+    """Create NVFP4 tensors using flashinfer's nvfp4_quantize (adaptive per-block SF)."""
     from flashinfer.quantization import nvfp4_quantize, SfLayout
 
     sf_vec_size = 16
@@ -593,7 +580,6 @@ def create_nvfp4_attention_tensors(
     q_fp4, q_sf = _quantize_and_reshape_sf(q_ref, batch, seqlen_q, nheads, headdim)
     k_fp4, k_sf = _quantize_and_reshape_sf(k_ref, batch, seqlen_k, nheads_kv, headdim)
 
-    # V stays in BF16/FP8 (no block-scaled PV)
     if pv_mode == "fp8":
         _fp8 = pv_fp8_dtype or cutlass.Float8E4M3FN
         _torch_fp8 = torch.float8_e4m3fn if _fp8 == cutlass.Float8E4M3FN else torch.float8_e5m2
@@ -617,10 +603,7 @@ def create_mxfp8_attention_tensors(
     pv_mode="bf16",
     pv_fp8_dtype=None,
 ):
-    """Create MXFP8 (FP8 E4M3 QK + E8M0 SF, sf_vec_size=32) tensors using
-    flashinfer's ``mxfp8_quantize`` with per-group adaptive scale factors
-    in BlockScaledBasicChunk (layout_128x4) format.
-    """
+    """Create MXFP8 tensors using flashinfer's mxfp8_quantize (adaptive per-group SF)."""
     from flashinfer.quantization import mxfp8_quantize, SfLayout
 
     sf_vec_size = 32
@@ -688,7 +671,14 @@ def main(
     debug=False,
     causal=False,
 ):
-    """Main benchmark function."""
+    """Main benchmark function.
+
+    Args:
+        ab_dtype: Data type for A/B matrices
+        sf_dtype: Scale factor dtype
+        sf_vec_size: Scale factor vector size
+        pv_mode: One of {'bf16', 'fp4', 'fp8'}
+    """
     torch.manual_seed(0)
     repeats = 10
     device = "cuda"
@@ -726,14 +716,10 @@ def main(
     print(f"QK sf_vec_size: {sf_vec_size}")
     print("=" * 80)
 
-    # Torch-native tensor creation for NVFP4 (flashinfer nvfp4_quantize, per-block SF)
-    # and MXFP8 (torch FP8 + uniform E8M0 SF). Both avoid cute_tensor_like /
-    # cute.testing.convert, which fails with cudaErrorInsufficientDriver in this env.
-    # FP4 PV still uses cute_tensor_like (block-scaled V).
     use_nvfp4 = ab_dtype == cutlass.Float4E2M1FN and pv_mode != "fp4"
     use_mxfp8 = ab_dtype == cutlass.Float8E4M3FN and pv_mode != "fp4"
 
-    for i, (batch_size, seqlen, nheads, headdim) in enumerate(configs):
+    for batch_size, seqlen, nheads, headdim in configs:
         nheads_kv = nheads
         headdim_v = headdim
         seqlen_q = seqlen
@@ -794,8 +780,10 @@ def main(
                     debug=debug,
                 )
             )
-        q_sf_torch = check_tensor_for_nans(q_sf, name="q_sf")
-        k_sf_torch = check_tensor_for_nans(k_sf, name="k_sf")
+
+        if not use_nvfp4 and not use_mxfp8:
+            q_sf_torch = check_tensor_for_nans(q_sf, name="q_sf")
+            k_sf_torch = check_tensor_for_nans(k_sf, name="k_sf")
 
         if pv_mode == "fp4":
             v_sf_torch = check_tensor_for_nans(v_sf, name="v_sf")
@@ -933,14 +921,13 @@ def main(
             try:
                 fp4_cmp = fp4_out[0] if isinstance(fp4_out, tuple) else fp4_out
                 ref_cmp = ref_out[0] if isinstance(ref_out, tuple) else ref_out
-                fp4_f = fp4_cmp.float()
-                ref_f = ref_cmp.float()
-                abs_diff = (fp4_f - ref_f).abs()
+                abs_diff = (fp4_cmp.float() - ref_cmp.float()).abs()
                 has_nan = fp4_cmp.isnan().any().item()
                 max_diff = abs_diff.max().item()
                 mean_diff = abs_diff.mean().item()
                 cos_sim = torch.nn.functional.cosine_similarity(
-                    fp4_f.flatten().unsqueeze(0), ref_f.flatten().unsqueeze(0)
+                    fp4_cmp.float().flatten().unsqueeze(0),
+                    ref_cmp.float().flatten().unsqueeze(0),
                 ).item()
                 print(
                     f"  FP4 vs ref: cos_sim={cos_sim:.6f}, max_diff={max_diff:.4f}, mean_diff={mean_diff:.6f}, has_nan={has_nan}"
@@ -968,10 +955,6 @@ def main(
 
                 traceback.print_exc()
 
-        if (i + 1) % 3 == 0:
-            torch.cuda.synchronize()
-            time.sleep(2)
-
 
 if __name__ == "__main__":
     import argparse
@@ -987,7 +970,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--pv_mode",
         choices=["bf16", "fp4", "fp8"],
-        default=None,
+        default="bf16",
         help="PV path: bf16 baseline V, fp4 block-scaled V, or pure fp8 V",
     )
     parser.add_argument(
