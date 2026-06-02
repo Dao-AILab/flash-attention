@@ -687,17 +687,18 @@ def _flash_attn_fwd(
 
         gather_kv_length = 2048  # dummy value
         sparse_kv = gather_kv_indices is not None
+        # always use kv bitmask by default (handles -1 sentinel)
         disable_sparse_kv_bitmask = False
         if sparse_kv:
             assert gather_kv_indices.shape[:-1] == qv.shape[:-2]
             gather_kv_length = gather_kv_indices.shape[-1]
             assert gather_kv_length % 128 == 0
-            if min_seqlen_k is None or causal:
-                disable_sparse_kv_bitmask = False
-            else:
-                # seqlen_k_boundary = min_seqlen_k - max_seqlen_q + 1 if causal else min_seqlen_k
-                seqlen_k_boundary = min_seqlen_k
-                disable_sparse_kv_bitmask = seqlen_k_boundary >= gather_kv_length
+            # if min_seqlen_k is None or causal:
+            #     disable_sparse_kv_bitmask = False
+            # else:
+            #     # seqlen_k_boundary = min_seqlen_k - max_seqlen_q + 1 if causal else min_seqlen_k
+            #     seqlen_k_boundary = min_seqlen_k
+            #     disable_sparse_kv_bitmask = seqlen_k_boundary >= gather_kv_length
         
         if requires_grad and sparse_kv:
             if cu_seqlens_q is None:
@@ -2037,15 +2038,15 @@ def _flash_attn_bwd_sparse_mla(
     assert arch // 10 in [10, 11], "Unsupported compute capability. Supported: 10.x, 11.x"
 
     q_shape = q.shape if q is not None else qv.shape
-    nhead, head_dim = q_shape[-2:]
+    nheads, head_dim = q_shape[-2:]
     nheads_kv, head_dim_v = v.shape[-2:]
-    qhead_per_kvhead = nhead // nheads_kv
-    pack_gqa = True
-    cluster_size = 2
-    use_2cta_instrs = True
+    qhead_per_kvhead = nheads // nheads_kv
     gather_kv_length = gather_kv_indices.shape[-1]
-    assert qhead_per_kvhead % 64 == 0, f"{qhead_per_kvhead=} not divisible by 64"
-    assert gather_kv_length % 128 == 0, f"{gather_kv_length=} not divisible by 128"
+    assert nheads_kv == 1 and qhead_per_kvhead == 128, f"sparse MLA bwd: only MQA 128 supported for now"
+    assert gather_kv_length % 128 == 0, f"sparse MLA bwd: {gather_kv_length=} must be divisible by 128"
+    assert deterministic is False, "sparse MLA bwd: deterministic mode not yet supported"
+    assert learnable_sink is None, "sparse MLA bwd: learnable sink not yet supported"
+    assert seqused_q is None and seqused_k is None, "sparse MLA bwd: seqused_q,k not yet supported"
 
     if softmax_scale is None:
         softmax_scale = (
@@ -2067,10 +2068,12 @@ def _flash_attn_bwd_sparse_mla(
     if cu_seqlens_q is None:
         batch_size, seqlen_q = q_shape[:2]
         total_q = batch_size * seqlen_q
+        p_shape = (batch_size, seqlen_q, nheads, gather_kv_length)
     else:
         batch_size = cu_seqlens_q.shape[0] - 1
         total_q = q_shape[0]
         seqlen_q = max_seqlen_q if max_seqlen_q is not None else total_q
+        p_shape = (total_q, nheads, gather_kv_length)
 
     varlen_k = cu_seqlens_k is not None or seqused_k is not None
     if cu_seqlens_k is None:
@@ -2083,12 +2086,14 @@ def _flash_attn_bwd_sparse_mla(
     if not varlen_k:
         min_seqlen_k = seqlen_k 
 
-    assert varlen_q == varlen_k, "either q and k are both varlen or not"
+    assert varlen_q == varlen_k, "sparse MLA bwd: either q and k are both varlen or not"
 
-    if min_seqlen_k is None or causal:
-        disable_sparse_kv_bitmask = False
-    else:
-        disable_sparse_kv_bitmask = min_seqlen_k >= gather_kv_length
+    # always use kv bitmask by default (handles -1 sentinel)
+    disable_sparse_kv_bitmask = False
+    # if min_seqlen_k is None or causal:
+    #     disable_sparse_kv_bitmask = False
+    # else:
+    #     disable_sparse_kv_bitmask = min_seqlen_k >= gather_kv_length
 
     prealloc_dq = dq is not None
     prealloc_dk = dk is not None
@@ -2105,10 +2110,20 @@ def _flash_attn_bwd_sparse_mla(
         dqv = torch.empty_like(qv)
     ds = torch.empty_like(p)
 
+    device = v.device
+    dtype = v.dtype
+    if q is not None:
+        _validate_tensor(dq, "dq", q.shape, dtype, device)
+    if k is not None:
+        _validate_tensor(dk, "dk", k.shape, torch.float32, device)
+    _validate_tensor(dv, "dv", v.shape, torch.float32, device)
+    _validate_tensor(dqv, "dqv", qv.shape, dtype, device)
+    _validate_tensor(p, "p", p_shape, dtype, device)
+
     if cu_seqlens_q is None:
-        dpsum = torch.empty(batch_size, seqlen_q, nhead, dtype=torch.float32, device=device)
+        dpsum = torch.empty(batch_size, seqlen_q, nheads, dtype=torch.float32, device=device)
     else:
-        dpsum = torch.empty(total_q, nhead, dtype=torch.float32, device=device)
+        dpsum = torch.empty(total_q, nheads, dtype=torch.float32, device=device)
     scale_p = torch.empty_like(row_max)
 
     dtype = torch2cute_dtype_map[dout.dtype]
@@ -2217,19 +2232,17 @@ def _flash_attn_bwd_sparse_mla(
             seqused_k,
         )
 
-    # todo: clean up layout discrepancy on nheads_kv dim
-    assert nheads_kv == 1, "only MQA supported for now"
     v = v.squeeze(-2)
     if k is not None:
         k = k.squeeze(-2)
     
-    _dq_dqv_gemm(
+    _sparse_mla_dq_dqv(
         ds, k, v, dq, dqv, gather_kv_indices, cu_seqlens_q, cu_seqlens_k,
     )
 
     if k is not None:
         dk = dk.squeeze(-2)
-        _dk_gemm(ds, gather_kv_indices, q, dk, cu_seqlens_q, cu_seqlens_k)
+        _sparse_mla_dk(ds, gather_kv_indices, q, dk, cu_seqlens_q, cu_seqlens_k)
         dk = dk.unsqueeze(-2)
     
     # return dk, dv in float32: all-reduce across sequence-parallel ranks must happen
@@ -2239,7 +2252,7 @@ def _flash_attn_bwd_sparse_mla(
 _flash_attn_bwd_sparse_mla.compile_cache = get_jit_cache("bwd_dsa")
 
 
-def _compile_dq_dqv_gemm(
+def _compile_sparse_mla_dq_dqv(
     dtype, nheads, head_dim, head_dim_v, top_k, varlen_q, varlen_k, compute_dq,
 ):
     sym = cute.sym_int 
@@ -2260,16 +2273,13 @@ def _compile_dq_dqv_gemm(
     mCuSeqlensQ = fake_tensor(Int32, (b_plus_1,), divisibility=1) if varlen_q else None 
     mCuSeqlensK = fake_tensor(Int32, (b_plus_1,), divisibility=1) if varlen_k else None 
     
-    if nheads == 128:
-        dq_dqv_gemm = dQdQvGemmKernel(
-            acc_dtype=Float32,
-            nheads=nheads,
-            head_dim_k=head_dim,
-            head_dim_v=head_dim_v,
-            top_k=top_k,
-        )
-    else:
-        raise ValueError(f"nheads != 128 not supported at this time; got {nheads}")
+    dq_dqv_gemm = dQdQvGemmKernel(
+        acc_dtype=Float32,
+        nheads=nheads,
+        head_dim_k=head_dim,
+        head_dim_v=head_dim_v,
+        top_k=top_k,
+    )
     
     return cute.compile(
         dq_dqv_gemm,
@@ -2286,52 +2296,37 @@ def _compile_dq_dqv_gemm(
     )
 
 
-def _dq_dqv_gemm(
-    dS, K, V, dQ, dQv, index_topk, cu_seqlens_q, cu_seqlens_k,
+def _sparse_mla_dq_dqv(
+    ds, k, v, dq, dqv, gather_kv_indices, cu_seqlens_q, cu_seqlens_k,
 ):
     """Compute dQ = dS @ K and dQv = dS @ V"""
-    *_, nheads, top_k = dS.shape
-    assert nheads == 128, "nheads == 64 support in later PR"
+    *_, nheads, gather_kv_length = ds.shape
     
-    head_dim_v = V.shape[-1]
-    head_dim = K.shape[-1] if K is not None else 0
+    head_dim_v = v.shape[-1]
+    head_dim = k.shape[-1] if k is not None else 0
     
-    dtype = dS.dtype
+    dtype = ds.dtype
     dtype_cute = torch2cute_dtype_map[dtype]
     
-    assert all(
-        t.dtype == dtype 
-        for t in [K, V, dQ, dQv] 
-        if t is not None
-    ), "dS, K, V, dQ, dQv dtypes must agree"
-    assert all(
-        t.dtype == torch.int32 
-        for t in [index_topk, cu_seqlens_q, cu_seqlens_k] 
-        if t is not None
-    ), "index_topk and cu_seqlens tensors must be float32"
-    
-    varlen = cu_seqlens_q is not None
-    if varlen:
-        assert cu_seqlens_k is not None, "varlen currently supported for either both or neither of q/k"
-    assert top_k % 128 == 0, f"top_k must be divisible by 128; got {top_k}"
-    assert dtype == torch.bfloat16
+    varlen_q = cu_seqlens_q is not None
+    varlen_k = cu_seqlens_k is not None
     
     compile_key = (
-        dtype_cute, nheads, head_dim, head_dim_v, top_k, cu_seqlens_q is not None, cu_seqlens_k is not None, K is not None,
+        dtype_cute, nheads, head_dim, head_dim_v, gather_kv_length, varlen_q, varlen_k, k is not None,
     )
-    if compile_key not in _dq_dqv_gemm.compile_cache:
-        _dq_dqv_gemm.compile_cache[compile_key] = _compile_dq_dqv_gemm(
+    if compile_key not in _sparse_mla_dq_dqv.compile_cache:
+        _sparse_mla_dq_dqv.compile_cache[compile_key] = _compile_sparse_mla_dq_dqv(
             *compile_key
         )
     if not is_fake_mode():
-        _dq_dqv_gemm.compile_cache[compile_key](
-            dS, K, V, dQ, dQv, index_topk, cu_seqlens_q, cu_seqlens_k
+        _sparse_mla_dq_dqv.compile_cache[compile_key](
+            ds, k, v, dq, dqv, gather_kv_indices, cu_seqlens_q, cu_seqlens_k
         )
 
-_dq_dqv_gemm.compile_cache = get_jit_cache("dq_dqv_gemm")
+_sparse_mla_dq_dqv.compile_cache = get_jit_cache("dq_dqv_gemm")
 
 
-def _compile_dk_gemm(
+def _compile_sparse_mla_dk(
     dtype,
     dtype_acc,
     nheads: int,
@@ -2351,8 +2346,6 @@ def _compile_dk_gemm(
     div = 128 // dtype.width
 
     sym = cute.sym_int
-    total_q, total_k = sym(), sym()
-
     batch_fake = sym()
     batchp1_fake = sym()
     seqlen_q_fake = sym()
@@ -2380,13 +2373,13 @@ def _compile_dk_gemm(
     )
 
 
-def _dk_gemm(
+def _sparse_mla_dk(
     dS: torch.Tensor,
     index_topk: torch.Tensor,
-    Q: torch.Tensor,
-    dK: torch.Tensor,
-    cuSeqlensQ: Optional[torch.Tensor],
-    cuSeqlensK: Optional[torch.Tensor],
+    q: torch.Tensor,
+    dk: torch.Tensor,
+    cu_seqlens_q: Optional[torch.Tensor],
+    cu_seqlens_k: Optional[torch.Tensor],
 ):
     """Compute dKaccum = scatter(dS'^T @ Q, I).
 
@@ -2404,67 +2397,26 @@ def _dk_gemm(
     determined using the cuSeqlensQ and cuSeqlensK tensors.
     For non-varlen, total_q and total_k are (batch, seqlen_q) and (batch, seqlen_k).
     """
-
     dtype = dS.dtype
     dtype_cute = torch2cute_dtype_map[dtype]
-
-    dtype_acc = dK.dtype
+    dtype_acc = dk.dtype
     dtype_acc_cute = torch2cute_dtype_map[dtype_acc]
 
-    assert not (
-        (cuSeqlensQ is None and cuSeqlensK is not None)
-        or (cuSeqlensK is None and cuSeqlensQ is not None)
-    ), "Expected both cuSeqlensQ and cuSeqlensK for varlen dK GEMM"
-    varlen = cuSeqlensQ is not None
-    if varlen:
-        assert all(x.ndim == 3 for x in [dS, Q]), "Expected total_q mode for dS, Q"
-        assert index_topk.ndim == 2, "Expected total_q mode for index_topk"
-        assert dK.ndim == 2, "Expected total_k mode for dK"
-    else:
-        assert all(x.ndim == 4 for x in [dS, Q]), "Expected (batch, seqlen_q) modes for dS, Q"
-        assert index_topk.ndim == 3, "Expected (batch, seqlen_q) modes for index_topk"
-        assert dK.ndim == 3, "Expected (batch, seqlen_k) modes for dK"
-
-    total_q = dS.shape[:-2]
-    total_k = dK.shape[:-1]
+    varlen = cu_seqlens_q is not None
     nheads, topk = dS.shape[-2], dS.shape[-1]
-    head_dim = Q.shape[-1] if Q is not None else 0
-    assert index_topk.dtype == torch.int32, f"Bad dtype for index_topk, expected int32, got {dS.dtype}"
-    assert index_topk.shape == (*total_q, topk), (
-        f"Bad shape for index_topk, expected {(*total_q, topk)}, got {index_topk.shape}"
-    )
-    assert Q.shape == (*total_q, nheads, head_dim), (
-        f"Bad shape for Q, expected {(*total_q, nheads, head_dim)}, got {Q.shape}"
-    )
-    assert Q.dtype == dtype, f"Bad dtype for Q, expected {dtype}, got {Q.dtype}"
-    assert dK.shape == (*total_k, head_dim), (
-        f"Bad shape for dK, expected {(*total_k, head_dim)}, got {dK.shape}"
-    )
-    assert dK.dtype == dtype_acc, (
-        f"Bad dtype for dK, expected {dtype_acc}, got {dK.dtype}"
-    )
-    if varlen:
-        assert cuSeqlensQ.ndim == 1 and cuSeqlensK.shape == cuSeqlensQ.shape, (
-            f"Bad shape for cuSeqlensQ and cuSeqlensK, expected (batch + 1,), got {cuSeqlensQ.shape}, {cuSeqlensK.shape}"
-        )
-        assert cuSeqlensQ.dtype == torch.int32, (
-            f"Bad dtype for cuSeqlensQ, expected int32, got {cuSeqlensQ.dtype}"
-        )
-        assert cuSeqlensK.dtype == torch.int32, (
-            f"Bad dtype for cuSeqlensK, expected int32, got {cuSeqlensQ.dtype}"
-        )
+    head_dim = q.shape[-1] if q is not None else 0
 
     compile_key = (
         dtype_cute, dtype_acc_cute, nheads, head_dim, topk, varlen,
     )
 
-    if compile_key not in _dk_gemm.compile_cache:
-        _dk_gemm.compile_cache[compile_key] = _compile_dk_gemm(*compile_key)
+    if compile_key not in _sparse_mla_dk.compile_cache:
+        _sparse_mla_dk.compile_cache[compile_key] = _compile_sparse_mla_dk(*compile_key)
 
     if not is_fake_mode():
-        _dk_gemm.compile_cache[compile_key](dS, index_topk, Q, dK, cuSeqlensQ, cuSeqlensK)
+        _sparse_mla_dk.compile_cache[compile_key](dS, index_topk, q, dk, cu_seqlens_q, cu_seqlens_k)
     
-_dk_gemm.compile_cache = get_jit_cache("dk_gemm")
+_sparse_mla_dk.compile_cache = get_jit_cache("dk_gemm")
 
 
 class FlashAttnFunc(torch.autograd.Function):
@@ -2676,6 +2628,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         ctx.deterministic = deterministic
         ctx.max_seqlen_q = max_seqlen_q
         ctx.max_seqlen_k = max_seqlen_k
+        ctx.min_seqlen_k = min_seqlen_k
         ctx.return_lse = return_lse
         ctx.score_mod = score_mod
         ctx.score_mod_bwd = score_mod_bwd
@@ -2710,6 +2663,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 seqused_k=seqused_k,
                 max_seqlen_q=ctx.max_seqlen_q,
                 max_seqlen_k=ctx.max_seqlen_k,
+                min_seqlen_k=ctx.min_seqlen_k,
             )
             if ctx.shared_kv:
                 return dqv, dv, None, None, *((None,) * 30)
@@ -2845,9 +2799,6 @@ def flash_attn_varlen_func(
         so we arrange for nheads as the contiguous mode for better vectorization.
 
     gather_kv_indices: used for topk sparsity with MLA absorption kernel.
-
-    min_seqlen_k: for varlen, specifies the minimum kv sequence length for any batch.
-        Used with gather_kv_indices to determine if we need oob masking.
     """
     return FlashAttnVarlenFunc.apply(
         q,
