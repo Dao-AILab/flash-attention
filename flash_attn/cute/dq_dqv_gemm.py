@@ -45,8 +45,7 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 from flash_attn.cute.topk_gather_kv import CpasyncGatherKVManager
-
-DEBUG = True
+from flash_attn.cute.utils import get_batch_from_cu_tensor
 
 
 class dQdQvGemmKernel:
@@ -1269,20 +1268,9 @@ class dQdQvGemmKernel:
         seqlen_q_divmod: FastDivmodDivisor,
         mCuSeqlensQ: Optional[cute.Tensor],
     ) -> Int32:
-        """binary search to find batch index from q token"""
+        """Find batch index from q token (binary search for varlen, divmod otherwise)"""
         if const_expr(mCuSeqlensQ is not None):
-            batch_size = cute.size(mCuSeqlensQ) - 1
-            lo = Int32(0)
-            hi = batch_size
-
-            while lo < hi:
-                mid = (lo + hi) // 2
-                if mCuSeqlensQ[mid + 1] <= token:
-                    lo = mid + 1
-                else:
-                    hi = mid
-
-            return lo
+            return get_batch_from_cu_tensor(token, mCuSeqlensQ)
         else:
             batch, _ = divmod(token, seqlen_q_divmod)
             return batch

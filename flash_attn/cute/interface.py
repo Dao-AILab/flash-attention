@@ -46,6 +46,7 @@ from flash_attn.cute.flash_fwd_combine import FlashAttentionForwardCombine
 from flash_attn.cute.flash_fwd_mla_sm100 import FlashAttentionMLAForwardSm100
 from flash_attn.cute.flash_bwd_mla_sm100 import FlashAttentionSparseMLABackwardSm100
 from flash_attn.cute.dq_dqv_gemm import dQdQvGemmKernel
+from flash_attn.cute.dk_gemm import dKGemmKernel
 
 # SM100 head_dim=256 2CTA kernel imports
 from flash_attn.cute.sm100_hd256_2cta_fmha_forward import BlackwellFusedMultiHeadAttentionForward
@@ -2226,10 +2227,10 @@ def _flash_attn_bwd_sparse_mla(
         ds, k, v, dq, dqv, gather_kv_indices, cu_seqlens_q, cu_seqlens_k,
     )
 
-    # TODO: fix up dk gemm
-    # if k is not None:
-    #     dk_view = dk.squeeze(-2)
-    #     _dk_gemm(ds, gather_kv_indices, q, dk_view)
+    if k is not None:
+        dk = dk.squeeze(-2)
+        _dk_gemm(ds, gather_kv_indices, q, dk, cu_seqlens_q, cu_seqlens_k)
+        dk = dk.unsqueeze(-2)
     
     # return dk, dv in float32: all-reduce across sequence-parallel ranks must happen
     # before downcasting to avoid rounding error during inter-rank grad accumulation
@@ -2328,6 +2329,142 @@ def _dq_dqv_gemm(
         )
 
 _dq_dqv_gemm.compile_cache = get_jit_cache("dq_dqv_gemm")
+
+
+def _compile_dk_gemm(
+    dtype,
+    dtype_acc,
+    nheads: int,
+    head_dim: int,
+    topk: int,
+    varlen: bool,
+):
+    kernel = dKGemmKernel(
+        topk,
+        nheads,
+        head_dim,
+        varlen,
+    )
+    # Check if configuration can be implemented
+    kernel.check_can_implement()
+
+    div = 128 // dtype.width
+
+    sym = cute.sym_int
+    total_q, total_k = sym(), sym()
+
+    batch_fake = sym()
+    batchp1_fake = sym()
+    seqlen_q_fake = sym()
+    seqlen_k_fake = sym()
+    total_q_fake = (batch_fake, seqlen_q_fake) if not varlen else (sym(),)
+    total_k_fake = (batch_fake, seqlen_k_fake) if not varlen else (sym(),)
+
+    mdS = fake_tensor(dtype, (*total_q_fake, nheads, topk), divisibility=div)
+    mI = fake_tensor(Int32, (*total_q_fake, topk), divisibility=div)
+    mQ = fake_tensor(dtype, (*total_q_fake, nheads, head_dim), divisibility=div)
+    mdK = fake_tensor(dtype_acc, (*total_k_fake, head_dim), divisibility=div)
+    mCuSeqlensQ = fake_tensor(Int32, (batchp1_fake,), divisibility=1) if varlen else None
+    mCuSeqlensK = fake_tensor(Int32, (batchp1_fake,), divisibility=1) if varlen else None
+    
+    return cute.compile(
+        kernel,
+        mdS,
+        mI,
+        mQ,
+        mdK,
+        mCuSeqlensQ,
+        mCuSeqlensK,
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--enable-tvm-ffi",
+    )
+
+
+def _dk_gemm(
+    dS: torch.Tensor,
+    index_topk: torch.Tensor,
+    Q: torch.Tensor,
+    dK: torch.Tensor,
+    cuSeqlensQ: Optional[torch.Tensor],
+    cuSeqlensK: Optional[torch.Tensor],
+):
+    """Compute dKaccum = scatter(dS'^T @ Q, I).
+
+    Args:
+      dS:          (*total_q, heads, topk), bf16
+      index_topk:  (*total_q, topk), int32
+      Q:           (*total_q, heads, dim), bf16
+      dK:          (*total_q, dim), fp32
+      cuSeqlensQ:  (batch + 1,), int32, omit for non-varlen
+      cuSeqlensK:  (batch + 1,), int32, omit for non-varlen
+
+    Accumulates in place on top of dK.
+
+    For varlen, total_q and total_k are 1-dimensional, and the seqlen indices per batch are
+    determined using the cuSeqlensQ and cuSeqlensK tensors.
+    For non-varlen, total_q and total_k are (batch, seqlen_q) and (batch, seqlen_k).
+    """
+
+    dtype = dS.dtype
+    dtype_cute = torch2cute_dtype_map[dtype]
+
+    dtype_acc = dK.dtype
+    dtype_acc_cute = torch2cute_dtype_map[dtype_acc]
+
+    assert not (
+        (cuSeqlensQ is None and cuSeqlensK is not None)
+        or (cuSeqlensK is None and cuSeqlensQ is not None)
+    ), "Expected both cuSeqlensQ and cuSeqlensK for varlen dK GEMM"
+    varlen = cuSeqlensQ is not None
+    if varlen:
+        assert all(x.ndim == 3 for x in [dS, Q]), "Expected total_q mode for dS, Q"
+        assert index_topk.ndim == 2, "Expected total_q mode for index_topk"
+        assert dK.ndim == 2, "Expected total_k mode for dK"
+    else:
+        assert all(x.ndim == 4 for x in [dS, Q]), "Expected (batch, seqlen_q) modes for dS, Q"
+        assert index_topk.ndim == 3, "Expected (batch, seqlen_q) modes for index_topk"
+        assert dK.ndim == 3, "Expected (batch, seqlen_k) modes for dK"
+
+    total_q = dS.shape[:-2]
+    total_k = dK.shape[:-1]
+    nheads, topk = dS.shape[-2], dS.shape[-1]
+    head_dim = Q.shape[-1] if Q is not None else 0
+    assert index_topk.dtype == torch.int32, f"Bad dtype for index_topk, expected int32, got {dS.dtype}"
+    assert index_topk.shape == (*total_q, topk), (
+        f"Bad shape for index_topk, expected {(*total_q, topk)}, got {index_topk.shape}"
+    )
+    assert Q.shape == (*total_q, nheads, head_dim), (
+        f"Bad shape for Q, expected {(*total_q, nheads, head_dim)}, got {Q.shape}"
+    )
+    assert Q.dtype == dtype, f"Bad dtype for Q, expected {dtype}, got {Q.dtype}"
+    assert dK.shape == (*total_k, head_dim), (
+        f"Bad shape for dK, expected {(*total_k, head_dim)}, got {dK.shape}"
+    )
+    assert dK.dtype == dtype_acc, (
+        f"Bad dtype for dK, expected {dtype_acc}, got {dK.dtype}"
+    )
+    if varlen:
+        assert cuSeqlensQ.ndim == 1 and cuSeqlensK.shape == cuSeqlensQ.shape, (
+            f"Bad shape for cuSeqlensQ and cuSeqlensK, expected (batch + 1,), got {cuSeqlensQ.shape}, {cuSeqlensK.shape}"
+        )
+        assert cuSeqlensQ.dtype == torch.int32, (
+            f"Bad dtype for cuSeqlensQ, expected int32, got {cuSeqlensQ.dtype}"
+        )
+        assert cuSeqlensK.dtype == torch.int32, (
+            f"Bad dtype for cuSeqlensK, expected int32, got {cuSeqlensQ.dtype}"
+        )
+
+    compile_key = (
+        dtype_cute, dtype_acc_cute, nheads, head_dim, topk, varlen,
+    )
+
+    if compile_key not in _dk_gemm.compile_cache:
+        _dk_gemm.compile_cache[compile_key] = _compile_dk_gemm(*compile_key)
+
+    if not is_fake_mode():
+        _dk_gemm.compile_cache[compile_key](dS, index_topk, Q, dK, cuSeqlensQ, cuSeqlensK)
+    
+_dk_gemm.compile_cache = get_jit_cache("dk_gemm")
 
 
 class FlashAttnFunc(torch.autograd.Function):
