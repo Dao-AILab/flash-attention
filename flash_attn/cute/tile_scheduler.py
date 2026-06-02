@@ -45,7 +45,7 @@ class SchedulerState(ParamsBase):
     Main kernels construct this via `create_clc` / `create_dynamic_persistent`,
     which return the appropriate concrete state (`ClcSchedulerState` or
     `DynamicPersistentSchedulerState`). Schedulers consume it through the
-    `ctx: SchedulerState | None` parameter on their `create(...)`.
+    `ctx: SchedulerState | None` parameter on their `__init__(...)`.
     """
 
     _pipeline: cutlass.pipeline.PipelineAsync
@@ -88,7 +88,18 @@ class SchedulerState(ParamsBase):
 
 @dataclass
 class ClcSchedulerState(SchedulerState):
-    """CLC-backed: `prefetch_next_work` issues the HW query."""
+    """Owns the runtime state shared by CLC-capable tile schedulers.
+
+    `FlashAttentionForwardSm100` constructs this state because it owns the CLC
+    response buffer, mbarrier storage, and launch geometry needed to initialize
+    the hardware scheduler and async pipeline. Individual tile schedulers then
+    consume this state and map the returned hardware work tiles into their own
+    logical `WorkTileInfo` coordinates.
+
+    To add CLC support to a scheduler:
+    - implement `clc_problem_shape(params)` so the kernel can create the hardware scheduler
+    - map `ctx.initial_work_tile_info()` and `ctx.get_current_work()` into scheduler coordinates
+    """
 
     _hw_scheduler: ClcDynamicPersistentTileScheduler
 

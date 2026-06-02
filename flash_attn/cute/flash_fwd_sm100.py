@@ -219,12 +219,12 @@ class FlashAttentionForwardSm100:
         )
 
         self.use_clc_scheduler = use_clc_scheduler
-        self.dynamic_persistent = (has_tile_count_semaphore and is_varlen_q) or use_clc_scheduler
         # ClC does not compose with these other features, so disable even if requested
         self.use_clc_scheduler = (
             use_clc_scheduler
             and self.use_tma_KV
         )
+        self.dynamic_persistent = (has_tile_count_semaphore and is_varlen_q) or use_clc_scheduler
         self.is_persistent = self.dynamic_persistent or self.is_static_persistent
         self.sched_stages = 1
         if self.use_clc_scheduler:
@@ -712,14 +712,8 @@ class FlashAttentionForwardSm100:
             cutlass.max(cute.cosize(sQ_layout), cute.cosize(sO_layout) * self.o_dtype.width // self.q_dtype.width)
         )
 
-        sched_response_size = (
-            self.sched_stages * 4
-            if (self.use_clc_scheduler or self.dynamic_persistent) else 0
-        )
-        sched_mbar_size = (
-            self.sched_stages * 2
-            if (self.use_clc_scheduler or self.dynamic_persistent) else 0
-        )
+        sched_response_size = self.sched_stages * 4 if self.dynamic_persistent else 0
+        sched_mbar_size = self.sched_stages * 2 if self.dynamic_persistent else 0
         load_epi_mbar_size = 2 if const_expr(self.overlap_sO_sQ) else 0
 
         @cute.struct
@@ -743,7 +737,8 @@ class FlashAttentionForwardSm100:
             # store row max and row sum
             sScale: cute.struct.MemRange[Float32, self.q_stage * self.m_block_size * 2]
             # Scheduler buffers placed here to utilize padding before sO's 1024-byte
-            # alignment. PipelineClcFetchAsync / PipelineAsync both expect
+            # alignment. This avoids adding bytes at the end when we're at the smem limit. 
+            # PipelineClcFetchAsync / PipelineAsync both expect
             # 2 * sched_stages mbarriers (full + empty). Response is 4 Int32 per stage
             # (CLC HW response, or work_info written by dynamic persistent producer).
             sched_mbar_ptr: cute.struct.MemRange[Int64, sched_mbar_size]
@@ -1070,6 +1065,9 @@ class FlashAttentionForwardSm100:
 
         pipeline_load_epi = None
         if const_expr(self.overlap_sO_sQ and self.is_persistent):
+            # when overlapping sO and sQ with a persistent kernel, we need this 
+            # additional pipeline to ensure sO from the previous work tile is 
+            # free for use by sQ in the current one.
             epi_warps_for_release = (
                 ThreadCooperativeGroup(len(self.correction_warp_ids))
                 if self.use_correction_warps_for_epi
@@ -1168,6 +1166,7 @@ class FlashAttentionForwardSm100:
                 cutlass_pipeline.Agent.Thread
             )
             num_sched_consumer_warps_per_cta = self.threads_per_cta // cute.arch.WARP_SIZE
+            # NB on CTA0 warp15 == scheduler on CTA1 == empty but still both consume
             num_sched_consumer_warps = num_sched_consumer_warps_per_cta * self.cta_group_size
             sched_consumer_group = cutlass_pipeline.CooperativeGroup(
                 cutlass_pipeline.Agent.Thread,
@@ -3082,11 +3081,12 @@ class FlashAttentionForwardSm100:
         while work_tile.is_valid_tile:
             tile_scheduler.prefetch_next_work()
             work_tile = tile_scheduler.advance_to_next_work()
-            if const_expr(self.use_clc_scheduler):
+            if const_expr(self.dynamic_persistent):
                 if cute.arch.thread_idx()[0] == self.scheduler_warp_id * cute.arch.WARP_SIZE:
+                    prefix_str = "[CLC] query " if const_expr(self.use_clc_scheduler) else "[DYNAMIC] info "
                     fa_printf(
                         3,
-                        "[CLC] query sm={} cta={} (m_blk={},h={},b={},s={}) valid={}\n",
+                        prefix_str + "sm={} cta={} (m_blk={},h={},b={},s={}) valid={}\n",
                         smid(),
                         cute.arch.block_idx()[0],
                         work_tile.tile_idx[0],
