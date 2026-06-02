@@ -441,6 +441,7 @@ class FlashAttentionBackwardPreprocess:
                 cute.copy(gmem_tiled_copy_dQaccum, zero, tdQgdQaccum)
 
             LOG2_E = math.log2(math.e)
+            lse_log2 = lse * LOG2_E if lse != -Float32.inf else 0.0
             if const_expr(mLSElog2 is not None):
                 mLSElog2_cur = seqlen.offset_batch(mLSElog2, batch_idx, dim=2, padded=padded)[
                     None, head_idx
@@ -448,7 +449,7 @@ class FlashAttentionBackwardPreprocess:
                 gLSElog2 = cute.local_tile(mLSElog2_cur, (self.tile_m,), (m_block,))
                 LOG2_E = math.log2(math.e)
                 if tidx < seqlen_q_rounded - m_block * self.tile_m:
-                    gLSElog2[tidx] = lse * LOG2_E if lse != -Float32.inf else 0.0
+                    gLSElog2[tidx] = lse_log2
 
             if const_expr(mRowMax is not None):
                 assert mLSE is not None
@@ -469,6 +470,6 @@ class FlashAttentionBackwardPreprocess:
                         row_max = gRowMax[tidx, n]
                         scale = 0.0
                         if row_max != -Float32.inf:
-                            scale = softmax_scale_log2 * row_max - lse * LOG2_E
+                            scale = softmax_scale_log2 * row_max - lse_log2
                             scale = cute.math.exp2(scale, fastmath=True)
                         gScaleP[tidx, n] = scale

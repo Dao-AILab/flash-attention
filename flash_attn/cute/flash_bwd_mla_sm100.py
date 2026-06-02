@@ -327,7 +327,7 @@ class FlashAttentionSparseMLABackwardSm100:
             sdS: sdS_struct
             sQv: sQvt_struct
 
-        print("smem bytes = ", SharedStorage.size_in_bytes())
+        # print("smem bytes = ", SharedStorage.size_in_bytes())
 
         return SharedStorage
 
@@ -828,7 +828,6 @@ class FlashAttentionSparseMLABackwardSm100:
         # tdVtdV0 = cute.make_tensor(tdVtdV0.iterator + self.tmem_offset_dV0, tdVtdV0.layout)
         # tdVtdV1 = cute.make_tensor(tdVtdV1.iterator + self.tmem_offset_dV1, tdVtdV1.layout)
 
-        # TODO: is this right?
         block_info = BlockInfo(
             self.tile_m * self.cta_group_size,
             self.tile_n,
@@ -1947,6 +1946,7 @@ class FlashAttentionSparseMLABackwardSm100:
                 # wait for tma store to free dSt buffer
                 if leader_warp:
                     cute.arch.cp_async_bulk_wait_group(1 - self.num_stages_dSt, read=True)
+                self.softmax_barrier.arrive_and_wait()
 
                 # note: dS guaranteed free as mma operand
                 pipeline_dSt.producer_acquire(producer_state_dSt)
@@ -2148,6 +2148,7 @@ class FlashAttentionSparseMLABackwardSm100:
                                 atomic_add_fp32x4(a, b, c, d, dV_gmem_ptr)
 
                     cute.arch.fence_view_async_tmem_load()
+                    self.epi_barrier.arrive_and_wait()
                     pipeline_dV.consumer_release(consumer_state_dV)
 
                     if leader_warp:
