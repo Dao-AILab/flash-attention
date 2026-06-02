@@ -349,32 +349,43 @@ def attention_ref(
     return_lse=False,
     gather_kv_indices=None,
 ):
+    assert v is not None
+    has_qk = q is not None and k is not None
+    assert has_qk or qv is not None
     if causal:
         window_size = (window_size[0], 0)
-    dtype_og = q.dtype
+    dtype_og = v.dtype
+    q_shape = q.shape if q is not None else qv.shape
     if upcast:
-        q, k, v = q.float(), k.float(), v.float()
-        qv = qv.float() if qv is not None else None
+        q, k, v, qv = [t.float() if t is not None else None for t in (q, k, v, qv)]
     if q_descale is not None:
-        q_descale = repeat(q_descale, "b h -> b 1 (h g) 1", g=q.shape[2] // k.shape[2])
-        q = (q.float() * q_descale).to(q.dtype)
-        qv = (qv.float() * q_descale).to(qv.dtype) if qv is not None else None
+        q_descale = repeat(q_descale, "b h -> b 1 (h g) 1", g=q_shape[2] // v.shape[2])
+        q, qv = [(t.float() * q_descale).to(t.dtype) if t is not None else None for t in (q, qv)]
     if k_descale is not None:
         k = (k.float() * rearrange(k_descale, "b h -> b 1 h 1")).to(dtype=k.dtype)
     if v_descale is not None:
         v = (v.float() * rearrange(v_descale, "b h -> b 1 h 1")).to(dtype=v.dtype)
-    seqlen_q, seqlen_k = q.shape[1], k.shape[1]
-    k = repeat(k, "b s h d -> b s (h g) d", g=q.shape[2] // k.shape[2])
-    v = repeat(v, "b s h d -> b s (h g) d", g=q.shape[2] // v.shape[2])
-    d = q.shape[-1]
+    seqlen_q, seqlen_k = q_shape[1], v.shape[1]
+    k, v = [
+        repeat(t, "b s h d -> b s (h g) d", g=q_shape[2] // t.shape[2]) if t is not None else None
+        for t in (k, v)
+    ]
+    d = q_shape[-1]  # == dv for qv
     dv = v.shape[-1]
-    softmax_scale = 1.0 / math.sqrt(d if qv is None else d + dv)
-    if not reorder_ops:
-        scores = torch.einsum("bthd,bshd->bhts", q * softmax_scale, k)
-    else:
-        scores = torch.einsum("bthd,bshd->bhts", q, k * softmax_scale)
+    softmax_scale = 1.0 / math.sqrt(d if qv is None or q is None else d + dv)
+    if has_qk:
+        scores = torch.einsum(
+            "bthd,bshd->bhts",
+            q if reorder_ops else q * softmax_scale,
+            k * softmax_scale if reorder_ops else k,
+        )
     if qv is not None:
-        scores = scores + torch.einsum("bthd,bshd->bhts", qv * softmax_scale, v)
+        qv_scores = torch.einsum(
+            "bthd,bshd->bhts",
+            qv if reorder_ops else qv * softmax_scale,
+            v * softmax_scale if reorder_ops else v,
+        )
+        scores = qv_scores if not has_qk else scores + qv_scores
     if softcap > 0:
         scores = torch.tanh(scores / softcap) * softcap
     if key_padding_mask is not None:
@@ -389,7 +400,7 @@ def attention_ref(
             query_padding_mask,
             key_padding_mask,
             key_leftpad=key_leftpad,
-            device=q.device,
+            device=v.device,
         )
     if attention_chunk > 0:
         chunk_mask = construct_chunk_mask(
@@ -399,13 +410,13 @@ def attention_ref(
             query_padding_mask,
             key_padding_mask,
             key_leftpad=key_leftpad,
-            device=q.device,
+            device=v.device,
         )
         local_mask = (
             torch.logical_or(local_mask, chunk_mask) if local_mask is not None else chunk_mask
         )
     if gather_kv_indices is not None:
-        batch = q.shape[0]
+        batch = q_shape[0]
         topk_len = gather_kv_indices.shape[2]
         if topk_len < seqlen_k:
             topk_index_mask = torch.full(
