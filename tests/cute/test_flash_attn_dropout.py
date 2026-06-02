@@ -64,10 +64,10 @@ def _fa2_varlen_fwd_with_rng(
 ):
     """Run FA2 varlen forward with a controlled Philox state.
 
-    Bypasses ``_flash_attn_varlen_forward`` (which appends ``num_splits``);
-    the underlying C++ ``varlen_fwd`` here takes exactly 21 positional args.
-    Returns the same ``(out, lse, S_dmask, rng_state)`` tuple the wrapper
-    would.
+    Bypasses ``_flash_attn_varlen_forward``; the underlying C++ ``varlen_fwd``
+    in the binary built from this tree takes 22 positional args, with a
+    trailing ``num_splits`` (``0`` = auto/heuristic). Returns the same
+    ``(out, lse, S_dmask, rng_state)`` tuple the wrapper would.
     """
     gen = torch.cuda.default_generators[torch.cuda.current_device()]
     gen.manual_seed(seed)
@@ -88,6 +88,7 @@ def _fa2_varlen_fwd_with_rng(
         0.0,          # softcap
         True,         # return_softmax
         None,         # generator (state is set above via gen.manual_seed)
+        0,            # num_splits (0 = auto)
     )
     return out, lse, S_dmask, rng_state
 
@@ -180,6 +181,10 @@ def _mask_match_rate_varlen(
         (2, 256, 4),
         (1, 512, 8),
         (4, 192, 4),  # B=4 with jagged lengths exercises the per-row philox math
+        (2, 1024, 4),
+        (1, 2048, 4),  # multi-tile seqlen, exercises philox tile stepping
+        (2, 4096, 2),
+        (1, 8192, 2),  # large-seqlen path; small B*H bounds the fp32 ref memory
     ],
 )
 def test_flash_attn_varlen_dropout_output(
@@ -354,7 +359,8 @@ def test_flash_attn_varlen_dropout_output(
 @requires_sm100
 @pytest.mark.parametrize("p_dropout", [0.0, 0.1, 0.25])
 @pytest.mark.parametrize("d", [64, 128])
-def test_flash_attn_varlen_dropout_kept_fraction(p_dropout, d):
+@pytest.mark.parametrize("seqlen", [512, 2048, 8192])
+def test_flash_attn_varlen_dropout_kept_fraction(seqlen, p_dropout, d):
     """Empirical kept-fraction of FA4's varlen dropout mask is close to ``1 - p``.
 
     Non-causal so every cell in the per-batch valid region is written; with
@@ -364,7 +370,7 @@ def test_flash_attn_varlen_dropout_kept_fraction(p_dropout, d):
     device = "cuda"
     torch.manual_seed(0)
     torch.cuda.manual_seed_all(0)
-    batch, seqlen, nheads = 2, 512, 8
+    batch, nheads = 2, 8
     q = torch.randn(batch, seqlen, nheads, d, device=device, dtype=torch.bfloat16)
     k = torch.randn(batch, seqlen, nheads, d, device=device, dtype=torch.bfloat16)
     v = torch.randn(batch, seqlen, nheads, d, device=device, dtype=torch.bfloat16)
