@@ -1,4 +1,4 @@
-# Copyright (c) 2026, Colfax International
+# Copyright (c) 2026, Colfax International.
 
 """
 CuTe DSL implementation of dQ+dQv gemm for DSA backward.
@@ -151,8 +151,9 @@ class dQdQvGemmKernel:
         # ------------------------------------------------------------------ #
         # Reshape GMEM layouts for static strides                            #
         # ------------------------------------------------------------------ #
-        seqlen_q = Int32(0) if const_expr(mCuSeqlensQ is not None) else mdS.shape[1]
+        seqlen_q = Int32(0) if const_expr(varlen_q) else mdS.shape[1]
         seqlen_q_divmod = FastDivmodDivisor(seqlen_q)
+        seqlen_k = Int32(0) if const_expr(varlen_k) else mV.shape[1]
 
         # ---- group batch and seqlen modes in nonvarlen case ----
         def group_batch_seqlen(t: cute.Tensor, varlen: bool) -> cute.Tensor:
@@ -422,6 +423,7 @@ class dQdQvGemmKernel:
             self.epi_tile_dQ,
             self.epi_tile_dQv,
             self.tile_sched_params,
+            seqlen_k,
         ).launch(
             grid=grid,
             block=[self.threads_per_cta, 1, 1],
@@ -457,6 +459,7 @@ class dQdQvGemmKernel:
         epi_tile_dQ: Optional[cute.Tile],
         epi_tile_dQv: cute.Tile,
         tile_sched_params: utils.ClcDynamicPersistentTileSchedulerParams,
+        seqlen_k_static: Int32,
     ):
         """
         GPU device kernel performing the Persistent batched GEMM computation.
@@ -780,6 +783,11 @@ class dQdQvGemmKernel:
                 k_batch_offset = (
                     mCuSeqlensK[batch_idx] if const_expr(mCuSeqlensK is not None) else Int32(0)
                 )
+                seqlen_k = (
+                    mCuSeqlensK[batch_idx + 1] - k_batch_offset
+                    if const_expr(mCuSeqlensK is not None)
+                    else seqlen_k_static
+                )
                 if const_expr(mCuSeqlensK is not None):
                     if const_expr(self.compute_dQ):
                         mK_cur = cute.domain_offset((0, k_batch_offset), mK)[None, None]
@@ -796,7 +804,7 @@ class dQdQvGemmKernel:
                     kv_tidx,
                     kv_warp_idx,
                     self.top_k,
-                    self.top_k,
+                    seqlen_k,
                     self.mma_tiler_dQv[2],
                     self.head_dim_k,
                     self.mma_tiler_dQv[1],
