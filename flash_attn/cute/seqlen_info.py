@@ -78,6 +78,8 @@ class SeqlenInfoQK:
     has_cu_seqlens_k: cutlass.Constexpr[bool]
     has_seqused_q: cutlass.Constexpr[bool]
     has_seqused_k: cutlass.Constexpr[bool]
+    has_chunk_size: cutlass.Constexpr[bool]
+    chunk_size: Int32
 
     @staticmethod
     def create(
@@ -92,9 +94,15 @@ class SeqlenInfoQK:
         mCuBlockIdxOffsets: Optional[cute.Tensor] = None,
         tile_m: cutlass.Constexpr[Int32] = 128,
         tile_n: cutlass.Constexpr[Int32] = 128,
+        mChunkSize: cutlass.Constexpr[cute.Tensor] = None,
     ):
         offset_q = 0 if const_expr(mCuSeqlensQ is None) else mCuSeqlensQ[batch_idx]
         offset_k = 0 if const_expr(mCuSeqlensK is None) else mCuSeqlensK[batch_idx]
+        chunk_size = (
+            -1
+            if const_expr(mChunkSize is None)
+            else mChunkSize[batch_idx]
+        )
         padded_offset_q = (
             0
             if const_expr(mCuSeqlensQ is None)
@@ -142,6 +150,8 @@ class SeqlenInfoQK:
             has_cu_seqlens_k=mCuSeqlensK is not None,
             has_seqused_q=mSeqUsedQ is not None,
             has_seqused_k=mSeqUsedK is not None,
+            has_chunk_size=mChunkSize is not None,
+            chunk_size=chunk_size,
         )
 
     def offset_batch_Q(

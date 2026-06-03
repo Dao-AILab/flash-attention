@@ -466,6 +466,7 @@ class FlashAttentionBackwardSm100:
         aux_tensors: Optional[list] = None,
         # Block-sparse tensors (Q direction - for iterating m_blocks per n_block):
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        mChunkSize: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -1001,6 +1002,7 @@ class FlashAttentionBackwardSm100:
             aux_tensors,
             fastdiv_mods,
             blocksparse_tensors,
+            mChunkSize,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -1084,6 +1086,7 @@ class FlashAttentionBackwardSm100:
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        mChunkSize: Optional[cute.Tensor] = None,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         bidx, _, _ = cute.arch.block_idx()
@@ -1418,6 +1421,7 @@ class FlashAttentionBackwardSm100:
             mCuSeqlensK=mCuSeqlensK,
             mSeqUsedQ=mSeqUsedQ,
             mSeqUsedK=mSeqUsedK,
+            mChunkSize=mChunkSize,
             tile_m=self.tile_m,
             tile_n=self.tile_n * self.cluster_shape_mnk[0],
         )
