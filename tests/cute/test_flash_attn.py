@@ -86,8 +86,8 @@ VERBOSE = True
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128])
 # @pytest.mark.parametrize("d", [64, 96, 128, 192])
 # @pytest.mark.parametrize("d", [128, 192])
-@pytest.mark.parametrize("d", [64, 96, 128, 256])
-# @pytest.mark.parametrize("d", [192])
+@pytest.mark.parametrize("d", [64, 96, 128, 192, 256])
+# @pytest.mark.parametrize("d", [128])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -493,8 +493,8 @@ def test_flash_attn_small_head_dim(seqlen_q, seqlen_k, d, causal, dtype):
 # @pytest.mark.parametrize("deterministic", [False])
 @pytest.mark.parametrize("softcap", [0.0, 15.0])
 # @pytest.mark.parametrize("softcap", [0.0])
-# @pytest.mark.parametrize("local_enum", [0, 1, 2, 3])
-@pytest.mark.parametrize("local_enum", [0])
+@pytest.mark.parametrize("local_enum", [0, 1, 2, 3])
+# @pytest.mark.parametrize("local_enum", [0])
 @pytest.mark.parametrize("causal", [False, True])
 # @pytest.mark.parametrize("causal", [False])
 # @pytest.mark.parametrize("add_unused_qkv", [False, True])
@@ -505,8 +505,8 @@ def test_flash_attn_small_head_dim(seqlen_q, seqlen_k, d, causal, dtype):
 # @pytest.mark.parametrize('d', [56, 80])
 # @pytest.mark.parametrize('d', [32, 40, 64, 80, 96, 128])
 # @pytest.mark.parametrize("d", [64, 96, 128])
-@pytest.mark.parametrize("d", [128, 192])
-# @pytest.mark.parametrize("d", [64, 128, 192, 256])
+# @pytest.mark.parametrize("d", [128, 192])
+@pytest.mark.parametrize("d", [64, 128, 192, 256])
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_k",
     [
@@ -519,13 +519,13 @@ def test_flash_attn_small_head_dim(seqlen_q, seqlen_k, d, causal, dtype):
         (128, 128),
         (256, 256),
         (113, 203),
-        # (128, 217),
-        # (113, 211),
-        # (108, 256),
-        # (256, 512),
-        # (307, 256),
-        # (640, 128),
-        # (512, 256),
+        (128, 217),
+        (113, 211),
+        (108, 256),
+        (256, 512),
+        (307, 256),
+        (640, 128),
+        (512, 256),
         (1024, 1024),
         (1023, 1024),
         (1024, 1023),
@@ -537,8 +537,8 @@ def test_flash_attn_small_head_dim(seqlen_q, seqlen_k, d, causal, dtype):
         (4224, 4224),
     ],
 )
-# @pytest.mark.parametrize("varlen_mode", ["random", "third", "full"])
-@pytest.mark.parametrize("varlen_mode", ["full"])
+@pytest.mark.parametrize("varlen_mode", ["random", "third", "full"])
+# @pytest.mark.parametrize("varlen_mode", ["full"])
 @pytest.mark.parametrize(
     "zero_lengths_q, zero_lengths_k",
     [
