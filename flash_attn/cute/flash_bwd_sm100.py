@@ -8,7 +8,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute import FastDivmodDivisor
-from cutlass import Float32, Int32, Int64, const_expr
+from cutlass import Float32, Int32, Uint32, Int64, Uint64, const_expr
 from cutlass.utils import LayoutEnum
 from cutlass.cute.nvgpu import cpasync, tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
@@ -34,7 +34,17 @@ from flash_attn.cute.tile_scheduler import (
 
 from flash_attn.cute import barrier
 from flash_attn.cute.named_barrier import NamedBarrierBwdSm100
-from flash_attn.cute.softmax import apply_score_mod_inner, apply_score_mod_bwd_inner
+from flash_attn.cute.softmax import (
+    apply_score_mod_inner,
+    apply_score_mod_bwd_inner,
+    f32_to_dropout_threshold_byte,
+    dropout_mask_to_bit,
+    dropout_bit_to_scale,
+    philox_extract_mask_bits_fa2,
+    smem_mask_store_u32,
+    smem_mask_load_u32,
+)
+from flash_attn.cute.philox import philox_unpack_seed_offset, philox_rounds
 from flash_attn.cute.block_sparsity import BlockSparseTensors
 from flash_attn.cute.block_sparse_utils import (
     get_total_q_block_count_bwd,
@@ -66,7 +76,12 @@ class FlashAttentionBackwardSm100:
         mask_mod: cutlass.Constexpr | None = None,
         has_aux_tensors: cutlass.Constexpr = False,
         subtile_factor: cutlass.Constexpr[int] = 1,
+        dropout_rate: float = 0.0,
     ):
+        self.is_dropout = dropout_rate > 0.0 and dropout_rate < 1.0
+        self.p_dropout = 1.0 - dropout_rate if self.is_dropout else 1.0
+        self.rp_dropout = 1.0 / self.p_dropout if self.is_dropout else 1.0
+
         # padding head_dim to a multiple of 16 as k_block_size
         hdim_multiple_of = 16
         self.tile_hdim = int(math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of)
@@ -137,6 +152,89 @@ class FlashAttentionBackwardSm100:
         self.shuffle_dPsum = False
         # Generally slower to use store dS in smem for dK, and doesn't work for 2cta
         self.use_smem_dS_for_mma_dK = False
+
+        # ── Dropout-bwd-only spill-reduction flags ────────────────────────────
+        # These mirror the blackstone tuning. The dropout consumer warpgroup is
+        # at the 128/136-reg budget cap and the extra long-lived state required
+        # by dropout (un-dropped P across two phases + LSE/dPsum rmem caches +
+        # tSrPdrop F32 fragment + sdS exchange fragment) pushes it into LDL/STL
+        # spill.  The flags below conditionally turn off those long-lived
+        # caches/fragments on the dropout path only (no effect when not
+        # ``is_dropout``).  See the merged exp+dropout+dS loop later in this
+        # file for details.
+        #
+        # 1. ``on_demand_lse_dpsum``:
+        #    skip the per-stage rmem cache of LSE / dPsum and read them
+        #    directly from SMEM inside the v-loops. SMEM-ld throughput is
+        #    plenty for ~32 loads / stage and ptxas pipelines the loads with
+        #    the FMA below to hide latency. Saves ~64 long-lived F32 regs in
+        #    the dropout consumer.  Hdim 192 keeps the rmem cache because its
+        #    consumer is on a different schedule.
+        self.on_demand_lse_dpsum = self.is_dropout and self.tile_hdim != 192
+        # 2. ``direct_sdS_xchg_write``:
+        #    skip the rmem-buffered exchange-stage write for ``sdS_xchg``.
+        #    The original path writes the exchange-stage dS to a register
+        #    fragment ``tdPrdS_xchg`` inside the dS loop, then SMEM-copies it
+        #    after the loop. With this flag we write directly to ``sdS_xchg``
+        #    SMEM inside the loop, removing the ~16-reg fragment. Safe for
+        #    hdim != 192 only because hdim 192 has sdQaccum overlapping with
+        #    sdS_xchg and needs the deferred mbarrier wait first.
+        self.direct_sdS_xchg_write = (
+            self.is_dropout
+            and self.use_2cta_instrs
+            and self.tile_hdim != 192
+        )
+        # 3. ``merge_exp_dropout_ds``:
+        #    fuse the two consecutive ``for stage in num_stages`` phases of the
+        #    dropout consumer:
+        #      Phase 1: P = exp(S - LSE) -> dropout(P) -> write P to TMEM
+        #      Phase 2: dP*scale - dPsum -> dS = P * dP_eff   -> write dS
+        #    into a single per-stage merged loop. The original path keeps
+        #    both stages of un-dropped P (= ``tSrS_t2r``, 64 F32 = 64 regs)
+        #    alive across both phases. Merging cuts that to a single stage
+        #    at a time (32 regs) — the biggest long-lived footprint in the
+        #    dropout consumer — and lets per-stage ``drop_bits`` stay
+        #    stage-local instead of being carried as ``drop_bits_s0`` /
+        #    ``drop_bits_s1``.  Requires ``on_demand_lse_dpsum`` and
+        #    ``direct_sdS_xchg_write`` (asserted by their definitions).
+        self.merge_exp_dropout_ds = (
+            self.is_dropout
+            and self.tile_hdim != 192
+            and self.score_mod is None
+            and self.score_mod_bwd is None
+        )
+        # 4. ``packed_dropout_fma``:
+        #    use ``mul_packed_f32x2`` for ``pdrop = S * scale`` and
+        #    ``fma_packed_f32x2`` for ``dP_eff = dP * scale - dPsum``.
+        #    Drops the non-fused FP32 op count for the dropout consumer
+        #    warpgroup from ~70M to ~1M.  Auto-gated on ``merge_exp_dropout_ds``.
+        self.packed_dropout_fma = self.merge_exp_dropout_ds
+        # 5. ``skip_drop_bits_pack``:
+        #    in the merged dropout dS-apply step, re-walk the SMEM mask instead
+        #    of carrying a single packed-bit Uint32 (``drop_bits_local``) across
+        #    the exp and dS phases. Originally gated on GQA>=2, on the theory
+        #    that the carried ``_cached_mask_word`` / ``_prev_m_local`` regs
+        #    triggered spill. Direct ptxas + latency measurement refined this:
+        #
+        #      * hdim 64/96 (GQA>=2): the re-walk path costs *more* registers
+        #        (two uncached SMEM loads + duplicated address arithmetic per
+        #        pair) and roughly doubles the local-memory spill
+        #        (hdim64/gqa2/noncausal: 144 B -> 64 B; hdim96/gqa2: 136 B
+        #        -> 64 B when disabled). Here the dropout consumer warpgroup is
+        #        on the critical path, so removing the spill is a 6-12% bwd
+        #        latency win. -> use the packed-bit path (skip = False).
+        #      * hdim 128 (GQA>=2): bwd is MMA-bound and the consumer is off the
+        #        critical path, so the (smaller) spill reduction doesn't help;
+        #        the packed-bit path's cross-phase register dependency instead
+        #        costs ~2-3% latency. -> keep the re-walk path (skip = True).
+        #
+        #    GQA=1 always stays on the packed-bit path (unchanged).
+        self.skip_drop_bits_pack = (
+            self.merge_exp_dropout_ds
+            and self.packed_dropout_fma
+            and self.qhead_per_kvhead >= 2
+            and self.tile_hdim >= 128
+        )
 
         self.reduce_warp_ids = (0, 1, 2, 3)
         self.compute_warp_ids = (4, 5, 6, 7, 8, 9, 10, 11)
@@ -252,10 +350,21 @@ class FlashAttentionBackwardSm100:
                 self.dQ_reduce_ncol = 16 if self.deterministic else 8
                 self.sdQaccum_stage = 2 if self.deterministic else 4
                 self.dQ_reduce_ncol_t2r = 32
+                # Dropout adds a 2 KiB sDropMask buffer. On GB200/SM100 the
+                # 2-CTA tile_m=128/tile_n=128 layout is at the SMEM cap, so we
+                # shrink sdQaccum by 1 stage when dropout is on to make room.
+                # The dQ-reduce pipeline still has >=1 stage of double-buffering.
+                if self.is_dropout:
+                    self.sdQaccum_stage = max(self.sdQaccum_stage - 1, 1)
             else:
                 self.dQ_reduce_ncol = 32
                 self.sdQaccum_stage = 64 // self.dQ_reduce_ncol
                 self.dQ_reduce_ncol_t2r = self.dQ_reduce_ncol
+                # Same SMEM-cap concern in the 1-CTA tile_m=128/tile_n=128 layout
+                # at head_dim=128: shrink sdQaccum by 1 stage when dropout is on
+                # so sDropMask fits.
+                if self.is_dropout:
+                    self.sdQaccum_stage = max(self.sdQaccum_stage - 1, 1)
         assert (self.tile_hdim // self.cta_group_size) % self.dQ_reduce_ncol == 0
         self.dQaccum_reduce_stage = self.tile_hdim // self.dQ_reduce_ncol
         self.dQaccum_reduce_stage_t2r = self.tile_hdim // self.dQ_reduce_ncol_t2r
@@ -466,6 +575,9 @@ class FlashAttentionBackwardSm100:
         aux_tensors: Optional[list] = None,
         # Block-sparse tensors (Q direction - for iterating m_blocks per n_block):
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        mRngState: Optional[cute.Tensor] = None,
+        rng_seed: Uint64 | int | None = None,
+        rng_offset: Uint64 | int | None = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -479,6 +591,10 @@ class FlashAttentionBackwardSm100:
         self.dk_dtype = mdK.element_type
         self.dv_dtype = mdV.element_type
         self.ds_dtype = self.q_dtype
+
+        if cutlass.const_expr(self.is_dropout):
+            if cutlass.const_expr(rng_seed is None or rng_offset is None):
+                raise RuntimeError("rng_seed and rng_offset are required when enable dropout")
 
         self.is_varlen_k = mCuSeqlensK is not None or mSeqUsedK is not None
         self.is_varlen_q = mCuSeqlensQ is not None or mSeqUsedQ is not None
@@ -769,6 +885,8 @@ class FlashAttentionBackwardSm100:
                 cute.cosize(self.sdS_xchg_layout) if const_expr(self.tile_hdim <= 128) else 0
             )
 
+            _drop_smem_size = self.tile_m * (self.tile_n // 32) if const_expr(self.is_dropout) else 0
+
             @cute.struct
             class SharedStorage:
                 Q_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.Q_stage]
@@ -845,8 +963,11 @@ class FlashAttentionBackwardSm100:
                     cute.struct.MemRange[self.dqaccum_dtype, cute.cosize(self.sdQaccum_layout)],
                     self.buffer_align_bytes if sdS_xchg_size == 0 else 128,
                 ]
+                sDropMask: cute.struct.MemRange[Int32, _drop_smem_size]
 
         else:
+
+            _drop_smem_size_1cta = self.tile_m * (self.tile_n // 32) if const_expr(self.is_dropout) else 0
 
             @cute.struct
             class SharedStorage:
@@ -900,6 +1021,7 @@ class FlashAttentionBackwardSm100:
                     cute.struct.MemRange[self.dqaccum_dtype, cute.cosize(self.sdQaccum_layout)],
                     self.buffer_align_bytes,
                 ]
+                sDropMask: cute.struct.MemRange[Int32, _drop_smem_size_1cta]
 
         self.shared_storage = SharedStorage
 
@@ -1001,6 +1123,10 @@ class FlashAttentionBackwardSm100:
             aux_tensors,
             fastdiv_mods,
             blocksparse_tensors,
+            mRngState,
+            Uint64(rng_seed) if cutlass.const_expr(self.is_dropout) else None,
+            Uint64(rng_offset) if cutlass.const_expr(self.is_dropout) else None,
+            cute.size(mQ.shape[2]) if cutlass.const_expr(self.is_dropout) else None,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -1084,6 +1210,10 @@ class FlashAttentionBackwardSm100:
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        mRngState: Optional[cute.Tensor] = None,
+        rng_seed: Uint64 | None = None,
+        rng_offset: Uint64 | None = None,
+        num_heads_q=None,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
         bidx, _, _ = cute.arch.block_idx()
@@ -1117,6 +1247,8 @@ class FlashAttentionBackwardSm100:
         # Alloc
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
+
+        sDropMask_ptr = storage.sDropMask.data_ptr() if cutlass.const_expr(self.is_dropout) else None
 
         dQ_cluster_full_mbar_ptr = storage.dQ_cluster_full_mbar_ptr.data_ptr()
         dQ_cluster_empty_mbar_ptr = storage.dQ_cluster_empty_mbar_ptr.data_ptr()
@@ -1599,6 +1731,11 @@ class FlashAttentionBackwardSm100:
                 aux_tensors,
                 fastdiv_mods,
                 blocksparse_tensors,
+                mRngState,
+                rng_seed,
+                rng_offset,
+                num_heads_q,
+                sDropMask_ptr,
             )
             tmem_alloc_barrier.arrive()
 
@@ -2860,6 +2997,11 @@ class FlashAttentionBackwardSm100:
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        mRngState: Optional[cute.Tensor] = None,
+        rng_seed: Uint64 | None = None,
+        rng_offset: Uint64 | None = None,
+        num_heads_q=None,
+        sDropMask_ptr=None,
     ):
         sLSE_2D = cute.make_tensor(
             sLSE.iterator,
@@ -3025,6 +3167,37 @@ class FlashAttentionBackwardSm100:
                 )
                 process_tile = loop_count > Int32(0)
 
+            if cutlass.const_expr(self.is_dropout):
+                base_rng_offset = rng_offset + Uint64((batch_idx * num_heads_q + head_idx) * 32)
+                key_x_bwd, key_y_bwd, base_ctr_x_bwd, ctr_y_bwd = philox_unpack_seed_offset(rng_seed, base_rng_offset)
+                p_dropout_8bit = f32_to_dropout_threshold_byte(self.p_dropout)
+                rp_dropout_val = Float32(self.rp_dropout)
+
+            mask_n_words = self.tile_n // 32
+            num_threads_compute = len(self.compute_warp_ids) * cute.arch.WARP_SIZE
+            num_row_pairs = (self.tile_m // 16) * 8
+            total_pair_cols = num_row_pairs * mask_n_words
+            pair_cols_per_thread = max(total_pair_cols // num_threads_compute, 1)
+            active_threads_for_pairs = total_pair_cols // pair_cols_per_thread
+
+            if cutlass.const_expr(self.is_dropout):
+                # For 2-CTA, the S MMA is cluster-wide (cluster_M = cta_group * tile_n).
+                # partition_C distributes those cluster-wide n-coords to each CTA's
+                # threads; CTA 0 sees n in [0, tile_n) and CTA 1 sees n in [tile_n,
+                # 2*tile_n). We then subtract the per-CTA n-base when indexing into
+                # sDropMask so each CTA's mask is keyed by its own local n in
+                # [0, tile_n).
+                _drop_cS_local = cute.make_identity_tensor(
+                    (self.cta_group_size * self.tile_n, self.tile_m)
+                )
+                _drop_tScS_local = thr_mma_S.partition_C(_drop_cS_local)
+                _drop_tScS_idx_local = thr_copy_t2r.partition_D(_drop_tScS_local)
+                _drop_n_base = (
+                    cta_rank_in_cluster * Int32(self.tile_n)
+                    if const_expr(self.use_2cta_instrs)
+                    else Int32(0)
+                )
+
             # Mainloop
             # Block sparsity: iterate over sparse m_block count and derive actual m_block
             # from Q_IDX/FULL_Q_IDX tensors. Dense: iterate m_block_min..m_block_max directly.
@@ -3043,11 +3216,58 @@ class FlashAttentionBackwardSm100:
                         m_block_max=m_block_max,
                     )
                     m_block_oob = m_block >= m_block_max
+
+                if cutlass.const_expr(self.is_dropout):
+                    m_block_start = m_block * self.tile_m
+                    n_base_col = n_block * self.tile_n
+                    if cutlass.const_expr(active_threads_for_pairs < num_threads_compute):
+                        _do_pair_mask = tidx < active_threads_for_pairs
+                    else:
+                        _do_pair_mask = True
+                    if _do_pair_mask:
+                        for wp in cutlass.range_constexpr(pair_cols_per_thread):
+                            pc_idx = tidx + wp * active_threads_for_pairs
+                            pair_idx = pc_idx // mask_n_words
+                            word_col_wp = pc_idx % mask_n_words
+                            m_local_row0 = (pair_idx // 8) * 16 + (pair_idx % 8)
+                            m_local_row8 = m_local_row0 + 8
+                            m_global_row0 = m_block_start + m_local_row0
+                            fa2_row_arg = Uint32(m_global_row0 // 16)
+                            fa2_base_lane = Uint32((m_global_row0 % 8) * 4)
+                            fa2_col_arg = Uint32(n_base_col // 32 + word_col_wp)
+                            mask_word_r0 = Uint32(0)
+                            mask_word_r8 = Uint32(0)
+                            for sub_lane in cutlass.range_constexpr(4):
+                                ctr_x_sl = base_ctr_x_bwd + fa2_base_lane + Uint32(sub_lane)
+                                r0, r1, r2, r3 = philox_rounds(
+                                    key_x_bwd, key_y_bwd, ctr_x_sl, ctr_y_bwd,
+                                    fa2_row_arg, fa2_col_arg,
+                                )
+                                bits_r0 = philox_extract_mask_bits_fa2(
+                                    r0, r1, r2, r3, p_dropout_8bit,
+                                    Uint32(0), Uint32(sub_lane),
+                                )
+                                bits_r8 = philox_extract_mask_bits_fa2(
+                                    r0, r1, r2, r3, p_dropout_8bit,
+                                    Uint32(2), Uint32(sub_lane),
+                                )
+                                mask_word_r0 = mask_word_r0 | bits_r0
+                                mask_word_r8 = mask_word_r8 | bits_r8
+                            smem_off_r0 = Int32(m_local_row0 * mask_n_words + word_col_wp)
+                            smem_off_r8 = Int32(m_local_row8 * mask_n_words + word_col_wp)
+                            smem_mask_store_u32(sDropMask_ptr, smem_off_r0, mask_word_r0)
+                            smem_mask_store_u32(sDropMask_ptr, smem_off_r8, mask_word_r8)
+
+                    self.compute_sync_barrier.arrive_and_wait()
+                    drop_bits_s0 = Uint32(0)
+                    drop_bits_s1 = Uint32(0)
+
                 # Prefetch 1 stage of LSE
                 pipeline_LSE.consumer_wait(consumer_state_LSE)
-                tSrLSE_s2r = cute.make_rmem_tensor(tScS_t2r[None, 0, 0, 0].shape, Float32)
-                if const_expr(prefetch_LSE and not self.shuffle_LSE):
-                    cute.autovec_copy(tSsLSE[None, 0, 0, 0, consumer_state_LSE.index], tSrLSE_s2r)
+                if const_expr(not self.on_demand_lse_dpsum):
+                    tSrLSE_s2r = cute.make_rmem_tensor(tScS_t2r[None, 0, 0, 0].shape, Float32)
+                    if const_expr(prefetch_LSE and not self.shuffle_LSE):
+                        cute.autovec_copy(tSsLSE[None, 0, 0, 0, consumer_state_LSE.index], tSrLSE_s2r)
 
                 pipeline_S_P.consumer_wait(consumer_state_S_P_dP)
                 # pipeline_S_P.sync_object_full.wait(0, consumer_phase_S_P_dP)
@@ -3105,171 +3325,485 @@ class FlashAttentionBackwardSm100:
                 lane_idx = cute.arch.lane_idx()
                 tSrP_r2t_f32 = cute.make_rmem_tensor(tScP_r2t.shape, Float32)  # 64
                 tSrP_r2t = cute.recast_tensor(tSrP_r2t_f32, self.q_dtype)
-                for stage in cutlass.range_constexpr(num_stages):
-                    tSrS_cur = tSrS_t2r[None, stage, 0, 0]
-                    tSsLSE_cur = tSsLSE[None, stage, 0, 0, consumer_state_LSE.index]
-                    if const_expr(not self.shuffle_LSE):
-                        if const_expr(stage > 0 or not prefetch_LSE):
-                            cute.autovec_copy(tSsLSE_cur, tSrLSE_s2r)
-                        tSrLSE = tSrLSE_s2r
-                    else:
-                        tSrLSE = tSsLSE_cur[lane_idx]
-                    for v in cutlass.range_constexpr(cute.size(tSrS_t2r, mode=[0]) // 2):
-                        if const_expr(not self.shuffle_LSE):
-                            lse_pair = (tSrLSE[2 * v], tSrLSE[2 * v + 1])
+                if const_expr(not self.merge_exp_dropout_ds):
+                    # ====================================================================
+                    # ORIGINAL TWO-PHASE PATH
+                    # Phase 1: P = exp(S - LSE) -> dropout -> write P to TMEM
+                    # Phase 2: dP*scale - dPsum -> dS = P*(dP_eff-dPsum) -> write dS
+                    # Used when dropout is off OR merge constraints don't hold
+                    # (hdim 192 / score_mod present).
+                    # ====================================================================
+                    for stage in cutlass.range_constexpr(num_stages):
+                        tSrS_cur = tSrS_t2r[None, stage, 0, 0]
+                        tSsLSE_cur = tSsLSE[None, stage, 0, 0, consumer_state_LSE.index]
+                        if const_expr(self.on_demand_lse_dpsum):
+                            # Dropout-path: skip the rmem cache; the v-loop below
+                            # reads LSE directly from SMEM. Saves ~32 long-lived
+                            # F32 regs per stage on the dropout consumer.
+                            pass
+                        elif const_expr(not self.shuffle_LSE):
+                            if const_expr(stage > 0 or not prefetch_LSE):
+                                cute.autovec_copy(tSsLSE_cur, tSrLSE_s2r)
+                            tSrLSE = tSrLSE_s2r
                         else:
-                            lse_pair = (
-                                utils.shuffle_sync(tSrLSE, offset=2 * v),
-                                utils.shuffle_sync(tSrLSE, offset=2 * v + 1),
+                            tSrLSE = tSsLSE_cur[lane_idx]
+                        for v in cutlass.range_constexpr(cute.size(tSrS_t2r, mode=[0]) // 2):
+                            if const_expr(self.on_demand_lse_dpsum):
+                                # SMEM ld each pair: ptxas pipelines the loads with
+                                # the FMA below to hide latency, no rmem cache held.
+                                lse_pair = (tSsLSE_cur[2 * v], tSsLSE_cur[2 * v + 1])
+                            elif const_expr(not self.shuffle_LSE):
+                                lse_pair = (tSrLSE[2 * v], tSrLSE[2 * v + 1])
+                            else:
+                                lse_pair = (
+                                    utils.shuffle_sync(tSrLSE, offset=2 * v),
+                                    utils.shuffle_sync(tSrLSE, offset=2 * v + 1),
+                                )
+                            tSrS_cur[2 * v], tSrS_cur[2 * v + 1] = cute.arch.fma_packed_f32x2(
+                                ((tSrS_cur[2 * v], tSrS_cur[2 * v + 1])),
+                                (softmax_scale_log2, softmax_scale_log2),
+                                (-lse_pair[0], -lse_pair[1]),
                             )
-                        tSrS_cur[2 * v], tSrS_cur[2 * v + 1] = cute.arch.fma_packed_f32x2(
-                            ((tSrS_cur[2 * v], tSrS_cur[2 * v + 1])),
-                            (softmax_scale_log2, softmax_scale_log2),
-                            (-lse_pair[0], -lse_pair[1]),
+                            tSrS_cur[2 * v] = cute.math.exp2(tSrS_cur[2 * v], fastmath=True)
+                            tSrS_cur[2 * v + 1] = cute.math.exp2(tSrS_cur[2 * v + 1], fastmath=True)
+
+                        if cutlass.const_expr(self.is_dropout):
+                            # Pair-based dropout + F32->BF16 fused into the same
+                            # i-loop. We avoid materialising a separate F32
+                            # ``tSrPdrop`` fragment (which used to live for the full
+                            # unrolled loop alongside ``tSrS_cur``, costing ~256 B
+                            # per thread of register pressure and pushing the
+                            # compute warpgroup over 128 regs -> ~218 LDL/STL spill
+                            # ops in the hot region in SASS). ``tSrS_cur`` (= un-
+                            # dropped P) MUST stay un-mutated because dS =
+                            # P*(dP_eff-dPsum) later reads it.
+                            num_drop_elems = cute.size(tSrS_cur)
+                            _drop_cur = _drop_tScS_idx_local[None, stage, 0, 0]
+                            # Cluster-wide n -> per-CTA-local n by subtracting n-base.
+                            _n_local_0 = Uint32(Int32(_drop_cur[0][0]) - _drop_n_base)
+                            _mask_word_col = Int32(_n_local_0 // Uint32(32))
+                            _mask_bit_pos = Uint32(_n_local_0 % Uint32(32))
+
+                            # Recast destination BF16 fragment as packed Int32 so
+                            # we can write 2 BF16 elements per cvt_f16x2_f32 call.
+                            tSrP_r2t_i32 = cute.recast_tensor(
+                                tSrP_r2t[None, stage, 0, 0], cutlass.Int32
+                            )
+
+                            _prev_m_local = Int32(-1)
+                            _cached_mask_word = Uint32(0)
+                            drop_bits = Uint32(0)
+                            for i in cutlass.range(num_drop_elems // 2, unroll_full=True):
+                                _m_local_a = Int32(_drop_cur[2 * i][1])
+                                if _m_local_a != _prev_m_local:
+                                    _smem_off_a = _m_local_a * Int32(mask_n_words) + _mask_word_col
+                                    _cached_mask_word = smem_mask_load_u32(
+                                        sDropMask_ptr, _smem_off_a
+                                    )
+                                    _prev_m_local = _m_local_a
+                                scale_a = dropout_bit_to_scale(
+                                    _cached_mask_word, _mask_bit_pos, rp_dropout_val
+                                )
+                                drop_bits = dropout_mask_to_bit(
+                                    scale_a, Uint32(2 * i), drop_bits
+                                )
+                                pdrop_a = tSrS_cur[2 * i] * scale_a
+
+                                _m_local_b = Int32(_drop_cur[2 * i + 1][1])
+                                if _m_local_b != _prev_m_local:
+                                    _smem_off_b = _m_local_b * Int32(mask_n_words) + _mask_word_col
+                                    _cached_mask_word = smem_mask_load_u32(
+                                        sDropMask_ptr, _smem_off_b
+                                    )
+                                    _prev_m_local = _m_local_b
+                                scale_b = dropout_bit_to_scale(
+                                    _cached_mask_word, _mask_bit_pos, rp_dropout_val
+                                )
+                                drop_bits = dropout_mask_to_bit(
+                                    scale_b, Uint32(2 * i + 1), drop_bits
+                                )
+                                pdrop_b = tSrS_cur[2 * i + 1] * scale_b
+
+                                # Pair-pack F32 -> BF16 and write directly to
+                                # the TMEM-bound BF16 buffer (i32 holds 2 BF16).
+                                tSrP_r2t_i32[i] = utils.cvt_f16x2_f32(
+                                    pdrop_a, pdrop_b, cutlass.BFloat16
+                                )
+
+                            if const_expr(stage == 0):
+                                drop_bits_s0 = drop_bits
+                            else:
+                                drop_bits_s1 = drop_bits
+                        else:
+                            utils.cvt_f16(tSrS_cur, tSrP_r2t[None, stage, 0, 0])
+                        if const_expr(stage == 0):
+                            cute.arch.fence_view_async_tmem_load()
+                            # Without this barrier, we could have 1 warp writing to P in tmem while
+                            # another warp is still reading S from tmem.
+                            self.compute_sync_barrier.arrive_and_wait()
+                        cute.copy(
+                            thr_copy_r2t,
+                            tSrP_r2t_f32[None, stage, None, None],
+                            tStP_r2t[None, stage, None, None],
                         )
-                        tSrS_cur[2 * v] = cute.math.exp2(tSrS_cur[2 * v], fastmath=True)
-                        tSrS_cur[2 * v + 1] = cute.math.exp2(tSrS_cur[2 * v + 1], fastmath=True)
-                    utils.cvt_f16(tSrS_cur, tSrP_r2t[None, stage, 0, 0])
-                    if const_expr(stage == 0):
-                        cute.arch.fence_view_async_tmem_load()
-                        # Without this barrier, we could have 1 warp writing to P in tmem while
-                        # another warp is still reading S from tmem.
-                        self.compute_sync_barrier.arrive_and_wait()
-                    cute.copy(
-                        thr_copy_r2t,
-                        tSrP_r2t_f32[None, stage, None, None],
-                        tStP_r2t[None, stage, None, None],
-                    )
 
-                cute.arch.fence_view_async_tmem_store()
-                cute.arch.fence_view_async_shared()
-                self.compute_sync_barrier.arrive_and_wait()
-                if const_expr(not self.tile_hdim == 192):
-                    # Signal tmem store P completion with pipeline_S_P
-                    with cute.arch.elect_one():
-                        pipeline_S_P.consumer_release(consumer_state_S_P_dP)
-                        # pipeline_S_P.sync_object_empty.arrive(0, pipeline_S_P.consumer_mask)
-                # Normally we'd need syncwarp here since only 1 thread will signal in
-                # consumer_release, but we already have the self.compute_sync_barrier before this
-                pipeline_LSE.consumer_release(consumer_state_LSE)
-                consumer_state_LSE.advance()
-                # ---------------------------------------------
-                # dS.T = P.T * (dP.T - D)
-                # ---------------------------------------------
-                pipeline_dPsum.consumer_wait(consumer_state_dPsum)
-                pipeline_dP.consumer_wait(consumer_state_S_P_dP)
-                # pipeline_dP.sync_object_full.wait(0, consumer_phase_S_P_dP)
-                ### Now delayed to after loop
-                # consumer_state_S_P_dP.advance()
-                # consumer_phase_S_P_dP ^= 1
-
-                ##### dS.T = P.T * (dP.T - Psum)
-                for stage in cutlass.range_constexpr(num_stages):
-                    tdPrdP_t2r = cute.make_rmem_tensor(tScS_t2r[None, 0, None, None].shape, Float32)
-                    cute.copy(thr_copy_t2r, tdPtdP_t2r[None, stage, None, None], tdPrdP_t2r)
-                    cute.arch.fence_view_async_tmem_load()
+                    cute.arch.fence_view_async_tmem_store()
+                    cute.arch.fence_view_async_shared()
                     self.compute_sync_barrier.arrive_and_wait()
-                    tdPrdP_cur = tdPrdP_t2r[None, 0, 0]
-                    tSrS_cur = tSrS_t2r[None, stage, 0, 0]
-                    tSsdPsum_cur = tSsdPsum[None, stage, 0, 0, consumer_state_dPsum.index]
-                    if const_expr(not self.shuffle_dPsum):
-                        tSrdPsum = cute.make_fragment_like(tSsdPsum_cur, Float32)
-                        cute.autovec_copy(tSsdPsum_cur, tSrdPsum)
-                    else:
-                        tSrdPsum = tSsdPsum_cur[lane_idx]
-                    for v in cutlass.range_constexpr(cute.size(tdPrdP_t2r, mode=[0]) // 2):
-                        if const_expr(not self.shuffle_dPsum):
-                            dPsum_pair = (tSrdPsum[2 * v], tSrdPsum[2 * v + 1])
+                    if const_expr(not self.tile_hdim == 192):
+                        # Signal tmem store P completion with pipeline_S_P
+                        with cute.arch.elect_one():
+                            pipeline_S_P.consumer_release(consumer_state_S_P_dP)
+                            # pipeline_S_P.sync_object_empty.arrive(0, pipeline_S_P.consumer_mask)
+                    # Normally we'd need syncwarp here since only 1 thread will signal in
+                    # consumer_release, but we already have the self.compute_sync_barrier before this
+                    pipeline_LSE.consumer_release(consumer_state_LSE)
+                    consumer_state_LSE.advance()
+                    # ---------------------------------------------
+                    # dS.T = P.T * (dP.T - D)
+                    # ---------------------------------------------
+                    pipeline_dPsum.consumer_wait(consumer_state_dPsum)
+                    pipeline_dP.consumer_wait(consumer_state_S_P_dP)
+                    # pipeline_dP.sync_object_full.wait(0, consumer_phase_S_P_dP)
+                    ### Now delayed to after loop
+                    # consumer_state_S_P_dP.advance()
+                    # consumer_phase_S_P_dP ^= 1
+
+                    ##### dS.T = P.T * (dP.T - Psum)
+                    for stage in cutlass.range_constexpr(num_stages):
+                        tdPrdP_t2r = cute.make_rmem_tensor(tScS_t2r[None, 0, None, None].shape, Float32)
+                        cute.copy(thr_copy_t2r, tdPtdP_t2r[None, stage, None, None], tdPrdP_t2r)
+                        cute.arch.fence_view_async_tmem_load()
+                        self.compute_sync_barrier.arrive_and_wait()
+                        tdPrdP_cur = tdPrdP_t2r[None, 0, 0]
+                        tSrS_cur = tSrS_t2r[None, stage, 0, 0]
+                        tSsdPsum_cur = tSsdPsum[None, stage, 0, 0, consumer_state_dPsum.index]
+                        if const_expr(self.on_demand_lse_dpsum):
+                            # Dropout-path: read dPsum directly from SMEM in the
+                            # v-loop below. No rmem cache held.
+                            pass
+                        elif const_expr(not self.shuffle_dPsum):
+                            tSrdPsum = cute.make_fragment_like(tSsdPsum_cur, Float32)
+                            cute.autovec_copy(tSsdPsum_cur, tSrdPsum)
                         else:
-                            dPsum_pair = (
-                                utils.shuffle_sync(tSrdPsum, offset=2 * v),
-                                utils.shuffle_sync(tSrdPsum, offset=2 * v + 1),
-                            )
-                        tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1] = (
-                            quack.activation.sub_packed_f32x2(
-                                (tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1]), dPsum_pair
-                            )
-                        )
-                        tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1] = cute.arch.mul_packed_f32x2(
-                            (tSrS_cur[2 * v], tSrS_cur[2 * v + 1]),
-                            (tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1]),
-                        )
+                            tSrdPsum = tSsdPsum_cur[lane_idx]
 
-                    if const_expr(self.score_mod_bwd is not None):
-                        tSrS_pre_cur = tSrS_pre[None, stage, 0, 0]
-                        cS_bwd = cute.make_identity_tensor((self.tile_n, self.tile_m))
-                        cS_bwd = cute.domain_offset(
-                            (n_block * self.tile_n, m_block * self.tile_m), cS_bwd
-                        )
-                        tScS_bwd = thr_mma_S.partition_C(cS_bwd)
-                        tScS_idx_bwd = thr_copy_t2r.partition_D(tScS_bwd)
-                        tScS_idx_cur = tScS_idx_bwd[None, stage, 0, 0]
-                        self.apply_score_mod_bwd(
-                            tdPrdP_cur,
-                            tSrS_pre_cur,
-                            tScS_idx_cur,
-                            batch_idx,
-                            head_idx,
-                            softmax_scale,
-                            seqlen,
-                            aux_tensors,
-                            fastdiv_mods,
-                        )
-                        # Zero out OOB positions (kv_idx >= seqlen_k) after score_mod_bwd
-                        for i in cutlass.range(cute.size(tdPrdP_cur), unroll_full=True):
-                            kv_idx = tScS_idx_cur[i][0]
-                            tdPrdP_cur[i] = 0.0 if kv_idx >= seqlen.seqlen_k else tdPrdP_cur[i]
+                        if cutlass.const_expr(self.is_dropout):
+                            drop_bits_ds = drop_bits_s0 if const_expr(stage == 0) else drop_bits_s1
+                            for i in cutlass.range(cute.size(tdPrdP_cur), unroll_full=True):
+                                drop_scale_ds = dropout_bit_to_scale(drop_bits_ds, Uint32(i), rp_dropout_val)
+                                tdPrdP_cur[i] = tdPrdP_cur[i] * drop_scale_ds
 
-                    tdPrdS_cvt = cute.make_fragment_like(tdPrdP_cur, self.ds_dtype)
-                    utils.cvt_f16(tdPrdP_cur, tdPrdS_cvt)
-                    if const_expr(stage == 0):
-                        pipeline_dS.producer_acquire(producer_state_dS)
+                        for v in cutlass.range_constexpr(cute.size(tdPrdP_t2r, mode=[0]) // 2):
+                            if const_expr(self.on_demand_lse_dpsum):
+                                dPsum_pair = (tSsdPsum_cur[2 * v], tSsdPsum_cur[2 * v + 1])
+                            elif const_expr(not self.shuffle_dPsum):
+                                dPsum_pair = (tSrdPsum[2 * v], tSrdPsum[2 * v + 1])
+                            else:
+                                dPsum_pair = (
+                                    utils.shuffle_sync(tSrdPsum, offset=2 * v),
+                                    utils.shuffle_sync(tSrdPsum, offset=2 * v + 1),
+                                )
+                            tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1] = (
+                                quack.activation.sub_packed_f32x2(
+                                    (tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1]), dPsum_pair
+                                )
+                            )
+                            tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1] = cute.arch.mul_packed_f32x2(
+                                (tSrS_cur[2 * v], tSrS_cur[2 * v + 1]),
+                                (tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1]),
+                            )
+
+                        if const_expr(self.score_mod_bwd is not None):
+                            tSrS_pre_cur = tSrS_pre[None, stage, 0, 0]
+                            cS_bwd = cute.make_identity_tensor((self.tile_n, self.tile_m))
+                            cS_bwd = cute.domain_offset(
+                                (n_block * self.tile_n, m_block * self.tile_m), cS_bwd
+                            )
+                            tScS_bwd = thr_mma_S.partition_C(cS_bwd)
+                            tScS_idx_bwd = thr_copy_t2r.partition_D(tScS_bwd)
+                            tScS_idx_cur = tScS_idx_bwd[None, stage, 0, 0]
+                            self.apply_score_mod_bwd(
+                                tdPrdP_cur,
+                                tSrS_pre_cur,
+                                tScS_idx_cur,
+                                batch_idx,
+                                head_idx,
+                                softmax_scale,
+                                seqlen,
+                                aux_tensors,
+                                fastdiv_mods,
+                            )
+                            # Zero out OOB positions (kv_idx >= seqlen_k) after score_mod_bwd
+                            for i in cutlass.range(cute.size(tdPrdP_cur), unroll_full=True):
+                                kv_idx = tScS_idx_cur[i][0]
+                                tdPrdP_cur[i] = 0.0 if kv_idx >= seqlen.seqlen_k else tdPrdP_cur[i]
+
+                        tdPrdS_cvt = cute.make_fragment_like(tdPrdP_cur, self.ds_dtype)
+                        utils.cvt_f16(tdPrdP_cur, tdPrdS_cvt)
+                        if const_expr(stage == 0):
+                            pipeline_dS.producer_acquire(producer_state_dS)
+                            if const_expr(self.use_2cta_instrs and not self.direct_sdS_xchg_write):
+                                tdPrdS_xchg = cute.make_fragment_like(tdPrdS_cvt, self.ds_dtype)
+
+                        # RMEM->TMEM: always write to TMEM for MMA
+                        if const_expr(not self.use_smem_dS_for_mma_dK or self.use_2cta_instrs):
+                            tdPrdS_r2t_f32 = cute.recast_tensor(tdPrdS_cvt, Float32)
+                            cute.copy(thr_copy_r2t, tdPrdS_r2t_f32, tdPtdS_r2t[None, stage, 0, 0])
+
+                        # RMEM->SMEM: For 2-CTA, keep exchange stage in registers, write non-exchange to sdS
                         if const_expr(self.use_2cta_instrs):
-                            tdPrdS_xchg = cute.make_fragment_like(tdPrdS_cvt, self.ds_dtype)
+                            if exchange_stage == stage:
+                                if const_expr(self.direct_sdS_xchg_write):
+                                    # Direct write to sdS_xchg SMEM, no rmem buffer.
+                                    # hdim != 192 so sdS_xchg does not overlap sdQaccum
+                                    # and no mbarrier_wait is required.
+                                    cute.autovec_copy(tdPrdS_cvt, tRS_sdS_xchg[None, 0])
+                                else:
+                                    cute.autovec_copy(tdPrdS_cvt, tdPrdS_xchg)
+                            else:
+                                cute.autovec_copy(tdPrdS_cvt, tRS_sdS[None, stage])
+                        else:
+                            cute.autovec_copy(tdPrdS_cvt, tRS_sdS[None, stage])
 
-                    # RMEM->TMEM: always write to TMEM for MMA
-                    if const_expr(not self.use_smem_dS_for_mma_dK or self.use_2cta_instrs):
+                    if const_expr(not self.use_smem_dS_for_mma_dK):
+                        cute.arch.fence_view_async_tmem_store()
+
+                    if const_expr(self.use_2cta_instrs):
+                        # use pipeline_dP to signal tmem store of dS
+                        with cute.arch.elect_one():
+                            pipeline_dP.consumer_release(consumer_state_S_P_dP)
+                    consumer_state_S_P_dP.advance()
+
+                    # After the loop: copy exchange registers to sdS_xchg buffer
+                    # (skipped under direct_sdS_xchg_write, which already wrote
+                    # straight to SMEM inside the loop).
+                    if const_expr(self.use_2cta_instrs and not self.direct_sdS_xchg_write):
+                        # when hdim 192, sdQaccum overlapped with sdS_xchg
+                        if const_expr(self.tile_hdim == 192):
+                            cute.arch.mbarrier_wait(
+                                dQaccum_empty_mbar_ptr, phase=producer_state_dS.phase
+                            )
+                        cute.autovec_copy(tdPrdS_xchg, tRS_sdS_xchg[None, 0])
+
+                    cute.arch.fence_view_async_shared()
+                    self.compute_sync_barrier.arrive_and_wait()
+                    # Normally we'd need syncwarp here since only 1 thread will signal in
+                    # consumer_release, but we already have the self.compute_sync_barrier before this
+                    pipeline_dPsum.consumer_release(consumer_state_dPsum)
+                    consumer_state_dPsum.advance()
+                    # when 2cta hdim 128, pipeline_dS also signals S tmem load completion so is deferred
+                    if const_expr(not (self.use_2cta_instrs and self.tile_hdim == 128)):
+                        with cute.arch.elect_one():
+                            pipeline_dS.producer_commit(producer_state_dS)
+                        producer_state_dS.advance()
+                else:
+                    # ====================================================================
+                    # MERGED PATH: per-stage exp + dropout + dS in one fused loop
+                    # tSrS_t2r is allocated as 64 F32 (2 stages) but each stage's
+                    # half is dead by the time the next stage begins, so ptxas
+                    # can reuse register slots between stages. Combined with the
+                    # per-stage drop_bits (no s0/s1 carry across phases), this
+                    # is the biggest reduction in long-lived register footprint
+                    # in the dropout consumer.
+                    # ====================================================================
+                    pipeline_dPsum.consumer_wait(consumer_state_dPsum)
+                    pipeline_dP.consumer_wait(consumer_state_S_P_dP)
+
+                    for stage in cutlass.range_constexpr(num_stages):
+                        tSrS_cur = tSrS_t2r[None, stage, 0, 0]
+                        tSsLSE_cur = tSsLSE[None, stage, 0, 0, consumer_state_LSE.index]
+                        tSsdPsum_cur = tSsdPsum[None, stage, 0, 0, consumer_state_dPsum.index]
+
+                        # === EXP: P = exp((S - LSE) * scale) ===
+                        for v in cutlass.range_constexpr(cute.size(tSrS_t2r, mode=[0]) // 2):
+                            lse_pair = (tSsLSE_cur[2 * v], tSsLSE_cur[2 * v + 1])
+                            tSrS_cur[2 * v], tSrS_cur[2 * v + 1] = cute.arch.fma_packed_f32x2(
+                                ((tSrS_cur[2 * v], tSrS_cur[2 * v + 1])),
+                                (softmax_scale_log2, softmax_scale_log2),
+                                (-lse_pair[0], -lse_pair[1]),
+                            )
+                            tSrS_cur[2 * v] = cute.math.exp2(tSrS_cur[2 * v], fastmath=True)
+                            tSrS_cur[2 * v + 1] = cute.math.exp2(tSrS_cur[2 * v + 1], fastmath=True)
+
+                        # === DROPOUT (per-stage drop_bits, NO carry to next stage) ===
+                        # tSrS_cur (= un-dropped P) MUST stay un-mutated because dS
+                        # = P*(dP_eff-dPsum) reads it below in this same stage.
+                        # Keep per-stage mask state bit-packed to avoid a long-lived
+                        # F32 scale fragment.
+                        drop_bits_local = Uint32(0)
+                        num_drop_elems = cute.size(tSrS_cur)
+                        _drop_cur = _drop_tScS_idx_local[None, stage, 0, 0]
+                        _n_local_0 = Uint32(Int32(_drop_cur[0][0]) - _drop_n_base)
+                        _mask_word_col = Int32(_n_local_0 // Uint32(32))
+                        _mask_bit_pos = Uint32(_n_local_0 % Uint32(32))
+
+                        tSrP_r2t_i32 = cute.recast_tensor(
+                            tSrP_r2t[None, stage, 0, 0], cutlass.Int32
+                        )
+
+                        _prev_m_local = Int32(-1)
+                        _cached_mask_word = Uint32(0)
+                        for i in cutlass.range(num_drop_elems // 2, unroll_full=True):
+                            _m_local_a = Int32(_drop_cur[2 * i][1])
+                            if _m_local_a != _prev_m_local:
+                                _smem_off_a = _m_local_a * Int32(mask_n_words) + _mask_word_col
+                                _cached_mask_word = smem_mask_load_u32(
+                                    sDropMask_ptr, _smem_off_a
+                                )
+                                _prev_m_local = _m_local_a
+                            scale_a = dropout_bit_to_scale(
+                                _cached_mask_word, _mask_bit_pos, rp_dropout_val
+                            )
+                            if const_expr(not self.skip_drop_bits_pack):
+                                drop_bits_local = dropout_mask_to_bit(
+                                    scale_a, Uint32(2 * i), drop_bits_local
+                                )
+
+                            _m_local_b = Int32(_drop_cur[2 * i + 1][1])
+                            if _m_local_b != _prev_m_local:
+                                _smem_off_b = _m_local_b * Int32(mask_n_words) + _mask_word_col
+                                _cached_mask_word = smem_mask_load_u32(
+                                    sDropMask_ptr, _smem_off_b
+                                )
+                                _prev_m_local = _m_local_b
+                            scale_b = dropout_bit_to_scale(
+                                _cached_mask_word, _mask_bit_pos, rp_dropout_val
+                            )
+                            if const_expr(not self.skip_drop_bits_pack):
+                                drop_bits_local = dropout_mask_to_bit(
+                                    scale_b, Uint32(2 * i + 1), drop_bits_local
+                                )
+
+                            # pdrop = S * scale. Packed_f32x2 form eliminates
+                            # the unfused scalar muls (70M -> 1M).
+                            pdrop_a, pdrop_b = cute.arch.mul_packed_f32x2(
+                                (tSrS_cur[2 * i], tSrS_cur[2 * i + 1]),
+                                (scale_a, scale_b),
+                            )
+
+                            tSrP_r2t_i32[i] = utils.cvt_f16x2_f32(
+                                pdrop_a, pdrop_b, cutlass.BFloat16
+                            )
+
+                        # === Stage 0: barrier between read S TMEM and write P TMEM ===
+                        if const_expr(stage == 0):
+                            cute.arch.fence_view_async_tmem_load()
+                            self.compute_sync_barrier.arrive_and_wait()
+
+                        # === Write P -> TMEM ===
+                        cute.copy(
+                            thr_copy_r2t,
+                            tSrP_r2t_f32[None, stage, None, None],
+                            tStP_r2t[None, stage, None, None],
+                        )
+
+                        # === Last stage: signal P TMEM done so MMA WG can start dV early ===
+                        if const_expr(stage == num_stages - 1):
+                            cute.arch.fence_view_async_tmem_store()
+                            cute.arch.fence_view_async_shared()
+                            self.compute_sync_barrier.arrive_and_wait()
+                            if const_expr(not self.tile_hdim == 192):
+                                with cute.arch.elect_one():
+                                    pipeline_S_P.consumer_release(consumer_state_S_P_dP)
+                            pipeline_LSE.consumer_release(consumer_state_LSE)
+                            consumer_state_LSE.advance()
+
+                        # === Load dP[stage] from TMEM ===
+                        tdPrdP_t2r = cute.make_fragment(tScS_t2r[None, 0, None, None].shape, Float32)
+                        cute.copy(thr_copy_t2r, tdPtdP_t2r[None, stage, None, None], tdPrdP_t2r)
+                        cute.arch.fence_view_async_tmem_load()
+                        self.compute_sync_barrier.arrive_and_wait()
+                        tdPrdP_cur = tdPrdP_t2r[None, 0, 0]
+
+                        # === dP_eff = dP * scale - dPsum (packed FFMA);
+                        #     dS    = P * dP_eff         (packed mul) ===
+                        for v in cutlass.range_constexpr(cute.size(tdPrdP_t2r, mode=[0]) // 2):
+                            dPsum_pair = (tSsdPsum_cur[2 * v], tSsdPsum_cur[2 * v + 1])
+                            if const_expr(self.skip_drop_bits_pack):
+                                # GQA path: re-walk SMEM mask (L1 hit) instead
+                                # of carrying packed bits across phases. Adds
+                                # 16 LDS per stage but avoids the persistent
+                                # _cached_mask_word_ds / _prev_m_local_ds regs
+                                # that triggered spill at GQA=1.
+                                _m_local_a_ds = Int32(_drop_cur[2 * v][1])
+                                _smem_off_a_ds = (
+                                    _m_local_a_ds * Int32(mask_n_words) + _mask_word_col
+                                )
+                                _cached_mask_word_a = smem_mask_load_u32(
+                                    sDropMask_ptr, _smem_off_a_ds
+                                )
+                                scale_a = dropout_bit_to_scale(
+                                    _cached_mask_word_a, _mask_bit_pos, rp_dropout_val
+                                )
+                                _m_local_b_ds = Int32(_drop_cur[2 * v + 1][1])
+                                _smem_off_b_ds = (
+                                    _m_local_b_ds * Int32(mask_n_words) + _mask_word_col
+                                )
+                                _cached_mask_word_b = smem_mask_load_u32(
+                                    sDropMask_ptr, _smem_off_b_ds
+                                )
+                                scale_b = dropout_bit_to_scale(
+                                    _cached_mask_word_b, _mask_bit_pos, rp_dropout_val
+                                )
+                            else:
+                                scale_a = dropout_bit_to_scale(
+                                    drop_bits_local, Uint32(2 * v), rp_dropout_val
+                                )
+                                scale_b = dropout_bit_to_scale(
+                                    drop_bits_local, Uint32(2 * v + 1), rp_dropout_val
+                                )
+                            tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1] = cute.arch.fma_packed_f32x2(
+                                (tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1]),
+                                (scale_a, scale_b),
+                                (-dPsum_pair[0], -dPsum_pair[1]),
+                            )
+                            tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1] = cute.arch.mul_packed_f32x2(
+                                (tSrS_cur[2 * v], tSrS_cur[2 * v + 1]),
+                                (tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1]),
+                            )
+
+                        # === Convert F32 -> BF16 dS ===
+                        tdPrdS_cvt = cute.make_fragment_like(tdPrdP_cur, self.ds_dtype)
+                        utils.cvt_f16(tdPrdP_cur, tdPrdS_cvt)
+
+                        # === Stage 0: acquire pipeline_dS ===
+                        if const_expr(stage == 0):
+                            pipeline_dS.producer_acquire(producer_state_dS)
+
+                        # === Write dS -> TMEM ===
                         tdPrdS_r2t_f32 = cute.recast_tensor(tdPrdS_cvt, Float32)
                         cute.copy(thr_copy_r2t, tdPrdS_r2t_f32, tdPtdS_r2t[None, stage, 0, 0])
 
-                    # RMEM->SMEM: For 2-CTA, keep exchange stage in registers, write non-exchange to sdS
-                    if const_expr(self.use_2cta_instrs):
-                        if exchange_stage == stage:
-                            cute.autovec_copy(tdPrdS_cvt, tdPrdS_xchg)
+                        # === Write dS -> SMEM ===
+                        # 2-CTA: peer-exchange via sdS_xchg for exchange_stage,
+                        # other stage goes to sdS directly. 1-CTA: always sdS.
+                        if const_expr(self.use_2cta_instrs):
+                            if exchange_stage == stage:
+                                cute.autovec_copy(tdPrdS_cvt, tRS_sdS_xchg[None, 0])
+                            else:
+                                cute.autovec_copy(tdPrdS_cvt, tRS_sdS[None, stage])
                         else:
                             cute.autovec_copy(tdPrdS_cvt, tRS_sdS[None, stage])
-                    else:
-                        cute.autovec_copy(tdPrdS_cvt, tRS_sdS[None, stage])
 
-                if const_expr(not self.use_smem_dS_for_mma_dK):
+                    # === Post merged loop: pipeline state cleanup ===
                     cute.arch.fence_view_async_tmem_store()
+                    if const_expr(self.use_2cta_instrs):
+                        with cute.arch.elect_one():
+                            pipeline_dP.consumer_release(consumer_state_S_P_dP)
+                    consumer_state_S_P_dP.advance()
 
-                if const_expr(self.use_2cta_instrs):
-                    # use pipeline_dP to signal tmem store of dS
-                    with cute.arch.elect_one():
-                        pipeline_dP.consumer_release(consumer_state_S_P_dP)
-                consumer_state_S_P_dP.advance()
-
-                # After the loop: copy exchange registers to sdS_xchg buffer
-                if const_expr(self.use_2cta_instrs):
-                    # when hdim 192, sdQaccum overlapped with sdS_xchg
-                    if const_expr(self.tile_hdim == 192):
-                        cute.arch.mbarrier_wait(
-                            dQaccum_empty_mbar_ptr, phase=producer_state_dS.phase
-                        )
-                    cute.autovec_copy(tdPrdS_xchg, tRS_sdS_xchg[None, 0])
-
-                cute.arch.fence_view_async_shared()
-                self.compute_sync_barrier.arrive_and_wait()
-                # Normally we'd need syncwarp here since only 1 thread will signal in
-                # consumer_release, but we already have the self.compute_sync_barrier before this
-                pipeline_dPsum.consumer_release(consumer_state_dPsum)
-                consumer_state_dPsum.advance()
-                # when 2cta hdim 128, pipeline_dS also signals S tmem load completion so is deferred
-                if const_expr(not (self.use_2cta_instrs and self.tile_hdim == 128)):
-                    with cute.arch.elect_one():
-                        pipeline_dS.producer_commit(producer_state_dS)
-                    producer_state_dS.advance()
+                    cute.arch.fence_view_async_shared()
+                    self.compute_sync_barrier.arrive_and_wait()
+                    pipeline_dPsum.consumer_release(consumer_state_dPsum)
+                    consumer_state_dPsum.advance()
+                    # 2-CTA hdim 128: pipeline_dS commit deferred to the start
+                    # of the next iter (signals S TMEM load completion, overlaps
+                    # with dQ).
+                    if const_expr(not (self.use_2cta_instrs and self.tile_hdim == 128)):
+                        with cute.arch.elect_one():
+                            pipeline_dS.producer_commit(producer_state_dS)
+                        producer_state_dS.advance()
 
                 # 2-CTA: DSMEM copy from sdS_xchg to peer's sdS buffer
                 if const_expr(self.use_2cta_instrs):
