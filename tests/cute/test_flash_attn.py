@@ -54,7 +54,6 @@ def retry_on_oom(func):
 
     return wrapper
 
-<<<<<<< HEAD
 def print_diff_stats(name, actual, ref, pt=None, verbose=True):
     if actual is None:
         return
@@ -77,8 +76,6 @@ def check_tensor_vs_ref(name, actual, ref, pt, rtol=2, atol=None):
     diff_max = (actual - ref).abs().max().item()
     diff_pt_max = (pt - ref).abs().max().item()
     assert diff_max <= rtol * diff_pt_max + atol, f"{name}: {diff_max=} too large compared to {diff_pt_max=} for {rtol=}, {atol=}"
-=======
->>>>>>> ebbdaeb6 (remove softcap != 0 limitation in test)
 
 # torch FakeTensorMode would enable fast cutedsl kernel compilation without allocating the actual GPU memory or running the kernel
 # When operating fake tensors, we cannot perform data-dependent operations (e.g., `tensor.max()`).
@@ -92,7 +89,6 @@ TEST_BWD_ONLY = False
 VERBOSE = True
 
 
-<<<<<<< HEAD
 @pytest.mark.skipif(not IS_SM120, reason="SM120-only SplitKV unsupported behavior")
 def test_flash_attn_sm120_rejects_splitkv():
     q = torch.randn(1, 16, 4, 64, device="cuda", dtype=torch.bfloat16)
@@ -102,8 +98,6 @@ def test_flash_attn_sm120_rejects_splitkv():
         flash_attn_func(q, k, v, num_splits=3)
 
 
-=======
->>>>>>> ebbdaeb6 (remove softcap != 0 limitation in test)
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
@@ -2431,7 +2425,6 @@ def test_flash_attn_mla_absorbed(
                     pack_gqa=pack_gqa,
                     num_splits=num_splits,
                 )
-<<<<<<< HEAD
                 assert torch.equal(out, out2), f"non-deterministic with max diff = {(out - out2).abs().max().item()} on {iter=}"
         
         if test_bwd:
@@ -2462,14 +2455,6 @@ def test_flash_attn_mla_absorbed(
             check_tensor_vs_ref("dK", dk, dk_ref, dk_pt)
             check_tensor_vs_ref("dV", dv, dv_ref, dv_pt)
             check_tensor_vs_ref("dQv", dqv, dqv_ref, dqv_pt)
-=======
-                # print(f"out max: {out.abs().max().item()}, {iter=}")
-                # print(f"out vs out2 max diff: {(out - out2).abs().max().item()}, {iter=}")
-                # print(f"out vs out2 mean diff: {(out - out2).abs().mean().item()}, {iter=}")
-                assert torch.equal(out, out2), (
-                    f"non-deterministic with max diff = {(out - out2).abs().max().item()} on {iter=}"
-                )
->>>>>>> ebbdaeb6 (remove softcap != 0 limitation in test)
 
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
