@@ -227,11 +227,8 @@ if IS_ROCM:
             assert os.path.isdir("third_party/aiter"), (
                 "third_party/aiter is missing, please use source distribution or git clone"
             )
-        aiter_env = os.environ.copy()
-        aiter_env.setdefault("AITER_TRITON_ONLY", "1")
         subprocess.run(
             [sys.executable, "-m", "pip", "install", "--no-build-isolation", "third_party/aiter"],
-            env=aiter_env,
             check=True,
         )
     elif ROCM_BACKEND == "ck":
