@@ -7,14 +7,14 @@
 
 import math
 from types import SimpleNamespace
-from typing import Type, Callable, Optional, List
+from typing import Type, Callable, Optional
 from functools import partial
 
 import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Constexpr, Float32, Int32, const_expr, Boolean
+from cutlass import Float32, Int32, const_expr
 from cutlass.cute.nvgpu import cpasync, warp
 import cutlass.utils as utils_basic
 from cutlass.base_dsl.arch import Arch
