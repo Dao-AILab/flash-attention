@@ -346,6 +346,9 @@ def _get_fwd_config(
         q_stage = 1
 
     m_block_size_effective = q_stage * tile_m
+    # Only None is unbounded; preserve 0 (e.g. the right bound of a causal window).
+    window_right_loaded = max_seqlen_k if window_size_right is None else window_size_right
+    window_left_loaded = max_seqlen_k if window_size_left is None else window_size_left
     seqlen_k_loaded = (
         max_seqlen_k
         if not local
@@ -353,8 +356,8 @@ def _get_fwd_config(
             0,
             min(
                 max_seqlen_k,
-                (window_size_right or max_seqlen_k)
-                + (window_size_left or max_seqlen_k)
+                window_right_loaded
+                + window_left_loaded
                 + 1
                 + tile_m,
             ),
