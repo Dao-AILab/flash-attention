@@ -510,59 +510,25 @@ class FlashAttentionForwardCombine:
             cute.copy(s2r_tiled_copy_LSE, ts2rsLSE, ts2rrLSE)
 
             # ===============================
-            # Step 4: Compute final LSE along split dimension
+            # Step 4: Per-row max valid split. sLSE keeps the RAW per-split LSE values;
+            # the actual combine is a single-pass streaming online-merge in Step 6, which
+            # matches the in-kernel fused-prefill merge order (split index ascending).
             # ===============================
 
-            lse_sum = cute.make_rmem_tensor(cute.size(ts2rrLSE, mode=[2]), Float32)
             ts2rcLSE = s2r_thr_copy_LSE.partition_D(cLSE)
-            # We compute the max valid split for each row to short-circuit the computation later
             max_valid_split = cute.make_rmem_tensor(cute.size(ts2rrLSE, mode=[2]), Int32)
             assert cute.size(ts2rrLSE, mode=[0]) == 1
-            # Compute max, scales, and final LSE for each row
+            threads_per_col = const_expr(self.smem_threads_per_col_lse)
             for m in cutlass.range(cute.size(ts2rrLSE, mode=[2]), unroll_full=True):
-                # Find max LSE value across splits
-                threads_per_col = const_expr(self.smem_threads_per_col_lse)
-                lse_max = cute.arch.warp_reduction_max(
-                    ts2rrLSE[None, None, m]
-                    .load()
-                    .reduce(cute.ReductionOp.MAX, init_val=-Float32.inf, reduction_profile=0),
-                    threads_in_group=threads_per_col,
-                )
-                # if cute.arch.thread_idx()[0] == 0: cute.printf(lse_max)
-                # Find max valid split index
+                # Highest split index with a finite LSE (short-circuits the merge loop)
                 max_valid_idx = -1
                 for s in cutlass.range(cute.size(ts2rrLSE, mode=[1]), unroll_full=True):
                     if ts2rrLSE[0, s, m] != -Float32.inf:
-                        max_valid_idx = ts2rcLSE[0, s, 0][0]  # Get split coordinate
-                # if cute.arch.thread_idx()[0] < 32: cute.printf(max_valid_idx)
+                        max_valid_idx = ts2rcLSE[0, s, 0][0]
                 max_valid_split[m] = cute.arch.warp_reduction_max(
                     max_valid_idx, threads_in_group=threads_per_col
                 )
-                # Compute exp scales and sum
-                lse_max_cur = (
-                    0.0 if lse_max == -Float32.inf else lse_max
-                )  # In case all local LSEs are -inf
-                LOG2_E = math.log2(math.e)
-                lse_sum_cur = 0.0
-                for s in cutlass.range(cute.size(ts2rrLSE, mode=[1]), unroll_full=True):
-                    scale = cute.math.exp2(
-                        ts2rrLSE[0, s, m] * LOG2_E - (lse_max_cur * LOG2_E), fastmath=True
-                    )
-                    lse_sum_cur += scale
-                    ts2rrLSE[0, s, m] = scale  # Store scale for later use
-                lse_sum_cur = cute.arch.warp_reduction_sum(
-                    lse_sum_cur, threads_in_group=threads_per_col
-                )
-                lse_sum[m] = cute.math.log(lse_sum_cur, fastmath=True) + lse_max
-                # Normalize scales
-                inv_sum = (
-                    0.0 if (lse_sum_cur == 0.0 or lse_sum_cur != lse_sum_cur) else 1.0 / lse_sum_cur
-                )
-                ts2rrLSE[None, None, m].store(ts2rrLSE[None, None, m].load() * inv_sum)
-            # Store the scales exp(lse - lse_logsum) back to smem
-            cute.copy(s2r_tiled_copy_LSE, ts2rrLSE, ts2rsLSE)
-
-            # Store max valid split to smem
+            # sLSE is left holding the raw LSE (no scale write-back).
             for m in cutlass.range(cute.size(ts2rrLSE, mode=[2]), unroll_full=True):
                 if ts2rcLSE[0, 0, m][0] == 0:  # Only thread responsible for s=0 writes
                     mi = ts2rcLSE[0, 0, m][1]
@@ -570,29 +536,10 @@ class FlashAttentionForwardCombine:
                         sMaxValidSplit[mi] = max_valid_split[m]
 
             # ===============================
-            # Step 5: Store final LSE to gmem
-            # ===============================
-
-            if const_expr(mLSE is not None):
-                if const_expr(cu_seqlens is None):
-                    mLSE_cur = mLSE[None, None, batch_idx]
-                else:
-                    mLSE_cur = cute.domain_offset((offset, 0), mLSE)
-                if k_block == 0:  # Only first k_block writes LSE when mLSE is provided
-                    for m in cutlass.range(cute.size(ts2rrLSE, mode=[2]), unroll_full=True):
-                        if ts2rcLSE[0, 0, m][0] == 0:  # Only thread responsible for s=0 writes
-                            mi = ts2rcLSE[0, 0, m][1]
-                            idx = m_block * self.tile_m + mi
-                            if idx < max_idx:
-                                if const_expr(not varlen):
-                                    head_idx, m_idx = divmod(idx, seqlen_divmod)
-                                else:
-                                    head_idx = idx // seqlen
-                                    m_idx = idx - head_idx * seqlen
-                                mLSE_cur[m_idx, head_idx] = lse_sum[m]
-
-            # ===============================
-            # Step 6: Read O_partial and accumulate final O
+            # Step 6: Streaming online-merge of O_partial across splits (single pass).
+            # Per row keep running (m_run = max lse, s_run = running denom, tOrO = running
+            # un-normalized weighted O). For each split: a = exp2(m_run-m_new), b =
+            # exp2(lse_s-m_new); tOrO = tOrO*a + O_s*b; s_run = s_run*a + b. Final O = tOrO/s_run.
             # ===============================
 
             cute.arch.sync_threads()
@@ -605,16 +552,21 @@ class FlashAttentionForwardCombine:
             tOrO_partial = cute.make_rmem_tensor_like(tOsO_partial[None, None, None, 0])
             tOrO = cute.make_rmem_tensor_like(tOrO_partial, Float32)
             tOrO.fill(0.0)
+            m_run = cute.make_rmem_tensor(num_rows, Float32)
+            s_run = cute.make_rmem_tensor(num_rows, Float32)
+            for m in cutlass.range(num_rows, unroll_full=True):
+                m_run[m] = -Float32.inf
+                s_run[m] = 0.0
 
+            LOG2_E = math.log2(math.e)
             stage_load = self.stages - 1
             stage_compute = 0
 
-            # Main accumulation loop
+            # Streaming merge loop (split index ascending)
             for s in cutlass.range(thr_max_valid_split + 1, unroll=4):
-                # Get scales for this split
-                scale = cute.make_rmem_tensor(num_rows, Float32)
+                lse_s = cute.make_rmem_tensor(num_rows, Float32)
                 for m in cutlass.range(num_rows, unroll_full=True):
-                    scale[m] = sLSE[s, tOcO[0, m, 0][0]]  # Get scale from smem
+                    lse_s[m] = sLSE[s, tOcO[0, m, 0][0]]  # raw per-split LSE
 
                 # Load next stage if needed
                 split_to_load = s + self.stages - 1
@@ -625,22 +577,59 @@ class FlashAttentionForwardCombine:
 
                 # Wait for the current stage to be ready
                 cute.arch.cp_async_wait_group(self.stages - 1)
-                # We don't need __syncthreads() because each thread is just reading its own data from smem
-                # Copy from smem to registers
                 cute.autovec_copy(tOsO_partial[None, None, None, stage_compute], tOrO_partial)
                 stage_compute = 0 if stage_compute == self.stages - 1 else stage_compute + 1
 
-                # Accumulate scaled partial results
+                # Online merge of this split's partial. -inf init handled by exp2(-inf)=0:
+                # first finite split gives a=exp2(-inf)=0 (tOrO was 0) and b=exp2(0)=1.
                 for m in cutlass.range(num_rows, unroll_full=True):
-                    if tOhidx[m] >= 0 and scale[m] > 0.0:
-                        tOrO[None, m, None].store(
-                            tOrO[None, m, None].load()
-                            + scale[m] * tOrO_partial[None, m, None].load().to(Float32)
-                        )
+                    if tOhidx[m] >= 0 and lse_s[m] != -Float32.inf:
+                        m_new = max(m_run[m], lse_s[m])
+                        a = cute.math.exp2((m_run[m] - m_new) * LOG2_E, fastmath=True)
+                        b = cute.math.exp2((lse_s[m] - m_new) * LOG2_E, fastmath=True)
+                        # Per-element acc*a + seg*b via separate f32 muls + add. The fused
+                        # in-kernel merge (correction_merge in flash_fwd_sm100.py) uses the
+                        # IDENTICAL op sequence so prefill (fused) == decode (gmem) bitwise.
+                        acc_row = tOrO[None, m, None]
+                        seg_row = cute.make_rmem_tensor_like(acc_row, Float32)
+                        seg_row.store(tOrO_partial[None, m, None].load().to(Float32))
+                        for k in cutlass.range(0, cute.size(acc_row), 2, unroll_full=True):
+                            pa0, pa1 = cute.arch.mul_packed_f32x2((acc_row[k], acc_row[k + 1]), (a, a))
+                            ps0, ps1 = cute.arch.mul_packed_f32x2((seg_row[k], seg_row[k + 1]), (b, b))
+                            acc_row[k], acc_row[k + 1] = pa0 + ps0, pa1 + ps1
+                        # Explicit non-FMA mul (mul_packed) + add, matching the fused in-kernel
+                        # merge's s_run accumulation exactly (bitwise inv_sum).
+                        _sa, _ = cute.arch.mul_packed_f32x2((s_run[m], Float32(0.0)), (a, a))
+                        s_run[m] = _sa + b
+                        m_run[m] = m_new
+
+            # Normalize: O = tOrO / s_run
+            for m in cutlass.range(num_rows, unroll_full=True):
+                inv_sum = (
+                    0.0 if (s_run[m] == 0.0 or s_run[m] != s_run[m]) else 1.0 / s_run[m]
+                )
+                tOrO[None, m, None].store(tOrO[None, m, None].load() * inv_sum)
 
             # ===============================
-            # Step 7: Write final O to gmem
+            # Step 7: Write final LSE + O to gmem
             # ===============================
+
+            # Final LSE = log(s_run) + m_run (logsumexp). Written once per row, by the thread
+            # owning the k=0 column, only on the first k_block.
+            if const_expr(mLSE is not None):
+                if const_expr(cu_seqlens is None):
+                    mLSE_cur = mLSE[None, None, batch_idx]
+                else:
+                    mLSE_cur = cute.domain_offset((offset, 0), mLSE)
+                if k_block == 0 and tOcO[0, 0, 0][1] == 0:
+                    for m in cutlass.range(num_rows, unroll_full=True):
+                        if tOhidx[m] >= 0:
+                            lse_final = (
+                                -Float32.inf
+                                if s_run[m] == 0.0
+                                else cute.math.log(s_run[m], fastmath=True) + m_run[m]
+                            )
+                            mLSE_cur[tOmidx[m], tOhidx[m]] = lse_final
 
             rO = cute.make_rmem_tensor_like(tOrO, self.dtype)
             rO.store(tOrO.load().to(self.dtype))

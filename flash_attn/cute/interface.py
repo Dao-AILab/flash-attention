@@ -265,6 +265,27 @@ def num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, max_splits):
     return min(num_SMs // total_mblocks, max_splits, num_n_blocks)
 
 
+def split_size_to_num_splits(split_size, tile_n, num_n_blocks, max_splits=256):
+    """Convert a fixed split_size (in KV tokens) into (num_splits, n_blocks_per_split).
+
+    Each split covers exactly ``n_blocks_per_split`` tile_n-blocks (last split takes the
+    remainder) -> seqlen-invariant, tile-aligned boundaries at absolute KV positions, which
+    is what makes prefill<->decode bitwise consistent under the same split_size. Returns
+    n_blocks_per_split=None whenever splitting collapses to a single split.
+    """
+    n_blocks_per_split = max((split_size + tile_n - 1) // tile_n, 1)
+    derived = (num_n_blocks + n_blocks_per_split - 1) // n_blocks_per_split
+    num_splits = max(1, min(derived, max_splits))
+    if derived > max_splits:
+        raise NotImplementedError(
+            f"split_size={split_size} (={n_blocks_per_split} KV blocks of {tile_n}) implies "
+            f"{derived} splits, exceeding the {max_splits} cap"
+        )
+    if num_splits <= 1:
+        n_blocks_per_split = None
+    return num_splits, n_blocks_per_split
+
+
 def _resolve_causal_local_window(causal, window_size_left, window_size_right, mask_mod=None):
     """Resolve causal/local/window settings into canonical form.
 
@@ -311,6 +332,7 @@ def _flash_attn_fwd(
     intra_wg_overlap: Optional[bool] = None,
     num_threads: int = 384,
     num_splits: int = 1,
+    split_size: Optional[int] = None,
     pack_gqa: Optional[bool] = None,
     _arch: Optional[int] = None,
     score_mod: Optional[Callable] = None,
@@ -324,6 +346,7 @@ def _flash_attn_fwd(
     k_descale: Optional[torch.Tensor] = None,
     v_descale: Optional[torch.Tensor] = None,
     gather_kv_indices: Optional[torch.Tensor] = None,
+    _disable_fused_split: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Forward pass for FlashAttention.
 
@@ -543,15 +566,73 @@ def _flash_attn_fwd(
     if pack_gqa and qv is not None and 128 % qhead_per_kvhead != 0:
         pack_gqa = False
 
+    # split_size: user-controlled, seqlen-invariant, tile-aligned KV split size (in tokens),
+    # mutually exclusive with an explicit num_splits>1. Only the SM100/110 SplitKV path
+    # supports it. The num_splits count is derived from split_size below, once tile_n and
+    # num_n_blocks are known.
+    if split_size is not None:
+        assert num_splits == 1, (
+            "Pass either num_splits or split_size, not both; split_size derives num_splits."
+        )
+        assert split_size > 0, "split_size must be a positive number of KV tokens"
+        if use_block_sparsity:
+            # split_size promises absolute, seqlen-invariant KV boundaries (0, S, 2S, ...).
+            # The SM100 block-sparse path partitions the *block list* by count
+            # (ceil_div(block_count, num_splits) in split_block_range), not by KV position,
+            # so it cannot honor those fixed boundaries and the prefill<->decode bitwise
+            # guarantee would not hold. Reject the combination rather than silently giving a
+            # derived split count with the wrong semantics.
+            raise NotImplementedError("split_size is not supported with block sparsity")
+        if arch // 10 not in (10, 11):
+            raise NotImplementedError("split_size (SplitKV) is only supported on SM100/110")
+        if qv is not None:
+            raise NotImplementedError("split_size is not supported with qv")
+        if head_dim == 256 and head_dim_v == 256:
+            raise NotImplementedError("split_size is not supported with the head_dim=256 kernel")
+        if head_dim != head_dim_v and head_dim_v == 512:
+            raise NotImplementedError("split_size is not supported for diff-headdim with head_dim_v=512")
+
     if max_seqlen_q is None:
         max_seqlen_q = seqlen_q if cu_seqlens_q is None else total_q
     if max_seqlen_k is None:
         max_seqlen_k = seqlen_k
+    if split_size is not None and max_seqlen_q > 1:
+        if local:
+            raise NotImplementedError("split_size prefill is not supported with local/window attention")
+        if int(math.ceil(head_dim_v / 16) * 16) > 128:
+            raise NotImplementedError("split_size prefill is not supported with head_dim_v > 128")
+        if (cu_seqlens_q is None) != (cu_seqlens_k is None):
+            raise NotImplementedError("split_size prefill requires matching q/k varlen mode")
+        if page_table is not None:
+            raise NotImplementedError("split_size prefill is not supported with paged KV")
+        if seqused_q is not None or seqused_k is not None:
+            raise NotImplementedError("split_size prefill is not supported with seqused_q/seqused_k")
+        if learnable_sink is not None:
+            raise NotImplementedError("split_size prefill is not supported with learnable_sink")
+        if mask_mod is not None or score_mod is not None:
+            raise NotImplementedError("split_size prefill is not supported with mask_mod/score_mod")
+        if is_fp8:
+            raise NotImplementedError("split_size prefill is not supported with fp8")
     if cu_seqlens_k is None and seqused_k is None:
         min_seqlen_k = seqlen_k 
     seqlen_q_packgqa = max_seqlen_q * qhead_per_kvhead
+    # Decide fused-prefill eligibility before q_stage so we can force q_stage=1 (the fused
+    # in-kernel merge keeps its running accumulator in the tmem columns that are only free
+    # at q_stage=1; q_stage=1 also handles large-Q prefill and matches decode's q_stage).
+    want_fused = (
+        not _disable_fused_split
+        and split_size is not None
+        and arch // 10 in [10, 11]
+        and not local
+        and max_seqlen_q is not None
+        and max_seqlen_q > 1
+        and max_seqlen_k is not None
+        and ((max_seqlen_k + tile_n - 1) // tile_n) > ((split_size + tile_n - 1) // tile_n)
+        and not use_block_sparsity
+        and qv is None
+    )
     if arch // 10 in [10, 11]:
-        q_stage = 2 if seqlen_q_packgqa > tile_m else 1
+        q_stage = 1 if want_fused else (2 if seqlen_q_packgqa > tile_m else 1)
     else:
         q_stage = 1
 
@@ -564,9 +645,29 @@ def _flash_attn_fwd(
     if num_splits < 1:
         num_splits = num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, 128)
 
-    # SplitKV uses float32 partial output, which doubles the O buffer size
-    # in shared memory, causing OOM for diff-headdim (192, 128)
-    if arch // 10 in [10, 11] and head_dim != head_dim_v and num_splits > 1:
+    # Derive num_splits from a fixed split_size. n_blocks_per_split=None means the kernel
+    # uses regular even-division by num_splits; a non-None value pins each split to exactly
+    # that many tile_n-blocks. This is what enables prefill (seqlen_q>1) to split KV with
+    # the same boundaries as decode, so the two are bitwise consistent.
+    n_blocks_per_split = None
+    if split_size is not None:
+        # SplitKV's fp32 partial-O doubles SMEM and OOMs at tile_n=128 for diff-headdim
+        # shapes (e.g. MLA 192/128), so the kernel must use tile_n=64. Unlike the regular
+        # num_splits guard below -- which only shrinks tile_n once seqlen is large enough
+        # to split -- we pin tile_n for ALL sequence lengths here. Otherwise a short decode
+        # (tile_n=128) and a long prefill (tile_n=64) would tile the same token's KV
+        # differently and break bitwise decode<->prefill consistency across lengths.
+        if arch // 10 in [10, 11] and head_dim != head_dim_v and head_dim_v != 512:
+            tile_n = 64
+            num_n_blocks = (seqlen_k_loaded + tile_n - 1) // tile_n
+        num_splits, n_blocks_per_split = split_size_to_num_splits(split_size, tile_n, num_n_blocks)
+        # TODO: fix GQA + SplitKV + non-varlen (mirror of the guard above for the derived count)
+        if pack_gqa and num_splits != 1 and cu_seqlens_q is None:
+            pack_gqa = False
+    elif arch // 10 in [10, 11] and head_dim != head_dim_v and num_splits > 1:
+        # Regular num_splits path: shrink tile_n only once there are enough blocks to split,
+        # otherwise disable splitting. (split_size is handled above with a seqlen-invariant
+        # tile_n so it is intentionally excluded here.)
         if num_n_blocks >= 64 and head_dim_v != 512:
             tile_n = 64
             num_n_blocks = (seqlen_k_loaded + tile_n - 1) // tile_n
@@ -574,7 +675,17 @@ def _flash_attn_fwd(
         else:
             num_splits = 1
 
-    is_split_kv = num_splits > 1
+    # Fused prefill SplitKV (memory-efficient): one CTA per query tile internally segments
+    # the KV loop into n_blocks_per_split chunks and online-merges the per-segment partials
+    # in registers/tmem -- no gmem out_partial and no separate combine kernel. Bitwise-equal
+    # to the gmem split path (same streaming-merge order). Milestone 1 supports q_stage==1
+    # (free tmem for the running accumulator), dense (causal/non-causal, non-local),
+    # batched or varlen, non-paged, no mods/fp8/block-sparsity.
+    # want_fused already captured the shape eligibility (and forced q_stage=1); engage the
+    # fused path only when splitting actually happens (>1 segment) and the size is fixed.
+    fused_split = want_fused and n_blocks_per_split is not None and num_splits > 1
+
+    is_split_kv = num_splits > 1 and not fused_split
     if is_split_kv:
         out_partial = torch.empty(num_splits, *q_batch_seqlen_shape, num_head, head_dim_v, dtype=torch.float32, device=device)
         lse_partial = torch.empty(num_splits, *lse_shape, dtype=torch.float32, device=device)
@@ -585,6 +696,7 @@ def _flash_attn_fwd(
         and not causal
         and not local
         and not is_split_kv
+        and not want_fused  # split decode is non-2CTA; fused prefill must match it for bitwise
         and cu_seqlens_q is None
         and seqused_q is None
         and not use_block_sparsity
@@ -732,6 +844,8 @@ def _flash_attn_fwd(
         q_stage,
         num_threads,
         is_split_kv,
+        n_blocks_per_split is not None,  # fixed-size vs even-division split mode (compile-time branch)
+        fused_split,  # fused in-kernel segmented-combine prefill
         pack_gqa,
         arch,
         page_size not in [None, tile_n],  # paged KV non-TMA
@@ -939,6 +1053,7 @@ def _flash_attn_fwd(
                     q_subtile_factor=q_subtile_factor,
                     use_2cta_instrs=use_2cta_instrs,
                     use_clc_scheduler=use_clc_scheduler,
+                    fused_split=fused_split,
                 )
         elif arch // 10 == 12:
             # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
@@ -1010,6 +1125,8 @@ def _flash_attn_fwd(
             ]
             if arch // 10 in [10, 11]:
                 compile_args.append(descale_tensors_tensor)
+                if not use_dedicated_hd256_kernel:
+                    compile_args.append(n_blocks_per_split)
             compile_args.extend([
                 sparse_tensors,
                 cute_aux_tensors,
@@ -1074,6 +1191,8 @@ def _flash_attn_fwd(
             ]
             if arch // 10 in [10, 11]:
                 call_args.append(descale_tensors)
+                if not use_dedicated_hd256_kernel:
+                    call_args.append(n_blocks_per_split)
             call_args.extend([
                 (
                     normalized_block_sparse_tensors.mask_block_cnt,
@@ -1976,6 +2095,9 @@ class FlashAttnFunc(torch.autograd.Function):
         block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
         block_sparse_tensors_bwd: Optional[BlockSparseTensorsTorch] = None,
         return_lse: bool = False,
+        # NB: split_size is appended at the end to preserve positional-argument
+        # compatibility for existing callers (num_splits -> pack_gqa -> ...).
+        split_size: Optional[int] = None,
     ):
         shared_kv = k is v
         if shared_kv and v.shape[-1] == 512:
@@ -1996,6 +2118,7 @@ class FlashAttnFunc(torch.autograd.Function):
             learnable_sink=learnable_sink,
             softcap=softcap,
             num_splits=num_splits,
+            split_size=split_size,
             pack_gqa=pack_gqa,
             score_mod=score_mod,
             mask_mod=mask_mod,
@@ -2080,6 +2203,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         block_sparse_tensors: Optional[list] = None,
         aux_tensors: Optional[list] = None,
         return_lse: bool = False,
+        # NB: split_size is appended at the end to preserve positional-argument
+        # compatibility for existing callers (num_splits -> pack_gqa -> ...).
+        split_size: Optional[int] = None,
     ):
         shared_kv = k is v
         if shared_kv and v.shape[-1] == 512:
@@ -2108,6 +2234,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             learnable_sink=learnable_sink,
             softcap=softcap,
             num_splits=num_splits,
+            split_size=split_size,
             pack_gqa=pack_gqa,
             score_mod=score_mod,
             mask_mod=mask_mod,
@@ -2198,6 +2325,9 @@ def flash_attn_func(
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     block_sparse_tensors_bwd: Optional[BlockSparseTensorsTorch] = None,
     return_lse: bool = False,
+    # Keyword-only and last so it cannot shift the meaning of existing positional args.
+    *,
+    split_size: Optional[int] = None,
 ):
     return FlashAttnFunc.apply(
         q,
@@ -2220,6 +2350,7 @@ def flash_attn_func(
         block_sparse_tensors,
         block_sparse_tensors_bwd,
         return_lse,
+        split_size,
     )
 
 
@@ -2251,6 +2382,9 @@ def flash_attn_varlen_func(
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     aux_tensors: Optional[list] = None,
     return_lse: bool = False,
+    # Keyword-only and last so it cannot shift the meaning of existing positional args.
+    *,
+    split_size: Optional[int] = None,
 ):
     """
     Tensor arguments:
@@ -2311,6 +2445,7 @@ def flash_attn_varlen_func(
         block_sparse_tensors,
         aux_tensors,
         return_lse,
+        split_size,
     )
 
 

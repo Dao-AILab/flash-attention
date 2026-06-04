@@ -134,6 +134,7 @@ class FlashAttentionForwardSm100:
         is_varlen_q: bool = False,
         use_2cta_instrs: bool = False,
         use_clc_scheduler: bool = False,
+        fused_split: bool = False,
     ):
         self.use_tma_KV = not paged_kv_non_tma
         # self.dtype = dtype
@@ -176,9 +177,14 @@ class FlashAttentionForwardSm100:
         self.is_causal = is_causal
         self.is_local = is_local
         self.is_varlen_q = is_varlen_q
-        self.use_correction_warps_for_epi = is_varlen_q
+        self.use_correction_warps_for_epi = is_varlen_q or fused_split
         self.qhead_per_kvhead = qhead_per_kvhead
         self.is_split_kv = is_split_kv
+        # Fused prefill SplitKV: one CTA per query tile internally segments the KV loop into
+        # n_blocks_per_split chunks and online-merges the per-segment partials in-kernel, so
+        # there are no gmem partials and no separate combine kernel. Milestone 1 supports
+        # q_stage==1 only (needs a free tmem column range for the running accumulator).
+        self.fused_split = fused_split
         self.pack_gqa = pack_gqa
         self.q_subtile_factor = q_subtile_factor
         assert not (self.is_split_kv and self.head_dim_v_padded >= 192), (
@@ -288,6 +294,13 @@ class FlashAttentionForwardSm100:
             for i in range(self.q_stage)
         ]  # e.g., 256, 384
         self.tmem_total = self.tmem_o_offset[-1] + self.head_dim_v_padded
+        # Fused prefill (M1): place the running merged-output accumulator Oacc_run in the
+        # free tmem columns after tmem_total. Only fits at q_stage==1 (q_stage==2 fills tmem).
+        self.tmem_oacc_offset = None
+        if self.fused_split:
+            assert self.q_stage == 1, "fused_split milestone 1 supports q_stage==1 only"
+            self.tmem_oacc_offset = self.tmem_total
+            self.tmem_total = self.tmem_oacc_offset + self.head_dim_v_padded
         assert self.tmem_total <= self.tmem_alloc_cols
         self.tmem_s_to_p_offset = self.n_block_size // 2
         self.tmem_p_offset = [
@@ -381,6 +394,7 @@ class FlashAttentionForwardSm100:
         window_size_right: Int32 | int | None = None,
         learnable_sink: Optional[cute.Tensor] = None,
         descale_tensors: Optional[DescaleTensors] = None,
+        n_blocks_per_split: Int32 | int | None = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_tensors: Optional[list] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
@@ -461,6 +475,7 @@ class FlashAttentionForwardSm100:
             and mSeqUsedQ is None
             and not (self.pack_gqa and self.m_block_size % self.qhead_per_kvhead != 0)
             and not (self.pack_gqa and self.is_split_kv)
+            and not self.fused_split  # fused uses the correction-warp (non-TMA) epilogue
         )
         self.ex2_emu_freq = 0
         self.ex2_emu_start_frg = self._tune.get("ex2_emu_start_frg", 1)
@@ -722,6 +737,7 @@ class FlashAttentionForwardSm100:
         softmax_scale_log2, softmax_scale = utils.compute_softmax_scale_log2(softmax_scale, self.score_mod)
         window_size_left = Int32(window_size_left) if window_size_left is not None else None
         window_size_right = Int32(window_size_right) if window_size_right is not None else None
+        n_blocks_per_split = Int32(n_blocks_per_split) if n_blocks_per_split is not None else None
         fastdiv_mods = utils.compute_fastdiv_mods(mQ, mK, self.qhead_per_kvhead, self.pack_gqa, aux_tensors, mPageTable)
 
         head_divmod = None
@@ -770,6 +786,7 @@ class FlashAttentionForwardSm100:
             tiled_mma_pv,
             tile_sched_params,
             num_splits,
+            n_blocks_per_split,
             aux_tensors,
             fastdiv_mods,
             head_divmod,
@@ -829,6 +846,7 @@ class FlashAttentionForwardSm100:
         tiled_mma_pv: cute.TiledMma,
         tile_sched_params: ParamsBase,
         num_splits: Int32,
+        n_blocks_per_split: Optional[Int32] = None,
         aux_tensors: Optional[list] = None,
         fastdiv_mods=(None, None),
         head_divmod=None,
@@ -1042,6 +1060,11 @@ class FlashAttentionForwardSm100:
         pv_acc_shape = thr_mma_pv.partition_shape_C(self.mma_tiler_pv[:2])
         tOtO = thr_mma_pv.make_fragment_C(cute.append(pv_acc_shape, self.q_stage))
         tOtO = cute.make_tensor(tOtO.iterator + self.tmem_o_offset[0], tOtO.layout)
+        # Fused prefill: running merged-output accumulator in the free tmem columns.
+        tOacc = None
+        if const_expr(self.fused_split):
+            tOacc = thr_mma_pv.make_fragment_C(cute.append(pv_acc_shape, 1))
+            tOacc = cute.make_tensor(tOacc.iterator + self.tmem_oacc_offset, tOacc.layout)
         tP = cute.make_tensor(tStS.iterator, tP_layout.outer)
         tOrP = thr_mma_pv.make_fragment_A(tP)[None, None, None, 0]
         # Need to multiply by width ratio bc tP is in v_dtype but tmem offsets are in FP32
@@ -1059,10 +1082,13 @@ class FlashAttentionForwardSm100:
             self.cta_tiler[1],
             self.is_causal,
             self.is_local,
-            self.is_split_kv,
+            # Fused prefill uses the same fixed-size split-range math to carve segments;
+            # the kernel's self.is_split_kv stays False (normal output, no gmem partials).
+            self.is_split_kv or self.fused_split,
             window_size_left,
             window_size_right,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+            n_blocks_per_split=n_blocks_per_split,
         )
         SeqlenInfoCls = partial(
             SeqlenInfoQK.create,
@@ -1293,6 +1319,7 @@ class FlashAttentionForwardSm100:
                 thr_mma_pv,
                 tStS,
                 tOtO,
+                tOacc,
                 sScale,
                 mO,
                 mLSE,
@@ -1356,10 +1383,14 @@ class FlashAttentionForwardSm100:
         kv_producer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Producer, self.kv_stage
         )
+        seg = Int32(0)
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
+            _n_seg, split_idx_eff, num_splits_eff = self._seg_split_range(
+                block_info, seqlen, m_block, seg, split_idx, num_splits
+            )
             mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, head_idx]
 
             head_idx_kv = (
@@ -1469,7 +1500,7 @@ class FlashAttentionForwardSm100:
 
             if const_expr(not self.use_block_sparsity):
                 n_block_min, n_block_max = block_info.get_n_block_min_max(
-                    seqlen, m_block, split_idx, num_splits
+                    seqlen, m_block, split_idx_eff, num_splits_eff
                 )
                 if const_expr(not self.is_split_kv) or n_block_min < n_block_max:
                     n_block_first = n_block_max - 1 if n_block_max > 0 else 0
@@ -1530,7 +1561,15 @@ class FlashAttentionForwardSm100:
                 )
 
 
-            work_tile = tile_scheduler.advance_to_next_work()
+            if const_expr(self.fused_split):
+                seg = seg + 1
+                _do_adv = seg >= _n_seg
+                if _do_adv:
+                    seg = Int32(0)
+            else:
+                _do_adv = True
+            if _do_adv:
+                work_tile = tile_scheduler.advance_to_next_work()
             # End of persistent scheduler loop
 
         if issue_kv_for_this_warp:
@@ -1651,10 +1690,14 @@ class FlashAttentionForwardSm100:
         )
         P_full_O_rescaled_phase = Int32(0)
 
+        seg = Int32(0)
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
+            _n_seg, split_idx_eff, num_splits_eff = self._seg_split_range(
+                block_info, seqlen, m_block, seg, split_idx, num_splits
+            )
 
             block_iter_count = Int32(0)
             process_tile = False
@@ -1673,9 +1716,9 @@ class FlashAttentionForwardSm100:
                 )
                 process_tile = block_iter_count > Int32(0)
             else:
-                n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
+                n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx_eff, num_splits_eff)
                 block_iter_count = n_block_max - n_block_min
-                if const_expr(not self.is_split_kv):
+                if const_expr(not self.is_split_kv and not self.fused_split):
                     process_tile = True
                 else:
                     process_tile = n_block_min < n_block_max
@@ -1824,7 +1867,15 @@ class FlashAttentionForwardSm100:
                 # End of GEMM_PV1(i_end) (P1 * Vi_end -> O1)
 
             # Advance to next tile
-            work_tile = tile_scheduler.advance_to_next_work()
+            if const_expr(self.fused_split):
+                seg = seg + 1
+                _do_adv = seg >= _n_seg
+                if _do_adv:
+                    seg = Int32(0)
+            else:
+                _do_adv = True
+            if _do_adv:
+                work_tile = tile_scheduler.advance_to_next_work()
         # End of persistent scheduler loop
 
         # We don't need pipeline_s_p_o.producer_tail() since there's no dangling mbarrier at the end
@@ -1947,12 +1998,16 @@ class FlashAttentionForwardSm100:
 
         warp_idx_in_wg = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
 
+        seg = Int32(0)
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             kv_head_idx = self._kv_head_idx(head_idx)
             seqlen = SeqlenInfoCls(batch_idx)
-            n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
+            _n_seg, split_idx_eff, num_splits_eff = self._seg_split_range(
+                block_info, seqlen, m_block, seg, split_idx, num_splits
+            )
+            n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx_eff, num_splits_eff)
 
             mask = AttentionMaskCls(seqlen)
             shared_mask_kwargs = dict(
@@ -2114,7 +2169,7 @@ class FlashAttentionForwardSm100:
                 )
                 if not empty_tile:
                     sScale[tidx + stage * self.m_block_size] = softmax.row_sum[0]
-                    if const_expr(mLSE is not None or learnable_sink is not None):
+                    if const_expr(mLSE is not None or learnable_sink is not None or self.fused_split):
                         sScale[
                             tidx + stage * self.m_block_size + self.q_stage * self.m_block_size
                         ] = softmax.row_max[0]
@@ -2185,7 +2240,7 @@ class FlashAttentionForwardSm100:
 
                     # Dense path always writes scale / signals
                     sScale[tidx + stage * self.m_block_size] = softmax.row_sum[0]
-                    if const_expr(mLSE is not None or learnable_sink is not None):
+                    if const_expr(mLSE is not None or learnable_sink is not None or self.fused_split):
                         sScale[
                             tidx + stage * self.m_block_size + self.q_stage * self.m_block_size
                         ] = softmax.row_max[0]
@@ -2212,7 +2267,15 @@ class FlashAttentionForwardSm100:
             #         gLSE[tidx] = lse
 
             # Advance to next tile
-            work_tile = tile_scheduler.advance_to_next_work()
+            if const_expr(self.fused_split):
+                seg = seg + 1
+                _do_adv = seg >= _n_seg
+                if _do_adv:
+                    seg = Int32(0)
+            else:
+                _do_adv = True
+            if _do_adv:
+                work_tile = tile_scheduler.advance_to_next_work()
         # End of persistent scheduler loop
 
         # This is equivalent to pipeline_sm_stats.producer_tail
@@ -2366,6 +2429,7 @@ class FlashAttentionForwardSm100:
         thr_mma_pv: cute.ThrMma,
         tStS: cute.Tensor,
         tOtO: cute.Tensor,
+        tOacc: Optional[cute.Tensor],
         sScale: cute.Tensor,
         mO: cute.Tensor,
         mLSE: cute.Tensor,
@@ -2414,6 +2478,10 @@ class FlashAttentionForwardSm100:
         o_corr_consumer_phase = Int32(0)
         corr_epi_producer_phase = Int32(1)
 
+        seg = Int32(0)
+        # Fused running-merge state (per correction-warp row / thread).
+        m_run = -Float32.inf
+        s_run = Float32(0.0)
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
@@ -2429,7 +2497,14 @@ class FlashAttentionForwardSm100:
                 Float32(256.0) if cutlass.const_expr(self.q_dtype.width == 8) else Float32(1.0)
             )
             seqlen = SeqlenInfoCls(batch_idx)
-            n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
+            _n_seg, split_idx_eff, num_splits_eff = self._seg_split_range(
+                block_info, seqlen, m_block, seg, split_idx, num_splits
+            )
+            _is_last_seg = seg + 1 >= _n_seg
+            if const_expr(self.fused_split) and seg == 0:
+                m_run = -Float32.inf  # reset running merge state at the first segment
+                s_run = Float32(0.0)
+            n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx_eff, num_splits_eff)
 
             if const_expr(self.is_split_kv):
                 mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3)[None, None, head_idx, split_idx]
@@ -2445,7 +2520,7 @@ class FlashAttentionForwardSm100:
                 gO = cute.flat_divide(gO, (self.mma_tiler_pv[0] // self.cta_group_size,))[None, mma_tile_coord_v, None, None]
 
             # Default LSE to -inf for invalid split_idx tiles
-            stats = [(0.0, -Float32.inf if const_expr(mLSE is not None or learnable_sink is not None) else None, True)] * self.q_stage
+            stats = [(0.0, -Float32.inf if const_expr(mLSE is not None or learnable_sink is not None or self.fused_split) else None, True)] * self.q_stage
 
             if const_expr(self.use_block_sparsity):
                 total_block_count = get_total_block_count(
@@ -2522,7 +2597,7 @@ class FlashAttentionForwardSm100:
                     # cute.arch.fence_view_async_tmem_load()
                     # scale = tSrScale_t2r[0]
                     row_sum = sScale[tidx + stage * self.m_block_size]
-                    if const_expr(mLSE is not None or learnable_sink is not None):
+                    if const_expr(mLSE is not None or learnable_sink is not None or self.fused_split):
                         row_max = sScale[tidx + stage * self.m_block_size + self.q_stage * self.m_block_size]
                     else:
                         row_max = None
@@ -2545,28 +2620,65 @@ class FlashAttentionForwardSm100:
                     scale = scale * v_descale
                     # Wait for the last O to be ready from the MMA warp
                     pipeline_o_acc.consumer_wait_w_index_phase(stage, o_corr_consumer_phase)
-                    if const_expr(not self.use_correction_warps_for_epi):
-                        pipeline_o_epi.producer_acquire_w_index_phase(stage, corr_epi_producer_phase)
                     gO_stage = gO[None, None, stage] if const_expr(gO is not None) else None
-                    self.correction_epilogue(
-                        thr_mma_pv,
-                        tOtO[None, None, None, stage],
-                        tidx,
-                        stage,
-                        m_block,
-                        seqlen.seqlen_q,
-                        scale,
-                        sO[None, None, stage],
-                        mO_cur,
-                        gO_stage,
-                        gmem_tiled_copy_O,
-                    )
-                    # Signal for the next work tile that O buffers in tmem are already read, so
-                    # mma warp can write to them
-                    pipeline_s_p_o.consumer_release_w_index(stage)
-                    if const_expr(not self.use_correction_warps_for_epi):
-                        pipeline_o_epi.producer_commit_w_index(stage)
-                    # if tidx == 0: cute.printf("Correction final scale for stage %d: %f\n", stage, scale)
+                    if const_expr(self.fused_split):
+                        # In-kernel streaming merge of this segment's partial into tOacc.
+                        LN2 = math.log(2.0)
+                        LOG2_E = math.log2(math.e)
+                        lse_s = (
+                            -Float32.inf
+                            if acc_O_mn_row_is_zero_or_nan
+                            else (row_max * softmax_scale_log2_eff
+                                  + (cute.math.log2(row_sum, fastmath=True) - max_offset)) * LN2
+                        )
+                        m_new = cutlass.max(m_run, lse_s)
+                        a = cute.math.exp2((m_run - m_new) * LOG2_E, fastmath=True)
+                        b = cute.math.exp2((lse_s - m_new) * LOG2_E, fastmath=True)
+                        # O_s = tOtO_seg * (rcp(row_sum)*v_descale), matching the gmem split epilogue,
+                        # then tOacc = tOacc*a + O_s*b (b folds in the merge weight).
+                        self.correction_rescale(thr_mma_pv, tOtO[None, None, None, stage], tidx, scale)
+                        self.correction_merge(
+                            thr_mma_pv, tOacc[None, None, None, 0], tOtO[None, None, None, stage],
+                            tidx, a, b, seg == 0,
+                        )
+                        # Explicit non-FMA mul (mul_packed) + add, matching the combine's
+                        # s_run accumulation exactly so inv_sum=1/s_run is bitwise-identical
+                        # (a scalar FMA-contraction mismatch here flips a bf16 element on
+                        # boundary-value rows).
+                        _sa, _ = cute.arch.mul_packed_f32x2((s_run, Float32(0.0)), (a, a))
+                        s_run = _sa + b
+                        m_run = m_new
+                        pipeline_s_p_o.consumer_release_w_index(stage)
+                        if _is_last_seg:
+                            final_scale = (
+                                0.0 if (s_run == 0.0 or s_run != s_run) else 1.0 / s_run
+                            )
+                            self.correction_epilogue(
+                                thr_mma_pv, tOacc[None, None, None, 0], tidx, stage, m_block,
+                                seqlen.seqlen_q, final_scale, sO[None, None, stage], mO_cur,
+                                gO_stage, gmem_tiled_copy_O,
+                            )
+                    else:
+                        if const_expr(not self.use_correction_warps_for_epi):
+                            pipeline_o_epi.producer_acquire_w_index_phase(stage, corr_epi_producer_phase)
+                        self.correction_epilogue(
+                            thr_mma_pv,
+                            tOtO[None, None, None, stage],
+                            tidx,
+                            stage,
+                            m_block,
+                            seqlen.seqlen_q,
+                            scale,
+                            sO[None, None, stage],
+                            mO_cur,
+                            gO_stage,
+                            gmem_tiled_copy_O,
+                        )
+                        # Signal for the next work tile that O buffers in tmem are already read, so
+                        # mma warp can write to them
+                        pipeline_s_p_o.consumer_release_w_index(stage)
+                        if const_expr(not self.use_correction_warps_for_epi):
+                            pipeline_o_epi.producer_commit_w_index(stage)
 
                 o_corr_consumer_phase ^= 1
                 sm_stats_consumer_phase ^= 1
@@ -2634,11 +2746,19 @@ class FlashAttentionForwardSm100:
                     # if tidx == 0 and stage <= 1:
                     #     cute.printf("row_sum = {}, row_max = {}, acc_O_mn_row_is_zero_or_nan = {}\n", row_sum, row_max, acc_O_mn_row_is_zero_or_nan)
                     LN2 = math.log(2.0)
-                    lse = (
-                        (row_max * softmax_scale_log2_eff + (cute.math.log2(row_sum, fastmath=True) - max_offset)) * LN2
-                        if not acc_O_mn_row_is_zero_or_nan
-                        else -Float32.inf
-                    )
+                    if const_expr(self.fused_split):
+                        # Final LSE from the merged running state (natural log).
+                        lse = (
+                            -Float32.inf
+                            if (s_run == 0.0 or s_run != s_run)
+                            else cute.math.log(s_run, fastmath=True) + m_run
+                        )
+                    else:
+                        lse = (
+                            (row_max * softmax_scale_log2_eff + (cute.math.log2(row_sum, fastmath=True) - max_offset)) * LN2
+                            if not acc_O_mn_row_is_zero_or_nan
+                            else -Float32.inf
+                        )
                     seqlen_q = (
                         seqlen.seqlen_q
                         if const_expr(not self.pack_gqa)
@@ -2646,7 +2766,10 @@ class FlashAttentionForwardSm100:
                     )
                     if const_expr(not self.pack_gqa or self.m_block_size % self.qhead_per_kvhead == 0):
                         gLSE = cute.local_tile(mLSE_cur, (self.m_block_size,), (m_tile_idx,))
-                        if tidx < seqlen_q - m_tile_idx * self.m_block_size:
+                        # Fused: only write LSE once, on the last segment.
+                        if tidx < seqlen_q - m_tile_idx * self.m_block_size and (
+                            const_expr(not self.fused_split) or _is_last_seg
+                        ):
                             # This actually just works with PackGQA too
                             gLSE[tidx] = lse
                     else:
@@ -2661,7 +2784,15 @@ class FlashAttentionForwardSm100:
                             cute.make_tensor(lse_gmem_ptr, (1,))[0] = lse
 
             # Advance to next tile
-            work_tile = tile_scheduler.advance_to_next_work()
+            if const_expr(self.fused_split):
+                seg = seg + 1
+                _do_adv = seg >= _n_seg
+                if _do_adv:
+                    seg = Int32(0)
+            else:
+                _do_adv = True
+            if _do_adv:
+                work_tile = tile_scheduler.advance_to_next_work()
         # End of persistent scheduler loop
 
         # This is equivalent to pipeline_o_epi.consumer_tail() for the correction warps
@@ -2717,6 +2848,80 @@ class FlashAttentionForwardSm100:
                 )
             tOtO_r2t_i = cute.make_tensor(tOtO_r2t.iterator + i * corr_tile_size, tOtO_r2t.layout)
             cute.copy(thr_tmem_store, tOrO_frg, tOtO_r2t_i)
+        cute.arch.fence_view_async_tmem_store()
+
+    @cute.jit
+    def _seg_split_range(self, block_info, seqlen, m_block, seg, split_idx, num_splits):
+        """Map the current per-tile segment to the (split_idx, num_splits) the block-range
+        math expects. Fused prefill carves the KV range into ceil(n_blocks / n_blocks_per_split)
+        segments; non-fused passes the scheduler's split through unchanged. Returns
+        (n_seg, split_idx_eff, num_splits_eff)."""
+        if const_expr(self.fused_split):
+            n_seg = cute.ceil_div(
+                block_info.get_n_block_max_for_m_block(seqlen, m_block),
+                block_info.n_blocks_per_split,
+            )
+            return n_seg, seg, n_seg
+        return Int32(1), split_idx, num_splits
+
+    @cute.jit
+    def correction_merge(
+        self,
+        thr_mma: cute.ThrMma,
+        tOacc: cute.Tensor,
+        tOseg: cute.Tensor,
+        tidx: Int32,
+        a: Float32,
+        scale_seg: Float32,
+        first: Boolean,
+    ):
+        """Online streaming merge of a segment partial into the running accumulator (fused
+        prefill SplitKV). Computes Oacc = Oacc * a + Oseg * scale_seg in tmem, where `a`
+        rescales the running accumulator to the new global max and `scale_seg` = (1/row_sum_seg)
+        * exp2(lse_seg - max_new) folds the segment's own normalization with its merge weight.
+        Mirrors correction_rescale's tmem load/store machinery; per-thread (per-row) scalars."""
+        tOcO = thr_mma.partition_C(cute.make_identity_tensor(self.mma_tiler_pv[:2]))
+        corr_tile_size = 16
+        tmem_load_atom = cute.make_copy_atom(
+            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(corr_tile_size)), self.pv_acc_dtype
+        )
+        tmem_store_atom = cute.make_copy_atom(
+            tcgen05.copy.St32x32bOp(tcgen05.copy.Repetition(corr_tile_size)), self.pv_acc_dtype
+        )
+        tOacc_i = cute.composition(tOacc, cute.make_layout((self.m_block_size, corr_tile_size)))
+        tOseg_i = cute.composition(tOseg, cute.make_layout((self.m_block_size, corr_tile_size)))
+        tOcO_i = cute.composition(tOcO, cute.make_layout((self.m_block_size, corr_tile_size)))
+        thr_tmem_load = tcgen05.make_tmem_copy(tmem_load_atom, tOacc_i).get_slice(tidx)
+        thr_tmem_store = tcgen05.make_tmem_copy(tmem_store_atom, tOacc_i).get_slice(tidx)
+        tOacc_t2r = thr_tmem_load.partition_S(tOacc_i)
+        tOseg_t2r = thr_tmem_load.partition_S(tOseg_i)
+        tOrO_t2r_shape = thr_tmem_load.partition_D(tOcO_i).shape
+        tOacc_r2t = thr_tmem_store.partition_D(tOacc_i)
+        frg_count = self.head_dim_v_padded // corr_tile_size
+        for i in cutlass.range_constexpr(frg_count):
+            acc_frg = cute.make_rmem_tensor(tOrO_t2r_shape, self.pv_acc_dtype)
+            seg_frg = cute.make_rmem_tensor(tOrO_t2r_shape, self.pv_acc_dtype)
+            out_frg = cute.make_rmem_tensor(tOrO_t2r_shape, self.pv_acc_dtype)
+            tOseg_t2r_i = cute.make_tensor(tOseg_t2r.iterator + i * corr_tile_size, tOseg_t2r.layout)
+            cute.copy(thr_tmem_load, tOseg_t2r_i, seg_frg)
+            # Per-element acc*a + seg*scale_seg via separate f32 muls + add. The streaming
+            # combine (flash_fwd_combine.py) uses the IDENTICAL op sequence so each element
+            # is bitwise-identical between the in-kernel merge and the gmem path.
+            if first:
+                # First segment: tOacc = O_s * scale_seg (don't read uninitialized tOacc).
+                for j in cutlass.range(0, cute.size(seg_frg), 2, unroll_full=True):
+                    out_frg[j], out_frg[j + 1] = cute.arch.mul_packed_f32x2(
+                        (seg_frg[j], seg_frg[j + 1]), (scale_seg, scale_seg)
+                    )
+            else:
+                tOacc_t2r_i = cute.make_tensor(tOacc_t2r.iterator + i * corr_tile_size, tOacc_t2r.layout)
+                cute.copy(thr_tmem_load, tOacc_t2r_i, acc_frg)
+                for j in cutlass.range(0, cute.size(acc_frg), 2, unroll_full=True):
+                    pa0, pa1 = cute.arch.mul_packed_f32x2((acc_frg[j], acc_frg[j + 1]), (a, a))
+                    ps0, ps1 = cute.arch.mul_packed_f32x2((seg_frg[j], seg_frg[j + 1]), (scale_seg, scale_seg))
+                    out_frg[j], out_frg[j + 1] = pa0 + ps0, pa1 + ps1
+            tOacc_r2t_i = cute.make_tensor(tOacc_r2t.iterator + i * corr_tile_size, tOacc_r2t.layout)
+            cute.copy(thr_tmem_store, out_frg, tOacc_r2t_i)
         cute.arch.fence_view_async_tmem_store()
 
     @cute.jit
