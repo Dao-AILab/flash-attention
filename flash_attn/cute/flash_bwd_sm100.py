@@ -2756,14 +2756,12 @@ class FlashAttentionBackwardSm100:
     ):
         """Apply forward score modification for SM100 backward pass."""
         # In bwd, S is computed as K @ Q.T so dimensions are (tile_n, tile_m).
-        # With 2CTA, partition_C must see the full cluster tile so each CTA 
+        # With 2CTA, partition_C must see the full cluster tile so each CTA
         # gets its own half of the tile.
         cluster_tile_n = self.tile_n * self.cta_group_size
         cluster_n_block = n_block // self.cta_group_size
         cS = cute.make_identity_tensor((cluster_tile_n, self.tile_m))
-        cS = cute.domain_offset(
-            (cluster_n_block * cluster_tile_n, m_block * self.tile_m), cS
-        )
+        cS = cute.domain_offset((cluster_n_block * cluster_tile_n, m_block * self.tile_m), cS)
         tScS = thr_mma_S.partition_C(cS)
         tScS_idx = thr_copy_t2r.partition_D(tScS)
 
