@@ -2994,6 +2994,96 @@ def test_flash_attn_mla_paged(dtype, seqlen_q, seqlen_k, page_size, causal, has_
     assert torch.equal(out, out_ref)
 
 
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("page_size", [1, 16, 64, 128])
+@pytest.mark.parametrize("has_qk", [True, False])
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_k",
+    [
+        (1, 128),
+        (4, 256),
+        (64, 512),
+        (1, 2048),
+        (2048, 2048),
+    ],
+)
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_mla_paged(dtype, seqlen_q, seqlen_k, page_size, causal, has_qk):
+    if not IS_SM100:
+        pytest.skip("MLA paged KV only supported on SM100")
+    device = "cuda"
+    d, dv = 64, 512
+    nheads = 128
+    nheads_kv = 1
+    batch_size = 49 if seqlen_k <= 512 else 7
+
+    torch.random.manual_seed(0)
+
+    # Non-paged reference tensors (varlen format)
+    q = k = None
+    if has_qk:
+        q = torch.randn(batch_size * seqlen_q, nheads, d, device=device, dtype=dtype)
+        k = torch.randn(batch_size * seqlen_k, nheads_kv, d, device=device, dtype=dtype)
+    v = torch.randn(batch_size * seqlen_k, nheads_kv, dv, device=device, dtype=dtype)
+    qv = torch.randn(batch_size * seqlen_q, nheads, dv, device=device, dtype=dtype)
+
+    cu_seqlens_q = torch.tensor(
+        [i * seqlen_q for i in range(batch_size + 1)], dtype=torch.int32, device=device
+    )
+    cu_seqlens_k = torch.tensor(
+        [i * seqlen_k for i in range(batch_size + 1)], dtype=torch.int32, device=device
+    )
+
+    # Non-paged reference
+    out_ref, _ = flash_attn_varlen_func(
+        q, k, v, qv=qv,
+        cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=seqlen_q, max_seqlen_k=seqlen_k,
+        causal=causal,
+    )
+
+    # Create paged K/V cache
+    num_pages_per_seq = (seqlen_k + page_size - 1) // page_size
+    total_pages = num_pages_per_seq * batch_size
+    k_paged = None
+    if has_qk:
+        k_paged = torch.zeros(total_pages, page_size, nheads_kv, d, device=device, dtype=dtype)
+    v_paged = torch.zeros(total_pages, page_size, nheads_kv, dv, device=device, dtype=dtype)
+    page_table = torch.zeros(batch_size, num_pages_per_seq, dtype=torch.int32, device=device)
+
+    # Fill paged K/V from contiguous K/V (sequential page assignment)
+    for b in range(batch_size):
+        for p in range(num_pages_per_seq):
+            page_idx = b * num_pages_per_seq + p
+            start = p * page_size
+            end = min(start + page_size, seqlen_k)
+            k_offset = b * seqlen_k
+            if start < seqlen_k:
+                if has_qk:
+                    k_paged[page_idx, :end - start] = k[k_offset + start:k_offset + end]
+                v_paged[page_idx, :end - start] = v[k_offset + start:k_offset + end]
+            page_table[b, p] = page_idx
+
+    seqused_k = torch.full((batch_size,), seqlen_k, dtype=torch.int32, device=device)
+
+    # Paged output (triggers cp.async path if page_size != 128)
+    out, _ = flash_attn_varlen_func(
+        q, k_paged, v_paged, qv=qv,
+        cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=None,
+        max_seqlen_q=seqlen_q, max_seqlen_k=None,
+        seqused_k=seqused_k, page_table=page_table,
+        causal=causal,
+    )
+
+    if is_fake_mode():
+        return
+
+    print(f"Output max diff: {(out - out_ref).abs().max().item()}")
+    print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
+    assert torch.equal(out, out_ref)
+
+
 # ---------------------------------------------------------------------------
 # Regression test: seqlen_k=0 must not crash (CUDA graph padding scenario)
 # ---------------------------------------------------------------------------
