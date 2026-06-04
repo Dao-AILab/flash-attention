@@ -145,11 +145,11 @@ class FlashAttentionMLAForwardSm100:
 
         # ==== register usage ====
         if self.num_warps == 16:
-            self.num_regs_load = 80
-            self.num_regs_mma = 80
-            self.num_regs_softmax = 208
+            self.num_regs_load = 112
+            self.num_regs_mma = 112
+            self.num_regs_softmax = 192
             self.num_regs_epilogue = 128
-            self.num_regs_cpasync = 96 if self.use_cpasync_load_KV else 0
+            self.num_regs_cpasync = 80 if self.use_cpasync_load_KV else 0
             self.num_regs_other = 48
         else:
             self.num_regs_load = 168 - 40
@@ -230,7 +230,7 @@ class FlashAttentionMLAForwardSm100:
         self.num_stages_P = 1
         self.num_stages_Oi = 1
         self.num_stages_sm_stats = 2
-        self.num_stages_bitmask = 4
+        self.num_stages_bitmask = 2
         assert self.num_stages_S == 2, "mainloops expect 2 stages for S"
 
         # ==== dtype info ====
@@ -1028,19 +1028,22 @@ class FlashAttentionMLAForwardSm100:
 
         if const_expr(self.use_clc_scheduler):
             if warp_idx == self.clc_scheduler_warp_id:
-                cute.arch.setmaxregister_decrease(self.num_regs_other)
+                if const_expr(self.num_regs_other < self.num_regs_per_thread):
+                    cute.arch.setmaxregister_decrease(self.num_regs_other)
                 if is_leader_cta:
                     self.clc_scheduler_warp(tile_scheduler)
                 else:
                     self.empty_warp(tile_scheduler)
             for i in cutlass.range_constexpr(len(self.empty_warp_ids)):
                 if warp_idx == self.empty_warp_ids[i] and warp_idx != self.clc_scheduler_warp_id:
-                    cute.arch.setmaxregister_decrease(self.num_regs_other)
+                    if const_expr(self.num_regs_other < self.num_regs_per_thread):
+                        cute.arch.setmaxregister_decrease(self.num_regs_other)
                     self.empty_warp(tile_scheduler)
         else:
             for i in cutlass.range_constexpr(len(self.empty_warp_ids)):
                 if warp_idx == self.empty_warp_ids[i]:
-                    cute.arch.setmaxregister_decrease(self.num_regs_other)
+                    if const_expr(self.num_regs_other < self.num_regs_per_thread):
+                        cute.arch.setmaxregister_decrease(self.num_regs_other)
 
         if const_expr(self.use_cpasync_load_KV):
             if warp_idx == self.relay_warp_id:
@@ -1160,7 +1163,8 @@ class FlashAttentionMLAForwardSm100:
             tmem.free(tmem_ptr)
 
         if warp_idx in self.softmax_warp_indices:
-            cute.arch.setmaxregister_increase(self.num_regs_softmax)
+            if const_expr(self.num_regs_softmax > self.num_regs_per_thread):
+                cute.arch.setmaxregister_increase(self.num_regs_softmax)
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.dtype_acc)
             tStS = cute.make_tensor(tmem_ptr, tStS_fake.layout)
@@ -2166,9 +2170,9 @@ class FlashAttentionMLAForwardSm100:
         pipelines_O = [pipeline_O0, pipeline_O1]
         tOtOs = [tOtO0, tOtO1]
 
-        use_ptx_gemm_QK = not self.is_topk_gather
-        use_ptx_gemm_QvV = not self.is_topk_gather
-        use_ptx_gemm_PVt = not self.is_topk_gather
+        use_ptx_gemm_QK = True
+        use_ptx_gemm_QvV = True
+        use_ptx_gemm_PVt = True
 
         # Operands for S = Q @ K^T
         if const_expr(self.has_qk):
@@ -3011,6 +3015,11 @@ class FlashAttentionMLAForwardSm100:
             acc_O_mn_row_is_zero_or_nan = row_sum == 0.0 or row_sum != row_sum
             scale = cute.arch.rcp_approx(row_sum if not acc_O_mn_row_is_zero_or_nan else 1.0)
 
+            row_max = 0.0
+            if const_expr(mLSE is not None):
+                if tidx < self.cta_tile_m:
+                    row_max = sRowMax[tidx, 0]
+
             self.sm_stats_barrier_empty.arrive()
 
             seqlen_q = (
@@ -3030,7 +3039,6 @@ class FlashAttentionMLAForwardSm100:
                     mLSE_cur = cute.domain_offset((lse_offset,), mLSE[None, head_idx])
                 gLSE = cute.local_tile(mLSE_cur, (self.cta_tile_m,), (cta_m_block,))
                 if tidx < self.cta_tile_m:
-                    row_max = sRowMax[tidx, 0]
                     LN2 = math.log(2.0)
                     lse = (
                         (row_max * softmax_scale_log2 + cute.math.log2(row_sum, fastmath=True))
