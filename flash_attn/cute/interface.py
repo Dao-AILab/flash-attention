@@ -10,7 +10,6 @@ from typing import Optional, Tuple, Callable
 import torch
 
 
-import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
@@ -55,7 +54,6 @@ from flash_attn.cute.block_sparsity import (
     to_cute_block_sparse_tensors,
     normalize_block_sparse_config,
     normalize_block_sparse_config_bwd,
-    get_block_sparse_broadcast_pattern,
 )
 
 def _parse_arch_str(arch_str):
