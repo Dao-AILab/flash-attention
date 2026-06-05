@@ -969,7 +969,7 @@ def test_flash_attn_varlen_output(
             and (
                 (dv == d and d <= 128)
                 or (d == 192 and dv == 128)
-                or (IS_SM100 and d == 256 and dv == 256)
+                or (IS_SM100 and d == 256 and dv == 256 and softcap == 0.0)
             )
             and not has_learnable_sink
             # and False

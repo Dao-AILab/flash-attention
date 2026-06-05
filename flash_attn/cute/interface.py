@@ -1351,6 +1351,13 @@ def _flash_attn_bwd(
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
     arch = _get_device_arch()
     assert arch // 10 in [9, 10, 11, 12], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x, 12.x"
+    if block_sparse_tensors is not None:
+        assert (
+            cu_seqlens_q is None
+            and cu_seqlens_k is None
+            and seqused_q is None
+            and seqused_k is None
+        ), "Varlen backward with block sparsity is not yet supported"
     sparse_q = None
     kv_subtile_factor = 1
     if block_sparse_tensors is not None:
