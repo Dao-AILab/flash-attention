@@ -1548,78 +1548,85 @@ class FlashAttentionSparseMLABackwardSm100:
         tdVrdSt = tiled_mma_dStQvt.make_fragment_A(sdSt)
         tdVrQvt = tiled_mma_dStQvt.make_fragment_B(sQvt)
 
+        use_ptx_gemm_VdO = False
+        use_ptx_gemm_PtdOt = False
+        use_ptx_gemm_dStQvt = False
+
         # GEMM functions
-        # gemm_VdO = partial(
-        #     fa_sm100_utils.gemm_ptx_partial,
-        #     tiled_mma_VdO.op,
-        #     self.tmem_offset_dP,
-        #     zero_init=True,
-        #     cta_group=self.cta_group_size,
-        # )
-        gemm_VdO = partial(
-            fa_sm100_utils.gemm,
-            tiled_mma_VdO,
-            tdPtdP,
-        )
-        # gemm_PtdOt = [
-        #     partial(
-        #         fa_sm100_utils.gemm_ptx_partial,
-        #         tiled_mma_PtdOt.op,
-        #         self.tmem_offsets_dV[split],
-        #         zero_init=True,
-        #         cta_group=self.cta_group_size,
-        #     )
-        #     for split in range(self.num_hdimv_splits)
-        # ]
-        gemm_PtdOt = [
-            partial(
-                fa_sm100_utils.gemm,
-                tiled_mma_PtdOt,
-                tdVtdVs[split],
+        if const_expr(use_ptx_gemm_VdO):
+            gemm_VdO = partial(
+                fa_sm100_utils.gemm_ptx_partial,
+                tiled_mma_VdO.op,
+                self.tmem_offset_dP,
                 zero_init=True,
+                cta_group=self.cta_group_size,
             )
-            for split in range(self.num_hdimv_splits)
-        ]
-        # gemm_dStQvt = [
-        #     partial(
-        #         fa_sm100_utils.gemm_ptx_partial,
-        #         tiled_mma_dStQvt.op,
-        #         self.tmem_offsets_dV[split],
-        #         zero_init=False,
-        #         cta_group=self.cta_group_size,
-        #     )
-        #     for split in range(self.num_hdimv_splits)
-        # ]
-        gemm_dStQvt = [
-            partial(
+        else:
+            gemm_VdO = partial(
                 fa_sm100_utils.gemm,
-                tiled_mma_dStQvt,
-                tdVtdVs[split],
-                zero_init=False,
+                tiled_mma_VdO,
+                tdPtdP,
             )
-            for split in range(self.num_hdimv_splits)
-        ]
+        if const_expr(use_ptx_gemm_PtdOt):
+            gemm_PtdOt = [
+                partial(
+                    fa_sm100_utils.gemm_ptx_partial,
+                    tiled_mma_PtdOt.op,
+                    self.tmem_offsets_dV[split],
+                    zero_init=True,
+                    cta_group=self.cta_group_size,
+                )
+                for split in range(self.num_hdimv_splits)
+            ]
+        else:
+            gemm_PtdOt = [
+                partial(
+                    fa_sm100_utils.gemm,
+                    tiled_mma_PtdOt,
+                    tdVtdVs[split],
+                    zero_init=True,
+                )
+                for split in range(self.num_hdimv_splits)
+            ]
+        if const_expr(use_ptx_gemm_dStQvt):
+            gemm_dStQvt = [
+                partial(
+                    fa_sm100_utils.gemm_ptx_partial,
+                    tiled_mma_dStQvt.op,
+                    self.tmem_offsets_dV[split],
+                    zero_init=False,
+                    cta_group=self.cta_group_size,
+                )
+                for split in range(self.num_hdimv_splits)
+            ]
+        else:
+            gemm_dStQvt = [
+                partial(
+                    fa_sm100_utils.gemm,
+                    tiled_mma_dStQvt,
+                    tdVtdVs[split],
+                    zero_init=False,
+                )
+                for split in range(self.num_hdimv_splits)
+            ]
 
-        type_C, type_P = pipeline.PipelineUserType.Consumer, pipeline.PipelineUserType.Producer
-        consumer_state_V = pipeline.make_pipeline_state(type_C, stages=self.num_stages_V)
-        consumer_state_dO = pipeline.make_pipeline_state(type_C, stages=self.num_stages_dO)
-        consumer_state_Pt = pipeline.make_pipeline_state(type_C, stages=self.num_stages_Pt)
-        consumer_state_dOt_Qvt = pipeline.make_pipeline_state(type_C, stages=self.num_stages_dOt)
-        consumer_state_dSt = pipeline.make_pipeline_state(type_C, stages=self.num_stages_dSt)
-        producer_state_dPt = pipeline.make_pipeline_state(type_P, stages=self.num_stages_dPt)
-        producer_state_dV = pipeline.make_pipeline_state(type_P, stages=self.num_stages_dV)
+        Consumer, Producer = pipeline.PipelineUserType.Consumer, pipeline.PipelineUserType.Producer
+        consumer_state_V = pipeline.make_pipeline_state(Consumer, stages=self.num_stages_V)
+        consumer_state_dO = pipeline.make_pipeline_state(Consumer, stages=self.num_stages_dO)
+        consumer_state_Pt = pipeline.make_pipeline_state(Consumer, stages=self.num_stages_Pt)
+        consumer_state_dOt_Qvt = pipeline.make_pipeline_state(Consumer, stages=self.num_stages_dOt)
+        consumer_state_dSt = pipeline.make_pipeline_state(Consumer, stages=self.num_stages_dSt)
+        producer_state_dPt = pipeline.make_pipeline_state(Producer, stages=self.num_stages_dPt)
+        producer_state_dV = pipeline.make_pipeline_state(Producer, stages=self.num_stages_dV)
 
-        # mma_VdO = partial(self.mma_inner, gemm_VdO, pipeline_V, tdPrV, sV, tdPrdO, sdO, swap_AB_stage=True)
-        # mma_PtdOt = partial(self.mma_inner, gemm_PtdOt, pipeline_dOt_Qvt, tdVrPt, sPt, tdVrdOt, sdOt)
-        # mma_dStQvt = partial(self.mma_inner, gemm_dStQvt, pipeline_dOt_Qvt, tdVrdSt, sdSt, tdVrQvt, sQvt)
         mma_VdO = partial(
-            self.mma_inner_cute, gemm_VdO, pipeline_V, tdPrV, sV, tdPrdO, sdO, swap_AB_stage=True
+            self.mma_inner, gemm_VdO, pipeline_V, tdPrV, sV, tdPrdO, sdO, swap_AB_stage=True, use_ptx=use_ptx_gemm_VdO
         )
         mma_PtdOt = partial(
-            self.mma_inner_cute, gemm_PtdOt, pipeline_dOt_Qvt, tdVrPt, sPt, tdVrdOt, sdOt
+            self.mma_inner, gemm_PtdOt, pipeline_dOt_Qvt, tdVrPt, sPt, tdVrdOt, sdOt, use_ptx=use_ptx_gemm_PtdOt
         )
         mma_dStQvt = partial(
-            self.mma_inner_cute, gemm_dStQvt, pipeline_dOt_Qvt, tdVrdSt, sdSt, tdVrQvt, sQvt
+            self.mma_inner, gemm_dStQvt, pipeline_dOt_Qvt, tdVrdSt, sdSt, tdVrQvt, sQvt, use_ptx=use_ptx_gemm_dStQvt
         )
 
         work_tile = tile_scheduler.initial_work_tile_info()
@@ -1683,45 +1690,6 @@ class FlashAttentionSparseMLABackwardSm100:
         pipeline_dV.producer_tail(producer_state_dV)
 
     @cute.jit
-    def mma_inner_cute(
-        self,
-        gemm,
-        load_pipeline,
-        tCrA,
-        sA,
-        tCrB,
-        sB,
-        consumer_state: pipeline.PipelineState,
-        acc_stage: Optional[Int32] = None,
-        a_stage: Int32 = 0,
-        zero_init: Optional[bool] = None,
-        swap_AB_stage: bool = False,
-    ):
-        if const_expr(acc_stage is not None):
-            gemm = gemm[acc_stage]
-
-        smem_stage = consumer_state.index
-
-        if const_expr(not swap_AB_stage):
-            a_stage = a_stage
-            b_stage = smem_stage
-        else:
-            a_stage = smem_stage
-            b_stage = a_stage
-
-        tCrA_cur = tCrA[None, None, None, a_stage]
-        tCrB_cur = tCrB[None, None, None, b_stage]
-
-        load_pipeline.consumer_wait(consumer_state)
-        if const_expr(zero_init is not None):
-            gemm(tCrA=tCrA_cur, tCrB=tCrB_cur, zero_init=zero_init)
-        else:
-            gemm(tCrA=tCrA_cur, tCrB=tCrB_cur)
-        load_pipeline.consumer_release(consumer_state)
-        consumer_state.advance()
-        return consumer_state
-
-    @cute.jit
     def mma_inner(
         self,
         gemm,
@@ -1735,6 +1703,7 @@ class FlashAttentionSparseMLABackwardSm100:
         a_stage: Int32 = 0,
         zero_init: Optional[bool] = None,
         swap_AB_stage: bool = False,
+        use_ptx: bool = True,
     ):
         if const_expr(acc_stage is not None):
             gemm = gemm[acc_stage]
@@ -1753,11 +1722,14 @@ class FlashAttentionSparseMLABackwardSm100:
         tCrB_cur = tCrB[None, None, None, b_stage]
         sB_cur = sB[None, None, None, b_stage]
 
-        load_pipeline.consumer_wait(consumer_state)
+        kwargs = dict(tCrA=tCrA_cur, tCrB=tCrB_cur)
+        if const_expr(use_ptx):
+            kwargs |= dict(sA=sA_cur, sB=sB_cur)
         if const_expr(zero_init is not None):
-            gemm(tCrA=tCrA_cur, sA=sA_cur, tCrB=tCrB_cur, sB=sB_cur, zero_init=zero_init)
-        else:
-            gemm(tCrA=tCrA_cur, sA=sA_cur, tCrB=tCrB_cur, sB=sB_cur)
+            kwargs["zero_init"] = zero_init
+
+        load_pipeline.consumer_wait(consumer_state)
+        gemm(**kwargs)
         load_pipeline.consumer_release(consumer_state)
         consumer_state.advance()
         return consumer_state
