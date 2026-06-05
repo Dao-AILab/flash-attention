@@ -17,7 +17,7 @@ def load_checkpoint(path, device='cpu'):
         else:
             raise ValueError(f"Unable to find 'latest' file at {latest_path}")
         path /= f'{tag}/mp_rank_00_model_states.pt'
-    state_dict = torch.load(path, map_location=device)
+    state_dict = torch.load(path, map_location=device, weights_only=True)
     if is_deepspeed:
         state_dict = state_dict['module']
 
