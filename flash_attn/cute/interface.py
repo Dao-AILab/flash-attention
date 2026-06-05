@@ -876,7 +876,8 @@ def _flash_attn_fwd(
                     pack_gqa=pack_gqa,
                     qhead_per_kvhead=qhead_per_kvhead,
                     nheads_kv=num_head_kv,
-                    is_varlen_q=cu_seqlens_q is not None or seqused_q is not None,
+                    has_seqused_q=seqused_q is not None,
+                    has_cu_seqlens_q=cu_seqlens_q is not None,
                     disable_bitmask=disable_sparse_kv_bitmask,
                     has_qk=has_qk,
                 )
