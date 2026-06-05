@@ -13,7 +13,7 @@ import cutlass
 from cutlass.pipeline import PipelineClcFetchAsync, PipelineState
 from cutlass._mlir import ir
 import cutlass.cute as cute
-from cutlass import Int32, const_expr
+from cutlass import Int32, Int64, const_expr
 from cutlass.cute import FastDivmodDivisor
 from cutlass.utils import ClcDynamicPersistentTileScheduler, ClcDynamicPersistentTileSchedulerParams
 from cutlass.cute.typing import Boolean
@@ -424,7 +424,10 @@ class SingleTileLPTScheduler:
                 f"Only STATIC and CLC are supported, got {scheduling_mode!r}"
             )
             size_one_kv_head = max(
-                args.seqlen_k * (args.headdim + args.headdim_v) * args.element_size, 1024
+                Int64(args.seqlen_k)
+                * Int64(args.headdim + args.headdim_v)
+                * Int64(args.element_size),
+                1024,
             )
             size_one_head = size_one_kv_head
             size_l2 = 50 * 1024 * 1024  # 40 MB for K & V
