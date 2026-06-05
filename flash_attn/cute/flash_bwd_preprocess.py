@@ -161,6 +161,7 @@ class FlashAttentionBackwardPreprocess:
         if const_expr(mdQaccum is not None):
             assert self.nheads_major is False
             assert self.pack_gqa is False
+            assert self.use_padded_offsets is True
             if const_expr(mdQaccum.element_type not in [Float32]):
                 raise TypeError("dQaccum tensor must be Float32")
         if const_expr(mLSE is not None):
@@ -311,14 +312,6 @@ class FlashAttentionBackwardPreprocess:
         work_tile = tile_scheduler.initial_work_tile_info()
         m_block, head_idx, batch_idx, _ = work_tile.tile_idx
 
-        # Stats buffers (dpsum/lse_log2) are always consumed with padded q-offsets
-        # on the generic backward path (mdQaccum is present).
-        # Other backward kernel behavior controlled by self.use_padded_offsets.
-        stats_use_padded_offsets = self.use_padded_offsets
-        if const_expr(mdQaccum is not None):
-            stats_use_padded_offsets = True
-        padded = stats_use_padded_offsets
-
         # This kernel is launched with use_pdl=True, so the GPU may start executing it in
         # "prologue" mode while the previous stream kernel is still running. We must wait
         # before touching any upstream GMEM outputs (mO, mdO, mLSE); otherwise we risk
@@ -339,9 +332,9 @@ class FlashAttentionBackwardPreprocess:
             mO_cur, mdO_cur = [
                 seqlen.offset_batch(mX, batch_idx, dim=3)[None, None, head_idx] for mX in (mO, mdO)
             ]
-            mPdPsum_cur = seqlen.offset_batch(mPdPsum, batch_idx, dim=2, padded=padded)[
-                None, head_idx
-            ]
+            mPdPsum_cur = seqlen.offset_batch(
+                mPdPsum, batch_idx, dim=2, padded=self.use_padded_offsets
+            )[None, head_idx]
             headdim_v = mO_cur.shape[1]
             seqlen_q = (
                 seqlen.seqlen
@@ -426,7 +419,7 @@ class FlashAttentionBackwardPreprocess:
                     mdQaccum,
                     batch_idx,
                     dim=2,
-                    padded=padded,
+                    padded=self.use_padded_offsets,
                     multiple=self.head_dim_padded,
                 )[None, head_idx]
                 blkdQaccum_shape = (self.tile_m * self.head_dim_padded,)
@@ -440,9 +433,9 @@ class FlashAttentionBackwardPreprocess:
             LOG2_E = math.log2(math.e)
             lse_log2 = lse * LOG2_E if lse != -Float32.inf else 0.0
             if const_expr(mLSElog2 is not None):
-                mLSElog2_cur = seqlen.offset_batch(mLSElog2, batch_idx, dim=2, padded=padded)[
-                    None, head_idx
-                ]
+                mLSElog2_cur = seqlen.offset_batch(
+                    mLSElog2, batch_idx, dim=2, padded=self.use_padded_offsets
+                )[None, head_idx]
                 gLSElog2 = cute.local_tile(mLSElog2_cur, (self.tile_m,), (m_block,))
                 LOG2_E = math.log2(math.e)
                 if tidx < seqlen_q_rounded - m_block * self.tile_m:
