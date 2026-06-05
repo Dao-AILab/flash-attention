@@ -649,7 +649,7 @@ class FlashAttentionMLAForwardSm100:
         )
 
         tile_sched_args = TileSchedulerArguments(
-            num_block=cute.ceil_div(cute.size(mQv.shape[0]), self.cta_tile_m),
+            num_block=cute.ceil_div(cute.size(mQv.shape[0]), self.cluster_tile_m),
             num_head=cute.size(mQv.shape[2]),
             num_batch=batch_size_for_sched,
             num_splits=1,  # todo: split_kv
@@ -661,10 +661,7 @@ class FlashAttentionMLAForwardSm100:
             total_q=cute.size(mQv.shape[0])
             if const_expr(mCuSeqlensQ is not None)
             else cute.size(mQv.shape[0]) * cute.size(mQv.shape[3]),
-            tile_shape_mn=(
-                self.cta_tile_m,
-                self.tile_n,
-            ),
+            tile_shape_mn=(self.cta_tile_m, self.tile_n),
             mCuSeqlensQ=mCuSeqlensQ,
             mSeqUsedQ=mSeqUsedQ,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
@@ -674,7 +671,7 @@ class FlashAttentionMLAForwardSm100:
             lpt=False,
             is_split_kv=False,
             cluster_shape_mn=self.cluster_shape_mn,
-            use_cluster_idx=False,
+            use_cluster_idx=True,
         )
         tile_sched_params = TileScheduler.to_underlying_arguments(
             tile_sched_args, scheduling_mode=self.scheduling_mode
@@ -815,10 +812,8 @@ class FlashAttentionMLAForwardSm100:
         cta_layout_vmnk = cute.tiled_divide(
             cute.make_layout(self.cluster_shape_mnk), (tiled_mma_QvV.thr_id.shape,)
         )
-
-        cta_m_block, head_idx, batch_idx = cute.arch.block_idx()
-        cluster_m_block = cta_m_block // self.cta_group_size
-        mma_tile_coord_v = cta_m_block % cute.size(tiled_mma_QvV.thr_id.shape)
+        cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+        mma_tile_coord_v = cta_rank_in_cluster % cute.size(tiled_mma_QvV.thr_id.shape)
         is_leader_cta = mma_tile_coord_v == 0
 
         # ==== Allocate SMEM ====
@@ -1252,7 +1247,7 @@ class FlashAttentionMLAForwardSm100:
         while work_tile.is_valid_tile:
             tile_scheduler.prefetch_next_work()
             work_tile = tile_scheduler.advance_to_next_work()
-            # cta_m_block, head_idx, batch_idx, _ = work_tile.tile_idx
+            # cluster_m_block, head_idx, batch_idx, _ = work_tile.tile_idx
             if cute.arch.thread_idx()[0] == self.clc_scheduler_warp_id * cute.arch.WARP_SIZE:
                 fa_printf(
                     3,
@@ -1306,13 +1301,11 @@ class FlashAttentionMLAForwardSm100:
 
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
-            cta_m_block, head_idx, batch_idx, _ = work_tile.tile_idx
-            cluster_m_block = cta_m_block // self.cta_group_size
+            cluster_m_block, head_idx, batch_idx, _ = work_tile.tile_idx
             if const_expr(self.use_packed_varlen_sched):
                 batch_idx = get_batch_from_cu_tensor(cluster_m_block, mCuSeqlensQ)
                 if const_expr(not self.is_topk_gather):
                     cluster_m_block -= mCuSeqlensQ[batch_idx]
-                # don't need to update cta_m_block
 
             seqlen = SeqlenInfoCls(batch_idx)
             if const_expr(self.is_topk_gather):
@@ -1424,13 +1417,11 @@ class FlashAttentionMLAForwardSm100:
 
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
-            cta_m_block, head_idx, batch_idx, _ = work_tile.tile_idx
-            cluster_m_block = cta_m_block // self.cta_group_size
+            cluster_m_block, head_idx, batch_idx, _ = work_tile.tile_idx
             if const_expr(self.use_packed_varlen_sched):
                 batch_idx = get_batch_from_cu_tensor(cluster_m_block, mCuSeqlensQ)
                 if const_expr(not self.is_topk_gather):
                     cluster_m_block -= mCuSeqlensQ[batch_idx]
-                # don't need to update cta_m_block
             head_idx_kv = (
                 head_idx // self.qhead_per_kvhead if const_expr(not self.pack_gqa) else head_idx
             )
@@ -1897,12 +1888,10 @@ class FlashAttentionMLAForwardSm100:
 
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
-            cta_m_block, head_idx, batch_idx, _ = work_tile.tile_idx
-            cluster_m_block = cta_m_block // self.cta_group_size
+            cluster_m_block, head_idx, batch_idx, _ = work_tile.tile_idx
             if const_expr(self.use_packed_varlen_sched):
                 batch_idx = get_batch_from_cu_tensor(cluster_m_block, mCuSeqlensQ)
                 cluster_m_block -= mCuSeqlensQ[batch_idx]
-                # don't need to update cta_m_block
             head_idx_kv = (
                 head_idx // self.qhead_per_kvhead if const_expr(not self.pack_gqa) else head_idx
             )
@@ -2311,12 +2300,10 @@ class FlashAttentionMLAForwardSm100:
         work_tile = tile_scheduler.initial_work_tile_info()
         O_should_accumulate = False
         while work_tile.is_valid_tile:
-            cta_m_block, head_idx, batch_idx, _ = work_tile.tile_idx
-            cluster_m_block = cta_m_block // self.cta_group_size
+            cluster_m_block, head_idx, batch_idx, _ = work_tile.tile_idx
             if const_expr(self.use_packed_varlen_sched):
                 batch_idx = get_batch_from_cu_tensor(cluster_m_block, mCuSeqlensQ)
                 cluster_m_block -= mCuSeqlensQ[batch_idx]
-                # don't need to update cta_m_block
 
             seqlen = SeqlenInfoCls(batch_idx)
             if const_expr(self.is_topk_gather):
@@ -2583,12 +2570,11 @@ class FlashAttentionMLAForwardSm100:
 
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
-            cta_m_block, head_idx, batch_idx, _ = work_tile.tile_idx
-            cluster_m_block = cta_m_block // self.cta_group_size
+            cluster_m_block, head_idx, batch_idx, _ = work_tile.tile_idx
             if const_expr(self.use_packed_varlen_sched):
                 batch_idx = get_batch_from_cu_tensor(cluster_m_block, mCuSeqlensQ)
                 cluster_m_block -= mCuSeqlensQ[batch_idx]
-                cta_m_block = cluster_m_block * self.cta_group_size + cta_rank_in_cluster
+            cta_m_block = cluster_m_block * self.cta_group_size + cta_rank_in_cluster
             seqlen = SeqlenInfoCls(batch_idx)
             if const_expr(self.is_topk_gather):
                 n_block_min = 0
@@ -2977,12 +2963,11 @@ class FlashAttentionMLAForwardSm100:
 
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
-            cta_m_block, head_idx, batch_idx, _ = work_tile.tile_idx
-            cluster_m_block = cta_m_block // self.cta_group_size
+            cluster_m_block, head_idx, batch_idx, _ = work_tile.tile_idx
             if const_expr(self.use_packed_varlen_sched):
                 batch_idx = get_batch_from_cu_tensor(cluster_m_block, mCuSeqlensQ)
                 cluster_m_block -= mCuSeqlensQ[batch_idx]
-                cta_m_block = cluster_m_block * self.cta_group_size + cta_rank_in_cluster
+            cta_m_block = cluster_m_block * self.cta_group_size + cta_rank_in_cluster
 
             seqlen = SeqlenInfoCls(batch_idx)
             if const_expr(self.is_topk_gather):
