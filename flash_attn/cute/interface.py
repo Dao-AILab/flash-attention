@@ -2037,6 +2037,7 @@ def _flash_attn_bwd_sparse_mla(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     arch = _get_device_arch()
     assert arch // 10 in [10, 11], "Unsupported compute capability. Supported: 10.x, 11.x"
+    assert gather_kv_indices is not None, "require gather kv indices for backward"
 
     q_shape = q.shape if q is not None else qv.shape
     nheads, head_dim = q_shape[-2:]
