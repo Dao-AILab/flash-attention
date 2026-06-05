@@ -1,7 +1,11 @@
 import pytest
 import torch
 from torch.nn.attention.flex_attention import flex_attention
-from flash_attn.cute.interface import _flash_attn_fwd, _flash_attn_bwd
+from flash_attn.cute.interface import (
+    _flash_attn_fwd,
+    _flash_attn_bwd,
+    flash_attn_varlen_func,
+)
 from test_score_mod import _generate_block_kvcache
 from score_mod_definitions import (
     # TensorSSA-based score mods
@@ -1217,12 +1221,34 @@ def run_cute_flash_bwd_varlen(
     cu_seqlens_k,
     aux_tensors=None,
     pack_gqa=False,
+    use_autograd=True,
 ):
-    """Forward + backward via _flash_attn_fwd / _flash_attn_bwd directly (no autograd).
+    """Forward + backward with score_mod for packed varlen inputs.
 
-    Mirrors run_cute_flash_bwd(use_autograd=False) in test_score_mod.py. Inputs are
-    already in packed varlen layout (total, num_heads, head_dim) so no transpose.
+    Mirrors run_cute_flash_bwd in test_score_mod.py. use_autograd=True drives
+    flash_attn_varlen_func + torch.autograd.grad; False calls the fwd/bwd entry
+    points directly.
     """
+    if use_autograd:
+        q = q.detach().requires_grad_(True)
+        k = k.detach().requires_grad_(True)
+        v = v.detach().requires_grad_(True)
+        out, lse = flash_attn_varlen_func(
+            q,
+            k,
+            v,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            score_mod=cute_score_mod,
+            score_mod_bwd=cute_score_mod_bwd,
+            aux_tensors=aux_tensors,
+            pack_gqa=pack_gqa,
+            return_lse=True,
+        )
+        grad_out = torch.randn_like(out)
+        dq, dk, dv = torch.autograd.grad(out, (q, k, v), grad_out)
+        return out, grad_out, dq, dk, dv
+
     out, lse = _flash_attn_fwd(
         q,
         k,
@@ -1327,7 +1353,10 @@ def _check_grad(name, cute_grad, ref_fp32, pt_grad, dtype, rtol=3, extra=1e-3):
 @pytest.mark.parametrize("dim", [64, 128])
 @pytest.mark.parametrize("seqlens_q,seqlens_k", BWD_SEQLEN_CONFIGS)
 @pytest.mark.parametrize("score_mod_tuple", BWD_TEST_PAIRS)
-def test_varlen_score_mod_backward(seqlens_q, seqlens_k, dim, dtype, score_mod_tuple):
+@pytest.mark.parametrize("use_autograd", [True, False])
+def test_varlen_score_mod_backward(
+    seqlens_q, seqlens_k, dim, dtype, score_mod_tuple, use_autograd
+):
     """Varlen backward with score_mod (no global indices in bwd)."""
     if IS_SM90 and dim == 64:
         pytest.skip("head_dim=64 not supported on SM90 for backward")
@@ -1373,6 +1402,7 @@ def test_varlen_score_mod_backward(seqlens_q, seqlens_k, dim, dtype, score_mod_t
         cu_seqlens_q,
         cu_seqlens_k,
         aux_tensors=aux_tensors,
+        use_autograd=use_autograd,
     )
 
     _, dq_ref_fp32, dk_ref_fp32, dv_ref_fp32 = run_flex_varlen_ref_bwd(
@@ -1406,8 +1436,9 @@ def test_varlen_score_mod_backward(seqlens_q, seqlens_k, dim, dtype, score_mod_t
 @pytest.mark.parametrize("dim", [64, 128])
 @pytest.mark.parametrize("seqlens_q,seqlens_k", BWD_SEQLEN_CONFIGS)
 @pytest.mark.parametrize("score_mod_tuple", BWD_TEST_PAIRS_WITH_GLOBAL)
+@pytest.mark.parametrize("use_autograd", [True, False])
 def test_varlen_score_mod_backward_with_global(
-    seqlens_q, seqlens_k, dim, dtype, score_mod_tuple
+    seqlens_q, seqlens_k, dim, dtype, score_mod_tuple, use_autograd
 ):
     """Varlen backward with a score_mod whose bwd reads aux at global indices.
 
@@ -1452,6 +1483,7 @@ def test_varlen_score_mod_backward_with_global(
         cu_seqlens_q,
         cu_seqlens_k,
         aux_tensors=aux_tensors,
+        use_autograd=use_autograd,
     )
 
     _, dq_ref_fp32, dk_ref_fp32, dv_ref_fp32 = run_flex_varlen_ref_bwd(

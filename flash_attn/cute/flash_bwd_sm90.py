@@ -1256,20 +1256,6 @@ class FlashAttentionBackwardSm90:
         PdS_barrier = cutlass.pipeline.NamedBarrier(
             barrier_id=int(NamedBarrierBwd.PdS), num_threads=self.num_mma_threads
         )
-        score_mod_fn = partial(
-            self.apply_score_mod,
-            thr_mma_SdP=thr_mma_SdP,
-            softmax_scale=softmax_scale,
-            aux_tensors=aux_tensors,
-            fastdiv_mods=fastdiv_mods,
-        )
-        score_mod_bwd_fn = partial(
-            self.apply_score_mod_bwd,
-            thr_mma_SdP=thr_mma_SdP,
-            softmax_scale=softmax_scale,
-            aux_tensors=aux_tensors,
-            fastdiv_mods=fastdiv_mods,
-        )
 
         mma_one_m_block_all = partial(
             self.mma_one_m_block,
@@ -1324,6 +1310,20 @@ class FlashAttentionBackwardSm90:
                 )
 
             mask = AttentionMaskCls(seqlen)
+            score_mod_fn = partial(
+                self.apply_score_mod,
+                thr_mma_SdP=thr_mma_SdP,
+                softmax_scale=softmax_scale,
+                aux_tensors=aux_tensors,
+                fastdiv_mods=fastdiv_mods,
+            )
+            score_mod_bwd_fn = partial(
+                self.apply_score_mod_bwd,
+                thr_mma_SdP=thr_mma_SdP,
+                softmax_scale=softmax_scale,
+                aux_tensors=aux_tensors,
+                fastdiv_mods=fastdiv_mods,
+            )
             score_mod_fn_cur = partial(
                 score_mod_fn,
                 batch_idx=batch_idx,
