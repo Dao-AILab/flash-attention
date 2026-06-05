@@ -59,7 +59,7 @@ def state_dict_from_pretrained(model_name, device=None, dtype=None):
     if load_safe:
         loader = partial(safe_load_file, device=mapped_device)
     else:
-        loader = partial(torch.load, map_location=mapped_device)
+        loader = partial(torch.load, map_location=mapped_device, weights_only=True)
 
     if is_sharded:
         # resolved_archive_file becomes a list of files that point to the different

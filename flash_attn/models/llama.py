@@ -385,7 +385,7 @@ def state_dicts_from_checkpoint(
 ) -> List[dict]:
     # Need to sort, otherwise we mess up the ordering and the weights are wrong
     return [
-        torch.load(path, map_location="cpu")
+        torch.load(path, map_location="cpu", weights_only=True)
         for path in sorted((Path(checkpoint_path) / model_name).glob("consolidated.*.pth"))
     ]
 
