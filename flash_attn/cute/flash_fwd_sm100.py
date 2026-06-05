@@ -176,10 +176,15 @@ class FlashAttentionForwardSm100:
         self.is_causal = is_causal
         self.is_local = is_local
         self.is_varlen_q = is_varlen_q
-        self.use_correction_warps_for_epi = is_varlen_q
         self.qhead_per_kvhead = qhead_per_kvhead
         self.is_split_kv = is_split_kv
         self.pack_gqa = pack_gqa
+        self.use_tma_O = (
+            not (self.pack_gqa and self.m_block_size % self.qhead_per_kvhead != 0)
+            and not (self.pack_gqa and self.is_split_kv)
+            and not is_varlen_q
+        )
+        self.use_correction_warps_for_epi = not self.use_tma_O
         self.q_subtile_factor = q_subtile_factor
         assert not (self.is_split_kv and self.head_dim_v_padded >= 192), (
             "SplitKV is not supported for hdim >= 192"
@@ -277,8 +282,6 @@ class FlashAttentionForwardSm100:
         if self.use_correction_warps_for_epi:
             self.empty_warp_ids = self.empty_warp_ids + self.epilogue_warp_ids
             self.epilogue_warp_ids = self.correction_warp_ids
-        elif self.is_varlen_q: # fallback
-            self.epilogue_warp_ids = (13, 14)
 
         self.clc_scheduler_warp_id = self.empty_warp_ids[0] if self.use_clc_scheduler else None
 
@@ -455,13 +458,6 @@ class FlashAttentionForwardSm100:
                     self.num_regs_correction = fp8_tune["num_regs_correction"]
                     self.num_regs_other = 512 - self.num_regs_softmax * 2 - self.num_regs_correction
         self._setup_attributes()
-        self.use_tma_O = (
-            self.arch >= Arch.sm_90
-            and mCuSeqlensQ is None
-            and mSeqUsedQ is None
-            and not (self.pack_gqa and self.m_block_size % self.qhead_per_kvhead != 0)
-            and not (self.pack_gqa and self.is_split_kv)
-        )
         self.ex2_emu_freq = 0
         self.ex2_emu_start_frg = self._tune.get("ex2_emu_start_frg", 1)
         if const_expr(self.enable_ex2_emu):

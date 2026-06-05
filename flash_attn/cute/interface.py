@@ -536,13 +536,6 @@ def _flash_attn_fwd(
     if intra_wg_overlap is None:
         intra_wg_overlap = fwd_cfg.intra_wg_overlap
 
-    # TODO: fix GQA + SplitKV + non-varlen
-    if pack_gqa and num_splits != 1 and cu_seqlens_q is None:
-        pack_gqa = False
-    
-    if pack_gqa and qv is not None and 128 % qhead_per_kvhead != 0:
-        pack_gqa = False
-
     if max_seqlen_q is None:
         max_seqlen_q = seqlen_q if cu_seqlens_q is None else total_q
     if max_seqlen_k is None:
