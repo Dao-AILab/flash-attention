@@ -97,7 +97,7 @@ class FlashAttentionMLAForwardSm100:
         )
 
         self.is_varlen_q = has_seqused_q or has_cu_seqlens_q
-        self.use_packed_varlen_sched = has_cu_seqlens_q and is_topk_gather
+        self.use_packed_varlen_sched = has_cu_seqlens_q and qhead_per_kvhead == 128 and pack_gqa
         self.use_varlen_scheduler = self.is_varlen_q and not self.use_packed_varlen_sched
 
         if const_expr(self.use_varlen_scheduler):

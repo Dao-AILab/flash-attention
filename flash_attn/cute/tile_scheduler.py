@@ -423,7 +423,9 @@ class SingleTileLPTScheduler:
             assert scheduling_mode in (SchedulingMode.STATIC, SchedulingMode.CLC), (
                 f"Only STATIC and CLC are supported, got {scheduling_mode!r}"
             )
-            size_one_kv_head = args.seqlen_k * (args.headdim + args.headdim_v) * args.element_size
+            size_one_kv_head = max(
+                args.seqlen_k * (args.headdim + args.headdim_v) * args.element_size, 1024
+            )
             size_one_head = size_one_kv_head
             size_l2 = 50 * 1024 * 1024  # 40 MB for K & V
             # Swizzle is the size of each "section". Round swizzle to a power of 2
