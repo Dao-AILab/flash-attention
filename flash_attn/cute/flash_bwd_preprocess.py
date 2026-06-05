@@ -311,16 +311,13 @@ class FlashAttentionBackwardPreprocess:
         work_tile = tile_scheduler.initial_work_tile_info()
         m_block, head_idx, batch_idx, _ = work_tile.tile_idx
 
-        if const_expr(self.nheads_major):
-            padded = False
-        else:
-            # Stats buffers (dpsum/lse_log2) are always consumed with padded q-offsets
-            # on the generic backward path (mdQaccum is present). Keep dedicated hd256
-            # behavior controlled by self.use_padded_offsets.
-            stats_use_padded_offsets = self.use_padded_offsets
-            if const_expr(mdQaccum is not None):
-                stats_use_padded_offsets = True
-            padded = stats_use_padded_offsets
+        # Stats buffers (dpsum/lse_log2) are always consumed with padded q-offsets
+        # on the generic backward path (mdQaccum is present).
+        # Other backward kernel behavior controlled by self.use_padded_offsets.
+        stats_use_padded_offsets = self.use_padded_offsets
+        if const_expr(mdQaccum is not None):
+            stats_use_padded_offsets = True
+        padded = stats_use_padded_offsets
 
         # This kernel is launched with use_pdl=True, so the GPU may start executing it in
         # "prologue" mode while the previous stream kernel is still running. We must wait
