@@ -41,7 +41,7 @@ from flash_attn.cute.tile_scheduler import (
     ParamsBase,
 )
 from flash_attn.cute.fa_logging import fa_log, fa_printf
-from flash_attn.cute.utils import smid
+from flash_attn.cute.utils import smid, get_batch_from_cu_tensor
 
 from flash_attn.cute.topk_gather_kv import CpasyncGatherKVManager
 
@@ -64,7 +64,8 @@ class FlashAttentionMLAForwardSm100:
         nheads_kv: int = 1,
         hdim: int = 64,
         hdimv: int = 512,
-        is_varlen_q: bool = False,
+        has_seqused_q: bool = False,
+        has_cu_seqlens_q: bool = False,
         disable_bitmask: bool = False,
         use_clc_scheduler: bool = True,
         has_qk: bool = True,
@@ -74,7 +75,6 @@ class FlashAttentionMLAForwardSm100:
         self.pack_gqa = pack_gqa
         self.qhead_per_kvhead = qhead_per_kvhead
         self.nheads_kv = nheads_kv
-        self.is_varlen_q = is_varlen_q
         self.use_tma_O = True
         self.use_cpasync_load_KV = use_cpasync_load_KV
         self.use_tma_KV = not use_cpasync_load_KV
@@ -90,13 +90,17 @@ class FlashAttentionMLAForwardSm100:
 
         # ==== tile scheduler ====
         self.is_persistent = False
-        self.use_clc_scheduler = use_clc_scheduler and not is_varlen_q
+        self.use_clc_scheduler = use_clc_scheduler
         self.sched_stages = 1
         self.scheduling_mode = (
             SchedulingMode.CLC if self.use_clc_scheduler else SchedulingMode.STATIC
         )
 
-        if const_expr(is_varlen_q):
+        self.is_varlen_q = has_seqused_q or has_cu_seqlens_q
+        self.use_packed_varlen_sched = has_cu_seqlens_q and is_topk_gather
+        self.use_varlen_scheduler = self.is_varlen_q and not self.use_packed_varlen_sched
+
+        if const_expr(self.use_varlen_scheduler):
             self.TileScheduler = SingleTileVarlenScheduler
         elif self.use_clc_scheduler:
             self.TileScheduler = SingleTileLPTScheduler
@@ -637,13 +641,17 @@ class FlashAttentionMLAForwardSm100:
         # ==== Tile scheduler ====
 
         TileScheduler = self.TileScheduler
+        
+        batch_size_for_sched = (
+            cute.size(mQv.shape[3]) if const_expr(mCuSeqlensQ is None)
+            else cute.size(mCuSeqlensQ.shape[0] - 1) if self.use_varlen_scheduler
+            else 1
+        )
 
         tile_sched_args = TileSchedulerArguments(
             num_block=cute.ceil_div(cute.size(mQv.shape[0]), self.cta_tile_m),
             num_head=cute.size(mQv.shape[2]),
-            num_batch=cute.size(mQv.shape[3])
-            if const_expr(mCuSeqlensQ is None)
-            else cute.size(mCuSeqlensQ.shape[0] - 1),
+            num_batch=batch_size_for_sched,
             num_splits=1,  # todo: split_kv
             seqlen_k=cute.size(mV.shape[0])
             if const_expr(mPageTable is None)
@@ -1059,6 +1067,7 @@ class FlashAttentionMLAForwardSm100:
                     block_info,
                     SeqlenInfoCls,
                     tile_scheduler=tile_scheduler,
+                    mCuSeqlensQ=mCuSeqlensQ,
                 )
 
             if warp_idx in self.cpasync_load_warp_indices:
@@ -1084,6 +1093,7 @@ class FlashAttentionMLAForwardSm100:
                     SeqlenInfoCls,
                     tile_scheduler=tile_scheduler,
                     mPageTable=mPageTable,
+                    mCuSeqlensQ=mCuSeqlensQ,
                 )
 
         if warp_idx == self.load_warp_id:
@@ -1118,6 +1128,7 @@ class FlashAttentionMLAForwardSm100:
                 SeqlenInfoCls,
                 tile_scheduler=tile_scheduler,
                 mPageTable=mPageTable,
+                mCuSeqlensQ=mCuSeqlensQ,
             )
 
         if warp_idx == self.mma_warp_id:
@@ -1157,6 +1168,7 @@ class FlashAttentionMLAForwardSm100:
                 block_info,
                 SeqlenInfoCls,
                 tile_scheduler=tile_scheduler,
+                mCuSeqlensQ=mCuSeqlensQ,
             )
             tmem.relinquish_alloc_permit()
             tmem_alloc_barrier.arrive_and_wait()
@@ -1193,6 +1205,7 @@ class FlashAttentionMLAForwardSm100:
                 tma_atom_P=tma_atom_P,
                 mP=mP,
                 sP_out=sP_out,
+                mCuSeqlensQ=mCuSeqlensQ,
             )
             tmem_alloc_barrier.arrive()
 
@@ -1226,6 +1239,7 @@ class FlashAttentionMLAForwardSm100:
                 block_info,
                 SeqlenInfoCls,
                 tile_scheduler=tile_scheduler,
+                mCuSeqlensQ=mCuSeqlensQ,
             )
             tmem_alloc_barrier.arrive()
 
@@ -1238,7 +1252,7 @@ class FlashAttentionMLAForwardSm100:
         while work_tile.is_valid_tile:
             tile_scheduler.prefetch_next_work()
             work_tile = tile_scheduler.advance_to_next_work()
-            cta_m_block, head_idx, batch_idx, _ = work_tile.tile_idx
+            # cta_m_block, head_idx, batch_idx, _ = work_tile.tile_idx
             if cute.arch.thread_idx()[0] == self.clc_scheduler_warp_id * cute.arch.WARP_SIZE:
                 fa_printf(
                     3,
@@ -1274,6 +1288,7 @@ class FlashAttentionMLAForwardSm100:
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
         tile_scheduler: TileSchedulerProtocol,
+        mCuSeqlensQ: Optional[cute.Tensor] = None,
     ):
         # ==== Make pipeline states ====
         # pipeline_{K,V0,V1} producer
@@ -1293,6 +1308,11 @@ class FlashAttentionMLAForwardSm100:
         while work_tile.is_valid_tile:
             cta_m_block, head_idx, batch_idx, _ = work_tile.tile_idx
             cluster_m_block = cta_m_block // self.cta_group_size
+            if const_expr(self.use_packed_varlen_sched):
+                batch_idx = get_batch_from_cu_tensor(cluster_m_block, mCuSeqlensQ)
+                if const_expr(not self.is_topk_gather):
+                    cluster_m_block -= mCuSeqlensQ[batch_idx]
+                # don't need to update cta_m_block
 
             seqlen = SeqlenInfoCls(batch_idx)
             if const_expr(self.is_topk_gather):
@@ -1374,6 +1394,7 @@ class FlashAttentionMLAForwardSm100:
         SeqlenInfoCls: Callable,
         tile_scheduler: TileSchedulerProtocol,
         mPageTable: Optional[cute.Tensor] = None,
+        mCuSeqlensQ: Optional[cute.Tensor] = None,
     ):
         # ==== cpasync load warpgroup ====
         # Description: loads tiles of K, V, V0, V1 from gmem to smem using cpasync
@@ -1405,6 +1426,11 @@ class FlashAttentionMLAForwardSm100:
         while work_tile.is_valid_tile:
             cta_m_block, head_idx, batch_idx, _ = work_tile.tile_idx
             cluster_m_block = cta_m_block // self.cta_group_size
+            if const_expr(self.use_packed_varlen_sched):
+                batch_idx = get_batch_from_cu_tensor(cluster_m_block, mCuSeqlensQ)
+                if const_expr(not self.is_topk_gather):
+                    cluster_m_block -= mCuSeqlensQ[batch_idx]
+                # don't need to update cta_m_block
             head_idx_kv = (
                 head_idx // self.qhead_per_kvhead if const_expr(not self.pack_gqa) else head_idx
             )
@@ -1428,11 +1454,14 @@ class FlashAttentionMLAForwardSm100:
                 if const_expr(not seqlen.has_cu_seqlens_q):
                     mIndexTopk_cur = mIndexTopk[None, m_idx, batch_idx]
                 else:
-                    offset_q = seqlen.offset_q
+                    offset_q = seqlen.offset_q if const_expr(not self.use_packed_varlen_sched) else 0
                     mIndexTopk_cur = mIndexTopk[None, m_idx + offset_q]
 
                 if const_expr(self.is_causal):
-                    seqlen_k_limit = m_idx + 1 + seqlen.seqlen_k - seqlen.seqlen_q
+                    m_local_idx = (
+                        m_idx - seqlen.offset_q if const_expr(self.use_packed_varlen_sched) else m_idx
+                    )
+                    seqlen_k_limit = m_local_idx + 1 + seqlen.seqlen_k - seqlen.seqlen_q
                 else:
                     seqlen_k_limit = seqlen.seqlen_k
                 cpasync_gather_kv_manager = CpasyncGatherKVManager.create(
@@ -1847,6 +1876,7 @@ class FlashAttentionMLAForwardSm100:
         SeqlenInfoCls: Callable,
         tile_scheduler: TileSchedulerProtocol,
         mPageTable: Optional[cute.Tensor] = None,
+        mCuSeqlensQ: Optional[cute.Tensor] = None,
     ):
         # ==== Load warp ====
         # Description: loads tiles of Q, Qv, K, V, V0, V1 from gmem to smem using TMA
@@ -1869,6 +1899,10 @@ class FlashAttentionMLAForwardSm100:
         while work_tile.is_valid_tile:
             cta_m_block, head_idx, batch_idx, _ = work_tile.tile_idx
             cluster_m_block = cta_m_block // self.cta_group_size
+            if const_expr(self.use_packed_varlen_sched):
+                batch_idx = get_batch_from_cu_tensor(cluster_m_block, mCuSeqlensQ)
+                cluster_m_block -= mCuSeqlensQ[batch_idx]
+                # don't need to update cta_m_block
             head_idx_kv = (
                 head_idx // self.qhead_per_kvhead if const_expr(not self.pack_gqa) else head_idx
             )
@@ -2161,6 +2195,7 @@ class FlashAttentionMLAForwardSm100:
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
         tile_scheduler: TileSchedulerProtocol,
+        mCuSeqlensQ: Optional[cute.Tensor] = None,
     ):
         # ==== mma warp ====
         # Description: Computes Q @ K^T, Qv @ V^T, and P @ V
@@ -2278,6 +2313,10 @@ class FlashAttentionMLAForwardSm100:
         while work_tile.is_valid_tile:
             cta_m_block, head_idx, batch_idx, _ = work_tile.tile_idx
             cluster_m_block = cta_m_block // self.cta_group_size
+            if const_expr(self.use_packed_varlen_sched):
+                batch_idx = get_batch_from_cu_tensor(cluster_m_block, mCuSeqlensQ)
+                cluster_m_block -= mCuSeqlensQ[batch_idx]
+                # don't need to update cta_m_block
 
             seqlen = SeqlenInfoCls(batch_idx)
             if const_expr(self.is_topk_gather):
@@ -2482,6 +2521,7 @@ class FlashAttentionMLAForwardSm100:
         tma_atom_P: Optional[cute.CopyAtom] = None,
         mP: Optional[cute.Tensor] = None,
         sP_out: Optional[cute.Tensor] = None,
+        mCuSeqlensQ: Optional[cute.Tensor] = None,
     ):
         # ==== softmax warpgroup ====
         # Description: computes softmax on S and writes the result to P
@@ -2492,6 +2532,7 @@ class FlashAttentionMLAForwardSm100:
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % (
             self.num_softmax_threads // 32
         )
+        cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
 
         tSAcc = tStS[(None, None), 0, 0, 0]
         tSAcc_staged = [tStS[(None, None), 0, 0, stage] for stage in range(self.num_stages_S)]
@@ -2544,6 +2585,10 @@ class FlashAttentionMLAForwardSm100:
         while work_tile.is_valid_tile:
             cta_m_block, head_idx, batch_idx, _ = work_tile.tile_idx
             cluster_m_block = cta_m_block // self.cta_group_size
+            if const_expr(self.use_packed_varlen_sched):
+                batch_idx = get_batch_from_cu_tensor(cluster_m_block, mCuSeqlensQ)
+                cluster_m_block -= mCuSeqlensQ[batch_idx]
+                cta_m_block = cluster_m_block * self.cta_group_size + cta_rank_in_cluster
             seqlen = SeqlenInfoCls(batch_idx)
             if const_expr(self.is_topk_gather):
                 n_block_min = 0
@@ -2868,6 +2913,7 @@ class FlashAttentionMLAForwardSm100:
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
         tile_scheduler: TileSchedulerProtocol,
+        mCuSeqlensQ: Optional[cute.Tensor] = None,
     ):
         ### ==== correction/epilogue warpgroup ====
         # Correction: copy scale smem -> rmem, copy O tmem -> rmem, rescale O, store O rmem -> tmem
@@ -2933,6 +2979,10 @@ class FlashAttentionMLAForwardSm100:
         while work_tile.is_valid_tile:
             cta_m_block, head_idx, batch_idx, _ = work_tile.tile_idx
             cluster_m_block = cta_m_block // self.cta_group_size
+            if const_expr(self.use_packed_varlen_sched):
+                batch_idx = get_batch_from_cu_tensor(cluster_m_block, mCuSeqlensQ)
+                cluster_m_block -= mCuSeqlensQ[batch_idx]
+                cta_m_block = cluster_m_block * self.cta_group_size + cta_rank_in_cluster
 
             seqlen = SeqlenInfoCls(batch_idx)
             if const_expr(self.is_topk_gather):
