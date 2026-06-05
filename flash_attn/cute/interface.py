@@ -1107,7 +1107,7 @@ def _flash_attn_fwd(
 _flash_attn_fwd.compile_cache = get_jit_cache("fwd")
 
 
-def make_fake_bwd_tensors(dtype, has_gqa, varlen_q, varlen_k, is_preprocess=False, nheads_major=False):
+def make_fake_bwd_tensors(dtype, has_gqa, varlen_q, varlen_k, nheads_major=False):
     sym = cute.sym_int
     # divisibility in elements: assumed_align_bytes = divisibility * dtype.width // 8
     # For 16-byte align: fp16/bf16 → divisibility=8, float32 → divisibility=4
@@ -1154,8 +1154,7 @@ def make_fake_bwd_tensors(dtype, has_gqa, varlen_q, varlen_k, is_preprocess=Fals
         else:
             mdKaccum = fake_tensor(Float32, (h_kv, total_k_rounded), divisibility=4)
             mdVaccum = fake_tensor(Float32, (h_kv, total_k_dv_rounded), divisibility=4)
-    return_tensors = (mQ, mK, mV, mO, mdO, mdQ, mdK, mdV, mLSE, mLSElog2, mPdPsum, dQaccum, mdKaccum, mdVaccum)
-    return return_tensors + (mScaleP, ) if is_preprocess else return_tensors
+    return mQ, mK, mV, mO, mdO, mdQ, mdK, mdV, mLSE, mLSElog2, mPdPsum, dQaccum, mdKaccum, mdVaccum, mScaleP
 
 
 def _compile_bwd_preprocess(
@@ -1176,7 +1175,7 @@ def _compile_bwd_preprocess(
 ):
     """Compile bwd preprocess kernel using cute fake tensors (no real GPU tensors needed)."""
     mQ, mK, mV, mO, mdO, mdQ, mdK, mdV, mLSE, mLSElog2, mPdPsum, mdQaccum, mdKaccum, mdVaccum, mScaleP = make_fake_bwd_tensors(
-        dtype, has_gqa=True, varlen_q=has_cuseqlens_q, varlen_k=False, is_preprocess=True, nheads_major=nheads_major,
+        dtype, has_gqa=True, varlen_q=has_cuseqlens_q, varlen_k=False, nheads_major=nheads_major,
     )
     batch = mQ.shape[0] if not has_cuseqlens_q else cute.sym_int()
     batchp1 = cute.sym_int()
@@ -1213,9 +1212,9 @@ def _bwd_preprocess(
     use_padded_offsets=True,
     nheads_major=False,
     pack_gqa=False,
-    qhead_per_kvhead=1,
-    nheads_kv=1,
-    softmax_scale=1.0,
+    qhead_per_kvhead=1,  # only used with pack_gqa
+    nheads_kv=1,         # only used with pack_gqa
+    softmax_scale=1.0,   # only used with scale_p
 ):
     """Backward preprocess: compute (o * dout).sum(dim=-1) - dLSE, lse * log2_e, and zero out dq_accum."""
     if row_max is not None:
@@ -1252,7 +1251,7 @@ def _compile_bwd_postprocess(
     use_2cta_instrs, cluster_size, arch,
 ):
     """Compile bwd postprocess kernel using cute fake tensors."""
-    mQ, mK, mV, mO, mdO, mdQ, mdK, mdV, mLSE, mLSElog2, mPdPsum, mdQaccum, mdKaccum, mdVaccum = make_fake_bwd_tensors(
+    mQ, mK, mV, mO, mdO, mdQ, mdK, mdV, mLSE, mLSElog2, mPdPsum, mdQaccum, mdKaccum, mdVaccum, mScaleP = make_fake_bwd_tensors(
         dtype, has_gqa=True, varlen_q=has_cuseqlens_q, varlen_k=False
     )
     batch = mQ.shape[0] if not has_cuseqlens_q else cute.sym_int()
@@ -1632,7 +1631,6 @@ def _flash_attn_bwd(
         out, dout, dpsum, lse, lse_log2, dq_accum,
         cu_seqlens_q, seqused_q, dlse,
         dtype, head_dim, head_dim_v, m_block_size,
-        use_padded_offsets=use_dedicated_hd256_kernel,
     )
     # num_threads: SM90 derives from BwdConfig.num_wg, SM120 is set to 128 above,
     # SM100/SM110 uses default from function signature (384).
