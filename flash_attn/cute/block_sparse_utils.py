@@ -18,6 +18,7 @@ from quack import copy_utils
 from flash_attn.cute.block_sparsity import BlockSparseTensors
 from flash_attn.cute.named_barrier import NamedBarrierBwd
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
+from flash_attn.cute.utils import AuxData
 
 
 @cute.jit
@@ -1363,7 +1364,7 @@ def consume_block_sparse_mma_bwd_sm90(
     score_mod_bwd_fn=None,
     subtile_factor: cutlass.Constexpr = 1,
     m_block_max: int = 0,
-    aux_tensors=None,
+    aux_data: AuxData = AuxData(),
     fastdiv_mods=(None, None),
 ):
     """SM90 backward block sparse MMA consumption with separate partial/full loops.
@@ -1396,7 +1397,7 @@ def consume_block_sparse_mma_bwd_sm90(
         mask_causal=is_causal,
         mask_local=is_local,
         mask_mod=mask_mod,
-        aux_tensors=aux_tensors,
+        aux_data=aux_data,
         fastdiv_mods=fastdiv_mods,
     )
 
@@ -1409,7 +1410,7 @@ def consume_block_sparse_mma_bwd_sm90(
         mask_seqlen=True,
         mask_causal=is_causal,
         mask_local=is_local,
-        aux_tensors=aux_tensors,
+        aux_data=aux_data,
         fastdiv_mods=fastdiv_mods,
     )
 

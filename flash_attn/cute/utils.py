@@ -5,7 +5,7 @@ import hashlib
 import inspect
 import os
 from functools import partial
-from typing import Type, Callable, Optional, Tuple, overload
+from typing import Type, Callable, Optional, Tuple, overload, NamedTuple
 
 import cutlass
 import cutlass.cute as cute
@@ -20,6 +20,12 @@ from cutlass.cute.runtime import from_dlpack
 import quack.activation
 
 _MIXER_ATTRS = ("__vec_size__",)
+
+
+class AuxData(NamedTuple):
+    tensors: tuple | list | None = None
+    scalars: tuple | None = None
+
 
 # Obtained from sollya:
 # fpminimax(exp(x * log(2.0)), 1, [|1,24...|],[0;1],relative);

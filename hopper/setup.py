@@ -86,6 +86,19 @@ from torch.utils.cpp_extension import (
     _maybe_write,
 )
 
+BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
+
+if BUILD_TARGET == "auto":
+    if IS_HIP_EXTENSION:
+        IS_ROCM = True
+    else:
+        IS_ROCM = False
+else:
+    if BUILD_TARGET == "cuda":
+        IS_ROCM = False
+    elif BUILD_TARGET == "rocm":
+        IS_ROCM = True
+
 def create_build_config_file():
     CONFIG = {
         "build_flags": {
@@ -329,6 +342,10 @@ def get_cuda_bare_metal_version(cuda_dir):
     bare_metal_version = parse(output[release_idx].split(",")[0])
 
     return raw_output, bare_metal_version
+
+
+def get_hip_version():
+    return parse(torch.version.hip.split()[-1].rstrip('-').replace('-', '+'))
 
 
 def check_if_cuda_home_none(global_option: str) -> None:
@@ -647,6 +664,12 @@ def get_package_version():
 
 
 def get_wheel_url():
+    if IS_ROCM:
+        return get_rocm_wheel_url()
+    return get_cuda_wheel_url()
+
+
+def get_cuda_wheel_url():
     # Determine the version numbers that will be used to determine the correct wheel
     # We're using the CUDA version used to build torch, not the one currently installed
     # _, cuda_version_raw = get_cuda_bare_metal_version(CUDA_HOME)
@@ -665,6 +688,21 @@ def get_wheel_url():
 
     # Determine wheel URL based on CUDA version, torch version, python version and OS
     wheel_filename = f"{PACKAGE_NAME}-{package_version}+cu{cuda_version}torch{torch_version}cxx11abi{cxx11_abi}-{python_version}-{python_version}-{platform_name}.whl"
+    wheel_url = BASE_WHEEL_URL.format(tag_name=f"v{package_version}", wheel_name=wheel_filename)
+    return wheel_url, wheel_filename
+
+
+def get_rocm_wheel_url():
+    torch_hip_version = get_hip_version()
+    torch_version_raw = parse(torch.__version__)
+    hip_version = f"{torch_hip_version.major}{torch_hip_version.minor}"
+    python_version = f"cp{sys.version_info.major}{sys.version_info.minor}"
+    platform_name = get_platform()
+    package_version = get_package_version()
+    torch_version = f"{torch_version_raw.major}.{torch_version_raw.minor}"
+    cxx11_abi = str(torch._C._GLIBCXX_USE_CXX11_ABI).upper()
+
+    wheel_filename = f"{PACKAGE_NAME}-{package_version}+rocm{hip_version}torch{torch_version}cxx11abi{cxx11_abi}-{python_version}-{python_version}-{platform_name}.whl"
     wheel_url = BASE_WHEEL_URL.format(tag_name=f"v{package_version}", wheel_name=wheel_filename)
     return wheel_url, wheel_filename
 
@@ -703,6 +741,22 @@ class CachedWheelsCommand(_bdist_wheel):
             # If the wheel could not be downloaded, build from source
             super().run()
 
+# Build install_requires based on platform
+if IS_ROCM:
+    # Note: torch is excluded because pip resolves it to CUDA PyTorch from PyPI, overwriting any pre-installed ROCm PyTorch. Users must have torch installed.
+    install_requires = [
+        "einops",
+        "packaging",
+        "ninja",
+    ]
+else:
+    install_requires = [
+        "torch",
+        "einops",
+        "packaging",
+        "ninja",
+    ]
+
 setup(
     name=PACKAGE_NAME,
     version=get_package_version(),
@@ -733,11 +787,6 @@ setup(
         "bdist_wheel": CachedWheelsCommand,
     },
     python_requires=">=3.10",
-    install_requires=[
-        "torch",
-        "einops",
-        "packaging",
-        "ninja",
-    ],
+    install_requires=install_requires,
     options={"bdist_wheel": {"py_limited_api": "cp310"}},
 )

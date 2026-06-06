@@ -14,17 +14,19 @@ from flash_attn.cute.block_sparsity import (
 from flash_attn.cute.block_sparse_utils import get_curr_blocksparse_tensors
 from flash_attn.cute.testing import is_fake_mode
 from flash_attn.cute.cute_dsl_utils import (
-    to_cute_tensor,
     get_aux_tensor_metadata,
     to_cute_aux_tensor,
+    to_cute_tensor,
 )
 from flash_attn.cute.utils import (
+    get_batch_from_cu_tensor,
     hash_callable,
     scalar_to_ssa,
     ssa_to_scalar,
-    get_batch_from_cu_tensor,
 )
+from flash_attn.cute.mask import call_mask_mod
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
+from flash_attn.cute.utils import AuxData
 
 
 class BlockSparsityKernel:
@@ -67,7 +69,7 @@ class BlockSparsityKernel:
         mCuSeqlensK: Optional[cute.Tensor] = None,
         mSeqUsedQ: Optional[cute.Tensor] = None,
         mSeqUsedK: Optional[cute.Tensor] = None,
-        aux_tensors: Optional[list] = None,
+        aux_data: AuxData = AuxData(),
     ):
         mask_cnt, mask_idx, full_cnt, full_idx, mCuTotalMBlocks, mCuBlockIdxOffsets, *_ = (
             blocksparse_tensors
@@ -112,7 +114,7 @@ class BlockSparsityKernel:
             mSeqUsedK,
             mCuTotalMBlocks,
             mCuBlockIdxOffsets,
-            aux_tensors,
+            aux_data,
         ).launch(grid=grid, block=[num_threads, 1, 1])
 
     @cute.kernel
@@ -128,7 +130,7 @@ class BlockSparsityKernel:
         mSeqUsedK: Optional[cute.Tensor] = None,
         mCuTotalMBlocks: Optional[cute.Tensor] = None,
         mCuBlockIdxOffsets: Optional[cute.Tensor] = None,
-        aux_tensors: Optional[list] = None,
+        aux_data: AuxData = AuxData(),
     ):
         tidx, _, _ = cute.arch.thread_idx()
         warp_idx = cute.arch.warp_idx()
@@ -224,13 +226,14 @@ class BlockSparsityKernel:
                 if tidx < 5:
                     thread_is_valid = Boolean(True)
                     thread_result = ssa_to_scalar(
-                        self.mask_mod(
+                        call_mask_mod(
+                            self.mask_mod,
                             ssa(batch_idx),
                             ssa(head_idx),
                             ssa(q_idx_sample),
                             ssa(kv_idx),
                             seqlen,
-                            aux_tensors,
+                            aux_data,
                         )
                     )
 
@@ -249,13 +252,14 @@ class BlockSparsityKernel:
                     if thread_in_bounds:
                         for c in cutlass.range(self.tile_mn[1], unroll_full=True):
                             mask_val = ssa_to_scalar(
-                                self.mask_mod(
+                                call_mask_mod(
+                                    self.mask_mod,
                                     ssa(batch_idx),
                                     ssa(head_idx),
                                     ssa(q_idx_thread),
                                     ssa(n_base + c),
                                     seqlen,
-                                    aux_tensors,
+                                    aux_data,
                                 )
                             )
                             thread_has_unmasked |= Boolean(mask_val)
@@ -266,13 +270,14 @@ class BlockSparsityKernel:
                             kv_idx = n_base + c
                             if kv_idx < seqlen_k:
                                 mask_val = ssa_to_scalar(
-                                    self.mask_mod(
+                                    call_mask_mod(
+                                        self.mask_mod,
                                         ssa(batch_idx),
                                         ssa(head_idx),
                                         ssa(q_idx_thread),
                                         ssa(kv_idx),
                                         seqlen,
-                                        aux_tensors,
+                                        aux_data,
                                     )
                                 )
                                 thread_has_unmasked |= Boolean(mask_val)
@@ -336,6 +341,7 @@ def compute_block_sparsity(
     mask_mod: Callable,
     aux_tensors: Optional[list],
     device,
+    aux_scalars: Optional[tuple] = None,
     cu_seqlens_q: Optional[torch.Tensor] = None,
     cu_seqlens_k: Optional[torch.Tensor] = None,
     seqused_q: Optional[torch.Tensor] = None,
@@ -371,6 +377,8 @@ def compute_block_sparsity(
     Returns:
         BlockSparseTensorsTorch
     """
+    aux_scalars = tuple(aux_scalars) if aux_scalars else None
+
     # Check if mask_mod is marked as suitable for 5-point sampling
     use_fast_sampling = getattr(mask_mod, "use_fast_sampling", use_fast_sampling)
 
@@ -457,12 +465,14 @@ def compute_block_sparsity(
         aux_tensor_metadata = get_aux_tensor_metadata(aux_tensors)
     else:
         aux_tensor_metadata = None
+    aux_scalar_metadata = tuple(type(s) for s in aux_scalars) if aux_scalars is not None else None
 
     compile_key = (
         tile_m,
         tile_n,
         mask_mod_hash,
         aux_tensor_metadata,
+        aux_scalar_metadata,
         compute_full_blocks,
         cu_seqlens_q is None,
         cu_seqlens_k is None,
@@ -510,7 +520,7 @@ def compute_block_sparsity(
             cu_seqlens_k_tensor,
             seqused_q_tensor,
             seqused_k_tensor,
-            cute_aux_tensors,
+            AuxData(cute_aux_tensors, aux_scalars),
             options="--enable-tvm-ffi",
         )
 
@@ -532,7 +542,7 @@ def compute_block_sparsity(
             cu_seqlens_k,
             seqused_q,
             seqused_k,
-            aux_tensors,
+            AuxData(aux_tensors, aux_scalars),
         )
 
     return blocksparse_tensors_torch

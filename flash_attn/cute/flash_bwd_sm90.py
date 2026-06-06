@@ -34,6 +34,7 @@ from flash_attn.cute import barrier
 from flash_attn.cute.named_barrier import NamedBarrierBwd
 from flash_attn.cute.softmax import apply_score_mod_inner, apply_score_mod_bwd_inner
 from flash_attn.cute.block_sparsity import BlockSparseTensors
+from flash_attn.cute.utils import AuxData
 from flash_attn.cute.block_sparse_utils import (
     get_total_q_block_count_bwd,
     produce_block_sparse_q_loads_bwd_sm90,
@@ -355,7 +356,7 @@ class FlashAttentionBackwardSm90:
         mdQ_semaphore: Optional[cute.Tensor] = None,
         mdK_semaphore: Optional[cute.Tensor] = None,
         mdV_semaphore: Optional[cute.Tensor] = None,
-        aux_tensors: Optional[list] = None,
+        aux_data: AuxData = AuxData(),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         mCuTotalMBlocks: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
@@ -550,7 +551,7 @@ class FlashAttentionBackwardSm90:
             softmax_scale_log2 = LOG2_E
 
         fastdiv_mods = None
-        if const_expr(aux_tensors is not None):
+        if const_expr(aux_data.tensors is not None):
             seqlen_q = cute.size(mQ.shape[0])
             seqlen_k = cute.size(mK.shape[0])
             seqlen_q_divmod = FastDivmodDivisor(seqlen_q)
@@ -604,7 +605,7 @@ class FlashAttentionBackwardSm90:
             tile_sched_params,
             TileScheduler,
             SharedStorage,
-            aux_tensors,
+            aux_data,
             fastdiv_mods,
             blocksparse_tensors,
             qhead_per_kvhead_divmod,
@@ -659,7 +660,7 @@ class FlashAttentionBackwardSm90:
         tile_sched_params: ParamsBase,
         TileScheduler: cutlass.Constexpr[Callable],
         SharedStorage: cutlass.Constexpr[Callable],
-        aux_tensors: Optional[list] = None,
+        aux_data: AuxData = AuxData(),
         fastdiv_mods=(None, None),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         qhead_per_kvhead_divmod: Optional[FastDivmodDivisor] = None,
@@ -826,7 +827,7 @@ class FlashAttentionBackwardSm90:
                 SeqlenInfoCls,
                 AttentionMaskCls,
                 TileSchedulerCls,
-                aux_tensors,
+                aux_data,
                 fastdiv_mods,
                 blocksparse_tensors,
                 qhead_per_kvhead_divmod,
@@ -1024,7 +1025,7 @@ class FlashAttentionBackwardSm90:
         n_block,
         softmax_scale,
         seqlen_info: SeqlenInfoQK,
-        aux_tensors=None,
+        aux_data: AuxData = AuxData(),
         fastdiv_mods=(None, None),
     ):
         # [NOTE] SdP_swapAB: swapAB transposes the tile, so use (n, m) indexing
@@ -1048,7 +1049,7 @@ class FlashAttentionBackwardSm90:
             softmax_scale,
             self.vec_size,
             self.qk_acc_dtype,
-            aux_tensors,
+            aux_data,
             fastdiv_mods,
             seqlen_info,
             constant_q_idx=None,
@@ -1068,7 +1069,7 @@ class FlashAttentionBackwardSm90:
         n_block,
         softmax_scale,
         seqlen_info: SeqlenInfoQK,
-        aux_tensors=None,
+        aux_data: AuxData = AuxData(),
         fastdiv_mods=(None, None),
     ):
         cS = cute.make_identity_tensor(
@@ -1092,7 +1093,7 @@ class FlashAttentionBackwardSm90:
             softmax_scale,
             self.vec_size,
             self.qk_acc_dtype,
-            aux_tensors,
+            aux_data,
             fastdiv_mods,
             seqlen_info,
             constant_q_idx=None,
@@ -1133,7 +1134,7 @@ class FlashAttentionBackwardSm90:
         SeqlenInfoCls: Callable,
         AttentionMaskCls: Callable,
         TileSchedulerCls: Callable,
-        aux_tensors: Optional[list] = None,
+        aux_data: AuxData = AuxData(),
         fastdiv_mods=(None, None),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         qhead_per_kvhead_divmod: Optional[FastDivmodDivisor] = None,
@@ -1262,14 +1263,14 @@ class FlashAttentionBackwardSm90:
             self.apply_score_mod,
             thr_mma_SdP=thr_mma_SdP,
             softmax_scale=softmax_scale,
-            aux_tensors=aux_tensors,
+            aux_data=aux_data,
             fastdiv_mods=fastdiv_mods,
         )
         score_mod_bwd_fn = partial(
             self.apply_score_mod_bwd,
             thr_mma_SdP=thr_mma_SdP,
             softmax_scale=softmax_scale,
-            aux_tensors=aux_tensors,
+            aux_data=aux_data,
             fastdiv_mods=fastdiv_mods,
         )
 
@@ -1351,7 +1352,7 @@ class FlashAttentionBackwardSm90:
                         mask_causal=self.is_causal,
                         mask_local=self.is_local,
                         mask_mod=self.mask_mod,
-                        aux_tensors=aux_tensors,
+                        aux_data=aux_data,
                         fastdiv_mods=fastdiv_mods,
                     )
                     dKV_accumulate = False
@@ -1384,7 +1385,7 @@ class FlashAttentionBackwardSm90:
                         score_mod_bwd_fn=score_mod_bwd_fn_cur,
                         subtile_factor=self.subtile_factor,
                         m_block_max=m_block_max,
-                        aux_tensors=aux_tensors,
+                        aux_data=aux_data,
                         fastdiv_mods=fastdiv_mods,
                     )
 

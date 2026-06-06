@@ -10,7 +10,6 @@ from typing import Optional, Tuple, Callable
 import torch
 
 
-import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
@@ -30,7 +29,10 @@ if os.environ.get("CUTE_DSL_PTXAS_PATH", None) is not None:
 from flash_attn.cute import utils
 from flash_attn.cute import fa_logging
 from flash_attn.cute.cute_dsl_utils import (
-    to_cute_tensor, to_cute_aux_tensor, get_aux_tensor_metadata, get_broadcast_dims,
+    get_aux_tensor_metadata,
+    get_broadcast_dims,
+    to_cute_aux_tensor,
+    to_cute_tensor,
 )
 from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80
 from flash_attn.cute.flash_fwd_sm90 import FlashAttentionForwardSm90
@@ -50,13 +52,13 @@ from flash_attn.cute.prepare_scheduler import FlashPrepareScheduler, SchedulerMe
 from flash_attn.cute.sm100_hd256_2cta_fmha_forward import BlackwellFusedMultiHeadAttentionForward
 from flash_attn.cute.sm100_hd256_2cta_fmha_backward import BlackwellFusedMultiHeadAttentionBackward
 
+from flash_attn.cute.utils import AuxData
 from flash_attn.cute.block_sparsity import (
     BlockSparseTensorsTorch,
     get_sparse_q_block_size,
     to_cute_block_sparse_tensors,
     normalize_block_sparse_config,
     normalize_block_sparse_config_bwd,
-    get_block_sparse_broadcast_pattern,
 )
 
 BIN_BATCH_SEARCH_THRESH = 512 # SingleTileVarlenScheduler uses binary search to find batch above this
@@ -459,6 +461,7 @@ def _flash_attn_fwd(
     out: Optional[torch.Tensor] = None,
     lse: Optional[torch.Tensor] = None,
     aux_tensors: Optional[list[torch.Tensor]] = None,
+    aux_scalars: Optional[tuple] = None,
     q_descale: Optional[torch.Tensor] = None,
     k_descale: Optional[torch.Tensor] = None,
     v_descale: Optional[torch.Tensor] = None,
@@ -479,7 +482,9 @@ def _flash_attn_fwd(
         out: Optional pre-allocated output tensor. If None, will be allocated internally.
         lse: Optional pre-allocated log-sum-exp tensor. If None, will be allocated when needed.
         aux_tensors: Some score_mods will want to read from global aux_tensors. This is how we thread them through to the inner kernel.
+        aux_scalars: Runtime scalar captures used by score_mod or mask_mod.
     """
+    aux_scalars = tuple(aux_scalars) if aux_scalars else None
     q, k, v, qv = [maybe_contiguous(t) for t in (q, k, v, qv)]
     assert q is not None or qv is not None
     assert v is not None
@@ -655,13 +660,6 @@ def _flash_attn_fwd(
     if arch // 10 in [8, 12]:
         num_threads = 128
 
-    # TODO: fix GQA + SplitKV + non-varlen
-    if pack_gqa and num_splits != 1 and cu_seqlens_q is None:
-        pack_gqa = False
-
-    if pack_gqa and qv is not None and 128 % qhead_per_kvhead != 0:
-        pack_gqa = False
-
     if max_seqlen_q is None:
         max_seqlen_q = seqlen_q if cu_seqlens_q is None else total_q
     if max_seqlen_k is None:
@@ -782,6 +780,7 @@ def _flash_attn_fwd(
         aux_tensor_metadata = get_aux_tensor_metadata(aux_tensors)
     else:
         aux_tensor_metadata = None
+    aux_scalar_metadata = tuple(type(s) for s in aux_scalars) if aux_scalars is not None else None
 
     if qv is not None:
         assert arch // 10 in [10, 11], "only support Blackwell arch with qv"
@@ -943,6 +942,7 @@ def _flash_attn_fwd(
         use_block_sparsity,
         block_sparse_broadcast_pattern,
         aux_tensor_metadata,
+        aux_scalar_metadata,
         lse is None,
         cu_seqlens_q is None,
         cu_seqlens_k is None,
@@ -1265,7 +1265,7 @@ def _flash_attn_fwd(
                 compile_args.append(descale_tensors_tensor)
             compile_args.extend([
                 sparse_tensors,
-                cute_aux_tensors,
+                AuxData(cute_aux_tensors, aux_scalars),
             ])
             if arch // 10 in [10, 11] and not use_dedicated_hd256_kernel:
                 compile_args.extend([
@@ -1353,7 +1353,7 @@ def _flash_attn_fwd(
                 )
                 if normalized_block_sparse_tensors is not None
                 else None,
-                aux_tensors,
+                AuxData(aux_tensors, aux_scalars),
             ])
             if arch // 10 in [10, 11] and not use_dedicated_hd256_kernel:
                 call_args.extend([
@@ -1593,9 +1593,11 @@ def _flash_attn_bwd(
     score_mod_bwd: Optional[Callable] = None,
     mask_mod: Optional[Callable] = None,
     aux_tensors: Optional[list[torch.Tensor]] = None,
+    aux_scalars: Optional[tuple] = None,
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     dlse: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    aux_scalars = tuple(aux_scalars) if aux_scalars else None
     arch = _get_device_arch()
     assert arch // 10 in [9, 10, 11, 12], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x, 12.x"
     sparse_q = None
@@ -1667,9 +1669,6 @@ def _flash_attn_bwd(
         requested_disable_2cta = utils._get_disable_2cta_default()
         disable_2cta = (
             requested_disable_2cta
-            or score_mod is not None
-            or score_mod_bwd is not None
-            or mask_mod is not None
             or block_sparse_tensors is not None
         )
         cluster_size = 2 if head_dim >= 128 and not disable_2cta else 1
@@ -1921,6 +1920,7 @@ def _flash_attn_bwd(
     score_mod_bwd_hash = utils.hash_callable(score_mod_bwd) if score_mod_bwd else False
     mask_mod_hash = utils.hash_callable(mask_mod) if mask_mod else False
     num_aux_tensors = len(aux_tensors) if aux_tensors else 0
+    aux_scalar_metadata = tuple(type(s) for s in aux_scalars) if aux_scalars is not None else None
     cute_aux_tensors = None
     if aux_tensors is not None:
         cute_aux_tensors = [to_cute_tensor(buf, assumed_align=None, fully_dynamic=True) for buf in aux_tensors]
@@ -1998,6 +1998,7 @@ def _flash_attn_bwd(
             score_mod_bwd_hash,
             mask_mod_hash,
             num_aux_tensors,
+            aux_scalar_metadata,
             use_block_sparsity,
             block_sparse_broadcast_pattern,
             get_broadcast_dims(q),
@@ -2031,6 +2032,7 @@ def _flash_attn_bwd(
             score_mod_bwd_hash,
             mask_mod_hash,
             num_aux_tensors,
+            aux_scalar_metadata,
             use_block_sparsity,
             block_sparse_broadcast_pattern,
             cu_seqlens_q is None,
@@ -2199,7 +2201,7 @@ def _flash_attn_bwd(
             dQ_semaphore_tensor,
             dK_semaphore_tensor,
             dV_semaphore_tensor,
-            cute_aux_tensors,
+            AuxData(cute_aux_tensors, aux_scalars),
             sparse_tensors_compile,
             cu_total_m_blocks_k_tensor,
             current_stream,
@@ -2227,7 +2229,7 @@ def _flash_attn_bwd(
             dQ_semaphore,
             dK_semaphore,
             dV_semaphore,
-            aux_tensors,
+            AuxData(aux_tensors, aux_scalars),
             (
                 normalized_block_sparse_tensors.mask_block_cnt,
                 normalized_block_sparse_tensors.mask_block_idx,
@@ -2308,10 +2310,12 @@ class FlashAttnFunc(torch.autograd.Function):
         score_mod_bwd: Optional[Callable] = None,
         mask_mod: Optional[Callable] = None,
         aux_tensors: Optional[list] = None,
+        aux_scalars: Optional[tuple] = None,
         block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
         block_sparse_tensors_bwd: Optional[BlockSparseTensorsTorch] = None,
         return_lse: bool = False,
     ):
+        aux_scalars = tuple(aux_scalars) if aux_scalars else None
         shared_kv = k is v
         if shared_kv and v.shape[-1] == 512:
             # specialize MLA attention formula
@@ -2335,6 +2339,7 @@ class FlashAttnFunc(torch.autograd.Function):
             score_mod=score_mod,
             mask_mod=mask_mod,
             aux_tensors=aux_tensors,
+            aux_scalars=aux_scalars,
             block_sparse_tensors=block_sparse_tensors,
             return_lse=return_lse,
             gather_kv_indices=gather_kv_indices,
@@ -2349,6 +2354,7 @@ class FlashAttnFunc(torch.autograd.Function):
         ctx.score_mod = score_mod 
         ctx.score_mod_bwd = score_mod_bwd 
         ctx.mask_mod = mask_mod
+        ctx.aux_scalars = aux_scalars
         ctx.block_sparse_tensors_bwd = block_sparse_tensors_bwd
         ctx.set_materialize_grads(False)
         return out, lse
@@ -2378,10 +2384,11 @@ class FlashAttnFunc(torch.autograd.Function):
             score_mod_bwd=ctx.score_mod_bwd,
             mask_mod=ctx.mask_mod,
             aux_tensors=aux_tensors,
+            aux_scalars=ctx.aux_scalars,
             block_sparse_tensors=ctx.block_sparse_tensors_bwd,
             dlse=dlse,
         )
-        return dq, dk, dv, *((None,) * 30)  # Extra Nones is fine
+        return dq, dk, dv, *((None,) * 31)
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -2414,11 +2421,13 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         mask_mod: Optional[Callable] = None,
         block_sparse_tensors: Optional[list] = None,
         aux_tensors: Optional[list] = None,
+        aux_scalars: Optional[tuple] = None,
         return_lse: bool = False,
         scheduler_metadata: Optional["SchedulerMetadataTensorsTorch"] = None,
         seqlen_k_per_split: Optional[int] = None,
         disable_scheduler_metadata: bool = False,
     ):
+        aux_scalars = tuple(aux_scalars) if aux_scalars else None
         shared_kv = k is v
         if shared_kv and v.shape[-1] == 512:
             # specialize MLA attention formula
@@ -2451,6 +2460,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             mask_mod=mask_mod,
             block_sparse_tensors=block_sparse_tensors,
             aux_tensors=aux_tensors,
+            aux_scalars=aux_scalars,
             return_lse=return_lse,
             gather_kv_indices=gather_kv_indices,
             scheduler_metadata=scheduler_metadata,
@@ -2479,6 +2489,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         ctx.return_lse = return_lse
         ctx.score_mod = score_mod
         ctx.score_mod_bwd = score_mod_bwd
+        ctx.mask_mod = mask_mod
+        ctx.aux_scalars = aux_scalars
         ctx.set_materialize_grads(False)
         return out, lse
 
@@ -2512,10 +2524,12 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             score_mod=ctx.score_mod,
             score_mod_bwd=ctx.score_mod_bwd,
             aux_tensors=aux_tensors,
+            aux_scalars=ctx.aux_scalars,
+            mask_mod=ctx.mask_mod,
             dlse=dlse,
         )
 
-        return dq, dk, dv, *((None,) * 30)
+        return dq, dk, dv, *((None,) * 31)
 
 
 def flash_attn_func(
@@ -2536,6 +2550,7 @@ def flash_attn_func(
     score_mod_bwd: Optional[Callable] = None,
     mask_mod: Optional[Callable] = None,
     aux_tensors: Optional[list] = None,
+    aux_scalars: Optional[tuple] = None,
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     block_sparse_tensors_bwd: Optional[BlockSparseTensorsTorch] = None,
     return_lse: bool = False,
@@ -2558,6 +2573,7 @@ def flash_attn_func(
         score_mod_bwd,
         mask_mod,
         aux_tensors,
+        aux_scalars,
         block_sparse_tensors,
         block_sparse_tensors_bwd,
         return_lse,
@@ -2591,6 +2607,7 @@ def flash_attn_varlen_func(
     mask_mod: Optional[Callable] = None,
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     aux_tensors: Optional[list] = None,
+    aux_scalars: Optional[tuple] = None,
     return_lse: bool = False,
     scheduler_metadata: Optional[SchedulerMetadataTensorsTorch] = None,
     seqlen_k_per_split: Optional[int] = None,
@@ -2663,6 +2680,7 @@ def flash_attn_varlen_func(
         mask_mod,
         block_sparse_tensors,
         aux_tensors,
+        aux_scalars,
         return_lse,
         scheduler_metadata,
         seqlen_k_per_split,
