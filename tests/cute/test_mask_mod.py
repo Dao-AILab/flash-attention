@@ -31,6 +31,7 @@ from flash_attn.cute.block_sparsity import (
     compute_dq_write_order_from_block_mask,
 )
 from flash_attn.cute.cache_utils import get_jit_cache
+from flash_attn.cute.compute_block_sparsity import compute_block_sparsity
 from flash_attn.cute import utils
 from mask_mod_definitions import (
     get_mask_pair,
@@ -40,6 +41,18 @@ from mask_mod_definitions import (
     make_packed_mask_aux_tensor,
 )
 COMPUTE_CAPABILITY = torch.cuda.get_device_capability()[0]
+
+
+@cute.jit
+def scalar_limit_mask(batch, head, q_idx, kv_idx, seqlen_info, aux_tensors, aux_scalars):
+    return (q_idx >= kv_idx) & (kv_idx < cutlass.Int32(aux_scalars[0]))
+
+
+def flex_scalar_limit_mask(limit: int):
+    def mask_mod(b_idx, h_idx, q_idx, kv_idx):
+        return (q_idx >= kv_idx) & (kv_idx < limit)
+
+    return mask_mod
 
 
 @pytest.fixture(autouse=True)
@@ -2605,6 +2618,65 @@ def test_compact_block_sparse_indices():
         f"Compact and full block sparse outputs differ: "
         f"max diff = {(out_compact - out_full).abs().max().item():.2e}"
     )
+
+
+@pytest.mark.parametrize("limit", [64, 96])
+def test_flash_attn_fwd_mask_mod_aux_scalars_matches_flex(limit):
+    torch.manual_seed(0)
+    tensors = create_tensors(1, 128, 128, 4, 4, 64, 64, torch.bfloat16)
+    out, _ = _flash_attn_fwd(
+        tensors["q"],
+        tensors["k"],
+        tensors["v"],
+        softmax_scale=1.0 / math.sqrt(64),
+        return_lse=True,
+        mask_mod=scalar_limit_mask,
+        aux_scalars=[cutlass.Int32(limit)],
+    )
+    expected = compute_reference_flex_attn(tensors, flex_scalar_limit_mask(limit))
+    torch.testing.assert_close(out, expected, rtol=2e-2, atol=2e-2)
+
+
+def test_flash_attn_bwd_mask_mod_aux_scalars_produces_grads():
+    torch.manual_seed(1)
+    q, k, v = [
+        x.requires_grad_()
+        for x in (
+            torch.randn(1, 128, 4, 64, device="cuda", dtype=torch.bfloat16),
+            torch.randn(1, 128, 4, 64, device="cuda", dtype=torch.bfloat16),
+            torch.randn(1, 128, 4, 64, device="cuda", dtype=torch.bfloat16),
+        )
+    ]
+    out, _ = flash_attn_func(
+        q,
+        k,
+        v,
+        softmax_scale=1.0 / math.sqrt(q.shape[-1]),
+        return_lse=True,
+        mask_mod=scalar_limit_mask,
+        aux_scalars=[cutlass.Int32(64)],
+    )
+    out.float().square().mean().backward()
+    assert q.grad is not None and torch.isfinite(q.grad).all()
+    assert k.grad is not None and torch.isfinite(k.grad).all()
+    assert v.grad is not None and torch.isfinite(v.grad).all()
+
+
+def test_compute_block_sparsity_mask_mod_aux_scalars_runs():
+    blocks = compute_block_sparsity(
+        tile_m=64,
+        tile_n=128,
+        batch_size=1,
+        num_heads=1,
+        seqlen_q=128,
+        seqlen_k=128,
+        mask_mod=scalar_limit_mask,
+        aux_tensors=None,
+        device="cuda",
+        aux_scalars=[cutlass.Int32(64)],
+    )
+    assert blocks.mask_block_cnt.shape == (1, 1, 2)
+    assert blocks.mask_block_idx.shape == (1, 1, 2, 1)
 
 
 if __name__ == "__main__":
