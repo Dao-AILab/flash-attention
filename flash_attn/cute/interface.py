@@ -1282,6 +1282,13 @@ def _flash_attn_bwd(
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     arch = _get_device_arch()
     assert arch // 10 in [9, 10, 11, 12], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x, 12.x"
+    if block_sparse_tensors is not None:
+        assert (
+            cu_seqlens_q is None
+            and cu_seqlens_k is None
+            and seqused_q is None
+            and seqused_k is None
+        ), "Varlen backward with block sparsity is not yet supported"
     sparse_q = None
     if block_sparse_tensors is not None and arch // 10 == 9:
         sparse_q = block_sparse_tensors.block_size[0] if block_sparse_tensors.block_size is not None else 128
@@ -1454,9 +1461,6 @@ def _flash_attn_bwd(
         score_mod_bwd = utils.create_softcap_scoremod_bwd(softcap)
     if score_mod is not None:
         assert score_mod_bwd is not None, "score_mod_bwd is required when score_mod is provided"
-        assert cu_seqlens_q is None and cu_seqlens_k is None, (
-            "varlen + score_mod not supported in bwd yet"
-        )
         if arch // 10 == 8:
             raise NotImplementedError("Custom user-provided score_mod is not supported on SM8x architectures.")
 
