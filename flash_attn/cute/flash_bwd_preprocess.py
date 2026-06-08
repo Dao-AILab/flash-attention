@@ -59,12 +59,7 @@ class FlashAttentionBackwardPreprocess:
         self.use_pdl = BaseDSL._get_dsl().get_arch_enum() >= Arch.sm_90a
         self.dtype = dtype
         self.tile_m = tile_m
-        # head_dim_padded sizes the dQaccum zeroing -> must match the main kernel's tile_hdim
-        # and interface's head_dim_rounded (multiple of 32).
         self.head_dim_padded = int(math.ceil(head_dim / 32) * 32)
-        # head_dim_v_padded sizes the O*dO reduction tile. Pad to a multiple of 16 (like the
-        # forward) so the head-dim predicate over the true-width O/dO tile stays tidy; padding
-        # to 32 makes the wrapped tile's K-layout non-tidy and predicate_k mis-shapes it.
         self.head_dim_v_padded = int(math.ceil(head_dim_v / 16) * 16)
         self.check_hdim_v_oob = head_dim_v != self.head_dim_v_padded
         self.num_threads = num_threads
@@ -104,10 +99,6 @@ class FlashAttentionBackwardPreprocess:
         # We want kBlockKGmem to be a power of 2 so that when we do the summing,
         # it's just between threads in the same warp
         if self.check_hdim_v_oob:
-            # When the head-dim is padded, O/dO are loaded with a per-column predicate over the
-            # true-width (wrapped) tile. predicate_k only stays tidy when the gmem K-block is 16;
-            # a larger block (32/64/128) makes the wrapped tile's K-mode hierarchical and the
-            # predicate comes out the wrong shape. Force 16 (still a power of 2 -> warp reduce ok).
             gmem_k_block_size = 16
         else:
             gmem_k_block_size = (

@@ -69,15 +69,8 @@ class FlashAttentionBackwardSm100:
         subtile_factor: cutlass.Constexpr[int] = 1,
     ):
         head_dim_v = head_dim_v if head_dim_v is not None else head_dim
-        # Keep the true (unpadded) head dims for head-dim predication in the epilogue stores.
         self.head_dim = head_dim
         self.head_dim_v = head_dim_v
-        # Two different padding rules, because dQ and dK/dV drain TMEM differently:
-        #   - dQ  : tcgen05.ld.32x32b(Rep=32) + 128B TMA-reduce into fp32 dQaccum
-        #           => tile_hdim must be a multiple of 32 (see dQ_reduce_ncol assert below).
-        #   - dK/V: tcgen05.ld.32x32b(Rep=16) + direct 128b store to gmem
-        #           => tile_hdimv only needs a multiple of 16.
-        # Padding to the smaller multiple where allowed saves dK/dV MMA/SMEM work.
         self.tile_hdim = int(math.ceil(head_dim / 32) * 32)
         self.same_hdim_kv = head_dim == head_dim_v
         self.tile_hdimv = int(math.ceil(head_dim_v / 16) * 16)
@@ -3747,11 +3740,6 @@ class FlashAttentionBackwardSm100:
         mdV_cur = seqlen.offset_batch_K(mdV, batch_idx, dim=3)[None, None, head_idx]
         mdK_cur = seqlen.offset_batch_K(mdK, batch_idx, dim=3)[None, None, head_idx]
 
-        # When the head-dim is padded (not a multiple of the native tile width), the gmem
-        # store must mask the padding columns. The store predicate granularity equals this
-        # repetition, so it must divide the true head-dim boundary. head_dim % 8 == 0 always,
-        # so a repetition of 8 lets the predicate land exactly on the boundary; otherwise the
-        # 16-wide group would straddle (e.g. head_dim=72 falls inside the [64,80) group).
         tmem_ld_rep = 8 if const_expr(self.check_hdim_oob or self.check_hdim_v_oob) else 16
         tmem_load_atom = cute.make_copy_atom(
             tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(tmem_ld_rep)), Float32
@@ -3800,10 +3788,6 @@ class FlashAttentionBackwardSm100:
         tdVgdV_r2g_p = thr_tmem_ld_dV.partition_D(tdVgdV)
         tdVgdV_r2g = self.split_wg(tdVgdV_r2g_p, wg_idx, num_wg)
 
-        # Head-dim predicate: mdV_cur is the true (unpadded) head_dim_v wide, but we tile it
-        # with the padded tile_hdimv, so columns d >= head_dim_v would spill into the next row.
-        # One predicate bit per value-group (mode[0] collapsed to 1); the group is `tmem_ld_rep`
-        # (=8) columns wide and head_dim_v % 8 == 0, so a group never straddles the boundary.
         tdVpdV = None
         if const_expr(self.check_hdim_v_oob):
             pred_shape = (1,) + tuple(tdVcdV_t2r.shape[1:])
@@ -3867,10 +3851,6 @@ class FlashAttentionBackwardSm100:
         tdKgdK_r2g_p = thr_tmem_ld_dK.partition_D(tdKgdK)
         tdKgdK_r2g = self.split_wg(tdKgdK_r2g_p, wg_idx, num_wg)
 
-        # Head-dim predicate: mdK_cur is the true (unpadded) head_dim wide, but we tile it
-        # with the padded tile_hdim, so columns d >= head_dim would spill into the next row.
-        # One predicate bit per value-group (mode[0] collapsed to 1); the group is `tmem_ld_rep`
-        # (=8) columns wide and head_dim % 8 == 0, so a group never straddles the boundary.
         tdKpdK = None
         if const_expr(self.check_hdim_oob):
             pred_shape = (1,) + tuple(tdKcdK_t2r.shape[1:])
