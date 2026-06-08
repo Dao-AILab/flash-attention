@@ -1,3 +1,4 @@
+# Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
 """
 Block-sparse runtime utilities for CUTE DSL kernels.
 
@@ -720,6 +721,15 @@ def run_block_sparse_mainloop_sm80(
 ):
     """Block-sparse mainloop iteration for SM80/SM120.
 
+    NOTE: This implementation hard-codes the non-varlen 4D indexing pattern
+    (lines below this docstring access blocksparse_tensors with 3D indices into
+    batch/head/m_block_sparse). Varlen + block-sparse on SM80/SM120 would
+    require routing through get_curr_blocksparse_tensors(...) (which handles
+    both 2D varlen and 4D non-varlen layouts) and threading seqlen_info into
+    this function. The SM120 dispatcher in interface.py currently does not
+    support varlen + block-sparse together, so this is intentionally narrow;
+    if you lift that restriction, update this function accordingly.
+
     Processes mask blocks first (applying mask_mod), then full blocks (seqlen masking only).
     The first full block always receives seqlen masking regardless of whether mask blocks
     preceded it, since full blocks may be at higher n positions than mask blocks.
@@ -738,7 +748,8 @@ def run_block_sparse_mainloop_sm80(
     Returns:
         processed_any: True if at least one block was processed.
     """
-    mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx = blocksparse_tensors
+    # SM80/SM120 only need the first 4 fields; trailing fields are SM100/backward-only.
+    mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx, *_ = blocksparse_tensors
 
     m_block_sparse = sparse_tensor_m_block(m_block, qhead_per_kvhead, q_subtile_factor)
 
@@ -783,20 +794,20 @@ def run_block_sparse_mainloop_sm80(
             if curr_mask_block_cnt == 0:
                 mma_one_n_block(
                     n_block=n_block,
-                    mask_fn=partial(mask_fn, mask_seqlen=True),
+                    mask_fn=partial(mask_fn, mask_mod=None, mask_seqlen=True),
                     is_first_n_block=True,
                 )
             else:
                 mma_one_n_block(
                     n_block=n_block,
-                    mask_fn=partial(mask_fn, mask_seqlen=True),
+                    mask_fn=partial(mask_fn, mask_mod=None, mask_seqlen=True),
                     is_first_n_block=False,
                 )
             for j in cutlass.range(1, curr_full_block_cnt):
                 n_block = curr_full_block_idx[curr_full_block_cnt - 1 - j]
                 mma_one_n_block(
                     n_block=n_block,
-                    mask_fn=partial(mask_fn, mask_seqlen=False),
+                    mask_fn=partial(mask_fn, mask_mod=None, mask_seqlen=False),
                     is_first_n_block=False,
                 )
 

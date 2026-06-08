@@ -105,26 +105,39 @@ class SeqlenInfoQK:
             if const_expr(mCuSeqlensK is None)
             else cute.assume((offset_k + batch_idx * tile_n) // tile_n * tile_n, divby=tile_n)
         )
+        # SM80/SM120 over-launch wasted grid tiles with batch_idx clamped to
+        # num_batch (unlike SM90, which gates on work_tile.is_valid_tile). The
+        # cu_seqlens tensors have shape [num_batch+1] so [batch_idx]==[num_batch]
+        # is still in-allocation, but the per-batch tensors below (mSeqUsed*,
+        # mCuTotalMBlocks, mCuBlockIdxOffsets) have shape [num_batch], so a raw
+        # [num_batch] read is one element OOB. Clamp every per-batch read so a
+        # wasted tile stays in-allocation (it will be discarded downstream).
         if const_expr(mSeqUsedQ is not None):
-            seqlen_q = mSeqUsedQ[batch_idx]
+            seqlen_q = mSeqUsedQ[cutlass.min(batch_idx, mSeqUsedQ.shape[0] - 1)]
         else:
+            # Clamp the cu_seqlens index so the read stays in-allocation and
+            # the wasted tile sees seqlen=0.
             seqlen_q = (
                 seqlen_q_static
                 if const_expr(mCuSeqlensQ is None)
-                else mCuSeqlensQ[batch_idx + 1] - offset_q
+                else mCuSeqlensQ[cutlass.min(batch_idx + 1, mCuSeqlensQ.shape[0] - 1)] - offset_q
             )
         if const_expr(mSeqUsedK is not None):
-            seqlen_k = mSeqUsedK[batch_idx]
+            seqlen_k = mSeqUsedK[cutlass.min(batch_idx, mSeqUsedK.shape[0] - 1)]
         else:
             seqlen_k = (
                 seqlen_k_static
                 if const_expr(mCuSeqlensK is None)
-                else mCuSeqlensK[batch_idx + 1] - offset_k
+                else mCuSeqlensK[cutlass.min(batch_idx + 1, mCuSeqlensK.shape[0] - 1)] - offset_k
             )
-        m_block_offset = 0 if const_expr(mCuTotalMBlocks is None) else mCuTotalMBlocks[batch_idx]
+        m_block_offset = (
+            0
+            if const_expr(mCuTotalMBlocks is None)
+            else mCuTotalMBlocks[cutlass.min(batch_idx, mCuTotalMBlocks.shape[0] - 1)]
+        )
         num_n_blocks = (seqlen_k + tile_n - 1) // tile_n
         block_idx_offset = (
-            mCuBlockIdxOffsets[batch_idx]
+            mCuBlockIdxOffsets[cutlass.min(batch_idx, mCuBlockIdxOffsets.shape[0] - 1)]
             if const_expr(mCuBlockIdxOffsets is not None)
             else m_block_offset * num_n_blocks
         )
