@@ -9,7 +9,6 @@
 #   - Swizzle(B, 4, 3) for SMEM layouts (TMA requirement, not M=3 like CpAsync)
 #
 # Validated on SM121a (DGX Spark).
-# Contributed by Second Nature Computing (https://joinsecondnature.com)
 
 import math
 from types import SimpleNamespace
@@ -20,7 +19,7 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Constexpr, Float32, Int32, const_expr
+from cutlass import Float32, Int32, const_expr
 from cutlass.cute.nvgpu import cpasync, warp
 import cutlass.utils as utils_basic
 
@@ -34,14 +33,12 @@ from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.softmax import Softmax, apply_score_mod_inner
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
-from flash_attn.cute.pack_gqa import PackGQA
-from flash_attn.cute.named_barrier import NamedBarrierFwd
 from flash_attn.cute.tile_scheduler import (
     TileSchedulerArguments,
     SingleTileScheduler,
+    SingleTileLPTScheduler,
     SingleTileVarlenScheduler,
 )
-from cutlass.cute import FastDivmodDivisor
 
 from flash_attn.cute.flash_fwd import FlashAttentionForwardBase
 
@@ -116,6 +113,7 @@ class FlashAttentionForwardSm120Tma(FlashAttentionForwardBase):
         score_mod: Optional[cutlass.Constexpr] = None,
         mask_mod: Optional[cutlass.Constexpr] = None,
         has_aux_tensors: bool = False,
+        skip_dense_seqlen_mask: bool = False,
     ):
         # Initialize base class with num_threads = (num_mma_warps + 1) * 32
         # The +1 is for the dedicated DMA/producer warp.
@@ -136,11 +134,13 @@ class FlashAttentionForwardSm120Tma(FlashAttentionForwardBase):
             score_mod=score_mod,
             mask_mod=mask_mod,
             has_aux_tensors=has_aux_tensors,
+            skip_dense_seqlen_mask=skip_dense_seqlen_mask,
         )
         # Override arch after parent __init__ which sets it to the runtime GPU arch.
         # SM120 uses SM80 mma.sync, so base class code paths must see arch=sm_80
         # to avoid enabling SM90+ features (TMA-O, WGMMA, etc.).
         from cutlass.base_dsl.arch import Arch
+
         self.arch = Arch.sm_80
         self.num_mma_warps = num_mma_warps
         self.kv_stages = kv_stages
@@ -165,6 +165,11 @@ class FlashAttentionForwardSm120Tma(FlashAttentionForwardBase):
         if head_dim_v is None:
             head_dim_v = head_dim
         if head_dim_v % 8 != 0:
+            return False
+        # head_dim > head_dim_v hangs the GPU on SM120. Match the non-TMA
+        # SM120 kernel's gate so the dispatch produces an AssertionError
+        # rather than wedging the GPU.
+        if head_dim > head_dim_v:
             return False
         # m_block_size must be divisible by MMA tile M (num_mma_warps * 16)
         if tile_m % (num_mma_warps * 16) != 0:
@@ -263,7 +268,7 @@ class FlashAttentionForwardSm120Tma(FlashAttentionForwardBase):
             batch_idx,
             head_idx,
             softmax_scale,
-            self.vec_size,
+            self.score_vec_size,
             self.qk_acc_dtype,
             aux_tensors,
             fastdiv_mods,
@@ -319,7 +324,9 @@ class FlashAttentionForwardSm120Tma(FlashAttentionForwardBase):
             order=(1, 0),
         )
         vO_layout = cute.make_layout((1, o_copy_elems))
-        self.gmem_tiled_copy_O = cute.make_tiled_copy_tv(atom_universal_copy_O, tO_layout, vO_layout)
+        self.gmem_tiled_copy_O = cute.make_tiled_copy_tv(
+            atom_universal_copy_O, tO_layout, vO_layout
+        )
 
     @cute.jit
     def __call__(
@@ -353,8 +360,10 @@ class FlashAttentionForwardSm120Tma(FlashAttentionForwardBase):
         assert learnable_sink is None, "Learnable sink is not supported in this kernel"
         assert mPageTable is None, "Paged KV not supported with TMA kernel (use CpAsync fallback)"
         self._check_type(
-            *(t.element_type if t is not None else None
-              for t in (mQ, mK, mV, mO, mLSE, mCuSeqlensQ, mCuSeqlensK, mSeqUsedQ, mSeqUsedK))
+            *(
+                t.element_type if t is not None else None
+                for t in (mQ, mK, mV, mO, mLSE, mCuSeqlensQ, mCuSeqlensK, mSeqUsedQ, mSeqUsedK)
+            )
         )
         self.o_dtype = mO.element_type
 
@@ -385,7 +394,11 @@ class FlashAttentionForwardSm120Tma(FlashAttentionForwardBase):
         LSE_layout_transpose = [2, 1, 0] if const_expr(mCuSeqlensQ is None) else [1, 0]
         num_splits = Int32(1)
         mO_t = layout_utils.select(mO, O_layout_transpose)
-        mLSE_t = layout_utils.select(mLSE, LSE_layout_transpose) if const_expr(mLSE is not None) else None
+        mLSE_t = (
+            layout_utils.select(mLSE, LSE_layout_transpose)
+            if const_expr(mLSE is not None)
+            else None
+        )
 
         # ///////////////////////////////////////////////////////////////////////////////
         # TMA descriptors
@@ -399,40 +412,58 @@ class FlashAttentionForwardSm120Tma(FlashAttentionForwardBase):
         # For non-varlen: mQ_t is (seq, dim, head, batch), tile (seq, dim)
         # For varlen: mQ_t is (total, dim, head), tile (total, dim)
         tma_atom_q, tma_tensor_q = cpasync.make_tiled_tma_atom(
-            tma_op, mQ_t, sQ_layout_one_stage,
-            (self.tile_m, self.tile_hdim), num_multicast=1,
+            tma_op,
+            mQ_t,
+            sQ_layout_one_stage,
+            (self.tile_m, self.tile_hdim),
+            num_multicast=1,
         )
         tma_atom_k, tma_tensor_k = cpasync.make_tiled_tma_atom(
-            tma_op, mK_t, sK_layout_one_stage,
-            (self.tile_n, self.tile_hdim), num_multicast=1,
+            tma_op,
+            mK_t,
+            sK_layout_one_stage,
+            (self.tile_n, self.tile_hdim),
+            num_multicast=1,
         )
         tma_atom_v, tma_tensor_v = cpasync.make_tiled_tma_atom(
-            tma_op, mV_t, sV_layout_one_stage,
-            (self.tile_n, self.tile_hdimv), num_multicast=1,
+            tma_op,
+            mV_t,
+            sV_layout_one_stage,
+            (self.tile_n, self.tile_hdimv),
+            num_multicast=1,
         )
 
         # TMA transfer sizes (bytes per load)
         q_copy_bytes = cute.size_in_bytes(self.dtype, sQ_layout_one_stage)
         kv_copy_bytes = cute.size_in_bytes(self.dtype, sK_layout_one_stage)
+        v_copy_bytes = cute.size_in_bytes(self.dtype, sV_layout_one_stage)
 
         # ///////////////////////////////////////////////////////////////////////////////
         # Tile scheduler
         # ///////////////////////////////////////////////////////////////////////////////
         if const_expr(mCuSeqlensQ is not None or mSeqUsedQ is not None):
             TileScheduler = SingleTileVarlenScheduler
+        elif const_expr(self.is_causal or self.is_local):
+            # Causal/local tiles do unequal work (the masked triangle), so a
+            # linear block_idx->tile map leaves a tail wave of light tiles
+            # idling SMs. SingleTileLPTScheduler honors the `lpt` flag (which
+            # SingleTileScheduler silently ignores) and runs heavy tiles first,
+            # balancing the tail. Output is bit-identical (only CTA->tile
+            # assignment changes). Requires a real seqlen_k below.
+            TileScheduler = SingleTileLPTScheduler
         else:
             TileScheduler = SingleTileScheduler
         num_batch = (
-            mCuSeqlensQ.shape[0] - 1
-            if const_expr(mCuSeqlensQ is not None)
-            else mQ_t.shape[3]
+            mCuSeqlensQ.shape[0] - 1 if const_expr(mCuSeqlensQ is not None) else mQ_t.shape[3]
         )
         tile_sched_args = TileSchedulerArguments(
             num_block=cute.ceil_div(mQ_t.shape[0], self.tile_m),
             num_head=cute.size(mQ_t.shape[2]),
             num_batch=num_batch,
             num_splits=num_splits,
-            seqlen_k=0,
+            # Real seqlen_k: SingleTileLPTScheduler's L2-swizzle sizing divides by
+            # this (size_one_head); 0 would fault. SingleTileScheduler ignores it.
+            seqlen_k=cute.size(mK_t.shape[0]),
             headdim=mQ_t.shape[1],
             headdim_v=mV_t.shape[1],
             total_q=cute.size(mQ_t.shape[0])
@@ -449,13 +480,20 @@ class FlashAttentionForwardSm120Tma(FlashAttentionForwardBase):
         )
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
         grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
-        softmax_scale_log2, softmax_scale_adj = utils.compute_softmax_scale_log2(softmax_scale, self.score_mod)
-        fastdiv_mods = utils.compute_fastdiv_mods(mQ_t, mK_t, self.qhead_per_kvhead, self.pack_gqa, aux_tensors)
+        softmax_scale_log2, softmax_scale_adj = utils.compute_softmax_scale_log2(
+            softmax_scale, self.score_mod
+        )
+        fastdiv_mods = utils.compute_fastdiv_mods(
+            mQ_t, mK_t, self.qhead_per_kvhead, self.pack_gqa, aux_tensors
+        )
 
         self.kernel(
-            tma_atom_q, tma_tensor_q,
-            tma_atom_k, tma_tensor_k,
-            tma_atom_v, tma_tensor_v,
+            tma_atom_q,
+            tma_tensor_q,
+            tma_atom_k,
+            tma_tensor_k,
+            tma_atom_v,
+            tma_tensor_v,
             mQ_t,
             mK_t,
             mV_t,
@@ -471,6 +509,7 @@ class FlashAttentionForwardSm120Tma(FlashAttentionForwardBase):
             window_size_right,
             q_copy_bytes,
             kv_copy_bytes,
+            v_copy_bytes,
             self.sQ_layout,
             self.sK_layout,
             self.sV_layout,
@@ -516,6 +555,7 @@ class FlashAttentionForwardSm120Tma(FlashAttentionForwardBase):
         window_size_right: Optional[Int32],
         q_copy_bytes: cutlass.Constexpr,
         kv_copy_bytes: cutlass.Constexpr,
+        v_copy_bytes: cutlass.Constexpr,
         sQ_layout: cute.ComposedLayout,
         sK_layout: cute.ComposedLayout,
         sV_layout: cute.ComposedLayout,
@@ -563,7 +603,6 @@ class FlashAttentionForwardSm120Tma(FlashAttentionForwardBase):
         n_block_min, n_block_max = block_info.get_n_block_min_max(
             seqlen, m_block, split_idx, num_splits
         )
-        n_block = cutlass.max(n_block_max - 1, 0)
 
         # ///////////////////////////////////////////////////////////////////////////////
         # Allocate SMEM and create tensors
@@ -595,7 +634,9 @@ class FlashAttentionForwardSm120Tma(FlashAttentionForwardBase):
                 (None, 0, None),
             )
         tQsQ, tQgQ = cpasync.tma_partition(
-            tma_atom_q, 0, cute.make_layout(1),
+            tma_atom_q,
+            0,
+            cute.make_layout(1),
             cute.group_modes(sQ, 0, 2),
             cute.group_modes(gQ, 0, 2),
         )
@@ -623,12 +664,16 @@ class FlashAttentionForwardSm120Tma(FlashAttentionForwardBase):
                 (None, 0, None),
             )
         tKsK, tKgK = cpasync.tma_partition(
-            tma_atom_k, 0, cute.make_layout(1),
+            tma_atom_k,
+            0,
+            cute.make_layout(1),
             cute.group_modes(sK, 0, 2),
             cute.group_modes(gK, 0, 2),
         )
         tVsV, tVgV = cpasync.tma_partition(
-            tma_atom_v, 0, cute.make_layout(1),
+            tma_atom_v,
+            0,
+            cute.make_layout(1),
             cute.group_modes(sV, 0, 2),
             cute.group_modes(gV, 0, 2),
         )
@@ -653,28 +698,22 @@ class FlashAttentionForwardSm120Tma(FlashAttentionForwardBase):
         q_pipeline = pipeline.PipelineTmaAsync.create(
             num_stages=1,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
-            consumer_group=pipeline.CooperativeGroup(
-                pipeline.Agent.Thread, self.num_mma_warps
-            ),
+            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, self.num_mma_warps),
             tx_count=q_copy_bytes,
             barrier_storage=storage.q_mbar_ptr.data_ptr(),
         )
         k_pipeline = pipeline.PipelineTmaAsync.create(
             num_stages=self.kv_stages,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
-            consumer_group=pipeline.CooperativeGroup(
-                pipeline.Agent.Thread, self.num_mma_warps
-            ),
+            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, self.num_mma_warps),
             tx_count=kv_copy_bytes,
             barrier_storage=storage.k_mbar_ptr.data_ptr(),
         )
         v_pipeline = pipeline.PipelineTmaAsync.create(
             num_stages=self.kv_stages,
             producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
-            consumer_group=pipeline.CooperativeGroup(
-                pipeline.Agent.Thread, self.num_mma_warps
-            ),
-            tx_count=kv_copy_bytes,
+            consumer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread, self.num_mma_warps),
+            tx_count=v_copy_bytes,
             barrier_storage=storage.v_mbar_ptr.data_ptr(),
         )
 
@@ -725,9 +764,7 @@ class FlashAttentionForwardSm120Tma(FlashAttentionForwardBase):
         softmax.reset()
 
         # Pipeline states
-        q_producer_state = pipeline.make_pipeline_state(
-            pipeline.PipelineUserType.Producer, 1
-        )
+        q_producer_state = pipeline.make_pipeline_state(pipeline.PipelineUserType.Producer, 1)
         k_producer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Producer, self.kv_stages
         )
@@ -751,9 +788,7 @@ class FlashAttentionForwardSm120Tma(FlashAttentionForwardBase):
             if n_block_max > n_block_min:
                 # Wait for Q to be loaded
                 q_pipeline.consumer_wait(
-                    pipeline.make_pipeline_state(
-                        pipeline.PipelineUserType.Consumer, 1
-                    )
+                    pipeline.make_pipeline_state(pipeline.PipelineUserType.Consumer, 1)
                 )
 
                 # Attention mask
@@ -776,6 +811,15 @@ class FlashAttentionForwardSm120Tma(FlashAttentionForwardBase):
                     aux_tensors=aux_tensors,
                     fastdiv_mods=fastdiv_mods if const_expr(self.mask_mod is not None) else None,
                 )
+                dense_static_noncausal = const_expr(
+                    not self.is_causal
+                    and not self.is_local
+                    and self.mask_mod is None
+                    and mCuSeqlensK is None
+                    and mSeqUsedK is None
+                )
+                if const_expr(dense_static_noncausal and not self.skip_dense_seqlen_mask):
+                    has_seqlen_tail = seqlen.seqlen_k != n_block_max * self.tile_n
 
                 # Main attention loop: all pipeline operations inlined here
                 # (not delegated to a separate @cute.jit method) to avoid CuTe DSL
@@ -793,9 +837,15 @@ class FlashAttentionForwardSm120Tma(FlashAttentionForwardBase):
                     acc_S.fill(0.0)
 
                     sm80_utils.gemm(
-                        thr_mma_qk, acc_S, tSrQ, tSrK,
-                        tSsQ, tSsK[None, None, None, k_stage],
-                        smem_thr_copy_Q, smem_thr_copy_K, A_in_regs=False,
+                        thr_mma_qk,
+                        acc_S,
+                        tSrQ,
+                        tSrK,
+                        tSsQ,
+                        tSsK[None, None, None, k_stage],
+                        smem_thr_copy_Q,
+                        smem_thr_copy_K,
+                        A_in_regs=False,
                     )
 
                     k_pipeline.consumer_release(k_consumer_state)
@@ -804,14 +854,31 @@ class FlashAttentionForwardSm120Tma(FlashAttentionForwardBase):
                     # Apply score_mod if present
                     if const_expr(self.score_mod is not None):
                         self.apply_score_mod(
-                            thr_mma_qk, batch_idx, head_idx, m_block,
-                            acc_S, cur_n_block, seqlen,
+                            thr_mma_qk,
+                            batch_idx,
+                            head_idx,
+                            m_block,
+                            acc_S,
+                            cur_n_block,
+                            seqlen,
                             softmax_scale=softmax.softmax_scale,
-                            aux_tensors=aux_tensors, fastdiv_mods=fastdiv_mods,
+                            aux_tensors=aux_tensors,
+                            fastdiv_mods=fastdiv_mods,
                         )
 
-                    # Apply mask (always check seqlen; causal handled by AttentionMask)
-                    mask_fn(acc_S, n_block=cur_n_block, mask_mod=self.mask_mod, mask_seqlen=True)
+                    # Dense static noncausal full tiles do not need seqlen masking;
+                    # only the first high-K tile can be a tail tile.
+                    if const_expr(self.skip_dense_seqlen_mask):
+                        pass
+                    elif const_expr(dense_static_noncausal):
+                        if has_seqlen_tail and n_tile == 0:
+                            mask_fn(
+                                acc_S, n_block=cur_n_block, mask_mod=self.mask_mod, mask_seqlen=True
+                            )
+                    else:
+                        mask_fn(
+                            acc_S, n_block=cur_n_block, mask_mod=self.mask_mod, mask_seqlen=True
+                        )
 
                     # Online softmax (is_first=False: softmax.reset() pre-initialized
                     # row_max=-inf and row_sum=0, which gives correct results for the
@@ -829,8 +896,12 @@ class FlashAttentionForwardSm120Tma(FlashAttentionForwardBase):
                     v_stage = v_consumer_state.index
 
                     sm80_utils.gemm_rs(
-                        thr_mma_pv, acc_O, tOrP, tOrVt,
-                        tOsVt[None, None, None, v_stage], smem_thr_copy_V,
+                        thr_mma_pv,
+                        acc_O,
+                        tOrP,
+                        tOrVt,
+                        tOsVt[None, None, None, v_stage],
+                        smem_thr_copy_V,
                     )
 
                     v_pipeline.consumer_release(v_consumer_state)
@@ -869,7 +940,8 @@ class FlashAttentionForwardSm120Tma(FlashAttentionForwardBase):
                 # Load Q (once, single stage)
                 q_pipeline.producer_acquire(q_producer_state)
                 cute.copy(
-                    tma_atom_q, tQgQ_block,
+                    tma_atom_q,
+                    tQgQ_block,
                     tQsQ[(None, q_producer_state.index)],
                     tma_bar_ptr=q_pipeline.producer_get_barrier(q_producer_state),
                 )
@@ -911,6 +983,9 @@ class FlashAttentionForwardSm120Tma(FlashAttentionForwardBase):
                 k_pipeline.producer_tail(k_producer_state)
                 v_pipeline.producer_tail(v_producer_state)
 
+    # Intentionally unused: this body is inlined into kernel() because
+    # passing k_pipeline / v_pipeline consumer states across a method
+    # boundary triggers a CuTe DSL compiler hang.
     @cute.jit
     def mma_one_n_block(
         self,
