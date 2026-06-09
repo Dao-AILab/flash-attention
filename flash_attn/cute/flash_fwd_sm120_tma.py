@@ -28,6 +28,7 @@ from quack import layout_utils
 from flash_attn.cute import ampere_helpers as sm80_utils
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import utils
+from flash_attn.cute.utils import AuxData
 import cutlass.pipeline as pipeline
 from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.softmax import Softmax, apply_score_mod_inner
@@ -254,7 +255,7 @@ class FlashAttentionForwardSm120Tma(FlashAttentionForwardBase):
         n_block,
         seqlen,
         softmax_scale,
-        aux_tensors=None,
+        aux_data: AuxData = AuxData(),
         fastdiv_mods=None,
     ):
         """Apply score_mod to attention scores."""
@@ -270,7 +271,7 @@ class FlashAttentionForwardSm120Tma(FlashAttentionForwardBase):
             softmax_scale,
             self.score_vec_size,
             self.qk_acc_dtype,
-            aux_tensors,
+            aux_data,
             fastdiv_mods,
             seqlen_info=seqlen,
             constant_q_idx=None,
@@ -346,7 +347,7 @@ class FlashAttentionForwardSm120Tma(FlashAttentionForwardBase):
         window_size_right: Optional[Int32] = None,
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors=None,
-        aux_tensors=None,
+        aux_data: AuxData = AuxData(),
         # Always keep stream as the last parameter (matches base
         # FlashAttentionForwardSm80.__call__ convention; cute.compile
         # binds arguments positionally against compile_args, which ends
@@ -484,7 +485,7 @@ class FlashAttentionForwardSm120Tma(FlashAttentionForwardBase):
             softmax_scale, self.score_mod
         )
         fastdiv_mods = utils.compute_fastdiv_mods(
-            mQ_t, mK_t, self.qhead_per_kvhead, self.pack_gqa, aux_tensors
+            mQ_t, mK_t, self.qhead_per_kvhead, self.pack_gqa, aux_data.tensors
         )
 
         self.kernel(
@@ -521,7 +522,7 @@ class FlashAttentionForwardSm120Tma(FlashAttentionForwardBase):
             tile_sched_params,
             TileScheduler,
             num_splits,
-            aux_tensors,
+            aux_data,
             fastdiv_mods,
         ).launch(
             grid=grid_dim,
@@ -567,7 +568,7 @@ class FlashAttentionForwardSm120Tma(FlashAttentionForwardBase):
         tile_sched_params,
         TileScheduler: cutlass.Constexpr[Callable],
         num_splits: Int32,
-        aux_tensors=None,
+        aux_data: AuxData = AuxData(),
         fastdiv_mods=None,
     ):
         tidx, _, _ = cute.arch.thread_idx()
@@ -735,7 +736,7 @@ class FlashAttentionForwardSm120Tma(FlashAttentionForwardBase):
         tSrK = thr_mma_qk.make_fragment_B(thr_mma_qk.partition_B(sK[None, None, 0]))
         tOrVt = thr_mma_pv.make_fragment_B(thr_mma_pv.partition_B(sVt[None, None, 0]))
         acc_shape_O = thr_mma_pv.partition_shape_C((self.tile_m, self.tile_hdimv))
-        acc_O = cute.make_fragment(acc_shape_O, Float32)
+        acc_O = cute.make_rmem_tensor(acc_shape_O, Float32)
         acc_O.fill(0.0)
 
         # LdMatrix atoms: shared → register
@@ -808,7 +809,7 @@ class FlashAttentionForwardSm120Tma(FlashAttentionForwardBase):
                     thr_mma=thr_mma_qk,
                     mask_causal=self.is_causal,
                     mask_local=self.is_local,
-                    aux_tensors=aux_tensors,
+                    aux_data=aux_data,
                     fastdiv_mods=fastdiv_mods if const_expr(self.mask_mod is not None) else None,
                 )
                 dense_static_noncausal = const_expr(
@@ -833,7 +834,7 @@ class FlashAttentionForwardSm120Tma(FlashAttentionForwardBase):
                     k_stage = k_consumer_state.index
 
                     acc_shape_S = thr_mma_qk.partition_shape_C((self.tile_m, self.tile_n))
-                    acc_S = cute.make_fragment(acc_shape_S, Float32)
+                    acc_S = cute.make_rmem_tensor(acc_shape_S, Float32)
                     acc_S.fill(0.0)
 
                     sm80_utils.gemm(
@@ -862,7 +863,7 @@ class FlashAttentionForwardSm120Tma(FlashAttentionForwardBase):
                             cur_n_block,
                             seqlen,
                             softmax_scale=softmax.softmax_scale,
-                            aux_tensors=aux_tensors,
+                            aux_data=aux_data,
                             fastdiv_mods=fastdiv_mods,
                         )
 
@@ -1003,7 +1004,7 @@ class FlashAttentionForwardSm120Tma(FlashAttentionForwardBase):
         m_block: Int32,
         mask_fn: Optional[Callable] = None,
         is_first_n_block: cutlass.Constexpr = False,
-        aux_tensors=None,
+        aux_data: AuxData = AuxData(),
         fastdiv_mods=None,
     ):
         """Consumer: compute one n_block of S and O with TMA pipeline synchronization."""
@@ -1013,7 +1014,7 @@ class FlashAttentionForwardSm120Tma(FlashAttentionForwardBase):
         k_stage = k_consumer_state.index
 
         acc_shape_S = mma_params.thr_mma_qk.partition_shape_C((self.tile_m, self.tile_n))
-        acc_S = cute.make_fragment(acc_shape_S, Float32)
+        acc_S = cute.make_rmem_tensor(acc_shape_S, Float32)
         acc_S.fill(0.0)
 
         # QK GEMM using SM80 MMA with register pipeline
@@ -1043,7 +1044,7 @@ class FlashAttentionForwardSm120Tma(FlashAttentionForwardBase):
                 n_block,
                 seqlen,
                 softmax_scale=softmax.softmax_scale,
-                aux_tensors=aux_tensors,
+                aux_data=aux_data,
                 fastdiv_mods=fastdiv_mods,
             )
 

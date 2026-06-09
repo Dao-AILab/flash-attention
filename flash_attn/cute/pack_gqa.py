@@ -141,7 +141,7 @@ class PackGQA:
         head_stride = tensor.stride[0][0]
         seqlen_stride = tensor.stride[0][1]
         num_ptr_per_thread = cute.ceil_div(cute.size(cRows), threads_per_row)
-        tPrPtr = cute.make_fragment(num_ptr_per_thread, cutlass.Int64)
+        tPrPtr = cute.make_rmem_tensor(num_ptr_per_thread, cutlass.Int64)
         base_ptr = tensor.iterator
         for i in cutlass.range_constexpr(num_ptr_per_thread):
             row = i * num_threads + cRows[tidx % threads_per_row][0]

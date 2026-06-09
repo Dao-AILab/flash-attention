@@ -272,16 +272,16 @@ class FlashAttentionDecodeSm120:
         gVc = cute.make_tensor(gV.iterator, gK_chunk_layout)
 
         # ---- load Q rows (R rows, this thread's vec chunk) into registers ----
-        rQ = cute.make_fragment((R, vec), Float32)
+        rQ = cute.make_rmem_tensor((R, vec), Float32)
         for r in cutlass.range_constexpr(R):
             q_head = kv_head * R + r
             for e in cutlass.range_constexpr(vec):
                 rQ[r, e] = Float32(mQ[batch, 0, q_head, lane_d * vec + e])
 
         # ---- online softmax state (per row; this thread's acc chunk) ----
-        acc_o = cute.make_fragment((R, vec), Float32)
-        row_max = cute.make_fragment((R,), Float32)
-        row_sum = cute.make_fragment((R,), Float32)
+        acc_o = cute.make_rmem_tensor((R, vec), Float32)
+        row_max = cute.make_rmem_tensor((R,), Float32)
+        row_sum = cute.make_rmem_tensor((R,), Float32)
         for r in cutlass.range_constexpr(R):
             row_max[r] = Float32(-1e30)
             row_sum[r] = Float32(0.0)

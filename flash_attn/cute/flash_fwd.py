@@ -40,6 +40,7 @@ from flash_attn.cute.block_sparse_utils import (
     sparse_tensor_m_block,
 )
 from flash_attn.cute.tile_scheduler import SingleTileScheduler, SingleTileVarlenScheduler, TileSchedulerArguments
+from flash_attn.cute.utils import AuxData
 
 
 class FlashAttentionForwardBase:
@@ -755,7 +756,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         window_size_right: Optional[Int32] = None,
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
-        aux_tensors=None,
+        aux_data: AuxData = AuxData(),
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -865,7 +866,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
         grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
         softmax_scale_log2, softmax_scale = utils.compute_softmax_scale_log2(softmax_scale, self.score_mod)
-        fastdiv_mods = utils.compute_fastdiv_mods(mQ, mK, self.qhead_per_kvhead, self.pack_gqa, aux_tensors)
+        fastdiv_mods = utils.compute_fastdiv_mods(mQ, mK, self.qhead_per_kvhead, self.pack_gqa, aux_data.tensors)
 
         self.kernel(
             mQ,
@@ -897,7 +898,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             SharedStorage,
             tile_sched_params,
             TileScheduler,
-            aux_tensors,
+            aux_data,
             fastdiv_mods,
             blocksparse_tensors,
         ).launch(
@@ -986,7 +987,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         SharedStorage: cutlass.Constexpr,
         tile_sched_params,
         TileScheduler: cutlass.Constexpr[Callable],
-        aux_tensors=None,
+        aux_data: AuxData = AuxData(),
         fastdiv_mods=None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
     ):
@@ -1147,7 +1148,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         tSrK = thr_mma_qk.make_fragment_B(thr_mma_qk.partition_B(sK[None, None, 0]))
         tOrVt = thr_mma_pv.make_fragment_B(thr_mma_pv.partition_B(sVt[None, None, 0]))
         acc_shape_O = thr_mma_pv.partition_shape_C((self.tile_m, self.tile_hdimv))
-        acc_O = cute.make_fragment(acc_shape_O, Float32)
+        acc_O = cute.make_rmem_tensor(acc_shape_O, Float32)
         acc_O.fill(0.0)
 
         # ///////////////////////////////////////////////////////////////////////////////
@@ -1239,7 +1240,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                 batch_idx=batch_size,
                 head_idx=num_head,
                 m_block=m_block,
-                aux_tensors=aux_tensors,
+                aux_data=aux_data,
                 fastdiv_mods=fastdiv_mods,
             )
 
@@ -1277,7 +1278,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                 thr_mma=thr_mma_qk,
                 mask_causal=False,
                 mask_local=False,
-                aux_tensors=aux_tensors,
+                aux_data=aux_data,
             )
 
             if total_block_cnt > 0:
@@ -1332,7 +1333,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                     head_idx=num_head,
                     m_block=m_block,
                     seqlen=seqlen,
-                    aux_tensors=aux_tensors,
+                    aux_data=aux_data,
                     fastdiv_mods=fastdiv_mods,
                 )
 
@@ -1453,7 +1454,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                 thr_mma=thr_mma_qk,
                 mask_causal=self.is_causal,
                 mask_local=self.is_local,
-                aux_tensors=aux_tensors,
+                aux_data=aux_data,
                 fastdiv_mods=fastdiv_mods if const_expr(self.mask_mod is not None) else None,
             )
 
@@ -1677,7 +1678,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                     gQ,
                     tidx,
                     mQ_cur,
-                    aux_tensors=aux_tensors,
+                    aux_data=aux_data,
                     fastdiv_mods=fastdiv_mods,
                     split_idx=split_idx if const_expr(self.is_split_kv) else Int32(0),
                 )
@@ -1698,7 +1699,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         head_idx: cutlass.Int32,
         m_block: cutlass.Int32,
         seqlen: SeqlenInfoQK,
-        aux_tensors=None,
+        aux_data: AuxData = AuxData(),
         fastdiv_mods=None,
         mask_fn: Optional[Callable] = None,
         is_first_n_block: cutlass.Constexpr = False,
@@ -1715,7 +1716,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             cute.arch.barrier()
 
         acc_shape_S = mma_params.thr_mma_qk.partition_shape_C((self.tile_m, self.tile_n))
-        acc_S = cute.make_fragment(acc_shape_S, Float32)
+        acc_S = cute.make_rmem_tensor(acc_shape_S, Float32)
         acc_S.fill(0.0)
         # wait for smem tile QK before mma calculation for S
         sync()
@@ -1756,7 +1757,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                 n_block,
                 softmax_scale=softmax.softmax_scale,
                 seqlen=seqlen,
-                aux_tensors=aux_tensors,
+                aux_data=aux_data,
                 fastdiv_mods=fastdiv_mods,
             )
 
@@ -1806,7 +1807,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         n_block,
         softmax_scale,
         seqlen,
-        aux_tensors: Optional[list] = None,
+        aux_data: AuxData = AuxData(),
         fastdiv_mods=None,
     ):
         # Prepare index tensor
@@ -1823,7 +1824,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             softmax_scale,
             self.score_vec_size,
             self.qk_acc_dtype,
-            aux_tensors,
+            aux_data,
             fastdiv_mods,
             seqlen_info=seqlen,
             constant_q_idx=None,
@@ -1844,7 +1845,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         head_idx: cutlass.Int32,
         m_block: cutlass.Int32,
         seqlen: SeqlenInfoQK,
-        aux_tensors=None,
+        aux_data: AuxData = AuxData(),
         fastdiv_mods=None,
         mask_fn: Optional[Callable] = None,
         is_first_n_block: cutlass.Constexpr = False,
@@ -1854,7 +1855,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         Unlike compute_one_n_block, this does not overlap loads with the next block since the
         next block address is not known ahead of time in the block-sparse case.
         """
-        acc_S = cute.make_fragment(
+        acc_S = cute.make_rmem_tensor(
             mma_params.thr_mma_qk.partition_shape_C((self.tile_m, self.tile_n)), Float32
         )
         acc_S.fill(0.0)
@@ -1900,7 +1901,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                 n_block,
                 softmax_scale=softmax.softmax_scale,
                 seqlen=seqlen,
-                aux_tensors=aux_tensors,
+                aux_data=aux_data,
                 fastdiv_mods=fastdiv_mods,
             )
 
@@ -1966,7 +1967,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         gQ: cute.Tensor,
         tidx: Int32,
         mQ_cur: cute.Tensor,
-        aux_tensors=None,
+        aux_data: AuxData = AuxData(),
         fastdiv_mods=None,
         split_idx: Int32 = Int32(0),
     ):
@@ -2072,7 +2073,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
 
         # ---- First (masked) iteration ----
         if has_work:
-            acc_S = cute.make_fragment(
+            acc_S = cute.make_rmem_tensor(
                 thr_mma_qk.partition_shape_C((self.tile_m, self.tile_n)), Float32
             )
             acc_S.fill(0.0)
@@ -2096,7 +2097,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                 self.apply_score_mod(
                     thr_mma_qk, batch_idx, head_idx, m_block, acc_S, nb,
                     softmax_scale=softmax.softmax_scale, seqlen=seqlen,
-                    aux_tensors=aux_tensors, fastdiv_mods=fastdiv_mods,
+                    aux_data=aux_data, fastdiv_mods=fastdiv_mods,
                 )
             # Wait for V; issue K(nb-1) if any remaining
             cute.arch.cp_async_wait_group(0)
@@ -2110,7 +2111,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                 batch_idx=batch_idx, head_idx=head_idx, m_block=m_block,
                 thr_mma=thr_mma_qk,
                 mask_causal=self.is_causal, mask_local=self.is_local,
-                aux_tensors=aux_tensors,
+                aux_data=aux_data,
                 fastdiv_mods=fastdiv_mods if const_expr(self.mask_mod is not None) else None,
                 mask_mod=self.mask_mod,
                 mask_seqlen=True,
@@ -2149,7 +2150,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                 n_block_max - 1 - n_block_min_causal_local_mask, unroll=1
             ):
                 nb = n_block_max - 2 - n_tile
-                acc_S = cute.make_fragment(
+                acc_S = cute.make_rmem_tensor(
                     thr_mma_qk.partition_shape_C((self.tile_m, self.tile_n)), Float32
                 )
                 acc_S.fill(0.0)
@@ -2172,7 +2173,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                     self.apply_score_mod(
                         thr_mma_qk, batch_idx, head_idx, m_block, acc_S, nb,
                         softmax_scale=softmax.softmax_scale, seqlen=seqlen,
-                        aux_tensors=aux_tensors, fastdiv_mods=fastdiv_mods,
+                        aux_data=aux_data, fastdiv_mods=fastdiv_mods,
                     )
                 cute.arch.cp_async_wait_group(0)
                 cute.arch.barrier()
@@ -2185,7 +2186,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                     batch_idx=batch_idx, head_idx=head_idx, m_block=m_block,
                     thr_mma=thr_mma_qk,
                     mask_causal=self.is_causal, mask_local=self.is_local,
-                    aux_tensors=aux_tensors,
+                    aux_data=aux_data,
                     fastdiv_mods=fastdiv_mods if const_expr(self.mask_mod is not None) else None,
                     mask_mod=self.mask_mod,
                     mask_seqlen=True,
@@ -2217,7 +2218,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             unmasked_n_block_start - unmasked_n_block_stop, unroll=1
         ):
             nb = unmasked_n_block_start - n_tile - 1
-            acc_S = cute.make_fragment(
+            acc_S = cute.make_rmem_tensor(
                 thr_mma_qk.partition_shape_C((self.tile_m, self.tile_n)), Float32
             )
             acc_S.fill(0.0)
@@ -2240,7 +2241,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                 self.apply_score_mod(
                     thr_mma_qk, batch_idx, head_idx, m_block, acc_S, nb,
                     softmax_scale=softmax.softmax_scale, seqlen=seqlen,
-                    aux_tensors=aux_tensors, fastdiv_mods=fastdiv_mods,
+                    aux_data=aux_data, fastdiv_mods=fastdiv_mods,
                 )
             cute.arch.cp_async_wait_group(0)
             cute.arch.barrier()
@@ -2253,7 +2254,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                 batch_idx=batch_idx, head_idx=head_idx, m_block=m_block,
                 thr_mma=thr_mma_qk,
                 mask_causal=self.is_causal, mask_local=self.is_local,
-                aux_tensors=aux_tensors,
+                aux_data=aux_data,
                 fastdiv_mods=fastdiv_mods if const_expr(self.mask_mod is not None) else None,
                 mask_mod=self.mask_mod,
                 mask_seqlen=False,
@@ -2276,7 +2277,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         if const_expr(self.is_local):
             for n_tile in cutlass.range(unmasked_n_block_stop - n_block_min, unroll=1):
                 nb = unmasked_n_block_stop - n_tile - 1
-                acc_S = cute.make_fragment(
+                acc_S = cute.make_rmem_tensor(
                     thr_mma_qk.partition_shape_C((self.tile_m, self.tile_n)), Float32
                 )
                 acc_S.fill(0.0)
@@ -2299,7 +2300,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                     self.apply_score_mod(
                         thr_mma_qk, batch_idx, head_idx, m_block, acc_S, nb,
                         softmax_scale=softmax.softmax_scale, seqlen=seqlen,
-                        aux_tensors=aux_tensors, fastdiv_mods=fastdiv_mods,
+                        aux_data=aux_data, fastdiv_mods=fastdiv_mods,
                     )
                 cute.arch.cp_async_wait_group(0)
                 cute.arch.barrier()
@@ -2312,7 +2313,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                     batch_idx=batch_idx, head_idx=head_idx, m_block=m_block,
                     thr_mma=thr_mma_qk,
                     mask_causal=self.is_causal, mask_local=self.is_local,
-                    aux_tensors=aux_tensors,
+                    aux_data=aux_data,
                     fastdiv_mods=fastdiv_mods if const_expr(self.mask_mod is not None) else None,
                     mask_mod=self.mask_mod,
                     mask_seqlen=True,
