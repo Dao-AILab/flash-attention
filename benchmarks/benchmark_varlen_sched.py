@@ -1,11 +1,16 @@
-"""Benchmark the dynamic-persistent varlen scheduler against the prior default
-(`SingleTileVarlenScheduler`), CLC (if available), and — on constant-seqlen workloads — the
-non-varlen `flash_attn_func` baseline.
+"""Benchmark varlen tile schedulers against each other across length distributions.
+
+Compares the dynamic persistent scheduler, the static single-tile scheduler, CLC
+(where supported), and — on constant-seqlen workloads — the non-varlen
+`flash_attn_func` baseline.
 
 Examples:
   python benchmarks/benchmark_varlen_sched.py --total-tokens 32k --patterns longtail
   python benchmarks/benchmark_varlen_sched.py --total-tokens 32k,64k --shapes 32x1k,16x2k \\
       --patterns constant longtail --csv > out.csv
+  # decode: short q, long k, SplitKV
+  python benchmarks/benchmark_varlen_sched.py --seqlen-q 1 --shapes 8x64k,32x128k \\
+      --num-splits 1 4 16
 """
 
 import argparse
@@ -16,6 +21,7 @@ import torch
 from triton.testing import do_bench
 
 from flash_attn.cute import utils as fa_utils
+from flash_attn.cute.bench_utils import flops
 from flash_attn.cute.interface import (
     flash_attn_func,
     flash_attn_varlen_func,
@@ -29,6 +35,8 @@ _CLC_MODES = {"clc", "clc-prep"}
 def _supports_clc(device):
     return torch.cuda.get_device_capability(device)[0] == 10
 
+
+# ── CLI value parsers ────────────────────────────────────────────────────────
 
 def parse_int_k(s):
     """Parse an integer with optional k/K/m/M suffix, e.g. '8k' -> 8192, '1m' -> 1048576."""
@@ -53,6 +61,8 @@ def parse_shape(s):
 def parse_shapes(s):
     return [parse_shape(x) for x in s.split(",")]
 
+
+# ── Workload generation ──────────────────────────────────────────────────────
 
 def _make_seqlens(batch, seqlen, pattern, seed):
     g = torch.Generator(device="cpu").manual_seed(seed)
@@ -105,14 +115,12 @@ def _apply_sort(seqlens_q, seqlens_k, sort):
     return [p[0] for p in pairs], [p[1] for p in pairs]
 
 
-def _override_random_subset(
-    seqlens_q, seqlens_k, frac, seed_salt, sq_value, sk_value, seed
-):
+def _override_random_subset(seqlens_q, seqlens_k, frac, sq_value, sk_value, seed):
     """Pick `frac` of batches at random and overwrite their seqlens to the given values.
     `sk_value=None` leaves seqlens_k untouched (used for decode-mix)."""
     if frac <= 0:
         return seqlens_q, seqlens_k
-    g = torch.Generator(device="cpu").manual_seed(seed + seed_salt)
+    g = torch.Generator(device="cpu").manual_seed(seed)
     B = len(seqlens_q)
     n = int(round(frac * B))
     if n <= 0:
@@ -127,15 +135,17 @@ def _override_random_subset(
 
 
 def build_ctx(
-    args, batch, seqlen, pattern, sort, decode_frac, zero_frac, num_splits, seed
+    args, batch, seqlen, pattern, sort, decode_frac, zero_frac, num_splits, ks_split, seed
 ):
     seqlens_k = _make_seqlens(batch, seqlen, pattern, seed)
-    seqlens_q = list(seqlens_k)
+    # seqlen_q=None matches k (prefill); a fixed value (e.g. 1) is the decode regime.
+    seqlens_q = [args.seqlen_q] * batch if args.seqlen_q is not None else list(seqlens_k)
+    # Distinct seeds (even/odd) so the decode and zero draws are uncorrelated.
     seqlens_q, seqlens_k = _override_random_subset(
-        seqlens_q, seqlens_k, decode_frac, 7919, sq_value=1, sk_value=None, seed=seed
+        seqlens_q, seqlens_k, decode_frac, sq_value=1, sk_value=None, seed=2 * seed
     )
     seqlens_q, seqlens_k = _override_random_subset(
-        seqlens_q, seqlens_k, zero_frac, 31337, sq_value=0, sk_value=0, seed=seed
+        seqlens_q, seqlens_k, zero_frac, sq_value=0, sk_value=0, seed=2 * seed + 1
     )
     seqlens_q, seqlens_k = _apply_sort(seqlens_q, seqlens_k, sort)
 
@@ -176,47 +186,43 @@ def build_ctx(
         max_seqlen_k=max(seqlens_k) if seqlens_k else 0,
         causal=True,
         num_splits=num_splits,
+        seqlen_k_per_split=ks_split or None,
         pack_gqa=args.pack_gqa,
     )
 
 
+# ── Scheduler metadata & benchmark modes ────────────────────────────────────
+
 def _make_meta(ctx):
-    tile_m = 128
-    qhead_per_kvhead = ctx["nheads"] // ctx["nheads_kv"]
-    arch = torch.cuda.get_device_capability()[0]
-    if arch == 10 and ctx["max_seqlen_q"] * qhead_per_kvhead > tile_m:
-        q_stage = 2
-    else:
-        q_stage = 1
+    # tile_m/tile_n/q_stage and the per-batch split count are derived internally
+    # to match the config the kernel actually launches with.
     return get_scheduler_metadata(
-        num_batch=ctx["batch"],
         max_seqlen_q=ctx["max_seqlen_q"],
         max_seqlen_k=ctx["max_seqlen_k"],
         nheads=ctx["nheads"],
         nheads_kv=ctx["nheads_kv"],
         headdim=ctx["headdim"],
         num_splits=ctx["num_splits"],
-        tile_m=tile_m,
-        tile_n=128,
         causal=ctx["causal"],
         pack_gqa=ctx["pack_gqa"],
         cu_seqlens_q=ctx["cu_q"],
         cu_seqlens_k=ctx["cu_k"],
-        q_stage=q_stage,
+        seqlen_k_per_split=ctx["seqlen_k_per_split"],
     )
 
 
 def _make_meta_no_semaphore(ctx):
-    """Like _make_meta but with tile_count_semaphore nulled out, so the FA kernel
-    selects SingleTileVarlenScheduler (STATIC) instead of DynamicPersistentVarlen.
-    Exercises the binary-search hint path on the scheduler that lacks resumption."""
-    m = _make_meta(ctx)
-    return m._replace(tile_count_semaphore=None)
+    """Like `_make_meta`, but with `tile_count_semaphore` nulled out so the kernel
+    falls back to the static SingleTileVarlenScheduler instead of the dynamic
+    persistent one, while still receiving the binary-search hints in the metadata."""
+    return _make_meta(ctx)._replace(tile_count_semaphore=None)
 
 
 def setup_dense(ctx):
-    """Non-varlen baseline; only meaningful when every batch has the same seqlen."""
+    """Non-varlen baseline; only meaningful when every batch has the same q==k seqlen."""
     if ctx["pattern"] != "constant" or ctx["decode_frac"] != 0 or ctx["zero_frac"] != 0:
+        return None
+    if ctx["max_seqlen_q"] != ctx["max_seqlen_k"]:
         return None
     batch, seqlen = ctx["batch"], ctx["seqlen"]
     nheads, nheads_kv, headdim = ctx["nheads"], ctx["nheads_kv"], ctx["headdim"]
@@ -230,20 +236,24 @@ def setup_dense(ctx):
 
 
 def make_varlen_setup(*, clc: bool, prep: str, no_semaphore: bool = False):
-    """`prep` is one of 'none', 'precompute', 'recompute'.
+    """Build a setup function for one varlen scheduler configuration.
 
-    `no_semaphore=True` nulls out `tile_count_semaphore` in the metadata so the
-    FA kernel picks SingleTileVarlenScheduler (STATIC) instead of the auto-
-    selected DynamicPersistentVarlenScheduler. Use this to exercise the binary-
-    search hint path on the no-resumption scheduler that PR #2520 targets."""
+    `prep` selects how scheduler metadata is handled: 'none' skips it entirely,
+    'precompute' builds it once outside the timed region, 'recompute' rebuilds it
+    on every call so the prep cost is included in the measurement.
+
+    `no_semaphore=True` nulls out `tile_count_semaphore` in the metadata, forcing
+    the static SingleTileVarlenScheduler instead of the dynamic persistent one."""
     assert prep in ("none", "precompute", "recompute")
     meta_fn = _make_meta_no_semaphore if no_semaphore else _make_meta
 
     def setup(ctx):
+        # CLC scheduler selection is a process-global toggle; set it before
+        # building metadata and keep it set for the duration of the benchmark.
+        fa_utils._fa_clc_enabled = clc
         meta_precomputed = meta_fn(ctx) if prep == "precompute" else None
 
         def fn():
-            fa_utils._fa_clc_enabled = clc
             meta = meta_fn(ctx) if prep == "recompute" else meta_precomputed
             return flash_attn_varlen_func(
                 ctx["q_unpad"],
@@ -265,18 +275,20 @@ def make_varlen_setup(*, clc: bool, prep: str, no_semaphore: bool = False):
     return setup
 
 
-# fmt: off
+# (cli_name, setup_fn). The "-prep" modes precompute scheduler metadata outside the
+# timed region; "dynamic-recompute" rebuilds it every call to measure the prep cost.
 MODES = [
-    ("dense",        setup_dense),
-    ("single-tile",  make_varlen_setup(clc=False, prep="none")),
-    ("st-prep",      make_varlen_setup(clc=False, prep="precompute", no_semaphore=True)),
-    ("clc",          make_varlen_setup(clc=True,  prep="none")),
-    ("clc-prep",     make_varlen_setup(clc=True,  prep="precompute")),
-    ("dynamic-prep", make_varlen_setup(clc=False, prep="precompute")),
-    ("dynamic+prep", make_varlen_setup(clc=False, prep="recompute")),
+    ("dense",             setup_dense),
+    ("single-tile",       make_varlen_setup(clc=False, prep="none")),
+    ("st-prep",           make_varlen_setup(clc=False, prep="precompute", no_semaphore=True)),
+    ("clc",               make_varlen_setup(clc=True,  prep="none")),
+    ("clc-prep",          make_varlen_setup(clc=True,  prep="precompute")),
+    ("dynamic-prep",      make_varlen_setup(clc=False, prep="precompute")),
+    ("dynamic-recompute", make_varlen_setup(clc=False, prep="recompute")),
 ]
-# fmt: on
 
+
+# ── Driver ───────────────────────────────────────────────────────────────────
 
 def parse_args():
     p = argparse.ArgumentParser(description="Benchmark FA4 varlen scheduler modes")
@@ -326,7 +338,22 @@ def parse_args():
         default=[1],
         help="num_splits values; >1 enables SplitKV",
     )
+    p.add_argument(
+        "--seqlen-k-per-split",
+        nargs="+",
+        type=parse_int_k,
+        default=[0],
+        help="Fixed K length per split fed to the prepare kernel (must divide tile_n); "
+        "0 uses the occupancy heuristic. Only affects metadata-prep modes.",
+    )
     p.add_argument("--modes", nargs="+", default=[cli for cli, _ in MODES])
+    p.add_argument(
+        "--seqlen-q",
+        type=parse_int_k,
+        default=None,
+        help="Fixed query length for every batch (e.g. 1 for decode). "
+        "Default: match seqlen_k (prefill).",
+    )
     p.add_argument("--headdim", type=int, default=128)
     p.add_argument("--nheads", type=int, default=16)
     p.add_argument("--nheads-kv", type=int, default=2)
@@ -387,10 +414,11 @@ def main():
             (cli, fn) for cli, fn in selected_modes if cli not in _CLC_MODES
         ]
 
+    seqlen_q_str = "match k (prefill)" if args.seqlen_q is None else str(args.seqlen_q)
     print(f"# device {args.device}: {torch.cuda.get_device_name(args.device)}")
     print(
         f"# headdim={args.headdim} nheads={args.nheads} nheads_kv={args.nheads_kv} "
-        f"(qhead_per_kvhead={args.nheads // args.nheads_kv})"
+        f"(qhead_per_kvhead={args.nheads // args.nheads_kv}) seqlen_q={seqlen_q_str}"
     )
     cols = [
         ("pattern", 14),
@@ -398,7 +426,8 @@ def main():
         ("zero", 6),
         ("shape", 10),
         ("splits", 8),
-        ("mode", 14),
+        ("ks_split", 9),
+        ("mode", 18),
         ("mean_us", 10),
         ("tok/us", 9),
         ("tflops", 8),
@@ -408,13 +437,14 @@ def main():
     widths = [w for _, w in cols]
     print(_format_row([h for h, _ in cols], args.csv, widths))
 
-    for shape, pattern, sort, decode_frac, zero_frac, num_splits in product(
+    for shape, pattern, sort, decode_frac, zero_frac, num_splits, ks_split in product(
         shapes,
         args.patterns,
         args.sorts,
         args.decode_fracs,
         args.zero_fracs,
         args.num_splits,
+        args.seqlen_k_per_split,
     ):
         batch, seqlen = shape
         results = {}
@@ -428,33 +458,24 @@ def main():
             decode_frac,
             zero_frac,
             num_splits,
+            ks_split,
             seed=0,
         )
         total_q = sum(ref_ctx["seqlens_q"])
-        # Causal varlen attention FLOPs per batch:
-        #   per (head, query q in [0, sq)): 4 * d * effective_k where
-        #   effective_k = max(0, sk - sq + q + 1).
-        #   sum_q effective_k = sq*sk - sq*(sq-1)/2  (for sk >= sq; otherwise clamped).
-        total_flops = 0
-        for sq, sk in zip(ref_ctx["seqlens_q"], ref_ctx["seqlens_k"]):
-            if sq == 0 or sk == 0:
-                continue
-            if ref_ctx["causal"]:
-                # sum_{q=0}^{sq-1} max(0, sk - sq + q + 1)
-                shift = sk - sq
-                if shift >= 0:
-                    eff = sq * sk - sq * (sq - 1) // 2
-                else:
-                    # clamp to non-negative for queries near 0
-                    first_visible_q = (
-                        -shift
-                    )  # smallest q with sk - sq + q + 1 > 0 is q = sq - sk
-                    visible = sq - first_visible_q
-                    eff = visible * sk - visible * (visible - 1) // 2
-                eff = max(0, eff)
-            else:
-                eff = sq * sk
-            total_flops += 4 * args.headdim * args.nheads * eff
+        # Sum the per-sequence attention FLOPs (batch=1 each); empty sequences add none.
+        total_flops = sum(
+            flops(
+                1,
+                args.nheads,
+                sq,
+                sk,
+                args.headdim,
+                args.headdim,
+                causal=ref_ctx["causal"],
+            )
+            for sq, sk in zip(ref_ctx["seqlens_q"], ref_ctx["seqlens_k"])
+            if sq > 0 and sk > 0
+        )
 
         for cli, setup in selected_modes:
             samples = []
@@ -468,6 +489,7 @@ def main():
                     decode_frac,
                     zero_frac,
                     num_splits,
+                    ks_split,
                     seed=s,
                 )
                 fn = setup(ctx)
@@ -500,6 +522,7 @@ def main():
                         f"{zero_frac:.2f}",
                         f"{batch}x{seqlen}",
                         num_splits,
+                        ks_split if ks_split else "-",
                         cli,
                         f"{us:.2f}",
                         f"{tok_per_us:.2f}",
