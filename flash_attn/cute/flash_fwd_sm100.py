@@ -405,6 +405,7 @@ class FlashAttentionForwardSm100:
         learnable_sink: Optional[cute.Tensor] = None,
         descale_tensors: Optional[DescaleTensors] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        aux_data: AuxData = AuxData(),
         num_splits_dynamic_ptr: Optional[cute.Tensor] = None,
         tile_count_semaphore: Optional[cute.Tensor] = None,
         virtual_batch_idx_ptr: Optional[cute.Tensor] = None,
@@ -412,7 +413,6 @@ class FlashAttentionForwardSm100:
         mCuTotalMBlocks: Optional[cute.Tensor] = None,
         mCuTotalSplitsMBlocks: Optional[cute.Tensor] = None,
         max_seqlen_q: Int32 | int | None = None,
-        aux_data: AuxData = AuxData(),
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):

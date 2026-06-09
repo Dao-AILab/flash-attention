@@ -1635,7 +1635,6 @@ def test_flash_attn_kvcache(
                     headdim_v=dv,
                     num_splits=num_splits,
                     causal=causal,
-                    sort=True,
                     cu_seqlens_q=cu_seqlens_q,
                     seqused_k=cache_seqlens,
                 )

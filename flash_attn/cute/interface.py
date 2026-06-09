@@ -408,6 +408,9 @@ def _compute_tile_cumsum(
 
     cu_total_splits_m_blocks is None when num_splits_dynamic is None.
     """
+    assert num_m_blocks is not None or cu_seqlens is not None or seqused is not None, (
+        "_compute_tile_cumsum requires num_m_blocks, cu_seqlens, or seqused"
+    )
     if num_m_blocks is None:
         seqlens = seqused if seqused is not None else (cu_seqlens[1:] - cu_seqlens[:-1])
         if pack_gqa and qhead_per_kvhead > 1:
@@ -1469,16 +1472,21 @@ def _bwd_preprocess(
     cu_total_m_blocks=None,
 ):
     """Backward preprocess: compute (o * dout).sum(dim=-1) - dLSE, lse * log2_e, and zero out dq_accum."""
-    is_varlen = cu_seqlens_q is not None
-    batch_size = (cu_seqlens_q.shape[0] - 1) if is_varlen else 0
-    if cu_total_m_blocks is None and batch_size > BIN_BATCH_SEARCH_THRESH:
+    is_varlen = cu_seqlens_q is not None or seqused_q is not None
+    if is_varlen:
+        batch_size = (cu_seqlens_q.shape[0] - 1) if cu_seqlens_q is not None else seqused_q.shape[0]
+    else:
+        batch_size = 0
+    if cu_total_m_blocks is None and is_varlen and batch_size > BIN_BATCH_SEARCH_THRESH:
         cu_total_m_blocks, _ = _compute_tile_cumsum(
             cu_seqlens=cu_seqlens_q,
             seqused=seqused_q,
             tile_size=m_block_size,
         )
     compile_key = (
-        dtype, head_dim, head_dim_v, m_block_size, is_varlen, seqused_q is not None, dlse is not None, dq_accum is not None,
+        dtype, head_dim, head_dim_v, m_block_size,
+        cu_seqlens_q is not None, seqused_q is not None,
+        dlse is not None, dq_accum is not None,
         use_padded_offsets, cu_total_m_blocks is not None,
     )
     if compile_key not in _bwd_preprocess.compile_cache:
@@ -1529,8 +1537,11 @@ def _bwd_postprocess_convert(
     cu_total_m_blocks=None,
 ):
     """Backward postprocess: convert float32 accumulator to bf16/fp16 output."""
-    is_varlen = cu_seqlens is not None
-    batch_size = (cu_seqlens.shape[0] - 1) if is_varlen else 0
+    is_varlen = cu_seqlens is not None or seqused is not None
+    if is_varlen:
+        batch_size = (cu_seqlens.shape[0] - 1) if cu_seqlens is not None else seqused.shape[0]
+    else:
+        batch_size = 0
     if cu_total_m_blocks is None and is_varlen and batch_size > BIN_BATCH_SEARCH_THRESH:
         cu_total_m_blocks, _ = _compute_tile_cumsum(
             cu_seqlens=cu_seqlens,
@@ -2179,8 +2190,7 @@ def _flash_attn_bwd(
             sparse_tensors_compile = to_cute_block_sparse_tensors(normalized_block_sparse_tensors)
         dq_accum_tensor = dq_tensor if use_dedicated_hd256_kernel else dq_accum_tensor
 
-        # TODO: check @can_implement
-        _flash_attn_bwd.compile_cache[compile_key] = cute.compile(
+        compile_args = [
             fa_bwd_obj,
             q_tensor,
             k_tensor,
@@ -2203,13 +2213,19 @@ def _flash_attn_bwd(
             dV_semaphore_tensor,
             AuxData(cute_aux_tensors, aux_scalars),
             sparse_tensors_compile,
-            cu_total_m_blocks_k_tensor,
-            current_stream,
-            options="--enable-tvm-ffi",
+        ]
+        if not use_dedicated_hd256_kernel:
+            compile_args.append(cu_total_m_blocks_k_tensor)
+        compile_args.append(current_stream)
+
+        # TODO: check @can_implement
+        _flash_attn_bwd.compile_cache[compile_key] = cute.compile(
+            *compile_args, options="--enable-tvm-ffi"
         )
+
     if not is_fake_mode():
         dq_accum = dq if use_dedicated_hd256_kernel else dq_accum
-        _flash_attn_bwd.compile_cache[compile_key](
+        call_args = [
             q.detach(),
             k.detach(),
             v.detach(),
@@ -2242,8 +2258,11 @@ def _flash_attn_bwd(
             )
             if normalized_block_sparse_tensors is not None
             else None,
-            cu_total_m_blocks_k,
-        )
+        ]
+        if not use_dedicated_hd256_kernel:
+            call_args.append(cu_total_m_blocks_k)
+        _flash_attn_bwd.compile_cache[compile_key](*call_args)
+
     # Postprocess: convert dq_accum from float32 to dq in bf16/fp16
     # hd=256 2CTA backward has its own internal postprocess, skip here.
     if not use_dedicated_hd256_kernel:
@@ -3122,18 +3141,21 @@ def _get_scheduler_metadata(
         return
 
     qhead_per_kvhead = nheads // nheads_kv
-    cu_total_m_blocks, cu_total_splits_m_blocks = _compute_tile_cumsum(
-        num_m_blocks=num_m_blocks,
-        cu_seqlens=cu_seqlens_q,
-        seqused=seqused_q,
-        num_splits_dynamic=num_splits_dynamic,
-        virtual_batch_idx=virtual_batch_idx,
-        tile_size=tile_m,
-        q_stage=q_stage,
-        cluster_shape_m=cluster_shape_m,
-        qhead_per_kvhead=qhead_per_kvhead,
-        pack_gqa=bool(pack_gqa),
-    )
+    if num_m_blocks is not None or cu_seqlens_q is not None or seqused_q is not None:
+        cu_total_m_blocks, cu_total_splits_m_blocks = _compute_tile_cumsum(
+            num_m_blocks=num_m_blocks,
+            cu_seqlens=cu_seqlens_q,
+            seqused=seqused_q,
+            num_splits_dynamic=num_splits_dynamic,
+            virtual_batch_idx=virtual_batch_idx,
+            tile_size=tile_m,
+            q_stage=q_stage,
+            cluster_shape_m=cluster_shape_m,
+            qhead_per_kvhead=qhead_per_kvhead,
+            pack_gqa=bool(pack_gqa),
+        )
+    else:
+        cu_total_m_blocks, cu_total_splits_m_blocks = None, None
 
     return SchedulerMetadataTensorsTorch(
         num_m_blocks_ptr=num_m_blocks,

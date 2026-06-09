@@ -637,9 +637,9 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         window_size_right: Optional[Int32] = None,
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        aux_data: AuxData = AuxData(),
         mCuTotalMBlocks: Optional[cute.Tensor] = None,
         mCuTotalSplitsMBlocks: Optional[cute.Tensor] = None,
-        aux_data: AuxData = AuxData(),
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
