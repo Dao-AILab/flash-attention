@@ -1226,6 +1226,22 @@ class FlashAttentionBackwardSm80:
             # ///////////////////////////////////////////////////////////////////////////////
             # Epilogue
             # ///////////////////////////////////////////////////////////////////////////////
+            # SM120 varlen zero-Q-length fix: when the m-loop runs zero iterations
+            # (e.g. a zero-length query sequence in varlen, where m_block_min ==
+            # m_block_max == 0), the prologue's K/V cp.async loads were committed
+            # but never waited on (the only `cp_async_wait_group` lives inside
+            # compute_one_m_block, which never runs). acc_dK/dV are correctly 0,
+            # but the MHA epilogue stores them into sdK/sdV — which ALIAS the sK/sV
+            # smem the in-flight K/V loads target. Those async copies then land
+            # AFTER the epilogue's smem store and overwrite the zeros with K/V
+            # data, which is read back and written to gmem as garbage dK/dV
+            # (non-deterministic, depends on cp.async timing). Drain all
+            # outstanding async copies here so the empty-m-loop tile cannot race.
+            # No-op cost for the common (non-empty) path: the m-loop already
+            # drained the groups, so wait_group(0) returns immediately.
+            if cutlass.const_expr(getattr(self, "arch", 80) == 120):
+                cute.arch.cp_async_wait_group(0)
+                cute.arch.barrier()
             # If GQA, we scale dK in the postprocessing kernel instead
             if cutlass.const_expr(self.qhead_per_kvhead == 1):
                 acc_dK.store(acc_dK.load() * softmax_scale)
