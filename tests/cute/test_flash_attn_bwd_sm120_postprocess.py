@@ -134,9 +134,13 @@ def test_sm120_postprocess_uses_universal_copy_for_dq_store(D):
     ).read_text()
     # The fix introduces a `store_atom_arch` variable that picks 80 for
     # arch in [8, 12] before calling get_smem_store_atom. Concretely, the
-    # bare `self.arch` must not be the first positional argument anymore.
-    # Whitespace-agnostic so a reformat can't silently disarm the guard.
-    assert re.search(r"get_smem_store_atom\(\s*self\.arch\s*,", src) is None, (
+    # bare `self.arch` must not reach get_smem_store_atom's `arch` parameter,
+    # whether passed positionally (first arg) or by keyword (arch=self.arch).
+    # Whitespace-agnostic so a reformat can't silently disarm the guard, and
+    # kwarg-aware so a positional->keyword refactor can't either.
+    positional = re.search(r"get_smem_store_atom\(\s*self\.arch\s*,", src)
+    keyword = re.search(r"get_smem_store_atom\([^)]*\barch\s*=\s*self\.arch\b", src)
+    assert positional is None and keyword is None, (
         "flash_bwd_postprocess passes self.arch (==120 on SM120) into "
         "get_smem_store_atom, which selects stmatrix despite the SM80 MMA "
         "output layout. See commit bc67a9c for the forward-side analog."

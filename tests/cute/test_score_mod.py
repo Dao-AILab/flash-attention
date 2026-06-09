@@ -1293,6 +1293,8 @@ def test_cute_score_mod_aux_tensors_and_scalars_match_flex():
 
 @pytest.mark.parametrize("use_autograd", [True, False])
 def test_cute_score_mod_bwd_aux_scalars_matches_flex(use_autograd):
+    if COMPUTE_CAPABILITY == 12:
+        pytest.skip("score_mod backward not supported on SM 12.0 (interface.py asserts)")
     torch.manual_seed(0)
     q, k, v = create_tensors(
         batch_size=1,

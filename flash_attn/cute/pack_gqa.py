@@ -636,6 +636,21 @@ class PackGQA:
         AtomLayoutMdQ=1, m16n8k16 atom, dQ_swapAB=False. For other
         configurations a separate code path would be needed.
         """
+        # Fail-fast on configs the hard-coded MMA-layout inversion below does NOT
+        # support, so an unsupported combo loudly errors instead of silently
+        # scattering dQ to the wrong gmem positions. The k_target formula
+        # (warp_id = warp_n*4 + warp_m over 8 warps, lane = lane_row*4 +
+        # lane_col_pair_idx, k = outer_iter*1024 + thread_target*4 + v) is exact
+        # only for: 256 threads (8 warps), m16n8k16 SM80 atom, AtomLayoutMdQ=1,
+        # dQ_swapAB=False, and m_block_size/head_dim_padded each <= 64.
+        assert tiled_mma_dq.size == 256, (
+            "PackGQA.atomic_add_dQaccum hard-codes 8 warps (256 threads); "
+            f"got tiled_mma size {tiled_mma_dq.size}"
+        )
+        assert self.m_block_size <= 64 and self.head_dim_padded <= 64, (
+            "PackGQA.atomic_add_dQaccum assumes m_block_size <= 64 and "
+            f"head_dim_padded <= 64; got {self.m_block_size}, {self.head_dim_padded}"
+        )
         thr_mma = tiled_mma_dq.get_slice(tidx)
         cdQ = cute.make_identity_tensor((self.m_block_size, self.head_dim_padded))
         taccdQcdQ = thr_mma.partition_C(cdQ)

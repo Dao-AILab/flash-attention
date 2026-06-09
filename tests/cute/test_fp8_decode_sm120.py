@@ -117,6 +117,20 @@ def test_fp8_decode_correctness(hq, hkv, sk, batch, env_flag, monkeypatch):
     seqlen_q = 1
     causal = True
 
+    # The fp32 SDPA reference materializes GQA-repeated, dequantized K/V plus the
+    # (b, hq, sq, sk) scores in fp32, so the largest cell (sk=16384, batch=16)
+    # needs tens of GB and OOMs on 16-24 GB consumer Blackwell. Skip it on
+    # devices that don't have the headroom (keeps the cell on >=40 GB cards).
+    if sk >= 16384 and batch >= 16:
+        free_bytes, _total = torch.cuda.mem_get_info()
+        needed_bytes = 40 * 1024**3  # generous headroom for the fp32 reference
+        if free_bytes < needed_bytes:
+            pytest.skip(
+                f"fp8 decode sk={sk} batch={batch} fp32 reference needs "
+                f">={needed_bytes // 1024**3} GB; only "
+                f"{free_bytes / 1024**3:.1f} GB free"
+            )
+
     if env_flag:
         monkeypatch.setenv("FLASH_ATTENTION_SM120_DECODE_KERNEL", "1")
     else:

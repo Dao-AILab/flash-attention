@@ -92,7 +92,9 @@ def _run_dgtdv_case(
     v = torch.randn(batch_size, seqlen, nheads, head_dim_v, device=device, dtype=dtype)
 
     torch.cuda.synchronize()
-    out, _lse = flash_attn_func(q, k, v, causal=causal)
+    out = flash_attn_func(q, k, v, causal=causal)
+    if isinstance(out, tuple):
+        out = out[0]
     torch.cuda.synchronize()
 
     # SDPA reference in (B, H, S, D) layout, fp32, math backend.
