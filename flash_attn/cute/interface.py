@@ -63,6 +63,31 @@ from flash_attn.cute.block_sparsity import (
     normalize_block_sparse_config_bwd,
 )
 
+
+# ---------------------------------------------------------------------------
+# torch.compile boundary for the FA4 (CuTe-DSL) public entry points.
+#
+# The CuTe-DSL kernels and the `cute.compile` machinery only accept concrete
+# python scalars/dtypes. Under `torch.compile` dynamo otherwise traces *into*
+# this interface and pushes fake/symbolic tensors into the DSL `const()` path,
+# which fails in ways like a tensor `max_seqlen` poisoning a `const_expr` bool
+# (backward) or a fake tensor corrupting dtype detection in flash_fwd
+# ("Only Float16 or BFloat16 is supported", forward under dynamic=True).
+#
+# Marking the two public functions opaque to dynamo makes the whole FA4 call a
+# single graph break: it runs eagerly (where FA4 is correct, and where the
+# underlying autograd.Function registers its backward into the eager graph),
+# while the surrounding model still compiles. This is a no-op in plain eager
+# execution and only affects code paths that go through these FA4 entry points,
+# so non-FA4 / non-sm120 kernels are behaviourally unchanged.
+def _opaque_to_dynamo(fn):
+    disable = getattr(getattr(torch, "compiler", None), "disable", None)
+    if disable is None:  # very old torch: fall back to private API
+        disable = getattr(getattr(torch, "_dynamo", None), "disable", None)
+    if disable is None:
+        return fn
+    return disable(fn, recursive=True)
+
 def _parse_arch_str(arch_str):
     """Parse arch string (e.g. 'sm_80', 'sm_90a', '80', '100') to int (e.g. 80, 90, 100)."""
     import re
@@ -3817,6 +3842,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         return dq, dk, dv, *((None,) * 31)
 
 
+@_opaque_to_dynamo
 def flash_attn_func(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -3865,6 +3891,7 @@ def flash_attn_func(
     )
 
 
+@_opaque_to_dynamo
 def flash_attn_varlen_func(
     q: torch.Tensor,
     k: torch.Tensor,
