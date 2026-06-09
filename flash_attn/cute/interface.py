@@ -2685,6 +2685,20 @@ def _flash_attn_bwd(
         maybe_contiguous(t)
         for t in (q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
     ]
+    # Under full-model torch.compile, transformers derives max_seqlen from
+    # position_ids/cu_seqlens *inside the compiled forward graph*, so it reaches
+    # the eager backward as a 0-d device int32 Tensor rather than a host Python
+    # int. These scalars feed host-side Python control flow below (the seqlen
+    # comparisons forming `sm120_skip_full_causal_mask`, the compile_cache key,
+    # and the kernel's `cutlass.const_expr(...)` conditions). A Tensor there
+    # turns Python `and`/`==` into per-element ops, ultimately tripping the
+    # cutlass DSL `and_op` (`DSLNotImplemented: torch.Tensor is not supported`)
+    # at flash_bwd.py's `skip_full_causal_mask and is_causal`. Materialize them
+    # to host ints. No-op for the normal eager path (values are already ints).
+    if isinstance(max_seqlen_q, torch.Tensor):
+        max_seqlen_q = int(max_seqlen_q.item())
+    if isinstance(max_seqlen_k, torch.Tensor):
+        max_seqlen_k = int(max_seqlen_k.item())
     if cu_seqlens_q is None:
         batch_size, seqlen_q = q.shape[:2]
         total_q = batch_size * seqlen_q
