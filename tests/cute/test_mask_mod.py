@@ -2665,6 +2665,11 @@ def test_flash_attn_fwd_mask_mod_aux_scalars_matches_flex(limit):
 
 
 def test_flash_attn_bwd_mask_mod_aux_scalars_produces_grads():
+    # SM 12.0 does not support mask_mod in the backward kernel (interface.py
+    # asserts "mask_mod backward not supported on SM 12.0"). The forward
+    # aux-scalars path is validated separately above; skip the unsupported bwd.
+    if COMPUTE_CAPABILITY == 12:
+        pytest.skip("mask_mod backward not supported on SM 12.0")
     torch.manual_seed(1)
     q, k, v = [
         x.requires_grad_()
