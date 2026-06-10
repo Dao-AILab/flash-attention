@@ -2633,6 +2633,23 @@ def _flash_attn_bwd(
             _sm_count = torch.cuda.get_device_properties(q.device).multi_processor_count
             if _grid_n128 >= 2 * _sm_count:
                 n_block_size = 128
+        # D<=64 long-seq: register-resident P/dS (Mma_dKV_is_RS) dK/dV gemms.
+        # With the 64x128 tile, AtomLayoutMSdP=1 + SdP_swapAB + AtomLayoutNdKV=8
+        # keeps P^T/dS^T in registers as direct A-operands of the dV/dK gemms
+        # (FA2's hdim64 structure), skipping the sP smem round trip. Round-wise
+        # isolated A/B on RTX PRO 6000 (vs the non-RS default, incl. its nsq=2
+        # rule): S8192nc +4.3%, S16384nc +4.7%, GQA qpkv4 S8192nc +4.8%,
+        # causal S>=8192 +2.2-2.8% (all min-round ratios > 1.017). S4096 is
+        # neutral and B4 S1024 mildly negative, so gate on seqlen >= 8192.
+        # RS prefers num_stages_Q=1 (pinned below): the extra Q stage costs
+        # smem/sync without hiding latency here (+1.9% over RS w/ nsq=2).
+        # pack_gqa is excluded (mask.py has no swap_AB + PackGQA support);
+        # auto-pack_gqa only triggers for D256 so only explicit requests hit it.
+        _sm120_bwd_rs = (
+            n_block_size == 128
+            and q.shape[1] >= 8192
+            and pack_gqa is not True
+        )
         # num_stages=1 across all head_dim on consumer Blackwell. At
         # head_dim>64 the SMEM cap forces ns=1; at head_dim<=64 the SM80-base
         # default was ns=2 but the async pipeline overhead exceeds the
@@ -2653,6 +2670,7 @@ def _flash_attn_bwd(
             and head_dim_v <= 128
             and cu_seqlens_q is None
             and q.shape[1] >= 8192
+            and not _sm120_bwd_rs
         ):
             num_stages_Q = 2
         SdP_swapAB = False
@@ -2661,6 +2679,11 @@ def _flash_attn_bwd(
         AtomLayoutMSdP = 4
         AtomLayoutNdKV = 4
         AtomLayoutMdQ = 4
+        if _sm120_bwd_rs:
+            # See comment above (_sm120_bwd_rs): RS register-resident dK/dV.
+            SdP_swapAB = True
+            AtomLayoutMSdP = 1
+            AtomLayoutNdKV = 8  # num_threads // 32; required by Mma_dKV_is_RS
         if head_dim == 128 and head_dim_v == 128:
             # FA2's sm8x d128 choice (NdKV=2): the dK/dV tiled-mma covers the
             # full 64-wide head_dim slab per atom iteration instead of
