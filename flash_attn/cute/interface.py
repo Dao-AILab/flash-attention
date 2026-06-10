@@ -2661,6 +2661,13 @@ def _flash_attn_bwd(
         AtomLayoutMSdP = 4
         AtomLayoutNdKV = 4
         AtomLayoutMdQ = 4
+        if head_dim == 128 and head_dim_v == 128:
+            # FA2's sm8x d128 choice (NdKV=2): the dK/dV tiled-mma covers the
+            # full 64-wide head_dim slab per atom iteration instead of
+            # splitting it 4 ways. 10-round isolated A/B on RTX PRO 6000:
+            # positive on 7/7 cells (causal/noncausal, MHA/GQA, S1024-S16384),
+            # +0.6% to +2.8%, median ~+1.1%.
+            AtomLayoutNdKV = 2
         V_in_regs = False
         cluster_size = 1
         use_2cta_instrs = False
