@@ -248,6 +248,16 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument("--atol-fp8", type=float, default=0.50)
     parser.add_argument("--rtol-fp8", type=float, default=0.50)
     parser.add_argument("--run-cudnn", action="store_true")
+    parser.add_argument("--batch-size", type=int, nargs="+", default=None,
+                        help="Batch sizes (default: derived from bs_seqlen pairs)")
+    parser.add_argument("--seqlen", type=int, nargs="+", default=None,
+                        help="Sequence lengths (default: derived from bs_seqlen pairs)")
+    parser.add_argument("--causal", type=int, nargs="+", default=None,
+                        help="Causal flags, 0 or 1 (default: [0, 1])")
+    parser.add_argument("--methods", type=str, nargs="+", default=None,
+                        help="Methods to run (default: all). Choices: Pytorch, FA4-CuTe-BF16, FA4-CuTe-FP8, cuDNN-FP8")
+    parser.add_argument("--nheads", type=int, default=None,
+                        help="Number of attention heads (default: dim // headdim)")
     args = parser.parse_args(list(argv) if argv is not None else None)
 
     if not torch.cuda.is_available():
@@ -262,21 +272,39 @@ def main(argv: Iterable[str] | None = None) -> int:
     device = "cuda"
     fp8_dtype = _torch_float8_dtype(args.dtype)
     headdim_vals = _parse_int_list(args.headdims)
-    bs_seqlen_vals = [(32, 512), (16, 1024), (8, 2048), (4, 4096), (2, 8192), (1, 16384)]
 
-    methods = ["Pytorch", "FA4-CuTe-BF16", "FA4-CuTe-FP8"] + (
+    _default_bs_seqlen = [(32, 512), (16, 1024), (8, 2048), (4, 4096), (2, 8192), (1, 16384)]
+    if args.batch_size is not None and args.seqlen is not None:
+        if len(args.batch_size) == 1:
+            bs_seqlen_vals = [(args.batch_size[0], s) for s in args.seqlen]
+        elif len(args.batch_size) == len(args.seqlen):
+            bs_seqlen_vals = list(zip(args.batch_size, args.seqlen))
+        else:
+            raise ValueError("--batch-size must be a single value or match --seqlen length")
+    elif args.batch_size is not None or args.seqlen is not None:
+        raise ValueError("--batch-size and --seqlen must be specified together")
+    else:
+        bs_seqlen_vals = _default_bs_seqlen
+
+    causal_vals = [bool(c) for c in args.causal] if args.causal is not None else [False, True]
+
+    all_methods = ["Pytorch", "FA4-CuTe-BF16", "FA4-CuTe-FP8"] + (
         ["cuDNN-FP8"] if args.run_cudnn and cudnn is not None else []
     )
+    methods = args.methods if args.methods is not None else all_methods
 
     fp8_failures = []
 
     for headdim in headdim_vals:
-        for causal in (False, True):
+        for causal in causal_vals:
             for batch, seqlen in bs_seqlen_vals:
                 torch.cuda.empty_cache()
-                nheads = args.dim // headdim
-                if args.dim % headdim != 0:
-                    raise ValueError(f"--dim must be divisible by headdim ({args.dim=} {headdim=})")
+                if args.nheads is not None:
+                    nheads = args.nheads
+                else:
+                    if args.dim % headdim != 0:
+                        raise ValueError(f"--dim must be divisible by headdim ({args.dim=} {headdim=})")
+                    nheads = args.dim // headdim
 
                 q_bf16 = torch.randn(
                     batch, seqlen, nheads, headdim, device=device, dtype=torch.bfloat16
@@ -310,6 +338,8 @@ def main(argv: Iterable[str] | None = None) -> int:
                     out_fa4_bf16, _ = flash_attn_cute_fwd(
                         q_bf16, k_bf16, v_bf16, softmax_scale=softmax_scale, causal=causal
                     )  # warmup / compile
+                    # Pre-allocate output to remove torch.empty overhead from timing
+                    out_pre = torch.empty_like(out_fa4_bf16)
                     t = time_fwd(
                         flash_attn_cute_fwd,
                         q_bf16,
@@ -317,6 +347,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                         v_bf16,
                         softmax_scale=softmax_scale,
                         causal=causal,
+                        out=out_pre,
                         repeats=args.repeats,
                     )
                     times["FA4-CuTe-BF16"] = t
@@ -410,7 +441,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                     t = time_fwd(lambda: runner(), repeats=args.repeats)
                     times["cuDNN-FP8"] = t
 
-                print(f"### causal={causal}, headdim={headdim}, batch={batch}, seqlen={seqlen} ###")
+                print(f"### causal={causal}, headdim={headdim}, nheads={nheads}, batch={batch}, seqlen={seqlen} ###")
                 for method in methods:
                     t = times.get(method, float("nan"))
                     speeds[method] = efficiency(flops(batch, seqlen, headdim, nheads, causal), t)
