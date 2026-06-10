@@ -2659,6 +2659,26 @@ def _flash_attn_bwd(
             "(SM80 base kernel lacks the dQ_semaphore code path; "
             "see flash_bwd.py:~395 'determinism not supported yet for Sm80')"
         )
+        # Experimental config override for kernel-structure A/B probing.
+        # Format: comma-separated key=val pairs, e.g.
+        #   FLASH_ATTENTION_SM120_BWD_CFG="m=64,n=128,t=256,nsq=1,nsdo=1,msdp=1,ndkv=8,mdq=4,swapsdp=1,swapdkv=0,swapdq=0,vregs=0"
+        # Unspecified keys keep the dispatch defaults above. All overridden
+        # values flow into the compile_key, so cached kernels stay distinct.
+        _sm120_bwd_cfg = os.environ.get("FLASH_ATTENTION_SM120_BWD_CFG")
+        if _sm120_bwd_cfg:
+            _cfg = dict(kv.split("=") for kv in _sm120_bwd_cfg.split(",") if kv)
+            m_block_size = int(_cfg.get("m", m_block_size))
+            n_block_size = int(_cfg.get("n", n_block_size))
+            num_threads = int(_cfg.get("t", num_threads))
+            num_stages_Q = int(_cfg.get("nsq", num_stages_Q))
+            num_stages_dO = int(_cfg.get("nsdo", num_stages_dO))
+            AtomLayoutMSdP = int(_cfg.get("msdp", AtomLayoutMSdP))
+            AtomLayoutNdKV = int(_cfg.get("ndkv", AtomLayoutNdKV))
+            AtomLayoutMdQ = int(_cfg.get("mdq", AtomLayoutMdQ))
+            SdP_swapAB = bool(int(_cfg.get("swapsdp", SdP_swapAB)))
+            dKV_swapAB = bool(int(_cfg.get("swapdkv", dKV_swapAB)))
+            dQ_swapAB = bool(int(_cfg.get("swapdq", dQ_swapAB)))
+            V_in_regs = bool(int(_cfg.get("vregs", V_in_regs)))
     elif arch // 10 == 9:
         cfg = _tile_size_bwd_sm90(
             head_dim,
@@ -2966,6 +2986,15 @@ def _flash_attn_bwd(
     sm120_nonpack_m_split_eligible = sm120_nonpack_base_ok and sm120_nonpack_m_split > 1
     if sm120_nonpack_m_split_eligible:
         pack_gqa_m_splits = sm120_nonpack_m_split
+    # Experimental m-split override (probing only); piggybacks on the
+    # FLASH_ATTENTION_SM120_BWD_CFG hook, key "msplit". pack_gqa_m_splits is
+    # part of the compile_key so overridden values cache separately.
+    if arch // 10 == 12:
+        _sm120_bwd_cfg2 = os.environ.get("FLASH_ATTENTION_SM120_BWD_CFG")
+        if _sm120_bwd_cfg2:
+            _cfg2 = dict(kv.split("=") for kv in _sm120_bwd_cfg2.split(",") if kv)
+            if "msplit" in _cfg2:
+                pack_gqa_m_splits = int(_cfg2["msplit"])
     pack_gqa_all_rows_valid = (
         arch // 10 == 12
         and pack_gqa
