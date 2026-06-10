@@ -106,8 +106,20 @@ def run_step(step: Step, repo_root: Path, base_env: dict[str, str], sif: str, wo
     print(f"=== {step.name} ===")
 
     # Install FA4 from the current repo inside this exec invocation.
+    # --no-deps keeps the SIF's baked torch/cudnn; deps are expected to already satisfy the
+    # pyproject floors via the image (rebuilt with tools/ci/docker/build.sh). We do NOT upgrade
+    # deps here: the --writable-tmpfs overlay is RAM-backed and too small to hold a cutlass-dsl
+    # reinstall (it ENOSPCs and can corrupt the baked torch). Instead assert_dsl_floor.py below
+    # fails loudly if the image is stale, pointing at a rebake.
     # Must be done per-step because --writable-tmpfs creates a fresh overlay each time.
     install_cmd = f"uv pip install --system --break-system-packages --no-deps -q -e {shlex.quote(str(repo_root / 'flash_attn/cute'))}"
+
+    # Guard against a SIF baked with deps below the pyproject floor (the silent --no-deps gap that
+    # otherwise surfaces as a cryptic DSLRuntimeError on the SM100 path). Cheap: reads versions, no install.
+    floor_check_cmd = (
+        f"python3 {shlex.quote(str(repo_root / 'tools/ci/assert_dsl_floor.py'))} "
+        f"{shlex.quote(str(repo_root / 'flash_attn/cute/pyproject.toml'))}"
+    )
 
     # Convert relative test/benchmark paths to absolute so we can run from /tmp.
     # Running from /tmp ensures Python does not insert repo_root into sys.path[0]
@@ -118,7 +130,7 @@ def run_step(step: Step, repo_root: Path, base_env: dict[str, str], sif: str, wo
     ]
     env_exports = " && ".join(f"export {k}={shlex.quote(v)}" for k, v in step.extra_env.items())
     inner_cmd = shlex.join(command)
-    shell_parts = [install_cmd]
+    shell_parts = [install_cmd, floor_check_cmd]
     if env_exports:
         shell_parts.append(env_exports)
     shell_parts.append(f"cd /tmp && {inner_cmd}")
