@@ -13,11 +13,21 @@ Reads the floor from pyproject so there is no hardcoded version here to drift ou
 from __future__ import annotations
 
 import sys
-import tomllib
 from importlib.metadata import PackageNotFoundError, version
 
 from packaging.requirements import Requirement
 from packaging.version import Version
+
+try:
+    import tomllib  # Python 3.11+
+except ModuleNotFoundError:  # Python 3.10 (pyproject declares requires-python >=3.10)
+    try:
+        import tomli as tomllib
+    except ModuleNotFoundError:
+        sys.exit(
+            "ERROR: assert_dsl_floor.py needs a TOML parser — use Python 3.11+ (stdlib tomllib) "
+            "or `pip install tomli` on 3.10."
+        )
 
 # Deps whose floor a stale SIF is known to silently violate. Other pyproject deps (torch, einops…)
 # are baked to match the image and not version-sensitive in the same way, so we don't gate on them.
