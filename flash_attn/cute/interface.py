@@ -3082,6 +3082,15 @@ def _flash_attn_bwd(
             and batch_size == 2
             and seqlen_q == 1024
         )
+        or (
+            # Packed split16 qpkv4 S2048 row: isolated on/off A/B on RTX PRO
+            # 6000 showed +6.2% median (all 12 rounds positive, min +1.9%).
+            qhead_per_kvhead == 4
+            and num_head == 16
+            and num_head_kv == 4
+            and batch_size == 2
+            and seqlen_q == 2048
+        )
     )
     # Structural eligibility for the masked/unmasked m-loop split: any dense
     # equal-length causal row whose seqlens tile evenly (mask_fn=None also
