@@ -59,10 +59,8 @@ class FlashAttentionBackwardPreprocess:
         self.use_pdl = BaseDSL._get_dsl().get_arch_enum() >= Arch.sm_90a
         self.dtype = dtype
         self.tile_m = tile_m
-        # padding head_dim to a multiple of 32 as k_block_size
-        hdim_multiple_of = 32
-        self.head_dim_padded = int(math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of)
-        self.head_dim_v_padded = int(math.ceil(head_dim_v / hdim_multiple_of) * hdim_multiple_of)
+        self.head_dim_padded = int(math.ceil(head_dim / 32) * 32)
+        self.head_dim_v_padded = int(math.ceil(head_dim_v / 16) * 16)
         self.check_hdim_v_oob = head_dim_v != self.head_dim_v_padded
         self.num_threads = num_threads
         self.use_padded_offsets = use_padded_offsets
@@ -100,15 +98,18 @@ class FlashAttentionBackwardPreprocess:
         # Thread layouts for copies
         # We want kBlockKGmem to be a power of 2 so that when we do the summing,
         # it's just between threads in the same warp
-        gmem_k_block_size = (
-            128
-            if self.head_dim_v_padded % 128 == 0
-            else (
-                64
-                if self.head_dim_v_padded % 64 == 0
-                else (32 if self.head_dim_v_padded % 32 == 0 else 16)
+        if self.check_hdim_v_oob:
+            gmem_k_block_size = 16
+        else:
+            gmem_k_block_size = (
+                128
+                if self.head_dim_v_padded % 128 == 0
+                else (
+                    64
+                    if self.head_dim_v_padded % 64 == 0
+                    else (32 if self.head_dim_v_padded % 32 == 0 else 16)
+                )
             )
-        )
         num_copy_elems = 128 // self.dtype.width
         threads_per_row = gmem_k_block_size // num_copy_elems
         self.gmem_tiled_copy_O = copy_utils.tiled_copy_2d(
