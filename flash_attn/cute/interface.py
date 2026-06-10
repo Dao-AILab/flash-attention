@@ -2614,6 +2614,25 @@ def _flash_attn_bwd(
         # SM120: uses SM80 MMA with 99 KB SMEM, 256 threads (8 warps).
         m_block_size = 64
         n_block_size = 64
+        if (
+            head_dim <= 64
+            and head_dim_v <= 64
+            and not local
+            and cu_seqlens_q is None
+            and cu_seqlens_k is None
+        ):
+            # D<=64 backward: a 64x128 tile halves the K/V-block grid and the
+            # per-CTA Q/dO gmem re-read volume (each n-CTA streams all m-blocks).
+            # Smem at 64x128xD64 is 80 KB (<99 KB cap). Round-wise isolated A/B
+            # on RTX PRO 6000: 24-cell new/old geomean 1.088 (21/24 wins),
+            # S8192nc +22%, S16384nc +23%; closes the D64 FA2 gap from ~0.85
+            # to ~0.98. Matches FA2's sm86/89 hdim64 kBlockN=128 choice.
+            # Halving the n-grid underfills tiny grids (qpkv8 Hq8 B1 S4096 and
+            # S512-class cells regressed 4-6%), so require >= 2 waves at n=128.
+            _grid_n128 = ((k.shape[1] + 127) // 128) * q.shape[-2] * q.shape[0]
+            _sm_count = torch.cuda.get_device_properties(q.device).multi_processor_count
+            if _grid_n128 >= 2 * _sm_count:
+                n_block_size = 128
         # num_stages=1 across all head_dim on consumer Blackwell. At
         # head_dim>64 the SMEM cap forces ns=1; at head_dim<=64 the SM80-base
         # default was ns=2 but the async pipeline overhead exceeds the
