@@ -3142,10 +3142,15 @@ def _get_scheduler_metadata(
 
     qhead_per_kvhead = nheads // nheads_kv
     # binary-search hint; only consumed by the single-tile scheduler above this batch
-    have_varlen_info = (
-        num_m_blocks is not None or cu_seqlens_q is not None or seqused_q is not None
+    has_varlen_info = (
+        cu_seqlens_q is not None or seqused_q is not None
     )
-    if have_varlen_info and num_batch > BIN_BATCH_SEARCH_THRESH:
+    needs_compute_tile_cumsum = (
+        has_varlen_info
+        and num_batch > BIN_BATCH_SEARCH_THRESH
+        and tile_count_semaphore is None
+    )
+    if needs_compute_tile_cumsum:
         cu_total_m_blocks, cu_total_splits_m_blocks = _compute_tile_cumsum(
             num_m_blocks=num_m_blocks,
             cu_seqlens=cu_seqlens_q,
