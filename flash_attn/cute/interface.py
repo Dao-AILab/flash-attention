@@ -225,7 +225,7 @@ def _sm120_bwd_pack_gqa_m_splits(
         return 2
     # B=1 D256 backward underfills the SMs (grid = ceil(S/64)*Hq*1 CTAs, all
     # <~1.4 waves for these small-Hq shapes) so the unsplit default idles SMs.
-    # These exact cells win from an M-split (+12-20% vs the unsplit dispatch,
+    # These exact cells win from an M-split (+4-20% vs the unsplit dispatch,
     # robust across seeds). B=1 runs non-packed, so handle before the
     # pack-only early-return. B>=2 is excluded: it either auto-splits already or
     # the split is noise (verified). Only these validated cells are listed.
@@ -243,6 +243,8 @@ def _sm120_bwd_pack_gqa_m_splits(
             return 4  # +20%
         if causal and qhead_per_kvhead == 4 and num_head == 8 and num_head_kv == 2 and seqlen_q == 512:
             return 3  # +18%
+        if causal and qhead_per_kvhead == 2 and num_head == 32 and num_head_kv == 16 and seqlen_q == 2048:
+            return 2  # +4%
         if not causal and qhead_per_kvhead == 4 and num_head == 16 and num_head_kv == 4 and seqlen_q == 1024:
             return 2  # +20%
         if not causal and qhead_per_kvhead == 4 and num_head == 8 and num_head_kv == 2 and seqlen_q == 2048:
@@ -3011,6 +3013,13 @@ def _flash_attn_bwd(
             and num_head == 16
             and num_head_kv == 4
             and batch_size == 2
+            and seqlen_q == 1024
+        )
+        or (
+            qhead_per_kvhead == 4
+            and num_head == 32
+            and num_head_kv == 8
+            and batch_size <= 8
             and seqlen_q == 1024
         )
         or (

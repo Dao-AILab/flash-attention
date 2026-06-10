@@ -387,6 +387,31 @@ def test_sm120_bwd_qpkv4_s1024_causal_pack_split_policy(monkeypatch):
     assert _sm120_bwd_pack_gqa_m_splits(seqlen_q=2048, **{**common, "seqlen_k": 2048}) == 16
 
 
+def test_sm120_bwd_qpkv2_b1_s2048_nonpack_split_policy(monkeypatch):
+    from flash_attn.cute.interface import _sm120_bwd_pack_gqa_m_splits
+
+    monkeypatch.delenv("FLASH_ATTENTION_SM120_BWD_PACK_GQA_M_SPLITS", raising=False)
+    common = dict(
+        arch=120,
+        pack_gqa=False,
+        qhead_per_kvhead=2,
+        num_head=32,
+        num_head_kv=16,
+        causal=True,
+        local=False,
+        seqlen_q=2048,
+        seqlen_k=2048,
+        head_dim=256,
+        head_dim_v=256,
+        m_block_size=64,
+        n_block_size=64,
+        cu_seqlens_q=None,
+        cu_seqlens_k=None,
+    )
+    assert _sm120_bwd_pack_gqa_m_splits(batch_size=1, **common) == 2
+    assert _sm120_bwd_pack_gqa_m_splits(batch_size=2, **common) == 1
+
+
 def test_sm120_bwd_qpkv8_s1024_causal_fused_dkv_policy(monkeypatch):
     from flash_attn.cute import interface
 
@@ -415,7 +440,7 @@ def test_sm120_bwd_qpkv8_s1024_causal_fused_dkv_policy(monkeypatch):
 
 
 @pytest.mark.timeout(120)
-@pytest.mark.parametrize("batch,h_q,h_kv", [(1, 8, 2), (2, 16, 4)])
+@pytest.mark.parametrize("batch,h_q,h_kv", [(1, 8, 2), (2, 16, 4), (1, 32, 8)])
 def test_sm120_d256_bwd_maskskip_default_matches_forced_off(monkeypatch, batch, h_q, h_kv):
     _sm120_only()
     from flash_attn.cute import flash_attn_func
