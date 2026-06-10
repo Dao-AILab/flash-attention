@@ -638,6 +638,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_data: AuxData = AuxData(),
+        mCuTotalMBlocks: Optional[cute.Tensor] = None,
+        mCuTotalSplitsMBlocks: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -699,6 +701,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
             mCuSeqlensQ=mCuSeqlensQ,
             mSeqUsedQ=mSeqUsedQ,
+            cu_total_m_blocks_ptr=mCuTotalMBlocks,
+            cu_total_splits_m_blocks_ptr=mCuTotalSplitsMBlocks,
         )
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
         grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
