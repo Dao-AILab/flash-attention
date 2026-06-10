@@ -3057,7 +3057,35 @@ def _flash_attn_bwd(
             and seqlen_q == 1024
         )
     )
-    sm120_skip_full_causal_mask = sm120_skip_full_causal_mask_default
+    # Structural eligibility for the masked/unmasked m-loop split: any dense
+    # equal-length causal row whose seqlens tile evenly (mask_fn=None also
+    # skips the seqlen bounds mask, so ragged tails are excluded). The env
+    # override allows forcing this beyond (=on) or below (=off) the
+    # row-validated default gate for profiling and A/B validation.
+    sm120_skip_full_causal_mask_struct = (
+        arch // 10 == 12
+        and causal
+        and not local
+        and seqlen_q == seqlen_k
+        and seqlen_q % m_block_size == 0
+        and seqlen_k % n_block_size == 0
+        and softcap == 0.0
+        and score_mod is None
+        and score_mod_bwd is None
+        and mask_mod is None
+        and block_sparse_tensors is None
+        and cu_seqlens_q is None
+        and cu_seqlens_k is None
+        and seqused_q is None
+        and seqused_k is None
+    )
+    _maskskip_env = os.environ.get("FLASH_ATTENTION_SM120_BWD_SKIP_FULL_CAUSAL_MASK")
+    if _maskskip_env is not None and _maskskip_env.lower() in ("0", "off", "false"):
+        sm120_skip_full_causal_mask = False
+    elif _maskskip_env is not None and _maskskip_env.lower() in ("1", "on", "true"):
+        sm120_skip_full_causal_mask = sm120_skip_full_causal_mask_struct
+    else:
+        sm120_skip_full_causal_mask = sm120_skip_full_causal_mask_default
 
     if softcap != 0.0:
         assert score_mod is None and score_mod_bwd is None, (
