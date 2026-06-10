@@ -2616,6 +2616,42 @@ def _flash_attn_bwd(
         # SM120: uses SM80 MMA with 99 KB SMEM, 256 threads (8 warps).
         m_block_size = 64
         n_block_size = 64
+        if (
+            head_dim <= 64
+            and head_dim_v <= 64
+            and not local
+            and cu_seqlens_q is None
+            and cu_seqlens_k is None
+        ):
+            # D<=64 backward: a 64x128 tile halves the K/V-block grid and the
+            # per-CTA Q/dO gmem re-read volume (each n-CTA streams all m-blocks).
+            # Smem at 64x128xD64 is 80 KB (<99 KB cap). Round-wise isolated A/B
+            # on RTX PRO 6000: 24-cell new/old geomean 1.088 (21/24 wins),
+            # S8192nc +22%, S16384nc +23%; closes the D64 FA2 gap from ~0.85
+            # to ~0.98. Matches FA2's sm86/89 hdim64 kBlockN=128 choice.
+            # Halving the n-grid underfills tiny grids (qpkv8 Hq8 B1 S4096 and
+            # S512-class cells regressed 4-6%), so require >= 2 waves at n=128.
+            _grid_n128 = ((k.shape[1] + 127) // 128) * q.shape[-2] * q.shape[0]
+            _sm_count = torch.cuda.get_device_properties(q.device).multi_processor_count
+            if _grid_n128 >= 2 * _sm_count:
+                n_block_size = 128
+        # D<=64 long-seq: register-resident P/dS (Mma_dKV_is_RS) dK/dV gemms.
+        # With the 64x128 tile, AtomLayoutMSdP=1 + SdP_swapAB + AtomLayoutNdKV=8
+        # keeps P^T/dS^T in registers as direct A-operands of the dV/dK gemms
+        # (FA2's hdim64 structure), skipping the sP smem round trip. Round-wise
+        # isolated A/B on RTX PRO 6000 (vs the non-RS default, incl. its nsq=2
+        # rule): S8192nc +4.3%, S16384nc +4.7%, GQA qpkv4 S8192nc +4.8%,
+        # causal S>=8192 +2.2-2.8% (all min-round ratios > 1.017). S4096 is
+        # neutral and B4 S1024 mildly negative, so gate on seqlen >= 8192.
+        # RS prefers num_stages_Q=1 (pinned below): the extra Q stage costs
+        # smem/sync without hiding latency here (+1.9% over RS w/ nsq=2).
+        # pack_gqa is excluded (mask.py has no swap_AB + PackGQA support);
+        # auto-pack_gqa only triggers for D256 so only explicit requests hit it.
+        _sm120_bwd_rs = (
+            n_block_size == 128
+            and q.shape[1] >= 8192
+            and pack_gqa is not True
+        )
         # num_stages=1 across all head_dim on consumer Blackwell. At
         # head_dim>64 the SMEM cap forces ns=1; at head_dim<=64 the SM80-base
         # default was ns=2 but the async pipeline overhead exceeds the
@@ -2636,6 +2672,7 @@ def _flash_attn_bwd(
             and head_dim_v <= 128
             and cu_seqlens_q is None
             and q.shape[1] >= 8192
+            and not _sm120_bwd_rs
         ):
             num_stages_Q = 2
         SdP_swapAB = False
@@ -2644,6 +2681,18 @@ def _flash_attn_bwd(
         AtomLayoutMSdP = 4
         AtomLayoutNdKV = 4
         AtomLayoutMdQ = 4
+        if _sm120_bwd_rs:
+            # See comment above (_sm120_bwd_rs): RS register-resident dK/dV.
+            SdP_swapAB = True
+            AtomLayoutMSdP = 1
+            AtomLayoutNdKV = 8  # num_threads // 32; required by Mma_dKV_is_RS
+        if head_dim == 128 and head_dim_v == 128:
+            # FA2's sm8x d128 choice (NdKV=2): the dK/dV tiled-mma covers the
+            # full 64-wide head_dim slab per atom iteration instead of
+            # splitting it 4 ways. 10-round isolated A/B on RTX PRO 6000:
+            # positive on 7/7 cells (causal/noncausal, MHA/GQA, S1024-S16384),
+            # +0.6% to +2.8%, median ~+1.1%.
+            AtomLayoutNdKV = 2
         V_in_regs = False
         cluster_size = 1
         use_2cta_instrs = False
@@ -2661,6 +2710,26 @@ def _flash_attn_bwd(
             "(SM80 base kernel lacks the dQ_semaphore code path; "
             "see flash_bwd.py:~395 'determinism not supported yet for Sm80')"
         )
+        # Experimental config override for kernel-structure A/B probing.
+        # Format: comma-separated key=val pairs, e.g.
+        #   FLASH_ATTENTION_SM120_BWD_CFG="m=64,n=128,t=256,nsq=1,nsdo=1,msdp=1,ndkv=8,mdq=4,swapsdp=1,swapdkv=0,swapdq=0,vregs=0"
+        # Unspecified keys keep the dispatch defaults above. All overridden
+        # values flow into the compile_key, so cached kernels stay distinct.
+        _sm120_bwd_cfg = os.environ.get("FLASH_ATTENTION_SM120_BWD_CFG")
+        if _sm120_bwd_cfg:
+            _cfg = dict(kv.split("=") for kv in _sm120_bwd_cfg.split(",") if kv)
+            m_block_size = int(_cfg.get("m", m_block_size))
+            n_block_size = int(_cfg.get("n", n_block_size))
+            num_threads = int(_cfg.get("t", num_threads))
+            num_stages_Q = int(_cfg.get("nsq", num_stages_Q))
+            num_stages_dO = int(_cfg.get("nsdo", num_stages_dO))
+            AtomLayoutMSdP = int(_cfg.get("msdp", AtomLayoutMSdP))
+            AtomLayoutNdKV = int(_cfg.get("ndkv", AtomLayoutNdKV))
+            AtomLayoutMdQ = int(_cfg.get("mdq", AtomLayoutMdQ))
+            SdP_swapAB = bool(int(_cfg.get("swapsdp", SdP_swapAB)))
+            dKV_swapAB = bool(int(_cfg.get("swapdkv", dKV_swapAB)))
+            dQ_swapAB = bool(int(_cfg.get("swapdq", dQ_swapAB)))
+            V_in_regs = bool(int(_cfg.get("vregs", V_in_regs)))
     elif arch // 10 == 9:
         cfg = _tile_size_bwd_sm90(
             head_dim,
@@ -2968,6 +3037,15 @@ def _flash_attn_bwd(
     sm120_nonpack_m_split_eligible = sm120_nonpack_base_ok and sm120_nonpack_m_split > 1
     if sm120_nonpack_m_split_eligible:
         pack_gqa_m_splits = sm120_nonpack_m_split
+    # Experimental m-split override (probing only); piggybacks on the
+    # FLASH_ATTENTION_SM120_BWD_CFG hook, key "msplit". pack_gqa_m_splits is
+    # part of the compile_key so overridden values cache separately.
+    if arch // 10 == 12:
+        _sm120_bwd_cfg2 = os.environ.get("FLASH_ATTENTION_SM120_BWD_CFG")
+        if _sm120_bwd_cfg2:
+            _cfg2 = dict(kv.split("=") for kv in _sm120_bwd_cfg2.split(",") if kv)
+            if "msplit" in _cfg2:
+                pack_gqa_m_splits = int(_cfg2["msplit"])
     pack_gqa_all_rows_valid = (
         arch // 10 == 12
         and pack_gqa
@@ -3036,8 +3114,45 @@ def _flash_attn_bwd(
             and batch_size == 2
             and seqlen_q == 1024
         )
+        or (
+            # Packed split16 qpkv4 S2048 row: isolated on/off A/B on RTX PRO
+            # 6000 showed +6.2% median (all 12 rounds positive, min +1.9%).
+            qhead_per_kvhead == 4
+            and num_head == 16
+            and num_head_kv == 4
+            and batch_size == 2
+            and seqlen_q == 2048
+        )
     )
-    sm120_skip_full_causal_mask = sm120_skip_full_causal_mask_default
+    # Structural eligibility for the masked/unmasked m-loop split: any dense
+    # equal-length causal row whose seqlens tile evenly (mask_fn=None also
+    # skips the seqlen bounds mask, so ragged tails are excluded). The env
+    # override allows forcing this beyond (=on) or below (=off) the
+    # row-validated default gate for profiling and A/B validation.
+    sm120_skip_full_causal_mask_struct = (
+        arch // 10 == 12
+        and causal
+        and not local
+        and seqlen_q == seqlen_k
+        and seqlen_q % m_block_size == 0
+        and seqlen_k % n_block_size == 0
+        and softcap == 0.0
+        and score_mod is None
+        and score_mod_bwd is None
+        and mask_mod is None
+        and block_sparse_tensors is None
+        and cu_seqlens_q is None
+        and cu_seqlens_k is None
+        and seqused_q is None
+        and seqused_k is None
+    )
+    _maskskip_env = os.environ.get("FLASH_ATTENTION_SM120_BWD_SKIP_FULL_CAUSAL_MASK")
+    if _maskskip_env is not None and _maskskip_env.lower() in ("0", "off", "false"):
+        sm120_skip_full_causal_mask = False
+    elif _maskskip_env is not None and _maskskip_env.lower() in ("1", "on", "true"):
+        sm120_skip_full_causal_mask = sm120_skip_full_causal_mask_struct
+    else:
+        sm120_skip_full_causal_mask = sm120_skip_full_causal_mask_default
 
     if softcap != 0.0:
         assert score_mod is None and score_mod_bwd is None, (
