@@ -599,6 +599,42 @@ def _flash_attn_fwd(
     use_dedicated_hd256_kernel = arch // 10 in [10, 11] and head_dim == 256 and head_dim_v == 256
     use_2cta_instrs = use_2cta_instrs or use_dedicated_hd256_kernel
 
+    # Host-side validation for the cp.async (non-TMA) paged-KV path. When
+    # page_size != tile_n the kernel loads the page table through PagedKVManager,
+    # which derives page_entry_per_thread = tile_n // <KV-load threads> via integer
+    # division (see PagedKVManager.create in paged_kv.py). If tile_n is not an exact
+    # multiple of the KV-load thread count, the trailing KV rows of every n-block are
+    # never fetched (page_entry_per_thread rounds down, or hits 0), silently
+    # corrupting the output. Fail fast here instead of deep inside JIT compilation.
+    # The dedicated hd256 kernel and the MLA (qv) path use their own KV loaders, so
+    # this guard is scoped to the standard SM90/SM100/SM110 forward.
+    if (
+        page_table is not None
+        and qv is None
+        and not use_dedicated_hd256_kernel
+        and arch // 10 in [9, 10, 11]
+        and page_size not in (None, tile_n)
+    ):
+        if arch // 10 == 9:
+            # SM90 loads KV with a single warp group (num_threads_per_warp_group).
+            paged_kv_load_threads = 128
+        else:
+            # SM100/SM110 cp.async path: the load warp group is softmax1 (4 warps =
+            # 128 threads) when q_stage == 1, otherwise the two trailing warps
+            # (64 threads). See FlashAttentionForwardSm100 load_warp_ids selection.
+            paged_kv_load_threads = 128 if q_stage == 1 else 64
+        if tile_n % paged_kv_load_threads != 0:
+            raise ValueError(
+                f"Paged KV with page_size ({page_size}) != n_block_size ({tile_n}) "
+                f"selects the cp.async KV-load path, which requires n_block_size "
+                f"(tile_n={tile_n}) to be a multiple of the KV-load thread count "
+                f"({paged_kv_load_threads}) so each thread loads a whole number of "
+                f"page-table entries; got tile_n={tile_n} % {paged_kv_load_threads} = "
+                f"{tile_n % paged_kv_load_threads}. Use page_size == n_block_size "
+                f"(={tile_n}) to take the TMA path, or pick a configuration whose "
+                f"tile_n is divisible by {paged_kv_load_threads}."
+            )
+
     if softcap is not None:
         assert score_mod is None, "softcap and score_mod cannot be used together"
         score_mod = utils.create_softcap_scoremod(softcap)
