@@ -228,10 +228,23 @@ class FlashAttentionBackwardSm80:
             sdO_layout_atom, (self.m_block_size, self.head_dim_v_padded, self.num_stages_dO), (0, 1, 2),
         )
         # TODO: do we set swizzle to be 3 here explicitly?
-        sPdS_layout_atom = sm80_utils.get_smem_layout_atom(self.dtype, self.n_block_size)
-        self.sPdS_layout = cute.tile_to_shape(
-            sPdS_layout_atom, (self.m_block_size, self.n_block_size), (0, 1),
-        )
+        if cutlass.const_expr(not self.SdP_swapAB):
+            sPdS_layout_atom = sm80_utils.get_smem_layout_atom(self.dtype, self.n_block_size)
+            self.sPdS_layout = cute.tile_to_shape(
+                sPdS_layout_atom, (self.m_block_size, self.n_block_size), (0, 1),
+            )
+        else:
+            # SdP_swapAB: the SdP accumulator is (n, m)-shaped, so store P/dS
+            # TRANSPOSED in smem, i.e. physically (n_block, m_block) with rows
+            # contiguous along m. The r2s copy (tiled over the swapped
+            # tiled_mma_sdp C layout) then composes without any transposed
+            # store, the dK/dV gemms read their (n, k=m) A-operand directly
+            # (non-transposed ldmatrix), and the dQ gemm reads dS as (m, n)
+            # through a transpose_view with the transposed ldmatrix atom.
+            sPdS_layout_atom = sm80_utils.get_smem_layout_atom(self.dtype, self.m_block_size)
+            self.sPdS_layout = cute.tile_to_shape(
+                sPdS_layout_atom, (self.n_block_size, self.m_block_size), (0, 1),
+            )
         # We set stride to be multiple of 64 so that if ShuffleLSE, even if threads read from sLSE but out of bounds,
         # it's still a valid smem address.
         self.sLSE_layout = cute.make_layout(
@@ -888,7 +901,17 @@ class FlashAttentionBackwardSm80:
             sdPsumMma = storage.sdPsum.get_tensor(sLSEMma_layout)
 
             # Transpose view of tensors for tiled mma
-            sQt, sdOt, sKt, sPt, sdSt = [layout_utils.transpose_view(t) for t in (sQ, sdO, sK, sP, sdS)]
+            sQt, sdOt, sKt = [layout_utils.transpose_view(t) for t in (sQ, sdO, sK)]
+            if cutlass.const_expr(not self.SdP_swapAB):
+                sPt, sdSt = [layout_utils.transpose_view(t) for t in (sP, sdS)]
+                sdS_dQ_view = sdS
+            else:
+                # P/dS are stored transposed in smem (physically (n, m)), so the
+                # (n, k=m) A-operand views for the dK/dV gemms are the tensors
+                # themselves, while the dQ gemm's (m, k=n) dS view is the
+                # transpose_view (read with the transposed ldmatrix atom).
+                sPt, sdSt = sP, sdS
+                sdS_dQ_view = layout_utils.transpose_view(sdS)
 
             gmem_thr_copy_QK = gmem_tiled_copy_QK.get_slice(tidx)
             gmem_thr_copy_VdO = gmem_tiled_copy_VdO.get_slice(tidx)
@@ -933,7 +956,7 @@ class FlashAttentionBackwardSm80:
             tdVrdO = utils.mma_make_fragment_B(sdOt[None, None, 0], thr_mma_dkv, swapAB=self.dKV_swapAB)
             tdKrdS = utils.mma_make_fragment_A(sdSt, thr_mma_dkv, swapAB=self.dKV_swapAB)
             tdKrQ = utils.mma_make_fragment_B(sQt[None, None, 0], thr_mma_dkv, swapAB=self.dKV_swapAB)
-            tdQrdS = utils.mma_make_fragment_A(sdS, thr_mma_dq, swapAB=self.dQ_swapAB)
+            tdQrdS = utils.mma_make_fragment_A(sdS_dQ_view, thr_mma_dq, swapAB=self.dQ_swapAB)
             tdQrK = utils.mma_make_fragment_B(sKt, thr_mma_dq, swapAB=self.dQ_swapAB)
 
             LSEslice = (None, 0, None) if cutlass.const_expr(not self.SdP_swapAB) else (0, None, None)
@@ -955,15 +978,20 @@ class FlashAttentionBackwardSm80:
             smem_thr_copy_KV = utils.make_tiled_copy_B(
                 smem_copy_atom, tiled_mma_sdp, swapAB=self.SdP_swapAB
             ).get_slice(tidx)
-            # TODO: should this be smem_copy_atom_transposed?
+            # When SdP_swapAB, P/dS live transposed in smem (physically (n, m),
+            # contiguous along m=k of the dK/dV gemms), so their A-operand reads
+            # use the NON-transposed ldmatrix atom; conversely the dQ gemm reads
+            # dS as (m, n) through a transpose_view, needing the transposed atom.
             smem_thr_copy_PdSt = utils.make_tiled_copy_A(
-                smem_copy_atom_transposed, tiled_mma_dkv, swapAB=self.dKV_swapAB
+                smem_copy_atom_transposed if cutlass.const_expr(not self.SdP_swapAB) else smem_copy_atom,
+                tiled_mma_dkv, swapAB=self.dKV_swapAB
             ).get_slice(tidx)
             smem_thr_copy_QdOt = utils.make_tiled_copy_B(
                 smem_copy_atom_transposed, tiled_mma_dkv, swapAB=self.dKV_swapAB
             ).get_slice(tidx)
             smem_thr_copy_dS = utils.make_tiled_copy_A(
-                smem_copy_atom, tiled_mma_dq, swapAB=self.dQ_swapAB
+                smem_copy_atom if cutlass.const_expr(not self.SdP_swapAB) else smem_copy_atom_transposed,
+                tiled_mma_dq, swapAB=self.dQ_swapAB
             ).get_slice(tidx)
             smem_thr_copy_Kt = utils.make_tiled_copy_B(
                 smem_copy_atom_transposed, tiled_mma_dq, swapAB=self.dQ_swapAB
@@ -984,7 +1012,7 @@ class FlashAttentionBackwardSm80:
             tdKsdSt = smem_thr_copy_PdSt.partition_S(sdSt)
             tdVsdOt = smem_thr_copy_QdOt.partition_S(sdOt)
             tdKsQt = smem_thr_copy_QdOt.partition_S(sQt)
-            tdQsdS = smem_thr_copy_dS.partition_S(sdS)
+            tdQsdS = smem_thr_copy_dS.partition_S(sdS_dQ_view)
             tdQsKt = smem_thr_copy_Kt.partition_S(sKt)
             tPsP = r2s_thr_copy_PdS.partition_D(sP)
             tdSsdS = r2s_thr_copy_PdS.partition_D(sdS)
@@ -1167,6 +1195,9 @@ class FlashAttentionBackwardSm80:
                 # (no window, no local) here.
                 window_size_left=window_size_left if cutlass.const_expr(self.is_local and getattr(self, "arch", 80) == 120) else None,
                 window_size_right=window_size_right if cutlass.const_expr(self.is_local and getattr(self, "arch", 80) == 120) else None,
+                # With SdP_swapAB the S/dP accumulator is (n, m)-shaped; the mask
+                # must swap its row/col interpretation accordingly.
+                swap_AB=self.SdP_swapAB,
             )
             mask_fn = partial(
                 mask.apply_mask, n_block=n_block, thr_mma=thr_mma_sdp,
@@ -1325,8 +1356,10 @@ class FlashAttentionBackwardSm80:
         cute.autovec_copy(
             smem_copy_params.tSsLSEMma[None, smem_pipe_read_q if cutlass.const_expr(self.num_stages_Q > 1) else 0], tLSErLSE
         )
-        acc_S_mn = layout_utils.reshape_acc_to_mn(acc_S)
-        acc_S_pre_mn = layout_utils.reshape_acc_to_mn(acc_S_pre)
+        # With SdP_swapAB the accumulator is (n, m)-shaped; transpose the mn view
+        # so mode 0 is always the query-row dim (LSE/dPsum are indexed per row).
+        acc_S_mn = layout_utils.reshape_acc_to_mn(acc_S, transpose=self.SdP_swapAB)
+        acc_S_pre_mn = layout_utils.reshape_acc_to_mn(acc_S_pre, transpose=self.SdP_swapAB)
         if cutlass.const_expr(self.score_mod is not None):
             for r in cutlass.range(cute.size(acc_S_mn, mode=[0]), unroll_full=True):
                 acc_S_mn[r, None].store(
@@ -1374,7 +1407,7 @@ class FlashAttentionBackwardSm80:
         cute.autovec_copy(
             smem_copy_params.tSsdPsumMma[None, smem_pipe_read_do if cutlass.const_expr(self.num_stages_dO > 1) else 0], tLSErdPsum
         )
-        acc_dP_mn = layout_utils.reshape_acc_to_mn(acc_dP)
+        acc_dP_mn = layout_utils.reshape_acc_to_mn(acc_dP, transpose=self.SdP_swapAB)
         # if cute.arch.thread_idx()[0] == 0 and cute.arch.block_idx()[0] == bidx: cute.print_tensor(acc_dP_mn)
         assert cute.size(acc_dP_mn, mode=[0]) == cute.size(tLSErdPsum)
         for r in cutlass.range(cute.size(acc_dP_mn, mode=[0]), unroll_full=True):
@@ -1403,9 +1436,11 @@ class FlashAttentionBackwardSm80:
         if cutlass.const_expr(not self.Mma_dKV_is_RS):
             cute.arch.barrier()  # Make sure P is written
         # For hdim 64, It's faster to write to smem_dS first before the dV gemm
-        if cutlass.const_expr(not self.Mma_dKV_is_RS):
-            tdSrdS = smem_copy_params.r2s_thr_copy_PdS.retile(rdS)
-            cute.copy(smem_copy_params.r2s_thr_copy_PdS, tdSrdS, smem_copy_params.tdSsdS)
+        # NOTE: even in RS mode (dK/dV consume P/dS straight from registers),
+        # dS must still be staged to smem because the dQ gemm always reads its
+        # A operand from sdS. Only the sP write is skipped in RS mode.
+        tdSrdS = smem_copy_params.r2s_thr_copy_PdS.retile(rdS)
+        cute.copy(smem_copy_params.r2s_thr_copy_PdS, tdSrdS, smem_copy_params.tdSsdS)
         if cutlass.const_expr(self.Mma_dKV_is_RS):
             tdVrP = layout_utils.reshape_acc_to_frgA(rP)
         else:
