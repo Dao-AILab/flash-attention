@@ -1706,10 +1706,10 @@ class FlashAttentionBackwardSm100:
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
 
-    @cute.jit 
+    @cute.jit
     def get_m_block_from_iter(self, iter_idx, m_block_min, m_block_max):
         if const_expr(self.pack_gqa):
-            num_m_blocks = m_block_max - m_block_min 
+            num_m_blocks = m_block_max - m_block_min
             num_m_blocks_per_head = num_m_blocks // self.qhead_per_kvhead
             boundary = num_m_blocks_per_head * self.qhead_per_kvhead
             qhead_swizzled = Int32(0)
@@ -1718,8 +1718,8 @@ class FlashAttentionBackwardSm100:
                 qhead_swizzled = iter_idx // num_m_blocks_per_head
                 pos_block = iter_idx - qhead_swizzled * num_m_blocks_per_head
             else:
-                qhead_swizzled = iter_idx 
-            return m_block_min + pos_block * self.qhead_per_kvhead + qhead_swizzled 
+                qhead_swizzled = iter_idx
+            return m_block_min + pos_block * self.qhead_per_kvhead + qhead_swizzled
         else:
             return m_block_min + iter_idx
 
@@ -2013,6 +2013,7 @@ class FlashAttentionBackwardSm100:
                         )
                     )
                 else:
+                    loop_count = m_block_max - m_block_min
                     first_m_block = self.get_m_block_from_iter(Int32(0), m_block_min, m_block_max)
                     if const_expr(self.use_2cta_instrs and self.tile_hdim == 192):
                         #### Prologue ####
@@ -2073,7 +2074,8 @@ class FlashAttentionBackwardSm100:
 
                         #### Mainloop ####
                         # 2CTA: [lse | Q | dOt | dPsum | Qt | dO]
-                        for m_block in cutlass.range(m_block_min + 1, m_block_max, unroll=1):
+                        for iter_idx in cutlass.range(1, loop_count, unroll=1):
+                            m_block = self.get_m_block_from_iter(iter_idx, m_block_min, m_block_max)
                             # LSE
                             pipeline_LSE.producer_acquire(producer_state_LSE)
                             with cute.arch.elect_one():
@@ -2180,11 +2182,15 @@ class FlashAttentionBackwardSm100:
                             pipeline_Kt.producer_commit(producer_state_Kt)
                             producer_state_Kt.advance()
                         #### Main Loop ####
-                        for m_block in cutlass.range(m_block_min + 1, m_block_max, unroll=1):
+                        for iter_idx in cutlass.range(1, loop_count, unroll=1):
+                            m_block = self.get_m_block_from_iter(iter_idx, m_block_min, m_block_max)
+                            m_block_prev = self.get_m_block_from_iter(
+                                iter_idx - 1, m_block_min, m_block_max
+                            )
                             if const_expr(should_load_Q):
                                 if const_expr(tma_atom_Qt is not None):
                                     pipeline_Qt.producer_acquire(producer_state_Qt)
-                                    load_Qt(m_block - 1, producer_state=producer_state_Qt)
+                                    load_Qt(m_block_prev, producer_state=producer_state_Qt)
                                     pipeline_Qt.producer_commit(producer_state_Qt)
                                     producer_state_Qt.advance()
 
@@ -2233,7 +2239,12 @@ class FlashAttentionBackwardSm100:
                         if const_expr(should_load_Q):
                             if const_expr(tma_atom_Qt is not None):
                                 pipeline_Qt.producer_acquire(producer_state_Qt)
-                                load_Qt(m_block_max - 1, producer_state=producer_state_Qt)
+                                load_Qt(
+                                    self.get_m_block_from_iter(
+                                        loop_count - 1, m_block_min, m_block_max
+                                    ),
+                                    producer_state=producer_state_Qt,
+                                )
                                 pipeline_Qt.producer_commit(producer_state_Qt)
                                 producer_state_Qt.advance()
 

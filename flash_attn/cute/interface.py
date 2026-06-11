@@ -1419,6 +1419,11 @@ def _flash_attn_bwd(
     subtile_factor = sparse_q // m_block_size if sparse_q is not None else 2
 
     qhead_per_kvhead = num_head // num_head_kv
+    if pack_gqa is None:
+        pack_gqa = qhead_per_kvhead > 1 and m_block_size % qhead_per_kvhead == 0
+    if arch // 10 not in [10, 11]:
+        # pack_gqa in backward not yet supported on Sm90
+        pack_gqa = False
     num_head_packgqa = num_head_kv if pack_gqa else num_head
     seqlen_q_rounded = (
         (seqlen_q * (qhead_per_kvhead if pack_gqa else 1) + m_block_size - 1)
@@ -1475,11 +1480,6 @@ def _flash_attn_bwd(
         _validate_head_dims(head_dim, head_dim_v, arch // 10, alignment)
     if softmax_scale is None:
         softmax_scale = 1.0 / math.sqrt(head_dim)
-    if pack_gqa is None:
-        pack_gqa = qhead_per_kvhead > 1 and m_block_size % qhead_per_kvhead == 0
-    if arch // 10 not in [10, 11]:
-        # pack_gqa in backward not yet supported on Sm90
-        pack_gqa = False
 
     if softcap != 0.0:
         assert score_mod is None and score_mod_bwd is None, (
