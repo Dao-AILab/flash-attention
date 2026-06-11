@@ -226,7 +226,7 @@ class FlashAttentionBackwardPreprocess:
         mPdPsum = layout_utils.select(mPdPsum, transpose)
         if const_expr(mLSE is not None):
             mLSE = layout_utils.select(mLSE, transpose)
-            mLSElog2 = layout_utils.select(mLSElog2, transpose) 
+            mLSElog2 = layout_utils.select(mLSElog2, transpose)
         if const_expr(mdLSE is not None):
             mdLSE = layout_utils.select(mdLSE, transpose)
         if const_expr(mdQaccum is not None):

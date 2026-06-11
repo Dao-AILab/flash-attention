@@ -35,7 +35,9 @@ class SeqlenInfo:
             0
             if const_expr(cu_seqlens is None)
             # Add divby so that the compiler knows the alignment when moving by offset_padded
-            else cute.assume((offset * qhead_per_kvhead_packgqa + batch_idx * tile) // tile * tile, divby=tile)
+            else cute.assume(
+                (offset * qhead_per_kvhead_packgqa + batch_idx * tile) // tile * tile, divby=tile
+            )
         )
         if const_expr(seqused is not None):
             seqlen = seqused[batch_idx]
@@ -100,7 +102,10 @@ class SeqlenInfoQK:
         padded_offset_q = (
             0
             if const_expr(mCuSeqlensQ is None)
-            else cute.assume((offset_q * qhead_per_kvhead_packgqa + batch_idx * tile_m) // tile_m * tile_m, divby=tile_m)
+            else cute.assume(
+                (offset_q * qhead_per_kvhead_packgqa + batch_idx * tile_m) // tile_m * tile_m,
+                divby=tile_m,
+            )
         )
         padded_offset_k = (
             0

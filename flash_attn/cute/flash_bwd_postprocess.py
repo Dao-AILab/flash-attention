@@ -377,7 +377,11 @@ class FlashAttentionBackwardPostprocess:
                 head_dim = mdQ.shape[3]
             else:
                 padded_offset_q = seqlen.padded_offset_q
-                dq_offset = (seqlen.offset_q, 0) if const_expr(not self.pack_gqa) else ((0, seqlen.offset_q), 0)
+                dq_offset = (
+                    (seqlen.offset_q, 0)
+                    if const_expr(not self.pack_gqa)
+                    else ((0, seqlen.offset_q), 0)
+                )
                 mdQ_cur = cute.domain_offset(dq_offset, mdQ[None, head_idx, None])
                 mdQaccum_cur = cute.domain_offset(
                     (padded_offset_q * self.tile_hdim,), mdQaccum[head_idx, None]

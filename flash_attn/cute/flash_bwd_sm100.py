@@ -1043,7 +1043,9 @@ class FlashAttentionBackwardSm100:
             min_blocks_per_mp=1,
         )
 
-    def _generate_attention_mask_cls(self, window_size_left, window_size_right, qhead_per_kvhead_packgqa=1):
+    def _generate_attention_mask_cls(
+        self, window_size_left, window_size_right, qhead_per_kvhead_packgqa=1
+    ):
         return partial(
             AttentionMask,
             self.tile_m,
@@ -1459,7 +1461,9 @@ class FlashAttentionBackwardSm100:
         )
         TileSchedulerCls = partial(self.tile_scheduler_cls.create, tile_sched_params)
 
-        AttentionMaskCls = self._generate_attention_mask_cls(window_size_left, window_size_right, qhead_per_kvhead_packgqa)
+        AttentionMaskCls = self._generate_attention_mask_cls(
+            window_size_left, window_size_right, qhead_per_kvhead_packgqa
+        )
 
         #  EMPTY
         # (15)
@@ -1684,7 +1688,9 @@ class FlashAttentionBackwardSm100:
             m_block_min, m_block_max = block_info.get_m_block_min_max(
                 seqlen, n_block // self.cluster_shape_mnk[0]
             )
-            head_idx_kv = head_idx // self.qhead_per_kvhead if const_expr(not self.pack_gqa) else head_idx
+            head_idx_kv = (
+                head_idx // self.qhead_per_kvhead if const_expr(not self.pack_gqa) else head_idx
+            )
 
             process_tile = (
                 const_expr(not self.is_local and not self.is_varlen_q) or m_block_min < m_block_max
@@ -1812,7 +1818,9 @@ class FlashAttentionBackwardSm100:
             m_block_min, m_block_max = block_info.get_m_block_min_max(
                 seqlen, n_block // self.cluster_shape_mnk[0]
             )
-            head_idx_kv = head_idx // self.qhead_per_kvhead if const_expr(not self.pack_gqa) else head_idx
+            head_idx_kv = (
+                head_idx // self.qhead_per_kvhead if const_expr(not self.pack_gqa) else head_idx
+            )
             n_block_cta_group = n_block // self.cta_group_size
 
             # GMEM tensors (varlen-aware)
@@ -1822,7 +1830,9 @@ class FlashAttentionBackwardSm100:
             if const_expr(not seqlen.has_cu_seqlens_q):
                 mdO_cur = mdO[None, None, head_idx, batch_idx]
             else:
-                dO_seq_offset = seqlen.offset_q if const_expr(not self.pack_gqa) else (0, seqlen.offset_q)
+                dO_seq_offset = (
+                    seqlen.offset_q if const_expr(not self.pack_gqa) else (0, seqlen.offset_q)
+                )
                 mdO_cur = cute.domain_offset((0, dO_seq_offset), mdO[None, None, head_idx])
             mLSE_cur = seqlen.offset_batch_Q(mLSE, batch_idx, dim=2, padded=True)[None, head_idx]
             mdPsum_cur = seqlen.offset_batch_Q(mdPsum, batch_idx, dim=2, padded=True)[
@@ -1834,11 +1844,11 @@ class FlashAttentionBackwardSm100:
                     mQt_cur = mQt[None, None, head_idx, batch_idx]
                     mdOt_cur = mdOt[None, None, head_idx, batch_idx]
                 else:
-                    qt_seq_offset = seqlen.offset_q if const_expr(not self.pack_gqa) else (0, seqlen.offset_q)
+                    qt_seq_offset = (
+                        seqlen.offset_q if const_expr(not self.pack_gqa) else (0, seqlen.offset_q)
+                    )
                     mQt_cur = cute.domain_offset((0, qt_seq_offset, 0), mQt)[None, None, head_idx]
-                    mdOt_cur = cute.domain_offset((qt_seq_offset, 0, 0), mdOt)[
-                        None, None, head_idx
-                    ]
+                    mdOt_cur = cute.domain_offset((qt_seq_offset, 0, 0), mdOt)[None, None, head_idx]
                 if const_expr(not seqlen.has_cu_seqlens_k):
                     mKt_cur = mKt[None, None, head_idx_kv, batch_idx]
                 else:
@@ -3166,7 +3176,9 @@ class FlashAttentionBackwardSm100:
                     )
 
                 #### APPLY MASK (after score_mod, matching forward pass order)
-                seqlen_q_packgqa = seqlen.seqlen_q * (self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1)
+                seqlen_q_packgqa = seqlen.seqlen_q * (
+                    self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1
+                )
                 check_m_boundary = (m_block + 1) * self.tile_m > seqlen_q_packgqa
                 mask_fn(
                     tSrS_t2r,
@@ -3735,7 +3747,9 @@ class FlashAttentionBackwardSm100:
 
                     if const_expr(self.deterministic and stage == 0 and delay_semaphore_release):
                         if iter_idx > 0:
-                            prev_m_block = self.get_m_block_from_iter(iter_idx - 1, m_block_min, m_block_max)
+                            prev_m_block = self.get_m_block_from_iter(
+                                iter_idx - 1, m_block_min, m_block_max
+                            )
                             barrier.arrive_inc(
                                 mdQ_semaphore_cur[(prev_m_block, None)].iterator,
                                 tidx,
@@ -3769,7 +3783,9 @@ class FlashAttentionBackwardSm100:
                 self.reduce_sync_barrier.arrive_and_wait()
                 # final semaphore release
                 if const_expr(self.deterministic and delay_semaphore_release):
-                    last_m_block = self.get_m_block_from_iter(loop_count - 1, m_block_min, m_block_max)
+                    last_m_block = self.get_m_block_from_iter(
+                        loop_count - 1, m_block_min, m_block_max
+                    )
                     barrier.arrive_inc(
                         mdQ_semaphore_cur[(last_m_block, None)].iterator,
                         tidx,
@@ -3819,7 +3835,9 @@ class FlashAttentionBackwardSm100:
         ) // 128
         num_wg = cute.arch.WARP_SIZE * len(self.compute_warp_ids) // 128
 
-        assert self.qhead_per_kvhead == 1 or self.pack_gqa, "This epilogue path is only for MHA or pack_gqa"
+        assert self.qhead_per_kvhead == 1 or self.pack_gqa, (
+            "This epilogue path is only for MHA or pack_gqa"
+        )
         mdV_cur = seqlen.offset_batch_K(mdV, batch_idx, dim=3)[None, None, head_idx]
         mdK_cur = seqlen.offset_batch_K(mdK, batch_idx, dim=3)[None, None, head_idx]
 
@@ -3975,7 +3993,9 @@ class FlashAttentionBackwardSm100:
         # (8, tile_n / 128, 64 / 8) = (8, 1, 8) or (4, tile_n * 32 / (128 * 4)) = (4, 8)
         tdKVsdKV_r2s = thr_copy_r2s_dKV.partition_D(sdKV)
 
-        head_idx_kv = head_idx // self.qhead_per_kvhead if const_expr(not self.pack_gqa) else head_idx
+        head_idx_kv = (
+            head_idx // self.qhead_per_kvhead if const_expr(not self.pack_gqa) else head_idx
+        )
         if const_expr(not self.dKV_postprocess):
             assert not seqlen.has_cu_seqlens_k, "varlen uses non tma store path"
             mdKV_cur = mdKV[None, None, head_idx_kv, batch_idx]  # (seqlen, hdim)
