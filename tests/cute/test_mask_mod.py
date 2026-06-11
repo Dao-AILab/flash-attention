@@ -26,6 +26,7 @@ from flash_attn.cute.interface import _flash_attn_fwd, _flash_attn_bwd, flash_at
 from flash_attn.cute.block_sparsity import (
     BlockSparseTensorsTorch,
     fast_sampling,
+    get_block_sparse_expected_shapes_bwd,
     normalize_block_sparse_config,
     compute_dq_write_order,
     compute_dq_write_order_from_block_mask,
@@ -2350,6 +2351,57 @@ WRITE_ORDER_SEQLENS = [
     (1024, 512),
     (384, 768),
 ]
+
+
+@pytest.mark.skipif(
+    COMPUTE_CAPABILITY != 9,
+    reason="subtile_factor varies with sparse block size only on SM90 backward",
+)
+@pytest.mark.parametrize("sparse_block_q", [128, 256])
+def test_block_sparse_bwd_subtile_factor_compile_key(sparse_block_q):
+    """Different sparse Q block sizes specialize the bwd kernel with different
+    subtile_factor values, so they must not share a compile-cache entry.
+    Both parametrizations run in one process; an "all blocks active" sparse
+    pattern is mathematically identical to dense attention, so dense backward
+    gradients are the exact reference.
+    """
+    device, dtype = "cuda", torch.bfloat16
+    batch_size, nheads, seqlen, headdim = 1, 4, 1024, 64
+    m_block_size, n_block_size = 128, 128  # BwdConfig for head_dim<=64
+
+    torch.manual_seed(0)
+    q, k, v = (
+        torch.randn(batch_size, seqlen, nheads, headdim, device=device, dtype=dtype)
+        for _ in range(3)
+    )
+    out, lse = _flash_attn_fwd(q=q, k=k, v=v, causal=False, return_lse=True)
+    dout = torch.randn_like(out)
+
+    dq_ref, dk_ref, dv_ref = _flash_attn_bwd(q, k, v, out, dout, lse, causal=False)
+
+    subtile = sparse_block_q // m_block_size
+    cnt_shape, idx_shape = get_block_sparse_expected_shapes_bwd(
+        batch_size, nheads, seqlen, seqlen, m_block_size, n_block_size, subtile
+    )
+    cnt = torch.full(cnt_shape, idx_shape[-1], dtype=torch.int32, device=device)
+    idx = (
+        torch.arange(idx_shape[-1], dtype=torch.int32, device=device)
+        .expand(idx_shape)
+        .contiguous()
+    )
+    sparse = BlockSparseTensorsTorch(
+        mask_block_cnt=cnt, mask_block_idx=idx, block_size=(sparse_block_q, n_block_size)
+    )
+    dq, dk, dv = _flash_attn_bwd(
+        q, k, v, out, dout, lse, causal=False, block_sparse_tensors=sparse
+    )
+
+    for name, got, ref in [("dq", dq, dq_ref), ("dk", dk, dk_ref), ("dv", dv, dv_ref)]:
+        rel = (got.float() - ref.float()).abs().max() / ref.float().abs().max()
+        assert rel < 0.02, (
+            f"{name} mismatch for sparse_block_q={sparse_block_q}: max_rel_err={rel:.3e} "
+            f"(all-blocks-active sparse pattern must match dense gradients)"
+        )
 
 
 @pytest.mark.parametrize("seqlen_q,seqlen_k", WRITE_ORDER_SEQLENS)
