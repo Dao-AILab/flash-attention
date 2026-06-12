@@ -32,7 +32,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-cu13 = ["nvidia-cutlass-dsl[cu13]==4.6.0dev0"]
+cu13 = ["nvidia-cutlass-dsl[cu13]==4.6.0.dev0"]
 dev = [
     "pytest",
     "pytest-xdist",
