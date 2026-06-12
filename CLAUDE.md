@@ -39,14 +39,15 @@ Compilation dominates test time. The fast workflow separates compilation (parall
 
 ```bash
 # Pass 1: compile all kernels in parallel using FakeTensorMode (no GPU memory allocation)
-FLASH_ATTENTION_FAKE_TENSOR=1 FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1 pytest -n 64 -x tests/cute/test_flash_attn.py
+FLASH_ATTENTION_FAKE_TENSOR=1 pytest -n 64 -x tests/cute/test_flash_attn.py
 
 # Pass 2: run tests using cached compiled kernels
-FLASH_ATTENTION_FAKE_TENSOR=0 FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1 pytest -x tests/cute/test_flash_attn.py
+FLASH_ATTENTION_FAKE_TENSOR=0 pytest -x tests/cute/test_flash_attn.py
 ```
 
 - `FLASH_ATTENTION_FAKE_TENSOR=1` — uses PyTorch FakeTensorMode to compile kernels without allocating GPU memory or running them.
-- `FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1` — enables persistent disk cache at `/tmp/${USER}/flash_attention_cute_dsl_cache/`.
+- `FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=0` — disables the persistent disk cache, which is enabled by default at `/tmp/${USER}/flash_attention_cute_dsl_cache/`.
+- `FLASH_ATTENTION_CUTE_DSL_CACHE_DIR=/path` — changes the persistent cache directory; use a fast shared path for distributed training.
 - `-n 256` — pytest-xdist parallel workers (only useful in the compilation pass).
 
 Tests are parametrized over dtype (fp16/bf16), head dimension (64, 96, 128), sequence length, causal/non-causal, and MHA/GQA/MQA.

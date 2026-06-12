@@ -9,7 +9,7 @@ import time
 from functools import lru_cache
 from getpass import getuser
 from pathlib import Path
-from typing import Hashable, TypeAlias
+from typing import Callable, Hashable, TypeAlias
 
 import ctypes
 
@@ -30,13 +30,22 @@ for _lib_path in cute.runtime.find_runtime_libraries(enable_tvm_ffi=False):
 CompileKeyType: TypeAlias = tuple[Hashable, ...]
 CallableFunction: TypeAlias = JitCompiledFunction | tvm_ffi.Function
 
-# Enable cache via `FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1`
-CUTE_DSL_CACHE_ENABLED: bool = os.getenv("FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED", "0") == "1"
+
+def _env_flag(name: str, default: str) -> bool:
+    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
+# Persistent cache is enabled by default. Set
+# `FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=0` to force in-process-only caching.
+CUTE_DSL_CACHE_ENABLED: bool = _env_flag("FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED", "1")
 
 
 # Customize cache dir via `FLASH_ATTENTION_CUTE_DSL_CACHE_DIR`, default is
 # `/tmp/${USER}/flash_attention_cute_dsl_cache``
 CUTE_DSL_CACHE_DIR: str | None = os.getenv("FLASH_ATTENTION_CUTE_DSL_CACHE_DIR", None)
+CUTE_DSL_CACHE_LOCK_TIMEOUT_SECONDS: float = float(
+    os.getenv("FLASH_ATTENTION_CUTE_DSL_CACHE_LOCK_TIMEOUT_SECONDS", "1800")
+)
 
 
 def get_cache_path() -> Path:
@@ -163,6 +172,13 @@ class JITCache:
     def __contains__(self, key: CompileKeyType) -> bool:
         return key in self.cache
 
+    def get_or_compile(
+        self, key: CompileKeyType, compile_fn: Callable[[], JitCompiledFunction]
+    ) -> CallableFunction:
+        if key not in self.cache:
+            self.cache[key] = compile_fn()
+        return self.cache[key]
+
     def clear(self) -> None:
         """
         Clear in-memory cache of compiled functions
@@ -177,7 +193,7 @@ class JITPersistentCache(JITCache):
     """
 
     EXPORT_FUNCTION_PREFIX = "func"
-    LOCK_TIMEOUT_SECONDS = 15
+    LOCK_TIMEOUT_SECONDS = CUTE_DSL_CACHE_LOCK_TIMEOUT_SECONDS
 
     def __init__(self, cache_path: Path):
         super().__init__()
@@ -215,14 +231,17 @@ class JITPersistentCache(JITCache):
             label=sha256_hex,
         ):
             if obj_path.exists():
-                fa_log(1, f"Loading compiled function from disk: {obj_path}")
-                m = cute.runtime.load_module(str(obj_path), enable_tvm_ffi=True)
-                fn = getattr(m, self.EXPORT_FUNCTION_PREFIX)
-                JITCache.__setitem__(self, key, fn)
+                self._load_from_storage_unlocked(key, obj_path)
                 return True
             else:
                 fa_log(1, f"Cache miss on disk for key hash {sha256_hex}")
         return False
+
+    def _load_from_storage_unlocked(self, key: CompileKeyType, obj_path: Path) -> None:
+        fa_log(1, f"Loading compiled function from disk: {obj_path}")
+        m = cute.runtime.load_module(str(obj_path), enable_tvm_ffi=True)
+        fn = getattr(m, self.EXPORT_FUNCTION_PREFIX)
+        JITCache.__setitem__(self, key, fn)
 
     def _try_export_to_storage(self, key: CompileKeyType, fn: JitCompiledFunction) -> None:
         """Export a compiled function to persistent storage under exclusive lock."""
@@ -238,12 +257,40 @@ class JITPersistentCache(JITCache):
                 # Another process already exported.
                 fa_log(1, f"Skipping export, already on disk: {obj_path}")
                 return
-            fa_log(1, f"Exporting compiled function to disk: {obj_path}")
-            fn.export_to_c(
-                object_file_path=str(obj_path),
-                function_name=self.EXPORT_FUNCTION_PREFIX,
-            )
-            fa_log(1, f"Successfully exported compiled function to disk: {obj_path}")
+            self._export_to_storage_unlocked(obj_path, fn)
+
+    def _export_to_storage_unlocked(self, obj_path: Path, fn: JitCompiledFunction) -> None:
+        fa_log(1, f"Exporting compiled function to disk: {obj_path}")
+        fn.export_to_c(
+            object_file_path=str(obj_path),
+            function_name=self.EXPORT_FUNCTION_PREFIX,
+        )
+        fa_log(1, f"Successfully exported compiled function to disk: {obj_path}")
+
+    def get_or_compile(
+        self, key: CompileKeyType, compile_fn: Callable[[], JitCompiledFunction]
+    ) -> CallableFunction:
+        if JITCache.__contains__(self, key):
+            return JITCache.__getitem__(self, key)
+
+        sha256_hex = self._key_to_hash(key)
+        obj_path = self.cache_path / f"{sha256_hex}.o"
+        with FileLock(
+            self._lock_path(sha256_hex),
+            exclusive=True,
+            timeout=self.LOCK_TIMEOUT_SECONDS,
+            label=sha256_hex,
+        ):
+            if JITCache.__contains__(self, key):
+                return JITCache.__getitem__(self, key)
+            if obj_path.exists():
+                self._load_from_storage_unlocked(key, obj_path)
+                return JITCache.__getitem__(self, key)
+
+            fn = compile_fn()
+            JITCache.__setitem__(self, key, fn)
+            self._export_to_storage_unlocked(obj_path, fn)
+            return fn
 
     def _key_to_hash(self, key: CompileKeyType) -> str:
         return hashlib.sha256(pickle.dumps(key)).hexdigest()

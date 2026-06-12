@@ -83,6 +83,12 @@ from flash_attn.cute import flash_attn_func
 out = flash_attn_func(q, k, v, causal=True)
 ```
 
+FA4 kernels are JIT-compiled and use a persistent on-disk cache by default at
+`/tmp/${USER}/flash_attention_cute_dsl_cache/`. For distributed training, set
+`FLASH_ATTENTION_CUTE_DSL_CACHE_DIR` to a fast shared path so ranks and restarts
+reuse compiled kernels. Set `FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=0` to force
+in-process-only caching.
+
 ## Installation and features
 **Requirements:**
 - CUDA toolkit or ROCm toolkit
