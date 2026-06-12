@@ -700,6 +700,7 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
         int64_t window_size_right,
         int64_t attention_chunk,
         double softcap,
+        double p_dropout,
         bool is_rotary_interleaved,   // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
         std::optional<at::Tensor> scheduler_metadata_,  // (b + 1)
         int64_t num_splits,
@@ -904,7 +905,7 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
                      seqused_q_.has_value() ? seqused_q_.value().data_ptr() : nullptr,
                      seqused_k_.has_value() ? seqused_k_.value().data_ptr() : nullptr,
                      softmax_lse.data_ptr(),
-                     /*p_dropout=*/0.f,
+                     static_cast<float>(p_dropout),
                      softmax_scale,
                      window_size_left,
                      window_size_right,
@@ -1701,6 +1702,7 @@ TORCH_LIBRARY(flash_attn_3, m) {
         "int window_size_right = -1,"
         "int attention_chunk = 0,"
         "float softcap = 0.0,"
+        "float p_dropout = 0.0,"
         "bool is_rotary_interleaved = False,"
         "Tensor? scheduler_metadata = None,"
         "int num_splits = 0,"
