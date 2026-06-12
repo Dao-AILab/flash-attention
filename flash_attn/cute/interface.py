@@ -752,7 +752,7 @@ def _flash_attn_fwd(
         fa_logging.get_fa_log_level(),
     )
 
-    if compile_key not in _flash_attn_fwd.compile_cache:
+    def _compile_fwd():
         (
             cu_seqlens_q_tensor,
             cu_seqlens_k_tensor,
@@ -970,7 +970,7 @@ def _flash_attn_fwd(
             )
         # TODO: check @can_implement
         if qv is not None:
-            _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
+            return cute.compile(
                 fa_fwd,
                 q_tensor,
                 qv_tensor,
@@ -1017,9 +1017,11 @@ def _flash_attn_fwd(
                 AuxData(cute_aux_tensors, aux_scalars),
             ])
             compile_args.append(current_stream)
-            _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
+            return cute.compile(
                 *compile_args, options="--enable-tvm-ffi"
             )
+
+    compiled_fwd = _flash_attn_fwd.compile_cache.get_or_compile(compile_key, _compile_fwd)
 
     if not is_fake_mode():
         q_call, k_call, v_call, qv_call = [
@@ -1038,7 +1040,7 @@ def _flash_attn_fwd(
             else None
         )
         if qv is not None:
-            _flash_attn_fwd.compile_cache[compile_key](
+            compiled_fwd(
                 q_call,
                 qv_call,
                 k_call,
@@ -1091,7 +1093,7 @@ def _flash_attn_fwd(
                 else None,
                 AuxData(aux_tensors, aux_scalars),
             ])
-            _flash_attn_fwd.compile_cache[compile_key](*call_args)
+            compiled_fwd(*call_args)
     if is_split_kv:
         _flash_attn_fwd_combine(
             out_partial,
@@ -1187,10 +1189,11 @@ def _bwd_preprocess(
         dtype, head_dim, head_dim_v, m_block_size, is_varlen, seqused_q is not None, dlse is not None, dq_accum is not None,
         use_padded_offsets,
     )
-    if compile_key not in _bwd_preprocess.compile_cache:
-        _bwd_preprocess.compile_cache[compile_key] = _compile_bwd_preprocess(*compile_key)
+    compiled = _bwd_preprocess.compile_cache.get_or_compile(
+        compile_key, lambda: _compile_bwd_preprocess(*compile_key)
+    )
     if not is_fake_mode():
-        _bwd_preprocess.compile_cache[compile_key](
+        compiled(
             out, dout, dpsum, lse, lse_log2, dq_accum, cu_seqlens_q, seqused_q, dlse
         )
 
@@ -1236,10 +1239,11 @@ def _bwd_postprocess_convert(
         cu_seqlens is not None, seqused is not None,
         use_2cta_instrs, cluster_size, arch,
     )
-    if compile_key not in _bwd_postprocess_convert.compile_cache:
-        _bwd_postprocess_convert.compile_cache[compile_key] = _compile_bwd_postprocess(*compile_key)
+    compiled = _bwd_postprocess_convert.compile_cache.get_or_compile(
+        compile_key, lambda: _compile_bwd_postprocess(*compile_key)
+    )
     if not is_fake_mode():
-        _bwd_postprocess_convert.compile_cache[compile_key](
+        compiled(
             accum, output, scale, cu_seqlens, seqused,
         )
 
@@ -1723,7 +1727,7 @@ def _flash_attn_bwd(
             (seqlen_k_rounded // n_block_size == 1),
         )
 
-    if compile_key not in _flash_attn_bwd.compile_cache:
+    def _compile_bwd():
         q_tensor, k_tensor, v_tensor, do_tensor, dq_tensor, dk_tensor, dv_tensor = [
             to_cute_tensor(t) for t in (q, k, v, dout, dq, dk, dv)
         ]
@@ -1854,7 +1858,7 @@ def _flash_attn_bwd(
         dq_accum_tensor = dq_tensor if use_dedicated_hd256_kernel else dq_accum_tensor
 
         # TODO: check @can_implement
-        _flash_attn_bwd.compile_cache[compile_key] = cute.compile(
+        return cute.compile(
             fa_bwd_obj,
             q_tensor,
             k_tensor,
@@ -1880,9 +1884,12 @@ def _flash_attn_bwd(
             current_stream,
             options="--enable-tvm-ffi",
         )
+
+    compiled_bwd = _flash_attn_bwd.compile_cache.get_or_compile(compile_key, _compile_bwd)
+
     if not is_fake_mode():
         dq_accum = dq if use_dedicated_hd256_kernel else dq_accum
-        _flash_attn_bwd.compile_cache[compile_key](
+        compiled_bwd(
             q.detach(),
             k.detach(),
             v.detach(),
@@ -2473,12 +2480,11 @@ def _flash_attn_fwd_combine(
         lse is not None,
         varlen_batch_idx is not None,
     )
-    if compile_key not in _flash_attn_fwd_combine.compile_cache:
-        _flash_attn_fwd_combine.compile_cache[compile_key] = _compile_fwd_combine(
-            *compile_key
-        )
+    compiled = _flash_attn_fwd_combine.compile_cache.get_or_compile(
+        compile_key, lambda: _compile_fwd_combine(*compile_key)
+    )
     if not is_fake_mode():
-        _flash_attn_fwd_combine.compile_cache[compile_key](
+        compiled(
             out_partial, lse_partial, out, lse,
             cu_seqlens, seqused, num_splits_dynamic_ptr, varlen_batch_idx,
             semaphore_to_reset,
