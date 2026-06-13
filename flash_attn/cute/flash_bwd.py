@@ -415,25 +415,25 @@ class FlashAttentionBackwardSm80:
         SharedStorage = self._get_shared_storage_cls()
         tiled_mma_sdp, tiled_mma_dkv, tiled_mma_dq = self._get_tiled_mma()
 
-        num_head = mQ.shape[1] if cutlass.const_expr(mCuSeqlensQ is not None) else mQ.shape[2]
-
         if cutlass.const_expr(mCuSeqlensK is not None):
             TileScheduler = SingleTileVarlenScheduler
             num_batch = mCuSeqlensK.shape[0] - 1
+            total_k = cute.size(mK.shape[0])
         else:
             TileScheduler = SingleTileScheduler
             num_batch = mK.shape[0]
+            total_k = cute.size(mK.shape[0]) * cute.size(mK.shape[1])
 
         # Uses seqlen k, etc. since main bwd kernel's blocks are over n
         tile_sched_args = TileSchedulerArguments(
-            num_block=cute.ceil_div(mK.shape[1], self.n_block_size),
-            num_head=num_head,
+            num_block=cute.ceil_div(mK.shape[-3], self.n_block_size),
+            num_head=mQ.shape[-2],
             num_batch=num_batch,
             num_splits=1,
-            seqlen_k=0,
-            headdim=mK.shape[2],
-            headdim_v=mV.shape[2],
-            total_q=mK.shape[0],
+            seqlen_k=cute.size(mQ.shape[-3]),
+            headdim=mK.shape[-1],
+            headdim_v=mV.shape[-1],
+            total_q=total_k,
             tile_shape_mn=(self.n_block_size, self.m_block_size),
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if cutlass.const_expr(self.pack_gqa) else 1,
             mCuSeqlensQ=mCuSeqlensK,
