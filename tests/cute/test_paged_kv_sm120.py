@@ -47,7 +47,7 @@ def _sm120_only():
     if not torch.cuda.is_available():
         pytest.skip("CUDA not available")
     cc = torch.cuda.get_device_capability(0)
-    if cc != (12, 0):
+    if cc[0] != 12:  # consumer Blackwell sm_12x (sm_120, sm_121 DGX Spark)
         pytest.skip(f"Test targets sm_120, current device is sm_{cc[0]}{cc[1]}")
 
 
