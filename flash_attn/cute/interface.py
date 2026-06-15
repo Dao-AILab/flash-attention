@@ -574,6 +574,12 @@ def _flash_attn_fwd(
         else:
             num_splits = 1
 
+    # SM120 (Blackwell GeForce / RTX PRO / DGX Spark) does not implement the SplitKV
+    # forward + combine path (SplitKV is an SM100-only feature; SM80/SM90 also lack it).
+    # Fall back to a single split: the full-KV kernel is correct and is the supported path.
+    if arch // 10 == 12 and num_splits != 1:
+        num_splits = 1
+
     is_split_kv = num_splits > 1
     if is_split_kv:
         out_partial = torch.empty(num_splits, *q_batch_seqlen_shape, num_head, head_dim_v, dtype=torch.float32, device=device)
