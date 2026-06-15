@@ -436,7 +436,16 @@ class FlashAttentionBackwardSm80:
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
         grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
 
-        softmax_scale_log2, softmax_scale = utils.compute_softmax_scale_log2(softmax_scale, self.score_mod)
+        # NB: keep softmax_scale as a real Float32 (do NOT null it via
+        # compute_softmax_scale_log2): the backward uses softmax_scale to rescale dK
+        # (acc_dK *= softmax_scale when qhead_per_kvhead == 1), and the kernel arg is
+        # typed Float32, so a None would crash at launch. Fold log2(e) separately.
+        LOG2_E = math.log2(math.e)
+        if cutlass.const_expr(self.score_mod is None):
+            softmax_scale_log2 = softmax_scale * LOG2_E
+        else:
+            # score_mod is applied to S * softmax_scale, then use the change-of-base only.
+            softmax_scale_log2 = LOG2_E
         self.kernel(
             mQ,
             mK,
