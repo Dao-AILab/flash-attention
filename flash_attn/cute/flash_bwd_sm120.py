@@ -12,6 +12,12 @@ from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
 
 
 class FlashAttentionBackwardSm120(FlashAttentionBackwardSm80):
+    # Marker for arch-gated logic inside the SM80-shared kernel body.
+    # See FlashAttentionBackwardSm80.__call__ where this is consulted to
+    # disable the R2P bitmask fast-path when AtomLayoutSdP has multiple
+    # N-warps (the SM120 256-thread / 8-warp configuration).
+    arch: int = 120
+
     @staticmethod
     def can_implement(
         dtype,
