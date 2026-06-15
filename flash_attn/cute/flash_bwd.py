@@ -11,11 +11,12 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync, warp
-from cutlass import Int32
+from cutlass import Int32, Int64
 import cutlass.utils as utils_basic
 
 from quack import layout_utils
 from flash_attn.cute import ampere_helpers as sm80_utils
+from flash_attn.cute import philox
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import utils
 from flash_attn.cute.mask import AttentionMask
@@ -50,6 +51,7 @@ class FlashAttentionBackwardSm80:
         V_in_regs: bool = False,
         score_mod: cutlass.Constexpr | None = None,
         score_mod_bwd: cutlass.Constexpr | None = None,
+        dropout_p: float = 0.0,
     ):
         """Initializes the configuration for a flash attention v2 kernel.
 
@@ -97,6 +99,7 @@ class FlashAttentionBackwardSm80:
         self.share_QV_smem = V_in_regs
         self.score_mod = score_mod
         self.score_mod_bwd = score_mod_bwd
+        self.dropout_p = dropout_p
 
     @staticmethod
     def can_implement(
@@ -391,6 +394,8 @@ class FlashAttentionBackwardSm80:
         mdV_semaphore: Optional[cute.Tensor] = None,
         aux_data: AuxData = AuxData(),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        dropout_seed: Optional[Int64] = None,
+        dropout_offset: Optional[Int64] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -482,6 +487,8 @@ class FlashAttentionBackwardSm80:
             tile_sched_params,
             TileScheduler,
             aux_data,
+            dropout_seed,
+            dropout_offset,
         ).launch(
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
@@ -527,9 +534,15 @@ class FlashAttentionBackwardSm80:
         tile_sched_params: ParamsBase,
         TileScheduler: cutlass.Constexpr[Callable],
         aux_data: AuxData = AuxData(),
+        dropout_seed: Optional[Int64] = None,
+        dropout_offset: Optional[Int64] = None,
     ):
         # Thread index, block index
         tidx, _, _ = cute.arch.thread_idx()
+
+        # Stash dropout RNG state for compute_one_m_block (runtime SSA values).
+        self._dropout_seed = dropout_seed
+        self._dropout_offset = dropout_offset
 
         tile_scheduler = TileScheduler.create(tile_sched_params)
         work_tile = tile_scheduler.initial_work_tile_info()
@@ -837,6 +850,10 @@ class FlashAttentionBackwardSm80:
                 batch_idx=batch_idx, head_idx=head_idx,
                 mask_seqlen=True, mask_causal=self.is_causal
             )
+            dropout_fn = partial(
+                self.apply_dropout, n_block=n_block, batch_idx=batch_idx,
+                head_idx=head_idx, seqlen_info=seqlen, thr_mma_SdP=thr_mma_sdp,
+            )
             smem_pipe_read_q = cutlass.Int32(0)
             smem_pipe_read_do = cutlass.Int32(0)
             smem_pipe_write_q = cutlass.Int32(self.num_stages_Q - 1)
@@ -845,6 +862,7 @@ class FlashAttentionBackwardSm80:
                 compute_one_m_block(
                     m_tile, smem_pipe_read_q, smem_pipe_read_do, smem_pipe_write_q, smem_pipe_write_do,
                     mask_fn=mask_fn,
+                    dropout_fn=dropout_fn,
                 )
                 smem_pipe_read_q = self.advance_pipeline(smem_pipe_read_q, self.num_stages_Q)
                 smem_pipe_read_do = self.advance_pipeline(smem_pipe_read_do, self.num_stages_dO)
@@ -884,6 +902,7 @@ class FlashAttentionBackwardSm80:
         softmax_scale_log2: cutlass.Float32,
         aux_data: AuxData = AuxData(),
         mask_fn: Optional[Callable] = None,
+        dropout_fn: Optional[Callable] = None,
     ):
         def load_Q_next():
             m_block_next = m_block + (self.num_stages_Q - 1 if cutlass.const_expr(self.num_stages_Q > 1) else 1)
@@ -941,6 +960,12 @@ class FlashAttentionBackwardSm80:
         assert cute.size(acc_S_mn, mode=[0]) == cute.size(tLSErLSE)
         for r in cutlass.range(cute.size(acc_S_mn, mode=[0]), unroll_full=True):
             acc_S_mn[r, None].store(cute.math.exp2(acc_S_mn[r, None].load() * softmax_scale_log2 - tLSErLSE[r], fastmath=True))
+        # Dropout: regenerate the IDENTICAL keep-mask used in the forward pass and
+        # apply it to the recomputed P (zero dropped positions, scale kept by 1/(1-p)).
+        # Zeroing P here automatically zeroes the dV and dS contributions of dropped
+        # entries, matching the forward where those entries did not contribute to O.
+        if cutlass.const_expr(self.dropout_p > 0.0):
+            dropout_fn(acc_S, m_block=m_block)
         # if cute.arch.thread_idx()[0] == 0 and cute.arch.block_idx()[0] == bidx: cute.print_tensor(acc_S_mn)
 
         # MMA dP
@@ -1054,6 +1079,41 @@ class FlashAttentionBackwardSm80:
         if cutlass.const_expr(self.num_stages_Q == 1):
             cute.arch.barrier()
             dQ_mma(load_Q_next)
+
+    @cute.jit
+    def apply_dropout(
+        self,
+        acc_S: cute.Tensor,
+        thr_mma_SdP: cute.ThrMma,
+        batch_idx,
+        head_idx,
+        m_block,
+        n_block,
+        seqlen_info: SeqlenInfoQK,
+    ):
+        """Regenerate the forward dropout keep-mask on the recomputed P and apply it.
+
+        Must produce the IDENTICAL mask as the forward pass: keyed by global
+        (batch, head, q_idx, kv_idx). The bwd S tile is (n, m) transposed when
+        SdP_swapAB, so the identity tensor coords are swapped accordingly and we
+        pass q_idx/kv_idx in the correct order to the shared applicator.
+        """
+        acc_shape = (self.m_block_size, self.n_block_size)
+        cS = cute.make_identity_tensor(acc_shape if not self.SdP_swapAB else acc_shape[::-1])
+        offset = (m_block * self.m_block_size, n_block * self.n_block_size)
+        cS = cute.domain_offset(offset if not self.SdP_swapAB else offset[::-1], cS)
+        tScS = thr_mma_SdP.partition_C(cS)
+        p_keep = cutlass.Float32(1.0 - self.dropout_p)
+        scale = cutlass.Float32(1.0 / (1.0 - self.dropout_p))
+        philox.apply_dropout(
+            acc_S, tScS,
+            self._dropout_seed, self._dropout_offset,
+            p_keep, scale,
+            batch_idx, head_idx,
+            num_heads=1,
+            seqlen_k=seqlen_info.seqlen_k,
+            transpose_indices=self.SdP_swapAB,
+        )
 
     @cute.jit
     def epilogue(
