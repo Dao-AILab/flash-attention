@@ -81,6 +81,96 @@ def get_curr_blocksparse_tensors(
     return _get_curr_blocksparse_tensors(batch_idx, head_idx, m_block, blocksparse_tensors)
 
 
+@cute.jit
+def run_block_sparse_mainloop_sm80(
+    blocksparse_tensors: BlockSparseTensors,
+    batch_idx: cutlass.Int32,
+    head_idx: cutlass.Int32,
+    m_block: cutlass.Int32,
+    seqlen_info: SeqlenInfoQK,
+    mma_one_n_block: Callable,
+    mask_fn: Callable,
+    mask_mod: cutlass.Constexpr,
+    fastdiv_mods=None,
+):
+    """Block-sparse mainloop for the SM80/SM120 (non-warp-specialized) forward kernel.
+
+    Mask blocks are processed first (applying ``mask_mod`` + seqlen masking), then full
+    blocks (seqlen masking only, no ``mask_mod``). Blocks are visited in descending
+    ``n_block`` order to match the dense mainloop. The first full block always receives
+    seqlen masking even when mask blocks preceded it, since a full block may sit at the
+    highest ``n`` position (the seqlen_kv boundary) regardless of mask-block positions.
+
+    This mirrors the masking contract of ``consume_block_sparse_loads`` (SM90/SM100) but
+    drives the non-warp-specialized ``mma_one_n_block`` (one load+compute per block); the
+    cp.async pipeline has no producer warp to run the warp-specialized produce/consume
+    helpers, and sparse blocks are not contiguous so cross-block prefetch does not apply.
+
+    Args:
+        mma_one_n_block: callable ``(n_block, mask_fn, is_first_n_block) -> None`` that
+            loads K/V for ``n_block`` and runs QK GEMM, mask, softmax, and PV GEMM.
+        mask_fn: ``mask.apply_mask`` partial with batch/head/m_block/thr_mma bound.
+        mask_mod: the user ``mask_mod`` constexpr (``None`` -> no mask_mod application).
+        fastdiv_mods: fast-division helpers, used only when ``mask_mod is not None``.
+    """
+    (
+        curr_mask_block_cnt,
+        curr_mask_block_idx,
+        curr_full_block_cnt,
+        curr_full_block_idx,
+    ) = get_curr_blocksparse_tensors(
+        batch_idx, head_idx, m_block, blocksparse_tensors, seqlen_info
+    )
+
+    # Mask blocks: first gets is_first=True + seqlen masking; the rest do not.
+    if curr_mask_block_cnt > 0:
+        n_block = curr_mask_block_idx[curr_mask_block_cnt - 1]
+        mma_one_n_block(
+            n_block=n_block,
+            mask_fn=partial(
+                mask_fn,
+                mask_mod=mask_mod,
+                mask_seqlen=True,
+                fastdiv_mods=fastdiv_mods if const_expr(mask_mod is not None) else None,
+            ),
+            is_first_n_block=True,
+        )
+        for i in cutlass.range(1, curr_mask_block_cnt):
+            n_block = curr_mask_block_idx[curr_mask_block_cnt - 1 - i]
+            mma_one_n_block(
+                n_block=n_block,
+                mask_fn=partial(mask_fn, mask_mod=mask_mod, mask_seqlen=False),
+                is_first_n_block=False,
+            )
+
+    # Full blocks: no mask_mod. The first full block always gets seqlen masking; whether
+    # it is the very first block overall (is_first) depends on there being no mask blocks.
+    if const_expr(curr_full_block_idx is not None):
+        if curr_full_block_cnt > 0:
+            n_block = curr_full_block_idx[curr_full_block_cnt - 1]
+            # is_first_n_block is a compile-time flag, so branch on the runtime
+            # "any mask blocks?" predicate and pass a literal in each arm.
+            if curr_mask_block_cnt == 0:
+                mma_one_n_block(
+                    n_block=n_block,
+                    mask_fn=partial(mask_fn, mask_mod=None, mask_seqlen=True),
+                    is_first_n_block=True,
+                )
+            else:
+                mma_one_n_block(
+                    n_block=n_block,
+                    mask_fn=partial(mask_fn, mask_mod=None, mask_seqlen=True),
+                    is_first_n_block=False,
+                )
+            for j in cutlass.range(1, curr_full_block_cnt):
+                n_block = curr_full_block_idx[curr_full_block_cnt - 1 - j]
+                mma_one_n_block(
+                    n_block=n_block,
+                    mask_fn=partial(mask_fn, mask_mod=None, mask_seqlen=False),
+                    is_first_n_block=False,
+                )
+
+
 # NOTE [SM100 block-sparse empty tiles: mbarrier contract]
 #
 # For block-sparse SM100 forward, a given (m_block, stage) Q tile can have zero active
