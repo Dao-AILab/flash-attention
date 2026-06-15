@@ -2730,6 +2730,40 @@ def _flash_attn_bwd(
             dKV_swapAB = bool(int(_cfg.get("swapdkv", dKV_swapAB)))
             dQ_swapAB = bool(int(_cfg.get("swapdq", dQ_swapAB)))
             V_in_regs = bool(int(_cfg.get("vregs", V_in_regs)))
+
+        # Pre-launch shared-memory guard. The SM120 backward shares the SM80
+        # kernel body, whose tile footprint (sQ + sdO + sK + sV + sP + sdS +
+        # sLSE/sdPsum) overflows the ~99 KB sm_120/sm_121 SMEM cap for some
+        # head dims — most notably equal-dims head_dim == head_dim_v == 192,
+        # which needs ~115 KB and otherwise fails at launch with an opaque
+        # cudaErrorInvalidValue. head_dim == head_dim_v == 256 fits because it
+        # uses the Q/dO + K/V smem-reuse path. Raise a clear error here instead.
+        # (head_dim=192 with head_dim_v=128 is supported and stays well under
+        # the cap.) Mirrors FlashAttentionBackwardSm80._get_shared_storage_cls.
+        _hd_pad = (head_dim + 31) // 32 * 32
+        _hdv_pad = (head_dim_v + 31) // 32 * 32
+        _reuse_qk_dov = (
+            _hd_pad == 256 and _hdv_pad == 256 and num_stages_Q == 1 and num_stages_dO == 1
+        )
+        if not _reuse_qk_dov:
+            _smem_bwd = (
+                m_block_size * _hd_pad * num_stages_Q * 2      # sQ
+                + m_block_size * _hdv_pad * num_stages_dO * 2  # sdO
+                + n_block_size * _hd_pad * 2                   # sK
+                + n_block_size * _hdv_pad * 2                  # sV
+                + 2 * (m_block_size * n_block_size * 2)        # sP + sdS
+                + 2 * (((m_block_size + 63) // 64 * 64) * num_stages_Q * 4)  # sLSE + sdPsum
+            )
+            _SM120_SMEM_CAP = 99 * 1024  # sm_120 / sm_121a opt-in SMEM cap (101376 B)
+            if _smem_bwd > _SM120_SMEM_CAP:
+                raise NotImplementedError(
+                    f"SM120 backward is not supported for head_dim={head_dim}, "
+                    f"head_dim_v={head_dim_v}: the {m_block_size}x{n_block_size} tile needs "
+                    f"~{_smem_bwd} B of shared memory, exceeding the {_SM120_SMEM_CAP} B "
+                    f"sm_120/sm_121 cap. Equal-dims head_dim=head_dim_v=192 is a known "
+                    f"limitation; use head_dim=192 with head_dim_v=128 (supported), or a "
+                    f"head_dim<=160 / 256 configuration."
+                )
     elif arch // 10 == 9:
         cfg = _tile_size_bwd_sm90(
             head_dim,
