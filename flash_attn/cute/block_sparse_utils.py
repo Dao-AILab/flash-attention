@@ -131,6 +131,34 @@ def get_curr_blocksparse_tensors(
 
 
 @cute.jit
+def sparse_physical_n_block_forward(
+    block_indices: cute.Tensor,
+    offset,
+    kv_subtile_factor: cutlass.Constexpr[int],
+):
+    """Map forward physical N offsets to physical N tile indices."""
+    sparse_offset = offset // kv_subtile_factor
+    subtile_offset = offset - sparse_offset * kv_subtile_factor
+    coarse_block = block_indices[sparse_offset]
+    return coarse_block * kv_subtile_factor + subtile_offset
+
+
+@cute.jit
+def sparse_physical_n_block(
+    block_indices: cute.Tensor,
+    block_count,
+    offset,
+    kv_subtile_factor: cutlass.Constexpr[int],
+):
+    """Map reverse block-list offsets to physical N tile indices."""
+    return sparse_physical_n_block_forward(
+        block_indices,
+        block_count * kv_subtile_factor - 1 - offset,
+        kv_subtile_factor,
+    )
+
+
+@cute.jit
 def load_block_list(
     block_indices: cute.Tensor,
     block_count,
@@ -141,6 +169,7 @@ def load_block_list(
     pipeline_k,
     pipeline_v,
     intra_wg_overlap: cutlass.Constexpr,
+    kv_subtile_factor: cutlass.Constexpr[int] = 1,
 ):
     """Iterate over the sparse blocks and load K, V into the pipeline.
     For the intra_wg_overlap case, we overlap the loads of K and V. And this
@@ -159,22 +188,30 @@ def load_block_list(
     """
     if block_count > 0:
         if const_expr(not intra_wg_overlap):
-            for offset in cutlass.range(block_count):
-                n_block = block_indices[block_count - 1 - offset]
+            for offset in cutlass.range(block_count * kv_subtile_factor):
+                n_block = sparse_physical_n_block(
+                    block_indices, block_count, offset, kv_subtile_factor
+                )
                 pipeline_k.producer_acquire(kv_producer_state)
                 load_K(src_idx=n_block, producer_state=kv_producer_state)
                 pipeline_v.producer_acquire(kv_producer_state)
                 load_V(src_idx=n_block, producer_state=kv_producer_state)
                 kv_producer_state.advance()
         else:
-            n_block_first = block_indices[block_count - 1]
+            n_block_first = sparse_physical_n_block(
+                block_indices, block_count, Int32(0), kv_subtile_factor
+            )
             if const_expr(not first_block_preloaded):
                 pipeline_k.producer_acquire(kv_producer_state)
                 load_K(src_idx=n_block_first, producer_state=kv_producer_state)
 
-            for idx in cutlass.range(block_count - 1, unroll=1):
-                n_block_prev = block_indices[block_count - 1 - idx]
-                n_block = block_indices[block_count - 2 - idx]
+            for idx in cutlass.range(block_count * kv_subtile_factor - 1, unroll=1):
+                n_block_prev = sparse_physical_n_block(
+                    block_indices, block_count, idx, kv_subtile_factor
+                )
+                n_block = sparse_physical_n_block(
+                    block_indices, block_count, idx + 1, kv_subtile_factor
+                )
                 kv_producer_state_prev = kv_producer_state.clone()
                 kv_producer_state.advance()
                 pipeline_k.producer_acquire(kv_producer_state)
@@ -192,10 +229,11 @@ def finish_overlap_v_load(
     load_V,
     pipeline_v,
     kv_producer_state,
+    kv_subtile_factor: cutlass.Constexpr[int] = 1,
 ):
     """Load the final V block after overlapped K/V loads."""
     if block_count > 0:
-        n_block_last = block_indices[0]
+        n_block_last = block_indices[0] * kv_subtile_factor
         pipeline_v.producer_acquire(kv_producer_state)
         load_V(src_idx=n_block_last, producer_state=kv_producer_state)
         kv_producer_state.advance()
@@ -233,6 +271,7 @@ def produce_block_sparse_loads(
     intra_wg_overlap: cutlass.Constexpr,
     qhead_per_kvhead: cutlass.Constexpr[int] = 1,
     q_subtile_factor: cutlass.Constexpr[int] = 1,
+    kv_subtile_factor: cutlass.Constexpr[int] = 1,
 ):
     """Iterate over the mask and full block lists for a single tile.
 
@@ -280,6 +319,7 @@ def produce_block_sparse_loads(
             pipeline_k=pipeline_k,
             pipeline_v=pipeline_v,
             intra_wg_overlap=intra_wg_overlap,
+            kv_subtile_factor=kv_subtile_factor,
         )
 
         if const_expr(intra_wg_overlap) and curr_full_block_cnt > 0:
@@ -289,6 +329,7 @@ def produce_block_sparse_loads(
                 load_V,
                 pipeline_v,
                 kv_producer_state,
+                kv_subtile_factor=kv_subtile_factor,
             )
     else:
         # Masked blocks present. When overlap is disabled this fully drains the list.
@@ -302,6 +343,7 @@ def produce_block_sparse_loads(
             pipeline_k=pipeline_k,
             pipeline_v=pipeline_v,
             intra_wg_overlap=intra_wg_overlap,
+            kv_subtile_factor=kv_subtile_factor,
         )
 
         if full_empty:
@@ -312,13 +354,19 @@ def produce_block_sparse_loads(
                     load_V,
                     pipeline_v,
                     kv_producer_state,
+                    kv_subtile_factor=kv_subtile_factor,
                 )
         else:
             if const_expr(intra_wg_overlap):
                 # Bridge the masked list to the full list by overlapping the pending masked V
                 # with the first full K load.
-                n_block_mask_last = curr_mask_block_idx[0]
-                n_block_full_first = curr_full_block_idx[curr_full_block_cnt - 1]
+                n_block_mask_last = curr_mask_block_idx[0] * kv_subtile_factor
+                n_block_full_first = sparse_physical_n_block(
+                    curr_full_block_idx,
+                    curr_full_block_cnt,
+                    Int32(0),
+                    kv_subtile_factor,
+                )
                 kv_producer_state_prev = kv_producer_state.clone()
                 kv_producer_state.advance()
                 pipeline_k.producer_acquire(kv_producer_state)
@@ -336,6 +384,7 @@ def produce_block_sparse_loads(
                     pipeline_k=pipeline_k,
                     pipeline_v=pipeline_v,
                     intra_wg_overlap=intra_wg_overlap,
+                    kv_subtile_factor=kv_subtile_factor,
                 )
 
                 kv_producer_state = finish_overlap_v_load(
@@ -344,6 +393,7 @@ def produce_block_sparse_loads(
                     load_V,
                     pipeline_v,
                     kv_producer_state,
+                    kv_subtile_factor=kv_subtile_factor,
                 )
             else:
                 # Non-overlap path with both lists: run the full list normally.
@@ -357,6 +407,7 @@ def produce_block_sparse_loads(
                     pipeline_k=pipeline_k,
                     pipeline_v=pipeline_v,
                     intra_wg_overlap=intra_wg_overlap,
+                    kv_subtile_factor=kv_subtile_factor,
                 )
 
     return kv_producer_state
@@ -572,12 +623,17 @@ def load_block_list_sm100(
     load_K,
     load_V,
     pipeline_kv,
+    kv_subtile_factor: cutlass.Constexpr[int] = 1,
 ):
-    """SM100 version of load_block_list (no intra_wg_overlap, no extra_tx_count)."""
-    block_count = block_end - block_begin
-    if block_count > 0:
+    """SM100 sparse load loop over physical N tiles from coarse metadata."""
+    physical_block_count = block_end - block_begin
+    if physical_block_count > 0:
         # First iteration: load Q alongside K if requested
-        n_block_first = block_indices[block_end - 1]
+        n_block_first = sparse_physical_n_block_forward(
+            block_indices,
+            block_end - 1,
+            kv_subtile_factor,
+        )
 
         if const_expr(load_q_with_first):
             # SM100 loads Q0 and optionally Q1
@@ -593,8 +649,12 @@ def load_block_list_sm100(
         kv_producer_state.advance()
 
         # Remaining blocks
-        for offset in cutlass.range(1, block_count):
-            n_block = block_indices[block_end - 1 - offset]
+        for offset in cutlass.range(1, physical_block_count):
+            n_block = sparse_physical_n_block_forward(
+                block_indices,
+                block_end - 1 - offset,
+                kv_subtile_factor,
+            )
             load_K(block=n_block, producer_state=kv_producer_state, page_idx=None)
             kv_producer_state.advance()
             load_V(block=n_block, producer_state=kv_producer_state, page_idx=None)
@@ -622,6 +682,7 @@ def produce_block_sparse_loads_sm100(
     q_producer_phase: Int32,
     qhead_per_kvhead: cutlass.Constexpr,
     q_subtile_factor: cutlass.Constexpr,
+    kv_subtile_factor: cutlass.Constexpr[int] = 1,
 ):
     """SM100 entry point for sparse block iteration.
 
@@ -647,8 +708,16 @@ def produce_block_sparse_loads_sm100(
         seqlen_info,
     )
 
-    mask_begin, mask_end = split_block_range(curr_mask_block_cnt, split_idx, num_splits)
-    full_begin, full_end = split_block_range(curr_full_block_cnt, split_idx, num_splits)
+    mask_begin, mask_end = split_block_range(
+        curr_mask_block_cnt * kv_subtile_factor,
+        split_idx,
+        num_splits,
+    )
+    full_begin, full_end = split_block_range(
+        curr_full_block_cnt * kv_subtile_factor,
+        split_idx,
+        num_splits,
+    )
     mask_empty = mask_begin == mask_end
     full_empty = full_begin == full_end
 
@@ -667,6 +736,7 @@ def produce_block_sparse_loads_sm100(
             load_K=load_K,
             load_V=load_V,
             pipeline_kv=pipeline_kv,
+            kv_subtile_factor=kv_subtile_factor,
         )
         q_phase_flipped = not full_empty
     else:
@@ -682,6 +752,7 @@ def produce_block_sparse_loads_sm100(
             load_K=load_K,
             load_V=load_V,
             pipeline_kv=pipeline_kv,
+            kv_subtile_factor=kv_subtile_factor,
         )
         q_phase_flipped = True
 
@@ -698,6 +769,7 @@ def produce_block_sparse_loads_sm100(
                 load_K=load_K,
                 load_V=load_V,
                 pipeline_kv=pipeline_kv,
+                kv_subtile_factor=kv_subtile_factor,
             )
 
     if q_phase_flipped:
@@ -717,6 +789,7 @@ def get_total_block_count(
     qhead_per_kvhead: cutlass.Constexpr,
     q_subtile_factor: cutlass.Constexpr,
     seqlen_info: SeqlenInfoQK,
+    kv_subtile_factor: cutlass.Constexpr[int] = 1,
 ):
     m_block_sparse = sparse_tensor_m_block(m_block, qhead_per_kvhead, q_subtile_factor)
     (
@@ -732,8 +805,16 @@ def get_total_block_count(
         seqlen_info,
     )
 
-    mask_begin, mask_end = split_block_range(curr_mask_block_cnt, split_idx, num_splits)
-    full_begin, full_end = split_block_range(curr_full_block_cnt, split_idx, num_splits)
+    mask_begin, mask_end = split_block_range(
+        curr_mask_block_cnt * kv_subtile_factor,
+        split_idx,
+        num_splits,
+    )
+    full_begin, full_end = split_block_range(
+        curr_full_block_cnt * kv_subtile_factor,
+        split_idx,
+        num_splits,
+    )
     return mask_end - mask_begin + full_end - full_begin
 
 
@@ -877,6 +958,7 @@ def softmax_block_sparse_sm100(
     check_m_boundary: bool,
     qhead_per_kvhead: cutlass.Constexpr,
     q_subtile_factor: cutlass.Constexpr[int] = 1,
+    kv_subtile_factor: cutlass.Constexpr[int] = 1,
 ):
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
     m_block_sparse = sparse_tensor_m_block(m_block, qhead_per_kvhead, q_subtile_factor)
@@ -894,8 +976,16 @@ def softmax_block_sparse_sm100(
         seqlen_info,
     )
 
-    mask_begin, mask_end = split_block_range(curr_mask_block_cnt, split_idx, num_splits)
-    full_begin, full_end = split_block_range(curr_full_block_cnt, split_idx, num_splits)
+    mask_begin, mask_end = split_block_range(
+        curr_mask_block_cnt * kv_subtile_factor,
+        split_idx,
+        num_splits,
+    )
+    full_begin, full_end = split_block_range(
+        curr_full_block_cnt * kv_subtile_factor,
+        split_idx,
+        num_splits,
+    )
     split_mask_block_cnt = mask_end - mask_begin
     split_full_block_cnt = full_end - full_begin
     total_block_cnt = split_mask_block_cnt + split_full_block_cnt
@@ -904,7 +994,11 @@ def softmax_block_sparse_sm100(
         sm_stats_barrier.arrive_w_index(index=stage_idx * 4 + warp_idx)
     else:
         if split_mask_block_cnt > 0:
-            mask_n_block = curr_mask_block_idx[mask_end - 1]
+            mask_n_block = sparse_physical_n_block_forward(
+                curr_mask_block_idx,
+                mask_end - 1,
+                kv_subtile_factor,
+            )
             (
                 mma_si_consumer_phase,
                 si_corr_producer_phase,
@@ -918,7 +1012,11 @@ def softmax_block_sparse_sm100(
                 mask_fn=partial(mask_fn, mask_seqlen=True, check_q_boundary=check_m_boundary),
             )
             for i in cutlass.range(1, split_mask_block_cnt):
-                mask_n_block = curr_mask_block_idx[mask_end - 1 - i]
+                mask_n_block = sparse_physical_n_block_forward(
+                    curr_mask_block_idx,
+                    mask_end - 1 - i,
+                    kv_subtile_factor,
+                )
                 (
                     mma_si_consumer_phase,
                     si_corr_producer_phase,
@@ -932,7 +1030,11 @@ def softmax_block_sparse_sm100(
                 )
 
         if split_full_block_cnt > 0:
-            full_n_block = curr_full_block_idx[full_end - 1]
+            full_n_block = sparse_physical_n_block_forward(
+                curr_full_block_idx,
+                full_end - 1,
+                kv_subtile_factor,
+            )
             if split_mask_block_cnt == 0:
                 (
                     mma_si_consumer_phase,
@@ -964,7 +1066,11 @@ def softmax_block_sparse_sm100(
                     ),
                 )
             for i in cutlass.range(1, split_full_block_cnt):
-                full_n_block = curr_full_block_idx[full_end - 1 - i]
+                full_n_block = sparse_physical_n_block_forward(
+                    curr_full_block_idx,
+                    full_end - 1 - i,
+                    kv_subtile_factor,
+                )
                 (
                     mma_si_consumer_phase,
                     si_corr_producer_phase,

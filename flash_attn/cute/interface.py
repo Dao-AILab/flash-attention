@@ -234,6 +234,17 @@ def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q
 
 
 
+def _block_sparse_bwd_supports_2cta(
+    block_sparse_tensors: BlockSparseTensorsTorch | None,
+    n_block_size: int,
+) -> bool:
+    """Return whether backward block-sparse metadata matches SM100 2CTA KV grouping."""
+    return block_sparse_tensors is None or (
+        block_sparse_tensors.block_size is not None
+        and block_sparse_tensors.block_size[1] == 2 * n_block_size
+    )
+
+
 def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
@@ -638,11 +649,13 @@ def _flash_attn_fwd(
     block_sparse_broadcast_pattern = None
     normalized_block_sparse_tensors = None
     q_subtile_factor = None
+    kv_subtile_factor = 1
     if block_sparse_tensors is not None:
         (
             normalized_block_sparse_tensors,
             block_sparse_broadcast_pattern,
             q_subtile_factor,
+            kv_subtile_factor,
         ) = normalize_block_sparse_config(
             block_sparse_tensors,
             batch_size=batch_size,
@@ -651,6 +664,7 @@ def _flash_attn_fwd(
             seqlen_k=seqlen_k,
             block_size=(tile_m, tile_n),
             q_stage=q_stage,
+            allow_kv_subtile=arch // 10 in [10, 11],
         )
     if aux_tensors is not None:
         aux_tensor_metadata = get_aux_tensor_metadata(aux_tensors)
@@ -739,6 +753,7 @@ def _flash_attn_fwd(
         page_size not in [None, tile_n],  # paged KV non-TMA
         use_2cta_instrs,
         q_subtile_factor,
+        kv_subtile_factor,
         mma_pv_is_rs,
         intra_wg_overlap,
         use_clc_scheduler,
@@ -939,6 +954,7 @@ def _flash_attn_fwd(
                     paged_kv_non_tma=page_size not in [None, tile_n],
                     is_varlen_q=cu_seqlens_q is not None or seqused_q is not None,
                     q_subtile_factor=q_subtile_factor,
+                    kv_subtile_factor=kv_subtile_factor,
                     use_2cta_instrs=use_2cta_instrs,
                     use_clc_scheduler=use_clc_scheduler,
                 )
@@ -1366,12 +1382,12 @@ def _flash_attn_bwd(
         AtomLayoutMdQ = 1
         AtomLayoutNdKV = 1
         requested_disable_2cta = utils._get_disable_2cta_default()
-        disable_2cta = (
-            requested_disable_2cta
-            or block_sparse_tensors is not None
+        disable_2cta = requested_disable_2cta or not _block_sparse_bwd_supports_2cta(
+            block_sparse_tensors,
+            n_block_size,
         )
-        cluster_size = 2 if head_dim >= 128 and not disable_2cta else 1
-        use_2cta_instrs = cluster_size==2
+        use_2cta_instrs = head_dim >= 128 and not disable_2cta
+        cluster_size = 2 if use_2cta_instrs else 1
 
     use_dedicated_hd256_kernel = arch // 10 in [10, 11] and head_dim == 256 and head_dim_v == 256
     use_2cta_instrs = use_2cta_instrs or use_dedicated_hd256_kernel
@@ -1599,11 +1615,11 @@ def _flash_attn_bwd(
     aux_scalar_metadata = tuple(type(s) for s in aux_scalars) if aux_scalars is not None else None
     cute_aux_tensors = None
     if aux_tensors is not None:
-        cute_aux_tensors = [to_cute_tensor(buf, assumed_align=None, fully_dynamic=True) for buf in aux_tensors]
+        cute_aux_tensors = [to_cute_aux_tensor(buf) for buf in aux_tensors]
 
     block_sparse_broadcast_pattern = None
     normalized_block_sparse_tensors = None
-    if block_sparse_tensors is not None:
+    if use_block_sparsity:
         (
             normalized_block_sparse_tensors,
             block_sparse_broadcast_pattern,
@@ -1615,6 +1631,7 @@ def _flash_attn_bwd(
             seqlen_k=seqlen_k,
             block_size=(m_block_size, n_block_size),
             subtile_factor=subtile_factor,
+            kv_subtile_factor=cluster_size if use_2cta_instrs else 1,
         )
         if deterministic:
             if normalized_block_sparse_tensors.dq_write_order is None:
