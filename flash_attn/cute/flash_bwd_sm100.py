@@ -66,7 +66,7 @@ class FlashAttentionBackwardSm100:
         score_mod_bwd: cutlass.Constexpr | None = None,
         mask_mod: cutlass.Constexpr | None = None,
         has_aux_tensors: cutlass.Constexpr = False,
-        subtile_factor: cutlass.Constexpr[int] = 1,
+        q_subtile_factor: cutlass.Constexpr[int] = 1,
     ):
         # padding head_dim to a multiple of 16 as k_block_size
         hdim_multiple_of = 16
@@ -119,7 +119,7 @@ class FlashAttentionBackwardSm100:
         self.score_mod_bwd = score_mod_bwd
         self.mask_mod = mask_mod
         self.has_aux_tensors = has_aux_tensors
-        self.subtile_factor = subtile_factor
+        self.q_subtile_factor = q_subtile_factor
         # For score_mod, use vec_size=1 (like forward) to handle per-element indices
         if cutlass.const_expr(has_aux_tensors):
             self.vec_size: cutlass.Constexpr = 1
@@ -1910,7 +1910,7 @@ class FlashAttentionBackwardSm100:
                     batch_idx,
                     head_idx,
                     n_block,
-                    subtile_factor=self.subtile_factor,
+                    q_subtile_factor=self.q_subtile_factor,
                     m_block_max=m_block_max,
                 )
                 process_tile = total_m_block_cnt > Int32(0)
@@ -1947,7 +1947,7 @@ class FlashAttentionBackwardSm100:
                             self.tma_copy_bytes["V"],
                             should_load_Q=should_load_Q,
                             should_load_dO=should_load_dO,
-                            subtile_factor=self.subtile_factor,
+                            q_subtile_factor=self.q_subtile_factor,
                             m_block_max=m_block_max,
                         )
                     )
@@ -2366,7 +2366,7 @@ class FlashAttentionBackwardSm100:
                     batch_idx,
                     head_idx,
                     n_block,
-                    subtile_factor=self.subtile_factor,
+                    q_subtile_factor=self.q_subtile_factor,
                     m_block_max=m_block_max,
                 )
                 process_tile = block_iter_count > Int32(0)
@@ -3019,7 +3019,7 @@ class FlashAttentionBackwardSm100:
                     batch_idx,
                     head_idx,
                     n_block,
-                    subtile_factor=self.subtile_factor,
+                    q_subtile_factor=self.q_subtile_factor,
                     m_block_max=m_block_max,
                 )
                 process_tile = loop_count > Int32(0)
@@ -3038,7 +3038,7 @@ class FlashAttentionBackwardSm100:
                         curr_q_idx,
                         curr_full_cnt,
                         curr_full_idx,
-                        subtile_factor=self.subtile_factor,
+                        q_subtile_factor=self.q_subtile_factor,
                         m_block_max=m_block_max,
                     )
                     m_block_oob = m_block >= m_block_max
@@ -3445,7 +3445,7 @@ class FlashAttentionBackwardSm100:
         if const_expr(self.use_block_sparsity):
             assert blocksparse_tensors is not None
             if const_expr(blocksparse_tensors.dq_write_order is not None):
-                sparse_iter = iter_idx // self.subtile_factor
+                sparse_iter = iter_idx // self.q_subtile_factor
                 if sparse_iter < curr_q_cnt:
                     assert curr_dq_write_order is not None
                     lock_value = curr_dq_write_order[sparse_iter]
@@ -3554,7 +3554,7 @@ class FlashAttentionBackwardSm100:
                     batch_idx,
                     head_idx,
                     n_block,
-                    subtile_factor=self.subtile_factor,
+                    q_subtile_factor=self.q_subtile_factor,
                     m_block_max=m_block_max,
                 )
                 process_tile = loop_count > Int32(0)
@@ -3584,7 +3584,7 @@ class FlashAttentionBackwardSm100:
                         curr_q_idx,
                         curr_full_cnt,
                         curr_full_idx,
-                        subtile_factor=self.subtile_factor,
+                        q_subtile_factor=self.q_subtile_factor,
                         m_block_max=m_block_max,
                     )
                     m_block_oob_upper = m_block >= m_block_max
