@@ -94,6 +94,11 @@ _TUNING_CONFIG = {
 }
 _FP8_TUNING_CONFIG = {
     (True, False, 128, False): {'ex2_emu_freq': 10, 'ex2_emu_start_frg': 1, 'num_regs_softmax': 160, 'num_regs_correction': 72},
+    # Causal hd128 FP8 previously inherited bf16's freq=16. FP8 fwd is MUFU/ex2-bound, so a more
+    # aggressive emulation freq=8 offloads more exp from MUFU: +3.4%(4k)..+5.5%(16k) on B200,
+    # MHA & GQA, accuracy-neutral (3-run validated, locked clocks). freq=8 would regress non-causal
+    # (0.94x), hence keyed on is_causal=True only.
+    (False, True, 128, False): {'ex2_emu_freq': 8, 'ex2_emu_start_frg': 1},
 }
 _FP8_SMALL_HDIM_REGS = {
     False: {"num_regs_softmax": 168, "num_regs_correction": 96, "num_regs_other": 80},
