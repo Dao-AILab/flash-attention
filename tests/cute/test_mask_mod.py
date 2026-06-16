@@ -279,6 +279,15 @@ def _run_mask_test(
 ):
     torch.manual_seed(42)
 
+    # SM 12.0 does not support block-sparse in the backward kernel. The
+    # use_autograd path builds the autograd graph eagerly via flash_attn_func
+    # with block_sparse_tensors_bwd, which normalizes the (unsupported) backward
+    # block-sparse config at forward time and raises before the forward result is
+    # even returned. The non-autograd block-sparse forward is supported and keeps
+    # running (its backward is skipped separately below).
+    if COMPUTE_CAPABILITY == 12 and use_autograd and use_block_sparsity:
+        pytest.skip("SM 12.0 block-sparse backward (autograd path) not supported")
+
     if mask_name == "sliding_window":
         assert window_size is not None, (
             "window_size must be specified for sliding_window"
@@ -517,6 +526,13 @@ def _run_mask_test(
         print(f"  DEBUG: Reference value: {out_ref_fp32[max_diff_coords]:.6f}")
 
     assert_fwd_matches_reference(out_cute, out_ref_fp32, out_pt, mask_desc)
+
+    # SM 12.0 does not support mask_mod / block-sparse in the backward kernel
+    # (interface.py asserts "mask_mod backward not supported on SM 12.0" /
+    # "Block sparsity backward not supported on SM 12.0"). The forward path above
+    # is supported and has just been validated; skip the unsupported backward.
+    if needs_backward and COMPUTE_CAPABILITY == 12:
+        pytest.skip("mask_mod / block-sparse backward not supported on SM 12.0")
 
     if needs_backward:
         q = tensors["q"]
@@ -1628,6 +1644,8 @@ def test_gqa_block_sparse_broadcast_pattern_recompilation():
     mark_layout_dynamic() keeps stride=0 as static, so different broadcast
     patterns require different compiled kernels.
     """
+    if COMPUTE_CAPABILITY == 12:
+        pytest.skip("block-sparse backward not supported on SM 12.0")
     torch.manual_seed(42)
 
     batch_size = 2
@@ -2542,6 +2560,15 @@ def test_compact_block_sparse_indices():
     test verifies that truncated (compact) index tensors produce identical output
     to full-sized ones.
     """
+    # This test builds block-sparse tensors with block_size[1]=tile_n=128 but does
+    # not pass an explicit tile_mn, so the SM 12.0 block-sparse forward picks its
+    # default n_block_size=64 config and raises ValueError "Block sparsity requires
+    # sparse_block_size[1]=64 to match tile_n." (block_sparsity.py).
+    if COMPUTE_CAPABILITY == 12:
+        pytest.skip(
+            "SM 12.0 block-sparse forward defaults to n_block_size=64; "
+            "sparse_block_size[1]=128 does not match tile_n"
+        )
     torch.manual_seed(42)
     batch_size = 1
     nheads = 4
@@ -2638,6 +2665,11 @@ def test_flash_attn_fwd_mask_mod_aux_scalars_matches_flex(limit):
 
 
 def test_flash_attn_bwd_mask_mod_aux_scalars_produces_grads():
+    # SM 12.0 does not support mask_mod in the backward kernel (interface.py
+    # asserts "mask_mod backward not supported on SM 12.0"). The forward
+    # aux-scalars path is validated separately above; skip the unsupported bwd.
+    if COMPUTE_CAPABILITY == 12:
+        pytest.skip("mask_mod backward not supported on SM 12.0")
     torch.manual_seed(1)
     q, k, v = [
         x.requires_grad_()
