@@ -129,6 +129,7 @@ class FlashAttentionForwardSm100:
         is_split_kv: bool = False,
         pack_gqa: bool = False,
         q_subtile_factor: int = 1,
+        kv_subtile_factor: int = 1,
         m_block_size: int = 128,
         n_block_size: int = 128,
         q_stage: cutlass.Constexpr[int] = 2,
@@ -192,6 +193,7 @@ class FlashAttentionForwardSm100:
         )
         self.use_correction_warps_for_epi = not self.use_tma_O
         self.q_subtile_factor = q_subtile_factor
+        self.kv_subtile_factor = kv_subtile_factor
         assert not (self.is_split_kv and self.head_dim_v_padded >= 192), (
             "SplitKV is not supported for hdim >= 192"
         )
@@ -1536,6 +1538,7 @@ class FlashAttentionForwardSm100:
                     q_producer_phase,
                     self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
                     self.q_subtile_factor,
+                    self.kv_subtile_factor,
                 )
 
 
@@ -1679,6 +1682,7 @@ class FlashAttentionForwardSm100:
                     self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
                     self.q_subtile_factor,
                     seqlen_info=seqlen,
+                    kv_subtile_factor=self.kv_subtile_factor,
                 )
                 process_tile = block_iter_count > Int32(0)
             else:
@@ -2053,6 +2057,7 @@ class FlashAttentionForwardSm100:
                     self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
                     self.q_subtile_factor,
                     seqlen_info=seqlen,
+                    kv_subtile_factor=self.kv_subtile_factor,
                 )
                 has_work = tile_block_count > Int32(0)
             else:
@@ -2124,6 +2129,7 @@ class FlashAttentionForwardSm100:
                     check_m_boundary,
                     self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
                     self.q_subtile_factor,
+                    self.kv_subtile_factor,
                 )
                 if not empty_tile:
                     sScale[tidx + stage * self.m_block_size] = softmax.row_sum[0]
@@ -2485,6 +2491,7 @@ class FlashAttentionForwardSm100:
                     self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
                     self.q_subtile_factor,
                     seqlen_info=seqlen,
+                    kv_subtile_factor=self.kv_subtile_factor,
                 )
                 has_work = total_block_count > Int32(0)
             else:
