@@ -17,7 +17,9 @@ def _tcgen05_mma_kind(op: cute.nvgpu.tcgen05.mma.MmaOp) -> str:
         return "tf32"
     if isinstance(op, tcgen05.mma.MmaI8Op):
         return "i8"
-    if isinstance(op, tcgen05.mma.MmaFP8Op):
+    # cutlass-dsl >=4.5.2 builds plain FP8 MMAs as MmaF8F6F4Op (make_trivial_tiled_mma's
+    # _F8F6F4_TYPES branch); <4.4.x returned the now-legacy MmaFP8Op. Both map to kind::f8f6f4.
+    if isinstance(op, (tcgen05.mma.MmaFP8Op, tcgen05.mma.MmaF8F6F4Op)):
         return "f8f6f4"
     if isinstance(op, tcgen05.mma.MmaMXF8Op):
         return "mxf8f6f4"
