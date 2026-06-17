@@ -128,7 +128,7 @@ class FlashAttentionForwardSm100:
         is_local: bool = False,
         is_split_kv: bool = False,
         pack_gqa: bool = False,
-        q_subtile_factor: int | None = None,
+        q_subtile_factor: int = 1,
         m_block_size: int = 128,
         n_block_size: int = 128,
         q_stage: cutlass.Constexpr[int] = 2,
@@ -1528,7 +1528,7 @@ class FlashAttentionForwardSm100:
                     self.q_stage,
                     q_producer_phase,
                     self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
-                    self.q_subtile_factor if self.q_subtile_factor is not None else 1,
+                    self.q_subtile_factor,
                 )
 
 
@@ -1670,7 +1670,7 @@ class FlashAttentionForwardSm100:
                     split_idx,
                     num_splits,
                     self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
-                    self.q_subtile_factor if self.q_subtile_factor is not None else 1,
+                    self.q_subtile_factor,
                     seqlen_info=seqlen,
                 )
                 process_tile = block_iter_count > Int32(0)
@@ -2041,7 +2041,7 @@ class FlashAttentionForwardSm100:
                     split_idx,
                     num_splits,
                     self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
-                    self.q_subtile_factor if self.q_subtile_factor is not None else 1,
+                    self.q_subtile_factor,
                     seqlen_info=seqlen,
                 )
                 has_work = tile_block_count > Int32(0)
@@ -2113,7 +2113,7 @@ class FlashAttentionForwardSm100:
                     Int32(stage),
                     check_m_boundary,
                     self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
-                    self.q_subtile_factor if self.q_subtile_factor is not None else 1,
+                    self.q_subtile_factor,
                 )
                 if not empty_tile:
                     sScale[tidx + stage * self.m_block_size] = softmax.row_sum[0]
@@ -2459,7 +2459,7 @@ class FlashAttentionForwardSm100:
                     split_idx,
                     num_splits,
                     self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
-                    self.q_subtile_factor if self.q_subtile_factor is not None else 1,
+                    self.q_subtile_factor,
                     seqlen_info=seqlen,
                 )
                 has_work = total_block_count > Int32(0)

@@ -637,7 +637,7 @@ def _flash_attn_fwd(
     # See get_broadcast_dims for why this is needed in compile key
     block_sparse_broadcast_pattern = None
     normalized_block_sparse_tensors = None
-    q_subtile_factor = None
+    q_subtile_factor = 1
     if block_sparse_tensors is not None:
         (
             normalized_block_sparse_tensors,
@@ -1399,7 +1399,7 @@ def _flash_attn_bwd(
     num_head_kv = k.shape[-2]
 
     use_block_sparsity = block_sparse_tensors is not None
-    subtile_factor = sparse_q // m_block_size if sparse_q is not None else 2
+    q_subtile_factor = sparse_q // m_block_size if sparse_q is not None else 2
     seqlen_q_rounded = (seqlen_q + m_block_size - 1) // m_block_size * m_block_size
     seqlen_k_rounded = (seqlen_k + n_block_size - 1) // n_block_size * n_block_size
     num_n_blocks = seqlen_k_rounded // n_block_size
@@ -1614,7 +1614,7 @@ def _flash_attn_bwd(
             seqlen_q=seqlen_q,
             seqlen_k=seqlen_k,
             block_size=(m_block_size, n_block_size),
-            subtile_factor=subtile_factor,
+            q_subtile_factor=q_subtile_factor,
         )
         if deterministic:
             if normalized_block_sparse_tensors.dq_write_order is None:
@@ -1792,7 +1792,7 @@ def _flash_attn_bwd(
                 score_mod_bwd=score_mod_bwd,
                 mask_mod=mask_mod,
                 has_aux_tensors=aux_tensors is not None,
-                subtile_factor=subtile_factor,
+                q_subtile_factor=q_subtile_factor,
                 dQ_single_wg=dQ_single_wg,
             )
         else:
@@ -1821,7 +1821,7 @@ def _flash_attn_bwd(
                     score_mod_bwd=score_mod_bwd,
                     mask_mod=mask_mod,
                     has_aux_tensors=aux_tensors is not None,
-                    subtile_factor=subtile_factor,
+                    q_subtile_factor=q_subtile_factor,
                     tile_m_dq=dq_tile_mn[0],
                     tile_n_dq=dq_tile_mn[1],
                     tile_m_dkdv=dkdv_tile_mn[0],
@@ -1844,7 +1844,7 @@ def _flash_attn_bwd(
                     score_mod_bwd=score_mod_bwd,
                     mask_mod=mask_mod,
                     has_aux_tensors=aux_tensors is not None,
-                    subtile_factor=subtile_factor,
+                    q_subtile_factor=q_subtile_factor,
                 )
 
         # Block sparse tensors for backward use Q-direction indexing (transposed from forward).

@@ -43,7 +43,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         is_local: bool = False,
         is_split_kv: bool = False,
         pack_gqa: bool = False,
-        q_subtile_factor: int | None = None,
+        q_subtile_factor: int = 1,
         m_block_size: int = 128,
         n_block_size: int = 128,
         q_stage: int = 2,
@@ -68,7 +68,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         )
         assert not pack_gqa, "SM100 forward with head_dim=256 does not support pack_gqa"
         assert not is_split_kv, "SM100 forward with head_dim=256 does not support SplitKV"
-        assert q_subtile_factor is None, (
+        assert q_subtile_factor == 1, (
             "SM100 forward with head_dim=256 does not support q_subtile_factor"
         )
         assert m_block_size == 128 and n_block_size == 128, (

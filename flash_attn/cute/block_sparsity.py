@@ -391,15 +391,15 @@ def get_block_sparse_expected_shapes_bwd(
     seqlen_k: int,
     m_block_size: int,
     n_block_size: int,
-    subtile_factor: int,
+    q_subtile_factor: int,
 ) -> Tuple[Tuple[int, int, int], Tuple[int, int, int, int]]:
     """Return (expected_count_shape, expected_index_shape) for backward block sparse normalization.
 
     Backward uses Q-direction indexing (transposed from forward), where shapes are
     indexed by N-blocks first, then M-blocks. The sparse_block_size_q is determined
-    by subtile_factor * m_block_size.
+    by q_subtile_factor * m_block_size.
     """
-    sparse_block_size_q = subtile_factor * m_block_size
+    sparse_block_size_q = q_subtile_factor * m_block_size
     expected_m_blocks = ceildiv(seqlen_q, sparse_block_size_q)
     expected_n_blocks = ceildiv(seqlen_k, n_block_size)
     expected_count_shape = (batch_size, num_head, expected_n_blocks)
@@ -590,17 +590,17 @@ def normalize_block_sparse_config_bwd(
     seqlen_q: int,
     seqlen_k: int,
     block_size: tuple[int, int],
-    subtile_factor: int,
+    q_subtile_factor: int,
 ) -> tuple[BlockSparseTensorsTorch, Tuple[Tuple[bool, ...], ...] | None]:
     m_block_size, n_block_size = block_size
     if tensors.block_size is None:
-        sparse_block_size_q, sparse_block_size_kv = subtile_factor * m_block_size, n_block_size
+        sparse_block_size_q, sparse_block_size_kv = q_subtile_factor * m_block_size, n_block_size
     else:
         sparse_block_size_q, sparse_block_size_kv = tensors.block_size
-    if sparse_block_size_q != subtile_factor * m_block_size:
+    if sparse_block_size_q != q_subtile_factor * m_block_size:
         raise ValueError(
-            f"Block sparsity expects sparse_block_size_q={subtile_factor * m_block_size} "
-            f"for subtile_factor={subtile_factor}."
+            f"Block sparsity expects sparse_block_size_q={q_subtile_factor * m_block_size} "
+            f"for q_subtile_factor={q_subtile_factor}."
         )
     if sparse_block_size_kv != n_block_size:
         raise ValueError(
@@ -613,7 +613,7 @@ def normalize_block_sparse_config_bwd(
         seqlen_k,
         m_block_size,
         n_block_size,
-        subtile_factor,
+        q_subtile_factor,
     )
     normalized_tensors = normalize_block_sparse_tensors(
         tensors,
@@ -623,7 +623,7 @@ def normalize_block_sparse_config_bwd(
         hint=lambda: (
             f"Backward expects Q-direction block-sparse tensors (q_mask_cnt/q_mask_idx, "
             f"and optionally full_q_cnt/full_q_idx). Regenerate the backward BlockMask with "
-            f"BLOCK_SIZE=({subtile_factor * m_block_size}, {n_block_size})."
+            f"BLOCK_SIZE=({q_subtile_factor * m_block_size}, {n_block_size})."
         ),
     )
     return normalized_tensors, get_block_sparse_broadcast_pattern(normalized_tensors)
