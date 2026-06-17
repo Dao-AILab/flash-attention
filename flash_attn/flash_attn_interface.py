@@ -2,6 +2,8 @@
 
 from typing import Optional, Sequence, Tuple, Union
 
+from packaging.version import Version
+
 import torch
 import torch.nn as nn
 import os
@@ -61,7 +63,7 @@ def round_multiple(x, m):
 # torch.compile() support is only enabled for pytorch >= 2.4
 # The reason for this is that we are using the new custom_op and register_fake
 # APIs, which support inplace modification of inputs in the function itself
-if torch.__version__ >= "2.4.0":
+if Version(torch.__version__) >= Version("2.4.0"):
     _torch_custom_op_wrapper = torch.library.custom_op
     _torch_register_fake_wrapper = torch.library.register_fake
 else:
@@ -144,7 +146,7 @@ def _flash_attn_forward_fake(
     return out, softmax_lse, p, rng_state
 
 
-if torch.__version__ >= "2.4.0":
+if Version(torch.__version__) >= Version("2.4.0"):
     _wrapped_flash_attn_forward = torch.ops.flash_attn._flash_attn_forward
 else:
     _wrapped_flash_attn_forward = _flash_attn_forward
@@ -243,7 +245,7 @@ def _flash_attn_varlen_forward_fake(
     return out, softmax_lse, p, rng_state
 
 
-if torch.__version__ >= "2.4.0":
+if Version(torch.__version__) >= Version("2.4.0"):
     _wrapped_flash_attn_varlen_forward = torch.ops.flash_attn._flash_attn_varlen_forward
 else:
     _wrapped_flash_attn_varlen_forward = _flash_attn_varlen_forward
@@ -338,7 +340,7 @@ def _flash_attn_backward_fake(
     return softmax_d
 
 
-if torch.__version__ >= "2.4.0":
+if Version(torch.__version__) >= Version("2.4.0"):
     _wrapped_flash_attn_backward = torch.ops.flash_attn._flash_attn_backward
 else:
     _wrapped_flash_attn_backward = _flash_attn_backward
@@ -452,7 +454,7 @@ def _flash_attn_varlen_backward_fake(
     return softmax_d
 
 
-if torch.__version__ >= "2.4.0":
+if Version(torch.__version__) >= Version("2.4.0"):
     _wrapped_flash_attn_varlen_backward = torch.ops.flash_attn._flash_attn_varlen_backward
 else:
     _wrapped_flash_attn_varlen_backward = _flash_attn_varlen_backward
@@ -1599,9 +1601,13 @@ def flash_attn_with_kvcache(
         cache_seqlens = torch.full(
             (q.shape[0],), cache_seqlens, dtype=torch.int32, device=k_cache.device
         )
-        cache_seqlens = maybe_contiguous(cache_seqlens)
+    cache_seqlens = maybe_contiguous(cache_seqlens)
     cache_batch_idx = maybe_contiguous(cache_batch_idx)
+    cache_leftpad = maybe_contiguous(cache_leftpad)
     block_table = maybe_contiguous(block_table)
+    rotary_cos = maybe_contiguous(rotary_cos)
+    rotary_sin = maybe_contiguous(rotary_sin)
+    alibi_slopes = maybe_contiguous(alibi_slopes)
     out, softmax_lse = flash_attn_gpu.fwd_kvcache(
         q,
         k_cache,
