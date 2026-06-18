@@ -1121,10 +1121,10 @@ class FlashAttentionBackwardSm100:
         dQ_cluster_empty_mbar_ptr = storage.dQ_cluster_empty_mbar_ptr.data_ptr()
 
         if const_expr(self.use_2cta_instrs):
-            dS_cluster_full_mbar_ptr = storage.dS_cluster_full_mbar_ptr
-            dS_cluster_empty_mbar_ptr = storage.dS_cluster_empty_mbar_ptr
-            dS_cluster_leader_mbar_ptr = storage.dS_cluster_leader_mbar_ptr
-            dQaccum_empty_mbar_ptr = storage.dQaccum_empty_mbar_ptr
+            dS_cluster_full_mbar_ptr = storage.dS_cluster_full_mbar_ptr.ptr
+            dS_cluster_empty_mbar_ptr = storage.dS_cluster_empty_mbar_ptr.ptr
+            dS_cluster_leader_mbar_ptr = storage.dS_cluster_leader_mbar_ptr.ptr
+            dQaccum_empty_mbar_ptr = storage.dQaccum_empty_mbar_ptr.ptr
         else:
             dS_cluster_full_mbar_ptr = None
             dS_cluster_empty_mbar_ptr = None
@@ -1156,11 +1156,11 @@ class FlashAttentionBackwardSm100:
             * len((self.mma_warp_id, *self.compute_warp_ids, *self.reduce_warp_ids)),
         )
         tmem = cutlass.utils.TmemAllocator(
-            storage.tmem_holding_buf,
+            storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=self.mma_warp_id,
             is_two_cta=self.use_2cta_instrs,
-            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr,
+            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr.ptr,
         )
 
         # UMMA producers and AsyncThread consumers
