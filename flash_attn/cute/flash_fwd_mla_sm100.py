@@ -821,11 +821,11 @@ class FlashAttentionMLAForwardSm100:
             num_threads=self.num_mma_threads + self.num_softmax_threads + self.num_epilogue_threads,
         )
         tmem = cutlass.utils.TmemAllocator(
-            storage.tmem_holding_buf,
+            storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=self.mma_warp_id,
             is_two_cta=self.use_2cta_instrs,
-            two_cta_tmem_dealloc_mbar_ptr=storage.mbar_ptr_tmem_dealloc,
+            two_cta_tmem_dealloc_mbar_ptr=storage.mbar_ptr_tmem_dealloc.ptr,
         )
 
         # ==== Prefetch TMA descriptors ====
