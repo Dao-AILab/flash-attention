@@ -1044,6 +1044,78 @@ def test_varlen_block_sparse(
     )
 
 
+@pytest.mark.skipif(COMPUTE_CAPABILITY not in (10, 11), reason="SM100/SM110 coarse KV forward only")
+@pytest.mark.parametrize("seqlens_k", [[512, 512], [384, 384], [128, 128]])
+@pytest.mark.parametrize("varlen_k", [False, True])
+def test_varlen_block_sparse_coarse_kv_metadata_stride_repro(seqlens_k, varlen_k):
+    torch.manual_seed(42)
+    device = "cuda"
+    seqlens_q = [512, 512]
+    num_heads = 1
+    head_dim = 128
+    dtype = torch.bfloat16
+    physical_tile_n = 128
+    sparse_tile_m = 256
+    sparse_tile_n = 256
+
+    q = torch.randn(sum(seqlens_q), num_heads, head_dim, device=device, dtype=dtype)
+    cu_seqlens_q = torch.tensor(
+        [0] + list(torch.tensor(seqlens_q).cumsum(0).tolist()),
+        device=device,
+        dtype=torch.int32,
+    )
+    if varlen_k:
+        k = torch.randn(sum(seqlens_k), num_heads, head_dim, device=device, dtype=dtype)
+        v = torch.randn_like(k)
+        cu_seqlens_k = torch.tensor(
+            [0] + list(torch.tensor(seqlens_k).cumsum(0).tolist()),
+            device=device,
+            dtype=torch.int32,
+        )
+    else:
+        k = torch.randn(
+            len(seqlens_k), max(seqlens_k), num_heads, head_dim, device=device, dtype=dtype
+        )
+        v = torch.randn_like(k)
+        cu_seqlens_k = None
+    mask_mod = get_mask_pair("block_diagonal")[0]
+    block_sparse_tensors = _make_block_sparse_tensors(
+        mask_mod=mask_mod,
+        seqlens_q=seqlens_q,
+        seqlens_k=seqlens_k,
+        num_heads=num_heads,
+        tile_m=sparse_tile_m,
+        tile_n=sparse_tile_n,
+        device=device,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+    )
+
+    out_with_block_sparsity = _run_fwd(
+        q,
+        k,
+        v,
+        mask_mod,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        block_sparse_tensors=block_sparse_tensors,
+    )
+    out_no_block_sparsity = _run_fwd(
+        q,
+        k,
+        v,
+        mask_mod,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+    )
+
+    max_err = (out_with_block_sparsity - out_no_block_sparsity).abs().max().item()
+    assert max_err <= 0.01, (
+        f"varlen coarse-KV block-sparse output differs from mask-mod-only by {max_err} "
+        f"with physical tile_n={physical_tile_n} and sparse tile_n={sparse_tile_n}"
+    )
+
+
 VARLEN_BLOCK_SPARSE_SPLITKV_SEQLENS = [
     ([128], [2048]),
     ([96], [1536]),
