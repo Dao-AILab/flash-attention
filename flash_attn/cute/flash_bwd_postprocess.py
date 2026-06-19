@@ -215,6 +215,7 @@ class FlashAttentionBackwardPostprocess:
         scale: cutlass.Float32,
         mCuSeqlensQ: Optional[cute.Tensor],
         mSeqUsedQ: Optional[cute.Tensor],
+        mCuTotalMBlocks: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -258,6 +259,7 @@ class FlashAttentionBackwardPostprocess:
             tile_shape_mn=(self.tile_m, 1),
             mCuSeqlensQ=mCuSeqlensQ,
             mSeqUsedQ=mSeqUsedQ,
+            cu_total_m_blocks_ptr=mCuTotalMBlocks,
         )
 
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
