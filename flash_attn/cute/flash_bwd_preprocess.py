@@ -459,7 +459,7 @@ class FlashAttentionBackwardPreprocess:
                     for n in cutlass.range(gRowMax.shape[1], unroll=4):
                         row_max = gRowMax[tidx, n]
                         scale = 0.0
-                        if row_max != -Float32.inf:
+                        if row_max != -Float32.inf and lse != -Float32.inf:
                             scale = softmax_scale_log2 * row_max - lse_log2
                             scale = cute.math.exp2(scale, fastmath=True)
                         gScaleP[tidx, n] = scale
