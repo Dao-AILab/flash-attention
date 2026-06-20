@@ -293,31 +293,78 @@ class BlackwellFusedMultiHeadAttentionForward:
             if cum_seqlen_k is not None and k_rank == 5
             else (k_tensor.shape[0] if cum_seqlen_k is not None else s_k64)
         )
+        # o/lse are freshly allocated contiguous outputs, so their layouts are still
+        # synthesized from shape below. q/k/v may be views with non-contiguous batch,
+        # sequence, or head strides, so derive their layouts from the actual tensors.
         stride_b_qo = h_r64 * h_k64 * s_q64 * d64 if cum_seqlen_q is None else 0
-        stride_b_kv = h_k64 * s_k64 * d64 if cum_seqlen_k is None else 0
         b_lse = b64 if cum_seqlen_q is None else 1
         stride_b_lse = h_r64 * h_k64 * s_lse64 if cum_seqlen_q is None else 0
 
-        # (s, d, ((h_r, h_k), b))
+        if cutlass.const_expr(q_rank == 5):
+            q_s_stride = q_tensor.stride[1]
+            q_hr_stride = q_tensor.stride[3]
+            q_hk_stride = q_tensor.stride[2]
+            q_b_stride = q_tensor.stride[0]
+        elif cutlass.const_expr(q_rank == 4):
+            q_s_stride = q_tensor.stride[1]
+            q_hr_stride = q_tensor.stride[2]
+            q_hk_stride = q_tensor.stride[2] * h_r
+            q_b_stride = q_tensor.stride[0]
+        else:
+            q_s_stride = q_tensor.stride[0]
+            q_hr_stride = q_tensor.stride[1]
+            q_hk_stride = q_tensor.stride[1] * h_r
+            q_b_stride = 0
+
+        if cutlass.const_expr(k_rank == 5):
+            k_s_stride = k_tensor.stride[1]
+            k_hk_stride = k_tensor.stride[2]
+            k_b_stride = k_tensor.stride[0]
+            v_s_stride = v_tensor.stride[1]
+            v_hk_stride = v_tensor.stride[2]
+            v_b_stride = v_tensor.stride[0]
+        elif cutlass.const_expr(k_rank == 4):
+            k_s_stride = k_tensor.stride[1]
+            k_hk_stride = k_tensor.stride[2]
+            k_b_stride = k_tensor.stride[0]
+            v_s_stride = v_tensor.stride[1]
+            v_hk_stride = v_tensor.stride[2]
+            v_b_stride = v_tensor.stride[0]
+        else:
+            k_s_stride = k_tensor.stride[0]
+            k_hk_stride = k_tensor.stride[1]
+            k_b_stride = 0
+            v_s_stride = v_tensor.stride[0]
+            v_hk_stride = v_tensor.stride[1]
+            v_b_stride = 0
+
+        # (s, d, ((h_r, h_k), b)). The d mode must stay a static 1 for TMA;
+        # maybe_contiguous() in the interface guarantees stride(-1) == 1.
         q_layout = cute.make_layout(
             (s_q_total, d, ((h_r, h_k), b)),
-            stride=(d64 * h_r64 * h_k64, 1, ((d64, d64 * h_r64), stride_b_qo)),
+            stride=(
+                cute.assume(q_s_stride, divby=64),
+                1,
+                (
+                    (q_hr_stride, q_hk_stride),
+                    0 if cum_seqlen_q is not None else cute.assume(q_b_stride, divby=64),
+                ),
+            ),
         )
         q = cute.make_tensor(q_tensor.iterator, q_layout)
         if cutlass.const_expr(mPageTable is not None):
             # Paged: K layout (num_pages, page_size, h_k, d); page_table maps kv_coord→physical page.
             num_pages = k_tensor.shape[0]
             page_size = k_tensor.shape[1]
-            page_size64 = Int64(page_size)
             max_seqlen_k_paged = Int32(mPageTable.shape[1] * page_size)
             k_paged_layout = cute.make_layout(
                 (page_size, d, h_k, num_pages),
-                stride=(d64 * h_k64, 1, d64, page_size64 * d64 * h_k64),
+                stride=(cute.assume(k_s_stride, divby=64), 1, k_hk_stride, k_b_stride),
             )
             k = cute.make_tensor(k_tensor.iterator, k_paged_layout)
             v_paged_layout = cute.make_layout(
                 (d, page_size, h_k, num_pages),
-                stride=(1, d64 * h_k64, d64, page_size64 * d64 * h_k64),
+                stride=(1, cute.assume(v_s_stride, divby=64), v_hk_stride, v_b_stride),
             )
             v = cute.make_tensor(v_tensor.iterator, v_paged_layout)
             page_table_layout = cute.make_layout(
@@ -329,13 +376,27 @@ class BlackwellFusedMultiHeadAttentionForward:
             # (s, d, ((h_r, h_k), b)), 0-stride for h_r to broadcast
             k_layout = cute.make_layout(
                 (s_k_total, d, ((h_r, h_k), b)),
-                stride=(d64 * h_k64, 1, ((0, d64), stride_b_kv)),
+                stride=(
+                    cute.assume(k_s_stride, divby=64),
+                    1,
+                    (
+                        (0, k_hk_stride),
+                        0 if cum_seqlen_k is not None else cute.assume(k_b_stride, divby=64),
+                    ),
+                ),
             )
             k = cute.make_tensor(k_tensor.iterator, k_layout)
             # (d, s, ((h_r, h_k), b)), 0-stride for h_r to broadcast
             v_layout = cute.make_layout(
                 (d, s_k_total, ((h_r, h_k), b)),
-                stride=(1, d64 * h_k64, ((0, d64), stride_b_kv)),
+                stride=(
+                    1,
+                    cute.assume(v_s_stride, divby=64),
+                    (
+                        (0, v_hk_stride),
+                        0 if cum_seqlen_k is not None else cute.assume(v_b_stride, divby=64),
+                    ),
+                ),
             )
             v = cute.make_tensor(v_tensor.iterator, v_layout)
             page_table = None

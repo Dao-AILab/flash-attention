@@ -241,6 +241,26 @@ def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
 
+def _hd256_stride_assume_compatible(t, is_varlen):
+    """Whether hd256 stride/alignment assumptions are valid for this tensor."""
+    if t is None:
+        return True
+    alignment = 16 // t.element_size()
+    if any(stride % alignment != 0 for stride in t.stride()[:-1]):
+        return False
+    if t.dim() == 3:
+        strides = (t.stride(0),)
+    else:
+        strides = (t.stride(1),) if is_varlen else (t.stride(0), t.stride(1))
+    return all(stride % 64 == 0 for stride in strides)
+
+
+def maybe_hd256_compatible_contiguous(t, is_varlen):
+    if _hd256_stride_assume_compatible(t, is_varlen):
+        return t
+    return t.contiguous()
+
+
 def _validate_tensor(t, name, expected_shape, expected_dtype, expected_device):
     assert t.shape == expected_shape, f"{name} shape {t.shape} != expected {expected_shape}"
     assert t.dtype == expected_dtype, f"{name} dtype {t.dtype} != expected {expected_dtype}"
@@ -715,6 +735,15 @@ def _flash_attn_fwd(
         disable_sparse_kv_bitmask = None
         p = row_max = None
 
+    if use_dedicated_hd256_kernel:
+        q = maybe_hd256_compatible_contiguous(q, cu_seqlens_q is not None)
+        k = maybe_hd256_compatible_contiguous(
+            k, cu_seqlens_k is not None and page_table is None
+        )
+        v = maybe_hd256_compatible_contiguous(
+            v, cu_seqlens_k is not None and page_table is None
+        )
+
     compile_key = (
         dtype,
         head_dim,
@@ -910,14 +939,9 @@ def _flash_attn_fwd(
                         )
                     # pack_gqa is an auto-selected optimization; disable it for hd256 kernel
                     pack_gqa = False
-                    # The hd256 dedicated kernel builds tensor layouts with hardcoded
-                    # contiguous strides computed from shape dimensions, so non-contiguous
-                    # inputs (e.g. from .transpose()) produce wrong memory accesses.
-                    # maybe_contiguous() above only guarantees stride(-1)==1; make fully
-                    # contiguous here before the compile key is derived from shapes.
-                    q = q.contiguous() if not q.is_contiguous() else q
-                    k = k.contiguous() if not k.is_contiguous() else k
-                    v = v.contiguous() if not v.is_contiguous() else v
+                    # The hd256 dedicated kernel derives q/k/v global-memory strides
+                    # from the actual input tensors. Compatible non-contiguous inputs stay
+                    # zero-copy; the guard above only copies if stride hints would be unsafe.
 
                 flash_fwd_obj_cls = (
                     BlackwellFusedMultiHeadAttentionForward
@@ -1526,6 +1550,13 @@ def _flash_attn_bwd(
         if arch // 10 == 8:
             raise NotImplementedError("Custom user-provided score_mod is not supported on SM8x architectures.")
 
+    if use_dedicated_hd256_kernel:
+        q = maybe_hd256_compatible_contiguous(q, cu_seqlens_q is not None)
+        k = maybe_hd256_compatible_contiguous(k, cu_seqlens_k is not None)
+        v = maybe_hd256_compatible_contiguous(v, cu_seqlens_k is not None)
+        out = maybe_hd256_compatible_contiguous(out, cu_seqlens_q is not None)
+        dout = maybe_hd256_compatible_contiguous(dout, cu_seqlens_q is not None)
+
     device = q.device
     out_torch_dtype = q.dtype
 
@@ -1858,12 +1889,8 @@ def _flash_attn_bwd(
                     "SM100 backward with head_dim=256 does not support dlse"
                 assert seqused_q is None and seqused_k is None, \
                     "SM100 backward with head_dim=256 does not support seqused_q/seqused_k"
-                # Same as forward: hd256 kernel uses hardcoded contiguous strides.
-                q = q.contiguous() if not q.is_contiguous() else q
-                k = k.contiguous() if not k.is_contiguous() else k
-                v = v.contiguous() if not v.is_contiguous() else v
-                out = out.contiguous() if not out.is_contiguous() else out
-                dout = dout.contiguous() if not dout.is_contiguous() else dout
+                # q/k/v/out/dout were already made compatible with the hd256
+                # stride assumptions before preprocess, compile, and launch.
 
                 dq_tile_mn = (128, 128)
                 dkdv_tile_mn = (128, 64)
