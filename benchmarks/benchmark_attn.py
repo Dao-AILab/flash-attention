@@ -146,6 +146,7 @@ def setup_fa4(ctx):
     gather_kv_indices = ctx.get("gather_kv_indices")
     k_use = ctx.get("k_paged", k) if ctx["page_size"] is not None else k
     v_use = ctx.get("v_paged", v) if ctx["page_size"] is not None else v
+    num_splits = ctx["num_splits"]
     if ctx["varlen"]:
         qu = ctx["q_unpad"]
         ku = ctx.get("k_paged", ctx["k_unpad"]) if ctx["page_size"] is not None else ctx["k_unpad"]
@@ -154,9 +155,9 @@ def setup_fa4(ctx):
         csq, csk = ctx["cu_seqlens_q"], ctx["cu_seqlens_k"]
         pt = ctx["page_table"]
         gather_kv_indices_unpad = ctx.get("gather_kv_indices_unpad")
-        fwd_fn = lambda: flash_attn_varlen_func_python(qu, ku, vu, qvu, csq, csk, page_table=pt, causal=causal, window_size=window_size, softcap=softcap, pack_gqa=pack_gqa, gather_kv_indices=gather_kv_indices_unpad)
+        fwd_fn = lambda: flash_attn_varlen_func_python(qu, ku, vu, qv=qvu, cu_seqlens_q=csq, cu_seqlens_k=csk, page_table=pt, causal=causal, window_size=window_size, softcap=softcap, pack_gqa=pack_gqa, gather_kv_indices=gather_kv_indices_unpad, num_splits=num_splits)
     else:
-        fwd_fn = lambda: flash_attn_func_python(q, k_use, v_use, qv=qv, causal=causal, window_size=window_size, learnable_sink=sinks, softcap=softcap, pack_gqa=pack_gqa, gather_kv_indices=gather_kv_indices)
+        fwd_fn = lambda: flash_attn_func_python(q, k_use, v_use, qv=qv, causal=causal, window_size=window_size, learnable_sink=sinks, softcap=softcap, pack_gqa=pack_gqa, gather_kv_indices=gather_kv_indices, num_splits=num_splits)
     bwd_fn = None
     if ctx["has_backward"] and ctx["dtype"] != torch.float8_e4m3fn:
         if ctx["varlen"]:
@@ -164,7 +165,7 @@ def setup_fa4(ctx):
             qvu = ctx["qv_unpad"]
             csq, csk = ctx["cu_seqlens_q"], ctx["cu_seqlens_k"]
             gather_kv_indices_unpad = ctx.get("gather_kv_indices_unpad")
-            bwd_fn = _make_bwd_fn(lambda: flash_attn_varlen_func_python(qu, ku, vu, qvu, csq, csk, causal=causal, softcap=softcap, deterministic=deterministic, gather_kv_indices=gather_kv_indices_unpad), gu, [qu, ku, vu, qvu])
+            bwd_fn = _make_bwd_fn(lambda: flash_attn_varlen_func_python(qu, ku, vu, qv=qvu, cu_seqlens_q=csq, cu_seqlens_k=csk, causal=causal, softcap=softcap, deterministic=deterministic, gather_kv_indices=gather_kv_indices_unpad), gu, [qu, ku, vu, qvu])
         else:
             bwd_fn = _make_bwd_fn(lambda: flash_attn_func_python(q, k, v, qv=qv, causal=causal, softcap=softcap, deterministic=deterministic, gather_kv_indices=gather_kv_indices), g, [q, k, v, qv])
     return fwd_fn, bwd_fn
@@ -320,9 +321,10 @@ def parse_args():
     parser.add_argument('--backend', type=csv_strs, default=['all'],
                         help='Which backends to benchmark, comma-separated (choices: all,standard,fa2,fa3,fa4,cudnn)')
     parser.add_argument('--gather-kv', type=int, default=None,
-                        help='kv sparsity length for MLA (hdim=64, hdim_v=512 only). '
+                        help='kv sparsity length (supported: hdim-hdim_v=64-512 or 512-512 with shared-kv).'
                              'When set, passes random kv indices (without repeats) to FA4 and uses gather-kv as '
                              'the effective KV length for flops/bandwidth accounting.')
+    parser.add_argument('--shared-kv', action='store_true', help='shared KV mode')
     parser.add_argument('--num-splits', type=int, default=0,
                         help='Override kernel num_splits heuristic. 0 = auto (default). '
                              '>1 forces SplitKV with that many splits.')
@@ -379,6 +381,7 @@ def main():
     seqlen_q_list = resolve_seqlen_q_list(seqlen_list, args.seqlen_q)
     varlen = args.varlen
     gather_kv_length = args.gather_kv
+    shared_kv = args.shared_kv
 
     # Filter backends to those requested and available
     enabled = set(args.backend)
@@ -426,6 +429,8 @@ def main():
             v = torch.randn(batch_size, seqlen, nheads_kv, headdim_v, device=device, dtype=dtype_gen, requires_grad=has_backward)
             qv = torch.randn(batch_size, seqlen_q, nheads, headdim_v, device=device, dtype=dtype_gen, requires_grad=has_backward) if has_qv else None
             q, k, v, qv = [x.detach().to(dtype).requires_grad_(has_backward) if x is not None else None for x in [q, k, v, qv]]
+            if shared_kv:
+                v = k
             g = torch.randn(batch_size, seqlen_q, nheads, headdim_v, device=device, dtype=dtype_gen)
 
             # Varlen tensors
@@ -435,6 +440,8 @@ def main():
                 g_unpad = rearrange(g.detach(), "b s h d -> (b s) h d")
                 cu_seqlens_q = torch.arange(batch_size + 1, device=device, dtype=torch.int32) * seqlen_q
                 cu_seqlens_k = torch.arange(batch_size + 1, device=device, dtype=torch.int32) * seqlen if page_size is None else None
+                if shared_kv:
+                    v_unpad = k_unpad
 
             # Paged KV tensors
             k_paged = v_paged = page_table = None
@@ -447,7 +454,7 @@ def main():
             # kv sparsity indices — only meaningful for MLA (hdim=64, hdim_v=512)
             gather_kv_indices = gather_kv_indices_unpad = None
             gather_kv_eff = None  # effective KV length for this config
-            if gather_kv_length is not None and has_qv:
+            if gather_kv_length is not None:
                 assert gather_kv_length <= seqlen, f"--gather_kv {gather_kv_length} > seqlen_kv {seqlen}"
                 gather_kv_indices = (
                     torch.rand(batch_size, seqlen_q, gather_kv_length, device=device)
@@ -533,13 +540,15 @@ def main():
             headdim, headdim_v, causal, seqlen_q, seqlen, batch_size, nheads, nheads_kv, gather_kv_eff = cfg
             has_qv = (headdim == 64 and headdim_v == 512)
             seqlen_k_eff = gather_kv_eff if gather_kv_eff is not None else seqlen
-            nFLOPS = flops(batch_size, nheads, seqlen_q, seqlen_k_eff, headdim, headdim_v, causal=causal, has_qv=has_qv)
+            causal_eff = False if gather_kv_eff is not None else causal
+            nFLOPS = flops(batch_size, nheads, seqlen_q, seqlen_k_eff, headdim, headdim_v, causal=causal_eff, has_qv=has_qv)
             dtype_bytes = 1 if dtype == torch.float8_e4m3fn else 2
             if direction == "FWD":
-                nbytes = bandwidth_fwd_bytes(batch_size, nheads, nheads_kv, seqlen_q, seqlen_k_eff,
-                                             headdim, headdim_v, dtype_bytes=dtype_bytes, has_qv=has_qv)
+                nbytes = bandwidth_fwd_bytes(batch_size, nheads, nheads_kv, seqlen_q, seqlen,
+                                             headdim, headdim_v, dtype_bytes=dtype_bytes,
+                                             has_qv=has_qv, shared_kv=shared_kv)
             else:
-                nbytes = bandwidth_bwd_bytes(batch_size, nheads, nheads_kv, seqlen_q, seqlen_k_eff,
+                nbytes = bandwidth_bwd_bytes(batch_size, nheads, nheads_kv, seqlen_q, seqlen,
                                              headdim, headdim_v, dtype_bytes=dtype_bytes)
             hdim_str = str(headdim) if headdim == headdim_v else f"{headdim}-{headdim_v}"
             row = f"{hdim_str:>9} {str(causal):>6} {batch_size:>5}"
