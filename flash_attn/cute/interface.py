@@ -903,21 +903,8 @@ def _flash_attn_fwd(
                             f"pass page_table[:, :{max_seqlen_k // page_size}] to slice to "
                             f"the actual sequence length"
                         )
-                        assert page_table.stride(0) == page_table.shape[1], (
-                            f"SM100 hd256 2CTA paged KV requires a fully contiguous page_table "
-                            f"(stride(0)={page_table.stride(0)} must equal "
-                            f"shape[1]={page_table.shape[1]})"
-                        )
                     # pack_gqa is an auto-selected optimization; disable it for hd256 kernel
                     pack_gqa = False
-                    # The hd256 dedicated kernel builds tensor layouts with hardcoded
-                    # contiguous strides computed from shape dimensions, so non-contiguous
-                    # inputs (e.g. from .transpose()) produce wrong memory accesses.
-                    # maybe_contiguous() above only guarantees stride(-1)==1; make fully
-                    # contiguous here before the compile key is derived from shapes.
-                    q = q.contiguous() if not q.is_contiguous() else q
-                    k = k.contiguous() if not k.is_contiguous() else k
-                    v = v.contiguous() if not v.is_contiguous() else v
 
                 flash_fwd_obj_cls = (
                     BlackwellFusedMultiHeadAttentionForward
@@ -1812,12 +1799,6 @@ def _flash_attn_bwd(
                     "SM100 backward with head_dim=256 does not support dlse"
                 assert seqused_q is None and seqused_k is None, \
                     "SM100 backward with head_dim=256 does not support seqused_q/seqused_k"
-                # Same as forward: hd256 kernel uses hardcoded contiguous strides.
-                q = q.contiguous() if not q.is_contiguous() else q
-                k = k.contiguous() if not k.is_contiguous() else k
-                v = v.contiguous() if not v.is_contiguous() else v
-                out = out.contiguous() if not out.is_contiguous() else out
-                dout = dout.contiguous() if not dout.is_contiguous() else dout
 
                 dq_tile_mn = (128, 128)
                 dkdv_tile_mn = (128, 64)
