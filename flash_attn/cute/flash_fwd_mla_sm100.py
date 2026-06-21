@@ -1,10 +1,9 @@
+# Copyright (c) 2026, Colfax International.
+
 import math
-import time
 from functools import partial
 from typing import Callable, Optional
 
-import torch
-import torch.utils.benchmark as benchmark
 
 import cuda.bindings.driver as cuda
 
@@ -14,7 +13,6 @@ from cutlass import Float32, Int64, Int32, Uint32, Boolean, const_expr
 from cutlass.cute import FastDivmodDivisor
 import cutlass.pipeline as pipeline
 from cutlass.cute.nvgpu import cpasync, tcgen05
-from cutlass.cute.runtime import from_dlpack
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.utils import ClcDynamicPersistentTileScheduler
 
@@ -39,15 +37,12 @@ from flash_attn.cute.tile_scheduler import (
     ParamsBase,
 )
 from flash_attn.cute.fa_logging import fa_log, fa_printf
-from flash_attn.cute.utils import smid
+from flash_attn.cute.utils import smid, get_batch_from_cu_tensor
 
 from flash_attn.cute.topk_gather_kv import CpasyncGatherKVManager
 
-from flash_attn.cute.testing import attention_ref
 
 from flash_attn.cute.named_barrier import NamedBarrierFwdSm100_MLA2CTA
-
-from flash_attn.cute.cute_dsl_utils import dump_kernel_attributes
 
 
 class FlashAttentionMLAForwardSm100:
@@ -62,7 +57,8 @@ class FlashAttentionMLAForwardSm100:
         nheads_kv: int = 1,
         hdim: int = 64,
         hdimv: int = 512,
-        is_varlen_q: bool = False,
+        has_seqused_q: bool = False,
+        has_cu_seqlens_q: bool = False,
         disable_bitmask: bool = False,
         use_clc_scheduler: bool = True,
         has_qk: bool = True,
@@ -71,8 +67,8 @@ class FlashAttentionMLAForwardSm100:
         self.is_local = False
         self.pack_gqa = pack_gqa
         self.qhead_per_kvhead = qhead_per_kvhead
+        assert qhead_per_kvhead <= 128
         self.nheads_kv = nheads_kv
-        self.is_varlen_q = is_varlen_q
         self.use_tma_O = True
         self.use_cpasync_load_KV = use_cpasync_load_KV
         self.use_tma_KV = not use_cpasync_load_KV
@@ -88,13 +84,17 @@ class FlashAttentionMLAForwardSm100:
 
         # ==== tile scheduler ====
         self.is_persistent = False
-        self.use_clc_scheduler = use_clc_scheduler and not is_varlen_q
+        self.use_clc_scheduler = use_clc_scheduler
         self.sched_stages = 1
         self.scheduling_mode = (
             SchedulingMode.CLC if self.use_clc_scheduler else SchedulingMode.STATIC
         )
 
-        if const_expr(is_varlen_q):
+        self.is_varlen_q = has_seqused_q or has_cu_seqlens_q
+        self.use_packed_varlen_sched = has_cu_seqlens_q and qhead_per_kvhead == 128 and pack_gqa
+        self.use_varlen_scheduler = self.is_varlen_q and not self.use_packed_varlen_sched
+
+        if const_expr(self.use_varlen_scheduler):
             self.TileScheduler = SingleTileVarlenScheduler
         elif self.use_clc_scheduler:
             self.TileScheduler = SingleTileLPTScheduler
@@ -143,11 +143,11 @@ class FlashAttentionMLAForwardSm100:
 
         # ==== register usage ====
         if self.num_warps == 16:
-            self.num_regs_load = 80
-            self.num_regs_mma = 80
-            self.num_regs_softmax = 208
+            self.num_regs_load = 112
+            self.num_regs_mma = 112
+            self.num_regs_softmax = 192
             self.num_regs_epilogue = 128
-            self.num_regs_cpasync = 96 if self.use_cpasync_load_KV else 0
+            self.num_regs_cpasync = 80 if self.use_cpasync_load_KV else 0
             self.num_regs_other = 48
         else:
             self.num_regs_load = 168 - 40
@@ -228,7 +228,7 @@ class FlashAttentionMLAForwardSm100:
         self.num_stages_P = 1
         self.num_stages_Oi = 1
         self.num_stages_sm_stats = 2
-        self.num_stages_bitmask = 4
+        self.num_stages_bitmask = 2
         assert self.num_stages_S == 2, "mainloops expect 2 stages for S"
 
         # ==== dtype info ====
@@ -635,13 +635,17 @@ class FlashAttentionMLAForwardSm100:
         # ==== Tile scheduler ====
 
         TileScheduler = self.TileScheduler
+        
+        batch_size_for_sched = (
+            cute.size(mQv.shape[3]) if const_expr(mCuSeqlensQ is None)
+            else cute.size(mCuSeqlensQ.shape[0] - 1) if self.use_varlen_scheduler
+            else 1
+        )
 
         tile_sched_args = TileSchedulerArguments(
-            num_block=cute.ceil_div(cute.size(mQv.shape[0]), self.cta_tile_m),
+            num_block=cute.ceil_div(cute.size(mQv.shape[0]), self.cluster_tile_m),
             num_head=cute.size(mQv.shape[2]),
-            num_batch=cute.size(mQv.shape[3])
-            if const_expr(mCuSeqlensQ is None)
-            else cute.size(mCuSeqlensQ.shape[0] - 1),
+            num_batch=batch_size_for_sched,
             num_splits=1,  # todo: split_kv
             seqlen_k=cute.size(mV.shape[0])
             if const_expr(mPageTable is None)
@@ -651,10 +655,7 @@ class FlashAttentionMLAForwardSm100:
             total_q=cute.size(mQv.shape[0])
             if const_expr(mCuSeqlensQ is not None)
             else cute.size(mQv.shape[0]) * cute.size(mQv.shape[3]),
-            tile_shape_mn=(
-                self.cta_tile_m,
-                self.tile_n,
-            ),
+            tile_shape_mn=(self.cta_tile_m, self.tile_n),
             mCuSeqlensQ=mCuSeqlensQ,
             mSeqUsedQ=mSeqUsedQ,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
@@ -664,7 +665,7 @@ class FlashAttentionMLAForwardSm100:
             lpt=False,
             is_split_kv=False,
             cluster_shape_mn=self.cluster_shape_mn,
-            use_cluster_idx=False,
+            use_cluster_idx=True,
         )
         tile_sched_params = TileScheduler.to_underlying_arguments(
             tile_sched_args, scheduling_mode=self.scheduling_mode
@@ -805,10 +806,8 @@ class FlashAttentionMLAForwardSm100:
         cta_layout_vmnk = cute.tiled_divide(
             cute.make_layout(self.cluster_shape_mnk), (tiled_mma_QvV.thr_id.shape,)
         )
-
-        cta_m_block, head_idx, batch_idx = cute.arch.block_idx()
-        cluster_m_block = cta_m_block // self.cta_group_size
-        mma_tile_coord_v = cta_m_block % cute.size(tiled_mma_QvV.thr_id.shape)
+        cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
+        mma_tile_coord_v = cta_rank_in_cluster % cute.size(tiled_mma_QvV.thr_id.shape)
         is_leader_cta = mma_tile_coord_v == 0
 
         # ==== Allocate SMEM ====
@@ -1026,19 +1025,22 @@ class FlashAttentionMLAForwardSm100:
 
         if const_expr(self.use_clc_scheduler):
             if warp_idx == self.clc_scheduler_warp_id:
-                cute.arch.setmaxregister_decrease(self.num_regs_other)
+                if const_expr(self.num_regs_other < self.num_regs_per_thread):
+                    cute.arch.setmaxregister_decrease(self.num_regs_other)
                 if is_leader_cta:
                     self.clc_scheduler_warp(tile_scheduler)
                 else:
                     self.empty_warp(tile_scheduler)
             for i in cutlass.range_constexpr(len(self.empty_warp_ids)):
                 if warp_idx == self.empty_warp_ids[i] and warp_idx != self.clc_scheduler_warp_id:
-                    cute.arch.setmaxregister_decrease(self.num_regs_other)
+                    if const_expr(self.num_regs_other < self.num_regs_per_thread):
+                        cute.arch.setmaxregister_decrease(self.num_regs_other)
                     self.empty_warp(tile_scheduler)
         else:
             for i in cutlass.range_constexpr(len(self.empty_warp_ids)):
                 if warp_idx == self.empty_warp_ids[i]:
-                    cute.arch.setmaxregister_decrease(self.num_regs_other)
+                    if const_expr(self.num_regs_other < self.num_regs_per_thread):
+                        cute.arch.setmaxregister_decrease(self.num_regs_other)
 
         if const_expr(self.use_cpasync_load_KV):
             if warp_idx == self.relay_warp_id:
@@ -1054,6 +1056,7 @@ class FlashAttentionMLAForwardSm100:
                     block_info,
                     SeqlenInfoCls,
                     tile_scheduler=tile_scheduler,
+                    mCuSeqlensQ=mCuSeqlensQ,
                 )
 
             if warp_idx in self.cpasync_load_warp_indices:
@@ -1079,6 +1082,7 @@ class FlashAttentionMLAForwardSm100:
                     SeqlenInfoCls,
                     tile_scheduler=tile_scheduler,
                     mPageTable=mPageTable,
+                    mCuSeqlensQ=mCuSeqlensQ,
                 )
 
         if warp_idx == self.load_warp_id:
@@ -1113,6 +1117,7 @@ class FlashAttentionMLAForwardSm100:
                 SeqlenInfoCls,
                 tile_scheduler=tile_scheduler,
                 mPageTable=mPageTable,
+                mCuSeqlensQ=mCuSeqlensQ,
             )
 
         if warp_idx == self.mma_warp_id:
@@ -1152,13 +1157,15 @@ class FlashAttentionMLAForwardSm100:
                 block_info,
                 SeqlenInfoCls,
                 tile_scheduler=tile_scheduler,
+                mCuSeqlensQ=mCuSeqlensQ,
             )
             tmem.relinquish_alloc_permit()
             tmem_alloc_barrier.arrive_and_wait()
             tmem.free(tmem_ptr)
 
         if warp_idx in self.softmax_warp_indices:
-            cute.arch.setmaxregister_increase(self.num_regs_softmax)
+            if const_expr(self.num_regs_softmax > self.num_regs_per_thread):
+                cute.arch.setmaxregister_increase(self.num_regs_softmax)
             tmem.wait_for_alloc()
             tmem_ptr = tmem.retrieve_ptr(self.dtype_acc)
             tStS = cute.make_tensor(tmem_ptr, tStS_fake.layout)
@@ -1187,6 +1194,7 @@ class FlashAttentionMLAForwardSm100:
                 tma_atom_P=tma_atom_P,
                 mP=mP,
                 sP_out=sP_out,
+                mCuSeqlensQ=mCuSeqlensQ,
             )
             tmem_alloc_barrier.arrive()
 
@@ -1220,6 +1228,7 @@ class FlashAttentionMLAForwardSm100:
                 block_info,
                 SeqlenInfoCls,
                 tile_scheduler=tile_scheduler,
+                mCuSeqlensQ=mCuSeqlensQ,
             )
             tmem_alloc_barrier.arrive()
 
@@ -1232,7 +1241,7 @@ class FlashAttentionMLAForwardSm100:
         while work_tile.is_valid_tile:
             tile_scheduler.prefetch_next_work()
             work_tile = tile_scheduler.advance_to_next_work()
-            cta_m_block, head_idx, batch_idx, _ = work_tile.tile_idx
+            # cluster_m_block, head_idx, batch_idx, _ = work_tile.tile_idx
             if cute.arch.thread_idx()[0] == self.clc_scheduler_warp_id * cute.arch.WARP_SIZE:
                 fa_printf(
                     3,
@@ -1268,6 +1277,7 @@ class FlashAttentionMLAForwardSm100:
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
         tile_scheduler: TileSchedulerProtocol,
+        mCuSeqlensQ: Optional[cute.Tensor] = None,
     ):
         # ==== Make pipeline states ====
         # pipeline_{K,V0,V1} producer
@@ -1285,8 +1295,11 @@ class FlashAttentionMLAForwardSm100:
 
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
-            cta_m_block, head_idx, batch_idx, _ = work_tile.tile_idx
-            cluster_m_block = cta_m_block // self.cta_group_size
+            cluster_m_block, head_idx, batch_idx, _ = work_tile.tile_idx
+            if const_expr(self.use_packed_varlen_sched):
+                batch_idx = get_batch_from_cu_tensor(cluster_m_block, mCuSeqlensQ)
+                if const_expr(not self.is_topk_gather):
+                    cluster_m_block -= mCuSeqlensQ[batch_idx]
 
             seqlen = SeqlenInfoCls(batch_idx)
             if const_expr(self.is_topk_gather):
@@ -1368,6 +1381,7 @@ class FlashAttentionMLAForwardSm100:
         SeqlenInfoCls: Callable,
         tile_scheduler: TileSchedulerProtocol,
         mPageTable: Optional[cute.Tensor] = None,
+        mCuSeqlensQ: Optional[cute.Tensor] = None,
     ):
         # ==== cpasync load warpgroup ====
         # Description: loads tiles of K, V, V0, V1 from gmem to smem using cpasync
@@ -1397,8 +1411,11 @@ class FlashAttentionMLAForwardSm100:
 
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
-            cta_m_block, head_idx, batch_idx, _ = work_tile.tile_idx
-            cluster_m_block = cta_m_block // self.cta_group_size
+            cluster_m_block, head_idx, batch_idx, _ = work_tile.tile_idx
+            if const_expr(self.use_packed_varlen_sched):
+                batch_idx = get_batch_from_cu_tensor(cluster_m_block, mCuSeqlensQ)
+                if const_expr(not self.is_topk_gather):
+                    cluster_m_block -= mCuSeqlensQ[batch_idx]
             head_idx_kv = (
                 head_idx // self.qhead_per_kvhead if const_expr(not self.pack_gqa) else head_idx
             )
@@ -1422,11 +1439,14 @@ class FlashAttentionMLAForwardSm100:
                 if const_expr(not seqlen.has_cu_seqlens_q):
                     mIndexTopk_cur = mIndexTopk[None, m_idx, batch_idx]
                 else:
-                    offset_q = seqlen.offset_q
+                    offset_q = seqlen.offset_q if const_expr(not self.use_packed_varlen_sched) else 0
                     mIndexTopk_cur = mIndexTopk[None, m_idx + offset_q]
 
                 if const_expr(self.is_causal):
-                    seqlen_k_limit = m_idx + 1 + seqlen.seqlen_k - seqlen.seqlen_q
+                    m_local_idx = (
+                        m_idx - seqlen.offset_q if const_expr(self.use_packed_varlen_sched) else m_idx
+                    )
+                    seqlen_k_limit = m_local_idx + 1 + seqlen.seqlen_k - seqlen.seqlen_q
                 else:
                     seqlen_k_limit = seqlen.seqlen_k
                 cpasync_gather_kv_manager = CpasyncGatherKVManager.create(
@@ -1841,6 +1861,7 @@ class FlashAttentionMLAForwardSm100:
         SeqlenInfoCls: Callable,
         tile_scheduler: TileSchedulerProtocol,
         mPageTable: Optional[cute.Tensor] = None,
+        mCuSeqlensQ: Optional[cute.Tensor] = None,
     ):
         # ==== Load warp ====
         # Description: loads tiles of Q, Qv, K, V, V0, V1 from gmem to smem using TMA
@@ -1861,8 +1882,10 @@ class FlashAttentionMLAForwardSm100:
 
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
-            cta_m_block, head_idx, batch_idx, _ = work_tile.tile_idx
-            cluster_m_block = cta_m_block // self.cta_group_size
+            cluster_m_block, head_idx, batch_idx, _ = work_tile.tile_idx
+            if const_expr(self.use_packed_varlen_sched):
+                batch_idx = get_batch_from_cu_tensor(cluster_m_block, mCuSeqlensQ)
+                cluster_m_block -= mCuSeqlensQ[batch_idx]
             head_idx_kv = (
                 head_idx // self.qhead_per_kvhead if const_expr(not self.pack_gqa) else head_idx
             )
@@ -2155,6 +2178,7 @@ class FlashAttentionMLAForwardSm100:
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
         tile_scheduler: TileSchedulerProtocol,
+        mCuSeqlensQ: Optional[cute.Tensor] = None,
     ):
         # ==== mma warp ====
         # Description: Computes Q @ K^T, Qv @ V^T, and P @ V
@@ -2164,9 +2188,9 @@ class FlashAttentionMLAForwardSm100:
         pipelines_O = [pipeline_O0, pipeline_O1]
         tOtOs = [tOtO0, tOtO1]
 
-        use_ptx_gemm_QK = not self.is_topk_gather
-        use_ptx_gemm_QvV = not self.is_topk_gather
-        use_ptx_gemm_PVt = not self.is_topk_gather
+        use_ptx_gemm_QK = True
+        use_ptx_gemm_QvV = True
+        use_ptx_gemm_PVt = True
 
         # Operands for S = Q @ K^T
         if const_expr(self.has_qk):
@@ -2270,8 +2294,10 @@ class FlashAttentionMLAForwardSm100:
         work_tile = tile_scheduler.initial_work_tile_info()
         O_should_accumulate = False
         while work_tile.is_valid_tile:
-            cta_m_block, head_idx, batch_idx, _ = work_tile.tile_idx
-            cluster_m_block = cta_m_block // self.cta_group_size
+            cluster_m_block, head_idx, batch_idx, _ = work_tile.tile_idx
+            if const_expr(self.use_packed_varlen_sched):
+                batch_idx = get_batch_from_cu_tensor(cluster_m_block, mCuSeqlensQ)
+                cluster_m_block -= mCuSeqlensQ[batch_idx]
 
             seqlen = SeqlenInfoCls(batch_idx)
             if const_expr(self.is_topk_gather):
@@ -2476,6 +2502,7 @@ class FlashAttentionMLAForwardSm100:
         tma_atom_P: Optional[cute.CopyAtom] = None,
         mP: Optional[cute.Tensor] = None,
         sP_out: Optional[cute.Tensor] = None,
+        mCuSeqlensQ: Optional[cute.Tensor] = None,
     ):
         # ==== softmax warpgroup ====
         # Description: computes softmax on S and writes the result to P
@@ -2486,6 +2513,7 @@ class FlashAttentionMLAForwardSm100:
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % (
             self.num_softmax_threads // 32
         )
+        cta_rank_in_cluster = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
 
         tSAcc = tStS[(None, None), 0, 0, 0]
         tSAcc_staged = [tStS[(None, None), 0, 0, stage] for stage in range(self.num_stages_S)]
@@ -2536,8 +2564,11 @@ class FlashAttentionMLAForwardSm100:
 
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
-            cta_m_block, head_idx, batch_idx, _ = work_tile.tile_idx
-            cluster_m_block = cta_m_block // self.cta_group_size
+            cluster_m_block, head_idx, batch_idx, _ = work_tile.tile_idx
+            if const_expr(self.use_packed_varlen_sched):
+                batch_idx = get_batch_from_cu_tensor(cluster_m_block, mCuSeqlensQ)
+                cluster_m_block -= mCuSeqlensQ[batch_idx]
+            cta_m_block = cluster_m_block * self.cta_group_size + cta_rank_in_cluster
             seqlen = SeqlenInfoCls(batch_idx)
             if const_expr(self.is_topk_gather):
                 n_block_min = 0
@@ -2862,6 +2893,7 @@ class FlashAttentionMLAForwardSm100:
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
         tile_scheduler: TileSchedulerProtocol,
+        mCuSeqlensQ: Optional[cute.Tensor] = None,
     ):
         ### ==== correction/epilogue warpgroup ====
         # Correction: copy scale smem -> rmem, copy O tmem -> rmem, rescale O, store O rmem -> tmem
@@ -2925,8 +2957,11 @@ class FlashAttentionMLAForwardSm100:
 
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
-            cta_m_block, head_idx, batch_idx, _ = work_tile.tile_idx
-            cluster_m_block = cta_m_block // self.cta_group_size
+            cluster_m_block, head_idx, batch_idx, _ = work_tile.tile_idx
+            if const_expr(self.use_packed_varlen_sched):
+                batch_idx = get_batch_from_cu_tensor(cluster_m_block, mCuSeqlensQ)
+                cluster_m_block -= mCuSeqlensQ[batch_idx]
+            cta_m_block = cluster_m_block * self.cta_group_size + cta_rank_in_cluster
 
             seqlen = SeqlenInfoCls(batch_idx)
             if const_expr(self.is_topk_gather):
@@ -3009,6 +3044,11 @@ class FlashAttentionMLAForwardSm100:
             acc_O_mn_row_is_zero_or_nan = row_sum == 0.0 or row_sum != row_sum
             scale = cute.arch.rcp_approx(row_sum if not acc_O_mn_row_is_zero_or_nan else 1.0)
 
+            row_max = 0.0
+            if const_expr(mLSE is not None):
+                if tidx < self.cta_tile_m:
+                    row_max = sRowMax[tidx, 0]
+
             self.sm_stats_barrier_empty.arrive()
 
             seqlen_q = (
@@ -3028,7 +3068,6 @@ class FlashAttentionMLAForwardSm100:
                     mLSE_cur = cute.domain_offset((lse_offset,), mLSE[None, head_idx])
                 gLSE = cute.local_tile(mLSE_cur, (self.cta_tile_m,), (cta_m_block,))
                 if tidx < self.cta_tile_m:
-                    row_max = sRowMax[tidx, 0]
                     LN2 = math.log(2.0)
                     lse = (
                         (row_max * softmax_scale_log2 + cute.math.log2(row_sum, fastmath=True))
@@ -3119,660 +3158,3 @@ class FlashAttentionMLAForwardSm100:
                 )
             cute.copy(thr_tmem_store, tOrO_t2r_frg, tOtO_r2t_cur)
         cute.arch.fence_view_async_tmem_store()
-
-
-def test_mla_kernel(
-    seqlen_q=2048,
-    seqlen_k=2048,
-    topk_length=2048,
-    nheads=1,
-    batch=1,
-    iter=0,
-    compile_cache=dict(),
-    validate=True,
-    seed=0,
-    gather_kv=True,
-    pack_gqa=False,
-    is_causal=False,
-    varlen_q=False,
-    varlen_k=False,
-    disable_bitmask=False,
-    has_qk=True,
-    store_P=False,
-):
-    torch.manual_seed(seed)
-    hdim = 64
-    hdimv = 512
-    softmax_scale = 1.0 / math.sqrt(hdim + hdimv) if has_qk else 1.0 / math.sqrt(hdimv)
-
-    nheads_kv = 1
-    qhead_per_kvhead = nheads
-    seqlen_k_rounded = (seqlen_k + 128 - 1) // 128 * 128
-    P_k_length = seqlen_k_rounded if not gather_kv else topk_length
-
-    torch_stream = torch.cuda.current_stream()
-    stream = cuda.CUstream(torch_stream.cuda_stream)
-
-    compile_key = (
-        is_causal,
-        gather_kv,
-        topk_length if gather_kv else None,
-        pack_gqa,
-        qhead_per_kvhead,
-        nheads_kv,
-        varlen_q,
-        varlen_k,
-        disable_bitmask,
-        has_qk,
-    )
-    if compile_key not in compile_cache:
-        total_q_dummy = batch * seqlen_q
-        total_k_dummy = batch * seqlen_k
-
-        if varlen_q:
-            Q = torch.randn(total_q_dummy, nheads, hdim, dtype=torch.bfloat16, device="cuda")
-            Qv = torch.randn(total_q_dummy, nheads, hdimv, dtype=torch.bfloat16, device="cuda")
-            O = torch.empty(total_q_dummy, nheads, hdimv, dtype=torch.bfloat16, device="cuda")
-            P = torch.empty(total_q_dummy, nheads, P_k_length, dtype=torch.bfloat16, device="cuda")
-            lse = torch.empty(total_q_dummy, nheads, dtype=torch.float32, device="cuda")
-            row_max = torch.empty(
-                total_q_dummy, nheads, P_k_length // 128, dtype=torch.float32, device="cuda"
-            )
-            index_topk = (
-                torch.rand(total_q_dummy, topk_length, device="cuda")
-                .argsort(dim=-1)
-                .to(torch.int32)
-            )
-            cu_seqlens_q_dummy = torch.arange(
-                0, (batch + 1) * seqlen_q, seqlen_q, dtype=torch.int32, device="cuda"
-            )
-        else:
-            Q = torch.randn(batch, seqlen_q, nheads, hdim, dtype=torch.bfloat16, device="cuda")
-            Qv = torch.randn(batch, seqlen_q, nheads, hdimv, dtype=torch.bfloat16, device="cuda")
-            O = torch.empty(batch, seqlen_q, nheads, hdimv, dtype=torch.bfloat16, device="cuda")
-            P = torch.empty(
-                batch, seqlen_q, nheads, P_k_length, dtype=torch.bfloat16, device="cuda"
-            )
-            lse = torch.empty(batch, seqlen_q, nheads, dtype=torch.float32, device="cuda")
-            row_max = torch.empty(
-                batch, seqlen_q, nheads, P_k_length // 128, dtype=torch.float32, device="cuda"
-            )
-            index_topk = (
-                torch.rand(batch, seqlen_q, topk_length, device="cuda")
-                .argsort(dim=-1)
-                .to(torch.int32)
-            )
-
-        if varlen_k:
-            K = torch.randn(total_k_dummy, nheads_kv, hdim, dtype=torch.bfloat16, device="cuda")
-            V = torch.randn(total_k_dummy, nheads_kv, hdimv, dtype=torch.bfloat16, device="cuda")
-            cu_seqlens_k_dummy = torch.arange(
-                0, (batch + 1) * seqlen_k, seqlen_k, dtype=torch.int32, device="cuda"
-            )
-        else:
-            K = torch.randn(batch, seqlen_k, nheads_kv, hdim, dtype=torch.bfloat16, device="cuda")
-            V = torch.randn(batch, seqlen_k, nheads_kv, hdimv, dtype=torch.bfloat16, device="cuda")
-
-        mQ = from_dlpack(Q, assumed_align=16).mark_layout_dynamic(leading_dim=Q.ndim - 1)
-        mQv = from_dlpack(Qv, assumed_align=16).mark_layout_dynamic(leading_dim=Qv.ndim - 1)
-        mK = from_dlpack(K, assumed_align=16).mark_layout_dynamic(leading_dim=K.ndim - 1)
-        mV = from_dlpack(V, assumed_align=16).mark_layout_dynamic(leading_dim=V.ndim - 1)
-        mO = from_dlpack(O, assumed_align=16).mark_layout_dynamic(leading_dim=O.ndim - 1)
-        mP = from_dlpack(P, assumed_align=16).mark_layout_dynamic(leading_dim=P.ndim - 1)
-        mLSE = from_dlpack(lse, assumed_align=4).mark_layout_dynamic(leading_dim=lse.ndim - 1)
-        mRowMax = from_dlpack(row_max, assumed_align=4).mark_layout_dynamic(
-            leading_dim=row_max.ndim - 1
-        )
-        if gather_kv:
-            mIndexTopk = from_dlpack(index_topk, assumed_align=16).mark_layout_dynamic(
-                leading_dim=index_topk.ndim - 1
-            )
-        else:
-            mIndexTopk = None
-
-        compile_kwargs = dict(mIndexTopk=mIndexTopk)
-        if varlen_q:
-            compile_kwargs["mCuSeqlensQ"] = from_dlpack(cu_seqlens_q_dummy, assumed_align=4)
-        if varlen_k:
-            compile_kwargs["mCuSeqlensK"] = from_dlpack(cu_seqlens_k_dummy, assumed_align=4)
-
-        if not has_qk:
-            mQ = mK = None
-
-        if store_P is False:
-            mP = mRowMax = None
-
-        kernel = cute.compile(
-            FlashAttentionMLAForwardSm100(
-                is_causal=is_causal,
-                use_cpasync_load_KV=gather_kv,
-                topk_length=topk_length if gather_kv else 2048,
-                is_topk_gather=gather_kv,
-                pack_gqa=pack_gqa,
-                qhead_per_kvhead=qhead_per_kvhead,
-                nheads_kv=nheads_kv,
-                is_varlen_q=varlen_q,
-                disable_bitmask=disable_bitmask,
-                has_qk=has_qk,
-            ),
-            mQ,
-            mQv,
-            mK,
-            mV,
-            mO,
-            mLSE,
-            softmax_scale,
-            mP,
-            mRowMax,
-            **compile_kwargs,
-            stream=stream,
-            options="--keep-ptx --keep-cubin --generate-line-info",
-        )
-        dump_kernel_attributes(kernel)
-        compile_cache[compile_key] = kernel
-
-    # ================================================================
-    # ---- Generate variable seqlens for this run ----
-    if varlen_q:
-        torch.manual_seed(seed + 1000)
-        # When causal without varlen_k, every per-batch seqlen_q must not exceed seqlen_k.
-        max_seqlen_q = seqlen_k if (is_causal and not varlen_k) else seqlen_q
-        seqlens_q = torch.randint(1, max_seqlen_q + 1, (batch,), dtype=torch.int32)
-        cu_seqlens_q = torch.zeros(batch + 1, dtype=torch.int32, device="cuda")
-        cu_seqlens_q[1:] = seqlens_q.cumsum(0).to(torch.int32).cuda()
-        total_q = cu_seqlens_q[-1].item()
-    else:
-        seqlens_q = torch.full((batch,), seqlen_q, dtype=torch.int32)
-        total_q = None  # unused
-
-    if varlen_k:
-        torch.manual_seed(seed + 2000)
-        # Each batch item must have at least topk_length keys so topk gather is valid.
-        min_seqlen_k = topk_length if gather_kv else 1
-        seqlens_k = torch.randint(min_seqlen_k, seqlen_k + 1, (batch,), dtype=torch.int32)
-        # When causal, every batch item needs seqlens_k[b] >= seqlens_q[b].
-        if is_causal:
-            seqlens_k = torch.maximum(seqlens_k, seqlens_q)
-        cu_seqlens_k = torch.zeros(batch + 1, dtype=torch.int32, device="cuda")
-        cu_seqlens_k[1:] = seqlens_k.cumsum(0).to(torch.int32).cuda()
-        total_k = cu_seqlens_k[-1].item()
-    else:
-        seqlens_k = torch.full((batch,), seqlen_k, dtype=torch.int32)
-        total_k = None  # unused
-
-    torch.manual_seed(seed)  # restore main seed before drawing actual tensors
-
-    # ---- Allocate Q / Qv / O / lse ----
-    if varlen_q:
-        Q = torch.randn(total_q, nheads, hdim, dtype=torch.bfloat16, device="cuda")
-        Qv = torch.randn(total_q, nheads, hdimv, dtype=torch.bfloat16, device="cuda")
-        O = torch.empty(total_q, nheads, hdimv, dtype=torch.bfloat16, device="cuda")
-        P = torch.empty(total_q, nheads, P_k_length, dtype=torch.bfloat16, device="cuda")
-        lse = torch.empty(total_q, nheads, dtype=torch.float32, device="cuda")
-        row_max = torch.empty(
-            total_q_dummy, P_k_length // 128, nheads, dtype=torch.float32, device="cuda"
-        )
-    else:
-        Q = torch.randn(batch, seqlen_q, nheads, hdim, dtype=torch.bfloat16, device="cuda")
-        Qv = torch.randn(batch, seqlen_q, nheads, hdimv, dtype=torch.bfloat16, device="cuda")
-        O = torch.empty(batch, seqlen_q, nheads, hdimv, dtype=torch.bfloat16, device="cuda")
-        P = torch.empty(batch, seqlen_q, nheads, P_k_length, dtype=torch.bfloat16, device="cuda")
-        lse = torch.empty(batch, seqlen_q, nheads, dtype=torch.float32, device="cuda")
-        row_max = torch.empty(
-            batch, seqlen_q, P_k_length // 128, nheads, dtype=torch.float32, device="cuda"
-        )
-
-    # ---- Allocate K / V ----
-    if varlen_k:
-        K = torch.randn(total_k, nheads_kv, hdim, dtype=torch.bfloat16, device="cuda")
-        V = torch.randn(total_k, nheads_kv, hdimv, dtype=torch.bfloat16, device="cuda")
-    else:
-        K = torch.randn(batch, seqlen_k, nheads_kv, hdim, dtype=torch.bfloat16, device="cuda")
-        V = torch.randn(batch, seqlen_k, nheads_kv, hdimv, dtype=torch.bfloat16, device="cuda")
-
-    # ---- Generate index_topk with per-batch valid ranges when varlen_k ----
-    # index_topk shape: (total_q, topk_length) if varlen_q else (batch, seqlen_q, topk_length)
-    if gather_kv:
-        topk_parts = []
-        for b in range(batch):
-            sl_q_b = seqlens_q[b].item()
-            sl_k_b = seqlens_k[b].item()
-            # Draw topk_length unique indices from [0, sl_k_b) for each query in this batch item.
-            topk_b = (
-                torch.rand(sl_q_b, sl_k_b, device="cuda")
-                .argsort(dim=-1)[..., :topk_length]
-                .to(torch.int32)
-            )  # (sl_q_b, topk_length), all < sl_k_b
-            topk_parts.append(topk_b)
-
-        if varlen_q:
-            index_topk = torch.cat(topk_parts, dim=0)  # (total_q, topk_length)
-        else:
-            index_topk = torch.stack(topk_parts, dim=0)  # (batch, seqlen_q, topk_length)
-    else:
-        index_topk = None
-
-    # ---- Reference computation (per-batch loop covers all four varlen combos) ----
-    O_ref_list, O_pt_list, lse_ref_list, lse_pt_list = [], [], [], []
-    for b in range(batch):
-        qs = cu_seqlens_q[b].item() if varlen_q else b * seqlen_q
-        qe = cu_seqlens_q[b + 1].item() if varlen_q else (b + 1) * seqlen_q
-        ks = cu_seqlens_k[b].item() if varlen_k else b * seqlen_k
-        ke = cu_seqlens_k[b + 1].item() if varlen_k else (b + 1) * seqlen_k
-
-        Q_b = Q[qs:qe].unsqueeze(0) if varlen_q else Q[b : b + 1]  # (1, sl_q, nheads, hdim)
-        Qv_b = Qv[qs:qe].unsqueeze(0) if varlen_q else Qv[b : b + 1]  # (1, sl_q, nheads, hdimv)
-        K_b = K[ks:ke].unsqueeze(0) if varlen_k else K[b : b + 1]  # (1, sl_k, nheads_kv, hdim)
-        V_b = V[ks:ke].unsqueeze(0) if varlen_k else V[b : b + 1]  # (1, sl_k, nheads_kv, hdimv)
-        if gather_kv:
-            topk_b = index_topk[qs:qe].unsqueeze(0) if varlen_q else index_topk[b : b + 1]
-        else:
-            topk_b = None
-
-        O_b, _, lse_b = attention_ref(
-            Q_b if has_qk else None,
-            K_b if has_qk else None,
-            V_b,
-            qv=Qv_b,
-            causal=is_causal,
-            return_lse=True,
-            gather_kv_indices=topk_b,
-        )
-        O_pt_b, _, lse_pt_b = attention_ref(
-            Q_b if has_qk else None,
-            K_b if has_qk else None,
-            V_b,
-            qv=Qv_b,
-            causal=is_causal,
-            upcast=False,
-            reorder_ops=True,
-            return_lse=True,
-            gather_kv_indices=topk_b,
-        )
-        O_ref_list.append(O_b.squeeze(0))
-        O_pt_list.append(O_pt_b.squeeze(0))
-        lse_ref_list.append(lse_b.squeeze(0))
-        lse_pt_list.append(lse_pt_b.squeeze(0))
-
-    cat_dim_o = 0 if (varlen_q) else 0  # always 0: leading token/batch dim
-    cat_dim_lse = -1 if (varlen_q) else -1  # always last: token dim
-
-    if varlen_q:
-        O_ref = torch.cat(O_ref_list, dim=0)  # (total_q, nheads, hdimv)
-        O_pt = torch.cat(O_pt_list, dim=0)
-        lse_ref = torch.cat(lse_ref_list, dim=-1)  # (nheads, total_q)
-        lse_pt = torch.cat(lse_pt_list, dim=-1)
-    else:
-        O_ref = torch.stack(O_ref_list, dim=0)  # (batch, seqlen_q, nheads, hdimv)
-        O_pt = torch.stack(O_pt_list, dim=0)
-        lse_ref = torch.stack(lse_ref_list, dim=0)  # (batch, nheads, seqlen_q)
-        lse_pt = torch.stack(lse_pt_list, dim=0)
-
-    rtol = 2
-    atol = 2 * (O_ref + 0.3 - 0.3 - O_ref).abs().max().item()
-
-    # ---- CuTe tensor wrappers ----
-    mQ = from_dlpack(Q, assumed_align=16).mark_layout_dynamic(leading_dim=Q.ndim - 1)
-    mQv = from_dlpack(Qv, assumed_align=16).mark_layout_dynamic(leading_dim=Qv.ndim - 1)
-    mK = from_dlpack(K, assumed_align=16).mark_layout_dynamic(leading_dim=K.ndim - 1)
-    mV = from_dlpack(V, assumed_align=16).mark_layout_dynamic(leading_dim=V.ndim - 1)
-    mO = from_dlpack(O, assumed_align=16).mark_layout_dynamic(leading_dim=O.ndim - 1)
-    mP = from_dlpack(P, assumed_align=16).mark_layout_dynamic(leading_dim=P.ndim - 1)
-    mLSE = from_dlpack(lse, assumed_align=4).mark_layout_dynamic(leading_dim=lse.ndim - 1)
-    mRowMax = from_dlpack(row_max, assumed_align=4).mark_layout_dynamic(
-        leading_dim=row_max.ndim - 1
-    )
-    if index_topk is not None:
-        mIndexTopk = from_dlpack(index_topk, assumed_align=16).mark_layout_dynamic(
-            leading_dim=index_topk.ndim - 1
-        )
-    else:
-        mIndexTopk = None
-
-    run_kwargs = dict(mIndexTopk=mIndexTopk)
-    if varlen_q:
-        run_kwargs["mCuSeqlensQ"] = from_dlpack(cu_seqlens_q, assumed_align=4)
-    if varlen_k:
-        run_kwargs["mCuSeqlensK"] = from_dlpack(cu_seqlens_k, assumed_align=4)
-
-    if not has_qk:
-        mQ = mK = None
-
-    if store_P is False:
-        mP = mRowMax = None
-
-    # ---- Run kernel ----
-    compile_cache[compile_key](
-        mQ,
-        mQv,
-        mK,
-        mV,
-        mO,
-        mLSE,
-        softmax_scale,
-        mP,
-        mRowMax,
-        **run_kwargs,
-        stream=stream,
-    )
-
-    O_ref_max = O_ref.abs().max().item()
-    O_max = O.abs().max().item()
-    print(f"Pytorch O max = {O_ref_max} and our O max = {O_max}")
-    print(f"Pytorch max O diff: {(O_pt - O_ref).abs().max().item()}")
-    print(f"Pytorch mean O diff: {(O_pt - O_ref).abs().mean().item()}")
-    print(f"Max abs diff O, O_ref: {(O - O_ref).abs().max().item()}")
-    print(f"Mean abs diff O, O_ref: {(O - O_ref).abs().mean().item()}")
-
-    lse = lse.transpose(-1, -2)
-    lse_ref_max = lse_ref.abs().max().item()
-    lse_max = lse.abs().max().item()
-    print(f"Pytorch LSE max = {lse_ref_max} and our LSE max = {lse_max}")
-    print(f"Pytorch LSE max diff: {(lse_pt - lse_ref).abs().max().item()}")
-    print(f"Pytorch LSE mean diff: {(lse_pt - lse_ref).abs().mean().item()}")
-    print(f"Max abs diff LSE: {(lse - lse_ref).abs().max().item()}")
-    print(f"Mean abs diff LSE: {(lse - lse_ref).abs().mean().item()}")
-
-    if validate:
-        assert (O - O_ref).abs().max().item() <= rtol * (O_pt - O_ref).abs().max().item() + atol
-        varlen_tag = ""
-        if varlen_q:
-            varlen_tag += f", total_q:{total_q}"
-        if varlen_k:
-            varlen_tag += f", total_k:{total_k}"
-        print(
-            f"batch:{batch:3d}, nheads:{nheads:3d}, seqlen_q:{seqlen_q:5d}, seqlen_k:{seqlen_k:5d}"
-            f"{varlen_tag}, iter:{iter:2d} PASSED"
-        )
-    else:
-        print(mO)
-        print(
-            f"batch:{batch:3d}, nheads:{nheads:3d}, seqlen_q:{seqlen_q:5d}, seqlen_k:{seqlen_k:5d}"
-            f", iter:{iter:2d} RUN (NOT TESTING CORRECTNESS)"
-        )
-
-    return None
-
-
-def timeit(fn, *args, **kwargs):
-    # Synchronize before timing
-    torch.cuda.synchronize()
-
-    # Warmup
-    for _ in range(10):
-        fn(*args, **kwargs)
-
-    # Benchmark using PyTorch's Timer
-    t = benchmark.Timer(
-        stmt="fn(*args, **kwargs)", globals={"fn": fn, "args": args, "kwargs": kwargs}
-    )
-
-    # Time it multiple runs
-    measurement = t.timeit(20)  # 20 repeats
-    avg_time = measurement.mean  # Average time in seconds
-
-    time.sleep(1)
-
-    return avg_time
-
-
-def benchmark_mla_kernel(
-    batch=1,
-    seqlen_q=2048,
-    seqlen_k=2048,
-    topk_length=2048,
-    nheads=128,
-    hdim=64,
-    hdimv=512,
-    compile_cache=dict(),
-    gather_kv=True,
-    is_causal=False,
-    disable_bitmask=False,
-    store_P=False,
-):
-    assert hdim == 64, "hdim must be 64"
-    assert hdimv == 512, "hdimv must be 512"
-
-    qhead_per_kvhead = nheads
-    nheads_kv = 1
-    pack_gqa = True
-    softmax_scale = 1.0 / math.sqrt(hdim + hdimv)
-    seqlen_k_rounded = (seqlen_k + 128 - 1) // 128 * 128
-    P_k_length = seqlen_k_rounded if not gather_kv else topk_length
-
-    torch_stream = torch.cuda.current_stream()
-    stream = cuda.CUstream(torch_stream.cuda_stream)
-
-    compile_key = (
-        is_causal,
-        gather_kv,
-        topk_length if gather_kv else None,
-        pack_gqa,
-        qhead_per_kvhead,
-        nheads_kv,
-        disable_bitmask,
-    )
-    if compile_key not in compile_cache:
-        Q = torch.randn(batch, seqlen_q, nheads, hdim, dtype=torch.bfloat16, device="cuda")
-        Qv = torch.randn(batch, seqlen_q, nheads, hdimv, dtype=torch.bfloat16, device="cuda")
-        K = torch.randn(batch, seqlen_k, nheads_kv, hdim, dtype=torch.bfloat16, device="cuda")
-        V = torch.randn(batch, seqlen_k, nheads_kv, hdimv, dtype=torch.bfloat16, device="cuda")
-        O = torch.empty(batch, seqlen_q, nheads, hdimv, dtype=torch.bfloat16, device="cuda")
-        P = torch.empty(batch, seqlen_q, nheads, P_k_length, dtype=torch.bfloat16, device="cuda")
-        index_topk = (
-            torch.rand(batch, seqlen_q, topk_length, device="cuda").argsort(dim=-1).to(torch.int32)
-        )
-
-        mQ = from_dlpack(Q, assumed_align=16).mark_layout_dynamic(leading_dim=Q.ndim - 1)
-        mQv = from_dlpack(Qv, assumed_align=16).mark_layout_dynamic(leading_dim=Qv.ndim - 1)
-        mK = from_dlpack(K, assumed_align=16).mark_layout_dynamic(leading_dim=K.ndim - 1)
-        mV = from_dlpack(V, assumed_align=16).mark_layout_dynamic(leading_dim=V.ndim - 1)
-        mO = from_dlpack(O, assumed_align=16).mark_layout_dynamic(leading_dim=O.ndim - 1)
-        mP = from_dlpack(P, assumed_align=16).mark_layout_dynamic(leading_dim=P.ndim - 1)
-        if gather_kv:
-            mIndexTopk = from_dlpack(index_topk, assumed_align=16).mark_layout_dynamic(
-                leading_dim=index_topk.ndim - 1
-            )
-        else:
-            mIndexTopk = None
-
-        mLSE = None
-
-        if store_P is False:
-            mP = None
-
-        kernel = cute.compile(
-            FlashAttentionMLAForwardSm100(
-                is_causal=is_causal,
-                use_cpasync_load_KV=gather_kv,
-                topk_length=topk_length if gather_kv else 2048,
-                is_topk_gather=gather_kv,
-                pack_gqa=pack_gqa,
-                qhead_per_kvhead=qhead_per_kvhead,
-                nheads_kv=nheads_kv,
-                disable_bitmask=disable_bitmask,
-            ),
-            mQ,
-            mQv,
-            mK,
-            mV,
-            mO,
-            mLSE,
-            softmax_scale,
-            mP=mP,
-            mIndexTopk=mIndexTopk,
-            stream=stream,
-        )
-        compile_cache[compile_key] = kernel
-
-    Q = torch.randn(batch, seqlen_q, nheads, hdim, dtype=torch.bfloat16, device="cuda")
-    Qv = torch.randn(batch, seqlen_q, nheads, hdimv, dtype=torch.bfloat16, device="cuda")
-    K = torch.randn(batch, seqlen_k, nheads_kv, hdim, dtype=torch.bfloat16, device="cuda")
-    V = torch.randn(batch, seqlen_k, nheads_kv, hdimv, dtype=torch.bfloat16, device="cuda")
-    O = torch.empty(batch, seqlen_q, nheads, hdimv, dtype=torch.bfloat16, device="cuda")
-    P = torch.empty(batch, seqlen_q, nheads, P_k_length, dtype=torch.bfloat16, device="cuda")
-
-    index_topk = (
-        torch.rand(batch, seqlen_q, topk_length, device="cuda").argsort(dim=-1).to(torch.int32)
-    )
-
-    mQ = from_dlpack(Q, assumed_align=16).mark_layout_dynamic(leading_dim=Q.ndim - 1)
-    mQv = from_dlpack(Qv, assumed_align=16).mark_layout_dynamic(leading_dim=Qv.ndim - 1)
-    mK = from_dlpack(K, assumed_align=16).mark_layout_dynamic(leading_dim=K.ndim - 1)
-    mV = from_dlpack(V, assumed_align=16).mark_layout_dynamic(leading_dim=V.ndim - 1)
-    mO = from_dlpack(O, assumed_align=16).mark_layout_dynamic(leading_dim=O.ndim - 1)
-    mP = from_dlpack(P, assumed_align=16).mark_layout_dynamic(leading_dim=P.ndim - 1)
-    if gather_kv:
-        mIndexTopk = from_dlpack(index_topk, assumed_align=16).mark_layout_dynamic(
-            leading_dim=index_topk.ndim - 1
-        )
-    else:
-        mIndexTopk = None
-    mLSE = None
-
-    if store_P is False:
-        mP = None
-
-    exec_time_in_s = timeit(
-        compile_cache[compile_key],
-        mQ,
-        mQv,
-        mK,
-        mV,
-        mO,
-        mLSE,
-        softmax_scale,
-        mP=mP,
-        mIndexTopk=mIndexTopk,
-        stream=stream,
-    )
-
-    seqlen_k_eff = topk_length if gather_kv else seqlen_k
-
-    FLOPs = 2 * batch * nheads * seqlen_q * seqlen_k_eff * (hdim + 2 * hdimv)
-    if is_causal and not gather_kv:
-        FLOPs /= 2
-
-    TFLOPS = FLOPs / exec_time_in_s / 1e12
-
-    q_bytes = 2 * batch * nheads * seqlen_q * hdim
-    qv_bytes = 2 * batch * nheads * seqlen_q * hdimv
-    k_bytes = 2 * batch * nheads_kv * seqlen_k_eff * hdim
-    v_bytes = 2 * batch * nheads_kv * seqlen_k_eff * hdimv
-    o_bytes = 2 * batch * nheads * seqlen_q * hdimv
-    total_bytes = q_bytes + qv_bytes + k_bytes + v_bytes + o_bytes
-    TBs = total_bytes / exec_time_in_s / 1e12
-
-    print(
-        f"batch: {batch}, seqlen_q: {seqlen_q}, seqlen_k: {seqlen_k}, nheads: {nheads}, -> {exec_time_in_s * 1e3:.2f} ms, {TFLOPS:.2f} TFLOPS, {TBs:.2f} TBs"
-    )
-
-
-if __name__ == "__main__":
-    run_test = True
-    run_benchmark = True
-    gather_kv = True
-    is_causal = False
-    pack_gqa = True
-    topk_length = 2048
-    varlen_q = False
-    varlen_k = False
-    disable_bitmask = False
-    validate = True
-    has_qk = True
-
-    if run_test:
-        if not gather_kv:
-            seqlen_q_test_values = range(1, 4002, 400)
-            seqlen_k_test_values = range(1, 4002, 400)
-        else:
-            seqlen_q_test_values = range(1, 1001, 200)
-            seqlen_k_test_values = range(topk_length, 9001, 2000)
-        seqlen_q_test_values = [4096]
-        seqlen_k_test_values = [4096]
-        nheads_test_values = [128]
-        batch_test_values = [1]
-        test_configs = [
-            (
-                batch,
-                nheads,
-                seqlen_q,
-                seqlen_k,
-            )
-            for batch in batch_test_values
-            for nheads in nheads_test_values
-            for seqlen_q in seqlen_q_test_values
-            for seqlen_k in seqlen_k_test_values
-        ]
-        iters_per_config = 1
-        compile_cache = dict()
-        print("=" * 40)
-        print("Testing MLA Kernel")
-        print("=" * 40)
-        for config in test_configs:
-            batch, nheads, seqlen_q, seqlen_k = config
-            # if is_causal and seqlen_k < seqlen_q:
-            #     continue
-            for iter in range(iters_per_config):
-                test_mla_kernel(
-                    seqlen_q=seqlen_q,
-                    seqlen_k=seqlen_k,
-                    topk_length=topk_length,
-                    nheads=nheads,
-                    batch=batch,
-                    iter=iter,
-                    compile_cache=compile_cache,
-                    validate=validate,
-                    seed=0,
-                    gather_kv=gather_kv,
-                    pack_gqa=pack_gqa,
-                    is_causal=is_causal,
-                    varlen_q=varlen_q,
-                    varlen_k=varlen_k,
-                    disable_bitmask=disable_bitmask,
-                    has_qk=has_qk,
-                )
-    if run_benchmark:
-        if gather_kv:
-            seqlen_q_benchmark_values = [1]
-            seqlen_k_benchmark_values = [8192 * 2]
-            nheads_benchmark_values = [128]
-            batch_benchmark_values = [128]
-        else:
-            seqlen_q_benchmark_values = [1]
-            seqlen_k_benchmark_values = [8192]
-            nheads_benchmark_values = [128]
-            batch_benchmark_values = [128]
-        # seqlen_q_benchmark_values = [4096]
-        # seqlen_k_benchmark_values = [4096]
-        # nheads_benchmark_values = [16]
-        # batch_benchmark_values = [8]
-        benchmark_configs = [
-            (
-                batch,
-                nheads,
-                seqlen_q,
-                seqlen_k,
-            )
-            for batch in batch_benchmark_values
-            for nheads in nheads_benchmark_values
-            for seqlen_q in seqlen_q_benchmark_values
-            for seqlen_k in seqlen_k_benchmark_values
-        ]
-        compile_cache = dict()
-        print("=" * 40)
-        print("Benchmarking MLA Kernel")
-        print("=" * 40)
-        for config in benchmark_configs:
-            batch, nheads, seqlen_q, seqlen_k = config
-            benchmark_mla_kernel(
-                batch=batch,
-                seqlen_q=seqlen_q,
-                seqlen_k=seqlen_k,
-                topk_length=topk_length,
-                nheads=nheads,
-                gather_kv=gather_kv,
-                is_causal=is_causal,
-                disable_bitmask=disable_bitmask,
-                compile_cache=compile_cache,
-            )

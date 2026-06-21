@@ -116,7 +116,7 @@ class BlackwellFusedMultiHeadAttentionBackward:
         score_mod_bwd: cutlass.Constexpr | None = None,
         mask_mod: cutlass.Constexpr | None = None,
         has_aux_tensors: cutlass.Constexpr = False,
-        subtile_factor: cutlass.Constexpr[int] = 1,
+        q_subtile_factor: cutlass.Constexpr[int] = 1,
         tile_m_dq: int = 128,
         tile_n_dq: int = 128,
         tile_m_dkdv: int = 128,
@@ -148,7 +148,7 @@ class BlackwellFusedMultiHeadAttentionBackward:
             "SM100 backward with head_dim=256 only supports cluster_size in {1, 2}"
         )
         assert use_2cta_instrs, "SM100 backward with head_dim=256 requires use_2cta_instrs=True"
-        # subtile_factor is accepted for interface parity with FlashAttentionBackwardSm100,
+        # q_subtile_factor is accepted for interface parity with FlashAttentionBackwardSm100,
         # but this dedicated kernel uses fixed internal behavior.
 
         self.acc_dtype = cutlass.Float32

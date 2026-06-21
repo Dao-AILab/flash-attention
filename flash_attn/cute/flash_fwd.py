@@ -56,7 +56,7 @@ class FlashAttentionForwardBase:
         score_mod: Optional[cutlass.Constexpr] = None,
         mask_mod: Optional[cutlass.Constexpr] = None,
         has_aux_tensors: bool = False,
-        q_subtile_factor: int | None = None,
+        q_subtile_factor: int = 1,
     ):
         """Initializes the configuration for a flash attention kernel.
 
