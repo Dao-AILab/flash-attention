@@ -41,6 +41,7 @@ class FlashAttentionBackwardSm80:
         num_threads: int = 256,
         pack_gqa: bool = False,
         is_causal: bool = False,
+        is_local: bool = False,
         SdP_swapAB: bool = False,
         dKV_swapAB: bool = False,
         dQ_swapAB: bool = False,
@@ -83,6 +84,7 @@ class FlashAttentionBackwardSm80:
         self.num_threads = num_threads
         self.pack_gqa = pack_gqa
         self.is_causal = is_causal
+        self.is_local = is_local
         self.num_stages_Q = num_stages_Q
         self.num_stages_dO = num_stages_dO
         self.SdP_swapAB = SdP_swapAB
@@ -436,7 +438,7 @@ class FlashAttentionBackwardSm80:
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
         grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
 
-        softmax_scale_log2, softmax_scale = utils.compute_softmax_scale_log2(softmax_scale, self.score_mod)
+        softmax_scale_log2, _ = utils.compute_softmax_scale_log2(softmax_scale, self.score_mod)
         self.kernel(
             mQ,
             mK,
@@ -451,6 +453,8 @@ class FlashAttentionBackwardSm80:
             mCuSeqlensK,
             mSeqUsedQ,
             mSeqUsedK,
+            window_size_left,
+            window_size_right,
             softmax_scale,
             softmax_scale_log2,
             self.sQ_layout,
@@ -496,6 +500,8 @@ class FlashAttentionBackwardSm80:
         mCuSeqlensK: Optional[cute.Tensor],
         mSeqUsedQ: Optional[cute.Tensor],
         mSeqUsedK: Optional[cute.Tensor],
+        window_size_left: Int32 | int | None,
+        window_size_right: Int32 | int | None,
         softmax_scale: cutlass.Float32,
         softmax_scale_log2: cutlass.Float32,
         sQ_layout: cute.ComposedLayout,
@@ -822,11 +828,18 @@ class FlashAttentionBackwardSm80:
             # Mainloop
             # ///////////////////////////////////////////////////////////////////////////////
             # Start processing of the first n-block.
-            mask = AttentionMask(self.m_block_size, self.n_block_size, seqlen)
+            mask = AttentionMask(
+                self.m_block_size,
+                self.n_block_size,
+                seqlen,
+                window_size_left=window_size_left,
+                window_size_right=window_size_right,
+                swap_AB=self.SdP_swapAB,
+            )
             mask_fn = partial(
                 mask.apply_mask, n_block=n_block, thr_mma=thr_mma_sdp,
                 batch_idx=batch_idx, head_idx=head_idx,
-                mask_seqlen=True, mask_causal=self.is_causal
+                mask_seqlen=True, mask_causal=self.is_causal, mask_local=self.is_local
             )
             smem_pipe_read_q = cutlass.Int32(0)
             smem_pipe_read_do = cutlass.Int32(0)

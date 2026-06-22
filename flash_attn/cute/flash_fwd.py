@@ -655,8 +655,10 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         self.num_producer_threads = self.num_threads
         self.num_Q_load_threads = self.num_threads
         self.num_epilogue_threads = self.num_threads
-        # self.use_tma_O = self.arch >= 90 and mCuSeqlensQ is None
-        self.use_tma_O = self.arch >= Arch.sm_90
+        # SM120 subclasses this SM80 kernel, but BaseDSL overwrites self.arch
+        # with the actual compile target. Keep the TMA-O path to SM90/SM100-era
+        # kernels where the TMA copy atom is initialized.
+        self.use_tma_O = Arch.sm_90 <= self.arch < Arch.sm_120
         self._setup_attributes()
         SharedStorage = self._get_shared_storage_cls()
         mQ, mK, mV, mO = [assume_tensor_aligned(t) for t in (mQ, mK, mV, mO)]

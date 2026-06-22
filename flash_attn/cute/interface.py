@@ -513,6 +513,8 @@ def _flash_attn_fwd(
     causal, local, window_size_left, window_size_right = _resolve_causal_local_window(
         causal, window_size_left, window_size_right, mask_mod
     )
+    window_size_left_compile = Int32(window_size_left) if window_size_left is not None else None
+    window_size_right_compile = Int32(window_size_right) if window_size_right is not None else None
 
     requested_use_clc_scheduler = utils._get_use_clc_scheduler_default()
     requested_disable_2cta = utils._get_disable_2cta_default(is_fwd=True)
@@ -995,8 +997,8 @@ def _flash_attn_fwd(
                 seqused_k_tensor,
                 gather_kv_indices_tensor,
                 page_table_tensor,
-                window_size_left,
-                window_size_right,
+                window_size_left_compile,
+                window_size_right_compile,
                 current_stream,
                 options="--enable-tvm-ffi",
             )
@@ -1014,8 +1016,8 @@ def _flash_attn_fwd(
                 seqused_q_tensor,
                 seqused_k_tensor,
                 page_table_tensor,
-                window_size_left,
-                window_size_right,
+                window_size_left_compile,
+                window_size_right_compile,
                 learnable_sink_tensor,
             ]
             if arch // 10 in [10, 11]:
@@ -1359,6 +1361,8 @@ def _flash_attn_bwd(
     causal, local, window_size_left, window_size_right = _resolve_causal_local_window(
         causal, window_size_left, window_size_right
     )
+    window_size_left_compile = Int32(window_size_left) if window_size_left is not None else None
+    window_size_right_compile = Int32(window_size_right) if window_size_right is not None else None
 
     if arch // 10 == 12:
         # SM120: uses SM80 MMA with 99 KB SMEM, 128 threads (4 warps).
@@ -1377,6 +1381,7 @@ def _flash_attn_bwd(
         AtomLayoutNdKV = 4
         AtomLayoutMdQ = 4
         V_in_regs = False
+        dQ_single_wg = False
         cluster_size = 1
         use_2cta_instrs = False
         num_threads = 128
@@ -1810,6 +1815,7 @@ def _flash_attn_bwd(
                 num_threads,
                 pack_gqa,
                 causal,
+                local,
                 SdP_swapAB,
                 dKV_swapAB,
                 dQ_swapAB,
@@ -1930,8 +1936,8 @@ def _flash_attn_bwd(
             cu_seqlens_k_tensor,
             seqused_q_tensor,
             seqused_k_tensor,
-            window_size_left,
-            window_size_right,
+            window_size_left_compile,
+            window_size_right_compile,
             dQ_semaphore_tensor,
             dK_semaphore_tensor,
             dV_semaphore_tensor,
