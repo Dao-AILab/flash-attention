@@ -939,9 +939,6 @@ def _flash_attn_fwd(
                         )
                     # pack_gqa is an auto-selected optimization; disable it for hd256 kernel
                     pack_gqa = False
-                    # The hd256 dedicated kernel derives q/k/v global-memory strides
-                    # from the actual input tensors. Compatible non-contiguous inputs stay
-                    # zero-copy; the guard above only copies if stride hints would be unsafe.
 
                 flash_fwd_obj_cls = (
                     BlackwellFusedMultiHeadAttentionForward
@@ -1889,8 +1886,6 @@ def _flash_attn_bwd(
                     "SM100 backward with head_dim=256 does not support dlse"
                 assert seqused_q is None and seqused_k is None, \
                     "SM100 backward with head_dim=256 does not support seqused_q/seqused_k"
-                # q/k/v/out/dout were already made compatible with the hd256
-                # stride assumptions before preprocess, compile, and launch.
 
                 dq_tile_mn = (128, 128)
                 dkdv_tile_mn = (128, 64)
