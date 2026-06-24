@@ -1,4 +1,4 @@
-# Copyright (c) 2025, Siyu Wang, Shengbin Di, Yuxi Chi, Johnsonms, Linfeng Zheng, Haoyan Huang, Lanbo Li, Yun Zhong, Man Yuan, Minmin Sun, Yong Li, Wei Lin.
+# Copyright (c) 2025, Siyu Wang, Shengbin Di, Yuxi Chi, Johnsonms, Linfeng Zheng, Haoyan Huang, Lanbo Li, Yun Zhong, Man Yuan, Minmin Sun, Yong Li, Wei Lin, Omar Attia.
 
 import math
 from typing import Tuple, Optional
@@ -296,11 +296,6 @@ class BlackwellFusedMultiHeadAttentionForward:
         b_lse = b64 if cum_seqlen_q is None else 1
         stride_b_lse = h_r64 * h_k64 * s_lse64 if cum_seqlen_q is None else 0
 
-        # Normalize q/o (and dense k/v) to canonical (B, S, H_k, H_r, D) views that
-        # preserve the *real* input strides. Hardcoding contiguous strides silently
-        # corrupts output for callers that pass transpose-views (e.g. HuggingFace
-        # attention's (B, H, S, D).transpose(1, 2)). Mirrors the helper-based pattern
-        # in sm100_hd256_2cta_fmha_backward.py:_as_bshkrd_tensor.
         varlen_q = cum_seqlen_q is not None
         varlen_k = cum_seqlen_k is not None
         q_norm = _as_bshkrd_tensor(q_tensor, h_k, h_r, varlen_q)
@@ -322,9 +317,8 @@ class BlackwellFusedMultiHeadAttentionForward:
         if cutlass.const_expr(mPageTable is not None):
             # Paged: input k/v are rank-4 (num_pages, page_size, h_k, d); the kernel
             # consumes K as (page_size, d, h_k, num_pages) and V as
-            # (d, page_size, h_k, num_pages). cute.select reorders modes while
-            # preserving input strides, matching flash_fwd_sm100.py's idiom.
-            num_pages = k_tensor.shape[0]
+            # (d, page_size, h_k, num_pages).
+            # cute.select reorders modes while preserving input strides
             page_size = k_tensor.shape[1]
             max_seqlen_k_paged = Int32(mPageTable.shape[1] * page_size)
             k = cute.make_tensor(k_tensor.iterator, cute.select(k_tensor.layout, mode=[1, 3, 2, 0]))
