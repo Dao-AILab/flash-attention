@@ -307,7 +307,7 @@ def main(argv: Iterable[str] | None = None) -> int:
                 # FA4 / CuTe BF16 baseline
                 try:
                     softmax_scale = headdim**-0.5
-                    out_fa4_bf16, _ = flash_attn_cute_fwd(
+                    out_fa4_bf16, *_ = flash_attn_cute_fwd(
                         q_bf16, k_bf16, v_bf16, softmax_scale=softmax_scale, causal=causal
                     )  # warmup / compile
                     t = time_fwd(
@@ -375,7 +375,7 @@ def main(argv: Iterable[str] | None = None) -> int:
 
                 try:
                     # Warmup/compile (will raise until FP8 is implemented)
-                    out_fa4_fp8, _ = flash_attn_cute_fwd(q_fp8, k_fp8, v_fp8, **fa4_kwargs)
+                    out_fa4_fp8, *_ = flash_attn_cute_fwd(q_fp8, k_fp8, v_fp8, **fa4_kwargs)
                     t = time_fwd(
                         flash_attn_cute_fwd,
                         q_fp8,

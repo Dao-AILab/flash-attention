@@ -825,7 +825,7 @@ def run_cute_flash_bwd(
 
         dq, dk, dv = torch.autograd.grad(out, (q_t, k_t, v_t), grad_out)
     else:
-        out, lse = _flash_attn_fwd(
+        out, lse, *_ = _flash_attn_fwd(
             q_t,
             k_t,
             v_t,
@@ -956,7 +956,7 @@ def test_sm90_block_sparse_score_mod_backward_with_dq_swapab():
     q_t = q.transpose(1, 2)
     k_t = k.transpose(1, 2)
     v_t = v.transpose(1, 2)
-    out, lse = _flash_attn_fwd(
+    out, lse, *_ = _flash_attn_fwd(
         q_t,
         k_t,
         v_t,
