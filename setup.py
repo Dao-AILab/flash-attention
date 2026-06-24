@@ -67,6 +67,9 @@ FORCE_CXX11_ABI = os.getenv("FLASH_ATTENTION_FORCE_CXX11_ABI", "FALSE") == "TRUE
 ROCM_BACKEND: Optional[Literal["triton", "ck"]] = None
 if IS_ROCM:
     ROCM_BACKEND = "triton" if os.getenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", "FALSE") == "TRUE" else "ck"
+USE_SYSTEM_TRITON = (
+    ROCM_BACKEND == "triton" and os.getenv("FLASH_ATTENTION_USE_SYSTEM_TRITON", "FALSE") == "TRUE"
+)
 NVCC_THREADS = os.getenv("NVCC_THREADS") or "4"
 
 @functools.lru_cache(maxsize=None)
@@ -227,9 +230,14 @@ if IS_ROCM:
             assert os.path.isdir("third_party/aiter"), (
                 "third_party/aiter is missing, please use source distribution or git clone"
             )
+        env = os.environ.copy()
+        if USE_SYSTEM_TRITON:
+            env["AITER_USE_SYSTEM_TRITON"] = "1"
+
         subprocess.run(
             [sys.executable, "-m", "pip", "install", "--no-build-isolation", "third_party/aiter"],
             check=True,
+            env=env,
         )
     elif ROCM_BACKEND == "ck":
         if os.path.isdir(".git"):
@@ -676,10 +684,11 @@ class NinjaBuildExtension(BuildExtension):
 # Build install_requires based on platform
 if ROCM_BACKEND == "triton":
     # Note: torch is excluded because pip resolves it to CUDA PyTorch from PyPI, overwriting any pre-installed ROCm PyTorch. Users must have torch installed.
-    install_requires = [
-        "einops",
-        "triton>=3.6.0" if sys.platform != "win32" else "triton-windows>=3.6.0",
-    ]
+    install_requires = ["einops"]
+    if not USE_SYSTEM_TRITON:
+        install_requires.append(
+            "triton>=3.6.0" if sys.platform != "win32" else "triton-windows>=3.6.0"
+        )
 else:
     install_requires = [
         "torch",
