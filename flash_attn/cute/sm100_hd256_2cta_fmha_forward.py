@@ -29,9 +29,7 @@ from flash_attn.cute.mask import (
 )
 from flash_attn.cute.tile_scheduler import SM100_TMEM_CAPACITY_COLUMNS
 from flash_attn.cute.flash_fwd_sm100 import DescaleTensors, _TUNING_CONFIG
-from flash_attn.cute.sm100_hd256_layout_utils import _as_bshkrd_tensor
-from flash_attn.cute.utils import ex2_emulation_2
-from flash_attn.cute.utils import AuxData
+from flash_attn.cute.utils import ex2_emulation_2, as_bshkrd_tensor, AuxData
 
 
 class BlackwellFusedMultiHeadAttentionForward:
@@ -298,8 +296,8 @@ class BlackwellFusedMultiHeadAttentionForward:
 
         varlen_q = cum_seqlen_q is not None
         varlen_k = cum_seqlen_k is not None
-        q_norm = _as_bshkrd_tensor(q_tensor, h_k, h_r, varlen_q)
-        o_norm = _as_bshkrd_tensor(o_tensor, h_k, h_r, varlen_q)
+        q_norm = as_bshkrd_tensor(q_tensor, h_k, h_r, varlen_q)
+        o_norm = as_bshkrd_tensor(o_tensor, h_k, h_r, varlen_q)
 
         # Forward layout: (s, d, ((h_r, h_k), b)). Stride picks from canonical
         # positions 1=S, 4=D, 3=H_r, 2=H_k, 0=B.
@@ -333,8 +331,8 @@ class BlackwellFusedMultiHeadAttentionForward:
         else:
             # K/V have no h_r dim; pass h_r=1 to the normalizer and override the
             # h_r stride to 0 below to broadcast across the query-grouped heads.
-            k_norm = _as_bshkrd_tensor(k_tensor, h_k, 1, varlen_k)
-            v_norm = _as_bshkrd_tensor(v_tensor, h_k, 1, varlen_k)
+            k_norm = as_bshkrd_tensor(k_tensor, h_k, 1, varlen_k)
+            v_norm = as_bshkrd_tensor(v_tensor, h_k, 1, varlen_k)
             # (s, d, ((h_r, h_k), b)), 0-stride for h_r to broadcast
             k = cute.make_tensor(
                 k_norm.iterator,

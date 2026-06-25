@@ -1,4 +1,4 @@
-# Copyright (c) 2025, Siyu Wang, Shengbin Di, Yuxi Chi, Johnsonms, Linfeng Zheng, Haoyan Huang, Lanbo Li, Yun Zhong, Man Yuan, Minmin Sun, Yong Li, Wei Lin.
+# Copyright (c) 2025, Siyu Wang, Shengbin Di, Yuxi Chi, Johnsonms, Linfeng Zheng, Haoyan Huang, Lanbo Li, Yun Zhong, Man Yuan, Minmin Sun, Yong Li, Wei Lin, Omar Attia.
 
 
 """Fused multi-head attention (FMHA) backward for the SM100 architecture using CUTE DSL.
@@ -22,8 +22,7 @@ from flash_attn.cute.sm100_hd256_2cta_fmha_backward_dkdvkernel import (
     BlackwellFusedMultiHeadAttentionBackwardDKDVKernel,
 )
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
-from flash_attn.cute.sm100_hd256_layout_utils import _as_bshkrd_tensor, _as_shhb_tensor
-from flash_attn.cute.utils import AuxData
+from flash_attn.cute.utils import AuxData, as_bshkrd_tensor, as_shhb_tensor
 
 
 class BlackwellFusedMultiHeadAttentionBackward:
@@ -186,15 +185,15 @@ class BlackwellFusedMultiHeadAttentionBackward:
 
         Q, K, V, dQ, dK, dV, dO = [assume_tensor_aligned(t) for t in (Q, K, V, dQ, dK, dV, dO)]
 
-        Q = _as_bshkrd_tensor(Q, h_k, h_r, varlen)
-        K = _as_bshkrd_tensor(K, h_k, 1, varlen)
-        V = _as_bshkrd_tensor(V, h_k, 1, varlen)
-        dQ = _as_bshkrd_tensor(dQ, h_k, h_r, varlen)
-        dK = _as_bshkrd_tensor(dK, h_k, 1, varlen)
-        dV = _as_bshkrd_tensor(dV, h_k, 1, varlen)
-        dO = _as_bshkrd_tensor(dO, h_k, h_r, varlen)
-        scaled_LSE = _as_shhb_tensor(lse_log2, h_k, h_r, b, varlen)
-        sum_OdO = _as_shhb_tensor(dpsum, h_k, h_r, b, varlen)
+        Q = as_bshkrd_tensor(Q, h_k, h_r, varlen)
+        K = as_bshkrd_tensor(K, h_k, 1, varlen)
+        V = as_bshkrd_tensor(V, h_k, 1, varlen)
+        dQ = as_bshkrd_tensor(dQ, h_k, h_r, varlen)
+        dK = as_bshkrd_tensor(dK, h_k, 1, varlen)
+        dV = as_bshkrd_tensor(dV, h_k, 1, varlen)
+        dO = as_bshkrd_tensor(dO, h_k, h_r, varlen)
+        scaled_LSE = as_shhb_tensor(lse_log2, h_k, h_r, b, varlen)
+        sum_OdO = as_shhb_tensor(dpsum, h_k, h_r, b, varlen)
 
         # Keep original order: dQ first, then dKdV.
         self.dq_kernel(
