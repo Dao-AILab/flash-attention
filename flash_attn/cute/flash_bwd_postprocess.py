@@ -16,9 +16,9 @@ from cutlass.utils import LayoutEnum
 
 from quack import copy_utils
 from quack import layout_utils
-from quack import sm90_utils
 
 from flash_attn.cute import utils
+from flash_attn.cute import sm90_layout
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import ampere_helpers as sm80_utils
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
@@ -195,7 +195,7 @@ class FlashAttentionBackwardPostprocess:
             )
         elif const_expr(self.arch // 10 == 9):
             wg_d_dQ = num_wg_mma // self.AtomLayoutMdQ
-            self.sdQ_layout = sm90_utils.make_smem_layout(
+            self.sdQ_layout = sm90_layout.make_smem_layout(
                 self.dtype,
                 LayoutEnum.ROW_MAJOR,
                 (self.tile_m, self.tile_hdim),
