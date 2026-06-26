@@ -354,7 +354,7 @@ class dQdQvGemmKernel:
             mbar_ptr_KV_cpasync: cute.struct.MemRange[cutlass.Int64, self.num_stages_KV * 2]
             mbar_ptr_load_kv_epi: cute.struct.MemRange[cutlass.Int64, 2]
             # Tmem holding buffer
-            mbar_ptr_tmem_dealloc: cutlass.Int64
+            tmem_dealloc_mbar: cutlass.Int64
             tmem_holding_buf: cutlass.Int32
             # Clc pointers
             clc_ptr: cute.struct.Align[
@@ -569,11 +569,11 @@ class dQdQvGemmKernel:
         )
         # ---- Tensor memory dealloc barrier init ----
         tmem = utils.TmemAllocator(
-            storage.tmem_holding_buf,
+            storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=self.epilogue_warp_ids[0],
             is_two_cta=False,
-            two_cta_tmem_dealloc_mbar_ptr=storage.mbar_ptr_tmem_dealloc,
+            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar.ptr,
         )
 
         # ---- Cluster arrive after barrier init ----
