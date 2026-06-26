@@ -304,7 +304,7 @@ class FlashAttentionMLAForwardSm100:
                 self.num_stages_bitmask,
             ]
         )
-        mbar_ptr_tmem_dealloc_struct = Int64
+        tmem_dealloc_mbar_struct = Int64
         tmem_holding_buf_struct = Int32
 
         self.sched_stages = 1
@@ -325,7 +325,7 @@ class FlashAttentionMLAForwardSm100:
             mbar_ptr_V_cpasync: mbar_ptr_V_struct
             mbar_ptr_sm_stats: mbar_sm_stats_struct
             mbar_ptr_bitmask: mbar_bitmask_struct
-            mbar_ptr_tmem_dealloc: mbar_ptr_tmem_dealloc_struct
+            tmem_dealloc_mbar: tmem_dealloc_mbar_struct
             tmem_holding_buf: tmem_holding_buf_struct
             clc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, clc_mbar_size]
             clc_response: cute.struct.MemRange[Int32, clc_response_size]
@@ -820,11 +820,11 @@ class FlashAttentionMLAForwardSm100:
             num_threads=self.num_mma_threads + self.num_softmax_threads + self.num_epilogue_threads,
         )
         tmem = cutlass.utils.TmemAllocator(
-            storage.tmem_holding_buf,
+            storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=self.mma_warp_id,
             is_two_cta=self.use_2cta_instrs,
-            two_cta_tmem_dealloc_mbar_ptr=storage.mbar_ptr_tmem_dealloc,
+            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar.ptr,
         )
 
         # ==== Prefetch TMA descriptors ====
