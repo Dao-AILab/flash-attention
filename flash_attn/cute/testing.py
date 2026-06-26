@@ -484,4 +484,16 @@ def maybe_fake_tensor_mode(fake: bool = True):
 
 
 def is_fake_mode() -> bool:
+    # During torch.compile / Dynamo tracing there are no real tensors to
+    # validate, and `active_fake_mode()` lives in Dynamo's MOD_SKIPLIST so
+    # calling it inside a traced region raises Unsupported ("Attempted to call
+    # function marked as skipped"). Treat compile-time tracing the same as fake
+    # mode so guards that gate real-tensor assertions (e.g. `.is_cuda` checks)
+    # are skipped cleanly under compilation. `torch.compiler.is_compiling()` is
+    # safe to trace.
+    try:
+        if torch.compiler.is_compiling():
+            return True
+    except Exception:
+        pass
     return active_fake_mode() is not None
