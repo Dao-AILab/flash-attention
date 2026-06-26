@@ -10,6 +10,7 @@
 #ifndef FLASHATTENTION_DISABLE_DROPOUT
 #include <ATen/cuda/CUDAGeneratorImpl.h>  // For at::PhiloxCudaState / at::CUDAGeneratorImpl (default-generator dropout path)
 #include "philox_unpack.cuh"  // For at::cuda::philox::unpack
+#include <type_traits>  // For std::is_trivially_copyable (philox_args buffer assert below)
 #endif
 
 #include <cutlass/numeric_types.h>
@@ -33,6 +34,11 @@ static_assert(sizeof(at::PhiloxCudaState) <= sizeof(Flash_fwd_params::philox_arg
               "Flash_fwd_params::philox_args buffer is too small for at::PhiloxCudaState");
 static_assert(alignof(at::PhiloxCudaState) <= alignof(decltype(Flash_fwd_params::philox_args)),
               "Flash_fwd_params::philox_args buffer is under-aligned for at::PhiloxCudaState");
+static_assert(std::is_trivially_copyable<at::PhiloxCudaState>::value,
+              "at::PhiloxCudaState must be trivially copyable: it is placement-new'd into "
+              "philox_args and the whole Flash_fwd_params is copied by value to the device kernel "
+              "(so the bytes must be memcpy-safe); this also guarantees a trivial destructor, so "
+              "the placement-new needs no matching delete");
 #endif
 
 void set_params_fprop(Flash_fwd_params &params,
