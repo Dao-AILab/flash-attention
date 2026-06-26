@@ -41,6 +41,10 @@ this_dir = os.path.dirname(os.path.abspath(__file__))
 
 BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
 
+print(f"\n[FlashAttention Build] PyTorch version: {torch.__version__}")
+print(f"[FlashAttention Build] CUDA version: {torch.version.cuda}")
+print(f"[FlashAttention Build] CXX11 ABI: {torch._C._GLIBCXX_USE_CXX11_ABI}\n")
+
 if BUILD_TARGET == "auto":
     if IS_HIP_EXTENSION:
         IS_ROCM = True
@@ -69,9 +73,42 @@ if IS_ROCM:
     ROCM_BACKEND = "triton" if os.getenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", "FALSE") == "TRUE" else "ck"
 NVCC_THREADS = os.getenv("NVCC_THREADS") or "4"
 
+# FA2 fork wheel build: SASS for Ampere/Hopper/Blackwell only (see md/CUDA_13.0_TO_13.2_BUILD_FIX.md).
+FORK_SUPPORTED_CUDA_ARCHS = ("80", "90", "100", "120")
+FORK_THOR_CUDA_ARCHS = frozenset({"101", "110"})
+
+
 @functools.lru_cache(maxsize=None)
-def cuda_archs() -> str:
-    return os.getenv("FLASH_ATTN_CUDA_ARCHS", "80;90;100;110;120").split(";")
+def cuda_archs() -> list[str]:
+    raw = os.getenv("FLASH_ATTN_CUDA_ARCHS", "80;90;100;120")
+    requested = [a.strip() for a in raw.split(";") if a.strip()]
+    dropped_thor = [a for a in requested if a in FORK_THOR_CUDA_ARCHS]
+    if dropped_thor:
+        warnings.warn(
+            "FLASH_ATTN_CUDA_ARCHS includes Thor GPU arch(es) "
+            f"{dropped_thor}; this fork FA2 build emits SASS for "
+            f"{list(FORK_SUPPORTED_CUDA_ARCHS)} only. Ignoring those entries.",
+            stacklevel=2,
+        )
+    archs = [a for a in requested if a in FORK_SUPPORTED_CUDA_ARCHS]
+    unknown = [
+        a
+        for a in requested
+        if a not in FORK_SUPPORTED_CUDA_ARCHS and a not in FORK_THOR_CUDA_ARCHS
+    ]
+    if unknown:
+        warnings.warn(
+            f"FLASH_ATTN_CUDA_ARCHS entries ignored (not built by this fork): {unknown}",
+            stacklevel=2,
+        )
+    if not archs:
+        warnings.warn(
+            "FLASH_ATTN_CUDA_ARCHS has no supported entries after filtering; "
+            f"using default {list(FORK_SUPPORTED_CUDA_ARCHS)}.",
+            stacklevel=2,
+        )
+        archs = list(FORK_SUPPORTED_CUDA_ARCHS)
+    return archs
 
 
 def get_platform():
@@ -100,12 +137,16 @@ def get_cuda_bare_metal_version(cuda_dir):
 
 def add_cuda_gencodes(cc_flag, archs, bare_metal_version):
     """
-    Adds -gencode flags based on nvcc capabilities:
-      - sm_80/90 (regular)
-      - sm_100/120 on CUDA >= 12.8
-      - Use 100f on CUDA >= 12.9 (Blackwell family-specific)
-      - Map requested 110 -> 101 if CUDA < 13.0 (Thor rename)
-      - Embed PTX for newest arch for forward compatibility
+    Adds -gencode flags for this fork's supported CUDA arch list only.
+
+    Requested arch tokens (after cuda_archs() filtering) map to nvcc targets as:
+      - 80  -> compute_80, sm_80
+      - 90  -> compute_90, sm_90  (CUDA >= 11.8)
+      - 100 -> compute_100f, sm_100 on CUDA >= 12.9 else compute_100, sm_100 (CUDA >= 12.8)
+      - 120 -> compute_120f, sm_120 on CUDA >= 12.9 else compute_120, sm_120 (CUDA >= 12.8)
+
+    Thor / sm_101 / sm_110 are not built (see FORK_THOR_CUDA_ARCHS in cuda_archs()).
+    PTX for the newest numeric arch is embedded for forward-compatible JIT.
     """
     # Always-regular 80
     if "80" in archs:
@@ -130,17 +171,6 @@ def add_cuda_gencodes(cc_flag, archs, bare_metal_version):
                 cc_flag += ["-gencode", "arch=compute_120f,code=sm_120"]
             else:
                 cc_flag += ["-gencode", "arch=compute_120,code=sm_120"]
-
-
-        # Thor rename: 12.9 uses sm_101; 13.0+ uses sm_110
-        if "110" in archs:
-            if bare_metal_version >= Version("13.0"):
-                cc_flag += ["-gencode", "arch=compute_110f,code=sm_110"]
-            else:
-                # Provide Thor support for CUDA 12.9 via sm_101
-                if bare_metal_version >= Version("12.8"):
-                    cc_flag += ["-gencode", "arch=compute_101,code=sm_101"]
-                # else: no Thor support in older toolkits
 
     # PTX for newest requested arch (forward-compat)
     numeric = [a for a in archs if a.isdigit()]
@@ -298,16 +328,16 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
     compiler_c17_flag=["-O3", "-std=c++17"]
     # Add Windows-specific flags
     if sys.platform == "win32" and os.getenv('DISTUTILS_USE_SDK') == '1':
-        nvcc_flags.extend(["-Xcompiler", "/Zc:__cplusplus"])
-        compiler_c17_flag=["-O2", "/std:c++17", "/Zc:__cplusplus"]
-
-    # Opt-in: skip the num_splits==1 blocksize-alignment instantiation in the
-    # splitkv dispatch. That alignment (PR #2448) compiles a second splitkv kernel
-    # tree per head dim, roughly doubling ptxas time for hd32/64/96/128 (hd64 can
-    # stall ptxas for hours). Disabling it keeps num_splits==1 correct but no
-    # longer bitwise-identical to the standard kernel. nvcc-only (header in .cu).
-    if os.getenv("FLASH_ATTENTION_DISABLE_SPLIT_ALIGNMENT", "FALSE") == "TRUE":
-        nvcc_flags.append("-DFLASHATTENTION_DISABLE_SPLIT_ALIGNMENT")
+        # CUDA 13.2 CCCL headers require MSVC conforming preprocessor (see md/CUDA_13.0_TO_13.2_BUILD_FIX.md).
+        nvcc_flags.extend(
+            ["-Xcompiler", "/Zc:__cplusplus", "-Xcompiler", "/Zc:preprocessor"]
+        )
+        compiler_c17_flag = [
+            "-O2",
+            "/std:c++17",
+            "/Zc:__cplusplus",
+            "/Zc:preprocessor",
+        ]
 
     ext_modules.append(
         CUDAExtension(
@@ -686,7 +716,7 @@ if ROCM_BACKEND == "triton":
     # Note: torch is excluded because pip resolves it to CUDA PyTorch from PyPI, overwriting any pre-installed ROCm PyTorch. Users must have torch installed.
     install_requires = [
         "einops",
-        "triton>=3.6.0" if sys.platform != "win32" else "triton-windows>=3.6.0",
+        "triton==3.5.1" if sys.platform != "win32" else "triton-windows>=3.6.0",
     ]
 else:
     install_requires = [
