@@ -166,15 +166,20 @@ void run_mha_fwd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t stream)
     // TD [2023-08-28]: nvcc segfaults for headdim 96 with block size 64 x 256,
     // and for headdim 192 with block size 64 x 128.
     constexpr static int kBlockN = Headdim <= 64 ? 256 : (Headdim <= 128 ? 128 : 64);
-    // if user specifies num_splits=1, we assume they want bitwise identical
+#ifndef FLASHATTENTION_DISABLE_SPLIT_ALIGNMENT
+    // If a user specifies num_splits=1, we assume they want bitwise identical
     // numerics across the split KV and standard kernels so we align kBLockN to
-    // match
+    // match.
+    // This compiles a second splitkv kernel tree (a different kBlockN), which
+    // could push build time to hours+. Define FLASHATTENTION_DISABLE_SPLIT_ALIGNMENT
+    // to skip.
     if (params.num_splits == 1) {
         constexpr static int kBlockN_standard = Headdim <= 64 ? 128 : 64;
         run_flash_splitkv_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN_standard, 4, false, false, T>, Is_causal>(params, stream);
-    } else {
-        run_flash_splitkv_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, 4, false, false, T>, Is_causal>(params, stream);
+        return;
     }
+#endif
+    run_flash_splitkv_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, 4, false, false, T>, Is_causal>(params, stream);
 }
 
 template<typename T, bool Is_causal>

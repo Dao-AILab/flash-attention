@@ -301,6 +301,14 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
         nvcc_flags.extend(["-Xcompiler", "/Zc:__cplusplus"])
         compiler_c17_flag=["-O2", "/std:c++17", "/Zc:__cplusplus"]
 
+    # Opt-in: skip the num_splits==1 blocksize-alignment instantiation in the
+    # splitkv dispatch. That alignment (PR #2448) compiles a second splitkv kernel
+    # tree per head dim, roughly doubling ptxas time for hd32/64/96/128 (hd64 can
+    # stall ptxas for hours). Disabling it keeps num_splits==1 correct but no
+    # longer bitwise-identical to the standard kernel. nvcc-only (header in .cu).
+    if os.getenv("FLASH_ATTENTION_DISABLE_SPLIT_ALIGNMENT", "FALSE") == "TRUE":
+        nvcc_flags.append("-DFLASHATTENTION_DISABLE_SPLIT_ALIGNMENT")
+
     ext_modules.append(
         CUDAExtension(
             name="flash_attn_2_cuda",
