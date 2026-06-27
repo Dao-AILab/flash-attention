@@ -45,4 +45,4 @@ jobs:
         with:
           test-filter: ${{ env.FA4_TEST_FILTER }}
           fa4_image_cu129: "togethercomputer/training-performance:flash-attn-cu12.9-26.03.25@sha256:304a5c3d2b3a75b151cd2a964cd26d444e0d8b5686d63943df13378c9705f943"
-          fa4_image_cu130: "togethercomputer/training-performance:flash-attn-cu13.0-26.06.10@sha256:f1efd03b9d78cf65d9f8df107d2f6f6d0a464cb8b773fd9364765f22f4772006"
+          fa4_image_cu130: "togethercomputer/training-performance:flash-attn-cu13.0-26.06.27@sha256:2c31843c7137cbe909611eb70a9b6940581a2e3018d2c8b629f84dfd04b9bfd7"
