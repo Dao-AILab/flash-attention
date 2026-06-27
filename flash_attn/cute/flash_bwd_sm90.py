@@ -19,7 +19,6 @@ from quack.sm90_utils import gemm_zero_init, gemm_w_idx
 
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import utils
-from flash_attn.cute import sm90_layout
 from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
@@ -206,7 +205,7 @@ class FlashAttentionBackwardSm90:
         wg_d_dKV = self.num_wg_mma // self.AtomLayoutNdKV
         self.sQ_layout, self.sdO_layout = [
             # Need to set major_mode_size (mms) to accommodate Q and Q.T
-            sm90_layout.make_smem_layout(
+            sm90_utils.make_smem_layout(
                 self.dtype,
                 LayoutEnum.ROW_MAJOR,
                 shape,
@@ -220,7 +219,7 @@ class FlashAttentionBackwardSm90:
         ]
         wg_d_dQ = self.num_wg_dQ // self.AtomLayoutMdQ
         # Accomodate both K and K.T
-        self.sK_layout = sm90_layout.make_smem_layout(
+        self.sK_layout = sm90_utils.make_smem_layout(
             self.dtype,
             LayoutEnum.ROW_MAJOR,
             (self.tile_n, self.tile_hdim),
@@ -234,7 +233,7 @@ class FlashAttentionBackwardSm90:
         # Accomodate both S and S.T
         wg_n_SdP = self.num_wg_mma // self.AtomLayoutMSdP
         wg_n_dKV = self.AtomLayoutNdKV
-        self.sPdS_layout = sm90_layout.make_smem_layout(
+        self.sPdS_layout = sm90_utils.make_smem_layout(
             self.dtype,
             LayoutEnum.ROW_MAJOR,
             (self.tile_m, self.tile_n),
