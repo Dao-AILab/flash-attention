@@ -31,7 +31,7 @@ except ModuleNotFoundError:  # Python 3.10 (pyproject declares requires-python >
 
 # Deps whose floor a stale SIF is known to silently violate. Other pyproject deps (torch, einops…)
 # are baked to match the image and not version-sensitive in the same way, so we don't gate on them.
-CHECKED = ("nvidia-cutlass-dsl", "quack-kernels")
+CHECKED = ("nvidia-cutlass-dsl", "quack-kernels", "apache-tvm-ffi")
 
 
 def main(pyproject_path: str) -> int:

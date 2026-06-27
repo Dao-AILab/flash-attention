@@ -26,9 +26,9 @@ dependencies = [
     "torch",
     "einops",
     "typing_extensions",
-    "apache-tvm-ffi>=0.1.5,<0.2",
+    "apache-tvm-ffi>=0.1.12,<0.2",
     "torch-c-dlpack-ext",
-    "quack-kernels>=0.5.0",
+    "quack-kernels>=0.5.3",
 ]
 
 [project.optional-dependencies]

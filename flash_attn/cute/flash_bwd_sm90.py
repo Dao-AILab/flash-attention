@@ -205,7 +205,13 @@ class FlashAttentionBackwardSm90:
         wg_d_dKV = self.num_wg_mma // self.AtomLayoutNdKV
         self.sQ_layout, self.sdO_layout = [
             # Need to set major_mode_size (mms) to accommodate Q and Q.T
-            sm90_utils.make_smem_layout(self.dtype, LayoutEnum.ROW_MAJOR, shape, stage, mms)
+            sm90_utils.make_smem_layout(
+                self.dtype,
+                LayoutEnum.ROW_MAJOR,
+                shape,
+                stage,
+                major_mode_size=mms,
+            )
             for shape, stage, mms in [
                 ((self.tile_m, self.tile_hdim), self.Q_stage, self.tile_hdim // wg_d_dKV),
                 ((self.tile_m, self.tile_hdimv), self.dO_stage, self.tile_hdim // wg_d_dKV),
