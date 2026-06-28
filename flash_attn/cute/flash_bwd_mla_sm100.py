@@ -371,11 +371,11 @@ class FlashAttentionSparseMLABackwardSm100:
             *(cute.assume(s, divby=128 // mX.element_type.width) for s in mX.stride[:-1]),
             mX.stride[-1],
         )
-        mQv, mV, mdV, mdO, mP, mdS, mScaleP = [
+        mQv, mV, mdV, mdO, mP, mdS, mScaleP, mdPsum = [
             cute.make_tensor(mX.iterator, cute.make_layout(mX.shape, stride=new_stride(mX)))
             if mX is not None
             else None
-            for mX in (mQv, mV, mdV, mdO, mP, mdS, mScaleP)
+            for mX in (mQv, mV, mdV, mdO, mP, mdS, mScaleP, mdPsum)
         ]
         # (b, s, h, d)  -> (s, d, h, b)  or
         # (total, h, d) -> (total, d, h)
