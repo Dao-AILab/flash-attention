@@ -2,8 +2,7 @@
  * Copyright (c) 2024, Tri Dao.
  ******************************************************************************/
 
-// Include these 2 headers instead of torch/extension.h since we don't need all of the torch headers.
-#include <torch/python.h>
+#include <torch/library.h>
 #include <torch/nn/functional.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/cuda/CUDAStream.h>
@@ -366,17 +365,17 @@ void set_params_alibi(Flash_fwd_params &params, std::optional<at::Tensor> &alibi
 }
 
 std::vector<at::Tensor>
-mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_multiple(head_size, 8)
+mha_fwd(at::Tensor q,         // batch_size x seqlen_q x num_heads x round_multiple(head_size, 8)
         const at::Tensor &k,         // batch_size x seqlen_k x num_heads_k x round_multiple(head_size, 8)
         const at::Tensor &v,         // batch_size x seqlen_k x num_heads_k x round_multiple(head_size, 8)
-        std::optional<at::Tensor> &out_,             // batch_size x seqlen_q x num_heads x round_multiple(head_size, 8)
-        std::optional<at::Tensor> &alibi_slopes_, // num_heads or batch_size x num_heads
-        const float p_dropout,
-        const float softmax_scale,
+        std::optional<at::Tensor> out_,             // batch_size x seqlen_q x num_heads x round_multiple(head_size, 8)
+        std::optional<at::Tensor> alibi_slopes_, // num_heads or batch_size x num_heads
+        const double p_dropout,
+        const double softmax_scale,
         bool is_causal,
         int window_size_left,
         int window_size_right,
-        const float softcap,
+        const double softcap,
         const bool return_softmax,
         // Retained only for backwards-compat arg positioning; must be None.
         std::optional<at::Tensor> unused_generator_compat) {
@@ -536,25 +535,25 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
 }
 
 std::vector<at::Tensor>
-mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
+mha_varlen_fwd(at::Tensor q,  // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
                const at::Tensor &k,  // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i or num_blocks x page_block_size x num_heads_k x head_size if there's a block_table.
                const at::Tensor &v,  // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i or num_blocks x page_block_size x num_heads_k x head_size if there's a block_table.
-               std::optional<at::Tensor> &out_, // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
+               std::optional<at::Tensor> out_, // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
                const at::Tensor &cu_seqlens_q,  // b+1
                const at::Tensor &cu_seqlens_k,  // b+1
-               std::optional<at::Tensor> &seqused_k, // b. If given, only this many elements of each batch element's keys are used.
-               std::optional<const at::Tensor> &leftpad_k_, // batch_size
-               std::optional<at::Tensor> &block_table_, // batch_size x max_num_blocks_per_seq
-               std::optional<at::Tensor> &alibi_slopes_, // num_heads or b x num_heads
-               int max_seqlen_q,
-               const int max_seqlen_k,
-               const float p_dropout,
-               const float softmax_scale,
+               std::optional<at::Tensor> seqused_k, // b. If given, only this many elements of each batch element's keys are used.
+               const std::optional<at::Tensor> &leftpad_k_, // batch_size
+               std::optional<at::Tensor> block_table_, // batch_size x max_num_blocks_per_seq
+               std::optional<at::Tensor> alibi_slopes_, // num_heads or b x num_heads
+               int64_t max_seqlen_q,
+               const int64_t max_seqlen_k,
+               const double p_dropout,
+               const double softmax_scale,
                const bool zero_tensors,
                bool is_causal,
-               int window_size_left,
-               int window_size_right,
-               const float softcap,
+               int64_t window_size_left,
+               int64_t window_size_right,
+               const double softcap,
                const bool return_softmax,
                // Retained only for backwards-compat arg positioning; must be None.
                std::optional<at::Tensor> unused_generator_compat,
@@ -804,16 +803,16 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multipl
         const at::Tensor &v,   // batch_size x seqlen_k x num_heads_k x head_size
         const at::Tensor &out,   // batch_size x seqlen_q x num_heads x head_size
         const at::Tensor &softmax_lse,     // b x h x seqlen_q
-        std::optional<at::Tensor> &dq_,   // batch_size x seqlen_q x num_heads x head_size
-        std::optional<at::Tensor> &dk_,   // batch_size x seqlen_k x num_heads_k x head_size
-        std::optional<at::Tensor> &dv_,   // batch_size x seqlen_k x num_heads_k x head_size
-        std::optional<at::Tensor> &alibi_slopes_, // num_heads or batch_size x num_heads
-        const float p_dropout,         // probability to drop
-        const float softmax_scale,
+        std::optional<at::Tensor> dq_,   // batch_size x seqlen_q x num_heads x head_size
+        std::optional<at::Tensor> dk_,   // batch_size x seqlen_k x num_heads_k x head_size
+        std::optional<at::Tensor> dv_,   // batch_size x seqlen_k x num_heads_k x head_size
+        std::optional<at::Tensor> alibi_slopes_, // num_heads or batch_size x num_heads
+        const double p_dropout,         // probability to drop
+        const double softmax_scale,
         const bool is_causal,
-        int window_size_left,
-        int window_size_right,
-        const float softcap,
+        int64_t window_size_left,
+        int64_t window_size_right,
+        const double softcap,
         const bool deterministic,
         // Retained only for backwards-compat arg positioning; must be None.
         std::optional<at::Tensor> unused_generator_compat,
@@ -1014,21 +1013,21 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
                const at::Tensor &v,   // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i
                const at::Tensor &out,   // total_q x num_heads x head_size
                const at::Tensor &softmax_lse,    // h x total_q, softmax logsumexp
-               std::optional<at::Tensor> &dq_,   // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
-               std::optional<at::Tensor> &dk_,   // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i
-               std::optional<at::Tensor> &dv_,   // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i
+               std::optional<at::Tensor> dq_,   // total_q x num_heads x head_size, total_q := \sum_{i=0}^{b} s_i
+               std::optional<at::Tensor> dk_,   // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i
+               std::optional<at::Tensor> dv_,   // total_k x num_heads_k x head_size, total_k := \sum_{i=0}^{b} s_i
                const at::Tensor &cu_seqlens_q,  // b+1
                const at::Tensor &cu_seqlens_k,  // b+1
-               std::optional<at::Tensor> &alibi_slopes_, // num_heads or b x num_heads
-               const int max_seqlen_q,
-               const int max_seqlen_k,          // max sequence length to choose the kernel
-               const float p_dropout,         // probability to drop
-               const float softmax_scale,
+               std::optional<at::Tensor> alibi_slopes_, // num_heads or b x num_heads
+               const int64_t max_seqlen_q,
+               const int64_t max_seqlen_k,          // max sequence length to choose the kernel
+               const double p_dropout,         // probability to drop
+               const double softmax_scale,
                const bool zero_tensors,
                const bool is_causal,
-               int window_size_left,
-               int window_size_right,
-               const float softcap,
+               int64_t window_size_left,
+               int64_t window_size_right,
+               const double softcap,
                const bool deterministic,
                // Retained only for backwards-compat arg positioning; must be None.
                std::optional<at::Tensor> unused_generator_compat,
@@ -1241,26 +1240,26 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
 }
 
 std::vector<at::Tensor>
-mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_heads x head_size
-                const at::Tensor &kcache,            // batch_size_c x seqlen_k x num_heads_k x head_size or num_blocks x page_block_size x num_heads_k x head_size if there's a block_table.
-                const at::Tensor &vcache,            // batch_size_c x seqlen_k x num_heads_k x head_size or num_blocks x page_block_size x num_heads_k x head_size if there's a block_table.
-                std::optional<const at::Tensor> &k_, // batch_size x seqlen_knew x num_heads_k x head_size
-                std::optional<const at::Tensor> &v_, // batch_size x seqlen_knew x num_heads_k x head_size
-                std::optional<const at::Tensor> &seqlens_k_, // batch_size
-                std::optional<const at::Tensor> &rotary_cos_, // seqlen_ro x (rotary_dim / 2)
-                std::optional<const at::Tensor> &rotary_sin_, // seqlen_ro x (rotary_dim / 2)
-                std::optional<const at::Tensor> &cache_batch_idx_, // indices to index into the KV cache
-                std::optional<const at::Tensor> &leftpad_k_, // batch_size
-                std::optional<at::Tensor> &block_table_, // batch_size x max_num_blocks_per_seq
-                std::optional<at::Tensor> &alibi_slopes_, // num_heads or batch_size x num_heads
-                std::optional<at::Tensor> &out_,             // batch_size x seqlen_q x num_heads x head_size
-                const float softmax_scale,
+mha_fwd_kvcache(at::Tensor q,                 // batch_size x seqlen_q x num_heads x head_size
+                at::Tensor &kcache,            // batch_size_c x seqlen_k x num_heads_k x head_size or num_blocks x page_block_size x num_heads_k x head_size if there's a block_table.
+                at::Tensor &vcache,            // batch_size_c x seqlen_k x num_heads_k x head_size or num_blocks x page_block_size x num_heads_k x head_size if there's a block_table.
+                const std::optional<at::Tensor> &k_, // batch_size x seqlen_knew x num_heads_k x head_size
+                const std::optional<at::Tensor> &v_, // batch_size x seqlen_knew x num_heads_k x head_size
+                const std::optional<at::Tensor> &seqlens_k_, // batch_size
+                const std::optional<at::Tensor> &rotary_cos_, // seqlen_ro x (rotary_dim / 2)
+                const std::optional<at::Tensor> &rotary_sin_, // seqlen_ro x (rotary_dim / 2)
+                const std::optional<at::Tensor> &cache_batch_idx_, // indices to index into the KV cache
+                const std::optional<at::Tensor> &leftpad_k_, // batch_size
+                std::optional<at::Tensor> block_table_, // batch_size x max_num_blocks_per_seq
+                std::optional<at::Tensor> alibi_slopes_, // num_heads or batch_size x num_heads
+                std::optional<at::Tensor> out_,             // batch_size x seqlen_q x num_heads x head_size
+                const double softmax_scale,
                 bool is_causal,
-                int window_size_left,
-                int window_size_right,
-                const float softcap,
+                int64_t window_size_left,
+                int64_t window_size_right,
+                const double softcap,
                 bool is_rotary_interleaved,   // if true, rotary combines indices 0 & 1, else indices 0 & rotary_dim / 2
-                int num_splits
+                int64_t num_splits
                 ) {
 
     // Otherwise the kernel will be launched from cuda:0 device
@@ -1532,11 +1531,116 @@ mha_fwd_kvcache(at::Tensor &q,                 // batch_size x seqlen_q x num_he
 }
 } // namespace FLASH_NAMESPACE
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.doc() = "FlashAttention";
-    m.def("fwd", &FLASH_NAMESPACE::mha_fwd, "Forward pass");
-    m.def("varlen_fwd", &FLASH_NAMESPACE::mha_varlen_fwd, "Forward pass (variable length)");
-    m.def("bwd", &FLASH_NAMESPACE::mha_bwd, "Backward pass");
-    m.def("varlen_bwd", &FLASH_NAMESPACE::mha_varlen_bwd, "Backward pass (variable length)");
-    m.def("fwd_kvcache", &FLASH_NAMESPACE::mha_fwd_kvcache, "Forward pass, with KV-cache");
+TORCH_LIBRARY(flash_attn_2, m) {
+    m.def("fwd("
+        "Tensor q,"
+        "Tensor k,"
+        "Tensor v,"
+        "Tensor!? out,"
+        "Tensor? alibi_slopes,"
+        "float p_dropout,"
+        "float softmax_scale,"
+        "bool is_causal,"
+        "int window_size_left,"
+        "int window_size_right,"
+        "float softcap,"
+        "bool return_softmax,"
+        "Tensor? unused_generator_compat) -> Tensor[]");
+    m.def("varlen_fwd("
+        "Tensor q,"
+        "Tensor k,"
+        "Tensor v,"
+        "Tensor!? out,"
+        "Tensor cu_seqlens_q,"
+        "Tensor cu_seqlens_k,"
+        "Tensor? seqused_k,"
+        "Tensor? leftpad_k,"
+        "Tensor? block_table,"
+        "Tensor? alibi_slopes,"
+        "int max_seqlen_q,"
+        "int max_seqlen_k,"
+        "float p_dropout,"
+        "float softmax_scale,"
+        "bool zero_tensors,"
+        "bool is_causal,"
+        "int window_size_left,"
+        "int window_size_right,"
+        "float softcap,"
+        "bool return_softmax,"
+        "Tensor? unused_generator_compat,"
+        "int num_splits=0) -> Tensor[]");
+    m.def("bwd("
+        "Tensor dout,"
+        "Tensor q,"
+        "Tensor k,"
+        "Tensor v,"
+        "Tensor out,"
+        "Tensor softmax_lse,"
+        "Tensor!? dq,"
+        "Tensor!? dk,"
+        "Tensor!? dv,"
+        "Tensor? alibi_slopes,"
+        "float p_dropout,"
+        "float softmax_scale,"
+        "bool is_causal,"
+        "int window_size_left,"
+        "int window_size_right,"
+        "float softcap,"
+        "bool deterministic,"
+        "Tensor? unused_generator_compat,"
+        "Tensor? rng_state) -> Tensor[]");
+    m.def("varlen_bwd("
+        "Tensor dout,"
+        "Tensor q,"
+        "Tensor k,"
+        "Tensor v,"
+        "Tensor out,"
+        "Tensor softmax_lse,"
+        "Tensor!? dq,"
+        "Tensor!? dk,"
+        "Tensor!? dv,"
+        "Tensor cu_seqlens_q,"
+        "Tensor cu_seqlens_k,"
+        "Tensor? alibi_slopes,"
+        "int max_seqlen_q,"
+        "int max_seqlen_k,"
+        "float p_dropout,"
+        "float softmax_scale,"
+        "bool zero_tensors,"
+        "bool is_causal,"
+        "int window_size_left,"
+        "int window_size_right,"
+        "float softcap,"
+        "bool deterministic,"
+        "Tensor? unused_generator_compat,"
+        "Tensor? rng_state) -> Tensor[]");
+    m.def("fwd_kvcache("
+        "Tensor q,"
+        "Tensor! kcache,"
+        "Tensor! vcache,"
+        "Tensor? k,"
+        "Tensor? v,"
+        "Tensor? seqlens_k,"
+        "Tensor? rotary_cos,"
+        "Tensor? rotary_sin,"
+        "Tensor? cache_batch_idx,"
+        "Tensor? leftpad_k,"
+        "Tensor? block_table,"
+        "Tensor? alibi_slopes,"
+        "Tensor!? out,"
+        "float softmax_scale,"
+        "bool is_causal,"
+        "int window_size_left,"
+        "int window_size_right,"
+        "float softcap,"
+        "bool is_rotary_interleaved,"
+        "int num_splits) -> Tensor[]");
+}
+
+TORCH_LIBRARY_IMPL(flash_attn_2, CUDA, m) {
+    m.impl("fwd", &FLASH_NAMESPACE::mha_fwd);
+    m.impl("varlen_fwd", &FLASH_NAMESPACE::mha_varlen_fwd);
+    m.impl("bwd", &FLASH_NAMESPACE::mha_bwd);
+    m.impl("varlen_bwd", &FLASH_NAMESPACE::mha_varlen_bwd);
+    m.impl("fwd_kvcache", &FLASH_NAMESPACE::mha_fwd_kvcache);
 }

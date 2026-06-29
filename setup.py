@@ -449,6 +449,7 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
                 "cxx": compiler_c17_flag + feature_flags,
                 "nvcc": append_nvcc_threads(nvcc_flags + cc_flag + feature_flags),
             },
+            py_limited_api=True,
             include_dirs=[
                 Path(this_dir) / "csrc" / "flash_attn",
                 Path(this_dir) / "csrc" / "flash_attn" / "src",
@@ -795,6 +796,8 @@ setup(
     else {
         "bdist_wheel": CachedWheelsCommand,
     },
+    # Tag with py_limited_api only for the CUDA build which is CPython agnostic by avoiding pybind.
+    options={"bdist_wheel": {"py_limited_api": "cp39"}} if ext_modules and not IS_ROCM else {},
     python_requires=">=3.9",
     install_requires=install_requires,
     setup_requires=[
