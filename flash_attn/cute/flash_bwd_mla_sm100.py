@@ -1488,9 +1488,6 @@ class FlashAttentionSparseMLABackwardSm100:
         load_pipeline.producer_acquire(producer_state)
         mbar_ptr = load_pipeline.producer_get_barrier(producer_state)
         if const_expr(bulk_copy):
-            # Single-issue bulk-copy atoms (cpasync.CopyBulkG2SOp) get their lane election
-            # generated inside cute.copy; an explicit elect_one here nests and can deadlock.
-            # See #2677. (Relies on the cute-dsl build that elects inside cute.copy for bulk copies.)
             cute.copy(copy_atom, tXgX, tXsX, mbar_ptr=mbar_ptr)
         else:
             cute.copy(copy_atom, tXgX, tXsX, tma_bar_ptr=mbar_ptr)
