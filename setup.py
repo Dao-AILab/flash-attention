@@ -309,6 +309,13 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
     if os.getenv("FLASH_ATTENTION_DISABLE_SPLIT_ALIGNMENT", "FALSE") == "TRUE":
         nvcc_flags.append("-DFLASHATTENTION_DISABLE_SPLIT_ALIGNMENT")
 
+    # Opt-in: disable building dropout and its dependent headers (ATen philox/RNG
+    # headers) from the FA2 build. This flag must be shared across both cxx and nvcc
+    # compilers, as FA2 is defined in both flash_api.cpp (cxx) and CUDA kernels.
+    feature_flags = []
+    if os.getenv("FLASH_ATTENTION_DISABLE_DROPOUT", "FALSE") == "TRUE":
+        feature_flags.append("-DFLASHATTENTION_DISABLE_DROPOUT")
+
     ext_modules.append(
         CUDAExtension(
             name="flash_attn_2_cuda",
@@ -388,8 +395,8 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
                 "csrc/flash_attn/src/flash_fwd_split_hdim256_bf16_causal_sm80.cu",
             ],
             extra_compile_args={
-                "cxx": compiler_c17_flag,
-                "nvcc": append_nvcc_threads(nvcc_flags + cc_flag),
+                "cxx": compiler_c17_flag + feature_flags,
+                "nvcc": append_nvcc_threads(nvcc_flags + cc_flag + feature_flags),
             },
             include_dirs=[
                 Path(this_dir) / "csrc" / "flash_attn",
