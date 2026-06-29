@@ -336,12 +336,17 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
         nvcc_flags.extend(["-Xcompiler", "/Zc:__cplusplus"])
         compiler_c17_flag=["-O2", "/std:c++17", "/Zc:__cplusplus"]
 
+    # USE_CUDA exposes the stable CUDA shims (aoti_torch_get_current_cuda_stream and the
+    # STD_CUDA_* check macros) that FA2 uses throughout. Shared across cxx and nvcc.
+    feature_flags = ["-DUSE_CUDA"]
+
     # Opt-in: disable building dropout and its dependent headers (ATen philox/RNG
-    # headers) from the FA2 build. This flag must be shared across both cxx and nvcc
-    # compilers, as FA2 is defined in both flash_api.cpp (cxx) and CUDA kernels.
-    feature_flags = []
+    # headers) in FA2. This flag must be shared across both cxx and nvcc.
     if os.getenv("FLASH_ATTENTION_DISABLE_DROPOUT", "FALSE") == "TRUE":
         feature_flags.append("-DFLASHATTENTION_DISABLE_DROPOUT")
+        # Only the dropout-disabled build can be fully ABI stable with torch
+        # Pin TORCH_TARGET_VERSION >= 2.10. 
+        feature_flags.append("-DTORCH_TARGET_VERSION=0x020a000000000000")
 
     ext_modules.append(
         CUDAExtension(
@@ -797,8 +802,8 @@ setup(
         "bdist_wheel": CachedWheelsCommand,
     },
     # Tag with py_limited_api only for the CUDA build which is CPython agnostic by avoiding pybind.
-    options={"bdist_wheel": {"py_limited_api": "cp39"}} if ext_modules and not IS_ROCM else {},
-    python_requires=">=3.9",
+    options={"bdist_wheel": {"py_limited_api": "cp310"}} if ext_modules and not IS_ROCM else {},
+    python_requires=">=3.10",
     install_requires=install_requires,
     setup_requires=[
         "packaging",
