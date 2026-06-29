@@ -504,6 +504,31 @@ def test_flash_attn_small_head_dim(seqlen_q, seqlen_k, d, causal, dtype):
     ).abs().max().item() + fwd_atol
 
 
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_hd256_sm100_noncontiguous_transpose():
+    if not IS_SM100:
+        pytest.skip("SM100-specific hd256 layout regression test")
+
+    torch.random.manual_seed(0)
+    batch_size, seqlen, nheads, d = 2, 128, 4, 256
+    dtype = torch.bfloat16
+    q = torch.randn(batch_size, nheads, seqlen, d, device="cuda", dtype=dtype).transpose(1, 2)
+    k = torch.randn(batch_size, nheads, seqlen, d, device="cuda", dtype=dtype).transpose(1, 2)
+    v = torch.randn(batch_size, nheads, seqlen, d, device="cuda", dtype=dtype).transpose(1, 2)
+
+    out, _ = flash_attn_func(q, k, v)
+    out_contig, _ = flash_attn_func(q.contiguous(), k.contiguous(), v.contiguous())
+
+    if is_fake_mode():
+        return
+
+    assert not q.is_contiguous() and not k.is_contiguous() and not v.is_contiguous()
+    assert torch.equal(out, out_contig), (
+        f"non-contiguous hd256 output differs from contiguous reference: "
+        f"max diff = {(out - out_contig).abs().max().item()}"
+    )
+
+
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])

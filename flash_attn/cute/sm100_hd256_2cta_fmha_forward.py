@@ -29,8 +29,7 @@ from flash_attn.cute.mask import (
 )
 from flash_attn.cute.tile_scheduler import SM100_TMEM_CAPACITY_COLUMNS
 from flash_attn.cute.flash_fwd_sm100 import DescaleTensors, _TUNING_CONFIG
-from flash_attn.cute.utils import ex2_emulation_2
-from flash_attn.cute.utils import AuxData
+from flash_attn.cute.utils import ex2_emulation_2, as_bshkrd_tensor, AuxData
 
 
 class BlackwellFusedMultiHeadAttentionForward:
@@ -279,7 +278,6 @@ class BlackwellFusedMultiHeadAttentionForward:
         s_q64 = Int64(s_q)
         s_k64 = Int64(s_k)
         s_lse64 = Int64(s_lse)
-        d64 = cute.assume(Int64(d), divby=128)
         h_r64 = Int64(h_r)
         h_k64 = Int64(h_k)
         b64 = Int64(b)
@@ -293,59 +291,86 @@ class BlackwellFusedMultiHeadAttentionForward:
             if cum_seqlen_k is not None and k_rank == 5
             else (k_tensor.shape[0] if cum_seqlen_k is not None else s_k64)
         )
-        stride_b_qo = h_r64 * h_k64 * s_q64 * d64 if cum_seqlen_q is None else 0
-        stride_b_kv = h_k64 * s_k64 * d64 if cum_seqlen_k is None else 0
         b_lse = b64 if cum_seqlen_q is None else 1
         stride_b_lse = h_r64 * h_k64 * s_lse64 if cum_seqlen_q is None else 0
 
-        # (s, d, ((h_r, h_k), b))
-        q_layout = cute.make_layout(
-            (s_q_total, d, ((h_r, h_k), b)),
-            stride=(d64 * h_r64 * h_k64, 1, ((d64, d64 * h_r64), stride_b_qo)),
+        varlen_q = cum_seqlen_q is not None
+        varlen_k = cum_seqlen_k is not None
+        q_norm = as_bshkrd_tensor(q_tensor, h_k, h_r, varlen_q)
+        o_norm = as_bshkrd_tensor(o_tensor, h_k, h_r, varlen_q)
+
+        # Forward layout: (s, d, ((h_r, h_k), b)). Stride picks from canonical
+        # positions 1=S, 4=D, 3=H_r, 2=H_k, 0=B.
+        q = cute.make_tensor(
+            q_norm.iterator,
+            cute.make_layout(
+                (s_q_total, d, ((h_r, h_k), b)),
+                stride=(
+                    q_norm.stride[1],
+                    q_norm.stride[4],
+                    ((q_norm.stride[3], q_norm.stride[2]), q_norm.stride[0]),
+                ),
+            ),
         )
-        q = cute.make_tensor(q_tensor.iterator, q_layout)
         if cutlass.const_expr(mPageTable is not None):
-            # Paged: K layout (num_pages, page_size, h_k, d); page_table maps kv_coord→physical page.
-            num_pages = k_tensor.shape[0]
+            # Paged: input k/v are rank-4 (num_pages, page_size, h_k, d); the kernel
+            # consumes K as (page_size, d, h_k, num_pages) and V as
+            # (d, page_size, h_k, num_pages).
+            # cute.select reorders modes while preserving input strides
             page_size = k_tensor.shape[1]
-            page_size64 = Int64(page_size)
             max_seqlen_k_paged = Int32(mPageTable.shape[1] * page_size)
-            k_paged_layout = cute.make_layout(
-                (page_size, d, h_k, num_pages),
-                stride=(d64 * h_k64, 1, d64, page_size64 * d64 * h_k64),
+            k = cute.make_tensor(k_tensor.iterator, cute.select(k_tensor.layout, mode=[1, 3, 2, 0]))
+            v = cute.make_tensor(v_tensor.iterator, cute.select(v_tensor.layout, mode=[3, 1, 2, 0]))
+            page_table = cute.make_tensor(
+                mPageTable.iterator,
+                cute.make_layout(
+                    (b, mPageTable.shape[1]),
+                    stride=(mPageTable.stride[0], mPageTable.stride[1]),
+                ),
             )
-            k = cute.make_tensor(k_tensor.iterator, k_paged_layout)
-            v_paged_layout = cute.make_layout(
-                (d, page_size, h_k, num_pages),
-                stride=(1, d64 * h_k64, d64, page_size64 * d64 * h_k64),
-            )
-            v = cute.make_tensor(v_tensor.iterator, v_paged_layout)
-            page_table_layout = cute.make_layout(
-                (b, mPageTable.shape[1]),
-                stride=(Int64(mPageTable.shape[1]), 1),
-            )
-            page_table = cute.make_tensor(mPageTable.iterator, page_table_layout)
         else:
+            # K/V have no h_r dim; pass h_r=1 to the normalizer and override the
+            # h_r stride to 0 below to broadcast across the query-grouped heads.
+            k_norm = as_bshkrd_tensor(k_tensor, h_k, 1, varlen_k)
+            v_norm = as_bshkrd_tensor(v_tensor, h_k, 1, varlen_k)
             # (s, d, ((h_r, h_k), b)), 0-stride for h_r to broadcast
-            k_layout = cute.make_layout(
-                (s_k_total, d, ((h_r, h_k), b)),
-                stride=(d64 * h_k64, 1, ((0, d64), stride_b_kv)),
+            k = cute.make_tensor(
+                k_norm.iterator,
+                cute.make_layout(
+                    (s_k_total, d, ((h_r, h_k), b)),
+                    stride=(
+                        k_norm.stride[1],
+                        k_norm.stride[4],
+                        ((0, k_norm.stride[2]), k_norm.stride[0]),
+                    ),
+                ),
             )
-            k = cute.make_tensor(k_tensor.iterator, k_layout)
             # (d, s, ((h_r, h_k), b)), 0-stride for h_r to broadcast
-            v_layout = cute.make_layout(
-                (d, s_k_total, ((h_r, h_k), b)),
-                stride=(1, d64 * h_k64, ((0, d64), stride_b_kv)),
+            v = cute.make_tensor(
+                v_norm.iterator,
+                cute.make_layout(
+                    (d, s_k_total, ((h_r, h_k), b)),
+                    stride=(
+                        v_norm.stride[4],
+                        v_norm.stride[1],
+                        ((0, v_norm.stride[2]), v_norm.stride[0]),
+                    ),
+                ),
             )
-            v = cute.make_tensor(v_tensor.iterator, v_layout)
             page_table = None
             max_seqlen_k_paged = None
         # (s, d, ((h_r, h_k), b))
-        o_layout = cute.make_layout(
-            (s_q_total, d, ((h_r, h_k), b)),
-            stride=(d64 * h_r64 * h_k64, 1, ((d64, d64 * h_r64), stride_b_qo)),
+        o = cute.make_tensor(
+            o_norm.iterator,
+            cute.make_layout(
+                (s_q_total, d, ((h_r, h_k), b)),
+                stride=(
+                    o_norm.stride[1],
+                    o_norm.stride[4],
+                    ((o_norm.stride[3], o_norm.stride[2]), o_norm.stride[0]),
+                ),
+            ),
         )
-        o = cute.make_tensor(o_tensor.iterator, o_layout)
         if cutlass.const_expr(lse_tensor is not None):
             # (s, ((h_r, h_k), b))
             lse_layout = cute.make_layout(
