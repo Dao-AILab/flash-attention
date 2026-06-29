@@ -1,4 +1,4 @@
-# Copyright (c) 2025, Tri Dao, Siyu Wang, Shengbin Di, Yuxi Chi, Johnsonms, Linfeng Zheng, Haoyan Huang, Lanbo Li, Yun Zhong, Man Yuan, Minmin Sun, Yong Li, Wei Lin, Omar Attia.
+# Copyright (c) 2025, Tri Dao.
 
 import math
 import hashlib
