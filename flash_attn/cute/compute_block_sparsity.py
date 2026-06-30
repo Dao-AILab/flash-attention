@@ -535,6 +535,9 @@ def compute_block_sparsity(
                 blocksparse_tensors_torch.cu_block_idx_offsets,
                 blocksparse_tensors_torch.dq_write_order,
                 blocksparse_tensors_torch.dq_write_order_full,
+                blocksparse_tensors_torch.dq_kv_order
+                if isinstance(blocksparse_tensors_torch.dq_kv_order, torch.Tensor)
+                else None,
             ),
             seqlen_q,
             seqlen_k,

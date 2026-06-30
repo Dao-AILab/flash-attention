@@ -61,6 +61,7 @@ from flash_attn.cute.block_sparsity import (
     to_cute_block_sparse_tensors,
     normalize_block_sparse_config,
     normalize_block_sparse_config_bwd,
+    get_deterministic_bwd_spt,
 )
 
 def _parse_arch_str(arch_str):
@@ -1081,6 +1082,9 @@ def _flash_attn_fwd(
                     normalized_block_sparse_tensors.cu_block_idx_offsets,
                     normalized_block_sparse_tensors.dq_write_order,
                     normalized_block_sparse_tensors.dq_write_order_full,
+                    normalized_block_sparse_tensors.dq_kv_order
+                    if isinstance(normalized_block_sparse_tensors.dq_kv_order, torch.Tensor)
+                    else None,
                 )
                 if normalized_block_sparse_tensors is not None
                 else None,
@@ -1658,30 +1662,11 @@ def _flash_attn_bwd(
             q_subtile_factor=q_subtile_factor,
         )
         if deterministic:
-            if normalized_block_sparse_tensors.dq_write_order is None:
-                raise ValueError(
-                    "deterministic block-sparse backward requires dq_write_order in block_sparse_tensors"
-                )
-            if (
-                normalized_block_sparse_tensors.full_block_cnt is not None
-                and normalized_block_sparse_tensors.dq_write_order_full is None
-            ):
-                raise ValueError(
-                    "deterministic block-sparse backward requires dq_write_order_full when full blocks are present"
-                )
-            if normalized_block_sparse_tensors.spt is None:
-                raise ValueError(
-                    "deterministic block-sparse backward requires block_sparse_tensors.spt "
-                    "to match dq_write_order direction"
-                )
-    if (
-        normalized_block_sparse_tensors is not None
-        and normalized_block_sparse_tensors.spt is not None
-    ):
-        spt = normalized_block_sparse_tensors.spt and deterministic
+            spt = get_deterministic_bwd_spt(normalized_block_sparse_tensors)
+        else:
+            spt = False
     else:
         spt = (causal or local) and deterministic
-
     if arch // 10 in [8, 9, 12]:
         compile_key = (
             arch,
@@ -1953,6 +1938,9 @@ def _flash_attn_bwd(
                 normalized_block_sparse_tensors.cu_block_idx_offsets,
                 normalized_block_sparse_tensors.dq_write_order,
                 normalized_block_sparse_tensors.dq_write_order_full,
+                normalized_block_sparse_tensors.dq_kv_order
+                if isinstance(normalized_block_sparse_tensors.dq_kv_order, torch.Tensor)
+                else None,
             )
             if normalized_block_sparse_tensors is not None
             else None,
