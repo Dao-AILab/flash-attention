@@ -44,20 +44,26 @@ class IndexPutFirstAxis(torch.autograd.Function):
         ctx.save_for_backward(indices)
         assert indices.ndim == 1
         assert values.ndim >= 2
+        other_shape = values.shape[1:]
+        second_dim = other_shape.numel()
         output = torch.zeros(
-            first_axis_dim, *values.shape[1:], device=values.device, dtype=values.dtype
+            first_axis_dim, second_dim, device=values.device, dtype=values.dtype
         )
         # TD [2022-03-04] For some reason torch.scatter is a bit faster than indexing.
-        output[indices] = values
-        # output.scatter_(0, repeat(indices, 'z -> z d', d=values.shape[1]), values)
-        return output
+        # output[indices] = values
+        output.scatter_(0, repeat(indices, "z -> z d", d=second_dim), rearrange(values, "b ... -> b (...)"))
+        return output.reshape(first_axis_dim, *other_shape)
 
     @staticmethod
     def backward(ctx, grad_output):
         (indices,) = ctx.saved_tensors
         # TD [2022-03-04] For some reason torch.gather is a bit faster than indexing.
-        grad_values = grad_output[indices]
-        # grad_values = torch.gather(grad_output, 0, repeat(indices, 'z -> z d', d=grad_output.shape[1]))
+        # grad_values = grad_output[indices]
+        other_shape = grad_output.shape[1:]
+        second_dim = other_shape.numel()
+        grad_values = torch.gather(
+            rearrange(grad_output, "b ... -> b (...)"), 0, repeat(indices, "z -> z d", d=second_dim)
+        ).reshape(-1, *other_shape)
         return grad_values, None, None
 
 
