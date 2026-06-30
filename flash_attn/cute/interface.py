@@ -963,7 +963,20 @@ def _flash_attn_fwd(
             raise ValueError(
                 f"Unsupported compute capability: {arch}. Supported: 8.x, 9.x, 10.x, 11.x, 12.x"
             )
-        # TODO: check @can_implement
+        # Validate the kernel configuration before JIT compilation so invalid tile /
+        # head-dim / SMEM configs fail with a clear error instead of an opaque CuTeDSL
+        # compile error. Only the SM80 and SM120 forward kernels expose can_implement;
+        # the SM90 and SM100 forward kernels do not define it, so they are skipped here.
+        if arch // 10 in [8, 12]:
+            if not fa_fwd.can_implement(
+                dtype, head_dim, head_dim_v, tile_m, tile_n, 1, num_threads, causal,
+            ):
+                raise RuntimeError(
+                    f"FlashAttention forward kernel ({type(fa_fwd).__name__}) cannot be "
+                    f"implemented with given parameters: dtype={dtype}, head_dim={head_dim}, "
+                    f"head_dim_v={head_dim_v}, tile_m={tile_m}, tile_n={tile_n}, "
+                    f"num_threads={num_threads}, causal={causal}"
+                )
         if qv is not None:
             _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
                 fa_fwd,
@@ -1894,7 +1907,34 @@ def _flash_attn_bwd(
             sparse_tensors_compile = to_cute_block_sparse_tensors(normalized_block_sparse_tensors)
         dq_accum_tensor = dq_tensor if use_dedicated_hd256_kernel else dq_accum_tensor
 
-        # TODO: check @can_implement
+        # Validate the kernel configuration before JIT compilation so invalid tile /
+        # head-dim / SMEM configs fail with a clear error instead of an opaque CuTeDSL
+        # compile error. The SM80/SM120 and SM90 backward kernels expose can_implement
+        # (with differing signatures); the SM100 backward kernel does not define it, so
+        # it is skipped here.
+        if arch // 10 in [8, 12]:
+            if not fa_bwd_obj.can_implement(
+                dtype, head_dim, head_dim_v, m_block_size, n_block_size,
+                num_stages_Q, num_stages_dO, num_threads, causal, V_in_regs=V_in_regs,
+            ):
+                raise RuntimeError(
+                    f"FlashAttention backward kernel ({type(fa_bwd_obj).__name__}) cannot be "
+                    f"implemented with given parameters: dtype={dtype}, head_dim={head_dim}, "
+                    f"head_dim_v={head_dim_v}, m_block_size={m_block_size}, "
+                    f"n_block_size={n_block_size}, num_stages_Q={num_stages_Q}, "
+                    f"num_stages_dO={num_stages_dO}, num_threads={num_threads}, causal={causal}"
+                )
+        elif arch // 10 == 9:
+            if not fa_bwd_obj.can_implement(
+                dtype, head_dim, head_dim_v, m_block_size, n_block_size,
+                num_stages_Q, num_threads, V_in_regs=V_in_regs,
+            ):
+                raise RuntimeError(
+                    f"FlashAttention backward kernel ({type(fa_bwd_obj).__name__}) cannot be "
+                    f"implemented with given parameters: dtype={dtype}, head_dim={head_dim}, "
+                    f"head_dim_v={head_dim_v}, tile_m={m_block_size}, tile_n={n_block_size}, "
+                    f"Q_stage={num_stages_Q}, num_threads={num_threads}"
+                )
         _flash_attn_bwd.compile_cache[compile_key] = cute.compile(
             fa_bwd_obj,
             q_tensor,
