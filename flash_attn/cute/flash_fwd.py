@@ -14,7 +14,7 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int32, const_expr
+from cutlass import Float32, Int32, Int64, const_expr
 from cutlass.cute.nvgpu import cpasync, warp
 import cutlass.utils as utils_basic
 from cutlass.base_dsl.arch import Arch
@@ -30,7 +30,8 @@ from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.softmax import Softmax, apply_score_mod_inner
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
-from flash_attn.cute.pack_gqa import PackGQA
+from flash_attn.cute.pack_gqa import PackGQA, pack_gqa_layout
+from flash_attn.cute import philox
 from flash_attn.cute.named_barrier import NamedBarrierFwd
 from flash_attn.cute.block_sparsity import BlockSparseTensors
 from flash_attn.cute.tile_scheduler import SingleTileScheduler, SingleTileVarlenScheduler, TileSchedulerArguments
@@ -57,6 +58,7 @@ class FlashAttentionForwardBase:
         mask_mod: Optional[cutlass.Constexpr] = None,
         has_aux_tensors: bool = False,
         q_subtile_factor: int = 1,
+        dropout_p: float = 0.0,
     ):
         """Initializes the configuration for a flash attention kernel.
 
@@ -99,6 +101,7 @@ class FlashAttentionForwardBase:
         self.Q_in_regs = Q_in_regs
         self.score_mod = score_mod
         self.mask_mod = mask_mod
+        self.dropout_p = dropout_p
         self.qk_acc_dtype = Float32
         self.score_vec_size: cutlass.Constexpr = getattr(
             score_mod, "__vec_size__", 1 if cutlass.const_expr(has_aux_tensors) else 2
@@ -638,6 +641,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_data: AuxData = AuxData(),
+        dropout_seed: Optional[Int64] = None,
+        dropout_offset: Optional[Int64] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -656,7 +661,11 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         self.num_Q_load_threads = self.num_threads
         self.num_epilogue_threads = self.num_threads
         # self.use_tma_O = self.arch >= 90 and mCuSeqlensQ is None
-        self.use_tma_O = self.arch >= Arch.sm_90
+        # SM120 (Blackwell GeForce / RTX PRO / DGX Spark) lacks the WGMMA-era TMA-store
+        # epilogue path used here; only sm_90..sm_119 use TMA for the O store. On sm_120
+        # tma_atom_O is None, so using it crashes in tma_partition with
+        # 'NoneType' object has no attribute '_trait'. (issue #2649)
+        self.use_tma_O = Arch.sm_90 <= self.arch < Arch.sm_120
         self._setup_attributes()
         SharedStorage = self._get_shared_storage_cls()
         mQ, mK, mV, mO = [assume_tensor_aligned(t) for t in (mQ, mK, mV, mO)]
@@ -735,6 +744,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             TileScheduler,
             aux_data,
             fastdiv_mods,
+            dropout_seed,
+            dropout_offset,
         ).launch(
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
@@ -774,9 +785,15 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         TileScheduler: cutlass.Constexpr[Callable],
         aux_data: AuxData = AuxData(),
         fastdiv_mods=None,
+        dropout_seed: Optional[Int64] = None,
+        dropout_offset: Optional[Int64] = None,
     ):
         # Thread index, block index
         tidx, _, _ = cute.arch.thread_idx()
+
+        # Stash dropout RNG state for compute_one_n_block (runtime SSA values).
+        self._dropout_seed = dropout_seed
+        self._dropout_offset = dropout_offset
 
         tile_scheduler = TileScheduler.create(tile_sched_params)
         work_tile = tile_scheduler.initial_work_tile_info()
@@ -1173,6 +1190,16 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             mask_fn(acc_S, n_block=n_block)
         row_scale = softmax.online_softmax(acc_S, is_first=is_first_n_block, check_inf=check_inf)
         softmax.rescale_O(mma_params.acc_O, row_scale)
+        if const_expr(self.dropout_p > 0.0):
+            self.apply_dropout(
+                mma_params.thr_mma_qk,
+                batch_idx,
+                head_idx,
+                m_block,
+                acc_S,
+                n_block,
+                seqlen=seqlen,
+            )
         rP = cute.make_fragment_like(acc_S, self.dtype)
         rP.store(acc_S.load().to(self.dtype))
         tOrP = layout_utils.reshape_acc_to_frgA(rP)
@@ -1225,6 +1252,38 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             seqlen_info=seqlen,
             constant_q_idx=None,
             qhead_per_kvhead=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
+        )
+
+    @cute.jit
+    def apply_dropout(
+        self,
+        thr_mma_qk,
+        batch_idx,
+        head_idx,
+        m_block,
+        acc_S,
+        n_block,
+        seqlen,
+    ):
+        # Build the same global (q_idx, kv_idx) identity coords used by mask/score_mod,
+        # so the forward and the backward recompute draw the IDENTICAL keep-mask.
+        cS = cute.make_identity_tensor((self.tile_m, self.tile_n))
+        cS = cute.domain_offset((m_block * self.tile_m, n_block * self.tile_n), cS)
+        tScS = thr_mma_qk.partition_C(cS)
+        p_keep = Float32(1.0 - self.dropout_p)
+        scale = Float32(1.0 / (1.0 - self.dropout_p))
+        philox.apply_dropout(
+            acc_S,
+            tScS,
+            self._dropout_seed,
+            self._dropout_offset,
+            p_keep,
+            scale,
+            batch_idx,
+            head_idx,
+            num_heads=1,
+            seqlen_k=seqlen.seqlen_k,
+            transpose_indices=False,
         )
 
 

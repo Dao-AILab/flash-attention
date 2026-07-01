@@ -472,9 +472,16 @@ def atomic_add_fp32(a: float | Float32, gmem_ptr: cute.Pointer, *, loc=None, ip=
     #     is_align_stack=False,
     #     asm_dialect=llvm.AsmDialect.AD_ATT,
     # )
-    nvvm.atomicrmw(
-        res=T.f32(), op=nvvm.AtomicOpKind.FADD, ptr=gmem_ptr.llvm_ptr, a=Float32(a).ir_value()
-    )
+    # The nvvm.atomicrmw binding signature differs across CUTLASS-DSL CUDA toolkit
+    # builds: cu12.x takes (res=, op=, ptr=, a=) while cu13 takes positional
+    # (op, ptr, a) with the result type inferred (no res= kwarg). Support both.
+    _a = Float32(a).ir_value()
+    try:
+        nvvm.atomicrmw(nvvm.AtomicOpKind.FADD, gmem_ptr.llvm_ptr, _a)
+    except TypeError:
+        nvvm.atomicrmw(
+            res=T.f32(), op=nvvm.AtomicOpKind.FADD, ptr=gmem_ptr.llvm_ptr, a=_a
+        )
 
 
 @dsl_user_op
