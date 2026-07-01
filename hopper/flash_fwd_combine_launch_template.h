@@ -41,7 +41,10 @@ void run_flash_fwd_combine(Flash_fwd_params &params, cudaStream_t stream, bool e
 
     typename CombineKernel::Params kernel_params = CombineKernel::to_underlying_arguments(args);
     int num_blocks_k = cute::ceil_div(params.dv, kBlockK);
-    int num_blocks_m = cute::ceil_div(params.seqlen_q * params.h, kBlockM);
+    // for varlen size the combine grid from the actual total query extent
+    // (params.total_q) instead of the per-request max seqlen_q
+    int num_blocks_m = cute::ceil_div(
+        (Varlen ? params.total_q : params.seqlen_q) * params.h, kBlockM);
     dim3 grid_m(num_blocks_m, num_blocks_k, params.b);
     auto kernel = cutlass::device_kernel<CombineKernel>;
     int smem_size = CombineKernel::SharedStorageSize;

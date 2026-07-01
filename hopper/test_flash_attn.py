@@ -1261,3 +1261,41 @@ def test_flash3_bw_compatibility() -> None:
         "int attention_chunk=0, bool has_softcap=False, int num_splits=0, bool? pack_gqa=None, "
         "int sm_margin=0) -> Tensor"
     ))
+
+
+@pytest.mark.skipif(DISABLE_SPLIT, reason="Split-KV (combine kernel) is disabled")
+def test_varlen_combine_cudagraph_stale_seqlen():
+    device, dtype = "cuda", torch.bfloat16
+    torch.manual_seed(0)
+    b, nheads, nheads_k, d = 64, 4, 1, 64
+    seqlen_k, num_splits = 512, 4  # force combine kernel
+    total_q, total_k = b, b * seqlen_k
+
+    q = torch.randn(total_q, nheads, d, device=device, dtype=dtype)
+    k = torch.randn(total_k, nheads_k, d, device=device, dtype=dtype)
+    v = torch.randn(total_k, nheads_k, d, device=device, dtype=dtype)
+    cu_seqlens_q = torch.arange(b + 1, device=device, dtype=torch.int32)  # uniform decode
+    cu_seqlens_k = torch.arange(b + 1, device=device, dtype=torch.int32) * seqlen_k
+
+    def run(max_seqlen_q):
+        return flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k,
+                                      max_seqlen_q, seqlen_k, num_splits=num_splits)
+
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(3):
+            run(1)
+    torch.cuda.current_stream().wait_stream(s)
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        out = run(1)
+
+    # real max query length is total_q but graph baked seqlen_q is still 1
+    cu_seqlens_q.copy_(torch.tensor([0] + [total_q] * b, device=device, dtype=torch.int32))
+    g.replay()
+    torch.cuda.synchronize()
+
+    ref = run(total_q)  # eager reference for the same repacked batch
+    assert not out.isnan().any(), "combine left output rows uninitialized"
+    assert (out - ref).abs().max().item() < 1e-2
