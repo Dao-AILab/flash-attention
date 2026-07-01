@@ -436,7 +436,9 @@ class FlashAttentionBackwardSm80:
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
         grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
 
-        softmax_scale_log2, softmax_scale = utils.compute_softmax_scale_log2(softmax_scale, self.score_mod)
+        softmax_scale_log2, _ = utils.compute_softmax_scale_log2(
+            softmax_scale, self.score_mod
+        )
         self.kernel(
             mQ,
             mK,
