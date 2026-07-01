@@ -651,14 +651,26 @@ class NinjaBuildExtension(BuildExtension):
             # calculate the maximum allowed NUM_JOBS based on cores
             max_num_jobs_cores = max(1, os.cpu_count() // 2)
 
-            # calculate the maximum allowed NUM_JOBS based on free memory
+            # calculate the maximum allowed NUM_JOBS based on free memory.
+            # Reserve a safety margin so the OS, other processes, and per-job
+            # peak spikes above the 5GB/thread average don't OOM the host
+            # (see issue #2493). Without it, the formula below targets ~100%
+            # of available memory on high-RAM machines, which has caused
+            # hard reboots when nvcc spikes coincide.
             free_memory_gb = psutil.virtual_memory().available / (1024 ** 3)  # free memory in GB
+            reserved_memory_gb = max(16.0, free_memory_gb * 0.15)
+            usable_memory_gb = max(0.0, free_memory_gb - reserved_memory_gb)
             # Assume worst-case peak observed memory usage of ~5GB per NVCC thread.
-            # Limit: peak_threads = max_jobs * nvcc_threads and peak_threads * 5GB <= free_memory.
-            max_num_jobs_memory = max(1, int(free_memory_gb / (5 * nvcc_threads)))
+            # Limit: peak_threads = max_jobs * nvcc_threads and peak_threads * 5GB <= usable_memory.
+            max_num_jobs_memory = max(1, int(usable_memory_gb / (5 * nvcc_threads)))
+
+            # Hard cap on parallelism to avoid diminishing returns and runaway
+            # spikes on very large hosts. Override with MAX_JOBS_HARDCAP=N if a
+            # build environment can sustain more.
+            max_jobs_hardcap = int(os.environ.get("MAX_JOBS_HARDCAP", "32"))
 
             # pick lower value of jobs based on cores vs memory metric to minimize oom and swap usage during compilation
-            max_jobs = max(1, min(max_num_jobs_cores, max_num_jobs_memory))
+            max_jobs = max(1, min(max_num_jobs_cores, max_num_jobs_memory, max_jobs_hardcap))
             print(
                 f"Auto set MAX_JOBS to `{max_jobs}`, NVCC_THREADS to `{nvcc_threads}`. "
                 "If you see memory pressure, please use a lower `MAX_JOBS=N` or `NVCC_THREADS=N` value."
