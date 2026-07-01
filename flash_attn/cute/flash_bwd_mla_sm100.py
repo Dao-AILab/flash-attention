@@ -1488,8 +1488,7 @@ class FlashAttentionSparseMLABackwardSm100:
         load_pipeline.producer_acquire(producer_state)
         mbar_ptr = load_pipeline.producer_get_barrier(producer_state)
         if const_expr(bulk_copy):
-            with cute.arch.elect_one():
-                cute.copy(copy_atom, tXgX, tXsX, mbar_ptr=mbar_ptr)
+            cute.copy(copy_atom, tXgX, tXsX, mbar_ptr=mbar_ptr)
         else:
             cute.copy(copy_atom, tXgX, tXsX, tma_bar_ptr=mbar_ptr)
         producer_state.advance()
