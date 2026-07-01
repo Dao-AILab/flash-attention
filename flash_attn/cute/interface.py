@@ -459,6 +459,14 @@ def _flash_attn_fwd(
     qhead_per_kvhead = num_head // num_head_kv
     if pack_gqa is None:
         pack_gqa = qhead_per_kvhead > 1
+        # `pack_gqa.compute_ptr` trips `cute.crd2idx` on SM_120 because
+        # cuTeDSL collapses the composite (qhead_per_kvhead, seqlen_q) mode
+        # in `mO[None, 0]` to a rank-1 layout, then refuses the rank-2 coord
+        # `((h_idx, m_idx),)` at pack_gqa.py:139. Default the consumer
+        # Blackwell path to the unpacked GQA codepath; an explicit
+        # `pack_gqa=True` from the caller is still honoured.
+        if pack_gqa and arch // 10 == 12:
+            pack_gqa = False
 
     is_fp8 = v.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
     requires_grad = any(t is not None and t.requires_grad for t in [q, k, v, qv])
