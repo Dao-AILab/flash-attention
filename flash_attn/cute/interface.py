@@ -1367,6 +1367,7 @@ def _flash_attn_bwd(
         cluster_size = 1
         use_2cta_instrs = False
         num_threads = 128
+        dQ_single_wg = False  # SM120 single-warpgroup dQ; was undefined in the compile key.
         assert not (block_sparse_tensors is not None), "Block sparsity backward not supported on SM 12.0"
         assert score_mod is None and score_mod_bwd is None, "score_mod backward not supported on SM 12.0"
         assert mask_mod is None, "mask_mod backward not supported on SM 12.0"
