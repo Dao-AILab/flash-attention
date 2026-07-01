@@ -559,7 +559,13 @@ def _flash_attn_fwd(
         q_stage = 1
 
     m_block_size_effective = q_stage * tile_m
-    seqlen_k_loaded = max_seqlen_k if not local else max(0, min(max_seqlen_k, (window_size_right or max_seqlen_k) + (window_size_left or max_seqlen_k) + 1 + tile_m))
+    # A window bound of 0 is legitimate (e.g. window_size_right == 0 for any causal
+    # sliding window), so only fall back to max_seqlen_k when the bound is None
+    # (unbounded). Using `or` here treats a real 0 as falsy and over-estimates the
+    # loaded KV range, defeating the purpose of seqlen_k_loaded for sliding windows.
+    window_right_loaded = max_seqlen_k if window_size_right is None else window_size_right
+    window_left_loaded = max_seqlen_k if window_size_left is None else window_size_left
+    seqlen_k_loaded = max_seqlen_k if not local else max(0, min(max_seqlen_k, window_right_loaded + window_left_loaded + 1 + tile_m))
     num_m_blocks = (seqlen_q_packgqa + m_block_size_effective - 1) // m_block_size_effective
     total_mblocks = batch_size * num_head_kv * num_m_blocks
     num_n_blocks = (seqlen_k_loaded + tile_n - 1) // tile_n
