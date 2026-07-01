@@ -56,6 +56,15 @@ def round_up_headdim(head_size: int) -> int:
     return 256
 
 
+def _check_hopper_device(device: Union[str, torch.device]) -> None:
+    major, minor = torch.cuda.get_device_capability(device)
+    if (major, minor) != (9, 0):
+        raise RuntimeError(
+            "flash_attn.hopper only supports Hopper GPUs (SM90). "
+            f"Got SM{major}{minor}."
+        )
+
+
 @torch.library.custom_op("flash_attn_3::_flash_attn_forward", mutates_args=(), device_types="cuda")
 def _flash_attn_forward(
     q: torch.Tensor,
@@ -791,6 +800,7 @@ def flash_attn_qkvpacked_func(
             The output of softmax (possibly with different scaling). It also encodes the dropout
             pattern (negative means that location was dropped, nonnegative means it was kept).
     """
+    _check_hopper_device(qkv.device)
     return FlashAttnQKVPackedFunc.apply(
         qkv,
         softmax_scale,
@@ -868,6 +878,7 @@ def flash_attn_func(
             logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
             normalization factor).
     """
+    _check_hopper_device(q.device)
     return FlashAttnFunc.apply(
         q,
         k,
@@ -910,6 +921,7 @@ def flash_attn_varlen_func(
     sm_margin=0,
     return_attn_probs=False,
 ):
+    _check_hopper_device(q.device)
     return FlashAttnVarlenFunc.apply(
         q,
         k,
@@ -1056,6 +1068,7 @@ def flash_attn_with_kvcache(
             logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
             normalization factor).
     """
+    _check_hopper_device(q.device)
     assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
     assert v_cache.stride(-1) == 1, "v_cache must have contiguous last dimension"
     if softmax_scale is None:
@@ -1121,6 +1134,7 @@ def get_scheduler_metadata(
     pack_gqa=None,   # Can be tuned for speed
     sm_margin=0,     # Can be tuned if some SMs are used for communication
 ):
+    _check_hopper_device(cache_seqlens.device)
     cache_seqlens = maybe_contiguous(cache_seqlens)
     if headdim_v is None:
         headdim_v = headdim
