@@ -65,6 +65,7 @@ flash_attn_interface.flash_attn_func()
 To install using `uv`, in your `pyproject.toml`:
 
 ```toml
+[project]
 dependencies = [
     "flash-attn-3"
 ]
