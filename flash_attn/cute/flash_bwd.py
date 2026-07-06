@@ -798,67 +798,68 @@ class FlashAttentionBackwardSm80:
                 aux_data=aux_data,
             )
 
-            # ///////////////////////////////////////////////////////////////////////////////
-            # Prologue
-            # ///////////////////////////////////////////////////////////////////////////////
-            # Start async loads of the last mn-tile, where we take care of the mn residue
-            self.load_V(gmem_thr_copy_VdO, tVgV, tVsV, n_block, seqlen=seqlen.seqlen_k,
-                        headdim=d_head_v)
-            if cutlass.const_expr(self.V_in_regs):
+            if m_block_min < m_block_max:
+                # ///////////////////////////////////////////////////////////////////////////////
+                # Prologue
+                # ///////////////////////////////////////////////////////////////////////////////
+                # Start async loads of the last mn-tile, where we take care of the mn residue
+                self.load_V(gmem_thr_copy_VdO, tVgV, tVsV, n_block, seqlen=seqlen.seqlen_k,
+                            headdim=d_head_v)
+                if cutlass.const_expr(self.V_in_regs):
+                    cute.arch.cp_async_commit_group()
+                self.load_K(gmem_thr_copy_QK, tKgK, tKsK, n_block, seqlen=seqlen.seqlen_k,
+                            headdim=d_head)
                 cute.arch.cp_async_commit_group()
-            self.load_K(gmem_thr_copy_QK, tKgK, tKsK, n_block, seqlen=seqlen.seqlen_k,
-                        headdim=d_head)
-            cute.arch.cp_async_commit_group()
 
-            if cutlass.const_expr(self.V_in_regs):
-                cute.arch.cp_async_wait_group(1)
-                cute.arch.barrier()
-                tdPrV_copy_view = smem_thr_copy_KV.retile(tdPrV)
-                cute.copy(smem_thr_copy_KV, tdPsV, tdPrV_copy_view)
-                # Sync to avoid loading Q to smem_q, which overlaps with smem_v
-                cute.arch.barrier()
+                if cutlass.const_expr(self.V_in_regs):
+                    cute.arch.cp_async_wait_group(1)
+                    cute.arch.barrier()
+                    tdPrV_copy_view = smem_thr_copy_KV.retile(tdPrV)
+                    cute.copy(smem_thr_copy_KV, tdPsV, tdPrV_copy_view)
+                    # Sync to avoid loading Q to smem_q, which overlaps with smem_v
+                    cute.arch.barrier()
 
-            m_block = m_block_min
-            assert self.num_stages_Q >= self.num_stages_dO
-            for stage in cutlass.range_constexpr(self.num_stages_Q):
-                if cutlass.const_expr(self.num_stages_Q == 1 or stage < self.num_stages_Q - 1):
-                    if stage == 0 or m_block + stage < m_block_max:
-                        load_Q_LSE(m_block + stage, smem_pipe_write_q=stage)
-                    cute.arch.cp_async_commit_group()
-                if cutlass.const_expr(stage < self.num_stages_dO):
-                    if stage == 0 or m_block + stage < m_block_max:
-                        load_dO_dPsum(m_block + stage, smem_pipe_write_q=stage)
-                    cute.arch.cp_async_commit_group()
+                m_block = m_block_min
+                assert self.num_stages_Q >= self.num_stages_dO
+                for stage in cutlass.range_constexpr(self.num_stages_Q):
+                    if cutlass.const_expr(self.num_stages_Q == 1 or stage < self.num_stages_Q - 1):
+                        if stage == 0 or m_block + stage < m_block_max:
+                            load_Q_LSE(m_block + stage, smem_pipe_write_q=stage)
+                        cute.arch.cp_async_commit_group()
+                    if cutlass.const_expr(stage < self.num_stages_dO):
+                        if stage == 0 or m_block + stage < m_block_max:
+                            load_dO_dPsum(m_block + stage, smem_pipe_write_q=stage)
+                        cute.arch.cp_async_commit_group()
 
-            # ///////////////////////////////////////////////////////////////////////////////
-            # Mainloop
-            # ///////////////////////////////////////////////////////////////////////////////
-            # Start processing of the first n-block.
-            mask = AttentionMask(
-                self.m_block_size,
-                self.n_block_size,
-                seqlen,
-                window_size_left,
-                window_size_right,
-            )
-            mask_fn = partial(
-                mask.apply_mask, n_block=n_block, thr_mma=thr_mma_sdp,
-                batch_idx=batch_idx, head_idx=head_idx,
-                mask_seqlen=True, mask_causal=self.is_causal, mask_local=self.is_local
-            )
-            smem_pipe_read_q = cutlass.Int32(0)
-            smem_pipe_read_do = cutlass.Int32(0)
-            smem_pipe_write_q = cutlass.Int32(self.num_stages_Q - 1)
-            smem_pipe_write_do = cutlass.Int32(0)
-            for m_tile in cutlass.range(m_block_min, m_block_max, unroll=1):
-                compute_one_m_block(
-                    m_tile, smem_pipe_read_q, smem_pipe_read_do, smem_pipe_write_q, smem_pipe_write_do,
-                    mask_fn=mask_fn,
+                # ///////////////////////////////////////////////////////////////////////////////
+                # Mainloop
+                # ///////////////////////////////////////////////////////////////////////////////
+                # Start processing of the first n-block.
+                mask = AttentionMask(
+                    self.m_block_size,
+                    self.n_block_size,
+                    seqlen,
+                    window_size_left,
+                    window_size_right,
                 )
-                smem_pipe_read_q = self.advance_pipeline(smem_pipe_read_q, self.num_stages_Q)
-                smem_pipe_read_do = self.advance_pipeline(smem_pipe_read_do, self.num_stages_dO)
-                smem_pipe_write_q = self.advance_pipeline(smem_pipe_write_q, self.num_stages_Q)
-                smem_pipe_write_do = self.advance_pipeline(smem_pipe_write_do, self.num_stages_dO)
+                mask_fn = partial(
+                    mask.apply_mask, n_block=n_block, thr_mma=thr_mma_sdp,
+                    batch_idx=batch_idx, head_idx=head_idx,
+                    mask_seqlen=True, mask_causal=self.is_causal, mask_local=self.is_local
+                )
+                smem_pipe_read_q = cutlass.Int32(0)
+                smem_pipe_read_do = cutlass.Int32(0)
+                smem_pipe_write_q = cutlass.Int32(self.num_stages_Q - 1)
+                smem_pipe_write_do = cutlass.Int32(0)
+                for m_tile in cutlass.range(m_block_min, m_block_max, unroll=1):
+                    compute_one_m_block(
+                        m_tile, smem_pipe_read_q, smem_pipe_read_do, smem_pipe_write_q, smem_pipe_write_do,
+                        mask_fn=mask_fn,
+                    )
+                    smem_pipe_read_q = self.advance_pipeline(smem_pipe_read_q, self.num_stages_Q)
+                    smem_pipe_read_do = self.advance_pipeline(smem_pipe_read_do, self.num_stages_dO)
+                    smem_pipe_write_q = self.advance_pipeline(smem_pipe_write_q, self.num_stages_Q)
+                    smem_pipe_write_do = self.advance_pipeline(smem_pipe_write_do, self.num_stages_dO)
 
             # ///////////////////////////////////////////////////////////////////////////////
             # Epilogue
