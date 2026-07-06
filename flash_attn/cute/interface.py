@@ -1368,7 +1368,6 @@ def _flash_attn_bwd(
         use_2cta_instrs = False
         num_threads = 128
         assert not (block_sparse_tensors is not None), "Block sparsity backward not supported on SM 12.0"
-        assert score_mod is None and score_mod_bwd is None, "score_mod backward not supported on SM 12.0"
         assert mask_mod is None, "mask_mod backward not supported on SM 12.0"
         assert deterministic is False, "deterministic backward not supported on SM 12.0"
     elif arch // 10 == 9:
@@ -1510,8 +1509,6 @@ def _flash_attn_bwd(
         assert cu_seqlens_q is None and cu_seqlens_k is None, (
             "varlen + score_mod not supported in bwd yet"
         )
-        if arch // 10 == 8:
-            raise NotImplementedError("Custom user-provided score_mod is not supported on SM8x architectures.")
 
     device = q.device
     out_torch_dtype = q.dtype
@@ -1682,7 +1679,7 @@ def _flash_attn_bwd(
     else:
         spt = (causal or local) and deterministic
 
-    if arch // 10 in [8, 9, 12]:
+    if arch // 10 in [8, 9]:
         compile_key = (
             arch,
             dtype,
@@ -1716,6 +1713,49 @@ def _flash_attn_bwd(
             mask_mod_hash,
             num_aux_tensors,
             aux_scalar_metadata,
+            use_block_sparsity,
+            block_sparse_broadcast_pattern,
+            get_broadcast_dims(q),
+            get_broadcast_dims(k),
+            get_broadcast_dims(v),
+            get_broadcast_dims(dout),
+            # Prevent TVM stride poisoning when only one block is present.
+            (seqlen_q_rounded // m_block_size == 1),
+            (seqlen_k_rounded // n_block_size == 1),
+        )
+    elif arch // 10 == 12:
+        compile_key = (
+            arch,
+            dtype,
+            head_dim,
+            head_dim_v,
+            qhead_per_kvhead,
+            causal,
+            window_size_left is not None,
+            window_size_right is not None,
+            m_block_size,
+            n_block_size,
+            num_threads,
+            pack_gqa,
+            num_stages_Q,
+            num_stages_dO,
+            SdP_swapAB,
+            dKV_swapAB,
+            dQ_swapAB,
+            AtomLayoutMSdP,
+            AtomLayoutNdKV,
+            AtomLayoutMdQ,
+            V_in_regs,
+            # dQ_single_wg,
+            deterministic,
+            cu_seqlens_q is None,
+            cu_seqlens_k is None,
+            seqused_q is None,
+            seqused_k is None,
+            score_mod_hash,
+            score_mod_bwd_hash,
+            mask_mod_hash,
+            num_aux_tensors,
             use_block_sparsity,
             block_sparse_broadcast_pattern,
             get_broadcast_dims(q),
@@ -1806,6 +1846,7 @@ def _flash_attn_bwd(
                 V_in_regs=V_in_regs,
                 score_mod=score_mod,
                 score_mod_bwd=score_mod_bwd,
+                has_aux_tensors=aux_tensors is not None,
             )
         elif arch // 10 == 9:
             fa_bwd_obj = FlashAttentionBackwardSm90(
