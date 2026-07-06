@@ -294,11 +294,6 @@ def _resolve_causal_local_window(causal, window_size_left, window_size_right, ma
         local = False
     return causal, local, window_size_left, window_size_right
 
-
-def _as_optional_int32(value):
-    return None if value is None else Int32(value)
-
-
 def _flash_attn_fwd(
     q: Optional[torch.Tensor],
     k: Optional[torch.Tensor],
@@ -464,6 +459,8 @@ def _flash_attn_fwd(
     qhead_per_kvhead = num_head // num_head_kv
     if pack_gqa is None:
         pack_gqa = qhead_per_kvhead > 1
+    if arch // 10 == 12:
+        pack_gqa = False
 
     is_fp8 = v.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
     requires_grad = any(t is not None and t.requires_grad for t in [q, k, v, qv])
@@ -518,8 +515,6 @@ def _flash_attn_fwd(
     causal, local, window_size_left, window_size_right = _resolve_causal_local_window(
         causal, window_size_left, window_size_right, mask_mod
     )
-    compile_window_size_left = _as_optional_int32(window_size_left)
-    compile_window_size_right = _as_optional_int32(window_size_right)
 
     requested_use_clc_scheduler = utils._get_use_clc_scheduler_default()
     requested_disable_2cta = utils._get_disable_2cta_default(is_fwd=True)
@@ -1002,8 +997,8 @@ def _flash_attn_fwd(
                 seqused_k_tensor,
                 gather_kv_indices_tensor,
                 page_table_tensor,
-                compile_window_size_left,
-                compile_window_size_right,
+                window_size_left,
+                window_size_right,
                 current_stream,
                 options="--enable-tvm-ffi",
             )
@@ -1021,8 +1016,8 @@ def _flash_attn_fwd(
                 seqused_q_tensor,
                 seqused_k_tensor,
                 page_table_tensor,
-                compile_window_size_left,
-                compile_window_size_right,
+                window_size_left,
+                window_size_right,
                 learnable_sink_tensor,
             ]
             if arch // 10 in [10, 11]:
@@ -1366,8 +1361,6 @@ def _flash_attn_bwd(
     causal, local, window_size_left, window_size_right = _resolve_causal_local_window(
         causal, window_size_left, window_size_right
     )
-    compile_window_size_left = _as_optional_int32(window_size_left)
-    compile_window_size_right = _as_optional_int32(window_size_right)
 
     if arch // 10 == 12:
         # SM120: uses SM80 MMA with 99 KB SMEM, 128 threads (4 warps).
@@ -1820,6 +1813,7 @@ def _flash_attn_bwd(
                 num_threads,
                 pack_gqa,
                 causal,
+                local,
                 SdP_swapAB,
                 dKV_swapAB,
                 dQ_swapAB,
@@ -1940,8 +1934,8 @@ def _flash_attn_bwd(
             cu_seqlens_k_tensor,
             seqused_q_tensor,
             seqused_k_tensor,
-            compile_window_size_left,
-            compile_window_size_right,
+            window_size_left,
+            window_size_right,
             dQ_semaphore_tensor,
             dK_semaphore_tensor,
             dV_semaphore_tensor,

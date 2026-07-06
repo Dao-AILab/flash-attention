@@ -21,6 +21,7 @@ from flash_attn.cute import utils
 from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.softmax import call_score_mod, call_score_mod_bwd
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
+from flash_attn.cute.block_info import BlockInfo
 from quack.cute_dsl_utils import ParamsBase
 from flash_attn.cute.tile_scheduler import SingleTileScheduler, SingleTileVarlenScheduler, TileSchedulerArguments
 from flash_attn.cute.block_sparsity import BlockSparseTensors
@@ -41,6 +42,7 @@ class FlashAttentionBackwardSm80:
         num_threads: int = 256,
         pack_gqa: bool = False,
         is_causal: bool = False,
+        is_local: bool = False,
         SdP_swapAB: bool = False,
         dKV_swapAB: bool = False,
         dQ_swapAB: bool = False,
@@ -83,6 +85,7 @@ class FlashAttentionBackwardSm80:
         self.num_threads = num_threads
         self.pack_gqa = pack_gqa
         self.is_causal = is_causal
+        self.is_local = is_local
         self.num_stages_Q = num_stages_Q
         self.num_stages_dO = num_stages_dO
         self.SdP_swapAB = SdP_swapAB
@@ -455,6 +458,8 @@ class FlashAttentionBackwardSm80:
             mSeqUsedK,
             softmax_scale,
             softmax_scale_log2,
+            window_size_left,
+            window_size_right,
             self.sQ_layout,
             self.sK_layout,
             self.sV_layout,
@@ -500,6 +505,8 @@ class FlashAttentionBackwardSm80:
         mSeqUsedK: Optional[cute.Tensor],
         softmax_scale: cutlass.Float32,
         softmax_scale_log2: cutlass.Float32,
+        window_size_left: Optional[Int32],
+        window_size_right: Optional[Int32],
         sQ_layout: cute.ComposedLayout,
         sK_layout: cute.ComposedLayout,
         sV_layout: cute.ComposedLayout,
@@ -542,13 +549,16 @@ class FlashAttentionBackwardSm80:
                 tile_n=self.n_block_size,
             )
 
-            m_block_max = cute.ceil_div(seqlen.seqlen_q, self.m_block_size)
-            m_block_min = 0
-            if cutlass.const_expr(self.is_causal):
-                m_block_min = max(
-                    (n_block * self.n_block_size + seqlen.seqlen_q - seqlen.seqlen_k) // self.m_block_size,
-                    m_block_min,
-                )
+            block_info = BlockInfo(
+                self.m_block_size,
+                self.n_block_size,
+                self.is_causal,
+                self.is_local,
+                False,
+                window_size_left,
+                window_size_right,
+            )
+            m_block_min, m_block_max = block_info.get_m_block_min_max(seqlen, n_block)
             # TODO: return early if m_block_max == 0
 
             # ///////////////////////////////////////////////////////////////////////////////
@@ -824,11 +834,17 @@ class FlashAttentionBackwardSm80:
             # Mainloop
             # ///////////////////////////////////////////////////////////////////////////////
             # Start processing of the first n-block.
-            mask = AttentionMask(self.m_block_size, self.n_block_size, seqlen)
+            mask = AttentionMask(
+                self.m_block_size,
+                self.n_block_size,
+                seqlen,
+                window_size_left,
+                window_size_right,
+            )
             mask_fn = partial(
                 mask.apply_mask, n_block=n_block, thr_mma=thr_mma_sdp,
                 batch_idx=batch_idx, head_idx=head_idx,
-                mask_seqlen=True, mask_causal=self.is_causal
+                mask_seqlen=True, mask_causal=self.is_causal, mask_local=self.is_local
             )
             smem_pipe_read_q = cutlass.Int32(0)
             smem_pipe_read_do = cutlass.Int32(0)
