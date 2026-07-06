@@ -299,6 +299,18 @@ class SoftmaxSm100(Softmax):
         return row_max_safe, acc_scale
 
     @cute.jit
+    def update_row_max_precomputed(
+        self, hw_row_max: Float32, is_first: int
+    ) -> Tuple[Float32, Float32]:
+        """Row max already reduced in hardware (SM103 tcgen05.ld.red): skip the
+        software fmax tree — the TMEM controller computed the max during the S load."""
+        if cutlass.const_expr(is_first):
+            row_max_new = hw_row_max
+        else:
+            row_max_new = cute.arch.fmax(hw_row_max, self.row_max[0])
+        return self.update_row_max_from_local(row_max_new, is_first)
+
+    @cute.jit
     def update_row_max(self, acc_S_row: cute.TensorSSA, is_first: int) -> Tuple[Float32, Float32]:
         if cutlass.const_expr(is_first):
             row_max_new = self._compute_row_max(acc_S_row)
