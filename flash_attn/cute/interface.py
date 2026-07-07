@@ -459,6 +459,8 @@ def _flash_attn_fwd(
     qhead_per_kvhead = num_head // num_head_kv
     if pack_gqa is None:
         pack_gqa = qhead_per_kvhead > 1
+    if arch // 10 == 12:
+        pack_gqa = False
 
     is_fp8 = v.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
     requires_grad = any(t is not None and t.requires_grad for t in [q, k, v, qv])
@@ -1364,6 +1366,7 @@ def _flash_attn_bwd(
         AtomLayoutNdKV = 4
         AtomLayoutMdQ = 4
         V_in_regs = False
+        dQ_single_wg = False
         cluster_size = 1
         use_2cta_instrs = False
         num_threads = 128
@@ -1797,6 +1800,7 @@ def _flash_attn_bwd(
                 num_threads,
                 pack_gqa,
                 causal,
+                local,
                 SdP_swapAB,
                 dKV_swapAB,
                 dQ_swapAB,
