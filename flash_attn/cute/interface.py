@@ -459,8 +459,6 @@ def _flash_attn_fwd(
     qhead_per_kvhead = num_head // num_head_kv
     if pack_gqa is None:
         pack_gqa = qhead_per_kvhead > 1
-    if arch // 10 == 12:
-        pack_gqa = False
 
     is_fp8 = v.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
     requires_grad = any(t is not None and t.requires_grad for t in [q, k, v, qv])
