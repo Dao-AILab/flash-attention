@@ -25,6 +25,7 @@ from flash_attn.cute.interface import (
 
 USE_FAKE_TENSOR = int(os.getenv("FLASH_ATTENTION_FAKE_TENSOR", 0)) == 1
 IS_SM90 = torch.cuda.get_device_capability()[0] == 9
+IS_SM120 = torch.cuda.get_device_capability()[0] == 12
 
 
 # ---------------------------------------------------------------------------
@@ -47,8 +48,8 @@ IS_SM90 = torch.cuda.get_device_capability()[0] == 9
 )
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_output(seqlen_q, seqlen_k, d, causal, num_splits, mha_type, dtype):
-    if IS_SM90 and num_splits > 1:
-        pytest.skip("SM90 fwd doens't support num_splits > 1")
+    if (IS_SM90 or IS_SM120) and num_splits > 1:
+        pytest.skip("SM90/SM120 fwd doesn't support num_splits > 1")
     device = "cuda"
     torch.random.manual_seed(0)
     random.seed(0)
