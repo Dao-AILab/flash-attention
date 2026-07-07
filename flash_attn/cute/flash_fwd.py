@@ -655,7 +655,6 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         self.num_producer_threads = self.num_threads
         self.num_Q_load_threads = self.num_threads
         self.num_epilogue_threads = self.num_threads
-        # self.use_tma_O = self.arch >= 90 and mCuSeqlensQ is None
         self.use_tma_O = Arch.sm_90 <= self.arch < Arch.sm_120
         self._setup_attributes()
         SharedStorage = self._get_shared_storage_cls()
@@ -821,10 +820,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         blkK_shape = (self.tile_n, self.tile_hdim)
         blkV_shape = (self.tile_n, self.tile_hdimv)
         num_head_kv = num_head if const_expr(self.pack_gqa) else num_head // self.qhead_per_kvhead
-        if const_expr(not seqlen.has_cu_seqlens_q):
-            mQ_cur = mQ[None, None, num_head, batch_size]
-        else:
-            mQ_cur = cute.domain_offset((seqlen.offset_q, 0), mQ[None, None, num_head])
+        mQ_cur = seqlen.offset_batch_Q(mQ, batch_size, dim=3)[None, None, num_head]
         if const_expr(not seqlen.has_cu_seqlens_k):
             mK_cur = mK[None, None, num_head_kv, batch_size]
             mV_cur = mV[None, None, num_head_kv, batch_size]

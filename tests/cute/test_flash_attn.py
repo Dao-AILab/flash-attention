@@ -86,6 +86,16 @@ IS_SM120 = torch.cuda.get_device_capability()[0] == 12
 TEST_BWD_ONLY = False
 VERBOSE = True
 
+
+@pytest.mark.skipif(not IS_SM120, reason="SM120-only SplitKV unsupported behavior")
+def test_flash_attn_sm120_rejects_splitkv():
+    q = torch.randn(1, 16, 4, 64, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, 16, 1, 64, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(1, 16, 1, 64, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(AssertionError, match="SM120 forward only supports num_splits=1"):
+        flash_attn_func(q, k, v, num_splits=3)
+
+
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
