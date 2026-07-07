@@ -31,7 +31,21 @@ def get_fwd_split_template() -> str:
 
 namespace FLASH_NAMESPACE {{
 
+// The num_splits==1 blocksize-aligned tree is instantiated in its own translation unit
+// (flash_fwd_split_align_*.cu) so it compiles in parallel; declare it extern so
+// the dispatch below references it instead of re-instantiating.
+extern template void run_mha_fwd_splitkv_align<{DTYPE}, {HEAD_DIM}, {IS_CAUSAL}>(Flash_fwd_params &params, cudaStream_t stream);
+
 template void run_mha_fwd_splitkv_dispatch<{DTYPE}, {HEAD_DIM}, {IS_CAUSAL}>(Flash_fwd_params &params, cudaStream_t stream);
+
+}} // namespace FLASH_NAMESPACE"""
+
+def get_fwd_split_align_template() -> str:
+    return NAMESPACE_INCLUDE + """#include "flash_fwd_launch_template.h"
+
+namespace FLASH_NAMESPACE {{
+
+template void run_mha_fwd_splitkv_align<{DTYPE}, {HEAD_DIM}, {IS_CAUSAL}>(Flash_fwd_params &params, cudaStream_t stream);
 
 }} // namespace FLASH_NAMESPACE"""
 
@@ -60,7 +74,8 @@ class Kernel:
         template_funcs = {
             "fwd": get_fwd_template,
             "bwd": get_bwd_template,
-            "fwd_split": get_fwd_split_template
+            "fwd_split": get_fwd_split_template,
+            "fwd_split_align": get_fwd_split_align_template,
         }
         template_func = template_funcs[self.direction]
         return template_func().format(
@@ -74,7 +89,7 @@ class Kernel:
         return f"flash_{self.direction}_hdim{self.head_dim}_{self.dtype}_{'causal_' if self.is_causal == 'true' else ''}sm{self.sm}.cu"
 
 def get_all_kernels() -> List[Kernel]:
-    for direction in ["fwd", "fwd_split", "bwd"]:
+    for direction in ["fwd", "fwd_split", "fwd_split_align", "bwd"]:
         for dtype, head_dim, is_causal, sm in itertools.product(DTYPE_MAP.keys(), HEAD_DIMENSIONS, IS_CAUSAL, SM):
             yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, is_causal=is_causal, direction=direction)
 

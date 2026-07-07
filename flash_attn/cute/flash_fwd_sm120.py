@@ -7,14 +7,16 @@
 
 import cutlass
 import cutlass.utils as utils_basic
+from cutlass.base_dsl.arch import Arch
 
 from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80
 
 
 class FlashAttentionForwardSm120(FlashAttentionForwardSm80):
-    # Keep arch = 80 to use CpAsync code paths (no TMA for output).
-    # The compilation target is determined by the GPU at compile time, not this field.
-    arch = 80
+    def __init__(self, *args, **kwargs):
+        """Force SM80 code paths while the DSL still targets the resident SM120 GPU."""
+        super().__init__(*args, **kwargs)
+        self.arch = Arch.sm_80
 
     @staticmethod
     def can_implement(
