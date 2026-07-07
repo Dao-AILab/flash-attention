@@ -3039,10 +3039,10 @@ class FlashAttentionBackwardSm100:
             seqlen = SeqlenInfoCls(batch_idx)
 
             recompute_fastdiv_mods_q = const_expr(
-                aux_tensors is not None and (seqlen.has_cu_seqlens_q or seqlen.has_seqused_q)
+                aux_data is not None and (seqlen.has_cu_seqlens_q or seqlen.has_seqused_q)
             )
             recompute_fastdiv_mods_k = const_expr(
-                aux_tensors is not None and (seqlen.has_cu_seqlens_k or seqlen.has_seqused_k)
+                aux_data is not None and (seqlen.has_cu_seqlens_k or seqlen.has_seqused_k)
             )
 
             if const_expr(fastdiv_mods is not None and fastdiv_mods[0] is not None):

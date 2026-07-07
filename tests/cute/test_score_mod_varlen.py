@@ -1249,7 +1249,7 @@ def run_cute_flash_bwd_varlen(
         dq, dk, dv = torch.autograd.grad(out, (q, k, v), grad_out)
         return out, grad_out, dq, dk, dv
 
-    out, lse = _flash_attn_fwd(
+    out, lse, *_ = _flash_attn_fwd(
         q,
         k,
         v,
@@ -1261,7 +1261,7 @@ def run_cute_flash_bwd_varlen(
         pack_gqa=pack_gqa,
     )
     grad_out = torch.randn_like(out)
-    dq, dk, dv = _flash_attn_bwd(
+    dq, dk, dv, *_ = _flash_attn_bwd(
         q,
         k,
         v,
