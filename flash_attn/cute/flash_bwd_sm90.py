@@ -1299,10 +1299,10 @@ class FlashAttentionBackwardSm90:
             seqlen = SeqlenInfoCls(batch_idx)
 
             recompute_fastdiv_mods_q = const_expr(
-                aux_tensors is not None and (seqlen.has_cu_seqlens_q or seqlen.has_seqused_q)
+                aux_data is not None and (seqlen.has_cu_seqlens_q or seqlen.has_seqused_q)
             )
             recompute_fastdiv_mods_k = const_expr(
-                aux_tensors is not None and (seqlen.has_cu_seqlens_k or seqlen.has_seqused_k)
+                aux_data is not None and (seqlen.has_cu_seqlens_k or seqlen.has_seqused_k)
             )
 
             if const_expr(fastdiv_mods is not None and fastdiv_mods[0] is not None):
@@ -1321,14 +1321,14 @@ class FlashAttentionBackwardSm90:
                 self.apply_score_mod,
                 thr_mma_SdP=thr_mma_SdP,
                 softmax_scale=softmax_scale,
-                aux_tensors=aux_tensors,
+                aux_data=aux_data,
                 fastdiv_mods=fastdiv_mods,
             )
             score_mod_bwd_fn = partial(
                 self.apply_score_mod_bwd,
                 thr_mma_SdP=thr_mma_SdP,
                 softmax_scale=softmax_scale,
-                aux_tensors=aux_tensors,
+                aux_data=aux_data,
                 fastdiv_mods=fastdiv_mods,
             )
             score_mod_fn_cur = partial(
