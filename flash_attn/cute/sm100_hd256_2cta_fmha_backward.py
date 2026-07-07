@@ -22,80 +22,7 @@ from flash_attn.cute.sm100_hd256_2cta_fmha_backward_dkdvkernel import (
     BlackwellFusedMultiHeadAttentionBackwardDKDVKernel,
 )
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
-from flash_attn.cute.utils import AuxData
-
-
-def _as_bshkrd_tensor(
-    tensor: cute.Tensor,
-    h_k: Int32,
-    h_r: Int32,
-    varlen: bool,
-) -> cute.Tensor:
-    """Normalize (B,S,H,D)/(S,H,D) tensors to (B,S,H_k,H_r,D) view."""
-    if cutlass.const_expr(cute.rank(tensor.layout) == 5):
-        return tensor
-    if cutlass.const_expr(cute.rank(tensor.layout) == 4):
-        return cute.make_tensor(
-            tensor.iterator,
-            cute.make_layout(
-                (tensor.shape[0], tensor.shape[1], h_k, h_r, tensor.shape[3]),
-                stride=(
-                    tensor.stride[0],
-                    tensor.stride[1],
-                    tensor.stride[2] * h_r,
-                    tensor.stride[2],
-                    tensor.stride[3],
-                ),
-            ),
-        )
-    assert cutlass.const_expr(cute.rank(tensor.layout) == 3), "Expected rank-3 varlen tensor"
-    assert cutlass.const_expr(varlen), "Rank-3 input is only valid for varlen backward"
-    return cute.make_tensor(
-        tensor.iterator,
-        cute.make_layout(
-            (1, tensor.shape[0], h_k, h_r, tensor.shape[2]),
-            stride=(
-                0,
-                tensor.stride[0],
-                tensor.stride[1] * h_r,
-                tensor.stride[1],
-                tensor.stride[2],
-            ),
-        ),
-    )
-
-
-def _as_shhb_tensor(
-    tensor: cute.Tensor,
-    h_k: Int32,
-    h_r: Int32,
-    b: Int32,
-    varlen: bool,
-) -> cute.Tensor:
-    """Normalize (B,H,S)/(H,S) tensors to (S, ((H_r, H_k), B)) view."""
-    if cutlass.const_expr(cute.rank(tensor.layout) == 3):
-        return cute.make_tensor(
-            tensor.iterator,
-            cute.make_layout(
-                (tensor.shape[2], ((h_r, h_k), tensor.shape[0])),
-                stride=(
-                    tensor.stride[2],
-                    ((tensor.stride[1], tensor.stride[1] * h_r), tensor.stride[0]),
-                ),
-            ),
-        )
-    assert cutlass.const_expr(cute.rank(tensor.layout) == 2), "Expected rank-2 varlen tensor"
-    assert cutlass.const_expr(varlen), "Rank-2 input is only valid for varlen backward"
-    return cute.make_tensor(
-        tensor.iterator,
-        cute.make_layout(
-            (tensor.shape[1], ((h_r, h_k), b)),
-            stride=(
-                tensor.stride[1],
-                ((tensor.stride[0], tensor.stride[0] * h_r), 0),
-            ),
-        ),
-    )
+from flash_attn.cute.utils import AuxData, as_bshkrd_tensor, as_shhb_tensor
 
 
 class BlackwellFusedMultiHeadAttentionBackward:
@@ -258,15 +185,15 @@ class BlackwellFusedMultiHeadAttentionBackward:
 
         Q, K, V, dQ, dK, dV, dO = [assume_tensor_aligned(t) for t in (Q, K, V, dQ, dK, dV, dO)]
 
-        Q = _as_bshkrd_tensor(Q, h_k, h_r, varlen)
-        K = _as_bshkrd_tensor(K, h_k, 1, varlen)
-        V = _as_bshkrd_tensor(V, h_k, 1, varlen)
-        dQ = _as_bshkrd_tensor(dQ, h_k, h_r, varlen)
-        dK = _as_bshkrd_tensor(dK, h_k, 1, varlen)
-        dV = _as_bshkrd_tensor(dV, h_k, 1, varlen)
-        dO = _as_bshkrd_tensor(dO, h_k, h_r, varlen)
-        scaled_LSE = _as_shhb_tensor(lse_log2, h_k, h_r, b, varlen)
-        sum_OdO = _as_shhb_tensor(dpsum, h_k, h_r, b, varlen)
+        Q = as_bshkrd_tensor(Q, h_k, h_r, varlen)
+        K = as_bshkrd_tensor(K, h_k, 1, varlen)
+        V = as_bshkrd_tensor(V, h_k, 1, varlen)
+        dQ = as_bshkrd_tensor(dQ, h_k, h_r, varlen)
+        dK = as_bshkrd_tensor(dK, h_k, 1, varlen)
+        dV = as_bshkrd_tensor(dV, h_k, 1, varlen)
+        dO = as_bshkrd_tensor(dO, h_k, h_r, varlen)
+        scaled_LSE = as_shhb_tensor(lse_log2, h_k, h_r, b, varlen)
+        sum_OdO = as_shhb_tensor(dpsum, h_k, h_r, b, varlen)
 
         # Keep original order: dQ first, then dKdV.
         self.dq_kernel(
