@@ -564,7 +564,9 @@ def _flash_attn_fwd(
     total_mblocks = batch_size * num_head_kv * num_m_blocks
     num_n_blocks = (seqlen_k_loaded + tile_n - 1) // tile_n
     num_SMs = 132 if is_fake_mode() else torch.cuda.get_device_properties(device).multi_processor_count
-    if num_splits < 1:
+    if arch // 10 == 12:
+        assert num_splits == 1, "SM120 forward only supports num_splits=1"
+    elif num_splits < 1:
         num_splits = num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, 128)
 
     # SplitKV uses float32 partial output, which doubles the O buffer size
@@ -576,12 +578,6 @@ def _flash_attn_fwd(
             num_splits = num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, 128)
         else:
             num_splits = 1
-
-    # SM120 (Blackwell GeForce / RTX PRO / DGX Spark) does not implement the SplitKV
-    # forward + combine path (SplitKV is an SM100-only feature; SM80/SM90 also lack it).
-    # Fall back to a single split: the full-KV kernel is correct and is the supported path.
-    if arch // 10 == 12 and num_splits != 1:
-        num_splits = 1
 
     is_split_kv = num_splits > 1
     if is_split_kv:

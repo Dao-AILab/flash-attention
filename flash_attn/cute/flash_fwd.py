@@ -656,10 +656,6 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         self.num_Q_load_threads = self.num_threads
         self.num_epilogue_threads = self.num_threads
         # self.use_tma_O = self.arch >= 90 and mCuSeqlensQ is None
-        # SM120 (Blackwell GeForce / RTX PRO / DGX Spark) lacks the WGMMA-era TMA-store
-        # epilogue path used here; only sm_90..sm_119 use TMA for the O store. On sm_120
-        # tma_atom_O is None, so using it crashes in tma_partition with
-        # 'NoneType' object has no attribute '_trait'. (issue #2649)
         self.use_tma_O = Arch.sm_90 <= self.arch < Arch.sm_120
         self._setup_attributes()
         SharedStorage = self._get_shared_storage_cls()
@@ -678,12 +674,6 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         if const_expr(mLSE is not None):
             LSE_layout_transpose = [2, 1, 0] if const_expr(mCuSeqlensQ is None) else [1, 0]
             mLSE = cute.make_tensor(mLSE.iterator, cute.select(mLSE.layout, mode=LSE_layout_transpose))
-        # Pack-GQA: fold qhead_per_kvhead into the seqlen mode so the kernel iterates
-        # over (qhead * seqlen) rows against a single KV head. After the transpose above,
-        # mQ/mO are (seqlen, headdim, nheads, [batch]) (head at mode 2) and mLSE is
-        # (seqlen, nheads, [batch]) (head at mode 1). This matches the SM90 path and is
-        # what PackGQA.store_O/store_LSE/load_Q expect; without it the packed (h_idx,m_idx)
-        # gmem coordinate in store_O hits an unpacked layout and crd2idx fails.
         if const_expr(self.pack_gqa):
             nheads_kv = mK.shape[2]
             mQ = pack_gqa_layout(mQ, self.qhead_per_kvhead, nheads_kv, head_idx=2)
@@ -830,12 +820,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         blkQ_shape = (self.tile_m, self.tile_hdim)
         blkK_shape = (self.tile_n, self.tile_hdim)
         blkV_shape = (self.tile_n, self.tile_hdimv)
-        # When pack_gqa, the scheduler iterates over KV heads, so num_head already
-        # indexes the KV head and mQ/mO are pre-packed (mode 2 = nheads_kv).
-        # When not pack_gqa, num_head indexes Q heads and KV heads are derived by division.
-        num_head_kv = (
-            num_head // self.qhead_per_kvhead if const_expr(not self.pack_gqa) else num_head
-        )
+        num_head_kv = num_head if const_expr(self.pack_gqa) else num_head // self.qhead_per_kvhead
         if const_expr(not seqlen.has_cu_seqlens_q):
             mQ_cur = mQ[None, None, num_head, batch_size]
         else:
@@ -846,12 +831,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         else:
             mK_cur = cute.domain_offset((seqlen.offset_k, 0), mK[None, None, num_head_kv])
             mV_cur = cute.domain_offset((seqlen.offset_k, 0), mV[None, None, num_head_kv])
-        # For pack_gqa, Q rows are gathered via per-row gmem pointers in PackGQA.load_Q,
-        # so the standard contiguous local_tile gQ is not used.
         if const_expr(not self.pack_gqa):
             gQ = cute.local_tile(mQ_cur, blkQ_shape, (m_block, 0))
-        else:
-            gQ = None
         gK = cute.local_tile(mK_cur, blkK_shape, (None, 0))
         gV = cute.local_tile(mV_cur, blkV_shape, (None, 0))
 
@@ -986,13 +967,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         if const_expr(not self.pack_gqa):
             self.load_Q(gmem_thr_copy_Q, gQ, sQ, m_block, seqlen=seqlen.seqlen_q, headdim=mQ.shape[1])
         else:
-            # PackGQA gathers Q rows by (h_idx, m_idx) via per-row gmem pointers.
-            pack_gqa_q = PackGQA(
-                self.tile_m, self.tile_hdim, self.check_hdim_oob, self.qhead_per_kvhead
-            )
-            pack_gqa_q.load_Q(
-                mQ_cur, sQ, gmem_tiled_copy_Q, tidx, m_block, seqlen.seqlen_q
-            )
+            pack_gqa = PackGQA(self.tile_m, self.tile_hdim, self.check_hdim_oob, self.qhead_per_kvhead)
+            pack_gqa.load_Q(mQ_cur, sQ, gmem_tiled_copy_Q, tidx, m_block, seqlen.seqlen_q)
         cute.arch.cp_async_commit_group()
 
         def preprocess_Q():
