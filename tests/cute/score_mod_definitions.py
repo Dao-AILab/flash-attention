@@ -838,9 +838,9 @@ def score_mod_scaled_squared(
     kv_idx_global = kv_idx + offset_k
     scale = aux_tensors[0]
     dtype = scale.element_type
-    kv_frag = cute.make_fragment(1, cutlass.Int32)
+    kv_frag = cute.make_rmem_tensor(1, cutlass.Int32)
     kv_frag.store(kv_idx_global)
-    scale_frag = cute.make_fragment(1, dtype)
+    scale_frag = cute.make_rmem_tensor(1, dtype)
     scale_frag[0] = scale[kv_frag[0]]
     scale_val = (scale_frag.load()).to(cutlass.Float32)
     return scale_val * tSrS_ssa * tSrS_ssa
@@ -855,9 +855,9 @@ def score_mod_bwd_scaled_squared(
     kv_idx_global = kv_idx + offset_k
     scale = aux_tensors[0]
     dtype = scale.element_type
-    kv_frag = cute.make_fragment(1, cutlass.Int32)
+    kv_frag = cute.make_rmem_tensor(1, cutlass.Int32)
     kv_frag.store(kv_idx_global)
-    scale_frag = cute.make_fragment(1, dtype)
+    scale_frag = cute.make_rmem_tensor(1, dtype)
     scale_frag[0] = scale[kv_frag[0]]
     scale_val = (scale_frag.load()).to(cutlass.Float32)
     return grad * cute.full_like(grad, 2.0) * scale_val * score
