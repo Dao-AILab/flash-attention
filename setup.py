@@ -193,9 +193,23 @@ def append_nvcc_threads(nvcc_extra_args):
     return nvcc_extra_args + ["--threads", NVCC_THREADS]
 
 
-def rename_cpp_to_cu(cpp_files):
+def rename_cpp_to_cu(cpp_files, generated_rdna_bfloat16_override=None):
     for entry in cpp_files:
-        shutil.copy(entry, os.path.splitext(entry)[0] + ".cu")
+        dst = os.path.splitext(entry)[0] + ".cu"
+        if (
+            generated_rdna_bfloat16_override is not None
+            and Path(entry).parent.name == "build"
+            and Path(entry).name.startswith(("fmha_fwd", "fmha_bwd"))
+            and re.search(r"_gfx1[12][^/]*\.cpp$", Path(entry).name)
+        ):
+            with open(entry, "r", encoding="utf-8") as src, open(dst, "w", encoding="utf-8") as out:
+                out.write(
+                    "#undef CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT\n"
+                    f"#define CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT {generated_rdna_bfloat16_override}\n"
+                )
+                out.write(src.read())
+        else:
+            shutil.copy(entry, dst)
 
 
 def validate_and_update_archs(archs):
@@ -212,6 +226,27 @@ def validate_and_update_archs(archs):
             f"'native' cannot be combined with explicit archs: {archs}. "
             "Use either GPU_ARCHS='native' or GPU_ARCHS='gfx942;gfx950'."
         )
+
+
+def get_ck_tile_bfloat16_supported_modes(ck_dir):
+    config_path = Path(this_dir) / ck_dir / "include" / "ck_tile" / "core" / "config.hpp"
+    try:
+        config_text = config_path.read_text(encoding="utf-8")
+    except OSError:
+        # Old vendored CK revisions support up to mode 4.
+        return {"0", "1", "2", "3", "4"}
+
+    supported_modes = set(
+        re.findall(
+            r"^#define\s+CK_TILE_FLOAT_TO_BFLOAT16_[A-Z0-9_]+\s+(\d+)\s*$",
+            config_text,
+            re.MULTILINE,
+        )
+    )
+    if not supported_modes:
+        raise RuntimeError(f"Failed to detect CK tile BF16 conversion modes from {config_path}.")
+
+    return supported_modes
 
 
 cmdclass = {}
@@ -301,14 +336,6 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
         nvcc_flags.extend(["-Xcompiler", "/Zc:__cplusplus"])
         compiler_c17_flag=["-O2", "/std:c++17", "/Zc:__cplusplus"]
 
-    # Opt-in: skip the num_splits==1 blocksize-alignment instantiation in the
-    # splitkv dispatch. That alignment (PR #2448) compiles a second splitkv kernel
-    # tree per head dim, roughly doubling ptxas time for hd32/64/96/128 (hd64 can
-    # stall ptxas for hours). Disabling it keeps num_splits==1 correct but no
-    # longer bitwise-identical to the standard kernel. nvcc-only (header in .cu).
-    if os.getenv("FLASH_ATTENTION_DISABLE_SPLIT_ALIGNMENT", "FALSE") == "TRUE":
-        nvcc_flags.append("-DFLASHATTENTION_DISABLE_SPLIT_ALIGNMENT")
-
     ext_modules.append(
         CUDAExtension(
             name="flash_attn_2_cuda",
@@ -386,6 +413,30 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
                 "csrc/flash_attn/src/flash_fwd_split_hdim192_bf16_causal_sm80.cu",
                 "csrc/flash_attn/src/flash_fwd_split_hdim256_fp16_causal_sm80.cu",
                 "csrc/flash_attn/src/flash_fwd_split_hdim256_bf16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_align_hdim32_fp16_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_align_hdim32_bf16_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_align_hdim64_fp16_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_align_hdim64_bf16_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_align_hdim96_fp16_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_align_hdim96_bf16_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_align_hdim128_fp16_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_align_hdim128_bf16_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_align_hdim192_fp16_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_align_hdim192_bf16_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_align_hdim256_fp16_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_align_hdim256_bf16_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_align_hdim32_fp16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_align_hdim32_bf16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_align_hdim64_fp16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_align_hdim64_bf16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_align_hdim96_fp16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_align_hdim96_bf16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_align_hdim128_fp16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_align_hdim128_bf16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_align_hdim192_fp16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_align_hdim192_bf16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_align_hdim256_fp16_causal_sm80.cu",
+                "csrc/flash_attn/src/flash_fwd_split_align_hdim256_bf16_causal_sm80.cu",
             ],
             extra_compile_args={
                 "cxx": compiler_c17_flag,
@@ -474,16 +525,6 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
         if detect_hipify_v2():
             maybe_hipify_v2_flag = ["-DHIPIFY_V2"]
 
-        rename_cpp_to_cu(sources)
-
-        renamed_sources = ["csrc/flash_attn_ck/flash_api.cu",
-                        "csrc/flash_attn_ck/flash_common.cu",
-                        "csrc/flash_attn_ck/mha_bwd.cu",
-                        "csrc/flash_attn_ck/mha_fwd_kvcache.cu",
-                        "csrc/flash_attn_ck/mha_fwd.cu",
-                        "csrc/flash_attn_ck/mha_varlen_bwd.cu",
-                        "csrc/flash_attn_ck/mha_varlen_fwd.cu"] + glob.glob(f"build/fmha_*wd*.cu")
-
         cc_flag += ["-O3","-std=c++20",
                     "-Wno-unknown-warning-option",
                     "-fbracket-depth=1024",
@@ -501,11 +542,30 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
                     # "-DFLASHATTENTION_DISABLE_BACKWARD",
                     "-D__HIP_PLATFORM_HCC__=1"]
 
+        supported_ck_tile_bfloat16_modes = get_ck_tile_bfloat16_supported_modes(ck_dir)
+        has_gfx11_or_gfx12_target = any(
+            arch.startswith(("gfx11", "gfx12")) for arch in kernel_targets
+        )
+        rdna_bfloat16_default = "5" if "5" in supported_ck_tile_bfloat16_modes else "0"
+
         ck_tile_float_to_bfloat16_default = os.environ.get("CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT")
         if ck_tile_float_to_bfloat16_default is None:
-            has_gfx11_target = any(arch.startswith("gfx11") for arch in kernel_targets)
-            ck_tile_float_to_bfloat16_default = "0" if has_gfx11_target else "3"
+            ck_tile_float_to_bfloat16_default = "3"
+
+        generated_rdna_bfloat16_override = None
+        if has_gfx11_or_gfx12_target:
+            generated_rdna_bfloat16_override = rdna_bfloat16_default
         cc_flag += [f"-DCK_TILE_FLOAT_TO_BFLOAT16_DEFAULT={ck_tile_float_to_bfloat16_default}"]
+
+        rename_cpp_to_cu(sources, generated_rdna_bfloat16_override=generated_rdna_bfloat16_override)
+
+        renamed_sources = ["csrc/flash_attn_ck/flash_api.cu",
+                        "csrc/flash_attn_ck/flash_common.cu",
+                        "csrc/flash_attn_ck/mha_bwd.cu",
+                        "csrc/flash_attn_ck/mha_fwd_kvcache.cu",
+                        "csrc/flash_attn_ck/mha_fwd.cu",
+                        "csrc/flash_attn_ck/mha_varlen_bwd.cu",
+                        "csrc/flash_attn_ck/mha_varlen_fwd.cu"] + glob.glob(f"build/fmha_*wd*.cu")
 
         # Imitate https://github.com/ROCm/composable_kernel/blob/c8b6b64240e840a7decf76dfaa13c37da5294c4a/CMakeLists.txt#L190-L214
         hip_version = get_hip_version()
