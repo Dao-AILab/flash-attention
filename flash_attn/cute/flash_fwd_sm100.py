@@ -95,6 +95,11 @@ _TUNING_CONFIG = {
 }
 _FP8_TUNING_CONFIG = {
     (True, False, 128, False): {'ex2_emu_freq': 10, 'ex2_emu_start_frg': 1, 'num_regs_softmax': 160, 'num_regs_correction': 72},
+    # Causal hd128 FP8 previously inherited bf16's freq=16. FP8 fwd is MUFU/ex2-bound, so a more
+    # aggressive emulation freq=8 offloads more exp from MUFU: +3.4%(4k)..+5.5%(16k) on B200,
+    # MHA & GQA, accuracy-neutral (3-run validated, locked clocks). freq=8 would regress non-causal
+    # (0.94x), hence keyed on is_causal=True only.
+    (False, True, 128, False): {'ex2_emu_freq': 8, 'ex2_emu_start_frg': 1},
 }
 _FP8_SMALL_HDIM_REGS = {
     False: {"num_regs_softmax": 168, "num_regs_correction": 96, "num_regs_other": 80},
@@ -124,7 +129,7 @@ class FlashAttentionForwardSm100:
         is_local: bool = False,
         is_split_kv: bool = False,
         pack_gqa: bool = False,
-        q_subtile_factor: int | None = None,
+        q_subtile_factor: int = 1,
         m_block_size: int = 128,
         n_block_size: int = 128,
         q_stage: cutlass.Constexpr[int] = 2,
@@ -727,7 +732,7 @@ class FlashAttentionForwardSm100:
             mbar_load_epi: cute.struct.MemRange[Int64, load_epi_mbar_size]
             mbar_s0_s1_sequence: cute.struct.MemRange[Int64, 2 * 2]
             # Tmem dealloc cluster barrier
-            tmem_dealloc_mbar_ptr: Int64
+            tmem_dealloc_mbar: Int64
             # Tmem holding buffer
             tmem_holding_buf: Int32
             # Smem tensors
@@ -925,11 +930,11 @@ class FlashAttentionForwardSm100:
         )
         # Tensor memory dealloc barrier init
         tmem = cutlass.utils.TmemAllocator(
-            storage.tmem_holding_buf,
+            storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=self.mma_warp_id,
             is_two_cta=self.use_2cta_instrs,
-            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr,
+            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar.ptr,
         )
 
         ThreadCooperativeGroup = partial(pipeline.CooperativeGroup, pipeline.Agent.Thread)
@@ -1627,7 +1632,7 @@ class FlashAttentionForwardSm100:
                     self.q_stage,
                     q_producer_phase,
                     self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
-                    self.q_subtile_factor if self.q_subtile_factor is not None else 1,
+                    self.q_subtile_factor,
                 )
 
 
@@ -1772,7 +1777,7 @@ class FlashAttentionForwardSm100:
                     split_idx,
                     num_splits,
                     self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
-                    self.q_subtile_factor if self.q_subtile_factor is not None else 1,
+                    self.q_subtile_factor,
                     seqlen_info=seqlen,
                 )
                 process_tile = block_iter_count > Int32(0)
@@ -2150,7 +2155,7 @@ class FlashAttentionForwardSm100:
                     split_idx,
                     num_splits,
                     self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
-                    self.q_subtile_factor if self.q_subtile_factor is not None else 1,
+                    self.q_subtile_factor,
                     seqlen_info=seqlen,
                 )
                 has_work = tile_block_count > Int32(0)
@@ -2222,7 +2227,7 @@ class FlashAttentionForwardSm100:
                     Int32(stage),
                     check_m_boundary,
                     self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
-                    self.q_subtile_factor if self.q_subtile_factor is not None else 1,
+                    self.q_subtile_factor,
                 )
                 if not empty_tile:
                     sScale[tidx + stage * self.m_block_size] = softmax.row_sum[0]
@@ -2576,7 +2581,7 @@ class FlashAttentionForwardSm100:
                     split_idx,
                     num_splits,
                     self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
-                    self.q_subtile_factor if self.q_subtile_factor is not None else 1,
+                    self.q_subtile_factor,
                     seqlen_info=seqlen,
                 )
                 has_work = total_block_count > Int32(0)

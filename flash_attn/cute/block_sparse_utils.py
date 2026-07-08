@@ -1007,7 +1007,7 @@ def get_total_q_block_count_bwd(
     batch_idx,
     head_idx,
     n_block,
-    subtile_factor: cutlass.Constexpr = 1,
+    q_subtile_factor: cutlass.Constexpr = 1,
     m_block_max: int = 0,
 ):
     """Count total tile iterations for given n_block (KV tile) in backward."""
@@ -1015,7 +1015,7 @@ def get_total_q_block_count_bwd(
     total = q_block_cnt[batch_idx, head_idx, n_block]
     if const_expr(full_block_cnt is not None):
         total = total + full_block_cnt[batch_idx, head_idx, n_block]
-    return total * subtile_factor
+    return total * q_subtile_factor
 
 
 @cute.jit
@@ -1050,7 +1050,7 @@ def produce_block_sparse_q_loads_bwd_sm100(
     should_load_Q: cutlass.Constexpr,
     should_load_dO: cutlass.Constexpr,
     # Subtiling factor and bounds
-    subtile_factor: cutlass.Constexpr = 1,
+    q_subtile_factor: cutlass.Constexpr = 1,
     m_block_max: int = 0,
 ):
     """SM100 backward block sparse loading with subtiling.
@@ -1065,7 +1065,7 @@ def produce_block_sparse_q_loads_bwd_sm100(
         curr_full_idx,
         loop_count,
     ) = get_block_sparse_iteration_info_bwd(
-        blocksparse_tensors, batch_idx, head_idx, n_block, subtile_factor, m_block_max
+        blocksparse_tensors, batch_idx, head_idx, n_block, q_subtile_factor, m_block_max
     )
 
     for iter_idx in cutlass.range(loop_count, unroll=1):
@@ -1075,7 +1075,7 @@ def produce_block_sparse_q_loads_bwd_sm100(
             curr_q_idx,
             curr_full_cnt,
             curr_full_idx,
-            subtile_factor,
+            q_subtile_factor,
             m_block_max,
         )
         m_block_safe = m_block
@@ -1148,7 +1148,7 @@ def get_block_sparse_iteration_info_bwd(
     batch_idx,
     head_idx,
     n_block,
-    subtile_factor: cutlass.Constexpr = 1,
+    q_subtile_factor: cutlass.Constexpr = 1,
     m_block_max: int = 0,
 ):
     """Extract block-sparse iteration info for backward pass.
@@ -1169,7 +1169,7 @@ def get_block_sparse_iteration_info_bwd(
     sparse_block_count = curr_q_cnt
     if const_expr(full_cnt is not None):
         sparse_block_count = sparse_block_count + curr_full_cnt
-    total_count = sparse_block_count * subtile_factor
+    total_count = sparse_block_count * q_subtile_factor
 
     return curr_q_cnt, curr_q_idx, curr_full_cnt, curr_full_idx, total_count
 
@@ -1181,7 +1181,7 @@ def get_m_block_from_iter_bwd(
     curr_q_idx: cute.Tensor,
     curr_full_cnt,
     curr_full_idx: Optional[cute.Tensor],
-    subtile_factor: cutlass.Constexpr = 1,
+    q_subtile_factor: cutlass.Constexpr = 1,
     m_block_max: int = 0,
 ):
     """Derive m_block index and is_full_block flag from iteration index.
@@ -1190,8 +1190,8 @@ def get_m_block_from_iter_bwd(
         - m_block: The actual Q-tile block index
         - is_full_block: True if this is a full block (no mask_mod needed)
     """
-    sparse_iter_idx = iter_idx // subtile_factor
-    subtile_offset = iter_idx % subtile_factor
+    sparse_iter_idx = iter_idx // q_subtile_factor
+    subtile_offset = iter_idx % q_subtile_factor
 
     sparse_m_block = Int32(0)
     is_full_block = False
@@ -1204,7 +1204,7 @@ def get_m_block_from_iter_bwd(
     else:
         sparse_m_block = curr_q_idx[sparse_iter_idx]
 
-    return sparse_m_block * subtile_factor + subtile_offset, is_full_block
+    return sparse_m_block * q_subtile_factor + subtile_offset, is_full_block
 
 
 @cute.jit
@@ -1269,7 +1269,7 @@ def produce_block_sparse_q_loads_bwd_sm90(
     tma_copy_bytes_K,
     tma_copy_bytes_V,
     Q_stage_eq_dO_stage: cutlass.Constexpr,
-    subtile_factor: cutlass.Constexpr,
+    q_subtile_factor: cutlass.Constexpr,
     m_block_max: int,
 ):
     """SM90 backward block sparse loading with separate partial/full loops.
@@ -1292,10 +1292,10 @@ def produce_block_sparse_q_loads_bwd_sm90(
 
     kv_loaded = False
 
-    for iter_idx in cutlass.range(curr_q_cnt * subtile_factor, unroll=1):
-        sparse_idx = iter_idx // subtile_factor
-        subtile_offset = iter_idx % subtile_factor
-        m_block = curr_q_idx[sparse_idx] * subtile_factor + subtile_offset
+    for iter_idx in cutlass.range(curr_q_cnt * q_subtile_factor, unroll=1):
+        sparse_idx = iter_idx // q_subtile_factor
+        subtile_offset = iter_idx % q_subtile_factor
+        m_block = curr_q_idx[sparse_idx] * q_subtile_factor + subtile_offset
 
         if m_block < m_block_max:
             producer_state_Q, producer_state_dO = _load_q_do_block_sm90(
@@ -1318,10 +1318,10 @@ def produce_block_sparse_q_loads_bwd_sm90(
             kv_loaded = True
 
     if const_expr(full_cnt is not None):
-        for iter_idx in cutlass.range(curr_full_cnt * subtile_factor, unroll=1):
-            sparse_idx = iter_idx // subtile_factor
-            subtile_offset = iter_idx % subtile_factor
-            m_block = curr_full_idx[sparse_idx] * subtile_factor + subtile_offset
+        for iter_idx in cutlass.range(curr_full_cnt * q_subtile_factor, unroll=1):
+            sparse_idx = iter_idx // q_subtile_factor
+            subtile_offset = iter_idx % q_subtile_factor
+            m_block = curr_full_idx[sparse_idx] * q_subtile_factor + subtile_offset
 
             if m_block < m_block_max:
                 producer_state_Q, producer_state_dO = _load_q_do_block_sm90(
@@ -1362,7 +1362,7 @@ def consume_block_sparse_mma_bwd_sm90(
     thr_mma_SdP,
     score_mod_fn=None,
     score_mod_bwd_fn=None,
-    subtile_factor: cutlass.Constexpr = 1,
+    q_subtile_factor: cutlass.Constexpr = 1,
     m_block_max: int = 0,
     aux_data: AuxData = AuxData(),
     fastdiv_mods=(None, None),
@@ -1414,10 +1414,10 @@ def consume_block_sparse_mma_bwd_sm90(
         fastdiv_mods=fastdiv_mods,
     )
 
-    for iter_idx in cutlass.range(curr_q_cnt * subtile_factor, unroll=1):
-        sparse_idx = iter_idx // subtile_factor
-        subtile_offset = iter_idx % subtile_factor
-        m_block = curr_q_idx[sparse_idx] * subtile_factor + subtile_offset
+    for iter_idx in cutlass.range(curr_q_cnt * q_subtile_factor, unroll=1):
+        sparse_idx = iter_idx // q_subtile_factor
+        subtile_offset = iter_idx % q_subtile_factor
+        m_block = curr_q_idx[sparse_idx] * q_subtile_factor + subtile_offset
 
         if m_block < m_block_max:
             consumer_state_Q, consumer_state_dO = mma_one_m_block_fn(
@@ -1432,10 +1432,10 @@ def consume_block_sparse_mma_bwd_sm90(
             dKV_accumulate = True
 
     if const_expr(full_cnt is not None):
-        for iter_idx in cutlass.range(curr_full_cnt * subtile_factor, unroll=1):
-            sparse_idx = iter_idx // subtile_factor
-            subtile_offset = iter_idx % subtile_factor
-            m_block = curr_full_idx[sparse_idx] * subtile_factor + subtile_offset
+        for iter_idx in cutlass.range(curr_full_cnt * q_subtile_factor, unroll=1):
+            sparse_idx = iter_idx // q_subtile_factor
+            subtile_offset = iter_idx % q_subtile_factor
+            m_block = curr_full_idx[sparse_idx] * q_subtile_factor + subtile_offset
 
             if m_block < m_block_max:
                 consumer_state_Q, consumer_state_dO = mma_one_m_block_fn(
@@ -1490,7 +1490,7 @@ def dQaccum_store_block_sparse_bwd_sm90(
     n_block,
     sdQaccum: cute.Tensor,
     gdQaccum: cute.Tensor,
-    subtile_factor: cutlass.Constexpr,
+    q_subtile_factor: cutlass.Constexpr,
     m_block_max: int,
     num_dQ_warp_groups: cutlass.Constexpr,
     num_threads_per_warp_group: cutlass.Constexpr,
@@ -1511,10 +1511,10 @@ def dQaccum_store_block_sparse_bwd_sm90(
         curr_full_cnt = Int32(0)
         curr_full_idx = None
 
-    for iter_idx in cutlass.range(curr_q_cnt * subtile_factor, unroll=1):
-        sparse_idx = iter_idx // subtile_factor
-        subtile_offset = iter_idx % subtile_factor
-        m_block = curr_q_idx[sparse_idx] * subtile_factor + subtile_offset
+    for iter_idx in cutlass.range(curr_q_cnt * q_subtile_factor, unroll=1):
+        sparse_idx = iter_idx // q_subtile_factor
+        subtile_offset = iter_idx % q_subtile_factor
+        m_block = curr_q_idx[sparse_idx] * q_subtile_factor + subtile_offset
 
         if m_block < m_block_max:
             _store_one_dQaccum_sm90(
@@ -1527,10 +1527,10 @@ def dQaccum_store_block_sparse_bwd_sm90(
             )
 
     if const_expr(full_cnt is not None):
-        for iter_idx in cutlass.range(curr_full_cnt * subtile_factor, unroll=1):
-            sparse_idx = iter_idx // subtile_factor
-            subtile_offset = iter_idx % subtile_factor
-            m_block = curr_full_idx[sparse_idx] * subtile_factor + subtile_offset
+        for iter_idx in cutlass.range(curr_full_cnt * q_subtile_factor, unroll=1):
+            sparse_idx = iter_idx // q_subtile_factor
+            subtile_offset = iter_idx % q_subtile_factor
+            m_block = curr_full_idx[sparse_idx] * q_subtile_factor + subtile_offset
 
             if m_block < m_block_max:
                 _store_one_dQaccum_sm90(

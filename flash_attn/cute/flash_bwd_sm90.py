@@ -72,7 +72,7 @@ class FlashAttentionBackwardSm90:
         score_mod_bwd: cutlass.Constexpr | None = None,
         mask_mod: cutlass.Constexpr | None = None,
         has_aux_tensors: cutlass.Constexpr = False,
-        subtile_factor: cutlass.Constexpr[int] = 1,
+        q_subtile_factor: cutlass.Constexpr[int] = 1,
         dQ_single_wg: bool = False,
     ):
         self.dtype = dtype
@@ -129,7 +129,7 @@ class FlashAttentionBackwardSm90:
         self.score_mod_bwd = score_mod_bwd
         self.mask_mod = mask_mod
         self.has_aux_tensors = has_aux_tensors
-        self.subtile_factor = subtile_factor
+        self.q_subtile_factor = q_subtile_factor
         if cutlass.const_expr(has_aux_tensors):
             self.vec_size: cutlass.Constexpr = 1
         else:
@@ -205,7 +205,13 @@ class FlashAttentionBackwardSm90:
         wg_d_dKV = self.num_wg_mma // self.AtomLayoutNdKV
         self.sQ_layout, self.sdO_layout = [
             # Need to set major_mode_size (mms) to accommodate Q and Q.T
-            sm90_utils.make_smem_layout(self.dtype, LayoutEnum.ROW_MAJOR, shape, stage, mms)
+            sm90_utils.make_smem_layout(
+                self.dtype,
+                LayoutEnum.ROW_MAJOR,
+                shape,
+                stage,
+                major_mode_size=mms,
+            )
             for shape, stage, mms in [
                 ((self.tile_m, self.tile_hdim), self.Q_stage, self.tile_hdim // wg_d_dKV),
                 ((self.tile_m, self.tile_hdimv), self.dO_stage, self.tile_hdim // wg_d_dKV),
@@ -943,7 +949,7 @@ class FlashAttentionBackwardSm90:
                         batch_idx,
                         head_idx,
                         n_block,
-                        subtile_factor=self.subtile_factor,
+                        q_subtile_factor=self.q_subtile_factor,
                         m_block_max=m_block_max,
                     )
                     process_tile = total_m_block_cnt > Int32(0)
@@ -1006,7 +1012,7 @@ class FlashAttentionBackwardSm90:
                             self.tma_copy_bytes["K"],
                             self.tma_copy_bytes["V"],
                             Q_stage_eq_dO_stage=(self.Q_stage == self.dO_stage),
-                            subtile_factor=self.subtile_factor,
+                            q_subtile_factor=self.q_subtile_factor,
                             m_block_max=m_block_max,
                         )
 
@@ -1335,7 +1341,7 @@ class FlashAttentionBackwardSm90:
                     batch_idx,
                     head_idx,
                     n_block,
-                    subtile_factor=self.subtile_factor,
+                    q_subtile_factor=self.q_subtile_factor,
                     m_block_max=m_block_max,
                 )
                 process_tile = total_m_block_cnt > Int32(0)
@@ -1383,7 +1389,7 @@ class FlashAttentionBackwardSm90:
                         thr_mma_SdP=thr_mma_SdP,
                         score_mod_fn=score_mod_fn_cur,
                         score_mod_bwd_fn=score_mod_bwd_fn_cur,
-                        subtile_factor=self.subtile_factor,
+                        q_subtile_factor=self.q_subtile_factor,
                         m_block_max=m_block_max,
                         aux_data=aux_data,
                         fastdiv_mods=fastdiv_mods,
@@ -1826,7 +1832,7 @@ class FlashAttentionBackwardSm90:
                     batch_idx,
                     head_idx,
                     n_block,
-                    subtile_factor=self.subtile_factor,
+                    q_subtile_factor=self.q_subtile_factor,
                     m_block_max=m_block_max,
                 )
                 process_tile = total_block_cnt > Int32(0)
@@ -1900,7 +1906,7 @@ class FlashAttentionBackwardSm90:
                         n_block,
                         sdQaccum,
                         gdQaccum,
-                        subtile_factor=self.subtile_factor,
+                        q_subtile_factor=self.q_subtile_factor,
                         m_block_max=m_block_max,
                         num_dQ_warp_groups=self.num_wg_dQ,
                         num_threads_per_warp_group=self.num_threads_per_warp_group,
