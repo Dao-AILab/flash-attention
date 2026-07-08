@@ -415,12 +415,24 @@ def download_and_copy(name, src_func, dst_path, version, url_func):
     src_path = src_func(supported[system], arch, version)
     tmp_path = os.path.join(flashattn_cache_path, "nvidia", name)  # path to cache the download
     dst_path = os.path.join(base_dir, os.pardir, "third_party", "nvidia", "backend", dst_path)  # final binary path
+    # Refuse to extract into a symlinked cache directory. The cache path
+    # (~/.flashattn/nvidia/<name>) is predictable, so a local attacker could
+    # pre-plant a symlink there and have extractall() write the downloaded
+    # toolchain through it to an attacker-chosen location.
+    if os.path.islink(tmp_path):
+        raise RuntimeError(f"Refusing to extract into symlinked cache path: {tmp_path}")
+    os.makedirs(tmp_path, exist_ok=True)
     src_path = os.path.join(tmp_path, src_path)
     download = not os.path.exists(src_path)
     if download:
         print(f'downloading and extracting {url} ...')
         file = tarfile.open(fileobj=open_url(url), mode="r|*")
-        file.extractall(path=tmp_path)
+        # Use the 'data' extraction filter (Python 3.12+) to block path
+        # traversal and unsafe symlink/device members inside the archive.
+        if hasattr(tarfile, "data_filter"):
+            file.extractall(path=tmp_path, filter="data")
+        else:
+            file.extractall(path=tmp_path)
     os.makedirs(os.path.split(dst_path)[0], exist_ok=True)
     print(f'copy {src_path} to {dst_path} ...')
     if os.path.isdir(src_path):
