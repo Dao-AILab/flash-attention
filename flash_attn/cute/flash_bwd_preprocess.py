@@ -13,7 +13,6 @@
 # So the main backward kernel is unchanged; we just replace D with D' = D - dLSE here.
 import math
 import operator
-from functools import partial
 from typing import Callable, Type, Optional
 
 import cuda.bindings.driver as cuda
@@ -365,8 +364,8 @@ class FlashAttentionBackwardPreprocess:
             tOpO = None
             if const_expr(self.check_hdim_v_oob):
                 tOpO = copy_utils.predicate_k(tOcO, limit=headdim_v)
-            # Each copy will use the same predicate
-            copy = partial(copy_utils.copy, pred=tOpO)
+            # Each copy uses the predicate sliced to the current m (see loop below).
+            copy = copy_utils.copy
 
             tOrO = cute.make_rmem_tensor_like(tOgO)
             tOrdO = cute.make_rmem_tensor_like(tOgdO)
@@ -378,8 +377,13 @@ class FlashAttentionBackwardPreprocess:
                 # Instead of using tOcO, we using t0OcO and subtract the offset from the limit.
                 # This is bc the entries of t0OcO are known at compile time.
                 if t0OcO[0, m, 0][0] < seqlen_limit - tOcO[0][0]:
-                    copy(tOgO[None, m, None], tOrO[None, m, None])
-                    copy(tOgdO[None, m, None], tOrdO[None, m, None])
+                    # The predicate carries a CPY_M mode (broadcast over m); slice it to the
+                    # current m so its shape matches the m-sliced copy source. Otherwise the
+                    # vectorized copy atom's predicate-shape verification fails when head_dim_v
+                    # is not a multiple of the copy-atom width (e.g. 72, 104).
+                    tOpO_cur = tOpO[None, m, None] if const_expr(tOpO is not None) else None
+                    copy(tOgO[None, m, None], tOrO[None, m, None], pred=tOpO_cur)
+                    copy(tOgdO[None, m, None], tOrdO[None, m, None], pred=tOpO_cur)
             # O and dO loads are done; signal that the next kernel can start.
             # Correctness is ensured by griddepcontrol_wait() in bwd_sm90 before it reads our outputs.
             if const_expr(self.use_pdl):

@@ -1611,6 +1611,28 @@ def _flash_attn_bwd(
     dtype = torch2cute_dtype_map[q.dtype]
     current_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
+    # Varlen MHA uses the non-TMA dK/dV epilogue store, which writes tile_hdim (a
+    # multiple of 32) columns per row and has no head-dim OOB predication (unlike the
+    # TMA store used elsewhere). When head_dim is not a multiple of 32 the store would
+    # spill past the real head_dim into neighboring memory and corrupt dK/dV. Route the
+    # store through a head-dim-padded scratch buffer, then slice back to head_dim.
+    head_dim_v_rounded = (head_dim_v + 32 - 1) // 32 * 32
+    dkv_hdim_pad = (
+        not dKV_postprocess
+        and cu_seqlens_k is not None
+        and (head_dim != head_dim_rounded or head_dim_v != head_dim_v_rounded)
+    )
+    dk_final, dv_final = dk, dv
+    if dkv_hdim_pad:
+        if head_dim != head_dim_rounded:
+            dk = torch.empty(
+                *dk_final.shape[:-1], head_dim_rounded, dtype=out_torch_dtype, device=device
+            )
+        if head_dim_v != head_dim_v_rounded:
+            dv = torch.empty(
+                *dv_final.shape[:-1], head_dim_v_rounded, dtype=out_torch_dtype, device=device
+            )
+
     if deterministic:
         dQ_semaphore = torch.zeros(batch_size, num_head, seqlen_q_rounded // m_block_size, cluster_size, dtype=torch.int32, device=device)
     else:
@@ -1997,6 +2019,14 @@ def _flash_attn_bwd(
                 AtomLayoutNdKV, dKV_swapAB,
                 cluster_size=cluster_size,
             )
+
+    if dkv_hdim_pad:
+        if not is_fake_mode():
+            if head_dim != head_dim_rounded:
+                dk_final.copy_(dk[..., :head_dim])
+            if head_dim_v != head_dim_v_rounded:
+                dv_final.copy_(dv[..., :head_dim_v])
+        dk, dv = dk_final, dv_final
 
     return dq, dk, dv
 

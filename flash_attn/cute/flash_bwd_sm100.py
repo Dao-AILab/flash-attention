@@ -68,8 +68,10 @@ class FlashAttentionBackwardSm100:
         has_aux_tensors: cutlass.Constexpr = False,
         q_subtile_factor: cutlass.Constexpr[int] = 1,
     ):
-        # padding head_dim to a multiple of 16 as k_block_size
-        hdim_multiple_of = 16
+        # Pad head_dim to a multiple of 32 (k_block_size). Must stay a multiple of 32 so
+        # that the dQ accumulator reduce (dQ_reduce_ncol up to 32) tiles evenly and matches
+        # both the preprocess kernel and the interface's head_dim_rounded (also mult of 32).
+        hdim_multiple_of = 32
         self.tile_hdim = int(math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of)
         head_dim_v = head_dim_v if head_dim_v is not None else head_dim
         self.same_hdim_kv = head_dim == head_dim_v
