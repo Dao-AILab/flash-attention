@@ -1961,7 +1961,6 @@ def _flash_attn_bwd(
         out, dout, dpsum, lse, lse_log2, dq_accum,
         cu_seqlens_q, seqused_q, dlse,
         dtype, head_dim, head_dim_v, m_block_size,
-        use_padded_offsets=use_dedicated_hd256_kernel,
         cu_total_m_blocks=cu_total_m_blocks_q,
     )
     # num_threads: SM90 derives from BwdConfig.num_wg, SM120 is set to 128 above,
