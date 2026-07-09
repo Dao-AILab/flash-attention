@@ -228,6 +228,7 @@ def test_flash_attn_output(
                 pack_gqa=pack_gqa,
                 num_splits=num_splits,
                 deterministic=deterministic,
+                return_lse=True,
             )
             print(f"Output max diff: {(out - out_ref).abs().max().item()}")
             print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
@@ -628,6 +629,7 @@ def test_flash_attn_varlen_output(
             num_splits=1,
             pack_gqa=False,
             deterministic=deterministic,
+            return_lse=True,
         )
         out = output_pad_fn(out_unpad)
         if query_unused_mask is not None:

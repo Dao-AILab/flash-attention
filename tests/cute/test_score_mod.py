@@ -810,7 +810,7 @@ def run_cute_flash_bwd(
         q_t = q_t.detach().requires_grad_(True)
         k_t = k_t.detach().requires_grad_(True)
         v_t = v_t.detach().requires_grad_(True)
-        out, lse = flash_attn_func(
+        out = flash_attn_func(
             q_t, 
             k_t, 
             v_t, 

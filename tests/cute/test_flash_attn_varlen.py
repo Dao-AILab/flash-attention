@@ -86,7 +86,7 @@ def check_varlen_vs_torch_flash(
         cu_seqlens_k_fa = None
         cu_seqlens_k_t = None
 
-    out_fa, lse_fa = flash_attn_varlen_func(
+    out_fa = flash_attn_varlen_func(
         q_fa, k_fa, v_fa,
         cu_seqlens_q=cu_seqlens_q_fa,
         cu_seqlens_k=cu_seqlens_k_fa,
