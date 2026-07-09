@@ -1320,7 +1320,7 @@ def _flash_attn_bwd(
     else:
         batch_size = cu_seqlens_q.shape[0] - 1
         total_q = q.shape[0]
-        seqlen_q = int(max_seqlen_q) if max_seqlen_q is not None else total_q
+        seqlen_q = max_seqlen_q if max_seqlen_q is not None else total_q
 
     if cu_seqlens_k is None:
         batch_size, seqlen_k = k.shape[:2]
@@ -1328,7 +1328,7 @@ def _flash_attn_bwd(
     else:
         batch_size = cu_seqlens_k.shape[0] - 1
         total_k = k.shape[0]
-        seqlen_k = int(max_seqlen_k) if max_seqlen_k is not None else total_k
+        seqlen_k = max_seqlen_k if max_seqlen_k is not None else total_k
 
     num_head_kv = k.shape[-2]
 
@@ -1339,6 +1339,16 @@ def _flash_attn_bwd(
     num_n_blocks = seqlen_k_rounded // n_block_size
     if cluster_size == 2 and num_n_blocks % cluster_size != 0:
         seqlen_k_rounded = seqlen_k_rounded + n_block_size
+
+    # The single-block specialization below only guards against TVM stride poisoning,
+    # which is a host-side branch predicate that selects a kernel variant. When
+    # max_seqlen is passed as a tensor (e.g. HF/TE varlen), seqlen_*_rounded are tensors,
+    # so `seqlen_*_rounded // block == 1` would leak a tensor into the compile key. Its
+    # pickle hash differs every call, forcing a recompile per step. Only specialize when
+    # the seqlen is already a host scalar; tensor callers fall back to the multi-block
+    # default, keeping the key stable with no device sync.
+    single_q_block = (not torch.is_tensor(seqlen_q_rounded)) and (seqlen_q_rounded // m_block_size == 1)
+    single_k_block = (not torch.is_tensor(seqlen_k_rounded)) and (seqlen_k_rounded // n_block_size == 1)
 
     if cu_seqlens_k is None:
         assert k.shape == (batch_size, seqlen_k, num_head_kv, head_dim)
@@ -1590,8 +1600,8 @@ def _flash_attn_bwd(
             get_broadcast_dims(v),
             get_broadcast_dims(dout),
             # Prevent TVM stride poisoning when only one block is present.
-            (seqlen_q_rounded // m_block_size == 1),
-            (seqlen_k_rounded // n_block_size == 1),
+            single_q_block,
+            single_k_block,
         )
     else:
         compile_key = (
@@ -1625,8 +1635,8 @@ def _flash_attn_bwd(
             get_broadcast_dims(v),
             get_broadcast_dims(dout),
             # Prevent TVM stride poisoning when only one block is present.
-            (seqlen_q_rounded // m_block_size == 1),
-            (seqlen_k_rounded // n_block_size == 1),
+            single_q_block,
+            single_k_block,
         )
 
     if compile_key not in _flash_attn_bwd.compile_cache:
