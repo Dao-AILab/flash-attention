@@ -11,7 +11,6 @@
 #include "cutlass/device_kernel.h"  // For device_kernel
 #include "cutlass/kernel_launch.h"  // For kernel_launch
 
-#include "cuda_check.h"
 #include "static_switch.h"
 #include "flash.h"
 #include "flash_fwd_combine_kernel.h"
@@ -26,6 +25,7 @@ void run_flash_fwd_combine(Flash_fwd_params &params, cudaStream_t stream, bool e
                                                      IsEvenK, Varlen, Element, ElementPartial, ArchTag>;
 
     typename CombineKernel::Arguments args {
+        params.b,
         static_cast<ElementPartial const*>(params.oaccum_ptr),
         {!Varlen ? params.seqlen_q : params.total_q, params.dv, params.num_splits, params.h, !Varlen ? params.b : 1},  // shape_O_partial
         {params.oaccum_row_stride, _1{}, params.oaccum_split_stride, params.oaccum_head_stride, !Varlen ? params.oaccum_batch_stride : 0},  // stride_O_partial
@@ -39,20 +39,26 @@ void run_flash_fwd_combine(Flash_fwd_params &params, cudaStream_t stream, bool e
         params.cu_seqlens_q, params.seqused_q, params.num_splits_dynamic_ptr, params.varlen_batch_idx_ptr, params.tile_count_semaphore
     };
 
-    typename CombineKernel::Params kernel_params = CombineKernel::to_underlying_arguments(args);
-    int num_blocks_k = cute::ceil_div(params.dv, kBlockK);
-    // for varlen size the combine grid from the actual total query extent
-    // (params.total_q) instead of the per-request max seqlen_q
-    int num_blocks_m = cute::ceil_div(
-        (Varlen ? params.total_q : params.seqlen_q) * params.h, kBlockM);
-    dim3 grid_m(num_blocks_m, num_blocks_k, params.b);
+    typename CombineKernel::SchedulerArguments scheduler_args  {
+        params.b, params.seqlen_q, params.total_q, params.h, params.h_k, params.dv, params.pack_gqa,
+        params.cu_seqlens_q, params.seqused_q, nullptr /*prepare_seqlen_q_ptr: not in this tree*/,
+        params.varlen_batch_idx_ptr
+    };
+
+    typename CombineKernel::Params kernel_params = {
+        CombineKernel::to_underlying_arguments(args),
+        CombineKernel::TileScheduler::to_underlying_arguments(scheduler_args)
+    };
+
+    dim3 grid_m = CombineKernel::TileScheduler::get_grid_shape(scheduler_args);
     auto kernel = cutlass::device_kernel<CombineKernel>;
     int smem_size = CombineKernel::SharedStorageSize;
     if (smem_size >= 48 * 1024) {
         CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
     }
     // kernel<<<grid_m, CombineKernel::MaxThreadsPerBlock, smem_size, stream>>>(kernel_params);
-    CHECK_CUTLASS(cutlass::kernel_launch<CombineKernel>(grid_m, CombineKernel::MaxThreadsPerBlock, smem_size, stream, kernel_params, Arch >= 90 && enable_pdl /*launch_with_pdl*/));
+    cutlass::kernel_launch<CombineKernel>(grid_m, CombineKernel::MaxThreadsPerBlock, smem_size, stream, kernel_params, Arch >= 90 && enable_pdl /*launch_with_pdl*/);
+    CHECK_CUDA_KERNEL_LAUNCH();
 }
 
 template<typename T, typename Tpartial, int kBlockK>

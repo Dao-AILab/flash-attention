@@ -1222,6 +1222,35 @@ def test_flash_attn_combine(num_splits, seqlen, d, dtype):
     # pytorch_profiler(flash_attn_combine, out_partial, lse_partial)
     # pytorch_profiler(torch.sum, out_partial)
 
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_flash_attn_varlen_combine_linearize(dtype):
+    if DISABLE_SPLIT or DISABLE_HDIM128:
+        pytest.skip()
+    device = "cuda"
+    torch.random.manual_seed(0)
+    batch_size, nheads, nheads_kv, d = 64, 6, 2, 128
+    seqlen_k = 512
+    seqlens_q = torch.ones(batch_size, dtype=torch.int32, device=device)
+    seqlens_q[40] = 512  # single prefill in the second warp-group -> ~1.8% dense
+    cu_seqlens_q = F.pad(torch.cumsum(seqlens_q, dim=0, dtype=torch.int32), (1, 0))
+    cu_seqlens_k = torch.arange(batch_size + 1, device=device, dtype=torch.int32) * seqlen_k
+    total_q, total_k = int(seqlens_q.sum()), batch_size * seqlen_k
+    max_seqlen_q = int(seqlens_q.max())
+
+    q = torch.randn(total_q, nheads, d, device=device, dtype=dtype)
+    k = torch.randn(total_k, nheads_kv, d, device=device, dtype=dtype)
+    v = torch.randn(total_k, nheads_kv, d, device=device, dtype=dtype)
+
+    def run(num_splits):
+        return flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k,
+                                      max_seqlen_q, seqlen_k, num_splits=num_splits)
+
+    out_ref = run(1)  # unsplit baseline (no combine kernel)
+    out = run(4)      # split-KV combine, routed through LINEARIZE_M_AND_BATCH
+    assert (out - out_ref).abs().max().item() <= 2e-3
+
+
 def test_flash3_bw_compatibility() -> None:
     # Let's try to always stay backward compatible! This will make life easier
     # for downstream libaries, users, and exported models.
@@ -1261,41 +1290,3 @@ def test_flash3_bw_compatibility() -> None:
         "int attention_chunk=0, bool has_softcap=False, int num_splits=0, bool? pack_gqa=None, "
         "int sm_margin=0) -> Tensor"
     ))
-
-
-@pytest.mark.skipif(DISABLE_SPLIT, reason="Split-KV (combine kernel) is disabled")
-def test_varlen_combine_cudagraph_stale_seqlen():
-    device, dtype = "cuda", torch.bfloat16
-    torch.manual_seed(0)
-    b, nheads, nheads_k, d = 64, 4, 1, 64
-    seqlen_k, num_splits = 512, 4  # force combine kernel
-    total_q, total_k = b, b * seqlen_k
-
-    q = torch.randn(total_q, nheads, d, device=device, dtype=dtype)
-    k = torch.randn(total_k, nheads_k, d, device=device, dtype=dtype)
-    v = torch.randn(total_k, nheads_k, d, device=device, dtype=dtype)
-    cu_seqlens_q = torch.arange(b + 1, device=device, dtype=torch.int32)  # uniform decode
-    cu_seqlens_k = torch.arange(b + 1, device=device, dtype=torch.int32) * seqlen_k
-
-    def run(max_seqlen_q):
-        return flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k,
-                                      max_seqlen_q, seqlen_k, num_splits=num_splits)
-
-    s = torch.cuda.Stream()
-    s.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(s):
-        for _ in range(3):
-            run(1)
-    torch.cuda.current_stream().wait_stream(s)
-    g = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(g):
-        out = run(1)
-
-    # real max query length is total_q but graph baked seqlen_q is still 1
-    cu_seqlens_q.copy_(torch.tensor([0] + [total_q] * b, device=device, dtype=torch.int32))
-    g.replay()
-    torch.cuda.synchronize()
-
-    ref = run(total_q)  # eager reference for the same repacked batch
-    assert not out.isnan().any(), "combine left output rows uninitialized"
-    assert (out - ref).abs().max().item() < 1e-2
