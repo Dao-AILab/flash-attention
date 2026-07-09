@@ -423,7 +423,11 @@ class SingleTileLPTScheduler:
             assert scheduling_mode in (SchedulingMode.STATIC, SchedulingMode.CLC), (
                 f"Only STATIC and CLC are supported, got {scheduling_mode!r}"
             )
-            size_one_kv_head = args.seqlen_k * (args.headdim + args.headdim_v) * args.element_size
+            # int64: this product overflows int32 once seqlen_k * (headdim +
+            # headdim_v) * element_size > 2**31 (seqlen_k > ~4M for hdim-128 bf16).
+            size_one_kv_head = (
+                cutlass.Int64(args.seqlen_k) * (args.headdim + args.headdim_v) * args.element_size
+            )
             size_one_head = size_one_kv_head
             size_l2 = 50 * 1024 * 1024  # 40 MB for K & V
             # Swizzle is the size of each "section". Round swizzle to a power of 2
@@ -431,7 +435,9 @@ class SingleTileLPTScheduler:
             # swizzle is how many heads can fit in L2
             # Seems faster if swizzle is a power of 2
             log2_floor = lambda n: 31 - clz(n)
-            swizzle = 1 if size_l2 < size_one_head else (1 << log2_floor(size_l2 // size_one_head))
+            swizzle = (
+                1 if size_l2 < size_one_head else (1 << log2_floor(Int32(size_l2 // size_one_head)))
+            )
             # If we're in the last section (called residual), we don't want to divide by
             # swizzle. Instead we want to divide by the remainder.
             num_hb_quotient = (args.num_head * args.num_batch) // swizzle
@@ -492,8 +498,13 @@ class SingleTileLPTScheduler:
             if const_expr(params.is_split_kv)
             else params.num_batch
         )
+        if const_expr(params.use_cluster_idx):
+            # Grid must have num_block * cluster_m physical blocks so that there are num_block clusters
+            grid_x = params.num_block * params.cluster_shape_m
+        else:
+            grid_x = cute.round_up(params.num_block, params.cluster_shape_m)
         return (
-            cute.round_up(params.num_block, params.cluster_shape_m),
+            grid_x,
             params.num_head,
             num_batch_splits,
         )
@@ -654,12 +665,18 @@ class SingleTileLPTBwdScheduler:
             args: TileSchedulerArguments, *, loc=None, ip=None
         ) -> "SingleTileLPTBwdScheduler.Params":
             size_l2 = 50 * 1024 * 1024
-            size_one_qdo_head = args.seqlen_k * (args.headdim + args.headdim_v) * args.element_size
-            size_one_dqaccum_head = args.seqlen_k * (args.headdim) * 4
+            # int64: these products overflow int32 at large seqlen_k (> ~4M for
+            # hdim-128 bf16; the dqaccum *4 term wraps even sooner).
+            size_one_qdo_head = (
+                cutlass.Int64(args.seqlen_k) * (args.headdim + args.headdim_v) * args.element_size
+            )
+            size_one_dqaccum_head = cutlass.Int64(args.seqlen_k) * (args.headdim) * 4
             # size_one_dqaccum_head = 0
             size_one_head = size_one_qdo_head + size_one_dqaccum_head
             log2_floor = lambda n: 31 - clz(n)
-            swizzle = 1 if size_l2 < size_one_head else (1 << log2_floor(size_l2 // size_one_head))
+            swizzle = (
+                1 if size_l2 < size_one_head else (1 << log2_floor(Int32(size_l2 // size_one_head)))
+            )
             # swizzle = 8
             # If we're in the last section (called residual), we don't want to divide by
             # swizzle. Instead we want to divide by the remainder.
@@ -784,6 +801,7 @@ class SingleTileVarlenScheduler:
         is_split_kv: cutlass.Constexpr[bool] = False
         head_swizzle: cutlass.Constexpr[bool] = False
         cluster_shape_m: cutlass.Constexpr[int] = 1
+        use_cluster_idx: cutlass.Constexpr[bool] = False
         scheduling_mode: cutlass.Constexpr[SchedulingMode] = SchedulingMode.STATIC
 
         @staticmethod
@@ -811,11 +829,6 @@ class SingleTileVarlenScheduler:
                 "At least one of mCuSeqlensQ or mSeqUsedQ must be provided"
             )
             assert args.cluster_shape_mn[1] == 1, "Only cluster_shape_mn[1] == 1 is supported"
-            # TODO: Support varlen CLC with cluster_shape_m > 1 by refactoring the
-            # flattened-tile decode so cluster unpacking semantics are explicit.
-            assert scheduling_mode != SchedulingMode.CLC or args.cluster_shape_mn[0] == 1, (
-                "Varlen CLC currently requires cluster_shape_mn[0] == 1"
-            )
             return SingleTileVarlenScheduler.Params(
                 num_head=args.num_head,
                 num_batch=args.num_batch,
@@ -830,6 +843,7 @@ class SingleTileVarlenScheduler:
                 is_split_kv=args.is_split_kv,
                 head_swizzle=args.head_swizzle,
                 cluster_shape_m=args.cluster_shape_mn[0],
+                use_cluster_idx=args.use_cluster_idx,
                 scheduling_mode=scheduling_mode,
             )
 
@@ -1024,7 +1038,7 @@ class SingleTileVarlenScheduler:
                 head_idx = mh_block // num_m_blocks
                 block = mh_block - head_idx * num_m_blocks
             is_valid = self._is_first_block and batch_idx < params.num_batch
-            if cutlass.const_expr(params.cluster_shape_m > 1):
+            if cutlass.const_expr(params.cluster_shape_m > 1 and not params.use_cluster_idx):
                 bidx_in_cluster = cute.arch.block_in_cluster_idx()
                 block = block * params.cluster_shape_m + bidx_in_cluster[0]
         # if cute.arch.thread_idx()[0] == 128: cute.printf("SingleTileVarlenScheduler: tile_idx=%d, batch_idx=%d, head_idx=%d, block=%d, is_valid = %d", self._tile_idx, batch_idx, head_idx, block, is_valid)

@@ -74,6 +74,7 @@ from flash_attn.cute.tile_scheduler import (
 )
 from flash_attn.cute.fa_logging import fa_log, fa_printf
 from flash_attn.cute.utils import smid
+from flash_attn.cute.utils import AuxData
 
 # === TUNING KNOBS (agent-editable) ===
 # Keys: (use_2cta_instrs: bool, is_causal: bool, head_dim_padded: int, is_sm103: bool)
@@ -100,6 +101,11 @@ _TUNING_CONFIG = {
 }
 _FP8_TUNING_CONFIG = {
     (True, False, 128, False): {'ex2_emu_freq': 10, 'ex2_emu_start_frg': 1, 'num_regs_softmax': 160, 'num_regs_correction': 72},
+    # Causal hd128 FP8 previously inherited bf16's freq=16. FP8 fwd is MUFU/ex2-bound, so a more
+    # aggressive emulation freq=8 offloads more exp from MUFU: +3.4%(4k)..+5.5%(16k) on B200,
+    # MHA & GQA, accuracy-neutral (3-run validated, locked clocks). freq=8 would regress non-causal
+    # (0.94x), hence keyed on is_causal=True only.
+    (False, True, 128, False): {'ex2_emu_freq': 8, 'ex2_emu_start_frg': 1},
 }
 _FP8_SMALL_HDIM_REGS = {
     False: {"num_regs_softmax": 168, "num_regs_correction": 96, "num_regs_other": 80},
@@ -129,7 +135,7 @@ class FlashAttentionForwardSm100:
         is_local: bool = False,
         is_split_kv: bool = False,
         pack_gqa: bool = False,
-        q_subtile_factor: int | None = None,
+        q_subtile_factor: int = 1,
         m_block_size: int = 128,
         n_block_size: int = 128,
         q_stage: cutlass.Constexpr[int] = 2,
@@ -223,10 +229,15 @@ class FlashAttentionForwardSm100:
         self.is_causal = is_causal
         self.is_local = is_local
         self.is_varlen_q = is_varlen_q
-        self.use_correction_warps_for_epi = is_varlen_q
         self.qhead_per_kvhead = qhead_per_kvhead
         self.is_split_kv = is_split_kv
         self.pack_gqa = pack_gqa
+        self.use_tma_O = (
+            not (self.pack_gqa and self.m_block_size % self.qhead_per_kvhead != 0)
+            and not (self.pack_gqa and self.is_split_kv)
+            and not is_varlen_q
+        )
+        self.use_correction_warps_for_epi = not self.use_tma_O
         self.q_subtile_factor = q_subtile_factor
         assert not (self.is_split_kv and self.head_dim_v_padded >= 192), (
             "SplitKV is not supported for hdim >= 192"
@@ -324,8 +335,6 @@ class FlashAttentionForwardSm100:
         if self.use_correction_warps_for_epi:
             self.empty_warp_ids = self.empty_warp_ids + self.epilogue_warp_ids
             self.epilogue_warp_ids = self.correction_warp_ids
-        elif self.is_varlen_q: # fallback
-            self.epilogue_warp_ids = (13, 14)
 
         self.clc_scheduler_warp_id = self.empty_warp_ids[0] if self.use_clc_scheduler else None
 
@@ -429,7 +438,7 @@ class FlashAttentionForwardSm100:
         learnable_sink: Optional[cute.Tensor] = None,
         descale_tensors: Optional[DescaleTensors] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
-        aux_tensors: Optional[list] = None,
+        aux_data: AuxData = AuxData(),
         mRngState: Optional[cute.Tensor] = None,
         rng_seed: Uint64 | int | None = None,
         rng_offset: Uint64 | int | None = None,
@@ -515,13 +524,6 @@ class FlashAttentionForwardSm100:
                     self.num_regs_correction = fp8_tune["num_regs_correction"]
                     self.num_regs_other = 512 - self.num_regs_softmax * 2 - self.num_regs_correction
         self._setup_attributes()
-        self.use_tma_O = (
-            self.arch >= Arch.sm_90
-            and mCuSeqlensQ is None
-            and mSeqUsedQ is None
-            and not (self.pack_gqa and self.m_block_size % self.qhead_per_kvhead != 0)
-            and not (self.pack_gqa and self.is_split_kv)
-        )
         self.ex2_emu_freq = 0
         self.ex2_emu_start_frg = self._tune.get("ex2_emu_start_frg", 1)
         if const_expr(self.enable_ex2_emu):
@@ -752,7 +754,7 @@ class FlashAttentionForwardSm100:
             mbar_O_epi: cute.struct.MemRange[Int64, self.q_stage * 2]
             mbar_s0_s1_sequence: cute.struct.MemRange[Int64, 2 * 2]
             # Tmem dealloc cluster barrier
-            tmem_dealloc_mbar_ptr: Int64
+            tmem_dealloc_mbar: Int64
             # Tmem holding buffer
             tmem_holding_buf: Int32
             # Smem tensors
@@ -782,7 +784,7 @@ class FlashAttentionForwardSm100:
         softmax_scale_log2, softmax_scale = utils.compute_softmax_scale_log2(softmax_scale, self.score_mod)
         window_size_left = Int32(window_size_left) if window_size_left is not None else None
         window_size_right = Int32(window_size_right) if window_size_right is not None else None
-        fastdiv_mods = utils.compute_fastdiv_mods(mQ, mK, self.qhead_per_kvhead, self.pack_gqa, aux_tensors, mPageTable)
+        fastdiv_mods = utils.compute_fastdiv_mods(mQ, mK, self.qhead_per_kvhead, self.pack_gqa, aux_data.tensors, mPageTable)
 
         head_divmod = None
         if cutlass.const_expr(self.pack_gqa):
@@ -830,7 +832,7 @@ class FlashAttentionForwardSm100:
             tiled_mma_pv,
             tile_sched_params,
             num_splits,
-            aux_tensors,
+            aux_data,
             fastdiv_mods,
             head_divmod,
             mRngState,
@@ -895,7 +897,7 @@ class FlashAttentionForwardSm100:
         tiled_mma_pv: cute.TiledMma,
         tile_sched_params: ParamsBase,
         num_splits: Int32,
-        aux_tensors: Optional[list] = None,
+        aux_data: AuxData = AuxData(),
         fastdiv_mods=(None, None),
         head_divmod=None,
         mRngState: Optional[cute.Tensor] = None,
@@ -953,11 +955,11 @@ class FlashAttentionForwardSm100:
         )
         # Tensor memory dealloc barrier init
         tmem = cutlass.utils.TmemAllocator(
-            storage.tmem_holding_buf,
+            storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=self.mma_warp_id,
             is_two_cta=self.use_2cta_instrs,
-            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr,
+            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar.ptr,
         )
 
         ThreadCooperativeGroup = partial(pipeline.CooperativeGroup, pipeline.Agent.Thread)
@@ -1333,7 +1335,7 @@ class FlashAttentionForwardSm100:
                 num_splits=num_splits,
                 SeqlenInfoCls=SeqlenInfoCls,
                 AttentionMaskCls=AttentionMaskCls,
-                aux_tensors=aux_tensors,
+                aux_data=aux_data,
                 fastdiv_mods=fastdiv_mods,
                 head_divmod=head_divmod,
                 blocksparse_tensors=blocksparse_tensors,
@@ -1604,7 +1606,7 @@ class FlashAttentionForwardSm100:
                     self.q_stage,
                     q_producer_phase,
                     self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
-                    self.q_subtile_factor if self.q_subtile_factor is not None else 1,
+                    self.q_subtile_factor,
                 )
 
 
@@ -1746,7 +1748,7 @@ class FlashAttentionForwardSm100:
                     split_idx,
                     num_splits,
                     self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
-                    self.q_subtile_factor if self.q_subtile_factor is not None else 1,
+                    self.q_subtile_factor,
                     seqlen_info=seqlen,
                 )
                 process_tile = block_iter_count > Int32(0)
@@ -1958,7 +1960,7 @@ class FlashAttentionForwardSm100:
         num_splits: Int32,
         SeqlenInfoCls: Callable,
         AttentionMaskCls: Callable,
-        aux_tensors: Optional[list] = None,
+        aux_data: AuxData = AuxData(),
         fastdiv_mods=(None, None),
         head_divmod=None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
@@ -1987,6 +1989,7 @@ class FlashAttentionForwardSm100:
             * (len(self.softmax0_warp_ids))
         )
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
+        aux_tensors = aux_data.tensors
 
         cta_qk_tiler = (self.mma_tiler_qk[0] // thr_mma_qk.thr_id.shape, self.mma_tiler_qk[1])
         if const_expr(self.use_16x256b_dropout):
@@ -2108,7 +2111,7 @@ class FlashAttentionForwardSm100:
                 mask_local=self.is_local,
                 batch_idx=batch_idx,
                 head_idx=head_idx,
-                aux_tensors=aux_tensors,
+                aux_data=aux_data,
                 vec_size=self.mask_vec_size,
             )
 
@@ -2189,7 +2192,7 @@ class FlashAttentionForwardSm100:
                     split_idx,
                     num_splits,
                     self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
-                    self.q_subtile_factor if self.q_subtile_factor is not None else 1,
+                    self.q_subtile_factor,
                     seqlen_info=seqlen,
                 )
                 has_work = tile_block_count > Int32(0)
@@ -2235,7 +2238,7 @@ class FlashAttentionForwardSm100:
                     + mma_tile_coord_v_for_dropout
                 ),
                 seqlen=seqlen,
-                aux_tensors=aux_tensors,
+                aux_data=aux_data,
                 fastdiv_mods=fastdiv_mods,
                 head_divmod=head_divmod,
                 rng_seed=rng_seed,
@@ -2284,7 +2287,7 @@ class FlashAttentionForwardSm100:
                     Int32(stage),
                     check_m_boundary,
                     self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
-                    self.q_subtile_factor if self.q_subtile_factor is not None else 1,
+                    self.q_subtile_factor,
                 )
                 if not empty_tile:
                     if const_expr(self.use_16x256b_dropout):
@@ -2470,7 +2473,7 @@ class FlashAttentionForwardSm100:
         head_idx: Int32,
         m_block: Int32,
         seqlen,
-        aux_tensors: Optional[list] = None,
+        aux_data: AuxData = AuxData(),
         fastdiv_mods=(None, None),
         head_divmod=None,
         mask_fn: Optional[Callable] = None,
@@ -2523,7 +2526,7 @@ class FlashAttentionForwardSm100:
                 n_block,
                 softmax,
                 seqlen,
-                aux_tensors,
+                aux_data,
                 fastdiv_mods,
                 head_divmod,
             )
@@ -2879,7 +2882,7 @@ class FlashAttentionForwardSm100:
                     split_idx,
                     num_splits,
                     self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
-                    self.q_subtile_factor if self.q_subtile_factor is not None else 1,
+                    self.q_subtile_factor,
                     seqlen_info=seqlen,
                 )
                 has_work = total_block_count > Int32(0)
@@ -3526,7 +3529,7 @@ class FlashAttentionForwardSm100:
         n_block,
         softmax,
         seqlen: SeqlenInfoQK,
-        aux_tensors=None,
+        aux_data: AuxData = AuxData(),
         fastdiv_mods=(None, None),
         head_divmod=None,
     ):
@@ -3549,7 +3552,7 @@ class FlashAttentionForwardSm100:
             q_idx_logical, head_offset = divmod(q_physical, head_divmod)
             head_idx = head_idx * self.qhead_per_kvhead + head_offset
 
-        if cutlass.const_expr(aux_tensors is not None):
+        if cutlass.const_expr(aux_data.tensors is not None):
             seqlen_q_divmod, _ = fastdiv_mods
             _, q_idx_logical = divmod(q_idx_logical, seqlen_q_divmod)
 
@@ -3562,7 +3565,7 @@ class FlashAttentionForwardSm100:
             softmax.softmax_scale,
             self.score_vec_size,
             self.qk_acc_dtype,
-            aux_tensors,
+            aux_data,
             fastdiv_mods,
             seqlen_info=seqlen,
             constant_q_idx=q_idx_logical,

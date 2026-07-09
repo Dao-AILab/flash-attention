@@ -46,6 +46,7 @@ from flash_attn.cute.softmax import (
 )
 from flash_attn.cute.philox import philox_unpack_seed_offset, philox_rounds
 from flash_attn.cute.block_sparsity import BlockSparseTensors
+from flash_attn.cute.utils import AuxData
 from flash_attn.cute.block_sparse_utils import (
     get_total_q_block_count_bwd,
     get_block_sparse_iteration_info_bwd,
@@ -75,7 +76,7 @@ class FlashAttentionBackwardSm100:
         score_mod_bwd: cutlass.Constexpr | None = None,
         mask_mod: cutlass.Constexpr | None = None,
         has_aux_tensors: cutlass.Constexpr = False,
-        subtile_factor: cutlass.Constexpr[int] = 1,
+        q_subtile_factor: cutlass.Constexpr[int] = 1,
         dropout_rate: float = 0.0,
     ):
         self.is_dropout = dropout_rate > 0.0 and dropout_rate < 1.0
@@ -97,13 +98,7 @@ class FlashAttentionBackwardSm100:
         assert self.tile_hdim <= 128 or (self.tile_hdim == 192 and self.tile_hdimv == 128)
         assert self.tile_hdimv <= 128
 
-        self.use_2cta_instrs = bool(
-            use_2cta_instrs
-            and cluster_size == 2
-            and score_mod is None
-            and score_mod_bwd is None
-            and mask_mod is None
-        )
+        self.use_2cta_instrs = bool(use_2cta_instrs and cluster_size == 2)
         self.cta_group_size = 2 if self.use_2cta_instrs else 1
 
         assert self.tile_hdim != 192 or self.use_2cta_instrs, "Must use 2CTA for hdim 192"
@@ -139,7 +134,7 @@ class FlashAttentionBackwardSm100:
         self.score_mod_bwd = score_mod_bwd
         self.mask_mod = mask_mod
         self.has_aux_tensors = has_aux_tensors
-        self.subtile_factor = subtile_factor
+        self.q_subtile_factor = q_subtile_factor
         # For score_mod, use vec_size=1 (like forward) to handle per-element indices
         if cutlass.const_expr(has_aux_tensors):
             self.vec_size: cutlass.Constexpr = 1
@@ -572,7 +567,7 @@ class FlashAttentionBackwardSm100:
         mdQ_semaphore: Optional[cute.Tensor] = None,
         mdK_semaphore: Optional[cute.Tensor] = None,
         mdV_semaphore: Optional[cute.Tensor] = None,
-        aux_tensors: Optional[list] = None,
+        aux_data: AuxData = AuxData(),
         # Block-sparse tensors (Q direction - for iterating m_blocks per n_block):
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         mRngState: Optional[cute.Tensor] = None,
@@ -606,7 +601,9 @@ class FlashAttentionBackwardSm100:
             assert self.dk_dtype.width == 32, "Must accumulate dK in float precision for GQA"
             assert self.dv_dtype.width == 32, "Must accumulate dV in float precision for GQA"
 
-        mdQaccum, mdK, mdV = [assume_tensor_aligned(t) for t in (mdQaccum, mdK, mdV)]
+        mdQaccum, mdK, mdV, mLSE, mdPsum = [
+            assume_tensor_aligned(t) for t in (mdQaccum, mdK, mdV, mLSE, mdPsum)
+        ]
 
         # (b, s, n, h) --> (s, h, n, b) or (t, n, h) -> (t, h, n)
         QO_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
@@ -905,7 +902,7 @@ class FlashAttentionBackwardSm100:
                     cutlass.Int64, self.dQaccum_reduce_stage // 2
                 ]
                 tmem_holding_buf: Int32
-                tmem_dealloc_mbar_ptr: cutlass.Int64
+                tmem_dealloc_mbar: cutlass.Int64
 
                 # 2-CTA
                 Qt_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.Q_stage]
@@ -987,7 +984,7 @@ class FlashAttentionBackwardSm100:
                     cutlass.Int64, self.dQaccum_reduce_stage // 2
                 ]
                 tmem_holding_buf: Int32
-                tmem_dealloc_mbar_ptr: Int64
+                tmem_dealloc_mbar: Int64
 
                 sQ: cute.struct.Align[
                     cute.struct.MemRange[cute.Uint8, sQ_alloc_bytes],
@@ -1039,7 +1036,7 @@ class FlashAttentionBackwardSm100:
             window_size_right = Int32(window_size_right)
 
         fastdiv_mods = None
-        if const_expr(aux_tensors is not None):
+        if const_expr(aux_data.tensors is not None):
             seqlen_q = cute.size(mQ.shape[0]) // (
                 self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1
             )
@@ -1056,7 +1053,7 @@ class FlashAttentionBackwardSm100:
             )
         # 2-CTA: 231424 and 1-CTA: 232448
         # print("SMEM: ", self.shared_storage.size_in_bytes())
-        if const_expr(self.use_block_sparsity or aux_tensors is not None):
+        if const_expr(self.use_block_sparsity or aux_data.tensors is not None):
             assert all(x is None for x in (mCuSeqlensQ, mCuSeqlensK, mSeqUsedQ, mSeqUsedK)), (
                 "Variable sequence length is not supported yet for blocksparse or aux tensors in bwd"
             )
@@ -1120,7 +1117,7 @@ class FlashAttentionBackwardSm100:
             window_size_left,
             window_size_right,
             tile_sched_params,
-            aux_tensors,
+            aux_data,
             fastdiv_mods,
             blocksparse_tensors,
             mRngState,
@@ -1207,7 +1204,7 @@ class FlashAttentionBackwardSm100:
         window_size_left: Optional[Int32],
         window_size_right: Optional[Int32],
         tile_sched_params: ParamsBase,
-        aux_tensors: Optional[list] = None,
+        aux_data: AuxData = AuxData(),
         fastdiv_mods=(None, None),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         mRngState: Optional[cute.Tensor] = None,
@@ -1289,11 +1286,11 @@ class FlashAttentionBackwardSm100:
             * len((self.mma_warp_id, *self.compute_warp_ids, *self.reduce_warp_ids)),
         )
         tmem = cutlass.utils.TmemAllocator(
-            storage.tmem_holding_buf,
+            storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=self.mma_warp_id,
             is_two_cta=self.use_2cta_instrs,
-            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr,
+            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar.ptr,
         )
 
         # UMMA producers and AsyncThread consumers
@@ -1728,7 +1725,7 @@ class FlashAttentionBackwardSm100:
                 tiled_copy_r2s_dKV,
                 mdK_semaphore,
                 mdV_semaphore,
-                aux_tensors,
+                aux_data,
                 fastdiv_mods,
                 blocksparse_tensors,
                 mRngState,
@@ -2052,7 +2049,7 @@ class FlashAttentionBackwardSm100:
                     batch_idx,
                     head_idx,
                     n_block,
-                    subtile_factor=self.subtile_factor,
+                    q_subtile_factor=self.q_subtile_factor,
                     m_block_max=m_block_max,
                 )
                 process_tile = total_m_block_cnt > Int32(0)
@@ -2089,7 +2086,7 @@ class FlashAttentionBackwardSm100:
                             self.tma_copy_bytes["V"],
                             should_load_Q=should_load_Q,
                             should_load_dO=should_load_dO,
-                            subtile_factor=self.subtile_factor,
+                            q_subtile_factor=self.q_subtile_factor,
                             m_block_max=m_block_max,
                         )
                     )
@@ -2508,7 +2505,7 @@ class FlashAttentionBackwardSm100:
                     batch_idx,
                     head_idx,
                     n_block,
-                    subtile_factor=self.subtile_factor,
+                    q_subtile_factor=self.q_subtile_factor,
                     m_block_max=m_block_max,
                 )
                 process_tile = block_iter_count > Int32(0)
@@ -2894,13 +2891,17 @@ class FlashAttentionBackwardSm100:
         n_block,
         softmax_scale,
         seqlen_info,
-        aux_tensors=None,
+        aux_data: AuxData = AuxData(),
         fastdiv_mods=(None, None),
     ):
         """Apply forward score modification for SM100 backward pass."""
-        # In bwd, S is computed as K @ Q.T so dimensions are (tile_n, tile_m)
-        cS = cute.make_identity_tensor((self.tile_n, self.tile_m))
-        cS = cute.domain_offset((n_block * self.tile_n, m_block * self.tile_m), cS)
+        # In bwd, S is computed as K @ Q.T so dimensions are (tile_n, tile_m).
+        # With 2CTA, partition_C must see the full cluster tile so each CTA
+        # gets its own half of the tile.
+        cluster_tile_n = self.tile_n * self.cta_group_size
+        cluster_n_block = n_block // self.cta_group_size
+        cS = cute.make_identity_tensor((cluster_tile_n, self.tile_m))
+        cS = cute.domain_offset((cluster_n_block * cluster_tile_n, m_block * self.tile_m), cS)
         tScS = thr_mma_S.partition_C(cS)
         tScS_idx = thr_copy_t2r.partition_D(tScS)
 
@@ -2913,7 +2914,7 @@ class FlashAttentionBackwardSm100:
             softmax_scale,
             self.vec_size,
             self.qk_acc_dtype,
-            aux_tensors,
+            aux_data,
             fastdiv_mods,
             seqlen_info,
             constant_q_idx=None,
@@ -2931,7 +2932,7 @@ class FlashAttentionBackwardSm100:
         head_idx,
         softmax_scale,
         seqlen_info,
-        aux_tensors=None,
+        aux_data: AuxData = AuxData(),
         fastdiv_mods=(None, None),
     ):
         """Apply backward score modification (joint graph) for SM100."""
@@ -2945,7 +2946,7 @@ class FlashAttentionBackwardSm100:
             softmax_scale,
             self.vec_size,
             self.qk_acc_dtype,
-            aux_tensors,
+            aux_data,
             fastdiv_mods,
             seqlen_info,
             constant_q_idx=None,
@@ -2994,7 +2995,7 @@ class FlashAttentionBackwardSm100:
         tiled_copy_r2s_dKV: Optional[cute.TiledCopy],
         mdK_semaphore: Optional[cute.Tensor],
         mdV_semaphore: Optional[cute.Tensor],
-        aux_tensors: Optional[list] = None,
+        aux_data: AuxData = AuxData(),
         fastdiv_mods=(None, None),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         mRngState: Optional[cute.Tensor] = None,
@@ -3121,20 +3122,20 @@ class FlashAttentionBackwardSm100:
                 seqlen, n_block // self.cluster_shape_mnk[0]
             )
             mask = AttentionMaskCls(seqlen)
-            n_block_for_cluster = n_block // self.cta_group_size
+            cluster_n_block = n_block // self.cta_group_size
             # TODO: condition mask_seqlen
             mask_fn = partial(
                 mask.apply_mask_sm100_transposed,
                 tScS_t2r=tScS_t2r,
                 t0ScS_t2r=t0ScS_t2r,
-                n_block=n_block_for_cluster,
+                n_block=cluster_n_block,
                 mask_seqlen=True,
                 mask_causal=self.is_causal,
                 mask_local=self.is_local,
                 mask_mod=self.mask_mod,
                 batch_idx=batch_idx,
                 head_idx=head_idx,
-                aux_tensors=aux_tensors,
+                aux_data=aux_data,
                 fastdiv_mods=fastdiv_mods,
             )
 
@@ -3162,7 +3163,7 @@ class FlashAttentionBackwardSm100:
                     batch_idx,
                     head_idx,
                     n_block,
-                    subtile_factor=self.subtile_factor,
+                    q_subtile_factor=self.q_subtile_factor,
                     m_block_max=m_block_max,
                 )
                 process_tile = loop_count > Int32(0)
@@ -3212,7 +3213,7 @@ class FlashAttentionBackwardSm100:
                         curr_q_idx,
                         curr_full_cnt,
                         curr_full_idx,
-                        subtile_factor=self.subtile_factor,
+                        q_subtile_factor=self.q_subtile_factor,
                         m_block_max=m_block_max,
                     )
                     m_block_oob = m_block >= m_block_max
@@ -3306,7 +3307,7 @@ class FlashAttentionBackwardSm100:
                         n_block,
                         softmax_scale,
                         seqlen,
-                        aux_tensors,
+                        aux_data,
                         fastdiv_mods,
                     )
 
@@ -3516,9 +3517,12 @@ class FlashAttentionBackwardSm100:
 
                         if const_expr(self.score_mod_bwd is not None):
                             tSrS_pre_cur = tSrS_pre[None, stage, 0, 0]
-                            cS_bwd = cute.make_identity_tensor((self.tile_n, self.tile_m))
+                            cluster_tile_n = self.tile_n * self.cta_group_size
+                            cluster_n_block = n_block // self.cta_group_size
+                            cS_bwd = cute.make_identity_tensor((cluster_tile_n, self.tile_m))
                             cS_bwd = cute.domain_offset(
-                                (n_block * self.tile_n, m_block * self.tile_m), cS_bwd
+                                (cluster_n_block * cluster_tile_n, m_block * self.tile_m),
+                                cS_bwd,
                             )
                             tScS_bwd = thr_mma_S.partition_C(cS_bwd)
                             tScS_idx_bwd = thr_copy_t2r.partition_D(tScS_bwd)
@@ -3531,7 +3535,7 @@ class FlashAttentionBackwardSm100:
                                 head_idx,
                                 softmax_scale,
                                 seqlen,
-                                aux_tensors,
+                                aux_data,
                                 fastdiv_mods,
                             )
                             # Zero out OOB positions (kv_idx >= seqlen_k) after score_mod_bwd
@@ -3977,7 +3981,7 @@ class FlashAttentionBackwardSm100:
         if const_expr(self.use_block_sparsity):
             assert blocksparse_tensors is not None
             if const_expr(blocksparse_tensors.dq_write_order is not None):
-                sparse_iter = iter_idx // self.subtile_factor
+                sparse_iter = iter_idx // self.q_subtile_factor
                 if sparse_iter < curr_q_cnt:
                     assert curr_dq_write_order is not None
                     lock_value = curr_dq_write_order[sparse_iter]
@@ -4086,7 +4090,7 @@ class FlashAttentionBackwardSm100:
                     batch_idx,
                     head_idx,
                     n_block,
-                    subtile_factor=self.subtile_factor,
+                    q_subtile_factor=self.q_subtile_factor,
                     m_block_max=m_block_max,
                 )
                 process_tile = loop_count > Int32(0)
@@ -4116,7 +4120,7 @@ class FlashAttentionBackwardSm100:
                         curr_q_idx,
                         curr_full_cnt,
                         curr_full_idx,
-                        subtile_factor=self.subtile_factor,
+                        q_subtile_factor=self.q_subtile_factor,
                         m_block_max=m_block_max,
                     )
                     m_block_oob_upper = m_block >= m_block_max
