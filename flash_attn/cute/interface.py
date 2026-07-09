@@ -2489,14 +2489,13 @@ class FlashAttnFunc(torch.autograd.Function):
         ctx.aux_scalars = aux_scalars
         ctx.block_sparse_tensors_bwd = block_sparse_tensors_bwd
         ctx.set_materialize_grads(False)
-        return out, lse
+        return (out, lse) if return_lse else out
 
     @staticmethod
-    def backward(ctx, dout, dlse):
+    def backward(ctx, dout, *args):
         q, k, v, qv, out, lse, p, row_max, gather_kv_indices, *aux = ctx.saved_tensors
         aux_tensors = aux if aux else None
-        if not ctx.return_lse:
-            dlse = None
+        dlse = args[0] if ctx.return_lse else None
         if dout is None:
             dout = torch.zeros_like(out)
         if qv is not None:
@@ -2644,14 +2643,13 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         ctx.mask_mod = mask_mod
         ctx.aux_scalars = aux_scalars
         ctx.set_materialize_grads(False)
-        return out, lse
+        return (out, lse) if return_lse else out
 
     @staticmethod
-    def backward(ctx, dout, dlse):
+    def backward(ctx, dout, *args):
         q, k, v, qv, out, lse, p, row_max, gather_kv_indices, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, *aux = ctx.saved_tensors
         aux_tensors = aux if aux else None
-        if not ctx.return_lse:
-            dlse = None
+        dlse = args[0] if ctx.return_lse else None
         if dout is None:
             dout = torch.zeros_like(out)
         if qv is not None:
@@ -2733,6 +2731,7 @@ def flash_attn_func(
     block_sparse_tensors_bwd: Optional[BlockSparseTensorsTorch] = None,
     return_lse: bool = False,
 ):
+    # Returns just out if return_lse is False (default), else (out, lse).
     return FlashAttnFunc.apply(
         q,
         k,
@@ -2801,6 +2800,8 @@ def flash_attn_varlen_func(
         page_table: (batch, max_num_pages_per_seq)
     
     Return:
+       If return_lse is False (default), returns just out. Otherwise returns
+       the tuple (out, lse).
        out: (total_q, nheads, hdim) or (batch, seqlen_q, nheads, hdim)
        lse: (nheads, total_q)       or (batch, nheads, seqlen_q) if not has_qv (standard)
             (total_q, nheads)       or (batch, seqlen_q, nheads) if has_qv
