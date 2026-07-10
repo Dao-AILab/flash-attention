@@ -105,7 +105,7 @@ class CuSeqlensToBlocksKernel:
 
             total_blocks_for_batch = num_blocks
             total_split_blocks_for_batch = num_split_blocks
-            
+
             for delta in (1, 2, 4, 8, 16):
                 other = cute.arch.shuffle_sync_up(total_blocks_for_batch, delta, mask_and_clamp=0)
                 if const_expr(has_splits):
@@ -126,7 +126,7 @@ class CuSeqlensToBlocksKernel:
 
             total_blocks_for_batch += base
             total_split_blocks_for_batch += base_splits
-            
+
             for idx in cutlass.range(warp_idx):
                 total_blocks_for_batch += warp_block_count[idx]
                 if const_expr(has_splits):
