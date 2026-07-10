@@ -1067,10 +1067,9 @@ def _flash_attn_fwd(
                 AuxData(cute_aux_tensors, aux_scalars),
             ])
             if arch // 10 in [10, 11]:
-                # Dropout positional args (mRngState, rng_seed, rng_offset,
-                # mDropoutMask, mask_row_stride) only exist on SM100/SM110.
+                # Dropout positional args (rng_seed, rng_offset, mDropoutMask,
+                # mask_row_stride) only exist on SM100/SM110.
                 compile_args.extend([
-                    None,  # mRngState placeholder
                     Uint64(rng_seed_scalar) if is_dropout else None,
                     Uint64(rng_offset_scalar) if is_dropout else None,
                     dropout_mask_tensor,
@@ -1152,10 +1151,9 @@ def _flash_attn_fwd(
                 AuxData(aux_tensors, aux_scalars),
             ])
             if arch // 10 in [10, 11]:
-                # Dropout runtime args (mRngState, rng_seed, rng_offset,
-                # mDropoutMask, mask_row_stride) only exist on SM100/SM110.
+                # Dropout runtime args (rng_seed, rng_offset, mDropoutMask,
+                # mask_row_stride) only exist on SM100/SM110.
                 call_args.extend([
-                    None,  # mRngState
                     rng_seed_scalar if is_dropout else None,
                     rng_offset_scalar if is_dropout else None,
                     dropout_mask,
@@ -1992,12 +1990,11 @@ def _flash_attn_bwd(
             sparse_tensors_compile = to_cute_block_sparse_tensors(normalized_block_sparse_tensors)
         dq_accum_tensor = dq_tensor if use_dedicated_hd256_kernel else dq_accum_tensor
 
-        # Dropout positional args (mRngState, rng_seed, rng_offset) only exist on
+        # Dropout positional args (rng_seed, rng_offset) only exist on
         # SM100/SM110 backward kernels.
         bwd_supports_dropout = arch // 10 in [10, 11] and not use_dedicated_hd256_kernel
         if bwd_supports_dropout:
             dropout_compile_args = (
-                None,  # mRngState placeholder
                 Uint64(bwd_rng_seed_scalar) if is_dropout_bwd else None,
                 Uint64(bwd_rng_offset_scalar) if is_dropout_bwd else None,
             )
@@ -2040,7 +2037,6 @@ def _flash_attn_bwd(
         bwd_supports_dropout = arch // 10 in [10, 11] and not use_dedicated_hd256_kernel
         if bwd_supports_dropout:
             dropout_runtime_args = (
-                None,  # mRngState
                 bwd_rng_seed_scalar if is_dropout_bwd else None,
                 bwd_rng_offset_scalar if is_dropout_bwd else None,
             )

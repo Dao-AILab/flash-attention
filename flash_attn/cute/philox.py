@@ -147,14 +147,6 @@ def philox_rounds(
     ``use_lop3`` is forwarded to ``philox_single_round`` — only enable
     on fwd softmax call sites; bwd must use the default (see
     ``philox_single_round`` docstring).
-
-    When multiple philox_rounds() calls share the same base
-    ``(key_x, key_y)`` (common case: a softmax_step issues N calls
-    that differ only in ``row_id`` / ``col_id``), precompute the
-    per-round key chain once with
-    ``philox_precompute_round_keys`` and call
-    ``philox_rounds_with_keys`` instead. That hoists ``6 * (N - 1)``
-    IADDs out of the inner loop.
     """
     kPhilox10A = Uint32(0x9E3779B9)
     kPhilox10B = Uint32(0xBB67AE85)
@@ -172,66 +164,6 @@ def philox_rounds(
 
     out_x, out_y, out_z, out_w = philox_single_round(
         ctr_x, ctr_y, ctr_z, ctr_w, key_x, key_y,
-        use_lop3=use_lop3, loc=loc, ip=ip,
-    )
-    return (out_x, out_y, out_z, out_w)
-
-
-@dsl_user_op
-def philox_precompute_round_keys(key_x: Uint32, key_y: Uint32, *, loc=None, ip=None):
-    """Pre-compute the per-round (key_x_i, key_y_i) chain for all
-    PHILOX_NUM_ROUNDS rounds.
-
-    Returns a tuple of length ``PHILOX_NUM_ROUNDS`` where entry ``i`` is
-    the ``(key_x, key_y)`` pair to feed into the i-th
-    ``philox_single_round`` invocation.
-
-    Use this with ``philox_rounds_with_keys`` to share the key chain
-    across all philox_rounds() calls in a softmax_step that have the
-    same base ``(key_x, key_y)``. With ``N`` philox calls per step,
-    this saves ``6 * (N - 1)`` IADDs per step per lane vs calling
-    ``philox_rounds`` directly (which redoes the key += K chain on
-    every call). ptxas does not reliably CSE these IADDs across
-    @dsl_user_op call boundaries.
-    """
-    kPhilox10A = Uint32(0x9E3779B9)
-    kPhilox10B = Uint32(0xBB67AE85)
-    keys = [(key_x, key_y)]
-    cur_x, cur_y = key_x, key_y
-    for _ in range(PHILOX_NUM_ROUNDS - 1):
-        cur_x = cur_x + kPhilox10A
-        cur_y = cur_y + kPhilox10B
-        keys.append((cur_x, cur_y))
-    return tuple(keys)
-
-
-@dsl_user_op
-def philox_rounds_with_keys(
-    round_keys, ctr_x: Uint32, ctr_y: Uint32,
-    row_id: Uint32, col_id: Uint32,
-    *, use_lop3: bool = False, loc=None, ip=None
-):
-    """N-round Philox using a precomputed key chain (see
-    ``philox_precompute_round_keys``).
-
-    ``round_keys`` is a Python tuple of length ``PHILOX_NUM_ROUNDS``;
-    each element is a ``(key_x, key_y)`` pair.
-    """
-    assert len(round_keys) == PHILOX_NUM_ROUNDS
-
-    ctr_z = row_id
-    ctr_w = col_id
-
-    for i in range(PHILOX_NUM_ROUNDS - 1):
-        kx, ky = round_keys[i]
-        ctr_x, ctr_y, ctr_z, ctr_w = philox_single_round(
-            ctr_x, ctr_y, ctr_z, ctr_w, kx, ky,
-            use_lop3=use_lop3, loc=loc, ip=ip,
-        )
-
-    kx, ky = round_keys[PHILOX_NUM_ROUNDS - 1]
-    out_x, out_y, out_z, out_w = philox_single_round(
-        ctr_x, ctr_y, ctr_z, ctr_w, kx, ky,
         use_lop3=use_lop3, loc=loc, ip=ip,
     )
     return (out_x, out_y, out_z, out_w)

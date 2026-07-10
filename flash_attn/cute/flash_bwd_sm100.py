@@ -37,12 +37,15 @@ from flash_attn.cute.named_barrier import NamedBarrierBwdSm100
 from flash_attn.cute.softmax import (
     apply_score_mod_inner,
     apply_score_mod_bwd_inner,
+)
+from flash_attn.cute.dropout import (
     f32_to_dropout_threshold_byte,
     dropout_mask_to_bit,
     dropout_bit_to_scale,
     philox_extract_mask_bits_fa2,
     smem_mask_store_u32,
     smem_mask_load_u32,
+    fa2_philox_row_index,
 )
 from flash_attn.cute.philox import philox_unpack_seed_offset, philox_rounds
 from flash_attn.cute.block_sparsity import BlockSparseTensors
@@ -570,7 +573,6 @@ class FlashAttentionBackwardSm100:
         aux_data: AuxData = AuxData(),
         # Block-sparse tensors (Q direction - for iterating m_blocks per n_block):
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
-        mRngState: Optional[cute.Tensor] = None,
         rng_seed: Uint64 | int | None = None,
         rng_offset: Uint64 | int | None = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
@@ -1120,7 +1122,6 @@ class FlashAttentionBackwardSm100:
             aux_data,
             fastdiv_mods,
             blocksparse_tensors,
-            mRngState,
             Uint64(rng_seed) if cutlass.const_expr(self.is_dropout) else None,
             Uint64(rng_offset) if cutlass.const_expr(self.is_dropout) else None,
             cute.size(mQ.shape[2]) if cutlass.const_expr(self.is_dropout) else None,
@@ -1207,7 +1208,6 @@ class FlashAttentionBackwardSm100:
         aux_data: AuxData = AuxData(),
         fastdiv_mods=(None, None),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
-        mRngState: Optional[cute.Tensor] = None,
         rng_seed: Uint64 | None = None,
         rng_offset: Uint64 | None = None,
         num_heads_q=None,
@@ -1728,7 +1728,6 @@ class FlashAttentionBackwardSm100:
                 aux_data,
                 fastdiv_mods,
                 blocksparse_tensors,
-                mRngState,
                 rng_seed,
                 rng_offset,
                 num_heads_q,
@@ -2998,7 +2997,6 @@ class FlashAttentionBackwardSm100:
         aux_data: AuxData = AuxData(),
         fastdiv_mods=(None, None),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
-        mRngState: Optional[cute.Tensor] = None,
         rng_seed: Uint64 | None = None,
         rng_offset: Uint64 | None = None,
         num_heads_q=None,
@@ -3233,8 +3231,9 @@ class FlashAttentionBackwardSm100:
                             m_local_row0 = (pair_idx // 8) * 16 + (pair_idx % 8)
                             m_local_row8 = m_local_row0 + 8
                             m_global_row0 = m_block_start + m_local_row0
-                            fa2_row_arg = Uint32(m_global_row0 // 16)
-                            fa2_base_lane = Uint32((m_global_row0 % 8) * 4)
+                            fa2_row_arg, fa2_base_lane, _ = fa2_philox_row_index(
+                                m_global_row0
+                            )
                             fa2_col_arg = Uint32(n_base_col // 32 + word_col_wp)
                             mask_word_r0 = Uint32(0)
                             mask_word_r8 = Uint32(0)

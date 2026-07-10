@@ -41,10 +41,12 @@ import flash_attn.cute.pipeline as pipeline_custom
 import cutlass.pipeline as cutlass_pipeline
 from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.softmax import (
-    FA4_DROP_E2E_MASK,
-    FA4_DROP_E2E_POLY_DEGREE,
     SoftmaxSm100,
     apply_score_mod_inner,
+)
+from flash_attn.cute.dropout import (
+    FA4_DROP_E2E_MASK,
+    FA4_DROP_E2E_POLY_DEGREE,
     f32_to_dropout_threshold,
 )
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
@@ -439,7 +441,6 @@ class FlashAttentionForwardSm100:
         descale_tensors: Optional[DescaleTensors] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_data: AuxData = AuxData(),
-        mRngState: Optional[cute.Tensor] = None,
         rng_seed: Uint64 | int | None = None,
         rng_offset: Uint64 | int | None = None,
         mDropoutMask=None,
@@ -835,7 +836,6 @@ class FlashAttentionForwardSm100:
             aux_data,
             fastdiv_mods,
             head_divmod,
-            mRngState,
             Uint64(rng_seed) if cutlass.const_expr(self.is_dropout) else None,
             Uint64(rng_offset) if cutlass.const_expr(self.is_dropout) else None,
             p_dropout_8bit_packed,
@@ -900,7 +900,6 @@ class FlashAttentionForwardSm100:
         aux_data: AuxData = AuxData(),
         fastdiv_mods=(None, None),
         head_divmod=None,
-        mRngState: Optional[cute.Tensor] = None,
         rng_seed: Uint64 | None = None,
         rng_offset: Uint64 | None = None,
         p_dropout_8bit_packed: Uint32 | None = None,
@@ -2585,17 +2584,12 @@ class FlashAttentionForwardSm100:
             )
             tSrP_bf16 = cute.make_rmem_tensor(tSrP_st_src_layout.shape, self.q_dtype)
 
-            # When dropout is on, ``apply_dropout_rP_pair`` rewrites
-            # acc_S in place and runs its own FP32->BF16 conversion at
-            # the end, so the conversion inside
-            # ``apply_exp2_convert_row_sum_pair`` is pure waste. Skip
-            # it via ``skip_convert``. Also pass ``inv_rp`` so the
-            # row_sum FMA2 cancels out the rp factor baked into exp2.
-            #
-            # ``FA4_DROP_E2E_MASK`` / ``FA4_DROP_E2E_POLY_DEGREE`` (from
-            # softmax.py) hard-code the per-g selective HW/SW exp2
-            # schedule: mask=4 (g=2 SW), poly_degree=1 wins ~3 us by
-            # filling one MUFU.EX2 -> FSEL/F2FP scheduling bubble.
+            # With dropout on, ``apply_dropout_rP_pair`` rewrites acc_S in
+            # place and does its own FP32->BF16 conversion, so ``skip_convert``
+            # drops the redundant conversion here; ``inv_rp`` lets the row_sum
+            # FMA2 cancel the rp factor baked into exp2. The two
+            # ``FA4_DROP_E2E_*`` constants (see dropout.py) fix the per-g HW/SW
+            # exp2 schedule.
             softmax.apply_exp2_convert_row_sum_pair(
                 tSrS_t2r,
                 tSrP_bf16,
