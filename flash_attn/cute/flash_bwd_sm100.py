@@ -3714,7 +3714,7 @@ class FlashAttentionBackwardSm100:
                             consumer_state_LSE.advance()
 
                         # === Load dP[stage] from TMEM ===
-                        tdPrdP_t2r = cute.make_fragment(tScS_t2r[None, 0, None, None].shape, Float32)
+                        tdPrdP_t2r = cute.make_rmem_tensor(tScS_t2r[None, 0, None, None].shape, Float32)
                         cute.copy(thr_copy_t2r, tdPtdP_t2r[None, stage, None, None], tdPrdP_t2r)
                         cute.arch.fence_view_async_tmem_load()
                         self.compute_sync_barrier.arrive_and_wait()

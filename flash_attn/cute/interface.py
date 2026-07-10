@@ -2622,7 +2622,7 @@ class FlashAttnFunc(torch.autograd.Function):
         return out, lse
 
     @staticmethod
-    def backward(ctx, dout, dlse):
+    def backward(ctx, dout, dlse, *args):
         q, k, v, qv, out, lse, p, row_max, rng_state, gather_kv_indices, *aux = ctx.saved_tensors
         aux_tensors = aux if aux else None
         if not ctx.return_lse:
@@ -2785,10 +2785,12 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         ctx.mask_mod = mask_mod
         ctx.aux_scalars = aux_scalars
         ctx.set_materialize_grads(False)
-        return out, lse, rng_state, dropout_mask
+        if return_dropout_mask:
+            return out, lse, rng_state, dropout_mask
+        return out, lse
 
     @staticmethod
-    def backward(ctx, dout, dlse):
+    def backward(ctx, dout, dlse, *args):
         q, k, v, qv, out, lse, p, row_max, rng_state, gather_kv_indices, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, *aux = ctx.saved_tensors
         aux_tensors = aux if aux else None
         if not ctx.return_lse:

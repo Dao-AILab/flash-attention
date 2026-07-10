@@ -2583,7 +2583,7 @@ class FlashAttentionForwardSm100:
             tSrP_st_src_layout = thr_tmem_store.partition_S(
                 cute.make_identity_tensor(tScP_bf16_shape)
             )
-            tSrP_bf16 = cute.make_fragment(tSrP_st_src_layout.shape, self.q_dtype)
+            tSrP_bf16 = cute.make_rmem_tensor(tSrP_st_src_layout.shape, self.q_dtype)
 
             # When dropout is on, ``apply_dropout_rP_pair`` rewrites
             # acc_S in place and runs its own FP32->BF16 conversion at
