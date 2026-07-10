@@ -403,6 +403,8 @@ def parse_args() -> argparse.Namespace:
                    help="# Q heads (default: 16 if hdim<=128 else 8)")
     p.add_argument("--p-dropout", type=float, default=0.125,
                    help="Dropout probability (default: 0.125 = 2/16, a cuDNN-friendly rate)")
+    p.add_argument("--no-cudnn", action="store_true",
+                   help="Skip the cuDNN SDPA backends and benchmark FA4 only.")
     p.add_argument("--causal", type=str.lower, choices=["true", "false", "both"], default="both",
                    help="Causal mode (default: both)")
     p.add_argument("--fwd", action="store_true",
@@ -461,9 +463,13 @@ def main():
     backends = [
         ("fa4_off",   "FA4 (no drop)",     lambda c: setup_fa4(c, 0.0),       0.0),
         ("fa4_on",    f"FA4 ({p_lbl})",    lambda c: setup_fa4(c, p_dropout), p_dropout),
-        ("cudnn_off", "cuDNN (no drop)",   lambda c: setup_cudnn_sdpa(c, 0.0), 0.0),
-        ("cudnn_on",  f"cuDNN ({p_lbl})",  lambda c: setup_cudnn_sdpa(c, p_dropout), p_dropout),
     ]
+    include_cudnn = not args.no_cudnn
+    if include_cudnn:
+        backends += [
+            ("cudnn_off", "cuDNN (no drop)",   lambda c: setup_cudnn_sdpa(c, 0.0), 0.0),
+            ("cudnn_on",  f"cuDNN ({p_lbl})",  lambda c: setup_cudnn_sdpa(c, p_dropout), p_dropout),
+        ]
     backend_short_names = [b[0] for b in backends]
     backend_labels = {b[0]: b[1] for b in backends}
 
@@ -562,6 +568,7 @@ def main():
         p_dropout,
         has_forward,
         has_backward,
+        include_cudnn,
     )
 
 
@@ -576,6 +583,7 @@ def _render_results(
     p_dropout: float,
     has_forward: bool,
     has_backward: bool,
+    include_cudnn: bool = True,
 ) -> None:
     """Render benchmark results so FA4 and cuDNN sit on the same row.
 
@@ -625,6 +633,8 @@ def _render_results(
         ("fa4_bwd",   "FA4 bwd",   "    ms / TFLOPS", METRIC_W),
         ("cudnn_bwd", "cuDNN bwd", "    ms / TFLOPS", METRIC_W),
     ]
+    if not include_cudnn:
+        COL_SPECS = [c for c in COL_SPECS if not c[0].startswith("cudnn_")]
 
     def _row(values: dict) -> str:
         cells = [f" {str(values[k]):>{w}} " for k, _, _, w in COL_SPECS]
@@ -655,8 +665,9 @@ def _render_results(
         title_bits.append("forward")
     if has_backward:
         title_bits.append("backward")
+    bench_subject = "FA4 vs cuDNN" if include_cudnn else "FA4"
     title = (
-        f" FA4 vs cuDNN dropout (varlen) — {' + '.join(title_bits)} "
+        f" {bench_subject} dropout (varlen) — {' + '.join(title_bits)} "
         f"(one row per config × dropout; each cell = latency_ms / TFLOPS)"
     )
     table_w = len(_sub_header_row())
