@@ -47,6 +47,7 @@ from flash_attn.cute.flash_bwd_postprocess import FlashAttentionBackwardPostproc
 from flash_attn.cute.flash_fwd_combine import FlashAttentionForwardCombine
 from flash_attn.cute.flash_fwd_mla_sm100 import FlashAttentionMLAForwardSm100
 from flash_attn.cute.prepare_scheduler import FlashPrepareScheduler, SchedulerMetadataTensorsTorch
+from flash_attn.cute.cu_blocks_kernel import CuSeqlensToBlocksKernel
 from flash_attn.cute.flash_bwd_mla_sm100 import FlashAttentionSparseMLABackwardSm100
 from flash_attn.cute.flash_bwd_mla_dq_dqv_sm100 import dQdQvGemmKernel
 from flash_attn.cute.flash_bwd_mla_dk_sm100 import dKGemmKernel
@@ -416,24 +417,61 @@ def _compute_tile_cumsum(
     assert num_m_blocks is not None or cu_seqlens is not None or seqused is not None, (
         "_compute_tile_cumsum requires num_m_blocks, cu_seqlens, or seqused"
     )
-    if num_m_blocks is None:
-        seqlens = seqused if seqused is not None else (cu_seqlens[1:] - cu_seqlens[:-1])
-        if pack_gqa and qhead_per_kvhead > 1:
-            seqlens = seqlens * qhead_per_kvhead
-        num_m_blocks = (seqlens + tile_size - 1) // tile_size
-    num_m_blocks_eff = (num_m_blocks + q_stage - 1) // q_stage
-    num_m_blocks_eff = (num_m_blocks_eff + cluster_shape_m - 1) // cluster_shape_m
-    order = virtual_batch_idx.long() if virtual_batch_idx is not None else None
-    if order is not None:
-        num_m_blocks_eff = num_m_blocks_eff[order]
-    if num_splits_dynamic is None:
-        cum = torch.cumsum(num_m_blocks_eff, dim=0, dtype=torch.int32)
-        return torch.nn.functional.pad(cum, (1, 0)), None
-    splits = num_splits_dynamic[order] if order is not None else num_splits_dynamic
-    stacked = torch.stack([num_m_blocks_eff, num_m_blocks_eff * splits], dim=0)
-    cum = torch.cumsum(stacked, dim=1, dtype=torch.int32)
-    padded = torch.nn.functional.pad(cum, (1, 0))
-    return padded[0], padded[1]
+    if num_m_blocks is not None:
+        # num_m_blocks is already in tile_size units; feed it through the seqused slot.
+        seqused = num_m_blocks
+        tile = q_stage * cluster_shape_m
+        seqlen_q_multiplier = 1
+    else:
+        tile = tile_size * q_stage * cluster_shape_m
+        seqlen_q_multiplier = qhead_per_kvhead if pack_gqa and qhead_per_kvhead > 1 else 1
+    batch_size = seqused.shape[0] if seqused is not None else cu_seqlens.shape[0] - 1
+    device = seqused.device if seqused is not None else cu_seqlens.device
+    cu_total_m_blocks = torch.empty(batch_size + 1, dtype=torch.int32, device=device)
+    cu_total_splits_m_blocks = (
+        torch.empty(batch_size + 1, dtype=torch.int32, device=device)
+        if num_splits_dynamic is not None
+        else None
+    )
+    compile_key = (
+        tile,
+        seqlen_q_multiplier,
+        cu_seqlens is not None,
+        seqused is not None,
+        num_splits_dynamic is not None,
+        virtual_batch_idx is not None,
+    )
+    if compile_key not in _compute_tile_cumsum.compile_cache:
+        cute_tensors = [
+            to_cute_tensor(t, assumed_align=4, leading_dim=0) if t is not None else None
+            for t in (
+                cu_total_m_blocks,
+                cu_total_splits_m_blocks,
+                cu_seqlens,
+                seqused,
+                num_splits_dynamic,
+                virtual_batch_idx,
+            )
+        ]
+        _compute_tile_cumsum.compile_cache[compile_key] = cute.compile(
+            CuSeqlensToBlocksKernel(tile=tile, seqlen_q_multiplier=seqlen_q_multiplier),
+            *cute_tensors,
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+            options="--enable-tvm-ffi",
+        )
+    if not is_fake_mode():
+        _compute_tile_cumsum.compile_cache[compile_key](
+            cu_total_m_blocks,
+            cu_total_splits_m_blocks,
+            cu_seqlens,
+            seqused,
+            num_splits_dynamic,
+            virtual_batch_idx,
+        )
+    return cu_total_m_blocks, cu_total_splits_m_blocks
+
+
+_compute_tile_cumsum.compile_cache = get_jit_cache("tile_cumsum")
 
 
 def _flash_attn_fwd(
@@ -915,7 +953,7 @@ def _flash_attn_fwd(
     cu_total_splits_m_blocks = None
     use_single_tile_varlen_scheduler = use_clc_scheduler or tile_count_semaphore is None
     use_cu_hint = (
-        is_varlen
+        is_varlen_q
         and use_single_tile_varlen_scheduler
         and batch_size > BIN_BATCH_SEARCH_THRESH
         and not use_dedicated_hd256_kernel
@@ -1516,6 +1554,8 @@ def _bwd_preprocess(
             cu_seqlens=cu_seqlens_q,
             seqused=seqused_q,
             tile_size=m_block_size,
+            qhead_per_kvhead=qhead_per_kvhead,
+            pack_gqa=pack_gqa,
         )
     compile_key = (
         dtype, head_dim, head_dim_v, m_block_size,
@@ -1953,6 +1993,7 @@ def _flash_attn_bwd(
             cu_seqlens=cu_seqlens_k,
             seqused=seqused_k,
             tile_size=n_block_size,
+            cluster_shape_m=cluster_size,
         )
 
     # Preprocess kernel: compute (o * dout).sum(dim=-1) - dLSE, lse * log2_e, and zero out dq_accum.
@@ -2334,7 +2375,7 @@ def _flash_attn_bwd(
                 arch, dtype, head_dim, n_block_size, num_threads_post_dKV,
                 AtomLayoutNdKV, dKV_swapAB,
                 cluster_size=cluster_size,
-                cu_total_m_blocks=cu_total_m_blocks_k,
+                cu_total_m_blocks=cu_total_m_blocks_k if cluster_size == 1 else None,
             )
             # Postprocess: convert dv_accum from float32 to dv in bf16/fp16
             _bwd_postprocess_convert(
@@ -2343,6 +2384,7 @@ def _flash_attn_bwd(
                 arch, dtype, head_dim_v, n_block_size, num_threads_post_dKV,
                 AtomLayoutNdKV, dKV_swapAB,
                 cluster_size=cluster_size,
+                cu_total_m_blocks=cu_total_m_blocks_k if cluster_size == 1 else None,
             )
 
     return dq, dk, dv
