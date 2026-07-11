@@ -402,6 +402,28 @@ def open_url(url):
     return urllib.request.urlopen(request, timeout=300)
 
 
+def safe_extractall(tar, path):
+    """Extract a tar stream, refusing members that would escape ``path``.
+
+    Uses the PEP 706 ``data`` filter when the interpreter supports it (added in
+    3.12, backported to 3.10.12 / 3.11.4). On older interpreters the filter
+    keyword does not exist, so we validate each member's resolved path stays
+    inside ``path`` and reject link members before extracting. The tar is opened
+    in stream mode, so members are validated and extracted in a single pass.
+    """
+    dest = os.path.realpath(path)
+    if hasattr(tarfile, "data_filter"):
+        tar.extractall(path=dest, filter="data")
+        return
+    for member in tar:
+        target = os.path.realpath(os.path.join(dest, member.name))
+        if target != dest and not target.startswith(dest + os.sep):
+            raise RuntimeError(f"Refusing tar member outside extract dir: {member.name!r}")
+        if member.issym() or member.islnk():
+            raise RuntimeError(f"Refusing link member in tar archive: {member.name!r}")
+        tar.extract(member, path=dest)
+
+
 def download_and_copy(name, src_func, dst_path, version, url_func):
     if is_offline_build():
         return
@@ -418,9 +440,15 @@ def download_and_copy(name, src_func, dst_path, version, url_func):
     src_path = os.path.join(tmp_path, src_path)
     download = not os.path.exists(src_path)
     if download:
+        # Refuse to extract into a pre-planted symlink: an attacker with write
+        # access to the predictable cache dir could otherwise redirect the
+        # extraction (and the shutil.copy below) to an arbitrary location.
+        if os.path.islink(tmp_path):
+            raise RuntimeError(f"Refusing to extract into symlinked cache path: {tmp_path}")
+        os.makedirs(tmp_path, exist_ok=True)
         print(f'downloading and extracting {url} ...')
         file = tarfile.open(fileobj=open_url(url), mode="r|*")
-        file.extractall(path=tmp_path)
+        safe_extractall(file, tmp_path)
     os.makedirs(os.path.split(dst_path)[0], exist_ok=True)
     print(f'copy {src_path} to {dst_path} ...')
     if os.path.isdir(src_path):
