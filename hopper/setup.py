@@ -415,12 +415,28 @@ def safe_extractall(tar, path):
     if hasattr(tarfile, "data_filter"):
         tar.extractall(path=dest, filter="data")
         return
+
+    def stays_inside(resolved):
+        return resolved == dest or resolved.startswith(dest + os.sep)
+
     for member in tar:
         target = os.path.realpath(os.path.join(dest, member.name))
-        if target != dest and not target.startswith(dest + os.sep):
+        if not stays_inside(target):
             raise RuntimeError(f"Refusing tar member outside extract dir: {member.name!r}")
+        # The data filter permits links whose target resolves inside the
+        # destination (the cuda_nvcc archives ship such intra-package symlinks,
+        # e.g. libnvvm.so -> libnvvm.so.4). Mirror that instead of rejecting all
+        # links, or real builds regress on interpreters without the data filter.
         if member.issym() or member.islnk():
-            raise RuntimeError(f"Refusing link member in tar archive: {member.name!r}")
+            # A symlink target is relative to the link's own directory; a hard
+            # link's is relative to the archive root.
+            link_base = os.path.dirname(target) if member.issym() else dest
+            link_target = os.path.realpath(os.path.join(link_base, member.linkname))
+            if not stays_inside(link_target):
+                raise RuntimeError(
+                    f"Refusing link member pointing outside extract dir: "
+                    f"{member.name!r} -> {member.linkname!r}"
+                )
         tar.extract(member, path=dest)
 
 
@@ -443,7 +459,13 @@ def download_and_copy(name, src_func, dst_path, version, url_func):
         # Refuse to extract into a pre-planted symlink: an attacker with write
         # access to the predictable cache dir could otherwise redirect the
         # extraction (and the shutil.copy below) to an arbitrary location.
-        if os.path.islink(tmp_path):
+        # islink() only inspects the leaf, so also require the fully resolved
+        # path to stay under the cache root, catching a symlinked parent.
+        cache_root = os.path.realpath(flashattn_cache_path)
+        resolved_tmp = os.path.realpath(tmp_path)
+        if os.path.islink(tmp_path) or not (
+            resolved_tmp == cache_root or resolved_tmp.startswith(cache_root + os.sep)
+        ):
             raise RuntimeError(f"Refusing to extract into symlinked cache path: {tmp_path}")
         os.makedirs(tmp_path, exist_ok=True)
         print(f'downloading and extracting {url} ...')
