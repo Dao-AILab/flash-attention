@@ -258,6 +258,13 @@ class FlashAttentionForwardSm100:
         # despite the literal `is_sm103` name.
         is_sm103 = self.arch.is_family_of(Arch.sm_103f)
         self.is_sm103 = is_sm103
+        # SM103 ld.red is profitable except for D32 when scores are unmodified.
+        self.use_ldred_rowmax = (
+            is_sm103
+            and self.score_mod is None
+            and self.mask_mod is None
+            and self.head_dim_padded != 32
+        )
         # enable_ex2_emu is derived: True if tuning config has freq > 0, else fallback to default logic
         _default_enable_ex2_emu = (self.head_dim_padded <= 128 or (self.head_dim_padded == 192 and self.use_2cta_instrs and not self.is_causal and not self.is_local)) and not is_sm103
         self.enable_ex2_emu = _default_enable_ex2_emu
@@ -2030,9 +2037,12 @@ class FlashAttentionForwardSm100:
                 self.qk_acc_dtype,
             )
         else:
-            tmem_load_atom = cute.make_copy_atom(
-                tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32)), self.qk_acc_dtype
+            tmem_load_op = (
+                tcgen05.copy.LdRed32x32bOp(tcgen05.copy.Repetition(32))
+                if const_expr(self.use_ldred_rowmax)
+                else tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32))
             )
+            tmem_load_atom = cute.make_copy_atom(tmem_load_op, self.qk_acc_dtype)
         thr_tmem_load = tcgen05.make_tmem_copy(tmem_load_atom, tSAcc).get_slice(tidx)
         tStS_t2r = thr_tmem_load.partition_S(tSAcc)  # (((32,32),1),1,4)
 
@@ -2499,6 +2509,8 @@ class FlashAttentionForwardSm100:
         4. Transforming scores using exp2(x*scale - max*scale)
         5. Computing row sums for normalization
         6. Coordinating pipeline synchronization between different processing stages
+
+        A None mask_fn means the tcgen05.ld.red hardware max is valid.
         """
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
         tilePlikeFP32 = self.mma_tiler_qk[1] // Float32.width * self.v_dtype.width
@@ -2512,7 +2524,15 @@ class FlashAttentionForwardSm100:
         # Wait for Si
         pipeline_s_p_o.consumer_wait_w_index_phase(stage, mma_si_consumer_phase)
         tSrS_t2r = cute.make_rmem_tensor(thr_tmem_load.partition_D(tScS).shape, self.qk_acc_dtype)
-        cute.copy(thr_tmem_load, tStS_t2r, tSrS_t2r)
+        hw_row_max = Float32(-Float32.inf)
+        if const_expr(self.use_ldred_rowmax):
+            # ld.red returns each x32 tile's max in an extra register.
+            tSrS_red = cute.make_rmem_tensor(((1, 1), *tSrS_t2r.shape[1:]), self.qk_acc_dtype)
+            cute.copy(thr_tmem_load, tStS_t2r, (tSrS_t2r, tSrS_red))
+            for i in cutlass.range_constexpr(cute.size(tSrS_red.shape)):
+                hw_row_max = cute.arch.fmax(hw_row_max, tSrS_red[i])
+        else:
+            cute.copy(thr_tmem_load, tStS_t2r, tSrS_t2r)
         # tSrS_t2r = copy_utils.load_t2r(thr_tmem_load, tScS_shape, tStS_t2r)
         if cutlass.const_expr(self.score_mod is not None):
             self.apply_score_mod(
@@ -2668,7 +2688,11 @@ class FlashAttentionForwardSm100:
             )
 
         # ------- legacy .32x32b path -------
-        row_max, acc_scale = softmax.update_row_max(tSrS_t2r.load(), is_first)
+        # Masked iterations reduce over post-mask values in software.
+        if const_expr(self.use_ldred_rowmax and mask_fn is None):
+            row_max, acc_scale = softmax.update_row_max_precomputed(hw_row_max, is_first)
+        else:
+            row_max, acc_scale = softmax.update_row_max(tSrS_t2r.load(), is_first)
 
         if const_expr(not is_first):
             # tSrScale_r2t = cute.make_rmem_tensor(thr_tmem_store_scale.partition_S(tScScale).shape, Float32)

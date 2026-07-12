@@ -974,7 +974,9 @@ def softmax_block_sparse_sm100(
                     si_corr_producer_phase,
                     s0_s1_sequence_phase,
                     full_n_block,
-                    mask_fn=partial(
+                    mask_fn=None
+                    if const_expr(check_m_boundary is False)
+                    else partial(
                         mask_fn_none, mask_seqlen=False, check_q_boundary=check_m_boundary
                     ),
                 )
