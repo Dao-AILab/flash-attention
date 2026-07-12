@@ -14,6 +14,7 @@
 # https://github.com/NVIDIA/cutlass/blob/main/examples/python/CuTeDSL/blackwell/fmha.py
 
 import math
+import os
 from typing import Tuple, Callable, Optional, Literal, NamedTuple
 from functools import partial
 
@@ -21,7 +22,7 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Int32, Int64, Boolean, const_expr
+from cutlass import Float32, Int32, Int64, Uint32, Uint64, Boolean, const_expr
 from cutlass.cute.nvgpu import cpasync
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
@@ -39,7 +40,15 @@ from flash_attn.cute import utils
 import flash_attn.cute.pipeline as pipeline_custom
 import cutlass.pipeline as cutlass_pipeline
 from flash_attn.cute.mask import AttentionMask
-from flash_attn.cute.softmax import SoftmaxSm100, apply_score_mod_inner
+from flash_attn.cute.softmax import (
+    SoftmaxSm100,
+    apply_score_mod_inner,
+)
+from flash_attn.cute.dropout import (
+    FA4_DROP_E2E_MASK,
+    FA4_DROP_E2E_POLY_DEGREE,
+    f32_to_dropout_threshold,
+)
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute.block_sparsity import BlockSparseTensors
@@ -140,7 +149,36 @@ class FlashAttentionForwardSm100:
         is_varlen_q: bool = False,
         use_2cta_instrs: bool = False,
         use_clc_scheduler: bool = False,
+        dropout_rate: Float32 = 0.0,
     ):
+        self.is_dropout = dropout_rate > 0.0 and dropout_rate < 1.0
+        self.p_dropout = 1.0 - dropout_rate if self.is_dropout else 1.0
+        self.rp_dropout = 1.0 / self.p_dropout if self.is_dropout else 1.0
+        # ``log2_rp_dropout`` is folded into the exp2 bias inside
+        # scale_subtract_rowmax_pair so that exp2 emits ``softmax_j * rp``
+        # directly, letting apply_dropout_rP_pair skip its per-element
+        # ``val * rp`` FMUL. ``inv_rp_dropout = p_dropout`` is used by
+        # apply_exp2_convert_row_sum_pair to compensate the row_sum (so
+        # ``self.row_sum`` still tracks raw sum(softmax)).
+        import math as _math
+        self.log2_rp_dropout = _math.log2(self.rp_dropout) if self.is_dropout else 0.0
+        self.inv_rp_dropout = self.p_dropout if self.is_dropout else 1.0
+        # `.16x256b` TMEM LD/ST path for the dropout case. When enabled,
+        # the dropout-only path uses:
+        #   * Ld16x256bOp for S TMEM -> register (4-row-per-lane fragment)
+        #   * 4-row softmax helpers in softmax.py (update_row_max_pair, etc.)
+        #   * 100%-util FA2 bit-identical philox dropout (one philox call
+        #     per row-pair x col_arg_local, all 4 bytes of each rng word
+        #     used)
+        #   * St16x128bOp for register -> P TMEM (BF16 view of P)
+        # Restricted to non-pack_gqa: each lane in `.16x256b` owns 4 rows
+        # spanning a 32-row stripe; for pack_gqa with qhead_per_kvhead < 32
+        # those rows can land in different q-head buckets and need
+        # different rng_offset adjustments per row, which would break the
+        # 1-philox-call-per-row-pair sharing the new dropout helper relies
+        # on. pack_gqa+dropout therefore stays on the legacy `.32x32b`
+        # branches in ``softmax_step``.
+        self.use_16x256b_dropout = self.is_dropout and not pack_gqa
         self.use_tma_KV = not paged_kv_non_tma
         # self.dtype = dtype
         # padding head_dim to a multiple of 16 as k_block_size
@@ -160,8 +198,19 @@ class FlashAttentionForwardSm100:
         # If split_P_arrive, the softmax warps write some columns of P first, signal to the MMA warp
         # to being the P @ V MMA, then write the rest of P and signal again. This allows some overlap
         # between compute the last couple columns of P and the P @ V MMA.
-        self.split_P_arrive = n_block_size // 4 * 3
-        self.split_P_arrive = int(self.split_P_arrive / 32) * 32  # multiple of 32
+        #
+        # Dropout-path tuning: when dropout is on, the softmax tail is much
+        # heavier (philox + PRMT/CMP/SELP/FMUL), so the cost of the final P
+        # chunk grows. Sweeping showed split=64 (50%) yields ~4% speedup over
+        # split=96 (75%) for the dropout path because PV MMA can start sooner
+        # and hide more of the heavy tail; non-dropout paths stay at 75% which
+        # is best for their lighter tail.
+        if self.is_dropout:
+            self.split_P_arrive = n_block_size // 2
+            self.split_P_arrive = int(self.split_P_arrive / 32) * 32  # multiple of 32
+        else:
+            self.split_P_arrive = n_block_size // 4 * 3
+            self.split_P_arrive = int(self.split_P_arrive / 32) * 32  # multiple of 32
         assert self.split_P_arrive % 32 == 0
         assert self.split_P_arrive < self.n_block_size
         self.arch = BaseDSL._get_dsl().get_arch_enum()
@@ -399,6 +448,10 @@ class FlashAttentionForwardSm100:
         descale_tensors: Optional[DescaleTensors] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_data: AuxData = AuxData(),
+        rng_seed: Uint64 | int | None = None,
+        rng_offset: Uint64 | int | None = None,
+        mDropoutMask=None,
+        mask_row_stride=None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -420,6 +473,14 @@ class FlashAttentionForwardSm100:
         self.k_dtype = mK.element_type
         self.v_dtype = mV.element_type
         self.o_dtype = mO.element_type
+
+        if cutlass.const_expr(self.is_dropout):
+            if cutlass.const_expr(rng_seed is None or rng_offset is None):
+                raise RuntimeError("rng_seed and rng_offset are required when enable dropout")
+            p_dropout_8bit_packed = f32_to_dropout_threshold(self.p_dropout)
+        else:
+            p_dropout_8bit_packed = None
+
         mQ, mK, mV, mO = [assume_tensor_aligned(t) for t in (mQ, mK, mV, mO)]
         Q_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
         mQ = cute.make_tensor(mQ.iterator, cute.select(mQ.layout, mode=Q_layout_transpose))
@@ -782,6 +843,11 @@ class FlashAttentionForwardSm100:
             aux_data,
             fastdiv_mods,
             head_divmod,
+            Uint64(rng_seed) if cutlass.const_expr(self.is_dropout) else None,
+            Uint64(rng_offset) if cutlass.const_expr(self.is_dropout) else None,
+            p_dropout_8bit_packed,
+            mDropoutMask,
+            mask_row_stride,
         ).launch(
             grid=grid_dim,
             block=[self.threads_per_cta, 1, 1],
@@ -841,6 +907,11 @@ class FlashAttentionForwardSm100:
         aux_data: AuxData = AuxData(),
         fastdiv_mods=(None, None),
         head_divmod=None,
+        rng_seed: Uint64 | None = None,
+        rng_offset: Uint64 | None = None,
+        p_dropout_8bit_packed: Uint32 | None = None,
+        mDropoutMask=None,
+        mask_row_stride=None,
     ):
         """The device kernel implementation of the Fused Multi-Head Attention.
 
@@ -1275,6 +1346,12 @@ class FlashAttentionForwardSm100:
                 head_divmod=head_divmod,
                 blocksparse_tensors=blocksparse_tensors,
                 tile_scheduler=tile_scheduler,
+                rng_seed=rng_seed,
+                rng_offset=rng_offset,
+                p_dropout_8bit_packed=p_dropout_8bit_packed,
+                mDropoutMask=mDropoutMask,
+                mask_row_stride=mask_row_stride,
+                num_head_q=cute.size(mQ.shape[2]) if cutlass.const_expr(self.is_dropout) else None,
             )
 
             if const_expr(not self.s0_s1_barrier):
@@ -1894,6 +1971,12 @@ class FlashAttentionForwardSm100:
         head_divmod=None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         tile_scheduler=None,
+        rng_seed: Uint64 | None = None,
+        rng_offset: Uint64 | None = None,
+        p_dropout_8bit_packed: Uint32 | None = None,
+        mDropoutMask: Optional[cute.Tensor] = None,
+        mask_row_stride: Int32 | None = None,
+        num_head_q: Int32 | int | None = None,
     ):
         """Compute softmax on attention scores from QK matrix multiplication.
 
@@ -1915,6 +1998,18 @@ class FlashAttentionForwardSm100:
         aux_tensors = aux_data.tensors
 
         cta_qk_tiler = (self.mma_tiler_qk[0] // thr_mma_qk.thr_id.shape, self.mma_tiler_qk[1])
+        if const_expr(self.use_16x256b_dropout):
+            # The Ld 16x256b atom verifies the tmem memref's alignment in cols
+            # (2 cols = 8 bytes for f32), but ``make_fragment_C`` gives an
+            # iterator with align<1 byte>. Rebuild the iterator at the same
+            # offset (0) with an explicit 8-byte alignment hint via make_ptr.
+            aligned_iter = cute.make_ptr(
+                tStS.element_type,
+                0,
+                cute.AddressSpace.tmem,
+                assumed_align=8,
+            )
+            tStS = cute.make_tensor(aligned_iter, tStS.layout)
         tSAcc = tStS[(None, None), 0, 0, stage]  # (128, 128)
         tStScale = cute.composition(tSAcc, cute.make_layout((self.m_block_size, 1)))
         tScS = thr_mma_qk.partition_C(cute.make_identity_tensor(self.mma_tiler_qk[:2]))
@@ -1927,12 +2022,27 @@ class FlashAttentionForwardSm100:
         )
         tStP = cute.make_tensor(tSAcc.iterator + self.tmem_s_to_p_offset, tStP_layout)
 
-        tmem_load_op = (
-            tcgen05.copy.LdRed32x32bOp(tcgen05.copy.Repetition(32))
-            if const_expr(self.use_ldred_rowmax)
-            else tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32))
-        )
-        tmem_load_atom = cute.make_copy_atom(tmem_load_op, self.qk_acc_dtype)
+        # Load atom: ``.16x256b`` for dropout (RNG 100% util, 4-row-per-lane
+        # fragment), ``.32x32b`` otherwise (legacy single-row fragment).
+        if const_expr(self.use_16x256b_dropout):
+            # Use Rep matching the ST side (n_block_size/32 = 4 for n=128) so
+            # LD and ST fragments share the same cell flat ordering. With
+            # Rep=Repetition_full (=n_block_size/8) the LD layout collapses
+            # to atom_n=1 (am-last stride), but the ST side with Rep=4 has
+            # am-first stride (atom_n=4); mismatched ordering breaks the
+            # FP32->BF16 logical_divide(4) conversion. Aligning Rep keeps
+            # cell index i mapped to the same (row, col) on both sides.
+            tmem_load_atom = cute.make_copy_atom(
+                tcgen05.copy.Ld16x256bOp(tcgen05.copy.Repetition(self.n_block_size // 32)),
+                self.qk_acc_dtype,
+            )
+        else:
+            tmem_load_op = (
+                tcgen05.copy.LdRed32x32bOp(tcgen05.copy.Repetition(32))
+                if const_expr(self.use_ldred_rowmax)
+                else tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(32))
+            )
+            tmem_load_atom = cute.make_copy_atom(tmem_load_op, self.qk_acc_dtype)
         thr_tmem_load = tcgen05.make_tmem_copy(tmem_load_atom, tSAcc).get_slice(tidx)
         tStS_t2r = thr_tmem_load.partition_S(tSAcc)  # (((32,32),1),1,4)
 
@@ -1943,14 +2053,38 @@ class FlashAttentionForwardSm100:
             tidx
         )
         tStScale_r2t = thr_tmem_store_scale.partition_D(tStScale)
-        tmem_store_atom = cute.make_copy_atom(
-            tcgen05.copy.St32x32bOp(
-                tcgen05.copy.Repetition(8 if const_expr(self.q_dtype.width == 8) else 16)
-            ),
-            Float32,
-        )
-        thr_tmem_store = tcgen05.make_tmem_copy(tmem_store_atom, tStP).get_slice(tidx)
-        tStP_r2t = thr_tmem_store.partition_D(tStP)  # (((16,32),1),1,4)
+        # Store atom for P:
+        #   * ``.16x256b`` LD (FP32) + ``.16x128b`` ST (BF16): same 16-TMEM-lane
+        #     datapath, same per-thread layout (4 cells/thread per atom inv,
+        #     same row/col distribution). After FP32->BF16 in-register
+        #     conversion the per-thread BF16 cells live at the positions
+        #     ``.16x128b`` ST expects, so no warp shuffle is needed.
+        #   * Legacy path uses ``.32x32b`` ST FP32 (1 row per lane).
+        if const_expr(self.use_16x256b_dropout):
+            # Recast P TMEM tile to BF16 view. Use recast_tensor directly so
+            # the base address (tSAcc.iterator + tmem_s_to_p_offset) is
+            # preserved; previously we created a fresh 0-based pointer which
+            # caused .16x128b ST to write to the wrong TMEM region.
+            tStP_bf16 = cute.recast_tensor(tStP, self.q_dtype)
+            tmem_store_atom = cute.make_copy_atom(
+                tcgen05.copy.St16x128bOp(
+                    tcgen05.copy.Repetition(self.n_block_size // 32)
+                ),
+                self.q_dtype,
+            )
+            thr_tmem_store = tcgen05.make_tmem_copy(tmem_store_atom, tStP_bf16).get_slice(
+                tidx
+            )
+            tStP_r2t = thr_tmem_store.partition_D(tStP_bf16)
+        else:
+            tmem_store_atom = cute.make_copy_atom(
+                tcgen05.copy.St32x32bOp(
+                    tcgen05.copy.Repetition(8 if const_expr(self.q_dtype.width == 8) else 16)
+                ),
+                Float32,
+            )
+            thr_tmem_store = tcgen05.make_tmem_copy(tmem_store_atom, tStP).get_slice(tidx)
+            tStP_r2t = thr_tmem_store.partition_D(tStP)  # (((16,32),1),1,4)
 
         mma_si_consumer_phase = Int32(0)
         sm_stats_producer_phase = Int32(1)
@@ -1959,6 +2093,16 @@ class FlashAttentionForwardSm100:
         # self.warp_scheduler_barrier_init()
 
         warp_idx_in_wg = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
+
+        # In 2-CTA mode each CTA owns its own m_block_size row slab, so the
+        # per-CTA m_block offset needs to add mma_tile_coord_v (0 for CTA0, 1
+        # for CTA1). The mask / softmax_step paths that derive row indices
+        # from thr_mma.partition_C are already CTA-aware, but the dropout
+        # mask write in apply_dropout_rP{,_pair} computes the row manually
+        # from m_block * m_block_size, so we have to fold in the CTA offset
+        # here (otherwise both CTAs write the same rows and the rows owned
+        # by the second CTA are left zero).
+        mma_tile_coord_v_for_dropout = thr_mma_qk.thr_idx
 
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
@@ -2005,6 +2149,7 @@ class FlashAttentionForwardSm100:
                 mask_mod=mask_mod,
                 fastdiv_mods=fastdiv_mods,
                 head_divmod=head_divmod,
+                four_row_layout=self.use_16x256b_dropout,
                 **shared_mask_kwargs,
             )
             if const_expr(self.use_block_sparsity):
@@ -2014,6 +2159,7 @@ class FlashAttentionForwardSm100:
                     mask_mod=None,
                     fastdiv_mods=fastdiv_mods,
                     head_divmod=head_divmod,
+                    four_row_layout=self.use_16x256b_dropout,
                     **shared_mask_kwargs,
                 )
             else:
@@ -2038,6 +2184,10 @@ class FlashAttentionForwardSm100:
                 softmax_scale_log2_eff,
                 rescale_threshold=rescale_threshold,
                 softmax_scale=softmax_scale_eff,
+                is_dropout=self.is_dropout,
+                m_block_size=self.m_block_size,
+                n_block_size=self.n_block_size,
+                num_rows=4 if const_expr(self.use_16x256b_dropout) else 1,
                 max_offset=max_offset,
             )
             softmax.reset()
@@ -2059,6 +2209,14 @@ class FlashAttentionForwardSm100:
                 tile_block_count = n_block_max - n_block_min
                 has_work = const_expr(not self.is_split_kv) or tile_block_count > Int32(0)
 
+            cur_rng_offset = 0
+            if cutlass.const_expr(self.is_dropout):
+                if cutlass.const_expr(self.pack_gqa):
+                    num_q_heads = num_head_q * self.qhead_per_kvhead
+                    cur_rng_offset = rng_offset + (batch_idx * num_q_heads + head_idx * self.qhead_per_kvhead) * 32
+                else:
+                    cur_rng_offset = rng_offset + (batch_idx * num_head_q + head_idx) * 32
+
             softmax_step = partial(
                 self.softmax_step,
                 softmax=softmax,
@@ -2079,10 +2237,25 @@ class FlashAttentionForwardSm100:
                 batch_idx=batch_idx,
                 head_idx=head_idx,
                 m_block=(self.q_stage * m_block + stage) * self.cta_group_size,
+                # For the dropout mask write path we need a per-CTA m_block
+                # (each CTA owns its own m_block_size rows in 2-CTA mode).
+                # softmax_step keeps this separate from the global m_block
+                # so that apply_mask / apply_score_mod (which derive rows via
+                # thr_mma.partition_C) are not double-counting the offset.
+                m_block_dropout=(
+                    (self.q_stage * m_block + stage) * self.cta_group_size
+                    + mma_tile_coord_v_for_dropout
+                ),
                 seqlen=seqlen,
                 aux_data=aux_data,
                 fastdiv_mods=fastdiv_mods,
                 head_divmod=head_divmod,
+                rng_seed=rng_seed,
+                rng_offset=cur_rng_offset,
+                p_dropout_8bit_packed=p_dropout_8bit_packed,
+                rp_dropout=self.rp_dropout,
+                mDropoutMask=mDropoutMask,
+                mask_row_stride=mask_row_stride,
             )
 
             if const_expr(self.use_block_sparsity) or has_work:
@@ -2126,11 +2299,36 @@ class FlashAttentionForwardSm100:
                     self.q_subtile_factor,
                 )
                 if not empty_tile:
-                    sScale[tidx + stage * self.m_block_size] = softmax.row_sum[0]
-                    if const_expr(mLSE is not None or learnable_sink is not None):
-                        sScale[
-                            tidx + stage * self.m_block_size + self.q_stage * self.m_block_size
-                        ] = softmax.row_max[0]
+                    if const_expr(self.use_16x256b_dropout):
+                        # Cross-lane (width=4) sum-reduce on row_sum so the
+                        # value in sScale is the full row sum. row_max was
+                        # already quad-reduced inside update_row_max_pair.
+                        # The reduce must run on all 4 sub_lanes (butterfly
+                        # shfl), so we do it BEFORE the sub_lane==0 gate.
+                        for r_off in cutlass.range_constexpr(4):
+                            softmax.row_sum[r_off] = cute.arch.warp_reduction_sum(
+                                softmax.row_sum[r_off], threads_in_group=4
+                            )
+                        sub_lane_local = tidx & 0x3
+                        if sub_lane_local == 0:
+                            group_idx_local = (tidx & 0x1F) >> 2
+                            warp_idx_in_wg = tidx >> 5
+                            base_row = warp_idx_in_wg * 32 + group_idx_local
+                            for r_off in cutlass.range_constexpr(4):
+                                sScale[
+                                    base_row + r_off * 8 + stage * self.m_block_size
+                                ] = softmax.row_sum[r_off]
+                                if const_expr(mLSE is not None or learnable_sink is not None):
+                                    sScale[
+                                        base_row + r_off * 8 + stage * self.m_block_size
+                                        + self.q_stage * self.m_block_size
+                                    ] = softmax.row_max[r_off]
+                    else:
+                        sScale[tidx + stage * self.m_block_size] = softmax.row_sum[0]
+                        if const_expr(mLSE is not None or learnable_sink is not None):
+                            sScale[
+                                tidx + stage * self.m_block_size + self.q_stage * self.m_block_size
+                            ] = softmax.row_max[0]
                     # if tidx == 0:
                     #     cute.printf("softmax row sum stage %d: %f, row_max = %f\n", stage, softmax.row_sum[0], softmax.row_max[0])
                     # See block_sparse_utils.py NOTE [SM100 block-sparse empty tiles: mbarrier contract].
@@ -2197,11 +2395,34 @@ class FlashAttentionForwardSm100:
                             # Now that we no longer already have the 1st iteration, need mask_seqlen=True here
 
                     # Dense path always writes scale / signals
-                    sScale[tidx + stage * self.m_block_size] = softmax.row_sum[0]
-                    if const_expr(mLSE is not None or learnable_sink is not None):
-                        sScale[
-                            tidx + stage * self.m_block_size + self.q_stage * self.m_block_size
-                        ] = softmax.row_max[0]
+                    if const_expr(self.use_16x256b_dropout):
+                        # See block-sparse branch above for the rationale on
+                        # quad-reducing row_sum here (per-lane partials cover
+                        # 1/4 of each row's cols).
+                        for r_off in cutlass.range_constexpr(4):
+                            softmax.row_sum[r_off] = cute.arch.warp_reduction_sum(
+                                softmax.row_sum[r_off], threads_in_group=4
+                            )
+                        sub_lane_local = tidx & 0x3
+                        if sub_lane_local == 0:
+                            group_idx_local = (tidx & 0x1F) >> 2
+                            warp_idx_in_wg = tidx >> 5
+                            base_row = warp_idx_in_wg * 32 + group_idx_local
+                            for r_off in cutlass.range_constexpr(4):
+                                sScale[
+                                    base_row + r_off * 8 + stage * self.m_block_size
+                                ] = softmax.row_sum[r_off]
+                                if const_expr(mLSE is not None or learnable_sink is not None):
+                                    sScale[
+                                        base_row + r_off * 8 + stage * self.m_block_size
+                                        + self.q_stage * self.m_block_size
+                                    ] = softmax.row_max[r_off]
+                    else:
+                        sScale[tidx + stage * self.m_block_size] = softmax.row_sum[0]
+                        if const_expr(mLSE is not None or learnable_sink is not None):
+                            sScale[
+                                tidx + stage * self.m_block_size + self.q_stage * self.m_block_size
+                            ] = softmax.row_max[0]
                     # pipeline_sm_stats.producer_commit_w_index(stage)
                     sm_stats_barrier.arrive_w_index(index=stage * 4 + warp_idx)
 
@@ -2266,6 +2487,13 @@ class FlashAttentionForwardSm100:
         head_divmod=None,
         mask_fn: Optional[Callable] = None,
         is_first: bool = False,
+        rng_seed: Uint64 | None = None,
+        rng_offset: Uint64 | None = None,
+        p_dropout_8bit_packed: Uint32 | None = None,
+        rp_dropout: Float32 | None = None,
+        mDropoutMask=None,
+        mask_row_stride=None,
+        m_block_dropout: Int32 | None = None,
     ) -> Tuple[cute.Int32, cute.Int32, cute.Int32]:
         """Perform a single step of the softmax computation on a block of attention scores.
 
@@ -2324,6 +2552,142 @@ class FlashAttentionForwardSm100:
 
         if const_expr(mask_fn is not None):
             mask_fn(tSrS_t2r, n_block=n_block)
+
+        if const_expr(self.use_16x256b_dropout):
+            # ------- .16x256b path: 4 rows per lane -------
+            row_max_safe_pair, acc_scale_pair = softmax.update_row_max_pair(
+                tSrS_t2r, is_first
+            )
+
+            if const_expr(not is_first):
+                # Write 4 acc_scale entries per (warp, group_idx). All 4
+                # sub_lanes hold the same value post-reduction; only
+                # sub_lane==0 writes to sScale to avoid 4x redundant
+                # writes / smem bank pressure.
+                tidx_local = thr_tmem_load.thr_idx
+                sub_lane = tidx_local & 0x3
+                if sub_lane == 0:
+                    group_idx_local = (tidx_local & 0x1F) >> 2
+                    warp_idx_in_wg = tidx_local >> 5
+                    base_row = warp_idx_in_wg * 32 + group_idx_local
+                    sScale[base_row + 0 + stage * self.m_block_size] = acc_scale_pair[0]
+                    sScale[base_row + 8 + stage * self.m_block_size] = acc_scale_pair[1]
+                    sScale[base_row + 16 + stage * self.m_block_size] = acc_scale_pair[2]
+                    sScale[base_row + 24 + stage * self.m_block_size] = acc_scale_pair[3]
+            sm_stats_barrier.arrive_w_index(index=stage * 4 + warp_idx)
+
+            # When dropout is on, fold ``log2(rp)`` into the bias here so
+            # that exp2 emits ``softmax_j * rp`` directly downstream.
+            # apply_dropout_rP_pair then becomes pure SELP (no FMUL),
+            # saving ~128 FMUL per softmax_step per lane. row_sum is
+            # compensated by ``inv_rp`` in the exp2 step below so the
+            # final O / row_sum normalization remains FA2 bit-identical.
+            softmax.scale_subtract_rowmax_pair(
+                tSrS_t2r,
+                row_max_safe_pair,
+                log2_rp=const_expr(
+                    self.log2_rp_dropout if self.is_dropout else None
+                ),
+            )
+            if const_expr(self.s0_s1_barrier):
+                pipeline_s0_s1_sequence.sync_object_full.wait(stage, s0_s1_sequence_phase)
+
+            # Allocate BF16 register fragment matching the ``.16x128b`` ST
+            # atom's source partition. NOTE: tScP_shape is in FP32 cell
+            # space (128, 64); for the BF16 ST we must use the BF16 cell
+            # space (128, 128) so the partition sees the correct atom_n
+            # granularity. With FP32-space the partition would under-count
+            # cells when atom_n > 1.
+            tScP_bf16_shape = (tScP_shape[0], 2 * tScP_shape[1])
+            tSrP_st_src_layout = thr_tmem_store.partition_S(
+                cute.make_identity_tensor(tScP_bf16_shape)
+            )
+            tSrP_bf16 = cute.make_rmem_tensor(tSrP_st_src_layout.shape, self.q_dtype)
+
+            # With dropout on, ``apply_dropout_rP_pair`` rewrites acc_S in
+            # place and does its own FP32->BF16 conversion, so ``skip_convert``
+            # drops the redundant conversion here; ``inv_rp`` lets the row_sum
+            # FMA2 cancel the rp factor baked into exp2. The two
+            # ``FA4_DROP_E2E_*`` constants (see dropout.py) fix the per-g HW/SW
+            # exp2 schedule.
+            softmax.apply_exp2_convert_row_sum_pair(
+                tSrS_t2r,
+                tSrP_bf16,
+                row_scale=acc_scale_pair,
+                is_first=is_first,
+                skip_convert=const_expr(self.is_dropout),
+                inv_rp=const_expr(
+                    self.inv_rp_dropout if self.is_dropout else None
+                ),
+                ex2_emu_mask=const_expr(
+                    FA4_DROP_E2E_MASK if self.is_dropout else 0
+                ),
+                ex2_emu_poly_degree=const_expr(FA4_DROP_E2E_POLY_DEGREE),
+            )
+
+            if const_expr(self.is_dropout):
+                # Use the per-CTA m_block so each CTA writes its own rows in
+                # 2-CTA mode; m_block (without _dropout) is the shared
+                # tile-base used elsewhere (e.g. apply_mask / apply_score_mod
+                # via partition_C).
+                softmax.apply_dropout_rP_pair(
+                    tSrS_t2r,
+                    tSrP_bf16,
+                    m_block=(
+                        m_block_dropout
+                        if const_expr(m_block_dropout is not None)
+                        else m_block
+                    ),
+                    n_block=n_block,
+                    rng_seed=rng_seed,
+                    rng_offset=rng_offset,
+                    p_dropout_8bit_packed=p_dropout_8bit_packed,
+                    rp_dropout=rp_dropout,
+                    mDropoutMask=mDropoutMask,
+                    mask_row_stride=mask_row_stride,
+                    batch_idx=batch_idx,
+                    head_idx=head_idx,
+                    seqlen_q=seqlen.seqlen_q,
+                    qhead_per_kvhead=1,  # `.16x256b` path requires pack_gqa=False
+                )
+
+            if const_expr(self.s0_s1_barrier):
+                pipeline_s0_s1_sequence.sync_object_full.arrive(1 - stage, dst=None)
+
+            for n_idx in cutlass.range_constexpr(cute.size(tStP_r2t.shape[2])):
+                cute.copy(
+                    thr_tmem_store,
+                    tSrP_bf16[None, None, n_idx],
+                    tStP_r2t[None, None, n_idx],
+                )
+                if const_expr(self.split_P_arrive > 0):
+                    # Mirror the .32x32b path: once split_P_arrive cols of
+                    # P have been written, release pipeline_s_p_o so the
+                    # PV MMA can begin processing while the remaining P
+                    # columns are still being stored.
+                    split_P_arrive_idx: cutlass.Constexpr[int] = (
+                        cute.size(tStP_r2t.shape[2])
+                        * self.split_P_arrive
+                        // self.n_block_size
+                    )
+                    if const_expr(n_idx + 1 == split_P_arrive_idx):
+                        cute.arch.fence_view_async_tmem_store()
+                        pipeline_s_p_o.consumer_release_w_index(stage)
+            cute.arch.fence_view_async_tmem_store()
+            if const_expr(self.split_P_arrive > 0):
+                cute.arch.sync_warp()
+                with cute.arch.elect_one():
+                    pipeline_p_lastsplit.producer_commit_w_index(stage)
+            else:
+                pipeline_s_p_o.consumer_release_w_index(stage)
+            pipeline_sm_stats.producer_acquire_w_index_phase(stage, sm_stats_producer_phase)
+            return (
+                mma_si_consumer_phase ^ 1,
+                sm_stats_producer_phase ^ 1,
+                s0_s1_sequence_phase ^ 1,
+            )
+
+        # ------- legacy .32x32b path -------
         # Masked iterations reduce over post-mask values in software.
         if const_expr(self.use_ldred_rowmax and mask_fn is None):
             row_max, acc_scale = softmax.update_row_max_precomputed(hw_row_max, is_first)
@@ -2354,12 +2718,64 @@ class FlashAttentionForwardSm100:
             cute.recast_ptr(tSrP_r2t_f32.iterator, dtype=self.q_dtype), tSrS_t2r.layout
         )
         # softmax.scale_apply_exp2_convert(tSrS_t2r, row_max, tSrP_r2t)
-        softmax.apply_exp2_convert(
-            tSrS_t2r,
-            tSrP_r2t,
-            ex2_emu_freq=self.ex2_emu_freq,
-            ex2_emu_start_frg=self.ex2_emu_start_frg,
-        )
+        if cutlass.const_expr(self.is_dropout):
+            softmax.apply_exp2_convert_row_sum(
+                tSrS_t2r,
+                tSrP_r2t,
+                row_scale=acc_scale,
+                is_first=is_first,
+            )
+        else:
+            softmax.apply_exp2_convert(
+                tSrS_t2r,
+                tSrP_r2t,
+                ex2_emu_freq=self.ex2_emu_freq,
+                ex2_emu_start_frg=self.ex2_emu_start_frg,
+            )
+
+        if cutlass.const_expr(self.is_dropout):
+            # In 2-CTA mode each CTA owns its own m_block_size row slab.
+            # The .32x32b path computes the global row manually below from
+            # m_block * m_block_size, so we use the per-CTA m_block here.
+            m_block_for_dropout = (
+                m_block_dropout
+                if const_expr(m_block_dropout is not None)
+                else m_block
+            )
+            mask_row_ptr = None
+            mask_row_valid = True
+            if cutlass.const_expr(mDropoutMask is not None):
+                thread_idx = thr_tmem_load.thr_idx
+                row_in_seq = m_block_for_dropout * self.m_block_size + thread_idx
+                if cutlass.const_expr(self.pack_gqa):
+                    actual_seq = row_in_seq // self.qhead_per_kvhead
+                    qhead_within_group = row_in_seq - actual_seq * self.qhead_per_kvhead
+                    actual_head = head_idx * self.qhead_per_kvhead + qhead_within_group
+                    bh_offset = Int64((batch_idx * mDropoutMask.shape[1] + actual_head) * mDropoutMask.shape[2])
+                    mask_row_ptr = mDropoutMask.iterator + (bh_offset + Int64(actual_seq)) * Int64(mask_row_stride)
+                    mask_row_valid = actual_seq < seqlen.seqlen_q
+                else:
+                    bh_offset = Int64((batch_idx * mDropoutMask.shape[1] + head_idx) * mDropoutMask.shape[2])
+                    mask_row_ptr = mDropoutMask.iterator + (bh_offset + Int64(row_in_seq)) * Int64(mask_row_stride)
+                    mask_row_valid = row_in_seq < seqlen.seqlen_q
+            qhead_per_kvhead_arg = (
+                self.qhead_per_kvhead if cutlass.const_expr(self.pack_gqa) else 1
+            )
+            softmax.apply_dropout_rP(
+                tSrS_t2r,
+                tSrP_r2t,
+                m_block=m_block_for_dropout,
+                n_block=n_block,
+                rng_seed=rng_seed,
+                rng_offset=rng_offset,
+                p_dropout_8bit_packed=p_dropout_8bit_packed,
+                rp_dropout=rp_dropout,
+                mask_row_ptr=mask_row_ptr,
+                mask_row_stride=mask_row_stride,
+                mask_row_valid=mask_row_valid,
+                qhead_per_kvhead=qhead_per_kvhead_arg,
+            )
+
         # Sequence barrier arrive
         if const_expr(self.s0_s1_barrier):
             pipeline_s0_s1_sequence.sync_object_full.arrive(1 - stage, dst=None)
@@ -2382,7 +2798,8 @@ class FlashAttentionForwardSm100:
         else:
             pipeline_s_p_o.consumer_release_w_index(stage)
         pipeline_sm_stats.producer_acquire_w_index_phase(stage, sm_stats_producer_phase)
-        softmax.update_row_sum(tSrS_t2r.load(), acc_scale, is_first)
+        if cutlass.const_expr(not self.is_dropout):
+            softmax.update_row_sum(tSrS_t2r.load(), acc_scale, is_first)
         # acc_scale = cute.math.exp2(acc_scale_, fastmath=True)
         return mma_si_consumer_phase ^ 1, sm_stats_producer_phase ^ 1, s0_s1_sequence_phase ^ 1
 

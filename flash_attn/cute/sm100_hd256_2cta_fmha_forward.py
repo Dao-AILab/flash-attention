@@ -54,7 +54,11 @@ class BlackwellFusedMultiHeadAttentionForward:
         is_varlen_q: bool = False,
         use_2cta_instrs: bool = False,
         use_clc_scheduler: bool = False,
+        dropout_rate: float = 0.0,
     ):
+        assert not (dropout_rate > 0.0), (
+            "SM100 hd256 dedicated kernel does not support dropout. Use the generic SM100 kernel instead."
+        )
         head_dim_v = head_dim if head_dim_v is None else head_dim_v
         assert head_dim == 256 and head_dim_v == 256, (
             "SM100 dedicated kernel only supports (head_dim, head_dim_v) = (256, 256)"

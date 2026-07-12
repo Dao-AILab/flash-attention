@@ -7,12 +7,27 @@ from dataclasses import dataclass
 
 import cutlass
 import cutlass.cute as cute
-from cutlass import Float32, Boolean
+
+from cutlass import Float32, Int32, Boolean
 
 from quack import layout_utils
 import flash_attn.cute.utils as utils
 from quack.cute_dsl_utils import ParamsBase
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
+from flash_attn.cute.philox import (
+    philox_unpack_seed_offset,
+    philox_rounds,
+)
+from flash_attn.cute.dropout import (
+    apply_dropout_pair,
+    apply_dropout_quad_select_only,
+    gen_dropout_mask_f32,
+    store_dropout_mask_u8,
+    fa2_philox_row_index,
+)
+from cutlass.cute.typing import Int64, Uint32, Uint64
+
+
 from flash_attn.cute.utils import AuxData
 
 
@@ -243,6 +258,9 @@ class Softmax(ParamsBase):
 @dataclass
 class SoftmaxSm100(Softmax):
     rescale_threshold: cutlass.Constexpr[float] = 0.0
+    is_dropout: cutlass.Constexpr[bool] = False
+    m_block_size: cutlass.Constexpr[int] = 128
+    n_block_size: cutlass.Constexpr[int] = 128
     max_offset: cutlass.Constexpr[int] = 0
 
     @staticmethod
@@ -250,9 +268,12 @@ class SoftmaxSm100(Softmax):
         scale_log2: Float32,
         rescale_threshold: cutlass.Constexpr[float] = 0.0,
         softmax_scale: Float32 | None = None,
+        is_dropout: cutlass.Constexpr[bool] = False,
+        m_block_size: cutlass.Constexpr[int] = 128,
+        n_block_size: cutlass.Constexpr[int] = 128,
+        num_rows: cutlass.Constexpr[int] = 1,
         max_offset: cutlass.Constexpr[int] = 0,
     ):
-        num_rows = 1
         arch = 100
         row_max = cute.make_rmem_tensor(num_rows, Float32)
         row_sum = cute.make_rmem_tensor(num_rows, Float32)
@@ -264,6 +285,9 @@ class SoftmaxSm100(Softmax):
             arch,
             softmax_scale,
             rescale_threshold=rescale_threshold,
+            is_dropout=is_dropout,
+            m_block_size=m_block_size,
+            n_block_size=n_block_size,
             max_offset=max_offset,
         )
 
@@ -398,6 +422,560 @@ class SoftmaxSm100(Softmax):
                         )
             acc_S_row_converted_frg[None, j].store(
                 acc_S_row_frg[None, j].load().to(acc_S_row_converted.element_type)
+            )
+
+    @cute.jit
+    def apply_exp2_convert_row_sum(
+        self,
+        acc_S_row: cute.Tensor,
+        acc_S_row_converted: cute.Tensor,
+        e2e: cutlass.Constexpr[bool] = False,
+        e2e_freq: cutlass.Constexpr[int] = 16,
+        e2e_res: cutlass.Constexpr[int] = 4,
+        e2e_frg_limit: cutlass.Constexpr[int] = 1,
+        row_scale: Float32 = 1.0,
+        is_first: int = False,
+    ):
+        """exp2(acc_S_row) in-place + bf16 convert + per-row row_sum accumulation.
+
+        ``row_sum`` is accumulated only when ``self.is_dropout`` is True.
+        Mirrors the non-dropout path API but with the row_sum update folded
+        into the exp2 loop so the kernel does not need to call
+        ``update_row_sum`` again after dropout. With dropout enabled the
+        post-dropout values would not match raw softmax, so we must
+        accumulate the row_sum BEFORE applying the dropout mask.
+        """
+        assert cute.size(acc_S_row.shape) % 2 == 0, "acc_S_row must have an even number of elements"
+        frg_tile = 16
+        assert frg_tile % 2 == 0
+        frg_cnt = cute.size(acc_S_row) // frg_tile
+        assert cute.size(acc_S_row) % frg_tile == 0
+        acc_S_row_frg = cute.logical_divide(acc_S_row, cute.make_layout(frg_tile))
+        acc_S_row_converted_frg = cute.logical_divide(
+            acc_S_row_converted, cute.make_layout(frg_tile)
+        )
+
+        init_row_sum = self.row_sum[0] * row_scale if cutlass.const_expr(not is_first) else 0.0
+        for j in cutlass.range_constexpr(frg_cnt):
+            for k in cutlass.range_constexpr(0, frg_tile, 2):
+                if cutlass.const_expr(not e2e):
+                    acc_S_row_frg[k, j] = cute.math.exp2(acc_S_row_frg[k, j], fastmath=True)
+                    acc_S_row_frg[k + 1, j] = cute.math.exp2(acc_S_row_frg[k + 1, j], fastmath=True)
+                else:
+                    if cutlass.const_expr(
+                        k % e2e_freq < e2e_freq - e2e_res or j >= frg_cnt - e2e_frg_limit
+                    ):
+                        acc_S_row_frg[k, j] = cute.math.exp2(acc_S_row_frg[k, j], fastmath=True)
+                        acc_S_row_frg[k + 1, j] = cute.math.exp2(acc_S_row_frg[k + 1, j], fastmath=True)
+                    else:
+                        acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = utils.ex2_emulation_2(
+                            acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j]
+                        )
+                if cutlass.const_expr(self.is_dropout):
+                    init_row_sum += (acc_S_row_frg[k, j] + acc_S_row_frg[k + 1, j])
+            acc_S_row_converted_frg[None, j].store(
+                acc_S_row_frg[None, j].load().to(acc_S_row_converted.element_type)
+            )
+
+        if cutlass.const_expr(self.is_dropout):
+            self.row_sum[0] = init_row_sum
+
+    @cute.jit
+    def apply_dropout_rP(
+        self,
+        acc_S_row: cute.Tensor,
+        acc_S_row_converted: cute.Tensor,
+        m_block: Int32 = 0,
+        n_block: Int32 = 0,
+        rng_seed: Uint64 | None = None,
+        rng_offset: Uint64 | None = None,
+        p_dropout_8bit_packed: Uint32 | None = None,
+        rp_dropout: Float32 | None = None,
+        mask_row_ptr: cute.Pointer | None = None,
+        mask_row_stride: Int32 | None = None,
+        mask_row_valid: bool = True,
+        qhead_per_kvhead: cutlass.Constexpr[int] = 1,
+    ):
+        """Apply dropout mask and rp_dropout scaling on the converted P tensor.
+
+        Uses FA2-compatible Philox convention so that given the same RNG state,
+        FA4 and FA2 produce bit-identical dropout masks.
+        """
+        assert cute.size(acc_S_row.shape) % 2 == 0
+        total_cols = cute.size(acc_S_row)
+        acc_S_row_2 = cute.logical_divide(acc_S_row, cute.make_layout(2))
+        acc_S_row_converted_2 = cute.logical_divide(
+            acc_S_row_converted, cute.make_layout(2)
+        )
+
+        lane_idx_i32 = Int32(cute.arch.lane_idx())
+        packed_row = m_block * self.m_block_size + Int32(
+            cute.arch.warp_idx() % (self.m_block_size // 32)
+        ) * 32 + lane_idx_i32
+
+        if cutlass.const_expr(qhead_per_kvhead > 1):
+            actual_seq_row = packed_row // qhead_per_kvhead
+            q_head_offset = packed_row - actual_seq_row * qhead_per_kvhead
+            rng_offset_adjusted = rng_offset + Uint64(q_head_offset * 32)
+        else:
+            actual_seq_row = packed_row
+            rng_offset_adjusted = rng_offset
+
+        key_x, key_y, base_ctr_x, base_ctr_y = philox_unpack_seed_offset(rng_seed, rng_offset_adjusted)
+
+        fa2_row_arg, fa2_base_lane, fa2_byte_pair_offset = fa2_philox_row_index(
+            actual_seq_row
+        )
+
+        n_blk_size = total_cols
+        base_col = n_block * n_blk_size
+
+        # Precompute prmt.b32 byte-select masks once per row entry. Selectors
+        # are lane-uniform within an 8-lane group and constant across the
+        # sub_lane / col_arg_local / byte_group inner loops.
+        prmt_sel_lo = Uint32(0x4440) | fa2_byte_pair_offset
+        prmt_sel_hi = Uint32(0x4441) | fa2_byte_pair_offset
+
+        # Hoist the dropout-threshold byte extraction (low 8 bits only).
+        thresh_byte = Uint32(p_dropout_8bit_packed) & Uint32(0xFF)
+
+        for sub_lane in cutlass.range_constexpr(4):
+            ctr_x_lane = base_ctr_x + fa2_base_lane + Uint32(sub_lane)
+
+            for col_arg_local in cutlass.range_constexpr(total_cols // 32):
+                fa2_col_arg = Uint32(base_col // 32 + col_arg_local)
+                rng0, rng1, rng2, rng3 = philox_rounds(
+                    key_x, key_y, ctr_x_lane, base_ctr_y,
+                    fa2_row_arg,
+                    fa2_col_arg,
+                    use_lop3=True,
+                )
+                rng_words = (rng0, rng1, rng2, rng3)
+                for byte_group in cutlass.range_constexpr(4):
+                    rng_word = rng_words[byte_group]
+                    phys_col_0 = col_arg_local * 32 + byte_group * 8 + sub_lane * 2
+                    elem_idx = phys_col_0 // 2
+                    acc_S_row_2[0, elem_idx], acc_S_row_2[1, elem_idx] = apply_dropout_pair(
+                        acc_S_row_2[0, elem_idx], acc_S_row_2[1, elem_idx],
+                        rng_word, prmt_sel_lo, prmt_sel_hi,
+                        thresh_byte, rp_dropout,
+                    )
+                    if cutlass.const_expr(mask_row_ptr is not None):
+                        if mask_row_valid:
+                            byte_shift = fa2_byte_pair_offset * Uint32(8)
+                            mask_lo, mask_hi = gen_dropout_mask_f32(
+                                rng_word, byte_shift, p_dropout_8bit_packed
+                            )
+                            col = base_col + phys_col_0
+                            if cutlass.const_expr(mask_row_stride is not None):
+                                if col < mask_row_stride:
+                                    store_dropout_mask_u8(mask_row_ptr, col, mask_lo)
+                                if col + 1 < mask_row_stride:
+                                    store_dropout_mask_u8(mask_row_ptr, col + 1, mask_hi)
+                            else:
+                                store_dropout_mask_u8(mask_row_ptr, col, mask_lo)
+                                store_dropout_mask_u8(mask_row_ptr, col + 1, mask_hi)
+
+        for i in cutlass.range_constexpr(total_cols // 2):
+            acc_S_row_converted_2[None, i].store(
+                acc_S_row_2[None, i].load().to(acc_S_row_converted.element_type)
+            )
+
+    @cute.jit
+    def update_row_max_pair(
+        self,
+        acc_S: cute.Tensor,
+        is_first: int,
+    ) -> Tuple[cute.Tensor, cute.Tensor]:
+        """Update self.row_max[0..3] over the 4-row lane fragment (.16x256b path).
+
+        Mirrors the 1-row ``update_row_max`` API but per-row; returns
+        (row_max_safe[0..3], acc_scale[0..3]) tensors.
+
+        Fragment layout (Rep=4 split-P ST aligned, am-first stride):
+        outer (am=2, an=4) with strides (16, 32); inner (2, 2, 4) strides
+        (1, 2, 4). Flat cell index for (am=h, an, rep, i0, i1) is
+        ``h*16 + an*32 + rep*4 + i0 + 2*i1``. The cells at ``base + 0..3``
+        for ``base = h*16 + an*32 + rep*4`` are (top col c, top col c+1,
+        bot col c, bot col c+1).
+        """
+        total = cute.size(acc_S)
+        R_load: cutlass.Constexpr[int] = total // 8
+
+        row_max_local = cute.make_rmem_tensor(4, Float32)
+        for r in cutlass.range_constexpr(4):
+            if cutlass.const_expr(is_first):
+                row_max_local[r] = -Float32.inf
+            else:
+                row_max_local[r] = self.row_max[r]
+
+        for h in cutlass.range_constexpr(2):
+            top_slot: cutlass.Constexpr[int] = 2 * h
+            bot_slot: cutlass.Constexpr[int] = 2 * h + 1
+            for g in cutlass.range_constexpr(R_load):
+                an: cutlass.Constexpr[int] = g // 4
+                rep: cutlass.Constexpr[int] = g % 4
+                base = h * 16 + an * 32 + rep * 4
+                row_max_local[top_slot] = utils.fmax(
+                    row_max_local[top_slot],
+                    acc_S[base + 0],
+                    acc_S[base + 1],
+                )
+                row_max_local[bot_slot] = utils.fmax(
+                    row_max_local[bot_slot],
+                    acc_S[base + 2],
+                    acc_S[base + 3],
+                )
+
+        for r in cutlass.range_constexpr(4):
+            row_max_local[r] = cute.arch.warp_reduction_max(
+                row_max_local[r], threads_in_group=4
+            )
+
+        row_max_safe = cute.make_rmem_tensor(4, Float32)
+        acc_scale = cute.make_rmem_tensor(4, Float32)
+        for r in cutlass.range_constexpr(4):
+            if cutlass.const_expr(is_first):
+                row_max_safe[r] = (
+                    row_max_local[r] if row_max_local[r] != -Float32.inf else Float32(0.0)
+                )
+                acc_scale[r] = Float32(0.0)
+                self.row_max[r] = row_max_local[r]
+            else:
+                row_max_old = self.row_max[r]
+                row_max_safe[r] = (
+                    row_max_local[r] if row_max_local[r] != -Float32.inf else Float32(0.0)
+                )
+                scale_arg = (row_max_old - row_max_safe[r]) * self.scale_log2
+                acc_scale[r] = cute.math.exp2(scale_arg, fastmath=True)
+                if cutlass.const_expr(self.rescale_threshold > 0.0):
+                    if scale_arg >= -self.rescale_threshold:
+                        row_max_local[r] = row_max_old
+                        row_max_safe[r] = row_max_old
+                        acc_scale[r] = Float32(1.0)
+                self.row_max[r] = row_max_local[r]
+
+        return row_max_safe, acc_scale
+
+    @cute.jit
+    def scale_subtract_rowmax_pair(
+        self,
+        acc_S: cute.Tensor,
+        row_max_safe: cute.Tensor,
+        log2_rp: Float32 | None = None,
+    ):
+        """In-place fma: acc_S[i] = acc_S[i] * scale_log2 - row_max_safe[row(i)] * scale_log2.
+
+        Uses ``fma_packed_f32x2`` to fuse (col c, c+1) of the same row.
+
+        When ``log2_rp`` is given (dropout fastpath), it is folded into
+        the FMA bias as ``-row_max_safe*scale_log2 + log2_rp`` so the
+        subsequent ``exp2`` emits ``softmax_j * rp`` directly. This lets
+        ``apply_dropout_rP_pair`` skip the per-element ``* rp`` FMUL
+        (saves 128 FMUL per softmax_step per lane on the .16x256b path).
+        """
+        total = cute.size(acc_S)
+        R_load: cutlass.Constexpr[int] = total // 8
+
+        scale_log2 = self.scale_log2
+
+        neg_rms_x_scale = cute.make_rmem_tensor(4, Float32)
+        for r in cutlass.range_constexpr(4):
+            if cutlass.const_expr(log2_rp is not None):
+                neg_rms_x_scale[r] = -row_max_safe[r] * scale_log2 + log2_rp
+            else:
+                neg_rms_x_scale[r] = -row_max_safe[r] * scale_log2
+
+        for h in cutlass.range_constexpr(2):
+            top_slot: cutlass.Constexpr[int] = 2 * h
+            bot_slot: cutlass.Constexpr[int] = 2 * h + 1
+            top_nrm = neg_rms_x_scale[top_slot]
+            bot_nrm = neg_rms_x_scale[bot_slot]
+            for g in cutlass.range_constexpr(R_load):
+                an: cutlass.Constexpr[int] = g // 4
+                rep: cutlass.Constexpr[int] = g % 4
+                base = h * 16 + an * 32 + rep * 4
+                acc_S[base + 0], acc_S[base + 1] = cute.arch.fma_packed_f32x2(
+                    (acc_S[base + 0], acc_S[base + 1]),
+                    (scale_log2, scale_log2),
+                    (top_nrm, top_nrm),
+                )
+                acc_S[base + 2], acc_S[base + 3] = cute.arch.fma_packed_f32x2(
+                    (acc_S[base + 2], acc_S[base + 3]),
+                    (scale_log2, scale_log2),
+                    (bot_nrm, bot_nrm),
+                )
+
+    @cute.jit
+    def apply_exp2_convert_row_sum_pair(
+        self,
+        acc_S: cute.Tensor,
+        acc_S_converted: cute.Tensor,
+        row_scale: cute.Tensor,
+        is_first: int,
+        skip_convert: cutlass.Constexpr[bool] = False,
+        inv_rp: Float32 | None = None,
+        ex2_emu_mask: cutlass.Constexpr[int] = 0,
+        ex2_emu_poly_degree: cutlass.Constexpr[int] = 3,
+    ):
+        """exp2(acc_S) in-place + bf16 convert + per-row row_sum accumulation.
+
+        row_sum update only when ``self.is_dropout`` (matches the 1-row API
+        where non-dropout paths use a separate ``update_row_sum`` call).
+
+        When ``skip_convert`` is True the FP32->BF16 conversion is elided;
+        callers that immediately follow with ``apply_dropout_rP_pair``
+        (which overwrites acc_S then performs its own conversion) should
+        set this to avoid a redundant conversion pass.
+
+        When ``inv_rp`` is given (paired with ``log2_rp`` baked into the
+        preceding ``scale_subtract_rowmax_pair``), exp2 emits
+        ``softmax_j * rp`` instead of raw ``softmax_j``. The row_sum
+        accumulation then folds the ``inv_rp = 1 - p`` factor back in via
+        two ``fma_packed_f32x2`` ops so ``self.row_sum`` still tracks the
+        raw softmax sum used for the final O / row_sum normalization.
+
+        ``ex2_emu_mask`` (constexpr, 0..0xFF) is the per-g selector for
+        selective hardware/software exp2: bit ``g`` set => the ``g``-th
+        iteration of the pair loop uses the FMA-pipe software polynomial
+        path; bit cleared => the XU-pipe hardware ``MUFU.EX2``.
+        """
+        total = cute.size(acc_S)
+        R_load: cutlass.Constexpr[int] = total // 8
+
+        row_sum_local = cute.make_rmem_tensor(4, Float32)
+        if cutlass.const_expr(self.is_dropout):
+            for r in cutlass.range_constexpr(4):
+                if cutlass.const_expr(is_first):
+                    row_sum_local[r] = Float32(0.0)
+                else:
+                    row_sum_local[r] = self.row_sum[r] * row_scale[r]
+
+        for h in cutlass.range_constexpr(2):
+            top_slot: cutlass.Constexpr[int] = 2 * h
+            bot_slot: cutlass.Constexpr[int] = 2 * h + 1
+            for g in cutlass.range_constexpr(R_load):
+                an: cutlass.Constexpr[int] = g // 4
+                rep: cutlass.Constexpr[int] = g % 4
+                base = h * 16 + an * 32 + rep * 4
+                _g_sw: cutlass.Constexpr[bool] = (
+                    (ex2_emu_mask >> g) & 1
+                ) == 1
+                if cutlass.const_expr(_g_sw):
+                    e0, e1 = utils.ex2_emulation_2(
+                        acc_S[base + 0], acc_S[base + 1],
+                        poly_degree=ex2_emu_poly_degree,
+                    )
+                    e2, e3 = utils.ex2_emulation_2(
+                        acc_S[base + 2], acc_S[base + 3],
+                        poly_degree=ex2_emu_poly_degree,
+                    )
+                else:
+                    e0 = cute.math.exp2(acc_S[base + 0], fastmath=True)
+                    e1 = cute.math.exp2(acc_S[base + 1], fastmath=True)
+                    e2 = cute.math.exp2(acc_S[base + 2], fastmath=True)
+                    e3 = cute.math.exp2(acc_S[base + 3], fastmath=True)
+                acc_S[base + 0] = e0
+                acc_S[base + 1] = e1
+                acc_S[base + 2] = e2
+                acc_S[base + 3] = e3
+                if cutlass.const_expr(self.is_dropout):
+                    if cutlass.const_expr(inv_rp is not None):
+                        (
+                            row_sum_local[top_slot],
+                            row_sum_local[bot_slot],
+                        ) = cute.arch.fma_packed_f32x2(
+                            (e0, e2),
+                            (inv_rp, inv_rp),
+                            (row_sum_local[top_slot], row_sum_local[bot_slot]),
+                        )
+                        (
+                            row_sum_local[top_slot],
+                            row_sum_local[bot_slot],
+                        ) = cute.arch.fma_packed_f32x2(
+                            (e1, e3),
+                            (inv_rp, inv_rp),
+                            (row_sum_local[top_slot], row_sum_local[bot_slot]),
+                        )
+                    else:
+                        sum_top, sum_bot = cute.arch.add_packed_f32x2(
+                            (e0, e2), (e1, e3)
+                        )
+                        (
+                            row_sum_local[top_slot],
+                            row_sum_local[bot_slot],
+                        ) = cute.arch.add_packed_f32x2(
+                            (row_sum_local[top_slot], row_sum_local[bot_slot]),
+                            (sum_top, sum_bot),
+                        )
+
+        if cutlass.const_expr(not skip_convert):
+            assert cute.size(acc_S) % 4 == 0
+            acc_S_frg = cute.logical_divide(acc_S, cute.make_layout(4))
+            acc_S_converted_frg = cute.logical_divide(
+                acc_S_converted, cute.make_layout(4)
+            )
+            n_frg: cutlass.Constexpr[int] = cute.size(acc_S) // 4
+            for j in cutlass.range_constexpr(n_frg):
+                acc_S_converted_frg[None, j].store(
+                    acc_S_frg[None, j].load().to(acc_S_converted.element_type)
+                )
+
+        if cutlass.const_expr(self.is_dropout):
+            for r in cutlass.range_constexpr(4):
+                self.row_sum[r] = row_sum_local[r]
+
+    @cute.jit
+    def apply_dropout_rP_pair(
+        self,
+        acc_S: cute.Tensor,
+        acc_S_converted: cute.Tensor,
+        m_block: Int32 = 0,
+        n_block: Int32 = 0,
+        rng_seed: Uint64 | None = None,
+        rng_offset: Uint64 | None = None,
+        p_dropout_8bit_packed: Uint32 | None = None,
+        rp_dropout: Float32 | None = None,
+        mDropoutMask=None,
+        mask_row_stride: Int32 | None = None,
+        batch_idx: Int32 = 0,
+        head_idx: Int32 = 0,
+        seqlen_q: Int32 = 0,
+        qhead_per_kvhead: cutlass.Constexpr[int] = 1,
+    ):
+        """100%-util FA2 bit-identical dropout for the ``.16x256b`` 4-row lane fragment.
+
+        Per (row_pair h, col_arg_local) -> 1 Philox call; all 4 bytes of
+        each of the 4 rng words are used:
+          bytes 0, 1 -> top row R cols (c, c+1)
+          bytes 2, 3 -> bot row R+8 cols (c, c+1)
+        Bit-identical to FA2 because the (row_arg, col_arg, ctr_x_lane)
+        triple matches the FA2 convention.
+
+        Compared with ``.32x32b`` 1-row dropout, philox calls per lane
+        drop by 2x (no separate sub_lane loop) since the 4 lanes in a
+        row-pair group already have distinct ctr_x_lane via
+        lane_idx % 4 -> sub_lane.
+        """
+        total = cute.size(acc_S)
+        R_load: cutlass.Constexpr[int] = total // 8
+        n_blk_size: cutlass.Constexpr[int] = self.n_block_size
+        base_col = n_block * n_blk_size
+
+        lane_idx_i32 = Int32(cute.arch.lane_idx())
+        sub_lane = Uint32(lane_idx_i32) & Uint32(0x3)
+        group_idx = lane_idx_i32 >> 2  # 0..7
+        warp_idx_in_wg = Int32(cute.arch.warp_idx() % (self.m_block_size // 32))
+
+        # Same FA2 key decomposition as ``fa2_philox_row_index`` but hoisted
+        # for the row-pair layout: here ``group_idx == row % 8`` (the other
+        # row terms are multiples of 8), so ``base_lane == (row % 8) * 4`` and
+        # ``fa2_row_arg == top_row // 16`` (computed per row-pair below).
+        fa2_base_lane = Uint32(group_idx) * Uint32(4)
+
+        sel_top_lo = Uint32(0x4440)
+        sel_top_hi = Uint32(0x4441)
+        sel_bot_lo = Uint32(0x4442)
+        sel_bot_hi = Uint32(0x4443)
+
+        thresh_byte = Uint32(p_dropout_8bit_packed) & Uint32(0xFF)
+
+        # pack_gqa > 1 path is intentionally not supported here: a lane's
+        # 4 active rows in the .16x256b layout can straddle q-head buckets
+        # when qhead_per_kvhead < 32, which would break the 1-philox-per-
+        # row-pair sharing. The caller gates pack_gqa back to the .32x32b
+        # path.
+        n_col_arg_local: cutlass.Constexpr[int] = R_load // 4
+
+        key_x, key_y, base_ctr_x, base_ctr_y = philox_unpack_seed_offset(
+            rng_seed, rng_offset
+        )
+        ctr_x_lane = base_ctr_x + fa2_base_lane + sub_lane
+
+        for h in cutlass.range_constexpr(2):
+            top_row = (
+                m_block * self.m_block_size
+                + warp_idx_in_wg * 32
+                + h * 16
+                + group_idx
+            )
+            bot_row = top_row + 8
+
+            fa2_row_arg = Uint32(top_row // 16)
+
+            for col_arg_local in cutlass.range_constexpr(n_col_arg_local):
+                fa2_col_arg = Uint32(base_col // 32 + col_arg_local)
+
+                rng0, rng1, rng2, rng3 = philox_rounds(
+                    key_x,
+                    key_y,
+                    ctr_x_lane,
+                    base_ctr_y,
+                    fa2_row_arg,
+                    fa2_col_arg,
+                    use_lop3=True,
+                )
+                rng_words = (rng0, rng1, rng2, rng3)
+
+                for byte_group in cutlass.range_constexpr(4):
+                    rng_word = rng_words[byte_group]
+                    base = h * 16 + col_arg_local * 32 + byte_group * 4
+
+                    (
+                        acc_S[base + 0], acc_S[base + 1],
+                        acc_S[base + 2], acc_S[base + 3],
+                    ) = apply_dropout_quad_select_only(
+                        acc_S[base + 0], acc_S[base + 1],
+                        acc_S[base + 2], acc_S[base + 3],
+                        rng_word,
+                        sel_top_lo, sel_top_hi, sel_bot_lo, sel_bot_hi,
+                        thresh_byte,
+                    )
+
+                    if cutlass.const_expr(mDropoutMask is not None):
+                        phys_col_0 = (
+                            col_arg_local * 32 + byte_group * 8 + Int32(sub_lane) * 2
+                        )
+                        col = base_col + phys_col_0
+                        for which in cutlass.range_constexpr(2):
+                            row_for_mask = (
+                                top_row if cutlass.const_expr(which == 0) else bot_row
+                            )
+                            byte_shift = Uint32(which * 2 * 8)
+                            mask_lo, mask_hi = gen_dropout_mask_f32(
+                                rng_word, byte_shift, p_dropout_8bit_packed
+                            )
+                            mask_row_valid = row_for_mask < seqlen_q
+                            bh_off = Int64(
+                                (batch_idx * mDropoutMask.shape[1] + head_idx)
+                                * mDropoutMask.shape[2]
+                            )
+                            mask_row_ptr = mDropoutMask.iterator + (
+                                bh_off + Int64(row_for_mask)
+                            ) * Int64(mask_row_stride)
+                            if mask_row_valid:
+                                if cutlass.const_expr(mask_row_stride is not None):
+                                    if col < mask_row_stride:
+                                        store_dropout_mask_u8(mask_row_ptr, col, mask_lo)
+                                    if col + 1 < mask_row_stride:
+                                        store_dropout_mask_u8(
+                                            mask_row_ptr, col + 1, mask_hi
+                                        )
+                                else:
+                                    store_dropout_mask_u8(mask_row_ptr, col, mask_lo)
+                                    store_dropout_mask_u8(
+                                        mask_row_ptr, col + 1, mask_hi
+                                    )
+
+        assert cute.size(acc_S) % 4 == 0
+        acc_S_frg = cute.logical_divide(acc_S, cute.make_layout(4))
+        acc_S_converted_frg = cute.logical_divide(
+            acc_S_converted, cute.make_layout(4)
+        )
+        n_frg: cutlass.Constexpr[int] = cute.size(acc_S) // 4
+        for j in cutlass.range_constexpr(n_frg):
+            acc_S_converted_frg[None, j].store(
+                acc_S_frg[None, j].load().to(acc_S_converted.element_type)
             )
 
     @cute.jit
