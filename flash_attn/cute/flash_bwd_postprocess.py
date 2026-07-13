@@ -96,9 +96,7 @@ class FlashAttentionBackwardSink:
         partials = smem.allocate_tensor(cutlass.Float32, smem_layout, byte_alignment=16)
         tidx, _, _ = cute.arch.thread_idx()
         head_idx, _, _ = cute.arch.block_idx()
-        num_batch = (
-            mQ.shape[0] if const_expr(mCuSeqlensQ is None) else mCuSeqlensQ.shape[0] - 1
-        )
+        num_batch = mQ.shape[0] if const_expr(mCuSeqlensQ is None) else mCuSeqlensQ.shape[0] - 1
         sink_val = Float32(mLearnableSink[head_idx])
         sink_sum = Float32(0.0)
         LOG2_E = math.log2(math.e)
