@@ -187,9 +187,6 @@ class BlackwellFusedMultiHeadAttentionForward:
         assert mSeqUsedQ is None and mSeqUsedK is None, (
             "SM100 forward with head_dim=256 does not support seqused_q/seqused_k"
         )
-        assert learnable_sink is None, (
-            "SM100 forward with head_dim=256 does not support learnable_sink"
-        )
         assert blocksparse_tensors is None, (
             "SM100 forward with head_dim=256 does not support block sparsity"
         )
@@ -559,6 +556,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             cum_seqlen_q,
             cum_seqlen_k,
             lse,
+            learnable_sink,
             scale_softmax_log2,
             scale_softmax,
             scale_output,
@@ -596,6 +594,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         cum_seqlen_q: Optional[cute.Tensor],
         cum_seqlen_k: Optional[cute.Tensor],
         mLSE: Optional[cute.Tensor],
+        learnable_sink: Optional[cute.Tensor],
         scale_softmax_log2: Float32,
         scale_softmax: Float32,
         scale_output: Float32,
@@ -1412,6 +1411,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                     sum_producer = self.store_sum_max(
                         row_max,
                         mLSE,
+                        learnable_sink,
                         row_sum,
                         sSum,
                         sum_producer,
@@ -1877,6 +1877,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         self,
         row_max,
         mLSE,
+        learnable_sink,
         row_sum,
         sSum,
         sum_producer,
@@ -1888,6 +1889,16 @@ class BlackwellFusedMultiHeadAttentionForward:
     ):
         tidx, _, _ = cute.arch.thread_idx()
         thread_idx = tidx % (self.threads_per_warp * len(self.softmax_warp_ids))
+        if cutlass.const_expr(learnable_sink is not None):
+            sink_val = Float32(learnable_sink[current_block_coord[2][0]])
+            if row_max == -Float32.inf:
+                row_max = sink_val / scale_softmax
+                row_sum = Float32(1.0)
+            else:
+                row_sum += cute.math.exp2(
+                    (sink_val - scale_softmax * row_max) * math.log2(math.e),
+                    fastmath=True,
+                )
         sum_handle = sum_producer.acquire_and_advance()
         sSum[thread_idx] = row_sum
         cute.arch.fence_view_async_shared()

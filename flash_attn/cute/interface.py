@@ -43,7 +43,10 @@ from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
 from flash_attn.cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
 from flash_attn.cute.flash_bwd_sm100 import FlashAttentionBackwardSm100
 from flash_attn.cute.flash_bwd_sm120 import FlashAttentionBackwardSm120
-from flash_attn.cute.flash_bwd_postprocess import FlashAttentionBackwardPostprocess
+from flash_attn.cute.flash_bwd_postprocess import (
+    FlashAttentionBackwardPostprocess,
+    FlashAttentionBackwardSink,
+)
 from flash_attn.cute.flash_fwd_combine import FlashAttentionForwardCombine
 from flash_attn.cute.flash_fwd_mla_sm100 import FlashAttentionMLAForwardSm100
 from flash_attn.cute.flash_bwd_mla_sm100 import FlashAttentionSparseMLABackwardSm100
@@ -469,7 +472,9 @@ def _flash_attn_fwd(
         pack_gqa = qhead_per_kvhead > 1
 
     is_fp8 = v.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
-    requires_grad = any(t is not None and t.requires_grad for t in [q, k, v, qv])
+    requires_grad = any(
+        t is not None and t.requires_grad for t in [q, k, v, qv, learnable_sink]
+    )
     if is_fp8 and requires_grad:
         raise NotImplementedError("FA4 CuTe FP8 backward is not supported yet (forward-only).")
     out_torch_dtype = torch.bfloat16 if is_fp8 else q_dtype
@@ -897,8 +902,6 @@ def _flash_attn_fwd(
                     assert softcap is None, "SM100 forward with head_dim=256 does not support softcap"
                     assert not use_block_sparsity, \
                         "SM100 forward with head_dim=256 does not support block sparsity"
-                    assert learnable_sink is None, \
-                        "SM100 forward with head_dim=256 does not support learnable_sink"
                     assert seqused_q is None and seqused_k is None, \
                         "SM100 forward with head_dim=256 does not support seqused_q/seqused_k"
                     if page_table is not None:
@@ -1318,6 +1321,85 @@ def _bwd_postprocess_convert(
 _bwd_postprocess_convert.compile_cache = get_jit_cache("bwd_post")
 
 
+def _compile_bwd_sink(_arch, dtype, block_size, has_cuseqlens_q, has_seqused_q):
+    """Compile the standalone sink reduction used by direct-dQ kernels."""
+    (
+        mQ,
+        _mK,
+        _mV,
+        _mO,
+        _mdO,
+        _mdQ,
+        _mdK,
+        _mdV,
+        mLSE,
+        _mLSElog2,
+        mPdPsum,
+        _mdQaccum,
+        _mdKaccum,
+        _mdVaccum,
+        _mScaleP,
+    ) = make_fake_bwd_tensors(
+        dtype, has_gqa=True, varlen_q=has_cuseqlens_q, varlen_k=False
+    )
+    batch = mQ.shape[0] if not has_cuseqlens_q else cute.sym_int()
+    batchp1 = cute.sym_int()
+    mCuSeqlensQ = (
+        fake_tensor(Int32, (batchp1,), divisibility=1) if has_cuseqlens_q else None
+    )
+    mSeqUsedQ = (
+        fake_tensor(Int32, (batch,), divisibility=1) if has_seqused_q else None
+    )
+    mLearnableSink = fake_tensor(cutlass.BFloat16, (mQ.shape[-2],), divisibility=1)
+    mdSink = fake_tensor(cutlass.BFloat16, (mQ.shape[-2],), divisibility=1)
+    fa_bwd_sink = FlashAttentionBackwardSink(tile_m=block_size)
+    return cute.compile(
+        fa_bwd_sink,
+        mPdPsum,
+        mLSE,
+        mLearnableSink,
+        mdSink,
+        mQ,
+        mCuSeqlensQ,
+        mSeqUsedQ,
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--enable-tvm-ffi",
+    )
+
+
+def _bwd_sink_reduce(
+    sink_tensors,
+    q,
+    cu_seqlens_q,
+    seqused_q,
+    arch,
+    dtype,
+    block_size,
+):
+    compile_key = (
+        arch,
+        dtype,
+        block_size,
+        cu_seqlens_q is not None,
+        seqused_q is not None,
+    )
+    if compile_key not in _bwd_sink_reduce.compile_cache:
+        _bwd_sink_reduce.compile_cache[compile_key] = _compile_bwd_sink(*compile_key)
+    if not is_fake_mode():
+        _bwd_sink_reduce.compile_cache[compile_key](
+            sink_tensors.dpsum,
+            sink_tensors.lse,
+            sink_tensors.learnable_sink,
+            sink_tensors.dsink,
+            q,
+            cu_seqlens_q,
+            seqused_q,
+        )
+
+
+_bwd_sink_reduce.compile_cache = get_jit_cache("bwd_sink")
+
+
 def _flash_attn_bwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -1449,10 +1531,6 @@ def _flash_attn_bwd(
         use_2cta_instrs = cluster_size==2
 
     use_dedicated_hd256_kernel = arch // 10 in [10, 11] and head_dim == 256 and head_dim_v == 256
-    if use_dedicated_hd256_kernel:
-        assert learnable_sink is None, (
-            "SM100 backward with head_dim=256 does not support learnable_sink"
-        )
     use_2cta_instrs = use_2cta_instrs or use_dedicated_hd256_kernel
 
     q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, learnable_sink = [
@@ -2018,6 +2096,17 @@ def _flash_attn_bwd(
             if normalized_block_sparse_tensors is not None
             else None,
         )
+    if use_dedicated_hd256_kernel and learnable_sink_tensors is not None:
+        _bwd_sink_reduce(
+            learnable_sink_tensors,
+            q,
+            cu_seqlens_q,
+            seqused_q,
+            arch,
+            dtype,
+            m_block_size,
+        )
+
     # Postprocess: convert dq_accum from float32 to dq in bf16/fp16
     # hd=256 2CTA backward has its own internal postprocess, skip here.
     if not use_dedicated_hd256_kernel:

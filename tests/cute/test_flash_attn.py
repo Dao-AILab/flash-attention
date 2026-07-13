@@ -181,8 +181,6 @@ def test_flash_attn_output(
     # TODO(wangsiyu): SM100 head_dim=256 2CTA kernel currently does not support the following features.
     # Remove these skips when support is added.
     if d == 256 and IS_SM100:
-        if has_learnable_sink:
-            pytest.skip("SM100 head_dim=256 2CTA kernel does not support learnable_sink yet")
         if local:
             pytest.skip("SM100 head_dim=256 2CTA kernel does not support local attention yet")
         if softcap > 0.0:
@@ -675,8 +673,6 @@ def test_flash_attn_varlen_output(
     # TODO(wangsiyu): SM100 head_dim=256 2CTA kernel currently does not support the following features.
     # Remove these skips when support is added.
     if d == 256 and IS_SM100:
-        if has_learnable_sink:
-            pytest.skip("SM100 head_dim=256 2CTA kernel does not support learnable_sink yet")
         if local:
             pytest.skip("SM100 head_dim=256 2CTA kernel does not support local attention yet")
         if softcap > 0.0:
@@ -3134,3 +3130,59 @@ def test_flash_attn_varlen_sm100_learnable_sink_fwd_bwd():
     torch.testing.assert_close(dk, dk_ref, atol=2e-2, rtol=0)
     torch.testing.assert_close(dv, dv_ref, atol=2e-2, rtol=0)
     torch.testing.assert_close(dsink, dsink_ref, atol=2e-2, rtol=0)
+
+
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability()[0] not in (9, 10, 11),
+    reason="learnable sink backward is supported on SM90/SM100/SM110",
+)
+@pytest.mark.parametrize(
+    "dtype,d,frozen_qkv",
+    [
+        (torch.float16, 64, False),
+        (torch.bfloat16, 64, True),
+        pytest.param(
+            torch.bfloat16,
+            256,
+            False,
+            marks=pytest.mark.skipif(
+                torch.cuda.get_device_capability()[0] not in (10, 11),
+                reason="head_dim=256 uses the SM100/SM110 dedicated kernel",
+            ),
+        ),
+    ],
+)
+@retry_on_oom
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_learnable_sink_backward_regressions(dtype, d, frozen_qkv):
+    """Cover FP16 QKV, sink-only training, and the dedicated hd256 path."""
+    device = "cuda"
+    torch.manual_seed(0)
+    batch_size, seqlen_q, seqlen_k, nheads, nheads_kv = 2, 64, 96, 4, 2
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
+    k = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype)
+    v = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype)
+    if not frozen_qkv:
+        q, k, v = [x.requires_grad_() for x in (q, k, v)]
+    sink = torch.randn(nheads, device=device, dtype=torch.bfloat16, requires_grad=True)
+
+    out, _ = flash_attn_func(q, k, v, learnable_sink=sink, pack_gqa=False)
+
+    q_ref, k_ref, v_ref = [x.detach().float() for x in (q, k, v)]
+    if not frozen_qkv:
+        q_ref, k_ref, v_ref = [x.requires_grad_() for x in (q_ref, k_ref, v_ref)]
+    sink_ref = sink.detach().clone().requires_grad_()
+    out_ref, _ = attention_ref(q_ref, k_ref, v_ref, learnable_sink=sink_ref)
+
+    if is_fake_mode():
+        grad_inputs = (sink,) if frozen_qkv else (q, k, v, sink)
+        torch.autograd.grad(out, grad_inputs, torch.empty_like(out))
+        return
+
+    torch.testing.assert_close(out.float(), out_ref, atol=4e-3, rtol=4e-3)
+    dout = torch.randn_like(out)
+    grad_inputs = (sink,) if frozen_qkv else (q, k, v, sink)
+    ref_inputs = (sink_ref,) if frozen_qkv else (q_ref, k_ref, v_ref, sink_ref)
+    grads = torch.autograd.grad(out, grad_inputs, dout)
+    grads_ref = torch.autograd.grad(out_ref, ref_inputs, dout.float())
+    torch.testing.assert_close(grads[-1].float(), grads_ref[-1].float(), atol=3e-2, rtol=3e-2)
