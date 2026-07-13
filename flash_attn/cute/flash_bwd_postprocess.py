@@ -2,6 +2,7 @@
 # A reimplementation of https://github.com/Dao-AILab/flash-attention/blob/main/hopper/flash_bwd_postprocess_kernel.h
 # from Cutlass C++ to Cute-DSL.
 import math
+import operator
 from typing import Callable, Optional, Type
 
 import cuda.bindings.driver as cuda
@@ -215,6 +216,10 @@ class FlashAttentionBackwardPostprocess:
         scale: cutlass.Float32,
         mCuSeqlensQ: Optional[cute.Tensor],
         mSeqUsedQ: Optional[cute.Tensor],
+        mdPsum: Optional[cute.Tensor],
+        mLSE: Optional[cute.Tensor],
+        mLearnableSink: Optional[cute.Tensor],
+        mdSink: Optional[cute.Tensor],
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -224,6 +229,16 @@ class FlashAttentionBackwardPostprocess:
         if const_expr(mdQaccum is not None):
             if const_expr(mdQaccum.element_type not in [cutlass.Float32]):
                 raise TypeError("dQaccum tensor must be Float32")
+        if const_expr(mLearnableSink is not None):
+            assert mdPsum is not None and mLSE is not None and mdSink is not None
+            if const_expr(mLearnableSink.element_type not in [cutlass.BFloat16]):
+                raise TypeError("Learnable sink tensor must be BFloat16")
+            if const_expr(mdPsum.element_type not in [cutlass.Float32]):
+                raise TypeError("dPsum must be Float32")
+            if const_expr(mLSE.element_type not in [cutlass.Float32]):
+                raise TypeError("LSE must be Float32")
+            if const_expr(mdSink.element_type != mLearnableSink.element_type):
+                raise TypeError("dSink must have the learnable sink dtype")
 
         mdQaccum, mdQ = [assume_tensor_aligned(t) for t in (mdQaccum, mdQ)]
 
@@ -269,6 +284,10 @@ class FlashAttentionBackwardPostprocess:
             mdQ,
             mCuSeqlensQ,
             mSeqUsedQ,
+            mdPsum,
+            mLSE,
+            mLearnableSink,
+            mdSink,
             scale,
             self.tiled_mma,
             self.dQ_swapAB,
@@ -293,6 +312,10 @@ class FlashAttentionBackwardPostprocess:
         mdQ: cute.Tensor,
         mCuSeqlensQ: Optional[cute.Tensor],
         mSeqUsedQ: Optional[cute.Tensor],
+        mdPsum: Optional[cute.Tensor],
+        mLSE: Optional[cute.Tensor],
+        mLearnableSink: Optional[cute.Tensor],
+        mdSink: Optional[cute.Tensor],
         scale: cutlass.Float32,
         tiled_mma: cute.TiledMma,
         dQ_swapAB: cutlass.Constexpr,
@@ -327,6 +350,70 @@ class FlashAttentionBackwardPostprocess:
         work_tile = tile_scheduler.initial_work_tile_info()
 
         m_block, head_idx, batch_idx, _ = work_tile.tile_idx
+
+        # Reuse one existing dQ postprocess CTA per head to reduce dSink from
+        # the per-row dPsum and LSE written by backward preprocess. This avoids
+        # both a global atomic accumulator and a separate zero-initialization.
+        if const_expr(mLearnableSink is not None):
+            block_x, block_y, block_z = cute.arch.block_idx()
+            sink_head_idx = head_idx if const_expr(mCuSeqlensQ is None) else block_x
+            reduce_sink = (
+                m_block == 0 and batch_idx == 0
+                if const_expr(mCuSeqlensQ is None)
+                else block_x < mdSink.shape[0] and block_y == 0 and block_z == 0
+            )
+            if reduce_sink:
+                sink_sum = Float32(0.0)
+                num_batch = (
+                    mdQ.shape[0]
+                    if const_expr(mCuSeqlensQ is None)
+                    else mCuSeqlensQ.shape[0] - 1
+                )
+                sink_val = Float32(mLearnableSink[sink_head_idx])
+                LOG2_E = math.log2(math.e)
+                sink_batch = 0
+                while sink_batch < num_batch:
+                    sink_seqlen = SeqlenInfoQK.create(
+                        sink_batch,
+                        mdQ.shape[1],
+                        0,
+                        mCuSeqlensQ=mCuSeqlensQ,
+                        mSeqUsedQ=mSeqUsedQ,
+                        tile_m=self.tile_m * self.cluster_size,
+                    )
+                    sink_row = tidx
+                    while sink_row < sink_seqlen.seqlen_q:
+                        if const_expr(mCuSeqlensQ is None):
+                            dpsum_val = mdPsum[sink_batch, sink_head_idx, sink_row]
+                            lse_val = mLSE[sink_batch, sink_head_idx, sink_row]
+                        else:
+                            dpsum_val = mdPsum[
+                                sink_head_idx, sink_seqlen.padded_offset_q + sink_row
+                            ]
+                            lse_val = mLSE[
+                                sink_head_idx, sink_seqlen.offset_q + sink_row
+                            ]
+                        sink_prob = cute.math.exp2(
+                            sink_val * LOG2_E - Float32(lse_val) * LOG2_E,
+                            fastmath=True,
+                        )
+                        sink_sum += -sink_prob * Float32(dpsum_val)
+                        sink_row += self.num_threads
+                    sink_batch += 1
+
+                sink_sum = utils.warp_reduce(sink_sum, operator.add)
+                lane_idx = cute.arch.lane_idx()
+                warp_idx = tidx // cute.arch.WARP_SIZE
+                num_warps = self.num_threads // cute.arch.WARP_SIZE
+                if lane_idx == 0:
+                    sdQaccum_flat[warp_idx] = sink_sum
+                cute.arch.barrier(barrier_id=5, number_of_threads=self.num_threads)
+                if warp_idx == 0:
+                    sink_sum = sdQaccum_flat[lane_idx] if lane_idx < num_warps else Float32(0.0)
+                    sink_sum = utils.warp_reduce(sink_sum, operator.add)
+                    if lane_idx == 0:
+                        mdSink[sink_head_idx] = sink_sum.to(cutlass.BFloat16)
+                cute.arch.barrier(barrier_id=5, number_of_threads=self.num_threads)
 
         if work_tile.is_valid_tile:
             # ///////////////////////////////////////////////////////////////////////////////

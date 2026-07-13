@@ -1246,6 +1246,7 @@ def _compile_bwd_postprocess(
     dtype, hdim, block_size, num_threads, atom_layout, swap_ab,
     has_cuseqlens_q, has_seqused_q,
     use_2cta_instrs, cluster_size, arch,
+    has_learnable_sink,
 ):
     """Compile bwd postprocess kernel using cute fake tensors."""
     mQ, mK, mV, mO, mdO, mdQ, mdK, mdV, mLSE, mLSElog2, mPdPsum, mdQaccum, mdKaccum, mdVaccum, mScaleP = make_fake_bwd_tensors(
@@ -1255,6 +1256,8 @@ def _compile_bwd_postprocess(
     batchp1 = cute.sym_int()
     mCuSeqlensQ = fake_tensor(Int32, (batchp1,), divisibility=1) if has_cuseqlens_q else None
     mSeqUsedQ = fake_tensor(Int32, (batch,), divisibility=1) if has_seqused_q else None
+    mLearnableSink = fake_tensor(cutlass.BFloat16, (mQ.shape[-2],), divisibility=1) if has_learnable_sink else None
+    mdSink = fake_tensor(cutlass.BFloat16, (mQ.shape[-2],), divisibility=1) if has_learnable_sink else None
     fa_bwd_post = FlashAttentionBackwardPostprocess(
         dtype, hdim, arch, block_size, num_threads, atom_layout, swap_ab,
         use_2cta_instrs=use_2cta_instrs,
@@ -1262,6 +1265,9 @@ def _compile_bwd_postprocess(
     )
     return cute.compile(
         fa_bwd_post, mdQaccum, mdQ, Float32(0.0), mCuSeqlensQ, mSeqUsedQ,
+        mPdPsum if has_learnable_sink else None,
+        mLSE if has_learnable_sink else None,
+        mLearnableSink, mdSink,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--enable-tvm-ffi",
     )
@@ -1273,18 +1279,26 @@ def _bwd_postprocess_convert(
     arch, dtype, hdim, block_size, num_threads,
     atom_layout, swap_ab,
     use_2cta_instrs=False, cluster_size=1,
+    dpsum=None, lse=None, learnable_sink=None, dsink=None,
 ):
     """Backward postprocess: convert float32 accumulator to bf16/fp16 output."""
     compile_key = (
         dtype, hdim, block_size, num_threads, atom_layout, swap_ab,
         cu_seqlens is not None, seqused is not None,
         use_2cta_instrs, cluster_size, arch,
+        learnable_sink is not None,
     )
     if compile_key not in _bwd_postprocess_convert.compile_cache:
         _bwd_postprocess_convert.compile_cache[compile_key] = _compile_bwd_postprocess(*compile_key)
     if not is_fake_mode():
+        sink_args = (
+            (dpsum, lse, learnable_sink, dsink)
+            if learnable_sink is not None
+            else (None, None, None, None)
+        )
         _bwd_postprocess_convert.compile_cache[compile_key](
             accum, output, scale, cu_seqlens, seqused,
+            *sink_args,
         )
 
 
@@ -1333,10 +1347,13 @@ def _flash_attn_bwd(
     aux_scalars: Optional[tuple] = None,
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     dlse: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    learnable_sink: Optional[torch.Tensor] = None,
+) -> tuple:
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
     arch = _get_device_arch()
     assert arch // 10 in [9, 10, 11, 12], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x, 12.x"
+    if learnable_sink is not None:
+        assert arch // 10 in [9, 10, 11], "Learnable sink backward is supported on SM90 and SM100/SM110"
     sparse_q = None
     if block_sparse_tensors is not None and arch // 10 == 9:
         sparse_q = block_sparse_tensors.block_size[0] if block_sparse_tensors.block_size is not None else 128
@@ -1421,9 +1438,21 @@ def _flash_attn_bwd(
     use_dedicated_hd256_kernel = arch // 10 in [10, 11] and head_dim == 256 and head_dim_v == 256
     use_2cta_instrs = use_2cta_instrs or use_dedicated_hd256_kernel
 
-    q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = [
+    q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, learnable_sink = [
         maybe_contiguous(t)
-        for t in (q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
+        for t in (
+            q,
+            k,
+            v,
+            out,
+            dout,
+            lse,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            seqused_q,
+            seqused_k,
+            learnable_sink,
+        )
     ]
     if cu_seqlens_q is None:
         batch_size, seqlen_q = q.shape[:2]
@@ -1486,9 +1515,13 @@ def _flash_attn_bwd(
     assert lse.dtype == torch.float32, "lse must be float32"
     if dlse is not None:
         dlse = maybe_contiguous(dlse)
+    if learnable_sink is not None:
+        assert learnable_sink.shape == (num_head,)
+        assert learnable_sink.dtype == torch.bfloat16, "learnable_sink must be bfloat16"
     if not is_fake_mode():
         assert all(
-            t is None or t.is_cuda for t in (q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k)
+            t is None or t.is_cuda
+            for t in (q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k, learnable_sink)
         ), "inputs must be on CUDA device"
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
     alignment = 16 // q.element_size()
@@ -1622,6 +1655,8 @@ def _flash_attn_bwd(
     else:
         dK_semaphore = None
         dV_semaphore = None
+
+    dsink = torch.empty_like(learnable_sink) if learnable_sink is not None else None
 
     # Preprocess kernel: compute (o * dout).sum(dim=-1) - dLSE, lse * log2_e, and zero out dq_accum.
     # For hd=256 dedicated path, dq_accum is None so preprocess only fills dpsum/lse_log2.
@@ -1978,6 +2013,7 @@ def _flash_attn_bwd(
             arch, dtype, head_dim, m_block_size, num_threads_post_dQ,
             AtomLayoutMdQ, dQ_swapAB,
             use_2cta_instrs=use_2cta_instrs, cluster_size=1,
+            dpsum=dpsum, lse=lse, learnable_sink=learnable_sink, dsink=dsink,
         )
 
         if dKV_postprocess:
@@ -1998,7 +2034,9 @@ def _flash_attn_bwd(
                 cluster_size=cluster_size,
             )
 
-    return dq, dk, dv
+    # Preserve the private helper's existing three-result contract for callers
+    # that do not request a sink gradient.
+    return (dq, dk, dv) if learnable_sink is None else (dq, dk, dv, dsink)
 
 
 _flash_attn_bwd.compile_cache = get_jit_cache("bwd")
@@ -2475,7 +2513,7 @@ class FlashAttnFunc(torch.autograd.Function):
             return_lse=return_lse,
             gather_kv_indices=gather_kv_indices,
         )
-        ctx.save_for_backward(q, k, v, qv, out, lse, p, row_max, gather_kv_indices, *(aux_tensors or ()))
+        ctx.save_for_backward(q, k, v, qv, out, lse, p, row_max, gather_kv_indices, learnable_sink, *(aux_tensors or ()))
         ctx.shared_kv = shared_kv
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
@@ -2493,7 +2531,7 @@ class FlashAttnFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, dlse):
-        q, k, v, qv, out, lse, p, row_max, gather_kv_indices, *aux = ctx.saved_tensors
+        q, k, v, qv, out, lse, p, row_max, gather_kv_indices, learnable_sink, *aux = ctx.saved_tensors
         aux_tensors = aux if aux else None
         if not ctx.return_lse:
             dlse = None
@@ -2519,7 +2557,7 @@ class FlashAttnFunc(torch.autograd.Function):
             else:
                 return dq, dk, dv, dqv, *((None,) * 30)
         else:
-            dq, dk, dv = _flash_attn_bwd(
+            bwd_result = _flash_attn_bwd(
                 q,
                 k,
                 v,
@@ -2539,8 +2577,14 @@ class FlashAttnFunc(torch.autograd.Function):
                 aux_scalars=ctx.aux_scalars,
                 block_sparse_tensors=ctx.block_sparse_tensors_bwd,
                 dlse=dlse,
+                learnable_sink=learnable_sink,
             )
-            return dq, dk, dv, *((None,) * 30)  # Extra Nones is fine
+            if learnable_sink is None:
+                dq, dk, dv = bwd_result
+                dsink = None
+            else:
+                dq, dk, dv, dsink = bwd_result
+            return dq, dk, dv, None, None, None, None, None, dsink, *((None,) * 12)
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -2623,6 +2667,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             p,
             row_max,
             gather_kv_indices,
+            learnable_sink,
             cu_seqlens_q,
             cu_seqlens_k,
             seqused_q,
@@ -2648,7 +2693,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, dlse):
-        q, k, v, qv, out, lse, p, row_max, gather_kv_indices, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, *aux = ctx.saved_tensors
+        q, k, v, qv, out, lse, p, row_max, gather_kv_indices, learnable_sink, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, *aux = ctx.saved_tensors
         aux_tensors = aux if aux else None
         if not ctx.return_lse:
             dlse = None
@@ -2681,7 +2726,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             else:
                 return dq, dk, dv, dqv, *((None,) * 31)
         else:
-            dq, dk, dv = _flash_attn_bwd(
+            bwd_result = _flash_attn_bwd(
                 q,
                 k,
                 v,
@@ -2706,8 +2751,14 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 aux_scalars=ctx.aux_scalars,
                 mask_mod=ctx.mask_mod,
                 dlse=dlse,
+                learnable_sink=learnable_sink,
             )
-            return dq, dk, dv, *((None,) * 31)
+            if learnable_sink is None:
+                dq, dk, dv = bwd_result
+                dsink = None
+            else:
+                dq, dk, dv, dsink = bwd_result
+            return dq, dk, dv, None, *((None,) * 12), dsink, *((None,) * 11)
 
 
 def flash_attn_func(

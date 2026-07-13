@@ -96,6 +96,86 @@ def test_flash_attn_sm120_rejects_splitkv():
         flash_attn_func(q, k, v, num_splits=3)
 
 
+@pytest.mark.skipif(not IS_SM100, reason="SM100-specific learnable sink backward test")
+@retry_on_oom
+def test_flash_attn_sm100_learnable_sink_backward():
+    torch.random.manual_seed(0)
+    batch_size, seqlen_q, seqlen_k, nheads, d = 2, 64, 64, 4, 64
+    dtype = torch.bfloat16
+    device = "cuda"
+
+    q_base = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
+    k_base = torch.randn(batch_size, seqlen_k, nheads, d, device=device, dtype=dtype)
+    v_base = torch.randn(batch_size, seqlen_k, nheads, d, device=device, dtype=dtype)
+    sink_base = torch.randn(nheads, device=device, dtype=dtype)
+
+    q_ref, k_ref, v_ref = [x.detach().clone().requires_grad_() for x in (q_base, k_base, v_base)]
+    sink_ref = sink_base.detach().clone().requires_grad_()
+    q, k, v = [x.detach().clone().requires_grad_() for x in (q_base, k_base, v_base)]
+    sink = sink_base.detach().clone().requires_grad_()
+
+    out_ref, _ = attention_ref(q_ref, k_ref, v_ref, None, None, learnable_sink=sink_ref)
+    out, _ = flash_attn_func(q, k, v, learnable_sink=sink)
+
+    dout = torch.randn_like(out)
+    dq_ref, dk_ref, dv_ref, dsink_ref = torch.autograd.grad(
+        out_ref, (q_ref, k_ref, v_ref, sink_ref), dout
+    )
+    dq, dk, dv, dsink = torch.autograd.grad(out, (q, k, v, sink), dout)
+
+    torch.testing.assert_close(dq, dq_ref, atol=2e-2, rtol=0)
+    torch.testing.assert_close(dk, dk_ref, atol=2e-2, rtol=0)
+    torch.testing.assert_close(dv, dv_ref, atol=2e-2, rtol=0)
+    torch.testing.assert_close(dsink, dsink_ref, atol=2e-2, rtol=0)
+
+
+@pytest.mark.skipif(not IS_SM100, reason="SM100-specific learnable sink backward test")
+@retry_on_oom
+def test_flash_attn_varlen_sm100_learnable_sink_backward():
+    torch.random.manual_seed(0)
+    batch_size, seqlen, nheads, d = 2, 64, 4, 64
+    dtype = torch.bfloat16
+    device = "cuda"
+
+    q_ref = torch.randn(batch_size, seqlen, nheads, d, device=device, dtype=dtype).requires_grad_()
+    k_ref = torch.randn(batch_size, seqlen, nheads, d, device=device, dtype=dtype).requires_grad_()
+    v_ref = torch.randn(batch_size, seqlen, nheads, d, device=device, dtype=dtype).requires_grad_()
+    sink_ref = torch.randn(nheads, device=device, dtype=dtype).requires_grad_()
+
+    q = q_ref.detach().clone().reshape(batch_size * seqlen, nheads, d).requires_grad_()
+    k = k_ref.detach().clone().reshape(batch_size * seqlen, nheads, d).requires_grad_()
+    v = v_ref.detach().clone().reshape(batch_size * seqlen, nheads, d).requires_grad_()
+    sink = sink_ref.detach().clone().requires_grad_()
+    cu_seqlens = torch.arange(
+        0, (batch_size + 1) * seqlen, seqlen, device=device, dtype=torch.int32
+    )
+
+    out_ref, _ = attention_ref(q_ref, k_ref, v_ref, None, None, learnable_sink=sink_ref)
+    out_unpad, _ = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_k=cu_seqlens,
+        max_seqlen_q=seqlen,
+        max_seqlen_k=seqlen,
+        learnable_sink=sink,
+    )
+    out = out_unpad.reshape(batch_size, seqlen, nheads, d)
+
+    dout = torch.randn_like(out)
+    dq_ref, dk_ref, dv_ref, dsink_ref = torch.autograd.grad(
+        out_ref, (q_ref, k_ref, v_ref, sink_ref), dout
+    )
+    dq, dk, dv, dsink = torch.autograd.grad(out, (q, k, v, sink), dout)
+    dq, dk, dv = [x.reshape(batch_size, seqlen, nheads, d) for x in (dq, dk, dv)]
+
+    torch.testing.assert_close(dq, dq_ref, atol=2e-2, rtol=0)
+    torch.testing.assert_close(dk, dk_ref, atol=2e-2, rtol=0)
+    torch.testing.assert_close(dv, dv_ref, atol=2e-2, rtol=0)
+    torch.testing.assert_close(dsink, dsink_ref, atol=2e-2, rtol=0)
+
+
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
