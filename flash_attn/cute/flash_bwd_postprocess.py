@@ -365,9 +365,7 @@ class FlashAttentionBackwardPostprocess:
             if reduce_sink:
                 sink_sum = Float32(0.0)
                 num_batch = (
-                    mdQ.shape[0]
-                    if const_expr(mCuSeqlensQ is None)
-                    else mCuSeqlensQ.shape[0] - 1
+                    mdQ.shape[0] if const_expr(mCuSeqlensQ is None) else mCuSeqlensQ.shape[0] - 1
                 )
                 sink_val = Float32(mLearnableSink[sink_head_idx])
                 LOG2_E = math.log2(math.e)
@@ -390,9 +388,7 @@ class FlashAttentionBackwardPostprocess:
                             dpsum_val = mdPsum[
                                 sink_head_idx, sink_seqlen.padded_offset_q + sink_row
                             ]
-                            lse_val = mLSE[
-                                sink_head_idx, sink_seqlen.offset_q + sink_row
-                            ]
+                            lse_val = mLSE[sink_head_idx, sink_seqlen.offset_q + sink_row]
                         sink_prob = cute.math.exp2(
                             sink_val * LOG2_E - Float32(lse_val) * LOG2_E,
                             fastmath=True,
