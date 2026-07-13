@@ -96,86 +96,6 @@ def test_flash_attn_sm120_rejects_splitkv():
         flash_attn_func(q, k, v, num_splits=3)
 
 
-@pytest.mark.skipif(not IS_SM100, reason="SM100-specific learnable sink backward test")
-@retry_on_oom
-def test_flash_attn_sm100_learnable_sink_backward():
-    torch.random.manual_seed(0)
-    batch_size, seqlen_q, seqlen_k, nheads, d = 2, 64, 64, 4, 64
-    dtype = torch.bfloat16
-    device = "cuda"
-
-    q_base = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
-    k_base = torch.randn(batch_size, seqlen_k, nheads, d, device=device, dtype=dtype)
-    v_base = torch.randn(batch_size, seqlen_k, nheads, d, device=device, dtype=dtype)
-    sink_base = torch.randn(nheads, device=device, dtype=dtype)
-
-    q_ref, k_ref, v_ref = [x.detach().clone().requires_grad_() for x in (q_base, k_base, v_base)]
-    sink_ref = sink_base.detach().clone().requires_grad_()
-    q, k, v = [x.detach().clone().requires_grad_() for x in (q_base, k_base, v_base)]
-    sink = sink_base.detach().clone().requires_grad_()
-
-    out_ref, _ = attention_ref(q_ref, k_ref, v_ref, None, None, learnable_sink=sink_ref)
-    out, _ = flash_attn_func(q, k, v, learnable_sink=sink)
-
-    dout = torch.randn_like(out)
-    dq_ref, dk_ref, dv_ref, dsink_ref = torch.autograd.grad(
-        out_ref, (q_ref, k_ref, v_ref, sink_ref), dout
-    )
-    dq, dk, dv, dsink = torch.autograd.grad(out, (q, k, v, sink), dout)
-
-    torch.testing.assert_close(dq, dq_ref, atol=2e-2, rtol=0)
-    torch.testing.assert_close(dk, dk_ref, atol=2e-2, rtol=0)
-    torch.testing.assert_close(dv, dv_ref, atol=2e-2, rtol=0)
-    torch.testing.assert_close(dsink, dsink_ref, atol=2e-2, rtol=0)
-
-
-@pytest.mark.skipif(not IS_SM100, reason="SM100-specific learnable sink backward test")
-@retry_on_oom
-def test_flash_attn_varlen_sm100_learnable_sink_backward():
-    torch.random.manual_seed(0)
-    batch_size, seqlen, nheads, d = 2, 64, 4, 64
-    dtype = torch.bfloat16
-    device = "cuda"
-
-    q_ref = torch.randn(batch_size, seqlen, nheads, d, device=device, dtype=dtype).requires_grad_()
-    k_ref = torch.randn(batch_size, seqlen, nheads, d, device=device, dtype=dtype).requires_grad_()
-    v_ref = torch.randn(batch_size, seqlen, nheads, d, device=device, dtype=dtype).requires_grad_()
-    sink_ref = torch.randn(nheads, device=device, dtype=dtype).requires_grad_()
-
-    q = q_ref.detach().clone().reshape(batch_size * seqlen, nheads, d).requires_grad_()
-    k = k_ref.detach().clone().reshape(batch_size * seqlen, nheads, d).requires_grad_()
-    v = v_ref.detach().clone().reshape(batch_size * seqlen, nheads, d).requires_grad_()
-    sink = sink_ref.detach().clone().requires_grad_()
-    cu_seqlens = torch.arange(
-        0, (batch_size + 1) * seqlen, seqlen, device=device, dtype=torch.int32
-    )
-
-    out_ref, _ = attention_ref(q_ref, k_ref, v_ref, None, None, learnable_sink=sink_ref)
-    out_unpad, _ = flash_attn_varlen_func(
-        q,
-        k,
-        v,
-        cu_seqlens_q=cu_seqlens,
-        cu_seqlens_k=cu_seqlens,
-        max_seqlen_q=seqlen,
-        max_seqlen_k=seqlen,
-        learnable_sink=sink,
-    )
-    out = out_unpad.reshape(batch_size, seqlen, nheads, d)
-
-    dout = torch.randn_like(out)
-    dq_ref, dk_ref, dv_ref, dsink_ref = torch.autograd.grad(
-        out_ref, (q_ref, k_ref, v_ref, sink_ref), dout
-    )
-    dq, dk, dv, dsink = torch.autograd.grad(out, (q, k, v, sink), dout)
-    dq, dk, dv = [x.reshape(batch_size, seqlen, nheads, d) for x in (dq, dk, dv)]
-
-    torch.testing.assert_close(dq, dq_ref, atol=2e-2, rtol=0)
-    torch.testing.assert_close(dk, dk_ref, atol=2e-2, rtol=0)
-    torch.testing.assert_close(dv, dv_ref, atol=2e-2, rtol=0)
-    torch.testing.assert_close(dsink, dsink_ref, atol=2e-2, rtol=0)
-
-
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
@@ -339,9 +259,31 @@ def test_flash_attn_output(
         if local:
             print("window size = ", window_size)
         # window_size = (-1, -1) if not local else (16, 0)
+        test_learnable_sink_bwd = (
+            has_learnable_sink
+            and d == 64
+            and seqlen_q == 128
+            and seqlen_k == 128
+            and not causal
+            and not local
+            and softcap == 0.0
+            and not deterministic
+            and mha_type == "mha"
+        )
         if has_learnable_sink:
-            learnable_sink = torch.randn(nheads, dtype=torch.bfloat16, device=device)
+            learnable_sink_base = torch.randn(nheads, dtype=torch.bfloat16, device=device)
+            learnable_sink_ref = (
+                learnable_sink_base.detach()
+                .clone()
+                .requires_grad_(test_learnable_sink_bwd)
+            )
+            learnable_sink = (
+                learnable_sink_base.detach()
+                .clone()
+                .requires_grad_(test_learnable_sink_bwd)
+            )
         else:
+            learnable_sink_ref = None
             learnable_sink = None
         if dtype == torch.float8_e4m3fn:
             q_descale, k_descale, v_descale = [
@@ -366,7 +308,7 @@ def test_flash_attn_output(
             v_descale=v_descale,
             window_size=window_size,
             attention_chunk=attention_chunk,
-            learnable_sink=learnable_sink,
+            learnable_sink=learnable_sink_ref,
             softcap=softcap,
         )
         out_pt, attn_pt = attention_ref(
@@ -382,7 +324,7 @@ def test_flash_attn_output(
             v_descale=v_descale,
             window_size=window_size,
             attention_chunk=attention_chunk,
-            learnable_sink=learnable_sink,
+            learnable_sink=learnable_sink_ref,
             softcap=softcap,
             upcast=False,
             reorder_ops=True,
@@ -466,7 +408,7 @@ def test_flash_attn_output(
                 or (d == 192 and dv == 128)
                 or (IS_SM100 and d == 256 and dv == 256 and softcap == 0.0)
             )
-            and learnable_sink is None
+            and (learnable_sink is None or test_learnable_sink_bwd)
             # and False
             and not ((causal or local) and seqlen_k < seqlen_q)
         ):
@@ -476,7 +418,10 @@ def test_flash_attn_output(
                 pytest.xfail("SM90 GQA bwd currently requires headdim == headdim_v")
             g = torch.randn_like(out)
             # do_o = ((g.float() * out.float()).sum(-1)).transpose(1, 2)
-            dq, dk, dv = torch.autograd.grad(out, (q, k, v), g)
+            grad_tensors = (q, k, v, learnable_sink) if test_learnable_sink_bwd else (q, k, v)
+            grads = torch.autograd.grad(out, grad_tensors, g)
+            dq, dk, dv = grads[:3]
+            dsink = grads[3] if test_learnable_sink_bwd else None
             if is_fake_mode():
                 # no more flash_attn cutedsl calls for the rest of the loop
                 # skip data-dependent postprocessing
@@ -494,9 +439,14 @@ def test_flash_attn_output(
             # breakpoint()
 
             # dq, dk, dv = torch.autograd.grad(out, (q, k, v), g)
-            dq_ref, dk_ref, dv_ref = torch.autograd.grad(
-                out_ref, (q_ref, k_ref, v_ref), g
+            grad_tensors_ref = (
+                (q_ref, k_ref, v_ref, learnable_sink_ref)
+                if test_learnable_sink_bwd
+                else (q_ref, k_ref, v_ref)
             )
+            grads_ref = torch.autograd.grad(out_ref, grad_tensors_ref, g)
+            dq_ref, dk_ref, dv_ref = grads_ref[:3]
+            dsink_ref = grads_ref[3] if test_learnable_sink_bwd else None
             dq_pt, dk_pt, dv_pt = torch.autograd.grad(out_pt, (q_ref, k_ref, v_ref), g)
             print(f"dQ max diff: {(dq - dq_ref).abs().max().item()}")
             print(f"dK max diff: {(dk - dk_ref).abs().max().item()}")
@@ -549,6 +499,8 @@ def test_flash_attn_output(
             assert (dv - dv_ref).abs().max().item() <= rtol * (
                 dv_pt - dv_ref
             ).abs().max().item() + dv_atol
+            if test_learnable_sink_bwd:
+                torch.testing.assert_close(dsink, dsink_ref, atol=2e-2, rtol=0)
 
 
 # Regression test for #2591: SMEM overflow at small head_dims on SM100. The main
@@ -3128,3 +3080,57 @@ def test_flash_attn_ex2_emu_decode_prefill_consistency(seqlen_k):
     assert torch.equal(out_prefill[-1], out_decode[0]), (
         f"decode↔prefill diverged: max_diff={max_diff}."
     )
+
+
+@pytest.mark.skipif(not IS_SM100, reason="SM100-specific learnable sink test")
+@retry_on_oom
+def test_flash_attn_varlen_sm100_learnable_sink_fwd_bwd():
+    torch.random.manual_seed(0)
+    batch_size, seqlen, nheads, d = 2, 64, 4, 64
+    dtype = torch.bfloat16
+    device = "cuda"
+
+    q_base = torch.randn(batch_size, seqlen, nheads, d, device=device, dtype=dtype)
+    k_base = torch.randn(batch_size, seqlen, nheads, d, device=device, dtype=dtype)
+    v_base = torch.randn(batch_size, seqlen, nheads, d, device=device, dtype=dtype)
+    sink_base = torch.randn(nheads, device=device, dtype=dtype)
+
+    q_ref, k_ref, v_ref = [
+        x.detach().clone().requires_grad_() for x in (q_base, k_base, v_base)
+    ]
+    sink_ref = sink_base.detach().clone().requires_grad_()
+    q, k, v = [
+        x.detach().clone().reshape(batch_size * seqlen, nheads, d).requires_grad_()
+        for x in (q_base, k_base, v_base)
+    ]
+    sink = sink_base.detach().clone().requires_grad_()
+
+    out_ref, _ = attention_ref(q_ref, k_ref, v_ref, None, None, learnable_sink=sink_ref)
+    cu_seqlens = torch.arange(
+        0, (batch_size + 1) * seqlen, seqlen, device=device, dtype=torch.int32
+    )
+    out_unpad, _ = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_k=cu_seqlens,
+        max_seqlen_q=seqlen,
+        max_seqlen_k=seqlen,
+        learnable_sink=sink,
+    )
+    out = out_unpad.reshape(batch_size, seqlen, nheads, d)
+
+    torch.testing.assert_close(out, out_ref, atol=2e-2, rtol=0)
+
+    dout = torch.randn_like(out)
+    dq_ref, dk_ref, dv_ref, dsink_ref = torch.autograd.grad(
+        out_ref, (q_ref, k_ref, v_ref, sink_ref), dout
+    )
+    dq, dk, dv, dsink = torch.autograd.grad(out, (q, k, v, sink), dout)
+    dq, dk, dv = [x.reshape(batch_size, seqlen, nheads, d) for x in (dq, dk, dv)]
+
+    torch.testing.assert_close(dq, dq_ref, atol=2e-2, rtol=0)
+    torch.testing.assert_close(dk, dk_ref, atol=2e-2, rtol=0)
+    torch.testing.assert_close(dv, dv_ref, atol=2e-2, rtol=0)
+    torch.testing.assert_close(dsink, dsink_ref, atol=2e-2, rtol=0)
