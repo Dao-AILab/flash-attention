@@ -182,6 +182,14 @@ class BwdConfig:
     dQ_single_wg: bool = False
 
 
+@dataclass(frozen=True)
+class BwdLearnableSinkTensors:
+    dpsum: torch.Tensor
+    lse: torch.Tensor
+    learnable_sink: torch.Tensor
+    dsink: torch.Tensor
+
+
 def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q=None):
     """Return BwdConfig for SM90.
 
@@ -1695,7 +1703,7 @@ def _bwd_postprocess_convert(
     atom_layout, swap_ab,
     use_2cta_instrs=False, cluster_size=1,
     cu_total_m_blocks=None,
-    dpsum=None, lse=None, learnable_sink=None, dsink=None,
+    learnable_sink_tensors: Optional[BwdLearnableSinkTensors] = None,
 ):
     """Backward postprocess: convert float32 accumulator to bf16/fp16 output."""
     is_varlen = cu_seqlens is not None or seqused is not None
@@ -1714,14 +1722,19 @@ def _bwd_postprocess_convert(
         cu_seqlens is not None, seqused is not None,
         use_2cta_instrs, cluster_size, arch,
         cu_total_m_blocks is not None,
-        learnable_sink is not None,
+        learnable_sink_tensors is not None,
     )
     if compile_key not in _bwd_postprocess_convert.compile_cache:
         _bwd_postprocess_convert.compile_cache[compile_key] = _compile_bwd_postprocess(*compile_key)
     if not is_fake_mode():
         sink_args = (
-            (dpsum, lse, learnable_sink, dsink)
-            if learnable_sink is not None
+            (
+                learnable_sink_tensors.dpsum,
+                learnable_sink_tensors.lse,
+                learnable_sink_tensors.learnable_sink,
+                learnable_sink_tensors.dsink,
+            )
+            if learnable_sink_tensors is not None
             else (None, None, None, None)
         )
         _bwd_postprocess_convert.compile_cache[compile_key](
@@ -1883,6 +1896,10 @@ def _flash_attn_bwd(
         cluster_size = 2 if use_2cta_instrs else 1
 
     use_dedicated_hd256_kernel = arch // 10 in [10, 11] and head_dim == 256 and head_dim_v == 256
+    if use_dedicated_hd256_kernel:
+        assert learnable_sink is None, (
+            "SM100 backward with head_dim=256 does not support learnable_sink"
+        )
     use_2cta_instrs = use_2cta_instrs or use_dedicated_hd256_kernel
     is_varlen = (
         cu_seqlens_q is not None
@@ -2139,6 +2156,11 @@ def _flash_attn_bwd(
         )
 
     dsink = torch.empty_like(learnable_sink) if learnable_sink is not None else None
+    learnable_sink_tensors = (
+        BwdLearnableSinkTensors(dpsum, lse, learnable_sink, dsink)
+        if learnable_sink is not None
+        else None
+    )
 
     # Preprocess kernel: compute (o * dout).sum(dim=-1) - dLSE, lse * log2_e, and zero out dq_accum.
     # For hd=256 dedicated path, dq_accum is None so preprocess only fills dpsum/lse_log2.
@@ -2517,7 +2539,7 @@ def _flash_attn_bwd(
             AtomLayoutMdQ, dQ_swapAB,
             use_2cta_instrs=use_2cta_instrs, cluster_size=1,
             cu_total_m_blocks=cu_total_m_blocks_q,
-            dpsum=dpsum, lse=lse, learnable_sink=learnable_sink, dsink=dsink,
+            learnable_sink_tensors=learnable_sink_tensors,
         )
 
         if dKV_postprocess:
@@ -2540,8 +2562,6 @@ def _flash_attn_bwd(
                 cu_total_m_blocks=cu_total_m_blocks_k if cluster_size == 1 else None,
             )
 
-    # Preserve the private helper's existing three-result contract for callers
-    # that do not request a sink gradient.
     return (dq, dk, dv) if learnable_sink is None else (dq, dk, dv, dsink)
 
 
