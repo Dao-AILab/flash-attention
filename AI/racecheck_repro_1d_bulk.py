@@ -22,7 +22,7 @@ N_STG = 2
 
 @cute.kernel
 def kernel(g_src: cute.Tensor, g_dst: cute.Tensor):
-    smem = cutlass.utils.SmemAllocator()
+    smem = cutlass.memory.SmemAllocator()
     s = smem.allocate_tensor(Float32, cute.make_layout((TILE, N_STG)), byte_alignment=128)
     s_mbar = smem.allocate_tensor(cutlass.Int64, cute.make_layout(2 * N_STG), byte_alignment=8)
     tidx, _, _ = cute.arch.thread_idx()
