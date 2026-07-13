@@ -10,7 +10,7 @@ import cutlass.utils.hopper_helpers as sm90_utils_basic
 from cutlass.cute.nvgpu import cpasync, warpgroup
 from cutlass.cute import FastDivmodDivisor
 from cutlass import Float32, Int32, Boolean, const_expr
-from cutlass.utils import LayoutEnum
+from cutlass.tensor_utils import LayoutEnum
 
 from quack import copy_utils
 from quack import layout_utils
@@ -682,7 +682,7 @@ class FlashAttentionBackwardSm90:
                 if const_expr(atom is not None):
                     cpasync.prefetch_descriptor(atom)
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(SharedStorage)
 
         pipeline_producer_group = cutlass.pipeline.CooperativeGroup(cutlass.pipeline.Agent.Thread)
