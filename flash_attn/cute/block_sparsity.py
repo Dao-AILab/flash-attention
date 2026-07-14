@@ -195,6 +195,32 @@ def get_sparse_q_block_size(
     return min_block_size
 
 
+def get_kv_subtile_factor(
+    block_sparse_tensors: BlockSparseTensorsTorch | None,
+    n_block_size: int,
+) -> int:
+    """Return the number of physical KV tiles covered by one sparse KV block."""
+    if block_sparse_tensors is None or block_sparse_tensors.block_size is None:
+        return 1
+    sparse_block_size_kv = block_sparse_tensors.block_size[1]
+    if sparse_block_size_kv % n_block_size != 0:
+        raise ValueError(
+            "Block sparsity expects sparse_block_size[1] "
+            f"to be a multiple of tile_n={n_block_size}; got {sparse_block_size_kv}."
+        )
+    return sparse_block_size_kv // n_block_size
+
+
+def block_sparse_bwd_supports_2cta(
+    block_sparse_tensors: BlockSparseTensorsTorch | None,
+    n_block_size: int,
+) -> bool:
+    """Return whether sparse KV metadata constrains backward away from 2CTA."""
+    if block_sparse_tensors is None:
+        return True
+    return get_kv_subtile_factor(block_sparse_tensors, n_block_size) % 2 == 0
+
+
 def _expand_sparsity_tensor(
     tensor: torch.Tensor,
     expected_shape: Tuple[int, ...],
@@ -310,7 +336,7 @@ def infer_block_sparse_expected_shapes(
     Expectations:
     - mask_block_cnt is (B, H, M) and mask_block_idx is (B, H, M, N).
     - Batch/head dims may be 1 for broadcast, or match the requested sizes.
-    - sparse_block_size_kv must match tile_n.
+    - sparse_block_size_kv must be a multiple of tile_n.
     - sparse_block_size_q must be a multiple of q_stage * tile_m.
     - If sparse_block_size_q is omitted and seqlen_q/num_m_blocks is ambiguous,
       the caller must provide block_size to disambiguate. TODO will make this required in a future PR.
@@ -319,8 +345,10 @@ def infer_block_sparse_expected_shapes(
     base_n_block = n_block_size
     if sparse_block_size_kv is None:
         sparse_block_size_kv = base_n_block
-    if sparse_block_size_kv != base_n_block:
-        raise ValueError(f"Block sparse tensors{context} require BLOCK_SIZE_KV={base_n_block}.")
+    if sparse_block_size_kv % base_n_block != 0:
+        raise ValueError(
+            f"Block sparse tensors{context} require BLOCK_SIZE_KV to be a multiple of {base_n_block}."
+        )
     if tensors.mask_block_idx is None:
         raise ValueError("mask_block_cnt and mask_block_idx must be provided for block sparsity.")
     num_m_blocks = tensors.mask_block_idx.shape[2]
@@ -392,6 +420,7 @@ def get_block_sparse_expected_shapes_bwd(
     m_block_size: int,
     n_block_size: int,
     q_subtile_factor: int,
+    kv_subtile_factor: int = 1,
 ) -> Tuple[Tuple[int, int, int], Tuple[int, int, int, int]]:
     """Return (expected_count_shape, expected_index_shape) for backward block sparse normalization.
 
@@ -400,8 +429,9 @@ def get_block_sparse_expected_shapes_bwd(
     by q_subtile_factor * m_block_size.
     """
     sparse_block_size_q = q_subtile_factor * m_block_size
+    sparse_block_size_kv = kv_subtile_factor * n_block_size
     expected_m_blocks = ceildiv(seqlen_q, sparse_block_size_q)
-    expected_n_blocks = ceildiv(seqlen_k, n_block_size)
+    expected_n_blocks = ceildiv(seqlen_k, sparse_block_size_kv)
     expected_count_shape = (batch_size, num_head, expected_n_blocks)
     expected_index_shape = (batch_size, num_head, expected_n_blocks, expected_m_blocks)
     return expected_count_shape, expected_index_shape
@@ -516,6 +546,15 @@ def get_block_sparse_broadcast_pattern(
     return tuple(patterns)
 
 
+class NormalizedBlockSparseConfig(NamedTuple):
+    """Result of validating and normalizing a user block-sparse config."""
+
+    tensors: BlockSparseTensorsTorch
+    broadcast_pattern: Tuple[Tuple[bool, ...], ...] | None
+    q_subtile_factor: int
+    kv_subtile_factor: int
+
+
 def normalize_block_sparse_config(
     tensors: BlockSparseTensorsTorch,
     *,
@@ -525,7 +564,8 @@ def normalize_block_sparse_config(
     seqlen_k: int,
     block_size: tuple[int, int],
     q_stage: int,
-) -> tuple[BlockSparseTensorsTorch, Tuple[Tuple[bool, ...], ...] | None, int]:
+    allow_kv_subtile: bool = False,
+) -> NormalizedBlockSparseConfig:
     """Validate the block-sparse config, infer expected shapes, and normalize.
 
     Handles both fixed-length (3D `[B, H, M]` / 4D `[B, H, M, N]`) and varlen
@@ -538,7 +578,12 @@ def normalize_block_sparse_config(
         sparse_block_size_q, sparse_block_size_kv = None, n_block_size
     else:
         sparse_block_size_q, sparse_block_size_kv = tensors.block_size
-    if sparse_block_size_kv != n_block_size:
+    if sparse_block_size_kv % n_block_size != 0:
+        raise ValueError(
+            f"Block sparsity requires sparse_block_size[1] to be a multiple of tile_n={n_block_size}."
+        )
+    kv_subtile_factor = sparse_block_size_kv // n_block_size
+    if kv_subtile_factor != 1 and not allow_kv_subtile:
         raise ValueError(
             f"Block sparsity requires sparse_block_size[1]={n_block_size} to match tile_n."
         )
@@ -575,10 +620,11 @@ def normalize_block_sparse_config(
         expected_count_shape=expected_count_shape,
         expected_index_shape=expected_index_shape,
     )
-    return (
-        normalized_tensors,
-        get_block_sparse_broadcast_pattern(normalized_tensors),
-        q_subtile_factor,
+    return NormalizedBlockSparseConfig(
+        tensors=normalized_tensors,
+        broadcast_pattern=get_block_sparse_broadcast_pattern(normalized_tensors),
+        q_subtile_factor=q_subtile_factor,
+        kv_subtile_factor=kv_subtile_factor,
     )
 
 
@@ -591,6 +637,7 @@ def normalize_block_sparse_config_bwd(
     seqlen_k: int,
     block_size: tuple[int, int],
     q_subtile_factor: int,
+    kv_subtile_factor: int = 1,
 ) -> tuple[BlockSparseTensorsTorch, Tuple[Tuple[bool, ...], ...] | None]:
     m_block_size, n_block_size = block_size
     if tensors.block_size is None:
@@ -602,9 +649,11 @@ def normalize_block_sparse_config_bwd(
             f"Block sparsity expects sparse_block_size_q={q_subtile_factor * m_block_size} "
             f"for q_subtile_factor={q_subtile_factor}."
         )
-    if sparse_block_size_kv != n_block_size:
+    expected_sparse_block_size_kv = kv_subtile_factor * n_block_size
+    if sparse_block_size_kv != expected_sparse_block_size_kv:
         raise ValueError(
-            f"Block sparsity expects sparse_block_size[1]={n_block_size} to match tile_n."
+            f"Block sparsity expects sparse_block_size[1]={expected_sparse_block_size_kv} "
+            f"for kv_subtile_factor={kv_subtile_factor}."
         )
     expected_count_shape, expected_index_shape = get_block_sparse_expected_shapes_bwd(
         batch_size,
@@ -614,6 +663,7 @@ def normalize_block_sparse_config_bwd(
         m_block_size,
         n_block_size,
         q_subtile_factor,
+        kv_subtile_factor,
     )
     normalized_tensors = normalize_block_sparse_tensors(
         tensors,
@@ -623,7 +673,7 @@ def normalize_block_sparse_config_bwd(
         hint=lambda: (
             f"Backward expects Q-direction block-sparse tensors (q_mask_cnt/q_mask_idx, "
             f"and optionally full_q_cnt/full_q_idx). Regenerate the backward BlockMask with "
-            f"BLOCK_SIZE=({q_subtile_factor * m_block_size}, {n_block_size})."
+            f"BLOCK_SIZE=({q_subtile_factor * m_block_size}, {expected_sparse_block_size_kv})."
         ),
     )
     return normalized_tensors, get_block_sparse_broadcast_pattern(normalized_tensors)
