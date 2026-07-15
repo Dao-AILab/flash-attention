@@ -2067,11 +2067,15 @@ class FlashAttentionSparseMLABackwardSm100:
 
                     pipeline_dV.consumer_wait(consumer_state_dV)
 
-                    # TODO: record meaning of hard-coded values
+                    # Epilogue configuration for dV store:
+                    # - num_cols_per_store: Number of columns processed per store operation (64)
+                    #   Derived from tile_dV width * 2 for vectorized access
+                    # - num_epi_subtiles: Number of epilogue sub-tiles (4)
+                    #   Calculated as hdimv / num_hdimv_splits / num_cols_per_store
                     num_cols_per_store = self.tile_dV[1] * 2
                     num_epi_subtiles = (self.hdimv // self.num_hdimv_splits) // num_cols_per_store
-                    assert num_cols_per_store == 64
-                    assert num_epi_subtiles == 4
+                    assert num_cols_per_store == 64, "Expected 64 columns per store for vectorized access"
+                    assert num_epi_subtiles == 4, "Expected 4 epilogue sub-tiles for current configuration"
                     assert cute.size(tdVtdV_t2r.shape[2]) == num_epi_subtiles
 
                     tdVrdV_cur_shape = tdVcdVmma_t2r[None, None, 0].shape
