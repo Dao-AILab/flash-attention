@@ -261,16 +261,8 @@ def test_flash_attn_output(
         # window_size = (-1, -1) if not local else (16, 0)
         if has_learnable_sink:
             learnable_sink_base = torch.randn(nheads, dtype=torch.bfloat16, device=device)
-            learnable_sink_ref = (
-                learnable_sink_base.detach()
-                .clone()
-                .requires_grad_()
-            )
-            learnable_sink = (
-                learnable_sink_base.detach()
-                .clone()
-                .requires_grad_()
-            )
+            learnable_sink_ref = learnable_sink_base.clone().requires_grad_()
+            learnable_sink = learnable_sink_base.clone().requires_grad_()
         else:
             learnable_sink_ref = None
             learnable_sink = None
