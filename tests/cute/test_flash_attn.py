@@ -181,6 +181,8 @@ def test_flash_attn_output(
     # TODO(wangsiyu): SM100 head_dim=256 2CTA kernel currently does not support the following features.
     # Remove these skips when support is added.
     if d == 256 and IS_SM100:
+        if has_learnable_sink:
+            pytest.skip("SM100 head_dim=256 2CTA kernel does not support learnable_sink yet")
         if local:
             pytest.skip("SM100 head_dim=256 2CTA kernel does not support local attention yet")
         if softcap > 0.0:
@@ -673,6 +675,8 @@ def test_flash_attn_varlen_output(
     # TODO(wangsiyu): SM100 head_dim=256 2CTA kernel currently does not support the following features.
     # Remove these skips when support is added.
     if d == 256 and IS_SM100:
+        if has_learnable_sink:
+            pytest.skip("SM100 head_dim=256 2CTA kernel does not support learnable_sink yet")
         if local:
             pytest.skip("SM100 head_dim=256 2CTA kernel does not support local attention yet")
         if softcap > 0.0:
