@@ -259,28 +259,17 @@ def test_flash_attn_output(
         if local:
             print("window size = ", window_size)
         # window_size = (-1, -1) if not local else (16, 0)
-        test_learnable_sink_bwd = (
-            has_learnable_sink
-            and d == 64
-            and seqlen_q == 128
-            and seqlen_k == 128
-            and not causal
-            and not local
-            and softcap == 0.0
-            and not deterministic
-            and mha_type == "mha"
-        )
         if has_learnable_sink:
             learnable_sink_base = torch.randn(nheads, dtype=torch.bfloat16, device=device)
             learnable_sink_ref = (
                 learnable_sink_base.detach()
                 .clone()
-                .requires_grad_(test_learnable_sink_bwd)
+                .requires_grad_()
             )
             learnable_sink = (
                 learnable_sink_base.detach()
                 .clone()
-                .requires_grad_(test_learnable_sink_bwd)
+                .requires_grad_()
             )
         else:
             learnable_sink_ref = None
@@ -408,7 +397,6 @@ def test_flash_attn_output(
                 or (d == 192 and dv == 128)
                 or (IS_SM100 and d == 256 and dv == 256 and softcap == 0.0)
             )
-            and (learnable_sink is None or test_learnable_sink_bwd)
             # and False
             and not ((causal or local) and seqlen_k < seqlen_q)
         ):
@@ -418,10 +406,10 @@ def test_flash_attn_output(
                 pytest.xfail("SM90 GQA bwd currently requires headdim == headdim_v")
             g = torch.randn_like(out)
             # do_o = ((g.float() * out.float()).sum(-1)).transpose(1, 2)
-            grad_tensors = (q, k, v, learnable_sink) if test_learnable_sink_bwd else (q, k, v)
+            grad_tensors = (q, k, v, learnable_sink) if has_learnable_sink else (q, k, v)
             grads = torch.autograd.grad(out, grad_tensors, g)
             dq, dk, dv = grads[:3]
-            dsink = grads[3] if test_learnable_sink_bwd else None
+            dsink = grads[3] if has_learnable_sink else None
             if is_fake_mode():
                 # no more flash_attn cutedsl calls for the rest of the loop
                 # skip data-dependent postprocessing
@@ -441,12 +429,12 @@ def test_flash_attn_output(
             # dq, dk, dv = torch.autograd.grad(out, (q, k, v), g)
             grad_tensors_ref = (
                 (q_ref, k_ref, v_ref, learnable_sink_ref)
-                if test_learnable_sink_bwd
+                if has_learnable_sink
                 else (q_ref, k_ref, v_ref)
             )
             grads_ref = torch.autograd.grad(out_ref, grad_tensors_ref, g)
             dq_ref, dk_ref, dv_ref = grads_ref[:3]
-            dsink_ref = grads_ref[3] if test_learnable_sink_bwd else None
+            dsink_ref = grads_ref[3] if has_learnable_sink else None
             dq_pt, dk_pt, dv_pt = torch.autograd.grad(out_pt, (q_ref, k_ref, v_ref), g)
             print(f"dQ max diff: {(dq - dq_ref).abs().max().item()}")
             print(f"dK max diff: {(dk - dk_ref).abs().max().item()}")
@@ -499,7 +487,7 @@ def test_flash_attn_output(
             assert (dv - dv_ref).abs().max().item() <= rtol * (
                 dv_pt - dv_ref
             ).abs().max().item() + dv_atol
-            if test_learnable_sink_bwd:
+            if has_learnable_sink:
                 torch.testing.assert_close(dsink, dsink_ref, atol=2e-2, rtol=0)
 
 
