@@ -79,11 +79,22 @@ def check_tensor_vs_ref(name, actual, ref, pt, rtol=2, atol=None):
 # When operating fake tensors, we cannot perform data-dependent operations (e.g., `tensor.max()`).
 USE_FAKE_TENSOR = int(os.getenv("FLASH_ATTENTION_FAKE_TENSOR", 0)) == 1
 DISABLE_SPLIT = os.getenv("FLASH_ATTENTION_DISABLE_SPLIT", "FALSE") == "TRUE"
-# SplitKV is not supported on SM90
+# SplitKV is not supported on SM90 or SM120
 IS_SM90 = torch.cuda.get_device_capability()[0] == 9
 IS_SM100 = torch.cuda.get_device_capability()[0] == 10
+IS_SM120 = torch.cuda.get_device_capability()[0] == 12
 TEST_BWD_ONLY = False
 VERBOSE = True
+
+
+@pytest.mark.skipif(not IS_SM120, reason="SM120-only SplitKV unsupported behavior")
+def test_flash_attn_sm120_rejects_splitkv():
+    q = torch.randn(1, 16, 4, 64, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, 16, 1, 64, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(1, 16, 1, 64, device="cuda", dtype=torch.bfloat16)
+    with pytest.raises(AssertionError, match="SM120 forward only supports num_splits=1"):
+        flash_attn_func(q, k, v, num_splits=3)
+
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
@@ -321,8 +332,8 @@ def test_flash_attn_output(
         # pack_gqa_vals = [False]
         num_splits_vals = [1, 3] if d < 192 and not DISABLE_SPLIT and not TEST_BWD_ONLY and not has_qv else [1]
         for pack_gqa, num_splits in itertools.product(pack_gqa_vals, num_splits_vals):
-            # SplitKV not supported on SM90 - skip this iteration
-            if IS_SM90 and num_splits > 1:
+            # SplitKV not supported on SM90/SM120 - skip this iteration
+            if (IS_SM90 or IS_SM120) and num_splits > 1:
                 continue
             if IS_SM100 and (d >= 192 and dv >= 192) and not (d == 256 and dv == 256):
                 continue
@@ -502,6 +513,31 @@ def test_flash_attn_small_head_dim(seqlen_q, seqlen_k, d, causal, dtype):
     assert (out - out_ref).abs().max().item() <= 2 * (
         out_pt - out_ref
     ).abs().max().item() + fwd_atol
+
+
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_hd256_sm100_noncontiguous_transpose():
+    if not IS_SM100:
+        pytest.skip("SM100-specific hd256 layout regression test")
+
+    torch.random.manual_seed(0)
+    batch_size, seqlen, nheads, d = 2, 128, 4, 256
+    dtype = torch.bfloat16
+    q = torch.randn(batch_size, nheads, seqlen, d, device="cuda", dtype=dtype).transpose(1, 2)
+    k = torch.randn(batch_size, nheads, seqlen, d, device="cuda", dtype=dtype).transpose(1, 2)
+    v = torch.randn(batch_size, nheads, seqlen, d, device="cuda", dtype=dtype).transpose(1, 2)
+
+    out, _ = flash_attn_func(q, k, v)
+    out_contig, _ = flash_attn_func(q.contiguous(), k.contiguous(), v.contiguous())
+
+    if is_fake_mode():
+        return
+
+    assert not q.is_contiguous() and not k.is_contiguous() and not v.is_contiguous()
+    assert torch.equal(out, out_contig), (
+        f"non-contiguous hd256 output differs from contiguous reference: "
+        f"max diff = {(out - out_contig).abs().max().item()}"
+    )
 
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
@@ -829,8 +865,8 @@ def test_flash_attn_varlen_output(
         # SplitKV is not supported for hdim >= 192
         num_splits_vals = [1, 3] if d < 192 and not DISABLE_SPLIT and not TEST_BWD_ONLY else [1]
         for pack_gqa, num_splits in itertools.product(pack_gqa_vals, num_splits_vals):
-            # SplitKV not supported on SM90 - skip this iteration
-            if IS_SM90 and num_splits > 1:
+            # SplitKV not supported on SM90/SM120 - skip this iteration
+            if (IS_SM90 or IS_SM120) and num_splits > 1:
                 continue
             # TODO(wangsiyu): SM100 head_dim=256 2CTA kernel does not support pack_gqa yet.
             # pack_gqa=None means auto-enable for GQA/MQA (qhead_per_kvhead > 1)
@@ -1452,8 +1488,8 @@ def test_flash_attn_kvcache(
         for num_splits, precompute_metadata in itertools.product(
             num_splits_vals, precompute_metadata_vals
         ):
-            # SplitKV not supported on SM90 - skip this iteration
-            if IS_SM90 and num_splits > 1:
+            # SplitKV not supported on SM90/SM120 - skip this iteration
+            if (IS_SM90 or IS_SM120) and num_splits > 1:
                 continue
             # if precompute_metadata:
             #     scheduler_metadata = get_scheduler_metadata(
@@ -2534,8 +2570,8 @@ def test_flash_attn_mla_absorbed_varlen(
         pack_gqa_vals = [True]
         num_splits_vals = [1]
         for pack_gqa, num_splits in itertools.product(pack_gqa_vals, num_splits_vals):
-            # SplitKV not supported on SM90 - skip this iteration
-            if IS_SM90 and num_splits > 1:
+            # SplitKV not supported on SM90/SM120 - skip this iteration
+            if (IS_SM90 or IS_SM120) and num_splits > 1:
                 continue
             out_unpad, lse = flash_attn_varlen_func(
                 q_unpad if unpad_q else q,

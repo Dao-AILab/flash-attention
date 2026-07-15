@@ -6,6 +6,11 @@
 
 namespace FLASH_NAMESPACE {
 
+// The num_splits==1 blocksize-aligned tree is instantiated in its own translation unit
+// (flash_fwd_split_align_*.cu) so it compiles in parallel; declare it extern so
+// the dispatch below references it instead of re-instantiating.
+extern template void run_mha_fwd_splitkv_align<cutlass::bfloat16_t, 128, false>(Flash_fwd_params &params, cudaStream_t stream);
+
 template void run_mha_fwd_splitkv_dispatch<cutlass::bfloat16_t, 128, false>(Flash_fwd_params &params, cudaStream_t stream);
 
 } // namespace FLASH_NAMESPACE
