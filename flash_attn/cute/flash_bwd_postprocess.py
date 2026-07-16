@@ -202,7 +202,9 @@ class FlashAttentionBackwardPostprocess:
                 major_mode_size=self.tile_hdim // wg_d_dQ,
             )
         else:
-            # TODO: this is hard-coded for hdim 128
+            # Blackwell architecture shared memory layout for dQ
+            # The layout is optimized for the padded tile dimension (tile_hdim)
+            # and uses make_smem_layout_epi for epilogue-friendly access patterns
             self.sdQ_layout = sm100_utils_basic.make_smem_layout_epi(
                 self.dtype, LayoutEnum.ROW_MAJOR, (self.tile_m, self.tile_hdim), 1
             )

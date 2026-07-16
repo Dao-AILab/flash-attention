@@ -996,7 +996,11 @@ class SingleTileVarlenScheduler:
                 # This is a version of the SingleTileLPTScheduler, complicated by the fact that
                 # the seqlen can vary per batch.
                 # TODO: is there any case where num_m_blocks is 0?
-                # TODO: by right we should read the seqlen_kv but we're assuming seqlen_q == seqlen_k here
+                # TODO: This implementation assumes seqlen_q == seqlen_k for simplicity.
+                # For cases where seqlen_q != seqlen_k, we should read seqlen_kv and compute:
+                # num_n_blocks = ceil(seqlen_kv / tile_shape_mn[1]) * cluster_shape_m
+                # This requires additional shared memory reads and may impact performance.
+                # Current implementation is valid for standard attention where q and k have same length.
                 num_n_blocks = (
                     num_m_blocks
                     * params.tile_shape_mn[0]
