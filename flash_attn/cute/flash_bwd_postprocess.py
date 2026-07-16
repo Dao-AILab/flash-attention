@@ -390,9 +390,14 @@ class FlashAttentionBackwardPostprocess:
                                 sink_head_idx, sink_seqlen.padded_offset_q + sink_row
                             ]
                             lse_val = mLSE[sink_head_idx, sink_seqlen.offset_q + sink_row]
-                        sink_prob = cute.math.exp2(
-                            (sink_val - Float32(lse_val)) * utils.LOG2_E,
-                            fastmath=True,
+                        lse_val = Float32(lse_val)
+                        sink_prob = (
+                            Float32(1.0)
+                            if lse_val == -Float32.inf
+                            else cute.math.exp2(
+                                (sink_val - lse_val) * utils.LOG2_E,
+                                fastmath=True,
+                            )
                         )
                         sink_sum += -sink_prob * Float32(dpsum_val)
                         sink_row += self.num_threads

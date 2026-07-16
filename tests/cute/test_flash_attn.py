@@ -482,9 +482,13 @@ def test_flash_attn_output(
                 dv_pt - dv_ref
             ).abs().max().item() + dv_atol
             if has_learnable_sink:
-                dsink_atol = 2 * (dsink_ref + 0.3 - 0.3 - dsink_ref).abs().max().item() + (
-                    0 if softcap == 0 else 3e-4
-                )
+                dsink_ulp = (
+                    torch.nextafter(
+                        dsink_ref.abs(), torch.full_like(dsink_ref, float("inf"))
+                    )
+                    - dsink_ref.abs()
+                ).max().item()
+                dsink_atol = 2 * dsink_ulp + (0 if softcap == 0 else 3e-4)
                 assert (dsink - dsink_ref).abs().max().item() <= rtol * (
                     dsink_pt - dsink_ref
                 ).abs().max().item() + dsink_atol
