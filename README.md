@@ -61,6 +61,21 @@ Once the package is installed, you can import it as follows:
 python -c "import flash_attn_interface; print(dir(flash_attn_interface))" 2>/dev/null | grep -q flash_attn_3 && echo "✓ flash_attn_3 installed" || echo "✗ flash_attn_3 not installed"
 ```
 
+To install using `uv`, in your `pyproject.toml`:
+
+```toml
+[project]
+dependencies = [
+    "flash-attn-3"
+]
+
+[tool.uv]
+no-build-isolation = true
+
+[tool.uv.sources]
+flash-attn-3 = { git = "https://github.com/Dao-AILab/flash-attention", subdirectory = "hopper" }
+```
+
 ## FlashAttention-4 (CuTeDSL)
 
 FlashAttention-4 is written in CuTeDSL and optimized for Hopper and Blackwell GPUs (e.g. H100, B200).
@@ -145,7 +160,6 @@ FlashAttention-2 ROCm CK backend currently supports:
 1. MI200x, MI250x, MI300x, MI355x, and RDNA 3/4 GPUs.
 2. Datatype fp16 and bf16
 3. Both forward's and backward's head dimensions up to 256.
-4. RDNA 3 GPUs do not currently support backward, and RDNA 4 GPUs support backward only with deterministic=False
 
 #### Triton Backend
 The Triton implementation of [Flash Attention](https://tridao.me/publications/flash2/flash2.pdf) supports AMD's CDNA (MI200, MI300) and RDNA GPUs using fp16, bf16, and fp32 datatypes. It provides forward and backward passes with causal masking, variable sequence lengths, arbitrary Q/KV sequence lengths and head sizes, MQA/GQA, dropout, rotary embeddings, ALiBi, paged attention, and FP8 (via the Flash Attention v3 interface). Sliding window attention is currently a work in progress.

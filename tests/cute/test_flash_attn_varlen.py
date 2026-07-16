@@ -7,7 +7,7 @@ from flash_attn.cute import flash_attn_varlen_func
 
 @pytest.mark.parametrize("B", [1, 7, 20])
 @pytest.mark.parametrize("H", [1, 4, 6])
-@pytest.mark.parametrize("D", [64, 128])
+@pytest.mark.parametrize("D", [64, 128, 256])
 @pytest.mark.parametrize("min_seq_len", [1, 32, 128])
 @pytest.mark.parametrize("max_seq_len", [8, 64, 2048])
 @pytest.mark.parametrize("causal", [True, False])

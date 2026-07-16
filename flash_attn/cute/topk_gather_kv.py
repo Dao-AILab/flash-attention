@@ -18,7 +18,7 @@ import math
 @dataclass
 class CpasyncGatherKVManager(ParamsBase):
     mIndexTopk: cute.Tensor
-    sBitmask: cute.Tensor
+    sBitmask: Optional[cute.Tensor]
 
     cta_rank_in_cluster: Int32
     thread_idx: Int32
@@ -46,14 +46,13 @@ class CpasyncGatherKVManager(ParamsBase):
     rTopk_NonInterleaved: cute.Tensor
 
     pipeline_bitmask: Optional[pipeline.PipelineAsync]
-    cpasync_barrier: pipeline.NamedBarrier
+    cpasync_barrier: Optional[pipeline.NamedBarrier]
 
     disable_bitmask: cutlass.Constexpr[Boolean]
 
     @staticmethod
     def create(
         mIndexTopk: cute.Tensor,
-        sBitmask: cute.Tensor,
         cta_rank_in_cluster: Int32,
         thread_idx: Int32,
         warp_idx: Int32,
@@ -66,10 +65,10 @@ class CpasyncGatherKVManager(ParamsBase):
         num_threads: cutlass.Constexpr[Int32],
         dtype: Type[cutlass.Numeric],
         cta_group_size: cutlass.Constexpr[Int32],
-        pipeline_bitmask: Optional[pipeline.PipelineAsync],
-        num_stages_bitmask: cutlass.Constexpr[Int32],
-        cpasync_barrier: pipeline.NamedBarrier,
-        disable_bitmask: cutlass.Constexpr[Boolean],
+        cpasync_barrier: Optional[pipeline.NamedBarrier] = None,
+        disable_bitmask: cutlass.Constexpr[Boolean] = False,
+        sBitmask: Optional[cute.Tensor] = None,
+        pipeline_bitmask: Optional[pipeline.PipelineAsync] = None,
     ):
         assert tile_n % num_threads == 0
         assert num_threads == 128
@@ -166,6 +165,9 @@ class CpasyncGatherKVManager(ParamsBase):
         self,
         producer_state_bitmask,
     ):
+        assert self.pipeline_bitmask is not None, "pipeline_bitmask not provided"
+        assert self.cpasync_barrier is not None, "cpasync barrier not provided"
+
         lane_idx = cute.arch.lane_idx()
         assert cute.size(self.rTopk_NonInterleaved) == 1
         bitmask = Uint32(0)
@@ -194,6 +196,7 @@ class CpasyncGatherKVManager(ParamsBase):
         self,
         mX: cute.Tensor,
         transpose: bool,
+        d_offset: int = 0,
     ):
         entries_per_thread = self.topk_indices_per_thread
         tPrXPtr = cute.make_rmem_tensor((entries_per_thread,), cutlass.Int64)
@@ -206,9 +209,9 @@ class CpasyncGatherKVManager(ParamsBase):
                 row_valid = topk_idx >= 0 and topk_idx < self.seqlen_k_limit
                 tPrRowValid[i] = row_valid
             if const_expr(not transpose):
-                tPrXPtr[i] = utils.elem_pointer(mX, (topk_idx, 0)).toint()
+                tPrXPtr[i] = utils.elem_pointer(mX, (topk_idx, d_offset)).toint()
             else:
-                tPrXPtr[i] = utils.elem_pointer(mX, (0, topk_idx)).toint()
+                tPrXPtr[i] = utils.elem_pointer(mX, (d_offset, topk_idx)).toint()
 
         return tPrXPtr, tPrRowValid
 
@@ -219,6 +222,7 @@ class CpasyncGatherKVManager(ParamsBase):
         sX: cute.Tensor,
         transpose: bool,
         K_or_V: str,
+        d_offset: int = 0,
     ):
         assert K_or_V in ("K", "V")
         cta_tile_n = self.tile_n if const_expr(transpose) else self.tile_n // self.cta_group_size
@@ -234,7 +238,7 @@ class CpasyncGatherKVManager(ParamsBase):
         tXsX = self.gmem_thr_copy_KV.partition_D(sX_nd)
         tXcX = self.gmem_thr_copy_KV.partition_S(cX)
 
-        tPrXPtr, tPrRowValid = self.compute_X_ptr(mX, transpose)
+        tPrXPtr, tPrRowValid = self.compute_X_ptr(mX, transpose, d_offset)
 
         if const_expr(not transpose):
             offset = self.cta_rank_in_cluster * (self.gmem_threads_per_row // self.cta_group_size)

@@ -251,8 +251,6 @@ def test_flash_attn_output(
             and learnable_sink is None
             # and False
         ):
-            if IS_SM90 and mha_type != "mha":
-                pytest.xfail("SM90 backward: GQA/MQA has tensor layout issue (qhead_per_kvhead > 1)")
             if IS_SM90 and local:
                 pytest.xfail("SM90 backward: local attention not supported yet")
             g = torch.randn_like(out)

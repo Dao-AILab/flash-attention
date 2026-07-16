@@ -46,6 +46,7 @@ from flash_attn.cute.tile_scheduler import (
 from cutlass.cute import FastDivmodDivisor
 
 from flash_attn.cute.flash_fwd import FlashAttentionForwardBase
+from flash_attn.cute.utils import AuxData
 
 
 class FlashAttentionForwardSm90(FlashAttentionForwardBase):
@@ -66,7 +67,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             "Paged KV does not support irregular head dim"
         )
         self.cluster_shape_mn = (1, 1)
-        assert self.arch >= Arch.sm_90 and self.arch <= Arch.sm_90a, "Only SM 9.x is supported"
+        assert self.arch.is_family_of(Arch.sm_90a), "Only SM 9.x is supported"
 
     def _get_smem_layout_atom(self):
         sQ_layout_atom = warpgroup.make_smem_layout_atom(
@@ -171,7 +172,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         window_size_right: Int32 | int | None = None,
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
-        aux_tensors: Optional[list] = None,
+        aux_data: AuxData = AuxData(),
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -350,7 +351,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         window_size_left = Int32(window_size_left) if window_size_left is not None else None
         window_size_right = Int32(window_size_right) if window_size_right is not None else None
         fastdiv_mods = utils.compute_fastdiv_mods(
-            mQ, mK, self.qhead_per_kvhead, self.pack_gqa, aux_tensors, mPageTable
+            mQ, mK, self.qhead_per_kvhead, self.pack_gqa, aux_data.tensors, mPageTable
         )
 
         self.kernel(
@@ -388,7 +389,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             tile_sched_params,
             TileScheduler,
             SharedStorage,
-            aux_tensors,
+            aux_data,
             fastdiv_mods,
         ).launch(
             grid=grid_dim,
@@ -434,7 +435,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         tile_sched_params: ParamsBase,
         TileScheduler: cutlass.Constexpr[Callable],
         SharedStorage: cutlass.Constexpr[Callable],
-        aux_tensors=Optional[list[cute.Tensor]],
+        aux_data: AuxData = AuxData(),
         fastdiv_mods=None,
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
@@ -553,6 +554,14 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             mCuSeqlensK=mCuSeqlensK,
             mSeqUsedQ=mSeqUsedQ,
             mSeqUsedK=mSeqUsedK,
+            mCuTotalMBlocks=(
+                blocksparse_tensors.cu_total_m_blocks if blocksparse_tensors is not None else None
+            ),
+            mCuBlockIdxOffsets=(
+                blocksparse_tensors.cu_block_idx_offsets
+                if blocksparse_tensors is not None
+                else None
+            ),
             # Don't need to pass in tile_mn because we won't access offset_padded
         )
         AttentionMaskCls = partial(
@@ -622,7 +631,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 AttentionMaskCls,
                 TileSchedulerCls,
                 blocksparse_tensors,
-                aux_tensors,
+                aux_data,
                 fastdiv_mods,
             )
 
@@ -882,6 +891,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                             batch_idx,
                             head_idx,
                             m_block,
+                            seqlen,
                             kv_producer_state,
                             tma_load_K_fn,
                             tma_load_V_fn,
@@ -889,7 +899,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                             pipeline_v,
                             self.intra_wg_overlap,
                             self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
-                            self.q_subtile_factor if self.q_subtile_factor is not None else 1,
+                            self.q_subtile_factor,
                         )
 
                 tile_scheduler.prefetch_next_work()
@@ -949,9 +959,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         AttentionMaskCls: Callable,
         TileSchedulerCls: Callable,
         blocksparse_tensors: Optional[BlockSparseTensors],
-        aux_tensors: Optional[list],
+        aux_data: AuxData = AuxData(),
         fastdiv_mods=None,
     ):
+        aux_tensors = aux_data.tensors
         warp_group_idx = cute.arch.make_warp_uniform(tidx // self.num_threads_per_warp_group)
         warp_group_thread_layout = cute.make_layout(
             self.num_wg_mma, stride=self.num_threads_per_warp_group
@@ -1066,7 +1077,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 thr_mma=thr_mma_qk,
                 mask_causal=self.is_causal,
                 mask_local=self.is_local,
-                aux_tensors=aux_tensors,
+                aux_data=aux_data,
                 fastdiv_mods=fastdiv_mods,
             )
             score_mod_fn = None
@@ -1078,7 +1089,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     head_idx,
                     m_block,
                     softmax_scale=softmax_scale,
-                    aux_tensors=aux_tensors,
+                    aux_data=aux_data,
                     fastdiv_mods=fastdiv_mods,
                 )
             mma_one_n_block = partial(
@@ -1203,7 +1214,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     self.warp_scheduler_barrier_sync,
                     self.warp_scheduler_barrier_arrive,
                     self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
-                    self.q_subtile_factor if self.q_subtile_factor is not None else 1,
+                    self.q_subtile_factor,
                 )
 
                 # Release Q pipeline so the producer can load the next tile's Q
@@ -1486,7 +1497,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         n_block,
         softmax_scale,
         seqlen,
-        aux_tensors: Optional[list] = None,
+        aux_data: AuxData = AuxData(),
         fastdiv_mods=None,
     ):
         # Prepare index tensor
@@ -1501,9 +1512,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             batch_idx,
             head_idx,
             softmax_scale,
-            self.vec_size,
+            self.score_vec_size,
             self.qk_acc_dtype,
-            aux_tensors,
+            aux_data,
             fastdiv_mods,
             seqlen_info=seqlen,
             constant_q_idx=None,

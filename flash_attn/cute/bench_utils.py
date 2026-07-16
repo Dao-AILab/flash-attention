@@ -51,13 +51,22 @@ def flops(
 
 
 def bandwidth_fwd_bytes(
-    batch, nheads, nheads_kv, seqlen_q, seqlen_k, headdim, headdim_v, dtype_bytes=2, has_qv=False
+    batch,
+    nheads,
+    nheads_kv,
+    seqlen_q,
+    seqlen_k,
+    headdim,
+    headdim_v,
+    dtype_bytes=2,
+    has_qv=False,
+    shared_kv=False,
 ):
     """HBM traffic for one attention pass: read Q,K,V + write O."""
     q = batch * nheads * seqlen_q * headdim
     qv = batch * nheads * seqlen_q * headdim_v if has_qv else 0
     k = batch * nheads_kv * seqlen_k * headdim
-    v = batch * nheads_kv * seqlen_k * headdim_v
+    v = batch * nheads_kv * seqlen_k * headdim_v if not shared_kv else 0
     o = batch * nheads * seqlen_q * headdim_v
     return (q + qv + k + v + o) * dtype_bytes
 

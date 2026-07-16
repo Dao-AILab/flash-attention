@@ -171,6 +171,7 @@ def _flash_attn_varlen_forward(
     leftpad_k: Optional[torch.Tensor] = None,
     seqused_k: Optional[torch.Tensor] = None,
     zero_tensors: bool = False,
+    num_splits: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     out, softmax_lse, S_dmask, rng_state = flash_attn_gpu.varlen_fwd(
@@ -195,6 +196,7 @@ def _flash_attn_varlen_forward(
         softcap,
         return_softmax,
         None,
+        num_splits,
     )
     # if out.isnan().any() or softmax_lse.isnan().any():
     #     breakpoint()
@@ -222,6 +224,7 @@ def _flash_attn_varlen_forward_fake(
     leftpad_k: Optional[torch.Tensor] = None,
     seqused_k: Optional[torch.Tensor] = None,
     zero_tensors: bool = False,
+    num_splits: int = 0,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     paged_kv = block_table is not None

@@ -4,7 +4,8 @@ import math
 import hashlib
 import inspect
 import os
-from typing import Type, Callable, Optional, Tuple, overload
+from functools import partial
+from typing import Type, Callable, Optional, Tuple, overload, NamedTuple
 
 import cutlass
 import cutlass.cute as cute
@@ -19,6 +20,12 @@ from cutlass.cute.runtime import from_dlpack
 import quack.activation
 
 _MIXER_ATTRS = ("__vec_size__",)
+
+
+class AuxData(NamedTuple):
+    tensors: tuple | list | None = None
+    scalars: tuple | None = None
+
 
 # Obtained from sollya:
 # fpminimax(exp(x * log(2.0)), 1, [|1,24...|],[0;1],relative);
@@ -85,8 +92,11 @@ def _get_use_clc_scheduler_default() -> bool:
     return _fa_clc_enabled
 
 
-def _get_disable_2cta_default() -> bool:
-    return _fa_disable_2cta_enabled or _fa_disable_2cta_cuda12
+def _get_disable_2cta_default(is_fwd: bool = False) -> bool:
+    if is_fwd:
+        return _fa_disable_2cta_enabled or _fa_disable_2cta_cuda12
+    else:
+        return _fa_disable_2cta_enabled
 
 
 def _compute_base_hash(func: Callable) -> str:
@@ -140,7 +150,7 @@ def hash_callable(
 
     hasher = hashlib.sha256(base_hash.encode())
 
-    for attr, val in zip(_MIXER_ATTRS, mixer_values):
+    for attr, val in zip(mixer_attrs, mixer_values):
         hasher.update(f"{attr}={val!r}".encode())
 
     return hasher.hexdigest()
@@ -213,6 +223,34 @@ def convert_from_dlpack(x, leading_dim, alignment=16, divisibility=1) -> cute.Te
     )
 
 
+def convert_from_dlpack_compact_dynamic(
+    x,
+    *,
+    dynamic_modes: tuple[int, ...],
+    alignment: int = 16,
+    stride_order=None,
+    divisibility: int = 1,
+    enable_tvm_ffi: bool = False,
+) -> cute.Tensor:
+    """Convert via DLPack and mark selected compact dimensions as dynamic."""
+    if isinstance(dynamic_modes, int):
+        dynamic_modes = (dynamic_modes,)
+    if stride_order is None:
+        stride_order = x.dim_order()
+    t = (
+        from_dlpack(x, assumed_align=alignment, enable_tvm_ffi=True)
+        if enable_tvm_ffi
+        else from_dlpack(x, assumed_align=alignment)
+    )
+    for mode in dynamic_modes:
+        t = t.mark_compact_shape_dynamic(
+            mode=mode,
+            stride_order=stride_order,
+            divisibility=divisibility,
+        )
+    return t
+
+
 def convert_from_dlpack_leading_static(
     x, leading_dim, alignment=16, static_modes=None, stride_order=None
 ) -> cute.Tensor:
@@ -244,7 +282,7 @@ def make_tiled_copy_B(
 
 
 def mma_make_fragment_A(
-    smem: cute.Tensor, thr_mma: cute.core.ThrMma, swapAB: cutlass.Constexpr[bool] = False
+    smem: cute.Tensor, thr_mma: cute.ThrMma, swapAB: cutlass.Constexpr[bool] = False
 ) -> cute.Tensor:
     if const_expr(swapAB):
         return mma_make_fragment_B(smem, thr_mma)
@@ -253,7 +291,7 @@ def mma_make_fragment_A(
 
 
 def mma_make_fragment_B(
-    smem: cute.Tensor, thr_mma: cute.core.ThrMma, swapAB: cutlass.Constexpr[bool] = False
+    smem: cute.Tensor, thr_mma: cute.ThrMma, swapAB: cutlass.Constexpr[bool] = False
 ) -> cute.Tensor:
     if const_expr(swapAB):
         return mma_make_fragment_A(smem, thr_mma)
@@ -284,7 +322,7 @@ def warp_reduce(
     width: cutlass.Constexpr[int] = cute.arch.WARP_SIZE,
 ) -> cute.TensorSSA | cute.Numeric:
     if const_expr(isinstance(val, cute.TensorSSA)):
-        res = cute.make_fragment(val.shape, val.dtype)
+        res = cute.make_rmem_tensor(val.shape, val.dtype)
         res.store(val)
         for i in cutlass.range_constexpr(cute.size(val.shape)):
             res[i] = warp_reduce(res[i], op, width)
@@ -314,32 +352,15 @@ def smid(*, loc=None, ip=None) -> Int32:
 def fmax(
     a: float | Float32, b: float | Float32, c: float | Float32 | None = None, *, loc=None, ip=None
 ) -> Float32:
-    from cutlass import CUDA_VERSION
-
-    # * NVVM call based on nvvm version
-    if CUDA_VERSION.major == 12 and CUDA_VERSION.minor == 9:
-        # Old API: requires explicit result type as first positional argument
-        return Float32(
-            nvvm.fmax(
-                T.f32(),
-                Float32(a).ir_value(loc=loc, ip=ip),
-                Float32(b).ir_value(loc=loc, ip=ip),
-                c=Float32(c).ir_value(loc=loc, ip=ip) if c is not None else None,
-                loc=loc,
-                ip=ip,
-            )
+    return Float32(
+        nvvm.fmax(
+            Float32(a).ir_value(loc=loc, ip=ip),
+            Float32(b).ir_value(loc=loc, ip=ip),
+            c=Float32(c).ir_value(loc=loc, ip=ip) if c is not None else None,
+            loc=loc,
+            ip=ip,
         )
-    else:
-        # New API: infers result type automatically
-        return Float32(
-            nvvm.fmax(
-                Float32(a).ir_value(loc=loc, ip=ip),
-                Float32(b).ir_value(loc=loc, ip=ip),
-                c=Float32(c).ir_value(loc=loc, ip=ip) if c is not None else None,
-                loc=loc,
-                ip=ip,
-            )
-        )
+    )
 
 
 @cute.jit
@@ -350,7 +371,7 @@ def fmax_reduce(
         # if const_expr(init_val is None):
         #     init_val = -cutlass.Float32.if
         # return x.reduce(cute.ReductionOp.MAX, init_val, 0)
-        res = cute.make_fragment(x.shape, Float32)
+        res = cute.make_rmem_tensor(x.shape, Float32)
         res.store(x)
         # local_max = [res[0], res[1]]
         # for i in cutlass.range_constexpr(2, cute.size(x.shape), 2):
@@ -371,7 +392,7 @@ def fmax_reduce(
     else:
         # [2025-06-15] x.reduce only seems to use 50% 3-input max and 50% 2-input max
         # We instead force the 3-input max.
-        res = cute.make_fragment(x.shape, Float32)
+        res = cute.make_rmem_tensor(x.shape, Float32)
         res.store(x)
         local_max_0 = (
             fmax(init_val, res[0], res[1])
@@ -401,7 +422,7 @@ def fadd_reduce(
         if const_expr(init_val is None):
             init_val = Float32.zero
         return x.reduce(cute.ReductionOp.ADD, init_val, 0)
-        # res = cute.make_fragment(x.shape, Float32)
+        # res = cute.make_rmem_tensor(x.shape, Float32)
         # res.store(x)
         # local_sum = [res[0], res[1], res[2], res[3]]
         # for i in cutlass.range_constexpr(4, cute.size(x.shape), 4):
@@ -414,7 +435,7 @@ def fadd_reduce(
         # local_sum[0] += local_sum[2]
         # return local_sum[0] if const_expr(init_val is None) else local_sum[0] + init_val
     else:
-        res = cute.make_fragment(x.shape, Float32)
+        res = cute.make_rmem_tensor(x.shape, Float32)
         res.store(x)
         local_sum_0 = (
             cute.arch.add_packed_f32x2((init_val, 0.0), (res[0], res[1]))
@@ -451,9 +472,7 @@ def atomic_add_fp32(a: float | Float32, gmem_ptr: cute.Pointer, *, loc=None, ip=
     #     is_align_stack=False,
     #     asm_dialect=llvm.AsmDialect.AD_ATT,
     # )
-    nvvm.atomicrmw(
-        res=T.f32(), op=nvvm.AtomicOpKind.FADD, ptr=gmem_ptr.llvm_ptr, a=Float32(a).ir_value()
-    )
+    nvvm.atomicrmw(op=nvvm.AtomicOpKind.FADD, ptr=gmem_ptr.llvm_ptr, a=Float32(a).ir_value())
 
 
 @dsl_user_op
@@ -464,7 +483,7 @@ def elem_pointer(x: cute.Tensor, coord: cute.Coord, *, loc=None, ip=None) -> cut
 @cute.jit
 def predicate_k(tAcA: cute.Tensor, limit: cutlass.Int32) -> cute.Tensor:
     # Only compute predicates for the "k" dimension. For the mn dimension, we will use "if"
-    tApA = cute.make_fragment(
+    tApA = cute.make_rmem_tensor(
         cute.make_layout(
             (cute.size(tAcA, mode=[0, 1]), cute.size(tAcA, mode=[1]), cute.size(tAcA, mode=[2])),
             stride=(cute.size(tAcA, mode=[2]), 0, 1),
@@ -637,7 +656,7 @@ def cvt_f16(src: cute.Tensor, dst_or_dtype):
     if const_expr(isinstance(dst_or_dtype, type)):
         # dtype variant: create new tensor and call the tensor variant
         dtype = dst_or_dtype
-        dst = cute.make_fragment(src.shape, dtype)
+        dst = cute.make_rmem_tensor(src.shape, dtype)
         cvt_f16(src, dst)
         return dst
     else:
@@ -820,10 +839,96 @@ def domain_offset_aligned(
     return cute.make_tensor(new_ptr, tensor.layout)
 
 
+@dsl_user_op
+def warp_reduction(
+    val: cute.Numeric, op: Callable, *, threads_in_group: int = 32, loc=None, ip=None
+) -> cute.Numeric:
+    """Warp-wide reduction helper for a custom binary op."""
+    offset = threads_in_group // 2
+    while offset > 0:
+        val = op(
+            val,
+            cute.arch.shuffle_sync_bfly(
+                val, offset=offset, mask=-1, mask_and_clamp=31, loc=loc, ip=ip
+            ),
+        )
+        offset //= 2
+    return val
+
+
+warp_reduction_max = partial(
+    warp_reduction, op=lambda x, y: fmax(x, y) if isinstance(x, Float32) else max(x, y)
+)
+warp_reduction_sum = partial(warp_reduction, op=lambda x, y: x + y)  # noqa: FURB118
+
+
+@dsl_user_op
+def make_cotiled_copy(
+    atom: cute.CopyAtom, atom_layout_tv: cute.Layout, data_layout: cute.Layout, *, loc=None, ip=None
+) -> cute.TiledCopy:
+    """Compatibility wrapper for deprecated CuTeDSL `make_cotiled_copy`."""
+    assert cute.is_static(atom_layout_tv.type), "atom_layout_tv must be static"
+    assert cute.is_static(data_layout.type), "data_layout must be static"
+
+    inv_layout_ = cute.left_inverse(data_layout, loc=loc, ip=ip)
+    inv_data_layout = cute.make_layout(
+        (inv_layout_.shape, (1)), stride=(inv_layout_.stride, (0)), loc=loc, ip=ip
+    )
+    layout_tv_data = cute.composition(inv_data_layout, atom_layout_tv, loc=loc, ip=ip)
+
+    atom_layout_v_to_check = cute.coalesce(
+        cute.make_layout(atom_layout_tv.shape[1], stride=atom_layout_tv.stride[1], loc=loc, ip=ip),
+        loc=loc,
+        ip=ip,
+    )
+    data_layout_v_to_check = cute.coalesce(
+        cute.composition(
+            data_layout,
+            cute.make_layout(
+                layout_tv_data.shape[1], stride=layout_tv_data.stride[1], loc=loc, ip=ip
+            ),
+            loc=loc,
+            ip=ip,
+        ),
+        loc=loc,
+        ip=ip,
+    )
+    assert data_layout_v_to_check == atom_layout_v_to_check, (
+        "the memory pointed to by atom_layout_tv does not exist in the data_layout."
+    )
+
+    flat_data_shape = cute.product_each(data_layout.shape, loc=loc, ip=ip)
+    tiler = tuple(
+        cute.filter(
+            cute.composition(
+                cute.make_layout(
+                    flat_data_shape,
+                    stride=tuple(0 if j != i else 1 for j in range(cute.rank(flat_data_shape))),
+                    loc=loc,
+                    ip=ip,
+                ),
+                layout_tv_data,
+                loc=loc,
+                ip=ip,
+            ),
+            loc=loc,
+            ip=ip,
+        )
+        for i in range(cute.rank(flat_data_shape))
+    )
+    tile2data = cute.composition(
+        cute.make_layout(flat_data_shape, loc=loc, ip=ip), tiler, loc=loc, ip=ip
+    )
+    layout_tv = cute.composition(
+        cute.left_inverse(tile2data, loc=loc, ip=ip), layout_tv_data, loc=loc, ip=ip
+    )
+    return cute.make_tiled_copy(atom, layout_tv, tiler, loc=loc, ip=ip)
+
+
 @cute.jit
 def scalar_to_ssa(a: cute.Numeric, dtype) -> cute.TensorSSA:
     """Convert a scalar to a cute TensorSSA of shape (1,) and given dtype"""
-    vec = cute.make_fragment(1, dtype)
+    vec = cute.make_rmem_tensor(1, dtype)
     vec[0] = a
     return vec.load()
 
@@ -831,3 +936,93 @@ def scalar_to_ssa(a: cute.Numeric, dtype) -> cute.TensorSSA:
 def ssa_to_scalar(val):
     """Could inline but nice for reflecting the above api"""
     return val[0]
+
+
+@cute.jit
+def get_batch_from_cu_tensor(idx: Int32, cu_tensor: cute.Tensor) -> Int32:
+    """Binary search to determine batch from packed index in a cumulative tensor"""
+    batch_size = cute.size(cu_tensor) - 1
+    lo = Int32(0)
+    hi = batch_size
+
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if cu_tensor[mid + 1] <= idx:
+            lo = mid + 1
+        else:
+            hi = mid
+
+    return lo
+
+
+def as_bshkrd_tensor(
+    tensor: cute.Tensor,
+    h_k: Int32,
+    h_r: Int32,
+    varlen: bool,
+) -> cute.Tensor:
+    """Normalize (B,S,H,D)/(S,H,D) tensors to (B,S,H_k,H_r,D) view."""
+    if cutlass.const_expr(cute.rank(tensor.layout) == 5):
+        return tensor
+    if cutlass.const_expr(cute.rank(tensor.layout) == 4):
+        return cute.make_tensor(
+            tensor.iterator,
+            cute.make_layout(
+                (tensor.shape[0], tensor.shape[1], h_k, h_r, tensor.shape[3]),
+                stride=(
+                    tensor.stride[0],
+                    tensor.stride[1],
+                    tensor.stride[2] * h_r,
+                    tensor.stride[2],
+                    tensor.stride[3],
+                ),
+            ),
+        )
+    assert cutlass.const_expr(cute.rank(tensor.layout) == 3), "Expected rank-3 varlen tensor"
+    assert cutlass.const_expr(varlen), "Rank-3 input is only valid for varlen"
+    return cute.make_tensor(
+        tensor.iterator,
+        cute.make_layout(
+            (1, tensor.shape[0], h_k, h_r, tensor.shape[2]),
+            stride=(
+                0,
+                tensor.stride[0],
+                tensor.stride[1] * h_r,
+                tensor.stride[1],
+                tensor.stride[2],
+            ),
+        ),
+    )
+
+
+def as_shhb_tensor(
+    tensor: cute.Tensor,
+    h_k: Int32,
+    h_r: Int32,
+    b: Int32,
+    varlen: bool,
+) -> cute.Tensor:
+    """Normalize (B,H,S)/(H,S) tensors to (S, ((H_r, H_k), B)) view."""
+    if cutlass.const_expr(cute.rank(tensor.layout) == 3):
+        return cute.make_tensor(
+            tensor.iterator,
+            cute.make_layout(
+                (tensor.shape[2], ((h_r, h_k), tensor.shape[0])),
+                stride=(
+                    tensor.stride[2],
+                    ((tensor.stride[1], tensor.stride[1] * h_r), tensor.stride[0]),
+                ),
+            ),
+        )
+    assert cutlass.const_expr(cute.rank(tensor.layout) == 2), "Expected rank-2 varlen tensor"
+    assert cutlass.const_expr(varlen), "Rank-2 input is only valid for varlen"
+    return cute.make_tensor(
+        tensor.iterator,
+        cute.make_layout(
+            (tensor.shape[1], ((h_r, h_k), b)),
+            stride=(
+                tensor.stride[1],
+                ((tensor.stride[0], tensor.stride[0] * h_r), 0),
+            ),
+        ),
+    )

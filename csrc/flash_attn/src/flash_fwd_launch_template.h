@@ -160,12 +160,34 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     }
 }
 
+// The num_splits==1 blocksize-aligned splitkv template. If a user specifies
+// num_splits=1, we assume they want bitwise identical numerics across the split
+// KV and standard kernels so we align kBlockN to match.
+// We technically can combine this into one dispatch under run_flash_splitkv_fwd
+// but that pathologically slowed down build time by doubling the number of kernels
+// in a single file, which made build go from minutes to hours. Thus, it is pulled
+// into its own function so it can be explicitly instantiated in a separate file
+// (flash_fwd_split_align_*.cu) and compiled in parallel instead of serializing in
+// one ptxas invocation.
+template<typename T, int Headdim, bool Is_causal>
+void run_mha_fwd_splitkv_align(Flash_fwd_params &params, cudaStream_t stream) {
+    constexpr static int kBlockM = 64;
+    constexpr static int kBlockN_standard = Headdim <= 64 ? 128 : 64;
+    run_flash_splitkv_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN_standard, 4, false, false, T>, Is_causal>(params, stream);
+}
+
 template<typename T, int Headdim, bool Is_causal>
 void run_mha_fwd_splitkv_dispatch(Flash_fwd_params &params, cudaStream_t stream) {
-    constexpr static int kBlockM = 64;  // Fixed for all head dimensions
+    constexpr static int kBlockM = 64;
     // TD [2023-08-28]: nvcc segfaults for headdim 96 with block size 64 x 256,
     // and for headdim 192 with block size 64 x 128.
     constexpr static int kBlockN = Headdim <= 64 ? 256 : (Headdim <= 128 ? 128 : 64);
+    if (params.num_splits == 1) {
+        // Defined in flash_fwd_split_align_*.cu; declared extern in the main
+        // flash_fwd_split_*.cu so this call does not re-instantiate the tree here.
+        run_mha_fwd_splitkv_align<T, Headdim, Is_causal>(params, stream);
+        return;
+    }
     run_flash_splitkv_fwd<Flash_fwd_kernel_traits<Headdim, kBlockM, kBlockN, 4, false, false, T>, Is_causal>(params, stream);
 }
 

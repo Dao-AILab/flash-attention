@@ -86,6 +86,19 @@ from torch.utils.cpp_extension import (
     _maybe_write,
 )
 
+BUILD_TARGET = os.environ.get("BUILD_TARGET", "auto")
+
+if BUILD_TARGET == "auto":
+    if IS_HIP_EXTENSION:
+        IS_ROCM = True
+    else:
+        IS_ROCM = False
+else:
+    if BUILD_TARGET == "cuda":
+        IS_ROCM = False
+    elif BUILD_TARGET == "rocm":
+        IS_ROCM = True
+
 def create_build_config_file():
     CONFIG = {
         "build_flags": {
@@ -331,6 +344,10 @@ def get_cuda_bare_metal_version(cuda_dir):
     return raw_output, bare_metal_version
 
 
+def get_hip_version():
+    return parse(torch.version.hip.split()[-1].rstrip('-').replace('-', '+'))
+
+
 def check_if_cuda_home_none(global_option: str) -> None:
     if CUDA_HOME is not None:
         return
@@ -385,6 +402,44 @@ def open_url(url):
     return urllib.request.urlopen(request, timeout=300)
 
 
+def safe_extractall(tar, path):
+    """Extract a tar stream, refusing members that would escape ``path``.
+
+    Uses the PEP 706 ``data`` filter when the interpreter supports it (added in
+    3.12, backported to 3.10.12 / 3.11.4). On older interpreters the filter
+    keyword does not exist, so we validate each member's resolved path stays
+    inside ``path`` and reject link members before extracting. The tar is opened
+    in stream mode, so members are validated and extracted in a single pass.
+    """
+    dest = os.path.realpath(path)
+    if hasattr(tarfile, "data_filter"):
+        tar.extractall(path=dest, filter="data")
+        return
+
+    def stays_inside(resolved):
+        return resolved == dest or resolved.startswith(dest + os.sep)
+
+    for member in tar:
+        target = os.path.realpath(os.path.join(dest, member.name))
+        if not stays_inside(target):
+            raise RuntimeError(f"Refusing tar member outside extract dir: {member.name!r}")
+        # The data filter permits links whose target resolves inside the
+        # destination (the cuda_nvcc archives ship such intra-package symlinks,
+        # e.g. libnvvm.so -> libnvvm.so.4). Mirror that instead of rejecting all
+        # links, or real builds regress on interpreters without the data filter.
+        if member.issym() or member.islnk():
+            # A symlink target is relative to the link's own directory; a hard
+            # link's is relative to the archive root.
+            link_base = os.path.dirname(target) if member.issym() else dest
+            link_target = os.path.realpath(os.path.join(link_base, member.linkname))
+            if not stays_inside(link_target):
+                raise RuntimeError(
+                    f"Refusing link member pointing outside extract dir: "
+                    f"{member.name!r} -> {member.linkname!r}"
+                )
+        tar.extract(member, path=dest)
+
+
 def download_and_copy(name, src_func, dst_path, version, url_func):
     if is_offline_build():
         return
@@ -401,9 +456,21 @@ def download_and_copy(name, src_func, dst_path, version, url_func):
     src_path = os.path.join(tmp_path, src_path)
     download = not os.path.exists(src_path)
     if download:
+        # Refuse to extract into a pre-planted symlink: an attacker with write
+        # access to the predictable cache dir could otherwise redirect the
+        # extraction (and the shutil.copy below) to an arbitrary location.
+        # islink() only inspects the leaf, so also require the fully resolved
+        # path to stay under the cache root, catching a symlinked parent.
+        cache_root = os.path.realpath(flashattn_cache_path)
+        resolved_tmp = os.path.realpath(tmp_path)
+        if os.path.islink(tmp_path) or not (
+            resolved_tmp == cache_root or resolved_tmp.startswith(cache_root + os.sep)
+        ):
+            raise RuntimeError(f"Refusing to extract into symlinked cache path: {tmp_path}")
+        os.makedirs(tmp_path, exist_ok=True)
         print(f'downloading and extracting {url} ...')
         file = tarfile.open(fileobj=open_url(url), mode="r|*")
-        file.extractall(path=tmp_path)
+        safe_extractall(file, tmp_path)
     os.makedirs(os.path.split(dst_path)[0], exist_ok=True)
     print(f'copy {src_path} to {dst_path} ...')
     if os.path.isdir(src_path):
@@ -647,6 +714,12 @@ def get_package_version():
 
 
 def get_wheel_url():
+    if IS_ROCM:
+        return get_rocm_wheel_url()
+    return get_cuda_wheel_url()
+
+
+def get_cuda_wheel_url():
     # Determine the version numbers that will be used to determine the correct wheel
     # We're using the CUDA version used to build torch, not the one currently installed
     # _, cuda_version_raw = get_cuda_bare_metal_version(CUDA_HOME)
@@ -665,6 +738,21 @@ def get_wheel_url():
 
     # Determine wheel URL based on CUDA version, torch version, python version and OS
     wheel_filename = f"{PACKAGE_NAME}-{package_version}+cu{cuda_version}torch{torch_version}cxx11abi{cxx11_abi}-{python_version}-{python_version}-{platform_name}.whl"
+    wheel_url = BASE_WHEEL_URL.format(tag_name=f"v{package_version}", wheel_name=wheel_filename)
+    return wheel_url, wheel_filename
+
+
+def get_rocm_wheel_url():
+    torch_hip_version = get_hip_version()
+    torch_version_raw = parse(torch.__version__)
+    hip_version = f"{torch_hip_version.major}{torch_hip_version.minor}"
+    python_version = f"cp{sys.version_info.major}{sys.version_info.minor}"
+    platform_name = get_platform()
+    package_version = get_package_version()
+    torch_version = f"{torch_version_raw.major}.{torch_version_raw.minor}"
+    cxx11_abi = str(torch._C._GLIBCXX_USE_CXX11_ABI).upper()
+
+    wheel_filename = f"{PACKAGE_NAME}-{package_version}+rocm{hip_version}torch{torch_version}cxx11abi{cxx11_abi}-{python_version}-{python_version}-{platform_name}.whl"
     wheel_url = BASE_WHEEL_URL.format(tag_name=f"v{package_version}", wheel_name=wheel_filename)
     return wheel_url, wheel_filename
 
@@ -703,6 +791,22 @@ class CachedWheelsCommand(_bdist_wheel):
             # If the wheel could not be downloaded, build from source
             super().run()
 
+# Build install_requires based on platform
+if IS_ROCM:
+    # Note: torch is excluded because pip resolves it to CUDA PyTorch from PyPI, overwriting any pre-installed ROCm PyTorch. Users must have torch installed.
+    install_requires = [
+        "einops",
+        "packaging",
+        "ninja",
+    ]
+else:
+    install_requires = [
+        "torch",
+        "einops",
+        "packaging",
+        "ninja",
+    ]
+
 setup(
     name=PACKAGE_NAME,
     version=get_package_version(),
@@ -732,12 +836,7 @@ setup(
     else {
         "bdist_wheel": CachedWheelsCommand,
     },
-    python_requires=">=3.8",
-    install_requires=[
-        "torch",
-        "einops",
-        "packaging",
-        "ninja",
-    ],
-    options={"bdist_wheel": {"py_limited_api": "cp39"}},
+    python_requires=">=3.10",
+    install_requires=install_requires,
+    options={"bdist_wheel": {"py_limited_api": "cp310"}},
 )

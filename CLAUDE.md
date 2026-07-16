@@ -20,7 +20,7 @@ pip install flash-attn-4
 pip install -e "flash_attn/cute[dev]"
 ```
 
-Dependencies: `nvidia-cutlass-dsl>=4.4.1`, `torch`, `einops`, `apache-tvm-ffi`, `quack-kernels>=0.2.10`.
+Dependencies: `nvidia-cutlass-dsl>=4.5.2`, `torch`, `einops`, `apache-tvm-ffi`, `quack-kernels>=0.5.0`.
 
 ## Running Tests
 
@@ -128,7 +128,7 @@ Env vars: `CUTE_CUBIN_PATH` (dump CUBIN/SASS), `CUTE_DSL_KEEP_PTX=1` (inspect PT
 
 ## Debugging GPU Kernels
 
-See `AI/DEBUG_2CTA.md` for kernel hang/deadlock debugging (printf bisection, pipeline barrier analysis, 2CTA pitfalls). See `AI/RACECHECK_TMA_HAZARD.md` for `compute-sanitizer` false positives with `cp.async.bulk`.
+See `AI/DEBUG_2CTA.md` for kernel hang/deadlock debugging (printf bisection, pipeline barrier analysis, 2CTA pitfalls). See `AI/RACECHECK_TMA_HAZARD.md` for `compute-sanitizer` false positives with `cp.async.bulk`. See `AI/CLC_TRACE_DEBUG.md` for visualization of CLC scheduling.
 
 Key tools:
 - `cute.printf` with thread guards (`tidx % 32 == 0`, `elect_one()`) for targeted output

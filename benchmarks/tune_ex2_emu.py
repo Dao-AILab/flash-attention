@@ -10,6 +10,7 @@ Usage:
 Requires: the _TUNING_CONFIG dict in flash_attn/cute/flash_fwd_sm100.py.
 """
 import argparse
+import atexit
 import json
 import re
 import subprocess
@@ -86,6 +87,98 @@ def detect_sm103():
     print(f"GPU: {torch.cuda.get_device_name()}, SM{sm}, is_sm103={is_sm103}")
     return is_sm103
 
+def _get_gpu_selector():
+    """Return the nvidia-smi GPU selector (-i argument) for the current device.
+
+    Resolves CUDA_VISIBLE_DEVICES so that nvidia-smi targets the same physical
+    GPU that PyTorch is using.
+    """
+    visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
+    if visible:
+        entries = [e.strip() for e in visible.split(",") if e.strip()]
+        if entries:
+            idx = torch.cuda.current_device() if torch.cuda.is_available() else 0
+            return entries[idx] if idx < len(entries) else entries[0]
+    if torch.cuda.is_available():
+        return str(torch.cuda.current_device())
+    return None
+
+def _nvidia_smi_cmd(*args):
+    """Build nvidia-smi command for the current GPU, prepending sudo when not root."""
+    prefix = [] if os.geteuid() == 0 else ["sudo"]
+    cmd = prefix + ["nvidia-smi"]
+    selector = _get_gpu_selector()
+    if selector is not None:
+        cmd += ["-i", selector]
+    return cmd + list(args)
+
+def _query_clocks():
+    """Return (current_mhz_str, max_mhz_str) or (None, None) on failure."""
+    try:
+        result = subprocess.run(
+            _nvidia_smi_cmd(
+                "--query-gpu=clocks.current.graphics,clocks.max.graphics",
+                "--format=csv,noheader,nounits",
+            ),
+            capture_output=True, text=True,
+        )
+    except OSError:
+        return None, None
+    if result.returncode != 0:
+        return None, None
+    lines = [ln.strip() for ln in result.stdout.strip().splitlines() if ln.strip()]
+    if not lines:
+        return None, None
+    fields = [f.strip() for f in lines[0].split(",")]
+    if len(fields) < 2 or not fields[0] or not fields[1]:
+        return None, None
+    return fields[0], fields[1]
+
+def lock_clocks(max_mhz):
+    """Lock GPU clocks to max_mhz. Returns True on success."""
+    try:
+        result = subprocess.run(
+            _nvidia_smi_cmd("--lock-gpu-clocks", str(max_mhz)),
+            capture_output=True, text=True,
+        )
+    except OSError as e:
+        print(f"WARNING: Could not lock GPU clocks ({e}).")
+        return False
+    if result.returncode == 0:
+        print(f"Locked GPU clocks to {max_mhz} MHz.")
+        return True
+    print(f"WARNING: Could not lock GPU clocks ({result.stderr.strip()}).")
+    return False
+
+def unlock_clocks():
+    """Unlock GPU clocks (best-effort, called at exit)."""
+    try:
+        subprocess.run(_nvidia_smi_cmd("--reset-gpu-clocks"), capture_output=True)
+    except OSError:
+        pass
+
+def setup_clocks(do_lock):
+    """Query clock state; if do_lock, attempt to lock and register unlock at exit."""
+    cur, max_clk = _query_clocks()
+    if cur is None:
+        return
+    if do_lock:
+        if cur == max_clk:
+            print(f"GPU clocks already at max ({max_clk} MHz).")
+        elif lock_clocks(max_clk):
+            atexit.register(unlock_clocks)
+            print("GPU clocks will be unlocked on exit.")
+        else:
+            lock_cmd = " ".join(_nvidia_smi_cmd("--lock-gpu-clocks", max_clk))
+            print(f"  To lock manually: {lock_cmd}")
+    else:
+        if cur != max_clk:
+            print(f"WARNING: GPU clocks not locked ({cur} MHz, max {max_clk} MHz).")
+            print("  Benchmark results may vary between runs.")
+            lock_cmd = " ".join(_nvidia_smi_cmd("--lock-gpu-clocks", max_clk))
+            print(f"  To lock: {lock_cmd}")
+    print()
+
 def run_benchmark(causal_flag, headdim_str, seqlen, rep=20, warmup=10):
     """Run benchmark, return (ms, tflops, mfu) or (None, None, None).
 
@@ -125,11 +218,15 @@ def parse_args():
     p.add_argument("--seqlen", type=str, default="8192")
     p.add_argument("--rep", type=int, default=20)
     p.add_argument("--warmup", type=int, default=10)
+    p.add_argument("--lock-clocks", action=argparse.BooleanOptionalAction, default=True,
+                   help="Lock GPU clocks before tuning (requires sudo); use --no-lock-clocks to warn only")
     return p.parse_args()
 
 def main():
     args = parse_args()
+    setup_clocks(args.lock_clocks)
     original_src = read_file()
+    atexit.register(write_file, original_src)
     config = parse_tuning_config(original_src)
 
     hdim, hdim_v = parse_headdim(args.headdim)
@@ -148,51 +245,81 @@ def main():
     print(f"Tuning hdim={args.headdim}, hdim_padded={hdim_padded}, seqlen={args.seqlen}, is_sm103={is_sm103}")
     print(f"Keys to tune: {keys_to_tune}\n")
 
-    # ── Phase 1: ex2_emu_freq + ex2_emu_start_frg sweep ──
+    # ── Phase 1: ex2_emu_freq + ex2_emu_start_frg sweep (+ ex2_emu_res for hd256) ──
 
     freq_values = [0, 6, 8, 10, 12, 14, 16, 20, 24, 32]
     start_frg_values = [0, 1]
+    # hd256 inner loop steps k by 2, so k%freq only takes even values.
+    # Meaningful res values that produce distinct hw:emu ratios on this sweep grid:
+    #   freq=6, res=3 → 50:50 | freq=8, res=6 → 25:75 | freq=8, res=4 → 50:50 (diff freq)
+    hd256_res_values = [3, 6, 4]
 
     for key in keys_to_tune:
-        use_2cta, is_causal, _, _ = key
+        use_2cta, is_causal, key_hdim, _ = key
         causal_flag = "true" if is_causal else "false"
         causal_label = "causal" if is_causal else "non-causal"
         cta_label = "2CTA" if use_2cta else "1CTA"
+        is_hd256 = key_hdim == 256
+        res_values = hd256_res_values if is_hd256 else [None]
 
         print("=" * 70)
         print(f"Phase 1: ex2_emu sweep for {causal_label} ({cta_label})")
         print("=" * 70)
-        print(f"{'freq':>5} {'start':>6} {'ms':>8} {'tflops':>10} {'mfu':>8}")
-        print("-" * 45)
+        if is_hd256:
+            print(f"{'freq':>5} {'res':>4} {'start':>6} {'ms':>8} {'tflops':>10} {'mfu':>8}")
+            print("-" * 50)
+        else:
+            print(f"{'freq':>5} {'start':>6} {'ms':>8} {'tflops':>10} {'mfu':>8}")
+            print("-" * 45)
 
         best_freq = config[key]["ex2_emu_freq"]
+        best_res = config[key].get("ex2_emu_res", None)
         best_start = config[key]["ex2_emu_start_frg"]
         best_tflops = 0
 
         for start_frg in start_frg_values:
             for freq in freq_values:
-                test_config = dict(config)
-                test_config[key] = {**config[key], "ex2_emu_freq": freq, "ex2_emu_start_frg": start_frg}
-                write_file(patch_config(original_src, test_config))
-                try:
-                    ms, tflops, mfu = run_benchmark(causal_flag, args.headdim, args.seqlen, args.rep, args.warmup)
-                    if tflops is None:
-                        print(f"{freq:>5} {start_frg:>6}  ERROR")
-                        continue
-                    marker = " ***" if tflops > best_tflops else ""
-                    print(f"{freq:>5} {start_frg:>6} {ms:>8.2f} {tflops:>10.0f} {mfu:>8.1f}{marker}")
-                    if tflops > best_tflops:
-                        best_tflops = tflops
-                        best_freq = freq
-                        best_start = start_frg
-                except Exception as e:
-                    print(f"{freq:>5} {start_frg:>6}  ERROR: {e}")
-                sys.stdout.flush()
+                for res in res_values:
+                    test_config = dict(config)
+                    patch = {"ex2_emu_freq": freq, "ex2_emu_start_frg": start_frg}
+                    if res is not None:
+                        patch["ex2_emu_res"] = res
+                    test_config[key] = {**config[key], **patch}
+                    write_file(patch_config(original_src, test_config))
+                    try:
+                        ms, tflops, mfu = run_benchmark(causal_flag, args.headdim, args.seqlen, args.rep, args.warmup)
+                        if tflops is None:
+                            if is_hd256:
+                                print(f"{freq:>5} {res:>4} {start_frg:>6}  ERROR")
+                            else:
+                                print(f"{freq:>5} {start_frg:>6}  ERROR")
+                            continue
+                        marker = " ***" if tflops > best_tflops else ""
+                        if is_hd256:
+                            print(f"{freq:>5} {res:>4} {start_frg:>6} {ms:>8.2f} {tflops:>10.0f} {mfu:>8.1f}{marker}")
+                        else:
+                            print(f"{freq:>5} {start_frg:>6} {ms:>8.2f} {tflops:>10.0f} {mfu:>8.1f}{marker}")
+                        if tflops > best_tflops:
+                            best_tflops = tflops
+                            best_freq = freq
+                            best_res = res
+                            best_start = start_frg
+                    except Exception as e:
+                        if is_hd256:
+                            print(f"{freq:>5} {res:>4} {start_frg:>6}  ERROR: {e}")
+                        else:
+                            print(f"{freq:>5} {start_frg:>6}  ERROR: {e}")
+                    sys.stdout.flush()
 
-        print(f"\n  Best: freq={best_freq}, start_frg={best_start}, {best_tflops:.0f} TFLOPS")
-        config[key] = {**config[key], "ex2_emu_freq": best_freq, "ex2_emu_start_frg": best_start}
+        if is_hd256:
+            print(f"\n  Best: freq={best_freq}, res={best_res}, start_frg={best_start}, {best_tflops:.0f} TFLOPS")
+            config[key] = {**config[key], "ex2_emu_freq": best_freq, "ex2_emu_res": best_res, "ex2_emu_start_frg": best_start}
+        else:
+            print(f"\n  Best: freq={best_freq}, start_frg={best_start}, {best_tflops:.0f} TFLOPS")
+            config[key] = {**config[key], "ex2_emu_freq": best_freq, "ex2_emu_start_frg": best_start}
 
     # ── Phase 2: Register count sweep (softmax, correction; other = 512 - 2*softmax - correction) ──
+    # hd256 skipped: its num_regs_other=32 is fixed and the 512-budget formula does not apply.
 
     reg_combos = []
     for softmax in [176, 184, 192, 200]:
@@ -202,7 +329,7 @@ def main():
                 reg_combos.append((softmax, correction, other))
 
     for key in keys_to_tune:
-        use_2cta, is_causal, _, _ = key
+        use_2cta, is_causal, key_hdim, _ = key
         causal_flag = "true" if is_causal else "false"
         causal_label = "causal" if is_causal else "non-causal"
         cta_label = "2CTA" if use_2cta else "1CTA"
@@ -210,6 +337,11 @@ def main():
         print("\n" + "=" * 70)
         print(f"Phase 2: Register sweep for {causal_label} ({cta_label})")
         print("=" * 70)
+
+        if key_hdim == 256:
+            print("  Skipping: hd256 uses fixed num_regs_other=32; 512-budget formula does not apply.")
+            continue
+
         print(f"{'softmax':>8} {'corr':>6} {'other':>6} {'ms':>8} {'tflops':>10} {'mfu':>8}")
         print("-" * 55)
 
@@ -255,10 +387,8 @@ def main():
         val_parts = ", ".join(f'"{k}": {json.dumps(v)}' for k, v in config[key].items())
         print(f"    {key!r}: {{{val_parts}}},")
 
-
     print(f"\nTo apply, update _TUNING_CONFIG in {KERNEL_FILE}")
 
-    # Restore original
     write_file(original_src)
     print("Restored original file.")
 

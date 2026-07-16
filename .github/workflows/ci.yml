@@ -9,7 +9,18 @@ permissions:
 
 env:
   CI_WORK_DIR: ${{ vars.CI_WORK_DIR || format('/scratch/user/{0}', github.actor) }}
-  FA4_TEST_FILTER: "1024-1024-128-True-0-0.0-False-False-False-mha-dtype0 or 1024-1024-128-False-0-0.0-False-False-False-mha-dtype0"
+  # The mla_absorbed cases exercise the MLA backward kernels (flash_bwd_mla_sm100.py +
+  # dq_dqv + dk); without them CI runs no MLA test at all. We cover the distinct backward
+  # paths: sparse (kv_sparsity=True) non-causal + causal, dense (kv_sparsity=False), and
+  # shared_kv=True. (deterministic/hdim/mha_type are single-valued for this test.)
+  FA4_TEST_FILTER: >-
+    1024-1024-128-True-0-0.0-False-False-False-mha-dtype0
+    or 1024-1024-128-False-0-0.0-False-False-False-mha-dtype0
+    or test_flash_attn_ex2_emu_decode_prefill_consistency
+    or test_flash_attn_mla_absorbed and 256-256-False-True-64-False-0-False-False-mqa-dtype0
+    or test_flash_attn_mla_absorbed and 256-256-False-True-64-True-0-False-False-mqa-dtype0
+    or test_flash_attn_mla_absorbed and 256-256-False-False-64-False-0-False-False-mqa-dtype0
+    or test_flash_attn_mla_absorbed and 256-256-True-True-64-False-0-False-False-mqa-dtype0
 
 jobs:
   lint:
@@ -42,4 +53,4 @@ jobs:
         with:
           test-filter: ${{ env.FA4_TEST_FILTER }}
           fa4_image_cu129: "togethercomputer/training-performance:flash-attn-cu12.9-26.03.25@sha256:304a5c3d2b3a75b151cd2a964cd26d444e0d8b5686d63943df13378c9705f943"
-          fa4_image_cu130: "togethercomputer/training-performance:flash-attn-cu13.0-26.04.01@sha256:56e50b056eb4d671410846c3483e843ee7bd0f5b13cb45b6f0d7eb8bd27694a5"
+          fa4_image_cu130: "togethercomputer/training-performance:flash-attn-cu13.0-26.06.27@sha256:2c31843c7137cbe909611eb70a9b6940581a2e3018d2c8b629f84dfd04b9bfd7"
