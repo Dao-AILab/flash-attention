@@ -2025,7 +2025,9 @@ class FlashAttentionForwardSm100:
 
             qk_descale, _ = self._load_effective_descales(descale_tensors, batch_idx, kv_head_idx)
 
-            max_offset = 8 if cutlass.const_expr(self.q_dtype.width == 8) else 0
+            # 8 leaves only 448/2^8 = 1.75x headroom before e4m3 saturates when
+            # P transiently exceeds 1 (running max lagging by a tile); 4 keeps 28x.
+            max_offset = 4 if cutlass.const_expr(self.q_dtype.width == 8) else 0
             if const_expr(self.score_mod is None):
                 softmax_scale_log2_eff = softmax_scale_log2 * qk_descale
                 softmax_scale_eff = None
@@ -2457,7 +2459,7 @@ class FlashAttentionForwardSm100:
             else:
                 softmax_scale_log2_eff = softmax_scale_log2
 
-            max_offset = Float32(8.0) if cutlass.const_expr(self.q_dtype.width == 8) else Float32(0.0)
+            max_offset = Float32(4.0) if cutlass.const_expr(self.q_dtype.width == 8) else Float32(0.0)
             max_offset_scale = (
                 Float32(256.0) if cutlass.const_expr(self.q_dtype.width == 8) else Float32(1.0)
             )
