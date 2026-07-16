@@ -493,13 +493,17 @@ def _flash_attn_fwd(
         _validate_tensor(lse, "lse", lse_shape, torch.float32, device)
 
     if seqlen_k == 0 or total_q == 0:
-        # With learnable_sink, empty K has LSE=sink, not -inf.
-        assert learnable_sink is None, (
-            "learnable_sink is not supported when seqlen_k == 0 or total_q == 0"
-        )
         out.zero_()
         if lse is not None:
-            lse.fill_(float("-inf"))
+            if learnable_sink is None:
+                lse.fill_(float("-inf"))
+            else:
+                assert qv is None
+                lse.copy_(
+                    learnable_sink[None, :, None]
+                    if cu_seqlens_q is None
+                    else learnable_sink[:, None]
+                )
         return out, lse, None, None
 
     if is_fp8:
@@ -1356,6 +1360,7 @@ def _flash_attn_bwd(
     if learnable_sink is not None:
         assert arch // 10 in [9, 10, 11], "Learnable sink backward is supported on SM90 and SM100/SM110"
         assert lse is not None, "learnable_sink backward requires LSE"
+        assert q.numel() > 0 and k.numel() > 0, "learnable_sink backward requires non-empty Q and K"
     sparse_q = None
     if block_sparse_tensors is not None and arch // 10 == 9:
         sparse_q = block_sparse_tensors.block_size[0] if block_sparse_tensors.block_size is not None else 128

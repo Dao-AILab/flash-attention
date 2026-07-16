@@ -427,7 +427,9 @@ def test_flash_attn_output(
             grads_ref = torch.autograd.grad(out_ref, grad_tensors_ref, g)
             dq_ref, dk_ref, dv_ref = grads_ref[:3]
             dsink_ref = grads_ref[3] if has_learnable_sink else None
-            dq_pt, dk_pt, dv_pt = torch.autograd.grad(out_pt, (q_ref, k_ref, v_ref), g)
+            grads_pt = torch.autograd.grad(out_pt, grad_tensors_ref, g)
+            dq_pt, dk_pt, dv_pt = grads_pt[:3]
+            dsink_pt = grads_pt[3] if has_learnable_sink else None
             print(f"dQ max diff: {(dq - dq_ref).abs().max().item()}")
             print(f"dK max diff: {(dk - dk_ref).abs().max().item()}")
             print(f"dV max diff: {(dv - dv_ref).abs().max().item()}")
@@ -480,7 +482,12 @@ def test_flash_attn_output(
                 dv_pt - dv_ref
             ).abs().max().item() + dv_atol
             if has_learnable_sink:
-                torch.testing.assert_close(dsink, dsink_ref, atol=2e-2, rtol=0)
+                dsink_atol = 2 * (dsink_ref + 0.3 - 0.3 - dsink_ref).abs().max().item() + (
+                    0 if softcap == 0 else 3e-4
+                )
+                assert (dsink - dsink_ref).abs().max().item() <= rtol * (
+                    dsink_pt - dsink_ref
+                ).abs().max().item() + dsink_atol
 
 
 # Regression test for #2591: SMEM overflow at small head_dims on SM100. The main

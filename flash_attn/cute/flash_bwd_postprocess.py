@@ -370,7 +370,6 @@ class FlashAttentionBackwardPostprocess:
                     mdQ.shape[0] if const_expr(mCuSeqlensQ is None) else mCuSeqlensQ.shape[0] - 1
                 )
                 sink_val = Float32(mLearnableSink[sink_head_idx])
-                LOG2_E = math.log2(math.e)
                 sink_batch = 0
                 while sink_batch < num_batch:
                     sink_seqlen = SeqlenInfoQK.create(
@@ -392,7 +391,7 @@ class FlashAttentionBackwardPostprocess:
                             ]
                             lse_val = mLSE[sink_head_idx, sink_seqlen.offset_q + sink_row]
                         sink_prob = cute.math.exp2(
-                            sink_val * LOG2_E - Float32(lse_val) * LOG2_E,
+                            (sink_val - Float32(lse_val)) * utils.LOG2_E,
                             fastmath=True,
                         )
                         sink_sum += -sink_prob * Float32(dpsum_val)
