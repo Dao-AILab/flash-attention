@@ -357,6 +357,8 @@ class FlashAttentionBackwardPostprocess:
         if const_expr(mLearnableSink is not None):
             block_x, block_y, block_z = cute.arch.block_idx()
             sink_head_idx = head_idx if const_expr(mCuSeqlensQ is None) else block_x
+            # Varlen uses block_x to select one CTA per head. block_y and block_z
+            # are currently always zero, but check them defensively.
             reduce_sink = (
                 m_block == 0 and batch_idx == 0
                 if const_expr(mCuSeqlensQ is None)
