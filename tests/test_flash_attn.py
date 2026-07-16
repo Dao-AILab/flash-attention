@@ -2581,3 +2581,66 @@ def test_flash_attn_varlen_paged_kv_num_splits(dtype):
 
     with pytest.raises(RuntimeError, match="num_splits > 1 is not supported"):
         _flash_attn_varlen_forward(q, k_cache, v_cache, **fwd_kwargs, num_splits=2)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16])
+@pytest.mark.parametrize("paged_kv_block_size", [256])
+@pytest.mark.parametrize("append_knew", [False, True])
+def test_flash_attn_kvcache_paged_block_table_bounds(append_knew, paged_kv_block_size, dtype):
+    # Regression test for the paged-KV out-of-bounds guard (issue #2709).
+    # block_table only has `max_num_blocks_per_seq` columns, so the split-KV kernel can
+    # only safely index it up to max_num_blocks_per_seq * page_block_size tokens. If any
+    # cache_seqlens[b] (+ appended new keys) exceeds that capacity, mha_fwd_kvcache must
+    # raise instead of letting the kernel read block_table out of bounds.
+    device = "cuda"
+    batch_size = 1
+    nheads = 1
+    d = 64
+    max_num_blocks_per_seq = 1
+    capacity = max_num_blocks_per_seq * paged_kv_block_size
+
+    # A pool of pages large enough that the block_table indices are always valid;
+    # the guard must fire on the sequence length, not on missing pages.
+    num_blocks = 4
+    k_cache_paged = torch.randn(num_blocks, paged_kv_block_size, nheads, d, device=device, dtype=dtype)
+    v_cache_paged = torch.randn(num_blocks, paged_kv_block_size, nheads, d, device=device, dtype=dtype)
+    block_table = torch.zeros(batch_size, max_num_blocks_per_seq, dtype=torch.int32, device=device)
+
+    q = torch.randn(batch_size, 1, nheads, d, device=device, dtype=dtype)
+
+    if append_knew:
+        # cache is full at capacity, appending even one new key overflows the block_table.
+        seqlen_knew = 1
+        k_new = torch.randn(batch_size, seqlen_knew, nheads, d, device=device, dtype=dtype)
+        v_new = torch.randn(batch_size, seqlen_knew, nheads, d, device=device, dtype=dtype)
+        cache_seqlens = torch.full((batch_size,), capacity, dtype=torch.int32, device=device)
+    else:
+        seqlen_knew = 0
+        k_new = None
+        v_new = None
+        cache_seqlens = torch.full((batch_size,), capacity + 1, dtype=torch.int32, device=device)
+
+    with pytest.raises(RuntimeError, match="block_table"):
+        flash_attn_with_kvcache(
+            q,
+            k_cache_paged,
+            v_cache_paged,
+            k=k_new,
+            v=v_new,
+            cache_seqlens=cache_seqlens,
+            block_table=block_table,
+            causal=False,
+        )
+
+    # Positive control: exactly at capacity (and no appended keys) must NOT raise.
+    cache_seqlens_ok = torch.full((batch_size,), capacity, dtype=torch.int32, device=device)
+    out = flash_attn_with_kvcache(
+        q,
+        k_cache_paged,
+        v_cache_paged,
+        cache_seqlens=cache_seqlens_ok,
+        block_table=block_table,
+        causal=False,
+    )
+    assert out.shape == (batch_size, 1, nheads, d)
+    assert not out.isnan().any()
