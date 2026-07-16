@@ -959,7 +959,13 @@ def _flash_attn_fwd(
         elif arch // 10 == 12:
             # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
             assert not use_block_sparsity, "Block sparsity not supported on SM 12.0"
-            assert page_table is None, "Paged KV not supported on SM 12.0"
+            if page_table is not None:
+                assert seqused_k is not None, (
+                    "Paged KV on SM120 requires seqused_k (actual sequence lengths per batch)"
+                )
+                # Note: tile_n=64 with num_threads=128 works for paged KV — threads 64-127
+                # get is_valid=False in the page table loop and are skipped. This is slightly
+                # less efficient than tile_n=128 but enables num_stages=2 pipelining (see below).
             fa_fwd = FlashAttentionForwardSm120(
                 dtype,
                 head_dim,
@@ -971,7 +977,12 @@ def _flash_attn_fwd(
                 pack_gqa=pack_gqa,
                 tile_m=tile_m,
                 tile_n=tile_n,
-                num_stages=1,
+                # num_stages=2: pipeline K/V loads with MMA — for paged KV this also overlaps
+                # page table lookups with MMA, which hides the scatter-gather latency.
+                # SMEM budget at num_stages=2: max config is D=128, tile_n=64 (FwdConfig default):
+                #   sQ=32KB + sK=32KB + sV=32KB = 96KB ≤ 99KB SM120 capacity ✓
+                # tile_n=128 (D<=64 path) gives 16+32+32=80KB ✓
+                num_stages=2,
                 num_threads=num_threads,
                 Q_in_regs=False,
                 score_mod=score_mod,
