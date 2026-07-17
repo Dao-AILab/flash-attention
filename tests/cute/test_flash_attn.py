@@ -541,13 +541,18 @@ def test_flash_attn_hd256_sm100_noncontiguous_transpose():
 
 
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_flash_attn_sm100_head_dim_72_backward():
-    """Cover predicate and multi-block dQ accumulator padding for head_dim=72."""
+@pytest.mark.parametrize(
+    ("seqlen", "head_dim"),
+    [(16, 8), (256, 72)],
+    ids=["head_dim_8", "head_dim_72_multiblock"],
+)
+def test_flash_attn_sm100_padded_head_dim_backward(seqlen, head_dim):
+    """Cover small and multi-block padded head dimensions in SM100 backward."""
     if not IS_SM100:
         pytest.skip("SM100-specific backward preprocess regression test")
 
     torch.manual_seed(0)
-    shape = (1, 256, 1, 72)
+    shape = (1, seqlen, 1, head_dim)
     q_ref, k_ref, v_ref = (
         torch.randn(shape, device="cuda", dtype=torch.bfloat16, requires_grad=True)
         for _ in range(3)

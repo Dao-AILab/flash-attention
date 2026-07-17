@@ -166,7 +166,7 @@ class FlashAttentionBackwardPostprocess:
                 (self.tile_m * self.tile_hdim // num_wg_mma, num_wg_mma)
             )
         else:
-            self.dQ_reduce_ncol = 32
+            self.dQ_reduce_ncol = math.gcd(32, self.tile_hdim)
             dQaccum_reduce_stage = self.tile_hdim // self.dQ_reduce_ncol
             assert self.num_threads == 128  # TODO: currently hard-coded
             self.s2r_tiled_copy_dQaccum = copy_utils.tiled_copy_1d(
