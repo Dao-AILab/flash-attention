@@ -540,6 +540,32 @@ def test_flash_attn_hd256_sm100_noncontiguous_transpose():
     )
 
 
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_sm100_head_dim_72_backward():
+    """Regression test for the backward preprocess O/dO predicate shape."""
+    if not IS_SM100:
+        pytest.skip("SM100-specific backward preprocess regression test")
+
+    torch.manual_seed(0)
+    shape = (1, 16, 1, 72)
+    q_ref, k_ref, v_ref = (
+        torch.randn(shape, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        for _ in range(3)
+    )
+    q, k, v = (x.detach().clone().requires_grad_() for x in (q_ref, k_ref, v_ref))
+    out_ref, _ = attention_ref(q_ref, k_ref, v_ref)
+    out, _ = flash_attn_func(q, k, v)
+    if is_fake_mode():
+        return
+
+    grad = torch.randn_like(out)
+    grads_ref = torch.autograd.grad(out_ref, (q_ref, k_ref, v_ref), grad)
+    grads = torch.autograd.grad(out, (q, k, v), grad)
+    torch.testing.assert_close(out, out_ref, rtol=5e-2, atol=1e-2)
+    for actual, expected in zip(grads, grads_ref):
+        torch.testing.assert_close(actual, expected, rtol=1e-1, atol=2e-2)
+
+
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
