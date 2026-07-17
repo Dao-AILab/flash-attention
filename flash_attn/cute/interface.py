@@ -1357,7 +1357,16 @@ def _flash_attn_fwd(
     num_n_blocks = (seqlen_k_loaded + tile_n - 1) // tile_n
     num_SMs = 132 if is_fake_mode() else torch.cuda.get_device_properties(device).multi_processor_count
     if arch // 10 == 12:
-        assert num_splits == 1, "SM120 forward only supports num_splits=1"
+        # Auto (num_splits < 1, e.g. the seqlen_q<=8 decode auto-split above)
+        # engages the SplitKV heuristic — it returns 1 when the grid is already
+        # filled and >1 only for underfilled decode/small-batch shapes, so the
+        # SM120 SplitKV forward path runs only where it helps. An explicit
+        # user-requested num_splits > 1 is still rejected (see
+        # test_flash_attn_sm120_rejects_splitkv).
+        if num_splits < 1:
+            num_splits = num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, 128)
+        else:
+            assert num_splits == 1, "SM120 forward only supports num_splits=1"
     elif num_splits < 1:
         num_splits = num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, 128)
 
