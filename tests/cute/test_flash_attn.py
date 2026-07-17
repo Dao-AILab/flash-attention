@@ -571,6 +571,103 @@ def test_flash_attn_sm100_padded_head_dim_backward(seqlen, head_dim):
         torch.testing.assert_close(actual, expected, rtol=1e-1, atol=2e-2)
 
 
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_sm100_varlen_gqa_padded_head_dim_backward():
+    """Cover varlen offsets and GQA dK/dV accumulation with 16-column padding."""
+    if not IS_SM100:
+        pytest.skip("SM100-specific backward accumulator regression test")
+
+    torch.manual_seed(0)
+    batch_size, seqlen_q, seqlen_k = 2, 129, 97
+    nheads, nheads_kv, head_dim = 4, 2, 72
+    q_ref = torch.randn(
+        batch_size,
+        seqlen_q,
+        nheads,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+        requires_grad=True,
+    )
+    k_ref, v_ref = (
+        torch.randn(
+            batch_size,
+            seqlen_k,
+            nheads_kv,
+            head_dim,
+            device="cuda",
+            dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        for _ in range(2)
+    )
+    query_padding_mask = torch.arange(seqlen_q, device="cuda")[None, :] < torch.tensor(
+        [129, 65], device="cuda"
+    )[:, None]
+    key_padding_mask = torch.arange(seqlen_k, device="cuda")[None, :] < torch.tensor(
+        [97, 33], device="cuda"
+    )[:, None]
+    (
+        q_unpad,
+        k_unpad,
+        v_unpad,
+        _,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        _,
+        _,
+        max_seqlen_q,
+        max_seqlen_k,
+        _,
+        _,
+        _,
+        _,
+        output_pad_fn,
+        dq_pad_fn,
+        dk_pad_fn,
+    ) = generate_qkv(
+        q_ref,
+        k_ref,
+        v_ref,
+        query_padding_mask,
+        key_padding_mask,
+    )
+
+    out_unpad, _ = flash_attn_varlen_func(
+        q_unpad,
+        k_unpad,
+        v_unpad,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        pack_gqa=False,
+    )
+    if is_fake_mode():
+        return
+
+    out_ref, _ = attention_ref(
+        q_ref,
+        k_ref,
+        v_ref,
+        query_padding_mask,
+        key_padding_mask,
+    )
+    grad_unpad = torch.randn_like(out_unpad)
+    grads_unpad = torch.autograd.grad(out_unpad, (q_unpad, k_unpad, v_unpad), grad_unpad)
+    grad = output_pad_fn(grad_unpad)
+    grads_ref = torch.autograd.grad(out_ref, (q_ref, k_ref, v_ref), grad)
+    grads = (
+        dq_pad_fn(grads_unpad[0]),
+        dk_pad_fn(grads_unpad[1]),
+        dk_pad_fn(grads_unpad[2]),
+    )
+
+    torch.testing.assert_close(output_pad_fn(out_unpad), out_ref, rtol=5e-2, atol=1e-2)
+    for actual, expected in zip(grads, grads_ref):
+        torch.testing.assert_close(actual, expected, rtol=1e-1, atol=2e-2)
+
+
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
