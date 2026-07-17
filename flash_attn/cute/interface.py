@@ -3612,7 +3612,6 @@ def _flash_attn_bwd(
                 num_threads,
                 pack_gqa,
                 causal,
-                local,
                 SdP_swapAB,
                 dKV_swapAB,
                 dQ_swapAB,
