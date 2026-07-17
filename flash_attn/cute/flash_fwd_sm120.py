@@ -20,6 +20,7 @@ class FlashAttentionForwardSm120(FlashAttentionForwardSm80):
     is_sm120: bool = True
 
     def __init__(self, *args, **kwargs):
+        """Force SM80 code paths while the DSL still targets the resident SM120 GPU."""
         super().__init__(*args, **kwargs)
         # Override arch to sm_80 so that __call__ uses CpAsync (not TMA) for the O epilogue.
         # BaseDSL._get_dsl().get_arch_enum() returns the real GPU arch (sm_121a on DGX Spark),

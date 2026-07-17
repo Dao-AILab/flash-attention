@@ -583,17 +583,13 @@ class FlashAttentionBackwardSm80:
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
         grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
 
-        # Compute softmax_scale_log2 inline (matching the SM90 backward).
-        # We must NOT use utils.compute_softmax_scale_log2 here because it returns
-        # softmax_scale=None when score_mod is None, but the SM80 backward kernel
-        # still uses `softmax_scale` directly for the dK epilogue scaling at line
-        # `acc_dK.store(acc_dK.load() * softmax_scale)` (when qhead_per_kvhead == 1).
-        # The kernel parameter `softmax_scale: cutlass.Float32` is also non-optional,
-        # so passing None triggers a DSL cast error.
-        if cutlass.const_expr(self.score_mod is None):
-            softmax_scale_log2 = softmax_scale * utils.LOG2_E
-        else:
-            softmax_scale_log2 = utils.LOG2_E
+        # Discard the second return (adjusted softmax_scale) with `_` so the
+        # original `softmax_scale` param stays non-None: the SM80 backward kernel
+        # uses it directly for the dK epilogue scaling and its kernel parameter is
+        # non-optional. (upstream #2671)
+        softmax_scale_log2, _ = utils.compute_softmax_scale_log2(
+            softmax_scale, self.score_mod
+        )
         self.kernel(
             mQ,
             mK,

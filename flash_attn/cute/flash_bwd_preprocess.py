@@ -33,6 +33,7 @@ from flash_attn.cute.tile_scheduler import (
     SingleTileVarlenScheduler,
     TileSchedulerArguments,
 )
+from flash_attn.cute.pack_gqa import pack_gqa_layout
 
 
 class FlashAttentionBackwardPreprocess:
@@ -44,6 +45,10 @@ class FlashAttentionBackwardPreprocess:
         tile_m: int = 128,
         num_threads: int = 256,
         use_padded_offsets: bool = True,
+        nheads_major: bool = False,
+        pack_gqa: bool = False,
+        qhead_per_kvhead: int = 1,
+        nheads_kv: int = 1,
     ):
         """
         All contiguous dimensions must be at least 16 bytes aligned which indicates the head dimension
@@ -66,6 +71,10 @@ class FlashAttentionBackwardPreprocess:
         self.check_hdim_v_oob = head_dim_v != self.head_dim_v_padded
         self.num_threads = num_threads
         self.use_padded_offsets = use_padded_offsets
+        self.nheads_major = nheads_major
+        self.pack_gqa = pack_gqa
+        self.qhead_per_kvhead = qhead_per_kvhead
+        self.nheads_kv = nheads_kv
 
     @staticmethod
     def can_implement(dtype, head_dim, tile_m, num_threads) -> bool:
@@ -136,6 +145,9 @@ class FlashAttentionBackwardPreprocess:
         mCuSeqlensQ: Optional[cute.Tensor],  # (batch + 1,)
         mSeqUsedQ: Optional[cute.Tensor],  # (batch,)
         mdLSE: Optional[cute.Tensor],  # (batch, nheads, seqlen) or (nheads, total_q)
+        mRowMax: Optional[cute.Tensor],  # (b, s, n, h) or (t, n, h)
+        mScaleP: Optional[cute.Tensor],  # == mRowMax
+        softmax_scale: Float32,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -147,56 +159,107 @@ class FlashAttentionBackwardPreprocess:
         if const_expr(mPdPsum.element_type not in [Float32]):
             raise TypeError("PdPsum tensor must be Float32")
         if const_expr(mdQaccum is not None):
+            assert self.nheads_major is False
+            assert self.pack_gqa is False
+            assert self.use_padded_offsets is True
             if const_expr(mdQaccum.element_type not in [Float32]):
                 raise TypeError("dQaccum tensor must be Float32")
         if const_expr(mLSE is not None):
-            assert mLSElog2 is not None, "If mLSE is provided, mLSElog2 must also be provided"
             if const_expr(mLSE.element_type not in [Float32]):
                 raise TypeError("LSE tensor must be Float32")
+        if const_expr(mLSElog2 is not None):
             if const_expr(mLSElog2.element_type not in [Float32]):
                 raise TypeError("LSElog2 tensor must be Float32")
         if const_expr(mdLSE is not None):
             if const_expr(mdLSE.element_type not in [Float32]):
                 raise TypeError("dLSE tensor must be Float32")
+        if const_expr(mScaleP is not None):
+            assert self.nheads_major is True
+            assert self.pack_gqa is True
+            assert mRowMax is not None
+            if const_expr(mScaleP.element_type not in [Float32]):
+                raise TypeError("ScaleP tensor must be Float32")
+            if const_expr(mRowMax.element_type not in [Float32]):
+                raise TypeError("RowMax tensor must be Float32")
 
         self._setup_attributes()
 
-        # (batch, nheads, seqlen) -> (seqlen, nheads, batch) or (total_q, nheads) -> (nheads, total_q)
-        transpose = [2, 1, 0] if const_expr(mCuSeqlensQ is None) else [1, 0]
-        mPdPsum = layout_utils.select(mPdPsum, transpose)
-        if const_expr(mLSE is not None):
-            mLSE = layout_utils.select(mLSE, transpose)
-            mLSElog2 = layout_utils.select(mLSElog2, transpose)
-        if const_expr(mdLSE is not None):
-            mdLSE = layout_utils.select(mdLSE, transpose)
-        if const_expr(mdQaccum is not None):
-            mdQaccum = layout_utils.select(mdQaccum, transpose)
+        # (b, s, h, d)  -> (s, d, h, b)  or
+        # (total, h, d) -> (total, d, h)
+        QO_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
+        mO, mdO = [
+            cute.make_tensor(mX.iterator, cute.select(mX.layout, mode=QO_layout_transpose))
+            for mX in (mO, mdO)
+        ]
 
+        if const_expr(not self.nheads_major):
+            # (batch, nheads, seqlen) -> (seqlen, nheads, batch) or
+            # (nheads, total_q) -> (total_q, nheads)
+            transpose = [2, 1, 0] if const_expr(mCuSeqlensQ is None) else [1, 0]
+        else:
+            # (batch, seqlen, nheads) -> (seqlen, nheads, batch) or
+            # (total_q, nheads) -> (total_q, nheads)
+            transpose = [1, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 1]
+        mPdPsum, mLSE, mLSElog2, mdLSE, mdQaccum = [
+            layout_utils.select(mX, transpose) if mX is not None else None
+            for mX in (mPdPsum, mLSE, mLSElog2, mdLSE, mdQaccum)
+        ]
+
+        # (b, s, n, h) => (s, n, h, b) or
+        # (total, n, h) == (total, n, h)
+        rowmax_layout_transpose = [1, 2, 3, 0] if const_expr(mCuSeqlensQ is None) else [0, 1, 2]
+        if const_expr(mRowMax is not None):
+            mRowMax = layout_utils.select(mRowMax, rowmax_layout_transpose)
+        if const_expr(mScaleP is not None):
+            mScaleP = layout_utils.select(mScaleP, rowmax_layout_transpose)
+
+        # pack gqa
+        if const_expr(self.pack_gqa):
+            mO, mdO, mRowMax, mScaleP = [
+                pack_gqa_layout(mX, self.qhead_per_kvhead, self.nheads_kv, head_idx=2)
+                if mX is not None
+                else None
+                for mX in (mO, mdO, mRowMax, mScaleP)
+            ]
+            mPdPsum, mLSE, mLSElog2, mdLSE = [
+                pack_gqa_layout(mX, self.qhead_per_kvhead, self.nheads_kv, head_idx=1)
+                if mX is not None
+                else None
+                for mX in (mPdPsum, mLSE, mLSElog2, mdLSE)
+            ]
+
+        # mO: (s, d, h, b) or (total, d, h)
         if const_expr(mCuSeqlensQ is not None):
             TileScheduler = SingleTileVarlenScheduler
-            num_head = mO.shape[1]
+            num_head = mO.shape[2]
             num_batch = mCuSeqlensQ.shape[0] - 1
         else:
             TileScheduler = SingleTileScheduler
             num_head = mO.shape[2]
-            num_batch = mO.shape[0]
+            num_batch = mO.shape[3]
 
         tile_sched_args = TileSchedulerArguments(
-            num_block=cute.ceil_div(mO.shape[1], self.tile_m),
+            num_block=cute.ceil_div(mO.shape[0], self.tile_m),
             num_head=num_head,
             num_batch=num_batch,
             num_splits=1,
             seqlen_k=0,
             headdim=0,
-            headdim_v=mO.shape[2],
-            total_q=mO.shape[0],
+            headdim_v=mO.shape[1],
+            total_q=cute.size(mO.shape[0])
+            if const_expr(mCuSeqlensQ is not None)
+            else cute.size(mO.shape[0]) * cute.size(mO.shape[3]),
             tile_shape_mn=(self.tile_m, 1),
             mCuSeqlensQ=mCuSeqlensQ,
             mSeqUsedQ=mSeqUsedQ,
+            qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
         )
 
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
         grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
+
+        LOG2_E = math.log2(math.e)
+        softmax_scale_log2 = softmax_scale * LOG2_E
 
         self.kernel(
             mO,
@@ -208,6 +271,9 @@ class FlashAttentionBackwardPreprocess:
             mCuSeqlensQ,
             mSeqUsedQ,
             mdLSE,
+            mRowMax,
+            mScaleP,
+            softmax_scale_log2,
             self.gmem_tiled_copy_O,
             self.gmem_tiled_copy_dQaccum,
             tile_sched_params,
@@ -231,6 +297,9 @@ class FlashAttentionBackwardPreprocess:
         mCuSeqlensQ: Optional[cute.Tensor],
         mSeqUsedQ: Optional[cute.Tensor],
         mdLSE: Optional[cute.Tensor],
+        mRowMax: Optional[cute.Tensor],
+        mScaleP: Optional[cute.Tensor],
+        softmax_scale_log2: Float32,
         gmem_tiled_copy_O: cute.TiledCopy,
         gmem_tiled_copy_dQaccum: cute.TiledCopy,
         tile_sched_params: ParamsBase,
@@ -255,22 +324,23 @@ class FlashAttentionBackwardPreprocess:
             # ///////////////////////////////////////////////////////////////////////////////
             # Get the appropriate tiles for this thread block.
             # ///////////////////////////////////////////////////////////////////////////////
+            seqlen_static = mO.shape[0] if const_expr(not self.pack_gqa) else mO.shape[0][1]
             seqlen = SeqlenInfo.create(
-                batch_idx, mO.shape[1], mCuSeqlensQ, mSeqUsedQ, tile=self.tile_m
+                batch_idx, seqlen_static, mCuSeqlensQ, mSeqUsedQ, tile=self.tile_m
             )
-            mO_cur = seqlen.offset_batch(mO, batch_idx, dim=0)[None, head_idx, None]
-            mdO_cur = seqlen.offset_batch(mdO, batch_idx, dim=0)[None, head_idx, None]
-            # Stats buffers (dpsum/lse_log2) are always consumed with padded q-offsets
-            # on the generic backward path (mdQaccum is present). Keep dedicated hd256
-            # behavior controlled by self.use_padded_offsets.
-            stats_use_padded_offsets = self.use_padded_offsets
-            if const_expr(mdQaccum is not None):
-                stats_use_padded_offsets = True
+            # (seqlen, dv)
+            mO_cur, mdO_cur = [
+                seqlen.offset_batch(mX, batch_idx, dim=3)[None, None, head_idx] for mX in (mO, mdO)
+            ]
             mPdPsum_cur = seqlen.offset_batch(
-                mPdPsum, batch_idx, dim=2, padded=stats_use_padded_offsets
+                mPdPsum, batch_idx, dim=2, padded=self.use_padded_offsets
             )[None, head_idx]
-            headdim_v = mO_cur.shape[cute.rank(mO_cur) - 1]
-            seqlen_q = seqlen.seqlen
+            headdim_v = mO_cur.shape[1]
+            seqlen_q = (
+                seqlen.seqlen
+                if const_expr(not self.pack_gqa)
+                else seqlen.seqlen * self.qhead_per_kvhead
+            )
             seqlen_q_rounded = cute.round_up(seqlen_q, self.tile_m)
             seqlen_limit = seqlen_q - m_block * self.tile_m
 
@@ -349,7 +419,7 @@ class FlashAttentionBackwardPreprocess:
                     mdQaccum,
                     batch_idx,
                     dim=2,
-                    padded=True,
+                    padded=self.use_padded_offsets,
                     multiple=self.head_dim_padded,
                 )[None, head_idx]
                 blkdQaccum_shape = (self.tile_m * self.head_dim_padded,)
@@ -360,11 +430,36 @@ class FlashAttentionBackwardPreprocess:
                 zero.fill(0.0)
                 cute.copy(gmem_tiled_copy_dQaccum, zero, tdQgdQaccum)
 
-            if const_expr(mLSE is not None):
+            LOG2_E = math.log2(math.e)
+            lse_log2 = lse * LOG2_E if lse != -Float32.inf else 0.0
+            if const_expr(mLSElog2 is not None):
                 mLSElog2_cur = seqlen.offset_batch(
-                    mLSElog2, batch_idx, dim=2, padded=stats_use_padded_offsets
+                    mLSElog2, batch_idx, dim=2, padded=self.use_padded_offsets
                 )[None, head_idx]
                 gLSElog2 = cute.local_tile(mLSElog2_cur, (self.tile_m,), (m_block,))
                 LOG2_E = math.log2(math.e)
                 if tidx < seqlen_q_rounded - m_block * self.tile_m:
-                    gLSElog2[tidx] = lse * LOG2_E if lse != -Float32.inf else 0.0
+                    gLSElog2[tidx] = lse_log2
+
+            if const_expr(mRowMax is not None):
+                assert mLSE is not None
+                # (s, n)
+                mRowMax_cur, mScaleP_cur = [
+                    seqlen.offset_batch(mX, batch_idx, dim=3)[None, None, head_idx]
+                    for mX in (mRowMax, mScaleP)
+                ]
+                # (tile_m, n)
+                gRowMax, gScaleP = [
+                    cute.local_tile(mX, (self.tile_m,), (m_block, None))
+                    for mX in (mRowMax_cur, mScaleP_cur)
+                ]
+
+                assert self.tile_m <= self.num_threads
+                if const_expr(self.tile_m == self.num_threads) or tidx < self.tile_m:
+                    for n in cutlass.range(gRowMax.shape[1], unroll=4):
+                        row_max = gRowMax[tidx, n]
+                        scale = 0.0
+                        if row_max != -Float32.inf and lse != -Float32.inf:
+                            scale = softmax_scale_log2 * row_max - lse_log2
+                            scale = cute.math.exp2(scale, fastmath=True)
+                        gScaleP[tidx, n] = scale

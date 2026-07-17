@@ -122,7 +122,7 @@ def bench_fwd(batch, seqlen, nheads, hdim, causal, tile_m=None, tile_n=None,
         kwargs["intra_wg_overlap"] = intra_wg_overlap
 
     try:
-        out, _lse = _flash_attn_fwd(q, k, v, **kwargs)
+        out, _lse, *_ = _flash_attn_fwd(q, k, v, **kwargs)
     except Exception as e:
         return None, None, str(e)[:80]
 
@@ -160,7 +160,7 @@ def bench_bwd(batch, seqlen, nheads, hdim, causal, warmup=5, rep=30, hdim_v=None
     v = torch.randn(batch, seqlen, nheads, hdim_v, device="cuda", dtype=torch.bfloat16)
     softmax_scale = hdim ** -0.5
     try:
-        out, lse = _flash_attn_fwd(q, k, v, softmax_scale=softmax_scale, causal=causal,
+        out, lse, *_ = _flash_attn_fwd(q, k, v, softmax_scale=softmax_scale, causal=causal,
                                     return_lse=True)
     except Exception as e:
         return None, None, str(e)[:80]

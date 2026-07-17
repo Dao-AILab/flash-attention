@@ -352,32 +352,15 @@ def smid(*, loc=None, ip=None) -> Int32:
 def fmax(
     a: float | Float32, b: float | Float32, c: float | Float32 | None = None, *, loc=None, ip=None
 ) -> Float32:
-    from cutlass import CUDA_VERSION
-
-    # * NVVM call based on nvvm version
-    if CUDA_VERSION.major == 12 and CUDA_VERSION.minor == 9:
-        # Old API: requires explicit result type as first positional argument
-        return Float32(
-            nvvm.fmax(
-                T.f32(),
-                Float32(a).ir_value(loc=loc, ip=ip),
-                Float32(b).ir_value(loc=loc, ip=ip),
-                c=Float32(c).ir_value(loc=loc, ip=ip) if c is not None else None,
-                loc=loc,
-                ip=ip,
-            )
+    return Float32(
+        nvvm.fmax(
+            Float32(a).ir_value(loc=loc, ip=ip),
+            Float32(b).ir_value(loc=loc, ip=ip),
+            c=Float32(c).ir_value(loc=loc, ip=ip) if c is not None else None,
+            loc=loc,
+            ip=ip,
         )
-    else:
-        # New API: infers result type automatically
-        return Float32(
-            nvvm.fmax(
-                Float32(a).ir_value(loc=loc, ip=ip),
-                Float32(b).ir_value(loc=loc, ip=ip),
-                c=Float32(c).ir_value(loc=loc, ip=ip) if c is not None else None,
-                loc=loc,
-                ip=ip,
-            )
-        )
+    )
 
 
 @cute.jit
@@ -474,16 +457,22 @@ def fadd_reduce(
 
 @dsl_user_op
 def atomic_add_fp32(a: float | Float32, gmem_ptr: cute.Pointer, *, loc=None, ip=None) -> None:
-    gmem_ptr_i64 = gmem_ptr.toint(loc=loc, ip=ip).ir_value()
-    llvm.inline_asm(
-        None,
-        [gmem_ptr_i64, Float32(a).ir_value(loc=loc, ip=ip)],
-        "red.global.add.f32 [$0], $1;",
-        "l,f",
-        has_side_effects=True,
-        is_align_stack=False,
-        asm_dialect=llvm.AsmDialect.AD_ATT,
-    )
+    # gmem_ptr_i64 = gmem_ptr.toint(loc=loc, ip=ip).ir_value()
+    # # cache_hint = cutlass.Int64(0x12F0000000000000)
+    # llvm.inline_asm(
+    #     None,
+    #     [gmem_ptr_i64, Float32(a).ir_value(loc=loc, ip=ip)],
+    #     # [gmem_ptr_i64, Float32(a).ir_value(loc=loc, ip=ip), cache_hint.ir_value()],
+    #     "red.global.add.f32 [$0], $1;",
+    #     # "red.global.add.L2::cache_hint.f32 [$0], $1, 0x12F0000000000000;",
+    #     # "red.global.add.L2::cache_hint.f32 [$0], $1, $2;",
+    #     "l,f",
+    #     # "l,f,l",
+    #     has_side_effects=True,
+    #     is_align_stack=False,
+    #     asm_dialect=llvm.AsmDialect.AD_ATT,
+    # )
+    nvvm.atomicrmw(op=nvvm.AtomicOpKind.FADD, ptr=gmem_ptr.llvm_ptr, a=Float32(a).ir_value())
 
 
 @dsl_user_op
@@ -1045,3 +1034,76 @@ def get_batch_from_cu_tensor(idx: Int32, cu_tensor: cute.Tensor) -> Int32:
             hi = mid
 
     return lo
+
+
+def as_bshkrd_tensor(
+    tensor: cute.Tensor,
+    h_k: Int32,
+    h_r: Int32,
+    varlen: bool,
+) -> cute.Tensor:
+    """Normalize (B,S,H,D)/(S,H,D) tensors to (B,S,H_k,H_r,D) view."""
+    if cutlass.const_expr(cute.rank(tensor.layout) == 5):
+        return tensor
+    if cutlass.const_expr(cute.rank(tensor.layout) == 4):
+        return cute.make_tensor(
+            tensor.iterator,
+            cute.make_layout(
+                (tensor.shape[0], tensor.shape[1], h_k, h_r, tensor.shape[3]),
+                stride=(
+                    tensor.stride[0],
+                    tensor.stride[1],
+                    tensor.stride[2] * h_r,
+                    tensor.stride[2],
+                    tensor.stride[3],
+                ),
+            ),
+        )
+    assert cutlass.const_expr(cute.rank(tensor.layout) == 3), "Expected rank-3 varlen tensor"
+    assert cutlass.const_expr(varlen), "Rank-3 input is only valid for varlen"
+    return cute.make_tensor(
+        tensor.iterator,
+        cute.make_layout(
+            (1, tensor.shape[0], h_k, h_r, tensor.shape[2]),
+            stride=(
+                0,
+                tensor.stride[0],
+                tensor.stride[1] * h_r,
+                tensor.stride[1],
+                tensor.stride[2],
+            ),
+        ),
+    )
+
+
+def as_shhb_tensor(
+    tensor: cute.Tensor,
+    h_k: Int32,
+    h_r: Int32,
+    b: Int32,
+    varlen: bool,
+) -> cute.Tensor:
+    """Normalize (B,H,S)/(H,S) tensors to (S, ((H_r, H_k), B)) view."""
+    if cutlass.const_expr(cute.rank(tensor.layout) == 3):
+        return cute.make_tensor(
+            tensor.iterator,
+            cute.make_layout(
+                (tensor.shape[2], ((h_r, h_k), tensor.shape[0])),
+                stride=(
+                    tensor.stride[2],
+                    ((tensor.stride[1], tensor.stride[1] * h_r), tensor.stride[0]),
+                ),
+            ),
+        )
+    assert cutlass.const_expr(cute.rank(tensor.layout) == 2), "Expected rank-2 varlen tensor"
+    assert cutlass.const_expr(varlen), "Rank-2 input is only valid for varlen"
+    return cute.make_tensor(
+        tensor.iterator,
+        cute.make_layout(
+            (tensor.shape[1], ((h_r, h_k), b)),
+            stride=(
+                tensor.stride[1],
+                ((tensor.stride[0], tensor.stride[0] * h_r), 0),
+            ),
+        ),
+    )

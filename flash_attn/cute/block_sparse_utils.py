@@ -28,11 +28,22 @@ def _get_curr_blocksparse_tensors_varlen(
     m_block: cutlass.Int32,
     blocksparse_tensors: BlockSparseTensors,
     seqlen_info: SeqlenInfoQK,
+    kv_subtile_factor: cutlass.Constexpr[int] = 1,
 ) -> Tuple[cutlass.Int32, cute.Tensor, cutlass.Int32, Optional[cute.Tensor]]:
     """Varlen path: tensors are 2D [nheads, total_m_blocks] / [nheads, total_n_blocks]."""
     mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx, *_ = blocksparse_tensors
     curr_m_block = seqlen_info.m_block_offset + m_block
-    curr_block_idx_offset = seqlen_info.block_idx_offset + m_block * seqlen_info.num_n_blocks
+    sparse_num_n_blocks = (
+        seqlen_info.num_n_blocks
+        if const_expr(kv_subtile_factor == 1)
+        else (seqlen_info.num_n_blocks + kv_subtile_factor - 1) // kv_subtile_factor
+    )
+    batch_block_idx_offset = (
+        seqlen_info.block_idx_offset
+        if const_expr(seqlen_info.has_cu_block_idx_offsets)
+        else seqlen_info.m_block_offset * sparse_num_n_blocks
+    )
+    curr_block_idx_offset = batch_block_idx_offset + m_block * sparse_num_n_blocks
     curr_mask_block_cnt = mask_block_cnt[head_idx, curr_m_block]
     curr_mask_block_idx = cute.domain_offset(curr_block_idx_offset, mask_block_idx[head_idx, None])
     if const_expr(full_block_cnt is not None):
@@ -73,11 +84,12 @@ def get_curr_blocksparse_tensors(
     m_block: cutlass.Int32,
     blocksparse_tensors: BlockSparseTensors,
     seqlen_info: SeqlenInfoQK,
+    kv_subtile_factor: cutlass.Constexpr[int] = 1,
 ) -> Tuple[cutlass.Int32, cute.Tensor, cutlass.Int32, Optional[cute.Tensor]]:
     """Extract head, m_block, and batch-local blocksparsity data from blocksparse_tensors"""
     if const_expr(len(blocksparse_tensors.mask_block_cnt.shape) == 2):
         return _get_curr_blocksparse_tensors_varlen(
-            head_idx, m_block, blocksparse_tensors, seqlen_info
+            head_idx, m_block, blocksparse_tensors, seqlen_info, kv_subtile_factor
         )
     return _get_curr_blocksparse_tensors(batch_idx, head_idx, m_block, blocksparse_tensors)
 
@@ -124,11 +136,28 @@ def get_curr_blocksparse_tensors(
 #   to ack/advance, and arrives `mbar_P_full_O_rescaled` when MMA can proceed.
 #
 # Backward (SM100):
-# - Empty KV tile: for a given `n_block`, `total_m_block_cnt == 0` means no Q tiles contribute.
-# - Both the load and compute loops guard all pipeline work on `process_tile`, so empty tiles
-#   skip producer/consumer operations entirely (no per-tile mbarrier phase handshake like forward).
+# - Empty KV tile: for a given sparse `n_block`, `loop_count == 0` means no Q tiles contribute.
+# - Load helpers guard their prologue/mainloop/tail on `loop_count > 0`; MMA/softmax/relay use
+#   the same block-sparse count as `process_tile`. Empty tiles therefore skip both producer and
+#   consumer operations entirely, with no synthetic per-tile mbarrier handshake like forward.
+# - For non-empty tiles, producer tails are part of the non-empty load contract: the load warp emits
+#   exactly the Q/dO/LSE/dPsum/Qt/Kt items that the MMA and softmax consumers wait on, then tails the
+#   advanced producer states. Empty tiles leave producer and consumer states unchanged for the next tile.
 # - In the `not dKV_postprocess` path, dK/dV for empty KV tiles are explicitly written as zeros
 #   even when `process_tile == False` (see `flash_bwd_sm100.py` `should_zero_dKV`).
+
+
+@cute.jit
+def sparse_physical_n_block_forward(
+    block_indices: cute.Tensor,
+    offset,
+    kv_subtile_factor: cutlass.Constexpr[int],
+):
+    """Map forward physical N offsets to physical N tile indices."""
+    sparse_offset = offset // kv_subtile_factor
+    subtile_offset = offset - sparse_offset * kv_subtile_factor
+    coarse_block = block_indices[sparse_offset]
+    return coarse_block * kv_subtile_factor + subtile_offset
 
 
 @cute.jit
@@ -142,6 +171,7 @@ def load_block_list(
     pipeline_k,
     pipeline_v,
     intra_wg_overlap: cutlass.Constexpr,
+    kv_subtile_factor: cutlass.Constexpr[int] = 1,
 ):
     """Iterate over the sparse blocks and load K, V into the pipeline.
     For the intra_wg_overlap case, we overlap the loads of K and V. And this
@@ -159,23 +189,40 @@ def load_block_list(
 
     """
     if block_count > 0:
+        total_blocks = block_count * kv_subtile_factor
         if const_expr(not intra_wg_overlap):
-            for offset in cutlass.range(block_count):
-                n_block = block_indices[block_count - 1 - offset]
+            for offset in cutlass.range(total_blocks):
+                n_block = sparse_physical_n_block_forward(
+                    block_indices,
+                    total_blocks - 1 - offset,
+                    kv_subtile_factor,
+                )
                 pipeline_k.producer_acquire(kv_producer_state)
                 load_K(src_idx=n_block, producer_state=kv_producer_state)
                 pipeline_v.producer_acquire(kv_producer_state)
                 load_V(src_idx=n_block, producer_state=kv_producer_state)
                 kv_producer_state.advance()
         else:
-            n_block_first = block_indices[block_count - 1]
+            n_block_first = sparse_physical_n_block_forward(
+                block_indices,
+                total_blocks - 1,
+                kv_subtile_factor,
+            )
             if const_expr(not first_block_preloaded):
                 pipeline_k.producer_acquire(kv_producer_state)
                 load_K(src_idx=n_block_first, producer_state=kv_producer_state)
 
-            for idx in cutlass.range(block_count - 1, unroll=1):
-                n_block_prev = block_indices[block_count - 1 - idx]
-                n_block = block_indices[block_count - 2 - idx]
+            for idx in cutlass.range(total_blocks - 1, unroll=1):
+                n_block_prev = sparse_physical_n_block_forward(
+                    block_indices,
+                    total_blocks - 1 - idx,
+                    kv_subtile_factor,
+                )
+                n_block = sparse_physical_n_block_forward(
+                    block_indices,
+                    total_blocks - 1 - (idx + 1),
+                    kv_subtile_factor,
+                )
                 kv_producer_state_prev = kv_producer_state.clone()
                 kv_producer_state.advance()
                 pipeline_k.producer_acquire(kv_producer_state)
@@ -193,10 +240,11 @@ def finish_overlap_v_load(
     load_V,
     pipeline_v,
     kv_producer_state,
+    kv_subtile_factor: cutlass.Constexpr[int] = 1,
 ):
     """Load the final V block after overlapped K/V loads."""
     if block_count > 0:
-        n_block_last = block_indices[0]
+        n_block_last = block_indices[0] * kv_subtile_factor
         pipeline_v.producer_acquire(kv_producer_state)
         load_V(src_idx=n_block_last, producer_state=kv_producer_state)
         kv_producer_state.advance()
@@ -234,6 +282,7 @@ def produce_block_sparse_loads(
     intra_wg_overlap: cutlass.Constexpr,
     qhead_per_kvhead: cutlass.Constexpr[int] = 1,
     q_subtile_factor: cutlass.Constexpr[int] = 1,
+    kv_subtile_factor: cutlass.Constexpr[int] = 1,
 ):
     """Iterate over the mask and full block lists for a single tile.
 
@@ -251,6 +300,10 @@ def produce_block_sparse_loads(
         qhead_per_kvhead: Pack-GQA factor. When > 1, m_block is in packed space and
             must be converted to unpacked for sparse tensor indexing.
     """
+    # The SM90 consumer (consume_block_sparse_loads) has no kv_subtile support yet.
+    assert kv_subtile_factor == 1, (
+        "Coarse KV blocks (kv_subtile_factor > 1) are not supported on the SM90 forward path yet."
+    )
     m_block_sparse = sparse_tensor_m_block(m_block, qhead_per_kvhead, q_subtile_factor)
 
     (
@@ -264,6 +317,7 @@ def produce_block_sparse_loads(
         m_block_sparse,
         blocksparse_tensors,
         seqlen_info,
+        kv_subtile_factor,
     )
 
     mask_empty = curr_mask_block_cnt == 0
@@ -281,6 +335,7 @@ def produce_block_sparse_loads(
             pipeline_k=pipeline_k,
             pipeline_v=pipeline_v,
             intra_wg_overlap=intra_wg_overlap,
+            kv_subtile_factor=kv_subtile_factor,
         )
 
         if const_expr(intra_wg_overlap) and curr_full_block_cnt > 0:
@@ -290,6 +345,7 @@ def produce_block_sparse_loads(
                 load_V,
                 pipeline_v,
                 kv_producer_state,
+                kv_subtile_factor=kv_subtile_factor,
             )
     else:
         # Masked blocks present. When overlap is disabled this fully drains the list.
@@ -303,6 +359,7 @@ def produce_block_sparse_loads(
             pipeline_k=pipeline_k,
             pipeline_v=pipeline_v,
             intra_wg_overlap=intra_wg_overlap,
+            kv_subtile_factor=kv_subtile_factor,
         )
 
         if full_empty:
@@ -313,13 +370,18 @@ def produce_block_sparse_loads(
                     load_V,
                     pipeline_v,
                     kv_producer_state,
+                    kv_subtile_factor=kv_subtile_factor,
                 )
         else:
             if const_expr(intra_wg_overlap):
                 # Bridge the masked list to the full list by overlapping the pending masked V
                 # with the first full K load.
-                n_block_mask_last = curr_mask_block_idx[0]
-                n_block_full_first = curr_full_block_idx[curr_full_block_cnt - 1]
+                n_block_mask_last = curr_mask_block_idx[0] * kv_subtile_factor
+                n_block_full_first = sparse_physical_n_block_forward(
+                    curr_full_block_idx,
+                    curr_full_block_cnt * kv_subtile_factor - 1,
+                    kv_subtile_factor,
+                )
                 kv_producer_state_prev = kv_producer_state.clone()
                 kv_producer_state.advance()
                 pipeline_k.producer_acquire(kv_producer_state)
@@ -337,6 +399,7 @@ def produce_block_sparse_loads(
                     pipeline_k=pipeline_k,
                     pipeline_v=pipeline_v,
                     intra_wg_overlap=intra_wg_overlap,
+                    kv_subtile_factor=kv_subtile_factor,
                 )
 
                 kv_producer_state = finish_overlap_v_load(
@@ -345,6 +408,7 @@ def produce_block_sparse_loads(
                     load_V,
                     pipeline_v,
                     kv_producer_state,
+                    kv_subtile_factor=kv_subtile_factor,
                 )
             else:
                 # Non-overlap path with both lists: run the full list normally.
@@ -358,6 +422,7 @@ def produce_block_sparse_loads(
                     pipeline_k=pipeline_k,
                     pipeline_v=pipeline_v,
                     intra_wg_overlap=intra_wg_overlap,
+                    kv_subtile_factor=kv_subtile_factor,
                 )
 
     return kv_producer_state
@@ -573,12 +638,16 @@ def load_block_list_sm100(
     load_K,
     load_V,
     pipeline_kv,
+    kv_subtile_factor: cutlass.Constexpr[int] = 1,
 ):
-    """SM100 version of load_block_list (no intra_wg_overlap, no extra_tx_count)."""
-    block_count = block_end - block_begin
-    if block_count > 0:
+    """SM100 sparse load loop over physical N tiles from coarse metadata."""
+    physical_n_block = partial(
+        sparse_physical_n_block_forward, block_indices, kv_subtile_factor=kv_subtile_factor
+    )
+    physical_block_count = block_end - block_begin
+    if physical_block_count > 0:
         # First iteration: load Q alongside K if requested
-        n_block_first = block_indices[block_end - 1]
+        n_block_first = physical_n_block(block_end - 1)
 
         if const_expr(load_q_with_first):
             # SM100 loads Q0 and optionally Q1
@@ -594,8 +663,8 @@ def load_block_list_sm100(
         kv_producer_state.advance()
 
         # Remaining blocks
-        for offset in cutlass.range(1, block_count):
-            n_block = block_indices[block_end - 1 - offset]
+        for offset in cutlass.range(1, physical_block_count):
+            n_block = physical_n_block(block_end - 1 - offset)
             load_K(block=n_block, producer_state=kv_producer_state, page_idx=None)
             kv_producer_state.advance()
             load_V(block=n_block, producer_state=kv_producer_state, page_idx=None)
@@ -623,6 +692,7 @@ def produce_block_sparse_loads_sm100(
     q_producer_phase: Int32,
     qhead_per_kvhead: cutlass.Constexpr,
     q_subtile_factor: cutlass.Constexpr,
+    kv_subtile_factor: cutlass.Constexpr[int] = 1,
 ):
     """SM100 entry point for sparse block iteration.
 
@@ -646,10 +716,19 @@ def produce_block_sparse_loads_sm100(
         m_block_sparse,
         blocksparse_tensors,
         seqlen_info,
+        kv_subtile_factor,
     )
 
-    mask_begin, mask_end = split_block_range(curr_mask_block_cnt, split_idx, num_splits)
-    full_begin, full_end = split_block_range(curr_full_block_cnt, split_idx, num_splits)
+    mask_begin, mask_end = split_block_range(
+        curr_mask_block_cnt * kv_subtile_factor,
+        split_idx,
+        num_splits,
+    )
+    full_begin, full_end = split_block_range(
+        curr_full_block_cnt * kv_subtile_factor,
+        split_idx,
+        num_splits,
+    )
     mask_empty = mask_begin == mask_end
     full_empty = full_begin == full_end
 
@@ -668,6 +747,7 @@ def produce_block_sparse_loads_sm100(
             load_K=load_K,
             load_V=load_V,
             pipeline_kv=pipeline_kv,
+            kv_subtile_factor=kv_subtile_factor,
         )
         q_phase_flipped = not full_empty
     else:
@@ -683,6 +763,7 @@ def produce_block_sparse_loads_sm100(
             load_K=load_K,
             load_V=load_V,
             pipeline_kv=pipeline_kv,
+            kv_subtile_factor=kv_subtile_factor,
         )
         q_phase_flipped = True
 
@@ -699,6 +780,7 @@ def produce_block_sparse_loads_sm100(
                 load_K=load_K,
                 load_V=load_V,
                 pipeline_kv=pipeline_kv,
+                kv_subtile_factor=kv_subtile_factor,
             )
 
     if q_phase_flipped:
@@ -826,6 +908,7 @@ def get_total_block_count(
     qhead_per_kvhead: cutlass.Constexpr,
     q_subtile_factor: cutlass.Constexpr,
     seqlen_info: SeqlenInfoQK,
+    kv_subtile_factor: cutlass.Constexpr[int] = 1,
 ):
     m_block_sparse = sparse_tensor_m_block(m_block, qhead_per_kvhead, q_subtile_factor)
     (
@@ -839,10 +922,19 @@ def get_total_block_count(
         m_block_sparse,
         blocksparse_tensors,
         seqlen_info,
+        kv_subtile_factor,
     )
 
-    mask_begin, mask_end = split_block_range(curr_mask_block_cnt, split_idx, num_splits)
-    full_begin, full_end = split_block_range(curr_full_block_cnt, split_idx, num_splits)
+    mask_begin, mask_end = split_block_range(
+        curr_mask_block_cnt * kv_subtile_factor,
+        split_idx,
+        num_splits,
+    )
+    full_begin, full_end = split_block_range(
+        curr_full_block_cnt * kv_subtile_factor,
+        split_idx,
+        num_splits,
+    )
     return mask_end - mask_begin + full_end - full_begin
 
 
@@ -965,6 +1057,94 @@ def handle_block_sparse_empty_tile_correction_sm100(
 
 
 @cute.jit
+def softmax_block_sparse_sm100_list(
+    block_indices: cute.Tensor,
+    block_end,
+    split_block_cnt,
+    kv_subtile_factor: cutlass.Constexpr[int],
+    softmax_step: Callable,
+    mask_fn_base: Callable,
+    mma_si_consumer_phase: Int32,
+    si_corr_producer_phase: Int32,
+    s0_s1_sequence_phase: Int32,
+    check_m_boundary: bool,
+    is_first_block: bool,
+    allow_unmasked_inner_blocks: cutlass.Constexpr[bool],
+):
+    """Run one reverse sparse list while masking only the first coarse KV fragment."""
+    mask_fn_seqlen = partial(mask_fn_base, mask_seqlen=True, check_q_boundary=check_m_boundary)
+    physical_n_block = partial(
+        sparse_physical_n_block_forward, block_indices, kv_subtile_factor=kv_subtile_factor
+    )
+
+    n_block = physical_n_block(block_end - 1)
+    if is_first_block:
+        (
+            mma_si_consumer_phase,
+            si_corr_producer_phase,
+            s0_s1_sequence_phase,
+        ) = softmax_step(
+            mma_si_consumer_phase,
+            si_corr_producer_phase,
+            s0_s1_sequence_phase,
+            n_block,
+            is_first=True,
+            mask_fn=mask_fn_seqlen,
+        )
+    else:
+        (
+            mma_si_consumer_phase,
+            si_corr_producer_phase,
+            s0_s1_sequence_phase,
+        ) = softmax_step(
+            mma_si_consumer_phase,
+            si_corr_producer_phase,
+            s0_s1_sequence_phase,
+            n_block,
+            is_first=False,
+            mask_fn=mask_fn_seqlen,
+        )
+
+    first_fragment_count = cutlass.min(
+        split_block_cnt,
+        (block_end - 1) % kv_subtile_factor + 1,
+    )
+    for j in cutlass.range_constexpr(1, kv_subtile_factor):
+        if j < first_fragment_count:
+            (
+                mma_si_consumer_phase,
+                si_corr_producer_phase,
+                s0_s1_sequence_phase,
+            ) = softmax_step(
+                mma_si_consumer_phase,
+                si_corr_producer_phase,
+                s0_s1_sequence_phase,
+                physical_n_block(block_end - 1 - j),
+                mask_fn=mask_fn_seqlen,
+            )
+    for i in cutlass.range(first_fragment_count, split_block_cnt):
+        (
+            mma_si_consumer_phase,
+            si_corr_producer_phase,
+            s0_s1_sequence_phase,
+        ) = softmax_step(
+            mma_si_consumer_phase,
+            si_corr_producer_phase,
+            s0_s1_sequence_phase,
+            physical_n_block(block_end - 1 - i),
+            mask_fn=None
+            if const_expr(allow_unmasked_inner_blocks and check_m_boundary is False)
+            else partial(
+                mask_fn_base,
+                mask_seqlen=False,
+                check_q_boundary=check_m_boundary,
+            ),
+        )
+
+    return mma_si_consumer_phase, si_corr_producer_phase, s0_s1_sequence_phase
+
+
+@cute.jit
 def softmax_block_sparse_sm100(
     blocksparse_tensors: BlockSparseTensors,
     batch_idx,
@@ -986,6 +1166,7 @@ def softmax_block_sparse_sm100(
     check_m_boundary: bool,
     qhead_per_kvhead: cutlass.Constexpr,
     q_subtile_factor: cutlass.Constexpr[int] = 1,
+    kv_subtile_factor: cutlass.Constexpr[int] = 1,
 ):
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
     m_block_sparse = sparse_tensor_m_block(m_block, qhead_per_kvhead, q_subtile_factor)
@@ -1001,10 +1182,19 @@ def softmax_block_sparse_sm100(
         m_block_sparse,
         blocksparse_tensors,
         seqlen_info,
+        kv_subtile_factor,
     )
 
-    mask_begin, mask_end = split_block_range(curr_mask_block_cnt, split_idx, num_splits)
-    full_begin, full_end = split_block_range(curr_full_block_cnt, split_idx, num_splits)
+    mask_begin, mask_end = split_block_range(
+        curr_mask_block_cnt * kv_subtile_factor,
+        split_idx,
+        num_splits,
+    )
+    full_begin, full_end = split_block_range(
+        curr_full_block_cnt * kv_subtile_factor,
+        split_idx,
+        num_splits,
+    )
     split_mask_block_cnt = mask_end - mask_begin
     split_full_block_cnt = full_end - full_begin
     total_block_cnt = split_mask_block_cnt + split_full_block_cnt
@@ -1013,80 +1203,44 @@ def softmax_block_sparse_sm100(
         sm_stats_barrier.arrive_w_index(index=stage_idx * 4 + warp_idx)
     else:
         if split_mask_block_cnt > 0:
-            mask_n_block = curr_mask_block_idx[mask_end - 1]
             (
                 mma_si_consumer_phase,
                 si_corr_producer_phase,
                 s0_s1_sequence_phase,
-            ) = softmax_step(
+            ) = softmax_block_sparse_sm100_list(
+                curr_mask_block_idx,
+                mask_end,
+                split_mask_block_cnt,
+                kv_subtile_factor,
+                softmax_step,
+                mask_fn,
                 mma_si_consumer_phase,
                 si_corr_producer_phase,
                 s0_s1_sequence_phase,
-                mask_n_block,
-                is_first=True,
-                mask_fn=partial(mask_fn, mask_seqlen=True, check_q_boundary=check_m_boundary),
+                check_m_boundary,
+                True,
+                False,
             )
-            for i in cutlass.range(1, split_mask_block_cnt):
-                mask_n_block = curr_mask_block_idx[mask_end - 1 - i]
-                (
-                    mma_si_consumer_phase,
-                    si_corr_producer_phase,
-                    s0_s1_sequence_phase,
-                ) = softmax_step(
-                    mma_si_consumer_phase,
-                    si_corr_producer_phase,
-                    s0_s1_sequence_phase,
-                    mask_n_block,
-                    mask_fn=partial(mask_fn, mask_seqlen=False, check_q_boundary=check_m_boundary),
-                )
 
         if split_full_block_cnt > 0:
-            full_n_block = curr_full_block_idx[full_end - 1]
-            if split_mask_block_cnt == 0:
-                (
-                    mma_si_consumer_phase,
-                    si_corr_producer_phase,
-                    s0_s1_sequence_phase,
-                ) = softmax_step(
-                    mma_si_consumer_phase,
-                    si_corr_producer_phase,
-                    s0_s1_sequence_phase,
-                    full_n_block,
-                    is_first=True,
-                    mask_fn=partial(
-                        mask_fn_none, mask_seqlen=True, check_q_boundary=check_m_boundary
-                    ),
-                )
-            else:
-                (
-                    mma_si_consumer_phase,
-                    si_corr_producer_phase,
-                    s0_s1_sequence_phase,
-                ) = softmax_step(
-                    mma_si_consumer_phase,
-                    si_corr_producer_phase,
-                    s0_s1_sequence_phase,
-                    full_n_block,
-                    is_first=False,
-                    mask_fn=partial(
-                        mask_fn_none, mask_seqlen=True, check_q_boundary=check_m_boundary
-                    ),
-                )
-            for i in cutlass.range(1, split_full_block_cnt):
-                full_n_block = curr_full_block_idx[full_end - 1 - i]
-                (
-                    mma_si_consumer_phase,
-                    si_corr_producer_phase,
-                    s0_s1_sequence_phase,
-                ) = softmax_step(
-                    mma_si_consumer_phase,
-                    si_corr_producer_phase,
-                    s0_s1_sequence_phase,
-                    full_n_block,
-                    mask_fn=partial(
-                        mask_fn_none, mask_seqlen=False, check_q_boundary=check_m_boundary
-                    ),
-                )
+            (
+                mma_si_consumer_phase,
+                si_corr_producer_phase,
+                s0_s1_sequence_phase,
+            ) = softmax_block_sparse_sm100_list(
+                curr_full_block_idx,
+                full_end,
+                split_full_block_cnt,
+                kv_subtile_factor,
+                softmax_step,
+                mask_fn_none,
+                mma_si_consumer_phase,
+                si_corr_producer_phase,
+                s0_s1_sequence_phase,
+                check_m_boundary,
+                split_mask_block_cnt == 0,
+                True,
+            )
 
     return (
         mma_si_consumer_phase,
@@ -1116,7 +1270,7 @@ def get_total_q_block_count_bwd(
     batch_idx,
     head_idx,
     n_block,
-    subtile_factor: cutlass.Constexpr = 1,
+    q_subtile_factor: cutlass.Constexpr = 1,
     m_block_max: int = 0,
 ):
     """Count total tile iterations for given n_block (KV tile) in backward."""
@@ -1124,16 +1278,16 @@ def get_total_q_block_count_bwd(
     total = q_block_cnt[batch_idx, head_idx, n_block]
     if const_expr(full_block_cnt is not None):
         total = total + full_block_cnt[batch_idx, head_idx, n_block]
-    return total * subtile_factor
+    return total * q_subtile_factor
 
 
 @cute.jit
-def produce_block_sparse_q_loads_bwd_sm100(
+def produce_block_sparse_q_loads_bwd_sm100_default(
     blocksparse_tensors: BlockSparseTensors,
     batch_idx,
     head_idx,
     n_block,
-    # Pipeline states (will be returned after advancing)
+    # Pipeline states returned after advancing
     producer_state_Q_LSE,
     producer_state_dO_dPsum,
     # Pipelines
@@ -1159,14 +1313,20 @@ def produce_block_sparse_q_loads_bwd_sm100(
     should_load_Q: cutlass.Constexpr,
     should_load_dO: cutlass.Constexpr,
     # Subtiling factor and bounds
-    subtile_factor: cutlass.Constexpr = 1,
+    q_subtile_factor: cutlass.Constexpr = 1,
     m_block_max: int = 0,
+    # Optional 2CTA state for hdim <= 128
+    use_2cta_instrs: cutlass.Constexpr = False,
+    producer_state_Qt=None,
+    producer_state_Kt=None,
+    pipeline_Qt=None,
+    pipeline_Kt=None,
+    load_Qt=None,
+    load_Kt=None,
+    load_dOt=None,
+    tma_copy_bytes_dO=0,
 ):
-    """SM100 backward block sparse loading with subtiling.
-
-    Returns updated (producer_state_Q_LSE, producer_state_dO_dPsum).
-    First iteration loads K/V alongside Q/dO; subsequent iterations load only Q/dO.
-    """
+    """Produce SM100 backward block-sparse Q/dO loads for 1CTA and non-hdim192 2CTA."""
     (
         curr_q_cnt,
         curr_q_idx,
@@ -1174,81 +1334,325 @@ def produce_block_sparse_q_loads_bwd_sm100(
         curr_full_idx,
         loop_count,
     ) = get_block_sparse_iteration_info_bwd(
-        blocksparse_tensors, batch_idx, head_idx, n_block, subtile_factor, m_block_max
+        blocksparse_tensors, batch_idx, head_idx, n_block, q_subtile_factor, m_block_max
     )
-
-    for iter_idx in cutlass.range(loop_count, unroll=1):
-        m_block, _ = get_m_block_from_iter_bwd(
-            iter_idx,
+    # 2 cta peels the first loop for Qt path; so we guard the whole block if loopcount == 0
+    if loop_count > Int32(0):
+        first_m_block, _ = get_m_block_from_iter_bwd(
+            Int32(0),
             curr_q_cnt,
             curr_q_idx,
             curr_full_cnt,
             curr_full_idx,
-            subtile_factor,
-            m_block_max,
+            q_subtile_factor=q_subtile_factor,
+            m_block_max=m_block_max,
         )
-        m_block_safe = m_block
+        # with q_subtile > 1 we need to guard against fully OOB regions
         if m_block_max > 0:
-            m_block_safe = cutlass.min(m_block, m_block_max - 1)
+            first_m_block = cutlass.min(first_m_block, m_block_max - 1)
 
-        if iter_idx == 0:
-            # First block: load K/V alongside Q/dO
+        if const_expr(should_load_Q):
+            pipeline_Q.producer_acquire(producer_state_Q_LSE, extra_tx_count=tma_copy_bytes_K)
+            load_K(tma_bar_ptr=pipeline_Q.producer_get_barrier(producer_state_Q_LSE))
+            load_Q(first_m_block, producer_state=producer_state_Q_LSE)
+            pipeline_Q.producer_commit(producer_state_Q_LSE)
+
+            pipeline_LSE.producer_acquire(producer_state_Q_LSE)
+            with cute.arch.elect_one():
+                copy_stats(
+                    gLSE[None, first_m_block],
+                    sLSE[None, producer_state_Q_LSE.index],
+                    mbar_ptr=pipeline_LSE.producer_get_barrier(producer_state_Q_LSE),
+                )
+            producer_state_Q_LSE.advance()
+
+        if const_expr(should_load_dO):
+            pipeline_dO.producer_acquire(
+                producer_state_dO_dPsum,
+                extra_tx_count=tma_copy_bytes_V + tma_copy_bytes_dO
+                if const_expr(load_dOt is not None)
+                else tma_copy_bytes_V,
+            )
+            load_V(tma_bar_ptr=pipeline_dO.producer_get_barrier(producer_state_dO_dPsum))
+            load_dO(first_m_block, producer_state=producer_state_dO_dPsum)
+            if const_expr(load_dOt is not None):
+                load_dOt(first_m_block, producer_state=producer_state_dO_dPsum)
+            pipeline_dO.producer_commit(producer_state_dO_dPsum)
+
+            pipeline_dPsum.producer_acquire(producer_state_dO_dPsum)
+            with cute.arch.elect_one():
+                copy_stats(
+                    gdPsum[None, first_m_block],
+                    sdPsum[None, producer_state_dO_dPsum.index],
+                    mbar_ptr=pipeline_dPsum.producer_get_barrier(producer_state_dO_dPsum),
+                )
+            producer_state_dO_dPsum.advance()
+
+        if const_expr(use_2cta_instrs):
+            assert load_Kt is not None and pipeline_Kt is not None
+            assert producer_state_Kt is not None
+            pipeline_Kt.producer_acquire(producer_state_Kt)
+            load_Kt(tma_bar_ptr=pipeline_Kt.producer_get_barrier(producer_state_Kt))
+            pipeline_Kt.producer_commit(producer_state_Kt)
+            producer_state_Kt.advance()
+
+        prev_m_block = first_m_block
+        for iter_idx in cutlass.range(Int32(1), loop_count, unroll=1):
+            m_block, _ = get_m_block_from_iter_bwd(
+                iter_idx,
+                curr_q_cnt,
+                curr_q_idx,
+                curr_full_cnt,
+                curr_full_idx,
+                q_subtile_factor=q_subtile_factor,
+                m_block_max=m_block_max,
+            )
+            if m_block_max > 0:
+                m_block = cutlass.min(m_block, m_block_max - 1)
             if const_expr(should_load_Q):
-                pipeline_Q.producer_acquire(producer_state_Q_LSE, extra_tx_count=tma_copy_bytes_K)
-                load_K(tma_bar_ptr=pipeline_Q.producer_get_barrier(producer_state_Q_LSE))
-                load_Q(m_block_safe, producer_state=producer_state_Q_LSE)
+                if const_expr(load_Qt is not None):
+                    assert pipeline_Qt is not None and producer_state_Qt is not None
+                    pipeline_Qt.producer_acquire(producer_state_Qt)
+                    load_Qt(prev_m_block, producer_state=producer_state_Qt)
+                    pipeline_Qt.producer_commit(producer_state_Qt)
+                    producer_state_Qt.advance()
+
+                pipeline_Q.producer_acquire(producer_state_Q_LSE)
+                load_Q(m_block, producer_state=producer_state_Q_LSE)
                 pipeline_Q.producer_commit(producer_state_Q_LSE)
+
                 pipeline_LSE.producer_acquire(producer_state_Q_LSE)
                 with cute.arch.elect_one():
                     copy_stats(
-                        gLSE[None, m_block_safe],
+                        gLSE[None, m_block],
                         sLSE[None, producer_state_Q_LSE.index],
                         mbar_ptr=pipeline_LSE.producer_get_barrier(producer_state_Q_LSE),
                     )
                 producer_state_Q_LSE.advance()
+
             if const_expr(should_load_dO):
                 pipeline_dO.producer_acquire(
-                    producer_state_dO_dPsum, extra_tx_count=tma_copy_bytes_V
+                    producer_state_dO_dPsum,
+                    extra_tx_count=tma_copy_bytes_dO if const_expr(load_dOt is not None) else 0,
                 )
-                load_V(tma_bar_ptr=pipeline_dO.producer_get_barrier(producer_state_dO_dPsum))
-                load_dO(m_block_safe, producer_state=producer_state_dO_dPsum)
+                load_dO(m_block, producer_state=producer_state_dO_dPsum)
+                if const_expr(load_dOt is not None):
+                    load_dOt(m_block, producer_state=producer_state_dO_dPsum)
                 pipeline_dO.producer_commit(producer_state_dO_dPsum)
-                pipeline_dPsum.producer_acquire(producer_state_dO_dPsum)
-                with cute.arch.elect_one():
-                    copy_stats(
-                        gdPsum[None, m_block_safe],
-                        sdPsum[None, producer_state_dO_dPsum.index],
-                        mbar_ptr=pipeline_dPsum.producer_get_barrier(producer_state_dO_dPsum),
-                    )
-                producer_state_dO_dPsum.advance()
-        else:
-            # Subsequent blocks: just load Q/dO (K/V already loaded)
-            if const_expr(should_load_Q):
-                pipeline_Q.producer_acquire(producer_state_Q_LSE)
-                load_Q(m_block_safe, producer_state=producer_state_Q_LSE)
-                pipeline_Q.producer_commit(producer_state_Q_LSE)
-                pipeline_LSE.producer_acquire(producer_state_Q_LSE)
-                with cute.arch.elect_one():
-                    copy_stats(
-                        gLSE[None, m_block_safe],
-                        sLSE[None, producer_state_Q_LSE.index],
-                        mbar_ptr=pipeline_LSE.producer_get_barrier(producer_state_Q_LSE),
-                    )
-                producer_state_Q_LSE.advance()
-            if const_expr(should_load_dO):
-                pipeline_dO.producer_acquire(producer_state_dO_dPsum)
-                load_dO(m_block_safe, producer_state=producer_state_dO_dPsum)
-                pipeline_dO.producer_commit(producer_state_dO_dPsum)
-                pipeline_dPsum.producer_acquire(producer_state_dO_dPsum)
-                with cute.arch.elect_one():
-                    copy_stats(
-                        gdPsum[None, m_block_safe],
-                        sdPsum[None, producer_state_dO_dPsum.index],
-                        mbar_ptr=pipeline_dPsum.producer_get_barrier(producer_state_dO_dPsum),
-                    )
-                producer_state_dO_dPsum.advance()
 
-    return producer_state_Q_LSE, producer_state_dO_dPsum
+                pipeline_dPsum.producer_acquire(producer_state_dO_dPsum)
+                with cute.arch.elect_one():
+                    copy_stats(
+                        gdPsum[None, m_block],
+                        sdPsum[None, producer_state_dO_dPsum.index],
+                        mbar_ptr=pipeline_dPsum.producer_get_barrier(producer_state_dO_dPsum),
+                    )
+                producer_state_dO_dPsum.advance()
+            prev_m_block = m_block
+
+        if const_expr(should_load_Q):
+            if const_expr(load_Qt is not None):
+                assert pipeline_Qt is not None and producer_state_Qt is not None
+                pipeline_Qt.producer_acquire(producer_state_Qt)
+                load_Qt(prev_m_block, producer_state=producer_state_Qt)
+                pipeline_Qt.producer_commit(producer_state_Qt)
+                producer_state_Qt.advance()
+
+            pipeline_Q.producer_tail(producer_state_Q_LSE.clone())
+            pipeline_LSE.producer_tail(producer_state_Q_LSE)
+            if const_expr(load_Qt is not None):
+                pipeline_Qt.producer_tail(producer_state_Qt)
+        if const_expr(should_load_dO):
+            pipeline_dO.producer_tail(producer_state_dO_dPsum.clone())
+            pipeline_dPsum.producer_tail(producer_state_dO_dPsum)
+
+    return producer_state_Q_LSE, producer_state_dO_dPsum, producer_state_Qt, producer_state_Kt
+
+
+@cute.jit
+def produce_block_sparse_q_loads_bwd_sm100_2cta_hdim192(
+    blocksparse_tensors: BlockSparseTensors,
+    batch_idx,
+    head_idx,
+    n_block,
+    # Pipeline states returned after advancing
+    producer_state_Q_Qt,
+    producer_state_O_Ot,
+    producer_state_LSE,
+    producer_state_dPsum,
+    # Pipelines
+    pipeline_Q,
+    pipeline_LSE,
+    pipeline_dO,
+    pipeline_dPsum,
+    pipeline_Qt,
+    # Load functions
+    load_K,
+    load_V,
+    load_Q,
+    load_dO,
+    load_Qt,
+    load_Kt,
+    load_dOt,
+    copy_stats,
+    # Global tensors for LSE/dPsum
+    gLSE,
+    sLSE,
+    gdPsum,
+    sdPsum,
+    # TMA copy bytes for extra_tx_count
+    tma_copy_bytes_K,
+    tma_copy_bytes_V,
+    # Subtiling factor and bounds
+    q_subtile_factor: cutlass.Constexpr = 1,
+    m_block_max: int = 0,
+):
+    """Produce SM100 backward block-sparse Q/dO loads for the hdim192 2CTA schedule."""
+    (
+        curr_q_cnt,
+        curr_q_idx,
+        curr_full_cnt,
+        curr_full_idx,
+        loop_count,
+    ) = get_block_sparse_iteration_info_bwd(
+        blocksparse_tensors, batch_idx, head_idx, n_block, q_subtile_factor, m_block_max
+    )
+
+    if loop_count > Int32(0):
+        first_m_block, _ = get_m_block_from_iter_bwd(
+            Int32(0),
+            curr_q_cnt,
+            curr_q_idx,
+            curr_full_cnt,
+            curr_full_idx,
+            q_subtile_factor=q_subtile_factor,
+            m_block_max=m_block_max,
+        )
+
+        # with q_subtile > 1 we need to guard against fully OOB regions
+        if m_block_max > 0:
+            first_m_block = cutlass.min(first_m_block, m_block_max - 1)
+
+        # K & Q (for S)
+        pipeline_Q.producer_acquire(
+            producer_state_Q_Qt,
+            extra_tx_count=tma_copy_bytes_K,
+        )
+        load_K(tma_bar_ptr=pipeline_Q.producer_get_barrier(producer_state_Q_Qt))
+        load_Q(first_m_block, producer_state=producer_state_Q_Qt)
+        pipeline_Q.producer_commit(producer_state_Q_Qt)
+        producer_state_Q_Qt.advance()
+
+        # LSE
+        pipeline_LSE.producer_acquire(producer_state_LSE)
+        with cute.arch.elect_one():
+            copy_stats(
+                gLSE[None, first_m_block],
+                sLSE[None, producer_state_LSE.index],
+                mbar_ptr=pipeline_LSE.producer_get_barrier(producer_state_LSE),
+            )
+        producer_state_LSE.advance()
+
+        # dOt + V, for dP.T = V @ dO.T
+        pipeline_dO.producer_acquire(
+            producer_state_O_Ot,
+            extra_tx_count=tma_copy_bytes_V,
+        )
+        load_V(tma_bar_ptr=pipeline_dO.producer_get_barrier(producer_state_O_Ot))
+        load_dOt(first_m_block, producer_state=producer_state_O_Ot)
+        pipeline_dO.producer_commit(producer_state_O_Ot)
+        producer_state_O_Ot.advance()
+
+        # dPsum
+        pipeline_dPsum.producer_acquire(producer_state_dPsum)
+        with cute.arch.elect_one():
+            copy_stats(
+                gdPsum[None, first_m_block],
+                sdPsum[None, producer_state_dPsum.index],
+                mbar_ptr=pipeline_dPsum.producer_get_barrier(producer_state_dPsum),
+            )
+        producer_state_dPsum.advance()
+
+        # Qt, for dK = dS.T @ Q
+        pipeline_Qt.producer_acquire(
+            producer_state_Q_Qt,
+            extra_tx_count=tma_copy_bytes_K,
+        )
+        load_Qt(first_m_block, producer_state=producer_state_Q_Qt)
+        load_Kt(tma_bar_ptr=pipeline_Qt.producer_get_barrier(producer_state_Q_Qt))
+        pipeline_Qt.producer_commit(producer_state_Q_Qt)
+        producer_state_Q_Qt.advance()
+
+        # dO, for dV = P.T @ dO
+        pipeline_dO.producer_acquire(producer_state_O_Ot)
+        load_dO(first_m_block, producer_state=producer_state_O_Ot)
+        pipeline_dO.producer_commit(producer_state_O_Ot)
+        producer_state_O_Ot.advance()
+
+        # 2CTA: [lse | Q | dOt | dPsum | Qt | dO]
+        for iter_idx in cutlass.range(Int32(1), loop_count, unroll=1):
+            m_block, _ = get_m_block_from_iter_bwd(
+                iter_idx,
+                curr_q_cnt,
+                curr_q_idx,
+                curr_full_cnt,
+                curr_full_idx,
+                q_subtile_factor=q_subtile_factor,
+                m_block_max=m_block_max,
+            )
+            if m_block_max > 0:
+                m_block = cutlass.min(m_block, m_block_max - 1)
+
+            # LSE
+            pipeline_LSE.producer_acquire(producer_state_LSE)
+            with cute.arch.elect_one():
+                copy_stats(
+                    gLSE[None, m_block],
+                    sLSE[None, producer_state_LSE.index],
+                    mbar_ptr=pipeline_LSE.producer_get_barrier(producer_state_LSE),
+                )
+            producer_state_LSE.advance()
+
+            # Q
+            pipeline_Q.producer_acquire(producer_state_Q_Qt)
+            load_Q(m_block, producer_state=producer_state_Q_Qt)
+            pipeline_Q.producer_commit(producer_state_Q_Qt)
+            producer_state_Q_Qt.advance()
+
+            # dPsum
+            pipeline_dPsum.producer_acquire(producer_state_dPsum)
+            with cute.arch.elect_one():
+                copy_stats(
+                    gdPsum[None, m_block],
+                    sdPsum[None, producer_state_dPsum.index],
+                    mbar_ptr=pipeline_dPsum.producer_get_barrier(producer_state_dPsum),
+                )
+            producer_state_dPsum.advance()
+
+            # dOt, for dP.T = V @ dO.T
+            pipeline_dO.producer_acquire(producer_state_O_Ot)
+            load_dOt(m_block, producer_state=producer_state_O_Ot)
+            pipeline_dO.producer_commit(producer_state_O_Ot)
+            producer_state_O_Ot.advance()
+
+            # Qt, for dK = dS.T @ Q
+            pipeline_Qt.producer_acquire(producer_state_Q_Qt)
+            load_Qt(m_block, producer_state=producer_state_Q_Qt)
+            pipeline_Qt.producer_commit(producer_state_Q_Qt)
+            producer_state_Q_Qt.advance()
+
+            # dO, for dV = P.T @ dO
+            pipeline_dO.producer_acquire(producer_state_O_Ot)
+            load_dO(m_block, producer_state=producer_state_O_Ot)
+            pipeline_dO.producer_commit(producer_state_O_Ot)
+            producer_state_O_Ot.advance()
+
+        pipeline_Q.producer_tail(producer_state_Q_Qt)
+        pipeline_LSE.producer_tail(producer_state_LSE)
+        pipeline_dO.producer_tail(producer_state_O_Ot)
+        pipeline_dPsum.producer_tail(producer_state_dPsum)
+
+    return producer_state_Q_Qt, producer_state_O_Ot, producer_state_LSE, producer_state_dPsum
 
 
 @cute.jit
@@ -1257,7 +1661,7 @@ def get_block_sparse_iteration_info_bwd(
     batch_idx,
     head_idx,
     n_block,
-    subtile_factor: cutlass.Constexpr = 1,
+    q_subtile_factor: cutlass.Constexpr = 1,
     m_block_max: int = 0,
 ):
     """Extract block-sparse iteration info for backward pass.
@@ -1278,7 +1682,7 @@ def get_block_sparse_iteration_info_bwd(
     sparse_block_count = curr_q_cnt
     if const_expr(full_cnt is not None):
         sparse_block_count = sparse_block_count + curr_full_cnt
-    total_count = sparse_block_count * subtile_factor
+    total_count = sparse_block_count * q_subtile_factor
 
     return curr_q_cnt, curr_q_idx, curr_full_cnt, curr_full_idx, total_count
 
@@ -1290,7 +1694,7 @@ def get_m_block_from_iter_bwd(
     curr_q_idx: cute.Tensor,
     curr_full_cnt,
     curr_full_idx: Optional[cute.Tensor],
-    subtile_factor: cutlass.Constexpr = 1,
+    q_subtile_factor: cutlass.Constexpr = 1,
     m_block_max: int = 0,
 ):
     """Derive m_block index and is_full_block flag from iteration index.
@@ -1299,8 +1703,8 @@ def get_m_block_from_iter_bwd(
         - m_block: The actual Q-tile block index
         - is_full_block: True if this is a full block (no mask_mod needed)
     """
-    sparse_iter_idx = iter_idx // subtile_factor
-    subtile_offset = iter_idx % subtile_factor
+    sparse_iter_idx = iter_idx // q_subtile_factor
+    subtile_offset = iter_idx % q_subtile_factor
 
     sparse_m_block = Int32(0)
     is_full_block = False
@@ -1313,7 +1717,7 @@ def get_m_block_from_iter_bwd(
     else:
         sparse_m_block = curr_q_idx[sparse_iter_idx]
 
-    return sparse_m_block * subtile_factor + subtile_offset, is_full_block
+    return sparse_m_block * q_subtile_factor + subtile_offset, is_full_block
 
 
 @cute.jit
@@ -1378,7 +1782,7 @@ def produce_block_sparse_q_loads_bwd_sm90(
     tma_copy_bytes_K,
     tma_copy_bytes_V,
     Q_stage_eq_dO_stage: cutlass.Constexpr,
-    subtile_factor: cutlass.Constexpr,
+    q_subtile_factor: cutlass.Constexpr,
     m_block_max: int,
 ):
     """SM90 backward block sparse loading with separate partial/full loops.
@@ -1401,10 +1805,10 @@ def produce_block_sparse_q_loads_bwd_sm90(
 
     kv_loaded = False
 
-    for iter_idx in cutlass.range(curr_q_cnt * subtile_factor, unroll=1):
-        sparse_idx = iter_idx // subtile_factor
-        subtile_offset = iter_idx % subtile_factor
-        m_block = curr_q_idx[sparse_idx] * subtile_factor + subtile_offset
+    for iter_idx in cutlass.range(curr_q_cnt * q_subtile_factor, unroll=1):
+        sparse_idx = iter_idx // q_subtile_factor
+        subtile_offset = iter_idx % q_subtile_factor
+        m_block = curr_q_idx[sparse_idx] * q_subtile_factor + subtile_offset
 
         if m_block < m_block_max:
             producer_state_Q, producer_state_dO = _load_q_do_block_sm90(
@@ -1427,10 +1831,10 @@ def produce_block_sparse_q_loads_bwd_sm90(
             kv_loaded = True
 
     if const_expr(full_cnt is not None):
-        for iter_idx in cutlass.range(curr_full_cnt * subtile_factor, unroll=1):
-            sparse_idx = iter_idx // subtile_factor
-            subtile_offset = iter_idx % subtile_factor
-            m_block = curr_full_idx[sparse_idx] * subtile_factor + subtile_offset
+        for iter_idx in cutlass.range(curr_full_cnt * q_subtile_factor, unroll=1):
+            sparse_idx = iter_idx // q_subtile_factor
+            subtile_offset = iter_idx % q_subtile_factor
+            m_block = curr_full_idx[sparse_idx] * q_subtile_factor + subtile_offset
 
             if m_block < m_block_max:
                 producer_state_Q, producer_state_dO = _load_q_do_block_sm90(
@@ -1471,7 +1875,7 @@ def consume_block_sparse_mma_bwd_sm90(
     thr_mma_SdP,
     score_mod_fn=None,
     score_mod_bwd_fn=None,
-    subtile_factor: cutlass.Constexpr = 1,
+    q_subtile_factor: cutlass.Constexpr = 1,
     m_block_max: int = 0,
     aux_data: AuxData = AuxData(),
     fastdiv_mods=(None, None),
@@ -1523,10 +1927,10 @@ def consume_block_sparse_mma_bwd_sm90(
         fastdiv_mods=fastdiv_mods,
     )
 
-    for iter_idx in cutlass.range(curr_q_cnt * subtile_factor, unroll=1):
-        sparse_idx = iter_idx // subtile_factor
-        subtile_offset = iter_idx % subtile_factor
-        m_block = curr_q_idx[sparse_idx] * subtile_factor + subtile_offset
+    for iter_idx in cutlass.range(curr_q_cnt * q_subtile_factor, unroll=1):
+        sparse_idx = iter_idx // q_subtile_factor
+        subtile_offset = iter_idx % q_subtile_factor
+        m_block = curr_q_idx[sparse_idx] * q_subtile_factor + subtile_offset
 
         if m_block < m_block_max:
             consumer_state_Q, consumer_state_dO = mma_one_m_block_fn(
@@ -1541,10 +1945,10 @@ def consume_block_sparse_mma_bwd_sm90(
             dKV_accumulate = True
 
     if const_expr(full_cnt is not None):
-        for iter_idx in cutlass.range(curr_full_cnt * subtile_factor, unroll=1):
-            sparse_idx = iter_idx // subtile_factor
-            subtile_offset = iter_idx % subtile_factor
-            m_block = curr_full_idx[sparse_idx] * subtile_factor + subtile_offset
+        for iter_idx in cutlass.range(curr_full_cnt * q_subtile_factor, unroll=1):
+            sparse_idx = iter_idx // q_subtile_factor
+            subtile_offset = iter_idx % q_subtile_factor
+            m_block = curr_full_idx[sparse_idx] * q_subtile_factor + subtile_offset
 
             if m_block < m_block_max:
                 consumer_state_Q, consumer_state_dO = mma_one_m_block_fn(
@@ -1599,7 +2003,7 @@ def dQaccum_store_block_sparse_bwd_sm90(
     n_block,
     sdQaccum: cute.Tensor,
     gdQaccum: cute.Tensor,
-    subtile_factor: cutlass.Constexpr,
+    q_subtile_factor: cutlass.Constexpr,
     m_block_max: int,
     num_dQ_warp_groups: cutlass.Constexpr,
     num_threads_per_warp_group: cutlass.Constexpr,
@@ -1620,10 +2024,10 @@ def dQaccum_store_block_sparse_bwd_sm90(
         curr_full_cnt = Int32(0)
         curr_full_idx = None
 
-    for iter_idx in cutlass.range(curr_q_cnt * subtile_factor, unroll=1):
-        sparse_idx = iter_idx // subtile_factor
-        subtile_offset = iter_idx % subtile_factor
-        m_block = curr_q_idx[sparse_idx] * subtile_factor + subtile_offset
+    for iter_idx in cutlass.range(curr_q_cnt * q_subtile_factor, unroll=1):
+        sparse_idx = iter_idx // q_subtile_factor
+        subtile_offset = iter_idx % q_subtile_factor
+        m_block = curr_q_idx[sparse_idx] * q_subtile_factor + subtile_offset
 
         if m_block < m_block_max:
             _store_one_dQaccum_sm90(
@@ -1636,10 +2040,10 @@ def dQaccum_store_block_sparse_bwd_sm90(
             )
 
     if const_expr(full_cnt is not None):
-        for iter_idx in cutlass.range(curr_full_cnt * subtile_factor, unroll=1):
-            sparse_idx = iter_idx // subtile_factor
-            subtile_offset = iter_idx % subtile_factor
-            m_block = curr_full_idx[sparse_idx] * subtile_factor + subtile_offset
+        for iter_idx in cutlass.range(curr_full_cnt * q_subtile_factor, unroll=1):
+            sparse_idx = iter_idx // q_subtile_factor
+            subtile_offset = iter_idx % q_subtile_factor
+            m_block = curr_full_idx[sparse_idx] * q_subtile_factor + subtile_offset
 
             if m_block < m_block_max:
                 _store_one_dQaccum_sm90(

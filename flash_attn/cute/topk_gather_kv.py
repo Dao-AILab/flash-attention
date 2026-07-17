@@ -66,7 +66,7 @@ class CpasyncGatherKVManager(ParamsBase):
         dtype: Type[cutlass.Numeric],
         cta_group_size: cutlass.Constexpr[Int32],
         cpasync_barrier: Optional[pipeline.NamedBarrier] = None,
-        disable_bitmask: cutlass.Constexpr[Boolean] = True,
+        disable_bitmask: cutlass.Constexpr[Boolean] = False,
         sBitmask: Optional[cute.Tensor] = None,
         pipeline_bitmask: Optional[pipeline.PipelineAsync] = None,
     ):

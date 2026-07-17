@@ -660,7 +660,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 cutlass.Int64, self.mma_compute_dKdV_stage * 2
             ]
             tmem_holding_buf: cutlass.Int32
-            tmem_dealloc_mbar_ptr: cutlass.Int64
+            tmem_dealloc_mbar: cutlass.Int64
             clc_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
             clc_response: cute.struct.MemRange[Int32, 4]
             # Smem tensors
@@ -1029,11 +1029,11 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         )
 
         tmem = utils.TmemAllocator(
-            storage.tmem_holding_buf,
+            storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=self.load_warp_id,
             is_two_cta=True,
-            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar_ptr,
+            two_cta_tmem_dealloc_mbar_ptr=storage.tmem_dealloc_mbar.ptr,
         )
 
         tmem.allocate(self.tmem_alloc_cols)

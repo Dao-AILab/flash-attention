@@ -180,6 +180,21 @@ def cute_ima_mask(
 # =============================================================================
 
 
+@cute.jit
+def read_aux_clamped(aux, idx_ssa: cute.TensorSSA, offset, seqlen) -> cute.TensorSSA:
+    """Load int32 aux data for a (possibly padded) tile position.
+
+    Padded tile positions can exceed the current sequence's length; clamp the global
+    index to the sequence tail so aux reads stay in bounds (the kernel discards the
+    masked-out padded results).
+    """
+    idx_frag = cute.make_rmem_tensor(1, cutlass.Int32)
+    idx_frag.store(idx_ssa)
+    value_frag = cute.make_rmem_tensor(1, cutlass.Int32)
+    value_frag[0] = aux[cutlass.min(idx_frag[0], offset + seqlen - 1)]
+    return value_frag.load()
+
+
 @fast_sampling
 @cute.jit
 def cute_global_packed_doc_mask(
@@ -200,21 +215,9 @@ def cute_global_packed_doc_mask(
     doc_ids_k = aux_tensors[1]
 
     offset_q = seqlen_info.offset_q
-    m_global = m_idx + offset_q
-    m_frag = cute.make_rmem_tensor(1, cutlass.Int32)
-    m_frag.store(m_global)
-    m_doc_frag = cute.make_rmem_tensor(1, cutlass.Int32)
-    m_doc_frag[0] = doc_ids_q[m_frag[0]]
-
     offset_k = seqlen_info.offset_k
-    n_global = n_idx + offset_k
-    n_frag = cute.make_rmem_tensor(1, cutlass.Int32)
-    n_frag.store(n_global)
-    n_doc_frag = cute.make_rmem_tensor(1, cutlass.Int32)
-    n_doc_frag[0] = doc_ids_k[n_frag[0]]
-
-    m_doc = m_doc_frag.load()
-    n_doc = n_doc_frag.load()
+    m_doc = read_aux_clamped(doc_ids_q, m_idx + offset_q, offset_q, seqlen_info.seqlen_q)
+    n_doc = read_aux_clamped(doc_ids_k, n_idx + offset_k, offset_k, seqlen_info.seqlen_k)
     return m_doc == n_doc
 
 
@@ -236,12 +239,7 @@ def cute_global_ima_mask(
     thresholds = aux_tensors[0]
 
     offset_k = seqlen_info.offset_k
-    n_global = n_idx + offset_k
-    n_frag = cute.make_rmem_tensor(1, cutlass.Int32)
-    n_frag.store(n_global)
-    val_frag = cute.make_rmem_tensor(1, cutlass.Int32)
-    val_frag[0] = thresholds[n_frag[0]]
-    threshold = val_frag.load()
+    threshold = read_aux_clamped(thresholds, n_idx + offset_k, offset_k, seqlen_info.seqlen_k)
 
     return n_idx >= threshold
 
@@ -264,12 +262,7 @@ def cute_global_causal_window_mask(
     windows = aux_tensors[0]
 
     offset_q = seqlen_info.offset_q
-    m_global = m_idx + offset_q
-    m_frag = cute.make_rmem_tensor(1, cutlass.Int32)
-    m_frag.store(m_global)
-    win_frag = cute.make_rmem_tensor(1, cutlass.Int32)
-    win_frag[0] = windows[m_frag[0]]
-    window = win_frag.load()
+    window = read_aux_clamped(windows, m_idx + offset_q, offset_q, seqlen_info.seqlen_q)
 
     return (n_idx <= m_idx) & ((m_idx - n_idx) <= window)
 

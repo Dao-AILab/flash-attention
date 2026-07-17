@@ -18,6 +18,7 @@ from cutlass import Float32, Int32, const_expr
 from cutlass.cute.nvgpu import cpasync, warp
 import cutlass.utils as utils_basic
 from cutlass.cutlass_dsl import BaseDSL
+from cutlass.base_dsl.arch import Arch
 
 from quack import copy_utils
 from quack import layout_utils
@@ -752,8 +753,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         mSeqUsedQ: Optional[cute.Tensor] = None,
         mSeqUsedK: Optional[cute.Tensor] = None,
         mPageTable: Optional[cute.Tensor] = None,
-        window_size_left: Optional[Int32] = None,
-        window_size_right: Optional[Int32] = None,
+        window_size_left: Int32 | int | None = None,
+        window_size_right: Int32 | int | None = None,
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_data: AuxData = AuxData(),
@@ -784,11 +785,11 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         self.num_epilogue_threads = self.num_threads
         # self.use_tma_O = self.arch >= 90 and mCuSeqlensQ is None
         # The SM80 base class never constructs tma_atom_O (it passes None to
-        # self.epilogue), so use_tma_O must stay False regardless of self.arch.
-        # FlashAttentionForwardSm120 inherits this class but self.arch is read
-        # from the DSL (= sm_120) in __init__, so without this the >= sm_90
-        # branch would crash in tma_get_copy_fn on consumer Blackwell.
-        self.use_tma_O = False
+        # self.epilogue). Restrict TMA-O to sm_90..sm_119; on SM120 (self.arch
+        # is forced to sm_80 in FlashAttentionForwardSm120.__init__, and the real
+        # DSL arch is sm_12x) this evaluates False, falling back to the register
+        # -> gmem O store the CpAsync SM120 kernel expects. (upstream #2656)
+        self.use_tma_O = Arch.sm_90 <= self.arch < Arch.sm_120
         self._setup_attributes()
         SharedStorage = self._get_shared_storage_cls()
         mQ, mK, mV, mO = [assume_tensor_aligned(t) for t in (mQ, mK, mV, mO)]
@@ -817,10 +818,9 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         # Fold qhead_per_kvhead into the seqlen mode of mQ/mO/mLSE so the
         # mainloop iterates over KV heads with packed Q rows. Required for
         # the epilogue's pack_gqa.store_O strides to make sense.
-        # sm120-only: this layout folding does not exist on main and must not
-        # run for real SM80 (which keeps the unfolded layout, == main).  The
-        # sm120 forward forces self.arch = Arch.sm_80, so gate on the is_sm120
-        # marker, not self.arch.
+        # sm120-only: gate on the is_sm120 marker (self.arch is forced to
+        # Arch.sm_80 on the SM120 forward, so `arch == 120` does not work here).
+        # Real SM80 keeps the unfolded layout and its own pack_gqa path.
         if const_expr(self.pack_gqa and getattr(self, "is_sm120", False)):
             nheads_kv = mK.shape[2]
             mQ = pack_gqa_layout(mQ, self.qhead_per_kvhead, nheads_kv, head_idx=2)
@@ -835,7 +835,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         num_batch = (
             mCuSeqlensQ.shape[0] - 1
             if const_expr(mCuSeqlensQ is not None)
-            else mQ.shape[3]
+            else cute.size(mQ.shape[3])
         )
         # When pack_gqa is True, mQ.shape[0] is a composite (qhead_per_kvhead,
         # seqlen_q) mode, so we use cute.size() to get the flat number of
