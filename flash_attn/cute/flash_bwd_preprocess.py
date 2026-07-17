@@ -48,6 +48,7 @@ class FlashAttentionBackwardPreprocess:
         pack_gqa: bool = False,
         qhead_per_kvhead: int = 1,
         nheads_kv: int = 1,
+        dq_accum_hdim_multiple: int = 32,
     ):
         """
         All contiguous dimensions must be at least 16 bytes aligned which indicates the head dimension
@@ -63,10 +64,13 @@ class FlashAttentionBackwardPreprocess:
         self.use_pdl = BaseDSL._get_dsl().get_arch_enum() >= Arch.sm_90a
         self.dtype = dtype
         self.tile_m = tile_m
-        # padding head_dim to a multiple of 32 as k_block_size
-        hdim_multiple_of = 32
-        self.head_dim_padded = int(math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of)
-        self.head_dim_v_padded = int(math.ceil(head_dim_v / hdim_multiple_of) * hdim_multiple_of)
+        self.head_dim_padded = int(
+            math.ceil(head_dim / dq_accum_hdim_multiple) * dq_accum_hdim_multiple
+        )
+        hdim_v_multiple_of = 32
+        self.head_dim_v_padded = int(
+            math.ceil(head_dim_v / hdim_v_multiple_of) * hdim_v_multiple_of
+        )
         self.check_hdim_v_oob = head_dim_v != self.head_dim_v_padded
         self.num_threads = num_threads
         self.use_padded_offsets = use_padded_offsets

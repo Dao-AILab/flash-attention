@@ -1183,6 +1183,7 @@ def _compile_bwd_preprocess(
     pack_gqa,
     qhead_per_kvhead,
     nheads_kv,
+    dq_accum_hdim_multiple,
 ):
     """Compile bwd preprocess kernel using cute fake tensors (no real GPU tensors needed)."""
     mQ, mK, mV, mO, mdO, mdQ, mdK, mdV, mLSE, mLSElog2, mPdPsum, mdQaccum, mdKaccum, mdVaccum, mScaleP = make_fake_bwd_tensors(
@@ -1205,6 +1206,7 @@ def _compile_bwd_preprocess(
         pack_gqa=pack_gqa,
         qhead_per_kvhead=qhead_per_kvhead,
         nheads_kv=nheads_kv,
+        dq_accum_hdim_multiple=dq_accum_hdim_multiple,
     )
     return cute.compile(
         fa_bwd_pre, mO, mdO, mPdPsum, mLSE, mLSElog2, mdQaccum, mCuSeqlensQ, mSequsedQ, mdLSE,
@@ -1225,6 +1227,7 @@ def _bwd_preprocess(
     pack_gqa=False,
     qhead_per_kvhead=1,  # only used with pack_gqa
     nheads_kv=1,         # only used with pack_gqa
+    dq_accum_hdim_multiple=32,
     softmax_scale=1.0,   # only used with scale_p
 ):
     """Backward preprocess: compute (o * dout).sum(dim=-1) - dLSE, lse * log2_e, and zero out dq_accum."""
@@ -1242,6 +1245,7 @@ def _bwd_preprocess(
         pack_gqa,
         qhead_per_kvhead,
         nheads_kv,
+        dq_accum_hdim_multiple,
     )
     if compile_key not in _bwd_preprocess.compile_cache:
         _bwd_preprocess.compile_cache[compile_key] = _compile_bwd_preprocess(*compile_key)
@@ -1580,7 +1584,8 @@ def _flash_attn_bwd(
     else:
         _validate_tensor(dv, "dv", v.shape, out_torch_dtype, device)
 
-    head_dim_rounded = (head_dim + 32 - 1) // 32 * 32
+    accum_hdim_multiple = 16 if arch // 10 in [10, 11] else 32
+    head_dim_rounded = (head_dim + accum_hdim_multiple - 1) // accum_hdim_multiple * accum_hdim_multiple
 
     if cu_seqlens_q is None:
         dq_accum = (
@@ -1620,7 +1625,11 @@ def _flash_attn_bwd(
     # hd=256 2CTA backward has its own internal postprocess for dK/dV.
     dKV_postprocess = qhead_per_kvhead > 1 and not use_dedicated_hd256_kernel
     if dKV_postprocess:
-        head_dim_v_rounded = (head_dim_v + 32 - 1) // 32 * 32
+        head_dim_v_rounded = (
+            (head_dim_v + accum_hdim_multiple - 1)
+            // accum_hdim_multiple
+            * accum_hdim_multiple
+        )
         if cu_seqlens_k is None:
             dk_accum = torch.zeros(
                 batch_size,
@@ -1675,6 +1684,7 @@ def _flash_attn_bwd(
         out, dout, dpsum, lse, lse_log2, dq_accum,
         cu_seqlens_q, seqused_q, dlse,
         dtype, head_dim, head_dim_v, m_block_size,
+        dq_accum_hdim_multiple=accum_hdim_multiple,
     )
     # num_threads: SM90 derives from BwdConfig.num_wg, SM120 is set to 128 above,
     # SM100/SM110 uses default from function signature (384).

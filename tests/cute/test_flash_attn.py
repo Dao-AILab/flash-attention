@@ -542,12 +542,12 @@ def test_flash_attn_hd256_sm100_noncontiguous_transpose():
 
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_sm100_head_dim_72_backward():
-    """Regression test for the backward preprocess O/dO predicate shape."""
+    """Cover predicate and multi-block dQ accumulator padding for head_dim=72."""
     if not IS_SM100:
         pytest.skip("SM100-specific backward preprocess regression test")
 
     torch.manual_seed(0)
-    shape = (1, 16, 1, 72)
+    shape = (1, 256, 1, 72)
     q_ref, k_ref, v_ref = (
         torch.randn(shape, device="cuda", dtype=torch.bfloat16, requires_grad=True)
         for _ in range(3)
