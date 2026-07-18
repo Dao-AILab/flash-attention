@@ -38,6 +38,7 @@ def retry_on_oom(func):
     @wraps(func)
     def wrapper(*args, **kwargs):
         try:
+            gc.collect()
             return func(*args, **kwargs)
         except torch.OutOfMemoryError as e:
             if "out of memory" in str(e).lower():
