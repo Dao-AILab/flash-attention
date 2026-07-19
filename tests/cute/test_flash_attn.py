@@ -263,15 +263,16 @@ def test_flash_attn_output(
             learnable_sink = torch.randn(nheads, dtype=torch.bfloat16, device=device)
         else:
             learnable_sink = None
-        if dtype == torch.float8_e4m3fn:
-            q_descale, k_descale, v_descale = [
-                torch.rand(batch_size, nheads_kv, device=device, dtype=torch.float32)
-                * 2
-                for _ in range(3)
-            ]
-        else:
-            q_descale, k_descale, v_descale = None, None, None
-        q, k, v = [x.detach().to(dtype).requires_grad_() for x in (q_ref, k_ref, v_ref)]
+        # flash_attn_func exposes no descale kwargs (the kernel then uses descale=1),
+        # so attention_ref must not apply descales either. Descale plumbing is
+        # exercised via _flash_attn_fwd directly.
+        q_descale, k_descale, v_descale = None, None, None
+        # FP8 is forward-only: the interface rejects fp8 inputs with requires_grad,
+        # and the grad checks below are dtype-gated anyway.
+        q, k, v = [
+            x.detach().to(dtype).requires_grad_(dtype != torch.float8_e4m3fn)
+            for x in (q_ref, k_ref, v_ref)
+        ]
         qv = qv_ref.detach().to(dtype).requires_grad_() if has_qv else None
         out_ref, attn_ref = attention_ref(
             q_ref,
