@@ -357,7 +357,9 @@ def attention_ref(
     dtype_og = v.dtype
     q_shape = q.shape if q is not None else qv.shape
     if upcast:
-        q, k, v, qv = [t.float() if t is not None else None for t in (q, k, v, qv)]
+        q, k, v, qv, learnable_sink = [
+            t.float() if t is not None else None for t in (q, k, v, qv, learnable_sink)
+        ]
     if q_descale is not None:
         q_descale = repeat(q_descale, "b h -> b 1 (h g) 1", g=q_shape[2] // v.shape[2])
         q, qv = [(t.float() * q_descale).to(t.dtype) if t is not None else None for t in (q, qv)]
