@@ -70,12 +70,12 @@ class FlashAttentionBackwardSm100:
         q_subtile_factor: cutlass.Constexpr[int] = 1,
         kv_subtile_factor: cutlass.Constexpr[int] = 1,
     ):
-        # padding head_dim to a multiple of 16 as k_block_size
-        hdim_multiple_of = 16
-        self.tile_hdim = int(math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of)
         head_dim_v = head_dim_v if head_dim_v is not None else head_dim
+        self.head_dim = head_dim
+        self.head_dim_v = head_dim_v
+        self.tile_hdim = int(math.ceil(head_dim / 32) * 32)
         self.same_hdim_kv = head_dim == head_dim_v
-        self.tile_hdimv = int(math.ceil(head_dim_v / hdim_multiple_of) * hdim_multiple_of)
+        self.tile_hdimv = int(math.ceil(head_dim_v / 16) * 16)
         self.check_hdim_oob = head_dim != self.tile_hdim
         self.check_hdim_v_oob = head_dim_v != self.tile_hdimv
 
@@ -3853,8 +3853,9 @@ class FlashAttentionBackwardSm100:
         mdV_cur = seqlen.offset_batch_K(mdV, batch_idx, dim=3)[None, None, head_idx]
         mdK_cur = seqlen.offset_batch_K(mdK, batch_idx, dim=3)[None, None, head_idx]
 
+        tmem_ld_rep = 8 if const_expr(self.check_hdim_oob or self.check_hdim_v_oob) else 16
         tmem_load_atom = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(16)), Float32
+            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(tmem_ld_rep)), Float32
         )
         # dV
         pipeline_dKV.consumer_wait(consumer_state_dKV)
@@ -3900,8 +3901,17 @@ class FlashAttentionBackwardSm100:
         tdVgdV_r2g_p = thr_tmem_ld_dV.partition_D(tdVgdV)
         tdVgdV_r2g = self.split_wg(tdVgdV_r2g_p, wg_idx, num_wg)
 
+        tdVpdV = None
+        if const_expr(self.check_hdim_v_oob):
+            pred_shape = (1,) + tuple(tdVcdV_t2r.shape[1:])
+            tdVpdV = cute.make_rmem_tensor(pred_shape, cutlass.Boolean)
+            for i in cutlass.range_constexpr(cute.size(tdVcdV_t2r, mode=[1])):
+                tdVpdV[(0, i, 0, 0)] = cute.elem_less(
+                    tdVcdV_t2r[(0, i, 0, 0)][1], self.head_dim_v
+                )
+
         if tidx < seqlen.seqlen_k - self.tile_n * n_block:
-            cute.copy(tiled_gmem_store_dV, tdVrdV_r2s, tdVgdV_r2g)
+            cute.copy(tiled_gmem_store_dV, tdVrdV_r2s, tdVgdV_r2g, pred=tdVpdV)
 
         cute.arch.sync_warp()
         with cute.arch.elect_one():
@@ -3954,8 +3964,17 @@ class FlashAttentionBackwardSm100:
         tdKgdK_r2g_p = thr_tmem_ld_dK.partition_D(tdKgdK)
         tdKgdK_r2g = self.split_wg(tdKgdK_r2g_p, wg_idx, num_wg)
 
+        tdKpdK = None
+        if const_expr(self.check_hdim_oob):
+            pred_shape = (1,) + tuple(tdKcdK_t2r.shape[1:])
+            tdKpdK = cute.make_rmem_tensor(pred_shape, cutlass.Boolean)
+            for i in cutlass.range_constexpr(cute.size(tdKcdK_t2r, mode=[1])):
+                tdKpdK[(0, i, 0, 0)] = cute.elem_less(
+                    tdKcdK_t2r[(0, i, 0, 0)][1], self.head_dim
+                )
+
         if tidx < seqlen.seqlen_k - self.tile_n * n_block:
-            cute.copy(tiled_gmem_store_dK, tdKrdK_r2s, tdKgdK_r2g)
+            cute.copy(tiled_gmem_store_dK, tdKrdK_r2s, tdKgdK_r2g, pred=tdKpdK)
 
         cute.arch.sync_warp()
         with cute.arch.elect_one():
