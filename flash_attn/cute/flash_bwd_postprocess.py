@@ -450,7 +450,6 @@ class FlashAttentionBackwardPostprocess:
                             sdQaccum_g2s[None, None, smem_buf],
                         )
 
-                    cute.arch.fence_view_async_shared()
                     cute.arch.barrier(barrier_id=6, number_of_threads=num_reduce_threads)
 
                     # S -> R
@@ -465,7 +464,6 @@ class FlashAttentionBackwardPostprocess:
                             tdQrdQ_s2r_cpy.iterator, cute.make_layout(sdQaccum_src.shape)
                         )
                         cute.copy(s2r_thr_copy, sdQaccum_src, tdQrdQ_r2s_cpy)
-                        cute.arch.fence_view_async_shared()
                         cute.arch.barrier(barrier_id=7, number_of_threads=num_reduce_threads)
 
                         # R -> S
@@ -486,7 +484,6 @@ class FlashAttentionBackwardPostprocess:
                     tdQrdQ_r2s[None, None, None, 0],
                     tdQsdQ_r2s[None, None, None, 0],
                 )
-                cute.arch.fence_view_async_shared()
                 cute.arch.barrier(barrier_id=8, number_of_threads=num_reduce_threads)
             else:
                 # Step 1: load dQaccum from gmem to smem
