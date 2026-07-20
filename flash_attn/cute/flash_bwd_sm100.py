@@ -22,6 +22,7 @@ from flash_attn.cute import copy_utils
 from flash_attn.cute import pipeline
 from flash_attn.cute.blackwell_helpers import gemm_w_idx, gemm_ptx_w_idx  # noqa
 from flash_attn.cute.mask import AttentionMask
+from flash_attn.cute.pack_gqa import pack_gqa_layout
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
 from quack.cute_dsl_utils import ParamsBase
@@ -56,6 +57,7 @@ class FlashAttentionBackwardSm100:
         is_causal: bool = False,
         is_local: bool = False,
         qhead_per_kvhead: cutlass.Constexpr[int] = 1,
+        pack_gqa: cutlass.Constexpr[bool] = False,
         tile_m: int = 128,
         tile_n: int = 128,
         is_persistent: bool = False,
@@ -112,7 +114,11 @@ class FlashAttentionBackwardSm100:
         self.is_causal = is_causal
         self.is_local = is_local
         self.qhead_per_kvhead = qhead_per_kvhead
-        self.pack_gqa = False
+        # PackGQA folds the qhead_per_kvhead query heads of a kv-group into the seqlen_q
+        # dimension so a single kv-head tile processes all of its query heads. This is only
+        # enabled by the interface for SM100/SM110 on the supported (dense, non-causal/local,
+        # non-2CTA-hd256) configs; every other path passes pack_gqa=False.
+        self.pack_gqa = pack_gqa
         self.deterministic = deterministic
         self.spt_override = spt
 
@@ -483,7 +489,10 @@ class FlashAttentionBackwardSm100:
         self.is_varlen_q = mCuSeqlensQ is not None or mSeqUsedQ is not None
         self.use_tma_store = not (self.qhead_per_kvhead == 1 and mCuSeqlensK is not None)
         # self.use_tma_store = not self.qhead_per_kvhead == 1
-        self.dKV_postprocess = self.qhead_per_kvhead > 1
+        # With PackGQA all query heads of a kv-group are processed within a single kv-head
+        # tile, so dK/dV accumulate directly in TMEM across the packed m-loop and no longer
+        # need the float32 accum + postprocess reduction across separate query-head tiles.
+        self.dKV_postprocess = self.qhead_per_kvhead > 1 and not self.pack_gqa
 
         if const_expr(self.dKV_postprocess):
             assert self.dk_dtype.width == 32, "Must accumulate dK in float precision for GQA"
@@ -497,6 +506,16 @@ class FlashAttentionBackwardSm100:
         QO_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
         mQ, mdO = [layout_utils.select(t, mode=QO_layout_transpose) for t in (mQ, mdO)]
 
+        # PackGQA: fold the query heads of each kv-group into seqlen_q (mode 0, which holds
+        # seqlen and has head at mode 2 after the transpose above). After packing, mode 2 is
+        # nheads_kv and the kernel iterates one tile per kv-head over the packed Q rows.
+        # mdQaccum is allocated by the interface already in packed (per-kv-head) form, so its
+        # view is left untouched here.
+        if const_expr(self.pack_gqa):
+            nheads_kv = mK.shape[2]
+            mQ = pack_gqa_layout(mQ, self.qhead_per_kvhead, nheads_kv, head_idx=2)
+            mdO = pack_gqa_layout(mdO, self.qhead_per_kvhead, nheads_kv, head_idx=2)
+
         KV_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensK is None) else [0, 2, 1]
         mK, mV = [layout_utils.select(t, mode=KV_layout_transpose) for t in (mK, mV)]
 
@@ -506,6 +525,12 @@ class FlashAttentionBackwardSm100:
             layout_utils.select(t, mode=LSE_dPsum_dQaccum_transpose)
             for t in (mLSE, mdPsum, mdQaccum)
         ]
+        # PackGQA: LSE/dPsum keep a separate seqlen mode (mode 0) and head (mode 1), so the
+        # head folds cleanly into seqlen. mdQaccum is physically packed already, so skip it.
+        if const_expr(self.pack_gqa):
+            nheads_kv = mK.shape[2]
+            mLSE = pack_gqa_layout(mLSE, self.qhead_per_kvhead, nheads_kv, head_idx=1)
+            mdPsum = pack_gqa_layout(mdPsum, self.qhead_per_kvhead, nheads_kv, head_idx=1)
 
         if const_expr(not self.dKV_postprocess):
             layout_dKV_transpose = KV_layout_transpose
@@ -730,7 +755,7 @@ class FlashAttentionBackwardSm100:
             cluster_shape_mn=self.cluster_shape_mnk[:2],
             mCuSeqlensQ=mCuSeqlensK,
             mSeqUsedQ=mSeqUsedK,
-            qhead_per_kvhead_packgqa=1,  # pack_gqa disabled for bwd
+            qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
             element_size=self.k_dtype.width // 8,
             is_persistent=self.is_persistent,  # persistent mode not tested
             lpt=self.spt,
@@ -1019,6 +1044,7 @@ class FlashAttentionBackwardSm100:
             swap_AB=True,
             window_size_left=window_size_left,
             window_size_right=window_size_right,
+            qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
         )
 
     @cute.kernel
@@ -1409,11 +1435,14 @@ class FlashAttentionBackwardSm100:
             False,  # is_split_kv
             window_size_left,
             window_size_right,
-            qhead_per_kvhead_packgqa=1,
+            qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
         )
         SeqlenInfoCls = partial(
             SeqlenInfoQK.create,
-            seqlen_q_static=mQ.shape[0],
+            # With PackGQA mQ.shape[0] is the nested (qhead_per_kvhead, seqlen_q) mode; pass the
+            # logical (unpacked) seqlen_q so masking/score_mod recover the per-head query index,
+            # while BlockInfo scales the m_block count by qhead_per_kvhead_packgqa.
+            seqlen_q_static=mQ.shape[0] if const_expr(not self.pack_gqa) else mQ.shape[0][1],
             seqlen_k_static=mK.shape[0],
             mCuSeqlensQ=mCuSeqlensQ,
             mCuSeqlensK=mCuSeqlensK,
@@ -1650,7 +1679,9 @@ class FlashAttentionBackwardSm100:
             m_block_min, m_block_max = block_info.get_m_block_min_max(
                 seqlen, n_block // self.cluster_shape_mnk[0]
             )
-            head_idx_kv = head_idx // self.qhead_per_kvhead
+            # PackGQA schedules one tile per kv-head (head_idx is already the kv-head index);
+            # otherwise head_idx is a query head and maps to its kv-head via integer division.
+            head_idx_kv = head_idx // (self.qhead_per_kvhead if const_expr(not self.pack_gqa) else 1)
 
             process_tile = (
                 const_expr(not self.is_local and not self.is_varlen_q) or m_block_min < m_block_max
@@ -1772,7 +1803,9 @@ class FlashAttentionBackwardSm100:
             m_block_min, m_block_max = block_info.get_m_block_min_max(
                 seqlen, n_block // self.cluster_shape_mnk[0]
             )
-            head_idx_kv = head_idx // self.qhead_per_kvhead
+            # PackGQA schedules one tile per kv-head (head_idx is already the kv-head index);
+            # otherwise head_idx is a query head and maps to its kv-head via integer division.
+            head_idx_kv = head_idx // (self.qhead_per_kvhead if const_expr(not self.pack_gqa) else 1)
             n_block_cta_group = n_block // self.cta_group_size
             n_block_sparse = n_block // self.kv_subtile_factor
 
@@ -4005,7 +4038,7 @@ class FlashAttentionBackwardSm100:
         # (8, tile_n / 128, 64 / 8) = (8, 1, 8) or (4, tile_n * 32 / (128 * 4)) = (4, 8)
         tdKVsdKV_r2s = thr_copy_r2s_dKV.partition_D(sdKV)
 
-        head_idx_kv = head_idx // self.qhead_per_kvhead
+        head_idx_kv = head_idx // (self.qhead_per_kvhead if const_expr(not self.pack_gqa) else 1)
         if const_expr(not self.dKV_postprocess):
             assert not seqlen.has_cu_seqlens_k, "varlen uses non tma store path"
             mdKV_cur = mdKV[None, None, head_idx_kv, batch_idx]  # (seqlen, hdim)
