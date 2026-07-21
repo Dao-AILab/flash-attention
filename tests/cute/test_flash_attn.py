@@ -96,6 +96,35 @@ def test_flash_attn_sm120_rejects_splitkv():
         flash_attn_func(q, k, v, num_splits=3)
 
 
+@pytest.mark.skipif(not IS_SM100, reason="SM100-only probability rounding behavior")
+def test_flash_attn_bf16_row_sum_matches_pv():
+    torch.manual_seed(0)
+    q = torch.randn(4, 8192, 1, 128, device="cuda", dtype=torch.bfloat16) * 1000
+    k = torch.randn(4, 8192, 1, 128, device="cuda", dtype=torch.bfloat16) * 1000
+    v = torch.ones(4, 8192, 1, 128, device="cuda", dtype=torch.bfloat16)
+
+    out, _ = flash_attn_func(q, k, v, causal=True)
+
+    assert torch.equal(out, v)
+
+
+@pytest.mark.skipif(not IS_SM100, reason="SM100-only probability rounding behavior")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_flash_attn_lowp_pv_row_sum_preserves_lse(dtype):
+    """Keep LSE tied to the FP32 exponential mass used by backward."""
+    torch.manual_seed(0)
+    q = torch.zeros(1, 1, 1, 128, device="cuda", dtype=dtype)
+    k = torch.zeros(1, 8192, 1, 128, device="cuda", dtype=dtype)
+    q[..., 0] = 1
+    logits = torch.randn(8192, device="cuda", dtype=dtype)
+    k[0, :, 0, 0] = logits
+    v = torch.ones_like(k)
+
+    _, lse = flash_attn_func(q, k, v, softmax_scale=1.0, return_lse=True)
+
+    assert torch.equal(lse[0, 0, 0], torch.logsumexp(logits.float(), dim=0))
+
+
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
