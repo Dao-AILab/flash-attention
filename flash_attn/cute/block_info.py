@@ -20,7 +20,8 @@ class BlockInfo:
     window_size_right: Optional[Int32] = None
     qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1
     num_splits: Int32 = 1
-    num_splits_dynamic_ptr: Optional[cute.Tensor] = None
+    # If True, the scheduler packs num_splits into the top 16 bits of split_idx
+    pack_split_idx: cutlass.Constexpr[bool] = False
     num_n_blocks_per_split: Optional[cutlass.Constexpr[Int32]] = None
 
     @cute.jit
@@ -29,7 +30,6 @@ class BlockInfo:
         seqlen_info: SeqlenInfoQK,
         m_block: Int32,
         split_idx: Int32 = 0,
-        batch_idx: Int32 = 0,
         num_splits: Int32 = 1,
     ) -> Tuple[Int32, Int32]:
         n_block_max = cute.ceil_div(seqlen_info.seqlen_k, self.tile_n)
@@ -49,7 +49,7 @@ class BlockInfo:
             n_idx_left = n_idx - self.window_size_left
             n_block_min = cutlass.max(n_idx_left // self.tile_n, 0)
         if cutlass.const_expr(self.is_split_kv):
-            if const_expr(self.num_splits_dynamic_ptr is not None):
+            if const_expr(self.pack_split_idx):
                 # Unpack num_splits from top 16 bits of split_idx (packed by scheduler)
                 num_splits = split_idx >> 16
                 split_idx = split_idx & 0xFFFF

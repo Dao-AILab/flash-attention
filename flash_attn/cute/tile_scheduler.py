@@ -1179,11 +1179,6 @@ class SingleTileVarlenScheduler:
                 "At least one of mCuSeqlensQ or mSeqUsedQ must be provided"
             )
             assert args.cluster_shape_mn[1] == 1, "Only cluster_shape_mn[1] == 1 is supported"
-            # TODO: Support varlen CLC with cluster_shape_m > 1 by refactoring the
-            # flattened-tile decode so cluster unpacking semantics are explicit.
-            assert scheduling_mode != SchedulingMode.CLC or args.cluster_shape_mn[0] == 1, (
-                "Varlen CLC currently requires cluster_shape_mn[0] == 1"
-            )
             decoder = VarlenDecoder.create(
                 args,
                 fold_splits_into_scan=False,
@@ -1382,6 +1377,10 @@ class DynamicPersistentVarlenScheduler:
         ) -> "DynamicPersistentVarlenScheduler.Params":
             assert args.mCuSeqlensQ is not None or args.mSeqUsedQ is not None, (
                 "At least one of mCuSeqlensQ or mSeqUsedQ must be provided"
+            )
+            # TODO: support non-trivial cluster shapes in a follow-on PR
+            assert args.cluster_shape_mn[0] == 1 and args.cluster_shape_mn[1] == 1, (
+                "DynamicPersistentVarlenScheduler currently requires cluster_shape_mn == (1, 1)"
             )
             decoder = VarlenDecoder.create(
                 args,

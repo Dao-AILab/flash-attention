@@ -951,7 +951,7 @@ def _flash_attn_fwd(
     # O(N^2) lookup; observed to be faster only for batch_size > BIN_BATCH_SEARCH_THRESH; this is tunable
     cu_total_m_blocks = None
     cu_total_splits_m_blocks = None
-    use_single_tile_varlen_scheduler = use_clc_scheduler or tile_count_semaphore is None
+    use_single_tile_varlen_scheduler = tile_count_semaphore is None
     use_cu_hint = (
         is_varlen_q
         and use_single_tile_varlen_scheduler
@@ -1112,10 +1112,10 @@ def _flash_attn_fwd(
             )
         ]
 
-        qv_tensor = to_cute_tensor(qv) if qv is not None else None
-        gather_kv_indices_tensor = to_cute_tensor(gather_kv_indices) if gather_kv_indices is not None else None
-        p_tensor = to_cute_tensor(p) if p is not None else None
-        row_max_tensor = to_cute_tensor(row_max) if row_max is not None else None
+        qv_tensor = to_cute_tensor(qv)
+        gather_kv_indices_tensor = to_cute_tensor(gather_kv_indices)
+        p_tensor = to_cute_tensor(p)
+        row_max_tensor = to_cute_tensor(row_max)
 
         if arch // 10 == 8:
             assert page_table is None, "paged KV not supported on SM 8.0"
@@ -1421,7 +1421,9 @@ def _flash_attn_fwd(
             virtual_batch_idx=virtual_batch_idx if has_scheduler_metadata else None,
         )
     if reuse_scheduler_metadata and tile_count_semaphore is not None:
-        # combine kernel does this for us
+        # TODO: pass tile_count_semaphore to the combine kernel and zero it there when
+        # is_split_kv (using CTA 0, since a later CTA may have exited prematurely), so
+        # that this host-side zeroing is only needed when is_split_kv=False.
         tile_count_semaphore.zero_()
     return out, lse, p, row_max
 

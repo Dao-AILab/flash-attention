@@ -308,6 +308,10 @@ class FlashAttentionForwardSm100:
             self.empty_warp_ids = self.empty_warp_ids + self.epilogue_warp_ids
             self.epilogue_warp_ids = self.correction_warp_ids
 
+        if self.dynamic_persistent:
+            assert len(self.empty_warp_ids) > 0, (
+                "dynamic persistent scheduling requires an empty warp to serve as the scheduler warp"
+            )
         self.scheduler_warp_id = self.empty_warp_ids[0] if self.dynamic_persistent else None
 
         self.tmem_s_offset = [0, self.n_block_size]  # e.g., 0, 128
@@ -1134,7 +1138,7 @@ class FlashAttentionForwardSm100:
             window_size_right,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
             num_splits=num_splits,
-            num_splits_dynamic_ptr=num_splits_dynamic_ptr,
+            pack_split_idx=num_splits_dynamic_ptr is not None,
             num_n_blocks_per_split=self.num_n_blocks_per_split,
         )
         SeqlenInfoCls = partial(
@@ -1224,11 +1228,11 @@ class FlashAttentionForwardSm100:
         # ///////////////////////////////////////////////////////////////////////////////
         #  EMPTY / SCHEDULER WARP
         # ///////////////////////////////////////////////////////////////////////////////
-        if const_expr(self.use_clc_scheduler or self.dynamic_persistent):
+        if const_expr(self.dynamic_persistent):
             if warp_idx == self.scheduler_warp_id:
                 cute.arch.setmaxregister_decrease(self.num_regs_other)
                 # CLC: only leader CTA produces.
-                if const_expr(self.dynamic_persistent) or is_leader_cta:
+                if is_leader_cta:
                     self.scheduler_warp(tile_scheduler)
                 else:
                     self.empty_warp(tile_scheduler)
@@ -1572,10 +1576,9 @@ class FlashAttentionForwardSm100:
                     seqlen,
                     m_block,
                     split_idx=split_idx,
-                    batch_idx=batch_idx,
                     num_splits=num_splits,
                 )
-                if const_expr(self.is_split_kv and block_info.num_splits_dynamic_ptr is not None):
+                if const_expr(self.is_split_kv and block_info.pack_split_idx):
                     split_idx = split_idx & 0xFFFF
                 if self.process_work_tile(seqlen, n_block_min, n_block_max):
                     n_block_first = n_block_max - 1 if n_block_max > 0 else 0
@@ -1786,7 +1789,6 @@ class FlashAttentionForwardSm100:
                     seqlen,
                     m_block,
                     split_idx=split_idx,
-                    batch_idx=batch_idx,
                     num_splits=num_splits,
                 )
                 block_iter_count = n_block_max - n_block_min
@@ -2066,9 +2068,9 @@ class FlashAttentionForwardSm100:
             kv_head_idx = self._kv_head_idx(head_idx)
             seqlen = SeqlenInfoCls(batch_idx)
             n_block_min, n_block_max = block_info.get_n_block_min_max(
-                seqlen, m_block, split_idx=split_idx, batch_idx=batch_idx, num_splits=num_splits,
+                seqlen, m_block, split_idx=split_idx, num_splits=num_splits,
             )
-            if const_expr(self.is_split_kv and block_info.num_splits_dynamic_ptr is not None):
+            if const_expr(self.is_split_kv and block_info.pack_split_idx):
                 split_idx = split_idx & 0xFFFF
 
             mask = AttentionMaskCls(seqlen)
@@ -2551,9 +2553,9 @@ class FlashAttentionForwardSm100:
             )
             seqlen = SeqlenInfoCls(batch_idx)
             n_block_min, n_block_max = block_info.get_n_block_min_max(
-                seqlen, m_block, split_idx=split_idx, batch_idx=batch_idx, num_splits=num_splits,
+                seqlen, m_block, split_idx=split_idx, num_splits=num_splits,
             )
-            if const_expr(self.is_split_kv and block_info.num_splits_dynamic_ptr is not None):
+            if const_expr(self.is_split_kv and block_info.pack_split_idx):
                 split_idx = split_idx & 0xFFFF
 
             if const_expr(self.is_split_kv):
@@ -3013,9 +3015,9 @@ class FlashAttentionForwardSm100:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
             n_block_min, n_block_max = block_info.get_n_block_min_max(
-                seqlen, m_block, split_idx=split_idx, batch_idx=batch_idx, num_splits=num_splits,
+                seqlen, m_block, split_idx=split_idx, num_splits=num_splits,
             )
-            if const_expr(self.is_split_kv and block_info.num_splits_dynamic_ptr is not None):
+            if const_expr(self.is_split_kv and block_info.pack_split_idx):
                 split_idx = split_idx & 0xFFFF
 
             if self.process_work_tile(seqlen, n_block_min, n_block_max):
@@ -3084,20 +3086,19 @@ class FlashAttentionForwardSm100:
         while work_tile.is_valid_tile:
             tile_scheduler.prefetch_next_work()
             work_tile = tile_scheduler.advance_to_next_work()
-            if const_expr(self.dynamic_persistent):
-                if cute.arch.thread_idx()[0] == self.scheduler_warp_id * cute.arch.WARP_SIZE:
-                    prefix_str = "[CLC] query " if const_expr(self.use_clc_scheduler) else "[DYNAMIC] info "
-                    fa_printf(
-                        3,
-                        prefix_str + "sm={} cta={} (m_blk={},h={},b={},s={}) valid={}\n",
-                        smid(),
-                        cute.arch.block_idx()[0],
-                        work_tile.tile_idx[0],
-                        work_tile.tile_idx[1],
-                        work_tile.tile_idx[2],
-                        work_tile.tile_idx[3],
-                        work_tile.is_valid_tile,
-                    )
+            if cute.arch.thread_idx()[0] == self.scheduler_warp_id * cute.arch.WARP_SIZE:
+                prefix_str = "[CLC] query " if const_expr(self.use_clc_scheduler) else "[DYNAMIC] info "
+                fa_printf(
+                    3,
+                    prefix_str + "sm={} cta={} (m_blk={},h={},b={},s={}) valid={}\n",
+                    smid(),
+                    cute.arch.block_idx()[0],
+                    work_tile.tile_idx[0],
+                    work_tile.tile_idx[1],
+                    work_tile.tile_idx[2],
+                    work_tile.tile_idx[3],
+                    work_tile.is_valid_tile,
+                )
         tile_scheduler.producer_tail()
 
     @cute.jit
