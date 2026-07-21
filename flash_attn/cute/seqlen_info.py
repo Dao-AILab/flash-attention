@@ -78,6 +78,7 @@ class SeqlenInfoQK:
     has_cu_seqlens_k: cutlass.Constexpr[bool]
     has_seqused_q: cutlass.Constexpr[bool]
     has_seqused_k: cutlass.Constexpr[bool]
+    has_cu_block_idx_offsets: cutlass.Constexpr[bool] = False
 
     @staticmethod
     def create(
@@ -142,6 +143,7 @@ class SeqlenInfoQK:
             has_cu_seqlens_k=mCuSeqlensK is not None,
             has_seqused_q=mSeqUsedQ is not None,
             has_seqused_k=mSeqUsedK is not None,
+            has_cu_block_idx_offsets=mCuBlockIdxOffsets is not None,
         )
 
     def offset_batch_Q(

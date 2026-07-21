@@ -1111,6 +1111,7 @@ class Sm100FusedMask:
             has_cu_seqlens_k=False,
             has_seqused_q=False,
             has_seqused_k=False,
+            has_cu_block_idx_offsets=False,
         )
         n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen_info, blk_coord[0])
         return n_block_min, n_block_max - n_block_min
@@ -1154,6 +1155,7 @@ class Sm100FusedMask:
             has_cu_seqlens_k=False,
             has_seqused_q=False,
             has_seqused_k=False,
+            has_cu_block_idx_offsets=False,
         )
         n_block_min, _ = block_info.get_n_block_min_max(seqlen_info, blk_coord[0])
         n_block_min_causal_local_mask = block_info.get_n_block_min_causal_local_mask(
