@@ -384,6 +384,19 @@ void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream) {
     });
 }
 
+// Ring-attention: run the forward kernel with Split forced true so it writes an
+// fp32 partial (oaccum + lseaccum) for ONE K/V block, and NO combine. Requires
+// num_splits >= 2 (dense) so no scheduler semaphore is needed (see mha_fwd_ring).
+void run_mha_fwd_ring(Flash_fwd_params &params, cudaStream_t stream) {
+    TORCH_CHECK(params.num_splits >= 1);
+    ARCH_SWITCH(params.arch, Arch, [&] {
+        SOFTCAP_SWITCH(params.softcap > 0.0, Has_softcap, [&] {
+            // Split=true always enables PackGQA; no paged-KV for ring partials.
+            run_mha_fwd_constexpr<Arch, /*Split=*/true, /*PagedKVNonTMA=*/false, /*PackGQA=*/true, Has_softcap>(params, stream);
+        });
+    });
+}
+
 void run_mha_fwd_combine(Flash_fwd_params &params, cudaStream_t stream, bool enable_pdl=false) {
     #ifndef FLASHATTENTION_DISABLE_SPLIT
     // If hdim is 96 or 192, it's faster to round them to 128 or 256 respectively
@@ -1197,6 +1210,196 @@ mha_fwd(at::Tensor q,   // (b, s_q, h, d) or (total_q, h, d) if there is cu_seql
     return {out, softmax_lse, out_accum, softmax_lse_accum};
 }
 
+// ===========================================================================
+// Ring-attention native forward primitive (FA3): one K/V block -> fp32 partial.
+// Writes the fp32 normalized partial (oaccum) + fp32 LSE for a single K/V block
+// into a caller-owned slot, with NO combine (no bf16 round-trip). The caller
+// stacks one such partial (num_splits sub-splits) per ring step and calls the
+// public `fwd_combine` once at the end. Dense (non-varlen, non-paged) fp16/bf16.
+// out_accum: [num_splits, b, h, seqlen_q, dv] fp32 ; lse_accum: [num_splits, b, h, seqlen_q] fp32.
+// Requires num_splits >= 2 so the split path needs no scheduler semaphore.
+// ===========================================================================
+void mha_fwd_ring(at::Tensor q,          // (b, s_q, h, d) or (total_q, h, d) if cu_seqlens_q
+                     at::Tensor k,          // (b, s_k, h_k, d) or (total_k, h_k, d) if cu_seqlens_k
+                     at::Tensor v,          // (b, s_k, h_k, dv) or (total_k, h_k, dv) if cu_seqlens_k
+                     at::Tensor out_accum,  // dense: num_splits x b x h x s_q x dv ; varlen: num_splits x h x total_q x dv (fp32)
+                     at::Tensor lse_accum,  // dense: num_splits x b x h x s_q     ; varlen: num_splits x h x total_q      (fp32)
+                     std::optional<double> softmax_scale_,
+                     bool is_causal,
+                     int64_t window_size_left,
+                     int64_t window_size_right,
+                     double softcap,
+                     int64_t num_splits,
+                     int64_t sm_margin,
+                     std::optional<at::Tensor> cu_seqlens_q_,   // b+1 (int32) — varlen
+                     std::optional<at::Tensor> cu_seqlens_k_,   // b+1 (int32) — varlen
+                     std::optional<at::Tensor> seqused_q_,      // b (int32)
+                     std::optional<at::Tensor> seqused_k_,      // b (int32)
+                     std::optional<int64_t> max_seqlen_q_,
+                     std::optional<int64_t> max_seqlen_k_) {
+    auto dprops = at::cuda::getCurrentDeviceProperties();
+    TORCH_CHECK(dprops->major >= 9, "mha_fwd_ring (ring) requires Hopper (sm90+).");
+    auto q_type = q.scalar_type();
+    TORCH_CHECK(q_type == at::ScalarType::Half || q_type == at::ScalarType::BFloat16,
+                "mha_fwd_ring supports fp16/bf16 only");
+    TORCH_CHECK(k.scalar_type() == q_type && v.scalar_type() == q_type, "q/k/v dtype mismatch");
+    TORCH_CHECK(out_accum.scalar_type() == at::ScalarType::Float && lse_accum.scalar_type() == at::ScalarType::Float,
+                "out_accum/lse_accum must be fp32");
+    CHECK_DEVICE(q); CHECK_DEVICE(k); CHECK_DEVICE(v); CHECK_DEVICE(out_accum); CHECK_DEVICE(lse_accum);
+    TORCH_CHECK(q.stride(-1) == 1 && k.stride(-1) == 1 && v.stride(-1) == 1 && out_accum.stride(-1) == 1,
+                "inputs/out_accum must have contiguous last dimension");
+    TORCH_CHECK(num_splits >= 1 && num_splits <= 256, "mha_fwd_ring requires 1 <= num_splits <= 256");
+
+    // ---- varlen plumbing (mirrors mha_fwd) ----
+    at::Tensor cu_seqlens_q, cu_seqlens_k;
+    bool const is_varlen_q = cu_seqlens_q_.has_value();
+    if (is_varlen_q) {
+        cu_seqlens_q = cu_seqlens_q_.value();
+        CHECK_DEVICE(cu_seqlens_q); CHECK_CONTIGUOUS(cu_seqlens_q);
+        TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32, "cu_seqlens_q must have dtype int32");
+        TORCH_CHECK(max_seqlen_q_.has_value(), "max_seqlen_q must be provided if cu_seqlens_q is provided");
+    }
+    bool const is_varlen_k = cu_seqlens_k_.has_value();
+    if (is_varlen_k) {
+        cu_seqlens_k = cu_seqlens_k_.value();
+        CHECK_DEVICE(cu_seqlens_k); CHECK_CONTIGUOUS(cu_seqlens_k);
+        TORCH_CHECK(cu_seqlens_k.dtype() == torch::kInt32, "cu_seqlens_k must have dtype int32");
+        TORCH_CHECK(max_seqlen_k_.has_value(), "max_seqlen_k must be provided if cu_seqlens_k is provided");
+    }
+    bool const is_varlen = is_varlen_q || is_varlen_k || seqused_q_.has_value() || seqused_k_.has_value();
+
+    auto const sizes = q.sizes();
+    const int b = !is_varlen_q ? sizes[0] : cu_seqlens_q.size(0) - 1;
+    const int seqlen_q = !is_varlen_q ? sizes[1] : max_seqlen_q_.value();
+    const int total_q = !is_varlen_q ? b * sizes[1] : sizes[0];
+    const int h = q.size(-2);
+    const int d = q.size(-1);
+    const int seqlen_k = !is_varlen_k ? k.size(1) : max_seqlen_k_.value();
+    const int total_k = !is_varlen_k ? b * k.size(1) : k.size(0);
+    const int h_k = k.size(-2);
+    const int dv = v.size(-1);
+    TORCH_CHECK(h % h_k == 0, "num_heads must be divisible by num_heads_k");
+    TORCH_CHECK(d <= get_max_headdim() && dv <= get_max_headdim(), "head dim too large");
+
+    double softmax_scale = softmax_scale_.has_value() ? softmax_scale_.value() : 1.0 / std::sqrt(double(d));
+    if (window_size_left >= seqlen_k - 1) { window_size_left = -1; }
+    if (window_size_right >= seqlen_q - 1) { window_size_right = -1; }
+    if (is_causal) { window_size_right = 0; }
+
+    auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
+    const int d_rounded = round_up_headdim(d);
+    const int dv_rounded = round_up_headdimv(dv);
+    const int seqlen_q_rounded = round_multiple(seqlen_q, 128);
+    const int seqlen_k_rounded = round_multiple(seqlen_k, 128);
+
+    if (!is_varlen_q) {
+        CHECK_SHAPE(q, b, seqlen_q, h, d);
+    } else {
+        CHECK_SHAPE(q, total_q, h, d);
+        CHECK_SHAPE(cu_seqlens_q, b + 1);
+    }
+    if (!is_varlen_k) {
+        CHECK_SHAPE(k, b, seqlen_k, h_k, d);
+        CHECK_SHAPE(v, b, seqlen_k, h_k, dv);
+    } else {
+        CHECK_SHAPE(k, total_k, h_k, d);
+        CHECK_SHAPE(v, total_k, h_k, dv);
+        CHECK_SHAPE(cu_seqlens_k, b + 1);
+    }
+    if (seqused_q_.has_value()) { auto t = seqused_q_.value(); TORCH_CHECK(t.dtype() == torch::kInt32); CHECK_DEVICE(t); CHECK_CONTIGUOUS(t); CHECK_SHAPE(t, b); }
+    if (seqused_k_.has_value()) { auto t = seqused_k_.value(); TORCH_CHECK(t.dtype() == torch::kInt32); CHECK_DEVICE(t); CHECK_CONTIGUOUS(t); CHECK_SHAPE(t, b); }
+    // Accumulator layout: dense keeps the batch dim; varlen collapses it (matches mha_fwd).
+    if (!is_varlen) {
+        CHECK_SHAPE(out_accum, (int)num_splits, b, h, seqlen_q, dv);
+        CHECK_SHAPE(lse_accum, (int)num_splits, b, h, seqlen_q);
+    } else {
+        CHECK_SHAPE(out_accum, (int)num_splits, h, total_q, dv);
+        CHECK_SHAPE(lse_accum, (int)num_splits, h, total_q);
+    }
+
+    at::cuda::CUDAGuard device_guard{q.device()};
+    auto opts = q.options();
+    // o_ptr / softmax_lse_ptr are unused on the Split path; pass small dummies.
+    at::Tensor dummy_out = is_varlen ? torch::empty({total_q, h, dv}, opts) : torch::empty({b, seqlen_q, h, dv}, opts);
+    at::Tensor dummy_lse = is_varlen ? torch::empty({h, total_q}, opts.dtype(at::kFloat)) : torch::empty({b, h, seqlen_q}, opts.dtype(at::kFloat));
+
+    Flash_fwd_params params;
+    set_params_fprop(params,
+                     b, seqlen_q, seqlen_k, seqlen_q_rounded, seqlen_k_rounded,
+                     h, h_k, d, d_rounded,
+                     q, k, v, dummy_out,
+                     !is_varlen_q ? nullptr : cu_seqlens_q.data_ptr(),
+                     !is_varlen_k ? nullptr : cu_seqlens_k.data_ptr(),
+                     seqused_q_.has_value() ? seqused_q_.value().data_ptr() : nullptr,
+                     seqused_k_.has_value() ? seqused_k_.value().data_ptr() : nullptr,
+                     dummy_lse.data_ptr(),
+                     /*p_dropout*/0.f, (float)softmax_scale,
+                     (int)window_size_left, (int)window_size_right, /*attention_chunk*/0,
+                     (float)softcap, (int)sm_margin);
+    params.total_q = total_q;
+    params.total_k = total_k;
+    params.b_k = b;
+    params.dv = dv;
+    params.dv_rounded = dv_rounded;
+    params.pack_gqa = true;              // Split path always uses PackGQA
+    params.pagedkv_tma = false;
+    params.is_fp32 = false;
+    // Varlen Split uses the persistent scheduler (needs prepared metadata); dense Split
+    // uses the single-tile scheduler (no metadata). Mirror mha_fwd's setup.
+    bool const use_prepare_varlen = is_varlen;
+    params.prepare_varlen_pdl = use_prepare_varlen && params.b <= PREPARE_VARLEN_MAX_BATCHES_1CTA;
+    params.num_splits_dynamic_ptr = !use_prepare_varlen ? nullptr : reinterpret_cast<int*>(1);
+    params.num_splits = (int)num_splits;
+    params.skip_scheduler_metadata_computation = false;
+    params.tile_count_semaphore = nullptr;
+    // fp32 partial accumulators (caller-owned slot). split/head/row strides work for
+    // both layouts; batch stride only exists (and is only read) in the dense layout.
+    params.oaccum_ptr = out_accum.data_ptr();
+    params.softmax_lseaccum_ptr = lse_accum.data_ptr();
+    params.oaccum_split_stride = out_accum.stride(0);
+    params.oaccum_head_stride = out_accum.stride(-3);
+    params.oaccum_row_stride = out_accum.stride(-2);
+    params.lseaccum_split_stride = lse_accum.stride(0);
+    params.lseaccum_head_stride = lse_accum.stride(-2);
+    if (!is_varlen) {
+        params.oaccum_batch_stride = out_accum.stride(1);
+        params.lseaccum_batch_stride = lse_accum.stride(1);
+    }
+
+    // Prepared-varlen scheduler metadata (persistent scheduler). Copied from mha_fwd.
+    at::Tensor tile_count_semaphore;
+    bool const scheduler_needs_semaphore = params.arch >= 90
+        ? (((params.is_causal || params.is_local) && (params.num_splits == 1)) || is_varlen)
+        : ((params.is_causal && !is_varlen) || (is_varlen && params.num_splits > 1));
+    params.varlen_sort_batches = !params.is_local;
+    params.head_swizzle = params.is_causal || params.is_local;
+    if (scheduler_needs_semaphore || use_prepare_varlen) {
+        int b_rounded = round_multiple(params.b, 4);
+        int num_prepare_batch_vectors = use_prepare_varlen ? 2 : 0;
+        if (params.varlen_sort_batches) { num_prepare_batch_vectors += 1; }
+        if (params.head_swizzle) { num_prepare_batch_vectors += 1; }
+        int head_swizzle_offset = b_rounded * (params.varlen_sort_batches ? 3 : 2);
+        int tile_count_semaphore_offset = b_rounded * num_prepare_batch_vectors;
+        int metadata_size = int(scheduler_needs_semaphore) + tile_count_semaphore_offset;
+        tile_count_semaphore = torch::empty({metadata_size}, opts.dtype(torch::kInt32));
+        if (scheduler_needs_semaphore && !use_prepare_varlen) { tile_count_semaphore.zero_(); }
+        params.num_splits_dynamic_ptr = use_prepare_varlen ? tile_count_semaphore.data_ptr<int>() : nullptr;
+        params.num_m_blocks_ptr = use_prepare_varlen ? tile_count_semaphore.data_ptr<int>() + b_rounded : nullptr;
+        params.varlen_batch_idx_ptr = use_prepare_varlen && params.varlen_sort_batches ? tile_count_semaphore.data_ptr<int>() + b_rounded * 2 : nullptr;
+        params.num_nheads_in_l2_ptr = use_prepare_varlen && params.head_swizzle ? tile_count_semaphore.data_ptr<int>() + head_swizzle_offset : nullptr;
+        params.tile_count_semaphore = scheduler_needs_semaphore ? tile_count_semaphore.data_ptr<int>() + tile_count_semaphore_offset : nullptr;
+        params.tile_count_semaphore_offset = tile_count_semaphore_offset;
+    }
+
+    if (params.total_q > 0 && params.total_k > 0 && h_k > 0) {
+        auto stream = at::cuda::getCurrentCUDAStream().stream();
+        run_mha_fwd_ring(params, stream);
+    } else {
+        out_accum.zero_();
+        lse_accum.fill_(-std::numeric_limits<float>::infinity());
+    }
+}
+
 #ifdef FLASHATTENTION_DISABLE_BACKWARD
 void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
     TORCH_CHECK(false, "Flash-Attention was built with backward disabled");
@@ -1567,6 +1770,272 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor> mha_bwd(
     return { softmax_d, softmax_lse_log2, dq_accum, dk_accum, dv_accum };
 }
 
+// ===========================================================================
+// Ring-attention native backward (FA3): phased, with a persistent fp32 dQ
+// accumulator across ring steps. Additive -- mha_bwd above and all bwd kernels
+// are untouched, so the standard backward path keeps identical speed/precision.
+//
+// A ring backward on each rank is a phased decomposition of the seqk-parallel
+// backward. The ring driver calls mha_bwd_ring three ways via `phase`:
+//   phase 1 (preprocess): compute D=rowsum(dO*O) -> dsoftmax_sum, softmax_lse_log2,
+//                         and CLEAR the persistent fp32 dq_accum. Call ONCE/rank
+//                         (dO, O, LSE are fixed for the rank across ring steps).
+//   phase 2 (step):       run the main bwd kernel for the CURRENT K/V shard --
+//                         atomicAdd its dQ into the persistent dq_accum (no clear,
+//                         no bf16 round-trip), and write this shard's dK/dV
+//                         (h_k-headed; GQA reduced on-device). Call PER ring step.
+//   phase 3 (convert):    convert accumulated fp32 dq_accum -> dq (bf16/fp16),
+//                         scaled by softmax_scale once. Call ONCE/rank.
+// The driver accumulates the per-step dK/dV contributions across ring steps in fp32.
+//
+// hd128 on sm90 pins kBlockM=64 in ring mode (run_mha_bwd_hdim128) so the persistent
+// dq_accum keeps ONE layout across mixed causal/non-causal steps.
+// ===========================================================================
+
+// kBlockM/kBlockN the ring backward uses. Mirrors mha_bwd's selection but is
+// CAUSAL-INDEPENDENT (a persistent dq_accum must keep one layout across mixed
+// causal/non-causal ring steps). On sm90: hd64 -> 128, hd96 -> 64, hd128 -> 80
+// (no-softcap; matches the ring branch of run_mha_bwd_hdim128, which pins the causal
+// diagonal to the tuned 80-block too) or 64 with softcap (where non-causal also uses
+// 64), hd192/256 -> 64. hd64 + softcap>0 is rejected by mha_bwd_ring. Single source
+// of truth for sizing the persistent dq_accum.
+static std::tuple<int, int> ring_bwd_kblock_mn(int arch, int head_size_rounded, double softcap) {
+    int kBlockM_sm90;
+    if (head_size_rounded <= 64) { kBlockM_sm90 = 128; }
+    else if (head_size_rounded <= 96) { kBlockM_sm90 = 64; }
+    else if (head_size_rounded <= 128) { kBlockM_sm90 = (softcap > 0.0 ? 64 : 80); }
+    else { kBlockM_sm90 = 64; }
+    int kBlockM_sm80 = head_size_rounded <= 64 ? 128 : 64;
+    int kBlockM_sm86 = head_size_rounded <= 192 ? 64 : 32;
+    int kBlockM = arch >= 90 ? kBlockM_sm90 : (arch == 86 || arch == 89 ? kBlockM_sm86 : kBlockM_sm80);
+    int kBlockN_sm90 = head_size_rounded <= 128 ? 128 : (head_size_rounded <= 192 ? 96 : 80);
+    int kBlockN_sm80 = head_size_rounded <= 128 ? 128 : (head_size_rounded <= 192 ? 80 : 64);
+    int kBlockN_sm86 = head_size_rounded <= 64 ? 128
+        : (head_size_rounded <= 96 ? 128
+           : (head_size_rounded <= 128 ? 96 : (head_size_rounded <= 192 ? 64 : 64)));
+    int kBlockN = arch >= 90 ? kBlockN_sm90 : (arch == 86 || arch == 89 ? kBlockN_sm86 : kBlockN_sm80);
+    return {kBlockM, kBlockN};
+}
+
+void mha_bwd_ring(
+    int64_t phase,                 // 1 = preprocess, 2 = step, 3 = convert_dq
+    at::Tensor dout,               // (b,s_q,h,dv) or (total_q,h,dv) if cu_seqlens_q
+    at::Tensor q,                  // (b,s_q,h,d)  or (total_q,h,d)
+    at::Tensor k,                  // (b,s_k,h_k,d) or (total_k,h_k,d)
+    at::Tensor v,                  // (b,s_k,h_k,dv) or (total_k,h_k,dv)
+    at::Tensor out,                // like dout
+    at::Tensor softmax_lse,        // dense (b,h,s_q) / varlen (h,total_q) (fp32)
+    at::Tensor dq,                 // like q    (written by phase 3)
+    at::Tensor dk,                 // like k    (this shard's contribution; phase 2)
+    at::Tensor dv,                 // like v    (this shard's contribution; phase 2)
+    at::Tensor dq_accum,           // dense (b,h,s_q_rounded*d_rounded) / varlen (h,total_q_padded_rounded*d_rounded) fp32
+    at::Tensor dsoftmax_sum,       // dense (b,h,s_q_rounded) / varlen (h,total_q_padded_rounded) fp32
+    at::Tensor softmax_lse_log2,   // same shape as dsoftmax_sum, fp32
+    std::optional<double> softmax_scale_,
+    bool is_causal,
+    int64_t window_size_left,
+    int64_t window_size_right,
+    double softcap,
+    int64_t sm_margin,
+    std::optional<at::Tensor> cu_seqlens_q_,   // b+1 (int32) — varlen
+    std::optional<at::Tensor> cu_seqlens_k_,   // b+1 (int32) — varlen
+    std::optional<at::Tensor> seqused_q_,      // b (int32)
+    std::optional<at::Tensor> seqused_k_,      // b (int32)
+    std::optional<int64_t> max_seqlen_q_,
+    std::optional<int64_t> max_seqlen_k_) {
+    #ifdef FLASHATTENTION_DISABLE_BACKWARD
+        TORCH_CHECK(false, "This flash attention build does not support backward.");
+    #endif
+    TORCH_CHECK(phase >= 1 && phase <= 3, "mha_bwd_ring phase must be 1, 2 or 3");
+
+    auto dprops = at::cuda::getCurrentDeviceProperties();
+    TORCH_CHECK(dprops->major >= 9, "mha_bwd_ring (ring) requires Hopper (sm90+).");
+
+    auto q_type = q.dtype();
+    TORCH_CHECK(q_type == torch::kFloat16 || q_type == torch::kBFloat16,
+                "mha_bwd_ring only supports fp16 and bf16 data type");
+    TORCH_CHECK(k.dtype() == q_type && v.dtype() == q_type && out.dtype() == q_type
+                && dout.dtype() == q_type && dq.dtype() == q_type
+                && dk.dtype() == q_type && dv.dtype() == q_type,
+                "q/k/v/out/dout/dq/dk/dv must share the same dtype");
+    TORCH_CHECK(dq_accum.dtype() == torch::kFloat32 && dsoftmax_sum.dtype() == torch::kFloat32
+                && softmax_lse_log2.dtype() == torch::kFloat32,
+                "dq_accum / dsoftmax_sum / softmax_lse_log2 must be float32");
+
+    CHECK_DEVICE(q); CHECK_DEVICE(k); CHECK_DEVICE(v); CHECK_DEVICE(out); CHECK_DEVICE(dout);
+    CHECK_DEVICE(softmax_lse); CHECK_DEVICE(dq); CHECK_DEVICE(dk); CHECK_DEVICE(dv);
+    CHECK_DEVICE(dq_accum); CHECK_DEVICE(dsoftmax_sum); CHECK_DEVICE(softmax_lse_log2);
+    TORCH_CHECK(q.stride(-1) == 1 && k.stride(-1) == 1 && v.stride(-1) == 1 && out.stride(-1) == 1
+                && dout.stride(-1) == 1 && dq.stride(-1) == 1 && dk.stride(-1) == 1 && dv.stride(-1) == 1,
+                "inputs/outputs must have contiguous last dimension");
+
+    // ---- varlen plumbing (mirrors mha_bwd) ----
+    at::Tensor cu_seqlens_q, cu_seqlens_k;
+    bool const is_varlen_q = cu_seqlens_q_.has_value();
+    if (is_varlen_q) {
+        cu_seqlens_q = cu_seqlens_q_.value();
+        CHECK_DEVICE(cu_seqlens_q); CHECK_CONTIGUOUS(cu_seqlens_q);
+        TORCH_CHECK(cu_seqlens_q.dtype() == torch::kInt32, "cu_seqlens_q must have dtype int32");
+        TORCH_CHECK(max_seqlen_q_.has_value(), "max_seqlen_q must be provided if cu_seqlens_q is provided");
+    }
+    bool const is_varlen_k = cu_seqlens_k_.has_value();
+    if (is_varlen_k) {
+        cu_seqlens_k = cu_seqlens_k_.value();
+        CHECK_DEVICE(cu_seqlens_k); CHECK_CONTIGUOUS(cu_seqlens_k);
+        TORCH_CHECK(cu_seqlens_k.dtype() == torch::kInt32, "cu_seqlens_k must have dtype int32");
+        TORCH_CHECK(max_seqlen_k_.has_value(), "max_seqlen_k must be provided if cu_seqlens_k is provided");
+    }
+    bool const is_varlen = is_varlen_q || is_varlen_k || seqused_q_.has_value() || seqused_k_.has_value();
+
+    auto const sizes = q.sizes();
+    int const batch_size = !is_varlen_q ? sizes[0] : cu_seqlens_q.size(0) - 1;
+    int const seqlen_q = !is_varlen_q ? sizes[1] : max_seqlen_q_.value();
+    int const total_q = !is_varlen_q ? batch_size * sizes[1] : sizes[0];
+    int const num_heads = q.size(-2);
+    int const head_size = q.size(-1);
+    int const head_size_v = v.size(-1);
+    int const seqlen_k = !is_varlen_k ? k.size(1) : max_seqlen_k_.value();
+    int const total_k = !is_varlen_k ? batch_size * k.size(1) : k.size(0);
+    int const num_heads_k = k.size(-2);
+    TORCH_CHECK(head_size % 8 == 0 && head_size_v % 8 == 0, "head sizes must be multiples of 8");
+    int const max_headdim = get_max_headdim();
+    TORCH_CHECK(std::max(head_size, head_size_v) <= max_headdim, "head dim too large");
+    TORCH_CHECK(num_heads % num_heads_k == 0, "num_heads must be divisible by num_heads_k");
+
+    double softmax_scale = softmax_scale_.has_value() ? softmax_scale_.value() : 1.0 / std::sqrt(double(head_size));
+
+    if (window_size_left >= seqlen_k - 1) { window_size_left = -1; }
+    if (window_size_right >= seqlen_q - 1) { window_size_right = -1; }
+    if (is_causal) { window_size_right = 0; }
+    // Match mha_bwd: fold window (-1, 0) into is_causal so the dispatch picks kBlockM
+    // consistently (matters for IMA-free indexing).
+    is_causal = window_size_left < 0 && window_size_right == 0;
+
+    int const arch = dprops->major * 10 + dprops->minor;
+    int const head_size_rounded = round_up_headdim(std::max(head_size, head_size_v));
+    int const head_size_v_rounded = head_size_rounded;
+    TORCH_CHECK(!(head_size_rounded <= 64 && softcap > 0.0),
+                "mha_bwd_ring does not support softcap for hdim<=64 (kBlockM would differ "
+                "across causal/non-causal ring steps and break the persistent dq_accum)");
+    auto [kBlockM, kBlockN] = ring_bwd_kblock_mn(arch, head_size_rounded, softcap);
+    auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
+    int const seqlen_q_rounded = round_multiple(seqlen_q, kBlockM);
+    int const seqlen_k_rounded = round_multiple(seqlen_k, kBlockN);
+    int const total_q_padded_rounded = round_multiple(total_q + batch_size * kBlockM, kBlockM);
+    int const total_k_padded_rounded = round_multiple(total_k + batch_size * kBlockN, kBlockN);
+
+    if (!is_varlen_q) {
+        CHECK_SHAPE(q, batch_size, seqlen_q, num_heads, head_size);
+        CHECK_SHAPE(out, batch_size, seqlen_q, num_heads, head_size_v);
+        CHECK_SHAPE(dout, batch_size, seqlen_q, num_heads, head_size_v);
+        CHECK_SHAPE(dq, batch_size, seqlen_q, num_heads, head_size);
+    } else {
+        CHECK_SHAPE(q, total_q, num_heads, head_size);
+        CHECK_SHAPE(out, total_q, num_heads, head_size_v);
+        CHECK_SHAPE(dout, total_q, num_heads, head_size_v);
+        CHECK_SHAPE(dq, total_q, num_heads, head_size);
+        CHECK_SHAPE(cu_seqlens_q, batch_size + 1);
+    }
+    if (!is_varlen_k) {
+        CHECK_SHAPE(k, batch_size, seqlen_k, num_heads_k, head_size);
+        CHECK_SHAPE(v, batch_size, seqlen_k, num_heads_k, head_size_v);
+        CHECK_SHAPE(dk, batch_size, seqlen_k, num_heads_k, head_size);
+        CHECK_SHAPE(dv, batch_size, seqlen_k, num_heads_k, head_size_v);
+    } else {
+        CHECK_SHAPE(k, total_k, num_heads_k, head_size);
+        CHECK_SHAPE(v, total_k, num_heads_k, head_size_v);
+        CHECK_SHAPE(dk, total_k, num_heads_k, head_size);
+        CHECK_SHAPE(dv, total_k, num_heads_k, head_size_v);
+        CHECK_SHAPE(cu_seqlens_k, batch_size + 1);
+    }
+    if (seqused_q_.has_value()) { auto t = seqused_q_.value(); TORCH_CHECK(t.dtype() == torch::kInt32); CHECK_DEVICE(t); CHECK_CONTIGUOUS(t); CHECK_SHAPE(t, batch_size); }
+    if (seqused_k_.has_value()) { auto t = seqused_k_.value(); TORCH_CHECK(t.dtype() == torch::kInt32); CHECK_DEVICE(t); CHECK_CONTIGUOUS(t); CHECK_SHAPE(t, batch_size); }
+    // Persistent-accumulator contract: dense keeps the batch dim; varlen collapses it
+    // and uses total_*_padded_rounded (matches stock mha_bwd's varlen layout).
+    if (!is_varlen) {
+        CHECK_SHAPE(dq_accum, batch_size, num_heads, seqlen_q_rounded * head_size_rounded);
+        CHECK_SHAPE(dsoftmax_sum, batch_size, num_heads, seqlen_q_rounded);
+        CHECK_SHAPE(softmax_lse_log2, batch_size, num_heads, seqlen_q_rounded);
+    } else {
+        CHECK_SHAPE(dq_accum, num_heads, total_q_padded_rounded * head_size_rounded);
+        CHECK_SHAPE(dsoftmax_sum, num_heads, total_q_padded_rounded);
+        CHECK_SHAPE(softmax_lse_log2, num_heads, total_q_padded_rounded);
+    }
+
+    auto device_guard = make_cuda_guard_from_tensor(q);
+    auto opts = q.options();
+
+    // For MQA/GQA the main kernel reduces multiple q-heads into one kv-head by
+    // atomicAdd-ing into fp32 dk/dv accumulators, then a convert kernel writes the
+    // h_k-headed dk/dv. Fresh (zeroed) per step -- each ring step emits ONE shard's
+    // dK/dV contribution; the driver sums contributions across steps in fp32.
+    at::Tensor dk_accum, dv_accum;
+    bool const use_kv_accum = (num_heads_k != num_heads) && phase == 2;
+    if (use_kv_accum) {
+        if (!is_varlen) {
+            dk_accum = torch::zeros({batch_size, num_heads_k, seqlen_k_rounded * head_size_rounded}, opts.dtype(at::kFloat));
+            dv_accum = torch::zeros({batch_size, num_heads_k, seqlen_k_rounded * head_size_v_rounded}, opts.dtype(at::kFloat));
+        } else {
+            dk_accum = torch::zeros({num_heads_k, total_k_padded_rounded, head_size_rounded}, opts.dtype(at::kFloat));
+            dv_accum = torch::zeros({num_heads_k, total_k_padded_rounded, head_size_v_rounded}, opts.dtype(at::kFloat));
+        }
+    }
+
+    Flash_bwd_params params;
+    set_params_dgrad(params,
+                     batch_size,
+                     seqlen_q, seqlen_k,
+                     seqlen_q_rounded, seqlen_k_rounded,
+                     num_heads, num_heads_k,
+                     head_size, head_size_rounded,
+                     q, k, v, out,
+                     dout, dq, dk, dv,
+                     !is_varlen_q ? nullptr : cu_seqlens_q.data_ptr(),
+                     !is_varlen_k ? nullptr : cu_seqlens_k.data_ptr(),
+                     seqused_q_.has_value() ? seqused_q_.value().data_ptr() : nullptr,
+                     seqused_k_.has_value() ? seqused_k_.value().data_ptr() : nullptr,
+                     dq_accum.data_ptr(),
+                     use_kv_accum ? dk_accum.data_ptr() : nullptr,
+                     use_kv_accum ? dv_accum.data_ptr() : nullptr,
+                     softmax_lse.data_ptr(),
+                     dsoftmax_sum.data_ptr(),
+                     /*p_dropout=*/0.f,
+                     softmax_scale,
+                     (int)window_size_left, (int)window_size_right,
+                     /*attention_chunk=*/0,
+                     softcap,
+                     /*deterministic=*/false,
+                     (int)sm_margin);
+    params.total_q = total_q;
+    params.total_k = total_k;
+    params.softmax_lse_log2_ptr = softmax_lse_log2.data_ptr();
+    params.dv = head_size_v;
+    params.dv_rounded = head_size_v_rounded;
+    params.ring_bwd_phase = (int)phase;
+
+    // dq_semaphore: allocated exactly like mha_bwd (zeroed inside the preprocess
+    // kernel). Unused by the main kernel here because deterministic=false, but the
+    // kernel params still reference it. seqlen_q is max_seqlen under varlen (matches mha_bwd).
+    at::Tensor dq_semaphore = torch::empty({(seqlen_q + kBlockM - 1) / kBlockM, batch_size, num_heads}, opts.dtype(torch::kInt32));
+    params.dq_semaphore = dq_semaphore.data_ptr<int>();
+
+    #ifdef FLASHATTENTION_DISABLE_LOCAL
+    TORCH_CHECK(!params.is_local, "This flash attention build does not support local attention.");
+    #endif
+    #ifdef FLASHATTENTION_DISABLE_SOFTCAP
+    TORCH_CHECK(params.softcap == 0.0, "This flash attention build does not support tanh softcapping.");
+    #endif
+
+    if (total_q > 0 && total_k > 0 && num_heads_k > 0) {
+        auto stream = at::cuda::getCurrentCUDAStream().stream();
+        run_mha_bwd(params, stream);
+    } else if (phase == 2) {
+        // Empty shard contributes nothing to this step's dK/dV.
+        dk.zero_();
+        dv.zero_();
+    }
+}
+
 std::tuple<at::Tensor, at::Tensor>
 mha_combine(at::Tensor out_partial,         // num_splits x batch_size x seqlen x num_heads x head_size
             at::Tensor lse_partial,         // num_splits x batch_size x seqlen x num_heads
@@ -1706,6 +2175,25 @@ TORCH_LIBRARY(flash_attn_3, m) {
         "int num_splits = 0,"
         "bool? pack_gqa = None,"
         "int sm_margin = 0) -> (Tensor(out!), Tensor, Tensor, Tensor)");
+    m.def("fwd_ring("
+        "Tensor q,"
+        "Tensor k,"
+        "Tensor v,"
+        "Tensor(out_accum!) out_accum,"
+        "Tensor(lse_accum!) lse_accum,"
+        "float? softmax_scale = None,"
+        "bool is_causal = False,"
+        "int window_size_left = -1,"
+        "int window_size_right = -1,"
+        "float softcap = 0.0,"
+        "int num_splits = 2,"
+        "int sm_margin = 0,"
+        "Tensor? cu_seqlens_q = None,"
+        "Tensor? cu_seqlens_k = None,"
+        "Tensor? seqused_q = None,"
+        "Tensor? seqused_k = None,"
+        "int? max_seqlen_q = None,"
+        "int? max_seqlen_k = None) -> ()");
     m.def("bwd("
         "Tensor dout,"
         "Tensor q,"
@@ -1729,6 +2217,32 @@ TORCH_LIBRARY(flash_attn_3, m) {
         "float softcap = 0.0,"
         "bool deterministic = False,"
         "int sm_margin = 0) -> (Tensor, Tensor, Tensor, Tensor, Tensor)");
+    m.def("bwd_ring("
+        "int phase,"
+        "Tensor dout,"
+        "Tensor q,"
+        "Tensor k,"
+        "Tensor v,"
+        "Tensor out,"
+        "Tensor softmax_lse,"
+        "Tensor(dq!) dq,"
+        "Tensor(dk!) dk,"
+        "Tensor(dv!) dv,"
+        "Tensor(dq_accum!) dq_accum,"
+        "Tensor(dsoftmax_sum!) dsoftmax_sum,"
+        "Tensor(softmax_lse_log2!) softmax_lse_log2,"
+        "float? softmax_scale = None,"
+        "bool is_causal = False,"
+        "int window_size_left = -1,"
+        "int window_size_right = -1,"
+        "float softcap = 0.0,"
+        "int sm_margin = 0,"
+        "Tensor? cu_seqlens_q = None,"
+        "Tensor? cu_seqlens_k = None,"
+        "Tensor? seqused_q = None,"
+        "Tensor? seqused_k = None,"
+        "int? max_seqlen_q = None,"
+        "int? max_seqlen_k = None) -> ()");
     m.def("fwd_combine("
         "Tensor out_partial,"
         "Tensor lse_partial,"
@@ -1763,7 +2277,9 @@ TORCH_LIBRARY(flash_attn_3, m) {
 
 TORCH_LIBRARY_IMPL(flash_attn_3, CUDA, m) {
     m.impl("fwd", &mha_fwd);
+    m.impl("fwd_ring", &mha_fwd_ring);
     m.impl("bwd", &mha_bwd);
+    m.impl("bwd_ring", &mha_bwd_ring);
     m.impl("fwd_combine", &mha_combine);
     m.impl("get_scheduler_metadata", &mha_fwd_get_scheduler_metadata);
 }
