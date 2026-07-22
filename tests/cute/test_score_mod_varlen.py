@@ -612,7 +612,10 @@ def test_varlen_with_score_mod_vectorized(
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
         )
-        assert torch.equal(out, out_ref)
+        # Vectorized codegen reorders float ops vs the scalar path; softmax amplifies
+        # the resulting 1-ulp score differences (measured max 4e-4 fp16 / 2.9e-3 bf16 on sm103).
+        rtol, atol = (2e-3, 1e-3) if dtype == torch.float16 else (1.6e-2, 5e-3)
+        assert torch.allclose(out, out_ref, rtol=rtol, atol=atol)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
