@@ -939,6 +939,145 @@ def flash_attn_combine(out_partial, lse_partial, out=None, out_dtype=None):
     return flash_attn_3_gpu.fwd_combine(out_partial, lse_partial, out, out_dtype)
 
 
+def ring_head_size_v(head_size_v):
+    """dv the fp32 partial accumulator uses (FA3 writes the true dv, no rounding)."""
+    return head_size_v
+
+
+def flash_attn_forward_ring(
+    q,
+    k,
+    v,
+    out_accum,   # dense (num_splits,b,h,s_q,dv) / varlen (num_splits,h,total_q,dv) fp32
+    lse_accum,   # dense (num_splits,b,h,s_q)    / varlen (num_splits,h,total_q)    fp32
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),
+    softcap=0.0,
+    num_splits=2,
+    cu_seqlens_q=None,
+    cu_seqlens_k=None,
+    seqused_q=None,
+    seqused_k=None,
+    max_seqlen_q=None,
+    max_seqlen_k=None,
+):
+    """Ring: attention of q against ONE K/V block -> fp32 normalized partial +
+    fp32 LSE written into out_accum/lse_accum (num_splits sub-splits), NO combine.
+    Stack these across ring steps and call flash_attn_combine once at the end.
+    Varlen: pass cu_seqlens_q/k (+ max_seqlen_q/k); q/k/v are (total_*, h, d) and the
+    accumulators collapse the batch dim to (num_splits, h, total_q, dv)."""
+    q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+    flash_attn_3_gpu.fwd_ring(
+        q, k, v, out_accum, lse_accum, softmax_scale, causal,
+        window_size[0], window_size[1], softcap, num_splits, 0,
+        cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, max_seqlen_q, max_seqlen_k,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Ring-attention native backward (FA3, phased). flash_attn_3_gpu.bwd_ring keeps a
+# persistent fp32 dq_accum across ring steps so dQ never round-trips through bf16,
+# and splits the backward into three separately-launchable phases. The standard
+# FA3 backward (flash_attn_3_gpu.bwd) path is untouched.
+#
+# Persistent buffers the ring driver allocates ONCE per rank (see ring_bwd_alloc):
+#   dq_accum:         (batch, nheads, seqlen_q_rounded * head_size_rounded) fp32
+#   dsoftmax_sum:     (batch, nheads, seqlen_q_rounded)                     fp32
+#   softmax_lse_log2: (batch, nheads, seqlen_q_rounded)                     fp32
+# Usage per rank:
+#   phase 1 (preprocess): once  -> D into dsoftmax_sum, softmax_lse_log2, clear dq_accum
+#   phase 2 (step):       per ring step -> atomicAdd this K/V shard's dQ into dq_accum,
+#                         write this shard's dk/dv (h_k-headed, GQA reduced); the driver
+#                         accumulates dk/dv in fp32 across ring steps.
+#   phase 3 (convert):    once  -> dq_accum -> dq (bf16/fp16), scaled once.
+# ---------------------------------------------------------------------------
+def _ring_round_up_headdim(d):
+    """Matches round_up_headdim in hopper/flash_api.cpp (64/96/128/192/256 steps)."""
+    for x in (64, 96, 128, 192, 256):
+        if d <= x:
+            return x
+    raise ValueError(f"head dim {d} too large (max 256)")
+
+
+def ring_bwd_alloc(batch, seqlen_q, nheads, head_size, head_size_v=None, device="cuda",
+                   total_q=None):
+    """Allocate the persistent (dq_accum, dsoftmax_sum, softmax_lse_log2) buffers for
+    the FA3 ring backward. Shapes match hopper/flash_api.cpp::mha_bwd_ring (sm90):
+    head_size_rounded = round_up_headdim(max(d, dv)); the ring kBlockM (see below) is
+    causal-independent so seqlen_q_rounded stays consistent across mixed causal/
+    non-causal steps.
+
+    Dense (total_q is None): dq_accum (batch, nheads, s_q_rounded*d_rounded) etc.
+    Varlen (total_q given): collapses the batch dim and uses total_q_padded_rounded =
+    round_up(total_q + batch*kBlockM, kBlockM) -> dq_accum (nheads, tqpr*d_rounded),
+    dsoftmax_sum / softmax_lse_log2 (nheads, tqpr). `seqlen_q` here is max_seqlen_q."""
+    if head_size_v is None:
+        head_size_v = head_size
+    d_rounded = _ring_round_up_headdim(max(head_size, head_size_v))
+    # kBlockM must match ring_bwd_kblock_mn (hopper/flash_api.cpp) for the no-softcap
+    # ring: hd<=64 -> 128, hd96 -> 64, hd128 -> 80 (tuned block, shared by the pinned
+    # causal diagonal), hd192/256 -> 64.
+    if d_rounded <= 64:
+        kBlockM = 128
+    elif d_rounded <= 96:
+        kBlockM = 64
+    elif d_rounded <= 128:
+        kBlockM = 80
+    else:
+        kBlockM = 64
+    if total_q is None:
+        s_q_rounded = ((seqlen_q + kBlockM - 1) // kBlockM) * kBlockM
+        lead = (batch, nheads)
+        n_rows = s_q_rounded
+    else:
+        tqpr = ((total_q + batch * kBlockM + kBlockM - 1) // kBlockM) * kBlockM
+        lead = (nheads,)
+        n_rows = tqpr
+    dq_accum = torch.empty(lead + (n_rows * d_rounded,), dtype=torch.float32, device=device)
+    dsoftmax_sum = torch.empty(lead + (n_rows,), dtype=torch.float32, device=device)
+    softmax_lse_log2 = torch.empty(lead + (n_rows,), dtype=torch.float32, device=device)
+    return dq_accum, dsoftmax_sum, softmax_lse_log2
+
+
+def flash_attn_backward_ring(
+    phase,                 # 1=preprocess, 2=step, 3=convert_dq
+    dout,
+    q,
+    k,
+    v,
+    out,
+    softmax_lse,
+    dq,                    # bf16/fp16 output (written by phase 3)
+    dk,                    # bf16/fp16 this-shard contribution (h_k-headed; phase 2)
+    dv,
+    dq_accum,              # persistent fp32
+    dsoftmax_sum,          # persistent fp32
+    softmax_lse_log2,      # persistent fp32
+    softmax_scale=None,
+    causal=False,
+    window_size=(-1, -1),
+    softcap=0.0,
+    cu_seqlens_q=None,
+    cu_seqlens_k=None,
+    seqused_q=None,
+    seqused_k=None,
+    max_seqlen_q=None,
+    max_seqlen_k=None,
+):
+    """Ring backward, one phase per call (see block comment above). Writes in place.
+    Varlen: pass cu_seqlens_q/k (+ max_seqlen_q/k); q/k/v/out/dout/dq/dk/dv are
+    (total_*, h, d) and the persistent buffers use the varlen layout from
+    ring_bwd_alloc(..., total_q=...)."""
+    dout, q, k, v, out = [maybe_contiguous(x) for x in (dout, q, k, v, out)]
+    flash_attn_3_gpu.bwd_ring(
+        phase, dout, q, k, v, out, softmax_lse,
+        dq, dk, dv, dq_accum, dsoftmax_sum, softmax_lse_log2,
+        softmax_scale, causal, window_size[0], window_size[1], softcap, 0,
+        cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, max_seqlen_q, max_seqlen_k,
+    )
+
+
 def flash_attn_with_kvcache(
     q,
     k_cache,
