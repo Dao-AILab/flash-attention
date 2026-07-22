@@ -109,7 +109,7 @@ def _flash_attn_forward(
         window_size_right,
         softcap,
         return_softmax,
-        None,
+        None,  # unused generator slot, kept for backwards-compat arg positioning
     )
     return out, softmax_lse, S_dmask, rng_state
 
@@ -195,7 +195,7 @@ def _flash_attn_varlen_forward(
         window_size_right,
         softcap,
         return_softmax,
-        None,
+        None,  # unused generator slot, kept for backwards-compat arg positioning
         num_splits,
     )
     # if out.isnan().any() or softmax_lse.isnan().any():
@@ -295,7 +295,7 @@ def _flash_attn_backward(
         window_size_right,
         softcap,
         deterministic,
-        None,
+        None,  # unused generator slot, kept for backwards-compat arg positioning
         rng_state,
     )
     return softmax_d
@@ -400,7 +400,7 @@ def _flash_attn_varlen_backward(
         window_size_right,
         softcap,
         deterministic,
-        None,
+        None,  # unused generator slot, kept for backwards-compat arg positioning
         rng_state,
     )
     # if dk.isnan().any() or dk.isnan().any() or dv.isnan().any() or softmax_d.isnan().any():
