@@ -1333,10 +1333,24 @@ def _flash_attn_bwd(
     aux_scalars: Optional[tuple] = None,
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     dlse: Optional[torch.Tensor] = None,
+    peer_k: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+    peer_v: Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+    compact_dkv_batch: bool = False,
+    two_section_causal_bwd: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
     arch = _get_device_arch()
     assert arch // 10 in [9, 10, 11, 12], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x, 12.x"
+    has_peer_kv = peer_k is not None or peer_v is not None
+    paired_adjacent_k_tiles = False
+    direct_owner_dkv = two_section_causal_bwd
+    if has_peer_kv:
+        assert peer_k is not None and peer_v is not None, "peer_k and peer_v must be provided together"
+        assert len(peer_k) == 4 and len(peer_v) == 4, "peer_k and peer_v must each contain 4 tensors"
+        assert arch // 10 == 10, "multi-base K/V backward is only supported on SM100"
+        assert cu_seqlens_q is None and cu_seqlens_k is None, "multi-base K/V does not support varlen"
+        assert seqused_q is None and seqused_k is None, "multi-base K/V does not support varlen"
+        assert block_sparse_tensors is None, "multi-base K/V does not support block sparsity"
     sparse_q = None
     if block_sparse_tensors is not None and arch // 10 == 9:
         sparse_q = block_sparse_tensors.block_size[0] if block_sparse_tensors.block_size is not None else 128
@@ -1425,6 +1439,9 @@ def _flash_attn_bwd(
         maybe_contiguous(t)
         for t in (q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
     ]
+    if has_peer_kv:
+        peer_k = tuple(maybe_contiguous(t) for t in peer_k)
+        peer_v = tuple(maybe_contiguous(t) for t in peer_v)
     if cu_seqlens_q is None:
         batch_size, seqlen_q = q.shape[:2]
         total_q = batch_size * seqlen_q
@@ -1435,6 +1452,9 @@ def _flash_attn_bwd(
 
     if cu_seqlens_k is None:
         batch_size, seqlen_k = k.shape[:2]
+        chunk_seqlen_k = seqlen_k
+        if has_peer_kv:
+            seqlen_k = 4 * chunk_seqlen_k
         total_k = batch_size * seqlen_k
     else:
         batch_size = cu_seqlens_k.shape[0] - 1
@@ -1442,18 +1462,35 @@ def _flash_attn_bwd(
         seqlen_k = max_seqlen_k if max_seqlen_k is not None else total_k
 
     num_head_kv = k.shape[-2]
+    if has_peer_kv:
+        assert q.shape[-2] == num_head_kv, "multi-base K/V initially requires MHA, not GQA"
+        assert head_dim != 256 and head_dim_v != 256, "multi-base K/V does not support dedicated hd256 kernels"
+        assert chunk_seqlen_k % 2 == 0, "multi-base K/V base length must be even"
+        assert (chunk_seqlen_k // 2) % (n_block_size * cluster_size) == 0, (
+            "multi-base K/V half length must align to the effective backward K/V tile"
+        )
+        for name, tensors, reference in (("peer_k", peer_k, k), ("peer_v", peer_v, v)):
+            for idx, tensor in enumerate(tensors):
+                assert tensor.shape == reference.shape, f"{name}[{idx}] must match peer base shape"
+                assert tensor.dtype == reference.dtype and tensor.device == reference.device, (
+                    f"{name}[{idx}] dtype/device must match local tensor"
+                )
+                assert tensor.stride() == reference.stride(), f"{name}[{idx}] strides must match"
+                assert tensor.data_ptr() % 16 == 0, f"{name}[{idx}] must be 16-byte aligned"
 
     use_block_sparsity = block_sparse_tensors is not None
     q_subtile_factor = sparse_q // m_block_size if sparse_q is not None else 2
     seqlen_q_rounded = (seqlen_q + m_block_size - 1) // m_block_size * m_block_size
     seqlen_k_rounded = (seqlen_k + n_block_size - 1) // n_block_size * n_block_size
     num_n_blocks = seqlen_k_rounded // n_block_size
-    if cluster_size == 2 and num_n_blocks % cluster_size != 0:
-        seqlen_k_rounded = seqlen_k_rounded + n_block_size
+    launch_cluster_size = 4 if paired_adjacent_k_tiles else cluster_size
+    if num_n_blocks % launch_cluster_size != 0:
+        seqlen_k_rounded += (launch_cluster_size - num_n_blocks % launch_cluster_size) * n_block_size
 
     if cu_seqlens_k is None:
-        assert k.shape == (batch_size, seqlen_k, num_head_kv, head_dim)
-        assert v.shape == (batch_size, seqlen_k, num_head_kv, head_dim_v)
+        expected_input_seqlen_k = chunk_seqlen_k if has_peer_kv else seqlen_k
+        assert k.shape == (batch_size, expected_input_seqlen_k, num_head_kv, head_dim)
+        assert v.shape == (batch_size, expected_input_seqlen_k, num_head_kv, head_dim_v)
     else:
         assert k.shape == (total_k, num_head_kv, head_dim)
         assert v.shape == (total_k, num_head_kv, head_dim_v)
@@ -1488,7 +1525,11 @@ def _flash_attn_bwd(
         dlse = maybe_contiguous(dlse)
     if not is_fake_mode():
         assert all(
-            t is None or t.is_cuda for t in (q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k)
+            t is None or t.is_cuda
+            for t in (
+                q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k,
+                *(peer_k or ()), *(peer_v or ()),
+            )
         ), "inputs must be on CUDA device"
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
     alignment = 16 // q.element_size()
@@ -1501,6 +1542,88 @@ def _flash_attn_bwd(
         pack_gqa = qhead_per_kvhead > 1
     # pack_gqa backward not yet supported in bwd
     pack_gqa = False
+
+    if compact_dkv_batch:
+        assert arch // 10 in [10, 11], "compact_dkv_batch is only supported on SM100/SM110"
+        assert qhead_per_kvhead == 1, "compact_dkv_batch currently requires MHA"
+        assert not use_dedicated_hd256_kernel, (
+            "compact_dkv_batch does not support the dedicated head-dim-256 kernel"
+        )
+        assert not has_peer_kv, "compact_dkv_batch does not support multi-base K/V"
+        assert block_sparse_tensors is None, "compact_dkv_batch does not support block sparsity"
+        assert cu_seqlens_k is None, "compact_dkv_batch requires fixed-storage K/V"
+        assert seqused_k is not None, "compact_dkv_batch requires seqused_k"
+        assert k.ndim == 4 and v.ndim == 4, "compact_dkv_batch requires 4D K/V"
+        assert batch_size > 1, "compact_dkv_batch requires multiple logical batches"
+        assert k.stride(0) == 0 and v.stride(0) == 0, (
+            "compact_dkv_batch requires shared K/V with zero batch stride"
+        )
+        assert seqused_k.shape == (batch_size,), (
+            "compact_dkv_batch requires seqused_k.shape == (logical_batch_size,)"
+        )
+        assert seqused_k.dtype == torch.int32 and seqused_k.is_contiguous(), (
+            "compact_dkv_batch requires contiguous int32 seqused_k"
+        )
+        assert not deterministic or two_section_causal_bwd, (
+            "compact_dkv_batch deterministic atomic accumulation is not yet validated"
+        )
+        if not is_fake_mode():
+            min_seqlen_k, max_used_seqlen_k = torch.aminmax(seqused_k)
+            assert min_seqlen_k.item() >= 0, "compact_dkv_batch seqused_k must be non-negative"
+            assert max_used_seqlen_k.item() <= seqlen_k, (
+                "compact_dkv_batch K/V storage length must cover max(seqused_k)"
+            )
+
+    if two_section_causal_bwd:
+        assert compact_dkv_batch, "two_section_causal_bwd requires compact_dkv_batch"
+        assert arch // 10 in [10, 11], "two_section_causal_bwd requires SM100/SM110"
+        assert causal and not local, "two_section_causal_bwd requires built-in causal attention"
+        assert mask_mod is None, "two_section_causal_bwd does not support mask_mod"
+        assert score_mod is None and score_mod_bwd is None, (
+            "two_section_causal_bwd does not support score_mod"
+        )
+        assert cu_seqlens_q is None and seqused_q is None, (
+            "two_section_causal_bwd requires fixed equal-length Q sections"
+        )
+        assert q.shape[0] == 2 and k.shape[0] == 2, (
+            "two_section_causal_bwd requires exactly two logical sections"
+        )
+        assert head_dim == 128 and head_dim_v == 128, (
+            "two_section_causal_bwd prototype requires head_dim=head_dim_v=128"
+        )
+        assert m_block_size == 128 and n_block_size == 128, (
+            "two_section_causal_bwd prototype requires BM128 with BN128"
+        )
+        assert cluster_size == 2 and use_2cta_instrs, (
+            "two_section_causal_bwd prototype requires the 2CTA path"
+        )
+        assert seqused_k.numel() == 2, (
+            "two_section_causal_bwd requires exactly two K/V prefixes"
+        )
+        if not is_fake_mode():
+            prefix1, prefix2 = (int(x) for x in seqused_k.tolist())
+            assert 0 < prefix1 <= prefix2 == seqlen_k, (
+                "two_section_causal_bwd requires 0 < prefix1 <= prefix2 == K/V length"
+            )
+            assert prefix1 % (cluster_size * n_block_size) == 0, (
+                "two_section_causal_bwd prefix1 must align to the 2CTA K/V tile"
+            )
+    if direct_owner_dkv:
+        assert compact_dkv_batch and qhead_per_kvhead == 1, (
+            "direct owner dKV requires compact two-section MHA backward"
+        )
+    if paired_adjacent_k_tiles:
+        assert arch // 10 in [10, 11], "paired K tiles require SM100/SM110"
+        assert causal and not local, "paired K tiles require causal non-local backward"
+        assert m_block_size == 128 and n_block_size == 128, (
+            "paired K tiles require 128x128 tiles"
+        )
+        assert head_dim == 128 and head_dim_v == 128, (
+            "paired K tiles require head_dim=head_dim_v=128"
+        )
+        assert cluster_size == 2 and use_2cta_instrs, (
+            "paired K tiles require the pair-local 2CTA path"
+        )
     
     if softcap != 0.0:
         assert score_mod is None and score_mod_bwd is None, (
@@ -1524,15 +1647,25 @@ def _flash_attn_bwd(
     else:
         _validate_tensor(dq, "dq", q.shape, out_torch_dtype, device)
 
+    logical_k_shape = (
+        (1, seqlen_k, num_head_kv, head_dim)
+        if compact_dkv_batch
+        else ((batch_size, seqlen_k, num_head_kv, head_dim) if has_peer_kv else k.shape)
+    )
+    logical_v_shape = (
+        (1, seqlen_k, num_head_kv, head_dim_v)
+        if compact_dkv_batch
+        else ((batch_size, seqlen_k, num_head_kv, head_dim_v) if has_peer_kv else v.shape)
+    )
     if dk is None:
-        dk = torch.empty_like(k)
+        dk = torch.empty(logical_k_shape, dtype=out_torch_dtype, device=device)
     else:
-        _validate_tensor(dk, "dk", k.shape, out_torch_dtype, device)
+        _validate_tensor(dk, "dk", logical_k_shape, out_torch_dtype, device)
 
     if dv is None:
-        dv = torch.empty_like(v)
+        dv = torch.empty(logical_v_shape, dtype=out_torch_dtype, device=device)
     else:
-        _validate_tensor(dv, "dv", v.shape, out_torch_dtype, device)
+        _validate_tensor(dv, "dv", logical_v_shape, out_torch_dtype, device)
 
     head_dim_rounded = (head_dim + 32 - 1) // 32 * 32
 
@@ -1568,23 +1701,27 @@ def _flash_attn_bwd(
         dpsum = torch.empty(num_head, total_q_rounded_padded, dtype=torch.float32, device=device)
         lse_log2 = torch.empty(num_head, total_q_rounded_padded, dtype=torch.float32, device=device)
 
-    # GQA (qhead_per_kvhead > 1) needs dK/dV accum+postprocess since multiple Q heads
-    # accumulate into the same dK/dV. SM90 varlen_k with qhead_per_kvhead==1 now uses
-    # ragged TMA tensors for direct store, so no longer needs accum+postprocess.
+    # GQA and compact logical-batch mode need FP32 dK/dV accumulation followed by
+    # conversion. Compact mode collapses all logical K/V batches into batch zero.
     # hd=256 2CTA backward has its own internal postprocess for dK/dV.
-    dKV_postprocess = qhead_per_kvhead > 1 and not use_dedicated_hd256_kernel
+    dKV_postprocess = (
+        (qhead_per_kvhead > 1 or compact_dkv_batch)
+        and not use_dedicated_hd256_kernel
+        and not direct_owner_dkv
+    )
     if dKV_postprocess:
         head_dim_v_rounded = (head_dim_v + 32 - 1) // 32 * 32
         if cu_seqlens_k is None:
+            dkv_accum_batch_size = 1 if compact_dkv_batch else batch_size
             dk_accum = torch.zeros(
-                batch_size,
+                dkv_accum_batch_size,
                 num_head_kv,
                 seqlen_k_rounded * head_dim_rounded,
                 dtype=torch.float32,
                 device=device,
             )
             dv_accum = torch.zeros(
-                batch_size,
+                dkv_accum_batch_size,
                 num_head_kv,
                 seqlen_k_rounded * head_dim_v_rounded,
                 dtype=torch.float32,
@@ -1725,6 +1862,11 @@ def _flash_attn_bwd(
             get_broadcast_dims(k),
             get_broadcast_dims(v),
             get_broadcast_dims(dout),
+            has_peer_kv,
+            compact_dkv_batch,
+            two_section_causal_bwd,
+            paired_adjacent_k_tiles,
+            direct_owner_dkv,
             # Prevent TVM stride poisoning when only one block is present.
             (seqlen_q_rounded // m_block_size == 1),
             (seqlen_k_rounded // n_block_size == 1),
@@ -1762,6 +1904,7 @@ def _flash_attn_bwd(
             get_broadcast_dims(k),
             get_broadcast_dims(v),
             get_broadcast_dims(dout),
+            has_peer_kv,
             # Prevent TVM stride poisoning when only one block is present.
             (seqlen_q_rounded // m_block_size == 1),
             (seqlen_k_rounded // n_block_size == 1),
@@ -1772,6 +1915,8 @@ def _flash_attn_bwd(
             to_cute_tensor(t) for t in (q, k, v, dout, dq, dk, dv)
         ]
         lse_log2_tensor, dpsum_tensor = [to_cute_tensor(t) for t in (lse_log2, dpsum)]
+        peer_k_tensors = tuple(to_cute_tensor(t) for t in peer_k) if has_peer_kv else (None,) * 4
+        peer_v_tensors = tuple(to_cute_tensor(t) for t in peer_v) if has_peer_kv else (None,) * 4
         dq_accum_tensor = to_cute_tensor(dq_accum) if dq_accum is not None else None
         if dKV_postprocess:
             dk_accum_tensor, dv_accum_tensor = [
@@ -1890,6 +2035,10 @@ def _flash_attn_bwd(
                     mask_mod=mask_mod,
                     has_aux_tensors=aux_tensors is not None,
                     q_subtile_factor=q_subtile_factor,
+                    compact_dkv_batch=compact_dkv_batch,
+                    two_section_causal_bwd=two_section_causal_bwd,
+                    paired_adjacent_k_tiles=paired_adjacent_k_tiles,
+                    direct_owner_dkv=direct_owner_dkv,
                 )
 
         # Block sparse tensors for backward use Q-direction indexing (transposed from forward).
@@ -1899,8 +2048,7 @@ def _flash_attn_bwd(
         dq_accum_tensor = dq_tensor if use_dedicated_hd256_kernel else dq_accum_tensor
 
         # TODO: check @can_implement
-        _flash_attn_bwd.compile_cache[compile_key] = cute.compile(
-            fa_bwd_obj,
+        compile_args = [
             q_tensor,
             k_tensor,
             v_tensor,
@@ -1922,12 +2070,18 @@ def _flash_attn_bwd(
             dV_semaphore_tensor,
             AuxData(cute_aux_tensors, aux_scalars),
             sparse_tensors_compile,
-            current_stream,
+        ]
+        if arch // 10 in [10, 11] and not use_dedicated_hd256_kernel:
+            compile_args.extend((*peer_k_tensors, *peer_v_tensors))
+        compile_args.append(current_stream)
+        _flash_attn_bwd.compile_cache[compile_key] = cute.compile(
+            fa_bwd_obj,
+            *compile_args,
             options="--enable-tvm-ffi",
         )
     if not is_fake_mode():
         dq_accum = dq if use_dedicated_hd256_kernel else dq_accum
-        _flash_attn_bwd.compile_cache[compile_key](
+        call_args = [
             q.detach(),
             k.detach(),
             v.detach(),
@@ -1960,7 +2114,12 @@ def _flash_attn_bwd(
             )
             if normalized_block_sparse_tensors is not None
             else None,
-        )
+        ]
+        if arch // 10 in [10, 11] and not use_dedicated_hd256_kernel:
+            call_args.extend(
+                (*peer_k, *peer_v) if has_peer_kv else (None,) * 8
+            )
+        _flash_attn_bwd.compile_cache[compile_key](*call_args)
     # Postprocess: convert dq_accum from float32 to dq in bf16/fp16
     # hd=256 2CTA backward has its own internal postprocess, skip here.
     if not use_dedicated_hd256_kernel:
@@ -1975,16 +2134,21 @@ def _flash_attn_bwd(
         _bwd_postprocess_convert(
             dq_accum, dq, softmax_scale,
             cu_seqlens_q, seqused_q,
-            arch, dtype, head_dim, m_block_size, num_threads_post_dQ,
+            arch, dtype, head_dim,
+            m_block_size,
+            num_threads_post_dQ,
             AtomLayoutMdQ, dQ_swapAB,
-            use_2cta_instrs=use_2cta_instrs, cluster_size=1,
+            use_2cta_instrs=use_2cta_instrs,
+            cluster_size=1,
         )
 
         if dKV_postprocess:
+            dkv_postprocess_cu_seqlens = None if compact_dkv_batch else cu_seqlens_k
+            dkv_postprocess_seqused = None if compact_dkv_batch else seqused_k
             # Postprocess: convert dk_accum from float32 to dk in bf16/fp16
             _bwd_postprocess_convert(
                 dk_accum, dk, softmax_scale,
-                cu_seqlens_k, seqused_k,
+                dkv_postprocess_cu_seqlens, dkv_postprocess_seqused,
                 arch, dtype, head_dim, n_block_size, num_threads_post_dKV,
                 AtomLayoutNdKV, dKV_swapAB,
                 cluster_size=cluster_size,
@@ -1992,7 +2156,7 @@ def _flash_attn_bwd(
             # Postprocess: convert dv_accum from float32 to dv in bf16/fp16
             _bwd_postprocess_convert(
                 dv_accum, dv, 1.0,
-                cu_seqlens_k, seqused_k,
+                dkv_postprocess_cu_seqlens, dkv_postprocess_seqused,
                 arch, dtype, head_dim_v, n_block_size, num_threads_post_dKV,
                 AtomLayoutNdKV, dKV_swapAB,
                 cluster_size=cluster_size,
@@ -2002,6 +2166,98 @@ def _flash_attn_bwd(
 
 
 _flash_attn_bwd.compile_cache = get_jit_cache("bwd")
+
+
+def _adjacent_section_batch(
+    first: torch.Tensor, second: torch.Tensor, name: str
+) -> torch.Tensor:
+    """Create a zero-copy two-section batch from adjacent batch-one views."""
+    assert first.shape == second.shape and first.ndim >= 2, (
+        f"{name} sections must have identical rank and shape"
+    )
+    assert first.shape[0] == 1, f"{name} sections must each have batch size one"
+    assert first.dtype == second.dtype and first.device == second.device, (
+        f"{name} sections must have identical dtype and device"
+    )
+    assert first.is_contiguous() and second.is_contiguous(), (
+        f"{name} sections must be contiguous"
+    )
+    assert first.untyped_storage().data_ptr() == second.untyped_storage().data_ptr(), (
+        f"{name} sections must share storage"
+    )
+    assert second.data_ptr() == first.data_ptr() + first.numel() * first.element_size(), (
+        f"{name} sections must be adjacent in section order"
+    )
+    return first.as_strided(
+        (2, *first.shape[1:]),
+        (first.numel(), *first.stride()[1:]),
+    )
+
+
+def _flash_attn_bwd_two_section_causal(
+    q1: torch.Tensor,
+    q2: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    out1: torch.Tensor,
+    out2: torch.Tensor,
+    dout1: torch.Tensor,
+    dout2: torch.Tensor,
+    lse1: torch.Tensor,
+    lse2: torch.Tensor,
+    prefix1: int,
+    prefix2: int,
+    softmax_scale: Optional[float] = None,
+    deterministic: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """SM100/SM110 two-section causal backward with one physical K/V tile owner.
+
+    Section tensors must be adjacent batch-one views, normally slices of the
+    corresponding batched forward tensors. K/V are one global batch and are
+    shared between the two logical sections with a zero batch stride.
+
+    Both section phases execute inside each warp-specialized role's single
+    physical work item. dK/dV are returned in the physical K/V owner's layout.
+    """
+    assert isinstance(prefix1, int) and isinstance(prefix2, int), (
+        "two-section prefixes must be Python integers"
+    )
+    assert 0 < prefix1 <= prefix2, "two-section prefixes must satisfy 0 < prefix1 <= prefix2"
+    assert k.ndim == 4 and v.ndim == 4 and k.shape[0] == v.shape[0] == 1, (
+        "two-section K/V must have shape [1, L, H, D]"
+    )
+    assert k.shape[1] >= prefix2 and v.shape[1] >= prefix2, (
+        "two-section global K/V must cover prefix2"
+    )
+    assert k.shape[2] == v.shape[2] and k.device == v.device and k.dtype == v.dtype, (
+        "two-section K/V heads, dtype, and device must match"
+    )
+
+    q = _adjacent_section_batch(q1, q2, "Q")
+    out = _adjacent_section_batch(out1, out2, "out")
+    dout = _adjacent_section_batch(dout1, dout2, "dout")
+    lse = _adjacent_section_batch(lse1, lse2, "LSE")
+    k = k[:, :prefix2].expand(2, -1, -1, -1)
+    v = v[:, :prefix2].expand(2, -1, -1, -1)
+    seqused_k = torch.tensor(
+        [prefix1, prefix2], dtype=torch.int32, device=k.device
+    )
+
+    dq, dk, dv = _flash_attn_bwd(
+        q,
+        k,
+        v,
+        out,
+        dout,
+        lse,
+        softmax_scale=softmax_scale,
+        causal=True,
+        seqused_k=seqused_k,
+        deterministic=deterministic,
+        compact_dkv_batch=True,
+        two_section_causal_bwd=True,
+    )
+    return dq[:1], dq[1:], dk, dv
 
 
 def _flash_attn_bwd_sparse_mla(
