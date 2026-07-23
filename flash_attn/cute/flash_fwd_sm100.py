@@ -2044,9 +2044,13 @@ class FlashAttentionForwardSm100:
                 softmax_scale_log2_eff = softmax_scale_log2
                 softmax_scale_eff = softmax_scale * qk_descale
 
+            # fp8: the threshold must keep exp2(threshold + max_offset) within
+            # e4m3's finite range, else the P convert saturates at 448 while
+            # row_sum accumulates the unsaturated fp32 value and dominant keys
+            # on peaked rows are underweighted. Bound: log2(448) - 8 = 0.807.
             rescale_threshold = (
                 8.0 if const_expr(self.q_dtype.width == 16) else
-                4.0 if const_expr(self.q_dtype.width == 8) else
+                0.75 if const_expr(self.q_dtype.width == 8) else
                 0.0
             )
             softmax = SoftmaxSm100.create(
