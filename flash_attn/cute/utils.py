@@ -456,6 +456,11 @@ def fadd_reduce(
 
 
 @dsl_user_op
+def atomic_add_i32(a: int | Int32, ptr: cute.Pointer, *, loc=None, ip=None) -> Int32:
+    return nvvm.atomicrmw(op=nvvm.AtomicOpKind.ADD, ptr=ptr.llvm_ptr, a=Int32(a).ir_value())
+
+
+@dsl_user_op
 def atomic_add_fp32(a: float | Float32, gmem_ptr: cute.Pointer, *, loc=None, ip=None) -> None:
     # gmem_ptr_i64 = gmem_ptr.toint(loc=loc, ip=ip).ir_value()
     # # cache_hint = cutlass.Int64(0x12F0000000000000)

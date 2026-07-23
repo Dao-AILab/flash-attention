@@ -16,7 +16,7 @@ from cutlass.cute.typing import Int32, Int64, Float32
 
 from cutlass.utils import ClcDynamicPersistentTileScheduler
 from flash_attn.cute.tile_scheduler import (
-    ClcState,
+    SchedulerState,
     compute_sm100_fmha_grid as compute_grid,
     compute_sm100_fmha_grid_clc as compute_grid_clc,
     make_sm100_thread_cooperative_group as make_thread_cooperative_group,
@@ -779,7 +779,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                 pipeline.Agent.Thread, num_clc_consumer_threads
             )
             clc_response_ptr = storage.clc_response.data_ptr()
-            clc = ClcState.create(
+            clc = SchedulerState.create_clc(
                 hw_scheduler=ClcDynamicPersistentTileScheduler.create(
                     self.tile_sched_params.clc_hw_params(),
                     cute.arch.block_idx(),

@@ -394,6 +394,7 @@ class FlashAttentionBackwardSm80:
         mdV_semaphore: Optional[cute.Tensor] = None,
         aux_data: AuxData = AuxData(),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        mCuTotalMBlocks: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -434,6 +435,7 @@ class FlashAttentionBackwardSm80:
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if cutlass.const_expr(self.pack_gqa) else 1,
             mCuSeqlensQ=mCuSeqlensK,
             mSeqUsedQ=mSeqUsedK,
+            cu_total_m_blocks_ptr=mCuTotalMBlocks,
         )
 
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
