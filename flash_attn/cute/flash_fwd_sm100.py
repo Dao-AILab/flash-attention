@@ -486,7 +486,7 @@ class FlashAttentionForwardSm100:
         q_major_mode = tcgen05.OperandMajorMode.K
         k_major_mode = tcgen05.OperandMajorMode.K
         v_major_mode = tcgen05.OperandMajorMode.MN
-        self.o_layout = cutlass.utils.LayoutEnum.from_tensor(mO)
+        self.o_layout = cutlass.tensor_utils.LayoutEnum.from_tensor(mO)
         # the intermediate tensor p is from tmem & mK-major
         p_source = tcgen05.OperandSource.TMEM
         p_major_mode = tcgen05.OperandMajorMode.K
@@ -878,7 +878,7 @@ class FlashAttentionForwardSm100:
         is_leader_cta = mma_tile_coord_v == 0
 
         # Alloc
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
         tmem_alloc_barrier = pipeline.NamedBarrier(
@@ -891,7 +891,7 @@ class FlashAttentionForwardSm100:
             ),
         )
         # Tensor memory dealloc barrier init
-        tmem = cutlass.utils.TmemAllocator(
+        tmem = cutlass.memory.TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=self.mma_warp_id,

@@ -11,7 +11,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, const_expr
 from cutlass.cute.nvgpu import cpasync, warpgroup
-from cutlass.utils import LayoutEnum
+from cutlass.tensor_utils import LayoutEnum
 import cutlass.utils.hopper_helpers as sm90_utils_basic
 from cutlass import pipeline
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
@@ -445,7 +445,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 if const_expr(tma_atom is not None):
                     cpasync.prefetch_descriptor(tma_atom)
 
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(SharedStorage)
 
         # Mbarrier / pipeline init

@@ -12,7 +12,7 @@ import cutlass.utils.hopper_helpers as sm90_utils_basic
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
 from cutlass.cute.nvgpu import cpasync, warp, warpgroup
 from cutlass import Float32, const_expr
-from cutlass.utils import LayoutEnum
+from cutlass.tensor_utils import LayoutEnum
 
 from quack import copy_utils
 from quack import layout_utils
@@ -307,7 +307,7 @@ class FlashAttentionBackwardPostprocess:
         # ///////////////////////////////////////////////////////////////////////////////
         # Get shared memory buffer
         # ///////////////////////////////////////////////////////////////////////////////
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         sdQaccum = smem.allocate_tensor(cutlass.Float32, sdQaccum_layout, byte_alignment=1024)
         sdQaccum_flat = cute.make_tensor(sdQaccum.iterator, cute.make_layout(cute.size(sdQaccum)))
         if const_expr(self.arch // 10 in [8, 9, 12]):

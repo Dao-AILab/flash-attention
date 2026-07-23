@@ -85,7 +85,7 @@ class dKGemmKernel:
 
         # Output dKaccum: (total_q, seqlen_k, dim), dim-major
         self.c_dtype = cutlass.Float32
-        self.c_layout = utils.LayoutEnum.ROW_MAJOR
+        self.c_layout = cutlass.tensor_utils.LayoutEnum.ROW_MAJOR
 
         self.acc_dtype = cutlass.Float32
 
@@ -214,7 +214,7 @@ class dKGemmKernel:
             self.c_dtype, self.c_layout, self.epi_tile_dK, 1
         )
 
-        smem_capacity = utils.get_smem_capacity_in_bytes()
+        smem_capacity = cutlass.memory.get_smem_capacity_in_bytes()
 
         # TMEM pipeline stages
         # 64 TMEM columns per stage, 8 stages can fit in TMEM
@@ -458,7 +458,7 @@ class dKGemmKernel:
         # Alloc and init: a+b full/empty, accumulator full/empty, tensor memory dealloc barrier
         #
 
-        smem = utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(SharedStorage)
 
         # Initialize mainloop ab_pipeline (barrier) and states
@@ -528,7 +528,7 @@ class dKGemmKernel:
             num_threads=32 * len((self.mma_warp_id, *self.epilogue_warp_id)),
         )
         # Tensor memory dealloc barrier init
-        tmem = utils.TmemAllocator(
+        tmem = cutlass.memory.TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=self.epilogue_warp_id[0],

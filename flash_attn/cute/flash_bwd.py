@@ -12,7 +12,6 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync, warp
 from cutlass import Int32
-import cutlass.utils as utils_basic
 
 from quack import layout_utils
 from flash_attn.cute import ampere_helpers as sm80_utils
@@ -143,7 +142,7 @@ class FlashAttentionBackwardSm80:
         smem_usage_V = n_block_size * head_dim_v * 2
         smem_usage_QV = (smem_usage_Q + smem_usage_V) if not V_in_regs else max(smem_usage_Q, smem_usage_V)
         smem_usage = smem_usage_QV + smem_usage_dO + smem_usage_K
-        smem_capacity = utils_basic.get_smem_capacity_in_bytes("sm_80")
+        smem_capacity = cutlass.memory.get_smem_capacity_in_bytes("sm_80")
         if smem_usage > smem_capacity:
             return False
         return True
@@ -604,7 +603,7 @@ class FlashAttentionBackwardSm80:
             # ///////////////////////////////////////////////////////////////////////////////
             # Get shared memory buffer
             # ///////////////////////////////////////////////////////////////////////////////
-            smem = cutlass.utils.SmemAllocator()
+            smem = cutlass.memory.SmemAllocator()
             storage = smem.allocate(SharedStorage)
             sQ = storage.sQ.get_tensor(sQ_layout)
             sK = storage.sK.get_tensor(sK_layout)

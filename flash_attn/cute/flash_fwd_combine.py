@@ -357,7 +357,7 @@ class FlashAttentionForwardCombine:
         # ///////////////////////////////////////////////////////////////////////////////
         # Get shared memory buffer
         # ///////////////////////////////////////////////////////////////////////////////
-        smem = cutlass.utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(SharedStorage)
         sLSE = storage.sLSE.get_tensor(smem_layout_lse)
         sMaxValidSplit = storage.sMaxValidSplit.get_tensor((self.tile_m,))
