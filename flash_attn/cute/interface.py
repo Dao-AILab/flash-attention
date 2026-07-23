@@ -1365,6 +1365,13 @@ def _flash_attn_bwd(
         assert cu_seqlens_q is None and cu_seqlens_k is None, "multi-base K/V does not support varlen"
         assert seqused_q is None and seqused_k is None, "multi-base K/V does not support varlen"
         assert block_sparse_tensors is None, "multi-base K/V does not support block sparsity"
+    if block_sparse_tensors is not None:
+        assert (
+            cu_seqlens_q is None
+            and cu_seqlens_k is None
+            and seqused_q is None
+            and seqused_k is None
+        ), "Varlen backward with block sparsity is not yet supported"
     sparse_q = None
     kv_subtile_factor = 1
     if block_sparse_tensors is not None:
@@ -1679,9 +1686,6 @@ def _flash_attn_bwd(
         score_mod_bwd = utils.create_softcap_scoremod_bwd(softcap)
     if score_mod is not None:
         assert score_mod_bwd is not None, "score_mod_bwd is required when score_mod is provided"
-        assert cu_seqlens_q is None and cu_seqlens_k is None, (
-            "varlen + score_mod not supported in bwd yet"
-        )
         if arch // 10 == 8:
             raise NotImplementedError("Custom user-provided score_mod is not supported on SM8x architectures.")
 

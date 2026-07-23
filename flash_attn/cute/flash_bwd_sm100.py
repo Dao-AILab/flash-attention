@@ -1010,9 +1010,9 @@ class FlashAttentionBackwardSm100:
 
         # 2-CTA: 231424 and 1-CTA: 232448
         # print("SMEM: ", self.shared_storage.size_in_bytes())
-        if const_expr(self.use_block_sparsity or aux_data.tensors is not None):
+        if const_expr(self.use_block_sparsity):
             assert all(x is None for x in (mCuSeqlensQ, mCuSeqlensK, mSeqUsedQ, mSeqUsedK)), (
-                "Variable sequence length is not supported yet for blocksparse or aux tensors in bwd"
+                "Variable sequence length is not supported yet for blocksparse in bwd"
             )
 
         self.kernel(
@@ -3388,6 +3388,26 @@ class FlashAttentionBackwardSm100:
                     else physical_batch_idx
                 )
                 seqlen = SeqlenInfoCls(batch_idx)
+
+                recompute_fastdiv_mods_q = const_expr(
+                    aux_data.tensors is not None
+                    and (seqlen.has_cu_seqlens_q or seqlen.has_seqused_q)
+                )
+                recompute_fastdiv_mods_k = const_expr(
+                    aux_data.tensors is not None
+                    and (seqlen.has_cu_seqlens_k or seqlen.has_seqused_k)
+                )
+
+                if const_expr(fastdiv_mods is not None and fastdiv_mods[0] is not None):
+                    seqlen_q_divmod, seqlen_k_divmod = fastdiv_mods
+                    fastdiv_mods = (
+                        seqlen_q_divmod
+                        if not recompute_fastdiv_mods_q
+                        else FastDivmodDivisor(seqlen.seqlen_q),
+                        seqlen_k_divmod
+                        if not recompute_fastdiv_mods_k
+                        else FastDivmodDivisor(seqlen.seqlen_k),
+                    )
                 m_block_min, m_block_max = block_info.get_m_block_min_max(
                     seqlen, self._logical_n_block(n_block)
                 )

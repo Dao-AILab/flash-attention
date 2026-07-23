@@ -52,6 +52,16 @@ from score_mod_definitions import (
     causal_v2_eager as causal_mask_v2_eager,
     batch_bias_factory as batch_bias,
     dual_buffer_factory as dual_buffer_bias,
+    squared_eager as score_squared_eager,
+)  # isort: split
+from score_mod_definitions import (
+    # Backward score mods
+    score_mod_squared,
+    score_mod_bwd_identity,
+    score_mod_bwd_times_two as score_mod_bwd_5,
+    score_mod_bwd_rel_bias as score_mod_bwd_3,
+    score_mod_bwd_causal,
+    score_mod_bwd_squared,
 )
 
 COMPUTE_CAPABILITY = torch.cuda.get_device_capability()[0]
@@ -272,7 +282,10 @@ def test_cute_score_mod_vectorized(
     for vec_size in VEC_SIZES_TO_CHECK_EQUALITY:
         cute_vectorized_score_mod.__vec_size__ = vec_size
         out = run_cute_flash(q, k, v, cute_vectorized_score_mod, pack_gqa=pack_gqa)
-        assert torch.equal(out, out_ref)
+        # Vectorized codegen reorders float ops vs the scalar path; softmax amplifies
+        # the resulting 1-ulp score differences (measured max 4e-4 fp16 / 2.9e-3 bf16 on sm103).
+        rtol, atol = (2e-3, 1e-3) if dtype == torch.float16 else (1.6e-2, 5e-3)
+        assert torch.allclose(out, out_ref, rtol=rtol, atol=atol)
 
 
 @pytest.mark.parametrize("seqlen_q,seqlen_kv", SEQLEN_CONFIGS)
@@ -395,7 +408,10 @@ def test_cute_score_mod_with_aux_tensors_vectorized(
             aux_tensors=aux_tensors,
             pack_gqa=pack_gqa,
         )
-        assert torch.equal(out, out_ref)
+        # Vectorized codegen reorders float ops vs the scalar path; softmax amplifies
+        # the resulting 1-ulp score differences (measured max 4e-4 fp16 / 2.9e-3 bf16 on sm103).
+        rtol, atol = (2e-3, 1e-3) if dtype == torch.float16 else (1.6e-2, 5e-3)
+        assert torch.allclose(out, out_ref, rtol=rtol, atol=atol)
 
 
 def _generate_block_kvcache(seqlen_k, page_size, batch_size, nheads_k, d, device, dtype):
@@ -735,49 +751,6 @@ def test_score_mod_with_paged_kvcache_aux_tensors(
     assert cute_error <= rtol * pt_error + fwd_atol, (
         f"CuTE error {cute_error:.2e} exceeds {rtol}x PyTorch error {pt_error:.2e} + {fwd_atol:.2e}"
     )
-
-
-@cute.jit
-def score_mod_bwd_5(grad, score, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
-    """Backward for score_mod_5 (times_two): d(score*2)/d(score) = 2."""
-    return grad * cute.full_like(grad, 2.0)
-
-
-@cute.jit
-def score_mod_bwd_3(grad, score, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
-    """Backward for score_mod_3 (relative_bias): d(score + |q-kv|)/d(score) = 1."""
-    return grad
-
-
-@cute.jit
-def score_mod_bwd_identity(grad, score, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
-    return grad
-
-
-@cute.jit
-def score_mod_bwd_causal(grad, score, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
-    """Backward for causal masking: d(where(mask, score, -inf))/d(score) = where(mask, 1, 0).
-
-    At unmasked positions (q_idx >= kv_idx), grad passes through.
-    At masked positions (q_idx < kv_idx), the kernel already zeros grad because P=0.
-    """
-    return grad
-
-
-@cute.jit
-def score_mod_squared(tSrS_ssa, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
-    """Forward: score ** 2."""
-    return tSrS_ssa * tSrS_ssa
-
-
-@cute.jit
-def score_mod_bwd_squared(grad, score, b_idx, h_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
-    """Backward for score**2: d(score**2)/d(score) = 2*score."""
-    return grad * cute.full_like(grad, 2.0) * score
-
-
-def score_squared_eager(score, b, h, q_idx, kv_idx):
-    return score * score
 
 
 BWD_TEST_PAIRS = [
