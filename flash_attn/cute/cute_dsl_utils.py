@@ -123,6 +123,129 @@ def get_broadcast_dims(tensor: torch.Tensor) -> Tuple[bool, ...]:
     return tuple(s == 0 for s in tensor.stride())
 
 
+_DTYPE_SHORT_NAMES = {
+    torch.float16: "f16",
+    torch.bfloat16: "bf16",
+    torch.float32: "f32",
+    torch.float8_e4m3fn: "e4m3",
+    torch.float8_e5m2: "e5m2",
+    cutlass.Float16: "f16",
+    cutlass.BFloat16: "bf16",
+    cutlass.Float32: "f32",
+    cutlass.Float8E4M3FN: "e4m3",
+    cutlass.Float8E5M2: "e5m2",
+}
+
+
+def short_dtype_name(dtype):
+    """Return a compact dtype label suitable for a kernel symbol."""
+    return _DTYPE_SHORT_NAMES.get(dtype, str(dtype).replace("torch.", "").replace(".", "_"))
+
+
+def make_kernel_name_prefix(
+    prefix,
+    *,
+    arch=None,
+    dtype=None,
+    head_dim=None,
+    head_dim_v=None,
+    qhead_per_kvhead=None,
+    tile_m=None,
+    tile_n=None,
+    q_stage=None,
+    dout_stage=None,
+    num_threads=None,
+    q_subtile_factor=None,
+    causal=False,
+    local=False,
+    varlen=False,
+    paged=False,
+    paged_non_tma=False,
+    split_kv=False,
+    pack_gqa=False,
+    use_2cta=False,
+    use_clc=False,
+    deterministic=False,
+    dq_single_wg=False,
+    spt=False,
+    cluster_size=None,
+    mma_pv_is_rs=False,
+    intra_wg_overlap=False,
+    no_lse=False,
+    has_score_mod=False,
+    has_mask_mod=False,
+    has_block_sparsity=False,
+    has_learnable_sink=False,
+    has_qv=False,
+    has_descale=False,
+    has_aux=False,
+):
+    """Build a readable prefix for CuTeDSL's normally mangled kernel symbol."""
+    parts = [prefix]
+    if arch is not None:
+        parts.append(f"sm{arch}")
+    if dtype is not None:
+        parts.append(short_dtype_name(dtype))
+    if head_dim is not None:
+        if head_dim_v in (None, head_dim):
+            parts.append(f"head_dim{head_dim}")
+        else:
+            parts.extend((f"head_dim{head_dim}", f"value_dim{head_dim_v}"))
+    if qhead_per_kvhead and qhead_per_kvhead > 1:
+        parts.append(f"gqa_ratio{qhead_per_kvhead}")
+    if tile_m and tile_n:
+        parts.append(f"tile{tile_m}x{tile_n}")
+    if q_stage is not None and q_stage != 1:
+        parts.append(f"q_stages{q_stage}")
+    if dout_stage is not None and dout_stage != 1:
+        parts.append(f"dout_stages{dout_stage}")
+    if num_threads is not None:
+        parts.append(f"threads{num_threads}")
+    if q_subtile_factor is not None and q_subtile_factor != 1:
+        parts.append(f"q_subtile{q_subtile_factor}")
+    for cond, tag in (
+        (causal, "causal"),
+        (local, "local"),
+        (varlen, "varlen"),
+        (paged, "paged"),
+        (paged_non_tma, "paged_non_tma"),
+        (split_kv, "split_kv"),
+        (pack_gqa, "pack_gqa"),
+        (use_2cta, "use_2cta"),
+        (use_clc, "clc_scheduler"),
+        (deterministic, "deterministic"),
+        (dq_single_wg, "dq_single_wg"),
+        (spt, "spt_scheduler"),
+        (cluster_size is not None and cluster_size > 1, f"cluster_size{cluster_size}"),
+        (mma_pv_is_rs, "pv_mma_rs"),
+        (intra_wg_overlap, "intra_wg_overlap"),
+        (no_lse, "no_lse"),
+        (has_score_mod, "score_mod"),
+        (has_mask_mod, "mask_mod"),
+        (has_block_sparsity, "block_sparse"),
+        (has_learnable_sink, "learnable_sink"),
+        (has_qv, "qv"),
+        (has_descale, "descale"),
+        (has_aux, "aux"),
+    ):
+        if cond:
+            parts.append(tag)
+    return "_".join(parts)
+
+
+def compile_with_kernel_name_prefix(op, *args, name_prefix, options="--enable-tvm-ffi"):
+    """Compile a CuTeDSL op with a temporary GPU kernel name prefix."""
+    kernel = type(op).kernel
+    kernel.set_name_prefix(name_prefix)
+    try:
+        return cute.compile(op, *args, options=options)
+    finally:
+        kernel.set_name_prefix(None)
+        dsl = kernel.__wrapped__.__dict__.get("_dsl_object")
+        if dsl is not None:
+            dsl._name_prefix = None
+
+
 # credit: monellz (https://github.com/NVIDIA/cutlass/issues/2658#issuecomment-3630564264)
 def dump_kernel_attributes(compiled_kernel):
     from cuda.bindings import driver
