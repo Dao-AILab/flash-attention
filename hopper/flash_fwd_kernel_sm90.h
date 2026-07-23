@@ -223,6 +223,7 @@ public:
         if constexpr (Use_TMA_KV) {
             pipeline_params_k.transaction_bytes = CollectiveMainloop::TmaTransactionBytesK;
             pipeline_params_k.is_leader = warp_group_thread_idx == 0;
+            // For LargeHeadDimV: only WG0 (mma) consumes K for QK^T. WG1 (mma_pv) never touches pipeline_k.
             pipeline_params_k.num_consumers = !LargeHeadDimV ? NumMmaThreads : cutlass::NumThreadsPerWarpGroup;
         } else {
             pipeline_params_k.consumer_arv_count = !LargeHeadDimV ? NumMmaThreads : cutlass::NumThreadsPerWarpGroup;
@@ -233,9 +234,15 @@ public:
         PipelineParamsVt pipeline_params_vt = pipeline_params_k;
         if constexpr (Use_TMA_KV && !SameHeadDim) {
             pipeline_params_vt.transaction_bytes = CollectiveMainloop::TmaTransactionBytesV;
-            if constexpr (LargeHeadDimV) { pipeline_params_vt.num_consumers = NumMmaThreads; }
-        } else {
-            if constexpr (LargeHeadDimV) { pipeline_params_vt.consumer_arv_count = NumMmaThreads; }
+        }
+        // For LargeHeadDimV: both WG0 (mma) and WG1 (mma_pv) consume V, so need NumMmaThreads consumers.
+        // This applies regardless of SameHeadDim — pipeline_v is separate from pipeline_k.
+        if constexpr (LargeHeadDimV) {
+            if constexpr (Use_TMA_KV) {
+                pipeline_params_vt.num_consumers = NumMmaThreads;
+            } else {
+                pipeline_params_vt.consumer_arv_count = NumMmaThreads;
+            }
         }
 
         MainloopPipelineK pipeline_k = [&] {
