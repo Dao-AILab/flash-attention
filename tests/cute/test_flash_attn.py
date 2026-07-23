@@ -1668,6 +1668,83 @@ def test_flash_attn_bwd_preallocated_outputs(seqlen_q, seqlen_k, d, causal, dtyp
     assert torch.allclose(dv, dv_ref, atol=1e-5, rtol=1e-5)
 
 
+@pytest.mark.parametrize("head_dim,head_dim_v", [(104, 104), (128, 104)])
+def test_flash_attn_bwd_preprocess_varlen_head_dim_v_not_multiple_of_32(
+    head_dim, head_dim_v
+):
+    import cutlass
+
+    from flash_attn.cute.interface import _bwd_preprocess
+
+    device = "cuda"
+    dtype = torch.bfloat16
+    torch.random.manual_seed(42)
+    seqlens = [128, 128]
+    total_seqlen = sum(seqlens)
+    nheads = 4
+    m_block_size = 128
+    cu_seqlens = torch.tensor(
+        [0, seqlens[0], total_seqlen], device=device, dtype=torch.int32
+    )
+    total_seqlen_padded = (
+        (total_seqlen + cu_seqlens.shape[0] * m_block_size - 1)
+        // m_block_size
+        * m_block_size
+    )
+    head_dim_rounded = (head_dim + 31) // 32 * 32
+
+    out = torch.randn(total_seqlen, nheads, head_dim_v, device=device, dtype=dtype)
+    dout = torch.randn_like(out)
+    dpsum = torch.full(
+        (nheads, total_seqlen_padded), torch.nan, device=device, dtype=torch.float32
+    )
+    lse = torch.randn(nheads, total_seqlen, device=device, dtype=torch.float32)
+    lse_log2 = torch.empty(nheads, total_seqlen_padded, device=device, dtype=torch.float32)
+    dq_accum = torch.full(
+        (nheads, total_seqlen_padded * head_dim_rounded),
+        torch.nan,
+        device=device,
+        dtype=torch.float32,
+    )
+
+    _bwd_preprocess(
+        out,
+        dout,
+        dpsum,
+        lse,
+        lse_log2,
+        dq_accum,
+        cu_seqlens_q=cu_seqlens,
+        seqused_q=None,
+        dlse=None,
+        dtype=cutlass.BFloat16,
+        head_dim=head_dim,
+        head_dim_v=head_dim_v,
+        m_block_size=m_block_size,
+    )
+    torch.cuda.synchronize()
+
+    padded_offsets = [
+        (sum(seqlens[:batch_idx]) + batch_idx * m_block_size)
+        // m_block_size
+        * m_block_size
+        for batch_idx in range(len(seqlens))
+    ]
+    valid_slices = [
+        slice(offset, offset + seqlen)
+        for offset, seqlen in zip(padded_offsets, seqlens)
+    ]
+    dpsum_actual = torch.cat([dpsum[:, valid_slice] for valid_slice in valid_slices], dim=1)
+    dpsum_ref = torch.einsum("thd,thd->ht", out.float(), dout.float())
+    torch.testing.assert_close(dpsum_actual, dpsum_ref, atol=1e-4, rtol=1e-4)
+
+    dq_accum_rows = dq_accum.view(nheads, total_seqlen_padded, head_dim_rounded)
+    dq_accum_actual = torch.cat(
+        [dq_accum_rows[:, valid_slice] for valid_slice in valid_slices], dim=1
+    )
+    assert torch.count_nonzero(dq_accum_actual) == 0
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("d", [64, 128])
