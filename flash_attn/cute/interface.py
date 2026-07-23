@@ -566,9 +566,7 @@ def _flash_attn_fwd(
     total_mblocks = batch_size * num_head_kv * num_m_blocks
     num_n_blocks = (seqlen_k_loaded + tile_n - 1) // tile_n
     num_SMs = 132 if is_fake_mode() else torch.cuda.get_device_properties(device).multi_processor_count
-    if arch // 10 == 12:
-        assert num_splits == 1, "SM120 forward only supports num_splits=1"
-    elif num_splits < 1:
+    if num_splits < 1:
         num_splits = num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, 128)
 
     # SplitKV uses float32 partial output, which doubles the O buffer size
@@ -582,9 +580,14 @@ def _flash_attn_fwd(
             num_splits = 1
 
     is_split_kv = num_splits > 1
+    if arch // 10 == 12 and is_split_kv and pack_gqa:
+        # pack_gqa is an auto-selected optimization; the packed O/LSE layout is not
+        # yet wired through the SM120 split-KV FP32-partial epilogue, so fall back
+        # to unpacked GQA when splitting (correctness over the packing speedup).
+        pack_gqa = False
     if is_split_kv:
-        out_partial = torch.empty(num_splits, *q_batch_seqlen_shape, num_head, head_dim_v, dtype=torch.float32, device=device)
-        lse_partial = torch.empty(num_splits, *lse_shape, dtype=torch.float32, device=device)
+        out_partial = torch.zeros(num_splits, *q_batch_seqlen_shape, num_head, head_dim_v, dtype=torch.float32, device=device)
+        lse_partial = torch.full((num_splits, *lse_shape), float('-inf'), dtype=torch.float32, device=device)
 
     use_2cta_instrs = (
         arch // 10 in [10, 11]
@@ -956,8 +959,13 @@ def _flash_attn_fwd(
         elif arch // 10 == 12:
             # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
             assert not use_block_sparsity, "Block sparsity not supported on SM 12.0"
-            assert page_table is None, "Paged KV not supported on SM 12.0 in this PR"
-            assert not is_split_kv, "SplitKV not supported on SM 12.0 in this PR"
+            if page_table is not None:
+                assert seqused_k is not None, (
+                    "Paged KV on SM120 requires seqused_k (actual sequence lengths per batch)"
+                )
+                # Note: tile_n=64 with num_threads=128 works for paged KV — threads 64-127
+                # get is_valid=False in the page table loop and are skipped. This is slightly
+                # less efficient than tile_n=128 but enables num_stages=2 pipelining (see below).
             fa_fwd = FlashAttentionForwardSm120(
                 dtype,
                 head_dim,
@@ -965,10 +973,16 @@ def _flash_attn_fwd(
                 qhead_per_kvhead,
                 is_causal=causal,
                 is_local=local,
+                is_split_kv=is_split_kv,
                 pack_gqa=pack_gqa,
                 tile_m=tile_m,
                 tile_n=tile_n,
-                num_stages=1,
+                # num_stages=2: pipeline K/V loads with MMA — for paged KV this also overlaps
+                # page table lookups with MMA, which hides the scatter-gather latency.
+                # SMEM budget at num_stages=2: max config is D=128, tile_n=64 (FwdConfig default):
+                #   sQ=32KB + sK=32KB + sV=32KB = 96KB ≤ 99KB SM120 capacity ✓
+                # tile_n=128 (D<=64 path) gives 16+32+32=80KB ✓
+                num_stages=2,
                 num_threads=num_threads,
                 Q_in_regs=False,
                 score_mod=score_mod,
