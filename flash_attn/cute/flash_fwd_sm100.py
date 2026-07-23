@@ -2037,6 +2037,11 @@ class FlashAttentionForwardSm100:
                 8 if cutlass.const_expr(self.q_dtype.width == 8) else
                 0
             )
+            max_offset_scale = (
+                Float32(16.0) if cutlass.const_expr(self.q_dtype is cutlass.Float8E4M3FN) else
+                Float32(256.0) if cutlass.const_expr(self.q_dtype.width == 8) else
+                Float32(1.0)
+            )
             if const_expr(self.score_mod is None):
                 softmax_scale_log2_eff = softmax_scale_log2 * qk_descale
                 softmax_scale_eff = None
@@ -2056,6 +2061,14 @@ class FlashAttentionForwardSm100:
                 max_offset=max_offset,
             )
             softmax.reset()
+            l_i_lowp = None
+            if const_expr(
+                self.q_dtype.width != Float32.width
+                and not self.is_split_kv
+                and (learnable_sink is None or not self.use_block_sparsity)
+            ):
+                l_i_lowp = cute.make_rmem_tensor(1, Float32)
+                l_i_lowp.fill(0.0)
 
             if const_expr(self.use_block_sparsity):
                 tile_block_count = get_total_block_count(
@@ -2078,6 +2091,7 @@ class FlashAttentionForwardSm100:
             softmax_step = partial(
                 self.softmax_step,
                 softmax=softmax,
+                l_i_lowp=l_i_lowp,
                 thr_mma_qk=thr_mma_qk,
                 pipeline_s_p_o=pipeline_s_p_o,
                 pipeline_p_lastsplit=pipeline_p_lastsplit,
@@ -2143,11 +2157,35 @@ class FlashAttentionForwardSm100:
                     self.kv_subtile_factor,
                 )
                 if not empty_tile:
-                    sScale[tidx + stage * self.m_block_size] = softmax.row_sum[0]
+                    l_i_fp32 = softmax.row_sum[0]
+                    sScale[tidx + stage * self.m_block_size] = (
+                        l_i_lowp[0] if const_expr(l_i_lowp is not None) else l_i_fp32
+                    )
                     if const_expr(mLSE is not None or learnable_sink is not None):
-                        sScale[
-                            tidx + stage * self.m_block_size + self.q_stage * self.m_block_size
-                        ] = softmax.row_max[0]
+                        if const_expr(l_i_lowp is not None):
+                            l_i_out = l_i_lowp[0]
+                            l_i_out_is_zero_or_nan = l_i_out == 0.0 or l_i_out != l_i_out
+                            LN2 = math.log(2.0)
+                            sScale[
+                                tidx
+                                + stage * self.m_block_size
+                                + self.q_stage * self.m_block_size
+                            ] = (
+                                (
+                                    softmax.row_max[0] * softmax_scale_log2_eff
+                                    + cute.math.log2(l_i_out, fastmath=True)
+                                    - max_offset
+                                )
+                                * LN2
+                                if not l_i_out_is_zero_or_nan
+                                else -Float32.inf
+                            )
+                        else:
+                            sScale[
+                                tidx
+                                + stage * self.m_block_size
+                                + self.q_stage * self.m_block_size
+                            ] = softmax.row_max[0]
                     # if tidx == 0:
                     #     cute.printf("softmax row sum stage %d: %f, row_max = %f\n", stage, softmax.row_sum[0], softmax.row_max[0])
                     # See block_sparse_utils.py NOTE [SM100 block-sparse empty tiles: mbarrier contract].
@@ -2214,11 +2252,79 @@ class FlashAttentionForwardSm100:
                             # Now that we no longer already have the 1st iteration, need mask_seqlen=True here
 
                     # Dense path always writes scale / signals
-                    sScale[tidx + stage * self.m_block_size] = softmax.row_sum[0]
+                    l_i_fp32 = softmax.row_sum[0]
+                    l_i_out = l_i_lowp[0] if const_expr(l_i_lowp is not None) else l_i_fp32
+                    if const_expr(l_i_lowp is not None):
+                        full_lse = Float32.zero
+                        l_i_fp32_is_zero_or_nan = l_i_fp32 == 0.0 or l_i_fp32 != l_i_fp32
+                        if const_expr(learnable_sink is not None):
+                            if const_expr(not self.pack_gqa):
+                                sink_val = Float32(learnable_sink[head_idx])
+                            else:
+                                mma_tile_coord_v = thr_mma_qk.thr_idx
+                                q_head_idx = (
+                                    (
+                                        (m_block * self.q_stage + stage) * self.cta_group_size
+                                        + mma_tile_coord_v
+                                    )
+                                    * self.m_block_size
+                                    + tidx
+                                ) % self.qhead_per_kvhead + head_idx * self.qhead_per_kvhead
+                                sink_val = Float32(learnable_sink[q_head_idx])
+                            if l_i_fp32_is_zero_or_nan:
+                                l_i_out = (
+                                    Float32.zero
+                                    if sink_val == -Float32.inf
+                                    else max_offset_scale
+                                )
+                                full_lse = (
+                                    -Float32.inf if sink_val == -Float32.inf else sink_val
+                                )
+                            else:
+                                LOG2_E = math.log2(math.e)
+                                sink_mass = cute.math.exp2(
+                                    sink_val * LOG2_E
+                                    - softmax.row_max[0] * softmax_scale_log2_eff
+                                    + max_offset,
+                                    fastmath=True,
+                                )
+                                l_i_out += sink_mass
+                                l_i_fp32 += sink_mass
+                        LN2 = math.log(2.0)
+                        l_i_out_is_zero_or_nan = l_i_out == 0.0 or l_i_out != l_i_out
+                        if const_expr(learnable_sink is None):
+                            full_lse = (
+                                (
+                                    softmax.row_max[0] * softmax_scale_log2_eff
+                                    + cute.math.log2(l_i_out, fastmath=True)
+                                    - max_offset
+                                )
+                                * LN2
+                                if not l_i_out_is_zero_or_nan
+                                else -Float32.inf
+                            )
+                        elif not l_i_fp32_is_zero_or_nan:
+                            full_lse = (
+                                (
+                                    softmax.row_max[0] * softmax_scale_log2_eff
+                                    + cute.math.log2(l_i_out, fastmath=True)
+                                    - max_offset
+                                )
+                                * LN2
+                                if not l_i_out_is_zero_or_nan
+                                else -Float32.inf
+                            )
+                    sScale[tidx + stage * self.m_block_size] = l_i_out
                     if const_expr(mLSE is not None or learnable_sink is not None):
                         sScale[
-                            tidx + stage * self.m_block_size + self.q_stage * self.m_block_size
-                        ] = softmax.row_max[0]
+                            tidx
+                            + stage * self.m_block_size
+                            + self.q_stage * self.m_block_size
+                        ] = (
+                            full_lse
+                            if const_expr(l_i_lowp is not None)
+                            else softmax.row_max[0]
+                        )
                     # pipeline_sm_stats.producer_commit_w_index(stage)
                     sm_stats_barrier.arrive_w_index(index=stage * 4 + warp_idx)
 
@@ -2260,6 +2366,7 @@ class FlashAttentionForwardSm100:
         s0_s1_sequence_phase: Int32,
         n_block: Int32,
         softmax: SoftmaxSm100,
+        l_i_lowp: Optional[cute.Tensor],
         thr_mma_qk: cute.ThrMma,
         pipeline_s_p_o: pipeline.PipelineAsync,
         pipeline_p_lastsplit: pipeline.PipelineAsync,
@@ -2377,6 +2484,16 @@ class FlashAttentionForwardSm100:
             ex2_emu_freq=self.ex2_emu_freq,
             ex2_emu_start_frg=self.ex2_emu_start_frg,
         )
+        use_fhadd_lowp_sum = const_expr(l_i_lowp is not None and self.q_dtype.width == 16)
+        lowp_acc = None
+        if const_expr(use_fhadd_lowp_sum):
+            lowp_suffix = "bf16" if const_expr(self.q_dtype is cutlass.BFloat16) else "f16"
+            lowp_acc = [
+                l_i_lowp[0] * acc_scale if const_expr(not is_first) else Float32.zero,
+                Float32.zero,
+                Float32.zero,
+                Float32.zero,
+            ]
         # Sequence barrier arrive
         if const_expr(self.s0_s1_barrier):
             pipeline_s0_s1_sequence.sync_object_full.arrive(1 - stage, dst=None)
@@ -2384,6 +2501,17 @@ class FlashAttentionForwardSm100:
         # cute.copy(thr_tmem_store, tSrP_r2t_f32, tStP_r2t)
         for i in cutlass.range_constexpr(cute.size(tStP_r2t.shape[2])):
             cute.copy(thr_tmem_store, tSrP_r2t_f32[None, None, i], tStP_r2t[None, None, i])
+            if const_expr(use_fhadd_lowp_sum):
+                lowp_acc[0], lowp_acc[1], lowp_acc[2], lowp_acc[3] = (
+                    utils.accum_packed_lowp_fragment(
+                        cute.recast_tensor(tSrP_r2t_f32[None, None, i], Int32),
+                        lowp_acc[0],
+                        lowp_acc[1],
+                        lowp_acc[2],
+                        lowp_acc[3],
+                        lowp_suffix,
+                    )
+                )
             if const_expr(self.split_P_arrive > 0):
                 split_P_arrive_idx = cute.size(tStP_r2t.shape[2]) * self.split_P_arrive // self.n_block_size
                 if const_expr(i + 1 == split_P_arrive_idx):
@@ -2400,6 +2528,14 @@ class FlashAttentionForwardSm100:
             pipeline_s_p_o.consumer_release_w_index(stage)
         pipeline_sm_stats.producer_acquire_w_index_phase(stage, sm_stats_producer_phase)
         softmax.update_row_sum(tSrS_t2r.load(), acc_scale, is_first)
+        if const_expr(use_fhadd_lowp_sum):
+            l_i_lowp[0] = (lowp_acc[0] + lowp_acc[1]) + (lowp_acc[2] + lowp_acc[3])
+        elif const_expr(l_i_lowp is not None):
+            l_i_lowp[0] = utils.fadd_reduce(
+                tSrP_r2t.load().to(Float32),
+                init_val=l_i_lowp[0] * acc_scale if const_expr(not is_first) else None,
+                arch=100,
+            )
         # acc_scale = cute.math.exp2(acc_scale_, fastmath=True)
         return mma_si_consumer_phase ^ 1, sm_stats_producer_phase ^ 1, s0_s1_sequence_phase ^ 1
 
@@ -2479,6 +2615,11 @@ class FlashAttentionForwardSm100:
                 Float32(16.0) if cutlass.const_expr(self.q_dtype is cutlass.Float8E4M3FN) else
                 Float32(256.0) if cutlass.const_expr(self.q_dtype.width == 8) else
                 Float32(1.0)
+            )
+            use_lowp_row_sum = const_expr(
+                self.q_dtype.width != Float32.width
+                and not self.is_split_kv
+                and (learnable_sink is None or not self.use_block_sparsity)
             )
             seqlen = SeqlenInfoCls(batch_idx)
             n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
@@ -2580,7 +2721,7 @@ class FlashAttentionForwardSm100:
                     else:
                         row_max = None
                     pipeline_sm_stats.consumer_release_w_index(stage)
-                    if const_expr(learnable_sink is not None):
+                    if const_expr(learnable_sink is not None and not use_lowp_row_sum):
                         LOG2_E = math.log2(math.e)
                         sink_val = learnable_sink_val[stage]
                         if const_expr(not self.is_split_kv) or split_idx == 0:
@@ -2688,9 +2829,13 @@ class FlashAttentionForwardSm100:
                     #     cute.printf("row_sum = {}, row_max = {}, acc_O_mn_row_is_zero_or_nan = {}\n", row_sum, row_max, acc_O_mn_row_is_zero_or_nan)
                     LN2 = math.log(2.0)
                     lse = (
-                        (row_max * softmax_scale_log2_eff + (cute.math.log2(row_sum, fastmath=True) - max_offset)) * LN2
-                        if not acc_O_mn_row_is_zero_or_nan
-                        else -Float32.inf
+                        row_max
+                        if const_expr(use_lowp_row_sum)
+                        else (
+                            (row_max * softmax_scale_log2_eff + (cute.math.log2(row_sum, fastmath=True) - max_offset)) * LN2
+                            if not acc_O_mn_row_is_zero_or_nan
+                            else -Float32.inf
+                        )
                     )
                     seqlen_q = (
                         seqlen.seqlen_q

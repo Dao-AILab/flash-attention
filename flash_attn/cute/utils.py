@@ -414,6 +414,60 @@ def fmax_reduce(
         return fmax(local_max[0], local_max[2], local_max[3])
 
 
+@dsl_user_op
+def accum_lowp_pair_into_f32(
+    packed: Int32,
+    acc0: Float32,
+    acc1: Float32,
+    lowp_suffix: str,
+    *,
+    loc=None,
+    ip=None,
+) -> Tuple[Float32, Float32]:
+    """Accumulate both lowp lanes of one packed word into two FP32 sums."""
+    out = llvm.inline_asm(
+        llvm.StructType.get_literal([T.f32(), T.f32()]),
+        [
+            Int32(packed).ir_value(loc=loc, ip=ip),
+            Float32(acc0).ir_value(loc=loc, ip=ip),
+            Float32(acc1).ir_value(loc=loc, ip=ip),
+        ],
+        "{\n\t"
+        ".reg .b16 lo, hi;\n\t"
+        "mov.b32 {lo, hi}, $2;\n\t"
+        f"add.rn.f32.{lowp_suffix} $0, lo, $0;\n\t"
+        f"add.rn.f32.{lowp_suffix} $1, hi, $1;\n\t"
+        "}\n",
+        "=f,=f,r,0,1",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+    return (
+        Float32(llvm.extractvalue(T.f32(), out, [0], loc=loc, ip=ip)),
+        Float32(llvm.extractvalue(T.f32(), out, [1], loc=loc, ip=ip)),
+    )
+
+
+@cute.jit
+def accum_packed_lowp_fragment(
+    x: cute.Tensor,
+    acc0: Float32,
+    acc1: Float32,
+    acc2: Float32,
+    acc3: Float32,
+    lowp_suffix: cutlass.Constexpr[str],
+) -> Tuple[Float32, Float32, Float32, Float32]:
+    """Accumulate one packed lowp P fragment into four FP32 chains."""
+    assert x.element_type is Int32, "x must contain packed lowp pairs"
+    n = cute.size(x.shape)
+    assert n % 2 == 0, "packed fragment size must be a multiple of 2 words"
+    for i in cutlass.range_constexpr(0, n, 2):
+        acc0, acc1 = accum_lowp_pair_into_f32(x[i], acc0, acc1, lowp_suffix)
+        acc2, acc3 = accum_lowp_pair_into_f32(x[i + 1], acc2, acc3, lowp_suffix)
+    return acc0, acc1, acc2, acc3
+
+
 @cute.jit
 def fadd_reduce(
     x: cute.TensorSSA, init_val: float | Float32 | None = None, arch: cutlass.Constexpr[int] = 80
