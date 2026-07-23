@@ -346,7 +346,7 @@ def test_flash_attn_output(
                     continue
                 if pack_gqa is None and mha_type != "mha":
                     continue
-            out, lse = flash_attn_func(
+            out = flash_attn_func(
                 q,
                 k,
                 v,
@@ -507,7 +507,7 @@ def test_flash_attn_small_head_dim(seqlen_q, seqlen_k, d, causal, dtype):
     out_pt, _ = attention_ref(
         q_ref, k_ref, v_ref, None, None, causal=causal, upcast=False, reorder_ops=True
     )
-    out, _ = flash_attn_func(q, k, v, causal=causal)
+    out = flash_attn_func(q, k, v, causal=causal)
     if is_fake_mode():
         return
     fwd_atol = 2 * (out_ref + 0.3 - 0.3 - out_ref).abs().max().item()
@@ -528,8 +528,8 @@ def test_flash_attn_hd256_sm100_noncontiguous_transpose():
     k = torch.randn(batch_size, nheads, seqlen, d, device="cuda", dtype=dtype).transpose(1, 2)
     v = torch.randn(batch_size, nheads, seqlen, d, device="cuda", dtype=dtype).transpose(1, 2)
 
-    out, _ = flash_attn_func(q, k, v)
-    out_contig, _ = flash_attn_func(q.contiguous(), k.contiguous(), v.contiguous())
+    out = flash_attn_func(q, k, v)
+    out_contig = flash_attn_func(q.contiguous(), k.contiguous(), v.contiguous())
 
     if is_fake_mode():
         return
@@ -877,7 +877,7 @@ def test_flash_attn_varlen_output(
                     continue
                 if pack_gqa is None and mha_type != "mha":
                     continue
-            out_unpad, lse = flash_attn_varlen_func(
+            out_unpad = flash_attn_varlen_func(
                 q_unpad if unpad_q else q,
                 k_unpad if unpad_kv else k,
                 v_unpad if unpad_kv else v,
@@ -1512,7 +1512,7 @@ def test_flash_attn_kvcache(
                     k_cache_paged.copy_(k_cache_saved)
                     v_cache_paged.copy_(v_cache_saved)
                 # out, lse, *rest = flash_attn_with_kvcache(
-                out, lse, *rest = flash_attn_varlen_func(
+                out = flash_attn_varlen_func(
                     q if not varlen_q else q_unpad,
                     k_cache if page_size is None else k_cache_paged,
                     v_cache if page_size is None else v_cache_paged,
@@ -1770,8 +1770,8 @@ def test_flash_attn_lse_grad_unused(seqlen_q, seqlen_k, d, causal, dtype):
     v = torch.randn(batch_size, seqlen_k, nheads, d, device=device, dtype=dtype, requires_grad=True)
     g = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
 
-    # Case 1: return_lse=False (standard path, lse marked non-differentiable)
-    out1, lse1 = flash_attn_func(q, k, v, causal=causal, return_lse=False)
+    # Case 1: return_lse=False (standard path, lse not returned / not differentiable)
+    out1 = flash_attn_func(q, k, v, causal=causal, return_lse=False)
     if is_fake_mode():
         return
     dq1, dk1, dv1 = torch.autograd.grad(out1, (q, k, v), g)
@@ -1857,7 +1857,7 @@ def test_flash_attn_paged_deepseek(seqlen_q, page_size):
     cu_seqlens = torch.tensor([0, seqlen_q], dtype=torch.int32, device=device)
 
     # Non-paged reference
-    out_ref, _ = flash_attn_varlen_func(
+    out_ref = flash_attn_varlen_func(
         q, k, v, cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
         max_seqlen_q=seqlen_q, max_seqlen_k=seqlen_q, causal=True,
     )
@@ -1872,7 +1872,7 @@ def test_flash_attn_paged_deepseek(seqlen_q, page_size):
     page_table = torch.arange(num_pages, dtype=torch.int32, device=device).unsqueeze(0)
     cache_seqlens = torch.tensor([seqlen_q], dtype=torch.int32, device=device)
 
-    out, _ = flash_attn_varlen_func(
+    out = flash_attn_varlen_func(
         q, k_cache_paged, v_cache_paged,
         cu_seqlens_q=cu_seqlens, cu_seqlens_k=None,
         max_seqlen_q=seqlen_q, max_seqlen_k=None,
@@ -1914,7 +1914,7 @@ def test_flash_attn_paged_hd256_sm100_tma(seqlen_q):
     cu_seqlens_k = cu_seqlens_q.clone()
 
     # Non-paged reference (varlen).
-    out_ref, _ = flash_attn_varlen_func(
+    out_ref = flash_attn_varlen_func(
         q, k, v,
         cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
         max_seqlen_q=seqlen_q, max_seqlen_k=seqlen_q,
@@ -1936,13 +1936,13 @@ def test_flash_attn_paged_hd256_sm100_tma(seqlen_q):
     )
 
     # Paged via hd256 2CTA TMA paged path — run twice for determinism.
-    out_paged_0, _ = flash_attn_varlen_func(
+    out_paged_0 = flash_attn_varlen_func(
         q, k_paged, v_paged,
         cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=None,
         max_seqlen_q=seqlen_q, max_seqlen_k=seqlen_q,
         page_table=page_table,
     )
-    out_paged_1, _ = flash_attn_varlen_func(
+    out_paged_1 = flash_attn_varlen_func(
         q, k_paged, v_paged,
         cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=None,
         max_seqlen_q=seqlen_q, max_seqlen_k=seqlen_q,
@@ -1985,7 +1985,7 @@ def test_flash_attn_paged_hd256_sm100_tma_gqa(nheads_kv):
     cu_seqlens_q = torch.arange(0, batch_size + 1, dtype=torch.int32, device=device) * seqlen_q
     cu_seqlens_k = cu_seqlens_q.clone()
 
-    out_ref, _ = flash_attn_varlen_func(
+    out_ref = flash_attn_varlen_func(
         q, k, v,
         cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
         max_seqlen_q=seqlen_q, max_seqlen_k=seqlen_q,
@@ -2005,7 +2005,7 @@ def test_flash_attn_paged_hd256_sm100_tma_gqa(nheads_kv):
         batch_size, num_pages_per_seq
     )
 
-    out_paged, _ = flash_attn_varlen_func(
+    out_paged = flash_attn_varlen_func(
         q, k_paged, v_paged,
         cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=None,
         max_seqlen_q=seqlen_q, max_seqlen_k=seqlen_q,
@@ -2049,7 +2049,7 @@ def test_flash_attn_paged_hd256_sm100_tma_shuffled():
     cu_seqlens_q = torch.arange(0, batch_size + 1, dtype=torch.int32, device=device) * seqlen_q
     cu_seqlens_k = cu_seqlens_q.clone()
 
-    out_ref, _ = flash_attn_varlen_func(
+    out_ref = flash_attn_varlen_func(
         q, k, v,
         cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
         max_seqlen_q=seqlen_q, max_seqlen_k=seqlen_q,
@@ -2072,7 +2072,7 @@ def test_flash_attn_paged_hd256_sm100_tma_shuffled():
             k_paged[phys, po] = k[b * seqlen_q + s]
             v_paged[phys, po] = v[b * seqlen_q + s]
 
-    out_paged, _ = flash_attn_varlen_func(
+    out_paged = flash_attn_varlen_func(
         q, k_paged, v_paged,
         cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=None,
         max_seqlen_q=seqlen_q, max_seqlen_k=seqlen_q,
@@ -2248,6 +2248,7 @@ def test_flash_attn_mla_absorbed(
                 pack_gqa=pack_gqa,
                 num_splits=num_splits,
                 deterministic=deterministic,
+                return_lse=True,
             )
             if is_fake_mode():
                 # no more flash_attn cutedsl calls for the rest of the loop
@@ -2266,7 +2267,7 @@ def test_flash_attn_mla_absorbed(
 
             repeats = 10 if check_fwd_deterministic else 0
             for iter in range(repeats):
-                out2, lse2 = flash_attn_func(
+                out2 = flash_attn_func(
                     q,
                     k,
                     v,
@@ -2592,6 +2593,7 @@ def test_flash_attn_mla_absorbed_varlen(
                 pack_gqa=pack_gqa,
                 deterministic=deterministic,
                 gather_kv_indices=gather_kv_indices_unpad if unpad_q else gather_kv_indices,
+                return_lse=True,
             )
             out = output_pad_fn(out_unpad) if unpad_q else out_unpad
             if is_fake_mode():
@@ -2628,7 +2630,7 @@ def test_flash_attn_mla_absorbed_varlen(
 
             repeats = 10 if check_fwd_deterministic else 0
             for iter in range(repeats):
-                out_unpad2, lse = flash_attn_varlen_func(
+                out_unpad2 = flash_attn_varlen_func(
                     q_unpad if unpad_q else q,
                     k_unpad if unpad_kv else k,
                     v_unpad if unpad_kv else v,
@@ -2779,7 +2781,7 @@ def test_flash_attn_mla_paged(dtype, seqlen_q, seqlen_k, page_size, causal, has_
     )
 
     # Non-paged reference
-    out_ref, _ = flash_attn_varlen_func(
+    out_ref = flash_attn_varlen_func(
         q, k, v, qv=qv,
         cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
         max_seqlen_q=seqlen_q, max_seqlen_k=seqlen_k,
@@ -2811,7 +2813,7 @@ def test_flash_attn_mla_paged(dtype, seqlen_q, seqlen_k, page_size, causal, has_
     seqused_k = torch.full((batch_size,), seqlen_k, dtype=torch.int32, device=device)
 
     # Paged output (triggers cp.async path if page_size != 128)
-    out, _ = flash_attn_varlen_func(
+    out = flash_attn_varlen_func(
         q, k_paged, v_paged, qv=qv,
         cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=None,
         max_seqlen_q=seqlen_q, max_seqlen_k=None,
@@ -2873,7 +2875,7 @@ def test_flash_attn_seqlen_k_zero(seqlen_q, d, causal):
     k = torch.empty(batch_size, 0, nheads_kv, d, device=device, dtype=dtype)
     v = torch.empty(batch_size, 0, nheads_kv, dv, device=device, dtype=dtype)
 
-    out, lse = flash_attn_func(q, k, v, causal=causal)
+    out, lse = flash_attn_func(q, k, v, causal=causal, return_lse=True)
 
     if is_fake_mode():
         return
@@ -2928,7 +2930,7 @@ def test_flash_attn_empty_q_dense(shape, causal):
     k = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype)
     v = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype)
 
-    out, lse = flash_attn_func(q, k, v, causal=causal)
+    out, lse = flash_attn_func(q, k, v, causal=causal, return_lse=True)
 
     if is_fake_mode():
         return
@@ -2978,6 +2980,7 @@ def test_flash_attn_empty_q_varlen(causal):
         cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
         max_seqlen_q=0, max_seqlen_k=seqlen_k_per_batch,
         causal=causal,
+        return_lse=True,
     )
 
     if is_fake_mode():
@@ -3013,7 +3016,7 @@ def test_flash_attn_ex2_emu_decode_prefill_consistency(seqlen_k):
 
     # Prefill: full sequence, non-paged, causal
     cu = torch.tensor([0, seqlen_k], dtype=torch.int32, device=device)
-    out_prefill, _ = flash_attn_varlen_func(
+    out_prefill = flash_attn_varlen_func(
         q, k, v,
         cu_seqlens_q=cu, cu_seqlens_k=cu,
         max_seqlen_q=seqlen_k, max_seqlen_k=seqlen_k,
@@ -3031,7 +3034,7 @@ def test_flash_attn_ex2_emu_decode_prefill_consistency(seqlen_k):
     page_table = torch.arange(num_pages, dtype=torch.int32, device=device).unsqueeze(0)
     cache_seqlens = torch.tensor([seqlen_k], dtype=torch.int32, device=device)
 
-    out_decode, _ = flash_attn_varlen_func(
+    out_decode = flash_attn_varlen_func(
         q[-1:], k_cache, v_cache,
         cu_seqlens_q=torch.tensor([0, 1], dtype=torch.int32, device=device),
         cu_seqlens_k=None,
