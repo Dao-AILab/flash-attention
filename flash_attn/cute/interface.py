@@ -57,6 +57,8 @@ from flash_attn.cute.sm100_hd256_2cta_fmha_backward import BlackwellFusedMultiHe
 from flash_attn.cute.utils import AuxData
 from flash_attn.cute.block_sparsity import (
     BlockSparseTensorsTorch,
+    block_sparse_bwd_supports_2cta,
+    get_kv_subtile_factor,
     get_sparse_q_block_size,
     to_cute_block_sparse_tensors,
     normalize_block_sparse_config,
@@ -638,17 +640,22 @@ def _flash_attn_fwd(
             assert block_sparse_tensors.cu_total_m_blocks is not None, (
                 "Varlen block sparsity requires block_sparse_tensors.cu_total_m_blocks."
             )
+            if (
+                block_sparse_tensors.cu_block_idx_offsets is None
+                and (cu_seqlens_k is not None or seqused_k is not None)
+            ):
+                raise ValueError(
+                    "Varlen block sparsity with cu_seqlens_k or seqused_k requires "
+                    "block_sparse_tensors.cu_block_idx_offsets."
+                )
 
     # See get_broadcast_dims for why this is needed in compile key
     block_sparse_broadcast_pattern = None
     normalized_block_sparse_tensors = None
     q_subtile_factor = 1
+    kv_subtile_factor = 1
     if block_sparse_tensors is not None:
-        (
-            normalized_block_sparse_tensors,
-            block_sparse_broadcast_pattern,
-            q_subtile_factor,
-        ) = normalize_block_sparse_config(
+        block_sparse_config = normalize_block_sparse_config(
             block_sparse_tensors,
             batch_size=batch_size,
             num_head=num_head,
@@ -656,7 +663,12 @@ def _flash_attn_fwd(
             seqlen_k=seqlen_k,
             block_size=(tile_m, tile_n),
             q_stage=q_stage,
+            allow_kv_subtile=arch // 10 in [10, 11],
         )
+        normalized_block_sparse_tensors = block_sparse_config.tensors
+        block_sparse_broadcast_pattern = block_sparse_config.broadcast_pattern
+        q_subtile_factor = block_sparse_config.q_subtile_factor
+        kv_subtile_factor = block_sparse_config.kv_subtile_factor
     if aux_tensors is not None:
         aux_tensor_metadata = get_aux_tensor_metadata(aux_tensors)
     else:
@@ -753,6 +765,7 @@ def _flash_attn_fwd(
         page_size not in [None, tile_n],  # paged KV non-TMA
         use_2cta_instrs,
         q_subtile_factor,
+        kv_subtile_factor,
         mma_pv_is_rs,
         intra_wg_overlap,
         use_clc_scheduler,
@@ -936,6 +949,7 @@ def _flash_attn_fwd(
                     paged_kv_non_tma=page_size not in [None, tile_n],
                     is_varlen_q=cu_seqlens_q is not None or seqused_q is not None,
                     q_subtile_factor=q_subtile_factor,
+                    kv_subtile_factor=kv_subtile_factor,
                     use_2cta_instrs=use_2cta_instrs,
                     use_clc_scheduler=use_clc_scheduler,
                 )
@@ -1352,8 +1366,12 @@ def _flash_attn_bwd(
         assert seqused_q is None and seqused_k is None, "multi-base K/V does not support varlen"
         assert block_sparse_tensors is None, "multi-base K/V does not support block sparsity"
     sparse_q = None
-    if block_sparse_tensors is not None and arch // 10 == 9:
-        sparse_q = block_sparse_tensors.block_size[0] if block_sparse_tensors.block_size is not None else 128
+    kv_subtile_factor = 1
+    if block_sparse_tensors is not None:
+        if block_sparse_tensors.block_size is not None:
+            sparse_q = block_sparse_tensors.block_size[0]
+        elif arch // 10 == 9:
+            sparse_q = 128
 
     num_head, head_dim = q.shape[-2:]
     head_dim_v = v.shape[-1]
@@ -1425,12 +1443,25 @@ def _flash_attn_bwd(
         AtomLayoutMdQ = 1
         AtomLayoutNdKV = 1
         requested_disable_2cta = utils._get_disable_2cta_default()
-        disable_2cta = (
-            requested_disable_2cta
-            or block_sparse_tensors is not None
+        kv_subtile_factor = get_kv_subtile_factor(block_sparse_tensors, n_block_size)
+        use_2cta_instrs = (
+            head_dim >= 128
+            and not requested_disable_2cta
+            and block_sparse_bwd_supports_2cta(block_sparse_tensors, n_block_size)
         )
-        cluster_size = 2 if head_dim >= 128 and not disable_2cta else 1
-        use_2cta_instrs = cluster_size==2
+        if block_sparse_tensors is not None and head_dim == 192 and not use_2cta_instrs:
+            reason = (
+                "2CTA was disabled by request"
+                if requested_disable_2cta
+                else (
+                    f"sparse_block_size[1] must cover an even number of tile_n={n_block_size} "
+                    f"tiles; got factor {kv_subtile_factor}"
+                )
+            )
+            raise ValueError(
+                f"SM100 block-sparse backward with head_dim=192 requires 2CTA; {reason}."
+            )
+        cluster_size = 2 if use_2cta_instrs else 1
 
     use_dedicated_hd256_kernel = arch // 10 in [10, 11] and head_dim == 256 and head_dim_v == 256
     use_2cta_instrs = use_2cta_instrs or use_dedicated_hd256_kernel
@@ -1479,6 +1510,11 @@ def _flash_attn_bwd(
                 assert tensor.data_ptr() % 16 == 0, f"{name}[{idx}] must be 16-byte aligned"
 
     use_block_sparsity = block_sparse_tensors is not None
+    if sparse_q is not None and (sparse_q <= 0 or sparse_q % m_block_size != 0):
+        raise ValueError(
+            "Block sparsity requires sparse_block_size[0] to be a multiple of "
+            f"tile_m={m_block_size}; got {sparse_q}."
+        )
     q_subtile_factor = sparse_q // m_block_size if sparse_q is not None else 2
     seqlen_q_rounded = (seqlen_q + m_block_size - 1) // m_block_size * m_block_size
     seqlen_k_rounded = (seqlen_k + n_block_size - 1) // n_block_size * n_block_size
@@ -1486,6 +1522,16 @@ def _flash_attn_bwd(
     launch_cluster_size = 4 if paired_adjacent_k_tiles else cluster_size
     if num_n_blocks % launch_cluster_size != 0:
         seqlen_k_rounded += (launch_cluster_size - num_n_blocks % launch_cluster_size) * n_block_size
+
+    # The single-block specialization below only guards against TVM stride poisoning,
+    # which is a host-side branch predicate that selects a kernel variant. When
+    # max_seqlen is passed as a tensor (e.g. HF/TE varlen), seqlen_*_rounded are tensors,
+    # so `seqlen_*_rounded // block == 1` would leak a tensor into the compile key. Its
+    # pickle hash differs every call, forcing a recompile per step. Only specialize when
+    # the seqlen is already a host scalar; tensor callers fall back to the multi-block
+    # default, keeping the key stable with no device sync.
+    single_q_block = (not torch.is_tensor(seqlen_q_rounded)) and (seqlen_q_rounded // m_block_size == 1)
+    single_k_block = (not torch.is_tensor(seqlen_k_rounded)) and (seqlen_k_rounded // n_block_size == 1)
 
     if cu_seqlens_k is None:
         expected_input_seqlen_k = chunk_seqlen_k if has_peer_kv else seqlen_k
@@ -1777,14 +1823,15 @@ def _flash_attn_bwd(
     score_mod_bwd_hash = utils.hash_callable(score_mod_bwd) if score_mod_bwd else False
     mask_mod_hash = utils.hash_callable(mask_mod) if mask_mod else False
     num_aux_tensors = len(aux_tensors) if aux_tensors else 0
+    aux_tensor_metadata = get_aux_tensor_metadata(aux_tensors) if aux_tensors is not None else None
     aux_scalar_metadata = tuple(type(s) for s in aux_scalars) if aux_scalars is not None else None
     cute_aux_tensors = None
     if aux_tensors is not None:
-        cute_aux_tensors = [to_cute_tensor(buf, assumed_align=None, fully_dynamic=True) for buf in aux_tensors]
+        cute_aux_tensors = [to_cute_aux_tensor(buf) for buf in aux_tensors]
 
     block_sparse_broadcast_pattern = None
     normalized_block_sparse_tensors = None
-    if block_sparse_tensors is not None:
+    if use_block_sparsity:
         (
             normalized_block_sparse_tensors,
             block_sparse_broadcast_pattern,
@@ -1796,6 +1843,7 @@ def _flash_attn_bwd(
             seqlen_k=seqlen_k,
             block_size=(m_block_size, n_block_size),
             q_subtile_factor=q_subtile_factor,
+            kv_subtile_factor=kv_subtile_factor,
         )
         if deterministic:
             if normalized_block_sparse_tensors.dq_write_order is None:
@@ -1855,8 +1903,10 @@ def _flash_attn_bwd(
             score_mod_bwd_hash,
             mask_mod_hash,
             num_aux_tensors,
+            aux_tensor_metadata,
             aux_scalar_metadata,
             use_block_sparsity,
+            q_subtile_factor,
             block_sparse_broadcast_pattern,
             get_broadcast_dims(q),
             get_broadcast_dims(k),
@@ -1868,8 +1918,8 @@ def _flash_attn_bwd(
             paired_adjacent_k_tiles,
             direct_owner_dkv,
             # Prevent TVM stride poisoning when only one block is present.
-            (seqlen_q_rounded // m_block_size == 1),
-            (seqlen_k_rounded // n_block_size == 1),
+            single_q_block,
+            single_k_block,
         )
     else:
         compile_key = (
@@ -1887,12 +1937,15 @@ def _flash_attn_bwd(
             pack_gqa,
             cluster_size,
             use_2cta_instrs,
+            q_subtile_factor,
+            kv_subtile_factor,
             deterministic,
             spt,
             score_mod_hash,
             score_mod_bwd_hash,
             mask_mod_hash,
             num_aux_tensors,
+            aux_tensor_metadata,
             aux_scalar_metadata,
             use_block_sparsity,
             block_sparse_broadcast_pattern,
@@ -1906,8 +1959,8 @@ def _flash_attn_bwd(
             get_broadcast_dims(dout),
             has_peer_kv,
             # Prevent TVM stride poisoning when only one block is present.
-            (seqlen_q_rounded // m_block_size == 1),
-            (seqlen_k_rounded // n_block_size == 1),
+            single_q_block,
+            single_k_block,
         )
 
     if compile_key not in _flash_attn_bwd.compile_cache:
@@ -2035,6 +2088,7 @@ def _flash_attn_bwd(
                     mask_mod=mask_mod,
                     has_aux_tensors=aux_tensors is not None,
                     q_subtile_factor=q_subtile_factor,
+                    kv_subtile_factor=kv_subtile_factor,
                     compact_dkv_batch=compact_dkv_batch,
                     two_section_causal_bwd=two_section_causal_bwd,
                     paired_adjacent_k_tiles=paired_adjacent_k_tiles,
