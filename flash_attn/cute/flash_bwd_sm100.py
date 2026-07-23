@@ -252,7 +252,7 @@ class FlashAttentionBackwardSm100:
                 self.sdQaccum_stage = 2 if self.deterministic else 4
                 self.dQ_reduce_ncol_t2r = 32
             else:
-                self.dQ_reduce_ncol = 32
+                self.dQ_reduce_ncol = math.gcd(32, self.tile_hdim)
                 self.sdQaccum_stage = 64 // self.dQ_reduce_ncol
                 self.dQ_reduce_ncol_t2r = self.dQ_reduce_ncol
         assert (self.tile_hdim // self.cta_group_size) % self.dQ_reduce_ncol == 0
