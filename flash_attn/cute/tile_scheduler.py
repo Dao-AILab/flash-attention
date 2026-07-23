@@ -882,7 +882,7 @@ class SingleTileVarlenScheduler:
     def clc_problem_shape(params: Params):
         return ClcDynamicPersistentTileSchedulerParams(
             problem_shape_ntile_mnl=SingleTileVarlenScheduler.get_grid_shape(params),
-            cluster_shape_mnk=(1, 1, 1),
+            cluster_shape_mnk=(params.cluster_shape_m, 1, 1),
         )
 
     @staticmethod

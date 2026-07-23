@@ -1,3 +1,4 @@
+import math
 from typing import Optional
 import pytest
 
@@ -143,6 +144,182 @@ def check_varlen_vs_torch_flash(
     ok_v = torch.allclose(dv_fa.float(), dv_t.float(), atol=atol, rtol=rtol)
     # print(f"Close? dQ={ok_q}, dK={ok_k}, dV={ok_v}")
     return ok_q and ok_k and ok_v
+
+
+@pytest.mark.parametrize("hq,hkv", [(8, 8), (8, 2), (16, 2), (16, 1)])
+def test_sm103_hd256_bf16_causal_varlen(hq, hkv):
+    if torch.cuda.get_device_capability() != (10, 3):
+        pytest.skip("SM103 is required")
+
+    torch.manual_seed(20260719 + hq)
+    lengths = [257, 509, 1021]
+    total = sum(lengths)
+    d = 256
+    q = torch.randn(
+        total, hq, d, device="cuda", dtype=torch.bfloat16, requires_grad=True
+    )
+    k = torch.randn(
+        total, hkv, d, device="cuda", dtype=torch.bfloat16, requires_grad=True
+    )
+    v = torch.randn_like(k, requires_grad=True)
+    cu_seqlens = torch.tensor(
+        [0, *torch.tensor(lengths).cumsum(0).tolist()],
+        device="cuda",
+        dtype=torch.int32,
+    )
+
+    assert check_varlen_vs_torch_flash(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_k=cu_seqlens,
+        total_q=total,
+        total_k=total,
+        causal=True,
+    )
+
+
+@pytest.mark.parametrize("hq,hkv", [(8, 8), (8, 2), (16, 2), (16, 1)])
+def test_sm103_hd256_fp8_causal_varlen(hq, hkv):
+    if torch.cuda.get_device_capability() != (10, 3):
+        pytest.skip("SM103 is required")
+
+    torch.manual_seed(20260720 + hq)
+    lengths = [257, 509]
+    total = sum(lengths)
+    d = 256
+    q = torch.randn(total, hq, d, device="cuda", dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+    k = torch.randn(total, hkv, d, device="cuda", dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+    v = torch.randn(total, hkv, d, device="cuda", dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+    cu_seqlens = torch.tensor(
+        [0, *torch.tensor(lengths).cumsum(0).tolist()],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    scale = d**-0.5
+
+    out, _ = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_k=cu_seqlens,
+        max_seqlen_q=max(lengths),
+        max_seqlen_k=max(lengths),
+        softmax_scale=scale,
+        causal=True,
+        pack_gqa=None,
+    )
+    ref = torch_flash_ref(
+        q.float(),
+        k.float(),
+        v.float(),
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_k=cu_seqlens,
+        total_q=total,
+        total_k=total,
+        softmax_scale=scale,
+        causal=True,
+    )
+    assert out.dtype == torch.bfloat16
+    out = out.float()
+    rel_l1 = ((out - ref).abs().sum() / ref.abs().sum()).item()
+    cosine = F.cosine_similarity(out.flatten(), ref.flatten(), dim=0).item()
+    assert cosine > 0.99, f"cosine={cosine}, rel_l1={rel_l1}"
+    assert rel_l1 < 0.08, f"rel_l1={rel_l1}, cosine={cosine}"
+
+
+@pytest.mark.parametrize("page_size", [16, 32, 64, 128, 256])
+@pytest.mark.parametrize(
+    "dtype", [torch.bfloat16, torch.float8_e4m3fn], ids=["bf16", "fp8"]
+)
+def test_sm103_hd256_causal_varlen_paged(dtype, page_size):
+    if torch.cuda.get_device_capability() != (10, 3):
+        pytest.skip("SM103 is required")
+
+    q_lengths = [257, 509, 1021]
+    k_lengths = [333, 777, 1539]
+    hq, hkv, d = 32, 2, 256
+    generator = torch.Generator(device="cuda").manual_seed(20260722 + page_size)
+
+    def random_input(shape):
+        return (
+            torch.randn(
+                shape,
+                device="cuda",
+                dtype=torch.bfloat16,
+                generator=generator,
+            )
+            .mul_(0.02)
+            .to(dtype)
+            .contiguous()
+        )
+
+    q_sequences = [random_input((length, hq, d)) for length in q_lengths]
+    k_sequences = [random_input((length, hkv, d)) for length in k_lengths]
+    v_sequences = [random_input((length, hkv, d)) for length in k_lengths]
+    q = torch.cat(q_sequences)
+    k = torch.cat(k_sequences)
+    v = torch.cat(v_sequences)
+    cu_q = torch.tensor(
+        [0, *torch.tensor(q_lengths).cumsum(0).tolist()],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    cu_k = torch.tensor(
+        [0, *torch.tensor(k_lengths).cumsum(0).tolist()],
+        device="cuda",
+        dtype=torch.int32,
+    )
+    seqused_k = torch.tensor(k_lengths, device="cuda", dtype=torch.int32)
+
+    page_counts = [math.ceil(length / page_size) for length in k_lengths]
+    total_pages = sum(page_counts)
+    page_table = torch.zeros(
+        len(k_lengths), max(page_counts), device="cuda", dtype=torch.int32
+    )
+    physical_pages = torch.randperm(total_pages, device="cuda", generator=generator)
+    k_paged = torch.zeros(total_pages, page_size, hkv, d, device="cuda", dtype=dtype)
+    v_paged = torch.zeros_like(k_paged)
+    page_cursor = 0
+    for batch_idx, (k_sequence, v_sequence, page_count) in enumerate(
+        zip(k_sequences, v_sequences, page_counts)
+    ):
+        page_ids = physical_pages[page_cursor : page_cursor + page_count]
+        page_table[batch_idx, :page_count] = page_ids
+        k_buffer = torch.zeros(
+            page_count * page_size, hkv, d, device="cuda", dtype=dtype
+        )
+        v_buffer = torch.zeros_like(k_buffer)
+        k_buffer[: k_sequence.shape[0]] = k_sequence
+        v_buffer[: v_sequence.shape[0]] = v_sequence
+        k_paged[page_ids] = k_buffer.view(page_count, page_size, hkv, d)
+        v_paged[page_ids] = v_buffer.view(page_count, page_size, hkv, d)
+        page_cursor += page_count
+
+    kwargs = dict(
+        cu_seqlens_q=cu_q,
+        max_seqlen_q=max(q_lengths),
+        max_seqlen_k=max(k_lengths),
+        causal=True,
+        softmax_scale=d**-0.5,
+        num_splits=1,
+        pack_gqa=True,
+    )
+    out_contiguous, _ = flash_attn_varlen_func(
+        q, k, v, cu_seqlens_k=cu_k, **kwargs
+    )
+    out_paged, _ = flash_attn_varlen_func(
+        q,
+        k_paged,
+        v_paged,
+        seqused_k=seqused_k,
+        page_table=page_table,
+        **kwargs,
+    )
+    torch.testing.assert_close(out_paged, out_contiguous, rtol=0, atol=0)
+
 
 def generate_varlen_args(
     batch_size=8,
