@@ -29,8 +29,10 @@ if os.environ.get("CUTE_DSL_PTXAS_PATH", None) is not None:
 from flash_attn.cute import utils
 from flash_attn.cute import fa_logging
 from flash_attn.cute.cute_dsl_utils import (
+    compile_with_kernel_name_prefix,
     get_aux_tensor_metadata,
     get_broadcast_dims,
+    make_kernel_name_prefix,
     to_cute_aux_tensor,
     to_cute_tensor,
 )
@@ -778,6 +780,40 @@ def _flash_attn_fwd(
         disable_sparse_kv_bitmask,
         fa_logging.get_fa_log_level(),
     )
+    kernel_name_prefix = make_kernel_name_prefix(
+        "flash_fwd",
+        arch=arch,
+        dtype=dtype,
+        head_dim=head_dim,
+        head_dim_v=head_dim_v,
+        qhead_per_kvhead=qhead_per_kvhead,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        q_stage=q_stage,
+        num_threads=num_threads,
+        q_subtile_factor=q_subtile_factor,
+        causal=causal,
+        local=local,
+        varlen=any(
+            x is not None for x in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
+        ),
+        paged=page_table is not None,
+        paged_non_tma=page_size not in [None, tile_n],
+        split_kv=is_split_kv,
+        pack_gqa=pack_gqa,
+        use_2cta=use_2cta_instrs,
+        use_clc=use_clc_scheduler,
+        mma_pv_is_rs=mma_pv_is_rs,
+        intra_wg_overlap=intra_wg_overlap,
+        no_lse=lse is None,
+        has_score_mod=score_mod is not None,
+        has_mask_mod=mask_mod is not None,
+        has_block_sparsity=use_block_sparsity,
+        has_learnable_sink=learnable_sink is not None,
+        has_qv=qv is not None,
+        has_descale=any(x is not None for x in (q_descale, k_descale, v_descale)),
+        has_aux=bool(aux_tensor_metadata or aux_scalar_metadata),
+    )
 
     if compile_key not in _flash_attn_fwd.compile_cache:
         (
@@ -981,7 +1017,7 @@ def _flash_attn_fwd(
             )
         # TODO: check @can_implement
         if qv is not None:
-            _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
+            compile_args = [
                 fa_fwd,
                 q_tensor,
                 qv_tensor,
@@ -1001,8 +1037,7 @@ def _flash_attn_fwd(
                 window_size_left,
                 window_size_right,
                 current_stream,
-                options="--enable-tvm-ffi",
-            )
+            ]
         else:
             compile_args = [
                 fa_fwd,
@@ -1028,9 +1063,9 @@ def _flash_attn_fwd(
                 AuxData(cute_aux_tensors, aux_scalars),
             ])
             compile_args.append(current_stream)
-            _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
-                *compile_args, options="--enable-tvm-ffi"
-            )
+        _flash_attn_fwd.compile_cache[compile_key] = compile_with_kernel_name_prefix(
+            *compile_args, name_prefix=kernel_name_prefix
+        )
 
     if not is_fake_mode():
         q_call, k_call, v_call, qv_call = [
@@ -1206,11 +1241,22 @@ def _compile_bwd_preprocess(
         qhead_per_kvhead=qhead_per_kvhead,
         nheads_kv=nheads_kv,
     )
-    return cute.compile(
+    kernel_name_prefix = make_kernel_name_prefix(
+        "flash_bwd_preprocess",
+        dtype=dtype,
+        head_dim=head_dim,
+        head_dim_v=head_dim_v,
+        qhead_per_kvhead=qhead_per_kvhead,
+        tile_m=m_block_size,
+        tile_n=m_block_size,
+        varlen=has_cuseqlens_q or has_seqused_q,
+        pack_gqa=pack_gqa,
+    )
+    return compile_with_kernel_name_prefix(
         fa_bwd_pre, mO, mdO, mPdPsum, mLSE, mLSElog2, mdQaccum, mCuSeqlensQ, mSequsedQ, mdLSE,
         mRowMax, mScaleP, softmax_scale,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-        options="--enable-tvm-ffi",
+        name_prefix=kernel_name_prefix,
     )
 
 
@@ -1274,10 +1320,22 @@ def _compile_bwd_postprocess(
         use_2cta_instrs=use_2cta_instrs,
         cluster_size=cluster_size,
     )
-    return cute.compile(
+    kernel_name_prefix = make_kernel_name_prefix(
+        "flash_bwd_postprocess",
+        arch=arch,
+        dtype=dtype,
+        head_dim=hdim,
+        tile_m=block_size,
+        tile_n=block_size,
+        num_threads=num_threads,
+        varlen=has_cuseqlens_q or has_seqused_q,
+        use_2cta=use_2cta_instrs,
+        cluster_size=cluster_size,
+    )
+    return compile_with_kernel_name_prefix(
         fa_bwd_post, mdQaccum, mdQ, Float32(0.0), mCuSeqlensQ, mSeqUsedQ,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-        options="--enable-tvm-ffi",
+        name_prefix=kernel_name_prefix,
     )
 
 
@@ -1373,6 +1431,7 @@ def _flash_attn_bwd(
     causal, local, window_size_left, window_size_right = _resolve_causal_local_window(
         causal, window_size_left, window_size_right
     )
+    dQ_single_wg = False
 
     if arch // 10 == 12:
         # SM120: uses SM80 MMA with 99 KB SMEM, 128 threads (4 warps).
@@ -1824,6 +1883,36 @@ def _flash_attn_bwd(
             single_k_block,
         )
 
+    kernel_name_prefix = make_kernel_name_prefix(
+        "flash_bwd",
+        arch=arch,
+        dtype=dtype,
+        head_dim=head_dim,
+        head_dim_v=head_dim_v,
+        qhead_per_kvhead=qhead_per_kvhead,
+        tile_m=m_block_size,
+        tile_n=n_block_size,
+        q_stage=num_stages_Q,
+        dout_stage=num_stages_dO,
+        num_threads=num_threads,
+        q_subtile_factor=q_subtile_factor,
+        causal=causal,
+        local=local,
+        varlen=any(
+            x is not None for x in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
+        ),
+        pack_gqa=pack_gqa,
+        use_2cta=use_2cta_instrs,
+        deterministic=deterministic,
+        dq_single_wg=dQ_single_wg,
+        spt=spt,
+        cluster_size=cluster_size,
+        has_score_mod=score_mod is not None or score_mod_bwd is not None,
+        has_mask_mod=mask_mod is not None,
+        has_block_sparsity=use_block_sparsity,
+        has_aux=bool(num_aux_tensors or aux_scalar_metadata),
+    )
+
     if compile_key not in _flash_attn_bwd.compile_cache:
         q_tensor, k_tensor, v_tensor, do_tensor, dq_tensor, dk_tensor, dv_tensor = [
             to_cute_tensor(t) for t in (q, k, v, dout, dq, dk, dv)
@@ -1957,7 +2046,7 @@ def _flash_attn_bwd(
         dq_accum_tensor = dq_tensor if use_dedicated_hd256_kernel else dq_accum_tensor
 
         # TODO: check @can_implement
-        _flash_attn_bwd.compile_cache[compile_key] = cute.compile(
+        _flash_attn_bwd.compile_cache[compile_key] = compile_with_kernel_name_prefix(
             fa_bwd_obj,
             q_tensor,
             k_tensor,
@@ -1981,7 +2070,7 @@ def _flash_attn_bwd(
             AuxData(cute_aux_tensors, aux_scalars),
             sparse_tensors_compile,
             current_stream,
-            options="--enable-tvm-ffi",
+            name_prefix=kernel_name_prefix,
         )
     if not is_fake_mode():
         dq_accum = dq if use_dedicated_hd256_kernel else dq_accum
@@ -2954,12 +3043,22 @@ def _compile_fwd_combine(
     mVarlenBatchIdx = fake_tensor(Int32, (batch_for_1d,), divisibility=1) if has_varlen_batch_idx else None
     mSemaphore = None  # Not parametrized in compile_key
 
-    return cute.compile(
+    kernel_name_prefix = make_kernel_name_prefix(
+        "flash_fwd_combine",
+        dtype=dtype,
+        head_dim=head_dim,
+        tile_m=tile_m,
+        tile_n=k_block_size,
+        num_threads=256,
+        varlen=has_cu_seqlens or has_seqused,
+        split_kv=True,
+    )
+    return compile_with_kernel_name_prefix(
         fa_combine,
         mO_partial, mLSE_partial, mO, mLSE,
         mCuSeqlens, mSeqused, mNumSplitsDynamic, mVarlenBatchIdx, mSemaphore,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-        options="--enable-tvm-ffi",
+        name_prefix=kernel_name_prefix,
     )
 
 
