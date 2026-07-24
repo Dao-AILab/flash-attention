@@ -1694,6 +1694,14 @@ def produce_block_sparse_q_loads_bwd_sm90(
         curr_full_cnt = Int32(0)
         curr_full_idx = None
 
+    # Wait for bwd preprocess to finish writing LSE / dPsum and zeroing dQaccum
+    # before issuing any TMA loads of those outputs. The dense producer path in
+    # flash_bwd_sm90 does this via griddepcontrol_wait() before load_LSE; without
+    # it, under PDL the bwd kernel can read un-written LSE/dPsum and reduce-add
+    # into an un-zeroed dQaccum. The block-sparse metadata reads above are
+    # host-provided inputs, safe before the wait.
+    cute.arch.griddepcontrol_wait()
+
     kv_loaded = False
 
     for iter_idx in cutlass.range(curr_q_cnt * q_subtile_factor, unroll=1):
