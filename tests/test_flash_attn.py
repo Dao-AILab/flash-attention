@@ -14,7 +14,7 @@ from flash_attn import (
     flash_attn_with_kvcache,
 )
 from flash_attn.bert_padding import pad_input, unpad_input
-from flash_attn.flash_attn_interface import _get_block_size_n
+from flash_attn.flash_attn_interface import _get_block_size_n, USE_TRITON_ROCM
 from flash_attn.layers.rotary import apply_rotary_emb
 
 MAX_HEADDIM_SM8x = 192
@@ -2646,15 +2646,13 @@ def test_flash_attn_kvcache_paged_block_table_bounds(append_knew, paged_kv_block
     assert not out.isnan().any()
 
 
+@pytest.mark.skipif(USE_TRITON_ROCM, reason="compat-slot assert is only in the CUDA extension")
 def test_flash_attn_generator_arg_must_be_none():
     """The optional RNG `generator` slot is retained only for backwards-compat arg
     positioning on all four raw C++ entry points (fwd/varlen_fwd/bwd/varlen_bwd):
     the arg is still accepted but must be None; a non-None value trips a targeted
     TORCH_CHECK."""
-    from flash_attn.flash_attn_interface import USE_TRITON_ROCM, flash_attn_gpu
-
-    if USE_TRITON_ROCM:
-        pytest.skip("compat-slot assert is only in the CUDA extension")
+    from flash_attn.flash_attn_interface import flash_attn_gpu
 
     device = "cuda"
     dtype = torch.bfloat16
