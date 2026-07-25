@@ -116,16 +116,35 @@ def test_flash_attn_forced_split_config_reuses_specializations():
         selected["config"] = select_fwd_config(inputs)
         return selected["config"]
 
+    out_partial_2 = torch.empty(2, 1, 128, 8, 64, device="cuda", dtype=torch.float32)
+    lse_partial_2 = torch.empty(2, 1, 8, 128, device="cuda", dtype=torch.float32)
     with mock.patch(
         "flash_attn.cute.interface.select_fwd_config", side_effect=capture_config
     ):
-        out_2 = _flash_attn_fwd(q, k, v, num_splits=2)[0]
+        result_2 = _flash_attn_fwd(
+            q,
+            k,
+            v,
+            num_splits=2,
+            out_partial=out_partial_2,
+            lse_partial=lse_partial_2,
+        )
+    out_2 = result_2[0]
     config_4 = replace(selected["config"], num_splits=4)
     validate_fwd_config(config_4, selected["inputs"])
 
     main_specs = set(_flash_attn_fwd.compile_cache.cache)
     combine_specs = set(_flash_attn_fwd_combine.compile_cache.cache)
-    out_4 = _flash_attn_fwd(q, k, v, config=config_4)[0]
+    out_partial_4 = torch.empty(4, 1, 128, 8, 64, device="cuda", dtype=torch.float32)
+    lse_partial_4 = torch.empty(4, 1, 8, 128, device="cuda", dtype=torch.float32)
+    out_4 = _flash_attn_fwd(
+        q,
+        k,
+        v,
+        config=config_4,
+        out_partial=out_partial_4,
+        lse_partial=lse_partial_4,
+    )[0]
     torch.cuda.synchronize()
     reference = torch.nn.functional.scaled_dot_product_attention(
         q.float().transpose(1, 2),

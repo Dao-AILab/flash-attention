@@ -295,6 +295,8 @@ def _flash_attn_fwd(
     v_descale: Optional[torch.Tensor] = None,
     gather_kv_indices: Optional[torch.Tensor] = None,
     *,
+    out_partial: Optional[torch.Tensor] = None,
+    lse_partial: Optional[torch.Tensor] = None,
     config: FwdConfig | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Execute FlashAttention with an optional explicit forward config.
@@ -308,6 +310,8 @@ def _flash_attn_fwd(
             The returned LSE supports taking gradient.
         out: Optional pre-allocated output tensor. If None, will be allocated internally.
         lse: Optional pre-allocated log-sum-exp tensor. If None, will be allocated when needed.
+        out_partial: Optional reusable float32 SplitKV output workspace.
+        lse_partial: Optional reusable float32 SplitKV LSE workspace.
         aux_tensors: Some score_mods will want to read from global aux_tensors. This is how we thread them through to the inner kernel.
         aux_scalars: Runtime scalar captures used by score_mod or mask_mod.
         config: Fully resolved forward configuration, or None to select the default.
@@ -550,17 +554,39 @@ def _flash_attn_fwd(
 
     is_split_kv = num_splits > 1
     if is_split_kv:
-        out_partial = torch.empty(
+        out_partial_shape = (
             num_splits,
             *q_batch_seqlen_shape,
             num_head,
             head_dim_v,
-            dtype=torch.float32,
-            device=device,
         )
-        lse_partial = torch.empty(
-            num_splits, *lse_shape, dtype=torch.float32, device=device
-        )
+        lse_partial_shape = (num_splits, *lse_shape)
+        if out_partial is None:
+            out_partial = torch.empty(
+                out_partial_shape, dtype=torch.float32, device=device
+            )
+        else:
+            _validate_tensor(
+                out_partial,
+                "out_partial",
+                out_partial_shape,
+                torch.float32,
+                device,
+            )
+        if lse_partial is None:
+            lse_partial = torch.empty(
+                lse_partial_shape, dtype=torch.float32, device=device
+            )
+        else:
+            _validate_tensor(
+                lse_partial,
+                "lse_partial",
+                lse_partial_shape,
+                torch.float32,
+                device,
+            )
+    elif out_partial is not None or lse_partial is not None:
+        raise ValueError("SplitKV workspaces require config.num_splits > 1")
 
     use_dedicated_hd256_kernel = (
         arch // 10 in [10, 11] and head_dim == 256 and head_dim_v == 256
