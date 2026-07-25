@@ -843,6 +843,7 @@ def _run_fwd(
     block_sparse_tensors=None,
     aux_tensors=None,
     num_splits=1,
+    tile_mn=(128, 128),
 ):
     out = torch.empty_like(q)
     return _flash_attn_fwd(
@@ -862,7 +863,7 @@ def _run_fwd(
         window_size_left=-1,
         window_size_right=-1,
         learnable_sink=None,
-        tile_mn=(128, 128),
+        tile_mn=tile_mn,
         pack_gqa=False,
         _arch=None,
         score_mod=None,
@@ -1047,14 +1048,14 @@ def test_varlen_block_sparse(
 @pytest.mark.skipif(COMPUTE_CAPABILITY not in (10, 11), reason="SM100/SM110 coarse KV forward only")
 @pytest.mark.parametrize("seqlens_k", [[512, 512], [384, 384], [128, 128]])
 @pytest.mark.parametrize("varlen_k", [False, True])
-def test_varlen_block_sparse_coarse_kv_metadata_stride_repro(seqlens_k, varlen_k):
+@pytest.mark.parametrize("physical_tile_n", [64, 128])
+def test_varlen_block_sparse_coarse_kv_metadata_stride_repro(seqlens_k, varlen_k, physical_tile_n):
     torch.manual_seed(42)
     device = "cuda"
     seqlens_q = [512, 512]
     num_heads = 1
     head_dim = 128
     dtype = torch.bfloat16
-    physical_tile_n = 128
     sparse_tile_m = 256
     sparse_tile_n = 256
 
@@ -1099,6 +1100,7 @@ def test_varlen_block_sparse_coarse_kv_metadata_stride_repro(seqlens_k, varlen_k
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_k=cu_seqlens_k,
         block_sparse_tensors=block_sparse_tensors,
+        tile_mn=(128, physical_tile_n),
     )
     out_no_block_sparsity = _run_fwd(
         q,
@@ -1107,6 +1109,7 @@ def test_varlen_block_sparse_coarse_kv_metadata_stride_repro(seqlens_k, varlen_k
         mask_mod,
         cu_seqlens_q=cu_seqlens_q,
         cu_seqlens_k=cu_seqlens_k,
+        tile_mn=(128, physical_tile_n),
     )
 
     max_err = (out_with_block_sparsity - out_no_block_sparsity).abs().max().item()

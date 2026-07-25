@@ -844,7 +844,6 @@ def handle_block_sparse_empty_tile_correction_sm100(
     head_idx: Int32,
     batch_idx: Int32,
     split_idx: Int32,
-    sScale: cute.Tensor,
     stats: list,
     correction_epilogue: Callable,
     thr_mma_pv: cute.ThrMma,
@@ -852,6 +851,7 @@ def handle_block_sparse_empty_tile_correction_sm100(
     sO: cute.Tensor,
     pipeline_sm_stats: cutlass.pipeline.PipelineAsync,
     sm_stats_barrier: cutlass.pipeline.NamedBarrier,
+    sm_stats_barrier_cta_wide: cutlass.Constexpr,
     pipeline_o_epi: cutlass.pipeline.PipelineAsync,
     sm_stats_consumer_phase: Int32,
     o_corr_consumer_phase: Int32,
@@ -870,8 +870,8 @@ def handle_block_sparse_empty_tile_correction_sm100(
     warp-group can:
 
     - seed fully-masked-row stats (row_sum=1; row_max=-inf when tracked) for LSE
-    - run `correction_epilogue` with `scale=0` so the output tile is written as zeros
-      (independent of any prior tmem contents)
+    - run the zero-output `correction_epilogue` specialization without reading prior TMEM
+      contents
     - wait on `mbar_softmax_corr_full` and arrive `mbar_softmax_corr_empty`
       (and `mbar_corr_epi_*` when applicable) so phases stay aligned across tiles
 
@@ -904,17 +904,14 @@ def handle_block_sparse_empty_tile_correction_sm100(
                         sink_val * LOG2_E - row_max_value * softmax_scale_log2 + max_offset,
                         fastmath=True,
                     )
-        if tidx < m_block_size:
-            scale_row_idx = tidx + stage * m_block_size
-            sScale[scale_row_idx] = row_sum_value
-            if const_expr(mLSE is not None or learnable_sink is not None):
-                sScale[scale_row_idx + q_stage * m_block_size] = row_max_value
         acc_flag = row_sum_value == Float32(0.0) or row_sum_value != row_sum_value
         stats[stage] = (row_sum_value, row_max_value, acc_flag)
 
         # See NOTE [SM100 block-sparse empty tiles: mbarrier contract].
         # pipeline_sm_stats.consumer_wait_w_index_phase(stage, sm_stats_consumer_phase)
-        sm_stats_barrier.arrive_and_wait_w_index(index=stage * 4 + warp_idx)
+        sm_stats_barrier.arrive_and_wait_w_index(
+            index=stage if const_expr(sm_stats_barrier_cta_wide) else stage * 4 + warp_idx
+        )
         pipeline_sm_stats.consumer_release_w_index(stage)
 
         if const_expr(gmem_tiled_copy_O is None):
@@ -928,7 +925,7 @@ def handle_block_sparse_empty_tile_correction_sm100(
             stage,
             m_block,
             seqlen_info.seqlen_q,
-            Float32(0.0),  # zero scale ensures empty tile writes zeros into staged outputs
+            Float32(0.0),
             sO[None, None, stage],
             mO_cur,
             gO_stage,
@@ -1052,6 +1049,7 @@ def softmax_block_sparse_sm100(
     s0_s1_sequence_phase: Int32,
     pipeline_sm_stats: cutlass.pipeline.PipelineAsync,
     sm_stats_barrier: cutlass.pipeline.NamedBarrier,
+    sm_stats_barrier_cta_wide: cutlass.Constexpr,
     q_stage: cutlass.Constexpr,
     stage_idx: Int32,
     check_m_boundary: bool,
@@ -1091,7 +1089,9 @@ def softmax_block_sparse_sm100(
     total_block_cnt = split_mask_block_cnt + split_full_block_cnt
 
     if total_block_cnt == 0:
-        sm_stats_barrier.arrive_w_index(index=stage_idx * 4 + warp_idx)
+        sm_stats_barrier.arrive_w_index(
+            index=(stage_idx if const_expr(sm_stats_barrier_cta_wide) else stage_idx * 4 + warp_idx)
+        )
     else:
         if split_mask_block_cnt > 0:
             (

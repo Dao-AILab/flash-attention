@@ -244,6 +244,7 @@ class Softmax(ParamsBase):
 class SoftmaxSm100(Softmax):
     rescale_threshold: cutlass.Constexpr[float] = 0.0
     max_offset: cutlass.Constexpr[int] = 0
+    row_pair_stride: cutlass.Constexpr[int] = 0
 
     @staticmethod
     def create(
@@ -251,6 +252,7 @@ class SoftmaxSm100(Softmax):
         rescale_threshold: cutlass.Constexpr[float] = 0.0,
         softmax_scale: Float32 | None = None,
         max_offset: cutlass.Constexpr[int] = 0,
+        row_pair_stride: cutlass.Constexpr[int] = 0,
     ):
         num_rows = 1
         arch = 100
@@ -265,6 +267,7 @@ class SoftmaxSm100(Softmax):
             softmax_scale,
             rescale_threshold=rescale_threshold,
             max_offset=max_offset,
+            row_pair_stride=row_pair_stride,
         )
 
     @cute.jit
@@ -282,6 +285,16 @@ class SoftmaxSm100(Softmax):
         row_max_new: Float32,
         is_first: Boolean,
     ) -> Tuple[Float32, Float32]:
+        if cutlass.const_expr(self.row_pair_stride != 0):
+            row_max_new = utils.fmax(
+                row_max_new,
+                cute.arch.shuffle_sync_bfly(
+                    row_max_new,
+                    offset=self.row_pair_stride,
+                    mask=-1,
+                    mask_and_clamp=31,
+                ),
+            )
         if cutlass.const_expr(is_first):
             row_max_safe = row_max_new if row_max_new != -cutlass.Float32.inf else 0.0
             acc_scale = 0.0
@@ -314,11 +327,31 @@ class SoftmaxSm100(Softmax):
     def update_row_max(self, acc_S_row: cute.TensorSSA, is_first: int) -> Tuple[Float32, Float32]:
         if cutlass.const_expr(is_first):
             row_max_new = self._compute_row_max(acc_S_row)
+            if cutlass.const_expr(self.row_pair_stride != 0):
+                row_max_new = utils.fmax(
+                    row_max_new,
+                    cute.arch.shuffle_sync_bfly(
+                        row_max_new,
+                        offset=self.row_pair_stride,
+                        mask=-1,
+                        mask_and_clamp=31,
+                    ),
+                )
             row_max_safe = row_max_new if row_max_new != -cutlass.Float32.inf else 0.0
             acc_scale = 0.0
         else:
             row_max_old = self.row_max[0]
             row_max_new = self._compute_row_max(acc_S_row, init_val=row_max_old)
+            if cutlass.const_expr(self.row_pair_stride != 0):
+                row_max_new = utils.fmax(
+                    row_max_new,
+                    cute.arch.shuffle_sync_bfly(
+                        row_max_new,
+                        offset=self.row_pair_stride,
+                        mask=-1,
+                        mask_and_clamp=31,
+                    ),
+                )
             row_max_safe = row_max_new if row_max_new != -cutlass.Float32.inf else 0.0
             acc_scale_ = (row_max_old - row_max_safe) * self.scale_log2
             acc_scale = cute.math.exp2(acc_scale_, fastmath=True)
@@ -333,11 +366,17 @@ class SoftmaxSm100(Softmax):
     def update_row_sum(
         self, acc_S_row_exp: cute.TensorSSA, row_scale: Float32, is_first: int = False
     ) -> None:
-        init_val = self.row_sum[0] * row_scale if cutlass.const_expr(not is_first) else None
-        # self.row_sum[0] = self._compute_row_sum(acc_S_row_exp, init_val=self.row_sum[0] * row_scale)
-        self.row_sum[0] = self._compute_row_sum(acc_S_row_exp, init_val=init_val)
-        # tmp = self._compute_row_sum(acc_S_row_exp)
-        # self.row_sum[0] = self.row_sum[0] * row_scale + tmp
+        if cutlass.const_expr(self.row_pair_stride != 0):
+            local_sum = self._compute_row_sum(acc_S_row_exp)
+            row_sum_new = local_sum + cute.arch.shuffle_sync_bfly(
+                local_sum, offset=self.row_pair_stride, mask=-1, mask_and_clamp=31
+            )
+            if cutlass.const_expr(not is_first):
+                row_sum_new = row_sum_new + self.row_sum[0] * row_scale
+            self.row_sum[0] = row_sum_new
+        else:
+            init_val = self.row_sum[0] * row_scale if cutlass.const_expr(not is_first) else None
+            self.row_sum[0] = self._compute_row_sum(acc_S_row_exp, init_val=init_val)
 
     @cute.jit
     def scale_subtract_rowmax(

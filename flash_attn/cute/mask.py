@@ -791,6 +791,7 @@ class AttentionMask:
         fastdiv_mods=(None, None),
         is_full_block: bool = False,
         check_m_boundary: bool = True,
+        r2p: cutlass.Constexpr = True,
     ) -> None:
         """
         Backward pass: mask S = K @ Q.T where n_block tiles seqlen_k and m_block tiles seqlen_q.
@@ -904,7 +905,6 @@ class AttentionMask:
                     # column, by setting row limit to be self.tile_m.
                     if seqlenk_col_limit <= 0:
                         row_limit_top = self.tile_m
-                r2p = True
                 if const_expr(not r2p):
                     for i in cutlass.range(cute.size(acc_S.shape), unroll_full=True):
                         acc_S[i] = (
@@ -929,7 +929,6 @@ class AttentionMask:
                 if const_expr(mask_seqlen):
                     if seqlenk_col_limit <= 0:
                         row_limit_top = self.tile_m
-                r2p = True
                 if const_expr(not r2p):
                     for i in cutlass.range(cute.size(acc_S.shape), unroll_full=True):
                         row_idx = t0ScS_t2r[i][ROW]

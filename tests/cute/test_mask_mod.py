@@ -13,6 +13,8 @@
 #   pytest test_mask_mod.py                            # Run all tests
 
 import math
+from contextlib import contextmanager
+from functools import partial
 from unittest import mock
 
 import pytest
@@ -38,6 +40,7 @@ from flash_attn.cute.block_sparsity import (
 )
 from flash_attn.cute.cache_utils import get_jit_cache
 from flash_attn.cute.compute_block_sparsity import compute_block_sparsity
+from flash_attn.cute.flash_bwd_sm100 import FlashAttentionBackwardSm100
 from flash_attn.cute import utils
 from mask_mod_definitions import (
     get_mask_pair,
@@ -204,6 +207,27 @@ def assert_bwd_matches_reference(
     assert cute_dq_err <= bwd_rtol * pt_dq_err + dq_atol, f"dQ error too large: {cute_dq_err:.2e}"
     assert cute_dk_err <= bwd_rtol * pt_dk_err + dk_atol, f"dK error too large: {cute_dk_err:.2e}"
     assert cute_dv_err <= bwd_rtol * pt_dv_err + dv_atol, f"dV error too large: {cute_dv_err:.2e}"
+
+
+def get_single_kv_block_mask_pair(tile_n: int, active_block: int):
+    @fast_sampling
+    @cute.jit
+    def _cute_single_kv_block_mask(
+        batch: cute.TensorSSA,
+        head: cute.TensorSSA,
+        m_idx: cute.TensorSSA,
+        n_idx: cute.TensorSSA,
+        seqlen_info,
+        aux_tensors,
+    ) -> cute.TensorSSA:
+        tile_n_ssa = utils.scalar_to_ssa(tile_n, cutlass.Int32)
+        active_block_ssa = utils.scalar_to_ssa(active_block, cutlass.Int32)
+        return n_idx // tile_n_ssa == active_block_ssa
+
+    def _flex_single_kv_block_mask(b, h, q_idx, kv_idx):
+        return kv_idx // tile_n == active_block
+
+    return _cute_single_kv_block_mask, _flex_single_kv_block_mask
 
 
 def get_coarse_block_mask_pair(sparse_tile_m: int, tile_n: int, last_block: int):
@@ -3228,6 +3252,583 @@ def test_flash_attn_bwd_mask_mod_aux_scalars_produces_grads():
     assert q.grad is not None and torch.isfinite(q.grad).all()
     assert k.grad is not None and torch.isfinite(k.grad).all()
     assert v.grad is not None and torch.isfinite(v.grad).all()
+
+
+@contextmanager
+def _capture_sm100_backward_tile_config():
+    """Capture selected tile sizes while forcing backward kernel construction."""
+    observed = {}
+    original_init = FlashAttentionBackwardSm100.__init__
+
+    def wrapped_init(self, *args, **kwargs):
+        result = original_init(self, *args, **kwargs)
+        observed["config"] = self.tile_m, self.tile_n
+        return result
+
+    compile_cache = _flash_attn_bwd.compile_cache
+    _flash_attn_bwd.compile_cache = {}
+    try:
+        with mock.patch.object(FlashAttentionBackwardSm100, "__init__", wrapped_init):
+            yield observed
+    finally:
+        _flash_attn_bwd.compile_cache = compile_cache
+
+
+@pytest.mark.skipif(COMPUTE_CAPABILITY != 10, reason="SM100-only test")
+def test_sm100_block_sparse_forward_tile_n64():
+    """Check SM100 block-sparse forward with a 64-token KV tile."""
+    torch.manual_seed(0)
+    batch_size, seqlen_q, seqlen_k, nheads, headdim = 1, 512, 512, 2, 128
+    tile_m, tile_n = 128, 64
+    sparse_tile_m = 256
+    sparse_tile_n = 256
+
+    mask_mod_cute, mask_mod_flex = get_mask_pair(
+        "block_diagonal", seqlen_q=seqlen_q, seqlen_k=seqlen_k, window_size=None
+    )
+    tensors = create_tensors(
+        batch_size, seqlen_q, seqlen_k, nheads, nheads, headdim, headdim, torch.bfloat16
+    )
+    bm = create_block_mask(
+        mask_mod_flex, batch_size, nheads, seqlen_q, seqlen_k,
+        device="cuda", BLOCK_SIZE=(sparse_tile_m, sparse_tile_n),
+    )
+    (_, _, kv_mask_cnt, kv_mask_idx, full_kv_cnt, full_kv_idx, *_) = bm.as_tuple()
+    sparse = BlockSparseTensorsTorch(
+        mask_block_cnt=kv_mask_cnt,
+        mask_block_idx=kv_mask_idx,
+        full_block_cnt=full_kv_cnt,
+        full_block_idx=full_kv_idx,
+        block_size=(sparse_tile_m, sparse_tile_n),
+    )
+
+    out_cute, _, *_ = _flash_attn_fwd(
+        q=tensors["q"], k=tensors["k"], v=tensors["v"],
+        out=tensors["out"], lse=tensors["lse"],
+        softmax_scale=1.0 / math.sqrt(headdim),
+        causal=False,
+        tile_mn=(tile_m, tile_n),
+        pack_gqa=False,
+        mask_mod=mask_mod_cute,
+        block_sparse_tensors=sparse,
+        return_lse=True,
+    )
+    out_ref_fp32 = compute_reference_flex_attn(
+        {name: t.float() for name, t in tensors.items()},
+        mask_mod_flex,
+        (sparse_tile_m, sparse_tile_n),
+    )
+    out_ref = compute_reference_flex_attn(tensors, mask_mod_flex, (sparse_tile_m, sparse_tile_n))
+    assert_fwd_matches_reference(out_cute, out_ref_fp32, out_ref)
+
+
+@pytest.mark.skipif(COMPUTE_CAPABILITY != 10, reason="SM100-only test")
+@pytest.mark.parametrize(
+    "tile_m,sparse_tile_m",
+    [
+        pytest.param(128, 256, id="physical-m128"),
+        pytest.param(64, 64, id="physical-m64"),
+    ],
+)
+@pytest.mark.parametrize("sparse_tile_n", [64, 128, 256])
+def test_sm100_block_sparse_backward_tile_n64(tile_m, sparse_tile_m, sparse_tile_n):
+    torch.manual_seed(1)
+    batch_size, seqlen_q, seqlen_k, nheads, headdim = 1, 256, 256, 1, 128
+    tile_n = 64
+    dtype = torch.bfloat16
+
+    mask_mod_cute, mask_mod_flex = get_mask_pair(
+        "block_diagonal", seqlen_q=seqlen_q, seqlen_k=seqlen_k, window_size=None
+    )
+    tensors = create_tensors(
+        batch_size, seqlen_q, seqlen_k, nheads, nheads, headdim, headdim, dtype
+    )
+    block_sparse_mask_fwd, block_sparse_mask_bwd, block_mask = _build_block_sparse_masks_for_bwd(
+        mask_mod_flex=mask_mod_flex,
+        batch_size=batch_size,
+        nheads=nheads,
+        seqlen_q=seqlen_q,
+        seqlen_k=seqlen_k,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        spt=False,
+        sparse_tile_m=sparse_tile_m,
+        sparse_tile_n=sparse_tile_n,
+        return_block_mask=True,
+    )
+
+    out_cute, lse_cute, *_ = _flash_attn_fwd(
+        q=tensors["q"], k=tensors["k"], v=tensors["v"],
+        out=tensors["out"], lse=tensors["lse"],
+        softmax_scale=1.0 / math.sqrt(headdim),
+        causal=False,
+        tile_mn=(tile_m, tile_n),
+        pack_gqa=False,
+        mask_mod=mask_mod_cute,
+        block_sparse_tensors=block_sparse_mask_fwd,
+        return_lse=True,
+    )
+    grad_out = torch.randn_like(out_cute)
+    with _capture_sm100_backward_tile_config() as observed:
+        dq_cute, dk_cute, dv_cute = run_cute_mask_bwd(
+            tensors["q"], tensors["k"], tensors["v"], out_cute, lse_cute, grad_out,
+            mask_mod_cute, block_sparse_mask_bwd=block_sparse_mask_bwd,
+            tile_m=tile_m, tile_n=tile_n,
+        )
+
+    assert observed["config"] == (tile_m, tile_n)
+    out_ref_fp32, dq_ref_fp32, dk_ref_fp32, dv_ref_fp32 = run_flex_reference_bwd(
+        tensors["q"], tensors["k"], tensors["v"], block_mask, grad_out, dtype=torch.float32
+    )
+    out_pt, dq_pt, dk_pt, dv_pt = run_flex_reference_bwd(
+        tensors["q"], tensors["k"], tensors["v"], block_mask, grad_out
+    )
+
+    assert_fwd_matches_reference(out_cute, out_ref_fp32, out_pt)
+    assert_bwd_matches_reference(
+        dq_cute, dk_cute, dv_cute,
+        dq_ref_fp32, dk_ref_fp32, dv_ref_fp32,
+        dq_pt, dk_pt, dv_pt,
+        dtype,
+        min(seqlen_q, seqlen_k),
+    )
+
+
+@pytest.mark.skipif(COMPUTE_CAPABILITY != 10, reason="SM100-only test")
+def test_sm100_block_sparse_64x64_public_autograd_selects_physical_tile():
+    """Select physical 64x64 forward and backward from semantic block metadata."""
+    torch.manual_seed(5)
+    batch_size, seqlen_q, seqlen_k, nheads, headdim = 1, 128, 128, 1, 128
+    mask_mod_cute, mask_mod_flex = get_mask_pair(
+        "block_diagonal", seqlen_q=seqlen_q, seqlen_k=seqlen_k, window_size=None
+    )
+    tensors = create_tensors(
+        batch_size,
+        seqlen_q,
+        seqlen_k,
+        nheads,
+        nheads,
+        headdim,
+        headdim,
+        torch.bfloat16,
+    )
+    q, k, v = [tensors[name].detach().requires_grad_() for name in ("q", "k", "v")]
+    sparse_fwd, sparse_bwd, block_mask = _build_block_sparse_masks_for_bwd(
+        mask_mod_flex=mask_mod_flex,
+        batch_size=batch_size,
+        nheads=nheads,
+        seqlen_q=seqlen_q,
+        seqlen_k=seqlen_k,
+        tile_m=64,
+        tile_n=64,
+        spt=False,
+        sparse_tile_m=64,
+        sparse_tile_n=64,
+        return_block_mask=True,
+    )
+    grad_out = torch.randn_like(tensors["out"])
+    with _capture_sm100_backward_tile_config() as observed:
+        out_cute, _ = flash_attn_func(
+            q,
+            k,
+            v,
+            softmax_scale=1.0 / math.sqrt(headdim),
+            mask_mod=mask_mod_cute,
+            block_sparse_tensors=sparse_fwd,
+            block_sparse_tensors_bwd=sparse_bwd,
+            return_lse=True,
+        )
+        grads = torch.autograd.grad(out_cute, (q, k, v), grad_out)
+
+    assert observed["config"] == (64, 64)
+    out_ref_fp32, *grads_ref_fp32 = run_flex_reference_bwd(
+        q, k, v, block_mask, grad_out, dtype=torch.float32
+    )
+    out_pt, *grads_pt = run_flex_reference_bwd(q, k, v, block_mask, grad_out)
+    assert_fwd_matches_reference(out_cute, out_ref_fp32, out_pt)
+    assert_bwd_matches_reference(
+        *grads,
+        *grads_ref_fp32,
+        *grads_pt,
+        torch.bfloat16,
+        min(seqlen_q, seqlen_k),
+    )
+
+
+@pytest.mark.skipif(COMPUTE_CAPABILITY != 10, reason="SM100-only test")
+def test_sm100_block_sparse_backward_64x64_deterministic():
+    """Order repeated N64 contributions to each M64 dQ tile deterministically."""
+    torch.manual_seed(6)
+    seqlen = 256
+    mask_mod_cute, mask_mod_flex = get_mask_pair(
+        "causal", seqlen_q=seqlen, seqlen_k=seqlen, window_size=None
+    )
+    tensors = create_tensors(
+        1, seqlen, seqlen, 1, 1, 128, 128, torch.bfloat16
+    )
+    sparse_fwd, sparse_bwd = _build_block_sparse_masks_for_bwd(
+        mask_mod_flex=mask_mod_flex,
+        batch_size=1,
+        nheads=1,
+        seqlen_q=seqlen,
+        seqlen_k=seqlen,
+        tile_m=64,
+        tile_n=64,
+        spt=False,
+        sparse_tile_m=64,
+        sparse_tile_n=64,
+    )
+    out, lse, *_ = _flash_attn_fwd(
+        tensors["q"],
+        tensors["k"],
+        tensors["v"],
+        tile_mn=(64, 64),
+        mask_mod=mask_mod_cute,
+        block_sparse_tensors=sparse_fwd,
+        return_lse=True,
+    )
+    grad_out = torch.randn_like(out)
+    backward = partial(
+        run_cute_mask_bwd,
+        tensors["q"],
+        tensors["k"],
+        tensors["v"],
+        out,
+        lse,
+        grad_out,
+        mask_mod_cute,
+        block_sparse_mask_bwd=sparse_bwd,
+        tile_m=64,
+        tile_n=64,
+        deterministic=True,
+    )
+    expected = backward()
+    for _ in range(3):
+        actual = backward()
+        for name, grad, reference in zip(("dQ", "dK", "dV"), actual, expected):
+            assert torch.equal(grad, reference), f"{name} is not deterministic"
+
+
+@pytest.mark.skipif(COMPUTE_CAPABILITY != 10, reason="SM100-only test")
+def test_sm100_block_sparse_backward_64x64_deterministic_coarse_tail():
+    """Bridge deterministic dQ locks across a truncated coarse-KV sparse block."""
+    torch.manual_seed(7)
+    seqlen = 255
+    mask_mod_cute, mask_mod_flex = get_mask_pair(
+        "causal", seqlen_q=seqlen, seqlen_k=seqlen, window_size=None
+    )
+    tensors = create_tensors(
+        1, seqlen, seqlen, 1, 1, 128, 128, torch.bfloat16
+    )
+    sparse_fwd, sparse_bwd = _build_block_sparse_masks_for_bwd(
+        mask_mod_flex=mask_mod_flex,
+        batch_size=1,
+        nheads=1,
+        seqlen_q=seqlen,
+        seqlen_k=seqlen,
+        tile_m=64,
+        tile_n=64,
+        spt=True,
+        sparse_tile_m=128,
+        sparse_tile_n=192,
+    )
+    out, lse, *_ = _flash_attn_fwd(
+        tensors["q"],
+        tensors["k"],
+        tensors["v"],
+        tile_mn=(64, 64),
+        mask_mod=mask_mod_cute,
+        block_sparse_tensors=sparse_fwd,
+        return_lse=True,
+    )
+    grad_out = torch.randn_like(out)
+    backward = partial(
+        run_cute_mask_bwd,
+        tensors["q"],
+        tensors["k"],
+        tensors["v"],
+        out,
+        lse,
+        grad_out,
+        mask_mod_cute,
+        block_sparse_mask_bwd=sparse_bwd,
+        tile_m=64,
+        tile_n=64,
+    )
+
+    expected = backward(deterministic=False)
+    first = backward(deterministic=True)
+    repeated = backward(deterministic=True)
+    for name, grad, repeat, reference in zip(
+        ("dQ", "dK", "dV"), first, repeated, expected
+    ):
+        assert torch.equal(grad, repeat), f"{name} is not deterministic"
+        torch.testing.assert_close(grad, reference, rtol=2e-2, atol=2e-2)
+
+
+@pytest.mark.skipif(COMPUTE_CAPABILITY != 10, reason="SM100-only test")
+@pytest.mark.parametrize(
+    "tile_m,tile_n,head_dim,head_dim_v",
+    [
+        pytest.param(128, 64, 24, 32, id="packed-m128-d24-dv32"),
+        pytest.param(64, 64, 24, 32, id="packed-m64-d24-dv32"),
+        pytest.param(128, 128, 24, 24, id="default-d24-dv24"),
+    ],
+)
+def test_sm100_block_sparse_backward_padded_empty_to_active_kv(
+    tile_m, tile_n, head_dim, head_dim_v
+):
+    """Zero empty sparse KV tiles without storing padded gradient columns."""
+    torch.manual_seed(2)
+    batch_size, seqlen_q, seqlen_k, nheads = 1, 128, 2 * tile_n, 1
+    dtype = torch.bfloat16
+    mask_mod_cute, mask_mod_flex = get_single_kv_block_mask_pair(tile_n, active_block=1)
+    tensors = create_tensors(
+        batch_size,
+        seqlen_q,
+        seqlen_k,
+        nheads,
+        nheads,
+        head_dim,
+        head_dim_v,
+        dtype,
+    )
+    block_sparse_mask_fwd, block_sparse_mask_bwd, block_mask = _build_block_sparse_masks_for_bwd(
+        mask_mod_flex=mask_mod_flex,
+        batch_size=batch_size,
+        nheads=nheads,
+        seqlen_q=seqlen_q,
+        seqlen_k=seqlen_k,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        spt=False,
+        sparse_tile_m=tile_m,
+        sparse_tile_n=tile_n,
+        return_block_mask=True,
+    )
+    out_cute, lse_cute, *_ = _flash_attn_fwd(
+        q=tensors["q"],
+        k=tensors["k"],
+        v=tensors["v"],
+        out=tensors["out"],
+        lse=tensors["lse"],
+        tile_mn=(tile_m, tile_n),
+        mask_mod=mask_mod_cute,
+        block_sparse_tensors=block_sparse_mask_fwd,
+        return_lse=True,
+    )
+    grad_out = torch.randn_like(out_cute)
+    dq_cute, dk_cute, dv_cute = run_cute_mask_bwd(
+        tensors["q"],
+        tensors["k"],
+        tensors["v"],
+        out_cute,
+        lse_cute,
+        grad_out,
+        mask_mod_cute,
+        block_sparse_mask_bwd=block_sparse_mask_bwd,
+        tile_m=tile_m,
+        tile_n=tile_n,
+    )
+
+    assert torch.count_nonzero(dk_cute[:, :tile_n]) == 0
+    assert torch.count_nonzero(dv_cute[:, :tile_n]) == 0
+    _, dq_ref_fp32, dk_ref_fp32, dv_ref_fp32 = run_flex_reference_bwd(
+        tensors["q"], tensors["k"], tensors["v"], block_mask, grad_out, dtype=torch.float32
+    )
+    _, dq_pt, dk_pt, dv_pt = run_flex_reference_bwd(
+        tensors["q"], tensors["k"], tensors["v"], block_mask, grad_out
+    )
+    assert_bwd_matches_reference(
+        dq_cute,
+        dk_cute,
+        dv_cute,
+        dq_ref_fp32,
+        dk_ref_fp32,
+        dv_ref_fp32,
+        dq_pt,
+        dk_pt,
+        dv_pt,
+        dtype,
+        min(seqlen_q, seqlen_k),
+    )
+
+
+@pytest.mark.skipif(COMPUTE_CAPABILITY != 10, reason="SM100-only test")
+def test_sm100_block_sparse_backward_tile_m64_dense_fallback():
+    torch.manual_seed(2)
+    batch_size, seqlen_q, seqlen_k, nheads, headdim = 1, 128, 128, 1, 128
+    tile_m, tile_n = 64, 128
+    sparse_tile_m, sparse_tile_n = 128, 128
+    dtype = torch.bfloat16
+
+    mask_mod_cute, mask_mod_flex = get_mask_pair(
+        "block_diagonal", seqlen_q=seqlen_q, seqlen_k=seqlen_k, window_size=None
+    )
+    tensors = create_tensors(
+        batch_size, seqlen_q, seqlen_k, nheads, nheads, headdim, headdim, dtype
+    )
+    _, block_sparse_mask_bwd, block_mask = _build_block_sparse_masks_for_bwd(
+        mask_mod_flex=mask_mod_flex,
+        batch_size=batch_size,
+        nheads=nheads,
+        seqlen_q=seqlen_q,
+        seqlen_k=seqlen_k,
+        tile_m=tile_m,
+        tile_n=tile_n,
+        spt=False,
+        sparse_tile_m=sparse_tile_m,
+        sparse_tile_n=sparse_tile_n,
+        return_block_mask=True,
+    )
+    out_cute, lse_cute, *_ = _flash_attn_fwd(
+        q=tensors["q"], k=tensors["k"], v=tensors["v"],
+        out=tensors["out"], lse=tensors["lse"],
+        softmax_scale=1.0 / math.sqrt(headdim), causal=False,
+        pack_gqa=False, mask_mod=mask_mod_cute, return_lse=True,
+    )
+    grad_out = torch.randn_like(out_cute)
+    dq_cute, dk_cute, dv_cute = run_cute_mask_bwd(
+        tensors["q"], tensors["k"], tensors["v"], out_cute, lse_cute, grad_out,
+        mask_mod_cute, block_sparse_mask_bwd=block_sparse_mask_bwd,
+        tile_m=tile_m, tile_n=tile_n,
+    )
+    out_ref_fp32, dq_ref_fp32, dk_ref_fp32, dv_ref_fp32 = run_flex_reference_bwd(
+        tensors["q"], tensors["k"], tensors["v"], block_mask, grad_out, dtype=torch.float32
+    )
+    out_pt, dq_pt, dk_pt, dv_pt = run_flex_reference_bwd(
+        tensors["q"], tensors["k"], tensors["v"], block_mask, grad_out
+    )
+
+    assert_fwd_matches_reference(out_cute, out_ref_fp32, out_pt)
+    assert_bwd_matches_reference(
+        dq_cute, dk_cute, dv_cute,
+        dq_ref_fp32, dk_ref_fp32, dv_ref_fp32,
+        dq_pt, dk_pt, dv_pt,
+        dtype,
+        min(seqlen_q, seqlen_k),
+    )
+
+
+@pytest.mark.skipif(COMPUTE_CAPABILITY != 10, reason="SM100-only test")
+@pytest.mark.parametrize("use_mask_mod", [False, True])
+def test_sm100_dense_backward_rejects_tile_m64(use_mask_mod):
+    torch.manual_seed(0)
+    batch_size, seqlen_q, seqlen_k, nheads, headdim = 1, 256, 256, 2, 128
+    tensors = create_tensors(
+        batch_size, seqlen_q, seqlen_k, nheads, nheads, headdim, headdim, torch.bfloat16
+    )
+    mask_mod_cute = (
+        get_mask_pair("block_diagonal", seqlen_q=seqlen_q, seqlen_k=seqlen_k, window_size=None)[0]
+        if use_mask_mod else None
+    )
+    dout = torch.randn_like(tensors["out"])
+    with pytest.raises(NotImplementedError, match="SM100 backward supports"):
+        _flash_attn_bwd(
+            q=tensors["q"], k=tensors["k"], v=tensors["v"],
+            out=tensors["out"], dout=dout, lse=tensors["lse"],
+            causal=False, m_block_size=64, n_block_size=128,
+            mask_mod=mask_mod_cute,
+        )
+
+
+@pytest.mark.skipif(COMPUTE_CAPABILITY != 10, reason="SM100-only test")
+def test_sm100_block_sparse_backward_rejects_tile_m64_without_mask_mod():
+    torch.manual_seed(0)
+    batch_size, seqlen_q, seqlen_k, nheads, headdim = 1, 256, 256, 2, 128
+    tensors = create_tensors(
+        batch_size, seqlen_q, seqlen_k, nheads, nheads, headdim, headdim, torch.bfloat16
+    )
+    sparse = BlockSparseTensorsTorch(
+        mask_block_cnt=torch.zeros((batch_size, nheads, 4), device="cuda", dtype=torch.int32),
+        mask_block_idx=torch.zeros((batch_size, nheads, 4, 1), device="cuda", dtype=torch.int32),
+        full_block_cnt=torch.zeros((batch_size, nheads, 4), device="cuda", dtype=torch.int32),
+        full_block_idx=torch.zeros((batch_size, nheads, 4, 1), device="cuda", dtype=torch.int32),
+        block_size=(128, 128),
+    )
+    dout = torch.randn_like(tensors["out"])
+    with pytest.raises(NotImplementedError, match="require mask_mod for dense fallback"):
+        _flash_attn_bwd(
+            q=tensors["q"], k=tensors["k"], v=tensors["v"],
+            out=tensors["out"], dout=dout, lse=tensors["lse"],
+            causal=False, m_block_size=64, n_block_size=128,
+            block_sparse_tensors=sparse,
+        )
+
+
+@pytest.mark.skipif(COMPUTE_CAPABILITY != 10, reason="SM100-only test")
+def test_sm100_block_sparse_64x64_backward_rejects_unpacked_v_fallback():
+    """Do not silently route semantic 64x64 metadata through an unsafe dV fallback."""
+    batch_size, seqlen_q, seqlen_k, nheads = 1, 65, 67, 1
+    tensors = create_tensors(
+        batch_size,
+        seqlen_q,
+        seqlen_k,
+        nheads,
+        nheads,
+        24,
+        40,
+        torch.bfloat16,
+    )
+    sparse = BlockSparseTensorsTorch(
+        mask_block_cnt=torch.zeros((batch_size, nheads, 2), device="cuda", dtype=torch.int32),
+        mask_block_idx=torch.zeros((batch_size, nheads, 2, 1), device="cuda", dtype=torch.int32),
+        block_size=(64, 64),
+    )
+
+    with pytest.raises(NotImplementedError, match="V head dimension to be a multiple of 16"):
+        _flash_attn_bwd(
+            q=tensors["q"],
+            k=tensors["k"],
+            v=tensors["v"],
+            out=tensors["out"],
+            dout=torch.randn_like(tensors["out"]),
+            lse=tensors["lse"],
+            mask_mod=scalar_limit_mask,
+            block_sparse_tensors=sparse,
+        )
+
+
+@pytest.mark.skipif(COMPUTE_CAPABILITY != 10, reason="SM100-only test")
+def test_sm100_backward_constructor_rejects_tile_m64():
+    with pytest.raises(NotImplementedError, match="SM100 backward supports"):
+        FlashAttentionBackwardSm100(128, tile_m=64, tile_n=128)
+
+
+@pytest.mark.skipif(COMPUTE_CAPABILITY != 10, reason="SM100-only test")
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_k,kv_mode,mask_name,window_size,tile_n,use_block_sparsity",
+    [
+        pytest.param(192, 224, "mha", "sliding_window", 128, 64, False, id="dense-window"),
+        pytest.param(256, 256, "gqa", "document", None, 128, True, id="sparse-document"),
+    ],
+)
+def test_sm100_forward_tile_m64_mask_mod(
+    seqlen_q,
+    seqlen_k,
+    kv_mode,
+    mask_name,
+    window_size,
+    tile_n,
+    use_block_sparsity,
+):
+    _run_mask_test(
+        seqlen_q=seqlen_q,
+        seqlen_k=seqlen_k,
+        nheads=4,
+        kv_mode=kv_mode,
+        headdim=128,
+        dtype=torch.bfloat16,
+        mask_name=mask_name,
+        window_size=window_size,
+        window_left=None,
+        window_right=None,
+        tile_m=64,
+        tile_n=tile_n,
+        use_block_sparsity=use_block_sparsity,
+        needs_backward=False,
+        use_autograd=False,
+    )
 
 
 def test_compute_block_sparsity_mask_mod_aux_scalars_runs():

@@ -51,7 +51,7 @@ def get_copy_atom(
 @dsl_user_op
 def make_tmem_copy(
     tmem_copy_atom: cute.CopyAtom, num_wg: int = 1, *, loc=None, ip=None
-) -> cute.CopyAtom:
+) -> cute.TiledCopy:
     num_dp, num_bits, num_rep, _ = sm100_utils.get_tmem_copy_properties(tmem_copy_atom)
     assert num_dp == 32
     assert num_bits == 32
@@ -59,6 +59,21 @@ def make_tmem_copy(
     layout_tv = cute.make_layout(
         ((32, 4, num_wg), (num_rep, 32)), stride=((0, 1, 4 * num_rep), (4, 4 * num_rep * num_wg))
     )
+    return cute.make_tiled_copy(tmem_copy_atom, layout_tv, tiler_mn)
+
+
+@dsl_user_op
+def make_tmem_copy_16dp(tmem_copy_atom: cute.CopyAtom, *, loc=None, ip=None) -> cute.TiledCopy:
+    """Preserve the native 16-datapath mapping through an scf.while region."""
+    num_dp, num_bits, num_rep, _ = sm100_utils.get_tmem_copy_properties(tmem_copy_atom)
+    assert num_dp == 16
+    assert num_bits == 32
+    tiler_mn = (
+        cute.make_layout((128, num_rep), stride=(num_rep, 1)),
+        cute.make_layout(1),
+        cute.make_layout(1),
+    )
+    layout_tv = cute.make_layout(((32, 4), (32, num_rep)), stride=((0, 1), (4, 128)))
     return cute.make_tiled_copy(tmem_copy_atom, layout_tv, tiler_mn)
 
 

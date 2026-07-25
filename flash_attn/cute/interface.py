@@ -36,12 +36,19 @@ from flash_attn.cute.cute_dsl_utils import (
 )
 from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80
 from flash_attn.cute.flash_fwd_sm90 import FlashAttentionForwardSm90
-from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100, DescaleTensors
+from flash_attn.cute.flash_fwd_sm100 import (
+    DescaleTensors,
+    FlashAttentionForwardSm100,
+    supports_sm100_tile_m64_head_dims,
+)
 from flash_attn.cute.flash_fwd_sm120 import FlashAttentionForwardSm120
 from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
 from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
 from flash_attn.cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
-from flash_attn.cute.flash_bwd_sm100 import FlashAttentionBackwardSm100
+from flash_attn.cute.flash_bwd_sm100 import (
+    FlashAttentionBackwardSm100,
+    supports_sm100_tile_n64_head_dims,
+)
 from flash_attn.cute.flash_bwd_sm120 import FlashAttentionBackwardSm120
 from flash_attn.cute.flash_bwd_postprocess import FlashAttentionBackwardPostprocess
 from flash_attn.cute.flash_fwd_combine import FlashAttentionForwardCombine
@@ -92,6 +99,17 @@ def _get_device_arch():
         return _parse_arch_str(arch_override)
     major, minor = torch.cuda.get_device_capability()
     return major * 10 + int(minor)
+
+
+def _requests_sm100_sparse_64x64_tiles(
+    arch: int, block_sparse_tensors: BlockSparseTensorsTorch | None
+) -> bool:
+    """Return whether exact SM100 64x64 sparse metadata requests 64x64 tiles."""
+    return (
+        arch == 100
+        and block_sparse_tensors is not None
+        and block_sparse_tensors.block_size == (64, 64)
+    )
 
 
 def _validate_head_dims(head_dim: int, head_dim_v: int, compute_capability: int, alignment: int) -> None:
@@ -540,9 +558,33 @@ def _flash_attn_fwd(
         elif arch // 10 == 9:
             sparse_q = get_sparse_q_block_size(block_sparse_tensors, seqlen_q)
             fwd_cfg = _tile_size_fwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q=sparse_q)
+        elif _requests_sm100_sparse_64x64_tiles(arch, block_sparse_tensors):
+            fwd_cfg = FwdConfig(64, 64, True, True)
     else:
         fwd_cfg = FwdConfig(tile_mn[0], tile_mn[1], fwd_cfg.mma_pv_is_rs, fwd_cfg.intra_wg_overlap)
     tile_m, tile_n = fwd_cfg.m_block_size, fwd_cfg.n_block_size
+    p_in_smem = arch // 10 in [10, 11] and tile_m == 64
+    if p_in_smem:
+        if arch != 100:
+            raise NotImplementedError("tile_m=64 forward is currently supported only on SM100")
+        if tile_n not in (64, 128):
+            raise NotImplementedError(
+                f"SM100 tile_m=64 forward requires tile_n in (64, 128), got tile_n={tile_n}"
+            )
+        if is_fp8:
+            raise NotImplementedError("SM100 tile_m=64 forward currently supports only FP16 and BF16")
+        if qv is not None or not supports_sm100_tile_m64_head_dims(head_dim, head_dim_v):
+            raise NotImplementedError(
+                "SM100 tile_m=64 forward supports head dimensions in [8, 128] or (192, 128)"
+            )
+        if page_table is not None and head_dim != head_dim_v:
+            raise NotImplementedError(
+                "SM100 tile_m=64 paged KV requires matching K and V head dimensions"
+            )
+        if page_table is not None and page_size != tile_n:
+            raise NotImplementedError(
+                "SM100 tile_m=64 forward requires paged KV page_size to equal tile_n"
+            )
     if mma_pv_is_rs is None:
         mma_pv_is_rs = fwd_cfg.mma_pv_is_rs
     if intra_wg_overlap is None:
@@ -556,7 +598,7 @@ def _flash_attn_fwd(
         min_seqlen_k = seqlen_k 
     seqlen_q_packgqa = max_seqlen_q * qhead_per_kvhead
     if arch // 10 in [10, 11]:
-        q_stage = 2 if seqlen_q_packgqa > tile_m else 1
+        q_stage = 1 if p_in_smem else (2 if seqlen_q_packgqa > tile_m else 1)
     else:
         q_stage = 1
 
@@ -595,9 +637,10 @@ def _flash_attn_fwd(
         and cu_seqlens_q is None
         and seqused_q is None
         and not use_block_sparsity
+        and not p_in_smem
         and page_size in [None, 128]
-        and int(math.ceil(head_dim / 16) * 16) in [128, 192]
-        and int(math.ceil(head_dim_v / 16) * 16) == 128
+        and cute.round_up(head_dim, 16) in [128, 192]
+        and cute.round_up(head_dim_v, 16) == 128
         and seqlen_q_packgqa > 2 * tile_m
         and (tile_m % qhead_per_kvhead == 0 or not pack_gqa)
     )
@@ -629,7 +672,12 @@ def _flash_attn_fwd(
     # pays work-stealing overhead.
     is_varlen_mha = is_varlen and qhead_per_kvhead == 1
     is_dense_noncausal = not is_varlen and not causal and not local
-    use_clc_scheduler = requested_use_clc_scheduler and not is_varlen_mha and not is_dense_noncausal
+    use_clc_scheduler = (
+        requested_use_clc_scheduler
+        and not is_varlen_mha
+        and not is_dense_noncausal
+        and not p_in_smem
+    )
 
     if use_block_sparsity:
         # NB: pack_gqa requires block sparse head dim == 1 (broadcasted)
@@ -1317,8 +1365,8 @@ def _flash_attn_bwd(
     softcap: float = 0.0,
     window_size_left: Optional[int] = None,
     window_size_right: Optional[int] = None,
-    m_block_size: int = 64,
-    n_block_size: int = 128,
+    m_block_size: int | None = None,
+    n_block_size: int | None = None,
     num_threads: int = 256,
     pack_gqa: bool = False,
     num_stages_Q: int = 2,
@@ -1429,28 +1477,70 @@ def _flash_attn_bwd(
             or seqused_k is not None
         )
     else:
-        m_block_size = 128
-        n_block_size = 128
+        if (
+            m_block_size is None
+            and n_block_size is None
+            and _requests_sm100_sparse_64x64_tiles(arch, block_sparse_tensors)
+        ):
+            m_block_size = n_block_size = 64
+        m_block_size = 128 if m_block_size is None else m_block_size
+        n_block_size = 128 if n_block_size is None else n_block_size
+        requested_bwd_smaller_tile = (m_block_size, n_block_size) in ((128, 64), (64, 64))
+        supports_bwd_smaller_tile = (
+            arch == 100
+            and supports_sm100_tile_n64_head_dims(head_dim, head_dim_v)
+            and num_head == k.shape[-2]
+        )
+        if requested_bwd_smaller_tile and head_dim_v % 16 != 0:
+            raise NotImplementedError(
+                "SM100 smaller-tile backward requires V head dimension to be a multiple of 16"
+            )
+        if requested_bwd_smaller_tile and block_sparse_tensors is None:
+            if arch != 100:
+                raise NotImplementedError(
+                    "backward 128x64 and 64x64 tiles are currently supported only on SM100"
+                )
+            if not supports_bwd_smaller_tile:
+                raise NotImplementedError(
+                    "SM100 smaller-tile backward supports QK dimensions 24..128 divisible by 8 "
+                    "with 32-column padded width, V dimensions 32..128 divisible by 16, and MHA"
+                )
+        if (
+            block_sparse_tensors is not None
+            and (m_block_size, n_block_size) != (128, 128)
+            and not (requested_bwd_smaller_tile and supports_bwd_smaller_tile)
+        ):
+            if mask_mod is None:
+                raise NotImplementedError(
+                    "SM100 backward smaller block-sparse tiles currently require mask_mod for dense fallback."
+                )
+            block_sparse_tensors = None
+            sparse_q = None
+            m_block_size = 128
+            n_block_size = 128
         dQ_swapAB = False
         dKV_swapAB = False
         AtomLayoutMdQ = 1
         AtomLayoutNdKV = 1
         requested_disable_2cta = utils._get_disable_2cta_default()
         kv_subtile_factor = get_kv_subtile_factor(block_sparse_tensors, n_block_size)
+        supports_2cta_tile = (m_block_size, n_block_size) == (128, 128)
         use_2cta_instrs = (
             head_dim >= 128
             and not requested_disable_2cta
+            and supports_2cta_tile
             and block_sparse_bwd_supports_2cta(block_sparse_tensors, n_block_size)
         )
         if block_sparse_tensors is not None and head_dim == 192 and not use_2cta_instrs:
-            reason = (
-                "2CTA was disabled by request"
-                if requested_disable_2cta
-                else (
+            if requested_disable_2cta:
+                reason = "2CTA was disabled by request"
+            elif not supports_2cta_tile:
+                reason = "the requested tile does not support 2CTA"
+            else:
+                reason = (
                     f"sparse_block_size[1] must cover an even number of tile_n={n_block_size} "
                     f"tiles; got factor {kv_subtile_factor}"
                 )
-            )
             raise ValueError(
                 f"SM100 block-sparse backward with head_dim=192 requires 2CTA; {reason}."
             )

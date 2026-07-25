@@ -57,8 +57,7 @@ class FlashAttentionBackwardPostprocess:
         )
         self.arch = arch
         # padding head_dim to a multiple of 32 as k_block_size
-        hdim_multiple_of = 32
-        self.tile_hdim = int(math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of)
+        self.tile_hdim = cute.round_up(head_dim, 32)
         self.check_hdim_oob = head_dim != self.tile_hdim
         self.num_threads = num_threads
         self.AtomLayoutMdQ = AtomLayoutMdQ
@@ -219,11 +218,10 @@ class FlashAttentionBackwardPostprocess:
         stream: cuda.CUstream = None,
     ):
         # Get the data type and check if it is fp16 or bf16
-        if const_expr(mdQ.element_type not in [cutlass.Float16, cutlass.BFloat16]):
+        if const_expr(mdQ.element_type not in (cutlass.Float16, cutlass.BFloat16)):
             raise TypeError("Only Float16 or BFloat16 is supported")
-        if const_expr(mdQaccum is not None):
-            if const_expr(mdQaccum.element_type not in [cutlass.Float32]):
-                raise TypeError("dQaccum tensor must be Float32")
+        if const_expr(mdQaccum.element_type != Float32):
+            raise TypeError("dQaccum tensor must be Float32")
 
         mdQaccum, mdQ = [assume_tensor_aligned(t) for t in (mdQaccum, mdQ)]
 
@@ -264,27 +262,94 @@ class FlashAttentionBackwardPostprocess:
         grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
 
         # grid_dim: (m_block, num_head, batch_size)
-        self.kernel(
-            mdQaccum,
-            mdQ,
-            mCuSeqlensQ,
-            mSeqUsedQ,
-            scale,
-            self.tiled_mma,
-            self.dQ_swapAB,
-            self.sdQaccum_layout,
-            self.sdQ_layout,
-            self.g2s_tiled_copy_dQaccum,
-            self.s2r_tiled_copy_dQaccum,
-            self.gmem_tiled_copy_dQ,
-            tile_sched_params,
-            TileScheduler,
-        ).launch(
-            grid=grid_dim,
-            block=[self.num_threads, 1, 1],
-            smem=smem_size,
-            stream=stream,
-        )
+        if const_expr(self.arch // 10 in [10, 11] and self.tile_m == 64):
+            self.kernel_direct_m64(
+                mdQaccum,
+                mdQ,
+                mCuSeqlensQ,
+                mSeqUsedQ,
+                scale,
+                tile_sched_params,
+                TileScheduler,
+            ).launch(
+                grid=grid_dim,
+                block=[self.num_threads, 1, 1],
+                stream=stream,
+            )
+        else:
+            self.kernel(
+                mdQaccum,
+                mdQ,
+                mCuSeqlensQ,
+                mSeqUsedQ,
+                scale,
+                self.tiled_mma,
+                self.dQ_swapAB,
+                self.sdQaccum_layout,
+                self.sdQ_layout,
+                self.g2s_tiled_copy_dQaccum,
+                self.s2r_tiled_copy_dQaccum,
+                self.gmem_tiled_copy_dQ,
+                tile_sched_params,
+                TileScheduler,
+            ).launch(
+                grid=grid_dim,
+                block=[self.num_threads, 1, 1],
+                smem=smem_size,
+                stream=stream,
+            )
+
+    @cute.kernel
+    def kernel_direct_m64(
+        self,
+        mdQaccum: cute.Tensor,
+        mdQ: cute.Tensor,
+        mCuSeqlensQ: Optional[cute.Tensor],
+        mSeqUsedQ: Optional[cute.Tensor],
+        scale: cutlass.Float32,
+        tile_sched_params: ParamsBase,
+        TileScheduler: cutlass.Constexpr[Callable],
+    ):
+        """Convert one flattened M64 dQ accumulator tile directly to GMEM."""
+        tidx, _, _ = cute.arch.thread_idx()
+        work_tile = TileScheduler.create(tile_sched_params).initial_work_tile_info()
+        m_block, head_idx, batch_idx, _ = work_tile.tile_idx
+        if work_tile.is_valid_tile:
+            seqlen = SeqlenInfoQK.create(
+                batch_idx,
+                mdQ.shape[1],
+                0,
+                mCuSeqlensQ=mCuSeqlensQ,
+                mCuSeqlensK=None,
+                mSeqUsedQ=mSeqUsedQ,
+                mSeqUsedK=None,
+                tile_m=self.tile_m,
+            )
+            if const_expr(not seqlen.has_cu_seqlens_q):
+                mdQ_cur = mdQ[batch_idx, None, head_idx, None]
+                mdQaccum_cur = mdQaccum[batch_idx, head_idx, None]
+                head_dim = mdQ.shape[3]
+            else:
+                mdQ_cur = cute.domain_offset((seqlen.offset_q, 0), mdQ[None, head_idx, None])
+                mdQaccum_cur = cute.domain_offset(
+                    (seqlen.padded_offset_q * self.tile_hdim,),
+                    mdQaccum[head_idx, None],
+                )
+                head_dim = mdQ.shape[2]
+
+            gdQaccum = cute.local_tile(mdQaccum_cur, (self.tile_m * self.tile_hdim,), (m_block,))
+            gdQ = cute.local_tile(mdQ_cur, (self.tile_m, self.tile_hdim), (m_block, 0))
+            remaining_q = seqlen.seqlen_q - m_block * self.tile_m
+            for linear_idx in cutlass.range(
+                tidx,
+                self.tile_m * self.tile_hdim,
+                self.num_threads,
+                unroll=1,
+            ):
+                row = linear_idx // self.tile_hdim
+                col = linear_idx % self.tile_hdim
+                if row < remaining_q and col < head_dim:
+                    gdQ[row, col] = self.dtype(gdQaccum[linear_idx] * scale)
 
     @cute.kernel
     def kernel(
