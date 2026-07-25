@@ -1,3 +1,4 @@
+import inspect
 from dataclasses import FrozenInstanceError, fields, replace
 
 import pytest
@@ -13,6 +14,7 @@ from flash_attn.cute.config import (
     select_fwd_config,
     validate_fwd_config,
 )
+from flash_attn.cute.interface import _flash_attn_fwd
 
 
 def make_inputs(**changes) -> FwdHeuristicInputs:
@@ -51,6 +53,13 @@ def make_inputs(**changes) -> FwdHeuristicInputs:
     }
     values.update(changes)
     return FwdHeuristicInputs(**values)
+
+
+def test_forward_config_is_optional_and_keyword_only():
+    parameter = inspect.signature(_flash_attn_fwd).parameters["config"]
+
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameter.default is None
 
 
 def test_selector_inputs_and_config_are_frozen_and_hashable():

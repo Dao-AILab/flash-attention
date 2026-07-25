@@ -141,6 +141,8 @@ class FlashAttentionForwardSm100:
         is_varlen_q: bool = False,
         use_2cta_instrs: bool = False,
         use_clc_scheduler: bool = False,
+        *,
+        use_tma_o: bool,
     ):
         self.use_tma_KV = not paged_kv_non_tma
         # self.dtype = dtype
@@ -186,11 +188,7 @@ class FlashAttentionForwardSm100:
         self.qhead_per_kvhead = qhead_per_kvhead
         self.is_split_kv = is_split_kv
         self.pack_gqa = pack_gqa
-        self.use_tma_O = (
-            not (self.pack_gqa and self.m_block_size % self.qhead_per_kvhead != 0)
-            and not (self.pack_gqa and self.is_split_kv)
-            and not is_varlen_q
-        )
+        self.use_tma_O = use_tma_o
         self.use_correction_warps_for_epi = not self.use_tma_O
         self.q_subtile_factor = q_subtile_factor
         self.kv_subtile_factor = kv_subtile_factor
