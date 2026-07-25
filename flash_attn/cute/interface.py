@@ -451,6 +451,12 @@ def _flash_attn_fwd(
         num_heads=num_head,
         num_heads_kv=num_head_kv,
         batch_size=batch_size,
+        total_q=total_q,
+        total_k=(
+            seqlen_k
+            if cu_seqlens_k is not None or page_table is not None
+            else batch_size * seqlen_k
+        ),
         max_seqlen_q=total_q if torch.is_tensor(max_seqlen_q) else max_seqlen_q,
         max_seqlen_k=seqlen_k if torch.is_tensor(max_seqlen_k) else max_seqlen_k,
         causal=causal,
@@ -462,6 +468,9 @@ def _flash_attn_fwd(
             for item in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
         ),
         is_varlen_q=cu_seqlens_q is not None or seqused_q is not None,
+        has_cu_seqlens_q=cu_seqlens_q is not None,
+        has_cu_seqlens_k=cu_seqlens_k is not None,
+        has_seqused=seqused_q is not None or seqused_k is not None,
         pack_gqa=pack_gqa,
         page_size=page_size,
         use_block_sparsity=use_block_sparsity,

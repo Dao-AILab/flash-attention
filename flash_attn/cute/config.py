@@ -52,6 +52,8 @@ class FwdHeuristicInputs:
     num_heads: int
     num_heads_kv: int
     batch_size: int
+    total_q: int
+    total_k: int
     max_seqlen_q: int
     max_seqlen_k: int
     causal: bool
@@ -60,6 +62,9 @@ class FwdHeuristicInputs:
     window_size_right: int | None
     is_varlen: bool
     is_varlen_q: bool
+    has_cu_seqlens_q: bool
+    has_cu_seqlens_k: bool
+    has_seqused: bool
     pack_gqa: bool
     page_size: int | None
     use_block_sparsity: bool

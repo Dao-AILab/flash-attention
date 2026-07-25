@@ -1,0 +1,91 @@
+dtype_name: bfloat16
+seed: 0
+workers: 16
+rounds: 5
+iters_per_round: 31
+warmup_iters: 10
+clock_warmup_iters: 20
+use_cuda_graphs: true
+bucket_filter: ""
+list_buckets: false
+
+q_stage_hdim192: &varlen_mha_sweep
+  enabled: true
+  discovery_token_pairs:
+    - [512, 512]
+    - [2048, 2048]
+    - [8192, 8192]
+    - [32768, 32768]
+    - [4096, 16384]
+    - [16384, 4096]
+  holdout_token_pairs:
+    - [3072, 6144]
+    - [12288, 6144]
+    - [24576, 24576]
+  discovery_batches: [4, 16]
+  holdout_batches: [8, 24]
+  discovery_patterns: [uniform, longtail, spiky]
+  holdout_patterns: [bimodal, staircase]
+  q_heads: [8, 16]
+  head_dims: [[192, 128]]
+
+clc_varlen_mha:
+  <<: *varlen_mha_sweep
+  head_dims: [64, 96, 128]
+
+nonpersistent_hdim64:
+  enabled: true
+  discovery_seqlen_pairs:
+    - [128, 128]
+    - [256, 256]
+    - [1024, 1024]
+    - [4096, 4096]
+    - [16384, 16384]
+    - [32, 8192]
+    - [128, 8192]
+    - [2048, 8192]
+    - [8192, 2048]
+  holdout_seqlen_pairs:
+    - [384, 640]
+    - [1536, 3072]
+    - [6144, 12288]
+    - [12288, 6144]
+  discovery_batches: [1, 4, 16, 32]
+  holdout_batches: [2, 8, 24]
+  head_pairs: [[16, 16], [16, 4], [16, 1]]
+
+direct_epilogue_hdim64:
+  enabled: true
+  discovery_seqlen_pairs:
+    - [4096, 4096]
+    - [8192, 8192]
+    - [16384, 16384]
+    - [32768, 32768]
+    - [4096, 16384]
+    - [16384, 4096]
+  holdout_seqlen_pairs:
+    - [6144, 12288]
+    - [12288, 6144]
+    - [24576, 24576]
+  discovery_batches: [1, 2, 4]
+  holdout_batches: [1, 3]
+  q_heads: [8, 16]
+
+one_cta_hdim128:
+  enabled: true
+  discovery_seqlen_pairs:
+    - [512, 512]
+    - [2048, 2048]
+    - [8192, 8192]
+    - [16384, 16384]
+    - [32768, 32768]
+    - [4096, 16384]
+    - [16384, 4096]
+  holdout_seqlen_pairs:
+    - [768, 1536]
+    - [6144, 12288]
+    - [12288, 6144]
+    - [24576, 24576]
+  discovery_batches: [1, 2, 4]
+  holdout_batches: [1, 3]
+  q_heads: [8, 16]
