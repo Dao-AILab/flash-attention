@@ -2000,6 +2000,7 @@ class FlashAttentionBackwardSm100:
                     for i in range(4)
                 )
 
+                load_dOt = None
                 if const_expr(tma_atom_dOt is not None):
                     gdOt = cute.local_tile(
                         mdOt_cur, cute.select(self.mma_tiler_vdo, mode=[1, 2]), (None, 0)
@@ -2031,6 +2032,7 @@ class FlashAttentionBackwardSm100:
                 load_dO = copy_utils.tma_producer_copy_fn(load_dO, pipeline_dO)
 
                 # (4) dK += dS.T @ Q (2-CTA: needs separate Qt load)
+                load_Qt = None
                 if const_expr(tma_atom_Qt is not None):
                     gQt = cute.local_tile(
                         mQt_cur, cute.select(self.mma_tiler_dsq, mode=[1, 2]), (0, None)
@@ -2047,6 +2049,7 @@ class FlashAttentionBackwardSm100:
                     load_Qt = copy_utils.tma_producer_copy_fn(load_Qt, pipeline_Qt)
 
                 # (5) dQ = dS @ K
+                load_Kt = None
                 if const_expr(self.use_2cta_instrs):
                     gKts = tuple(
                         cute.local_tile(
