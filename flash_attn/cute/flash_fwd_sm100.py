@@ -80,6 +80,22 @@ from flash_attn.cute.utils import AuxData
 #   num_regs_correction: int — register count for correction warps (multiple of 8)
 #   num_regs_other is derived: 512 - num_regs_softmax * 2 - num_regs_correction
 #                  (hd256 exception: num_regs_other is fixed at 32, not derived)
+
+# Note [Low Precision Scaling]
+# P is in (0, 1] and is cast to the input dtype before P @ V, so scaling it by 2^max_offset
+# spends the dtype's unused upper code points on the probability tail. A positive
+# rescale_threshold lets the row max lag by that many log2 units, so P can reach
+# 2^(max_offset + rescale_threshold); above the dtype max the top probabilities saturate
+# while the FP32 denominator still counts them in full, shrinking the output (#2716).
+
+# log2 of the largest finite value representable in each supported input dtype.
+_LOG2_DTYPE_MAX = {
+    cutlass.Float8E4M3FN: math.log2(448.0),
+    cutlass.Float8E5M2: math.log2(57344.0),
+    cutlass.Float16: math.log2(65504.0),
+    cutlass.BFloat16: math.log2(3.3895313892515355e38),
+}
+
 _TUNING_CONFIG = {
     (True, False, 128, False): {"ex2_emu_freq": 10, "ex2_emu_start_frg": 1, "num_regs_softmax": 176, "num_regs_correction": 88},
     (False, True, 128, False): {"ex2_emu_freq": 16, "ex2_emu_start_frg": 1, "num_regs_softmax": 192, "num_regs_correction": 72},
@@ -2027,16 +2043,8 @@ class FlashAttentionForwardSm100:
 
             qk_descale, _ = self._load_effective_descales(descale_tensors, batch_idx, kv_head_idx)
 
-            # P is scaled by 2^max_offset before the FP8 conversion. With rescale_threshold > 0
-            # the row max can be stale by up to rescale_threshold (in log2 units), so P can reach
-            # 2^(max_offset + rescale_threshold). max_offset + rescale_threshold must stay within
-            # log2(fp8_max) (448 = 2^8.8 for e4m3fn, 57344 = 2^15.8 for e5m2), otherwise the
-            # largest probabilities saturate and accuracy degrades (#2716).
-            max_offset = (
-                4 if cutlass.const_expr(self.q_dtype is cutlass.Float8E4M3FN) else
-                8 if cutlass.const_expr(self.q_dtype.width == 8) else
-                0
-            )
+            # See Note [Low Precision Scaling]
+            max_offset = 8 if cutlass.const_expr(self.q_dtype.width == 8) else 0
             if const_expr(self.score_mod is None):
                 softmax_scale_log2_eff = softmax_scale_log2 * qk_descale
                 softmax_scale_eff = None
@@ -2044,10 +2052,11 @@ class FlashAttentionForwardSm100:
                 softmax_scale_log2_eff = softmax_scale_log2
                 softmax_scale_eff = softmax_scale * qk_descale
 
-            rescale_threshold = (
-                8.0 if const_expr(self.q_dtype.width == 16) else
-                4.0 if const_expr(self.q_dtype.width == 8) else
-                0.0
+            rescale_threshold = 8.0 if const_expr(self.q_dtype.width == 16) else 0.0
+            # See Note [Low Precision Scaling]
+            assert max_offset + rescale_threshold < _LOG2_DTYPE_MAX[self.q_dtype], (
+                f"max_offset ({max_offset}) + rescale_threshold ({rescale_threshold}) must stay "
+                f"below log2(max {self.q_dtype} value) to avoid saturating P"
             )
             softmax = SoftmaxSm100.create(
                 softmax_scale_log2_eff,
@@ -2468,17 +2477,10 @@ class FlashAttentionForwardSm100:
             else:
                 softmax_scale_log2_eff = softmax_scale_log2
 
-            # Must match the softmax warp's max_offset (see comment there; #2716);
-            # max_offset_scale = 2^max_offset.
-            max_offset = (
-                Float32(4.0) if cutlass.const_expr(self.q_dtype is cutlass.Float8E4M3FN) else
-                Float32(8.0) if cutlass.const_expr(self.q_dtype.width == 8) else
-                Float32(0.0)
-            )
+            # Must match the softmax warp's max_offset; max_offset_scale = 2^max_offset.
+            max_offset = Float32(8.0) if cutlass.const_expr(self.q_dtype.width == 8) else Float32(0.0)
             max_offset_scale = (
-                Float32(16.0) if cutlass.const_expr(self.q_dtype is cutlass.Float8E4M3FN) else
-                Float32(256.0) if cutlass.const_expr(self.q_dtype.width == 8) else
-                Float32(1.0)
+                Float32(256.0) if cutlass.const_expr(self.q_dtype.width == 8) else Float32(1.0)
             )
             seqlen = SeqlenInfoCls(batch_idx)
             n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block, split_idx, num_splits)
