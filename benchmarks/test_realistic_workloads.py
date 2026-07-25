@@ -1,6 +1,7 @@
 from collections import Counter
 from pathlib import Path
 
+from flex_flash_block_sparse import generate_flex_block_sparse_cases
 from fwd_heuristics_bench import aggregate_bucket_results
 from realistic_workloads import (
     estimate_case_bytes,
@@ -152,6 +153,22 @@ def test_bucket_aggregation_excludes_configs_missing_from_any_case():
     assert summary["winner_config"] == common
     assert summary["production_to_winner_speedup"] == 200.0 / 180.0
     assert summary["excluded_incomplete_configs"] == [incomplete]
+
+
+def test_flex_flash_block_sparse_cases_are_model_held_out():
+    cases = generate_flex_block_sparse_cases(CONFIG)
+    discovery = [case for case in cases if case.phase == "discovery"]
+    holdout = [case for case in cases if case.phase == "holdout"]
+
+    assert len(discovery) == 32
+    assert len(holdout) == 6
+    assert {case.mask_name for case in cases} == {
+        "block_diagonal_128",
+        "causal_window_128",
+    }
+    assert {case.profile for case in holdout}.isdisjoint(
+        {case.profile for case in discovery}
+    )
 
 
 def test_model_family_holdouts_are_absent_from_discovery():
