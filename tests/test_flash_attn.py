@@ -14,7 +14,7 @@ from flash_attn import (
     flash_attn_with_kvcache,
 )
 from flash_attn.bert_padding import pad_input, unpad_input
-from flash_attn.flash_attn_interface import _get_block_size_n
+from flash_attn.flash_attn_interface import _get_block_size_n, USE_TRITON_ROCM
 from flash_attn.layers.rotary import apply_rotary_emb
 
 MAX_HEADDIM_SM8x = 192
@@ -2644,3 +2644,45 @@ def test_flash_attn_kvcache_paged_block_table_bounds(append_knew, paged_kv_block
     )
     assert out.shape == (batch_size, 1, nheads, d)
     assert not out.isnan().any()
+
+
+@pytest.mark.skipif(USE_TRITON_ROCM, reason="compat-slot assert is only in the CUDA extension")
+def test_flash_attn_generator_arg_must_be_none():
+    """The optional RNG `generator` slot is retained only for backwards-compat arg
+    positioning on all four raw C++ entry points (fwd/varlen_fwd/bwd/varlen_bwd):
+    the arg is still accepted but must be None; a non-None value trips a targeted
+    TORCH_CHECK."""
+    from flash_attn.flash_attn_interface import flash_attn_gpu
+
+    device = "cuda"
+    dtype = torch.bfloat16
+    match = r"generator` argument is no longer supported"
+
+    # Dims are irrelevant: the TORCH_CHECK fires first
+    batch, seqlen, nheads, nheads_k, head_dim = 1, 1, 2, 1, 8
+    q = torch.randn(batch, seqlen, nheads, head_dim, device=device, dtype=dtype)
+    k = torch.randn(batch, seqlen, nheads_k, head_dim, device=device, dtype=dtype)
+    v = torch.randn(batch, seqlen, nheads_k, head_dim, device=device, dtype=dtype)
+    scale = head_dim ** -0.5
+    lse = torch.randn(batch, nheads, seqlen, device=device, dtype=torch.float32)
+    bad = torch.empty(1, device=device)  # any non-None value for the generator slot
+
+    with pytest.raises(RuntimeError, match=match):
+        flash_attn_gpu.fwd(q, k, v, None, None, 0.0, scale, True, -1, -1, 0.0, False, bad)
+    with pytest.raises(RuntimeError, match=match):
+        flash_attn_gpu.bwd(q, q, k, v, q, lse, None, None, None, None,
+                           0.0, scale, True, -1, -1, 0.0, False, bad, None)
+
+    # For varlen
+    total_q = batch * seqlen
+    qf = q.view(total_q, nheads, head_dim)  # contiguous -> free reshape
+    kf = k.view(total_q, nheads_k, head_dim)
+    vf = v.view(total_q, nheads_k, head_dim)
+    cu = torch.arange(0, total_q + 1, seqlen, dtype=torch.int32, device=device)
+
+    with pytest.raises(RuntimeError, match=match):
+        flash_attn_gpu.varlen_fwd(qf, kf, vf, None, cu, cu, None, None, None, None,
+                                  seqlen, seqlen, 0.0, scale, False, True, -1, -1, 0.0, False, bad, 0)
+    with pytest.raises(RuntimeError, match=match):
+        flash_attn_gpu.varlen_bwd(qf, qf, kf, vf, qf, lse, None, None, None, cu, cu, None,
+                                  seqlen, seqlen, 0.0, scale, False, True, -1, -1, 0.0, False, bad, None)
