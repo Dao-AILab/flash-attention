@@ -86,9 +86,9 @@ def test_dense_sm100_default_and_candidates_share_named_bucket():
     assert bucket.default == select_fwd_config(inputs)
     assert bucket.default in bucket.candidates
     assert len(bucket.candidates) == len(set(bucket.candidates))
-    assert bucket.name == (
+    assert bucket.name.startswith(
         "sm100.bfloat16.dense.noncausal.mha.d64.standard.tile128x128.q2.nosplit."
-        "1cta.persistent.tma-o"
+        "1cta.persistent.tma-o.candidates-"
     )
     assert replace(bucket.default, q_stage=1) in bucket.candidates
     assert replace(bucket.default, is_persistent=False) in bucket.candidates
@@ -109,6 +109,30 @@ def test_same_named_region_has_stable_default_and_candidates():
     assert first_bucket.name == second_bucket.name
     assert first_bucket.default == second_bucket.default
     assert first_bucket.candidates == second_bucket.candidates
+
+
+def test_bucket_identity_includes_candidate_set():
+    short = make_inputs(
+        device_arch=103,
+        causal=True,
+        num_heads=32,
+        num_heads_kv=8,
+        pack_gqa=True,
+        batch_size=32,
+        total_q=32,
+        total_k=32 * 640,
+        max_seqlen_q=1,
+        max_seqlen_k=640,
+        requested_num_splits=None,
+        requested_use_clc_scheduler=False,
+    )
+    long = replace(short, total_k=32 * 2048, max_seqlen_k=2048)
+    short_bucket = get_fwd_config_bucket(short)
+    long_bucket = get_fwd_config_bucket(long)
+
+    assert short_bucket.default == long_bucket.default
+    assert short_bucket.candidates != long_bucket.candidates
+    assert short_bucket.name != long_bucket.name
 
 
 def test_default_selector_does_not_construct_tuning_candidates():
@@ -308,6 +332,28 @@ def test_auto_split_resolves_from_exact_shape_metadata():
 
     assert select_fwd_config(inputs).num_splits == 128
     assert select_fwd_config(changed_shape).num_splits == 64
+
+
+def test_auto_split_bucket_contains_bounded_exact_counts():
+    inputs = make_inputs(
+        num_sms=152,
+        num_heads=1,
+        num_heads_kv=1,
+        batch_size=1,
+        total_q=1,
+        total_k=2048,
+        max_seqlen_q=1,
+        max_seqlen_k=2048,
+        requested_num_splits=None,
+    )
+
+    assert {config.num_splits for config in get_fwd_config_bucket(inputs).candidates} == {
+        1,
+        2,
+        4,
+        8,
+        16,
+    }
 
 
 def test_auto_split_normalizes_nonsplit_to_one():

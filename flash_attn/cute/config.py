@@ -15,6 +15,7 @@ independently buckets concrete split counts. Selection must not read tensor
 contents, synchronize CUDA, or allocate outputs.
 """
 
+import hashlib
 import math
 from dataclasses import dataclass, replace
 from functools import lru_cache
@@ -609,6 +610,16 @@ def is_2cta_eligible(
     )
 
 
+def split_candidate_counts(inputs: FwdHeuristicInputs, tile_n: int) -> tuple[int, ...]:
+    """Return bounded exact SplitKV counts for an automatic split request."""
+    if inputs.requested_num_splits is not None:
+        return ()
+    num_n_blocks = math.ceil(inputs.max_seqlen_k / tile_n)
+    if num_n_blocks <= 4:
+        return ()
+    return tuple(count for count in (1, 2, 4, 8, 16, 32, 64) if count <= num_n_blocks)
+
+
 def candidate_fwd_configs(
     inputs: FwdHeuristicInputs,
     default: FwdConfig,
@@ -622,6 +633,14 @@ def candidate_fwd_configs(
         return (default,)
 
     candidates = [default]
+    for count in split_candidate_counts(inputs, default.tile_n):
+        try:
+            candidate = default_fwd_config(replace(inputs, requested_num_splits=count))
+        except ValueError:
+            continue
+        if candidate not in candidates:
+            candidates.append(candidate)
+
     alternatives = (
         {"q_stage": 1 if default.q_stage == 2 else 2},
         {
@@ -706,10 +725,12 @@ def fwd_bucket_name(inputs: FwdHeuristicInputs, default: FwdConfig) -> str:
 def get_fwd_config_bucket(inputs: FwdHeuristicInputs) -> FwdConfigBucket:
     """Return the cached named default and candidates for one immutable input."""
     default = default_fwd_config(inputs)
+    candidates = candidate_fwd_configs(inputs, default)
+    candidate_set_id = hashlib.sha256(repr(candidates).encode()).hexdigest()[:8]
     return FwdConfigBucket(
-        name=fwd_bucket_name(inputs, default),
+        name=f"{fwd_bucket_name(inputs, default)}.candidates-{candidate_set_id}",
         default=default,
-        candidates=candidate_fwd_configs(inputs, default),
+        candidates=candidates,
     )
 
 

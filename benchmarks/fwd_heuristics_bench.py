@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
 
 if TYPE_CHECKING:
     from flash_attn.cute.config import FwdConfig, FwdHeuristicInputs
@@ -47,6 +48,7 @@ from clc_bench import (
     pattern_weights,
     varlen_case_name,
 )
+from realistic_workloads import generate_realistic_workloads
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 RESULTS_ROOT = REPO_ROOT / "benchmarks" / "results" / "fwd_heuristics"
@@ -57,6 +59,7 @@ ExperimentName = Literal[
     "nonpersistent_hdim64",
     "direct_epilogue_hdim64",
     "one_cta_hdim128",
+    "realistic",
 ]
 DTypeName = Literal["bfloat16", "float16"]
 
@@ -156,7 +159,7 @@ class DenseArchitectureSweep:
 @dataclass(frozen=True)
 class BenchCase:
     experiment: ExperimentName
-    phase: Literal["discovery", "holdout"]
+    phase: Literal["discovery", "boundary", "holdout"]
     case: Case
 
 
@@ -470,6 +473,7 @@ def generate_cases(
     experiment_filter: str,
     case_filter: str,
     phase_filter: str,
+    extra_cases: Sequence[BenchCase] = (),
 ) -> list[BenchCase]:
     """Generate and filter all configured experiments."""
     cases = [
@@ -480,6 +484,7 @@ def generate_cases(
             "direct_epilogue_hdim64", direct_epilogue_hdim64, 64
         ),
         *generate_dense_architecture_cases("one_cta_hdim128", one_cta_hdim128, 128),
+        *extra_cases,
     ]
     if experiment_filter:
         cases = [
@@ -511,9 +516,24 @@ def fwd_heuristic_inputs(case: Case, dtype_name: DTypeName) -> FwdHeuristicInput
         batch_size = case.batch or 0
         max_seqlen_q = case.seqlen_q or 0
         max_seqlen_k = case.seqlen_k or 0
+    total_k = (
+        batch_size * math.ceil(max_seqlen_k / case.page_size) * case.page_size
+        if case.page_size is not None
+        else sum(case.seqlens_k or case.seqlens_q or [])
+        if is_varlen
+        else batch_size * max_seqlen_k
+    )
     props = torch.cuda.get_device_properties(torch.cuda.current_device())
     config_module, interface_module, utils_module = flash_attn_modules()
     device_arch = interface_module._get_device_arch()
+    causal, local, window_size_left, window_size_right = (
+        interface_module._resolve_causal_local_window(
+            case.causal,
+            None,
+            None,
+            case.mask_mod_name or None,
+        )
+    )
     return config_module.FwdHeuristicInputs(
         device_capacity=device_arch // 10,
         device_arch=device_arch,
@@ -525,34 +545,30 @@ def fwd_heuristic_inputs(case: Case, dtype_name: DTypeName) -> FwdHeuristicInput
         num_heads_kv=case.kv_heads,
         batch_size=batch_size,
         total_q=(sum(case.seqlens_q or []) if is_varlen else batch_size * max_seqlen_q),
-        total_k=(
-            sum(case.seqlens_k or case.seqlens_q or [])
-            if is_varlen
-            else batch_size * max_seqlen_k
-        ),
+        total_k=total_k,
         max_seqlen_q=max_seqlen_q,
         max_seqlen_k=max_seqlen_k,
-        causal=case.causal,
-        local=False,
-        window_size_left=None,
-        window_size_right=None,
+        causal=causal,
+        local=local,
+        window_size_left=window_size_left,
+        window_size_right=window_size_right,
         is_varlen=is_varlen,
         is_varlen_q=is_varlen,
         has_cu_seqlens_q=is_varlen,
-        has_cu_seqlens_k=is_varlen,
-        has_seqused=False,
+        has_cu_seqlens_k=is_varlen and case.page_size is None,
+        has_seqused=case.page_size is not None,
         pack_gqa=case.q_heads != case.kv_heads,
-        page_size=None,
+        page_size=case.page_size,
         use_block_sparsity=False,
         sparse_q_block_size=None,
-        has_qv=False,
-        has_gather_kv=False,
+        has_qv=case.has_qv,
+        has_gather_kv=case.gather_kv_length is not None,
         requested_tile_m=None,
         requested_tile_n=None,
         requested_num_threads=384,
         requested_mma_pv_is_rs=None,
         requested_intra_wg_overlap=None,
-        requested_num_splits=1,
+        requested_num_splits=None if case.num_splits < 1 else case.num_splits,
         requested_use_clc_scheduler=utils_module._get_use_clc_scheduler_default(),
         disable_2cta=utils_module._get_disable_2cta_default(is_fwd=True),
     )
@@ -616,6 +632,12 @@ def compile_signature(
         case.d,
         case.dv,
         case.causal,
+        case.has_qv,
+        case.page_size,
+        case.score_mod_name,
+        case.mask_mod_name,
+        case.has_learnable_sink,
+        case.gather_kv_length,
         main_config,
         combine_bucket,
     )
@@ -642,8 +664,9 @@ def compile_variant(
     os.environ["FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED"] = "1"
     torch.manual_seed(seed)
     _, interface_module, _ = flash_attn_modules()
-    _, kwargs = build_inputs(bench_case.case, dtype_name, fake_tensor=True)
-    interface_module._flash_attn_fwd(**kwargs, config=variant.config)
+    with FakeTensorMode():
+        _, kwargs = build_inputs(bench_case.case, dtype_name, fake_tensor=False)
+        interface_module._flash_attn_fwd(**kwargs, config=variant.config)
     return {
         "experiment": bench_case.experiment,
         "case": bench_case.case.name,
@@ -721,6 +744,35 @@ def run_compile(
     return rows
 
 
+def split_workspace_kwargs(
+    case: Case, shared_kwargs: dict, config: FwdConfig
+) -> dict[str, torch.Tensor]:
+    """Preallocate reusable SplitKV partial output and LSE workspaces."""
+    if config.num_splits == 1:
+        return {}
+    q = shared_kwargs["q"]
+    output_shape = (*q.shape[:-1], case.dv)
+    lse_shape = (
+        (case.batch, case.q_heads, case.seqlen_q)
+        if case.mode == "dense"
+        else (case.q_heads, q.shape[0])
+    )
+    return {
+        "out_partial": torch.empty(
+            config.num_splits,
+            *output_shape,
+            dtype=torch.float32,
+            device="cuda",
+        ),
+        "lse_partial": torch.empty(
+            config.num_splits,
+            *lse_shape,
+            dtype=torch.float32,
+            device="cuda",
+        ),
+    }
+
+
 def make_variant_callables(
     bench_case: BenchCase,
     dtype_name: DTypeName,
@@ -740,7 +792,11 @@ def make_variant_callables(
             device="cuda",
             dtype=getattr(torch, dtype_name),
         )
-        kwargs = {**shared_kwargs, "out": output}
+        kwargs = {
+            **shared_kwargs,
+            "out": output,
+            **split_workspace_kwargs(bench_case.case, shared_kwargs, variant.config),
+        }
 
         def invoke(kwargs=kwargs, config=variant.config):
             return interface_module._flash_attn_fwd(**kwargs, config=config)[0]
@@ -779,10 +835,6 @@ def benchmark_case(
     if rounds < 1:
         raise ValueError(f"rounds must be positive, got {rounds}")
     variants = variants_for_case(bench_case, dtype_name)
-    if any(variant.config.num_splits > 1 for variant in variants):
-        raise NotImplementedError(
-            "Timed SplitKV tuning requires reusable preallocated partial workspaces"
-        )
     _, callables, _ = make_variant_callables(bench_case, dtype_name, seed, variants)
     warm_clocks = make_clock_warmup(dtype_name, clock_warmup_iters)
     samples = {variant.name: [] for variant in variants}
@@ -837,13 +889,96 @@ def benchmark_case(
     }
 
 
+def manual_attention_reference(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    qv: torch.Tensor | None,
+    *,
+    causal: bool,
+    scale: float,
+    score_mod_name: str = "",
+    mask_mod_name: str = "",
+    learnable_sink: torch.Tensor | None = None,
+    gather_kv_indices: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Compute attention with campaign modifiers, QV scores, and sink logits."""
+    if q.shape[1] != k.shape[1]:
+        repeat = q.shape[1] // k.shape[1]
+        k = k.repeat_interleave(repeat, dim=1)
+        v = v.repeat_interleave(repeat, dim=1)
+    scores = q @ k.transpose(-1, -2)
+    if qv is not None:
+        scores += qv @ v.transpose(-1, -2)
+    scores *= scale
+    if score_mod_name == "times_two":
+        scores *= 2
+    elif score_mod_name:
+        raise ValueError(f"Unsupported score modifier reference: {score_mod_name}")
+    if causal:
+        q_positions = torch.arange(q.shape[-2], device=q.device)[:, None]
+        k_positions = torch.arange(k.shape[-2], device=q.device)[None, :]
+        scores.masked_fill_(
+            k_positions > q_positions + k.shape[-2] - q.shape[-2], -torch.inf
+        )
+    if mask_mod_name == "causal_window_128":
+        q_positions = torch.arange(q.shape[-2], device=q.device)[:, None]
+        k_positions = torch.arange(k.shape[-2], device=q.device)[None, :]
+        centers = q_positions + k.shape[-2] - q.shape[-2]
+        scores.masked_fill_(
+            (k_positions > centers) | (k_positions < centers - 128), -torch.inf
+        )
+    elif mask_mod_name:
+        raise ValueError(f"Unsupported mask modifier reference: {mask_mod_name}")
+    if gather_kv_indices is not None:
+        if gather_kv_indices.dim() == 2:
+            gather_kv_indices = gather_kv_indices.unsqueeze(0)
+        gather_mask = torch.zeros(
+            gather_kv_indices.shape[0],
+            gather_kv_indices.shape[1],
+            k.shape[-2],
+            dtype=torch.bool,
+            device=q.device,
+        ).scatter_(-1, gather_kv_indices.long(), True)
+        scores.masked_fill_(~gather_mask[:, None], -torch.inf)
+    if learnable_sink is None:
+        probabilities = torch.softmax(scores, dim=-1)
+        return torch.nan_to_num(probabilities, nan=0.0) @ v
+    sink = learnable_sink.float().view(1, -1, 1, 1)
+    normalizer_max = torch.maximum(scores.amax(dim=-1, keepdim=True), sink)
+    weights = torch.exp(scores - normalizer_max)
+    denominator = weights.sum(dim=-1, keepdim=True) + torch.exp(sink - normalizer_max)
+    return (weights / denominator) @ v
+
+
 def reference_output(case: Case, kwargs: dict) -> torch.Tensor:
     """Compute an independent float32 SDPA reference for dense or varlen inputs."""
-    scale = 1.0 / math.sqrt(case.d)
+    scale = 1.0 / math.sqrt(case.d + case.dv if case.has_qv else case.d)
     if case.mode == "dense":
         q = kwargs["q"].float().transpose(1, 2)
         k = kwargs["k"].float().transpose(1, 2)
         v = kwargs["v"].float().transpose(1, 2)
+        if (
+            case.has_qv
+            or (case.causal and q.shape[-2] != k.shape[-2])
+            or case.score_mod_name
+            or case.mask_mod_name
+            or case.has_learnable_sink
+            or case.gather_kv_length is not None
+        ):
+            qv = kwargs["qv"].float().transpose(1, 2) if case.has_qv else None
+            return manual_attention_reference(
+                q,
+                k,
+                v,
+                qv,
+                causal=case.causal,
+                scale=scale,
+                score_mod_name=case.score_mod_name,
+                mask_mod_name=case.mask_mod_name,
+                learnable_sink=kwargs.get("learnable_sink"),
+                gather_kv_indices=kwargs.get("gather_kv_indices"),
+            ).transpose(1, 2)
         return torch.nn.functional.scaled_dot_product_attention(
             q,
             k,
@@ -855,27 +990,60 @@ def reference_output(case: Case, kwargs: dict) -> torch.Tensor:
     outputs = []
     q_start = 0
     k_start = 0
-    for q_length, k_length in zip(case.seqlens_q or [], case.seqlens_k or []):
+    for batch_index, (q_length, k_length) in enumerate(
+        zip(case.seqlens_q or [], case.seqlens_k or [])
+    ):
         q = (
             kwargs["q"][q_start : q_start + q_length]
             .float()
             .transpose(0, 1)
             .unsqueeze(0)
         )
-        k = (
-            kwargs["k"][k_start : k_start + k_length]
-            .float()
-            .transpose(0, 1)
-            .unsqueeze(0)
-        )
-        v = (
-            kwargs["v"][k_start : k_start + k_length]
-            .float()
-            .transpose(0, 1)
-            .unsqueeze(0)
-        )
-        outputs.append(
-            torch.nn.functional.scaled_dot_product_attention(
+        if case.page_size is None:
+            k_slice = kwargs["k"][k_start : k_start + k_length]
+            v_slice = kwargs["v"][k_start : k_start + k_length]
+        else:
+            max_pages = kwargs["page_table"].shape[1]
+            page_start = batch_index * max_pages
+            page_end = page_start + max_pages
+            k_slice = kwargs["k"][page_start:page_end].flatten(0, 1)[:k_length]
+            v_slice = kwargs["v"][page_start:page_end].flatten(0, 1)[:k_length]
+        k = k_slice.float().transpose(0, 1).unsqueeze(0)
+        v = v_slice.float().transpose(0, 1).unsqueeze(0)
+        if (
+            case.has_qv
+            or (case.causal and q_length != k_length)
+            or case.score_mod_name
+            or case.mask_mod_name
+            or case.has_learnable_sink
+            or case.gather_kv_length is not None
+        ):
+            qv = (
+                kwargs["qv"][q_start : q_start + q_length]
+                .float()
+                .transpose(0, 1)
+                .unsqueeze(0)
+                if case.has_qv
+                else None
+            )
+            output = manual_attention_reference(
+                q,
+                k,
+                v,
+                qv,
+                causal=case.causal,
+                scale=scale,
+                score_mod_name=case.score_mod_name,
+                mask_mod_name=case.mask_mod_name,
+                learnable_sink=kwargs.get("learnable_sink"),
+                gather_kv_indices=(
+                    kwargs["gather_kv_indices"][q_start : q_start + q_length]
+                    if case.gather_kv_length is not None
+                    else None
+                ),
+            )
+        else:
+            output = torch.nn.functional.scaled_dot_product_attention(
                 q,
                 k,
                 v,
@@ -883,9 +1051,7 @@ def reference_output(case: Case, kwargs: dict) -> torch.Tensor:
                 scale=scale,
                 enable_gqa=case.q_heads != case.kv_heads,
             )
-            .squeeze(0)
-            .transpose(0, 1)
-        )
+        outputs.append(output.squeeze(0).transpose(0, 1))
         q_start += q_length
         k_start += k_length
     return torch.cat(outputs)
@@ -974,6 +1140,140 @@ def correctness_cases() -> list[BenchCase]:
                 batch=2,
                 seqlen_q=384,
                 seqlen_k=512,
+            ),
+        ),
+        BenchCase(
+            "realistic",
+            "holdout",
+            Case(
+                name="correctness_score_mod",
+                mode="dense",
+                q_heads=8,
+                kv_heads=2,
+                d=64,
+                dv=64,
+                causal=True,
+                batch=2,
+                seqlen_q=65,
+                seqlen_k=97,
+                score_mod_name="times_two",
+                scenario="correctness",
+            ),
+        ),
+        BenchCase(
+            "realistic",
+            "holdout",
+            Case(
+                name="correctness_mask_mod",
+                mode="dense",
+                q_heads=8,
+                kv_heads=2,
+                d=64,
+                dv=64,
+                causal=False,
+                batch=2,
+                seqlen_q=65,
+                seqlen_k=193,
+                mask_mod_name="causal_window_128",
+                scenario="correctness",
+            ),
+        ),
+        BenchCase(
+            "realistic",
+            "holdout",
+            Case(
+                name="correctness_learnable_sink",
+                mode="dense",
+                q_heads=8,
+                kv_heads=2,
+                d=64,
+                dv=64,
+                causal=True,
+                batch=2,
+                seqlen_q=65,
+                seqlen_k=97,
+                has_learnable_sink=True,
+                scenario="correctness",
+            ),
+        ),
+        BenchCase(
+            "realistic",
+            "holdout",
+            Case(
+                name="correctness_paged_gqa",
+                mode="varlen",
+                q_heads=8,
+                kv_heads=2,
+                d=128,
+                dv=128,
+                causal=True,
+                batch=2,
+                seqlens_q=[3, 5],
+                seqlens_k=[131, 97],
+                pattern="manual",
+                page_size=128,
+                scenario="correctness",
+            ),
+        ),
+        BenchCase(
+            "realistic",
+            "holdout",
+            Case(
+                name="correctness_mla_gather",
+                mode="dense",
+                q_heads=128,
+                kv_heads=1,
+                d=64,
+                dv=512,
+                causal=True,
+                batch=2,
+                seqlen_q=3,
+                seqlen_k=256,
+                has_qv=True,
+                gather_kv_length=128,
+                profile="deepseek_v3_absorbed_decode",
+                scenario="correctness",
+            ),
+        ),
+        BenchCase(
+            "realistic",
+            "holdout",
+            Case(
+                name="correctness_mla_paged",
+                mode="varlen",
+                q_heads=128,
+                kv_heads=1,
+                d=64,
+                dv=512,
+                causal=True,
+                batch=2,
+                seqlens_q=[1, 1],
+                seqlens_k=[131, 97],
+                pattern="manual",
+                has_qv=True,
+                page_size=64,
+                profile="deepseek_v3_absorbed_decode",
+                scenario="correctness",
+            ),
+        ),
+        BenchCase(
+            "realistic",
+            "holdout",
+            Case(
+                name="correctness_mla_absorbed",
+                mode="varlen",
+                q_heads=128,
+                kv_heads=1,
+                d=64,
+                dv=512,
+                causal=True,
+                batch=3,
+                seqlens_q=[1, 1, 1],
+                seqlens_k=[17, 31, 43],
+                pattern="manual",
+                has_qv=True,
+                profile="deepseek_v3_absorbed_decode",
+                scenario="correctness",
             ),
         ),
     ]
@@ -1088,30 +1388,44 @@ def environment_metadata(
 
 
 def aggregate_bucket_results(rows: list[dict]) -> list[dict]:
-    """Aggregate all measured configs by production bucket and phase."""
+    """Compare only configs measured for every case in each bucket and phase."""
     groups = {}
     for row in rows:
         groups.setdefault((row["bucket_name"], row["phase"]), []).append(row)
 
     summaries = []
     for (bucket_name, phase), group in groups.items():
-        totals = {}
-        names = {}
-        wins = {}
-        production_keys = set()
-        for row in group:
-            production_key = json.dumps(row["production_config"], sort_keys=True)
-            production_keys.add(production_key)
-            winning_key = json.dumps(row["winner_config"], sort_keys=True)
-            wins[winning_key] = wins.get(winning_key, 0) + 1
-            for result in row["config_results"]:
-                config_key = json.dumps(result["config"], sort_keys=True)
-                totals[config_key] = totals.get(config_key, 0.0) + result["median_us"]
-                names.setdefault(config_key, set()).add(result["name"])
+        result_maps = [
+            {
+                json.dumps(result["config"], sort_keys=True): result
+                for result in row["config_results"]
+            }
+            for row in group
+        ]
+        common_keys = set(result_maps[0]).intersection(
+            *(set(row) for row in result_maps[1:])
+        )
+        all_keys = set().union(*(set(row) for row in result_maps))
+        production_keys = {
+            json.dumps(row["production_config"], sort_keys=True) for row in group
+        }
         if len(production_keys) != 1:
             raise RuntimeError(f"Bucket {bucket_name} has multiple production defaults")
         production_key = next(iter(production_keys))
-        winner_key = min(totals, key=totals.__getitem__)
+        if production_key not in common_keys:
+            raise RuntimeError(
+                f"Bucket {bucket_name} does not measure its default in every case"
+            )
+
+        totals = {key: 0.0 for key in common_keys}
+        names = {key: set() for key in common_keys}
+        wins = {key: 0 for key in common_keys}
+        for result_map in result_maps:
+            for key in common_keys:
+                totals[key] += result_map[key]["median_us"]
+                names[key].add(result_map[key]["name"])
+            wins[min(common_keys, key=lambda key: result_map[key]["median_us"])] += 1
+        winner_key = min(common_keys, key=totals.__getitem__)
         summaries.append(
             {
                 "bucket_name": bucket_name,
@@ -1123,12 +1437,15 @@ def aggregate_bucket_results(rows: list[dict]) -> list[dict]:
                 "winner_total_us": totals[winner_key],
                 "production_to_winner_speedup": totals[production_key]
                 / totals[winner_key],
+                "excluded_incomplete_configs": [
+                    json.loads(key) for key in sorted(all_keys - common_keys)
+                ],
                 "config_results": [
                     {
                         "config": json.loads(config_key),
                         "names": sorted(names[config_key]),
                         "total_us": total,
-                        "case_wins": wins.get(config_key, 0),
+                        "case_wins": wins[config_key],
                     }
                     for config_key, total in sorted(
                         totals.items(), key=lambda item: item[1]
@@ -1137,6 +1454,32 @@ def aggregate_bucket_results(rows: list[dict]) -> list[dict]:
             }
         )
     return summaries
+
+
+def write_results_checkpoint(
+    path: Path,
+    metadata: dict,
+    realistic_skipped: Sequence[str],
+    correctness: list[dict],
+    rows: list[dict],
+    failures: list[dict],
+    total_cases: int,
+) -> list[dict]:
+    """Atomically preserve raw samples and progress during long campaigns."""
+    bucket_summaries = aggregate_bucket_results(rows)
+    payload = {
+        "metadata": metadata,
+        "progress": {"completed": len(rows), "total": total_cases},
+        "realistic_skipped": list(realistic_skipped),
+        "correctness": correctness,
+        "failures": failures,
+        "bucket_summaries": bucket_summaries,
+        "results": rows,
+    }
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(payload, indent=2))
+    temporary.replace(path)
+    return bucket_summaries
 
 
 def main(
@@ -1154,6 +1497,7 @@ def main(
     phase_filter: str = "",
     bucket_filter: str = "",
     list_buckets: bool = False,
+    realistic_workloads: Path | None = None,
     q_stage_hdim192: VarlenPolicySweep = DEFAULT_Q_STAGE_SWEEP,
     clc_varlen_mha: VarlenPolicySweep = DEFAULT_CLC_SWEEP,
     nonpersistent_hdim64: DensePolicySweep = DEFAULT_NONPERSISTENT_SWEEP,
@@ -1189,6 +1533,20 @@ def main(
         return
 
     os.environ["FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED"] = "1"
+    realistic = (
+        generate_realistic_workloads(
+            realistic_workloads,
+            dtype_name,
+            torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory,
+        )
+        if realistic_workloads is not None
+        else None
+    )
+    extra_cases = (
+        [BenchCase("realistic", item.phase, item.case) for item in realistic.cases]
+        if realistic is not None
+        else []
+    )
     cases = generate_cases(
         q_stage_hdim192,
         clc_varlen_mha,
@@ -1198,6 +1556,7 @@ def main(
         experiment_filter,
         case_filter,
         phase_filter,
+        extra_cases,
     )
     bucket_names = {
         variants_for_case(bench_case, dtype_name)[0].bucket_name for bench_case in cases
@@ -1235,17 +1594,43 @@ def main(
     )
 
     rows = []
+    failures = []
+    results_path = run_dir / "results.json"
+    skipped = realistic.skipped if realistic is not None else ()
+    write_results_checkpoint(
+        results_path, metadata, skipped, correctness, rows, failures, len(cases)
+    )
     for index, bench_case in enumerate(cases, start=1):
-        row = benchmark_case(
-            bench_case,
-            dtype_name,
-            rounds,
-            iters_per_round,
-            warmup_iters,
-            clock_warmup_iters,
-            use_cuda_graphs,
-            seed,
-        )
+        try:
+            row = benchmark_case(
+                bench_case,
+                dtype_name,
+                rounds,
+                iters_per_round,
+                warmup_iters,
+                clock_warmup_iters,
+                use_cuda_graphs,
+                seed,
+            )
+        except Exception as error:
+            failures.append(
+                {
+                    "case": bench_case.case.name,
+                    "phase": bench_case.phase,
+                    "error_type": type(error).__name__,
+                    "error": str(error),
+                }
+            )
+            write_results_checkpoint(
+                results_path,
+                metadata,
+                skipped,
+                correctness,
+                rows,
+                failures,
+                len(cases),
+            )
+            raise
         rows.append(row)
         print(
             f"[{index}/{len(cases)}] {row['experiment']} {row['phase']} {row['name']}: "
@@ -1253,15 +1638,19 @@ def main(
             f"winner={row['winner_median_us']:.3f}us "
             f"({row['production_to_winner_speedup']:.3f}x)"
         )
+        if index % 10 == 0 or index == len(cases):
+            write_results_checkpoint(
+                results_path,
+                metadata,
+                skipped,
+                correctness,
+                rows,
+                failures,
+                len(cases),
+            )
+        torch.cuda.empty_cache()
 
     bucket_summaries = aggregate_bucket_results(rows)
-    payload = {
-        "metadata": metadata,
-        "correctness": correctness,
-        "bucket_summaries": bucket_summaries,
-        "results": rows,
-    }
-    (run_dir / "results.json").write_text(json.dumps(payload, indent=2))
     for summary in bucket_summaries:
         print(
             f"bucket {summary['bucket_name']} {summary['phase']}: "

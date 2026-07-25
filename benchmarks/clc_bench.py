@@ -99,6 +99,15 @@ class Case:
     pattern: str = ""
     mask_name: str = ""
     window_size: int | None = None
+    num_splits: int = 1
+    has_qv: bool = False
+    page_size: int | None = None
+    score_mod_name: str = ""
+    mask_mod_name: str = ""
+    has_learnable_sink: bool = False
+    gather_kv_length: int | None = None
+    profile: str = ""
+    scenario: str = ""
 
 
 def utc_timestamp() -> str:
@@ -392,6 +401,49 @@ def block_sparse_imports():
     return compute_block_sparsity, get_mask_pair
 
 
+def modifier_imports():
+    """Load the campaign's fixed score and mask modifiers lazily."""
+    from fwd_modifiers import MASK_MODS, SCORE_MODS
+
+    return SCORE_MODS, MASK_MODS
+
+
+def add_optional_features(torch_mod, case: Case, factory, kwargs: dict) -> None:
+    """Attach score, mask, sink, and gather inputs to one invocation."""
+    if not (
+        case.score_mod_name
+        or case.mask_mod_name
+        or case.has_learnable_sink
+        or case.gather_kv_length is not None
+    ):
+        return
+    score_mods, mask_mods = (
+        modifier_imports() if case.score_mod_name or case.mask_mod_name else ({}, {})
+    )
+    if case.score_mod_name:
+        kwargs["score_mod"] = score_mods[case.score_mod_name]
+    if case.mask_mod_name:
+        kwargs["mask_mod"] = mask_mods[case.mask_mod_name]
+    if case.has_learnable_sink:
+        kwargs["learnable_sink"] = factory(
+            case.q_heads, device="cuda", dtype=torch_mod.bfloat16
+        )
+    if case.gather_kv_length is not None:
+        if case.mode == "dense":
+            shape = (case.batch, case.seqlen_q, case.gather_kv_length)
+            seqlen_k = case.seqlen_k or 0
+        else:
+            shape = (sum(case.seqlens_q or []), case.gather_kv_length)
+            seqlen_k = max(case.seqlens_k or [])
+        indices = (
+            torch_mod.arange(
+                case.gather_kv_length, device="cuda", dtype=torch_mod.int32
+            )
+            % seqlen_k
+        )
+        kwargs["gather_kv_indices"] = indices.expand(*shape).contiguous()
+
+
 def build_cu_seqlens(torch_mod, lengths: list[int]) -> torch_mod.Tensor:
     cu_seqlens = torch_mod.zeros(len(lengths) + 1, device="cuda", dtype=torch_mod.int32)
     cu_seqlens[1:] = torch_mod.tensor(lengths, device="cuda", dtype=torch_mod.int32).cumsum(0)
@@ -402,27 +454,65 @@ def build_dense_inputs(torch_mod, flash_attn_func, case: Case, dtype, factory):
     q = factory(case.batch, case.seqlen_q, case.q_heads, case.d, device="cuda", dtype=dtype)
     k = factory(case.batch, case.seqlen_k, case.kv_heads, case.d, device="cuda", dtype=dtype)
     v = factory(case.batch, case.seqlen_k, case.kv_heads, case.dv, device="cuda", dtype=dtype)
-    return flash_attn_func, dict(q=q, k=k, v=v, causal=case.causal)
+    kwargs = dict(q=q, k=k, v=v, causal=case.causal, num_splits=case.num_splits)
+    if case.has_qv:
+        kwargs["qv"] = factory(
+            case.batch, case.seqlen_q, case.q_heads, case.dv, device="cuda", dtype=dtype
+        )
+    add_optional_features(torch_mod, case, factory, kwargs)
+    return flash_attn_func, kwargs
 
 
 def build_varlen_inputs(torch_mod, flash_attn_varlen_func, case: Case, dtype, factory):
     lengths_q = case.seqlens_q or []
     lengths_k = case.seqlens_k or lengths_q
     total_q = sum(lengths_q)
-    total_k = sum(lengths_k)
     q = factory(total_q, case.q_heads, case.d, device="cuda", dtype=dtype)
-    k = factory(total_k, case.kv_heads, case.d, device="cuda", dtype=dtype)
-    v = factory(total_k, case.kv_heads, case.dv, device="cuda", dtype=dtype)
-    return flash_attn_varlen_func, dict(
+    kwargs = dict(
         q=q,
-        k=k,
-        v=v,
         cu_seqlens_q=build_cu_seqlens(torch_mod, lengths_q),
-        cu_seqlens_k=build_cu_seqlens(torch_mod, lengths_k),
         max_seqlen_q=max(lengths_q),
         max_seqlen_k=max(lengths_k),
         causal=case.causal,
+        num_splits=case.num_splits,
     )
+    if case.page_size is None:
+        total_k = sum(lengths_k)
+        kwargs.update(
+            k=factory(total_k, case.kv_heads, case.d, device="cuda", dtype=dtype),
+            v=factory(total_k, case.kv_heads, case.dv, device="cuda", dtype=dtype),
+            cu_seqlens_k=build_cu_seqlens(torch_mod, lengths_k),
+        )
+    else:
+        max_pages_per_sequence = math.ceil(max(lengths_k) / case.page_size)
+        total_pages = len(lengths_k) * max_pages_per_sequence
+        kwargs.update(
+            k=factory(
+                total_pages,
+                case.page_size,
+                case.kv_heads,
+                case.d,
+                device="cuda",
+                dtype=dtype,
+            ),
+            v=factory(
+                total_pages,
+                case.page_size,
+                case.kv_heads,
+                case.dv,
+                device="cuda",
+                dtype=dtype,
+            ),
+            cu_seqlens_k=None,
+            seqused_k=torch_mod.tensor(lengths_k, device="cuda", dtype=torch_mod.int32),
+            page_table=torch_mod.arange(
+                total_pages, device="cuda", dtype=torch_mod.int32
+            ).reshape(len(lengths_k), max_pages_per_sequence),
+        )
+    if case.has_qv:
+        kwargs["qv"] = factory(total_q, case.q_heads, case.dv, device="cuda", dtype=dtype)
+    add_optional_features(torch_mod, case, factory, kwargs)
+    return flash_attn_varlen_func, kwargs
 
 
 def build_block_sparse_compile_tensors(torch_mod, case: Case):
@@ -580,11 +670,21 @@ def case_shape(case: Case) -> str:
 
 
 def case_metadata(case: Case) -> dict:
+    lengths_q = case.seqlens_q or [case.seqlen_q or 0] * (case.batch or 0)
+    lengths_k = case.seqlens_k or [case.seqlen_k or 0] * (case.batch or 0)
     return {
         "name": case.name,
         "mode": case.mode,
         "shape": case_shape(case),
         "batch": case.batch,
+        "seqlen_q": case.seqlen_q,
+        "seqlen_k": case.seqlen_k,
+        "seqlens_q": case.seqlens_q,
+        "seqlens_k": case.seqlens_k,
+        "total_q": sum(lengths_q),
+        "total_k": sum(lengths_k),
+        "max_seqlen_q": max(lengths_q, default=0),
+        "max_seqlen_k": max(lengths_k, default=0),
         "q_heads": case.q_heads,
         "kv_heads": case.kv_heads,
         "d": case.d,
@@ -593,6 +693,15 @@ def case_metadata(case: Case) -> dict:
         "pattern": case.pattern,
         "mask_name": case.mask_name,
         "window_size": case.window_size,
+        "num_splits": case.num_splits,
+        "has_qv": case.has_qv,
+        "page_size": case.page_size,
+        "score_mod_name": case.score_mod_name,
+        "mask_mod_name": case.mask_mod_name,
+        "has_learnable_sink": case.has_learnable_sink,
+        "gather_kv_length": case.gather_kv_length,
+        "profile": case.profile,
+        "scenario": case.scenario,
     }
 
 

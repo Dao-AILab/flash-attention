@@ -1,0 +1,346 @@
+version: 1
+baseline:
+  commit: 057a866f
+  gpu: NVIDIA GB300
+  architecture: sm103
+  sms: 152
+  primary_dtype: bfloat16
+
+# Values below come from the linked public model config unless marked derived.
+model_profiles:
+  - id: qwen2_5_7b
+    source: https://huggingface.co/Qwen/Qwen2.5-7B-Instruct/blob/main/config.json
+    setup: decoder
+    dtype: bfloat16
+    q_heads: 28
+    kv_heads: 4
+    d: 128  # hidden_size 3584 / 28 heads
+    dv: 128
+    max_context: 32768
+    attention: causal_gqa
+
+  - id: qwen3_8b
+    source: https://huggingface.co/Qwen/Qwen3-8B/blob/main/config.json
+    setup: decoder
+    dtype: bfloat16
+    q_heads: 32
+    kv_heads: 8
+    d: 128
+    dv: 128
+    max_context: 40960
+    attention: causal_gqa
+
+  - id: mistral_7b_v03
+    source: https://huggingface.co/mistralai/Mistral-7B-v0.3/blob/main/config.json
+    setup: decoder
+    dtype: bfloat16
+    q_heads: 32
+    kv_heads: 8
+    d: 128  # hidden_size 4096 / 32 heads
+    dv: 128
+    max_context: 32768
+    attention: causal_gqa
+
+  - id: phi3_mini_128k
+    source: https://huggingface.co/microsoft/Phi-3-mini-128k-instruct/blob/main/config.json
+    setup: long_context_decoder
+    dtype: bfloat16
+    q_heads: 32
+    kv_heads: 32
+    d: 96  # hidden_size 3072 / 32 heads
+    dv: 96
+    max_context: 131072
+    attention: causal_mha
+
+  - id: gpt_oss_20b
+    source: https://huggingface.co/openai/gpt-oss-20b/blob/main/config.json
+    setup: alternating_full_and_sliding_decoder
+    dtype: bfloat16
+    q_heads: 64
+    kv_heads: 8
+    d: 64
+    dv: 64
+    max_context: 131072
+    sliding_window: 128
+    attention: causal_gqa
+
+  - id: deepseek_v3_unabsorbed
+    source: https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/main/config.json
+    setup: mla_training_or_unabsorbed
+    dtype: bfloat16
+    q_heads: 128
+    kv_heads: 128
+    d: 192  # qk_nope_head_dim 128 + qk_rope_head_dim 64
+    dv: 128  # v_head_dim
+    max_context: 163840
+    attention: causal_diff_head
+
+  - id: deepseek_v3_absorbed_decode
+    source: https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/main/config.json
+    setup: mla_absorbed_decode
+    dtype: bfloat16
+    q_heads: 128
+    kv_heads: 1
+    d: 64  # rotary key/query component
+    dv: 512  # absorbed latent/value rank; uses qv
+    has_qv: true
+    max_context: 163840
+    attention: causal_mqa
+
+  - id: opt_2_7b
+    source: https://huggingface.co/facebook/opt-2.7b/blob/main/config.json
+    setup: decoder
+    dtype: float16
+    q_heads: 32
+    kv_heads: 32
+    d: 80  # hidden_size 2560 / 32 heads
+    dv: 80
+    max_context: 2048
+    attention: causal_mha
+
+  - id: falcon_7b
+    source: https://huggingface.co/tiiuae/falcon-7b/blob/main/config.json
+    setup: multi_query_decoder
+    dtype: bfloat16
+    q_heads: 71
+    kv_heads: 1  # multi_query=true
+    d: 64  # hidden_size 4544 / 71 heads
+    dv: 64
+    max_context: null
+    attention: causal_mqa
+
+  - id: smollm2_1_7b
+    source: https://huggingface.co/HuggingFaceTB/SmolLM2-1.7B-Instruct/blob/main/config.json
+    setup: small_decoder
+    dtype: bfloat16
+    q_heads: 32
+    kv_heads: 32
+    d: 64
+    dv: 64
+    max_context: 8192
+    attention: causal_mha
+
+  - id: bert_base
+    source: https://huggingface.co/google-bert/bert-base-uncased/blob/main/config.json
+    setup: encoder
+    dtype: bfloat16
+    q_heads: 12
+    kv_heads: 12
+    d: 64
+    dv: 64
+    max_context: 512
+    attention: noncausal_mha
+
+  - id: t5_base
+    source: https://huggingface.co/google-t5/t5-base/blob/main/config.json
+    setup: encoder_decoder
+    dtype: bfloat16
+    q_heads: 12
+    kv_heads: 12
+    d: 64  # d_kv
+    dv: 64
+    max_context: 512
+    attention: encoder_self_decoder_self_cross
+
+  - id: vit_base_patch16_224
+    source: https://huggingface.co/google/vit-base-patch16-224/blob/main/config.json
+    setup: vision_encoder
+    dtype: bfloat16
+    q_heads: 12
+    kv_heads: 12
+    d: 64
+    dv: 64
+    fixed_sequence: 197  # 1 + (224 / 16)^2
+    attention: noncausal_mha
+
+  - id: qwen2_5_vl_vision
+    source: https://huggingface.co/Qwen/Qwen2.5-VL-7B-Instruct/blob/main/config.json
+    setup: vision_encoder
+    dtype: bfloat16
+    q_heads: 16
+    kv_heads: 16
+    d: 80  # vision hidden_size 1280 / 16 heads
+    dv: 80
+    window_size: 112
+    attention: noncausal_windowed_mha
+
+  - id: pixart_sigma
+    source: https://huggingface.co/PixArt-alpha/PixArt-Sigma-XL-2-1024-MS/blob/main/transformer/config.json
+    setup: diffusion_transformer
+    dtype: bfloat16
+    q_heads: 16
+    kv_heads: 16
+    d: 72
+    dv: 72
+    latent_sequence: 4096  # (sample_size 128 / patch_size 2)^2
+    attention: noncausal_self_and_cross
+
+case_budgets:
+  discovery: 800
+  boundary: 300
+  holdout: 30
+  policy: Use deterministic stratified/pairwise coverage; never expand all axes as a full Cartesian product.
+
+scenario_templates:
+  discovery:
+    full_prefill_training:
+      profiles: [qwen3_8b, phi3_mini_128k, gpt_oss_20b, opt_2_7b, smollm2_1_7b]
+      contexts: [128, 512, 2048, 8192, 32768]
+      batches_by_context:
+        128: [1, 8, 32]
+        512: [1, 8, 16]
+        2048: [1, 4, 8]
+        8192: [1, 2, 4]
+        32768: [1, 2]
+      causal: true
+      respect_profile_max_context: true
+
+    chunked_prefill:
+      profiles: [qwen3_8b, gpt_oss_20b, phi3_mini_128k]
+      q_lengths: [128, 512, 1024, 4096]
+      k_lengths: [2048, 8192, 32768, 131072]
+      batches_by_k:
+        2048: [1, 8, 32]
+        8192: [1, 8]
+        32768: [1, 4]
+        131072: [1]
+      causal: true
+      respect_profile_max_context: true
+
+    decode:
+      profiles: [qwen3_8b, gpt_oss_20b, phi3_mini_128k, deepseek_v3_absorbed_decode]
+      q_lengths: [1, 16, 64, 128]
+      k_lengths: [1024, 8192, 32768, 131072]
+      batches_by_k:
+        1024: [1, 8, 32, 128]
+        8192: [1, 8, 32]
+        32768: [1, 8]
+        131072: [1, 2]
+      causal: true
+      include_splitkv: true
+      respect_profile_max_context: true
+
+    paged_decode:
+      profiles: [qwen3_8b, gpt_oss_20b, deepseek_v3_absorbed_decode]
+      q_lengths: [1, 16]
+      k_lengths: [8192, 32768]
+      batches_by_k:
+        8192: [8, 32]
+        32768: [1, 8]
+      page_sizes: [16, 64, 128]
+      causal: true
+
+    noncausal_and_cross:
+      cases:
+        - {profile: bert_base, q: 128, k: 128, batches: [8, 32]}
+        - {profile: bert_base, q: 512, k: 512, batches: [1, 8, 32]}
+        - {profile: vit_base_patch16_224, q: 197, k: 197, batches: [1, 32, 128]}
+        - {profile: t5_base, q: 512, k: 512, batches: [1, 8, 32]}
+        - {profile: t5_base, q: 128, k: 512, batches: [1, 8, 32]}
+        - {profile: t5_base, q: 300, k: 512, batches: [1, 8, 16]}
+        - {profile: pixart_sigma, q: 4096, k: 4096, batches: [1, 2, 4]}
+        - {profile: pixart_sigma, q: 4096, k: 300, batches: [1, 2, 4]}
+      causal: false
+
+    feature_strata:
+      - name: score_times_two
+        profiles: [qwen3_8b, gpt_oss_20b, phi3_mini_128k, smollm2_1_7b]
+        qk: [[128, 8192], [2048, 2048]]
+        batches: [1, 8, 32]
+        causal: true
+        score_mod_name: times_two
+      - name: causal_window_128
+        profiles: [qwen3_8b, gpt_oss_20b, phi3_mini_128k, smollm2_1_7b]
+        qk: [[128, 8192], [2048, 2048]]
+        batches: [1, 8, 32]
+        causal: false
+        mask_mod_name: causal_window_128
+      - name: learnable_sink
+        profiles: [qwen3_8b, gpt_oss_20b, phi3_mini_128k, smollm2_1_7b]
+        qk: [[128, 8192], [2048, 2048]]
+        batches: [1, 8, 32]
+        causal: true
+        has_learnable_sink: true
+
+    gather_kv:
+      profiles: [deepseek_v3_absorbed_decode]
+      q_lengths: [1, 16]
+      k_lengths: [4096, 32768]
+      batches: [1, 8]
+      gather_lengths: [128, 512, 2048]
+      causal: true
+
+    packed_varlen:
+      profiles: [qwen3_8b, gpt_oss_20b, phi3_mini_128k]
+      total_qk: [[4096, 4096], [16384, 4096], [16384, 16384], [32768, 65536], [65536, 32768]]
+      batches: [4, 16, 64]
+      patterns: [uniform, longtail, spiky]
+      causal_values: [false, true]
+
+    mla_and_diff_head:
+      profiles: [deepseek_v3_unabsorbed, deepseek_v3_absorbed_decode]
+      qk: [[1, 4096], [1, 32768], [128, 8192], [2048, 2048], [8192, 8192]]
+      batches: [1, 8, 32, 128]
+
+  flex_block_sparse:
+    discovery:
+      - {profile: qwen3_8b, qk: [[2048, 2048], [8192, 8192]], batches: [1, 8], masks: [block_diagonal_128, causal_window_128]}
+      - {profile: gpt_oss_20b, qk: [[2048, 2048], [8192, 8192]], batches: [1, 8], masks: [block_diagonal_128, causal_window_128]}
+      - {profile: phi3_mini_128k, qk: [[2048, 2048], [8192, 8192]], batches: [1, 8], masks: [block_diagonal_128, causal_window_128]}
+      - {profile: smollm2_1_7b, qk: [[2048, 2048], [8192, 8192]], batches: [1, 8], masks: [block_diagonal_128, causal_window_128]}
+    holdout:
+      - {profile: qwen2_5_7b, qk: [[3072, 3072]], batches: [3], masks: [block_diagonal_128, causal_window_128]}
+      - {profile: mistral_7b_v03, qk: [[6144, 6144]], batches: [2], masks: [block_diagonal_128, causal_window_128]}
+      - {profile: falcon_7b, qk: [[1536, 1536]], batches: [6], masks: [block_diagonal_128, causal_window_128]}
+
+  boundary:
+    # Non-powers-of-two probe selector transitions without duplicating discovery.
+    # Select at most 300 pairwise-covering cases, then focus around observed crossovers.
+    q_lengths: [1, 17, 96, 192, 384, 768, 1536, 3072, 6144, 12288, 24576, 49152]
+    k_lengths: [640, 1536, 2560, 3584, 4608, 7168, 12288, 24576, 49152, 98304]
+    batches: [2, 3, 6, 12, 24]
+    head_dim_regimes:
+      - [12, 12, 64, 64, false]
+      - [16, 16, 72, 72, false]
+      - [16, 16, 80, 80, false]
+      - [32, 32, 96, 96, false]
+      - [28, 4, 128, 128, false]
+      - [32, 8, 128, 128, false]
+      - [64, 8, 64, 64, false]
+      - [71, 1, 64, 64, false]
+      - [128, 128, 192, 128, false]
+      - [128, 1, 64, 512, true]
+
+  holdout:
+    # Exact families and odd grids are withheld from heuristic fitting.
+    - {name: qwen2_5_prefill, profile: qwen2_5_7b, mode: dense, causal: true, batch: 3, q: 6144, k: 6144}
+    - {name: qwen2_5_chunked, profile: qwen2_5_7b, mode: dense, causal: true, batch: 4, q: 1536, k: 24576}
+    - {name: qwen2_5_decode, profile: qwen2_5_7b, mode: dense, causal: true, batch: 8, q: 1, k: 32768}
+    - {name: mistral_prefill, profile: mistral_7b_v03, mode: dense, causal: true, batch: 3, q: 12288, k: 12288}
+    - {name: mistral_decode, profile: mistral_7b_v03, mode: dense, causal: true, batch: 16, q: 1, k: 8192}
+    - {name: falcon_mqa_prefill, profile: falcon_7b, mode: dense, causal: true, batch: 3, q: 2048, k: 2048}
+    - {name: falcon_mqa_decode, profile: falcon_7b, mode: dense, causal: true, batch: 32, q: 1, k: 8192}
+    - {name: t5_encoder, profile: t5_base, mode: dense, causal: false, batch: 24, q: 512, k: 512}
+    - {name: t5_cross, profile: t5_base, mode: dense, causal: false, batch: 16, q: 300, k: 512}
+    - {name: vit_224, profile: vit_base_patch16_224, mode: dense, causal: false, batch: 64, q: 197, k: 197}
+    - {name: qwen_vl_vision, profile: qwen2_5_vl_vision, mode: dense, causal: false, batch: 6, q: 1536, k: 1536}
+    - {name: pixart_self, profile: pixart_sigma, mode: dense, causal: false, batch: 2, q: 4096, k: 4096}
+    - {name: pixart_cross, profile: pixart_sigma, mode: dense, causal: false, batch: 2, q: 4096, k: 300}
+    - {name: deepseek_diff_head, profile: deepseek_v3_unabsorbed, mode: dense, causal: true, batch: 2, q: 6144, k: 12288}
+    - {name: deepseek_mla_decode, profile: deepseek_v3_absorbed_decode, mode: varlen, causal: true, batch: 64, q: 1, k: 32768}
+    - {name: qwen2_5_paged_decode, profile: qwen2_5_7b, mode: varlen, causal: true, batch: 6, q: 1, k: 24576, page_size: 64}
+    - {name: deepseek_mla_paged_decode, profile: deepseek_v3_absorbed_decode, mode: varlen, causal: true, batch: 12, q: 1, k: 24576, page_size: 128}
+    - {name: qwen2_5_score_mod, profile: qwen2_5_7b, mode: dense, causal: true, batch: 3, q: 192, k: 7168, score_mod_name: times_two}
+    - {name: mistral_score_mod, profile: mistral_7b_v03, mode: dense, causal: true, batch: 6, q: 768, k: 12288, score_mod_name: times_two}
+    - {name: qwen2_5_mask_mod, profile: qwen2_5_7b, mode: dense, causal: false, batch: 3, q: 192, k: 7168, mask_mod_name: causal_window_128}
+    - {name: falcon_mask_mod, profile: falcon_7b, mode: dense, causal: false, batch: 6, q: 768, k: 12288, mask_mod_name: causal_window_128}
+    - {name: mistral_learnable_sink, profile: mistral_7b_v03, mode: dense, causal: true, batch: 3, q: 192, k: 7168, has_learnable_sink: true}
+    - {name: falcon_learnable_sink, profile: falcon_7b, mode: dense, causal: true, batch: 6, q: 768, k: 12288, has_learnable_sink: true}
+    - {name: deepseek_gather_384, profile: deepseek_v3_absorbed_decode, mode: dense, causal: true, batch: 12, q: 1, k: 24576, gather_kv_length: 384}
+    - {name: deepseek_gather_1024, profile: deepseek_v3_absorbed_decode, mode: dense, causal: true, batch: 3, q: 17, k: 49152, gather_kv_length: 1024}
+
+exclusions:
+  - Drop combinations exceeding 80% of available GPU memory before allocation.
+  - Do not infer max context when the public config omits it; use only explicit scenario lengths.
+  - Keep FP16, FP8, paged KV, block sparse, score/mask modification, and learnable-sink results in separate aggregates.
+  - Do not use holdout model profiles or odd boundary lengths while fitting selector rules.

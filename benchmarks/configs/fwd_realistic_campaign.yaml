@@ -1,0 +1,26 @@
+out_dir: null
+dtype_name: bfloat16
+seed: 0
+workers: 16
+rounds: 5
+iters_per_round: 31
+warmup_iters: 10
+clock_warmup_iters: 20
+use_cuda_graphs: true
+experiment_filter: ""
+case_filter: ""
+phase_filter: ""
+bucket_filter: ""
+list_buckets: false
+realistic_workloads: benchmarks/configs/fwd_realistic_workloads.yaml
+
+q_stage_hdim192:
+  enabled: false
+clc_varlen_mha:
+  enabled: false
+nonpersistent_hdim64:
+  enabled: false
+direct_epilogue_hdim64:
+  enabled: false
+one_cta_hdim128:
+  enabled: false
