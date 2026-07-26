@@ -152,6 +152,11 @@ def _decision_value(v):
         return [_decision_value(x) for x in v]
     if isinstance(v, dict):
         return {str(k): _decision_value(x) for k, x in sorted(v.items())}
+    import dataclasses
+
+    if dataclasses.is_dataclass(v) and not isinstance(v, type):
+        return {type(v).__name__: {f.name: _decision_value(getattr(v, f.name))
+                                   for f in dataclasses.fields(v)}}
     return repr(v)
 
 
@@ -223,6 +228,12 @@ def _golden_ctx(arch: str):
             os.environ.pop(k, None)
         os.environ["FLASH_ATTENTION_ARCH"] = arch
         fa._get_device_arch.cache_clear()
+        try:  # kernel_compiler (Datasheet slice) caches the arch separately
+            from flash_attn.cute import kernel_compiler
+
+            kernel_compiler.get_device_arch.cache_clear()
+        except ImportError:
+            pass
         for name, fn in launchers:
             fn.compile_cache = recorders[name]
         fa.cute.compile = _stub_compile
