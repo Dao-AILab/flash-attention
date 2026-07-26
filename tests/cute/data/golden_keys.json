@@ -1,0 +1,3076 @@
+{
+ "cases": {
+  "bwd.sm100.bf16.dense.causal.d128": {
+   "arch": "sm_100",
+   "ctors": [
+    {
+     "args": {
+      "has_aux_tensors": "False",
+      "head_dim": "128",
+      "head_dim_v": "128",
+      "is_causal": "True",
+      "is_local": "False",
+      "is_persistent": "False",
+      "is_split_kv": "False",
+      "is_varlen_q": "False",
+      "kv_subtile_factor": "1",
+      "m_block_size": "128",
+      "mask_mod": "None",
+      "n_block_size": "128",
+      "pack_gqa": "False",
+      "paged_kv_non_tma": "False",
+      "q_stage": "2",
+      "q_subtile_factor": "1",
+      "qhead_per_kvhead": "1",
+      "score_mod": "None",
+      "use_2cta_instrs": "False",
+      "use_clc_scheduler": "False"
+     },
+     "cls": "FlashAttentionForwardSm100",
+     "declared_in": "FlashAttentionForwardSm100"
+    },
+    {
+     "args": {
+      "dtype": "<class 'cutlass.base_dsl.typing.BFloat16'>",
+      "head_dim": "128",
+      "head_dim_v": "128",
+      "nheads_kv": "1",
+      "nheads_major": "False",
+      "num_threads": "256",
+      "pack_gqa": "False",
+      "qhead_per_kvhead": "1",
+      "tile_m": "128",
+      "use_padded_offsets": "True"
+     },
+     "cls": "FlashAttentionBackwardPreprocess",
+     "declared_in": "FlashAttentionBackwardPreprocess"
+    },
+    {
+     "args": {
+      "cluster_size": "2",
+      "deterministic": "False",
+      "has_aux_tensors": "False",
+      "head_dim": "128",
+      "head_dim_v": "128",
+      "is_causal": "True",
+      "is_local": "False",
+      "is_persistent": "False",
+      "kv_subtile_factor": "1",
+      "mask_mod": "None",
+      "q_subtile_factor": "2",
+      "qhead_per_kvhead": "1",
+      "score_mod": "None",
+      "score_mod_bwd": "None",
+      "spt": "False",
+      "tile_m": "128",
+      "tile_n": "128",
+      "use_2cta_instrs": "True"
+     },
+     "cls": "FlashAttentionBackwardSm100",
+     "declared_in": "FlashAttentionBackwardSm100"
+    },
+    {
+     "args": {
+      "AtomLayoutMdQ": "1",
+      "arch": "100",
+      "cluster_size": "1",
+      "dQ_swapAB": "False",
+      "dtype": "<class 'cutlass.base_dsl.typing.BFloat16'>",
+      "head_dim": "128",
+      "num_threads": "128",
+      "tile_m": "128",
+      "use_2cta_instrs": "True"
+     },
+     "cls": "FlashAttentionBackwardPostprocess",
+     "declared_in": "FlashAttentionBackwardPostprocess"
+    }
+   ],
+   "error": null,
+   "keys": {
+    "bwd": [
+     {
+      "repr": "(100, <class 'cutlass.base_dsl.typing.BFloat16'>, 128, 128, 1, True, False, False, 128, 128, 384, False, 2, True, 2, 1, False, False, False, False, False, 0, None, None, False, None, True, True, True, True, (False, False, False, False), (False, False, False, False), (False, False, False, False), (False, False, False, False), False, False)",
+      "sha256": "87bacaefb051cb2c391f1a71800336beeffba059ce7a9fa2bcedc1be836d87ea"
+     }
+    ],
+    "bwd_post": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 128, 128, 128, 1, False, False, False, True, 1, 100)",
+      "sha256": "9ac31adeb16282eede6aca139434987a6ca66c767aadd6bdf6d54e7785b48df3"
+     }
+    ],
+    "bwd_pre": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 128, 128, 128, False, False, False, True, False, True, False, False, 1, 1)",
+      "sha256": "5678ffa9fb5b007b0353c8bbd8713cbf7c2e314949694881a96a620b2d96f747"
+     }
+    ],
+    "fwd": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 128, 128, 1, True, False, False, False, None, None, None, False, True, True, True, True, False, False, False, False, False, False, False, True, True, 128, 128, 2, 384, False, False, 100, False, False, 1, 1, True, True, False, True, False, False, False, None, None, None, 0)",
+      "sha256": "26b1165ac932f136282ddacaa32a11533056477cde7fe139416755b4dfd175a6"
+     }
+    ]
+   }
+  },
+  "bwd.sm100.bf16.dense.d64": {
+   "arch": "sm_100",
+   "ctors": [
+    {
+     "args": {
+      "has_aux_tensors": "False",
+      "head_dim": "64",
+      "head_dim_v": "64",
+      "is_causal": "False",
+      "is_local": "False",
+      "is_persistent": "True",
+      "is_split_kv": "False",
+      "is_varlen_q": "False",
+      "kv_subtile_factor": "1",
+      "m_block_size": "128",
+      "mask_mod": "None",
+      "n_block_size": "128",
+      "pack_gqa": "False",
+      "paged_kv_non_tma": "False",
+      "q_stage": "2",
+      "q_subtile_factor": "1",
+      "qhead_per_kvhead": "1",
+      "score_mod": "None",
+      "use_2cta_instrs": "False",
+      "use_clc_scheduler": "False"
+     },
+     "cls": "FlashAttentionForwardSm100",
+     "declared_in": "FlashAttentionForwardSm100"
+    },
+    {
+     "args": {
+      "dtype": "<class 'cutlass.base_dsl.typing.BFloat16'>",
+      "head_dim": "64",
+      "head_dim_v": "64",
+      "nheads_kv": "1",
+      "nheads_major": "False",
+      "num_threads": "256",
+      "pack_gqa": "False",
+      "qhead_per_kvhead": "1",
+      "tile_m": "128",
+      "use_padded_offsets": "True"
+     },
+     "cls": "FlashAttentionBackwardPreprocess",
+     "declared_in": "FlashAttentionBackwardPreprocess"
+    },
+    {
+     "args": {
+      "cluster_size": "1",
+      "deterministic": "False",
+      "has_aux_tensors": "False",
+      "head_dim": "64",
+      "head_dim_v": "64",
+      "is_causal": "False",
+      "is_local": "False",
+      "is_persistent": "False",
+      "kv_subtile_factor": "1",
+      "mask_mod": "None",
+      "q_subtile_factor": "2",
+      "qhead_per_kvhead": "1",
+      "score_mod": "None",
+      "score_mod_bwd": "None",
+      "spt": "False",
+      "tile_m": "128",
+      "tile_n": "128",
+      "use_2cta_instrs": "False"
+     },
+     "cls": "FlashAttentionBackwardSm100",
+     "declared_in": "FlashAttentionBackwardSm100"
+    },
+    {
+     "args": {
+      "AtomLayoutMdQ": "1",
+      "arch": "100",
+      "cluster_size": "1",
+      "dQ_swapAB": "False",
+      "dtype": "<class 'cutlass.base_dsl.typing.BFloat16'>",
+      "head_dim": "64",
+      "num_threads": "128",
+      "tile_m": "128",
+      "use_2cta_instrs": "False"
+     },
+     "cls": "FlashAttentionBackwardPostprocess",
+     "declared_in": "FlashAttentionBackwardPostprocess"
+    }
+   ],
+   "error": null,
+   "keys": {
+    "bwd": [
+     {
+      "repr": "(100, <class 'cutlass.base_dsl.typing.BFloat16'>, 64, 64, 1, False, False, False, 128, 128, 384, False, 1, False, 2, 1, False, False, False, False, False, 0, None, None, False, None, True, True, True, True, (False, False, False, False), (False, False, False, False), (False, False, False, False), (False, False, False, False), False, False)",
+      "sha256": "22716ab3ba637db9fcb9963c304c93727df5a921eb7231812b1edd0fecfddaf0"
+     }
+    ],
+    "bwd_post": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 64, 128, 128, 1, False, False, False, False, 1, 100)",
+      "sha256": "7f446a233dff47b43eca1d59375c61b133f2dc7def3bc2b0312a4f6991c2b27f"
+     }
+    ],
+    "bwd_pre": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 64, 64, 128, False, False, False, True, False, True, False, False, 1, 1)",
+      "sha256": "e3da23a83e4e4f1e9048b6779726a1031c2a1a602b36d540d854f9d5acedbcb0"
+     }
+    ],
+    "fwd": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 64, 64, 1, False, False, False, False, None, None, None, False, True, True, True, True, False, False, False, False, False, False, False, True, True, 128, 128, 2, 384, False, False, 100, False, False, 1, 1, True, True, False, True, False, False, False, None, None, None, 0)",
+      "sha256": "203354c585f4c44e978cbdd76d6ae1484c3efb2b81cd060c04e53f80025d31ff"
+     }
+    ]
+   }
+  },
+  "bwd.sm100.bf16.dense.deterministic.d128": {
+   "arch": "sm_100",
+   "ctors": [
+    {
+     "args": {
+      "has_aux_tensors": "False",
+      "head_dim": "128",
+      "head_dim_v": "128",
+      "is_causal": "False",
+      "is_local": "False",
+      "is_persistent": "True",
+      "is_split_kv": "False",
+      "is_varlen_q": "False",
+      "kv_subtile_factor": "1",
+      "m_block_size": "128",
+      "mask_mod": "None",
+      "n_block_size": "128",
+      "pack_gqa": "False",
+      "paged_kv_non_tma": "False",
+      "q_stage": "2",
+      "q_subtile_factor": "1",
+      "qhead_per_kvhead": "1",
+      "score_mod": "None",
+      "use_2cta_instrs": "True",
+      "use_clc_scheduler": "False"
+     },
+     "cls": "FlashAttentionForwardSm100",
+     "declared_in": "FlashAttentionForwardSm100"
+    },
+    {
+     "args": {
+      "dtype": "<class 'cutlass.base_dsl.typing.BFloat16'>",
+      "head_dim": "128",
+      "head_dim_v": "128",
+      "nheads_kv": "1",
+      "nheads_major": "False",
+      "num_threads": "256",
+      "pack_gqa": "False",
+      "qhead_per_kvhead": "1",
+      "tile_m": "128",
+      "use_padded_offsets": "True"
+     },
+     "cls": "FlashAttentionBackwardPreprocess",
+     "declared_in": "FlashAttentionBackwardPreprocess"
+    },
+    {
+     "args": {
+      "cluster_size": "2",
+      "deterministic": "True",
+      "has_aux_tensors": "False",
+      "head_dim": "128",
+      "head_dim_v": "128",
+      "is_causal": "False",
+      "is_local": "False",
+      "is_persistent": "False",
+      "kv_subtile_factor": "1",
+      "mask_mod": "None",
+      "q_subtile_factor": "2",
+      "qhead_per_kvhead": "1",
+      "score_mod": "None",
+      "score_mod_bwd": "None",
+      "spt": "False",
+      "tile_m": "128",
+      "tile_n": "128",
+      "use_2cta_instrs": "True"
+     },
+     "cls": "FlashAttentionBackwardSm100",
+     "declared_in": "FlashAttentionBackwardSm100"
+    },
+    {
+     "args": {
+      "AtomLayoutMdQ": "1",
+      "arch": "100",
+      "cluster_size": "1",
+      "dQ_swapAB": "False",
+      "dtype": "<class 'cutlass.base_dsl.typing.BFloat16'>",
+      "head_dim": "128",
+      "num_threads": "128",
+      "tile_m": "128",
+      "use_2cta_instrs": "True"
+     },
+     "cls": "FlashAttentionBackwardPostprocess",
+     "declared_in": "FlashAttentionBackwardPostprocess"
+    }
+   ],
+   "error": null,
+   "keys": {
+    "bwd": [
+     {
+      "repr": "(100, <class 'cutlass.base_dsl.typing.BFloat16'>, 128, 128, 1, False, False, False, 128, 128, 384, False, 2, True, 2, 1, True, False, False, False, False, 0, None, None, False, None, True, True, True, True, (False, False, False, False), (False, False, False, False), (False, False, False, False), (False, False, False, False), False, False)",
+      "sha256": "fd21352b5a2497cc73d92b0d8605060e24f45541952eac3c716b8d24b8dbc983"
+     }
+    ],
+    "bwd_post": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 128, 128, 128, 1, False, False, False, True, 1, 100)",
+      "sha256": "9ac31adeb16282eede6aca139434987a6ca66c767aadd6bdf6d54e7785b48df3"
+     }
+    ],
+    "bwd_pre": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 128, 128, 128, False, False, False, True, False, True, False, False, 1, 1)",
+      "sha256": "5678ffa9fb5b007b0353c8bbd8713cbf7c2e314949694881a96a620b2d96f747"
+     }
+    ],
+    "fwd": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 128, 128, 1, False, False, False, False, None, None, None, False, True, True, True, True, False, False, False, False, False, False, False, True, True, 128, 128, 2, 384, False, False, 100, False, True, 1, 1, True, True, False, True, False, False, False, None, None, None, 0)",
+      "sha256": "2aea66795c7e50075065481619d5546943f75b91824c29f811c64247549e0a25"
+     }
+    ]
+   }
+  },
+  "bwd.sm100.bf16.varlen.causal.d128": {
+   "arch": "sm_100",
+   "ctors": [
+    {
+     "args": {
+      "has_aux_tensors": "False",
+      "head_dim": "128",
+      "head_dim_v": "128",
+      "is_causal": "True",
+      "is_local": "False",
+      "is_persistent": "False",
+      "is_split_kv": "False",
+      "is_varlen_q": "True",
+      "kv_subtile_factor": "1",
+      "m_block_size": "128",
+      "mask_mod": "None",
+      "n_block_size": "128",
+      "pack_gqa": "False",
+      "paged_kv_non_tma": "False",
+      "q_stage": "2",
+      "q_subtile_factor": "1",
+      "qhead_per_kvhead": "1",
+      "score_mod": "None",
+      "use_2cta_instrs": "False",
+      "use_clc_scheduler": "False"
+     },
+     "cls": "FlashAttentionForwardSm100",
+     "declared_in": "FlashAttentionForwardSm100"
+    },
+    {
+     "args": {
+      "dtype": "<class 'cutlass.base_dsl.typing.BFloat16'>",
+      "head_dim": "128",
+      "head_dim_v": "128",
+      "nheads_kv": "1",
+      "nheads_major": "False",
+      "num_threads": "256",
+      "pack_gqa": "False",
+      "qhead_per_kvhead": "1",
+      "tile_m": "128",
+      "use_padded_offsets": "True"
+     },
+     "cls": "FlashAttentionBackwardPreprocess",
+     "declared_in": "FlashAttentionBackwardPreprocess"
+    },
+    {
+     "args": {
+      "cluster_size": "2",
+      "deterministic": "False",
+      "has_aux_tensors": "False",
+      "head_dim": "128",
+      "head_dim_v": "128",
+      "is_causal": "True",
+      "is_local": "False",
+      "is_persistent": "False",
+      "kv_subtile_factor": "1",
+      "mask_mod": "None",
+      "q_subtile_factor": "2",
+      "qhead_per_kvhead": "1",
+      "score_mod": "None",
+      "score_mod_bwd": "None",
+      "spt": "False",
+      "tile_m": "128",
+      "tile_n": "128",
+      "use_2cta_instrs": "True"
+     },
+     "cls": "FlashAttentionBackwardSm100",
+     "declared_in": "FlashAttentionBackwardSm100"
+    },
+    {
+     "args": {
+      "AtomLayoutMdQ": "1",
+      "arch": "100",
+      "cluster_size": "1",
+      "dQ_swapAB": "False",
+      "dtype": "<class 'cutlass.base_dsl.typing.BFloat16'>",
+      "head_dim": "128",
+      "num_threads": "128",
+      "tile_m": "128",
+      "use_2cta_instrs": "True"
+     },
+     "cls": "FlashAttentionBackwardPostprocess",
+     "declared_in": "FlashAttentionBackwardPostprocess"
+    }
+   ],
+   "error": null,
+   "keys": {
+    "bwd": [
+     {
+      "repr": "(100, <class 'cutlass.base_dsl.typing.BFloat16'>, 128, 128, 1, True, False, False, 128, 128, 384, False, 2, True, 2, 1, False, False, False, False, False, 0, None, None, False, None, False, False, True, True, (False, False, False), (False, False, False), (False, False, False), (False, False, False), False, False)",
+      "sha256": "0565801e49f73aac148fbe3749446bf3e82c706780be565f0210d41805d80346"
+     }
+    ],
+    "bwd_post": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 128, 128, 128, 1, False, True, False, True, 1, 100)",
+      "sha256": "80111cf51adb3abd646d1d252e23939cafe8e4ea1dbc19471e7a469ca80e1141"
+     }
+    ],
+    "bwd_pre": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 128, 128, 128, True, False, False, True, False, True, False, False, 1, 1)",
+      "sha256": "ba8f50b2089f4cea813c2c76518fd7988d9c5f9cc33c7005fc22222c169aaac8"
+     }
+    ],
+    "fwd": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 128, 128, 1, True, False, False, False, None, None, None, False, False, False, True, True, False, False, False, False, False, False, False, True, True, 128, 128, 2, 384, False, False, 100, False, False, 1, 1, True, True, False, True, False, False, False, None, None, None, 0)",
+      "sha256": "8c2f6d9650325eb974704737d54ccbde468052048ae181ed23c133554e32ef65"
+     }
+    ]
+   }
+  },
+  "bwd.sm103.bf16.dense.causal.d128": {
+   "arch": "sm_103",
+   "ctors": [
+    {
+     "args": {
+      "has_aux_tensors": "False",
+      "head_dim": "128",
+      "head_dim_v": "128",
+      "is_causal": "True",
+      "is_local": "False",
+      "is_persistent": "False",
+      "is_split_kv": "False",
+      "is_varlen_q": "False",
+      "kv_subtile_factor": "1",
+      "m_block_size": "128",
+      "mask_mod": "None",
+      "n_block_size": "128",
+      "pack_gqa": "False",
+      "paged_kv_non_tma": "False",
+      "q_stage": "2",
+      "q_subtile_factor": "1",
+      "qhead_per_kvhead": "1",
+      "score_mod": "None",
+      "use_2cta_instrs": "False",
+      "use_clc_scheduler": "False"
+     },
+     "cls": "FlashAttentionForwardSm100",
+     "declared_in": "FlashAttentionForwardSm100"
+    },
+    {
+     "args": {
+      "dtype": "<class 'cutlass.base_dsl.typing.BFloat16'>",
+      "head_dim": "128",
+      "head_dim_v": "128",
+      "nheads_kv": "1",
+      "nheads_major": "False",
+      "num_threads": "256",
+      "pack_gqa": "False",
+      "qhead_per_kvhead": "1",
+      "tile_m": "128",
+      "use_padded_offsets": "True"
+     },
+     "cls": "FlashAttentionBackwardPreprocess",
+     "declared_in": "FlashAttentionBackwardPreprocess"
+    },
+    {
+     "args": {
+      "cluster_size": "2",
+      "deterministic": "False",
+      "has_aux_tensors": "False",
+      "head_dim": "128",
+      "head_dim_v": "128",
+      "is_causal": "True",
+      "is_local": "False",
+      "is_persistent": "False",
+      "kv_subtile_factor": "1",
+      "mask_mod": "None",
+      "q_subtile_factor": "2",
+      "qhead_per_kvhead": "1",
+      "score_mod": "None",
+      "score_mod_bwd": "None",
+      "spt": "False",
+      "tile_m": "128",
+      "tile_n": "128",
+      "use_2cta_instrs": "True"
+     },
+     "cls": "FlashAttentionBackwardSm100",
+     "declared_in": "FlashAttentionBackwardSm100"
+    },
+    {
+     "args": {
+      "AtomLayoutMdQ": "1",
+      "arch": "103",
+      "cluster_size": "1",
+      "dQ_swapAB": "False",
+      "dtype": "<class 'cutlass.base_dsl.typing.BFloat16'>",
+      "head_dim": "128",
+      "num_threads": "128",
+      "tile_m": "128",
+      "use_2cta_instrs": "True"
+     },
+     "cls": "FlashAttentionBackwardPostprocess",
+     "declared_in": "FlashAttentionBackwardPostprocess"
+    }
+   ],
+   "error": null,
+   "keys": {
+    "bwd": [
+     {
+      "repr": "(103, <class 'cutlass.base_dsl.typing.BFloat16'>, 128, 128, 1, True, False, False, 128, 128, 384, False, 2, True, 2, 1, False, False, False, False, False, 0, None, None, False, None, True, True, True, True, (False, False, False, False), (False, False, False, False), (False, False, False, False), (False, False, False, False), False, False)",
+      "sha256": "266cd99e0a8fc5eb68fb10ae530ce83854866bfb95fc5104682a6407c34f3720"
+     }
+    ],
+    "bwd_post": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 128, 128, 128, 1, False, False, False, True, 1, 103)",
+      "sha256": "825ee25e0a37f3ed3c70a2ae936536f4f05a8c66c0618edd2cedba15dec73804"
+     }
+    ],
+    "bwd_pre": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 128, 128, 128, False, False, False, True, False, True, False, False, 1, 1)",
+      "sha256": "5678ffa9fb5b007b0353c8bbd8713cbf7c2e314949694881a96a620b2d96f747"
+     }
+    ],
+    "fwd": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 128, 128, 1, True, False, False, False, None, None, None, False, True, True, True, True, False, False, False, False, False, False, False, True, True, 128, 128, 2, 384, False, False, 103, False, False, 1, 1, True, True, False, True, False, False, False, None, None, None, 0)",
+      "sha256": "a8bed07ffdefe2d93dd37069d529b0fff8d03d1f63b5fcaa9817a92b70238d99"
+     }
+    ]
+   }
+  },
+  "bwd.sm120.bf16.dense.d64": {
+   "arch": "sm_120",
+   "ctors": [
+    {
+     "args": {
+      "args": [
+       "<class 'cutlass.base_dsl.typing.BFloat16'>",
+       "64",
+       "64",
+       "1"
+      ],
+      "kwargs": {
+       "Q_in_regs": "False",
+       "has_aux_tensors": "False",
+       "is_causal": "False",
+       "is_local": "False",
+       "mask_mod": "None",
+       "num_stages": "1",
+       "num_threads": "128",
+       "pack_gqa": "False",
+       "score_mod": "None",
+       "tile_m": "128",
+       "tile_n": "128"
+      }
+     },
+     "cls": "FlashAttentionForwardSm120",
+     "declared_in": "FlashAttentionForwardSm120"
+    },
+    {
+     "args": {
+      "dtype": "<class 'cutlass.base_dsl.typing.BFloat16'>",
+      "head_dim": "64",
+      "head_dim_v": "64",
+      "nheads_kv": "1",
+      "nheads_major": "False",
+      "num_threads": "256",
+      "pack_gqa": "False",
+      "qhead_per_kvhead": "1",
+      "tile_m": "64",
+      "use_padded_offsets": "True"
+     },
+     "cls": "FlashAttentionBackwardPreprocess",
+     "declared_in": "FlashAttentionBackwardPreprocess"
+    },
+    {
+     "args": {
+      "AtomLayoutMSdP": "4",
+      "AtomLayoutMdQ": "4",
+      "AtomLayoutNdKV": "4",
+      "SdP_swapAB": "False",
+      "V_in_regs": "False",
+      "dKV_swapAB": "False",
+      "dQ_swapAB": "False",
+      "dtype": "<class 'cutlass.base_dsl.typing.BFloat16'>",
+      "head_dim": "64",
+      "head_dim_v": "64",
+      "is_causal": "False",
+      "is_local": "False",
+      "m_block_size": "64",
+      "n_block_size": "64",
+      "num_stages_Q": "2",
+      "num_stages_dO": "2",
+      "num_threads": "128",
+      "pack_gqa": "False",
+      "qhead_per_kvhead": "1",
+      "score_mod": "None",
+      "score_mod_bwd": "None"
+     },
+     "cls": "FlashAttentionBackwardSm120",
+     "declared_in": "FlashAttentionBackwardSm80"
+    },
+    {
+     "args": {
+      "AtomLayoutMdQ": "4",
+      "arch": "120",
+      "cluster_size": "1",
+      "dQ_swapAB": "False",
+      "dtype": "<class 'cutlass.base_dsl.typing.BFloat16'>",
+      "head_dim": "64",
+      "num_threads": "128",
+      "tile_m": "64",
+      "use_2cta_instrs": "False"
+     },
+     "cls": "FlashAttentionBackwardPostprocess",
+     "declared_in": "FlashAttentionBackwardPostprocess"
+    }
+   ],
+   "error": null,
+   "keys": {
+    "bwd": [
+     {
+      "repr": "(120, <class 'cutlass.base_dsl.typing.BFloat16'>, 64, 64, 1, False, False, False, 64, 64, 128, False, 2, 2, False, False, False, 4, 4, 4, False, False, False, True, True, True, True, False, False, False, 0, None, None, False, 2, None, (False, False, False, False), (False, False, False, False), (False, False, False, False), (False, False, False, False), False, False)",
+      "sha256": "c89abfe1cb7a6abb71b7b7348339129a624ec77696a445ca3a61e1f2960d4013"
+     }
+    ],
+    "bwd_post": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 64, 64, 128, 4, False, False, False, False, 1, 120)",
+      "sha256": "7165a0638271ada6621fe2a0ef55c6262902dfe050239d80e00a4b2ffa17d852"
+     }
+    ],
+    "bwd_pre": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 64, 64, 64, False, False, False, True, False, True, False, False, 1, 1)",
+      "sha256": "e9ccaa34b4fa3d976ea975e5dc3aac6f9b16ebee12af1596517b1c5866e27bf8"
+     }
+    ],
+    "fwd": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 64, 64, 1, False, False, False, False, None, None, None, False, True, True, True, True, False, False, False, False, False, False, False, True, True, 128, 128, 1, 128, False, False, 120, False, False, 1, 1, True, True, False, True, False, False, False, None, None, None, 0)",
+      "sha256": "08404fa239d90fe1d72f81f3a219db676ad1c912559e56ed50a4a52f520331aa"
+     }
+    ]
+   }
+  },
+  "bwd.sm90.bf16.dense.causal.d64": {
+   "arch": "sm_90",
+   "ctors": [
+    {
+     "args": {
+      "args": [
+       "<class 'cutlass.base_dsl.typing.BFloat16'>",
+       "64",
+       "64",
+       "1"
+      ],
+      "intra_wg_overlap": "True",
+      "kwargs": {
+       "Q_in_regs": "False",
+       "has_aux_tensors": "False",
+       "is_causal": "True",
+       "is_local": "False",
+       "mask_mod": "None",
+       "num_stages": "2",
+       "num_threads": "384",
+       "pack_gqa": "False",
+       "q_subtile_factor": "1",
+       "score_mod": "None",
+       "tile_m": "192",
+       "tile_n": "128"
+      },
+      "mma_pv_is_rs": "True",
+      "paged_kv_non_tma": "False"
+     },
+     "cls": "FlashAttentionForwardSm90",
+     "declared_in": "FlashAttentionForwardSm90"
+    },
+    {
+     "args": {
+      "dtype": "<class 'cutlass.base_dsl.typing.BFloat16'>",
+      "head_dim": "64",
+      "head_dim_v": "64",
+      "nheads_kv": "1",
+      "nheads_major": "False",
+      "num_threads": "256",
+      "pack_gqa": "False",
+      "qhead_per_kvhead": "1",
+      "tile_m": "128",
+      "use_padded_offsets": "True"
+     },
+     "cls": "FlashAttentionBackwardPreprocess",
+     "declared_in": "FlashAttentionBackwardPreprocess"
+    },
+    {
+     "args": {
+      "AtomLayoutMSdP": "1",
+      "AtomLayoutMdQ": "2",
+      "AtomLayoutNdKV": "2",
+      "PdS_stage": "2",
+      "Q_stage": "2",
+      "SdP_swapAB": "True",
+      "V_in_regs": "False",
+      "dKV_swapAB": "False",
+      "dO_stage": "2",
+      "dQ_single_wg": "False",
+      "dQ_swapAB": "False",
+      "deterministic": "False",
+      "dtype": "<class 'cutlass.base_dsl.typing.BFloat16'>",
+      "has_aux_tensors": "False",
+      "head_dim": "64",
+      "head_dim_v": "64",
+      "is_causal": "True",
+      "is_local": "False",
+      "mask_mod": "None",
+      "num_threads": "384",
+      "q_subtile_factor": "2",
+      "qhead_per_kvhead": "1",
+      "score_mod": "None",
+      "score_mod_bwd": "None",
+      "tile_m": "128",
+      "tile_n": "128"
+     },
+     "cls": "FlashAttentionBackwardSm90",
+     "declared_in": "FlashAttentionBackwardSm90"
+    },
+    {
+     "args": {
+      "AtomLayoutMdQ": "2",
+      "arch": "90",
+      "cluster_size": "1",
+      "dQ_swapAB": "False",
+      "dtype": "<class 'cutlass.base_dsl.typing.BFloat16'>",
+      "head_dim": "64",
+      "num_threads": "256",
+      "tile_m": "128",
+      "use_2cta_instrs": "False"
+     },
+     "cls": "FlashAttentionBackwardPostprocess",
+     "declared_in": "FlashAttentionBackwardPostprocess"
+    }
+   ],
+   "error": null,
+   "keys": {
+    "bwd": [
+     {
+      "repr": "(90, <class 'cutlass.base_dsl.typing.BFloat16'>, 64, 64, 1, True, False, False, 128, 128, 384, False, 2, 2, True, False, False, 1, 2, 2, False, False, False, True, True, True, True, False, False, False, 0, None, None, False, 2, None, (False, False, False, False), (False, False, False, False), (False, False, False, False), (False, False, False, False), False, False)",
+      "sha256": "23088334aaea0e4e86e9b90462b6853e823fb841c37ae2aa54b1cf7d5b0cf299"
+     }
+    ],
+    "bwd_post": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 64, 128, 256, 2, False, False, False, False, 1, 90)",
+      "sha256": "88683d34ce838a45cfa2eec7d8394374cf1aa2f9d7fd281fa7266da708a8b673"
+     }
+    ],
+    "bwd_pre": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 64, 64, 128, False, False, False, True, False, True, False, False, 1, 1)",
+      "sha256": "e3da23a83e4e4f1e9048b6779726a1031c2a1a602b36d540d854f9d5acedbcb0"
+     }
+    ],
+    "fwd": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 64, 64, 1, True, False, False, False, None, None, None, False, True, True, True, True, False, False, False, False, False, False, False, True, True, 192, 128, 1, 384, False, False, 90, False, False, 1, 1, True, True, False, True, False, False, False, None, None, None, 0)",
+      "sha256": "daec429b3954345484fb6507c665eb405bdf4740158b881223a5dd2afffc7085"
+     }
+    ]
+   }
+  },
+  "bwd.sm90.bf16.dense.causal.d96": {
+   "arch": "sm_90",
+   "ctors": [
+    {
+     "args": {
+      "args": [
+       "<class 'cutlass.base_dsl.typing.BFloat16'>",
+       "96",
+       "96",
+       "1"
+      ],
+      "intra_wg_overlap": "True",
+      "kwargs": {
+       "Q_in_regs": "False",
+       "has_aux_tensors": "False",
+       "is_causal": "True",
+       "is_local": "False",
+       "mask_mod": "None",
+       "num_stages": "2",
+       "num_threads": "384",
+       "pack_gqa": "False",
+       "q_subtile_factor": "1",
+       "score_mod": "None",
+       "tile_m": "192",
+       "tile_n": "128"
+      },
+      "mma_pv_is_rs": "False",
+      "paged_kv_non_tma": "False"
+     },
+     "cls": "FlashAttentionForwardSm90",
+     "declared_in": "FlashAttentionForwardSm90"
+    },
+    {
+     "args": {
+      "dtype": "<class 'cutlass.base_dsl.typing.BFloat16'>",
+      "head_dim": "96",
+      "head_dim_v": "96",
+      "nheads_kv": "1",
+      "nheads_major": "False",
+      "num_threads": "256",
+      "pack_gqa": "False",
+      "qhead_per_kvhead": "1",
+      "tile_m": "64",
+      "use_padded_offsets": "True"
+     },
+     "cls": "FlashAttentionBackwardPreprocess",
+     "declared_in": "FlashAttentionBackwardPreprocess"
+    },
+    {
+     "args": {
+      "AtomLayoutMSdP": "1",
+      "AtomLayoutMdQ": "1",
+      "AtomLayoutNdKV": "2",
+      "PdS_stage": "2",
+      "Q_stage": "2",
+      "SdP_swapAB": "True",
+      "V_in_regs": "False",
+      "dKV_swapAB": "False",
+      "dO_stage": "2",
+      "dQ_single_wg": "True",
+      "dQ_swapAB": "False",
+      "deterministic": "False",
+      "dtype": "<class 'cutlass.base_dsl.typing.BFloat16'>",
+      "has_aux_tensors": "False",
+      "head_dim": "96",
+      "head_dim_v": "96",
+      "is_causal": "True",
+      "is_local": "False",
+      "mask_mod": "None",
+      "num_threads": "384",
+      "q_subtile_factor": "2",
+      "qhead_per_kvhead": "1",
+      "score_mod": "None",
+      "score_mod_bwd": "None",
+      "tile_m": "64",
+      "tile_n": "128"
+     },
+     "cls": "FlashAttentionBackwardSm90",
+     "declared_in": "FlashAttentionBackwardSm90"
+    },
+    {
+     "args": {
+      "AtomLayoutMdQ": "1",
+      "arch": "90",
+      "cluster_size": "1",
+      "dQ_swapAB": "False",
+      "dtype": "<class 'cutlass.base_dsl.typing.BFloat16'>",
+      "head_dim": "96",
+      "num_threads": "128",
+      "tile_m": "64",
+      "use_2cta_instrs": "False"
+     },
+     "cls": "FlashAttentionBackwardPostprocess",
+     "declared_in": "FlashAttentionBackwardPostprocess"
+    }
+   ],
+   "error": null,
+   "keys": {
+    "bwd": [
+     {
+      "repr": "(90, <class 'cutlass.base_dsl.typing.BFloat16'>, 96, 96, 1, True, False, False, 64, 128, 384, False, 2, 2, True, False, False, 1, 2, 1, False, True, False, True, True, True, True, False, False, False, 0, None, None, False, 2, None, (False, False, False, False), (False, False, False, False), (False, False, False, False), (False, False, False, False), False, False)",
+      "sha256": "67c45fb4640cde10779984d201332710b9cb0a124387d6380e16cfa89f04ef82"
+     }
+    ],
+    "bwd_post": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 96, 64, 128, 1, False, False, False, False, 1, 90)",
+      "sha256": "f69eba09cd5bc9c66a4ffa62f47c68aa81fdf4a076d1889877a2ae339e4bd4e3"
+     }
+    ],
+    "bwd_pre": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 96, 96, 64, False, False, False, True, False, True, False, False, 1, 1)",
+      "sha256": "0653340e58adb9ecf65fba706a91166305dd19adc9e2aba9fba5e6704bff3159"
+     }
+    ],
+    "fwd": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 96, 96, 1, True, False, False, False, None, None, None, False, True, True, True, True, False, False, False, False, False, False, False, True, True, 192, 128, 1, 384, False, False, 90, False, False, 1, 1, False, True, False, True, False, False, False, None, None, None, 0)",
+      "sha256": "7cd257976661f9956dcec4411c65d5710dc66f85e0ce212cfa2115a6a8312a15"
+     }
+    ]
+   }
+  },
+  "bwd.sm90.bf16.dense.d128": {
+   "arch": "sm_90",
+   "ctors": [
+    {
+     "args": {
+      "args": [
+       "<class 'cutlass.base_dsl.typing.BFloat16'>",
+       "128",
+       "128",
+       "1"
+      ],
+      "intra_wg_overlap": "True",
+      "kwargs": {
+       "Q_in_regs": "False",
+       "has_aux_tensors": "False",
+       "is_causal": "False",
+       "is_local": "False",
+       "mask_mod": "None",
+       "num_stages": "2",
+       "num_threads": "384",
+       "pack_gqa": "False",
+       "q_subtile_factor": "1",
+       "score_mod": "None",
+       "tile_m": "128",
+       "tile_n": "128"
+      },
+      "mma_pv_is_rs": "True",
+      "paged_kv_non_tma": "False"
+     },
+     "cls": "FlashAttentionForwardSm90",
+     "declared_in": "FlashAttentionForwardSm90"
+    },
+    {
+     "args": {
+      "dtype": "<class 'cutlass.base_dsl.typing.BFloat16'>",
+      "head_dim": "128",
+      "head_dim_v": "128",
+      "nheads_kv": "1",
+      "nheads_major": "False",
+      "num_threads": "256",
+      "pack_gqa": "False",
+      "qhead_per_kvhead": "1",
+      "tile_m": "80",
+      "use_padded_offsets": "True"
+     },
+     "cls": "FlashAttentionBackwardPreprocess",
+     "declared_in": "FlashAttentionBackwardPreprocess"
+    },
+    {
+     "args": {
+      "AtomLayoutMSdP": "1",
+      "AtomLayoutMdQ": "1",
+      "AtomLayoutNdKV": "2",
+      "PdS_stage": "2",
+      "Q_stage": "2",
+      "SdP_swapAB": "True",
+      "V_in_regs": "False",
+      "dKV_swapAB": "False",
+      "dO_stage": "2",
+      "dQ_single_wg": "False",
+      "dQ_swapAB": "True",
+      "deterministic": "False",
+      "dtype": "<class 'cutlass.base_dsl.typing.BFloat16'>",
+      "has_aux_tensors": "False",
+      "head_dim": "128",
+      "head_dim_v": "128",
+      "is_causal": "False",
+      "is_local": "False",
+      "mask_mod": "None",
+      "num_threads": "384",
+      "q_subtile_factor": "2",
+      "qhead_per_kvhead": "1",
+      "score_mod": "None",
+      "score_mod_bwd": "None",
+      "tile_m": "80",
+      "tile_n": "128"
+     },
+     "cls": "FlashAttentionBackwardSm90",
+     "declared_in": "FlashAttentionBackwardSm90"
+    },
+    {
+     "args": {
+      "AtomLayoutMdQ": "1",
+      "arch": "90",
+      "cluster_size": "1",
+      "dQ_swapAB": "True",
+      "dtype": "<class 'cutlass.base_dsl.typing.BFloat16'>",
+      "head_dim": "128",
+      "num_threads": "256",
+      "tile_m": "80",
+      "use_2cta_instrs": "False"
+     },
+     "cls": "FlashAttentionBackwardPostprocess",
+     "declared_in": "FlashAttentionBackwardPostprocess"
+    }
+   ],
+   "error": null,
+   "keys": {
+    "bwd": [
+     {
+      "repr": "(90, <class 'cutlass.base_dsl.typing.BFloat16'>, 128, 128, 1, False, False, False, 80, 128, 384, False, 2, 2, True, False, True, 1, 2, 1, False, False, False, True, True, True, True, False, False, False, 0, None, None, False, 2, None, (False, False, False, False), (False, False, False, False), (False, False, False, False), (False, False, False, False), False, False)",
+      "sha256": "54a5ee29d6059e0adfb7c814ca21d319b54b005fd22f234961fb92f94b1d574c"
+     }
+    ],
+    "bwd_post": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 128, 80, 256, 1, True, False, False, False, 1, 90)",
+      "sha256": "a7398ef5d4635d904415d72488dc7f500637688c24690bb6408f922b8100c303"
+     }
+    ],
+    "bwd_pre": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 128, 128, 80, False, False, False, True, False, True, False, False, 1, 1)",
+      "sha256": "817135892a79e0165539192b1088b44c5392b231cd9369c49924d2c7f251a1de"
+     }
+    ],
+    "fwd": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 128, 128, 1, False, False, False, False, None, None, None, False, True, True, True, True, False, False, False, False, False, False, False, True, True, 128, 128, 1, 384, False, False, 90, False, False, 1, 1, True, True, False, True, False, False, False, None, None, None, 0)",
+      "sha256": "2c47d592c90036fb536c767a758aa03301d886f8bac204fecd5f83870a9e3c53"
+     }
+    ]
+   }
+  },
+  "bwd.sm90.bf16.dense.d128.knob_override": {
+   "arch": "sm_90",
+   "ctors": [
+    {
+     "args": {
+      "args": [
+       "<class 'cutlass.base_dsl.typing.BFloat16'>",
+       "128",
+       "128",
+       "1"
+      ],
+      "intra_wg_overlap": "True",
+      "kwargs": {
+       "Q_in_regs": "False",
+       "has_aux_tensors": "False",
+       "is_causal": "False",
+       "is_local": "False",
+       "mask_mod": "None",
+       "num_stages": "2",
+       "num_threads": "384",
+       "pack_gqa": "False",
+       "q_subtile_factor": "1",
+       "score_mod": "None",
+       "tile_m": "128",
+       "tile_n": "128"
+      },
+      "mma_pv_is_rs": "True",
+      "paged_kv_non_tma": "False"
+     },
+     "cls": "FlashAttentionForwardSm90",
+     "declared_in": "FlashAttentionForwardSm90"
+    },
+    {
+     "args": {
+      "dtype": "<class 'cutlass.base_dsl.typing.BFloat16'>",
+      "head_dim": "128",
+      "head_dim_v": "128",
+      "nheads_kv": "1",
+      "nheads_major": "False",
+      "num_threads": "256",
+      "pack_gqa": "False",
+      "qhead_per_kvhead": "1",
+      "tile_m": "80",
+      "use_padded_offsets": "True"
+     },
+     "cls": "FlashAttentionBackwardPreprocess",
+     "declared_in": "FlashAttentionBackwardPreprocess"
+    },
+    {
+     "args": {
+      "AtomLayoutMSdP": "1",
+      "AtomLayoutMdQ": "1",
+      "AtomLayoutNdKV": "2",
+      "PdS_stage": "2",
+      "Q_stage": "2",
+      "SdP_swapAB": "True",
+      "V_in_regs": "False",
+      "dKV_swapAB": "False",
+      "dO_stage": "2",
+      "dQ_single_wg": "False",
+      "dQ_swapAB": "True",
+      "deterministic": "False",
+      "dtype": "<class 'cutlass.base_dsl.typing.BFloat16'>",
+      "has_aux_tensors": "False",
+      "head_dim": "128",
+      "head_dim_v": "128",
+      "is_causal": "False",
+      "is_local": "False",
+      "mask_mod": "None",
+      "num_threads": "384",
+      "q_subtile_factor": "2",
+      "qhead_per_kvhead": "1",
+      "score_mod": "None",
+      "score_mod_bwd": "None",
+      "tile_m": "80",
+      "tile_n": "128"
+     },
+     "cls": "FlashAttentionBackwardSm90",
+     "declared_in": "FlashAttentionBackwardSm90"
+    },
+    {
+     "args": {
+      "AtomLayoutMdQ": "1",
+      "arch": "90",
+      "cluster_size": "1",
+      "dQ_swapAB": "True",
+      "dtype": "<class 'cutlass.base_dsl.typing.BFloat16'>",
+      "head_dim": "128",
+      "num_threads": "256",
+      "tile_m": "80",
+      "use_2cta_instrs": "False"
+     },
+     "cls": "FlashAttentionBackwardPostprocess",
+     "declared_in": "FlashAttentionBackwardPostprocess"
+    }
+   ],
+   "error": null,
+   "keys": {
+    "bwd": [
+     {
+      "repr": "(90, <class 'cutlass.base_dsl.typing.BFloat16'>, 128, 128, 1, False, False, False, 80, 128, 384, False, 2, 2, True, False, True, 1, 2, 1, False, False, False, True, True, True, True, False, False, False, 0, None, None, False, 2, None, (False, False, False, False), (False, False, False, False), (False, False, False, False), (False, False, False, False), False, False)",
+      "sha256": "54a5ee29d6059e0adfb7c814ca21d319b54b005fd22f234961fb92f94b1d574c"
+     }
+    ],
+    "bwd_post": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 128, 80, 256, 1, True, False, False, False, 1, 90)",
+      "sha256": "a7398ef5d4635d904415d72488dc7f500637688c24690bb6408f922b8100c303"
+     }
+    ],
+    "bwd_pre": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 128, 128, 80, False, False, False, True, False, True, False, False, 1, 1)",
+      "sha256": "817135892a79e0165539192b1088b44c5392b231cd9369c49924d2c7f251a1de"
+     }
+    ],
+    "fwd": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 128, 128, 1, False, False, False, False, None, None, None, False, True, True, True, True, False, False, False, False, False, False, False, True, True, 128, 128, 1, 384, False, False, 90, False, False, 1, 1, True, True, False, True, False, False, False, None, None, None, 0)",
+      "sha256": "2c47d592c90036fb536c767a758aa03301d886f8bac204fecd5f83870a9e3c53"
+     }
+    ]
+   }
+  },
+  "bwd.sm90.bf16.dense.deterministic.d64": {
+   "arch": "sm_90",
+   "ctors": [
+    {
+     "args": {
+      "args": [
+       "<class 'cutlass.base_dsl.typing.BFloat16'>",
+       "64",
+       "64",
+       "1"
+      ],
+      "intra_wg_overlap": "True",
+      "kwargs": {
+       "Q_in_regs": "False",
+       "has_aux_tensors": "False",
+       "is_causal": "False",
+       "is_local": "False",
+       "mask_mod": "None",
+       "num_stages": "2",
+       "num_threads": "384",
+       "pack_gqa": "False",
+       "q_subtile_factor": "1",
+       "score_mod": "None",
+       "tile_m": "192",
+       "tile_n": "128"
+      },
+      "mma_pv_is_rs": "True",
+      "paged_kv_non_tma": "False"
+     },
+     "cls": "FlashAttentionForwardSm90",
+     "declared_in": "FlashAttentionForwardSm90"
+    },
+    {
+     "args": {
+      "dtype": "<class 'cutlass.base_dsl.typing.BFloat16'>",
+      "head_dim": "64",
+      "head_dim_v": "64",
+      "nheads_kv": "1",
+      "nheads_major": "False",
+      "num_threads": "256",
+      "pack_gqa": "False",
+      "qhead_per_kvhead": "1",
+      "tile_m": "128",
+      "use_padded_offsets": "True"
+     },
+     "cls": "FlashAttentionBackwardPreprocess",
+     "declared_in": "FlashAttentionBackwardPreprocess"
+    },
+    {
+     "args": {
+      "AtomLayoutMSdP": "1",
+      "AtomLayoutMdQ": "2",
+      "AtomLayoutNdKV": "2",
+      "PdS_stage": "2",
+      "Q_stage": "2",
+      "SdP_swapAB": "True",
+      "V_in_regs": "False",
+      "dKV_swapAB": "False",
+      "dO_stage": "2",
+      "dQ_single_wg": "False",
+      "dQ_swapAB": "False",
+      "deterministic": "True",
+      "dtype": "<class 'cutlass.base_dsl.typing.BFloat16'>",
+      "has_aux_tensors": "False",
+      "head_dim": "64",
+      "head_dim_v": "64",
+      "is_causal": "False",
+      "is_local": "False",
+      "mask_mod": "None",
+      "num_threads": "384",
+      "q_subtile_factor": "2",
+      "qhead_per_kvhead": "1",
+      "score_mod": "None",
+      "score_mod_bwd": "None",
+      "tile_m": "128",
+      "tile_n": "128"
+     },
+     "cls": "FlashAttentionBackwardSm90",
+     "declared_in": "FlashAttentionBackwardSm90"
+    },
+    {
+     "args": {
+      "AtomLayoutMdQ": "2",
+      "arch": "90",
+      "cluster_size": "1",
+      "dQ_swapAB": "False",
+      "dtype": "<class 'cutlass.base_dsl.typing.BFloat16'>",
+      "head_dim": "64",
+      "num_threads": "256",
+      "tile_m": "128",
+      "use_2cta_instrs": "False"
+     },
+     "cls": "FlashAttentionBackwardPostprocess",
+     "declared_in": "FlashAttentionBackwardPostprocess"
+    }
+   ],
+   "error": null,
+   "keys": {
+    "bwd": [
+     {
+      "repr": "(90, <class 'cutlass.base_dsl.typing.BFloat16'>, 64, 64, 1, False, False, False, 128, 128, 384, False, 2, 2, True, False, False, 1, 2, 2, False, False, True, True, True, True, True, False, False, False, 0, None, None, False, 2, None, (False, False, False, False), (False, False, False, False), (False, False, False, False), (False, False, False, False), False, False)",
+      "sha256": "9770790adc7343d5bb121bbeda2779e9d284935468bbda99daf14bea36c83595"
+     }
+    ],
+    "bwd_post": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 64, 128, 256, 2, False, False, False, False, 1, 90)",
+      "sha256": "88683d34ce838a45cfa2eec7d8394374cf1aa2f9d7fd281fa7266da708a8b673"
+     }
+    ],
+    "bwd_pre": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 64, 64, 128, False, False, False, True, False, True, False, False, 1, 1)",
+      "sha256": "e3da23a83e4e4f1e9048b6779726a1031c2a1a602b36d540d854f9d5acedbcb0"
+     }
+    ],
+    "fwd": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 64, 64, 1, False, False, False, False, None, None, None, False, True, True, True, True, False, False, False, False, False, False, False, True, True, 192, 128, 1, 384, False, False, 90, False, False, 1, 1, True, True, False, True, False, False, False, None, None, None, 0)",
+      "sha256": "1755ca7f206a7315e049cb5bcd9b6c9b614b3b1c8894fc4bfe1734340cd806e9"
+     }
+    ]
+   }
+  },
+  "bwd.sm90.bf16.dense.score_mod.d64": {
+   "arch": "sm_90",
+   "ctors": [
+    {
+     "args": {
+      "args": [
+       "<class 'cutlass.base_dsl.typing.BFloat16'>",
+       "64",
+       "64",
+       "1"
+      ],
+      "intra_wg_overlap": "True",
+      "kwargs": {
+       "Q_in_regs": "False",
+       "has_aux_tensors": "False",
+       "is_causal": "False",
+       "is_local": "False",
+       "mask_mod": "None",
+       "num_stages": "2",
+       "num_threads": "384",
+       "pack_gqa": "False",
+       "q_subtile_factor": "1",
+       "score_mod": "None",
+       "tile_m": "192",
+       "tile_n": "128"
+      },
+      "mma_pv_is_rs": "True",
+      "paged_kv_non_tma": "False"
+     },
+     "cls": "FlashAttentionForwardSm90",
+     "declared_in": "FlashAttentionForwardSm90"
+    },
+    {
+     "args": {
+      "dtype": "<class 'cutlass.base_dsl.typing.BFloat16'>",
+      "head_dim": "64",
+      "head_dim_v": "64",
+      "nheads_kv": "1",
+      "nheads_major": "False",
+      "num_threads": "256",
+      "pack_gqa": "False",
+      "qhead_per_kvhead": "1",
+      "tile_m": "128",
+      "use_padded_offsets": "True"
+     },
+     "cls": "FlashAttentionBackwardPreprocess",
+     "declared_in": "FlashAttentionBackwardPreprocess"
+    },
+    {
+     "args": {
+      "AtomLayoutMSdP": "1",
+      "AtomLayoutMdQ": "2",
+      "AtomLayoutNdKV": "2",
+      "PdS_stage": "2",
+      "Q_stage": "2",
+      "SdP_swapAB": "True",
+      "V_in_regs": "False",
+      "dKV_swapAB": "False",
+      "dO_stage": "2",
+      "dQ_single_wg": "False",
+      "dQ_swapAB": "False",
+      "deterministic": "False",
+      "dtype": "<class 'cutlass.base_dsl.typing.BFloat16'>",
+      "has_aux_tensors": "False",
+      "head_dim": "64",
+      "head_dim_v": "64",
+      "is_causal": "False",
+      "is_local": "False",
+      "mask_mod": "None",
+      "num_threads": "384",
+      "q_subtile_factor": "2",
+      "qhead_per_kvhead": "1",
+      "score_mod": "callable:fae6422ed920",
+      "score_mod_bwd": "callable:49e96ffbde0f",
+      "tile_m": "128",
+      "tile_n": "128"
+     },
+     "cls": "FlashAttentionBackwardSm90",
+     "declared_in": "FlashAttentionBackwardSm90"
+    },
+    {
+     "args": {
+      "AtomLayoutMdQ": "2",
+      "arch": "90",
+      "cluster_size": "1",
+      "dQ_swapAB": "False",
+      "dtype": "<class 'cutlass.base_dsl.typing.BFloat16'>",
+      "head_dim": "64",
+      "num_threads": "256",
+      "tile_m": "128",
+      "use_2cta_instrs": "False"
+     },
+     "cls": "FlashAttentionBackwardPostprocess",
+     "declared_in": "FlashAttentionBackwardPostprocess"
+    }
+   ],
+   "error": null,
+   "keys": {
+    "bwd": [
+     {
+      "repr": "(90, <class 'cutlass.base_dsl.typing.BFloat16'>, 64, 64, 1, False, False, False, 128, 128, 384, False, 2, 2, True, False, False, 1, 2, 2, False, False, False, True, True, True, True, 'fae6422ed920764b1f3dd3f635ede19c20995507c11c3cbecb8b5dc461d6c329', '49e96ffbde0faead72a53cea79a7ff688b5290bc56c4437b8fdf9b019e6759a7', False, 0, None, None, False, 2, None, (False, False, False, False), (False, False, False, False), (False, False, False, False), (False, False, False, False), False, False)",
+      "sha256": "4ac3a2e180b3b5d3d863fc4a1901d984defb329dfb3ecb48ed3f8f7fc026375a"
+     }
+    ],
+    "bwd_post": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 64, 128, 256, 2, False, False, False, False, 1, 90)",
+      "sha256": "88683d34ce838a45cfa2eec7d8394374cf1aa2f9d7fd281fa7266da708a8b673"
+     }
+    ],
+    "bwd_pre": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 64, 64, 128, False, False, False, True, False, True, False, False, 1, 1)",
+      "sha256": "e3da23a83e4e4f1e9048b6779726a1031c2a1a602b36d540d854f9d5acedbcb0"
+     }
+    ],
+    "fwd": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 64, 64, 1, False, False, False, False, None, None, None, False, True, True, True, True, False, False, False, False, False, False, False, True, True, 192, 128, 1, 384, False, False, 90, False, False, 1, 1, True, True, False, True, False, False, False, None, None, None, 0)",
+      "sha256": "1755ca7f206a7315e049cb5bcd9b6c9b614b3b1c8894fc4bfe1734340cd806e9"
+     }
+    ]
+   }
+  },
+  "bwd.sm90.bf16.varlen.causal.d128": {
+   "arch": "sm_90",
+   "ctors": [
+    {
+     "args": {
+      "args": [
+       "<class 'cutlass.base_dsl.typing.BFloat16'>",
+       "128",
+       "128",
+       "1"
+      ],
+      "intra_wg_overlap": "True",
+      "kwargs": {
+       "Q_in_regs": "False",
+       "has_aux_tensors": "False",
+       "is_causal": "True",
+       "is_local": "False",
+       "mask_mod": "None",
+       "num_stages": "2",
+       "num_threads": "384",
+       "pack_gqa": "False",
+       "q_subtile_factor": "1",
+       "score_mod": "None",
+       "tile_m": "128",
+       "tile_n": "128"
+      },
+      "mma_pv_is_rs": "True",
+      "paged_kv_non_tma": "False"
+     },
+     "cls": "FlashAttentionForwardSm90",
+     "declared_in": "FlashAttentionForwardSm90"
+    },
+    {
+     "args": {
+      "dtype": "<class 'cutlass.base_dsl.typing.BFloat16'>",
+      "head_dim": "128",
+      "head_dim_v": "128",
+      "nheads_kv": "1",
+      "nheads_major": "False",
+      "num_threads": "256",
+      "pack_gqa": "False",
+      "qhead_per_kvhead": "1",
+      "tile_m": "64",
+      "use_padded_offsets": "True"
+     },
+     "cls": "FlashAttentionBackwardPreprocess",
+     "declared_in": "FlashAttentionBackwardPreprocess"
+    },
+    {
+     "args": {
+      "AtomLayoutMSdP": "1",
+      "AtomLayoutMdQ": "1",
+      "AtomLayoutNdKV": "2",
+      "PdS_stage": "2",
+      "Q_stage": "2",
+      "SdP_swapAB": "True",
+      "V_in_regs": "False",
+      "dKV_swapAB": "False",
+      "dO_stage": "2",
+      "dQ_single_wg": "False",
+      "dQ_swapAB": "False",
+      "deterministic": "False",
+      "dtype": "<class 'cutlass.base_dsl.typing.BFloat16'>",
+      "has_aux_tensors": "False",
+      "head_dim": "128",
+      "head_dim_v": "128",
+      "is_causal": "True",
+      "is_local": "False",
+      "mask_mod": "None",
+      "num_threads": "384",
+      "q_subtile_factor": "2",
+      "qhead_per_kvhead": "1",
+      "score_mod": "None",
+      "score_mod_bwd": "None",
+      "tile_m": "64",
+      "tile_n": "128"
+     },
+     "cls": "FlashAttentionBackwardSm90",
+     "declared_in": "FlashAttentionBackwardSm90"
+    },
+    {
+     "args": {
+      "AtomLayoutMdQ": "1",
+      "arch": "90",
+      "cluster_size": "1",
+      "dQ_swapAB": "False",
+      "dtype": "<class 'cutlass.base_dsl.typing.BFloat16'>",
+      "head_dim": "128",
+      "num_threads": "256",
+      "tile_m": "64",
+      "use_2cta_instrs": "False"
+     },
+     "cls": "FlashAttentionBackwardPostprocess",
+     "declared_in": "FlashAttentionBackwardPostprocess"
+    }
+   ],
+   "error": null,
+   "keys": {
+    "bwd": [
+     {
+      "repr": "(90, <class 'cutlass.base_dsl.typing.BFloat16'>, 128, 128, 1, True, False, False, 64, 128, 384, False, 2, 2, True, False, False, 1, 2, 1, False, False, False, False, False, True, True, False, False, False, 0, None, None, False, 2, None, (False, False, False), (False, False, False), (False, False, False), (False, False, False), False, False)",
+      "sha256": "9daa8f79a422b360284a973a4497735d807435025d7c78a4802a5b5e83a54f80"
+     }
+    ],
+    "bwd_post": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 128, 64, 256, 1, False, True, False, False, 1, 90)",
+      "sha256": "3963c568f0363d91d3b0327b58c35f60b5a1d67d78745175ff9c6aa7476675cd"
+     }
+    ],
+    "bwd_pre": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 128, 128, 64, True, False, False, True, False, True, False, False, 1, 1)",
+      "sha256": "4c2ab1c41ee7db20982fdb1cad2e503075769f4c72a5eef041a25337bd78cf09"
+     }
+    ],
+    "fwd": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 128, 128, 1, True, False, False, False, None, None, None, False, False, False, True, True, False, False, False, False, False, False, False, True, True, 128, 128, 1, 384, False, False, 90, False, False, 1, 1, True, True, False, True, False, False, False, None, None, None, 0)",
+      "sha256": "2ce3082506b3dac462b1b2bd988c97baeababcd3248ff66c0e2ba9d2ee1b0366"
+     }
+    ]
+   }
+  },
+  "fwd.sm100.bf16.batched.seqused.d128": {
+   "arch": "sm_100",
+   "ctors": [
+    {
+     "args": {
+      "has_aux_tensors": "False",
+      "head_dim": "128",
+      "head_dim_v": "128",
+      "is_causal": "False",
+      "is_local": "False",
+      "is_persistent": "False",
+      "is_split_kv": "False",
+      "is_varlen_q": "True",
+      "kv_subtile_factor": "1",
+      "m_block_size": "128",
+      "mask_mod": "None",
+      "n_block_size": "128",
+      "pack_gqa": "False",
+      "paged_kv_non_tma": "False",
+      "q_stage": "2",
+      "q_subtile_factor": "1",
+      "qhead_per_kvhead": "1",
+      "score_mod": "None",
+      "use_2cta_instrs": "False",
+      "use_clc_scheduler": "False"
+     },
+     "cls": "FlashAttentionForwardSm100",
+     "declared_in": "FlashAttentionForwardSm100"
+    }
+   ],
+   "error": null,
+   "keys": {
+    "fwd": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 128, 128, 1, False, False, False, False, None, None, None, False, True, True, False, False, False, False, False, False, False, False, False, True, True, 128, 128, 2, 384, False, False, 100, False, False, 1, 1, True, True, False, True, False, False, False, None, None, None, 0)",
+      "sha256": "64434d7a9157c0d69fa2bad2dc71cfb77d9f349bc31ef26e5d0efbfd4d7c58fe"
+     }
+    ]
+   }
+  },
+  "fwd.sm100.bf16.dense.causal.d128": {
+   "arch": "sm_100",
+   "ctors": [
+    {
+     "args": {
+      "has_aux_tensors": "False",
+      "head_dim": "128",
+      "head_dim_v": "128",
+      "is_causal": "True",
+      "is_local": "False",
+      "is_persistent": "False",
+      "is_split_kv": "False",
+      "is_varlen_q": "False",
+      "kv_subtile_factor": "1",
+      "m_block_size": "128",
+      "mask_mod": "None",
+      "n_block_size": "128",
+      "pack_gqa": "False",
+      "paged_kv_non_tma": "False",
+      "q_stage": "2",
+      "q_subtile_factor": "1",
+      "qhead_per_kvhead": "1",
+      "score_mod": "None",
+      "use_2cta_instrs": "False",
+      "use_clc_scheduler": "False"
+     },
+     "cls": "FlashAttentionForwardSm100",
+     "declared_in": "FlashAttentionForwardSm100"
+    }
+   ],
+   "error": null,
+   "keys": {
+    "fwd": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 128, 128, 1, True, False, False, False, None, None, None, False, True, True, True, True, False, False, False, False, False, False, False, True, True, 128, 128, 2, 384, False, False, 100, False, False, 1, 1, True, True, False, True, False, False, False, None, None, None, 0)",
+      "sha256": "26b1165ac932f136282ddacaa32a11533056477cde7fe139416755b4dfd175a6"
+     }
+    ]
+   }
+  },
+  "fwd.sm100.bf16.dense.causal.d256": {
+   "arch": "sm_100",
+   "ctors": [
+    {
+     "args": {
+      "has_aux_tensors": "False",
+      "head_dim": "256",
+      "head_dim_v": "256",
+      "is_causal": "True",
+      "is_local": "False",
+      "is_persistent": "False",
+      "is_split_kv": "False",
+      "is_varlen_q": "False",
+      "kv_subtile_factor": "1",
+      "m_block_size": "128",
+      "mask_mod": "None",
+      "n_block_size": "128",
+      "pack_gqa": "False",
+      "paged_kv_non_tma": "False",
+      "q_stage": "2",
+      "q_subtile_factor": "1",
+      "qhead_per_kvhead": "1",
+      "score_mod": "None",
+      "use_2cta_instrs": "True",
+      "use_clc_scheduler": "False"
+     },
+     "cls": "BlackwellFusedMultiHeadAttentionForward",
+     "declared_in": "BlackwellFusedMultiHeadAttentionForward"
+    }
+   ],
+   "error": null,
+   "keys": {
+    "fwd": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 256, 256, 1, True, False, False, False, None, None, None, False, True, True, True, True, False, False, False, False, False, False, False, True, True, 128, 128, 2, 384, False, False, 100, False, True, 1, 1, True, True, False, True, False, False, False, None, None, None, 0)",
+      "sha256": "1f7d4a8b1ec8606fb3de9eba9b7694cfcf23d0936107326b80d4f30d994bdc6d"
+     }
+    ]
+   }
+  },
+  "fwd.sm100.bf16.dense.causal.gqa8.d128": {
+   "arch": "sm_100",
+   "ctors": [
+    {
+     "args": {
+      "has_aux_tensors": "False",
+      "head_dim": "128",
+      "head_dim_v": "128",
+      "is_causal": "True",
+      "is_local": "False",
+      "is_persistent": "False",
+      "is_split_kv": "False",
+      "is_varlen_q": "False",
+      "kv_subtile_factor": "1",
+      "m_block_size": "128",
+      "mask_mod": "None",
+      "n_block_size": "128",
+      "pack_gqa": "True",
+      "paged_kv_non_tma": "False",
+      "q_stage": "2",
+      "q_subtile_factor": "1",
+      "qhead_per_kvhead": "8",
+      "score_mod": "None",
+      "use_2cta_instrs": "False",
+      "use_clc_scheduler": "False"
+     },
+     "cls": "FlashAttentionForwardSm100",
+     "declared_in": "FlashAttentionForwardSm100"
+    }
+   ],
+   "error": null,
+   "keys": {
+    "fwd": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 128, 128, 8, True, False, False, False, None, None, None, False, True, True, True, True, False, False, False, False, False, False, False, True, True, 128, 128, 2, 384, False, True, 100, False, False, 1, 1, True, True, False, True, False, False, False, None, None, None, 0)",
+      "sha256": "5b62eb4115ca427b1cac92fc4d0b08d50cd64d97b8fbd6994e73cf78304ea820"
+     }
+    ]
+   }
+  },
+  "fwd.sm100.bf16.dense.causal.gqa8.d128.nopack": {
+   "arch": "sm_100",
+   "ctors": [
+    {
+     "args": {
+      "has_aux_tensors": "False",
+      "head_dim": "128",
+      "head_dim_v": "128",
+      "is_causal": "True",
+      "is_local": "False",
+      "is_persistent": "False",
+      "is_split_kv": "False",
+      "is_varlen_q": "False",
+      "kv_subtile_factor": "1",
+      "m_block_size": "128",
+      "mask_mod": "None",
+      "n_block_size": "128",
+      "pack_gqa": "False",
+      "paged_kv_non_tma": "False",
+      "q_stage": "2",
+      "q_subtile_factor": "1",
+      "qhead_per_kvhead": "8",
+      "score_mod": "None",
+      "use_2cta_instrs": "False",
+      "use_clc_scheduler": "False"
+     },
+     "cls": "FlashAttentionForwardSm100",
+     "declared_in": "FlashAttentionForwardSm100"
+    }
+   ],
+   "error": null,
+   "keys": {
+    "fwd": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 128, 128, 8, True, False, False, False, None, None, None, False, True, True, True, True, False, False, False, False, False, False, False, True, True, 128, 128, 2, 384, False, False, 100, False, False, 1, 1, True, True, False, True, False, False, False, None, None, None, 0)",
+      "sha256": "63eae3d1c3495ad61ac3a565d0ab7ffe8e669f9ef1da3c51269ea9f6ce1f7c30"
+     }
+    ]
+   }
+  },
+  "fwd.sm100.bf16.dense.d192v128": {
+   "arch": "sm_100",
+   "ctors": [
+    {
+     "args": {
+      "has_aux_tensors": "False",
+      "head_dim": "192",
+      "head_dim_v": "128",
+      "is_causal": "False",
+      "is_local": "False",
+      "is_persistent": "True",
+      "is_split_kv": "False",
+      "is_varlen_q": "False",
+      "kv_subtile_factor": "1",
+      "m_block_size": "128",
+      "mask_mod": "None",
+      "n_block_size": "128",
+      "pack_gqa": "False",
+      "paged_kv_non_tma": "False",
+      "q_stage": "2",
+      "q_subtile_factor": "1",
+      "qhead_per_kvhead": "1",
+      "score_mod": "None",
+      "use_2cta_instrs": "True",
+      "use_clc_scheduler": "False"
+     },
+     "cls": "FlashAttentionForwardSm100",
+     "declared_in": "FlashAttentionForwardSm100"
+    }
+   ],
+   "error": null,
+   "keys": {
+    "fwd": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 192, 128, 1, False, False, False, False, None, None, None, False, True, True, True, True, False, False, False, False, False, False, False, True, True, 128, 128, 2, 384, False, False, 100, False, True, 1, 1, True, True, False, True, False, False, False, None, None, None, 0)",
+      "sha256": "0c5549cfaf7729286d1a63b12ab7c7d53adf27f2307b292f4c2409025fd99b5c"
+     }
+    ]
+   }
+  },
+  "fwd.sm100.bf16.dense.d64": {
+   "arch": "sm_100",
+   "ctors": [
+    {
+     "args": {
+      "has_aux_tensors": "False",
+      "head_dim": "64",
+      "head_dim_v": "64",
+      "is_causal": "False",
+      "is_local": "False",
+      "is_persistent": "True",
+      "is_split_kv": "False",
+      "is_varlen_q": "False",
+      "kv_subtile_factor": "1",
+      "m_block_size": "128",
+      "mask_mod": "None",
+      "n_block_size": "128",
+      "pack_gqa": "False",
+      "paged_kv_non_tma": "False",
+      "q_stage": "2",
+      "q_subtile_factor": "1",
+      "qhead_per_kvhead": "1",
+      "score_mod": "None",
+      "use_2cta_instrs": "False",
+      "use_clc_scheduler": "False"
+     },
+     "cls": "FlashAttentionForwardSm100",
+     "declared_in": "FlashAttentionForwardSm100"
+    }
+   ],
+   "error": null,
+   "keys": {
+    "fwd": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 64, 64, 1, False, False, False, False, None, None, None, False, True, True, True, True, False, False, False, False, False, False, False, True, True, 128, 128, 2, 384, False, False, 100, False, False, 1, 1, True, True, False, True, False, False, False, None, None, None, 0)",
+      "sha256": "203354c585f4c44e978cbdd76d6ae1484c3efb2b81cd060c04e53f80025d31ff"
+     }
+    ]
+   }
+  },
+  "fwd.sm100.bf16.dense.local.d64": {
+   "arch": "sm_100",
+   "ctors": [
+    {
+     "args": {
+      "has_aux_tensors": "False",
+      "head_dim": "64",
+      "head_dim_v": "64",
+      "is_causal": "False",
+      "is_local": "True",
+      "is_persistent": "False",
+      "is_split_kv": "False",
+      "is_varlen_q": "False",
+      "kv_subtile_factor": "1",
+      "m_block_size": "128",
+      "mask_mod": "None",
+      "n_block_size": "128",
+      "pack_gqa": "False",
+      "paged_kv_non_tma": "False",
+      "q_stage": "2",
+      "q_subtile_factor": "1",
+      "qhead_per_kvhead": "1",
+      "score_mod": "None",
+      "use_2cta_instrs": "False",
+      "use_clc_scheduler": "False"
+     },
+     "cls": "FlashAttentionForwardSm100",
+     "declared_in": "FlashAttentionForwardSm100"
+    }
+   ],
+   "error": null,
+   "keys": {
+    "fwd": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 64, 64, 1, False, False, False, False, None, None, None, False, True, True, True, True, False, True, True, False, False, False, False, True, True, 128, 128, 2, 384, False, False, 100, False, False, 1, 1, True, True, False, True, False, False, False, None, None, None, 0)",
+      "sha256": "f112066a7ef94f7cf2befa48357ca686b108ebbb6021fd9cba361460ceb8857b"
+     }
+    ]
+   }
+  },
+  "fwd.sm100.bf16.dense.mask_mod.d128": {
+   "arch": "sm_100",
+   "ctors": [
+    {
+     "args": {
+      "has_aux_tensors": "False",
+      "head_dim": "128",
+      "head_dim_v": "128",
+      "is_causal": "False",
+      "is_local": "False",
+      "is_persistent": "True",
+      "is_split_kv": "False",
+      "is_varlen_q": "False",
+      "kv_subtile_factor": "1",
+      "m_block_size": "128",
+      "mask_mod": "callable:0da4a639f184",
+      "n_block_size": "128",
+      "pack_gqa": "False",
+      "paged_kv_non_tma": "False",
+      "q_stage": "2",
+      "q_subtile_factor": "1",
+      "qhead_per_kvhead": "1",
+      "score_mod": "None",
+      "use_2cta_instrs": "True",
+      "use_clc_scheduler": "False"
+     },
+     "cls": "FlashAttentionForwardSm100",
+     "declared_in": "FlashAttentionForwardSm100"
+    }
+   ],
+   "error": null,
+   "keys": {
+    "fwd": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 128, 128, 1, False, False, '0da4a639f1844d23267110d41d80fd0fb8cf2c533e9c83aa7773795bf6b08afd', False, None, None, None, False, True, True, True, True, False, False, False, False, False, False, False, True, True, 128, 128, 2, 384, False, False, 100, False, True, 1, 1, True, True, False, True, False, False, False, None, None, None, 0)",
+      "sha256": "2b9080feeb49697d0999f0c9b199503d44be87617a6a050a7d9a32e078a0c98a"
+     }
+    ]
+   }
+  },
+  "fwd.sm100.bf16.dense.noncausal.d128.sq8k": {
+   "arch": "sm_100",
+   "ctors": [
+    {
+     "args": {
+      "has_aux_tensors": "False",
+      "head_dim": "128",
+      "head_dim_v": "128",
+      "is_causal": "False",
+      "is_local": "False",
+      "is_persistent": "True",
+      "is_split_kv": "False",
+      "is_varlen_q": "False",
+      "kv_subtile_factor": "1",
+      "m_block_size": "128",
+      "mask_mod": "None",
+      "n_block_size": "128",
+      "pack_gqa": "False",
+      "paged_kv_non_tma": "False",
+      "q_stage": "2",
+      "q_subtile_factor": "1",
+      "qhead_per_kvhead": "1",
+      "score_mod": "None",
+      "use_2cta_instrs": "True",
+      "use_clc_scheduler": "False"
+     },
+     "cls": "FlashAttentionForwardSm100",
+     "declared_in": "FlashAttentionForwardSm100"
+    }
+   ],
+   "error": null,
+   "keys": {
+    "fwd": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 128, 128, 1, False, False, False, False, None, None, None, False, True, True, True, True, False, False, False, False, False, False, False, True, True, 128, 128, 2, 384, False, False, 100, False, True, 1, 1, True, True, False, True, False, False, False, None, None, None, 0)",
+      "sha256": "2aea66795c7e50075065481619d5546943f75b91824c29f811c64247549e0a25"
+     }
+    ]
+   }
+  },
+  "fwd.sm100.bf16.dense.qv.d64v512": {
+   "arch": "sm_100",
+   "ctors": [
+    {
+     "args": {
+      "disable_bitmask": "False",
+      "has_cu_seqlens_q": "False",
+      "has_qk": "True",
+      "has_seqused_q": "False",
+      "hdim": "64",
+      "hdimv": "512",
+      "is_causal": "False",
+      "is_topk_gather": "False",
+      "nheads_kv": "8",
+      "pack_gqa": "False",
+      "qhead_per_kvhead": "1",
+      "topk_length": "2048",
+      "use_clc_scheduler": "True",
+      "use_cpasync_load_KV": "False"
+     },
+     "cls": "FlashAttentionMLAForwardSm100",
+     "declared_in": "FlashAttentionMLAForwardSm100"
+    }
+   ],
+   "error": null,
+   "keys": {
+    "fwd": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 64, 512, 1, False, False, False, False, None, None, None, False, True, True, True, True, False, False, False, False, False, False, False, True, True, 128, 128, 2, 384, False, False, 100, False, False, 1, 1, True, True, False, True, True, False, False, 2048, False, False, 0)",
+      "sha256": "1298a2656d65ef685cce2e555c9ee08194e2961eeaf4f1588a7f64b26492b719"
+     }
+    ]
+   }
+  },
+  "fwd.sm100.bf16.dense.score_mod.d128": {
+   "arch": "sm_100",
+   "ctors": [
+    {
+     "args": {
+      "has_aux_tensors": "False",
+      "head_dim": "128",
+      "head_dim_v": "128",
+      "is_causal": "False",
+      "is_local": "False",
+      "is_persistent": "True",
+      "is_split_kv": "False",
+      "is_varlen_q": "False",
+      "kv_subtile_factor": "1",
+      "m_block_size": "128",
+      "mask_mod": "None",
+      "n_block_size": "128",
+      "pack_gqa": "False",
+      "paged_kv_non_tma": "False",
+      "q_stage": "2",
+      "q_subtile_factor": "1",
+      "qhead_per_kvhead": "1",
+      "score_mod": "callable:fae6422ed920",
+      "use_2cta_instrs": "True",
+      "use_clc_scheduler": "False"
+     },
+     "cls": "FlashAttentionForwardSm100",
+     "declared_in": "FlashAttentionForwardSm100"
+    }
+   ],
+   "error": null,
+   "keys": {
+    "fwd": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 128, 128, 1, False, 'fae6422ed920764b1f3dd3f635ede19c20995507c11c3cbecb8b5dc461d6c329', False, False, None, None, None, False, True, True, True, True, False, False, False, False, False, False, False, True, True, 128, 128, 2, 384, False, False, 100, False, True, 1, 1, True, True, False, True, False, False, False, None, None, None, 0)",
+      "sha256": "dba6a567c49a1ce9cbfa5639d79e65084a086b1c57992b2ae76fb4a4abe6ec41"
+     }
+    ]
+   }
+  },
+  "fwd.sm100.bf16.dense.short.d64": {
+   "arch": "sm_100",
+   "ctors": [
+    {
+     "args": {
+      "has_aux_tensors": "False",
+      "head_dim": "64",
+      "head_dim_v": "64",
+      "is_causal": "False",
+      "is_local": "False",
+      "is_persistent": "True",
+      "is_split_kv": "False",
+      "is_varlen_q": "False",
+      "kv_subtile_factor": "1",
+      "m_block_size": "128",
+      "mask_mod": "None",
+      "n_block_size": "128",
+      "pack_gqa": "False",
+      "paged_kv_non_tma": "False",
+      "q_stage": "1",
+      "q_subtile_factor": "1",
+      "qhead_per_kvhead": "1",
+      "score_mod": "None",
+      "use_2cta_instrs": "False",
+      "use_clc_scheduler": "False"
+     },
+     "cls": "FlashAttentionForwardSm100",
+     "declared_in": "FlashAttentionForwardSm100"
+    }
+   ],
+   "error": null,
+   "keys": {
+    "fwd": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 64, 64, 1, False, False, False, False, None, None, None, False, True, True, True, True, False, False, False, False, False, False, False, True, True, 128, 128, 1, 384, False, False, 100, False, False, 1, 1, True, True, False, True, False, False, False, None, None, None, 0)",
+      "sha256": "bdb7856dec360ec224b7f62c0eb6d141041fed7f4f58ca91175742d101336d38"
+     }
+    ]
+   }
+  },
+  "fwd.sm100.bf16.dense.sink.d128": {
+   "arch": "sm_100",
+   "ctors": [
+    {
+     "args": {
+      "has_aux_tensors": "False",
+      "head_dim": "128",
+      "head_dim_v": "128",
+      "is_causal": "False",
+      "is_local": "False",
+      "is_persistent": "True",
+      "is_split_kv": "False",
+      "is_varlen_q": "False",
+      "kv_subtile_factor": "1",
+      "m_block_size": "128",
+      "mask_mod": "None",
+      "n_block_size": "128",
+      "pack_gqa": "False",
+      "paged_kv_non_tma": "False",
+      "q_stage": "2",
+      "q_subtile_factor": "1",
+      "qhead_per_kvhead": "1",
+      "score_mod": "None",
+      "use_2cta_instrs": "True",
+      "use_clc_scheduler": "False"
+     },
+     "cls": "FlashAttentionForwardSm100",
+     "declared_in": "FlashAttentionForwardSm100"
+    }
+   ],
+   "error": null,
+   "keys": {
+    "fwd": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 128, 128, 1, False, False, False, False, None, None, None, False, True, True, True, True, False, False, False, True, False, False, False, True, True, 128, 128, 2, 384, False, False, 100, False, True, 1, 1, True, True, False, True, False, False, False, None, None, None, 0)",
+      "sha256": "f40a73f6df190ccf154376bdb6502ef7a757d7010db605a8bd7a76913a5d52d8"
+     }
+    ]
+   }
+  },
+  "fwd.sm100.bf16.dense.split3.d128": {
+   "arch": "sm_100",
+   "ctors": [
+    {
+     "args": {
+      "has_aux_tensors": "False",
+      "head_dim": "128",
+      "head_dim_v": "128",
+      "is_causal": "False",
+      "is_local": "False",
+      "is_persistent": "False",
+      "is_split_kv": "True",
+      "is_varlen_q": "False",
+      "kv_subtile_factor": "1",
+      "m_block_size": "128",
+      "mask_mod": "None",
+      "n_block_size": "128",
+      "pack_gqa": "False",
+      "paged_kv_non_tma": "False",
+      "q_stage": "1",
+      "q_subtile_factor": "1",
+      "qhead_per_kvhead": "1",
+      "score_mod": "None",
+      "use_2cta_instrs": "False",
+      "use_clc_scheduler": "False"
+     },
+     "cls": "FlashAttentionForwardSm100",
+     "declared_in": "FlashAttentionForwardSm100"
+    },
+    {
+     "args": {
+      "dtype": "<class 'cutlass.base_dsl.typing.BFloat16'>",
+      "dtype_partial": "<class 'cutlass.base_dsl.typing.Float32'>",
+      "head_dim": "128",
+      "k_block_size": "128",
+      "log_max_splits": "5",
+      "num_threads": "256",
+      "stages": "4",
+      "tile_m": "8"
+     },
+     "cls": "FlashAttentionForwardCombine",
+     "declared_in": "FlashAttentionForwardCombine"
+    }
+   ],
+   "error": null,
+   "keys": {
+    "fwd": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 128, 128, 1, False, False, False, False, None, None, None, False, True, True, True, True, False, False, False, False, False, False, False, True, True, 128, 128, 1, 384, True, False, 100, False, False, 1, 1, True, True, False, True, False, False, False, None, None, None, 0)",
+      "sha256": "4e88374b6a9ddb9d0b2f9fe27427463d880139b0f2f2b8f66c8709d436ee8b62"
+     }
+    ],
+    "fwd_combine": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, <class 'cutlass.base_dsl.typing.Float32'>, 128, 8, 128, 5, False, False, True, False)",
+      "sha256": "3ab9be049e9b9b01316443598646d403a3cdfbf8142cdb73f881a1b93cb8a5c5"
+     }
+    ]
+   }
+  },
+  "fwd.sm100.bf16.paged.decode.d128": {
+   "arch": "sm_100",
+   "ctors": [
+    {
+     "args": {
+      "has_aux_tensors": "False",
+      "head_dim": "128",
+      "head_dim_v": "128",
+      "is_causal": "False",
+      "is_local": "False",
+      "is_persistent": "True",
+      "is_split_kv": "False",
+      "is_varlen_q": "False",
+      "kv_subtile_factor": "1",
+      "m_block_size": "128",
+      "mask_mod": "None",
+      "n_block_size": "128",
+      "pack_gqa": "False",
+      "paged_kv_non_tma": "False",
+      "q_stage": "1",
+      "q_subtile_factor": "1",
+      "qhead_per_kvhead": "1",
+      "score_mod": "None",
+      "use_2cta_instrs": "False",
+      "use_clc_scheduler": "False"
+     },
+     "cls": "FlashAttentionForwardSm100",
+     "declared_in": "FlashAttentionForwardSm100"
+    }
+   ],
+   "error": null,
+   "keys": {
+    "fwd": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 128, 128, 1, False, False, False, False, None, None, None, False, True, True, True, False, True, False, False, False, False, False, False, True, True, 128, 128, 1, 384, False, False, 100, False, False, 1, 1, True, True, False, True, False, False, False, None, None, None, 0)",
+      "sha256": "3f6c1dc75ef256acb22664dc7bfd767d483806dca710ee421e947c552bf87119"
+     }
+    ]
+   }
+  },
+  "fwd.sm100.bf16.varlen.causal.d128": {
+   "arch": "sm_100",
+   "ctors": [
+    {
+     "args": {
+      "has_aux_tensors": "False",
+      "head_dim": "128",
+      "head_dim_v": "128",
+      "is_causal": "True",
+      "is_local": "False",
+      "is_persistent": "False",
+      "is_split_kv": "False",
+      "is_varlen_q": "True",
+      "kv_subtile_factor": "1",
+      "m_block_size": "128",
+      "mask_mod": "None",
+      "n_block_size": "128",
+      "pack_gqa": "False",
+      "paged_kv_non_tma": "False",
+      "q_stage": "2",
+      "q_subtile_factor": "1",
+      "qhead_per_kvhead": "1",
+      "score_mod": "None",
+      "use_2cta_instrs": "False",
+      "use_clc_scheduler": "False"
+     },
+     "cls": "FlashAttentionForwardSm100",
+     "declared_in": "FlashAttentionForwardSm100"
+    }
+   ],
+   "error": null,
+   "keys": {
+    "fwd": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 128, 128, 1, True, False, False, False, None, None, None, False, False, False, True, True, False, False, False, False, False, False, False, True, True, 128, 128, 2, 384, False, False, 100, False, False, 1, 1, True, True, False, True, False, False, False, None, None, None, 0)",
+      "sha256": "8c2f6d9650325eb974704737d54ccbde468052048ae181ed23c133554e32ef65"
+     }
+    ]
+   }
+  },
+  "fwd.sm100.fp8e4m3.dense.d128": {
+   "arch": "sm_100",
+   "ctors": [
+    {
+     "args": {
+      "has_aux_tensors": "False",
+      "head_dim": "128",
+      "head_dim_v": "128",
+      "is_causal": "False",
+      "is_local": "False",
+      "is_persistent": "True",
+      "is_split_kv": "False",
+      "is_varlen_q": "False",
+      "kv_subtile_factor": "1",
+      "m_block_size": "128",
+      "mask_mod": "None",
+      "n_block_size": "128",
+      "pack_gqa": "False",
+      "paged_kv_non_tma": "False",
+      "q_stage": "2",
+      "q_subtile_factor": "1",
+      "qhead_per_kvhead": "1",
+      "score_mod": "None",
+      "use_2cta_instrs": "True",
+      "use_clc_scheduler": "False"
+     },
+     "cls": "FlashAttentionForwardSm100",
+     "declared_in": "FlashAttentionForwardSm100"
+    }
+   ],
+   "error": null,
+   "keys": {
+    "fwd": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.Float8E4M3FN'>, 128, 128, 1, False, False, False, False, None, None, None, False, True, True, True, True, False, False, False, False, False, False, False, True, True, 128, 128, 2, 384, False, False, 100, False, True, 1, 1, True, True, False, True, False, False, False, None, None, None, 0)",
+      "sha256": "8b57e119448d8e8b472db05342c0d95ca0380f5c922b3f1c39ebe16433bddf65"
+     }
+    ]
+   }
+  },
+  "fwd.sm100.fp8e4m3.dense.descale.d128": {
+   "arch": "sm_100",
+   "ctors": [
+    {
+     "args": {
+      "has_aux_tensors": "False",
+      "head_dim": "128",
+      "head_dim_v": "128",
+      "is_causal": "False",
+      "is_local": "False",
+      "is_persistent": "True",
+      "is_split_kv": "False",
+      "is_varlen_q": "False",
+      "kv_subtile_factor": "1",
+      "m_block_size": "128",
+      "mask_mod": "None",
+      "n_block_size": "128",
+      "pack_gqa": "False",
+      "paged_kv_non_tma": "False",
+      "q_stage": "2",
+      "q_subtile_factor": "1",
+      "qhead_per_kvhead": "1",
+      "score_mod": "None",
+      "use_2cta_instrs": "True",
+      "use_clc_scheduler": "False"
+     },
+     "cls": "FlashAttentionForwardSm100",
+     "declared_in": "FlashAttentionForwardSm100"
+    }
+   ],
+   "error": null,
+   "keys": {
+    "fwd": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.Float8E4M3FN'>, 128, 128, 1, False, False, False, False, None, None, None, False, True, True, True, True, False, False, False, False, True, True, True, True, True, 128, 128, 2, 384, False, False, 100, False, True, 1, 1, True, True, False, True, False, False, False, None, None, None, 0)",
+      "sha256": "bcd6ee09c1557d5cf0ff59b5cd54826b659e30fc29d089e52efa9b3a22e7d034"
+     }
+    ]
+   }
+  },
+  "fwd.sm103.bf16.dense.causal.d128": {
+   "arch": "sm_103",
+   "ctors": [
+    {
+     "args": {
+      "has_aux_tensors": "False",
+      "head_dim": "128",
+      "head_dim_v": "128",
+      "is_causal": "True",
+      "is_local": "False",
+      "is_persistent": "False",
+      "is_split_kv": "False",
+      "is_varlen_q": "False",
+      "kv_subtile_factor": "1",
+      "m_block_size": "128",
+      "mask_mod": "None",
+      "n_block_size": "128",
+      "pack_gqa": "False",
+      "paged_kv_non_tma": "False",
+      "q_stage": "2",
+      "q_subtile_factor": "1",
+      "qhead_per_kvhead": "1",
+      "score_mod": "None",
+      "use_2cta_instrs": "False",
+      "use_clc_scheduler": "False"
+     },
+     "cls": "FlashAttentionForwardSm100",
+     "declared_in": "FlashAttentionForwardSm100"
+    }
+   ],
+   "error": null,
+   "keys": {
+    "fwd": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 128, 128, 1, True, False, False, False, None, None, None, False, True, True, True, True, False, False, False, False, False, False, False, True, True, 128, 128, 2, 384, False, False, 103, False, False, 1, 1, True, True, False, True, False, False, False, None, None, None, 0)",
+      "sha256": "a8bed07ffdefe2d93dd37069d529b0fff8d03d1f63b5fcaa9817a92b70238d99"
+     }
+    ]
+   }
+  },
+  "fwd.sm103.bf16.varlen.causal.d128": {
+   "arch": "sm_103",
+   "ctors": [
+    {
+     "args": {
+      "has_aux_tensors": "False",
+      "head_dim": "128",
+      "head_dim_v": "128",
+      "is_causal": "True",
+      "is_local": "False",
+      "is_persistent": "False",
+      "is_split_kv": "False",
+      "is_varlen_q": "True",
+      "kv_subtile_factor": "1",
+      "m_block_size": "128",
+      "mask_mod": "None",
+      "n_block_size": "128",
+      "pack_gqa": "False",
+      "paged_kv_non_tma": "False",
+      "q_stage": "2",
+      "q_subtile_factor": "1",
+      "qhead_per_kvhead": "1",
+      "score_mod": "None",
+      "use_2cta_instrs": "False",
+      "use_clc_scheduler": "False"
+     },
+     "cls": "FlashAttentionForwardSm100",
+     "declared_in": "FlashAttentionForwardSm100"
+    }
+   ],
+   "error": null,
+   "keys": {
+    "fwd": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 128, 128, 1, True, False, False, False, None, None, None, False, False, False, True, True, False, False, False, False, False, False, False, True, True, 128, 128, 2, 384, False, False, 103, False, False, 1, 1, True, True, False, True, False, False, False, None, None, None, 0)",
+      "sha256": "afe12dc6997c6eb2f4657fa33d5b38b758eb8d0e51d75d50bd1b9f1db70b0af9"
+     }
+    ]
+   }
+  },
+  "fwd.sm120.bf16.dense.causal.d128": {
+   "arch": "sm_120",
+   "ctors": [
+    {
+     "args": {
+      "args": [
+       "<class 'cutlass.base_dsl.typing.BFloat16'>",
+       "128",
+       "128",
+       "1"
+      ],
+      "kwargs": {
+       "Q_in_regs": "False",
+       "has_aux_tensors": "False",
+       "is_causal": "True",
+       "is_local": "False",
+       "mask_mod": "None",
+       "num_stages": "1",
+       "num_threads": "128",
+       "pack_gqa": "False",
+       "score_mod": "None",
+       "tile_m": "128",
+       "tile_n": "64"
+      }
+     },
+     "cls": "FlashAttentionForwardSm120",
+     "declared_in": "FlashAttentionForwardSm120"
+    }
+   ],
+   "error": null,
+   "keys": {
+    "fwd": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 128, 128, 1, True, False, False, False, None, None, None, False, True, True, True, True, False, False, False, False, False, False, False, True, True, 128, 64, 1, 128, False, False, 120, False, False, 1, 1, True, True, False, True, False, False, False, None, None, None, 0)",
+      "sha256": "62f05a8032a73211fd87d1773c8ad4ccb45ebb520dcb5409e66b39b52df79a8b"
+     }
+    ]
+   }
+  },
+  "fwd.sm120.bf16.dense.d64": {
+   "arch": "sm_120",
+   "ctors": [
+    {
+     "args": {
+      "args": [
+       "<class 'cutlass.base_dsl.typing.BFloat16'>",
+       "64",
+       "64",
+       "1"
+      ],
+      "kwargs": {
+       "Q_in_regs": "False",
+       "has_aux_tensors": "False",
+       "is_causal": "False",
+       "is_local": "False",
+       "mask_mod": "None",
+       "num_stages": "1",
+       "num_threads": "128",
+       "pack_gqa": "False",
+       "score_mod": "None",
+       "tile_m": "128",
+       "tile_n": "128"
+      }
+     },
+     "cls": "FlashAttentionForwardSm120",
+     "declared_in": "FlashAttentionForwardSm120"
+    }
+   ],
+   "error": null,
+   "keys": {
+    "fwd": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 64, 64, 1, False, False, False, False, None, None, None, False, True, True, True, True, False, False, False, False, False, False, False, True, True, 128, 128, 1, 128, False, False, 120, False, False, 1, 1, True, True, False, True, False, False, False, None, None, None, 0)",
+      "sha256": "08404fa239d90fe1d72f81f3a219db676ad1c912559e56ed50a4a52f520331aa"
+     }
+    ]
+   }
+  },
+  "fwd.sm120.bf16.dense.split3.d128": {
+   "arch": "sm_120",
+   "ctors": [],
+   "error": {
+    "message": "SM120 forward only supports num_splits=1",
+    "type": "AssertionError"
+   },
+   "keys": {}
+  },
+  "fwd.sm80.bf16.dense.causal.d128": {
+   "arch": "sm_80",
+   "ctors": [],
+   "error": null,
+   "keys": {
+    "fwd": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 128, 128, 1, True, False, False, False, None, None, None, False, True, True, True, True, False, False, False, False, False, False, False, True, True, 128, 64, 1, 128, False, False, 80, False, False, 1, 1, True, True, False, True, False, False, False, None, None, None, 0)",
+      "sha256": "c28b7b9a47237f699dcf5d7c0600bcdaae750aef86c2145792660bf5663bd55f"
+     }
+    ]
+   }
+  },
+  "fwd.sm80.bf16.dense.d64": {
+   "arch": "sm_80",
+   "ctors": [],
+   "error": null,
+   "keys": {
+    "fwd": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 64, 64, 1, False, False, False, False, None, None, None, False, True, True, True, True, False, False, False, False, False, False, False, True, True, 128, 64, 1, 128, False, False, 80, False, False, 1, 1, True, True, False, True, False, False, False, None, None, None, 0)",
+      "sha256": "dcb183fcd5d9b285dd88dfba367a1ee306c653b1a0b2efe3cb27751f1eec414c"
+     }
+    ]
+   }
+  },
+  "fwd.sm80.bf16.varlen.d64": {
+   "arch": "sm_80",
+   "ctors": [],
+   "error": null,
+   "keys": {
+    "fwd": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 64, 64, 1, False, False, False, False, None, None, None, False, False, False, True, True, False, False, False, False, False, False, False, True, True, 128, 64, 1, 128, False, False, 80, False, False, 1, 1, True, True, False, True, False, False, False, None, None, None, 0)",
+      "sha256": "8c9a779032f5ac283451eba3cb4d3355d81d878682c99d7ff22e0a9f00addb58"
+     }
+    ]
+   }
+  },
+  "fwd.sm80.fp16.dense.causal.gqa4.d128": {
+   "arch": "sm_80",
+   "ctors": [],
+   "error": null,
+   "keys": {
+    "fwd": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.Float16'>, 128, 128, 4, True, False, False, False, None, None, None, False, True, True, True, True, False, False, False, False, False, False, False, True, True, 128, 64, 1, 128, False, True, 80, False, False, 1, 1, True, True, False, True, False, False, False, None, None, None, 0)",
+      "sha256": "619d1a2079dab6bd303af302f0223cb06a6ffb005b7235ba7a80f6bfc969e0f0"
+     }
+    ]
+   }
+  },
+  "fwd.sm90.bf16.batched.seqused.d64": {
+   "arch": "sm_90",
+   "ctors": [
+    {
+     "args": {
+      "args": [
+       "<class 'cutlass.base_dsl.typing.BFloat16'>",
+       "64",
+       "64",
+       "1"
+      ],
+      "intra_wg_overlap": "True",
+      "kwargs": {
+       "Q_in_regs": "False",
+       "has_aux_tensors": "False",
+       "is_causal": "False",
+       "is_local": "False",
+       "mask_mod": "None",
+       "num_stages": "2",
+       "num_threads": "384",
+       "pack_gqa": "False",
+       "q_subtile_factor": "1",
+       "score_mod": "None",
+       "tile_m": "192",
+       "tile_n": "128"
+      },
+      "mma_pv_is_rs": "True",
+      "paged_kv_non_tma": "False"
+     },
+     "cls": "FlashAttentionForwardSm90",
+     "declared_in": "FlashAttentionForwardSm90"
+    }
+   ],
+   "error": null,
+   "keys": {
+    "fwd": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 64, 64, 1, False, False, False, False, None, None, None, False, True, True, False, False, False, False, False, False, False, False, False, True, True, 192, 128, 1, 384, False, False, 90, False, False, 1, 1, True, True, False, True, False, False, False, None, None, None, 0)",
+      "sha256": "1a5707c714a538ae48cfd41750302d8c4a4759014673d4a3c71e009fb545c589"
+     }
+    ]
+   }
+  },
+  "fwd.sm90.bf16.dense.aux_score_mod.d64": {
+   "arch": "sm_90",
+   "ctors": [
+    {
+     "args": {
+      "args": [
+       "<class 'cutlass.base_dsl.typing.BFloat16'>",
+       "64",
+       "64",
+       "1"
+      ],
+      "intra_wg_overlap": "True",
+      "kwargs": {
+       "Q_in_regs": "False",
+       "has_aux_tensors": "True",
+       "is_causal": "False",
+       "is_local": "False",
+       "mask_mod": "None",
+       "num_stages": "2",
+       "num_threads": "384",
+       "pack_gqa": "False",
+       "q_subtile_factor": "1",
+       "score_mod": "callable:fae6422ed920",
+       "tile_m": "192",
+       "tile_n": "128"
+      },
+      "mma_pv_is_rs": "True",
+      "paged_kv_non_tma": "False"
+     },
+     "cls": "FlashAttentionForwardSm90",
+     "declared_in": "FlashAttentionForwardSm90"
+    }
+   ],
+   "error": null,
+   "keys": {
+    "fwd": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 64, 64, 1, False, 'fae6422ed920764b1f3dd3f635ede19c20995507c11c3cbecb8b5dc461d6c329', False, False, None, ((0, -1, False),), None, False, True, True, True, True, False, False, False, False, False, False, False, True, True, 192, 128, 1, 384, False, False, 90, False, False, 1, 1, True, True, False, True, False, False, False, None, None, None, 0)",
+      "sha256": "44251a545105a074aec296fe0b9ee894fc0abaf9a6ce926ae1ceaaefae95abb8"
+     }
+    ]
+   }
+  },
+  "fwd.sm90.bf16.dense.causal.d128": {
+   "arch": "sm_90",
+   "ctors": [
+    {
+     "args": {
+      "args": [
+       "<class 'cutlass.base_dsl.typing.BFloat16'>",
+       "128",
+       "128",
+       "1"
+      ],
+      "intra_wg_overlap": "True",
+      "kwargs": {
+       "Q_in_regs": "False",
+       "has_aux_tensors": "False",
+       "is_causal": "True",
+       "is_local": "False",
+       "mask_mod": "None",
+       "num_stages": "2",
+       "num_threads": "384",
+       "pack_gqa": "False",
+       "q_subtile_factor": "1",
+       "score_mod": "None",
+       "tile_m": "128",
+       "tile_n": "128"
+      },
+      "mma_pv_is_rs": "True",
+      "paged_kv_non_tma": "False"
+     },
+     "cls": "FlashAttentionForwardSm90",
+     "declared_in": "FlashAttentionForwardSm90"
+    }
+   ],
+   "error": null,
+   "keys": {
+    "fwd": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 128, 128, 1, True, False, False, False, None, None, None, False, True, True, True, True, False, False, False, False, False, False, False, True, True, 128, 128, 1, 384, False, False, 90, False, False, 1, 1, True, True, False, True, False, False, False, None, None, None, 0)",
+      "sha256": "f7c5d8afe13a87b99dc0b8e3c825bc1cabbc06727215745172076d7c25208d26"
+     }
+    ]
+   }
+  },
+  "fwd.sm90.bf16.dense.causal.d128.tile_override": {
+   "arch": "sm_90",
+   "ctors": [
+    {
+     "args": {
+      "args": [
+       "<class 'cutlass.base_dsl.typing.BFloat16'>",
+       "128",
+       "128",
+       "1"
+      ],
+      "intra_wg_overlap": "True",
+      "kwargs": {
+       "Q_in_regs": "False",
+       "has_aux_tensors": "False",
+       "is_causal": "True",
+       "is_local": "False",
+       "mask_mod": "None",
+       "num_stages": "2",
+       "num_threads": "384",
+       "pack_gqa": "False",
+       "q_subtile_factor": "1",
+       "score_mod": "None",
+       "tile_m": "128",
+       "tile_n": "128"
+      },
+      "mma_pv_is_rs": "True",
+      "paged_kv_non_tma": "False"
+     },
+     "cls": "FlashAttentionForwardSm90",
+     "declared_in": "FlashAttentionForwardSm90"
+    }
+   ],
+   "error": null,
+   "keys": {
+    "fwd": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 128, 128, 1, True, False, False, False, None, None, None, False, True, True, True, True, False, False, False, False, False, False, False, True, True, 128, 128, 1, 384, False, False, 90, False, False, 1, 1, True, True, False, True, False, False, False, None, None, None, 0)",
+      "sha256": "f7c5d8afe13a87b99dc0b8e3c825bc1cabbc06727215745172076d7c25208d26"
+     }
+    ]
+   }
+  },
+  "fwd.sm90.bf16.dense.causal.gqa8.d96": {
+   "arch": "sm_90",
+   "ctors": [
+    {
+     "args": {
+      "args": [
+       "<class 'cutlass.base_dsl.typing.BFloat16'>",
+       "96",
+       "96",
+       "8"
+      ],
+      "intra_wg_overlap": "True",
+      "kwargs": {
+       "Q_in_regs": "False",
+       "has_aux_tensors": "False",
+       "is_causal": "True",
+       "is_local": "False",
+       "mask_mod": "None",
+       "num_stages": "2",
+       "num_threads": "384",
+       "pack_gqa": "True",
+       "q_subtile_factor": "1",
+       "score_mod": "None",
+       "tile_m": "192",
+       "tile_n": "128"
+      },
+      "mma_pv_is_rs": "False",
+      "paged_kv_non_tma": "False"
+     },
+     "cls": "FlashAttentionForwardSm90",
+     "declared_in": "FlashAttentionForwardSm90"
+    }
+   ],
+   "error": null,
+   "keys": {
+    "fwd": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 96, 96, 8, True, False, False, False, None, None, None, False, True, True, True, True, False, False, False, False, False, False, False, True, True, 192, 128, 1, 384, False, True, 90, False, False, 1, 1, False, True, False, True, False, False, False, None, None, None, 0)",
+      "sha256": "2463bfabfd2fb9cf746cbc64e23009039f11e436f9556e846901667d1895169c"
+     }
+    ]
+   }
+  },
+  "fwd.sm90.bf16.dense.d64": {
+   "arch": "sm_90",
+   "ctors": [
+    {
+     "args": {
+      "args": [
+       "<class 'cutlass.base_dsl.typing.BFloat16'>",
+       "64",
+       "64",
+       "1"
+      ],
+      "intra_wg_overlap": "True",
+      "kwargs": {
+       "Q_in_regs": "False",
+       "has_aux_tensors": "False",
+       "is_causal": "False",
+       "is_local": "False",
+       "mask_mod": "None",
+       "num_stages": "2",
+       "num_threads": "384",
+       "pack_gqa": "False",
+       "q_subtile_factor": "1",
+       "score_mod": "None",
+       "tile_m": "192",
+       "tile_n": "128"
+      },
+      "mma_pv_is_rs": "True",
+      "paged_kv_non_tma": "False"
+     },
+     "cls": "FlashAttentionForwardSm90",
+     "declared_in": "FlashAttentionForwardSm90"
+    }
+   ],
+   "error": null,
+   "keys": {
+    "fwd": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 64, 64, 1, False, False, False, False, None, None, None, False, True, True, True, True, False, False, False, False, False, False, False, True, True, 192, 128, 1, 384, False, False, 90, False, False, 1, 1, True, True, False, True, False, False, False, None, None, None, 0)",
+      "sha256": "1755ca7f206a7315e049cb5bcd9b6c9b614b3b1c8894fc4bfe1734340cd806e9"
+     }
+    ]
+   }
+  },
+  "fwd.sm90.bf16.dense.local.d128": {
+   "arch": "sm_90",
+   "ctors": [
+    {
+     "args": {
+      "args": [
+       "<class 'cutlass.base_dsl.typing.BFloat16'>",
+       "128",
+       "128",
+       "1"
+      ],
+      "intra_wg_overlap": "True",
+      "kwargs": {
+       "Q_in_regs": "False",
+       "has_aux_tensors": "False",
+       "is_causal": "False",
+       "is_local": "True",
+       "mask_mod": "None",
+       "num_stages": "2",
+       "num_threads": "384",
+       "pack_gqa": "False",
+       "q_subtile_factor": "1",
+       "score_mod": "None",
+       "tile_m": "128",
+       "tile_n": "128"
+      },
+      "mma_pv_is_rs": "True",
+      "paged_kv_non_tma": "False"
+     },
+     "cls": "FlashAttentionForwardSm90",
+     "declared_in": "FlashAttentionForwardSm90"
+    }
+   ],
+   "error": null,
+   "keys": {
+    "fwd": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 128, 128, 1, False, False, False, False, None, None, None, False, True, True, True, True, False, True, True, False, False, False, False, True, True, 128, 128, 1, 384, False, False, 90, False, False, 1, 1, True, True, False, True, False, False, False, None, None, None, 0)",
+      "sha256": "210967261f6886e4956dc2d4f4211bcdddd6b6f6ec9ca03d0fed485feacc8752"
+     }
+    ]
+   }
+  },
+  "fwd.sm90.bf16.dense.mask_mod.d128": {
+   "arch": "sm_90",
+   "ctors": [
+    {
+     "args": {
+      "args": [
+       "<class 'cutlass.base_dsl.typing.BFloat16'>",
+       "128",
+       "128",
+       "1"
+      ],
+      "intra_wg_overlap": "True",
+      "kwargs": {
+       "Q_in_regs": "False",
+       "has_aux_tensors": "False",
+       "is_causal": "False",
+       "is_local": "False",
+       "mask_mod": "callable:0da4a639f184",
+       "num_stages": "2",
+       "num_threads": "384",
+       "pack_gqa": "False",
+       "q_subtile_factor": "1",
+       "score_mod": "None",
+       "tile_m": "128",
+       "tile_n": "128"
+      },
+      "mma_pv_is_rs": "True",
+      "paged_kv_non_tma": "False"
+     },
+     "cls": "FlashAttentionForwardSm90",
+     "declared_in": "FlashAttentionForwardSm90"
+    }
+   ],
+   "error": null,
+   "keys": {
+    "fwd": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 128, 128, 1, False, False, '0da4a639f1844d23267110d41d80fd0fb8cf2c533e9c83aa7773795bf6b08afd', False, None, None, None, False, True, True, True, True, False, False, False, False, False, False, False, True, True, 128, 128, 1, 384, False, False, 90, False, False, 1, 1, True, True, False, True, False, False, False, None, None, None, 0)",
+      "sha256": "885c488a5700b7a076eb5da44ce4904fa4afd3718c2f9e38459711cfd507ab98"
+     }
+    ]
+   }
+  },
+  "fwd.sm90.bf16.dense.score_mod.d128": {
+   "arch": "sm_90",
+   "ctors": [
+    {
+     "args": {
+      "args": [
+       "<class 'cutlass.base_dsl.typing.BFloat16'>",
+       "128",
+       "128",
+       "1"
+      ],
+      "intra_wg_overlap": "True",
+      "kwargs": {
+       "Q_in_regs": "False",
+       "has_aux_tensors": "False",
+       "is_causal": "False",
+       "is_local": "False",
+       "mask_mod": "None",
+       "num_stages": "2",
+       "num_threads": "384",
+       "pack_gqa": "False",
+       "q_subtile_factor": "1",
+       "score_mod": "callable:fae6422ed920",
+       "tile_m": "128",
+       "tile_n": "128"
+      },
+      "mma_pv_is_rs": "True",
+      "paged_kv_non_tma": "False"
+     },
+     "cls": "FlashAttentionForwardSm90",
+     "declared_in": "FlashAttentionForwardSm90"
+    }
+   ],
+   "error": null,
+   "keys": {
+    "fwd": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 128, 128, 1, False, 'fae6422ed920764b1f3dd3f635ede19c20995507c11c3cbecb8b5dc461d6c329', False, False, None, None, None, False, True, True, True, True, False, False, False, False, False, False, False, True, True, 128, 128, 1, 384, False, False, 90, False, False, 1, 1, True, True, False, True, False, False, False, None, None, None, 0)",
+      "sha256": "f98c257819917aa0de28136d023b55d0cd51d4dd5fa9815d410859f5dce87834"
+     }
+    ]
+   }
+  },
+  "fwd.sm90.bf16.dense.softcap.d128": {
+   "arch": "sm_90",
+   "ctors": [
+    {
+     "args": {
+      "args": [
+       "<class 'cutlass.base_dsl.typing.BFloat16'>",
+       "128",
+       "128",
+       "1"
+      ],
+      "intra_wg_overlap": "True",
+      "kwargs": {
+       "Q_in_regs": "False",
+       "has_aux_tensors": "False",
+       "is_causal": "False",
+       "is_local": "False",
+       "mask_mod": "None",
+       "num_stages": "2",
+       "num_threads": "384",
+       "pack_gqa": "False",
+       "q_subtile_factor": "1",
+       "score_mod": "callable:25ef9e116487",
+       "tile_m": "128",
+       "tile_n": "128"
+      },
+      "mma_pv_is_rs": "True",
+      "paged_kv_non_tma": "False"
+     },
+     "cls": "FlashAttentionForwardSm90",
+     "declared_in": "FlashAttentionForwardSm90"
+    }
+   ],
+   "error": null,
+   "keys": {
+    "fwd": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 128, 128, 1, False, '25ef9e11648731cfda11ad64a7e03aa1ba8fdb0d682ed83d914de3014cee3065', False, False, None, None, None, False, True, True, True, True, False, False, False, False, False, False, False, True, True, 128, 128, 1, 384, False, False, 90, False, False, 1, 1, True, True, False, True, False, False, False, None, None, None, 0)",
+      "sha256": "5abea6214fc170a1f2db183749582be385f2d822a24d5524cc2d8aa0f99b5568"
+     }
+    ]
+   }
+  },
+  "fwd.sm90.bf16.varlen.causal.d128": {
+   "arch": "sm_90",
+   "ctors": [
+    {
+     "args": {
+      "args": [
+       "<class 'cutlass.base_dsl.typing.BFloat16'>",
+       "128",
+       "128",
+       "1"
+      ],
+      "intra_wg_overlap": "True",
+      "kwargs": {
+       "Q_in_regs": "False",
+       "has_aux_tensors": "False",
+       "is_causal": "True",
+       "is_local": "False",
+       "mask_mod": "None",
+       "num_stages": "2",
+       "num_threads": "384",
+       "pack_gqa": "False",
+       "q_subtile_factor": "1",
+       "score_mod": "None",
+       "tile_m": "128",
+       "tile_n": "128"
+      },
+      "mma_pv_is_rs": "True",
+      "paged_kv_non_tma": "False"
+     },
+     "cls": "FlashAttentionForwardSm90",
+     "declared_in": "FlashAttentionForwardSm90"
+    }
+   ],
+   "error": null,
+   "keys": {
+    "fwd": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 128, 128, 1, True, False, False, False, None, None, None, False, False, False, True, True, False, False, False, False, False, False, False, True, True, 128, 128, 1, 384, False, False, 90, False, False, 1, 1, True, True, False, True, False, False, False, None, None, None, 0)",
+      "sha256": "2ce3082506b3dac462b1b2bd988c97baeababcd3248ff66c0e2ba9d2ee1b0366"
+     }
+    ]
+   }
+  },
+  "fwd.sm90.fp16.dense.causal.d192v128": {
+   "arch": "sm_90",
+   "ctors": [
+    {
+     "args": {
+      "args": [
+       "<class 'cutlass.base_dsl.typing.Float16'>",
+       "192",
+       "128",
+       "1"
+      ],
+      "intra_wg_overlap": "True",
+      "kwargs": {
+       "Q_in_regs": "False",
+       "has_aux_tensors": "False",
+       "is_causal": "True",
+       "is_local": "False",
+       "mask_mod": "None",
+       "num_stages": "2",
+       "num_threads": "384",
+       "pack_gqa": "False",
+       "q_subtile_factor": "1",
+       "score_mod": "None",
+       "tile_m": "128",
+       "tile_n": "128"
+      },
+      "mma_pv_is_rs": "True",
+      "paged_kv_non_tma": "False"
+     },
+     "cls": "FlashAttentionForwardSm90",
+     "declared_in": "FlashAttentionForwardSm90"
+    }
+   ],
+   "error": null,
+   "keys": {
+    "fwd": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.Float16'>, 192, 128, 1, True, False, False, False, None, None, None, False, True, True, True, True, False, False, False, False, False, False, False, True, True, 128, 128, 1, 384, False, False, 90, False, False, 1, 1, True, True, False, True, False, False, False, None, None, None, 0)",
+      "sha256": "e03d2d22b38d4b27201a076df33752ab7f016af2aeabb537d1212387488eda55"
+     }
+    ]
+   }
+  }
+ },
+ "meta": {
+  "commit": "00756db9",
+  "device": "NVIDIA GB300",
+  "device_capability": [
+   10,
+   3
+  ],
+  "dropped_coverage": [
+   "block-sparse tensors (covered by specialization-partition baseline)",
+   "sparse MLA backward (bwd_dsa/dq_dqv_gemm/dk_gemm launchers)",
+   "BlockSparsityKernel (raw-dict cache, not launcher-reachable)"
+  ],
+  "num_cases": 53,
+  "torch": "2.13.0+cu130"
+ }
+}
