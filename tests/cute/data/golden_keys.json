@@ -1,5 +1,118 @@
 {
  "cases": {
+  "bwd.sm100.bf16.block_sparse.causal.d128": {
+   "arch": "sm_100",
+   "ctors": [
+    {
+     "args": {
+      "has_aux_tensors": "False",
+      "head_dim": "128",
+      "head_dim_v": "128",
+      "is_causal": "True",
+      "is_local": "False",
+      "is_persistent": "False",
+      "is_split_kv": "False",
+      "is_varlen_q": "False",
+      "kv_subtile_factor": "1",
+      "m_block_size": "128",
+      "mask_mod": "None",
+      "n_block_size": "128",
+      "pack_gqa": "False",
+      "paged_kv_non_tma": "False",
+      "q_stage": "2",
+      "q_subtile_factor": "1",
+      "qhead_per_kvhead": "1",
+      "score_mod": "None",
+      "use_2cta_instrs": "False",
+      "use_clc_scheduler": "False"
+     },
+     "cls": "FlashAttentionForwardSm100",
+     "declared_in": "FlashAttentionForwardSm100"
+    },
+    {
+     "args": {
+      "dtype": "<class 'cutlass.base_dsl.typing.BFloat16'>",
+      "head_dim": "128",
+      "head_dim_v": "128",
+      "nheads_kv": "1",
+      "nheads_major": "False",
+      "num_threads": "256",
+      "pack_gqa": "False",
+      "qhead_per_kvhead": "1",
+      "tile_m": "128",
+      "use_padded_offsets": "True"
+     },
+     "cls": "FlashAttentionBackwardPreprocess",
+     "declared_in": "FlashAttentionBackwardPreprocess"
+    },
+    {
+     "args": {
+      "cluster_size": "1",
+      "deterministic": "False",
+      "has_aux_tensors": "False",
+      "head_dim": "128",
+      "head_dim_v": "128",
+      "is_causal": "True",
+      "is_local": "False",
+      "is_persistent": "False",
+      "kv_subtile_factor": "1",
+      "mask_mod": "None",
+      "q_subtile_factor": "1",
+      "qhead_per_kvhead": "1",
+      "score_mod": "None",
+      "score_mod_bwd": "None",
+      "spt": "False",
+      "tile_m": "128",
+      "tile_n": "128",
+      "use_2cta_instrs": "False"
+     },
+     "cls": "FlashAttentionBackwardSm100",
+     "declared_in": "FlashAttentionBackwardSm100"
+    },
+    {
+     "args": {
+      "AtomLayoutMdQ": "1",
+      "arch": "100",
+      "cluster_size": "1",
+      "dQ_swapAB": "False",
+      "dtype": "<class 'cutlass.base_dsl.typing.BFloat16'>",
+      "head_dim": "128",
+      "num_threads": "128",
+      "tile_m": "128",
+      "use_2cta_instrs": "False"
+     },
+     "cls": "FlashAttentionBackwardPostprocess",
+     "declared_in": "FlashAttentionBackwardPostprocess"
+    }
+   ],
+   "error": null,
+   "keys": {
+    "bwd": [
+     {
+      "repr": "(100, <class 'cutlass.base_dsl.typing.BFloat16'>, 128, 128, 1, True, False, False, 128, 128, 384, False, 1, False, 1, 1, False, False, False, False, False, 0, None, None, True, ((False, False, False), (False, False, False, False), (False, False, False), (False, False, False, False), None, None), True, True, True, True, (False, False, False, False), (False, False, False, False), (False, False, False, False), (False, False, False, False), False, False)",
+      "sha256": "9b0ee299958c33efaa7b590eb128aa3cc40b83de3e7e0b3aa5ace46336b1411a"
+     }
+    ],
+    "bwd_post": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 128, 128, 128, 1, False, False, False, False, 1, 100)",
+      "sha256": "894eeca435ceeacc773d2294b1b5b245775cb65efeae4d455e10f36cd50f9048"
+     }
+    ],
+    "bwd_pre": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 128, 128, 128, False, False, False, True, False, True, False, False, 1, 1)",
+      "sha256": "5678ffa9fb5b007b0353c8bbd8713cbf7c2e314949694881a96a620b2d96f747"
+     }
+    ],
+    "fwd": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 128, 128, 1, True, False, False, False, None, None, None, False, True, True, True, True, False, False, False, False, False, False, False, True, True, 128, 128, 2, 384, False, False, 100, False, False, 1, 1, True, True, False, True, False, False, False, None, None, None, 0)",
+      "sha256": "26b1165ac932f136282ddacaa32a11533056477cde7fe139416755b4dfd175a6"
+     }
+    ]
+   }
+  },
   "bwd.sm100.bf16.dense.causal.d128": {
    "arch": "sm_100",
    "ctors": [
@@ -1588,6 +1701,46 @@
     ]
    }
   },
+  "fwd.sm100.bf16.block_sparse.d128": {
+   "arch": "sm_100",
+   "ctors": [
+    {
+     "args": {
+      "has_aux_tensors": "False",
+      "head_dim": "128",
+      "head_dim_v": "128",
+      "is_causal": "False",
+      "is_local": "False",
+      "is_persistent": "True",
+      "is_split_kv": "False",
+      "is_varlen_q": "False",
+      "kv_subtile_factor": "1",
+      "m_block_size": "128",
+      "mask_mod": "callable:0da4a639f184",
+      "n_block_size": "128",
+      "pack_gqa": "False",
+      "paged_kv_non_tma": "False",
+      "q_stage": "2",
+      "q_subtile_factor": "1",
+      "qhead_per_kvhead": "1",
+      "score_mod": "None",
+      "use_2cta_instrs": "False",
+      "use_clc_scheduler": "False"
+     },
+     "cls": "FlashAttentionForwardSm100",
+     "declared_in": "FlashAttentionForwardSm100"
+    }
+   ],
+   "error": null,
+   "keys": {
+    "fwd": [
+     {
+      "repr": "(<class 'cutlass.base_dsl.typing.BFloat16'>, 128, 128, 1, False, False, '0da4a639f1844d23267110d41d80fd0fb8cf2c533e9c83aa7773795bf6b08afd', True, ((False, False, False), (False, False, False, False), (False, False, False), (False, False, False, False), None, None), None, None, False, True, True, True, True, False, False, False, False, False, False, False, True, True, 128, 128, 2, 384, False, False, 100, False, False, 1, 1, True, True, False, True, False, False, False, None, None, None, 0)",
+      "sha256": "c2ad833a284844d3e77dd174b9b141f47e72330a6d1ff62a1ca8a35212012e86"
+     }
+    ]
+   }
+  },
   "fwd.sm100.bf16.dense.causal.d128": {
    "arch": "sm_100",
    "ctors": [
@@ -3059,18 +3212,17 @@
   }
  },
  "meta": {
-  "commit": "00756db9",
+  "commit": "26631d2c",
   "device": "NVIDIA GB300",
   "device_capability": [
    10,
    3
   ],
   "dropped_coverage": [
-   "block-sparse tensors (covered by specialization-partition baseline)",
    "sparse MLA backward (bwd_dsa/dq_dqv_gemm/dk_gemm launchers)",
    "BlockSparsityKernel (raw-dict cache, not launcher-reachable)"
   ],
-  "num_cases": 53,
+  "num_cases": 55,
   "torch": "2.13.0+cu130"
  }
 }

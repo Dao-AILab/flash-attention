@@ -1,11 +1,21 @@
 import os
 import subprocess
 import logging
+import sys
 import tempfile
 import json
 import time
 from pathlib import Path
 from getpass import getuser
+
+
+def pytest_unconfigure(config):
+    if os.getenv("PARTITION_RECORD") == "1":
+        import partition_recorder
+
+        partition_recorder.dump(
+            os.getenv("PARTITION_OUT", "/tmp/partition_record.json")
+        )
 
 
 def _get_gpu_ids():
@@ -30,6 +40,14 @@ def _get_gpu_ids():
 
 
 def pytest_configure(config):
+    if os.getenv("PARTITION_RECORD") == "1":
+        # Specialization-partition recording for the interface refactor
+        # bake-off; see partition_recorder.py for usage.
+        sys.path.insert(0, str(Path(__file__).parent))
+        import partition_recorder
+
+        partition_recorder.install()
+
     tmp = Path(tempfile.gettempdir()) / getuser() / "flash_attention_tests"
     tmp.mkdir(parents=True, exist_ok=True)
 

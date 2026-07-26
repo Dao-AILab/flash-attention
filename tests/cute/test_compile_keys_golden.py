@@ -34,10 +34,10 @@ or the raised error for cases that are rejected by design. A refactor must
 either leave these byte-identical or regenerate the snapshot with the diff
 itemized in the PR description.
 
-Coverage deliberately not included (tracked, not silent): block-sparse tensors
-(setup requires the block-sparsity pipeline; covered by the specialization-
-partition baseline instead), sparse MLA backward, and the standalone
-BlockSparsityKernel (raw-dict cache, not reachable through the launchers).
+Coverage deliberately not included (tracked, not silent): sparse MLA backward
+(bwd_dsa/dq_dqv_gemm/dk_gemm launchers) and the standalone BlockSparsityKernel
+(raw-dict cache, not reachable through the launchers). Block-sparse fwd/bwd
+launches ARE covered, via hand-built BlockSparseTensorsTorch.
 """
 
 from __future__ import annotations
@@ -272,6 +272,7 @@ class Case:
     score_mod: bool = False
     mask_mod: bool = False
     aux: bool = False
+    block_sparse: bool = False      # hand-built BlockSparseTensorsTorch
     deterministic: bool = False     # bwd only
     fwd_kwargs: dict = field(default_factory=dict, hash=False, compare=False)
     bwd_kwargs: dict = field(default_factory=dict, hash=False, compare=False)
@@ -321,6 +322,10 @@ CASES = [
     # ---- SM103 forward (arch is a key component) ----
     Case("fwd.sm103.bf16.dense.causal.d128", "sm_103", causal=True),
     Case("fwd.sm103.bf16.varlen.causal.d128", "sm_103", causal=True, varlen=True),
+    # ---- block-sparse (hand-built tensors; the launcher-reachable coverage) ----
+    Case("fwd.sm100.bf16.block_sparse.d128", "sm_100", block_sparse=True, mask_mod=True),
+    Case("bwd.sm100.bf16.block_sparse.causal.d128", "sm_100", fn="bwd",
+         causal=True, block_sparse=True),
     # ---- SM120 forward ----
     Case("fwd.sm120.bf16.dense.d64", "sm_120", d=64),
     Case("fwd.sm120.bf16.dense.causal.d128", "sm_120", causal=True),
@@ -409,6 +414,20 @@ def _build_tensors(case: Case):
         kw["mask_mod"] = golden_mask_mod
     if case.aux:
         kw["aux_tensors"] = [t(case.b, case.sq, dt=torch.float32)]
+    if case.block_sparse:
+        from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch
+
+        # fwd wants sparse-Q blocks at q_stage*tile_m=256 granularity; bwd wants
+        # Q-direction tensors at its own 128 tile.
+        bs_q = 128 if case.fn == "bwd" else 256
+        rows, cols = case.sq // bs_q, case.sk // 128
+        kw["block_sparse_tensors"] = BlockSparseTensorsTorch(
+            mask_block_cnt=t(case.b, case.h, rows, dt=torch.int32),
+            mask_block_idx=t(case.b, case.h, rows, cols, dt=torch.int32),
+            full_block_cnt=t(case.b, case.h, rows, dt=torch.int32),
+            full_block_idx=t(case.b, case.h, rows, cols, dt=torch.int32),
+            block_size=(bs_q, 128),
+        )
     return kw
 
 
@@ -429,13 +448,15 @@ def _run_case(case: Case) -> dict:
                 else:
                     fwd_only = dict(kw)
                     fwd_only.pop("score_mod", None)  # fwd half of bwd cases runs plain
+                    fwd_only.pop("block_sparse_tensors", None)  # bwd-oriented tensors
                     out, lse, *_ = fa._flash_attn_fwd(**fwd_only, return_lse=True)
                     dout = torch.empty_like(out)
                     bwd_kw = {
                         k: v for k, v in kw.items()
                         if k in ("q", "k", "v", "causal", "window_size_left",
                                  "window_size_right", "cu_seqlens_q", "cu_seqlens_k",
-                                 "seqused_q", "seqused_k", "max_seqlen_q", "max_seqlen_k")
+                                 "seqused_q", "seqused_k", "max_seqlen_q", "max_seqlen_k",
+                                 "block_sparse_tensors")
                     }
                     if case.score_mod:
                         bwd_kw["score_mod"] = golden_score_mod
@@ -507,7 +528,6 @@ def _snapshot() -> dict:
             "torch": torch.__version__,
             "num_cases": len(cases),
             "dropped_coverage": [
-                "block-sparse tensors (covered by specialization-partition baseline)",
                 "sparse MLA backward (bwd_dsa/dq_dqv_gemm/dk_gemm launchers)",
                 "BlockSparsityKernel (raw-dict cache, not launcher-reachable)",
             ],
