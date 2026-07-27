@@ -14,6 +14,7 @@ from cutlass.cute.runtime import from_dlpack
 import numpy as np
 import torch
 
+from flash_attn.cute.config import FwdSm90RegisterAllocation
 from flash_attn.cute.flash_fwd_sm90 import FlashAttentionForwardSm90
 from mask_mod_definitions import (
     get_mask_pair,
@@ -24,6 +25,9 @@ from flash_attn.cute.block_sparsity import (
     to_cute_block_sparse_tensors,
 )
 from flash_attn.cute.compute_block_sparsity import compute_block_sparsity
+
+
+_DEFAULT_REGISTERS = FwdSm90RegisterAllocation(240, 24)
 
 
 @dataclass
@@ -72,6 +76,7 @@ class BenchmarkConfig:
     num_threads: int = 384
     intra_wg_overlap: bool = True
     mma_pv_is_rs: bool = True
+    registers: FwdSm90RegisterAllocation = _DEFAULT_REGISTERS
 
     # Benchmark parameters
     warmup_iters: int = 10
@@ -332,6 +337,7 @@ class FlashAttentionBenchmark:
             mask_mod=self.mask_mod_cute,
             Q_in_regs=False,
             has_aux_tensors=config.has_aux_tensors,
+            registers=config.registers,
         )
 
         softmax_scale = 1.0 / math.sqrt(config.headdim)

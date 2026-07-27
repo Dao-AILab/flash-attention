@@ -14,6 +14,7 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cute.typing import Int32, Int64, Float32
 
 from cutlass.utils import ClcDynamicPersistentTileScheduler
+from flash_attn.cute.config import FwdSm100RegisterAllocation
 from flash_attn.cute.tile_scheduler import (
     SchedulerState,
     compute_sm100_fmha_grid as compute_grid,
@@ -28,7 +29,7 @@ from flash_attn.cute.mask import (
     Sm100FusedMask as FusedMask,
 )
 from flash_attn.cute.tile_scheduler import SM100_TMEM_CAPACITY_COLUMNS
-from flash_attn.cute.flash_fwd_sm100 import DescaleTensors, _TUNING_CONFIG
+from flash_attn.cute.flash_fwd_sm100 import DescaleTensors, _EX2_CONFIG
 from flash_attn.cute.utils import ex2_emulation_2, as_bshkrd_tensor, AuxData
 
 
@@ -57,6 +58,9 @@ class BlackwellFusedMultiHeadAttentionForward:
         use_clc_scheduler: bool = False,
         has_tile_count_semaphore: bool = False,
         seqlen_k_per_split: Optional[int] = None,
+        *,
+        use_tma_o: bool,
+        registers: FwdSm100RegisterAllocation,
     ):
         head_dim_v = head_dim if head_dim_v is None else head_dim_v
         assert head_dim == 256 and head_dim_v == 256, (
@@ -68,6 +72,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         assert not paged_kv_non_tma, (
             "SM100 hd256 2CTA supports TMA paged KV only (page_size must equal tile_n=128)"
         )
+        assert not use_tma_o, "SM100 head_dim=256 uses its fixed output path"
         assert not pack_gqa, "SM100 forward with head_dim=256 does not support pack_gqa"
         assert not is_split_kv, "SM100 forward with head_dim=256 does not support SplitKV"
         assert q_subtile_factor == 1, (
@@ -146,14 +151,14 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.tmem_o_offset = 256
         self.tmem_p_offset = self.tmem_s_offset
 
-        _tune_key = (True, is_causal, 256, False)  # hd256: always 2cta, no sm103 variant
-        _tune = _TUNING_CONFIG.get(_tune_key, {})
-        self.num_regs_softmax = _tune.get("num_regs_softmax", 256)
-        self.num_regs_correction = _tune.get("num_regs_correction", 160)
-        self.num_regs_other = 32  # fixed for hd256; not derived from 512 budget like other kernels
-        self.ex2_emu_freq = _tune.get("ex2_emu_freq", 4)
-        self.ex2_emu_res = _tune.get("ex2_emu_res", 3)
-        self.ex2_emu_start_frg = _tune.get("ex2_emu_start_frg", 0)
+        ex2_key = (True, is_causal, 256, False)  # hd256: always 2cta, no sm103 variant
+        ex2_config = _EX2_CONFIG.get(ex2_key, {})
+        self.num_regs_softmax = registers.softmax
+        self.num_regs_correction = registers.correction
+        self.num_regs_other = registers.other
+        self.ex2_emu_freq = ex2_config.get("ex2_emu_freq", 4)
+        self.ex2_emu_res = ex2_config.get("ex2_emu_res", 3)
+        self.ex2_emu_start_frg = ex2_config.get("ex2_emu_start_frg", 0)
 
         self.buffer_align_bytes = 1024
 

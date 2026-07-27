@@ -186,6 +186,14 @@ class FwdMainKernelSpec(NamedTuple):
     is_static_persistent: bool | None
     use_tma_o: bool | None
     registers: FwdRegisterAllocation | None
+    has_num_splits_dynamic: bool
+    has_virtual_batch_idx: bool
+    has_num_nheads_in_l2: bool
+    has_tile_count_semaphore: bool
+    has_scheduler_cu_total_m_blocks: bool
+    has_scheduler_cu_total_splits_m_blocks: bool
+    has_blocks_to_batch_idx: bool
+    seqlen_k_per_split: int | None
     has_q: bool
     has_p: bool
     has_row_max: bool
@@ -244,15 +252,17 @@ class FwdMainKernelSpec(NamedTuple):
 class FwdCombineKernelSpec(NamedTuple):
     """Typed cache key for one generated SplitKV combine kernel."""
 
+    arch: int
     dtype: object
     dtype_partial: object
     head_dim: int
+    num_head: int
     log_max_splits: int
     has_cu_seqlens: bool
     has_seqused: bool
     has_lse: bool
     has_num_splits_dynamic_ptr: bool
-    has_varlen_batch_idx: bool
+    has_virtual_batch_idx: bool
     has_semaphore_to_reset: bool
 
 
@@ -596,12 +606,13 @@ def select_fwd_config(inputs: FwdHeuristicInputs) -> FwdConfig:
     )
     is_static_persistent = (
         is_sm100_family
-        and not inputs.causal
-        and not inputs.local
-        and not inputs.is_varlen_q
         and not is_split_kv
         and not overlap_s_o_s_q
         and not use_clc_scheduler
+        and (
+            (not inputs.causal and not inputs.local and not inputs.is_varlen_q)
+            or packed_seqlen_q <= effective_tile_m
+        )
     )
     use_tma_o = is_sm100_family and can_use_tma_o(inputs, tile_m=tile_m, num_splits=num_splits)
 
@@ -781,13 +792,11 @@ def validate_fwd_config(config: FwdConfig, inputs: FwdHeuristicInputs) -> None:
         raise ValueError("Non-TMA paged KV requires head dimensions divisible by 16")
     if config.use_clc_scheduler and (paged_kv_non_tma or overlap_s_o_s_q):
         raise ValueError("CLC requires TMA KV and a non-overlapping O/Q shared-memory layout")
+    persistent_shape = (not inputs.causal and not inputs.local and not inputs.is_varlen_q) or (
+        inputs.max_seqlen_q * inputs.qhead_per_kvhead <= config.q_stage * config.tile_m
+    )
     if config.is_static_persistent and (
-        inputs.causal
-        or inputs.local
-        or inputs.is_varlen_q
-        or config.num_splits > 1
-        or overlap_s_o_s_q
-        or config.use_clc_scheduler
+        not persistent_shape or config.num_splits > 1 or overlap_s_o_s_q or config.use_clc_scheduler
     ):
         raise ValueError("Static persistent scheduling is not effective for this forward problem")
 
