@@ -1,0 +1,260 @@
+# Explicit old-vs-new config comparisons for the four SM103 BF16 policies.
+# Adding another campaign means adding an experiment/grid here; the runner emits
+# n, geomean with paired-round 95% timing interval, time-weighted gain,
+# min/max, and W/N/L.
+settings:
+  dtype: bfloat16
+  seed: 0
+  workers: 16
+  rounds: 7
+  iters_per_round: 31
+  warmup_iters: 10
+  clock_warmup_iters: 20
+
+experiments:
+  - name: long_k_d64_nonpersistent
+    baseline: {is_static_persistent: true}
+    candidate: {is_static_persistent: false}
+    correctness:
+      mode: dense
+      q_heads: 16
+      kv_heads: 4
+      head_dim: 64
+      batch: 1
+      seqlen_q: 65
+      seqlen_k: 4096
+      causal: false
+    grids:
+      - phase: boundary
+        mode: dense
+        head_pairs: [[16, 16], [16, 4]]
+        head_dims: [64]
+        batches: [1, 8]
+        seqlen_pairs:
+          - [128, 4096]
+          - [128, 5120]
+          - [128, 8192]
+          - [1024, 4096]
+          - [1024, 5120]
+          - [1024, 8192]
+          - [4096, 4096]
+          - [4096, 5120]
+          - [4096, 8192]
+          - [8192, 4096]
+          - [8192, 5120]
+          - [8192, 8192]
+        causal: false
+      - phase: holdout
+        mode: dense
+        head_pairs: [[16, 16], [16, 1]]
+        head_dims: [64]
+        batches: [2, 16]
+        seqlen_pairs:
+          - [384, 4608]
+          - [384, 6144]
+          - [384, 7168]
+          - [1536, 4608]
+          - [1536, 6144]
+          - [1536, 7168]
+          - [6144, 4608]
+          - [6144, 6144]
+          - [6144, 7168]
+          - [12288, 4608]
+          - [12288, 6144]
+          - [12288, 7168]
+        causal: false
+
+  - name: balanced_varlen_mha_clc
+    baseline: {use_clc_scheduler: false, is_static_persistent: false}
+    candidate: {use_clc_scheduler: true, is_static_persistent: false}
+    correctness:
+      mode: varlen
+      q_heads: 8
+      kv_heads: 8
+      head_dim: 128
+      seqlens_q: [65, 129, 257, 33]
+      seqlens_k: [71, 193, 263, 41]
+      causal: false
+    grids:
+      - phase: boundary
+        mode: varlen
+        head_pairs: [[8, 8], [16, 16]]
+        head_dims: [64, 128]
+        batches: [4, 16]
+        token_pairs:
+          - [10240, 5120]
+          - [10240, 15360]
+          - [12288, 6144]
+          - [12288, 18432]
+          - [16384, 8192]
+          - [16384, 24576]
+        patterns: [uniform]
+        causal: false
+      - phase: holdout
+        mode: varlen
+        head_pairs: [[16, 16]]
+        head_dims: [96]
+        batches: [8, 24]
+        token_pairs:
+          - [11264, 4224]
+          - [11264, 11264]
+          - [11264, 22528]
+          - [13312, 4992]
+          - [13312, 13312]
+          - [13312, 26624]
+          - [18432, 6912]
+          - [18432, 18432]
+          - [18432, 36864]
+        patterns: [bimodal, staircase]
+        causal: false
+
+  - name: high_head_varlen_clc
+    baseline: {use_clc_scheduler: false, is_static_persistent: false}
+    candidate: {use_clc_scheduler: true, is_static_persistent: false}
+    correctness:
+      mode: varlen
+      q_heads: 32
+      kv_heads: 8
+      head_dim: 128
+      seqlens_q: [127, 193, 61]
+      seqlens_k: [131, 211, 73]
+      causal: true
+    case_table:
+      mode: varlen
+      columns: [phase, q_heads, kv_heads, head_dim, batch, total_q, total_k, pattern, causal]
+      rows:
+        - [boundary, 32, 8, 128, 48, 6144, 12288, bimodal, true]
+        - [boundary, 24, 24, 96, 3, 12288, 6144, staircase, false]
+        - [boundary, 28, 4, 128, 48, 6144, 6144, staircase, true]
+        - [boundary, 32, 8, 128, 24, 24576, 24576, staircase, false]
+        - [boundary, 71, 1, 64, 12, 6144, 6144, bimodal, true]
+        - [boundary, 28, 4, 128, 24, 12288, 6144, staircase, true]
+        - [boundary, 32, 8, 128, 12, 4096, 4096, staircase, false]
+        - [boundary, 24, 24, 96, 24, 6144, 6144, bimodal, true]
+        - [boundary, 71, 1, 64, 3, 12288, 6144, staircase, true]
+        - [boundary, 32, 8, 128, 3, 6144, 12288, bimodal, true]
+        - [boundary, 24, 24, 96, 12, 12288, 6144, staircase, true]
+        - [boundary, 28, 4, 128, 12, 6144, 6144, bimodal, false]
+        - [boundary, 32, 8, 128, 48, 24576, 24576, bimodal, true]
+        - [boundary, 71, 1, 64, 24, 6144, 6144, bimodal, false]
+        - [boundary, 28, 4, 128, 3, 12288, 6144, staircase, true]
+        - [boundary, 32, 8, 128, 48, 4096, 4096, staircase, false]
+        - [boundary, 24, 24, 96, 3, 6144, 6144, bimodal, false]
+        - [boundary, 71, 1, 64, 12, 12288, 6144, staircase, true]
+        - [boundary, 32, 8, 128, 24, 6144, 12288, staircase, false]
+        - [boundary, 24, 24, 96, 48, 12288, 6144, bimodal, true]
+        - [boundary, 28, 4, 128, 24, 6144, 6144, bimodal, false]
+        - [boundary, 32, 8, 128, 12, 24576, 24576, bimodal, true]
+        - [boundary, 71, 1, 64, 3, 6144, 6144, bimodal, false]
+        - [boundary, 28, 4, 128, 12, 12288, 6144, staircase, false]
+        - [boundary, 32, 8, 128, 3, 4096, 4096, bimodal, true]
+        - [boundary, 24, 24, 96, 12, 6144, 6144, staircase, false]
+        - [boundary, 71, 1, 64, 48, 12288, 6144, bimodal, false]
+        - [boundary, 32, 8, 128, 48, 6144, 12288, staircase, false]
+        - [boundary, 24, 24, 96, 3, 12288, 6144, bimodal, false]
+        - [boundary, 28, 4, 128, 3, 6144, 6144, bimodal, true]
+        - [boundary, 32, 8, 128, 24, 24576, 24576, bimodal, false]
+        - [boundary, 71, 1, 64, 12, 6144, 6144, staircase, true]
+        - [boundary, 28, 4, 128, 48, 12288, 6144, bimodal, false]
+        - [boundary, 32, 8, 128, 24, 4096, 4096, bimodal, false]
+        - [boundary, 24, 24, 96, 48, 6144, 6144, staircase, true]
+        - [boundary, 71, 1, 64, 3, 12288, 6144, bimodal, false]
+        - [boundary, 32, 8, 128, 12, 6144, 12288, staircase, true]
+        - [boundary, 24, 24, 96, 24, 12288, 6144, bimodal, false]
+        - [boundary, 28, 4, 128, 12, 6144, 6144, staircase, false]
+        - [boundary, 32, 8, 128, 3, 24576, 24576, staircase, false]
+        - [boundary, 71, 1, 64, 48, 6144, 6144, staircase, false]
+        - [boundary, 28, 4, 128, 3, 12288, 6144, bimodal, true]
+        - [boundary, 32, 8, 128, 48, 4096, 4096, bimodal, false]
+        - [boundary, 24, 24, 96, 3, 6144, 6144, staircase, false]
+        - [holdout, 28, 4, 128, 6, 6144, 12288, bimodal, false]
+        - [holdout, 28, 4, 128, 6, 6144, 12288, bimodal, true]
+        - [holdout, 32, 8, 128, 12, 12288, 6144, staircase, false]
+        - [holdout, 32, 8, 128, 12, 12288, 6144, staircase, true]
+        - [holdout, 24, 24, 96, 12, 9216, 4608, bimodal, false]
+        - [holdout, 24, 24, 96, 12, 9216, 4608, bimodal, true]
+
+  - name: dense_short_k_clc
+    baseline: {use_clc_scheduler: false, is_static_persistent: false}
+    candidate: {use_clc_scheduler: true, is_static_persistent: false}
+    correctness:
+      mode: dense
+      q_heads: 32
+      kv_heads: 8
+      head_dim: 128
+      batch: 32
+      seqlen_q: 3
+      seqlen_k: 640
+      causal: true
+    case_table:
+      mode: dense
+      causal: true
+      columns: [phase, q_heads, kv_heads, head_dim, batch, seqlen_q, seqlen_k]
+      rows:
+        - [boundary, 32, 8, 128, 32, 1, 2048]
+        - [boundary, 71, 1, 64, 48, 17, 1536]
+        - [boundary, 32, 32, 96, 96, 64, 1280]
+        - [boundary, 32, 8, 128, 32, 1, 1152]
+        - [boundary, 71, 1, 64, 48, 17, 1024]
+        - [boundary, 32, 32, 96, 96, 64, 896]
+        - [boundary, 32, 8, 128, 32, 1, 640]
+        - [boundary, 32, 32, 96, 96, 17, 1536]
+        - [boundary, 32, 32, 96, 96, 17, 1024]
+        - [boundary, 32, 32, 96, 96, 1, 2048]
+        - [boundary, 32, 8, 128, 48, 129, 1280]
+        - [boundary, 32, 32, 96, 96, 1, 1152]
+        - [boundary, 32, 8, 128, 48, 129, 896]
+        - [boundary, 32, 32, 96, 96, 1, 640]
+        - [boundary, 32, 8, 128, 48, 64, 1536]
+        - [boundary, 71, 1, 64, 96, 129, 1280]
+        - [boundary, 32, 8, 128, 48, 64, 1024]
+        - [boundary, 71, 1, 64, 96, 129, 896]
+        - [boundary, 32, 8, 128, 48, 17, 2048]
+        - [boundary, 71, 1, 64, 96, 64, 1536]
+        - [boundary, 32, 8, 128, 48, 17, 1152]
+        - [boundary, 71, 1, 64, 96, 64, 1024]
+        - [boundary, 32, 8, 128, 48, 17, 640]
+        - [boundary, 71, 1, 64, 96, 17, 2048]
+        - [boundary, 64, 8, 64, 32, 129, 1536]
+        - [boundary, 32, 8, 128, 48, 1, 1280]
+        - [boundary, 71, 1, 64, 96, 17, 1152]
+        - [boundary, 64, 8, 64, 32, 129, 1024]
+        - [boundary, 32, 8, 128, 48, 1, 896]
+        - [boundary, 71, 1, 64, 96, 17, 640]
+        - [boundary, 64, 8, 64, 32, 64, 2048]
+        - [boundary, 64, 8, 64, 32, 64, 1152]
+        - [boundary, 64, 8, 64, 32, 64, 640]
+        - [boundary, 32, 8, 128, 96, 129, 1536]
+        - [boundary, 64, 8, 64, 32, 17, 1280]
+        - [boundary, 32, 8, 128, 96, 129, 1024]
+        - [boundary, 64, 8, 64, 32, 17, 896]
+        - [boundary, 32, 8, 128, 96, 64, 2048]
+        - [boundary, 64, 8, 64, 32, 1, 1536]
+        - [boundary, 32, 8, 128, 96, 64, 1152]
+        - [boundary, 64, 8, 64, 32, 1, 1024]
+        - [boundary, 32, 8, 128, 96, 64, 640]
+        - [boundary, 32, 32, 96, 32, 129, 2048]
+        - [boundary, 32, 8, 128, 96, 17, 1280]
+        - [boundary, 32, 32, 96, 32, 129, 1152]
+        - [boundary, 32, 8, 128, 96, 17, 896]
+        - [boundary, 32, 32, 96, 32, 129, 640]
+        - [boundary, 64, 8, 64, 48, 129, 2048]
+        - [boundary, 32, 8, 128, 96, 1, 1536]
+        - [boundary, 32, 32, 96, 32, 64, 1280]
+        - [boundary, 64, 8, 64, 48, 129, 1152]
+        - [boundary, 32, 8, 128, 96, 1, 1024]
+        - [boundary, 32, 32, 96, 32, 64, 896]
+        - [boundary, 64, 8, 64, 48, 129, 640]
+        - [boundary, 32, 32, 96, 32, 17, 1536]
+        - [boundary, 64, 8, 64, 48, 64, 1280]
+        - [boundary, 32, 32, 96, 32, 17, 1024]
+        - [boundary, 64, 8, 64, 48, 64, 896]
+        - [boundary, 32, 32, 96, 32, 1, 2048]
+        - [boundary, 64, 8, 64, 48, 17, 1536]
+        - [boundary, 32, 32, 96, 32, 1, 1152]
+        - [boundary, 64, 8, 64, 48, 17, 1024]
+        - [holdout, 32, 8, 128, 40, 17, 1088]
+        - [holdout, 32, 8, 128, 40, 97, 1216]
+        - [holdout, 71, 1, 64, 40, 33, 1152]
+        - [holdout, 32, 32, 96, 40, 17, 1088]
+        - [holdout, 64, 8, 64, 40, 97, 1216]
