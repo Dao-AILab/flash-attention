@@ -242,6 +242,7 @@ def test_sm103_dense_short_k_clc_scope(changes, expected_clc):
 
 def test_selector_preserves_a_codegen_changing_2cta_boundary():
     one_cta = make_inputs(
+        dtype="torch.float16",
         head_dim=128,
         head_dim_v=128,
         max_seqlen_q=129,
@@ -292,8 +293,136 @@ def test_varlen_k_dense_q_clc_rejects_persistent_codegen_flag():
         validate_fwd_config(replace(config, is_persistent=True), inputs)
 
 
-def test_long_dense_d128_selects_2cta():
-    inputs = make_inputs(head_dim=128, head_dim_v=128)
+@pytest.mark.parametrize(
+    ("head_dim", "config_field"),
+    [(64, "use_tma_o"), (128, "use_2cta_instrs")],
+)
+@pytest.mark.parametrize("qhead_per_kvhead", [1, 4, 8, 16])
+def test_b200_bf16_output_policy_covers_measured_mha_and_gqa(
+    head_dim, config_field, qhead_per_kvhead
+):
+    inputs = make_inputs(
+        head_dim=head_dim,
+        head_dim_v=head_dim,
+        num_heads=16,
+        num_heads_kv=16 // qhead_per_kvhead,
+        pack_gqa=qhead_per_kvhead != 1,
+        batch_size=1,
+        total_q=257,
+        total_k=2048,
+        max_seqlen_q=257,
+        max_seqlen_k=2048,
+    )
+
+    assert not getattr(select_fwd_config(inputs), config_field)
+
+
+@pytest.mark.parametrize(
+    ("changes", "expected_tma_o"),
+    [
+        ({}, False),
+        ({"max_seqlen_q": 256}, True),
+        ({"max_seqlen_k": 2047}, True),
+    ],
+)
+def test_b200_d64_output_policy_boundaries(changes, expected_tma_o):
+    inputs = replace(
+        make_inputs(
+            batch_size=1,
+            total_q=257,
+            total_k=2048,
+            max_seqlen_q=257,
+            max_seqlen_k=2048,
+        ),
+        **changes,
+    )
+
+    assert select_fwd_config(inputs).use_tma_o is expected_tma_o
+
+
+def test_b200_d128_output_policy_keeps_short_k_on_2cta():
+    inputs = make_inputs(
+        head_dim=128,
+        head_dim_v=128,
+        batch_size=1,
+        total_q=257,
+        total_k=2048,
+        max_seqlen_q=257,
+        max_seqlen_k=2048,
+    )
+
+    assert not select_fwd_config(inputs).use_2cta_instrs
+    assert select_fwd_config(replace(inputs, max_seqlen_k=2047)).use_2cta_instrs
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"dtype": "torch.float16"},
+        {"device_arch": 103},
+        {"causal": True},
+        {"local": True},
+        {"requested_num_splits": 2},
+        {"page_size": 128},
+        {"use_block_sparsity": True},
+        {"has_qv": True},
+        {"has_gather_kv": True},
+        {"has_score_mod": True},
+        {"has_mask_mod": True},
+        {"has_learnable_sink": True},
+        {"has_lse": True},
+        {"requested_tile_m": 64},
+        {"requested_tile_n": 64},
+        {"num_heads": 16, "num_heads_kv": 8, "pack_gqa": True},
+        {"num_heads": 16, "num_heads_kv": 4, "pack_gqa": False},
+    ],
+)
+def test_b200_d64_output_policy_exclusions(changes):
+    inputs = replace(
+        make_inputs(
+            batch_size=1,
+            total_q=257,
+            total_k=2048,
+            max_seqlen_q=257,
+            max_seqlen_k=2048,
+        ),
+        **changes,
+    )
+
+    assert select_fwd_config(inputs).use_tma_o
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"dtype": "torch.float16"},
+        {"device_arch": 103},
+        {"page_size": 128},
+        {"has_qv": True},
+        {"has_gather_kv": True},
+        {"has_score_mod": True},
+        {"has_mask_mod": True},
+        {"has_learnable_sink": True},
+        {"has_lse": True},
+        {"requested_tile_m": 64},
+        {"requested_tile_n": 64},
+        {"num_heads": 16, "num_heads_kv": 8, "pack_gqa": True},
+        {"num_heads": 16, "num_heads_kv": 4, "pack_gqa": False},
+    ],
+)
+def test_b200_d128_output_policy_exclusions(changes):
+    inputs = replace(
+        make_inputs(
+            head_dim=128,
+            head_dim_v=128,
+            batch_size=1,
+            total_q=257,
+            total_k=2048,
+            max_seqlen_q=257,
+            max_seqlen_k=2048,
+        ),
+        **changes,
+    )
 
     assert select_fwd_config(inputs).use_2cta_instrs
 

@@ -425,6 +425,30 @@ def select_fwd_config(inputs: FwdHeuristicInputs) -> FwdConfig:
     overlap_s_o_s_q = is_sm100_family and has_s_o_s_q_overlap(inputs, num_splits)
     is_varlen_mha = inputs.is_varlen and inputs.qhead_per_kvhead == 1
     is_dense_noncausal = not inputs.is_varlen and not inputs.causal and not inputs.local
+    is_b200_bf16_output = (
+        inputs.device_arch == 100
+        and inputs.dtype == "torch.bfloat16"
+        and is_dense_noncausal
+        and inputs.head_dim == inputs.head_dim_v
+        and inputs.head_dim in (64, 128)
+        and inputs.qhead_per_kvhead in (1, 4, 8, 16)
+        and (inputs.qhead_per_kvhead == 1 or inputs.pack_gqa)
+        and packed_seqlen_q > 2 * tile_m
+        and inputs.max_seqlen_k >= 2048
+        and not is_split_kv
+        and inputs.page_size is None
+        and not inputs.use_block_sparsity
+        and not inputs.has_qv
+        and not inputs.has_gather_kv
+        and not inputs.has_score_mod
+        and not inputs.has_mask_mod
+        and not inputs.has_learnable_sink
+        and not inputs.has_lse
+        and tile_m == 128
+        and tile_n == 128
+    )
+    if is_b200_bf16_output and inputs.head_dim == 128:
+        use_2cta_instrs = False
     is_standard_sm103_bf16 = (
         inputs.device_arch == 103
         and inputs.dtype == "torch.bfloat16"
@@ -520,6 +544,7 @@ def select_fwd_config(inputs: FwdHeuristicInputs) -> FwdConfig:
     use_tma_o = (
         is_sm100_family
         and not is_dedicated_hd256
+        and not (is_b200_bf16_output and inputs.head_dim == 64)
         and can_use_tma_o(inputs, tile_m=tile_m, num_splits=num_splits)
     )
 

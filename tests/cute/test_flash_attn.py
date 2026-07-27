@@ -333,6 +333,46 @@ def test_flash_attn_dense_short_k_clc_default_matches_reference():
     torch.testing.assert_close(out.float(), reference, atol=0.04, rtol=0.04)
 
 
+@pytest.mark.parametrize("head_dim", [64, 128])
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability() != (10, 0) or USE_FAKE_TENSOR,
+    reason="B200/SM100 BF16 output-policy runtime test",
+)
+def test_flash_attn_b200_bf16_output_policy_default_matches_reference(head_dim):
+    """Exercise the B200 output-only policy through config=None."""
+    torch.manual_seed(0)
+    q = torch.randn(1, 257, 16, head_dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, 2048, 4, head_dim, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    selected = {}
+
+    def capture_config(inputs):
+        selected["inputs"] = inputs
+        selected["config"] = select_fwd_config(inputs)
+        return selected["config"]
+
+    with mock.patch(
+        "flash_attn.cute.interface.select_fwd_config", side_effect=capture_config
+    ):
+        out = _flash_attn_fwd(q, k, v)[0]
+
+    assert selected["inputs"].device_arch == 100
+    assert selected["inputs"].pack_gqa
+    assert not selected["inputs"].has_lse
+    if head_dim == 64:
+        assert not selected["config"].use_tma_o
+    else:
+        assert not selected["config"].use_2cta_instrs
+    reference = torch.nn.functional.scaled_dot_product_attention(
+        q.float().transpose(1, 2),
+        k.float().transpose(1, 2),
+        v.float().transpose(1, 2),
+        scale=1 / math.sqrt(head_dim),
+        enable_gqa=True,
+    ).transpose(1, 2)
+    torch.testing.assert_close(out.float(), reference, atol=0.04, rtol=0.04)
+
+
 @pytest.mark.skipif(
     torch.cuda.get_device_capability()[0] not in [10, 11] or USE_FAKE_TENSOR,
     reason="SM100/SM110 selector metadata test",
