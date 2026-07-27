@@ -423,18 +423,88 @@ def select_fwd_config(inputs: FwdHeuristicInputs) -> FwdConfig:
     ) or is_dedicated_hd256
 
     overlap_s_o_s_q = is_sm100_family and has_s_o_s_q_overlap(inputs, num_splits)
-    # CLC regresses varlen MHA and dense noncausal: the former increases K/V
-    # traffic under imbalance, while the latter mostly pays work-stealing overhead.
     is_varlen_mha = inputs.is_varlen and inputs.qhead_per_kvhead == 1
     is_dense_noncausal = not inputs.is_varlen and not inputs.causal and not inputs.local
+    is_standard_sm103_bf16 = (
+        inputs.device_arch == 103
+        and inputs.dtype == "torch.bfloat16"
+        and inputs.page_size is None
+        and not inputs.use_block_sparsity
+        and not inputs.has_qv
+        and not inputs.has_gather_kv
+        and not inputs.has_score_mod
+        and not inputs.has_mask_mod
+        and not inputs.has_learnable_sink
+        and not inputs.has_lse
+    )
+    has_clc_head_dim = inputs.head_dim_v == inputs.head_dim and inputs.head_dim in (64, 96, 128)
+    sm103_varlen_clc_base = (
+        is_standard_sm103_bf16
+        and has_clc_head_dim
+        and inputs.is_varlen_q
+        and inputs.has_cu_seqlens_q
+        and inputs.has_cu_seqlens_k
+        and not inputs.has_seqused
+        and not inputs.local
+        and not is_split_kv
+        and tile_m == 128
+        and tile_n == 128
+    )
+    # CLC pays off for balanced medium-head MHA and broadly for packed high-head
+    # attention once Q has enough work, including causal GQA and MQA.
+    use_clc_sm103_varlen = sm103_varlen_clc_base and (
+        (
+            inputs.qhead_per_kvhead == 1
+            and not inputs.causal
+            and inputs.num_heads in (8, 16)
+            and 4 <= inputs.batch_size <= 24
+            and inputs.total_q >= 10240
+            and inputs.total_q * 5 >= 2 * inputs.batch_size * inputs.max_seqlen_q
+            and inputs.total_k * 5 >= 2 * inputs.batch_size * inputs.max_seqlen_k
+        )
+        or (
+            inputs.num_heads >= 24
+            and (inputs.qhead_per_kvhead == 1 or inputs.pack_gqa)
+            and 3 <= inputs.batch_size <= 64
+            and inputs.total_q >= 4096
+        )
+    )
+    use_clc_sm103_dense = (
+        is_standard_sm103_bf16
+        and has_clc_head_dim
+        and not inputs.is_varlen
+        and inputs.causal
+        and not inputs.local
+        and inputs.num_heads >= 24
+        and (inputs.num_heads % 8 == 0 or inputs.num_heads_kv == 1)
+        and (inputs.num_heads_kv != 1 or inputs.max_seqlen_q > 1)
+        and (inputs.qhead_per_kvhead == 1 or inputs.pack_gqa)
+        and inputs.batch_size >= 32
+        and 640 <= inputs.max_seqlen_k <= 2048
+        and not is_split_kv
+        and tile_m == 128
+        and tile_n == 128
+    )
+    use_clc_sm103 = use_clc_sm103_varlen or use_clc_sm103_dense
     use_clc_scheduler = (
         is_sm100_family
-        and inputs.requested_use_clc_scheduler
-        and not is_varlen_mha
+        and (inputs.requested_use_clc_scheduler or use_clc_sm103)
+        and (not is_varlen_mha or use_clc_sm103)
         and not is_dense_noncausal
         and inputs.page_size in (None, tile_n)
         and not overlap_s_o_s_q
         and not is_dedicated_hd256
+    )
+    # On GB300, nonpersistent scheduling wins once D64 spans at least 32 K tiles.
+    use_nonpersistent_sm103 = (
+        is_standard_sm103_bf16
+        and is_dense_noncausal
+        and inputs.head_dim == 64
+        and inputs.head_dim_v == 64
+        and tile_m == 128
+        and tile_n == 128
+        and (inputs.qhead_per_kvhead == 1 or inputs.pack_gqa)
+        and num_n_blocks >= 32
     )
     is_persistent = (
         is_sm100_family
@@ -444,6 +514,7 @@ def select_fwd_config(inputs: FwdHeuristicInputs) -> FwdConfig:
         and not is_split_kv
         and not overlap_s_o_s_q
         and not use_clc_scheduler
+        and not use_nonpersistent_sm103
         and not is_dedicated_hd256
     )
     use_tma_o = (
