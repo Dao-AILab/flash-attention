@@ -27,7 +27,7 @@ for _lib_path in cute.runtime.find_runtime_libraries(enable_tvm_ffi=False):
     if Path(_lib_path).exists():
         ctypes.CDLL(_lib_path, mode=ctypes.RTLD_GLOBAL)
 
-CompileKeyType: TypeAlias = tuple[Hashable, ...]
+CompileKeyType: TypeAlias = Hashable
 CallableFunction: TypeAlias = JitCompiledFunction | tvm_ffi.Function
 
 # Enable cache via `FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1`
