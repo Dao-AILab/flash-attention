@@ -96,6 +96,96 @@ def test_flash_attn_sm120_rejects_splitkv():
         flash_attn_func(q, k, v, num_splits=3)
 
 
+@pytest.mark.skipif(not IS_SM100, reason="SM100-only probability rounding behavior")
+def test_flash_attn_bf16_row_sum_matches_pv():
+    torch.manual_seed(0)
+    q = torch.randn(4, 8192, 1, 128, device="cuda", dtype=torch.bfloat16) * 1000
+    k = torch.randn(4, 8192, 1, 128, device="cuda", dtype=torch.bfloat16) * 1000
+    v = torch.ones(4, 8192, 1, 128, device="cuda", dtype=torch.bfloat16)
+
+    out, _ = flash_attn_func(q, k, v, causal=True)
+
+    assert torch.equal(out, v)
+
+
+@pytest.mark.skipif(not IS_SM100, reason="SM100-only probability rounding behavior")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_flash_attn_lowp_pv_row_sum_uses_lowp_lse(dtype):
+    """Use the same rounded exponential mass for output and backward LSE."""
+    torch.manual_seed(0)
+    q = torch.zeros(1, 1, 1, 128, device="cuda", dtype=dtype)
+    k = torch.zeros(1, 8192, 1, 128, device="cuda", dtype=dtype)
+    q[..., 0] = 1
+    logits = torch.randn(8192, device="cuda", dtype=dtype)
+    k[0, :, 0, 0] = logits
+    v = torch.ones_like(k)
+
+    _, lse = flash_attn_func(q, k, v, softmax_scale=1.0, return_lse=True)
+
+    row_max = logits.float().max()
+    p_lowp = torch.exp(logits.float() - row_max).to(dtype).float()
+    expected_lse = row_max + torch.log(p_lowp.sum())
+
+    torch.testing.assert_close(lse[0, 0, 0], expected_lse, atol=1e-5, rtol=0.0)
+
+
+@pytest.mark.skipif(not IS_SM100, reason="SM100-only probability rounding behavior")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("q_heads,kv_heads", [(1, 1), (4, 2)])
+def test_flash_attn_lowp_negative_inf_sink_matches_no_sink(dtype, q_heads, kv_heads):
+    """A zero-mass sink must not change lowp output normalization."""
+    torch.manual_seed(0)
+    q = torch.randn(1, 8, q_heads, 128, device="cuda", dtype=dtype) * 1000
+    k = torch.randn(1, 1024, kv_heads, 128, device="cuda", dtype=dtype) * 1000
+    v = torch.ones_like(k)
+    sink = torch.full((q_heads,), -torch.inf, device="cuda", dtype=torch.bfloat16)
+
+    out, lse = flash_attn_func(q, k, v, return_lse=True)
+    out_sink, lse_sink = flash_attn_func(
+        q, k, v, learnable_sink=sink, return_lse=True
+    )
+
+    assert torch.equal(out_sink, out)
+    assert torch.equal(lse_sink, lse)
+
+
+@pytest.mark.skipif(not IS_SM100, reason="SM100-only probability rounding behavior")
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_flash_attn_lowp_finite_sink_uses_lowp_mass(dtype):
+    """Use rounded P mass for both output and sink-inclusive LSE."""
+    torch.manual_seed(0)
+    q = torch.zeros(1, 1, 1, 128, device="cuda", dtype=dtype)
+    k = torch.zeros(1, 8192, 1, 128, device="cuda", dtype=dtype)
+    q[..., 0] = 1
+    logits = torch.randn(8192, device="cuda", dtype=dtype)
+    k[0, :, 0, 0] = logits
+    v = torch.ones_like(k)
+    sink = torch.tensor([0.5], device="cuda", dtype=torch.bfloat16)
+
+    out, lse = flash_attn_func(
+        q,
+        k,
+        v,
+        softmax_scale=1.0,
+        learnable_sink=sink,
+        return_lse=True,
+    )
+
+    row_max = torch.maximum(logits.float().max(), sink.float()[0])
+    p_lowp = torch.exp(logits.float() - row_max).to(dtype).float()
+    sink_mass = torch.exp(sink.float()[0] - row_max)
+    expected_out = (p_lowp.sum() / (p_lowp.sum() + sink_mass)).to(dtype)
+    expected_lse = row_max + torch.log(p_lowp.sum() + sink_mass)
+
+    torch.testing.assert_close(
+        out,
+        torch.full_like(out, expected_out),
+        atol=torch.finfo(dtype).eps,
+        rtol=0.0,
+    )
+    torch.testing.assert_close(lse[0, 0, 0], expected_lse, atol=1e-5, rtol=0.0)
+
+
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
