@@ -141,6 +141,8 @@ def atomic_add_fp32x4(
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
     )
 
 
@@ -159,6 +161,8 @@ def set_block_rank(
             has_side_effects=False,
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
+            loc=loc,
+            ip=ip,
         )
     )
 
@@ -204,6 +208,8 @@ def store_shared_remote_fp32x4(
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
     )
 
 
@@ -236,6 +242,8 @@ def cpasync_bulk_s2cluster(
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
     )
 
 
@@ -260,6 +268,8 @@ def cpasync_bulk_g2s(
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
     )
 
 
@@ -285,6 +295,8 @@ def cpasync_reduce_bulk_add_f32(
         has_side_effects=True,
         is_align_stack=False,
         asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
     )
 
 
