@@ -1,0 +1,253 @@
+# Independent B200/SM100 BF16 policy measurements.
+#
+# The *_long_noncausal_mha experiments cover long-context interiors and
+# holdouts; the *_controls experiments cover selector boundaries, GQA, and the
+# rejected causal stratum. Policy summaries include every row retained by the
+# proposed predicate and report excluded causal controls separately. D64 changes
+# only the output epilogue. D128 changes CTA topology; its explicit register fields
+# reproduce the allocations that the kernel previously derived from that topology.
+settings:
+  dtype: bfloat16
+  seed: 0
+  workers: 16
+  rounds: 7
+  iters_per_round: 31
+  warmup_iters: 10
+  clock_warmup_iters: 20
+
+experiments:
+  - name: d64_direct_long_noncausal_mha
+    baseline: {use_tma_o: true}
+    candidate: {use_tma_o: false}
+    correctness:
+      mode: dense
+      q_heads: 8
+      kv_heads: 8
+      head_dim: 64
+      batch: 1
+      seqlen_q: 65
+      seqlen_k: 129
+      causal: false
+    case_table:
+      mode: dense
+      causal: false
+      columns: [phase, q_heads, kv_heads, head_dim, batch, seqlen_q, seqlen_k]
+      rows:
+        # Discovery: long-context interiors across batch, heads, and Q/K aspect ratios.
+        - [discovery, 16, 16, 64, 1, 32768, 16384]
+        - [discovery, 16, 16, 64, 1, 32768, 32768]
+        - [discovery, 32, 32, 64, 1, 16384, 8192]
+        - [discovery, 32, 32, 64, 1, 16384, 24576]
+        - [discovery, 16, 16, 64, 2, 16384, 12288]
+        - [discovery, 16, 16, 64, 2, 16384, 32768]
+        - [discovery, 32, 32, 64, 2, 8192, 8192]
+        - [discovery, 32, 32, 64, 2, 8192, 24576]
+        - [discovery, 16, 16, 64, 4, 8192, 16384]
+        - [discovery, 16, 16, 64, 4, 8192, 32768]
+        - [discovery, 32, 32, 64, 4, 4096, 8192]
+        - [discovery, 32, 32, 64, 4, 4096, 24576]
+        # Boundary: total-Q*heads around 524288 and K around 64 128-wide tiles.
+        - [boundary, 16, 16, 64, 1, 32767, 9216]
+        - [boundary, 16, 16, 64, 1, 32768, 9216]
+        - [boundary, 16, 16, 64, 1, 32769, 9216]
+        - [boundary, 32, 32, 64, 1, 16383, 12288]
+        - [boundary, 32, 32, 64, 1, 16384, 12288]
+        - [boundary, 32, 32, 64, 1, 16385, 12288]
+        - [boundary, 32, 32, 64, 2, 8191, 16384]
+        - [boundary, 32, 32, 64, 2, 8192, 16384]
+        - [boundary, 32, 32, 64, 2, 8193, 16384]
+        - [boundary, 16, 16, 64, 2, 24577, 8191]
+        - [boundary, 16, 16, 64, 2, 24577, 8192]
+        - [boundary, 16, 16, 64, 2, 24577, 8193]
+        # Holdout: independent odd shapes and unseen batch/head combinations.
+        - [holdout, 24, 24, 64, 3, 8193, 12289]
+        - [holdout, 16, 16, 64, 3, 11009, 10241]
+        - [holdout, 16, 16, 64, 5, 6657, 9217]
+        - [holdout, 24, 24, 64, 2, 11009, 15361]
+        - [holdout, 40, 40, 64, 1, 13313, 10241]
+        - [holdout, 20, 20, 64, 4, 6657, 18433]
+        - [holdout, 12, 12, 64, 6, 7283, 11265]
+        - [holdout, 8, 8, 64, 7, 9363, 24577]
+        - [holdout, 40, 40, 64, 2, 6657, 13313]
+        - [holdout, 24, 24, 64, 1, 22017, 9217]
+        - [holdout, 32, 32, 64, 3, 5505, 20481]
+        - [holdout, 24, 24, 64, 5, 4401, 16385]
+
+  - name: d64_direct_scope_controls
+    baseline: {use_tma_o: true}
+    candidate: {use_tma_o: false}
+    correctness:
+      mode: dense
+      q_heads: 8
+      kv_heads: 2
+      head_dim: 64
+      batch: 1
+      seqlen_q: 65
+      seqlen_k: 129
+      causal: true
+    case_table:
+      mode: dense
+      columns: [phase, q_heads, kv_heads, head_dim, batch, seqlen_q, seqlen_k, causal]
+      rows:
+        # Short-context and launch-wave controls around 152-SM occupancy boundaries.
+        - [boundary, 16, 16, 64, 1, 1151, 4096, false]
+        - [boundary, 16, 16, 64, 1, 1152, 4096, false]
+        - [boundary, 16, 16, 64, 1, 1153, 4096, false]
+        - [boundary, 32, 32, 64, 1, 511, 8192, false]
+        - [boundary, 32, 32, 64, 1, 512, 8192, false]
+        - [boundary, 32, 32, 64, 1, 513, 8192, false]
+        - [boundary, 16, 16, 64, 2, 639, 4096, false]
+        - [boundary, 8, 8, 64, 4, 257, 2049, false]
+        # Long causal MHA controls.
+        - [discovery, 16, 16, 64, 1, 32768, 8192, true]
+        - [discovery, 32, 32, 64, 1, 16384, 16384, true]
+        - [discovery, 16, 16, 64, 2, 16385, 12289, true]
+        - [discovery, 32, 32, 64, 2, 8193, 24577, true]
+        - [discovery, 16, 16, 64, 4, 8192, 32768, true]
+        - [discovery, 24, 24, 64, 3, 8193, 12289, true]
+        - [discovery, 40, 40, 64, 1, 13313, 10241, true]
+        - [discovery, 16, 16, 64, 5, 6657, 9217, true]
+        # Long legal GQA/MQA controls; every ratio divides tile_m=128.
+        - [discovery, 16, 4, 64, 2, 16384, 8192, false]
+        - [discovery, 32, 8, 64, 2, 8192, 16384, false]
+        - [discovery, 32, 4, 64, 1, 16385, 24577, false]
+        - [discovery, 16, 1, 64, 2, 16385, 12289, false]
+        - [discovery, 24, 6, 64, 3, 8193, 10241, false]
+        - [discovery, 40, 10, 64, 1, 13313, 18433, false]
+        - [discovery, 24, 3, 64, 3, 8193, 16385, false]
+        - [discovery, 32, 2, 64, 2, 8193, 32769, false]
+        # Independent controls holdout: unseen short, causal, and GQA cells.
+        - [holdout, 24, 24, 64, 1, 769, 3073, false]
+        - [holdout, 12, 12, 64, 2, 769, 6145, false]
+        - [holdout, 8, 8, 64, 3, 641, 4097, false]
+        - [holdout, 40, 40, 64, 1, 385, 7169, false]
+        - [holdout, 20, 20, 64, 3, 9001, 14337, true]
+        - [holdout, 24, 24, 64, 2, 11009, 13313, true]
+        - [holdout, 48, 48, 64, 1, 11009, 9217, true]
+        - [holdout, 12, 12, 64, 5, 8801, 18433, true]
+        - [holdout, 24, 6, 64, 2, 11009, 11265, false]
+        - [holdout, 32, 4, 64, 3, 5505, 15361, false]
+        - [holdout, 48, 12, 64, 1, 11009, 20481, false]
+        - [holdout, 16, 2, 64, 5, 6657, 10241, false]
+
+  - name: d128_1cta_long_noncausal_mha
+    baseline:
+      use_2cta_instrs: true
+      registers: {softmax: 176, correction: 88, other: 72}
+    candidate:
+      use_2cta_instrs: false
+      registers: {softmax: 192, correction: 80, other: 48}
+    correctness:
+      mode: dense
+      q_heads: 8
+      kv_heads: 8
+      head_dim: 128
+      batch: 1
+      seqlen_q: 257
+      seqlen_k: 263
+      causal: false
+    case_table:
+      mode: dense
+      causal: false
+      columns: [phase, q_heads, kv_heads, head_dim, batch, seqlen_q, seqlen_k]
+      rows:
+        # Discovery: same frozen geometry as D64, measured independently.
+        - [discovery, 16, 16, 128, 1, 32768, 16384]
+        - [discovery, 16, 16, 128, 1, 32768, 32768]
+        - [discovery, 32, 32, 128, 1, 16384, 8192]
+        - [discovery, 32, 32, 128, 1, 16384, 24576]
+        - [discovery, 16, 16, 128, 2, 16384, 12288]
+        - [discovery, 16, 16, 128, 2, 16384, 32768]
+        - [discovery, 32, 32, 128, 2, 8192, 8192]
+        - [discovery, 32, 32, 128, 2, 8192, 24576]
+        - [discovery, 16, 16, 128, 4, 8192, 16384]
+        - [discovery, 16, 16, 128, 4, 8192, 32768]
+        - [discovery, 32, 32, 128, 4, 4096, 8192]
+        - [discovery, 32, 32, 128, 4, 4096, 24576]
+        # Boundary: total-Q*heads and K-block thresholds, including odd lengths.
+        - [boundary, 16, 16, 128, 1, 32767, 9216]
+        - [boundary, 16, 16, 128, 1, 32768, 9216]
+        - [boundary, 16, 16, 128, 1, 32769, 9216]
+        - [boundary, 32, 32, 128, 1, 16383, 12288]
+        - [boundary, 32, 32, 128, 1, 16384, 12288]
+        - [boundary, 32, 32, 128, 1, 16385, 12288]
+        - [boundary, 32, 32, 128, 2, 8191, 16384]
+        - [boundary, 32, 32, 128, 2, 8192, 16384]
+        - [boundary, 32, 32, 128, 2, 8193, 16384]
+        - [boundary, 16, 16, 128, 2, 24577, 8191]
+        - [boundary, 16, 16, 128, 2, 24577, 8192]
+        - [boundary, 16, 16, 128, 2, 24577, 8193]
+        # Holdout: independent odd shapes and unseen batch/head combinations.
+        - [holdout, 24, 24, 128, 3, 8193, 12289]
+        - [holdout, 16, 16, 128, 3, 11009, 10241]
+        - [holdout, 16, 16, 128, 5, 6657, 9217]
+        - [holdout, 24, 24, 128, 2, 11009, 15361]
+        - [holdout, 40, 40, 128, 1, 13313, 10241]
+        - [holdout, 20, 20, 128, 4, 6657, 18433]
+        - [holdout, 12, 12, 128, 6, 7283, 11265]
+        - [holdout, 8, 8, 128, 7, 9363, 24577]
+        - [holdout, 40, 40, 128, 2, 6657, 13313]
+        - [holdout, 24, 24, 128, 1, 22017, 9217]
+        - [holdout, 32, 32, 128, 3, 5505, 20481]
+        - [holdout, 24, 24, 128, 5, 4401, 16385]
+
+  - name: d128_1cta_scope_controls
+    baseline:
+      use_2cta_instrs: true
+      registers: {softmax: 176, correction: 88, other: 72}
+    candidate:
+      use_2cta_instrs: false
+      registers: {softmax: 192, correction: 80, other: 48}
+    correctness:
+      mode: dense
+      q_heads: 8
+      kv_heads: 2
+      head_dim: 128
+      batch: 1
+      seqlen_q: 257
+      seqlen_k: 263
+      causal: false
+    case_table:
+      mode: dense
+      causal: false
+      columns: [phase, q_heads, kv_heads, head_dim, batch, seqlen_q, seqlen_k]
+      rows:
+        # Short-context and 152-SM launch-wave controls; all remain 2CTA-eligible.
+        - [boundary, 16, 16, 128, 1, 1151, 4096]
+        - [boundary, 16, 16, 128, 1, 1152, 4096]
+        - [boundary, 16, 16, 128, 1, 1153, 4096]
+        - [boundary, 32, 32, 128, 1, 511, 8192]
+        - [boundary, 32, 32, 128, 1, 512, 8192]
+        - [boundary, 32, 32, 128, 1, 513, 8192]
+        - [boundary, 16, 16, 128, 2, 511, 2048]
+        - [boundary, 16, 16, 128, 2, 512, 2048]
+        - [boundary, 16, 16, 128, 2, 513, 2048]
+        - [boundary, 8, 8, 128, 4, 511, 4096]
+        - [boundary, 8, 8, 128, 4, 512, 4096]
+        - [boundary, 8, 8, 128, 4, 513, 4096]
+        # Long legal GQA/MQA controls; every ratio divides tile_m=128.
+        - [discovery, 16, 4, 128, 2, 16384, 8192]
+        - [discovery, 32, 8, 128, 2, 8192, 16384]
+        - [discovery, 32, 4, 128, 1, 16385, 24577]
+        - [discovery, 16, 1, 128, 2, 16385, 12289]
+        - [discovery, 24, 6, 128, 3, 8193, 10241]
+        - [discovery, 40, 10, 128, 1, 13313, 18433]
+        - [discovery, 24, 3, 128, 3, 8193, 16385]
+        - [discovery, 32, 2, 128, 2, 8193, 32769]
+        - [discovery, 8, 2, 128, 8, 8193, 9217]
+        - [discovery, 64, 8, 128, 1, 8193, 12289]
+        - [discovery, 48, 12, 128, 2, 5505, 20481]
+        - [discovery, 32, 4, 128, 4, 4097, 16385]
+        # Independent controls holdout: unseen short-MHA and long-GQA cells.
+        - [holdout, 24, 24, 128, 1, 769, 3073]
+        - [holdout, 12, 12, 128, 2, 769, 6145]
+        - [holdout, 8, 8, 128, 3, 641, 4097]
+        - [holdout, 40, 40, 128, 1, 385, 7169]
+        - [holdout, 20, 20, 128, 2, 385, 5121]
+        - [holdout, 8, 8, 128, 4, 385, 8193]
+        - [holdout, 24, 6, 128, 2, 11009, 11265]
+        - [holdout, 32, 4, 128, 3, 5505, 15361]
+        - [holdout, 48, 12, 128, 1, 11009, 20481]
+        - [holdout, 16, 2, 128, 5, 6657, 10241]
+        - [holdout, 64, 16, 128, 1, 8257, 13313]
+        - [holdout, 32, 8, 128, 4, 4225, 18433]
