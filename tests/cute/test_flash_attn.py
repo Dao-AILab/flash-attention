@@ -1835,6 +1835,78 @@ def _generate_block_kvcache(
     return k_cache, v_cache, page_table, k_cache_paged, v_cache_paged, num_blocks
 
 
+def _run_fp8_paged_decode(q, k, v, page_size=128):
+    """Run a single-sequence FP8 paged decode with unit descales."""
+    seqlen_k, nheads_kv, d = k.shape
+    num_pages = math.ceil(seqlen_k / page_size)
+    k_cache = torch.zeros(num_pages, page_size, nheads_kv, d, device=k.device, dtype=k.dtype)
+    v_cache = torch.zeros_like(k_cache)
+    k_cache.view(-1, nheads_kv, d)[:seqlen_k].copy_(k)
+    v_cache.view(-1, nheads_kv, d)[:seqlen_k].copy_(v)
+    page_table = torch.arange(num_pages, dtype=torch.int32, device=k.device).unsqueeze(0)
+    descale = torch.ones(1, nheads_kv, dtype=torch.float32, device=k.device)
+    return _flash_attn_fwd(
+        q,
+        k_cache,
+        v_cache,
+        cu_seqlens_q=torch.tensor([0, 1], dtype=torch.int32, device=q.device),
+        seqused_k=torch.tensor([seqlen_k], dtype=torch.int32, device=q.device),
+        page_table=page_table,
+        softmax_scale=d**-0.5,
+        causal=True,
+        q_descale=descale,
+        k_descale=descale,
+        v_descale=descale,
+    )[0]
+
+
+def _fp8_decode_reference(q, k, v):
+    """Compute FP32 attention over dequantized FP8 decode inputs."""
+    nheads = q.shape[1]
+    k = k.float().repeat_interleave(nheads // k.shape[1], dim=1)
+    v = v.float().repeat_interleave(nheads // v.shape[1], dim=1)
+    scores = torch.einsum("qhd,khd->hqk", q.float(), k) * q.shape[-1] ** -0.5
+    return torch.einsum("hqk,khd->qhd", torch.softmax(scores, dim=-1), v)
+
+
+@pytest.mark.skipif(not IS_SM100, reason="FP8 paged decode is SM100-only")
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_fp8_paged_decode_tile_boundary():
+    """A second KV tile must not saturate e4m3 softmax probabilities."""
+    torch.manual_seed(0)
+    q = torch.randn(1, 6, 128, device="cuda", dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+    k = torch.randn(129, 1, 128, device="cuda", dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+    v = torch.randn(129, 1, 128, device="cuda", dtype=torch.bfloat16).to(torch.float8_e4m3fn)
+
+    out = _run_fp8_paged_decode(q, k, v)
+    if is_fake_mode():
+        return
+
+    ref = _fp8_decode_reference(q, k, v)
+    cosine = torch.nn.functional.cosine_similarity(out.float().flatten(), ref.flatten(), dim=0)
+    assert cosine > 0.99, f"FP8 paged decode lost accuracy at the tile boundary: {cosine=}"
+
+
+@pytest.mark.skipif(not IS_SM100, reason="FP8 paged decode is SM100-only")
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_fp8_paged_decode_preserves_tail_mass():
+    """Collectively significant e4m3 softmax tails must not flush to zero."""
+    q = torch.zeros(1, 6, 128, device="cuda", dtype=torch.float8_e4m3fn)
+    q[..., 0] = 16.0
+    k = torch.zeros(1024, 1, 128, device="cuda", dtype=torch.float8_e4m3fn)
+    # Decode visits KV blocks right-to-left, so k[-1] establishes the max before the tails.
+    k[:-1, ..., 0] = -7.0
+    v = torch.ones_like(k)
+    v[-1] = 0.0
+
+    out = _run_fp8_paged_decode(q, k, v)
+    if is_fake_mode():
+        return
+
+    ref = _fp8_decode_reference(q, k, v)
+    torch.testing.assert_close(out.float(), ref, atol=0.01, rtol=0.1)
+
+
 @pytest.mark.parametrize("page_size", [16, 64, 256])
 @pytest.mark.parametrize("seqlen_q", [64, 128, 256])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
