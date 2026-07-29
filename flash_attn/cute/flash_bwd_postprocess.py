@@ -3,7 +3,7 @@
 # from Cutlass C++ to Cute-DSL.
 import math
 import operator
-from typing import Callable, Optional, Type
+from typing import Callable, NamedTuple, Optional, Type
 
 import cuda.bindings.driver as cuda
 
@@ -30,6 +30,16 @@ from flash_attn.cute.tile_scheduler import (
     SingleTileVarlenScheduler,
     TileSchedulerArguments,
 )
+
+
+class LearnableSinkBwdTensors(NamedTuple):
+    dpsum: cute.Tensor
+    lse: cute.Tensor
+    sink: cute.Tensor
+    dsink: cute.Tensor
+
+    def __new_from_mlir_values__(self, values):
+        return LearnableSinkBwdTensors(*values)
 
 
 class FlashAttentionBackwardPostprocess:
@@ -216,10 +226,7 @@ class FlashAttentionBackwardPostprocess:
         scale: cutlass.Float32,
         mCuSeqlensQ: Optional[cute.Tensor],
         mSeqUsedQ: Optional[cute.Tensor],
-        mdPsum: Optional[cute.Tensor],
-        mLSE: Optional[cute.Tensor],
-        mLearnableSink: Optional[cute.Tensor],
-        mdSink: Optional[cute.Tensor],
+        sink_tensors: LearnableSinkBwdTensors | None,
         mCuTotalMBlocks: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
@@ -230,10 +237,13 @@ class FlashAttentionBackwardPostprocess:
         if const_expr(mdQaccum is not None):
             if const_expr(mdQaccum.element_type not in [cutlass.Float32]):
                 raise TypeError("dQaccum tensor must be Float32")
-        if const_expr(mLearnableSink is not None):
-            assert mdPsum is not None and mLSE is not None and mdSink is not None
-            if const_expr(mLearnableSink.element_type not in [cutlass.BFloat16]):
-                raise TypeError("Learnable sink tensor must be BFloat16")
+        if const_expr(sink_tensors is not None):
+            mdPsum, mLSE, mLearnableSink, mdSink = sink_tensors
+            if const_expr(
+                mLearnableSink.element_type
+                not in [cutlass.Float16, cutlass.BFloat16, cutlass.Float32]
+            ):
+                raise TypeError("Learnable sink tensor must be Float16, BFloat16, or Float32")
             if const_expr(mdPsum.element_type not in [cutlass.Float32]):
                 raise TypeError("dPsum must be Float32")
             if const_expr(mLSE.element_type not in [cutlass.Float32]):
@@ -286,10 +296,7 @@ class FlashAttentionBackwardPostprocess:
             mdQ,
             mCuSeqlensQ,
             mSeqUsedQ,
-            mdPsum,
-            mLSE,
-            mLearnableSink,
-            mdSink,
+            sink_tensors,
             scale,
             self.tiled_mma,
             self.dQ_swapAB,
@@ -314,10 +321,7 @@ class FlashAttentionBackwardPostprocess:
         mdQ: cute.Tensor,
         mCuSeqlensQ: Optional[cute.Tensor],
         mSeqUsedQ: Optional[cute.Tensor],
-        mdPsum: Optional[cute.Tensor],
-        mLSE: Optional[cute.Tensor],
-        mLearnableSink: Optional[cute.Tensor],
-        mdSink: Optional[cute.Tensor],
+        sink_tensors: LearnableSinkBwdTensors | None,
         scale: cutlass.Float32,
         tiled_mma: cute.TiledMma,
         dQ_swapAB: cutlass.Constexpr,
@@ -356,7 +360,8 @@ class FlashAttentionBackwardPostprocess:
         # Reuse one existing dQ postprocess CTA per head to reduce dSink from
         # the per-row dPsum and LSE written by backward preprocess. This avoids
         # both a global atomic accumulator and a separate zero-initialization.
-        if const_expr(mLearnableSink is not None):
+        if const_expr(sink_tensors is not None):
+            mdPsum, mLSE, mLearnableSink, mdSink = sink_tensors
             block_x, block_y, block_z = cute.arch.block_idx()
             sink_head_idx = head_idx if const_expr(mCuSeqlensQ is None) else block_x
             # Varlen uses block_x to select one CTA per head. block_y and block_z
@@ -416,7 +421,7 @@ class FlashAttentionBackwardPostprocess:
                     sink_sum = sdQaccum_flat[lane_idx] if lane_idx < num_warps else Float32(0.0)
                     sink_sum = utils.warp_reduce(sink_sum, operator.add)
                     if lane_idx == 0:
-                        mdSink[sink_head_idx] = sink_sum.to(cutlass.BFloat16)
+                        mdSink[sink_head_idx] = sink_sum.to(mdSink.element_type)
                 cute.arch.barrier(barrier_id=5, number_of_threads=self.num_threads)
 
         if work_tile.is_valid_tile:

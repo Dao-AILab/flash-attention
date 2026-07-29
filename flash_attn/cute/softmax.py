@@ -205,12 +205,13 @@ class Softmax(ParamsBase):
         row_scale = cute.make_fragment_like(row_max, Float32)
 
         for r in cutlass.range(cute.size(row_sum), unroll_full=True):
+            row_max_scaled = row_max[r] * scale_log2
             if cutlass.const_expr(sink_val is not None):
                 sink_val_cur = sink_val if not isinstance(sink_val, cute.Tensor) else sink_val[r]
                 LOG2_E = math.log2(math.e)
-                row_sum[r] += cute.math.exp2(
-                    sink_val_cur * LOG2_E - row_max[r] * scale_log2, fastmath=True
-                )
+                if row_max[r] == -Float32.inf:
+                    row_max_scaled = sink_val_cur * LOG2_E
+                row_sum[r] += cute.math.exp2(sink_val_cur * LOG2_E - row_max_scaled, fastmath=True)
 
             # if row_sum is zero or nan, set acc_O_mn_row to 1.0
             acc_O_mn_row_is_zero_or_nan = row_sum[r] == 0.0 or row_sum[r] != row_sum[r]
@@ -220,7 +221,7 @@ class Softmax(ParamsBase):
             row_sum_cur = row_sum[r]
             LN2 = math.log(2.0)
             row_sum[r] = (
-                (row_max[r] * scale_log2 + cute.math.log2(row_sum_cur, fastmath=True)) * LN2
+                (row_max_scaled + cute.math.log2(row_sum_cur, fastmath=True)) * LN2
                 if not acc_O_mn_row_is_zero_or_nan
                 else -Float32.inf
             )

@@ -43,7 +43,10 @@ from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
 from flash_attn.cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
 from flash_attn.cute.flash_bwd_sm100 import FlashAttentionBackwardSm100
 from flash_attn.cute.flash_bwd_sm120 import FlashAttentionBackwardSm120
-from flash_attn.cute.flash_bwd_postprocess import FlashAttentionBackwardPostprocess
+from flash_attn.cute.flash_bwd_postprocess import (
+    FlashAttentionBackwardPostprocess,
+    LearnableSinkBwdTensors,
+)
 from flash_attn.cute.flash_fwd_combine import FlashAttentionForwardCombine
 from flash_attn.cute.flash_fwd_mla_sm100 import FlashAttentionMLAForwardSm100
 from flash_attn.cute.prepare_scheduler import FlashPrepareScheduler, SchedulerMetadataTensorsTorch
@@ -266,6 +269,8 @@ torch2cute_dtype_map = {
     torch.float8_e4m3fn: cutlass.Float8E4M3FN,
     torch.float8_e5m2: cutlass.Float8E5M2,
 }
+
+_LEARNABLE_SINK_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
 
 def num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, max_splits):
@@ -643,7 +648,9 @@ def _flash_attn_fwd(
             )
     if learnable_sink is not None:
         assert learnable_sink.shape == (num_head,)
-        assert learnable_sink.dtype == torch.bfloat16, "learnable_sink must be bfloat16"
+        assert learnable_sink.dtype in _LEARNABLE_SINK_DTYPES, (
+            "learnable_sink must be float16, bfloat16, or float32"
+        )
 
     if not is_fake_mode():
         assert all(
@@ -1076,7 +1083,11 @@ def _flash_attn_fwd(
         page_table is not None,
         window_size_left is not None,
         window_size_right is not None,
-        learnable_sink is not None,
+        (
+            torch2cute_dtype_map[learnable_sink.dtype]
+            if learnable_sink is not None
+            else None
+        ),
         q_descale is not None,
         k_descale is not None,
         v_descale is not None,
@@ -1669,7 +1680,7 @@ def _compile_bwd_postprocess(
     has_cuseqlens_q, has_seqused_q,
     use_2cta_instrs, cluster_size, arch,
     has_cu_total_m_blocks,
-    has_learnable_sink,
+    learnable_sink_dtype,
 ):
     """Compile bwd postprocess kernel using cute fake tensors."""
     mQ, mK, mV, mO, mdO, mdQ, mdK, mdV, mLSE, mLSElog2, mPdPsum, mdQaccum, mdKaccum, mdVaccum, mScaleP = make_fake_bwd_tensors(
@@ -1680,8 +1691,16 @@ def _compile_bwd_postprocess(
     mCuSeqlensQ = fake_tensor(Int32, (batchp1,), divisibility=1) if has_cuseqlens_q else None
     mSeqUsedQ = fake_tensor(Int32, (batch,), divisibility=1) if has_seqused_q else None
     mCuTotalMBlocks = fake_tensor(Int32, (batchp1,), divisibility=1) if has_cu_total_m_blocks else None
-    mLearnableSink = fake_tensor(cutlass.BFloat16, (mQ.shape[-2],), divisibility=1) if has_learnable_sink else None
-    mdSink = fake_tensor(cutlass.BFloat16, (mQ.shape[-2],), divisibility=1) if has_learnable_sink else None
+    sink_tensors = (
+        LearnableSinkBwdTensors(
+            mPdPsum,
+            mLSE,
+            fake_tensor(learnable_sink_dtype, (mQ.shape[-2],), divisibility=1),
+            fake_tensor(learnable_sink_dtype, (mQ.shape[-2],), divisibility=1),
+        )
+        if learnable_sink_dtype is not None
+        else None
+    )
     fa_bwd_post = FlashAttentionBackwardPostprocess(
         dtype, hdim, arch, block_size, num_threads, atom_layout, swap_ab,
         use_2cta_instrs=use_2cta_instrs,
@@ -1689,9 +1708,7 @@ def _compile_bwd_postprocess(
     )
     return cute.compile(
         fa_bwd_post, mdQaccum, mdQ, Float32(0.0), mCuSeqlensQ, mSeqUsedQ,
-        mPdPsum if has_learnable_sink else None,
-        mLSE if has_learnable_sink else None,
-        mLearnableSink, mdSink,
+        sink_tensors,
         mCuTotalMBlocks,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--enable-tvm-ffi",
@@ -1705,7 +1722,7 @@ def _bwd_postprocess_convert(
     atom_layout, swap_ab,
     use_2cta_instrs=False, cluster_size=1,
     cu_total_m_blocks=None,
-    dpsum=None, lse=None, learnable_sink=None, dsink=None,
+    sink_tensors=None,
 ):
     """Backward postprocess: convert float32 accumulator to bf16/fp16 output."""
     is_varlen = cu_seqlens is not None or seqused is not None
@@ -1724,14 +1741,18 @@ def _bwd_postprocess_convert(
         cu_seqlens is not None, seqused is not None,
         use_2cta_instrs, cluster_size, arch,
         cu_total_m_blocks is not None,
-        learnable_sink is not None,
+        (
+            torch2cute_dtype_map[sink_tensors.sink.dtype]
+            if sink_tensors is not None
+            else None
+        ),
     )
     if compile_key not in _bwd_postprocess_convert.compile_cache:
         _bwd_postprocess_convert.compile_cache[compile_key] = _compile_bwd_postprocess(*compile_key)
     if not is_fake_mode():
         _bwd_postprocess_convert.compile_cache[compile_key](
             accum, output, scale, cu_seqlens, seqused,
-            dpsum, lse, learnable_sink, dsink,
+            sink_tensors,
             cu_total_m_blocks,
         )
 
@@ -1996,7 +2017,9 @@ def _flash_attn_bwd(
         dlse = maybe_contiguous(dlse)
     if learnable_sink is not None:
         assert learnable_sink.shape == (num_head,)
-        assert learnable_sink.dtype == torch.bfloat16, "learnable_sink must be bfloat16"
+        assert learnable_sink.dtype in _LEARNABLE_SINK_DTYPES, (
+            "learnable_sink must be float16, bfloat16, or float32"
+        )
     if not is_fake_mode():
         assert all(
             t is None or t.is_cuda
@@ -2527,11 +2550,11 @@ def _flash_attn_bwd(
             AtomLayoutMdQ, dQ_swapAB,
             use_2cta_instrs=use_2cta_instrs, cluster_size=1,
             cu_total_m_blocks=cu_total_m_blocks_q,
-            # For sink grad.
-            dpsum=dpsum if learnable_sink is not None else None,
-            lse=lse if learnable_sink is not None else None,
-            learnable_sink=learnable_sink,
-            dsink=dsink,
+            sink_tensors=(
+                LearnableSinkBwdTensors(dpsum, lse, learnable_sink, dsink)
+                if learnable_sink is not None
+                else None
+            ),
         )
 
         if dKV_postprocess:
