@@ -13,7 +13,6 @@
 # So the main backward kernel is unchanged; we just replace D with D' = D - dLSE here.
 import math
 import operator
-from functools import partial
 from typing import Callable, Type, Optional
 
 import cuda.bindings.driver as cuda
@@ -49,6 +48,7 @@ class FlashAttentionBackwardPreprocess:
         pack_gqa: bool = False,
         qhead_per_kvhead: int = 1,
         nheads_kv: int = 1,
+        dq_accum_hdim_multiple: int = 32,
     ):
         """
         All contiguous dimensions must be at least 16 bytes aligned which indicates the head dimension
@@ -64,10 +64,13 @@ class FlashAttentionBackwardPreprocess:
         self.use_pdl = BaseDSL._get_dsl().get_arch_enum() >= Arch.sm_90a
         self.dtype = dtype
         self.tile_m = tile_m
-        # padding head_dim to a multiple of 32 as k_block_size
-        hdim_multiple_of = 32
-        self.head_dim_padded = int(math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of)
-        self.head_dim_v_padded = int(math.ceil(head_dim_v / hdim_multiple_of) * hdim_multiple_of)
+        self.head_dim_padded = int(
+            math.ceil(head_dim / dq_accum_hdim_multiple) * dq_accum_hdim_multiple
+        )
+        hdim_v_multiple_of = 32
+        self.head_dim_v_padded = int(
+            math.ceil(head_dim_v / hdim_v_multiple_of) * hdim_v_multiple_of
+        )
         self.check_hdim_v_oob = head_dim_v != self.head_dim_v_padded
         self.num_threads = num_threads
         self.use_padded_offsets = use_padded_offsets
@@ -365,8 +368,6 @@ class FlashAttentionBackwardPreprocess:
             tOpO = None
             if const_expr(self.check_hdim_v_oob):
                 tOpO = copy_utils.predicate_k(tOcO, limit=headdim_v)
-            # Each copy will use the same predicate
-            copy = partial(copy_utils.copy, pred=tOpO)
 
             tOrO = cute.make_rmem_tensor_like(tOgO)
             tOrdO = cute.make_rmem_tensor_like(tOgdO)
@@ -378,8 +379,9 @@ class FlashAttentionBackwardPreprocess:
                 # Instead of using tOcO, we using t0OcO and subtract the offset from the limit.
                 # This is bc the entries of t0OcO are known at compile time.
                 if t0OcO[0, m, 0][0] < seqlen_limit - tOcO[0][0]:
-                    copy(tOgO[None, m, None], tOrO[None, m, None])
-                    copy(tOgdO[None, m, None], tOrdO[None, m, None])
+                    pred = tOpO[None, m, None] if const_expr(self.check_hdim_v_oob) else None
+                    copy_utils.copy(tOgO[None, m, None], tOrO[None, m, None], pred=pred)
+                    copy_utils.copy(tOgdO[None, m, None], tOrdO[None, m, None], pred=pred)
             # O and dO loads are done; signal that the next kernel can start.
             # Correctness is ensured by griddepcontrol_wait() in bwd_sm90 before it reads our outputs.
             if const_expr(self.use_pdl):

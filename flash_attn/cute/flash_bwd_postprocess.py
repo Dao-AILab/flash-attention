@@ -56,8 +56,8 @@ class FlashAttentionBackwardPostprocess:
             "Only Ampere (8.x), Hopper (9.x), and Blackwell (10.x, 11.x, 12.x) are supported"
         )
         self.arch = arch
-        # padding head_dim to a multiple of 32 as k_block_size
-        hdim_multiple_of = 32
+        # SM100/SM110 backward accumulates packed 16-column head-dimension tiles.
+        hdim_multiple_of = 16 if arch // 10 in [10, 11] else 32
         self.tile_hdim = int(math.ceil(head_dim / hdim_multiple_of) * hdim_multiple_of)
         self.check_hdim_oob = head_dim != self.tile_hdim
         self.num_threads = num_threads
@@ -166,7 +166,7 @@ class FlashAttentionBackwardPostprocess:
                 (self.tile_m * self.tile_hdim // num_wg_mma, num_wg_mma)
             )
         else:
-            self.dQ_reduce_ncol = 32
+            self.dQ_reduce_ncol = math.gcd(32, self.tile_hdim)
             dQaccum_reduce_stage = self.tile_hdim // self.dQ_reduce_ncol
             assert self.num_threads == 128  # TODO: currently hard-coded
             self.s2r_tiled_copy_dQaccum = copy_utils.tiled_copy_1d(
