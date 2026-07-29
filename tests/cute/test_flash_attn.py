@@ -263,14 +263,7 @@ def test_flash_attn_output(
             print("window size = ", window_size)
         # window_size = (-1, -1) if not local else (16, 0)
         if has_learnable_sink:
-            # Exercise independent sink dtypes without expanding the test matrix.
-            if not deterministic:
-                sink_dtype = torch.float16
-            elif softcap == 0.0:
-                sink_dtype = torch.float32
-            else:
-                sink_dtype = torch.bfloat16
-            learnable_sink_base = torch.randn(nheads, dtype=sink_dtype, device=device)
+            learnable_sink_base = torch.randn(nheads, dtype=dtype, device=device)
             learnable_sink_ref = learnable_sink_base.detach().clone().requires_grad_()
             learnable_sink = learnable_sink_base.detach().clone().requires_grad_()
         else:
@@ -504,6 +497,66 @@ def test_flash_attn_output(
                 assert (dsink - dsink_ref).abs().max().item() <= rtol * (
                     dsink_pt - dsink_ref
                 ).abs().max().item() + dsink_atol
+
+
+@pytest.mark.skipif(
+    not (IS_SM90 or IS_SM100 or IS_SM110),
+    reason="Learnable sink backward requires SM90, SM100, or SM110",
+)
+@pytest.mark.parametrize(
+    "sink_dtype",
+    [torch.float16, torch.bfloat16, torch.float32],
+    ids=["fp16", "bf16", "fp32"],
+)
+@retry_on_oom
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_learnable_sink_backward_dtype(sink_dtype):
+    torch.random.manual_seed(0)
+    batch_size, seqlen, nheads, d = 9, 128, 6, 64
+    device, dtype = "cuda", torch.bfloat16
+    q, k, v = [
+        torch.randn(
+            batch_size,
+            seqlen,
+            nheads,
+            d,
+            device=device,
+            dtype=dtype,
+            requires_grad=True,
+        )
+        for _ in range(3)
+    ]
+    sink_base = torch.randn(nheads, device=device, dtype=sink_dtype)
+    sink_ref = sink_base.detach().clone().requires_grad_()
+    sink = sink_base.detach().clone().requires_grad_()
+
+    out_ref, _ = attention_ref(q, k, v, None, None, learnable_sink=sink_ref)
+    out_pt, _ = attention_ref(
+        q,
+        k,
+        v,
+        None,
+        None,
+        learnable_sink=sink_ref,
+        upcast=False,
+        reorder_ops=True,
+    )
+    out, _ = flash_attn_func(q, k, v, learnable_sink=sink)
+    dout = torch.randn_like(out)
+    dsink = torch.autograd.grad(out, (q, k, v, sink), dout)[-1]
+    if is_fake_mode():
+        return
+
+    dsink_ref = torch.autograd.grad(out_ref, sink_ref, dout)[0]
+    dsink_pt = torch.autograd.grad(out_pt, sink_ref, dout)[0]
+    assert dsink.dtype == sink_dtype
+    dsink_ulp = (
+        torch.nextafter(dsink_ref.abs(), torch.full_like(dsink_ref, float("inf")))
+        - dsink_ref.abs()
+    ).max().item()
+    assert (dsink - dsink_ref).abs().max().item() <= 2 * (
+        dsink_pt - dsink_ref
+    ).abs().max().item() + 2 * dsink_ulp
 
 
 @pytest.mark.skipif(
