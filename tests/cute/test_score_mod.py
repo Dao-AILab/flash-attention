@@ -1,3 +1,5 @@
+import math
+
 import pytest
 import torch
 import cutlass
@@ -5,6 +7,7 @@ import cutlass.cute as cute
 from cutlass._mlir.dialects import math as mlir_math
 import operator
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+from flash_attn.cute.cache_utils import JITCache
 from flash_attn.cute.interface import (
     flash_attn_func,
     _flash_attn_fwd,
@@ -28,6 +31,7 @@ from score_mod_definitions import (
     score_mod_causal_v2 as score_mod_9,
     score_mod_batch_bias as score_mod_10,
     score_mod_dual_buffer as score_mod_11,
+    score_mod_global_kv_bias,
 )  # isort: split
 from score_mod_definitions import (
     score_mod_identity_vectorized as score_mod_1_vectorized,
@@ -197,6 +201,34 @@ def run_flex_reference(q, k, v, eager_score_mod, dtype=None) -> torch.Tensor:
     if dtype is not None:
         q, k, v = q.to(dtype), k.to(dtype), v.to(dtype)
     return flex_attention(q, k, v, score_mod=eager_score_mod, enable_gqa=q.shape[1] != k.shape[1])
+
+
+@pytest.mark.skipif(COMPUTE_CAPABILITY not in [10, 11], reason="SM100/SM110 aux-cache test")
+def test_score_mod_aux_cache_separates_dtype_and_layout(monkeypatch):
+    torch.manual_seed(0)
+    batch, seqlen_q, seqlen_k, heads, head_dim = 2, 65, 129, 4, 64
+    q = torch.randn(
+        batch, seqlen_q, heads, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    k = torch.randn(
+        batch, seqlen_k, heads, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    v = torch.randn_like(k)
+    bias = torch.randn(seqlen_k, device="cuda", dtype=torch.bfloat16) * 0.1
+    aux_tensors = (bias, bias.float(), bias[:1].expand(seqlen_k))
+    cache = JITCache()
+    monkeypatch.setattr(_flash_attn_fwd, "compile_cache", cache)
+    for aux in aux_tensors:
+        out = _flash_attn_fwd(
+            q, k, v, score_mod=score_mod_global_kv_bias, aux_tensors=[aux]
+        )[0]
+        scores = q.float().transpose(1, 2) @ k.float().transpose(1, 2).transpose(-1, -2)
+        reference = (
+            torch.softmax(scores / math.sqrt(head_dim) + aux.float(), dim=-1)
+            @ v.float().transpose(1, 2)
+        ).transpose(1, 2)
+        torch.testing.assert_close(out.float(), reference, atol=0.04, rtol=0.04)
+    assert len(cache.cache) == 3
 
 
 @pytest.mark.parametrize("seqlen_q,seqlen_kv", SEQLEN_CONFIGS)

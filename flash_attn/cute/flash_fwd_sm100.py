@@ -746,6 +746,8 @@ class FlashAttentionForwardSm100:
             cute.cosize(sQ_layout) if const_expr(not self.overlap_sO_sQ) else
             cutlass.max(cute.cosize(sQ_layout), cute.cosize(sO_layout) * self.o_dtype.width // self.q_dtype.width)
         )
+        # K and V alias the same physical buffer and may have different extents.
+        sKV_size = cutlass.max(cute.cosize(sK_layout), cute.cosize(sV_layout))
 
         sched_response_size = self.sched_stages * 4 if self.dynamic_persistent else 0
         sched_mbar_size = self.sched_stages * 2 if self.dynamic_persistent else 0
@@ -786,8 +788,7 @@ class FlashAttentionForwardSm100:
                 cute.struct.MemRange[self.q_dtype, sQ_size], self.buffer_align_bytes
             ]
             sK: cute.struct.Align[
-                # cute.cosize(sK_layout) is correct even in the case of self.uneven_kv_smem
-                cute.struct.MemRange[self.k_dtype, cute.cosize(sK_layout)],
+                cute.struct.MemRange[self.k_dtype, sKV_size],
                 self.buffer_align_bytes,
             ]
 
