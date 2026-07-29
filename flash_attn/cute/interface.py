@@ -50,9 +50,12 @@ from flash_attn.cute.flash_bwd_mla_sm100 import FlashAttentionSparseMLABackwardS
 from flash_attn.cute.flash_bwd_mla_dq_dqv_sm100 import dQdQvGemmKernel
 from flash_attn.cute.flash_bwd_mla_dk_sm100 import dKGemmKernel
 
-# SM100 head_dim=256 2CTA kernel imports
+# Dedicated head_dim=256 2CTA kernel imports
 from flash_attn.cute.sm100_hd256_2cta_fmha_forward import BlackwellFusedMultiHeadAttentionForward
 from flash_attn.cute.sm100_hd256_2cta_fmha_backward import BlackwellFusedMultiHeadAttentionBackward
+from flash_attn.cute.blackwell_hd256_causal_varlen_forward import (
+    BlackwellHd256CausalVarlenForward,
+)
 
 from flash_attn.cute.utils import AuxData
 from flash_attn.cute.block_sparsity import (
@@ -64,6 +67,7 @@ from flash_attn.cute.block_sparsity import (
     normalize_block_sparse_config,
     normalize_block_sparse_config_bwd,
 )
+
 
 def _parse_arch_str(arch_str):
     """Parse arch string (e.g. 'sm_80', 'sm_90a', '80', '100') to int (e.g. 80, 90, 100)."""
@@ -519,13 +523,41 @@ def _flash_attn_fwd(
     requested_use_clc_scheduler = utils._get_use_clc_scheduler_default()
     requested_disable_2cta = utils._get_disable_2cta_default(is_fwd=True)
 
+    use_blackwell_hd256_causal_varlen_kernel = (
+        arch == 103
+        and q_dtype in (torch.bfloat16, torch.float8_e4m3fn)
+        and head_dim == 256
+        and head_dim_v == 256
+        and causal
+        and not local
+        and q is not None
+        and k is not None
+        and qv is None
+        and cu_seqlens_q is not None
+        and (cu_seqlens_k is not None or page_table is not None)
+        and seqused_q is None
+        and gather_kv_indices is None
+        and num_splits == 1
+        and not use_block_sparsity
+        and softcap is None
+        and score_mod is None
+        and mask_mod is None
+        and learnable_sink is None
+    )
     current_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
     # SM80/SM120: uses SM80 MMA, 128 threads (4 warps)
     if arch // 10 in [8, 12]:
         num_threads = 128
 
-    fwd_cfg = FwdConfig(128, 128, True, True)  # default
+    # BF16 hd256 uses a 128x64 tile so K/V can run a five-stage pipeline
+    # within the SM103 shared-memory budget. FP8 keeps its tuned 128x128 tile.
+    fwd_cfg = FwdConfig(
+        128,
+        64 if use_blackwell_hd256_causal_varlen_kernel and not is_fp8 else 128,
+        True,
+        True,
+    )
     if tile_mn is None:
         if arch // 10 == 12:
             # SM120 tile sizes tuned for 99 KB SMEM capacity:
@@ -556,7 +588,11 @@ def _flash_attn_fwd(
         min_seqlen_k = seqlen_k 
     seqlen_q_packgqa = max_seqlen_q * qhead_per_kvhead
     if arch // 10 in [10, 11]:
-        q_stage = 2 if seqlen_q_packgqa > tile_m else 1
+        q_stage = (
+            1
+            if use_blackwell_hd256_causal_varlen_kernel
+            else (2 if seqlen_q_packgqa > tile_m else 1)
+        )
     else:
         q_stage = 1
 
@@ -603,8 +639,17 @@ def _flash_attn_fwd(
     )
 
     # hd=256 2CTA forward uses dedicated kernel (Blackwell family)
-    use_dedicated_hd256_kernel = arch // 10 in [10, 11] and head_dim == 256 and head_dim_v == 256
-    use_2cta_instrs = use_2cta_instrs or use_dedicated_hd256_kernel
+    use_dedicated_hd256_kernel = (
+        arch // 10 in [10, 11]
+        and head_dim == 256
+        and head_dim_v == 256
+        and not use_blackwell_hd256_causal_varlen_kernel
+    )
+    use_2cta_instrs = (
+        use_2cta_instrs
+        or use_dedicated_hd256_kernel
+        or use_blackwell_hd256_causal_varlen_kernel
+    )
 
     if softcap is not None:
         assert score_mod is None, "softcap and score_mod cannot be used together"
@@ -629,7 +674,11 @@ def _flash_attn_fwd(
     # pays work-stealing overhead.
     is_varlen_mha = is_varlen and qhead_per_kvhead == 1
     is_dense_noncausal = not is_varlen and not causal and not local
-    use_clc_scheduler = requested_use_clc_scheduler and not is_varlen_mha and not is_dense_noncausal
+    use_clc_scheduler = (
+        True
+        if use_blackwell_hd256_causal_varlen_kernel
+        else requested_use_clc_scheduler and not is_varlen_mha and not is_dense_noncausal
+    )
 
     if use_block_sparsity:
         # NB: pack_gqa requires block sparse head dim == 1 (broadcasted)
@@ -762,13 +811,15 @@ def _flash_attn_fwd(
         is_split_kv,
         pack_gqa,
         arch,
-        page_size not in [None, tile_n],  # paged KV non-TMA
+        page_size is not None and page_size % tile_n != 0,
+        page_size,
         use_2cta_instrs,
         q_subtile_factor,
         kv_subtile_factor,
         mma_pv_is_rs,
         intra_wg_overlap,
         use_clc_scheduler,
+        use_blackwell_hd256_causal_varlen_kernel,
         q is not None,
         qv is not None,
         p is not None,
@@ -922,10 +973,22 @@ def _flash_attn_fwd(
                     pack_gqa = False
 
                 flash_fwd_obj_cls = (
-                    BlackwellFusedMultiHeadAttentionForward
-                    if use_dedicated_hd256_kernel
-                    else FlashAttentionForwardSm100
+                    BlackwellHd256CausalVarlenForward
+                    if use_blackwell_hd256_causal_varlen_kernel
+                    else (
+                        BlackwellFusedMultiHeadAttentionForward
+                        if use_dedicated_hd256_kernel
+                        else FlashAttentionForwardSm100
+                    )
                 )
+
+                extra_fwd_kwargs = {}
+                if use_blackwell_hd256_causal_varlen_kernel:
+                    extra_fwd_kwargs = {
+                        "paged_kv_page_size": page_size,
+                    }
+                else:
+                    extra_fwd_kwargs = {"use_clc_scheduler": use_clc_scheduler}
 
                 fa_fwd = flash_fwd_obj_cls(
                     head_dim,
@@ -946,12 +1009,14 @@ def _flash_attn_fwd(
                     score_mod=score_mod,
                     mask_mod=mask_mod,
                     has_aux_tensors=aux_tensors is not None,
-                    paged_kv_non_tma=page_size not in [None, tile_n],
+                    paged_kv_non_tma=(
+                        page_size is not None and page_size % tile_n != 0
+                    ),
                     is_varlen_q=cu_seqlens_q is not None or seqused_q is not None,
                     q_subtile_factor=q_subtile_factor,
                     kv_subtile_factor=kv_subtile_factor,
                     use_2cta_instrs=use_2cta_instrs,
-                    use_clc_scheduler=use_clc_scheduler,
+                    **extra_fwd_kwargs,
                 )
         elif arch // 10 == 12:
             # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
