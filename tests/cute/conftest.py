@@ -58,6 +58,36 @@ def pytest_configure(config):
 
     os.environ["CUDA_VISIBLE_DEVICES"] = gpu_ids[worker_num % len(gpu_ids)]
 
+def _disable_torch_native_triton_bmm():
+    """Work around an int32 overflow in torch's Triton override for aten::bmm.
+
+    torch 2.13 routes bmm to a Triton "outer product" kernel when the contraction
+    dim is 1 (torch/_native/ops/bmm_outer_product/). That kernel addresses the
+    output as `pid_b * stride_ob + ...` in int32, so once B * M * N exceeds 2**31 the
+    address wraps negative and the launch takes an illegal memory access, which
+    poisons the CUDA context and cascades into every later test in the process.
+
+    Reference (not kernel) code in these tests hits it: with seqlen_q == 1 the
+    backward of P @ V is a K=1 bmm, e.g. B=batch*nheads=1536, M=seqlen_k=8192,
+    N=head_dim_v=512 -> B*M*N = 6.4e9. Deregistering just this override falls back
+    to eager (cuBLAS) bmm, which handles 64-bit offsets correctly.
+
+    Repro without any FlashAttention code: agent_space/repro_torch_bmm_outer_int32.py
+    """
+    try:
+        from torch._native import registry
+    except ImportError:
+        return  # torch too old to have the override at all
+    try:
+        registry.deregister_op_overrides(disable_op_symbols="bmm")
+    except Exception as exc:  # never let a workaround break collection
+        logging.warning("could not disable torch._native bmm override: %s", exc)
+
+
+def pytest_sessionstart(session):
+    _disable_torch_native_triton_bmm()
+
+
 def pytest_collection_finish(session):
     if not session.config.option.collectonly:
         return

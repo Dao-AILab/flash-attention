@@ -3307,6 +3307,8 @@ def test_flash_attn_mla_absorbed(
     hdimv = 512
     if not IS_SM100:
         pytest.skip()
+    if kv_sparsity and os.environ.get("FLASH_ATTENTION_MLA_1CTA", "0") == "1":
+        pytest.skip("1CTA MLA kernel does not support sparse KV")
     local = local_enum > 0
     if local and causal:
         pytest.skip()
@@ -4460,6 +4462,8 @@ def test_flash_attn_mla_absorbed_varlen(
     hdimv = 512
     if not IS_SM100:
         pytest.skip()
+    if os.environ.get("FLASH_ATTENTION_MLA_1CTA", "0") == "1":
+        pytest.skip("1CTA MLA kernel does not support varlen (v1)")
     local = local_enum > 0
     if local and causal:
         pytest.skip()
