@@ -733,8 +733,12 @@ def _flash_attn_fwd(
     # Opt-in routing to the 1CTA (tcgen05.mma.ws) MLA kernel.
     mla_1cta = qv is not None and os.environ.get("FLASH_ATTENTION_MLA_1CTA", "0") == "1"
     # Opt-in to the Q-in-TMEM variant of that kernel (unified sK + single TS QK mma).
+    # Q-in-TMEM (unified sK + one N=128 weight-stationary TS QK mma) is the default: it
+    # is faster than the two-phase path on every measured shape and is bit-identical to
+    # the 2CTA kernel. Set FLASH_ATTENTION_MLA_1CTA_Q_TMEM=0 to get the legacy path
+    # (ablation only -- it does not support paged KV with a rope part).
     mla_1cta_q_tmem = (
-        mla_1cta and os.environ.get("FLASH_ATTENTION_MLA_1CTA_Q_TMEM", "0") == "1"
+        mla_1cta and os.environ.get("FLASH_ATTENTION_MLA_1CTA_Q_TMEM", "1") == "1"
     )
 
     compile_key = (
@@ -895,12 +899,12 @@ def _flash_attn_fwd(
                 has_qk = q is not None
                 if mla_1cta:
                     # 1CTA (tcgen05.mma.ws) MLA kernel, opt-in via FLASH_ATTENTION_MLA_1CTA=1.
-                    # Supports varlen (cu_seqlens / seqused, Q and K sides independently)
-                    # and pack_gqa at any ratio (including ratios that do not divide the
-                    # 64-row tile). Still TMA-only KV: no sparse/topk gather, no paged KV.
+                    # Supports varlen (cu_seqlens / seqused, Q and K sides independently),
+                    # pack_gqa at any ratio (including ratios that do not divide the 64-row
+                    # tile), and paged KV at any page size (TMA when page_size == tile_n,
+                    # else a cp.async gather warp group). No sparse/topk gather.
                     for feat, name in [
                         (sparse_kv, "sparse_kv / gather_kv_indices"),
-                        (page_table is not None, "paged KV"),
                         (p is not None, "P emission"),
                         (row_max is not None, "row_max emission"),
                         (local, "local attention"),
@@ -917,9 +921,11 @@ def _flash_attn_fwd(
                         else True,
                         has_qk=has_qk,
                         pack_gqa=pack_gqa,
-                        q_in_tmem=mla_1cta_q_tmem,
+                        # paged KV gathers into the unified sK slot -> q_in_tmem
+                        q_in_tmem=mla_1cta_q_tmem or page_table is not None,
                         has_seqused_q=seqused_q is not None,
                         has_cu_seqlens_q=cu_seqlens_q is not None,
+                        use_cpasync_load_KV=paged_kv_cpasync,
                     )
                 else:
                     fa_fwd = FlashAttentionMLAForwardSm100(
