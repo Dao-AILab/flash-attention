@@ -18,11 +18,20 @@
 #    phase accumulators tile the plain N=128 Layout E S accumulator (phase p at
 #    column offset 32*p). sK is a single (64, hdim) slot loaded twice per block
 #    as 2x2 32-row TMA boxes (keeping the true seqlen extent for OOB zero-fill).
+#    With `q_in_tmem` this collapses to QK[zero_init] -> QvV(dv0) -> QvV(dv1):
+#    Q is staged into TMEM once per m-tile (tcgen05.cp, duplicated across lane
+#    halves) and QK becomes ONE N=128 ws mma with its A operand in TMEM, reading a
+#    unified (128, hdim) sK slot filled by a single TMA box per n_block. Faster on
+#    every measured shape; see agent_space/NOTES_mla_1cta.md for the ablation and
+#    for the two syncs that path depends on.
 #  - Dense only: no topk/DSA gather, no bitmask, no P/rowmax emission, no paged
-#    KV, no varlen, no pack_gqa (v1 scope).
+#    KV, no varlen (v1 scope). pack_gqa is supported (any ratio up to 128).
 #
-# SMEM (231.5 KB): sQ 8K + sK 8K + sQv 64K + sV 128K (one n_block) + sP 16K + stats.
-# TMEM (384/512): S 2 stages x 64 cols + O 2 dv-splits x 128 cols, Layout E packed.
+# SMEM (226 KB): sQv 64K + sV 128K (one n_block) + sP 16K + stats, plus either
+#   sQ 8K + sK 8K, or (q_in_tmem) a unified sK 16K whose first half doubles as the
+#   Q staging buffer.
+# TMEM (384/512, 416 with q_in_tmem): S 2 stages x 64 cols + O 2 dv-splits x 128
+#   cols, Layout E packed, + 32 cols of duplicated Q.
 
 import math
 from functools import partial
@@ -74,12 +83,24 @@ class FlashAttentionMLAForward1CtaSm100:
         use_clc_scheduler: bool = True,
         has_qk: bool = True,
         pack_gqa: bool = False,
+        q_in_tmem: bool = False,
+        _qk_issue_last: bool = False,
     ):
         self.is_causal = is_causal
         self.is_local = False
         self.qhead_per_kvhead = qhead_per_kvhead
         self.nheads_kv = nheads_kv
         self.has_qk = has_qk
+        # q_in_tmem: stage the rope-part Q into TMEM (32 cols, duplicated across lane
+        # halves by tcgen05.cp) and run QK as ONE N=128 weight-stationary TS mma against
+        # a unified (128, hdim) sK slot -- instead of two N=64 SS phases against a
+        # half-size sK reloaded with an interleaved token gather. The freed sQ (8 KB)
+        # pays for the larger sK. Q's smem staging buffer aliases the first half of sK.
+        self.q_in_tmem = q_in_tmem and has_qk
+        # EXPERIMENT-ONLY knob (perf attribution): with q_in_tmem, issue the QK mma
+        # AFTER the QvV splits instead of before, isolating the "QK overlaps the V TMA
+        # tail" mechanism from the structural unified-sK/TS changes. Not for production.
+        self._qk_issue_last = _qk_issue_last and self.q_in_tmem
         # pack_gqa folds qhead_per_kvhead into the row (m) dimension so one K/V tile
         # serves every q head of a kv group. Any ratio is supported: the packed row
         # index is m = h_in_group + qhead_per_kvhead * q_pos.
@@ -170,11 +191,12 @@ class FlashAttentionMLAForward1CtaSm100:
         assert hdimv % (2 * self.num_hdimv_splits) == 0
         self.epi_tile = (self.cta_tile_m, self.hdimv // self.num_hdimv_splits)
         self.tile_P = (self.cta_tile_m, self.tile_n)
-        # QK runs as two N=64 ws phases with interleaved K token gather; each phase
-        # loads 2 x 32 gathered rows into a single (64, hdim) sK slot.
-        self.num_qk_phases = 2
+        # q_in_tmem: QK is ONE N=128 ws mma over a unified (128, hdim) sK slot.
+        # Otherwise QK runs as two N=64 ws phases with interleaved K token gather;
+        # each phase loads 2 x 32 gathered rows into a single (64, hdim) sK slot.
+        self.num_qk_phases = 1 if self.q_in_tmem else 2
         self.qk_phase_n = self.tile_n // self.num_qk_phases
-        assert self.qk_phase_n == 64
+        assert self.qk_phase_n == (128 if self.q_in_tmem else 64)
 
         # ==== MMA info ====
         self.mma_tiler_QK = (self.cta_tile_m, self.qk_phase_n, self.hdim)
@@ -189,6 +211,11 @@ class FlashAttentionMLAForward1CtaSm100:
         self.major_mode_Vti = tcgen05.OperandMajorMode.MN
         self.major_mode_P = tcgen05.OperandMajorMode.K
         self.operand_source_A = tcgen05.OperandSource.SMEM
+        # Only the QK mma can take its A operand (Q) from TMEM; Qv and P stay in SMEM
+        # (Qv would need 256 TMEM columns -- see agent_space/NOTES_mla_1cta.md).
+        self.operand_source_Q = (
+            tcgen05.OperandSource.TMEM if self.q_in_tmem else tcgen05.OperandSource.SMEM
+        )
 
         # ==== pipeline info ====
         self.num_stages_Q = 1
@@ -217,6 +244,13 @@ class FlashAttentionMLAForward1CtaSm100:
         self.tmem_offset_O1 = self.tmem_offset_O0 + self.tmem_cols_Oi
         self.tmem_offsets_O = [self.tmem_offset_O0, self.tmem_offset_O1]
         self.total_tmem = self.tmem_offset_O1 + self.tmem_cols_Oi
+        # Q operand region (q_in_tmem): a (64, hdim) 16-bit A operand for an M=64 ws mma
+        # occupies hdim/2 columns, holding TWO copies of the tile (rows land at lanes m
+        # and m + 64 -- the PTX Layout E A-operand organization, decoded empirically in
+        # agent_space/ws_ts_mma_validation.py).
+        self.tmem_offset_Q = self.total_tmem
+        self.tmem_cols_Q = self.hdim // 2 if self.q_in_tmem else 0
+        self.total_tmem += self.tmem_cols_Q
         assert self.total_tmem <= self.tmem_alloc_cols, (
             f"Total TMEM columns allocated {self.total_tmem} exceeds capacity {self.tmem_alloc_cols}"
         )
@@ -274,7 +308,9 @@ class FlashAttentionMLAForward1CtaSm100:
         (sQ_struct, sK_struct, sQv_struct, sV_struct, sP_struct) = (
             smem_struct_align(dtype, layout, disabled)
             for dtype, layout, disabled in [
-                (self.dtype_Q, self.sQ_layout_staged, not self.has_qk),
+                # q_in_tmem: Q's smem staging aliases the first (64, hdim) half of the
+                # unified sK slot, so it needs no allocation of its own.
+                (self.dtype_Q, self.sQ_layout_staged, not self.has_qk or self.q_in_tmem),
                 (self.dtype_K, self.sK_layout_staged, not self.has_qk),
                 (self.dtype_Qv, self.sQv_layout_staged, False),
                 (self.dtype_V, self.sV_layout_staged, False),
@@ -330,6 +366,11 @@ class FlashAttentionMLAForward1CtaSm100:
             ]
             tmem_holding_buf: Int32
             sO_empty_mbar_ptr: cutlass.Int64
+            # q_in_tmem: "Q staging consumed". The staging tile aliases the first half
+            # of the unified sK slot, so the load warp must not issue this tile's K
+            # loads until the mma warp's tcgen05.cp's have drained it. The mma warp
+            # arrives with tcgen05.commit, which completes on cp completion.
+            staging_mbar_ptr: cutlass.Int64
 
             sRowMax: sStats_struct
             sRowSum: sStats_struct
@@ -441,18 +482,22 @@ class FlashAttentionMLAForward1CtaSm100:
         # ==== Prepare MMAs ====
         # (local_var, dtype_a, major_a, major_b, mma_tiler)
         # fmt: off
+        # tiled_mma_Qst is the SMEM-A twin of tiled_mma_QK: with q_in_tmem the QK mma
+        # takes Q from TMEM, but the Q smem staging layout / TMA atom / load-side
+        # partition_A still need an SMEM-A mma (the A-side tiler is N-independent).
         _mma_specs = [
-            ("tiled_mma_QK",   self.dtype_Q,  self.major_mode_Q,   self.major_mode_K,   self.mma_tiler_QK),
-            ("tiled_mma_QK32", self.dtype_Q,  self.major_mode_Q,   self.major_mode_K,   self.mma_tiler_QK32),
-            ("tiled_mma_QvV",  self.dtype_Qv, self.major_mode_Qvi, self.major_mode_Vi,  self.mma_tiler_QvV),
-            ("tiled_mma_PVt",  self.dtype_P,  self.major_mode_P,   self.major_mode_Vti, self.mma_tiler_PVt),
+            ("tiled_mma_QK",   self.dtype_Q,  self.major_mode_Q,   self.major_mode_K,   self.mma_tiler_QK,   self.operand_source_Q),
+            ("tiled_mma_Qst",  self.dtype_Q,  self.major_mode_Q,   self.major_mode_K,   self.mma_tiler_QK,   self.operand_source_A),
+            ("tiled_mma_QK32", self.dtype_Q,  self.major_mode_Q,   self.major_mode_K,   self.mma_tiler_QK32, self.operand_source_A),
+            ("tiled_mma_QvV",  self.dtype_Qv, self.major_mode_Qvi, self.major_mode_Vi,  self.mma_tiler_QvV,  self.operand_source_A),
+            ("tiled_mma_PVt",  self.dtype_P,  self.major_mode_P,   self.major_mode_Vti, self.mma_tiler_PVt,  self.operand_source_A),
         ]
-        tiled_mma_QK, tiled_mma_QK32, tiled_mma_QvV, tiled_mma_PVt = (
+        tiled_mma_QK, tiled_mma_Qst, tiled_mma_QK32, tiled_mma_QvV, tiled_mma_PVt = (
             sm100_utils.make_trivial_tiled_mma(
                 dtype_a, major_a, major_b, self.dtype_acc, self.cta_group, mma_tiler[:2],
-                self.operand_source_A,
+                a_source,
             )
-            for _, dtype_a, major_a, major_b, mma_tiler in _mma_specs
+            for _, dtype_a, major_a, major_b, mma_tiler, a_source in _mma_specs
         )
         # fmt: on
 
@@ -460,7 +505,7 @@ class FlashAttentionMLAForward1CtaSm100:
         # (attr, make_fn, tiled_mma, mma_tiler, dtype, num_stages)
         # fmt: off
         _smem_layout_specs = [
-            ("sQ_layout",   sm100_utils.make_smem_layout_a, tiled_mma_QK,   self.mma_tiler_QK,   self.dtype_Q,  self.num_stages_Q),
+            ("sQ_layout",   sm100_utils.make_smem_layout_a, tiled_mma_Qst,  self.mma_tiler_QK,   self.dtype_Q,  self.num_stages_Q),
             ("sK_layout",   sm100_utils.make_smem_layout_b, tiled_mma_QK,   self.mma_tiler_QK,   self.dtype_K,  self.num_stages_K),
             # 32-row halves of the sK slot, used as the TMA destination view.
             ("sK32_layout", sm100_utils.make_smem_layout_b, tiled_mma_QK32, self.mma_tiler_QK32, self.dtype_K,  2 * self.num_stages_K),
@@ -482,9 +527,36 @@ class FlashAttentionMLAForward1CtaSm100:
             setattr(self, f"{attr}_staged", staged)
             setattr(self, attr, cute.select(staged, mode=[0, 1, 2]))
         # fmt: on
-        if const_expr(self.has_qk):
+        if const_expr(self.has_qk and not self.q_in_tmem):
             assert cute.cosize(self.sK32_layout_staged) == cute.cosize(self.sK_layout_staged), (
                 "stacked (32, hdim) K tiles must tile the (64, hdim) sK slot byte-identically"
+            )
+        self.sQst_layout = None
+        if const_expr(self.q_in_tmem):
+            # Q's staging buffer aliases the first (64, hdim) half of the unified
+            # (128, hdim) sK slot.
+            assert cute.cosize(self.sQ_layout_staged) * 2 == cute.cosize(self.sK_layout_staged), (
+                "unified sK must be exactly twice the Q staging tile"
+            )
+            # Flat (cta_tile_m, hdim) view of the staging tile: cp_smem_to_tmem_dup_64
+            # builds a UMMA descriptor from it, which needs the plain 2-D canonical
+            # profile rather than the mma A-fragment profile of sQ_layout. Derived from
+            # sQ_layout itself (regroup the A-fragment modes to (m, k), then coalesce),
+            # so it addresses exactly the bytes the Q load writes, by construction.
+            sQ_outer = self.sQ_layout.outer
+            self.sQst_layout = cute.make_composed_layout(
+                self.sQ_layout.inner,
+                0,
+                cute.coalesce(
+                    cute.make_layout(
+                        (sQ_outer.shape[0][0], (sQ_outer.shape[0][1], sQ_outer.shape[2])),
+                        stride=(
+                            sQ_outer.stride[0][0],
+                            (sQ_outer.stride[0][1], sQ_outer.stride[2]),
+                        ),
+                    ),
+                    target_profile=(1, 1),
+                ),
             )
         assert cute.cosize(self.sVt_layout_staged) == cute.cosize(self.sV_layout_staged), (
             "sVt view must cover exactly the sV bytes"
@@ -516,12 +588,18 @@ class FlashAttentionMLAForward1CtaSm100:
 
         # (atom_name, tensor_name, make_fn, m, smem_layout, mma_tiler, tiled_mma)
         # fmt: off
+        # K: with a unified sK slot one plain (tile_n, hdim) box per n_block suffices.
+        # Otherwise it loads via 32-row boxes (interleaved gather); either way the
+        # descriptor keeps the true seqlen extent, so partial tail blocks zero-fill.
+        _K_tma = (
+            (self.sK_layout, self.mma_tiler_QK, tiled_mma_QK)
+            if self.q_in_tmem
+            else (self.sK32_layout, self.mma_tiler_QK32, tiled_mma_QK32)
+        )
         _tma_specs = [
-            ("tma_atom_Q",  "tma_tensor_Q",  A, mQ,  self.sQ_layout,   self.mma_tiler_QK,   tiled_mma_QK),
+            ("tma_atom_Q",  "tma_tensor_Q",  A, mQ,  self.sQ_layout,   self.mma_tiler_QK,   tiled_mma_Qst),
             ("tma_atom_Qv", "tma_tensor_Qv", A, mQv, self.sQv_layout,  self.mma_tiler_QvV,  tiled_mma_QvV),
-            # K loads via 32-row boxes so the descriptor keeps the true seqlen extent
-            # (correct OOB zero-fill for partial tail blocks).
-            ("tma_atom_K",  "tma_tensor_K",  B, mK,  self.sK32_layout, self.mma_tiler_QK32, tiled_mma_QK32),
+            ("tma_atom_K",  "tma_tensor_K",  B, mK,  *_K_tma),
             ("tma_atom_V",  "tma_tensor_V",  B, mV,  self.sV_layout,   self.mma_tiler_QvV,  tiled_mma_QvV),
         ]
         _tmas = {}
@@ -670,6 +748,7 @@ class FlashAttentionMLAForward1CtaSm100:
             self.gmem_tiled_copy_Q if const_expr(not self.use_tma_QQv) else None,
             self.gmem_tiled_copy_Qv if const_expr(not self.use_tma_QQv) else None,
             self.sQ_layout_staged,
+            self.sQst_layout,
             self.sK_layout_staged,
             self.sK32_layout_staged,
             self.sQv_layout_staged,
@@ -680,6 +759,7 @@ class FlashAttentionMLAForward1CtaSm100:
             self.sScale_layout,
             sO_layout,
             tiled_mma_QK,
+            tiled_mma_Qst,
             tiled_mma_QK32,
             tiled_mma_QvV,
             tiled_mma_PVt,
@@ -712,6 +792,7 @@ class FlashAttentionMLAForward1CtaSm100:
         gmem_tiled_copy_Q: Optional[cute.TiledCopy],
         gmem_tiled_copy_Qv: Optional[cute.TiledCopy],
         sQ_layout_staged: Optional[cute.ComposedLayout],
+        sQst_layout: Optional[cute.ComposedLayout],
         sK_layout_staged: Optional[cute.ComposedLayout],
         sK32_layout_staged: Optional[cute.ComposedLayout],
         sQv_layout_staged: cute.ComposedLayout,
@@ -722,6 +803,7 @@ class FlashAttentionMLAForward1CtaSm100:
         sScale_layout: cute.Layout,
         sO_layout: cute.ComposedLayout,
         tiled_mma_QK: cute.TiledMma,
+        tiled_mma_Qst: cute.TiledMma,
         tiled_mma_QK32: cute.TiledMma,
         tiled_mma_QvV: cute.TiledMma,
         tiled_mma_PVt: cute.TiledMma,
@@ -807,8 +889,11 @@ class FlashAttentionMLAForward1CtaSm100:
         # fmt: on
 
         sO_empty_mbar_ptr = storage.sO_empty_mbar_ptr
+        staging_mbar_ptr = storage.staging_mbar_ptr
         if warp_idx == 0:
             cute.arch.mbarrier_init(sO_empty_mbar_ptr, 1)
+            if const_expr(self.q_in_tmem):
+                cute.arch.mbarrier_init(staging_mbar_ptr, 1)
 
         pipeline.pipeline_init_arrive(cluster_shape_mn=cta_layout_vmnk, is_relaxed=True)
 
@@ -818,7 +903,8 @@ class FlashAttentionMLAForward1CtaSm100:
             store.get_tensor(layout.outer, swizzle=layout.inner)
             if const_expr(store._size > 0) else None
             for store, layout in [
-                (storage.sQ,  sQ_layout_staged),
+                # q_in_tmem: Q's staging buffer is the first (64, hdim) half of sK
+                (storage.sQ if not self.q_in_tmem else storage.sK, sQ_layout_staged),
                 (storage.sK,  sK_layout_staged),
                 (storage.sK,  sK32_layout_staged),  # 32-row TMA destination view of sK
                 (storage.sQv, sQv_layout_staged),
@@ -828,6 +914,12 @@ class FlashAttentionMLAForward1CtaSm100:
             ]
         )
         # fmt: on
+        # q_in_tmem: flat 2-D view of the Q staging tile (cp source), same bytes as sQ
+        sQst = (
+            storage.sK.get_tensor(sQst_layout.outer, swizzle=sQst_layout.inner)
+            if const_expr(self.q_in_tmem)
+            else None
+        )
         sRowMax = storage.sRowMax.get_tensor(sStats_layout)
         sRowSum = storage.sRowSum.get_tensor(sStats_layout)
         sScale = storage.sScale.get_tensor(sScale_layout)
@@ -923,6 +1015,7 @@ class FlashAttentionMLAForward1CtaSm100:
                 mQv,
                 mV,
                 sQ,
+                sK,
                 sK32,
                 sQv,
                 sV,
@@ -935,7 +1028,9 @@ class FlashAttentionMLAForward1CtaSm100:
                 pipeline_Qv,
                 pipeline_V,
                 sO_empty_mbar_ptr,
+                staging_mbar_ptr,
                 tiled_mma_QK,
+                tiled_mma_Qst,
                 tiled_mma_QK32,
                 tiled_mma_QvV,
                 gmem_tiled_copy_Q,
@@ -954,11 +1049,14 @@ class FlashAttentionMLAForward1CtaSm100:
             tmem_ptr = tmem.retrieve_ptr(self.dtype_acc)
             self.mma(
                 sQ,
+                sQst,
                 sK,
                 sQv,
                 sV,
                 sVt,
                 sP,
+                tmem_ptr,
+                staging_mbar_ptr,
                 tiled_mma_QK,
                 tiled_mma_QvV,
                 tiled_mma_PVt,
@@ -1057,6 +1155,7 @@ class FlashAttentionMLAForward1CtaSm100:
         mQv: cute.Tensor,
         mV: cute.Tensor,
         sQ: Optional[cute.Tensor],
+        sK: Optional[cute.Tensor],
         sK32: Optional[cute.Tensor],
         sQv: cute.Tensor,
         sV: cute.Tensor,
@@ -1069,7 +1168,9 @@ class FlashAttentionMLAForward1CtaSm100:
         pipeline_Qv: pipeline.PipelineAsync,
         pipeline_V: pipeline.PipelineAsync,
         sO_empty_mbar_ptr: cute.Pointer,
+        staging_mbar_ptr: cute.Pointer,
         tiled_mma_QK: cute.TiledMma,
+        tiled_mma_Qst: cute.TiledMma,
         tiled_mma_QK32: cute.TiledMma,
         tiled_mma_QvV: cute.TiledMma,
         gmem_tiled_copy_Q: Optional[cute.TiledCopy],
@@ -1084,6 +1185,7 @@ class FlashAttentionMLAForward1CtaSm100:
         # consumes: -
 
         thr_mma_QK = tiled_mma_QK.get_slice(0)
+        thr_mma_Qst = tiled_mma_Qst.get_slice(0)
         thr_mma_QK32 = tiled_mma_QK32.get_slice(0)
         thr_mma_QvV = tiled_mma_QvV.get_slice(0)
 
@@ -1094,6 +1196,7 @@ class FlashAttentionMLAForward1CtaSm100:
         producer_state_Qv = pipeline.make_pipeline_state(Producer, stages=self.num_stages_Qv)
         producer_state_V = pipeline.make_pipeline_state(Producer, stages=self.num_stages_V)
         producer_phase_O = Int32(1)
+        staging_phase = Int32(0)
 
         tidx = cute.arch.thread_idx()[0] % self.num_load_threads
 
@@ -1116,7 +1219,7 @@ class FlashAttentionMLAForward1CtaSm100:
                     gQ = cute.local_tile(
                         mQ_cur, (self.mma_tiler_QK[0], self.mma_tiler_QK[2]), (m_block, 0)
                     )
-                    tSgQ = thr_mma_QK.partition_A(gQ)
+                    tSgQ = thr_mma_Qst.partition_A(gQ)
                     tQsQ, tQgQ = cpasync.tma_partition(
                         atom=tma_atom_Q,
                         cta_coord=0,
@@ -1124,18 +1227,32 @@ class FlashAttentionMLAForward1CtaSm100:
                         smem_tensor=cute.group_modes(sQ, 0, 3),
                         gmem_tensor=cute.group_modes(tSgQ, 0, 3),
                     )
-                # K: 32-row tiles; token = n_block*128 + p*32 + r + 64*h
-                # -> 32-row block index = 4*n_block + 2*h + p
                 mK_cur = mK[None, None, head_idx_kv, batch_idx]
-                gK32 = cute.local_tile(mK_cur, (32, self.mma_tiler_QK32[2]), (None, 0))
-                tSgK = thr_mma_QK32.partition_B(gK32)
-                tKsK, tKgK = cpasync.tma_partition(
-                    atom=tma_atom_K,
-                    cta_coord=0,
-                    cta_layout=cute.make_layout(1),
-                    smem_tensor=cute.group_modes(sK32, 0, 3),
-                    gmem_tensor=cute.group_modes(tSgK, 0, 3),
-                )
+                if const_expr(self.q_in_tmem):
+                    # unified sK: one plain (tile_n, hdim) box per n_block
+                    gK = cute.local_tile(
+                        mK_cur, (self.mma_tiler_QK[1], self.mma_tiler_QK[2]), (None, 0)
+                    )
+                    tSgK = thr_mma_QK.partition_B(gK)
+                    tKsK, tKgK = cpasync.tma_partition(
+                        atom=tma_atom_K,
+                        cta_coord=0,
+                        cta_layout=cute.make_layout(1),
+                        smem_tensor=cute.group_modes(sK, 0, 3),
+                        gmem_tensor=cute.group_modes(tSgK, 0, 3),
+                    )
+                else:
+                    # K: 32-row tiles; token = n_block*128 + p*32 + r + 64*h
+                    # -> 32-row block index = 4*n_block + 2*h + p
+                    gK32 = cute.local_tile(mK_cur, (32, self.mma_tiler_QK32[2]), (None, 0))
+                    tSgK = thr_mma_QK32.partition_B(gK32)
+                    tKsK, tKgK = cpasync.tma_partition(
+                        atom=tma_atom_K,
+                        cta_coord=0,
+                        cta_layout=cute.make_layout(1),
+                        smem_tensor=cute.group_modes(sK32, 0, 3),
+                        gmem_tensor=cute.group_modes(tSgK, 0, 3),
+                    )
 
             mQv_cur = mQv[None, None, head_idx, batch_idx]
             if const_expr(self.use_tma_QQv):
@@ -1223,18 +1340,32 @@ class FlashAttentionMLAForward1CtaSm100:
             # contribution, so the result (O = 0, LSE = -inf) is still correct.
             num_n_blocks_load = cutlass.max(num_n_blocks, 1)
             n_block_first = n_block_max - 1 if num_n_blocks > 0 else 0
-            for i in cutlass.range(num_n_blocks_load, unroll=1):
-                n_block = n_block_first - i
-                producer_state_V = load_V(producer_state_V, block=n_block, split=0)
-                if const_expr(self.has_qk):
-                    producer_state_K = self.load_K_phase(
-                        tma_atom_K, tKgK, tKsK, pipeline_K, producer_state_K, n_block, 0
-                    )
-                producer_state_V = load_V(producer_state_V, block=n_block, split=1)
-                if const_expr(self.has_qk):
-                    producer_state_K = self.load_K_phase(
-                        tma_atom_K, tKgK, tKsK, pipeline_K, producer_state_K, n_block, 1
-                    )
+            if const_expr(self.q_in_tmem):
+                # The Q staging tile aliases the first half of the sK slot: wait until
+                # the mma warp's cp's have drained it before overwriting it with K.
+                cute.arch.mbarrier_wait(staging_mbar_ptr, phase=staging_phase)
+                staging_phase ^= 1
+                # Unified sK: K first (it gates the first mma of the step and is 8x
+                # smaller than a V split), then the two V dv splits.
+                load_K = partial(self.load_inner, tma_atom_K, tKgK, tKsK, pipeline_K)
+                for i in cutlass.range(num_n_blocks_load, unroll=1):
+                    n_block = n_block_first - i
+                    producer_state_K = load_K(producer_state_K, block=n_block)
+                    producer_state_V = load_V(producer_state_V, block=n_block, split=0)
+                    producer_state_V = load_V(producer_state_V, block=n_block, split=1)
+            else:
+                for i in cutlass.range(num_n_blocks_load, unroll=1):
+                    n_block = n_block_first - i
+                    producer_state_V = load_V(producer_state_V, block=n_block, split=0)
+                    if const_expr(self.has_qk):
+                        producer_state_K = self.load_K_phase(
+                            tma_atom_K, tKgK, tKsK, pipeline_K, producer_state_K, n_block, 0
+                        )
+                    producer_state_V = load_V(producer_state_V, block=n_block, split=1)
+                    if const_expr(self.has_qk):
+                        producer_state_K = self.load_K_phase(
+                            tma_atom_K, tKgK, tKsK, pipeline_K, producer_state_K, n_block, 1
+                        )
 
             # Advance to next tile
             work_tile = tile_scheduler.advance_to_next_work()
@@ -1337,11 +1468,14 @@ class FlashAttentionMLAForward1CtaSm100:
     def mma(
         self,
         sQ: Optional[cute.Tensor],
+        sQst: Optional[cute.Tensor],
         sK: Optional[cute.Tensor],
         sQv: cute.Tensor,
         sV: cute.Tensor,
         sVt: cute.Tensor,
         sP: cute.Tensor,
+        tmem_ptr: cute.Pointer,
+        staging_mbar_ptr: cute.Pointer,
         tiled_mma_QK: cute.TiledMma,
         tiled_mma_QvV: cute.TiledMma,
         tiled_mma_PVt: cute.TiledMma,
@@ -1367,7 +1501,17 @@ class FlashAttentionMLAForward1CtaSm100:
 
         # Operands
         if const_expr(self.has_qk):
-            tSrQ = tiled_mma_QK.make_fragment_A(sQ)
+            if const_expr(self.q_in_tmem):
+                # TS A operand: gemm_ptx_partial only reads the element type and the
+                # k-group offsets off this tensor (recast to 32-bit TMEM column units);
+                # the base address is passed separately as tA_addr. Stride 16 bf16
+                # elements per K=16 group => 8 columns, the validated ws A stepping.
+                tSrQ = cute.make_tensor(
+                    cute.recast_ptr(tmem_ptr + self.tmem_offset_Q, dtype=self.dtype_Q),
+                    cute.make_layout((1, 1, self.hdim // 16), stride=(0, 0, 16)),
+                )
+            else:
+                tSrQ = tiled_mma_QK.make_fragment_A(sQ)
             tSrK = tiled_mma_QK.make_fragment_B(sK)
         tSrQv = tiled_mma_QvV.make_fragment_A(sQv)
         tSrV = tiled_mma_QvV.make_fragment_B(sV)
@@ -1387,14 +1531,25 @@ class FlashAttentionMLAForward1CtaSm100:
             for stage in range(self.num_stages_S)
         ]
         if const_expr(self.has_qk):
+            # q_in_tmem: ONE N=128 TS mma per stage, covering the full Layout E S
+            # region -- so QK owns the zero-init and QvV accumulates on top (unless the
+            # _qk_issue_last experiment reorders it after QvV, which then zero-inits).
+            qk_extra = (
+                {
+                    "zero_init": not self._qk_issue_last,
+                    "tA_addr": Int32(tmem_ptr.toint() + self.tmem_offset_Q),
+                }
+                if const_expr(self.q_in_tmem)
+                else {"zero_init": False}
+            )
             gemm_QK = [
                 [
                     partial(
                         fa_sm100_utils.gemm_ws_ptx_partial,
                         tiled_mma_QK.op,
-                        self.tmem_offset_S[stage] + 32 * phase,
-                        zero_init=False,
+                        self.tmem_offset_S[stage] + self.qk_phase_n // 2 * phase,
                         cta_group=1,
+                        **qk_extra,
                     )
                     for phase in range(self.num_qk_phases)
                 ]
@@ -1466,6 +1621,22 @@ class FlashAttentionMLAForward1CtaSm100:
 
             if const_expr(self.has_qk):
                 pipeline_Q.consumer_wait(consumer_state_Q)
+            if const_expr(self.q_in_tmem):
+                # Stage Q into TMEM, duplicated across lane halves (the ws M=64 A-operand
+                # layout). No wait is needed between these cp's and the QK mma below:
+                # tcgen05.cp -> tcgen05.mma from the same thread is a PTX-ordered pair.
+                #
+                # The reverse (mma -> cp) is NOT ordered, but the previous tile's QK
+                # mmas are already known to have retired here: this tile's Q TMA had to
+                # wait on pipeline_Q's empty barrier, which the mma warp signals at the
+                # end of a tile with a tcgen05.commit-backed release.
+                fa_sm100_utils.cp_smem_to_tmem_dup_64(
+                    sQst, Int32(tmem_ptr.toint() + self.tmem_offset_Q)
+                )
+                # Tell the load warp the staging tile (aliased with sK) is free. The
+                # commit completes when the cp's do.
+                with cute.arch.elect_one():
+                    tcgen05.commit(staging_mbar_ptr, None, self.cta_group)
 
             consumer_wait_state_Qv = consumer_state_Qv.clone()
             for _ in cutlass.range_constexpr(self.num_hdimv_splits):
@@ -1530,6 +1701,10 @@ class FlashAttentionMLAForward1CtaSm100:
                             )
 
             if const_expr(self.has_qk):
+                # Released at the END of the tile on purpose when q_in_tmem: the release
+                # is a tcgen05.commit, so it fires only once every mma of this tile has
+                # retired -- which is what keeps the next tile's cp's from overwriting
+                # the Q TMEM region this tile's QK mmas are still reading.
                 pipeline_Q.consumer_release(consumer_state_Q)
                 consumer_state_Q.advance()
 
@@ -1568,13 +1743,35 @@ class FlashAttentionMLAForward1CtaSm100:
     ):
         """S(stage) = Q @ K^T + Qv @ V^T for the current n_block.
 
-        Order: QvV(dv0)[zero_init] -> QK phase0 -> QvV(dv1) -> QK phase1.
-        QvV(dv0) zero-inits the whole N=128 Layout E S region in one instruction
-        (the N=64 QK phase accumulators each cover only half of it); the K-phase1
-        TMA load hides under the long QvV(dv1) mma. V slots are only waited on
-        here -- they are released by the P @ V gemm (mma_PVt_step).
+        Order with q_in_tmem: QK[zero_init] -> QvV(dv0) -> QvV(dv1), one N=128 TS mma
+        for QK against the unified sK slot.
+
+        Otherwise: QvV(dv0)[zero_init] -> QK phase0 -> QvV(dv1) -> QK phase1, where
+        QvV(dv0) zero-inits the whole N=128 Layout E S region in one instruction (the
+        N=64 QK phase accumulators each cover only half of it) and the K-phase1 TMA
+        load hides under the long QvV(dv1) mma.
+
+        Either way V slots are only waited on here -- they are released by the P @ V
+        gemm (mma_PVt_step).
         """
         pipeline_S.producer_acquire(producer_state_S)
+
+        def qk_ts_step():
+            # Single N=128 TS mma. Issued FIRST in production: K (16 KB) lands well
+            # before the two 64 KB V splits, so S accumulation starts during the V TMA
+            # tail, and it owns the zero-init of the full S region.
+            pipeline_K.consumer_wait(consumer_state_K)
+            gemm_QK[stage][0](
+                tCrA=tSrQ,
+                tCrB=tSrK[None, None, None, consumer_state_K.index],
+                sA=None,
+                sB=sK[None, None, None, consumer_state_K.index],
+            )
+            pipeline_K.consumer_release(consumer_state_K)
+            consumer_state_K.advance()
+
+        if const_expr(self.q_in_tmem and not self._qk_issue_last):
+            qk_ts_step()
         for split in cutlass.range_constexpr(self.num_hdimv_splits):
             v_stage = consumer_state_V_wait.index
             pipeline_V.consumer_wait(consumer_state_V_wait)
@@ -1583,10 +1780,10 @@ class FlashAttentionMLAForward1CtaSm100:
                 tCrB=tSrV[None, None, None, v_stage],
                 sA=sQv[None, None, None, split],
                 sB=sV[None, None, None, v_stage],
-                zero_init=split == 0,
+                zero_init=split == 0 and (not self.q_in_tmem or self._qk_issue_last),
             )
             consumer_state_V_wait.advance()
-            if const_expr(self.has_qk):
+            if const_expr(self.has_qk and not self.q_in_tmem):
                 pipeline_K.consumer_wait(consumer_state_K)
                 gemm_QK[stage][split](
                     tCrA=tSrQ[None, None, None, 0],
@@ -1596,6 +1793,8 @@ class FlashAttentionMLAForward1CtaSm100:
                 )
                 pipeline_K.consumer_release(consumer_state_K)
                 consumer_state_K.advance()
+        if const_expr(self._qk_issue_last):
+            qk_ts_step()
         pipeline_S.producer_commit(producer_state_S)
         producer_state_S.advance()
         return producer_state_S, consumer_state_V_wait, consumer_state_K
