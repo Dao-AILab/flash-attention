@@ -895,15 +895,12 @@ def _flash_attn_fwd(
                 has_qk = q is not None
                 if mla_1cta:
                     # 1CTA (tcgen05.mma.ws) MLA kernel, opt-in via FLASH_ATTENTION_MLA_1CTA=1.
-                    # v1 scope: dense, fixed-length batch, TMA-only KV. pack_gqa is
-                    # supported for any ratio (including ones not dividing the 64-row tile).
+                    # Supports varlen (cu_seqlens / seqused, Q and K sides independently)
+                    # and pack_gqa at any ratio (including ratios that do not divide the
+                    # 64-row tile). Still TMA-only KV: no sparse/topk gather, no paged KV.
                     for feat, name in [
                         (sparse_kv, "sparse_kv / gather_kv_indices"),
                         (page_table is not None, "paged KV"),
-                        (cu_seqlens_q is not None, "cu_seqlens_q"),
-                        (cu_seqlens_k is not None, "cu_seqlens_k"),
-                        (seqused_q is not None, "seqused_q"),
-                        (seqused_k is not None, "seqused_k"),
                         (p is not None, "P emission"),
                         (row_max is not None, "row_max emission"),
                         (local, "local attention"),
@@ -921,6 +918,8 @@ def _flash_attn_fwd(
                         has_qk=has_qk,
                         pack_gqa=pack_gqa,
                         q_in_tmem=mla_1cta_q_tmem,
+                        has_seqused_q=seqused_q is not None,
+                        has_cu_seqlens_q=cu_seqlens_q is not None,
                     )
                 else:
                     fa_fwd = FlashAttentionMLAForwardSm100(

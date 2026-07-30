@@ -2394,8 +2394,12 @@ def test_flash_attn_mla_absorbed(
 @pytest.mark.parametrize("causal", [False, True])
 # @pytest.mark.parametrize("causal", [False])
 @pytest.mark.parametrize("add_unused_qkv", [False])
-# @pytest.mark.parametrize("kv_sparsity", [False, True])
-@pytest.mark.parametrize("kv_sparsity", [True])
+# The 1CTA MLA kernel supports varlen but not the topk/sparse gather, so give it the
+# kv_sparsity=False cases (which the 2CTA matrix leaves commented out by default).
+@pytest.mark.parametrize(
+    "kv_sparsity",
+    [False, True] if os.environ.get("FLASH_ATTENTION_MLA_1CTA", "0") == "1" else [True],
+)
 @pytest.mark.parametrize("hdim", [64])
 @pytest.mark.parametrize("shared_kv", [False, True])
 @pytest.mark.parametrize(
@@ -2462,8 +2466,8 @@ def test_flash_attn_mla_absorbed_varlen(
     hdimv = 512
     if not IS_SM100:
         pytest.skip()
-    if os.environ.get("FLASH_ATTENTION_MLA_1CTA", "0") == "1":
-        pytest.skip("1CTA MLA kernel does not support varlen (v1)")
+    if os.environ.get("FLASH_ATTENTION_MLA_1CTA", "0") == "1" and kv_sparsity:
+        pytest.skip("1CTA MLA kernel does not support the topk/sparse KV gather")
     local = local_enum > 0
     if local and causal:
         pytest.skip()
