@@ -24,8 +24,12 @@
 #    unified (128, hdim) sK slot filled by a single TMA box per n_block. Faster on
 #    every measured shape; see agent_space/NOTES_mla_1cta.md for the ablation and
 #    for the two syncs that path depends on.
-#  - Dense only: no topk/DSA gather, no bitmask, no P/rowmax emission, no paged
-#    KV, no varlen (v1 scope). pack_gqa is supported (any ratio up to 128).
+#  - Varlen: cu_seqlens / seqused on either side (independently). Q-side varlen uses
+#    SingleTileVarlenScheduler; under cu_seqlens_q the O store falls back to the
+#    per-row predicated path (a bulk TMA box would race on rows belonging to the next
+#    sequence). See agent_space/NOTES_mla_1cta.md.
+#  - Not supported: topk/DSA gather, bitmask, P/rowmax emission, paged KV, local.
+#    pack_gqa is supported (any ratio up to 128).
 #
 # SMEM (226 KB): sQv 64K + sV 128K (one n_block) + sP 16K + stats, plus either
 #   sQ 8K + sK 8K, or (q_in_tmem) a unified sK 16K whose first half doubles as the
@@ -62,6 +66,7 @@ from flash_attn.cute.tile_scheduler import (
     TileSchedulerProtocol,
     SingleTileScheduler,
     SingleTileLPTScheduler,
+    SingleTileVarlenScheduler,
     ParamsBase,
 )
 from flash_attn.cute.named_barrier import NamedBarrierFwdSm100_MLA2CTA
@@ -84,6 +89,8 @@ class FlashAttentionMLAForward1CtaSm100:
         has_qk: bool = True,
         pack_gqa: bool = False,
         q_in_tmem: bool = False,
+        has_seqused_q: bool = False,
+        has_cu_seqlens_q: bool = False,
         _qk_issue_last: bool = False,
     ):
         self.is_causal = is_causal
@@ -116,7 +123,22 @@ class FlashAttentionMLAForward1CtaSm100:
         # NB: 64 here is cta_tile_m, which is assigned further down in __init__.
         self.pack_gqa_tma = self.pack_gqa and 64 % qhead_per_kvhead == 0
         self.use_tma_QQv = not self.pack_gqa or self.pack_gqa_tma
-        self.use_tma_O = not self.pack_gqa or self.pack_gqa_tma
+        # O: a bulk TMA store writes whole 64-row boxes, which is unsafe under
+        # cu_seqlens_q -- rows past this batch's seqlen_q belong to the NEXT sequence
+        # and are written by another tile (write-write race), and the 64-row tile
+        # straddles whenever (ratio *) seqlen_q % 64 != 0, i.e. routinely. Fall back to
+        # the per-row predicated rmem->gmem store (the same path pack_gqa gather uses).
+        # seqused_q keeps TMA: its layout is dense, so the rows past seqlen_q are that
+        # batch's own padding and harmless to overwrite.
+        self.use_tma_O = (not self.pack_gqa or self.pack_gqa_tma) and not has_cu_seqlens_q
+
+        # ==== varlen info ====
+        # Q-side varlen changes the number of m-blocks per batch, so it needs the
+        # varlen scheduler. K-side varlen only changes seqlen_k / the K,V base offsets
+        # (both handled per-tile), so it keeps the dense schedulers.
+        self.has_seqused_q = has_seqused_q
+        self.has_cu_seqlens_q = has_cu_seqlens_q
+        self.is_varlen_q = has_seqused_q or has_cu_seqlens_q
 
         # ==== tile scheduler ====
         self.is_persistent = False
@@ -125,9 +147,12 @@ class FlashAttentionMLAForward1CtaSm100:
         self.scheduling_mode = (
             SchedulingMode.CLC if self.use_clc_scheduler else SchedulingMode.STATIC
         )
-        self.TileScheduler = (
-            SingleTileLPTScheduler if self.use_clc_scheduler else SingleTileScheduler
-        )
+        if self.is_varlen_q:
+            self.TileScheduler = SingleTileVarlenScheduler
+        elif self.use_clc_scheduler:
+            self.TileScheduler = SingleTileLPTScheduler
+        else:
+            self.TileScheduler = SingleTileScheduler
 
         # ==== thread info ====
         self.num_softmax_threads = 128
@@ -387,21 +412,21 @@ class FlashAttentionMLAForward1CtaSm100:
     @cute.jit
     def __call__(
         self,
-        mQ: Optional[cute.Tensor],    # (b, s_q, h, d)
-        mQv: cute.Tensor,             # (b, s_q, h, dv)
-        mK: Optional[cute.Tensor],    # (b, s_k, h_k, d)
-        mV: cute.Tensor,              # (b, s_k, h_k, dv)
-        mO: cute.Tensor,              # (b, s_q, h, dv)
-        mLSE: Optional[cute.Tensor],  # (b, s_q, h)
+        mQ: Optional[cute.Tensor],    # (b, s_q, h, d)   or (total_q, h, d)  if cu_seqlens_q
+        mQv: cute.Tensor,             # (b, s_q, h, dv)  or (total_q, h, dv) if cu_seqlens_q
+        mK: Optional[cute.Tensor],    # (b, s_k, h_k, d) or (total_k, h_k, d)  if cu_seqlens_k
+        mV: cute.Tensor,              # (b, s_k, h_k, dv) or (total_k, h_k, dv) if cu_seqlens_k
+        mO: cute.Tensor,              # (b, s_q, h, dv)  or (total_q, h, dv) if cu_seqlens_q
+        mLSE: Optional[cute.Tensor],  # (b, s_q, h)      or (total_q, h)     if cu_seqlens_q
         softmax_scale: Float32,
         # The following are accepted for interface compatibility with the 2CTA MLA
-        # kernel but are not supported by the 1CTA v1 (asserted None).
+        # kernel; the ones the 1CTA kernel does not support are asserted None.
         mP: Optional[cute.Tensor] = None,
         mRowMax: Optional[cute.Tensor] = None,
-        mCuSeqlensQ: Optional[cute.Tensor] = None,
-        mCuSeqlensK: Optional[cute.Tensor] = None,
-        mSeqUsedQ: Optional[cute.Tensor] = None,
-        mSeqUsedK: Optional[cute.Tensor] = None,
+        mCuSeqlensQ: Optional[cute.Tensor] = None,  # (b + 1)
+        mCuSeqlensK: Optional[cute.Tensor] = None,  # (b + 1)
+        mSeqUsedQ: Optional[cute.Tensor] = None,    # (b)
+        mSeqUsedK: Optional[cute.Tensor] = None,    # (b)
         mIndexTopk: Optional[cute.Tensor] = None,
         mPageTable: Optional[cute.Tensor] = None,
         window_size_left: Int32 | int | None = None,
@@ -411,13 +436,19 @@ class FlashAttentionMLAForward1CtaSm100:
     ):
         # fmt: on
         for name, t in [
-            ("mP", mP), ("mRowMax", mRowMax), ("mCuSeqlensQ", mCuSeqlensQ),
-            ("mCuSeqlensK", mCuSeqlensK), ("mSeqUsedQ", mSeqUsedQ),
-            ("mSeqUsedK", mSeqUsedK), ("mIndexTopk", mIndexTopk),
+            ("mP", mP), ("mRowMax", mRowMax), ("mIndexTopk", mIndexTopk),
             ("mPageTable", mPageTable), ("window_size_left", window_size_left),
             ("window_size_right", window_size_right),
         ]:
             assert t is None, f"{name} is not supported by the 1CTA MLA kernel (v1)"
+        # Q-side varlen is a compile-time ctor flag (it selects the scheduler); K-side
+        # is inferred from the tensors here, as in the 2CTA kernel.
+        assert (mCuSeqlensQ is not None) == self.has_cu_seqlens_q, (
+            "mCuSeqlensQ presence must match the has_cu_seqlens_q ctor flag"
+        )
+        assert (mSeqUsedQ is not None) == self.has_seqused_q, (
+            "mSeqUsedQ presence must match the has_seqused_q ctor flag"
+        )
         if const_expr(self.has_qk):
             assert mQ is not None and mK is not None, "has_qk requires mQ and mK"
         else:
@@ -443,9 +474,10 @@ class FlashAttentionMLAForward1CtaSm100:
             for mX in (mQ, mQv, mK, mV, mO)
         ]
 
-        # (b, s, h, d) -> (s, d, h, b)
-        QO_layout_transpose = [1, 3, 2, 0]
-        KV_layout_transpose = [1, 3, 2, 0]
+        # (b, s, h, d) -> (s, d, h, b), or packed (total, h, d) -> (total, d, h)
+        # (Q and K sides are independent; seqused_* keeps the dense 4-D layout.)
+        QO_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
+        KV_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensK is None) else [0, 2, 1]
         mQ, mQv, mO = [
             cute.make_tensor(mX.iterator, cute.select(mX.layout, mode=QO_layout_transpose))
             if mX is not None
@@ -458,9 +490,10 @@ class FlashAttentionMLAForward1CtaSm100:
             else None
             for mX in (mK, mV)
         ]
-        # (b, s_q, h) -> (s_q, h, b)
+        # (b, s_q, h) -> (s_q, h, b), or packed (total_q, h) unchanged
+        LSE_layout_transpose = [1, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 1]
         mLSE = (
-            cute.make_tensor(mLSE.iterator, cute.select(mLSE.layout, mode=[1, 2, 0]))
+            cute.make_tensor(mLSE.iterator, cute.select(mLSE.layout, mode=LSE_layout_transpose))
             if mLSE is not None
             else None
         )
@@ -656,7 +689,8 @@ class FlashAttentionMLAForward1CtaSm100:
                 tma_store_op, mO, cute.select(sO_layout, mode=[0, 1]), self.epi_tile
             )
         else:
-            # packed rows are not contiguous in gmem: store rmem -> gmem per row
+            # packed rows are not contiguous in gmem, and varlen-q rows past seqlen_q
+            # must not be written at all: store rmem -> gmem per row instead.
             tma_atom_O, tma_tensor_O = None, mO
 
         # ==== Set up Oi tmem -> rmem -> smem copy ====
@@ -683,18 +717,32 @@ class FlashAttentionMLAForward1CtaSm100:
 
         # ==== Tile scheduler ====
         TileScheduler = self.TileScheduler
+        # Under cu_seqlens_q, mQv is packed (total_q, dv, h) -- no batch mode -- and the
+        # varlen scheduler derives per-batch m-block counts from cu_seqlens/seqused
+        # (scaling by qhead_per_kvhead_packgqa), so num_block is unused there.
+        # NB cute.size(mQv.shape[0]) counts PACKED rows under pack_gqa (mode 0 is the
+        # (ratio, s) tuple), which is what the varlen scheduler's grid bound expects --
+        # it scales per-batch seqlens by qhead_per_kvhead_packgqa the same way.
+        num_batch_sched = (
+            cute.size(mCuSeqlensQ.shape[0] - 1)
+            if const_expr(mCuSeqlensQ is not None)
+            else cute.size(mQv.shape[3])
+        )
+        total_q_sched = cute.size(mQv.shape[0]) * (
+            1 if const_expr(mCuSeqlensQ is not None) else cute.size(mQv.shape[3])
+        )
         tile_sched_args = TileSchedulerArguments(
             num_block=cute.ceil_div(cute.size(mQv.shape[0]), self.cta_tile_m),
             num_head=cute.size(mQv.shape[2]),
-            num_batch=cute.size(mQv.shape[3]),
+            num_batch=num_batch_sched,
             num_splits=1,
             seqlen_k=cute.size(mV.shape[0]),
             headdim=self.hdim,
             headdim_v=self.hdimv,
-            total_q=cute.size(mQv.shape[0]) * cute.size(mQv.shape[3]),
+            total_q=total_q_sched,
             tile_shape_mn=(self.cta_tile_m, self.tile_n),
-            mCuSeqlensQ=None,
-            mSeqUsedQ=None,
+            mCuSeqlensQ=mCuSeqlensQ,
+            mSeqUsedQ=mSeqUsedQ,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
             element_size=self.dtype_V.width // 8,
             is_persistent=self.is_persistent,
@@ -739,6 +787,10 @@ class FlashAttentionMLAForward1CtaSm100:
             tma_tensor_V,
             tma_tensor_O,
             mLSE,
+            mCuSeqlensQ,
+            mCuSeqlensK,
+            mSeqUsedQ,
+            mSeqUsedK,
             tma_atom_Q,
             tma_atom_Qv,
             tma_atom_K,
@@ -783,6 +835,10 @@ class FlashAttentionMLAForward1CtaSm100:
         mV: cute.Tensor,
         mO: cute.Tensor,
         mLSE: Optional[cute.Tensor],
+        mCuSeqlensQ: Optional[cute.Tensor],
+        mCuSeqlensK: Optional[cute.Tensor],
+        mSeqUsedQ: Optional[cute.Tensor],
+        mSeqUsedK: Optional[cute.Tensor],
         tma_atom_Q: Optional[cute.CopyAtom],
         tma_atom_Qv: cute.CopyAtom,
         tma_atom_K: Optional[cute.CopyAtom],
@@ -944,10 +1000,10 @@ class FlashAttentionMLAForward1CtaSm100:
             seqlen_k_static=mV.shape[0],
             tile_m=self.cta_tile_m,
             tile_n=self.tile_n,
-            mCuSeqlensQ=None,
-            mCuSeqlensK=None,
-            mSeqUsedQ=None,
-            mSeqUsedK=None,
+            mCuSeqlensQ=mCuSeqlensQ,
+            mCuSeqlensK=mCuSeqlensK,
+            mSeqUsedQ=mSeqUsedQ,
+            mSeqUsedK=mSeqUsedK,
         )
 
         if const_expr(self.use_clc_scheduler):
@@ -1214,7 +1270,7 @@ class FlashAttentionMLAForward1CtaSm100:
 
             # ==== Partition GMEM tensors ====
             if const_expr(self.has_qk):
-                mQ_cur = mQ[None, None, head_idx, batch_idx]
+                mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, head_idx]
                 if const_expr(self.use_tma_QQv):
                     gQ = cute.local_tile(
                         mQ_cur, (self.mma_tiler_QK[0], self.mma_tiler_QK[2]), (m_block, 0)
@@ -1227,7 +1283,7 @@ class FlashAttentionMLAForward1CtaSm100:
                         smem_tensor=cute.group_modes(sQ, 0, 3),
                         gmem_tensor=cute.group_modes(tSgQ, 0, 3),
                     )
-                mK_cur = mK[None, None, head_idx_kv, batch_idx]
+                mK_cur = seqlen.offset_batch_K(mK, batch_idx, dim=3)[None, None, head_idx_kv]
                 if const_expr(self.q_in_tmem):
                     # unified sK: one plain (tile_n, hdim) box per n_block
                     gK = cute.local_tile(
@@ -1254,7 +1310,7 @@ class FlashAttentionMLAForward1CtaSm100:
                         gmem_tensor=cute.group_modes(tSgK, 0, 3),
                     )
 
-            mQv_cur = mQv[None, None, head_idx, batch_idx]
+            mQv_cur = seqlen.offset_batch_Q(mQv, batch_idx, dim=3)[None, None, head_idx]
             if const_expr(self.use_tma_QQv):
                 gQv = cute.local_tile(
                     mQv_cur, (self.mma_tiler_QvV[0], self.mma_tiler_QvV[2]), (m_block, None)
@@ -1268,7 +1324,7 @@ class FlashAttentionMLAForward1CtaSm100:
                     gmem_tensor=cute.group_modes(tSgQv, 0, 3),
                 )
 
-            mV_cur = mV[None, None, head_idx_kv, batch_idx]
+            mV_cur = seqlen.offset_batch_K(mV, batch_idx, dim=3)[None, None, head_idx_kv]
             # (tile_n, hdimv//2, num_n_blocks, num_d_blocks=2)
             gV = cute.local_tile(
                 mV_cur, (self.mma_tiler_QvV[1], self.mma_tiler_QvV[2]), (None, None)
@@ -2284,7 +2340,7 @@ class FlashAttentionMLAForward1CtaSm100:
                     consumer_states_O[split] = consumer_state_Oi
 
             # (seqlen_q, hdimv), or ((qhead_per_kvhead, seqlen_q), hdimv) when packed
-            mO_cur = mO[None, None, head_idx, batch_idx]
+            mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3)[None, None, head_idx]
             gO = None
             if const_expr(self.use_tma_O):
                 # (cta_tile_m, hdimv//2, 2)
@@ -2334,7 +2390,18 @@ class FlashAttentionMLAForward1CtaSm100:
 
             # compute and store lse to gmem
             if const_expr(mLSE is not None):
-                mLSE_cur = mLSE[None, head_idx, batch_idx]
+                # LSE is offset by hand (not via offset_batch_Q): its seqlen mode is 0
+                # but the tensor is rank-2/3 with no separate d mode, and under pack_gqa
+                # the offset must land on the q_pos sub-mode of the packed tuple.
+                if const_expr(not seqlen.has_cu_seqlens_q):
+                    mLSE_cur = mLSE[None, head_idx, batch_idx]
+                else:
+                    lse_offset = (
+                        seqlen.offset_q
+                        if const_expr(not self.pack_gqa)
+                        else (0, seqlen.offset_q)
+                    )
+                    mLSE_cur = cute.domain_offset((lse_offset,), mLSE[None, head_idx])
                 if tidx < self.cta_tile_m:
                     LN2 = math.log(2.0)
                     lse = (
@@ -2405,14 +2472,18 @@ class FlashAttentionMLAForward1CtaSm100:
     @cute.jit
     def store_O_packed(
         self,
-        mO_cur: cute.Tensor,  # ((qhead_per_kvhead, seqlen_q), hdimv)
+        mO_cur: cute.Tensor,  # ((qhead_per_kvhead, seqlen_q), hdimv) or (seqlen_q, hdimv)
         tOrO: cute.Tensor,  # this thread's O values, ((elems), 1, num_chunks)
         tidx: Int32,
         m_block: Int32,
         split: cutlass.Constexpr[int],
         seqlen_q: Int32,
     ):
-        """Store one thread's slice of O to scattered packed rows.
+        """Store one thread's slice of O to gmem, one row per thread.
+
+        Used when a bulk TMA store is not applicable: packed pack_gqa rows (not
+        contiguous in gmem) or varlen-q (rows past seqlen_q belong to the next sequence
+        and must not be written).
 
         Under the Layout E epilogue partitioning each thread owns exactly one row
         (`tidx % cta_tile_m`) and a contiguous `cols_per_thread` run of that row, so a
@@ -2425,16 +2496,17 @@ class FlashAttentionMLAForward1CtaSm100:
 
         row_in_tile = tidx % self.cta_tile_m
         packed_row = m_block * self.cta_tile_m + row_in_tile
-        q_pos = packed_row // self.qhead_per_kvhead
+        q_pos = packed_row // self.qhead_per_kvhead if const_expr(self.pack_gqa) else packed_row
         h_in_group = packed_row - q_pos * self.qhead_per_kvhead
         col_base = split * dv_split + cols_per_thread * (tidx // self.cta_tile_m)
 
         if q_pos < seqlen_q:
             # hdimv is contiguous and 16B-aligned in gmem, and col_base is a multiple of
             # cols_per_thread, so this thread's run is a 16B-aligned contiguous vector.
+            row_crd = (h_in_group, q_pos) if const_expr(self.pack_gqa) else q_pos
             o_ptr = cute.make_ptr(
                 self.dtype_O,
-                fa_utils.elem_pointer(mO_cur, ((h_in_group, q_pos), col_base)).toint(),
+                fa_utils.elem_pointer(mO_cur, (row_crd, col_base)).toint(),
                 cute.AddressSpace.gmem,
                 assumed_align=16,
             )
