@@ -81,16 +81,21 @@ class FlashAttentionMLAForward1CtaSm100:
         self.nheads_kv = nheads_kv
         self.has_qk = has_qk
         # pack_gqa folds qhead_per_kvhead into the row (m) dimension so one K/V tile
-        # serves every q head of a kv group. Any ratio is supported, including ones
-        # that do not divide the 64-row tile ("irregular") and ratios > 64: the packed
-        # row index is m = h_in_group + qhead_per_kvhead * q_pos and rows are gathered
-        # per-row (cp.async for Q/Qv, plain stores for O/LSE) rather than by TMA, which
-        # could only express tiles that are rectangular in (h_in_group, q_pos).
+        # serves every q head of a kv group. Any ratio is supported: the packed row
+        # index is m = h_in_group + qhead_per_kvhead * q_pos.
+        # - Regular ratios (ratio | 64): the packed 64-row tile is a rectangle in
+        #   (h_in_group, q_pos), so Q/Qv/O go through TMA on the packed layout directly
+        #   (same recipe as the 2CTA MLA kernel). The packed gmem tensor
+        #   ((ratio, s), d, h_kv, b) is exactly 5 flat dims -- at the TMA limit.
+        # - Irregular ratios and ratio > 64 (splitting the ratio mode would need a 6th
+        #   TMA dim): rows are gathered per-row instead (cp.async for Q/Qv, plain
+        #   stores for O/LSE).
         self.pack_gqa = pack_gqa and qhead_per_kvhead > 1
         assert qhead_per_kvhead <= 128, "qhead_per_kvhead > 128 is not supported"
-        # TMA needs a rectangular tile; the gathered packed path does not use it.
-        self.use_tma_QQv = not self.pack_gqa
-        self.use_tma_O = not self.pack_gqa
+        # NB: 64 here is cta_tile_m, which is assigned further down in __init__.
+        self.pack_gqa_tma = self.pack_gqa and 64 % qhead_per_kvhead == 0
+        self.use_tma_QQv = not self.pack_gqa or self.pack_gqa_tma
+        self.use_tma_O = not self.pack_gqa or self.pack_gqa_tma
 
         # ==== tile scheduler ====
         self.is_persistent = False
@@ -159,6 +164,7 @@ class FlashAttentionMLAForward1CtaSm100:
         self.hdim = hdim
         self.hdimv = hdimv
         self.cta_tile_m = 64
+        assert not self.pack_gqa_tma or self.cta_tile_m % self.qhead_per_kvhead == 0
         self.tile_n = 128
         self.num_hdimv_splits = 2  # split hdimv in half for our Qv @ V^T and P @ V mmas.
         assert hdimv % (2 * self.num_hdimv_splits) == 0
