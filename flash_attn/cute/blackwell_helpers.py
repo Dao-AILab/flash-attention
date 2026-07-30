@@ -626,6 +626,82 @@ gemm_ws_ptx_partial = partial(gemm_ptx_partial, ws=True)
 
 
 @cute.jit
+def cp_smem_to_tmem_dup_64(
+    sX: cute.Tensor,
+    tmem_addr: Int32,
+    num_rows: int = 64,
+) -> None:
+    """SMEM -> TMEM copy of a (num_rows <= 64, K) 16-bit tile, duplicated across lane halves.
+
+    Emits `tcgen05.cp.cta_group::1.64x128b.warpx2::02_13`, which lands source row m at
+    BOTH TMEM lane m and lane m + 64, packing two 16-bit elements per 32-bit word
+    (element k at word k // 2, low half for even k). That is exactly the A-operand
+    layout an M=64 `tcgen05.mma.ws` reads (PTX "Layout E" data path), so this is the
+    one-instruction way to stage a weight-stationary A operand into TMEM.
+
+    Each instruction moves 128 bits (8 elements) per row, so K // 8 instructions are
+    emitted. `tmem_addr` must be a TMEM address whose lane is 0; the destination
+    occupies K // 2 columns starting there.
+
+    Ordering: `tcgen05.cp -> tcgen05.mma` issued by the same thread is a PTX-guaranteed
+    pipeline pair, so no explicit wait is needed before a dependent mma from this thread.
+    Other consumers (e.g. tcgen05.ld) must synchronize explicitly.
+
+    Must be called by exactly one warp (an elect.sync inside picks the issuing thread).
+    """
+    assert sX.element_type.width == 16, "only 16-bit element types are supported"
+    assert num_rows <= 64, "the .64x128b copy shape covers at most 64 rows"
+    layout = sX.layout.outer if isinstance(sX.layout, cute.ComposedLayout) else sX.layout
+    k_size: int = const_expr(cute.size(layout.shape[1]))
+    assert k_size % 8 == 0, "K must be a multiple of 8 (128 bits per row per copy)"
+    desc_base: int = const_expr(
+        sm100_desc.make_smem_desc_base(
+            cute.recast_layout(128, sX.element_type.width, layout),
+            sX.iterator.type.swizzle_type,
+            sm100_desc.Major.K,
+        )
+    )
+    desc_lo_base, desc_hi = i64_to_i32x2(desc_base)
+    desc_hi = const_expr(desc_hi)
+    desc_lo = Int32(const_expr(desc_lo_base) | sm100_desc.make_smem_desc_start_addr(sX.iterator))
+    # Per chunk of 8 elements along K: TMEM destination advances 4 columns (words), and
+    # the descriptor start address advances by the chunk's byte offset in 16B units.
+    steps = tuple(
+        (4 * c, (cute.crd2idx((0, 8 * c), layout) * sX.element_type.width // 8) >> 4)
+        for c in range(k_size // 8)
+    )
+    body = (
+        "{\n\t"
+        ".reg .pred leader_thread;\n\t"
+        ".reg .b32 tmem_dst;\n\t"
+        ".reg .b32 desc_lo, desc_hi;\n\t"
+        ".reg .b64 desc;\n\t"
+        "elect.sync _|leader_thread, -1;\n\t"
+        f"mov.b32 desc_hi, {hex(desc_hi)};\n\t"
+    )
+    for tmem_off, desc_off in steps:
+        body += (
+            f"add.u32 tmem_dst, $0, {hex(tmem_off)};\n\t"
+            f"add.u32 desc_lo, $1, {hex(desc_off)};\n\t"
+            "mov.b64 desc, {desc_lo, desc_hi};\n\t"
+            "@leader_thread tcgen05.cp.cta_group::1.64x128b.warpx2::02_13 [tmem_dst], desc;\n\t"
+        )
+    body += "}\n"
+    llvm.inline_asm(
+        None,
+        [
+            Int32(cute.arch.make_warp_uniform(tmem_addr)).ir_value(),
+            Int32(cute.arch.make_warp_uniform(desc_lo)).ir_value(),
+        ],
+        body,
+        "r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@cute.jit
 def gemm_ptx_partial1(
     op: cute.nvgpu.tcgen05.mma.MmaOp,
     acc_tmem_addr: cutlass.Constexpr[int],

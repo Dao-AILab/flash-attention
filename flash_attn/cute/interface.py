@@ -1198,9 +1198,14 @@ def _flash_attn_fwd(
     mla_fwd_rescale_threshold = 0.0 if (requires_grad and sparse_kv) else 8.0
     # Opt-in routing to the 1CTA (tcgen05.mma.ws) MLA kernel.
     mla_1cta = qv is not None and os.environ.get("FLASH_ATTENTION_MLA_1CTA", "0") == "1"
+    # Opt-in to the Q-in-TMEM variant of that kernel (unified sK + single TS QK mma).
+    mla_1cta_q_tmem = (
+        mla_1cta and os.environ.get("FLASH_ATTENTION_MLA_1CTA_Q_TMEM", "0") == "1"
+    )
 
     compile_key = (
         mla_1cta,
+        mla_1cta_q_tmem,
         dtype,
         head_dim,
         head_dim_v,
@@ -1422,6 +1427,7 @@ def _flash_attn_fwd(
                         else True,
                         has_qk=has_qk,
                         pack_gqa=pack_gqa,
+                        q_in_tmem=mla_1cta_q_tmem,
                     )
                 else:
                     fa_fwd = FlashAttentionMLAForwardSm100(
