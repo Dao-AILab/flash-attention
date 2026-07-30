@@ -46,6 +46,7 @@ from flash_attn.cute.flash_bwd_sm120 import FlashAttentionBackwardSm120
 from flash_attn.cute.flash_bwd_postprocess import FlashAttentionBackwardPostprocess
 from flash_attn.cute.flash_fwd_combine import FlashAttentionForwardCombine
 from flash_attn.cute.flash_fwd_mla_sm100 import FlashAttentionMLAForwardSm100
+from flash_attn.cute.flash_fwd_mla_1cta_sm100 import FlashAttentionMLAForward1CtaSm100
 from flash_attn.cute.flash_bwd_mla_sm100 import FlashAttentionSparseMLABackwardSm100
 from flash_attn.cute.flash_bwd_mla_dq_dqv_sm100 import dQdQvGemmKernel
 from flash_attn.cute.flash_bwd_mla_dk_sm100 import dKGemmKernel
@@ -729,7 +730,11 @@ def _flash_attn_fwd(
         disable_sparse_kv_bitmask = None
         p = row_max = None
 
+    # Opt-in routing to the 1CTA (tcgen05.mma.ws) MLA kernel.
+    mla_1cta = qv is not None and os.environ.get("FLASH_ATTENTION_MLA_1CTA", "0") == "1"
+
     compile_key = (
+        mla_1cta,
         dtype,
         head_dim,
         head_dim_v,
@@ -883,19 +888,48 @@ def _flash_attn_fwd(
             if qv is not None:
                 paged_kv_cpasync = page_table is not None and page_size != tile_n
                 has_qk = q is not None
-                fa_fwd = FlashAttentionMLAForwardSm100(
-                    is_causal=causal,
-                    use_cpasync_load_KV=sparse_kv or paged_kv_cpasync,
-                    topk_length=gather_kv_length,
-                    is_topk_gather=sparse_kv,
-                    pack_gqa=pack_gqa,
-                    qhead_per_kvhead=qhead_per_kvhead,
-                    nheads_kv=num_head_kv,
-                    has_seqused_q=seqused_q is not None,
-                    has_cu_seqlens_q=cu_seqlens_q is not None,
-                    disable_bitmask=disable_sparse_kv_bitmask,
-                    has_qk=has_qk,
-                )
+                if mla_1cta:
+                    # 1CTA (tcgen05.mma.ws) MLA kernel, opt-in via FLASH_ATTENTION_MLA_1CTA=1.
+                    # v1 scope: dense, fixed-length batch, TMA-only KV. pack_gqa is
+                    # supported for any ratio (including ones not dividing the 64-row tile).
+                    for feat, name in [
+                        (sparse_kv, "sparse_kv / gather_kv_indices"),
+                        (page_table is not None, "paged KV"),
+                        (cu_seqlens_q is not None, "cu_seqlens_q"),
+                        (cu_seqlens_k is not None, "cu_seqlens_k"),
+                        (seqused_q is not None, "seqused_q"),
+                        (seqused_k is not None, "seqused_k"),
+                        (p is not None, "P emission"),
+                        (row_max is not None, "row_max emission"),
+                        (local, "local attention"),
+                    ]:
+                        assert not feat, f"1CTA MLA kernel does not support {name}"
+                    fa_fwd = FlashAttentionMLAForward1CtaSm100(
+                        is_causal=causal,
+                        qhead_per_kvhead=qhead_per_kvhead,
+                        nheads_kv=num_head_kv,
+                        hdim=head_dim,
+                        hdimv=head_dim_v,
+                        use_clc_scheduler=use_clc_scheduler
+                        if use_clc_scheduler is not None
+                        else True,
+                        has_qk=has_qk,
+                        pack_gqa=pack_gqa,
+                    )
+                else:
+                    fa_fwd = FlashAttentionMLAForwardSm100(
+                        is_causal=causal,
+                        use_cpasync_load_KV=sparse_kv or paged_kv_cpasync,
+                        topk_length=gather_kv_length,
+                        is_topk_gather=sparse_kv,
+                        pack_gqa=pack_gqa,
+                        qhead_per_kvhead=qhead_per_kvhead,
+                        nheads_kv=num_head_kv,
+                        has_seqused_q=seqused_q is not None,
+                        has_cu_seqlens_q=cu_seqlens_q is not None,
+                        disable_bitmask=disable_sparse_kv_bitmask,
+                        has_qk=has_qk,
+                    )
             else:
                 if use_dedicated_hd256_kernel:
                     # hd=256 2CTA forward: check for currently unsupported features

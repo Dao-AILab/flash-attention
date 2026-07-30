@@ -1,4 +1,5 @@
 # Copyright (c) 2025, Tri Dao.
+from functools import partial
 from typing import Optional, Tuple
 
 import cutlass
@@ -408,11 +409,16 @@ def gemm_ptx_partial(
     # acc_offset: Int32 = 0,
     tA_addr: Optional[Int32] = None,
     cta_group: int = 1,
+    ws: bool = False,
 ) -> None:
     # acc_tmem_addr += acc_offset
     is_ts = op.a_src == cute.nvgpu.tcgen05.OperandSource.TMEM
     if const_expr(not is_ts):
         assert sA is not None, "sA must be provided when a_src is not TMEM"
+    if const_expr(ws):
+        # tcgen05.mma.ws only exists for cta_group::1 (PTX ISA 9.7.17.10.9.3)
+        assert cta_group == 1, "ws mode requires cta_group::1"
+    mma_instr = "tcgen05.mma.ws" if ws else "tcgen05.mma"
     sA_layout = sA.layout if sA is not None else tCrA.layout
     sB_layout = sB.layout
     idesc: int = const_expr(sm100_desc.mma_op_to_idesc(op))
@@ -500,7 +506,7 @@ def gemm_ptx_partial(
             f"mov.b64 smem_desc_a, {{smem_desc_a_lo_start, smem_desc_a_hi}};\n\t"
             f"mov.b64 smem_desc_b, {{smem_desc_b_lo_start, smem_desc_b_hi}};\n\t"
             "setp.ne.b32 p, $2, 0;\n\t"
-            f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::{kind} [tmem_acc], smem_desc_a, smem_desc_b, idesc, {pred_str};\n\t"
+            f"@leader_thread {mma_instr}.cta_group::{cta_group}.kind::{kind} [tmem_acc], smem_desc_a, smem_desc_b, idesc, {pred_str};\n\t"
             + "".join(
                 (
                     # f"add.u32 smem_desc_a_lo, smem_desc_a_lo, {hex(offset_a_diff[k - 1])};\n\t"
@@ -509,7 +515,7 @@ def gemm_ptx_partial(
                     f"add.u32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[k])};\n\t"
                     f"mov.b64 smem_desc_a, {{smem_desc_a_lo, smem_desc_a_hi}};\n\t"
                     f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
-                    f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::{kind} [tmem_acc], smem_desc_a, smem_desc_b, idesc, 1;\n\t"
+                    f"@leader_thread {mma_instr}.cta_group::{cta_group}.kind::{kind} [tmem_acc], smem_desc_a, smem_desc_b, idesc, 1;\n\t"
                 )
                 for k in range(1, cute.size(tCrA.shape[2]))
             )
@@ -577,7 +583,7 @@ def gemm_ptx_partial(
             f"mov.b32 smem_desc_b_hi, {hex(smem_desc_b_hi)};\n\t"
             f"mov.b64 smem_desc_b, {{smem_desc_b_lo_start, smem_desc_b_hi}};\n\t"
             "setp.ne.b32 p, $2, 0;\n\t"
-            f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::{kind} [tmem_acc], [tmem_a], smem_desc_b, idesc, {pred_str};\n\t"
+            f"@leader_thread {mma_instr}.cta_group::{cta_group}.kind::{kind} [tmem_acc], [tmem_a], smem_desc_b, idesc, {pred_str};\n\t"
             + "".join(
                 (
                     # f"add.u32 tmem_a, tmem_a, {hex(offset_a_diff[k - 1])};\n\t"
@@ -585,7 +591,7 @@ def gemm_ptx_partial(
                     f"add.u32 smem_desc_b_lo, smem_desc_b_lo_start, {hex(offset_b[k])};\n\t"
                     f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
                     # f"@leader_thread tcgen05.mma.cta_group::1.kind::f16 [tmem_acc], [tmem_a], smem_desc_b, idesc, 1;\n\t"
-                    f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::{kind} [tmem_acc], [tmem_a + {hex(offset_a[k])}], smem_desc_b, idesc, 1;\n\t"
+                    f"@leader_thread {mma_instr}.cta_group::{cta_group}.kind::{kind} [tmem_acc], [tmem_a + {hex(offset_a[k])}], smem_desc_b, idesc, 1;\n\t"
                 )
                 for k in range(
                     1,
@@ -598,7 +604,7 @@ def gemm_ptx_partial(
                     (
                         f"add.u32 smem_desc_b_lo, smem_desc_b_lo, {hex(offset_b_diff[k - 1])};\n\t"
                         f"mov.b64 smem_desc_b, {{smem_desc_b_lo, smem_desc_b_hi}};\n\t"
-                        f"@leader_thread tcgen05.mma.cta_group::{cta_group}.kind::{kind} [tmem_acc], [tmem_a + {hex(offset_a[k])}], smem_desc_b, idesc, 1;\n\t"
+                        f"@leader_thread {mma_instr}.cta_group::{cta_group}.kind::{kind} [tmem_acc], [tmem_a + {hex(offset_a[k])}], smem_desc_b, idesc, 1;\n\t"
                     )
                     for k in range(split_arrive_idx, cute.size(tCrA.shape[2]))
                 )
@@ -611,6 +617,12 @@ def gemm_ptx_partial(
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
         )
+
+
+# Weight-stationary variant: emits tcgen05.mma.ws.cta_group::1 (Layout E packed accumulator
+# for M=64: 64 x N stored as physical 128 lanes x N/2 columns). Requires cta_group == 1;
+# f16/bf16 supports N in {64, 128, 256} only (PTX ISA Table 42).
+gemm_ws_ptx_partial = partial(gemm_ptx_partial, ws=True)
 
 
 @cute.jit
