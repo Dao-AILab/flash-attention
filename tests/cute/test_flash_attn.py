@@ -77,6 +77,12 @@ def check_tensor_vs_ref(name, actual, ref, pt, rtol=2, atol=None):
     diff_pt_max = (pt - ref).abs().max().item()
     assert diff_max <= rtol * diff_pt_max + atol, f"{name}: {diff_max=} too large compared to {diff_pt_max=} for {rtol=}, {atol=}"
 
+def check_dsink_vs_ref(actual, ref, pt, rtol=2, atol=0.0):
+    ulp = torch.nextafter(ref.abs(), torch.full_like(ref, float("inf"))) - ref.abs()
+    diff = (actual - ref).abs()
+    tolerance = rtol * (pt - ref).abs().max().item() + 2 * ulp + atol
+    assert torch.all(diff <= tolerance), f"dSink: {diff=} exceeds {tolerance=}"
+
 # torch FakeTensorMode would enable fast cutedsl kernel compilation without allocating the actual GPU memory or running the kernel
 # When operating fake tensors, we cannot perform data-dependent operations (e.g., `tensor.max()`).
 USE_FAKE_TENSOR = int(os.getenv("FLASH_ATTENTION_FAKE_TENSOR", 0)) == 1
@@ -487,16 +493,13 @@ def test_flash_attn_output(
             ).abs().max().item() + dv_atol
             if has_learnable_sink:
                 assert dsink.dtype == learnable_sink.dtype
-                dsink_ulp = (
-                    torch.nextafter(
-                        dsink_ref.abs(), torch.full_like(dsink_ref, float("inf"))
-                    )
-                    - dsink_ref.abs()
-                ).max().item()
-                dsink_atol = 2 * dsink_ulp + (0 if softcap == 0 else 3e-4)
-                assert (dsink - dsink_ref).abs().max().item() <= rtol * (
-                    dsink_pt - dsink_ref
-                ).abs().max().item() + dsink_atol
+                check_dsink_vs_ref(
+                    dsink,
+                    dsink_ref,
+                    dsink_pt,
+                    rtol=rtol,
+                    atol=0 if softcap == 0 else 3e-4,
+                )
 
 
 @pytest.mark.skipif(
@@ -550,22 +553,21 @@ def test_flash_attn_learnable_sink_backward_dtype(sink_dtype):
     dsink_ref = torch.autograd.grad(out_ref, sink_ref, dout)[0]
     dsink_pt = torch.autograd.grad(out_pt, sink_ref, dout)[0]
     assert dsink.dtype == sink_dtype
-    dsink_ulp = (
-        torch.nextafter(dsink_ref.abs(), torch.full_like(dsink_ref, float("inf")))
-        - dsink_ref.abs()
-    ).max().item()
-    assert (dsink - dsink_ref).abs().max().item() <= 2 * (
-        dsink_pt - dsink_ref
-    ).abs().max().item() + 2 * dsink_ulp
+    check_dsink_vs_ref(dsink, dsink_ref, dsink_pt)
 
 
 @pytest.mark.skipif(
     not (IS_SM90 or IS_SM100 or IS_SM110),
     reason="Learnable sink backward requires SM90, SM100, or SM110",
 )
+@pytest.mark.parametrize(
+    "sink_dtype",
+    [torch.float16, torch.bfloat16, torch.float32],
+    ids=["fp16", "bf16", "fp32"],
+)
 @retry_on_oom
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_flash_attn_varlen_learnable_sink_backward_with_lse():
+def test_flash_attn_varlen_learnable_sink_backward_with_lse(sink_dtype):
     torch.random.manual_seed(0)
     batch_size, seqlen_q, seqlen_k, nheads, d = 3, 5, 2, 2, 64
     device, dtype = "cuda", torch.bfloat16
@@ -584,7 +586,7 @@ def test_flash_attn_varlen_learnable_sink_backward_with_lse():
         )
         for _ in range(2)
     ]
-    sink_ref = torch.randn(nheads, device=device, dtype=dtype, requires_grad=True)
+    sink_ref = torch.randn(nheads, device=device, dtype=sink_dtype, requires_grad=True)
     q_lengths = torch.tensor([5, 3, 0], device=device)
     k_lengths = torch.tensor([2, 0, 1], device=device)
     q_mask = torch.arange(seqlen_q, device=device) < q_lengths[:, None]
@@ -636,9 +638,12 @@ def test_flash_attn_varlen_learnable_sink_backward_with_lse():
         grads[3],
     )
     for name, grad, grad_ref, grad_pt in zip(
-        ("dQ", "dK", "dV", "dSink"), grads, grads_ref, grads_pt
+        ("dQ", "dK", "dV"), grads[:3], grads_ref[:3], grads_pt[:3]
     ):
         check_tensor_vs_ref(name, grad, grad_ref, grad_pt, rtol=3)
+    dsink, dsink_ref, dsink_pt = grads[3], grads_ref[3], grads_pt[3]
+    assert dsink.dtype == sink_dtype
+    check_dsink_vs_ref(dsink, dsink_ref, dsink_pt, rtol=3)
 
 
 # Regression test for #2591: SMEM overflow at small head_dims on SM100. The main
