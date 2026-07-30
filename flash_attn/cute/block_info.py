@@ -56,7 +56,15 @@ class BlockInfo:
 
     @cute.jit
     def get_m_block_min_max(self, seqlen_info: SeqlenInfoQK, n_block: Int32) -> Tuple[Int32, Int32]:
-        m_block_max = cute.ceil_div(seqlen_info.seqlen_q, self.tile_m)
+        # With PackGQA the backward iterates over the packed Q dimension
+        # (qhead_per_kvhead_packgqa * seqlen_q rows per kv-head), so the number of
+        # m_blocks scales by the packing factor. seqlen_info.seqlen_q stays the
+        # logical (unpacked) sequence length so masking/score_mod can recover the
+        # per-head query position.
+        seqlen_q_packed = seqlen_info.seqlen_q
+        if const_expr(self.qhead_per_kvhead_packgqa > 1):
+            seqlen_q_packed = seqlen_info.seqlen_q * self.qhead_per_kvhead_packgqa
+        m_block_max = cute.ceil_div(seqlen_q_packed, self.tile_m)
         m_block_min = 0
         if const_expr(self.is_causal or (self.is_local and self.window_size_right is not None)):
             n_idx_min = n_block * self.tile_n
