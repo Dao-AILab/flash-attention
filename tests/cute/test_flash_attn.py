@@ -2307,7 +2307,13 @@ def test_flash_attn_mla_absorbed(
             rtol = 2
             print(f"Pytorch max diff: {(out_pt - out_ref).abs().max().item()}")
             print(f"Pytorch mean diff: {(out_pt - out_ref).abs().mean().item()}")
-        num_splits_vals = [1]
+        # SplitKV is implemented for the 1CTA MLA kernel only (the 2CTA MLA path still
+        # asserts it off), so only widen the matrix under that env var.
+        num_splits_vals = (
+            [1, 3]
+            if os.environ.get("FLASH_ATTENTION_MLA_1CTA", "0") == "1" and not DISABLE_SPLIT
+            else [1]
+        )
         pack_gqa_vals = [True]
         for pack_gqa, num_splits in itertools.product(pack_gqa_vals, num_splits_vals):
             out, lse = flash_attn_func(
