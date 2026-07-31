@@ -127,6 +127,7 @@ class FlashAttentionForwardBase:
         num_threads,
         is_causal,
         Q_in_regs=False,
+        smem_capacity_arch: str = "sm_80",
     ) -> bool:
         """Check if the kernel can be implemented with the given parameters.
 
@@ -142,6 +143,14 @@ class FlashAttentionForwardBase:
         :type num_threads: int
         :param is_causal: is causal
         :type is_causal: bool
+        :param smem_capacity_arch: compute-capability string (e.g. "sm_80", "sm_86",
+            "sm_89") used to look up the static SMEM budget for this check. The SM80
+            family is not uniform: sm_80 (A100) has 166912 B available, while sm_86
+            and sm_89 (RTX 30xx/40xx) are capped at 101376 B. Callers running on
+            sm_86/sm_89 hardware must pass the matching string here (e.g.
+            ``f"sm_{arch}"`` where ``arch`` is the detected compute capability) to get
+            an accurate check; the default of "sm_80" only reflects the A100 budget.
+        :type smem_capacity_arch: str
 
         :return: True if the kernel can be implemented, False otherwise
         :rtype: bool
@@ -165,8 +174,7 @@ class FlashAttentionForwardBase:
             (smem_usage_Q + smem_usage_V) if not Q_in_regs else max(smem_usage_Q, smem_usage_V)
         )
         smem_usage = smem_usage_QV + smem_usage_K
-        # TODO: sm86 and sm89
-        smem_capacity = utils_basic.get_smem_capacity_in_bytes("sm_80")
+        smem_capacity = utils_basic.get_smem_capacity_in_bytes(smem_capacity_arch)
         if smem_usage > smem_capacity:
             return False
         # Check if twice the block size is divisible by the number of threads
