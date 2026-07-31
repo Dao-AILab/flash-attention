@@ -340,6 +340,7 @@ def _get_fwd_config(
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     mma_pv_is_rs: Optional[bool] = None,
     intra_wg_overlap: Optional[bool] = None,
+    mla_1cta: bool = False,
 ) -> FwdConfig:
     if seqlen_q is None:
         seqlen_q = max_seqlen_q
@@ -413,8 +414,15 @@ def _get_fwd_config(
         num_splits = num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, 128)
 
     # SplitKV uses float32 partial output, which doubles the O buffer size
-    # in shared memory, causing OOM for diff-headdim (192, 128)
-    if arch // 10 in [10, 11] and head_dim != head_dim_v and num_splits > 1:
+    # in shared memory, causing OOM for diff-headdim (192, 128).
+    # The 1CTA MLA kernel is exempt: it stores O_partial straight from registers
+    # (use_tma_O is off under split), so fp32 partials cost it no shared memory.
+    if (
+        arch // 10 in [10, 11]
+        and head_dim != head_dim_v
+        and num_splits > 1
+        and not mla_1cta
+    ):
         if num_n_blocks >= 64 and head_dim_v != 512:
             tile_n = 64
             num_n_blocks = (seqlen_k_loaded + tile_n - 1) // tile_n
@@ -869,6 +877,9 @@ def _flash_attn_fwd(
         page_table = page_table[:, :required_pages]
         max_seqlen_k = required_pages * page_size
 
+    # Opt-in routing to the 1CTA (tcgen05.mma.ws) MLA kernel. Defined here because the
+    # SplitKV heuristics in _get_fwd_config need it.
+    mla_1cta = qv is not None and os.environ.get("FLASH_ATTENTION_MLA_1CTA", "0") == "1"
     fwd_cfg = _get_fwd_config(
         arch=arch,
         head_dim=head_dim,
@@ -890,6 +901,7 @@ def _flash_attn_fwd(
         block_sparse_tensors=block_sparse_tensors,
         mma_pv_is_rs=mma_pv_is_rs,
         intra_wg_overlap=intra_wg_overlap,
+        mla_1cta=mla_1cta,
     )
     tile_m, tile_n = fwd_cfg.m_block_size, fwd_cfg.n_block_size
     q_stage = fwd_cfg.q_stage
@@ -903,7 +915,17 @@ def _flash_attn_fwd(
     is_split_kv = num_splits > 1
     if is_split_kv:
         out_partial = torch.empty(num_splits, *q_batch_seqlen_shape, num_head, head_dim_v, dtype=torch.float32, device=device)
-        lse_partial = torch.empty(num_splits, *lse_shape, dtype=torch.float32, device=device)
+        # The combine kernel needs LSE seqlen-contiguous, i.e. the non-qv (..., h, s)
+        # layout. The MLA kernels want (..., s, h); allocate combine's layout and give
+        # the main kernel a transposed view (its LSE writes are scatters, so strides
+        # don't matter to it).
+        lse_partial_shape = (
+            lse_shape
+            if qv is None
+            else ((batch_size, num_head, seqlen_q) if cu_seqlens_q is None else (num_head, total_q))
+        )
+        lse_partial = torch.empty(num_splits, *lse_partial_shape, dtype=torch.float32, device=device)
+        lse_partial_kernel = lse_partial if qv is None else lse_partial.transpose(-1, -2)
 
     use_2cta_instrs = (
         arch // 10 in [10, 11]
@@ -1004,7 +1026,10 @@ def _flash_attn_fwd(
         )
         assert tile_n == 128
 
-        assert not is_split_kv, "split kv not supported with qv"
+        assert not is_split_kv or mla_1cta, (
+            "split kv with qv is only supported by the 1CTA MLA kernel "
+            "(FLASH_ATTENTION_MLA_1CTA=1)"
+        )
         assert softcap is None
         assert score_mod is None
         assert mask_mod is None
@@ -1196,8 +1221,7 @@ def _flash_attn_fwd(
     # Sparse-MLA training uses the exact running max: the lazy rescale (threshold 8) leaves a
     # coherent bf16 gain error on peaked rows. See AI/SPARSE_MLA_EXACT_SOFTMAX_MAX.md.
     mla_fwd_rescale_threshold = 0.0 if (requires_grad and sparse_kv) else 8.0
-    # Opt-in routing to the 1CTA (tcgen05.mma.ws) MLA kernel.
-    mla_1cta = qv is not None and os.environ.get("FLASH_ATTENTION_MLA_1CTA", "0") == "1"
+
     # Opt-in to the Q-in-TMEM variant of that kernel (unified sK + single TS QK mma).
     # Q-in-TMEM (unified sK + one N=128 weight-stationary TS QK mma) is the default: it
     # is faster than the two-phase path on every measured shape and is bit-identical to
@@ -1300,7 +1324,18 @@ def _flash_attn_fwd(
             to_cute_tensor(t) for t in (q, k, v, out if not is_split_kv else out_partial)
         ]
         if is_split_kv:
-            lse_tensor = to_cute_tensor(lse_partial, assumed_align=4)
+            # Must match the tensor actually passed at the call site. The MLA path hands
+            # the kernel a transposed view of lse_partial (combine needs seqlen-stride-1,
+            # the MLA kernel wants (..., s, h) modes), so mark the seqlen mode -- which is
+            # the contiguous one in that view -- as leading.
+            lse_tensor = (
+                to_cute_tensor(lse_partial, assumed_align=4)
+                if qv is None
+                else to_cute_tensor(
+                    lse_partial_kernel, assumed_align=4,
+                    leading_dim=lse_partial_kernel.ndim - 2,
+                )
+            )
         else:
             lse_tensor = to_cute_tensor(lse, assumed_align=4)
 
@@ -1433,6 +1468,7 @@ def _flash_attn_fwd(
                         has_seqused_q=seqused_q is not None,
                         has_cu_seqlens_q=cu_seqlens_q is not None,
                         use_cpasync_load_KV=paged_kv_cpasync,
+                        is_split_kv=is_split_kv,
                     )
                 else:
                     fa_fwd = FlashAttentionMLAForwardSm100(
@@ -1621,8 +1657,8 @@ def _flash_attn_fwd(
                 qv_call,
                 k_call,
                 v_call,
-                out.detach(),
-                lse,
+                out.detach() if not is_split_kv else out_partial,
+                lse_partial_kernel if is_split_kv else lse,
                 softmax_scale,
                 p,
                 row_max,
@@ -1695,17 +1731,33 @@ def _flash_attn_fwd(
                 ])
             _flash_attn_fwd.compile_cache[compile_key](*call_args)
     if is_split_kv:
+        # The combine kernel wants (splits, ..., s, h) partials and a (..., s, h) output,
+        # both with the SEQLEN mode contiguous. lse_partial is allocated (..., h, s) so a
+        # transposed view satisfies that. For the final LSE the non-qv layout is (..., h, s)
+        # (transposed view works too), but the MLA/qv layout is (..., s, h) contiguous --
+        # h-major -- so combine cannot write it directly; give combine a seqlen-major
+        # staging buffer and copy back (tiny: b*s*h floats).
+        lse_combine = None
+        if lse is not None:
+            if qv is None:
+                lse_combine = lse.transpose(-1, -2)
+            else:
+                lse_combine = torch.empty(
+                    lse.transpose(-1, -2).shape, dtype=lse.dtype, device=lse.device
+                ).transpose(-1, -2)
         _flash_attn_fwd_combine(
             out_partial,
             lse_partial.transpose(-1, -2),
             out,
-            lse.transpose(-1, -2) if lse is not None else None,
+            lse_combine,
             cu_seqlens_q,
             seqused_q,
             num_splits_dynamic_ptr=num_splits_dynamic if has_scheduler_metadata else None,
             virtual_batch_idx=virtual_batch_idx if has_scheduler_metadata else None,
             _arch=arch,
         )
+        if lse is not None and qv is not None:
+            lse.copy_(lse_combine)
     if reuse_scheduler_metadata and tile_count_semaphore is not None:
         # TODO: pass tile_count_semaphore to the combine kernel and zero it there when
         # is_split_kv (using CTA 0, since a later CTA may have exited prematurely), so

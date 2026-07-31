@@ -98,6 +98,7 @@ class FlashAttentionMLAForward1CtaSm100:
         has_seqused_q: bool = False,
         has_cu_seqlens_q: bool = False,
         use_cpasync_load_KV: bool = False,
+        is_split_kv: bool = False,
         _qk_issue_last: bool = False,
     ):
         self.is_causal = is_causal
@@ -154,7 +155,22 @@ class FlashAttentionMLAForward1CtaSm100:
         # the per-row predicated rmem->gmem store (the same path pack_gqa gather uses).
         # seqused_q keeps TMA: its layout is dense, so the rows past seqlen_q are that
         # batch's own padding and harmless to overwrite.
-        self.use_tma_O = (not self.pack_gqa or self.pack_gqa_tma) and not has_cu_seqlens_q
+        # Under split-kv O_partial is fp32, which doubles sO past the sV slot it overlays;
+        # the per-row predicated store needs no smem at all, and partial-O traffic
+        # (64 x 512 x 4B per tile) is small next to the per-n_block KV stream.
+        self.use_tma_O = (
+            (not self.pack_gqa or self.pack_gqa_tma)
+            and not has_cu_seqlens_q
+            and not is_split_kv
+        )
+
+        # ==== split-kv info ====
+        # Each (m_block, head, batch) tile is launched num_splits times; split s takes a
+        # contiguous chunk of the tile's n_block range (BlockInfo does the arithmetic) and
+        # writes a split-local softmax-normalized O_partial + LSE_partial, which the
+        # separate combine kernel reduces. num_splits itself is a runtime value
+        # (mO.shape[0]); only is_split_kv is compile-time.
+        self.is_split_kv = is_split_kv
 
         # ==== varlen info ====
         # Q-side varlen changes the number of m-blocks per batch, so it needs the
@@ -540,20 +556,46 @@ class FlashAttentionMLAForward1CtaSm100:
         # (Q and K sides are independent; seqused_* keeps the dense 4-D layout.)
         QO_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
         KV_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensK is None) else [0, 2, 1]
-        mQ, mQv, mO = [
+        # Split-kv: O/LSE arrive with num_splits as mode 0 (fp32 partials) and keep it as
+        # the trailing mode after the transpose, so per-tile slicing just appends
+        # [..., split_idx]. num_splits is dynamic; only is_split_kv is compile-time.
+        if const_expr(self.is_split_kv):
+            O_split_transpose = (
+                [2, 4, 3, 1, 0] if const_expr(mCuSeqlensQ is None) else [1, 3, 2, 0]
+            )
+            num_splits = mO.shape[0]
+        else:
+            O_split_transpose = None
+            num_splits = Int32(1)
+        mQ, mQv = [
             cute.make_tensor(mX.iterator, cute.select(mX.layout, mode=QO_layout_transpose))
             if mX is not None
             else None
-            for mX in (mQ, mQv, mO)
+            for mX in (mQ, mQv)
         ]
+        mO = cute.make_tensor(
+            mO.iterator,
+            cute.select(
+                mO.layout,
+                mode=QO_layout_transpose
+                if const_expr(not self.is_split_kv)
+                else O_split_transpose,
+            ),
+        )
         mK, mV = [
             cute.make_tensor(mX.iterator, cute.select(mX.layout, mode=KV_layout_transpose))
             if mX is not None
             else None
             for mX in (mK, mV)
         ]
-        # (b, s_q, h) -> (s_q, h, b), or packed (total_q, h) unchanged
-        LSE_layout_transpose = [1, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 1]
+        # (b, s_q, h) -> (s_q, h, b), or packed (total_q, h) unchanged; split-kv adds the
+        # trailing split mode: (splits, b, s, h) -> (s, h, b, splits)
+        if const_expr(self.is_split_kv):
+            LSE_layout_transpose = (
+                [2, 3, 1, 0] if const_expr(mCuSeqlensQ is None) else [1, 2, 0]
+            )
+        else:
+            LSE_layout_transpose = [1, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 1]
         mLSE = (
             cute.make_tensor(mLSE.iterator, cute.select(mLSE.layout, mode=LSE_layout_transpose))
             if mLSE is not None
@@ -803,7 +845,7 @@ class FlashAttentionMLAForward1CtaSm100:
             num_block=cute.ceil_div(cute.size(mQv.shape[0]), self.cta_tile_m),
             num_head=cute.size(mQv.shape[2]),
             num_batch=num_batch_sched,
-            num_splits=1,
+            num_splits=num_splits,
             seqlen_k=cute.size(mV.shape[0])
             if const_expr(mPageTable is None)
             else cute.size(mV.shape[0]) * cute.size(mPageTable.shape[1]),
@@ -817,7 +859,7 @@ class FlashAttentionMLAForward1CtaSm100:
             element_size=self.dtype_V.width // 8,
             is_persistent=self.is_persistent,
             lpt=False,
-            is_split_kv=False,
+            is_split_kv=self.is_split_kv,
             cluster_shape_mn=self.cluster_shape_mn,
             use_cluster_idx=True,
         )
@@ -887,6 +929,7 @@ class FlashAttentionMLAForward1CtaSm100:
             tiled_mma_QvV,
             tiled_mma_PVt,
             softmax_scale_log2,
+            num_splits,
             tile_sched_params,
             SharedStorage,
         ).launch(
@@ -936,6 +979,7 @@ class FlashAttentionMLAForward1CtaSm100:
         tiled_mma_QvV: cute.TiledMma,
         tiled_mma_PVt: cute.TiledMma,
         softmax_scale_log2: Float32,
+        num_splits: Int32,
         tile_sched_params: ParamsBase,
         SharedStorage: cutlass.Constexpr[Callable],
     ):
@@ -1084,6 +1128,7 @@ class FlashAttentionMLAForward1CtaSm100:
             self.cta_tile_m,
             self.tile_n,
             is_causal=self.is_causal,
+            is_split_kv=self.is_split_kv,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
         )
         SeqlenInfoCls = partial(
@@ -1190,6 +1235,7 @@ class FlashAttentionMLAForward1CtaSm100:
                 gmem_tiled_copy_Qv,
                 block_info,
                 SeqlenInfoCls,
+                num_splits,
                 tile_scheduler=tile_scheduler,
             )
 
@@ -1209,6 +1255,7 @@ class FlashAttentionMLAForward1CtaSm100:
                     sK_free_mbar_ptr,
                     block_info,
                     SeqlenInfoCls,
+                    num_splits,
                     tile_scheduler=tile_scheduler,
                 )
 
@@ -1242,6 +1289,7 @@ class FlashAttentionMLAForward1CtaSm100:
                 pipeline_O1,
                 block_info,
                 SeqlenInfoCls,
+                num_splits,
                 tile_scheduler=tile_scheduler,
             )
             tmem.relinquish_alloc_permit()
@@ -1266,6 +1314,7 @@ class FlashAttentionMLAForward1CtaSm100:
                 pipeline_sm_stats,
                 block_info,
                 SeqlenInfoCls,
+                num_splits,
                 tile_scheduler=tile_scheduler,
             )
             tmem_alloc_barrier.arrive()
@@ -1295,6 +1344,7 @@ class FlashAttentionMLAForward1CtaSm100:
                 tiled_copy_O_r2g,
                 block_info,
                 SeqlenInfoCls,
+                num_splits,
                 tile_scheduler=tile_scheduler,
             )
             tmem_alloc_barrier.arrive()
@@ -1351,6 +1401,7 @@ class FlashAttentionMLAForward1CtaSm100:
         gmem_tiled_copy_Qv: Optional[cute.TiledCopy],
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
+        num_splits: Int32,
         tile_scheduler: TileSchedulerProtocol,
     ):
         # ==== Load warp ====
@@ -1378,218 +1429,227 @@ class FlashAttentionMLAForward1CtaSm100:
 
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
-            m_block, head_idx, batch_idx, _ = work_tile.tile_idx
+            m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             # with pack_gqa the scheduler's head index already is the kv head
             head_idx_kv = (
                 head_idx // self.qhead_per_kvhead if const_expr(not self.pack_gqa) else head_idx
             )
 
             seqlen = SeqlenInfoCls(batch_idx)
-            n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
+            n_block_min, n_block_max = block_info.get_n_block_min_max(
+                seqlen, m_block, split_idx=split_idx, num_splits=num_splits
+            )
             num_n_blocks = n_block_max - n_block_min
+            # Split-kv: this split's slice of the n_block range can be empty (the
+            # per-split count is rounded up, so empties are the trailing splits).
+            # Every warp role skips the whole tile body together, which keeps all
+            # pipeline phases and raw-mbar phase counters consistent; the epilogue
+            # still writes LSE = -inf so the combine kernel can ignore this split.
+            has_work = const_expr(not self.is_split_kv) or n_block_min < n_block_max
+            if has_work:
 
-            if const_expr(self.cpasync_staging_sync):
-                # Q staging aliases sK's first half and K is written by the cp.async warp
-                # group: wait until its previous-tile gathers landed before overwriting.
-                cute.arch.mbarrier_wait(sK_free_mbar_ptr, phase=sK_free_phase)
-                sK_free_phase ^= 1
+                if const_expr(self.cpasync_staging_sync):
+                    # Q staging aliases sK's first half and K is written by the cp.async warp
+                    # group: wait until its previous-tile gathers landed before overwriting.
+                    cute.arch.mbarrier_wait(sK_free_mbar_ptr, phase=sK_free_phase)
+                    sK_free_phase ^= 1
 
-            # ==== Partition GMEM tensors ====
-            if const_expr(self.has_qk):
-                mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, head_idx]
-                if const_expr(self.use_tma_QQv):
-                    gQ = cute.local_tile(
-                        mQ_cur, (self.mma_tiler_QK[0], self.mma_tiler_QK[2]), (m_block, 0)
+                # ==== Partition GMEM tensors ====
+                if const_expr(self.has_qk):
+                    mQ_cur = seqlen.offset_batch_Q(mQ, batch_idx, dim=3)[None, None, head_idx]
+                    if const_expr(self.use_tma_QQv):
+                        gQ = cute.local_tile(
+                            mQ_cur, (self.mma_tiler_QK[0], self.mma_tiler_QK[2]), (m_block, 0)
+                        )
+                        tSgQ = thr_mma_Qst.partition_A(gQ)
+                        tQsQ, tQgQ = cpasync.tma_partition(
+                            atom=tma_atom_Q,
+                            cta_coord=0,
+                            cta_layout=cute.make_layout(1),
+                            smem_tensor=cute.group_modes(sQ, 0, 3),
+                            gmem_tensor=cute.group_modes(tSgQ, 0, 3),
+                        )
+                    # Paged KV keeps the page mode as a free TMA coordinate (the page table
+                    # selects the batch), so no batch offset is applied here.
+                    mK_cur = (
+                        seqlen.offset_batch_K(mK, batch_idx, dim=3)[None, None, head_idx_kv]
+                        if const_expr(mPageTable is None)
+                        else mK[None, None, head_idx_kv, None]
                     )
-                    tSgQ = thr_mma_Qst.partition_A(gQ)
-                    tQsQ, tQgQ = cpasync.tma_partition(
-                        atom=tma_atom_Q,
+                    if const_expr(not self.use_tma_KV):
+                        # K is gathered by the cp.async warp group (no descriptor here)
+                        pass
+                    elif const_expr(self.q_in_tmem):
+                        # unified sK: one plain (tile_n, hdim) box per n_block (or per page)
+                        gK = cute.local_tile(
+                            mK_cur,
+                            (self.mma_tiler_QK[1], self.mma_tiler_QK[2]),
+                            (None, 0) if const_expr(mPageTable is None) else (0, 0, None),
+                        )
+                        tSgK = thr_mma_QK.partition_B(gK)
+                        tKsK, tKgK = cpasync.tma_partition(
+                            atom=tma_atom_K,
+                            cta_coord=0,
+                            cta_layout=cute.make_layout(1),
+                            smem_tensor=cute.group_modes(sK, 0, 3),
+                            gmem_tensor=cute.group_modes(tSgK, 0, 3),
+                        )
+                    else:
+                        # K: 32-row tiles; token = n_block*128 + p*32 + r + 64*h
+                        # -> 32-row block index = 4*n_block + 2*h + p
+                        gK32 = cute.local_tile(mK_cur, (32, self.mma_tiler_QK32[2]), (None, 0))
+                        tSgK = thr_mma_QK32.partition_B(gK32)
+                        tKsK, tKgK = cpasync.tma_partition(
+                            atom=tma_atom_K,
+                            cta_coord=0,
+                            cta_layout=cute.make_layout(1),
+                            smem_tensor=cute.group_modes(sK32, 0, 3),
+                            gmem_tensor=cute.group_modes(tSgK, 0, 3),
+                        )
+
+                mQv_cur = seqlen.offset_batch_Q(mQv, batch_idx, dim=3)[None, None, head_idx]
+                if const_expr(self.use_tma_QQv):
+                    gQv = cute.local_tile(
+                        mQv_cur, (self.mma_tiler_QvV[0], self.mma_tiler_QvV[2]), (m_block, None)
+                    )
+                    tSgQv = thr_mma_QvV.partition_A(gQv)
+                    tQvsQv, tQvgQv = cpasync.tma_partition(
+                        atom=tma_atom_Qv,
                         cta_coord=0,
                         cta_layout=cute.make_layout(1),
-                        smem_tensor=cute.group_modes(sQ, 0, 3),
-                        gmem_tensor=cute.group_modes(tSgQ, 0, 3),
+                        smem_tensor=cute.group_modes(sQv, 0, 3),
+                        gmem_tensor=cute.group_modes(tSgQv, 0, 3),
                     )
-                # Paged KV keeps the page mode as a free TMA coordinate (the page table
-                # selects the batch), so no batch offset is applied here.
-                mK_cur = (
-                    seqlen.offset_batch_K(mK, batch_idx, dim=3)[None, None, head_idx_kv]
-                    if const_expr(mPageTable is None)
-                    else mK[None, None, head_idx_kv, None]
+
+                if const_expr(self.use_tma_KV):
+                    mV_cur = (
+                        seqlen.offset_batch_K(mV, batch_idx, dim=3)[None, None, head_idx_kv]
+                        if const_expr(mPageTable is None)
+                        else mV[None, None, head_idx_kv, None]
+                    )
+                if const_expr(not self.use_tma_KV):
+                    # V is gathered by the cp.async warp group
+                    load_V = None
+                elif const_expr(mPageTable is None):
+                    # (tile_n, hdimv//2, num_n_blocks, num_d_blocks=2)
+                    gV = cute.local_tile(
+                        mV_cur, (self.mma_tiler_QvV[1], self.mma_tiler_QvV[2]), (None, None)
+                    )
+                    # (tile_n, hdimv//2, num_d_blocks=2, num_n_blocks)
+                    gV = cute.make_tensor(gV.iterator, cute.select(gV.layout, mode=[0, 1, 3, 2]))
+                else:
+                    # paged: one page per tile -> (tile_n, hdimv//2, num_d_blocks=2, num_pages),
+                    # already in (split, page) order
+                    gV = cute.local_tile(
+                        mV_cur, (self.mma_tiler_QvV[1], self.mma_tiler_QvV[2]), (0, None, None)
+                    )
+                if const_expr(self.use_tma_KV):
+                    tSgV = thr_mma_QvV.partition_B(gV)
+                    tVsV, tVgV = cpasync.tma_partition(
+                        atom=tma_atom_V,
+                        cta_coord=0,
+                        cta_layout=cute.make_layout(1),
+                        smem_tensor=cute.group_modes(sV, 0, 3),
+                        gmem_tensor=cute.group_modes(tSgV, 0, 3),
+                    )
+                    load_V = partial(self.load_inner, tma_atom_V, tVgV, tVsV, pipeline_V)
+
+                # ==== Load stationary operands ====
+                if const_expr(self.use_tma_QQv):
+                    if const_expr(self.has_qk):
+                        producer_state_Q = self.load_inner(
+                            tma_atom_Q, tQgQ, tQsQ, pipeline_Q, producer_state_Q
+                        )
+                    load_Qv = partial(self.load_inner, tma_atom_Qv, tQvgQv, tQvsQv, pipeline_Qv)
+                    for dv_split in cutlass.range_constexpr(self.num_hdimv_splits):
+                        producer_state_Qv = load_Qv(producer_state_Qv, block=dv_split)
+                else:
+                    # pack_gqa: gather the packed rows with cp.async (see load_QQv_packed)
+                    if const_expr(self.has_qk):
+                        producer_state_Q = self.load_QQv_packed(
+                            mQ_cur,
+                            sQ,
+                            gmem_tiled_copy_Q,
+                            pipeline_Q,
+                            producer_state_Q,
+                            self.hdim,
+                            tidx,
+                            m_block,
+                            seqlen.seqlen_q,
+                        )
+                    for dv_split in cutlass.range_constexpr(self.num_hdimv_splits):
+                        producer_state_Qv = self.load_QQv_packed(
+                            cute.domain_offset(
+                                (0, dv_split * self.hdimv // self.num_hdimv_splits), mQv_cur
+                            ),
+                            sQv,
+                            gmem_tiled_copy_Qv,
+                            pipeline_Qv,
+                            producer_state_Qv,
+                            self.hdimv // self.num_hdimv_splits,
+                            tidx,
+                            m_block,
+                            seqlen.seqlen_q,
+                        )
+
+                if const_expr(self.use_tma_O):
+                    # sO (previous tile's epilogue) overlays sV: wait for it to drain before
+                    # overwriting V slots. Not needed when O is stored straight from rmem.
+                    cute.arch.mbarrier_wait(sO_empty_mbar_ptr, phase=producer_phase_O)
+                    producer_phase_O ^= 1
+
+                # ==== Main loop (descending n_block) ====
+                # Issue order matches mma consumption: V0, K-phase0, V1, K-phase1.
+                #
+                # A fully-masked m-tile (causal with seqlen_q > seqlen_k) has num_n_blocks == 0,
+                # but the mma warp always issues one S step and one P @ V step. Load one dummy
+                # block (index 0) in that case so the K/V pipeline counts stay balanced --
+                # otherwise the mma warp waits forever. Masking zeroes the dummy block's
+                # contribution, so the result (O = 0, LSE = -inf) is still correct.
+                num_n_blocks_load = cutlass.max(num_n_blocks, 1)
+                n_block_first = n_block_max - 1 if num_n_blocks > 0 else 0
+                # Paged KV (page_size == tile_n): the page table turns the logical n_block
+                # into the physical page that indexes the K/V descriptors.
+                mPageTable_cur = (
+                    mPageTable[batch_idx, None] if const_expr(mPageTable is not None) else None
                 )
                 if const_expr(not self.use_tma_KV):
-                    # K is gathered by the cp.async warp group (no descriptor here)
+                    # K/V are gathered by the cp.async warp group; nothing to do here.
                     pass
                 elif const_expr(self.q_in_tmem):
-                    # unified sK: one plain (tile_n, hdim) box per n_block (or per page)
-                    gK = cute.local_tile(
-                        mK_cur,
-                        (self.mma_tiler_QK[1], self.mma_tiler_QK[2]),
-                        (None, 0) if const_expr(mPageTable is None) else (0, 0, None),
-                    )
-                    tSgK = thr_mma_QK.partition_B(gK)
-                    tKsK, tKgK = cpasync.tma_partition(
-                        atom=tma_atom_K,
-                        cta_coord=0,
-                        cta_layout=cute.make_layout(1),
-                        smem_tensor=cute.group_modes(sK, 0, 3),
-                        gmem_tensor=cute.group_modes(tSgK, 0, 3),
-                    )
+                    # The Q staging tile aliases the first half of the sK slot: wait until
+                    # the mma warp's cp's have drained it before overwriting it with K.
+                    cute.arch.mbarrier_wait(staging_mbar_ptr, phase=staging_phase)
+                    staging_phase ^= 1
+                    # Unified sK: K first (it gates the first mma of the step and is 8x
+                    # smaller than a V split), then the two V dv splits.
+                    load_K = partial(self.load_inner, tma_atom_K, tKgK, tKsK, pipeline_K)
+                    for i in cutlass.range(num_n_blocks_load, unroll=1):
+                        n_block = n_block_first - i
+                        block = self._get_block_idx(n_block, mPageTable_cur)
+                        producer_state_K = load_K(producer_state_K, block=block)
+                        producer_state_V = load_V(producer_state_V, block=block, split=0)
+                        producer_state_V = load_V(producer_state_V, block=block, split=1)
                 else:
-                    # K: 32-row tiles; token = n_block*128 + p*32 + r + 64*h
-                    # -> 32-row block index = 4*n_block + 2*h + p
-                    gK32 = cute.local_tile(mK_cur, (32, self.mma_tiler_QK32[2]), (None, 0))
-                    tSgK = thr_mma_QK32.partition_B(gK32)
-                    tKsK, tKgK = cpasync.tma_partition(
-                        atom=tma_atom_K,
-                        cta_coord=0,
-                        cta_layout=cute.make_layout(1),
-                        smem_tensor=cute.group_modes(sK32, 0, 3),
-                        gmem_tensor=cute.group_modes(tSgK, 0, 3),
+                    # Legacy two-phase QK path. Paged K would need a second 32-row gather, so
+                    # paged requires q_in_tmem when there is a rope part; with has_qk=False
+                    # only V is loaded and the page indirection applies to it as usual.
+                    assert not self.has_qk or mPageTable is None, (
+                        "paged KV with a rope part requires q_in_tmem=True"
                     )
-
-            mQv_cur = seqlen.offset_batch_Q(mQv, batch_idx, dim=3)[None, None, head_idx]
-            if const_expr(self.use_tma_QQv):
-                gQv = cute.local_tile(
-                    mQv_cur, (self.mma_tiler_QvV[0], self.mma_tiler_QvV[2]), (m_block, None)
-                )
-                tSgQv = thr_mma_QvV.partition_A(gQv)
-                tQvsQv, tQvgQv = cpasync.tma_partition(
-                    atom=tma_atom_Qv,
-                    cta_coord=0,
-                    cta_layout=cute.make_layout(1),
-                    smem_tensor=cute.group_modes(sQv, 0, 3),
-                    gmem_tensor=cute.group_modes(tSgQv, 0, 3),
-                )
-
-            if const_expr(self.use_tma_KV):
-                mV_cur = (
-                    seqlen.offset_batch_K(mV, batch_idx, dim=3)[None, None, head_idx_kv]
-                    if const_expr(mPageTable is None)
-                    else mV[None, None, head_idx_kv, None]
-                )
-            if const_expr(not self.use_tma_KV):
-                # V is gathered by the cp.async warp group
-                load_V = None
-            elif const_expr(mPageTable is None):
-                # (tile_n, hdimv//2, num_n_blocks, num_d_blocks=2)
-                gV = cute.local_tile(
-                    mV_cur, (self.mma_tiler_QvV[1], self.mma_tiler_QvV[2]), (None, None)
-                )
-                # (tile_n, hdimv//2, num_d_blocks=2, num_n_blocks)
-                gV = cute.make_tensor(gV.iterator, cute.select(gV.layout, mode=[0, 1, 3, 2]))
-            else:
-                # paged: one page per tile -> (tile_n, hdimv//2, num_d_blocks=2, num_pages),
-                # already in (split, page) order
-                gV = cute.local_tile(
-                    mV_cur, (self.mma_tiler_QvV[1], self.mma_tiler_QvV[2]), (0, None, None)
-                )
-            if const_expr(self.use_tma_KV):
-                tSgV = thr_mma_QvV.partition_B(gV)
-                tVsV, tVgV = cpasync.tma_partition(
-                    atom=tma_atom_V,
-                    cta_coord=0,
-                    cta_layout=cute.make_layout(1),
-                    smem_tensor=cute.group_modes(sV, 0, 3),
-                    gmem_tensor=cute.group_modes(tSgV, 0, 3),
-                )
-                load_V = partial(self.load_inner, tma_atom_V, tVgV, tVsV, pipeline_V)
-
-            # ==== Load stationary operands ====
-            if const_expr(self.use_tma_QQv):
-                if const_expr(self.has_qk):
-                    producer_state_Q = self.load_inner(
-                        tma_atom_Q, tQgQ, tQsQ, pipeline_Q, producer_state_Q
-                    )
-                load_Qv = partial(self.load_inner, tma_atom_Qv, tQvgQv, tQvsQv, pipeline_Qv)
-                for dv_split in cutlass.range_constexpr(self.num_hdimv_splits):
-                    producer_state_Qv = load_Qv(producer_state_Qv, block=dv_split)
-            else:
-                # pack_gqa: gather the packed rows with cp.async (see load_QQv_packed)
-                if const_expr(self.has_qk):
-                    producer_state_Q = self.load_QQv_packed(
-                        mQ_cur,
-                        sQ,
-                        gmem_tiled_copy_Q,
-                        pipeline_Q,
-                        producer_state_Q,
-                        self.hdim,
-                        tidx,
-                        m_block,
-                        seqlen.seqlen_q,
-                    )
-                for dv_split in cutlass.range_constexpr(self.num_hdimv_splits):
-                    producer_state_Qv = self.load_QQv_packed(
-                        cute.domain_offset(
-                            (0, dv_split * self.hdimv // self.num_hdimv_splits), mQv_cur
-                        ),
-                        sQv,
-                        gmem_tiled_copy_Qv,
-                        pipeline_Qv,
-                        producer_state_Qv,
-                        self.hdimv // self.num_hdimv_splits,
-                        tidx,
-                        m_block,
-                        seqlen.seqlen_q,
-                    )
-
-            if const_expr(self.use_tma_O):
-                # sO (previous tile's epilogue) overlays sV: wait for it to drain before
-                # overwriting V slots. Not needed when O is stored straight from rmem.
-                cute.arch.mbarrier_wait(sO_empty_mbar_ptr, phase=producer_phase_O)
-                producer_phase_O ^= 1
-
-            # ==== Main loop (descending n_block) ====
-            # Issue order matches mma consumption: V0, K-phase0, V1, K-phase1.
-            #
-            # A fully-masked m-tile (causal with seqlen_q > seqlen_k) has num_n_blocks == 0,
-            # but the mma warp always issues one S step and one P @ V step. Load one dummy
-            # block (index 0) in that case so the K/V pipeline counts stay balanced --
-            # otherwise the mma warp waits forever. Masking zeroes the dummy block's
-            # contribution, so the result (O = 0, LSE = -inf) is still correct.
-            num_n_blocks_load = cutlass.max(num_n_blocks, 1)
-            n_block_first = n_block_max - 1 if num_n_blocks > 0 else 0
-            # Paged KV (page_size == tile_n): the page table turns the logical n_block
-            # into the physical page that indexes the K/V descriptors.
-            mPageTable_cur = (
-                mPageTable[batch_idx, None] if const_expr(mPageTable is not None) else None
-            )
-            if const_expr(not self.use_tma_KV):
-                # K/V are gathered by the cp.async warp group; nothing to do here.
-                pass
-            elif const_expr(self.q_in_tmem):
-                # The Q staging tile aliases the first half of the sK slot: wait until
-                # the mma warp's cp's have drained it before overwriting it with K.
-                cute.arch.mbarrier_wait(staging_mbar_ptr, phase=staging_phase)
-                staging_phase ^= 1
-                # Unified sK: K first (it gates the first mma of the step and is 8x
-                # smaller than a V split), then the two V dv splits.
-                load_K = partial(self.load_inner, tma_atom_K, tKgK, tKsK, pipeline_K)
-                for i in cutlass.range(num_n_blocks_load, unroll=1):
-                    n_block = n_block_first - i
-                    block = self._get_block_idx(n_block, mPageTable_cur)
-                    producer_state_K = load_K(producer_state_K, block=block)
-                    producer_state_V = load_V(producer_state_V, block=block, split=0)
-                    producer_state_V = load_V(producer_state_V, block=block, split=1)
-            else:
-                # Legacy two-phase QK path. Paged K would need a second 32-row gather, so
-                # paged requires q_in_tmem when there is a rope part; with has_qk=False
-                # only V is loaded and the page indirection applies to it as usual.
-                assert not self.has_qk or mPageTable is None, (
-                    "paged KV with a rope part requires q_in_tmem=True"
-                )
-                for i in cutlass.range(num_n_blocks_load, unroll=1):
-                    n_block = n_block_first - i
-                    block = self._get_block_idx(n_block, mPageTable_cur)
-                    producer_state_V = load_V(producer_state_V, block=block, split=0)
-                    if const_expr(self.has_qk):
-                        producer_state_K = self.load_K_phase(
-                            tma_atom_K, tKgK, tKsK, pipeline_K, producer_state_K, n_block, 0
-                        )
-                    producer_state_V = load_V(producer_state_V, block=block, split=1)
-                    if const_expr(self.has_qk):
-                        producer_state_K = self.load_K_phase(
-                            tma_atom_K, tKgK, tKsK, pipeline_K, producer_state_K, n_block, 1
-                        )
+                    for i in cutlass.range(num_n_blocks_load, unroll=1):
+                        n_block = n_block_first - i
+                        block = self._get_block_idx(n_block, mPageTable_cur)
+                        producer_state_V = load_V(producer_state_V, block=block, split=0)
+                        if const_expr(self.has_qk):
+                            producer_state_K = self.load_K_phase(
+                                tma_atom_K, tKgK, tKsK, pipeline_K, producer_state_K, n_block, 0
+                            )
+                        producer_state_V = load_V(producer_state_V, block=block, split=1)
+                        if const_expr(self.has_qk):
+                            producer_state_K = self.load_K_phase(
+                                tma_atom_K, tKgK, tKsK, pipeline_K, producer_state_K, n_block, 1
+                            )
 
             # Advance to next tile
             work_tile = tile_scheduler.advance_to_next_work()
@@ -1725,6 +1785,7 @@ class FlashAttentionMLAForward1CtaSm100:
         sK_free_mbar_ptr: cute.Pointer,
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
+        num_splits: Int32,
         tile_scheduler: TileSchedulerProtocol,
     ):
         # ==== cp.async load warp group (paged KV, page_size != tile_n) ====
@@ -1740,78 +1801,87 @@ class FlashAttentionMLAForward1CtaSm100:
 
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
-            m_block, head_idx, batch_idx, _ = work_tile.tile_idx
+            m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             head_idx_kv = (
                 head_idx // self.qhead_per_kvhead if const_expr(not self.pack_gqa) else head_idx
             )
             seqlen = SeqlenInfoCls(batch_idx)
-            n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
+            n_block_min, n_block_max = block_info.get_n_block_min_max(
+                seqlen, m_block, split_idx=split_idx, num_splits=num_splits
+            )
             num_n_blocks = n_block_max - n_block_min
+            # Split-kv: this split's slice of the n_block range can be empty (the
+            # per-split count is rounded up, so empties are the trailing splits).
+            # Every warp role skips the whole tile body together, which keeps all
+            # pipeline phases and raw-mbar phase counters consistent; the epilogue
+            # still writes LSE = -inf so the combine kernel can ignore this split.
+            has_work = const_expr(not self.is_split_kv) or n_block_min < n_block_max
+            if has_work:
 
-            make_manager = partial(
-                PagedKVManager.create,
-                mPageTable,
-                page_size_divmod=page_size_divmod,
-                bidb=batch_idx,
-                bidh=head_idx_kv,
-                thread_idx=tidx,
-                seqlen_k=seqlen.seqlen_k,
-                leftpad_k=0,
-                n_block_size=self.tile_n,
-                num_threads=self.num_cpasync_load_threads,
-            )
-            # Both managers use mode "K" (non-transposed): the 1CTA kernel reads P@V
-            # through an smem VIEW of the same sV bytes, so there is no separate Vt tile
-            # to gather (unlike the CTA-split 2CTA kernel).
-            if const_expr(self.has_qk):
-                paged_K = make_manager(
-                    mK_paged=mK,
-                    mV_paged=mK,
-                    head_dim_padded=self.hdim,
-                    head_dim_v_padded=self.hdim,
-                    dtype=self.dtype_K,
+                make_manager = partial(
+                    PagedKVManager.create,
+                    mPageTable,
+                    page_size_divmod=page_size_divmod,
+                    bidb=batch_idx,
+                    bidh=head_idx_kv,
+                    thread_idx=tidx,
+                    seqlen_k=seqlen.seqlen_k,
+                    leftpad_k=0,
+                    n_block_size=self.tile_n,
+                    num_threads=self.num_cpasync_load_threads,
                 )
-            paged_V = make_manager(
-                mK_paged=mV,
-                mV_paged=mV,
-                head_dim_padded=dv_split,
-                head_dim_v_padded=dv_split,
-                dtype=self.dtype_V,
-            )
-
-            # See the load warp: a fully-masked m-tile still needs one balanced K/V set.
-            num_n_blocks_load = cutlass.max(num_n_blocks, 1)
-            n_block_first = n_block_max - 1 if num_n_blocks > 0 else 0
-            if const_expr(self.cpasync_staging_sync):
-                # The Q staging tile aliases the first half of sK; wait until the mma
-                # warp's tcgen05.cp's have consumed it before gathering K over it.
-                cute.arch.mbarrier_wait(staging_mbar_ptr, phase=staging_phase)
-                staging_phase ^= 1
-            for i in cutlass.range(num_n_blocks_load, unroll=1):
-                n_block = n_block_first - i
+                # Both managers use mode "K" (non-transposed): the 1CTA kernel reads P@V
+                # through an smem VIEW of the same sV bytes, so there is no separate Vt tile
+                # to gather (unlike the CTA-split 2CTA kernel).
                 if const_expr(self.has_qk):
-                    paged_K.load_page_table(n_block)
-                    producer_state_K = self.cpasync_load_KV(
-                        paged_K, pipeline_K, sK, self.hdim, n_block, producer_state_K
+                    paged_K = make_manager(
+                        mK_paged=mK,
+                        mV_paged=mK,
+                        head_dim_padded=self.hdim,
+                        head_dim_v_padded=self.hdim,
+                        dtype=self.dtype_K,
                     )
-                paged_V.load_page_table(n_block)
-                for split in cutlass.range_constexpr(self.num_hdimv_splits):
-                    producer_state_V = self.cpasync_load_KV(
-                        paged_V,
-                        pipeline_V,
-                        sV,
-                        dv_split,
-                        n_block,
-                        producer_state_V,
-                        d_offset=split * dv_split,
-                    )
+                paged_V = make_manager(
+                    mK_paged=mV,
+                    mV_paged=mV,
+                    head_dim_padded=dv_split,
+                    head_dim_v_padded=dv_split,
+                    dtype=self.dtype_V,
+                )
 
-            if const_expr(self.cpasync_staging_sync):
-                # All of this tile's K writes have landed -> the load warp may stage the
-                # next tile's Q over sK's first half. cp.async completion is per thread,
-                # so each waits for its own groups and arrives (init count = all of them).
-                cute.arch.cp_async_wait_group(0)
-                cute.arch.mbarrier_arrive(sK_free_mbar_ptr)
+                # See the load warp: a fully-masked m-tile still needs one balanced K/V set.
+                num_n_blocks_load = cutlass.max(num_n_blocks, 1)
+                n_block_first = n_block_max - 1 if num_n_blocks > 0 else 0
+                if const_expr(self.cpasync_staging_sync):
+                    # The Q staging tile aliases the first half of sK; wait until the mma
+                    # warp's tcgen05.cp's have consumed it before gathering K over it.
+                    cute.arch.mbarrier_wait(staging_mbar_ptr, phase=staging_phase)
+                    staging_phase ^= 1
+                for i in cutlass.range(num_n_blocks_load, unroll=1):
+                    n_block = n_block_first - i
+                    if const_expr(self.has_qk):
+                        paged_K.load_page_table(n_block)
+                        producer_state_K = self.cpasync_load_KV(
+                            paged_K, pipeline_K, sK, self.hdim, n_block, producer_state_K
+                        )
+                    paged_V.load_page_table(n_block)
+                    for split in cutlass.range_constexpr(self.num_hdimv_splits):
+                        producer_state_V = self.cpasync_load_KV(
+                            paged_V,
+                            pipeline_V,
+                            sV,
+                            dv_split,
+                            n_block,
+                            producer_state_V,
+                            d_offset=split * dv_split,
+                        )
+
+                if const_expr(self.cpasync_staging_sync):
+                    # All of this tile's K writes have landed -> the load warp may stage the
+                    # next tile's Q over sK's first half. cp.async completion is per thread,
+                    # so each waits for its own groups and arrives (init count = all of them).
+                    cute.arch.cp_async_wait_group(0)
+                    cute.arch.mbarrier_arrive(sK_free_mbar_ptr)
 
             work_tile = tile_scheduler.advance_to_next_work()
 
@@ -1907,6 +1977,7 @@ class FlashAttentionMLAForward1CtaSm100:
         pipeline_O1: pipeline.PipelineAsync,
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
+        num_splits: Int32,
         tile_scheduler: TileSchedulerProtocol,
     ):
         # ==== mma warp ====
@@ -2029,106 +2100,115 @@ class FlashAttentionMLAForward1CtaSm100:
         work_tile = tile_scheduler.initial_work_tile_info()
         O_should_accumulate = Boolean(False)
         while work_tile.is_valid_tile:
-            m_block, head_idx, batch_idx, _ = work_tile.tile_idx
+            m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
 
             seqlen = SeqlenInfoCls(batch_idx)
-            n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
-            num_n_blocks = n_block_max - n_block_min
-            even_n_blocks = num_n_blocks % 2 == 0 and num_n_blocks > 0
-            num_n_block_groups = cute.ceil_div(num_n_blocks, self.num_stages_S)
-
-            if const_expr(self.has_qk):
-                pipeline_Q.consumer_wait(consumer_state_Q)
-            if const_expr(self.q_in_tmem):
-                # Stage Q into TMEM, duplicated across lane halves (the ws M=64 A-operand
-                # layout). No wait is needed between these cp's and the QK mma below:
-                # tcgen05.cp -> tcgen05.mma from the same thread is a PTX-ordered pair.
-                #
-                # The reverse (mma -> cp) is NOT ordered, but the previous tile's QK
-                # mmas are already known to have retired here: this tile's Q TMA had to
-                # wait on pipeline_Q's empty barrier, which the mma warp signals at the
-                # end of a tile with a tcgen05.commit-backed release.
-                fa_sm100_utils.cp_smem_to_tmem_dup_64(
-                    sQst, Int32(tmem_ptr.toint() + self.tmem_offset_Q)
-                )
-                # Tell the load warp the staging tile (aliased with sK) is free. The
-                # commit completes when the cp's do.
-                with cute.arch.elect_one():
-                    tcgen05.commit(staging_mbar_ptr, None, self.cta_group)
-
-            consumer_wait_state_Qv = consumer_state_Qv.clone()
-            for _ in cutlass.range_constexpr(self.num_hdimv_splits):
-                pipeline_Qv.consumer_wait(consumer_wait_state_Qv)
-                consumer_wait_state_Qv.advance()
-
-            # ==== Prologue ====
-            producer_state_S, consumer_state_V_wait, consumer_state_K = mma_S(
-                producer_state_S, consumer_state_V_wait, consumer_state_K, stage=0
+            n_block_min, n_block_max = block_info.get_n_block_min_max(
+                seqlen, m_block, split_idx=split_idx, num_splits=num_splits
             )
+            num_n_blocks = n_block_max - n_block_min
+            # Split-kv: this split's slice of the n_block range can be empty (the
+            # per-split count is rounded up, so empties are the trailing splits).
+            # Every warp role skips the whole tile body together, which keeps all
+            # pipeline phases and raw-mbar phase counters consistent; the epilogue
+            # still writes LSE = -inf so the combine kernel can ignore this split.
+            has_work = const_expr(not self.is_split_kv) or n_block_min < n_block_max
+            if has_work:
+                even_n_blocks = num_n_blocks % 2 == 0 and num_n_blocks > 0
+                num_n_block_groups = cute.ceil_div(num_n_blocks, self.num_stages_S)
 
-            # ==== Mainloop ====
-            # Single-block V residency forces PVt(cur) before S(next): S(next)
-            # needs V(next), whose slots are freed only by PVt(cur).
-            for _ in cutlass.range(num_n_block_groups - 1, unroll=1):
+                if const_expr(self.has_qk):
+                    pipeline_Q.consumer_wait(consumer_state_Q)
+                if const_expr(self.q_in_tmem):
+                    # Stage Q into TMEM, duplicated across lane halves (the ws M=64 A-operand
+                    # layout). No wait is needed between these cp's and the QK mma below:
+                    # tcgen05.cp -> tcgen05.mma from the same thread is a PTX-ordered pair.
+                    #
+                    # The reverse (mma -> cp) is NOT ordered, but the previous tile's QK
+                    # mmas are already known to have retired here: this tile's Q TMA had to
+                    # wait on pipeline_Q's empty barrier, which the mma warp signals at the
+                    # end of a tile with a tcgen05.commit-backed release.
+                    fa_sm100_utils.cp_smem_to_tmem_dup_64(
+                        sQst, Int32(tmem_ptr.toint() + self.tmem_offset_Q)
+                    )
+                    # Tell the load warp the staging tile (aliased with sK) is free. The
+                    # commit completes when the cp's do.
+                    with cute.arch.elect_one():
+                        tcgen05.commit(staging_mbar_ptr, None, self.cta_group)
+
+                consumer_wait_state_Qv = consumer_state_Qv.clone()
+                for _ in cutlass.range_constexpr(self.num_hdimv_splits):
+                    pipeline_Qv.consumer_wait(consumer_wait_state_Qv)
+                    consumer_wait_state_Qv.advance()
+
+                # ==== Prologue ====
+                producer_state_S, consumer_state_V_wait, consumer_state_K = mma_S(
+                    producer_state_S, consumer_state_V_wait, consumer_state_K, stage=0
+                )
+
+                # ==== Mainloop ====
+                # Single-block V residency forces PVt(cur) before S(next): S(next)
+                # needs V(next), whose slots are freed only by PVt(cur).
+                for _ in cutlass.range(num_n_block_groups - 1, unroll=1):
+                    for stage in cutlass.range_constexpr(self.num_stages_S):
+                        (
+                            producer_state_O0,
+                            producer_state_O1,
+                            consumer_state_P,
+                            consumer_state_V_release,
+                            O_should_accumulate,
+                        ) = mma_PVt(
+                            producer_state_O0,
+                            producer_state_O1,
+                            consumer_state_P,
+                            consumer_state_V_release,
+                            O_should_accumulate,
+                        )
+                        producer_state_S, consumer_state_V_wait, consumer_state_K = mma_S(
+                            producer_state_S,
+                            consumer_state_V_wait,
+                            consumer_state_K,
+                            stage=const_expr((stage + 1) % self.num_stages_S),
+                        )
+
+                # ==== Epilogue ====
+                num_final_n_blocks = self.num_stages_S if even_n_blocks else self.num_stages_S - 1
                 for stage in cutlass.range_constexpr(self.num_stages_S):
-                    (
-                        producer_state_O0,
-                        producer_state_O1,
-                        consumer_state_P,
-                        consumer_state_V_release,
-                        O_should_accumulate,
-                    ) = mma_PVt(
-                        producer_state_O0,
-                        producer_state_O1,
-                        consumer_state_P,
-                        consumer_state_V_release,
-                        O_should_accumulate,
-                    )
-                    producer_state_S, consumer_state_V_wait, consumer_state_K = mma_S(
-                        producer_state_S,
-                        consumer_state_V_wait,
-                        consumer_state_K,
-                        stage=const_expr((stage + 1) % self.num_stages_S),
-                    )
+                    n_block = num_final_n_blocks - 1 - stage
+                    if n_block >= 0:
+                        (
+                            producer_state_O0,
+                            producer_state_O1,
+                            consumer_state_P,
+                            consumer_state_V_release,
+                            O_should_accumulate,
+                        ) = mma_PVt(
+                            producer_state_O0,
+                            producer_state_O1,
+                            consumer_state_P,
+                            consumer_state_V_release,
+                            O_should_accumulate,
+                        )
+                        if const_expr(stage == 0):
+                            if n_block > 0:
+                                producer_state_S, consumer_state_V_wait, consumer_state_K = mma_S(
+                                    producer_state_S,
+                                    consumer_state_V_wait,
+                                    consumer_state_K,
+                                    stage=1,
+                                )
 
-            # ==== Epilogue ====
-            num_final_n_blocks = self.num_stages_S if even_n_blocks else self.num_stages_S - 1
-            for stage in cutlass.range_constexpr(self.num_stages_S):
-                n_block = num_final_n_blocks - 1 - stage
-                if n_block >= 0:
-                    (
-                        producer_state_O0,
-                        producer_state_O1,
-                        consumer_state_P,
-                        consumer_state_V_release,
-                        O_should_accumulate,
-                    ) = mma_PVt(
-                        producer_state_O0,
-                        producer_state_O1,
-                        consumer_state_P,
-                        consumer_state_V_release,
-                        O_should_accumulate,
-                    )
-                    if const_expr(stage == 0):
-                        if n_block > 0:
-                            producer_state_S, consumer_state_V_wait, consumer_state_K = mma_S(
-                                producer_state_S,
-                                consumer_state_V_wait,
-                                consumer_state_K,
-                                stage=1,
-                            )
+                if const_expr(self.has_qk):
+                    # Released at the END of the tile on purpose when q_in_tmem: the release
+                    # is a tcgen05.commit, so it fires only once every mma of this tile has
+                    # retired -- which is what keeps the next tile's cp's from overwriting
+                    # the Q TMEM region this tile's QK mmas are still reading.
+                    pipeline_Q.consumer_release(consumer_state_Q)
+                    consumer_state_Q.advance()
 
-            if const_expr(self.has_qk):
-                # Released at the END of the tile on purpose when q_in_tmem: the release
-                # is a tcgen05.commit, so it fires only once every mma of this tile has
-                # retired -- which is what keeps the next tile's cp's from overwriting
-                # the Q TMEM region this tile's QK mmas are still reading.
-                pipeline_Q.consumer_release(consumer_state_Q)
-                consumer_state_Q.advance()
-
-            for _ in cutlass.range_constexpr(self.num_hdimv_splits):
-                pipeline_Qv.consumer_release(consumer_state_Qv)
-                consumer_state_Qv.advance()
+                for _ in cutlass.range_constexpr(self.num_hdimv_splits):
+                    pipeline_Qv.consumer_release(consumer_state_Qv)
+                    consumer_state_Qv.advance()
 
             # Advance to next tile
             work_tile = tile_scheduler.advance_to_next_work()
@@ -2314,6 +2394,7 @@ class FlashAttentionMLAForward1CtaSm100:
         pipeline_sm_stats: pipeline.PipelineAsync,
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
+        num_splits: Int32,
         tile_scheduler: TileSchedulerProtocol,
     ):
         # ==== softmax warpgroup ====
@@ -2373,74 +2454,110 @@ class FlashAttentionMLAForward1CtaSm100:
 
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
-            m_block, head_idx, batch_idx, _ = work_tile.tile_idx
+            m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
-            n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
+            n_block_min, n_block_max = block_info.get_n_block_min_max(
+                seqlen, m_block, split_idx=split_idx, num_splits=num_splits
+            )
             num_n_blocks = n_block_max - n_block_min
-            even_n_blocks = num_n_blocks % 2 == 0 and num_n_blocks > 0
-            num_n_block_groups = cute.ceil_div(num_n_blocks, self.num_stages_S)
+            # Split-kv: this split's slice of the n_block range can be empty (the
+            # per-split count is rounded up, so empties are the trailing splits).
+            # Every warp role skips the whole tile body together, which keeps all
+            # pipeline phases and raw-mbar phase counters consistent; the epilogue
+            # still writes LSE = -inf so the combine kernel can ignore this split.
+            has_work = const_expr(not self.is_split_kv) or n_block_min < n_block_max
+            if has_work:
+                even_n_blocks = num_n_blocks % 2 == 0 and num_n_blocks > 0
+                num_n_block_groups = cute.ceil_div(num_n_blocks, self.num_stages_S)
 
-            mask_fn = partial(
-                self.apply_mask,
-                tScS_t2r=tScS_t2r,
-                seqlen=seqlen,
-                m_block=m_block,
-                mask_causal=self.is_causal,
-            )
-
-            softmax = SoftmaxSm100.create(
-                softmax_scale_log2,
-                rescale_threshold=8.0 if const_expr(self.dtype_Qv.width == 16) else 0.0,
-            )
-            softmax.reset()
-
-            softmax_step_fn = partial(
-                self.softmax_step,
-                softmax,
-                sRowMax,
-                sScale,
-                tStS_t2r_staged,
-                tSrS_t2r,
-                sP_smem_view,
-                tmem_load_thr,
-                smem_store_thr,
-                pipeline_S,
-                pipeline_P,
-                pipeline_sm_stats,
-                tidx,
-                warp_idx,
-            )
-
-            ### first iteration ###
-            n_block = n_block_max - 1
-            (
-                consumer_state_S,
-                producer_state_P,
-                producer_state_sm_stats,
-            ) = softmax_step_fn(
-                consumer_state_S,
-                producer_state_P,
-                producer_state_sm_stats,
-                0,
-                n_block,
-                mask_fn=partial(mask_fn, mask_seqlen=True),
-                is_first=True,
-            )
-            n_block -= 1
-
-            ### Separate iterations with causal masking
-            # note: For square-ish tiles, at most ceil(tile_n / tile_m) extra blocks
-            # need causal masking beyond the first.
-            if const_expr(self.is_causal):
-                n_block_min_causal_local_mask = block_info.get_n_block_min_causal_local_mask(
-                    seqlen, m_block, n_block_min
+                mask_fn = partial(
+                    self.apply_mask,
+                    tScS_t2r=tScS_t2r,
+                    seqlen=seqlen,
+                    m_block=m_block,
+                    mask_causal=self.is_causal,
                 )
-                num_masked_n_blocks = n_block_max - 1 - n_block_min_causal_local_mask
-                num_masked_n_block_groups = min(
-                    num_n_block_groups - 1, cute.ceil_div(num_masked_n_blocks, self.num_stages_S)
+
+                softmax = SoftmaxSm100.create(
+                    softmax_scale_log2,
+                    rescale_threshold=8.0 if const_expr(self.dtype_Qv.width == 16) else 0.0,
                 )
-                num_n_block_groups -= num_masked_n_block_groups
-                for _ in cutlass.range(num_masked_n_block_groups, unroll=1):
+                softmax.reset()
+
+                softmax_step_fn = partial(
+                    self.softmax_step,
+                    softmax,
+                    sRowMax,
+                    sScale,
+                    tStS_t2r_staged,
+                    tSrS_t2r,
+                    sP_smem_view,
+                    tmem_load_thr,
+                    smem_store_thr,
+                    pipeline_S,
+                    pipeline_P,
+                    pipeline_sm_stats,
+                    tidx,
+                    warp_idx,
+                )
+
+                ### first iteration ###
+                n_block = n_block_max - 1
+                (
+                    consumer_state_S,
+                    producer_state_P,
+                    producer_state_sm_stats,
+                ) = softmax_step_fn(
+                    consumer_state_S,
+                    producer_state_P,
+                    producer_state_sm_stats,
+                    0,
+                    n_block,
+                    mask_fn=partial(mask_fn, mask_seqlen=True),
+                    is_first=True,
+                )
+                n_block -= 1
+
+                ### Separate iterations with causal masking
+                # note: For square-ish tiles, at most ceil(tile_n / tile_m) extra blocks
+                # need causal masking beyond the first.
+                if const_expr(self.is_causal):
+                    n_block_min_causal_local_mask = block_info.get_n_block_min_causal_local_mask(
+                        seqlen, m_block, n_block_min
+                    )
+                    # Clamp at 0: with split-kv this split's range can lie entirely below
+                    # the causal-mask boundary, making the difference negative. Left
+                    # unclamped it would SUBTRACT from num_n_block_groups below, so
+                    # softmax would wait on S stages the mma warp never produces.
+                    num_masked_n_blocks = cutlass.max(
+                        n_block_max - 1 - n_block_min_causal_local_mask, 0
+                    )
+                    num_masked_n_block_groups = cutlass.max(
+                        min(
+                            num_n_block_groups - 1,
+                            cute.ceil_div(num_masked_n_blocks, self.num_stages_S),
+                        ),
+                        0,
+                    )
+                    num_n_block_groups -= num_masked_n_block_groups
+                    for _ in cutlass.range(num_masked_n_block_groups, unroll=1):
+                        for stage in cutlass.range_constexpr(self.num_stages_S):
+                            (
+                                consumer_state_S,
+                                producer_state_P,
+                                producer_state_sm_stats,
+                            ) = softmax_step_fn(
+                                consumer_state_S,
+                                producer_state_P,
+                                producer_state_sm_stats,
+                                1 - stage,
+                                n_block,
+                                mask_fn=partial(mask_fn, mask_seqlen=False),
+                            )
+                            n_block -= 1
+
+                ### Mainloop ###
+                for _ in cutlass.range(num_n_block_groups - 1, unroll=1):
                     for stage in cutlass.range_constexpr(self.num_stages_S):
                         (
                             consumer_state_S,
@@ -2452,13 +2569,13 @@ class FlashAttentionMLAForward1CtaSm100:
                             producer_state_sm_stats,
                             1 - stage,
                             n_block,
-                            mask_fn=partial(mask_fn, mask_seqlen=False),
+                            mask_fn=None,
                         )
                         n_block -= 1
 
-            ### Mainloop ###
-            for _ in cutlass.range(num_n_block_groups - 1, unroll=1):
-                for stage in cutlass.range_constexpr(self.num_stages_S):
+                ### last iteration if even ###
+                # always mask to simplify logic
+                if even_n_blocks:
                     (
                         consumer_state_S,
                         producer_state_P,
@@ -2467,39 +2584,25 @@ class FlashAttentionMLAForward1CtaSm100:
                         consumer_state_S,
                         producer_state_P,
                         producer_state_sm_stats,
-                        1 - stage,
+                        1,
                         n_block,
-                        mask_fn=None,
+                        mask_fn=partial(mask_fn, mask_seqlen=False),
                     )
                     n_block -= 1
 
-            ### last iteration if even ###
-            # always mask to simplify logic
-            if even_n_blocks:
-                (
-                    consumer_state_S,
-                    producer_state_P,
-                    producer_state_sm_stats,
-                ) = softmax_step_fn(
-                    consumer_state_S,
-                    producer_state_P,
-                    producer_state_sm_stats,
-                    1,
-                    n_block,
-                    mask_fn=partial(mask_fn, mask_seqlen=False),
-                )
-                n_block -= 1
-
-            # write row max and sum to smem
-            sRowSum[tidx % self.cta_tile_m, warp_idx // self.num_acc_halves] = softmax.row_sum[0]
-            if const_expr(mLSE is not None):
-                if tidx < self.cta_tile_m:
-                    sRowMax[tidx, 0] = softmax.row_max[0]
-            self.sm_stats_barrier_full.arrive()
+                # write row max and sum to smem
+                sRowSum[tidx % self.cta_tile_m, warp_idx // self.num_acc_halves] = softmax.row_sum[0]
+                if const_expr(mLSE is not None):
+                    if tidx < self.cta_tile_m:
+                        sRowMax[tidx, 0] = softmax.row_max[0]
+                self.sm_stats_barrier_full.arrive()
 
             # Advance to next tile
             work_tile = tile_scheduler.advance_to_next_work()
-            self.sm_stats_barrier_empty.arrive_and_wait()
+            if has_work:
+                # Paired with the epilogue's arrive inside ITS has_work branch: an empty
+                # split must skip both halves of this 256-thread barrier.
+                self.sm_stats_barrier_empty.arrive_and_wait()
 
         pipeline_P.producer_tail(producer_state_P)
         pipeline_sm_stats.producer_tail(producer_state_sm_stats)
@@ -2600,6 +2703,7 @@ class FlashAttentionMLAForward1CtaSm100:
         tiled_copy_O_r2g: cute.TiledCopy,
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
+        num_splits: Int32,
         tile_scheduler: TileSchedulerProtocol,
     ):
         ### ==== correction/epilogue warpgroup ====
@@ -2668,168 +2772,212 @@ class FlashAttentionMLAForward1CtaSm100:
 
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
-            m_block, head_idx, batch_idx, _ = work_tile.tile_idx
+            m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
 
             seqlen = SeqlenInfoCls(batch_idx)
-            n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
+            n_block_min, n_block_max = block_info.get_n_block_min_max(
+                seqlen, m_block, split_idx=split_idx, num_splits=num_splits
+            )
             num_n_blocks = n_block_max - n_block_min
+            # Split-kv: this split's slice of the n_block range can be empty (the
+            # per-split count is rounded up, so empties are the trailing splits).
+            # Every warp role skips the whole tile body together, which keeps all
+            # pipeline phases and raw-mbar phase counters consistent; the epilogue
+            # still writes LSE = -inf so the combine kernel can ignore this split.
+            has_work = const_expr(not self.is_split_kv) or n_block_min < n_block_max
+            if has_work:
 
-            consumer_states_O = [consumer_state_O0, consumer_state_O1]
+                consumer_states_O = [consumer_state_O0, consumer_state_O1]
 
-            # acquire first signal and release immediately
-            pipeline_sm_stats.consumer_wait(consumer_state_sm_stats)
-            pipeline_sm_stats.consumer_release(consumer_state_sm_stats)
-            consumer_state_sm_stats.advance()
-
-            for _ in cutlass.range(num_n_blocks - 1, unroll=1):
+                # acquire first signal and release immediately
                 pipeline_sm_stats.consumer_wait(consumer_state_sm_stats)
-                scale = sScale[tidx % self.cta_tile_m, consumer_state_sm_stats.index]
-                should_rescale = cute.arch.vote_ballot_sync(scale < 1.0) != 0
                 pipeline_sm_stats.consumer_release(consumer_state_sm_stats)
                 consumer_state_sm_stats.advance()
+
+                for _ in cutlass.range(num_n_blocks - 1, unroll=1):
+                    pipeline_sm_stats.consumer_wait(consumer_state_sm_stats)
+                    scale = sScale[tidx % self.cta_tile_m, consumer_state_sm_stats.index]
+                    should_rescale = cute.arch.vote_ballot_sync(scale < 1.0) != 0
+                    pipeline_sm_stats.consumer_release(consumer_state_sm_stats)
+                    consumer_state_sm_stats.advance()
+
+                    for split in cutlass.range_constexpr(self.num_hdimv_splits):
+                        consumer_state_Oi = consumer_states_O[split]
+                        pipelines_O[split].consumer_wait(consumer_state_Oi)
+                        if should_rescale:
+                            do_correction_rescale(
+                                tOtOs_t2r[split],
+                                tOtOs_r2t[split],
+                                scale,
+                            )
+                        pipelines_O[split].consumer_release(consumer_state_Oi)
+                        consumer_state_Oi.advance()
+                        consumer_states_O[split] = consumer_state_Oi
+
+                # (seqlen_q, hdimv), or ((qhead_per_kvhead, seqlen_q), hdimv) when packed;
+                # split-kv writes this split's fp32 partial (trailing split mode)
+                mO_batch = seqlen.offset_batch_Q(mO, batch_idx, dim=3)
+                mO_cur = (
+                    mO_batch[None, None, head_idx]
+                    if const_expr(not self.is_split_kv)
+                    else mO_batch[None, None, head_idx, split_idx]
+                )
+                gO = None
+                if const_expr(self.use_tma_O):
+                    # (cta_tile_m, hdimv//2, 2)
+                    gO = cute.local_tile(
+                        mO_cur,
+                        (self.cta_tile_m, self.hdimv // self.num_hdimv_splits),
+                        (m_block, None),
+                    )
+                tOrOs_t2r = [
+                    cute.make_rmem_tensor(tOicOi_t2r.shape, self.dtype_acc)
+                    for split in range(self.num_hdimv_splits)
+                ]
+                tOrOs_r2g_f32 = [
+                    thr_tiled_copy_O_r2g.retile(tOrOs_t2r[split])
+                    for split in range(self.num_hdimv_splits)
+                ]
+                tOrOs_r2g = [
+                    cute.make_rmem_tensor_like(tOrOs_r2g_f32[split], self.dtype_O)
+                    for split in range(self.num_hdimv_splits)
+                ]
+                if const_expr(self.use_tma_O):
+                    tOsO = thr_tiled_copy_O_r2g.partition_D(sO)
+                    store_O, _, _ = copy_utils.tma_get_copy_fn(
+                        tma_atom_O,
+                        0,
+                        cute.make_layout(1),
+                        sO,
+                        gO,
+                    )
+
+                self.sm_stats_barrier_full.arrive_and_wait()
+
+                row_sum0 = sRowSum[tidx % self.cta_tile_m, 0]
+                row_sum1 = sRowSum[tidx % self.cta_tile_m, 1]
+                row_sum = row_sum0 + row_sum1
+                LN2 = math.log(2.0)
+                acc_O_mn_row_is_zero_or_nan = row_sum == 0.0 or row_sum != row_sum
+                scale = cute.arch.rcp_approx(row_sum if not acc_O_mn_row_is_zero_or_nan else 1.0)
+
+                row_max = 0.0
+                if const_expr(mLSE is not None):
+                    if tidx < self.cta_tile_m:
+                        row_max = sRowMax[tidx, 0]
+
+                self.sm_stats_barrier_empty.arrive()
+
+                seqlen_q = seqlen.seqlen_q
+
+                # compute and store lse to gmem
+                if const_expr(mLSE is not None):
+                    lse = (
+                        (row_max * softmax_scale_log2 + cute.math.log2(row_sum, fastmath=True)) * LN2
+                        if not acc_O_mn_row_is_zero_or_nan
+                        else -Float32.inf
+                    )
+                    self.store_lse(mLSE, seqlen, head_idx, batch_idx, split_idx, m_block, tidx, lse)
 
                 for split in cutlass.range_constexpr(self.num_hdimv_splits):
                     consumer_state_Oi = consumer_states_O[split]
                     pipelines_O[split].consumer_wait(consumer_state_Oi)
-                    if should_rescale:
-                        do_correction_rescale(
-                            tOtOs_t2r[split],
-                            tOtOs_r2t[split],
-                            scale,
-                        )
-                    pipelines_O[split].consumer_release(consumer_state_Oi)
-                    consumer_state_Oi.advance()
-                    consumer_states_O[split] = consumer_state_Oi
-
-            # (seqlen_q, hdimv), or ((qhead_per_kvhead, seqlen_q), hdimv) when packed
-            mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3)[None, None, head_idx]
-            gO = None
-            if const_expr(self.use_tma_O):
-                # (cta_tile_m, hdimv//2, 2)
-                gO = cute.local_tile(
-                    mO_cur,
-                    (self.cta_tile_m, self.hdimv // self.num_hdimv_splits),
-                    (m_block, None),
-                )
-            tOrOs_t2r = [
-                cute.make_rmem_tensor(tOicOi_t2r.shape, self.dtype_acc)
-                for split in range(self.num_hdimv_splits)
-            ]
-            tOrOs_r2g_f32 = [
-                thr_tiled_copy_O_r2g.retile(tOrOs_t2r[split])
-                for split in range(self.num_hdimv_splits)
-            ]
-            tOrOs_r2g = [
-                cute.make_rmem_tensor_like(tOrOs_r2g_f32[split], self.dtype_O)
-                for split in range(self.num_hdimv_splits)
-            ]
-            if const_expr(self.use_tma_O):
-                tOsO = thr_tiled_copy_O_r2g.partition_D(sO)
-                store_O, _, _ = copy_utils.tma_get_copy_fn(
-                    tma_atom_O,
-                    0,
-                    cute.make_layout(1),
-                    sO,
-                    gO,
-                )
-
-            self.sm_stats_barrier_full.arrive_and_wait()
-
-            row_sum0 = sRowSum[tidx % self.cta_tile_m, 0]
-            row_sum1 = sRowSum[tidx % self.cta_tile_m, 1]
-            row_sum = row_sum0 + row_sum1
-            acc_O_mn_row_is_zero_or_nan = row_sum == 0.0 or row_sum != row_sum
-            scale = cute.arch.rcp_approx(row_sum if not acc_O_mn_row_is_zero_or_nan else 1.0)
-
-            row_max = 0.0
-            if const_expr(mLSE is not None):
-                if tidx < self.cta_tile_m:
-                    row_max = sRowMax[tidx, 0]
-
-            self.sm_stats_barrier_empty.arrive()
-
-            seqlen_q = seqlen.seqlen_q
-
-            # compute and store lse to gmem
-            if const_expr(mLSE is not None):
-                # LSE is offset by hand (not via offset_batch_Q): its seqlen mode is 0
-                # but the tensor is rank-2/3 with no separate d mode, and under pack_gqa
-                # the offset must land on the q_pos sub-mode of the packed tuple.
-                if const_expr(not seqlen.has_cu_seqlens_q):
-                    mLSE_cur = mLSE[None, head_idx, batch_idx]
-                else:
-                    lse_offset = (
-                        seqlen.offset_q
-                        if const_expr(not self.pack_gqa)
-                        else (0, seqlen.offset_q)
-                    )
-                    mLSE_cur = cute.domain_offset((lse_offset,), mLSE[None, head_idx])
-                if tidx < self.cta_tile_m:
-                    LN2 = math.log(2.0)
-                    lse = (
-                        (row_max * softmax_scale_log2 + cute.math.log2(row_sum, fastmath=True))
-                        * LN2
-                        if not acc_O_mn_row_is_zero_or_nan
-                        else -Float32.inf
-                    )
-                    if const_expr(not self.pack_gqa):
-                        gLSE = cute.local_tile(mLSE_cur, (self.cta_tile_m,), (m_block,))
-                        if tidx < seqlen_q - m_block * self.cta_tile_m:
-                            gLSE[tidx] = lse
-                    else:
-                        # mLSE_cur is ((qhead_per_kvhead, seqlen_q),): scatter per packed row
-                        packed_row = m_block * self.cta_tile_m + tidx
-                        q_pos = packed_row // self.qhead_per_kvhead
-                        h_in_group = packed_row - q_pos * self.qhead_per_kvhead
-                        if q_pos < seqlen_q:
-                            mLSE_cur[((h_in_group, q_pos),)] = lse
-
-            for split in cutlass.range_constexpr(self.num_hdimv_splits):
-                consumer_state_Oi = consumer_states_O[split]
-                pipelines_O[split].consumer_wait(consumer_state_Oi)
-                # copy Oi tmem -> rmem
-                cute.copy(
-                    thr_tmem_load_O,
-                    tOtOs_t2r[split],
-                    tOrOs_t2r[split],
-                )
-
-                # scale and downcast Oi
-                tOrOs_r2g[split].store((tOrOs_r2g_f32[split].load() * scale).to(self.dtype_O))
-
-                if const_expr(not self.use_tma_O):
-                    # packed rows are scattered in gmem: store rmem -> gmem per row
-                    self.store_O_packed(
-                        mO_cur, tOrOs_r2g[split], tidx, m_block, split, seqlen_q
-                    )
-                else:
-                    # copy Oi rmem -> smem
+                    # copy Oi tmem -> rmem
                     cute.copy(
-                        thr_tiled_copy_O_r2g,
-                        tOrOs_r2g[split],
-                        tOsO[None, None, None, split],
+                        thr_tmem_load_O,
+                        tOtOs_t2r[split],
+                        tOrOs_t2r[split],
                     )
-                    cute.arch.fence_view_async_shared()
-                    self.epi_barrier.arrive_and_wait()
-                    # tma store Oi smem -> gmem
-                    if leader_warp:
-                        store_O(src_idx=split, dst_idx=split)
-                        cute.arch.cp_async_bulk_commit_group()
-                        cute.arch.cp_async_bulk_wait_group(1 - split, read=True)
-                        if const_expr(split == self.num_hdimv_splits - 1):
-                            with cute.arch.elect_one():
-                                cute.arch.mbarrier_arrive(sO_empty_mbar_ptr)
 
-            consumer_state_O0, consumer_state_O1 = consumer_states_O
+                    # scale and downcast Oi
+                    tOrOs_r2g[split].store((tOrOs_r2g_f32[split].load() * scale).to(self.dtype_O))
 
-            cute.arch.fence_view_async_tmem_load()
-            pipeline_O0.consumer_release(consumer_state_O0)
-            pipeline_O1.consumer_release(consumer_state_O1)
-            consumer_state_O0.advance()
-            consumer_state_O1.advance()
+                    if const_expr(not self.use_tma_O):
+                        # packed rows are scattered in gmem: store rmem -> gmem per row
+                        self.store_O_packed(
+                            mO_cur, tOrOs_r2g[split], tidx, m_block, split, seqlen_q
+                        )
+                    else:
+                        # copy Oi rmem -> smem
+                        cute.copy(
+                            thr_tiled_copy_O_r2g,
+                            tOrOs_r2g[split],
+                            tOsO[None, None, None, split],
+                        )
+                        cute.arch.fence_view_async_shared()
+                        self.epi_barrier.arrive_and_wait()
+                        # tma store Oi smem -> gmem
+                        if leader_warp:
+                            store_O(src_idx=split, dst_idx=split)
+                            cute.arch.cp_async_bulk_commit_group()
+                            cute.arch.cp_async_bulk_wait_group(1 - split, read=True)
+                            if const_expr(split == self.num_hdimv_splits - 1):
+                                with cute.arch.elect_one():
+                                    cute.arch.mbarrier_arrive(sO_empty_mbar_ptr)
+
+                consumer_state_O0, consumer_state_O1 = consumer_states_O
+
+                cute.arch.fence_view_async_tmem_load()
+                pipeline_O0.consumer_release(consumer_state_O0)
+                pipeline_O1.consumer_release(consumer_state_O1)
+                consumer_state_O0.advance()
+                consumer_state_O1.advance()
+            else:
+                # Empty split: no O to reduce, but the combine kernel keys off LSE, so
+                # this split must be marked dead. O_partial is left unwritten (combine
+                # never reads a split whose LSE is -inf).
+                if const_expr(mLSE is not None):
+                    self.store_lse(
+                        mLSE, seqlen, head_idx, batch_idx, split_idx, m_block, tidx,
+                        -Float32.inf,
+                    )
 
             # Advance to next tile
             work_tile = tile_scheduler.advance_to_next_work()
+
+    @cute.jit
+    def store_lse(
+        self,
+        mLSE: cute.Tensor,
+        seqlen: SeqlenInfoQK,
+        head_idx: Int32,
+        batch_idx: Int32,
+        split_idx: Int32,
+        m_block: Int32,
+        tidx: Int32,
+        lse: Float32,
+    ):
+        """Store one row's LSE. Offsets are hand-rolled (not offset_batch_Q): the seqlen
+        mode is 0 but there is no d mode, and under pack_gqa the offset must land on the
+        q_pos sub-mode of the packed tuple. Split-kv adds a trailing split mode."""
+        if const_expr(not seqlen.has_cu_seqlens_q):
+            mLSE_cur = (
+                mLSE[None, head_idx, batch_idx]
+                if const_expr(not self.is_split_kv)
+                else mLSE[None, head_idx, batch_idx, split_idx]
+            )
+        else:
+            lse_offset = (
+                seqlen.offset_q if const_expr(not self.pack_gqa) else (0, seqlen.offset_q)
+            )
+            mLSE_head = (
+                mLSE[None, head_idx]
+                if const_expr(not self.is_split_kv)
+                else mLSE[None, head_idx, split_idx]
+            )
+            mLSE_cur = cute.domain_offset((lse_offset,), mLSE_head)
+        if tidx < self.cta_tile_m:
+            if const_expr(not self.pack_gqa):
+                gLSE = cute.local_tile(mLSE_cur, (self.cta_tile_m,), (m_block,))
+                if tidx < seqlen.seqlen_q - m_block * self.cta_tile_m:
+                    gLSE[tidx] = lse
+            else:
+                # mLSE_cur is ((qhead_per_kvhead, seqlen_q),): scatter per packed row
+                packed_row = m_block * self.cta_tile_m + tidx
+                q_pos = packed_row // self.qhead_per_kvhead
+                h_in_group = packed_row - q_pos * self.qhead_per_kvhead
+                if q_pos < seqlen.seqlen_q:
+                    mLSE_cur[((h_in_group, q_pos),)] = lse
 
     @cute.jit
     def store_O_packed(
