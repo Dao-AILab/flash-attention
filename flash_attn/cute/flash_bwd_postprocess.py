@@ -416,13 +416,13 @@ class FlashAttentionBackwardPostprocess:
                 num_warps = self.num_threads // cute.arch.WARP_SIZE
                 if lane_idx == 0:
                     sdQaccum_flat[warp_idx] = sink_sum
-                cute.arch.barrier(barrier_id=5, number_of_threads=self.num_threads)
+                cute.arch.sync_threads()
                 if warp_idx == 0:
                     sink_sum = sdQaccum_flat[lane_idx] if lane_idx < num_warps else Float32(0.0)
                     sink_sum = utils.warp_reduce(sink_sum, operator.add)
                     if lane_idx == 0:
                         mdSink[sink_head_idx] = sink_sum.to(mdSink.element_type)
-                cute.arch.barrier(barrier_id=5, number_of_threads=self.num_threads)
+                cute.arch.sync_threads()
 
         if work_tile.is_valid_tile:
             # ///////////////////////////////////////////////////////////////////////////////
