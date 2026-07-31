@@ -133,6 +133,7 @@ class CuSeqlensToBlocksKernel:
                     total_split_blocks_for_batch += warp_split_count[idx]
 
             if batch_idx < batch_size:
+                mCuBlocks[chunk * self.num_threads + tidx + 1] = total_blocks_for_batch
                 if const_expr(has_splits):
                     mCuSplitsBlocks[chunk * self.num_threads + tidx + 1] = (
                         total_split_blocks_for_batch

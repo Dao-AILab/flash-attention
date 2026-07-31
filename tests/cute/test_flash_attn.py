@@ -1104,14 +1104,16 @@ def test_flash_attn_varlen_output(
 def test_flash_attn_varlen_cumsum_metadata_paths(causal, cumsum_mode, qhead_per_kvhead):
     """Exercise the cu_total_m_blocks fast paths end-to-end.
 
-    - "jit_cumsum": batch_size > 512 varlen, no scheduler_metadata. Triggers
-      the just-in-time host cumsum in _flash_attn_fwd and the hoisted Q/K
-      cumsum in _flash_attn_bwd.
+    All modes use batch_size > BIN_BATCH_SEARCH_THRESH, since that is the only
+    regime in which the binary-search hint is produced or consumed.
+
+    - "jit_cumsum": no scheduler_metadata. Triggers the just-in-time host cumsum
+      in _flash_attn_fwd and the hoisted Q/K cumsum in _flash_attn_bwd.
     - "metadata_cumsum_only": scheduler_metadata from get_scheduler_metadata
       with num_splits=1 — skips the FlashPrepareScheduler kernel and returns
       only cu_total_m_blocks. Fwd reads it from scheduler_metadata.
     - "metadata_full": scheduler_metadata with num_splits>1 (SM100 only).
-      Runs the full prepare kernel and populates both cu_total tensors.
+      Runs the full prepare kernel.
     """
     if cumsum_mode == "metadata_full" and (IS_SM90 or DISABLE_SPLIT):
         pytest.skip("split-kv not yet implemented on SM90")
@@ -1119,10 +1121,7 @@ def test_flash_attn_varlen_cumsum_metadata_paths(causal, cumsum_mode, qhead_per_
     torch.manual_seed(0)
     random.seed(0)
 
-    if cumsum_mode == "jit_cumsum":
-        batch_size = 600
-    else:
-        batch_size = 64
+    batch_size = 600
     seqlen_q = seqlen_k = 64
     nheads_kv = 4
     nheads = nheads_kv * qhead_per_kvhead
@@ -1186,14 +1185,18 @@ def test_flash_attn_varlen_cumsum_metadata_paths(causal, cumsum_mode, qhead_per_
         )
         if is_fake_mode():
             return
-        assert scheduler_metadata.cu_total_m_blocks is not None
+        # The hint is only computed for the single-tile varlen scheduler, i.e. when
+        # no tile_count_semaphore was allocated (num_splits == 1 and not causal).
+        if scheduler_metadata.tile_count_semaphore is None:
+            assert scheduler_metadata.cu_total_m_blocks is not None
+        else:
+            assert scheduler_metadata.cu_total_m_blocks is None
         if cumsum_mode == "metadata_cumsum_only" and not causal:
             # FlashPrepareScheduler is skipped only when num_splits == 1 and not causal and not sort.
             assert scheduler_metadata.num_m_blocks_ptr is None
             assert scheduler_metadata.tile_count_semaphore is None
         if cumsum_mode == "metadata_full":
             assert scheduler_metadata.num_m_blocks_ptr is not None
-            assert scheduler_metadata.cu_total_splits_m_blocks is not None
 
     out_ref, _ = attention_ref(
         q_ref, k_ref, v_ref, query_padding_mask, key_padding_mask, causal=causal
@@ -3244,4 +3247,81 @@ def test_flash_attn_ex2_emu_decode_prefill_consistency(seqlen_k):
     print(f"decode↔prefill max diff: {max_diff}")
     assert torch.equal(out_prefill[-1], out_decode[0]), (
         f"decode↔prefill diverged: max_diff={max_diff}."
+    )
+
+
+@pytest.mark.skipif(not IS_SM100, reason="SplitKV is only supported on SM100")
+@pytest.mark.skipif(DISABLE_SPLIT, reason="SplitKV disabled")
+@pytest.mark.parametrize("causal", [False, True])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_varlen_seqlen_k_per_split(causal):
+    """seqlen_k_per_split pins each split to a fixed KV extent.
+
+    seqlens[0] is deliberately not a multiple of either split size, and both
+    sizes yield the same num_splits_dynamic (5). So they agree on how many
+    splits to launch and differ only in where the split boundaries fall:
+    {8,8,8,8,1} blocks vs {7,7,7,7,5}. If the kernel ignored the requested
+    extent and fell back to ceil(n_blocks / num_splits_dynamic), both would
+    use 7 and the two outputs would be bitwise identical.
+
+    Also checks the batch invariance this buys: a sequence's split boundaries,
+    and hence its output bitwise, do not depend on its companions.
+    """
+    device = "cuda"
+    dtype = torch.bfloat16
+    d = 128
+    nheads = nheads_kv = 4
+    num_splits = 8
+    # Longest first so max_seqlen_k (and hence the tile config) matches across calls.
+    seqlens = [4224, 1024, 2048]
+
+    torch.random.manual_seed(0)
+    qs = [torch.randn(s, nheads, d, device=device, dtype=dtype) for s in seqlens]
+    ks = [torch.randn(s, nheads_kv, d, device=device, dtype=dtype) for s in seqlens]
+    vs = [torch.randn(s, nheads_kv, d, device=device, dtype=dtype) for s in seqlens]
+
+    def run(n, seqlen_k_per_split):
+        cu = torch.tensor([0] + list(itertools.accumulate(seqlens[:n])),
+                          dtype=torch.int32, device=device)
+        out, _ = flash_attn_varlen_func(
+            torch.cat(qs[:n]), torch.cat(ks[:n]), torch.cat(vs[:n]),
+            cu_seqlens_q=cu, cu_seqlens_k=cu,
+            max_seqlen_q=seqlens[0], max_seqlen_k=seqlens[0],
+            causal=causal,
+            num_splits=num_splits,
+            seqlen_k_per_split=seqlen_k_per_split,
+        )
+        return out
+
+    out_1024 = run(1, 1024)
+    out_896 = run(1, 896)
+    out_1024_batched = run(len(seqlens), 1024)
+
+    if is_fake_mode():
+        return
+
+    out_ref, _ = attention_ref(
+        qs[0].unsqueeze(0), ks[0].unsqueeze(0), vs[0].unsqueeze(0), causal=causal
+    )
+    out_pt, _ = attention_ref(
+        qs[0].unsqueeze(0), ks[0].unsqueeze(0), vs[0].unsqueeze(0), causal=causal,
+        upcast=False, reorder_ops=True,
+    )
+    # Catches a split extent that silently drops or double-counts KV blocks.
+    pt_err = (out_pt - out_ref).abs().max().item()
+    for name, out in [("1024", out_1024), ("896", out_896)]:
+        err = (out.unsqueeze(0) - out_ref).abs().max().item()
+        assert err <= 2 * pt_err + 1e-4, (
+            f"seqlen_k_per_split={name} inaccurate: {err} vs pytorch {pt_err}."
+        )
+
+    assert not torch.equal(out_1024, out_896), (
+        "seqlen_k_per_split did not reach the kernel: split sizes 1024 and 896 "
+        "produced bitwise identical output."
+    )
+
+    first = out_1024_batched[: seqlens[0]]
+    max_diff = (out_1024 - first).abs().max().item()
+    assert torch.equal(out_1024, first), (
+        f"seqlen_k_per_split not batch-invariant: max_diff={max_diff}."
     )

@@ -1044,6 +1044,7 @@ def _flash_attn_fwd(
         tile_count_semaphore is not None,
         cu_total_m_blocks is not None,
         cu_total_splits_m_blocks is not None,
+        seqlen_k_per_split,
         is_static_persistent,
         q is not None,
         qv is not None,
@@ -1241,6 +1242,7 @@ def _flash_attn_fwd(
                     kv_subtile_factor=kv_subtile_factor,
                     use_2cta_instrs=use_2cta_instrs,
                     use_clc_scheduler=use_clc_scheduler,
+                    seqlen_k_per_split=seqlen_k_per_split,
                 )
                 if not use_dedicated_hd256_kernel:
                     fa_fwd_kwargs["has_tile_count_semaphore"] = tile_count_semaphore is not None
@@ -3318,7 +3320,7 @@ def flash_attn_varlen_func(
 
 
 def _compile_fwd_combine(
-    dtype, dtype_partial, head_dim, tile_m, k_block_size, log_max_splits,
+    dtype, dtype_partial, head_dim, num_head, tile_m, k_block_size, log_max_splits,
     has_cu_seqlens, has_seqused, has_lse, has_virtual_batch_idx,
     has_num_splits_dynamic, has_semaphore_to_reset,
 ):
@@ -3330,6 +3332,7 @@ def _compile_fwd_combine(
         dtype=dtype,
         dtype_partial=dtype_partial,
         head_dim=head_dim,
+        num_head=num_head,
         tile_m=tile_m,
         k_block_size=k_block_size,
         log_max_splits=log_max_splits,
@@ -3425,6 +3428,7 @@ def _flash_attn_fwd_combine(
                 assert t.is_cuda, f"{name} must be on CUDA device"
             assert t.is_contiguous(), f"{name} must be contiguous"
     head_dim = out_partial.shape[-1]
+    num_head = out_partial.shape[-2]
     num_splits = out_partial.shape[0]
     assert num_splits <= 256
     # If hdim is 96 or 192, it's faster to round them to 128 or 256 respectively
@@ -3446,6 +3450,7 @@ def _flash_attn_fwd_combine(
         dtype,
         dtype_partial,
         head_dim,
+        num_head,
         tile_m,
         k_block_size,
         log_max_splits,
@@ -3608,6 +3613,12 @@ def _get_scheduler_metadata(
     if seqlen_k_per_split is not None:
         assert seqlen_k_per_split % tile_n == 0, "seqlen per split must be divisible by tile_n"
         n_blocks_per_split = seqlen_k_per_split // tile_n
+        n_blocks_total = (max_seqlen_k + seqlen_k_new + tile_n - 1) // tile_n
+        splits_needed = (n_blocks_total + n_blocks_per_split - 1) // n_blocks_per_split
+        assert num_splits >= splits_needed, (
+            f"seqlen_k_per_split={seqlen_k_per_split} needs num_splits>={splits_needed}, "
+            f"got {num_splits}"
+        )
     else:
         n_blocks_per_split = None
 
