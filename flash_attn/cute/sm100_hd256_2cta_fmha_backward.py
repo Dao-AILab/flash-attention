@@ -57,7 +57,6 @@ class BlackwellFusedMultiHeadAttentionBackward:
         assert head_dim == 256 and head_dim_v == 256, (
             "SM100 dedicated backward kernel only supports (head_dim, head_dim_v) = (256, 256)"
         )
-        assert not is_local, "SM100 backward with head_dim=256 does not support local attention"
         assert tile_m_dq == 128 and tile_n_dq == 128, (
             "SM100 dedicated backward kernel only supports tile_m_dq=128 and tile_n_dq=128"
         )
