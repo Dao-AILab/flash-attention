@@ -703,10 +703,35 @@ def _flash_attn_fwd(
         assert head_dim_v == 512
         assert q is None or head_dim == 64
         assert not local, "local not yet supported with qv"
-        assert q_descale is None and k_descale is None and v_descale is None, (
-            "q_descale/k_descale/v_descale are not yet supported with qv"
-        )
+        if not mla_1cta:
+            assert q_descale is None and k_descale is None and v_descale is None, (
+                "q_descale/k_descale/v_descale with qv are only supported by the 1CTA "
+                "MLA kernel (FLASH_ATTENTION_MLA_1CTA=1)"
+            )
+        elif q is not None and (k_descale is not None or v_descale is not None):
+            # MLA absorbed applies q_descale to BOTH Q and Qv, and both S contributions
+            # (Q@K^T and Qv@V^T) land in ONE accumulator, so a single folded softmax
+            # scale is only correct when k_descale == v_descale. That is the natural
+            # case for MLA: the rope-K and latent-V halves live in one quantized cache.
+            assert k_descale is not None and v_descale is not None, (
+                "MLA absorbed needs k_descale and v_descale together (or neither)"
+            )
+            assert torch.equal(k_descale, v_descale), (
+                "MLA absorbed requires k_descale == v_descale: Q@K^T and Qv@V^T share "
+                "one accumulator, so their descales must fold into one softmax scale"
+            )
         assert tile_n == 128
+        if mla_1cta and (q_descale is not None or k_descale is not None
+                         or v_descale is not None):
+            # Fill in any missing descales with ones: a partially-filled DescaleTensors
+            # shifts positionally when it crosses the MLIR boundary
+            # (__new_from_mlir_values__ pads the TAIL with None), which would silently
+            # drop a member. All-three-or-none keeps the marshalling unambiguous.
+            ones = torch.ones(batch_size, num_head_kv, dtype=torch.float32,
+                              device=v.device)
+            q_descale = ones if q_descale is None else q_descale
+            k_descale = ones if k_descale is None else k_descale
+            v_descale = ones if v_descale is None else v_descale
 
         assert not is_split_kv or mla_1cta, (
             "split kv with qv is only supported by the 1CTA MLA kernel "
@@ -1076,6 +1101,7 @@ def _flash_attn_fwd(
                 seqused_k_tensor,
                 gather_kv_indices_tensor,
                 page_table_tensor,
+                descale_tensors_tensor,
                 window_size_left,
                 window_size_right,
                 current_stream,
@@ -1143,6 +1169,7 @@ def _flash_attn_fwd(
                 seqused_k,
                 gather_kv_indices,
                 page_table,
+                descale_tensors,
                 window_size_left,
                 window_size_right,
             )

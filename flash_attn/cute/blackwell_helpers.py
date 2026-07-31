@@ -631,17 +631,18 @@ def cp_smem_to_tmem_dup_64(
     tmem_addr: Int32,
     num_rows: int = 64,
 ) -> None:
-    """SMEM -> TMEM copy of a (num_rows <= 64, K) 16-bit tile, duplicated across lane halves.
+    """SMEM -> TMEM copy of a (num_rows <= 64, K) tile, duplicated across lane halves.
 
     Emits `tcgen05.cp.cta_group::1.64x128b.warpx2::02_13`, which lands source row m at
-    BOTH TMEM lane m and lane m + 64, packing two 16-bit elements per 32-bit word
-    (element k at word k // 2, low half for even k). That is exactly the A-operand
-    layout an M=64 `tcgen05.mma.ws` reads (PTX "Layout E" data path), so this is the
-    one-instruction way to stage a weight-stationary A operand into TMEM.
+    BOTH TMEM lane m and lane m + 64. It is a raw bit blit, so the packing follows the
+    element width: `32 // width` elements per 32-bit word (16-bit: element k at word
+    k // 2, low half for even k; 8-bit: word k // 4, byte k % 4). That is exactly the
+    A-operand layout an M=64 `tcgen05.mma.ws` reads (PTX "Layout E" data path), so this
+    is the one-instruction way to stage a weight-stationary A operand into TMEM.
 
-    Each instruction moves 128 bits (8 elements) per row, so K // 8 instructions are
-    emitted. `tmem_addr` must be a TMEM address whose lane is 0; the destination
-    occupies K // 2 columns starting there.
+    Each instruction moves 128 bits (`128 // width` elements) per row, so
+    K // (128 // width) instructions are emitted. `tmem_addr` must be a TMEM address
+    whose lane is 0; the destination occupies `K * width // 32` columns starting there.
 
     Ordering: `tcgen05.cp -> tcgen05.mma` issued by the same thread is a PTX-guaranteed
     pipeline pair, so no explicit wait is needed before a dependent mma from this thread.
@@ -649,11 +650,14 @@ def cp_smem_to_tmem_dup_64(
 
     Must be called by exactly one warp (an elect.sync inside picks the issuing thread).
     """
-    assert sX.element_type.width == 16, "only 16-bit element types are supported"
+    width: int = const_expr(sX.element_type.width)
+    assert width in (8, 16), "only 8-bit and 16-bit element types are supported"
     assert num_rows <= 64, "the .64x128b copy shape covers at most 64 rows"
     layout = sX.layout.outer if isinstance(sX.layout, cute.ComposedLayout) else sX.layout
     k_size: int = const_expr(cute.size(layout.shape[1]))
-    assert k_size % 8 == 0, "K must be a multiple of 8 (128 bits per row per copy)"
+    # elements moved per row per instruction (128 bits)
+    elems: int = const_expr(128 // width)
+    assert k_size % elems == 0, f"K must be a multiple of {elems} (128 bits per row per copy)"
     desc_base: int = const_expr(
         sm100_desc.make_smem_desc_base(
             cute.recast_layout(128, sX.element_type.width, layout),
@@ -664,11 +668,12 @@ def cp_smem_to_tmem_dup_64(
     desc_lo_base, desc_hi = i64_to_i32x2(desc_base)
     desc_hi = const_expr(desc_hi)
     desc_lo = Int32(const_expr(desc_lo_base) | sm100_desc.make_smem_desc_start_addr(sX.iterator))
-    # Per chunk of 8 elements along K: TMEM destination advances 4 columns (words), and
-    # the descriptor start address advances by the chunk's byte offset in 16B units.
+    # Per chunk of `elems` elements along K: TMEM destination advances 4 columns (128
+    # bits = 4 words, any dtype), and the descriptor start address advances by the
+    # chunk's byte offset in 16B units.
     steps = tuple(
-        (4 * c, (cute.crd2idx((0, 8 * c), layout) * sX.element_type.width // 8) >> 4)
-        for c in range(k_size // 8)
+        (4 * c, (cute.crd2idx((0, elems * c), layout) * width // 8) >> 4)
+        for c in range(k_size // elems)
     )
     body = (
         "{\n\t"
