@@ -75,6 +75,7 @@ def check_tensor_vs_ref(name, actual, ref, pt, rtol=2, atol=None):
     diff_pt_max = (pt - ref).abs().max().item()
     assert diff_max <= rtol * diff_pt_max + atol, f"{name}: {diff_max=} too large compared to {diff_pt_max=} for {rtol=}, {atol=}"
 
+
 # torch FakeTensorMode would enable fast cutedsl kernel compilation without allocating the actual GPU memory or running the kernel
 # When operating fake tensors, we cannot perform data-dependent operations (e.g., `tensor.max()`).
 USE_FAKE_TENSOR = int(os.getenv("FLASH_ATTENTION_FAKE_TENSOR", 0)) == 1
@@ -178,17 +179,6 @@ def test_flash_attn_output(
         pytest.xfail("has_qv: local not supported yet")
     if has_qv and has_learnable_sink:
         pytest.xfail("has_qv: learnable sink not supported yet")
-    # TODO(wangsiyu): SM100 head_dim=256 2CTA kernel currently does not support the following features.
-    # Remove these skips when support is added.
-    if d == 256 and IS_SM100:
-        if has_learnable_sink:
-            pytest.skip("SM100 head_dim=256 2CTA kernel does not support learnable_sink yet")
-        if local:
-            pytest.skip("SM100 head_dim=256 2CTA kernel does not support local attention yet")
-        if softcap > 0.0:
-            pytest.skip("SM100 head_dim=256 2CTA kernel does not support softcap yet")
-        if deterministic:
-            pytest.skip("SM100 head_dim=256 2CTA kernel does not support deterministic mode yet")
     device = "cuda"
     # set seed
     seed = 0
@@ -545,8 +535,8 @@ def test_flash_attn_hd256_sm100_noncontiguous_transpose():
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 # @pytest.mark.parametrize("mha_type", ["mha"])
-# @pytest.mark.parametrize("has_learnable_sink", [False, True])
-@pytest.mark.parametrize("has_learnable_sink", [False])
+@pytest.mark.parametrize("has_learnable_sink", [False, True])
+# @pytest.mark.parametrize("has_learnable_sink", [False])
 # @pytest.mark.parametrize("has_qv", [False, True])
 @pytest.mark.parametrize("has_qv", [False])
 @pytest.mark.parametrize("deterministic", [False, True])
@@ -641,19 +631,6 @@ def test_flash_attn_varlen_output(
     local = local_enum > 0
     if local and causal:
         pytest.skip()
-    # TODO(wangsiyu): SM100 head_dim=256 2CTA kernel currently does not support the following features.
-    # Remove these skips when support is added.
-    if d == 256 and IS_SM100:
-        if has_learnable_sink:
-            pytest.skip("SM100 head_dim=256 2CTA kernel does not support learnable_sink yet")
-        if local:
-            pytest.skip("SM100 head_dim=256 2CTA kernel does not support local attention yet")
-        if softcap > 0.0:
-            pytest.skip("SM100 head_dim=256 2CTA kernel does not support softcap yet")
-        if deterministic:
-            pytest.skip("SM100 head_dim=256 2CTA kernel does not support deterministic mode yet")
-        if not unpad_q or not unpad_kv:
-            pytest.skip("SM100 head_dim=256 2CTA kernel does not support seqused_q/seqused_k mode yet (requires unpad_q=True and unpad_kv=True)")
     if (
         causal or local
     ):  # Right now reference only supports causal attention with seqlen_k == seqlen_q
@@ -936,9 +913,10 @@ def test_flash_attn_varlen_output(
             and (
                 (dv == d and d <= 128)
                 or (d == 192 and dv == 128)
-                or (IS_SM100 and d == 256 and dv == 256 and softcap == 0.0)
+                or (IS_SM100 and d == 256 and dv == 256)
             )
             and not has_learnable_sink
+            and (softcap == 0.0 or (IS_SM100 and d == 256 and dv == 256))
             # and False
         ):
             if d > 192 and IS_SM90:
@@ -1631,7 +1609,7 @@ def test_flash_attn_kvcache(
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("d", [64, 128, 256])
 @pytest.mark.parametrize("seqlen_q,seqlen_k", [(128, 128), (256, 256)])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_bwd_preallocated_outputs(seqlen_q, seqlen_k, d, causal, dtype):
@@ -1670,7 +1648,7 @@ def test_flash_attn_bwd_preallocated_outputs(seqlen_q, seqlen_k, d, causal, dtyp
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("d", [64, 128])
+@pytest.mark.parametrize("d", [64, 128, 256])
 @pytest.mark.parametrize("seqlen_q,seqlen_k", [(128, 128), (256, 256)])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_lse_grad(seqlen_q, seqlen_k, d, causal, dtype):
@@ -1750,7 +1728,7 @@ def test_flash_attn_lse_grad(seqlen_q, seqlen_k, d, causal, dtype):
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("d", [128])
+@pytest.mark.parametrize("d", [128, 256])
 @pytest.mark.parametrize("seqlen_q,seqlen_k", [(128, 128)])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_lse_grad_unused(seqlen_q, seqlen_k, d, causal, dtype):
@@ -2904,7 +2882,7 @@ def test_flash_attn_mla_paged(dtype, seqlen_q, seqlen_k, page_size, causal, has_
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("d", [128, 192])
+@pytest.mark.parametrize("d", [128, 192, 256])
 @pytest.mark.parametrize("seqlen_q", [1, 64, 128, 256])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_seqlen_k_zero(seqlen_q, d, causal):
@@ -2974,8 +2952,9 @@ def test_flash_attn_seqlen_k_zero(seqlen_q, d, causal):
     ],
 )
 @pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("d", [128, 256])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_flash_attn_empty_q_dense(shape, causal):
+def test_flash_attn_empty_q_dense(shape, causal, d):
     """Dense (non-varlen) path must not raise ZeroDivisionError when Q is empty.
 
     num_splits_heuristic divides num_SMs by total_mblocks = batch_size * num_head_kv
@@ -2987,7 +2966,6 @@ def test_flash_attn_empty_q_dense(shape, causal):
     batch_size, seqlen_q = shape
     device = "cuda"
     dtype = torch.bfloat16
-    d = 128
     nheads = 16
     nheads_kv = 16
     # Pick seqlen_k large enough that num_n_blocks > 4 so the heuristic's own
@@ -3015,8 +2993,9 @@ def test_flash_attn_empty_q_dense(shape, causal):
 
 
 @pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("d", [128, 256])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_flash_attn_empty_q_varlen(causal):
+def test_flash_attn_empty_q_varlen(causal, d):
     """Varlen path must not raise ZeroDivisionError when total_q == 0.
 
     Parallels test_flash_attn_empty_q_dense for the cu_seqlens_q path, where
@@ -3025,7 +3004,6 @@ def test_flash_attn_empty_q_varlen(causal):
     """
     device = "cuda"
     dtype = torch.bfloat16
-    d = 128
     nheads = 16
     nheads_kv = 16
     batch_size = 2

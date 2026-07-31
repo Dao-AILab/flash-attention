@@ -201,10 +201,11 @@ def run_flex_reference(q, k, v, eager_score_mod, dtype=None) -> torch.Tensor:
 
 @pytest.mark.parametrize("seqlen_q,seqlen_kv", SEQLEN_CONFIGS)
 @pytest.mark.parametrize("qhead_per_kvhead,num_kv_heads", [(1, 2), (4, 2)])
+@pytest.mark.parametrize("dim", [128, 256])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("score_mod_pair", TEST_PAIRS)
 def test_cute_vs_flex_attention(
-    seqlen_q, seqlen_kv, qhead_per_kvhead, num_kv_heads, dtype, score_mod_pair
+    seqlen_q, seqlen_kv, qhead_per_kvhead, num_kv_heads, dim, dtype, score_mod_pair
 ):
     torch.random.manual_seed(42)
     cute_score_mod, eager_score_mod = score_mod_pair
@@ -212,7 +213,11 @@ def test_cute_vs_flex_attention(
     num_q_heads = num_kv_heads * qhead_per_kvhead
     pack_gqa = qhead_per_kvhead > 1
     q, k, v = create_tensors(
-        seqlen_q=seqlen_q, seqlen_kv=seqlen_kv, num_heads=num_q_heads, dtype=dtype
+        seqlen_q=seqlen_q,
+        seqlen_kv=seqlen_kv,
+        num_heads=num_q_heads,
+        dim=dim,
+        dtype=dtype,
     )
     if pack_gqa:
         k = k[:, :num_kv_heads, :, :].clone()
@@ -254,6 +259,7 @@ def test_cute_vs_flex_attention(
 
 @pytest.mark.parametrize("seqlen_q,seqlen_kv", SEQLEN_CONFIGS)
 @pytest.mark.parametrize("qhead_per_kvhead,num_kv_heads", [(1, 1), (4, 2)])
+@pytest.mark.parametrize("dim", [128, 256])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("score_mod_vec_pair", TEST_PAIRS_VECTORIZED)
 def test_cute_score_mod_vectorized(
@@ -261,6 +267,7 @@ def test_cute_score_mod_vectorized(
     seqlen_kv,
     qhead_per_kvhead,
     num_kv_heads,
+    dim,
     dtype,
     score_mod_vec_pair,
 ):
@@ -271,7 +278,11 @@ def test_cute_score_mod_vectorized(
     num_q_heads = num_kv_heads * qhead_per_kvhead
     pack_gqa = qhead_per_kvhead > 1
     q, k, v = create_tensors(
-        seqlen_q=seqlen_q, seqlen_kv=seqlen_kv, num_heads=num_q_heads, dtype=dtype
+        seqlen_q=seqlen_q,
+        seqlen_kv=seqlen_kv,
+        num_heads=num_q_heads,
+        dim=dim,
+        dtype=dtype,
     )
     if pack_gqa:
         k = k[:, :num_kv_heads, :, :].clone()
@@ -290,10 +301,11 @@ def test_cute_score_mod_vectorized(
 
 @pytest.mark.parametrize("seqlen_q,seqlen_kv", SEQLEN_CONFIGS)
 @pytest.mark.parametrize("qhead_per_kvhead,num_kv_heads", [(1, 1), (4, 2)])
+@pytest.mark.parametrize("dim", [128, 256])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("score_mod_pair", TEST_PAIRS_WITH_AUX_TENSORS)
 def test_cute_vs_flex_attention_with_aux_tensors(
-    seqlen_q, seqlen_kv, qhead_per_kvhead, num_kv_heads, dtype, score_mod_pair
+    seqlen_q, seqlen_kv, qhead_per_kvhead, num_kv_heads, dim, dtype, score_mod_pair
 ):
     torch.random.manual_seed(42)
     cute_score_mod, eager_score_mod_factory = score_mod_pair
@@ -306,6 +318,7 @@ def test_cute_vs_flex_attention_with_aux_tensors(
         seqlen_q=seqlen_q,
         seqlen_kv=seqlen_kv,
         num_heads=num_q_heads,
+        dim=dim,
         dtype=dtype,
     )
     if pack_gqa:
@@ -361,6 +374,7 @@ def test_cute_vs_flex_attention_with_aux_tensors(
 
 @pytest.mark.parametrize("seqlen_q,seqlen_kv", SEQLEN_CONFIGS)
 @pytest.mark.parametrize("qhead_per_kvhead,num_kv_heads", [(1, 1), (4, 2)])
+@pytest.mark.parametrize("dim", [128, 256])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("score_mod_vec_pair", TEST_PAIRS_WITH_AUX_TENSORS_VECTORIZED)
 def test_cute_score_mod_with_aux_tensors_vectorized(
@@ -368,6 +382,7 @@ def test_cute_score_mod_with_aux_tensors_vectorized(
     seqlen_kv,
     qhead_per_kvhead,
     num_kv_heads,
+    dim,
     dtype,
     score_mod_vec_pair,
 ):
@@ -379,7 +394,11 @@ def test_cute_score_mod_with_aux_tensors_vectorized(
     num_q_heads = num_kv_heads * qhead_per_kvhead
     pack_gqa = qhead_per_kvhead > 1
     q, k, v = create_tensors(
-        seqlen_q=seqlen_q, seqlen_kv=seqlen_kv, num_heads=num_q_heads, dtype=dtype
+        seqlen_q=seqlen_q,
+        seqlen_kv=seqlen_kv,
+        num_heads=num_q_heads,
+        dim=dim,
+        dtype=dtype,
     )
     if pack_gqa:
         k = k[:, :num_kv_heads, :, :].clone()
@@ -847,7 +866,24 @@ def run_flex_reference_bwd(q, k, v, eager_score_mod, grad_out, dtype=None):
         v = v.requires_grad_(True)
 
     compiled_flex = torch.compile(flex_attention)
-    out = compiled_flex(q, k, v, score_mod=eager_score_mod, enable_gqa=q.shape[1] != k.shape[1])
+    kernel_options = (
+        {
+            "bwd_BLOCK_M1": 32,
+            "bwd_BLOCK_N1": 32,
+            "bwd_BLOCK_M2": 32,
+            "bwd_BLOCK_N2": 32,
+        }
+        if q.dtype != torch.float32 and q.shape[-1] == 256
+        else None
+    )
+    out = compiled_flex(
+        q,
+        k,
+        v,
+        score_mod=eager_score_mod,
+        enable_gqa=q.shape[1] != k.shape[1],
+        kernel_options=kernel_options,
+    )
     dq, dk, dv = torch.autograd.grad(out, (q, k, v), grad_out)
 
     return out, dq, dk, dv
@@ -1019,7 +1055,7 @@ def test_sm90_block_sparse_score_mod_backward_with_dq_swapab():
         (113, 203),
     ],
 )
-@pytest.mark.parametrize("dim", [64, 128])
+@pytest.mark.parametrize("dim", [64, 128, 256])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("score_mod_triple", BWD_TEST_PAIRS)
 @pytest.mark.parametrize("use_autograd", [True, False])
@@ -1089,7 +1125,7 @@ def make_aux_tensors_for_bwd(cute_score_mod, eager_factory, seqlen_q, num_heads,
         (256, 128),
     ],
 )
-@pytest.mark.parametrize("dim", [64, 128])
+@pytest.mark.parametrize("dim", [64, 128, 256])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("score_mod_triple", BWD_TEST_PAIRS_WITH_AUX)
 def test_cute_vs_flex_attention_backward_with_aux(
@@ -1149,7 +1185,7 @@ def test_cute_vs_flex_attention_backward_with_aux(
 
 
 @pytest.mark.parametrize("seqlen_q,seqlen_kv", [(128, 128), (128, 256)])
-@pytest.mark.parametrize("dim", [64, 128])
+@pytest.mark.parametrize("dim", [64, 128, 256])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("qhead_per_kvhead,num_kv_heads", [(4, 2)])
 @pytest.mark.parametrize("score_mod_triple", BWD_TEST_PAIRS_PACK_GQA)
@@ -1259,14 +1295,15 @@ def test_cute_score_mod_aux_tensors_and_scalars_match_flex():
 
 
 @pytest.mark.parametrize("use_autograd", [True, False])
-def test_cute_score_mod_bwd_aux_scalars_matches_flex(use_autograd):
+@pytest.mark.parametrize("dim", [128, 256])
+def test_cute_score_mod_bwd_aux_scalars_matches_flex(use_autograd, dim):
     torch.manual_seed(0)
     q, k, v = create_tensors(
         batch_size=1,
         num_heads=4,
         seqlen_q=128,
         seqlen_kv=128,
-        dim=128,
+        dim=dim,
         dtype=torch.bfloat16,
     )
     score_scale = 2
