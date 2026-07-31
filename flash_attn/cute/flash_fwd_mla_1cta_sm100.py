@@ -63,6 +63,7 @@ from flash_attn.cute.pack_gqa import PackGQA, pack_gqa_layout
 from flash_attn.cute.paged_kv import PagedKVManager
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
+from flash_attn.cute.flash_fwd_sm100 import DescaleTensors
 import flash_attn.cute.blackwell_helpers as fa_sm100_utils
 from flash_attn.cute.softmax import SoftmaxSm100
 from flash_attn.cute.tile_scheduler import (
@@ -99,6 +100,10 @@ class FlashAttentionMLAForward1CtaSm100:
         has_cu_seqlens_q: bool = False,
         use_cpasync_load_KV: bool = False,
         is_split_kv: bool = False,
+        is_fp8: bool = False,
+        num_stages_V: Optional[int] = None,
+        num_stages_K: Optional[int] = None,
+        num_stages_P: Optional[int] = None,
         _qk_issue_last: bool = False,
     ):
         self.is_causal = is_causal
@@ -305,16 +310,56 @@ class FlashAttentionMLAForward1CtaSm100:
             tcgen05.OperandSource.TMEM if self.q_in_tmem else tcgen05.OperandSource.SMEM
         )
 
+        # ==== element width ====
+        # Needed here rather than in __call__ (where the tensors arrive) because the TMEM
+        # accounting below depends on it: the A-in-TMEM staging packs 32 // width
+        # elements per 32-bit word. __call__ asserts the tensors match.
+        self.is_fp8 = is_fp8
+        self.dtype_ab_width = 8 if is_fp8 else 16
+        # Note [Low Precision Scaling] (see flash_fwd_sm100.py): P in (0, 1] is cast to
+        # the input dtype before P @ V, so for fp8 it is pre-scaled by 2^max_offset to
+        # spend e4m3's unused upper code points on the probability tail. row_sum carries
+        # the same factor, so O / row_sum cancels it -- only LSE must subtract it back
+        # out. rescale_threshold (letting row_max go stale) must be 0 for fp8: it would
+        # let P reach 2^(max_offset + threshold) and saturate.
+        self.max_offset = 8 if is_fp8 else 0
+        self.rescale_threshold = 0.0 if is_fp8 else 8.0
+        # e4m3 max is 448 -> log2 = 8.807
+        _log2_dtype_max = 8.807 if is_fp8 else 127.0
+        assert self.max_offset + self.rescale_threshold < _log2_dtype_max, (
+            f"max_offset {self.max_offset} + rescale_threshold {self.rescale_threshold} "
+            f"exceeds the representable log2 range {_log2_dtype_max}"
+        )
+
         # ==== pipeline info ====
+        # fp8 halves every K/V/Q byte, freeing ~112 KB of the 227 KB SMEM budget. Measured
+        # (agent_space/bench_mla_1cta_fp8.py --ablate): spending it on the V ring is worth
+        # 17-29% on decode -- it lets the load warp run a whole n_block ahead instead of
+        # stalling on single-block V residency (the known softmax-on-the-critical-path
+        # limitation). Deeper K and P rings measured neutral or worse. V=6 does not fit
+        # (32 KB/stage in fp8). Overridable per knob for ablation.
         self.num_stages_Q = 1
-        self.num_stages_K = 1  # single (64, hdim) slot, reloaded once per phase
+        # K stays single-slot even for fp8: the Q staging tile aliases the first half of
+        # the unified sK slot, so a deeper K ring would need a separate staging buffer.
+        # K is also only 8 KB in fp8 -- the headroom is worth far more on V.
+        self.num_stages_K = 1 if num_stages_K is None else num_stages_K
         self.num_stages_Qv = 2  # the two dv splits of stationary Qv
-        self.num_stages_V = 2  # the two dv splits of ONE n_block
+        # the two dv splits of ONE n_block (bf16 default), or of two n_blocks (fp8)
+        self.num_stages_V = (4 if is_fp8 else 2) if num_stages_V is None else num_stages_V
         self.num_stages_S = 2
-        self.num_stages_P = 1
+        # P depth measured neutral-to-negative for fp8 on every shape (the P handoff was
+        # never the bottleneck) -- see the ablation in agent_space/NOTES_mla_1cta.md.
+        self.num_stages_P = 1 if num_stages_P is None else num_stages_P
         self.num_stages_Oi = 1
         self.num_stages_sm_stats = 2
         assert self.num_stages_S == 2, "mainloops expect 2 stages for S"
+        assert self.num_stages_V % self.num_hdimv_splits == 0, (
+            "V stages must be a whole number of n_blocks (num_hdimv_splits per block)"
+        )
+        assert not q_in_tmem or self.num_stages_K == 1, (
+            "q_in_tmem aliases the Q staging tile onto the first half of the single sK "
+            "slot; num_stages_K > 1 would need a separate Q staging buffer"
+        )
 
         # ==== dtype info ====
         self.dtype_acc = Float32
@@ -337,7 +382,10 @@ class FlashAttentionMLAForward1CtaSm100:
         # and m + 64 -- the PTX Layout E A-operand organization, decoded empirically in
         # agent_space/ws_ts_mma_validation.py).
         self.tmem_offset_Q = self.total_tmem
-        self.tmem_cols_Q = self.hdim // 2 if self.q_in_tmem else 0
+        # 32 // width elements per 32-bit TMEM word (bf16: hdim/2 cols, fp8: hdim/4)
+        self.tmem_cols_Q = (
+            self.hdim * self.dtype_ab_width // 32 if self.q_in_tmem else 0
+        )
         self.total_tmem += self.tmem_cols_Q
         assert self.total_tmem <= self.tmem_alloc_cols, (
             f"Total TMEM columns allocated {self.total_tmem} exceeds capacity {self.tmem_alloc_cols}"
@@ -497,6 +545,8 @@ class FlashAttentionMLAForward1CtaSm100:
         mSeqUsedK: Optional[cute.Tensor] = None,    # (b)
         mIndexTopk: Optional[cute.Tensor] = None,
         mPageTable: Optional[cute.Tensor] = None,
+        # fp8 per-(batch, kv head) dequantization scales; see _effective_descales.
+        descale_tensors: Optional[DescaleTensors] = None,
         window_size_left: Int32 | int | None = None,
         window_size_right: Int32 | int | None = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
@@ -534,6 +584,12 @@ class FlashAttentionMLAForward1CtaSm100:
 
         # ==== dtype info ====
         self.dtype_Q = mQ.element_type if self.has_qk else cutlass.BFloat16
+        if const_expr(descale_tensors is not None):
+            assert self.is_fp8, "descales are only meaningful for fp8 inputs"
+        assert mQv.element_type.width == self.dtype_ab_width, (
+            f"is_fp8={self.is_fp8} implies {self.dtype_ab_width}-bit inputs, "
+            f"got {mQv.element_type}"
+        )
         self.dtype_K = mK.element_type if self.has_qk else cutlass.BFloat16
         self.dtype_Qv = mQv.element_type
         self.dtype_V = mV.element_type
@@ -904,6 +960,7 @@ class FlashAttentionMLAForward1CtaSm100:
             mSeqUsedQ,
             mSeqUsedK,
             mPageTable,
+            descale_tensors,
             tma_atom_Q,
             tma_atom_Qv,
             tma_atom_K,
@@ -954,6 +1011,7 @@ class FlashAttentionMLAForward1CtaSm100:
         mSeqUsedQ: Optional[cute.Tensor],
         mSeqUsedK: Optional[cute.Tensor],
         mPageTable: Optional[cute.Tensor],
+        descale_tensors,
         tma_atom_Q: Optional[cute.CopyAtom],
         tma_atom_Qv: cute.CopyAtom,
         tma_atom_K: Optional[cute.CopyAtom],
@@ -1315,6 +1373,7 @@ class FlashAttentionMLAForward1CtaSm100:
                 block_info,
                 SeqlenInfoCls,
                 num_splits,
+                descale_tensors,
                 tile_scheduler=tile_scheduler,
             )
             tmem_alloc_barrier.arrive()
@@ -1345,6 +1404,7 @@ class FlashAttentionMLAForward1CtaSm100:
                 block_info,
                 SeqlenInfoCls,
                 num_splits,
+                descale_tensors,
                 tile_scheduler=tile_scheduler,
             )
             tmem_alloc_barrier.arrive()
@@ -1993,11 +2053,13 @@ class FlashAttentionMLAForward1CtaSm100:
             if const_expr(self.q_in_tmem):
                 # TS A operand: gemm_ptx_partial only reads the element type and the
                 # k-group offsets off this tensor (recast to 32-bit TMEM column units);
-                # the base address is passed separately as tA_addr. Stride 16 bf16
-                # elements per K=16 group => 8 columns, the validated ws A stepping.
+                # the base address is passed separately as tA_addr. One k-group is the
+                # mma's K-instruction (16 bf16 / 32 fp8 elements) and recasts to the
+                # same 8 TMEM columns either way -- the validated ws A stepping.
+                kinstr = const_expr(256 // self.dtype_ab_width)
                 tSrQ = cute.make_tensor(
                     cute.recast_ptr(tmem_ptr + self.tmem_offset_Q, dtype=self.dtype_Q),
-                    cute.make_layout((1, 1, self.hdim // 16), stride=(0, 0, 16)),
+                    cute.make_layout((1, 1, self.hdim // kinstr), stride=(0, 0, kinstr)),
                 )
             else:
                 tSrQ = tiled_mma_QK.make_fragment_A(sQ)
@@ -2379,6 +2441,45 @@ class FlashAttentionMLAForward1CtaSm100:
             if col_idx >= col_limit or col_idx < 0:
                 tSrS[i] = -Float32.inf
 
+    def _kv_head_idx(self, head_idx: Int32) -> Int32:
+        """KV head for descale indexing (FA3 semantics: descales are per (b, h_kv))."""
+        return (
+            head_idx if const_expr(self.pack_gqa) else head_idx // self.qhead_per_kvhead
+        )
+
+    @cute.jit
+    def _effective_descales(self, descale_tensors, batch_idx: Int32, head_idx: Int32):
+        """(qk_descale, v_descale) for this tile; (1.0, 1.0) when there are no descales.
+
+        MLA has TWO Q operands sharing q_descale, and BOTH S contributions land in one
+        accumulator: S = qd*kd*(Q@K^T) + qd*vd*(Qv@V^T). Folding a single scale into
+        softmax is therefore only valid when kd == vd, which the interface enforces
+        (natural for MLA: the rope-K and latent-V halves live in one quantized cache).
+        We fold qd*vd; v_descale is additionally applied to O in the epilogue.
+
+        All three members must be present when the struct is: `DescaleTensors`
+        round-trips through MLIR via `__new_from_mlir_values__`, which pads the *tail*
+        with None -- so a partially-filled struct (e.g. q and v set, k None) arrives
+        positionally shifted (v lands in the k slot) and silently loses v_descale. The
+        interface normalizes to all-three-or-none for this path.
+        """
+        qk_descale = Float32(1.0)
+        v_descale = Float32(1.0)
+        if const_expr(descale_tensors is not None):
+            assert (
+                descale_tensors.q_descale is not None
+                and descale_tensors.k_descale is not None
+                and descale_tensors.v_descale is not None
+            ), (
+                "the MLA kernel needs all three descales present (see docstring: "
+                "partially-filled DescaleTensors shift positionally across MLIR)"
+            )
+            head_idx_kv = self._kv_head_idx(head_idx)
+            v_descale = Float32(descale_tensors.v_descale[batch_idx, head_idx_kv])
+            # k_descale == v_descale is enforced host-side, so folding either is the same
+            qk_descale = Float32(descale_tensors.q_descale[batch_idx, head_idx_kv]) * v_descale
+        return qk_descale, v_descale
+
     @cute.jit
     def softmax_loop(
         self,
@@ -2395,6 +2496,7 @@ class FlashAttentionMLAForward1CtaSm100:
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
         num_splits: Int32,
+        descale_tensors,
         tile_scheduler: TileSchedulerProtocol,
     ):
         # ==== softmax warpgroup ====
@@ -2456,6 +2558,11 @@ class FlashAttentionMLAForward1CtaSm100:
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
+            # fp8: fold q_descale * v_descale into the softmax scale (see
+            # _effective_descales); log2 folding is valid because the descale multiplies
+            # S, and softmax_scale_log2 == softmax_scale * log2(e).
+            qk_descale, _ = self._effective_descales(descale_tensors, batch_idx, head_idx)
+            softmax_scale_log2_eff = softmax_scale_log2 * qk_descale
             n_block_min, n_block_max = block_info.get_n_block_min_max(
                 seqlen, m_block, split_idx=split_idx, num_splits=num_splits
             )
@@ -2479,8 +2586,9 @@ class FlashAttentionMLAForward1CtaSm100:
                 )
 
                 softmax = SoftmaxSm100.create(
-                    softmax_scale_log2,
-                    rescale_threshold=8.0 if const_expr(self.dtype_Qv.width == 16) else 0.0,
+                    softmax_scale_log2_eff,
+                    rescale_threshold=self.rescale_threshold,
+                    max_offset=self.max_offset,
                 )
                 softmax.reset()
 
@@ -2704,6 +2812,7 @@ class FlashAttentionMLAForward1CtaSm100:
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
         num_splits: Int32,
+        descale_tensors,
         tile_scheduler: TileSchedulerProtocol,
     ):
         ### ==== correction/epilogue warpgroup ====
@@ -2773,6 +2882,11 @@ class FlashAttentionMLAForward1CtaSm100:
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
+            qk_descale, v_descale = self._effective_descales(
+                descale_tensors, batch_idx, head_idx
+            )
+            # same effective scale the softmax warp used (needed for LSE)
+            softmax_scale_log2_eff = softmax_scale_log2 * qk_descale
 
             seqlen = SeqlenInfoCls(batch_idx)
             n_block_min, n_block_max = block_info.get_n_block_min_max(
@@ -2859,7 +2973,10 @@ class FlashAttentionMLAForward1CtaSm100:
                 row_sum = row_sum0 + row_sum1
                 LN2 = math.log(2.0)
                 acc_O_mn_row_is_zero_or_nan = row_sum == 0.0 or row_sum != row_sum
+                # fp8: dequantize O by v_descale here (never in the running rescale,
+                # and never in LSE -- LSE is a function of the dequantized scores only).
                 scale = cute.arch.rcp_approx(row_sum if not acc_O_mn_row_is_zero_or_nan else 1.0)
+                scale = scale * v_descale
 
                 row_max = 0.0
                 if const_expr(mLSE is not None):
@@ -2872,8 +2989,14 @@ class FlashAttentionMLAForward1CtaSm100:
 
                 # compute and store lse to gmem
                 if const_expr(mLSE is not None):
+                    # row_sum carries the fp8 2^max_offset pre-scale; subtract it here
+                    # (O needs no correction -- it cancels in O / row_sum).
                     lse = (
-                        (row_max * softmax_scale_log2 + cute.math.log2(row_sum, fastmath=True)) * LN2
+                        (
+                            row_max * softmax_scale_log2_eff
+                            + (cute.math.log2(row_sum, fastmath=True) - self.max_offset)
+                        )
+                        * LN2
                         if not acc_O_mn_row_is_zero_or_nan
                         else -Float32.inf
                     )
