@@ -604,7 +604,10 @@ Q_BOUNDARY_SEQLEN_PAIRS = [
 
 @pytest.mark.parametrize("seqlen_q,seqlen_k", Q_BOUNDARY_SEQLEN_PAIRS)
 @pytest.mark.parametrize("mask_name", ["block_diagonal", "document"])
-def test_q_boundary_masking_block_sparse_bwd(seqlen_q, seqlen_k, mask_name):
+@pytest.mark.parametrize("headdim", [128, 256])
+def test_q_boundary_masking_block_sparse_bwd(
+    seqlen_q, seqlen_k, mask_name, headdim
+):
     """Test Q boundary masking for block-sparse backward pass.
 
     This test specifically exercises the fix for the bug where Q rows beyond seqlen_q
@@ -625,7 +628,7 @@ def test_q_boundary_masking_block_sparse_bwd(seqlen_q, seqlen_k, mask_name):
         seqlen_k=seqlen_k,
         nheads=4,
         kv_mode="mha",
-        headdim=128,
+        headdim=headdim,
         dtype=torch.bfloat16,
         mask_name=mask_name,
         window_size=None,
@@ -763,7 +766,7 @@ def test_single_doc_bwd_minimal():
 @pytest.mark.parametrize("seqlen_q,seqlen_k", SEQLEN_PAIRS_COMPREHENSIVE)
 @pytest.mark.parametrize("nheads", [16])
 @pytest.mark.parametrize("kv_mode", ["mha", "gqa", "mqa"])
-@pytest.mark.parametrize("headdim", [128])
+@pytest.mark.parametrize("headdim", [128, 256])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("use_block_sparsity", [True, False])
 @pytest.mark.parametrize(
@@ -804,7 +807,7 @@ def test_static_masks(
 @pytest.mark.parametrize("seqlen_q,seqlen_k", SEQLEN_PAIRS_SMOKE)
 @pytest.mark.parametrize("nheads", [16])
 @pytest.mark.parametrize("kv_mode", ["mha", "gqa"])
-@pytest.mark.parametrize("headdim", [128])
+@pytest.mark.parametrize("headdim", [128, 256])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("use_block_sparsity", [True, False])
 @pytest.mark.parametrize(
@@ -913,8 +916,15 @@ def _run_mask_mod_only(q, k, v, mask_mod, aux_tensors, pack_gqa):
 @pytest.mark.parametrize("qhead_per_kvhead,num_kv_heads", [(1, 4), (4, 2)])
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("mask_case", VEC_MASK_TEST_CASES)
+@pytest.mark.parametrize("head_dim", [128, 256])
 def test_cute_mask_mod_vectorized(
-    seqlen_q, seqlen_k, qhead_per_kvhead, num_kv_heads, dtype, mask_case
+    seqlen_q,
+    seqlen_k,
+    qhead_per_kvhead,
+    num_kv_heads,
+    dtype,
+    mask_case,
+    head_dim,
 ):
     """Tests equality between scalar and vectorized versions of mask mods."""
     if COMPUTE_CAPABILITY not in (10, 11):
@@ -924,7 +934,6 @@ def test_cute_mask_mod_vectorized(
 
     num_heads = num_kv_heads * qhead_per_kvhead
     pack_gqa = qhead_per_kvhead > 1
-    head_dim = 128
     batch_size = 2
 
     q = torch.randn(
@@ -970,7 +979,8 @@ def test_cute_mask_mod_vectorized(
         )
 
 
-def test_sm100_block_sparse_sink_all_masked():
+@pytest.mark.parametrize("headdim", [128, 256])
+def test_sm100_block_sparse_sink_all_masked(headdim):
     """Block-sparse regression for the sink path"""
     if torch.cuda.get_device_capability()[0] != 10:
         pytest.skip("SM100-only test")
@@ -980,7 +990,6 @@ def test_sm100_block_sparse_sink_all_masked():
     seqlen_q = 256
     seqlen_k = 128
     nheads = 8
-    headdim = 128
     q = torch.randn(batch_size, seqlen_q, nheads, headdim, dtype=dtype, device=device)
     k = torch.randn(batch_size, seqlen_k, nheads, headdim, dtype=dtype, device=device)
     v = torch.randn(batch_size, seqlen_k, nheads, headdim, dtype=dtype, device=device)
@@ -1262,12 +1271,12 @@ def test_sm100_block_sparse_q_stage1():
 
 
 @pytest.mark.skipif(COMPUTE_CAPABILITY != 10, reason="SM100-only test")
-def test_sm100_block_sparse_coarse_blocks():
+@pytest.mark.parametrize("headdim", [128, 256])
+def test_sm100_block_sparse_coarse_blocks(headdim):
     torch.manual_seed(42)
     seqlen_q = 512
     seqlen_k = 512
     nheads = 4
-    headdim = 128
     dtype = torch.bfloat16
     tile_m = 128
     tile_n = 128
@@ -1434,12 +1443,12 @@ def test_sm100_block_sparse_coarse_kv_masks_tail_subtiles(headdim):
 
 
 @pytest.mark.skipif(COMPUTE_CAPABILITY != 10, reason="SM100-only test")
-def test_sm100_block_sparse_coarse_blocks_mismatch():
+@pytest.mark.parametrize("headdim", [128, 256])
+def test_sm100_block_sparse_coarse_blocks_mismatch(headdim):
     torch.manual_seed(0)
     seqlen_q = 1024
     seqlen_k = 512
     nheads = 2
-    headdim = 128
     dtype = torch.bfloat16
     tile_m = 128
     tile_n = 128
@@ -2378,7 +2387,10 @@ def _build_block_sparse_masks_for_bwd(
 )
 @pytest.mark.parametrize("spt", [False, True])
 @pytest.mark.parametrize("kv_mode", ["mha", "gqa"])
-def test_block_sparse_bwd_deterministic(seqlen_q, seqlen_k, mask_name, window_size, spt, kv_mode):
+@pytest.mark.parametrize("headdim", [128, 256])
+def test_block_sparse_bwd_deterministic(
+    seqlen_q, seqlen_k, mask_name, window_size, spt, kv_mode, headdim
+):
     torch.manual_seed(42)
     if mask_name == "sliding_window" and seqlen_q > seqlen_k:
         pytest.skip("sliding_window requires seqlen_q <= seqlen_k")
@@ -2389,7 +2401,6 @@ def test_block_sparse_bwd_deterministic(seqlen_q, seqlen_k, mask_name, window_si
     nheads = 4
     nheads_kv = 1 if kv_mode == "gqa" else nheads
     pack_gqa = nheads != nheads_kv
-    headdim = 128
     tile_m = 128
     tile_n = 128
     dtype = torch.bfloat16

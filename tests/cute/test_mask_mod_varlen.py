@@ -439,7 +439,10 @@ PARAMETERIZED_MASK_CONFIGS = [
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("kv_mode", ["mha", "gqa"])
 @pytest.mark.parametrize("mask_name", STATIC_MASK_NAMES)
-def test_varlen_static_masks(seqlens_q, seqlens_k, dtype, kv_mode, mask_name):
+@pytest.mark.parametrize("head_dim", [128, 256])
+def test_varlen_static_masks(
+    seqlens_q, seqlens_k, dtype, kv_mode, mask_name, head_dim
+):
     """Test static mask_mods with varlen (packed) attention."""
     num_heads = 8
     if kv_mode == "gqa":
@@ -454,7 +457,7 @@ def test_varlen_static_masks(seqlens_q, seqlens_k, dtype, kv_mode, mask_name):
         seqlens_k=seqlens_k,
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
-        head_dim=128,
+        head_dim=head_dim,
         dtype=dtype,
         mask_name=mask_name,
     )
@@ -464,8 +467,9 @@ def test_varlen_static_masks(seqlens_q, seqlens_k, dtype, kv_mode, mask_name):
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("kv_mode", ["mha", "gqa"])
 @pytest.mark.parametrize("mask_name,window_size", PARAMETERIZED_MASK_CONFIGS)
+@pytest.mark.parametrize("head_dim", [128, 256])
 def test_varlen_parameterized_masks(
-    seqlens_q, seqlens_k, dtype, kv_mode, mask_name, window_size
+    seqlens_q, seqlens_k, dtype, kv_mode, mask_name, window_size, head_dim
 ):
     """Test parameterized mask_mods with varlen (packed) attention.
 
@@ -484,7 +488,7 @@ def test_varlen_parameterized_masks(
         seqlens_k=seqlens_k,
         num_heads=num_heads,
         num_kv_heads=num_kv_heads,
-        head_dim=128,
+        head_dim=head_dim,
         dtype=dtype,
         mask_name=mask_name,
         window_size=window_size,
@@ -609,10 +613,17 @@ GLOBAL_MASK_NAMES = ["global_packed_doc", "global_ima", "global_causal_window"]
 
 @pytest.mark.parametrize("seqlens_q,seqlens_k", SEQLEN_CONFIGS)
 @pytest.mark.parametrize("mask_name", GLOBAL_MASK_NAMES)
-def test_varlen_global_masks(seqlens_q, seqlens_k, mask_name):
+@pytest.mark.parametrize("head_dim", [128, 256])
+def test_varlen_global_masks(seqlens_q, seqlens_k, mask_name, head_dim):
     """Test global-index mask_mods (aux-tensor-driven) with varlen packed attention."""
     _run_varlen_global_mask_test(
-        seqlens_q, seqlens_k, 8, 8, 128, torch.bfloat16, mask_name
+        seqlens_q,
+        seqlens_k,
+        8,
+        8,
+        head_dim,
+        torch.bfloat16,
+        mask_name,
     )
 
 
@@ -674,7 +685,10 @@ def _run_varlen_mask_only(
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("kv_mode", ["mha", "gqa"])
 @pytest.mark.parametrize("mask_case", VEC_MASK_TEST_CASES)
-def test_varlen_mask_mod_vectorized(seqlens_q, seqlens_k, dtype, kv_mode, mask_case):
+@pytest.mark.parametrize("head_dim", [128, 256])
+def test_varlen_mask_mod_vectorized(
+    seqlens_q, seqlens_k, dtype, kv_mode, mask_case, head_dim
+):
     """Tests equality between scalar and vectorized mask mods on varlen inputs."""
     if COMPUTE_CAPABILITY not in (10, 11):
         pytest.skip("vectorized mask_mod application is SM100/SM110-only")
@@ -703,8 +717,6 @@ def test_varlen_mask_mod_vectorized(seqlens_q, seqlens_k, dtype, kv_mode, mask_c
     else:
         num_kv_heads = num_heads
     pack_gqa = num_heads != num_kv_heads
-    head_dim = 128
-
     q, k, v, cu_seqlens_q, cu_seqlens_k = setup_varlen_tensors(
         seqlens_q, seqlens_k, num_heads, num_kv_heads, head_dim, dtype
     )
@@ -900,8 +912,15 @@ BLOCK_SPARSE_SEQLEN_CONFIGS = [
 @pytest.mark.parametrize("varlen_k", [False, True])
 @pytest.mark.parametrize("use_seqused_k", [False, True])
 @pytest.mark.parametrize("head_broadcast", [False, True])
+@pytest.mark.parametrize("head_dim", [128, 256])
 def test_varlen_block_sparse(
-    varlen_q, varlen_k, use_seqused_k, head_broadcast, mask_name, seqlens
+    varlen_q,
+    varlen_k,
+    use_seqused_k,
+    head_broadcast,
+    mask_name,
+    seqlens,
+    head_dim,
 ):
     """Block sparsity + mask_mod should produce identical output to mask_mod alone."""
     if varlen_k and use_seqused_k:
@@ -915,7 +934,6 @@ def test_varlen_block_sparse(
     random.seed(42)
     device = "cuda"
     num_heads = 4
-    head_dim = 128
     dtype = torch.bfloat16
     # On Blackwell (SM100) q_stage=2 → effective tile is 256; elsewhere 128.
     tile_m = 256 if COMPUTE_CAPABILITY >= 10 else 128

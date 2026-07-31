@@ -672,6 +672,63 @@ def load_block_list_sm100(
     return kv_producer_state
 
 
+@cute.jit
+def load_block_list_sm100_qk_ahead(
+    block_indices: cute.Tensor,
+    block_count,
+    first_block_preloaded: cutlass.Constexpr,
+    load_q_with_first: cutlass.Constexpr,
+    q_stage: cutlass.Constexpr,
+    kv_producer_state,
+    load_Q,
+    load_K,
+    load_V,
+    pipeline_kv,
+):
+    """SM100 block-list loader with QK-ahead issue order."""
+    if block_count > 0:
+        # First iteration: load Q alongside K if requested
+        n_block_first = block_indices[block_count - 1]
+
+        if const_expr(load_q_with_first):
+            load_Q(block=0, stage=0)
+            if const_expr(q_stage == 2):
+                load_Q(block=1, stage=1)
+
+        # SM100 doesn't use producer_acquire for pipeline_kv in load path.
+        # The pipeline barriers are handled inside load_KV.
+        if const_expr(not first_block_preloaded):
+            load_K(block=n_block_first, producer_state=kv_producer_state, page_idx=None)
+            kv_producer_state.advance()
+
+        # Remaining blocks: load the next K before the previous V.
+        for offset in cutlass.range(1, block_count):
+            n_block_prev = block_indices[block_count - offset]
+            n_block = block_indices[block_count - 1 - offset]
+            load_K(block=n_block, producer_state=kv_producer_state, page_idx=None)
+            kv_producer_state.advance()
+            load_V(block=n_block_prev, producer_state=kv_producer_state, page_idx=None)
+            kv_producer_state.advance()
+
+    return kv_producer_state
+
+
+@cute.jit
+def finish_qk_ahead_v_load_sm100(
+    block_indices: cute.Tensor,
+    block_count,
+    load_V,
+    kv_producer_state,
+):
+    """Load the final V block after QK-ahead K loads."""
+    if block_count > 0:
+        n_block_last = block_indices[0]
+        load_V(block=n_block_last, producer_state=kv_producer_state, page_idx=None)
+        kv_producer_state.advance()
+
+    return kv_producer_state
+
+
 # SM100-specific tile processor using SM100 helpers
 @cute.jit
 def produce_block_sparse_loads_sm100(
@@ -780,6 +837,124 @@ def produce_block_sparse_loads_sm100(
                 load_V=load_V,
                 pipeline_kv=pipeline_kv,
                 kv_subtile_factor=kv_subtile_factor,
+            )
+
+    if q_phase_flipped:
+        q_producer_phase ^= 1
+
+    return kv_producer_state, q_producer_phase
+
+
+@cute.jit
+def produce_block_sparse_loads_sm100_qk_ahead(
+    blocksparse_tensors: BlockSparseTensors,
+    batch_idx,
+    head_idx,
+    m_block,
+    seqlen_info,
+    kv_producer_state,
+    load_Q,
+    load_K,
+    load_V,
+    pipeline_kv,
+    q_stage: cutlass.Constexpr,
+    q_producer_phase: Int32,
+    qhead_per_kvhead: cutlass.Constexpr,
+    q_subtile_factor: cutlass.Constexpr,
+):
+    """SM100 sparse block iteration with QK-ahead K/V issue order."""
+    m_block_sparse = sparse_tensor_m_block(m_block, qhead_per_kvhead, q_subtile_factor)
+
+    (
+        curr_mask_block_cnt,
+        curr_mask_block_idx,
+        curr_full_block_cnt,
+        curr_full_block_idx,
+    ) = get_curr_blocksparse_tensors(
+        batch_idx,
+        head_idx,
+        m_block_sparse,
+        blocksparse_tensors,
+        seqlen_info,
+    )
+
+    mask_empty = curr_mask_block_cnt == 0
+    full_empty = curr_full_block_cnt == 0
+
+    q_phase_flipped = False
+
+    if mask_empty:
+        # No masked blocks: process full list with Q loading
+        kv_producer_state = load_block_list_sm100_qk_ahead(
+            curr_full_block_idx,
+            curr_full_block_cnt,
+            first_block_preloaded=False,
+            load_q_with_first=True,
+            q_stage=q_stage,
+            kv_producer_state=kv_producer_state,
+            load_Q=load_Q,
+            load_K=load_K,
+            load_V=load_V,
+            pipeline_kv=pipeline_kv,
+        )
+        kv_producer_state = finish_qk_ahead_v_load_sm100(
+            curr_full_block_idx,
+            curr_full_block_cnt,
+            load_V,
+            kv_producer_state,
+        )
+        q_phase_flipped = not full_empty
+    else:
+        # Process masked blocks with Q loading
+        kv_producer_state = load_block_list_sm100_qk_ahead(
+            curr_mask_block_idx,
+            curr_mask_block_cnt,
+            first_block_preloaded=False,
+            load_q_with_first=True,
+            q_stage=q_stage,
+            kv_producer_state=kv_producer_state,
+            load_Q=load_Q,
+            load_K=load_K,
+            load_V=load_V,
+            pipeline_kv=pipeline_kv,
+        )
+        q_phase_flipped = True
+
+        if full_empty:
+            kv_producer_state = finish_qk_ahead_v_load_sm100(
+                curr_mask_block_idx,
+                curr_mask_block_cnt,
+                load_V,
+                kv_producer_state,
+            )
+        else:
+            # Bridge the masked list to the full list by loading the first full K
+            # before the pending masked V.
+            n_block_mask_last = curr_mask_block_idx[0]
+            n_block_full_first = curr_full_block_idx[curr_full_block_cnt - 1]
+            load_K(block=n_block_full_first, producer_state=kv_producer_state, page_idx=None)
+            kv_producer_state.advance()
+            load_V(block=n_block_mask_last, producer_state=kv_producer_state, page_idx=None)
+            kv_producer_state.advance()
+
+            # Process full blocks without Q loading
+            kv_producer_state = load_block_list_sm100_qk_ahead(
+                curr_full_block_idx,
+                curr_full_block_cnt,
+                first_block_preloaded=True,
+                load_q_with_first=False,
+                q_stage=q_stage,
+                kv_producer_state=kv_producer_state,
+                load_Q=load_Q,
+                load_K=load_K,
+                load_V=load_V,
+                pipeline_kv=pipeline_kv,
+            )
+            kv_producer_state = finish_qk_ahead_v_load_sm100(
+                curr_full_block_idx,
+                curr_full_block_cnt,
+                load_V,
+                kv_producer_state,
             )
 
     if q_phase_flipped:

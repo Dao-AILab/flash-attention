@@ -899,13 +899,6 @@ def _flash_attn_fwd(
             else:
                 if use_dedicated_hd256_kernel:
                     # hd=256 2CTA forward: check for currently unsupported features
-                    assert softcap is None, "SM100 forward with head_dim=256 does not support softcap"
-                    assert not use_block_sparsity, \
-                        "SM100 forward with head_dim=256 does not support block sparsity"
-                    assert learnable_sink is None, \
-                        "SM100 forward with head_dim=256 does not support learnable_sink"
-                    assert seqused_q is None and seqused_k is None, \
-                        "SM100 forward with head_dim=256 does not support seqused_q/seqused_k"
                     if page_table is not None:
                         assert max_seqlen_k % page_size == 0, (
                             f"SM100 hd256 2CTA paged KV requires max_seqlen_k divisible by "
@@ -1457,7 +1450,13 @@ def _flash_attn_bwd(
         cluster_size = 2 if use_2cta_instrs else 1
 
     use_dedicated_hd256_kernel = arch // 10 in [10, 11] and head_dim == 256 and head_dim_v == 256
+    if use_dedicated_hd256_kernel:
+        cluster_size = 2
     use_2cta_instrs = use_2cta_instrs or use_dedicated_hd256_kernel
+    dkv_n_block_size = 64 if use_dedicated_hd256_kernel else n_block_size
+    dkv_postprocess_n_block_size = (
+        cluster_size * dkv_n_block_size if use_dedicated_hd256_kernel else dkv_n_block_size
+    )
 
     q, k, v, out, dout, lse, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k = [
         maybe_contiguous(t)
@@ -1493,6 +1492,10 @@ def _flash_attn_bwd(
     num_n_blocks = seqlen_k_rounded // n_block_size
     if cluster_size == 2 and num_n_blocks % cluster_size != 0:
         seqlen_k_rounded = seqlen_k_rounded + n_block_size
+    seqlen_k_rounded_dkv = (seqlen_k + dkv_n_block_size - 1) // dkv_n_block_size * dkv_n_block_size
+    num_n_blocks_dkv = seqlen_k_rounded_dkv // dkv_n_block_size
+    if cluster_size == 2 and num_n_blocks_dkv % cluster_size != 0:
+        seqlen_k_rounded_dkv = seqlen_k_rounded_dkv + dkv_n_block_size
 
     # The single-block specialization below only guards against TVM stride poisoning,
     # which is a host-side branch predicate that selects a kernel variant. When
@@ -1621,27 +1624,26 @@ def _flash_attn_bwd(
     # GQA (qhead_per_kvhead > 1) needs dK/dV accum+postprocess since multiple Q heads
     # accumulate into the same dK/dV. SM90 varlen_k with qhead_per_kvhead==1 now uses
     # ragged TMA tensors for direct store, so no longer needs accum+postprocess.
-    # hd=256 2CTA backward has its own internal postprocess for dK/dV.
-    dKV_postprocess = qhead_per_kvhead > 1 and not use_dedicated_hd256_kernel
+    dKV_postprocess = qhead_per_kvhead > 1
     if dKV_postprocess:
         head_dim_v_rounded = (head_dim_v + 32 - 1) // 32 * 32
         if cu_seqlens_k is None:
             dk_accum = torch.zeros(
                 batch_size,
                 num_head_kv,
-                seqlen_k_rounded * head_dim_rounded,
+                seqlen_k_rounded_dkv * head_dim_rounded,
                 dtype=torch.float32,
                 device=device,
             )
             dv_accum = torch.zeros(
                 batch_size,
                 num_head_kv,
-                seqlen_k_rounded * head_dim_v_rounded,
+                seqlen_k_rounded_dkv * head_dim_v_rounded,
                 dtype=torch.float32,
                 device=device,
             )
         else:
-            cluster_tile_n = cluster_size * n_block_size
+            cluster_tile_n = cluster_size * dkv_n_block_size
             total_k_rounded_padded = (
                 (total_k + cu_seqlens_k.shape[0] * cluster_tile_n - 1) // cluster_tile_n * cluster_tile_n
             )
@@ -1667,8 +1669,8 @@ def _flash_attn_bwd(
         dQ_semaphore = None
 
     if deterministic and qhead_per_kvhead > 1:
-        dK_semaphore = torch.zeros(batch_size, num_head_kv, seqlen_k_rounded // n_block_size, 2, dtype=torch.int32, device=device)
-        dV_semaphore = torch.zeros(batch_size, num_head_kv, seqlen_k_rounded // n_block_size, 2, dtype=torch.int32, device=device)
+        dK_semaphore = torch.zeros(batch_size, num_head_kv, seqlen_k_rounded_dkv // dkv_n_block_size, 2, dtype=torch.int32, device=device)
+        dV_semaphore = torch.zeros(batch_size, num_head_kv, seqlen_k_rounded_dkv // dkv_n_block_size, 2, dtype=torch.int32, device=device)
     else:
         dK_semaphore = None
         dV_semaphore = None
@@ -1899,14 +1901,6 @@ def _flash_attn_bwd(
             )
         else:
             if use_dedicated_hd256_kernel:
-                assert softcap == 0.0, "SM100 backward with head_dim=256 does not support softcap"
-                assert block_sparse_tensors is None, \
-                    "SM100 backward with head_dim=256 does not support block sparsity"
-                assert dlse is None, \
-                    "SM100 backward with head_dim=256 does not support dlse"
-                assert seqused_q is None and seqused_k is None, \
-                    "SM100 backward with head_dim=256 does not support seqused_q/seqused_k"
-
                 dq_tile_mn = (128, 128)
                 dkdv_tile_mn = (128, 64)
                 fa_bwd_obj = BlackwellFusedMultiHeadAttentionBackward(
@@ -2020,7 +2014,6 @@ def _flash_attn_bwd(
             else None,
         )
     # Postprocess: convert dq_accum from float32 to dq in bf16/fp16
-    # hd=256 2CTA backward has its own internal postprocess, skip here.
     if not use_dedicated_hd256_kernel:
         if arch // 10 == 9:
             # dQ postprocess: match main kernel's MMA WG count, unless dQ_single_wg
@@ -2054,6 +2047,25 @@ def _flash_attn_bwd(
                 arch, dtype, head_dim_v, n_block_size, num_threads_post_dKV,
                 AtomLayoutNdKV, dKV_swapAB,
                 cluster_size=cluster_size,
+            )
+    else:
+        num_threads_post_dKV = 128
+
+        if dKV_postprocess:
+            # Dedicated hd256 dK/dV kernels use a 128-token accumulator layout.
+            _bwd_postprocess_convert(
+                dk_accum, dk, softmax_scale,
+                cu_seqlens_k, seqused_k,
+                arch, dtype, head_dim, dkv_postprocess_n_block_size, num_threads_post_dKV,
+                AtomLayoutNdKV, dKV_swapAB,
+                cluster_size=1,
+            )
+            _bwd_postprocess_convert(
+                dv_accum, dv, 1.0,
+                cu_seqlens_k, seqused_k,
+                arch, dtype, head_dim_v, dkv_postprocess_n_block_size, num_threads_post_dKV,
+                AtomLayoutNdKV, dKV_swapAB,
+                cluster_size=1,
             )
 
     return dq, dk, dv
