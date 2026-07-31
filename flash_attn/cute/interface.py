@@ -156,6 +156,40 @@ def _tile_size_fwd_sm90(head_dim, head_dim_v, is_causal, is_local, sparse_block_
         tile_n = 64 if is_local else 80
         return FwdConfig(128, tile_n, True, True)
 
+
+def _tile_size_fwd_sm80(head_dim, head_dim_v):
+    """Return FwdConfig for SM80-family forward (sm_80/sm_86/sm_87/sm_89).
+
+    Unlike SM90 (`_tile_size_fwd_sm90`), the SM80 kernel (`FlashAttentionForwardSm80`)
+    always uses tile_m=128, num_stages=1, Q_in_regs=False; only tile_n is varied here.
+
+    tile_n must be picked so the kernel fits in shared memory on *every* SM80-family
+    part, not just the ones with the most SMEM. sm_80 (A100) has 166912 B (163 KB) of
+    static SMEM, but sm_86/sm_89 (RTX 30xx/40xx) are capped at 101376 B (99 KB) -- see
+    `SMEM_CAPACITY_MAP` in cutlass.utils. A single tile_n=64 default sized for the
+    common head_dim<=128 case silently overflows the 101376 B budget once head_dim
+    grows past ~196 (e.g. head_dim=256 needs 131072 B with tile_n=64), crashing at
+    kernel launch with a raw `cudaErrorInvalidValue` on sm_86/sm_89.
+
+    SMEM usage follows the same formula as `can_implement` in flash_fwd.py:
+        2 * (tile_m * head_dim + tile_n * (head_dim + head_dim_v))
+    (using max(head_dim, head_dim_v) below is a safe over-estimate for asymmetric
+    head_dim/head_dim_v shapes.) Each branch below is sized to stay under the tighter
+    101376 B sm_86/sm_89 budget with headroom, verified by hand for every multiple of
+    8 in [64, 256]:
+        d<=192,  tile_n=64: worst case d=192  -> 2*(128*192 + 64*384) =  98304 B
+        d<=224,  tile_n=48: worst case d=224  -> 2*(128*224 + 48*448) = 100352 B
+        d>224,   tile_n=32: worst case d=256  -> 2*(128*256 + 32*512) =  98304 B
+    """
+    d = max(head_dim, head_dim_v)
+    if d <= 192:
+        return FwdConfig(128, 64, True, True)
+    elif d <= 224:
+        return FwdConfig(128, 48, True, True)
+    else:
+        return FwdConfig(128, 32, True, True)
+
+
 @dataclass(frozen=True)
 class BwdConfig:
     m_block_size: int
@@ -536,7 +570,7 @@ def _flash_attn_fwd(
             else:
                 fwd_cfg = FwdConfig(128, 64, True, True)
         elif arch // 10 == 8:
-            fwd_cfg = FwdConfig(128, 64, True, True)  # SM80, should tune
+            fwd_cfg = _tile_size_fwd_sm80(head_dim, head_dim_v)
         elif arch // 10 == 9:
             sparse_q = get_sparse_q_block_size(block_sparse_tensors, seqlen_q)
             fwd_cfg = _tile_size_fwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q=sparse_q)
