@@ -96,6 +96,47 @@ def test_flash_attn_sm120_rejects_splitkv():
         flash_attn_func(q, k, v, num_splits=3)
 
 
+@pytest.mark.skipif(not IS_SM100, reason="requires the SM100 head_dim=256 kernel")
+def test_flash_attn_hd256_gemma4_sliding_window():
+    """Exercise the causal-left local path used by Gemma 4."""
+    torch.manual_seed(1234)
+    device = "cuda"
+    batch, seqlen, nheads, nheads_kv, head_dim = 1, 2048, 8, 4, 256
+    window_size = (1023, 0)
+
+    q, k, v = [
+        torch.randn(shape, device=device, dtype=torch.bfloat16, requires_grad=True)
+        for shape in (
+            (batch, seqlen, nheads, head_dim),
+            (batch, seqlen, nheads_kv, head_dim),
+            (batch, seqlen, nheads_kv, head_dim),
+        )
+    ]
+    q_ref, k_ref, v_ref = [tensor.detach().float().requires_grad_(True) for tensor in (q, k, v)]
+    dout = torch.randn_like(q)
+
+    out_ref, _ = attention_ref(q_ref, k_ref, v_ref, None, None, window_size=window_size)
+    out, _ = flash_attn_func(q, k, v, window_size=window_size)
+    out_ref.backward(dout.float())
+    out.backward(dout)
+
+    for name, actual, reference in (
+        ("out", out, out_ref),
+        ("dq", q.grad, q_ref.grad),
+        ("dk", k.grad, k_ref.grad),
+        ("dv", v.grad, v_ref.grad),
+    ):
+        actual_float = actual.detach().float().flatten()
+        reference_float = reference.detach().float().flatten()
+        cosine = torch.nn.functional.cosine_similarity(actual_float, reference_float, dim=0).item()
+        relative_l2 = (
+            torch.linalg.vector_norm(actual_float - reference_float)
+            / torch.linalg.vector_norm(reference_float)
+        ).item()
+        assert cosine >= 0.9999, f"{name}: cosine={cosine:.8f}"
+        assert relative_l2 <= 1e-2, f"{name}: relative_l2={relative_l2:.8f}"
+
+
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])

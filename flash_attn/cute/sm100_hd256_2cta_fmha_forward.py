@@ -203,12 +203,6 @@ class BlackwellFusedMultiHeadAttentionForward:
         assert aux_data.scalars is None, (
             "SM100 forward with head_dim=256 does not support aux_scalars"
         )
-        assert not self.is_local, (
-            "SM100 forward with head_dim=256 does not support local attention yet"
-        )
-        assert window_size_left is None and window_size_right is None, (
-            "SM100 forward with head_dim=256 does not support runtime window_size overrides"
-        )
         assert descale_tensors is None, (
             "SM100 forward with head_dim=256 does not support descale_tensors"
         )
