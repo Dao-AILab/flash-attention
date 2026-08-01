@@ -61,7 +61,7 @@ def clc_scheduler_enabled():
 
 def check_output(q, k, v, *, causal=False, window_size=(None, None), num_splits=1, assert_clc=True, assert_2cta=False):
     _captured_schedulers.clear()
-    out, _ = flash_attn_func(q, k, v, causal=causal, window_size=window_size, num_splits=num_splits)
+    out = flash_attn_func(q, k, v, causal=causal, window_size=window_size, num_splits=num_splits)
     torch.cuda.synchronize()
     if assert_clc and _captured_schedulers:
         sched_cls, sched_mode, use_2cta = _captured_schedulers[-1]
@@ -272,7 +272,7 @@ class TestCLCFallback:
         q = torch.randn(total, heads, d, device="cuda", dtype=torch.bfloat16)
         k = torch.randn(total, heads, d, device="cuda", dtype=torch.bfloat16)
         v = torch.randn(total, heads, d, device="cuda", dtype=torch.bfloat16)
-        out, _ = flash_attn_varlen_func(
+        out = flash_attn_varlen_func(
             q, k, v,
             cu_seqlens_q=cu_seqlens,
             cu_seqlens_k=cu_seqlens,
@@ -312,7 +312,7 @@ def check_varlen_output(seqlens, heads, d, *, causal=False, kv_heads=None, num_s
     v = torch.randn(total, kv_heads, d, device="cuda", dtype=torch.bfloat16)
 
     _captured_schedulers.clear()
-    out, _ = flash_attn_varlen_func(
+    out = flash_attn_varlen_func(
         q, k, v,
         cu_seqlens_q=cu_seqlens,
         cu_seqlens_k=cu_seqlens,
@@ -357,7 +357,7 @@ def check_varlen_output_seqused(seqlens, heads, d, *, causal=False, kv_heads=Non
     k_mask = q_mask
 
     _captured_schedulers.clear()
-    out, _ = flash_attn_varlen_func(
+    out = flash_attn_varlen_func(
         q,
         k,
         v,

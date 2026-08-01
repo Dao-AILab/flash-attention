@@ -71,7 +71,7 @@ def test_flash_attn_output(seqlen_q, seqlen_k, d, causal, num_splits, mha_type, 
         q_ref, k_ref, v_ref, None, None, causal=causal, upcast=False, reorder_ops=True,
     )
 
-    out, lse = flash_attn_func(q, k, v, causal=causal, num_splits=num_splits)
+    out = flash_attn_func(q, k, v, causal=causal, num_splits=num_splits)
 
     if is_fake_mode():
         return
@@ -138,7 +138,7 @@ def test_flash_attn_varlen_output(seqlen, d, causal, mha_type, dtype):
     k_varlen = rearrange(k_ref.detach(), "b s h d -> (b s) h d").requires_grad_()
     v_varlen = rearrange(v_ref.detach(), "b s h d -> (b s) h d").requires_grad_()
 
-    out_varlen, lse = flash_attn_varlen_func(
+    out_varlen = flash_attn_varlen_func(
         q_varlen, k_varlen, v_varlen,
         cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
         max_seqlen_q=seqlen, max_seqlen_k=seqlen,
@@ -239,7 +239,7 @@ def test_flash_attn_varlen_unpad_output(seqlen, d, causal, mha_type, unpad_q, un
         k_in = k.detach().to(dtype).requires_grad_()
         v_in = v.detach().to(dtype).requires_grad_()
 
-    out_unpad, lse = flash_attn_varlen_func(
+    out_unpad = flash_attn_varlen_func(
         q_in, k_in, v_in,
         cu_seqlens_q=cu_seqlens_q if unpad_q else None,
         cu_seqlens_k=cu_seqlens_k if unpad_kv else None,
