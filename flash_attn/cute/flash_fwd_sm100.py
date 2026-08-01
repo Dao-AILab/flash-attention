@@ -238,7 +238,6 @@ class FlashAttentionForwardSm100:
             "Paged KV does not support irregular head dim"
         )
 
-        self.use_clc_scheduler = use_clc_scheduler
         # ClC does not compose with these other features, so disable even if requested
         self.use_clc_scheduler = (
             use_clc_scheduler
@@ -757,7 +756,7 @@ class FlashAttentionForwardSm100:
             # store row max and row sum
             sScale: cute.struct.MemRange[Float32, self.q_stage * self.m_block_size * 2]
             # Scheduler buffers placed here to utilize padding before sO's 1024-byte
-            # alignment. This avoids adding bytes at the end when we're at the smem limit. 
+            # alignment. This avoids adding bytes at the end when we're at the smem limit.
             # PipelineClcFetchAsync / PipelineAsync both expect
             # 2 * sched_stages mbarriers (full + empty). Response is 4 Int32 per stage
             # (CLC HW response, or work_info written by dynamic persistent producer).
@@ -1085,8 +1084,8 @@ class FlashAttentionForwardSm100:
 
         pipeline_load_epi = None
         if const_expr(self.overlap_sO_sQ and self.is_persistent):
-            # when overlapping sO and sQ with a persistent kernel, we need this 
-            # additional pipeline to ensure sO from the previous work tile is 
+            # when overlapping sO and sQ with a persistent kernel, we need this
+            # additional pipeline to ensure sO from the previous work tile is
             # free for use by sQ in the current one.
             epi_warps_for_release = (
                 ThreadCooperativeGroup(len(self.correction_warp_ids))
@@ -3073,7 +3072,9 @@ class FlashAttentionForwardSm100:
             if const_expr(self.is_split_kv and block_info.pack_split_idx):
                 split_idx = split_idx & 0xFFFF
 
-            if self.process_work_tile(seqlen, n_block_min, n_block_max):
+            if const_expr(self.use_block_sparsity) or self.process_work_tile(
+                seqlen, n_block_min, n_block_max
+            ):
                 if const_expr(self.is_split_kv):
                     mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3)[None, None, head_idx, split_idx]
                 else:

@@ -685,7 +685,6 @@ class FlashAttentionForwardCombine:
 
                 rO = cute.make_rmem_tensor_like(tOrO, self.dtype)
                 rO.store(tOrO.load().to(self.dtype))
-                mO_cur = seqlen_info.offset_batch(mO, batch_idx, dim=3)
                 if const_expr(cu_seqlens is None):
                     mO_cur = mO[None, None, None, batch_idx]
                 else:

@@ -457,7 +457,15 @@ def fadd_reduce(
 
 @dsl_user_op
 def atomic_add_i32(a: int | Int32, ptr: cute.Pointer, *, loc=None, ip=None) -> Int32:
-    return nvvm.atomicrmw(op=nvvm.AtomicOpKind.ADD, ptr=ptr.llvm_ptr, a=Int32(a).ir_value())
+    return Int32(
+        nvvm.atomicrmw(
+            op=nvvm.AtomicOpKind.ADD,
+            ptr=ptr.llvm_ptr,
+            a=Int32(a).ir_value(loc=loc, ip=ip),
+            loc=loc,
+            ip=ip,
+        )
+    )
 
 
 @dsl_user_op

@@ -139,9 +139,6 @@ class DynamicPersistentSchedulerState(SchedulerState):
         self._work_info[3] = split
 
 
-ClcState = SchedulerState
-
-
 class WorkTileInfo(cutlass.utils.WorkTileInfo):
     """Altered WorkTileInfo which includes four axes: (block, head, batch, split)"""
 
@@ -1494,7 +1491,7 @@ class DynamicPersistentVarlenScheduler:
         *,
         loc=None,
         ip=None,
-    ) -> WorkTileInfo:
+    ) -> Tuple[WorkTileInfo, Int32]:
         d = self.params.decoder
         block, head_idx, batch_idx, split_idx, num_splits, group_start_tile, is_valid = d.decode(
             next_tile_idx, bidb_start, group_start_tile
@@ -1951,7 +1948,7 @@ class Sm100FmhaClcDynamicTileScheduler:
         num_tiles_executed: Int32,
         clc_response_ptr: cute.Pointer,
         block_idx: Tuple,
-        clc: ClcState = None,
+        clc: ClcSchedulerState = None,
         *,
         loc=None,
         ip=None,
@@ -1997,7 +1994,7 @@ class Sm100FmhaClcDynamicTileScheduler:
         block_idx: Tuple,
         grid_dim: Tuple,
         clc_response_ptr: cute.Pointer,
-        clc: ClcState = None,
+        clc: ClcSchedulerState = None,
         *,
         loc=None,
         ip=None,

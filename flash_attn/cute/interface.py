@@ -67,9 +67,10 @@ from flash_attn.cute.block_sparsity import (
     normalize_block_sparse_config_bwd,
 )
 
-BIN_BATCH_SEARCH_THRESH = 256 # SingleTileVarlenScheduler uses binary search to find batch above this
+BIN_BATCH_SEARCH_THRESH = 256  # above this batch size SingleTileVarlenScheduler gets a batch-lookup aid
 # Where the cu hint applies, use an O(1) flat-block -> batch lookup instead of the binary search.
 USE_BLOCKS_TO_BATCH: bool = True
+
 
 def _parse_arch_str(arch_str):
     """Parse arch string (e.g. 'sm_80', 'sm_90a', '80', '100') to int (e.g. 80, 90, 100)."""
@@ -2081,7 +2082,7 @@ def _flash_attn_bwd(
         dK_semaphore = None
         dV_semaphore = None
 
-    # SingleTileVarlenScheduler uses binary search to find batch idx with > 512 batch size
+    # SingleTileVarlenScheduler batch-lookup aid, above BIN_BATCH_SEARCH_THRESH;
     # shared across preprocess, main bwd, and the three postprocess calls.
     cu_total_m_blocks_q = None
     cu_total_m_blocks_k = None
@@ -3661,8 +3662,7 @@ def _get_scheduler_metadata(
     # Override enable_pdl (not supported yet)
     enable_pdl = False
 
-    # Override sort (not supported yet)
-    sort = False
+    assert not sort, "LPT batch sort not yet implemented"
 
     if seqlen_k_per_split is not None:
         assert seqlen_k_per_split % tile_n == 0, "seqlen per split must be divisible by tile_n"
@@ -3813,9 +3813,6 @@ def _get_scheduler_metadata(
         virtual_batch_idx = None
         num_nheads_in_l2 = None
         tile_count_semaphore = None
-
-    if is_fake_mode():
-        return
 
     qhead_per_kvhead = nheads // nheads_kv
     # binary-search hint; only consumed by the single-tile scheduler above this batch

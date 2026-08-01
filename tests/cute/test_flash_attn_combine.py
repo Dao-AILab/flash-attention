@@ -1,6 +1,7 @@
 # Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
 
 import os
+import random
 
 import pytest
 import torch
@@ -115,26 +116,27 @@ def test_flash_attn_combine(num_splits, seqlen, d, dtype):
 def test_flash_attn_combine_varlen(varlen_mode, num_splits, seqlen, d, dtype):
     device = "cuda"
     torch.random.manual_seed(1)
+    random.seed(1)
     batch_size = 3
     nheads = 8
     use_cu_seqlens = "cu_seqlens" in varlen_mode
     use_seqused = "seqused" in varlen_mode
 
     # Generate variable-length sequences
-    seqlens = torch.randint(1, seqlen + 1, (batch_size,), device=device, dtype=torch.int32)
+    seqlens_list = [random.randint(1, seqlen) for _ in range(batch_size)]
+    seqlens = torch.tensor(seqlens_list, device=device, dtype=torch.int32)
     # For cu_seqlens+seqused mode, seqused < seqlen (kernel processes fewer tokens)
-    seqused_vals = (
-        torch.clamp(
-            seqlens - torch.randint(0, max(1, seqlen // 4), (batch_size,), device=device, dtype=torch.int32),
-            min=1,
-        )
-        if use_cu_seqlens and use_seqused
-        else seqlens
-    )
+    if use_cu_seqlens and use_seqused:
+        seqused_list = [
+            max(1, s - random.randrange(0, max(1, seqlen // 4))) for s in seqlens_list
+        ]
+    else:
+        seqused_list = seqlens_list
+    seqused_vals = torch.tensor(seqused_list, device=device, dtype=torch.int32)
 
     if use_cu_seqlens:
         # Packed varlen layout: (num_splits, total_q, nheads, d)
-        total_q = seqlens.sum().item()
+        total_q = sum(seqlens_list)
         cu_seqlens_q = torch.zeros(batch_size + 1, device=device, dtype=torch.int32)
         cu_seqlens_q[1:] = torch.cumsum(seqlens, dim=0)
 
@@ -188,7 +190,7 @@ def test_flash_attn_combine_varlen(varlen_mode, num_splits, seqlen, d, dtype):
 
     else:
         # seqused only — batched layout: (num_splits, batch, max_seqlen, nheads, d)
-        max_seqlen = seqlens.max().item()
+        max_seqlen = max(seqlens_list)
         out_partial = torch.randn(
             num_splits, batch_size, max_seqlen, nheads, d, device=device, dtype=torch.float32,
         )
@@ -198,9 +200,9 @@ def test_flash_attn_combine_varlen(varlen_mode, num_splits, seqlen, d, dtype):
         ).transpose(-1, -2)
         lse_partial[num_splits // 2:, :batch_size // 2] = -float("inf")
         # Zero out / -inf beyond seqused so reference matches kernel
-        for i in range(batch_size):
-            out_partial[:, i, seqlens[i]:] = 0
-            lse_partial[:, i, seqlens[i]:] = -float("inf")
+        for i, sl in enumerate(seqlens_list):
+            out_partial[:, i, sl:] = 0
+            lse_partial[:, i, sl:] = -float("inf")
 
         out, lse = flash_attn_combine(
             out_partial, lse_partial, out_dtype=dtype, seqused=seqlens, return_lse=True,
@@ -239,6 +241,7 @@ def test_flash_attn_combine_virtual_batch_idx(num_splits, seqlen, d, dtype):
     """
     device = "cuda"
     torch.random.manual_seed(42)
+    random.seed(42)
     batch_size = 4
     nheads = 8
 
@@ -256,11 +259,12 @@ def test_flash_attn_combine_virtual_batch_idx(num_splits, seqlen, d, dtype):
     assert perm.shape[0] == batch_size
 
     # Also test with seqused to verify interaction with virtual_batch_idx
-    seqused = torch.randint(1, seqlen + 1, (batch_size,), device=device, dtype=torch.int32)
+    seqused_list = [random.randint(1, seqlen) for _ in range(batch_size)]
+    seqused = torch.tensor(seqused_list, device=device, dtype=torch.int32)
     # Zero out / -inf beyond seqused so reference matches kernel
-    for i in range(batch_size):
-        out_partial[:, i, seqused[i]:] = 0
-        lse_partial[:, i, seqused[i]:] = -float("inf")
+    for i, sl in enumerate(seqused_list):
+        out_partial[:, i, sl:] = 0
+        lse_partial[:, i, sl:] = -float("inf")
 
     # Run with virtual_batch_idx and seqused via public API
     out, lse = flash_attn_combine(

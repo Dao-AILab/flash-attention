@@ -48,8 +48,8 @@ class FlashPrepareScheduler:
         self.num_warps = num_warps
         self.is_causal = is_causal
         self.packgqa = packgqa
-        # TODO: Implement batch sort for LPT.
-        self.sort = False
+        assert not sort, "LPT batch sort not yet implemented"
+        self.sort = sort
         self.num_threads_per_warp = 32
         self.tile_m = tile_m
         self.tile_n = tile_n
@@ -192,11 +192,11 @@ class FlashPrepareScheduler:
             if tidx == 0:
                 tile_count_semaphore[0] = Int32(0)
 
-        batch_cta_idx_offset = bidx * 992
+        batch_cta_idx_offset = bidx * self.k_num_batch_per_warp * self.num_warps
         bidb_start = batch_cta_idx_offset + self.k_num_batch_per_warp * warp_idx
         batch_idx = lane_idx + bidb_start
 
-        num_m_blocks, seqlen_q = self.get_num_m_blocks_and_seqlen(
+        num_m_blocks, _ = self.get_num_m_blocks_and_seqlen(
             lane_idx,
             batch_idx,
             mSeqUsedQ,
@@ -221,7 +221,6 @@ class FlashPrepareScheduler:
 
         num_splits_dynamic = Int32(1)
         if const_expr(n_blocks_per_split is not None):
-            # print("n_blocks_per_splits = ", n_blocks_per_split)
             num_splits_dynamic = cutlass.min(
                 cute.ceil_div(num_n_blocks, n_blocks_per_split), num_splits_static
             )
@@ -262,16 +261,6 @@ class FlashPrepareScheduler:
                     num_splits_dynamic = cutlass.max(num_splits_dynamic, Int32(1))
                 if num_splits_dynamic > 0:
                     num_n_blocks = cute.ceil_div(num_n_blocks, num_splits_dynamic)
-                # if tidx == 0:
-                #     cute.printf("num_batch = {}", num_batch)
-                #     cute.printf("num_m_blocks = {}", num_m_blocks)
-                #     cute.printf("num_n_blocks = {}", num_n_blocks)
-                #     cute.printf("total_blocks = {}", total_blocks)
-                #     cute.printf("numerator = {}", total_blocks * self.nheads_computed)
-                #     cute.printf("denominator num_sm = {}", num_sm)
-                #     cute.printf("blocks_per_sm = {}", blocks_per_sm)
-                #     cute.printf("sm margin = {}", sm_margin)
-                #     cute.printf("num_splits_dynamic = {}", num_splits_dynamic)
 
         if const_expr(self.sort):
             # TODO: Implement sort logic

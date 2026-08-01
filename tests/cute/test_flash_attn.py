@@ -3167,7 +3167,7 @@ def test_flash_attn_empty_q_varlen(causal):
         [0, seqlen_k_per_batch, 2 * seqlen_k_per_batch],
         dtype=torch.int32, device=device,
     )
-    total_k = int(cu_seqlens_k[-1].item())
+    total_k = 2 * seqlen_k_per_batch
 
     q = torch.empty(0, nheads, d, device=device, dtype=dtype)
     k = torch.randn(total_k, nheads_kv, d, device=device, dtype=dtype)
