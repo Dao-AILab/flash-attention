@@ -962,9 +962,7 @@ class VarlenDecoder(ParamsBase):
                 if cutlass.const_expr(self.mSeqUsedQ is not None):
                     seqlen = self.mSeqUsedQ[real_batch_idx]
                 else:
-                    seqlen = (
-                        self.mCuSeqlensQ[real_batch_idx + 1] - self.mCuSeqlensQ[real_batch_idx]
-                    )
+                    seqlen = self.mCuSeqlensQ[real_batch_idx + 1] - self.mCuSeqlensQ[real_batch_idx]
             if cutlass.const_expr(self.qhead_per_kvhead_packgqa > 1):
                 seqlen *= self.qhead_per_kvhead_packgqa
             return (

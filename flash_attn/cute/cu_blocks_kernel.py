@@ -176,8 +176,6 @@ class CuBlocksToBatchKernel:
         mCuTotalBlocks: cute.Tensor,
         mBlocksToBatchIdx: cute.Tensor,
     ):
-        block_idx = (
-            cute.arch.block_idx()[0] * self.num_threads + cute.arch.thread_idx()[0]
-        )
+        block_idx = cute.arch.block_idx()[0] * self.num_threads + cute.arch.thread_idx()[0]
         if block_idx < mBlocksToBatchIdx.shape[0]:
             mBlocksToBatchIdx[block_idx] = get_batch_from_cu_tensor(block_idx, mCuTotalBlocks)

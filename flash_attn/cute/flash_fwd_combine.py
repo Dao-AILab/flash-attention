@@ -508,7 +508,9 @@ class FlashAttentionForwardCombine:
                 if const_expr(not self.is_even_k):
                     tOpO = cute.make_rmem_tensor(cute.size(tOcO, mode=[2]), Boolean)
                     for k in cutlass.range(cute.size(tOpO), unroll_full=True):
-                        tOpO[k] = tOcO[0, 0, k][1] < mO_partial.shape[1] - k_block * self.k_block_size
+                        tOpO[k] = (
+                            tOcO[0, 0, k][1] < mO_partial.shape[1] - k_block * self.k_block_size
+                        )
                     # if cute.arch.thread_idx()[0] == 0 and k_block == 1: cute.print_tensor(tOpO)
 
                 load_O_partial = partial(
@@ -593,7 +595,9 @@ class FlashAttentionForwardCombine:
                     lse_sum[m] = cute.math.log(lse_sum_cur, fastmath=True) + lse_max
                     # Normalize scales
                     inv_sum = (
-                        0.0 if (lse_sum_cur == 0.0 or lse_sum_cur != lse_sum_cur) else 1.0 / lse_sum_cur
+                        0.0
+                        if (lse_sum_cur == 0.0 or lse_sum_cur != lse_sum_cur)
+                        else 1.0 / lse_sum_cur
                     )
                     ts2rrLSE[None, None, m].store(ts2rrLSE[None, None, m].load() * inv_sum)
                 # Store the scales exp(lse - lse_logsum) back to smem
