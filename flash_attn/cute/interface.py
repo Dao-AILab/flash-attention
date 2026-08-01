@@ -47,7 +47,7 @@ from flash_attn.cute.flash_bwd_postprocess import FlashAttentionBackwardPostproc
 from flash_attn.cute.flash_fwd_combine import FlashAttentionForwardCombine
 from flash_attn.cute.flash_fwd_mla_sm100 import FlashAttentionMLAForwardSm100
 from flash_attn.cute.prepare_scheduler import FlashPrepareScheduler, SchedulerMetadataTensorsTorch
-from flash_attn.cute.cu_blocks_kernel import CuSeqlensToBlocksKernel
+from flash_attn.cute.cu_blocks_kernel import CuSeqlensToBlocksKernel, CuBlocksToBatchKernel
 from flash_attn.cute.flash_bwd_mla_sm100 import FlashAttentionSparseMLABackwardSm100
 from flash_attn.cute.flash_bwd_mla_dq_dqv_sm100 import dQdQvGemmKernel
 from flash_attn.cute.flash_bwd_mla_dk_sm100 import dKGemmKernel
@@ -67,7 +67,9 @@ from flash_attn.cute.block_sparsity import (
     normalize_block_sparse_config_bwd,
 )
 
-BIN_BATCH_SEARCH_THRESH = 512 # SingleTileVarlenScheduler uses binary search to find batch above this
+BIN_BATCH_SEARCH_THRESH = 256 # SingleTileVarlenScheduler uses binary search to find batch above this
+# Where the cu hint applies, use an O(1) flat-block -> batch lookup instead of the binary search.
+USE_BLOCKS_TO_BATCH: bool = True
 
 def _parse_arch_str(arch_str):
     """Parse arch string (e.g. 'sm_80', 'sm_90a', '80', '100') to int (e.g. 80, 90, 100)."""
@@ -474,6 +476,39 @@ def _compute_tile_cumsum(
 
 
 _compute_tile_cumsum.compile_cache = get_jit_cache("tile_cumsum")
+
+
+def _blocks_to_batch_size(total_q, num_batch, tile_m, qhead_per_kvhead, pack_gqa):
+    """Upper bound on number of m_blocks in a given varlen invocation"""
+    seqlen_mult = qhead_per_kvhead if pack_gqa and qhead_per_kvhead > 1 else 1
+    return (total_q * seqlen_mult + num_batch * (tile_m - 1)) // tile_m + 1
+
+
+def _compute_blocks_to_batch(cu_total_blocks, num_blocks, device):
+    """Inverted index of _compute_tile_cumsum: flat scheduler block -> batch, int32, (num_blocks,).
+
+    Blocks past the last batch's range map to batch_size (invalid).
+    """
+    blocks_to_batch = torch.empty(num_blocks, dtype=torch.int32, device=device)
+    compile_key = ()
+    if compile_key not in _compute_blocks_to_batch.compile_cache:
+        cu_total_blocks_tensor, blocks_to_batch_tensor = [
+            to_cute_tensor(t, assumed_align=4, leading_dim=0)
+            for t in (cu_total_blocks, blocks_to_batch)
+        ]
+        _compute_blocks_to_batch.compile_cache[compile_key] = cute.compile(
+            CuBlocksToBatchKernel(),
+            cu_total_blocks_tensor,
+            blocks_to_batch_tensor,
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+            options="--enable-tvm-ffi",
+        )
+    if not is_fake_mode():
+        _compute_blocks_to_batch.compile_cache[compile_key](cu_total_blocks, blocks_to_batch)
+    return blocks_to_batch
+
+
+_compute_blocks_to_batch.compile_cache = get_jit_cache("blocks_to_batch")
 
 
 def _flash_attn_fwd(
@@ -897,6 +932,7 @@ def _flash_attn_fwd(
 
     reuse_scheduler_metadata = scheduler_metadata is not None
     is_varlen_q = cu_seqlens_q is not None or seqused_q is not None
+    cluster_shape_m = 2 if use_2cta_instrs else 1
     if use_dedicated_hd256_kernel:
         # The hd=256 2CTA fwd kernel does not support the dynamic-persistent scheduler.
         scheduler_metadata = None
@@ -927,7 +963,9 @@ def _flash_attn_fwd(
             seqused_k=seqused_k,
             seqlen_k_per_split=seqlen_k_per_split,
             q_stage=q_stage,
-            cluster_shape_m=2 if use_2cta_instrs else 1,
+            cluster_shape_m=cluster_shape_m,
+            total_q=total_q if cu_seqlens_q is not None else None,
+            use_clc_scheduler=use_clc_scheduler,
         )
 
     has_scheduler_metadata = scheduler_metadata is not None and not disable_scheduler_metadata
@@ -963,6 +1001,7 @@ def _flash_attn_fwd(
     # O(N^2) lookup; observed to be faster only for batch_size > BIN_BATCH_SEARCH_THRESH; this is tunable
     cu_total_m_blocks = None
     cu_total_splits_m_blocks = None
+    blocks_to_batch_idx = None
     use_single_tile_varlen_scheduler = tile_count_semaphore is None
     use_cu_hint = (
         is_varlen_q
@@ -977,6 +1016,7 @@ def _flash_attn_fwd(
     ):
         cu_total_m_blocks = scheduler_metadata.cu_total_m_blocks
         cu_total_splits_m_blocks = scheduler_metadata.cu_total_splits_m_blocks
+        blocks_to_batch_idx = scheduler_metadata.blocks_to_batch_idx
     elif use_cu_hint:
         cu_total_m_blocks, cu_total_splits_m_blocks = _compute_tile_cumsum(
             num_m_blocks=num_m_blocks,
@@ -986,8 +1026,15 @@ def _flash_attn_fwd(
             virtual_batch_idx=virtual_batch_idx,
             tile_size=tile_m,
             q_stage=q_stage,
+            cluster_shape_m=cluster_shape_m,
             qhead_per_kvhead=qhead_per_kvhead,
             pack_gqa=pack_gqa,
+        )
+    if blocks_to_batch_idx is None and USE_BLOCKS_TO_BATCH and cu_total_m_blocks is not None:
+        blocks_to_batch_idx = _compute_blocks_to_batch(
+            cu_total_m_blocks,
+            _blocks_to_batch_size(total_q, batch_size, tile_m, qhead_per_kvhead, pack_gqa),
+            cu_total_m_blocks.device,
         )
 
     is_static_persistent = (
@@ -1044,6 +1091,7 @@ def _flash_attn_fwd(
         tile_count_semaphore is not None,
         cu_total_m_blocks is not None,
         cu_total_splits_m_blocks is not None,
+        blocks_to_batch_idx is not None,
         seqlen_k_per_split,
         is_static_persistent,
         q is not None,
@@ -1114,6 +1162,7 @@ def _flash_attn_fwd(
             num_nheads_in_l2_tensor,
             cu_total_m_blocks_tensor,
             cu_total_splits_m_blocks_tensor,
+            blocks_to_batch_idx_tensor,
         ) = [
             to_cute_tensor(t, assumed_align=4, leading_dim=0)
             for t in (
@@ -1123,6 +1172,7 @@ def _flash_attn_fwd(
                 num_nheads_in_l2,
                 cu_total_m_blocks,
                 cu_total_splits_m_blocks,
+                blocks_to_batch_idx,
             )
         ]
 
@@ -1329,6 +1379,7 @@ def _flash_attn_fwd(
                     num_nheads_in_l2_tensor,
                     cu_total_m_blocks_tensor,
                     cu_total_splits_m_blocks_tensor,
+                    blocks_to_batch_idx_tensor,
                     max_seqlen_q,
                 ])
             elif arch // 10 in [8, 9, 12]:
@@ -1417,6 +1468,7 @@ def _flash_attn_fwd(
                     num_nheads_in_l2,
                     cu_total_m_blocks,
                     cu_total_splits_m_blocks,
+                    blocks_to_batch_idx,
                     max_seqlen_q,
                 ])
             elif arch // 10 in [8, 9, 12]:
@@ -3591,6 +3643,8 @@ def _get_scheduler_metadata(
     leftpad_k: Optional[torch.Tensor] = None,
     seqlen_k_per_split: Optional[int] = None,
     zfill_padded_output: bool = True,
+    total_q: Optional[int] = None,
+    use_clc_scheduler: bool = False,
 ) -> SchedulerMetadataTensorsTorch:
     device = None
     for t in [cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k]:
@@ -3634,7 +3688,9 @@ def _get_scheduler_metadata(
         num_nheads_in_l2 = (
             torch.empty(num_batch, dtype=torch.int32, device=device) if causal else None
         )
-        tile_count_semaphore = torch.empty(1, dtype=torch.int32, device=device)
+        tile_count_semaphore = (
+            torch.empty(1, dtype=torch.int32, device=device) if not use_clc_scheduler else None
+        )
 
         num_warps = min((num_batch + 30) // 31, 32)
         num_warps = 1 << (num_warps - 1).bit_length()
@@ -3787,6 +3843,17 @@ def _get_scheduler_metadata(
     else:
         cu_total_m_blocks, cu_total_splits_m_blocks = None, None
 
+    blocks_to_batch_idx = None
+    if USE_BLOCKS_TO_BATCH and cu_total_m_blocks is not None:
+        blocks_to_batch_idx = _compute_blocks_to_batch(
+            cu_total_m_blocks,
+            _blocks_to_batch_size(
+                total_q if total_q is not None else num_batch * max_seqlen_q,
+                num_batch, tile_m, qhead_per_kvhead, pack_gqa,
+            ),
+            cu_total_m_blocks.device,
+        )
+
     return SchedulerMetadataTensorsTorch(
         num_m_blocks_ptr=num_m_blocks,
         num_splits_dynamic_ptr=num_splits_dynamic,
@@ -3795,6 +3862,7 @@ def _get_scheduler_metadata(
         tile_count_semaphore=tile_count_semaphore,
         cu_total_m_blocks=cu_total_m_blocks,
         cu_total_splits_m_blocks=cu_total_splits_m_blocks,
+        blocks_to_batch_idx=blocks_to_batch_idx,
     )
 
 
@@ -3919,4 +3987,5 @@ def get_scheduler_metadata(
         leftpad_k=leftpad_k,
         seqlen_k_per_split=seqlen_k_per_split,
         zfill_padded_output=True,
+        use_clc_scheduler=utils._get_use_clc_scheduler_default(),
     )

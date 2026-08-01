@@ -217,6 +217,7 @@ class TileSchedulerArguments(ParamsBase):
     num_nheads_in_l2_ptr: Optional[cute.Tensor] = None
     cu_total_m_blocks_ptr: Optional[cute.Tensor] = None
     cu_total_splits_m_blocks_ptr: Optional[cute.Tensor] = None
+    blocks_to_batch_idx_ptr: Optional[cute.Tensor] = None
     tile_count_semaphore: Optional[cute.Pointer] = None
     persistent_cta_multiplier: cutlass.Constexpr[int] = 1
 
@@ -894,6 +895,7 @@ class VarlenDecoder(ParamsBase):
     num_nheads_in_l2_ptr: Optional[cute.Tensor] = None
     cu_total_m_blocks_ptr: Optional[cute.Tensor] = None
     cu_total_splits_m_blocks_ptr: Optional[cute.Tensor] = None
+    blocks_to_batch_idx_ptr: Optional[cute.Tensor] = None
 
     @staticmethod
     @cute.jit
@@ -936,6 +938,7 @@ class VarlenDecoder(ParamsBase):
             num_nheads_in_l2_ptr=args.num_nheads_in_l2_ptr,
             cu_total_m_blocks_ptr=args.cu_total_m_blocks_ptr,
             cu_total_splits_m_blocks_ptr=args.cu_total_splits_m_blocks_ptr,
+            blocks_to_batch_idx_ptr=args.blocks_to_batch_idx_ptr,
         )
 
     @cute.jit
@@ -1024,68 +1027,91 @@ class VarlenDecoder(ParamsBase):
             - group_start_tile
             - is_valid
         """
-        if const_expr(self.is_split_kv):
+        # The scan counts m_blocks unless splits are folded into it, so the cumsum used as a
+        # hint must match: cu_total_splits_m_blocks only applies to the folded (persistent)
+        # layout, where SingleTileVarlen keeps splits in a separate grid dim.
+        if const_expr(self.fold_splits_into_scan):
             cu_hint_ptr = self.cu_total_splits_m_blocks_ptr
         else:
             cu_hint_ptr = self.cu_total_m_blocks_ptr
         # Both SingleTileVarlen STATIC and CLC; not DynamicPersistent (where
         # warp-scan's _bidb_start resumption already amortizes per-call cost).
-        use_cumsum_hint = const_expr(
+        hint_mode_ok = const_expr(
             cu_hint_ptr is not None
             and (
                 self.scheduling_mode == SchedulingMode.STATIC
                 or self.scheduling_mode == SchedulingMode.CLC
             )
         )
-        if const_expr(use_cumsum_hint):
-            target = next_tile_idx // self.num_head
-            lo = utils.get_batch_from_cu_tensor(target, cu_hint_ptr)
-            group_size = Int32(cute.arch.WARP_SIZE - 1)
-            bidb_start = (lo // group_size) * group_size
-            group_start_tile = cu_hint_ptr[bidb_start] * self.num_head
+        # O(1) inverted index (flat block -> batch) replaces the warp scan outright. Needs the
+        # unfolded layout, where a batch owns a contiguous tile range given by the cumsum.
+        use_blocks_to_batch = const_expr(
+            hint_mode_ok
+            and self.blocks_to_batch_idx_ptr is not None
+            and not self.fold_splits_into_scan
+        )
+        use_cumsum_hint = const_expr(hint_mode_ok and not use_blocks_to_batch)
 
         lane_idx = cute.arch.lane_idx()
-        num_m_blocks = self._num_m_blocks(lane_idx, bidb_start=bidb_start)
-        num_splits = self._num_splits(lane_idx, bidb_start=bidb_start)
-        per_batch = num_m_blocks * num_splits if const_expr(self.is_split_kv) else num_m_blocks
-        cumulative = utils.warp_prefix_sum(per_batch, lane_idx)
-        m_blocks_in_group = cute.arch.shuffle_sync(cumulative, cute.arch.WARP_SIZE - 1)
-        group_end_tile = m_blocks_in_group * self.num_head + group_start_tile
-
-        batch_idx = bidb_start
-        while group_end_tile <= next_tile_idx:
-            batch_idx += cute.arch.WARP_SIZE - 1
-            if batch_idx >= self.num_batch:
-                batch_idx = Int32(self.num_batch)
-                group_end_tile = next_tile_idx + 1
+        if const_expr(use_blocks_to_batch):
+            batch_idx = Int32(self.blocks_to_batch_idx_ptr[next_tile_idx // self.num_head])
+            num_m_blocks, num_splits = Int32(0), Int32(1)
+            is_valid = batch_idx < self.num_batch
+            if is_valid:
+                cu_lo = cu_hint_ptr[batch_idx]
+                num_m_blocks = cu_hint_ptr[batch_idx + 1] - cu_lo
+                group_start_tile = cu_lo * self.num_head
             else:
-                num_m_blocks = self._num_m_blocks(lane_idx, bidb_start=batch_idx)
-                num_splits = self._num_splits(lane_idx, bidb_start=batch_idx)
-                per_batch = (
-                    num_m_blocks * num_splits if const_expr(self.is_split_kv) else num_m_blocks
-                )
-                cumulative = utils.warp_prefix_sum(per_batch, lane_idx)
-                m_blocks_in_group = cute.arch.shuffle_sync(cumulative, cute.arch.WARP_SIZE - 1)
-                group_end_tile += m_blocks_in_group * self.num_head
+                batch_idx = Int32(self.num_batch)
+        else:
+            if const_expr(use_cumsum_hint):
+                target = next_tile_idx // self.num_head
+                lo = utils.get_batch_from_cu_tensor(target, cu_hint_ptr)
+                group_size = Int32(cute.arch.WARP_SIZE - 1)
+                bidb_start = (lo // group_size) * group_size
+                group_start_tile = cu_hint_ptr[bidb_start] * self.num_head
 
-        is_valid = batch_idx < self.num_batch
-        if is_valid:
-            group_start_tile = group_end_tile - m_blocks_in_group * self.num_head
-            batch_idx_in_group = cute.arch.popc(
-                cute.arch.vote_ballot_sync(
-                    group_start_tile + cumulative * self.num_head <= next_tile_idx
+            num_m_blocks = self._num_m_blocks(lane_idx, bidb_start=bidb_start)
+            num_splits = self._num_splits(lane_idx, bidb_start=bidb_start)
+            per_batch = num_m_blocks * num_splits if const_expr(self.is_split_kv) else num_m_blocks
+            cumulative = utils.warp_prefix_sum(per_batch, lane_idx)
+            m_blocks_in_group = cute.arch.shuffle_sync(cumulative, cute.arch.WARP_SIZE - 1)
+            group_end_tile = m_blocks_in_group * self.num_head + group_start_tile
+
+            batch_idx = bidb_start
+            while group_end_tile <= next_tile_idx:
+                batch_idx += cute.arch.WARP_SIZE - 1
+                if batch_idx >= self.num_batch:
+                    batch_idx = Int32(self.num_batch)
+                    group_end_tile = next_tile_idx + 1
+                else:
+                    num_m_blocks = self._num_m_blocks(lane_idx, bidb_start=batch_idx)
+                    num_splits = self._num_splits(lane_idx, bidb_start=batch_idx)
+                    per_batch = (
+                        num_m_blocks * num_splits if const_expr(self.is_split_kv) else num_m_blocks
+                    )
+                    cumulative = utils.warp_prefix_sum(per_batch, lane_idx)
+                    m_blocks_in_group = cute.arch.shuffle_sync(cumulative, cute.arch.WARP_SIZE - 1)
+                    group_end_tile += m_blocks_in_group * self.num_head
+
+            is_valid = batch_idx < self.num_batch
+            if is_valid:
+                group_start_tile = group_end_tile - m_blocks_in_group * self.num_head
+                batch_idx_in_group = cute.arch.popc(
+                    cute.arch.vote_ballot_sync(
+                        group_start_tile + cumulative * self.num_head <= next_tile_idx
+                    )
                 )
-            )
-            batch_idx += batch_idx_in_group
-            num_m_blocks_prev_lane = (
-                Int32(0)
-                if batch_idx_in_group == 0
-                else cute.arch.shuffle_sync(cumulative, batch_idx_in_group - 1)
-            )
-            group_start_tile += num_m_blocks_prev_lane * self.num_head
-            num_m_blocks = cute.arch.shuffle_sync(num_m_blocks, batch_idx_in_group)
-            if const_expr(self.is_split_kv):
-                num_splits = cute.arch.shuffle_sync(num_splits, batch_idx_in_group)
+                batch_idx += batch_idx_in_group
+                num_m_blocks_prev_lane = (
+                    Int32(0)
+                    if batch_idx_in_group == 0
+                    else cute.arch.shuffle_sync(cumulative, batch_idx_in_group - 1)
+                )
+                group_start_tile += num_m_blocks_prev_lane * self.num_head
+                num_m_blocks = cute.arch.shuffle_sync(num_m_blocks, batch_idx_in_group)
+                if const_expr(self.is_split_kv):
+                    num_splits = cute.arch.shuffle_sync(num_splits, batch_idx_in_group)
 
         block, head_idx, split_idx = Int32(0), Int32(0), Int32(0)
         if is_valid:

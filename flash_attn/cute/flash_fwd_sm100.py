@@ -243,8 +243,11 @@ class FlashAttentionForwardSm100:
         self.use_clc_scheduler = (
             use_clc_scheduler
             and self.use_tma_KV
+            and not (has_tile_count_semaphore and is_varlen_q)
         )
-        self.dynamic_persistent = (has_tile_count_semaphore and is_varlen_q) or use_clc_scheduler
+        self.dynamic_persistent = (
+            has_tile_count_semaphore and is_varlen_q
+        ) or self.use_clc_scheduler
         self.is_persistent = self.dynamic_persistent or self.is_static_persistent
         self.sched_stages = 1
         if self.use_clc_scheduler:
@@ -430,6 +433,7 @@ class FlashAttentionForwardSm100:
         num_nheads_in_l2_ptr: Optional[cute.Tensor] = None,
         mCuTotalMBlocks: Optional[cute.Tensor] = None,
         mCuTotalSplitsMBlocks: Optional[cute.Tensor] = None,
+        mBlocksToBatchIdx: Optional[cute.Tensor] = None,
         max_seqlen_q: Int32 | int | None = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
@@ -713,6 +717,7 @@ class FlashAttentionForwardSm100:
             num_nheads_in_l2_ptr=num_nheads_in_l2_ptr,
             cu_total_m_blocks_ptr=mCuTotalMBlocks,
             cu_total_splits_m_blocks_ptr=mCuTotalSplitsMBlocks,
+            blocks_to_batch_idx_ptr=mBlocksToBatchIdx,
             tile_count_semaphore=tile_count_semaphore.iterator if tile_count_semaphore is not None else None,
         )
         tile_sched_params = TileScheduler.to_underlying_arguments(

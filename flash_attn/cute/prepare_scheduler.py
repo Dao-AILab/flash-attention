@@ -27,6 +27,7 @@ class SchedulerMetadataTensorsTorch(NamedTuple):
     # cu_total_splits_m_blocks[b+1] = sum_{i<=b} num_m_blocks[i] * num_splits_dynamic[i]
     cu_total_m_blocks: Optional[torch.Tensor] = None
     cu_total_splits_m_blocks: Optional[torch.Tensor] = None
+    blocks_to_batch_idx: Optional[torch.Tensor] = None
 
 
 class FlashPrepareScheduler:

@@ -6,6 +6,8 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, const_expr
 
+from flash_attn.cute.utils import get_batch_from_cu_tensor
+
 
 class CuSeqlensToBlocksKernel:
     def __init__(
@@ -145,3 +147,37 @@ class CuSeqlensToBlocksKernel:
                     base_splits += warp_split_count[idx]
             # warp_block_count / warp_split_count are reused by the next chunk.
             cute.arch.sync_threads()
+
+
+class CuBlocksToBatchKernel:
+    """Inverts a cumulative block count into a flat block -> batch lookup."""
+
+    def __init__(self, num_threads: int = 128):
+        self.num_threads = num_threads
+
+    @cute.jit
+    def __call__(
+        self,
+        mCuTotalBlocks: cute.Tensor,
+        mBlocksToBatchIdx: cute.Tensor,
+        # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
+        stream: cuda.CUstream = None,
+    ):
+        num_blocks = mBlocksToBatchIdx.shape[0]
+        self.kernel(mCuTotalBlocks, mBlocksToBatchIdx).launch(
+            grid=[(num_blocks + self.num_threads - 1) // self.num_threads, 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mCuTotalBlocks: cute.Tensor,
+        mBlocksToBatchIdx: cute.Tensor,
+    ):
+        block_idx = (
+            cute.arch.block_idx()[0] * self.num_threads + cute.arch.thread_idx()[0]
+        )
+        if block_idx < mBlocksToBatchIdx.shape[0]:
+            mBlocksToBatchIdx[block_idx] = get_batch_from_cu_tensor(block_idx, mCuTotalBlocks)
