@@ -8,10 +8,15 @@ Applies to: hangs, deadlocks, illegal-address traps, Xid faults, sanitizer
 reports, and numerical mismatches where the defect is **not visible in the CuteDSL
 source**. It does not apply to ordinary bugs where reading the code finds it.
 
-These rules were written after an investigation spent hours building fixes on a
-root-cause theory that was internally consistent, explained every observation, and
-was wrong. The theory was checkable in minutes and never checked. Treat the
-overhead below as cheap relative to that.
+These rules were written after a real investigation (anonymized here) spent hours
+building fixes on a root-cause theory that was internally consistent, explained
+every observation, and was wrong. The theory was checkable in minutes and never
+checked — the falsifying observation was already sitting in the session's own
+logs. Two successor theories followed. The last was adopted *after* the working
+fix landed, survived every validation run, and fell only when the fix itself was
+finally disassembled and turned out to contain nothing resembling the mechanism
+it was credited with. Three wrong mechanisms, one episode. Treat the overhead
+below as cheap relative to that.
 
 ---
 
@@ -22,8 +27,9 @@ rationale; this is the contract.
 
 1. **No patch before a checked prediction.** Write the theory block (Theory /
    Predicts / Falsified by / Cost to check / Status) into the ledger at
-   `agent_space/ledger_<bug-slug>.md` and run the check. Cannot name a falsifier
-   → not a theory → no patch.
+   `agent_space/ledger_<bug-slug>.md` and run the check — starting with evidence
+   already captured; the falsifier is often already in your logs. Cannot name a
+   falsifier → not a theory → no patch.
 2. **Trap-time evidence confirms only predictions registered in advance.** It
    never confirms a story assembled after looking at it.
 3. **Every hex offset, register name, or line number you cite must be greppable
@@ -32,7 +38,10 @@ rationale; this is the contract.
 4. **Validating a fix:** wipe the compile cache; run fixed and unfixed builds
    N ≥ 10 each; run the perturbation control (a semantically neutral edit — if it
    also "fixes" the bug, your green runs mean nothing about mechanism).
-5. **Two failed fixes on one theory, or three reconciliations to save it, kills
+5. **Before explaining why a fix works, disassemble it.** Diff normalized SASS of
+   the fixed and unfixed builds and confirm the fix's hypothesized action exists
+   in the binary at all. (Fixes have turned out to compile to a literal NOP.)
+6. **Two failed fixes on one theory, or three reconciliations to save it, kills
    it.** Restart from the evidence or escalate to a human.
 
 ---
@@ -57,13 +66,27 @@ Status:      UNTESTED | CONFIRMED | FALSIFIED
 If you cannot name a falsifier, you do not have a theory — you have a narrative.
 Narratives are fine as *candidates*; they do not get a patch.
 
-Illustration. Suppose the theory is that the compiler merged a plain SMEM address
-onto a cluster-rank-encoded base, making the load invalid on non-zero-rank CTAs.
-That predicts **every faulting CTA has non-zero rank** — minutes to check against
-the trap logs, and a single rank-0 fault kills it. A theory of this shape can
-absorb a great deal of patch effort before anyone thinks to run the check, because
-each failed patch reads as "the fix didn't reach the merge" rather than as
-evidence against the merge.
+Illustration, from the motivating episode. The theory was that the compiler had
+merged a plain SMEM address onto a cluster-rank-encoded base, making the load
+invalid on non-zero-rank CTAs. That predicts **every faulting CTA has non-zero
+rank** — minutes to check against the trap logs, and a single rank-0 fault kills
+it. The check was never run; two fixes were built on the theory and both failed,
+each failure reading as "the fix didn't reach the merge" rather than as evidence
+against the merge. When the trap logs were finally examined, **both captured
+traps were rank-0 CTAs** — the falsifying data had been in the session's own
+logs since before the first fix attempt. Hence the corollary: run the check
+first against evidence you already hold; only then design a new experiment.
+
+A caution about this example, which recurs through the doc because it is real:
+what transfers to the next bug is the failure **shape** — a coherent narrative,
+an unchecked cheap falsifier, patch effort absorbing contrary evidence — not the
+mechanisms. Address CSE, warp reconvergence, barrier asymmetry, `sync_warp`
+fixes: none of these is an elevated prior for a new bug. If one of them comes to
+mind because you read it here rather than because your evidence points there,
+that is availability bias; start from your bug's evidence. The discipline itself
+is domain-general — the ledger example under "Recording" runs the same protocol
+on a deterministic numerical mismatch with no trap, no hang, and no codegen
+mystery in sight.
 
 ---
 
@@ -130,6 +153,10 @@ one — reshuffles codegen. Consequences:
      no-op edit "fixes" the bug too, the real fix's green runs are worthless as
      evidence about mechanism — the defect is codegen-sensitive and the fix is,
      until proven otherwise, just another perturbation.
+   - *Instrumentation is a perturbation too.* A `printf` that makes the hang
+     vanish has not located the bug; it has demonstrated the defect is
+     timing/codegen-sensitive — which makes both controls above mandatory, and
+     makes "it stopped reproducing after I added logging" a red flag, not a fix.
 2. **Clear the cache when validating a fix.** `FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED=1`
    persists cubins at `/tmp/${USER}/flash_attention_cute_dsl_cache/`. A "fix
    confirmed" run that loaded a stale cubin confirms nothing. Wipe it, or run with
@@ -188,9 +215,31 @@ What it does **not** license: "the mechanism is X." The weaker fix may still wor
 by perturbation (see above), and sufficiency is not mechanism. Ablation results
 need the same N ≥ 10 repetition and cache hygiene as any other validation run.
 
+**Disassemble the fix before explaining it.** The strongest cheap check on any
+mechanism story: dump SASS for the fixed and unfixed builds (a FakeTensorMode
+compile works, needs no GPU memory, and can be verified bit-identical to the
+real-run compile), strip addresses/labels/lineinfo, and diff. Two questions:
+does the fix's hypothesized action appear in the binary at all, and is the total
+diff small enough to read end to end? In the motivating episode the
+weakest-primitive fix emitted no synchronization instruction whatsoever — a NOP
+plus a reshaped ptxas convergence region — and the accepted mechanism died on the
+spot, *after* it had passed every validation run. A mechanism story about a fix
+nobody has disassembled is a story about an imagined binary.
+
+**Rule-implication cross-check.** If the mechanism implies a general rule
+("pattern X requires Y before Z"), search the repo for an existing site with
+pattern X and no Y that runs correctly. One healthy counterexample kills the
+rule, and the search costs minutes. Example shape: a claimed rule
+"lane-predicated stores need a source-level sync before an aligned barrier" is
+refuted by any kernel that already runs that exact pattern correctly on every
+call.
+
 Also look for **an existing control**: often a run from earlier in the
 investigation already varies only the hypothesized trigger. Say plainly that it
-was not designed as a control when you use it that way.
+was not designed as a control when you use it that way, and hold it to the
+control's standard: it must differ from the failing configuration in **one
+variable**. A run that also changed layout, offsets, or preprocessing is not a
+control, and reinterpreting it as one is narrative-building, not evidence.
 
 ---
 
@@ -253,27 +302,34 @@ raw artifacts (trap logs, dumps) it cites. It is the artifact that makes "how
 many rescues has this theory needed" answerable. Shape:
 
 ```markdown
-# bwd hang, 2CTA hdim128 — ledger
+# fp16 mismatch, local attention hdim64 — ledger
 Toolchain: nvidia-cutlass-dsl 4.5.2, ptxas 13.0, driver 580.xx
-Repro: CUDA_VISIBLE_DEVICES=3 pytest tests/cute/test_flash_attn.py -k "..." (fails ~1 in 3)
+Repro: CUDA_VISIBLE_DEVICES=3 pytest tests/cute/test_flash_attn.py -k "..." (deterministic, fails every run)
 
 ## Evidence
 | Observed (artifact, file:line) | Inferred (causal claim) |
 |---|---|
-| trap.log:44 — faulting CTA has rank 1 | base address not cluster-mapped? |
-| trap.log:91 — faulting CTA has rank 0 | — |
+| diff.log:12 — first divergence at (b=0, h=2, q=191, d=17); q=191 is the last row of its m-block | tile-edge mask handling? |
 
 ## Theories
-### T1: compiler CSE'd plain SMEM base onto mapa-encoded base
-Predicts:      every faulting CTA has non-zero rank
-Falsified by:  any rank-0 fault in the trap logs
-Cost to check: 5 min (grep trap.log)
-Status:        FALSIFIED — Evidence row 2. Five minutes of grep; do not patch.
+### T1: local-window mask off by one on the diagonal n-block
+Predicts:      the set of divergent q-rows moves when n_block_size goes 128 → 64
+Falsified by:  divergent-row set unchanged across n_block_size
+Cost to check: 10 min (one recompile, diff the mismatch indices)
+Status:        CONFIRMED — set shifted exactly with the tile edge (diff_n64.log:3)
 Rescues:       0
 ```
 
+(The illustration in "The one rule" shows the same table catching a falsified
+theory; this one shows a confirmation earned by a discriminating prediction.
+Both cost minutes.)
+
 In the final report or commit message:
 
+- Lead with the two statuses stated separately: `Status: FIXED` (or not) and
+  `Mechanism: ESTABLISHED` (with the confirming prediction cited) or
+  `Mechanism: OPEN`. A report is allowed to stay at `Mechanism: OPEN`
+  indefinitely; promoting it costs a checked prediction, not a landed fix.
 - State unproven mechanisms **as hypotheses**, and name the experiment that would
   settle each one. Do not promote a plausible mechanism to a stated cause because
   the fix landed.
@@ -284,3 +340,8 @@ In the final report or commit message:
   the next reader — human or agent — that the answer was obvious, and destroys the
   information about which evidence was misleading. That information is the most
   reusable part of the investigation.
+- **Audit the lesson itself.** The post-mortem is a narrative artifact and can
+  repeat the fallacy one level up — first drafts reliably do. Give the final
+  report the same fresh-context adversarial review as the investigation. And do
+  not overcorrect into discarding an evidence class: trap-time data is
+  insufficient alone, not useless.
