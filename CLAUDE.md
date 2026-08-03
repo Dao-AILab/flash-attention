@@ -128,7 +128,16 @@ Env vars: `CUTE_CUBIN_PATH` (dump CUBIN/SASS), `CUTE_DSL_KEEP_PTX=1` (inspect PT
 
 ## Debugging GPU Kernels
 
-See `AI/DEBUG_2CTA.md` for kernel hang/deadlock debugging (printf bisection, pipeline barrier analysis, 2CTA pitfalls). See `AI/RACECHECK_TMA_HAZARD.md` for `compute-sanitizer` false positives with `cp.async.bulk`. See `AI/CLC_TRACE_DEBUG.md` for visualization of CLC scheduling.
+**Before proposing a root cause for any hang, deadlock, illegal-address trap, Xid fault, sanitizer report, or numerical mismatch that is not visible in the CuteDSL source, read `AI/DEBUG_METHODOLOGY.md` and follow its protocol** (falsifiable-prediction discipline, evidence tiers, fix-validation hygiene, hypothesis ledger in `agent_space/`).
+
+Tactical docs in `AI/`:
+- `DEBUG_2CTA.md` — kernel hang/deadlock debugging (printf bisection, pipeline barrier analysis, 2CTA pitfalls).
+- `RACECHECK_TMA_HAZARD.md` — `compute-sanitizer` false positives with `cp.async.bulk` (repro scripts: `racecheck_repro_1d_*.py`).
+- `CLC_TRACE_DEBUG.md` — visualization of CLC scheduling (`parse_clc_log.py`).
+- `SASS_MMA_ANALYSIS.md` — dumping SASS and analyzing HGMMA instruction mix.
+- `SM90_BLOCK_SIZE_TUNING.md` — choosing tile sizes/MMA configs on Hopper (`sm90_config_search.py`).
+- `SM90_R2P_MASKING_SASS.md` — SASS-level analysis of R2P predicate masking in SM90 forward.
+- `VARLEN_PREPROCESS_TILE_BUG.md` — post-mortem: varlen preprocess tile-size mismatch and padded-offset layout.
 
 Key tools:
 - `cute.printf` with thread guards (`tidx % 32 == 0`, `elect_one()`) for targeted output
