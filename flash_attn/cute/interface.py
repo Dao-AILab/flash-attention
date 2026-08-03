@@ -1225,6 +1225,7 @@ def _flash_attn_fwd(
                 has_aux_tensors=aux_tensors is not None,
                 q_subtile_factor=q_subtile_factor,
                 paged_kv_non_tma=page_size not in [None, tile_n],
+                has_tile_count_semaphore=tile_count_semaphore is not None,
             )
         elif arch // 10 in [10, 11]:
             if qv is not None:
@@ -1372,7 +1373,7 @@ def _flash_attn_fwd(
                 sparse_tensors,
                 AuxData(cute_aux_tensors, aux_scalars),
             ])
-            if arch // 10 in [10, 11] and not use_dedicated_hd256_kernel:
+            if arch // 10 in [9, 10, 11] and not use_dedicated_hd256_kernel:
                 compile_args.extend([
                     num_splits_dynamic_tensor,
                     tile_count_semaphore_tensor,
@@ -1383,7 +1384,7 @@ def _flash_attn_fwd(
                     blocks_to_batch_idx_tensor,
                     max_seqlen_q,
                 ])
-            elif arch // 10 in [8, 9, 12]:
+            elif arch // 10 in [8, 12]:
                 compile_args.extend([
                     cu_total_m_blocks_tensor,
                     cu_total_splits_m_blocks_tensor,
@@ -1461,7 +1462,7 @@ def _flash_attn_fwd(
                 else None,
                 AuxData(aux_tensors, aux_scalars),
             ])
-            if arch // 10 in [10, 11] and not use_dedicated_hd256_kernel:
+            if arch // 10 in [9, 10, 11] and not use_dedicated_hd256_kernel:
                 call_args.extend([
                     num_splits_dynamic,
                     tile_count_semaphore,
@@ -1472,7 +1473,7 @@ def _flash_attn_fwd(
                     blocks_to_batch_idx,
                     max_seqlen_q,
                 ])
-            elif arch // 10 in [8, 9, 12]:
+            elif arch // 10 in [8, 12]:
                 call_args.extend([
                     cu_total_m_blocks,
                     cu_total_splits_m_blocks,
@@ -3650,6 +3651,7 @@ def _get_scheduler_metadata(
     zfill_padded_output: bool = True,
     total_q: Optional[int] = None,
     use_clc_scheduler: bool = False,
+    dynamic_persistent: bool = False,
 ) -> SchedulerMetadataTensorsTorch:
     device = None
     for t in [cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k]:
@@ -3685,7 +3687,9 @@ def _get_scheduler_metadata(
 
     if needs_prepare_kernel:
         num_m_blocks = torch.empty(num_batch, dtype=torch.int32, device=device)
-        num_splits_dynamic = torch.empty(num_batch, dtype=torch.int32, device=device)
+        num_splits_dynamic = (
+            torch.empty(num_batch, dtype=torch.int32, device=device) if is_split_kv else None
+        )
         virtual_batch_idx = (
             torch.empty(num_batch, dtype=torch.int32, device=device) if sort else None
         )
@@ -3818,6 +3822,9 @@ def _get_scheduler_metadata(
         num_nheads_in_l2 = None
         tile_count_semaphore = None
 
+    if dynamic_persistent and tile_count_semaphore is None and not use_clc_scheduler:
+        tile_count_semaphore = torch.zeros(1, dtype=torch.int32, device=device)
+
     qhead_per_kvhead = nheads // nheads_kv
     # binary-search hint; only consumed by the single-tile scheduler above this batch
     has_varlen_info = (
@@ -3890,6 +3897,7 @@ def get_scheduler_metadata(
     seqused_k: Optional[torch.Tensor] = None,
     leftpad_k: Optional[torch.Tensor] = None,
     seqlen_k_per_split: Optional[int] = None,
+    dynamic_persistent: bool = False,
     _arch: Optional[int] = None,
 ) -> SchedulerMetadataTensorsTorch:
     """Prepares metadata tensors used by varlen tile schedulers (SingleTileVarlenScheduler
@@ -3899,6 +3907,7 @@ def get_scheduler_metadata(
         num_splits: maximum number of splits per batch entry that the prepare kernel can emit
         seqlen_k_per_split: for bitwise reproducibility between forward and backward, can fix
             an exact seqlen_k per split; num_splits is calculated accordingly.
+        dynamic_persistent: emit a tile_count_semaphore to select DynamicPersistentVarlenScheduler.
 
     Returns
         SchedulerMetadataTensorsTorch, a named tuple including:
@@ -3989,4 +3998,5 @@ def get_scheduler_metadata(
         seqlen_k_per_split=seqlen_k_per_split,
         zfill_padded_output=True,
         use_clc_scheduler=utils._get_use_clc_scheduler_default(),
+        dynamic_persistent=dynamic_persistent,
     )
