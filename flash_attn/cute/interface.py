@@ -2604,7 +2604,6 @@ def _flash_attn_bwd_sparse_mla(
     prealloc_dk = dk is not None
     prealloc_dqv = dqv is not None
     prealloc_dv = dv is not None
-    dq = dk = None
     if not prealloc_dq and q is not None:
         dq = torch.empty_like(q)
     if not prealloc_dk and k is not None:

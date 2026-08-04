@@ -2103,21 +2103,23 @@ class FlashAttentionSparseMLABackwardSm100:
 
                         for j in cutlass.range_constexpr(gmem_rows_per_thread):
                             gmem_n_idx = rIdxTopK[j]
-                            for w in cutlass.range_constexpr(2):
-                                dv_offset = (
-                                    self.hdimv // self.num_hdimv_splits * split  # 256 * split
-                                    + (self.hdimv // self.num_hdimv_splits // 2) * w  # 128 * w
-                                    + 32 * i
-                                )
-                                dv_offset += tdVcdV[0, j, 0][1]
-                                gmem_coord = (gmem_n_idx, dv_offset)
-                                dV_gmem_ptr = elem_pointer(mdV_cur, gmem_coord)
+                            # Skip -1 sentinel slots (invalid top-k entries)
+                            if gmem_n_idx >= 0:
+                                for w in cutlass.range_constexpr(2):
+                                    dv_offset = (
+                                        self.hdimv // self.num_hdimv_splits * split  # 256 * split
+                                        + (self.hdimv // self.num_hdimv_splits // 2) * w  # 128 * w
+                                        + 32 * i
+                                    )
+                                    dv_offset += tdVcdV[0, j, 0][1]
+                                    gmem_coord = (gmem_n_idx, dv_offset)
+                                    dV_gmem_ptr = elem_pointer(mdV_cur, gmem_coord)
 
-                                a = tSR_rdV[0, j, 0, w]
-                                b = tSR_rdV[1, j, 0, w]
-                                c = tSR_rdV[2, j, 0, w]
-                                d = tSR_rdV[3, j, 0, w]
-                                atomic_add_fp32x4(a, b, c, d, dV_gmem_ptr)
+                                    a = tSR_rdV[0, j, 0, w]
+                                    b = tSR_rdV[1, j, 0, w]
+                                    c = tSR_rdV[2, j, 0, w]
+                                    d = tSR_rdV[3, j, 0, w]
+                                    atomic_add_fp32x4(a, b, c, d, dV_gmem_ptr)
 
                     cute.arch.fence_view_async_tmem_load()
                     self.epi_barrier.arrive_and_wait()
