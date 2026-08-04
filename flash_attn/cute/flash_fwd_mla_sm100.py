@@ -31,6 +31,7 @@ from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute.mask import AttentionMask
 import flash_attn.cute.blackwell_helpers as fa_sm100_utils
+from flash_attn.cute.flash_fwd_sm100 import DescaleTensors
 from flash_attn.cute.softmax import SoftmaxSm100, apply_learnable_sink, load_learnable_sink
 from flash_attn.cute.tile_scheduler import (
     SchedulerState,
@@ -390,6 +391,9 @@ class FlashAttentionMLAForwardSm100:
         mSeqUsedK: Optional[cute.Tensor] = None,    # (b)
         mIndexTopk: Optional[cute.Tensor] = None,   # (b, s_q, topk)  or (total_q, topk) if there is cu_seqlens_q
         mPageTable: Optional[cute.Tensor] = None,
+        # Accepted for signature parity with FlashAttentionMLAForward1CtaSm100 (the
+        # interface passes it positionally on the shared qv path); fp8 is 1CTA-only.
+        descale_tensors: Optional[DescaleTensors] = None,
         window_size_left: Int32 | int | None = None,
         window_size_right: Int32 | int | None = None,
         learnable_sink: Optional[cute.Tensor] = None,
@@ -398,6 +402,7 @@ class FlashAttentionMLAForwardSm100:
         stream: cuda.CUstream = None,
     ):
         # fmt: on
+        assert descale_tensors is None, "fp8 descales are not supported by 2CTA MLA"
         self.store_P = mP is not None
         self.store_row_max = mRowMax is not None
         self.store_O_residual = mOlo is not None
