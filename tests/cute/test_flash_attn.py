@@ -1268,6 +1268,8 @@ def test_flash_attn_varlen_cumsum_metadata_paths(causal, cumsum_mode, qhead_per_
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_varlen_dynamic_persistent(causal, qhead_per_kvhead, zero_lengths):
     """DynamicPersistentVarlenScheduler via get_scheduler_metadata(dynamic_persistent=True)."""
+    if torch.cuda.get_device_capability()[0] not in (9, 10, 11):
+        pytest.skip("dynamic persistent scheduler requires SM90/SM100/SM110")
     device = "cuda"
     torch.manual_seed(0)
     random.seed(0)
@@ -1298,6 +1300,9 @@ def test_flash_attn_varlen_dynamic_persistent(causal, qhead_per_kvhead, zero_len
         mode="random" if zero_lengths else "third",
         zero_lengths=zero_lengths,
     )
+    if zero_lengths:
+        key_padding_mask[1] = False
+        key_padding_mask[2] = False
     (
         q_unpad,
         k_unpad,
@@ -1375,6 +1380,9 @@ def test_flash_attn_varlen_dynamic_persistent(causal, qhead_per_kvhead, zero_len
         upcast=False,
         reorder_ops=True,
     )
+    empty_k = ~key_padding_mask.any(dim=-1)
+    out_ref[empty_k] = 0.0
+    out_pt[empty_k] = 0.0
     fwd_atol = 2 * (out_ref + 0.3 - 0.3 - out_ref).abs().max().item()
     assert (out - out_ref).abs().max().item() <= 2 * (
         out_pt - out_ref

@@ -218,6 +218,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         assert num_splits_dynamic_ptr is None, "SplitKV is not supported on SM 9.0"
         self.dynamic_persistent = self.has_tile_count_semaphore and self.varlen_q
         self.is_persistent = self.dynamic_persistent
+        assert not (self.is_persistent and self.Q_in_regs), (
+            "persistent scheduling is incompatible with Q_in_regs: sO would alias sV, "
+            "which the deferred Q release does not protect"
+        )
         self.scheduling_mode = (
             SchedulingMode.DYNAMIC if self.dynamic_persistent else SchedulingMode.STATIC
         )
@@ -358,8 +362,16 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 if const_expr(not self.is_causal or self.is_local)
                 else SingleTileLPTScheduler
             )
+        if const_expr(max_seqlen_q is None):
+            eff_seqlen_q = cute.size(mQ.shape[0])
+        else:
+            eff_seqlen_q = (
+                max_seqlen_q
+                if const_expr(not self.pack_gqa)
+                else max_seqlen_q * self.qhead_per_kvhead
+            )
         tile_sched_args = TileSchedulerArguments(
-            cute.ceil_div(cute.size(mQ.shape[0]), self.tile_m),
+            cute.ceil_div(eff_seqlen_q, self.tile_m),
             cute.size(mQ.shape[2]),
             cute.size(mQ.shape[3])
             if const_expr(mCuSeqlensQ is None)
@@ -736,7 +748,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
         # TMA: only warp 0 loads. cp_async: all warps load.
         # When not use_tma_Q, all 128 producer threads participate in Q loading.
-        is_load_warp = warp_idx_in_wg == 0 or const_expr(not self.use_tma_KV or not self.use_tma_Q)
+        is_load_warp = warp_idx_in_wg == 0 or const_expr(self.num_sched_load_warps == 4)
         # KV loading restricted to warp 0 for TMA, all warps for non-TMA KV
         is_kv_load_warp = warp_idx_in_wg == 0 or const_expr(not self.use_tma_KV)
 
@@ -1257,8 +1269,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         )
                         O_should_accumulate = True
                 # Release Q pipeline so the producer can load the next tile's Q.
-                # When persistent, sO aliases sQ, so this is deferred until after the epilogue
-                # has finished reading sO.
+                # When persistent, sO aliases sQ, so this is deferred to after the epilogue.
                 if const_expr(not self.is_persistent):
                     pipeline_q.consumer_release_w_index(0)
                 # Last "half" iteration
@@ -1299,8 +1310,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 )
 
                 # Release Q pipeline so the producer can load the next tile's Q.
-                # When persistent, sO aliases sQ, so this is deferred until after the epilogue
-                # has finished reading sO.
+                # When persistent, sO aliases sQ, so this is deferred to after the epilogue.
                 if const_expr(not self.is_persistent):
                     pipeline_q.consumer_release_w_index(0)
 
@@ -1351,9 +1361,14 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 batch_idx,
             )
 
-            # sO aliases sQ: only now is it safe for the producer to overwrite it with the
-            # next tile's Q. The epilogue has waited for the O TMA store to finish reading sO.
+            # sO aliases sQ: with TMA O only warp 4 waits for the store to finish reading
+            # sO, so sync with it before releasing sQ to the producer.
             if const_expr(self.is_persistent):
+                if const_expr(self.use_tma_O):
+                    cute.arch.barrier(
+                        barrier_id=int(NamedBarrierFwd.EpilogueSOFree),
+                        number_of_threads=self.num_epilogue_threads,
+                    )
                 pipeline_q.consumer_release_w_index(0)
 
     @cute.jit

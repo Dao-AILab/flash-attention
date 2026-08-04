@@ -998,6 +998,9 @@ def _flash_attn_fwd(
         num_nheads_in_l2 = None
         tile_count_semaphore = None
 
+    if tile_count_semaphore is not None and arch // 10 == 9 and not is_varlen_q:
+        tile_count_semaphore = None
+
     # use binary batch search in SingleTileVarlenScheduler to avoid
     # O(N^2) lookup; observed to be faster only for batch_size > BIN_BATCH_SEARCH_THRESH; this is tunable
     cu_total_m_blocks = None
@@ -3671,6 +3674,7 @@ def _get_scheduler_metadata(
     assert not sort, "LPT batch sort not yet implemented"
 
     if seqlen_k_per_split is not None:
+        assert num_splits > 1, "seqlen_k_per_split has no effect with num_splits == 1"
         assert seqlen_k_per_split % tile_n == 0, "seqlen per split must be divisible by tile_n"
         n_blocks_per_split = seqlen_k_per_split // tile_n
         n_blocks_total = (max_seqlen_k + seqlen_k_new + tile_n - 1) // tile_n
@@ -3919,6 +3923,10 @@ def get_scheduler_metadata(
             extract dynamic num splits in the absense of num_splits_dynamic_ptr
     """
     arch = _get_device_arch() if _arch is None else _arch
+    if dynamic_persistent:
+        assert arch // 10 in (9, 10, 11), (
+            f"dynamic_persistent is only supported on SM90/SM100/SM110, got arch {arch}"
+        )
     if headdim_v is None:
         headdim_v = headdim
 
@@ -3997,6 +4005,6 @@ def get_scheduler_metadata(
         leftpad_k=leftpad_k,
         seqlen_k_per_split=seqlen_k_per_split,
         zfill_padded_output=True,
-        use_clc_scheduler=utils._get_use_clc_scheduler_default(),
+        use_clc_scheduler=utils._get_use_clc_scheduler_default() and arch // 10 in (10, 11),
         dynamic_persistent=dynamic_persistent,
     )

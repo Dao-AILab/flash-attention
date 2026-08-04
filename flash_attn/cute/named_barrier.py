@@ -10,6 +10,7 @@ class NamedBarrierFwd(enum.IntEnum):
     WarpSchedulerWG3 = enum.auto()
     PFull = enum.auto()
     PEmpty = enum.auto()
+    EpilogueSOFree = enum.auto()
 
 
 class NamedBarrierFwdSm100(enum.IntEnum):
