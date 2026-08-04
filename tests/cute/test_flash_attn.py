@@ -33,6 +33,7 @@ from flash_attn.cute.interface import (
     get_scheduler_metadata,
     _flash_attn_fwd,
     _flash_attn_bwd,
+    _flash_attn_bwd_sparse_mla,
 )
 
 def retry_on_oom(func):
@@ -2579,6 +2580,295 @@ def test_flash_attn_mla_absorbed(
             check_tensor_vs_ref("dK", dk, dk_ref, dk_pt)
             check_tensor_vs_ref("dV", dv, dv_ref, dv_pt)
             check_tensor_vs_ref("dQv", dqv, dqv_ref, dqv_pt)
+
+
+def causal_topk_indices(batch_size, seqlen_q, seqlen_k, topk_len, device):
+    """Top-k indices as produced by a causal sparse-attention selector: query t
+    gets min(t+1, seqlen_k, topk_len) valid keys drawn from [0, t], with
+    trailing -1 sentinel padding (the documented marker for invalid slots)."""
+    n_keys = max(seqlen_k, topk_len)
+    scores = torch.rand(batch_size, seqlen_q, n_keys, device=device)
+    key_idx = torch.arange(n_keys, device=device)
+    query_idx = torch.arange(seqlen_q, device=device)
+    invalid = (key_idx[None, None, :] > query_idx[None, :, None]) | (key_idx >= seqlen_k)[None, None, :]
+    scores.masked_fill_(invalid, float("-inf"))
+    val, idx = scores.topk(topk_len, dim=-1)
+    idx = idx.masked_fill(torch.isinf(val), -1)
+    return idx.to(torch.int32).contiguous()
+
+
+def plant_canary(shape, pad_words, device):
+    """Allocate a float32 buffer of `shape` with `pad_words` extra words on
+    each side holding int32 patterns 1..pad_words. Every pattern value is a
+    subnormal fp32 bit pattern, so a single misdirected red.add.f32 (even of
+    +0.0) flushes it to zero."""
+    numel = math.prod(shape)
+    parent = torch.zeros(pad_words + numel + pad_words, dtype=torch.float32, device=device)
+    pattern = torch.arange(1, pad_words + 1, dtype=torch.int32, device=device)
+    parent[:pad_words].view(torch.int32).copy_(pattern)
+    parent[-pad_words:].view(torch.int32).copy_(pattern)
+    return parent, parent[pad_words:-pad_words].view(shape)
+
+
+def check_canary(name, parent, pad_words):
+    expected = torch.arange(1, pad_words + 1, dtype=torch.int32)
+    for side, sl in (("before", slice(None, pad_words)), ("after", slice(-pad_words, None))):
+        got = parent[sl].view(torch.int32).cpu()
+        n_bad = (got != expected).sum().item()
+        assert n_bad == 0, (
+            f"{name}: {n_bad}/{pad_words} canary words {side} the buffer were "
+            f"corrupted by an out-of-bounds scatter"
+        )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("shared_kv", [False, True])
+@pytest.mark.parametrize("seqlen_q,seqlen_k", [(512, 512), (1024, 1024)])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_mla_sparse_bwd_sentinel(seqlen_q, seqlen_k, shared_kv, causal, dtype):
+    """Sparse-MLA backward with -1-padded gather_kv_indices, the padding any
+    causal top-k selector produces for early queries.
+
+    Regression test for unguarded sentinel scatters: the dV/dK backward
+    epilogues used to atomically accumulate at row -1 — out of bounds of the
+    (batch-sliced) buffer — corrupting adjacent memory even though the addend
+    is exactly 0.0, because red.add.f32 flushes subnormal destinations to zero
+    and canonicalizes NaN payloads. Checks that
+      1. grads match the reference through the public autograd path, and
+      2. int32 canaries planted directly before/after preallocated dk/dv
+         buffers are untouched by the scatter epilogues.
+    """
+    if not IS_SM100:
+        pytest.skip()
+    device = "cuda"
+    torch.random.manual_seed(0)
+    batch_size = 2
+    nheads, nheads_kv, hdim, hdimv = 128, 1, 64, 512
+    topk_len = 256
+
+    q_ref = torch.randn(batch_size, seqlen_q, nheads, hdim, device=device, dtype=dtype).requires_grad_()
+    k_ref = torch.randn(batch_size, seqlen_k, nheads_kv, hdim, device=device, dtype=dtype).requires_grad_()
+    v_ref = torch.randn(batch_size, seqlen_k, nheads_kv, hdimv, device=device, dtype=dtype).requires_grad_()
+    qv_ref = torch.randn(batch_size, seqlen_q, nheads, hdimv, device=device, dtype=dtype).requires_grad_()
+    gather_kv_indices = causal_topk_indices(batch_size, seqlen_q, seqlen_k, topk_len, device)
+
+    q, k, v, qv = [x.detach().clone().requires_grad_() for x in (q_ref, k_ref, v_ref, qv_ref)]
+    if shared_kv:
+        q, k, qv = qv, v, None
+        q_ref, k_ref, qv_ref = qv_ref, v_ref, None
+
+    out_ref, _ = attention_ref(
+        q_ref, k_ref, v_ref, causal=causal, qv=qv_ref, gather_kv_indices=gather_kv_indices
+    )
+    out_pt, _ = attention_ref(
+        q_ref, k_ref, v_ref, causal=causal, qv=qv_ref, gather_kv_indices=gather_kv_indices,
+        upcast=False, reorder_ops=True,
+    )
+
+    out, lse = flash_attn_func(
+        q, k, v, qv=qv, gather_kv_indices=gather_kv_indices, causal=causal, pack_gqa=True
+    )
+
+    g = torch.randn_like(out)
+    if shared_kv:
+        dq, dk = torch.autograd.grad(out, (q, k), g)
+        dv = dqv = None
+    else:
+        dq, dk, dv, dqv = torch.autograd.grad(out, (q, k, v, qv), g)
+
+    # Rerun the backward with preallocated dk/dv surrounded by canaries. The
+    # scatter epilogues write rows of hdim/hdimv fp32 words, so an unguarded
+    # -1 sentinel lands exactly in the pad before the buffer.
+    dv_parent, dv_buf = plant_canary((batch_size, seqlen_k, nheads_kv, hdimv), hdimv, device)
+    if shared_kv:
+        dk_parent = dk_buf = None
+    else:
+        dk_parent, dk_buf = plant_canary((batch_size, seqlen_k, nheads_kv, hdim), hdim, device)
+    with torch.no_grad():
+        fq, fk, fqv = (None, None, q) if shared_kv else (q, k, qv)
+        out2, lse2, p2, row_max2 = _flash_attn_fwd(
+            fq, fk, v, qv=fqv, causal=causal, gather_kv_indices=gather_kv_indices, pack_gqa=True
+        )
+        dq2, dk2, dv2, dqv2 = _flash_attn_bwd_sparse_mla(
+            fq, fk, v, fqv, out2, g, lse2, p2, row_max2, gather_kv_indices,
+            causal=causal, dk=dk_buf, dv=dv_buf,
+        )
+
+    if is_fake_mode():
+        # no more flash_attn cutedsl calls; skip data-dependent checks
+        return
+
+    assert (gather_kv_indices == -1).any(), "test must exercise sentinel slots"
+
+    fwd_atol = 2 * (out_ref + 0.3 - 0.3 - out_ref).abs().max().item()
+    assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item() + fwd_atol
+    assert not torch.isnan(lse).any(), "LSE contains NaN"
+
+    if shared_kv:
+        dq_ref, dk_ref = torch.autograd.grad(out_ref, (q_ref, k_ref), g)
+        dq_pt, dk_pt = torch.autograd.grad(out_pt, (q_ref, k_ref), g)
+        dv_ref = dqv_ref = dv_pt = dqv_pt = None
+    else:
+        dq_ref, dk_ref, dv_ref, dqv_ref = torch.autograd.grad(out_ref, (q_ref, k_ref, v_ref, qv_ref), g)
+        dq_pt, dk_pt, dv_pt, dqv_pt = torch.autograd.grad(out_pt, (q_ref, k_ref, v_ref, qv_ref), g)
+
+    print_diff_stats("dQ", dq, dq_ref, dq_pt)
+    print_diff_stats("dK", dk, dk_ref, dk_pt)
+    print_diff_stats("dV", dv, dv_ref, dv_pt)
+    print_diff_stats("dQv", dqv, dqv_ref, dqv_pt)
+
+    check_tensor_vs_ref("dQ", dq, dq_ref, dq_pt)
+    check_tensor_vs_ref("dK", dk, dk_ref, dk_pt)
+    check_tensor_vs_ref("dV", dv, dv_ref, dv_pt)
+    check_tensor_vs_ref("dQv", dqv, dqv_ref, dqv_pt)
+
+    check_canary("dV", dv_parent, hdimv)
+    if not shared_kv:
+        check_canary("dK", dk_parent, hdim)
+    # preallocated buffers must produce the same grads as internal allocation
+    if shared_kv:
+        check_tensor_vs_ref("dV(prealloc)", dv2, dk_ref, dk_pt)
+        check_tensor_vs_ref("dQv(prealloc)", dqv2, dq_ref, dq_pt)
+    else:
+        check_tensor_vs_ref("dQ(prealloc)", dq2, dq_ref, dq_pt)
+        check_tensor_vs_ref("dK(prealloc)", dk2, dk_ref, dk_pt)
+        check_tensor_vs_ref("dV(prealloc)", dv2, dv_ref, dv_pt)
+        check_tensor_vs_ref("dQv(prealloc)", dqv2, dqv_ref, dqv_pt)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("shared_kv", [False, True])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_mla_sparse_bwd_sentinel_varlen(shared_kv, causal, dtype):
+    """Varlen counterpart of test_flash_attn_mla_sparse_bwd_sentinel.
+
+    The varlen kernels are separate compile-time specializations, and the dK
+    epilogue applies the sentinel guard to the doc-relative index before
+    adding seqlen_k_offset — a -1 that slipped past the guard would land in
+    the previous doc's last row (in bounds, so only doc 0's row -1 is
+    canary-visible, same as batch 0 in the non-varlen test). Includes a doc
+    shorter than topk_len whose index rows are almost entirely sentinels.
+    """
+    if not IS_SM100:
+        pytest.skip()
+    device = "cuda"
+    torch.random.manual_seed(0)
+    nheads, nheads_kv, hdim, hdimv = 128, 1, 64, 512
+    topk_len = 256
+    seqlens = [512, 4, 1024]
+    total = sum(seqlens)
+    cu_bounds = [0] + list(itertools.accumulate(seqlens))
+    cu_seqlens = torch.tensor(cu_bounds, dtype=torch.int32, device=device)
+    max_seqlen = max(seqlens)
+
+    q_ref = torch.randn(total, nheads, hdim, device=device, dtype=dtype).requires_grad_()
+    k_ref = torch.randn(total, nheads_kv, hdim, device=device, dtype=dtype).requires_grad_()
+    v_ref = torch.randn(total, nheads_kv, hdimv, device=device, dtype=dtype).requires_grad_()
+    qv_ref = torch.randn(total, nheads, hdimv, device=device, dtype=dtype).requires_grad_()
+    # doc-relative key indices with -1 tail padding, packed along the token dim
+    gather_kv_indices = torch.cat(
+        [causal_topk_indices(1, L, L, topk_len, device)[0] for L in seqlens], dim=0
+    ).contiguous()
+
+    q, k, v, qv = [x.detach().clone().requires_grad_() for x in (q_ref, k_ref, v_ref, qv_ref)]
+    if shared_kv:
+        q, k, qv = qv, v, None
+        q_ref, k_ref, qv_ref = qv_ref, v_ref, None
+
+    # reference per doc (each doc is an independent attention problem)
+    outs_ref, outs_pt = [], []
+    for i in range(len(seqlens)):
+        s, e = cu_bounds[i], cu_bounds[i + 1]
+        doc = dict(causal=causal, gather_kv_indices=gather_kv_indices[s:e].unsqueeze(0))
+        o_ref, _ = attention_ref(
+            q_ref[s:e].unsqueeze(0), k_ref[s:e].unsqueeze(0), v_ref[s:e].unsqueeze(0),
+            qv=qv_ref[s:e].unsqueeze(0) if qv_ref is not None else None, **doc,
+        )
+        o_pt, _ = attention_ref(
+            q_ref[s:e].unsqueeze(0), k_ref[s:e].unsqueeze(0), v_ref[s:e].unsqueeze(0),
+            qv=qv_ref[s:e].unsqueeze(0) if qv_ref is not None else None,
+            upcast=False, reorder_ops=True, **doc,
+        )
+        outs_ref.append(o_ref[0])
+        outs_pt.append(o_pt[0])
+    out_ref = torch.cat(outs_ref, dim=0)
+    out_pt = torch.cat(outs_pt, dim=0)
+
+    out, lse = flash_attn_varlen_func(
+        q, k, v, qv=qv, cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
+        max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen,
+        gather_kv_indices=gather_kv_indices, causal=causal, pack_gqa=True,
+    )
+
+    g = torch.randn_like(out)
+    if shared_kv:
+        dq, dk = torch.autograd.grad(out, (q, k), g)
+        dv = dqv = None
+    else:
+        dq, dk, dv, dqv = torch.autograd.grad(out, (q, k, v, qv), g)
+
+    # canary rerun with preallocated dk/dv (see non-varlen test)
+    dv_parent, dv_buf = plant_canary((total, nheads_kv, hdimv), hdimv, device)
+    if shared_kv:
+        dk_parent = dk_buf = None
+    else:
+        dk_parent, dk_buf = plant_canary((total, nheads_kv, hdim), hdim, device)
+    with torch.no_grad():
+        fq, fk, fqv = (None, None, q) if shared_kv else (q, k, qv)
+        out2, lse2, p2, row_max2 = _flash_attn_fwd(
+            fq, fk, v, qv=fqv, cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen,
+            causal=causal, gather_kv_indices=gather_kv_indices, pack_gqa=True,
+        )
+        dq2, dk2, dv2, dqv2 = _flash_attn_bwd_sparse_mla(
+            fq, fk, v, fqv, out2, g, lse2, p2, row_max2, gather_kv_indices,
+            causal=causal,
+            cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen,
+            dk=dk_buf, dv=dv_buf,
+        )
+
+    if is_fake_mode():
+        # no more flash_attn cutedsl calls; skip data-dependent checks
+        return
+
+    assert (gather_kv_indices == -1).any(), "test must exercise sentinel slots"
+
+    fwd_atol = 2 * (out_ref + 0.3 - 0.3 - out_ref).abs().max().item()
+    assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item() + fwd_atol
+    assert not torch.isnan(lse).any(), "LSE contains NaN"
+
+    if shared_kv:
+        dq_ref, dk_ref = torch.autograd.grad(out_ref, (q_ref, k_ref), g)
+        dq_pt, dk_pt = torch.autograd.grad(out_pt, (q_ref, k_ref), g)
+        dv_ref = dqv_ref = dv_pt = dqv_pt = None
+    else:
+        dq_ref, dk_ref, dv_ref, dqv_ref = torch.autograd.grad(out_ref, (q_ref, k_ref, v_ref, qv_ref), g)
+        dq_pt, dk_pt, dv_pt, dqv_pt = torch.autograd.grad(out_pt, (q_ref, k_ref, v_ref, qv_ref), g)
+
+    print_diff_stats("dQ", dq, dq_ref, dq_pt)
+    print_diff_stats("dK", dk, dk_ref, dk_pt)
+    print_diff_stats("dV", dv, dv_ref, dv_pt)
+    print_diff_stats("dQv", dqv, dqv_ref, dqv_pt)
+
+    check_tensor_vs_ref("dQ", dq, dq_ref, dq_pt)
+    check_tensor_vs_ref("dK", dk, dk_ref, dk_pt)
+    check_tensor_vs_ref("dV", dv, dv_ref, dv_pt)
+    check_tensor_vs_ref("dQv", dqv, dqv_ref, dqv_pt)
+
+    check_canary("dV", dv_parent, hdimv)
+    if not shared_kv:
+        check_canary("dK", dk_parent, hdim)
+    if shared_kv:
+        check_tensor_vs_ref("dV(prealloc)", dv2, dk_ref, dk_pt)
+        check_tensor_vs_ref("dQv(prealloc)", dqv2, dq_ref, dq_pt)
+    else:
+        check_tensor_vs_ref("dQ(prealloc)", dq2, dq_ref, dq_pt)
+        check_tensor_vs_ref("dK(prealloc)", dk2, dk_ref, dk_pt)
+        check_tensor_vs_ref("dV(prealloc)", dv2, dv_ref, dv_pt)
+        check_tensor_vs_ref("dQv(prealloc)", dqv2, dqv_ref, dqv_pt)
 
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
