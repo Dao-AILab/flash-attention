@@ -994,6 +994,8 @@ class FlashAttentionBackwardSm90:
                             producer_state_Q.advance()
                             producer_state_dO.advance()
                     else:
+                        # The wait for bwd preprocess that the dense arm above does inline sits
+                        # in _load_q_do_block_sm90, at the same point in the load order.
                         producer_state_Q, producer_state_dO = produce_block_sparse_q_loads_bwd_sm90(
                             blocksparse_tensors,
                             batch_idx,
