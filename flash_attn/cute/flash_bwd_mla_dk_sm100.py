@@ -1117,13 +1117,15 @@ class dKGemmKernel:
                 else:
                     seqlen_k_idx = (batch, seqlen_k_idx_in_batch)
                 cute.copy(tiled_copy_c, tCsC[(None, None, topk_idx, c_buffer)], tCrC)
-                for j in cutlass.range_constexpr(cute.size(tCrC, mode=[1])):
-                    for i in cutlass.range_constexpr(cute.size(tCrC, mode=[0])):
-                        ptr = elem_pointer(tCgC, (i, j, subtile_idx, seqlen_k_idx))
-                        cute.arch.atomic_add(
-                            ptr=ptr,
-                            val=tCrC[i, j],
-                        )
+                # Skip -1 sentinel slots (invalid top-k entries)
+                if seqlen_k_idx_in_batch >= 0:
+                    for j in cutlass.range_constexpr(cute.size(tCrC, mode=[1])):
+                        for i in cutlass.range_constexpr(cute.size(tCrC, mode=[0])):
+                            ptr = elem_pointer(tCgC, (i, j, subtile_idx, seqlen_k_idx))
+                            cute.arch.atomic_add(
+                                ptr=ptr,
+                                val=tCrC[i, j],
+                            )
             epilog_sync_barrier.arrive_and_wait()
 
         epilog_sync_barrier.arrive_and_wait()

@@ -27,7 +27,7 @@ from flash_attn.cute.mask import AttentionMask
 import flash_attn.cute.blackwell_helpers as fa_sm100_utils
 from flash_attn.cute.softmax import SoftmaxSm100
 from flash_attn.cute.tile_scheduler import (
-    ClcState,
+    SchedulerState,
     SchedulingMode,
     TileSchedulerArguments,
     TileSchedulerProtocol,
@@ -992,7 +992,7 @@ class FlashAttentionMLAForwardSm100:
             clc_pipeline_consumer_group = pipeline.CooperativeGroup(
                 pipeline.Agent.Thread, cute.arch.WARP_SIZE * num_clc_consumer_warps
             )
-            clc = ClcState.create(
+            sched_ctx = SchedulerState.create_clc(
                 hw_scheduler=ClcDynamicPersistentTileScheduler.create(
                     self.tile_scheduler_cls.clc_problem_shape(tile_sched_params),
                     cute.arch.block_idx(),
@@ -1014,7 +1014,7 @@ class FlashAttentionMLAForwardSm100:
                     pipeline.PipelineUserType.Producer, self.sched_stages
                 ),
             )
-            tile_scheduler = self.tile_scheduler_cls.create(tile_sched_params, clc=clc)
+            tile_scheduler = self.tile_scheduler_cls.create(tile_sched_params, ctx=sched_ctx)
         else:
             tile_scheduler = self.tile_scheduler_cls.create(tile_sched_params)
         assert isinstance(tile_scheduler, TileSchedulerProtocol), (

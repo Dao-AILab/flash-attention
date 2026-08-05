@@ -1222,6 +1222,35 @@ def test_flash_attn_combine(num_splits, seqlen, d, dtype):
     # pytorch_profiler(flash_attn_combine, out_partial, lse_partial)
     # pytorch_profiler(torch.sum, out_partial)
 
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_flash_attn_varlen_combine_linearize(dtype):
+    if DISABLE_SPLIT or DISABLE_HDIM128:
+        pytest.skip()
+    device = "cuda"
+    torch.random.manual_seed(0)
+    batch_size, nheads, nheads_kv, d = 64, 6, 2, 128
+    seqlen_k = 512
+    seqlens_q = torch.ones(batch_size, dtype=torch.int32, device=device)
+    seqlens_q[40] = 512  # single prefill in the second warp-group -> ~1.8% dense
+    cu_seqlens_q = F.pad(torch.cumsum(seqlens_q, dim=0, dtype=torch.int32), (1, 0))
+    cu_seqlens_k = torch.arange(batch_size + 1, device=device, dtype=torch.int32) * seqlen_k
+    total_q, total_k = int(seqlens_q.sum()), batch_size * seqlen_k
+    max_seqlen_q = int(seqlens_q.max())
+
+    q = torch.randn(total_q, nheads, d, device=device, dtype=dtype)
+    k = torch.randn(total_k, nheads_kv, d, device=device, dtype=dtype)
+    v = torch.randn(total_k, nheads_kv, d, device=device, dtype=dtype)
+
+    def run(num_splits):
+        return flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k,
+                                      max_seqlen_q, seqlen_k, num_splits=num_splits)
+
+    out_ref = run(1)  # unsplit baseline (no combine kernel)
+    out = run(4)      # split-KV combine, routed through LINEARIZE_M_AND_BATCH
+    assert (out - out_ref).abs().max().item() <= 2e-3
+
+
 def test_flash3_bw_compatibility() -> None:
     # Let's try to always stay backward compatible! This will make life easier
     # for downstream libaries, users, and exported models.

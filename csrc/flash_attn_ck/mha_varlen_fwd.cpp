@@ -342,7 +342,8 @@ mha_varlen_fwd(at::Tensor &q,                   // total_q x num_heads x head_si
                int window_size_right,
                const float /*softcap*/,
                const bool return_dropout_randval,
-               std::optional<at::Generator> gen_)
+               std::optional<at::Generator> gen_,
+               int /*num_splits*/)
 {
     auto q_dtype = q.dtype();
     TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,

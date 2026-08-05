@@ -7,9 +7,8 @@
 #include "namespace_config.h"
 
 #include <cuda.h>
+#include <cstdint>
 #include <vector>
-
-#include <ATen/cuda/CUDAGeneratorImpl.h> // For at::Generator and at::PhiloxCudaState
 
 namespace FLASH_NAMESPACE {
 constexpr int TOTAL_DIM = 0;
@@ -118,8 +117,13 @@ struct Flash_fwd_params : public Qkv_params {
     int window_size_left, window_size_right;
     float softcap;
 
-    // Random state.
-    at::PhiloxCudaState philox_args;
+    // Random state, stored as an opaque buffer that will potentially hold at::PhiloxCudaState.
+    // We intentionally use an opaque buffer to allow the disabled dropout binary to stay
+    // free of unnecessary headers like <ATen/cuda/CUDAGeneratorImpl.h>.
+    // flash_api.cpp will write into this buffer via placement-new of an at::PhiloxCudaState
+    // (guarded by FLASHATTENTION_DISABLE_DROPOUT) and the forward kernel (in flash_fwd_kernel.h)
+    // will read it back via reinterpret_cast. Size validated by static_assert in flash_api.cpp.
+    uint64_t philox_args[4];
 
     // Pointer to the RNG seed (idx 0) and offset (idx 1).
     uint64_t * rng_state;

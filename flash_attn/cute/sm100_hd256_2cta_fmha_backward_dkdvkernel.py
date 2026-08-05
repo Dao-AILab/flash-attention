@@ -24,7 +24,7 @@ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
 from cutlass.utils import ClcDynamicPersistentTileScheduler
 from flash_attn.cute.tile_scheduler import (
-    ClcState,
+    SchedulerState,
     SM100_TMEM_CAPACITY_COLUMNS,
     make_sm100_thread_cooperative_group as make_thread_cooperative_group,
     Sm100FmhaClcDynamicTileSchedulerParams as FmhaClcDynamicTileSchedulerParams,
@@ -1062,7 +1062,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 pipeline.Agent.Thread, num_clc_consumer_threads
             )
             clc_response_ptr = storage.clc_response.data_ptr()
-            clc = ClcState.create(
+            clc = SchedulerState.create_clc(
                 hw_scheduler=ClcDynamicPersistentTileScheduler.create(
                     self.tile_sched_params.clc_hw_params(),
                     cute.arch.block_idx(),
