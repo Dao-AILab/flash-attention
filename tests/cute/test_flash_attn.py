@@ -77,6 +77,12 @@ def check_tensor_vs_ref(name, actual, ref, pt, rtol=2, atol=None):
     diff_pt_max = (pt - ref).abs().max().item()
     assert diff_max <= rtol * diff_pt_max + atol, f"{name}: {diff_max=} too large compared to {diff_pt_max=} for {rtol=}, {atol=}"
 
+def check_dsink_vs_ref(actual, ref, pt, rtol=2, atol=0.0):
+    ulp = torch.nextafter(ref.abs(), torch.full_like(ref, float("inf"))) - ref.abs()
+    diff = (actual - ref).abs()
+    tolerance = rtol * (pt - ref).abs().max().item() + 2 * ulp + atol
+    assert torch.all(diff <= tolerance), f"dSink: {diff=} exceeds {tolerance=}"
+
 # torch FakeTensorMode would enable fast cutedsl kernel compilation without allocating the actual GPU memory or running the kernel
 # When operating fake tensors, we cannot perform data-dependent operations (e.g., `tensor.max()`).
 USE_FAKE_TENSOR = int(os.getenv("FLASH_ATTENTION_FAKE_TENSOR", 0)) == 1
@@ -84,6 +90,7 @@ DISABLE_SPLIT = os.getenv("FLASH_ATTENTION_DISABLE_SPLIT", "FALSE") == "TRUE"
 # SplitKV is not supported on SM90 or SM120
 IS_SM90 = torch.cuda.get_device_capability()[0] == 9
 IS_SM100 = torch.cuda.get_device_capability()[0] == 10
+IS_SM110 = torch.cuda.get_device_capability()[0] == 11
 IS_SM120 = torch.cuda.get_device_capability()[0] == 12
 TEST_BWD_ONLY = False
 VERBOSE = True
@@ -262,8 +269,11 @@ def test_flash_attn_output(
             print("window size = ", window_size)
         # window_size = (-1, -1) if not local else (16, 0)
         if has_learnable_sink:
-            learnable_sink = torch.randn(nheads, dtype=torch.bfloat16, device=device)
+            learnable_sink_base = torch.randn(nheads, dtype=dtype, device=device)
+            learnable_sink_ref = learnable_sink_base.detach().clone().requires_grad_()
+            learnable_sink = learnable_sink_base.detach().clone().requires_grad_()
         else:
+            learnable_sink_ref = None
             learnable_sink = None
         # flash_attn_func exposes no descale kwargs (the kernel then uses descale=1),
         # so attention_ref must not apply descales either. Descale plumbing is
@@ -289,7 +299,7 @@ def test_flash_attn_output(
             v_descale=v_descale,
             window_size=window_size,
             attention_chunk=attention_chunk,
-            learnable_sink=learnable_sink,
+            learnable_sink=learnable_sink_ref,
             softcap=softcap,
         )
         out_pt, attn_pt = attention_ref(
@@ -305,7 +315,7 @@ def test_flash_attn_output(
             v_descale=v_descale,
             window_size=window_size,
             attention_chunk=attention_chunk,
-            learnable_sink=learnable_sink,
+            learnable_sink=learnable_sink_ref,
             softcap=softcap,
             upcast=False,
             reorder_ops=True,
@@ -389,7 +399,6 @@ def test_flash_attn_output(
                 or (d == 192 and dv == 128)
                 or (IS_SM100 and d == 256 and dv == 256 and softcap == 0.0)
             )
-            and learnable_sink is None
             # and False
             and not ((causal or local) and seqlen_k < seqlen_q)
         ):
@@ -399,7 +408,10 @@ def test_flash_attn_output(
                 pytest.xfail("SM90 GQA bwd currently requires headdim == headdim_v")
             g = torch.randn_like(out)
             # do_o = ((g.float() * out.float()).sum(-1)).transpose(1, 2)
-            dq, dk, dv = torch.autograd.grad(out, (q, k, v), g)
+            grad_tensors = (q, k, v, learnable_sink) if has_learnable_sink else (q, k, v)
+            grads = torch.autograd.grad(out, grad_tensors, g)
+            dq, dk, dv = grads[:3]
+            dsink = grads[3] if has_learnable_sink else None
             if is_fake_mode():
                 # no more flash_attn cutedsl calls for the rest of the loop
                 # skip data-dependent postprocessing
@@ -417,10 +429,17 @@ def test_flash_attn_output(
             # breakpoint()
 
             # dq, dk, dv = torch.autograd.grad(out, (q, k, v), g)
-            dq_ref, dk_ref, dv_ref = torch.autograd.grad(
-                out_ref, (q_ref, k_ref, v_ref), g
+            grad_tensors_ref = (
+                (q_ref, k_ref, v_ref, learnable_sink_ref)
+                if has_learnable_sink
+                else (q_ref, k_ref, v_ref)
             )
-            dq_pt, dk_pt, dv_pt = torch.autograd.grad(out_pt, (q_ref, k_ref, v_ref), g)
+            grads_ref = torch.autograd.grad(out_ref, grad_tensors_ref, g)
+            dq_ref, dk_ref, dv_ref = grads_ref[:3]
+            dsink_ref = grads_ref[3] if has_learnable_sink else None
+            grads_pt = torch.autograd.grad(out_pt, grad_tensors_ref, g)
+            dq_pt, dk_pt, dv_pt = grads_pt[:3]
+            dsink_pt = grads_pt[3] if has_learnable_sink else None
             print(f"dQ max diff: {(dq - dq_ref).abs().max().item()}")
             print(f"dK max diff: {(dk - dk_ref).abs().max().item()}")
             print(f"dV max diff: {(dv - dv_ref).abs().max().item()}")
@@ -472,6 +491,159 @@ def test_flash_attn_output(
             assert (dv - dv_ref).abs().max().item() <= rtol * (
                 dv_pt - dv_ref
             ).abs().max().item() + dv_atol
+            if has_learnable_sink:
+                assert dsink.dtype == learnable_sink.dtype
+                check_dsink_vs_ref(
+                    dsink,
+                    dsink_ref,
+                    dsink_pt,
+                    rtol=rtol,
+                    atol=0 if softcap == 0 else 3e-4,
+                )
+
+
+@pytest.mark.skipif(
+    not (IS_SM90 or IS_SM100 or IS_SM110),
+    reason="Learnable sink backward requires SM90, SM100, or SM110",
+)
+@pytest.mark.parametrize(
+    "sink_dtype",
+    [torch.float16, torch.bfloat16, torch.float32],
+    ids=["fp16", "bf16", "fp32"],
+)
+@retry_on_oom
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_learnable_sink_backward_dtype(sink_dtype):
+    torch.random.manual_seed(0)
+    batch_size, seqlen, nheads, d = 9, 128, 6, 64
+    device, dtype = "cuda", torch.bfloat16
+    q, k, v = [
+        torch.randn(
+            batch_size,
+            seqlen,
+            nheads,
+            d,
+            device=device,
+            dtype=dtype,
+            requires_grad=True,
+        )
+        for _ in range(3)
+    ]
+    sink_base = torch.randn(nheads, device=device, dtype=sink_dtype)
+    sink_ref = sink_base.detach().clone().requires_grad_()
+    sink = sink_base.detach().clone().requires_grad_()
+
+    out_ref, _ = attention_ref(q, k, v, None, None, learnable_sink=sink_ref)
+    out_pt, _ = attention_ref(
+        q,
+        k,
+        v,
+        None,
+        None,
+        learnable_sink=sink_ref,
+        upcast=False,
+        reorder_ops=True,
+    )
+    out, _ = flash_attn_func(q, k, v, learnable_sink=sink)
+    dout = torch.randn_like(out)
+    dsink = torch.autograd.grad(out, (q, k, v, sink), dout)[-1]
+    if is_fake_mode():
+        return
+
+    dsink_ref = torch.autograd.grad(out_ref, sink_ref, dout)[0]
+    dsink_pt = torch.autograd.grad(out_pt, sink_ref, dout)[0]
+    assert dsink.dtype == sink_dtype
+    check_dsink_vs_ref(dsink, dsink_ref, dsink_pt)
+
+
+@pytest.mark.skipif(
+    not (IS_SM90 or IS_SM100 or IS_SM110),
+    reason="Learnable sink backward requires SM90, SM100, or SM110",
+)
+@pytest.mark.parametrize(
+    "sink_dtype",
+    [torch.float16, torch.bfloat16, torch.float32],
+    ids=["fp16", "bf16", "fp32"],
+)
+@retry_on_oom
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_varlen_learnable_sink_backward_with_lse(sink_dtype):
+    torch.random.manual_seed(0)
+    batch_size, seqlen_q, seqlen_k, nheads, d = 3, 5, 2, 2, 64
+    device, dtype = "cuda", torch.bfloat16
+    q_ref = torch.randn(
+        batch_size, seqlen_q, nheads, d, device=device, dtype=dtype, requires_grad=True
+    )
+    k_ref, v_ref = [
+        torch.randn(
+            batch_size,
+            seqlen_k,
+            nheads,
+            d,
+            device=device,
+            dtype=dtype,
+            requires_grad=True,
+        )
+        for _ in range(2)
+    ]
+    sink_ref = torch.randn(nheads, device=device, dtype=sink_dtype, requires_grad=True)
+    q_lengths = torch.tensor([5, 3, 0], device=device)
+    k_lengths = torch.tensor([2, 0, 1], device=device)
+    q_mask = torch.arange(seqlen_q, device=device) < q_lengths[:, None]
+    k_mask = torch.arange(seqlen_k, device=device) < k_lengths[:, None]
+    q, indices_q, cu_seqlens_q, max_seqlen_q, _ = unpad_input(q_ref, q_mask)
+    k, indices_k, cu_seqlens_k, max_seqlen_k, _ = unpad_input(k_ref, k_mask)
+    v, *_ = unpad_input(v_ref, k_mask)
+    q, k, v = [tensor.detach().requires_grad_() for tensor in (q, k, v)]
+    sink = sink_ref.detach().requires_grad_()
+
+    out, lse = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        causal=True,
+        learnable_sink=sink,
+        return_lse=True,
+    )
+    dout, dlse = torch.randn_like(out), torch.randn_like(lse)
+    grads = torch.autograd.grad((out, lse), (q, k, v, sink), (dout, dlse))
+    if is_fake_mode():
+        return
+
+    ref_args = (q_ref, k_ref, v_ref, q_mask, k_mask)
+    out_ref, _, lse_ref = attention_ref(
+        *ref_args, causal=True, learnable_sink=sink_ref, return_lse=True
+    )
+    out_pt, _, lse_pt = attention_ref(
+        *ref_args,
+        causal=True,
+        learnable_sink=sink_ref,
+        upcast=False,
+        reorder_ops=True,
+        return_lse=True,
+    )
+    dout_ref = pad_input(dout, indices_q, batch_size, seqlen_q)
+    dlse_ref = pad_input(dlse.transpose(0, 1), indices_q, batch_size, seqlen_q).transpose(1, 2)
+    grad_inputs_ref = (q_ref, k_ref, v_ref, sink_ref)
+    grads_ref = torch.autograd.grad((out_ref, lse_ref), grad_inputs_ref, (dout_ref, dlse_ref))
+    grads_pt = torch.autograd.grad((out_pt, lse_pt), grad_inputs_ref, (dout_ref, dlse_ref))
+    grads = (
+        pad_input(grads[0], indices_q, batch_size, seqlen_q),
+        pad_input(grads[1], indices_k, batch_size, seqlen_k),
+        pad_input(grads[2], indices_k, batch_size, seqlen_k),
+        grads[3],
+    )
+    for name, grad, grad_ref, grad_pt in zip(
+        ("dQ", "dK", "dV"), grads[:3], grads_ref[:3], grads_pt[:3]
+    ):
+        check_tensor_vs_ref(name, grad, grad_ref, grad_pt, rtol=3)
+    dsink, dsink_ref, dsink_pt = grads[3], grads_ref[3], grads_pt[3]
+    assert dsink.dtype == sink_dtype
+    check_dsink_vs_ref(dsink, dsink_ref, dsink_pt, rtol=3)
 
 
 # Regression test for #2591: SMEM overflow at small head_dims on SM100. The main
@@ -3609,8 +3781,6 @@ def test_flash_attn_ex2_emu_decode_prefill_consistency(seqlen_k):
     assert torch.equal(out_prefill[-1], out_decode[0]), (
         f"decode↔prefill diverged: max_diff={max_diff}."
     )
-
-
 @pytest.mark.skipif(not IS_SM100, reason="SplitKV is only supported on SM100")
 @pytest.mark.skipif(DISABLE_SPLIT, reason="SplitKV disabled")
 @pytest.mark.parametrize("causal", [False, True])
