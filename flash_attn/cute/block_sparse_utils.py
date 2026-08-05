@@ -1636,6 +1636,13 @@ def _load_q_do_block_sm90(
     else:
         pipeline_Q.producer_acquire(producer_state_Q)
     load_Q(m_block, producer_state=producer_state_Q)
+    if load_kv:
+        # Wait for bwd preprocess to finish writing LSE and dPsum, and zeroing dQaccum. Same
+        # point in the load order as the dense arm's wait in flash_bwd_sm90.load(): after this
+        # block's K/Q loads, before the first load that reads preprocess output.
+        # load_kv is the tile's first-block marker -- the caller flips kv_loaded in the same
+        # branch that loads a block -- so this runs once per tile, like the dense arm's.
+        cute.arch.griddepcontrol_wait()
     load_LSE(m_block, producer_state=producer_state_Q)
 
     producer_state_dO_cur = (
