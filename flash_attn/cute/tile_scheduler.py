@@ -343,7 +343,8 @@ class SingleTileScheduler:
             obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
             values = values[n_items:]
         scheduler = SingleTileScheduler(*(tuple(obj_list)), loc=self._loc)
-        # Preserve the Python-only first-tile flag across CuTe reconstruction.
+        # Note: _is_first_block is a Python-only attribute omitted from MLIR values,
+        # so it must be restored explicitly after reconstruction.
         scheduler._is_first_block = self._is_first_block
         return scheduler
 
@@ -1389,7 +1390,7 @@ class SingleTileVarlenScheduler:
             obj_list.append(cutlass.new_from_mlir_values(obj, values[:n_items]))
             values = values[n_items:]
         scheduler = self.__class__(*obj_list, loc=self._loc)
-        # Preserve the Python-only first-tile flag across CuTe reconstruction.
+        # See the note on Python-only attributes in SingleTileScheduler.
         scheduler._is_first_block = self._is_first_block
         return scheduler
 
@@ -1836,7 +1837,7 @@ class Sm100FmhaStaticTileScheduler:
         scheduler = Sm100FmhaStaticTileScheduler(
             new_params, new_current_work_linear_idx, new_blk_coord, new_grid_shape
         )
-        # Preserve the Python-only first-tile flag across CuTe reconstruction.
+        # See the note on Python-only attributes in SingleTileScheduler.
         scheduler._is_first_block = self._is_first_block
         return scheduler
 
