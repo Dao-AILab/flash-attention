@@ -1055,13 +1055,19 @@ def _flash_attn_fwd(
             cu_total_m_blocks.device,
         )
 
+    # Tensor max_seqlen values (e.g. HF varlen) must not leak into the compile key:
+    # tensor identity changes on every call and defeats the JIT cache.
     is_static_persistent = (
         not causal
         and not local
         and cu_seqlens_q is None
         and seqused_q is None
         and not is_split_kv
-    ) or (max_m_blocks_leq_one and not is_split_kv)
+    ) or (
+        not torch.is_tensor(max_m_blocks_leq_one)
+        and max_m_blocks_leq_one
+        and not is_split_kv
+    )
 
     compile_key = (
         dtype,

@@ -7,20 +7,21 @@ import random
 
 import pytest
 import torch
-
 from einops import rearrange
 
-from flash_attn.cute.testing import (
-    attention_ref,
-    generate_random_padding_mask,
-    generate_qkv,
-    maybe_fake_tensor_mode,
-    is_fake_mode,
-)
+from flash_attn.cute.cache_utils import JITCache
 from flash_attn.cute.interface import (
+    _flash_attn_fwd,
+    flash_attn_combine,
     flash_attn_func,
     flash_attn_varlen_func,
-    flash_attn_combine,
+)
+from flash_attn.cute.testing import (
+    attention_ref,
+    generate_qkv,
+    generate_random_padding_mask,
+    is_fake_mode,
+    maybe_fake_tensor_mode,
 )
 
 USE_FAKE_TENSOR = int(os.getenv("FLASH_ATTENTION_FAKE_TENSOR", 0)) == 1
@@ -107,6 +108,54 @@ def test_flash_attn_output(seqlen_q, seqlen_k, d, causal, num_splits, mha_type, 
 # ---------------------------------------------------------------------------
 # Forward + backward (varlen with cu_seqlens)
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.skipif(USE_FAKE_TENSOR, reason="requires a data-dependent CUDA max")
+def test_flash_attn_varlen_tensor_max_seqlen_reuses_fwd_cache():
+    """A fresh CUDA scalar max_seqlen must not create a new compile key."""
+    device = "cuda"
+    dtype = torch.bfloat16
+    seqlens = torch.tensor([384, 320], dtype=torch.int32, device=device)
+    cu_seqlens = torch.cat(
+        [
+            torch.zeros(1, dtype=torch.int32, device=device),
+            seqlens.cumsum(0, dtype=torch.int32),
+        ]
+    )
+    total = int(cu_seqlens[-1].item())
+    q = torch.randn(total, 2, 64, device=device, dtype=dtype)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+
+    original_cache = _flash_attn_fwd.compile_cache
+    test_cache = JITCache()
+    _flash_attn_fwd.compile_cache = test_cache
+    try:
+        outputs = []
+        for _ in range(2):
+            max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
+            out, _ = flash_attn_varlen_func(
+                q,
+                k,
+                v,
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=max_seqlen,
+                max_seqlen_k=max_seqlen,
+            )
+            outputs.append(out)
+
+        assert torch.equal(outputs[0], outputs[1])
+        assert len(test_cache.cache) == 1
+        assert all(
+            not torch.is_tensor(value)
+            for key in test_cache.cache
+            for value in key
+        )
+    finally:
+        test_cache.clear()
+        _flash_attn_fwd.compile_cache = original_cache
+
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("mha_type", ["mha", "gqa", "mqa"])
