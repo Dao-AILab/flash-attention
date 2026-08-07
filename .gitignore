@@ -38,6 +38,7 @@ var/
 venv
 agent_space/
 benchmarks/results/
+profiler/
 
 # compile-time generated file
 flash_attn_config.py
