@@ -1,3 +1,4 @@
+import inspect
 import json
 from dataclasses import asdict, replace
 
@@ -16,6 +17,7 @@ from flash_attn.cute.config import (
     select_sm100_register_allocation,
     validate_fwd_config,
 )
+from flash_attn.cute.interface import _flash_attn_fwd
 
 _BASE_INPUTS = FwdHeuristicInputs(
     device_arch=100,
@@ -61,6 +63,13 @@ _BASE_INPUTS = FwdHeuristicInputs(
 
 def make_inputs(**changes) -> FwdHeuristicInputs:
     return _BASE_INPUTS._replace(**changes)
+
+
+def test_forward_config_is_optional_and_keyword_only():
+    parameter = inspect.signature(_flash_attn_fwd).parameters["config"]
+
+    assert parameter.kind is inspect.Parameter.KEYWORD_ONLY
+    assert parameter.default is None
 
 
 @pytest.mark.parametrize(
