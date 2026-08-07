@@ -906,7 +906,7 @@ def _flash_attn_fwd(
         assert tile_n == 128
 
         assert not is_split_kv, "split kv not supported with qv"
-        assert learnable_sink is None
+
         assert softcap is None
         assert score_mod is None
         assert mask_mod is None
@@ -1366,7 +1366,8 @@ def _flash_attn_fwd(
                 page_table_tensor,
                 window_size_left,
                 window_size_right,
-                current_stream,
+                learnable_sink = learnable_sink_tensor,
+                stream = current_stream,
                 options="--enable-tvm-ffi",
             )
         else:
@@ -1447,6 +1448,7 @@ def _flash_attn_fwd(
                 page_table,
                 window_size_left,
                 window_size_right,
+                learnable_sink
             )
         else:
             call_args = [
@@ -1660,7 +1662,7 @@ def _bwd_preprocess(
         nheads_major,
         pack_gqa,
         qhead_per_kvhead,
-        nheads_kv,
+        nheads_kv, 
         cu_total_m_blocks is not None,
     )
     if compile_key not in _bwd_preprocess.compile_cache:
