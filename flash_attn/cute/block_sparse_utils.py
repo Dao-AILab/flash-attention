@@ -1163,13 +1163,19 @@ def get_total_q_block_count_bwd(
     n_block,
     q_subtile_factor: cutlass.Constexpr = 1,
     m_block_max: int = 0,
+    num_sparse_m_blocks: int | None = None,
 ):
     """Count total tile iterations for given n_block (KV tile) in backward."""
-    q_block_cnt, _, full_block_cnt, _, *_ = blocksparse_tensors
-    total = q_block_cnt[batch_idx, head_idx, n_block]
-    if const_expr(full_block_cnt is not None):
-        total = total + full_block_cnt[batch_idx, head_idx, n_block]
-    return total * q_subtile_factor
+    *_, total = get_block_sparse_iteration_info_bwd(
+        blocksparse_tensors,
+        batch_idx,
+        head_idx,
+        n_block,
+        q_subtile_factor,
+        m_block_max,
+        num_sparse_m_blocks,
+    )
+    return total
 
 
 @cute.jit
@@ -1554,21 +1560,39 @@ def get_block_sparse_iteration_info_bwd(
     n_block,
     q_subtile_factor: cutlass.Constexpr = 1,
     m_block_max: int = 0,
+    num_sparse_m_blocks: int | None = None,
 ):
-    """Extract block-sparse iteration info for backward pass.
+    """Extract fixed or packed block-sparse iteration info for backward.
 
+    Packed metadata requires the sequence-local number of sparse M blocks.
     Returns (curr_q_cnt, curr_q_idx, curr_full_cnt, curr_full_idx, total_count).
     """
     q_cnt, q_idx, full_cnt, full_idx, *_ = blocksparse_tensors
-    curr_q_cnt = q_cnt[batch_idx, head_idx, n_block]
-    curr_q_idx = q_idx[batch_idx, head_idx, n_block, None]
-
-    if const_expr(full_cnt is not None):
-        curr_full_cnt = full_cnt[batch_idx, head_idx, n_block]
-        curr_full_idx = full_idx[batch_idx, head_idx, n_block, None]
+    if const_expr(len(q_cnt.shape) == 2):
+        assert num_sparse_m_blocks is not None
+        assert blocksparse_tensors.cu_total_n_blocks is not None
+        assert blocksparse_tensors.cu_block_idx_offsets is not None
+        global_n_block = blocksparse_tensors.cu_total_n_blocks[batch_idx] + n_block
+        block_idx_offset = (
+            blocksparse_tensors.cu_block_idx_offsets[batch_idx] + n_block * num_sparse_m_blocks
+        )
+        curr_q_cnt = q_cnt[head_idx, global_n_block]
+        curr_q_idx = cute.domain_offset(block_idx_offset, q_idx[head_idx, None])
+        if const_expr(full_cnt is not None):
+            curr_full_cnt = full_cnt[head_idx, global_n_block]
+            curr_full_idx = cute.domain_offset(block_idx_offset, full_idx[head_idx, None])
+        else:
+            curr_full_cnt = Int32(0)
+            curr_full_idx = None
     else:
-        curr_full_cnt = Int32(0)
-        curr_full_idx = None
+        curr_q_cnt = q_cnt[batch_idx, head_idx, n_block]
+        curr_q_idx = q_idx[batch_idx, head_idx, n_block, None]
+        if const_expr(full_cnt is not None):
+            curr_full_cnt = full_cnt[batch_idx, head_idx, n_block]
+            curr_full_idx = full_idx[batch_idx, head_idx, n_block, None]
+        else:
+            curr_full_cnt = Int32(0)
+            curr_full_idx = None
 
     sparse_block_count = curr_q_cnt
     if const_expr(full_cnt is not None):
@@ -1682,6 +1706,7 @@ def produce_block_sparse_q_loads_bwd_sm90(
     Q_stage_eq_dO_stage: cutlass.Constexpr,
     q_subtile_factor: cutlass.Constexpr,
     m_block_max: int,
+    num_sparse_m_blocks: int,
 ):
     """SM90 backward block sparse loading with separate partial/full loops.
 
@@ -1690,16 +1715,21 @@ def produce_block_sparse_q_loads_bwd_sm90(
 
     Returns updated (producer_state_Q, producer_state_dO).
     """
-    q_cnt, q_idx, full_cnt, full_idx, *_ = blocksparse_tensors
-    curr_q_cnt = q_cnt[batch_idx, head_idx, n_block]
-    curr_q_idx = q_idx[batch_idx, head_idx, n_block, None]
-
-    if const_expr(full_cnt is not None):
-        curr_full_cnt = full_cnt[batch_idx, head_idx, n_block]
-        curr_full_idx = full_idx[batch_idx, head_idx, n_block, None]
-    else:
-        curr_full_cnt = Int32(0)
-        curr_full_idx = None
+    (
+        curr_q_cnt,
+        curr_q_idx,
+        curr_full_cnt,
+        curr_full_idx,
+        _,
+    ) = get_block_sparse_iteration_info_bwd(
+        blocksparse_tensors,
+        batch_idx,
+        head_idx,
+        n_block,
+        q_subtile_factor,
+        m_block_max,
+        num_sparse_m_blocks,
+    )
 
     kv_loaded = False
 
@@ -1728,7 +1758,7 @@ def produce_block_sparse_q_loads_bwd_sm90(
             )
             kv_loaded = True
 
-    if const_expr(full_cnt is not None):
+    if const_expr(curr_full_idx is not None):
         for iter_idx in cutlass.range(curr_full_cnt * q_subtile_factor, unroll=1):
             sparse_idx = iter_idx // q_subtile_factor
             subtile_offset = iter_idx % q_subtile_factor
@@ -1771,10 +1801,11 @@ def consume_block_sparse_mma_bwd_sm90(
     is_causal: cutlass.Constexpr,
     is_local: cutlass.Constexpr,
     thr_mma_SdP,
+    q_subtile_factor: cutlass.Constexpr,
+    m_block_max: int,
+    num_sparse_m_blocks: int,
     score_mod_fn=None,
     score_mod_bwd_fn=None,
-    q_subtile_factor: cutlass.Constexpr = 1,
-    m_block_max: int = 0,
     aux_data: AuxData = AuxData(),
     fastdiv_mods=(None, None),
 ):
@@ -1785,16 +1816,21 @@ def consume_block_sparse_mma_bwd_sm90(
 
     Returns updated (consumer_state_Q, consumer_state_dO).
     """
-    q_cnt, q_idx, full_cnt, full_idx, *_ = blocksparse_tensors
-    curr_q_cnt = q_cnt[batch_idx, head_idx, n_block]
-    curr_q_idx = q_idx[batch_idx, head_idx, n_block, None]
-
-    if const_expr(full_cnt is not None):
-        curr_full_cnt = full_cnt[batch_idx, head_idx, n_block]
-        curr_full_idx = full_idx[batch_idx, head_idx, n_block, None]
-    else:
-        curr_full_cnt = Int32(0)
-        curr_full_idx = None
+    (
+        curr_q_cnt,
+        curr_q_idx,
+        curr_full_cnt,
+        curr_full_idx,
+        _,
+    ) = get_block_sparse_iteration_info_bwd(
+        blocksparse_tensors,
+        batch_idx,
+        head_idx,
+        n_block,
+        q_subtile_factor,
+        m_block_max,
+        num_sparse_m_blocks,
+    )
 
     dKV_accumulate = False
 
@@ -1842,7 +1878,7 @@ def consume_block_sparse_mma_bwd_sm90(
             )
             dKV_accumulate = True
 
-    if const_expr(full_cnt is not None):
+    if const_expr(curr_full_idx is not None):
         for iter_idx in cutlass.range(curr_full_cnt * q_subtile_factor, unroll=1):
             sparse_idx = iter_idx // q_subtile_factor
             subtile_offset = iter_idx % q_subtile_factor
@@ -1903,6 +1939,7 @@ def dQaccum_store_block_sparse_bwd_sm90(
     gdQaccum: cute.Tensor,
     q_subtile_factor: cutlass.Constexpr,
     m_block_max: int,
+    num_sparse_m_blocks: int,
     num_dQ_warp_groups: cutlass.Constexpr,
     num_threads_per_warp_group: cutlass.Constexpr,
     tma_copy_bytes_dQ,
@@ -1911,16 +1948,21 @@ def dQaccum_store_block_sparse_bwd_sm90(
 
     Iterates partial blocks first, then full blocks, matching producer/consumer order.
     """
-    q_cnt, q_idx, full_cnt, full_idx, *_ = blocksparse_tensors
-    curr_q_cnt = q_cnt[batch_idx, head_idx, n_block]
-    curr_q_idx = q_idx[batch_idx, head_idx, n_block, None]
-
-    if const_expr(full_cnt is not None):
-        curr_full_cnt = full_cnt[batch_idx, head_idx, n_block]
-        curr_full_idx = full_idx[batch_idx, head_idx, n_block, None]
-    else:
-        curr_full_cnt = Int32(0)
-        curr_full_idx = None
+    (
+        curr_q_cnt,
+        curr_q_idx,
+        curr_full_cnt,
+        curr_full_idx,
+        _,
+    ) = get_block_sparse_iteration_info_bwd(
+        blocksparse_tensors,
+        batch_idx,
+        head_idx,
+        n_block,
+        q_subtile_factor,
+        m_block_max,
+        num_sparse_m_blocks,
+    )
 
     for iter_idx in cutlass.range(curr_q_cnt * q_subtile_factor, unroll=1):
         sparse_idx = iter_idx // q_subtile_factor
@@ -1937,7 +1979,7 @@ def dQaccum_store_block_sparse_bwd_sm90(
                 tma_copy_bytes_dQ,
             )
 
-    if const_expr(full_cnt is not None):
+    if const_expr(curr_full_idx is not None):
         for iter_idx in cutlass.range(curr_full_cnt * q_subtile_factor, unroll=1):
             sparse_idx = iter_idx // q_subtile_factor
             subtile_offset = iter_idx % q_subtile_factor
