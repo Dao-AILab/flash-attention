@@ -55,7 +55,8 @@ __global__ void prepare_varlen_num_blocks_kernel(
         bool enable_pdl,
         bool is_causal,
         bool packgqa,
-        int max_kvblocks_in_l2) {
+        int max_kvblocks_in_l2,
+        bool batch_invariant) {
 
     static constexpr int kNumBatchPerWarp = cutlass::NumThreadsPerWarp - 1;
     static constexpr int kSmemSize = 1;
@@ -138,7 +139,14 @@ __global__ void prepare_varlen_num_blocks_kernel(
     };
     
     int num_splits_dynamic;
-    if (int(gridDim.x) > 1 || num_splits_static == 1) {
+    if (batch_invariant) {
+        // When batch_invariant, use static num_splits for all batches so that split
+        // boundaries depend only on per-sequence properties, not batch composition.
+        num_splits_dynamic = num_splits_static;
+        if (num_splits_dynamic > 1 && int(gridDim.x) == 1) {
+            num_n_blocks = cutlass::ceil_div(num_n_blocks, num_splits_dynamic);
+        }
+    } else if (int(gridDim.x) > 1 || num_splits_static == 1) {
         // set num splits for all batches to 1 (note that user expects num_splits_static to mean upper bound on splits)
         // for batch size > 992, we expect GPU occupancy to not be an issue except in degenerate cases (e.g., most are zero-length)
         num_splits_dynamic = 1;
@@ -157,7 +165,7 @@ __global__ void prepare_varlen_num_blocks_kernel(
         // blocks_per_sm = std::max(1, blocks_per_sm);  // 1 is the minimum number of blocks per SM
         num_splits_dynamic = std::max(std::min((num_n_blocks + blocks_per_sm - 1) / blocks_per_sm, num_splits_static), 1);
         // num_n_blocks per work tile for the batch
-        num_n_blocks = cutlass::ceil_div(num_n_blocks, num_splits_dynamic); 
+        num_n_blocks = cutlass::ceil_div(num_n_blocks, num_splits_dynamic);
     }
 
     if constexpr (Sort) {
@@ -244,7 +252,8 @@ void prepare_varlen_num_blocks(Flash_fwd_params &params, cudaStream_t stream, bo
                 enable_pdl,
                 params.is_causal,
                 packgqa,
-                max_kvblocks_in_l2);
+                max_kvblocks_in_l2,
+                params.batch_invariant);
         });
     });
 }
