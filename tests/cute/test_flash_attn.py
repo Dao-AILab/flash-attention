@@ -18,6 +18,7 @@ try:
 except ImportError:
     apply_rotary_emb = None
 
+from flash_attn.cute.cache_utils import JITCache
 from flash_attn.cute.testing import (
     attention_ref,
     generate_qkv,
@@ -103,6 +104,130 @@ def test_flash_attn_sm120_rejects_splitkv():
     v = torch.randn(1, 16, 1, 64, device="cuda", dtype=torch.bfloat16)
     with pytest.raises(AssertionError, match="SM120 forward only supports num_splits=1"):
         flash_attn_func(q, k, v, num_splits=3)
+
+
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability()[0] not in [10, 11] or USE_FAKE_TENSOR,
+    reason="SM100/SM110 runtime layout-cache test",
+)
+def test_flash_attn_cache_separates_broadcast_layouts(monkeypatch):
+    torch.manual_seed(0)
+    q = torch.randn(1, 65, 4, 64, device="cuda", dtype=torch.bfloat16)
+    k_base = torch.randn(1, 129, 1, 64, device="cuda", dtype=torch.bfloat16)
+    v_base = torch.randn_like(k_base)
+    layouts = (
+        (k_base.expand(-1, -1, 4, -1), v_base.expand(-1, -1, 4, -1)),
+        (
+            torch.randn(1, 129, 4, 64, device="cuda", dtype=torch.bfloat16),
+            torch.randn(1, 129, 4, 64, device="cuda", dtype=torch.bfloat16),
+        ),
+    )
+    cache = JITCache()
+    monkeypatch.setattr(_flash_attn_fwd, "compile_cache", cache)
+    for k, v in layouts:
+        out = _flash_attn_fwd(q, k, v)[0]
+        reference = torch.nn.functional.scaled_dot_product_attention(
+            q.float().transpose(1, 2),
+            k.float().transpose(1, 2),
+            v.float().transpose(1, 2),
+        ).transpose(1, 2)
+        torch.testing.assert_close(out.float(), reference, atol=0.04, rtol=0.04)
+    assert len(cache.cache) == 2
+
+
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability()[0] not in [10, 11] or USE_FAKE_TENSOR,
+    reason="SM100/SM110 runtime input-alignment test",
+)
+@pytest.mark.parametrize("layout", ["padded_stride", "unaligned_offset"])
+def test_flash_attn_canonicalizes_unaligned_inputs(layout):
+    torch.manual_seed(0)
+    shape = (1, 65, 4, 64)
+    if layout == "padded_stride":
+        inputs = tuple(
+            torch.randn(*shape[:-1], 65, device="cuda", dtype=torch.bfloat16)[..., :64]
+            for _ in range(3)
+        )
+    else:
+        inputs = tuple(
+            torch.as_strided(
+                torch.randn(math.prod(shape) + 1, device="cuda", dtype=torch.bfloat16),
+                shape,
+                (65 * 4 * 64, 4 * 64, 64, 1),
+                1,
+            )
+            for _ in range(3)
+        )
+
+    q, k, v = (tensor.detach().requires_grad_() for tensor in inputs)
+    q_ref, k_ref, v_ref = (
+        tensor.detach().float().requires_grad_() for tensor in (q, k, v)
+    )
+    out, _ = flash_attn_func(q, k, v)
+    reference = torch.nn.functional.scaled_dot_product_attention(
+        q_ref.transpose(1, 2),
+        k_ref.transpose(1, 2),
+        v_ref.transpose(1, 2),
+    ).transpose(1, 2)
+    torch.testing.assert_close(out.float(), reference, atol=0.04, rtol=0.04)
+
+    dout = torch.randn_like(out)
+    grads = torch.autograd.grad(out, (q, k, v), dout)
+    grads_ref = torch.autograd.grad(reference, (q_ref, k_ref, v_ref), dout.float())
+    for grad, grad_ref in zip(grads, grads_ref, strict=True):
+        torch.testing.assert_close(grad.float(), grad_ref, atol=0.05, rtol=0.05)
+
+
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability()[0] not in [10, 11] or USE_FAKE_TENSOR,
+    reason="SM100/SM110 runtime value-dimension shared-memory test",
+)
+def test_flash_attn_value_dim_larger_than_query_dim():
+    torch.manual_seed(0)
+    q = torch.randn(1, 129, 8, 64, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, 769, 8, 64, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(1, 769, 8, 128, device="cuda", dtype=torch.bfloat16)
+
+    out = _flash_attn_fwd(q, k, v)[0]
+    reference = torch.nn.functional.scaled_dot_product_attention(
+        q.float().transpose(1, 2),
+        k.float().transpose(1, 2),
+        v.float().transpose(1, 2),
+    ).transpose(1, 2)
+    torch.testing.assert_close(out.float(), reference, atol=0.04, rtol=0.04)
+
+
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability()[0] not in [10, 11] or USE_FAKE_TENSOR,
+    reason="SM100/SM110 runtime paged-KV tail-loading test",
+)
+def test_flash_attn_paged_non_tma_partial_loader_tile():
+    torch.manual_seed(0)
+    seqlen_q, seqlen_k, page_size, num_heads, head_dim = 65, 257, 16, 4, 64
+    pages_per_sequence = math.ceil(seqlen_k / page_size)
+    num_pages = pages_per_sequence + 3
+    page_ids = torch.randperm(num_pages, device="cuda")[:pages_per_sequence]
+    page_table = page_ids.to(torch.int32).unsqueeze(0)
+    q = torch.randn(1, seqlen_q, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(num_pages, page_size, num_heads, head_dim, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+
+    out = _flash_attn_fwd(
+        q,
+        k,
+        v,
+        seqused_k=torch.tensor([seqlen_k], device="cuda", dtype=torch.int32),
+        page_table=page_table,
+        tile_mn=(128, 192),
+    )[0]
+    k_ref = k[page_ids].reshape(-1, num_heads, head_dim)[:seqlen_k]
+    v_ref = v[page_ids].reshape(-1, num_heads, head_dim)[:seqlen_k]
+    reference = torch.nn.functional.scaled_dot_product_attention(
+        q.float().transpose(1, 2),
+        k_ref.float().transpose(0, 1).unsqueeze(0),
+        v_ref.float().transpose(0, 1).unsqueeze(0),
+    ).transpose(1, 2)
+    torch.testing.assert_close(out.float(), reference, atol=0.04, rtol=0.04)
 
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])

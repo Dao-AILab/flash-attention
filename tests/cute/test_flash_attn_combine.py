@@ -5,12 +5,17 @@ import random
 
 import pytest
 import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
 
+import flash_attn.cute.interface as interface
+from flash_attn.cute.cache_utils import JITCache
 from flash_attn.cute.testing import (
     maybe_fake_tensor_mode,
     is_fake_mode,
 )
 from flash_attn.cute.interface import (
+    _flash_attn_fwd,
+    _flash_attn_fwd_combine,
     flash_attn_combine,
 )
 
@@ -42,6 +47,87 @@ def check_combine_results(out, lse, out_ref, lse_ref, dtype):
         (out - out_ref).abs().max().item()
         <= 2 * (out_pt - out_ref).abs().max().item()
     ) or torch.allclose(out, out_pt, atol=1e-5, rtol=1e-5)
+
+
+def test_splitkv_forwards_explicit_arch(monkeypatch):
+    class HitCache:
+        def __contains__(self, _key):
+            return True
+
+    def unexpected_arch_query():
+        raise AssertionError("explicit architecture was not forwarded to combine")
+
+    monkeypatch.setattr(_flash_attn_fwd, "compile_cache", HitCache())
+    monkeypatch.setattr(_flash_attn_fwd_combine, "compile_cache", HitCache())
+    monkeypatch.setattr(interface, "_get_device_arch", unexpected_arch_query)
+    with FakeTensorMode():
+        q = torch.empty(1, 1, 8, 64, device="cuda", dtype=torch.bfloat16)
+        k = torch.empty(1, 1024, 8, 64, device="cuda", dtype=torch.bfloat16)
+        v = torch.empty_like(k)
+        _flash_attn_fwd(q, k, v, num_splits=2, _arch=100)
+
+
+@pytest.mark.skipif(USE_FAKE_TENSOR, reason="Runtime combine optional-input test")
+def test_flash_attn_combine_dynamic_splits_and_semaphore(monkeypatch):
+    torch.manual_seed(0)
+    num_splits, batch, seqlen, heads, head_dim = 3, 2, 17, 4, 64
+    out_partial = torch.randn(
+        num_splits,
+        batch,
+        seqlen,
+        heads,
+        head_dim,
+        device="cuda",
+        dtype=torch.float32,
+    )
+    lse_partial = torch.randn(
+        num_splits, batch, heads, seqlen, device="cuda", dtype=torch.float32
+    ).transpose(-1, -2)
+    out = torch.empty(
+        batch, seqlen, heads, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    lse = torch.empty(
+        batch, heads, seqlen, device="cuda", dtype=torch.float32
+    ).transpose(-1, -2)
+    dynamic_splits = torch.tensor([2, 3], device="cuda", dtype=torch.int32)
+    semaphore = torch.ones(1, device="cuda", dtype=torch.int32)
+
+    full_reference = attention_combine_ref(out_partial, lse_partial)
+    dynamic_references = [
+        attention_combine_ref(
+            out_partial[:split_count, batch_idx : batch_idx + 1],
+            lse_partial[:split_count, batch_idx : batch_idx + 1],
+        )
+        for batch_idx, split_count in enumerate((2, 3))
+    ]
+    dynamic_reference = (
+        torch.cat([reference[0] for reference in dynamic_references]),
+        torch.cat([reference[1] for reference in dynamic_references]),
+    )
+    cache = JITCache()
+    monkeypatch.setattr(_flash_attn_fwd_combine, "compile_cache", cache)
+
+    cases = (
+        (None, None, full_reference),
+        (dynamic_splits, None, dynamic_reference),
+        (None, semaphore, full_reference),
+        (dynamic_splits, semaphore, dynamic_reference),
+    )
+    for expected_cache_size, (dynamic_ptr, semaphore_ptr, reference) in enumerate(cases, 1):
+        if semaphore_ptr is not None:
+            semaphore_ptr.fill_(1)
+        _flash_attn_fwd_combine(
+            out_partial,
+            lse_partial,
+            out,
+            lse,
+            num_splits_dynamic_ptr=dynamic_ptr,
+            semaphore_to_reset=semaphore_ptr,
+        )
+        check_combine_results(out, lse, *reference, torch.bfloat16)
+        assert len(cache.cache) == expected_cache_size
+        if semaphore_ptr is not None:
+            assert semaphore_ptr.item() == 0
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
