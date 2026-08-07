@@ -2149,10 +2149,10 @@ class DSinkReductionKernel:
     @cute.jit
     def __call__(
         self,
-        mDpsum: cute.Tensor,         # (batch, seqlen_q, nheads) or (total_q, nheads)
-        mLSE: cute.Tensor,           # (batch, seqlen_q, nheads) or (total_q, nheads)
+        mDpsum: cute.Tensor,  # (batch, seqlen_q, nheads) or (total_q, nheads)
+        mLSE: cute.Tensor,  # (batch, seqlen_q, nheads) or (total_q, nheads)
         mLearnableSink: cute.Tensor,  # (nheads,)
-        mDSink: cute.Tensor,          # (nheads,)
+        mDSink: cute.Tensor,  # (nheads,)
         mCuSeqlensQ: Optional[cute.Tensor] = None,  # (batch + 1,)
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
