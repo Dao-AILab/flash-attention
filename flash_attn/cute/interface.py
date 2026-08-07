@@ -2594,6 +2594,48 @@ def _flash_attn_bwd(
 _flash_attn_bwd.compile_cache = get_jit_cache("bwd")
 
 
+def _bwd_dsink_reduce(dpsum, lse, learnable_sink, cu_seqlens_q=None):
+    """Compute dsink[h] = -sum_rows(exp(sink[h] - lse[row,h]) * dpsum[row,h])."""
+    from flash_attn.cute.flash_bwd_mla_sm100 import DSinkReductionKernel
+
+    dsink = torch.empty_like(learnable_sink)
+    is_varlen = cu_seqlens_q is not None
+
+    compile_key = (
+        is_varlen,
+        torch2cute_dtype_map[learnable_sink.dtype],
+    )
+    if compile_key not in _bwd_dsink_reduce.compile_cache:
+        kernel_obj = DSinkReductionKernel(num_threads=256)
+        dpsum_tensor = to_cute_tensor(dpsum)
+        lse_tensor = to_cute_tensor(lse)
+        sink_tensor = to_cute_tensor(learnable_sink, assumed_align=4, leading_dim=0)
+        dsink_tensor = to_cute_tensor(dsink, assumed_align=4, leading_dim=0)
+        cu_seqlens_q_tensor = (
+            to_cute_tensor(cu_seqlens_q, assumed_align=4, leading_dim=0)
+            if cu_seqlens_q is not None
+            else None
+        )
+        _bwd_dsink_reduce.compile_cache[compile_key] = cute.compile(
+            kernel_obj,
+            dpsum_tensor,
+            lse_tensor,
+            sink_tensor,
+            dsink_tensor,
+            cu_seqlens_q_tensor,
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+            options="--enable-tvm-ffi",
+        )
+    if not is_fake_mode():
+        _bwd_dsink_reduce.compile_cache[compile_key](
+            dpsum, lse, learnable_sink, dsink, cu_seqlens_q,
+        )
+    return dsink
+
+
+_bwd_dsink_reduce.compile_cache = get_jit_cache("bwd_dsink")
+
+
 def _flash_attn_bwd_sparse_mla(
     q: Optional[torch.Tensor],
     k: Optional[torch.Tensor],
@@ -2636,7 +2678,7 @@ def _flash_attn_bwd_sparse_mla(
     assert nheads_kv == 1 and qhead_per_kvhead == 128, f"sparse MLA bwd: only MQA 128 supported for now"
     assert gather_kv_length % 128 == 0, f"sparse MLA bwd: {gather_kv_length=} must be divisible by 128"
     assert deterministic is False, "sparse MLA bwd: deterministic mode not yet supported"
-    assert learnable_sink is None, "sparse MLA bwd: learnable sink not yet supported"
+    # learnable_sink is supported: dsink computed after main backward kernel
     assert seqused_q is None and seqused_k is None, "sparse MLA bwd: seqused_q,k not yet supported"
 
     if softmax_scale is None:
@@ -2837,7 +2879,10 @@ def _flash_attn_bwd_sparse_mla(
     
     # return dk, dv in float32: all-reduce across sequence-parallel ranks must happen
     # before downcasting to avoid rounding error during inter-rank grad accumulation
-    return dq, dk, dv, dqv
+    if learnable_sink is not None:
+        dsink = _bwd_dsink_reduce(dpsum, lse, learnable_sink, cu_seqlens_q)
+        return dq, dk, dv, dqv, dsink
+    return dq, dk, dv, dqv, None
 
 _flash_attn_bwd_sparse_mla.compile_cache = get_jit_cache("bwd_dsa")
 
@@ -3089,7 +3134,7 @@ class FlashAttnFunc(torch.autograd.Function):
         if dout is None:
             dout = torch.zeros_like(out)
         if qv is not None:
-            dq, dk, dv, dqv = _flash_attn_bwd_sparse_mla(
+            dq, dk, dv, dqv, dsink = _flash_attn_bwd_sparse_mla(
                 q,
                 k,
                 v,
@@ -3100,13 +3145,14 @@ class FlashAttnFunc(torch.autograd.Function):
                 p,
                 row_max,
                 gather_kv_indices,
+                learnable_sink=learnable_sink,
                 softmax_scale=ctx.softmax_scale,
                 causal=ctx.causal,
             )
             if ctx.shared_kv:
-                return dqv, dv, None, None, *((None,) * 30)
+                return dqv, dv, None, None, None, None, None, None, dsink, *((None,) * 12)
             else:
-                return dq, dk, dv, dqv, *((None,) * 30)
+                return dq, dk, dv, dqv, None, None, None, None, dsink, *((None,) * 12)
         else:
             bwd_result = _flash_attn_bwd(
                 q,
