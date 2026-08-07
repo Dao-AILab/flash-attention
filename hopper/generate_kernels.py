@@ -29,7 +29,7 @@ DTYPE_MAP_BWD = {
 }
 
 SM = [80, 90]  # Sm kernels support up to
-HEAD_DIMENSIONS = [64, 96, 128, 192, 256]
+HEAD_DIMENSIONS = [64, 96, 128, 192, 256, 512]
 PAGEDKV = [False, True]
 SPLIT = [False, True]
 SOFTCAP = [False, True]
@@ -134,6 +134,15 @@ def get_all_kernels() -> List[Kernel]:
          # so we should just pass in packgqa=False to avoid the `_packgqa` in the filename.
         if packgqa and (sm < 90 or (sm >= 90 and (paged_kv or split))):
             continue
+        # Symmetric d=512: SM90 only, BF16/FP16 only (no FP8, no SM80)
+        if head_dim > 256 and (sm < 90 or dtype == "e4m3"):
+            continue
+        # Symmetric d=512 + PagedKV non-TMA: register budget insufficient
+        # (384 threads = 256 MMA + 128 producer, 170 reg/thread max, not enough for d=512 WGMMA)
+        # PagedKV TMA path (pagedkv_tma=True) is unaffected and works normally.
+        # This only skips generating the non-TMA paged kernel instantiations.
+        if head_dim > 256 and paged_kv:
+            continue
         if sm >= 90 or dtype in DTYPE_MAP_FWD_SM8x:
             yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, head_dim_v=head_dim, split=split, paged_kv=paged_kv, softcap=softcap, packgqa=packgqa, direction="fwd")
         if sm == 90 and head_dim == 192:
@@ -142,6 +151,8 @@ def get_all_kernels() -> List[Kernel]:
             yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, head_dim_v=256, split=split, paged_kv=paged_kv, softcap=softcap, packgqa=packgqa, direction="fwd")
             yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, head_dim_v=512, split=split, paged_kv=paged_kv, softcap=softcap, packgqa=packgqa, direction="fwd")
     for dtype, head_dim, softcap, sm in itertools.product(DTYPE_MAP_BWD.keys(), HEAD_DIMENSIONS, SOFTCAP, SM):
+        if head_dim > 256:  # No backward for d>256
+            continue
         yield Kernel(sm=sm, dtype=dtype, head_dim=head_dim, head_dim_v=head_dim, split=False, paged_kv=False, softcap=softcap, packgqa=False, direction="bwd")
 
 
