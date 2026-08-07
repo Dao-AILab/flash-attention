@@ -26,6 +26,7 @@ from test_util import (
 )
 
 from flash_attn_interface import flash_attn_func, flash_attn_varlen_func, flash_attn_combine
+from flash_attn_interface import flash_attn_varlen_qkvpacked_func
 from flash_attn_interface import flash_attn_with_kvcache, get_scheduler_metadata
 
 
@@ -658,6 +659,84 @@ def test_flash_attn_varlen_output(
             assert (dk - dk_ref).abs().max().item() <= rtol * (dk_pt - dk_ref).abs().max().item() + dk_atol
             dv_atol = 2 * (dv_ref + 0.3 - 0.3 - dv_ref).abs().max().item() + (0 if softcap == 0 else 3e-4)
             assert (dv - dv_ref).abs().max().item() <= rtol * (dv_pt - dv_ref).abs().max().item() + dv_atol
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16] + ([torch.float16] if not DISABLE_FP16 else []))
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("d", COMPILED_HDIMS)
+@pytest.mark.parametrize(
+    "seqlen", [64, 128, 256, 512]
+)
+def test_flash_attn_varlen_qkvpacked_output(
+    seqlen, d, causal, dtype
+):
+    device = "cuda"
+    torch.random.manual_seed(0)
+    batch_size = 4
+    nheads = 8
+    
+    # Generate QKV packed tensor
+    qkv = torch.randn(
+        batch_size, seqlen, 3, nheads, d, device=device, dtype=dtype, requires_grad=True
+    )
+    
+    # Generate random padding mask for variable length sequences
+    query_padding_mask = generate_random_padding_mask(seqlen, batch_size, device, mode="random")
+    key_padding_mask = query_padding_mask  # Same for qkvpacked
+    
+    # Generate unpadded inputs using test utility
+    qkv_unpad, cu_seqlens, max_seqlen, qkv_padded, output_pad_fn, dqkv_pad_fn = generate_qkv(
+        *qkv.unbind(dim=2), query_padding_mask, key_padding_mask, qkvpacked=True
+    )
+    
+    # Test our implementation
+    out_unpad = flash_attn_varlen_qkvpacked_func(
+        qkv_unpad,
+        cu_seqlens,
+        max_seqlen,
+        causal=causal
+    )
+    out = output_pad_fn(out_unpad)
+    
+    # Test against reference implementation
+    q_ref, k_ref, v_ref = qkv.unbind(dim=2)
+    out_ref, attn_ref = attention_ref(
+        q_ref,
+        k_ref,
+        v_ref,
+        query_padding_mask,
+        key_padding_mask,
+        causal=causal,
+    )
+    
+    # Compare outputs
+    print(f"Output max diff: {(out - out_ref).abs().max().item()}")
+    print(f"Output mean diff: {(out - out_ref).abs().mean().item()}")
+    
+    # Set tolerances based on dtype
+    rtol = 2e-3 if dtype == torch.bfloat16 else 2e-3
+    atol = 2e-2 if dtype == torch.bfloat16 else 2e-2
+    
+    assert torch.allclose(out, out_ref, atol=atol, rtol=rtol)
+    
+    # Test backward pass if not disabled
+    if not DISABLE_BACKWARD:
+        g = torch.randn_like(out)
+        g_unpad = unpad_input(g, query_padding_mask)[0]  # Convert to unpadded format
+        dqkv_unpad, = torch.autograd.grad(out_unpad, qkv_unpad, g_unpad)
+        dqkv = dqkv_pad_fn(dqkv_unpad)
+        
+        dq_ref, dk_ref, dv_ref = torch.autograd.grad(out_ref, (q_ref, k_ref, v_ref), g)
+        dqkv_ref = torch.stack([dq_ref, dk_ref, dv_ref], dim=2)
+        
+        print(f"dQKV max diff: {(dqkv - dqkv_ref).abs().max().item()}")
+        print(f"dQKV mean diff: {(dqkv - dqkv_ref).abs().mean().item()}")
+        
+        # Higher tolerance for gradients
+        grad_rtol = rtol * 2
+        grad_atol = atol * 2
+        
+        assert torch.allclose(dqkv, dqkv_ref, atol=grad_atol, rtol=grad_rtol)
 
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
