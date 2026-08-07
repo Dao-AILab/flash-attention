@@ -6,7 +6,6 @@
 # FlashAttentionForwardSm80 and overrides the SMEM capacity check accordingly.
 
 import cutlass
-import cutlass.utils as utils_basic
 from cutlass.base_dsl.arch import Arch
 
 from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80
@@ -53,7 +52,7 @@ class FlashAttentionForwardSm120(FlashAttentionForwardSm80):
         )
         smem_usage = smem_usage_QV + smem_usage_K
         # SM120 has 99 KB shared memory (vs 163 KB on SM80)
-        smem_capacity = utils_basic.get_smem_capacity_in_bytes("sm_120")
+        smem_capacity = cutlass.memory.get_smem_capacity_in_bytes("sm_120")
         if smem_usage > smem_capacity:
             return False
         if (tile_m * 2) % num_threads != 0:
