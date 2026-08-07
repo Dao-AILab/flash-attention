@@ -190,7 +190,14 @@ class BwdConfig:
     dQ_single_wg: bool = False
 
 
-def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q=None):
+def _tile_size_bwd_sm90(
+    head_dim,
+    head_dim_v,
+    causal,
+    local,
+    sparse_block_size_q=None,
+    sparse_block_size_kv=None,
+):
     """Return BwdConfig for SM90.
 
     Configs based on C++ FA3 hopper/flash_bwd_launch_template.h,
@@ -230,9 +237,14 @@ def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q
     elif head_dim <= 192:
         hdimv128 = head_dim_v <= 128
         if hdimv128:
+            # Match 128-wide sparse metadata and reduce dO staging when needed to keep
+            # the wider tile under Hopper's shared-memory limit.
+            n_block_size = 128 if (head_dim == 192 and sparse_block_size_kv == 128) else 96
             return BwdConfig(
-                m_block_size=64, n_block_size=96,
-                num_stages_Q=2, num_stages_dO=2, num_stages_PdS=1,
+                m_block_size=64, n_block_size=n_block_size,
+                num_stages_Q=2,
+                num_stages_dO=1 if n_block_size == 128 and head_dim_v > 96 else 2,
+                num_stages_PdS=1,
                 SdP_swapAB=False, dKV_swapAB=True, dQ_swapAB=False,
                 AtomLayoutMSdP=1, AtomLayoutNdKV=2, AtomLayoutMdQ=1,
                 num_wg=2,
@@ -1872,11 +1884,11 @@ def _flash_attn_bwd(
                 else torch.zeros_like(learnable_sink)
             )
             return dq, dk, dv, dsink
-    sparse_q = None
+    sparse_q = sparse_kv = None
     kv_subtile_factor = 1
     if block_sparse_tensors is not None:
         if block_sparse_tensors.block_size is not None:
-            sparse_q = block_sparse_tensors.block_size[0]
+            sparse_q, sparse_kv = block_sparse_tensors.block_size
         elif arch // 10 == 9:
             sparse_q = 128
 
@@ -1920,6 +1932,7 @@ def _flash_attn_bwd(
             causal,
             local,
             sparse_block_size_q=sparse_q,
+            sparse_block_size_kv=sparse_kv,
         )
         m_block_size = cfg.m_block_size
         n_block_size = cfg.n_block_size
