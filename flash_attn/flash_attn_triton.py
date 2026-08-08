@@ -180,7 +180,7 @@ def _fwd_kernel(
                     other=0.0,
                 )
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-        qk += tl.dot(q, k, trans_b=True)
+        qk += tl.dot(q, tl.trans(k))
         # Trying to combine the two masks seem to make the result wrong
         if not EVEN_N:  # Need to mask out otherwise the softmax is wrong
             qk += tl.where((start_n + offs_n)[None, :] < seqlen_k, 0, float("-inf"))
@@ -477,7 +477,7 @@ def _bwd_kernel_one_col_block(
                     other=0.0,
                 )
         # recompute p = softmax(qk, dim=-1).T
-        qk = tl.dot(q, k, trans_b=True)
+        qk = tl.dot(q, tl.trans(k))
         # Trying to combine the two masks seem to make the result wrong
         if not EVEN_N:  # Need to mask out otherwise the softmax is wrong
             qk = tl.where(offs_n[None, :] < seqlen_k, qk, float("-inf"))
@@ -542,7 +542,7 @@ def _bwd_kernel_one_col_block(
         # Also wrong for headdim=64, seqlen=(1023, 1024), and ATOMIC_ADD=False
         if not (EVEN_M & EVEN_HEADDIM):
             tl.debug_barrier()
-        dp = tl.dot(do, v, trans_b=True)
+        dp = tl.dot(do, tl.trans(v))
         # There's a race condition for headdim=48
         if not EVEN_HEADDIM:
             tl.debug_barrier()
