@@ -159,7 +159,15 @@ class FlashAttentionBackwardPostprocess:
             cute.make_layout(self.num_threads),
             cute.make_layout(async_copy_elems_accum),
         )
-        num_s2r_copy_elems = 1 if const_expr(self.arch // 10 in [8, 12]) else 4
+        # SM120's 256-thread main kernel writes each lane's dQ accumulator as
+        # four contiguous fp32 values. Read the same four-value grouping back
+        # before reinterpreting it as the MMA accumulator fragment.
+        if const_expr(self.arch // 10 == 12):
+            num_s2r_copy_elems = 4
+        elif const_expr(self.arch // 10 == 8):
+            num_s2r_copy_elems = 1
+        else:
+            num_s2r_copy_elems = 4
         if const_expr(self.arch // 10 in [8, 12]):
             self.s2r_tiled_copy_dQaccum = copy_utils.tiled_copy_1d(
                 Float32, self.num_threads, num_s2r_copy_elems
@@ -630,8 +638,14 @@ class FlashAttentionBackwardPostprocess:
                 # Step 3: Copy dQ from register to smem
                 cute.arch.barrier()  # make sure all threads have finished loading dQaccum
                 if const_expr(self.arch // 10 in [8, 9, 12]):
+                    # SM120 uses the SM80 MMA register layout, so its R->S
+                    # mapping must use the universal SM80 copy rather than the
+                    # stmatrix path selected for native SM90 MMA fragments.
+                    store_atom_arch = (
+                        80 if const_expr(self.arch // 10 in [8, 12]) else self.arch
+                    )
                     copy_atom_r2s_dQ = utils.get_smem_store_atom(
-                        self.arch, self.dtype, transpose=self.dQ_swapAB
+                        store_atom_arch, self.dtype, transpose=self.dQ_swapAB
                     )
                     tiled_copy_r2s_dQ = cute.make_tiled_copy_C(copy_atom_r2s_dQ, tiled_mma)
                 else:
