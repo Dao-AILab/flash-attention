@@ -61,7 +61,7 @@ def modify_logits_for_top_p_filtering(logits, top_p):
     sorted_indices_to_remove = cumulative_probs <= (1 - top_p)
     # scatter sorted tensors to original indexing
     indices_to_remove = sorted_indices_to_remove.scatter(
-        1, sorted_indices, sorted_indices_to_remove
+        -1, sorted_indices, sorted_indices_to_remove
     )
     logits.masked_fill_(indices_to_remove, float("-inf"))
 
@@ -261,7 +261,7 @@ def sample_speculative(logits, logits_draft, tokens_draft, top_k=1, top_p=0.0, t
     )
     resample = torch.multinomial(resample_probs, num_samples=1).squeeze(dim=-1)  # (batch,)
     tokens = F.pad(tokens_draft, (0, 1))
-    tokens[:, first_rejected_idx] = resample
+    tokens[torch.arange(batch, device=tokens.device), first_rejected_idx] = resample
     return tokens, first_rejected_idx + 1
 
 
