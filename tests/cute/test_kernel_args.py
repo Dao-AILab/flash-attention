@@ -102,7 +102,7 @@ def test_missing_required_arguments_are_all_reported_with_the_kernel_name():
     assert "Sm90" in message and "mQ" in message and "mV" in message
 
 
-def test_kernel_specific_contracts():
+def test_narrowing_drops_fields_the_kernel_does_not_declare():
     hd256 = normalize_kernel_args(
         FwdKernelArgs(**FWD_REQUIRED),
         BlackwellFusedMultiHeadAttentionForward.Args,
@@ -110,6 +110,8 @@ def test_kernel_specific_contracts():
     )
     assert "learnable_sink" not in hd256._fields
 
+
+def test_narrowing_rejects_a_field_the_kernel_does_not_declare():
     with pytest.raises(TypeError):
         normalize_kernel_args(
             FwdKernelArgs(**FWD_REQUIRED, learnable_sink="sink"),
@@ -117,6 +119,8 @@ def test_kernel_specific_contracts():
             "hd256",
         )
 
+
+def test_narrowing_keeps_required_values_and_defaults_the_rest():
     bwd = normalize_kernel_args(
         BwdKernelArgs(**BWD_REQUIRED), FlashAttentionBackwardSm100.Args, "Sm100"
     )
