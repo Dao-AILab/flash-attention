@@ -24,6 +24,40 @@ load_cubin_module_data_og = cutlass.base_dsl.runtime.cuda.load_cubin_module_data
 cute_compile_og = cute.compile
 
 
+def _enable_nested_env_stream_detection():
+    """Let TVM FFI find the implicit stream inside a tuple parameter.
+
+    Kernels take their arguments as a single Args namedtuple, so no tensor appears at the top
+    level of the signature and the stock lookup, which only scans top-level parameters, finds
+    nothing. Retry against a flattened parameter list; signatures that do have a top-level
+    tensor never reach the fallback.
+    """
+    from cutlass.base_dsl.tvm_ffi_builder import spec
+    from cutlass.base_dsl.tvm_ffi_builder.tvm_ffi_builder import TVMFFIFunctionBuilder
+
+    find_env_stream_og = TVMFFIFunctionBuilder.find_env_stream
+
+    def flatten(params):
+        flat = []
+        for param in params:
+            if isinstance(param, spec.TupleParam):
+                flat.extend(flatten(param.params))
+            else:
+                flat.append(param)
+        return flat
+
+    def find_env_stream(self, params):
+        stream = find_env_stream_og(self, params)
+        if stream is None:
+            stream = find_env_stream_og(self, flatten(params))
+        return stream
+
+    TVMFFIFunctionBuilder.find_env_stream = find_env_stream
+
+
+_enable_nested_env_stream_detection()
+
+
 torch2cute_dtype_map = {
     torch.float16: cutlass.Float16,
     torch.bfloat16: cutlass.BFloat16,

@@ -2,7 +2,7 @@
 
 import math
 from functools import partial
-from typing import Callable, Optional
+from typing import Callable, NamedTuple, Optional
 
 
 import cuda.bindings.driver as cuda
@@ -23,6 +23,7 @@ from flash_attn.cute.paged_kv import PagedKVManager
 from flash_attn.cute import utils as fa_utils
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
+from flash_attn.cute.kernel_args import normalize_kernel_args
 from flash_attn.cute.mask import AttentionMask
 import flash_attn.cute.blackwell_helpers as fa_sm100_utils
 from flash_attn.cute.softmax import SoftmaxSm100
@@ -46,6 +47,29 @@ from flash_attn.cute.named_barrier import NamedBarrierFwdSm100_MLA2CTA
 
 
 class FlashAttentionMLAForwardSm100:
+    # fmt: off
+    # NamedTuple requires fields without defaults first; every use is by name, so the order
+    # carries no meaning beyond that.
+    class Args(NamedTuple):
+        mQv: cute.Tensor                            # (b, s_q, h, dv)    or (total_q, h, d)    if there is cu_seqlens_q
+        mV: cute.Tensor                             # (b, s_k, h_k, dv)  or (total_k, h_k, dv) if there is cu_seqlens_k  or (num_pages, page_size, h_k, dv) if there is page_table
+        mO: cute.Tensor                             # (b, s_q, h, dv)    or (total_q, h, dv)   if there is cu_seqlens_q
+        softmax_scale: Float32
+        mQ: Optional[cute.Tensor] = None            # (b, s_q, h, d)     or (total_q, h, d)    if there is cu_seqlens_q
+        mK: Optional[cute.Tensor] = None            # (b, s_k, h_k, d)   or (total_k, h_k, d)  if there is cu_seqlens_k  or (num_pages, page_size, h_k, d) if there is page_table
+        mLSE: Optional[cute.Tensor] = None          # (b, s_q, h)        or (total_q, h)       if there is cu_seqlens_q
+        mP: Optional[cute.Tensor] = None            # (b, s_q, h, topk)            or (total_q, h, topk)           if there is cu_seqlens_q
+        mRowMax: Optional[cute.Tensor] = None       # (b, s_q, topk // tile_n, h)  or (total_q, topk // tile_n, h) if there is cu_seqlens_q
+        mCuSeqlensQ: Optional[cute.Tensor] = None   # (b + 1)
+        mCuSeqlensK: Optional[cute.Tensor] = None   # (b + 1)
+        mSeqUsedQ: Optional[cute.Tensor] = None     # (b)
+        mSeqUsedK: Optional[cute.Tensor] = None     # (b)
+        mIndexTopk: Optional[cute.Tensor] = None    # (b, s_q, topk)  or (total_q, topk) if there is cu_seqlens_q
+        mPageTable: Optional[cute.Tensor] = None
+        window_size_left: Optional[Int32] = None
+        window_size_right: Optional[Int32] = None
+    # fmt: on
+
     def __init__(
         self,
         is_causal: bool = False,
@@ -345,31 +369,23 @@ class FlashAttentionMLAForwardSm100:
 
         return SharedStorage
 
-    # fmt: off
     @cute.jit
     def __call__(
         self,
-        mQ: Optional[cute.Tensor],    # (b, s_q, h, d)     or (total_q, h, d)    if there is cu_seqlens_q
-        mQv: cute.Tensor,             # (b, s_q, h, dv)    or (total_q, h, d)    if there is cu_seqlens_q
-        mK: Optional[cute.Tensor],    # (b, s_k, h_k, d)   or (total_k, h_k, d)  if there is cu_seqlens_k  or (num_pages, page_size, h_k, d)  if there is page_table
-        mV: cute.Tensor,              # (b, s_k, h_k, dv)  or (total_k, h_k, dv) if there is cu_seqlens_k  or (num_pages, page_size, h_k, dv) if there is page_table
-        mO: cute.Tensor,              # (b, s_q, h, dv)    or (total_q, h, dv)   if there is cu_seqlens_q
-        mLSE: Optional[cute.Tensor],  # (b, s_q, h)        or (total_q, h)       if there is cu_seqlens_q
-        softmax_scale: Float32,
-        mP: Optional[cute.Tensor] = None,           # (b, s_q, h, topk)            or (total_q, h, topk)           if there is cu_seqlens_q
-        mRowMax: Optional[cute.Tensor] = None,      # (b, s_q, topk // tile_n, h)  or (total_q, topk // tile_n, h) if there is cu_seqlens_q
-        mCuSeqlensQ: Optional[cute.Tensor] = None,  # (b + 1)
-        mCuSeqlensK: Optional[cute.Tensor] = None,  # (b + 1)
-        mSeqUsedQ: Optional[cute.Tensor] = None,    # (b)
-        mSeqUsedK: Optional[cute.Tensor] = None,    # (b)
-        mIndexTopk: Optional[cute.Tensor] = None,   # (b, s_q, topk)  or (total_q, topk) if there is cu_seqlens_q
-        mPageTable: Optional[cute.Tensor] = None,
-        window_size_left: Int32 | int | None = None,
-        window_size_right: Int32 | int | None = None,
+        args,  # Args, or any namedtuple whose extra fields are all None
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
-        # fmt: on
+        args = normalize_kernel_args(args, self.Args, type(self).__name__)
+        mQ, mQv, mK, mV, mO, mLSE = args.mQ, args.mQv, args.mK, args.mV, args.mO, args.mLSE
+        softmax_scale = args.softmax_scale
+        mP, mRowMax = args.mP, args.mRowMax
+        mCuSeqlensQ, mCuSeqlensK = args.mCuSeqlensQ, args.mCuSeqlensK
+        mSeqUsedQ, mSeqUsedK = args.mSeqUsedQ, args.mSeqUsedK
+        mIndexTopk = args.mIndexTopk
+        mPageTable = args.mPageTable
+        window_size_left, window_size_right = args.window_size_left, args.window_size_right
+
         self.store_P = mP is not None
         self.store_row_max = mRowMax is not None
 

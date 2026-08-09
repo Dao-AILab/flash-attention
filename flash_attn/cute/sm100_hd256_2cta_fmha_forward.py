@@ -1,7 +1,7 @@
 # Copyright (c) 2025, Siyu Wang, Shengbin Di, Yuxi Chi, Johnsonms, Linfeng Zheng, Haoyan Huang, Lanbo Li, Yun Zhong, Man Yuan, Minmin Sun, Yong Li, Wei Lin.
 
 import math
-from typing import Tuple, Optional
+from typing import NamedTuple, Optional, Tuple
 
 import cuda.bindings.driver as cuda
 
@@ -28,11 +28,26 @@ from flash_attn.cute.mask import (
     Sm100FusedMask as FusedMask,
 )
 from flash_attn.cute.tile_scheduler import SM100_TMEM_CAPACITY_COLUMNS
-from flash_attn.cute.flash_fwd_sm100 import DescaleTensors, _TUNING_CONFIG
-from flash_attn.cute.utils import ex2_emulation_2, as_bshkrd_tensor, AuxData
+from flash_attn.cute.flash_fwd_sm100 import _TUNING_CONFIG
+from flash_attn.cute.kernel_args import normalize_kernel_args
+from flash_attn.cute.utils import ex2_emulation_2, as_bshkrd_tensor
 
 
 class BlackwellFusedMultiHeadAttentionForward:
+    # Unlike FlashAttentionForwardSm100, this kernel supports neither seqused_q/k,
+    # learnable_sink, block sparsity, aux tensors, descale tensors, nor runtime window-size
+    # overrides. Omitting those fields is what rejects them.
+    class Args(NamedTuple):
+        mQ: cute.Tensor
+        mK: cute.Tensor
+        mV: cute.Tensor
+        mO: cute.Tensor
+        softmax_scale: Float32
+        mLSE: Optional[cute.Tensor] = None
+        mCuSeqlensQ: Optional[cute.Tensor] = None
+        mCuSeqlensK: Optional[cute.Tensor] = None
+        mPageTable: Optional[cute.Tensor] = None
+
     def __init__(
         self,
         head_dim: int,
@@ -169,56 +184,24 @@ class BlackwellFusedMultiHeadAttentionForward:
     @cute.jit
     def __call__(
         self,
-        mQ: cute.Tensor,
-        mK: cute.Tensor,
-        mV: cute.Tensor,
-        mO: cute.Tensor,
-        mLSE: Optional[cute.Tensor],
-        softmax_scale: Float32,
-        mCuSeqlensQ: Optional[cute.Tensor] = None,
-        mCuSeqlensK: Optional[cute.Tensor] = None,
-        mSeqUsedQ: Optional[cute.Tensor] = None,
-        mSeqUsedK: Optional[cute.Tensor] = None,
-        mPageTable: Optional[cute.Tensor] = None,
-        window_size_left: Int32 | int | None = None,
-        window_size_right: Int32 | int | None = None,
-        learnable_sink: Optional[cute.Tensor] = None,
-        descale_tensors: Optional[DescaleTensors] = None,
-        blocksparse_tensors: Optional[cute.Tensor] = None,
-        aux_data: AuxData = AuxData(),
+        args,  # Args, or any namedtuple whose extra fields are all None
+        # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
-        # Keep parity with FlashAttentionForwardSm100.__call__ interface.
-        # (TODO@wangsiyu) Implement these features.
-        assert mSeqUsedQ is None and mSeqUsedK is None, (
-            "SM100 forward with head_dim=256 does not support seqused_q/seqused_k"
-        )
-        assert learnable_sink is None, (
-            "SM100 forward with head_dim=256 does not support learnable_sink"
-        )
-        assert blocksparse_tensors is None, (
-            "SM100 forward with head_dim=256 does not support block sparsity"
-        )
-        assert aux_data.tensors is None, (
-            "SM100 forward with head_dim=256 does not support aux_tensors"
-        )
-        assert aux_data.scalars is None, (
-            "SM100 forward with head_dim=256 does not support aux_scalars"
-        )
+        args = normalize_kernel_args(args, self.Args, type(self).__name__)
         assert not self.is_local, (
             "SM100 forward with head_dim=256 does not support local attention yet"
         )
-        assert window_size_left is None and window_size_right is None, (
-            "SM100 forward with head_dim=256 does not support runtime window_size overrides"
-        )
-        assert descale_tensors is None, (
-            "SM100 forward with head_dim=256 does not support descale_tensors"
-        )
 
+        mQ, mK, mV, mO = args.mQ, args.mK, args.mV, args.mO
+        mPageTable = args.mPageTable
+        softmax_scale = args.softmax_scale
         q_tensor, k_tensor, v_tensor, o_tensor = mQ, mK, mV, mO
-        lse_tensor = mLSE
-        cum_seqlen_q = mCuSeqlensQ
-        cum_seqlen_k = mCuSeqlensK
+        lse_tensor = args.mLSE
+        cum_seqlen_q = args.mCuSeqlensQ
+        cum_seqlen_k = args.mCuSeqlensK
+        # Masking is decided at compile time here; there is no runtime window override.
+        window_size_left, window_size_right = None, None
 
         q_rank = len(mQ.shape)
         k_rank = len(mK.shape)
@@ -270,9 +253,9 @@ class BlackwellFusedMultiHeadAttentionForward:
                     f"hd256 forward non-varlen expects k rank 4 or 5, got rank {k_rank}"
                 )
         if cutlass.const_expr(cum_seqlen_q is not None):
-            b = mCuSeqlensQ.shape[0] - 1
+            b = cum_seqlen_q.shape[0] - 1
         elif cutlass.const_expr(cum_seqlen_k is not None):
-            b = mCuSeqlensK.shape[0] - 1
+            b = cum_seqlen_k.shape[0] - 1
         else:
             b = mQ.shape[0]
 

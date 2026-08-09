@@ -13,7 +13,7 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute.typing import Int32
+from typing import NamedTuple, Optional
 
 from flash_attn.cute.sm100_hd256_2cta_fmha_backward_dqkernel import (
     BlackwellFusedMultiHeadAttentionBackwardDQKernel,
@@ -22,11 +22,29 @@ from flash_attn.cute.sm100_hd256_2cta_fmha_backward_dkdvkernel import (
     BlackwellFusedMultiHeadAttentionBackwardDKDVKernel,
 )
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
-from flash_attn.cute.utils import AuxData, as_bshkrd_tensor, as_shhb_tensor
+from flash_attn.cute.kernel_args import normalize_kernel_args
+from flash_attn.cute.utils import as_bshkrd_tensor, as_shhb_tensor
 
 
 class BlackwellFusedMultiHeadAttentionBackward:
     """FMHA backward class for executing CuTeDSL kernel."""
+
+    # Unlike FlashAttentionBackwardSm100, this kernel supports neither seqused_q/k, semaphores,
+    # block sparsity, aux tensors, nor runtime window-size overrides (it takes those from the
+    # constructor). Omitting those fields is what rejects them. mdQaccum carries dQ itself.
+    class Args(NamedTuple):
+        mQ: cute.Tensor
+        mK: cute.Tensor
+        mV: cute.Tensor
+        mdO: cute.Tensor
+        mLSE: cute.Tensor
+        mdPsum: cute.Tensor
+        mdQaccum: cute.Tensor
+        mdK: cute.Tensor
+        mdV: cute.Tensor
+        softmax_scale: cutlass.Float32
+        mCuSeqlensQ: Optional[cute.Tensor] = None
+        mCuSeqlensK: Optional[cute.Tensor] = None
 
     def __init__(
         self,
@@ -114,52 +132,19 @@ class BlackwellFusedMultiHeadAttentionBackward:
     @cute.jit
     def __call__(
         self,
-        Q: cute.Tensor,
-        K: cute.Tensor,
-        V: cute.Tensor,
-        dO: cute.Tensor,
-        lse_log2: cute.Tensor,
-        dpsum: cute.Tensor,
-        dQ_accum: cute.Tensor | None,
-        dK: cute.Tensor,
-        dV: cute.Tensor,
-        scale_softmax: cutlass.Float32,
-        cumulative_s_q: cute.Tensor | None,
-        cumulative_s_k: cute.Tensor | None,
-        seqused_q: cute.Tensor | None = None,
-        seqused_k: cute.Tensor | None = None,
-        window_size_left: Int32 | None = None,
-        window_size_right: Int32 | None = None,
-        dQ_semaphore: cute.Tensor | None = None,
-        dK_semaphore: cute.Tensor | None = None,
-        dV_semaphore: cute.Tensor | None = None,
-        aux_data: AuxData = AuxData(),
-        block_sparse_tensors: cute.Tensor | None = None,
+        args,  # Args, or any namedtuple whose extra fields are all None
+        # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
         """Host function to launch CuTeDSL kernel."""
-        assert seqused_q is None and seqused_k is None, (
-            "SM100 backward with head_dim=256 does not support seqused_q/seqused_k"
-        )
-        assert window_size_left is None and window_size_right is None, (
-            "SM100 backward with head_dim=256 uses constructor-provided window sizes"
-        )
-        assert dQ_semaphore is None and dK_semaphore is None and dV_semaphore is None, (
-            "SM100 backward with head_dim=256 does not use semaphores"
-        )
-        assert block_sparse_tensors is None, (
-            "SM100 backward with head_dim=256 does not support block sparse tensors"
-        )
-        assert aux_data.tensors is None or len(aux_data.tensors) == 0, (
-            "SM100 backward with head_dim=256 does not support aux_tensors"
-        )
-        assert aux_data.scalars is None or len(aux_data.scalars) == 0, (
-            "SM100 backward with head_dim=256 does not support aux_scalars"
-        )
-        assert dQ_accum is not None, (
-            "SM100 backward with head_dim=256 expects dQ tensor at dQ_accum slot"
-        )
-        dQ = dQ_accum
+        args = normalize_kernel_args(args, self.Args, type(self).__name__)
+        Q, K, V, dO = args.mQ, args.mK, args.mV, args.mdO
+        lse_log2, dpsum = args.mLSE, args.mdPsum
+        dK, dV = args.mdK, args.mdV
+        scale_softmax = args.softmax_scale
+        cumulative_s_q, cumulative_s_k = args.mCuSeqlensQ, args.mCuSeqlensK
+
+        dQ = args.mdQaccum
         varlen = cumulative_s_q is not None or cumulative_s_k is not None
         q_rank = cute.rank(Q.layout)
         k_rank = cute.rank(K.layout)

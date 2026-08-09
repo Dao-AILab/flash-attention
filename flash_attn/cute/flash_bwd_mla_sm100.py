@@ -2,7 +2,7 @@
 
 import math
 from functools import partial
-from typing import Callable, Optional
+from typing import Callable, NamedTuple, Optional
 
 import cuda.bindings.driver as cuda
 
@@ -19,6 +19,7 @@ from quack import copy_utils, layout_utils
 from flash_attn.cute.pack_gqa import pack_gqa_layout
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
+from flash_attn.cute.kernel_args import normalize_kernel_args
 import flash_attn.cute.blackwell_helpers as fa_sm100_utils
 from flash_attn.cute.tile_scheduler import (
     SchedulerState,
@@ -41,6 +42,26 @@ from flash_attn.cute.named_barrier import NamedBarrierBwdSm100_MLA2CTA
 
 
 class FlashAttentionSparseMLABackwardSm100:
+    # fmt: off
+    # NamedTuple requires fields without defaults first; every use is by name, so the order
+    # carries no meaning beyond that.
+    class Args(NamedTuple):
+        mdO: cute.Tensor                            # (b, s_q, h, dv) or (total_q, h, dv) if there is cu_seqlens_q
+        mV: cute.Tensor                             # (b_k, s_k, h_k, dv) or (total_k, h_k, dv) if there is cu_seqlens_k
+        mQv: cute.Tensor                            # == mdO
+        mP: cute.Tensor                             # (b, s_q, h, topk) or (total_q, h, topk)
+        mdV: cute.Tensor                            # == mV
+        mdS: cute.Tensor                            # == mP
+        mIndexTopk: cute.Tensor                     # (b, s_q, topk) or (total_q, topk) if there is cu_seqlens_q
+        softmax_scale: Float32
+        mScaleP: Optional[cute.Tensor] = None       # (b, s_q, topk//128, h) or (total_q, topk//128, h)
+        mdPsum: Optional[cute.Tensor] = None        # (b, s_q, h) or (total_q, h) if there is cu_seqlens_q
+        mCuSeqlensQ: Optional[cute.Tensor] = None   # (b + 1)
+        mCuSeqlensK: Optional[cute.Tensor] = None   # (b + 1)
+        mSeqUsedQ: Optional[cute.Tensor] = None     # (b)
+        mSeqUsedK: Optional[cute.Tensor] = None     # (b)
+    # fmt: on
+
     def __init__(
         self,
         is_causal: bool = False,
@@ -331,28 +352,20 @@ class FlashAttentionSparseMLABackwardSm100:
 
         return SharedStorage
 
-    # fmt: off
     @cute.jit
     def __call__(
         self,
-        mdO: cute.Tensor,  # (b, s_q, h, dv) or (total_q, h, dv) if there is cu_seqlens_q
-        mV: cute.Tensor,   # (b_k, s_k, h_k, dv) or (total_k, h_k, dv) if there is cu_seqlens_k
-        mQv: cute.Tensor,  # == mdO
-        mP: cute.Tensor,   # (b, s_q, h, topk) or (total_q, h, topk)
-        mdV: cute.Tensor,  # == mV
-        mdS: cute.Tensor,  # == mP
-        mIndexTopk: cute.Tensor,  # (b, s_q, topk) or (total_q, topk) if there is cu_seqlens_q
-        softmax_scale: Float32,
-        mScaleP: Optional[cute.Tensor] = None,      # (b, s_q, topk//128, h) or (total_q, topk//128, h)
-        mdPsum: Optional[cute.Tensor] = None,       # (b, s_q, h) or (total_q, h) if there is cu_seqlens_q
-        mCuSeqlensQ: Optional[cute.Tensor] = None,  # (b + 1)
-        mCuSeqlensK: Optional[cute.Tensor] = None,  # (b + 1)
-        mSeqUsedQ: Optional[cute.Tensor] = None,    # (b)
-        mSeqUsedK: Optional[cute.Tensor] = None,    # (b)
+        args,  # Args, or any namedtuple whose extra fields are all None
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
-        # fmt: on
+        args = normalize_kernel_args(args, self.Args, type(self).__name__)
+        mdO, mV, mQv, mP, mdV, mdS = args.mdO, args.mV, args.mQv, args.mP, args.mdV, args.mdS
+        mIndexTopk = args.mIndexTopk
+        softmax_scale = args.softmax_scale
+        mScaleP, mdPsum = args.mScaleP, args.mdPsum
+        mCuSeqlensQ, mCuSeqlensK = args.mCuSeqlensQ, args.mCuSeqlensK
+        mSeqUsedQ, mSeqUsedK = args.mSeqUsedQ, args.mSeqUsedK
         # ==== dtype info ====
         self.dtype = mdO.element_type
         self.dtype_dV = mdV.element_type

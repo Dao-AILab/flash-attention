@@ -7,7 +7,7 @@
 
 import math
 from types import SimpleNamespace
-from typing import Type, Callable, Optional
+from typing import Type, Callable, NamedTuple, Optional
 from functools import partial
 
 import cuda.bindings.driver as cuda
@@ -33,6 +33,7 @@ from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute.pack_gqa import PackGQA, pack_gqa_layout
 from flash_attn.cute.named_barrier import NamedBarrierFwd
 from flash_attn.cute.block_sparsity import BlockSparseTensors
+from flash_attn.cute.kernel_args import normalize_kernel_args
 from flash_attn.cute.tile_scheduler import SingleTileScheduler, SingleTileVarlenScheduler, TileSchedulerArguments
 from flash_attn.cute.utils import AuxData
 
@@ -311,12 +312,7 @@ class FlashAttentionForwardBase:
     @cute.jit
     def __call__(
         self,
-        mQ: cute.Tensor,
-        mK: cute.Tensor,
-        mV: cute.Tensor,
-        mO: cute.Tensor,
-        mLSE: Optional[cute.Tensor],
-        softmax_scale: Float32,
+        args,  # the subclass's Args, or any namedtuple whose extra fields are all None
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -577,6 +573,28 @@ class FlashAttentionForwardBase:
 
 
 class FlashAttentionForwardSm80(FlashAttentionForwardBase):
+    # NamedTuple requires fields without defaults first; every use is by name, so the order
+    # carries no meaning beyond that.
+    class Args(NamedTuple):
+        mQ: cute.Tensor
+        mK: cute.Tensor
+        mV: cute.Tensor
+        mO: cute.Tensor
+        softmax_scale: Float32
+        mLSE: Optional[cute.Tensor] = None
+        mCuSeqlensQ: Optional[cute.Tensor] = None
+        mCuSeqlensK: Optional[cute.Tensor] = None
+        mSeqUsedQ: Optional[cute.Tensor] = None
+        mSeqUsedK: Optional[cute.Tensor] = None
+        mPageTable: Optional[cute.Tensor] = None
+        window_size_left: Optional[Int32] = None
+        window_size_right: Optional[Int32] = None
+        learnable_sink: Optional[cute.Tensor] = None
+        blocksparse_tensors: Optional[BlockSparseTensors] = None
+        aux_data: AuxData = AuxData()
+        mCuTotalMBlocks: Optional[cute.Tensor] = None
+        mCuTotalSplitsMBlocks: Optional[cute.Tensor] = None
+
     def _get_smem_layout_atom(self):
         sQ_layout_atom = sm80_utils.get_smem_layout_atom(self.dtype, self.tile_hdim)
         sK_layout_atom = sQ_layout_atom
@@ -622,24 +640,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
     @cute.jit
     def __call__(
         self,
-        mQ: cute.Tensor,
-        mK: cute.Tensor,
-        mV: cute.Tensor,
-        mO: cute.Tensor,
-        mLSE: Optional[cute.Tensor],
-        softmax_scale: Float32,
-        mCuSeqlensQ: Optional[cute.Tensor] = None,
-        mCuSeqlensK: Optional[cute.Tensor] = None,
-        mSeqUsedQ: Optional[cute.Tensor] = None,
-        mSeqUsedK: Optional[cute.Tensor] = None,
-        mPageTable: Optional[cute.Tensor] = None,
-        window_size_left: Int32 | int | None = None,
-        window_size_right: Int32 | int | None = None,
-        learnable_sink: Optional[cute.Tensor] = None,
-        blocksparse_tensors: Optional[BlockSparseTensors] = None,
-        aux_data: AuxData = AuxData(),
-        mCuTotalMBlocks: Optional[cute.Tensor] = None,
-        mCuTotalSplitsMBlocks: Optional[cute.Tensor] = None,
+        args,  # Args, or any namedtuple whose extra fields are all None
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -648,6 +649,18 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         mQ/mK/mV/mO has same data types(supports fp16 and bf16) and same layout:
         (batch_size, seqlen_q, num_head, head_dim):(_, _, _, 1)
         """
+        args = normalize_kernel_args(args, self.Args, type(self).__name__)
+        mQ, mK, mV, mO, mLSE = args.mQ, args.mK, args.mV, args.mO, args.mLSE
+        softmax_scale = args.softmax_scale
+        mCuSeqlensQ, mCuSeqlensK = args.mCuSeqlensQ, args.mCuSeqlensK
+        mSeqUsedQ, mSeqUsedK = args.mSeqUsedQ, args.mSeqUsedK
+        mPageTable = args.mPageTable
+        window_size_left, window_size_right = args.window_size_left, args.window_size_right
+        learnable_sink = args.learnable_sink
+        blocksparse_tensors = args.blocksparse_tensors
+        aux_data = args.aux_data
+        mCuTotalMBlocks, mCuTotalSplitsMBlocks = args.mCuTotalMBlocks, args.mCuTotalSplitsMBlocks
+
         assert learnable_sink is None, "Learnable sink is not supported in this kernel"
         self._check_type(
             *(t.element_type if t is not None else None for t in (mQ, mK, mV, mO, mLSE, mCuSeqlensQ, mCuSeqlensK, mSeqUsedQ, mSeqUsedK))
