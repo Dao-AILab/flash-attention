@@ -15,6 +15,7 @@ import numpy as np
 import torch
 
 from flash_attn.cute.flash_fwd_sm90 import FlashAttentionForwardSm90
+from flash_attn.cute.utils import AuxData
 from mask_mod_definitions import (
     get_mask_pair,
     random_doc_id_tensor,
@@ -400,48 +401,22 @@ class FlashAttentionBenchmark:
             cutlass.Int32(config.window_right) if config.window_right is not None else None
         )
 
-        compiled = cute.compile(
-            kernel,
-            q_cute,
-            k_cute,
-            v_cute,
-            out_cute,
-            lse_cute,
-            softmax_scale,
-            current_stream,
-            cu_seqlens_q_cute,
-            cu_seqlens_k_cute,
-            None,  # seqused_q
-            None,  # seqused_k
-            None,  # page_table
-            window_left_cute,
-            window_right_cute,
-            learnable_sink_cute,
-            blocksparse_tensors_cute,
-            aux_tensors_cute,
-            # None,
+        args = FlashAttentionForwardSm90.Args(
+            mQ=q_cute,
+            mK=k_cute,
+            mV=v_cute,
+            mO=out_cute,
+            mLSE=lse_cute,
+            softmax_scale=cutlass.Float32(softmax_scale),
+            mCuSeqlensQ=cu_seqlens_q_cute,
+            mCuSeqlensK=cu_seqlens_k_cute,
+            window_size_left=window_left_cute,
+            window_size_right=window_right_cute,
+            learnable_sink=learnable_sink_cute,
+            blocksparse_tensors=blocksparse_tensors_cute,
+            aux_data=AuxData(aux_tensors_cute),
         )
-
-        args = (
-            q_cute,
-            k_cute,
-            v_cute,
-            out_cute,
-            lse_cute,
-            softmax_scale,
-            current_stream,
-            cu_seqlens_q_cute,
-            cu_seqlens_k_cute,
-            None,
-            None,
-            None,
-            window_left_cute,
-            window_right_cute,
-            learnable_sink_cute,
-            blocksparse_tensors_cute,
-            aux_tensors_cute,
-            # None,
-        )
+        compiled = cute.compile(kernel, args, current_stream)
 
         return compiled, args
 
@@ -530,7 +505,7 @@ class FlashAttentionBenchmark:
 
         # Warmup
         for _ in range(config.warmup_iters):
-            compiled_kernel(*args)
+            compiled_kernel(args)
         torch.cuda.synchronize()
 
         # Benchmark
@@ -540,7 +515,7 @@ class FlashAttentionBenchmark:
             end = torch.cuda.Event(enable_timing=True)
 
             start.record()
-            compiled_kernel(*args)
+            compiled_kernel(args)
             end.record()
             torch.cuda.synchronize()
 

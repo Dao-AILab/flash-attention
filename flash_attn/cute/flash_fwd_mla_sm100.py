@@ -2,7 +2,7 @@
 
 import math
 from functools import partial
-from typing import Callable, Optional
+from typing import Callable, NamedTuple, Optional
 
 
 import cuda.bindings.driver as cuda
@@ -29,9 +29,9 @@ from flash_attn.cute.paged_kv import PagedKVManager
 from flash_attn.cute import utils as fa_utils
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
+from flash_attn.cute.kernel_args import normalize_kernel_args
 from flash_attn.cute.mask import AttentionMask
 import flash_attn.cute.blackwell_helpers as fa_sm100_utils
-from flash_attn.cute.flash_fwd_sm100 import DescaleTensors
 from flash_attn.cute.softmax import SoftmaxSm100, apply_learnable_sink, load_learnable_sink
 from flash_attn.cute.tile_scheduler import (
     SchedulerState,
@@ -59,6 +59,30 @@ class FlashAttentionMLAForwardSm100:
     ptxas_options = "-O2"
     # sparse MLA: a token's heads padded to one 128-row (2-CTA) tile
     SPARSE_HEAD_TILE = 128
+    # fmt: off
+    # NamedTuple requires fields without defaults first; every use is by name, so the order
+    # carries no meaning beyond that.
+    class Args(NamedTuple):
+        mQv: cute.Tensor                            # (b, s_q, h, dv)    or (total_q, h, d)    if there is cu_seqlens_q
+        mV: cute.Tensor                             # (b, s_k, h_k, dv)  or (total_k, h_k, dv) if there is cu_seqlens_k  or (num_pages, page_size, h_k, dv) if there is page_table
+        mO: cute.Tensor                             # (b, s_q, h, dv)    or (total_q, h, dv)   if there is cu_seqlens_q
+        softmax_scale: Float32
+        mQ: Optional[cute.Tensor] = None            # (b, s_q, h, d)     or (total_q, h, d)    if there is cu_seqlens_q
+        mK: Optional[cute.Tensor] = None            # (b, s_k, h_k, d)   or (total_k, h_k, d)  if there is cu_seqlens_k  or (num_pages, page_size, h_k, d) if there is page_table
+        mLSE: Optional[cute.Tensor] = None          # (b, s_q, h)        or (total_q, h)       if there is cu_seqlens_q
+        mP: Optional[cute.Tensor] = None            # (b, s_q, h, topk)            or (total_q, h, topk)           if there is cu_seqlens_q
+        mRowMax: Optional[cute.Tensor] = None       # (b, s_q, topk // tile_n, h)  or (total_q, topk // tile_n, h) if there is cu_seqlens_q
+        mCuSeqlensQ: Optional[cute.Tensor] = None   # (b + 1)
+        mCuSeqlensK: Optional[cute.Tensor] = None   # (b + 1)
+        mSeqUsedQ: Optional[cute.Tensor] = None     # (b)
+        mSeqUsedK: Optional[cute.Tensor] = None     # (b)
+        mIndexTopk: Optional[cute.Tensor] = None    # (b, s_q, topk)  or (total_q, topk) if there is cu_seqlens_q
+        mPageTable: Optional[cute.Tensor] = None
+        window_size_left: Optional[Int32] = None
+        window_size_right: Optional[Int32] = None
+        learnable_sink: Optional[cute.Tensor] = None
+        mOlo: Optional[cute.Tensor] = None          # same shape/dtype as mO: bf16 rounding residual of O
+    # fmt: on
 
     def __init__(
         self,
@@ -379,37 +403,25 @@ class FlashAttentionMLAForwardSm100:
 
         return SharedStorage
 
-    # fmt: off
     @cute.jit
     def __call__(
         self,
-        mQ: Optional[cute.Tensor],    # (b, s_q, h, d)     or (total_q, h, d)    if there is cu_seqlens_q
-        mQv: cute.Tensor,             # (b, s_q, h, dv)    or (total_q, h, d)    if there is cu_seqlens_q
-        mK: Optional[cute.Tensor],    # (b, s_k, h_k, d)   or (total_k, h_k, d)  if there is cu_seqlens_k  or (num_pages, page_size, h_k, d)  if there is page_table
-        mV: cute.Tensor,              # (b, s_k, h_k, dv)  or (total_k, h_k, dv) if there is cu_seqlens_k  or (num_pages, page_size, h_k, dv) if there is page_table
-        mO: cute.Tensor,              # (b, s_q, h, dv)    or (total_q, h, dv)   if there is cu_seqlens_q
-        mLSE: Optional[cute.Tensor],  # (b, s_q, h)        or (total_q, h)       if there is cu_seqlens_q
-        softmax_scale: Float32,
-        mP: Optional[cute.Tensor] = None,           # (b, s_q, h, topk)            or (total_q, h, topk)           if there is cu_seqlens_q
-        mRowMax: Optional[cute.Tensor] = None,      # (b, s_q, topk // tile_n, h)  or (total_q, topk // tile_n, h) if there is cu_seqlens_q
-        mCuSeqlensQ: Optional[cute.Tensor] = None,  # (b + 1)
-        mCuSeqlensK: Optional[cute.Tensor] = None,  # (b + 1)
-        mSeqUsedQ: Optional[cute.Tensor] = None,    # (b)
-        mSeqUsedK: Optional[cute.Tensor] = None,    # (b)
-        mIndexTopk: Optional[cute.Tensor] = None,   # (b, s_q, topk)  or (total_q, topk) if there is cu_seqlens_q
-        mPageTable: Optional[cute.Tensor] = None,
-        # Accepted for signature parity with FlashAttentionMLAForward1CtaSm100 (the
-        # interface passes it positionally on the shared qv path); fp8 is 1CTA-only.
-        descale_tensors: Optional[DescaleTensors] = None,
-        window_size_left: Int32 | int | None = None,
-        window_size_right: Int32 | int | None = None,
-        learnable_sink: Optional[cute.Tensor] = None,
-        mOlo: Optional[cute.Tensor] = None,          # same shape/dtype as mO: bf16 rounding residual of O
+        args,  # Args, or any namedtuple whose extra fields are all None
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
-        # fmt: on
-        assert descale_tensors is None, "fp8 descales are not supported by 2CTA MLA"
+        args = normalize_kernel_args(args, self.Args, type(self).__name__)
+        mQ, mQv, mK, mV, mO, mLSE = args.mQ, args.mQv, args.mK, args.mV, args.mO, args.mLSE
+        softmax_scale = args.softmax_scale
+        mP, mRowMax = args.mP, args.mRowMax
+        mCuSeqlensQ, mCuSeqlensK = args.mCuSeqlensQ, args.mCuSeqlensK
+        mSeqUsedQ, mSeqUsedK = args.mSeqUsedQ, args.mSeqUsedK
+        mIndexTopk = args.mIndexTopk
+        mPageTable = args.mPageTable
+        window_size_left, window_size_right = args.window_size_left, args.window_size_right
+        learnable_sink = args.learnable_sink
+        mOlo = args.mOlo
+
         self.store_P = mP is not None
         self.store_row_max = mRowMax is not None
         self.store_O_residual = mOlo is not None

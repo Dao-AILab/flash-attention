@@ -1,5 +1,5 @@
 import math
-from typing import Callable, Optional, Type
+from typing import Callable, NamedTuple, Optional, Type
 from functools import partial
 
 import cuda.bindings.driver as cuda
@@ -34,6 +34,7 @@ from flash_attn.cute import barrier
 from flash_attn.cute.named_barrier import NamedBarrierBwd
 from flash_attn.cute.softmax import apply_score_mod_inner, apply_score_mod_bwd_inner
 from flash_attn.cute.block_sparsity import BlockSparseTensors
+from flash_attn.cute.kernel_args import normalize_kernel_args
 from flash_attn.cute.utils import AuxData
 from flash_attn.cute.block_sparse_utils import (
     get_total_q_block_count_bwd,
@@ -44,6 +45,32 @@ from flash_attn.cute.block_sparse_utils import (
 
 
 class FlashAttentionBackwardSm90:
+    # NamedTuple requires fields without defaults first; every use is by name, so the order
+    # carries no meaning beyond that.
+    class Args(NamedTuple):
+        mQ: cute.Tensor
+        mK: cute.Tensor
+        mV: cute.Tensor
+        mdO: cute.Tensor
+        mLSE: cute.Tensor
+        mdPsum: cute.Tensor
+        mdQaccum: cute.Tensor
+        mdK: cute.Tensor
+        mdV: cute.Tensor
+        softmax_scale: Float32
+        mCuSeqlensQ: Optional[cute.Tensor] = None
+        mCuSeqlensK: Optional[cute.Tensor] = None
+        mSeqUsedQ: Optional[cute.Tensor] = None
+        mSeqUsedK: Optional[cute.Tensor] = None
+        window_size_left: Optional[Int32] = None
+        window_size_right: Optional[Int32] = None
+        mdQ_semaphore: Optional[cute.Tensor] = None
+        mdK_semaphore: Optional[cute.Tensor] = None
+        mdV_semaphore: Optional[cute.Tensor] = None
+        aux_data: AuxData = AuxData()
+        blocksparse_tensors: Optional[BlockSparseTensors] = None
+        mCuTotalMBlocks: Optional[cute.Tensor] = None
+
     arch = 90
 
     def __init__(
@@ -343,31 +370,26 @@ class FlashAttentionBackwardSm90:
     @cute.jit
     def __call__(
         self,
-        mQ: cute.Tensor,
-        mK: cute.Tensor,
-        mV: cute.Tensor,
-        mdO: cute.Tensor,
-        mLSE: cute.Tensor,
-        mdPsum: cute.Tensor,
-        mdQaccum: cute.Tensor,
-        mdK: cute.Tensor,
-        mdV: cute.Tensor,
-        softmax_scale: Float32,
-        mCuSeqlensQ: Optional[cute.Tensor] = None,
-        mCuSeqlensK: Optional[cute.Tensor] = None,
-        mSeqUsedQ: Optional[cute.Tensor] = None,
-        mSeqUsedK: Optional[cute.Tensor] = None,
-        window_size_left: Int32 | int | None = None,
-        window_size_right: Int32 | int | None = None,
-        mdQ_semaphore: Optional[cute.Tensor] = None,
-        mdK_semaphore: Optional[cute.Tensor] = None,
-        mdV_semaphore: Optional[cute.Tensor] = None,
-        aux_data: AuxData = AuxData(),
-        blocksparse_tensors: Optional[BlockSparseTensors] = None,
-        mCuTotalMBlocks: Optional[cute.Tensor] = None,
+        args,  # Args, or any namedtuple whose extra fields are all None
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
+        args = normalize_kernel_args(args, self.Args, type(self).__name__)
+        mQ, mK, mV, mdO = args.mQ, args.mK, args.mV, args.mdO
+        mLSE, mdPsum, mdQaccum = args.mLSE, args.mdPsum, args.mdQaccum
+        mdK, mdV = args.mdK, args.mdV
+        softmax_scale = args.softmax_scale
+        mCuSeqlensQ, mCuSeqlensK = args.mCuSeqlensQ, args.mCuSeqlensK
+        mSeqUsedQ, mSeqUsedK = args.mSeqUsedQ, args.mSeqUsedK
+        window_size_left, window_size_right = args.window_size_left, args.window_size_right
+        mdQ_semaphore, mdK_semaphore, mdV_semaphore = (
+            args.mdQ_semaphore,
+            args.mdK_semaphore,
+            args.mdV_semaphore,
+        )
+        aux_data = args.aux_data
+        blocksparse_tensors = args.blocksparse_tensors
+        mCuTotalMBlocks = args.mCuTotalMBlocks
         # For GQA (qhead_per_kvhead > 1), multiple Q heads accumulate into the same dK/dV,
         # so we need the float32 accum path + postprocess.
         # For varlen_k with qhead_per_kvhead == 1, we use ragged TMA tensors.

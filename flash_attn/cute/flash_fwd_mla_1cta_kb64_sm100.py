@@ -41,7 +41,7 @@ Two load front ends share the MMA, softmax and epilogue (`is_topk_gather`, compi
 
 import math
 from functools import partial
-from typing import Callable, Optional
+from typing import Callable, NamedTuple, Optional
 
 import cuda.bindings.driver as cuda
 
@@ -63,7 +63,7 @@ from flash_attn.cute.pack_gqa import (
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
-from flash_attn.cute.flash_fwd_sm100 import DescaleTensors
+from flash_attn.cute.kernel_args import normalize_kernel_args
 import flash_attn.cute.blackwell_helpers as fa_sm100_utils
 from flash_attn.cute.softmax import SoftmaxSm100, apply_learnable_sink, load_learnable_sink
 from flash_attn.cute.tile_scheduler import (
@@ -102,6 +102,26 @@ class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
     # combine (one block per split measured 30% slower than 32 splits at s_k = 8K, b = 1)
     TILE_MN = (64, 64)
     MIN_BLOCKS_PER_SPLIT = 4
+    # fmt: off
+    # NamedTuple requires fields without defaults first; every use is by name, so the order
+    # carries no meaning beyond that. Unlike the 128-key mainloop, no fp8 descales.
+    class Args(NamedTuple):
+        mQv: cute.Tensor                            # (b, s_q, h, dv)  or (total_q, h, dv) if cu_seqlens_q
+        mV: cute.Tensor                             # (b, s_k, h_k, dv) or (total_k, h_k, dv) if cu_seqlens_k
+        mO: cute.Tensor                             # (b, s_q, h, dv)  or (total_q, h, dv) if cu_seqlens_q
+        softmax_scale: Float32
+        mQ: Optional[cute.Tensor] = None            # (b, s_q, h, d)   or (total_q, h, d)  if cu_seqlens_q
+        mK: Optional[cute.Tensor] = None            # (b, s_k, h_k, d) or (total_k, h_k, d)  if cu_seqlens_k
+        mLSE: Optional[cute.Tensor] = None          # (b, s_q, h)      or (total_q, h)     if cu_seqlens_q
+        mCuSeqlensQ: Optional[cute.Tensor] = None   # (b + 1)
+        mCuSeqlensK: Optional[cute.Tensor] = None   # (b + 1)
+        mSeqUsedQ: Optional[cute.Tensor] = None     # (b)
+        mSeqUsedK: Optional[cute.Tensor] = None     # (b)
+        mIndexTopk: Optional[cute.Tensor] = None    # (b, s_q, topk) or (total_q, topk)
+        mPageTable: Optional[cute.Tensor] = None
+        learnable_sink: Optional[cute.Tensor] = None  # (h,)
+        mOlo: Optional[cute.Tensor] = None          # bf16 rounding residual of O (training)
+    # fmt: on
 
     @staticmethod
     def can_implement(*, is_topk_gather, is_fp8, nheads_per_kv, num_head_kv, seqlen_q_hint) -> bool:
@@ -407,44 +427,27 @@ class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
 
         return SharedStorage
 
-    # fmt: off
     @cute.jit
     def __call__(
         self,
-        mQ: Optional[cute.Tensor],    # (b, s_q, h, d)   or (total_q, h, d)  if cu_seqlens_q
-        mQv: cute.Tensor,             # (b, s_q, h, dv)  or (total_q, h, dv) if cu_seqlens_q
-        mK: Optional[cute.Tensor],    # (b, s_k, h_k, d) or (total_k, h_k, d)  if cu_seqlens_k
-        mV: cute.Tensor,              # (b, s_k, h_k, dv) or (total_k, h_k, dv) if cu_seqlens_k
-        mO: cute.Tensor,              # (b, s_q, h, dv)  or (total_q, h, dv) if cu_seqlens_q
-        mLSE: Optional[cute.Tensor],  # (b, s_q, h)      or (total_q, h)     if cu_seqlens_q
-        softmax_scale: Float32,
-        mP: Optional[cute.Tensor] = None,
-        mRowMax: Optional[cute.Tensor] = None,
-        mCuSeqlensQ: Optional[cute.Tensor] = None,  # (b + 1)
-        mCuSeqlensK: Optional[cute.Tensor] = None,  # (b + 1)
-        mSeqUsedQ: Optional[cute.Tensor] = None,    # (b)
-        mSeqUsedK: Optional[cute.Tensor] = None,    # (b)
-        mIndexTopk: Optional[cute.Tensor] = None,   # (b, s_q, topk) or (total_q, topk)
-        mPageTable: Optional[cute.Tensor] = None,
-        descale_tensors: Optional[DescaleTensors] = None,
-        window_size_left: Int32 | int | None = None,
-        window_size_right: Int32 | int | None = None,
-        learnable_sink: Optional[cute.Tensor] = None,  # (h,)
-        mOlo: Optional[cute.Tensor] = None,            # bf16 rounding residual of O (training)
+        args,  # Args, or any namedtuple whose extra fields are all None
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
-        # fmt: on
+        args = normalize_kernel_args(args, self.Args, type(self).__name__)
+        mQ, mQv, mK, mV, mO, mLSE = args.mQ, args.mQv, args.mK, args.mV, args.mO, args.mLSE
+        softmax_scale = args.softmax_scale
+        mCuSeqlensQ, mCuSeqlensK = args.mCuSeqlensQ, args.mCuSeqlensK
+        mSeqUsedQ, mSeqUsedK = args.mSeqUsedQ, args.mSeqUsedK
+        mIndexTopk = args.mIndexTopk
+        mPageTable = args.mPageTable
+        learnable_sink = args.learnable_sink
+        mOlo = args.mOlo
+
         self.has_learnable_sink = learnable_sink is not None
         assert (mIndexTopk is not None) == self.is_topk_gather
         assert (mPageTable is not None) == (self.paged_kv_tma is not None)
         assert mOlo is None or not self.is_split_kv, "mOlo is not supported with split-KV"
-        for name, t in [
-            ("mP", mP), ("mRowMax", mRowMax),
-            ("descale_tensors", descale_tensors),
-            ("window_size_left", window_size_left), ("window_size_right", window_size_right),
-        ]:
-            assert t is None, f"{name} is not supported by the kb64 mainloop"
         assert (mCuSeqlensQ is not None) == self.has_cu_seqlens_q
         assert (mSeqUsedQ is not None) == self.has_seqused_q
         if const_expr(self.has_qk):
