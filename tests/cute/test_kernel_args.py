@@ -102,19 +102,26 @@ def test_missing_required_arguments_are_all_reported_with_the_kernel_name():
     assert "Sm90" in message and "mQ" in message and "mV" in message
 
 
-def test_kernel_specific_contracts():
-    mla_args = FwdKernelArgs(
-        mQ=None, mK=None, mQv="qv", mV="v", mO="o", softmax_scale=Float32(1.0),
-        descale_tensors="descale",
+MLA_REQUIRED = dict(mQ=None, mK=None, mQv="qv", mV="v", mO="o", softmax_scale=Float32(1.0))
+
+
+def test_narrowing_drops_fields_the_kernel_does_not_declare():
+    kb64 = normalize_kernel_args(
+        FwdKernelArgs(**MLA_REQUIRED),
+        FlashAttentionMLAForward1CtaKb64Sm100.Args,
+        "Kb64",
     )
-    mla_1cta = normalize_kernel_args(
-        mla_args, FlashAttentionMLAForward1CtaSm100.Args, "Mla1Cta"
-    )
-    assert mla_1cta.descale_tensors == "descale" and mla_1cta.mQ is None
+    assert "descale_tensors" not in kb64._fields
+
+
+def test_narrowing_rejects_a_field_the_kernel_does_not_declare():
     # The kb64 mainloop is 16-bit only.
     with pytest.raises(TypeError):
-        normalize_kernel_args(mla_args, FlashAttentionMLAForward1CtaKb64Sm100.Args, "Kb64")
-
+        normalize_kernel_args(
+            FwdKernelArgs(**MLA_REQUIRED, descale_tensors="descale"),
+            FlashAttentionMLAForward1CtaKb64Sm100.Args,
+            "Kb64",
+        )
     with pytest.raises(TypeError):
         normalize_kernel_args(
             BwdKernelArgs(**BWD_REQUIRED, mdQ_semaphore="semaphore"),
@@ -122,10 +129,19 @@ def test_kernel_specific_contracts():
             "hd256",
         )
 
+
+def test_narrowing_keeps_required_values_and_defaults_the_rest():
     bwd = normalize_kernel_args(
         BwdKernelArgs(**BWD_REQUIRED), FlashAttentionBackwardSm100.Args, "Sm100"
     )
     assert bwd.mdQaccum == "dqaccum" and bwd.mCuTotalMBlocks is None
+
+    mla_1cta = normalize_kernel_args(
+        FwdKernelArgs(**MLA_REQUIRED, descale_tensors="descale"),
+        FlashAttentionMLAForward1CtaSm100.Args,
+        "Mla1Cta",
+    )
+    assert mla_1cta.descale_tensors == "descale" and mla_1cta.mQ is None
 
 
 @pytest.mark.parametrize("kernel", KERNEL_SUPERSETS, ids=lambda kernel: kernel.__name__)
