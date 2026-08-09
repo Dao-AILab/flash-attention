@@ -6,7 +6,9 @@ import os
 import random
 import re
 import gc
+from dataclasses import replace
 from functools import wraps
+from unittest import mock
 
 import pytest
 import torch
@@ -19,6 +21,11 @@ except ImportError:
     apply_rotary_emb = None
 
 from flash_attn.cute.cache_utils import JITCache
+from flash_attn.cute.config import (
+    FwdSm100RegisterAllocation,
+    select_fwd_config,
+    validate_fwd_config,
+)
 from flash_attn.cute.testing import (
     attention_ref,
     generate_qkv,
@@ -33,6 +40,7 @@ from flash_attn.cute.interface import (
     flash_attn_varlen_func,
     get_scheduler_metadata,
     _flash_attn_fwd,
+    _flash_attn_fwd_combine,
     _flash_attn_bwd,
     _flash_attn_bwd_sparse_mla,
 )
@@ -228,6 +236,301 @@ def test_flash_attn_paged_non_tma_partial_loader_tile():
         v_ref.float().transpose(0, 1).unsqueeze(0),
     ).transpose(1, 2)
     torch.testing.assert_close(out.float(), reference, atol=0.04, rtol=0.04)
+
+
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability()[0] != 10 or USE_FAKE_TENSOR,
+    reason="SM100 runtime FP8 register-allocation test",
+)
+@pytest.mark.parametrize("head_dim,seqlen_q", [(64, 65), (128, 257)])
+def test_flash_attn_fp8_register_allocation_matches_reference(head_dim, seqlen_q):
+    torch.manual_seed(head_dim)
+    q, k, v = [
+        tensor.to(torch.float8_e4m3fn)
+        for tensor in (
+            torch.randn(1, seqlen_q, 8, head_dim, device="cuda", dtype=torch.bfloat16),
+            torch.randn(1, 257, 8, head_dim, device="cuda", dtype=torch.bfloat16),
+            torch.randn(1, 257, 8, head_dim, device="cuda", dtype=torch.bfloat16),
+        )
+    ]
+    selected = {}
+
+    def capture_config(inputs):
+        selected["config"] = select_fwd_config(inputs)
+        return selected["config"]
+
+    with mock.patch(
+        "flash_attn.cute.interface.select_fwd_config", side_effect=capture_config
+    ):
+        out = _flash_attn_fwd(q, k, v)[0]
+    is_sm103_family = torch.cuda.get_device_capability()[1] >= 3
+    expected_registers = (
+        (168, 96, 80)
+        if head_dim == 64
+        else (176, 80, 80)
+        if is_sm103_family
+        else (160, 72, 120)
+    )
+    reference = torch.nn.functional.scaled_dot_product_attention(
+        q.float().transpose(1, 2),
+        k.float().transpose(1, 2),
+        v.float().transpose(1, 2),
+    ).transpose(1, 2)
+
+    assert selected["config"].registers == FwdSm100RegisterAllocation(*expected_registers)
+    torch.testing.assert_close(out.float(), reference, atol=0.08, rtol=0.08)
+
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability()[0] not in [10, 11] or USE_FAKE_TENSOR,
+    reason="SM100/SM110 runtime register-allocation test",
+)
+def test_flash_attn_forced_register_allocation_matches_reference():
+    torch.manual_seed(0)
+    q = torch.randn(1, 65, 8, 64, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, 257, 8, 64, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    selected = {}
+
+    def capture_config(inputs):
+        selected["config"] = select_fwd_config(inputs)
+        return selected["config"]
+
+    with mock.patch(
+        "flash_attn.cute.interface.select_fwd_config", side_effect=capture_config
+    ):
+        baseline = _flash_attn_fwd(q, k, v)[0]
+    alternate_config = replace(
+        selected["config"], registers=FwdSm100RegisterAllocation(192, 80, 48)
+    )
+    alternate = _flash_attn_fwd(q, k, v, config=alternate_config)[0]
+    reference = torch.nn.functional.scaled_dot_product_attention(
+        q.float().transpose(1, 2),
+        k.float().transpose(1, 2),
+        v.float().transpose(1, 2),
+    ).transpose(1, 2)
+
+    torch.testing.assert_close(baseline.float(), reference, atol=0.04, rtol=0.04)
+    torch.testing.assert_close(alternate.float(), reference, atol=0.04, rtol=0.04)
+
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability()[0] not in [10, 11] or USE_FAKE_TENSOR,
+    reason="SM100/SM110 runtime SplitKV specialization test",
+)
+def test_flash_attn_forced_split_config_reuses_specializations():
+    torch.manual_seed(0)
+    q = torch.randn(1, 128, 8, 64, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(1, 2048, 8, 64, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(1, 2048, 8, 64, device="cuda", dtype=torch.bfloat16)
+    selected = {}
+
+    def capture_config(inputs):
+        selected["inputs"] = inputs
+        selected["config"] = select_fwd_config(inputs)
+        return selected["config"]
+
+    out_partial_2 = torch.empty(2, 1, 128, 8, 64, device="cuda", dtype=torch.float32)
+    lse_partial_2 = torch.empty(2, 1, 8, 128, device="cuda", dtype=torch.float32)
+    with mock.patch(
+        "flash_attn.cute.interface.select_fwd_config", side_effect=capture_config
+    ):
+        result_2 = _flash_attn_fwd(
+            q,
+            k,
+            v,
+            num_splits=2,
+            out_partial=out_partial_2,
+            lse_partial=lse_partial_2,
+        )
+    out_2 = result_2[0]
+    config_4 = replace(selected["config"], num_splits=4)
+    validate_fwd_config(config_4, selected["inputs"])
+
+    main_specs = set(_flash_attn_fwd.compile_cache.cache)
+    combine_specs = set(_flash_attn_fwd_combine.compile_cache.cache)
+    major, minor = torch.cuda.get_device_capability()
+    assert all(spec.arch == major * 10 + minor for spec in combine_specs)
+    split_main_specs = {spec for spec in main_specs if spec.is_split_kv}
+    assert split_main_specs
+    assert all(spec.has_lse for spec in split_main_specs)
+    out_partial_4 = torch.empty(4, 1, 128, 8, 64, device="cuda", dtype=torch.float32)
+    lse_partial_4 = torch.empty(4, 1, 8, 128, device="cuda", dtype=torch.float32)
+    out_4 = _flash_attn_fwd(
+        q,
+        k,
+        v,
+        config=config_4,
+        out_partial=out_partial_4,
+        lse_partial=lse_partial_4,
+    )[0]
+    torch.cuda.synchronize()
+    reference = torch.nn.functional.scaled_dot_product_attention(
+        q.float().transpose(1, 2),
+        k.float().transpose(1, 2),
+        v.float().transpose(1, 2),
+        scale=1 / math.sqrt(q.shape[-1]),
+    ).transpose(1, 2)
+
+    torch.testing.assert_close(out_2.float(), reference, atol=0.04, rtol=0.04)
+    torch.testing.assert_close(out_4.float(), reference, atol=0.04, rtol=0.04)
+    assert set(_flash_attn_fwd.compile_cache.cache) == main_specs
+    assert set(_flash_attn_fwd_combine.compile_cache.cache) == combine_specs
+
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability()[0] not in [10, 11] or USE_FAKE_TENSOR,
+    reason="SM100/SM110 runtime CLC configuration test",
+)
+def test_flash_attn_clc_rejects_static_persistent_codegen_flag():
+    """Keep CLC off the static-persistent divisor/cluster codegen path."""
+    torch.manual_seed(0)
+    batch, seqlen_q, q_heads, kv_heads, head_dim = 2, 128, 8, 2, 128
+    lengths_k = [191, 127]
+    q = torch.randn(
+        batch,
+        seqlen_q,
+        q_heads,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    k = torch.randn(
+        sum(lengths_k),
+        kv_heads,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    v = torch.randn_like(k)
+    cu_seqlens_k = torch.tensor(
+        [0, lengths_k[0], sum(lengths_k)], device="cuda", dtype=torch.int32
+    )
+    selected = {}
+
+    def force_clc_config(inputs):
+        selected["inputs"] = inputs
+        selected["config"] = replace(
+            select_fwd_config(inputs), use_clc_scheduler=True, is_static_persistent=False
+        )
+        return selected["config"]
+
+    with mock.patch(
+        "flash_attn.cute.interface.select_fwd_config", side_effect=force_clc_config
+    ):
+        out = _flash_attn_fwd(
+            q,
+            k,
+            v,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_k=max(lengths_k),
+        )[0]
+    validate_fwd_config(selected["config"], selected["inputs"])
+    with pytest.raises(ValueError, match="Static persistent scheduling is not effective"):
+        validate_fwd_config(
+            replace(selected["config"], is_static_persistent=True), selected["inputs"]
+        )
+    references = []
+    start = 0
+    for batch_idx, length in enumerate(lengths_k):
+        references.append(
+            torch.nn.functional.scaled_dot_product_attention(
+                q[batch_idx].float().transpose(0, 1).unsqueeze(0),
+                k[start : start + length].float().transpose(0, 1).unsqueeze(0),
+                v[start : start + length].float().transpose(0, 1).unsqueeze(0),
+                scale=1 / math.sqrt(head_dim),
+                enable_gqa=True,
+            )
+            .squeeze(0)
+            .transpose(0, 1)
+        )
+        start += length
+
+    torch.testing.assert_close(
+        out.float(), torch.stack(references), atol=0.04, rtol=0.04
+    )
+
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability()[0] not in [10, 11] or USE_FAKE_TENSOR,
+    reason="SM100/SM110 selector metadata test",
+)
+def test_flash_attn_lse_requirement_is_selector_metadata():
+    q = torch.randn(1, 1, 4, 64, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+
+    class SelectionCaptured(Exception):
+        pass
+
+    def capture(q_arg, **kwargs):
+        selected = {}
+
+        def capture_config(inputs):
+            selected["inputs"] = inputs
+            raise SelectionCaptured
+
+        with mock.patch(
+            "flash_attn.cute.interface.select_fwd_config", side_effect=capture_config
+        ), pytest.raises(SelectionCaptured):
+            _flash_attn_fwd(q_arg, k, v, **kwargs)
+        return selected["inputs"]
+
+    assert not capture(q).has_lse
+    assert capture(q, return_lse=True).has_lse
+    assert capture(
+        q, lse=torch.empty(1, 4, 1, device="cuda", dtype=torch.float32)
+    ).has_lse
+    assert capture(q.requires_grad_()).has_lse
+
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability()[0] not in [10, 11] or USE_FAKE_TENSOR,
+    reason="SM100/SM110 selector metadata test",
+)
+def test_flash_attn_softcap_is_score_modifier_for_selection():
+    """Keep softcap workloads out of unmeasured plain-score selector regions."""
+    q = torch.randn(32, 1, 24, 64, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(32, 640, 6, 64, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn_like(k)
+    selected = {}
+
+    class SelectionCaptured(Exception):
+        pass
+
+    def capture_config(inputs):
+        selected["inputs"] = inputs
+        raise SelectionCaptured
+
+    with mock.patch(
+        "flash_attn.cute.interface.select_fwd_config", side_effect=capture_config
+    ), pytest.raises(SelectionCaptured):
+        _flash_attn_fwd(q, k, v, causal=True, softcap=15.0)
+
+    assert selected["inputs"].has_score_mod
+    assert not select_fwd_config(selected["inputs"]).use_clc_scheduler
+
+@pytest.mark.skipif(
+    torch.cuda.get_device_capability()[0] not in [10, 11] or USE_FAKE_TENSOR,
+    reason="SM100/SM110 MLA cache projection test",
+)
+def test_flash_attn_mla_cache_separates_kv_head_counts():
+    """Prevent MLA kernels with equal GQA ratios from sharing packed layouts."""
+    torch.manual_seed(0)
+    initial_specs = set(_flash_attn_fwd.compile_cache.cache)
+    for q_heads, kv_heads in ((128, 2), (64, 1)):
+        q = torch.randn(1, 2, q_heads, 64, device="cuda", dtype=torch.bfloat16)
+        qv = torch.randn(1, 2, q_heads, 512, device="cuda", dtype=torch.bfloat16)
+        k = torch.randn(1, 17, kv_heads, 64, device="cuda", dtype=torch.bfloat16)
+        v = torch.randn(1, 17, kv_heads, 512, device="cuda", dtype=torch.bfloat16)
+        out = _flash_attn_fwd(q, k, v, qv=qv)[0]
+        k_expanded = k.float().repeat_interleave(q_heads // kv_heads, dim=2)
+        v_expanded = v.float().repeat_interleave(q_heads // kv_heads, dim=2)
+        scores = torch.einsum("bqhd,bkhd->bhqk", q.float(), k_expanded)
+        scores += torch.einsum("bqhd,bkhd->bhqk", qv.float(), v_expanded)
+        probabilities = torch.softmax(scores / math.sqrt(64 + 512), dim=-1)
+        reference = torch.einsum("bhqk,bkhd->bqhd", probabilities, v_expanded)
+        torch.testing.assert_close(out.float(), reference, atol=0.04, rtol=0.04)
+
+    new_specs = set(_flash_attn_fwd.compile_cache.cache) - initial_specs
+    assert {
+        spec.num_heads_kv for spec in new_specs if spec.kernel_family == "mla_sm100"
+    } == {1, 2}
 
 
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
@@ -3927,7 +4230,6 @@ def test_flash_attn_varlen_seqlen_k_per_split(causal):
     dtype = torch.bfloat16
     d = 128
     nheads = nheads_kv = 4
-    num_splits = 8
     # Longest first so max_seqlen_k (and hence the tile config) matches across calls.
     seqlens = [4224, 1024, 2048]
 
@@ -3944,7 +4246,7 @@ def test_flash_attn_varlen_seqlen_k_per_split(causal):
             cu_seqlens_q=cu, cu_seqlens_k=cu,
             max_seqlen_q=seqlens[0], max_seqlen_k=seqlens[0],
             causal=causal,
-            num_splits=num_splits,
+            num_splits=0,
             seqlen_k_per_split=seqlen_k_per_split,
         )
         return out
