@@ -2832,39 +2832,6 @@ def _flash_attn_bwd_sparse_mla(
         disable_sparse_kv_bitmask,
     )
 
-    def build_sparse_mla_bwd_args(
-        *,
-        do,
-        v,
-        qv,
-        p,
-        dv,
-        ds,
-        gather_kv_indices,
-        scale_p,
-        dpsum,
-        cu_seqlens_q,
-        cu_seqlens_k,
-        seqused_q,
-        seqused_k,
-    ) -> FlashAttentionSparseMLABackwardSm100.Args:
-        return FlashAttentionSparseMLABackwardSm100.Args(
-            mdO=do,
-            mV=v,
-            mQv=qv,
-            mP=p,
-            mdV=dv,
-            mdS=ds,
-            mIndexTopk=gather_kv_indices,
-            softmax_scale=Float32(softmax_scale),
-            mScaleP=scale_p,
-            mdPsum=dpsum,
-            mCuSeqlensQ=cu_seqlens_q,
-            mCuSeqlensK=cu_seqlens_k,
-            mSeqUsedQ=seqused_q,
-            mSeqUsedK=seqused_k,
-        )
-
     if compile_key not in _flash_attn_bwd_sparse_mla.compile_cache:
         current_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         (
@@ -2901,21 +2868,20 @@ def _flash_attn_bwd_sparse_mla(
         )
         fa_bwd_kernel = cute.compile(
             fa_bwd_obj,
-            build_sparse_mla_bwd_args(
-                do=do_tensor,
-                v=v_tensor,
-                qv=qv_tensor,
-                p=p_tensor,
-                dv=dv_tensor,
-                ds=ds_tensor,
-                gather_kv_indices=gather_kv_indices_tensor,
-                scale_p=scale_p_tensor,
-                dpsum=dpsum_tensor,
-                cu_seqlens_q=cu_seqlens_q_tensor,
-                cu_seqlens_k=cu_seqlens_k_tensor,
-                seqused_q=seqused_q_tensor,
-                seqused_k=seqused_k_tensor,
-            ),
+            do_tensor,
+            v_tensor,
+            qv_tensor,
+            p_tensor,
+            dv_tensor,
+            ds_tensor,
+            gather_kv_indices_tensor,
+            softmax_scale,
+            scale_p_tensor,
+            dpsum_tensor,
+            cu_seqlens_q_tensor,
+            cu_seqlens_k_tensor,
+            seqused_q_tensor,
+            seqused_k_tensor,
             current_stream,
             options="--enable-tvm-ffi",
         )
@@ -2923,21 +2889,20 @@ def _flash_attn_bwd_sparse_mla(
 
     if not fake_mode:
         _flash_attn_bwd_sparse_mla.compile_cache[compile_key](
-            build_sparse_mla_bwd_args(
-                do=dout,
-                v=v,
-                qv=qv,
-                p=p,
-                dv=dv,
-                ds=ds,
-                gather_kv_indices=gather_kv_indices,
-                scale_p=scale_p,
-                dpsum=dpsum,
-                cu_seqlens_q=cu_seqlens_q,
-                cu_seqlens_k=cu_seqlens_k,
-                seqused_q=seqused_q,
-                seqused_k=seqused_k,
-            )
+            dout,
+            v,
+            qv,
+            p,
+            dv,
+            ds,
+            gather_kv_indices,
+            softmax_scale,
+            scale_p,
+            dpsum,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            seqused_q,
+            seqused_k,
         )
 
     v = v.squeeze(-2)
