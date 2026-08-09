@@ -3,6 +3,7 @@ import fcntl
 import hashlib
 import os
 import pickle
+import secrets
 import sys
 import tempfile
 import time
@@ -203,8 +204,9 @@ class JITPersistentCache(JITCache):
     def _try_load_from_storage(self, key: CompileKeyType) -> bool:
         """
         Try to load a function from persistent storage into in-memory cache.
-        Returns True if loaded successfully, False if not found on disk.
-        Holds a shared lock during loading to prevent concurrent writes.
+        Returns True if loaded successfully, False if missing or invalid on disk.
+        Loads under a shared lock, then revalidates failures under an exclusive
+        lock before removing an invalid artifact.
         """
         sha256_hex = self._key_to_hash(key)
         obj_path = self.cache_path / f"{sha256_hex}.o"
@@ -214,15 +216,44 @@ class JITPersistentCache(JITCache):
             timeout=self.LOCK_TIMEOUT_SECONDS,
             label=sha256_hex,
         ):
-            if obj_path.exists():
-                fa_log(1, f"Loading compiled function from disk: {obj_path}")
-                m = cute.runtime.load_module(str(obj_path), enable_tvm_ffi=True)
-                fn = getattr(m, self.EXPORT_FUNCTION_PREFIX)
-                JITCache.__setitem__(self, key, fn)
+            try:
+                return self._load_from_storage_unlocked(key, obj_path)
+            except Exception as exc:
+                load_error = exc
+
+        fa_log(
+            1,
+            f"Failed to load cached function from {obj_path}; "
+            f"revalidating under exclusive lock: {load_error}",
+        )
+        with FileLock(
+            self._lock_path(sha256_hex),
+            exclusive=True,
+            timeout=self.LOCK_TIMEOUT_SECONDS,
+            label=sha256_hex,
+        ):
+            if JITCache.__contains__(self, key):
                 return True
-            else:
-                fa_log(1, f"Cache miss on disk for key hash {sha256_hex}")
-        return False
+            if not obj_path.exists():
+                return False
+            try:
+                return self._load_from_storage_unlocked(key, obj_path)
+            except Exception as exc:
+                fa_log(1, f"Removing invalid cached function {obj_path}: {exc}")
+                obj_path.unlink(missing_ok=True)
+                return False
+
+    def _load_from_storage_unlocked(self, key: CompileKeyType, obj_path: Path) -> bool:
+        """Load one object while the caller holds its shared or exclusive lock."""
+        if not obj_path.exists():
+            fa_log(1, f"Cache miss on disk for key hash {obj_path.stem}")
+            return False
+
+        fa_log(1, f"Loading compiled function from disk: {obj_path}")
+        module = cute.runtime.load_module(str(obj_path), enable_tvm_ffi=True)
+        fn = getattr(module, self.EXPORT_FUNCTION_PREFIX)
+        JITCache.__setitem__(self, key, fn)
+        return True
 
     def _try_export_to_storage(self, key: CompileKeyType, fn: JitCompiledFunction) -> None:
         """Export a compiled function to persistent storage under exclusive lock."""
@@ -239,10 +270,26 @@ class JITPersistentCache(JITCache):
                 fa_log(1, f"Skipping export, already on disk: {obj_path}")
                 return
             fa_log(1, f"Exporting compiled function to disk: {obj_path}")
-            fn.export_to_c(
-                object_file_path=str(obj_path),
-                function_name=self.EXPORT_FUNCTION_PREFIX,
-            )
+            while True:
+                temp_path = self.cache_path / (f".{sha256_hex}.{secrets.token_hex(8)}.tmp.o")
+                try:
+                    fd = os.open(
+                        temp_path,
+                        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                        0o666,
+                    )
+                    break
+                except FileExistsError:
+                    continue
+            try:
+                os.close(fd)
+                fn.export_to_c(
+                    object_file_path=str(temp_path),
+                    function_name=self.EXPORT_FUNCTION_PREFIX,
+                )
+                temp_path.replace(obj_path)
+            finally:
+                temp_path.unlink(missing_ok=True)
             fa_log(1, f"Successfully exported compiled function to disk: {obj_path}")
 
     def _key_to_hash(self, key: CompileKeyType) -> str:
