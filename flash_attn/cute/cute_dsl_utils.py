@@ -67,6 +67,19 @@ torch2cute_dtype_map = {
 }
 
 
+# Building a cutlass Int32/Float32 from a python value runs a numpy cast that costs ~1us, which is
+# material next to a kernel launch. These wrap the Python value and nothing else, so one instance
+# per value is shared.
+@lru_cache
+def cutlass_int32(value: int) -> cutlass.Int32:
+    return cutlass.Int32(value)
+
+
+@lru_cache
+def cutlass_float32(value: float) -> cutlass.Float32:
+    return cutlass.Float32(value)
+
+
 @lru_cache
 def get_max_active_clusters(cluster_size):
     return cutlass.utils.HardwareInfo().get_max_active_clusters(cluster_size=cluster_size)
