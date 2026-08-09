@@ -2,7 +2,7 @@
 
 import os
 from typing import Tuple
-from functools import lru_cache
+from functools import lru_cache, wraps
 
 import torch
 from torch._subclasses.fake_tensor import FakeTensor
@@ -24,40 +24,34 @@ load_cubin_module_data_og = cutlass.base_dsl.runtime.cuda.load_cubin_module_data
 cute_compile_og = cute.compile
 
 
+_PATCH_MARKER = "_flash_attn_nested_env_stream_detection"
+
+
 def _enable_nested_env_stream_detection():
-    """Let TVM FFI find the implicit stream inside a tuple parameter.
+    from cutlass.base_dsl.tvm_ffi_builder import spec
+    from cutlass.base_dsl.tvm_ffi_builder.tvm_ffi_builder import (
+        TVMFFIFunctionBuilder,
+    )
 
-    Some kernels take their arguments as a single Args namedtuple, so no tensor appears at the top
-    level of the signature and the stock lookup, which only scans top-level parameters, finds
-    nothing. Retry against a flattened parameter list; signatures that do have a top-level
-    tensor never reach the fallback.
-    """
-    try:
-        from cutlass.base_dsl.tvm_ffi_builder import spec
-        from cutlass.base_dsl.tvm_ffi_builder.tvm_ffi_builder import TVMFFIFunctionBuilder
-
-        find_env_stream_og = TVMFFIFunctionBuilder.find_env_stream
-        tuple_param_cls = spec.TupleParam
-    except (ImportError, AttributeError) as err:
-        raise ImportError("Cannot patch nvidia-cutlass-dsl env-stream detection") from err
+    current = TVMFFIFunctionBuilder.find_env_stream
+    if getattr(current, _PATCH_MARKER, False):
+        return
 
     def flatten(params):
-        flat = []
         for param in params:
-            if isinstance(param, tuple_param_cls):
-                flat.extend(flatten(param.params))
+            if isinstance(param, spec.TupleParam):
+                yield from flatten(param.params)
             else:
-                flat.append(param)
-        return flat
+                yield param
 
+    @wraps(current)
     def find_env_stream(self, params):
-        stream = find_env_stream_og(self, params)
-        if stream is None:
-            stream = find_env_stream_og(self, flatten(params))
-        return stream
+        stream = current(self, params)
+        return stream if stream is not None else current(self, list(flatten(params)))
 
+    setattr(find_env_stream, _PATCH_MARKER, True)
     TVMFFIFunctionBuilder.find_env_stream = find_env_stream
-
+      
 
 _enable_nested_env_stream_detection()
 
