@@ -149,6 +149,162 @@ def test_sm100_register_allocation_matches_existing_kernel_policy(
     ) == FwdSm100RegisterAllocation(*expected)
 
 
+@pytest.mark.parametrize(
+    ("changes", "expected_static_persistent"),
+    [
+        ({}, False),
+        ({"max_seqlen_k": 4096}, False),
+        ({"max_seqlen_k": 3072}, True),
+        ({"head_dim": 32, "head_dim_v": 32}, True),
+        ({"head_dim": 96, "head_dim_v": 96}, True),
+        ({"dtype": "torch.float16"}, True),
+        ({"device_arch": 100}, True),
+        ({"page_size": 128}, True),
+        ({"use_block_sparsity": True}, True),
+        ({"has_gather_kv": True}, True),
+        ({"has_score_mod": True}, True),
+        ({"has_mask_mod": True}, True),
+        ({"has_learnable_sink": True}, True),
+        ({"has_lse": True}, True),
+        ({"requested_tile_n": 64}, True),
+        ({"num_heads_kv": 2, "pack_gqa": False}, True),
+    ],
+)
+def test_sm103_long_d64_nonpersistent_scheduler_scope(
+    changes, expected_static_persistent
+):
+    inputs = make_inputs(device_arch=103, max_seqlen_k=8192)._replace(**changes)
+
+    assert select_fwd_config(inputs).is_static_persistent is expected_static_persistent
+
+
+@pytest.mark.parametrize(
+    ("changes", "expected_clc"),
+    [
+        ({}, True),
+        ({"total_q": 10239}, False),
+        ({"max_seqlen_q": 6401}, False),
+        ({"total_k": 6553}, False),
+        ({"batch_size": 3}, False),
+        ({"batch_size": 25}, False),
+        ({"head_dim": 192, "head_dim_v": 192}, False),
+        ({"num_heads": 4, "num_heads_kv": 4}, False),
+        ({"dtype": "torch.float16"}, False),
+        ({"device_arch": 100}, False),
+        ({"is_varlen_q": False}, False),
+        ({"has_cu_seqlens_q": False}, False),
+        ({"has_cu_seqlens_k": False}, False),
+        ({"has_seqused": True}, False),
+        ({"num_heads_kv": 4}, False),
+        ({"requested_num_splits": 2}, False),
+        ({"page_size": 128}, False),
+        ({"use_block_sparsity": True}, False),
+        ({"has_gather_kv": True}, False),
+        ({"has_score_mod": True}, False),
+        ({"has_mask_mod": True}, False),
+        ({"has_learnable_sink": True}, False),
+        ({"has_lse": True}, False),
+        ({"requested_tile_n": 64}, False),
+    ],
+)
+def test_sm103_balanced_varlen_mha_clc_scope(changes, expected_clc):
+    inputs = make_inputs(
+        device_arch=103,
+        batch_size=4,
+        total_q=10240,
+        max_seqlen_q=6400,
+        is_varlen_q=True,
+        has_cu_seqlens_q=True,
+        has_cu_seqlens_k=True,
+        requested_use_clc_scheduler=False,
+    )._replace(**changes)
+    config = select_fwd_config(inputs)
+
+    assert config.use_clc_scheduler is expected_clc
+    if expected_clc:
+        assert not config.is_static_persistent
+
+
+@pytest.mark.parametrize(
+    ("changes", "expected_clc"),
+    [
+        ({}, True),
+        ({"causal": False}, True),
+        ({"total_q": 4095}, False),
+        ({"batch_size": 2}, False),
+        ({"batch_size": 65}, False),
+        ({"num_heads": 23, "num_heads_kv": 1}, False),
+        ({"head_dim": 80, "head_dim_v": 80}, False),
+        ({"pack_gqa": False}, False),
+        ({"has_score_mod": True}, False),
+        ({"has_mask_mod": True}, False),
+        ({"has_learnable_sink": True}, False),
+        ({"has_lse": True}, False),
+    ],
+)
+def test_sm103_high_head_varlen_clc_scope(changes, expected_clc):
+    inputs = make_inputs(
+        device_arch=103,
+        num_heads=28,
+        num_heads_kv=4,
+        pack_gqa=True,
+        batch_size=3,
+        total_q=4096,
+        total_k=4096,
+        max_seqlen_q=2048,
+        max_seqlen_k=2048,
+        causal=True,
+        is_varlen_q=True,
+        has_cu_seqlens_q=True,
+        has_cu_seqlens_k=True,
+        requested_use_clc_scheduler=False,
+    )._replace(**changes)
+
+    assert select_fwd_config(inputs).use_clc_scheduler is expected_clc
+
+
+@pytest.mark.parametrize(
+    ("changes", "expected_clc"),
+    [
+        ({}, True),
+        ({"max_seqlen_k": 640}, True),
+        ({"max_seqlen_k": 2048}, True),
+        ({"max_seqlen_k": 639}, False),
+        ({"max_seqlen_k": 2049}, False),
+        ({"batch_size": 31}, False),
+        ({"causal": False}, False),
+        ({"num_heads": 23, "num_heads_kv": 1}, False),
+        ({"num_heads": 28, "num_heads_kv": 4}, False),
+        ({"num_heads": 71, "num_heads_kv": 1}, True),
+        ({"num_heads": 71, "num_heads_kv": 1, "max_seqlen_q": 1}, False),
+        ({"num_heads": 64, "num_heads_kv": 1, "max_seqlen_q": 1}, False),
+        ({"head_dim": 80, "head_dim_v": 80}, False),
+        ({"pack_gqa": False}, False),
+        ({"requested_num_splits": 2}, False),
+        ({"has_score_mod": True}, False),
+        ({"has_mask_mod": True}, False),
+        ({"has_learnable_sink": True}, False),
+        ({"has_lse": True}, False),
+    ],
+)
+def test_sm103_dense_short_k_clc_scope(changes, expected_clc):
+    inputs = make_inputs(
+        device_arch=103,
+        num_heads=32,
+        num_heads_kv=8,
+        pack_gqa=True,
+        batch_size=32,
+        total_q=32 * 64,
+        total_k=32 * 1024,
+        max_seqlen_q=64,
+        max_seqlen_k=1024,
+        causal=True,
+        requested_use_clc_scheduler=False,
+    )._replace(**changes)
+
+    assert select_fwd_config(inputs).use_clc_scheduler is expected_clc
+
+
 def test_selector_preserves_a_codegen_changing_2cta_boundary():
     one_cta = make_inputs(
         head_dim=128,
