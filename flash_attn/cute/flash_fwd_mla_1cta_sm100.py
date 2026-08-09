@@ -68,7 +68,7 @@ from flash_attn.cute.topk_gather_kv import CpasyncGatherKVManager
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute.kernel_args import normalize_kernel_args
-from flash_attn.cute.flash_fwd_sm100 import DescaleTensors
+from flash_attn.cute.utils import DescaleTensors
 import flash_attn.cute.blackwell_helpers as fa_sm100_utils
 from flash_attn.cute.softmax import SoftmaxSm100, apply_learnable_sink, load_learnable_sink
 from flash_attn.cute.tile_scheduler import (
@@ -91,8 +91,6 @@ class FlashAttentionMLAForward1CtaSm100:
     # sparse MLA: a token's heads padded to one 64-row tile (pack_gqa.sparse_mla_qhead_tile)
     SPARSE_HEAD_TILE = 64
     # fmt: off
-    # NamedTuple requires fields without defaults first; every use is by name, so the order
-    # carries no meaning beyond that.
     class Args(NamedTuple):
         mQv: cute.Tensor                            # (b, s_q, h, dv)  or (total_q, h, dv) if cu_seqlens_q
         mV: cute.Tensor                             # (b, s_k, h_k, dv) or (total_k, h_k, dv) if cu_seqlens_k
@@ -600,7 +598,7 @@ class FlashAttentionMLAForward1CtaSm100:
     @cute.jit
     def __call__(
         self,
-        args,  # Args, or any namedtuple whose extra fields are all None
+        args,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):

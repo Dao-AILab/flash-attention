@@ -41,7 +41,7 @@ from flash_attn.cute.cute_dsl_utils import (
 )
 from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80
 from flash_attn.cute.flash_fwd_sm90 import FlashAttentionForwardSm90
-from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100, DescaleTensors
+from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
 from flash_attn.cute.flash_fwd_sm120 import FlashAttentionForwardSm120
 from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
 from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
@@ -68,7 +68,7 @@ from flash_attn.cute.flash_bwd_mla_dk_sm100 import dKGemmKernel
 # SM100 head_dim=256 2CTA backward kernel
 from flash_attn.cute.sm100_hd256_2cta_fmha_backward import BlackwellFusedMultiHeadAttentionBackward
 
-from flash_attn.cute.utils import AuxData
+from flash_attn.cute.utils import AuxData, DescaleTensors
 from flash_attn.cute.block_sparsity import (
     BlockSparseTensorsTorch,
     block_sparse_bwd_supports_2cta,

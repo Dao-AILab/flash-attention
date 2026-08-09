@@ -103,8 +103,7 @@ class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
     TILE_MN = (64, 64)
     MIN_BLOCKS_PER_SPLIT = 4
     # fmt: off
-    # NamedTuple requires fields without defaults first; every use is by name, so the order
-    # carries no meaning beyond that. Unlike the 128-key mainloop, no fp8 descales.
+    # Unlike the 128-key mainloop, no fp8 descales.
     class Args(NamedTuple):
         mQv: cute.Tensor                            # (b, s_q, h, dv)  or (total_q, h, dv) if cu_seqlens_q
         mV: cute.Tensor                             # (b, s_k, h_k, dv) or (total_k, h_k, dv) if cu_seqlens_k
@@ -430,7 +429,7 @@ class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
     @cute.jit
     def __call__(
         self,
-        args,  # Args, or any namedtuple whose extra fields are all None
+        args,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):

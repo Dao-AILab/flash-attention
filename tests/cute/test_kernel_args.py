@@ -56,8 +56,6 @@ def test_none_falls_back_to_the_kernel_default():
 
 
 def test_raw_python_scalars_are_rejected():
-    # A raw scalar inside a namedtuple is baked in as a compile-time constant rather than
-    # passed as a dynamic argument, so a later call would silently reuse the compiled value.
     args = FwdKernelArgs(**{**FWD_REQUIRED, "softmax_scale": 1.0}, window_size_left=3)
     with pytest.raises(TypeError) as excinfo:
         normalize_kernel_args(args, FlashAttentionForwardSm90.Args, "Sm90")
