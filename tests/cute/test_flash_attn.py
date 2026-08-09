@@ -815,6 +815,74 @@ def test_flash_attn_small_head_dim(seqlen_q, seqlen_k, d, causal, dtype):
     ).abs().max().item() + fwd_atol
 
 
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("head_dim,head_dim_v", [(72, 64), (64, 72)])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_pack_gqa_padded_head_dim(head_dim, head_dim_v, causal):
+    torch.manual_seed(0)
+    batch_size, seqlen_q, seqlen_k = 1, 64, 64
+    num_heads, num_heads_kv = 5, 1
+    dtype = torch.bfloat16
+    q = torch.randn(
+        batch_size, seqlen_q, num_heads, head_dim, device="cuda", dtype=dtype
+    )
+    k = torch.randn(
+        batch_size, seqlen_k, num_heads_kv, head_dim, device="cuda", dtype=dtype
+    )
+    v = torch.randn(
+        batch_size, seqlen_k, num_heads_kv, head_dim_v, device="cuda", dtype=dtype
+    )
+
+    out, _ = flash_attn_func(q, k, v, causal=causal, pack_gqa=True)
+    if is_fake_mode():
+        return
+
+    out_ref, _ = attention_ref(q, k, v, causal=causal)
+    out_pt, _ = attention_ref(q, k, v, causal=causal, upcast=False, reorder_ops=True)
+    check_tensor_vs_ref("out", out, out_ref, out_pt)
+
+
+def test_flash_attn_varlen_pack_gqa_padded_head_dim():
+    torch.manual_seed(0)
+    q_lengths, k_lengths = (33, 64), (65, 64)
+    num_heads, num_heads_kv = 5, 1
+    head_dim, head_dim_v = 72, 72
+    dtype = torch.bfloat16
+    q = torch.randn(sum(q_lengths), num_heads, head_dim, device="cuda", dtype=dtype)
+    k = torch.randn(sum(k_lengths), num_heads_kv, head_dim, device="cuda", dtype=dtype)
+    v = torch.randn(sum(k_lengths), num_heads_kv, head_dim_v, device="cuda", dtype=dtype)
+    cu_seqlens_q = torch.tensor(
+        [0, q_lengths[0], sum(q_lengths)], device="cuda", dtype=torch.int32
+    )
+    cu_seqlens_k = torch.tensor(
+        [0, k_lengths[0], sum(k_lengths)], device="cuda", dtype=torch.int32
+    )
+
+    out, _ = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max(q_lengths),
+        max_seqlen_k=max(k_lengths),
+        pack_gqa=True,
+    )
+
+    references = []
+    q_start = k_start = 0
+    for q_length, k_length in zip(q_lengths, k_lengths):
+        q_batch = q[q_start : q_start + q_length].unsqueeze(0)
+        k_batch = k[k_start : k_start + k_length].unsqueeze(0)
+        v_batch = v[k_start : k_start + k_length].unsqueeze(0)
+        references.append(attention_ref(q_batch, k_batch, v_batch)[0].squeeze(0))
+        q_start += q_length
+        k_start += k_length
+    reference = torch.cat(references)
+
+    torch.testing.assert_close(out, reference, atol=0.025, rtol=0.025)
+
+
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_hd256_sm100_noncontiguous_transpose():
     if not IS_SM100:
