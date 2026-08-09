@@ -9,11 +9,12 @@ Constraints:
 * Batch size must be the same for Q, K, and V tensors
 """
 
+from typing import NamedTuple, Optional
+
 import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
-from typing import NamedTuple, Optional
 
 from flash_attn.cute.sm100_hd256_2cta_fmha_backward_dqkernel import (
     BlackwellFusedMultiHeadAttentionBackwardDQKernel,
@@ -29,9 +30,6 @@ from flash_attn.cute.utils import as_bshkrd_tensor, as_shhb_tensor
 class BlackwellFusedMultiHeadAttentionBackward:
     """FMHA backward class for executing CuTeDSL kernel."""
 
-    # Unlike FlashAttentionBackwardSm100, this kernel supports neither seqused_q/k, semaphores,
-    # block sparsity, aux tensors, nor runtime window-size overrides (it takes those from the
-    # constructor). Omitting those fields is what rejects them. mdQaccum carries dQ itself.
     class Args(NamedTuple):
         mQ: cute.Tensor
         mK: cute.Tensor
@@ -132,7 +130,7 @@ class BlackwellFusedMultiHeadAttentionBackward:
     @cute.jit
     def __call__(
         self,
-        args,  # Args, or any namedtuple whose extra fields are all None
+        args,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):

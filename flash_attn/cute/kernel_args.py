@@ -1,8 +1,8 @@
 """General call arguments for the main forward/backward kernels.
 
 Each kernel class owns a local Args NamedTuple declaring exactly the arguments it
-accepts. The interface builds one superset namedtuple (FwdKernelArgs / BwdKernelArgs) 
-and hands the same object to every architecture; each kernel narrows it through 
+accepts. The interface builds one superset namedtuple (FwdKernelArgs / BwdKernelArgs)
+and hands the same object to every architecture; each kernel narrows it through
 normalize_kernel_args, which rejects any arguments the kernel does not explicitly
 accept.
 
@@ -17,18 +17,9 @@ import torch
 from cutlass import Float32, Int32
 
 from flash_attn.cute.block_sparsity import BlockSparseTensors
-from flash_attn.cute.utils import AuxData
+from flash_attn.cute.utils import AuxData, DescaleTensors
 
 TensorArg = Union[cute.Tensor, torch.Tensor]
-
-
-class DescaleTensors(NamedTuple):
-    q_descale: Optional[TensorArg] = None
-    k_descale: Optional[TensorArg] = None
-    v_descale: Optional[TensorArg] = None
-
-    def __new_from_mlir_values__(self, values):
-        return DescaleTensors(*((*values, None, None, None)[:3]))
 
 
 class FwdKernelArgs(NamedTuple):

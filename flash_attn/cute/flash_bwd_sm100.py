@@ -48,8 +48,6 @@ from flash_attn.cute.block_sparse_utils import (
 
 
 class FlashAttentionBackwardSm100:
-    # NamedTuple requires fields without defaults first; every use is by name, so the order
-    # carries no meaning beyond that.
     class Args(NamedTuple):
         mQ: cute.Tensor
         mK: cute.Tensor
@@ -470,7 +468,7 @@ class FlashAttentionBackwardSm100:
     @cute.jit
     def __call__(
         self,
-        args,  # Args, or any namedtuple whose extra fields are all None
+        args,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):

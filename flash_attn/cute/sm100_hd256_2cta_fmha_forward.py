@@ -34,9 +34,6 @@ from flash_attn.cute.utils import ex2_emulation_2, as_bshkrd_tensor
 
 
 class BlackwellFusedMultiHeadAttentionForward:
-    # Unlike FlashAttentionForwardSm100, this kernel supports neither seqused_q/k,
-    # learnable_sink, block sparsity, aux tensors, descale tensors, nor runtime window-size
-    # overrides. Omitting those fields is what rejects them.
     class Args(NamedTuple):
         mQ: cute.Tensor
         mK: cute.Tensor
@@ -184,7 +181,7 @@ class BlackwellFusedMultiHeadAttentionForward:
     @cute.jit
     def __call__(
         self,
-        args,  # Args, or any namedtuple whose extra fields are all None
+        args,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):

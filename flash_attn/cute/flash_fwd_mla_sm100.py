@@ -48,8 +48,6 @@ from flash_attn.cute.named_barrier import NamedBarrierFwdSm100_MLA2CTA
 
 class FlashAttentionMLAForwardSm100:
     # fmt: off
-    # NamedTuple requires fields without defaults first; every use is by name, so the order
-    # carries no meaning beyond that.
     class Args(NamedTuple):
         mQv: cute.Tensor                            # (b, s_q, h, dv)    or (total_q, h, d)    if there is cu_seqlens_q
         mV: cute.Tensor                             # (b, s_k, h_k, dv)  or (total_k, h_k, dv) if there is cu_seqlens_k  or (num_pages, page_size, h_k, dv) if there is page_table
@@ -372,7 +370,7 @@ class FlashAttentionMLAForwardSm100:
     @cute.jit
     def __call__(
         self,
-        args,  # Args, or any namedtuple whose extra fields are all None
+        args,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):

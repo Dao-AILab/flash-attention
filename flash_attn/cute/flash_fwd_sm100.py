@@ -43,7 +43,7 @@ from flash_attn.cute.softmax import SoftmaxSm100, apply_score_mod_inner
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute.block_sparsity import BlockSparseTensors
-from flash_attn.cute.kernel_args import DescaleTensors, normalize_kernel_args
+from flash_attn.cute.kernel_args import normalize_kernel_args
 from flash_attn.cute.block_sparse_utils import (
     get_total_block_count,
     produce_block_sparse_loads_sm100,
@@ -69,7 +69,7 @@ from flash_attn.cute.tile_scheduler import (
 )
 from flash_attn.cute.fa_logging import fa_log, fa_printf
 from flash_attn.cute.utils import smid
-from flash_attn.cute.utils import AuxData
+from flash_attn.cute.utils import AuxData, DescaleTensors
 
 # === TUNING KNOBS (agent-editable) ===
 # Keys: (use_2cta_instrs: bool, is_causal: bool, head_dim_padded: int, is_sm103: bool)
@@ -126,8 +126,6 @@ _FP8_SMALL_HDIM_REGS = {
 
 
 class FlashAttentionForwardSm100:
-    # NamedTuple requires fields without defaults first; every use is by name, so the order
-    # carries no meaning beyond that.
     class Args(NamedTuple):
         mQ: cute.Tensor  # (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
         mK: cute.Tensor  # (b_k, s_k, h_k, d), (total_k, h_k, d) with cu_seqlens_k, or (num_pages, page_size, h_k, d) with page_table
@@ -445,7 +443,7 @@ class FlashAttentionForwardSm100:
     @cute.jit
     def __call__(
         self,
-        args,  # Args, or any namedtuple whose extra fields are all None
+        args,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
