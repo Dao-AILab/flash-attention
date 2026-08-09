@@ -80,6 +80,12 @@ def test_none_falls_back_to_the_kernel_default():
     assert narrowed.aux_data == AuxData()
 
 
+def test_none_falls_back_to_the_kernel_default_for_the_kernels_own_args():
+    args = FlashAttentionForwardSm90.Args(**FWD_REQUIRED, aux_data=None)
+    narrowed = normalize_kernel_args(args, FlashAttentionForwardSm90.Args, "Sm90")
+    assert narrowed.aux_data == AuxData()
+
+
 def test_raw_python_scalars_are_rejected():
     args = FwdKernelArgs(**{**FWD_REQUIRED, "softmax_scale": 1.0}, window_size_left=3)
     with pytest.raises(TypeError) as excinfo:
@@ -88,10 +94,12 @@ def test_raw_python_scalars_are_rejected():
     assert "softmax_scale" in message and "window_size_left" in message
 
 
-def test_missing_required_argument_is_rejected():
-    args = FwdKernelArgs(**{**FWD_REQUIRED, "mQ": None})
-    with pytest.raises(TypeError):
+def test_missing_required_arguments_are_all_reported_with_the_kernel_name():
+    args = FwdKernelArgs(**{**FWD_REQUIRED, "mQ": None, "mV": None})
+    with pytest.raises(TypeError) as excinfo:
         normalize_kernel_args(args, FlashAttentionForwardSm90.Args, "Sm90")
+    message = str(excinfo.value)
+    assert "Sm90" in message and "mQ" in message and "mV" in message
 
 
 def test_kernel_specific_contracts():

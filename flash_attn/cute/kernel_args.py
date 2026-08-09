@@ -87,6 +87,7 @@ def normalize_kernel_args(args: tuple, args_cls: type, kernel_name: str):
     Raises a TypeError if
         - args is not a NamedTuple
         - any given non-None argument is not supported by kernel_name
+        - any argument kernel_name requires is missing or None
         - any raw Python scalar arguments are passed in, as they get compiled away
             and disappear (should be passed to __init__ instead)
     """
@@ -95,20 +96,26 @@ def normalize_kernel_args(args: tuple, args_cls: type, kernel_name: str):
             f"{kernel_name}.__call__ expects a NamedTuple of kernel arguments, "
             f"got {type(args).__name__}"
         )
-    if type(args) is not args_cls:
-        unsupported = [
-            f for f, v in zip(args._fields, args) if f not in args_cls._fields and v is not None
-        ]
-        if unsupported:
-            raise TypeError(
-                f"{kernel_name} does not support argument(s): {', '.join(unsupported)}. "
-                f"It accepts: {', '.join(args_cls._fields)}"
-            )
-        # None means "not provided", so the kernel's own default applies. Any field a kernel
-        # may legitimately receive as None must therefore declare a default.
-        args = args_cls(
-            **{f: v for f, v in zip(args._fields, args) if f in args_cls._fields and v is not None}
+    unsupported = [
+        f for f, v in zip(args._fields, args) if f not in args_cls._fields and v is not None
+    ]
+    if unsupported:
+        raise TypeError(
+            f"{kernel_name} does not support argument(s): {', '.join(unsupported)}. "
+            f"It accepts: {', '.join(args_cls._fields)}"
         )
+    # None means "not provided", so the kernel's own default applies. Any field a kernel
+    # may legitimately receive as None must therefore declare a default. args_cls is rebuilt
+    # even when it is already the right type, so this holds however the caller built it.
+    provided = {f: v for f, v in zip(args._fields, args) if f in args_cls._fields and v is not None}
+    missing = [
+        f for f in args_cls._fields if f not in provided and f not in args_cls._field_defaults
+    ]
+    if missing:
+        raise TypeError(
+            f"{kernel_name} is missing required argument(s): {', '.join(missing)} (absent or None)"
+        )
+    args = args_cls(**provided)
     # A raw Python scalar inside a namedtuple is baked into the kernel as a compile-time
     # constant rather than becoming a dynamic argument, so a later call silently reuses it.
     baked = [f for f, v in zip(args._fields, args) if isinstance(v, (bool, int, float))]
