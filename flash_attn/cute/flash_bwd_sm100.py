@@ -259,8 +259,10 @@ class FlashAttentionBackwardSm100:
         self.dQaccum_reduce_stage = self.tile_hdim // self.dQ_reduce_ncol
         self.dQaccum_reduce_stage_t2r = self.tile_hdim // self.dQ_reduce_ncol_t2r
         self.cluster_reduce_dQ = False and cute.size(self.cluster_shape_mn) > 1
-        # number of tma reduce adds for dKacc and dVacc epilogue (must divide hdim_per_wg)
+        # Column widths for TMA reduce-add in the dKacc and dVacc epilogues. Each
+        # width must divide its own head dimension per warpgroup.
         self.dK_reduce_ncol = math.gcd(32, self.tile_hdim // 2)
+        self.dV_reduce_ncol = math.gcd(32, self.tile_hdimv // 2)
         # CTA group for MMA operations
         self.cta_group = tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
 
@@ -437,8 +439,7 @@ class FlashAttentionBackwardSm100:
             )
         else:
             self.sdK_layout = cute.make_layout((self.tile_n * self.dK_reduce_ncol, 2))
-            # self.dK_reduce_ncol same for dV
-            self.sdV_layout = cute.make_layout((self.tile_n * self.dK_reduce_ncol, 2))
+            self.sdV_layout = cute.make_layout((self.tile_n * self.dV_reduce_ncol, 2))
 
     @cute.jit
     def __call__(
@@ -699,6 +700,7 @@ class FlashAttentionBackwardSm100:
         self.tma_copy_bytes["dPsum"] = self.tile_m * Float32.width // 8
         self.tma_copy_bytes["dQ"] = self.tile_m * self.dQ_reduce_ncol * Float32.width // 8
         self.tma_copy_bytes["dKacc"] = self.tile_n * self.dK_reduce_ncol * Float32.width // 8
+        self.tma_copy_bytes["dVacc"] = self.tile_n * self.dV_reduce_ncol * Float32.width // 8
         self.tma_copy_bytes["dS"] = cute.size_in_bytes(self.ds_dtype, self.sdS_layout)
         self.tma_copy_bytes["sdS_xchg"] = self.tma_copy_bytes["dS"] // 2  # Half of dS for exchange
 
@@ -4010,6 +4012,12 @@ class FlashAttentionBackwardSm100:
         flat_epi_tile = (
             self.sdK_flat_epi_tile if const_expr(K_or_V == "K") else self.sdV_flat_epi_tile
         )
+        reduce_ncol = self.dK_reduce_ncol if const_expr(K_or_V == "K") else self.dV_reduce_ncol
+        reduce_copy_bytes = (
+            self.tma_copy_bytes["dKacc"]
+            if const_expr(K_or_V == "K")
+            else self.tma_copy_bytes["dVacc"]
+        )
         num_compute_threads = cute.arch.WARP_SIZE * len(self.compute_warp_ids)
         wg_idx = (cute.arch.thread_idx()[0] % num_compute_threads) // 128
         num_wg = num_compute_threads // 128
@@ -4080,7 +4088,7 @@ class FlashAttentionBackwardSm100:
             )
 
         tmem_load_atom = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(self.dK_reduce_ncol)), Float32
+            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(reduce_ncol)), Float32
         )
 
         read_flag = const_expr(not deterministic_KV)
@@ -4143,7 +4151,7 @@ class FlashAttentionBackwardSm100:
                         copy_utils.cpasync_reduce_bulk_add_f32(
                             sdKV.iterator,
                             gdKV_epi[None, epi_stage].iterator,
-                            self.tma_copy_bytes["dKacc"],
+                            reduce_copy_bytes,
                         )
                 if const_expr(epi_stage < num_epi_stages - 1):
                     cute.arch.cp_async_bulk_commit_group()
