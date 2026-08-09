@@ -1862,16 +1862,18 @@ def _flash_attn_bwd(
     if learnable_sink is not None:
         assert arch // 10 in [9, 10, 11], "Learnable sink backward is supported on SM90 and SM100/SM110"
         assert lse is not None, "learnable_sink backward requires LSE"
-        if q.numel() == 0 or k.numel() == 0:
-            dq = torch.zeros_like(q) if dq is None else dq.zero_()
-            dk = torch.zeros_like(k) if dk is None else dk.zero_()
-            dv = torch.zeros_like(v) if dv is None else dv.zero_()
-            dsink = (
-                dlse.sum(dim=(0, 2) if dlse.ndim == 3 else 1).to(learnable_sink.dtype)
-                if dlse is not None
-                else torch.zeros_like(learnable_sink)
-            )
-            return dq, dk, dv, dsink
+    if q.numel() == 0 or k.numel() == 0:
+        dq = torch.zeros_like(q) if dq is None else dq.zero_()
+        dk = torch.zeros_like(k) if dk is None else dk.zero_()
+        dv = torch.zeros_like(v) if dv is None else dv.zero_()
+        if learnable_sink is None:
+            return dq, dk, dv
+        dsink = (
+            dlse.sum(dim=(0, 2) if dlse.ndim == 3 else 1).to(learnable_sink.dtype)
+            if dlse is not None
+            else torch.zeros_like(learnable_sink)
+        )
+        return dq, dk, dv, dsink
     sparse_q = None
     kv_subtile_factor = 1
     if block_sparse_tensors is not None:
