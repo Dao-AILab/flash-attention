@@ -364,6 +364,7 @@ class FlashAttentionBackwardSm90:
         mdV_semaphore: Optional[cute.Tensor] = None,
         aux_data: AuxData = AuxData(),
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
+        mCuTotalMBlocks: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -543,6 +544,7 @@ class FlashAttentionBackwardSm90:
             is_persistent=False,
             lpt=self.spt,
             head_swizzle=self.deterministic,
+            cu_total_m_blocks_ptr=mCuTotalMBlocks,
         )
 
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
@@ -992,6 +994,8 @@ class FlashAttentionBackwardSm90:
                             producer_state_Q.advance()
                             producer_state_dO.advance()
                     else:
+                        # The wait for bwd preprocess that the dense arm above does inline sits
+                        # in _load_q_do_block_sm90, at the same point in the load order.
                         producer_state_Q, producer_state_dO = produce_block_sparse_q_loads_bwd_sm90(
                             blocksparse_tensors,
                             batch_idx,
@@ -1263,20 +1267,6 @@ class FlashAttentionBackwardSm90:
         PdS_barrier = cutlass.pipeline.NamedBarrier(
             barrier_id=int(NamedBarrierBwd.PdS), num_threads=self.num_mma_threads
         )
-        score_mod_fn = partial(
-            self.apply_score_mod,
-            thr_mma_SdP=thr_mma_SdP,
-            softmax_scale=softmax_scale,
-            aux_data=aux_data,
-            fastdiv_mods=fastdiv_mods,
-        )
-        score_mod_bwd_fn = partial(
-            self.apply_score_mod_bwd,
-            thr_mma_SdP=thr_mma_SdP,
-            softmax_scale=softmax_scale,
-            aux_data=aux_data,
-            fastdiv_mods=fastdiv_mods,
-        )
 
         mma_one_m_block_all = partial(
             self.mma_one_m_block,
@@ -1311,7 +1301,40 @@ class FlashAttentionBackwardSm90:
         while work_tile.is_valid_tile:
             n_block, head_idx, batch_idx, _ = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
+
+            recompute_fastdiv_mods_q = const_expr(
+                aux_data.tensors is not None and (seqlen.has_cu_seqlens_q or seqlen.has_seqused_q)
+            )
+            recompute_fastdiv_mods_k = const_expr(
+                aux_data.tensors is not None and (seqlen.has_cu_seqlens_k or seqlen.has_seqused_k)
+            )
+
+            if const_expr(fastdiv_mods is not None and fastdiv_mods[0] is not None):
+                seqlen_q_divmod, seqlen_k_divmod = fastdiv_mods
+                fastdiv_mods = (
+                    seqlen_q_divmod
+                    if not recompute_fastdiv_mods_q
+                    else FastDivmodDivisor(seqlen.seqlen_q),
+                    seqlen_k_divmod
+                    if not recompute_fastdiv_mods_k
+                    else FastDivmodDivisor(seqlen.seqlen_k),
+                )
+
             mask = AttentionMaskCls(seqlen)
+            score_mod_fn = partial(
+                self.apply_score_mod,
+                thr_mma_SdP=thr_mma_SdP,
+                softmax_scale=softmax_scale,
+                aux_data=aux_data,
+                fastdiv_mods=fastdiv_mods,
+            )
+            score_mod_bwd_fn = partial(
+                self.apply_score_mod_bwd,
+                thr_mma_SdP=thr_mma_SdP,
+                softmax_scale=softmax_scale,
+                aux_data=aux_data,
+                fastdiv_mods=fastdiv_mods,
+            )
             score_mod_fn_cur = partial(
                 score_mod_fn,
                 batch_idx=batch_idx,

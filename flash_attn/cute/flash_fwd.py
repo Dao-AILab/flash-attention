@@ -758,6 +758,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_data: AuxData = AuxData(),
+        mCuTotalMBlocks: Optional[cute.Tensor] = None,
+        mCuTotalSplitsMBlocks: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -862,6 +864,8 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             mCuSeqlensQ=mCuSeqlensQ,
             mSeqUsedQ=mSeqUsedQ,
             is_split_kv=self.is_split_kv,
+            cu_total_m_blocks_ptr=mCuTotalMBlocks,
+            cu_total_splits_m_blocks_ptr=mCuTotalSplitsMBlocks,
         )
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
         grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
@@ -1354,7 +1358,6 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                 sink_val=self.compute_sink_val(
                     learnable_sink, softmax, m_block, num_head, thr_mma_qk, split_idx
                 ),
-                is_sm120=getattr(self, "is_sm120", False),
             )
             softmax.rescale_O(acc_O, row_scale)
             sO = cute.make_tensor(sQ.iterator, sO_layout)
@@ -1562,7 +1565,6 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
                 sink_val=self.compute_sink_val(
                     learnable_sink, softmax, m_block, num_head, thr_mma_qk, split_idx
                 ),
-                is_sm120=getattr(self, "is_sm120", False),
             )
             softmax.rescale_O(acc_O, row_scale)
 
@@ -2343,7 +2345,6 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             sink_val=self.compute_sink_val(
                 learnable_sink, softmax, m_block, head_idx, thr_mma_qk, split_idx
             ),
-            is_sm120=getattr(self, "is_sm120", False),
         )
         softmax.rescale_O(acc_O, row_scale)
         sO = cute.make_tensor(sQ.iterator, sO_layout)

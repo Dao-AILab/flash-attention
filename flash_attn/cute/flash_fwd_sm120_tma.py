@@ -348,6 +348,11 @@ class FlashAttentionForwardSm120Tma(FlashAttentionForwardBase):
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors=None,
         aux_data: AuxData = AuxData(),
+        # Flat-block -> batch lookup for SingleTileVarlenScheduler, in the same
+        # position as FlashAttentionForwardSm80.__call__ (upstream #2559), since
+        # cute.compile binds compile_args positionally.
+        mCuTotalMBlocks: Optional[cute.Tensor] = None,
+        mCuTotalSplitsMBlocks: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (matches base
         # FlashAttentionForwardSm80.__call__ convention; cute.compile
         # binds arguments positionally against compile_args, which ends
@@ -478,6 +483,9 @@ class FlashAttentionForwardSm120Tma(FlashAttentionForwardBase):
             is_persistent=False,
             lpt=self.is_causal or self.is_local,
             is_split_kv=False,
+            # Only the non-split cumsum applies here: this path never sets
+            # is_split_kv, so cu_total_splits_m_blocks would be unused.
+            cu_total_m_blocks_ptr=mCuTotalMBlocks,
         )
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
         grid_dim = TileScheduler.get_grid_shape(tile_sched_params)

@@ -173,6 +173,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_data: AuxData = AuxData(),
+        mCuTotalMBlocks: Optional[cute.Tensor] = None,
+        mCuTotalSplitsMBlocks: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -313,6 +315,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 (self.tile_m, self.tile_hdimv),  # No mcast
             )
         if const_expr(mCuSeqlensQ is not None or mSeqUsedQ is not None):
+            # TODO: dispatch to DynamicPersistentVarlenScheduler when appropriate
             TileScheduler = SingleTileVarlenScheduler
         else:
             TileScheduler = (
@@ -342,6 +345,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             element_size=self.dtype.width // 8,
             is_persistent=False,
             lpt=self.is_causal or self.is_local,
+            cu_total_m_blocks_ptr=mCuTotalMBlocks,
+            cu_total_splits_m_blocks_ptr=mCuTotalSplitsMBlocks,
         )
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
         grid_dim = TileScheduler.get_grid_shape(tile_sched_params)

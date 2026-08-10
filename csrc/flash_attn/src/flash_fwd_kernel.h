@@ -5,8 +5,11 @@
 #pragma once
 
 #include "namespace_config.h"
+#ifndef FLASHATTENTION_DISABLE_DROPOUT
 #include "philox_unpack.cuh" // For at::cuda::philox::unpack
+#endif
 
+#include <tuple>
 #include <cute/tensor.hpp>
 
 #include <cutlass/cutlass.h>
@@ -66,7 +69,11 @@ inline __device__ void compute_attn_1rowblock(const Params &params, const int bi
     constexpr int kHeadDim = Kernel_traits::kHeadDim;
     constexpr int kNWarps = Kernel_traits::kNWarps;
 
-    auto seed_offset = at::cuda::philox::unpack(params.philox_args);
+#ifndef FLASHATTENTION_DISABLE_DROPOUT
+    auto seed_offset = at::cuda::philox::unpack(*reinterpret_cast<at::PhiloxCudaState const*>(params.philox_args));
+#else
+    auto seed_offset = std::make_tuple(uint64_t(0), uint64_t(0));
+#endif
     FLASH_NAMESPACE::Dropout dropout(std::get<0>(seed_offset), std::get<1>(seed_offset), params.p_dropout_in_uint8_t,
                            bidb, bidh, tidx, params.h);
 

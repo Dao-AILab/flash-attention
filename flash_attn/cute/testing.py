@@ -357,7 +357,9 @@ def attention_ref(
     dtype_og = v.dtype
     q_shape = q.shape if q is not None else qv.shape
     if upcast:
-        q, k, v, qv = [t.float() if t is not None else None for t in (q, k, v, qv)]
+        q, k, v, qv, learnable_sink = [
+            t.float() if t is not None else None for t in (q, k, v, qv, learnable_sink)
+        ]
     if q_descale is not None:
         q_descale = repeat(q_descale, "b h -> b 1 (h g) 1", g=q_shape[2] // v.shape[2])
         q, qv = [(t.float() * q_descale).to(t.dtype) if t is not None else None for t in (q, qv)]
@@ -417,12 +419,15 @@ def attention_ref(
         )
     if gather_kv_indices is not None:
         batch = q_shape[0]
-        topk_len = gather_kv_indices.shape[2]
-        if topk_len < seqlen_k:
-            topk_index_mask = torch.full(
-                (batch, seqlen_q, seqlen_k), False, device="cuda"
-            ).scatter_(-1, gather_kv_indices, True)
-            scores.masked_fill_(rearrange(~topk_index_mask, "b t s -> b 1 t s"), float("-inf"))
+        # -1 is a sentinel for invalid top-k slots; route sentinels (and any
+        # out-of-range index) to a dummy extra column so they never unmask a
+        # real key
+        gather_idx = gather_kv_indices.long()
+        gather_idx = gather_idx.masked_fill((gather_idx < 0) | (gather_idx >= seqlen_k), seqlen_k)
+        topk_index_mask = torch.full(
+            (batch, seqlen_q, seqlen_k + 1), False, device="cuda"
+        ).scatter_(-1, gather_idx, True)[..., :seqlen_k]
+        scores.masked_fill_(rearrange(~topk_index_mask, "b t s -> b 1 t s"), float("-inf"))
     if local_mask is not None:
         scores.masked_fill_(local_mask, float("-inf"))
     if attn_bias is not None:

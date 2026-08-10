@@ -18,6 +18,7 @@ from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
 from flash_attn.cute.interface import flash_attn_func, flash_attn_varlen_func
 from flash_attn.cute.testing import attention_ref
 from flash_attn.cute.tile_scheduler import (
+    DynamicPersistentVarlenScheduler,
     SchedulingMode,
     SingleTileLPTScheduler,
     SingleTileVarlenScheduler,
@@ -100,6 +101,31 @@ def expected_total_tiles_mha(batch, seqlen_q, heads):
     q_stage = 2 if COMPUTE_CAPABILITY == 10 and seqlen_q > 128 else 1
     num_block = (seqlen_q + q_stage * 128 - 1) // (q_stage * 128)
     return num_block * heads * batch
+
+
+def assert_varlen_scheduler(sched_cls, sched_mode, *, heads, kv_heads, num_splits):
+    expected_mode = (
+        SchedulingMode.CLC
+        if heads != kv_heads
+        else SchedulingMode.DYNAMIC
+        if num_splits > 1
+        else SchedulingMode.STATIC
+    )
+    assert sched_mode == expected_mode, (
+        f"Expected {expected_mode.name} scheduling mode, got {sched_mode!r}"
+    )
+    expected_classes = {
+        SchedulingMode.CLC: (SingleTileVarlenScheduler,),
+        SchedulingMode.DYNAMIC: (DynamicPersistentVarlenScheduler,),
+        SchedulingMode.STATIC: (
+            SingleTileVarlenScheduler,
+            StaticPersistentTileScheduler,
+        ),
+    }[expected_mode]
+    assert sched_cls in expected_classes, (
+        f"Expected one of {[cls.__name__ for cls in expected_classes]}, "
+        f"got {sched_cls.__name__}"
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -251,13 +277,13 @@ class TestCLCHeadDim:
         check_output(randn(4, sq, 4, d), randn(4, sk, 4, d), randn(4, sk, 4, dv))
 
     def test_overlap_sO_sQ_fallback(self):
-        from flash_attn.cute.tile_scheduler import SingleTileScheduler
-
         _captured_schedulers.clear()
         check_output(randn(4, 128, 4, 192), randn(4, 257, 4, 192), randn(4, 257, 4, 128), assert_clc=False)
         assert _captured_schedulers, "No scheduler was captured"
         sched_cls, sched_mode, *_ = _captured_schedulers[-1]
-        assert sched_cls is SingleTileScheduler, f"Expected SingleTileScheduler fallback, got {sched_cls.__name__}"
+        assert sched_cls is StaticPersistentTileScheduler, (
+            f"Expected StaticPersistentTileScheduler fallback, got {sched_cls.__name__}"
+        )
         assert sched_mode == SchedulingMode.STATIC, f"Expected STATIC fallback, got {sched_mode!r}"
 
 
@@ -282,8 +308,8 @@ class TestCLCFallback:
         torch.cuda.synchronize()
         assert _captured_schedulers, "No scheduler was captured"
         sched_cls, sched_mode, *_ = _captured_schedulers[-1]
-        assert sched_cls is SingleTileVarlenScheduler, (
-            f"Expected SingleTileVarlenScheduler for varlen, got {sched_cls.__name__}"
+        assert sched_cls is StaticPersistentTileScheduler, (
+            f"Expected StaticPersistentTileScheduler for varlen, got {sched_cls.__name__}"
         )
         assert sched_mode == SchedulingMode.STATIC, f"Expected STATIC scheduling mode, got {sched_mode!r}"
 
@@ -324,10 +350,12 @@ def check_varlen_output(seqlens, heads, d, *, causal=False, kv_heads=None, num_s
     torch.cuda.synchronize()
     if _captured_schedulers:
         sched_cls, sched_mode, *_ = _captured_schedulers[-1]
-        assert sched_cls is SingleTileVarlenScheduler, f"Expected SingleTileVarlenScheduler, got {sched_cls.__name__}"
-        expected_sched_mode = SchedulingMode.CLC if heads != kv_heads else SchedulingMode.STATIC
-        assert sched_mode == expected_sched_mode, (
-            f"Expected {expected_sched_mode.name} scheduling mode, got {sched_mode!r}"
+        assert_varlen_scheduler(
+            sched_cls,
+            sched_mode,
+            heads=heads,
+            kv_heads=kv_heads,
+            num_splits=num_splits,
         )
 
     for i in range(len(seqlens)):
@@ -371,10 +399,12 @@ def check_varlen_output_seqused(seqlens, heads, d, *, causal=False, kv_heads=Non
     torch.cuda.synchronize()
     if _captured_schedulers:
         sched_cls, sched_mode, *_ = _captured_schedulers[-1]
-        assert sched_cls is SingleTileVarlenScheduler, f"Expected SingleTileVarlenScheduler, got {sched_cls.__name__}"
-        expected_sched_mode = SchedulingMode.CLC if heads != kv_heads else SchedulingMode.STATIC
-        assert sched_mode == expected_sched_mode, (
-            f"Expected {expected_sched_mode.name} scheduling mode, got {sched_mode!r}"
+        assert_varlen_scheduler(
+            sched_cls,
+            sched_mode,
+            heads=heads,
+            kv_heads=kv_heads,
+            num_splits=num_splits,
         )
 
     out_ref, _ = attention_ref(q, k, v, q_mask, k_mask, causal=causal)
