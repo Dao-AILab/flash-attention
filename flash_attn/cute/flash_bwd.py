@@ -25,7 +25,7 @@ from flash_attn.cute.block_info import BlockInfo
 from quack.cute_dsl_utils import ParamsBase
 from flash_attn.cute.tile_scheduler import SingleTileScheduler, SingleTileVarlenScheduler, TileSchedulerArguments
 from flash_attn.cute.block_sparsity import BlockSparseTensors
-from flash_attn.cute.kernel_args import normalize_kernel_args
+from flash_attn.cute.kernel_args import BwdKernelArgs, normalize_kernel_args
 from flash_attn.cute.utils import AuxData
 
 
@@ -398,7 +398,7 @@ class FlashAttentionBackwardSm80:
     @cute.jit
     def __call__(
         self,
-        args,
+        args: BwdKernelArgs,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):

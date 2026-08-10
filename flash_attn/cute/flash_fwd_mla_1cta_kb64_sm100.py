@@ -63,7 +63,7 @@ from flash_attn.cute.pack_gqa import (
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
-from flash_attn.cute.kernel_args import normalize_kernel_args
+from flash_attn.cute.kernel_args import FwdKernelArgs, normalize_kernel_args
 import flash_attn.cute.blackwell_helpers as fa_sm100_utils
 from flash_attn.cute.softmax import SoftmaxSm100, apply_learnable_sink, load_learnable_sink
 from flash_attn.cute.tile_scheduler import (
@@ -429,7 +429,7 @@ class FlashAttentionMLAForward1CtaKb64Sm100(FlashAttentionMLAForward1CtaSm100):
     @cute.jit
     def __call__(
         self,
-        args,
+        args: FwdKernelArgs,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):

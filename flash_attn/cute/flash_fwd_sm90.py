@@ -28,7 +28,7 @@ from flash_attn.cute.softmax import Softmax, apply_score_mod_inner
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute.block_sparsity import BlockSparseTensors
-from flash_attn.cute.kernel_args import normalize_kernel_args
+from flash_attn.cute.kernel_args import FwdKernelArgs, normalize_kernel_args
 from flash_attn.cute.block_sparse_utils import (
     produce_block_sparse_loads,
     consume_block_sparse_loads,
@@ -178,7 +178,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
     @cute.jit
     def __call__(
         self,
-        args,
+        args: FwdKernelArgs,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):

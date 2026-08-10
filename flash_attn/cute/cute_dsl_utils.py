@@ -24,6 +24,10 @@ load_cubin_module_data_og = cutlass.base_dsl.runtime.cuda.load_cubin_module_data
 cute_compile_og = cute.compile
 
 
+# Monkey-patch: as of 2026-08-10, TVM-FFI cannot detect env stream if all
+# tensor arguments to a kernel are contained in a tuple/NamedTuple. This workaround
+# patches TVMFFIFunctionBuilder.find_env_stream to search through nested args
+# when finding the current stream.
 _PATCH_MARKER = "_flash_attn_nested_env_stream_detection"
 
 
