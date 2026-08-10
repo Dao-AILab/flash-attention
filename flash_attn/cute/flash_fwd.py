@@ -33,7 +33,7 @@ from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute.pack_gqa import PackGQA, pack_gqa_layout
 from flash_attn.cute.named_barrier import NamedBarrierFwd
 from flash_attn.cute.block_sparsity import BlockSparseTensors
-from flash_attn.cute.kernel_args import normalize_kernel_args
+from flash_attn.cute.kernel_args import FwdKernelArgs, normalize_kernel_args
 from flash_attn.cute.tile_scheduler import SingleTileScheduler, SingleTileVarlenScheduler, TileSchedulerArguments
 from flash_attn.cute.utils import AuxData
 
@@ -312,7 +312,7 @@ class FlashAttentionForwardBase:
     @cute.jit
     def __call__(
         self,
-        args,
+        args: FwdKernelArgs,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -638,7 +638,7 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
     @cute.jit
     def __call__(
         self,
-        args,
+        args: FwdKernelArgs,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):

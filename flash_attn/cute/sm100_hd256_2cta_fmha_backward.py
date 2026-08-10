@@ -23,7 +23,7 @@ from flash_attn.cute.sm100_hd256_2cta_fmha_backward_dkdvkernel import (
     BlackwellFusedMultiHeadAttentionBackwardDKDVKernel,
 )
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
-from flash_attn.cute.kernel_args import normalize_kernel_args
+from flash_attn.cute.kernel_args import BwdKernelArgs, normalize_kernel_args
 from flash_attn.cute.utils import as_bshkrd_tensor, as_shhb_tensor
 
 
@@ -130,7 +130,7 @@ class BlackwellFusedMultiHeadAttentionBackward:
     @cute.jit
     def __call__(
         self,
-        args,
+        args: BwdKernelArgs,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):

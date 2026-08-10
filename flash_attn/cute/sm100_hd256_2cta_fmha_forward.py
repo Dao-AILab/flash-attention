@@ -29,7 +29,7 @@ from flash_attn.cute.mask import (
 )
 from flash_attn.cute.tile_scheduler import SM100_TMEM_CAPACITY_COLUMNS
 from flash_attn.cute.flash_fwd_sm100 import _TUNING_CONFIG
-from flash_attn.cute.kernel_args import normalize_kernel_args
+from flash_attn.cute.kernel_args import FwdKernelArgs, normalize_kernel_args
 from flash_attn.cute.utils import ex2_emulation_2, as_bshkrd_tensor
 
 
@@ -181,7 +181,7 @@ class BlackwellFusedMultiHeadAttentionForward:
     @cute.jit
     def __call__(
         self,
-        args,
+        args: FwdKernelArgs,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):

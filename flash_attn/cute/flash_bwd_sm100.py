@@ -36,7 +36,7 @@ from flash_attn.cute import barrier
 from flash_attn.cute.named_barrier import NamedBarrierBwdSm100
 from flash_attn.cute.softmax import apply_score_mod_inner, apply_score_mod_bwd_inner
 from flash_attn.cute.block_sparsity import BlockSparseTensors
-from flash_attn.cute.kernel_args import normalize_kernel_args
+from flash_attn.cute.kernel_args import BwdKernelArgs, normalize_kernel_args
 from flash_attn.cute.utils import AuxData
 from flash_attn.cute.block_sparse_utils import (
     get_total_q_block_count_bwd,
@@ -468,7 +468,7 @@ class FlashAttentionBackwardSm100:
     @cute.jit
     def __call__(
         self,
-        args,
+        args: BwdKernelArgs,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
