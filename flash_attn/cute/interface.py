@@ -3329,7 +3329,6 @@ def _flash_attn_bwd(
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     dlse: Optional[torch.Tensor] = None,
     learnable_sink: Optional[torch.Tensor] = None,
-    compute_dsink: Optional[bool] = None,
 ) -> Tuple[torch.Tensor, ...]:
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
     fake_mode = is_fake_mode()
@@ -3342,30 +3341,17 @@ def _flash_attn_bwd(
             and seqused_q is None
             and seqused_k is None
         ), "Varlen backward with block sparsity is not yet supported"
-    if compute_dsink is None:
-        compute_dsink = learnable_sink is not None
     if learnable_sink is not None:
-        # dSink is produced by a reduction in the dQ postprocess that only
-        # SM90/SM100/SM110 implement. It is a pure side-output: dq/dk/dv never
-        # read sink_tensors, and the sink's effect on them already arrives via
-        # LSE. So a frozen sink (compute_dsink=False) still backprops correctly
-        # on SM120 -- only an actual dSink request is unsupported there.
-        assert not compute_dsink or arch // 10 in [9, 10, 11], (
-            "Learnable sink backward (dSink) is supported on SM90 and SM100/SM110"
-        )
+        assert arch // 10 in [9, 10, 11], "Learnable sink backward is supported on SM90 and SM100/SM110"
         assert lse is not None, "learnable_sink backward requires LSE"
         if q.numel() == 0 or k.numel() == 0:
             dq = torch.zeros_like(q) if dq is None else dq.zero_()
             dk = torch.zeros_like(k) if dk is None else dk.zero_()
             dv = torch.zeros_like(v) if dv is None else dv.zero_()
             dsink = (
-                (
-                    dlse.sum(dim=(0, 2) if dlse.ndim == 3 else 1).to(learnable_sink.dtype)
-                    if dlse is not None
-                    else torch.zeros_like(learnable_sink)
-                )
-                if compute_dsink
-                else None
+                dlse.sum(dim=(0, 2) if dlse.ndim == 3 else 1).to(learnable_sink.dtype)
+                if dlse is not None
+                else torch.zeros_like(learnable_sink)
             )
             return dq, dk, dv, dsink
     sparse_q = None
@@ -4170,7 +4156,7 @@ def _flash_attn_bwd(
             cluster_shape_m=cluster_size,
         )
 
-    dsink = torch.empty_like(learnable_sink) if compute_dsink else None
+    dsink = torch.empty_like(learnable_sink) if learnable_sink is not None else None
 
     # Preprocess kernel: compute (o * dout).sum(dim=-1) - dLSE, lse * log2_e, and zero out dq_accum.
     # For hd=256 dedicated path, dq_accum is None so preprocess only fills dpsum/lse_log2.
@@ -4574,7 +4560,7 @@ def _flash_attn_bwd(
             cu_total_m_blocks=cu_total_m_blocks_q,
             sink_tensors=(
                 LearnableSinkBwdTensors(dpsum, lse, learnable_sink, dsink)
-                if compute_dsink
+                if learnable_sink is not None
                 else None
             ),
             fake_mode=fake_mode,
@@ -5147,6 +5133,13 @@ class FlashAttnFunc(torch.autograd.Function):
             else:
                 return dq, dk, dv, dqv, *((None,) * 30)
         else:
+            # dSink is only produced by the dQ postprocess on SM90/SM100/SM110, and
+            # _flash_attn_bwd rejects a sink outright elsewhere (upstream #2706). It
+            # is a pure side-output though: dq/dk/dv never read sink_tensors and
+            # already pick up the sink through LSE. So when the sink is frozen, keep
+            # it out of the backward rather than tripping that assert -- this is what
+            # lets sink models train on SM120.
+            sink_bwd = learnable_sink if ctx.needs_input_grad[8] else None
             bwd_result = _flash_attn_bwd(
                 q,
                 k,
@@ -5168,13 +5161,9 @@ class FlashAttnFunc(torch.autograd.Function):
                 aux_scalars=ctx.aux_scalars,
                 block_sparse_tensors=ctx.block_sparse_tensors_bwd,
                 dlse=dlse,
-                learnable_sink=learnable_sink,
-                # learnable_sink is forward arg 8; only ask for dSink when the
-                # sink actually requires grad, so a frozen sink still backprops
-                # on arches without the dSink reduction (e.g. SM120).
-                compute_dsink=ctx.needs_input_grad[8],
+                learnable_sink=sink_bwd,
             )
-            if learnable_sink is None:
+            if sink_bwd is None:
                 dq, dk, dv = bwd_result
                 dsink = None
             else:
@@ -5328,6 +5317,13 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             else:
                 return dq, dk, dv, dqv, *((None,) * 31)
         else:
+            # dSink is only produced by the dQ postprocess on SM90/SM100/SM110, and
+            # _flash_attn_bwd rejects a sink outright elsewhere (upstream #2706). It
+            # is a pure side-output though: dq/dk/dv never read sink_tensors and
+            # already pick up the sink through LSE. So when the sink is frozen, keep
+            # it out of the backward rather than tripping that assert -- this is what
+            # lets sink models train on SM120.
+            sink_bwd = learnable_sink if ctx.needs_input_grad[16] else None
             bwd_result = _flash_attn_bwd(
                 q,
                 k,
@@ -5354,11 +5350,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 aux_scalars=ctx.aux_scalars,
                 mask_mod=ctx.mask_mod,
                 dlse=dlse,
-                learnable_sink=learnable_sink,
-                # learnable_sink is forward arg 16 here (see FlashAttnFunc note).
-                compute_dsink=ctx.needs_input_grad[16],
+                learnable_sink=sink_bwd,
             )
-            if learnable_sink is None:
+            if sink_bwd is None:
                 dq, dk, dv = bwd_result
                 dsink = None
             else:
