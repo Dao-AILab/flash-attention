@@ -3368,6 +3368,127 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             return dq, dk, dv, None, *((None,) * 12), dsink, *((None,) * 14)
 
 
+def _unpack_packed_tensor(
+    tensor: torch.Tensor,
+    *,
+    name: str,
+    num_components: int,
+    expected_ndim: int,
+) -> tuple[torch.Tensor, ...]:
+    """Validate and unpack the QKV/KV axis shared by the packed public APIs."""
+    if tensor.ndim != expected_ndim:
+        raise ValueError(f"{name} must have {expected_ndim} dimensions, got {tensor.ndim}")
+    if tensor.shape[-3] != num_components:
+        raise ValueError(
+            f"{name} must have size {num_components} in its packed dimension, "
+            f"got {tensor.shape[-3]}"
+        )
+    return tensor.unbind(dim=-3)
+
+
+def flash_attn_qkvpacked_func(
+    qkv: torch.Tensor,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    window_size: Tuple[Optional[int], Optional[int]] = (None, None),
+    learnable_sink: Optional[torch.Tensor] = None,
+    softcap: float = 0.0,
+    num_splits: int = 1,
+    deterministic: bool = False,
+    score_mod: Optional[Callable] = None,
+    score_mod_bwd: Optional[Callable] = None,
+    mask_mod: Optional[Callable] = None,
+    aux_tensors: Optional[list] = None,
+    aux_scalars: Optional[tuple] = None,
+    block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
+    block_sparse_tensors_bwd: Optional[BlockSparseTensorsTorch] = None,
+    return_lse: bool = False,
+):
+    """FlashAttention over ``qkv`` shaped ``(batch, seqlen, 3, heads, dim)``.
+
+    This is the packed-input counterpart of :func:`flash_attn_func`. It delegates
+    to the same kernels and returns the CuTe API's ``(out, lse)`` tuple. Autograd
+    joins the Q, K, and V view gradients back into one packed gradient.
+    """
+    q, k, v = _unpack_packed_tensor(
+        qkv, name="qkv", num_components=3, expected_ndim=5
+    )
+    return flash_attn_func(
+        q,
+        k,
+        v,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size=window_size,
+        learnable_sink=learnable_sink,
+        softcap=softcap,
+        num_splits=num_splits,
+        pack_gqa=False,
+        deterministic=deterministic,
+        score_mod=score_mod,
+        score_mod_bwd=score_mod_bwd,
+        mask_mod=mask_mod,
+        aux_tensors=aux_tensors,
+        aux_scalars=aux_scalars,
+        block_sparse_tensors=block_sparse_tensors,
+        block_sparse_tensors_bwd=block_sparse_tensors_bwd,
+        return_lse=return_lse,
+    )
+
+
+def flash_attn_kvpacked_func(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    qv: Optional[torch.Tensor] = None,
+    gather_kv_indices: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    window_size: Tuple[Optional[int], Optional[int]] = (None, None),
+    learnable_sink: Optional[torch.Tensor] = None,
+    softcap: float = 0.0,
+    num_splits: int = 1,
+    pack_gqa: Optional[bool] = None,
+    deterministic: bool = False,
+    score_mod: Optional[Callable] = None,
+    score_mod_bwd: Optional[Callable] = None,
+    mask_mod: Optional[Callable] = None,
+    aux_tensors: Optional[list] = None,
+    aux_scalars: Optional[tuple] = None,
+    block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
+    block_sparse_tensors_bwd: Optional[BlockSparseTensorsTorch] = None,
+    return_lse: bool = False,
+):
+    """FlashAttention over ``kv`` shaped ``(batch, seqlen_k, 2, heads_k, dim)``.
+
+    K and V may have fewer heads than Q for MQA/GQA. The function otherwise has
+    the same behavior and ``(out, lse)`` return contract as :func:`flash_attn_func`.
+    """
+    k, v = _unpack_packed_tensor(kv, name="kv", num_components=2, expected_ndim=5)
+    return flash_attn_func(
+        q,
+        k,
+        v,
+        qv=qv,
+        gather_kv_indices=gather_kv_indices,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size=window_size,
+        learnable_sink=learnable_sink,
+        softcap=softcap,
+        num_splits=num_splits,
+        pack_gqa=pack_gqa,
+        deterministic=deterministic,
+        score_mod=score_mod,
+        score_mod_bwd=score_mod_bwd,
+        mask_mod=mask_mod,
+        aux_tensors=aux_tensors,
+        aux_scalars=aux_scalars,
+        block_sparse_tensors=block_sparse_tensors,
+        block_sparse_tensors_bwd=block_sparse_tensors_bwd,
+        return_lse=return_lse,
+    )
+
+
 def flash_attn_func(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -3413,6 +3534,146 @@ def flash_attn_func(
         block_sparse_tensors,
         block_sparse_tensors_bwd,
         return_lse,
+    )
+
+
+def flash_attn_varlen_qkvpacked_func(
+    qkv: torch.Tensor,
+    cu_seqlens: Optional[torch.Tensor] = None,
+    max_seqlen: Optional[int] = None,
+    seqused: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    window_size: Tuple[Optional[int], Optional[int]] = (None, None),
+    learnable_sink: Optional[torch.Tensor] = None,
+    softcap: float = 0.0,
+    num_splits: int = 1,
+    deterministic: bool = False,
+    score_mod: Optional[Callable] = None,
+    score_mod_bwd: Optional[Callable] = None,
+    mask_mod: Optional[Callable] = None,
+    block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
+    aux_tensors: Optional[list] = None,
+    aux_scalars: Optional[tuple] = None,
+    return_lse: bool = False,
+    scheduler_metadata: Optional[SchedulerMetadataTensorsTorch] = None,
+    seqlen_k_per_split: Optional[int] = None,
+    disable_scheduler_metadata: bool = False,
+):
+    """Varlen FlashAttention over ``qkv`` shaped ``(total, 3, heads, dim)``.
+
+    Q, K, and V share cumulative and maximum sequence lengths. The function
+    delegates to :func:`flash_attn_varlen_func` and returns its ``(out, lse)``
+    tuple, while autograd produces one gradient matching the packed input.
+    """
+    q, k, v = _unpack_packed_tensor(
+        qkv, name="qkv", num_components=3, expected_ndim=4
+    )
+    return flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_k=cu_seqlens,
+        max_seqlen_q=max_seqlen,
+        max_seqlen_k=max_seqlen,
+        seqused_q=seqused,
+        seqused_k=seqused,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size=window_size,
+        learnable_sink=learnable_sink,
+        softcap=softcap,
+        num_splits=num_splits,
+        pack_gqa=False,
+        deterministic=deterministic,
+        score_mod=score_mod,
+        score_mod_bwd=score_mod_bwd,
+        mask_mod=mask_mod,
+        block_sparse_tensors=block_sparse_tensors,
+        aux_tensors=aux_tensors,
+        aux_scalars=aux_scalars,
+        return_lse=return_lse,
+        scheduler_metadata=scheduler_metadata,
+        seqlen_k_per_split=seqlen_k_per_split,
+        disable_scheduler_metadata=disable_scheduler_metadata,
+    )
+
+
+def flash_attn_varlen_kvpacked_func(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    cu_seqlens_q: Optional[torch.Tensor] = None,
+    cu_seqlens_k: Optional[torch.Tensor] = None,
+    max_seqlen_q: Optional[int] = None,
+    max_seqlen_k: Optional[int] = None,
+    qv: Optional[torch.Tensor] = None,
+    min_seqlen_k: Optional[int] = None,
+    seqused_q: Optional[torch.Tensor] = None,
+    seqused_k: Optional[torch.Tensor] = None,
+    gather_kv_indices: Optional[torch.Tensor] = None,
+    page_table: Optional[torch.Tensor] = None,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    window_size: Tuple[Optional[int], Optional[int]] = (None, None),
+    learnable_sink: Optional[torch.Tensor] = None,
+    softcap: float = 0.0,
+    num_splits: int = 1,
+    pack_gqa: Optional[bool] = None,
+    deterministic: bool = False,
+    score_mod: Optional[Callable] = None,
+    score_mod_bwd: Optional[Callable] = None,
+    mask_mod: Optional[Callable] = None,
+    block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
+    aux_tensors: Optional[list] = None,
+    aux_scalars: Optional[tuple] = None,
+    return_lse: bool = False,
+    scheduler_metadata: Optional[SchedulerMetadataTensorsTorch] = None,
+    seqlen_k_per_split: Optional[int] = None,
+    disable_scheduler_metadata: bool = False,
+):
+    """Varlen FlashAttention over ``kv`` shaped ``(total_k, 2, heads_k, dim)``.
+
+    K and V may have fewer heads than Q for MQA/GQA. On architectures where the
+    underlying CuTe path supports paged KV, ``kv`` may instead have shape
+    ``(num_pages, page_size, 2, heads_k, dim)`` when ``page_table`` is set.
+    """
+    expected_ndim = 5 if page_table is not None else 4
+    k, v = _unpack_packed_tensor(
+        kv, name="kv", num_components=2, expected_ndim=expected_ndim
+    )
+    return flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        qv=qv,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        min_seqlen_k=min_seqlen_k,
+        seqused_q=seqused_q,
+        seqused_k=seqused_k,
+        gather_kv_indices=gather_kv_indices,
+        page_table=page_table,
+        softmax_scale=softmax_scale,
+        causal=causal,
+        window_size=window_size,
+        learnable_sink=learnable_sink,
+        softcap=softcap,
+        num_splits=num_splits,
+        pack_gqa=pack_gqa,
+        deterministic=deterministic,
+        score_mod=score_mod,
+        score_mod_bwd=score_mod_bwd,
+        mask_mod=mask_mod,
+        block_sparse_tensors=block_sparse_tensors,
+        aux_tensors=aux_tensors,
+        aux_scalars=aux_scalars,
+        return_lse=return_lse,
+        scheduler_metadata=scheduler_metadata,
+        seqlen_k_per_split=seqlen_k_per_split,
+        disable_scheduler_metadata=disable_scheduler_metadata,
     )
 
 
