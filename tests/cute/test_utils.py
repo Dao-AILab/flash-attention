@@ -6,6 +6,20 @@ from flash_attn.cute import utils as cute_utils
 from flash_attn.cute.utils import hash_callable
 
 
+def with_positional_default(value):
+    def inner(arg=value):
+        return arg
+
+    return inner
+
+
+def with_keyword_default(value):
+    def inner(*, arg=value):
+        return arg
+
+    return inner
+
+
 class TestHashCallable:
     """Tests for hash_callable function."""
 
@@ -191,6 +205,33 @@ class TestHashCallable:
         hash2 = hash_callable(func2)
         assert hash1 != hash2
 
+    def test_positional_default_values_affect_hash(self):
+        """Defaults can specialize generated callables without creating a closure."""
+        func1 = with_positional_default(1)
+        func1_equivalent = with_positional_default(1)
+        func2 = with_positional_default(2)
+        assert func1.__closure__ is None
+
+        assert hash_callable(func1, set_cute_hash=False) == hash_callable(
+            func1_equivalent, set_cute_hash=False
+        )
+        assert hash_callable(func1, set_cute_hash=False) != hash_callable(
+            func2, set_cute_hash=False
+        )
+
+    def test_keyword_default_values_affect_hash(self):
+        func1 = with_keyword_default(1)
+        func1_equivalent = with_keyword_default(1)
+        func2 = with_keyword_default(2)
+        assert func1.__closure__ is None
+
+        assert hash_callable(func1, set_cute_hash=False) == hash_callable(
+            func1_equivalent, set_cute_hash=False
+        )
+        assert hash_callable(func1, set_cute_hash=False) != hash_callable(
+            func2, set_cute_hash=False
+        )
+
 
 class TestHashCallableIntegration:
     """Integration tests for hash_callable with flash attention."""
@@ -223,4 +264,3 @@ class TestHashCallableIntegration:
         # getsource should never be called because __cute_hash__ is set
         assert call_count[0] == 0, f"getsource was called {call_count[0]} times"
         assert hash1 == hash2 == hash3 == "inductor-generated-hash"
-
