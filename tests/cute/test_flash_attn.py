@@ -816,13 +816,16 @@ def test_flash_attn_small_head_dim(seqlen_q, seqlen_k, d, causal, dtype):
 
 
 @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("head_dim,head_dim_v", [(72, 64), (64, 72)])
+@pytest.mark.parametrize(
+    "head_dim,head_dim_v",
+    [(72, 64), (64, 72), (88, 88), (104, 104), (120, 120), (136, 136)],
+)
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_flash_attn_pack_gqa_padded_head_dim(head_dim, head_dim_v, causal):
+def test_flash_attn_pack_gqa_padded_head_dim(head_dim, head_dim_v, causal, dtype):
     torch.manual_seed(0)
     batch_size, seqlen_q, seqlen_k = 1, 64, 64
     num_heads, num_heads_kv = 5, 1
-    dtype = torch.bfloat16
     q = torch.randn(
         batch_size, seqlen_q, num_heads, head_dim, device="cuda", dtype=dtype
     )
@@ -833,7 +836,8 @@ def test_flash_attn_pack_gqa_padded_head_dim(head_dim, head_dim_v, causal):
         batch_size, seqlen_k, num_heads_kv, head_dim_v, device="cuda", dtype=dtype
     )
 
-    out, _ = flash_attn_func(q, k, v, causal=causal, pack_gqa=True)
+    # GQA selects PackGQA by default, so cover the public default dispatch.
+    out, _ = flash_attn_func(q, k, v, causal=causal)
     if is_fake_mode():
         return
 
@@ -866,7 +870,6 @@ def test_flash_attn_varlen_pack_gqa_padded_head_dim():
         cu_seqlens_k=cu_seqlens_k,
         max_seqlen_q=max(q_lengths),
         max_seqlen_k=max(k_lengths),
-        pack_gqa=True,
     )
 
     references = []
