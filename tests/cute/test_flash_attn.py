@@ -32,6 +32,8 @@ from flash_attn.cute.interface import (
     flash_attn_func,
     flash_attn_varlen_func,
     get_scheduler_metadata,
+    _bwd_preprocess,
+    _bwd_postprocess_convert,
     _flash_attn_fwd,
     _flash_attn_bwd,
     _flash_attn_bwd_sparse_mla,
@@ -3938,8 +3940,10 @@ def test_flash_attn_empty_backward_varlen(total_q, total_k, causal):
 
 @pytest.mark.parametrize("seqlen_q,seqlen_k", [(32, 0), (0, 32)])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_flash_attn_empty_backward_preallocated_outputs(seqlen_q, seqlen_k):
-    """The empty-workload shortcut zeros and reuses caller-provided gradient buffers."""
+def test_flash_attn_empty_backward_preallocated_outputs(
+    seqlen_q, seqlen_k, monkeypatch
+):
+    """The shortcut reuses gradient buffers without compiling backward kernels."""
     device = "cuda"
     dtype = torch.bfloat16
     batch_size = 2
@@ -3954,10 +3958,16 @@ def test_flash_attn_empty_backward_preallocated_outputs(seqlen_q, seqlen_k):
     dk = torch.ones_like(k)
     dv = torch.ones_like(v)
 
+    backward_stages = (_bwd_preprocess, _flash_attn_bwd, _bwd_postprocess_convert)
+    test_caches = tuple(JITCache() for _ in backward_stages)
+    for stage, cache in zip(backward_stages, test_caches):
+        monkeypatch.setattr(stage, "compile_cache", cache)
+
     grads = _flash_attn_bwd(
         q, k, v, out, torch.randn_like(out), lse, dq=dq, dk=dk, dv=dv,
     )
 
+    assert all(not cache.cache for cache in test_caches)
     assert grads[0] is dq
     assert grads[1] is dk
     assert grads[2] is dv
