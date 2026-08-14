@@ -1968,9 +1968,9 @@ def _flash_attn_bwd(
         )
     q_subtile_factor = sparse_q // m_block_size if sparse_q is not None else 2
     if is_varlen and use_block_sparsity:
-        if arch // 10 != 9:
+        if arch // 10 not in (9, 10, 11):
             raise NotImplementedError(
-                "Varlen block-sparse backward is supported on SM90 only"
+                "Varlen block-sparse backward is supported on SM90/SM100/SM110 only"
             )
         if deterministic:
             raise NotImplementedError(

@@ -1110,7 +1110,13 @@ def _assert_varlen_block_sparse_backward_matches_reference(
         )
 
 
-@pytest.mark.skipif(COMPUTE_CAPABILITY != 9, reason="SM90 only")
+# Varlen block-sparse backward is implemented for SM90 and SM100/SM110.
+VARLEN_BWD_SPARSE_SUPPORTED = COMPUTE_CAPABILITY in (9, 10, 11)
+# Sparse forward metadata must match the forward Q tile: 256 on SM100+, 128 on SM90.
+SPARSE_FWD_Q_BLOCK = 256 if COMPUTE_CAPABILITY >= 10 else 128
+
+
+@pytest.mark.skipif(not VARLEN_BWD_SPARSE_SUPPORTED, reason="SM90/SM100/SM110 only")
 @pytest.mark.parametrize(
     "dtype,metadata_heads,mask_name",
     [
@@ -1118,27 +1124,39 @@ def _assert_varlen_block_sparse_backward_matches_reference(
         pytest.param(torch.float16, 1, "mini_causal", id="fp16-broadcast"),
     ],
 )
-def test_varlen_block_sparse_backward_sm90(dtype, metadata_heads, mask_name):
+def test_varlen_block_sparse_backward(dtype, metadata_heads, mask_name):
     _assert_varlen_block_sparse_backward_matches_reference(
         [257, 129],
         [385, 129],
         metadata_heads=metadata_heads,
         dtype=dtype,
         mask_name=mask_name,
+        # Backward-direction (128, 128) metadata does not match the SM100 forward
+        # Q tile of 256, so pair it with a dense mask-mod forward there.
+        use_sparse_forward=COMPUTE_CAPABILITY == 9,
     )
 
 
-@pytest.mark.skipif(COMPUTE_CAPABILITY != 9, reason="SM90 only")
-@pytest.mark.parametrize(
-    "head_dim,block_size,use_sparse_forward",
-    [
+if COMPUTE_CAPABILITY == 9:
+    Q_SUBTILE_CASES = [
         pytest.param(128, (128, 128), True, id="factor-2"),
         # D=96 forward uses tile_n=144, while backward uses tile_n=128. A dense
         # mask-mod forward isolates the packed factor-3 backward metadata path.
         pytest.param(96, (192, 128), False, id="factor-3"),
-    ],
-)
-def test_varlen_block_sparse_backward_q_subtiles_sm90(
+    ]
+else:
+    # SM100 backward uses tile_m=128, so the subtile factors shift by one
+    # relative to SM90 for the same sparse block sizes.
+    Q_SUBTILE_CASES = [
+        pytest.param(128, (128, 128), False, id="factor-1"),
+        pytest.param(128, (256, 128), True, id="factor-2"),
+        pytest.param(64, (384, 128), False, id="factor-3"),
+    ]
+
+
+@pytest.mark.skipif(not VARLEN_BWD_SPARSE_SUPPORTED, reason="SM90/SM100/SM110 only")
+@pytest.mark.parametrize("head_dim,block_size,use_sparse_forward", Q_SUBTILE_CASES)
+def test_varlen_block_sparse_backward_q_subtiles(
     head_dim, block_size, use_sparse_forward
 ):
     # Ragged tails make the last coarse block expand past the effective length,
@@ -1153,16 +1171,23 @@ def test_varlen_block_sparse_backward_q_subtiles_sm90(
     )
 
 
-@pytest.mark.skipif(COMPUTE_CAPABILITY != 9, reason="SM90 only")
+@pytest.mark.skipif(not VARLEN_BWD_SPARSE_SUPPORTED, reason="SM90/SM100/SM110 only")
 @pytest.mark.parametrize("seed", range(9))
-def test_varlen_block_sparse_backward_fuzz_sm90(seed):
+def test_varlen_block_sparse_backward_fuzz(seed):
     """Bounded randomized coverage for packed metadata and ragged tails."""
     rng = random.Random(1000 + seed)
-    q_configs = [
-        (64, (128, 128)),
-        (128, (128, 128)),
-        (96, (192, 128)),
-    ]
+    if COMPUTE_CAPABILITY == 9:
+        q_configs = [
+            (64, (128, 128)),
+            (128, (128, 128)),
+            (96, (192, 128)),
+        ]
+    else:
+        q_configs = [
+            (64, (128, 128)),
+            (128, (256, 128)),
+            (96, (384, 128)),
+        ]
     head_modes = [
         (2, 2, False),
         (4, 2, True),
@@ -1216,9 +1241,76 @@ def test_varlen_block_sparse_backward_fuzz_sm90(seed):
     )
 
 
-@pytest.mark.skipif(COMPUTE_CAPABILITY != 9, reason="SM90 only")
+@pytest.mark.skipif(not VARLEN_BWD_SPARSE_SUPPORTED, reason="SM90/SM100/SM110 only")
+def test_varlen_block_sparse_batch_invariant_fwd():
+    """Permuting packed sequences must not change any sequence's forward bits.
+
+    Per-sequence tile grids are anchored at each sequence's own offset, so the
+    packing order cannot change a sequence's tiling or reduction structure --
+    unlike a fused doc-mask over one packed sequence, where blocks straddle
+    unaligned document boundaries. The contract is forward-only; backward runs
+    as part of the flow but gradients are not part of the bitwise contract
+    (dQ cross-KV-tile accumulation is atomic and order-dependent).
+    """
+    torch.manual_seed(42)
+    device = "cuda"
+    dtype = torch.bfloat16
+    seqlens = [257, 129, 385, 300]
+    permutation = [2, 0, 3, 1]
+    num_heads = 2
+    head_dim = 64
+    window = 256
+    mask_mod_cute, mask_mod_flex = get_mask_pair(
+        "sliding_window", seqlen_q=max(seqlens), seqlen_k=max(seqlens), window_size=window
+    )
+    docs = [
+        tuple(
+            torch.randn(seqlen, num_heads, head_dim, device=device, dtype=dtype)
+            for _ in range(4)
+        )
+        for seqlen in seqlens
+    ]
+
+    def run(order):
+        lens = [seqlens[i] for i in order]
+        q, k, v, dout = (
+            torch.cat([docs[i][j] for i in order]).requires_grad_(j < 3)
+            for j in range(4)
+        )
+        cu_seqlens = torch.tensor(
+            [0, *torch.tensor(lens).cumsum(0).tolist()], device=device, dtype=torch.int32
+        )
+        sparse_fwd, sparse_bwd = _make_varlen_block_sparse_pair(
+            mask_mod_flex, lens, lens, 1, (128, 128), device
+        )
+        out, _ = flash_attn_varlen_func(
+            q, k, v,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max(lens),
+            max_seqlen_k=max(lens),
+            mask_mod=mask_mod_cute,
+            # (128, 128) forward metadata does not match the SM100 forward tile.
+            block_sparse_tensors=sparse_fwd if COMPUTE_CAPABILITY == 9 else None,
+            block_sparse_tensors_bwd=sparse_bwd,
+        )
+        torch.autograd.grad(out, (q, k, v), dout)
+        per_doc = {}
+        for pos, i in enumerate(order):
+            per_doc[i] = out[cu_seqlens[pos] : cu_seqlens[pos + 1]].detach()
+        return per_doc
+
+    base = run(list(range(len(seqlens))))
+    permuted = run(permutation)
+    for i in base:
+        assert torch.equal(permuted[i], base[i]), (
+            f"sequence {i} out is not bitwise equal after permuting the packing order"
+        )
+
+
+@pytest.mark.skipif(not VARLEN_BWD_SPARSE_SUPPORTED, reason="SM90/SM100/SM110 only")
 @pytest.mark.parametrize("score_case", ["times_two", "aux_buffers"])
-def test_varlen_block_sparse_backward_score_mod_and_sink_sm90(score_case):
+def test_varlen_block_sparse_backward_score_mod_and_sink(score_case):
     """Block-sparse packed indexing composes with score backward and sink gradients."""
     torch.manual_seed(42)
     device = "cuda"
@@ -1227,7 +1319,7 @@ def test_varlen_block_sparse_backward_score_mod_and_sink_sm90(score_case):
     seqlens_k = [385, 129]
     num_heads = 2
     head_dim = 64
-    block_size = (128, 128)
+    block_size = (SPARSE_FWD_Q_BLOCK, 128)
     q, k, v, cu_seqlens_q, cu_seqlens_k = setup_varlen_tensors(
         seqlens_q, seqlens_k, num_heads, num_heads, head_dim, dtype
     )

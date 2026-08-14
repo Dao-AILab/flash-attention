@@ -1212,6 +1212,7 @@ def produce_block_sparse_q_loads_bwd_sm100_default(
     # Subtiling factor and bounds
     q_subtile_factor: cutlass.Constexpr = 1,
     m_block_max: int = 0,
+    num_sparse_m_blocks: int | None = None,
     # Optional 2CTA state for hdim <= 128
     use_2cta_instrs: cutlass.Constexpr = False,
     producer_state_Qt=None,
@@ -1231,7 +1232,13 @@ def produce_block_sparse_q_loads_bwd_sm100_default(
         curr_full_idx,
         loop_count,
     ) = get_block_sparse_iteration_info_bwd(
-        blocksparse_tensors, batch_idx, head_idx, n_block, q_subtile_factor, m_block_max
+        blocksparse_tensors,
+        batch_idx,
+        head_idx,
+        n_block,
+        q_subtile_factor,
+        m_block_max,
+        num_sparse_m_blocks,
     )
     # 2 cta peels the first loop for Qt path; so we guard the whole block if loopcount == 0
     if loop_count > Int32(0):
@@ -1403,6 +1410,7 @@ def produce_block_sparse_q_loads_bwd_sm100_2cta_hdim192(
     # Subtiling factor and bounds
     q_subtile_factor: cutlass.Constexpr = 1,
     m_block_max: int = 0,
+    num_sparse_m_blocks: int | None = None,
 ):
     """Produce SM100 backward block-sparse Q/dO loads for the hdim192 2CTA schedule."""
     (
@@ -1412,7 +1420,13 @@ def produce_block_sparse_q_loads_bwd_sm100_2cta_hdim192(
         curr_full_idx,
         loop_count,
     ) = get_block_sparse_iteration_info_bwd(
-        blocksparse_tensors, batch_idx, head_idx, n_block, q_subtile_factor, m_block_max
+        blocksparse_tensors,
+        batch_idx,
+        head_idx,
+        n_block,
+        q_subtile_factor,
+        m_block_max,
+        num_sparse_m_blocks,
     )
 
     if loop_count > Int32(0):

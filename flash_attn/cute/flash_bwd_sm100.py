@@ -938,9 +938,14 @@ class FlashAttentionBackwardSm100:
         # 2-CTA: 231424 and 1-CTA: 232448
         # print("SMEM: ", self.shared_storage.size_in_bytes())
         if const_expr(self.use_block_sparsity):
-            assert all(x is None for x in (mCuSeqlensQ, mCuSeqlensK, mSeqUsedQ, mSeqUsedK)), (
-                "Variable sequence length is not supported yet for blocksparse in bwd"
-            )
+            is_varlen = any(x is not None for x in (mCuSeqlensQ, mCuSeqlensK, mSeqUsedQ, mSeqUsedK))
+            if const_expr(is_varlen):
+                # Packed varlen metadata is per-physical-KV-tile and per-sequence, so
+                # neither KV subtiling nor 2CTA clustering is supported.
+                assert self.kv_subtile_factor == 1 and not self.use_2cta_instrs, (
+                    "Varlen block-sparse backward requires kv_subtile_factor == 1 "
+                    "and no 2CTA instructions"
+                )
 
         self.kernel(
             tma_tensor_Q,
@@ -1660,6 +1665,9 @@ class FlashAttentionBackwardSm100:
             num_iters = m_block_max - m_block_min
             if const_expr(self.use_block_sparsity):
                 assert blocksparse_tensors is not None
+                num_sparse_m_blocks = cute.ceil_div(
+                    seqlen.seqlen_q, self.tile_m * self.q_subtile_factor
+                )
                 num_iters = get_total_q_block_count_bwd(
                     blocksparse_tensors,
                     batch_idx,
@@ -1667,6 +1675,7 @@ class FlashAttentionBackwardSm100:
                     n_block // self.kv_subtile_factor,
                     q_subtile_factor=self.q_subtile_factor,
                     m_block_max=m_block_max,
+                    num_sparse_m_blocks=num_sparse_m_blocks,
                 )
                 process_tile = num_iters > Int32(0)
 
@@ -2174,6 +2183,9 @@ class FlashAttentionBackwardSm100:
 
             else:
                 assert blocksparse_tensors is not None
+                num_sparse_m_blocks = cute.ceil_div(
+                    seqlen.seqlen_q, self.tile_m * self.q_subtile_factor
+                )
                 if const_expr(self.use_2cta_instrs and self.tile_hdim == 192):
                     assert should_load_Q and should_load_dO
                     assert load_dOt is not None and load_Qt is not None
@@ -2213,6 +2225,7 @@ class FlashAttentionBackwardSm100:
                         self.tma_copy_bytes["V"],
                         q_subtile_factor=self.q_subtile_factor,
                         m_block_max=m_block_max,
+                        num_sparse_m_blocks=num_sparse_m_blocks,
                     )
                 else:
                     (
@@ -2246,6 +2259,7 @@ class FlashAttentionBackwardSm100:
                         should_load_dO,
                         q_subtile_factor=self.q_subtile_factor,
                         m_block_max=m_block_max,
+                        num_sparse_m_blocks=num_sparse_m_blocks,
                         use_2cta_instrs=self.use_2cta_instrs,
                         producer_state_Qt=producer_state_Qt,
                         producer_state_Kt=producer_state_Kt,
@@ -2426,6 +2440,9 @@ class FlashAttentionBackwardSm100:
             )
 
             if const_expr(self.use_block_sparsity):
+                num_sparse_m_blocks = cute.ceil_div(
+                    seqlen.seqlen_q, self.tile_m * self.q_subtile_factor
+                )
                 block_iter_count = get_total_q_block_count_bwd(
                     blocksparse_tensors,
                     batch_idx,
@@ -2433,6 +2450,7 @@ class FlashAttentionBackwardSm100:
                     n_block // self.kv_subtile_factor,
                     q_subtile_factor=self.q_subtile_factor,
                     m_block_max=m_block_max,
+                    num_sparse_m_blocks=num_sparse_m_blocks,
                 )
                 process_tile = block_iter_count > Int32(0)
             else:
@@ -3091,6 +3109,9 @@ class FlashAttentionBackwardSm100:
             )
             if const_expr(self.use_block_sparsity):
                 assert blocksparse_tensors is not None
+                num_sparse_m_blocks = cute.ceil_div(
+                    seqlen.seqlen_q, self.tile_m * self.q_subtile_factor
+                )
                 (
                     curr_q_cnt,
                     curr_q_idx,
@@ -3104,6 +3125,7 @@ class FlashAttentionBackwardSm100:
                     n_block // self.kv_subtile_factor,
                     q_subtile_factor=self.q_subtile_factor,
                     m_block_max=m_block_max,
+                    num_sparse_m_blocks=num_sparse_m_blocks,
                 )
                 process_tile = loop_count > Int32(0)
 
@@ -3673,6 +3695,9 @@ class FlashAttentionBackwardSm100:
             )
             if const_expr(self.use_block_sparsity):
                 assert blocksparse_tensors is not None
+                num_sparse_m_blocks = cute.ceil_div(
+                    seqlen.seqlen_q, self.tile_m * self.q_subtile_factor
+                )
                 (
                     curr_q_cnt,
                     curr_q_idx,
@@ -3686,6 +3711,7 @@ class FlashAttentionBackwardSm100:
                     n_block_sparse,
                     q_subtile_factor=self.q_subtile_factor,
                     m_block_max=m_block_max,
+                    num_sparse_m_blocks=num_sparse_m_blocks,
                 )
                 process_tile = loop_count > Int32(0)
             if const_expr(self.deterministic and self.use_block_sparsity):
