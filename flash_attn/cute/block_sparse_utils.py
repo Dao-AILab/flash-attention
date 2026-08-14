@@ -1617,6 +1617,40 @@ def get_block_sparse_iteration_info_bwd(
 
 
 @cute.jit
+def get_dq_write_order_bwd(
+    blocksparse_tensors: BlockSparseTensors,
+    batch_idx,
+    head_idx,
+    n_block,
+    num_sparse_m_blocks: int | None = None,
+):
+    """Slice per-tile dQ write-order metadata for fixed or packed layouts.
+
+    Packed (varlen) write orders use the same flattened per-sequence layout and
+    addressing as the packed Q-index tensors. Returns (curr, curr_full).
+    """
+    dq_write_order = blocksparse_tensors.dq_write_order
+    dq_write_order_full = blocksparse_tensors.dq_write_order_full
+    assert dq_write_order is not None
+    if const_expr(len(dq_write_order.shape) == 2):
+        assert num_sparse_m_blocks is not None
+        assert blocksparse_tensors.cu_block_idx_offsets is not None
+        block_idx_offset = (
+            blocksparse_tensors.cu_block_idx_offsets[batch_idx] + n_block * num_sparse_m_blocks
+        )
+        curr = cute.domain_offset(block_idx_offset, dq_write_order[head_idx, None])
+        curr_full = None
+        if const_expr(dq_write_order_full is not None):
+            curr_full = cute.domain_offset(block_idx_offset, dq_write_order_full[head_idx, None])
+    else:
+        curr = dq_write_order[batch_idx, head_idx, n_block, None]
+        curr_full = None
+        if const_expr(dq_write_order_full is not None):
+            curr_full = dq_write_order_full[batch_idx, head_idx, n_block, None]
+    return curr, curr_full
+
+
+@cute.jit
 def get_m_block_from_iter_bwd(
     iter_idx,
     curr_q_cnt,

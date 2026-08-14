@@ -1973,9 +1973,10 @@ def _flash_attn_bwd(
                 "Varlen block-sparse backward is supported on SM90/SM100/SM110 only"
             )
         if deterministic:
-            raise NotImplementedError(
-                "Deterministic varlen block-sparse backward is not yet supported"
-            )
+            if arch // 10 not in (10, 11):
+                raise NotImplementedError(
+                    "Deterministic varlen block-sparse backward requires SM100/SM110"
+                )
         if cu_seqlens_q is None or cu_seqlens_k is None:
             raise NotImplementedError(
                 "Varlen block-sparse backward requires packed Q and K"
