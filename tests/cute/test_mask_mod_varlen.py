@@ -19,7 +19,7 @@ from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
 from flash_attn.cute.interface import _flash_attn_fwd, flash_attn_varlen_func
 from flash_attn.cute import utils
-from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch
+from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch, compute_dq_write_order
 from flash_attn.cute.compute_block_sparsity import compute_block_sparsity
 from score_mod_definitions import (
     score_mod_bwd_dual_buffer,
@@ -921,8 +921,15 @@ def _make_varlen_block_sparse_pair(
     num_heads,
     block_size,
     device,
+    compute_write_order=False,
+    spt=False,
 ):
-    """Pack both BlockMask directions using each sequence's effective lengths."""
+    """Pack both BlockMask directions using each sequence's effective lengths.
+
+    With compute_write_order, also packs per-sequence dQ write-order metadata
+    for deterministic backward: ascending n_block ranks for spt=False, or
+    descending for spt=True (matching the varlen scheduler's lpt visit order).
+    """
     block_masks = [
         create_block_mask(
             mask_mod,
@@ -939,6 +946,9 @@ def _make_varlen_block_sparse_pair(
     def pack(field):
         values = [mask[field][0].flatten(1) for mask in block_masks]
         return torch.cat(values, dim=1).contiguous()
+
+    def pack_tensors(values):
+        return torch.cat([value[0].flatten(1) for value in values], dim=1).contiguous()
 
     def cumsum(values):
         values = torch.tensor([0, *values], dtype=torch.int32, device=device)
@@ -968,6 +978,13 @@ def _make_varlen_block_sparse_pair(
         cu_block_idx_offsets=cu_block_idx_offsets,
         block_size=block_size,
     )
+    dq_write_order = dq_write_order_full = None
+    if compute_write_order:
+        per_seq_orders = [
+            compute_dq_write_order(*mask[2:10], spt=spt) for mask in block_masks
+        ]
+        dq_write_order = pack_tensors([order for order, _ in per_seq_orders])
+        dq_write_order_full = pack_tensors([order_full for _, order_full in per_seq_orders])
     bwd = BlockSparseTensorsTorch(
         mask_block_cnt=q_mask_cnt,
         mask_block_idx=q_mask_idx,
@@ -976,6 +993,9 @@ def _make_varlen_block_sparse_pair(
         cu_block_idx_offsets=cu_block_idx_offsets,
         block_size=block_size,
         cu_total_n_blocks=cumsum(num_n_blocks),
+        dq_write_order=dq_write_order,
+        dq_write_order_full=dq_write_order_full,
+        spt=spt if compute_write_order else None,
     )
     return fwd, bwd
 
@@ -1306,6 +1326,129 @@ def test_varlen_block_sparse_batch_invariant_fwd():
         assert torch.equal(permuted[i], base[i]), (
             f"sequence {i} out is not bitwise equal after permuting the packing order"
         )
+
+
+def _assert_varlen_block_sparse_deterministic(
+    seqlens,
+    block_size,
+    spt,
+    mask_pair,
+    num_heads=2,
+    head_dim=64,
+    seed=42,
+):
+    """Deterministic varlen sparse backward is bitwise reproducible and batch-invariant.
+
+    Packed dq_write_order serializes cross-KV-tile dQ accumulation per Q tile, so
+    dQ joins out/dK/dV in being bitwise identical run-to-run and under permutation
+    of the packed sequence order (each sequence's contributor ranks are
+    sequence-local, so the packing position cannot change accumulation order).
+    """
+    torch.manual_seed(seed)
+    device = "cuda"
+    dtype = torch.bfloat16
+    mask_mod_cute, mask_mod_flex = mask_pair
+    permutation = list(range(len(seqlens)))
+    random.Random(seed).shuffle(permutation)
+    docs = [
+        tuple(
+            torch.randn(seqlen, num_heads, head_dim, device=device, dtype=dtype)
+            for _ in range(4)
+        )
+        for seqlen in seqlens
+    ]
+
+    def run(order, deterministic=True):
+        lens = [seqlens[i] for i in order]
+        q, k, v, dout = (
+            torch.cat([docs[i][j] for i in order]).requires_grad_(j < 3)
+            for j in range(4)
+        )
+        cu_seqlens = torch.tensor(
+            [0, *torch.tensor(lens).cumsum(0).tolist()], device=device, dtype=torch.int32
+        )
+        _, sparse_bwd = _make_varlen_block_sparse_pair(
+            mask_mod_flex, lens, lens, 1, block_size, device,
+            compute_write_order=deterministic, spt=spt,
+        )
+        out, _ = flash_attn_varlen_func(
+            q, k, v,
+            cu_seqlens_q=cu_seqlens,
+            cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max(lens),
+            max_seqlen_k=max(lens),
+            mask_mod=mask_mod_cute,
+            block_sparse_tensors_bwd=sparse_bwd,
+            deterministic=deterministic,
+        )
+        grads = torch.autograd.grad(out, (q, k, v), dout)
+        per_doc = {}
+        for pos, i in enumerate(order):
+            start, end = cu_seqlens[pos], cu_seqlens[pos + 1]
+            per_doc[i] = tuple(t[start:end].detach() for t in (out, *grads))
+        return per_doc
+
+    identity = list(range(len(seqlens)))
+    base = run(identity)
+    rerun = run(identity)
+    permuted = run(permutation)
+    nondet = run(identity, deterministic=False)
+    labels = ("out", "dq", "dk", "dv")
+    for i in base:
+        for label, expected, again, moved in zip(labels, base[i], rerun[i], permuted[i]):
+            assert torch.equal(expected, again), (
+                f"sequence {i} {label} is not bitwise reproducible run-to-run"
+            )
+            assert torch.equal(expected, moved), (
+                f"sequence {i} {label} is not bitwise equal after permuting the packing order"
+            )
+        for label, expected, actual in zip(labels, base[i], nondet[i]):
+            torch.testing.assert_close(
+                actual, expected, rtol=3e-2, atol=3e-2,
+                msg=lambda m: f"sequence {i} {label} vs non-deterministic: {m}",
+            )
+
+
+@pytest.mark.skipif(COMPUTE_CAPABILITY not in (10, 11), reason="SM100/SM110 only")
+@pytest.mark.parametrize("spt", [False, True], ids=["ascending", "spt"])
+@pytest.mark.parametrize(
+    "block_size",
+    [pytest.param((128, 128), id="factor-1"), pytest.param((256, 128), id="factor-2")],
+)
+def test_varlen_block_sparse_backward_deterministic(block_size, spt):
+    # Windows span several KV tiles, so dQ rows race without the semaphore order.
+    # Enough sequences to oversubscribe the SMs: rank/visit-order mismatches
+    # deadlock only when waiting CTAs can starve the rank-0 writer.
+    _assert_varlen_block_sparse_deterministic(
+        [257, 700, 1411, 129] * 8,
+        block_size,
+        spt,
+        get_mask_pair("sliding_window", seqlen_q=1411, seqlen_k=1411, window_size=256),
+    )
+
+
+@pytest.mark.skipif(COMPUTE_CAPABILITY not in (10, 11), reason="SM100/SM110 only")
+@pytest.mark.parametrize("seed", range(6))
+def test_varlen_block_sparse_backward_deterministic_fuzz(seed):
+    """Randomized bitwise-reproducibility coverage for deterministic varlen sparse."""
+    rng = random.Random(3000 + seed)
+    block_size = [(128, 128), (256, 128), (384, 128)][seed % 3]
+    spt = bool(seed % 2)
+    mask_name = "block_diagonal" if seed % 2 else "mini_causal"
+    batch_size = rng.randint(3, 8)
+    seqlens = [rng.randint(1, 3 * block_size[0] - 1) for _ in range(batch_size)]
+    seqlens[0] = rng.randint(block_size[0] + 1, 3 * block_size[0] - 1)
+    # Avoid only tile-aligned cases; ragged tails must stay deterministic too.
+    seqlens = [seqlen + int(seqlen % 128 == 0) for seqlen in seqlens]
+    _assert_varlen_block_sparse_deterministic(
+        seqlens,
+        block_size,
+        spt,
+        get_mask_pair(mask_name),
+        num_heads=rng.choice([1, 2, 4]),
+        head_dim=rng.choice([64, 128]),
+        seed=seed,
+    )
 
 
 @pytest.mark.skipif(not VARLEN_BWD_SPARSE_SUPPORTED, reason="SM90/SM100/SM110 only")

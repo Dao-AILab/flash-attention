@@ -40,6 +40,7 @@ from flash_attn.cute.utils import AuxData
 from flash_attn.cute.block_sparse_utils import (
     get_total_q_block_count_bwd,
     get_block_sparse_iteration_info_bwd,
+    get_dq_write_order_bwd,
     get_m_block_from_iter_bwd,
     produce_block_sparse_q_loads_bwd_sm100_2cta_hdim192,
     produce_block_sparse_q_loads_bwd_sm100_default,
@@ -3717,15 +3718,13 @@ class FlashAttentionBackwardSm100:
             if const_expr(self.deterministic and self.use_block_sparsity):
                 assert blocksparse_tensors is not None
                 if const_expr(blocksparse_tensors.dq_write_order is not None):
-                    assert blocksparse_tensors.dq_write_order is not None
-                    curr_dq_write_order = blocksparse_tensors.dq_write_order[
-                        batch_idx, head_idx, n_block_sparse, None
-                    ]
-                    if const_expr(blocksparse_tensors.dq_write_order_full is not None):
-                        assert blocksparse_tensors.dq_write_order_full is not None
-                        curr_dq_write_order_full = blocksparse_tensors.dq_write_order_full[
-                            batch_idx, head_idx, n_block_sparse, None
-                        ]
+                    curr_dq_write_order, curr_dq_write_order_full = get_dq_write_order_bwd(
+                        blocksparse_tensors,
+                        batch_idx,
+                        head_idx,
+                        n_block_sparse,
+                        num_sparse_m_blocks=num_sparse_m_blocks,
+                    )
 
             # dQacc_reduce mainloop
             # Block sparsity: iterate over sparse m_block count and derive actual m_block
