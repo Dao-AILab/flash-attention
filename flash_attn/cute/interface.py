@@ -1516,6 +1516,7 @@ def _flash_attn_fwd(
                     normalized_block_sparse_tensors.cu_block_idx_offsets,
                     normalized_block_sparse_tensors.dq_write_order,
                     normalized_block_sparse_tensors.dq_write_order_full,
+                    normalized_block_sparse_tensors.cu_total_n_blocks,
                 )
                 if normalized_block_sparse_tensors is not None
                 else None,
@@ -1852,13 +1853,6 @@ def _flash_attn_bwd(
     fake_mode = is_fake_mode()
     arch = _get_device_arch()
     assert arch // 10 in [9, 10, 11, 12], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x, 12.x"
-    if block_sparse_tensors is not None:
-        assert (
-            cu_seqlens_q is None
-            and cu_seqlens_k is None
-            and seqused_q is None
-            and seqused_k is None
-        ), "Varlen backward with block sparsity is not yet supported"
     if learnable_sink is not None:
         assert arch // 10 in [9, 10, 11], "Learnable sink backward is supported on SM90 and SM100/SM110"
         assert lse is not None, "learnable_sink backward requires LSE"
@@ -2018,6 +2012,21 @@ def _flash_attn_bwd(
             f"tile_m={m_block_size}; got {sparse_q}."
         )
     q_subtile_factor = sparse_q // m_block_size if sparse_q is not None else 2
+    if is_varlen and use_block_sparsity:
+        if arch // 10 != 9:
+            raise NotImplementedError(
+                "Varlen block-sparse backward is supported on SM90 only"
+            )
+        if deterministic:
+            raise NotImplementedError(
+                "Deterministic varlen block-sparse backward is not yet supported"
+            )
+        if cu_seqlens_q is None or cu_seqlens_k is None:
+            raise NotImplementedError(
+                "Varlen block-sparse backward requires packed Q and K"
+            )
+        if block_sparse_tensors.cu_total_n_blocks is None:
+            raise ValueError("Varlen block-sparse backward requires cu_total_n_blocks")
     seqlen_q_rounded = (seqlen_q + m_block_size - 1) // m_block_size * m_block_size
     seqlen_k_rounded = (seqlen_k + n_block_size - 1) // n_block_size * n_block_size
     num_n_blocks = seqlen_k_rounded // n_block_size
@@ -2581,6 +2590,7 @@ def _flash_attn_bwd(
                 normalized_block_sparse_tensors.cu_block_idx_offsets,
                 normalized_block_sparse_tensors.dq_write_order,
                 normalized_block_sparse_tensors.dq_write_order_full,
+                normalized_block_sparse_tensors.cu_total_n_blocks,
             )
             if normalized_block_sparse_tensors is not None
             else None,
@@ -3216,7 +3226,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         score_mod: Optional[Callable] = None,
         score_mod_bwd: Optional[Callable] = None,
         mask_mod: Optional[Callable] = None,
-        block_sparse_tensors: Optional[list] = None,
+        block_sparse_tensors: BlockSparseTensorsTorch | None = None,
+        block_sparse_tensors_bwd: BlockSparseTensorsTorch | None = None,
         aux_tensors: Optional[list] = None,
         aux_scalars: Optional[tuple] = None,
         return_lse: bool = False,
@@ -3294,6 +3305,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         ctx.score_mod = score_mod
         ctx.score_mod_bwd = score_mod_bwd
         ctx.mask_mod = mask_mod
+        ctx.block_sparse_tensors_bwd = block_sparse_tensors_bwd
         ctx.aux_scalars = aux_scalars
         ctx.set_materialize_grads(False)
         return out, lse
@@ -3357,6 +3369,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 aux_tensors=aux_tensors,
                 aux_scalars=ctx.aux_scalars,
                 mask_mod=ctx.mask_mod,
+                block_sparse_tensors=ctx.block_sparse_tensors_bwd,
                 dlse=dlse,
                 learnable_sink=learnable_sink,
             )
@@ -3365,7 +3378,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 dsink = None
             else:
                 dq, dk, dv, dsink = bwd_result
-            return dq, dk, dv, None, *((None,) * 12), dsink, *((None,) * 14)
+            return dq, dk, dv, None, *((None,) * 12), dsink, *((None,) * 15)
 
 
 def flash_attn_func(
@@ -3441,7 +3454,8 @@ def flash_attn_varlen_func(
     score_mod: Optional[Callable] = None,
     score_mod_bwd: Optional[Callable] = None,
     mask_mod: Optional[Callable] = None,
-    block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
+    block_sparse_tensors: BlockSparseTensorsTorch | None = None,
+    block_sparse_tensors_bwd: BlockSparseTensorsTorch | None = None,
     aux_tensors: Optional[list] = None,
     aux_scalars: Optional[tuple] = None,
     return_lse: bool = False,
@@ -3480,6 +3494,13 @@ def flash_attn_varlen_func(
     min_seqlen_k: for varlen, specifies the minimum kv sequence length for any batch.
         Used with gather_kv_indices to determine if we need oob masking.
 
+    block_sparse_tensors_bwd: Q-direction metadata for backward. For packed varlen,
+        counts are shaped (num_heads, sum(num_n_blocks)), indices are flattened per
+        sequence, and cu_total_n_blocks / cu_block_idx_offsets are required. The sparse
+        Q block size may be an integer multiple of the native backward Q tile. When
+        seqused_q / seqused_k are provided, pack metadata and offsets using those
+        effective lengths; cu_seqlens_q / cu_seqlens_k still locate physical segments.
+
     scheduler_metadata: optional tensors used by certain tile schedulers, for optimization
         and functionality. computed in get_scheduler_metadata.
 
@@ -3515,6 +3536,7 @@ def flash_attn_varlen_func(
         score_mod_bwd,
         mask_mod,
         block_sparse_tensors,
+        block_sparse_tensors_bwd,
         aux_tensors,
         aux_scalars,
         return_lse,
