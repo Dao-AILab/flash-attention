@@ -1888,27 +1888,89 @@ def _flash_attn_bwd(
         causal, window_size_left, window_size_right
     )
 
+    sm120_bwd_d128_long = False
     if arch // 10 == 12:
-        # SM120: uses SM80 MMA with 99 KB SMEM, 128 threads (4 warps).
+        # SM120: uses SM80 MMA with 99 KB SMEM, 256 threads (8 warps).
         m_block_size = 64
         n_block_size = 64
-        if head_dim <= 64:
+        if (
+            head_dim <= 64
+            and head_dim_v <= 64
+            and not local
+            and cu_seqlens_q is None
+            and cu_seqlens_k is None
+            and seqused_q is None
+            and seqused_k is None
+        ):
+            # A 64x128 tile halves the K/V grid and Q/dO rereads, and fits the
+            # 99 KB SMEM cap. Require two waves so small grids stay at 64x64.
+            _grid_n128 = ((k.shape[1] + 127) // 128) * q.shape[-2] * q.shape[0]
+            _sm_count = get_num_sms_for_selection(q.device.index, arch)
+            if _grid_n128 >= 2 * _sm_count:
+                n_block_size = 128
+        # For long D<=64 problems, keep P/dS in registers as direct dV/dK
+        # operands. Shorter problems do not amortize this RS configuration.
+        _sm120_bwd_rs = (
+            n_block_size == 128
+            and q.shape[1] >= 8192
+        )
+        # One Q/dO stage reduces SMEM pressure and pipeline overhead on SM120.
+        num_stages_Q = 1
+        num_stages_dO = 1
+        # Long D128 has room for a second Q stage, while a second dO stage would
+        # exceed the SMEM cap. Short sequences stay at one stage.
+        if (
+            head_dim <= 128
+            and head_dim_v <= 128
+            and cu_seqlens_q is None
+            and cu_seqlens_k is None
+            and seqused_q is None
+            and seqused_k is None
+            and q.shape[1] >= 8192
+            and not _sm120_bwd_rs
+        ):
             num_stages_Q = 2
-            num_stages_dO = 2
-        else:
-            num_stages_Q = 1
-            num_stages_dO = 1
         SdP_swapAB = False
         dKV_swapAB = False
         dQ_swapAB = False
         AtomLayoutMSdP = 4
         AtomLayoutNdKV = 4
         AtomLayoutMdQ = 4
+        if _sm120_bwd_rs:
+            # See comment above (_sm120_bwd_rs): RS register-resident dK/dV.
+            SdP_swapAB = True
+            AtomLayoutMSdP = 1
+            AtomLayoutNdKV = 8  # num_threads // 32; required by Mma_dKV_is_RS
+        if head_dim == 128 and head_dim_v == 128:
+            # Match the SM8x D128 geometry so dK/dV cover the full 64-wide
+            # head-dimension slab per atom iteration.
+            AtomLayoutNdKV = 2
         V_in_regs = False
+        sm120_bwd_d128_long = (
+            head_dim == 128
+            and head_dim_v == 128
+            and not local
+            and block_sparse_tensors is None
+            and cu_seqlens_q is None
+            and cu_seqlens_k is None
+            and seqused_q is None
+            and seqused_k is None
+            and q.shape[1] == k.shape[1]
+            and q.shape[1] >= 8192
+            and q.shape[-2] == k.shape[-2]
+        )
+        if sm120_bwd_d128_long:
+            # Match the SM8x D128 warp geometry and keep V in registers. The
+            # latter is safe because the dP GEMM explicitly consumes its
+            # register fragment instead of re-reading the Q/V smem alias.
+            AtomLayoutMdQ = 2
+            V_in_regs = True
+        # This flag only selects the SM90 single-WG postprocess; SM120 selects
+        # its postprocess thread count from AtomLayoutMdQ below.
         dQ_single_wg = False
         cluster_size = 1
         use_2cta_instrs = False
-        num_threads = 128
+        num_threads = 256
         assert not (block_sparse_tensors is not None), "Block sparsity backward not supported on SM 12.0"
         assert score_mod is None and score_mod_bwd is None, "score_mod backward not supported on SM 12.0"
         assert mask_mod is None, "mask_mod backward not supported on SM 12.0"
@@ -2102,6 +2164,22 @@ def _flash_attn_bwd(
         if arch // 10 == 8:
             raise NotImplementedError("Custom user-provided score_mod is not supported on SM8x architectures.")
 
+    sm120_skip_full_causal_mask = (
+        arch // 10 == 12
+        and sm120_bwd_d128_long
+        and causal
+        and qhead_per_kvhead == 1
+        and seqlen_q == seqlen_k
+        and seqlen_q % m_block_size == 0
+        and seqlen_k % n_block_size == 0
+        and softcap == 0.0
+        and score_mod is None
+        and score_mod_bwd is None
+        and mask_mod is None
+        and learnable_sink is None
+        and dlse is None
+    )
+
     device = q.device
     out_torch_dtype = q.dtype
 
@@ -2236,7 +2314,7 @@ def _flash_attn_bwd(
         cu_total_m_blocks=cu_total_m_blocks_q,
         fake_mode=fake_mode,
     )
-    # num_threads: SM90 derives from BwdConfig.num_wg, SM120 is set to 128 above,
+    # num_threads: SM90 derives from BwdConfig.num_wg, SM120 is set to 256 above,
     # SM100/SM110 uses default from function signature (384).
     if arch // 10 not in [9, 12]:
         num_threads = 384
@@ -2304,6 +2382,7 @@ def _flash_attn_bwd(
             n_block_size,
             num_threads,
             pack_gqa,
+            sm120_skip_full_causal_mask,
             num_stages_Q,
             num_stages_dO,
             SdP_swapAB,
@@ -2428,6 +2507,7 @@ def _flash_attn_bwd(
                 V_in_regs=V_in_regs,
                 score_mod=score_mod,
                 score_mod_bwd=score_mod_bwd,
+                skip_full_causal_mask=sm120_skip_full_causal_mask,
             )
         elif arch // 10 == 9:
             fa_bwd_obj = FlashAttentionBackwardSm90(
@@ -2595,6 +2675,13 @@ def _flash_attn_bwd(
             # dQ postprocess: match main kernel's MMA WG count, unless dQ_single_wg
             num_threads_post_dQ = 128 if dQ_single_wg else cfg.num_wg * 128
             num_threads_post_dKV = cfg.num_wg * 128
+        elif arch // 10 == 12:
+            # The long D128 AtomLayoutMdQ=2 path uses the full 256-thread
+            # accumulator partition. The default AtomLayoutMdQ=4 path keeps
+            # the validated 128-thread V4 bridge, which is faster for small
+            # problems. dK/dV always follow the 256-thread main partition.
+            num_threads_post_dQ = num_threads if AtomLayoutMdQ == 2 else 128
+            num_threads_post_dKV = num_threads
         else:
             num_threads_post_dQ = 128
             num_threads_post_dKV = 128
