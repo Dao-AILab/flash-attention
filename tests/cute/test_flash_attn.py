@@ -3981,3 +3981,283 @@ def test_flash_attn_varlen_seqlen_k_per_split(causal):
     assert torch.equal(out_1024, first), (
         f"seqlen_k_per_split not batch-invariant: max_diff={max_diff}."
     )
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_k",
+    [
+        (64, 64),
+        (128, 128),
+        (256, 256),
+        (128, 512),
+        (1024, 1024),
+    ],
+)
+@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="MLA kernel requires SM100/SM110")
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_mla_learnable_sink(seqlen_q, seqlen_k, causal, dtype):
+    """Test MLA with learnable sink forward.
+
+    The learnable sink adds a virtual token to the softmax normalizer:
+        scores_extended = cat([sink_logit, scores], dim=-1)
+        attn = softmax(scores_extended, dim=-1)
+        O = attn[..., 1:] @ V   (exclude the sink column)
+
+    Compares flash_attn_func output against attention_ref with learnable_sink.
+    """
+    device = "cuda"
+    torch.manual_seed(42)
+    torch.cuda.empty_cache()
+
+    batch_size = 2
+    nheads = 128
+    nheads_kv = 1
+    d = 512
+
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
+    v = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype)
+    k = v
+    learnable_sink = torch.randn(nheads, device=device, dtype=dtype)
+
+    q_ref = q.clone()
+    v_ref = v.clone()
+    sink_ref = learnable_sink.clone()
+
+    out, lse = flash_attn_func(q, k, v, causal=causal, learnable_sink=learnable_sink)
+
+    if is_fake_mode():
+        return
+
+    out_ref, _ = attention_ref(None, None, v_ref, causal=causal, qv=q_ref, learnable_sink=sink_ref)
+
+    diff = (out - out_ref).abs()
+    max_diff = diff.max().item()
+    mean_diff = diff.mean().item()
+    print(f"MLA+sink output max diff: {max_diff}")
+    print(f"MLA+sink output mean diff: {mean_diff}")
+    assert max_diff < 3e-2, f"MLA+sink output max diff {max_diff} exceeds tolerance 3e-2"
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_k",
+    [
+        (128, 128),
+        (256, 256),
+        (128, 512),
+    ],
+)
+@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="MLA kernel requires SM100/SM110")
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_mla_learnable_sink_backward(seqlen_q, seqlen_k, causal, dtype):
+    """Test MLA backward with learnable sink.
+
+    Uses gather_kv_indices that selects all KV positions (dense through the sparse path)
+    to exercise the backward. Verifies dsink via comparison against a PyTorch reference.
+    """
+    device = "cuda"
+    torch.manual_seed(42)
+    torch.cuda.empty_cache()
+
+    batch_size = 2
+    nheads = 128
+    nheads_kv = 1
+    d = 512
+    gather_kv_length = ((seqlen_k + 127) // 128) * 128
+
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype, requires_grad=True)
+    v = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype, requires_grad=True)
+    learnable_sink = torch.randn(nheads, device=device, dtype=dtype, requires_grad=True)
+
+    indices = torch.full((batch_size, seqlen_q, gather_kv_length), -1, device=device, dtype=torch.int32)
+    indices[:, :, :seqlen_k] = torch.arange(seqlen_k, device=device, dtype=torch.int32).expand(batch_size, seqlen_q, -1)
+
+    out, lse = flash_attn_func(
+        q, v, v,
+        causal=causal,
+        learnable_sink=learnable_sink,
+        return_lse=True,
+        gather_kv_indices=indices,
+    )
+
+    if is_fake_mode():
+        return
+
+    loss = out.sum()
+    loss.backward()
+
+    dsink_kernel = learnable_sink.grad.clone()
+    dv_kernel = v.grad.clone()
+
+    # Reference dsink: dsink[h] = -sum_rows(exp(sink[h] - lse[row,h]) * dpsum[row,h])
+    with torch.no_grad():
+        dpsum_ref = out.detach().sum(dim=-1)
+        lse_detached = lse.detach()
+        sink_expanded = learnable_sink.detach().float().view(1, 1, nheads)
+        sink_prob = torch.exp(sink_expanded - lse_detached.float())
+        dsink_ref = -(sink_prob * dpsum_ref.float()).sum(dim=(0, 1)).to(dtype)
+
+    # Reference dv: run attention_ref forward+backward with sink
+    q_ref = q.detach().clone().requires_grad_(True)
+    v_ref = v.detach().clone().requires_grad_(True)
+    sink_ref = learnable_sink.detach().clone().requires_grad_(True)
+    out_ref, _ = attention_ref(None, None, v_ref, causal=causal, qv=q_ref,
+                               learnable_sink=sink_ref, gather_kv_indices=indices)
+    out_ref.sum().backward()
+    dv_ref = v_ref.grad
+
+    # Check dsink
+    diff_sink = (dsink_kernel - dsink_ref).abs()
+    max_diff_sink = diff_sink.max().item()
+    max_val_sink = max(dsink_kernel.abs().max().item(), dsink_ref.abs().max().item(), 1.0)
+    atol = 3e-2
+    rtol = 1e-2
+    tol_sink = atol + rtol * max_val_sink
+    print(f"dsink max diff: {max_diff_sink}, tol: {tol_sink:.4f}")
+    assert max_diff_sink < tol_sink, f"dsink max diff {max_diff_sink} exceeds tolerance {tol_sink}"
+
+    # Check dv (dkv since k=v, the backward returns dv in fp32 then accumulated)
+    diff_dv = (dv_kernel.float() - dv_ref.float()).abs()
+    max_diff_dv = diff_dv.max().item()
+    max_val_dv = max(dv_kernel.abs().max().item(), dv_ref.abs().max().item(), 1.0)
+    tol_dv = atol + rtol * max_val_dv
+    print(f"dv max diff: {max_diff_dv}, tol: {tol_dv:.4f}")
+    assert max_diff_dv < tol_dv, f"dv max diff {max_diff_dv} exceeds tolerance {tol_dv}"
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize(
+    "seqlen_q,seqlen_k",
+    [
+        (64, 64),
+        (128, 128),
+        (128, 256),
+    ],
+)
+@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="MLA kernel requires SM100/SM110")
+def test_mla_sink_precision_vs_fp64(seqlen_q, seqlen_k, causal):
+    """Compare kernel error against bf16 reference error, both measured from fp64 ground truth.
+
+    Runs the same MLA+sink computation in three ways:
+      1. fp64 reference (ground truth)
+      2. bf16 reference (PyTorch eager, quantifies dtype-inherent error)
+      3. bf16 kernel (flash_attn_func, quantifies kernel error)
+
+    Fails if kernel/reference error ratio exceeds 5x for any quantity.
+    """
+    device = "cuda"
+    dtype = torch.bfloat16
+    seed = 42
+    torch.manual_seed(seed)
+    torch.cuda.empty_cache()
+
+    batch_size = 2
+    nheads = 128
+    nheads_kv = 1
+    d = 512
+    gather_kv_length = ((seqlen_k + 127) // 128) * 128
+
+    gen = torch.Generator(device=device).manual_seed(seed)
+
+    def randn64(*shape):
+        return torch.randn(*shape, dtype=torch.float64, device=device, generator=gen, requires_grad=True)
+
+    q_64 = randn64(batch_size, seqlen_q, nheads, d)
+    v_64 = randn64(batch_size, seqlen_k, nheads_kv, d)
+    sink_64 = randn64(nheads)
+
+    # --- fp64 reference forward ---
+    softmax_scale = 1.0 / math.sqrt(d)
+    v_expanded_64 = v_64.expand(batch_size, seqlen_k, nheads, d)
+    scores_64 = torch.einsum("bthd,bshd->bhts", q_64 * softmax_scale, v_expanded_64)
+
+    if causal:
+        row_idx = torch.arange(seqlen_q, device=device).unsqueeze(1)
+        col_idx = torch.arange(seqlen_k, device=device).unsqueeze(0)
+        causal_mask = col_idx > row_idx + (seqlen_k - seqlen_q)
+        scores_64 = scores_64.masked_fill(causal_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+
+    sink_logit_64 = sink_64.view(1, nheads, 1, 1).expand(batch_size, nheads, seqlen_q, 1)
+    scores_with_sink_64 = torch.cat([sink_logit_64, scores_64], dim=-1)
+    attn_with_sink_64 = torch.softmax(scores_with_sink_64, dim=-1)
+    attn_64 = attn_with_sink_64[..., 1:]
+    out_64 = torch.einsum("bhts,bshd->bthd", attn_64, v_expanded_64)
+
+    # --- bf16 reference forward ---
+    q_bf = q_64.detach().to(dtype).requires_grad_(True)
+    v_bf = v_64.detach().to(dtype).requires_grad_(True)
+    sink_bf = sink_64.detach().to(dtype).requires_grad_(True)
+
+    v_expanded_bf = v_bf.float().expand(batch_size, seqlen_k, nheads, d)
+    scores_bf = torch.einsum("bthd,bshd->bhts", q_bf.float() * softmax_scale, v_expanded_bf)
+    if causal:
+        scores_bf = scores_bf.masked_fill(causal_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
+    sink_logit_bf = sink_bf.float().view(1, nheads, 1, 1).expand(batch_size, nheads, seqlen_q, 1)
+    scores_with_sink_bf = torch.cat([sink_logit_bf, scores_bf], dim=-1)
+    attn_with_sink_bf = torch.softmax(scores_with_sink_bf, dim=-1)
+    attn_bf = attn_with_sink_bf[..., 1:]
+    out_bf = torch.einsum("bhts,bshd->bthd", attn_bf, v_expanded_bf).to(dtype)
+
+    # --- bf16 kernel forward ---
+    q_kern = q_64.detach().to(dtype).requires_grad_(True)
+    v_kern = v_64.detach().to(dtype).requires_grad_(True)
+    sink_kern = sink_64.detach().to(dtype).requires_grad_(True)
+
+    indices = torch.full((batch_size, seqlen_q, gather_kv_length), -1, device=device, dtype=torch.int32)
+    indices[:, :, :seqlen_k] = torch.arange(seqlen_k, device=device, dtype=torch.int32).expand(batch_size, seqlen_q, -1)
+
+    out_kern, lse_kern = flash_attn_func(
+        q_kern, v_kern, v_kern,
+        causal=causal,
+        learnable_sink=sink_kern,
+        return_lse=True,
+        gather_kv_indices=indices,
+    )
+
+    # --- Forward error ---
+    ref_fwd_diff = (out_64.double() - out_bf.double()).abs().max().item()
+    kern_fwd_diff = (out_64.double() - out_kern.double()).abs().max().item()
+
+    # --- Backward ---
+    grad_gen = torch.Generator(device=device).manual_seed(1234)
+    grad_64 = torch.randn(out_64.shape, dtype=torch.float64, device=device, generator=grad_gen)
+    grad_bf = grad_64.to(dtype)
+
+    out_64.backward(grad_64)
+    out_bf.backward(grad_bf)
+    out_kern.backward(grad_bf)
+
+    ref_dsink = (sink_64.grad.double() - sink_bf.grad.double()).abs().max().item()
+    kern_dsink = (sink_64.grad.double() - sink_kern.grad.double()).abs().max().item()
+
+    ref_dq = (q_64.grad.double() - q_bf.grad.double()).abs().max().item()
+    kern_dq = (q_64.grad.double() - q_kern.grad.double()).abs().max().item()
+
+    ref_dv = (v_64.grad.double() - v_bf.grad.double()).abs().max().item()
+    kern_dv = (v_64.grad.double() - v_kern.grad.double()).abs().max().item()
+
+    # --- Ratios ---
+    def _ratio(kern_val, ref_val):
+        if ref_val == 0:
+            return float("inf") if kern_val > 0 else 1.0
+        return kern_val / ref_val
+
+    r_fwd = _ratio(kern_fwd_diff, ref_fwd_diff)
+    r_dsink = _ratio(kern_dsink, ref_dsink)
+    r_dq = _ratio(kern_dq, ref_dq)
+    r_dv = _ratio(kern_dv, ref_dv)
+
+    print(
+        f"\n[causal={causal}, sq={seqlen_q}, sk={seqlen_k}]"
+        f"\n  {'':15s} {'fwd':>10s} {'dSink':>10s} {'dQ':>10s} {'dV':>10s}"
+        f"\n  {'ref bf16':15s} {ref_fwd_diff:10.4e} {ref_dsink:10.4e} {ref_dq:10.4e} {ref_dv:10.4e}"
+        f"\n  {'kernel bf16':15s} {kern_fwd_diff:10.4e} {kern_dsink:10.4e} {kern_dq:10.4e} {kern_dv:10.4e}"
+        f"\n  {'kernel/ref':15s} {r_fwd:10.2f}x {r_dsink:10.2f}x {r_dq:10.2f}x {r_dv:10.2f}x"
+    )
+
+    assert r_fwd < 3, f"Kernel fwd error ratio too large: {r_fwd:.2f}x"
+    assert r_dsink < 3, f"Kernel dSink error ratio too large: {r_dsink:.2f}x"
+    assert r_dq < 3, f"Kernel dQ error ratio too large: {r_dq:.2f}x"
+    assert r_dv < 3, f"Kernel dV error ratio too large: {r_dv:.2f}x"
