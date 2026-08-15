@@ -32,6 +32,8 @@ from flash_attn.cute.interface import (
     flash_attn_func,
     flash_attn_varlen_func,
     get_scheduler_metadata,
+    _bwd_preprocess,
+    _bwd_postprocess_convert,
     _flash_attn_fwd,
     _flash_attn_bwd,
     _flash_attn_bwd_sparse_mla,
@@ -3845,6 +3847,134 @@ def test_flash_attn_empty_q_varlen(causal):
     assert out.numel() == 0
     if lse is not None:
         assert lse.numel() == 0
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize(
+    "batch_size,seqlen_q,seqlen_k",
+    [
+        (2, 0, 32),
+        (2, 32, 0),
+        (0, 32, 32),
+    ],
+)
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_empty_backward_dense(batch_size, seqlen_q, seqlen_k, causal):
+    """Dense backward returns zero gradients when the attention workload is empty."""
+    device = "cuda"
+    dtype = torch.bfloat16
+    nheads = 4
+    d = 64
+
+    q = torch.randn(
+        batch_size, seqlen_q, nheads, d,
+        device=device, dtype=dtype, requires_grad=True,
+    )
+    k = torch.randn(
+        batch_size, seqlen_k, nheads, d,
+        device=device, dtype=dtype, requires_grad=True,
+    )
+    v = torch.randn(
+        batch_size, seqlen_k, nheads, d,
+        device=device, dtype=dtype, requires_grad=True,
+    )
+
+    out, lse = flash_attn_func(q, k, v, causal=causal, return_lse=True)
+    grads = torch.autograd.grad(
+        (out, lse),
+        (q, k, v),
+        (torch.randn_like(out), torch.randn_like(lse)),
+    )
+
+    if is_fake_mode():
+        return
+    for grad, tensor in zip(grads, (q, k, v)):
+        assert grad.shape == tensor.shape
+        assert torch.count_nonzero(grad).item() == 0
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("total_q,total_k", [(0, 64), (64, 0), (0, 0)])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_empty_backward_varlen(total_q, total_k, causal):
+    """Varlen backward returns zero gradients when all Q or K sequences are empty."""
+    device = "cuda"
+    dtype = torch.bfloat16
+    nheads = 4
+    d = 64
+    batch_size = 2
+
+    q = torch.randn(total_q, nheads, d, device=device, dtype=dtype, requires_grad=True)
+    k = torch.randn(total_k, nheads, d, device=device, dtype=dtype, requires_grad=True)
+    v = torch.randn(total_k, nheads, d, device=device, dtype=dtype, requires_grad=True)
+    cu_seqlens_q = torch.tensor(
+        [0, total_q // 2, total_q], device=device, dtype=torch.int32,
+    )
+    cu_seqlens_k = torch.tensor(
+        [0, total_k // 2, total_k], device=device, dtype=torch.int32,
+    )
+
+    out, lse = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=total_q // batch_size,
+        max_seqlen_k=total_k // batch_size,
+        causal=causal,
+        return_lse=True,
+    )
+    grads = torch.autograd.grad(
+        (out, lse),
+        (q, k, v),
+        (torch.randn_like(out), torch.randn_like(lse)),
+    )
+
+    if is_fake_mode():
+        return
+    for grad, tensor in zip(grads, (q, k, v)):
+        assert grad.shape == tensor.shape
+        assert torch.count_nonzero(grad).item() == 0
+
+
+@pytest.mark.parametrize("seqlen_q,seqlen_k", [(32, 0), (0, 32)])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_empty_backward_preallocated_outputs(
+    seqlen_q, seqlen_k, monkeypatch
+):
+    """The shortcut reuses gradient buffers without compiling backward kernels."""
+    device = "cuda"
+    dtype = torch.bfloat16
+    batch_size = 2
+    nheads = 4
+    d = 64
+
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
+    k = torch.randn(batch_size, seqlen_k, nheads, d, device=device, dtype=dtype)
+    v = torch.randn_like(k)
+    out, lse, *_ = _flash_attn_fwd(q, k, v, return_lse=True)
+    dq = torch.ones_like(q)
+    dk = torch.ones_like(k)
+    dv = torch.ones_like(v)
+
+    backward_stages = (_bwd_preprocess, _flash_attn_bwd, _bwd_postprocess_convert)
+    test_caches = tuple(JITCache() for _ in backward_stages)
+    for stage, cache in zip(backward_stages, test_caches):
+        monkeypatch.setattr(stage, "compile_cache", cache)
+
+    grads = _flash_attn_bwd(
+        q, k, v, out, torch.randn_like(out), lse, dq=dq, dk=dk, dv=dv,
+    )
+
+    assert all(not cache.cache for cache in test_caches)
+    assert grads[0] is dq
+    assert grads[1] is dk
+    assert grads[2] is dv
+    if is_fake_mode():
+        return
+    for grad in grads:
+        assert torch.count_nonzero(grad).item() == 0
 
 
 @pytest.mark.parametrize("seqlen_k", [512, 1024])
