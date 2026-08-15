@@ -365,7 +365,8 @@ def _get_fwd_config(
     num_n_blocks = (seqlen_k_loaded + tile_n - 1) // tile_n
     num_SMs = None
     if arch // 10 == 12:
-        assert num_splits == 1, "SM120 forward only supports num_splits=1"
+        assert num_splits <= 1, "SM120 forward only supports num_splits=1"
+        num_splits = 1
     elif num_splits < 1:
         num_SMs = get_num_sms_for_selection(device.index, arch)
         num_splits = num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, 128)
