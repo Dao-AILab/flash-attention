@@ -98,7 +98,7 @@ def _get_disable_2cta_default(is_fwd: bool = False) -> bool:
 
 
 def _compute_base_hash(func: Callable) -> str:
-    """Compute hash from source code or bytecode and closure values."""
+    """Compute a hash from callable code and captured compile-time values."""
     try:
         data = inspect.getsource(func).encode()
     except (OSError, TypeError):
@@ -113,13 +113,22 @@ def _compute_base_hash(func: Callable) -> str:
         for cell in func.__closure__:
             hasher.update(repr(cell.cell_contents).encode())
 
+    # Factory-generated score/mask modifiers often capture specialization values
+    # as defaults instead of closure cells. Those values affect generated code and
+    # therefore must distinguish entries in the compile cache as well.
+    for attr in ("__defaults__", "__kwdefaults__"):
+        values = getattr(func, attr, None)
+        if values is not None:
+            hasher.update(attr.encode())
+            hasher.update(repr(values).encode())
+
     return hasher.hexdigest()
 
 
 def hash_callable(
     func: Callable, mixer_attrs: Tuple[str] = _MIXER_ATTRS, set_cute_hash: bool = True
 ) -> str:
-    """Hash a callable based on the source code or bytecode and closure values.
+    """Hash a callable based on its code and captured compile-time values.
     Fast-path: if the callable (or its __wrapped__ base) has a ``__cute_hash__``
     attribute, that value is returned immediately as the base hash, then
     metadata dunders are mixed in to produce the final dict-key hash.
