@@ -20,7 +20,7 @@ pip install flash-attn-4
 pip install -e "flash_attn/cute[dev]"
 ```
 
-Dependencies: `nvidia-cutlass-dsl>=4.5.2`, `torch`, `einops`, `apache-tvm-ffi`, `quack-kernels>=0.5.0`.
+Dependencies: `nvidia-cutlass-dsl>=4.6.2`, `torch`, `einops`, `apache-tvm-ffi`, `quack-kernels>=0.5.3`.
 
 ## Running Tests
 
