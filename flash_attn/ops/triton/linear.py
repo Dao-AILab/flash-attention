@@ -252,7 +252,7 @@ def kernel_fwd(
     # C = C + rm[:, None] * stride_cm + rn[None, :] * stride_cn
     C = C + rm[:, None] * stride_cm + rn[None, :]
     mask = (rm < M)[:, None] & (rn < N)[None, :]
-    tl.store(C, acc)
+    tl.store(C, acc, mask=mask)
 
 
 def triton_linear_act(
