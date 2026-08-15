@@ -21,6 +21,8 @@ import urllib.request
 import urllib.error
 from wheel.bdist_wheel import bdist_wheel as _bdist_wheel
 
+from setup_helpers import add_cuda_gencodes, get_cuda_supported_archs
+
 import torch
 from torch.utils.cpp_extension import (
     BuildExtension,
@@ -96,59 +98,6 @@ def get_cuda_bare_metal_version(cuda_dir):
     bare_metal_version = parse(output[release_idx].split(",")[0])
 
     return raw_output, bare_metal_version
-
-
-def add_cuda_gencodes(cc_flag, archs, bare_metal_version):
-    """
-    Adds -gencode flags based on nvcc capabilities:
-      - sm_80/90 (regular)
-      - sm_100/120 on CUDA >= 12.8
-      - Use 100f on CUDA >= 12.9 (Blackwell family-specific)
-      - Map requested 110 -> 101 if CUDA < 13.0 (Thor rename)
-      - Embed PTX for newest arch for forward compatibility
-    """
-    # Always-regular 80
-    if "80" in archs:
-        cc_flag += ["-gencode", "arch=compute_80,code=sm_80"]
-
-    # Hopper 9.0 needs >= 11.8
-    if bare_metal_version >= Version("11.8") and "90" in archs:
-        cc_flag += ["-gencode", "arch=compute_90,code=sm_90"]
-
-    # Blackwell 10.x requires >= 12.8
-    if bare_metal_version >= Version("12.8"):
-        if "100" in archs:
-            # CUDA 12.9 introduced "family-specific" for Blackwell (100f)
-            if bare_metal_version >= Version("12.9"):
-                cc_flag += ["-gencode", "arch=compute_100f,code=sm_100"]
-            else:
-                cc_flag += ["-gencode", "arch=compute_100,code=sm_100"]
-
-        if "120" in archs:
-            # sm_120 is supported in CUDA 12.8/12.9+ toolkits
-            if bare_metal_version >= Version("12.9"):
-                cc_flag += ["-gencode", "arch=compute_120f,code=sm_120"]
-            else:
-                cc_flag += ["-gencode", "arch=compute_120,code=sm_120"]
-
-
-        # Thor rename: 12.9 uses sm_101; 13.0+ uses sm_110
-        if "110" in archs:
-            if bare_metal_version >= Version("13.0"):
-                cc_flag += ["-gencode", "arch=compute_110f,code=sm_110"]
-            else:
-                # Provide Thor support for CUDA 12.9 via sm_101
-                if bare_metal_version >= Version("12.8"):
-                    cc_flag += ["-gencode", "arch=compute_101,code=sm_101"]
-                # else: no Thor support in older toolkits
-
-    # PTX for newest requested arch (forward-compat)
-    numeric = [a for a in archs if a.isdigit()]
-    if numeric:
-        newest = max(numeric, key=int)
-        cc_flag += ["-gencode", f"arch=compute_{newest},code=compute_{newest}"]
-
-    return cc_flag
 
 
 def get_hip_version():
@@ -298,7 +247,12 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
                 "Note: make sure nvcc has a supported version by running nvcc -V."
             )
         # Build -gencode (regular + PTX + family-specific 'f' when available)
-        add_cuda_gencodes(cc_flag, set(cuda_archs()), bare_metal_version)
+        add_cuda_gencodes(
+            cc_flag,
+            set(cuda_archs()),
+            bare_metal_version,
+            get_cuda_supported_archs(CUDA_HOME),
+        )
     else:
         # No nvcc present; warnings already emitted above
         pass
