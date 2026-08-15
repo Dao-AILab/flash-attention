@@ -1,4 +1,5 @@
 import math
+import os
 
 import pytest
 import torch
@@ -15,6 +16,7 @@ from flash_attn.cute.interface import (
     _tile_size_bwd_sm90,
 )
 from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch
+from flash_attn.cute.testing import is_fake_mode, maybe_fake_tensor_mode
 
 COMPUTE_CAPABILITY = torch.cuda.get_device_capability()[0]
 
@@ -883,6 +885,142 @@ def run_flex_reference_bwd(q, k, v, eager_score_mod, grad_out, dtype=None):
     dq, dk, dv = torch.autograd.grad(out, (q, k, v), grad_out)
 
     return out, dq, dk, dv
+
+
+def run_eager_attention_reference_bwd(q, k, v, eager_score_mod, grad_out, dtype):
+    """Dense PyTorch reference that does not depend on a fused GPU kernel."""
+    q = q.to(dtype).detach().requires_grad_(True)
+    k = k.to(dtype).detach().requires_grad_(True)
+    v = v.to(dtype).detach().requires_grad_(True)
+    grad_out = grad_out.to(dtype)
+
+    qhead_per_kvhead = q.shape[1] // k.shape[1]
+    k_for_scores = k.repeat_interleave(qhead_per_kvhead, dim=1)
+    v_for_out = v.repeat_interleave(qhead_per_kvhead, dim=1)
+    scores = torch.matmul(q, k_for_scores.transpose(-2, -1)) * (q.shape[-1] ** -0.5)
+    batch_idx = torch.arange(q.shape[0], device=q.device).view(-1, 1, 1, 1)
+    head_idx = torch.arange(q.shape[1], device=q.device).view(1, -1, 1, 1)
+    q_idx = torch.arange(q.shape[2], device=q.device).view(1, 1, -1, 1)
+    kv_idx = torch.arange(k.shape[2], device=q.device).view(1, 1, 1, -1)
+    scores = eager_score_mod(scores, batch_idx, head_idx, q_idx, kv_idx)
+    out = torch.matmul(torch.softmax(scores, dim=-1), v_for_out)
+    dq, dk, dv = torch.autograd.grad(out, (q, k, v), grad_out)
+    return out, dq, dk, dv
+
+
+@pytest.mark.skipif(COMPUTE_CAPABILITY != 12, reason="SM120-only score_mod backward coverage")
+@pytest.mark.parametrize(
+    "dim,dtype,seqlen_q,seqlen_kv,score_mod_triple,uses_aux,num_kv_heads",
+    [
+        pytest.param(
+            64,
+            torch.bfloat16,
+            65,
+            97,
+            (score_mod_5, score_mod_bwd_5, times_two_eager),
+            False,
+            4,
+            id="times-two-bf16-d64",
+        ),
+        pytest.param(
+            64,
+            torch.float16,
+            113,
+            203,
+            (score_mod_3, score_mod_bwd_3, relative_bias_eager),
+            False,
+            4,
+            id="relative-bias-fp16-d64",
+        ),
+        pytest.param(
+            128,
+            torch.bfloat16,
+            64,
+            96,
+            (score_mod_squared, score_mod_bwd_squared, score_squared_eager),
+            False,
+            4,
+            id="squared-bf16-d128",
+        ),
+        pytest.param(
+            128,
+            torch.float16,
+            97,
+            65,
+            (score_mod_11, score_mod_bwd_identity, dual_buffer_bias),
+            True,
+            4,
+            id="dual-buffer-fp16-d128",
+        ),
+        pytest.param(
+            64,
+            torch.bfloat16,
+            129,
+            97,
+            (score_mod_11, score_mod_bwd_identity, dual_buffer_bias),
+            True,
+            1,
+            id="dual-buffer-gqa-bf16-d64",
+        ),
+    ],
+)
+@maybe_fake_tensor_mode(int(os.getenv("FLASH_ATTENTION_FAKE_TENSOR", 0)) == 1)
+def test_sm120_score_mod_backward(
+    dim, dtype, seqlen_q, seqlen_kv, score_mod_triple, uses_aux, num_kv_heads
+):
+    """Exercise value-, position-, and aux-dependent score gradients on SM120."""
+    torch.random.manual_seed(42)
+    cute_fwd, cute_bwd, eager_mod = score_mod_triple
+    q, k, v = create_tensors(
+        batch_size=2,
+        seqlen_q=seqlen_q,
+        seqlen_kv=seqlen_kv,
+        num_heads=4,
+        dim=dim,
+        dtype=dtype,
+    )
+    k = k[:, :num_kv_heads].clone()
+    v = v[:, :num_kv_heads].clone()
+
+    aux_tensors = None
+    if uses_aux:
+        head_bias = torch.randn(q.shape[1], device="cuda", dtype=dtype) * 0.2
+        pos_bias = torch.arange(seqlen_q, device="cuda", dtype=dtype) * 0.01
+        aux_tensors = [head_bias, pos_bias]
+        eager_mod = eager_mod(head_bias, pos_bias)
+
+    _, grad_out, dq_cute, dk_cute, dv_cute = run_cute_flash_bwd(
+        q,
+        k,
+        v,
+        cute_fwd,
+        cute_bwd,
+        aux_tensors=aux_tensors,
+        pack_gqa=num_kv_heads != q.shape[1],
+    )
+    if is_fake_mode():
+        return
+    _, dq_ref_fp32, dk_ref_fp32, dv_ref_fp32 = run_eager_attention_reference_bwd(
+        q, k, v, eager_mod, grad_out, torch.float32
+    )
+    _, dq_pt, dk_pt, dv_pt = run_eager_attention_reference_bwd(
+        q, k, v, eager_mod, grad_out, dtype
+    )
+
+    for name, cute_grad, ref_fp32, pt_grad in (
+        ("dQ", dq_cute, dq_ref_fp32, dq_pt),
+        ("dK", dk_cute, dk_ref_fp32, dk_pt),
+        ("dV", dv_cute, dv_ref_fp32, dv_pt),
+    ):
+        assert not torch.isnan(cute_grad).any(), f"{name} contains NaN"
+        atol = 2 * (ref_fp32 + 0.3 - 0.3 - ref_fp32).abs().max().item() + 1e-3
+        ref = ref_fp32.to(dtype)
+        pt_error = (pt_grad - ref).abs().max().item()
+        cute_error = (cute_grad - ref).abs().max().item()
+        assert cute_error <= 3 * pt_error + atol, (
+            f"{name} CuTE error {cute_error:.2e} exceeds "
+            f"3x PyTorch error {pt_error:.2e} + {atol:.2e}"
+        )
 
 
 @pytest.mark.skipif(COMPUTE_CAPABILITY != 9, reason="SM90-only test")
