@@ -191,7 +191,9 @@ class Softmax(ParamsBase):
 
     @cute.jit
     def finalize(
-        self, final_scale: Float32 = 1.0, sink_val: Float32 | cute.Tensor | None = None
+        self,
+        final_scale: Float32 = 1.0,
+        sink_val: Float32 | cute.Tensor | None = None,
     ) -> cute.Tensor:
         """Finalize the online softmax by computing the scale and logsumexp."""
         if cutlass.const_expr(sink_val is not None and isinstance(sink_val, cute.Tensor)):

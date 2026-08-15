@@ -904,6 +904,8 @@ def test_varlen_block_sparse(
     varlen_q, varlen_k, use_seqused_k, head_broadcast, mask_name, seqlens
 ):
     """Block sparsity + mask_mod should produce identical output to mask_mod alone."""
+    if COMPUTE_CAPABILITY in (8, 12) and (varlen_q or varlen_k):
+        pytest.skip("SM80/SM120 block-sparse forward does not support cu_seqlens varlen")
     if varlen_k and use_seqused_k:
         pytest.skip("packed K (cu_seqlens_k) and seqused_k are mutually exclusive")
     if not varlen_q and varlen_k:

@@ -86,7 +86,9 @@ class PagedKVManager(ParamsBase):
         val_layout = cute.make_layout((1, async_copy_elems))
         gmem_tiled_copy_KV = cute.make_tiled_copy_tv(atom_async_copy, thr_layout, val_layout)
         gmem_thr_copy_KV = gmem_tiled_copy_KV.get_slice(thread_idx)
-        # Include the final partially populated wave of rows.
+        # Include the final partially populated wave of rows. This also covers the
+        # SM120 D192/D256 non-TMA path, where tile_n < 128 is required to fit the
+        # 99 KB SMEM cap; row_valid below disables rows outside n_block_size.
         page_entry_per_thread = (n_block_size + num_threads - 1) // num_threads
 
         tPrPage = cute.make_rmem_tensor((page_entry_per_thread,), Int32)

@@ -106,29 +106,74 @@ class SeqlenInfoQK:
             if const_expr(mCuSeqlensK is None)
             else cute.assume((offset_k + batch_idx * tile_n) // tile_n * tile_n, divby=tile_n)
         )
+        # SM80/SM120 over-launch wasted grid tiles with batch_idx clamped to
+        # num_batch (unlike SM90, which gates on work_tile.is_valid_tile). The
+        # cu_seqlens tensors have shape [num_batch+1] so [batch_idx]==[num_batch]
+        # is still in-allocation, but the per-batch tensors below (mSeqUsed*,
+        # mCuTotalMBlocks, mCuBlockIdxOffsets) have shape [num_batch], so a raw
+        # [num_batch] read is one element OOB. Clamp every per-batch read so a
+        # wasted tile stays in-allocation (it will be discarded downstream).
+        #
+        # The cu_seqlens path already yields seqlen=0 for the phantom tile
+        # (cu_seqlens[num_batch] - cu_seqlens[num_batch] == 0), making it a true
+        # no-op. The mSeqUsed* path does NOT: clamping batch_idx to num_batch-1
+        # returns the LAST batch's (nonzero) length, while offset_q stays pinned
+        # at cu_seqlens[num_batch] == total_q, so the phantom tile would issue
+        # real work reading PAST total_q (OOB on Q/K data). Force seqlen=0 for
+        # the phantom tile (batch_idx >= shape[0]) so it is discarded like the
+        # cu_seqlens path. Valid tiles (batch_idx < num_batch) are unaffected.
+        #
+        # `SeqlenInfoQK.create` is inline-traced (not a standalone @cute.jit), so a
+        # dynamic `if`/ternary on `batch_idx >= shape` would try to bool() a runtime
+        # value at trace time and fail. Instead use arithmetic masking:
+        # Int32(batch_idx < shape[0]) is 1 for valid tiles and 0 for the phantom
+        # over-launch tile, zeroing the phantom's seqlen/offsets.
         if const_expr(mSeqUsedQ is not None):
-            seqlen_q = mSeqUsedQ[batch_idx]
+            seqlen_q = mSeqUsedQ[cutlass.min(batch_idx, mSeqUsedQ.shape[0] - 1)]
+            seqlen_q = seqlen_q * Int32(batch_idx < mSeqUsedQ.shape[0])
         else:
+            # Clamp the cu_seqlens index so the read stays in-allocation and
+            # the wasted tile sees seqlen=0.
             seqlen_q = (
                 seqlen_q_static
                 if const_expr(mCuSeqlensQ is None)
-                else mCuSeqlensQ[batch_idx + 1] - offset_q
+                else mCuSeqlensQ[cutlass.min(batch_idx + 1, mCuSeqlensQ.shape[0] - 1)] - offset_q
             )
         if const_expr(mSeqUsedK is not None):
-            seqlen_k = mSeqUsedK[batch_idx]
+            seqlen_k = mSeqUsedK[cutlass.min(batch_idx, mSeqUsedK.shape[0] - 1)]
+            seqlen_k = seqlen_k * Int32(batch_idx < mSeqUsedK.shape[0])
         else:
             seqlen_k = (
                 seqlen_k_static
                 if const_expr(mCuSeqlensK is None)
-                else mCuSeqlensK[batch_idx + 1] - offset_k
+                else mCuSeqlensK[cutlass.min(batch_idx + 1, mCuSeqlensK.shape[0] - 1)] - offset_k
             )
-        m_block_offset = 0 if const_expr(mCuTotalMBlocks is None) else mCuTotalMBlocks[batch_idx]
+        # Zero the sparse offsets for the phantom tile too (mSeqUsed* path only),
+        # so the wasted tile does no block-sparse work either. The valid mask is a
+        # const_expr 1 when no mSeqUsed* tensor is present (no over-launch phantom
+        # to worry about on the cu_seqlens-only path); otherwise it is the dynamic
+        # arithmetic mask above.
+        if const_expr(mSeqUsedQ is not None):
+            sparse_valid_mask = Int32(batch_idx < mSeqUsedQ.shape[0])
+        elif const_expr(mSeqUsedK is not None):
+            sparse_valid_mask = Int32(batch_idx < mSeqUsedK.shape[0])
+        else:
+            sparse_valid_mask = 1
+        if const_expr(mCuTotalMBlocks is None):
+            m_block_offset = Int32(0)
+        else:
+            m_block_offset = (
+                mCuTotalMBlocks[cutlass.min(batch_idx, mCuTotalMBlocks.shape[0] - 1)]
+                * sparse_valid_mask
+            )
         num_n_blocks = (seqlen_k + tile_n - 1) // tile_n
-        block_idx_offset = (
-            mCuBlockIdxOffsets[batch_idx]
-            if const_expr(mCuBlockIdxOffsets is not None)
-            else m_block_offset * num_n_blocks
-        )
+        if const_expr(mCuBlockIdxOffsets is not None):
+            block_idx_offset = (
+                mCuBlockIdxOffsets[cutlass.min(batch_idx, mCuBlockIdxOffsets.shape[0] - 1)]
+                * sparse_valid_mask
+            )
+        else:
+            block_idx_offset = m_block_offset * num_n_blocks
         return SeqlenInfoQK(
             offset_q,
             offset_k,
