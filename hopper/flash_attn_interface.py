@@ -948,7 +948,7 @@ def flash_attn_with_kvcache(
     qv=None,
     rotary_cos=None,
     rotary_sin=None,
-    cache_seqlens: Optional[Union[(int, torch.Tensor)]] = None,
+    cache_seqlens: Optional[Union[int, torch.Tensor]] = None,
     cache_batch_idx: Optional[torch.Tensor] = None,
     cache_leftpad: Optional[torch.Tensor] = None,
     page_table: Optional[torch.Tensor] = None,
@@ -1058,13 +1058,15 @@ def flash_attn_with_kvcache(
     """
     assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
     assert v_cache.stride(-1) == 1, "v_cache must have contiguous last dimension"
+    assert (k is None) == (v is None), "k and v must both be None or both be provided"
+    assert (rotary_cos is None) == (rotary_sin is None), "rotary_cos and rotary_sin must both be None or both be provided"
     if softmax_scale is None:
         softmax_scale = (q.shape[-1] + (qv.shape[-1] if qv is not None else 0)) ** (-0.5)
     if cache_seqlens is not None and isinstance(cache_seqlens, int):
         cache_seqlens = torch.full(
             (q.shape[0],), cache_seqlens, dtype=torch.int32, device=k_cache.device
         )
-        cache_seqlens = maybe_contiguous(cache_seqlens)
+    cache_seqlens = maybe_contiguous(cache_seqlens)
     out, softmax_lse, *rest = _flash_attn_forward(
         q,
         k_cache,
