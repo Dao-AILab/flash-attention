@@ -25,9 +25,7 @@ RUN uv pip install --system --break-system-packages --no-cache --pre \
 # The package itself (version 0.0.0 via setuptools-scm fallback) is overwritten at
 # step time by the editable install from the mounted repo.
 COPY flash_attn/cute/ /tmp/fa4/
-# --prerelease=allow: the cutlass-dsl floor is pinned to a dev build (e.g. 4.6.0.dev0), whose
-# cu13 extra pulls transitive pre-release deps (nvidia-cutlass-dsl-libs-base==4.6.0.dev0 …).
-# uv honors the explicit top-level pre-release pin but refuses transitive pre-releases without this.
+# Keep pre-releases enabled so future development-build dependency floors remain resolvable.
 RUN uv pip install --system --break-system-packages --no-cache --prerelease=allow "/tmp/fa4[cu13,dev]"
 
 CMD ["/bin/bash"]

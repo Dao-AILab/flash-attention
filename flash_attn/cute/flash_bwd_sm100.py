@@ -3266,10 +3266,8 @@ class FlashAttentionBackwardSm100:
                                 utils.shuffle_sync(tSrdPsum, offset=2 * v),
                                 utils.shuffle_sync(tSrdPsum, offset=2 * v + 1),
                             )
-                        tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1] = (
-                            cute.arch.sub_packed_f32x2(
-                                (tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1]), dPsum_pair
-                            )
+                        tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1] = cute.arch.sub_packed_f32x2(
+                            (tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1]), dPsum_pair
                         )
                         tdPrdP_cur[2 * v], tdPrdP_cur[2 * v + 1] = cute.arch.mul_packed_f32x2(
                             (tSrS_cur[2 * v], tSrS_cur[2 * v + 1]),
