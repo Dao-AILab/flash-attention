@@ -282,6 +282,7 @@ def _run_mask_test(
     use_block_sparsity,
     needs_backward=False,
     use_autograd=False,
+    headdim_v=None,
 ):
     torch.manual_seed(42)
 
@@ -310,7 +311,7 @@ def _run_mask_test(
         raise ValueError(f"Unknown kv_mode: {kv_mode}")
 
     batch_size = 1
-    headdim_v = headdim
+    headdim_v = headdim if headdim_v is None else headdim_v
 
     aux_tensors_arg = None
     mask_mod_cute, mask_mod_flex = get_mask_pair(
@@ -1609,6 +1610,28 @@ def run_flex_reference_bwd(q, k, v, block_mask, grad_out, dtype=None):
         dq_ref.transpose(1, 2),
         dk_ref.transpose(1, 2),
         dv_ref.transpose(1, 2),
+    )
+
+
+@pytest.mark.skipif(COMPUTE_CAPABILITY != 9, reason="SM90-only test")
+def test_sm90_block_sparse_bwd_hdim192_hdimv128():
+    _run_mask_test(
+        seqlen_q=257,
+        seqlen_k=257,
+        nheads=2,
+        kv_mode="mha",
+        headdim=192,
+        headdim_v=128,
+        dtype=torch.bfloat16,
+        mask_name="causal",
+        window_size=None,
+        window_left=None,
+        window_right=None,
+        tile_m=128,
+        tile_n=128,
+        use_block_sparsity=True,
+        needs_backward=True,
+        use_autograd=True,
     )
 
 
