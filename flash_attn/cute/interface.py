@@ -777,7 +777,7 @@ def _flash_attn_fwd(
         num_threads = 128
 
     if max_seqlen_q is None:
-        max_seqlen_q = seqlen_q if cu_seqlens_q is None else total_q
+        max_seqlen_q = seqlen_q if cu_seqlens_q is None else cu_seqlens_q.diff().max().item()
     if max_seqlen_k is None:
         max_seqlen_k = seqlen_k
     if cu_seqlens_k is None and seqused_k is None:
