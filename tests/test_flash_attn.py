@@ -2646,6 +2646,106 @@ def test_flash_attn_kvcache_paged_block_table_bounds(append_knew, paged_kv_block
     assert not out.isnan().any()
 
 
+@pytest.mark.parametrize(
+    "api",
+    [
+        "qkvpacked",
+        "kvpacked",
+        "separate",
+        "varlen_qkvpacked",
+        "varlen_kvpacked",
+        "varlen_separate",
+    ],
+)
+def test_flash_attn_aux_outputs_are_non_differentiable(api):
+    """Auxiliary testing outputs must not silently accept gradients."""
+    batch_size, seqlen, nheads, d = 2, 16, 4, 32
+    device = "cuda"
+    dtype = torch.bfloat16
+    total = batch_size * seqlen
+    kwargs = {
+        "dropout_p": 0.1,
+        "causal": True,
+        "return_attn_probs": True,
+    }
+
+    if api == "qkvpacked":
+        qkv = torch.randn(
+            batch_size,
+            seqlen,
+            3,
+            nheads,
+            d,
+            device=device,
+            dtype=dtype,
+            requires_grad=True,
+        )
+        inputs = (qkv,)
+        result = flash_attn_qkvpacked_func(qkv, **kwargs)
+    elif api == "kvpacked":
+        q = torch.randn(
+            batch_size, seqlen, nheads, d, device=device, dtype=dtype, requires_grad=True
+        )
+        kv = torch.randn(
+            batch_size,
+            seqlen,
+            2,
+            nheads,
+            d,
+            device=device,
+            dtype=dtype,
+            requires_grad=True,
+        )
+        inputs = (q, kv)
+        result = flash_attn_kvpacked_func(q, kv, **kwargs)
+    elif api == "separate":
+        q = torch.randn(
+            batch_size, seqlen, nheads, d, device=device, dtype=dtype, requires_grad=True
+        )
+        k = torch.randn_like(q, requires_grad=True)
+        v = torch.randn_like(q, requires_grad=True)
+        inputs = (q, k, v)
+        result = flash_attn_func(q, k, v, **kwargs)
+    else:
+        cu_seqlens = torch.arange(
+            0, total + 1, seqlen, device=device, dtype=torch.int32
+        )
+        if api == "varlen_qkvpacked":
+            qkv = torch.randn(
+                total, 3, nheads, d, device=device, dtype=dtype, requires_grad=True
+            )
+            inputs = (qkv,)
+            result = flash_attn_varlen_qkvpacked_func(
+                qkv, cu_seqlens, seqlen, **kwargs
+            )
+        elif api == "varlen_kvpacked":
+            q = torch.randn(total, nheads, d, device=device, dtype=dtype, requires_grad=True)
+            kv = torch.randn(
+                total, 2, nheads, d, device=device, dtype=dtype, requires_grad=True
+            )
+            inputs = (q, kv)
+            result = flash_attn_varlen_kvpacked_func(
+                q, kv, cu_seqlens, cu_seqlens, seqlen, seqlen, **kwargs
+            )
+        else:
+            q = torch.randn(total, nheads, d, device=device, dtype=dtype, requires_grad=True)
+            k = torch.randn_like(q, requires_grad=True)
+            v = torch.randn_like(q, requires_grad=True)
+            inputs = (q, k, v)
+            result = flash_attn_varlen_func(
+                q, k, v, cu_seqlens, cu_seqlens, seqlen, seqlen, **kwargs
+            )
+
+    out, softmax_lse, s_dmask = result
+    assert out.requires_grad
+    assert not softmax_lse.requires_grad
+    assert not s_dmask.requires_grad
+    with pytest.raises(RuntimeError, match="does not require grad"):
+        softmax_lse.sum().backward()
+    out.sum().backward()
+    assert all(x.grad is not None and torch.isfinite(x.grad).all() for x in inputs)
+
+
 @pytest.mark.skipif(USE_TRITON_ROCM, reason="compat-slot assert is only in the CUDA extension")
 def test_flash_attn_generator_arg_must_be_none():
     """The optional RNG `generator` slot is retained only for backwards-compat arg
