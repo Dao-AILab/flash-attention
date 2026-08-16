@@ -43,6 +43,7 @@ from flash_attn.cute.softmax import SoftmaxSm100, apply_score_mod_inner
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute.block_sparsity import BlockSparseTensors
+from flash_attn.cute.kernel_args import FwdKernelArgs, normalize_kernel_args
 from flash_attn.cute.block_sparse_utils import (
     get_total_block_count,
     produce_block_sparse_loads_sm100,
@@ -68,7 +69,7 @@ from flash_attn.cute.tile_scheduler import (
 )
 from flash_attn.cute.fa_logging import fa_log, fa_printf
 from flash_attn.cute.utils import smid
-from flash_attn.cute.utils import AuxData
+from flash_attn.cute.utils import AuxData, DescaleTensors
 
 # === TUNING KNOBS (agent-editable) ===
 # Keys: (use_2cta_instrs: bool, is_causal: bool, head_dim_padded: int, is_sm103: bool)
@@ -124,16 +125,33 @@ _FP8_SMALL_HDIM_REGS = {
 # === END TUNING KNOBS ===
 
 
-class DescaleTensors(NamedTuple):
-    q_descale: Optional[cute.Tensor] = None
-    k_descale: Optional[cute.Tensor] = None
-    v_descale: Optional[cute.Tensor] = None
-
-    def __new_from_mlir_values__(self, values):
-        return DescaleTensors(*((*values, None, None, None)[:3]))
-
-
 class FlashAttentionForwardSm100:
+    class Args(NamedTuple):
+        mQ: cute.Tensor  # (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
+        mK: cute.Tensor  # (b_k, s_k, h_k, d), (total_k, h_k, d) with cu_seqlens_k, or (num_pages, page_size, h_k, d) with page_table
+        mV: cute.Tensor  # (b_k, s_k, h_k, dv), (total_k, h_k, dv) with cu_seqlens_k, or (num_pages, page_size, h_k, dv) with page_table
+        mO: cute.Tensor  # (b, s_q, h, dv) or (total_q, h, dv) if there is cu_seqlens_q
+        softmax_scale: Float32
+        mLSE: Optional[cute.Tensor] = None
+        mCuSeqlensQ: Optional[cute.Tensor] = None
+        mCuSeqlensK: Optional[cute.Tensor] = None
+        mSeqUsedQ: Optional[cute.Tensor] = None
+        mSeqUsedK: Optional[cute.Tensor] = None
+        mPageTable: Optional[cute.Tensor] = None  # (b_k, max_num_pages_per_seq)
+        window_size_left: Optional[Int32] = None
+        window_size_right: Optional[Int32] = None
+        learnable_sink: Optional[cute.Tensor] = None
+        descale_tensors: Optional[DescaleTensors] = None
+        blocksparse_tensors: Optional[BlockSparseTensors] = None
+        aux_data: AuxData = AuxData()
+        num_splits_dynamic_ptr: Optional[cute.Tensor] = None
+        tile_count_semaphore: Optional[cute.Tensor] = None
+        virtual_batch_idx_ptr: Optional[cute.Tensor] = None
+        num_nheads_in_l2_ptr: Optional[cute.Tensor] = None
+        mCuTotalMBlocks: Optional[cute.Tensor] = None
+        mCuTotalSplitsMBlocks: Optional[cute.Tensor] = None
+        mBlocksToBatchIdx: Optional[cute.Tensor] = None
+        max_seqlen_q: Optional[Int32] = None
 
     def __init__(
         self,
@@ -425,31 +443,7 @@ class FlashAttentionForwardSm100:
     @cute.jit
     def __call__(
         self,
-        mQ: cute.Tensor,  # (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
-        mK: cute.Tensor,  # (b_k, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k or (num_pages, page_size, h_k, d) if there is page_table
-        mV: cute.Tensor,  # (b_k, s_k, h_k, dv) or (total_k, h_k, dv) if there is cu_seqlens_k or (num_pages, page_size, h_k, dv) if there is page_table
-        mO: cute.Tensor,  # (b, s_q, h, dv) or (total_q, h, dv) if there is cu_seqlens_q
-        mLSE: Optional[cute.Tensor],
-        softmax_scale: Float32,
-        mCuSeqlensQ: Optional[cute.Tensor] = None,
-        mCuSeqlensK: Optional[cute.Tensor] = None,
-        mSeqUsedQ: Optional[cute.Tensor] = None,
-        mSeqUsedK: Optional[cute.Tensor] = None,
-        mPageTable: Optional[cute.Tensor] = None,  # (b_k, max_num_pages_per_seq)
-        window_size_left: Int32 | int | None = None,
-        window_size_right: Int32 | int | None = None,
-        learnable_sink: Optional[cute.Tensor] = None,
-        descale_tensors: Optional[DescaleTensors] = None,
-        blocksparse_tensors: Optional[BlockSparseTensors] = None,
-        aux_data: AuxData = AuxData(),
-        num_splits_dynamic_ptr: Optional[cute.Tensor] = None,
-        tile_count_semaphore: Optional[cute.Tensor] = None,
-        virtual_batch_idx_ptr: Optional[cute.Tensor] = None,
-        num_nheads_in_l2_ptr: Optional[cute.Tensor] = None,
-        mCuTotalMBlocks: Optional[cute.Tensor] = None,
-        mCuTotalSplitsMBlocks: Optional[cute.Tensor] = None,
-        mBlocksToBatchIdx: Optional[cute.Tensor] = None,
-        max_seqlen_q: Int32 | int | None = None,
+        args: FwdKernelArgs,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -466,6 +460,24 @@ class FlashAttentionForwardSm100:
         5. Grid and work scheduling computation
         6. Kernel launch with appropriate parameters
         """
+        args = normalize_kernel_args(args, self.Args, type(self).__name__)
+        mQ, mK, mV, mO, mLSE = args.mQ, args.mK, args.mV, args.mO, args.mLSE
+        softmax_scale = args.softmax_scale
+        mCuSeqlensQ, mCuSeqlensK = args.mCuSeqlensQ, args.mCuSeqlensK
+        mSeqUsedQ, mSeqUsedK = args.mSeqUsedQ, args.mSeqUsedK
+        mPageTable = args.mPageTable
+        window_size_left, window_size_right = args.window_size_left, args.window_size_right
+        learnable_sink = args.learnable_sink
+        descale_tensors = args.descale_tensors
+        blocksparse_tensors = args.blocksparse_tensors
+        aux_data = args.aux_data
+        num_splits_dynamic_ptr = args.num_splits_dynamic_ptr
+        tile_count_semaphore = args.tile_count_semaphore
+        virtual_batch_idx_ptr = args.virtual_batch_idx_ptr
+        num_nheads_in_l2_ptr = args.num_nheads_in_l2_ptr
+        mCuTotalMBlocks, mCuTotalSplitsMBlocks = args.mCuTotalMBlocks, args.mCuTotalSplitsMBlocks
+        mBlocksToBatchIdx = args.mBlocksToBatchIdx
+        max_seqlen_q = args.max_seqlen_q
         # setup static attributes before smem/grid/tma computation
         self.q_dtype = mQ.element_type
         self.k_dtype = mK.element_type

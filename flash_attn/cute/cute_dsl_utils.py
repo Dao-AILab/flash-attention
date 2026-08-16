@@ -2,7 +2,7 @@
 
 import os
 from typing import Tuple
-from functools import lru_cache
+from functools import lru_cache, wraps
 
 import torch
 from torch._subclasses.fake_tensor import FakeTensor
@@ -24,6 +24,42 @@ load_cubin_module_data_og = cutlass.base_dsl.runtime.cuda.load_cubin_module_data
 cute_compile_og = cute.compile
 
 
+# Monkey-patch: as of 2026-08-10, TVM-FFI cannot detect env stream if all
+# tensor arguments to a kernel are contained in a tuple/NamedTuple. This workaround
+# patches TVMFFIFunctionBuilder.find_env_stream to search through nested args
+# when finding the current stream.
+_PATCH_MARKER = "_flash_attn_nested_env_stream_detection"
+
+
+def _enable_nested_env_stream_detection():
+    from cutlass.base_dsl.tvm_ffi_builder import spec
+    from cutlass.base_dsl.tvm_ffi_builder.tvm_ffi_builder import (
+        TVMFFIFunctionBuilder,
+    )
+
+    current = TVMFFIFunctionBuilder.find_env_stream
+    if getattr(current, _PATCH_MARKER, False):
+        return
+
+    def flatten(params):
+        for param in params:
+            if isinstance(param, spec.TupleParam):
+                yield from flatten(param.params)
+            else:
+                yield param
+
+    @wraps(current)
+    def find_env_stream(self, params):
+        stream = current(self, params)
+        return stream if stream is not None else current(self, list(flatten(params)))
+
+    setattr(find_env_stream, _PATCH_MARKER, True)
+    TVMFFIFunctionBuilder.find_env_stream = find_env_stream
+      
+
+_enable_nested_env_stream_detection()
+
+
 torch2cute_dtype_map = {
     torch.float16: cutlass.Float16,
     torch.bfloat16: cutlass.BFloat16,
@@ -31,6 +67,19 @@ torch2cute_dtype_map = {
     torch.float8_e4m3fn: cutlass.Float8E4M3FN,
     torch.float8_e5m2: cutlass.Float8E5M2,
 }
+
+
+# Building a cutlass Int32/Float32 from a python value runs a numpy cast that costs ~1us, which is
+# material next to a kernel launch. These wrap the Python value and nothing else, so one instance
+# per value is shared.
+@lru_cache
+def cutlass_int32(value: int) -> cutlass.Int32:
+    return cutlass.Int32(value)
+
+
+@lru_cache
+def cutlass_float32(value: float) -> cutlass.Float32:
+    return cutlass.Float32(value)
 
 
 @lru_cache

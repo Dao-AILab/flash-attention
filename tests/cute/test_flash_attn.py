@@ -97,6 +97,31 @@ TEST_BWD_ONLY = False
 VERBOSE = True
 
 
+@pytest.mark.skipif(USE_FAKE_TENSOR, reason="requires a real TVM-FFI launch")
+def test_nested_kernel_args_find_tvm_ffi_env_stream(monkeypatch):
+    """A tensor nested in the kernel Args tuple must provide the implicit CUDA stream."""
+    torch.manual_seed(0)
+    q, k, v = (
+        torch.randn(1, 64, 2, 64, device="cuda", dtype=torch.bfloat16)
+        for _ in range(3)
+    )
+
+    # Force compilation here: a persistent-cache hit would bypass EnvStream detection and
+    # could let this regression test pass even if the CuTeDSL compatibility patch is broken.
+    cache = JITCache()
+    monkeypatch.setattr(_flash_attn_fwd, "compile_cache", cache)
+
+    out, _ = flash_attn_func(q, k, v)
+    reference = torch.nn.functional.scaled_dot_product_attention(
+        q.float().transpose(1, 2),
+        k.float().transpose(1, 2),
+        v.float().transpose(1, 2),
+    ).transpose(1, 2)
+
+    assert len(cache.cache) == 1
+    torch.testing.assert_close(out.float(), reference, atol=0.04, rtol=0.04)
+
+
 @pytest.mark.skipif(not IS_SM120, reason="SM120-only SplitKV unsupported behavior")
 def test_flash_attn_sm120_rejects_splitkv():
     q = torch.randn(1, 16, 4, 64, device="cuda", dtype=torch.bfloat16)

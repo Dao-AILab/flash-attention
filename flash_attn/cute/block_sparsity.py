@@ -720,6 +720,24 @@ def to_cute_block_sparse_tensors(
     )
 
 
+def to_block_sparse_call_args(
+    tensors: BlockSparseTensorsTorch | None,
+) -> BlockSparseTensors | None:
+    """Reorder torch block sparsity tensors into the layout the compiled kernel expects."""
+    if tensors is None or not is_block_sparsity_enabled(tensors):
+        return None
+    return BlockSparseTensors(
+        tensors.mask_block_cnt,
+        tensors.mask_block_idx,
+        tensors.full_block_cnt,
+        tensors.full_block_idx,
+        tensors.cu_total_m_blocks,
+        tensors.cu_block_idx_offsets,
+        tensors.dq_write_order,
+        tensors.dq_write_order_full,
+    )
+
+
 def fast_sampling(mask_mod):
     """Convenience decorator to mark mask_mod as safe for 5-point fast sampling"""
     mask_mod.use_fast_sampling = True

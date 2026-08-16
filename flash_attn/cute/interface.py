@@ -29,6 +29,8 @@ if os.environ.get("CUTE_DSL_PTXAS_PATH", None) is not None:
 from flash_attn.cute import utils
 from flash_attn.cute import fa_logging
 from flash_attn.cute.cute_dsl_utils import (
+    cutlass_float32,
+    cutlass_int32,
     get_aux_tensor_metadata,
     get_broadcast_dims,
     get_num_sms_for_selection,
@@ -39,7 +41,7 @@ from flash_attn.cute.cute_dsl_utils import (
 )
 from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80
 from flash_attn.cute.flash_fwd_sm90 import FlashAttentionForwardSm90
-from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100, DescaleTensors
+from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
 from flash_attn.cute.flash_fwd_sm120 import FlashAttentionForwardSm120
 from flash_attn.cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
 from flash_attn.cute.flash_bwd import FlashAttentionBackwardSm80
@@ -62,16 +64,18 @@ from flash_attn.cute.flash_bwd_mla_dk_sm100 import dKGemmKernel
 from flash_attn.cute.sm100_hd256_2cta_fmha_forward import BlackwellFusedMultiHeadAttentionForward
 from flash_attn.cute.sm100_hd256_2cta_fmha_backward import BlackwellFusedMultiHeadAttentionBackward
 
-from flash_attn.cute.utils import AuxData
+from flash_attn.cute.utils import AuxData, DescaleTensors
 from flash_attn.cute.block_sparsity import (
     BlockSparseTensorsTorch,
     block_sparse_bwd_supports_2cta,
     get_kv_subtile_factor,
     get_sparse_q_block_size,
+    to_block_sparse_call_args,
     to_cute_block_sparse_tensors,
     normalize_block_sparse_config,
     normalize_block_sparse_config_bwd,
 )
+from flash_attn.cute.kernel_args import BwdKernelArgs, FwdKernelArgs
 
 BIN_BATCH_SEARCH_THRESH = 256  # above this batch size SingleTileVarlenScheduler gets a batch-lookup aid
 # Where the cu hint applies, use an O(1) flat-block -> batch lookup instead of the binary search.
@@ -1164,6 +1168,89 @@ def _flash_attn_fwd(
         fa_logging.get_fa_log_level(),
     )
 
+    # Scheduling aids are computed without regard to which kernel will run (max_seqlen_q
+    # always, the varlen block hints for any large-batch varlen call), but only the general
+    # forward kernels declare them, so mask off what the selected kernel does not accept.
+    is_mla = qv is not None
+    pass_scheduler_args = (
+        arch // 10 in [10, 11] and not use_dedicated_hd256_kernel and not is_mla
+    )
+    if pass_scheduler_args and torch.is_tensor(max_seqlen_q):
+        raise TypeError(
+            "max_seqlen_q must be an int for this kernel, which uses it to size the tile "
+            "grid; pass int(max_seqlen_q) (note this syncs with the device)."
+        )
+
+    def build_fwd_args(
+        *,
+        q,
+        qv,
+        k,
+        v,
+        out,
+        lse,
+        p,
+        row_max,
+        gather_kv_indices,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        seqused_q,
+        seqused_k,
+        page_table,
+        learnable_sink,
+        descale_tensors,
+        blocksparse_tensors,
+        aux_tensors,
+        num_splits_dynamic,
+        tile_count_semaphore,
+        virtual_batch_idx,
+        num_nheads_in_l2,
+        cu_total_m_blocks,
+        cu_total_splits_m_blocks,
+        blocks_to_batch_idx,
+    ) -> FwdKernelArgs:
+        """Build the kernel arguments; used for both compilation and invocation so that the
+        two can never disagree on which arguments are present."""
+        return FwdKernelArgs(
+            mQ=q,
+            mQv=qv,
+            mK=k,
+            mV=v,
+            mO=out,
+            mLSE=lse,
+            softmax_scale=cutlass_float32(softmax_scale),
+            mP=p,
+            mRowMax=row_max,
+            mIndexTopk=gather_kv_indices,
+            mCuSeqlensQ=cu_seqlens_q,
+            mCuSeqlensK=cu_seqlens_k,
+            mSeqUsedQ=seqused_q,
+            mSeqUsedK=seqused_k,
+            mPageTable=page_table,
+            window_size_left=(
+                cutlass_int32(window_size_left) if window_size_left is not None else None
+            ),
+            window_size_right=(
+                cutlass_int32(window_size_right) if window_size_right is not None else None
+            ),
+            learnable_sink=learnable_sink,
+            descale_tensors=descale_tensors,
+            blocksparse_tensors=blocksparse_tensors,
+            aux_data=(
+                AuxData(aux_tensors, aux_scalars)
+                if aux_tensors is not None or aux_scalars is not None
+                else None
+            ),
+            num_splits_dynamic_ptr=num_splits_dynamic if pass_scheduler_args else None,
+            tile_count_semaphore=tile_count_semaphore if pass_scheduler_args else None,
+            virtual_batch_idx_ptr=virtual_batch_idx if pass_scheduler_args else None,
+            num_nheads_in_l2_ptr=num_nheads_in_l2 if pass_scheduler_args else None,
+            mCuTotalMBlocks=cu_total_m_blocks if not is_mla else None,
+            mCuTotalSplitsMBlocks=cu_total_splits_m_blocks if not is_mla else None,
+            mBlocksToBatchIdx=blocks_to_batch_idx if pass_scheduler_args else None,
+            max_seqlen_q=cutlass_int32(max_seqlen_q) if pass_scheduler_args else None,
+        )
+
     if compile_key not in _flash_attn_fwd.compile_cache:
         current_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         (
@@ -1385,71 +1472,36 @@ def _flash_attn_fwd(
                 f"Unsupported compute capability: {arch}. Supported: 8.x, 9.x, 10.x, 11.x, 12.x"
             )
         # TODO: check @can_implement
-        if qv is not None:
-            _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
-                fa_fwd,
-                q_tensor,
-                qv_tensor,
-                k_tensor,
-                v_tensor,
-                o_tensor,
-                lse_tensor,
-                softmax_scale,
-                p_tensor,
-                row_max_tensor,
-                cu_seqlens_q_tensor,
-                cu_seqlens_k_tensor,
-                seqused_q_tensor,
-                seqused_k_tensor,
-                gather_kv_indices_tensor,
-                page_table_tensor,
-                window_size_left,
-                window_size_right,
-                current_stream,
-                options="--enable-tvm-ffi",
-            )
-        else:
-            compile_args = [
-                fa_fwd,
-                q_tensor,
-                k_tensor,
-                v_tensor,
-                o_tensor,
-                lse_tensor,
-                softmax_scale,
-                cu_seqlens_q_tensor,
-                cu_seqlens_k_tensor,
-                seqused_q_tensor,
-                seqused_k_tensor,
-                page_table_tensor,
-                window_size_left,
-                window_size_right,
-                learnable_sink_tensor,
-            ]
-            if arch // 10 in [10, 11]:
-                compile_args.append(descale_tensors_tensor)
-            compile_args.extend([
-                sparse_tensors,
-                AuxData(cute_aux_tensors, aux_scalars),
-            ])
-            if arch // 10 in [10, 11] and not use_dedicated_hd256_kernel:
-                compile_args.extend([
-                    num_splits_dynamic_tensor,
-                    tile_count_semaphore_tensor,
-                    virtual_batch_idx_tensor,
-                    num_nheads_in_l2_tensor,
-                    cu_total_m_blocks_tensor,
-                    cu_total_splits_m_blocks_tensor,
-                    blocks_to_batch_idx_tensor,
-                    max_seqlen_q,
-                ])
-            elif arch // 10 in [8, 9, 12]:
-                compile_args.extend([
-                    cu_total_m_blocks_tensor,
-                    cu_total_splits_m_blocks_tensor,
-                ])
-            compile_args.append(current_stream)
-            _flash_attn_fwd.compile_cache[compile_key] = cute.compile(*compile_args, options="--enable-tvm-ffi")
+        compile_args = build_fwd_args(
+            q=q_tensor,
+            qv=qv_tensor,
+            k=k_tensor,
+            v=v_tensor,
+            out=o_tensor,
+            lse=lse_tensor,
+            p=p_tensor,
+            row_max=row_max_tensor,
+            gather_kv_indices=gather_kv_indices_tensor,
+            cu_seqlens_q=cu_seqlens_q_tensor,
+            cu_seqlens_k=cu_seqlens_k_tensor,
+            seqused_q=seqused_q_tensor,
+            seqused_k=seqused_k_tensor,
+            page_table=page_table_tensor,
+            learnable_sink=learnable_sink_tensor,
+            descale_tensors=descale_tensors_tensor,
+            blocksparse_tensors=sparse_tensors,
+            aux_tensors=cute_aux_tensors,
+            num_splits_dynamic=num_splits_dynamic_tensor,
+            tile_count_semaphore=tile_count_semaphore_tensor,
+            virtual_batch_idx=virtual_batch_idx_tensor,
+            num_nheads_in_l2=num_nheads_in_l2_tensor,
+            cu_total_m_blocks=cu_total_m_blocks_tensor,
+            cu_total_splits_m_blocks=cu_total_splits_m_blocks_tensor,
+            blocks_to_batch_idx=blocks_to_batch_idx_tensor,
+        )
+        _flash_attn_fwd.compile_cache[compile_key] = cute.compile(
+            fa_fwd, compile_args, current_stream, options="--enable-tvm-ffi"
+        )
 
     if not fake_mode:
         q_call, k_call, v_call, qv_call = [
@@ -1467,77 +1519,34 @@ def _flash_attn_fwd(
             if q_descale is not None or k_descale is not None or v_descale is not None
             else None
         )
-        if qv is not None:
-            _flash_attn_fwd.compile_cache[compile_key](
-                q_call,
-                qv_call,
-                k_call,
-                v_call,
-                out.detach(),
-                lse,
-                softmax_scale,
-                p,
-                row_max,
-                cu_seqlens_q,
-                cu_seqlens_k,
-                seqused_q,
-                seqused_k,
-                gather_kv_indices,
-                page_table,
-                window_size_left,
-                window_size_right,
-            )
-        else:
-            call_args = [
-                q_call,
-                k_call,
-                v_call,
-                out.detach() if not is_split_kv else out_partial,
-                lse_partial if is_split_kv else lse,
-                softmax_scale,
-                cu_seqlens_q,
-                cu_seqlens_k,
-                seqused_q,
-                seqused_k,
-                page_table,
-                window_size_left,
-                window_size_right,
-                learnable_sink,
-            ]
-            if arch // 10 in [10, 11]:
-                call_args.append(descale_tensors)
-            call_args.extend([
-                (
-                    normalized_block_sparse_tensors.mask_block_cnt,
-                    normalized_block_sparse_tensors.mask_block_idx,
-                    normalized_block_sparse_tensors.full_block_cnt,
-                    normalized_block_sparse_tensors.full_block_idx,
-                    normalized_block_sparse_tensors.cu_total_m_blocks,
-                    normalized_block_sparse_tensors.cu_block_idx_offsets,
-                    normalized_block_sparse_tensors.dq_write_order,
-                    normalized_block_sparse_tensors.dq_write_order_full,
-                )
-                if normalized_block_sparse_tensors is not None
-                else None,
-                AuxData(aux_tensors, aux_scalars),
-            ])
-            if arch // 10 in [10, 11] and not use_dedicated_hd256_kernel:
-                call_args.extend([
-                    num_splits_dynamic,
-                    tile_count_semaphore,
-                    virtual_batch_idx,
-                    num_nheads_in_l2,
-                    cu_total_m_blocks,
-                    cu_total_splits_m_blocks,
-                    blocks_to_batch_idx,
-                    max_seqlen_q,
-                ])
-            elif arch // 10 in [8, 9, 12]:
-                call_args.extend([
-                    cu_total_m_blocks,
-                    cu_total_splits_m_blocks,
-                ])
-            _flash_attn_fwd.compile_cache[compile_key](*call_args)
+        call_args = build_fwd_args(
+            q=q_call,
+            qv=qv_call,
+            k=k_call,
+            v=v_call,
+            out=out.detach() if not is_split_kv else out_partial,
+            lse=lse_partial if is_split_kv else lse,
+            p=p,
+            row_max=row_max,
+            gather_kv_indices=gather_kv_indices,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            seqused_q=seqused_q,
+            seqused_k=seqused_k,
+            page_table=page_table,
+            learnable_sink=learnable_sink,
+            descale_tensors=descale_tensors,
+            blocksparse_tensors=to_block_sparse_call_args(normalized_block_sparse_tensors),
+            aux_tensors=aux_tensors,
+            num_splits_dynamic=num_splits_dynamic,
+            tile_count_semaphore=tile_count_semaphore,
+            virtual_batch_idx=virtual_batch_idx,
+            num_nheads_in_l2=num_nheads_in_l2,
+            cu_total_m_blocks=cu_total_m_blocks,
+            cu_total_splits_m_blocks=cu_total_splits_m_blocks,
+            blocks_to_batch_idx=blocks_to_batch_idx,
+        )
+        _flash_attn_fwd.compile_cache[compile_key](call_args)
     if is_split_kv:
         _flash_attn_fwd_combine(
             out_partial,
@@ -2379,6 +2388,61 @@ def _flash_attn_bwd(
             cu_total_m_blocks_k is not None,
         )
 
+    def build_bwd_args(
+        *,
+        q,
+        k,
+        v,
+        do,
+        lse_log2,
+        dpsum,
+        dq_accum,
+        dk,
+        dv,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        seqused_q,
+        seqused_k,
+        dQ_semaphore,
+        dK_semaphore,
+        dV_semaphore,
+        aux_tensors,
+        blocksparse_tensors,
+        cu_total_m_blocks_k,
+    ) -> BwdKernelArgs:
+        return BwdKernelArgs(
+            mQ=q,
+            mK=k,
+            mV=v,
+            mdO=do,
+            mLSE=lse_log2,
+            mdPsum=dpsum,
+            mdQaccum=dq_accum,
+            mdK=dk,
+            mdV=dv,
+            softmax_scale=cutlass_float32(softmax_scale),
+            mCuSeqlensQ=cu_seqlens_q,
+            mCuSeqlensK=cu_seqlens_k,
+            mSeqUsedQ=seqused_q,
+            mSeqUsedK=seqused_k,
+            window_size_left=(
+                cutlass_int32(window_size_left) if window_size_left is not None else None
+            ),
+            window_size_right=(
+                cutlass_int32(window_size_right) if window_size_right is not None else None
+            ),
+            mdQ_semaphore=dQ_semaphore,
+            mdK_semaphore=dK_semaphore,
+            mdV_semaphore=dV_semaphore,
+            aux_data=(
+                AuxData(aux_tensors, aux_scalars)
+                if aux_tensors is not None or aux_scalars is not None
+                else None
+            ),
+            blocksparse_tensors=blocksparse_tensors,
+            mCuTotalMBlocks=cu_total_m_blocks_k,
+        )
+
     if compile_key not in _flash_attn_bwd.compile_cache:
         current_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
         cute_aux_tensors = (
@@ -2517,77 +2581,56 @@ def _flash_attn_bwd(
             sparse_tensors_compile = to_cute_block_sparse_tensors(normalized_block_sparse_tensors)
         dq_accum_tensor = dq_tensor if use_dedicated_hd256_kernel else dq_accum_tensor
 
-        compile_args = [
-            fa_bwd_obj,
-            q_tensor,
-            k_tensor,
-            v_tensor,
-            do_tensor,
-            lse_log2_tensor,
-            dpsum_tensor,
-            dq_accum_tensor,
-            dk_tensor if not dKV_postprocess else dk_accum_tensor,
-            dv_tensor if not dKV_postprocess else dv_accum_tensor,
-            softmax_scale,
-            cu_seqlens_q_tensor,
-            cu_seqlens_k_tensor,
-            seqused_q_tensor,
-            seqused_k_tensor,
-            window_size_left,
-            window_size_right,
-            dQ_semaphore_tensor,
-            dK_semaphore_tensor,
-            dV_semaphore_tensor,
-            AuxData(cute_aux_tensors, aux_scalars),
-            sparse_tensors_compile,
-        ]
-        if not use_dedicated_hd256_kernel:
-            compile_args.append(cu_total_m_blocks_k_tensor)
-        compile_args.append(current_stream)
+        compile_args = build_bwd_args(
+            q=q_tensor,
+            k=k_tensor,
+            v=v_tensor,
+            do=do_tensor,
+            lse_log2=lse_log2_tensor,
+            dpsum=dpsum_tensor,
+            dq_accum=dq_accum_tensor,
+            dk=dk_tensor if not dKV_postprocess else dk_accum_tensor,
+            dv=dv_tensor if not dKV_postprocess else dv_accum_tensor,
+            cu_seqlens_q=cu_seqlens_q_tensor,
+            cu_seqlens_k=cu_seqlens_k_tensor,
+            seqused_q=seqused_q_tensor,
+            seqused_k=seqused_k_tensor,
+            dQ_semaphore=dQ_semaphore_tensor,
+            dK_semaphore=dK_semaphore_tensor,
+            dV_semaphore=dV_semaphore_tensor,
+            aux_tensors=cute_aux_tensors,
+            blocksparse_tensors=sparse_tensors_compile,
+            cu_total_m_blocks_k=cu_total_m_blocks_k_tensor,
+        )
 
         # TODO: check @can_implement
         _flash_attn_bwd.compile_cache[compile_key] = cute.compile(
-            *compile_args, options="--enable-tvm-ffi"
+            fa_bwd_obj, compile_args, current_stream, options="--enable-tvm-ffi"
         )
     if not fake_mode:
         dq_accum = dq if use_dedicated_hd256_kernel else dq_accum
-        call_args = [
-            q.detach(),
-            k.detach(),
-            v.detach(),
-            dout,
-            lse_log2,
-            dpsum,
-            dq_accum,
-            dk if not dKV_postprocess else dk_accum,
-            dv if not dKV_postprocess else dv_accum,
-            softmax_scale,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            seqused_q,
-            seqused_k,
-            window_size_left,
-            window_size_right,
-            dQ_semaphore,
-            dK_semaphore,
-            dV_semaphore,
-            AuxData(aux_tensors, aux_scalars),
-            (
-                normalized_block_sparse_tensors.mask_block_cnt,
-                normalized_block_sparse_tensors.mask_block_idx,
-                normalized_block_sparse_tensors.full_block_cnt,
-                normalized_block_sparse_tensors.full_block_idx,
-                normalized_block_sparse_tensors.cu_total_m_blocks,
-                normalized_block_sparse_tensors.cu_block_idx_offsets,
-                normalized_block_sparse_tensors.dq_write_order,
-                normalized_block_sparse_tensors.dq_write_order_full,
-            )
-            if normalized_block_sparse_tensors is not None
-            else None,
-        ]
-        if not use_dedicated_hd256_kernel:
-            call_args.append(cu_total_m_blocks_k)
-        _flash_attn_bwd.compile_cache[compile_key](*call_args)
+        call_args = build_bwd_args(
+            q=q.detach(),
+            k=k.detach(),
+            v=v.detach(),
+            do=dout,
+            lse_log2=lse_log2,
+            dpsum=dpsum,
+            dq_accum=dq_accum,
+            dk=dk if not dKV_postprocess else dk_accum,
+            dv=dv if not dKV_postprocess else dv_accum,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            seqused_q=seqused_q,
+            seqused_k=seqused_k,
+            dQ_semaphore=dQ_semaphore,
+            dK_semaphore=dK_semaphore,
+            dV_semaphore=dV_semaphore,
+            aux_tensors=aux_tensors,
+            blocksparse_tensors=to_block_sparse_call_args(normalized_block_sparse_tensors),
+            cu_total_m_blocks_k=cu_total_m_blocks_k,
+        )
+        _flash_attn_bwd.compile_cache[compile_key](call_args)
     # Postprocess: convert dq_accum from float32 to dq in bf16/fp16
     # hd=256 2CTA backward has its own internal postprocess, skip here.
     if not use_dedicated_hd256_kernel:
