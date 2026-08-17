@@ -20,7 +20,17 @@ if not USE_TRITON_ROCM and getattr(torch.version, 'hip', None) is not None:
 if USE_TRITON_ROCM:
     from aiter.ops.triton._triton_kernels.flash_attn_triton_amd import flash_attn_2 as flash_attn_gpu
 else:
-    import flash_attn_2_cuda as flash_attn_gpu
+    # `flash_attn_2_cuda` is now a CPython agnostic shared library that registers its ops into
+    # torch.ops.flash_attn_2 (via TORCH_LIBRARY). It's no longer an importable pybind module.
+    # Load the shared library so its static registration runs, then alias the op namespace so
+    # existing `flash_attn_gpu.<op>(...)` calls work.
+    import importlib.util as _importlib_util
+
+    _flash_attn_2_spec = _importlib_util.find_spec("flash_attn_2_cuda")
+    if _flash_attn_2_spec is None or _flash_attn_2_spec.origin is None:
+        raise ImportError("Could not locate the flash_attn_2_cuda shared library")
+    torch.ops.load_library(_flash_attn_2_spec.origin)
+    flash_attn_gpu = torch.ops.flash_attn_2
 
 # isort: on
 
