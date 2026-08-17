@@ -16,7 +16,6 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync, tcgen05
-import cutlass.utils as utils
 import cutlass.pipeline as pipeline
 import cutlass.utils.blackwell_helpers as sm100_utils
 from cutlass.cute.typing import Int32
@@ -350,12 +349,12 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             ),
         )
 
-        self.Q_major_mode = utils.LayoutEnum.from_tensor(Q).mma_major_mode()
-        self.K_major_mode = utils.LayoutEnum.from_tensor(K).mma_major_mode()
-        self.dK_major_mode = utils.LayoutEnum.from_tensor(dK).mma_major_mode()
-        self.V_major_mode = utils.LayoutEnum.from_tensor(V).mma_major_mode()
-        self.dV_major_mode = utils.LayoutEnum.from_tensor(dV).mma_major_mode()
-        self.dO_major_mode = utils.LayoutEnum.from_tensor(dO).mma_major_mode()
+        self.Q_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(Q).mma_major_mode()
+        self.K_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(K).mma_major_mode()
+        self.dK_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(dK).mma_major_mode()
+        self.V_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(V).mma_major_mode()
+        self.dV_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(dV).mma_major_mode()
+        self.dO_major_mode = cutlass.tensor_utils.LayoutEnum.from_tensor(dO).mma_major_mode()
 
         if cutlass.const_expr(self.Q_major_mode != tcgen05.OperandMajorMode.K):
             raise RuntimeError(f"The layout of q is not supported: {self.Q_major_mode}")
@@ -602,8 +601,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         num_epi_stages_dKV = (self.cta_tiler[2] // num_compute_wgs) // epi_cols_dKV
         epi_tile_dKV = (self.cta_tiler[1], epi_cols_dKV)
         total_epi_stages = num_compute_wgs * num_epi_stages_dKV
-        dK_layout_enum = utils.LayoutEnum.from_tensor(dK)
-        dV_layout_enum = utils.LayoutEnum.from_tensor(dV)
+        dK_layout_enum = cutlass.tensor_utils.LayoutEnum.from_tensor(dK)
+        dV_layout_enum = cutlass.tensor_utils.LayoutEnum.from_tensor(dV)
         sdK_epi_layout = sm100_utils.make_smem_layout_epi(
             dK.element_type,
             dK_layout_enum,
@@ -853,7 +852,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             cpasync.prefetch_descriptor(tma_atom_dO)
             cpasync.prefetch_descriptor(tma_atom_dOT)
 
-        smem = utils.SmemAllocator()
+        smem = cutlass.memory.SmemAllocator()
         storage = smem.allocate(self.shared_storage)
 
         load_mma_Q_producer, load_mma_Q_consumer = pipeline.PipelineTmaUmma.create(
@@ -1028,7 +1027,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             num_threads=self.threads_per_cta,
         )
 
-        tmem = utils.TmemAllocator(
+        tmem = cutlass.memory.TmemAllocator(
             storage.tmem_holding_buf.ptr,
             barrier_for_retrieve=tmem_alloc_barrier,
             allocator_warp_id=self.load_warp_id,
