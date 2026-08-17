@@ -706,7 +706,7 @@ struct Stats<T, 1, WARPS_M, WARPS_N> {
         }
         __syncthreads();
 
-        int n = 0;;
+        int n = 0;
         T m = Zeros<T>::get();
         T m2 = Zeros<T>::get();
 
