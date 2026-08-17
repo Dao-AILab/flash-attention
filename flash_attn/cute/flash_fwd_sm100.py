@@ -2520,6 +2520,7 @@ class FlashAttentionForwardSm100:
             tSrP_r2t,
             ex2_emu_freq=self.ex2_emu_freq,
             ex2_emu_start_frg=self.ex2_emu_start_frg,
+            converted_f32=tSrP_r2t_f32,
         )
         # Sequence barrier arrive
         if const_expr(self.s0_s1_barrier):
