@@ -8,12 +8,44 @@ from dataclasses import dataclass
 import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Boolean
+from cutlass.cutlass_dsl import T as _fa4_T, dsl_user_op as _fa4_dsl_user_op
+from cutlass._mlir.dialects import llvm as _fa4_llvm
 
 from quack import layout_utils
 import flash_attn.cute.utils as utils
 from quack.cute_dsl_utils import ParamsBase
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.utils import AuxData
+
+# The standard elementwise f32 -> e4m3 conversion emits a PRMT to pack each
+# group of four bytes.  Expressing the conversion as two e4m3x2 operations
+# lets ptxas fold that packing into F2FP's merge operand.
+_FA4_PACK4 = True
+
+
+@_fa4_dsl_user_op
+def _fa4_cvt_e4m3x4(e0, e1, e2, e3, *, loc=None, ip=None):
+    """Return four packed e4m3 values in the bit pattern of one Float32."""
+    out = _fa4_llvm.inline_asm(
+        _fa4_T.f32(),
+        [
+            Float32(e0).ir_value(loc=loc, ip=ip),
+            Float32(e1).ir_value(loc=loc, ip=ip),
+            Float32(e2).ir_value(loc=loc, ip=ip),
+            Float32(e3).ir_value(loc=loc, ip=ip),
+        ],
+        "{\n\t"
+        ".reg .b16 lo, hi;\n\t"
+        "cvt.rn.satfinite.e4m3x2.f32 lo, $2, $1;\n\t"
+        "cvt.rn.satfinite.e4m3x2.f32 hi, $4, $3;\n\t"
+        "mov.b32 $0, {lo, hi};\n\t"
+        "}\n",
+        "=f,f,f,f,f",
+        has_side_effects=False,
+        is_align_stack=False,
+        asm_dialect=_fa4_llvm.AsmDialect.AD_ATT,
+    )
+    return Float32(out)
 
 
 @cute.jit
@@ -365,6 +397,7 @@ class SoftmaxSm100(Softmax):
         ex2_emu_freq: cutlass.Constexpr[int] = 0,
         ex2_emu_res: cutlass.Constexpr[int] = 4,
         ex2_emu_start_frg: cutlass.Constexpr[int] = 0,
+        converted_f32: cute.Tensor = None,
     ):
         assert cute.size(acc_S_row.shape) % 2 == 0, "acc_S_row must have an even number of elements"
         frg_tile = 32
@@ -374,6 +407,11 @@ class SoftmaxSm100(Softmax):
         acc_S_row_frg = cute.logical_divide(acc_S_row, cute.make_layout(frg_tile))
         acc_S_row_converted_frg = cute.logical_divide(
             acc_S_row_converted, cute.make_layout(frg_tile)
+        )
+        pack4 = cutlass.const_expr(
+            _FA4_PACK4
+            and converted_f32 is not None
+            and acc_S_row_converted.element_type is cutlass.Float8E4M3FN
         )
         for j in cutlass.range_constexpr(frg_cnt):
             for k in cutlass.range_constexpr(0, cute.size(acc_S_row_frg, mode=[0]), 2):
@@ -397,9 +435,19 @@ class SoftmaxSm100(Softmax):
                         acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j] = utils.ex2_emulation_2(
                             acc_S_row_frg[k, j], acc_S_row_frg[k + 1, j]
                         )
-            acc_S_row_converted_frg[None, j].store(
-                acc_S_row_frg[None, j].load().to(acc_S_row_converted.element_type)
-            )
+            if cutlass.const_expr(pack4):
+                for word in cutlass.range_constexpr(frg_tile // 4):
+                    k = word * 4
+                    converted_f32[j * (frg_tile // 4) + word] = _fa4_cvt_e4m3x4(
+                        acc_S_row_frg[k, j],
+                        acc_S_row_frg[k + 1, j],
+                        acc_S_row_frg[k + 2, j],
+                        acc_S_row_frg[k + 3, j],
+                    )
+            else:
+                acc_S_row_converted_frg[None, j].store(
+                    acc_S_row_frg[None, j].load().to(acc_S_row_converted.element_type)
+                )
 
     @cute.jit
     def scale_apply_exp2_convert(
