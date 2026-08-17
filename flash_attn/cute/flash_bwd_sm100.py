@@ -68,6 +68,7 @@ class FlashAttentionBackwardSm100:
         has_aux_tensors: cutlass.Constexpr = False,
         q_subtile_factor: cutlass.Constexpr[int] = 1,
         kv_subtile_factor: cutlass.Constexpr[int] = 1,
+        split_P_dS: Optional[bool] = None,
     ):
         # padding head_dim to a multiple of 16 as k_block_size
         hdim_multiple_of = 16
@@ -136,6 +137,24 @@ class FlashAttentionBackwardSm100:
         # Generally slower to use store dS in smem for dK, and doesn't work for 2cta
         self.use_smem_dS_for_mma_dK = False
 
+        # hdim 64 1-CTA only uses TMEM cols [0, 384), so we can allocate dedicated TMEM
+        # buffers for P and dS.
+        split_P_dS_eligible = (
+            not self.use_2cta_instrs
+            and self.tile_m == 128
+            and self.tile_n == 128
+            and self.tile_hdim == 64
+            and self.tile_hdimv == 64
+            and not self.use_smem_dS_for_mma_dK
+        )
+        if split_P_dS is None:
+            self.split_P_dS = split_P_dS_eligible
+        else:
+            assert not split_P_dS or split_P_dS_eligible, (
+                "split_P_dS requires 1-CTA hdim64 with 128x128 tiles"
+            )
+            self.split_P_dS = split_P_dS
+
         self.reduce_warp_ids = (0, 1, 2, 3)
         self.compute_warp_ids = (4, 5, 6, 7, 8, 9, 10, 11)
         self.mma_warp_id = 12
@@ -190,7 +209,6 @@ class FlashAttentionBackwardSm100:
             self.tmem_dQ_offset = 512 - self.tile_hdim // 2
         else:
             self.tmem_S_offset = 0
-            self.tmem_P_offset = 0  # overlap with S
             self.tmem_dV_offset = self.tmem_S_offset + self.tile_n
             self.tmem_dP_offset = self.tmem_dV_offset + self.tile_hdimv
             self.tmem_dQ_offset = (
@@ -199,7 +217,14 @@ class FlashAttentionBackwardSm100:
                 else self.tmem_dP_offset
             )
             self.tmem_dK_offset = self.tmem_dP_offset + self.tile_m
-            self.tmem_dS_offset = self.tmem_dP_offset  # overlap with dP
+            if self.split_P_dS:
+                # P/dS are packed 16-bit over tile_m columns -> tile_m // 2 fp32 columns
+                self.tmem_P_offset = self.tmem_dK_offset + self.tile_hdim
+                self.tmem_dS_offset = self.tmem_P_offset + self.tile_m // 2
+                assert self.tmem_dS_offset + self.tile_m // 2 <= self.tmem_alloc_cols
+            else:
+                self.tmem_P_offset = self.tmem_S_offset  # overlap with S
+                self.tmem_dS_offset = self.tmem_dP_offset  # overlap with dP
 
         if (not is_causal and not is_local) or deterministic:
             self.num_regs_reduce = 136 if self.use_2cta_instrs else 152
@@ -237,6 +262,8 @@ class FlashAttentionBackwardSm100:
         self.Q_stage = 1 if self.use_2cta_instrs else 2
         self.dO_stage = 1
         self.single_stage = 1
+        # dedicated-P pipeline; 0 stages when P overlaps S
+        self.P_stage = self.single_stage if self.split_P_dS else 0
         # LSE_stage = Q_stage and dPsum_stage = dO_stage
         self.sdKVaccum_stage = 2
         # number of tma reduce adds per dQacc mma
@@ -859,6 +886,7 @@ class FlashAttentionBackwardSm100:
                 S_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.single_stage]
                 dP_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.single_stage]
                 dS_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.single_stage]
+                P_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.P_stage]
                 dKV_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2 * self.sdKVaccum_stage]
                 dQ_mbar_ptr: cute.struct.MemRange[cutlass.Int64, 2]
                 dQ_cluster_full_mbar_ptr: cute.struct.MemRange[
@@ -1222,6 +1250,17 @@ class FlashAttentionBackwardSm100:
             barrier_storage=storage.dS_mbar_ptr.data_ptr(),
             cta_layout_vmnk=cluster_layout_vmnk,
         )
+        # Split S/P: P gets its own pipeline so S can be released as soon as compute has read it
+        if const_expr(self.split_P_dS):
+            pipeline_P = cutlass.pipeline.PipelineAsyncUmma.create(
+                num_stages=1,
+                producer_group=pipeline_PdS_producer_group,
+                consumer_group=pipeline_PdS_consumer_group,
+                barrier_storage=storage.P_mbar_ptr.data_ptr(),
+                cta_layout_vmnk=cluster_layout_vmnk,
+            )
+        else:
+            pipeline_P = None
 
         # TMA producer and UMMA consumers
         pipeline_producer_group = cutlass.pipeline.CooperativeGroup(
@@ -1543,6 +1582,7 @@ class FlashAttentionBackwardSm100:
                 pipeline_dKV,
                 pipeline_dP,
                 pipeline_dQ,
+                pipeline_P,
                 block_info,
                 SeqlenInfoCls,
                 TileSchedulerCls,
@@ -1581,6 +1621,7 @@ class FlashAttentionBackwardSm100:
                 pipeline_dS,
                 pipeline_dKV,
                 pipeline_dP,
+                pipeline_P,
                 dS_cluster_empty_mbar_ptr,
                 dS_cluster_full_mbar_ptr,
                 dQaccum_empty_mbar_ptr,
@@ -2295,6 +2336,7 @@ class FlashAttentionBackwardSm100:
         pipeline_dKV: PipelineAsync,
         pipeline_dP: PipelineAsync,
         pipeline_dQ: PipelineAsync,
+        pipeline_P: Optional[PipelineAsync],
         block_info: BlockInfo,
         SeqlenInfoCls: Callable,
         TileSchedulerCls: Callable,
@@ -2406,6 +2448,10 @@ class FlashAttentionBackwardSm100:
         )
         producer_phase_acc = Int32(1)  # For S & P, dP, dQ
         producer_phase_dQ = Int32(1)  # 2-CTA: separate phase for dQ pipeline
+        producer_phase_S = Int32(1)  # split_P_dS: separate phase for the S handshake
+        consumer_state_P = cutlass.pipeline.make_pipeline_state(
+            cutlass.pipeline.PipelineUserType.Consumer, 1
+        )
         consumer_state_dS = cutlass.pipeline.make_pipeline_state(
             cutlass.pipeline.PipelineUserType.Consumer, 1
         )
@@ -2654,9 +2700,14 @@ class FlashAttentionBackwardSm100:
 
                     # 1) S = K @ Q
                     handle_Q = pipeline_Q_consumer.wait_and_advance()
-                    pipeline_S_P.sync_object_empty.wait(0, producer_phase_acc)
+                    if const_expr(self.split_P_dS):
+                        pipeline_S_P.sync_object_empty.wait(0, producer_phase_S)  # S read
+                    else:
+                        pipeline_S_P.sync_object_empty.wait(0, producer_phase_acc)
                     mma_qk_fn(B_idx=handle_Q.index)
                     pipeline_S_P.sync_object_full.arrive(0, pipeline_S_P.producer_mask, cta_group)
+                    if const_expr(self.split_P_dS):
+                        producer_phase_S ^= 1
 
                     # 2) dP = V @ dOt.T
                     pipeline_dO.consumer_wait(consumer_state_dO)
@@ -2667,8 +2718,14 @@ class FlashAttentionBackwardSm100:
 
                     producer_phase_acc ^= 1
                     # 3) dV = P.T @ dO
-                    pipeline_S_P.sync_object_empty.wait(0, producer_phase_acc)
-                    mma_pdo_fn(B_idx=consumer_state_dO.index, zero_init=True)
+                    if const_expr(self.split_P_dS):
+                        pipeline_P.consumer_wait(consumer_state_P)
+                        mma_pdo_fn(B_idx=consumer_state_dO.index, zero_init=True)
+                        pipeline_P.consumer_release(consumer_state_P)
+                        consumer_state_P.advance()
+                    else:
+                        pipeline_S_P.sync_object_empty.wait(0, producer_phase_acc)
+                        mma_pdo_fn(B_idx=consumer_state_dO.index, zero_init=True)
                     pipeline_dO.consumer_release(consumer_state_dO)
                     consumer_state_dO.advance()
 
@@ -2693,10 +2750,15 @@ class FlashAttentionBackwardSm100:
                     for _ in cutlass.range(main_loop_iters, unroll=1):
                         # (1) S.T = K @ Q.T
                         handle_Q_next = pipeline_Q_consumer.wait_and_advance()
+                        if const_expr(self.split_P_dS):
+                            # only wait for "S_i read"; exp/P computation overlaps this QK
+                            pipeline_S_P.sync_object_empty.wait(0, producer_phase_S)
                         mma_qk_fn(B_idx=handle_Q_next.index)
                         pipeline_S_P.sync_object_full.arrive(
                             0, pipeline_S_P.producer_mask, cta_group
                         )
+                        if const_expr(self.split_P_dS):
+                            producer_phase_S ^= 1
 
                         # (2) dK += dS.T @ Q
                         pipeline_dS.consumer_wait(consumer_state_dS)
@@ -2718,14 +2780,23 @@ class FlashAttentionBackwardSm100:
 
                         # (5) dV += P.T @ dO
                         producer_phase_acc ^= 1
-                        pipeline_S_P.sync_object_empty.wait(0, producer_phase_acc)
-                        mma_pdo_fn(B_idx=consumer_state_dO.index, zero_init=False)
+                        if const_expr(self.split_P_dS):
+                            pipeline_P.consumer_wait(consumer_state_P)
+                            mma_pdo_fn(B_idx=consumer_state_dO.index, zero_init=False)
+                            pipeline_P.consumer_release(consumer_state_P)
+                            consumer_state_P.advance()
+                        else:
+                            pipeline_S_P.sync_object_empty.wait(0, producer_phase_acc)
+                            mma_pdo_fn(B_idx=consumer_state_dO.index, zero_init=False)
                         pipeline_dO.consumer_release(consumer_state_dO)
                         consumer_state_dO.advance()
 
                         handle_Q = handle_Q_next
 
-                    pipeline_S_P.sync_object_full.arrive(0, pipeline_S_P.producer_mask, cta_group)
+                    if const_expr(not self.split_P_dS):
+                        pipeline_S_P.sync_object_full.arrive(
+                            0, pipeline_S_P.producer_mask, cta_group
+                        )
 
                     # signal to the epilogue that dV is ready
                     # pipeline_dKV.producer_acquire(producer_state_dKV)
@@ -2902,6 +2973,7 @@ class FlashAttentionBackwardSm100:
         pipeline_dS: PipelineAsync,
         pipeline_dKV: PipelineAsync,
         pipeline_dP: PipelineAsync,
+        pipeline_P: Optional[PipelineAsync],
         dS_cluster_empty_mbar_ptr: cute.Pointer,
         dS_cluster_full_mbar_ptr: cute.Pointer,
         dQaccum_empty_mbar_ptr: cute.Pointer,
@@ -2955,13 +3027,21 @@ class FlashAttentionBackwardSm100:
 
         tileP_f32_like = self.cta_tiler[1] // 32 * self.v_dtype.width
         # tStS has shape ((128, 128), 1, 1), tStP has shape ((128, 64), 1, 1)
-        # tP overlap with tS
         tStP = cute.composition(tStS, (cute.make_layout((self.tile_n, tileP_f32_like)), 1, 1))
-        tStP = cute.make_tensor(tStS.iterator, tStP.layout)  # Otherwise the tmem address is wrong
+        # Rebase the iterator explicitly, otherwise the tmem address is wrong
+        if const_expr(self.tmem_P_offset != self.tmem_S_offset):
+            tStP = cute.make_tensor(
+                tStS.iterator + (self.tmem_P_offset - self.tmem_S_offset), tStP.layout
+            )
+        else:
+            tStP = cute.make_tensor(tStS.iterator, tStP.layout)
         tScS = thr_mma_S.partition_C(cute.make_identity_tensor(self.mma_tiler_kq[:2]))
         tScP = cute.composition(tScS, (cute.make_layout((self.tile_n, tileP_f32_like)), 1, 1))
-        # tdS overlap with tdP
         tdPtdS = cute.composition(tdPtdP, (cute.make_layout((self.tile_n, tileP_f32_like)), 1, 1))
+        if const_expr(self.tmem_dS_offset != self.tmem_dP_offset):
+            tdPtdS = cute.make_tensor(
+                tdPtdP.iterator + (self.tmem_dS_offset - self.tmem_dP_offset), tdPtdS.layout
+            )
         tdPcdP = thr_mma_dP.partition_C(cute.make_identity_tensor(self.mma_tiler_vdo[:2]))
         tdPcdS = cute.composition(tdPcdP, (cute.make_layout((self.tile_n, tileP_f32_like)), 1, 1))
 
@@ -3020,6 +3100,12 @@ class FlashAttentionBackwardSm100:
             cutlass.pipeline.PipelineUserType.Consumer, 1
         )
         # consumer_phase_S_P_dP = Int32(0)
+        consumer_state_S = pipeline.make_pipeline_state(
+            cutlass.pipeline.PipelineUserType.Consumer, 1
+        )
+        producer_state_P = pipeline.make_pipeline_state(
+            cutlass.pipeline.PipelineUserType.Producer, 1
+        )
         producer_state_dS = pipeline.make_pipeline_state(  # Our impl has shortcut for stage==1
             cutlass.pipeline.PipelineUserType.Producer, 1
         )
@@ -3130,13 +3216,23 @@ class FlashAttentionBackwardSm100:
                 if const_expr(prefetch_LSE and not self.shuffle_LSE):
                     cute.autovec_copy(tSsLSE[None, 0, 0, 0, consumer_state_LSE.index], tSrLSE_s2r)
 
-                pipeline_S_P.consumer_wait(consumer_state_S_P_dP)
+                if const_expr(self.split_P_dS):
+                    pipeline_S_P.consumer_wait(consumer_state_S)
+                else:
+                    pipeline_S_P.consumer_wait(consumer_state_S_P_dP)
                 # pipeline_S_P.sync_object_full.wait(0, consumer_phase_S_P_dP)
                 #### TMEM->RMEM (Load S from TMEM)
                 tSrS_t2r = cute.make_rmem_tensor(tScS_t2r.shape, Float32)
                 cute.copy(thr_copy_t2r, tStS_t2r, tSrS_t2r)
 
-                if const_expr(self.tile_hdim == 192):
+                if const_expr(self.split_P_dS):
+                    # Release S right after the loads (before exp/P) so the next QK can issue
+                    cute.arch.fence_view_async_tmem_load()
+                    cute.arch.sync_warp()
+                    with cute.arch.elect_one():
+                        pipeline_S_P.consumer_release(consumer_state_S)
+                    consumer_state_S.advance()
+                elif const_expr(self.tile_hdim == 192):
                     # Signal S tmem load completion using pipeline_S_P when hdim 192
                     # dP is overlapped with S
                     cute.arch.fence_view_async_tmem_load()
@@ -3212,10 +3308,14 @@ class FlashAttentionBackwardSm100:
                         tSrS_cur[2 * v + 1] = cute.math.exp2(tSrS_cur[2 * v + 1], fastmath=True)
                     utils.cvt_f16(tSrS_cur, tSrP_r2t[None, stage, 0, 0])
                     if const_expr(stage == 0):
-                        cute.arch.fence_view_async_tmem_load()
-                        # Without this barrier, we could have 1 warp writing to P in tmem while
-                        # another warp is still reading S from tmem.
-                        self.compute_sync_barrier.arrive_and_wait()
+                        if const_expr(self.split_P_dS):
+                            # wait until the previous pdo UMMA has consumed the P slot
+                            pipeline_P.producer_acquire(producer_state_P)
+                        else:
+                            cute.arch.fence_view_async_tmem_load()
+                            # Without this barrier, we could have 1 warp writing to P in tmem
+                            # while another warp is still reading S from tmem.
+                            self.compute_sync_barrier.arrive_and_wait()
                     cute.copy(
                         thr_copy_r2t,
                         tSrP_r2t_f32[None, stage, None, None],
@@ -3224,14 +3324,22 @@ class FlashAttentionBackwardSm100:
 
                 cute.arch.fence_view_async_tmem_store()
                 cute.arch.fence_view_async_shared()
-                self.compute_sync_barrier.arrive_and_wait()
-                if const_expr(not self.tile_hdim == 192):
-                    # Signal tmem store P completion with pipeline_S_P
+                if const_expr(self.split_P_dS):
+                    # The P and LSE mbarriers expect one arrival per warp: no CTA-wide barrier needed
+                    cute.arch.sync_warp()
                     with cute.arch.elect_one():
-                        pipeline_S_P.consumer_release(consumer_state_S_P_dP)
-                        # pipeline_S_P.sync_object_empty.arrive(0, pipeline_S_P.consumer_mask)
+                        pipeline_P.producer_commit(producer_state_P)
+                    producer_state_P.advance()
+                else:
+                    self.compute_sync_barrier.arrive_and_wait()
+                    if const_expr(not self.tile_hdim == 192):
+                        # Signal tmem store P completion with pipeline_S_P
+                        with cute.arch.elect_one():
+                            pipeline_S_P.consumer_release(consumer_state_S_P_dP)
+                            # pipeline_S_P.sync_object_empty.arrive(0, pipeline_S_P.consumer_mask)
                 # Normally we'd need syncwarp here since only 1 thread will signal in
-                # consumer_release, but we already have the self.compute_sync_barrier before this
+                # consumer_release, but we already have the compute_sync_barrier or sync_warp
+                # before this
                 pipeline_LSE.consumer_release(consumer_state_LSE)
                 consumer_state_LSE.advance()
                 # ---------------------------------------------
@@ -3249,7 +3357,9 @@ class FlashAttentionBackwardSm100:
                     tdPrdP_t2r = cute.make_rmem_tensor(tScS_t2r[None, 0, None, None].shape, Float32)
                     cute.copy(thr_copy_t2r, tdPtdP_t2r[None, stage, None, None], tdPrdP_t2r)
                     cute.arch.fence_view_async_tmem_load()
-                    self.compute_sync_barrier.arrive_and_wait()
+                    if const_expr(not self.split_P_dS):
+                        # All warps must load their dP stage before any warp overwrites it with dS
+                        self.compute_sync_barrier.arrive_and_wait()
                     tdPrdP_cur = tdPrdP_t2r[None, 0, 0]
                     tSrS_cur = tSrS_t2r[None, stage, 0, 0]
                     tSsdPsum_cur = tSsdPsum[None, stage, 0, 0, consumer_state_dPsum.index]
@@ -3342,9 +3452,13 @@ class FlashAttentionBackwardSm100:
                     cute.autovec_copy(tdPrdS_xchg, tRS_sdS_xchg[None, 0])
 
                 cute.arch.fence_view_async_shared()
-                self.compute_sync_barrier.arrive_and_wait()
+                if const_expr(self.split_P_dS):
+                    # The dS and dPsum mbarriers expect one arrival per warp
+                    cute.arch.sync_warp()
+                else:
+                    self.compute_sync_barrier.arrive_and_wait()
                 # Normally we'd need syncwarp here since only 1 thread will signal in
-                # consumer_release, but we already have the self.compute_sync_barrier before this
+                # consumer_release, but we already have the barrier or sync_warp before this
                 pipeline_dPsum.consumer_release(consumer_state_dPsum)
                 consumer_state_dPsum.advance()
                 # when 2cta hdim 128, pipeline_dS also signals S tmem load completion so is deferred

@@ -1847,11 +1847,14 @@ def _flash_attn_bwd(
     block_sparse_tensors: Optional[BlockSparseTensorsTorch] = None,
     dlse: Optional[torch.Tensor] = None,
     learnable_sink: Optional[torch.Tensor] = None,
+    split_P_dS: Optional[bool] = None,
 ) -> Tuple[torch.Tensor, ...]:
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
     fake_mode = is_fake_mode()
     arch = _get_device_arch()
     assert arch // 10 in [9, 10, 11, 12], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x, 12.x"
+    if split_P_dS is not None:
+        assert arch // 10 in [10, 11], "split_P_dS is only supported on SM100/SM110"
     if block_sparse_tensors is not None:
         assert (
             cu_seqlens_q is None
@@ -2377,6 +2380,7 @@ def _flash_attn_bwd(
             single_q_block,
             single_k_block,
             cu_total_m_blocks_k is not None,
+            split_P_dS,
         )
 
     if compile_key not in _flash_attn_bwd.compile_cache:
@@ -2509,6 +2513,7 @@ def _flash_attn_bwd(
                     has_aux_tensors=aux_tensors is not None,
                     q_subtile_factor=q_subtile_factor,
                     kv_subtile_factor=kv_subtile_factor,
+                    split_P_dS=split_P_dS,
                 )
 
         # Block sparse tensors for backward use Q-direction indexing (transposed from forward).
