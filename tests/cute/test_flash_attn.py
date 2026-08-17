@@ -1559,6 +1559,134 @@ def test_flash_attn_varlen_cumsum_metadata_paths(causal, cumsum_mode, qhead_per_
         ).abs().max().item() + atol, name
 
 
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("qhead_per_kvhead", [1, 3])
+@pytest.mark.parametrize("zero_lengths", [False, True])
+@retry_on_oom
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_varlen_dynamic_persistent(causal, qhead_per_kvhead, zero_lengths):
+    """DynamicPersistentVarlenScheduler via get_scheduler_metadata(dynamic_persistent=True)."""
+    if torch.cuda.get_device_capability()[0] not in (9, 10, 11):
+        pytest.skip("dynamic persistent scheduler requires SM90/SM100/SM110")
+    device = "cuda"
+    torch.manual_seed(0)
+    random.seed(0)
+
+    # Enough tiles that CTAs must pull extra work through the atomic counter.
+    batch_size = 32
+    seqlen_q = seqlen_k = 1024
+    nheads_kv = 2
+    nheads = nheads_kv * qhead_per_kvhead
+    d = dv = 128
+    dtype = torch.bfloat16
+
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
+    k = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype)
+    v = torch.randn(batch_size, seqlen_k, nheads_kv, dv, device=device, dtype=dtype)
+
+    query_padding_mask = generate_random_padding_mask(
+        seqlen_q,
+        batch_size,
+        device,
+        mode="random" if zero_lengths else "third",
+        zero_lengths=zero_lengths,
+    )
+    key_padding_mask = generate_random_padding_mask(
+        seqlen_k,
+        batch_size,
+        device,
+        mode="random" if zero_lengths else "third",
+        zero_lengths=zero_lengths,
+    )
+    if zero_lengths:
+        key_padding_mask[1] = False
+        key_padding_mask[2] = False
+    (
+        q_unpad,
+        k_unpad,
+        v_unpad,
+        _qv_unpad,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        _seqused_q,
+        _seqused_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        _q,
+        _k,
+        _v,
+        _qv,
+        output_pad_fn,
+        _dq_pad_fn,
+        _dk_pad_fn,
+    ) = generate_qkv(q, k, v, query_padding_mask, key_padding_mask, kvpacked=False)
+
+    scheduler_metadata = get_scheduler_metadata(
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        nheads=nheads,
+        nheads_kv=nheads_kv,
+        headdim=d,
+        headdim_v=dv,
+        num_splits=1,
+        causal=causal,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        dynamic_persistent=True,
+    )
+    if is_fake_mode():
+        return
+
+    assert scheduler_metadata.tile_count_semaphore is not None
+
+    fwd_kwargs = dict(
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max_seqlen_q,
+        max_seqlen_k=max_seqlen_k,
+        causal=causal,
+    )
+    # Two calls, to cover metadata reuse and the semaphore reset between launches.
+    for _ in range(2):
+        out_unpad, _ = flash_attn_varlen_func(
+            q_unpad,
+            k_unpad,
+            v_unpad,
+            scheduler_metadata=scheduler_metadata,
+            **fwd_kwargs,
+        )
+    out_single_tile, _ = flash_attn_varlen_func(
+        q_unpad,
+        k_unpad,
+        v_unpad,
+        disable_scheduler_metadata=True,
+        **fwd_kwargs,
+    )
+    assert torch.equal(out_unpad, out_single_tile)
+
+    out = output_pad_fn(out_unpad)
+    out_ref, _ = attention_ref(
+        q, k, v, query_padding_mask, key_padding_mask, causal=causal
+    )
+    out_pt, _ = attention_ref(
+        q,
+        k,
+        v,
+        query_padding_mask,
+        key_padding_mask,
+        causal=causal,
+        upcast=False,
+        reorder_ops=True,
+    )
+    empty_k = ~key_padding_mask.any(dim=-1)
+    out_ref[empty_k] = 0.0
+    out_pt[empty_k] = 0.0
+    fwd_atol = 2 * (out_ref + 0.3 - 0.3 - out_ref).abs().max().item()
+    assert (out - out_ref).abs().max().item() <= 2 * (
+        out_pt - out_ref
+    ).abs().max().item() + fwd_atol
+
+
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 # @pytest.mark.parametrize("dtype", [torch.float8_e4m3fn])
