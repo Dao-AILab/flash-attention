@@ -216,6 +216,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         cumulative_s_q: cute.Tensor | None,
         cumulative_s_k: cute.Tensor | None,
         scale_softmax: cutlass.Float32,
+        max_seqlen_k: Int32 | None,
         stream: cuda.CUstream,
     ):
         """Host function to launch CuTeDSL kernel."""
@@ -712,7 +713,15 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         self.shared_storage = SharedStorage
 
         # =============================== bwd ===============================
-        K_val = problem_shape[1]
+        K_val = (
+            max_seqlen_k
+            if cutlass.const_expr(cumulative_s_k is not None)
+            else problem_shape[1]
+        )
+        if cutlass.const_expr(cumulative_s_k is not None):
+            assert max_seqlen_k is not None, (
+                "SM100 hd256 varlen dK/dV requires max_seqlen_k for grid sizing"
+            )
         _, H_K = problem_shape[3][0]
         B = problem_shape[3][1]
         problem_shape_mbh = (
@@ -731,7 +740,11 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 is_persistent=False,
                 problem_shape_mbh=problem_shape_mbh,
             )
-            bwd_grid = self._compute_bwd_grid(problem_shape, self.cta_tiler[1])
+            bwd_grid = (
+                cute.ceil_div(K_val, self.cta_tiler[1]),
+                cute.size(H_K),
+                cute.size(B),
+            )
             bwd_grid = cute.round_up(bwd_grid, self.cluster_shape_mnk)
 
         self.dkdv_bwd(
@@ -1190,6 +1203,11 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                         is_2cta=True,
                     )
                     iter_count = (iter_end - iter_start) * problem_shape[3][0][0]
+                    cluster_k_start = (
+                        (blk_coord_k // 2) * 2 * self.tile_shape_K
+                    )
+                    if cluster_k_start >= seqlen_k_cur_batch:
+                        iter_count = Int32(0)
                     if iter_count <= 0:
                         if blk_coord_k * self.tile_shape_K < seqlen_k_cur_batch:
                             problem_shape_cur_batch = (
@@ -1319,6 +1337,11 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                         is_2cta=True,
                     )
                     iter_count = (iter_end - iter_start) * problem_shape[3][0][0]
+                    cluster_k_start = (
+                        (blk_coord_k // 2) * 2 * self.tile_shape_K
+                    )
+                    if cluster_k_start >= seqlen_k_cur_batch:
+                        iter_count = Int32(0)
                     if iter_count <= 0:
                         if blk_coord_k * self.tile_shape_K < seqlen_k_cur_batch:
                             problem_shape_cur_batch = (
@@ -1417,6 +1440,11 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                         is_2cta=True,
                     )
                     iter_count = (iter_end - iter_start) * problem_shape[3][0][0]
+                    cluster_k_start = (
+                        (blk_coord_k // 2) * 2 * self.tile_shape_K
+                    )
+                    if cluster_k_start >= seqlen_k_cur_batch:
+                        iter_count = Int32(0)
                     if iter_count <= 0:
                         if blk_coord_k * self.tile_shape_K < seqlen_k_cur_batch:
                             problem_shape_cur_batch = (
@@ -1530,6 +1558,11 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             pipeline_init_wait(cluster_shape_mn=cluster_layout_vmnk)
 
             iter_count = (iter_end - iter_start) * problem_shape[3][0][0]
+            cluster_k_start = (
+                (bidx // 2) * 2 * self.tile_shape_K
+            )
+            if cluster_k_start >= seqlen_k_cur_batch:
+                iter_count = Int32(0)
             problem_shape_cur_batch = (
                 seqlen_q_cur_batch,
                 seqlen_k_cur_batch,

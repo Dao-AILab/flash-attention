@@ -186,6 +186,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         descale_tensors: Optional[DescaleTensors] = None,
         blocksparse_tensors: Optional[cute.Tensor] = None,
         aux_data: AuxData = AuxData(),
+        max_seqlen_q: Optional[Int32] = None,
         stream: cuda.CUstream = None,
     ):
         # Keep parity with FlashAttentionForwardSm100.__call__ interface.
@@ -371,7 +372,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             cute.make_layout(
                 (s_q_total, d, ((h_r, h_k), b)),
                 stride=(
-                    o_norm.stride[1],
+                    cute.assume(o_norm.stride[1], divby=64),
                     o_norm.stride[4],
                     ((o_norm.stride[3], o_norm.stride[2]), o_norm.stride[0]),
                 ),
@@ -394,15 +395,25 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.o_dtype = o.element_type
         self.tilePlikeFP32 = self.qk_mma_tiler[1] // Float32.width * self.q_dtype.width
 
+        grid_q_extent = (
+            max_seqlen_q
+            if cutlass.const_expr(cum_seqlen_q is not None)
+            else cute.size(o.shape[0])
+        )
+        if cutlass.const_expr(cum_seqlen_q is not None):
+            assert max_seqlen_q is not None, (
+                "SM100 hd256 varlen forward requires max_seqlen_q for grid sizing"
+            )
+
         if cutlass.const_expr(self.use_clc_scheduler):
             self.tile_sched_params, grid = compute_grid_clc(
-                (s_q, o.shape[1], o.shape[2]) if cum_seqlen_q is not None else o.shape,
+                (grid_q_extent, o.shape[1], o.shape[2]),
                 self.cta_tiler,
                 (*self.cluster_shape_mn, 1),
             )
         else:
             self.tile_sched_params, grid = compute_grid(
-                (s_q, o.shape[1], o.shape[2]) if cum_seqlen_q is not None else o.shape,
+                (grid_q_extent, o.shape[1], o.shape[2]),
                 self.cta_tiler,
                 self.is_persistent,
             )

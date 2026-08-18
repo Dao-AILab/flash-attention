@@ -165,6 +165,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         cum_seqlen_q: Optional[cute.Tensor],
         cum_seqlen_k: Optional[cute.Tensor],
         scale_softmax: cutlass.Float32,
+        max_seqlen_q: Optional[Int32],
         stream: cuda.CUstream,
     ):
         varlen = cum_seqlen_q is not None or cum_seqlen_k is not None
@@ -294,15 +295,25 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         self.dq_dtype = dq.element_type
         self.tilePlikeFP32 = self.qk_mma_tiler[1] // Float32.width * self.q_dtype.width
 
+        grid_q_extent = (
+            max_seqlen_q
+            if cutlass.const_expr(cum_seqlen_q is not None)
+            else cute.size(dq.shape[0])
+        )
+        if cutlass.const_expr(cum_seqlen_q is not None):
+            assert max_seqlen_q is not None, (
+                "SM100 hd256 varlen dQ requires max_seqlen_q for grid sizing"
+            )
+
         if cutlass.const_expr(self.use_clc_scheduler):
             self.tile_sched_params, grid = compute_grid_clc(
-                (s_q, dq.shape[1], dq.shape[2]) if cum_seqlen_q is not None else dq.shape,
+                (grid_q_extent, dq.shape[1], dq.shape[2]),
                 self.cta_tiler,
                 (*self.cluster_shape_mn, 1),
             )
         else:
             self.tile_sched_params, grid = compute_grid(
-                (s_q, dq.shape[1], dq.shape[2]) if cum_seqlen_q is not None else dq.shape,
+                (grid_q_extent, dq.shape[1], dq.shape[2]),
                 self.cta_tiler,
                 self.is_persistent,
             )
