@@ -77,6 +77,7 @@ def mask_r2p_lambda(
     X: cute.Tensor,
     mask_gen_fn: cutlass.Constexpr[MaskGenFn],
     rank1: bool = False,
+    use_bitwise_select: bool = False,
 ) -> None:
     """Apply R2P masking with a custom bitmask generator.
 
@@ -91,24 +92,32 @@ def mask_r2p_lambda(
         mask = mask_gen_fn(s)
         # This needs to be range_constexpr, o/w the compiler can't generate the R2P instruction
         for i in cutlass.range_constexpr(min(CHUNK_SIZE, ncol - s * CHUNK_SIZE)):
-            in_bound = cutlass.Boolean(mask & (Uint32(1) << i))
             c = s * CHUNK_SIZE + i
-            if const_expr(rank1):
-                X[c] = X[c] if in_bound else -Float32.inf
+            if const_expr(use_bitwise_select):
+                if const_expr(rank1):
+                    X[c] = utils.mask_f32_by_u32_bit(X[c], mask, i)
+                else:
+                    for r in cutlass.range_constexpr(cute.size(X.shape[0])):
+                        X[r, c] = utils.mask_f32_by_u32_bit(X[r, c], mask, i)
             else:
-                for r in cutlass.range_constexpr(cute.size(X.shape[0])):
-                    X[r, c] = X[r, c] if in_bound else -Float32.inf
+                in_bound = cutlass.Boolean(mask & (Uint32(1) << i))
+                if const_expr(rank1):
+                    X[c] = X[c] if in_bound else -Float32.inf
+                else:
+                    for r in cutlass.range_constexpr(cute.size(X.shape[0])):
+                        X[r, c] = X[r, c] if in_bound else -Float32.inf
 
 
 @cute.jit
-def sm90_col_to_r2p_idx(col_limit: Int32) -> Int32:
-    """Transform SM90 MMA column coordinate to R2P element index.
+def col_to_r2p_idx(col_limit: Int32, col_stride: int) -> Int32:
+    """Transform an MMA column coordinate to its R2P element index.
 
-    SM90 MMA accumulator column indices are non-contiguous: 0, 1, 8, 9, 16, 17, ...
-    Element indices are contiguous: 0, 1, 2, 3, 4, 5, ...
-    This converts a column-space threshold to element-space for r2p_bitmask_below/above.
+    Each MMA accumulator thread owns adjacent column pairs separated by
+    ``col_stride``: 0, 1, col_stride, col_stride + 1, ...  Element indices are
+    contiguous: 0, 1, 2, 3, ...  This converts a column-space threshold to
+    element-space for r2p_bitmask_below/above.
     """
-    return col_limit // 8 * 2 + min(col_limit % 8, 2)
+    return col_limit // col_stride * 2 + min(col_limit % col_stride, 2)
 
 
 @cute.jit
@@ -202,6 +211,14 @@ class AttentionMask:
         ROW = 0 if const_expr(not self.swap_AB) else 1
         COL = 1 if const_expr(not self.swap_AB) else 0
         thr_col_offset = tScS_mn[0][COL]
+        use_bitwise_r2p = False
+        if const_expr(not self.swap_AB):
+            # MMA accumulator columns are pairs whose stride depends on the thread
+            # layout. Infer it from the compile-time identity coordinates instead of
+            # assuming the SM90 value (8). SM80 can use a stride of 32 when MMA
+            # warps are partitioned along N.
+            r2p_col_stride = t0ScS_mn[0, 2][COL] - t0ScS_mn[0, 0][COL]
+            use_bitwise_r2p = const_expr(r2p_col_stride != 8)
         # To handle edge cases of completely masked out rows where n_block_max = 0,
         # we treat negative n_blocks as 0th n_block
         # TODO: find more transparent solution
@@ -210,16 +227,24 @@ class AttentionMask:
         seqlenk_col_limit = self.seqlen_k - n_block * self.tile_n - thr_col_offset
         if const_expr(not mask_causal and not mask_local and mask_mod is None):
             if const_expr(mask_seqlen):
-                r2p = const_expr(not self.swap_AB)
-                if const_expr(not r2p):
-                    # traverse column index.
-                    for c in cutlass.range(cute.size(tScS_mn.shape[1]), unroll_full=True):
-                        oob = t0ScS_mn[0, c][COL] >= seqlenk_col_limit
-                        for r in cutlass.range(cute.size(tScS_mn.shape[0]), unroll_full=True):
-                            acc_S_mn[r, c] = -Float32.inf if oob else acc_S_mn[r, c]
-                else:
-                    seqlenk_col_limit_r2p = sm90_col_to_r2p_idx(seqlenk_col_limit)
-                    mask_r2p_lambda(acc_S_mn, lambda s: r2p_bitmask_below(seqlenk_col_limit_r2p, s))
+                # Full KV tiles need no elementwise masking. This is the common
+                # dense case and avoids executing an all-ones R2P mask for every
+                # score tile.
+                if (n_block + 1) * self.tile_n > self.seqlen_k:
+                    r2p = const_expr(not self.swap_AB)
+                    if const_expr(not r2p):
+                        # traverse column index.
+                        for c in cutlass.range(cute.size(tScS_mn.shape[1]), unroll_full=True):
+                            oob = t0ScS_mn[0, c][COL] >= seqlenk_col_limit
+                            for r in cutlass.range(cute.size(tScS_mn.shape[0]), unroll_full=True):
+                                acc_S_mn[r, c] = -Float32.inf if oob else acc_S_mn[r, c]
+                    else:
+                        seqlenk_col_limit_r2p = col_to_r2p_idx(seqlenk_col_limit, r2p_col_stride)
+                        mask_r2p_lambda(
+                            acc_S_mn,
+                            lambda s: r2p_bitmask_below(seqlenk_col_limit_r2p, s),
+                            use_bitwise_select=use_bitwise_r2p,
+                        )
 
         elif const_expr(
             not mask_causal and not mask_local and mask_mod is not None
@@ -322,11 +347,12 @@ class AttentionMask:
                                     else acc_S_mn[r, c]
                                 )
                         else:
-                            col_limit_r2p = sm90_col_to_r2p_idx(col_limit_right)
+                            col_limit_r2p = col_to_r2p_idx(col_limit_right, r2p_col_stride)
                             mask_r2p_lambda(
                                 acc_S_mn[r, None],
                                 lambda s: r2p_bitmask_below(col_limit_r2p, s),
                                 rank1=True,
+                                use_bitwise_select=use_bitwise_r2p,
                             )
                 else:  # Local
                     local_row_offset_right = (
@@ -365,15 +391,20 @@ class AttentionMask:
                                 if col_idx >= col_limit_right or col_idx < col_limit_left:
                                     acc_S_mn[r, c] = -Float32.inf
                         else:
-                            col_limit_right_r2p = sm90_col_to_r2p_idx(col_limit_right)
-                            col_limit_left_r2p = sm90_col_to_r2p_idx(col_limit_left)
+                            col_limit_right_r2p = col_to_r2p_idx(col_limit_right, r2p_col_stride)
+                            col_limit_left_r2p = col_to_r2p_idx(col_limit_left, r2p_col_stride)
 
                             def mask_gen_fn(s: int) -> Uint32:
                                 return r2p_bitmask_below(
                                     col_limit_right_r2p, s
                                 ) & r2p_bitmask_above(col_limit_left_r2p, s)
 
-                            mask_r2p_lambda(acc_S_mn[r, None], mask_gen_fn, rank1=True)
+                            mask_r2p_lambda(
+                                acc_S_mn[r, None],
+                                mask_gen_fn,
+                                rank1=True,
+                                use_bitwise_select=use_bitwise_r2p,
+                            )
             else:  # swap_AB
                 assert self.qhead_per_kvhead_packgqa == 1
                 thr_row_offset = tScS_mn[0][ROW]
