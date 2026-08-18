@@ -1432,6 +1432,12 @@ def _flash_attn_fwd(
                 sparse_tensors,
                 AuxData(cute_aux_tensors, aux_scalars),
             ])
+            if use_dedicated_hd256_kernel:
+                compile_args.append(
+                    Int32(max_seqlen_q)
+                    if cu_seqlens_q is not None
+                    else None
+                )
             if arch // 10 in [10, 11] and not use_dedicated_hd256_kernel:
                 compile_args.extend([
                     num_splits_dynamic_tensor,
@@ -1521,6 +1527,12 @@ def _flash_attn_fwd(
                 else None,
                 AuxData(aux_tensors, aux_scalars),
             ])
+            if use_dedicated_hd256_kernel:
+                call_args.append(
+                    max_seqlen_q
+                    if cu_seqlens_q is not None
+                    else None
+                )
             if arch // 10 in [10, 11] and not use_dedicated_hd256_kernel:
                 call_args.extend([
                     num_splits_dynamic,
@@ -2543,6 +2555,17 @@ def _flash_attn_bwd(
         ]
         if not use_dedicated_hd256_kernel:
             compile_args.append(cu_total_m_blocks_k_tensor)
+        else:
+            compile_args.extend(
+                (
+                    Int32(seqlen_q)
+                    if cu_seqlens_q is not None
+                    else None,
+                    Int32(seqlen_k)
+                    if cu_seqlens_k is not None
+                    else None,
+                )
+            )
         compile_args.append(current_stream)
 
         # TODO: check @can_implement
@@ -2587,6 +2610,17 @@ def _flash_attn_bwd(
         ]
         if not use_dedicated_hd256_kernel:
             call_args.append(cu_total_m_blocks_k)
+        else:
+            call_args.extend(
+                (
+                    seqlen_q
+                    if cu_seqlens_q is not None
+                    else None,
+                    seqlen_k
+                    if cu_seqlens_k is not None
+                    else None,
+                )
+            )
         _flash_attn_bwd.compile_cache[compile_key](*call_args)
     # Postprocess: convert dq_accum from float32 to dq in bf16/fp16
     # hd=256 2CTA backward has its own internal postprocess, skip here.
