@@ -1467,14 +1467,16 @@ class BlackwellFusedMultiHeadAttentionForward:
 
                     mO_qdl_eff = mO_qdl
                     if cutlass.const_expr(cum_seqlen_q is not None):
-                        block_offset_o = (
-                            cuseqlen_q,
-                            Int32(0),
-                            Int32(0),
-                            ((Int32(0), Int32(0)), Int32(0)),
+                        # Every packed token row is 64-element aligned, so an
+                        # arbitrary cumulative row offset preserves vector-store
+                        # alignment. Keep the divisibility proof in the IR.
+                        offset_o = cute.assume(
+                            cuseqlen_q * mO_qdl.stride[0],
+                            divby=64,
                         )
-                        mO_qdl_eff = cute.domain_offset(
-                            cute.select(block_offset_o, mode=[0, 2, 3]), mO_qdl
+                        mO_qdl_eff = cute.make_tensor(
+                            mO_qdl.iterator + offset_o,
+                            mO_qdl.layout,
                         )
 
                     # (bM, bN, loopM, loopN, loopL)

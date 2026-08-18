@@ -1983,7 +1983,14 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                 mdQ_qdl_eff = mdQ_qdl
                 if cutlass.const_expr(cum_seqlen_q is not None):
                     block_offset_dQ = (cuseqlen_q,) + (None,) * 2
-                    mdQ_qdl_eff = cute.domain_offset(block_offset_dQ, mdQ_qdl)
+                    offset_dQ = cute.assume(
+                        cuseqlen_q * mdQ_qdl.stride[0],
+                        divby=64,
+                    )
+                    mdQ_qdl_eff = cute.make_tensor(
+                        mdQ_qdl.iterator + offset_dQ,
+                        mdQ_qdl.layout,
+                    )
 
                 # (bM, bN, loopM, loopN, loopL)
                 gdQ_qdl = cute.flat_divide(
@@ -1996,20 +2003,25 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
 
                 gdQ_staged = gdQ_qdl[None, None, curr_block_coord[0], None, curr_block_coord[2]]
                 cdQ_staged = cdQ_qdl[None, None, curr_block_coord[0], None, curr_block_coord[2]]
-                gdQ_tma_staged = gdQ_staged
-
-                if cutlass.const_expr(not varlen):
-                    gdQ_tma_qdl = cute.flat_divide(
-                        mdQ_tma, cute.select(self.dsk_block_tiler, mode=[0, 1])
+                mdQ_tma_eff = mdQ_tma
+                if cutlass.const_expr(varlen):
+                    mdQ_tma_eff = cute.domain_offset(
+                        block_offset_dQ,
+                        mdQ_tma,
                     )
-                    gdQ_tma_staged = gdQ_tma_qdl[
-                        None, None, curr_block_coord[0], None, curr_block_coord[2]
-                    ]
+                gdQ_tma_qdl = cute.flat_divide(
+                    mdQ_tma_eff,
+                    cute.select(self.dsk_block_tiler, mode=[0, 1]),
+                )
+                gdQ_tma_staged = gdQ_tma_qdl[
+                    None, None, curr_block_coord[0], None, curr_block_coord[2]
+                ]
 
                 if has_work:
                     # dQ TMEM to GMEM
                     mma_dq_consumer = self.dQ_epilogue(
                         seqlen_q,
+                        curr_block_coord[0],
                         (mma_dq_consumer, gdQ_staged, cdQ_staged, tdQtdQ_staged),
                         self.epi_tile,
                         (tma_atom_dQ, gdQ_tma_staged, s_epi_dQ, varlen),
@@ -2196,6 +2208,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
     def dQ_epilogue(
         self,
         seqlen_q: int,
+        q_block: int,
         dq_args: Tuple,
         epi_tile: cute.Tile,
         tma_args: Tuple,
@@ -2234,7 +2247,14 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
             tTMEM_LOADcdQ = thr_tmem_load.partition_D(cdQ_epi)
             tTMEM_LOADcdQ_local = thr_tmem_load.partition_D(cdQ_local_epi)
 
-            if cutlass.const_expr(not varlen):
+            use_tma_store = True
+            if cutlass.const_expr(varlen):
+                use_tma_store = (
+                    q_block * self.dsk_block_tiler[0]
+                    + self.dsk_block_tiler[0]
+                    <= seqlen_q
+                )
+            if use_tma_store:
                 gdQ_tma = gdQ_tma_staged[None, None, iter]
                 gdQ_tma_epi = cute.local_tile(gdQ_tma, epi_tile_dQ, (0, None))
                 sdQ_stage = s_epi_dQ[None, None, 0]
