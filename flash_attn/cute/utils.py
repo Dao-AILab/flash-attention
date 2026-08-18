@@ -612,6 +612,44 @@ def shr_u32(val: cutlass.Uint32, shift: cutlass.Uint32, *, loc=None, ip=None) ->
     )
 
 
+@dsl_user_op
+def mask_f32_by_u32_bit(
+    value: cutlass.Float32,
+    bitmask: cutlass.Uint32,
+    bit_index: int,
+    *,
+    loc=None,
+    ip=None,
+) -> cutlass.Float32:
+    """Keep ``value`` when ``bit_index`` is set, otherwise return negative infinity.
+
+    Extract and sign-extend the bit inside the inline assembly so unrolled mask
+    applications do not keep a separate scalar or predicate live per element.
+    """
+    assert 0 <= bit_index < 32
+    return cutlass.Float32(
+        llvm.inline_asm(
+            T.f32(),
+            [
+                cutlass.Float32(value).ir_value(loc=loc, ip=ip),
+                cutlass.Uint32(bitmask).ir_value(loc=loc, ip=ip),
+            ],
+            "{\n\t"
+            ".reg .b32 keep_mask, value_bits;\n\t"
+            f"bfe.s32 keep_mask, $2, {bit_index}, 1;\n\t"
+            "mov.b32 value_bits, $1;\n\t"
+            # F(a, b, c) = c ? b : a; immLut = 0xd8.
+            "lop3.b32 value_bits, 0xff800000, value_bits, keep_mask, 0xd8;\n\t"
+            "mov.b32 $0, value_bits;\n\t"
+            "}\n",
+            "=f,f,r",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
 @cute.jit
 def warp_prefix_sum(val: cutlass.Int32, lane: Optional[cutlass.Int32] = None) -> cutlass.Int32:
     if const_expr(lane is None):

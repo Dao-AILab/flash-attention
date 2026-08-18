@@ -117,7 +117,12 @@ def _validate_head_dims(head_dim: int, head_dim_v: int, compute_capability: int,
     is_standard_range = 8 <= head_dim <= 128 and 8 <= head_dim_v <= 128
 
     is_sm90_range = 8 <= head_dim <= 256 and 8 <= head_dim_v <= 256
-    if compute_capability == 9:
+    if compute_capability == 8:
+        assert is_sm90_range and head_dim % alignment == 0 and head_dim_v % alignment == 0, (
+            f"(head_dim, head_dim_v)=({head_dim}, {head_dim_v}) is not supported on SM8x. "
+            f"head_dim and head_dim_v must be between 8 and 256 and divisible by {alignment}."
+        )
+    elif compute_capability == 9:
         assert is_sm90_range and head_dim % alignment == 0 and head_dim_v % alignment == 0, (
             f"(head_dim, head_dim_v)=({head_dim}, {head_dim_v}) is not supported on SM90. "
             f"head_dim and head_dim_v must be between 8 and 256 and divisible by {alignment}."
@@ -1851,7 +1856,9 @@ def _flash_attn_bwd(
     aux_scalars = tuple(aux_scalars) if aux_scalars else None
     fake_mode = is_fake_mode()
     arch = _get_device_arch()
-    assert arch // 10 in [9, 10, 11, 12], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x, 12.x"
+    assert arch == 80 or arch // 10 in [9, 10, 11, 12], (
+        "Unsupported compute capability. Supported: 8.0, 9.x, 10.x, 11.x, 12.x"
+    )
     if block_sparse_tensors is not None:
         assert (
             cu_seqlens_q is None
@@ -1885,10 +1892,44 @@ def _flash_attn_bwd(
 
     window_size = [window_size_left, window_size_right]
     causal, local, window_size_left, window_size_right = _resolve_causal_local_window(
-        causal, window_size_left, window_size_right
+        causal, window_size_left, window_size_right, mask_mod
     )
 
-    if arch // 10 == 12:
+    if arch // 10 == 8:
+        # Ampere uses warp-level mma.sync and has 163 KB of shared memory per SM.
+        # D<=64 uses the same 8-warp 128x128 tile shape as FlashAttention-2.
+        # D<=128 uses the original 8-warp 64x128 tile, with dKV warps spread
+        # along N to match Ampere's mma.sync accumulator ownership. Larger
+        # heads use 64-wide KV tiles to stay within SM80 shared memory.
+        max_head_dim = max(head_dim, head_dim_v)
+        m_block_size = 128 if max_head_dim <= 64 else 64
+        n_block_size = 128 if max_head_dim <= 128 else 64
+        num_stages_Q = 2 if max_head_dim <= 128 else 1
+        num_stages_dO = 2 if max_head_dim <= 128 else 1
+        if max_head_dim <= 64 and causal:
+            # Causal D64 traverses fewer Q blocks, so one pipeline stage is faster.
+            num_stages_Q = 1
+            num_stages_dO = 1
+        SdP_swapAB = False
+        dKV_swapAB = False
+        dQ_swapAB = False
+        if max_head_dim <= 64:
+            AtomLayoutMSdP = 4
+            AtomLayoutNdKV = 4
+            AtomLayoutMdQ = 4
+            num_threads = 256
+        else:
+            AtomLayoutMSdP = 2
+            AtomLayoutNdKV = 4 if n_block_size == 128 else 2
+            AtomLayoutMdQ = 2
+            num_threads = 256
+        V_in_regs = False
+        dQ_single_wg = False
+        cluster_size = 1
+        use_2cta_instrs = False
+        assert block_sparse_tensors is None, "Block sparsity backward is not supported on SM80"
+        assert deterministic is False, "Deterministic backward is not supported on SM80"
+    elif arch // 10 == 12:
         # SM120: uses SM80 MMA with 99 KB SMEM, 128 threads (4 warps).
         m_block_size = 64
         n_block_size = 64
@@ -2033,6 +2074,14 @@ def _flash_attn_bwd(
     # default, keeping the key stable with no device sync.
     single_q_block = (not torch.is_tensor(seqlen_q_rounded)) and (seqlen_q_rounded // m_block_size == 1)
     single_k_block = (not torch.is_tensor(seqlen_k_rounded)) and (seqlen_k_rounded // n_block_size == 1)
+    mask_seqlen_sm80 = not (
+        arch == 80
+        and not is_varlen
+        and isinstance(seqlen_q, int)
+        and isinstance(seqlen_k, int)
+        and seqlen_q % m_block_size == 0
+        and seqlen_k % n_block_size == 0
+    )
 
     if cu_seqlens_k is None:
         assert k.shape == (batch_size, seqlen_k, num_head_kv, head_dim)
@@ -2236,9 +2285,9 @@ def _flash_attn_bwd(
         cu_total_m_blocks=cu_total_m_blocks_q,
         fake_mode=fake_mode,
     )
-    # num_threads: SM90 derives from BwdConfig.num_wg, SM120 is set to 128 above,
-    # SM100/SM110 uses default from function signature (384).
-    if arch // 10 not in [9, 12]:
+    # num_threads: SM80/SM120 and SM90 are selected above; SM100/SM110 uses
+    # the default from the function signature (384).
+    if arch // 10 not in [8, 9, 12]:
         num_threads = 384
 
     # Backward kernel: compute dk, dv, dq_accum.
@@ -2313,6 +2362,7 @@ def _flash_attn_bwd(
             AtomLayoutNdKV,
             AtomLayoutMdQ,
             V_in_regs,
+            mask_seqlen_sm80,
             dQ_single_wg,
             deterministic,
             cu_seqlens_q is None,
@@ -2428,6 +2478,8 @@ def _flash_attn_bwd(
                 V_in_regs=V_in_regs,
                 score_mod=score_mod,
                 score_mod_bwd=score_mod_bwd,
+                mask_mod=mask_mod,
+                mask_seqlen=mask_seqlen_sm80 if arch == 80 else True,
             )
         elif arch // 10 == 9:
             fa_bwd_obj = FlashAttentionBackwardSm90(
@@ -2595,6 +2647,12 @@ def _flash_attn_bwd(
             # dQ postprocess: match main kernel's MMA WG count, unless dQ_single_wg
             num_threads_post_dQ = 128 if dQ_single_wg else cfg.num_wg * 128
             num_threads_post_dKV = cfg.num_wg * 128
+        elif arch // 10 == 8:
+            # The SM80 accumulator layout spans all MMA warps from the main
+            # kernel. Reconstruct it with the same thread count; using the
+            # generic 128-thread postprocess silently permutes dQ and GQA dK/dV.
+            num_threads_post_dQ = num_threads
+            num_threads_post_dKV = num_threads
         else:
             num_threads_post_dQ = 128
             num_threads_post_dKV = 128
