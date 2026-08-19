@@ -2288,10 +2288,9 @@ class FlashAttentionForwardSm100:
                 )
                 if not empty_tile:
                     sScale[tidx + stage * self.m_block_size] = softmax.row_sum[0]
-                    if const_expr(mLSE is not None or learnable_sink is not None):
-                        sScale[
-                            tidx + stage * self.m_block_size + self.q_stage * self.m_block_size
-                        ] = softmax.row_max[0]
+                    sScale[
+                        tidx + stage * self.m_block_size + self.q_stage * self.m_block_size
+                    ] = softmax.row_max[0]
                     # if tidx == 0:
                     #     cute.printf("softmax row sum stage %d: %f, row_max = %f\n", stage, softmax.row_sum[0], softmax.row_max[0])
                     # See block_sparse_utils.py NOTE [SM100 block-sparse empty tiles: mbarrier contract].
@@ -2359,10 +2358,9 @@ class FlashAttentionForwardSm100:
 
                     # Dense path always writes scale / signals
                     sScale[tidx + stage * self.m_block_size] = softmax.row_sum[0]
-                    if const_expr(mLSE is not None or learnable_sink is not None):
-                        sScale[
-                            tidx + stage * self.m_block_size + self.q_stage * self.m_block_size
-                        ] = softmax.row_max[0]
+                    sScale[
+                        tidx + stage * self.m_block_size + self.q_stage * self.m_block_size
+                    ] = softmax.row_max[0]
                     # pipeline_sm_stats.producer_commit_w_index(stage)
                     sm_stats_barrier.arrive_w_index(index=stage * 4 + warp_idx)
 
@@ -2645,7 +2643,7 @@ class FlashAttentionForwardSm100:
                 gO = cute.flat_divide(gO, (self.mma_tiler_pv[0] // self.cta_group_size,))[None, mma_tile_coord_v, None, None]
 
             # Default LSE to -inf for invalid split_idx tiles
-            stats = [(0.0, -Float32.inf if const_expr(mLSE is not None or learnable_sink is not None) else None, True)] * self.q_stage
+            stats = [(0.0, -Float32.inf, True)] * self.q_stage
 
             if const_expr(self.use_block_sparsity):
                 total_block_count = get_total_block_count(
@@ -2723,10 +2721,7 @@ class FlashAttentionForwardSm100:
                     # cute.arch.fence_view_async_tmem_load()
                     # scale = tSrScale_t2r[0]
                     row_sum = sScale[tidx + stage * self.m_block_size]
-                    if const_expr(mLSE is not None or learnable_sink is not None):
-                        row_max = sScale[tidx + stage * self.m_block_size + self.q_stage * self.m_block_size]
-                    else:
-                        row_max = None
+                    row_max = sScale[tidx + stage * self.m_block_size + self.q_stage * self.m_block_size]
                     pipeline_sm_stats.consumer_release_w_index(stage)
                     if const_expr(learnable_sink is not None):
                         LOG2_E = math.log2(math.e)
@@ -2829,37 +2824,40 @@ class FlashAttentionForwardSm100:
                         mLSE_cur = cute.domain_offset((offset,), mLSE[None, head_idx, split_idx])
                     else:
                         mLSE_cur = cute.domain_offset((offset,), mLSE[None, head_idx])
-                for stage in cutlass.range_constexpr(self.q_stage):
-                    m_tile_idx = (m_block * self.q_stage + stage) * self.cta_group_size + mma_tile_coord_v
-                    row_sum, row_max, acc_O_mn_row_is_zero_or_nan = stats[stage]
-                    # if tidx == 0 and stage <= 1:
-                    #     cute.printf("row_sum = {}, row_max = {}, acc_O_mn_row_is_zero_or_nan = {}\n", row_sum, row_max, acc_O_mn_row_is_zero_or_nan)
-                    LN2 = math.log(2.0)
-                    lse = (
-                        (row_max * softmax_scale_log2_eff + (cute.math.log2(row_sum, fastmath=True) - max_offset)) * LN2
-                        if not acc_O_mn_row_is_zero_or_nan
-                        else -Float32.inf
-                    )
-                    seqlen_q = (
-                        seqlen.seqlen_q
-                        if const_expr(not self.pack_gqa)
-                        else seqlen.seqlen_q * self.qhead_per_kvhead
-                    )
-                    if const_expr(not self.pack_gqa or self.m_block_size % self.qhead_per_kvhead == 0):
-                        gLSE = cute.local_tile(mLSE_cur, (self.m_block_size,), (m_tile_idx,))
-                        if tidx < seqlen_q - m_tile_idx * self.m_block_size:
-                            # This actually just works with PackGQA too
-                            gLSE[tidx] = lse
-                    else:
-                        idx = m_tile_idx * self.m_block_size + tidx
-                        if idx < seqlen_q:
-                            m_idx = idx // self.qhead_per_kvhead
-                            h_idx = idx - m_idx * self.qhead_per_kvhead
-                            lse_ptr_i64 = utils.elem_pointer(mLSE_cur, ((h_idx, m_idx),)).toint()
-                            lse_gmem_ptr = cute.make_ptr(
-                                mLSE_cur.element_type, lse_ptr_i64, cute.AddressSpace.gmem, assumed_align=4
-                            )
-                            cute.make_tensor(lse_gmem_ptr, (1,))[0] = lse
+            for stage in cutlass.range_constexpr(self.q_stage):
+                m_tile_idx = (m_block * self.q_stage + stage) * self.cta_group_size + mma_tile_coord_v
+                row_sum, row_max, acc_O_mn_row_is_zero_or_nan = stats[stage]
+                # if tidx == 0 and stage <= 1:
+                #     cute.printf("row_sum = {}, row_max = {}, acc_O_mn_row_is_zero_or_nan = {}\n", row_sum, row_max, acc_O_mn_row_is_zero_or_nan)
+                LN2 = math.log(2.0)
+                lse = (
+                    (row_max * softmax_scale_log2_eff + (cute.math.log2(row_sum, fastmath=True) - max_offset)) * LN2
+                    if not acc_O_mn_row_is_zero_or_nan
+                    else -Float32.inf
+                )
+                seqlen_q = (
+                    seqlen.seqlen_q
+                    if const_expr(not self.pack_gqa)
+                    else seqlen.seqlen_q * self.qhead_per_kvhead
+                )
+                if const_expr(mLSE is None):
+                    # Keep the combine live without a user-visible store.
+                    sScale[tidx + stage * self.m_block_size] = lse
+                elif const_expr(not self.pack_gqa or self.m_block_size % self.qhead_per_kvhead == 0):
+                    gLSE = cute.local_tile(mLSE_cur, (self.m_block_size,), (m_tile_idx,))
+                    if tidx < seqlen_q - m_tile_idx * self.m_block_size:
+                        # This actually just works with PackGQA too
+                        gLSE[tidx] = lse
+                else:
+                    idx = m_tile_idx * self.m_block_size + tidx
+                    if idx < seqlen_q:
+                        m_idx = idx // self.qhead_per_kvhead
+                        h_idx = idx - m_idx * self.qhead_per_kvhead
+                        lse_ptr_i64 = utils.elem_pointer(mLSE_cur, ((h_idx, m_idx),)).toint()
+                        lse_gmem_ptr = cute.make_ptr(
+                            mLSE_cur.element_type, lse_ptr_i64, cute.AddressSpace.gmem, assumed_align=4
+                        )
+                        cute.make_tensor(lse_gmem_ptr, (1,))[0] = lse
 
             if const_expr(pipeline_load_epi is not None and self.use_correction_warps_for_epi):
                 pipeline_load_epi.producer_acquire(load_epi_producer_state)
