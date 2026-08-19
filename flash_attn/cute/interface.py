@@ -783,6 +783,44 @@ def _flash_attn_fwd(
     if cu_seqlens_k is None and seqused_k is None:
         min_seqlen_k = seqlen_k
 
+    # hd=256 2CTA forward uses dedicated kernel (Blackwell family)
+    use_dedicated_hd256_kernel = arch // 10 in [10, 11] and head_dim == 256 and head_dim_v == 256
+
+    if use_dedicated_hd256_kernel and page_table is not None:
+        # The dedicated kernel takes its paged KV extent from the page-table
+        # width (`max_seqlen_k_paged = mPageTable.shape[1] * page_size`), so the
+        # table has to describe exactly ceil(max_seqlen_k / page_size) pages.
+        # Continuous-batching servers cannot satisfy that directly: they hand
+        # over the current batch maximum as `max_seqlen_k` (arbitrary, rarely
+        # page-aligned) together with a `page_table` whose width is fixed by the
+        # largest supported context, not by this batch. Normalize both here
+        # instead of requiring every caller to pre-slice: widen the KV extent to
+        # the enclosing page boundary and narrow the table to match.
+        #
+        # This must run before `_get_fwd_config`, the compile key and the page
+        # table conversion below, so tile selection, kernel specialization and
+        # the device-side tensor all see the same (normalized) values.
+        required_pages = (max_seqlen_k + page_size - 1) // page_size
+        assert page_table.shape[1] >= required_pages, (
+            f"SM100 hd256 2CTA paged KV requires page_table to cover max_seqlen_k="
+            f"{max_seqlen_k}, i.e. at least ceil({max_seqlen_k} / {page_size}) = "
+            f"{required_pages} pages, got page_table.shape[1]={page_table.shape[1]}"
+        )
+        if max_seqlen_k % page_size != 0:
+            # Rounding the extent up only stays faithful to the caller's request
+            # if something still bounds each sequence at its true length;
+            # seqused_k is that bound (positions in [seqused_k, rounded) mask to
+            # exact-zero probability). Without it every sequence would silently
+            # attend to the remainder of its last page.
+            assert seqused_k is not None, (
+                f"SM100 hd256 2CTA paged KV rounds max_seqlen_k up to the page "
+                f"boundary ({max_seqlen_k} -> {required_pages * page_size}); pass "
+                f"seqused_k with the per-batch KV lengths so the tail inside the "
+                f"last page is masked, or pass a page-aligned max_seqlen_k"
+            )
+        page_table = page_table[:, :required_pages]
+        max_seqlen_k = required_pages * page_size
+
     fwd_cfg = _get_fwd_config(
         arch=arch,
         head_dim=head_dim,
@@ -835,8 +873,6 @@ def _flash_attn_fwd(
         and (tile_m % qhead_per_kvhead == 0 or not pack_gqa)
     )
 
-    # hd=256 2CTA forward uses dedicated kernel (Blackwell family)
-    use_dedicated_hd256_kernel = arch // 10 in [10, 11] and head_dim == 256 and head_dim_v == 256
     use_2cta_instrs = use_2cta_instrs or use_dedicated_hd256_kernel
 
     if softcap is not None:
@@ -1316,18 +1352,9 @@ def _flash_attn_fwd(
                     # silently mis-addressed, so reject it loudly.
                     assert cu_seqlens_k is None or cu_seqlens_q is not None, \
                         "SM100 forward with head_dim=256 requires cu_seqlens_q when cu_seqlens_k is used"
-                    if page_table is not None:
-                        assert max_seqlen_k % page_size == 0, (
-                            f"SM100 hd256 2CTA paged KV requires max_seqlen_k divisible by "
-                            f"page_size ({page_size}), got max_seqlen_k={max_seqlen_k}"
-                        )
-                        assert page_table.shape[1] == max_seqlen_k // page_size, (
-                            f"SM100 hd256 2CTA paged KV requires page_table.shape[1] == "
-                            f"max_seqlen_k // page_size ({max_seqlen_k} // {page_size} = "
-                            f"{max_seqlen_k // page_size}), got {page_table.shape[1]}; "
-                            f"pass page_table[:, :{max_seqlen_k // page_size}] to slice to "
-                            f"the actual sequence length"
-                        )
+                    # The paged-KV extent/page-table contract is normalized
+                    # up front (see the page_table block above), so it holds by
+                    # construction here.
                     # pack_gqa is an auto-selected optimization; disable it for hd256 kernel
                     pack_gqa = False
 
