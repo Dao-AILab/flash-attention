@@ -951,8 +951,11 @@ def test_flash_attn_varlen_output(
             pytest.skip("SM100 head_dim=256 2CTA kernel does not support softcap yet")
         if deterministic:
             pytest.skip("SM100 head_dim=256 2CTA kernel does not support deterministic mode yet")
-        if not unpad_q or not unpad_kv:
-            pytest.skip("SM100 head_dim=256 2CTA kernel does not support seqused_q/seqused_k mode yet (requires unpad_q=True and unpad_kv=True)")
+        if not unpad_q and unpad_kv:
+            pytest.skip(
+                "SM100 head_dim=256 2CTA kernel does not support varlen-packed K "
+                "without varlen Q (cu_seqlens_k requires cu_seqlens_q)"
+            )
     if (
         causal or local
     ):  # Right now reference only supports causal attention with seqlen_k == seqlen_q
@@ -1260,7 +1263,9 @@ def test_flash_attn_varlen_output(
             and (
                 (dv == d and d <= 128)
                 or (d == 192 and dv == 128)
-                or (IS_SM100 and d == 256 and dv == 256 and softcap == 0.0)
+                # hd256 backward does not support seqused_q/seqused_k yet, so
+                # only run it in the fully-unpadded (cu_seqlens-only) mode.
+                or (IS_SM100 and d == 256 and dv == 256 and softcap == 0.0 and unpad_q and unpad_kv)
             )
             and not has_learnable_sink
             # and False
@@ -2655,6 +2660,194 @@ def test_flash_attn_paged_hd256_sm100_tma_shuffled():
     assert torch.allclose(out_paged, out_ref, atol=1e-3, rtol=1e-3), (
         "Shuffled paged output does not match non-paged reference"
     )
+
+
+@pytest.mark.parametrize("seqlen_q", [1, 120])
+@pytest.mark.parametrize("max_seqlen_k_mode", ["batch_max", "page_aligned"])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_paged_hd256_sm100_tma_seqused_k(max_seqlen_k_mode, seqlen_q):
+    """Per-batch KV lengths (seqused_k) in the SM100 hd256 2CTA forward kernel.
+
+    Shaped after what a continuous-batching server hands the decoder: a paged
+    KV cache, a ``page_table`` whose width is fixed by the largest supported
+    context (wider than this batch needs), ``seqused_k`` carrying the actual
+    per-batch KV lengths, and ``max_seqlen_k`` as the current batch maximum.
+
+    ``max_seqlen_k_mode`` covers both callers:
+
+    * ``batch_max``    - ``max(seqused_k)`` (257 here), i.e. neither page-aligned
+      nor equal to ``page_table.shape[1] * page_size``. This is what vLLM's
+      decoder passes; the interface normalizes it up to the enclosing page and
+      narrows the table.
+    * ``page_aligned`` - the allocated capacity (512), what a caller that
+      pre-slices to the kernel's original contract passes.
+
+    Both must agree with a dense varlen reference over the true per-batch
+    lengths. KV beyond each sequence's ``seqused_k`` - the tail inside its last
+    page and every page after it - is poisoned with large finite values, so
+    attending past ``seqused_k`` (for instance if rounding the extent up leaked
+    into the last page) is a gross mismatch rather than a rounding difference.
+    Finite poison rather than NaN on purpose: masked positions still contribute
+    ``0 * value`` to the PV accumulation, and ``0 * NaN`` would poison a correct
+    kernel too.
+    """
+    if not IS_SM100:
+        pytest.skip("SM100-specific paged hd256 test")
+    device = "cuda"
+    dtype = torch.bfloat16
+    d = 256
+    nheads = 8
+    nheads_kv = 8
+    page_size = 128
+    # Allocated KV capacity per sequence (the page_table spans all of it).
+    seqlen_k_alloc = 512
+    num_pages_per_seq = seqlen_k_alloc // page_size
+    # Per-batch actual lengths: page-aligned, one past a page boundary, and
+    # mid-page. The batch maximum (257) is deliberately not page-aligned and
+    # needs only 3 of the table's 4 pages.
+    seqused_k_list = [128, 129, 257]
+    batch_size = len(seqused_k_list)
+    total_pages = batch_size * num_pages_per_seq
+    assert all(seqlen_q <= s <= seqlen_k_alloc for s in seqused_k_list)
+    max_seqlen_k = max(seqused_k_list) if max_seqlen_k_mode == "batch_max" else seqlen_k_alloc
+    # The shape under test: the table is wider than the requested extent needs.
+    if max_seqlen_k_mode == "batch_max":
+        assert max_seqlen_k % page_size != 0
+        assert -(-max_seqlen_k // page_size) < num_pages_per_seq
+
+    torch.random.manual_seed(0)
+    q = torch.randn(batch_size * seqlen_q, nheads, d, device=device, dtype=dtype)
+    cu_seqlens_q = torch.arange(0, batch_size + 1, dtype=torch.int32, device=device) * seqlen_q
+    # Packed dense K/V holding only the used tokens of each sequence.
+    k_offsets = [0] + list(itertools.accumulate(seqused_k_list))
+    k = torch.randn(k_offsets[-1], nheads_kv, d, device=device, dtype=dtype)
+    v = torch.randn(k_offsets[-1], nheads_kv, d, device=device, dtype=dtype)
+    cu_seqlens_k = torch.tensor(k_offsets, dtype=torch.int32, device=device)
+    seqused_k = torch.tensor(seqused_k_list, dtype=torch.int32, device=device)
+
+    # Dense varlen reference over the exact per-batch lengths.
+    out_ref, _ = flash_attn_varlen_func(
+        q, k, v,
+        cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=seqlen_q, max_seqlen_k=max(seqused_k_list),
+        causal=True,
+    )
+
+    # Paged layout at full capacity, everything past seqused_k poisoned.
+    k_paged = torch.full(
+        (total_pages, page_size, nheads_kv, d), 300.0, device=device, dtype=dtype
+    )
+    v_paged = torch.full_like(k_paged, 300.0)
+    for b in range(batch_size):
+        for s in range(seqused_k_list[b]):
+            pi = b * num_pages_per_seq + s // page_size
+            po = s % page_size
+            k_paged[pi, po] = k[k_offsets[b] + s]
+            v_paged[pi, po] = v[k_offsets[b] + s]
+    page_table = torch.arange(total_pages, dtype=torch.int32, device=device).reshape(
+        batch_size, num_pages_per_seq
+    )
+
+    out_paged, _ = flash_attn_varlen_func(
+        q, k_paged, v_paged,
+        cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=None,
+        max_seqlen_q=seqlen_q, max_seqlen_k=max_seqlen_k,
+        page_table=page_table,
+        seqused_k=seqused_k,
+        causal=True,
+    )
+
+    # With seqused_k at the allocated capacity every position is legitimately
+    # attended (poison included), so passing seqused_k must be indistinguishable
+    # from not passing it at all.
+    seqused_full = torch.full(
+        (batch_size,), seqlen_k_alloc, dtype=torch.int32, device=device
+    )
+    out_full_seqused, _ = flash_attn_varlen_func(
+        q, k_paged, v_paged,
+        cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=None,
+        max_seqlen_q=seqlen_q, max_seqlen_k=seqlen_k_alloc,
+        page_table=page_table,
+        seqused_k=seqused_full,
+        causal=True,
+    )
+    out_no_seqused, _ = flash_attn_varlen_func(
+        q, k_paged, v_paged,
+        cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=None,
+        max_seqlen_q=seqlen_q, max_seqlen_k=seqlen_k_alloc,
+        page_table=page_table,
+        causal=True,
+    )
+
+    if is_fake_mode():
+        return
+
+    print(f"Paged seqused_k vs dense varlen max diff: {(out_paged - out_ref).abs().max().item()}")
+    assert out_paged.isfinite().all(), "Paged seqused_k output is not finite"
+    # The poison is ~300 against unit-normal data: any leak past seqused_k moves
+    # the output far outside the reference's range.
+    assert out_paged.abs().max().item() < 10.0, (
+        "Paged seqused_k output has poison-scale magnitudes: KV past seqused_k leaked"
+    )
+    assert torch.allclose(out_paged, out_ref, atol=1e-3, rtol=1e-3), (
+        "Paged seqused_k output does not match the dense varlen reference"
+    )
+    assert torch.equal(out_full_seqused, out_no_seqused), (
+        "seqused_k equal to the allocated length must match the non-seqused path"
+    )
+
+
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_paged_hd256_sm100_tma_contract_guards():
+    """The two paged-KV contract guards of the SM100 hd256 2CTA forward kernel.
+
+    The interface widens ``max_seqlen_k`` to the enclosing page and narrows the
+    ``page_table`` to match, which is only well defined when (a) the table
+    actually covers the requested extent and (b) something bounds each sequence
+    at its true length once the extent is rounded up.
+    """
+    if not IS_SM100:
+        pytest.skip("SM100-specific paged hd256 test")
+    device = "cuda"
+    dtype = torch.bfloat16
+    d = 256
+    nheads = 8
+    nheads_kv = 8
+    page_size = 128
+    seqlen_q = 1
+    batch_size = 2
+    num_pages_per_seq = 2
+    total_pages = batch_size * num_pages_per_seq
+
+    q = torch.randn(batch_size * seqlen_q, nheads, d, device=device, dtype=dtype)
+    cu_seqlens_q = torch.arange(0, batch_size + 1, dtype=torch.int32, device=device) * seqlen_q
+    k_paged = torch.randn(total_pages, page_size, nheads_kv, d, device=device, dtype=dtype)
+    v_paged = torch.randn_like(k_paged)
+    page_table = torch.arange(total_pages, dtype=torch.int32, device=device).reshape(
+        batch_size, num_pages_per_seq
+    )
+    seqused_k = torch.full((batch_size,), 200, dtype=torch.int32, device=device)
+
+    # (a) page_table narrower than the requested extent needs.
+    with pytest.raises(AssertionError, match="page_table to cover max_seqlen_k"):
+        flash_attn_varlen_func(
+            q, k_paged, v_paged,
+            cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=None,
+            max_seqlen_q=seqlen_q, max_seqlen_k=num_pages_per_seq * page_size + 1,
+            page_table=page_table,
+            seqused_k=seqused_k,
+            causal=True,
+        )
+
+    # (b) extent that needs rounding, with nothing bounding the true lengths.
+    with pytest.raises(AssertionError, match="rounds max_seqlen_k up"):
+        flash_attn_varlen_func(
+            q, k_paged, v_paged,
+            cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=None,
+            max_seqlen_q=seqlen_q, max_seqlen_k=page_size + 1,
+            page_table=page_table,
+            causal=True,
+        )
 
 
 @pytest.mark.parametrize("head_dim", [4, 148, 288])
