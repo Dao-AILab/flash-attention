@@ -951,8 +951,11 @@ def test_flash_attn_varlen_output(
             pytest.skip("SM100 head_dim=256 2CTA kernel does not support softcap yet")
         if deterministic:
             pytest.skip("SM100 head_dim=256 2CTA kernel does not support deterministic mode yet")
-        if not unpad_q or not unpad_kv:
-            pytest.skip("SM100 head_dim=256 2CTA kernel does not support seqused_q/seqused_k mode yet (requires unpad_q=True and unpad_kv=True)")
+        if not unpad_q and unpad_kv:
+            pytest.skip(
+                "SM100 head_dim=256 2CTA kernel does not support varlen-packed K "
+                "without varlen Q (cu_seqlens_k requires cu_seqlens_q)"
+            )
     if (
         causal or local
     ):  # Right now reference only supports causal attention with seqlen_k == seqlen_q
@@ -1260,7 +1263,9 @@ def test_flash_attn_varlen_output(
             and (
                 (dv == d and d <= 128)
                 or (d == 192 and dv == 128)
-                or (IS_SM100 and d == 256 and dv == 256 and softcap == 0.0)
+                # hd256 backward does not support seqused_q/seqused_k yet, so
+                # only run it in the fully-unpadded (cu_seqlens-only) mode.
+                or (IS_SM100 and d == 256 and dv == 256 and softcap == 0.0 and unpad_q and unpad_kv)
             )
             and not has_learnable_sink
             # and False
