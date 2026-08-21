@@ -555,7 +555,12 @@ of a baseline implementation in Pytorch (for different head dimensions, input
 dtype, sequence length, causal / non-causal).
 
 To run the tests:
+Prepare/install FlashAttention using the installation instructions above in a
+compatible PyTorch and CUDA or ROCm environment. `pip install einops pytest`
+only installs the test dependencies; FlashAttention must still be prepared
+according to the installation instructions above.
 ```sh
+pip install einops pytest
 pytest -q -s tests/test_flash_attn.py
 ```
 ## When you encounter issues
