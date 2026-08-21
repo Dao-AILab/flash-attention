@@ -2196,6 +2196,31 @@ def _flash_attn_bwd(
 
     dtype = torch2cute_dtype_map[q.dtype]
 
+    # On SM100/SM110, varlen MHA uses the non-TMA dK/dV epilogue store, which writes
+    # tile_hdim (a multiple of 32) columns per row and has no head-dim OOB predication
+    # (unlike the TMA store used elsewhere). When head_dim is not a multiple of 32 the
+    # store would spill past the real head_dim into neighboring memory and corrupt
+    # dK/dV. Route the store through a head-dim-padded scratch buffer, then slice back
+    # to head_dim. Other arches predicate their dK/dV store, so they skip the scratch
+    # buffers entirely rather than pay the extra alloc + copy.
+    head_dim_v_rounded = (head_dim_v + 32 - 1) // 32 * 32
+    dkv_hdim_pad = (
+        arch // 10 in [10, 11]
+        and not dKV_postprocess
+        and cu_seqlens_k is not None
+        and (head_dim != head_dim_rounded or head_dim_v != head_dim_v_rounded)
+    )
+    dk_final, dv_final = dk, dv
+    if dkv_hdim_pad:
+        if head_dim != head_dim_rounded:
+            dk = torch.empty(
+                *dk_final.shape[:-1], head_dim_rounded, dtype=out_torch_dtype, device=device
+            )
+        if head_dim_v != head_dim_v_rounded:
+            dv = torch.empty(
+                *dv_final.shape[:-1], head_dim_v_rounded, dtype=out_torch_dtype, device=device
+            )
+
     if deterministic:
         dQ_semaphore = torch.zeros(batch_size, num_head, seqlen_q_rounded // m_block_size, cluster_size, dtype=torch.int32, device=device)
     else:
@@ -2635,6 +2660,14 @@ def _flash_attn_bwd(
                 cu_total_m_blocks=cu_total_m_blocks_k if cluster_size == 1 else None,
                 fake_mode=fake_mode,
             )
+
+    if dkv_hdim_pad:
+        if not is_fake_mode():
+            if head_dim != head_dim_rounded:
+                dk_final.copy_(dk[..., :head_dim])
+            if head_dim_v != head_dim_v_rounded:
+                dv_final.copy_(dv[..., :head_dim_v])
+        dk, dv = dk_final, dv_final
 
     return (dq, dk, dv) if learnable_sink is None else (dq, dk, dv, dsink)
 

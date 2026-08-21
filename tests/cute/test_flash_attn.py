@@ -197,6 +197,65 @@ def test_flash_attn_value_dim_larger_than_query_dim():
     torch.testing.assert_close(out.float(), reference, atol=0.04, rtol=0.04)
 
 
+@pytest.mark.parametrize("head_dim", [72, 104])
+@pytest.mark.parametrize("causal", [False, True])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_varlen_backward_non_aligned_head_dim(head_dim, causal):
+    torch.manual_seed(0)
+    device = "cuda"
+    dtype = torch.bfloat16
+    seqlens = [97, 128]
+    total_seqlen = sum(seqlens)
+    nheads = 4
+    cu_seqlens = torch.tensor(
+        [0, seqlens[0], total_seqlen], device=device, dtype=torch.int32
+    )
+
+    q = torch.randn(
+        total_seqlen, nheads, head_dim, device=device, dtype=dtype, requires_grad=True
+    )
+    k = torch.randn_like(q, requires_grad=True)
+    v = torch.randn_like(q, requires_grad=True)
+    out, _ = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_k=cu_seqlens,
+        max_seqlen_q=max(seqlens),
+        max_seqlen_k=max(seqlens),
+        causal=causal,
+    )
+    dout = torch.randn_like(out)
+    grads = torch.autograd.grad(out, (q, k, v), dout)
+
+    if is_fake_mode():
+        return
+
+    q_ref = q.detach().float().requires_grad_()
+    k_ref = k.detach().float().requires_grad_()
+    v_ref = v.detach().float().requires_grad_()
+    out_ref_chunks = []
+    offset = 0
+    for seqlen in seqlens:
+        seq_slice = slice(offset, offset + seqlen)
+        out_ref = torch.nn.functional.scaled_dot_product_attention(
+            q_ref[seq_slice].transpose(0, 1).unsqueeze(0),
+            k_ref[seq_slice].transpose(0, 1).unsqueeze(0),
+            v_ref[seq_slice].transpose(0, 1).unsqueeze(0),
+            dropout_p=0.0,
+            is_causal=causal,
+        )
+        out_ref_chunks.append(out_ref.squeeze(0).transpose(0, 1))
+        offset += seqlen
+    out_ref = torch.cat(out_ref_chunks, dim=0)
+    grads_ref = torch.autograd.grad(out_ref, (q_ref, k_ref, v_ref), dout.float())
+
+    torch.testing.assert_close(out.float(), out_ref, atol=0.04, rtol=0.04)
+    for grad, grad_ref in zip(grads, grads_ref, strict=True):
+        torch.testing.assert_close(grad.float(), grad_ref, atol=0.05, rtol=0.05)
+
+
 @pytest.mark.skipif(
     torch.cuda.get_device_capability()[0] not in [10, 11] or USE_FAKE_TENSOR,
     reason="SM100/SM110 runtime paged-KV tail-loading test",
