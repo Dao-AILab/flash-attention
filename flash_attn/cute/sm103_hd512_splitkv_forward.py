@@ -1791,7 +1791,7 @@ def run_sm103_hd512_splitkv_decode(
         cutlass_torch.current_stream(),
     )
 
-    from flash_attn.cute.sm103_hd512_splitkv_combine import (
+    from .sm103_hd512_splitkv_combine import (
         run_sm103_hd512_splitkv_combine,
     )
 
