@@ -29,8 +29,6 @@ if os.environ.get("CUTE_DSL_PTXAS_PATH", None) is not None:
 from flash_attn.cute import utils
 from flash_attn.cute import fa_logging
 from flash_attn.cute.cute_dsl_utils import (
-    cutlass_float32,
-    cutlass_int32,
     get_aux_tensor_metadata,
     get_broadcast_dims,
     get_num_sms_for_selection,
@@ -1218,7 +1216,7 @@ def _flash_attn_fwd(
             mV=v,
             mO=out,
             mLSE=lse,
-            softmax_scale=cutlass_float32(softmax_scale),
+            softmax_scale=Float32(softmax_scale),
             mP=p,
             mRowMax=row_max,
             mIndexTopk=gather_kv_indices,
@@ -1228,10 +1226,10 @@ def _flash_attn_fwd(
             mSeqUsedK=seqused_k,
             mPageTable=page_table,
             window_size_left=(
-                cutlass_int32(window_size_left) if window_size_left is not None else None
+                Int32(window_size_left) if window_size_left is not None else None
             ),
             window_size_right=(
-                cutlass_int32(window_size_right) if window_size_right is not None else None
+                Int32(window_size_right) if window_size_right is not None else None
             ),
             learnable_sink=learnable_sink,
             descale_tensors=descale_tensors,
@@ -1248,7 +1246,7 @@ def _flash_attn_fwd(
             mCuTotalMBlocks=cu_total_m_blocks if not is_mla else None,
             mCuTotalSplitsMBlocks=cu_total_splits_m_blocks if not is_mla else None,
             mBlocksToBatchIdx=blocks_to_batch_idx if pass_scheduler_args else None,
-            max_seqlen_q=cutlass_int32(max_seqlen_q) if pass_scheduler_args else None,
+            max_seqlen_q=Int32(max_seqlen_q) if pass_scheduler_args else None,
         )
 
     if compile_key not in _flash_attn_fwd.compile_cache:
@@ -2420,16 +2418,16 @@ def _flash_attn_bwd(
             mdQaccum=dq_accum,
             mdK=dk,
             mdV=dv,
-            softmax_scale=cutlass_float32(softmax_scale),
+            softmax_scale=Float32(softmax_scale),
             mCuSeqlensQ=cu_seqlens_q,
             mCuSeqlensK=cu_seqlens_k,
             mSeqUsedQ=seqused_q,
             mSeqUsedK=seqused_k,
             window_size_left=(
-                cutlass_int32(window_size_left) if window_size_left is not None else None
+                Int32(window_size_left) if window_size_left is not None else None
             ),
             window_size_right=(
-                cutlass_int32(window_size_right) if window_size_right is not None else None
+                Int32(window_size_right) if window_size_right is not None else None
             ),
             mdQ_semaphore=dQ_semaphore,
             mdK_semaphore=dK_semaphore,
