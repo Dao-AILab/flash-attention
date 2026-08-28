@@ -11,6 +11,7 @@ import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync
 from cutlass import Float32, Int32, Boolean, const_expr
+from cutlass.base_dsl.dsl import BaseDSL
 
 from quack.cute_dsl_utils import ParamsBase
 
@@ -62,6 +63,17 @@ class FlashAttentionForwardCombine:
         self.num_threads = num_threads
         self.is_even_k = head_dim % k_block_size == 0
         self.stages = stages
+        # Programmatic dependent launch (griddepcontrol.wait) requires sm_90+.
+        # On SM80 / SM120 (compiled as an sm_80-compatible target) the
+        # instruction is illegal, so gate it out.  The launch below does not
+        # request dependent grids anyway, so skipping the wait is correct on
+        # every target.
+        arch = BaseDSL._get_dsl().get_arch_enum()
+        self.arch_int = arch.major * 10 + arch.minor
+        # sm_90/sm_100/sm_110 support griddepcontrol.wait; sm_120 (consumer
+        # Blackwell, compiled as an sm_80-compatible target here) does not, so
+        # exclude arch 12 explicitly even though arch_int (120) is >= 90.
+        self.use_pdl = self.arch_int >= 90 and self.arch_int // 10 != 12
 
     @staticmethod
     def can_implement(
@@ -406,7 +418,8 @@ class FlashAttentionForwardCombine:
                 and bidy == cute.arch.grid_dim()[1] - 1
                 and bidz == cute.arch.grid_dim()[2] - 1
             ):
-                cute.arch.griddepcontrol_wait()
+                if const_expr(self.use_pdl):
+                    cute.arch.griddepcontrol_wait()
                 semaphore_to_reset[0] = 0
 
         if work_tile.is_valid_tile:
@@ -436,7 +449,8 @@ class FlashAttentionForwardCombine:
                 const_expr(not varlen) or m_block * self.tile_m < max_idx
             ):
                 # Wait for dependent grids (e.g., the main attention kernel that produces O_partial/LSE_partial)
-                cute.arch.griddepcontrol_wait()
+                if const_expr(self.use_pdl):
+                    cute.arch.griddepcontrol_wait()
 
                 # ===============================
                 # Step 1: Load LSE_partial from gmem to shared memory

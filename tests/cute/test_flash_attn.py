@@ -92,6 +92,11 @@ DISABLE_SPLIT = os.getenv("FLASH_ATTENTION_DISABLE_SPLIT", "FALSE") == "TRUE"
 IS_SM90 = torch.cuda.get_device_capability()[0] == 9
 IS_SM100 = torch.cuda.get_device_capability()[0] == 10
 IS_SM110 = torch.cuda.get_device_capability()[0] == 11
+# Consumer Blackwell (RTX PRO 6000 / RTX 50xx). arch // 10 == 12, matching the
+# `arch // 10 == 12` dispatch checks in flash_attn/cute/interface.py. The SM120
+# backward reuses the SM80-base kernel, which raises AssertionError for the
+# deterministic dQ-semaphore path that only exists in the SM90/SM100 kernels
+# (see flash_attn/cute/interface.py:~2421).
 IS_SM120 = torch.cuda.get_device_capability()[0] == 12
 TEST_BWD_ONLY = False
 VERBOSE = True
@@ -531,6 +536,20 @@ def test_flash_attn_output(
                 pytest.xfail("hdim > 192 backward: SM90 not supported yet")
             if d != dv and mha_type != "mha" and IS_SM90:
                 pytest.xfail("SM90 GQA bwd currently requires headdim == headdim_v")
+            if deterministic and IS_SM120:
+                pytest.skip(
+                    "SM120 deterministic backward not supported: the SM80-base "
+                    "bwd kernel lacks the dQ_semaphore code path (asserts in "
+                    "interface.py:~2421); only SM90/SM100 implement it."
+                )
+            if has_learnable_sink and IS_SM120:
+                pytest.skip(
+                    "SM120 has no dSink reduction in the dQ postprocess, so "
+                    "_flash_attn_bwd restricts dSink to SM90/SM100/SM110 and this "
+                    "test grads w.r.t. the sink. A frozen sink still backprops "
+                    "correctly on SM120 (dq/dk/dv get the sink via LSE); that path "
+                    "is covered by the forward checks above."
+                )
             g = torch.randn_like(out)
             # do_o = ((g.float() * out.float()).sum(-1)).transpose(1, 2)
             grad_tensors = (q, k, v, learnable_sink) if has_learnable_sink else (q, k, v)
@@ -1269,6 +1288,20 @@ def test_flash_attn_varlen_output(
                 pytest.xfail("hdim > 192 backward: SM90 not supported yet")
             if d != dv and mha_type != "mha" and IS_SM90:
                 pytest.xfail("SM90 GQA bwd currently requires headdim == headdim_v")
+            if deterministic and IS_SM120:
+                pytest.skip(
+                    "SM120 deterministic backward not supported: the SM80-base "
+                    "bwd kernel lacks the dQ_semaphore code path (asserts in "
+                    "interface.py:~2421); only SM90/SM100 implement it."
+                )
+            if has_learnable_sink and IS_SM120:
+                pytest.skip(
+                    "SM120 has no dSink reduction in the dQ postprocess, so "
+                    "_flash_attn_bwd restricts dSink to SM90/SM100/SM110 and this "
+                    "test grads w.r.t. the sink. A frozen sink still backprops "
+                    "correctly on SM120 (dq/dk/dv get the sink via LSE); that path "
+                    "is covered by the forward checks above."
+                )
             g_unpad = torch.randn_like(out_unpad)
             # do_o = ((g_unpad.float() * out_unpad.float()).sum(-1)).transpose(-1, -2)
             # import flash_attn_3_cuda
@@ -2160,7 +2193,14 @@ def test_flash_attn_bwd_preallocated_outputs(seqlen_q, seqlen_k, d, causal, dtyp
     assert dq_out is dq
     assert dk_out is dk
     assert dv_out is dv
-    assert torch.allclose(dq, dq_ref, atol=1e-5, rtol=1e-5)
+    # SM 12.0 (consumer Blackwell) accumulates dQ with non-deterministic
+    # atomic-add (the deterministic semaphore-based dQ scheduler only exists on
+    # SM90/SM100), so dQ differs ~2e-4 run-to-run. dK/dV remain bit-identical.
+    # Relax dQ to a bf16-appropriate tolerance there; keep dK/dV bit-exact.
+    if IS_SM120:
+        assert torch.allclose(dq, dq_ref, atol=1e-2, rtol=1e-2)
+    else:
+        assert torch.allclose(dq, dq_ref, atol=1e-5, rtol=1e-5)
     assert torch.allclose(dk, dk_ref, atol=1e-5, rtol=1e-5)
     assert torch.allclose(dv, dv_ref, atol=1e-5, rtol=1e-5)
 

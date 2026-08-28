@@ -1,3 +1,4 @@
+# Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
 """
 Block-sparse runtime utilities for CUTE DSL kernels.
 
@@ -786,6 +787,114 @@ def produce_block_sparse_loads_sm100(
         q_producer_phase ^= 1
 
     return kv_producer_state, q_producer_phase
+
+
+@cute.jit
+def run_block_sparse_mainloop_sm80(
+    blocksparse_tensors: BlockSparseTensors,
+    batch_idx,
+    head_idx,
+    m_block,
+    mma_one_n_block,
+    mask_fn,
+    mask_mod,
+    fastdiv_mods,
+    qhead_per_kvhead: cutlass.Constexpr[int] = 1,
+    q_subtile_factor: cutlass.Constexpr[int] = 1,
+):
+    """Block-sparse mainloop iteration for SM80/SM120.
+
+    NOTE: This implementation hard-codes the non-varlen 4D indexing pattern
+    (lines below this docstring access blocksparse_tensors with 3D indices into
+    batch/head/m_block_sparse). Varlen + block-sparse on SM80/SM120 would
+    require routing through get_curr_blocksparse_tensors(...) (which handles
+    both 2D varlen and 4D non-varlen layouts) and threading seqlen_info into
+    this function. The SM120 dispatcher in interface.py currently does not
+    support varlen + block-sparse together, so this is intentionally narrow;
+    if you lift that restriction, update this function accordingly.
+
+    Processes mask blocks first (applying mask_mod), then full blocks (seqlen masking only).
+    The first full block always receives seqlen masking regardless of whether mask blocks
+    preceded it, since full blocks may be at higher n positions than mask blocks.
+
+    Mirrors the non-intra-wg-overlap path of consume_block_sparse_loads for SM90/SM100.
+
+    Args:
+        mma_one_n_block: callable with signature
+            (n_block, mask_fn, is_first_n_block) -> None
+        mask_fn: partial of mask.apply_mask with batch/head/m_block/thr_mma already bound.
+            Called as mask_fn(acc_S, n_block=n, mask_mod=..., mask_seqlen=...,
+                              fastdiv_mods=...)
+        mask_mod: the user mask_mod constexpr (None → no mask_mod application)
+        fastdiv_mods: fast-division helpers when mask_mod is not None
+
+    Returns:
+        processed_any: True if at least one block was processed.
+    """
+    # SM80/SM120 only need the first 4 fields; trailing fields are SM100/backward-only.
+    mask_block_cnt, mask_block_idx, full_block_cnt, full_block_idx, *_ = blocksparse_tensors
+
+    m_block_sparse = sparse_tensor_m_block(m_block, qhead_per_kvhead, q_subtile_factor)
+
+    curr_mask_block_cnt = mask_block_cnt[batch_idx, head_idx, m_block_sparse]
+    curr_mask_block_idx = mask_block_idx[batch_idx, head_idx, m_block_sparse, None]
+
+    if const_expr(full_block_cnt is not None):
+        curr_full_block_cnt = full_block_cnt[batch_idx, head_idx, m_block_sparse]
+        curr_full_block_idx = full_block_idx[batch_idx, head_idx, m_block_sparse, None]
+    else:
+        curr_full_block_cnt = Int32(0)
+        curr_full_block_idx = None
+
+    processed_any = curr_mask_block_cnt + curr_full_block_cnt > 0
+
+    # Process mask blocks: first gets is_first=True and seqlen masking; rest get is_first=False.
+    if curr_mask_block_cnt > 0:
+        n_block = curr_mask_block_idx[curr_mask_block_cnt - 1]
+        mma_one_n_block(
+            n_block=n_block,
+            mask_fn=partial(
+                mask_fn,
+                mask_mod=mask_mod,
+                mask_seqlen=True,
+                fastdiv_mods=fastdiv_mods if const_expr(mask_mod is not None) else None,
+            ),
+            is_first_n_block=True,
+        )
+        for i in cutlass.range(1, curr_mask_block_cnt):
+            n_block = curr_mask_block_idx[curr_mask_block_cnt - 1 - i]
+            mma_one_n_block(
+                n_block=n_block,
+                mask_fn=partial(mask_fn, mask_mod=mask_mod, mask_seqlen=False),
+                is_first_n_block=False,
+            )
+
+    # Process full blocks: first full block always gets seqlen masking (it may be at the
+    # highest n position even when mask blocks were present). No mask_mod applied.
+    if const_expr(full_block_cnt is not None):
+        if curr_full_block_cnt > 0:
+            n_block = curr_full_block_idx[curr_full_block_cnt - 1]
+            if curr_mask_block_cnt == 0:
+                mma_one_n_block(
+                    n_block=n_block,
+                    mask_fn=partial(mask_fn, mask_mod=None, mask_seqlen=True),
+                    is_first_n_block=True,
+                )
+            else:
+                mma_one_n_block(
+                    n_block=n_block,
+                    mask_fn=partial(mask_fn, mask_mod=None, mask_seqlen=True),
+                    is_first_n_block=False,
+                )
+            for j in cutlass.range(1, curr_full_block_cnt):
+                n_block = curr_full_block_idx[curr_full_block_cnt - 1 - j]
+                mma_one_n_block(
+                    n_block=n_block,
+                    mask_fn=partial(mask_fn, mask_mod=None, mask_seqlen=False),
+                    is_first_n_block=False,
+                )
+
+    return processed_any
 
 
 @cute.jit
