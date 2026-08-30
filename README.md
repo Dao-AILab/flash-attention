@@ -556,6 +556,7 @@ dtype, sequence length, causal / non-causal).
 
 To run the tests:
 ```sh
+pip install -r tests/requirements.txt
 pytest -q -s tests/test_flash_attn.py
 ```
 ## When you encounter issues
