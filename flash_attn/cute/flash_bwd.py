@@ -52,6 +52,8 @@ class FlashAttentionBackwardSm80:
         V_in_regs: bool = False,
         score_mod: cutlass.Constexpr | None = None,
         score_mod_bwd: cutlass.Constexpr | None = None,
+        mask_mod: cutlass.Constexpr | None = None,
+        mask_seqlen: bool = True,
     ):
         """Initializes the configuration for a flash attention v2 kernel.
 
@@ -100,6 +102,14 @@ class FlashAttentionBackwardSm80:
         self.share_QV_smem = V_in_regs
         self.score_mod = score_mod
         self.score_mod_bwd = score_mod_bwd
+        self.mask_mod = mask_mod
+        self.mask_seqlen = mask_seqlen
+        self.mask_vec_size: cutlass.Constexpr = getattr(mask_mod, "__vec_size__", 1)
+        if self.mask_vec_size > 1:
+            raise ValueError(
+                f"mask_mod vec_size {self.mask_vec_size} not supported on Sm80 "
+                "due to accumulator thread ownership pattern."
+            )
 
     @staticmethod
     def can_implement(
@@ -444,6 +454,9 @@ class FlashAttentionBackwardSm80:
         softmax_scale_log2, _ = utils.compute_softmax_scale_log2(
             softmax_scale, self.score_mod
         )
+        fastdiv_mods = utils.compute_fastdiv_mods(
+            mQ, mK, self.qhead_per_kvhead, self.pack_gqa, aux_data.tensors
+        )
         self.kernel(
             mQ,
             mK,
@@ -482,6 +495,7 @@ class FlashAttentionBackwardSm80:
             tile_sched_params,
             TileScheduler,
             aux_data,
+            fastdiv_mods,
         ).launch(
             grid=grid_dim,
             block=[self.num_threads, 1, 1],
@@ -529,6 +543,7 @@ class FlashAttentionBackwardSm80:
         tile_sched_params: ParamsBase,
         TileScheduler: cutlass.Constexpr[Callable],
         aux_data: AuxData = AuxData(),
+        fastdiv_mods=None,
     ):
         # Thread index, block index
         tidx, _, _ = cute.arch.thread_idx()
@@ -847,7 +862,13 @@ class FlashAttentionBackwardSm80:
                 mask_fn = partial(
                     mask.apply_mask, n_block=n_block, thr_mma=thr_mma_sdp,
                     batch_idx=batch_idx, head_idx=head_idx,
-                    mask_seqlen=True, mask_causal=self.is_causal, mask_local=self.is_local
+                    mask_seqlen=self.mask_seqlen,
+                    mask_causal=self.is_causal,
+                    mask_local=self.is_local,
+                    mask_mod=self.mask_mod, aux_data=aux_data,
+                    fastdiv_mods=(
+                        fastdiv_mods if cutlass.const_expr(self.mask_mod is not None) else None
+                    ),
                 )
                 smem_pipe_read_q = cutlass.Int32(0)
                 smem_pipe_read_do = cutlass.Int32(0)
@@ -923,14 +944,16 @@ class FlashAttentionBackwardSm80:
             smem_copy_params.smem_thr_copy_QdO, smem_copy_params.smem_thr_copy_KV,
             swap_AB=self.SdP_swapAB,
         )
-        acc_S_pre = cute.make_fragment_like(acc_S)
-        acc_S_pre.store(acc_S.load())
+        if cutlass.const_expr(self.score_mod_bwd is not None):
+            acc_S_pre = cute.make_fragment_like(acc_S)
+            acc_S_pre.store(acc_S.load())
         tLSErLSE = cute.make_fragment_like(smem_copy_params.tSsLSEMma[None, 0])
         cute.autovec_copy(
             smem_copy_params.tSsLSEMma[None, smem_pipe_read_q if cutlass.const_expr(self.num_stages_Q > 1) else 0], tLSErLSE
         )
         acc_S_mn = layout_utils.reshape_acc_to_mn(acc_S)
-        acc_S_pre_mn = layout_utils.reshape_acc_to_mn(acc_S_pre)
+        if cutlass.const_expr(self.score_mod_bwd is not None):
+            acc_S_pre_mn = layout_utils.reshape_acc_to_mn(acc_S_pre)
         if cutlass.const_expr(self.score_mod is not None):
             for r in cutlass.range(cute.size(acc_S_mn, mode=[0]), unroll_full=True):
                 acc_S_mn[r, None].store(
@@ -1179,7 +1202,7 @@ class FlashAttentionBackwardSm80:
             if cutlass.const_expr(not seqlen.has_cu_seqlens_k):
                 mdK_cur, mdV_cur = [t[batch_idx, head_idx_kv, None] for t in (mdK, mdV)]
             else:
-                padded_offset_k = seqlen.offset_k + batch_idx * self.n_block_size
+                padded_offset_k = seqlen.padded_offset_k
                 mdK_cur = cute.domain_offset((padded_offset_k * self.head_dim_padded,), mdK[head_idx_kv, None])
                 mdV_cur = cute.domain_offset((padded_offset_k * self.head_dim_v_padded,), mdV[head_idx_kv, None])
 

@@ -791,6 +791,21 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
         work_tile = tile_scheduler.initial_work_tile_info()
         m_block, num_head, batch_size, _ = work_tile.tile_idx
 
+        if const_expr(mCuSeqlensQ is not None or mSeqUsedQ is not None):
+            # The varlen grid is an upper bound and can contain padding CTAs.
+            # CuTe kernels cannot return early on a dynamic predicate, so use
+            # valid coordinates and zero seqlens for those CTAs instead.
+            m_block_safe = Int32(0)
+            num_head_safe = Int32(0)
+            batch_size_safe = Int32(0)
+            if work_tile.is_valid_tile:
+                m_block_safe = m_block
+                num_head_safe = num_head
+                batch_size_safe = batch_size
+            m_block = m_block_safe
+            num_head = num_head_safe
+            batch_size = batch_size_safe
+
         block_info = BlockInfo(
             self.tile_m,
             self.tile_n,
@@ -810,6 +825,34 @@ class FlashAttentionForwardSm80(FlashAttentionForwardBase):
             mSeqUsedQ=mSeqUsedQ,
             mSeqUsedK=mSeqUsedK,
         )
+        if const_expr(mCuSeqlensQ is not None or mSeqUsedQ is not None):
+            seqlen_q_safe = Int32(0)
+            seqlen_k_safe = Int32(0)
+            m_block_offset_safe = Int32(0)
+            block_idx_offset_safe = Int32(0)
+            num_n_blocks_safe = Int32(0)
+            if work_tile.is_valid_tile:
+                seqlen_q_safe = seqlen.seqlen_q
+                seqlen_k_safe = seqlen.seqlen_k
+                m_block_offset_safe = seqlen.m_block_offset
+                block_idx_offset_safe = seqlen.block_idx_offset
+                num_n_blocks_safe = seqlen.num_n_blocks
+            seqlen = SeqlenInfoQK(
+                seqlen.offset_q,
+                seqlen.offset_k,
+                seqlen.padded_offset_q,
+                seqlen.padded_offset_k,
+                seqlen_q_safe,
+                seqlen_k_safe,
+                m_block_offset_safe,
+                block_idx_offset_safe,
+                num_n_blocks_safe,
+                seqlen.has_cu_seqlens_q,
+                seqlen.has_cu_seqlens_k,
+                seqlen.has_seqused_q,
+                seqlen.has_seqused_k,
+                seqlen.has_cu_block_idx_offsets,
+            )
         n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
         # For varlen, wasted grid tiles (where batch_idx >= num_batch) will have
         # seqlen_q=seqlen_k=0 and n_block_max=0.  Clamp to 0 so we don't use a

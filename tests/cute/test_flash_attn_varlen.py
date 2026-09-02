@@ -48,6 +48,108 @@ def test_varlen(
     )
     assert ok
 
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] == 12,
+    reason="mask_mod backward is not supported on this device",
+)
+@pytest.mark.parametrize("num_kv_heads", [8, 4])
+@pytest.mark.parametrize("mask_kind", ["plain", "causal", "parallel_chunks"])
+def test_varlen_mask_mod_backward(num_kv_heads, mask_kind):
+    """Exercise masked MHA/GQA backward with unequal packed Q/K lengths."""
+    mask_seed = {"plain": 0, "causal": 1, "parallel_chunks": 2}[mask_kind]
+    torch.manual_seed(1234 + mask_seed)
+    q_lengths = (128, 96)
+    prefix_lengths = (257, 193)
+    kv_lengths = tuple(prefix + q for prefix, q in zip(prefix_lengths, q_lengths))
+    num_query_heads, headdim = 8, 128
+
+    cu_seqlens_q = torch.tensor(
+        [0, q_lengths[0], sum(q_lengths)], device="cuda", dtype=torch.int32
+    )
+    cu_seqlens_k = torch.tensor(
+        [0, kv_lengths[0], sum(kv_lengths)], device="cuda", dtype=torch.int32
+    )
+    inputs = [
+        torch.randn(total, nheads, headdim, device="cuda", dtype=torch.bfloat16)
+        for total, nheads in (
+            (sum(q_lengths), num_query_heads),
+            (sum(kv_lengths), num_kv_heads),
+            (sum(kv_lengths), num_kv_heads),
+        )
+    ]
+    actual_inputs = [tensor.clone().requires_grad_() for tensor in inputs]
+    reference_inputs = [tensor.float().requires_grad_() for tensor in inputs]
+
+    def mask_mod(batch_idx, head_idx, q_idx, kv_idx, seqlen_info, aux_tensors):
+        prefix_len = seqlen_info.seqlen_k - seqlen_info.seqlen_q
+        chunk_size = seqlen_info.seqlen_q // 4
+        suffix_kv_idx = kv_idx - prefix_len
+        return (kv_idx < prefix_len) | (
+            (suffix_kv_idx >= 0)
+            & ((q_idx // chunk_size) == (suffix_kv_idx // chunk_size))
+        )
+
+    custom_mask = mask_mod if mask_kind == "parallel_chunks" else None
+
+    actual, _ = flash_attn_varlen_func(
+        *actual_inputs,
+        cu_seqlens_q=cu_seqlens_q,
+        cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max(q_lengths),
+        max_seqlen_k=max(kv_lengths),
+        softmax_scale=headdim**-0.5,
+        causal=mask_kind == "causal",
+        mask_mod=custom_mask,
+        return_lse=True,
+    )
+
+    reference_outputs = []
+    q_offset = kv_offset = 0
+    for q_len, kv_len in zip(q_lengths, kv_lengths):
+        q, k, v = (
+            reference_inputs[0][q_offset : q_offset + q_len],
+            reference_inputs[1][kv_offset : kv_offset + kv_len],
+            reference_inputs[2][kv_offset : kv_offset + kv_len],
+        )
+        k, v = (
+            tensor.repeat_interleave(num_query_heads // num_kv_heads, dim=1)
+            for tensor in (k, v)
+        )
+        scores = torch.einsum("qhd,khd->hqk", q, k) * headdim**-0.5
+        prefix_len = kv_len - q_len
+        q_idx = torch.arange(q_len, device="cuda")
+        kv_idx = torch.arange(kv_len, device="cuda")
+        if mask_kind == "causal":
+            visible = kv_idx[None] <= q_idx[:, None] + prefix_len
+            scores = scores.masked_fill(~visible[None], float("-inf"))
+        elif mask_kind == "parallel_chunks":
+            chunk_size = q_len // 4
+            visible = (kv_idx[None] < prefix_len) | (
+                (q_idx[:, None] // chunk_size)
+                == ((kv_idx[None] - prefix_len).clamp_min(0) // chunk_size)
+            )
+            scores = scores.masked_fill(~visible[None], float("-inf"))
+        reference_outputs.append(
+            torch.einsum("hqk,khd->qhd", torch.softmax(scores, dim=-1), v)
+        )
+        q_offset += q_len
+        kv_offset += kv_len
+    reference = torch.cat(reference_outputs, dim=0)
+
+    grad_out = torch.randn_like(actual)
+    actual.backward(grad_out)
+    reference.backward(grad_out.float())
+
+    torch.testing.assert_close(actual.float(), reference, rtol=3e-2, atol=5e-2)
+    for actual_input, reference_input in zip(actual_inputs, reference_inputs):
+        assert actual_input.grad is not None and reference_input.grad is not None
+        assert torch.isfinite(actual_input.grad).all()
+        torch.testing.assert_close(
+            actual_input.grad.float(), reference_input.grad, rtol=3e-2, atol=5e-2
+        )
+
+
 def check_varlen_vs_torch_flash(
     q, k, v,
     cu_seqlens_q=None,
