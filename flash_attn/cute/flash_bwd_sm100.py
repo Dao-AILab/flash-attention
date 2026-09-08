@@ -45,6 +45,25 @@ from flash_attn.cute.block_sparse_utils import (
 )
 
 
+# NOTE [hdim64 dedicated P/dS TMEM slots]
+# The 1-CTA hdim64 backward uses TMEM columns [0, 384), leaving room for two 64-column
+# slots. With split_P_dS, P and dS live there instead of aliasing S and dP:
+#   * S is released as soon as the compute warps have loaded it, so the MMA warp issues
+#     QK_{t+1} while the softmax of tile t is still running; dV += P.T @ dO for tile t
+#     then trails QK_{t+1} and is gated by its own pipeline_P.
+#   * The compute-wide barriers that ordered the P-over-S and dS-over-dP overwrites are
+#     gone. They were cross-warp hazards: a warp's P (dS) columns overlap S (dP) lanes
+#     that another warp still has to load.
+# With warp_sync, the remaining compute-wide barriers before pipeline arrivals become
+# sync_warp: every mbarrier signalled from the compute warps expects one arrival per warp,
+# so the mbarrier itself is the cross-warp join. This is 1-CTA only: at 2-CTA the barrier
+# before the dS commit also orders every warp's sdS_xchg write ahead of the single-thread
+# DSMEM copy to the peer CTA. Both flags default on wherever eligible; the explicit
+# arguments exist only for A/B measurement (perf evidence in PR #2804).
+# In split mode the S handshake keeps its own phase/state (producer_phase_S,
+# consumer_state_S) so its parity never depends on where the other pipelines flip.
+
+
 class FlashAttentionBackwardSm100:
     arch = 100
 
@@ -109,6 +128,9 @@ class FlashAttentionBackwardSm100:
 
         assert cluster_size in (1, 2), "Only cluster_size=1 or 2 is supported"
         self.cluster_shape_mn = (cluster_size, 1)
+        # The MMA warp's producer_phase_acc (shared by the S/P, dP and dQ empty waits in the
+        # aliased layout) is only consistent across one work tile per CTA.
+        assert not is_persistent, "persistent tile scheduling is not supported"
         self.is_persistent = is_persistent
         self.is_causal = is_causal
         self.is_local = is_local
@@ -138,62 +160,23 @@ class FlashAttentionBackwardSm100:
         # Generally slower to use store dS in smem for dK, and doesn't work for 2cta
         self.use_smem_dS_for_mma_dK = False
 
-        # The hdim-64 1-CTA backward uses TMEM columns [0, 384) only, leaving two spare
-        # 64-column slots. With split_P_dS, P and dS get dedicated slots there instead of
-        # aliasing P onto S and dS onto dP. Once nothing aliases:
-        #   * the compute warps release S as soon as they have loaded it (rather than
-        #     after the softmax and the P store), and the MMA warp issues QK_{t+1}
-        #     before it waits for P_t / PV_t, so the next S tile is computed while the
-        #     softmax of the current one is still in flight;
-        #   * the two compute-wide barriers that ordered the P-over-S and dS-over-dP
-        #     overwrites have nothing left to guard and disappear.
-        # Every other shape is either 2-CTA or has no spare columns.
+        # See NOTE [hdim64 dedicated P/dS TMEM slots]
         split_P_dS_eligible = (
-            not self.use_2cta_instrs
+            cluster_size == 1
             and self.tile_m == 128
             and self.tile_n == 128
             and self.tile_hdim == 64
             and self.tile_hdimv == 64
             and not self.use_smem_dS_for_mma_dK
         )
-        if split_P_dS is None:
-            # Enabled wherever it is legal, deterministic causal included. That case was
-            # once carved out -- the semaphore-serialized dQ reduce paces those runs, and
-            # the dedicated slots did not obviously pay for the extra P pipeline there --
-            # but on a remeasurement (2026-09-03, blog/hd64_bwd_barriers) the two layouts
-            # are no longer within noise of each other on deterministic causal shapes:
-            # over the 30 such cells of the 124-configuration sweep the dealiased layout
-            # is 1.050x baseline against 1.012-1.018x for the aliased one, worst cell
-            # 1.003x. The carve-out was costing ~3.5% geomean, so it is gone.
-            self.split_P_dS = split_P_dS_eligible
-        else:
-            assert not split_P_dS or split_P_dS_eligible, (
-                "split_P_dS requires 1-CTA hdim64 with 128x128 tiles"
-            )
-            self.split_P_dS = split_P_dS
-        # With warp_sync, each compute warp converges only with itself (sync_warp) before
-        # its elected arrive on a pipeline mbarrier, instead of all eight warps first
-        # meeting at the compute-wide compute_sync_barrier. Every mbarrier signalled from the
-        # compute warps expects one arrival per warp, so the mbarrier is already the
-        # cross-warp join and the barrier in front of it was redundant convergence. The
-        # alias guards of the aliased layout are not signalling sites and always keep the
-        # compute-wide barrier: the t2r/r2t partition puts warp w's P (dS) columns under warp
-        # w+4's S (dP) lanes, so those hazards are cross-warp.
-        # The flag drives two sites. The P/LSE site is correct at any cluster size; the
-        # dS/dPsum site is 1-CTA only, because one thread bulk-copies the whole sdS_xchg
-        # buffer into the peer CTA and the barrier is what orders the compute warps'
-        # writes before it. One flag for both, so the assert tests cluster size rather
-        # than shape: widening within 1-CTA is a perf question, enabling at 2-CTA is a
-        # correctness bug. Widening was measured and is a wash outside hdim64 (notes 8.3).
-        if warp_sync is None:
-            self.warp_sync = split_P_dS_eligible
-        else:
-            assert not warp_sync or not self.use_2cta_instrs, (
-                "warp_sync must not be enabled at 2-CTA: the dS/dPsum site's compute-wide "
-                "barrier orders the compute warps' sdS_xchg writes before the "
-                "single-thread DSMEM copy to the peer CTA"
-            )
-            self.warp_sync = warp_sync
+        self.split_P_dS = split_P_dS_eligible if split_P_dS is None else split_P_dS
+        assert not self.split_P_dS or split_P_dS_eligible, (
+            "split_P_dS requires 1-CTA hdim64 with 128x128 tiles"
+        )
+        self.warp_sync = split_P_dS_eligible if warp_sync is None else warp_sync
+        assert not self.warp_sync or cluster_size == 1, (
+            "warp_sync requires 1-CTA, see NOTE [hdim64 dedicated P/dS TMEM slots]"
+        )
 
         self.reduce_warp_ids = (0, 1, 2, 3)
         self.compute_warp_ids = (4, 5, 6, 7, 8, 9, 10, 11)
@@ -302,8 +285,7 @@ class FlashAttentionBackwardSm100:
         self.Q_stage = 1 if self.use_2cta_instrs else 2
         self.dO_stage = 1
         self.single_stage = 1
-        # dedicated-P pipeline; 0 stages when P overlaps S
-        self.P_stage = self.single_stage if self.split_P_dS else 0
+        self.P_stage = 1 if self.split_P_dS else 0  # dedicated P pipeline, else P aliases S
         # LSE_stage = Q_stage and dPsum_stage = dO_stage
         self.sdKVaccum_stage = 2
         # number of tma reduce adds per dQacc mma
@@ -1291,7 +1273,6 @@ class FlashAttentionBackwardSm100:
             barrier_storage=storage.dS_mbar_ptr.data_ptr(),
             cta_layout_vmnk=cluster_layout_vmnk,
         )
-        # Split S/P: P gets its own pipeline so S can be released as soon as compute has read it
         if const_expr(self.split_P_dS):
             pipeline_P = cutlass.pipeline.PipelineAsyncUmma.create(
                 num_stages=1,
@@ -2769,13 +2750,13 @@ class FlashAttentionBackwardSm100:
                     # -----------------------------------------------------------
                     ###### MAIN LOOP
                     # -----------------------------------------------------------
-                    # Per trip t (tiles are KV-major, so every accumulator is the transpose):
+                    # Per trip t (the CTA owns a KV tile, so S and dP come out transposed):
                     # 1.  S.T  = K    @ Q.T    (tile t+1)
                     # 1b. dV  += P.T  @ dO     (tile t; split_P_dS only -- otherwise at 5)
                     # 2.  dK  += dS.T @ Q
                     # 3.  dQ   = dS   @ K
                     # 4.  dP.T = V    @ dO.T   (tile t+1)
-                    # 5.  dV  += P.T  @ dO     (tile t; aliased layout only)
+                    # 5.  dV  += P.T  @ dO     (tile t+1; aliased layout only)
 
                     # For block sparsity, we use block_iter_count; for dense, use m_block range
                     # MMA doesn't need actual m_block indices, just the iteration count
@@ -2790,8 +2771,8 @@ class FlashAttentionBackwardSm100:
                         # (1) S.T = K @ Q.T
                         handle_Q_next = pipeline_Q_consumer.wait_and_advance()
                         if const_expr(self.split_P_dS):
-                            # Gated on "S_t read" only, so this QK overlaps the softmax of
-                            # tile t. Legal because it writes S while PV_t (below) reads P.
+                            # S empty means "S_t loaded", not "P_t stored", so this QK
+                            # overlaps the softmax of tile t.
                             pipeline_S_P.sync_object_empty.wait(0, producer_phase_S)
                         mma_qk_fn(B_idx=handle_Q_next.index)
                         pipeline_S_P.sync_object_full.arrive(
@@ -2799,8 +2780,8 @@ class FlashAttentionBackwardSm100:
                         )
                         if const_expr(self.split_P_dS):
                             producer_phase_S ^= 1
-                            # (1b) dV += P_t.T @ dO_t: the previous tile's PV, issued after
-                            # QK_{t+1} so that the QK never waits behind P.
+                            # (1b) dV += P_t.T @ dO_t, issued after QK_{t+1} so QK never
+                            # waits behind the P store.
                             pipeline_P.consumer_wait(consumer_state_P)
                             mma_pdo_fn(B_idx=consumer_state_dO.index, zero_init=not accumulate_dV)
                             accumulate_dV = True
@@ -3080,20 +3061,16 @@ class FlashAttentionBackwardSm100:
         tileP_f32_like = self.cta_tiler[1] // 32 * self.v_dtype.width
         # tStS has shape ((128, 128), 1, 1), tStP has shape ((128, 64), 1, 1)
         tStP = cute.composition(tStS, (cute.make_layout((self.tile_n, tileP_f32_like)), 1, 1))
-        # Rebase the iterator explicitly, otherwise the tmem address is wrong
-        if const_expr(self.tmem_P_offset != self.tmem_S_offset):
-            tStP = cute.make_tensor(
-                tStS.iterator + (self.tmem_P_offset - self.tmem_S_offset), tStP.layout
-            )
-        else:
-            tStP = cute.make_tensor(tStS.iterator, tStP.layout)
+        # Rebase the iterator explicitly (P may alias S), otherwise the tmem address is wrong
+        tStP = cute.make_tensor(
+            tStS.iterator + (self.tmem_P_offset - self.tmem_S_offset), tStP.layout
+        )
         tScS = thr_mma_S.partition_C(cute.make_identity_tensor(self.mma_tiler_kq[:2]))
         tScP = cute.composition(tScS, (cute.make_layout((self.tile_n, tileP_f32_like)), 1, 1))
         tdPtdS = cute.composition(tdPtdP, (cute.make_layout((self.tile_n, tileP_f32_like)), 1, 1))
-        if const_expr(self.tmem_dS_offset != self.tmem_dP_offset):
-            tdPtdS = cute.make_tensor(
-                tdPtdP.iterator + (self.tmem_dS_offset - self.tmem_dP_offset), tdPtdS.layout
-            )
+        tdPtdS = cute.make_tensor(
+            tdPtdP.iterator + (self.tmem_dS_offset - self.tmem_dP_offset), tdPtdS.layout
+        )
         tdPcdP = thr_mma_dP.partition_C(cute.make_identity_tensor(self.mma_tiler_vdo[:2]))
         tdPcdS = cute.composition(tdPcdP, (cute.make_layout((self.tile_n, tileP_f32_like)), 1, 1))
 
@@ -3278,8 +3255,8 @@ class FlashAttentionBackwardSm100:
                 cute.copy(thr_copy_t2r, tStS_t2r, tSrS_t2r)
 
                 if const_expr(self.split_P_dS):
-                    # S is in registers: release it now, before the softmax, so the MMA
-                    # warp can issue the next QK into the slot
+                    # S is in registers: release it before the softmax so the MMA warp can
+                    # issue the next QK into the slot
                     cute.arch.fence_view_async_tmem_load()
                     if const_expr(self.warp_sync):
                         cute.arch.sync_warp()
@@ -3369,9 +3346,8 @@ class FlashAttentionBackwardSm100:
                             pipeline_P.producer_acquire(producer_state_P)
                         else:
                             cute.arch.fence_view_async_tmem_load()
-                            # P overwrites S, and warp w's P columns sit under warp w+4's S
-                            # lanes: every warp must have loaded S before any warp stores P.
-                            # A cross-warp join, so this stays a compute-wide barrier.
+                            # P overwrites S lanes another warp may still be loading, so
+                            # every warp must have loaded S before any stores P.
                             self.compute_sync_barrier.arrive_and_wait()
                     cute.copy(
                         thr_copy_r2t,
@@ -3415,8 +3391,7 @@ class FlashAttentionBackwardSm100:
                     cute.copy(thr_copy_t2r, tdPtdP_t2r[None, stage, None, None], tdPrdP_t2r)
                     cute.arch.fence_view_async_tmem_load()
                     if const_expr(not self.split_P_dS):
-                        # dS overwrites dP, with the same cross-warp lane sharing as P over S:
-                        # every warp must have loaded its dP stage before any warp stores dS.
+                        # dS overwrites dP with the same cross-warp lane sharing as P over S
                         self.compute_sync_barrier.arrive_and_wait()
                     tdPrdP_cur = tdPrdP_t2r[None, 0, 0]
                     tSrS_cur = tSrS_t2r[None, stage, 0, 0]

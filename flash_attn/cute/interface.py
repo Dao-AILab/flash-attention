@@ -1854,10 +1854,8 @@ def _flash_attn_bwd(
     fake_mode = is_fake_mode()
     arch = _get_device_arch()
     assert arch // 10 in [9, 10, 11, 12], "Unsupported compute capability. Supported: 9.x, 10.x, 11.x, 12.x"
-    if split_P_dS is not None:
-        assert arch // 10 in [10, 11], "split_P_dS is only supported on SM100/SM110"
-    if warp_sync is not None:
-        assert arch // 10 in [10, 11], "warp_sync is only supported on SM100/SM110"
+    if split_P_dS is not None or warp_sync is not None:
+        assert arch // 10 in [10, 11], "split_P_dS / warp_sync are SM100/SM110 tuning knobs"
     if block_sparse_tensors is not None:
         assert (
             cu_seqlens_q is None
