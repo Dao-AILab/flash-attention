@@ -3,7 +3,7 @@
 # from Cutlass C++ to Cute-DSL.
 import math
 from types import SimpleNamespace
-from typing import Type, Callable, Optional
+from typing import Type, Callable, NamedTuple, Optional
 from functools import partial
 
 import cuda.bindings.driver as cuda
@@ -11,7 +11,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync, warp
-from cutlass import Int32
+from cutlass import Float32, Int32
 import cutlass.utils as utils_basic
 
 from quack import layout_utils
@@ -25,10 +25,35 @@ from flash_attn.cute.block_info import BlockInfo
 from quack.cute_dsl_utils import ParamsBase
 from flash_attn.cute.tile_scheduler import SingleTileScheduler, SingleTileVarlenScheduler, TileSchedulerArguments
 from flash_attn.cute.block_sparsity import BlockSparseTensors
+from flash_attn.cute.kernel_args import BwdKernelArgs, normalize_kernel_args
 from flash_attn.cute.utils import AuxData
 
 
 class FlashAttentionBackwardSm80:
+    class Args(NamedTuple):
+        mQ: cute.Tensor
+        mK: cute.Tensor
+        mV: cute.Tensor
+        mdO: cute.Tensor
+        mLSE: cute.Tensor
+        mdPsum: cute.Tensor
+        mdQaccum: cute.Tensor
+        mdK: cute.Tensor
+        mdV: cute.Tensor
+        softmax_scale: Float32
+        mCuSeqlensQ: Optional[cute.Tensor] = None
+        mCuSeqlensK: Optional[cute.Tensor] = None
+        mSeqUsedQ: Optional[cute.Tensor] = None
+        mSeqUsedK: Optional[cute.Tensor] = None
+        window_size_left: Optional[Int32] = None
+        window_size_right: Optional[Int32] = None
+        mdQ_semaphore: Optional[cute.Tensor] = None
+        mdK_semaphore: Optional[cute.Tensor] = None
+        mdV_semaphore: Optional[cute.Tensor] = None
+        aux_data: AuxData = AuxData()
+        blocksparse_tensors: Optional[BlockSparseTensors] = None
+        mCuTotalMBlocks: Optional[cute.Tensor] = None
+
     def __init__(
         self,
         dtype: Type[cutlass.Numeric],
@@ -373,31 +398,26 @@ class FlashAttentionBackwardSm80:
     @cute.jit
     def __call__(
         self,
-        mQ: cute.Tensor,
-        mK: cute.Tensor,
-        mV: cute.Tensor,
-        mdO: cute.Tensor,
-        mLSE: cute.Tensor,
-        mdPsum: cute.Tensor,
-        mdQaccum: cute.Tensor,
-        mdK: cute.Tensor,
-        mdV: cute.Tensor,
-        softmax_scale: cutlass.Float32,
-        mCuSeqlensQ: Optional[cute.Tensor] = None,
-        mCuSeqlensK: Optional[cute.Tensor] = None,
-        mSeqUsedQ: Optional[cute.Tensor] = None,
-        mSeqUsedK: Optional[cute.Tensor] = None,
-        window_size_left: Int32 | int | None = None,
-        window_size_right: Int32 | int | None = None,
-        mdQ_semaphore: Optional[cute.Tensor] = None,
-        mdK_semaphore: Optional[cute.Tensor] = None,
-        mdV_semaphore: Optional[cute.Tensor] = None,
-        aux_data: AuxData = AuxData(),
-        blocksparse_tensors: Optional[BlockSparseTensors] = None,
-        mCuTotalMBlocks: Optional[cute.Tensor] = None,
+        args: BwdKernelArgs,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
+        args = normalize_kernel_args(args, self.Args, type(self).__name__)
+        mQ, mK, mV, mdO = args.mQ, args.mK, args.mV, args.mdO
+        mLSE, mdPsum, mdQaccum = args.mLSE, args.mdPsum, args.mdQaccum
+        mdK, mdV = args.mdK, args.mdV
+        softmax_scale = args.softmax_scale
+        mCuSeqlensQ, mCuSeqlensK = args.mCuSeqlensQ, args.mCuSeqlensK
+        mSeqUsedQ, mSeqUsedK = args.mSeqUsedQ, args.mSeqUsedK
+        window_size_left, window_size_right = args.window_size_left, args.window_size_right
+        mdQ_semaphore, mdK_semaphore, mdV_semaphore = (
+            args.mdQ_semaphore,
+            args.mdK_semaphore,
+            args.mdV_semaphore,
+        )
+        aux_data = args.aux_data
+        blocksparse_tensors = args.blocksparse_tensors
+        mCuTotalMBlocks = args.mCuTotalMBlocks
         assert mdQ_semaphore is None and mdK_semaphore is None and mdV_semaphore is None, (
             "determinism not supported yet for Sm80"
         )

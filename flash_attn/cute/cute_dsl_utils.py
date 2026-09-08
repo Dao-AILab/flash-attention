@@ -2,7 +2,7 @@
 
 import os
 from typing import Tuple
-from functools import lru_cache
+from functools import lru_cache, wraps
 
 import torch
 from torch._subclasses.fake_tensor import FakeTensor

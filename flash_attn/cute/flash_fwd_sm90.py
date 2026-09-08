@@ -2,7 +2,7 @@
 # SM90 (Hopper) forward pass for flash attention, extracted from flash_fwd.py.
 
 from types import SimpleNamespace
-from typing import Callable, Literal, Optional
+from typing import Callable, Literal, NamedTuple, Optional
 from functools import partial
 
 import cuda.bindings.driver as cuda
@@ -28,6 +28,7 @@ from flash_attn.cute.softmax import Softmax, apply_score_mod_inner
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute.block_sparsity import BlockSparseTensors
+from flash_attn.cute.kernel_args import FwdKernelArgs, normalize_kernel_args
 from flash_attn.cute.block_sparse_utils import (
     produce_block_sparse_loads,
     consume_block_sparse_loads,
@@ -50,6 +51,26 @@ from flash_attn.cute.utils import AuxData
 
 
 class FlashAttentionForwardSm90(FlashAttentionForwardBase):
+    class Args(NamedTuple):
+        mQ: cute.Tensor  # (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
+        mK: cute.Tensor  # (b_k, s_k, h_k, d), (total_k, h_k, d) with cu_seqlens_k, or (num_pages, page_size, h_k, d) with page_table
+        mV: cute.Tensor  # (b_k, s_k, h_k, dv), (total_k, h_k, dv) with cu_seqlens_k, or (num_pages, page_size, h_k, dv) with page_table
+        mO: cute.Tensor  # (b, s_q, h, dv) or (total_q, h, dv) if there is cu_seqlens_q
+        softmax_scale: Float32
+        mLSE: Optional[cute.Tensor] = None
+        mCuSeqlensQ: Optional[cute.Tensor] = None
+        mCuSeqlensK: Optional[cute.Tensor] = None
+        mSeqUsedQ: Optional[cute.Tensor] = None
+        mSeqUsedK: Optional[cute.Tensor] = None
+        mPageTable: Optional[cute.Tensor] = None  # (b_k, max_num_pages_per_seq)
+        window_size_left: Optional[Int32] = None
+        window_size_right: Optional[Int32] = None
+        learnable_sink: Optional[cute.Tensor] = None
+        blocksparse_tensors: Optional[BlockSparseTensors] = None
+        aux_data: AuxData = AuxData()
+        mCuTotalMBlocks: Optional[cute.Tensor] = None
+        mCuTotalSplitsMBlocks: Optional[cute.Tensor] = None
+
     def __init__(
         self,
         *args,
@@ -157,24 +178,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
     @cute.jit
     def __call__(
         self,
-        mQ: cute.Tensor,  # (b, s_q, h, d) or (total_q, h, d) if there is cu_seqlens_q
-        mK: cute.Tensor,  # (b_k, s_k, h_k, d) or (total_k, h_k, d) if there is cu_seqlens_k or (num_pages, page_size, h_k, d) if there is page_table
-        mV: cute.Tensor,  # (b_k, s_k, h_k, dv) or (total_k, h_k, dv) if there is cu_seqlens_k or (num_pages, page_size, h_k, dv) if there is page_table
-        mO: cute.Tensor,  # (b, s_q, h, dv) or (total_q, h, dv) if there is cu_seqlens_q
-        mLSE: Optional[cute.Tensor],
-        softmax_scale: Float32,
-        mCuSeqlensQ: Optional[cute.Tensor] = None,
-        mCuSeqlensK: Optional[cute.Tensor] = None,
-        mSeqUsedQ: Optional[cute.Tensor] = None,
-        mSeqUsedK: Optional[cute.Tensor] = None,
-        mPageTable: Optional[cute.Tensor] = None,  # (b_k, max_num_pages_per_seq)
-        window_size_left: Int32 | int | None = None,
-        window_size_right: Int32 | int | None = None,
-        learnable_sink: Optional[cute.Tensor] = None,
-        blocksparse_tensors: Optional[BlockSparseTensors] = None,
-        aux_data: AuxData = AuxData(),
-        mCuTotalMBlocks: Optional[cute.Tensor] = None,
-        mCuTotalSplitsMBlocks: Optional[cute.Tensor] = None,
+        args: FwdKernelArgs,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -183,6 +187,17 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mQ/mK/mV/mO has same data types(supports fp16 and bf16) and same layout:
         (batch_size, seqlen_q, num_head, head_dim):(_, _, _, 1)
         """
+        args = normalize_kernel_args(args, self.Args, type(self).__name__)
+        mQ, mK, mV, mO, mLSE = args.mQ, args.mK, args.mV, args.mO, args.mLSE
+        softmax_scale = args.softmax_scale
+        mCuSeqlensQ, mCuSeqlensK = args.mCuSeqlensQ, args.mCuSeqlensK
+        mSeqUsedQ, mSeqUsedK = args.mSeqUsedQ, args.mSeqUsedK
+        mPageTable = args.mPageTable
+        window_size_left, window_size_right = args.window_size_left, args.window_size_right
+        learnable_sink = args.learnable_sink
+        blocksparse_tensors = args.blocksparse_tensors
+        aux_data = args.aux_data
+        mCuTotalMBlocks, mCuTotalSplitsMBlocks = args.mCuTotalMBlocks, args.mCuTotalSplitsMBlocks
 
         self._check_type(
             *(
