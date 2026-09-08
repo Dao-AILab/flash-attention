@@ -7,7 +7,7 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute import FastDivmodDivisor
+from cutlass.cute import FastDivmodDivisorV2
 from cutlass import Float32, Int32, Int64, const_expr
 from cutlass.utils import LayoutEnum
 from cutlass.cute.nvgpu import cpasync, tcgen05
@@ -267,8 +267,9 @@ class FlashAttentionBackwardSm100:
         # S.T = K @ Q.T
         tiled_mma_S = sm100_utils_basic.make_trivial_tiled_mma(
             self.q_dtype,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.K,
+            self.q_dtype,
+            cute.nvgpu.OperandMajorMode.K,
+            cute.nvgpu.OperandMajorMode.K,
             self.acc_dtype,
             self.cta_group,
             self.mma_tiler_kq[:2],
@@ -276,8 +277,9 @@ class FlashAttentionBackwardSm100:
         # dP.T = V @ dO.T
         tiled_mma_dP = sm100_utils_basic.make_trivial_tiled_mma(
             self.do_dtype,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.K,
+            self.do_dtype,
+            cute.nvgpu.OperandMajorMode.K,
+            cute.nvgpu.OperandMajorMode.K,
             self.acc_dtype,
             self.cta_group,
             self.mma_tiler_vdo[:2],
@@ -285,8 +287,9 @@ class FlashAttentionBackwardSm100:
         # dV += P.T @ dO --> (K, MN) major
         tiled_mma_dV = sm100_utils_basic.make_trivial_tiled_mma(
             self.do_dtype,
-            tcgen05.OperandMajorMode.K,  # P_major_mode
-            tcgen05.OperandMajorMode.MN,  # dO_major_mode
+            self.do_dtype,
+            cute.nvgpu.OperandMajorMode.K,  # P_major_mode
+            cute.nvgpu.OperandMajorMode.MN,  # dO_major_mode
             self.acc_dtype,
             self.cta_group,
             self.mma_tiler_pdo[:2],
@@ -299,8 +302,9 @@ class FlashAttentionBackwardSm100:
             mma_dK_a_src = tcgen05.OperandSource.TMEM
         tiled_mma_dK = sm100_utils_basic.make_trivial_tiled_mma(
             self.do_dtype,
-            tcgen05.OperandMajorMode.K,  # dS_major_mode
-            tcgen05.OperandMajorMode.MN,  # Q_major_mode
+            self.do_dtype,
+            cute.nvgpu.OperandMajorMode.K,  # dS_major_mode
+            cute.nvgpu.OperandMajorMode.MN,  # Q_major_mode
             self.acc_dtype,
             self.cta_group,
             self.mma_tiler_dsq[:2],
@@ -309,8 +313,9 @@ class FlashAttentionBackwardSm100:
         # dQ = dS @ K
         tiled_mma_dQ = sm100_utils_basic.make_trivial_tiled_mma(
             self.k_dtype,
-            tcgen05.OperandMajorMode.MN,  # dS_major_mode
-            tcgen05.OperandMajorMode.MN,  # Kt_major_mode
+            self.k_dtype,
+            cute.nvgpu.OperandMajorMode.MN,  # dS_major_mode
+            cute.nvgpu.OperandMajorMode.MN,  # Kt_major_mode
             self.acc_dtype,
             self.cta_group,
             self.mma_tiler_dsk[:2],
@@ -560,9 +565,9 @@ class FlashAttentionBackwardSm100:
             self.mdV_layout_enum = LayoutEnum.from_tensor(mdV)
             dK_major_mode = self.mdK_layout_enum.mma_major_mode()
             dV_major_mode = self.mdV_layout_enum.mma_major_mode()
-            if const_expr(dK_major_mode != tcgen05.OperandMajorMode.K):
+            if const_expr(dK_major_mode != cute.nvgpu.OperandMajorMode.K):
                 raise RuntimeError("The layout of mdK is wrong")
-            if const_expr(dV_major_mode != tcgen05.OperandMajorMode.K):
+            if const_expr(dV_major_mode != cute.nvgpu.OperandMajorMode.K):
                 raise RuntimeError("The layout of mdV is wrong")
 
         if const_expr(self.use_tma_store and not self.dKV_postprocess):
@@ -924,8 +929,8 @@ class FlashAttentionBackwardSm100:
                 self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1
             )
             seqlen_k = cute.size(mK.shape[0])
-            seqlen_q_divmod = FastDivmodDivisor(seqlen_q)
-            seqlen_k_divmod = FastDivmodDivisor(seqlen_k)
+            seqlen_q_divmod = FastDivmodDivisorV2(seqlen_q)
+            seqlen_k_divmod = FastDivmodDivisorV2(seqlen_k)
             fastdiv_mods = (seqlen_q_divmod, seqlen_k_divmod)
         self.use_block_sparsity = cutlass.const_expr(blocksparse_tensors is not None)
         if const_expr(self.use_block_sparsity and self.use_2cta_instrs):
@@ -3051,10 +3056,10 @@ class FlashAttentionBackwardSm100:
                 fastdiv_mods = (
                     seqlen_q_divmod
                     if not recompute_fastdiv_mods_q
-                    else FastDivmodDivisor(seqlen.seqlen_q),
+                    else FastDivmodDivisorV2(seqlen.seqlen_q),
                     seqlen_k_divmod
                     if not recompute_fastdiv_mods_k
-                    else FastDivmodDivisor(seqlen.seqlen_k),
+                    else FastDivmodDivisorV2(seqlen.seqlen_k),
                 )
             m_block_min, m_block_max = block_info.get_m_block_min_max(
                 seqlen, n_block // self.cluster_shape_mnk[0]

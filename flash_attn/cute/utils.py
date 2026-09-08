@@ -11,7 +11,7 @@ import cutlass
 import cutlass.cute as cute
 
 from cutlass import Float32, Int32, const_expr
-from cutlass.cute import FastDivmodDivisor
+from cutlass.cute import FastDivmodDivisorV2
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import nvvm, llvm
 from cutlass.cute.runtime import from_dlpack
@@ -196,7 +196,7 @@ def compute_softmax_scale_log2(softmax_scale, score_mod):
 
 
 def compute_fastdiv_mods(mQ, mK, qhead_per_kvhead, pack_gqa, aux_tensors, mPageTable=None):
-    """Compute FastDivmodDivisor pairs for aux_tensors index computation.
+    """Compute FastDivmodDivisorV2 pairs for aux_tensors index computation.
 
     Returns a (seqlen_q_divmod, seqlen_k_divmod) tuple, or None if aux_tensors is None.
     """
@@ -208,7 +208,7 @@ def compute_fastdiv_mods(mQ, mK, qhead_per_kvhead, pack_gqa, aux_tensors, mPageT
         if const_expr(mPageTable is None)
         else mK.shape[0] * mPageTable.shape[1]
     )
-    return (FastDivmodDivisor(seqlen_q), FastDivmodDivisor(seqlen_k))
+    return (FastDivmodDivisorV2(seqlen_q), FastDivmodDivisorV2(seqlen_k))
 
 
 def convert_from_dlpack(x, leading_dim, alignment=16, divisibility=1) -> cute.Tensor:
