@@ -79,6 +79,8 @@ class FlashAttentionBackwardSm100:
         self.tile_hdimv = int(math.ceil(head_dim_v / hdim_multiple_of) * hdim_multiple_of)
         self.check_hdim_oob = head_dim != self.tile_hdim
         self.check_hdim_v_oob = head_dim_v != self.tile_hdimv
+        self.head_dim = head_dim
+        self.head_dim_v = head_dim_v
 
         self.tile_m = tile_m
         self.tile_n = tile_n
@@ -3872,13 +3874,22 @@ class FlashAttentionBackwardSm100:
         mdV_cur = seqlen.offset_batch_K(mdV, batch_idx, dim=3)[None, None, head_idx]
         mdK_cur = seqlen.offset_batch_K(mdK, batch_idx, dim=3)[None, None, head_idx]
 
-        tmem_load_atom = cute.make_copy_atom(
-            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(16)), Float32
+        # The gmem store below has no head-dim OOB protection from TMA, so when head_dim is
+        # not a multiple of the tile we predicate each 128-bit store vector (8 bf16 columns).
+        # The store's predicate granularity is one tmem-load repetition, so shrink the
+        # repetition to 8 columns for that case; 16 keeps fewer tmem loads otherwise.
+        tmem_load_atom_dV = cute.make_copy_atom(
+            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(8 if self.check_hdim_v_oob else 16)),
+            Float32,
+        )
+        tmem_load_atom_dK = cute.make_copy_atom(
+            tcgen05.copy.Ld32x32bOp(tcgen05.copy.Repetition(8 if self.check_hdim_oob else 16)),
+            Float32,
         )
         # dV
         pipeline_dKV.consumer_wait(consumer_state_dKV)
 
-        tiled_tmem_ld_dV = tcgen05.make_tmem_copy(tmem_load_atom, tdVtdV)
+        tiled_tmem_ld_dV = tcgen05.make_tmem_copy(tmem_load_atom_dV, tdVtdV)
         thr_tmem_ld_dV = tiled_tmem_ld_dV.get_slice(tidx)
 
         tdVtdV_t2r_p = thr_tmem_ld_dV.partition_S(tdVtdV)
@@ -3919,8 +3930,11 @@ class FlashAttentionBackwardSm100:
         tdVgdV_r2g_p = thr_tmem_ld_dV.partition_D(tdVgdV)
         tdVgdV_r2g = self.split_wg(tdVgdV_r2g_p, wg_idx, num_wg)
 
+        tdVpdV = None
+        if const_expr(self.check_hdim_v_oob):
+            tdVpdV = self.predicate_hdim(tdVcdV_t2r, self.head_dim_v)
         if tidx < seqlen.seqlen_k - self.tile_n * n_block:
-            cute.copy(tiled_gmem_store_dV, tdVrdV_r2s, tdVgdV_r2g)
+            cute.copy(tiled_gmem_store_dV, tdVrdV_r2s, tdVgdV_r2g, pred=tdVpdV)
 
         cute.arch.sync_warp()
         with cute.arch.elect_one():
@@ -3930,7 +3944,7 @@ class FlashAttentionBackwardSm100:
         # dK
         pipeline_dKV.consumer_wait(consumer_state_dKV)
 
-        tiled_tmem_ld_dK = tcgen05.make_tmem_copy(tmem_load_atom, tdKtdK)
+        tiled_tmem_ld_dK = tcgen05.make_tmem_copy(tmem_load_atom_dK, tdKtdK)
         thr_tmem_ld_dK = tiled_tmem_ld_dK.get_slice(tidx)
 
         tdKtdK_t2r_p = thr_tmem_ld_dK.partition_S(tdKtdK)
@@ -3973,13 +3987,32 @@ class FlashAttentionBackwardSm100:
         tdKgdK_r2g_p = thr_tmem_ld_dK.partition_D(tdKgdK)
         tdKgdK_r2g = self.split_wg(tdKgdK_r2g_p, wg_idx, num_wg)
 
+        tdKpdK = None
+        if const_expr(self.check_hdim_oob):
+            tdKpdK = self.predicate_hdim(tdKcdK_t2r, self.head_dim)
         if tidx < seqlen.seqlen_k - self.tile_n * n_block:
-            cute.copy(tiled_gmem_store_dK, tdKrdK_r2s, tdKgdK_r2g)
+            cute.copy(tiled_gmem_store_dK, tdKrdK_r2s, tdKgdK_r2g, pred=tdKpdK)
 
         cute.arch.sync_warp()
         with cute.arch.elect_one():
             pipeline_dKV.consumer_release(consumer_state_dKV)
         return consumer_state_dKV
+
+    @cute.jit
+    def predicate_hdim(self, tcoord: cute.Tensor, limit: cutlass.Constexpr[int]) -> cute.Tensor:
+        """Per-store-vector head-dim predicate for the non-TMA dK/dV epilogue store.
+
+        ``tcoord`` is the (tile_n, hdim) identity tensor partitioned like the register data,
+        shape ((rep, 1), chunks, 1, 1) with one contiguous ``rep``-wide column chunk per copy
+        vector; the predicate drops the vector mode and marks each chunk whose first column
+        is inside ``limit``. Valid because ``limit`` is a multiple of ``rep``.
+        """
+        tpred = cute.make_rmem_tensor(
+            cute.make_layout((1, cute.size(tcoord, mode=[1]), 1, 1)), cutlass.Boolean
+        )
+        for i in cutlass.range_constexpr(cute.size(tcoord, mode=[1])):
+            tpred[0, i, 0, 0] = tcoord[0, i, 0, 0][1] < limit
+        return tpred
 
     @cute.jit
     def epilogue_dK_or_dV_tma(
