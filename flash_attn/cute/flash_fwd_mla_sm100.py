@@ -10,7 +10,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int64, Int32, Uint32, Boolean, const_expr
-from cutlass.cute import FastDivmodDivisor
+from cutlass.cute import FastDivmodDivisorV2
 import cutlass.pipeline as pipeline
 from cutlass.cute.nvgpu import cpasync, tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils
@@ -1570,7 +1570,7 @@ class FlashAttentionMLAForwardSm100:
                     )
             else:
                 # ==== Paged KV cp.async path (page_size != tile_n) ====
-                page_size_divmod = FastDivmodDivisor(cute.size(mV.shape[0]))
+                page_size_divmod = FastDivmodDivisorV2(cute.size(mV.shape[0]))
                 hdimv_split = self.hdimv // self.num_hdimv_splits
                 hdimv_split_per_cta = hdimv_split // self.cta_group_size
 

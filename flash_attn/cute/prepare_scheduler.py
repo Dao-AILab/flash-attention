@@ -8,7 +8,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass import Int32, const_expr, Float32
-from cutlass.cute import FastDivmodDivisor
+from cutlass.cute import FastDivmodDivisorV2
 import flash_attn.cute.utils as utils
 
 
@@ -107,8 +107,8 @@ class FlashPrepareScheduler:
         n_blocks_per_split: Optional[int],  # overrides heuristic
         stream: cuda.CUstream,
     ):
-        tile_m_divmod = FastDivmodDivisor(self.tile_m)
-        tile_n_divmod = FastDivmodDivisor(self.tile_n)
+        tile_m_divmod = FastDivmodDivisorV2(self.tile_m)
+        tile_n_divmod = FastDivmodDivisorV2(self.tile_n)
 
         @cute.struct
         class SharedStorage:
@@ -165,8 +165,8 @@ class FlashPrepareScheduler:
         num_batch: Int32,
         num_sm: Int32,
         num_splits_static: Int32,
-        tile_m_divmod: FastDivmodDivisor,
-        tile_n_divmod: FastDivmodDivisor,
+        tile_m_divmod: FastDivmodDivisorV2,
+        tile_n_divmod: FastDivmodDivisorV2,
         tile_count_semaphore: Optional[cute.Tensor],
         num_m_blocks_ptr: Optional[cute.Tensor],
         num_splits_dynamic_ptr: Optional[cute.Tensor],
@@ -283,7 +283,7 @@ class FlashPrepareScheduler:
         mSeqUsedQ: Optional[cute.Tensor],
         mCuSeqlensQ: Optional[cute.Tensor],
         seqlen_q_static: Int32,
-        tile_m_divmod: FastDivmodDivisor,
+        tile_m_divmod: FastDivmodDivisorV2,
         num_batch: Int32,
     ):
         seqlen = Int32(0)
@@ -322,7 +322,7 @@ class FlashPrepareScheduler:
         seqlen_k_static: Int32,
         seqlen_k_new_static: Int32,
         mLeftPadK: Optional[cute.Tensor],
-        tile_n_divmod: FastDivmodDivisor,
+        tile_n_divmod: FastDivmodDivisorV2,
         num_batch: Int32,
     ):
         leftpad_k = (
