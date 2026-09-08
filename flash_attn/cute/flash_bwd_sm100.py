@@ -54,14 +54,14 @@ from flash_attn.cute.block_sparse_utils import (
 #   * The compute-wide barriers that ordered the P-over-S and dS-over-dP overwrites are
 #     gone. They were cross-warp hazards: a warp's P (dS) columns overlap S (dP) lanes
 #     that another warp still has to load.
-# With warp_sync, the remaining compute-wide barriers before pipeline arrivals become
-# sync_warp: every mbarrier signalled from the compute warps expects one arrival per warp,
-# so the mbarrier itself is the cross-warp join. This is 1-CTA only: at 2-CTA the barrier
-# before the dS commit also orders every warp's sdS_xchg write ahead of the single-thread
-# DSMEM copy to the peer CTA. Both flags default on wherever eligible; the constructor
-# arguments exist only for A/B measurement (perf evidence in PR #2804).
-# In split mode the S handshake keeps its own phase/state (producer_phase_S,
-# consumer_state_S) so its parity never depends on where the other pipelines flip.
+#   * The remaining compute-wide barriers before pipeline arrivals become sync_warp: every
+#     mbarrier signalled from the compute warps expects one arrival per warp, so the
+#     mbarrier itself is the cross-warp join. This is 1-CTA only: at 2-CTA the barrier
+#     before the dS commit also orders every warp's sdS_xchg write ahead of the
+#     single-thread DSMEM copy to the peer CTA.
+# The S handshake keeps its own phase/state (producer_phase_S, consumer_state_S) so its
+# parity never depends on where the other pipelines flip. Perf evidence in PR #2804; the
+# aliased layout is what every other shape runs.
 
 
 class FlashAttentionBackwardSm100:
@@ -87,8 +87,6 @@ class FlashAttentionBackwardSm100:
         has_aux_tensors: cutlass.Constexpr = False,
         q_subtile_factor: cutlass.Constexpr[int] = 1,
         kv_subtile_factor: cutlass.Constexpr[int] = 1,
-        split_P_dS: Optional[bool] = None,
-        warp_sync: Optional[bool] = None,
     ):
         # padding head_dim to a multiple of 16 as k_block_size
         hdim_multiple_of = 16
@@ -161,21 +159,13 @@ class FlashAttentionBackwardSm100:
         self.use_smem_dS_for_mma_dK = False
 
         # See NOTE [hdim64 dedicated P/dS TMEM slots]
-        split_P_dS_eligible = (
+        self.split_P_dS = (
             cluster_size == 1
             and self.tile_m == 128
             and self.tile_n == 128
             and self.tile_hdim == 64
             and self.tile_hdimv == 64
             and not self.use_smem_dS_for_mma_dK
-        )
-        self.split_P_dS = split_P_dS_eligible if split_P_dS is None else split_P_dS
-        assert not self.split_P_dS or split_P_dS_eligible, (
-            "split_P_dS requires 1-CTA hdim64 with 128x128 tiles"
-        )
-        self.warp_sync = split_P_dS_eligible if warp_sync is None else warp_sync
-        assert not self.warp_sync or cluster_size == 1, (
-            "warp_sync requires 1-CTA, see NOTE [hdim64 dedicated P/dS TMEM slots]"
         )
 
         self.reduce_warp_ids = (0, 1, 2, 3)
@@ -3258,10 +3248,7 @@ class FlashAttentionBackwardSm100:
                     # S is in registers: release it before the softmax so the MMA warp can
                     # issue the next QK into the slot
                     cute.arch.fence_view_async_tmem_load()
-                    if const_expr(self.warp_sync):
-                        cute.arch.sync_warp()
-                    else:
-                        self.compute_sync_barrier.arrive_and_wait()
+                    cute.arch.sync_warp()
                     with cute.arch.elect_one():
                         pipeline_S_P.consumer_release(consumer_state_S)
                     consumer_state_S.advance()
@@ -3358,7 +3345,7 @@ class FlashAttentionBackwardSm100:
                 cute.arch.fence_view_async_tmem_store()
                 cute.arch.fence_view_async_shared()
                 # The P (or S_P) and LSE mbarriers expect one arrival per compute warp
-                if const_expr(self.warp_sync):
+                if const_expr(self.split_P_dS):
                     cute.arch.sync_warp()
                 else:
                     self.compute_sync_barrier.arrive_and_wait()
@@ -3486,7 +3473,7 @@ class FlashAttentionBackwardSm100:
 
                 cute.arch.fence_view_async_shared()
                 # The dS and dPsum mbarriers expect one arrival per compute warp
-                if const_expr(self.warp_sync):
+                if const_expr(self.split_P_dS):
                     cute.arch.sync_warp()
                 else:
                     self.compute_sync_barrier.arrive_and_wait()
