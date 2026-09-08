@@ -207,6 +207,7 @@ class dQdQvGemmKernel:
         # ------------------------------------------------------------------ #
         tiled_mma_v = utils.sm100.make_trivial_tiled_mma(
             self.ds_dtype,
+            self.ds_dtype,
             self.ds_major_mode,
             self.kv_major_mode,
             self.acc_dtype,
@@ -215,6 +216,7 @@ class dQdQvGemmKernel:
         )
         if const_expr(self.compute_dQ):
             tiled_mma_k = utils.sm100.make_trivial_tiled_mma(
+                self.ds_dtype,
                 self.ds_dtype,
                 self.ds_major_mode,
                 self.kv_major_mode,

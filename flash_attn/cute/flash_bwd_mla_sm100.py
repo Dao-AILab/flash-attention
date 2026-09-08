@@ -179,12 +179,12 @@ class FlashAttentionSparseMLABackwardSm100:
             self.tile_m,
         )
         # note: store P.T, dS.T as tile_n major (i.e., as P and dS)
-        self.major_mode_V = tcgen05.OperandMajorMode.K
-        self.major_mode_dO = tcgen05.OperandMajorMode.K
-        self.major_mode_Pt = tcgen05.OperandMajorMode.MN
-        self.major_mode_dOt = tcgen05.OperandMajorMode.MN
-        self.major_mode_dSt = tcgen05.OperandMajorMode.MN
-        self.major_mode_Qvt = tcgen05.OperandMajorMode.MN
+        self.major_mode_V = cute.nvgpu.OperandMajorMode.K
+        self.major_mode_dO = cute.nvgpu.OperandMajorMode.K
+        self.major_mode_Pt = cute.nvgpu.OperandMajorMode.MN
+        self.major_mode_dOt = cute.nvgpu.OperandMajorMode.MN
+        self.major_mode_dSt = cute.nvgpu.OperandMajorMode.MN
+        self.major_mode_Qvt = cute.nvgpu.OperandMajorMode.MN
         self.operand_source_V = tcgen05.OperandSource.SMEM
         self.operand_source_Pt = tcgen05.OperandSource.SMEM
         self.operand_source_dSt = tcgen05.OperandSource.SMEM
@@ -445,7 +445,7 @@ class FlashAttentionSparseMLABackwardSm100:
         ]
         tiled_mma_VdO, tiled_mma_PtdOt, tiled_mma_dStQvt = (
             sm100_utils.make_trivial_tiled_mma(
-                dtype_a, major_a, major_b, self.dtype_acc, self.cta_group, mma_tiler[:2], operand_source_a,
+                dtype_a, dtype_a, major_a, major_b, self.dtype_acc, self.cta_group, mma_tiler[:2], operand_source_a,
             )
             for _, dtype_a, major_a, major_b, mma_tiler, operand_source_a in _mma_specs
         )
