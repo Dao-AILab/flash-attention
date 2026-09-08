@@ -58,7 +58,7 @@ from flash_attn.cute.block_sparse_utils import (
 # sync_warp: every mbarrier signalled from the compute warps expects one arrival per warp,
 # so the mbarrier itself is the cross-warp join. This is 1-CTA only: at 2-CTA the barrier
 # before the dS commit also orders every warp's sdS_xchg write ahead of the single-thread
-# DSMEM copy to the peer CTA. Both flags default on wherever eligible; the explicit
+# DSMEM copy to the peer CTA. Both flags default on wherever eligible; the constructor
 # arguments exist only for A/B measurement (perf evidence in PR #2804).
 # In split mode the S handshake keeps its own phase/state (producer_phase_S,
 # consumer_state_S) so its parity never depends on where the other pipelines flip.
