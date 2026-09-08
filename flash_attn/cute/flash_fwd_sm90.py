@@ -43,7 +43,7 @@ from flash_attn.cute.tile_scheduler import (
     SingleTileLPTScheduler,
     SingleTileVarlenScheduler,
 )
-from cutlass.cute import FastDivmodDivisor
+from cutlass.cute import FastDivmodDivisorV2
 
 from flash_attn.cute.flash_fwd import FlashAttentionForwardBase
 from flash_attn.cute.utils import AuxData
@@ -730,7 +730,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         mPageTable,
                         mK,
                         mV,
-                        FastDivmodDivisor(mK.shape[0]),
+                        FastDivmodDivisorV2(mK.shape[0]),
                         batch_idx,
                         head_idx_kv,
                         tidx,
@@ -1067,10 +1067,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 fastdiv_mods = (
                     seqlen_q_divmod
                     if not recompute_fastdiv_mods_q
-                    else FastDivmodDivisor(seqlen.seqlen_q),
+                    else FastDivmodDivisorV2(seqlen.seqlen_q),
                     seqlen_k_divmod
                     if not recompute_fastdiv_mods_k
-                    else FastDivmodDivisor(seqlen.seqlen_k),
+                    else FastDivmodDivisorV2(seqlen.seqlen_k),
                 )
 
             mask = AttentionMaskCls(seqlen)

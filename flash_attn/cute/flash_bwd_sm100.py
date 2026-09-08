@@ -7,7 +7,7 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
-from cutlass.cute import FastDivmodDivisor
+from cutlass.cute import FastDivmodDivisorV2
 from cutlass import Float32, Int32, Int64, const_expr
 from cutlass.utils import LayoutEnum
 from cutlass.cute.nvgpu import cpasync, tcgen05
@@ -929,8 +929,8 @@ class FlashAttentionBackwardSm100:
                 self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1
             )
             seqlen_k = cute.size(mK.shape[0])
-            seqlen_q_divmod = FastDivmodDivisor(seqlen_q)
-            seqlen_k_divmod = FastDivmodDivisor(seqlen_k)
+            seqlen_q_divmod = FastDivmodDivisorV2(seqlen_q)
+            seqlen_k_divmod = FastDivmodDivisorV2(seqlen_k)
             fastdiv_mods = (seqlen_q_divmod, seqlen_k_divmod)
         self.use_block_sparsity = cutlass.const_expr(blocksparse_tensors is not None)
         if const_expr(self.use_block_sparsity and self.use_2cta_instrs):
@@ -3056,10 +3056,10 @@ class FlashAttentionBackwardSm100:
                 fastdiv_mods = (
                     seqlen_q_divmod
                     if not recompute_fastdiv_mods_q
-                    else FastDivmodDivisor(seqlen.seqlen_q),
+                    else FastDivmodDivisorV2(seqlen.seqlen_q),
                     seqlen_k_divmod
                     if not recompute_fastdiv_mods_k
-                    else FastDivmodDivisor(seqlen.seqlen_k),
+                    else FastDivmodDivisorV2(seqlen.seqlen_k),
                 )
             m_block_min, m_block_max = block_info.get_m_block_min_max(
                 seqlen, n_block // self.cluster_shape_mnk[0]

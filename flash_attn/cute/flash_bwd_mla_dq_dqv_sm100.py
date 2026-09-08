@@ -40,7 +40,7 @@ import cutlass.cute as cute
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 from cutlass import Int32, const_expr
-from cutlass.cute import FastDivmodDivisor
+from cutlass.cute import FastDivmodDivisorV2
 from cutlass.cute.nvgpu import cpasync, tcgen05
 from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 
@@ -152,7 +152,7 @@ class dQdQvGemmKernel:
         # Reshape GMEM layouts for static strides                            #
         # ------------------------------------------------------------------ #
         seqlen_q = Int32(0) if const_expr(varlen_q) else mdS.shape[1]
-        seqlen_q_divmod = FastDivmodDivisor(seqlen_q)
+        seqlen_q_divmod = FastDivmodDivisorV2(seqlen_q)
         seqlen_k = Int32(0) if const_expr(varlen_k) else mV.shape[1]
 
         # ---- group batch and seqlen modes in nonvarlen case ----
@@ -451,7 +451,7 @@ class dQdQvGemmKernel:
         mIdxTopK: cute.Tensor,
         mCuSeqlensQ: cute.Tensor,
         mCuSeqlensK: cute.Tensor,
-        seqlen_q_divmod: FastDivmodDivisor,
+        seqlen_q_divmod: FastDivmodDivisorV2,
         cluster_layout_vmnk: cute.Layout,
         sdS_layout: cute.ComposedLayout,
         sK_layout: Optional[cute.ComposedLayout],
@@ -1270,7 +1270,7 @@ class dQdQvGemmKernel:
     def find_batch_from_q(
         self,
         token: Int32,
-        seqlen_q_divmod: FastDivmodDivisor,
+        seqlen_q_divmod: FastDivmodDivisorV2,
         mCuSeqlensQ: Optional[cute.Tensor],
     ) -> Int32:
         """Find batch index from q token (binary search for varlen, divmod otherwise)"""
