@@ -787,19 +787,8 @@ def _flash_attn_fwd(
     use_dedicated_hd256_kernel = arch // 10 in [10, 11] and head_dim == 256 and head_dim_v == 256
 
     if use_dedicated_hd256_kernel and page_table is not None:
-        # The dedicated kernel takes its paged KV extent from the page-table
-        # width (`max_seqlen_k_paged = mPageTable.shape[1] * page_size`), so the
-        # table has to describe exactly ceil(max_seqlen_k / page_size) pages.
-        # Continuous-batching servers cannot satisfy that directly: they hand
-        # over the current batch maximum as `max_seqlen_k` (arbitrary, rarely
-        # page-aligned) together with a `page_table` whose width is fixed by the
-        # largest supported context, not by this batch. Normalize both here
-        # instead of requiring every caller to pre-slice: widen the KV extent to
-        # the enclosing page boundary and narrow the table to match.
-        #
-        # This must run before `_get_fwd_config`, the compile key and the page
-        # table conversion below, so tile selection, kernel specialization and
-        # the device-side tensor all see the same (normalized) values.
+        # The kernel derives KV capacity from the page-table width. Normalize
+        # both before config selection, cache-key construction and tensor conversion.
         required_pages = (max_seqlen_k + page_size - 1) // page_size
         assert page_table.shape[1] >= required_pages, (
             f"SM100 hd256 2CTA paged KV requires page_table to cover max_seqlen_k="
@@ -807,11 +796,7 @@ def _flash_attn_fwd(
             f"{required_pages} pages, got page_table.shape[1]={page_table.shape[1]}"
         )
         if max_seqlen_k % page_size != 0:
-            # Rounding the extent up only stays faithful to the caller's request
-            # if something still bounds each sequence at its true length;
-            # seqused_k is that bound (positions in [seqused_k, rounded) mask to
-            # exact-zero probability). Without it every sequence would silently
-            # attend to the remainder of its last page.
+            # seqused_k must mask the extra tokens introduced by page rounding.
             assert seqused_k is not None, (
                 f"SM100 hd256 2CTA paged KV rounds max_seqlen_k up to the page "
                 f"boundary ({max_seqlen_k} -> {required_pages * page_size}); pass "

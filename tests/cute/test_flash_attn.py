@@ -2666,31 +2666,7 @@ def test_flash_attn_paged_hd256_sm100_tma_shuffled():
 @pytest.mark.parametrize("max_seqlen_k_mode", ["batch_max", "page_aligned"])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_paged_hd256_sm100_tma_seqused_k(max_seqlen_k_mode, seqlen_q):
-    """Per-batch KV lengths (seqused_k) in the SM100 hd256 2CTA forward kernel.
-
-    Shaped after what a continuous-batching server hands the decoder: a paged
-    KV cache, a ``page_table`` whose width is fixed by the largest supported
-    context (wider than this batch needs), ``seqused_k`` carrying the actual
-    per-batch KV lengths, and ``max_seqlen_k`` as the current batch maximum.
-
-    ``max_seqlen_k_mode`` covers both callers:
-
-    * ``batch_max``    - ``max(seqused_k)`` (257 here), i.e. neither page-aligned
-      nor equal to ``page_table.shape[1] * page_size``. This is what vLLM's
-      decoder passes; the interface normalizes it up to the enclosing page and
-      narrows the table.
-    * ``page_aligned`` - the allocated capacity (512), what a caller that
-      pre-slices to the kernel's original contract passes.
-
-    Both must agree with a dense varlen reference over the true per-batch
-    lengths. KV beyond each sequence's ``seqused_k`` - the tail inside its last
-    page and every page after it - is poisoned with large finite values, so
-    attending past ``seqused_k`` (for instance if rounding the extent up leaked
-    into the last page) is a gross mismatch rather than a rounding difference.
-    Finite poison rather than NaN on purpose: masked positions still contribute
-    ``0 * value`` to the PV accumulation, and ``0 * NaN`` would poison a correct
-    kernel too.
-    """
+    """Check paged seqused_k against dense varlen for batch-max and capacity extents."""
     if not IS_SM100:
         pytest.skip("SM100-specific paged hd256 test")
     device = "cuda"
@@ -2734,6 +2710,8 @@ def test_flash_attn_paged_hd256_sm100_tma_seqused_k(max_seqlen_k_mode, seqlen_q)
     )
 
     # Paged layout at full capacity, everything past seqused_k poisoned.
+    # Use finite poison: masked PV terms still evaluate 0 * V, so NaNs would
+    # contaminate valid output.
     k_paged = torch.full(
         (total_pages, page_size, nheads_kv, d), 300.0, device=device, dtype=dtype
     )

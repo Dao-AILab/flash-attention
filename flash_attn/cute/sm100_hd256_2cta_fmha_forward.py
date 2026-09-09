@@ -877,12 +877,10 @@ class BlackwellFusedMultiHeadAttentionForward:
                         mma_block_coord[0],
                         seqlen_q,
                     )
-                # seqused_q/seqused_k override the static or cu_seqlens-derived
-                # lengths (same precedence as SeqlenInfoQK.create); cu_seqlens
-                # still provide the packing offsets. continue_cond is recomputed
-                # from the overridden seqlen_q with the identical expression in
-                # every warp section so all pipeline participants agree on which
-                # work tiles are skipped.
+                # NOTE [Per-batch sequence lengths]
+                # seqused overrides lengths, not cu_seqlens packing offsets.
+                # All four warp roles must use the same effective Q length when
+                # deciding which tiles to skip.
                 if cutlass.const_expr(mSeqUsedQ is not None):
                     seqlen_q = mSeqUsedQ[batch_coord]
                     continue_cond = not FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
@@ -1107,8 +1105,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                         mma_block_coord[0],
                         seqlen_q,
                     )
-                # See the load-warp comment: seqused overrides + consistent
-                # continue_cond recompute across warp sections.
+                # See NOTE [Per-batch sequence lengths]
                 if cutlass.const_expr(mSeqUsedQ is not None):
                     seqlen_q = mSeqUsedQ[batch_coord]
                     continue_cond = not FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
@@ -1366,8 +1363,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                         mma_block_coord[0],
                         seqlen_q,
                     )
-                # See the load-warp comment: seqused overrides + consistent
-                # continue_cond recompute across warp sections.
+                # See NOTE [Per-batch sequence lengths]
                 if cutlass.const_expr(mSeqUsedQ is not None):
                     seqlen_q = mSeqUsedQ[batch_coord]
                     continue_cond = not FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
@@ -1497,8 +1493,7 @@ class BlackwellFusedMultiHeadAttentionForward:
                         mma_block_coord[0],
                         seqlen_q,
                     )
-                # See the load-warp comment: seqused overrides + consistent
-                # continue_cond recompute across warp sections.
+                # See NOTE [Per-batch sequence lengths]
                 if cutlass.const_expr(mSeqUsedQ is not None):
                     seqlen_q = mSeqUsedQ[batch_coord]
                     continue_cond = not FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
