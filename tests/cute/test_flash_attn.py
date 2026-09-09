@@ -197,6 +197,138 @@ def test_flash_attn_value_dim_larger_than_query_dim():
     torch.testing.assert_close(out.float(), reference, atol=0.04, rtol=0.04)
 
 
+def check_sm90_hdim_padding(
+    d: int,
+    seqlen_q: int = 257,
+    seqlen_k: int = 513,
+    mask: str = "causal",
+    varlen: bool = False,
+    dtype: torch.dtype = torch.bfloat16,
+    d_v: int = 128,
+) -> None:
+    """Check the public forward/backward path against FP64 and low-precision eager."""
+    torch.manual_seed(0)
+    q = torch.randn(2, seqlen_q, 4, d, device="cuda", dtype=dtype, requires_grad=True)
+    k = torch.randn(2, seqlen_k, 4, d, device="cuda", dtype=dtype, requires_grad=True)
+    v = torch.randn(2, seqlen_k, 4, d_v, device="cuda", dtype=dtype, requires_grad=True)
+    causal = mask == "causal"
+    window = (32, 16) if mask == "local" else (None, None)
+    q_mask = k_mask = None
+    if varlen:
+        q_mask = (
+            torch.arange(seqlen_q, device="cuda")[None, :]
+            < torch.tensor([seqlen_q - 17, seqlen_q], device="cuda")[:, None]
+        )
+        k_mask = (
+            torch.arange(seqlen_k, device="cuda")[None, :]
+            < torch.tensor([seqlen_k - 23, seqlen_k], device="cuda")[:, None]
+        )
+        q_packed = torch.cat((q[0, : seqlen_q - 17], q[1]))
+        k_packed = torch.cat((k[0, : seqlen_k - 23], k[1]))
+        v_packed = torch.cat((v[0, : seqlen_k - 23], v[1]))
+        out, _ = flash_attn_varlen_func(
+            q_packed,
+            k_packed,
+            v_packed,
+            cu_seqlens_q=torch.tensor(
+                [0, seqlen_q - 17, 2 * seqlen_q - 17], device="cuda", dtype=torch.int32
+            ),
+            cu_seqlens_k=torch.tensor(
+                [0, seqlen_k - 23, 2 * seqlen_k - 23], device="cuda", dtype=torch.int32
+            ),
+            max_seqlen_q=seqlen_q,
+            max_seqlen_k=seqlen_k,
+            causal=causal,
+            window_size=window,
+        )
+    else:
+        out, _ = flash_attn_func(q, k, v, causal=causal, window_size=window)
+    dout = torch.randn_like(out)
+    grads = torch.autograd.grad(out, (q, k, v), dout)
+    if is_fake_mode():
+        return
+
+    q_ref, k_ref, v_ref = [x.detach().double().requires_grad_() for x in (q, k, v)]
+    out_ref, _ = attention_ref(
+        q_ref,
+        k_ref,
+        v_ref,
+        q_mask,
+        k_mask,
+        causal=causal,
+        window_size=window,
+        upcast=False,
+    )
+    out_pt, _ = attention_ref(
+        q,
+        k,
+        v,
+        q_mask,
+        k_mask,
+        causal=causal,
+        window_size=window,
+        upcast=False,
+        reorder_ops=True,
+    )
+    if varlen:
+        out_ref = torch.cat((out_ref[0, : seqlen_q - 17], out_ref[1]))
+        out_pt = torch.cat((out_pt[0, : seqlen_q - 17], out_pt[1]))
+    grads_ref = torch.autograd.grad(out_ref, (q_ref, k_ref, v_ref), dout.double())
+    grads_pt = torch.autograd.grad(out_pt, (q, k, v), dout)
+    for name, actual, reference, eager in zip(
+        ("out", "dq", "dk", "dv"),
+        (out, *grads),
+        (out_ref, *grads_ref),
+        (out_pt, *grads_pt),
+    ):
+        assert actual.isfinite().all(), name
+        error = (actual.double() - reference).abs()
+        eager_error = (eager.double() - reference).abs()
+        # Follow the attention tests' 2x eager-error allowance, including output rounding.
+        rounding = 2 * torch.finfo(dtype).eps * reference.abs()
+        check_tensor_vs_ref(
+            name, actual.double(), reference, eager.double(), atol=rounding.max().item()
+        )
+        assert error.mean() <= 2 * eager_error.mean() + rounding.mean(), name
+
+
+@pytest.mark.skipif(not IS_SM90, reason="SM90 backward padding regression")
+@pytest.mark.parametrize("d", [136, 144, 152, 160, 168, 176, 184, 192])
+@pytest.mark.parametrize("seqlen_q,seqlen_k", [(113, 211), (257, 513)])
+@pytest.mark.parametrize("mask", ["dense", "causal", "local"])
+@pytest.mark.parametrize("varlen", [False, True])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_sm90_hdim_padding(d, seqlen_q, seqlen_k, mask, varlen):
+    check_sm90_hdim_padding(d, seqlen_q, seqlen_k, mask, varlen)
+
+
+@pytest.mark.skipif(not IS_SM90, reason="SM90 backward padding regression")
+@pytest.mark.parametrize("d,d_v", [(144, 64), (160, 96)])
+@pytest.mark.parametrize("varlen", [False, True])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_sm90_hdim_padding_value_dim(d, d_v, varlen):
+    check_sm90_hdim_padding(d, varlen=varlen, d_v=d_v)
+
+
+@pytest.mark.skipif(not IS_SM90, reason="SM90 backward padding regression")
+@pytest.mark.parametrize(
+    "d_first,d_second",
+    [(144, 160), (160, 144), (144, 176), (176, 144), (128, 144), (144, 192)],
+)
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_sm90_hdim_padding_reuse(d_first, d_second):
+    """Dimensions sharing padded storage must remain correct back-to-back."""
+    check_sm90_hdim_padding(d_first)
+    check_sm90_hdim_padding(d_second)
+
+
+@pytest.mark.skipif(not IS_SM90, reason="SM90 backward padding regression")
+@pytest.mark.parametrize("d", [144, 176])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_sm90_hdim_padding_fp16(d):
+    check_sm90_hdim_padding(d, dtype=torch.float16)
+
+
 @pytest.mark.parametrize("head_dim", [72, 104])
 @pytest.mark.parametrize("causal", [False, True])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)

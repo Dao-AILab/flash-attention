@@ -1631,6 +1631,7 @@ def _compile_bwd_preprocess(
     qhead_per_kvhead,
     nheads_kv,
     has_cu_total_m_blocks,
+    hdim_multiple_of,
 ):
     """Compile bwd preprocess kernel using cute fake tensors (no real GPU tensors needed)."""
     mQ, mK, mV, mO, mdO, mdQ, mdK, mdV, mLSE, mLSElog2, mPdPsum, mdQaccum, mdKaccum, mdVaccum, mScaleP = make_fake_bwd_tensors(
@@ -1654,6 +1655,7 @@ def _compile_bwd_preprocess(
         pack_gqa=pack_gqa,
         qhead_per_kvhead=qhead_per_kvhead,
         nheads_kv=nheads_kv,
+        hdim_multiple_of=hdim_multiple_of,
     )
     return cute.compile(
         fa_bwd_pre, mO, mdO, mPdPsum, mLSE, mLSElog2, mdQaccum, mCuSeqlensQ, mSequsedQ, mdLSE,
@@ -1676,6 +1678,7 @@ def _bwd_preprocess(
     nheads_kv=1,         # only used with pack_gqa
     softmax_scale=1.0,   # only used with scale_p
     cu_total_m_blocks=None,
+    hdim_multiple_of=32,
     *,
     fake_mode,
 ):
@@ -1708,6 +1711,7 @@ def _bwd_preprocess(
         qhead_per_kvhead,
         nheads_kv,
         cu_total_m_blocks is not None,
+        hdim_multiple_of,
     )
     if compile_key not in _bwd_preprocess.compile_cache:
         _bwd_preprocess.compile_cache[compile_key] = _compile_bwd_preprocess(*compile_key)
@@ -1727,6 +1731,7 @@ def _compile_bwd_postprocess(
     use_2cta_instrs, cluster_size, arch,
     has_cu_total_m_blocks,
     learnable_sink_dtype,
+    hdim_multiple_of,
 ):
     """Compile bwd postprocess kernel using cute fake tensors."""
     mQ, mK, mV, mO, mdO, mdQ, mdK, mdV, mLSE, mLSElog2, mPdPsum, mdQaccum, mdKaccum, mdVaccum, mScaleP = make_fake_bwd_tensors(
@@ -1751,6 +1756,7 @@ def _compile_bwd_postprocess(
         dtype, hdim, arch, block_size, num_threads, atom_layout, swap_ab,
         use_2cta_instrs=use_2cta_instrs,
         cluster_size=cluster_size,
+        hdim_multiple_of=hdim_multiple_of,
     )
     return cute.compile(
         fa_bwd_post, mdQaccum, mdQ, Float32(0.0), mCuSeqlensQ, mSeqUsedQ,
@@ -1769,6 +1775,7 @@ def _bwd_postprocess_convert(
     use_2cta_instrs=False, cluster_size=1,
     cu_total_m_blocks=None,
     sink_tensors=None,
+    hdim_multiple_of=32,
     *,
     fake_mode,
 ):
@@ -1794,6 +1801,7 @@ def _bwd_postprocess_convert(
             if sink_tensors is not None
             else None
         ),
+        hdim_multiple_of,
     )
     if compile_key not in _bwd_postprocess_convert.compile_cache:
         _bwd_postprocess_convert.compile_cache[compile_key] = _compile_bwd_postprocess(*compile_key)
@@ -2124,7 +2132,9 @@ def _flash_attn_bwd(
     else:
         _validate_tensor(dv, "dv", v.shape, out_torch_dtype, device)
 
-    head_dim_rounded = (head_dim + 32 - 1) // 32 * 32
+    # Keep accumulator allocation, zeroing, and readback aligned with SM90's swapped MMA.
+    hdim_multiple_of = 64 if arch // 10 == 9 and dKV_swapAB else 32
+    head_dim_rounded = (head_dim + hdim_multiple_of - 1) // hdim_multiple_of * hdim_multiple_of
 
     if cu_seqlens_q is None:
         dq_accum = (
@@ -2239,6 +2249,7 @@ def _flash_attn_bwd(
         dtype, head_dim, head_dim_v, m_block_size,
         cu_total_m_blocks=cu_total_m_blocks_q,
         fake_mode=fake_mode,
+        hdim_multiple_of=hdim_multiple_of,
     )
     # num_threads: SM90 derives from BwdConfig.num_wg, SM120 is set to 128 above,
     # SM100/SM110 uses default from function signature (384).
@@ -2616,6 +2627,7 @@ def _flash_attn_bwd(
                 else None
             ),
             fake_mode=fake_mode,
+            hdim_multiple_of=hdim_multiple_of,
         )
 
         if dKV_postprocess:
@@ -2628,6 +2640,7 @@ def _flash_attn_bwd(
                 cluster_size=cluster_size,
                 cu_total_m_blocks=cu_total_m_blocks_k if cluster_size == 1 else None,
                 fake_mode=fake_mode,
+                hdim_multiple_of=hdim_multiple_of,
             )
             # Postprocess: convert dv_accum from float32 to dv in bf16/fp16
             _bwd_postprocess_convert(
@@ -2638,6 +2651,7 @@ def _flash_attn_bwd(
                 cluster_size=cluster_size,
                 cu_total_m_blocks=cu_total_m_blocks_k if cluster_size == 1 else None,
                 fake_mode=fake_mode,
+                hdim_multiple_of=hdim_multiple_of,
             )
 
     return (dq, dk, dv) if learnable_sink is None else (dq, dk, dv, dsink)
