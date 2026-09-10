@@ -483,6 +483,8 @@ class MHA(nn.Module):
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None):
         dtype = self.out_proj.weight.dtype if dtype is None else dtype
         device = self.out_proj.weight.device
+        if device == 'meta':
+            device = 'cuda' # do something else
         return torch.empty(
             batch_size,
             max_seqlen,
@@ -824,6 +826,8 @@ class ParallelMHA(nn.Module):
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None):
         dtype = self.out_proj.weight.dtype if dtype is None else dtype
         device = self.out_proj.weight.device
+        if device == 'meta':
+            device = 'cuda'
         return torch.empty(
             batch_size,
             max_seqlen,
