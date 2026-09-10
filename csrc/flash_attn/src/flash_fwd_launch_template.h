@@ -4,7 +4,7 @@
 
 #pragma once
 #include "namespace_config.h"
-#include <c10/cuda/CUDAException.h>  // For C10_CUDA_CHECK and C10_CUDA_KERNEL_LAUNCH_CHECK
+#include "cuda_check.h"
 
 #include "static_switch.h"
 #include "hardware_info.h"
@@ -81,7 +81,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                             // printf("IsEvenMNConst = %d, IsEvenKConst = %d, Is_local = %d, Is_causal = %d, ReturnSoftmaxConst = %d, Is_dropout = %d\n", int(IsEvenMNConst), int(IsEvenKConst), int(Is_local), int(Is_causal), int(ReturnSoftmaxConst), int(Is_dropout));
                             // auto kernel = &flash_fwd_kernel<Kernel_traits, false, Is_causal, false, true, true, false>;
                             if (smem_size >= 48 * 1024) {
-                                C10_CUDA_CHECK(cudaFuncSetAttribute(
+                                FLASHATTENTION_CUDA_CHECK(cudaFuncSetAttribute(
                                     kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
                             }
                             // int ctas_per_sm;
@@ -89,7 +89,7 @@ void run_flash_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                             //     &ctas_per_sm, kernel, Kernel_traits::kNThreads, smem_size);
                             // printf("smem_size = %d, CTAs per SM = %d\n", int(smem_size), ctas_per_sm);
                             kernel<<<grid, Kernel_traits::kNThreads, smem_size, stream>>>(params);
-                            C10_CUDA_KERNEL_LAUNCH_CHECK();
+                            FLASHATTENTION_CUDA_KERNEL_LAUNCH_CHECK();
                         });
                     });
                 });
@@ -121,11 +121,11 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
                                 // auto kernel = &flash_fwd_splitkv_kernel<Kernel_traits, Is_causal, false, true, Split, Append_KV>;
                                 // auto kernel = &flash_fwd_splitkv_kernel<Kernel_traits, Is_causal, false, IsEvenKConst>;
                                 if (smem_size >= 48 * 1024) {
-                                    C10_CUDA_CHECK(cudaFuncSetAttribute(
+                                    FLASHATTENTION_CUDA_CHECK(cudaFuncSetAttribute(
                                         kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
                                 }
                                 kernel<<<grid, Kernel_traits::kNThreads, smem_size, stream>>>(params);
-                                C10_CUDA_KERNEL_LAUNCH_CHECK();
+                                FLASHATTENTION_CUDA_KERNEL_LAUNCH_CHECK();
                             });
                         });
                     });
@@ -155,7 +155,7 @@ void run_flash_splitkv_fwd(Flash_fwd_params &params, cudaStream_t stream) {
             } else if (params.num_splits <= 128) {
                 flash_fwd_splitkv_combine_kernel<Kernel_traits, kBlockM, 7, IsEvenKConst><<<grid_combine, Kernel_traits::kNThreads, 0, stream>>>(params);
             }
-            C10_CUDA_KERNEL_LAUNCH_CHECK();
+            FLASHATTENTION_CUDA_KERNEL_LAUNCH_CHECK();
         });
     }
 }
@@ -306,7 +306,7 @@ void run_mha_fwd_hdim256(Flash_fwd_params &params, cudaStream_t stream) {
     status_ = cudaDeviceGetAttribute(
         &max_smem_per_block, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
     if (status_ != cudaSuccess) {
-      C10_CUDA_CHECK(status_);
+      FLASHATTENTION_CUDA_CHECK(status_);
     }
     // printf("max_smem_per_sm = %d, max_smem_per_block = %d\n", max_smem_per_sm, max_smem_per_block);
     DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
