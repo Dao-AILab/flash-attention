@@ -39,7 +39,12 @@ from flash_attn.cute import utils
 import flash_attn.cute.pipeline as pipeline_custom
 import cutlass.pipeline as cutlass_pipeline
 from flash_attn.cute.mask import AttentionMask
-from flash_attn.cute.softmax import SoftmaxSm100, apply_score_mod_inner
+from flash_attn.cute.softmax import (
+    SoftmaxSm100,
+    apply_score_mod_inner,
+    apply_learnable_sink,
+    load_learnable_sink,
+)
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute.block_sparsity import BlockSparseTensors
@@ -2708,14 +2713,15 @@ class FlashAttentionForwardSm100:
                 learnable_sink_val = [None] * self.q_stage
                 if const_expr(learnable_sink is not None):
                     if const_expr(not self.pack_gqa):
-                        sink_val = Float32(learnable_sink[head_idx])
-                        learnable_sink_val = [sink_val] * self.q_stage
+                        learnable_sink_val = [Float32(learnable_sink[head_idx])] * self.q_stage
                     else:  # Each thread might have a different sink value due to different q_head
                         for stage in cutlass.range_constexpr(self.q_stage):
-                            q_head_idx = (
-                                ((m_block * self.q_stage + stage) * self.cta_group_size + mma_tile_coord_v) * self.m_block_size + tidx
-                            ) % self.qhead_per_kvhead + head_idx * self.qhead_per_kvhead
-                            learnable_sink_val[stage] = Float32(learnable_sink[q_head_idx])
+                            packed_row = (
+                                (m_block * self.q_stage + stage) * self.cta_group_size + mma_tile_coord_v
+                            ) * self.m_block_size + tidx
+                            learnable_sink_val[stage] = load_learnable_sink(
+                                learnable_sink, head_idx, packed_row, self.qhead_per_kvhead, self.pack_gqa
+                            )
                 for stage in cutlass.range_constexpr(self.q_stage):
                     # pipeline_sm_stats.consumer_wait_w_index_phase(stage, sm_stats_consumer_phase)
                     sm_stats_barrier.arrive_and_wait_w_index(index=stage * 4 + warp_idx)
@@ -2729,17 +2735,16 @@ class FlashAttentionForwardSm100:
                         row_max = None
                     pipeline_sm_stats.consumer_release_w_index(stage)
                     if const_expr(learnable_sink is not None):
-                        LOG2_E = math.log2(math.e)
-                        sink_val = learnable_sink_val[stage]
+                        # Only the first split owns the sink column; empty rows occur with splitKV.
                         if const_expr(not self.is_split_kv) or split_idx == 0:
-                            if row_max == -Float32.inf:
-                                # It's possible to have an empty row with splitKV.
-                                row_max = sink_val * (LOG2_E / softmax_scale_log2_eff)
-                                row_sum = max_offset_scale
-                            else:
-                                row_sum += cute.math.exp2(
-                                    sink_val * LOG2_E - row_max * softmax_scale_log2_eff + max_offset, fastmath=True
-                                )
+                            row_max, row_sum = apply_learnable_sink(
+                                row_max,
+                                row_sum,
+                                learnable_sink_val[stage],
+                                softmax_scale_log2_eff,
+                                max_offset=max_offset,
+                                empty_row_sum=max_offset_scale,
+                            )
                     acc_O_mn_row_is_zero_or_nan = row_sum == 0.0 or row_sum != row_sum
                     stats[stage] = (row_sum, row_max, acc_O_mn_row_is_zero_or_nan)
                     scale = cute.arch.rcp_approx(row_sum if not acc_O_mn_row_is_zero_or_nan else 1.0)
