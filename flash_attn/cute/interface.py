@@ -79,6 +79,15 @@ BIN_BATCH_SEARCH_THRESH = 256  # above this batch size SingleTileVarlenScheduler
 USE_BLOCKS_TO_BATCH: bool = True
 
 
+def _normalize_max_seqlen(max_seqlen: Optional[int]) -> Optional[int]:
+    """Return a host scalar for compiled forward-kernel scalar arguments."""
+    if isinstance(max_seqlen, torch.Tensor):
+        if max_seqlen.numel() != 1:
+            raise ValueError("max_seqlen must be a scalar")
+        return int(max_seqlen.item())
+    return max_seqlen
+
+
 def _parse_arch_str(arch_str):
     """Parse arch string (e.g. 'sm_80', 'sm_90a', '80', '100') to int (e.g. 80, 90, 100)."""
     import re
@@ -784,6 +793,11 @@ def _flash_attn_fwd(
         max_seqlen_k = seqlen_k
     if cu_seqlens_k is None and seqused_k is None:
         min_seqlen_k = seqlen_k
+
+    # SM100/SM110 pass max_seqlen_q as a typed kernel argument.  On other
+    # architectures, preserve a tensor value to avoid an unnecessary host sync.
+    if arch // 10 in [10, 11]:
+        max_seqlen_q = _normalize_max_seqlen(max_seqlen_q)
 
     fwd_cfg = _get_fwd_config(
         arch=arch,
