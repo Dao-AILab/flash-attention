@@ -38,6 +38,7 @@ def rotary_kernel(
     IS_VARLEN: tl.constexpr,
     INTERLEAVED: tl.constexpr,
     CONJUGATE: tl.constexpr,
+    IS_PER_HEAD: tl.constexpr,
     BLOCK_H: tl.constexpr,
     BLOCK_M: tl.constexpr,
 ):
@@ -67,9 +68,26 @@ def rotary_kernel(
         rm_cs = rm + tl.load(SEQLEN_OFFSETS + pid_batch)
 
     rk_half = tl.arange(0, BLOCK_K // 2)
-    COS = COS + (rm_cs[:, None] * ROTARY_DIM_HALF + rk_half[None, :])
-    SIN = SIN + (rm_cs[:, None] * ROTARY_DIM_HALF + rk_half[None, :])
-    mask_cs = (rm_cs[:, None] < seqlen_ro) & (rk_half[None, :] < ROTARY_DIM_HALF)
+    if IS_PER_HEAD:
+        COS = COS + (
+            rh[:, None, None] * ROTARY_DIM_HALF
+            + rm_cs[None, :, None] * nheads * ROTARY_DIM_HALF
+            + rk_half[None, None, :]
+        )
+        SIN = SIN + (
+            rh[:, None, None] * ROTARY_DIM_HALF
+            + rm_cs[None, :, None] * nheads * ROTARY_DIM_HALF
+            + rk_half[None, None, :]
+        )
+        mask_cs = (
+            (rh[:, None, None] < nheads)
+            & (rm_cs[None, :, None] < seqlen_ro)
+            & (rk_half[None, None, :] < ROTARY_DIM_HALF)
+        )
+    else:
+        COS = COS + (rm_cs[:, None] * ROTARY_DIM_HALF + rk_half[None, :])
+        SIN = SIN + (rm_cs[:, None] * ROTARY_DIM_HALF + rk_half[None, :])
+        mask_cs = (rm_cs[:, None] < seqlen_ro) & (rk_half[None, :] < ROTARY_DIM_HALF)
     cos = tl.load(COS, mask=mask_cs, other=1.0).to(tl.float32)
     sin = tl.load(SIN, mask=mask_cs, other=0.0).to(tl.float32)
     if CONJUGATE:
@@ -114,8 +132,8 @@ def apply_rotary(
     Arguments:
         x: (batch, seqlen, nheads, headdim) if cu_seqlens is None
             else (total_seqlen, nheads, headdim).
-        cos: (seqlen_ro, rotary_dim / 2)
-        sin: (seqlen_ro, rotary_dim / 2)
+        cos: (seqlen_ro, rotary_dim / 2) or (seqlen_ro, nheads, rotary_dim / 2)
+        sin: (seqlen_ro, rotary_dim / 2) or (seqlen_ro, nheads, rotary_dim / 2)
         seqlen_offsets: integer or integer tensor of size (batch,)
         cu_seqlens: (batch + 1,) or None
         max_seqlen: int
@@ -131,8 +149,17 @@ def apply_rotary(
         batch_p_1 = cu_seqlens.shape[0]
         batch = batch_p_1 - 1
         seqlen = max_seqlen
-    seqlen_ro, rotary_dim = cos.shape
+    assert cos.ndim in (2, 3), (
+        "cos and sin must have shape (seqlen_ro, rotary_dim / 2) or "
+        "(seqlen_ro, nheads, rotary_dim / 2)"
+    )
     assert sin.shape == cos.shape
+    is_per_head = cos.ndim == 3
+    if is_per_head:
+        seqlen_ro, nheads_ro, rotary_dim = cos.shape
+        assert nheads_ro == nheads, "The number of rotary heads must match the input"
+    else:
+        seqlen_ro, rotary_dim = cos.shape
     rotary_dim *= 2
     assert rotary_dim <= headdim, "rotary_dim must be <= headdim"
     assert headdim <= 256, "Only support headdim <= 256"
@@ -179,6 +206,7 @@ def apply_rotary(
             is_varlen,
             interleaved,
             conjugate,
+            is_per_head,
             BLOCK_M=BLOCK_M,
             BLOCK_H=2,
         )
