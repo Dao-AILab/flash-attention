@@ -48,6 +48,55 @@ def test_varlen(
     )
     assert ok
 
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability()[0] not in (10, 11),
+    reason="SM100/SM110-only test",
+)
+@pytest.mark.parametrize("seqlens", ((128, 256), (129, 257)))
+@pytest.mark.parametrize("causal", (False, True))
+def test_hd256_varlen_epilogue(seqlens, causal):
+    """HD256 uses aligned stores for full tiles and predicates ragged tails."""
+    torch.manual_seed(20260814)
+    num_heads_q, num_heads_kv, head_dim = 4, 1, 256
+    total = sum(seqlens)
+    cu_seqlens = torch.tensor(
+        (0, seqlens[0], total),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    q = torch.randn(
+        total,
+        num_heads_q,
+        head_dim,
+        dtype=torch.bfloat16,
+        device="cuda",
+        requires_grad=True,
+    )
+    k = torch.randn(
+        total,
+        num_heads_kv,
+        head_dim,
+        dtype=torch.bfloat16,
+        device="cuda",
+        requires_grad=True,
+    )
+    v = torch.randn_like(k, requires_grad=True)
+
+    assert check_varlen_vs_torch_flash(
+        q,
+        k,
+        v,
+        cu_seqlens_q=cu_seqlens,
+        cu_seqlens_k=cu_seqlens,
+        total_q=total,
+        total_k=total,
+        causal=causal,
+        mha_type="mqa",
+    )
+
+
 def check_varlen_vs_torch_flash(
     q, k, v,
     cu_seqlens_q=None,

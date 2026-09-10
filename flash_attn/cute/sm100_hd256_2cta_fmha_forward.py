@@ -186,6 +186,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         descale_tensors: Optional[DescaleTensors] = None,
         blocksparse_tensors: Optional[cute.Tensor] = None,
         aux_data: AuxData = AuxData(),
+        max_seqlen_q: Optional[Int32] = None,
         stream: cuda.CUstream = None,
     ):
         # Keep parity with FlashAttentionForwardSm100.__call__ interface.
@@ -371,7 +372,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             cute.make_layout(
                 (s_q_total, d, ((h_r, h_k), b)),
                 stride=(
-                    o_norm.stride[1],
+                    cute.assume(o_norm.stride[1], divby=64),
                     o_norm.stride[4],
                     ((o_norm.stride[3], o_norm.stride[2]), o_norm.stride[0]),
                 ),
@@ -394,15 +395,25 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.o_dtype = o.element_type
         self.tilePlikeFP32 = self.qk_mma_tiler[1] // Float32.width * self.q_dtype.width
 
+        grid_q_extent = (
+            max_seqlen_q
+            if cutlass.const_expr(cum_seqlen_q is not None)
+            else cute.size(o.shape[0])
+        )
+        if cutlass.const_expr(cum_seqlen_q is not None):
+            assert max_seqlen_q is not None, (
+                "SM100 hd256 varlen forward requires max_seqlen_q for grid sizing"
+            )
+
         if cutlass.const_expr(self.use_clc_scheduler):
             self.tile_sched_params, grid = compute_grid_clc(
-                (s_q, o.shape[1], o.shape[2]) if cum_seqlen_q is not None else o.shape,
+                (grid_q_extent, o.shape[1], o.shape[2]),
                 self.cta_tiler,
                 (*self.cluster_shape_mn, 1),
             )
         else:
             self.tile_sched_params, grid = compute_grid(
-                (s_q, o.shape[1], o.shape[2]) if cum_seqlen_q is not None else o.shape,
+                (grid_q_extent, o.shape[1], o.shape[2]),
                 self.cta_tiler,
                 self.is_persistent,
             )
@@ -1467,14 +1478,16 @@ class BlackwellFusedMultiHeadAttentionForward:
 
                     mO_qdl_eff = mO_qdl
                     if cutlass.const_expr(cum_seqlen_q is not None):
-                        block_offset_o = (
-                            cuseqlen_q,
-                            Int32(0),
-                            Int32(0),
-                            ((Int32(0), Int32(0)), Int32(0)),
+                        # Every packed token row is 64-element aligned, so an
+                        # arbitrary cumulative row offset preserves vector-store
+                        # alignment. Keep the divisibility proof in the IR.
+                        offset_o = cute.assume(
+                            cuseqlen_q * mO_qdl.stride[0],
+                            divby=64,
                         )
-                        mO_qdl_eff = cute.domain_offset(
-                            cute.select(block_offset_o, mode=[0, 2, 3]), mO_qdl
+                        mO_qdl_eff = cute.make_tensor(
+                            mO_qdl.iterator + offset_o,
+                            mO_qdl.layout,
                         )
 
                     # (bM, bN, loopM, loopN, loopL)
