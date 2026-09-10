@@ -114,7 +114,7 @@ def _validate_head_dims(head_dim: int, head_dim_v: int, compute_capability: int,
     """Validate head dimension constraints based on compute capability."""
     is_deepseek_shape = head_dim == 192 and head_dim_v == 128
     is_deepseek_mla_absorbed_shape = (head_dim == 64 or head_dim == head_dim_v) and head_dim_v == 512
-    is_dedicate_kernel_shape = head_dim == 256 and head_dim_v == 256
+    is_dedicate_kernel_shape = (head_dim == 256 and head_dim_v == 256) or (head_dim == 512 and head_dim_v in (128, 256))
     is_standard_range = 8 <= head_dim <= 128 and 8 <= head_dim_v <= 128
 
     is_sm90_range = 8 <= head_dim <= 256 and 8 <= head_dim_v <= 256
@@ -312,6 +312,21 @@ def _get_fwd_config(
     mma_pv_is_rs: Optional[bool] = None,
     intra_wg_overlap: Optional[bool] = None,
 ) -> FwdConfig:
+    # Reuse Q storage for the output after its last read. This leaves room
+    # for 96 KV rows per stage with V256, while staying within SM100 SMEM
+    # and TMEM capacity. Each V slice retains the complete QK dot product.
+    if arch // 10 == 10 and head_dim == 512 and head_dim_v in (128, 256):
+        tile_n = tile_mn[1] if tile_mn is not None else (96 if head_dim_v == 256 else 64)
+        if num_splits < 1:
+            packed_q = max_seqlen_q * (qhead_per_kvhead if pack_gqa else 1)
+            m_blocks = (packed_q + 127) // 128
+            total_mblocks = batch_size * num_head_kv * m_blocks * (1 if pack_gqa else qhead_per_kvhead)
+            num_splits = num_splits_heuristic(
+                max(total_mblocks, 1), get_num_sms_for_selection(device.index, arch),
+                (max_seqlen_k + tile_n - 1) // tile_n, 128,
+            )
+        return FwdConfig(128, tile_n, True, True, 1, num_splits)
+
     if seqlen_q is None:
         seqlen_q = max_seqlen_q
 
@@ -745,6 +760,56 @@ def _flash_attn_fwd(
                 # Empty rows have lse == sink (see softmax.apply_learnable_sink). Heads are the
                 # last dim for the qv layout (lse_shape above) and second-to-last otherwise.
                 lse.copy_(learnable_sink if qv is not None else learnable_sink[:, None])
+        return out, lse, None, None
+
+    if arch // 10 == 10 and qv is None and head_dim == head_dim_v == 512:
+        if any(x is not None for x in (
+            learnable_sink, score_mod, mask_mod, block_sparse_tensors,
+            aux_tensors, aux_scalars, gather_kv_indices, scheduler_metadata,
+            seqlen_k_per_split,
+        )):
+            raise NotImplementedError("D512 supports dense/varlen/paged attention, causal and window masks, and softcap")
+        if tile_mn not in (None, (128, 32), (128, 64), (128, 96)):
+            raise ValueError("D512 forward supports tile_mn=(128, 32/64/96)")
+        if page_table is not None and seqused_k is None:
+            raise ValueError("D512 paged KV requires seqused_k with each sequence's actual KV length")
+        # The fused two-CTA specialization shares QK/softmax across all 512
+        # output columns. Other feature/layout combinations retain the general
+        # two-slice implementation below.
+        if (
+            not fake_mode and not is_fp8 and num_splits == 1
+            and not utils._get_disable_2cta_default(is_fwd=True)
+            and tile_mn is None and softcap in (None, 0.0)
+            and window_size_left in (None, -1)
+            and window_size_right in (None, -1)
+            and all(x is None for x in (
+                cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, page_table,
+                q_descale, k_descale, v_descale,
+            ))
+            and all(
+                t.stride(-1) == 1 and t.data_ptr() % 16 == 0
+                and all(s % 8 == 0 for s in t.stride()[:-1])
+                for t in (q, k, v, out)
+            )
+        ):
+            from flash_attn.cute.flash_fwd_sm100_hd512 import forward_sm100_d512
+            forward_sm100_d512(q, k, v, out, lse, softmax_scale, causal, arch=arch)
+            return out, lse, None, None
+        for start in range(0, 512, 256):
+            _flash_attn_fwd(
+                q, k, v[..., start:start + 256],
+                cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
+                seqused_q=seqused_q, seqused_k=seqused_k,
+                max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
+                min_seqlen_k=min_seqlen_k, softmax_scale=softmax_scale,
+                page_table=page_table,
+                causal=causal, softcap=softcap,
+                window_size_left=window_size_left, window_size_right=window_size_right,
+                num_splits=num_splits, pack_gqa=False, _arch=arch, tile_mn=tile_mn,
+                q_descale=q_descale, k_descale=k_descale, v_descale=v_descale,
+                return_lse=return_lse, out=out[..., start:start + 256], lse=lse,
+                disable_scheduler_metadata=True,
+            )
         return out, lse, None, None
 
     if is_fp8:
@@ -1914,7 +1979,19 @@ def _flash_attn_bwd(
         causal, window_size_left, window_size_right
     )
 
-    if arch // 10 == 12:
+    use_hd512_native = arch // 10 == 10 and head_dim == head_dim_v == 512
+    if use_hd512_native:
+        if deterministic or any(x is not None for x in (
+            learnable_sink, score_mod, score_mod_bwd, mask_mod,
+            block_sparse_tensors, aux_tensors, aux_scalars,
+        )):
+            raise NotImplementedError("D512 backward supports dense/varlen, causal/window masks and softcap; deterministic mode is unavailable")
+        # Native D512 returns after common input and output validation below.
+        m_block_size = n_block_size = 128
+        num_threads = 256
+        cluster_size = 2
+        use_2cta_instrs = True
+    elif arch // 10 == 12:
         # SM120: uses SM80 MMA with 99 KB SMEM, 128 threads (4 warps).
         m_block_size = 64
         n_block_size = 64
@@ -2145,6 +2222,16 @@ def _flash_attn_bwd(
         dv = torch.empty_like(v)
     else:
         _validate_tensor(dv, "dv", v.shape, out_torch_dtype, device)
+
+    if use_hd512_native:
+        from flash_attn.cute.flash_bwd_sm100_hd512 import backward_sm100_d512
+
+        return backward_sm100_d512(
+            q, k, v, out, dout, lse, dq, dk, dv, softmax_scale, causal, softcap,
+            window_size_left, window_size_right,
+            cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k,
+            max_seqlen_q, max_seqlen_k, dlse, arch=arch, fake_mode=fake_mode,
+        )
 
     # Keep accumulator allocation, zeroing, and readback aligned with SM90's swapped MMA.
     hdim_multiple_of = 64 if arch // 10 == 9 and dKV_swapAB else 32
@@ -3146,7 +3233,7 @@ class FlashAttnFunc(torch.autograd.Function):
     ):
         aux_scalars = tuple(aux_scalars) if aux_scalars else None
         shared_kv = k is v
-        if shared_kv and v.shape[-1] == 512:
+        if shared_kv and v.shape[-1] == 512 and (qv is not None or gather_kv_indices is not None):
             # specialize MLA attention formula
             # O = softmax(Q @ K.T + Qv @ V.T) @ V
             # by setting q, k to None
@@ -3286,7 +3373,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
     ):
         aux_scalars = tuple(aux_scalars) if aux_scalars else None
         shared_kv = k is v
-        if shared_kv and v.shape[-1] == 512:
+        if shared_kv and v.shape[-1] == 512 and (qv is not None or gather_kv_indices is not None):
             # specialize MLA attention formula
             # O = softmax(Q @ K.T + Qv @ V.T) @ V
             # by setting q, k to None
@@ -3341,6 +3428,10 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             seqused_k,
             *(aux_tensors or ()),
         )
+        ctx.d512_paged_kv = (
+            page_table is not None and qv is None and q is not None
+            and q.shape[-1] == v.shape[-1] == 512
+        )
         ctx.shared_kv = shared_kv
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
@@ -3360,6 +3451,8 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, dlse):
+        if ctx.d512_paged_kv:
+            raise NotImplementedError("D512 paged KV supports forward only; use dense/varlen KV for backward")
         q, k, v, qv, out, lse, p, row_max, gather_kv_indices, learnable_sink, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, *aux = ctx.saved_tensors
         aux_tensors = aux if aux else None
         if not ctx.return_lse:

@@ -222,7 +222,13 @@ class FlashAttentionForwardSm100:
         self.use_correction_warps_for_epi = not self.use_tma_O
         self.q_subtile_factor = q_subtile_factor
         self.kv_subtile_factor = kv_subtile_factor
-        assert not (self.is_split_kv and self.head_dim_v_padded >= 192), (
+        # D512/V256 uses one Q stage and aliases Q with the FP32 partial O.
+        # At N<=96, max(Q, O) + staged KV fits the 224 KiB SM100 budget.
+        d512_split_fits = (
+            self.head_dim_padded == 512 and self.head_dim_v_padded == 256
+            and q_stage == 1 and m_block_size == 128 and n_block_size <= 96
+        )
+        assert not (self.is_split_kv and self.head_dim_v_padded >= 192 and not d512_split_fits), (
             "SplitKV is not supported for hdim >= 192"
         )
         self.score_mod = score_mod
@@ -251,6 +257,7 @@ class FlashAttentionForwardSm100:
         self.enable_ex2_emu = _default_enable_ex2_emu
         self.s0_s1_barrier = False
         self.overlap_sO_sQ = (
+            (self.head_dim_padded == 512 and self.head_dim_v_padded == 256) or
             (self.head_dim_padded == 192 and self.head_dim_v_padded >= 64) or
             (self.head_dim_v_padded >= 128 and self.is_split_kv)
         )
