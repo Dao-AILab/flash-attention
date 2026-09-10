@@ -184,6 +184,15 @@ struct Flash_bwd_params : public Flash_fwd_params {
     // The pointer to the softmax d sum.
     void *__restrict__ dsoftmax_sum;
 
+    // One ALiBi slope-gradient partial per key block and warp. The allocation uses
+    // the smallest supported key block and largest supported number of warps.
+    static constexpr int kAlibiGradMinBlockN = 32;
+    static constexpr int kAlibiGradMaxWarps = 8;
+    float *__restrict__ dalibi_slopes_accum_ptr;
+    index_t dalibi_slopes_accum_head_stride;
+    // Optional contiguous (batch, head) output for the varlen segmented reduction.
+    float *__restrict__ dalibi_slopes_batched_ptr;
+
     bool deterministic;
     index_t dq_accum_split_stride;
 };
