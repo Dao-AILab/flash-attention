@@ -10,3 +10,5 @@ recursive-include flash_attn *.h
 recursive-include flash_attn *.cuh
 recursive-include flash_attn *.cpp
 recursive-include flash_attn *.hpp
+
+include setup_helpers.py
