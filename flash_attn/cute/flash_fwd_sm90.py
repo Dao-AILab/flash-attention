@@ -39,9 +39,12 @@ from flash_attn.cute.named_barrier import NamedBarrierFwd
 from quack.cute_dsl_utils import ParamsBase
 from flash_attn.cute.tile_scheduler import (
     TileSchedulerArguments,
+    SchedulerState,
+    SchedulingMode,
     SingleTileScheduler,
     SingleTileLPTScheduler,
     SingleTileVarlenScheduler,
+    DynamicPersistentVarlenScheduler,
 )
 from cutlass.cute import FastDivmodDivisor
 
@@ -56,11 +59,14 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         intra_wg_overlap: bool = True,
         mma_pv_is_rs: bool = True,
         paged_kv_non_tma: bool = False,
+        has_tile_count_semaphore: bool = False,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
         self.intra_wg_overlap = intra_wg_overlap
         self.mma_pv_is_rs = mma_pv_is_rs
+        self.has_tile_count_semaphore = has_tile_count_semaphore
+        self.sched_stages = 1
         self.buffer_align_bytes = 1024
         self.use_tma_KV = not paged_kv_non_tma
         assert self.use_tma_KV or not (self.check_hdim_oob or self.check_hdim_v_oob), (
@@ -132,12 +138,20 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mbar_ptr_Q_struct = cute.struct.MemRange[cutlass.Int64, 1 * 2]
         mbar_ptr_K_struct = cute.struct.MemRange[cutlass.Int64, self.num_stages * 2]
         mbar_ptr_V_struct = cute.struct.MemRange[cutlass.Int64, self.num_stages * 2]
+        # Scheduler mbarriers (full + empty) and the 4-int work tile broadcast buffer.
+        # These fit in the padding before the 1024B-aligned sV/sQ, so they cost no extra smem.
+        sched_mbar_size = self.sched_stages * 2 if const_expr(self.dynamic_persistent) else 0
+        sched_response_size = self.sched_stages * 4 if const_expr(self.dynamic_persistent) else 0
+        sched_mbar_ptr_struct = cute.struct.MemRange[cutlass.Int64, sched_mbar_size]
+        sched_response_struct = cute.struct.MemRange[Int32, sched_response_size]
 
         @cute.struct
         class SharedStorageQKV:
             mbar_ptr_Q: mbar_ptr_Q_struct
             mbar_ptr_K: mbar_ptr_K_struct
             mbar_ptr_V: mbar_ptr_V_struct
+            sched_mbar_ptr: sched_mbar_ptr_struct
+            sched_response: sched_response_struct
             sV: sV_struct
             sQ: sQ_struct
             sK: sK_struct
@@ -148,6 +162,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             mbar_ptr_Q: mbar_ptr_Q_struct
             mbar_ptr_K: mbar_ptr_K_struct
             mbar_ptr_V: mbar_ptr_V_struct
+            sched_mbar_ptr: sched_mbar_ptr_struct
+            sched_response: sched_response_struct
             sQ: sQV_struct
             sK: sK_struct
             sP: sP_struct
@@ -173,8 +189,14 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         learnable_sink: Optional[cute.Tensor] = None,
         blocksparse_tensors: Optional[BlockSparseTensors] = None,
         aux_data: AuxData = AuxData(),
+        num_splits_dynamic_ptr: Optional[cute.Tensor] = None,
+        tile_count_semaphore: Optional[cute.Tensor] = None,
+        virtual_batch_idx_ptr: Optional[cute.Tensor] = None,
+        num_nheads_in_l2_ptr: Optional[cute.Tensor] = None,
         mCuTotalMBlocks: Optional[cute.Tensor] = None,
         mCuTotalSplitsMBlocks: Optional[cute.Tensor] = None,
+        mBlocksToBatchIdx: Optional[cute.Tensor] = None,
+        max_seqlen_q: Int32 | int | None = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -192,6 +214,17 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         )
 
         self.varlen_q = mCuSeqlensQ is not None or mSeqUsedQ is not None
+        assert (tile_count_semaphore is not None) == self.has_tile_count_semaphore
+        assert num_splits_dynamic_ptr is None, "SplitKV is not supported on SM 9.0"
+        self.dynamic_persistent = self.has_tile_count_semaphore and self.varlen_q
+        self.is_persistent = self.dynamic_persistent
+        assert not (self.is_persistent and self.Q_in_regs), (
+            "persistent scheduling is incompatible with Q_in_regs: sO would alias sV, "
+            "which the deferred Q release does not protect"
+        )
+        self.scheduling_mode = (
+            SchedulingMode.DYNAMIC if self.dynamic_persistent else SchedulingMode.STATIC
+        )
 
         mQ, mK, mV, mO = [assume_tensor_aligned(t) for t in (mQ, mK, mV, mO)]
         QO_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
@@ -228,6 +261,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             self.pack_gqa and self.tile_m % self.qhead_per_kvhead != 0
         )
         self.use_tma_O = self.use_tma_Q
+        # Warps of the producer warpgroup that participate in the load also participate in
+        # the scheduler broadcast: only warp 0 with TMA and all 4 when either Q or KV uses cp.async.
+        self.num_sched_load_warps = 1 if (self.use_tma_KV and self.use_tma_Q) else 4
         # Producer needs more registers when doing cp.async Q or KV loads
         if const_expr(self.num_wg_mma == 2 and (not self.use_tma_Q or not self.use_tma_KV)):
             self.num_mma_regs, self.num_producer_regs = 224, 40
@@ -315,16 +351,27 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 (self.tile_m, self.tile_hdimv),  # No mcast
             )
         if const_expr(mCuSeqlensQ is not None or mSeqUsedQ is not None):
-            # TODO: dispatch to DynamicPersistentVarlenScheduler when appropriate
-            TileScheduler = SingleTileVarlenScheduler
+            TileScheduler = (
+                DynamicPersistentVarlenScheduler
+                if const_expr(self.dynamic_persistent)
+                else SingleTileVarlenScheduler
+            )
         else:
             TileScheduler = (
                 SingleTileScheduler
                 if const_expr(not self.is_causal or self.is_local)
                 else SingleTileLPTScheduler
             )
+        if const_expr(max_seqlen_q is None):
+            eff_seqlen_q = cute.size(mQ.shape[0])
+        else:
+            eff_seqlen_q = (
+                max_seqlen_q
+                if const_expr(not self.pack_gqa)
+                else max_seqlen_q * self.qhead_per_kvhead
+            )
         tile_sched_args = TileSchedulerArguments(
-            cute.ceil_div(cute.size(mQ.shape[0]), self.tile_m),
+            cute.ceil_div(eff_seqlen_q, self.tile_m),
             cute.size(mQ.shape[2]),
             cute.size(mQ.shape[3])
             if const_expr(mCuSeqlensQ is None)
@@ -343,12 +390,21 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             mSeqUsedQ=mSeqUsedQ,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
             element_size=self.dtype.width // 8,
-            is_persistent=False,
+            is_persistent=self.is_persistent,
             lpt=self.is_causal or self.is_local,
+            num_splits_dynamic_ptr=num_splits_dynamic_ptr,
+            virtual_batch_idx_ptr=virtual_batch_idx_ptr,
+            num_nheads_in_l2_ptr=num_nheads_in_l2_ptr,
             cu_total_m_blocks_ptr=mCuTotalMBlocks,
             cu_total_splits_m_blocks_ptr=mCuTotalSplitsMBlocks,
+            blocks_to_batch_idx_ptr=mBlocksToBatchIdx,
+            tile_count_semaphore=(
+                tile_count_semaphore.iterator if tile_count_semaphore is not None else None
+            ),
         )
-        tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
+        tile_sched_params = TileScheduler.to_underlying_arguments(
+            tile_sched_args, scheduling_mode=self.scheduling_mode
+        )
         grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
         softmax_scale_log2, softmax_scale = utils.compute_softmax_scale_log2(
             softmax_scale, self.score_mod
@@ -577,10 +633,35 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             window_size_right=window_size_right,
             qhead_per_kvhead_packgqa=self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1,
         )
-        TileSchedulerCls = partial(TileScheduler.create, tile_sched_params)
 
         # Cluster wait before starting
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
+
+        if const_expr(self.dynamic_persistent):
+            # Scheduler pipeline consumer group is all threads of warps that do work:
+            # both consumer warpgroups and the load warps that participate -- warp 0
+            # when using TMA, warps 0-3 when Q or KV uses cp.async.
+            sched_ctx = SchedulerState.create_dynamic_persistent(
+                work_info=storage.sched_response.get_tensor((4,)),
+                pipeline=pipeline.PipelineAsync.create(
+                    barrier_storage=storage.sched_mbar_ptr.data_ptr(),
+                    num_stages=self.sched_stages,
+                    producer_group=pipeline.CooperativeGroup(pipeline.Agent.Thread),
+                    consumer_group=pipeline.CooperativeGroup(
+                        pipeline.Agent.Thread,
+                        self.num_mma_threads + cute.arch.WARP_SIZE * self.num_sched_load_warps,
+                    ),
+                ),
+                consumer_state=pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Consumer, self.sched_stages
+                ),
+                producer_state=pipeline.make_pipeline_state(
+                    pipeline.PipelineUserType.Producer, self.sched_stages
+                ),
+            )
+            TileSchedulerCls = partial(TileScheduler.create, tile_sched_params, ctx=sched_ctx)
+        else:
+            TileSchedulerCls = partial(TileScheduler.create, tile_sched_params)
 
         if warp_idx < 4:  # Producer
             cute.arch.setmaxregister_decrease(self.num_producer_regs)
@@ -667,7 +748,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
         # TMA: only warp 0 loads. cp_async: all warps load.
         # When not use_tma_Q, all 128 producer threads participate in Q loading.
-        is_load_warp = warp_idx_in_wg == 0 or const_expr(not self.use_tma_KV or not self.use_tma_Q)
+        is_load_warp = warp_idx_in_wg == 0 or const_expr(self.num_sched_load_warps == 4)
         # KV loading restricted to warp 0 for TMA, all warps for non-TMA KV
         is_kv_load_warp = warp_idx_in_wg == 0 or const_expr(not self.use_tma_KV)
 
@@ -907,9 +988,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                             self.q_subtile_factor,
                         )
 
-                tile_scheduler.prefetch_next_work()
-                tile_scheduler.advance_to_next_work()
-                work_tile = tile_scheduler.get_current_work()
+                # Only warp 0 drives the scheduler: it owns the atomic tile counter and the
+                # smem broadcast. Every warp in the loop then picks up the result.
+                if warp_idx_in_wg == 0:
+                    tile_scheduler.prefetch_next_work()
+                work_tile = tile_scheduler.advance_to_next_work()
                 # End of persistent scheduler loop
 
             # Producer tail is only useful for cluster to avoid early exit of blocks.
@@ -917,6 +1000,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             # need it for Q (no cluster) and K.
             if is_kv_load_warp:
                 pipeline_v.producer_tail(kv_producer_state)
+            if warp_idx_in_wg == 0:
+                tile_scheduler.producer_tail()
 
     @cute.jit
     def load_KV(
@@ -1183,8 +1268,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                             mask_fn=partial(mask_fn, mask_mod=self.mask_mod, mask_seqlen=False),
                         )
                         O_should_accumulate = True
-                # Release Q pipeline so the producer can load the next tile's Q
-                pipeline_q.consumer_release_w_index(0)
+                # Release Q pipeline so the producer can load the next tile's Q.
+                # When persistent, sO aliases sQ, so this is deferred to after the epilogue.
+                if const_expr(not self.is_persistent):
+                    pipeline_q.consumer_release_w_index(0)
                 # Last "half" iteration
                 if const_expr(self.intra_wg_overlap):
                     kv_consumer_state = process_last_half_block(
@@ -1222,8 +1309,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     self.q_subtile_factor,
                 )
 
-                # Release Q pipeline so the producer can load the next tile's Q
-                pipeline_q.consumer_release_w_index(0)
+                # Release Q pipeline so the producer can load the next tile's Q.
+                # When persistent, sO aliases sQ, so this is deferred to after the epilogue.
+                if const_expr(not self.is_persistent):
+                    pipeline_q.consumer_release_w_index(0)
 
                 # Handle empty case (when no blocks to process)
                 if not processed_any:
@@ -1249,6 +1338,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             row_scale = softmax.finalize(sink_val=sink_val)
             softmax.rescale_O(acc_O, row_scale)
 
+            # Fetch the next work tile before the epilogue so the producer can start loading
+            # it while we're still writing out O.
+            work_tile = tile_scheduler.advance_to_next_work()
+
             # ///////////////////////////////////////////////////////////////////////////////
             # Epilogue
             # ///////////////////////////////////////////////////////////////////////////////
@@ -1268,8 +1361,15 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 batch_idx,
             )
 
-            tile_scheduler.advance_to_next_work()
-            work_tile = tile_scheduler.get_current_work()
+            # sO aliases sQ: with TMA O only warp 4 waits for the store to finish reading
+            # sO, so sync with it before releasing sQ to the producer.
+            if const_expr(self.is_persistent):
+                if const_expr(self.use_tma_O):
+                    cute.arch.barrier(
+                        barrier_id=int(NamedBarrierFwd.EpilogueSOFree),
+                        number_of_threads=self.num_epilogue_threads,
+                    )
+                pipeline_q.consumer_release_w_index(0)
 
     @cute.jit
     def first_half_block_overlap(
