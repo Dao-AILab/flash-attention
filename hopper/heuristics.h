@@ -36,8 +36,18 @@ inline int num_splits_heuristic(int total_mblocks, int num_SMs, int num_n_blocks
             return 1;
         }
     }
-    // If num_n_blocks is too small, use 1 split. For example, we never split for hdim = 128 and seqlen_k = 512.
-    if (num_n_blocks <= 4) { return 1; }
+    // Guard 1: L_K <= 384 (nblk <= 3) - leave shorter contexts unchanged
+    if (num_n_blocks <= 3) { return 1; }
+
+    // Guard 2: nblk = 4 boundary bucket with enough tiles
+    // total_mblocks is the aggregate work-tile count; for decode (L_Q = 1),
+    // this reduces to batch_size * num_heads_kv.
+    if (num_n_blocks <= 4 && total_mblocks >= 4) { return 1; }
+
+    // Low-tile boundary case: demonstrate the idea with one small override
+    if (num_n_blocks == 4 && total_mblocks < 4) { return 3; }
+
+    // For longer contexts, existing efficiency loop runs (unchanged)
     max_splits = std::min({max_splits, num_SMs, num_n_blocks});
     float max_efficiency = 0.f;
     std::vector<float> efficiency;
