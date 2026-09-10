@@ -954,6 +954,7 @@ def flash_attn_with_kvcache(
     page_table: Optional[torch.Tensor] = None,
     cu_seqlens_q: Optional[torch.Tensor] = None,
     cu_seqlens_k_new: Optional[torch.Tensor] = None,
+    seqused_q: Optional[torch.Tensor] = None,
     max_seqlen_q: Optional[int] = None,
     rotary_seqlens: Optional[torch.Tensor] = None,
     q_descale: Optional[torch.Tensor] = None,
@@ -1029,6 +1030,9 @@ def flash_attn_with_kvcache(
         rotary_sin [optional]: (seqlen_ro, rotary_dim / 2). Similar to rotary_cos.
         cache_seqlens: int, or (batch_size,), dtype torch.int32. The sequence lengths of the
             KV cache.
+        seqused_q: Optional[torch.Tensor]: Per-batch number of query tokens to
+            execute. Query rows beyond this length are not written and may be
+            left uninitialized.
         cache_batch_idx: (batch_size,), dtype torch.int32. The indices used to index into the KV cache.
             If None, we assume that the batch indices are [0, 1, 2, ..., batch_size - 1].
             If the indices are not distinct, and k and v are provided, the values updated in the cache
@@ -1076,7 +1080,7 @@ def flash_attn_with_kvcache(
         cu_seqlens_q,
         None,  # cu_seqlens_k
         cu_seqlens_k_new,
-        None,  # seqused_q
+        seqused_q,
         cache_seqlens,
         max_seqlen_q,
         None,  # max_seqlen_k
@@ -1110,6 +1114,7 @@ def get_scheduler_metadata(
     headdim_v=None,
     cu_seqlens_q: Optional[torch.Tensor] = None,
     cu_seqlens_k_new: Optional[torch.Tensor] = None,
+    seqused_q: Optional[torch.Tensor] = None,
     cache_leftpad: Optional[torch.Tensor] = None,
     page_size: Optional[int] = None,
     max_seqlen_k_new=0,
@@ -1131,7 +1136,7 @@ def get_scheduler_metadata(
         cu_seqlens_q,
         None,  # cu_seqlens_k
         cu_seqlens_k_new,
-        None,  # seqused_q
+        seqused_q,
         cache_leftpad,
         page_size,
         max_seqlen_k_new,
