@@ -49,6 +49,7 @@ from flash_attn.cute.flash_bwd_sm120 import FlashAttentionBackwardSm120
 from flash_attn.cute.flash_bwd_postprocess import (
     FlashAttentionBackwardPostprocess,
     LearnableSinkBwdTensors,
+    DSinkReduceKernel,
 )
 from flash_attn.cute.flash_fwd_combine import FlashAttentionForwardCombine
 from flash_attn.cute.flash_fwd_mla_sm100 import FlashAttentionMLAForwardSm100
@@ -741,12 +742,9 @@ def _flash_attn_fwd(
             if learnable_sink is None:
                 lse.fill_(float("-inf"))
             else:
-                assert qv is None
-                lse.copy_(
-                    learnable_sink[None, :, None]
-                    if cu_seqlens_q is None
-                    else learnable_sink[:, None]
-                )
+                # Empty rows have lse == sink (see softmax.apply_learnable_sink). Heads are the
+                # last dim for the qv layout (lse_shape above) and second-to-last otherwise.
+                lse.copy_(learnable_sink if qv is not None else learnable_sink[:, None])
         return out, lse, None, None
 
     if is_fp8:
@@ -925,7 +923,6 @@ def _flash_attn_fwd(
         assert tile_n == 128
 
         assert not is_split_kv, "split kv not supported with qv"
-
         assert softcap is None
         assert score_mod is None
         assert mask_mod is None
@@ -1409,8 +1406,8 @@ def _flash_attn_fwd(
                 page_table_tensor,
                 window_size_left,
                 window_size_right,
-                learnable_sink = learnable_sink_tensor,
-                stream = current_stream,
+                learnable_sink=learnable_sink_tensor,
+                stream=current_stream,
                 options="--enable-tvm-ffi",
             )
         else:
@@ -1491,7 +1488,7 @@ def _flash_attn_fwd(
                 page_table,
                 window_size_left,
                 window_size_right,
-                learnable_sink
+                learnable_sink,
             )
         else:
             call_args = [
@@ -1711,7 +1708,7 @@ def _bwd_preprocess(
         nheads_major,
         pack_gqa,
         qhead_per_kvhead,
-        nheads_kv, 
+        nheads_kv,
         cu_total_m_blocks is not None,
         hdim_multiple_of,
     )
@@ -2662,42 +2659,29 @@ def _flash_attn_bwd(
 _flash_attn_bwd.compile_cache = get_jit_cache("bwd")
 
 
-def _bwd_dsink_reduce(dpsum, lse, learnable_sink, cu_seqlens_q=None):
-    """Compute dsink[h] = -sum_rows(exp(sink[h] - lse[row,h]) * dpsum[row,h])."""
-    from flash_attn.cute.flash_bwd_mla_sm100 import DSinkReductionKernel
-
+def _bwd_dsink_reduce(
+    dpsum: torch.Tensor, lse: torch.Tensor, learnable_sink: torch.Tensor
+) -> torch.Tensor:
+    """dsink for backward passes with head-minor (…, nheads) dpsum/lse and no postprocess kernel."""
+    nheads = learnable_sink.shape[0]
+    dpsum, lse = dpsum.reshape(-1, nheads), lse.reshape(-1, nheads)
     dsink = torch.empty_like(learnable_sink)
-    is_varlen = cu_seqlens_q is not None
-
-    compile_key = (
-        is_varlen,
-        torch2cute_dtype_map[learnable_sink.dtype],
-    )
+    compile_key = torch2cute_dtype_map[learnable_sink.dtype]
     if compile_key not in _bwd_dsink_reduce.compile_cache:
-        kernel_obj = DSinkReductionKernel(num_threads=256)
-        dpsum_tensor = to_cute_tensor(dpsum)
-        lse_tensor = to_cute_tensor(lse)
-        sink_tensor = to_cute_tensor(learnable_sink, assumed_align=4, leading_dim=0)
-        dsink_tensor = to_cute_tensor(dsink, assumed_align=4, leading_dim=0)
-        cu_seqlens_q_tensor = (
-            to_cute_tensor(cu_seqlens_q, assumed_align=4, leading_dim=0)
-            if cu_seqlens_q is not None
-            else None
-        )
+        sink_tensor, dsink_tensor = [
+            to_cute_tensor(t, assumed_align=4, leading_dim=0) for t in (learnable_sink, dsink)
+        ]
         _bwd_dsink_reduce.compile_cache[compile_key] = cute.compile(
-            kernel_obj,
-            dpsum_tensor,
-            lse_tensor,
+            DSinkReduceKernel(),
+            to_cute_tensor(dpsum),
+            to_cute_tensor(lse),
             sink_tensor,
             dsink_tensor,
-            cu_seqlens_q_tensor,
             cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
             options="--enable-tvm-ffi",
         )
     if not is_fake_mode():
-        _bwd_dsink_reduce.compile_cache[compile_key](
-            dpsum, lse, learnable_sink, dsink, cu_seqlens_q,
-        )
+        _bwd_dsink_reduce.compile_cache[compile_key](dpsum, lse, learnable_sink, dsink)
     return dsink
 
 
@@ -2733,7 +2717,7 @@ def _flash_attn_bwd_sparse_mla(
     dk: Optional[torch.Tensor] = None,
     dv: Optional[torch.Tensor] = None,
     dqv: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     fake_mode = is_fake_mode()
     arch = _get_device_arch()
     assert arch // 10 in [10, 11], "Unsupported compute capability. Supported: 10.x, 11.x"
@@ -2747,7 +2731,6 @@ def _flash_attn_bwd_sparse_mla(
     assert nheads_kv == 1 and qhead_per_kvhead == 128, f"sparse MLA bwd: only MQA 128 supported for now"
     assert gather_kv_length % 128 == 0, f"sparse MLA bwd: {gather_kv_length=} must be divisible by 128"
     assert deterministic is False, "sparse MLA bwd: deterministic mode not yet supported"
-    # learnable_sink is supported: dsink computed after main backward kernel
     assert seqused_q is None and seqused_k is None, "sparse MLA bwd: seqused_q,k not yet supported"
 
     if softmax_scale is None:
@@ -2857,7 +2840,6 @@ def _flash_attn_bwd_sparse_mla(
         seqused_k is None,
         q is not None,
         gather_kv_length,
-        learnable_sink is not None,
         disable_sparse_kv_bitmask,
     )
 
@@ -2868,10 +2850,9 @@ def _flash_attn_bwd_sparse_mla(
             cu_seqlens_k_tensor,
             seqused_q_tensor,
             seqused_k_tensor,
-            learnable_sink_tensor,
         ) = [
             to_cute_tensor(t, assumed_align=4, leading_dim=0)
-            for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, learnable_sink)
+            for t in (cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k)
         ]
         (
             v_tensor,
@@ -2949,10 +2930,8 @@ def _flash_attn_bwd_sparse_mla(
     
     # return dk, dv in float32: all-reduce across sequence-parallel ranks must happen
     # before downcasting to avoid rounding error during inter-rank grad accumulation
-    if learnable_sink is not None:
-        dsink = _bwd_dsink_reduce(dpsum, lse, learnable_sink, cu_seqlens_q)
-        return dq, dk, dv, dqv, dsink
-    return dq, dk, dv, dqv, None
+    dsink = _bwd_dsink_reduce(dpsum, lse, learnable_sink) if learnable_sink is not None else None
+    return dq, dk, dv, dqv, dsink
 
 _flash_attn_bwd_sparse_mla.compile_cache = get_jit_cache("bwd_dsa")
 
@@ -3373,7 +3352,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
         if dout is None:
             dout = torch.zeros_like(out)
         if qv is not None:
-            dq, dk, dv, dqv = _flash_attn_bwd_sparse_mla(
+            dq, dk, dv, dqv, dsink = _flash_attn_bwd_sparse_mla(
                 q,
                 k,
                 v,
@@ -3384,6 +3363,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 p,
                 row_max,
                 gather_kv_indices,
+                learnable_sink=learnable_sink,
                 softmax_scale=ctx.softmax_scale,
                 causal=ctx.causal,
                 cu_seqlens_q=cu_seqlens_q,
@@ -3395,9 +3375,9 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 min_seqlen_k=ctx.min_seqlen_k,
             )
             if ctx.shared_kv:
-                return dqv, dv, None, None, *((None,) * 31)
+                return dqv, dv, None, None, *((None,) * 12), dsink, *((None,) * 14)
             else:
-                return dq, dk, dv, dqv, *((None,) * 31)
+                return dq, dk, dv, dqv, *((None,) * 12), dsink, *((None,) * 14)
         else:
             bwd_result = _flash_attn_bwd(
                 q,

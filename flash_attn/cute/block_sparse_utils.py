@@ -7,7 +7,6 @@ These utilities are used by CUTE DSL kernels to produce and consume block-sparse
 
 from typing import Callable, Optional, Tuple
 from functools import partial
-import math
 import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, const_expr
@@ -18,6 +17,7 @@ from quack import copy_utils
 from flash_attn.cute.block_sparsity import BlockSparseTensors
 from flash_attn.cute.named_barrier import NamedBarrierBwd
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
+from flash_attn.cute.softmax import apply_learnable_sink, load_learnable_sink
 from flash_attn.cute.utils import AuxData
 
 
@@ -878,7 +878,6 @@ def handle_block_sparse_empty_tile_correction_sm100(
     This helper intentionally does not touch `mbar_P_full_*` since no P is produced.
     See NOTE [SM100 block-sparse empty tiles: mbarrier contract].
     """
-    LOG2_E = Float32(math.log2(math.e))
     warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx()) % 4
 
     for stage in cutlass.range_constexpr(q_stage):
@@ -886,24 +885,26 @@ def handle_block_sparse_empty_tile_correction_sm100(
         row_max_value = (
             -Float32.inf if const_expr(mLSE is not None or learnable_sink is not None) else None
         )
+        # Threads >= m_block_size hold no row; their stats are never stored.
         if const_expr(learnable_sink is not None):
-            sink_val = -Float32.inf
-            if const_expr(not pack_gqa):
-                sink_val = Float32(learnable_sink[head_idx])
-            elif tidx < m_block_size:
-                q_head_idx = (
-                    (q_stage * m_block + stage) * m_block_size + tidx
-                ) % qhead_per_kvhead + head_idx * qhead_per_kvhead
-                sink_val = Float32(learnable_sink[q_head_idx])
-            if sink_val != -Float32.inf and (const_expr(not is_split_kv) or split_idx == 0):
-                if row_max_value == -Float32.inf:
-                    row_max_value = sink_val * (LOG2_E / softmax_scale_log2)
-                    row_sum_value = max_offset_scale
-                else:
-                    row_sum_value = row_sum_value + cute.math.exp2(
-                        sink_val * LOG2_E - row_max_value * softmax_scale_log2 + max_offset,
-                        fastmath=True,
-                    )
+            if (const_expr(not pack_gqa) or tidx < m_block_size) and (
+                const_expr(not is_split_kv) or split_idx == 0
+            ):
+                sink_val = load_learnable_sink(
+                    learnable_sink,
+                    head_idx,
+                    (q_stage * m_block + stage) * m_block_size + tidx,
+                    qhead_per_kvhead,
+                    pack_gqa,
+                )
+                row_max_value, row_sum_value = apply_learnable_sink(
+                    row_max_value,
+                    row_sum_value,
+                    sink_val,
+                    softmax_scale_log2,
+                    max_offset=max_offset,
+                    empty_row_sum=max_offset_scale,
+                )
         if tidx < m_block_size:
             scale_row_idx = tidx + stage * m_block_size
             sScale[scale_row_idx] = row_sum_value

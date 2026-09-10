@@ -42,6 +42,96 @@ class LearnableSinkBwdTensors(NamedTuple):
         return LearnableSinkBwdTensors(*values)
 
 
+@cute.jit
+def dsink_row_term(sink_val: Float32, lse_val: Float32, dpsum_val: Float32) -> Float32:
+    """One row's contribution -exp(sink - lse) * dpsum to dsink; see `softmax.apply_learnable_sink`.
+
+    A row with lse == -inf attended nothing, so the sink holds all its probability mass.
+    """
+    sink_prob = (
+        Float32(1.0)
+        if lse_val == -Float32.inf
+        else cute.math.exp2((sink_val - lse_val) * utils.LOG2_E, fastmath=True)
+    )
+    return -sink_prob * dpsum_val
+
+
+@cute.jit
+def block_sum(val: Float32, sScratch: cute.Tensor, num_threads: cutlass.Constexpr[int]) -> Float32:
+    """Sum `val` over the CTA; the result is valid in every lane of warp 0.
+
+    `sScratch` needs one Float32 per warp. Ends with a barrier so the caller may reuse it.
+    """
+    num_warps = num_threads // cute.arch.WARP_SIZE
+    lane_idx = cute.arch.lane_idx()
+    warp_idx = cute.arch.thread_idx()[0] // cute.arch.WARP_SIZE
+    val = utils.warp_reduce(val, operator.add)
+    if lane_idx == 0:
+        sScratch[warp_idx] = val
+    cute.arch.sync_threads()
+    total = Float32(0.0)
+    if warp_idx == 0:
+        total = utils.warp_reduce(
+            sScratch[lane_idx] if lane_idx < num_warps else Float32(0.0), operator.add
+        )
+    cute.arch.sync_threads()
+    return total
+
+
+class DSinkReduceKernel:
+    """Standalone dsink reduction for backward passes without a dQ postprocess kernel.
+
+    One CTA per Q head sums `dsink_row_term` over the (rows, nheads) dpsum/lse views. The
+    dense backward instead folds the same reduction into `FlashAttentionBackwardPostprocess`.
+    """
+
+    num_threads = 256
+
+    @cute.jit
+    def __call__(
+        self,
+        mDpsum: cute.Tensor,  # (rows, nheads)
+        mLSE: cute.Tensor,  # (rows, nheads)
+        mLearnableSink: cute.Tensor,  # (nheads,)
+        mDSink: cute.Tensor,  # (nheads,)
+        # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
+        stream: cuda.CUstream = None,
+    ):
+        self.kernel(mDpsum, mLSE, mLearnableSink, mDSink).launch(
+            grid=[mLearnableSink.shape[0], 1, 1],
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def kernel(
+        self,
+        mDpsum: cute.Tensor,
+        mLSE: cute.Tensor,
+        mLearnableSink: cute.Tensor,
+        mDSink: cute.Tensor,
+    ):
+        num_warps = self.num_threads // cute.arch.WARP_SIZE
+        sReduce = cutlass.utils.SmemAllocator().allocate_tensor(
+            Float32, cute.make_layout(num_warps), byte_alignment=4
+        )
+        head_idx = cute.arch.block_idx()[0]
+        tidx = cute.arch.thread_idx()[0]
+        sink_val = Float32(mLearnableSink[head_idx])
+
+        sink_sum = Float32(0.0)
+        row = tidx
+        while row < mDpsum.shape[0]:
+            sink_sum += dsink_row_term(
+                sink_val, Float32(mLSE[row, head_idx]), Float32(mDpsum[row, head_idx])
+            )
+            row += self.num_threads
+
+        sink_sum = block_sum(sink_sum, sReduce, self.num_threads)
+        if tidx == 0:
+            mDSink[head_idx] = sink_sum.to(mDSink.element_type)
+
+
 class FlashAttentionBackwardPostprocess:
     def __init__(
         self,
@@ -397,32 +487,13 @@ class FlashAttentionBackwardPostprocess:
                                 sink_head_idx, sink_seqlen.padded_offset_q + sink_row
                             ]
                             lse_val = mLSE[sink_head_idx, sink_seqlen.offset_q + sink_row]
-                        lse_val = Float32(lse_val)
-                        sink_prob = (
-                            Float32(1.0)
-                            if lse_val == -Float32.inf
-                            else cute.math.exp2(
-                                (sink_val - lse_val) * utils.LOG2_E,
-                                fastmath=True,
-                            )
-                        )
-                        sink_sum += -sink_prob * Float32(dpsum_val)
+                        sink_sum += dsink_row_term(sink_val, Float32(lse_val), Float32(dpsum_val))
                         sink_row += self.num_threads
                     sink_batch += 1
 
-                sink_sum = utils.warp_reduce(sink_sum, operator.add)
-                lane_idx = cute.arch.lane_idx()
-                warp_idx = tidx // cute.arch.WARP_SIZE
-                num_warps = self.num_threads // cute.arch.WARP_SIZE
-                if lane_idx == 0:
-                    sdQaccum_flat[warp_idx] = sink_sum
-                cute.arch.sync_threads()
-                if warp_idx == 0:
-                    sink_sum = sdQaccum_flat[lane_idx] if lane_idx < num_warps else Float32(0.0)
-                    sink_sum = utils.warp_reduce(sink_sum, operator.add)
-                    if lane_idx == 0:
-                        mdSink[sink_head_idx] = sink_sum.to(mdSink.element_type)
-                cute.arch.sync_threads()
+                sink_sum = block_sum(sink_sum, sdQaccum_flat, self.num_threads)
+                if tidx == 0:
+                    mdSink[sink_head_idx] = sink_sum.to(mdSink.element_type)
 
         if work_tile.is_valid_tile:
             # ///////////////////////////////////////////////////////////////////////////////

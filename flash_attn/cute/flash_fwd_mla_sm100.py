@@ -25,7 +25,7 @@ from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute.mask import AttentionMask
 import flash_attn.cute.blackwell_helpers as fa_sm100_utils
-from flash_attn.cute.softmax import SoftmaxSm100
+from flash_attn.cute.softmax import SoftmaxSm100, apply_learnable_sink, load_learnable_sink
 from flash_attn.cute.tile_scheduler import (
     SchedulerState,
     SchedulingMode,
@@ -3052,19 +3052,15 @@ class FlashAttentionMLAForwardSm100:
             row_max = 0.0
             if const_expr(mLSE is not None or learnable_sink is not None):
                 row_max = sRowMax[tidx % self.cta_tile_m, 0]
-
             if const_expr(learnable_sink is not None):
-                LOG2_E = math.log2(math.e)
-                row_tidx = tidx % self.cta_tile_m
-                q_head_idx = head_idx * self.qhead_per_kvhead + (cta_m_block * self.cta_tile_m + row_tidx) % self.qhead_per_kvhead
-                sink_val = Float32(learnable_sink[q_head_idx])
-                if row_max == -Float32.inf:
-                    row_max = sink_val * (LOG2_E / softmax_scale_log2)
-                    row_sum = 1.0
-                else:
-                    row_sum += cute.math.exp2(
-                        sink_val * LOG2_E - row_max * softmax_scale_log2, fastmath=True
-                    )
+                sink_val = load_learnable_sink(
+                    learnable_sink,
+                    head_idx,
+                    cta_m_block * self.cta_tile_m + tidx % self.cta_tile_m,
+                    self.qhead_per_kvhead,
+                    self.pack_gqa,
+                )
+                row_max, row_sum = apply_learnable_sink(row_max, row_sum, sink_val, softmax_scale_log2)
 
             acc_O_mn_row_is_zero_or_nan = row_sum == 0.0 or row_sum != row_sum
             scale = cute.arch.rcp_approx(row_sum if not acc_O_mn_row_is_zero_or_nan else 1.0)

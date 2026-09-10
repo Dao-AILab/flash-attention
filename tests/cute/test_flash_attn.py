@@ -501,8 +501,6 @@ def test_flash_attn_output(
         pytest.skip()
     if has_qv and local:
         pytest.xfail("has_qv: local not supported yet")
-    if has_qv and has_learnable_sink:
-        pytest.xfail("has_qv: learnable sink not supported yet")
     # TODO(wangsiyu): SM100 head_dim=256 2CTA kernel currently does not support the following features.
     # Remove these skips when support is added.
     if d == 256 and IS_SM100:
@@ -2866,7 +2864,7 @@ def test_flash_attn_invalid_head_dim(head_dim):
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 # @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 @pytest.mark.parametrize("mha_type", ["mqa"])
-@pytest.mark.parametrize("has_learnable_sink", [False])
+@pytest.mark.parametrize("has_learnable_sink", [False, True])
 @pytest.mark.parametrize("deterministic", [False])
 @pytest.mark.parametrize("local_enum", [0])
 @pytest.mark.parametrize("causal", [False, True])
@@ -2957,7 +2955,7 @@ def test_flash_attn_mla_absorbed(
             print("window size = ", window_size)
         # window_size = (-1, -1) if not local else (16, 0)
         if has_learnable_sink:
-            learnable_sink = torch.randn(nheads, dtype=torch.bfloat16, device=device)
+            learnable_sink = torch.randn(nheads, dtype=torch.bfloat16, device=device, requires_grad=True)
         else:
             learnable_sink = None
         q, k, v, qv = [x.detach().to(dtype).requires_grad_() for x in (q_ref, k_ref, v_ref, qv_ref)]
@@ -3043,31 +3041,21 @@ def test_flash_attn_mla_absorbed(
         if test_bwd:
             print("BWD SPARSE MLA")
             g = torch.randn_like(out)
-            if shared_kv:
-                dq, dk = torch.autograd.grad(out, (q, k), g)
-            else:
-                dq, dk, dv, dqv = torch.autograd.grad(out, (q, k, v, qv), g)
-            
+            sink_inputs = (learnable_sink,) if has_learnable_sink else ()
+            inputs = ((q, k) if shared_kv else (q, k, v, qv)) + sink_inputs
+            inputs_ref = ((q_ref, k_ref) if shared_kv else (q_ref, k_ref, v_ref, qv_ref)) + sink_inputs
+            grads = torch.autograd.grad(out, inputs, g)
+
             if is_fake_mode():
                 continue
-            
-            if shared_kv:
-                dq_ref, dk_ref = torch.autograd.grad(out_ref, (q_ref, k_ref), g)
-                dq_pt, dk_pt = torch.autograd.grad(out_pt, (q_ref, k_ref), g)
-                dv, dqv, dv_ref, dqv_ref, dv_pt, dqv_pt = None, None, None, None, None, None
-            else:
-                dq_ref, dk_ref, dv_ref, dqv_ref = torch.autograd.grad(out_ref, (q_ref, k_ref, v_ref, qv_ref), g)
-                dq_pt, dk_pt, dv_pt, dqv_pt = torch.autograd.grad(out_pt, (q_ref, k_ref, v_ref, qv_ref), g)
 
-            print_diff_stats("dQ", dq, dq_ref, dq_pt)
-            print_diff_stats("dK", dk, dk_ref, dk_pt)
-            print_diff_stats("dV", dv, dv_ref, dv_pt)
-            print_diff_stats("dQv", dqv, dqv_ref, dqv_pt)
-
-            check_tensor_vs_ref("dQ", dq, dq_ref, dq_pt)
-            check_tensor_vs_ref("dK", dk, dk_ref, dk_pt)
-            check_tensor_vs_ref("dV", dv, dv_ref, dv_pt)
-            check_tensor_vs_ref("dQv", dqv, dqv_ref, dqv_pt)
+            grads_ref = torch.autograd.grad(out_ref, inputs_ref, g)
+            grads_pt = torch.autograd.grad(out_pt, inputs_ref, g)
+            for name, actual, ref, pt in zip(("dQ", "dK", "dV", "dQv"), grads, grads_ref, grads_pt):
+                print_diff_stats(name, actual, ref, pt)
+                check_tensor_vs_ref(name, actual, ref, pt)
+            if has_learnable_sink:
+                check_dsink_vs_ref(grads[-1], grads_ref[-1], grads_pt[-1])
 
 
 def causal_topk_indices(batch_size, seqlen_q, seqlen_k, topk_len, device):
@@ -3178,7 +3166,7 @@ def test_flash_attn_mla_sparse_bwd_sentinel(seqlen_q, seqlen_k, shared_kv, causa
         out2, lse2, p2, row_max2 = _flash_attn_fwd(
             fq, fk, v, qv=fqv, causal=causal, gather_kv_indices=gather_kv_indices, pack_gqa=True
         )
-        dq2, dk2, dv2, dqv2 = _flash_attn_bwd_sparse_mla(
+        dq2, dk2, dv2, dqv2, _ = _flash_attn_bwd_sparse_mla(
             fq, fk, v, fqv, out2, g, lse2, p2, row_max2, gather_kv_indices,
             causal=causal, dk=dk_buf, dv=dv_buf,
         )
@@ -3310,7 +3298,7 @@ def test_flash_attn_mla_sparse_bwd_sentinel_varlen(shared_kv, causal, dtype):
             max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen,
             causal=causal, gather_kv_indices=gather_kv_indices, pack_gqa=True,
         )
-        dq2, dk2, dv2, dqv2 = _flash_attn_bwd_sparse_mla(
+        dq2, dk2, dv2, dqv2, _ = _flash_attn_bwd_sparse_mla(
             fq, fk, v, fqv, out2, g, lse2, p2, row_max2, gather_kv_indices,
             causal=causal,
             cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
@@ -3363,7 +3351,7 @@ def test_flash_attn_mla_sparse_bwd_sentinel_varlen(shared_kv, causal, dtype):
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 # @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
 @pytest.mark.parametrize("mha_type", ["mqa"])
-@pytest.mark.parametrize("has_learnable_sink", [False])
+@pytest.mark.parametrize("has_learnable_sink", [False, True])
 @pytest.mark.parametrize("deterministic", [False])
 @pytest.mark.parametrize("local_enum", [0])
 @pytest.mark.parametrize("causal", [False, True])
@@ -3481,7 +3469,7 @@ def test_flash_attn_mla_absorbed_varlen(
         if local:
             print("window size = ", window_size)
         if has_learnable_sink:
-            learnable_sink = torch.randn(nheads, dtype=torch.bfloat16, device=device)
+            learnable_sink = torch.randn(nheads, dtype=torch.bfloat16, device=device, requires_grad=True)
         else:
             learnable_sink = None
         q, k, v, qv = [x.detach().requires_grad_() for x in (q_ref, k_ref, v_ref, qv_ref)]
@@ -3715,25 +3703,28 @@ def test_flash_attn_mla_absorbed_varlen(
         if test_bwd:
             print("VARLEN BWD SPARSE MLA")
             g_unpad = torch.randn_like(out_unpad)
+            sink_inputs = (learnable_sink,) if has_learnable_sink else ()
             if shared_kv:
-                dq_unpad, dk_unpad = torch.autograd.grad(
+                dq_unpad, dk_unpad, *dsink = torch.autograd.grad(
                     out_unpad,
                     (
                         q_unpad if unpad_q else q,
                         k_unpad if unpad_kv else k,
+                        *sink_inputs,
                     ),
                     g_unpad,
                     allow_unused=True,
                 )
                 dv_unpad, dqv_unpad = None, None
             else:
-                dq_unpad, dk_unpad, dv_unpad, dqv_unpad = torch.autograd.grad(
+                dq_unpad, dk_unpad, dv_unpad, dqv_unpad, *dsink = torch.autograd.grad(
                     out_unpad,
                     (
                         q_unpad if unpad_q else q,
                         k_unpad if unpad_kv else k,
                         v_unpad if unpad_kv else v,
                         qv_unpad if unpad_q else qv,
+                        *sink_inputs,
                     ),
                     g_unpad,
                     allow_unused=True,
@@ -3768,13 +3759,17 @@ def test_flash_attn_mla_absorbed_varlen(
             g = output_pad_fn(g_unpad) if unpad_q else g_unpad
 
             if shared_kv:
-                dq_ref, dk_ref = torch.autograd.grad(out_ref, (q_ref, k_ref), g)
-                dq_pt, dk_pt = torch.autograd.grad(out_pt, (q_ref, k_ref), g)
+                dq_ref, dk_ref, *dsink_ref = torch.autograd.grad(out_ref, (q_ref, k_ref, *sink_inputs), g)
+                dq_pt, dk_pt, *dsink_pt = torch.autograd.grad(out_pt, (q_ref, k_ref, *sink_inputs), g)
                 dv, dqv, dv_ref, dqv_ref, dv_pt, dqv_pt = None, None, None, None, None, None
             else:
-                dq_ref, dk_ref, dv_ref, dqv_ref = torch.autograd.grad(out_ref, (q_ref, k_ref, v_ref, qv_ref), g)
-                dq_pt, dk_pt, dv_pt, dqv_pt = torch.autograd.grad(out_pt, (q_ref, k_ref, v_ref, qv_ref), g)
-            
+                dq_ref, dk_ref, dv_ref, dqv_ref, *dsink_ref = torch.autograd.grad(
+                    out_ref, (q_ref, k_ref, v_ref, qv_ref, *sink_inputs), g
+                )
+                dq_pt, dk_pt, dv_pt, dqv_pt, *dsink_pt = torch.autograd.grad(
+                    out_pt, (q_ref, k_ref, v_ref, qv_ref, *sink_inputs), g
+                )
+
             print_diff_stats("dQ", dq, dq_ref, dq_pt)
             print_diff_stats("dK", dk, dk_ref, dk_pt)
             print_diff_stats("dV", dv, dv_ref, dv_pt)
@@ -3784,6 +3779,8 @@ def test_flash_attn_mla_absorbed_varlen(
             check_tensor_vs_ref("dK", dk, dk_ref, dk_pt)
             check_tensor_vs_ref("dV", dv, dv_ref, dv_pt)
             check_tensor_vs_ref("dQv", dqv, dqv_ref, dqv_pt)
+            if has_learnable_sink:
+                check_dsink_vs_ref(dsink[0], dsink_ref[0], dsink_pt[0])
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
@@ -4173,282 +4170,66 @@ def test_flash_attn_varlen_seqlen_k_per_split(causal):
         f"seqlen_k_per_split not batch-invariant: max_diff={max_diff}."
     )
 
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
+
 @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize(
-    "seqlen_q,seqlen_k",
-    [
-        (64, 64),
-        (128, 128),
-        (256, 256),
-        (128, 512),
-        (1024, 1024),
-    ],
-)
+@pytest.mark.parametrize("seqlen_q,seqlen_k", [(64, 64), (128, 128), (128, 256)])
 @pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="MLA kernel requires SM100/SM110")
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_mla_learnable_sink(seqlen_q, seqlen_k, causal, dtype):
-    """Test MLA with learnable sink forward.
-
-    The learnable sink adds a virtual token to the softmax normalizer:
-        scores_extended = cat([sink_logit, scores], dim=-1)
-        attn = softmax(scores_extended, dim=-1)
-        O = attn[..., 1:] @ V   (exclude the sink column)
-
-    Compares flash_attn_func output against attention_ref with learnable_sink.
-    """
-    device = "cuda"
-    torch.manual_seed(42)
-    torch.cuda.empty_cache()
-
-    batch_size = 2
-    nheads = 128
-    nheads_kv = 1
-    d = 512
-
-    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
-    v = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype)
-    k = v
-    learnable_sink = torch.randn(nheads, device=device, dtype=dtype)
-
-    q_ref = q.clone()
-    v_ref = v.clone()
-    sink_ref = learnable_sink.clone()
-
-    out, lse = flash_attn_func(q, k, v, causal=causal, learnable_sink=learnable_sink)
-
-    if is_fake_mode():
-        return
-
-    out_ref, _ = attention_ref(None, None, v_ref, causal=causal, qv=q_ref, learnable_sink=sink_ref)
-
-    diff = (out - out_ref).abs()
-    max_diff = diff.max().item()
-    mean_diff = diff.mean().item()
-    print(f"MLA+sink output max diff: {max_diff}")
-    print(f"MLA+sink output mean diff: {mean_diff}")
-    assert max_diff < 3e-2, f"MLA+sink output max diff {max_diff} exceeds tolerance 3e-2"
-
-
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize(
-    "seqlen_q,seqlen_k",
-    [
-        (128, 128),
-        (256, 256),
-        (128, 512),
-    ],
-)
-@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="MLA kernel requires SM100/SM110")
-@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_mla_learnable_sink_backward(seqlen_q, seqlen_k, causal, dtype):
-    """Test MLA backward with learnable sink.
-
-    Uses gather_kv_indices that selects all KV positions (dense through the sparse path)
-    to exercise the backward. Verifies dsink via comparison against a PyTorch reference.
-    """
-    device = "cuda"
-    torch.manual_seed(42)
-    torch.cuda.empty_cache()
-
-    batch_size = 2
-    nheads = 128
-    nheads_kv = 1
-    d = 512
-    gather_kv_length = ((seqlen_k + 127) // 128) * 128
-
-    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype, requires_grad=True)
-    v = torch.randn(batch_size, seqlen_k, nheads_kv, d, device=device, dtype=dtype, requires_grad=True)
-    learnable_sink = torch.randn(nheads, device=device, dtype=dtype, requires_grad=True)
-
-    indices = torch.full((batch_size, seqlen_q, gather_kv_length), -1, device=device, dtype=torch.int32)
-    indices[:, :, :seqlen_k] = torch.arange(seqlen_k, device=device, dtype=torch.int32).expand(batch_size, seqlen_q, -1)
-
-    out, lse = flash_attn_func(
-        q, v, v,
-        causal=causal,
-        learnable_sink=learnable_sink,
-        return_lse=True,
-        gather_kv_indices=indices,
-    )
-
-    if is_fake_mode():
-        return
-
-    loss = out.sum()
-    loss.backward()
-
-    dsink_kernel = learnable_sink.grad.clone()
-    dv_kernel = v.grad.clone()
-
-    # Reference dsink: dsink[h] = -sum_rows(exp(sink[h] - lse[row,h]) * dpsum[row,h])
-    with torch.no_grad():
-        dpsum_ref = out.detach().sum(dim=-1)
-        lse_detached = lse.detach()
-        sink_expanded = learnable_sink.detach().float().view(1, 1, nheads)
-        sink_prob = torch.exp(sink_expanded - lse_detached.float())
-        dsink_ref = -(sink_prob * dpsum_ref.float()).sum(dim=(0, 1)).to(dtype)
-
-    # Reference dv: run attention_ref forward+backward with sink
-    q_ref = q.detach().clone().requires_grad_(True)
-    v_ref = v.detach().clone().requires_grad_(True)
-    sink_ref = learnable_sink.detach().clone().requires_grad_(True)
-    out_ref, _ = attention_ref(None, None, v_ref, causal=causal, qv=q_ref,
-                               learnable_sink=sink_ref, gather_kv_indices=indices)
-    out_ref.sum().backward()
-    dv_ref = v_ref.grad
-
-    # Check dsink
-    diff_sink = (dsink_kernel - dsink_ref).abs()
-    max_diff_sink = diff_sink.max().item()
-    max_val_sink = max(dsink_kernel.abs().max().item(), dsink_ref.abs().max().item(), 1.0)
-    atol = 3e-2
-    rtol = 1e-2
-    tol_sink = atol + rtol * max_val_sink
-    print(f"dsink max diff: {max_diff_sink}, tol: {tol_sink:.4f}")
-    assert max_diff_sink < tol_sink, f"dsink max diff {max_diff_sink} exceeds tolerance {tol_sink}"
-
-    # Check dv (dkv since k=v, the backward returns dv in fp32 then accumulated)
-    diff_dv = (dv_kernel.float() - dv_ref.float()).abs()
-    max_diff_dv = diff_dv.max().item()
-    max_val_dv = max(dv_kernel.abs().max().item(), dv_ref.abs().max().item(), 1.0)
-    tol_dv = atol + rtol * max_val_dv
-    print(f"dv max diff: {max_diff_dv}, tol: {tol_dv:.4f}")
-    assert max_diff_dv < tol_dv, f"dv max diff {max_diff_dv} exceeds tolerance {tol_dv}"
-
-
-@pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize(
-    "seqlen_q,seqlen_k",
-    [
-        (64, 64),
-        (128, 128),
-        (128, 256),
-    ],
-)
-@pytest.mark.skipif(not (IS_SM100 or IS_SM110), reason="MLA kernel requires SM100/SM110")
 def test_mla_sink_precision_vs_fp64(seqlen_q, seqlen_k, causal):
-    """Compare kernel error against bf16 reference error, both measured from fp64 ground truth.
+    """Sparse MLA + learnable sink: kernel fwd/bwd error vs an fp64 ground truth.
 
-    Runs the same MLA+sink computation in three ways:
-      1. fp64 reference (ground truth)
-      2. bf16 reference (PyTorch eager, quantifies dtype-inherent error)
-      3. bf16 kernel (flash_attn_func, quantifies kernel error)
-
-    Fails if kernel/reference error ratio exceeds 5x for any quantity.
+    `attention_ref` computes its sink path in fp32, so this is the only check that measures
+    the kernel against an exact reference. The kernel (bf16 in, fp32 accumulate) must stay
+    within 3x the error of an fp32 eager evaluation of the same bf16 inputs, after rounding
+    the eager result to the kernel's output dtype.
     """
     device = "cuda"
     dtype = torch.bfloat16
-    seed = 42
-    torch.manual_seed(seed)
-    torch.cuda.empty_cache()
-
-    batch_size = 2
-    nheads = 128
-    nheads_kv = 1
-    d = 512
+    torch.manual_seed(42)
+    batch_size, nheads, d = 2, 128, 512
     gather_kv_length = ((seqlen_k + 127) // 128) * 128
 
-    gen = torch.Generator(device=device).manual_seed(seed)
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
+    v = torch.randn(batch_size, seqlen_k, 1, d, device=device, dtype=dtype)
+    sink = torch.randn(nheads, device=device, dtype=dtype)
+    g = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
 
-    def randn64(*shape):
-        return torch.randn(*shape, dtype=torch.float64, device=device, generator=gen, requires_grad=True)
+    def reference(q, v, sink):
+        """softmax over [sink, scores] per row; the sink column has no value vector."""
+        scores = torch.einsum("bthd,bsd->bhts", q / math.sqrt(d), v[:, :, 0])
+        if causal:
+            row_idx = torch.arange(seqlen_q, device=device)[:, None]
+            col_idx = torch.arange(seqlen_k, device=device)[None, :]
+            scores = scores.masked_fill(col_idx > row_idx + (seqlen_k - seqlen_q), float("-inf"))
+        sink_logit = sink.view(1, nheads, 1, 1).expand(batch_size, nheads, seqlen_q, 1)
+        attn = torch.softmax(torch.cat([sink_logit, scores], dim=-1), dim=-1)[..., 1:]
+        return torch.einsum("bhts,bsd->bthd", attn, v[:, :, 0])
 
-    q_64 = randn64(batch_size, seqlen_q, nheads, d)
-    v_64 = randn64(batch_size, seqlen_k, nheads_kv, d)
-    sink_64 = randn64(nheads)
-
-    # --- fp64 reference forward ---
-    softmax_scale = 1.0 / math.sqrt(d)
-    v_expanded_64 = v_64.expand(batch_size, seqlen_k, nheads, d)
-    scores_64 = torch.einsum("bthd,bshd->bhts", q_64 * softmax_scale, v_expanded_64)
-
-    if causal:
-        row_idx = torch.arange(seqlen_q, device=device).unsqueeze(1)
-        col_idx = torch.arange(seqlen_k, device=device).unsqueeze(0)
-        causal_mask = col_idx > row_idx + (seqlen_k - seqlen_q)
-        scores_64 = scores_64.masked_fill(causal_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
-
-    sink_logit_64 = sink_64.view(1, nheads, 1, 1).expand(batch_size, nheads, seqlen_q, 1)
-    scores_with_sink_64 = torch.cat([sink_logit_64, scores_64], dim=-1)
-    attn_with_sink_64 = torch.softmax(scores_with_sink_64, dim=-1)
-    attn_64 = attn_with_sink_64[..., 1:]
-    out_64 = torch.einsum("bhts,bshd->bthd", attn_64, v_expanded_64)
-
-    # --- bf16 reference forward ---
-    q_bf = q_64.detach().to(dtype).requires_grad_(True)
-    v_bf = v_64.detach().to(dtype).requires_grad_(True)
-    sink_bf = sink_64.detach().to(dtype).requires_grad_(True)
-
-    v_expanded_bf = v_bf.float().expand(batch_size, seqlen_k, nheads, d)
-    scores_bf = torch.einsum("bthd,bshd->bhts", q_bf.float() * softmax_scale, v_expanded_bf)
-    if causal:
-        scores_bf = scores_bf.masked_fill(causal_mask.unsqueeze(0).unsqueeze(0), float("-inf"))
-    sink_logit_bf = sink_bf.float().view(1, nheads, 1, 1).expand(batch_size, nheads, seqlen_q, 1)
-    scores_with_sink_bf = torch.cat([sink_logit_bf, scores_bf], dim=-1)
-    attn_with_sink_bf = torch.softmax(scores_with_sink_bf, dim=-1)
-    attn_bf = attn_with_sink_bf[..., 1:]
-    out_bf = torch.einsum("bhts,bshd->bthd", attn_bf, v_expanded_bf).to(dtype)
-
-    # --- bf16 kernel forward ---
-    q_kern = q_64.detach().to(dtype).requires_grad_(True)
-    v_kern = v_64.detach().to(dtype).requires_grad_(True)
-    sink_kern = sink_64.detach().to(dtype).requires_grad_(True)
+    inputs_64 = [t.double().requires_grad_() for t in (q, v, sink)]
+    inputs_32 = [t.float().requires_grad_() for t in (q, v, sink)]
+    inputs_kern = [t.clone().requires_grad_() for t in (q, v, sink)]
 
     indices = torch.full((batch_size, seqlen_q, gather_kv_length), -1, device=device, dtype=torch.int32)
-    indices[:, :, :seqlen_k] = torch.arange(seqlen_k, device=device, dtype=torch.int32).expand(batch_size, seqlen_q, -1)
-
-    out_kern, lse_kern = flash_attn_func(
-        q_kern, v_kern, v_kern,
-        causal=causal,
-        learnable_sink=sink_kern,
-        return_lse=True,
-        gather_kv_indices=indices,
+    indices[:, :, :seqlen_k] = torch.arange(seqlen_k, device=device, dtype=torch.int32)
+    q_kern, v_kern, sink_kern = inputs_kern
+    out_kern, _ = flash_attn_func(
+        q_kern, v_kern, v_kern, causal=causal, learnable_sink=sink_kern, gather_kv_indices=indices
     )
+    grads_kern = torch.autograd.grad(out_kern, inputs_kern, g)
+    if is_fake_mode():
+        return
 
-    # --- Forward error ---
-    ref_fwd_diff = (out_64.double() - out_bf.double()).abs().max().item()
-    kern_fwd_diff = (out_64.double() - out_kern.double()).abs().max().item()
+    out_64 = reference(*inputs_64)
+    out_32 = reference(*inputs_32)
+    grads_64 = torch.autograd.grad(out_64, inputs_64, g.double())
+    grads_32 = torch.autograd.grad(out_32, inputs_32, g.float())
 
-    # --- Backward ---
-    grad_gen = torch.Generator(device=device).manual_seed(1234)
-    grad_64 = torch.randn(out_64.shape, dtype=torch.float64, device=device, generator=grad_gen)
-    grad_bf = grad_64.to(dtype)
-
-    out_64.backward(grad_64)
-    out_bf.backward(grad_bf)
-    out_kern.backward(grad_bf)
-
-    ref_dsink = (sink_64.grad.double() - sink_bf.grad.double()).abs().max().item()
-    kern_dsink = (sink_64.grad.double() - sink_kern.grad.double()).abs().max().item()
-
-    ref_dq = (q_64.grad.double() - q_bf.grad.double()).abs().max().item()
-    kern_dq = (q_64.grad.double() - q_kern.grad.double()).abs().max().item()
-
-    ref_dv = (v_64.grad.double() - v_bf.grad.double()).abs().max().item()
-    kern_dv = (v_64.grad.double() - v_kern.grad.double()).abs().max().item()
-
-    # --- Ratios ---
-    def _ratio(kern_val, ref_val):
-        if ref_val == 0:
-            return float("inf") if kern_val > 0 else 1.0
-        return kern_val / ref_val
-
-    r_fwd = _ratio(kern_fwd_diff, ref_fwd_diff)
-    r_dsink = _ratio(kern_dsink, ref_dsink)
-    r_dq = _ratio(kern_dq, ref_dq)
-    r_dv = _ratio(kern_dv, ref_dv)
-
-    print(
-        f"\n[causal={causal}, sq={seqlen_q}, sk={seqlen_k}]"
-        f"\n  {'':15s} {'fwd':>10s} {'dSink':>10s} {'dQ':>10s} {'dV':>10s}"
-        f"\n  {'ref bf16':15s} {ref_fwd_diff:10.4e} {ref_dsink:10.4e} {ref_dq:10.4e} {ref_dv:10.4e}"
-        f"\n  {'kernel bf16':15s} {kern_fwd_diff:10.4e} {kern_dsink:10.4e} {kern_dq:10.4e} {kern_dv:10.4e}"
-        f"\n  {'kernel/ref':15s} {r_fwd:10.2f}x {r_dsink:10.2f}x {r_dq:10.2f}x {r_dv:10.2f}x"
-    )
-
-    assert r_fwd < 3, f"Kernel fwd error ratio too large: {r_fwd:.2f}x"
-    assert r_dsink < 3, f"Kernel dSink error ratio too large: {r_dsink:.2f}x"
-    assert r_dq < 3, f"Kernel dQ error ratio too large: {r_dq:.2f}x"
-    assert r_dv < 3, f"Kernel dV error ratio too large: {r_dv:.2f}x"
+    for name, exact, eager, kern in zip(
+        ("out", "dQ", "dV", "dSink"), (out_64, *grads_64), (out_32, *grads_32), (out_kern, *grads_kern)
+    ):
+        # Round the eager result to the kernel's output dtype so both sides pay the same
+        # storage-precision cost and the ratio isolates the kernel's arithmetic error.
+        eager_err = (eager.to(kern.dtype).double() - exact).abs().max().item()
+        kern_err = (kern.double() - exact).abs().max().item()
+        print(f"[causal={causal}, sq={seqlen_q}, sk={seqlen_k}] {name}: kernel {kern_err:.3e} vs eager fp32 {eager_err:.3e}")
+        assert kern_err <= 3 * eager_err + 1e-6, f"{name}: kernel error {kern_err:.3e} > 3x eager fp32 {eager_err:.3e}"
