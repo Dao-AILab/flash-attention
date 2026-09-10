@@ -2347,6 +2347,60 @@ def test_flash_attn_bwd_transpose(seqlen, d, causal, dtype):
     ).abs().max().item()
 
 
+@pytest.mark.parametrize("varlen", [False, True], ids=["dense", "varlen"])
+@pytest.mark.parametrize("kvpacked", [False, True], ids=["separate", "kvpacked"])
+def test_flash_attn_bwd_noncontiguous_lastdim_inputs(varlen, kvpacked):
+    """Backward accepts the same last-dimension-strided inputs as forward."""
+    device = "cuda"
+    dtype = torch.float16
+    nheads = 4
+    d = 64
+    batch_size = 2
+    seqlen = 64
+
+    def make_lastdim_strided(shape):
+        base_shape = (*shape[:-2], shape[-1], shape[-2])
+        tensor = torch.randn(base_shape, device=device, dtype=dtype).transpose(-1, -2)
+        assert tensor.shape == shape
+        assert tensor.stride(-1) != 1
+        return tensor.detach().requires_grad_()
+
+    shape_prefix = (96,) if varlen else (batch_size, seqlen)
+    q = make_lastdim_strided((*shape_prefix, nheads, d))
+    if kvpacked:
+        inputs = (q, make_lastdim_strided((*shape_prefix, 2, nheads, d)))
+    else:
+        inputs = (
+            q,
+            make_lastdim_strided((*shape_prefix, nheads, d)),
+            make_lastdim_strided((*shape_prefix, nheads, d)),
+        )
+    inputs_ref = tuple(x.detach().contiguous().requires_grad_() for x in inputs)
+
+    cu_seqlens = (
+        torch.tensor([0, 32, 96], dtype=torch.int32, device=device) if varlen else None
+    )
+
+    def run_attn(tensors):
+        if varlen:
+            func = (
+                flash_attn_varlen_kvpacked_func if kvpacked else flash_attn_varlen_func
+            )
+            return func(*tensors, cu_seqlens, cu_seqlens, 64, 64, deterministic=True)
+        func = flash_attn_kvpacked_func if kvpacked else flash_attn_func
+        return func(*tensors, deterministic=True)
+
+    out = run_attn(inputs)
+    out_ref = run_attn(inputs_ref)
+    dout = torch.randn_like(out)
+    grads = torch.autograd.grad(out, inputs, dout)
+    grads_ref = torch.autograd.grad(out_ref, inputs_ref, dout)
+
+    torch.testing.assert_close(out, out_ref, rtol=0, atol=0)
+    for grad, grad_ref in zip(grads, grads_ref):
+        torch.testing.assert_close(grad, grad_ref, rtol=0, atol=0)
+
+
 @pytest.mark.parametrize("dtype", [torch.float16])
 @pytest.mark.parametrize("causal", [False, True])
 # @pytest.mark.parametrize('causal', [False])
