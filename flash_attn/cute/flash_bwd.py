@@ -17,6 +17,7 @@ import cutlass.utils as utils_basic
 from quack import layout_utils
 from flash_attn.cute import ampere_helpers as sm80_utils
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
+from flash_attn.cute import copy_utils
 from flash_attn.cute import utils
 from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.softmax import call_score_mod, call_score_mod_bwd
@@ -52,6 +53,7 @@ class FlashAttentionBackwardSm80:
         V_in_regs: bool = False,
         score_mod: cutlass.Constexpr | None = None,
         score_mod_bwd: cutlass.Constexpr | None = None,
+        skip_full_causal_mask: bool = False,
     ):
         """Initializes the configuration for a flash attention v2 kernel.
 
@@ -100,6 +102,7 @@ class FlashAttentionBackwardSm80:
         self.share_QV_smem = V_in_regs
         self.score_mod = score_mod
         self.score_mod_bwd = score_mod_bwd
+        self.skip_full_causal_mask = skip_full_causal_mask
 
     @staticmethod
     def can_implement(
@@ -211,10 +214,23 @@ class FlashAttentionBackwardSm80:
             sdO_layout_atom, (self.m_block_size, self.head_dim_v_padded, self.num_stages_dO), (0, 1, 2),
         )
         # TODO: do we set swizzle to be 3 here explicitly?
-        sPdS_layout_atom = sm80_utils.get_smem_layout_atom(self.dtype, self.n_block_size)
-        self.sPdS_layout = cute.tile_to_shape(
-            sPdS_layout_atom, (self.m_block_size, self.n_block_size), (0, 1),
-        )
+        if cutlass.const_expr(not self.SdP_swapAB):
+            sPdS_layout_atom = sm80_utils.get_smem_layout_atom(self.dtype, self.n_block_size)
+            self.sPdS_layout = cute.tile_to_shape(
+                sPdS_layout_atom, (self.m_block_size, self.n_block_size), (0, 1),
+            )
+        else:
+            # SdP_swapAB: the SdP accumulator is (n, m)-shaped, so store P/dS
+            # TRANSPOSED in smem, i.e. physically (n_block, m_block) with rows
+            # contiguous along m. The r2s copy (tiled over the swapped
+            # tiled_mma_sdp C layout) then composes without any transposed
+            # store, the dK/dV gemms read their (n, k=m) A-operand directly
+            # (non-transposed ldmatrix), and the dQ gemm reads dS as (m, n)
+            # through a transpose_view with the transposed ldmatrix atom.
+            sPdS_layout_atom = sm80_utils.get_smem_layout_atom(self.dtype, self.m_block_size)
+            self.sPdS_layout = cute.tile_to_shape(
+                sPdS_layout_atom, (self.n_block_size, self.m_block_size), (0, 1),
+            )
         # We set stride to be multiple of 64 so that if ShuffleLSE, even if threads read from sLSE but out of bounds,
         # it's still a valid smem address.
         self.sLSE_layout = cute.make_layout(
@@ -296,12 +312,20 @@ class FlashAttentionBackwardSm80:
             cute.make_layout(self.num_threads),
             cute.make_layout(async_copy_elems_accum),
         )
+        # The 256-thread SM120 dQ MMA distributes each lane's C fragment as
+        # four contiguous fp32 values. Preserve that grouping in the global
+        # accumulator so the 128-thread postprocess can reconstruct it.
+        dQaccum_values_per_thread = (
+            4 if cutlass.const_expr(getattr(self, "arch", 80) == 120) else 1
+        )
         self.gmem_tiled_copy_dQaccum = cute.make_tiled_copy_tv(
             cute.make_copy_atom(
-                cute.nvgpu.CopyUniversalOp(), cutlass.Float32, num_bits_per_copy=cutlass.Float32.width
+                cute.nvgpu.CopyUniversalOp(),
+                cutlass.Float32,
+                num_bits_per_copy=dQaccum_values_per_thread * cutlass.Float32.width,
             ),
             cute.make_layout(self.num_threads),
-            cute.make_layout(1)
+            cute.make_layout(dQaccum_values_per_thread),
         )
         if cutlass.const_expr(self.qhead_per_kvhead > 1):
             self.gmem_tiled_copy_dK = self.gmem_tiled_copy_dQaccum
@@ -623,7 +647,17 @@ class FlashAttentionBackwardSm80:
             sdPsumMma = storage.sdPsum.get_tensor(sLSEMma_layout)
 
             # Transpose view of tensors for tiled mma
-            sQt, sdOt, sKt, sPt, sdSt = [layout_utils.transpose_view(t) for t in (sQ, sdO, sK, sP, sdS)]
+            sQt, sdOt, sKt = [layout_utils.transpose_view(t) for t in (sQ, sdO, sK)]
+            if cutlass.const_expr(not self.SdP_swapAB):
+                sPt, sdSt = [layout_utils.transpose_view(t) for t in (sP, sdS)]
+                sdS_dQ_view = sdS
+            else:
+                # P/dS are stored transposed in smem (physically (n, m)), so the
+                # (n, k=m) A-operand views for the dK/dV gemms are the tensors
+                # themselves, while the dQ gemm's (m, k=n) dS view is the
+                # transpose_view (read with the transposed ldmatrix atom).
+                sPt, sdSt = sP, sdS
+                sdS_dQ_view = layout_utils.transpose_view(sdS)
 
             gmem_thr_copy_QK = gmem_tiled_copy_QK.get_slice(tidx)
             gmem_thr_copy_VdO = gmem_tiled_copy_VdO.get_slice(tidx)
@@ -668,7 +702,7 @@ class FlashAttentionBackwardSm80:
             tdVrdO = utils.mma_make_fragment_B(sdOt[None, None, 0], thr_mma_dkv, swapAB=self.dKV_swapAB)
             tdKrdS = utils.mma_make_fragment_A(sdSt, thr_mma_dkv, swapAB=self.dKV_swapAB)
             tdKrQ = utils.mma_make_fragment_B(sQt[None, None, 0], thr_mma_dkv, swapAB=self.dKV_swapAB)
-            tdQrdS = utils.mma_make_fragment_A(sdS, thr_mma_dq, swapAB=self.dQ_swapAB)
+            tdQrdS = utils.mma_make_fragment_A(sdS_dQ_view, thr_mma_dq, swapAB=self.dQ_swapAB)
             tdQrK = utils.mma_make_fragment_B(sKt, thr_mma_dq, swapAB=self.dQ_swapAB)
 
             LSEslice = (None, 0, None) if cutlass.const_expr(not self.SdP_swapAB) else (0, None, None)
@@ -690,15 +724,20 @@ class FlashAttentionBackwardSm80:
             smem_thr_copy_KV = utils.make_tiled_copy_B(
                 smem_copy_atom, tiled_mma_sdp, swapAB=self.SdP_swapAB
             ).get_slice(tidx)
-            # TODO: should this be smem_copy_atom_transposed?
+            # When SdP_swapAB, P/dS live transposed in smem (physically (n, m),
+            # contiguous along m=k of the dK/dV gemms), so their A-operand reads
+            # use the NON-transposed ldmatrix atom; conversely the dQ gemm reads
+            # dS as (m, n) through a transpose_view, needing the transposed atom.
             smem_thr_copy_PdSt = utils.make_tiled_copy_A(
-                smem_copy_atom_transposed, tiled_mma_dkv, swapAB=self.dKV_swapAB
+                smem_copy_atom_transposed if cutlass.const_expr(not self.SdP_swapAB) else smem_copy_atom,
+                tiled_mma_dkv, swapAB=self.dKV_swapAB
             ).get_slice(tidx)
             smem_thr_copy_QdOt = utils.make_tiled_copy_B(
                 smem_copy_atom_transposed, tiled_mma_dkv, swapAB=self.dKV_swapAB
             ).get_slice(tidx)
             smem_thr_copy_dS = utils.make_tiled_copy_A(
-                smem_copy_atom, tiled_mma_dq, swapAB=self.dQ_swapAB
+                smem_copy_atom if cutlass.const_expr(not self.SdP_swapAB) else smem_copy_atom_transposed,
+                tiled_mma_dq, swapAB=self.dQ_swapAB
             ).get_slice(tidx)
             smem_thr_copy_Kt = utils.make_tiled_copy_B(
                 smem_copy_atom_transposed, tiled_mma_dq, swapAB=self.dQ_swapAB
@@ -719,7 +758,7 @@ class FlashAttentionBackwardSm80:
             tdKsdSt = smem_thr_copy_PdSt.partition_S(sdSt)
             tdVsdOt = smem_thr_copy_QdOt.partition_S(sdOt)
             tdKsQt = smem_thr_copy_QdOt.partition_S(sQt)
-            tdQsdS = smem_thr_copy_dS.partition_S(sdS)
+            tdQsdS = smem_thr_copy_dS.partition_S(sdS_dQ_view)
             tdQsKt = smem_thr_copy_Kt.partition_S(sKt)
             tPsP = r2s_thr_copy_PdS.partition_D(sP)
             tdSsdS = r2s_thr_copy_PdS.partition_D(sdS)
@@ -837,12 +876,24 @@ class FlashAttentionBackwardSm80:
                 # Mainloop
                 # ///////////////////////////////////////////////////////////////////////////////
                 # Start processing of the first n-block.
+                if cutlass.const_expr(getattr(self, "arch", 80) == 120):
+                    num_mma_warps_sdp = self.num_threads // cute.arch.WARP_SIZE
+                    n_warps_sdp = (
+                        num_mma_warps_sdp // self.AtomLayoutMSdP
+                        if not self.SdP_swapAB
+                        else self.AtomLayoutMSdP
+                    )
+                    r2p_compatible = cutlass.const_expr(n_warps_sdp == 1)
+                else:
+                    r2p_compatible = cutlass.const_expr(True)
                 mask = AttentionMask(
                     self.m_block_size,
                     self.n_block_size,
                     seqlen,
                     window_size_left,
                     window_size_right,
+                    swap_AB=self.SdP_swapAB,
+                    r2p_compatible=r2p_compatible,
                 )
                 mask_fn = partial(
                     mask.apply_mask, n_block=n_block, thr_mma=thr_mma_sdp,
@@ -853,7 +904,21 @@ class FlashAttentionBackwardSm80:
                 smem_pipe_read_do = cutlass.Int32(0)
                 smem_pipe_write_q = cutlass.Int32(self.num_stages_Q - 1)
                 smem_pipe_write_do = cutlass.Int32(0)
-                for m_tile in cutlass.range(m_block_min, m_block_max, unroll=1):
+                masked_m_block_max = m_block_max
+                if cutlass.const_expr(self.skip_full_causal_mask and self.is_causal):
+                    full_valid_m_block_min = cute.ceil_div(
+                        n_block * self.n_block_size
+                        + self.n_block_size
+                        - 1
+                        + seqlen.seqlen_q
+                        - seqlen.seqlen_k,
+                        self.m_block_size,
+                    )
+                    masked_m_block_max = min(
+                        max(full_valid_m_block_min, m_block_min), m_block_max
+                    )
+
+                for m_tile in cutlass.range(m_block_min, masked_m_block_max, unroll=1):
                     compute_one_m_block(
                         m_tile, smem_pipe_read_q, smem_pipe_read_do, smem_pipe_write_q, smem_pipe_write_do,
                         mask_fn=mask_fn,
@@ -862,6 +927,28 @@ class FlashAttentionBackwardSm80:
                     smem_pipe_read_do = self.advance_pipeline(smem_pipe_read_do, self.num_stages_dO)
                     smem_pipe_write_q = self.advance_pipeline(smem_pipe_write_q, self.num_stages_Q)
                     smem_pipe_write_do = self.advance_pipeline(smem_pipe_write_do, self.num_stages_dO)
+                if cutlass.const_expr(self.skip_full_causal_mask and self.is_causal):
+                    for m_tile in cutlass.range(masked_m_block_max, m_block_max, unroll=1):
+                        compute_one_m_block(
+                            m_tile,
+                            smem_pipe_read_q,
+                            smem_pipe_read_do,
+                            smem_pipe_write_q,
+                            smem_pipe_write_do,
+                            mask_fn=None,
+                        )
+                        smem_pipe_read_q = self.advance_pipeline(
+                            smem_pipe_read_q, self.num_stages_Q
+                        )
+                        smem_pipe_read_do = self.advance_pipeline(
+                            smem_pipe_read_do, self.num_stages_dO
+                        )
+                        smem_pipe_write_q = self.advance_pipeline(
+                            smem_pipe_write_q, self.num_stages_Q
+                        )
+                        smem_pipe_write_do = self.advance_pipeline(
+                            smem_pipe_write_do, self.num_stages_dO
+                        )
 
             # ///////////////////////////////////////////////////////////////////////////////
             # Epilogue
@@ -929,8 +1016,10 @@ class FlashAttentionBackwardSm80:
         cute.autovec_copy(
             smem_copy_params.tSsLSEMma[None, smem_pipe_read_q if cutlass.const_expr(self.num_stages_Q > 1) else 0], tLSErLSE
         )
-        acc_S_mn = layout_utils.reshape_acc_to_mn(acc_S)
-        acc_S_pre_mn = layout_utils.reshape_acc_to_mn(acc_S_pre)
+        # With SdP_swapAB the accumulator is (n, m)-shaped; transpose the mn view
+        # so mode 0 is always the query-row dim (LSE/dPsum are indexed per row).
+        acc_S_mn = layout_utils.reshape_acc_to_mn(acc_S, transpose=self.SdP_swapAB)
+        acc_S_pre_mn = layout_utils.reshape_acc_to_mn(acc_S_pre, transpose=self.SdP_swapAB)
         if cutlass.const_expr(self.score_mod is not None):
             for r in cutlass.range(cute.size(acc_S_mn, mode=[0]), unroll_full=True):
                 acc_S_mn[r, None].store(
@@ -966,13 +1055,14 @@ class FlashAttentionBackwardSm80:
             smem_copy_params.tdPsV,
             smem_copy_params.smem_thr_copy_QdO, smem_copy_params.smem_thr_copy_KV,
             hook_fn=load_Q_next if cutlass.const_expr(self.num_stages_Q > 1) else None,
+            B_in_regs=self.V_in_regs,
             swap_AB=self.SdP_swapAB,
         )
         tLSErdPsum = cute.make_fragment_like(smem_copy_params.tSsdPsumMma[None, 0])
         cute.autovec_copy(
             smem_copy_params.tSsdPsumMma[None, smem_pipe_read_do if cutlass.const_expr(self.num_stages_dO > 1) else 0], tLSErdPsum
         )
-        acc_dP_mn = layout_utils.reshape_acc_to_mn(acc_dP)
+        acc_dP_mn = layout_utils.reshape_acc_to_mn(acc_dP, transpose=self.SdP_swapAB)
         # if cute.arch.thread_idx()[0] == 0 and cute.arch.block_idx()[0] == bidx: cute.print_tensor(acc_dP_mn)
         assert cute.size(acc_dP_mn, mode=[0]) == cute.size(tLSErdPsum)
         for r in cutlass.range(cute.size(acc_dP_mn, mode=[0]), unroll_full=True):
@@ -1001,9 +1091,11 @@ class FlashAttentionBackwardSm80:
         if cutlass.const_expr(not self.Mma_dKV_is_RS):
             cute.arch.barrier()  # Make sure P is written
         # For hdim 64, It's faster to write to smem_dS first before the dV gemm
-        if cutlass.const_expr(not self.Mma_dKV_is_RS):
-            tdSrdS = smem_copy_params.r2s_thr_copy_PdS.retile(rdS)
-            cute.copy(smem_copy_params.r2s_thr_copy_PdS, tdSrdS, smem_copy_params.tdSsdS)
+        # NOTE: even in RS mode (dK/dV consume P/dS straight from registers),
+        # dS must still be staged to smem because the dQ gemm always reads its
+        # A operand from sdS. Only the sP write is skipped in RS mode.
+        tdSrdS = smem_copy_params.r2s_thr_copy_PdS.retile(rdS)
+        cute.copy(smem_copy_params.r2s_thr_copy_PdS, tdSrdS, smem_copy_params.tdSsdS)
         if cutlass.const_expr(self.Mma_dKV_is_RS):
             tdVrP = layout_utils.reshape_acc_to_frgA(rP)
         else:
@@ -1039,9 +1131,22 @@ class FlashAttentionBackwardSm80:
             acc_dQ_atomic = gmem_copy_params.gmem_thr_copy_dQaccum.retile(acc_dQ)
             tdQgdQaccum_atomic = gmem_copy_params.tdQgdQaccum[None, None, m_block]
             assert cute.size(acc_dQ_atomic) == cute.size(tdQgdQaccum_atomic)
-            for i in cutlass.range(cute.size(acc_dQ_atomic), unroll_full=True):
-                utils.atomic_add_fp32(acc_dQ_atomic[i], utils.elem_pointer(tdQgdQaccum_atomic, i))
-                # utils.atomic_add_fp32(acc_dQ[i], tdQgdQaccum_atomic.iterator + i * tdQgdQaccum_atomic.stride[1])
+            if cutlass.const_expr(getattr(self, "arch", 80) == 120):
+                num_atomic_values = cute.size(acc_dQ_atomic)
+                assert num_atomic_values % 4 == 0
+                for i in cutlass.range(0, num_atomic_values, 4, unroll_full=True):
+                    copy_utils.atomic_add_fp32x4(
+                        acc_dQ_atomic[i],
+                        acc_dQ_atomic[i + 1],
+                        acc_dQ_atomic[i + 2],
+                        acc_dQ_atomic[i + 3],
+                        utils.elem_pointer(tdQgdQaccum_atomic, i),
+                    )
+            else:
+                for i in cutlass.range(cute.size(acc_dQ_atomic), unroll_full=True):
+                    utils.atomic_add_fp32(
+                        acc_dQ_atomic[i], utils.elem_pointer(tdQgdQaccum_atomic, i)
+                    )
             # if cute.arch.thread_idx()[0] == 64 and cute.arch.block_idx()[0] == bidx: cute.print_tensor(acc_dQ)
 
         # If num_stages_Q == 1, we want to do Mma_dK first so we can start loading Q for the next iteration
@@ -1179,7 +1284,9 @@ class FlashAttentionBackwardSm80:
             if cutlass.const_expr(not seqlen.has_cu_seqlens_k):
                 mdK_cur, mdV_cur = [t[batch_idx, head_idx_kv, None] for t in (mdK, mdV)]
             else:
-                padded_offset_k = seqlen.offset_k + batch_idx * self.n_block_size
+                # Match the padded sequence base used by the dK/dV
+                # postprocess. Raw offset_k can start part-way through a tile.
+                padded_offset_k = seqlen.padded_offset_k
                 mdK_cur = cute.domain_offset((padded_offset_k * self.head_dim_padded,), mdK[head_idx_kv, None])
                 mdV_cur = cute.domain_offset((padded_offset_k * self.head_dim_v_padded,), mdV[head_idx_kv, None])
 
@@ -1191,10 +1298,35 @@ class FlashAttentionBackwardSm80:
             acc_dK_atomic = gmem_thr_copy_dK.retile(acc_dK)
             assert cute.size(acc_dV_atomic) == cute.size(tdVgdVaccum)
             assert cute.size(acc_dK_atomic) == cute.size(tdKgdKaccum)
-            for i in cutlass.range(cute.size(acc_dV_atomic), unroll_full=True):
-                utils.atomic_add_fp32(acc_dV_atomic[i], utils.elem_pointer(tdVgdVaccum, i))
-            for i in cutlass.range(cute.size(acc_dK_atomic), unroll_full=True):
-                utils.atomic_add_fp32(acc_dK_atomic[i], utils.elem_pointer(tdKgdKaccum, i))
+            if cutlass.const_expr(getattr(self, "arch", 80) == 120):
+                num_dv_values = cute.size(acc_dV_atomic)
+                num_dk_values = cute.size(acc_dK_atomic)
+                assert num_dv_values % 4 == 0 and num_dk_values % 4 == 0
+                for i in cutlass.range(0, num_dv_values, 4, unroll_full=True):
+                    copy_utils.atomic_add_fp32x4(
+                        acc_dV_atomic[i],
+                        acc_dV_atomic[i + 1],
+                        acc_dV_atomic[i + 2],
+                        acc_dV_atomic[i + 3],
+                        utils.elem_pointer(tdVgdVaccum, i),
+                    )
+                for i in cutlass.range(0, num_dk_values, 4, unroll_full=True):
+                    copy_utils.atomic_add_fp32x4(
+                        acc_dK_atomic[i],
+                        acc_dK_atomic[i + 1],
+                        acc_dK_atomic[i + 2],
+                        acc_dK_atomic[i + 3],
+                        utils.elem_pointer(tdKgdKaccum, i),
+                    )
+            else:
+                for i in cutlass.range(cute.size(acc_dV_atomic), unroll_full=True):
+                    utils.atomic_add_fp32(
+                        acc_dV_atomic[i], utils.elem_pointer(tdVgdVaccum, i)
+                    )
+                for i in cutlass.range(cute.size(acc_dK_atomic), unroll_full=True):
+                    utils.atomic_add_fp32(
+                        acc_dK_atomic[i], utils.elem_pointer(tdKgdKaccum, i)
+                    )
 
     @cute.jit
     def advance_pipeline(self, pipeline_index, num_stages: cutlass.Constexpr):
