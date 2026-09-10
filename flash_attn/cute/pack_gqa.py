@@ -176,11 +176,17 @@ class PackGQA:
                 mQ_cur_copy = cute.tiled_divide(mQ_cur, (elems_per_load,))
                 for k in cutlass.range_constexpr(cute.size(tQsQ.shape[2])):
                     ki = tQcQ[0, 0, k][1] // elems_per_load
+                    pred = None
+                    if cutlass.const_expr(self.check_hdim_oob):
+                        # Slicing one K group drops tiled-copy predicate broadcasting,
+                        # so expand its transaction predicate to the copy operand.
+                        pred = cute.make_fragment_like(tQsQ[None, m, k], cutlass.Boolean)
+                        pred.fill(tQpQ[0, m, k])
                     cute.copy(
                         gmem_thr_copy,
                         mQ_cur_copy[None, ki],
                         tQsQ[None, m, k],
-                        pred=tQpQ[None, m, k] if cutlass.const_expr(self.check_hdim_oob) else None,
+                        pred=pred,
                     )
             # We don't need to clear the sQ smem tiles since we'll only write out the valid outputs
 
@@ -255,9 +261,15 @@ class PackGQA:
                 mO_cur_copy = cute.tiled_divide(mO_cur, (elems_per_load,))
                 for k in cutlass.range_constexpr(cute.size(tOrO.shape[2])):
                     ki = tOcO[0, 0, k][1] // elems_per_load
+                    pred = None
+                    if cutlass.const_expr(self.check_hdim_oob):
+                        # Slicing one K group drops tiled-copy predicate broadcasting,
+                        # so expand its transaction predicate to the copy operand.
+                        pred = cute.make_fragment_like(tOrO[None, m, k], cutlass.Boolean)
+                        pred.fill(tOpO[0, m, k])
                     cute.copy(
                         gmem_thr_copy,
                         tOrO[None, m, k],
                         mO_cur_copy[None, ki],
-                        pred=tOpO[None, m, k] if cutlass.const_expr(self.check_hdim_oob) else None,
+                        pred=pred,
                     )
