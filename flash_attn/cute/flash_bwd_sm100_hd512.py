@@ -3,7 +3,7 @@
 The dedicated D256 backward supplies the producer/consumer design: TMA sends
 transaction completion directly to the leader CTA, MMA releases input buffers,
 and elementwise warps publish the probability or dS operand. DQ/DK compute
-probabilities while dP runs; DV uses a wider sequence tile. Two input stages
+probabilities while dP runs; DV selects its query tile by mask type. Two input stages
 split the 512-wide reduction into 256-wide chunks. FP32 gradient accumulators
 remain in TMEM until the final write, with an FP32 GQA reduction when needed.
 """
@@ -1009,6 +1009,9 @@ class NativeD512Dv(NativeD512DqDk):
         self.maxsq = maxsq
         self.maxsk = maxsk
         self.threads = 256
+        # A smaller query tile reduces resource pressure for noncausal DV.
+        # Causal attention retains the wider tile to amortize traversal costs.
+        self.query_tile = 256 if causal else 128
 
     @cute.jit
     def __call__(
@@ -1036,7 +1039,7 @@ class NativeD512Dv(NativeD512DqDk):
             tcgen05.OperandMajorMode.K,
             Float32,
             tcgen05.CtaGroup.TWO,
-            (128, 256),
+            (128, self.query_tile),
         )
         mg = sm100.make_trivial_tiled_mma(
             self.dtype,
@@ -1046,21 +1049,21 @@ class NativeD512Dv(NativeD512DqDk):
             tcgen05.CtaGroup.TWO,
             (128, 256),
         )
-        la = sm100.make_smem_layout_a(ms, (128, 256, 512), self.dtype, 1)
-        lb = sm100.make_smem_layout_b(ms, (128, 256, 256), self.dtype, 2)
-        lp = sm100.make_smem_layout_a(mg, (128, 256, 256), self.dtype, 1)
-        lbg = sm100.make_smem_layout_b(mg, (128, 256, 256), self.dtype, 1)
+        la = sm100.make_smem_layout_a(ms, (128, self.query_tile, 512), self.dtype, 1)
+        lb = sm100.make_smem_layout_b(ms, (128, self.query_tile, 256), self.dtype, 2)
+        lp = sm100.make_smem_layout_a(mg, (128, 256, self.query_tile), self.dtype, 1)
+        lbg = sm100.make_smem_layout_b(mg, (128, 256, self.query_tile), self.dtype, 1)
         # TMA uses the per-CTA physical operand layouts; MMA coordinates remain cluster-wide.
         ls = cute.composition(
             cute.select(la, mode=[0, 1, 2]), cute.make_layout((64, 512), stride=(1, 64))
         )
         lg = cute.composition(
             cute.select(lbg, mode=[0, 1, 2]),
-            cute.make_layout((128, 256), stride=(1, 128)),
+            cute.make_layout((128, self.query_tile), stride=(1, 128)),
         )
         lbs = cute.composition(
             cute.select(lb, mode=[0, 1, 2]),
-            cute.make_layout((128, 256), stride=(1, 128)),
+            cute.make_layout((self.query_tile // 2, 256), stride=(1, self.query_tile // 2)),
         )
         op = cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE)
         qa, qt = cpasync.make_tiled_tma_atom(op, self.view(q), ls, (64, 512))
@@ -1068,13 +1071,13 @@ class NativeD512Dv(NativeD512DqDk):
         va, vt = cpasync.make_tiled_tma_atom(op, self.view(v), ls, (64, 512))
         oa, ot = cpasync.make_tiled_tma_atom(op, self.view(do), ls, (64, 512))
         op = cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.TWO)
-        qga, qgt = cpasync.make_tiled_tma_atom(op, self.view(q, True), lg, (128, 256))
-        kga, kgt = cpasync.make_tiled_tma_atom(op, self.view(k, True), lg, (128, 256))
-        oga, ogt = cpasync.make_tiled_tma_atom(op, self.view(do, True), lg, (128, 256))
-        qba, qbt = cpasync.make_tiled_tma_atom(op, self.view(q), lbs, (128, 256))
-        kba, kbt = cpasync.make_tiled_tma_atom(op, self.view(k), lbs, (128, 256))
-        vba, vbt = cpasync.make_tiled_tma_atom(op, self.view(v), lbs, (128, 256))
-        oba, obt = cpasync.make_tiled_tma_atom(op, self.view(do), lbs, (128, 256))
+        qga, qgt = cpasync.make_tiled_tma_atom(op, self.view(q, True), lg, (128, self.query_tile))
+        kga, kgt = cpasync.make_tiled_tma_atom(op, self.view(k, True), lg, (128, self.query_tile))
+        oga, ogt = cpasync.make_tiled_tma_atom(op, self.view(do, True), lg, (128, self.query_tile))
+        qba, qbt = cpasync.make_tiled_tma_atom(op, self.view(q), lbs, (self.query_tile // 2, 256))
+        kba, kbt = cpasync.make_tiled_tma_atom(op, self.view(k), lbs, (self.query_tile // 2, 256))
+        vba, vbt = cpasync.make_tiled_tma_atom(op, self.view(v), lbs, (self.query_tile // 2, 256))
+        oba, obt = cpasync.make_tiled_tma_atom(op, self.view(do), lbs, (self.query_tile // 2, 256))
         loaders = (
             qa,
             qt,
@@ -1150,11 +1153,13 @@ class NativeD512Dv(NativeD512DqDk):
         else:
             m = cute.domain_offset((offset, 0), m)
         if const_expr(transpose):
-            g = cute.local_tile(m, (128, 256), (col // 128, start // 256))
-            nbytes = 65536
+            g = cute.local_tile(m, (128, self.query_tile), (col // 128, start // self.query_tile))
+            nbytes = self.query_tile * 256
         else:
-            g = cute.local_tile(m, (128, 256), (start // 128, col // 256))
-            nbytes = 65536
+            g = cute.local_tile(
+                m, (self.query_tile // 2, 256), (start // (self.query_tile // 2), col // 256)
+            )
+            nbytes = self.query_tile * 256
         d, s = cpasync.tma_partition(
             atom,
             0,
@@ -1228,9 +1233,9 @@ class NativeD512Dv(NativeD512DqDk):
             h = by
             kh = h // ratio
             ks = tile * 128
-            iterations = cute.ceil_div(sq, 256)
+            iterations = cute.ceil_div(sq, self.query_tile)
             smem = utils.SmemAllocator()
-            slse = smem.allocate_array(Float32, 256)
+            slse = smem.allocate_array(Float32, self.query_tile)
             ready = smem.allocate_array(Int64, 2)
             compute_ready = smem.allocate_array(Int64, 1)
             ds_ready = smem.allocate_array(Int64, 1)
@@ -1274,14 +1279,16 @@ class NativeD512Dv(NativeD512DqDk):
             )
             ap = cute.make_tensor(sa_full.iterator, cute.select(la.outer, mode=[0, 1, 2]))
             bp = cute.make_tensor(sb_full.iterator, cute.select(lb.outer, mode=[0, 1, 2]))
-            bp1 = cute.make_tensor(sb_full.iterator + 32768, cute.select(lb.outer, mode=[0, 1, 2]))
+            bp1 = cute.make_tensor(
+                sb_full.iterator + self.query_tile * 128, cute.select(lb.outer, mode=[0, 1, 2])
+            )
             pp = cute.make_tensor(sp_full.iterator, cute.select(lp.outer, mode=[0, 1, 2]))
             bgp = cute.make_tensor(
                 cute.recast_ptr(sb_full.iterator, lbg.inner),
                 cute.select(lbg.outer, mode=[0, 1, 2]),
             )
             bgp1 = cute.make_tensor(
-                cute.recast_ptr(sb_full.iterator + 32768, lbg.inner),
+                cute.recast_ptr(sb_full.iterator + self.query_tile * 128, lbg.inner),
                 cute.select(lbg.outer, mode=[0, 1, 2]),
             )
             sa = cute.make_tensor(
@@ -1290,23 +1297,35 @@ class NativeD512Dv(NativeD512DqDk):
             )
             sb = cute.make_tensor(
                 bp.iterator,
-                cute.composition(bp.layout, cute.make_layout((128, 256), stride=(1, 128))),
+                cute.composition(
+                    bp.layout,
+                    cute.make_layout((self.query_tile // 2, 256), stride=(1, self.query_tile // 2)),
+                ),
             )
             sb1 = cute.make_tensor(
                 bp1.iterator,
-                cute.composition(bp1.layout, cute.make_layout((128, 256), stride=(1, 128))),
+                cute.composition(
+                    bp1.layout,
+                    cute.make_layout((self.query_tile // 2, 256), stride=(1, self.query_tile // 2)),
+                ),
             )
             bg1 = cute.make_tensor(
                 bgp1.iterator,
-                cute.composition(bgp1.layout, cute.make_layout((128, 256), stride=(1, 128))),
+                cute.composition(
+                    bgp1.layout, cute.make_layout((128, self.query_tile), stride=(1, 128))
+                ),
             )
             sp = cute.make_tensor(
                 pp.iterator,
-                cute.composition(pp.layout, cute.make_layout((64, 256), stride=(1, 64))),
+                cute.composition(
+                    pp.layout, cute.make_layout((64, self.query_tile), stride=(1, 64))
+                ),
             )
             bg = cute.make_tensor(
                 bgp.iterator,
-                cute.composition(bgp.layout, cute.make_layout((128, 256), stride=(1, 128))),
+                cute.composition(
+                    bgp.layout, cute.make_layout((128, self.query_tile), stride=(1, 128))
+                ),
             )
             if tid == 0:
                 cute.arch.mbarrier_init(bar, 1)
@@ -1338,7 +1357,7 @@ class NativeD512Dv(NativeD512DqDk):
                 mg.get_slice(rank).partition_shape_C((128, 256))
             )
             cs = ms.get_slice(rank).make_fragment_C(
-                ms.get_slice(rank).partition_shape_C((128, 256))
+                ms.get_slice(rank).partition_shape_C((128, self.query_tile))
             )
             acc0 = cute.make_tensor(tp, cg.layout)
             acc1 = cute.make_tensor(tp + 128, cg.layout)
@@ -1352,15 +1371,15 @@ class NativeD512Dv(NativeD512DqDk):
             compute_sync = cutlass.pipeline.NamedBarrier(barrier_id=2, num_threads=128)
             cphase = Int32(0)
             for it in cutlass.range(iterations):
-                qs = it * 256
+                qs = it * self.query_tile
                 active = True
                 if const_expr(self.causal):
-                    active = ks <= qs + 255 + sk - sq
-                # DV traverses 256 query rows for a 128-key-row output tile.
+                    active = ks <= qs + self.query_tile - 1 + sk - sq
+                # DV traverses query_tile rows for a 128-key-row output tile.
                 if const_expr(self.window[0] >= 0):
                     active = active and ks + 127 >= qs + sk - sq - self.window[0]
                 if const_expr(self.window[1] >= 0 and not self.causal):
-                    active = active and ks <= qs + 255 + sk - sq + self.window[1]
+                    active = active and ks <= qs + self.query_tile - 1 + sk - sq + self.window[1]
                 if active:
                     if warp == 5:
                         if initialized:
@@ -1369,7 +1388,7 @@ class NativeD512Dv(NativeD512DqDk):
                             qba,
                             qbt,
                             sb,
-                            qs + rank * 128,
+                            qs + rank * (self.query_tile // 2),
                             h,
                             qb,
                             0,
@@ -1384,7 +1403,7 @@ class NativeD512Dv(NativeD512DqDk):
                             qba,
                             qbt,
                             sb1,
-                            qs + rank * 128,
+                            qs + rank * (self.query_tile // 2),
                             h,
                             qb,
                             256,
@@ -1446,7 +1465,7 @@ class NativeD512Dv(NativeD512DqDk):
                                 not initialized,
                             )
                     if warp < 4:
-                        for chunk in cutlass.range_constexpr(2):
+                        for chunk in cutlass.range_constexpr(self.query_tile // 128):
                             x = Float32(0)
                             pos = tid + chunk * 128
                             if qs + pos < sq:
@@ -1459,7 +1478,7 @@ class NativeD512Dv(NativeD512DqDk):
                             self.dtype,
                             num_bits_per_copy=128,
                         )
-                        for strip in cutlass.range_constexpr(8):
+                        for strip in cutlass.range_constexpr(self.query_tile // 32):
                             physical = cute.make_layout((128, 16), stride=(65536, 1))
                             ts = cute.make_tensor(scores.iterator + strip * 16, physical)
                             cp = tcgen05.make_tmem_copy(
@@ -1477,7 +1496,7 @@ class NativeD512Dv(NativeD512DqDk):
                             for j in cutlass.range_constexpr(cute.size(rs)):
                                 row, col = coords[j]
                                 r = rank * 64 + row % 64
-                                c = (row // 64) * 128 + strip * 16 + col
+                                c = (row // 64) * (self.query_tile // 2) + strip * 16 + col
                                 qi = qs + c
                                 ki = ks + r
                                 valid = qi < sq and ki < sk
@@ -1509,7 +1528,7 @@ class NativeD512Dv(NativeD512DqDk):
                             for j in cutlass.range_constexpr(2):
                                 row, col = coords[j * 8]
                                 r = row % 64
-                                c = (row // 64) * 128 + strip * 16 + col
+                                c = (row // 64) * (self.query_tile // 2) + strip * 16 + col
                                 offset = cute.assume(cute.crd2idx((r, c), sp.layout), divby=8)
                                 ptarget = cute.make_tensor(
                                     sp.iterator + offset, cute.make_layout(8)
