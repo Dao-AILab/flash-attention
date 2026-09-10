@@ -78,6 +78,10 @@ BIN_BATCH_SEARCH_THRESH = 256  # above this batch size SingleTileVarlenScheduler
 # Where the cu hint applies, use an O(1) flat-block -> batch lookup instead of the binary search.
 USE_BLOCKS_TO_BATCH: bool = True
 
+# Enable the S ping-pong only when each split's mainloop is at least this many
+# n_blocks: 16 for hdim=64 and 64 for hdim=128 
+S_PING_PONG_MIN_N_BLOCKS_PER_SPLIT = {64: 16, 128: 64}
+
 
 def _parse_arch_str(arch_str):
     """Parse arch string (e.g. 'sm_80', 'sm_90a', '80', '100') to int (e.g. 80, 90, 100)."""
@@ -773,6 +777,7 @@ def _flash_attn_fwd(
 
     requested_use_clc_scheduler = utils._get_use_clc_scheduler_default()
     requested_disable_2cta = utils._get_disable_2cta_default(is_fwd=True)
+    requested_disable_s_ping_pong = utils._get_disable_s_ping_pong_default()
 
     # SM80/SM120: uses SM80 MMA, 128 threads (4 warps)
     if arch // 10 in [8, 12]:
@@ -1101,6 +1106,42 @@ def _flash_attn_fwd(
         )
     )
 
+    s_ping_pong_seqlen_k_loaded = (
+        max_seqlen_k
+        if not local
+        else max(
+            0,
+            min(
+                max_seqlen_k,
+                (window_size_right or max_seqlen_k)
+                + (window_size_left or max_seqlen_k)
+                + 1
+                + tile_m,
+            ),
+        )
+    )
+    s_ping_pong_num_n_blocks = (s_ping_pong_seqlen_k_loaded + tile_n - 1) // tile_n
+    num_n_blocks_per_split = (s_ping_pong_num_n_blocks + num_splits - 1) // num_splits
+    use_s_ping_pong = (
+        not requested_disable_s_ping_pong
+        and arch in (100, 110)
+        and q_stage == 1
+        and head_dim in (64, 128)
+        and head_dim_v == head_dim
+        and tile_m == 128
+        and tile_n == 128
+        and not use_2cta_instrs
+        and page_size in (None, tile_n)
+        and score_mod is None
+        and mask_mod is None
+        and not use_block_sparsity
+        and learnable_sink is None
+        and (
+            num_splits == 1
+            or num_n_blocks_per_split >= S_PING_PONG_MIN_N_BLOCKS_PER_SPLIT[head_dim]
+        )
+    )
+
     compile_key = (
         dtype,
         head_dim,
@@ -1146,6 +1187,7 @@ def _flash_attn_fwd(
         mma_pv_is_rs,
         intra_wg_overlap,
         use_clc_scheduler,
+        use_s_ping_pong,
         num_splits_dynamic is not None,
         virtual_batch_idx is not None,
         num_nheads_in_l2 is not None,
@@ -1358,6 +1400,7 @@ def _flash_attn_fwd(
                 )
                 if not use_dedicated_hd256_kernel:
                     fa_fwd_kwargs["has_tile_count_semaphore"] = tile_count_semaphore is not None
+                    fa_fwd_kwargs["use_s_ping_pong"] = use_s_ping_pong
                 fa_fwd = flash_fwd_obj_cls(head_dim, head_dim_v, **fa_fwd_kwargs)
         elif arch // 10 == 12:
             # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
