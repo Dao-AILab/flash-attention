@@ -170,14 +170,17 @@ The Triton backend kernels are provided by the [aiter](https://github.com/ROCm/a
 To install, first get PyTorch for ROCm from https://pytorch.org/get-started/locally/, then install Flash Attention:
 ```sh
 cd flash-attention
-FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" pip install --no-build-isolation .
+AITER_USE_SYSTEM_TRITON="1" FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" pip install --no-build-isolation .
 ```
+When Triton is already installed, Flash Attention passes this setting to AITER
+so the existing package is preserved. Set `AITER_USE_SYSTEM_TRITON="0"` to let
+AITER install its recommended Triton build instead.
 
 To use a specific aiter commit (e.g., for testing or development):
 ```sh
 cd flash-attention
 cd third_party/aiter && git fetch origin && git checkout <commit-sha> && cd ../..
-FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" pip install --no-build-isolation .
+AITER_USE_SYSTEM_TRITON="1" FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" pip install --no-build-isolation .
 ```
 
 To run the tests (note: full suite takes hours):
