@@ -793,3 +793,60 @@ def test_fused_forward_persistent_cache(tmp_path, monkeypatch, dtype, return_lse
     check(out, expected, dtype)
     if return_lse:
         torch.testing.assert_close(lse.double(), expected_lse, atol=0.003, rtol=0.003)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("ratio", [1, 2])
+@pytest.mark.parametrize("causal", [False, True])
+def test_native_gradient_write_isolation(dtype, ratio, causal, monkeypatch):
+    """A gradient kernel must not write another kernel's output buffer."""
+    from flash_attn.cute import flash_bwd_sm100_hd512 as native
+
+    torch.manual_seed(921)
+    q = torch.randn(2, 257, 2 * ratio, 512, device="cuda", dtype=dtype)
+    k, v = [torch.randn(2, 257, 2, 512, device="cuda", dtype=dtype) for _ in range(2)]
+    out, lse, _, _ = _flash_attn_fwd(q, k, v, causal=causal, return_lse=True)
+    dout = torch.randn_like(out)
+    cache = native._native_cache
+    seen = []
+
+    class CheckedCache:
+        def __contains__(self, key):
+            return key in cache
+
+        def __setitem__(self, key, value):
+            cache[key] = value
+
+        def __getitem__(self, key):
+            compiled = cache[key]
+            mode = key[1]
+            target = ("dq", "dk", "dv").index(mode)
+
+            def checked(*args):
+                outputs = args[6:9]
+                if mode == "dq":
+                    for i, tensor in enumerate(outputs):
+                        tensor.fill_(-17.0 - i)
+                saved = {i: t.clone() for i, t in enumerate(outputs) if i != target}
+                result = compiled(*args)
+                for i, expected in saved.items():
+                    torch.testing.assert_close(
+                        outputs[i],
+                        expected,
+                        atol=0,
+                        rtol=0,
+                        msg=f"{mode} kernel modified gradient buffer {i}",
+                    )
+                seen.append(mode)
+                return result
+
+            return checked
+
+    monkeypatch.setattr(native, "_native_cache", CheckedCache())
+    actual = _flash_attn_bwd(q, k, v, out, dout, lse, causal=causal)
+    assert seen == ["dq", "dk", "dv"]
+    qr, kr, vr = [x.double().requires_grad_() for x in (q, k, v)]
+    ref, _ = reference(qr, kr, vr, causal=causal)
+    expected = torch.autograd.grad(ref, (qr, kr, vr), dout.double())
+    for grad, expected_grad in zip(actual, expected):
+        check(grad, expected_grad, dtype)

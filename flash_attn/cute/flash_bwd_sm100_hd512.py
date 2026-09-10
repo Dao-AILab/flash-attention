@@ -971,28 +971,29 @@ class NativeD512DqDk:
                         qo + sq_storage,
                         256,
                     )
-                self.epilogue(
-                    acc0,
-                    coord_g,
-                    sa_full.iterator,
-                    dk,
-                    kb,
-                    h,
-                    ko + ks,
-                    ko + sk_storage,
-                    0,
-                )
-                self.epilogue(
-                    acc1,
-                    coord_g,
-                    sa_full.iterator,
-                    dk,
-                    kb,
-                    h,
-                    ko + ks,
-                    ko + sk_storage,
-                    256,
-                )
+                else:
+                    self.epilogue(
+                        acc0,
+                        coord_g,
+                        sa_full.iterator,
+                        dk,
+                        kb,
+                        h,
+                        ko + ks,
+                        ko + sk_storage,
+                        0,
+                    )
+                    self.epilogue(
+                        acc1,
+                        coord_g,
+                        sa_full.iterator,
+                        dk,
+                        kb,
+                        h,
+                        ko + ks,
+                        ko + sk_storage,
+                        256,
+                    )
             cute.arch.cluster_arrive()
             cute.arch.cluster_wait()
             tmem.free(tp)
