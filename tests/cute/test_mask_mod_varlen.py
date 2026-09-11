@@ -1,5 +1,4 @@
 # mask_mod varlen test script
-# Forward-only 
 #
 # Since flex_attention doesn't support varlen natively, we compare
 # results sequence-by-sequence: run the kernel with cu_seqlens (packed),
@@ -18,9 +17,16 @@ import cutlass
 import cutlass.cute as cute
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention
 
-from flash_attn.cute.interface import _flash_attn_fwd
+from flash_attn.cute.interface import _flash_attn_fwd, flash_attn_varlen_func
 from flash_attn.cute import utils
+from flash_attn.cute.block_sparsity import BlockSparseTensorsTorch
 from flash_attn.cute.compute_block_sparsity import compute_block_sparsity
+from score_mod_definitions import (
+    score_mod_bwd_dual_buffer,
+    score_mod_bwd_times_two,
+    score_mod_dual_buffer,
+    score_mod_times_two,
+)
 from mask_mod_definitions import (
     get_mask_pair,
     get_vec_mask,
@@ -124,6 +130,20 @@ def setup_varlen_tensors(
     return q, k, v, cu_seqlens_q, cu_seqlens_k
 
 
+def _active_packed_indices(cu_seqlens, seqused):
+    """Return packed row indices covered by each sequence's effective length."""
+    return torch.cat(
+        [
+            torch.arange(
+                cu_seqlens[batch_idx],
+                cu_seqlens[batch_idx] + seqlen,
+                device=cu_seqlens.device,
+            )
+            for batch_idx, seqlen in enumerate(seqused)
+        ]
+    )
+
+
 def run_flex_per_sequence(
     q,
     k,
@@ -150,12 +170,13 @@ def run_flex_per_sequence(
         sq = seqlens_q[i]
         sk = seqlens_k[i]
 
-        # Extract packed slices
-        q_slice = q[cu_seqlens_q[i] : cu_seqlens_q[i + 1]].unsqueeze(0)  # (1, sq, H, D)
-        k_slice = k[cu_seqlens_k[i] : cu_seqlens_k[i + 1]].unsqueeze(
-            0
-        )  # (1, sk, Hkv, D)
-        v_slice = v[cu_seqlens_k[i] : cu_seqlens_k[i + 1]].unsqueeze(0)
+        # Slice only the effective prefix. This also supports seqused_* being
+        # shorter than the physical segment described by cu_seqlens_*.
+        q_start = cu_seqlens_q[i]
+        k_start = cu_seqlens_k[i]
+        q_slice = q[q_start : q_start + sq].unsqueeze(0)  # (1, sq, H, D)
+        k_slice = k[k_start : k_start + sk].unsqueeze(0)  # (1, sk, Hkv, D)
+        v_slice = v[k_start : k_start + sk].unsqueeze(0)
 
         if dtype is not None:
             q_slice = q_slice.to(dtype)
@@ -891,6 +912,384 @@ BLOCK_SPARSE_SEQLEN_CONFIGS = [
     ([256, 512, 256], [256, 512, 256]),
     ([128, 192, 256], [64, 128, 192]),
 ]
+
+
+def _make_varlen_block_sparse_pair(
+    mask_mod,
+    seqlens_q,
+    seqlens_k,
+    num_heads,
+    block_size,
+    device,
+):
+    """Pack both BlockMask directions using each sequence's effective lengths."""
+    block_masks = [
+        create_block_mask(
+            mask_mod,
+            B=1,
+            H=num_heads,
+            Q_LEN=seqlen_q,
+            KV_LEN=seqlen_k,
+            device=device,
+            BLOCK_SIZE=block_size,
+        ).as_tuple()
+        for seqlen_q, seqlen_k in zip(seqlens_q, seqlens_k)
+    ]
+
+    def pack(field):
+        values = [mask[field][0].flatten(1) for mask in block_masks]
+        return torch.cat(values, dim=1).contiguous()
+
+    def cumsum(values):
+        values = torch.tensor([0, *values], dtype=torch.int32, device=device)
+        return values.cumsum(0, dtype=torch.int32)
+
+    (
+        kv_mask_cnt,
+        kv_mask_idx,
+        full_kv_cnt,
+        full_kv_idx,
+        q_mask_cnt,
+        q_mask_idx,
+        full_q_cnt,
+        full_q_idx,
+    ) = [pack(field) for field in range(2, 10)]
+    num_m_blocks = [(q + block_size[0] - 1) // block_size[0] for q in seqlens_q]
+    num_n_blocks = [(k + block_size[1] - 1) // block_size[1] for k in seqlens_k]
+    cu_block_idx_offsets = cumsum(
+        [m_blocks * n_blocks for m_blocks, n_blocks in zip(num_m_blocks, num_n_blocks)]
+    )
+    fwd = BlockSparseTensorsTorch(
+        mask_block_cnt=kv_mask_cnt,
+        mask_block_idx=kv_mask_idx,
+        full_block_cnt=full_kv_cnt,
+        full_block_idx=full_kv_idx,
+        cu_total_m_blocks=cumsum(num_m_blocks),
+        cu_block_idx_offsets=cu_block_idx_offsets,
+        block_size=block_size,
+    )
+    bwd = BlockSparseTensorsTorch(
+        mask_block_cnt=q_mask_cnt,
+        mask_block_idx=q_mask_idx,
+        full_block_cnt=full_q_cnt,
+        full_block_idx=full_q_idx,
+        cu_block_idx_offsets=cu_block_idx_offsets,
+        block_size=block_size,
+        cu_total_n_blocks=cumsum(num_n_blocks),
+    )
+    return fwd, bwd
+
+
+def _assert_varlen_block_sparse_backward_matches_reference(
+    physical_seqlens_q,
+    physical_seqlens_k,
+    *,
+    effective_seqlens_q=None,
+    effective_seqlens_k=None,
+    num_heads=2,
+    num_kv_heads=None,
+    metadata_heads=1,
+    head_dim=64,
+    block_size=(128, 128),
+    dtype=torch.bfloat16,
+    mask_name="mini_causal",
+    pack_gqa=False,
+    use_sparse_forward=True,
+    seed=42,
+):
+    """Compare packed sparse backward with dense FA4 and per-sequence FP32 Flex."""
+    torch.manual_seed(seed)
+    device = "cuda"
+    num_kv_heads = num_heads if num_kv_heads is None else num_kv_heads
+    seqlens_q = physical_seqlens_q if effective_seqlens_q is None else effective_seqlens_q
+    seqlens_k = physical_seqlens_k if effective_seqlens_k is None else effective_seqlens_k
+    q, k, v, cu_seqlens_q, cu_seqlens_k = setup_varlen_tensors(
+        physical_seqlens_q,
+        physical_seqlens_k,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+        dtype,
+    )
+    q.requires_grad_(True)
+    k.requires_grad_(True)
+    v.requires_grad_(True)
+    seqused_q = (
+        torch.tensor(seqlens_q, dtype=torch.int32, device=device)
+        if effective_seqlens_q is not None
+        else None
+    )
+    seqused_k = (
+        torch.tensor(seqlens_k, dtype=torch.int32, device=device)
+        if effective_seqlens_k is not None
+        else None
+    )
+    mask_mod_cute, mask_mod_flex = get_mask_pair(mask_name)
+    sparse_fwd, sparse_bwd = _make_varlen_block_sparse_pair(
+        mask_mod_flex,
+        seqlens_q,
+        seqlens_k,
+        metadata_heads,
+        block_size,
+        device,
+    )
+    common_kwargs = {
+        "cu_seqlens_q": cu_seqlens_q,
+        "cu_seqlens_k": cu_seqlens_k,
+        "seqused_q": seqused_q,
+        "seqused_k": seqused_k,
+        "max_seqlen_q": max(seqlens_q),
+        "max_seqlen_k": max(seqlens_k),
+        "pack_gqa": pack_gqa,
+        "mask_mod": mask_mod_cute,
+    }
+    out_sparse, _ = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        block_sparse_tensors=sparse_fwd if use_sparse_forward else None,
+        block_sparse_tensors_bwd=sparse_bwd,
+        **common_kwargs,
+    )
+    out_dense, _ = flash_attn_varlen_func(q, k, v, **common_kwargs)
+
+    active_q = _active_packed_indices(cu_seqlens_q, seqlens_q)
+    active_k = _active_packed_indices(cu_seqlens_k, seqlens_k)
+    out_sparse_active = out_sparse[active_q]
+    out_dense_active = out_dense[active_q]
+    dout = torch.randn_like(out_sparse_active)
+    grads_sparse = torch.autograd.grad(
+        out_sparse_active, (q, k, v), dout, retain_graph=True
+    )
+    grads_dense = torch.autograd.grad(out_dense_active, (q, k, v), dout)
+
+    q_ref = q.detach().float().requires_grad_(True)
+    k_ref = k.detach().float().requires_grad_(True)
+    v_ref = v.detach().float().requires_grad_(True)
+    out_ref = run_flex_per_sequence(
+        q_ref,
+        k_ref,
+        v_ref,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        lambda *_: mask_mod_flex,
+        seqlens_q,
+        seqlens_k,
+        num_heads,
+        num_kv_heads,
+        head_dim,
+    )
+    grads_ref = torch.autograd.grad(out_ref, (q_ref, k_ref, v_ref), dout.float())
+
+    for name, actual, baseline, reference in zip(
+        ("out", "dQ", "dK", "dV"),
+        (
+            out_sparse_active,
+            grads_sparse[0][active_q],
+            grads_sparse[1][active_k],
+            grads_sparse[2][active_k],
+        ),
+        (
+            out_dense_active,
+            grads_dense[0][active_q],
+            grads_dense[1][active_k],
+            grads_dense[2][active_k],
+        ),
+        (
+            out_ref,
+            grads_ref[0][active_q],
+            grads_ref[1][active_k],
+            grads_ref[2][active_k],
+        ),
+    ):
+        actual_error = (actual.float() - reference).abs().max().item()
+        baseline_error = (baseline.float() - reference).abs().max().item()
+        rounding_atol = 2 * (reference + 0.3 - 0.3 - reference).abs().max().item()
+        assert actual_error <= 2 * baseline_error + rounding_atol, (
+            f"{name}: sparse error {actual_error} exceeds dense error {baseline_error}"
+        )
+
+
+@pytest.mark.skipif(COMPUTE_CAPABILITY != 9, reason="SM90 only")
+@pytest.mark.parametrize(
+    "dtype,metadata_heads,mask_name",
+    [
+        pytest.param(torch.bfloat16, 2, "block_diagonal", id="bf16-per-head"),
+        pytest.param(torch.float16, 1, "mini_causal", id="fp16-broadcast"),
+    ],
+)
+def test_varlen_block_sparse_backward_sm90(dtype, metadata_heads, mask_name):
+    _assert_varlen_block_sparse_backward_matches_reference(
+        [257, 129],
+        [385, 129],
+        metadata_heads=metadata_heads,
+        dtype=dtype,
+        mask_name=mask_name,
+    )
+
+
+@pytest.mark.skipif(COMPUTE_CAPABILITY != 9, reason="SM90 only")
+@pytest.mark.parametrize(
+    "head_dim,block_size,use_sparse_forward",
+    [
+        pytest.param(128, (128, 128), True, id="factor-2"),
+        # D=96 forward uses tile_n=144, while backward uses tile_n=128. A dense
+        # mask-mod forward isolates the packed factor-3 backward metadata path.
+        pytest.param(96, (192, 128), False, id="factor-3"),
+    ],
+)
+def test_varlen_block_sparse_backward_q_subtiles_sm90(
+    head_dim, block_size, use_sparse_forward
+):
+    # Ragged tails make the last coarse block expand past the effective length,
+    # exercising the same m_block_max trimming as fixed-length block sparsity.
+    _assert_varlen_block_sparse_backward_matches_reference(
+        [257, 129],
+        [385, 129],
+        head_dim=head_dim,
+        block_size=block_size,
+        metadata_heads=1,
+        use_sparse_forward=use_sparse_forward,
+    )
+
+
+@pytest.mark.skipif(COMPUTE_CAPABILITY != 9, reason="SM90 only")
+@pytest.mark.parametrize("seed", range(9))
+def test_varlen_block_sparse_backward_fuzz_sm90(seed):
+    """Bounded randomized coverage for packed metadata and ragged tails."""
+    rng = random.Random(1000 + seed)
+    q_configs = [
+        (64, (128, 128)),
+        (128, (128, 128)),
+        (96, (192, 128)),
+    ]
+    head_modes = [
+        (2, 2, False),
+        (4, 2, True),
+        (4, 1, False),
+    ]
+    # Nine seeds cover every Q-subtile configuration × head mode.
+    head_dim, block_size = q_configs[seed % len(q_configs)]
+    num_heads, num_kv_heads, pack_gqa = head_modes[seed // len(q_configs)]
+    batch_size = rng.randint(2, 4)
+
+    effective_seqlens_q = [
+        rng.randint(1, 3 * block_size[0] - 1) for _ in range(batch_size)
+    ]
+    effective_seqlens_q[0] = rng.randint(block_size[0] + 1, 3 * block_size[0] - 1)
+    effective_seqlens_q[-1] = rng.randint(1, block_size[0] - 1)
+    effective_seqlens_k = [
+        seqlen_q + rng.randint(0, 2 * block_size[1])
+        for seqlen_q in effective_seqlens_q
+    ]
+    # Avoid only tile-aligned cases; the subtile loops must trim ragged tails.
+    effective_seqlens_q = [q + int(q % 64 == 0) for q in effective_seqlens_q]
+    effective_seqlens_k = [k + int(k % 128 == 0) for k in effective_seqlens_k]
+
+    if seed % 2:
+        physical_seqlens_q = [
+            q + rng.randint(1, block_size[0]) for q in effective_seqlens_q
+        ]
+        physical_seqlens_k = [
+            k + rng.randint(1, block_size[1]) for k in effective_seqlens_k
+        ]
+    else:
+        physical_seqlens_q = effective_seqlens_q
+        physical_seqlens_k = effective_seqlens_k
+
+    metadata_heads = 1 if pack_gqa or seed % 2 == 0 else num_heads
+    _assert_varlen_block_sparse_backward_matches_reference(
+        physical_seqlens_q,
+        physical_seqlens_k,
+        effective_seqlens_q=effective_seqlens_q if seed % 2 else None,
+        effective_seqlens_k=effective_seqlens_k if seed % 2 else None,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        metadata_heads=metadata_heads,
+        head_dim=head_dim,
+        block_size=block_size,
+        dtype=torch.float16 if seed % 2 == 0 else torch.bfloat16,
+        mask_name="block_diagonal" if seed % 2 == 0 else "mini_causal",
+        pack_gqa=pack_gqa,
+        use_sparse_forward=False,
+        seed=seed,
+    )
+
+
+@pytest.mark.skipif(COMPUTE_CAPABILITY != 9, reason="SM90 only")
+@pytest.mark.parametrize("score_case", ["times_two", "aux_buffers"])
+def test_varlen_block_sparse_backward_score_mod_and_sink_sm90(score_case):
+    """Block-sparse packed indexing composes with score backward and sink gradients."""
+    torch.manual_seed(42)
+    device = "cuda"
+    dtype = torch.bfloat16
+    seqlens_q = [257, 129]
+    seqlens_k = [385, 129]
+    num_heads = 2
+    head_dim = 64
+    block_size = (128, 128)
+    q, k, v, cu_seqlens_q, cu_seqlens_k = setup_varlen_tensors(
+        seqlens_q, seqlens_k, num_heads, num_heads, head_dim, dtype
+    )
+    q.requires_grad_(True)
+    k.requires_grad_(True)
+    v.requires_grad_(True)
+    sink_sparse = torch.randn(
+        num_heads, device=device, dtype=dtype, requires_grad=True
+    )
+    sink_dense = sink_sparse.detach().clone().requires_grad_(True)
+    mask_mod_cute, mask_mod_flex = get_mask_pair("mini_causal")
+    sparse_fwd, sparse_bwd = _make_varlen_block_sparse_pair(
+        mask_mod_flex,
+        seqlens_q,
+        seqlens_k,
+        num_heads=1,
+        block_size=block_size,
+        device=device,
+    )
+    if score_case == "aux_buffers":
+        score_mod = score_mod_dual_buffer
+        score_mod_bwd = score_mod_bwd_dual_buffer
+        aux_tensors = [
+            torch.randn(num_heads, device=device, dtype=dtype) * 0.2,
+            torch.arange(max(seqlens_q), device=device, dtype=dtype) * 0.01,
+        ]
+    else:
+        score_mod = score_mod_times_two
+        score_mod_bwd = score_mod_bwd_times_two
+        aux_tensors = None
+    common_kwargs = {
+        "cu_seqlens_q": cu_seqlens_q,
+        "cu_seqlens_k": cu_seqlens_k,
+        "max_seqlen_q": max(seqlens_q),
+        "max_seqlen_k": max(seqlens_k),
+        "score_mod": score_mod,
+        "score_mod_bwd": score_mod_bwd,
+        "mask_mod": mask_mod_cute,
+        "aux_tensors": aux_tensors,
+    }
+    out_sparse, _ = flash_attn_varlen_func(
+        q,
+        k,
+        v,
+        learnable_sink=sink_sparse,
+        block_sparse_tensors=sparse_fwd,
+        block_sparse_tensors_bwd=sparse_bwd,
+        **common_kwargs,
+    )
+    out_dense, _ = flash_attn_varlen_func(
+        q, k, v, learnable_sink=sink_dense, **common_kwargs
+    )
+    dout = torch.randn_like(out_sparse)
+    grads_sparse = torch.autograd.grad(
+        out_sparse, (q, k, v, sink_sparse), dout, retain_graph=True
+    )
+    grads_dense = torch.autograd.grad(out_dense, (q, k, v, sink_dense), dout)
+
+    for actual, expected in zip(
+        (out_sparse, *grads_sparse), (out_dense, *grads_dense)
+    ):
+        torch.testing.assert_close(actual, expected, rtol=3e-2, atol=3e-2)
 
 
 # @pytest.mark.parametrize("varlen_q", [False, True])

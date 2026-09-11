@@ -535,6 +535,7 @@ def compute_block_sparsity(
                 blocksparse_tensors_torch.cu_block_idx_offsets,
                 blocksparse_tensors_torch.dq_write_order,
                 blocksparse_tensors_torch.dq_write_order_full,
+                blocksparse_tensors_torch.cu_total_n_blocks,
             ),
             seqlen_q,
             seqlen_k,

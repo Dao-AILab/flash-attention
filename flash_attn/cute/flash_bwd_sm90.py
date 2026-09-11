@@ -944,6 +944,9 @@ class FlashAttentionBackwardSm90:
                         or m_block_min < m_block_max
                     )
                 else:
+                    num_sparse_m_blocks = cute.ceil_div(
+                        seqlen.seqlen_q, self.tile_m * self.q_subtile_factor
+                    )
                     total_m_block_cnt = get_total_q_block_count_bwd(
                         blocksparse_tensors,
                         batch_idx,
@@ -951,6 +954,7 @@ class FlashAttentionBackwardSm90:
                         n_block,
                         q_subtile_factor=self.q_subtile_factor,
                         m_block_max=m_block_max,
+                        num_sparse_m_blocks=num_sparse_m_blocks,
                     )
                     process_tile = total_m_block_cnt > Int32(0)
 
@@ -1016,6 +1020,7 @@ class FlashAttentionBackwardSm90:
                             Q_stage_eq_dO_stage=(self.Q_stage == self.dO_stage),
                             q_subtile_factor=self.q_subtile_factor,
                             m_block_max=m_block_max,
+                            num_sparse_m_blocks=num_sparse_m_blocks,
                         )
 
                 tile_scheduler.prefetch_next_work()
@@ -1357,6 +1362,9 @@ class FlashAttentionBackwardSm90:
                     or m_block_min < m_block_max
                 )
             else:
+                num_sparse_m_blocks = cute.ceil_div(
+                    seqlen.seqlen_q, self.tile_m * self.q_subtile_factor
+                )
                 total_m_block_cnt = get_total_q_block_count_bwd(
                     blocksparse_tensors,
                     batch_idx,
@@ -1364,6 +1372,7 @@ class FlashAttentionBackwardSm90:
                     n_block,
                     q_subtile_factor=self.q_subtile_factor,
                     m_block_max=m_block_max,
+                    num_sparse_m_blocks=num_sparse_m_blocks,
                 )
                 process_tile = total_m_block_cnt > Int32(0)
 
@@ -1412,6 +1421,7 @@ class FlashAttentionBackwardSm90:
                         score_mod_bwd_fn=score_mod_bwd_fn_cur,
                         q_subtile_factor=self.q_subtile_factor,
                         m_block_max=m_block_max,
+                        num_sparse_m_blocks=num_sparse_m_blocks,
                         aux_data=aux_data,
                         fastdiv_mods=fastdiv_mods,
                     )
@@ -1848,6 +1858,9 @@ class FlashAttentionBackwardSm90:
                 )
                 loop_count = m_block_max - m_block_min
             else:
+                num_sparse_m_blocks = cute.ceil_div(
+                    seqlen.seqlen_q, self.tile_m * self.q_subtile_factor
+                )
                 total_block_cnt = get_total_q_block_count_bwd(
                     blocksparse_tensors,
                     batch_idx,
@@ -1855,6 +1868,7 @@ class FlashAttentionBackwardSm90:
                     n_block,
                     q_subtile_factor=self.q_subtile_factor,
                     m_block_max=m_block_max,
+                    num_sparse_m_blocks=num_sparse_m_blocks,
                 )
                 process_tile = total_block_cnt > Int32(0)
 
@@ -1929,6 +1943,7 @@ class FlashAttentionBackwardSm90:
                         gdQaccum,
                         q_subtile_factor=self.q_subtile_factor,
                         m_block_max=m_block_max,
+                        num_sparse_m_blocks=num_sparse_m_blocks,
                         num_dQ_warp_groups=self.num_wg_dQ,
                         num_threads_per_warp_group=self.num_threads_per_warp_group,
                         tma_copy_bytes_dQ=self.tma_copy_bytes["dQ"],
