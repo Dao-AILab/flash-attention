@@ -33,7 +33,7 @@ Non-goals (and other resources):
 ## Model Components
 
 The GPT model is implemented
-[here](https://github.com/HazyResearch/flash-attention/blob/main/flash_attn/models/gpt.py).
+[here](https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/models/gpt.py).
 And here's an example to construct the GPT3-1.3B model with rotary embedding:
 ```python
 from transformers.models.gpt2.configuration_gpt2 import GPT2Config
@@ -82,7 +82,7 @@ cd ../csrc/rotary && pip install .
 ```
 5. Fused dropout + residual + LayerNorm, adapted from Apex's
 [FastLayerNorm](https://github.com/NVIDIA/apex/tree/master/apex/contrib/layer_norm). We add dropout and residual, and make it work for both pre-norm and post-norm architecture.
-This supports dimensions divisible by 8, up to 6144.
+This supports dimensions divisible by 8, up to 8192.
 ```sh
 cd ../csrc/layer_norm && pip install .
 ```
