@@ -391,7 +391,7 @@ to use Flash Attention 2 and 3 right away.
 from kernels import get_kernel
 
 # FA2
-fa_module = get_kernel("kernels-community/flash-attn2", version=1)
+fa_module = get_kernel("kernels-community/flash-attn2", version=2)
 flash_attn_func = fa_module.flash_attn_func
 
 # FA3
