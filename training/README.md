@@ -73,13 +73,9 @@ cd ../csrc/fused_dense_lib && pip install .
 ```
 3. Optimized cross-entropy loss, adapted from Apex's
 [Xentropy](https://github.com/NVIDIA/apex/tree/master/apex/contrib/xentropy). We make it work for bfloat16 and support in-place backward to save memory.
-```sh
-cd ../csrc/xentropy && pip install .
-```
+Included with `pip install flash-attn` (see `flash_attn/losses/cross_entropy.py`).
 4. Fused rotary embedding:
-```sh
-cd ../csrc/rotary && pip install .
-```
+Included with `pip install flash-attn` (see `flash_attn/layers/rotary.py`).
 5. Fused dropout + residual + LayerNorm, adapted from Apex's
 [FastLayerNorm](https://github.com/NVIDIA/apex/tree/master/apex/contrib/layer_norm). We add dropout and residual, and make it work for both pre-norm and post-norm architecture.
 This supports dimensions divisible by 8, up to 6144.
