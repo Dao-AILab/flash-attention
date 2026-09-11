@@ -1029,6 +1029,111 @@ def test_flash_attn_hd256_sm100_noncontiguous_transpose():
     )
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("paged", [False, True])
+@pytest.mark.parametrize("layout", ["padded", "transposed"])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_hd256_varlen_output_alignment(dtype, paged, layout):
+    """Preserve aligned strided outputs and guards across a nonzero packed-Q offset."""
+    if not (IS_SM100 or IS_SM110):
+        pytest.skip("SM100/SM110-specific hd256 output alignment test")
+    torch.manual_seed(0)
+    q_lengths, k_lengths = [129, 257], [257, 513]
+    q_offsets, k_offsets = [0, 129, 386], [0, 257, 770]
+    nheads, nheads_kv, d = 4, 2, 256
+    q = torch.randn(q_offsets[-1], nheads, d, device="cuda", dtype=dtype)
+    k = torch.randn(k_offsets[-1], nheads_kv, d, device="cuda", dtype=dtype)
+    v = torch.randn_like(k)
+    cu_q = torch.tensor(q_offsets, device="cuda", dtype=torch.int32)
+    cu_k = torch.tensor(k_offsets, device="cuda", dtype=torch.int32)
+    page_table = seqused_k = None
+    kernel_k, kernel_v = k, v
+    if paged:
+        page_size, pages_per_seq = 128, 5
+        page_table = torch.randperm(10, device="cuda", dtype=torch.int32).reshape(2, 5)
+        seqused_k = torch.tensor(k_lengths, device="cuda", dtype=torch.int32)
+        kernel_k = torch.zeros(10, page_size, nheads_kv, d, device="cuda", dtype=dtype)
+        kernel_v = torch.zeros_like(kernel_k)
+        for b, length in enumerate(k_lengths):
+            padding = (0, 0, 0, 0, 0, pages_per_seq * page_size - length)
+            for source, cache in ((k, kernel_k), (v, kernel_v)):
+                cache[page_table[b].long()] = torch.nn.functional.pad(
+                    source[k_offsets[b]:k_offsets[b + 1]], padding
+                ).reshape(pages_per_seq, page_size, nheads_kv, d)
+        cu_k = None
+
+    # Eight padding elements keep all strides 16-byte aligned without requiring
+    # 128-byte alignment. The leading guard also tests a nonzero storage offset.
+    shape = (q_offsets[-1], nheads, d + 8)
+    if layout == "transposed":
+        shape = (nheads, q_offsets[-1], d + 8)
+    storage = torch.full((math.prod(shape) + 8,), 123.0, device="cuda", dtype=dtype)
+    padded = storage[8:].view(shape)
+    if layout == "transposed":
+        padded = padded.transpose(0, 1)
+    out = padded[..., :d]
+    result = _flash_attn_fwd(
+        q, kernel_k, kernel_v, out=out,
+        cu_seqlens_q=cu_q, cu_seqlens_k=cu_k,
+        max_seqlen_q=max(q_lengths), max_seqlen_k=max(k_lengths),
+        seqused_k=seqused_k, page_table=page_table, causal=True,
+    )[0]
+    if is_fake_mode():
+        return
+
+    assert result.data_ptr() == out.data_ptr()
+    assert not out.is_contiguous()
+    assert torch.equal(storage[:8], torch.full_like(storage[:8], 123.0))
+    assert torch.equal(padded[..., d:], torch.full_like(padded[..., d:], 123.0))
+    assert torch.isfinite(out).all()
+    refs = {}
+    for ref_dtype in (torch.float64, dtype):
+        pieces = []
+        for b, (sq, sk) in enumerate(zip(q_lengths, k_lengths)):
+            mask = torch.arange(sk, device="cuda")[None, :] <= (
+                torch.arange(sq, device="cuda")[:, None] + sk - sq
+            )
+            with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
+                pieces.append(torch.nn.functional.scaled_dot_product_attention(
+                    q[q_offsets[b]:q_offsets[b + 1]].to(ref_dtype).transpose(0, 1),
+                    k[k_offsets[b]:k_offsets[b + 1]].to(ref_dtype).transpose(0, 1),
+                    v[k_offsets[b]:k_offsets[b + 1]].to(ref_dtype).transpose(0, 1),
+                    attn_mask=mask, enable_gqa=True,
+                ).transpose(0, 1))
+        refs[ref_dtype] = torch.cat(pieces)
+    check_tensor_vs_ref("out", out, refs[torch.float64], refs[dtype], rtol=2)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("shape", [(1, 129, 4, 256), (2, 1, 4, 256), (2, 129, 1, 256)])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_hd256_output_singleton_strides(dtype, shape):
+    """Accept arbitrary unused strides without assuming they are aligned."""
+    if not (IS_SM100 or IS_SM110):
+        pytest.skip("SM100/SM110-specific hd256 output alignment test")
+    torch.manual_seed(0)
+    q, k, v = [torch.randn(shape, device="cuda", dtype=dtype) for _ in range(3)]
+    strides = tuple(1 if size == 1 else stride for size, stride in zip(shape, q.stride()))
+    out = torch.empty_strided(shape, strides, device="cuda", dtype=dtype)
+    assert out.is_contiguous()
+    result = _flash_attn_fwd(q, k, v, out=out, causal=True)[0]
+    if is_fake_mode():
+        return
+    assert result.data_ptr() == out.data_ptr()
+    assert out.stride() == strides
+    assert torch.isfinite(out).all()
+    refs = {}
+    with torch.nn.attention.sdpa_kernel(torch.nn.attention.SDPBackend.MATH):
+        for ref_dtype in (torch.float64, dtype):
+            refs[ref_dtype] = torch.nn.functional.scaled_dot_product_attention(
+                q.to(ref_dtype).transpose(1, 2),
+                k.to(ref_dtype).transpose(1, 2),
+                v.to(ref_dtype).transpose(1, 2),
+                is_causal=True,
+            ).transpose(1, 2)
+    check_tensor_vs_ref("out", out, refs[torch.float64], refs[dtype], rtol=2)
+
+
 # @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
