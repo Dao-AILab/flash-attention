@@ -310,8 +310,9 @@ class FlashAttentionBackwardSm100:
         # S.T = K @ Q.T
         tiled_mma_S = sm100_utils_basic.make_trivial_tiled_mma(
             self.q_dtype,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.K,
+            self.q_dtype,
+            cute.nvgpu.OperandMajorMode.K,
+            cute.nvgpu.OperandMajorMode.K,
             self.acc_dtype,
             self.cta_group,
             self.mma_tiler_kq[:2],
@@ -319,8 +320,9 @@ class FlashAttentionBackwardSm100:
         # dP.T = V @ dO.T
         tiled_mma_dP = sm100_utils_basic.make_trivial_tiled_mma(
             self.do_dtype,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.K,
+            self.do_dtype,
+            cute.nvgpu.OperandMajorMode.K,
+            cute.nvgpu.OperandMajorMode.K,
             self.acc_dtype,
             self.cta_group,
             self.mma_tiler_vdo[:2],
@@ -328,8 +330,9 @@ class FlashAttentionBackwardSm100:
         # dV += P.T @ dO --> (K, MN) major
         tiled_mma_dV = sm100_utils_basic.make_trivial_tiled_mma(
             self.do_dtype,
-            tcgen05.OperandMajorMode.K,  # P_major_mode
-            tcgen05.OperandMajorMode.MN,  # dO_major_mode
+            self.do_dtype,
+            cute.nvgpu.OperandMajorMode.K,  # P_major_mode
+            cute.nvgpu.OperandMajorMode.MN,  # dO_major_mode
             self.acc_dtype,
             self.cta_group,
             self.mma_tiler_pdo[:2],
@@ -342,8 +345,9 @@ class FlashAttentionBackwardSm100:
             mma_dK_a_src = tcgen05.OperandSource.TMEM
         tiled_mma_dK = sm100_utils_basic.make_trivial_tiled_mma(
             self.do_dtype,
-            tcgen05.OperandMajorMode.K,  # dS_major_mode
-            tcgen05.OperandMajorMode.MN,  # Q_major_mode
+            self.do_dtype,
+            cute.nvgpu.OperandMajorMode.K,  # dS_major_mode
+            cute.nvgpu.OperandMajorMode.MN,  # Q_major_mode
             self.acc_dtype,
             self.cta_group,
             self.mma_tiler_dsq[:2],
@@ -352,8 +356,9 @@ class FlashAttentionBackwardSm100:
         # dQ = dS @ K
         tiled_mma_dQ = sm100_utils_basic.make_trivial_tiled_mma(
             self.k_dtype,
-            tcgen05.OperandMajorMode.MN,  # dS_major_mode
-            tcgen05.OperandMajorMode.MN,  # Kt_major_mode
+            self.k_dtype,
+            cute.nvgpu.OperandMajorMode.MN,  # dS_major_mode
+            cute.nvgpu.OperandMajorMode.MN,  # Kt_major_mode
             self.acc_dtype,
             self.cta_group,
             self.mma_tiler_dsk[:2],
@@ -603,9 +608,9 @@ class FlashAttentionBackwardSm100:
             self.mdV_layout_enum = LayoutEnum.from_tensor(mdV)
             dK_major_mode = self.mdK_layout_enum.mma_major_mode()
             dV_major_mode = self.mdV_layout_enum.mma_major_mode()
-            if const_expr(dK_major_mode != tcgen05.OperandMajorMode.K):
+            if const_expr(dK_major_mode != cute.nvgpu.OperandMajorMode.K):
                 raise RuntimeError("The layout of mdK is wrong")
-            if const_expr(dV_major_mode != tcgen05.OperandMajorMode.K):
+            if const_expr(dV_major_mode != cute.nvgpu.OperandMajorMode.K):
                 raise RuntimeError("The layout of mdV is wrong")
 
         if const_expr(self.use_tma_store and not self.dKV_postprocess):
