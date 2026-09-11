@@ -51,7 +51,7 @@ yields the fastest BERT training on cloud instances in MLPerf training 2.0 (June
 
 ## Language model training & inference
 
-- [PubMedGPT 2.7B](https://crfm.stanford.edu/2022/12/15/pubmedgpt.html), a
+- [PubMedGPT 2.7B](https://crfm.stanford.edu/2022/12/15/biomedlm.html), a
   domain-specific LLM for biomedicine, by Stanford CRFM, trained on
   [MosaicML](https://www.mosaicml.com/blog/introducing-pubmed-gpt) Cloud. Just
   using FlashAttention nearly halves the total training time.
