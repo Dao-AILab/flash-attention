@@ -110,7 +110,7 @@ yields the fastest BERT training on cloud instances in MLPerf training 2.0 (June
 
 ## Different implementations
 
-- [Triton](https://github.com/openai/triton): an [implementation](https://github.com/openai/triton/blob/master/python/tutorials/06-fused-attention.py) of
+- [Triton](https://github.com/triton-lang/triton): an [implementation](https://github.com/triton-lang/triton/blob/main/python/tutorials/06-fused-attention.py) of
   FlashAttention in Triton by Phil Tillet from OpenAI. Triton is a Python-based
   language and compiler for parallel programming.
 
