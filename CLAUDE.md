@@ -76,8 +76,10 @@ Tensor layout: `(batch, seqlen, num_heads, head_dim)`, last dim contiguous, 16-b
 
 ### Forward Kernels
 
-- `flash_fwd.py` — `FlashAttentionForwardSm90`: Hopper forward. No SplitKV or paged KV.
+- `flash_fwd.py` — `FlashAttentionForwardBase` / `FlashAttentionForwardSm80`: Ampere forward. No SplitKV or paged KV.
+- `flash_fwd_sm90.py` — `FlashAttentionForwardSm90`: Hopper forward (extracted from `flash_fwd.py`). Supports paged KV; no SplitKV.
 - `flash_fwd_sm100.py` — `FlashAttentionForwardSm100`: Blackwell forward. Full features including SplitKV, paged KV cache, persistent kernels, 2CTA instructions.
+- `flash_fwd_sm120.py` — `FlashAttentionForwardSm120`: SM120 forward (extends Sm80).
 - `flash_fwd_combine.py` — `FlashAttentionForwardCombine`: merges SplitKV partial results.
 
 ### Backward Kernels
@@ -85,6 +87,7 @@ Tensor layout: `(batch, seqlen, num_heads, head_dim)`, last dim contiguous, 16-b
 - `flash_bwd.py` — `FlashAttentionBackwardSm80`: Ampere backward (base).
 - `flash_bwd_sm90.py` — `FlashAttentionBackwardSm90`: Hopper backward.
 - `flash_bwd_sm100.py` — `FlashAttentionBackwardSm100`: Blackwell backward with 2CTA and block sparse support.
+- `flash_bwd_sm120.py` — `FlashAttentionBackwardSm120`: SM120 backward (extends Sm80).
 - `flash_bwd_preprocess.py` / `flash_bwd_postprocess.py` — auxiliary backward kernels.
 
 ### Core Abstractions
