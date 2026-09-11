@@ -70,7 +70,7 @@ Two entry points exported from `flash_attn/cute/__init__.py`:
 - `flash_attn_func(q, k, v, ...)` — standard attention
 - `flash_attn_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_k, ...)` — variable-length
 
-Key parameters: `causal`, `window_size_left/right`, `softmax_scale`, `softcap`, `score_mod`, `mask_mod`, `block_sparse_tensors`, `num_splits`, `pack_gqa`, `m_block_size`, `n_block_size`, `num_threads`.
+Key parameters: `causal`, `window_size` (tuple of left/right), `softmax_scale`, `softcap`, `score_mod`, `mask_mod`, `block_sparse_tensors`, `num_splits`, `pack_gqa`, `learnable_sink`, `return_lse`, `deterministic`. Tile knobs such as `m_block_size` / `n_block_size` / `num_threads` are internal to `_flash_attn_fwd` / `_flash_attn_bwd`, not public entry-point arguments.
 
 Tensor layout: `(batch, seqlen, num_heads, head_dim)`, last dim contiguous, 16-byte aligned.
 
