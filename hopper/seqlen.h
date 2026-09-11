@@ -28,6 +28,33 @@ struct SeqlenInfo {
 
 };
 
+// Map a block index in the linearized padded layout back to the sequence that
+// owns it, plus the block index within that sequence.
+//
+// The padded layout gives sequence i the half-open block range
+//   [ (cu_seqlens[i] + i * kBlock) / kBlock, (cu_seqlens[i+1] + (i+1) * kBlock) / kBlock )
+// i.e. SeqlenInfo::offset_padded / kBlock. Because cu_seqlens is non-decreasing,
+// consecutive starts differ by at least one block, so the starts are strictly
+// increasing and a binary search recovers the owner. Every sequence owns at
+// least one block, including empty ones (which the caller then skips).
+//
+// This lets a kernel launch ceil_div(total + num_batch * kBlock, kBlock) blocks,
+// the exact extent of the padded layout, instead of a grid sized
+// ceil_div(max_seqlen, kBlock) * num_batch, whose cost grows with the longest
+// sequence and with sequences that hold no work at all.
+template <int kBlock>
+CUTLASS_DEVICE cute::tuple<int, int>
+padded_block_to_seq(int const block_linear, int const num_batch, int const* const cu_seqlens) {
+    auto start_block = [&](int const bidb) { return (cu_seqlens[bidb] + bidb * kBlock) / kBlock; };
+    // Last sequence whose padded range starts at or before block_linear.
+    int lo = 0, hi = num_batch;
+    while (lo + 1 < hi) {
+        int const mid = lo + (hi - lo) / 2;
+        if (start_block(mid) <= block_linear) { lo = mid; } else { hi = mid; }
+    }
+    return {lo, block_linear - start_block(lo)};
+}
+
 template <bool Varlen, int kBlockM>
 struct SeqlenInfoQK {
 
