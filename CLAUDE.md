@@ -111,13 +111,13 @@ Tensor layout: `(batch, seqlen, num_heads, head_dim)`, last dim contiguous, 16-b
 - `fast_math.py` — exp2 polynomial coefficients, softcap score_mod creation.
 - `utils.py` — Hash functions for compile cache keys, warp reductions, predicates.
 - `cache_utils.py` — JIT compilation cache management.
-- `cute_dsl_utils.py` — Patched `cute.compile` that optionally dumps SASS.
+- `cute_dsl_utils.py` — CuTe DSL helpers and kernel attribute dumps.
 
 ### Compilation & Caching
 
 Kernels are JIT-compiled. Cache key includes dtype, head_dim, causal, mask/score_mod hashes, architecture, block sizes. Caching levels: in-memory LRU + optional disk cache via `get_jit_cache()`.
 
-Env vars: `CUTE_CUBIN_PATH` (dump CUBIN/SASS), `CUTE_DSL_KEEP_PTX=1` (inspect PTX), `CUTE_DSL_PTXAS_PATH` (custom ptxas).
+Env vars: `CUTE_DSL_KEEP_CUBIN=1` (keep CUBIN), `CUTE_DSL_DUMP_DIR` (dump directory), `CUTE_DSL_KEEP_PTX=1` (inspect PTX), `CUTE_DSL_PTXAS_PATH` (custom ptxas).
 
 ## Key Patterns
 
