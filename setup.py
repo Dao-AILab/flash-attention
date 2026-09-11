@@ -348,6 +348,8 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
             name="flash_attn_2_cuda",
             sources=[
                 "csrc/flash_attn/flash_api.cpp",
+                "csrc/flash_attn/src/flash_fwd_hdim512_sm89.cu",
+                "csrc/flash_attn/src/flash_bwd_hdim512_sm89.cu",
                 "csrc/flash_attn/src/flash_fwd_hdim32_fp16_sm80.cu",
                 "csrc/flash_attn/src/flash_fwd_hdim32_bf16_sm80.cu",
                 "csrc/flash_attn/src/flash_fwd_hdim64_fp16_sm80.cu",
