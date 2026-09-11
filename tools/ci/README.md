@@ -8,7 +8,7 @@ Triggered on every push to `main`.
 - **Pass 1** — compile kernels in parallel via `FakeTensorMode` (no GPU memory needed)
 - **Pass 2** — run tests using cached compiled kernels on real GPU
 
-See `run_fa4_ci.py` for the shared logic used by both CI and `test_ci_local.sh`.
+See `run_fa4_ci.py` for the shared logic used by both CI and local runs.
 
 ## Required GitHub secrets / variables
 
@@ -46,3 +46,4 @@ Tests run inside the Apptainer container. The repo's `flash_attn/__init__.py` im
 1. Register a self-hosted runner on the machine with the desired label (e.g. `h100`).
 2. Add the label to the `gpu` matrix in `.github/workflows/ci.yml`.
 3. Set `CI_WORK_DIR` for the new machine if its scratch path differs.
+
