@@ -219,17 +219,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         )
 
         q_tensor, k_tensor, v_tensor = mQ, mK, mV
-        # Contiguous torch outputs can have arbitrary strides on singleton axes.
-        # Canonicalize those unused strides before asserting their alignment.
-        o_strides = tuple(
-            s if isinstance(s, int) else s * Int64(mO.shape[i] != 1)
-            for i, s in enumerate(mO.stride[:-1])
-        )
-        o_tensor = assume_tensor_aligned(
-            cute.make_tensor(
-                mO.iterator, cute.make_layout(mO.shape, stride=(*o_strides, mO.stride[-1]))
-            )
-        )
+        o_tensor = assume_tensor_aligned(mO, canonicalize_singletons=True)
         lse_tensor = mLSE
         cum_seqlen_q = mCuSeqlensQ
         cum_seqlen_k = mCuSeqlensK
@@ -1534,7 +1524,6 @@ class BlackwellFusedMultiHeadAttentionForward:
                             Int32(0),
                             ((Int32(0), Int32(0)), Int32(0)),
                         )
-                        # Whole-row offsets preserve the output's validated 16-byte alignment.
                         mO_qdl_eff = domain_offset_aligned(
                             cute.select(block_offset_o, mode=[0, 2, 3]), mO_qdl
                         )
