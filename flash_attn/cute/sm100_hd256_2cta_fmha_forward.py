@@ -29,7 +29,13 @@ from flash_attn.cute.mask import (
 )
 from flash_attn.cute.tile_scheduler import SM100_TMEM_CAPACITY_COLUMNS
 from flash_attn.cute.flash_fwd_sm100 import DescaleTensors, _TUNING_CONFIG
-from flash_attn.cute.utils import ex2_emulation_2, as_bshkrd_tensor, AuxData
+from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
+from flash_attn.cute.utils import (
+    ex2_emulation_2,
+    as_bshkrd_tensor,
+    AuxData,
+    domain_offset_aligned,
+)
 
 
 class BlackwellFusedMultiHeadAttentionForward:
@@ -212,7 +218,18 @@ class BlackwellFusedMultiHeadAttentionForward:
             "SM100 forward with head_dim=256 does not support descale_tensors"
         )
 
-        q_tensor, k_tensor, v_tensor, o_tensor = mQ, mK, mV, mO
+        q_tensor, k_tensor, v_tensor = mQ, mK, mV
+        # Contiguous torch outputs can have arbitrary strides on singleton axes.
+        # Canonicalize those unused strides before asserting their alignment.
+        o_strides = tuple(
+            s if isinstance(s, int) else s * Int64(mO.shape[i] != 1)
+            for i, s in enumerate(mO.stride[:-1])
+        )
+        o_tensor = assume_tensor_aligned(
+            cute.make_tensor(
+                mO.iterator, cute.make_layout(mO.shape, stride=(*o_strides, mO.stride[-1]))
+            )
+        )
         lse_tensor = mLSE
         cum_seqlen_q = mCuSeqlensQ
         cum_seqlen_k = mCuSeqlensK
@@ -1517,7 +1534,8 @@ class BlackwellFusedMultiHeadAttentionForward:
                             Int32(0),
                             ((Int32(0), Int32(0)), Int32(0)),
                         )
-                        mO_qdl_eff = cute.domain_offset(
+                        # Whole-row offsets preserve the output's validated 16-byte alignment.
+                        mO_qdl_eff = domain_offset_aligned(
                             cute.select(block_offset_o, mode=[0, 2, 3]), mO_qdl
                         )
 
