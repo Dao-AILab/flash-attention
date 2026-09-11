@@ -206,7 +206,14 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     Tensor tVsV = gmem_thr_copy_QKV.partition_D(sV);
     Tensor tdQsdQ = gmem_thr_copy_dQ.partition_S(sdQ);    // ((Atom,AtomNum),ATOM_M,ATOM_N)
     Tensor tdQgdQ = gmem_thr_copy_dQ.partition_D(gdQ);
-    Tensor tdQgdQaccum = gmem_thr_copy_dQaccum.partition_D(gdQaccum);
+    Tensor tdQgdQaccum = [&] {
+        if constexpr (kHeadDim == 512 && Seq_parallel) {
+            typename Kernel_traits::TiledMmadQ tiled_mma;
+            return tiled_mma.get_thread_slice(tidx).partition_C(gdQaccum);
+        } else {
+            return gmem_thr_copy_dQaccum.partition_D(gdQaccum);
+        }
+    }();
     // if (cute::thread0()) { print(tdQgdQaccum.layout()); printf("\n"); }
     // __syncthreads();
     // if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && tidx < 64) {
