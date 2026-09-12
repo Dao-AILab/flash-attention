@@ -579,6 +579,7 @@ def _flash_attn_fwd(
     seqlen_k_per_split: Optional[int] = None,
     disable_scheduler_metadata: bool = False,
     gather_bwd_recompute_p: bool = False,
+    gather_kv_token_pairs: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Forward pass for FlashAttention.
 
@@ -711,11 +712,18 @@ def _flash_attn_fwd(
     if softcap == 0.0:
         softcap = None
     qhead_per_kvhead = num_head // num_head_kv
-    # Sparse MLA pads the heads to the 128-row tile (see pack_gqa.padded_qheads_tma_source);
-    # the kernel takes the real count and rounds the same way, the interface needs the tile
-    # width for its grid math.
+    # Sparse MLA pads the heads to the 128-row tile, or the 64-row half-tile for token pairs
+    # (see pack_gqa.padded_qheads_tma_source); the kernel takes the real count and rounds the
+    # same way, the interface needs the tile width for its grid math.
     nheads_per_kv = qhead_per_kvhead
-    if qv is not None and gather_kv_indices is not None and qhead_per_kvhead < 128:
+    if gather_kv_token_pairs:
+        # Index contract: see the topk_gather_kv.CpasyncGatherKVManager note.
+        assert qv is not None and gather_kv_indices is not None and num_head_kv == 1
+        assert qhead_per_kvhead <= 64, f"token-pair gather needs <= 64 Q heads, got {qhead_per_kvhead}"
+        assert cu_seqlens_q is None and seqused_q is None and gather_kv_indices.shape[1] % 2 == 0
+        qhead_per_kvhead = sparse_mla_qhead_tile(qhead_per_kvhead, min_tile=64)
+        pack_gqa = True
+    elif qv is not None and gather_kv_indices is not None and qhead_per_kvhead < 128:
         assert num_head_kv == 1, "sparse MLA requires a single KV head"
         qhead_per_kvhead = sparse_mla_qhead_tile(qhead_per_kvhead)
         pack_gqa = True
@@ -1169,6 +1177,7 @@ def _flash_attn_fwd(
         head_dim_v,
         qhead_per_kvhead,
         nheads_per_kv,
+        gather_kv_token_pairs,
         causal,
         score_mod_hash,
         mask_mod_hash,
@@ -1367,6 +1376,7 @@ def _flash_attn_fwd(
                     has_cu_seqlens_q=cu_seqlens_q is not None,
                     disable_bitmask=disable_sparse_kv_bitmask,
                     has_qk=has_qk,
+                    token_pair_gather=gather_kv_token_pairs,
                 )
             else:
                 if use_dedicated_hd256_kernel:
@@ -2836,6 +2846,7 @@ def _flash_attn_bwd_sparse_mla(
     dqv: Optional[torch.Tensor] = None,
     recompute_p: bool = False,
     token_chunk: Optional[int] = None,
+    gather_kv_token_pairs: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     fake_mode = is_fake_mode()
     arch = _get_device_arch()
@@ -2856,6 +2867,10 @@ def _flash_attn_bwd_sparse_mla(
     assert nheads_kv == 1, "sparse MLA bwd: MQA only"
     if recompute_p and nheads != 128:
         raise ValueError("gather_bwd_recompute_p requires 128 Q heads")
+    if gather_kv_token_pairs:
+        # Token-pair gather: see the topk_gather_kv.CpasyncGatherKVManager note.
+        assert qhead_per_kvhead <= 64, f"token-pair gather needs <= 64 Q heads, got {qhead_per_kvhead}"
+        assert cu_seqlens_q is None and seqused_q is None and gather_kv_indices.shape[1] % 2 == 0
     # Backward head padding: see pack_gqa.padded_qheads_tma_source. The kernel takes the real
     # count; the interface needs the tile width for the dPsum/scaleP buffers.
     qhead_tile = sparse_mla_qhead_tile(qhead_per_kvhead, min_tile=64)
@@ -2916,14 +2931,16 @@ def _flash_attn_bwd_sparse_mla(
     prealloc_dqv = dqv is not None
     prealloc_dv = dv is not None
     if not prealloc_dq and q is not None:
-        dq = torch.empty_like(q)
+        dq = torch.empty(q.shape, dtype=q.dtype, device=q.device)
     if not prealloc_dk and k is not None:
         dk = torch.zeros_like(k, dtype=torch.float32)
     if not prealloc_dv:
         dv = torch.zeros_like(v, dtype=torch.float32)
     if not prealloc_dqv:
-        dqv = torch.empty_like(qv)
+        dqv = torch.empty(qv.shape, dtype=qv.dtype, device=qv.device)
     bwd_chunk = token_chunk if token_chunk is not None else 0
+    if gather_kv_token_pairs and bwd_chunk % 2:
+        raise ValueError("gather_kv_token_pairs requires an even gather_bwd_token_chunk")
     n_tokens = total_q if varlen_q else seqlen_q
     # Chunking slices the token axis; non-varlen slices stay contiguous only for batch 1.
     can_chunk = (
@@ -3016,6 +3033,7 @@ def _flash_attn_bwd_sparse_mla(
         gather_kv_length,
         disable_sparse_kv_bitmask,
         recompute_p,
+        gather_kv_token_pairs,
     )
 
     if compile_key not in _flash_attn_bwd_sparse_mla.compile_cache:
@@ -3055,6 +3073,7 @@ def _flash_attn_bwd_sparse_mla(
             has_seqused_q=seqused_q is not None,
             disable_bitmask=disable_sparse_kv_bitmask,
             recompute_P=recompute_p,
+            token_pair_gather=gather_kv_token_pairs,
         )
         fa_bwd_kernel = cute.compile(
             fa_bwd_obj,
@@ -3184,12 +3203,33 @@ def _flash_attn_bwd_sparse_mla(
                 seqused_k,
             )
 
+        ds_p, dq_p, dqv_p, q_p, idx_p = ds_c, dq_c, dqv_c, q_c, idx_c
+        if gather_kv_token_pairs:
+            # dQ/dQv/dK per pair: one 2H-row tile over the union list via the (b, s/2, 2H, x) view.
+            def pair_view(t, name):
+                if t is None:
+                    return None
+                shape = (batch_size, t.shape[1] // 2, 2 * nheads, t.shape[-1])
+                if name == "q":
+                    return t.reshape(shape)  # read-only: copies if not viewable
+                # Merging (seqlen, heads) only needs those two dims adjacent; batch and last-dim
+                # strides stay whatever the kernels accept.
+                assert t.stride(1) == nheads * t.stride(2), (
+                    f"gather_kv_token_pairs: {name} seqlen/head dims must be adjacent, "
+                    f"got strides {tuple(t.stride())}"
+                )
+                return t.view(shape)
+            ds_p, dq_p, dqv_p, q_p = (
+                pair_view(t, n) for t, n in ((ds_c, "ds"), (dq_c, "dq"), (dqv_c, "dqv"), (q_c, "q"))
+            )
+            idx_p = torch.maximum(idx_c[:, 0::2], idx_c[:, 1::2])
+
         _sparse_mla_dq_dqv(
-            ds_c, k_sq, v_sq, dq_c, dqv_c, idx_c, cu_seqlens_q_c, cu_seqlens_k,
+            ds_p, k_sq, v_sq, dq_p, dqv_p, idx_p, cu_seqlens_q_c, cu_seqlens_k,
         )
 
         if k is not None:
-            _sparse_mla_dk(ds_c, idx_c, q_c, dk_sq, cu_seqlens_q_c, cu_seqlens_k)
+            _sparse_mla_dk(ds_p, idx_p, q_p, dk_sq, cu_seqlens_q_c, cu_seqlens_k)
 
     # return dk, dv in float32: all-reduce across sequence-parallel ranks must happen
     # before downcasting to avoid rounding error during inter-rank grad accumulation
@@ -3398,6 +3438,7 @@ class FlashAttnFunc(torch.autograd.Function):
         return_lse: bool = False,
         gather_bwd_recompute_p: bool = False,
         gather_bwd_token_chunk: Optional[int] = None,
+        gather_kv_token_pairs: bool = False,
     ):
         aux_scalars = tuple(aux_scalars) if aux_scalars else None
         shared_kv = k is v
@@ -3428,10 +3469,12 @@ class FlashAttnFunc(torch.autograd.Function):
             return_lse=return_lse,
             gather_kv_indices=gather_kv_indices,
             gather_bwd_recompute_p=gather_bwd_recompute_p,
+            gather_kv_token_pairs=gather_kv_token_pairs,
         )
         ctx.save_for_backward(q, k, v, qv, out, lse, p, row_max, gather_kv_indices, learnable_sink, *(aux_tensors or ()))
         ctx.gather_bwd_recompute_p = gather_bwd_recompute_p
         ctx.shared_kv = shared_kv
+        ctx.gather_kv_token_pairs = gather_kv_token_pairs
         ctx.softmax_scale = softmax_scale
         ctx.causal = causal
         ctx.window_size = window_size
@@ -3472,11 +3515,12 @@ class FlashAttnFunc(torch.autograd.Function):
                 causal=ctx.causal,
                 recompute_p=ctx.gather_bwd_recompute_p,
                 token_chunk=ctx.gather_bwd_token_chunk,
+                gather_kv_token_pairs=ctx.gather_kv_token_pairs,
             )
             if ctx.shared_kv:
-                return dqv, dv, None, None, None, None, None, None, dsink, *((None,) * 14)
+                return dqv, dv, None, None, None, None, None, None, dsink, *((None,) * 15)
             else:
-                return dq, dk, dv, dqv, None, None, None, None, dsink, *((None,) * 14)
+                return dq, dk, dv, dqv, None, None, None, None, dsink, *((None,) * 15)
         else:
             bwd_result = _flash_attn_bwd(
                 q,
@@ -3505,7 +3549,7 @@ class FlashAttnFunc(torch.autograd.Function):
                 dsink = None
             else:
                 dq, dk, dv, dsink = bwd_result
-            return dq, dk, dv, None, None, None, None, None, dsink, *((None,) * 14)
+            return dq, dk, dv, None, None, None, None, None, dsink, *((None,) * 15)
 
 
 class FlashAttnVarlenFunc(torch.autograd.Function):
@@ -3757,10 +3801,13 @@ def flash_attn_func(
     return_lse: bool = False,
     gather_bwd_recompute_p: bool = False,
     gather_bwd_token_chunk: Optional[int] = None,
+    gather_kv_token_pairs: bool = False,
 ):
     gather_bwd_token_chunk = _validate_gather_bwd_kwargs(
         gather_kv_indices, gather_bwd_recompute_p, gather_bwd_token_chunk
     )
+    if gather_kv_token_pairs and gather_bwd_token_chunk is not None and gather_bwd_token_chunk % 2:
+        raise ValueError("gather_kv_token_pairs requires an even gather_bwd_token_chunk")
     if (
         gather_bwd_token_chunk is not None
         and q.dim() == 4
@@ -3799,6 +3846,7 @@ def flash_attn_func(
         return_lse,
         gather_bwd_recompute_p,
         gather_bwd_token_chunk,
+        gather_kv_token_pairs,
     )
 
 
