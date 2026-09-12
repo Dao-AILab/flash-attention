@@ -564,6 +564,7 @@ def _flash_attn_fwd(
     scheduler_metadata: Optional[SchedulerMetadataTensorsTorch] = None,
     seqlen_k_per_split: Optional[int] = None,
     disable_scheduler_metadata: bool = False,
+    gather_kv_token_pairs: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """Forward pass for FlashAttention.
 
@@ -698,7 +699,16 @@ def _flash_attn_fwd(
     qhead_per_kvhead = num_head // num_head_kv
     # Sparse MLA head padding: see pack_gqa.padded_qheads_tma_source.
     qhead_per_kvhead_valid = qhead_per_kvhead
-    if qv is not None and gather_kv_indices is not None and qhead_per_kvhead < 128:
+    if gather_kv_token_pairs:
+        # Two 64-head tokens per 128-row tile sharing one union gather list; rows of tokens
+        # 2p and 2p+1 of gather_kv_indices hold that list with -1 at non-member slots.
+        assert qv is not None and gather_kv_indices is not None and num_head_kv == 1
+        assert qhead_per_kvhead <= 64, f"token-pair gather needs <= 64 Q heads, got {qhead_per_kvhead}"
+        assert cu_seqlens_q is None and seqused_q is None and gather_kv_indices.shape[1] % 2 == 0
+        # Fewer heads pad to the 64-row half-tile; see pack_gqa.padded_qheads_tma_source.
+        qhead_per_kvhead = 64
+        pack_gqa = True
+    elif qv is not None and gather_kv_indices is not None and qhead_per_kvhead < 128:
         assert num_head_kv == 1, "sparse MLA requires a single KV head"
         qhead_per_kvhead = 128
         pack_gqa = True
@@ -1134,6 +1144,7 @@ def _flash_attn_fwd(
         head_dim_v,
         qhead_per_kvhead,
         qhead_per_kvhead_valid,
+        gather_kv_token_pairs,
         causal,
         score_mod_hash,
         mask_mod_hash,
@@ -1332,6 +1343,7 @@ def _flash_attn_fwd(
                     disable_bitmask=disable_sparse_kv_bitmask,
                     has_qk=has_qk,
                     qhead_per_kvhead_valid=qhead_per_kvhead_valid,
+                    token_pair_gather=gather_kv_token_pairs,
                 )
             else:
                 if use_dedicated_hd256_kernel:

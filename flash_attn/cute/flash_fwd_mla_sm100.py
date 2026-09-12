@@ -68,6 +68,7 @@ class FlashAttentionMLAForwardSm100:
         use_clc_scheduler: bool = True,
         has_qk: bool = True,
         qhead_per_kvhead_valid: Optional[int] = None,
+        token_pair_gather: bool = False,
     ):
         self.is_causal = is_causal
         self.is_local = False
@@ -87,10 +88,18 @@ class FlashAttentionMLAForwardSm100:
         self.use_tma_KV = not use_cpasync_load_KV
         self.topk_length = topk_length
         self.is_topk_gather = is_topk_gather
+        # Token-pair gather: two 64-head tokens share a 128-row tile and one union gather list;
+        # each CTA masks its token's non-member slots. Indices of tokens 2p and 2p+1 must be the
+        # same union list with -1 at the slots the token does not attend.
+        self.token_pair_gather = token_pair_gather
         if is_topk_gather:
             assert pack_gqa
-            assert qhead_per_kvhead == 128, "DSA path tiles one token x 128 packed Q heads"
             assert use_cpasync_load_KV
+            if token_pair_gather:
+                assert qhead_per_kvhead == 64, "token pairs: 64-row half-tile per token"
+                assert not (has_seqused_q or has_cu_seqlens_q), "token pairs: non-varlen only"
+            else:
+                assert qhead_per_kvhead == 128, "DSA path tiles one token x 128 packed Q heads"
         # user-provided option if topk indices guaranteed in bounds
         self.disable_bitmask = disable_bitmask
         self.has_qk = has_qk
@@ -1478,11 +1487,18 @@ class FlashAttentionMLAForwardSm100:
 
             if const_expr(self.is_topk_gather):
                 # ==== Topk gather path ====
-                # cluster_m_block == m_idx under MQA 128 assumption
-                m_idx = cluster_m_block
-                if const_expr(not seqlen.has_cu_seqlens_q):
+                # One token per 128-row tile (MQA 128), or two 64-head tokens whose CTA rank
+                # selects the token (token_pair_gather).
+                mIndexTopk_peer = None
+                if const_expr(self.token_pair_gather):
+                    m_idx = 2 * cluster_m_block + cta_rank_in_cluster
+                    mIndexTopk_cur = mIndexTopk[None, m_idx, batch_idx]
+                    mIndexTopk_peer = mIndexTopk[None, m_idx ^ 1, batch_idx]
+                elif const_expr(not seqlen.has_cu_seqlens_q):
+                    m_idx = cluster_m_block
                     mIndexTopk_cur = mIndexTopk[None, m_idx, batch_idx]
                 else:
+                    m_idx = cluster_m_block
                     offset_q = seqlen.offset_q if const_expr(not self.use_packed_varlen_sched) else 0
                     mIndexTopk_cur = mIndexTopk[None, m_idx + offset_q]
 
@@ -1511,6 +1527,7 @@ class FlashAttentionMLAForwardSm100:
                     self.disable_bitmask,
                     sBitmask,
                     pipeline_bitmask,
+                    mIndexTopk_peer,
                 )
 
                 # (seqlen_k, hdim) or (seqlen_k, hdimv)
