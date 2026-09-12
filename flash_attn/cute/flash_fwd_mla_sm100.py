@@ -18,7 +18,12 @@ from cutlass.utils import ClcDynamicPersistentTileScheduler
 
 from quack import copy_utils
 
-from flash_attn.cute.pack_gqa import pack_gqa_layout, make_packgqa_tiled_tma_atom
+from flash_attn.cute.pack_gqa import (
+    pack_gqa_layout,
+    make_packgqa_tiled_tma_atom,
+    padded_qheads_tma_source,
+    regroup_padded_qheads,
+)
 from flash_attn.cute.paged_kv import PagedKVManager
 from flash_attn.cute import utils as fa_utils
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
@@ -62,12 +67,20 @@ class FlashAttentionMLAForwardSm100:
         disable_bitmask: bool = False,
         use_clc_scheduler: bool = True,
         has_qk: bool = True,
+        qhead_per_kvhead_valid: Optional[int] = None,
     ):
         self.is_causal = is_causal
         self.is_local = False
         self.pack_gqa = pack_gqa
         self.qhead_per_kvhead = qhead_per_kvhead
         assert qhead_per_kvhead <= 128
+        # Head padding: see pack_gqa.padded_qheads_tma_source.
+        if qhead_per_kvhead_valid is None:
+            qhead_per_kvhead_valid = qhead_per_kvhead
+        assert 0 < qhead_per_kvhead_valid <= qhead_per_kvhead
+        assert qhead_per_kvhead_valid == qhead_per_kvhead or pack_gqa
+        self.qhead_per_kvhead_valid = qhead_per_kvhead_valid
+        self.pad_qheads = qhead_per_kvhead_valid != qhead_per_kvhead
         self.nheads_kv = nheads_kv
         self.use_tma_O = True
         self.use_cpasync_load_KV = use_cpasync_load_KV
@@ -76,7 +89,7 @@ class FlashAttentionMLAForwardSm100:
         self.is_topk_gather = is_topk_gather
         if is_topk_gather:
             assert pack_gqa
-            assert qhead_per_kvhead == 128, "require MQA 128 for DSA path"
+            assert qhead_per_kvhead == 128, "DSA path tiles one token x 128 packed Q heads"
             assert use_cpasync_load_KV
         # user-provided option if topk indices guaranteed in bounds
         self.disable_bitmask = disable_bitmask
@@ -249,6 +262,13 @@ class FlashAttentionMLAForwardSm100:
         assert self.total_tmem <= self.tmem_alloc_cols, (
             f"Total TMEM columns allocated {self.total_tmem} exceeds capacity {self.tmem_alloc_cols}"
         )
+
+    @cute.jit
+    def is_valid_qhead_row(self, packed_row) -> Boolean:
+        """Head guard for non-TMA accesses; see pack_gqa.padded_qheads_tma_source."""
+        if const_expr(not self.pad_qheads):
+            return Boolean(True)
+        return packed_row % self.qhead_per_kvhead < self.qhead_per_kvhead_valid
 
     def _get_shared_storage_cls(self):
         self.buffer_align_bytes = 1024
@@ -456,6 +476,14 @@ class FlashAttentionMLAForwardSm100:
 
         mO_og = mO
         mP_og = mP
+        # TMA source contract: see pack_gqa.padded_qheads_tma_source.
+        if const_expr(self.pad_qheads):
+            mQ_valid, mQv_valid, mO_valid, mP_valid = [
+                padded_qheads_tma_source(mX, self.qhead_per_kvhead_valid, head_idx=2)
+                if mX is not None
+                else None
+                for mX in (mQ, mQv, mO, mP)
+            ]
         if const_expr(self.pack_gqa):
             mQ, mQv, mO, mP, mRowMax = [
                 pack_gqa_layout(mX, self.qhead_per_kvhead, self.nheads_kv, head_idx=2)
@@ -465,6 +493,8 @@ class FlashAttentionMLAForwardSm100:
             ]
             if const_expr(mLSE is not None):
                 mLSE = pack_gqa_layout(mLSE, self.qhead_per_kvhead, self.nheads_kv, head_idx=1)
+        if const_expr(not self.pad_qheads):
+            mQ_valid, mQv_valid, mO_valid, mP_valid = mQ, mQv, mO, mP
 
         # ==== Prepare MMAs ====
         # (local_var, dtype_a, major_a, major_b, mma_tiler, operand_source_a)
@@ -525,16 +555,19 @@ class FlashAttentionMLAForwardSm100:
         )
         cta_shape = cta_layout_vmnk.shape
 
-        def make_tma(make_fn, mX, smem_layout, mma_tiler, tiled_mma):
-            return make_fn(tma_load_op, mX, smem_layout, mma_tiler, tiled_mma, cta_shape)
+        def make_tma(make_fn, mX, smem_layout, mma_tiler, tiled_mma, packed_qheads):
+            atom, tensor = make_fn(tma_load_op, mX, smem_layout, mma_tiler, tiled_mma, cta_shape)
+            if const_expr(packed_qheads and self.pad_qheads):
+                tensor = regroup_padded_qheads(tensor, self.qhead_per_kvhead, head_idx=2)
+            return atom, tensor
 
         A, B = cute.nvgpu.make_tiled_tma_atom_A, cute.nvgpu.make_tiled_tma_atom_B
 
         # (atom_name, tensor_name, make_fn, m, smem_layout, mma_tiler, tiled_mma, kv_only)
         # fmt: off
         _tma_specs = [
-            ("tma_atom_Q",  "tma_tensor_Q",  A, mQ,  self.sQ_layout,  self.mma_tiler_QK,  tiled_mma_QK,  False),
-            ("tma_atom_Qv", "tma_tensor_Qv", A, mQv, self.sQv_layout, self.mma_tiler_QvV, tiled_mma_QvV, False),
+            ("tma_atom_Q",  "tma_tensor_Q",  A, mQ_valid,  self.sQ_layout,  self.mma_tiler_QK,  tiled_mma_QK,  False),
+            ("tma_atom_Qv", "tma_tensor_Qv", A, mQv_valid, self.sQv_layout, self.mma_tiler_QvV, tiled_mma_QvV, False),
             ("tma_atom_K",  "tma_tensor_K",  B, mK,  self.sK_layout,  self.mma_tiler_QK,  tiled_mma_QK,  True),
             ("tma_atom_V",  "tma_tensor_V",  B, mV,  self.sV_layout,  self.mma_tiler_QvV, tiled_mma_QvV, True),
             ("tma_atom_Vt", "tma_tensor_Vt", B, mVt, self.sVt_layout, self.mma_tiler_PVt, tiled_mma_PVt, True),
@@ -542,7 +575,7 @@ class FlashAttentionMLAForwardSm100:
         _tmas = {}
         for atom_name, tensor_name, make_fn, m, smem_layout, mma_tiler, tiled_mma, kv_only in _tma_specs:
             _tmas[atom_name], _tmas[tensor_name] = (
-                make_tma(make_fn, m, smem_layout, mma_tiler, tiled_mma)
+                make_tma(make_fn, m, smem_layout, mma_tiler, tiled_mma, packed_qheads=not kv_only)
                 if const_expr((not kv_only or self.use_tma_KV) and m is not None)
                 else (None, None)
             )
@@ -561,11 +594,17 @@ class FlashAttentionMLAForwardSm100:
             and self.pack_gqa
             and self.cta_tile_m % self.qhead_per_kvhead == 0
         )
-        make_tiled_tma_atom_fn = (
-            partial(make_packgqa_tiled_tma_atom, qhead_per_kvhead=self.qhead_per_kvhead, head_idx=2)
-            if const_expr(self.ragged_tma_O)
-            else cpasync.make_tiled_tma_atom
-        )
+        assert not (self.ragged_tma_O and self.pad_qheads)
+
+        def make_tiled_tma_atom_fn(op, mX, smem_layout, tiler):
+            if const_expr(self.ragged_tma_O):
+                return make_packgqa_tiled_tma_atom(
+                    op, mX, smem_layout, tiler, qhead_per_kvhead=self.qhead_per_kvhead, head_idx=2
+                )
+            atom, tensor = cpasync.make_tiled_tma_atom(op, mX, smem_layout, tiler)
+            if const_expr(self.pad_qheads):
+                tensor = regroup_padded_qheads(tensor, self.qhead_per_kvhead, head_idx=2)
+            return atom, tensor
 
         # ==== Set up P smem -> gmem tma store ====
 
@@ -576,7 +615,7 @@ class FlashAttentionMLAForwardSm100:
 
         if const_expr(self.store_P):
             # TODO: add asserts
-            mP_tma = mP_og if const_expr(self.ragged_tma_O) else mP
+            mP_tma = mP_og if const_expr(self.ragged_tma_O) else mP_valid
             if const_expr(self.ragged_tma_O):
                 mP_tma = copy_utils.create_ragged_tensor_for_tma(
                     mP_tma, ragged_dim=0, ptr_shift=True
@@ -600,7 +639,7 @@ class FlashAttentionMLAForwardSm100:
         )
 
         if const_expr(self.use_tma_O):
-            mO_tma = mO_og if const_expr(self.ragged_tma_O) else mO
+            mO_tma = mO_og if const_expr(self.ragged_tma_O) else mO_valid
             if const_expr(self.ragged_tma_O):
                 mO_tma = copy_utils.create_ragged_tensor_for_tma(
                     mO_tma, ragged_dim=0, ptr_shift=True
@@ -2658,6 +2697,7 @@ class FlashAttentionMLAForwardSm100:
                 warp_idx,
                 store_P=store_P,
                 gRowMax=gRowMax,
+                packed_row0=cta_m_block * self.cta_tile_m,
             )
 
             ### first iteration ###
@@ -2794,6 +2834,7 @@ class FlashAttentionMLAForwardSm100:
         is_first: Boolean = False,
         store_P: Optional[Callable] = None,
         gRowMax: Optional[cute.Tensor] = None,
+        packed_row0: Int32 = 0,
     ):
         leader_warp = warp_idx == 0
         tSrP = cute.make_rmem_tensor(tSrS_t2r.shape, self.dtype_P)
@@ -2833,7 +2874,7 @@ class FlashAttentionMLAForwardSm100:
         row_max, acc_scale = softmax.update_row_max_from_local(row_max, is_first)
 
         if const_expr(gRowMax is not None):
-            if tidx < self.cta_tile_m:
+            if tidx < self.cta_tile_m and self.is_valid_qhead_row(packed_row0 + tidx):
                 gRowMax[tidx, n_block] = row_max
 
         # note: acc_scales agree for paired threads
@@ -3059,6 +3100,7 @@ class FlashAttentionMLAForwardSm100:
                     cta_m_block * self.cta_tile_m + tidx % self.cta_tile_m,
                     self.qhead_per_kvhead,
                     self.pack_gqa,
+                    self.qhead_per_kvhead_valid if const_expr(self.pad_qheads) else None,
                 )
                 row_max, row_sum = apply_learnable_sink(row_max, row_sum, sink_val, softmax_scale_log2)
 
@@ -3091,7 +3133,9 @@ class FlashAttentionMLAForwardSm100:
                         if not acc_O_mn_row_is_zero_or_nan
                         else -Float32.inf
                     )
-                    if tidx < seqlen_q - cta_m_block * self.cta_tile_m:
+                    if tidx < seqlen_q - cta_m_block * self.cta_tile_m and self.is_valid_qhead_row(
+                        cta_m_block * self.cta_tile_m + tidx
+                    ):
                         gLSE[tidx] = lse
 
             row_idx = cta_m_block * self.cta_tile_m + tOicOi[0][0]
