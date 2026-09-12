@@ -19,7 +19,9 @@ from flash_attn.cute.cache_utils import get_jit_cache
 
 
 class NativeD512DqDk:
-    def __init__(self, mode, causal=False, softcap=0.0, window=(-1, -1), maxsq=None, maxsk=None):
+    def __init__(
+        self, mode, causal=False, softcap=0.0, window=(-1, -1), maxsq=None, maxsk=None, head_group=1
+    ):
         self.mode = mode
         self.causal = causal
         self.softcap = softcap
@@ -28,6 +30,7 @@ class NativeD512DqDk:
         self.maxsq = maxsq
         self.maxsk = maxsk
         self.threads = 256
+        self.head_group = head_group if mode != "dq" else 1
 
     @cute.jit
     def __call__(
@@ -123,7 +126,7 @@ class NativeD512DqDk:
         if const_expr(self.mode == "dq"):
             grid = (cute.ceil_div(maxsq, 128) * 2 * q.shape[2], 1, batches)
         else:
-            grid = (cute.ceil_div(maxsk, 128) * 2 * q.shape[2], 1, batches)
+            grid = (cute.ceil_div(maxsk, 128) * 2 * (q.shape[2] // self.head_group), 1, batches)
         self.kernel(
             q,
             k,
@@ -378,13 +381,13 @@ class NativeD512DqDk:
         bx, by, batch = cute.arch.block_idx()
         rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
         if const_expr(self.mode == "dq"):
-            by = (bx // 2) % q.shape[2]
-            tile = (bx // 2) // q.shape[2]
+            by = (bx // 2) % (q.shape[2] // self.head_group)
+            tile = (bx // 2) // (q.shape[2] // self.head_group)
             if const_expr(self.causal):
                 tile = cute.ceil_div(maxsq, 128) - 1 - tile
         else:
-            by = (bx // 2) % q.shape[2]
-            tile = (bx // 2) // q.shape[2]
+            by = (bx // 2) % (q.shape[2] // self.head_group)
+            tile = (bx // 2) // (q.shape[2] // self.head_group)
         ratio = q.shape[2] // k.shape[2]
         sq = q.shape[1]
         sk = k.shape[1]
@@ -414,12 +417,12 @@ class NativeD512DqDk:
             qs = Int32(0)
             ks = Int32(0)
             if const_expr(self.mode == "dq"):
-                h = by
+                h = by * self.head_group
                 kh = h // ratio
                 qs = tile * 128
                 iterations = cute.ceil_div(sk, 128)
             else:
-                h = by
+                h = by * self.head_group
                 kh = h // ratio
                 ks = tile * 128
                 iterations = cute.ceil_div(sq, 128)
@@ -581,368 +584,376 @@ class NativeD512DqDk:
             warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
             compute_sync = cutlass.pipeline.NamedBarrier(barrier_id=2, num_threads=128)
             cphase = Int32(0)
-            for it in cutlass.range(iterations):
-                if const_expr(self.mode == "dq"):
-                    ks = it * 128
-                else:
-                    qs = it * 128
-                active = True
-                if const_expr(self.causal):
-                    active = ks <= qs + 127 + sk - sq
-                # Skip tiles outside the local window before TMA and MMA.
-                # Elementwise masking still handles partial boundary tiles.
-                if const_expr(self.window[0] >= 0):
-                    active = active and ks + 127 >= qs + sk - sq - self.window[0]
-                if const_expr(self.window[1] >= 0 and not self.causal):
-                    active = active and ks <= qs + 127 + sk - sq + self.window[1]
-                if active:
-                    if warp == 5:
-                        if initialized:
+            for head_part in cutlass.range(self.head_group, unroll=1):
+                h = by * self.head_group + head_part
+                for it in cutlass.range(iterations):
+                    if const_expr(self.mode == "dq"):
+                        ks = it * 128
+                    else:
+                        qs = it * 128
+                    active = True
+                    if const_expr(self.causal):
+                        active = ks <= qs + 127 + sk - sq
+                    # Skip tiles outside the local window before TMA and MMA.
+                    # Elementwise masking still handles partial boundary tiles.
+                    if const_expr(self.window[0] >= 0):
+                        active = active and ks + 127 >= qs + sk - sq - self.window[0]
+                    if const_expr(self.window[1] >= 0 and not self.causal):
+                        active = active and ks <= qs + 127 + sk - sq + self.window[1]
+                    if active:
+                        if warp == 5:
+                            if initialized:
+                                cute.arch.mbarrier_wait(bar, cphase ^ 1)
+                            if const_expr(self.mode == "dq"):
+                                lphase = self.produce(
+                                    kba,
+                                    kbt,
+                                    sb0,
+                                    ks + rank * 64,
+                                    kh,
+                                    kb,
+                                    0,
+                                    loadbar,
+                                    ready,
+                                    lphase,
+                                    offset=ko,
+                                )
+                            else:
+                                lphase = self.produce(
+                                    qba,
+                                    qbt,
+                                    sb0,
+                                    qs + rank * 64,
+                                    h,
+                                    qb,
+                                    0,
+                                    loadbar,
+                                    ready,
+                                    lphase,
+                                    offset=qo,
+                                )
+                            if initialized:
+                                cute.arch.mbarrier_wait(bar + 1, cphase ^ 1)
+                            if const_expr(self.mode == "dq"):
+                                lphase = self.produce(
+                                    kba,
+                                    kbt,
+                                    sb1,
+                                    ks + rank * 64,
+                                    kh,
+                                    kb,
+                                    256,
+                                    loadbar,
+                                    ready + 1,
+                                    lphase,
+                                    offset=ko,
+                                )
+                            else:
+                                lphase = self.produce(
+                                    qba,
+                                    qbt,
+                                    sb1,
+                                    qs + rank * 64,
+                                    h,
+                                    qb,
+                                    256,
+                                    loadbar,
+                                    ready + 1,
+                                    lphase,
+                                    offset=qo,
+                                )
+                            cute.arch.mbarrier_wait(bar, cphase)
+                            if const_expr(self.mode == "dq"):
+                                lphase = self.produce(
+                                    vba,
+                                    vbt,
+                                    sb0,
+                                    ks + rank * 64,
+                                    kh,
+                                    kb,
+                                    0,
+                                    loadbar,
+                                    ready,
+                                    lphase,
+                                    offset=ko,
+                                )
+                            else:
+                                lphase = self.produce(
+                                    oba,
+                                    obt,
+                                    sb0,
+                                    qs + rank * 64,
+                                    h,
+                                    qb,
+                                    0,
+                                    loadbar,
+                                    ready,
+                                    lphase,
+                                    offset=qo,
+                                )
+                            cute.arch.mbarrier_wait(bar + 1, cphase)
+                            if const_expr(self.mode == "dq"):
+                                lphase = self.produce(
+                                    vba,
+                                    vbt,
+                                    sb1,
+                                    ks + rank * 64,
+                                    kh,
+                                    kb,
+                                    256,
+                                    loadbar,
+                                    ready + 1,
+                                    lphase,
+                                    offset=ko,
+                                )
+                            else:
+                                lphase = self.produce(
+                                    oba,
+                                    obt,
+                                    sb1,
+                                    qs + rank * 64,
+                                    h,
+                                    qb,
+                                    256,
+                                    loadbar,
+                                    ready + 1,
+                                    lphase,
+                                    offset=qo,
+                                )
                             cute.arch.mbarrier_wait(bar, cphase ^ 1)
-                        if const_expr(self.mode == "dq"):
-                            lphase = self.produce(
-                                kba,
-                                kbt,
-                                sb0,
-                                ks + rank * 64,
-                                kh,
-                                kb,
-                                0,
-                                loadbar,
-                                ready,
-                                lphase,
-                                offset=ko,
-                            )
-                        else:
-                            lphase = self.produce(
-                                qba,
-                                qbt,
-                                sb0,
-                                qs + rank * 64,
-                                h,
-                                qb,
-                                0,
-                                loadbar,
-                                ready,
-                                lphase,
-                                offset=qo,
-                            )
-                        if initialized:
+                            if const_expr(self.mode == "dq"):
+                                lphase = self.produce(
+                                    kga,
+                                    kgt,
+                                    bg0,
+                                    ks,
+                                    kh,
+                                    kb,
+                                    rank * 128,
+                                    loadbar,
+                                    ready,
+                                    lphase,
+                                    True,
+                                    offset=ko,
+                                )
+                            else:
+                                lphase = self.produce(
+                                    qga,
+                                    qgt,
+                                    bg0,
+                                    qs,
+                                    h,
+                                    qb,
+                                    rank * 128,
+                                    loadbar,
+                                    ready,
+                                    lphase,
+                                    True,
+                                    offset=qo,
+                                )
                             cute.arch.mbarrier_wait(bar + 1, cphase ^ 1)
-                        if const_expr(self.mode == "dq"):
-                            lphase = self.produce(
-                                kba,
-                                kbt,
-                                sb1,
-                                ks + rank * 64,
-                                kh,
-                                kb,
-                                256,
-                                loadbar,
-                                ready + 1,
-                                lphase,
-                                offset=ko,
-                            )
-                        else:
-                            lphase = self.produce(
-                                qba,
-                                qbt,
-                                sb1,
-                                qs + rank * 64,
-                                h,
-                                qb,
-                                256,
-                                loadbar,
-                                ready + 1,
-                                lphase,
-                                offset=qo,
-                            )
-                        cute.arch.mbarrier_wait(bar, cphase)
-                        if const_expr(self.mode == "dq"):
-                            lphase = self.produce(
-                                vba,
-                                vbt,
-                                sb0,
-                                ks + rank * 64,
-                                kh,
-                                kb,
-                                0,
-                                loadbar,
-                                ready,
-                                lphase,
-                                offset=ko,
-                            )
-                        else:
-                            lphase = self.produce(
-                                oba,
-                                obt,
-                                sb0,
-                                qs + rank * 64,
-                                h,
-                                qb,
-                                0,
-                                loadbar,
-                                ready,
-                                lphase,
-                                offset=qo,
-                            )
-                        cute.arch.mbarrier_wait(bar + 1, cphase)
-                        if const_expr(self.mode == "dq"):
-                            lphase = self.produce(
-                                vba,
-                                vbt,
-                                sb1,
-                                ks + rank * 64,
-                                kh,
-                                kb,
-                                256,
-                                loadbar,
-                                ready + 1,
-                                lphase,
-                                offset=ko,
-                            )
-                        else:
-                            lphase = self.produce(
-                                oba,
-                                obt,
-                                sb1,
-                                qs + rank * 64,
-                                h,
-                                qb,
-                                256,
-                                loadbar,
-                                ready + 1,
-                                lphase,
-                                offset=qo,
-                            )
-                        cute.arch.mbarrier_wait(bar, cphase ^ 1)
-                        if const_expr(self.mode == "dq"):
-                            lphase = self.produce(
-                                kga,
-                                kgt,
-                                bg0,
-                                ks,
-                                kh,
-                                kb,
-                                rank * 128,
-                                loadbar,
-                                ready,
-                                lphase,
-                                True,
-                                offset=ko,
-                            )
-                        else:
-                            lphase = self.produce(
-                                qga,
-                                qgt,
-                                bg0,
-                                qs,
-                                h,
-                                qb,
-                                rank * 128,
-                                loadbar,
-                                ready,
-                                lphase,
-                                True,
-                                offset=qo,
-                            )
-                        cute.arch.mbarrier_wait(bar + 1, cphase ^ 1)
-                        if const_expr(self.mode == "dq"):
-                            lphase = self.produce(
-                                kga,
-                                kgt,
-                                bg1,
-                                ks,
-                                kh,
-                                kb,
-                                256 + rank * 128,
-                                loadbar,
-                                ready + 1,
-                                lphase,
-                                True,
-                                offset=ko,
-                            )
-                        else:
-                            lphase = self.produce(
-                                qga,
-                                qgt,
-                                bg1,
-                                qs,
-                                h,
-                                qb,
-                                256 + rank * 128,
-                                loadbar,
-                                ready + 1,
-                                lphase,
-                                True,
-                                offset=qo,
-                            )
-                    if warp == 4:
-                        if rank == 0:
-                            self.issue(ms, scores, ap, bp0, ready, bar, cphase, True, 0)
-                            self.issue(
-                                ms,
-                                scores,
-                                ap,
-                                bp1,
-                                ready + 1,
-                                bar + 1,
-                                cphase,
-                                False,
-                                1,
-                            )
-                            with cute.arch.elect_one():
-                                tcgen05.commit(score_ready, mask=3, cta_group=tcgen05.CtaGroup.TWO)
-                            self.issue(ms, dprob, aop, bp0, ready, bar, cphase ^ 1, True, 0)
-                            self.issue(
-                                ms,
-                                dprob,
-                                aop,
-                                bp1,
-                                ready + 1,
-                                bar + 1,
-                                cphase ^ 1,
-                                False,
-                                1,
-                            )
-                            with cute.arch.elect_one():
-                                tcgen05.commit(
-                                    compute_ready,
-                                    mask=3,
-                                    cta_group=tcgen05.CtaGroup.TWO,
+                            if const_expr(self.mode == "dq"):
+                                lphase = self.produce(
+                                    kga,
+                                    kgt,
+                                    bg1,
+                                    ks,
+                                    kh,
+                                    kb,
+                                    256 + rank * 128,
+                                    loadbar,
+                                    ready + 1,
+                                    lphase,
+                                    True,
+                                    offset=ko,
                                 )
-                            cute.arch.mbarrier_wait(ds_ready, cphase)
-                            self.issue(mg, acc0, ds, bgp0, ready, bar, cphase, not initialized)
-                            self.issue(
-                                mg,
-                                acc1,
-                                ds,
-                                bgp1,
-                                ready + 1,
-                                bar + 1,
-                                cphase,
-                                not initialized,
-                            )
-                    if warp < 4:
-                        x = Float32(0)
-                        y = Float32(0)
-                        if qs + tid < sq:
-                            x = lse[qb, h, qo + qs + tid]
-                            y = delta[qb, h, delta_offset + qs + tid]
-                        slse[tid] = x
-                        sdelta[tid] = y
-                        compute_sync.arrive_and_wait()
-                        cute.arch.mbarrier_wait(score_ready, cphase)
-                        probabilities = cute.make_rmem_tensor((64,), Float32)
-                        if const_expr(self.softcap > 0):
-                            derivatives = cute.make_rmem_tensor((64,), Float32)
-                        for strip in cutlass.range_constexpr(4):
-                            physical = cute.make_layout((128, 16), stride=(65536, 1))
-                            ts = cute.make_tensor(scores.iterator + strip * 16, physical)
-                            cp = tcgen05.make_tmem_copy(
-                                cute.make_copy_atom(
-                                    tcgen05.Ld32x32bOp(tcgen05.Repetition(16)), Float32
-                                ),
-                                ts,
-                            )
-                            th = cp.get_slice(tid)
-                            coords = th.partition_D(cute.make_identity_tensor((128, 16)))
-                            rs = cute.make_rmem_tensor(coords.shape, Float32)
-                            cute.copy(cp, th.partition_S(ts), rs)
-                            cute.arch.fence_view_async_tmem_load()
-                            for j in cutlass.range_constexpr(cute.size(rs)):
-                                row, col = coords[j]
-                                r = rank * 64 + row % 64
-                                c = (row // 64) * 64 + strip * 16 + col
-                                if const_expr(self.mode == "dq"):
-                                    qi = qs + r
-                                    ki = ks + c
-                                else:
-                                    qi = qs + c
-                                    ki = ks + r
-                                valid = qi < sq and ki < sk
-                                center = qi + sk - sq
-                                if const_expr(self.causal):
-                                    valid = valid and ki <= center
-                                if const_expr(self.window[0] >= 0):
-                                    valid = valid and ki >= center - self.window[0]
-                                if const_expr(self.window[1] >= 0):
-                                    valid = valid and ki <= center + self.window[1]
-                                prob = Float32(0)
-                                deriv = Float32(1)
-                                if valid:
-                                    value = rs[j] * scale
-                                    if const_expr(self.softcap > 0):
-                                        t = (
-                                            2
-                                            / (
-                                                1
-                                                + cute.math.exp(
-                                                    -2 * value / self.softcap,
-                                                    fastmath=True,
+                            else:
+                                lphase = self.produce(
+                                    qga,
+                                    qgt,
+                                    bg1,
+                                    qs,
+                                    h,
+                                    qb,
+                                    256 + rank * 128,
+                                    loadbar,
+                                    ready + 1,
+                                    lphase,
+                                    True,
+                                    offset=qo,
+                                )
+                        if warp == 4:
+                            if rank == 0:
+                                self.issue(ms, scores, ap, bp0, ready, bar, cphase, True, 0)
+                                self.issue(
+                                    ms,
+                                    scores,
+                                    ap,
+                                    bp1,
+                                    ready + 1,
+                                    bar + 1,
+                                    cphase,
+                                    False,
+                                    1,
+                                )
+                                with cute.arch.elect_one():
+                                    tcgen05.commit(
+                                        score_ready, mask=3, cta_group=tcgen05.CtaGroup.TWO
+                                    )
+                                self.issue(ms, dprob, aop, bp0, ready, bar, cphase ^ 1, True, 0)
+                                self.issue(
+                                    ms,
+                                    dprob,
+                                    aop,
+                                    bp1,
+                                    ready + 1,
+                                    bar + 1,
+                                    cphase ^ 1,
+                                    False,
+                                    1,
+                                )
+                                with cute.arch.elect_one():
+                                    tcgen05.commit(
+                                        compute_ready,
+                                        mask=3,
+                                        cta_group=tcgen05.CtaGroup.TWO,
+                                    )
+                                cute.arch.mbarrier_wait(ds_ready, cphase)
+                                self.issue(mg, acc0, ds, bgp0, ready, bar, cphase, not initialized)
+                                self.issue(
+                                    mg,
+                                    acc1,
+                                    ds,
+                                    bgp1,
+                                    ready + 1,
+                                    bar + 1,
+                                    cphase,
+                                    not initialized,
+                                )
+                        if warp < 4:
+                            x = Float32(0)
+                            y = Float32(0)
+                            if qs + tid < sq:
+                                x = lse[qb, h, qo + qs + tid]
+                                y = delta[qb, h, delta_offset + qs + tid]
+                            slse[tid] = x
+                            sdelta[tid] = y
+                            compute_sync.arrive_and_wait()
+                            cute.arch.mbarrier_wait(score_ready, cphase)
+                            probabilities = cute.make_rmem_tensor((64,), Float32)
+                            if const_expr(self.softcap > 0):
+                                derivatives = cute.make_rmem_tensor((64,), Float32)
+                            for strip in cutlass.range_constexpr(4):
+                                physical = cute.make_layout((128, 16), stride=(65536, 1))
+                                ts = cute.make_tensor(scores.iterator + strip * 16, physical)
+                                cp = tcgen05.make_tmem_copy(
+                                    cute.make_copy_atom(
+                                        tcgen05.Ld32x32bOp(tcgen05.Repetition(16)), Float32
+                                    ),
+                                    ts,
+                                )
+                                th = cp.get_slice(tid)
+                                coords = th.partition_D(cute.make_identity_tensor((128, 16)))
+                                rs = cute.make_rmem_tensor(coords.shape, Float32)
+                                cute.copy(cp, th.partition_S(ts), rs)
+                                cute.arch.fence_view_async_tmem_load()
+                                for j in cutlass.range_constexpr(cute.size(rs)):
+                                    row, col = coords[j]
+                                    r = rank * 64 + row % 64
+                                    c = (row // 64) * 64 + strip * 16 + col
+                                    if const_expr(self.mode == "dq"):
+                                        qi = qs + r
+                                        ki = ks + c
+                                    else:
+                                        qi = qs + c
+                                        ki = ks + r
+                                    valid = qi < sq and ki < sk
+                                    center = qi + sk - sq
+                                    if const_expr(self.causal):
+                                        valid = valid and ki <= center
+                                    if const_expr(self.window[0] >= 0):
+                                        valid = valid and ki >= center - self.window[0]
+                                    if const_expr(self.window[1] >= 0):
+                                        valid = valid and ki <= center + self.window[1]
+                                    prob = Float32(0)
+                                    deriv = Float32(1)
+                                    if valid:
+                                        value = rs[j] * scale
+                                        if const_expr(self.softcap > 0):
+                                            t = (
+                                                2
+                                                / (
+                                                    1
+                                                    + cute.math.exp(
+                                                        -2 * value / self.softcap,
+                                                        fastmath=True,
+                                                    )
                                                 )
+                                                - 1
                                             )
-                                            - 1
-                                        )
-                                        value = self.softcap * t
-                                        deriv = 1 - t * t
-                                    prob = cute.math.exp(value - slse[qi - qs], fastmath=True)
-                                probabilities[strip * 16 + j] = prob
-                                if const_expr(self.softcap > 0):
-                                    derivatives[strip * 16 + j] = deriv
-                        cute.arch.mbarrier_wait(compute_ready, cphase)
-                        copy_smem = cute.make_copy_atom(
-                            cute.nvgpu.CopyUniversalOp(),
-                            self.dtype,
-                            num_bits_per_copy=128,
-                        )
-                        for strip in cutlass.range_constexpr(4):
-                            td = cute.make_tensor(
-                                dprob.iterator + strip * 16,
-                                cute.make_layout((128, 16), stride=(65536, 1)),
+                                            value = self.softcap * t
+                                            deriv = 1 - t * t
+                                        prob = cute.math.exp(value - slse[qi - qs], fastmath=True)
+                                    probabilities[strip * 16 + j] = prob
+                                    if const_expr(self.softcap > 0):
+                                        derivatives[strip * 16 + j] = deriv
+                            cute.arch.mbarrier_wait(compute_ready, cphase)
+                            copy_smem = cute.make_copy_atom(
+                                cute.nvgpu.CopyUniversalOp(),
+                                self.dtype,
+                                num_bits_per_copy=128,
                             )
-                            cp = tcgen05.make_tmem_copy(
-                                cute.make_copy_atom(
-                                    tcgen05.Ld32x32bOp(tcgen05.Repetition(16)), Float32
-                                ),
-                                td,
-                            )
-                            th = cp.get_slice(tid)
-                            coords = th.partition_D(cute.make_identity_tensor((128, 16)))
-                            rd = cute.make_rmem_tensor(coords.shape, Float32)
-                            rds = cute.make_rmem_tensor(coords.shape, self.dtype)
-                            cute.copy(cp, th.partition_S(td), rd)
-                            cute.arch.fence_view_async_tmem_load()
-                            for j in cutlass.range_constexpr(cute.size(rd)):
-                                row, col = coords[j]
-                                r = rank * 64 + row % 64
-                                c = (row // 64) * 64 + strip * 16 + col
-                                if const_expr(self.mode == "dq"):
-                                    qi = qs + r
-                                else:
-                                    qi = qs + c
-                                dd = (
-                                    probabilities[strip * 16 + j]
-                                    * (rd[j] - sdelta[qi - qs])
-                                    * scale
+                            for strip in cutlass.range_constexpr(4):
+                                td = cute.make_tensor(
+                                    dprob.iterator + strip * 16,
+                                    cute.make_layout((128, 16), stride=(65536, 1)),
                                 )
-                                if const_expr(self.softcap > 0):
-                                    dd = dd * derivatives[strip * 16 + j]
-                                rds[j] = self.dtype(dd)
-                            for j in cutlass.range_constexpr(2):
-                                row, col = coords[j * 8]
-                                r = row % 64
-                                c = (row // 64) * 64 + strip * 16 + col
-                                offset = cute.assume(cute.crd2idx((r, c), ss.layout), divby=8)
-                                target = cute.make_tensor(ss.iterator + offset, cute.make_layout(8))
-                                source = cute.make_tensor(rds.iterator + j * 8, cute.make_layout(8))
-                                cute.copy(copy_smem, source, target)
-                        cute.arch.fence_view_async_shared()
-                        compute_sync.arrive_and_wait()
-                        if tid == 0:
-                            cute.arch.mbarrier_arrive(ds_ready, peer_cta_rank_in_cluster=0)
-                    initialized = True
-                    cphase = cphase ^ 1
+                                cp = tcgen05.make_tmem_copy(
+                                    cute.make_copy_atom(
+                                        tcgen05.Ld32x32bOp(tcgen05.Repetition(16)), Float32
+                                    ),
+                                    td,
+                                )
+                                th = cp.get_slice(tid)
+                                coords = th.partition_D(cute.make_identity_tensor((128, 16)))
+                                rd = cute.make_rmem_tensor(coords.shape, Float32)
+                                rds = cute.make_rmem_tensor(coords.shape, self.dtype)
+                                cute.copy(cp, th.partition_S(td), rd)
+                                cute.arch.fence_view_async_tmem_load()
+                                for j in cutlass.range_constexpr(cute.size(rd)):
+                                    row, col = coords[j]
+                                    r = rank * 64 + row % 64
+                                    c = (row // 64) * 64 + strip * 16 + col
+                                    if const_expr(self.mode == "dq"):
+                                        qi = qs + r
+                                    else:
+                                        qi = qs + c
+                                    dd = (
+                                        probabilities[strip * 16 + j]
+                                        * (rd[j] - sdelta[qi - qs])
+                                        * scale
+                                    )
+                                    if const_expr(self.softcap > 0):
+                                        dd = dd * derivatives[strip * 16 + j]
+                                    rds[j] = self.dtype(dd)
+                                for j in cutlass.range_constexpr(2):
+                                    row, col = coords[j * 8]
+                                    r = row % 64
+                                    c = (row // 64) * 64 + strip * 16 + col
+                                    offset = cute.assume(cute.crd2idx((r, c), ss.layout), divby=8)
+                                    target = cute.make_tensor(
+                                        ss.iterator + offset, cute.make_layout(8)
+                                    )
+                                    source = cute.make_tensor(
+                                        rds.iterator + j * 8, cute.make_layout(8)
+                                    )
+                                    cute.copy(copy_smem, source, target)
+                            cute.arch.fence_view_async_shared()
+                            compute_sync.arrive_and_wait()
+                            if tid == 0:
+                                cute.arch.mbarrier_arrive(ds_ready, peer_cta_rank_in_cluster=0)
+                        initialized = True
+                        cphase = cphase ^ 1
             cute.arch.barrier()
             if initialized:
                 cute.arch.mbarrier_wait(bar + 1, cphase ^ 1)
@@ -978,7 +989,7 @@ class NativeD512DqDk:
                         sa_full.iterator,
                         dk,
                         kb,
-                        h,
+                        by,
                         ko + ks,
                         ko + sk_storage,
                         0,
@@ -989,7 +1000,7 @@ class NativeD512DqDk:
                         sa_full.iterator,
                         dk,
                         kb,
-                        h,
+                        by,
                         ko + ks,
                         ko + sk_storage,
                         256,
@@ -1000,7 +1011,9 @@ class NativeD512DqDk:
 
 
 class NativeD512Dv(NativeD512DqDk):
-    def __init__(self, mode, causal=False, softcap=0.0, window=(-1, -1), maxsq=None, maxsk=None):
+    def __init__(
+        self, mode, causal=False, softcap=0.0, window=(-1, -1), maxsq=None, maxsk=None, head_group=1
+    ):
         self.mode = mode
         self.causal = causal
         self.softcap = softcap
@@ -1009,6 +1022,7 @@ class NativeD512Dv(NativeD512DqDk):
         self.maxsq = maxsq
         self.maxsk = maxsk
         self.threads = 256
+        self.head_group = head_group if mode != "dq" else 1
         # A smaller query tile reduces resource pressure for noncausal DV.
         # Causal attention retains the wider tile to amortize traversal costs.
         self.query_tile = 256 if causal else 128
@@ -1105,7 +1119,7 @@ class NativeD512Dv(NativeD512DqDk):
         maxsq = self.maxsq if self.maxsq is not None else q.shape[1]
         maxsk = self.maxsk if self.maxsk is not None else k.shape[1]
         batches = cuq.shape[0] - 1 if cuq is not None else q.shape[0]
-        grid = (cute.ceil_div(maxsk, 128) * 2 * q.shape[2], 1, batches)
+        grid = (cute.ceil_div(maxsk, 128) * 2 * (q.shape[2] // self.head_group), 1, batches)
         self.kernel(
             q,
             k,
@@ -1204,8 +1218,8 @@ class NativeD512Dv(NativeD512DqDk):
         tid, _, _ = cute.arch.thread_idx()
         bx, by, batch = cute.arch.block_idx()
         rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
-        by = (bx // 2) % q.shape[2]
-        tile = (bx // 2) // q.shape[2]
+        by = (bx // 2) % (q.shape[2] // self.head_group)
+        tile = (bx // 2) // (q.shape[2] // self.head_group)
         ratio = q.shape[2] // k.shape[2]
         sq = q.shape[1]
         sk = k.shape[1]
@@ -1230,7 +1244,7 @@ class NativeD512Dv(NativeD512DqDk):
         if tile * 128 < tile_rows:
             qs = Int32(0)
             ks = Int32(0)
-            h = by
+            h = by * self.head_group
             kh = h // ratio
             ks = tile * 128
             iterations = cute.ceil_div(sq, self.query_tile)
@@ -1370,177 +1384,183 @@ class NativeD512Dv(NativeD512DqDk):
             warp = cute.arch.make_warp_uniform(cute.arch.warp_idx())
             compute_sync = cutlass.pipeline.NamedBarrier(barrier_id=2, num_threads=128)
             cphase = Int32(0)
-            for it in cutlass.range(iterations):
-                qs = it * self.query_tile
-                active = True
-                if const_expr(self.causal):
-                    active = ks <= qs + self.query_tile - 1 + sk - sq
-                # DV traverses query_tile rows for a 128-key-row output tile.
-                if const_expr(self.window[0] >= 0):
-                    active = active and ks + 127 >= qs + sk - sq - self.window[0]
-                if const_expr(self.window[1] >= 0 and not self.causal):
-                    active = active and ks <= qs + self.query_tile - 1 + sk - sq + self.window[1]
-                if active:
-                    if warp == 5:
-                        if initialized:
-                            cute.arch.mbarrier_wait(bar, 1)
-                        lphase = self.produce(
-                            qba,
-                            qbt,
-                            sb,
-                            qs + rank * (self.query_tile // 2),
-                            h,
-                            qb,
-                            0,
-                            loadbar,
-                            ready,
-                            lphase,
-                            offset=qo,
+            for head_part in cutlass.range(self.head_group, unroll=1):
+                h = by * self.head_group + head_part
+                for it in cutlass.range(iterations):
+                    qs = it * self.query_tile
+                    active = True
+                    if const_expr(self.causal):
+                        active = ks <= qs + self.query_tile - 1 + sk - sq
+                    # DV traverses query_tile rows for a 128-key-row output tile.
+                    if const_expr(self.window[0] >= 0):
+                        active = active and ks + 127 >= qs + sk - sq - self.window[0]
+                    if const_expr(self.window[1] >= 0 and not self.causal):
+                        active = (
+                            active and ks <= qs + self.query_tile - 1 + sk - sq + self.window[1]
                         )
-                        if initialized:
-                            cute.arch.mbarrier_wait(bar + 1, 1)
-                        lphase = self.produce(
-                            qba,
-                            qbt,
-                            sb1,
-                            qs + rank * (self.query_tile // 2),
-                            h,
-                            qb,
-                            256,
-                            loadbar,
-                            ready + 1,
-                            lphase,
-                            offset=qo,
-                        )
-                        cute.arch.mbarrier_wait(bar, 0)
-                        lphase = self.produce(
-                            oga,
-                            ogt,
-                            bg,
-                            qs,
-                            h,
-                            qb,
-                            rank * 128,
-                            loadbar,
-                            ready,
-                            lphase,
-                            True,
-                            offset=qo,
-                        )
-                        cute.arch.mbarrier_wait(bar + 1, 0)
-                        lphase = self.produce(
-                            oga,
-                            ogt,
-                            bg1,
-                            qs,
-                            h,
-                            qb,
-                            256 + rank * 128,
-                            loadbar,
-                            ready + 1,
-                            lphase,
-                            True,
-                            offset=qo,
-                        )
-                    if warp == 4:
-                        if rank == 0:
-                            self.issue(ms, scores, ap, bp, ready, bar, 0, True, 0)
-                            self.issue(ms, scores, ap, bp1, ready + 1, bar + 1, 0, False, 1)
-                            with cute.arch.elect_one():
-                                tcgen05.commit(
-                                    compute_ready,
-                                    mask=3,
-                                    cta_group=tcgen05.CtaGroup.TWO,
-                                )
-                            cute.arch.mbarrier_wait(ds_ready, cphase)
-                            self.issue(mg, acc0, pp, bgp, ready, bar, 1, not initialized)
-                            self.issue(
-                                mg,
-                                acc1,
-                                pp,
-                                bgp1,
+                    if active:
+                        if warp == 5:
+                            if initialized:
+                                cute.arch.mbarrier_wait(bar, 1)
+                            lphase = self.produce(
+                                qba,
+                                qbt,
+                                sb,
+                                qs + rank * (self.query_tile // 2),
+                                h,
+                                qb,
+                                0,
+                                loadbar,
+                                ready,
+                                lphase,
+                                offset=qo,
+                            )
+                            if initialized:
+                                cute.arch.mbarrier_wait(bar + 1, 1)
+                            lphase = self.produce(
+                                qba,
+                                qbt,
+                                sb1,
+                                qs + rank * (self.query_tile // 2),
+                                h,
+                                qb,
+                                256,
+                                loadbar,
                                 ready + 1,
-                                bar + 1,
-                                1,
-                                not initialized,
+                                lphase,
+                                offset=qo,
                             )
-                    if warp < 4:
-                        for chunk in cutlass.range_constexpr(self.query_tile // 128):
-                            x = Float32(0)
-                            pos = tid + chunk * 128
-                            if qs + pos < sq:
-                                x = lse[qb, h, qo + qs + pos]
-                            slse[pos] = x
-                        compute_sync.arrive_and_wait()
-                        cute.arch.mbarrier_wait(compute_ready, cphase)
-                        copy_smem = cute.make_copy_atom(
-                            cute.nvgpu.CopyUniversalOp(),
-                            self.dtype,
-                            num_bits_per_copy=128,
-                        )
-                        for strip in cutlass.range_constexpr(self.query_tile // 32):
-                            physical = cute.make_layout((128, 16), stride=(65536, 1))
-                            ts = cute.make_tensor(scores.iterator + strip * 16, physical)
-                            cp = tcgen05.make_tmem_copy(
-                                cute.make_copy_atom(
-                                    tcgen05.Ld32x32bOp(tcgen05.Repetition(16)), Float32
-                                ),
-                                ts,
+                            cute.arch.mbarrier_wait(bar, 0)
+                            lphase = self.produce(
+                                oga,
+                                ogt,
+                                bg,
+                                qs,
+                                h,
+                                qb,
+                                rank * 128,
+                                loadbar,
+                                ready,
+                                lphase,
+                                True,
+                                offset=qo,
                             )
-                            th = cp.get_slice(tid)
-                            coords = th.partition_D(cute.make_identity_tensor((128, 16)))
-                            rs = cute.make_rmem_tensor(coords.shape, Float32)
-                            rp = cute.make_rmem_tensor(coords.shape, self.dtype)
-                            cute.copy(cp, th.partition_S(ts), rs)
-                            cute.arch.fence_view_async_tmem_load()
-                            for j in cutlass.range_constexpr(cute.size(rs)):
-                                row, col = coords[j]
-                                r = rank * 64 + row % 64
-                                c = (row // 64) * (self.query_tile // 2) + strip * 16 + col
-                                qi = qs + c
-                                ki = ks + r
-                                valid = qi < sq and ki < sk
-                                center = qi + sk - sq
-                                if const_expr(self.causal):
-                                    valid = valid and ki <= center
-                                if const_expr(self.window[0] >= 0):
-                                    valid = valid and ki >= center - self.window[0]
-                                if const_expr(self.window[1] >= 0):
-                                    valid = valid and ki <= center + self.window[1]
-                                prob = Float32(0)
-                                if valid:
-                                    value = rs[j] * scale
-                                    if const_expr(self.softcap > 0):
-                                        t = (
-                                            2
-                                            / (
-                                                1
-                                                + cute.math.exp(
-                                                    -2 * value / self.softcap,
-                                                    fastmath=True,
-                                                )
-                                            )
-                                            - 1
-                                        )
-                                        value = self.softcap * t
-                                    prob = cute.math.exp(value - slse[qi - qs], fastmath=True)
-                                rp[j] = self.dtype(prob)
-                            for j in cutlass.range_constexpr(2):
-                                row, col = coords[j * 8]
-                                r = row % 64
-                                c = (row // 64) * (self.query_tile // 2) + strip * 16 + col
-                                offset = cute.assume(cute.crd2idx((r, c), sp.layout), divby=8)
-                                ptarget = cute.make_tensor(
-                                    sp.iterator + offset, cute.make_layout(8)
+                            cute.arch.mbarrier_wait(bar + 1, 0)
+                            lphase = self.produce(
+                                oga,
+                                ogt,
+                                bg1,
+                                qs,
+                                h,
+                                qb,
+                                256 + rank * 128,
+                                loadbar,
+                                ready + 1,
+                                lphase,
+                                True,
+                                offset=qo,
+                            )
+                        if warp == 4:
+                            if rank == 0:
+                                self.issue(ms, scores, ap, bp, ready, bar, 0, True, 0)
+                                self.issue(ms, scores, ap, bp1, ready + 1, bar + 1, 0, False, 1)
+                                with cute.arch.elect_one():
+                                    tcgen05.commit(
+                                        compute_ready,
+                                        mask=3,
+                                        cta_group=tcgen05.CtaGroup.TWO,
+                                    )
+                                cute.arch.mbarrier_wait(ds_ready, cphase)
+                                self.issue(mg, acc0, pp, bgp, ready, bar, 1, not initialized)
+                                self.issue(
+                                    mg,
+                                    acc1,
+                                    pp,
+                                    bgp1,
+                                    ready + 1,
+                                    bar + 1,
+                                    1,
+                                    not initialized,
                                 )
-                                psource = cute.make_tensor(rp.iterator + j * 8, cute.make_layout(8))
-                                cute.copy(copy_smem, psource, ptarget)
-                        cute.arch.fence_view_async_shared()
-                        compute_sync.arrive_and_wait()
-                        if tid == 0:
-                            cute.arch.mbarrier_arrive(ds_ready, peer_cta_rank_in_cluster=0)
-                    initialized = True
-                    cphase = cphase ^ 1
+                        if warp < 4:
+                            for chunk in cutlass.range_constexpr(self.query_tile // 128):
+                                x = Float32(0)
+                                pos = tid + chunk * 128
+                                if qs + pos < sq:
+                                    x = lse[qb, h, qo + qs + pos]
+                                slse[pos] = x
+                            compute_sync.arrive_and_wait()
+                            cute.arch.mbarrier_wait(compute_ready, cphase)
+                            copy_smem = cute.make_copy_atom(
+                                cute.nvgpu.CopyUniversalOp(),
+                                self.dtype,
+                                num_bits_per_copy=128,
+                            )
+                            for strip in cutlass.range_constexpr(self.query_tile // 32):
+                                physical = cute.make_layout((128, 16), stride=(65536, 1))
+                                ts = cute.make_tensor(scores.iterator + strip * 16, physical)
+                                cp = tcgen05.make_tmem_copy(
+                                    cute.make_copy_atom(
+                                        tcgen05.Ld32x32bOp(tcgen05.Repetition(16)), Float32
+                                    ),
+                                    ts,
+                                )
+                                th = cp.get_slice(tid)
+                                coords = th.partition_D(cute.make_identity_tensor((128, 16)))
+                                rs = cute.make_rmem_tensor(coords.shape, Float32)
+                                rp = cute.make_rmem_tensor(coords.shape, self.dtype)
+                                cute.copy(cp, th.partition_S(ts), rs)
+                                cute.arch.fence_view_async_tmem_load()
+                                for j in cutlass.range_constexpr(cute.size(rs)):
+                                    row, col = coords[j]
+                                    r = rank * 64 + row % 64
+                                    c = (row // 64) * (self.query_tile // 2) + strip * 16 + col
+                                    qi = qs + c
+                                    ki = ks + r
+                                    valid = qi < sq and ki < sk
+                                    center = qi + sk - sq
+                                    if const_expr(self.causal):
+                                        valid = valid and ki <= center
+                                    if const_expr(self.window[0] >= 0):
+                                        valid = valid and ki >= center - self.window[0]
+                                    if const_expr(self.window[1] >= 0):
+                                        valid = valid and ki <= center + self.window[1]
+                                    prob = Float32(0)
+                                    if valid:
+                                        value = rs[j] * scale
+                                        if const_expr(self.softcap > 0):
+                                            t = (
+                                                2
+                                                / (
+                                                    1
+                                                    + cute.math.exp(
+                                                        -2 * value / self.softcap,
+                                                        fastmath=True,
+                                                    )
+                                                )
+                                                - 1
+                                            )
+                                            value = self.softcap * t
+                                        prob = cute.math.exp(value - slse[qi - qs], fastmath=True)
+                                    rp[j] = self.dtype(prob)
+                                for j in cutlass.range_constexpr(2):
+                                    row, col = coords[j * 8]
+                                    r = row % 64
+                                    c = (row // 64) * (self.query_tile // 2) + strip * 16 + col
+                                    offset = cute.assume(cute.crd2idx((r, c), sp.layout), divby=8)
+                                    ptarget = cute.make_tensor(
+                                        sp.iterator + offset, cute.make_layout(8)
+                                    )
+                                    psource = cute.make_tensor(
+                                        rp.iterator + j * 8, cute.make_layout(8)
+                                    )
+                                    cute.copy(copy_smem, psource, ptarget)
+                            cute.arch.fence_view_async_shared()
+                            compute_sync.arrive_and_wait()
+                            if tid == 0:
+                                cute.arch.mbarrier_arrive(ds_ready, peer_cta_rank_in_cluster=0)
+                        initialized = True
+                        cphase = cphase ^ 1
             cute.arch.barrier()
             if initialized:
                 cute.arch.mbarrier_wait(bar + 1, 1)
@@ -1552,7 +1572,7 @@ class NativeD512Dv(NativeD512DqDk):
                     sa_full.iterator,
                     dv,
                     kb,
-                    h,
+                    by,
                     ko + ks,
                     ko + sk_storage,
                     0,
@@ -1563,7 +1583,7 @@ class NativeD512Dv(NativeD512DqDk):
                     sa_full.iterator,
                     dv,
                     kb,
-                    h,
+                    by,
                     ko + ks,
                     ko + sk_storage,
                     256,
@@ -1660,6 +1680,44 @@ def _tensor_signature(tensor):
     return (tuple(tensor.shape), tuple(tensor.stride()), tensor.dtype)
 
 
+def _select_head_group(q, k, causal, cuq, cuk, usedq, usedk):
+    import torch
+
+    if q.ndim != 4 or q.shape[1] != k.shape[1]:
+        return 1
+    if any(x is not None for x in (cuq, cuk, usedq, usedk)):
+        return 1
+    ratio = q.shape[2] // k.shape[2]
+    if ratio % 2:
+        return 1
+    sms = torch.cuda.get_device_properties(q.device).multi_processor_count
+    clusters = q.shape[0] * q.shape[2] * ((k.shape[1] + 127) // 128)
+    if not causal:
+        # Keep the serialized query traversal per grouped cluster at or below
+        # 64 tiles.  Retain at least 3/4 of one two-CTA cluster wave; when the
+        # ungrouped grid is very large, group=2 preserves useful parallelism.
+        # This narrow path is benchmarked for dense ratio-4 GQA only.
+        if ratio != 4:
+            return 1
+        q_tiles = (q.shape[1] + 127) // 128
+        cluster_slots = sms // 2
+        if q_tiles <= 16:
+            if clusters // 4 >= (3 * cluster_slots) // 4:
+                return 2 if clusters // 4 > 3 * cluster_slots else 4
+            if clusters // 2 >= (3 * cluster_slots) // 4:
+                return 2
+        return 1
+    # Long traversals amortize grouping with more than one wave of clusters.
+    if ratio % 4 == 0 and q.shape[1] >= 4096 and clusters // 4 > sms // 2:
+        return 4
+    if clusters // 2 > sms // 2:
+        return 2
+    # For short traversals, saving prologues/reduction offsets a partial wave.
+    if q.shape[1] <= 512 and (clusters // 2) * 8 >= 3 * sms:
+        return 2
+    return 1
+
+
 def backward_sm100_d512(
     q,
     k,
@@ -1700,6 +1758,7 @@ def backward_sm100_d512(
     # non-padded output would let one sequence's padding overwrite its neighbor.
     hq, hk = q.shape[-2], k.shape[-2]
     ratio = hq // hk
+    head_group = _select_head_group(q, k, causal, cuq, cuk, usedq, usedk)
     if cuq is None:
         delta_shape = (q.shape[0], hq, ((q.shape[1] + 127) // 128) * 128)
     else:
@@ -1740,13 +1799,13 @@ def backward_sm100_d512(
     )
     if zero_outputs:
         work_dq.zero_()
-    if ratio == 1:
+    if ratio == head_group:
         pk, pv = work_dk, work_dv
         if zero_outputs:
             pk.zero_()
             pv.zero_()
     else:
-        partial_shape = (*k.shape[:-2], hq, 512)
+        partial_shape = (*k.shape[:-2], hq // head_group, 512)
         pk = torch.empty(partial_shape, device=k.device, dtype=torch.float32)
         pv = torch.empty_like(pk)
         if zero_outputs:
@@ -1775,12 +1834,12 @@ def backward_sm100_d512(
     signature = tuple(_tensor_signature(t) for t in (*tensors, *metadata))
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     for mode in ("dq", "dk", "dv"):
-        key = (arch, mode, signature, causal, softcap, window, maxsq, maxsk)
+        key = (arch, mode, signature, causal, softcap, window, maxsq, maxsk, head_group)
         if key not in _native_cache:
             args = [from_dlpack(t.detach(), assumed_align=16) for t in tensors]
             meta = [from_dlpack(t, assumed_align=4) if t is not None else None for t in metadata]
             kernel = (NativeD512Dv if mode == "dv" else NativeD512DqDk)(
-                mode, causal, softcap, window, maxsq, maxsk
+                mode, causal, softcap, window, maxsq, maxsk, head_group=head_group
             )
             _native_cache[key] = cute.compile(
                 kernel,
@@ -1792,13 +1851,13 @@ def backward_sm100_d512(
             )
         _native_cache[key](*tensors, scale, *metadata)
 
-    if ratio > 1:
+    if ratio > head_group:
         reduce_tensors = tuple(batch_view(t) for t in (pk, pv, work_dk, work_dv))
         key = (arch, ratio, tuple(_tensor_signature(t) for t in reduce_tensors))
         if key not in _reduce_cache:
             args = [from_dlpack(t.detach(), assumed_align=16) for t in reduce_tensors]
             _reduce_cache[key] = cute.compile(
-                ReduceD512Gqa(ratio), *args, stream, options="--enable-tvm-ffi"
+                ReduceD512Gqa(ratio // head_group), *args, stream, options="--enable-tvm-ffi"
             )
         _reduce_cache[key](*reduce_tensors)
     for output, work in zip(outputs, work_outputs):

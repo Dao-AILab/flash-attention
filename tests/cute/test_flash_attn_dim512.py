@@ -4,9 +4,12 @@ from itertools import accumulate
 import pytest
 import torch
 from flash_attn.cute import flash_attn_func, flash_attn_varlen_func
+from flash_attn.cute import flash_bwd_sm100_hd512 as native
 from flash_attn.cute.interface import _flash_attn_bwd, _flash_attn_fwd
+from flash_attn.cute.testing import attention_ref
 from functools import wraps
 from flash_attn.cute import interface
+from test_flash_attn import check_tensor_vs_ref
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
@@ -850,3 +853,137 @@ def test_native_gradient_write_isolation(dtype, ratio, causal, monkeypatch):
     expected = torch.autograd.grad(ref, (qr, kr, vr), dout.double())
     for grad, expected_grad in zip(actual, expected):
         check(grad, expected_grad, dtype)
+
+
+def check_grouped_error(name, actual, exact, eager, dtype):
+    """Apply the upstream relative-error criterion to a grouped gradient."""
+    assert torch.isfinite(actual).all()
+    error = (actual.double() - exact).abs()
+    eager_error = (eager.double() - exact).abs()
+    rounding = 2 * torch.finfo(dtype).eps * exact.abs()
+    check_tensor_vs_ref(
+        name, actual.double(), exact, eager.double(), atol=rounding.max().item()
+    )
+    assert error.mean() <= 2 * eager_error.mean() + rounding.mean(), name
+
+
+def fixed_threshold_failures(actual, exact, dtype):
+    atol, rtol = (0.01, 0.03) if dtype == torch.bfloat16 else (0.002, 0.005)
+    error = (actual.double() - exact).abs()
+    return int((error > atol + rtol * exact.abs()).sum().item())
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize(
+    ("ratio", "head_group"), [(2, 2), (4, 2), (4, 4), (8, 2), (8, 4)]
+)
+def test_grouped_native_backward(monkeypatch, head_group, dtype, causal, ratio):
+    torch.manual_seed(193)
+    q = torch.randn(2, 257, ratio * 2, 512, device="cuda", dtype=dtype)
+    k, v = [
+        torch.randn(2, 257, 2, 512, device="cuda", dtype=dtype) for _ in range(2)
+    ]
+    qr, kr, vr = [x.double().requires_grad_() for x in (q, k, v)]
+    exact_out, _ = reference(qr, kr, vr, causal=causal)
+    out, lse, *_ = _flash_attn_fwd(q, k, v, causal=causal, return_lse=True)
+    dout = torch.randn_like(out)
+    exact = torch.autograd.grad(exact_out, (qr, kr, vr), dout.double())
+    qe, ke, ve = [x.detach().requires_grad_() for x in (q, k, v)]
+    eager_out, _ = attention_ref(qe, ke, ve, causal=causal, upcast=False)
+    eager = torch.autograd.grad(eager_out, (qe, ke, ve), dout)
+
+    monkeypatch.setattr(native, "_select_head_group", lambda *args: 1)
+    baseline = _flash_attn_bwd(q, k, v, out, dout, lse, causal=causal)
+    baseline_failures = [
+        fixed_threshold_failures(actual, expected, dtype)
+        for actual, expected in zip(baseline, exact)
+    ]
+
+    monkeypatch.setattr(native, "_select_head_group", lambda *args: head_group)
+    for _ in range(3):
+        actual = _flash_attn_bwd(q, k, v, out, dout, lse, causal=causal)
+        for name, result, expected, eager_result, baseline_count in zip(
+            ("dq", "dk", "dv"), actual, exact, eager, baseline_failures
+        ):
+            check_grouped_error(name, result, expected, eager_result, dtype)
+            assert fixed_threshold_failures(result, expected, dtype) <= baseline_count, name
+    torch.cuda.synchronize()
+
+
+@pytest.mark.parametrize("head_group", [2, 4])
+def test_grouped_softcap_window_write_isolation(monkeypatch, head_group):
+    monkeypatch.setattr(native, "_select_head_group", lambda *args: head_group)
+    torch.manual_seed(194)
+    dtype = torch.bfloat16
+    ratio = 8
+    q = torch.randn(1, 137, ratio * 2, 512, device="cuda", dtype=dtype)
+    k, v = [
+        torch.randn(1, 149, 2, 512, device="cuda", dtype=dtype) for _ in range(2)
+    ]
+    opts = {
+        "causal": True,
+        "softcap": 12.0,
+        "window_size_left": 32,
+        "window_size_right": 48,
+    }
+    out, lse, *_ = _flash_attn_fwd(q, k, v, return_lse=True, **opts)
+    dout = torch.randn_like(out)
+    cache = native._native_cache
+    seen = []
+
+    class CheckedCache:
+        def __contains__(self, key):
+            return key in cache
+
+        def __setitem__(self, key, value):
+            cache[key] = value
+
+        def __getitem__(self, key):
+            compiled = cache[key]
+            mode = key[1]
+            target = ("dq", "dk", "dv").index(mode)
+
+            def checked(*args):
+                outputs = args[6:9]
+                if mode == "dq":
+                    for idx, tensor in enumerate(outputs):
+                        tensor.fill_(-17.0 - idx)
+                saved = {
+                    idx: tensor.clone()
+                    for idx, tensor in enumerate(outputs)
+                    if idx != target
+                }
+                result = compiled(*args)
+                for idx, expected in saved.items():
+                    torch.testing.assert_close(outputs[idx], expected, atol=0, rtol=0)
+                seen.append(mode)
+                return result
+
+            return checked
+
+    monkeypatch.setattr(native, "_native_cache", CheckedCache())
+    actual = _flash_attn_bwd(q, k, v, out, dout, lse, **opts)
+    assert seen == ["dq", "dk", "dv"]
+
+    qr, kr, vr = [x.double().requires_grad_() for x in (q, k, v)]
+    exact_out, _ = reference(
+        qr, kr, vr, causal=True, softcap=12.0, window=(32, 48)
+    )
+    exact = torch.autograd.grad(exact_out, (qr, kr, vr), dout.double())
+    qe, ke, ve = [x.detach().requires_grad_() for x in (q, k, v)]
+    eager_out, _ = attention_ref(
+        qe,
+        ke,
+        ve,
+        causal=True,
+        softcap=12.0,
+        window_size=(32, 48),
+        upcast=False,
+    )
+    eager = torch.autograd.grad(eager_out, (qe, ke, ve), dout)
+    for name, result, expected, eager_result in zip(
+        ("dq", "dk", "dv"), actual, exact, eager
+    ):
+        check_grouped_error(name, result, expected, eager_result, dtype)
+    torch.cuda.synchronize()
