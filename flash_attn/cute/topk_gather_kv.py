@@ -18,6 +18,9 @@ import math
 @dataclass
 class CpasyncGatherKVManager(ParamsBase):
     mIndexTopk: cute.Tensor
+    # Token-pair tiles: the paired token's list over the same union slots. Gather rows come
+    # from max(own, peer) (-1 marks a non-member slot); the validity bitmask uses own only.
+    mIndexTopkPeer: Optional[cute.Tensor]
     sBitmask: Optional[cute.Tensor]
 
     cta_rank_in_cluster: Int32
@@ -69,6 +72,7 @@ class CpasyncGatherKVManager(ParamsBase):
         disable_bitmask: cutlass.Constexpr[Boolean] = False,
         sBitmask: Optional[cute.Tensor] = None,
         pipeline_bitmask: Optional[pipeline.PipelineAsync] = None,
+        mIndexTopkPeer: Optional[cute.Tensor] = None,
     ):
         assert tile_n % num_threads == 0
         assert num_threads == 128
@@ -107,6 +111,7 @@ class CpasyncGatherKVManager(ParamsBase):
 
         return CpasyncGatherKVManager(
             mIndexTopk,
+            mIndexTopkPeer,
             sBitmask,
             cta_rank_in_cluster,
             thread_idx,
@@ -154,6 +159,8 @@ class CpasyncGatherKVManager(ParamsBase):
             #     row = row % self.tile_n
             row_idx = n_block * self.tile_n + row
             rTopk[i] = self.mIndexTopk[row_idx]
+            if const_expr(self.mIndexTopkPeer is not None):
+                rTopk[i] = max(rTopk[i], self.mIndexTopkPeer[row_idx])
 
             if const_expr(not transpose and not self.disable_bitmask):
                 row_non_interleaved = i * self.num_threads + self.thread_idx
