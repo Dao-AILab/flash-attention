@@ -56,6 +56,7 @@ from flash_attn.cute.flash_fwd_mla_sm100 import FlashAttentionMLAForwardSm100
 from flash_attn.cute.prepare_scheduler import FlashPrepareScheduler, SchedulerMetadataTensorsTorch
 from flash_attn.cute.cu_blocks_kernel import CuSeqlensToBlocksKernel, CuBlocksToBatchKernel
 from flash_attn.cute.flash_bwd_mla_sm100 import FlashAttentionSparseMLABackwardSm100
+from flash_attn.cute.pack_gqa import sparse_mla_qhead_tile
 from flash_attn.cute.flash_bwd_mla_dq_dqv_sm100 import dQdQvGemmKernel
 from flash_attn.cute.flash_bwd_mla_dk_sm100 import dKGemmKernel
 
@@ -696,6 +697,14 @@ def _flash_attn_fwd(
     if softcap == 0.0:
         softcap = None
     qhead_per_kvhead = num_head // num_head_kv
+    # Sparse MLA pads the heads to the 128-row tile (see pack_gqa.padded_qheads_tma_source);
+    # the kernel takes the real count and rounds the same way, the interface needs the tile
+    # width for its grid math.
+    nheads_per_kv = qhead_per_kvhead
+    if qv is not None and gather_kv_indices is not None and qhead_per_kvhead < 128:
+        assert num_head_kv == 1, "sparse MLA requires a single KV head"
+        qhead_per_kvhead = sparse_mla_qhead_tile(qhead_per_kvhead)
+        pack_gqa = True
     if pack_gqa is None:
         pack_gqa = qhead_per_kvhead > 1
 
@@ -1127,6 +1136,7 @@ def _flash_attn_fwd(
         head_dim,
         head_dim_v,
         qhead_per_kvhead,
+        nheads_per_kv,
         causal,
         score_mod_hash,
         mask_mod_hash,
@@ -1318,7 +1328,7 @@ def _flash_attn_fwd(
                     topk_length=gather_kv_length,
                     is_topk_gather=sparse_kv,
                     pack_gqa=pack_gqa,
-                    qhead_per_kvhead=qhead_per_kvhead,
+                    qhead_per_kvhead=nheads_per_kv,
                     nheads_kv=num_head_kv,
                     has_seqused_q=seqused_q is not None,
                     has_cu_seqlens_q=cu_seqlens_q is not None,
@@ -2743,7 +2753,11 @@ def _flash_attn_bwd_sparse_mla(
     nheads_kv, head_dim_v = v.shape[-2:]
     qhead_per_kvhead = nheads // nheads_kv
     gather_kv_length = gather_kv_indices.shape[-1]
-    assert nheads_kv == 1 and qhead_per_kvhead == 128, f"sparse MLA bwd: only MQA 128 supported for now"
+    assert nheads_kv == 1, "sparse MLA bwd: MQA only"
+    # Backward head padding: see pack_gqa.padded_qheads_tma_source. The kernel takes the real
+    # count; the interface needs the tile width for the dPsum/scaleP buffers.
+    qhead_tile = sparse_mla_qhead_tile(qhead_per_kvhead, min_tile=64)
+    pad_qheads = qhead_tile != qhead_per_kvhead
     assert gather_kv_length % 128 == 0, f"sparse MLA bwd: {gather_kv_length=} must be divisible by 128"
     assert deterministic is False, "sparse MLA bwd: deterministic mode not yet supported"
     assert seqused_q is None and seqused_k is None, "sparse MLA bwd: seqused_q,k not yet supported"
@@ -2811,6 +2825,9 @@ def _flash_attn_bwd_sparse_mla(
 
     device = v.device
     dtype = v.dtype
+    # The dK kernel is bf16-only (flash_bwd_mla_dk_sm100.ab_dtype); fail before launching
+    # the preprocess and main backward instead of mid-way through.
+    assert k is None or dtype == torch.bfloat16, "sparse MLA dK requires bfloat16"
     if q is not None:
         _validate_tensor(dq, "dq", q.shape, dtype, device)
     if k is not None:
@@ -2819,26 +2836,28 @@ def _flash_attn_bwd_sparse_mla(
     _validate_tensor(dqv, "dqv", qv.shape, dtype, device)
     _validate_tensor(p, "p", p_shape, dtype, device)
 
-    if cu_seqlens_q is None:
-        dpsum = torch.empty(batch_size, seqlen_q, nheads, dtype=torch.float32, device=device)
-    else:
-        dpsum = torch.empty(total_q, nheads, dtype=torch.float32, device=device)
-    scale_p = torch.empty_like(row_max)
+    # Finite tile-width padding: see pack_gqa.padded_qheads_tma_source.
+    heads_shape = (batch_size, seqlen_q) if cu_seqlens_q is None else (total_q,)
+    alloc = torch.zeros if pad_qheads else torch.empty
+    dpsum = alloc(*heads_shape, qhead_tile, dtype=torch.float32, device=device)
+    scale_p = alloc(*row_max.shape[:-1], qhead_tile, dtype=torch.float32, device=device)
 
     dtype = torch2cute_dtype_map[dout.dtype]
 
     # Preprocess kernel: compute (o * dout).sum(dim=-1), scale_p.
+    # Padded counts use trivial packing: not all head counts divide the 128-row tile.
+    # Non-power-of-two tiles (e.g. 48 rows for 24 heads) produced incorrect dpsum.
     _bwd_preprocess(
-        out, dout, dpsum, lse, None, None,
+        out, dout, dpsum[..., :nheads], lse, None, None,
         cu_seqlens_q, seqused_q, None,
         dtype, head_dim, head_dim_v, m_block_size,
         row_max=row_max,
-        scale_p=scale_p,
+        scale_p=scale_p[..., :nheads],
         use_padded_offsets=False,
         nheads_major=True,
         pack_gqa=True,
-        qhead_per_kvhead=qhead_per_kvhead,
-        nheads_kv=nheads_kv,
+        qhead_per_kvhead=1 if pad_qheads else qhead_per_kvhead,
+        nheads_kv=nheads if pad_qheads else nheads_kv,
         softmax_scale=softmax_scale,
         fake_mode=fake_mode,
     )
@@ -2945,7 +2964,12 @@ def _flash_attn_bwd_sparse_mla(
     
     # return dk, dv in float32: all-reduce across sequence-parallel ranks must happen
     # before downcasting to avoid rounding error during inter-rank grad accumulation
-    dsink = _bwd_dsink_reduce(dpsum, lse, learnable_sink) if learnable_sink is not None else None
+    # dpsum is tile-width when heads are padded; the reducer pairs it with the real-head lse.
+    dsink = (
+        _bwd_dsink_reduce(dpsum[..., :nheads], lse, learnable_sink)
+        if learnable_sink is not None
+        else None
+    )
     return dq, dk, dv, dqv, dsink
 
 _flash_attn_bwd_sparse_mla.compile_cache = get_jit_cache("bwd_dsa")
