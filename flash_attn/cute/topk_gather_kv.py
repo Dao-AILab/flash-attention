@@ -17,7 +17,26 @@ import math
 
 @dataclass
 class CpasyncGatherKVManager(ParamsBase):
+    """Gathers the K/V rows of one top-k list into shared memory with cp.async.
+
+    .. note:: Token-pair gather (sparse MLA, ``gather_kv_token_pairs``).
+        Two 64-head tokens, ``2p`` and ``2p+1``, share one 128-row tile and one gather list.
+        Their rows of ``gather_kv_indices`` hold the same union list (sorted, padded to a
+        multiple of 128) with ``-1`` at the slots that token does not attend. Because ``-1``
+        is the minimum, ``max(own, peer)`` recovers the union without a third tensor: the
+        gather loads ``max(own, peer)`` while the validity bitmask uses ``own``, so each
+        token's rows are masked to its own selection by the existing mask path. The gather
+        predicate uses ``seqlen_k_limit_gather`` (the later token's causal limit) because the
+        two CTAs load disjoint halves of the shared block; the bitmask keeps the per-token
+        limit. Forward: the CTA rank selects the token (``m_idx = 2 * cluster_m_block +
+        rank``, peer ``m_idx ^ 1``). Backward: P and dS are already 0 at a token's
+        non-member slots, so the 128-row tile (tokens 2p, 2p+1) and the dQ/dQv/dK GEMMs
+        over the ``(b, s/2, 2H, x)`` view need no per-token mask. H < 64 pads to the 64-row
+        half-tile (see ``pack_gqa.qheads_first_tma_view``). Non-varlen only.
+    """
+
     mIndexTopk: cute.Tensor
+    mIndexTopkPeer: Optional[cute.Tensor]  # paired token's list; see the class note
     sBitmask: Optional[cute.Tensor]
 
     cta_rank_in_cluster: Int32
@@ -26,6 +45,7 @@ class CpasyncGatherKVManager(ParamsBase):
 
     topk_length: Int32
     seqlen_k_limit: Int32
+    seqlen_k_limit_gather: Int32  # later token's limit for token pairs; see the class note
     tile_n: Int32
     num_threads: cutlass.Constexpr[Int32]
     hdim: cutlass.Constexpr[Int32]
@@ -69,7 +89,11 @@ class CpasyncGatherKVManager(ParamsBase):
         disable_bitmask: cutlass.Constexpr[Boolean] = False,
         sBitmask: Optional[cute.Tensor] = None,
         pipeline_bitmask: Optional[pipeline.PipelineAsync] = None,
+        mIndexTopkPeer: Optional[cute.Tensor] = None,
+        seqlen_k_limit_gather: Optional[Int32] = None,
     ):
+        if seqlen_k_limit_gather is None:
+            seqlen_k_limit_gather = seqlen_k_limit
         assert tile_n % num_threads == 0
         assert num_threads == 128
         assert hdim % 64 == 0
@@ -107,12 +131,14 @@ class CpasyncGatherKVManager(ParamsBase):
 
         return CpasyncGatherKVManager(
             mIndexTopk,
+            mIndexTopkPeer,
             sBitmask,
             cta_rank_in_cluster,
             thread_idx,
             warp_idx,
             topk_length,
             seqlen_k_limit,
+            seqlen_k_limit_gather,
             tile_n,
             num_threads,
             hdim,
@@ -154,6 +180,8 @@ class CpasyncGatherKVManager(ParamsBase):
             #     row = row % self.tile_n
             row_idx = n_block * self.tile_n + row
             rTopk[i] = self.mIndexTopk[row_idx]
+            if const_expr(self.mIndexTopkPeer is not None):
+                rTopk[i] = max(rTopk[i], self.mIndexTopkPeer[row_idx])
 
             if const_expr(not transpose and not self.disable_bitmask):
                 row_non_interleaved = i * self.num_threads + self.thread_idx
@@ -206,7 +234,7 @@ class CpasyncGatherKVManager(ParamsBase):
         for i in cutlass.range_constexpr(entries_per_thread):
             topk_idx = rTopk[i]
             if const_expr(not self.disable_bitmask):
-                row_valid = topk_idx >= 0 and topk_idx < self.seqlen_k_limit
+                row_valid = topk_idx >= 0 and topk_idx < self.seqlen_k_limit_gather
                 tPrRowValid[i] = row_valid
             if const_expr(not transpose):
                 tPrXPtr[i] = utils.elem_pointer(mX, (topk_idx, d_offset)).toint()
