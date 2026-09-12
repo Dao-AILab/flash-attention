@@ -20,7 +20,15 @@ from flash_attn.cute.cache_utils import get_jit_cache
 
 class NativeD512DqDk:
     def __init__(
-        self, mode, causal=False, softcap=0.0, window=(-1, -1), maxsq=None, maxsk=None, head_group=1
+        self,
+        mode,
+        causal=False,
+        softcap=0.0,
+        window=(-1, -1),
+        maxsq=None,
+        maxsk=None,
+        head_group=1,
+        head_major=False,
     ):
         self.mode = mode
         self.causal = causal
@@ -31,6 +39,7 @@ class NativeD512DqDk:
         self.maxsk = maxsk
         self.threads = 256
         self.head_group = head_group if mode != "dq" else 1
+        self.head_major = head_major
 
     @cute.jit
     def __call__(
@@ -386,8 +395,15 @@ class NativeD512DqDk:
             if const_expr(self.causal):
                 tile = cute.ceil_div(maxsq, 128) - 1 - tile
         else:
-            by = (bx // 2) % (q.shape[2] // self.head_group)
-            tile = (bx // 2) // (q.shape[2] // self.head_group)
+            # Head-major order reuses long dense Q/dO working sets across key tiles.
+            # Keep the original order for smaller grids that regress with head-major scheduling.
+            if const_expr(self.head_major):
+                tiles = cute.ceil_div(k.shape[1], 128)
+                tile = (bx // 2) % tiles
+                by = (bx // 2) // tiles
+            else:
+                by = (bx // 2) % (q.shape[2] // self.head_group)
+                tile = (bx // 2) // (q.shape[2] // self.head_group)
         ratio = q.shape[2] // k.shape[2]
         sq = q.shape[1]
         sk = k.shape[1]
@@ -1012,7 +1028,15 @@ class NativeD512DqDk:
 
 class NativeD512Dv(NativeD512DqDk):
     def __init__(
-        self, mode, causal=False, softcap=0.0, window=(-1, -1), maxsq=None, maxsk=None, head_group=1
+        self,
+        mode,
+        causal=False,
+        softcap=0.0,
+        window=(-1, -1),
+        maxsq=None,
+        maxsk=None,
+        head_group=1,
+        head_major=False,
     ):
         self.mode = mode
         self.causal = causal
@@ -1023,6 +1047,7 @@ class NativeD512Dv(NativeD512DqDk):
         self.maxsk = maxsk
         self.threads = 256
         self.head_group = head_group if mode != "dq" else 1
+        self.head_major = head_major
         # A smaller query tile reduces resource pressure for noncausal DV.
         # Causal attention retains the wider tile to amortize traversal costs.
         self.query_tile = 256 if causal else 128
@@ -1218,8 +1243,15 @@ class NativeD512Dv(NativeD512DqDk):
         tid, _, _ = cute.arch.thread_idx()
         bx, by, batch = cute.arch.block_idx()
         rank = cute.arch.make_warp_uniform(cute.arch.block_idx_in_cluster())
-        by = (bx // 2) % (q.shape[2] // self.head_group)
-        tile = (bx // 2) // (q.shape[2] // self.head_group)
+        # Head-major order reuses long dense Q/dO working sets across key tiles.
+        # Keep the original order for smaller grids that regress with head-major scheduling.
+        if const_expr(self.head_major):
+            tiles = cute.ceil_div(k.shape[1], 128)
+            tile = (bx // 2) % tiles
+            by = (bx // 2) // tiles
+        else:
+            by = (bx // 2) % (q.shape[2] // self.head_group)
+            tile = (bx // 2) // (q.shape[2] // self.head_group)
         ratio = q.shape[2] // k.shape[2]
         sq = q.shape[1]
         sk = k.shape[1]
@@ -1831,6 +1863,21 @@ def backward_sm100_d512(
     maxsq = maxsq if isinstance(maxsq, int) else tensors[0].shape[1]
     maxsk = maxsk if isinstance(maxsk, int) else tensors[1].shape[1]
     window = tuple(-1 if x is None else x for x in (window_left, window_right))
+    # Evaluate scheduling policy in Python: long BoolOp chains expand heavily
+    # in CuTeDSL preprocessing, even when their inputs are compile-time constants.
+    key_tiles = (tensors[1].shape[1] + 127) // 128
+    scheduled_heads = hq // head_group
+    head_major = (
+        not causal
+        and all(x is None for x in metadata)
+        and tensors[0].shape[1] == tensors[1].shape[1]
+        and window[0] < 0
+        and window[1] < 0
+        and maxsk == tensors[1].shape[1]
+        and key_tiles >= 32
+        and scheduled_heads >= 4
+        and key_tiles * scheduled_heads >= 256
+    )
     signature = tuple(_tensor_signature(t) for t in (*tensors, *metadata))
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     for mode in ("dq", "dk", "dv"):
@@ -1839,7 +1886,14 @@ def backward_sm100_d512(
             args = [from_dlpack(t.detach(), assumed_align=16) for t in tensors]
             meta = [from_dlpack(t, assumed_align=4) if t is not None else None for t in metadata]
             kernel = (NativeD512Dv if mode == "dv" else NativeD512DqDk)(
-                mode, causal, softcap, window, maxsq, maxsk, head_group=head_group
+                mode,
+                causal,
+                softcap,
+                window,
+                maxsq,
+                maxsk,
+                head_group=head_group,
+                head_major=head_major,
             )
             _native_cache[key] = cute.compile(
                 kernel,

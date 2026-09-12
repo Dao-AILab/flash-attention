@@ -799,15 +799,24 @@ def test_fused_forward_persistent_cache(tmp_path, monkeypatch, dtype, return_lse
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("ratio", [1, 2])
-@pytest.mark.parametrize("causal", [False, True])
-def test_native_gradient_write_isolation(dtype, ratio, causal, monkeypatch):
+@pytest.mark.parametrize(
+    "batch,seq,hq,hk,causal,maxsk",
+    [
+        (2, 257, 2, 2, False, None),
+        (2, 257, 2, 2, True, None),
+        (2, 257, 4, 2, False, None),
+        (2, 257, 4, 2, True, None),
+        (1, 4103, 8, 2, False, None),
+        (1, 4096, 8, 2, False, 4224),
+    ],
+)
+def test_native_gradient_write_isolation(dtype, batch, seq, hq, hk, causal, maxsk, monkeypatch):
     """A gradient kernel must not write another kernel's output buffer."""
     from flash_attn.cute import flash_bwd_sm100_hd512 as native
 
     torch.manual_seed(921)
-    q = torch.randn(2, 257, 2 * ratio, 512, device="cuda", dtype=dtype)
-    k, v = [torch.randn(2, 257, 2, 512, device="cuda", dtype=dtype) for _ in range(2)]
+    q = torch.randn(batch, seq, hq, 512, device="cuda", dtype=dtype)
+    k, v = [torch.randn(batch, seq, hk, 512, device="cuda", dtype=dtype) for _ in range(2)]
     out, lse, _, _ = _flash_attn_fwd(q, k, v, causal=causal, return_lse=True)
     dout = torch.randn_like(out)
     cache = native._native_cache
@@ -846,7 +855,9 @@ def test_native_gradient_write_isolation(dtype, ratio, causal, monkeypatch):
             return checked
 
     monkeypatch.setattr(native, "_native_cache", CheckedCache())
-    actual = _flash_attn_bwd(q, k, v, out, dout, lse, causal=causal)
+    actual = _flash_attn_bwd(
+        q, k, v, out, dout, lse, causal=causal, max_seqlen_k=maxsk
+    )
     assert seen == ["dq", "dk", "dv"]
     qr, kr, vr = [x.double().requires_grad_() for x in (q, k, v)]
     ref, _ = reference(qr, kr, vr, causal=causal)
