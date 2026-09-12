@@ -3495,6 +3495,109 @@ def test_flash_attn_mla_sparse_bwd_sentinel(seqlen_q, seqlen_k, nheads, shared_k
         check_tensor_vs_ref("dQv(prealloc)", dqv2, dqv_ref, dqv_pt)
 
 
+def pair_union_indices(idx, pad_to=128):
+    """Per-token lists [B, T, K] (-1 padded) -> the token-pair gather contract: rows 2p and
+    2p+1 both hold sorted(unique(idx[2p] | idx[2p+1])) padded to a multiple of ``pad_to``,
+    with -1 at the slots that token does not attend."""
+    batch, seqlen, _ = idx.shape
+    assert seqlen % 2 == 0
+    a, b = idx[:, 0::2], idx[:, 1::2]
+    both, _ = torch.cat([a, b], dim=-1).sort(dim=-1)
+    dup = torch.zeros_like(both, dtype=torch.bool)
+    dup[..., 1:] = both[..., 1:] == both[..., :-1]
+    valid = (both >= 0) & ~dup
+    sentinel = torch.iinfo(torch.int32).max
+    union, _ = torch.where(valid, both, torch.full_like(both, sentinel)).sort(dim=-1)
+    # Static width (2K rounded up) keeps the helper usable under FakeTensorMode.
+    union_len = -(-both.shape[-1] // pad_to) * pad_to
+    union = union[..., :union_len]
+    union = torch.where(union == sentinel, torch.full_like(union, -1), union)
+
+    def view(tok):
+        member = ((union.unsqueeze(-1) == tok.unsqueeze(-2)) & (tok >= 0).unsqueeze(-2)).any(-1)
+        return torch.where(member & (union >= 0), union, torch.full_like(union, -1))
+
+    out = torch.empty(batch, seqlen, union_len, dtype=torch.int32, device=idx.device)
+    out[:, 0::2], out[:, 1::2] = view(a), view(b)
+    return out
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("shared_kv", [False, True])
+@pytest.mark.parametrize("nheads", [64, 32, 16])
+@pytest.mark.parametrize("seqlen_q,seqlen_k", [(256, 512), (1024, 1024)])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_mla_sparse_token_pairs(seqlen_q, seqlen_k, nheads, shared_kv, causal, dtype):
+    """Token-pair gather: two <=64-head tokens per 128-row tile sharing one union gather list.
+
+    The kernel gets the pair-union contract (`pair_union_indices`); the reference and the
+    padded single-token path get the original per-token lists, so this checks both the
+    masking of non-member slots and, with causal=True, that a union row valid only for the
+    later token of the pair is still gathered (the two CTAs load disjoint halves of the
+    shared block). fwd + bwd, H < 64 composes with in-kernel head padding to 64.
+    """
+    if not IS_SM100:
+        pytest.skip()
+    device = "cuda"
+    torch.random.manual_seed(0)
+    batch_size = 2
+    nheads_kv, hdim, hdimv = 1, 64, 512
+    topk_len = 128
+
+    q_ref = torch.randn(batch_size, seqlen_q, nheads, hdim, device=device, dtype=dtype).requires_grad_()
+    k_ref = torch.randn(batch_size, seqlen_k, nheads_kv, hdim, device=device, dtype=dtype).requires_grad_()
+    v_ref = torch.randn(batch_size, seqlen_k, nheads_kv, hdimv, device=device, dtype=dtype).requires_grad_()
+    qv_ref = torch.randn(batch_size, seqlen_q, nheads, hdimv, device=device, dtype=dtype).requires_grad_()
+    gather_kv_indices = causal_topk_indices(batch_size, seqlen_q, seqlen_k, topk_len, device)
+    pair_indices = pair_union_indices(gather_kv_indices)
+    assert pair_indices.shape[-1] > topk_len, "pairs must actually widen the gather list"
+
+    q, k, v, qv = [x.detach().clone().requires_grad_() for x in (q_ref, k_ref, v_ref, qv_ref)]
+    if shared_kv:
+        q, k, qv = qv, v, None
+        q_ref, k_ref, qv_ref = qv_ref, v_ref, None
+
+    out_ref, _ = attention_ref(
+        q_ref, k_ref, v_ref, causal=causal, qv=qv_ref, gather_kv_indices=gather_kv_indices
+    )
+    out_pt, _ = attention_ref(
+        q_ref, k_ref, v_ref, causal=causal, qv=qv_ref, gather_kv_indices=gather_kv_indices,
+        upcast=False, reorder_ops=True,
+    )
+    out, lse = flash_attn_func(
+        q, k, v, qv=qv, gather_kv_indices=pair_indices, causal=causal, pack_gqa=True,
+        gather_kv_token_pairs=True,
+    )
+
+    g = torch.randn_like(out)
+    if shared_kv:
+        dq, dk = torch.autograd.grad(out, (q, k), g)
+        dv = dqv = None
+    else:
+        dq, dk, dv, dqv = torch.autograd.grad(out, (q, k, v, qv), g)
+
+    if is_fake_mode():
+        return
+
+    fwd_atol = 2 * (out_ref + 0.3 - 0.3 - out_ref).abs().max().item()
+    assert (out - out_ref).abs().max().item() <= 2 * (out_pt - out_ref).abs().max().item() + fwd_atol
+    assert not torch.isnan(lse).any(), "LSE contains NaN"
+
+    if shared_kv:
+        dq_ref, dk_ref = torch.autograd.grad(out_ref, (q_ref, k_ref), g)
+        dq_pt, dk_pt = torch.autograd.grad(out_pt, (q_ref, k_ref), g)
+        dv_ref = dqv_ref = dv_pt = dqv_pt = None
+    else:
+        dq_ref, dk_ref, dv_ref, dqv_ref = torch.autograd.grad(out_ref, (q_ref, k_ref, v_ref, qv_ref), g)
+        dq_pt, dk_pt, dv_pt, dqv_pt = torch.autograd.grad(out_pt, (q_ref, k_ref, v_ref, qv_ref), g)
+
+    check_tensor_vs_ref("dQ", dq, dq_ref, dq_pt)
+    check_tensor_vs_ref("dK", dk, dk_ref, dk_pt)
+    check_tensor_vs_ref("dV", dv, dv_ref, dv_pt)
+    check_tensor_vs_ref("dQv", dqv, dqv_ref, dqv_pt)
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("shared_kv", [False, True])
