@@ -3376,11 +3376,15 @@ def check_canary(name, parent, pad_words):
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("shared_kv", [False, True])
+@pytest.mark.parametrize("nheads", [128, 64, 96, 24, 1])
 @pytest.mark.parametrize("seqlen_q,seqlen_k", [(512, 512), (1024, 1024)])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_flash_attn_mla_sparse_bwd_sentinel(seqlen_q, seqlen_k, shared_kv, causal, dtype):
+def test_flash_attn_mla_sparse_bwd_sentinel(seqlen_q, seqlen_k, nheads, shared_kv, causal, dtype):
     """Sparse-MLA backward with -1-padded gather_kv_indices, the padding any
     causal top-k selector produces for early queries.
+
+    nheads < 128 covers in-kernel head padding (pack_gqa.padded_qheads_tma_source):
+    96 pads to 128 with a partial second CTA, 24 and 1 pad to the 64-head bwd tile.
 
     Regression test for unguarded sentinel scatters: the dV/dK backward
     epilogues used to atomically accumulate at row -1 — out of bounds of the
@@ -3396,7 +3400,7 @@ def test_flash_attn_mla_sparse_bwd_sentinel(seqlen_q, seqlen_k, shared_kv, causa
     device = "cuda"
     torch.random.manual_seed(0)
     batch_size = 2
-    nheads, nheads_kv, hdim, hdimv = 128, 1, 64, 512
+    nheads_kv, hdim, hdimv = 1, 64, 512
     topk_len = 256
 
     q_ref = torch.randn(batch_size, seqlen_q, nheads, hdim, device=device, dtype=dtype).requires_grad_()

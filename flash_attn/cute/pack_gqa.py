@@ -40,6 +40,50 @@ def pack_gqa_layout(T, qhead_per_kvhead, nheads_kv, head_idx):
     return cute.make_tensor(T.iterator, cute.make_layout(shape_packed, stride=stride_packed))
 
 
+def _heads_first_order(T, head_idx):
+    """Mode permutation swapping the seqlen mode (0) with the head mode; its own inverse."""
+    return [head_idx, *range(1, head_idx), 0, *range(head_idx + 1, cute.rank(T))]
+
+
+def padded_qheads_tma_source(T, qhead_per_kvhead_valid, head_idx):
+    """Return a heads-first TMA source with a dynamic extent equal to the real head count.
+
+    .. note:: In-kernel Q-head padding (sparse MLA).
+        MQA only. Each tile covers one token and one top-k gather list: 128 heads in
+        forward and dQ/dQv, 64 or 128 in backward. The heads-first view
+        ``(nheads, ..., seqlen, ...)`` has a dynamic head extent so CuTe can tile it
+        without requiring divisibility. TMA zero-fills out-of-bounds loads and drops
+        out-of-bounds stores, avoiding padded operand copies in global memory.
+        ``regroup_padded_qheads`` folds the TMA coordinate tensor into the packed
+        ``(qhead, seqlen)`` layout. Non-TMA LSE, row_max, and learnable-sink accesses
+        need head guards: the hierarchical packed layout wraps padded heads into
+        the next token. The caller allocates dPsum/scaleP at tile width with finite
+        padding. TMA loads zero padded Q rows in forward and dO/P rows in backward.
+        These rows produce dS = 0 and contribute nothing to dK/dV.
+    """
+    T = cute.make_tensor(T.iterator, cute.select(T.layout, mode=_heads_first_order(T, head_idx)))
+    shape = (cutlass.Int32(qhead_per_kvhead_valid), *T.shape[1:])
+    return cute.make_tensor(T.iterator, cute.make_layout(shape, stride=T.stride))
+
+
+def regroup_padded_qheads(tma_tensor, qhead_per_kvhead, head_idx):
+    """Fold a ``padded_qheads_tma_source`` coordinate tensor into the pack-GQA layout
+    ``((qhead_per_kvhead, seqlen), ..., 1, ...)``: ``pack_gqa_layout`` with the tile's head
+    count, after undoing the heads-first permutation.
+
+    Not ``pack_gqa_layout`` itself: its KV-head stride ``head_stride * qhead_per_kvhead``
+    scales a TMA basis stride, which the DSL fails to lower (ICE). The size-1 KV-head mode
+    reuses the head basis instead.
+    """
+    T = tma_tensor
+    order = _heads_first_order(T, head_idx)
+    shape = [T.shape[i] for i in order]
+    stride = [T.stride[i] for i in order]
+    shape[0], stride[0] = (qhead_per_kvhead, shape[0]), (stride[head_idx], stride[0])
+    shape[head_idx] = 1
+    return cute.make_tensor(T.iterator, cute.make_layout(tuple(shape), stride=tuple(stride)))
+
+
 def make_packgqa_tiled_tma_atom(
     op: cute.atom.CopyOp,
     gmem_tensor: cute.Tensor,

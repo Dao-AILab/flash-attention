@@ -2,7 +2,7 @@
 
 import math
 import operator
-from typing import Tuple
+from typing import Optional, Tuple
 from dataclasses import dataclass
 
 import cutlass
@@ -23,16 +23,24 @@ def load_learnable_sink(
     packed_row,
     qhead_per_kvhead: cutlass.Constexpr[int],
     pack_gqa: cutlass.Constexpr[bool],
+    qhead_per_kvhead_valid: cutlass.Constexpr[Optional[int]] = None,
 ) -> Float32:
     """Load the sink logit for one output row; see `apply_learnable_sink`.
 
     With pack_gqa the M tile interleaves the Q heads of one KV head, so `head_idx` is the KV
     head and the Q head is `packed_row % qhead_per_kvhead`; otherwise `head_idx` is already
     the Q head and `packed_row` is ignored.
+    Padded Q heads get -inf (no sink); see `pack_gqa.padded_qheads_tma_source`.
     """
     if cutlass.const_expr(not pack_gqa):
         return Float32(learnable_sink[head_idx])
-    return Float32(learnable_sink[head_idx * qhead_per_kvhead + packed_row % qhead_per_kvhead])
+    if cutlass.const_expr(qhead_per_kvhead_valid is None):
+        qhead_per_kvhead_valid = qhead_per_kvhead
+    qhead = packed_row % qhead_per_kvhead
+    sink_val = -Float32.inf
+    if qhead < qhead_per_kvhead_valid:
+        sink_val = Float32(learnable_sink[head_idx * qhead_per_kvhead_valid + qhead])
+    return sink_val
 
 
 @cute.jit
