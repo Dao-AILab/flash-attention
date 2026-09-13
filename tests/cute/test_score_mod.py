@@ -1085,6 +1085,19 @@ def test_sm90_block_sparse_score_mod_backward_with_dq_swapab():
     ).abs().max().item() + dv_atol
 
 
+@pytest.mark.skipif(COMPUTE_CAPABILITY != 9, reason="SM90-only test")
+def test_sm90_hdim256_mha_backward_uses_two_stage_dkv_pipeline():
+    mha_cfg = _tile_size_bwd_sm90(256, 256, causal=False, local=False, qhead_per_kvhead=1)
+    assert (mha_cfg.m_block_size, mha_cfg.n_block_size) == (64, 48)
+    assert mha_cfg.num_stages_Q == 2
+    assert mha_cfg.dKV_swapAB
+
+    gqa_cfg = _tile_size_bwd_sm90(256, 256, causal=False, local=False, qhead_per_kvhead=2)
+    assert (gqa_cfg.m_block_size, gqa_cfg.n_block_size) == (64, 64)
+    assert gqa_cfg.num_stages_Q == 1
+    assert not gqa_cfg.dKV_swapAB
+
+
 @pytest.mark.parametrize(
     "seqlen_q,seqlen_kv",
     [
