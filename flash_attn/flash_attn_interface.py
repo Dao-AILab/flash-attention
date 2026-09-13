@@ -28,6 +28,12 @@ def maybe_contiguous(x):
     return x.contiguous() if x is not None and x.stride(-1) != 1 else x
 
 
+def _empty_like_lastdim_contiguous(x):
+    # CUDA backward requires stride(-1) == 1, but supported outer strides should be preserved.
+    memory_format = torch.preserve_format if x.stride(-1) == 1 else torch.contiguous_format
+    return torch.empty_like(x, memory_format=memory_format)
+
+
 def _get_block_size_n(device, head_dim, is_dropout, is_causal):
     # This should match the block sizes in the CUDA kernel
     assert head_dim <= 256
@@ -689,7 +695,7 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dout, *args):
         q, k, v, out, softmax_lse, rng_state = ctx.saved_tensors
-        dq = torch.empty_like(q)
+        dq = _empty_like_lastdim_contiguous(q)
         kv_shape = k.shape[:-2] + (2, *k.shape[-2:])
         dkv = torch.empty(kv_shape, dtype=k.dtype, device=k.device)
         head_size_og = dout.size(3)
@@ -789,7 +795,7 @@ class FlashAttnVarlenKVPackedFunc(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dout, *args):
         q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state = ctx.saved_tensors
-        dq = torch.empty_like(q)
+        dq = _empty_like_lastdim_contiguous(q)
         kv_shape = k.shape[:-2] + (2, *k.shape[-2:])
         dkv = torch.empty(kv_shape, dtype=k.dtype, device=k.device)
         head_size_og = dout.size(2)
@@ -880,7 +886,7 @@ class FlashAttnFunc(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dout, *args):
         q, k, v, out, softmax_lse, rng_state = ctx.saved_tensors
-        dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+        dq, dk, dv = [_empty_like_lastdim_contiguous(x) for x in (q, k, v)]
         head_size_og = dout.size(3)
         dout_padded = dout
         if head_size_og % 8 != 0:
@@ -981,7 +987,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
     @staticmethod
     def backward(ctx, dout, *args):
         q, k, v, out, softmax_lse, cu_seqlens_q, cu_seqlens_k, rng_state = ctx.saved_tensors
-        dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
+        dq, dk, dv = [_empty_like_lastdim_contiguous(x) for x in (q, k, v)]
         head_size_og = dout.size(2)
         dout_padded = dout
         if head_size_og % 8 != 0:
