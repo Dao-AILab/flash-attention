@@ -313,13 +313,13 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         self.v_major_mode = utils.LayoutEnum.from_tensor(v).mma_major_mode()
         self.dq_layout = utils.LayoutEnum.from_tensor(dq)
 
-        if cutlass.const_expr(self.q_major_mode != tcgen05.OperandMajorMode.K):
+        if cutlass.const_expr(self.q_major_mode != cute.nvgpu.OperandMajorMode.K):
             raise RuntimeError("The layout of q is not supported")
-        if cutlass.const_expr(self.k_major_mode != tcgen05.OperandMajorMode.K):
+        if cutlass.const_expr(self.k_major_mode != cute.nvgpu.OperandMajorMode.K):
             raise RuntimeError("The layout of k is not supported")
-        if cutlass.const_expr(self.v_major_mode != tcgen05.OperandMajorMode.K):
+        if cutlass.const_expr(self.v_major_mode != cute.nvgpu.OperandMajorMode.K):
             raise RuntimeError("The layout of v is not supported")
-        if cutlass.const_expr(self.do_major_mode != tcgen05.OperandMajorMode.K):
+        if cutlass.const_expr(self.do_major_mode != cute.nvgpu.OperandMajorMode.K):
             raise RuntimeError("The layout of v is not supported")
 
         # check type consistency
@@ -335,9 +335,10 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         cta_group = tcgen05.CtaGroup.TWO
         # the intermediate tensor p is from tmem & k-major
         ds_source = tcgen05.OperandSource.TMEM
-        ds_major_mode = tcgen05.OperandMajorMode.K
-        k_trans_major_mode = tcgen05.OperandMajorMode.MN
+        ds_major_mode = cute.nvgpu.OperandMajorMode.K
+        k_trans_major_mode = cute.nvgpu.OperandMajorMode.MN
         qk_tiled_mma = sm100_utils.make_trivial_tiled_mma(
+            self.q_dtype,
             self.q_dtype,
             self.q_major_mode,
             self.k_major_mode,
@@ -347,6 +348,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         )
         dov_tiled_mma = sm100_utils.make_trivial_tiled_mma(
             self.do_dtype,
+            self.do_dtype,
             self.do_major_mode,
             self.v_major_mode,
             self.acc_dtype,
@@ -354,6 +356,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
             self.dov_mma_tiler[:2],
         )
         dsk_tiled_mma = sm100_utils.make_trivial_tiled_mma(
+            self.q_dtype,
             self.q_dtype,
             ds_major_mode,
             k_trans_major_mode,

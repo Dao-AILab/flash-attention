@@ -8,7 +8,7 @@ from cutlass import Int32, const_expr
 
 from flash_attn.cute import utils
 from quack.cute_dsl_utils import ParamsBase
-from cutlass.cute import FastDivmodDivisor
+from cutlass.cute import FastDivmodDivisorV2
 
 import math
 
@@ -20,7 +20,7 @@ class PagedKVManager(ParamsBase):
     mV_paged: cute.Tensor
     thread_idx: Int32
 
-    page_size_divmod: FastDivmodDivisor
+    page_size_divmod: FastDivmodDivisorV2
     seqlen_k: Int32
     leftpad_k: Int32
     n_block_size: Int32
@@ -47,7 +47,7 @@ class PagedKVManager(ParamsBase):
         mPageTable: cute.Tensor,
         mK_paged: cute.Tensor,
         mV_paged: cute.Tensor,
-        page_size_divmod: FastDivmodDivisor,
+        page_size_divmod: FastDivmodDivisorV2,
         bidb: Int32,
         bidh: Int32,
         thread_idx: Int32,

@@ -220,8 +220,9 @@ class FlashAttentionBackwardPostprocess:
             cta_group = tcgen05.CtaGroup.ONE
             tiled_mma = sm100_utils_basic.make_trivial_tiled_mma(
                 self.dtype,
-                tcgen05.OperandMajorMode.MN,  # dS_major_mode
-                tcgen05.OperandMajorMode.MN,  # Kt_major_mode
+                self.dtype,
+                cute.nvgpu.OperandMajorMode.MN,  # dS_major_mode
+                cute.nvgpu.OperandMajorMode.MN,  # Kt_major_mode
                 Float32,
                 cta_group,
                 (self.tile_m, self.tile_hdim),
