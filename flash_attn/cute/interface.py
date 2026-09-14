@@ -2188,7 +2188,11 @@ def _flash_attn_bwd(
     # hd=256 2CTA backward has its own internal postprocess for dK/dV.
     dKV_postprocess = qhead_per_kvhead > 1 and not use_dedicated_hd256_kernel
     if dKV_postprocess:
-        head_dim_v_rounded = (head_dim_v + 32 - 1) // 32 * 32
+        # Same rounding as the kernel's tile_hdimv and the postprocess (64 with dKV_swapAB on
+        # SM90): the GQA epilogue reduces tile_n * tile_hdimv fp32 values per block.
+        head_dim_v_rounded = (
+            (head_dim_v + hdim_multiple_of - 1) // hdim_multiple_of * hdim_multiple_of
+        )
         if cu_seqlens_k is None:
             dk_accum = torch.zeros(
                 batch_size,
