@@ -98,10 +98,13 @@ VERBOSE = True
 
 
 @pytest.mark.skipif(not IS_SM120, reason="SM120-only SplitKV unsupported behavior")
-def test_flash_attn_sm120_rejects_splitkv():
+def test_flash_attn_sm120_num_splits():
     q = torch.randn(1, 16, 4, 64, device="cuda", dtype=torch.bfloat16)
     k = torch.randn(1, 16, 1, 64, device="cuda", dtype=torch.bfloat16)
     v = torch.randn(1, 16, 1, 64, device="cuda", dtype=torch.bfloat16)
+    out = flash_attn_func(q, k, v)
+    out_auto = flash_attn_func(q, k, v, num_splits=0)
+    torch.testing.assert_close(out_auto, out)
     with pytest.raises(AssertionError, match="SM120 forward only supports num_splits=1"):
         flash_attn_func(q, k, v, num_splits=3)
 
