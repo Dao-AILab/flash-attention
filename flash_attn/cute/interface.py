@@ -191,7 +191,9 @@ class BwdConfig:
     dQ_single_wg: bool = False
 
 
-def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q=None):
+def _tile_size_bwd_sm90(
+    head_dim, head_dim_v, causal, local, sparse_block_size_q=None, qhead_per_kvhead=1
+):
     """Return BwdConfig for SM90.
 
     Configs based on C++ FA3 hopper/flash_bwd_launch_template.h,
@@ -247,7 +249,15 @@ def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q
                 num_wg=2,
             )
     else:
-        # hdim 256
+        # MHA hdim 256 benefits from a double-buffered Q pipeline. GQA keeps the
+        # single-stage path because its dKV postprocess does not support dKV_swapAB.
+        if qhead_per_kvhead == 1:
+            return BwdConfig(
+                m_block_size=64, n_block_size=48,
+                num_stages_Q=2, num_stages_dO=1, num_stages_PdS=1,
+                SdP_swapAB=False, dKV_swapAB=True, dQ_swapAB=False,
+                AtomLayoutMSdP=1, AtomLayoutNdKV=1, AtomLayoutMdQ=1,
+            )
         return BwdConfig(
             m_block_size=64, n_block_size=64,
             num_stages_Q=1, num_stages_dO=1, num_stages_PdS=1,
@@ -1972,6 +1982,7 @@ def _flash_attn_bwd(
             causal,
             local,
             sparse_block_size_q=sparse_q,
+            qhead_per_kvhead=num_head // k.shape[-2],
         )
         m_block_size = cfg.m_block_size
         n_block_size = cfg.n_block_size
