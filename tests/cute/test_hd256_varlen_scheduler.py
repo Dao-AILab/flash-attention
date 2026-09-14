@@ -18,8 +18,8 @@ from flash_attn.cute import flash_attn_varlen_func, interface
 from flash_attn.cute.cache_utils import JITCache
 from flash_attn.cute.interface import _flash_attn_bwd, _flash_attn_fwd
 
-USE_FAKE_TENSOR = int(os.getenv("FLASH_ATTENTION_FAKE_TENSOR", 0)) == 1
-RUN_STRESS = int(os.getenv("FLASH_ATTENTION_HD256_STRESS", 0)) == 1
+USE_FAKE_TENSOR = int(os.getenv("FLASH_ATTENTION_FAKE_TENSOR", "0")) == 1
+RUN_STRESS = int(os.getenv("FLASH_ATTENTION_HD256_STRESS", "0")) == 1
 
 pytestmark = [
     pytest.mark.skipif(
@@ -248,7 +248,7 @@ def test_hd256_varlen_maxima_compile_keys(causal, monkeypatch):
         for value in key
     ), "tensor leaked into a compile key"
 
-    for mode, result in by_mode.items():
+    for result in by_mode.values():
         check_against_reference(result, q, k, v, dout, q_lens, k_lens, causal, dtype)
 
 
