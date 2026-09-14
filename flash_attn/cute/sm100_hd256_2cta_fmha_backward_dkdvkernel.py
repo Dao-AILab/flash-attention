@@ -25,7 +25,9 @@ from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass.utils import ClcDynamicPersistentTileScheduler
 from flash_attn.cute.tile_scheduler import (
     SchedulerState,
+    SingleTileVarlenScheduler,
     SM100_TMEM_CAPACITY_COLUMNS,
+    compute_sm100_fmha_varlen_grid,
     make_sm100_thread_cooperative_group as make_thread_cooperative_group,
     Sm100FmhaClcDynamicTileSchedulerParams as FmhaClcDynamicTileSchedulerParams,
     Sm100FmhaClcDynamicTileScheduler as FmhaClcDynamicTileScheduler,
@@ -216,10 +218,12 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         cumulative_s_q: cute.Tensor | None,
         cumulative_s_k: cute.Tensor | None,
         scale_softmax: cutlass.Float32,
+        max_seqlen_k: Int32 | None,
         stream: cuda.CUstream,
     ):
         """Host function to launch CuTeDSL kernel."""
         varlen = cumulative_s_q is not None or cumulative_s_k is not None
+        self.use_varlen_scheduler = cumulative_s_k is not None and max_seqlen_k is None
         # Infer shape metadata from normalized 5D tensors (B, S, H_k, H_r, D).
         h_r = Q.shape[3]
         h_k = Q.shape[2]
@@ -719,27 +723,44 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         self.shared_storage = SharedStorage
 
         # =============================== bwd ===============================
-        K_val = problem_shape[1]
         _, H_K = problem_shape[3][0]
         B = problem_shape[3][1]
-        problem_shape_mbh = (
-            cute.ceil_div(K_val, self.cta_tiler[1]),
-            cute.size(B),
-            cute.size(H_K),
-        )
-        if cutlass.const_expr(self.use_clc_scheduler):
-            self.tile_sched_params = FmhaClcDynamicTileSchedulerParams(
-                problem_shape_mbh,
-                (*self.cluster_shape_mn, 1),
+        if cutlass.const_expr(self.use_varlen_scheduler and not self.use_clc_scheduler):
+            self.tile_sched_params, bwd_grid = compute_sm100_fmha_varlen_grid(
+                (problem_shape[1], problem_shape[2], ((1, H_K), B)),
+                cumulative_s_k,
+                (self.tile_shape_K, self.tile_shape_Q),
             )
-            bwd_grid = FmhaClcDynamicTileScheduler.get_grid_shape(self.tile_sched_params)
         else:
-            self.tile_sched_params = FmhaStaticTileSchedulerParams(
-                is_persistent=False,
-                problem_shape_mbh=problem_shape_mbh,
+            K_val = (
+                max_seqlen_k if cutlass.const_expr(cumulative_s_k is not None) else problem_shape[1]
             )
-            bwd_grid = self._compute_bwd_grid(problem_shape, self.cta_tiler[1])
-            bwd_grid = cute.round_up(bwd_grid, self.cluster_shape_mnk)
+            if cutlass.const_expr(cumulative_s_k is not None):
+                assert max_seqlen_k is not None, (
+                    "SM100 hd256 varlen dK/dV requires max_seqlen_k for grid sizing"
+                )
+            problem_shape_mbh = (
+                cute.ceil_div(K_val, self.cta_tiler[1]),
+                cute.size(B),
+                cute.size(H_K),
+            )
+            if cutlass.const_expr(self.use_clc_scheduler):
+                self.tile_sched_params = FmhaClcDynamicTileSchedulerParams(
+                    problem_shape_mbh,
+                    (*self.cluster_shape_mn, 1),
+                )
+                bwd_grid = FmhaClcDynamicTileScheduler.get_grid_shape(self.tile_sched_params)
+            else:
+                self.tile_sched_params = FmhaStaticTileSchedulerParams(
+                    is_persistent=False,
+                    problem_shape_mbh=problem_shape_mbh,
+                )
+                bwd_grid = (
+                    cute.ceil_div(K_val, self.cta_tiler[1]),
+                    cute.size(H_K),
+                    cute.size(B),
+                )
+                bwd_grid = cute.round_up(bwd_grid, self.cluster_shape_mnk)
 
         self.dkdv_bwd(
             KQ_tiled_mma,
@@ -843,7 +864,11 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         sum_OdO_smem_layout: cute.Layout,
         sdK_epi_layout: cute.ComposedLayout,
         sdV_epi_layout: cute.ComposedLayout,
-        tile_sched_params: FmhaStaticTileSchedulerParams | FmhaClcDynamicTileSchedulerParams,
+        tile_sched_params: (
+            FmhaStaticTileSchedulerParams
+            | FmhaClcDynamicTileSchedulerParams
+            | SingleTileVarlenScheduler.Params
+        ),
     ):
         """Core CuTeDSL backward kernel."""
         bidx, bidy, bidz = cute.arch.block_idx()
@@ -1197,6 +1222,9 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                         is_2cta=True,
                     )
                     iter_count = (iter_end - iter_start) * problem_shape[3][0][0]
+                    cluster_k_start = (blk_coord_k // 2) * 2 * self.tile_shape_K
+                    if cluster_k_start >= seqlen_k_cur_batch:
+                        iter_count = Int32(0)
                     if iter_count <= 0:
                         if blk_coord_k * self.tile_shape_K < seqlen_k_cur_batch:
                             problem_shape_cur_batch = (
@@ -1326,6 +1354,9 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                         is_2cta=True,
                     )
                     iter_count = (iter_end - iter_start) * problem_shape[3][0][0]
+                    cluster_k_start = (blk_coord_k // 2) * 2 * self.tile_shape_K
+                    if cluster_k_start >= seqlen_k_cur_batch:
+                        iter_count = Int32(0)
                     if iter_count <= 0:
                         if blk_coord_k * self.tile_shape_K < seqlen_k_cur_batch:
                             problem_shape_cur_batch = (
@@ -1424,6 +1455,9 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                         is_2cta=True,
                     )
                     iter_count = (iter_end - iter_start) * problem_shape[3][0][0]
+                    cluster_k_start = (blk_coord_k // 2) * 2 * self.tile_shape_K
+                    if cluster_k_start >= seqlen_k_cur_batch:
+                        iter_count = Int32(0)
                     if iter_count <= 0:
                         if blk_coord_k * self.tile_shape_K < seqlen_k_cur_batch:
                             problem_shape_cur_batch = (
@@ -1509,22 +1543,41 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 compute_mma_dS_producer.tail()
 
         else:
-            # ===== STATIC PATH: original non-persistent code =====
-            blk_coord = (Int32(0), bidx, Int32(0), ((Int32(0), bidy), bidz))
+            # ===== STATIC PATH: one logical tile per CTA =====
+            if cutlass.const_expr(self.use_varlen_scheduler):
+                tile_sched = SingleTileVarlenScheduler.create(tile_sched_params)
+                work_tile = tile_sched.initial_work_tile_info()
+                is_valid_tile = work_tile.is_valid_tile
+                blk_coord_k, blk_coord_h_k, blk_coord_b, _ = work_tile.tile_idx
+            else:
+                is_valid_tile = cutlass.Boolean(True)
+                blk_coord_k, blk_coord_h_k, blk_coord_b = bidx, bidy, bidz
+            blk_coord = (
+                Int32(0),
+                blk_coord_k,
+                Int32(0),
+                ((Int32(0), blk_coord_h_k), blk_coord_b),
+            )
             seqlen_q_cur_batch = Q_ref.shape[0]
             seqlen_k_cur_batch = K_ref.shape[0]
             blk_offset = (Int32(0), Int32(0), Int32(0), ((Int32(0), Int32(0)), Int32(0)))
             if cutlass.const_expr(varlen):
                 assert isinstance(cumulative_s_q, cute.Tensor)
                 assert isinstance(cumulative_s_k, cute.Tensor)
-                seqlen_q_cur_batch = cumulative_s_q[bidz + 1] - cumulative_s_q[bidz]
-                seqlen_k_cur_batch = cumulative_s_k[bidz + 1] - cumulative_s_k[bidz]
-                blk_offset = (
-                    cumulative_s_q[bidz],
-                    cumulative_s_k[bidz],
-                    Int32(0),
-                    ((Int32(0), Int32(0)), Int32(0)),
-                )
+                seqlen_q_cur_batch, seqlen_k_cur_batch = Int32(0), Int32(0)
+                if is_valid_tile:
+                    seqlen_q_cur_batch = (
+                        cumulative_s_q[blk_coord_b + 1] - cumulative_s_q[blk_coord_b]
+                    )
+                    seqlen_k_cur_batch = (
+                        cumulative_s_k[blk_coord_b + 1] - cumulative_s_k[blk_coord_b]
+                    )
+                    blk_offset = (
+                        cumulative_s_q[blk_coord_b],
+                        cumulative_s_k[blk_coord_b],
+                        Int32(0),
+                        ((Int32(0), Int32(0)), Int32(0)),
+                    )
 
             iter_start, iter_end = self.get_Q_block_min_max(
                 seqlen_q_cur_batch,
@@ -1537,6 +1590,9 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             pipeline_init_wait(cluster_shape_mn=cluster_layout_vmnk)
 
             iter_count = (iter_end - iter_start) * problem_shape[3][0][0]
+            cluster_k_start = (blk_coord_k // 2) * 2 * self.tile_shape_K
+            if cluster_k_start >= seqlen_k_cur_batch:
+                iter_count = Int32(0)
             problem_shape_cur_batch = (
                 seqlen_q_cur_batch,
                 seqlen_k_cur_batch,
@@ -1544,7 +1600,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                 problem_shape[3],
             )
             if iter_count <= 0:
-                if bidx * self.tile_shape_K < seqlen_k_cur_batch:
+                if blk_coord_k * self.tile_shape_K < seqlen_k_cur_batch:
                     self.epilogue_clear(
                         blk_coord,
                         blk_offset,
@@ -1607,6 +1663,9 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                     load_compute_sum_OdO_consumer,
                     load_mma_QT_producer,
                     load_mma_QT_consumer,
+                    blk_coord_k,
+                    blk_coord_h_k,
+                    blk_coord_b,
                 )
 
             # ///////////////////////////////////////////////////////////////////////////////
@@ -1800,22 +1859,17 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         load_compute_sum_OdO_consumer,
         load_mma_QT_producer,
         load_mma_QT_consumer,
-        blk_coord_k_override: Int32 = Int32(-1),
-        blk_coord_h_k_override: Int32 = Int32(-1),
-        blk_coord_b_override: Int32 = Int32(-1),
+        blk_coord_k: Int32,
+        blk_coord_h_k: Int32,
+        blk_coord_b: Int32,
     ):
         """TMA load."""
         tidx, _, _ = cute.arch.thread_idx()
-        if cutlass.const_expr(self.use_clc_scheduler):
-            blk_coord_k = blk_coord_k_override
-            blk_coord_h_k = blk_coord_h_k_override
-            blk_coord_b = blk_coord_b_override
-        else:
-            blk_coord_k, blk_coord_h_k, blk_coord_b = cute.arch.block_idx()
         blk_coord_h_r = Int32(0)
         blk_coord_h = (blk_coord_h_r, blk_coord_h_k)
         iter_index = iter_start
-        mma_tile_coord_v = blk_coord_k % cute.size(KQ_tiled_mma.thr_id.shape)
+        # MMA/TMA use physical CTA rank, not the flat tile index.
+        mma_tile_coord_v = cute.arch.block_idx_in_cluster() % cute.size(KQ_tiled_mma.thr_id.shape)
         mma_tile_coord_m = blk_coord_k // cute.size(KQ_tiled_mma.thr_id.shape)
 
         K = cute.domain_offset(cute.select(blk_offset, mode=[1, 2, 3]), K_in)

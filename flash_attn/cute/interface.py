@@ -778,15 +778,27 @@ def _flash_attn_fwd(
     if arch // 10 in [8, 12]:
         num_threads = 128
 
+    # Preserve the caller's hint.
+    host_max_seqlen_q = max_seqlen_q if not torch.is_tensor(max_seqlen_q) else None
+    use_dedicated_hd256_kernel = arch // 10 in [10, 11] and head_dim == 256 and head_dim_v == 256
+    if use_dedicated_hd256_kernel or (arch // 10 in [10, 11] and cu_seqlens_q is not None):
+        max_seqlen_q = host_max_seqlen_q
+    if (
+        use_dedicated_hd256_kernel
+        or (arch // 10 in [10, 11] and cu_seqlens_k is not None)
+    ) and torch.is_tensor(max_seqlen_k):
+        max_seqlen_k = None
     if max_seqlen_q is None:
         max_seqlen_q = seqlen_q if cu_seqlens_q is None else total_q
     if max_seqlen_k is None:
-        max_seqlen_k = seqlen_k
+        # Bound each sequence by its page-table row, not the shared pool.
+        max_seqlen_k = (
+            page_table.shape[1] * page_size
+            if use_dedicated_hd256_kernel and page_table is not None
+            else seqlen_k
+        )
     if cu_seqlens_k is None and seqused_k is None:
         min_seqlen_k = seqlen_k
-
-    # hd=256 2CTA forward uses dedicated kernel (Blackwell family)
-    use_dedicated_hd256_kernel = arch // 10 in [10, 11] and head_dim == 256 and head_dim_v == 256
 
     if use_dedicated_hd256_kernel and page_table is not None:
         # The kernel derives KV capacity from the page-table width. Normalize
@@ -1104,6 +1116,7 @@ def _flash_attn_fwd(
         not torch.is_tensor(max_m_blocks_leq_one)
         and max_m_blocks_leq_one
         and not is_split_kv
+        and (cu_seqlens_q is None or host_max_seqlen_q is not None)
     )
 
     # CuTe keeps stride-zero modes static when marking layouts dynamic.
@@ -1184,6 +1197,7 @@ def _flash_attn_fwd(
         sparse_kv,
         disable_sparse_kv_bitmask,
         fa_logging.get_fa_log_level(),
+        use_dedicated_hd256_kernel and cu_seqlens_q is not None and host_max_seqlen_q is None,
     )
 
     if compile_key not in _flash_attn_fwd.compile_cache:
@@ -1449,6 +1463,12 @@ def _flash_attn_fwd(
                 sparse_tensors,
                 AuxData(cute_aux_tensors, aux_scalars),
             ])
+            if use_dedicated_hd256_kernel:
+                compile_args.append(
+                    Int32(host_max_seqlen_q)
+                    if cu_seqlens_q is not None and host_max_seqlen_q is not None
+                    else None
+                )
             if arch // 10 in [10, 11] and not use_dedicated_hd256_kernel:
                 compile_args.extend([
                     num_splits_dynamic_tensor,
@@ -1539,6 +1559,12 @@ def _flash_attn_fwd(
                 else None,
                 AuxData(aux_tensors, aux_scalars),
             ])
+            if use_dedicated_hd256_kernel:
+                call_args.append(
+                    host_max_seqlen_q
+                    if cu_seqlens_q is not None
+                    else None
+                )
             if arch // 10 in [10, 11] and not use_dedicated_hd256_kernel:
                 call_args.extend([
                     num_splits_dynamic,
@@ -1991,6 +2017,16 @@ def _flash_attn_bwd(
         cluster_size = 2 if use_2cta_instrs else 1
 
     use_dedicated_hd256_kernel = arch // 10 in [10, 11] and head_dim == 256 and head_dim_v == 256
+    if (
+        use_dedicated_hd256_kernel
+        or (arch // 10 in [10, 11] and cu_seqlens_q is not None)
+    ) and torch.is_tensor(max_seqlen_q):
+        max_seqlen_q = None
+    if (
+        use_dedicated_hd256_kernel
+        or (arch // 10 in [10, 11] and cu_seqlens_k is not None)
+    ) and torch.is_tensor(max_seqlen_k):
+        max_seqlen_k = None
     if use_dedicated_hd256_kernel:
         assert learnable_sink is None, (
             "SM100 backward with head_dim=256 does not support learnable_sink"
@@ -2406,6 +2442,8 @@ def _flash_attn_bwd(
             single_q_block,
             single_k_block,
             cu_total_m_blocks_k is not None,
+            use_dedicated_hd256_kernel and cu_seqlens_q is not None and max_seqlen_q is None,
+            use_dedicated_hd256_kernel and cu_seqlens_k is not None and max_seqlen_k is None,
         )
 
     if compile_key not in _flash_attn_bwd.compile_cache:
@@ -2572,6 +2610,17 @@ def _flash_attn_bwd(
         ]
         if not use_dedicated_hd256_kernel:
             compile_args.append(cu_total_m_blocks_k_tensor)
+        else:
+            compile_args.extend(
+                (
+                    Int32(max_seqlen_q)
+                    if cu_seqlens_q is not None and max_seqlen_q is not None
+                    else None,
+                    Int32(max_seqlen_k)
+                    if cu_seqlens_k is not None and max_seqlen_k is not None
+                    else None,
+                )
+            )
         compile_args.append(current_stream)
 
         # TODO: check @can_implement
@@ -2616,6 +2665,17 @@ def _flash_attn_bwd(
         ]
         if not use_dedicated_hd256_kernel:
             call_args.append(cu_total_m_blocks_k)
+        else:
+            call_args.extend(
+                (
+                    max_seqlen_q
+                    if cu_seqlens_q is not None
+                    else None,
+                    max_seqlen_k
+                    if cu_seqlens_k is not None
+                    else None,
+                )
+            )
         _flash_attn_bwd.compile_cache[compile_key](*call_args)
     # Postprocess: convert dq_accum from float32 to dq in bf16/fp16
     # hd=256 2CTA backward has its own internal postprocess, skip here.
@@ -3537,6 +3597,11 @@ def flash_attn_varlen_func(
         so we arrange for nheads as the contiguous mode for better vectorization.
 
     gather_kv_indices: used for topk sparsity with MLA absorption kernel.
+
+    max_seqlen_q/k: optional scalar length bounds. With Blackwell cumulative
+        lengths, tensor hints are not read on the host. HD256 uses flat grids
+        for omitted/tensor hints and rectangular grids for host integers.
+        Integer bounds must cover every CUDA graph replay.
 
     min_seqlen_k: for varlen, specifies the minimum kv sequence length for any batch.
         Used with gather_kv_indices to determine if we need oob masking.

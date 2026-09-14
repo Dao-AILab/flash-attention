@@ -17,6 +17,9 @@ from cutlass.cute.typing import Int32, Int64, Float32
 from cutlass.utils import ClcDynamicPersistentTileScheduler
 from flash_attn.cute.tile_scheduler import (
     SchedulerState,
+    SingleTileVarlenScheduler,
+    compute_sm100_fmha_varlen_grid,
+    sm100_fmha_block_coord,
     compute_sm100_fmha_grid as compute_grid,
     compute_sm100_fmha_grid_clc as compute_grid_clc,
     make_sm100_thread_cooperative_group as make_thread_cooperative_group,
@@ -165,6 +168,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         cum_seqlen_q: Optional[cute.Tensor],
         cum_seqlen_k: Optional[cute.Tensor],
         scale_softmax: cutlass.Float32,
+        max_seqlen_q: Optional[Int32],
         stream: cuda.CUstream,
     ):
         varlen = cum_seqlen_q is not None or cum_seqlen_k is not None
@@ -294,15 +298,26 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         self.dq_dtype = dq.element_type
         self.tilePlikeFP32 = self.qk_mma_tiler[1] // Float32.width * self.q_dtype.width
 
-        if cutlass.const_expr(self.use_clc_scheduler):
+        self.use_varlen_scheduler = cum_seqlen_q is not None and max_seqlen_q is None
+        assert not (self.use_varlen_scheduler and self.use_clc_scheduler), (
+            "SM100 hd256 varlen dQ requires max_seqlen_q for grid sizing"
+        )
+        grid_q_extent = (
+            max_seqlen_q if cutlass.const_expr(cum_seqlen_q is not None) else cute.size(dq.shape[0])
+        )
+        if cutlass.const_expr(self.use_varlen_scheduler):
+            self.tile_sched_params, grid = compute_sm100_fmha_varlen_grid(
+                dq.shape, cum_seqlen_q, self.cta_tiler[:2]
+            )
+        elif cutlass.const_expr(self.use_clc_scheduler):
             self.tile_sched_params, grid = compute_grid_clc(
-                (s_q, dq.shape[1], dq.shape[2]) if cum_seqlen_q is not None else dq.shape,
+                (grid_q_extent, dq.shape[1], dq.shape[2]),
                 self.cta_tiler,
                 (*self.cluster_shape_mn, 1),
             )
         else:
             self.tile_sched_params, grid = compute_grid(
-                (s_q, dq.shape[1], dq.shape[2]) if cum_seqlen_q is not None else dq.shape,
+                (grid_q_extent, dq.shape[1], dq.shape[2]),
                 self.cta_tiler,
                 self.is_persistent,
             )
@@ -614,7 +629,11 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         sdQ_epi_layout: cute.ComposedLayout,
         lse_smem_layout: cute.Layout,
         sum_odo_smem_layout: cute.Layout,
-        tile_sched_params: FmhaStaticTileSchedulerParams | FmhaClcDynamicTileSchedulerParams,
+        tile_sched_params: (
+            FmhaStaticTileSchedulerParams
+            | FmhaClcDynamicTileSchedulerParams
+            | SingleTileVarlenScheduler.Params
+        ),
     ):
         # llvm.inline_asm(
         #     None,
@@ -905,6 +924,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                 clc_response_ptr,
                 clc,
             )
+        elif cutlass.const_expr(self.use_varlen_scheduler):
+            tile_sched = SingleTileVarlenScheduler.create(tile_sched_params)
         else:
             blk_idx = cute.arch.block_idx()
             tile_sched = FmhaStaticTileScheduler(
@@ -922,7 +943,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
             cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
 
             while work_tile.is_valid_tile:
-                curr_block_coord = work_tile.tile_idx
+                curr_block_coord = sm100_fmha_block_coord(work_tile, self.use_varlen_scheduler)
                 mma_block_coord = (
                     curr_block_coord[0] // cute.size(qk_tiled_mma.thr_id.shape),
                     curr_block_coord[1],
@@ -1202,7 +1223,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
             is_leader_cta = cta_rank_in_cluster % 2 == 0
 
             while work_tile.is_valid_tile:
-                curr_block_coord = work_tile.tile_idx
+                curr_block_coord = sm100_fmha_block_coord(work_tile, self.use_varlen_scheduler)
                 mma_block_coord = (
                     curr_block_coord[0] // cute.size(qk_tiled_mma.thr_id.shape),
                     curr_block_coord[1],
@@ -1829,7 +1850,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
             # increase register after decreasing
             cute.arch.warpgroup_reg_alloc(self.num_regs_compute)
             while work_tile.is_valid_tile:
-                curr_block_coord = work_tile.tile_idx
+                curr_block_coord = sm100_fmha_block_coord(work_tile, self.use_varlen_scheduler)
                 mma_block_coord = (
                     curr_block_coord[0] // cute.size(qk_tiled_mma.thr_id.shape),
                     curr_block_coord[1],
@@ -1945,7 +1966,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
             cute.arch.warpgroup_reg_dealloc(self.num_regs_epilogue)
 
             while work_tile.is_valid_tile:
-                curr_block_coord = work_tile.tile_idx
+                curr_block_coord = sm100_fmha_block_coord(work_tile, self.use_varlen_scheduler)
                 mma_block_coord = (
                     curr_block_coord[0] // cute.size(qk_tiled_mma.thr_id.shape),
                     curr_block_coord[1],
@@ -1986,7 +2007,14 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                 mdQ_qdl_eff = mdQ_qdl
                 if cutlass.const_expr(cum_seqlen_q is not None):
                     block_offset_dQ = (cuseqlen_q,) + (None,) * 2
-                    mdQ_qdl_eff = cute.domain_offset(block_offset_dQ, mdQ_qdl)
+                    offset_dQ = cute.assume(
+                        cuseqlen_q * mdQ_qdl.stride[0],
+                        divby=64,
+                    )
+                    mdQ_qdl_eff = cute.make_tensor(
+                        mdQ_qdl.iterator + offset_dQ,
+                        mdQ_qdl.layout,
+                    )
 
                 # (bM, bN, loopM, loopN, loopL)
                 gdQ_qdl = cute.flat_divide(
@@ -1999,20 +2027,25 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
 
                 gdQ_staged = gdQ_qdl[None, None, curr_block_coord[0], None, curr_block_coord[2]]
                 cdQ_staged = cdQ_qdl[None, None, curr_block_coord[0], None, curr_block_coord[2]]
-                gdQ_tma_staged = gdQ_staged
-
-                if cutlass.const_expr(not varlen):
-                    gdQ_tma_qdl = cute.flat_divide(
-                        mdQ_tma, cute.select(self.dsk_block_tiler, mode=[0, 1])
+                mdQ_tma_eff = mdQ_tma
+                if cutlass.const_expr(varlen):
+                    mdQ_tma_eff = cute.domain_offset(
+                        block_offset_dQ,
+                        mdQ_tma,
                     )
-                    gdQ_tma_staged = gdQ_tma_qdl[
-                        None, None, curr_block_coord[0], None, curr_block_coord[2]
-                    ]
+                gdQ_tma_qdl = cute.flat_divide(
+                    mdQ_tma_eff,
+                    cute.select(self.dsk_block_tiler, mode=[0, 1]),
+                )
+                gdQ_tma_staged = gdQ_tma_qdl[
+                    None, None, curr_block_coord[0], None, curr_block_coord[2]
+                ]
 
                 if has_work:
                     # dQ TMEM to GMEM
                     mma_dq_consumer = self.dQ_epilogue(
                         seqlen_q,
+                        curr_block_coord[0],
                         (mma_dq_consumer, gdQ_staged, cdQ_staged, tdQtdQ_staged),
                         self.epi_tile,
                         (tma_atom_dQ, gdQ_tma_staged, s_epi_dQ, varlen),
@@ -2199,6 +2232,7 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
     def dQ_epilogue(
         self,
         seqlen_q: int,
+        q_block: int,
         dq_args: Tuple,
         epi_tile: cute.Tile,
         tma_args: Tuple,
@@ -2237,7 +2271,12 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
             tTMEM_LOADcdQ = thr_tmem_load.partition_D(cdQ_epi)
             tTMEM_LOADcdQ_local = thr_tmem_load.partition_D(cdQ_local_epi)
 
-            if cutlass.const_expr(not varlen):
+            use_tma_store = True
+            if cutlass.const_expr(varlen):
+                use_tma_store = (
+                    q_block * self.dsk_block_tiler[0] + self.dsk_block_tiler[0] <= seqlen_q
+                )
+            if use_tma_store:
                 gdQ_tma = gdQ_tma_staged[None, None, iter]
                 gdQ_tma_epi = cute.local_tile(gdQ_tma, epi_tile_dQ, (0, None))
                 sdQ_stage = s_epi_dQ[None, None, 0]

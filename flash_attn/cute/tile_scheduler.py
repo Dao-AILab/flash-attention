@@ -1863,6 +1863,40 @@ def compute_sm100_fmha_grid(
     return tile_sched_params, grid
 
 
+def compute_sm100_fmha_varlen_grid(
+    shape: cute.Shape,
+    cu_seqlens: cute.Tensor,
+    tile_shape_mn: Tuple[int, int],
+) -> Tuple[SingleTileVarlenScheduler.Params, Tuple[Int32, Int32, Int32]]:
+    """Build a flat grid with each CTA pair confined to one sequence.
+
+    ``shape`` is (token_capacity, head_dim, ((head_ratio, num_heads), batch)).
+    """
+    args = TileSchedulerArguments(
+        num_block=Int32(0),
+        num_head=cute.size(shape[2][0]),
+        num_batch=cute.size(shape[2][1]),
+        num_splits=Int32(1),
+        seqlen_k=Int32(0),
+        headdim=cute.size(shape[1]),
+        headdim_v=cute.size(shape[1]),
+        total_q=cute.size(shape[0]),
+        tile_shape_mn=tile_shape_mn,
+        cluster_shape_mn=(2, 1),
+        mCuSeqlensQ=cu_seqlens,
+    )
+    params = SingleTileVarlenScheduler.to_underlying_arguments(args)
+    return params, SingleTileVarlenScheduler.get_grid_shape(params)
+
+
+def sm100_fmha_block_coord(work_tile: WorkTileInfo, flat: bool) -> cute.Coord:
+    """Adapt flat-scheduler axes or keep the legacy FMHA coordinate layout."""
+    if not flat:
+        return work_tile.tile_idx
+    block, head, batch, _ = work_tile.tile_idx
+    return block, Int32(0), (head, batch)
+
+
 ##############################################################################
 # Fmha CLC dynamic tile scheduler
 ##############################################################################

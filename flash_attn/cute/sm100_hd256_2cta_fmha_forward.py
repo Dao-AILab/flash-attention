@@ -16,6 +16,9 @@ from cutlass.cute.typing import Int32, Int64, Float32
 from cutlass.utils import ClcDynamicPersistentTileScheduler
 from flash_attn.cute.tile_scheduler import (
     SchedulerState,
+    SingleTileVarlenScheduler,
+    compute_sm100_fmha_varlen_grid,
+    sm100_fmha_block_coord,
     compute_sm100_fmha_grid as compute_grid,
     compute_sm100_fmha_grid_clc as compute_grid_clc,
     make_sm100_thread_cooperative_group as make_thread_cooperative_group,
@@ -192,6 +195,7 @@ class BlackwellFusedMultiHeadAttentionForward:
         descale_tensors: Optional[DescaleTensors] = None,
         blocksparse_tensors: Optional[cute.Tensor] = None,
         aux_data: AuxData = AuxData(),
+        max_seqlen_q: Optional[Int32] = None,
         stream: cuda.CUstream = None,
     ):
         # Keep parity with FlashAttentionForwardSm100.__call__ interface.
@@ -398,15 +402,23 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.o_dtype = o.element_type
         self.tilePlikeFP32 = self.qk_mma_tiler[1] // Float32.width * self.q_dtype.width
 
-        if cutlass.const_expr(self.use_clc_scheduler):
+        self.use_varlen_scheduler = cum_seqlen_q is not None and max_seqlen_q is None
+        grid_q_extent = (
+            max_seqlen_q if cutlass.const_expr(cum_seqlen_q is not None) else cute.size(o.shape[0])
+        )
+        if cutlass.const_expr(self.use_varlen_scheduler):
+            self.tile_sched_params, grid = compute_sm100_fmha_varlen_grid(
+                o.shape, cum_seqlen_q, self.cta_tiler[:2]
+            )
+        elif cutlass.const_expr(self.use_clc_scheduler):
             self.tile_sched_params, grid = compute_grid_clc(
-                (s_q, o.shape[1], o.shape[2]) if cum_seqlen_q is not None else o.shape,
+                (grid_q_extent, o.shape[1], o.shape[2]),
                 self.cta_tiler,
                 (*self.cluster_shape_mn, 1),
             )
         else:
             self.tile_sched_params, grid = compute_grid(
-                (s_q, o.shape[1], o.shape[2]) if cum_seqlen_q is not None else o.shape,
+                (grid_q_extent, o.shape[1], o.shape[2]),
                 self.cta_tiler,
                 self.is_persistent,
             )
@@ -624,7 +636,11 @@ class BlackwellFusedMultiHeadAttentionForward:
         k_smem_layout_staged: cute.ComposedLayout,
         p_tmem_layout_staged: cute.ComposedLayout,
         v_smem_layout_staged: cute.ComposedLayout,
-        tile_sched_params: FmhaStaticTileSchedulerParams | FmhaClcDynamicTileSchedulerParams,
+        tile_sched_params: (
+            FmhaStaticTileSchedulerParams
+            | FmhaClcDynamicTileSchedulerParams
+            | SingleTileVarlenScheduler.Params
+        ),
     ):
         warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
 
@@ -833,6 +849,8 @@ class BlackwellFusedMultiHeadAttentionForward:
                 clc_response_ptr,
                 clc,
             )
+        elif cutlass.const_expr(self.use_varlen_scheduler):
+            tile_sched = SingleTileVarlenScheduler.create(tile_sched_params)
         else:
             blk_idx = cute.arch.block_idx()
             tile_sched = FmhaStaticTileScheduler(
@@ -849,7 +867,9 @@ class BlackwellFusedMultiHeadAttentionForward:
         if warp_idx == self.load_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.num_regs_other)
             while work_tile.is_valid_tile:
-                curr_block_coord = work_tile.tile_idx  # (q_tile_idx, 0, (head_idx, batch_idx))
+                curr_block_coord = sm100_fmha_block_coord(
+                    work_tile, self.use_varlen_scheduler
+                )  # (q_tile_idx, 0, (head_idx, batch_idx))
                 mma_block_coord = (
                     curr_block_coord[0] // cute.size(qk_tiled_mma.thr_id.shape),
                     curr_block_coord[1],
@@ -1094,7 +1114,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             is_leader_cta = cta_rank_in_cluster % 2 == 0
 
             while work_tile.is_valid_tile:
-                curr_block_coord = work_tile.tile_idx
+                curr_block_coord = sm100_fmha_block_coord(work_tile, self.use_varlen_scheduler)
                 mma_block_coord = (
                     curr_block_coord[0] // cute.size(qk_tiled_mma.thr_id.shape),
                     curr_block_coord[1],
@@ -1351,7 +1371,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             cute.arch.warpgroup_reg_alloc(self.num_regs_softmax)
 
             while work_tile.is_valid_tile:
-                curr_block_coord = work_tile.tile_idx
+                curr_block_coord = sm100_fmha_block_coord(work_tile, self.use_varlen_scheduler)
                 mma_block_coord = (
                     curr_block_coord[0] // cute.size(qk_tiled_mma.thr_id.shape),
                     curr_block_coord[1],
@@ -1481,7 +1501,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             cute.arch.warpgroup_reg_dealloc(self.num_regs_correction)
 
             while work_tile.is_valid_tile:
-                curr_block_coord = work_tile.tile_idx
+                curr_block_coord = sm100_fmha_block_coord(work_tile, self.use_varlen_scheduler)
                 mma_block_coord = (
                     curr_block_coord[0] // cute.size(qk_tiled_mma.thr_id.shape),
                     curr_block_coord[1],

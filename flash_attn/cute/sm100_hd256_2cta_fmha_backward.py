@@ -135,6 +135,8 @@ class BlackwellFusedMultiHeadAttentionBackward:
         dV_semaphore: cute.Tensor | None = None,
         aux_data: AuxData = AuxData(),
         block_sparse_tensors: cute.Tensor | None = None,
+        max_seqlen_q: Int32 | None = None,
+        max_seqlen_k: Int32 | None = None,
         stream: cuda.CUstream = None,
     ):
         """Host function to launch CuTeDSL kernel."""
@@ -207,6 +209,7 @@ class BlackwellFusedMultiHeadAttentionBackward:
             cumulative_s_q,
             cumulative_s_k,
             scale_softmax,
+            max_seqlen_q,
             stream,
         )
         self.dkdv_kernel(
@@ -221,5 +224,6 @@ class BlackwellFusedMultiHeadAttentionBackward:
             cumulative_s_q,
             cumulative_s_k,
             scale_softmax,
+            max_seqlen_k,
             stream,
         )
