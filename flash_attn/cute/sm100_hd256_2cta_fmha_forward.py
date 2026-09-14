@@ -379,7 +379,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             cute.make_layout(
                 (s_q_total, d, ((h_r, h_k), b)),
                 stride=(
-                    cute.assume(o_norm.stride[1], divby=64),
+                    o_norm.stride[1],
                     o_norm.stride[4],
                     ((o_norm.stride[3], o_norm.stride[2]), o_norm.stride[0]),
                 ),
