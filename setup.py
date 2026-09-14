@@ -309,9 +309,16 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
     if FORCE_CXX11_ABI:
         torch._C._GLIBCXX_USE_CXX11_ABI = True
 
+    # PyTorch 2.13+ requires C++20 for extensions that include ATen headers
+    # (ATen raises "#error C++20 or later ... required"). Because we pass an
+    # explicit -std flag below, PyTorch's build machinery cannot upgrade the
+    # standard for us, so select it from the installed torch version. Older
+    # torch keeps C++17 to avoid requiring a newer toolchain unnecessarily.
+    cxx_standard = "c++20" if (TORCH_MAJOR, TORCH_MINOR) >= (2, 13) else "c++17"
+
     nvcc_flags = [
     "-O3",
-    "-std=c++17",
+    f"-std={cxx_standard}",
     "-U__CUDA_NO_HALF_OPERATORS__",
     "-U__CUDA_NO_HALF_CONVERSIONS__",
     "-U__CUDA_NO_HALF2_OPERATORS__",
@@ -330,11 +337,11 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
     # "-DFLASHATTENTION_DISABLE_LOCAL",
     ]
 
-    compiler_c17_flag=["-O3", "-std=c++17"]
+    compiler_cxx_flag = ["-O3", f"-std={cxx_standard}"]
     # Add Windows-specific flags
     if sys.platform == "win32" and os.getenv('DISTUTILS_USE_SDK') == '1':
         nvcc_flags.extend(["-Xcompiler", "/Zc:__cplusplus"])
-        compiler_c17_flag=["-O2", "/std:c++17", "/Zc:__cplusplus"]
+        compiler_cxx_flag = ["-O2", f"/std:{cxx_standard}", "/Zc:__cplusplus"]
 
     # Opt-in: disable building dropout and its dependent headers (ATen philox/RNG
     # headers) from the FA2 build. This flag must be shared across both cxx and nvcc
@@ -446,7 +453,7 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
                 "csrc/flash_attn/src/flash_fwd_split_align_hdim256_bf16_causal_sm80.cu",
             ],
             extra_compile_args={
-                "cxx": compiler_c17_flag + feature_flags,
+                "cxx": compiler_cxx_flag + feature_flags,
                 "nvcc": append_nvcc_threads(nvcc_flags + cc_flag + feature_flags),
             },
             include_dirs=[
