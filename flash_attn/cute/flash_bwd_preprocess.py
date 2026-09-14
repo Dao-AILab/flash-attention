@@ -417,7 +417,10 @@ class FlashAttentionBackwardPreprocess:
                         PdPsum_val = PdP_sum[m]
                         if const_expr(mdLSE is not None):
                             PdPsum_val -= gdLSE[row]
-                    gPdPsum[row] = PdPsum_val
+                    # Without padded per-sequence offsets there is no slack past seqlen: the
+                    # zero-filled tail would alias the next sequence (or fall off the buffer).
+                    if const_expr(self.use_padded_offsets) or row < seqlen_limit:
+                        gPdPsum[row] = PdPsum_val
 
             # Clear dQaccum
             if const_expr(mdQaccum is not None):
@@ -461,7 +464,10 @@ class FlashAttentionBackwardPreprocess:
                 ]
 
                 assert self.tile_m <= self.num_threads
-                if const_expr(self.tile_m == self.num_threads) or tidx < self.tile_m:
+                # Rows past seqlen_limit are outside row_max/scale_p (partial last tile).
+                if (
+                    const_expr(self.tile_m == self.num_threads) or tidx < self.tile_m
+                ) and tidx < seqlen_limit:
                     for n in cutlass.range(gRowMax.shape[1], unroll=4):
                         row_max = gRowMax[tidx, n]
                         scale = 0.0
