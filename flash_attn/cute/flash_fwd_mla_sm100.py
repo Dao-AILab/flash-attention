@@ -10,7 +10,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int64, Int32, Uint32, Boolean, const_expr
-from cutlass.cute import FastDivmodDivisor
+from cutlass.cute import FastDivmodDivisorV2
 import cutlass.pipeline as pipeline
 from cutlass.cute.nvgpu import cpasync, tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils
@@ -25,7 +25,7 @@ from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute.mask import AttentionMask
 import flash_attn.cute.blackwell_helpers as fa_sm100_utils
-from flash_attn.cute.softmax import SoftmaxSm100
+from flash_attn.cute.softmax import SoftmaxSm100, apply_learnable_sink, load_learnable_sink
 from flash_attn.cute.tile_scheduler import (
     SchedulerState,
     SchedulingMode,
@@ -208,12 +208,12 @@ class FlashAttentionMLAForwardSm100:
             self.hdimv // self.num_hdimv_splits,
             self.tile_n,
         )
-        self.major_mode_Q = tcgen05.OperandMajorMode.K
-        self.major_mode_Qvi = tcgen05.OperandMajorMode.K
-        self.major_mode_K = tcgen05.OperandMajorMode.K
-        self.major_mode_Vi = tcgen05.OperandMajorMode.K
-        self.major_mode_Vti = tcgen05.OperandMajorMode.MN
-        self.major_mode_P = tcgen05.OperandMajorMode.K
+        self.major_mode_Q = cute.nvgpu.OperandMajorMode.K
+        self.major_mode_Qvi = cute.nvgpu.OperandMajorMode.K
+        self.major_mode_K = cute.nvgpu.OperandMajorMode.K
+        self.major_mode_Vi = cute.nvgpu.OperandMajorMode.K
+        self.major_mode_Vti = cute.nvgpu.OperandMajorMode.MN
+        self.major_mode_P = cute.nvgpu.OperandMajorMode.K
         self.operand_source_Q = tcgen05.OperandSource.SMEM
         self.operand_source_Qvi = tcgen05.OperandSource.SMEM
         self.operand_source_P = tcgen05.OperandSource.SMEM
@@ -366,6 +366,7 @@ class FlashAttentionMLAForwardSm100:
         mPageTable: Optional[cute.Tensor] = None,
         window_size_left: Int32 | int | None = None,
         window_size_right: Int32 | int | None = None,
+        learnable_sink: Optional[cute.Tensor] = None,
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
@@ -475,7 +476,7 @@ class FlashAttentionMLAForwardSm100:
         ]
         tiled_mma_QK, tiled_mma_QvV, tiled_mma_PVt = (
             sm100_utils.make_trivial_tiled_mma(
-                dtype_a, major_a, major_b, self.dtype_acc, self.cta_group, mma_tiler[:2], operand_source_a,
+                dtype_a, dtype_a, major_a, major_b, self.dtype_acc, self.cta_group, mma_tiler[:2], operand_source_a,
             )
             for _, dtype_a, major_a, major_b, mma_tiler, operand_source_a in _mma_specs
         )
@@ -717,6 +718,7 @@ class FlashAttentionMLAForwardSm100:
             mSeqUsedK,
             mIndexTopk,
             mPageTable,
+            learnable_sink,
             tma_atom_Q,
             tma_atom_Qv,
             tma_atom_K,
@@ -774,6 +776,7 @@ class FlashAttentionMLAForwardSm100:
         mSeqUsedK: Optional[cute.Tensor],
         mIndexTopk: Optional[cute.Tensor],
         mPageTable: Optional[cute.Tensor],
+        learnable_sink: Optional[cute.Tensor],
         tma_atom_Q: cute.CopyAtom,
         tma_atom_Qv: cute.CopyAtom,
         tma_atom_K: Optional[cute.CopyAtom],
@@ -1195,6 +1198,7 @@ class FlashAttentionMLAForwardSm100:
                 mP=mP,
                 sP_out=sP_out,
                 mCuSeqlensQ=mCuSeqlensQ,
+                learnable_sink=learnable_sink,
             )
             tmem_alloc_barrier.arrive()
 
@@ -1229,6 +1233,7 @@ class FlashAttentionMLAForwardSm100:
                 SeqlenInfoCls,
                 tile_scheduler=tile_scheduler,
                 mCuSeqlensQ=mCuSeqlensQ,
+                learnable_sink=learnable_sink,
             )
             tmem_alloc_barrier.arrive()
 
@@ -1570,7 +1575,7 @@ class FlashAttentionMLAForwardSm100:
                     )
             else:
                 # ==== Paged KV cp.async path (page_size != tile_n) ====
-                page_size_divmod = FastDivmodDivisor(cute.size(mV.shape[0]))
+                page_size_divmod = FastDivmodDivisorV2(cute.size(mV.shape[0]))
                 hdimv_split = self.hdimv // self.num_hdimv_splits
                 hdimv_split_per_cta = hdimv_split // self.cta_group_size
 
@@ -2503,6 +2508,7 @@ class FlashAttentionMLAForwardSm100:
         mP: Optional[cute.Tensor] = None,
         sP_out: Optional[cute.Tensor] = None,
         mCuSeqlensQ: Optional[cute.Tensor] = None,
+        learnable_sink: Optional[cute.Tensor] = None,
     ):
         # ==== softmax warpgroup ====
         # Description: computes softmax on S and writes the result to P
@@ -2748,7 +2754,7 @@ class FlashAttentionMLAForwardSm100:
 
             # write row max and sum to smem
             sRowSum[tidx % self.cta_tile_m, warp_idx // self.cta_group_size] = softmax.row_sum[0]
-            if const_expr(mLSE is not None):
+            if const_expr(mLSE is not None or learnable_sink is not None):
                 if tidx < self.cta_tile_m:
                     sRowMax[tidx, 0] = softmax.row_max[0]
             self.sm_stats_barrier_full.arrive()
@@ -2894,6 +2900,7 @@ class FlashAttentionMLAForwardSm100:
         SeqlenInfoCls: Callable,
         tile_scheduler: TileSchedulerProtocol,
         mCuSeqlensQ: Optional[cute.Tensor] = None,
+        learnable_sink: Optional[cute.Tensor] = None,
     ):
         ### ==== correction/epilogue warpgroup ====
         # Correction: copy scale smem -> rmem, copy O tmem -> rmem, rescale O, store O rmem -> tmem
@@ -3041,13 +3048,22 @@ class FlashAttentionMLAForwardSm100:
             row_sum0 = sRowSum[tidx % self.cta_tile_m, 0]
             row_sum1 = sRowSum[tidx % self.cta_tile_m, 1]
             row_sum = row_sum0 + row_sum1
-            acc_O_mn_row_is_zero_or_nan = row_sum == 0.0 or row_sum != row_sum
-            scale = cute.arch.rcp_approx(row_sum if not acc_O_mn_row_is_zero_or_nan else 1.0)
 
             row_max = 0.0
-            if const_expr(mLSE is not None):
-                if tidx < self.cta_tile_m:
-                    row_max = sRowMax[tidx, 0]
+            if const_expr(mLSE is not None or learnable_sink is not None):
+                row_max = sRowMax[tidx % self.cta_tile_m, 0]
+            if const_expr(learnable_sink is not None):
+                sink_val = load_learnable_sink(
+                    learnable_sink,
+                    head_idx,
+                    cta_m_block * self.cta_tile_m + tidx % self.cta_tile_m,
+                    self.qhead_per_kvhead,
+                    self.pack_gqa,
+                )
+                row_max, row_sum = apply_learnable_sink(row_max, row_sum, sink_val, softmax_scale_log2)
+
+            acc_O_mn_row_is_zero_or_nan = row_sum == 0.0 or row_sum != row_sum
+            scale = cute.arch.rcp_approx(row_sum if not acc_O_mn_row_is_zero_or_nan else 1.0)
 
             self.sm_stats_barrier_empty.arrive()
 

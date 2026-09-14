@@ -17,6 +17,58 @@ from flash_attn.cute.utils import AuxData
 
 
 @cute.jit
+def load_learnable_sink(
+    learnable_sink: cute.Tensor,
+    head_idx,
+    packed_row,
+    qhead_per_kvhead: cutlass.Constexpr[int],
+    pack_gqa: cutlass.Constexpr[bool],
+) -> Float32:
+    """Load the sink logit for one output row; see `apply_learnable_sink`.
+
+    With pack_gqa the M tile interleaves the Q heads of one KV head, so `head_idx` is the KV
+    head and the Q head is `packed_row % qhead_per_kvhead`; otherwise `head_idx` is already
+    the Q head and `packed_row` is ignored.
+    """
+    if cutlass.const_expr(not pack_gqa):
+        return Float32(learnable_sink[head_idx])
+    return Float32(learnable_sink[head_idx * qhead_per_kvhead + packed_row % qhead_per_kvhead])
+
+
+@cute.jit
+def apply_learnable_sink(
+    row_max: Float32,
+    row_sum: Float32,
+    sink_val: Float32,
+    scale_log2: Float32,
+    max_offset: Float32 = 0.0,
+    empty_row_sum: Float32 = 1.0,
+) -> tuple[Float32, Float32]:
+    """Fold a learnable sink logit into the final (unscaled row_max, row_sum) softmax stats.
+
+    A learnable sink is one extra softmax column per Q head with logit `sink_val` (natural-log
+    units, not multiplied by softmax_scale) and no value vector: it enlarges the normalizer
+    and the LSE but contributes nothing to O. Kernels fold it in at the end of the KV loop.
+    The stats are an *unscaled* row max and a row sum of exp2(score*scale_log2 - max*scale_log2)
+    terms, so the sink enters as exp2(sink*LOG2_E - row_max*scale_log2 + max_offset). A fully
+    masked row (row_max == -inf) has the sink as its only column, so its stats become
+    row_max = sink/scale (i.e. row_max*scale_log2 == sink*LOG2_E) and row_sum = empty_row_sum,
+    giving O = 0 and lse = sink. Backward: dsink[h] = -sum_rows exp(sink[h] - lse[row,h]) * dpsum[row,h].
+
+    `max_offset` is the fp8 exponent offset and `empty_row_sum == 2**max_offset` (0 and 1 for
+    bf16/fp16). `Softmax.finalize` (SM80/SM90) applies the same fold in the scaled domain.
+    """
+    if row_max == -Float32.inf:
+        row_max = sink_val * (utils.LOG2_E / scale_log2)
+        row_sum = empty_row_sum
+    else:
+        row_sum += cute.math.exp2(
+            sink_val * utils.LOG2_E - row_max * scale_log2 + max_offset, fastmath=True
+        )
+    return row_max, row_sum
+
+
+@cute.jit
 def call_score_mod(
     score_mod: cutlass.Constexpr,
     score,

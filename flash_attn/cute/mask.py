@@ -452,7 +452,7 @@ class AttentionMask:
         batch_idx_ssa = utils.scalar_to_ssa(batch_idx, cutlass.Int32)
         ncol = const_expr(cute.size(tScS_t2r.shape))
 
-        for i in cutlass.range_constexpr(ncol):
+        for i in cutlass.range(ncol, unroll_full=True):
             row_coord = tScS_t2r[i][0] if not self.swap_AB else tScS_t2r[i][1]
             col_coord = tScS_t2r[i][1] if not self.swap_AB else tScS_t2r[i][0]
             global_row = row_coord + m_block * self.tile_m

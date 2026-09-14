@@ -32,7 +32,13 @@ from flash_attn.cute.mask import (
 )
 from flash_attn.cute.tile_scheduler import SM100_TMEM_CAPACITY_COLUMNS
 from flash_attn.cute.flash_fwd_sm100 import DescaleTensors, _TUNING_CONFIG
-from flash_attn.cute.utils import ex2_emulation_2, as_bshkrd_tensor, AuxData
+from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
+from flash_attn.cute.utils import (
+    ex2_emulation_2,
+    as_bshkrd_tensor,
+    AuxData,
+    domain_offset_aligned,
+)
 
 
 class BlackwellFusedMultiHeadAttentionForward:
@@ -194,9 +200,6 @@ class BlackwellFusedMultiHeadAttentionForward:
     ):
         # Keep parity with FlashAttentionForwardSm100.__call__ interface.
         # (TODO@wangsiyu) Implement these features.
-        assert mSeqUsedQ is None and mSeqUsedK is None, (
-            "SM100 forward with head_dim=256 does not support seqused_q/seqused_k"
-        )
         assert learnable_sink is None, (
             "SM100 forward with head_dim=256 does not support learnable_sink"
         )
@@ -219,7 +222,8 @@ class BlackwellFusedMultiHeadAttentionForward:
             "SM100 forward with head_dim=256 does not support descale_tensors"
         )
 
-        q_tensor, k_tensor, v_tensor, o_tensor = mQ, mK, mV, mO
+        q_tensor, k_tensor, v_tensor = mQ, mK, mV
+        o_tensor = assume_tensor_aligned(mO, canonicalize_singletons=True)
         lse_tensor = mLSE
         cum_seqlen_q = mCuSeqlensQ
         cum_seqlen_k = mCuSeqlensK
@@ -424,11 +428,11 @@ class BlackwellFusedMultiHeadAttentionForward:
         self.v_major_mode = utils.LayoutEnum.from_tensor(v).mma_major_mode()
         self.o_layout = utils.LayoutEnum.from_tensor(o)
 
-        if cutlass.const_expr(self.q_major_mode != tcgen05.OperandMajorMode.K):
+        if cutlass.const_expr(self.q_major_mode != cute.nvgpu.OperandMajorMode.K):
             raise RuntimeError("The layout of q is not supported")
-        if cutlass.const_expr(self.k_major_mode != tcgen05.OperandMajorMode.K):
+        if cutlass.const_expr(self.k_major_mode != cute.nvgpu.OperandMajorMode.K):
             raise RuntimeError("The layout of k is not supported")
-        if cutlass.const_expr(self.v_major_mode != tcgen05.OperandMajorMode.MN):
+        if cutlass.const_expr(self.v_major_mode != cute.nvgpu.OperandMajorMode.MN):
             raise RuntimeError("The layout of v is not supported")
 
         # check type consistency
@@ -441,8 +445,9 @@ class BlackwellFusedMultiHeadAttentionForward:
         cta_group = tcgen05.CtaGroup.TWO
         # the intermediate tensor p is from tmem & k-major
         p_source = tcgen05.OperandSource.TMEM
-        p_major_mode = tcgen05.OperandMajorMode.K
+        p_major_mode = cute.nvgpu.OperandMajorMode.K
         qk_tiled_mma = sm100_utils.make_trivial_tiled_mma(
+            self.q_dtype,
             self.q_dtype,
             self.q_major_mode,
             self.k_major_mode,
@@ -451,6 +456,7 @@ class BlackwellFusedMultiHeadAttentionForward:
             self.qk_mma_tiler[:2],
         )
         pv_tiled_mma = sm100_utils.make_trivial_tiled_mma(
+            self.v_dtype,
             self.v_dtype,
             p_major_mode,
             self.v_major_mode,
@@ -576,6 +582,8 @@ class BlackwellFusedMultiHeadAttentionForward:
             o,
             cum_seqlen_q,
             cum_seqlen_k,
+            mSeqUsedQ,
+            mSeqUsedK,
             lse,
             scale_softmax_log2,
             scale_softmax,
@@ -613,6 +621,8 @@ class BlackwellFusedMultiHeadAttentionForward:
         mO_qdl: cute.Tensor,
         cum_seqlen_q: Optional[cute.Tensor],
         cum_seqlen_k: Optional[cute.Tensor],
+        mSeqUsedQ: Optional[cute.Tensor],
+        mSeqUsedK: Optional[cute.Tensor],
         mLSE: Optional[cute.Tensor],
         scale_softmax_log2: Float32,
         scale_softmax: Float32,
@@ -896,6 +906,19 @@ class BlackwellFusedMultiHeadAttentionForward:
                         mma_block_coord[0],
                         seqlen_q,
                     )
+                # NOTE [Per-batch sequence lengths]
+                # seqused overrides lengths, not cu_seqlens packing offsets.
+                # All four warp roles must use the same effective Q length when
+                # deciding which tiles to skip.
+                if cutlass.const_expr(mSeqUsedQ is not None):
+                    seqlen_q = mSeqUsedQ[batch_coord]
+                    continue_cond = not FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
+                        self.qk_mma_tiler[0],
+                        mma_block_coord[0],
+                        seqlen_q,
+                    )
+                if cutlass.const_expr(mSeqUsedK is not None):
+                    seqlen_k = mSeqUsedK[batch_coord]
                 if not continue_cond:
                     mQ_qdl_ = cute.domain_offset(cute.select(block_offset, mode=[0, 2, 3]), mQ_qdl)
                     # Local tile partition global tensors
@@ -1111,11 +1134,21 @@ class BlackwellFusedMultiHeadAttentionForward:
                         mma_block_coord[0],
                         seqlen_q,
                     )
+                # See NOTE [Per-batch sequence lengths]
+                if cutlass.const_expr(mSeqUsedQ is not None):
+                    seqlen_q = mSeqUsedQ[batch_coord]
+                    continue_cond = not FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
+                        self.qk_mma_tiler[0],
+                        mma_block_coord[0],
+                        seqlen_q,
+                    )
 
                 if not continue_cond:
                     if cutlass.const_expr(cum_seqlen_k is not None):
                         cuseqlen_k = cum_seqlen_k[batch_coord]
                         seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
+                    if cutlass.const_expr(mSeqUsedK is not None):
+                        seqlen_k = mSeqUsedK[batch_coord]
 
                     seqlen_kv_loop_start, seqlen_kv_loop_steps = (
                         FusedMask.get_trip_start_count_via_block_info(
@@ -1359,10 +1392,20 @@ class BlackwellFusedMultiHeadAttentionForward:
                         mma_block_coord[0],
                         seqlen_q,
                     )
+                # See NOTE [Per-batch sequence lengths]
+                if cutlass.const_expr(mSeqUsedQ is not None):
+                    seqlen_q = mSeqUsedQ[batch_coord]
+                    continue_cond = not FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
+                        self.qk_mma_tiler[0],
+                        mma_block_coord[0],
+                        seqlen_q,
+                    )
                 if not continue_cond:
                     if cutlass.const_expr(cum_seqlen_k is not None):
                         cuseqlen_k = cum_seqlen_k[batch_coord]
                         seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
+                    if cutlass.const_expr(mSeqUsedK is not None):
+                        seqlen_k = mSeqUsedK[batch_coord]
 
                     row_max = -Float32.inf
                     row_max_prev = -Float32.inf
@@ -1479,24 +1522,32 @@ class BlackwellFusedMultiHeadAttentionForward:
                         mma_block_coord[0],
                         seqlen_q,
                     )
+                # See NOTE [Per-batch sequence lengths]
+                if cutlass.const_expr(mSeqUsedQ is not None):
+                    seqlen_q = mSeqUsedQ[batch_coord]
+                    continue_cond = not FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
+                        self.qk_mma_tiler[0],
+                        mma_block_coord[0],
+                        seqlen_q,
+                    )
 
                 if not continue_cond:
                     if cutlass.const_expr(cum_seqlen_k is not None):
                         cuseqlen_k = cum_seqlen_k[batch_coord]
                         seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
+                    if cutlass.const_expr(mSeqUsedK is not None):
+                        seqlen_k = mSeqUsedK[batch_coord]
 
                     mO_qdl_eff = mO_qdl
                     if cutlass.const_expr(cum_seqlen_q is not None):
-                        # Every packed token row is 64-element aligned, so an
-                        # arbitrary cumulative row offset preserves vector-store
-                        # alignment. Keep the divisibility proof in the IR.
-                        offset_o = cute.assume(
-                            cuseqlen_q * mO_qdl.stride[0],
-                            divby=64,
+                        block_offset_o = (
+                            cuseqlen_q,
+                            Int32(0),
+                            Int32(0),
+                            ((Int32(0), Int32(0)), Int32(0)),
                         )
-                        mO_qdl_eff = cute.make_tensor(
-                            mO_qdl.iterator + offset_o,
-                            mO_qdl.layout,
+                        mO_qdl_eff = domain_offset_aligned(
+                            cute.select(block_offset_o, mode=[0, 2, 3]), mO_qdl
                         )
 
                     # (bM, bN, loopM, loopN, loopL)

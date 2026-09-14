@@ -11,7 +11,7 @@ import cutlass
 import cutlass.cute as cute
 
 from cutlass import Float32, Int32, const_expr
-from cutlass.cute import FastDivmodDivisor
+from cutlass.cute import FastDivmodDivisorV2
 from cutlass.cutlass_dsl import T, dsl_user_op
 from cutlass._mlir.dialects import nvvm, llvm
 from cutlass.cute.runtime import from_dlpack
@@ -98,7 +98,7 @@ def _get_disable_2cta_default(is_fwd: bool = False) -> bool:
 
 
 def _compute_base_hash(func: Callable) -> str:
-    """Compute hash from source code or bytecode and closure values."""
+    """Compute a hash from callable code and captured compile-time values."""
     try:
         data = inspect.getsource(func).encode()
     except (OSError, TypeError):
@@ -113,13 +113,22 @@ def _compute_base_hash(func: Callable) -> str:
         for cell in func.__closure__:
             hasher.update(repr(cell.cell_contents).encode())
 
+    # Factory-generated score/mask modifiers often capture specialization values
+    # as defaults instead of closure cells. Those values affect generated code and
+    # therefore must distinguish entries in the compile cache as well.
+    for attr in ("__defaults__", "__kwdefaults__"):
+        values = getattr(func, attr, None)
+        if values is not None:
+            hasher.update(attr.encode())
+            hasher.update(repr(values).encode())
+
     return hasher.hexdigest()
 
 
 def hash_callable(
     func: Callable, mixer_attrs: Tuple[str] = _MIXER_ATTRS, set_cute_hash: bool = True
 ) -> str:
-    """Hash a callable based on the source code or bytecode and closure values.
+    """Hash a callable based on its code and captured compile-time values.
     Fast-path: if the callable (or its __wrapped__ base) has a ``__cute_hash__``
     attribute, that value is returned immediately as the base hash, then
     metadata dunders are mixed in to produce the final dict-key hash.
@@ -196,7 +205,7 @@ def compute_softmax_scale_log2(softmax_scale, score_mod):
 
 
 def compute_fastdiv_mods(mQ, mK, qhead_per_kvhead, pack_gqa, aux_tensors, mPageTable=None):
-    """Compute FastDivmodDivisor pairs for aux_tensors index computation.
+    """Compute FastDivmodDivisorV2 pairs for aux_tensors index computation.
 
     Returns a (seqlen_q_divmod, seqlen_k_divmod) tuple, or None if aux_tensors is None.
     """
@@ -208,7 +217,7 @@ def compute_fastdiv_mods(mQ, mK, qhead_per_kvhead, pack_gqa, aux_tensors, mPageT
         if const_expr(mPageTable is None)
         else mK.shape[0] * mPageTable.shape[1]
     )
-    return (FastDivmodDivisor(seqlen_q), FastDivmodDivisor(seqlen_k))
+    return (FastDivmodDivisorV2(seqlen_q), FastDivmodDivisorV2(seqlen_k))
 
 
 def convert_from_dlpack(x, leading_dim, alignment=16, divisibility=1) -> cute.Tensor:

@@ -168,6 +168,23 @@ def tensor_bias_and_scalar_scale_score_eager(batch_bias, scale: int):
     return score_mod
 
 
+def default_scale_score_mod(scale):
+    @cute.jit
+    def score_mod(
+        score,
+        b_idx,
+        h_idx,
+        q_idx,
+        kv_idx,
+        seqlen_info,
+        aux_tensors,
+        scale=scale,
+    ):
+        return score * cutlass.Float32(scale)
+
+    return score_mod
+
+
 def create_tensors(
     batch_size=2, num_heads=4, seqlen_q=64, seqlen_kv=64, dim=128, dtype=torch.bfloat16
 ):
@@ -229,6 +246,37 @@ def test_score_mod_aux_cache_separates_dtype_and_layout(monkeypatch):
         ).transpose(1, 2)
         torch.testing.assert_close(out.float(), reference, atol=0.04, rtol=0.04)
     assert len(cache.cache) == 3
+
+
+def test_score_mod_defaults_separate_compile_cache(monkeypatch):
+    torch.manual_seed(0)
+    head_dim = 64
+    q, k, v = create_tensors(
+        batch_size=1,
+        num_heads=2,
+        seqlen_q=64,
+        seqlen_kv=64,
+        dim=head_dim,
+        dtype=torch.bfloat16,
+    )
+    scales = (1.0, 2.0)
+    cache = JITCache()
+    monkeypatch.setattr(_flash_attn_fwd, "compile_cache", cache)
+
+    outputs = [
+        run_cute_flash(q, k, v, default_scale_score_mod(scale)) for scale in scales
+    ]
+
+    scores = q.float() @ k.float().transpose(-1, -2) / math.sqrt(head_dim)
+    references = [
+        (torch.softmax(scores * scale, dim=-1) @ v.float()).to(q.dtype)
+        for scale in scales
+    ]
+    for out, reference in zip(outputs, references):
+        torch.testing.assert_close(out, reference, atol=0.025, rtol=0.025)
+
+    assert len(cache.cache) == 2
+    assert not torch.equal(outputs[0], outputs[1])
 
 
 @pytest.mark.parametrize("seqlen_q,seqlen_kv", SEQLEN_CONFIGS)

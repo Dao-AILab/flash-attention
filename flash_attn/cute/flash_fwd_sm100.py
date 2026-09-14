@@ -39,7 +39,12 @@ from flash_attn.cute import utils
 import flash_attn.cute.pipeline as pipeline_custom
 import cutlass.pipeline as cutlass_pipeline
 from flash_attn.cute.mask import AttentionMask
-from flash_attn.cute.softmax import SoftmaxSm100, apply_score_mod_inner
+from flash_attn.cute.softmax import (
+    SoftmaxSm100,
+    apply_score_mod_inner,
+    apply_learnable_sink,
+    load_learnable_sink,
+)
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
 from flash_attn.cute.block_sparsity import BlockSparseTensors
@@ -53,7 +58,7 @@ from flash_attn.cute.pack_gqa import PackGQA, pack_gqa_layout
 from flash_attn.cute import mma_sm100_desc as sm100_desc
 from flash_attn.cute import blackwell_helpers as sm100_utils
 from flash_attn.cute.named_barrier import NamedBarrierFwdSm100
-from cutlass.cute import FastDivmodDivisor
+from cutlass.cute import FastDivmodDivisorV2
 from quack.cute_dsl_utils import ParamsBase
 from flash_attn.cute.tile_scheduler import (
     SchedulerState,
@@ -98,7 +103,7 @@ _LOG2_DTYPE_MAX = {
 }
 
 _TUNING_CONFIG = {
-    (True, False, 128, False): {"ex2_emu_freq": 10, "ex2_emu_start_frg": 1, "num_regs_softmax": 176, "num_regs_correction": 88},
+    (True, False, 128, False): {"ex2_emu_freq": 10, "ex2_emu_start_frg": 1, "num_regs_softmax": 184, "num_regs_correction": 80},
     (False, True, 128, False): {"ex2_emu_freq": 16, "ex2_emu_start_frg": 1, "num_regs_softmax": 192, "num_regs_correction": 72},
     (True, False, 192, False): {"ex2_emu_freq": 16, "ex2_emu_start_frg": 0, "num_regs_softmax": 184, "num_regs_correction": 80},
     (False, True, 192, False): {"ex2_emu_freq": 32, "ex2_emu_start_frg": 1, "num_regs_softmax": 192, "num_regs_correction": 72},
@@ -532,14 +537,15 @@ class FlashAttentionForwardSm100:
                 self.ex2_emu_freq = 32 if mCuSeqlensQ is not None or mSeqUsedQ is not None else self._tune.get("ex2_emu_freq", 10)
 
         cta_group = tcgen05.CtaGroup.TWO if self.use_2cta_instrs else tcgen05.CtaGroup.ONE
-        q_major_mode = tcgen05.OperandMajorMode.K
-        k_major_mode = tcgen05.OperandMajorMode.K
-        v_major_mode = tcgen05.OperandMajorMode.MN
+        q_major_mode = cute.nvgpu.OperandMajorMode.K
+        k_major_mode = cute.nvgpu.OperandMajorMode.K
+        v_major_mode = cute.nvgpu.OperandMajorMode.MN
         self.o_layout = cutlass.utils.LayoutEnum.from_tensor(mO)
         # the intermediate tensor p is from tmem & mK-major
         p_source = tcgen05.OperandSource.TMEM
-        p_major_mode = tcgen05.OperandMajorMode.K
+        p_major_mode = cute.nvgpu.OperandMajorMode.K
         tiled_mma_qk = sm100_utils_basic.make_trivial_tiled_mma(
+            self.q_dtype,
             self.q_dtype,
             q_major_mode,
             k_major_mode,
@@ -548,6 +554,7 @@ class FlashAttentionForwardSm100:
             self.mma_tiler_qk[:2],
         )
         tiled_mma_pv = sm100_utils_basic.make_trivial_tiled_mma(
+            self.v_dtype,
             self.v_dtype,
             p_major_mode,
             v_major_mode,
@@ -801,7 +808,7 @@ class FlashAttentionForwardSm100:
 
         head_divmod = None
         if cutlass.const_expr(self.pack_gqa):
-            head_divmod = FastDivmodDivisor(self.qhead_per_kvhead)
+            head_divmod = FastDivmodDivisorV2(self.qhead_per_kvhead)
 
         self.use_block_sparsity = cutlass.const_expr(blocksparse_tensors is not None)
         if cutlass.const_expr(self.use_block_sparsity and mPageTable is not None):
@@ -1567,7 +1574,7 @@ class FlashAttentionForwardSm100:
                     mPageTable,
                     mK,
                     mV,
-                    FastDivmodDivisor(page_size),
+                    FastDivmodDivisorV2(page_size),
                     batch_idx,
                     head_idx_kv,
                     tidx,
@@ -2150,10 +2157,10 @@ class FlashAttentionForwardSm100:
                 fastdiv_mods = (
                     seqlen_q_divmod
                     if not recompute_fastdiv_mods_q
-                    else FastDivmodDivisor(seqlen.seqlen_q),
+                    else FastDivmodDivisorV2(seqlen.seqlen_q),
                     seqlen_k_divmod
                     if not recompute_fastdiv_mods_k
-                    else FastDivmodDivisor(seqlen.seqlen_k),
+                    else FastDivmodDivisorV2(seqlen.seqlen_k),
                 )
 
             mask_mod = self.mask_mod if const_expr(self.mask_mod is not None) else None
@@ -2708,14 +2715,15 @@ class FlashAttentionForwardSm100:
                 learnable_sink_val = [None] * self.q_stage
                 if const_expr(learnable_sink is not None):
                     if const_expr(not self.pack_gqa):
-                        sink_val = Float32(learnable_sink[head_idx])
-                        learnable_sink_val = [sink_val] * self.q_stage
+                        learnable_sink_val = [Float32(learnable_sink[head_idx])] * self.q_stage
                     else:  # Each thread might have a different sink value due to different q_head
                         for stage in cutlass.range_constexpr(self.q_stage):
-                            q_head_idx = (
-                                ((m_block * self.q_stage + stage) * self.cta_group_size + mma_tile_coord_v) * self.m_block_size + tidx
-                            ) % self.qhead_per_kvhead + head_idx * self.qhead_per_kvhead
-                            learnable_sink_val[stage] = Float32(learnable_sink[q_head_idx])
+                            packed_row = (
+                                (m_block * self.q_stage + stage) * self.cta_group_size + mma_tile_coord_v
+                            ) * self.m_block_size + tidx
+                            learnable_sink_val[stage] = load_learnable_sink(
+                                learnable_sink, head_idx, packed_row, self.qhead_per_kvhead, self.pack_gqa
+                            )
                 for stage in cutlass.range_constexpr(self.q_stage):
                     # pipeline_sm_stats.consumer_wait_w_index_phase(stage, sm_stats_consumer_phase)
                     sm_stats_barrier.arrive_and_wait_w_index(index=stage * 4 + warp_idx)
@@ -2729,17 +2737,16 @@ class FlashAttentionForwardSm100:
                         row_max = None
                     pipeline_sm_stats.consumer_release_w_index(stage)
                     if const_expr(learnable_sink is not None):
-                        LOG2_E = math.log2(math.e)
-                        sink_val = learnable_sink_val[stage]
+                        # Only the first split owns the sink column; empty rows occur with splitKV.
                         if const_expr(not self.is_split_kv) or split_idx == 0:
-                            if row_max == -Float32.inf:
-                                # It's possible to have an empty row with splitKV.
-                                row_max = sink_val * (LOG2_E / softmax_scale_log2_eff)
-                                row_sum = max_offset_scale
-                            else:
-                                row_sum += cute.math.exp2(
-                                    sink_val * LOG2_E - row_max * softmax_scale_log2_eff + max_offset, fastmath=True
-                                )
+                            row_max, row_sum = apply_learnable_sink(
+                                row_max,
+                                row_sum,
+                                learnable_sink_val[stage],
+                                softmax_scale_log2_eff,
+                                max_offset=max_offset,
+                                empty_row_sum=max_offset_scale,
+                            )
                     acc_O_mn_row_is_zero_or_nan = row_sum == 0.0 or row_sum != row_sum
                     stats[stage] = (row_sum, row_max, acc_O_mn_row_is_zero_or_nan)
                     scale = cute.arch.rcp_approx(row_sum if not acc_O_mn_row_is_zero_or_nan else 1.0)
