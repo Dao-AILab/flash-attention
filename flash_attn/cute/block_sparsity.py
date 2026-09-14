@@ -23,6 +23,7 @@ class BlockSparseTensors(NamedTuple):
     cu_block_idx_offsets: cute.Tensor | None = None
     dq_write_order: cute.Tensor | None = None
     dq_write_order_full: cute.Tensor | None = None
+    cu_total_n_blocks: cute.Tensor | None = None
 
     def __new_from_mlir_values__(self, values):
         new_fields = []
@@ -47,6 +48,8 @@ class BlockSparseTensorsTorch(NamedTuple):
     dq_write_order: torch.Tensor | None = None
     dq_write_order_full: torch.Tensor | None = None
     spt: bool | None = None
+    # Varlen backward: cumulative effective sparse KV blocks, shape (batch_size + 1,).
+    cu_total_n_blocks: torch.Tensor | None = None
 
 
 def _ordered_to_dense_simple(
@@ -505,6 +508,7 @@ def normalize_block_sparse_tensors(
         dq_write_order=dq_write_order,
         dq_write_order_full=dq_write_order_full,
         spt=spt,
+        cu_total_n_blocks=tensors.cu_total_n_blocks,
     )
 
 
@@ -639,6 +643,7 @@ def normalize_block_sparse_config_bwd(
     q_subtile_factor: int,
     kv_subtile_factor: int = 1,
 ) -> tuple[BlockSparseTensorsTorch, Tuple[Tuple[bool, ...], ...] | None]:
+    """Normalize fixed or packed-varlen Q-direction backward metadata."""
     m_block_size, n_block_size = block_size
     if tensors.block_size is None:
         sparse_block_size_q, sparse_block_size_kv = q_subtile_factor * m_block_size, n_block_size
@@ -655,16 +660,35 @@ def normalize_block_sparse_config_bwd(
             f"Block sparsity expects sparse_block_size[1]={expected_sparse_block_size_kv} "
             f"for kv_subtile_factor={kv_subtile_factor}."
         )
-    expected_count_shape, expected_index_shape = get_block_sparse_expected_shapes_bwd(
-        batch_size,
-        num_head,
-        seqlen_q,
-        seqlen_k,
-        m_block_size,
-        n_block_size,
-        q_subtile_factor,
-        kv_subtile_factor,
-    )
+    if tensors.cu_total_n_blocks is not None:
+        if kv_subtile_factor != 1:
+            raise NotImplementedError(
+                "Varlen block-sparse backward does not yet support KV subtile factors"
+            )
+        if tensors.cu_block_idx_offsets is None:
+            raise ValueError("Varlen block-sparse backward requires cu_block_idx_offsets")
+        if tensors.mask_block_cnt.ndim != 2 or tensors.mask_block_idx.ndim != 2:
+            raise ValueError(
+                "Varlen backward block-sparse tensors must have shapes "
+                "(num_heads, total_n_blocks) and (num_heads, total_block_indices)"
+            )
+        if tensors.cu_total_n_blocks.shape != (batch_size + 1,):
+            raise ValueError("cu_total_n_blocks must have shape (batch_size + 1,)")
+        if tensors.cu_block_idx_offsets.shape != (batch_size + 1,):
+            raise ValueError("cu_block_idx_offsets must have shape (batch_size + 1,)")
+        expected_count_shape = (num_head, tensors.mask_block_cnt.shape[-1])
+        expected_index_shape = (num_head, tensors.mask_block_idx.shape[-1])
+    else:
+        expected_count_shape, expected_index_shape = get_block_sparse_expected_shapes_bwd(
+            batch_size,
+            num_head,
+            seqlen_q,
+            seqlen_k,
+            m_block_size,
+            n_block_size,
+            q_subtile_factor,
+            kv_subtile_factor,
+        )
     normalized_tensors = normalize_block_sparse_tensors(
         tensors,
         expected_count_shape=expected_count_shape,
@@ -695,11 +719,15 @@ def to_cute_block_sparse_tensors(
         else None
         for t in (tensors.full_block_cnt, tensors.full_block_idx)
     ]
-    cu_total_m_blocks_tensor, cu_block_idx_offsets_tensor = [
+    cu_total_m_blocks_tensor, cu_block_idx_offsets_tensor, cu_total_n_blocks_tensor = [
         to_cute_tensor(t, assumed_align=4, leading_dim=0, enable_tvm_ffi=enable_tvm_ffi)
         if t is not None
         else None
-        for t in (tensors.cu_total_m_blocks, tensors.cu_block_idx_offsets)
+        for t in (
+            tensors.cu_total_m_blocks,
+            tensors.cu_block_idx_offsets,
+            tensors.cu_total_n_blocks,
+        )
     ]
     dq_write_order_tensor, dq_write_order_full_tensor = [
         to_cute_tensor(t, assumed_align=4, leading_dim=-1, enable_tvm_ffi=enable_tvm_ffi)
@@ -717,6 +745,7 @@ def to_cute_block_sparse_tensors(
         cu_block_idx_offsets_tensor,
         dq_write_order_tensor,
         dq_write_order_full_tensor,
+        cu_total_n_blocks_tensor,
     )
 
 
