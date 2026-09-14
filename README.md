@@ -173,6 +173,14 @@ cd flash-attention
 FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" pip install --no-build-isolation .
 ```
 
+If your ROCm PyTorch environment already provides a compatible Triton package
+(for example, a container image with a PyTorch-pinned ROCm Triton wheel), set
+`FLASH_ATTENTION_USE_SYSTEM_TRITON="TRUE"` to keep that Triton package instead
+of installing another one:
+```sh
+FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" FLASH_ATTENTION_USE_SYSTEM_TRITON="TRUE" pip install --no-build-isolation .
+```
+
 To use a specific aiter commit (e.g., for testing or development):
 ```sh
 cd flash-attention
