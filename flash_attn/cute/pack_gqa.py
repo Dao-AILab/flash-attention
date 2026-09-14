@@ -64,8 +64,10 @@ def padded_qheads_tma_source(T, qhead_per_kvhead_valid, head_idx):
     """Return a heads-first TMA source with a dynamic extent equal to the real head count.
 
     .. note:: In-kernel Q-head padding (sparse MLA).
-        MQA only. Each tile covers one token and one top-k gather list: 128 heads in
-        forward and dQ/dQv, 64 or 128 in backward (``sparse_mla_qhead_tile``). The heads-first view
+        MQA only. Each padded unit is one token's heads over one top-k gather list: 128
+        heads in forward and dQ/dQv, 64 or 128 in backward (``sparse_mla_qhead_tile``);
+        token-pair tiles hold two
+        such units (``gather_kv_token_pairs``). The heads-first view
         ``(nheads, ..., seqlen, ...)`` has a dynamic head extent so CuTe can tile it
         without requiring divisibility. TMA zero-fills out-of-bounds loads and drops
         out-of-bounds stores, avoiding padded operand copies in global memory.
