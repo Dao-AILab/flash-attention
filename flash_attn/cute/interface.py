@@ -192,10 +192,19 @@ class BwdConfig:
     # False: no smem dQ staging, dQ reduced into gmem with red.global.add.v4.f32 from registers
     # (C++ FA3's hdim256 path). Frees 64 KB of smem; not compatible with deterministic.
     dQacc_use_TMA: bool = True
+    # 2: the two CTAs of a cluster take adjacent KV blocks, exchange dS through DSMEM and each
+    # reduces half of the head dim (half the dQ atomics); needs dQacc_use_TMA=False.
+    cluster_size: int = 1
 
 
 def _tile_size_bwd_sm90(
-    head_dim, head_dim_v, causal, local, sparse_block_size_q=None, deterministic=False
+    head_dim,
+    head_dim_v,
+    causal,
+    local,
+    sparse_block_size_q=None,
+    deterministic=False,
+    seqlen_q=None,
 ):
     """Return BwdConfig for SM90.
 
@@ -275,14 +284,24 @@ def _tile_size_bwd_sm90(
         # C++ FA3 hdim256 config (64x80, 2-stage Q, dKV_swapAB, dQ_swapAB) with its
         # dQacc_use_TMA=false path: no smem dQ staging, dQ reduced into gmem with
         # red.global.add.v4.f32 straight from the accumulator, computed in two hdim halves into
-        # the same registers (flash_bwd_sm90.slice_dQ_mma). The freed smem also fits a 2-stage
-        # P/dS buffer.
+        # the same registers (flash_bwd_sm90.slice_dQ_mma).
+        # The hdim 256 backward is bound by that fp32 reduce traffic (S^2 * d * 4 B / tile_n
+        # per head), so for long sequences pairs of CTAs (cluster_size=2, FA4's 2-CTA dS
+        # exchange, here via DSMEM) each reduce half of the head dim with K = 2 * tile_n,
+        # halving the atomics, and share the Q / dO tiles through TMA multicast. The pair's
+        # fixed cost (peer K load, cluster syncs, lockstep) only pays off once the m-block
+        # loop is long enough: on H200 the 2-CTA kernel is 9-17% faster at seqlen_q >= 2048
+        # (dense, causal and wide local windows) and 2-3% slower at seqlen_q <= 1024.
+        # smem at 2 CTAs: Q2 64 + dO 32 + K 40 + K_peer/2 20 + V 40 + P 10 + dS 10 +
+        # dS_xchg 10 = 226 KB, the 227 KB limit together with the 1 KB of LSE/dPsum/mbarriers;
+        # the 1-CTA config spends the peer-K / exchange smem on a 2-stage P/dS buffer instead.
+        cluster_size = 2 if seqlen_q is None or seqlen_q >= 2048 else 1
         return BwdConfig(
             m_block_size=64, n_block_size=80,
-            num_stages_Q=2, num_stages_dO=1, num_stages_PdS=2,
+            num_stages_Q=2, num_stages_dO=1, num_stages_PdS=1 if cluster_size == 2 else 2,
             SdP_swapAB=False, dKV_swapAB=True, dQ_swapAB=True,
             AtomLayoutMSdP=1, AtomLayoutNdKV=1, AtomLayoutMdQ=1,
-            dQacc_use_TMA=False,
+            dQacc_use_TMA=False, cluster_size=cluster_size,
         )
 
 
@@ -2005,6 +2024,12 @@ def _flash_attn_bwd(
             local,
             sparse_block_size_q=sparse_q,
             deterministic=deterministic,
+            # q.shape[1] unless q is packed (cu_seqlens_q); then max_seqlen_q, but only when
+            # it is a host int: callers may pass a device tensor (no sync, no data-dependent
+            # host branch under FakeTensorMode), which selects the long-sequence config.
+            seqlen_q=q.shape[1]
+            if cu_seqlens_q is None
+            else (max_seqlen_q if isinstance(max_seqlen_q, int) else None),
         )
         m_block_size = cfg.m_block_size
         n_block_size = cfg.n_block_size
@@ -2020,7 +2045,7 @@ def _flash_attn_bwd(
         num_threads = (cfg.num_wg + 1) * 128
         dQ_single_wg = cfg.dQ_single_wg
         dQacc_use_TMA = cfg.dQacc_use_TMA
-        cluster_size = 1
+        cluster_size = cfg.cluster_size
         use_2cta_instrs = False
     else:
         m_block_size = 128
@@ -2418,6 +2443,7 @@ def _flash_attn_bwd(
             V_in_regs,
             dQ_single_wg,
             dQacc_use_TMA if arch // 10 == 9 else None,
+            cluster_size if arch // 10 == 9 else None,
             deterministic,
             cu_seqlens_q is None,
             cu_seqlens_k is None,
@@ -2564,6 +2590,7 @@ def _flash_attn_bwd(
                 q_subtile_factor=q_subtile_factor,
                 dQ_single_wg=dQ_single_wg,
                 dQacc_use_TMA=dQacc_use_TMA,
+                cluster_size=cluster_size,
             )
         else:
             if use_dedicated_hd256_kernel:
