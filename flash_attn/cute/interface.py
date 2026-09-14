@@ -247,11 +247,22 @@ def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q
                 num_wg=2,
             )
     else:
-        # hdim 256
+        # hdim 256. The smem dQaccum staging buffer (64 KB) leaves no room for the C++ FA3
+        # tile (64x80, 2-stage Q); 64x48 is the largest tile_n that fits a 2-stage Q pipeline,
+        # and dKV_swapAB (hdim on WGMMA's M axis) is what allows tile_n=48. It also rounds
+        # tile_hdim to 64, which is what makes head_dim in (192, 256) compile.
+        if sparse_block_size_q is not None:
+            # Block sparsity derives its KV block size from n_block_size; keep it at 64.
+            return BwdConfig(
+                m_block_size=64, n_block_size=64,
+                num_stages_Q=1, num_stages_dO=1, num_stages_PdS=1,
+                SdP_swapAB=False, dKV_swapAB=False, dQ_swapAB=False,
+                AtomLayoutMSdP=1, AtomLayoutNdKV=1, AtomLayoutMdQ=1,
+            )
         return BwdConfig(
-            m_block_size=64, n_block_size=64,
-            num_stages_Q=1, num_stages_dO=1, num_stages_PdS=1,
-            SdP_swapAB=False, dKV_swapAB=False, dQ_swapAB=False,
+            m_block_size=64, n_block_size=48,
+            num_stages_Q=2, num_stages_dO=1, num_stages_PdS=1,
+            SdP_swapAB=False, dKV_swapAB=True, dQ_swapAB=False,
             AtomLayoutMSdP=1, AtomLayoutNdKV=1, AtomLayoutMdQ=1,
         )
 
