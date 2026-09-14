@@ -2140,10 +2140,12 @@ def _flash_attn_bwd(
         )
     q_subtile_factor = sparse_q // m_block_size if sparse_q is not None else 2
     seqlen_q_rounded = (seqlen_q + m_block_size - 1) // m_block_size * m_block_size
-    seqlen_k_rounded = (seqlen_k + n_block_size - 1) // n_block_size * n_block_size
-    num_n_blocks = seqlen_k_rounded // n_block_size
-    if cluster_size == 2 and num_n_blocks % cluster_size != 0:
-        seqlen_k_rounded = seqlen_k_rounded + n_block_size
+    # Round up to the whole KV footprint of a cluster so a 2-CTA pair always has a
+    # partner n-block. Plain arithmetic rather than a branch on the block count:
+    # max_seqlen_k may be a device tensor, and a Python `if` on it would sync and
+    # break FakeTensorMode, for the same reason single_k_block is guarded below.
+    n_block_round = n_block_size * cluster_size
+    seqlen_k_rounded = (seqlen_k + n_block_round - 1) // n_block_round * n_block_round
 
     # The single-block specialization below only guards against TVM stride poisoning,
     # which is a host-side branch predicate that selects a kernel variant. When
