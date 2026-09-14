@@ -189,9 +189,14 @@ class BwdConfig:
     AtomLayoutMdQ: int
     num_wg: int = 2  # MMA warp groups (total threads = (num_wg + 1) * 128)
     dQ_single_wg: bool = False
+    # False: no smem dQ staging, dQ reduced into gmem with red.global.add.v4.f32 from registers
+    # (C++ FA3's hdim256 path). Frees 64 KB of smem; not compatible with deterministic.
+    dQacc_use_TMA: bool = True
 
 
-def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q=None):
+def _tile_size_bwd_sm90(
+    head_dim, head_dim_v, causal, local, sparse_block_size_q=None, deterministic=False
+):
     """Return BwdConfig for SM90.
 
     Configs based on C++ FA3 hopper/flash_bwd_launch_template.h,
@@ -247,10 +252,8 @@ def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q
                 num_wg=2,
             )
     else:
-        # hdim 256. The smem dQaccum staging buffer (64 KB) leaves no room for the C++ FA3
-        # tile (64x80, 2-stage Q); 64x48 is the largest tile_n that fits a 2-stage Q pipeline,
-        # and dKV_swapAB (hdim on WGMMA's M axis) is what allows tile_n=48. It also rounds
-        # tile_hdim to 64, which is what makes head_dim in (192, 256) compile.
+        # hdim 256. dKV_swapAB (hdim on WGMMA's M axis) rounds tile_hdim to 64, which is what
+        # makes head_dim in (192, 256) compile.
         if sparse_block_size_q is not None:
             # Block sparsity derives its KV block size from n_block_size; keep it at 64.
             return BwdConfig(
@@ -259,11 +262,27 @@ def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q
                 SdP_swapAB=False, dKV_swapAB=False, dQ_swapAB=False,
                 AtomLayoutMSdP=1, AtomLayoutNdKV=1, AtomLayoutMdQ=1,
             )
+        if deterministic:
+            # The semaphore-ordered dQ reduction needs the smem-staged dQ path; its 64 KB
+            # buffer leaves no room for the C++ FA3 tile (64x80, 2-stage Q), and 64x48 is the
+            # largest tile_n that fits a 2-stage Q pipeline.
+            return BwdConfig(
+                m_block_size=64, n_block_size=48,
+                num_stages_Q=2, num_stages_dO=1, num_stages_PdS=1,
+                SdP_swapAB=False, dKV_swapAB=True, dQ_swapAB=False,
+                AtomLayoutMSdP=1, AtomLayoutNdKV=1, AtomLayoutMdQ=1,
+            )
+        # C++ FA3 hdim256 config (64x80, 2-stage Q, dKV_swapAB, dQ_swapAB) with its
+        # dQacc_use_TMA=false path: no smem dQ staging, dQ reduced into gmem with
+        # red.global.add.v4.f32 straight from the accumulator, computed in two hdim halves into
+        # the same registers (flash_bwd_sm90.slice_dQ_mma). The freed smem also fits a 2-stage
+        # P/dS buffer.
         return BwdConfig(
-            m_block_size=64, n_block_size=48,
-            num_stages_Q=2, num_stages_dO=1, num_stages_PdS=1,
-            SdP_swapAB=False, dKV_swapAB=True, dQ_swapAB=False,
+            m_block_size=64, n_block_size=80,
+            num_stages_Q=2, num_stages_dO=1, num_stages_PdS=2,
+            SdP_swapAB=False, dKV_swapAB=True, dQ_swapAB=True,
             AtomLayoutMSdP=1, AtomLayoutNdKV=1, AtomLayoutMdQ=1,
+            dQacc_use_TMA=False,
         )
 
 
@@ -1985,6 +2004,7 @@ def _flash_attn_bwd(
             causal,
             local,
             sparse_block_size_q=sparse_q,
+            deterministic=deterministic,
         )
         m_block_size = cfg.m_block_size
         n_block_size = cfg.n_block_size
@@ -1999,6 +2019,7 @@ def _flash_attn_bwd(
         AtomLayoutMdQ = cfg.AtomLayoutMdQ
         num_threads = (cfg.num_wg + 1) * 128
         dQ_single_wg = cfg.dQ_single_wg
+        dQacc_use_TMA = cfg.dQacc_use_TMA
         cluster_size = 1
         use_2cta_instrs = False
     else:
@@ -2396,6 +2417,7 @@ def _flash_attn_bwd(
             AtomLayoutMdQ,
             V_in_regs,
             dQ_single_wg,
+            dQacc_use_TMA if arch // 10 == 9 else None,
             deterministic,
             cu_seqlens_q is None,
             cu_seqlens_k is None,
@@ -2541,6 +2563,7 @@ def _flash_attn_bwd(
                 has_aux_tensors=aux_tensors is not None,
                 q_subtile_factor=q_subtile_factor,
                 dQ_single_wg=dQ_single_wg,
+                dQacc_use_TMA=dQacc_use_TMA,
             )
         else:
             if use_dedicated_hd256_kernel:
