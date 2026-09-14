@@ -823,6 +823,8 @@ def test_flash_attn_small_head_dim(seqlen_q, seqlen_k, d, causal, dtype):
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_pack_gqa_padded_head_dim(head_dim, head_dim_v, causal, dtype):
+    if (IS_SM100 or IS_SM110) and head_dim == 136:
+        pytest.skip("SM100/SM110 do not support head_dim=136")
     torch.manual_seed(0)
     batch_size, seqlen_q, seqlen_k = 1, 64, 64
     num_heads, num_heads_kv = 5, 1

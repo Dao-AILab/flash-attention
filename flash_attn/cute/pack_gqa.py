@@ -263,8 +263,6 @@ class PackGQA:
                     ki = tOcO[0, 0, k][1] // elems_per_load
                     pred = None
                     if cutlass.const_expr(self.check_hdim_oob):
-                        # Slicing one K group drops tiled-copy predicate broadcasting,
-                        # so expand its transaction predicate to the copy operand.
                         pred = cute.make_fragment_like(tOrO[None, m, k], cutlass.Boolean)
                         pred.fill(tOpO[0, m, k])
                     cute.copy(
