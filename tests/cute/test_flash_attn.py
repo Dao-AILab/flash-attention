@@ -205,12 +205,17 @@ def check_sm90_hdim_padding(
     varlen: bool = False,
     dtype: torch.dtype = torch.bfloat16,
     d_v: int = 128,
+    nheads_kv: int = 4,
 ) -> None:
     """Check the public forward/backward path against FP64 and low-precision eager."""
     torch.manual_seed(0)
     q = torch.randn(2, seqlen_q, 4, d, device="cuda", dtype=dtype, requires_grad=True)
-    k = torch.randn(2, seqlen_k, 4, d, device="cuda", dtype=dtype, requires_grad=True)
-    v = torch.randn(2, seqlen_k, 4, d_v, device="cuda", dtype=dtype, requires_grad=True)
+    k = torch.randn(
+        2, seqlen_k, nheads_kv, d, device="cuda", dtype=dtype, requires_grad=True
+    )
+    v = torch.randn(
+        2, seqlen_k, nheads_kv, d_v, device="cuda", dtype=dtype, requires_grad=True
+    )
     causal = mask == "causal"
     window = (32, 16) if mask == "local" else (None, None)
     q_mask = k_mask = None
@@ -293,13 +298,22 @@ def check_sm90_hdim_padding(
 
 
 @pytest.mark.skipif(not IS_SM90, reason="SM90 backward padding regression")
-@pytest.mark.parametrize("d", [136, 144, 152, 160, 168, 176, 184, 192])
+@pytest.mark.parametrize("d", [136, 144, 152, 160, 168, 176, 184, 192, 200, 224, 240])
 @pytest.mark.parametrize("seqlen_q,seqlen_k", [(113, 211), (257, 513)])
 @pytest.mark.parametrize("mask", ["dense", "causal", "local"])
 @pytest.mark.parametrize("varlen", [False, True])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_sm90_hdim_padding(d, seqlen_q, seqlen_k, mask, varlen):
     check_sm90_hdim_padding(d, seqlen_q, seqlen_k, mask, varlen)
+
+
+@pytest.mark.skipif(not IS_SM90, reason="SM90 backward padding regression")
+@pytest.mark.parametrize("d", [160, 192, 224])
+@pytest.mark.parametrize("mask", ["dense", "causal"])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_sm90_hdim_padding_gqa(d, mask):
+    """GQA goes through the fp32 dK/dV accumulators and the swapped-layout postprocess."""
+    check_sm90_hdim_padding(d, mask=mask, d_v=d, nheads_kv=2)
 
 
 @pytest.mark.skipif(not IS_SM90, reason="SM90 backward padding regression")
