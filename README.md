@@ -536,7 +536,7 @@ train GPT2 on Openwebtext and GPT3 on The Pile.
 ## Triton implementation of FlashAttention
 
 Phil Tillet (OpenAI) has an experimental implementation of FlashAttention in Triton:
-https://github.com/openai/triton/blob/master/python/tutorials/06-fused-attention.py
+https://github.com/triton-lang/triton/blob/main/python/tutorials/06-fused-attention.py
 
 As Triton is a higher-level language than CUDA, it might be easier to understand
 and experiment with. The notations in the Triton implementation are also closer
