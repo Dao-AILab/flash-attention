@@ -23,7 +23,7 @@ See `run_fa4_ci.py` for the shared logic used by both CI and `test_ci_local.sh`.
 ## Updating the container image
 
 1. Build and push a new image via `tools/ci/docker/build.sh` + `tag_and_push.sh`.
-2. Update `FA4_IMAGE` in `.github/workflows/ci.yml` with the new tag and `sha256` digest.
+2. Update `fa4_image_cu129` and/or `fa4_image_cu130` on the `gpu-test` action call in `.github/workflows/ci.yml` with the new tag and `sha256` digest. The action picks between them from the runner CUDA version and exports `FA4_IMAGE` internally.
 3. The old SIF is automatically deleted from the runner on the next CI run.
 
 ## Expanding test coverage
