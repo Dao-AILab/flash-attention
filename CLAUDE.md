@@ -100,7 +100,7 @@ Tensor layout: `(batch, seqlen, num_heads, head_dim)`, last dim contiguous, 16-b
 
 ### Architecture-Specific Helpers
 
-- `hopper_helpers.py` — SM90 warp-group GEMM, shared memory layout creation, fence/commit/wait.
+- `quack.sm90_utils` — SM90 warp-group GEMM, shared memory layout creation, fence/commit/wait.
 - `blackwell_helpers.py` — SM100 UMMA-based GEMM, PTX-optimized paths, 2CTA support.
 - `mma_sm100_desc.py` — Hardware MMA descriptor enums (formats, saturation, scaling).
 
