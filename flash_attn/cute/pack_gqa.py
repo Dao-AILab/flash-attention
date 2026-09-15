@@ -129,6 +129,11 @@ class PackGQA:
         threads_per_row: cutlass.Constexpr[int],
         num_threads: cutlass.Constexpr[int],
     ):
+        # Avoid elem_pointer with a nested coord: MLIR flattens the dynamic
+        # layout type to `(?):(?)` and crd2idx rejects the coord `((h,m),)`.
+        base_ptr = tensor.iterator
+        head_stride = tensor.stride[0][0]
+        seq_stride = tensor.stride[0][1]
         num_ptr_per_thread = cute.ceil_div(cute.size(cRows), threads_per_row)
         tPrPtr = cute.make_rmem_tensor(num_ptr_per_thread, cutlass.Int64)
         for i in cutlass.range_constexpr(num_ptr_per_thread):
@@ -136,7 +141,7 @@ class PackGQA:
             idx = block * self.m_block_size + row
             m_idx = idx // self.qhead_per_kvhead
             h_idx = idx - m_idx * self.qhead_per_kvhead
-            tPrPtr[i] = utils.elem_pointer(tensor, ((h_idx, m_idx),)).toint()
+            tPrPtr[i] = (base_ptr + (h_idx * head_stride + m_idx * seq_stride)).toint()
         return tPrPtr
 
     @cute.jit
