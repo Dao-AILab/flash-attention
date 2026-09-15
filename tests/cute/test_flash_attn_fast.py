@@ -11,6 +11,7 @@ from einops import rearrange
 
 from flash_attn.cute.cache_utils import JITCache
 from flash_attn.cute.interface import (
+    _flash_attn_bwd,
     _flash_attn_fwd,
     flash_attn_combine,
     flash_attn_func,
@@ -105,14 +106,116 @@ def test_flash_attn_output(seqlen_q, seqlen_k, d, causal, num_splits, mha_type, 
     assert (dv - dv_ref).abs().max().item() <= 2 * (dv_pt - dv_ref).abs().max().item() + dv_atol
 
 
+@pytest.mark.skipif(not IS_SM120, reason="SM120-specific long-sequence backward paths")
+@pytest.mark.parametrize("d,causal", [(64, False), (128, False), (128, True)])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_sm120_long_backward_paths(d, causal, monkeypatch):
+    """Cover the D64 RS path and the D128 V-in-register/mask-skip path."""
+    device = "cuda"
+    dtype = torch.bfloat16
+    seqlen = 8192
+    shape = (1, seqlen, 1, d)
+
+    # With one reported SM, the small B1/H1 D64 case still selects the 64x128
+    # tile and register-resident P/dS path, without allocating a multi-wave
+    # reference problem. D128 ignores this selector and exercises its separate
+    # long-sequence V-in-register path (plus mask skip for the causal case).
+    if d == 64:
+        monkeypatch.setenv("FLASH_ATTENTION_NUM_SMS", "1")
+    torch.manual_seed(8192 + d + int(causal))
+    base = [torch.randn(shape, device=device, dtype=dtype) for _ in range(3)]
+    q, k, v = [tensor.detach().requires_grad_() for tensor in base]
+    out, lse = flash_attn_func(q, k, v, causal=causal, num_splits=1)
+    dout = torch.randn_like(out)
+
+    original_bwd_cache = _flash_attn_bwd.compile_cache
+    test_bwd_cache = JITCache()
+    _flash_attn_bwd.compile_cache = test_bwd_cache
+    try:
+        grads = _flash_attn_bwd(q, k, v, out, dout, lse, causal=causal)
+        assert len(test_bwd_cache.cache) == 1
+        key = next(iter(test_bwd_cache.cache))
+        # Keep these indices synchronized with the SM80/SM90/SM120 compile key
+        # in interface._flash_attn_bwd.
+        selected = {
+            "m_block_size": key[8],
+            "n_block_size": key[9],
+            "num_threads": key[10],
+            "skip_full_causal_mask": key[12],
+            "num_stages_Q": key[13],
+            "num_stages_dO": key[14],
+            "SdP_swapAB": key[15],
+            "AtomLayoutMSdP": key[18],
+            "AtomLayoutNdKV": key[19],
+            "AtomLayoutMdQ": key[20],
+            "V_in_regs": key[21],
+        }
+        expected = (
+            {
+                "m_block_size": 64,
+                "n_block_size": 128,
+                "num_threads": 256,
+                "skip_full_causal_mask": False,
+                "num_stages_Q": 1,
+                "num_stages_dO": 1,
+                "SdP_swapAB": True,
+                "AtomLayoutMSdP": 1,
+                "AtomLayoutNdKV": 8,
+                "AtomLayoutMdQ": 4,
+                "V_in_regs": False,
+            }
+            if d == 64
+            else {
+                "m_block_size": 64,
+                "n_block_size": 64,
+                "num_threads": 256,
+                "skip_full_causal_mask": causal,
+                "num_stages_Q": 2,
+                "num_stages_dO": 1,
+                "SdP_swapAB": False,
+                "AtomLayoutMSdP": 4,
+                "AtomLayoutNdKV": 2,
+                "AtomLayoutMdQ": 2,
+                "V_in_regs": True,
+            }
+        )
+        assert selected == expected
+        if not is_fake_mode():
+            torch.cuda.synchronize()
+    finally:
+        test_bwd_cache.clear()
+        _flash_attn_bwd.compile_cache = original_bwd_cache
+
+    if is_fake_mode():
+        return
+
+    q_ref, k_ref, v_ref = [tensor.detach().requires_grad_() for tensor in base]
+    q_pt, k_pt, v_pt = [tensor.detach().requires_grad_() for tensor in base]
+    out_ref, _ = attention_ref(q_ref, k_ref, v_ref, causal=causal)
+    out_pt, _ = attention_ref(
+        q_pt, k_pt, v_pt, causal=causal, upcast=False, reorder_ops=True
+    )
+    grads_ref = torch.autograd.grad(out_ref, (q_ref, k_ref, v_ref), dout)
+    grads_pt = torch.autograd.grad(out_pt, (q_pt, k_pt, v_pt), dout)
+
+    for actual, reference, pytorch in (
+        (out, out_ref, out_pt),
+        *zip(grads, grads_ref, grads_pt),
+    ):
+        atol = 2 * (reference + 0.3 - 0.3 - reference).abs().max().item()
+        assert (actual - reference).abs().max().item() <= (
+            2 * (pytorch - reference).abs().max().item() + atol
+        )
+
+
 # ---------------------------------------------------------------------------
 # Forward + backward (varlen with cu_seqlens)
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.skipif(USE_FAKE_TENSOR, reason="requires a data-dependent CUDA max")
-def test_flash_attn_varlen_tensor_max_seqlen_reuses_fwd_cache():
-    """A fresh CUDA scalar max_seqlen must not create a new compile key."""
+def test_flash_attn_varlen_tensor_max_seqlen_reuses_fwd_bwd_cache():
+    """A fresh CUDA scalar max_seqlen must not create new compile keys."""
     device = "cuda"
     dtype = torch.bfloat16
     seqlens = torch.tensor([384, 320], dtype=torch.int32, device=device)
@@ -123,17 +226,25 @@ def test_flash_attn_varlen_tensor_max_seqlen_reuses_fwd_cache():
         ]
     )
     total = int(cu_seqlens[-1].item())
-    q = torch.randn(total, 2, 64, device=device, dtype=dtype)
-    k = torch.randn_like(q)
-    v = torch.randn_like(q)
+    q = torch.randn(total, 2, 64, device=device, dtype=dtype, requires_grad=True)
+    k = torch.randn_like(q, requires_grad=True)
+    v = torch.randn_like(q, requires_grad=True)
+    dout = torch.randn_like(q)
 
-    original_cache = _flash_attn_fwd.compile_cache
-    test_cache = JITCache()
-    _flash_attn_fwd.compile_cache = test_cache
+    original_fwd_cache = _flash_attn_fwd.compile_cache
+    original_bwd_cache = _flash_attn_bwd.compile_cache
+    test_fwd_cache = JITCache()
+    test_bwd_cache = JITCache()
+    _flash_attn_fwd.compile_cache = test_fwd_cache
+    _flash_attn_bwd.compile_cache = test_bwd_cache
     try:
         outputs = []
-        for _ in range(2):
-            max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
+        grads = []
+        for max_seqlen in (
+            (cu_seqlens[1:] - cu_seqlens[:-1]).max(),
+            (cu_seqlens[1:] - cu_seqlens[:-1]).max(),
+            int(seqlens.max().item()),
+        ):
             out, _ = flash_attn_varlen_func(
                 q,
                 k,
@@ -144,17 +255,28 @@ def test_flash_attn_varlen_tensor_max_seqlen_reuses_fwd_cache():
                 max_seqlen_k=max_seqlen,
             )
             outputs.append(out)
+            grads.append(torch.autograd.grad(out, (q, k, v), dout))
 
-        assert torch.equal(outputs[0], outputs[1])
-        assert len(test_cache.cache) == 1
-        assert all(
-            not torch.is_tensor(value)
-            for key in test_cache.cache
-            for value in key
-        )
+        for output in outputs[1:]:
+            assert torch.equal(outputs[0], output)
+        for current_grads in grads[1:]:
+            for expected, actual in zip(grads[0], current_grads):
+                # SM120 dQ/dK/dV use atomics, so repeated launches need not be
+                # bitwise deterministic even when they reuse the same kernel.
+                torch.testing.assert_close(actual, expected, atol=1e-2, rtol=1e-2)
+        assert len(test_fwd_cache.cache) == 1
+        assert len(test_bwd_cache.cache) == 1
+        for test_cache in (test_fwd_cache, test_bwd_cache):
+            assert all(
+                not torch.is_tensor(value)
+                for key in test_cache.cache
+                for value in key
+            )
     finally:
-        test_cache.clear()
-        _flash_attn_fwd.compile_cache = original_cache
+        test_fwd_cache.clear()
+        test_bwd_cache.clear()
+        _flash_attn_fwd.compile_cache = original_fwd_cache
+        _flash_attn_bwd.compile_cache = original_bwd_cache
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
@@ -320,22 +442,33 @@ def test_flash_attn_varlen_unpad_output(seqlen, d, causal, mha_type, unpad_q, un
         return
 
     g = torch.randn_like(out_unpad)
+    if not unpad_q:
+        g = g.masked_fill(~q_mask, 0.0)
     dq_in, dk_in, dv_in = torch.autograd.grad(out_unpad, (q_in, k_in, v_in), g)
+
+    g_padded = output_pad_fn(g) if unpad_q else g
+    grads_ref = torch.autograd.grad(out_ref, (q_ref, k_ref, v_ref), g_padded)
+    grads_pt = torch.autograd.grad(out_pt, (q_ref, k_ref, v_ref), g_padded)
+
+    dq = dq_pad_fn(dq_in) if unpad_q else dq_in
+    dk = dk_pad_fn(dk_in) if unpad_kv else dk_in
+    dv = dk_pad_fn(dv_in) if unpad_kv else dv_in
 
     # Mask out padding positions again
     k_mask = rearrange(key_padding_mask, "b s -> b s 1 1")
-    if not unpad_q:
-        dq_in = dq_in.clone().masked_fill_(~q_mask, 0.0)
-    if not unpad_kv:
-        dk_in = dk_in.clone().masked_fill_(~k_mask, 0.0)
-        dv_in = dv_in.clone().masked_fill_(~k_mask, 0.0)
+    dq = dq.masked_fill(~q_mask, 0.0)
+    dk = dk.masked_fill(~k_mask, 0.0)
+    dv = dv.masked_fill(~k_mask, 0.0)
 
-    assert dq_in.isfinite().all(), "dq contains non-finite values"
-    assert dk_in.isfinite().all(), "dk contains non-finite values"
-    assert dv_in.isfinite().all(), "dv contains non-finite values"
-    assert dq_in.abs().max().item() > 0, "dq is all zeros"
-    assert dk_in.abs().max().item() > 0, "dk is all zeros"
-    assert dv_in.abs().max().item() > 0, "dv is all zeros"
+    for name, actual, reference, pytorch in zip(
+        ("dq", "dk", "dv"), (dq, dk, dv), grads_ref, grads_pt
+    ):
+        assert actual.isfinite().all(), f"{name} contains non-finite values"
+        assert actual.abs().max().item() > 0, f"{name} is all zeros"
+        atol = 2 * (reference + 0.3 - 0.3 - reference).abs().max().item()
+        assert (actual - reference).abs().max().item() <= (
+            2 * (pytorch - reference).abs().max().item() + atol
+        )
 
 
 # ---------------------------------------------------------------------------
