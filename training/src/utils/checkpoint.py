@@ -32,7 +32,7 @@ def load_checkpoint(path, device='cpu'):
 def blockdiag_to_dense_mlp_bert(state_dict):
     from src.ops.blockdiag_multiply import blockdiag_weight_to_dense_weight
     names = {name for name in state_dict
-             if re.match('bert.encoder.layer.(\d+).(mlp.fc(1|2)|(intermediate|output).dense).weight',
+             if re.match('bert.encoder.layer.(\\d+).(mlp.fc(1|2)|(intermediate|output).dense).weight',
                          name)}
     for name in names:
         state_dict[name] = blockdiag_weight_to_dense_weight(state_dict[name])
