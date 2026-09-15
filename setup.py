@@ -465,8 +465,19 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
     if ROCM_BACKEND == "ck":
         ck_dir = "csrc/composable_kernel"
 
-        #use codegen get code dispatch
-        if not os.path.exists("./build"):
+        # Feature trimming. Each disabled feature removes both its host sources and the
+        # CK kernels generated for it, which is what actually dominates build time.
+        disable_backward = os.getenv("FLASH_ATTENTION_DISABLE_BACKWARD", "FALSE").upper() == "TRUE"
+        disable_varlen = os.getenv("FLASH_ATTENTION_DISABLE_VARLEN", "FALSE").upper() == "TRUE"
+        disable_kvcache = os.getenv("FLASH_ATTENTION_DISABLE_KVCACHE", "FALSE").upper() == "TRUE"
+
+        # generate.py only ever adds files, and rename_cpp_to_cu leaves .cu behind, so a
+        # stale build dir silently reintroduces kernels that the current flags exclude.
+        if os.path.exists("./build"):
+            for stale in glob.glob("build/fmha_*"):
+                if os.path.isfile(stale):
+                    os.remove(stale)
+        else:
             os.makedirs("build")
 
         optdim = os.getenv("OPT_DIM", "32,64,128,256")
@@ -497,7 +508,16 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
         # If generate.py fails with an unknown argument error, ensure the
         # composable_kernel submodule is up to date.
         targets_arg = ",".join(kernel_targets)
-        for direction in ["fwd", "fwd_appendkv", "fwd_splitkv", "bwd"]:
+        directions = ["fwd"]
+        if not disable_kvcache:
+            directions.append("fwd_appendkv")
+        # varlen forward references fmha_fwd_splitkv on its paged-KV path, kvcache uses it too
+        if not (disable_varlen and disable_kvcache):
+            directions.append("fwd_splitkv")
+        if not disable_backward:
+            directions.append("bwd")
+        print(f"CK FMHA codegen directions: {directions} (optdim={optdim})")
+        for direction in directions:
             subprocess.run([sys.executable, f"{ck_dir}/example/ck_tile/01_fmha/generate.py", "-d", direction, "--output_dir", "build", "--receipt", "2", "--optdim", optdim, "--targets", targets_arg], check=True)
 
         # Check, if ATen/CUDAGeneratorImpl.h is found, otherwise use ATen/cuda/CUDAGeneratorImpl.h
@@ -516,13 +536,17 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
         if FORCE_CXX11_ABI:
             torch._C._GLIBCXX_USE_CXX11_ABI = True
 
-        sources = ["csrc/flash_attn_ck/flash_api.cpp",
-                "csrc/flash_attn_ck/flash_common.cpp",
-                "csrc/flash_attn_ck/mha_bwd.cpp",
-                "csrc/flash_attn_ck/mha_fwd_kvcache.cpp",
-                "csrc/flash_attn_ck/mha_fwd.cpp",
-                "csrc/flash_attn_ck/mha_varlen_bwd.cpp",
-                "csrc/flash_attn_ck/mha_varlen_fwd.cpp"] + glob.glob(
+        host_sources = ["flash_api", "flash_common", "mha_fwd"]
+        if not disable_backward:
+            host_sources.append("mha_bwd")
+            if not disable_varlen:
+                host_sources.append("mha_varlen_bwd")
+        if not disable_varlen:
+            host_sources.append("mha_varlen_fwd")
+        if not disable_kvcache:
+            host_sources.append("mha_fwd_kvcache")
+
+        sources = [f"csrc/flash_attn_ck/{name}.cpp" for name in host_sources] + glob.glob(
             f"build/fmha_*wd*.cpp"
         )
 
@@ -546,7 +570,6 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
                     "-DCK_ENABLE_INT8",
                     "-DCK_USE_XDL",
                     "-DUSE_PROF_API=1",
-                    # "-DFLASHATTENTION_DISABLE_BACKWARD",
                     "-D__HIP_PLATFORM_HCC__=1"]
 
         supported_ck_tile_bfloat16_modes = get_ck_tile_bfloat16_supported_modes(ck_dir)
@@ -554,6 +577,12 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
             arch.startswith(("gfx11", "gfx12")) for arch in kernel_targets
         )
         rdna_bfloat16_default = "5" if "5" in supported_ck_tile_bfloat16_modes else "0"
+
+        for macro, enabled in (("FLASHATTENTION_DISABLE_BACKWARD", disable_backward),
+                               ("FLASHATTENTION_DISABLE_VARLEN", disable_varlen),
+                               ("FLASHATTENTION_DISABLE_KVCACHE", disable_kvcache)):
+            if enabled:
+                cc_flag.append(f"-D{macro}")
 
         ck_tile_float_to_bfloat16_default = os.environ.get("CK_TILE_FLOAT_TO_BFLOAT16_DEFAULT")
         if ck_tile_float_to_bfloat16_default is None:
@@ -566,13 +595,9 @@ elif not SKIP_CUDA_BUILD and IS_ROCM:
 
         rename_cpp_to_cu(sources, generated_rdna_bfloat16_override=generated_rdna_bfloat16_override)
 
-        renamed_sources = ["csrc/flash_attn_ck/flash_api.cu",
-                        "csrc/flash_attn_ck/flash_common.cu",
-                        "csrc/flash_attn_ck/mha_bwd.cu",
-                        "csrc/flash_attn_ck/mha_fwd_kvcache.cu",
-                        "csrc/flash_attn_ck/mha_fwd.cu",
-                        "csrc/flash_attn_ck/mha_varlen_bwd.cu",
-                        "csrc/flash_attn_ck/mha_varlen_fwd.cu"] + glob.glob(f"build/fmha_*wd*.cu")
+        renamed_sources = [f"csrc/flash_attn_ck/{name}.cu" for name in host_sources] + glob.glob(
+            f"build/fmha_*wd*.cu"
+        )
 
         # Imitate https://github.com/ROCm/composable_kernel/blob/c8b6b64240e840a7decf76dfaa13c37da5294c4a/CMakeLists.txt#L190-L214
         hip_version = get_hip_version()
