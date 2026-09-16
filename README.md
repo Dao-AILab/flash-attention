@@ -289,7 +289,7 @@ def flash_attn_with_kvcache(
     v=None,
     rotary_cos=None,
     rotary_sin=None,
-    cache_seqlens: Optional[Union[(int, torch.Tensor)]] = None,
+    cache_seqlens: Optional[Union[int, torch.Tensor]] = None,
     cache_batch_idx: Optional[torch.Tensor] = None,
     block_table: Optional[torch.Tensor] = None,
     softmax_scale=None,
