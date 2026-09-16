@@ -2646,21 +2646,25 @@ class FlashAttentionSparseMLABackwardSm100:
                     tSR_sPt_cur = tSR_sPt[None, None, None, consumer_state_P.index]
                     cute.copy(tiled_copy_s2r, tSR_sPt_cur, rPt_copy_view)
 
+                    # Normalize the saved (unnormalized, bf16) P^T in fp32 with
+                    # the fp32 scale_p. The result is rounded to bf16 once for
+                    # the dV mma operand; the fp32 copy stays live for dS.
+                    rPt_f32 = cute.make_rmem_tensor(rPt.shape, self.dtype_acc)
+                    rPt_f32.store(rPt.load().to(self.dtype_acc))
                     # ((2,2),(2,8,1)):((2,32),(1,4,0))
-                    rP_nm = layout_utils.reshape_acc_to_mn(rPt[(None, 0), None, None])
+                    rP_nm = layout_utils.reshape_acc_to_mn(rPt_f32[(None, 0), None, None])
 
                     tPsScaleP_cur = tPsScaleP_nm[0, None, consumer_state_scaleP.index]
                     tPrScaleP_cur_f32 = cute.make_rmem_tensor(
                         tPsScaleP_cur.shape, dtype=self.dtype_scale
                     )
-                    tPrScaleP_cur = cute.make_rmem_tensor(tPsScaleP_cur.shape, dtype=self.dtype)
                     cute.autovec_copy(tPsScaleP_cur, tPrScaleP_cur_f32)
-                    tPrScaleP_cur.store(tPrScaleP_cur_f32.load().to(self.dtype))
 
                     # scale P
                     for n in cutlass.range_constexpr(cute.size(rP_nm.shape[0])):
                         rP_cur = rP_nm[n, None]
-                        rP_cur.store(rP_cur.load() * tPrScaleP_cur.load())
+                        rP_cur.store(rP_cur.load() * tPrScaleP_cur_f32.load())
+                    rPt.store(rPt_f32.load().to(self.dtype))
                     cute.arch.sync_warp()
 
                     cute.copy(tiled_copy_r2s, rPt_copy_view, tSR_sPt_cur)
@@ -2736,7 +2740,9 @@ class FlashAttentionSparseMLABackwardSm100:
                     for i in cutlass.range_constexpr(0, cute.size(rS_t2r), 2):
                         rS_t2r[i] = cute.math.exp2(rS_t2r[i], fastmath=True)
                         rS_t2r[i + 1] = cute.math.exp2(rS_t2r[i + 1], fastmath=True)
-                    rPt.store(rS_t2r.load().to(self.dtype))
+                    # fp32 P^T stays live for dS; the bf16 copy feeds the dV mma.
+                    rPt_f32 = rS_t2r
+                    rPt.store(rPt_f32.load().to(self.dtype))
 
                     # ==== 5) stage P^T into the Pt operand buffer ====
                     if const_expr(self.merged_dS):
@@ -2785,7 +2791,9 @@ class FlashAttentionSparseMLABackwardSm100:
                         for i in cutlass.range_constexpr(cute.size(rdP_cur)):
                             rdP_cur[i] = rdP_cur[i] if valid else Float32(0.0)
 
-                rPt.store(rPt.load() * (tdPrdP_t2r.load() * softmax_scale).to(self.dtype))
+                # dS^T = P^T o (dP^T - dPsum) * softmax_scale: form the product in
+                # fp32 and round to bf16 once (dS store / dQ,dK mma operand).
+                rPt.store((rPt_f32.load() * (tdPrdP_t2r.load() * softmax_scale)).to(self.dtype))
 
                 if const_expr(not self.merged_dS):
                     # wait for tma store to free dSt buffer
