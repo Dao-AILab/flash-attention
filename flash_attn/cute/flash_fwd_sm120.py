@@ -18,6 +18,15 @@ class FlashAttentionForwardSm120(FlashAttentionForwardSm80):
         super().__init__(*args, **kwargs)
         self.arch = Arch.sm_80
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # FlashAttentionForwardSm80.__init__ sets self.arch from
+        # BaseDSL.get_arch_enum() which returns the real GPU arch (sm_120),
+        # overwriting the class-level arch = 80. This enables TMA code paths
+        # (use_tma_O) that SM120 doesn't support, since tma_atom_O is never
+        # created for this subclass. Reset to sm_80 to stay on CpAsync paths.
+        self.arch = Arch.sm_80
+
     @staticmethod
     def can_implement(
         dtype,
