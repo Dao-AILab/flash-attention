@@ -1,7 +1,8 @@
 # FA4 CI
 
-CI runs on a self-hosted GPU runner using an Apptainer (SIF) container pulled from Docker Hub.
-Triggered on every push to `main`.
+CI runs on a self-hosted GPU runner inside an Apptainer (SIF) container. The container is either
+pulled from Docker Hub (default) or, when the runner has one, a SIF built locally from
+`tools/ci/docker/Dockerfile` (registry-free mode, see below). Triggered on every push to `main`.
 
 ## Two-pass test strategy
 
@@ -17,10 +18,23 @@ See `run_fa4_ci.py` for the shared logic used by both CI and `test_ci_local.sh`.
 | `DOCKERHUB_USERNAME` | Secret | Docker Hub username |
 | `DOCKERHUB_TOKEN` | Secret | Docker Hub access token |
 | `CI_WORK_DIR` | Variable | Large-disk path on runner, e.g. `/scratch/user/johnson` |
+| `FA4_LOCAL_SIF` | Variable | Optional. Absolute path of a runner-local SIF; enables registry-free mode |
 
 `CI_WORK_DIR` is used for SIF caching and Apptainer temp files. Falls back to `/scratch/user/<github-actor>` if unset.
 
-## Updating the container image
+## Registry-free mode (runner-local SIF)
+
+When `FA4_LOCAL_SIF` is set, the GPU job skips the Docker Hub login and pull and runs in that SIF, so
+CI needs no registry credentials. The Docker Hub secrets are then unused.
+
+1. On the runner: `tools/ci/docker/build_local_sif.sh` builds `tools/ci/docker/Dockerfile` and writes a SIF
+   to `CI_WORK_DIR/local-sif/` (keep it there: registry mode prunes `*.sif` directly under `CI_WORK_DIR`).
+2. Set the repo variable `FA4_LOCAL_SIF` to the printed path. A missing file fails the job explicitly.
+
+The image only provides OS, Python and torch; `run_fa4_ci.py` installs cutlass-dsl, quack and FA4 at job
+time, so DSL pin bumps never need a rebuild. Rebuild when the Dockerfile changes.
+
+## Updating the container image (registry mode)
 
 1. Build and push a new image via `tools/ci/docker/build.sh` + `tag_and_push.sh`.
 2. Update `FA4_IMAGE` in `.github/workflows/ci.yml` with the new tag and `sha256` digest.
