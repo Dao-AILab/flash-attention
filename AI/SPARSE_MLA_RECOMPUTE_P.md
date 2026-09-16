@@ -69,6 +69,18 @@ graph (`retain_graph=True`) works in this mode (asserted in the test).
 Second-order gradients (grad-of-grad) are not implemented by these autograd
 Functions, same as the default path.
 
+### Learnable sink
+
+A learnable sink needs no recompute-specific handling: the forward folds
+the sink logit into `lse = log(exp(sink) + Σ_j exp(s_j))`, and the recompute
+formula `P = exp2(scale·log2e·S − lse·log2e)` is exactly the sink-normalized
+probability of each real key. `dsink = −Σ_rows exp(sink − lse)·dpsum`
+depends only on `dpsum` and `lse`, both of which stay full-size under token
+chunking (the preprocess runs once before the chunk loop, the dsink reduce
+once after it). `test_flash_attn_mla_sparse_bwd_learnable_sink` asserts
+out/lse/dsink bitwise-identical across default, recompute-P and chunked
+modes, and every grad (incl. dsink) within tolerance of the fp32 reference.
+
 ### Kernel restructure (SM100, 232448 B smem cap)
 
 The main backward kernel was already at the exact SM100 smem limit, so the
@@ -236,6 +248,12 @@ it entirely would require fusing the dq/dk GEMMs into the main kernel
 - New test `test_flash_attn_mla_sparse_bwd_recompute_p` (causal × shared_kv):
   bitwise fwd, fp32-reference grads, bitwise chunked-vs-unchunked dq/dqv
   with non-causal indices under causal=True, retain_graph.
+- `test_flash_attn_mla_sparse_bwd_token_chunk_varlen` (recompute_p ×
+  shared_kv): varlen docs split across chunk boundaries, for both the
+  rope (dS merged into sP) and no-rope (separate dS buffer) recompute
+  layouts.
+- `test_flash_attn_mla_sparse_bwd_learnable_sink` (varlen × shared_kv ×
+  causal): sink + sentinel indices in every gather_bwd mode, see above.
 - Existing sparse-MLA sentinel tests (12) pass with and without the new
   flags; the absorbed-MLA suite (96 non-varlen params) passes with
   recompute-P enabled.
