@@ -217,6 +217,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         sum_OdO: cute.Tensor,
         cumulative_s_q: cute.Tensor | None,
         cumulative_s_k: cute.Tensor | None,
+        seqused_q: cute.Tensor | None,
+        seqused_k: cute.Tensor | None,
         scale_softmax: cutlass.Float32,
         max_seqlen_k: Int32 | None,
         stream: cuda.CUstream,
@@ -793,6 +795,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             problem_shape,
             cumulative_s_q,
             cumulative_s_k,
+            seqused_q,
+            seqused_k,
             self.cluster_layout_vmnk,
             K_smem_layout_staged,
             Q_smem_layout_staged,
@@ -850,6 +854,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
         problem_shape: tuple[Int32, Int32, Int32, tuple[tuple[Int32, Int32], Int32]],
         cumulative_s_q: cute.Tensor | None,
         cumulative_s_k: cute.Tensor | None,
+        seqused_q: cute.Tensor | None,
+        seqused_k: cute.Tensor | None,
         cluster_layout_vmnk: cute.Layout,
         K_smem_layout_staged: cute.ComposedLayout,
         Q_smem_layout_staged: cute.ComposedLayout,
@@ -1199,22 +1205,25 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                     )
                     seqlen_q_cur_batch = Q_ref.shape[0]
                     seqlen_k_cur_batch = K_ref.shape[0]
-                    blk_offset = (Int32(0), Int32(0), Int32(0), ((Int32(0), Int32(0)), Int32(0)))
-                    if cutlass.const_expr(varlen):
-                        assert isinstance(cumulative_s_q, cute.Tensor)
-                        assert isinstance(cumulative_s_k, cute.Tensor)
-                        seqlen_q_cur_batch = (
-                            cumulative_s_q[blk_coord_b + 1] - cumulative_s_q[blk_coord_b]
-                        )
-                        seqlen_k_cur_batch = (
-                            cumulative_s_k[blk_coord_b + 1] - cumulative_s_k[blk_coord_b]
-                        )
-                        blk_offset = (
-                            cumulative_s_q[blk_coord_b],
-                            cumulative_s_k[blk_coord_b],
-                            Int32(0),
-                            ((Int32(0), Int32(0)), Int32(0)),
-                        )
+                    cuseqlen_q, cuseqlen_k = Int32(0), Int32(0)
+                    if cutlass.const_expr(cumulative_s_q is not None):
+                        cuseqlen_q = cumulative_s_q[blk_coord_b]
+                        seqlen_q_cur_batch = cumulative_s_q[blk_coord_b + 1] - cuseqlen_q
+                    if cutlass.const_expr(cumulative_s_k is not None):
+                        cuseqlen_k = cumulative_s_k[blk_coord_b]
+                        seqlen_k_cur_batch = cumulative_s_k[blk_coord_b + 1] - cuseqlen_k
+                    blk_offset = (
+                        cuseqlen_q,
+                        cuseqlen_k,
+                        Int32(0),
+                        ((Int32(0), Int32(0)), Int32(0)),
+                    )
+                    # Keep physical offsets separate from effective lengths in
+                    # every warp role, including the cluster-wide trip bounds.
+                    if cutlass.const_expr(seqused_q is not None):
+                        seqlen_q_cur_batch = seqused_q[blk_coord_b]
+                    if cutlass.const_expr(seqused_k is not None):
+                        seqlen_k_cur_batch = seqused_k[blk_coord_b]
                     iter_start, iter_end = self.get_Q_block_min_max(
                         seqlen_q_cur_batch,
                         seqlen_k_cur_batch,
@@ -1331,22 +1340,23 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                     )
                     seqlen_q_cur_batch = Q_ref.shape[0]
                     seqlen_k_cur_batch = K_ref.shape[0]
-                    blk_offset = (Int32(0), Int32(0), Int32(0), ((Int32(0), Int32(0)), Int32(0)))
-                    if cutlass.const_expr(varlen):
-                        assert isinstance(cumulative_s_q, cute.Tensor)
-                        assert isinstance(cumulative_s_k, cute.Tensor)
-                        seqlen_q_cur_batch = (
-                            cumulative_s_q[blk_coord_b + 1] - cumulative_s_q[blk_coord_b]
-                        )
-                        seqlen_k_cur_batch = (
-                            cumulative_s_k[blk_coord_b + 1] - cumulative_s_k[blk_coord_b]
-                        )
-                        blk_offset = (
-                            cumulative_s_q[blk_coord_b],
-                            cumulative_s_k[blk_coord_b],
-                            Int32(0),
-                            ((Int32(0), Int32(0)), Int32(0)),
-                        )
+                    cuseqlen_q, cuseqlen_k = Int32(0), Int32(0)
+                    if cutlass.const_expr(cumulative_s_q is not None):
+                        cuseqlen_q = cumulative_s_q[blk_coord_b]
+                        seqlen_q_cur_batch = cumulative_s_q[blk_coord_b + 1] - cuseqlen_q
+                    if cutlass.const_expr(cumulative_s_k is not None):
+                        cuseqlen_k = cumulative_s_k[blk_coord_b]
+                        seqlen_k_cur_batch = cumulative_s_k[blk_coord_b + 1] - cuseqlen_k
+                    blk_offset = (
+                        cuseqlen_q,
+                        cuseqlen_k,
+                        Int32(0),
+                        ((Int32(0), Int32(0)), Int32(0)),
+                    )
+                    if cutlass.const_expr(seqused_q is not None):
+                        seqlen_q_cur_batch = seqused_q[blk_coord_b]
+                    if cutlass.const_expr(seqused_k is not None):
+                        seqlen_k_cur_batch = seqused_k[blk_coord_b]
                     iter_start, iter_end = self.get_Q_block_min_max(
                         seqlen_q_cur_batch,
                         seqlen_k_cur_batch,
@@ -1432,22 +1442,23 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
                     )
                     seqlen_q_cur_batch = Q_ref.shape[0]
                     seqlen_k_cur_batch = K_ref.shape[0]
-                    blk_offset = (Int32(0), Int32(0), Int32(0), ((Int32(0), Int32(0)), Int32(0)))
-                    if cutlass.const_expr(varlen):
-                        assert isinstance(cumulative_s_q, cute.Tensor)
-                        assert isinstance(cumulative_s_k, cute.Tensor)
-                        seqlen_q_cur_batch = (
-                            cumulative_s_q[blk_coord_b + 1] - cumulative_s_q[blk_coord_b]
-                        )
-                        seqlen_k_cur_batch = (
-                            cumulative_s_k[blk_coord_b + 1] - cumulative_s_k[blk_coord_b]
-                        )
-                        blk_offset = (
-                            cumulative_s_q[blk_coord_b],
-                            cumulative_s_k[blk_coord_b],
-                            Int32(0),
-                            ((Int32(0), Int32(0)), Int32(0)),
-                        )
+                    cuseqlen_q, cuseqlen_k = Int32(0), Int32(0)
+                    if cutlass.const_expr(cumulative_s_q is not None):
+                        cuseqlen_q = cumulative_s_q[blk_coord_b]
+                        seqlen_q_cur_batch = cumulative_s_q[blk_coord_b + 1] - cuseqlen_q
+                    if cutlass.const_expr(cumulative_s_k is not None):
+                        cuseqlen_k = cumulative_s_k[blk_coord_b]
+                        seqlen_k_cur_batch = cumulative_s_k[blk_coord_b + 1] - cuseqlen_k
+                    blk_offset = (
+                        cuseqlen_q,
+                        cuseqlen_k,
+                        Int32(0),
+                        ((Int32(0), Int32(0)), Int32(0)),
+                    )
+                    if cutlass.const_expr(seqused_q is not None):
+                        seqlen_q_cur_batch = seqused_q[blk_coord_b]
+                    if cutlass.const_expr(seqused_k is not None):
+                        seqlen_k_cur_batch = seqused_k[blk_coord_b]
                     iter_start, iter_end = self.get_Q_block_min_max(
                         seqlen_q_cur_batch,
                         seqlen_k_cur_batch,
@@ -1560,24 +1571,28 @@ class BlackwellFusedMultiHeadAttentionBackwardDKDVKernel:
             )
             seqlen_q_cur_batch = Q_ref.shape[0]
             seqlen_k_cur_batch = K_ref.shape[0]
-            blk_offset = (Int32(0), Int32(0), Int32(0), ((Int32(0), Int32(0)), Int32(0)))
-            if cutlass.const_expr(varlen):
-                assert isinstance(cumulative_s_q, cute.Tensor)
-                assert isinstance(cumulative_s_k, cute.Tensor)
+            cuseqlen_q, cuseqlen_k = Int32(0), Int32(0)
+            if cutlass.const_expr(varlen or seqused_q is not None or seqused_k is not None):
                 seqlen_q_cur_batch, seqlen_k_cur_batch = Int32(0), Int32(0)
                 if is_valid_tile:
-                    seqlen_q_cur_batch = (
-                        cumulative_s_q[blk_coord_b + 1] - cumulative_s_q[blk_coord_b]
-                    )
-                    seqlen_k_cur_batch = (
-                        cumulative_s_k[blk_coord_b + 1] - cumulative_s_k[blk_coord_b]
-                    )
-                    blk_offset = (
-                        cumulative_s_q[blk_coord_b],
-                        cumulative_s_k[blk_coord_b],
-                        Int32(0),
-                        ((Int32(0), Int32(0)), Int32(0)),
-                    )
+                    seqlen_q_cur_batch = Q_ref.shape[0]
+                    seqlen_k_cur_batch = K_ref.shape[0]
+                    if cutlass.const_expr(cumulative_s_q is not None):
+                        cuseqlen_q = cumulative_s_q[blk_coord_b]
+                        seqlen_q_cur_batch = cumulative_s_q[blk_coord_b + 1] - cuseqlen_q
+                    if cutlass.const_expr(cumulative_s_k is not None):
+                        cuseqlen_k = cumulative_s_k[blk_coord_b]
+                        seqlen_k_cur_batch = cumulative_s_k[blk_coord_b + 1] - cuseqlen_k
+                    if cutlass.const_expr(seqused_q is not None):
+                        seqlen_q_cur_batch = seqused_q[blk_coord_b]
+                    if cutlass.const_expr(seqused_k is not None):
+                        seqlen_k_cur_batch = seqused_k[blk_coord_b]
+            blk_offset = (
+                cuseqlen_q,
+                cuseqlen_k,
+                Int32(0),
+                ((Int32(0), Int32(0)), Int32(0)),
+            )
 
             iter_start, iter_end = self.get_Q_block_min_max(
                 seqlen_q_cur_batch,
