@@ -30,12 +30,15 @@ void run_mha_bwd_hdim512(Flash_bwd_params &params, cudaStream_t stream) {
                 flash_bwd_dot_do_o_kernel<true, Traits><<<grid_m, Traits::kNThreads, 0, stream>>>(params);
             }
             C10_CUDA_KERNEL_LAUNCH_CHECK();
-            auto kernel = &flash_bwd_dq_dk_dv_loop_seqk_parallel_kernel<
-                Traits, false, Is_causal, false, false, false, true, false>;
-            C10_CUDA_CHECK(cudaFuncSetAttribute(
-                kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
-            kernel<<<dim3(nblocks, params.b, params.h), Traits::kNThreads, smem_size, stream>>>(params);
-            C10_CUDA_KERNEL_LAUNCH_CHECK();
+            // Empty K/V needs no main kernel, but still needs zero dQ written below.
+            if (params.seqlen_k > 0) {
+                auto kernel = &flash_bwd_dq_dk_dv_loop_seqk_parallel_kernel<
+                    Traits, false, Is_causal, false, false, false, true, false>;
+                C10_CUDA_CHECK(cudaFuncSetAttribute(
+                    kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+                kernel<<<dim3(nblocks, params.b, params.h), Traits::kNThreads, smem_size, stream>>>(params);
+                C10_CUDA_KERNEL_LAUNCH_CHECK();
+            }
             flash_bwd_convert_dq_kernel<Traits><<<grid_m, Traits::kNThreads, Traits::kSmemdQSize, stream>>>(
                 params, params.deterministic ? nblocks : 1);
             C10_CUDA_KERNEL_LAUNCH_CHECK();

@@ -64,6 +64,38 @@ def test_dense(dtype, causal, sq, sk, heads_k):
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("deterministic", [False, True])
+@pytest.mark.parametrize("varlen", [False, True])
+@pytest.mark.parametrize("heads_k", [1, 2, 8])
+def test_empty_kv(dtype, causal, deterministic, varlen, heads_k):
+    torch.manual_seed(3)
+    if varlen:
+        # Include an empty Q sequence and multiple Q tiles with no K/V tokens.
+        q_shape, k_shape = (50, 8, 512), (0, heads_k, 512)
+    else:
+        q_shape, k_shape = (2, 17, 8, 512), (2, 0, heads_k, 512)
+    q = torch.randn(q_shape, device="cuda", dtype=dtype, requires_grad=True)
+    k = torch.empty(k_shape, device="cuda", dtype=dtype, requires_grad=True)
+    v = torch.empty_like(k, requires_grad=True)
+    if varlen:
+        cuq = torch.tensor([0, 17, 17, 50], device="cuda", dtype=torch.int32)
+        cuk = torch.zeros(4, device="cuda", dtype=torch.int32)
+        out = flash_attn_varlen_func(q, k, v, cuq, cuk, 33, 0,
+                                    causal=causal, deterministic=deterministic)
+    else:
+        out = flash_attn_func(q, k, v, causal=causal, deterministic=deterministic)
+    assert torch.equal(out, torch.zeros_like(q))
+    dq, dk, dv = torch.autograd.grad(out, (q, k, v), torch.randn_like(out))
+    assert torch.equal(dq, torch.zeros_like(q))
+    for grad, x in ((dq, q), (dk, k), (dv, v)):
+        assert grad.shape == x.shape
+        assert grad.dtype == x.dtype
+        assert grad.device == x.device
+    assert dk.numel() == dv.numel() == 0
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("deterministic", [False, True])
 @pytest.mark.parametrize("lengths", [
     [(17, 31), (97, 129), (129, 97)],
     [(0, 0), (1, 97), (0, 31), (1, 1)],
