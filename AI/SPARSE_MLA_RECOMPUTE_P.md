@@ -58,11 +58,20 @@ rows are fully masked by the bitmask.
 ### Numerics
 
 P is reconstructed with a *single* rounding (`exp2(e) → bf16`), whereas the
-default path stores `p = exp2(scale·S − row_max_blk)` and multiplies by a
-bf16 `scale_p` in the backward — two roundings. Gradients are therefore not
+default path stores `p = exp2(scale·S − row_max_blk)` in bf16 and normalizes
+it by `scale_p` in the backward — two roundings. Gradients are therefore not
 bitwise-identical to the default path but measure *more* accurate against an
-fp32 reference (e.g. dq rel-err 3.41e-3 vs 3.95e-3 at T=1024, W=2048).
+fp64 reference (e.g. dq rel-L2 0.239% vs 0.285% at T=16K, W=2048).
 P ∈ [0,1] exactly (lse ≥ scale·max), no overflow concerns.
+
+In both modes the softmax warps keep an fp32 copy of P^T (after the fp32
+`scale_p` normalization in the default path, straight from `exp2` in the
+recompute path) and form `dS^T = P^T ⊙ (dP^T − dPsum) · softmax_scale` in
+fp32, rounding to bf16 exactly once for the dS store. Only the copy staged as
+the `dV += P^T·dO` mma operand is rounded to bf16 first. Rounding `scale_p`,
+the normalized P and `(dP − dPsum)·scale` to bf16 *before* the product (the
+original scheme) cost ~29% dq / ~22% dK+dV relative-L2 error at no measurable
+speed or register cost (128 regs/thread; fewer spills).
 
 Because nothing saved is consumed, re-running the backward over the same
 graph (`retain_graph=True`) works in this mode (asserted in the test).
