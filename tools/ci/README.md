@@ -11,6 +11,13 @@ pulled from Docker Hub (default) or, when the runner has one, a SIF built locall
 
 See `run_fa4_ci.py` for the shared logic used by both CI and `test_ci_local.sh`.
 
+Before Pass 1 the driver provisions a disk-backed Apptainer overlay (replaces the SIF-baked cutlass-dsl /
+quack / FA4 with the versions pinned in `flash_attn/cute/pyproject.toml` plus the checked-out FA4) and
+**verifies it from a fresh session**: one distribution per package, `flash_attn.cute` from the checkout,
+and the CuTeDSL runtime owned by the installed cutlass-dsl. On failure it re-provisions once, then fails
+with `OVERLAY VERIFY FAILED`. The verified runtime is pinned via `CUTE_DSL_LIBS`. This guards against
+an apptainer session hand-off race where the SIF-baked packages reappear next to the installed ones.
+
 ## Required GitHub secrets / variables
 
 | Name | Kind | Value |
