@@ -309,12 +309,12 @@ if not SKIP_CUDA_BUILD and not IS_ROCM:
     if FORCE_CXX11_ABI:
         torch._C._GLIBCXX_USE_CXX11_ABI = True
 
-    # PyTorch 2.13+ requires C++20 for extensions that include ATen headers
+    # PyTorch 2.14+ requires C++20 for extensions that include ATen headers
     # (ATen raises "#error C++20 or later ... required"). Because we pass an
     # explicit -std flag below, PyTorch's build machinery cannot upgrade the
     # standard for us, so select it from the installed torch version. Older
     # torch keeps C++17 to avoid requiring a newer toolchain unnecessarily.
-    cxx_standard = "c++20" if (TORCH_MAJOR, TORCH_MINOR) >= (2, 13) else "c++17"
+    cxx_standard = "c++20" if (TORCH_MAJOR, TORCH_MINOR) >= (2, 14) else "c++17"
 
     nvcc_flags = [
     "-O3",
