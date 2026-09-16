@@ -10,6 +10,15 @@ Triggered on every push to `main`.
 
 See `run_fa4_ci.py` for the shared logic used by both CI and `test_ci_local.sh`.
 
+Before Pass 1 the driver provisions a disk-backed Apptainer overlay (deletes the SIF-baked
+cutlass-dsl / quack / FA4, installs the versions pinned in `flash_attn/cute/pyproject.toml` plus the
+checked-out FA4), then **verifies it from a fresh session**: one visible distribution per package,
+`flash_attn.cute` importing from the checkout, and the CuTeDSL runtime that JIT links owned by the
+installed cutlass-dsl. A failed verification re-provisions once, then fails the job with
+`OVERLAY VERIFY FAILED`. The verified runtime is pinned into the test sessions via `CUTE_DSL_LIBS`.
+This guards against a fuse2fs/fuse-overlayfs hand-off race in which a new session sees the image
+without the previous session's whiteouts (SIF-baked packages reappear next to the installed ones).
+
 ## Required GitHub secrets / variables
 
 | Name | Kind | Value |
