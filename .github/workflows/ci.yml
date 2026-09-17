@@ -45,6 +45,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Log in to Docker Hub
+        # Only needed to pull the image; skipped when the runner uses a locally built SIF.
+        if: ${{ vars.FA4_LOCAL_SIF == '' }}
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -52,5 +54,6 @@ jobs:
       - uses: ./.github/actions/gpu-test
         with:
           test-filter: ${{ env.FA4_TEST_FILTER }}
+          fa4_local_sif: ${{ vars.FA4_LOCAL_SIF }}
           fa4_image_cu129: "togethercomputer/training-performance:flash-attn-cu12.9-26.03.25@sha256:304a5c3d2b3a75b151cd2a964cd26d444e0d8b5686d63943df13378c9705f943"
           fa4_image_cu130: "togethercomputer/training-performance:flash-attn-cu13.0-26.06.27@sha256:2c31843c7137cbe909611eb70a9b6940581a2e3018d2c8b629f84dfd04b9bfd7"

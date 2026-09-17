@@ -11,6 +11,7 @@ import os
 import re
 import shlex
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -178,12 +179,157 @@ def prepare_overlay(
         f"python3 {shlex.quote(str(repo_root / 'tools/ci/assert_dsl_floor.py'))} "
         f"{shlex.quote(str(repo_root / 'flash_attn/cute/pyproject.toml'))}"
     )
-    parts = [uv_cache_export, site_packages, nuke_baked_dsl, dsl_install_cmd, fa4_install_cmd, floor_check_cmd]
+    # sync: flush the overlay image before this session tears down (see wait_for_overlay_release).
+    parts = [uv_cache_export, site_packages, nuke_baked_dsl, dsl_install_cmd, fa4_install_cmd, floor_check_cmd, "sync"]
     cmd = ["apptainer", "exec", "--nv", "--overlay", overlay, "--bind", work_dir, sif, "bash", "-c", " && ".join(parts)]
     subprocess.run(cmd, check=True, cwd=repo_root, env=base_env)
 
 
-def run_step(step: Step, repo_root: Path, base_env: dict[str, str], sif: str, work_dir: str, overlay: str) -> None:
+# ── Overlay hand-off between apptainer sessions ────────────────────────────────────────────────
+# `apptainer exec` returns before its fuse2fs child has finished flushing the ext3 overlay image, so a
+# session opened right after may see the image without the previous session's whiteouts: the SIF-baked
+# packages that prepare_overlay() deleted reappear next to the installed ones. Seen 2026-09-16: the
+# baked cutlass-dsl 4.6.0 `lib/` runtime was linked instead of 4.8.0 `cu13/lib/` ("Symbols not found").
+# Defence: wait for the image to be released, verify the stack from a fresh session (re-provision
+# once), and pin the verified runtime via CUTE_DSL_LIBS.
+
+def _pids_holding(path: str) -> list[int]:
+    """PIDs with `path` open (the fuse2fs of a live session)."""
+    holders = []
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        fd_dir = f"/proc/{pid}/fd"
+        try:
+            fds = os.listdir(fd_dir)
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                target = os.readlink(f"{fd_dir}/{fd}")
+            except OSError:
+                continue
+            if target == path or target == f"{path} (deleted)":
+                holders.append(int(pid))
+                break
+    return holders
+
+
+def wait_for_overlay_release(overlay: str, timeout_s: float = 60.0) -> float:
+    """Block until no process holds the overlay image open; return the seconds waited.
+
+    Fails after `timeout_s`: opening another session on a still-held image is exactly the
+    stale-view hazard this guards against, so continuing would defeat the check.
+    """
+    real = os.path.realpath(overlay)
+    start = time.monotonic()
+    while True:
+        holders = _pids_holding(real)
+        waited = time.monotonic() - start
+        if not holders:
+            if waited > 0.5:
+                print(f"(overlay hand-off: waited {waited:.1f}s for the previous session to release {overlay})")
+            return waited
+        if waited > timeout_s:
+            raise RuntimeError(f"{overlay} still held by pid(s) {holders} after {timeout_s:.0f}s")
+        time.sleep(0.2)
+
+
+# Runs in a fresh session after provisioning; prints "CUTE_DSL_LIBS=<paths>" on success.
+_VERIFY_OVERLAY_PY = r"""
+import importlib.metadata as md, os, sys
+repo = os.path.realpath(sys.argv[1])
+problems = []
+
+def dists():
+    for d in md.distributions():
+        yield (d.metadata.get("Name") or "").lower().replace("_", "-"), d
+
+# 1. One visible distribution per runtime package (two = the SIF-baked copy leaked through).
+seen = {}
+for name, d in dists():
+    if name.startswith("nvidia-cutlass-dsl") or name in ("quack-kernels", "flash-attn-4"):
+        seen.setdefault(name, []).append(f"{d.version} @ {d.locate_file('')}")
+for name, versions in seen.items():
+    if len(versions) > 1:
+        problems.append(f"{name}: {len(versions)} distributions visible: {versions}")
+
+# 2. FA4 imports from the checkout, not from a baked copy.
+import flash_attn.cute.interface as iface
+if not os.path.realpath(iface.__file__).startswith(repo):
+    problems.append(f"flash_attn.cute imports from {iface.__file__}, expected under {repo}")
+
+# 3. The runtime the JIT will link belongs to the installed cutlass-dsl distribution.
+import cutlass.cutlass_dsl as cd
+libs = cd.CuTeDSL._get_dsl().get_shared_libs()
+runtimes = [l for l in libs if os.path.basename(l).startswith("libcute_dsl_runtime")]
+owned = set()
+for name, d in dists():
+    if name.startswith("nvidia-cutlass-dsl"):
+        for f in d.files or []:
+            owned.add(os.path.realpath(str(d.locate_file(f))))
+if not runtimes:
+    problems.append(f"no libcute_dsl_runtime in get_shared_libs(): {libs}")
+for l in runtimes:
+    if os.path.realpath(l) not in owned:
+        problems.append(f"runtime {l} is not part of the installed cutlass-dsl distribution (stale SIF-baked copy?)")
+
+if problems:
+    print("OVERLAY VERIFY FAILED:")
+    for p in problems:
+        print("  -", p)
+    sys.exit(1)
+print(f"overlay verify OK: FA4 from {os.path.dirname(iface.__file__)}, runtime {runtimes[0]}")
+print("CUTE_DSL_LIBS=" + os.pathsep.join(libs))
+"""
+
+
+def verify_overlay(repo_root: Path, base_env: dict[str, str], sif: str, work_dir: str, overlay: str) -> str | None:
+    """Check the provisioned overlay from a fresh session; return CUTE_DSL_LIBS to pin, or None."""
+    print("=== Verify overlay (fresh session) ===")
+    # Re-run the version floor check here too: in the provisioning session it sees the in-memory
+    # overlay state, which is always right; this session sees what the tests will see.
+    floor_check = (
+        f"python3 {shlex.quote(str(repo_root / 'tools/ci/assert_dsl_floor.py'))} "
+        f"{shlex.quote(str(repo_root / 'flash_attn/cute/pyproject.toml'))}"
+    )
+    inner = f"cd /tmp && {floor_check} && python3 -c {shlex.quote(_VERIFY_OVERLAY_PY)} {shlex.quote(str(repo_root))}"
+    cmd = ["apptainer", "exec", "--overlay", overlay, "--bind", work_dir, sif, "bash", "-c", inner]
+    proc = subprocess.run(cmd, cwd=repo_root, env=base_env, text=True, capture_output=True)
+    print(proc.stdout, end="")
+    if proc.returncode != 0:
+        print(proc.stderr[-2000:], end="")
+        return None
+    for line in proc.stdout.splitlines():
+        if line.startswith("CUTE_DSL_LIBS="):
+            return line[len("CUTE_DSL_LIBS="):]
+    return None
+
+
+def provision_verified_overlay(
+    repo_root: Path, base_env: dict[str, str], sif: str, work_dir: str, overlay: str,
+    cutlass_spec: str, quack_spec: str, dsl_variant: str,
+) -> str:
+    """Create, provision and verify the overlay; re-provision once if verification fails."""
+    for attempt in (1, 2):
+        if os.path.exists(overlay):
+            os.remove(overlay)
+        subprocess.run(["apptainer", "overlay", "create", "--size", "4096", overlay], check=True)
+        prepare_overlay(
+            repo_root=repo_root, base_env=base_env, sif=sif, work_dir=work_dir, overlay=overlay,
+            cutlass_spec=cutlass_spec, quack_spec=quack_spec, dsl_variant=dsl_variant,
+        )
+        wait_for_overlay_release(overlay)
+        dsl_libs = verify_overlay(repo_root=repo_root, base_env=base_env, sif=sif, work_dir=work_dir, overlay=overlay)
+        wait_for_overlay_release(overlay)
+        if dsl_libs:
+            return dsl_libs
+        if attempt == 1:
+            print("Overlay verification failed — recreating the overlay and provisioning again.")
+    raise SystemExit("Overlay verification failed twice; see the OVERLAY VERIFY FAILED lines above.")
+
+
+def run_step(step: Step, repo_root: Path, base_env: dict[str, str], sif: str, work_dir: str, overlay: str, dsl_libs: str | None = None) -> None:
     print(f"=== {step.name} ===")
     # Convert relative test/benchmark paths to absolute so we can run from /tmp.
     # Running from /tmp ensures Python does not insert repo_root into sys.path[0]
@@ -192,12 +338,17 @@ def run_step(step: Step, repo_root: Path, base_env: dict[str, str], sif: str, wo
         str(repo_root / arg) if (arg.startswith("tests/") or arg.startswith("benchmarks/")) else arg
         for arg in step.command
     ]
-    env_exports = " && ".join(f"export {k}={shlex.quote(v)}" for k, v in step.extra_env.items())
+    extra_env = dict(step.extra_env)
+    if dsl_libs:
+        # Pin the runtime verified by verify_overlay() so JIT linking does not depend on discovery.
+        extra_env.setdefault("CUTE_DSL_LIBS", dsl_libs)
+    env_exports = " && ".join(f"export {k}={shlex.quote(v)}" for k, v in extra_env.items())
     inner_cmd = shlex.join(command)
     shell_parts = [env_exports] if env_exports else []
     shell_parts.append(f"cd /tmp && {inner_cmd}")
     cmd = ["apptainer", "exec", "--nv", "--overlay", overlay, "--bind", work_dir, sif, "bash", "-c", " && ".join(shell_parts)]
     subprocess.run(cmd, check=True, cwd=repo_root, env=base_env)
+    wait_for_overlay_release(overlay)
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -242,13 +393,10 @@ def main() -> None:
     dsl_variant = "cu13" if read_cuda_major() >= 13 else "cu12"
     overlay = os.path.join(work_dir, "fa4_ci_overlay.img")
     os.makedirs(work_dir, exist_ok=True)
-    if os.path.exists(overlay):
-        os.remove(overlay)
-    subprocess.run(["apptainer", "overlay", "create", "--size", "4096", overlay], check=True)
     print(f"Runtime DSL: cutlass-dsl[{dsl_variant}]{cutlass_spec} + quack-kernels{quack_spec} (into {overlay})")
 
     try:
-        prepare_overlay(
+        dsl_libs = provision_verified_overlay(
             repo_root=repo_root, base_env=base_env, sif=args.sif, work_dir=work_dir,
             overlay=overlay, cutlass_spec=cutlass_spec, quack_spec=quack_spec, dsl_variant=dsl_variant,
         )
@@ -261,7 +409,7 @@ def main() -> None:
             benchmark_visible_devices=benchmark_visible_devices,
             skip_benchmark=args.skip_benchmark,
         ):
-            run_step(step, repo_root=repo_root, base_env=base_env, sif=args.sif, work_dir=work_dir, overlay=overlay)
+            run_step(step, repo_root=repo_root, base_env=base_env, sif=args.sif, work_dir=work_dir, overlay=overlay, dsl_libs=dsl_libs)
     finally:
         # The overlay can hold gigabytes; don't leave it behind on the runner between jobs.
         if os.path.exists(overlay):
