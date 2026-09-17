@@ -191,9 +191,23 @@ class BwdConfig:
     AtomLayoutMdQ: int
     num_wg: int = 2  # MMA warp groups (total threads = (num_wg + 1) * 128)
     dQ_single_wg: bool = False
+    # False: no smem dQ staging, dQ reduced into gmem with red.global.add.v4.f32 from registers
+    # (C++ FA3's hdim256 path). Frees 64 KB of smem; not compatible with deterministic.
+    dQacc_use_TMA: bool = True
+    # 2: the two CTAs of a cluster take adjacent KV blocks, exchange dS through DSMEM and each
+    # reduces half of the head dim (half the dQ atomics); needs dQacc_use_TMA=False.
+    cluster_size: int = 1
 
 
-def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q=None):
+def _tile_size_bwd_sm90(
+    head_dim,
+    head_dim_v,
+    causal,
+    local,
+    sparse_block_size_q=None,
+    deterministic=False,
+    seqlen_q=None,
+):
     """Return BwdConfig for SM90.
 
     Configs based on C++ FA3 hopper/flash_bwd_launch_template.h,
@@ -249,10 +263,8 @@ def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q
                 num_wg=2,
             )
     else:
-        # hdim 256. The smem dQaccum staging buffer (64 KB) leaves no room for the C++ FA3
-        # tile (64x80, 2-stage Q); 64x48 is the largest tile_n that fits a 2-stage Q pipeline,
-        # and dKV_swapAB (hdim on WGMMA's M axis) is what allows tile_n=48. It also rounds
-        # tile_hdim to 64, which is what makes head_dim in (192, 256) compile.
+        # hdim 256. dKV_swapAB (hdim on WGMMA's M axis) rounds tile_hdim to 64, which is what
+        # makes head_dim in (192, 256) compile.
         if sparse_block_size_q is not None:
             # Block sparsity derives its KV block size from n_block_size; keep it at 64.
             return BwdConfig(
@@ -261,11 +273,37 @@ def _tile_size_bwd_sm90(head_dim, head_dim_v, causal, local, sparse_block_size_q
                 SdP_swapAB=False, dKV_swapAB=False, dQ_swapAB=False,
                 AtomLayoutMSdP=1, AtomLayoutNdKV=1, AtomLayoutMdQ=1,
             )
+        if deterministic:
+            # The semaphore-ordered dQ reduction needs the smem-staged dQ path; its 64 KB
+            # buffer leaves no room for the C++ FA3 tile (64x80, 2-stage Q), and 64x48 is the
+            # largest tile_n that fits a 2-stage Q pipeline.
+            return BwdConfig(
+                m_block_size=64, n_block_size=48,
+                num_stages_Q=2, num_stages_dO=1, num_stages_PdS=1,
+                SdP_swapAB=False, dKV_swapAB=True, dQ_swapAB=False,
+                AtomLayoutMSdP=1, AtomLayoutNdKV=1, AtomLayoutMdQ=1,
+            )
+        # C++ FA3 hdim256 config (64x80, 2-stage Q, dKV_swapAB, dQ_swapAB) with its
+        # dQacc_use_TMA=false path: no smem dQ staging, dQ reduced into gmem with
+        # red.global.add.v4.f32 straight from the accumulator, computed in two hdim halves into
+        # the same registers (flash_bwd_sm90.slice_dQ_mma).
+        # The hdim 256 backward is bound by that fp32 reduce traffic (S^2 * d * 4 B / tile_n
+        # per head), so for long sequences pairs of CTAs (cluster_size=2, FA4's 2-CTA dS
+        # exchange, here via DSMEM) each reduce half of the head dim with K = 2 * tile_n,
+        # halving the atomics, and share the Q / dO tiles through TMA multicast. The pair's
+        # fixed cost (peer K load, cluster syncs, lockstep) only pays off once the m-block
+        # loop is long enough: on H200 the 2-CTA kernel is 9-17% faster at seqlen_q >= 2048
+        # (dense, causal and wide local windows) and 2-3% slower at seqlen_q <= 1024.
+        # smem at 2 CTAs: Q2 64 + dO 32 + K 40 + K_peer/2 20 + V 40 + P 10 + dS 10 +
+        # dS_xchg 10 = 226 KB, the 227 KB limit together with the 1 KB of LSE/dPsum/mbarriers;
+        # the 1-CTA config spends the peer-K / exchange smem on a 2-stage P/dS buffer instead.
+        cluster_size = 2 if seqlen_q is None or seqlen_q >= 2048 else 1
         return BwdConfig(
-            m_block_size=64, n_block_size=48,
-            num_stages_Q=2, num_stages_dO=1, num_stages_PdS=1,
-            SdP_swapAB=False, dKV_swapAB=True, dQ_swapAB=False,
+            m_block_size=64, n_block_size=80,
+            num_stages_Q=2, num_stages_dO=1, num_stages_PdS=1 if cluster_size == 2 else 2,
+            SdP_swapAB=False, dKV_swapAB=True, dQ_swapAB=True,
             AtomLayoutMSdP=1, AtomLayoutNdKV=1, AtomLayoutMdQ=1,
+            dQacc_use_TMA=False, cluster_size=cluster_size,
         )
 
 
@@ -1998,6 +2036,13 @@ def _flash_attn_bwd(
             causal,
             local,
             sparse_block_size_q=sparse_q,
+            deterministic=deterministic,
+            # q.shape[1] unless q is packed (cu_seqlens_q); then max_seqlen_q, but only when
+            # it is a host int: callers may pass a device tensor (no sync, no data-dependent
+            # host branch under FakeTensorMode), which selects the long-sequence config.
+            seqlen_q=q.shape[1]
+            if cu_seqlens_q is None
+            else (max_seqlen_q if isinstance(max_seqlen_q, int) else None),
         )
         m_block_size = cfg.m_block_size
         n_block_size = cfg.n_block_size
@@ -2012,7 +2057,8 @@ def _flash_attn_bwd(
         AtomLayoutMdQ = cfg.AtomLayoutMdQ
         num_threads = (cfg.num_wg + 1) * 128
         dQ_single_wg = cfg.dQ_single_wg
-        cluster_size = 1
+        dQacc_use_TMA = cfg.dQacc_use_TMA
+        cluster_size = cfg.cluster_size
         use_2cta_instrs = False
     else:
         m_block_size = 128
@@ -2107,10 +2153,12 @@ def _flash_attn_bwd(
         )
     q_subtile_factor = sparse_q // m_block_size if sparse_q is not None else 2
     seqlen_q_rounded = (seqlen_q + m_block_size - 1) // m_block_size * m_block_size
-    seqlen_k_rounded = (seqlen_k + n_block_size - 1) // n_block_size * n_block_size
-    num_n_blocks = seqlen_k_rounded // n_block_size
-    if cluster_size == 2 and num_n_blocks % cluster_size != 0:
-        seqlen_k_rounded = seqlen_k_rounded + n_block_size
+    # Round up to the whole KV footprint of a cluster so a 2-CTA pair always has a
+    # partner n-block. Plain arithmetic rather than a branch on the block count:
+    # max_seqlen_k may be a device tensor, and a Python `if` on it would sync and
+    # break FakeTensorMode, for the same reason single_k_block is guarded below.
+    n_block_round = n_block_size * cluster_size
+    seqlen_k_rounded = (seqlen_k + n_block_round - 1) // n_block_round * n_block_round
 
     # The single-block specialization below only guards against TVM stride poisoning,
     # which is a host-side branch predicate that selects a kernel variant. When
@@ -2409,6 +2457,8 @@ def _flash_attn_bwd(
             AtomLayoutMdQ,
             V_in_regs,
             dQ_single_wg,
+            dQacc_use_TMA if arch // 10 == 9 else None,
+            cluster_size if arch // 10 == 9 else None,
             deterministic,
             cu_seqlens_q is None,
             cu_seqlens_k is None,
@@ -2554,6 +2604,8 @@ def _flash_attn_bwd(
                 has_aux_tensors=aux_tensors is not None,
                 q_subtile_factor=q_subtile_factor,
                 dQ_single_wg=dQ_single_wg,
+                dQacc_use_TMA=dQacc_use_TMA,
+                cluster_size=cluster_size,
             )
         else:
             if use_dedicated_hd256_kernel:
