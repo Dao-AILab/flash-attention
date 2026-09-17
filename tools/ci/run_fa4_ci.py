@@ -216,7 +216,11 @@ def _pids_holding(path: str) -> list[int]:
 
 
 def wait_for_overlay_release(overlay: str, timeout_s: float = 60.0) -> float:
-    """Block until no process holds the overlay image open; return the seconds waited."""
+    """Block until no process holds the overlay image open; return the seconds waited.
+
+    Fails after `timeout_s`: opening another session on a still-held image is exactly the
+    stale-view hazard this guards against, so continuing would defeat the check.
+    """
     real = os.path.realpath(overlay)
     start = time.monotonic()
     while True:
@@ -227,8 +231,7 @@ def wait_for_overlay_release(overlay: str, timeout_s: float = 60.0) -> float:
                 print(f"(overlay hand-off: waited {waited:.1f}s for the previous session to release {overlay})")
             return waited
         if waited > timeout_s:
-            print(f"WARNING: {overlay} still held by pid(s) {holders} after {timeout_s:.0f}s; continuing")
-            return waited
+            raise RuntimeError(f"{overlay} still held by pid(s) {holders} after {timeout_s:.0f}s")
         time.sleep(0.2)
 
 
@@ -284,7 +287,13 @@ print("CUTE_DSL_LIBS=" + os.pathsep.join(libs))
 def verify_overlay(repo_root: Path, base_env: dict[str, str], sif: str, work_dir: str, overlay: str) -> str | None:
     """Check the provisioned overlay from a fresh session; return CUTE_DSL_LIBS to pin, or None."""
     print("=== Verify overlay (fresh session) ===")
-    inner = f"cd /tmp && python3 -c {shlex.quote(_VERIFY_OVERLAY_PY)} {shlex.quote(str(repo_root))}"
+    # Re-run the version floor check here too: in the provisioning session it sees the in-memory
+    # overlay state, which is always right; this session sees what the tests will see.
+    floor_check = (
+        f"python3 {shlex.quote(str(repo_root / 'tools/ci/assert_dsl_floor.py'))} "
+        f"{shlex.quote(str(repo_root / 'flash_attn/cute/pyproject.toml'))}"
+    )
+    inner = f"cd /tmp && {floor_check} && python3 -c {shlex.quote(_VERIFY_OVERLAY_PY)} {shlex.quote(str(repo_root))}"
     cmd = ["apptainer", "exec", "--overlay", overlay, "--bind", work_dir, sif, "bash", "-c", inner]
     proc = subprocess.run(cmd, cwd=repo_root, env=base_env, text=True, capture_output=True)
     print(proc.stdout, end="")
@@ -338,10 +347,8 @@ def run_step(step: Step, repo_root: Path, base_env: dict[str, str], sif: str, wo
     shell_parts = [env_exports] if env_exports else []
     shell_parts.append(f"cd /tmp && {inner_cmd}")
     cmd = ["apptainer", "exec", "--nv", "--overlay", overlay, "--bind", work_dir, sif, "bash", "-c", " && ".join(shell_parts)]
-    try:
-        subprocess.run(cmd, check=True, cwd=repo_root, env=base_env)
-    finally:
-        wait_for_overlay_release(overlay)
+    subprocess.run(cmd, check=True, cwd=repo_root, env=base_env)
+    wait_for_overlay_release(overlay)
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
