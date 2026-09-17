@@ -259,6 +259,12 @@ void set_params_dgrad(Flash_bwd_params &params,
 }
 
 void run_mha_fwd(Flash_fwd_params &params, cudaStream_t stream, bool force_split_kernel=false) {
+    if (params.d == 512) {
+        TORCH_CHECK(!force_split_kernel && params.num_splits <= 1,
+                    "Head dimension 512 does not support split KV attention");
+        run_mha_fwd_hdim512(params, stream);
+        return;
+    }
     FP16_SWITCH(!params.is_bf16, [&] {
         HEADDIM_SWITCH(params.d, [&] {
             BOOL_SWITCH(params.is_causal, Is_causal, [&] {
@@ -319,6 +325,12 @@ std::tuple<at::Tensor, at::Tensor> set_params_splitkv(Flash_fwd_params &params, 
     const int head_size_rounded, const float p_dropout,
     const int num_splits, const int num_sm, struct c10::TensorOptions opts) {
 
+    if (head_size == 512) {
+        TORCH_CHECK(num_splits <= 1, "Head dimension 512 does not support split KV attention");
+        params.num_splits = 1;
+        return std::make_tuple(at::Tensor(), at::Tensor());
+    }
+
     // This needs to match with run_mha_fwd_splitkv_dispatch
     const int block_n = head_size <= 64 ? 256 : (head_size <= 128 ? 128 : 64);
     const int num_n_blocks = (max_seqlen_k + block_n - 1) / block_n;
@@ -363,6 +375,23 @@ void set_params_alibi(Flash_fwd_params &params, std::optional<at::Tensor> &alibi
         params.alibi_slopes_ptr = nullptr;
     }
 #endif
+}
+
+// D512 uses smaller tiles to fit within Ada's 99 KiB shared-memory limit.
+// Keep its supported feature set explicit before allocating or launching kernels.
+void check_head_dim(const int head_size, const int cc_major, const int cc_minor,
+                    const float p_dropout, const float softcap,
+                    const int window_size_left, const int window_size_right,
+                    const bool is_causal, const bool has_alibi) {
+    TORCH_CHECK(head_size <= 256 || head_size == 512,
+                "FlashAttention supports head dimensions up to 256, or exactly 512 on SM89");
+    if (head_size != 512) { return; }
+    TORCH_CHECK(cc_major == 8 && cc_minor == 9, "Head dimension 512 requires an SM89 GPU");
+    TORCH_CHECK(p_dropout == 0.f, "Head dimension 512 does not support dropout");
+    TORCH_CHECK(softcap == 0.f, "Head dimension 512 does not support softcap");
+    TORCH_CHECK(!has_alibi, "Head dimension 512 does not support ALiBi");
+    TORCH_CHECK(window_size_left < 0 && (is_causal || window_size_right < 0),
+                "Head dimension 512 does not support local attention");
 }
 
 std::vector<at::Tensor>
@@ -413,7 +442,8 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
     const int seqlen_k = k.size(1);
     const int num_heads_k = k.size(2);
     TORCH_CHECK(batch_size > 0, "batch size must be positive");
-    TORCH_CHECK(head_size <= 256, "FlashAttention forward only supports head dimension at most 256");
+    check_head_dim(head_size, cc_major, cc_minor, p_dropout, softcap,
+                   window_size_left, window_size_right, is_causal, alibi_slopes_.has_value());
     TORCH_CHECK(head_size % 8 == 0, "query, key, value, and out_ must have a head_size that is a multiple of 8");
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
 
@@ -428,7 +458,7 @@ mha_fwd(at::Tensor &q,         // batch_size x seqlen_q x num_heads x round_mult
 
     // Faster to transpose q from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d) in this case
     // H/t Daniel Haziza
-    const int seqlenq_ngroups_swapped = seqlen_q == 1 && num_heads > num_heads_k && window_size_left < 0 && window_size_right < 0 && p_dropout == 0.f && head_size % 8 == 0 && !alibi_slopes_.has_value();
+    const int seqlenq_ngroups_swapped = head_size != 512 && seqlen_q == 1 && num_heads > num_heads_k && window_size_left < 0 && window_size_right < 0 && p_dropout == 0.f && head_size % 8 == 0 && !alibi_slopes_.has_value();
     const int ngroups = num_heads / num_heads_k;
     if (seqlenq_ngroups_swapped) {
         q = q.reshape({batch_size, num_heads_k, ngroups, head_size}).transpose(1, 2);
@@ -604,6 +634,12 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     int num_heads = sizes[1];
     const int head_size = sizes[2];
     const int num_heads_k = paged_KV ? k.size(2) : k.size(1);
+    if (head_size == 512) {
+        TORCH_CHECK(!paged_KV, "Head dimension 512 does not support paged KV attention");
+        TORCH_CHECK(!leftpad_k_.has_value(), "Head dimension 512 does not support leftpad_k");
+        TORCH_CHECK(!seqused_k.has_value(), "Head dimension 512 does not support seqused_k");
+        TORCH_CHECK(num_splits <= 1, "Head dimension 512 does not support split KV attention");
+    }
 
     if (softcap > 0.f) { TORCH_CHECK(p_dropout == 0.f, "Softcapping does not support dropout for now"); }
 
@@ -619,7 +655,7 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
 
     // Faster to transpose q from (b, 1, (nheads_kv ngroups), d) to (b, ngroups, nheads_kv, d) in this case
     // H/t Daniel Haziza
-    const int seqlenq_ngroups_swapped = max_seqlen_q == 1 && num_heads > num_heads_k && window_size_left < 0 && window_size_right < 0 && p_dropout == 0.f && head_size % 8 == 0 && !alibi_slopes_.has_value();
+    const int seqlenq_ngroups_swapped = head_size != 512 && max_seqlen_q == 1 && num_heads > num_heads_k && window_size_left < 0 && window_size_right < 0 && p_dropout == 0.f && head_size % 8 == 0 && !alibi_slopes_.has_value();
     const int ngroups = num_heads / num_heads_k;
     if (seqlenq_ngroups_swapped) {
         q = q.reshape({batch_size, num_heads_k, ngroups, head_size}).transpose(1, 2).reshape({batch_size * ngroups, num_heads_k, head_size});
@@ -631,7 +667,8 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
     const int total_q = q.sizes()[0];
 
     TORCH_CHECK(batch_size > 0, "batch size must be positive");
-    TORCH_CHECK(head_size <= 256, "FlashAttention forward only supports head dimension at most 256");
+    check_head_dim(head_size, cc_major, cc_minor, p_dropout, softcap,
+                   window_size_left, window_size_right, is_causal, alibi_slopes_.has_value());
     TORCH_CHECK(head_size % 8 == 0, "query, key, value, and out_ must have a head_size that is a multiple of 8");
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
 
@@ -788,6 +825,10 @@ mha_varlen_fwd(at::Tensor &q,  // total_q x num_heads x head_size, total_q := \s
 }
 
 void run_mha_bwd(Flash_bwd_params &params, cudaStream_t stream) {
+    if (params.d == 512) {
+        run_mha_bwd_hdim512(params, stream);
+        return;
+    }
     FP16_SWITCH(!params.is_bf16, [&] {
         HEADDIM_SWITCH(params.d, [&] {
             BOOL_SWITCH(params.is_causal, Is_causal, [&] {
@@ -865,7 +906,8 @@ mha_bwd(const at::Tensor &dout,  // batch_size x seqlen_q x num_heads, x multipl
     const int num_heads_k = k.size(2);
     TORCH_CHECK(batch_size > 0, "batch size must be positive");
     TORCH_CHECK(head_size % 8 == 0, "head_size should be a multiple of 8");
-    TORCH_CHECK(head_size <= 256, "FlashAttention backward only supports head dimension at most 256");
+    check_head_dim(head_size, cc_major, cc_minor, p_dropout, softcap,
+                   window_size_left, window_size_right, is_causal, alibi_slopes_.has_value());
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
 
     auto round_multiple = [](int x, int m) { return (x + m - 1) / m * m; };
@@ -1085,7 +1127,8 @@ mha_varlen_bwd(const at::Tensor &dout,  // total_q x num_heads, x head_size
     const int num_heads_k = k.size(1);
     TORCH_CHECK(batch_size > 0, "batch size must be positive");
     TORCH_CHECK(head_size % 8 == 0, "head_size should be a multiple of 8");
-    TORCH_CHECK(head_size <= 256, "FlashAttention backward only supports head dimension at most 256");
+    check_head_dim(head_size, cc_major, cc_minor, p_dropout, softcap,
+                   window_size_left, window_size_right, is_causal, alibi_slopes_.has_value());
     TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
     if (softcap > 0.f) { TORCH_CHECK(p_dropout == 0.f, "Softcapping does not support dropout for now"); }
 
