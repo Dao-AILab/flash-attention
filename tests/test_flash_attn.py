@@ -2526,12 +2526,16 @@ def test_flash_attn_varlen_deterministic(seqlen_q, seqlen_k, swap_sq_sk, d, caus
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_flash_attn_varlen_paged_kv_num_splits(dtype):
-    """Passing num_splits=0 explicitly should be bitwise identical to not passing it (default)."""
-    from flash_attn.flash_attn_interface import _flash_attn_varlen_forward
+@pytest.mark.parametrize(
+    "q_lens,num_heads_k",
+    [((1, 1), 4), ((1, 3), 4), ((0, 3), 4), ((1, 3), 2), ((1, 1), 2)],
+)
+def test_flash_attn_varlen_paged_kv_split(num_heads_k, q_lens, dtype):
+    from flash_attn.flash_attn_interface import flash_attn_gpu
 
     device = "cuda"
-    num_heads, num_heads_k, head_dim = 4, 2, 64
+    torch.random.manual_seed(0)
+    num_heads, head_dim = 4, 64
     page_block_size = 256
     scale = head_dim ** -0.5
 
@@ -2558,29 +2562,64 @@ def test_flash_attn_varlen_paged_kv_num_splits(dtype):
         b=batch_size,
     )
 
-    q = torch.randn(batch_size, num_heads, head_dim, device=device, dtype=dtype)
-    cu_seqlens_q = torch.arange(batch_size + 1, dtype=torch.int32, device=device)
+    q = torch.randn(sum(q_lens), num_heads, head_dim, device=device, dtype=dtype)
+    cu_seqlens_q = F.pad(
+        torch.tensor(q_lens, dtype=torch.int32, device=device).cumsum(0), (1, 0)
+    ).to(torch.int32)
     seqused_k = torch.tensor(kv_lens, dtype=torch.int32, device=device)
-    cu_seqlens_k = torch.nn.functional.pad(seqused_k.cumsum(0), (1, 0)).to(torch.int32)
+    cu_seqlens_k = F.pad(seqused_k.cumsum(0), (1, 0)).to(torch.int32)
 
-    fwd_kwargs = dict(
-        cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
-        max_seqlen_q=1, max_seqlen_k=max_seqlen_k,
-        dropout_p=0.0, softmax_scale=scale,
-        causal=False, window_size_left=-1, window_size_right=0,
-        block_table=block_table, seqused_k=seqused_k,
-    )
+    seqlenq_ngroups_swapped = max(q_lens) == 1 and num_heads > num_heads_k
 
-    out_default = _flash_attn_varlen_forward(q, k_cache, v_cache, **fwd_kwargs)[0]
-    out_explicit = _flash_attn_varlen_forward(q, k_cache, v_cache, **fwd_kwargs, num_splits=0)[0]
+    def run_flash_attn(num_splits, dropout_p=0.0):
+        out_buf = None if seqlenq_ngroups_swapped else torch.full_like(q, torch.nan)
+        out, lse = flash_attn_gpu.varlen_fwd(
+            q,
+            k_cache,
+            v_cache,
+            out_buf,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            seqused_k,
+            None,
+            block_table,
+            None,
+            max(q_lens),
+            max_seqlen_k,
+            dropout_p,
+            scale,
+            False,
+            False,
+            -1,
+            -1,
+            0.0,
+            False,
+            None,
+            num_splits,
+        )[:2]
+        if out_buf is not None:
+            assert out.data_ptr() == out_buf.data_ptr()
+            out = out_buf
+        return out, lse
 
-    assert not out_default.isnan().any(), "default num_splits produced NaN"
-    assert torch.equal(out_default, out_explicit), (
-        f"default vs num_splits=0 differ: max diff {(out_default - out_explicit).abs().max().item()}"
-    )
+    out_ref, lse_ref = run_flash_attn(1)
+    if seqlenq_ngroups_swapped:
+        lse_ref_batches = []
+        for batch_idx, kv_len in enumerate(kv_lens):
+            k_ref = k_cache[block_table[batch_idx].long()].flatten(0, 1)[:kv_len]
+            k_ref = repeat(k_ref, "s h d -> s (h g) d", g=num_heads // num_heads_k)
+            scores = torch.einsum("hd,shd->hs", q[batch_idx].float(), k_ref.float()) * scale
+            lse_ref_batches.append(torch.logsumexp(scores, dim=-1))
+        lse_ref = torch.stack(lse_ref_batches, dim=1)
+    atol = 1e-2 if dtype == torch.bfloat16 else 2e-3
+    for num_splits in (0, 2):
+        out, lse = run_flash_attn(num_splits)
+        torch.testing.assert_close(out, out_ref, rtol=atol, atol=atol)
+        torch.testing.assert_close(lse, lse_ref, rtol=1e-5, atol=1e-5)
 
-    with pytest.raises(RuntimeError, match="num_splits > 1 is not supported"):
-        _flash_attn_varlen_forward(q, k_cache, v_cache, **fwd_kwargs, num_splits=2)
+    if dtype == torch.float16 and q_lens == (1, 1) and num_heads_k == num_heads:
+        with pytest.raises(RuntimeError, match="num_splits > 1 is not supported with dropout"):
+            run_flash_attn(2, dropout_p=0.1)
 
 
 @pytest.mark.parametrize("dtype", [torch.float16])
