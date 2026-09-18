@@ -9,6 +9,7 @@ import ast
 import glob
 import shutil
 import tempfile
+from importlib.util import find_spec
 from pathlib import Path
 from typing import Literal, Optional
 from packaging.version import parse, Version
@@ -68,6 +69,15 @@ ROCM_BACKEND: Optional[Literal["triton", "ck"]] = None
 if IS_ROCM:
     ROCM_BACKEND = "triton" if os.getenv("FLASH_ATTENTION_TRITON_AMD_ENABLE", "FALSE") == "TRUE" else "ck"
 NVCC_THREADS = os.getenv("NVCC_THREADS") or "4"
+
+
+def aiter_install_env():
+    env = os.environ.copy()
+    if "AITER_USE_SYSTEM_TRITON" not in env and find_spec("triton") is not None:
+        env["AITER_USE_SYSTEM_TRITON"] = "1"
+        print("[flash-attn] Preserving the installed Triton for AITER")
+    return env
+
 
 @functools.lru_cache(maxsize=None)
 def cuda_archs() -> str:
@@ -265,6 +275,7 @@ if IS_ROCM:
         subprocess.run(
             [sys.executable, "-m", "pip", "install", "--no-build-isolation", "third_party/aiter"],
             check=True,
+            env=aiter_install_env(),
         )
     elif ROCM_BACKEND == "ck":
         if os.path.isdir(".git"):
