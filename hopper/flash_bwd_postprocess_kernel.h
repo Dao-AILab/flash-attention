@@ -116,6 +116,7 @@ public:
         ShapedQ const shape_dQ;
         StridedQ const stride_dQ;
         float const softmax_scale;
+        int num_batch;  // Needed to walk the padded layout when varlen
         int const* cu_seqlens = nullptr;
         int const* seqused = nullptr;
     };
@@ -129,6 +130,7 @@ public:
         ShapedQ const shape_dQ;
         StridedQ const stride_dQ;
         float const softmax_scale;
+        int num_batch;  // Needed to walk the padded layout when varlen
         int const* cu_seqlens = nullptr;
         int const* seqused = nullptr;
     };
@@ -145,6 +147,7 @@ public:
             args.shape_dQ,
             args.stride_dQ,
             args.softmax_scale,
+            args.num_batch,
             args.cu_seqlens,
             args.seqused
         };
@@ -163,12 +166,20 @@ public:
         Tensor sdQt = make_tensor(make_smem_ptr(shared_storage.smem_dq.data()), SmemLayoutdQt{});
 
         int const thread_idx = threadIdx.x;
-        int const m_block = blockIdx.x;
         int const bidh = blockIdx.y;
-        int const bidb = blockIdx.z;
+        bool const is_varlen = params.cu_seqlens;
+        // For varlen the grid is linearized over the padded layout; see
+        // flash::padded_block_to_seq.
+        int m_block = blockIdx.x;
+        int bidb = blockIdx.z;
+        if (is_varlen) {
+            auto const seq_and_block =
+                flash::padded_block_to_seq<kBlockM>(blockIdx.x, params.num_batch, params.cu_seqlens);
+            bidb = cute::get<0>(seq_and_block);
+            m_block = cute::get<1>(seq_and_block);
+        }
 
         flash::SeqlenInfo<true /*Varlen*/, kBlockM> seqlen_info(bidb, size<0>(params.shape_dQ), params.cu_seqlens, params.seqused);
-        bool const is_varlen = params.cu_seqlens;
         if (is_varlen && m_block * kBlockM >= seqlen_info.seqlen) { return; }
 
         // Step 1: load dQaccum from gmem to smem
