@@ -218,7 +218,7 @@ class FlashAttentionBackwardSm90:
             ]
         ]
         wg_d_dQ = self.num_wg_dQ // self.AtomLayoutMdQ
-        # Accomodate both K and K.T
+        # Accommodate both K and K.T
         self.sK_layout = sm90_utils.make_smem_layout(
             self.dtype,
             LayoutEnum.ROW_MAJOR,
@@ -230,7 +230,7 @@ class FlashAttentionBackwardSm90:
         self.sV_layout = sm90_utils.make_smem_layout(
             self.dtype, LayoutEnum.ROW_MAJOR, (self.tile_n, self.tile_hdimv), None
         )
-        # Accomodate both S and S.T
+        # Accommodate both S and S.T
         wg_n_SdP = self.num_wg_mma // self.AtomLayoutMSdP
         wg_n_dKV = self.AtomLayoutNdKV
         self.sPdS_layout = sm90_utils.make_smem_layout(
