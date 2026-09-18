@@ -2347,6 +2347,105 @@ def test_flash_attn_bwd_transpose(seqlen, d, causal, dtype):
     ).abs().max().item()
 
 
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("swap_gqa", [False, True])
+def test_flash_attn_varlen_splitkv_empty_k_lse(swap_gqa, dtype):
+    # Regression for PR #2573: the SplitKV early-exit path must write LSE at
+    # the correct offset for varlen and seqlenq_ngroups_swapped layouts.
+    # An empty K row (seqused_k[b] == 0) forces n_block_min >= n_block_max and
+    # writes +INFINITY to LSE; the buggy path wrote to a padded-layout offset
+    # even in varlen mode, corrupting other rows' LSE.
+    #
+    # swap_gqa=False exercises the varlen packed (h, b, seq) layout that the
+    # PR's offset conditional fixes. swap_gqa=True exercises the swapped
+    # (h, seq, b) layout that requires routing through get_lse_tile — the
+    # branch the plain offset conditional misses.
+    from flash_attn.flash_attn_interface import _flash_attn_varlen_forward
+
+    device = "cuda"
+    torch.random.manual_seed(0)
+    head_dim = 64
+    page_block_size = 256
+    scale = head_dim ** -0.5
+
+    if swap_gqa:
+        num_heads, num_heads_k = 4, 2
+        seqlens_q = [1, 1, 1, 1]
+    else:
+        num_heads, num_heads_k = 2, 2
+        seqlens_q = [16, 16, 16, 16]
+    kv_lens = [512, 0, 1024, 0]
+
+    batch_size = len(seqlens_q)
+    total_q = sum(seqlens_q)
+    max_seqlen_q = max(seqlens_q)
+    max_seqlen_k = max(kv_lens)
+
+    max_blocks_per_seq = max((s + page_block_size - 1) // page_block_size for s in kv_lens)
+    max_blocks_per_seq = max(max_blocks_per_seq, 1)
+    total_blocks = batch_size * max_blocks_per_seq
+    k_cache = torch.randn(total_blocks, page_block_size, num_heads_k, head_dim,
+                          device=device, dtype=dtype)
+    v_cache = torch.randn(total_blocks, page_block_size, num_heads_k, head_dim,
+                          device=device, dtype=dtype)
+    block_table = rearrange(
+        torch.randperm(total_blocks, dtype=torch.int32, device=device),
+        "(b nblocks) -> b nblocks", b=batch_size,
+    )
+
+    q = torch.randn(total_q, num_heads, head_dim, device=device, dtype=dtype)
+    cu_seqlens_q = torch.nn.functional.pad(
+        torch.tensor(seqlens_q, dtype=torch.int32, device=device).cumsum(0),
+        (1, 0),
+    ).to(torch.int32)
+    seqused_k = torch.tensor(kv_lens, dtype=torch.int32, device=device)
+    cu_seqlens_k = torch.nn.functional.pad(seqused_k.cumsum(0), (1, 0)).to(torch.int32)
+
+    # Force num_splits=1 so the SplitKV kernel launches with Split=false.
+    # With paged_KV the dispatcher always routes through the splitkv kernel
+    # (force_split_kernel=paged_KV in run_mha_fwd), and only Split=false takes
+    # the early-exit branch that writes directly into softmax_lse_ptr — i.e.,
+    # the path this PR patches. With Split=true the write goes into the
+    # padded lseaccum buffer and the combine kernel produces the final LSE,
+    # so the bug is masked.
+    out, softmax_lse, _, _ = _flash_attn_varlen_forward(
+        q, k_cache, v_cache,
+        cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
+        max_seqlen_q=max_seqlen_q, max_seqlen_k=max_seqlen_k,
+        dropout_p=0.0, softmax_scale=scale,
+        causal=False, window_size_left=-1, window_size_right=-1,
+        block_table=block_table, seqused_k=seqused_k,
+        num_splits=1,
+    )
+
+    for b in range(batch_size):
+        q_slice = q[cu_seqlens_q[b]:cu_seqlens_q[b + 1]].float()  # (seq_q, H, D)
+        if kv_lens[b] > 0:
+            block_idxs = block_table[b].tolist()
+            n_pages = (kv_lens[b] + page_block_size - 1) // page_block_size
+            k_full = torch.cat([k_cache[block_idxs[p]] for p in range(n_pages)])
+            k_slice = k_full[:kv_lens[b]].float()
+            k_rep = repeat(k_slice, "s h d -> s (h g) d", g=num_heads // num_heads_k)
+            scores = torch.einsum("qhd,khd->hqk", q_slice, k_rep) * scale
+            lse_ref = torch.logsumexp(scores, dim=-1)  # (H, seq_q)
+        else:
+            lse_ref = torch.full(
+                (num_heads, seqlens_q[b]),
+                float("inf"), device=device, dtype=torch.float32,
+            )
+
+        if swap_gqa:
+            # LSE reshaped to (orig_num_heads, batch) after the swap. seqlens_q[b] == 1.
+            lse_kernel = softmax_lse[:, b:b + 1]
+        else:
+            lse_kernel = softmax_lse[:, cu_seqlens_q[b]:cu_seqlens_q[b + 1]]
+
+        torch.testing.assert_close(
+            lse_kernel, lse_ref, atol=1e-2, rtol=1e-2,
+            msg=f"LSE mismatch at batch {b} (kv_lens={kv_lens[b]}, swap_gqa={swap_gqa})",
+        )
+
+
 @pytest.mark.parametrize("dtype", [torch.float16])
 @pytest.mark.parametrize("causal", [False, True])
 # @pytest.mark.parametrize('causal', [False])
