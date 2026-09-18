@@ -214,14 +214,17 @@ class FlashAttentionBackwardPostprocess:
                 Float32,
                 atom_layout_mnk=(atom_layout_dQ if not self.dQ_swapAB else atom_layout_dQ[::-1])
                 + (1,),
-                tiler_mn=tiler_mn_dQ if not self.dQ_swapAB else tiler_mn_dQ[::-1],
+                # Same construction as flash_bwd_sm90._get_tiled_mma: tiler_mn is the WGMMA
+                # atom shape, so M is always 64 and the swapped case puts tile_m / atom on N.
+                tiler_mn=(64, tiler_mn_dQ[1] if not self.dQ_swapAB else tiler_mn_dQ[0]),
             )
         else:
             cta_group = tcgen05.CtaGroup.ONE
             tiled_mma = sm100_utils_basic.make_trivial_tiled_mma(
                 self.dtype,
-                tcgen05.OperandMajorMode.MN,  # dS_major_mode
-                tcgen05.OperandMajorMode.MN,  # Kt_major_mode
+                self.dtype,
+                cute.nvgpu.OperandMajorMode.MN,  # dS_major_mode
+                cute.nvgpu.OperandMajorMode.MN,  # Kt_major_mode
                 Float32,
                 cta_group,
                 (self.tile_m, self.tile_hdim),

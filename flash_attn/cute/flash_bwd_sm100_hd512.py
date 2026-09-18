@@ -63,16 +63,18 @@ class NativeD512DqDk:
         self.dtype = q.element_type
         ms = sm100.make_trivial_tiled_mma(
             self.dtype,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.K,
+            self.dtype,
+            cute.nvgpu.OperandMajorMode.K,
+            cute.nvgpu.OperandMajorMode.K,
             Float32,
             tcgen05.CtaGroup.TWO,
             (128, 128),
         )
         mg = sm100.make_trivial_tiled_mma(
             self.dtype,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.MN,
+            self.dtype,
+            cute.nvgpu.OperandMajorMode.K,
+            cute.nvgpu.OperandMajorMode.MN,
             Float32,
             tcgen05.CtaGroup.TWO,
             (128, 256),
@@ -1074,16 +1076,18 @@ class NativeD512Dv(NativeD512DqDk):
         self.dtype = q.element_type
         ms = sm100.make_trivial_tiled_mma(
             self.dtype,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.K,
+            self.dtype,
+            cute.nvgpu.OperandMajorMode.K,
+            cute.nvgpu.OperandMajorMode.K,
             Float32,
             tcgen05.CtaGroup.TWO,
             (128, self.query_tile),
         )
         mg = sm100.make_trivial_tiled_mma(
             self.dtype,
-            tcgen05.OperandMajorMode.K,
-            tcgen05.OperandMajorMode.MN,
+            self.dtype,
+            cute.nvgpu.OperandMajorMode.K,
+            cute.nvgpu.OperandMajorMode.MN,
             Float32,
             tcgen05.CtaGroup.TWO,
             (128, 256),

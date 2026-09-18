@@ -16,6 +16,12 @@ inputs:
   fa4_image_cu130:
     description: Docker image for CUDA 13.0 (used when driver supports CUDA 13.0)
     required: true
+  fa4_local_sif:
+    description: >-
+      Absolute path of a SIF on the runner. When set, the image inputs are ignored and nothing is
+      pulled (build one with tools/ci/docker/build_local_sif.sh). Missing file = job fails.
+    required: false
+    default: ""
 
 runs:
   using: composite
@@ -37,7 +43,21 @@ runs:
 
     - name: Pull FA4 SIF
       shell: bash
+      env:
+        FA4_LOCAL_SIF: ${{ inputs.fa4_local_sif }}
       run: |
+        if [ -n "$FA4_LOCAL_SIF" ]; then
+          # Registry-free mode: the runner keeps a SIF built from tools/ci/docker/Dockerfile.
+          if [ ! -f "$FA4_LOCAL_SIF" ]; then
+            echo "::error::fa4_local_sif is set but $FA4_LOCAL_SIF does not exist on this runner." \
+                 "Rebuild it with tools/ci/docker/build_local_sif.sh or unset the FA4_LOCAL_SIF variable."
+            exit 1
+          fi
+          echo "Using local SIF: $FA4_LOCAL_SIF"
+          apptainer inspect "$FA4_LOCAL_SIF" 2>/dev/null | sed 's/^/  /' || true
+          echo "FA4_SIF=$FA4_LOCAL_SIF" >> "$GITHUB_ENV"
+          exit 0
+        fi
         CI_WORK_DIR="${CI_WORK_DIR:-/scratch/user/$USER}"
         TAG=$(echo "$FA4_IMAGE" | tr '/: ' '---')
         SIF="$CI_WORK_DIR/${TAG}.sif"
