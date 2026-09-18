@@ -226,7 +226,7 @@ from flash_attn import flash_attn_qkvpacked_func, flash_attn_func
 
 ```python
 flash_attn_qkvpacked_func(qkv, dropout_p=0.0, softmax_scale=None, causal=False,
-                          window_size=(-1, -1), alibi_slopes=None, deterministic=False):
+                          window_size=(-1, -1), softcap=0.0, alibi_slopes=None, deterministic=False):
 """dropout_p should be set to 0.0 during evaluation
 If Q, K, V are already stacked into 1 tensor, this function will be faster than
 calling flash_attn_func on Q, K, V since the backward pass avoids explicit concatenation
@@ -240,6 +240,7 @@ Arguments:
         Default to 1 / sqrt(headdim).
     causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
     window_size: (left, right). If not (-1, -1), implements sliding window local attention.
+    softcap: float. Anything > 0 activates softcapping attention.
     alibi_slopes: (nheads,) or (batch_size, nheads), fp32. A bias of (-alibi_slope * |i - j|) is added to
         the attention score of query i and key j.
     deterministic: bool. Whether to use the deterministic implementation of the backward pass,
@@ -251,7 +252,7 @@ Return:
 
 ```python
 flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=None, causal=False,
-                window_size=(-1, -1), alibi_slopes=None, deterministic=False):
+                window_size=(-1, -1), softcap=0.0, alibi_slopes=None, deterministic=False):
 """dropout_p should be set to 0.0 during evaluation
 Supports multi-query and grouped-query attention (MQA/GQA) by passing in KV with fewer heads
 than Q. Note that the number of heads in Q must be divisible by the number of heads in KV.
@@ -270,6 +271,7 @@ Arguments:
         Default to 1 / sqrt(headdim).
     causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
     window_size: (left, right). If not (-1, -1), implements sliding window local attention.
+    softcap: float. Anything > 0 activates softcapping attention.
     alibi_slopes: (nheads,) or (batch_size, nheads), fp32. A bias of
         (-alibi_slope * |i + seqlen_k - seqlen_q - j|)
         is added to the attention score of query i and key j.
@@ -291,12 +293,16 @@ def flash_attn_with_kvcache(
     rotary_sin=None,
     cache_seqlens: Optional[Union[(int, torch.Tensor)]] = None,
     cache_batch_idx: Optional[torch.Tensor] = None,
+    cache_leftpad: Optional[torch.Tensor] = None,
     block_table: Optional[torch.Tensor] = None,
     softmax_scale=None,
     causal=False,
     window_size=(-1, -1),  # -1 means infinite context window
+    softcap=0.0,  # 0.0 means deactivated
     rotary_interleaved=True,
     alibi_slopes=None,
+    num_splits=0,
+    return_softmax_lse=False,
 ):
     """
     If k and v are not None, k_cache and v_cache will be updated *inplace* with the new values from
@@ -360,10 +366,12 @@ def flash_attn_with_kvcache(
             If None, we assume that the batch indices are [0, 1, 2, ..., batch_size - 1].
             If the indices are not distinct, and k and v are provided, the values updated in the cache
                  might come from any of the duplicate indices.
+        cache_leftpad: (batch_size,), dtype torch.int32. The index that the KV cache starts. If None, assume 0.
         softmax_scale: float. The scaling of QK^T before applying softmax.
             Default to 1 / sqrt(headdim).
         causal: bool. Whether to apply causal attention mask (e.g., for auto-regressive modeling).
         window_size: (left, right). If not (-1, -1), implements sliding window local attention.
+        softcap: float. Anything > 0 activates softcapping attention.
         rotary_interleaved: bool. Only applicable if rotary_cos and rotary_sin are passed in.
             If True, rotary embedding will combine dimensions 0 & 1, 2 & 3, etc. If False,
             rotary embedding will combine dimensions 0 & rotary_dim / 2, 1 & rotary_dim / 2 + 1
@@ -371,9 +379,17 @@ def flash_attn_with_kvcache(
         alibi_slopes: (nheads,) or (batch_size, nheads), fp32. A bias of
             (-alibi_slope * |i + seqlen_k - seqlen_q - j|)
             is added to the attention score of query i and key j.
+        num_splits: int. If > 1, split the key/value into this many chunks along the sequence.
+            If num_splits == 1, we don't split the key/value. If num_splits == 0, we use a heuristic
+            to automatically determine the number of splits.
+            Don't change this unless you know what you are doing.
+        return_softmax_lse: bool. Whether to return the logsumexp of the attention scores.
 
     Return:
         out: (batch_size, seqlen, nheads, headdim).
+        softmax_lse [optional, if return_softmax_lse=True]: (batch_size, nheads, seqlen). The
+            logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
+            normalization factor).
     """
 ```
 
