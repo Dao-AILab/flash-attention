@@ -173,6 +173,12 @@ cd flash-attention
 FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" pip install --no-build-isolation .
 ```
 
+To build against an `aiter` that is already installed, instead of building the bundled
+`third_party/aiter` submodule:
+```sh
+cd flash-attention
+FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" FLASH_ATTENTION_USE_SYSTEM_AITER="TRUE" pip install --no-build-isolation .
+```
 To use a specific aiter commit (e.g., for testing or development):
 ```sh
 cd flash-attention
