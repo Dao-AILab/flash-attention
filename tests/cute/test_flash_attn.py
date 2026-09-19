@@ -1662,9 +1662,7 @@ def test_flash_attn_varlen_output(
             and (
                 (dv == d and d <= 128)
                 or (d == 192 and dv == 128)
-                # hd256 backward does not support seqused_q/seqused_k yet, so
-                # only run it in the fully-unpadded (cu_seqlens-only) mode.
-                or (IS_SM100 and d == 256 and dv == 256 and softcap == 0.0 and unpad_q and unpad_kv)
+                or (IS_SM100 and d == 256 and dv == 256 and softcap == 0.0)
             )
             and not has_learnable_sink
             # and False

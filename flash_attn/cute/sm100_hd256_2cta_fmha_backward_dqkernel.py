@@ -167,6 +167,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         sum_odo_tensor: cute.Tensor,
         cum_seqlen_q: Optional[cute.Tensor],
         cum_seqlen_k: Optional[cute.Tensor],
+        seqused_q: Optional[cute.Tensor],
+        seqused_k: Optional[cute.Tensor],
         scale_softmax: cutlass.Float32,
         max_seqlen_q: Optional[Int32],
         stream: cuda.CUstream,
@@ -570,6 +572,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
             dq,
             cum_seqlen_q,
             cum_seqlen_k,
+            seqused_q,
+            seqused_k,
             scale_softmax,
             self.window_size_left,
             self.window_size_right,
@@ -616,6 +620,8 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
         mdQ_qdl: cute.Tensor,
         cum_seqlen_q: Optional[cute.Tensor],
         cum_seqlen_k: Optional[cute.Tensor],
+        seqused_q: Optional[cute.Tensor],
+        seqused_k: Optional[cute.Tensor],
         scale_softmax: Float32,
         window_size_left: Optional[Int32],
         window_size_right: Optional[Int32],
@@ -958,14 +964,21 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                 if cutlass.const_expr(cum_seqlen_q is not None):
                     cuseqlen_q = cum_seqlen_q[batch_coord]
                     seqlen_q = cum_seqlen_q[batch_coord + 1] - cuseqlen_q
+                if cutlass.const_expr(cum_seqlen_k is not None):
+                    cuseqlen_k = cum_seqlen_k[batch_coord]
+                    seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
+                # Used lengths control masks and work, while cu_seqlens retain
+                # physical offsets. All four warp roles must agree on has_work.
+                if cutlass.const_expr(seqused_q is not None):
+                    seqlen_q = seqused_q[batch_coord]
+                if cutlass.const_expr(seqused_k is not None):
+                    seqlen_k = seqused_k[batch_coord]
+                if cutlass.const_expr(cum_seqlen_q is not None or seqused_q is not None):
                     is_valid_q = FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
                         self.qk_mma_tiler[0],
                         mma_block_coord[0],
                         seqlen_q,
                     )
-                if cutlass.const_expr(cum_seqlen_k is not None):
-                    cuseqlen_k = cum_seqlen_k[batch_coord]
-                    seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
                 seqlen_kv_loop_start, seqlen_kv_loop_steps = (
                     FusedMask.get_trip_start_count_via_block_info(
                         mma_block_coord,
@@ -1236,14 +1249,19 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                 if cutlass.const_expr(cum_seqlen_q is not None):
                     cuseqlen_q = cum_seqlen_q[batch_coord]
                     seqlen_q = cum_seqlen_q[batch_coord + 1] - cuseqlen_q
+                if cutlass.const_expr(cum_seqlen_k is not None):
+                    cuseqlen_k = cum_seqlen_k[batch_coord]
+                    seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
+                if cutlass.const_expr(seqused_q is not None):
+                    seqlen_q = seqused_q[batch_coord]
+                if cutlass.const_expr(seqused_k is not None):
+                    seqlen_k = seqused_k[batch_coord]
+                if cutlass.const_expr(cum_seqlen_q is not None or seqused_q is not None):
                     is_valid_q = FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
                         self.qk_mma_tiler[0],
                         mma_block_coord[0],
                         seqlen_q,
                     )
-                if cutlass.const_expr(cum_seqlen_k is not None):
-                    cuseqlen_k = cum_seqlen_k[batch_coord]
-                    seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
                 seqlen_kv_loop_start, seqlen_kv_loop_steps = (
                     FusedMask.get_trip_start_count_via_block_info(
                         mma_block_coord,
@@ -1864,14 +1882,19 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                 if cutlass.const_expr(cum_seqlen_q is not None):
                     cuseqlen_q = cum_seqlen_q[batch_coord]
                     seqlen_q = cum_seqlen_q[batch_coord + 1] - cuseqlen_q
+                if cutlass.const_expr(cum_seqlen_k is not None):
+                    cuseqlen_k = cum_seqlen_k[batch_coord]
+                    seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
+                if cutlass.const_expr(seqused_q is not None):
+                    seqlen_q = seqused_q[batch_coord]
+                if cutlass.const_expr(seqused_k is not None):
+                    seqlen_k = seqused_k[batch_coord]
+                if cutlass.const_expr(cum_seqlen_q is not None or seqused_q is not None):
                     is_valid_q = FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
                         self.qk_mma_tiler[0],
                         mma_block_coord[0],
                         seqlen_q,
                     )
-                if cutlass.const_expr(cum_seqlen_k is not None):
-                    cuseqlen_k = cum_seqlen_k[batch_coord]
-                    seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
                 start_count, trip_count = FusedMask.get_trip_start_count_via_block_info(
                     mma_block_coord,
                     self.qk_mma_tiler,
@@ -1981,14 +2004,19 @@ class BlackwellFusedMultiHeadAttentionBackwardDQKernel:
                 if cutlass.const_expr(cum_seqlen_q is not None):
                     cuseqlen_q = cum_seqlen_q[batch_coord]
                     seqlen_q = cum_seqlen_q[batch_coord + 1] - cuseqlen_q
+                if cutlass.const_expr(cum_seqlen_k is not None):
+                    cuseqlen_k = cum_seqlen_k[batch_coord]
+                    seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
+                if cutlass.const_expr(seqused_q is not None):
+                    seqlen_q = seqused_q[batch_coord]
+                if cutlass.const_expr(seqused_k is not None):
+                    seqlen_k = seqused_k[batch_coord]
+                if cutlass.const_expr(cum_seqlen_q is not None or seqused_q is not None):
                     is_valid_q = FmhaStaticTileScheduler.check_valid_work_for_seqlen_q(
                         self.qk_mma_tiler[0],
                         mma_block_coord[0],
                         seqlen_q,
                     )
-                if cutlass.const_expr(cum_seqlen_k is not None):
-                    cuseqlen_k = cum_seqlen_k[batch_coord]
-                    seqlen_k = cum_seqlen_k[batch_coord + 1] - cuseqlen_k
                 seqlen_kv_loop_start, seqlen_kv_loop_steps = (
                     FusedMask.get_trip_start_count_via_block_info(
                         mma_block_coord,
