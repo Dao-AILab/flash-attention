@@ -939,6 +939,74 @@ def flash_attn_combine(out_partial, lse_partial, out=None, out_dtype=None):
     return flash_attn_3_gpu.fwd_combine(out_partial, lse_partial, out, out_dtype)
 
 
+# ---------------------------------------------------------------------------
+# Ring-attention native backward (FA3, phased). The phased backward is the stock
+# `bwd` op with ring_phase != 0 (folded in -- there is NO separate op / wrapper): it
+# keeps a caller-owned persistent fp32 dq_accum across ring steps so dQ never round-trips
+# through bf16, and splits the backward into three separately-launchable phases.
+# ring_phase == 0 is the standard FA3 backward, untouched. ring_bwd_alloc (below) sizes
+# the three persistent fp32 buffers the driver passes to bwd(..., ring_phase=, dq_accum=,
+# dsoftmax_sum=, softmax_lse_log2=).
+#
+# Persistent buffers the ring driver allocates ONCE per rank (see ring_bwd_alloc):
+#   dq_accum:         (batch, nheads, seqlen_q_rounded * head_size_rounded) fp32
+#   dsoftmax_sum:     (batch, nheads, seqlen_q_rounded)                     fp32
+#   softmax_lse_log2: (batch, nheads, seqlen_q_rounded)                     fp32
+# Usage per rank:
+#   phase 1 (preprocess): once  -> D into dsoftmax_sum, softmax_lse_log2, clear dq_accum
+#   phase 2 (step):       per ring step -> atomicAdd this K/V shard's dQ into dq_accum,
+#                         write this shard's dk/dv (h_k-headed, GQA reduced); the driver
+#                         accumulates dk/dv in fp32 across ring steps.
+#   phase 3 (convert):    once  -> dq_accum -> dq (bf16/fp16), scaled once.
+# ---------------------------------------------------------------------------
+def _ring_round_up_headdim(d):
+    """Matches round_up_headdim in hopper/flash_api.cpp (64/96/128/192/256 steps)."""
+    for x in (64, 96, 128, 192, 256):
+        if d <= x:
+            return x
+    raise ValueError(f"head dim {d} too large (max 256)")
+
+
+def ring_bwd_alloc(batch, seqlen_q, nheads, head_size, head_size_v=None, device="cuda",
+                   total_q=None):
+    """Allocate the persistent (dq_accum, dsoftmax_sum, softmax_lse_log2) buffers for
+    the FA3 ring backward. Shapes match hopper/flash_api.cpp::mha_bwd (ring_phase!=0, sm90):
+    head_size_rounded = round_up_headdim(max(d, dv)); the ring kBlockM (see below) is
+    causal-independent so seqlen_q_rounded stays consistent across mixed causal/
+    non-causal steps.
+
+    Dense (total_q is None): dq_accum (batch, nheads, s_q_rounded*d_rounded) etc.
+    Varlen (total_q given): collapses the batch dim and uses total_q_padded_rounded =
+    round_up(total_q + batch*kBlockM, kBlockM) -> dq_accum (nheads, tqpr*d_rounded),
+    dsoftmax_sum / softmax_lse_log2 (nheads, tqpr). `seqlen_q` here is max_seqlen_q."""
+    if head_size_v is None:
+        head_size_v = head_size
+    d_rounded = _ring_round_up_headdim(max(head_size, head_size_v))
+    # kBlockM must match ring_bwd_kblock_mn (hopper/flash_api.cpp) for the no-softcap
+    # ring: hd<=64 -> 128, hd96 -> 64, hd128 -> 80 (tuned block, shared by the pinned
+    # causal diagonal), hd192/256 -> 64.
+    if d_rounded <= 64:
+        kBlockM = 128
+    elif d_rounded <= 96:
+        kBlockM = 64
+    elif d_rounded <= 128:
+        kBlockM = 80
+    else:
+        kBlockM = 64
+    if total_q is None:
+        s_q_rounded = ((seqlen_q + kBlockM - 1) // kBlockM) * kBlockM
+        lead = (batch, nheads)
+        n_rows = s_q_rounded
+    else:
+        tqpr = ((total_q + batch * kBlockM + kBlockM - 1) // kBlockM) * kBlockM
+        lead = (nheads,)
+        n_rows = tqpr
+    dq_accum = torch.empty(lead + (n_rows * d_rounded,), dtype=torch.float32, device=device)
+    dsoftmax_sum = torch.empty(lead + (n_rows,), dtype=torch.float32, device=device)
+    softmax_lse_log2 = torch.empty(lead + (n_rows,), dtype=torch.float32, device=device)
+    return dq_accum, dsoftmax_sum, softmax_lse_log2
+
+
 def flash_attn_with_kvcache(
     q,
     k_cache,
