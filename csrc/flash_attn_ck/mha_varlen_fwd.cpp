@@ -343,7 +343,7 @@ mha_varlen_fwd(at::Tensor &q,                   // total_q x num_heads x head_si
                const float /*softcap*/,
                const bool return_dropout_randval,
                std::optional<at::Generator> gen_,
-               int /*num_splits*/)
+               int num_splits)
 {
     auto q_dtype = q.dtype();
     TORCH_CHECK(q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16,
@@ -474,13 +474,23 @@ mha_varlen_fwd(at::Tensor &q,                   // total_q x num_heads x head_si
         if (return_dropout_randval) {p.zero_();}
     }
 
-    int num_splits = 0;
-    num_splits = flash::override_num_splits_if_necessary(batch_size, num_heads, max_seqlen_q, head_size, 0, num_splits);
-    TORCH_CHECK(num_splits > 0, "num_splits should greater than 0");
-    TORCH_CHECK(num_splits <= 128, "num_splits greater than 128 is not supported");
-
-    auto softmax_lse_accum = torch::empty({num_heads, num_splits, total_q}, opts.dtype(at::kFloat));
-    auto out_accum = torch::empty({num_heads, num_splits, total_q, head_size}, opts.dtype(at::kFloat));
+    // Only the paged path dispatches fmha_fwd_splitkv. The dense path goes to fmha_fwd, which
+    // ignores num_splits, so running the heuristic for it would size the split accumulators
+    // (allocated next to the splitkv call) for splits that are never performed, and a cap on
+    // the requested value would reject a number that cannot affect the result on that path.
+    if (paged_KV)
+    {
+        num_splits = flash::override_num_splits_if_necessary(
+            batch_size, num_heads, num_heads_k, max_seqlen_q, max_seqlen_k, head_size, 0, num_splits);
+        TORCH_CHECK(num_splits > 0, "num_splits should greater than 0");
+        // The CK splitkv combine kernel silently returns wrong results above 8 splits
+        // (see override_num_splits_if_necessary), so reject rather than corrupt.
+        TORCH_CHECK(num_splits <= 8, "num_splits greater than 8 is not supported");
+    }
+    else
+    {
+        num_splits = 1;
+    }
 
     int64_t counter_offset = batch_size * num_heads * ck_tile::get_warp_size();
     auto rng_state = torch::empty({2}, opts.dtype(torch::kInt64));
@@ -506,6 +516,11 @@ mha_varlen_fwd(at::Tensor &q,                   // total_q x num_heads x head_si
 
         if (paged_KV)
         {
+            auto softmax_lse_accum =
+                torch::empty({num_heads, num_splits, total_q}, opts.dtype(at::kFloat));
+            auto out_accum =
+                torch::empty({num_heads, num_splits, total_q, head_size}, opts.dtype(at::kFloat));
+
             auto traits =
                 get_ck_fmha_varlen_fwd_splitkv_traits(
                     mask,
