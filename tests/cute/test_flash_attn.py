@@ -3307,7 +3307,8 @@ def test_flash_attn_mla_absorbed(
     torch.cuda.synchronize()
     batch_size = 12 if seqlen_q <= 512 else 3 if seqlen_q <= 2048 else 1
     dtype_ref = torch.bfloat16 if dtype == torch.float8_e4m3fn else dtype
-    nheads_vals = [128] if kv_sparsity else [16, 128]
+    # 24 heads pad to the 64-head bwd tile and exercise the sink reduction on padded dpsum.
+    nheads_vals = [128, 24] if kv_sparsity else [16, 128]
     seqlen_k_base = max(min(seqlen_k // 256 * 256, 1024), 256)
     gather_kv_lengths = [seqlen_k_base - 128, seqlen_k_base] if kv_sparsity else [0]
     seqlen_k_og = seqlen_k
@@ -3481,11 +3482,16 @@ def check_canary(name, parent, pad_words):
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("shared_kv", [False, True])
-@pytest.mark.parametrize("seqlen_q,seqlen_k", [(512, 512), (1024, 1024)])
+@pytest.mark.parametrize("nheads", [128, 64, 96, 24, 1])
+# 130 rows: a partial last preprocess tile when padded heads use per-head packing.
+@pytest.mark.parametrize("seqlen_q,seqlen_k", [(130, 258), (512, 512), (1024, 1024)])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_flash_attn_mla_sparse_bwd_sentinel(seqlen_q, seqlen_k, shared_kv, causal, dtype):
+def test_flash_attn_mla_sparse_bwd_sentinel(seqlen_q, seqlen_k, nheads, shared_kv, causal, dtype):
     """Sparse-MLA backward with -1-padded gather_kv_indices, the padding any
     causal top-k selector produces for early queries.
+
+    nheads < 128 covers in-kernel head padding (pack_gqa.padded_qheads_tma_source):
+    96 pads to 128 with a partial second CTA, 24 and 1 pad to the 64-head bwd tile.
 
     Regression test for unguarded sentinel scatters: the dV/dK backward
     epilogues used to atomically accumulate at row -1 — out of bounds of the
@@ -3501,7 +3507,7 @@ def test_flash_attn_mla_sparse_bwd_sentinel(seqlen_q, seqlen_k, shared_kv, causa
     device = "cuda"
     torch.random.manual_seed(0)
     batch_size = 2
-    nheads, nheads_kv, hdim, hdimv = 128, 1, 64, 512
+    nheads_kv, hdim, hdimv = 1, 64, 512
     topk_len = 256
 
     q_ref = torch.randn(batch_size, seqlen_q, nheads, hdim, device=device, dtype=dtype).requires_grad_()
@@ -3522,6 +3528,14 @@ def test_flash_attn_mla_sparse_bwd_sentinel(seqlen_q, seqlen_k, shared_kv, causa
         q_ref, k_ref, v_ref, causal=causal, qv=qv_ref, gather_kv_indices=gather_kv_indices,
         upcast=False, reorder_ops=True,
     )
+
+    if nheads != 128:
+        # Recompute-P still requires the native 128-head backward layout.
+        with pytest.raises(ValueError, match="gather_bwd_recompute_p requires 128 Q heads"):
+            flash_attn_func(
+                q, k, v, qv=qv, gather_kv_indices=gather_kv_indices,
+                causal=causal, pack_gqa=True, gather_bwd_recompute_p=True,
+            )
 
     out, lse = flash_attn_func(
         q, k, v, qv=qv, gather_kv_indices=gather_kv_indices, causal=causal, pack_gqa=True
@@ -3597,8 +3611,10 @@ def test_flash_attn_mla_sparse_bwd_sentinel(seqlen_q, seqlen_k, shared_kv, causa
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("shared_kv", [False, True])
+# 24 heads: padded per-head preprocess tiles must not spill into the next packed sequence.
+@pytest.mark.parametrize("nheads", [128, 24])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_flash_attn_mla_sparse_bwd_sentinel_varlen(shared_kv, causal, dtype):
+def test_flash_attn_mla_sparse_bwd_sentinel_varlen(nheads, shared_kv, causal, dtype):
     """Varlen counterpart of test_flash_attn_mla_sparse_bwd_sentinel.
 
     The varlen kernels are separate compile-time specializations, and the dK
@@ -3612,9 +3628,9 @@ def test_flash_attn_mla_sparse_bwd_sentinel_varlen(shared_kv, causal, dtype):
         pytest.skip()
     device = "cuda"
     torch.random.manual_seed(0)
-    nheads, nheads_kv, hdim, hdimv = 128, 1, 64, 512
+    nheads_kv, hdim, hdimv = 1, 64, 512
     topk_len = 256
-    seqlens = [512, 4, 1024]
+    seqlens = [512, 4, 1024] if nheads == 128 else [130, 4, 258]
     total = sum(seqlens)
     cu_bounds = [0] + list(itertools.accumulate(seqlens))
     cu_seqlens = torch.tensor(cu_bounds, dtype=torch.int32, device=device)
