@@ -259,7 +259,7 @@ def check_system_aiter():
     dotted name imports the parent, and importing aiter JIT-builds against a GPU the build has not got.
     """
     spec = importlib.util.find_spec("aiter")
-    locations = list(spec.submodule_search_locations) if spec is not None else []
+    locations = list(spec.submodule_search_locations or []) if spec is not None else []
     kernels = os.path.join("ops", "triton", "_triton_kernels", "flash_attn_triton_amd")
     if any(os.path.isdir(os.path.join(root, kernels)) for root in locations):
         return
