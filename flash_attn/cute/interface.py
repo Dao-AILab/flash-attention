@@ -794,8 +794,8 @@ def _flash_attn_fwd(
             not fake_mode and not is_fp8 and num_splits == 1
             and not utils._get_disable_2cta_default(is_fwd=True)
             and tile_mn is None and softcap in (None, 0.0)
-            and window_size_left in (None, -1)
-            and window_size_right in (None, -1)
+            and window_size_left is None
+            and window_size_right is None
             and all(x is None for x in (
                 cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, page_table,
                 q_descale, k_descale, v_descale,

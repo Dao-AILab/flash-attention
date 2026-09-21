@@ -998,3 +998,170 @@ def test_grouped_softcap_window_write_isolation(monkeypatch, head_group):
     ):
         check_grouped_error(name, result, expected, eager_result, dtype)
     torch.cuda.synchronize()
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("packed", [False, True])
+def test_dynamic_batch_token_cache_reuse(monkeypatch, dtype, causal, packed):
+    """Changing batch/token extents must reuse kernels and preserve FP64 accuracy."""
+    from flash_attn.cute import flash_fwd_sm100_hd512 as fused
+
+    monkeypatch.setattr(native, "_native_cache", {})
+    monkeypatch.setattr(native, "_reduce_cache", {})
+    monkeypatch.setattr(fused, "_forward_cache", {})
+    torch.manual_seed(482)
+    for batch, seq in [(1, 129), (2, 193), (3, 257), (1, 129)]:
+        lengths = [seq - i * 7 for i in range(batch)]
+        shape = (sum(lengths),) if packed else (batch, seq)
+        q = torch.randn(*shape, 4, 512, device="cuda", dtype=dtype, requires_grad=True)
+        k, v = [
+            torch.randn(*shape, 2, 512, device="cuda", dtype=dtype, requires_grad=True)
+            for _ in range(2)
+        ]
+        qr, kr, vr = [t.detach().double().requires_grad_() for t in (q, k, v)]
+        if packed:
+            cu = torch.tensor([0, *accumulate(lengths)], device="cuda", dtype=torch.int32)
+            out, _ = flash_attn_varlen_func(
+                q, k, v, cu_seqlens_q=cu, cu_seqlens_k=cu,
+                max_seqlen_q=seq, max_seqlen_k=seq, causal=causal,
+            )
+            ref = torch.cat([
+                reference(a[None], b[None], c[None], causal=causal)[0][0]
+                for a, b, c in zip(qr.split(lengths), kr.split(lengths), vr.split(lengths))
+            ])
+        else:
+            out, _ = flash_attn_func(q, k, v, causal=causal)
+            ref, _ = reference(qr, kr, vr, causal=causal)
+        grad = torch.randn_like(out)
+        actual = torch.autograd.grad(out, (q, k, v), grad)
+        expected = torch.autograd.grad(ref, (qr, kr, vr), grad.double())
+        check(out, ref, dtype)
+        qp, kp, vp = [t.detach().clone().requires_grad_() for t in (q, k, v)]
+        if packed:
+            eager = torch.cat([
+                attention_ref(a[None], b[None], c[None], causal=causal,
+                              upcast=False, reorder_ops=True)[0][0]
+                for a, b, c in zip(qp.split(lengths), kp.split(lengths), vp.split(lengths))
+            ])
+        else:
+            eager = attention_ref(qp, kp, vp, causal=causal, upcast=False, reorder_ops=True)[0]
+        eager_grads = torch.autograd.grad(eager, (qp, kp, vp), grad)
+        for name, a, r, pt in zip(("dq", "dk", "dv"), actual, expected, eager_grads):
+            assert torch.isfinite(a).all()
+            check_tensor_vs_ref(name, a.double(), r, pt.double())
+        assert len(native._native_cache) == 3
+        assert len(native._reduce_cache) == 1
+        if not packed:
+            assert len(fused._forward_cache) == 1
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("window", [(-1, 0), (-257, 0), (-2, 3), (3, -1), (-1, None), (None, -2)])
+def test_signed_window_boundaries(dtype, window):
+    """Negative offset bounds are literal after the public window resolver."""
+    torch.manual_seed(712)
+    q = torch.randn(1, 137, 4, 512, device="cuda", dtype=dtype, requires_grad=True)
+    k, v = [
+        torch.randn(1, 149, 2, 512, device="cuda", dtype=dtype, requires_grad=True)
+        for _ in range(2)
+    ]
+    qr, kr, vr = [t.detach().double().requires_grad_() for t in (q, k, v)]
+    scores = torch.einsum("bmhd,bnhd->bhmn", qr, kr.repeat_interleave(2, dim=2)) / (512 ** 0.5)
+    center = torch.arange(137, device="cuda")[:, None] + 149 - 137
+    keys = torch.arange(149, device="cuda")[None, :]
+    valid = torch.ones((137, 149), device="cuda", dtype=torch.bool)
+    if window[0] is not None:
+        valid &= keys >= center - window[0]
+    if window[1] is not None:
+        valid &= keys <= center + window[1]
+    masked = scores.masked_fill(~valid, -torch.inf)
+    safe = torch.where(valid.any(-1)[None, None, :, None], masked, 0.)
+    probs = safe.softmax(-1).masked_fill(~valid, 0.)
+    ref = torch.einsum("bhmn,bnhd->bmhd", probs, vr.repeat_interleave(2, dim=2))
+    out, _ = flash_attn_func(q, k, v, window_size=window)
+    grad = torch.randn_like(out)
+    actual = torch.autograd.grad(out, (q, k, v), grad)
+    expected = torch.autograd.grad(ref, (qr, kr, vr), grad.double())
+    check(out, ref, dtype)
+    qp, kp, vp = [t.detach().clone().requires_grad_() for t in (q, k, v)]
+    eager = attention_ref(qp, kp, vp, window_size=window, upcast=False, reorder_ops=True)[0]
+    eager_grads = torch.autograd.grad(eager, (qp, kp, vp), grad)
+    for name, a, r, pt in zip(("dq", "dk", "dv"), actual, expected, eager_grads):
+        assert torch.isfinite(a).all()
+        check_tensor_vs_ref(name, a.double(), r, pt.double())
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_dynamic_cache_layout_fallback(monkeypatch, dtype):
+    """Different compact orders and noncompact views cannot alias a cached layout."""
+    from flash_attn.cute import flash_fwd_sm100_hd512 as fused
+
+    monkeypatch.setattr(native, "_native_cache", {})
+    monkeypatch.setattr(native, "_reduce_cache", {})
+    monkeypatch.setattr(fused, "_forward_cache", {})
+    torch.manual_seed(919)
+    for layout, seq in [("dense", 33), ("transpose", 49), ("slice", 49), ("slice", 65)]:
+        def tensor(heads):
+            if layout == "transpose":
+                t = torch.randn(2, heads, seq, 512, device="cuda", dtype=dtype).transpose(1, 2)
+            elif layout == "slice":
+                t = torch.randn(2, 2 * seq, heads, 512, device="cuda", dtype=dtype)[:, ::2]
+            else:
+                t = torch.randn(2, seq, heads, 512, device="cuda", dtype=dtype)
+            return t.requires_grad_()
+
+        q, k, v = tensor(4), tensor(2), tensor(2)
+        qr, kr, vr = [t.detach().double().requires_grad_() for t in (q, k, v)]
+        out, _ = flash_attn_func(q, k, v, causal=True)
+        ref, _ = reference(qr, kr, vr, causal=True)
+        g = torch.randn_like(out)
+        actual = torch.autograd.grad(out, (q, k, v), g)
+        exact = torch.autograd.grad(ref, (qr, kr, vr), g.double())
+        qp, kp, vp = [t.detach().clone().requires_grad_() for t in (q, k, v)]
+        pt = attention_ref(qp, kp, vp, causal=True, upcast=False, reorder_ops=True)[0]
+        eager = torch.autograd.grad(pt, (qp, kp, vp), g)
+        check(out, ref, dtype)
+        for name, a, r, baseline in zip(("dq", "dk", "dv"), actual, exact, eager):
+            assert torch.isfinite(a).all()
+            check_tensor_vs_ref(name, a.double(), r, baseline.double())
+    # The two noncompact token-strided shapes must retain separate static entries.
+    assert len(native._native_cache) == 12
+    assert len(fused._forward_cache) == 4
+
+
+def test_dynamic_backward_persistent_cache(tmp_path, monkeypatch):
+    """Reload dynamic kernels from disk, then use a different batch and length."""
+    from flash_attn.cute.cache_utils import JITPersistentCache
+    from flash_attn.cute import flash_fwd_sm100_hd512 as fused
+
+    modules = [(native, "_native_cache"), (native, "_reduce_cache"), (fused, "_forward_cache")]
+    for module, name in modules:
+        monkeypatch.setattr(module, name, JITPersistentCache(tmp_path / name))
+    torch.manual_seed(721)
+    for i, (batch, seq) in enumerate([(1, 33), (2, 49)]):
+        if i:
+            for module, name in modules:
+                monkeypatch.setattr(module, name, JITPersistentCache(tmp_path / name))
+            original_compile = native.cute.compile
+
+            def reject_recompile(kernel, *args, **kwargs):
+                assert not isinstance(kernel, (native.NativeD512DqDk, native.ReduceD512Gqa,
+                                               fused.FusedD512Forward)), "Dynamic kernel recompiled"
+                return original_compile(kernel, *args, **kwargs)
+
+            monkeypatch.setattr(native.cute, "compile", reject_recompile)
+        q = torch.randn(batch, seq, 4, 512, device="cuda", dtype=torch.float16, requires_grad=True)
+        k, v = [torch.randn(batch, seq, 2, 512, device="cuda", dtype=q.dtype, requires_grad=True)
+                for _ in range(2)]
+        qr, kr, vr = [t.detach().double().requires_grad_() for t in (q, k, v)]
+        out, _ = flash_attn_func(q, k, v)
+        ref, _ = reference(qr, kr, vr)
+        grad = torch.randn_like(out)
+        actual = torch.autograd.grad(out, (q, k, v), grad)
+        expected = torch.autograd.grad(ref, (qr, kr, vr), grad.double())
+        check(out, ref, q.dtype)
+        for a, r in zip(actual, expected):
+            check(a, r, q.dtype)
+    assert len(list((tmp_path / "_native_cache").glob("*.o"))) == 3
+    assert len(list((tmp_path / "_reduce_cache").glob("*.o"))) == 1

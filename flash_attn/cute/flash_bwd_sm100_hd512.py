@@ -29,7 +29,7 @@ class NativeD512DqDk:
         mode,
         causal=False,
         softcap=0.0,
-        window=(-1, -1),
+        window=(None, None),
         head_group=1,
         head_major=False,
     ):
@@ -615,9 +615,9 @@ class NativeD512DqDk:
                         active = ks <= qs + 127 + sk - sq
                     # Skip tiles outside the local window before TMA and MMA.
                     # Elementwise masking still handles partial boundary tiles.
-                    if const_expr(self.window[0] >= 0):
+                    if const_expr(self.window[0] is not None):
                         active = active and ks + 127 >= qs + sk - sq - self.window[0]
-                    if const_expr(self.window[1] >= 0 and not self.causal):
+                    if const_expr(self.window[1] is not None and not self.causal):
                         active = active and ks <= qs + 127 + sk - sq + self.window[1]
                     if active:
                         if warp == 5:
@@ -890,9 +890,9 @@ class NativeD512DqDk:
                                     center = qi + sk - sq
                                     if const_expr(self.causal):
                                         valid = valid and ki <= center
-                                    if const_expr(self.window[0] >= 0):
+                                    if const_expr(self.window[0] is not None):
                                         valid = valid and ki >= center - self.window[0]
-                                    if const_expr(self.window[1] >= 0):
+                                    if const_expr(self.window[1] is not None):
                                         valid = valid and ki <= center + self.window[1]
                                     prob = Float32(0)
                                     deriv = Float32(1)
@@ -1035,7 +1035,7 @@ class NativeD512Dv(NativeD512DqDk):
         mode,
         causal=False,
         softcap=0.0,
-        window=(-1, -1),
+        window=(None, None),
         head_group=1,
         head_major=False,
     ):
@@ -1425,9 +1425,9 @@ class NativeD512Dv(NativeD512DqDk):
                     if const_expr(self.causal):
                         active = ks <= qs + self.query_tile - 1 + sk - sq
                     # DV traverses query_tile rows for a 128-key-row output tile.
-                    if const_expr(self.window[0] >= 0):
+                    if const_expr(self.window[0] is not None):
                         active = active and ks + 127 >= qs + sk - sq - self.window[0]
-                    if const_expr(self.window[1] >= 0 and not self.causal):
+                    if const_expr(self.window[1] is not None and not self.causal):
                         active = (
                             active and ks <= qs + self.query_tile - 1 + sk - sq + self.window[1]
                         )
@@ -1554,9 +1554,9 @@ class NativeD512Dv(NativeD512DqDk):
                                     center = qi + sk - sq
                                     if const_expr(self.causal):
                                         valid = valid and ki <= center
-                                    if const_expr(self.window[0] >= 0):
+                                    if const_expr(self.window[0] is not None):
                                         valid = valid and ki >= center - self.window[0]
-                                    if const_expr(self.window[1] >= 0):
+                                    if const_expr(self.window[1] is not None):
                                         valid = valid and ki <= center + self.window[1]
                                     prob = Float32(0)
                                     if valid:
@@ -1775,7 +1775,6 @@ def backward_sm100_d512(
 ):
     """Launch native D512 backward after the public interface validates inputs."""
     import torch
-    from cutlass.cute.runtime import from_dlpack
     from flash_attn.cute.interface import _bwd_preprocess, torch2cute_dtype_map
 
     if fake_mode:
@@ -1859,7 +1858,7 @@ def backward_sm100_d512(
     # CUDA graph capture. The physical length is a safe launch upper bound.
     maxsq = maxsq if isinstance(maxsq, int) else tensors[0].shape[1]
     maxsk = maxsk if isinstance(maxsk, int) else tensors[1].shape[1]
-    window = tuple(-1 if x is None else x for x in (window_left, window_right))
+    window = (window_left, window_right)
     # Evaluate scheduling policy in Python: long BoolOp chains expand heavily
     # in CuTeDSL preprocessing, even when their inputs are compile-time constants.
     key_tiles = (tensors[1].shape[1] + 127) // 128
@@ -1868,17 +1867,16 @@ def backward_sm100_d512(
         not causal
         and all(x is None for x in metadata)
         and tensors[0].shape[1] == tensors[1].shape[1]
-        and window[0] < 0
-        and window[1] < 0
+        and window[0] is None
+        and window[1] is None
         and maxsk == tensors[1].shape[1]
         and key_tiles >= 32
         and scheduled_heads >= 4
         and key_tiles * scheduled_heads >= 256
     )
-    # Varlen hands over a different token count on nearly every call, so keep the token mode
-    # out of the compile key: mark it dynamic where the layout is compact, and bake only the
-    # head shape the tiling depends on.
-    token_modes = ((1,), (1,), (1,), (1,), (2,), (2,), (1,), (1,), (1,))
+    # Keep batch and token extents dynamic for compact dense and packed layouts.
+    # Head dimensions and scheduling policies still select distinct kernels.
+    token_modes = ((0, 1), (0, 1), (0, 1), (0, 1), (0, 2), (0, 2), (0, 1), (0, 1), (0, 1))
     assert len(token_modes) == len(tensors)
     dynamic_tokens = all(
         is_compact_layout(t) for t in (*tensors, *(t for t in metadata if t is not None))
@@ -1923,7 +1921,7 @@ def backward_sm100_d512(
         reduce_tensors = tuple(batch_view(t) for t in (pk, pv, work_dk, work_dv))
         # The reduction sees the caller's dk/dv, which the main tensor set does not cover and
         # which may arrive over-strided; judge its layout on its own.
-        reduce_mode = (1,) if all(is_compact_layout(t) for t in reduce_tensors) else ()
+        reduce_mode = (0, 1) if all(is_compact_layout(t) for t in reduce_tensors) else ()
         key = (arch, ratio, tuple(dynamic_shape_signature(t, reduce_mode) for t in reduce_tensors))
         if key not in _reduce_cache:
             args = [to_compact_dynamic_tensor(t.detach(), 16, reduce_mode) for t in reduce_tensors]
