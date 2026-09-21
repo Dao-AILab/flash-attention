@@ -1634,21 +1634,26 @@ class ReduceD512Gqa:
 
     @cute.jit
     def __call__(self, pk, pv, dk, dv, stream: cuda.CUstream):
-        count = cute.size(dk)
+        # Dynamic shape products otherwise use Int32, overflowing before launch.
+        count = Int64(dk.shape[0]) * dk.shape[1] * dk.shape[2] * dk.shape[3]
         self.kernel(pk, pv, dk, dv, count).launch(
             grid=(cute.ceil_div(count, 1024), 1, 1), block=(256, 1, 1), stream=stream
         )
 
     @cute.kernel
-    def kernel(self, pk, pv, dk, dv, count: Int32):
+    def kernel(self, pk, pv, dk, dv, count: Int64):
         tid, _, _ = cute.arch.thread_idx()
         block, _, _ = cute.arch.block_idx()
-        index = (block * 256 + tid) * 4
+        # A single gradient can exceed 2**31 elements on SM100. Widen before
+        # multiplication as well as at the bound, so the final blocks cannot wrap.
+        index = (Int64(block) * 256 + tid) * 4
         if index < count:
             col = index % 512
-            head = (index // 512) % dk.shape[2]
-            row = (index // (512 * dk.shape[2])) % dk.shape[1]
-            batch = index // (512 * dk.shape[2] * dk.shape[1])
+            head_and_row = index // 512
+            head = head_and_row % dk.shape[2]
+            row_and_batch = head_and_row // dk.shape[2]
+            row = row_and_batch % dk.shape[1]
+            batch = row_and_batch // dk.shape[1]
             load_atom = cute.make_copy_atom(
                 cute.nvgpu.CopyUniversalOp(), Float32, num_bits_per_copy=128
             )
@@ -1705,8 +1710,6 @@ class ReduceD512Gqa:
                 ov,
                 cute.make_tensor(dv.iterator + offv, cute.make_layout(4)),
             )
-
-
 
 
 def _select_head_group(q, k, causal, cuq, cuk, usedq, usedk):
@@ -1883,9 +1886,9 @@ def backward_sm100_d512(
     )
     token_modes = token_modes if dynamic_tokens else ((),) * len(tensors)
     meta_mode = (0,) if dynamic_tokens else ()
-    signature = tuple(
-        dynamic_shape_signature(t, m) for t, m in zip(tensors, token_modes)
-    ) + tuple(dynamic_shape_signature(t, meta_mode) for t in metadata)
+    signature = tuple(dynamic_shape_signature(t, m) for t, m in zip(tensors, token_modes)) + tuple(
+        dynamic_shape_signature(t, meta_mode) for t in metadata
+    )
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     for mode in ("dq", "dk", "dv"):
         key = (arch, mode, signature, causal, softcap, window, head_group, head_major)

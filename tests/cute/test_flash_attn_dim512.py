@@ -1165,3 +1165,156 @@ def test_dynamic_backward_persistent_cache(tmp_path, monkeypatch):
             check(a, r, q.dtype)
     assert len(list((tmp_path / "_native_cache").glob("*.o"))) == 3
     assert len(list((tmp_path / "_reduce_cache").glob("*.o"))) == 1
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("layout", ["packed_q", "packed_k", "packed_both"])
+@pytest.mark.parametrize("causal", [False, True])
+def test_mixed_varlen_used_lengths_lse_grad(dtype, layout, causal):
+    """Independently packed Q/K, unused rows and LSE gradients compose correctly."""
+    torch.manual_seed(921)
+    packed_q, packed_k = layout != "packed_k", layout != "packed_q"
+    q_storage = [137, 19, 73] if packed_q else [137] * 3
+    k_storage = [101, 41, 11] if packed_k else [101] * 3
+    used_q, used_k = [129, 0, 65], [97, 33, 0]
+    q_shape = (sum(q_storage),) if packed_q else (3, q_storage[0])
+    k_shape = (sum(k_storage),) if packed_k else (3, k_storage[0])
+    q = torch.randn(*q_shape, 4, 512, device="cuda", dtype=dtype, requires_grad=True)
+    k, v = [torch.randn(*k_shape, 2, 512, device="cuda", dtype=dtype, requires_grad=True)
+            for _ in range(2)]
+    cuq = torch.tensor([0, *accumulate(q_storage)], device="cuda", dtype=torch.int32) if packed_q else None
+    cuk = torch.tensor([0, *accumulate(k_storage)], device="cuda", dtype=torch.int32) if packed_k else None
+    uq = torch.tensor(used_q, device="cuda", dtype=torch.int32)
+    uk = torch.tensor(used_k, device="cuda", dtype=torch.int32)
+    out, lse = flash_attn_varlen_func(
+        q, k, v, cu_seqlens_q=cuq, cu_seqlens_k=cuk, seqused_q=uq, seqused_k=uk,
+        max_seqlen_q=max(q_storage), max_seqlen_k=max(k_storage),
+        causal=causal, softcap=5.0, return_lse=True,
+    )
+    qr, kr, vr = [t.detach().double().requires_grad_() for t in (q, k, v)]
+    qp, kp, vp = [t.detach().clone().requires_grad_() for t in (q, k, v)]
+
+    def rows(t, storage, packed):
+        return t.split(storage) if packed else t.unbind(0)
+
+    outs = rows(out, q_storage, packed_q)
+    lses = lse.split(q_storage, dim=-1) if packed_q else lse.unbind(0)
+    ref_rows = list(zip(rows(qr, q_storage, packed_q), rows(kr, k_storage, packed_k),
+                        rows(vr, k_storage, packed_k)))
+    eager_rows = list(zip(rows(qp, q_storage, packed_q), rows(kp, k_storage, packed_k),
+                          rows(vp, k_storage, packed_k)))
+    actual_loss, ref_loss, eager_loss = 0., 0., 0.
+    for i, (a, b, c) in enumerate(ref_rows):
+        nq, nk = used_q[i], used_k[i]
+        if nq == 0:
+            continue
+        ref, rlse = reference(a[None, :nq], b[None, :nk], c[None, :nk],
+                              causal=causal, softcap=5.0)
+        check(outs[i][:nq], ref[0], dtype)
+        torch.testing.assert_close(lses[i][:, :nq].double(), rlse[0], atol=0.003, rtol=0.003)
+        do = torch.randn_like(outs[i][:nq])
+        dlse = torch.randn_like(lses[i][:, :nq])
+        finite = torch.isfinite(rlse[0])
+        actual_loss = actual_loss + (outs[i][:nq].float() * do.float()).sum()
+        actual_loss = actual_loss + (lses[i][:, :nq][finite] * dlse[finite]).sum()
+        ref_loss = ref_loss + (ref[0] * do.double()).sum() + (rlse[0][finite] * dlse.double()[finite]).sum()
+        a, b, c = eager_rows[i]
+        if nk:
+            eager, _ = attention_ref(a[None, :nq], b[None, :nk], c[None, :nk],
+                                      causal=causal, softcap=5.0, upcast=False, reorder_ops=True)
+            # Use an independent input-precision reference for the output gradient;
+            # the LSE-only term is evaluated in FP64 for both references.
+            _, eager_lse = reference(a[None, :nq], b[None, :nk], c[None, :nk],
+                                     causal=causal, softcap=5.0)
+            eager_loss = eager_loss + (eager[0].float() * do.float()).sum()
+            eager_loss = eager_loss + (eager_lse[0][finite] * dlse.double()[finite]).sum()
+        else:
+            eager_loss = eager_loss + (a.sum() + b.sum() + c.sum()) * 0.
+    actual = torch.autograd.grad(actual_loss, (q, k, v))
+    exact = torch.autograd.grad(ref_loss, (qr, kr, vr))
+    eager = torch.autograd.grad(eager_loss, (qp, kp, vp))
+    for name, result, expected, eager_result in zip(("dq", "dk", "dv"), actual, exact, eager):
+        assert torch.isfinite(result).all()
+        check_tensor_vs_ref(name, result.double(), expected, eager_result.double())
+    torch.cuda.synchronize()
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+@pytest.mark.parametrize("use_reentrant", [False, True])
+def test_checkpoint_training(dtype, use_reentrant):
+    """Checkpoint recomputation preserves gradients and optimizer updates across lengths."""
+    import copy
+    from torch.utils.checkpoint import checkpoint
+
+    torch.manual_seed(922)
+    class AttentionBlock(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.qkv = torch.nn.Linear(32, 4 * 512, bias=False)
+            self.proj = torch.nn.Linear(2 * 512, 32, bias=False)
+
+        def forward(self, x):
+            z = self.qkv(x)
+            q, k, v = z.split((1024, 512, 512), dim=-1)
+            q = q.reshape(*x.shape[:-1], 2, 512)
+            k, v = [t.reshape(*x.shape[:-1], 1, 512) for t in (k, v)]
+            out, _ = flash_attn_func(q, k, v, causal=True)
+            return self.proj(out.flatten(-2)) + x
+
+    model = AttentionBlock().cuda()
+    checked = copy.deepcopy(model)
+    optimizers = [torch.optim.AdamW(m.parameters(), lr=1e-3) for m in (model, checked)]
+    for batch, seq in [(1, 65), (2, 129), (1, 97)]:
+        x = torch.randn(batch, seq, 32, device="cuda", requires_grad=True)
+        xc = x.detach().clone().requires_grad_()
+        for optimizer in optimizers:
+            optimizer.zero_grad(set_to_none=True)
+        with torch.autocast("cuda", dtype=dtype):
+            out = model(x)
+            recomputed = checkpoint(checked, xc, use_reentrant=use_reentrant)
+            loss = out.float().square().mean()
+            checked_loss = recomputed.float().square().mean()
+        loss.backward()
+        checked_loss.backward()
+        torch.testing.assert_close(recomputed, out, atol=0, rtol=0)
+        torch.testing.assert_close(xc.grad, x.grad, atol=0, rtol=0)
+        for p, pc in zip(model.parameters(), checked.parameters()):
+            assert torch.isfinite(p.grad).all()
+            torch.testing.assert_close(pc.grad, p.grad, atol=0, rtol=0)
+        for optimizer in optimizers:
+            optimizer.step()
+        for p, pc in zip(model.parameters(), checked.parameters()):
+            torch.testing.assert_close(pc, p, atol=0, rtol=0)
+    torch.cuda.synchronize()
+
+
+@pytest.mark.parametrize("batch,seq", [(16, 8192), (16, 8193), (1, 131072), (1, 131073)])
+def test_large_gqa_reduction_count(batch, seq):
+    """GQA reduction must address gradients at and above the signed-int32 limit."""
+    import cutlass.cute as cute
+    from flash_attn.cute.cute_dsl_utils import to_compact_dynamic_tensor
+
+    # 40 GiB of input/output buffers; allow room for the CUDA context and allocator.
+    torch.cuda.empty_cache()
+    if torch.cuda.mem_get_info()[0] < 48 * 1024**3:
+        pytest.skip("Large-index regression requires 48 GiB of free device memory")
+    shape = (batch, seq, 32, 512)
+    pk = torch.ones(batch, seq, 64, 512, device="cuda", dtype=torch.float32)
+    pv = torch.full_like(pk, 2.)
+    dk = torch.full(shape, -7., device="cuda", dtype=torch.float16)
+    dv = torch.full_like(dk, -7.)
+    assert dk.numel() >= 2**31
+    tensors = (pk, pv, dk, dv)
+    args = [to_compact_dynamic_tensor(t, 16, (0, 1)) for t in tensors]
+    fn = cute.compile(
+        native.ReduceD512Gqa(2), *args,
+        cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+        options="--enable-tvm-ffi",
+    )
+    fn(*tensors)
+    # Sample all batches/heads at the beginning, middle and end, including indices
+    # beyond 2**31; avoid allocating another full-size reference tensor.
+    rows = [0, seq // 2, seq - 1]
+    assert (dk[:, rows] == 2.).all()
+    assert (dv[:, rows] == 4.).all()
+    torch.cuda.synchronize()
