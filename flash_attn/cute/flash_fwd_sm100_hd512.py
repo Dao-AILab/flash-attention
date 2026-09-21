@@ -14,6 +14,11 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 from quack import copy_utils
 
 from flash_attn.cute.cache_utils import get_jit_cache
+from flash_attn.cute.cute_dsl_utils import (
+    dynamic_shape_signature,
+    is_compact_layout,
+    to_compact_dynamic_tensor,
+)
 from flash_attn.cute.block_info import BlockInfo
 import flash_attn.cute.blackwell_helpers as fa_sm100_utils
 from flash_attn.cute.tile_scheduler import (
@@ -895,17 +900,18 @@ def forward_sm100_d512(q, k, v, out, lse, scale, causal, *, arch: int):
     is loaded and no Qv-V score term is computed by this specialization.
     LSE uses a view of the public B,H,S buffer; no transpose copy is needed.
     """
-    from cutlass.cute.runtime import from_dlpack
-
     lse_view = lse.transpose(1, 2) if lse is not None else None
     tensors = (q, q, k, v, out, lse_view)
-    signature = tuple(
-        (tuple(t.shape), tuple(t.stride()), t.dtype) if t is not None else None for t in tensors
-    )
+    # Batch and sequence extents change from call to call, so mark them dynamic and keep them out
+    # of the compile key; only the head shape the tiling depends on has to be baked in.
+    dynamic_modes = (0, 1) if all(is_compact_layout(t) for t in tensors if t is not None) else ()
+    signature = tuple(dynamic_shape_signature(t, dynamic_modes) for t in tensors)
     key = (arch, signature, causal, q.device.index)
     if key not in _forward_cache:
         args = [
-            from_dlpack(t.detach(), assumed_align=4 if i == 5 else 16) if t is not None else None
+            to_compact_dynamic_tensor(t.detach(), 4 if i == 5 else 16, dynamic_modes)
+            if t is not None
+            else None
             for i, t in enumerate(tensors)
         ]
         _forward_cache[key] = cute.compile(

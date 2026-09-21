@@ -16,6 +16,11 @@ from cutlass.cute.nvgpu import tcgen05, cpasync
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100
 from flash_attn.cute.cache_utils import get_jit_cache
+from flash_attn.cute.cute_dsl_utils import (
+    dynamic_shape_signature,
+    is_compact_layout,
+    to_compact_dynamic_tensor,
+)
 
 
 class NativeD512DqDk:
@@ -25,8 +30,6 @@ class NativeD512DqDk:
         causal=False,
         softcap=0.0,
         window=(-1, -1),
-        maxsq=None,
-        maxsk=None,
         head_group=1,
         head_major=False,
     ):
@@ -35,8 +38,6 @@ class NativeD512DqDk:
         self.softcap = softcap
         self.window = window
         assert mode in ("dq", "dk")
-        self.maxsq = maxsq
-        self.maxsk = maxsk
         self.threads = 256
         self.head_group = head_group if mode != "dq" else 1
         self.head_major = head_major
@@ -54,6 +55,8 @@ class NativeD512DqDk:
         dk,
         dv,
         scale: Float32,
+        maxsq: Int32,
+        maxsk: Int32,
         cuq,
         cuk,
         usedq,
@@ -131,8 +134,6 @@ class NativeD512DqDk:
             oba,
             obt,
         )
-        maxsq = self.maxsq if self.maxsq is not None else q.shape[1]
-        maxsk = self.maxsk if self.maxsk is not None else k.shape[1]
         batches = cuq.shape[0] - 1 if cuq is not None else q.shape[0]
         if const_expr(self.mode == "dq"):
             grid = (cute.ceil_div(maxsq, 128) * 2 * q.shape[2], 1, batches)
@@ -385,7 +386,7 @@ class NativeD512DqDk:
         cuk,
         usedq,
         usedk,
-        maxsq: cutlass.Constexpr,
+        maxsq: Int32,
     ):
         cute.arch.griddepcontrol_wait()
         tid, _, _ = cute.arch.thread_idx()
@@ -1035,8 +1036,6 @@ class NativeD512Dv(NativeD512DqDk):
         causal=False,
         softcap=0.0,
         window=(-1, -1),
-        maxsq=None,
-        maxsk=None,
         head_group=1,
         head_major=False,
     ):
@@ -1045,8 +1044,6 @@ class NativeD512Dv(NativeD512DqDk):
         self.softcap = softcap
         self.window = window
         assert mode == "dv"
-        self.maxsq = maxsq
-        self.maxsk = maxsk
         self.threads = 256
         self.head_group = head_group if mode != "dq" else 1
         self.head_major = head_major
@@ -1067,6 +1064,8 @@ class NativeD512Dv(NativeD512DqDk):
         dk,
         dv,
         scale: Float32,
+        maxsq: Int32,
+        maxsk: Int32,
         cuq,
         cuk,
         usedq,
@@ -1145,8 +1144,6 @@ class NativeD512Dv(NativeD512DqDk):
             oba,
             obt,
         )
-        maxsq = self.maxsq if self.maxsq is not None else q.shape[1]
-        maxsk = self.maxsk if self.maxsk is not None else k.shape[1]
         batches = cuq.shape[0] - 1 if cuq is not None else q.shape[0]
         grid = (cute.ceil_div(maxsk, 128) * 2 * (q.shape[2] // self.head_group), 1, batches)
         self.kernel(
@@ -1241,7 +1238,7 @@ class NativeD512Dv(NativeD512DqDk):
         cuk,
         usedq,
         usedk,
-        maxsq: cutlass.Constexpr,
+        maxsq: Int32,
     ):
         cute.arch.griddepcontrol_wait()
         tid, _, _ = cute.arch.thread_idx()
@@ -1710,10 +1707,6 @@ class ReduceD512Gqa:
             )
 
 
-def _tensor_signature(tensor):
-    if tensor is None:
-        return None
-    return (tuple(tensor.shape), tuple(tensor.stride()), tensor.dtype)
 
 
 def _select_head_group(q, k, causal, cuq, cuk, usedq, usedk):
@@ -1882,20 +1875,35 @@ def backward_sm100_d512(
         and scheduled_heads >= 4
         and key_tiles * scheduled_heads >= 256
     )
-    signature = tuple(_tensor_signature(t) for t in (*tensors, *metadata))
+    # Varlen hands over a different token count on nearly every call, so keep the token mode
+    # out of the compile key: mark it dynamic where the layout is compact, and bake only the
+    # head shape the tiling depends on.
+    token_modes = ((1,), (1,), (1,), (1,), (2,), (2,), (1,), (1,), (1,))
+    assert len(token_modes) == len(tensors)
+    dynamic_tokens = all(
+        is_compact_layout(t) for t in (*tensors, *(t for t in metadata if t is not None))
+    )
+    token_modes = token_modes if dynamic_tokens else ((),) * len(tensors)
+    meta_mode = (0,) if dynamic_tokens else ()
+    signature = tuple(
+        dynamic_shape_signature(t, m) for t, m in zip(tensors, token_modes)
+    ) + tuple(dynamic_shape_signature(t, meta_mode) for t in metadata)
     stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
     for mode in ("dq", "dk", "dv"):
-        key = (arch, mode, signature, causal, softcap, window, maxsq, maxsk, head_group)
+        key = (arch, mode, signature, causal, softcap, window, head_group, head_major)
         if key not in _native_cache:
-            args = [from_dlpack(t.detach(), assumed_align=16) for t in tensors]
-            meta = [from_dlpack(t, assumed_align=4) if t is not None else None for t in metadata]
+            args = [
+                to_compact_dynamic_tensor(t.detach(), 16, m) for t, m in zip(tensors, token_modes)
+            ]
+            meta = [
+                to_compact_dynamic_tensor(t, 4, meta_mode) if t is not None else None
+                for t in metadata
+            ]
             kernel = (NativeD512Dv if mode == "dv" else NativeD512DqDk)(
                 mode,
                 causal,
                 softcap,
                 window,
-                maxsq,
-                maxsk,
                 head_group=head_group,
                 head_major=head_major,
             )
@@ -1903,17 +1911,22 @@ def backward_sm100_d512(
                 kernel,
                 *args,
                 Float32(0),
+                Int32(0),
+                Int32(0),
                 *meta,
                 stream,
                 options="--enable-tvm-ffi --ptxas-options='--minnctapersm=1 --maxntid=256'",
             )
-        _native_cache[key](*tensors, scale, *metadata)
+        _native_cache[key](*tensors, scale, maxsq, maxsk, *metadata)
 
     if ratio > head_group:
         reduce_tensors = tuple(batch_view(t) for t in (pk, pv, work_dk, work_dv))
-        key = (arch, ratio, tuple(_tensor_signature(t) for t in reduce_tensors))
+        # The reduction sees the caller's dk/dv, which the main tensor set does not cover and
+        # which may arrive over-strided; judge its layout on its own.
+        reduce_mode = (1,) if all(is_compact_layout(t) for t in reduce_tensors) else ()
+        key = (arch, ratio, tuple(dynamic_shape_signature(t, reduce_mode) for t in reduce_tensors))
         if key not in _reduce_cache:
-            args = [from_dlpack(t.detach(), assumed_align=16) for t in reduce_tensors]
+            args = [to_compact_dynamic_tensor(t.detach(), 16, reduce_mode) for t in reduce_tensors]
             _reduce_cache[key] = cute.compile(
                 ReduceD512Gqa(ratio // head_group), *args, stream, options="--enable-tvm-ffi"
             )

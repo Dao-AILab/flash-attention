@@ -165,6 +165,39 @@ def to_cute_tensor(t, assumed_align=16, leading_dim=-1, fully_dynamic=False, ena
     return tensor.mark_layout_dynamic(leading_dim=leading_dim)
 
 
+def is_compact_layout(t) -> bool:
+    """True when the tensor is densely packed in its own stride order."""
+    expected = 1
+    for dim in reversed(t.dim_order()):
+        if t.stride(dim) != expected:
+            return False
+        expected *= t.shape[dim]
+    return True
+
+
+def dynamic_shape_signature(t, dynamic_modes=()):
+    """Compile-key entry for a tensor whose dynamic_modes are marked dynamic.
+
+    Those extents reach the kernel as runtime values, so they must stay out of the key or every
+    new sequence length compiles again. A compact layout's strides follow from its shape and its
+    stride order, so the order replaces them.
+    """
+    if t is None:
+        return None
+    if not dynamic_modes:
+        return (tuple(t.shape), tuple(t.stride()), t.dtype)
+    shape = tuple(None if i in dynamic_modes else s for i, s in enumerate(t.shape))
+    return (shape, tuple(t.dim_order()), t.dtype)
+
+
+def to_compact_dynamic_tensor(t, alignment=16, dynamic_modes=()):
+    """Convert via DLPack, marking dynamic_modes dynamic. The layout must be compact."""
+    tensor = from_dlpack(t, assumed_align=alignment)
+    for mode in dynamic_modes:
+        tensor = tensor.mark_compact_shape_dynamic(mode=mode, stride_order=t.dim_order())
+    return tensor
+
+
 def to_cute_aux_tensor(t, enable_tvm_ffi=True):
     """Convert torch tensor to cute tensor for TVM FFI, tailored to FlexAttention aux tensors.
     This allows the user to specify alignment and leading dimension for aux tensors used in
