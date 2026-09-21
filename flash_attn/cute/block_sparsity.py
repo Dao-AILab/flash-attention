@@ -585,7 +585,8 @@ def normalize_block_sparse_config(
     kv_subtile_factor = sparse_block_size_kv // n_block_size
     if kv_subtile_factor != 1 and not allow_kv_subtile:
         raise ValueError(
-            f"Block sparsity requires sparse_block_size[1]={n_block_size} to match tile_n."
+            f"Block sparsity requires sparse_block_size[1]={sparse_block_size_kv} to match "
+            f"tile_n={n_block_size}."
         )
     if tensors.cu_total_m_blocks is not None:
         base_m_block = q_stage * m_block_size
