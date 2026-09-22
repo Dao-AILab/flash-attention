@@ -1163,6 +1163,15 @@ def _flash_attn_fwd(
         )
     )
 
+    # Online-softmax rescale threshold of the MLA forward (log2 units). The inference
+    # default (8) skips the O/row_sum rescale unless the block max grows by > 8, but then
+    # the row's dominant probability is exp2(delta) with non-integer delta and its bf16
+    # rounding puts a coherent ~2^-9 relative error on the whole output row (the
+    # effective attention weights no longer sum to 1). That error is systematic for
+    # peaked rows, propagates through the network, and enters the backward through
+    # dpsum = rowsum(dO * O). Training forwards of the sparse path therefore use the
+    # exact running max (0; dominant p == 1.0 exactly) at ~4% forward cost.
+    mla_fwd_rescale_threshold = 0.0 if (requires_grad and sparse_kv) else 8.0
     compile_key = (
         dtype,
         head_dim,
@@ -1210,6 +1219,7 @@ def _flash_attn_fwd(
         intra_wg_overlap,
         use_clc_scheduler,
         num_splits_dynamic is not None,
+        mla_fwd_rescale_threshold,
         virtual_batch_idx is not None,
         num_nheads_in_l2 is not None,
         tile_count_semaphore is not None,
@@ -1367,6 +1377,7 @@ def _flash_attn_fwd(
                     has_cu_seqlens_q=cu_seqlens_q is not None,
                     disable_bitmask=disable_sparse_kv_bitmask,
                     has_qk=has_qk,
+                    rescale_threshold=mla_fwd_rescale_threshold,
                 )
             else:
                 if use_dedicated_hd256_kernel:
@@ -3895,6 +3906,14 @@ def flash_attn_varlen_func(
         gather_bwd_recompute_p, making the whole backward transient bounded by the chunk.
         Must be a positive int (anything else raises); requires varlen or batch 1 (warns
         and runs unchunked otherwise). Small launch-overhead cost. None disables.
+
+    Sparse-MLA training forwards (any input requires grad) run the online softmax with an
+        exact running max instead of the lazy rescale (threshold 8 in log2 units) used for
+        inference. With a stale max the row's dominant probability is exp2(delta), delta
+        non-integer, and its bf16 rounding (the P@V operand) is a coherent gain error on the
+        whole output row that also depends on the order of the gathered indices. Costs ~4%
+        forward time; training and inference forward outputs are therefore not bitwise
+        equal. See AI/SPARSE_MLA_EXACT_SOFTMAX_MAX.md.
     """
     gather_bwd_token_chunk = _validate_gather_bwd_kwargs(
         gather_kv_indices, gather_bwd_recompute_p, gather_bwd_token_chunk

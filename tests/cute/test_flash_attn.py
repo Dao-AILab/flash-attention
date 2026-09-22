@@ -5276,3 +5276,167 @@ def test_mla_sink_precision_vs_fp64(seqlen_q, seqlen_k, causal):
         kern_err = (kern.double() - exact).abs().max().item()
         print(f"[causal={causal}, sq={seqlen_q}, sk={seqlen_k}] {name}: kernel {kern_err:.3e} vs eager fp32 {eager_err:.3e}")
         assert kern_err <= 3 * eager_err + 1e-6, f"{name}: kernel error {kern_err:.3e} > 3x eager fp32 {eager_err:.3e}"
+
+
+def _sparse_mla_fp64_reference(q, k, v, qv, gather_kv_indices, softmax_scale, causal, g):
+    """fp64 out and grads of one sparse-MLA problem (MQA, top-k gathered KV, no batch dim).
+
+    q: (T, H, hdim), k: (S, 1, hdim), v: (S, 1, hdimv), qv: (T, H, hdimv),
+    gather_kv_indices: (T, W) int32 with -1 sentinels, g: (T, H, hdimv).
+    Returns out, dq, dk, dv, dqv in fp64 (dk/dv keep the kv-head dim), plus a dict with
+    the grads of an emulated ideal bf16 pipeline (exact dpsum; P rounded to bf16 only as
+    the dV operand, dS rounded to bf16 once as the dQ/dK operand, bf16 outputs) to
+    calibrate what "at the bf16 floor" means for these inputs.
+    """
+    T, S = q.shape[0], k.shape[0]
+    device = q.device
+    qf, qvf, gf = q.double(), qv.double(), g.double()
+    kf, vf = k[:, 0].double(), v[:, 0].double()
+    ix = gather_kv_indices.long()
+    valid = ix >= 0
+    if causal:  # bottom-right aligned causal limit, as in the kernel
+        valid &= ix <= (torch.arange(T, device=device) + (S - T))[:, None]
+    ixs = ix.clamp_min(0)
+    kg, vg = kf[ixs], vf[ixs]  # (T, W, hdim), (T, W, hdimv)
+    s = torch.einsum("thd,twd->thw", qf, kg) + torch.einsum("thd,twd->thw", qvf, vg)
+    s = (s * softmax_scale).masked_fill(~valid[:, None, :], float("-inf"))
+    p = torch.softmax(s, dim=-1).nan_to_num(0.0)
+    o = torch.einsum("thw,twd->thd", p, vg)
+    dp = torch.einsum("thd,twd->thw", gf, vg)
+    ds = p * (dp - (gf * o).sum(-1, keepdim=True)) * softmax_scale
+    dq = torch.einsum("thw,twd->thd", ds, kg)
+    dqv = torch.einsum("thw,twd->thd", ds, vg)
+    dk = torch.zeros_like(kf).index_add_(0, ix[valid], torch.einsum("thw,thd->twd", ds, qf)[valid])
+    dv_g = torch.einsum("thw,thd->twd", ds, qvf) + torch.einsum("thw,thd->twd", p, gf)
+    dv = torch.zeros_like(vf).index_add_(0, ix[valid], dv_g[valid])
+
+    def bf16(x):
+        return x.to(torch.bfloat16).double()
+
+    ds_b, p_b = bf16(ds), bf16(p)
+    dv_gi = torch.einsum("thw,thd->twd", ds_b, qvf) + torch.einsum("thw,thd->twd", p_b, gf)
+    ideal = dict(
+        dq=bf16(torch.einsum("thw,twd->thd", ds_b, kg)),
+        dqv=bf16(torch.einsum("thw,twd->thd", ds_b, vg)),
+        dk=bf16(torch.zeros_like(kf).index_add_(0, ix[valid], torch.einsum("thw,thd->twd", ds_b, qf)[valid])).unsqueeze(1),
+        dv=bf16(torch.zeros_like(vf).index_add_(0, ix[valid], dv_gi[valid])).unsqueeze(1),
+    )
+    return o, dq, dk.unsqueeze(1), dv.unsqueeze(1), dqv, ideal
+
+
+def self_including_topk_indices(seqlen, topk_len, device):
+    """Causal top-k indices that always contain the query's own key (plus random earlier
+    keys), -1 padded: the selection an indexer makes for strongly self-attending tokens.
+    Pure tensor ops (no data-dependent Python) so it also runs under FakeTensorMode."""
+    n_keys = max(seqlen, topk_len)
+    scores = torch.rand(seqlen, n_keys, device=device)
+    query_idx = torch.arange(seqlen, device=device)
+    scores[query_idx, query_idx] = 2.0  # the query's own key always wins
+    key_idx = torch.arange(n_keys, device=device)
+    invalid = (key_idx[None, :] > query_idx[:, None]) | (key_idx >= seqlen)[None, :]
+    scores.masked_fill_(invalid, float("-inf"))
+    val, idx = scores.topk(topk_len, dim=-1)
+    idx = idx.masked_fill(torch.isinf(val), -1)
+    return idx.to(torch.int32).contiguous()
+
+
+def _self_last_permutation(idx):
+    """Move slot 0 of every row of a -1 padded top-k index tensor to the last valid slot
+    (pure tensor ops so it also runs under FakeTensorMode). Same set per row, new order."""
+    n_valid = (idx >= 0).sum(-1, keepdim=True)
+    pos = torch.arange(idx.shape[-1], device=idx.device)[None, :]
+    src = torch.where(pos < n_valid - 1, pos + 1, torch.where(pos == n_valid - 1, torch.zeros_like(pos), pos))
+    return torch.gather(idx, -1, src.expand_as(idx)).contiguous()
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("causal", [False, True])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_mla_sparse_topk_order_invariance(causal, dtype):
+    """The sparse-MLA training forward must not care about the ORDER of the per-row top-k
+    indices beyond bf16 rounding noise.
+
+    The kernel walks the index blocks from the last to the first, so an indexer that puts
+    the query's own (dominant) key in slot 0 has it processed last. With a lazy running
+    max the dominant P is exp2(delta) instead of exactly 1.0 and its bf16 rounding is a
+    coherent gain error on the whole output row that flips with the order; with the exact
+    running max used for training forwards it is exactly 1.0 in either order.
+
+    Runs the same set with the dominant key first and last and checks that the per-row
+    coherent component of the difference (projection of out_first - out_last onto the
+    fp64 out row) is at the level expected from independent per-element rounding, and
+    that both orderings are within 2x of the ideal bf16 output floor in that metric.
+    """
+    if not IS_SM100:
+        pytest.skip()
+    device = "cuda"
+    torch.random.manual_seed(0)
+    nheads, nheads_kv, hdim, hdimv = 128, 1, 64, 512
+    total, topk_len = 512, 256
+    softmax_scale = (hdim + hdimv) ** -0.5
+    beta = 0.25  # self-key boost: q_t += beta * k_t, qv_t += beta * v_t (~50% self weight)
+
+    k32 = torch.randn(total, nheads_kv, hdim, device=device)
+    v32 = torch.randn(total, nheads_kv, hdimv, device=device)
+    q32 = torch.randn(total, nheads, hdim, device=device) + beta * k32
+    qv32 = torch.randn(total, nheads, hdimv, device=device) + beta * v32
+    q, k, v, qv = [x.to(dtype).requires_grad_() for x in (q32, k32, v32, qv32)]
+    g = torch.randn(total, nheads, hdimv, device=device, dtype=dtype)
+    idx_first = self_including_topk_indices(total, topk_len, device)  # own key in slot 0
+    idx_last = _self_last_permutation(idx_first)
+
+    def run(idx):
+        out, _ = flash_attn_func(
+            q[None], k[None], v[None], qv=qv[None], gather_kv_indices=idx[None],
+            softmax_scale=softmax_scale, causal=causal, pack_gqa=True,
+        )
+        grads = torch.autograd.grad(out, (q, k, v, qv), g[None])
+        return out[0], grads
+
+    out_first, grads_first = run(idx_first)
+    out_last, grads_last = run(idx_last)
+
+    if is_fake_mode():
+        return
+
+    assert torch.equal(idx_first.sort(-1).values, idx_last.sort(-1).values)
+    assert not torch.equal(out_first, out_last), "orderings must differ in bf16 rounding for the test to mean anything"
+
+    o_ref, dq_ref, dk_ref, dv_ref, dqv_ref, _ = _sparse_mla_fp64_reference(
+        q.detach(), k.detach(), v.detach(), qv.detach(), idx_first, softmax_scale, causal, g,
+    )
+    den = (o_ref * o_ref).sum(-1)  # (total, nheads)
+    keep = den > 1e-12 * den.max()
+
+    def row_gain(a, b):
+        """Coherent per-row component of (a - b) along the reference out row, and the
+        per-row elementwise relative rms of the same difference."""
+        d = a.double() - b.double()
+        gain = (d * o_ref).sum(-1) / den.clamp_min(1e-300)
+        elem = (d * d).sum(-1).sqrt() / den.clamp_min(1e-300).sqrt()
+        return gain[keep], elem[keep]
+
+    def rms(x):
+        return x.pow(2).mean().sqrt().item()
+
+    # coherent component of the ordering difference vs its random-noise expectation
+    gain_diff, elem_diff = row_gain(out_first, out_last)
+    noise_floor = rms(elem_diff) * math.sqrt(3.0 / hdimv)
+    # each ordering vs fp64, against the bf16 output-rounding floor for these rows
+    gain_first, _ = row_gain(out_first, o_ref)
+    gain_last, _ = row_gain(out_last, o_ref)
+    gain_ideal, _ = row_gain(o_ref.to(dtype), o_ref)
+    print(f"row-gain rms: first-vs-last {rms(gain_diff):.3e} (noise floor {noise_floor:.3e}); "
+          f"vs fp64: first {rms(gain_first):.3e}, last {rms(gain_last):.3e}, ideal bf16 {rms(gain_ideal):.3e}")
+    assert rms(gain_diff) < 2.0 * noise_floor, "top-k order changes the output rows coherently"
+    assert rms(gain_first) < 2.0 * rms(gain_ideal)
+    assert rms(gain_last) < 2.0 * rms(gain_ideal)
+
+    # the gradient accuracy must be order-independent too
+    def rel_l2(a, r):
+        return ((a.reshape(r.shape).double() - r).norm() / r.norm()).item()
+
+    for name, i, ref in (("dq", 0, dq_ref), ("dk", 1, dk_ref), ("dv", 2, dv_ref), ("dqv", 3, dqv_ref)):
+        e_first, e_last = rel_l2(grads_first[i], ref), rel_l2(grads_last[i], ref)
+        print(f"{name} rel-L2 vs fp64: first {e_first:.4%} last {e_last:.4%}")
+        assert abs(e_first - e_last) < 0.05 * max(e_first, e_last), f"{name}: gradient accuracy depends on the top-k order"

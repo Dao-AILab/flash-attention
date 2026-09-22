@@ -68,8 +68,15 @@ class FlashAttentionMLAForwardSm100:
         disable_bitmask: bool = False,
         use_clc_scheduler: bool = True,
         has_qk: bool = True,
+        rescale_threshold: float = 8.0,
     ):
         self.is_causal = is_causal
+        # Lazy online-softmax rescaling: the running row max (and hence the O/row_sum
+        # rescale) is only updated when the new block max exceeds it by more than this
+        # many log2 units. 0.0 = exact running max (P of the row's max element is then
+        # exactly 1.0 in bf16; with a stale max it is exp2(delta) and its bf16 rounding
+        # puts a coherent ~2^-9 relative error on the whole output row).
+        self.rescale_threshold = float(rescale_threshold)
         self.is_local = False
         self.pack_gqa = pack_gqa
         assert 0 < qhead_per_kvhead <= 128
@@ -2672,7 +2679,7 @@ class FlashAttentionMLAForwardSm100:
 
             softmax = SoftmaxSm100.create(
                 softmax_scale_log2,
-                rescale_threshold=8.0 if const_expr(self.dtype_Q.width == 16) else 0.0,
+                rescale_threshold=self.rescale_threshold if const_expr(self.dtype_Q.width == 16) else 0.0,
                 softmax_scale=softmax_scale,
             )
             softmax.reset()
