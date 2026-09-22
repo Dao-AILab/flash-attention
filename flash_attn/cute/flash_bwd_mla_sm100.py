@@ -16,7 +16,13 @@ from cutlass.utils import ClcDynamicPersistentTileScheduler
 
 from quack import copy_utils, layout_utils
 
-from flash_attn.cute.pack_gqa import pack_gqa_layout
+from flash_attn.cute.pack_gqa import (
+    pack_gqa_layout,
+    qheads_first_tma_view,
+    regroup_padded_qheads,
+    select_modes,
+    sparse_mla_qhead_tile,
+)
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_info import BlockInfo
 import flash_attn.cute.blackwell_helpers as fa_sm100_utils
@@ -63,7 +69,11 @@ class FlashAttentionSparseMLABackwardSm100:
         self.is_causal = is_causal
         self.is_local = False
         self.pack_gqa = True
-        self.qhead_per_kvhead = qhead_per_kvhead
+        # qhead_per_kvhead is the real head count, padded to a 64- or 128-row tile.
+        # Head padding and scaleP/dPsum contract: see pack_gqa.qheads_first_tma_view.
+        self.qhead_per_kvhead_valid = qhead_per_kvhead
+        self.qhead_per_kvhead = sparse_mla_qhead_tile(qhead_per_kvhead, min_tile=64)
+        self.pad_qheads = self.qhead_per_kvhead != qhead_per_kvhead
         self.nheads_kv = nheads_kv
         self.has_seqused_q = has_seqused_q
         self.use_tma_O = True
@@ -71,7 +81,6 @@ class FlashAttentionSparseMLABackwardSm100:
         self.use_tma_KV = False
         self.topk_length = topk_length
         self.is_topk_gather = True
-        assert qhead_per_kvhead == 128 or qhead_per_kvhead == 64
 
         # user-provided option if topk indices guaranteed in bounds
         self.disable_bitmask = disable_bitmask
@@ -161,7 +170,7 @@ class FlashAttentionSparseMLABackwardSm100:
         # ==== problem shape info ====
         self.hdim = hdim  # ignored
         self.hdimv = hdimv
-        self.tile_m = qhead_per_kvhead
+        self.tile_m = self.qhead_per_kvhead
         self.tile_n = 64
         self.cta_tiler_mn = (self.tile_m // self.cta_group_size, self.tile_n)
         self.cluster_tile_n = self.cta_group_size * self.tile_n
@@ -229,7 +238,8 @@ class FlashAttentionSparseMLABackwardSm100:
         self.num_stages_dP = 1
         self.num_stages_dPt = 1
         self.num_stages_dV = 2  # == hdimv splits, for Umma <-> Async
-        self.num_epi_stages_dV = 8  # == 2 splits x 4 slots/split
+        # Per hdimv split: 2 warpgroup halves x 2 subtile parities.
+        self.num_epi_stages_dV = 4
 
         self.num_stages_scaleP = 1
         self.num_stages_dPsum = 1
@@ -294,7 +304,6 @@ class FlashAttentionSparseMLABackwardSm100:
             sdO_struct,
             sP_struct,
             sdS_struct,
-            sQvt_struct,
             sScaleP_struct,
             sdPsum_struct,
         ) = (
@@ -306,12 +315,32 @@ class FlashAttentionSparseMLABackwardSm100:
                 # merged_dS: dS shares sP's buffer (P is consumed by the
                 # dV += P^T @ dO mma strictly before dS overwrites it)
                 (self.dtype, self.sdSt_layout_staged, self.merged_dS),
-                (self.dtype, self.sQvt_layout_staged, False),
                 # recompute_P replaces the fwd-saved scaleP by lse
                 (self.dtype_scale, self.sScaleP_layout_staged, self.recompute_P),
                 (self.dtype_scale, self.sdPsum_layout_staged, False),
             ]
         )
+        # dV staging must not overwrite operands still in use by another split's MMA.
+        # If staging equals one dOt/Qvt stage, split s stages in place over stage s.
+        # Otherwise, both splits take turns using one staging area after the operands.
+        staging_elems = (
+            math.prod(self.tile_dV)
+            * self.num_epi_stages_dV
+            * self.dtype_acc.width
+            // self.dtype.width
+        )
+        operand_elems = cute.cosize(self.sQvt_layout_staged)
+        assert self.num_stages_Qvt == self.num_hdimv_splits
+        stage_elems = operand_elems // self.num_hdimv_splits
+        if staging_elems == stage_elems:
+            self.sdV_split_offsets = [split * stage_elems for split in range(self.num_hdimv_splits)]
+            sQv_elems = operand_elems
+        else:
+            self.sdV_split_offsets = [operand_elems] * self.num_hdimv_splits
+            sQv_elems = operand_elems + staging_elems
+        sQvt_struct = cute.struct.Align[
+            cute.struct.MemRange[self.dtype, sQv_elems], self.buffer_align_bytes
+        ]
 
         # Fields absent from a compile mode get 0 stages => zero-size
         # MemRanges that add no bytes and no padding (all header fields in a
@@ -531,6 +560,14 @@ class FlashAttentionSparseMLABackwardSm100:
         )
         topk_length_dynamic = mIndexTopk.shape[0]
 
+        # TMA source contract: see pack_gqa.qheads_first_tma_view.
+        if const_expr(self.pad_qheads):
+            mQv_valid, mdO_valid, mP_valid, mdS_valid = [
+                qheads_first_tma_view(mX, self.qhead_per_kvhead_valid, head_idx=2)
+                if mX is not None
+                else None
+                for mX in (mQv, mdO, mP, mdS)
+            ]
         if const_expr(self.pack_gqa):
             mQv, mdO, mP, mdS, mQ = [
                 pack_gqa_layout(mX, self.qhead_per_kvhead, self.nheads_kv, head_idx=2)
@@ -544,15 +581,18 @@ class FlashAttentionSparseMLABackwardSm100:
                 mdPsum = pack_gqa_layout(mdPsum, self.qhead_per_kvhead, self.nheads_kv, head_idx=1)
             if const_expr(mLseLog2 is not None):
                 mLseLog2 = pack_gqa_layout(mLseLog2, self.qhead_per_kvhead, self.nheads_kv, head_idx=1)
+        if const_expr(not self.pad_qheads):
+            mQv_valid, mdO_valid, mP_valid, mdS_valid = mQv, mdO, mP, mdS
 
         # ((h/h_k, s_q), dv, h_k, b) -> (dv, (h/h_k, s_q), h_k, b)
         # or ((h/h_k, total_q), dv, h_k) -> (dv, (h/h_k, total_q), h_k)
+        # *_valid: (h, dv, s_q, b) -> (dv, h, s_q, b).
         mma_operand_layout_transpose = (
             [1, 0, 2, 3] if const_expr(mCuSeqlensQ is None) else [1, 0, 2]
         )
-        mQvt, mdOt = [
+        mQvt, mdOt, mQvt_valid, mdOt_valid = [
             cute.make_tensor(mX.iterator, cute.select(mX.layout, mode=mma_operand_layout_transpose))
-            for mX in (mQv, mdO)
+            for mX in (mQv, mdO, mQv_valid, mdO_valid)
         ]
 
         # fmt: off
@@ -654,21 +694,33 @@ class FlashAttentionSparseMLABackwardSm100:
         )
         cta_shape = cta_layout_vmnk.shape
 
-        def make_tma(make_fn, mX, smem_layout, mma_tiler, tiled_mma):
-            return make_fn(tma_load_op, mX, smem_layout, mma_tiler, tiled_mma, cta_shape)
+        def regroup(tensor, transposed=False):
+            if const_expr(self.pad_qheads):
+                # Transposed operands: undo the transpose, fold, and transpose back, mirroring
+                # how mdOt/mQvt derive from mdO/mQv.
+                if const_expr(transposed):
+                    tensor = select_modes(tensor, mma_operand_layout_transpose)
+                tensor = regroup_padded_qheads(tensor, self.qhead_per_kvhead, head_idx=2)
+                if const_expr(transposed):
+                    tensor = select_modes(tensor, mma_operand_layout_transpose)
+            return tensor
+
+        def make_tma(make_fn, mX, smem_layout, mma_tiler, tiled_mma, transposed):
+            atom, tensor = make_fn(tma_load_op, mX, smem_layout, mma_tiler, tiled_mma, cta_shape)
+            return atom, regroup(tensor, transposed)
 
         A, B = cute.nvgpu.make_tiled_tma_atom_A, cute.nvgpu.make_tiled_tma_atom_B
 
-        # (atom_name, tensor_name, make_fn, m, smem_layout, mma_tiler, tiled_mma)
+        # (atom_name, tensor_name, make_fn, m, smem_layout, mma_tiler, tiled_mma, transposed)
         _tma_specs = [
-            ("tma_atom_dO",  "tma_tensor_dO",  B, mdO,  self.sdO_layout,  self.mma_tiler_VdO,    tiled_mma_VdO),
-            ("tma_atom_dOt", "tma_tensor_dOt", B, mdOt, self.sdOt_layout, self.mma_tiler_PtdOt,  tiled_mma_PtdOt),
-            ("tma_atom_Qvt", "tma_tensor_Qvt", B, mQvt, self.sQvt_layout, self.mma_tiler_dStQvt, tiled_mma_dStQvt),
+            ("tma_atom_dO",  "tma_tensor_dO",  B, mdO_valid,  self.sdO_layout,  self.mma_tiler_VdO,    tiled_mma_VdO,    False),
+            ("tma_atom_dOt", "tma_tensor_dOt", B, mdOt_valid, self.sdOt_layout, self.mma_tiler_PtdOt,  tiled_mma_PtdOt,  True),
+            ("tma_atom_Qvt", "tma_tensor_Qvt", B, mQvt_valid, self.sQvt_layout, self.mma_tiler_dStQvt, tiled_mma_dStQvt, True),
         ]
         _tmas = {}
-        for atom_name, tensor_name, make_fn, m, smem_layout, mma_tiler, tiled_mma in _tma_specs:
+        for atom_name, tensor_name, make_fn, m, smem_layout, mma_tiler, tiled_mma, transposed in _tma_specs:
             _tmas[atom_name], _tmas[tensor_name] = (
-                make_tma(make_fn, m, smem_layout, mma_tiler, tiled_mma)
+                make_tma(make_fn, m, smem_layout, mma_tiler, tiled_mma, transposed)
             )
 
         (tma_atom_dO,  tma_tensor_dO,
@@ -682,17 +734,18 @@ class FlashAttentionSparseMLABackwardSm100:
             # Make TMA load for P separately
             tma_atom_P, tma_tensor_P = cute.nvgpu.cpasync.make_tiled_tma_atom(
                 cpasync.CopyBulkTensorTileG2SOp(),
-                mP,
+                mP_valid,
                 self.sP_layout,
                 self.tile_P,
             )
+            tma_tensor_P = regroup(tma_tensor_P)
         else:
             tma_atom_QvB, tma_tensor_QvB = make_tma(
-                B, mQv, self.sQvB_layout, self.mma_tiler_VdO, tiled_mma_VdO
+                B, mQv, self.sQvB_layout, self.mma_tiler_VdO, tiled_mma_VdO, False
             )
             if const_expr(self.has_qk):
                 tma_atom_Qr, tma_tensor_Qr = make_tma(
-                    B, mQ, self.sQr_layout, self.mma_tiler_Kr, tiled_mma_VdO
+                    B, mQ, self.sQr_layout, self.mma_tiler_Kr, tiled_mma_VdO, False
                 )
 
         # ==== TMA store ====
@@ -709,8 +762,9 @@ class FlashAttentionSparseMLABackwardSm100:
             self.dtype_dV, self.dV_layout_major, self.tile_dV, self.num_epi_stages_dV
         )
         tma_atom_dS, tma_tensor_dS = cpasync.make_tiled_tma_atom(
-            tma_store_op, mdS, cute.select(sdS_layout_staged, mode=[0, 1]), self.tile_dS
+            tma_store_op, mdS_valid, cute.select(sdS_layout_staged, mode=[0, 1]), self.tile_dS
         )
+        tma_tensor_dS = regroup(tma_tensor_dS)
         # fmt: on
 
         # ==== Allocate shared memory ====
@@ -1048,10 +1102,14 @@ class FlashAttentionSparseMLABackwardSm100:
                 (storage.sQv, sQvt_layout_staged),  # {dOt, Qvt, dV} overlap
             ]
         )
-        sdV = cute.make_tensor(
-            cute.recast_ptr(sdOt.iterator, sdV_layout_staged.inner, self.dtype_acc), sdV_layout_staged.outer
-        )
-        assert cute.cosize(sdV) * self.dtype_acc.width // self.dtype.width == cute.cosize(sdOt)
+        # Staging placement: see _get_shared_storage_cls.
+        sdVs = [
+            cute.make_tensor(
+                cute.recast_ptr(sdOt.iterator + offset, sdV_layout_staged.inner, self.dtype_acc),
+                sdV_layout_staged.outer,
+            )
+            for offset in self.sdV_split_offsets
+        ]
 
         sScaleP = sdPsum = sQvB = sLse = sQr = sKr = sBitmask = None
         if const_expr(not self.recompute_P):
@@ -1345,7 +1403,7 @@ class FlashAttentionSparseMLABackwardSm100:
             self.dVacc_store(
                 mIndexTopk,
                 mdV,
-                sdV,
+                sdVs,
                 tdVtdV0,
                 tdVtdV1,
                 thr_mma_PtdOt,
@@ -2797,7 +2855,7 @@ class FlashAttentionSparseMLABackwardSm100:
         self,
         mIndexTopk: cute.Tensor,
         mdV: cute.Tensor,
-        sdV: cute.Tensor,
+        sdVs: list[cute.Tensor],
         tdVtdV0: cute.Tensor,
         tdVtdV1: cute.Tensor,
         thr_mma_PtdOt: cute.ThrMma,
@@ -2845,15 +2903,14 @@ class FlashAttentionSparseMLABackwardSm100:
         tiled_copy_r2s = tiled_copy_2d(self.dtype_acc, 4, 64)
         thr_copy_r2s = tiled_copy_r2s.get_slice(tidx % 64)
 
-        # ((4,1),1,8,(1,8)):((1,0),0,4,(0,2048))
-        tRS_sdV = thr_copy_r2s.partition_D(sdV)
-
         tiled_copy_s2r = copy_utils.tiled_copy_2d(self.dtype_acc, 8, self.num_epilogue_threads, 4)
         thr_copy_s2r = tiled_copy_s2r.get_slice(tidx)
-        # (V, M, N, STAGE)
-        tSR_sdV = thr_copy_s2r.partition_S(sdV)
+        # ((4,1),1,8,(1,8)):((1,0),0,4,(0,2048)) and (V, M, N, STAGE), per split
+        tRS_sdVs = [thr_copy_r2s.partition_D(sdV) for sdV in sdVs]
+        tSR_sdVs = [thr_copy_s2r.partition_S(sdV) for sdV in sdVs]
+        tRS_sdV, tSR_sdV = tRS_sdVs[0], tSR_sdVs[0]
 
-        cdV = cute.make_identity_tensor(cute.product_each(sdV.shape[:2]))
+        cdV = cute.make_identity_tensor(cute.product_each(sdVs[0].shape[:2]))
         # (V, M, N)
         tdVcdV = thr_copy_s2r.partition_S(cdV)
 
@@ -2911,18 +2968,18 @@ class FlashAttentionSparseMLABackwardSm100:
 
                         tRS_rdV_cur = cute.make_tensor(tdVrdV_cur.iterator, tRS_rdV_cur_shape)
 
-                        stage = 4 * split + 2 * wg_half + (i % 2)
-                        cute.copy(tiled_copy_r2s, tRS_rdV_cur, tRS_sdV[None, None, None, stage])
+                        stage = 2 * wg_half + (i % 2)
+                        cute.copy(tiled_copy_r2s, tRS_rdV_cur, tRS_sdVs[split][None, None, None, stage])
                         cute.arch.fence_view_async_shared()
                         self.epi_barrier.arrive_and_wait()
 
                         tSR_rdV = cute.make_rmem_tensor(tdVrdV_out_shape, dtype=self.dtype_acc)
 
                         for w in cutlass.range_constexpr(2):
-                            stage_out = 4 * split + 2 * w + (i % 2)
+                            stage_out = 2 * w + (i % 2)
                             cute.copy(
                                 tiled_copy_s2r,
-                                tSR_sdV[None, None, None, stage_out],
+                                tSR_sdVs[split][None, None, None, stage_out],
                                 tSR_rdV[None, None, None, w],
                             )
 
