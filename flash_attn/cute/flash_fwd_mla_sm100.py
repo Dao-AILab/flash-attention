@@ -68,17 +68,20 @@ class FlashAttentionMLAForwardSm100:
         disable_bitmask: bool = False,
         use_clc_scheduler: bool = True,
         has_qk: bool = True,
+        token_pair_gather: bool = False,
     ):
         self.is_causal = is_causal
         self.is_local = False
         self.pack_gqa = pack_gqa
         assert 0 < qhead_per_kvhead <= 128
-        # qhead_per_kvhead is the real head count. Sparse MLA (MQA) pads it to the tile:
-        # see pack_gqa.qheads_first_tma_view.
+        # qhead_per_kvhead is the real head count. Sparse MLA (MQA) pads it to the tile, or to
+        # the 64-row half-tile for token pairs: see pack_gqa.qheads_first_tma_view.
         self.qhead_per_kvhead_valid = qhead_per_kvhead
         if is_topk_gather:
             assert pack_gqa
-            qhead_per_kvhead = sparse_mla_qhead_tile(qhead_per_kvhead)
+            qhead_per_kvhead = sparse_mla_qhead_tile(
+                qhead_per_kvhead, min_tile=64 if token_pair_gather else 128
+            )
         self.qhead_per_kvhead = qhead_per_kvhead
         self.pad_qheads = qhead_per_kvhead != self.qhead_per_kvhead_valid
         self.nheads_kv = nheads_kv
@@ -87,9 +90,14 @@ class FlashAttentionMLAForwardSm100:
         self.use_tma_KV = not use_cpasync_load_KV
         self.topk_length = topk_length
         self.is_topk_gather = is_topk_gather
+        # Token-pair gather: see the topk_gather_kv.CpasyncGatherKVManager note.
+        self.token_pair_gather = token_pair_gather
         if is_topk_gather:
-            # One token x 128 packed (padded) Q heads per tile.
+            # One token x 128 padded Q heads per tile, or two 64-head tokens for token pairs.
             assert use_cpasync_load_KV
+            if token_pair_gather:
+                assert qhead_per_kvhead == 64, "token pairs need <= 64 Q heads"
+                assert not (has_seqused_q or has_cu_seqlens_q), "token pairs: non-varlen only"
         # user-provided option if topk indices guaranteed in bounds
         self.disable_bitmask = disable_bitmask
         self.has_qk = has_qk
@@ -1477,19 +1485,30 @@ class FlashAttentionMLAForwardSm100:
 
             if const_expr(self.is_topk_gather):
                 # ==== Topk gather path ====
-                # cluster_m_block == m_idx under MQA 128 assumption
-                m_idx = cluster_m_block
-                if const_expr(not seqlen.has_cu_seqlens_q):
+                # One token per 128-row tile (MQA 128), or two 64-head tokens whose CTA rank
+                # selects the token (token-pair gather).
+                mIndexTopk_peer = None
+                if const_expr(self.token_pair_gather):
+                    m_idx = 2 * cluster_m_block + cta_rank_in_cluster
+                    mIndexTopk_cur = mIndexTopk[None, m_idx, batch_idx]
+                    mIndexTopk_peer = mIndexTopk[None, m_idx ^ 1, batch_idx]
+                elif const_expr(not seqlen.has_cu_seqlens_q):
+                    m_idx = cluster_m_block
                     mIndexTopk_cur = mIndexTopk[None, m_idx, batch_idx]
                 else:
+                    m_idx = cluster_m_block
                     offset_q = seqlen.offset_q if const_expr(not self.use_packed_varlen_sched) else 0
                     mIndexTopk_cur = mIndexTopk[None, m_idx + offset_q]
 
+                seqlen_k_limit_gather = None
                 if const_expr(self.is_causal):
                     m_local_idx = (
                         m_idx - seqlen.offset_q if const_expr(self.use_packed_varlen_sched) else m_idx
                     )
                     seqlen_k_limit = m_local_idx + 1 + seqlen.seqlen_k - seqlen.seqlen_q
+                    if const_expr(self.token_pair_gather):
+                        # Later token's limit for the shared union block (token-pair gather).
+                        seqlen_k_limit_gather = 2 * cluster_m_block + 2 + seqlen.seqlen_k - seqlen.seqlen_q
                 else:
                     seqlen_k_limit = seqlen.seqlen_k
                 cpasync_gather_kv_manager = CpasyncGatherKVManager.create(
@@ -1510,6 +1529,8 @@ class FlashAttentionMLAForwardSm100:
                     self.disable_bitmask,
                     sBitmask,
                     pipeline_bitmask,
+                    mIndexTopk_peer,
+                    seqlen_k_limit_gather=seqlen_k_limit_gather,
                 )
 
                 # (seqlen_k, hdim) or (seqlen_k, hdimv)

@@ -59,6 +59,7 @@ class FlashAttentionSparseMLABackwardSm100:
         disable_bitmask: bool = False,
         use_clc_scheduler: bool = True,
         recompute_P: bool = False,
+        token_pair_gather: bool = False,
     ):
         use_cpasync_load_KV = True
         # recompute_P: instead of loading the fwd-saved p (rescaled by scale_p),
@@ -69,6 +70,12 @@ class FlashAttentionSparseMLABackwardSm100:
         self.is_causal = is_causal
         self.is_local = False
         self.pack_gqa = True
+        # Token-pair gather (128-row tile = tokens 2p, 2p+1): see the
+        # topk_gather_kv.CpasyncGatherKVManager note.
+        self.token_pair_gather = token_pair_gather
+        if token_pair_gather:
+            assert qhead_per_kvhead <= 64, "token pairs: 64-row half-tile per token"
+            assert not has_seqused_q, "token pairs: non-varlen only"
         # qhead_per_kvhead is the real head count, padded to a 64- or 128-row tile.
         # Head padding and scaleP/dPsum contract: see pack_gqa.qheads_first_tma_view.
         self.qhead_per_kvhead_valid = qhead_per_kvhead
@@ -170,7 +177,7 @@ class FlashAttentionSparseMLABackwardSm100:
         # ==== problem shape info ====
         self.hdim = hdim  # ignored
         self.hdimv = hdimv
-        self.tile_m = self.qhead_per_kvhead
+        self.tile_m = 128 if token_pair_gather else self.qhead_per_kvhead
         self.tile_n = 64
         self.cta_tiler_mn = (self.tile_m // self.cta_group_size, self.tile_n)
         self.cluster_tile_n = self.cta_group_size * self.tile_n
@@ -561,6 +568,11 @@ class FlashAttentionSparseMLABackwardSm100:
         topk_length_dynamic = mIndexTopk.shape[0]
 
         # TMA source contract: see pack_gqa.qheads_first_tma_view.
+        # Token pairs with padding: the per-CTA P, dS, dOt and Qvt tiles span both tokens, so
+        # their sources group the token with the heads, ((h, s), x, b), and are tiled with
+        # ((64, 2), x): one box of 2 tokens x 64 heads with heads >= h zero-filled. dO stays
+        # heads-first: its per-CTA half tile is one token's 64 heads.
+        pair_pad = self.pad_qheads and self.token_pair_gather
         if const_expr(self.pad_qheads):
             mQv_valid, mdO_valid, mP_valid, mdS_valid = [
                 qheads_first_tma_view(mX, self.qhead_per_kvhead_valid, head_idx=2)
@@ -568,6 +580,16 @@ class FlashAttentionSparseMLABackwardSm100:
                 else None
                 for mX in (mQv, mdO, mP, mdS)
             ]
+            if const_expr(pair_pad):
+                mQv_valid, mdOt_src, mP_valid, mdS_valid = [
+                    cute.group_modes(
+                        cute.make_tensor(mX.iterator, cute.select(mX.layout, mode=[0, 2, 1, 3])), 0, 2
+                    )
+                    for mX in (mQv_valid, mdO_valid, mP_valid, mdS_valid)
+                ]
+        pair_rows = (self.qhead_per_kvhead, 2) if pair_pad else self.tile_m
+        tile_PdS_tma = (pair_rows, self.tile_n)
+        mma_tiler_dOt_Qvt_tma = (*self.mma_tiler_PtdOt[:2], pair_rows)
         if const_expr(self.pack_gqa):
             mQv, mdO, mP, mdS, mQ = [
                 pack_gqa_layout(mX, self.qhead_per_kvhead, self.nheads_kv, head_idx=2)
@@ -590,9 +612,16 @@ class FlashAttentionSparseMLABackwardSm100:
         mma_operand_layout_transpose = (
             [1, 0, 2, 3] if const_expr(mCuSeqlensQ is None) else [1, 0, 2]
         )
+        # Grouped pair sources: ((h, s), dv, b) -> (dv, (h, s), b).
+        valid_transpose = [1, 0, 2] if const_expr(pair_pad) else mma_operand_layout_transpose
         mQvt, mdOt, mQvt_valid, mdOt_valid = [
-            cute.make_tensor(mX.iterator, cute.select(mX.layout, mode=mma_operand_layout_transpose))
-            for mX in (mQv, mdO, mQv_valid, mdO_valid)
+            cute.make_tensor(mX.iterator, cute.select(mX.layout, mode=order))
+            for mX, order in (
+                (mQv, mma_operand_layout_transpose),
+                (mdO, mma_operand_layout_transpose),
+                (mQv_valid, valid_transpose),
+                (mdOt_src if const_expr(pair_pad) else mdO_valid, valid_transpose),
+            )
         ]
 
         # fmt: off
@@ -694,33 +723,41 @@ class FlashAttentionSparseMLABackwardSm100:
         )
         cta_shape = cta_layout_vmnk.shape
 
-        def regroup(tensor, transposed=False):
+        def regroup(tensor, transposed=False, grouped=False):
             if const_expr(self.pad_qheads):
                 # Transposed operands: undo the transpose, fold, and transpose back, mirroring
                 # how mdOt/mQvt derive from mdO/mQv.
                 if const_expr(transposed):
-                    tensor = select_modes(tensor, mma_operand_layout_transpose)
-                tensor = regroup_padded_qheads(tensor, self.qhead_per_kvhead, head_idx=2)
+                    tensor = select_modes(tensor, valid_transpose)
+                if const_expr(grouped):
+                    # ((h, s), x, b) -> ((64, s), x, 1, b); the size-1 KV-head mode reuses the
+                    # head basis, as in regroup_padded_qheads.
+                    T = tensor
+                    shape = ((self.qhead_per_kvhead, T.shape[0][1]), T.shape[1], 1, *T.shape[2:])
+                    stride = (T.stride[0], T.stride[1], T.stride[0][0], *T.stride[2:])
+                    tensor = cute.make_tensor(T.iterator, cute.make_layout(shape, stride=stride))
+                else:
+                    tensor = regroup_padded_qheads(tensor, self.qhead_per_kvhead, head_idx=2)
                 if const_expr(transposed):
                     tensor = select_modes(tensor, mma_operand_layout_transpose)
             return tensor
 
-        def make_tma(make_fn, mX, smem_layout, mma_tiler, tiled_mma, transposed):
+        def make_tma(make_fn, mX, smem_layout, mma_tiler, tiled_mma, transposed, grouped):
             atom, tensor = make_fn(tma_load_op, mX, smem_layout, mma_tiler, tiled_mma, cta_shape)
-            return atom, regroup(tensor, transposed)
+            return atom, regroup(tensor, transposed, grouped)
 
         A, B = cute.nvgpu.make_tiled_tma_atom_A, cute.nvgpu.make_tiled_tma_atom_B
 
-        # (atom_name, tensor_name, make_fn, m, smem_layout, mma_tiler, tiled_mma, transposed)
+        # (atom_name, tensor_name, make_fn, m, smem_layout, mma_tiler, tiled_mma, transposed, grouped)
         _tma_specs = [
-            ("tma_atom_dO",  "tma_tensor_dO",  B, mdO_valid,  self.sdO_layout,  self.mma_tiler_VdO,    tiled_mma_VdO,    False),
-            ("tma_atom_dOt", "tma_tensor_dOt", B, mdOt_valid, self.sdOt_layout, self.mma_tiler_PtdOt,  tiled_mma_PtdOt,  True),
-            ("tma_atom_Qvt", "tma_tensor_Qvt", B, mQvt_valid, self.sQvt_layout, self.mma_tiler_dStQvt, tiled_mma_dStQvt, True),
+            ("tma_atom_dO",  "tma_tensor_dO",  B, mdO_valid,  self.sdO_layout,  self.mma_tiler_VdO,    tiled_mma_VdO,    False, False),
+            ("tma_atom_dOt", "tma_tensor_dOt", B, mdOt_valid, self.sdOt_layout, mma_tiler_dOt_Qvt_tma, tiled_mma_PtdOt,  True,  pair_pad),
+            ("tma_atom_Qvt", "tma_tensor_Qvt", B, mQvt_valid, self.sQvt_layout, mma_tiler_dOt_Qvt_tma, tiled_mma_dStQvt, True,  pair_pad),
         ]
         _tmas = {}
-        for atom_name, tensor_name, make_fn, m, smem_layout, mma_tiler, tiled_mma, transposed in _tma_specs:
+        for atom_name, tensor_name, make_fn, m, smem_layout, mma_tiler, tiled_mma, transposed, grouped in _tma_specs:
             _tmas[atom_name], _tmas[tensor_name] = (
-                make_tma(make_fn, m, smem_layout, mma_tiler, tiled_mma, transposed)
+                make_tma(make_fn, m, smem_layout, mma_tiler, tiled_mma, transposed, grouped)
             )
 
         (tma_atom_dO,  tma_tensor_dO,
@@ -736,16 +773,16 @@ class FlashAttentionSparseMLABackwardSm100:
                 cpasync.CopyBulkTensorTileG2SOp(),
                 mP_valid,
                 self.sP_layout,
-                self.tile_P,
+                tile_PdS_tma,
             )
-            tma_tensor_P = regroup(tma_tensor_P)
+            tma_tensor_P = regroup(tma_tensor_P, grouped=pair_pad)
         else:
             tma_atom_QvB, tma_tensor_QvB = make_tma(
-                B, mQv, self.sQvB_layout, self.mma_tiler_VdO, tiled_mma_VdO, False
+                B, mQv, self.sQvB_layout, self.mma_tiler_VdO, tiled_mma_VdO, False, False
             )
             if const_expr(self.has_qk):
                 tma_atom_Qr, tma_tensor_Qr = make_tma(
-                    B, mQ, self.sQr_layout, self.mma_tiler_Kr, tiled_mma_VdO, False
+                    B, mQ, self.sQr_layout, self.mma_tiler_Kr, tiled_mma_VdO, False, False
                 )
 
         # ==== TMA store ====
@@ -762,9 +799,9 @@ class FlashAttentionSparseMLABackwardSm100:
             self.dtype_dV, self.dV_layout_major, self.tile_dV, self.num_epi_stages_dV
         )
         tma_atom_dS, tma_tensor_dS = cpasync.make_tiled_tma_atom(
-            tma_store_op, mdS_valid, cute.select(sdS_layout_staged, mode=[0, 1]), self.tile_dS
+            tma_store_op, mdS_valid, cute.select(sdS_layout_staged, mode=[0, 1]), tile_PdS_tma
         )
-        tma_tensor_dS = regroup(tma_tensor_dS)
+        tma_tensor_dS = regroup(tma_tensor_dS, grouped=pair_pad)
         # fmt: on
 
         # ==== Allocate shared memory ====
@@ -1580,11 +1617,7 @@ class FlashAttentionSparseMLABackwardSm100:
             num_n_block_groups = self.topk_length // self.cluster_tile_n
             # num_n_block_groups = topk_length_dynamic // self.cluster_tile_n
 
-            if const_expr(seqlen.has_cu_seqlens_q):
-                # m_block means absolute m_idx
-                mIndexTopk_cur = mIndexTopk[None, m_block]
-            else:
-                mIndexTopk_cur = mIndexTopk[None, m_block, batch_idx]
+            mIndexTopk_cur, mIndexTopk_peer = self.index_topk_rows(mIndexTopk, m_block, batch_idx, seqlen)
 
             if const_expr(self.is_causal):
                 m_local_idx = (
@@ -1597,6 +1630,9 @@ class FlashAttentionSparseMLABackwardSm100:
                 # this formula changes (e.g. local windows, seqused), the
                 # chunked wrapper must change with it, or chunked recompute-P
                 # gradients silently diverge from the forward's mask.
+                if const_expr(self.token_pair_gather):
+                    # Later token's limit for the shared union list (token-pair gather).
+                    m_local_idx = 2 * m_local_idx + 1
                 seqlen_k_limit = m_local_idx + 1 + seqlen.seqlen_k - seqlen.seqlen_q
             else:
                 seqlen_k_limit = seqlen.seqlen_k
@@ -1618,6 +1654,7 @@ class FlashAttentionSparseMLABackwardSm100:
                 self.disable_bitmask,
                 sBitmask,
                 pipeline_bitmask,
+                mIndexTopkPeer=mIndexTopk_peer,
             )
 
             # (seqlen_k, hdimv)
@@ -1991,6 +2028,20 @@ class FlashAttentionSparseMLABackwardSm100:
         pipeline_dOt_Qvt.producer_tail(producer_state_dOt_Qvt)
 
     @cute.jit
+    def index_topk_rows(self, mIndexTopk: cute.Tensor, m_block: Int32, batch_idx: Int32, seqlen):
+        """(own, peer) gather lists of the tile; peer is None unless token_pair_gather."""
+        mIndexTopk_peer = None
+        if const_expr(self.token_pair_gather):
+            mIndexTopk_cur = mIndexTopk[None, 2 * m_block, batch_idx]
+            mIndexTopk_peer = mIndexTopk[None, 2 * m_block + 1, batch_idx]
+        elif const_expr(seqlen.has_cu_seqlens_q):
+            # m_block means absolute m_idx
+            mIndexTopk_cur = mIndexTopk[None, m_block]
+        else:
+            mIndexTopk_cur = mIndexTopk[None, m_block, batch_idx]
+        return mIndexTopk_cur, mIndexTopk_peer
+
+    @cute.jit
     def load_inner(
         self,
         copy_atom: cute.CopyAtom,
@@ -2010,7 +2061,19 @@ class FlashAttentionSparseMLABackwardSm100:
 
         load_pipeline.producer_acquire(producer_state)
         mbar_ptr = load_pipeline.producer_get_barrier(producer_state)
-        if const_expr(bulk_copy):
+        if const_expr(bulk_copy and self.token_pair_gather):
+            # The 128 stats rows are two 64-row token halves that are not contiguous in gmem
+            # (scaleP has a topk-block mode between token and head): one bulk copy per token.
+            half = self.qhead_per_kvhead
+            with cute.arch.elect_one():
+                for r in cutlass.range_constexpr(2):
+                    cute.copy(
+                        copy_atom,
+                        cute.local_tile(tXgX, (half,), (r,)),
+                        cute.local_tile(tXsX, (half,), (r,)),
+                        mbar_ptr=mbar_ptr,
+                    )
+        elif const_expr(bulk_copy):
             with cute.arch.elect_one():
                 cute.copy(copy_atom, tXgX, tXsX, mbar_ptr=mbar_ptr)
         else:
@@ -2928,12 +2991,7 @@ class FlashAttentionSparseMLABackwardSm100:
             # (seqlen_k, hdimv)
             mdV_cur = seqlen.offset_batch_K(mdV, batch_idx, dim=3)[None, None, head_idx]
 
-            # (topk, dv)
-            if const_expr(seqlen.has_cu_seqlens_q):
-                # m_block means absolute m_idx
-                mIndexTopk_cur = mIndexTopk[None, m_block]
-            else:
-                mIndexTopk_cur = mIndexTopk[None, m_block, batch_idx]
+            mIndexTopk_cur, mIndexTopk_peer = self.index_topk_rows(mIndexTopk, m_block, batch_idx, seqlen)
 
             # ==== Mainloop ====
             for n_block_group in cutlass.range(num_n_block_groups, unroll=1):
@@ -2943,6 +3001,8 @@ class FlashAttentionSparseMLABackwardSm100:
                 for j in cutlass.range_constexpr(gmem_rows_per_thread):
                     n_idx = n_block * self.tile_n + tdVcdV[0, j, 0][0]
                     rIdxTopK[j] = mIndexTopk_cur[n_idx]
+                    if const_expr(mIndexTopk_peer is not None):
+                        rIdxTopK[j] = max(rIdxTopK[j], mIndexTopk_peer[n_idx])
 
                 for split in cutlass.range_constexpr(self.num_hdimv_splits):
                     tdVtdV_t2r = tdVtdVs_t2r[split]
