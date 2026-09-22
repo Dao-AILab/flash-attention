@@ -3558,7 +3558,7 @@ def test_flash_attn_mla_sparse_bwd_sentinel(seqlen_q, seqlen_k, nheads, shared_k
         dk_parent, dk_buf = plant_canary((batch_size, seqlen_k, nheads_kv, hdim), hdim, device)
     with torch.no_grad():
         fq, fk, fqv = (None, None, q) if shared_kv else (q, k, qv)
-        out2, lse2, p2, row_max2 = _flash_attn_fwd(
+        out2, lse2, p2, row_max2, _ = _flash_attn_fwd(
             fq, fk, v, qv=fqv, causal=causal, gather_kv_indices=gather_kv_indices, pack_gqa=True
         )
         dq2, dk2, dv2, dqv2, _ = _flash_attn_bwd_sparse_mla(
@@ -3690,7 +3690,7 @@ def test_flash_attn_mla_sparse_bwd_sentinel_varlen(nheads, shared_kv, causal, dt
         dk_parent, dk_buf = plant_canary((total, nheads_kv, hdim), hdim, device)
     with torch.no_grad():
         fq, fk, fqv = (None, None, q) if shared_kv else (q, k, qv)
-        out2, lse2, p2, row_max2 = _flash_attn_fwd(
+        out2, lse2, p2, row_max2, _ = _flash_attn_fwd(
             fq, fk, v, qv=fqv, cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
             max_seqlen_q=max_seqlen, max_seqlen_k=max_seqlen,
             causal=causal, gather_kv_indices=gather_kv_indices, pack_gqa=True,
@@ -5338,6 +5338,146 @@ def self_including_topk_indices(seqlen, topk_len, device):
     val, idx = scores.topk(topk_len, dim=-1)
     idx = idx.masked_fill(torch.isinf(val), -1)
     return idx.to(torch.int32).contiguous()
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("recompute_p", [False, True])
+@pytest.mark.parametrize("varlen", [False, True])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_mla_sparse_bwd_precise_dpsum(varlen, recompute_p, causal, dtype):
+    """Sparse-MLA training numerics: the forward writes o_lo = fp32(O) - bf16(O) and the
+    backward preprocess forms dpsum = rowsum(dO * (O + o_lo)); the forward runs the online
+    softmax with an exact running max.
+
+    Inputs are built so every token attends ~80% to its own key: then dP ~ dpsum and the
+    bf16 rounding of O, which is row-coherent in dS = P * (dP - dpsum), dominates the dq/dk
+    error (~1% rel-L2 vs fp64, with a tail of rows at ~100%). Checks:
+      1. the internal forward/backward entry points reproduce the autograd path;
+      2. dq/dqv/dk rel-L2 vs an fp64 reference drops well below the error of the same
+         backward run without the residual (internal entry point, dpsum from bf16 out
+         only) and lands within 1.5x of an emulated ideal bf16 pipeline with exact dpsum
+         (the bf16 floor for these inputs); dv does not get worse;
+      3. o_lo is the bf16 rounding residual of out (|o_lo| <= half an ulp of out) and
+         out + o_lo is closer to the fp64 out than out alone;
+      4. composes with gather_bwd_token_chunk (dq/dqv bitwise vs unchunked).
+    """
+    if not IS_SM100:
+        pytest.skip()
+    device = "cuda"
+    torch.random.manual_seed(0)
+    nheads, nheads_kv, hdim, hdimv = 128, 1, 64, 512
+    topk_len = 256
+    seqlens = [512, 384] if varlen else [512]
+    total = sum(seqlens)
+    softmax_scale = (hdim + hdimv) ** -0.5
+    beta = 0.4  # self-key boost: q_t += beta * k_t, qv_t += beta * v_t
+
+    k32 = torch.randn(total, nheads_kv, hdim, device=device)
+    v32 = torch.randn(total, nheads_kv, hdimv, device=device)
+    q32 = torch.randn(total, nheads, hdim, device=device) + beta * k32
+    qv32 = torch.randn(total, nheads, hdimv, device=device) + beta * v32
+    q, k, v, qv = [x.to(dtype).requires_grad_() for x in (q32, k32, v32, qv32)]
+    g = torch.randn(total, nheads, hdimv, device=device, dtype=dtype)
+    gather_kv_indices = torch.cat(
+        [self_including_topk_indices(L, topk_len, device) for L in seqlens]
+    ).contiguous()
+    cu_bounds = [0] + list(itertools.accumulate(seqlens))
+
+    if varlen:
+        cu_seqlens = torch.tensor(cu_bounds, dtype=torch.int32, device=device)
+
+        def run(**kw):
+            return flash_attn_varlen_func(
+                q, k, v, qv=qv, cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=max(seqlens), max_seqlen_k=max(seqlens),
+                gather_kv_indices=gather_kv_indices, softmax_scale=softmax_scale,
+                causal=causal, pack_gqa=True, gather_bwd_recompute_p=recompute_p, **kw,
+            )
+
+        g_call = g
+    else:
+
+        def run(**kw):
+            return flash_attn_func(
+                q[None], k[None], v[None], qv=qv[None], gather_kv_indices=gather_kv_indices[None],
+                softmax_scale=softmax_scale, causal=causal, pack_gqa=True,
+                gather_bwd_recompute_p=recompute_p, **kw,
+            )
+
+        g_call = g[None]
+
+    out1, lse1 = run()
+    grads1 = torch.autograd.grad(out1, (q, k, v, qv), g_call)
+    out_ck, _ = run(gather_bwd_token_chunk=200)
+    grads_ck = torch.autograd.grad(out_ck, (q, k, v, qv), g_call)
+    # Baseline without the residual through the internal entry points (the public API
+    # always uses it for training forwards): same forward, dpsum from the bf16 out only.
+    if varlen:
+        q_c, k_c, v_c, qv_c, idx_c = q, k, v, qv, gather_kv_indices
+        seq_kw = dict(
+            cu_seqlens_q=cu_seqlens, cu_seqlens_k=cu_seqlens,
+            max_seqlen_q=max(seqlens), max_seqlen_k=max(seqlens),
+        )
+    else:
+        q_c, k_c, v_c, qv_c, idx_c = q[None], k[None], v[None], qv[None], gather_kv_indices[None]
+        seq_kw = {}
+    with torch.no_grad():
+        out0, lse0, p0, row_max0, o_lo = _flash_attn_fwd(
+            q_c, k_c, v_c, qv=qv_c, gather_kv_indices=idx_c, softmax_scale=softmax_scale,
+            causal=causal, pack_gqa=True, gather_bwd_recompute_p=recompute_p, **seq_kw,
+        )
+        dq0, dk0, dv0, dqv0, _ = _flash_attn_bwd_sparse_mla(
+            q_c, k_c, v_c, qv_c, out0, g_call, lse0, p0, row_max0, idx_c,
+            softmax_scale=softmax_scale, causal=causal, recompute_p=recompute_p, o_lo=None,
+            **seq_kw,
+        )
+    grads0 = (dq0, dk0, dv0, dqv0)
+
+    if is_fake_mode():
+        # no more flash_attn cutedsl calls; skip data-dependent checks
+        return
+
+    assert torch.equal(out0, out1) and torch.equal(lse0, lse1), "internal fwd must match autograd fwd"
+    assert torch.equal(out_ck, out1)
+    for i, (a, b) in enumerate(zip(grads_ck, grads1)):
+        if i in (0, 3):  # dq, dqv: pure GEMM consumers of identical dS tiles
+            assert torch.equal(a, b), f"chunked grad {i} not bitwise vs unchunked"
+
+    # fp64 reference, per document
+    refs = []
+    for i in range(len(seqlens)):
+        s, e = cu_bounds[i], cu_bounds[i + 1]
+        refs.append(
+            _sparse_mla_fp64_reference(
+                q[s:e].detach(), k[s:e].detach(), v[s:e].detach(), qv[s:e].detach(),
+                gather_kv_indices[s:e], softmax_scale, causal, g[s:e],
+            )
+        )
+    out_ref, dq_ref, dk_ref, dv_ref, dqv_ref = [torch.cat(x, dim=0) for x in list(zip(*refs))[:5]]
+    ideal_ref = {n: torch.cat([r[5][n] for r in refs], dim=0) for n in ("dq", "dk", "dv", "dqv")}
+    out_flat = out1.reshape(total, nheads, hdimv)
+
+    def rel_l2(a, r):
+        return ((a.reshape(r.shape).double() - r).norm() / r.norm()).item()
+
+    names = ("dq", "dk", "dv", "dqv")
+    refs_by_name = dict(zip(names, (dq_ref, dk_ref, dv_ref, dqv_ref)))
+    err0 = {n: rel_l2(a, refs_by_name[n]) for n, a in zip(names, grads0)}
+    err1 = {n: rel_l2(a, refs_by_name[n]) for n, a in zip(names, grads1)}
+    err_ideal = {n: rel_l2(ideal_ref[n], refs_by_name[n]) for n in names}
+    print("rel-L2 vs fp64 without/with O residual (ideal bf16 pipeline): "
+          + ", ".join(f"{n} {err0[n]:.4%}/{err1[n]:.4%} ({err_ideal[n]:.4%})" for n in names))
+    assert err0["dq"] > 5e-3, "test inputs must be peaked enough for the bf16-O dpsum error to dominate"
+    for n in ("dq", "dqv", "dk"):
+        assert err1[n] < 0.6 * err0[n], f"{n}: the O residual did not reduce the error ({err0[n]:.4%} -> {err1[n]:.4%})"
+    for n in names:
+        assert err1[n] <= 1.5 * err_ideal[n], f"{n}: rel-L2 {err1[n]:.4%} vs ideal bf16 pipeline {err_ideal[n]:.4%}"
+
+    assert o_lo is not None and o_lo.shape == out1.shape and o_lo.dtype == out1.dtype
+    half_ulp = out1.float().abs() * 2**-8
+    assert (o_lo.float().abs() <= half_ulp + 1e-30).all(), "o_lo must be the bf16 rounding residual of out"
+    assert rel_l2(out_flat.double() + o_lo.reshape(out_flat.shape).double(), out_ref) < rel_l2(out_flat, out_ref)
 
 
 def _self_last_permutation(idx):
