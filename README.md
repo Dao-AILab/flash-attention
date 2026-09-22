@@ -173,6 +173,21 @@ cd flash-attention
 FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" pip install --no-build-isolation .
 ```
 
+Installing the bundled `third_party/aiter` replaces an existing Triton with an aiter-compatible one.
+On a ROCm PyTorch image, whose Triton is matched to its PyTorch and ROCm versions, set
+`AITER_USE_SYSTEM_TRITON=1` to keep that Triton instead:
+```sh
+cd flash-attention
+FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" AITER_USE_SYSTEM_TRITON=1 pip install --no-build-isolation .
+```
+
+To build against an `aiter` that is already installed, instead of building the bundled
+`third_party/aiter` submodule:
+```sh
+cd flash-attention
+FLASH_ATTENTION_TRITON_AMD_ENABLE="TRUE" FLASH_ATTENTION_USE_SYSTEM_AITER="TRUE" pip install --no-build-isolation .
+```
+
 To use a specific aiter commit (e.g., for testing or development):
 ```sh
 cd flash-attention

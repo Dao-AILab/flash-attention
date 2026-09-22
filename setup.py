@@ -2,6 +2,7 @@
 
 import sys
 import functools
+import importlib.util
 import warnings
 import os
 import re
@@ -62,6 +63,7 @@ BASE_WHEEL_URL = (
 # SKIP_CUDA_BUILD: Intended to allow CI to use a simple `python setup.py sdist` run to copy over raw files, without any cuda compilation
 FORCE_BUILD = os.getenv("FLASH_ATTENTION_FORCE_BUILD", "FALSE") == "TRUE"
 SKIP_CUDA_BUILD = os.getenv("FLASH_ATTENTION_SKIP_CUDA_BUILD", "FALSE") == "TRUE"
+USE_SYSTEM_AITER = os.getenv("FLASH_ATTENTION_USE_SYSTEM_AITER", "FALSE") == "TRUE"
 # For CI, we want the option to build with C++11 ABI since the nvcr images use C++11 ABI
 FORCE_CXX11_ABI = os.getenv("FLASH_ATTENTION_FORCE_CXX11_ABI", "FALSE") == "TRUE"
 ROCM_BACKEND: Optional[Literal["triton", "ck"]] = None
@@ -252,20 +254,39 @@ def get_ck_tile_bfloat16_supported_modes(ck_dir):
 cmdclass = {}
 ext_modules = []
 
+def check_system_aiter():
+    """Check an installed aiter provides the Triton kernels, without importing it: find_spec() on a
+    dotted name imports the parent, and importing aiter JIT-builds against a GPU the build has not got.
+    """
+    spec = importlib.util.find_spec("aiter")
+    locations = list(spec.submodule_search_locations or []) if spec is not None else []
+    kernels = os.path.join("ops", "triton", "_triton_kernels", "flash_attn_triton_amd")
+    if any(os.path.isdir(os.path.join(root, kernels)) for root in locations):
+        return
+    raise RuntimeError(
+        "FLASH_ATTENTION_USE_SYSTEM_AITER=TRUE was set, but no installed aiter provides "
+        f"aiter.{kernels.replace(os.sep, '.')}. Install a compatible aiter, or unset "
+        "FLASH_ATTENTION_USE_SYSTEM_AITER to build the bundled third_party/aiter."
+    )
+
+
 # We want this even if SKIP_CUDA_BUILD because when we run python setup.py sdist we want the .hpp
 # files included in the source distribution, in case the user compiles from source.
 if IS_ROCM:
     if ROCM_BACKEND == "triton":
-        if os.path.isdir(".git"):
-            subprocess.run(["git", "submodule", "update", "--init", "third_party/aiter"], check=True)
+        if USE_SYSTEM_AITER:
+            check_system_aiter()
         else:
-            assert os.path.isdir("third_party/aiter"), (
-                "third_party/aiter is missing, please use source distribution or git clone"
+            if os.path.isdir(".git"):
+                subprocess.run(["git", "submodule", "update", "--init", "third_party/aiter"], check=True)
+            else:
+                assert os.path.isdir("third_party/aiter"), (
+                    "third_party/aiter is missing, please use source distribution or git clone"
+                )
+            subprocess.run(
+                [sys.executable, "-m", "pip", "install", "--no-build-isolation", "third_party/aiter"],
+                check=True,
             )
-        subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--no-build-isolation", "third_party/aiter"],
-            check=True,
-        )
     elif ROCM_BACKEND == "ck":
         if os.path.isdir(".git"):
             subprocess.run(["git", "submodule", "update", "--init", "csrc/composable_kernel"], check=True)
