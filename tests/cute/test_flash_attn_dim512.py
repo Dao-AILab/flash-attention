@@ -1,6 +1,7 @@
 """SM100 symmetric head-dimension 512 correctness and boundary regressions."""
 
 from itertools import accumulate
+import os
 import pytest
 import torch
 from flash_attn.cute import flash_attn_func, flash_attn_varlen_func
@@ -11,10 +12,18 @@ from functools import wraps
 from flash_attn.cute import interface
 from test_flash_attn import check_tensor_vs_ref
 
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
-    reason="Requires SM100",
-)
+pytestmark = [
+    # These regressions inspect real values, cache reuse, and output buffers.
+    # Run them on the selected GPU in pass 2, not in the parallel fake-tensor pass.
+    pytest.mark.skipif(
+        os.getenv("FLASH_ATTENTION_FAKE_TENSOR", "0") == "1",
+        reason="D512 regressions require GPU execution",
+    ),
+    pytest.mark.skipif(
+        not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
+        reason="Requires SM100",
+    ),
+]
 
 
 def reference(q, k, v, causal=False, window=(-1, -1), softcap=0.0, scale=None):
@@ -1057,20 +1066,33 @@ def test_dynamic_batch_token_cache_reuse(monkeypatch, dtype, causal, packed):
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize("window", [(-1, 0), (-257, 0), (-2, 3), (3, -1), (-1, None), (None, -2)])
-def test_signed_window_boundaries(dtype, window):
+@pytest.mark.parametrize(
+    "sq,sk,hq,hk,window",
+    [
+        (sq, sk, hq, hk, window)
+        for sq, sk, hq, hk in [(137, 149, 4, 2), (137, 137, 2, 2), (137, 137, 4, 2)]
+        for window in [(-1, 0), (-257, 0), (-2, 3), (3, -1), (-1, None), (None, -2),
+                       (-257, None), (None, -257)]
+    ] + [
+        # Only the leading/trailing output tiles are empty in these square cases.
+        (257, 257, hq, hk, window)
+        for hq, hk in [(2, 2), (4, 2)]
+        for window in [(-129, None), (None, -129)]
+    ],
+)
+def test_signed_window_boundaries(dtype, window, sq, sk, hq, hk):
     """Negative offset bounds are literal after the public window resolver."""
     torch.manual_seed(712)
-    q = torch.randn(1, 137, 4, 512, device="cuda", dtype=dtype, requires_grad=True)
+    q = torch.randn(1, sq, hq, 512, device="cuda", dtype=dtype, requires_grad=True)
     k, v = [
-        torch.randn(1, 149, 2, 512, device="cuda", dtype=dtype, requires_grad=True)
+        torch.randn(1, sk, hk, 512, device="cuda", dtype=dtype, requires_grad=True)
         for _ in range(2)
     ]
     qr, kr, vr = [t.detach().double().requires_grad_() for t in (q, k, v)]
-    scores = torch.einsum("bmhd,bnhd->bhmn", qr, kr.repeat_interleave(2, dim=2)) / (512 ** 0.5)
-    center = torch.arange(137, device="cuda")[:, None] + 149 - 137
-    keys = torch.arange(149, device="cuda")[None, :]
-    valid = torch.ones((137, 149), device="cuda", dtype=torch.bool)
+    scores = torch.einsum("bmhd,bnhd->bhmn", qr, kr.repeat_interleave(hq // hk, dim=2)) / (512 ** 0.5)
+    center = torch.arange(sq, device="cuda")[:, None] + sk - sq
+    keys = torch.arange(sk, device="cuda")[None, :]
+    valid = torch.ones((sq, sk), device="cuda", dtype=torch.bool)
     if window[0] is not None:
         valid &= keys >= center - window[0]
     if window[1] is not None:
@@ -1078,11 +1100,22 @@ def test_signed_window_boundaries(dtype, window):
     masked = scores.masked_fill(~valid, -torch.inf)
     safe = torch.where(valid.any(-1)[None, None, :, None], masked, 0.)
     probs = safe.softmax(-1).masked_fill(~valid, 0.)
-    ref = torch.einsum("bhmn,bnhd->bmhd", probs, vr.repeat_interleave(2, dim=2))
-    out, _ = flash_attn_func(q, k, v, window_size=window)
+    ref = torch.einsum("bhmn,bnhd->bmhd", probs, vr.repeat_interleave(hq // hk, dim=2))
+    out, lse = flash_attn_func(q, k, v, window_size=window, return_lse=True)
     grad = torch.randn_like(out)
     actual = torch.autograd.grad(out, (q, k, v), grad)
     expected = torch.autograd.grad(ref, (qr, kr, vr), grad.double())
+    # Entire output tiles can have no active key/query tile with signed windows.
+    # Supplied nonzero buffers make missing zero writes independent of allocator reuse.
+    supplied = [torch.full_like(t, 7) for t in (q, k, v)]
+    written = _flash_attn_bwd(
+        q, k, v, out, grad, lse,
+        window_size_left=window[0], window_size_right=window[1],
+        dq=supplied[0], dk=supplied[1], dv=supplied[2],
+    )
+    for result, buffer, autograd_result in zip(written, supplied, actual):
+        assert result is buffer
+        torch.testing.assert_close(result, autograd_result, atol=0, rtol=0)
     check(out, ref, dtype)
     qp, kp, vp = [t.detach().clone().requires_grad_() for t in (q, k, v)]
     eager = attention_ref(qp, kp, vp, window_size=window, upcast=False, reorder_ops=True)[0]

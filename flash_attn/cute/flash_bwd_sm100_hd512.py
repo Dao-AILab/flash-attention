@@ -1823,10 +1823,12 @@ def backward_sm100_d512(
         for t in outputs
     )
     work_dq, work_dk, work_dv = work_outputs
-    # Dense square attention writes every gradient element. Other layouts may
-    # contain empty or unused rows and need zero initialization.
+    # Empty or unused rows need zero initialization. A negative window bound
+    # can also exclude a whole tile in dense square attention, skipping its store.
     zero_outputs = (
-        any(x is not None for x in (cuq, cuk, usedq, usedk)) or q.shape[-3] != k.shape[-3]
+        any(x is not None for x in (cuq, cuk, usedq, usedk))
+        or q.shape[-3] != k.shape[-3]
+        or any(bound is not None and bound < 0 for bound in (window_left, window_right))
     )
     if zero_outputs:
         work_dq.zero_()

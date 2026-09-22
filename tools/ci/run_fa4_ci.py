@@ -16,7 +16,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 DEFAULT_TEST_FILTER = ""  # empty = run all; CI overrides via --test-filter
-DEFAULT_TEST_TARGET = "tests/cute/test_flash_attn.py"
+DEFAULT_TEST_TARGETS = ["tests/cute/test_flash_attn.py", "tests/cute/test_flash_attn_dim512.py"]
 
 
 @dataclass(frozen=True)
@@ -87,7 +87,7 @@ def read_cuda_major() -> int:
 # ── Step plan ─────────────────────────────────────────────────────────────────
 
 def build_step_plan(
-    test_target: str,
+    test_target: str | list[str],
     test_filter: str,
     compile_workers: int,
     run_workers: int,
@@ -95,7 +95,8 @@ def build_step_plan(
     benchmark_visible_devices: str,
     skip_benchmark: bool,
 ) -> list[Step]:
-    pytest_base = ["python3", "-m", "pytest", test_target, *(["-k", test_filter] if test_filter else [])]
+    test_targets = [test_target] if isinstance(test_target, str) else test_target
+    pytest_base = ["python3", "-m", "pytest", *test_targets, *(["-k", test_filter] if test_filter else [])]
 
     steps = [
         Step(
@@ -358,7 +359,8 @@ def make_parser() -> argparse.ArgumentParser:
     parser.add_argument("--repo-root", type=Path, default=Path.cwd())
     parser.add_argument("--sif", default=os.environ.get("FA4_SIF", ""),
                         help="Apptainer .sif image path (or set FA4_SIF env var)")
-    parser.add_argument("--test-target", default=DEFAULT_TEST_TARGET)
+    parser.add_argument("--test-target", nargs="+", default=DEFAULT_TEST_TARGETS,
+                        help="One or more pytest file paths or node IDs")
     parser.add_argument("--test-filter", default=DEFAULT_TEST_FILTER)
     parser.add_argument("--compile-workers", type=int, default=1)
     parser.add_argument("--run-workers", type=int, default=1)
