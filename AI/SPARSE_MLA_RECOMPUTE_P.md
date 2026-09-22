@@ -73,6 +73,13 @@ the normalized P and `(dP − dPsum)·scale` to bf16 *before* the product (the
 original scheme) cost ~29% dq / ~22% dK+dV relative-L2 error at no measurable
 speed or register cost (128 regs/thread; fewer spills).
 
+Both modes form `dPsum = rowsum(dO ⊙ O)` in the preprocess. Training forwards
+also save the bf16 rounding residual of `out` and the preprocess reads
+`out + o_lo`, so this term does not carry the bf16 output rounding; with peaked
+attention (dP ≈ dPsum on the dominant slot) that rounding otherwise dominates dS
+and dq/dk. Training forwards also use an exact running softmax max. See
+`AI/SPARSE_MLA_DPSUM_PRECISION.md` for the decomposition and measurements.
+
 Because nothing saved is consumed, re-running the backward over the same
 graph (`retain_graph=True`) works in this mode (asserted in the test).
 Second-order gradients (grad-of-grad) are not implemented by these autograd

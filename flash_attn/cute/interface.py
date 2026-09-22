@@ -579,7 +579,9 @@ def _flash_attn_fwd(
     seqlen_k_per_split: Optional[int] = None,
     disable_scheduler_metadata: bool = False,
     gather_bwd_recompute_p: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+) -> Tuple[
+    torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]
+]:
     """Forward pass for FlashAttention.
 
     Args:
@@ -768,7 +770,7 @@ def _flash_attn_fwd(
                 # Empty rows have lse == sink (see softmax.apply_learnable_sink). Heads are the
                 # last dim for the qv layout (lse_shape above) and second-to-last otherwise.
                 lse.copy_(learnable_sink if qv is not None else learnable_sink[:, None])
-        return out, lse, None, None
+        return out, lse, None, None, None
 
     if is_fp8:
         for t, name in ((q_descale, "q_descale"), (k_descale, "k_descale"), (v_descale, "v_descale")):
@@ -1017,12 +1019,15 @@ def _flash_attn_fwd(
                 row_max = torch.empty(total_q, gather_kv_length//128, num_head, dtype=torch.float32, device=device)
         else:
             p = row_max = None
+        # Rounding residual fp32(O) - bf16(O), saved so the backward forms dpsum from a
+        # near-fp32 O. See AI/SPARSE_MLA_DPSUM_PRECISION.md.
+        o_lo = torch.empty_like(out) if requires_grad and sparse_kv else None
     else:
         assert gather_kv_indices is None, "gather_kv_indices is only supported with qv"
         gather_kv_length = None
         sparse_kv = None
         disable_sparse_kv_bitmask = None
-        p = row_max = None
+        p = row_max = o_lo = None
 
 
     reuse_scheduler_metadata = scheduler_metadata is not None
@@ -1214,6 +1219,7 @@ def _flash_attn_fwd(
         use_clc_scheduler,
         num_splits_dynamic is not None,
         mla_fwd_rescale_threshold,
+        o_lo is not None,
         virtual_batch_idx is not None,
         num_nheads_in_l2 is not None,
         tile_count_semaphore is not None,
@@ -1310,6 +1316,7 @@ def _flash_attn_fwd(
         gather_kv_indices_tensor = to_cute_tensor(gather_kv_indices)
         p_tensor = to_cute_tensor(p)
         row_max_tensor = to_cute_tensor(row_max)
+        o_lo_tensor = to_cute_tensor(o_lo)
 
         if arch // 10 == 8:
             assert page_table is None, "paged KV not supported on SM 8.0"
@@ -1470,6 +1477,7 @@ def _flash_attn_fwd(
                 window_size_left,
                 window_size_right,
                 learnable_sink=learnable_sink_tensor,
+                mOlo=o_lo_tensor,
                 stream=current_stream,
                 options="--enable-tvm-ffi",
             )
@@ -1558,6 +1566,7 @@ def _flash_attn_fwd(
                 window_size_left,
                 window_size_right,
                 learnable_sink,
+                o_lo,
             )
         else:
             call_args = [
@@ -1633,7 +1642,7 @@ def _flash_attn_fwd(
         # is_split_kv (using CTA 0, since a later CTA may have exited prematurely), so
         # that this host-side zeroing is only needed when is_split_kv=False.
         tile_count_semaphore.zero_()
-    return out, lse, p, row_max
+    return out, lse, p, row_max, o_lo
 
 
 _flash_attn_fwd.compile_cache = get_jit_cache("fwd")
@@ -1707,6 +1716,7 @@ def _compile_bwd_preprocess(
     nheads_kv,
     has_cu_total_m_blocks,
     hdim_multiple_of,
+    has_o_lo=False,
 ):
     """Compile bwd preprocess kernel using cute fake tensors (no real GPU tensors needed)."""
     mQ, mK, mV, mO, mdO, mdQ, mdK, mdV, mLSE, mLSElog2, mPdPsum, mdQaccum, mdKaccum, mdVaccum, mScaleP = make_fake_bwd_tensors(
@@ -1723,6 +1733,7 @@ def _compile_bwd_preprocess(
     mScaleP = fake_tensor(Float32, mScaleP.shape, divisibility=1) if has_scaleP else None
     softmax_scale = Float32(1.0)
     mCuTotalMBlocks = fake_tensor(Int32, (batchp1,), divisibility=1) if has_cu_total_m_blocks else None
+    mOlo = fake_tensor(dtype, mO.shape, divisibility=128 // dtype.width) if has_o_lo else None
     fa_bwd_pre = FlashAttentionBackwardPreprocess(
         dtype, head_dim, head_dim_v, m_block_size,
         use_padded_offsets=use_padded_offsets,
@@ -1734,7 +1745,7 @@ def _compile_bwd_preprocess(
     )
     return cute.compile(
         fa_bwd_pre, mO, mdO, mPdPsum, mLSE, mLSElog2, mdQaccum, mCuSeqlensQ, mSequsedQ, mdLSE,
-        mRowMax, mScaleP, softmax_scale, mCuTotalMBlocks,
+        mRowMax, mScaleP, softmax_scale, mCuTotalMBlocks, mOlo,
         cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
         options="--enable-tvm-ffi",
     )
@@ -1754,10 +1765,14 @@ def _bwd_preprocess(
     softmax_scale=1.0,   # only used with scale_p
     cu_total_m_blocks=None,
     hdim_multiple_of=32,
+    o_lo=None,
     *,
     fake_mode,
 ):
-    """Backward preprocess: compute (o * dout).sum(dim=-1) - dLSE, lse * log2_e, and zero out dq_accum."""
+    """Backward preprocess: compute (o * dout).sum(dim=-1) - dLSE, lse * log2_e, and zero out dq_accum.
+
+    If o_lo (the bf16 rounding residual of out) is given, dpsum is formed from out + o_lo.
+    """
     if row_max is not None:
         assert scale_p is not None
         # scale_p (load-p) mode and lse_log2 (recompute-P) mode are mutually
@@ -1793,13 +1808,14 @@ def _bwd_preprocess(
         nheads_kv,
         cu_total_m_blocks is not None,
         hdim_multiple_of,
+        o_lo is not None,
     )
     if compile_key not in _bwd_preprocess.compile_cache:
         _bwd_preprocess.compile_cache[compile_key] = _compile_bwd_preprocess(*compile_key)
     if not fake_mode:
         _bwd_preprocess.compile_cache[compile_key](
             out, dout, dpsum, lse, lse_log2, dq_accum, cu_seqlens_q, seqused_q, dlse,
-            row_max, scale_p, softmax_scale, cu_total_m_blocks,
+            row_max, scale_p, softmax_scale, cu_total_m_blocks, o_lo,
         )
 
 
@@ -2841,6 +2857,7 @@ def _flash_attn_bwd_sparse_mla(
     dqv: Optional[torch.Tensor] = None,
     recompute_p: bool = False,
     token_chunk: Optional[int] = None,
+    o_lo: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     fake_mode = is_fake_mode()
     arch = _get_device_arch()
@@ -2875,10 +2892,12 @@ def _flash_attn_bwd_sparse_mla(
             else 1.0 / math.sqrt(head_dim + head_dim_v)
         )
 
-    q, k, v, qv, out, dout, lse, p, row_max = [
+    q, k, v, qv, out, dout, lse, p, row_max, o_lo = [
         maybe_contiguous(t)
-        for t in (q, k, v, qv, out, dout, lse, p, row_max)
+        for t in (q, k, v, qv, out, dout, lse, p, row_max, o_lo)
     ]
+    if o_lo is not None:
+        _validate_tensor(o_lo, "o_lo", out.shape, out.dtype, v.device)
     gather_kv_indices, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, learnable_sink = [
         maybe_contiguous(t)
         for t in (gather_kv_indices, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, learnable_sink)
@@ -3004,6 +3023,7 @@ def _flash_attn_bwd_sparse_mla(
         qhead_per_kvhead=1 if pad_qheads else qhead_per_kvhead,
         nheads_kv=nheads if pad_qheads else nheads_kv,
         softmax_scale=softmax_scale,
+        o_lo=o_lo,
         fake_mode=fake_mode,
     )
 
@@ -3412,7 +3432,7 @@ class FlashAttnFunc(torch.autograd.Function):
             # by setting q, k to None
             qv = q if qv is None else qv
             q = k = None
-        out, lse, p, row_max = _flash_attn_fwd(
+        out, lse, p, row_max, o_lo = _flash_attn_fwd(
             q,
             k,
             v,
@@ -3434,7 +3454,7 @@ class FlashAttnFunc(torch.autograd.Function):
             gather_kv_indices=gather_kv_indices,
             gather_bwd_recompute_p=gather_bwd_recompute_p,
         )
-        ctx.save_for_backward(q, k, v, qv, out, lse, p, row_max, gather_kv_indices, learnable_sink, *(aux_tensors or ()))
+        ctx.save_for_backward(q, k, v, qv, out, lse, p, row_max, o_lo, gather_kv_indices, learnable_sink, *(aux_tensors or ()))
         ctx.gather_bwd_recompute_p = gather_bwd_recompute_p
         ctx.shared_kv = shared_kv
         ctx.softmax_scale = softmax_scale
@@ -3454,7 +3474,7 @@ class FlashAttnFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, dlse):
-        q, k, v, qv, out, lse, p, row_max, gather_kv_indices, learnable_sink, *aux = ctx.saved_tensors
+        q, k, v, qv, out, lse, p, row_max, o_lo, gather_kv_indices, learnable_sink, *aux = ctx.saved_tensors
         aux_tensors = aux if aux else None
         if not ctx.return_lse:
             dlse = None
@@ -3477,6 +3497,7 @@ class FlashAttnFunc(torch.autograd.Function):
                 causal=ctx.causal,
                 recompute_p=ctx.gather_bwd_recompute_p,
                 token_chunk=ctx.gather_bwd_token_chunk,
+                o_lo=o_lo,
             )
             if ctx.shared_kv:
                 return dqv, dv, None, None, None, None, None, None, dsink, *((None,) * 14)
@@ -3559,7 +3580,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             # by setting q, k to None
             qv = q if qv is None else qv
             q = k = None
-        out, lse, p, row_max = _flash_attn_fwd(
+        out, lse, p, row_max, o_lo = _flash_attn_fwd(
             q,
             k,
             v,
@@ -3601,6 +3622,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
             lse,
             p,
             row_max,
+            o_lo,
             gather_kv_indices,
             learnable_sink,
             cu_seqlens_q,
@@ -3630,7 +3652,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, dout, dlse):
-        q, k, v, qv, out, lse, p, row_max, gather_kv_indices, learnable_sink, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, *aux = ctx.saved_tensors
+        q, k, v, qv, out, lse, p, row_max, o_lo, gather_kv_indices, learnable_sink, cu_seqlens_q, cu_seqlens_k, seqused_q, seqused_k, *aux = ctx.saved_tensors
         aux_tensors = aux if aux else None
         if not ctx.return_lse:
             dlse = None
@@ -3660,6 +3682,7 @@ class FlashAttnVarlenFunc(torch.autograd.Function):
                 min_seqlen_k=ctx.min_seqlen_k,
                 recompute_p=ctx.gather_bwd_recompute_p,
                 token_chunk=ctx.gather_bwd_token_chunk,
+                o_lo=o_lo,
             )
             if ctx.shared_kv:
                 return dqv, dv, None, None, *((None,) * 12), dsink, *((None,) * 16)

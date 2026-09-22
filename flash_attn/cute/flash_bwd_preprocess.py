@@ -148,12 +148,16 @@ class FlashAttentionBackwardPreprocess:
         mScaleP: Optional[cute.Tensor],  # == mRowMax
         softmax_scale: Float32,
         mCuTotalMBlocks: Optional[cute.Tensor] = None,
+        mOlo: Optional[cute.Tensor] = None,  # same shape/dtype as mO: bf16 rounding residual of O
         # Always keep stream as the last parameter (EnvStream: obtained implicitly via TVM FFI).
         stream: cuda.CUstream = None,
     ):
         # Get the data type and check if it is fp16 or bf16
         if const_expr(not (mO.element_type == mdO.element_type)):
             raise TypeError("All tensors must have the same data type")
+        if const_expr(mOlo is not None):
+            if const_expr(not (mOlo.element_type == mO.element_type)):
+                raise TypeError("O residual must have O's data type")
         if const_expr(mO.element_type not in [cutlass.Float16, cutlass.BFloat16]):
             raise TypeError("Only Float16 or BFloat16 is supported")
         if const_expr(mPdPsum.element_type not in [Float32]):
@@ -187,9 +191,11 @@ class FlashAttentionBackwardPreprocess:
         # (b, s, h, d)  -> (s, d, h, b)  or
         # (total, h, d) -> (total, d, h)
         QO_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
-        mO, mdO = [
+        mO, mdO, mOlo = [
             cute.make_tensor(mX.iterator, cute.select(mX.layout, mode=QO_layout_transpose))
-            for mX in (mO, mdO)
+            if mX is not None
+            else None
+            for mX in (mO, mdO, mOlo)
         ]
 
         if const_expr(not self.nheads_major):
@@ -215,11 +221,11 @@ class FlashAttentionBackwardPreprocess:
 
         # pack gqa
         if const_expr(self.pack_gqa):
-            mO, mdO, mRowMax, mScaleP = [
+            mO, mdO, mRowMax, mScaleP, mOlo = [
                 pack_gqa_layout(mX, self.qhead_per_kvhead, self.nheads_kv, head_idx=2)
                 if mX is not None
                 else None
-                for mX in (mO, mdO, mRowMax, mScaleP)
+                for mX in (mO, mdO, mRowMax, mScaleP, mOlo)
             ]
             mPdPsum, mLSE, mLSElog2, mdLSE = [
                 pack_gqa_layout(mX, self.qhead_per_kvhead, self.nheads_kv, head_idx=1)
@@ -265,6 +271,7 @@ class FlashAttentionBackwardPreprocess:
         self.kernel(
             mO,
             mdO,
+            mOlo,
             mPdPsum,
             mLSE,
             mLSElog2,
@@ -291,6 +298,7 @@ class FlashAttentionBackwardPreprocess:
         self,
         mO: cute.Tensor,
         mdO: cute.Tensor,
+        mOlo: Optional[cute.Tensor],
         mPdPsum: cute.Tensor,
         mLSE: Optional[cute.Tensor],
         mLSElog2: Optional[cute.Tensor],
@@ -333,6 +341,9 @@ class FlashAttentionBackwardPreprocess:
             mO_cur, mdO_cur = [
                 seqlen.offset_batch(mX, batch_idx, dim=3)[None, None, head_idx] for mX in (mO, mdO)
             ]
+            mOlo_cur = None
+            if const_expr(mOlo is not None):
+                mOlo_cur = seqlen.offset_batch(mOlo, batch_idx, dim=3)[None, None, head_idx]
             mPdPsum_cur = seqlen.offset_batch(
                 mPdPsum, batch_idx, dim=2, padded=self.use_padded_offsets
             )[None, head_idx]
@@ -360,6 +371,10 @@ class FlashAttentionBackwardPreprocess:
             # (CPY_Atom, CPY_M, CPY_K)
             tOgO = gmem_thr_copy_O.partition_S(gO)
             tOgdO = gmem_thr_copy_O.partition_S(gdO)
+            tOgOlo = None
+            if const_expr(mOlo is not None):
+                gOlo = cute.local_tile(mOlo_cur, blk_shape, (m_block, 0))
+                tOgOlo = gmem_thr_copy_O.partition_S(gOlo)
             cO = cute.make_identity_tensor(blk_shape)
             tOcO = gmem_thr_copy_O.partition_S(cO)
             t0OcO = gmem_thr_copy_O.get_slice(0).partition_S(cO)
@@ -375,25 +390,52 @@ class FlashAttentionBackwardPreprocess:
                 tOrO.fill(0.0)
                 tOrdO.fill(0.0)
             assert tOgO.shape == tOgdO.shape
-            for m in cutlass.range(cute.size(tOrO.shape[1]), unroll_full=True):
-                # Instead of using tOcO, we using t0OcO and subtract the offset from the limit.
-                # This is bc the entries of t0OcO are known at compile time.
-                if t0OcO[0, m, 0][0] < seqlen_limit - tOcO[0][0]:
-                    # The predicate carries a CPY_M mode (broadcast over m); slice it to the
-                    # current m so its shape matches the m-sliced copy source. Otherwise the
-                    # vectorized copy atom's predicate-shape verification fails when head_dim_v
-                    # is not a multiple of the copy-atom width (e.g. 72, 104).
-                    tOpO_cur = tOpO[None, m, None] if const_expr(tOpO is not None) else None
-                    copy(tOgO[None, m, None], tOrO[None, m, None], pred=tOpO_cur)
-                    copy(tOgdO[None, m, None], tOrdO[None, m, None], pred=tOpO_cur)
-            # O and dO loads are done; signal that the next kernel can start.
-            # Correctness is ensured by griddepcontrol_wait() in bwd_sm90 before it reads our outputs.
-            if const_expr(self.use_pdl):
-                cute.arch.griddepcontrol_launch_dependents()
-            # Sum across the "k" dimension
-            pdpsum = (tOrO.load().to(Float32) * tOrdO.load().to(Float32)).reduce(
-                cute.ReductionOp.ADD, init_val=0.0, reduction_profile=(0, None, 1)
-            )
+            if const_expr(mOlo is None):
+                for m in cutlass.range(cute.size(tOrO.shape[1]), unroll_full=True):
+                    # Instead of using tOcO, we using t0OcO and subtract the offset from the limit.
+                    # This is bc the entries of t0OcO are known at compile time.
+                    if t0OcO[0, m, 0][0] < seqlen_limit - tOcO[0][0]:
+                        # The predicate carries a CPY_M mode (broadcast over m); slice it to the
+                        # current m so its shape matches the m-sliced copy source. Otherwise the
+                        # vectorized copy atom's predicate-shape verification fails when head_dim_v
+                        # is not a multiple of the copy-atom width (e.g. 72, 104).
+                        tOpO_cur = tOpO[None, m, None] if const_expr(tOpO is not None) else None
+                        copy(tOgO[None, m, None], tOrO[None, m, None], pred=tOpO_cur)
+                        copy(tOgdO[None, m, None], tOrdO[None, m, None], pred=tOpO_cur)
+                # O and dO loads are done; signal that the next kernel can start.
+                # Correctness is ensured by griddepcontrol_wait() in bwd_sm90 before it reads our outputs.
+                if const_expr(self.use_pdl):
+                    cute.arch.griddepcontrol_launch_dependents()
+                # Sum across the "k" dimension
+                pdpsum = (tOrO.load().to(Float32) * tOrdO.load().to(Float32)).reduce(
+                    cute.ReductionOp.ADD, init_val=0.0, reduction_profile=(0, None, 1)
+                )
+            else:
+                # O residual: O + O_lo recovers the forward's fp32 O to ~2^-16 relative, so
+                # dpsum = rowsum(dO * O) no longer carries the bf16 output rounding (which
+                # dominates dS = P * (dP - dpsum) for peaked attention rows). Three tiles do
+                # not fit the register budget the (O, dO) pair already fills, so this variant
+                # streams one row-slice at a time: load O/dO/O_lo for slice m, reduce over
+                # the head dimension, keep only the per-row partial sums.
+                tOrOlo = cute.make_rmem_tensor_like(tOgOlo)
+                if const_expr(self.check_hdim_v_oob):
+                    tOrOlo.fill(0.0)
+                PdP_part = cute.make_rmem_tensor(cute.size(tOrO, mode=[1]), Float32)
+                for m in cutlass.range(cute.size(tOrO.shape[1]), unroll_full=True):
+                    if t0OcO[0, m, 0][0] < seqlen_limit - tOcO[0][0]:
+                        tOpO_cur = tOpO[None, m, None] if const_expr(tOpO is not None) else None
+                        copy(tOgO[None, m, None], tOrO[None, m, None], pred=tOpO_cur)
+                        copy(tOgdO[None, m, None], tOrdO[None, m, None], pred=tOpO_cur)
+                        copy(tOgOlo[None, m, None], tOrOlo[None, m, None], pred=tOpO_cur)
+                    # Rows past seqlen_limit hold stale registers here, exactly as in the
+                    # non-residual path; their partial sums are masked at the gmem write.
+                    o_f32 = tOrO[None, m, None].load().to(Float32) + tOrOlo[None, m, None].load().to(Float32)
+                    PdP_part[m] = (o_f32 * tOrdO[None, m, None].load().to(Float32)).reduce(
+                        cute.ReductionOp.ADD, init_val=0.0, reduction_profile=0
+                    )
+                if const_expr(self.use_pdl):
+                    cute.arch.griddepcontrol_launch_dependents()
+                pdpsum = PdP_part.load()
             threads_per_row = gmem_tiled_copy_O.layout_src_tv_tiled[0].shape[0]
             assert cute.arch.WARP_SIZE % threads_per_row == 0
             pdpsum = utils.warp_reduce(pdpsum, operator.add, width=threads_per_row)
