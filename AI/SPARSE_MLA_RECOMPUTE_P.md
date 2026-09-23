@@ -141,6 +141,19 @@ rows (so the recomputed P is exactly 0) and a head-sliced view for the
 preprocess, and `q` (rope) would need a padded TMA view in the main kernel.
 Load-P mode supports 1..128 heads.
 
+The preprocess tile is 128 packed (token, head) rows regardless of the head
+count, and the sparse-MLA path runs the preprocess without padded
+per-sequence offsets (`use_padded_offsets=False`): sequences sit back to back
+in `dpsum`/`lse_log2`. With 64 heads a tile spans two tokens, so a sequence
+with an odd token count ends in a half-filled tile whose tail rows are the
+next sequence's first token (or lie past the end of the buffer). Every
+per-row store in the preprocess therefore stops at the sequence's real row
+count in this mode (`tidx < seqlen_limit`, like `dpsum`); the tile-rounded
+store that pads `lse_log2` with `+inf` is only valid with padded offsets,
+where the slack exists. The main kernel never reads those rows: its tile is
+one token (`tile_m` = head count). 128 heads fill every tile exactly, which is
+why the tail was invisible before 64 heads were allowed.
+
 64-head train step (GB200, B=1, one causal document, 64 Q heads, head_dim
 64 rope + 512 latent, gather width 2048, `token_chunk=4096`):
 
@@ -297,6 +310,10 @@ it entirely would require fusing the dq/dk GEMMs into the main kernel
   layouts.
 - `test_flash_attn_mla_sparse_bwd_learnable_sink` (varlen × shared_kv ×
   causal): sink + sentinel indices in every gather_bwd mode, see above.
+- `test_flash_attn_mla_sparse_bwd_preprocess_tile_tail` (varlen ×
+  recompute_p): 64 heads, many odd-length sequences (varlen and batched),
+  grads vs the fp32 reference per token, so a preprocess store that runs
+  past a sequence's rows into the next sequence's first token is caught.
 - Existing sparse-MLA sentinel tests (12) pass with and without the new
   flags; the absorbed-MLA suite (96 non-varlen params) passes with
   recompute-P enabled.
