@@ -259,16 +259,22 @@ class FlashAttentionForwardSm100:
             "Paged KV does not support irregular head dim"
         )
 
+        self.pair_tiles = self.is_causal and self.is_static_persistent
         # ClC does not compose with these other features, so disable even if requested
         self.use_clc_scheduler = (
             use_clc_scheduler
             and self.use_tma_KV
             and not (has_tile_count_semaphore and is_varlen_q)
+            and not self.pair_tiles
         )
         self.dynamic_persistent = (
             has_tile_count_semaphore and is_varlen_q
         ) or self.use_clc_scheduler
         self.is_persistent = self.dynamic_persistent or self.is_static_persistent
+        # CLC returns raw grid coordinates, so the swizzle is ours to apply
+        self.clc_l2_swizzle = self.use_clc_scheduler
+        # only an iteration that has a successor owes its output buffer back
+        self.skip_last_drain = self.is_persistent
         self.sched_stages = 1
         if self.use_clc_scheduler:
             assert self.cluster_shape_mn[1] == 1, f"CLC requires cluster N == 1: {self.cluster_shape_mn}"
@@ -293,6 +299,8 @@ class FlashAttentionForwardSm100:
             else:
                 self.use_varlen_scheduler = True
                 self.TileScheduler = SingleTileVarlenScheduler
+        elif self.pair_tiles:
+            self.TileScheduler = StaticPersistentTileScheduler
         elif self.is_causal or self.is_local or self.use_clc_scheduler:
             self.TileScheduler = SingleTileLPTScheduler
         elif self.is_static_persistent:
@@ -734,6 +742,9 @@ class FlashAttentionForwardSm100:
             is_split_kv=self.is_split_kv,
             cluster_shape_mn=self.cluster_shape_mn,
             use_cluster_idx=not self.is_persistent and self.cta_group_size > 1,
+            clc_l2_swizzle=self.clc_l2_swizzle,
+            lpt_global=self.use_clc_scheduler,
+            pair_tiles=self.pair_tiles,
             num_splits_dynamic_ptr=num_splits_dynamic_ptr,
             virtual_batch_idx_ptr=virtual_batch_idx_ptr,
             num_nheads_in_l2_ptr=num_nheads_in_l2_ptr,
@@ -2879,7 +2890,7 @@ class FlashAttentionForwardSm100:
         # End of persistent scheduler loop
 
         # This is equivalent to pipeline_o_epi.consumer_tail() for the correction warps
-        if const_expr(not self.use_correction_warps_for_epi):
+        if const_expr(not self.use_correction_warps_for_epi and not self.skip_last_drain):
             pipeline_o_epi.producer_acquire_w_index_phase(self.q_stage - 1, corr_epi_producer_phase)
 
     @cute.jit
@@ -3128,10 +3139,11 @@ class FlashAttentionForwardSm100:
                         # 2. copy O0 / O1 to gmem
                         store_O(src_idx=stage, dst_idx=stage)
                         cute.arch.cp_async_bulk_commit_group()
-                    for stage in cutlass.range_constexpr(self.q_stage):
-                        # Ensure O0 / O1 buffer is ready to be released
-                        cute.arch.cp_async_bulk_wait_group(self.q_stage - 1 - stage, read=True)
-                        pipeline_o_epi.consumer_release_w_index(stage)
+                    if const_expr(not self.skip_last_drain):
+                        for stage in cutlass.range_constexpr(self.q_stage):
+                            # Ensure O0 / O1 buffer is ready to be released
+                            cute.arch.cp_async_bulk_wait_group(self.q_stage - 1 - stage, read=True)
+                            pipeline_o_epi.consumer_release_w_index(stage)
                 else:
                     tidx = cute.arch.thread_idx()[0] % (
                         cute.arch.WARP_SIZE * len(self.epilogue_warp_ids)
@@ -3159,6 +3171,12 @@ class FlashAttentionForwardSm100:
 
             # Advance to next tile
             work_tile = tile_scheduler.advance_to_next_work()
+
+            if const_expr(self.skip_last_drain and self.use_tma_O):
+                if work_tile.is_valid_tile:
+                    for stage in cutlass.range_constexpr(self.q_stage):
+                        cute.arch.cp_async_bulk_wait_group(self.q_stage - 1 - stage, read=True)
+                        pipeline_o_epi.consumer_release_w_index(stage)
 
     @cute.jit
     def scheduler_warp(
