@@ -489,8 +489,12 @@ class FlashAttentionBackwardPreprocess:
                     mLSElog2, batch_idx, dim=2, padded=self.use_padded_offsets
                 )[None, head_idx]
                 gLSElog2 = cute.local_tile(mLSElog2_cur, (self.tile_m,), (m_block,))
-                LOG2_E = math.log2(math.e)
-                if tidx < seqlen_q_rounded - m_block * self.tile_m:
+                # Without padded per-sequence offsets there is no slack past seqlen: the
+                # +inf tail would alias the next sequence's rows (or fall off the buffer).
+                seqlen_q_stored = (
+                    seqlen_q_rounded if const_expr(self.use_padded_offsets) else seqlen_q
+                )
+                if tidx < seqlen_q_stored - m_block * self.tile_m:
                     gLSElog2[tidx] = lse_log2
 
             if const_expr(mRowMax is not None):

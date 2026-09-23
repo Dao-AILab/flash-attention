@@ -4124,6 +4124,110 @@ def test_flash_attn_mla_sparse_bwd_token_chunk_varlen(shared_kv, recompute_p, dt
 
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("recompute_p", [False, True])
+@pytest.mark.parametrize("varlen", [False, True])
+@maybe_fake_tensor_mode(USE_FAKE_TENSOR)
+def test_flash_attn_mla_sparse_bwd_preprocess_tile_tail(varlen, recompute_p, dtype):
+    """Sparse-MLA backward at 64 Q heads with an odd token count per sequence.
+
+    The backward preprocess tiles the packed (token, head) rows 128 at a time, and the
+    sparse-MLA path runs it without padded per-sequence offsets: sequences sit back to
+    back with no slack between them. With 64 heads a tile spans two tokens, so a sequence
+    with an odd token count ends in a half-filled tile whose tail rows ARE the next
+    sequence's first token (or lie past the end of the buffer, for the last sequence).
+    Every per-row store of that tile has to stop at the sequence's real row count; a
+    tile-rounded store overwrites the next sequence's first token with the padding value.
+    For lse_log2 that value is +inf: the recomputed P of that token is exp2(S - inf) = 0,
+    so its dq/dqv vanish and its dk/dv contributions are lost. Whether the tail store or
+    the next sequence's own store lands last is a race between CTAs, so a single boundary
+    fails intermittently; this test packs many odd-length sequences (varlen) or batches
+    them (non-varlen, where the batch elements are likewise contiguous) so a hit is
+    near-certain. 128 heads fill every tile exactly and cannot hit this.
+
+    Keys extend 64 tokens past the queries (bottom-right aligned causal), so the first
+    token of every sequence has a non-trivial softmax and a non-zero gradient to lose.
+    Grads are checked per sequence against the fp32 reference; dq/dqv additionally per
+    token, so a failure names the corrupted tokens. recompute_p=False covers the load-P
+    stores (dpsum, scale_p) of the same tiles.
+    """
+    if not IS_SM100:
+        pytest.skip()
+    device = "cuda"
+    torch.random.manual_seed(0)
+    nheads, nheads_kv, hdim, hdimv = 64, 1, 64, 512
+    topk_len = 128
+    kv_extra = 64  # keys before the first query token
+    if varlen:
+        # 11 sequence boundaries with a half-filled preprocess tile on the left, plus one
+        # half-filled tile at the end of the buffer.
+        q_lens = (129, 1, 65, 17, 3, 131, 33, 5, 99, 61, 127, 19)
+    else:
+        q_lens = (129,) * 4
+    k_lens = tuple(n + kv_extra for n in q_lens)
+    total_q, total_k = sum(q_lens), sum(k_lens)
+    cu_q = [0] + list(itertools.accumulate(q_lens))
+    cu_k = [0] + list(itertools.accumulate(k_lens))
+
+    q = torch.randn(total_q, nheads, hdim, device=device, dtype=dtype, requires_grad=True)
+    k = torch.randn(total_k, nheads_kv, hdim, device=device, dtype=dtype, requires_grad=True)
+    v = torch.randn(total_k, nheads_kv, hdimv, device=device, dtype=dtype, requires_grad=True)
+    qv = torch.randn(total_q, nheads, hdimv, device=device, dtype=dtype, requires_grad=True)
+    g = torch.randn(total_q, nheads, hdimv, device=device, dtype=dtype)
+    # Indices from the full key range: the causal limit masks some, -1 pads the rest.
+    gather_kv_indices = torch.cat([
+        random_cutoff_topk_indices(1, nq, nk, topk_len, device).squeeze(0)
+        for nq, nk in zip(q_lens, k_lens)
+    ])
+
+    if varlen:
+        cu_seqlens_q = torch.tensor(cu_q, device=device, dtype=torch.int32)
+        cu_seqlens_k = torch.tensor(cu_k, device=device, dtype=torch.int32)
+        out, _ = flash_attn_varlen_func(
+            q, k, v, qv=qv, cu_seqlens_q=cu_seqlens_q, cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max(q_lens), max_seqlen_k=max(k_lens),
+            gather_kv_indices=gather_kv_indices, causal=True, pack_gqa=True,
+            gather_bwd_recompute_p=recompute_p,
+        )
+        g_call = g
+    else:
+        # Same packed tensors viewed as (batch, seqlen, ...): the grads come back packed.
+        batch = len(q_lens)
+        unpack = lambda t, n: t.view(batch, n, *t.shape[1:])  # noqa: E731
+        out, _ = flash_attn_func(
+            unpack(q, q_lens[0]), unpack(k, k_lens[0]), unpack(v, k_lens[0]),
+            qv=unpack(qv, q_lens[0]), gather_kv_indices=unpack(gather_kv_indices, q_lens[0]),
+            causal=True, pack_gqa=True, gather_bwd_recompute_p=recompute_p,
+        )
+        g_call = unpack(g, q_lens[0])
+    grads = torch.autograd.grad(out, (q, k, v, qv), g_call)
+
+    if is_fake_mode():
+        return
+
+    assert (gather_kv_indices == -1).any(), "test must exercise sentinel slots"
+    q_ref, k_ref, v_ref, qv_ref = [x.detach().clone().requires_grad_() for x in (q, k, v, qv)]
+    outs_ref, outs_pt = [], []
+    for b in range(len(q_lens)):
+        sq, sk = slice(cu_q[b], cu_q[b + 1]), slice(cu_k[b], cu_k[b + 1])
+        args = (q_ref[sq][None], k_ref[sk][None], v_ref[sk][None])
+        kw = dict(causal=True, qv=qv_ref[sq][None], gather_kv_indices=gather_kv_indices[sq][None])
+        outs_ref.append(attention_ref(*args, **kw)[0].squeeze(0))
+        outs_pt.append(attention_ref(*args, **kw, upcast=False, reorder_ops=True)[0].squeeze(0))
+    ref_inputs = (q_ref, k_ref, v_ref, qv_ref)
+    grads_ref = torch.autograd.grad(torch.cat(outs_ref), ref_inputs, g)
+    grads_pt = torch.autograd.grad(torch.cat(outs_pt), ref_inputs, g)
+    for name, a, r, p_ in zip(("dQ", "dK", "dV", "dQv"), grads, grads_ref, grads_pt):
+        assert not a.isnan().any(), f"{name} has NaN"
+        print_diff_stats(name, a, r, p_)
+        if name in ("dQ", "dQv"):
+            rel_tok = (a.float() - r.float()).flatten(1).norm(dim=1) / r.float().flatten(1).norm(dim=1)
+            print(f"{name} per-token rel-L2 max: {rel_tok.max().item():.3e}")
+            lost = torch.nonzero(rel_tok > 0.5).flatten().tolist()
+            assert not lost, f"{name}: tokens {lost} lost their gradient (sequence starts {cu_q[:-1]})"
+        check_tensor_vs_ref(name, a, r, p_)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("shared_kv", [False, True])
 @pytest.mark.parametrize("varlen", [False, True])
