@@ -3228,7 +3228,9 @@ class FlashAttentionMLAForwardSm100:
                     n_atoms = cute.size(tOrOres_lo) // 8
                     tOrOres_lo_v = cute.make_tensor(tOrOres_lo.iterator, cute.make_layout((8, n_atoms)))
                     tOgOlo_cur = tOgOlo[None, None, None, split]
-                    store_residual = row_idx < seqlen_q
+                    # Non-TMA store: guard padded Q-head rows like the LSE store, or they wrap
+                    # into the next token's residual (see pack_gqa.qheads_first_tma_view).
+                    store_residual = row_idx < seqlen_q and self.is_valid_qhead_row(row_idx)
                     for i in cutlass.range_constexpr(cute.size(tOtOs_t2r[split], mode=[2])):
                         cute.copy(thr_tmem_load_O, tOtOs_t2r[split][None, None, i], tOrOres_f32)
                         o_f32 = tOrOres_f32.load() * scale

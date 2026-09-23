@@ -143,6 +143,10 @@ ptxas collapsing to 32 regs, +4.3 ms):
   level chunking of the register tile does *not* help: ptxas re-hoists it (the
   register-to-global partition's leading mode is `(8, n_atoms)`, i.e. the whole row
   segment; slice `[(None, a), 0, 0]` to address one atom).
+- Forward, padded Q heads (real head count < 128, `pack_gqa.qheads_first_tma_view`): the
+  residual store is a plain register-to-global copy, not TMA, so like the LSE store it
+  guards each row with `is_valid_qhead_row`. Without the guard the padded rows of a token
+  wrap into the next token's `o_lo` (and the last token's run past the tensor).
 - Preprocess: the (O, dO) tile pair already fills 255 regs. The residual variant
   streams one row-slice at a time (load O/dO/o_lo for slice m, reduce over the head
   dimension, keep 8 partial sums) — 74 regs, no spills, and faster than the original
