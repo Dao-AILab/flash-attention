@@ -102,7 +102,7 @@ modes, and every grad (incl. dsink) within tolerance of the fp32 reference.
 The main backward kernel was already at the exact SM100 smem limit, so the
 recompute operands are funded by re-budgeting rather than growth:
 
-- **S^T UMMA reuses `tiled_mma_VdO`** (M = 128 topk rows, N = 128 heads):
+- **S^T UMMA reuses `tiled_mma_VdO`** (M = 128 topk rows, N = `tile_m` = 64 or 128 heads):
   A-operand is the already-gathered `sV` stages (each stage consumed by the
   S-chunk and then the dP-chunk before release), rope chunk accumulates from
   gathered `sKr` (new 8 KiB stage) × stationary `sQr` (8 KiB).
@@ -126,6 +126,33 @@ recompute operands are funded by re-budgeting rather than growth:
 
 Both paths coexist as a compile-time specialization
 (`recompute_P` constexpr); the default path's schedule is unchanged.
+
+### Head counts
+
+The backward tile is 64 or 128 rows: the real Q-head count per KV head,
+padded up (`pack_gqa.qheads_first_tma_view`). Recompute-P requires the head
+count to fill that tile exactly, i.e. **64 or 128 Q heads**; the interface
+raises `ValueError` otherwise. With 64 heads nothing is padded: `tile_m = 64`,
+the S^T UMMA runs at N = 64 and `sLse`/`sQr` shrink with the tile. Padded
+counts (e.g. 24 -> 64, 96 -> 128) are not supported in this mode because the
+recompute operands are read through the packed tile layout without the
+padded TMA views `qv`/`dO` get: `lse_log2` would need `+inf` in the padded
+rows (so the recomputed P is exactly 0) and a head-sliced view for the
+preprocess, and `q` (rope) would need a padded TMA view in the main kernel.
+Load-P mode supports 1..128 heads.
+
+64-head train step (GB200, B=1, one causal document, 64 Q heads, head_dim
+64 rope + 512 latent, gather width 2048, `token_chunk=4096`):
+
+| tokens | load-P (ms / peak GiB / saved GiB) | recompute-P (ms / peak GiB / saved GiB) |
+|-------:|-----------------------------------:|----------------------------------------:|
+| 4k     | 8.2 / 2.6 / 1.3                    | 8.7 / 1.8 / 0.5                         |
+| 64k    | 144.3 / 41.2 / 20.3                | 150.8 / 13.7 / 8.0                      |
+| 128k   | 321.5 / 82.3 / 40.5                | 325.4 / 26.4 / 16.0                     |
+
+Saved activations in recompute mode are `out` + the `o_lo` residual
+(AI/SPARSE_MLA_DPSUM_PRECISION.md). Gradient error vs an fp64 reference is
+unchanged from the 128-head recompute path and slightly below load-P.
 
 ## Design: token-chunked backward
 

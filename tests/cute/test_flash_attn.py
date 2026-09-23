@@ -3529,9 +3529,9 @@ def test_flash_attn_mla_sparse_bwd_sentinel(seqlen_q, seqlen_k, nheads, shared_k
         upcast=False, reorder_ops=True,
     )
 
-    if nheads != 128:
-        # Recompute-P still requires the native 128-head backward layout.
-        with pytest.raises(ValueError, match="gather_bwd_recompute_p requires 128 Q heads"):
+    if nheads not in (64, 128):
+        # Recompute-P requires an unpadded backward tile (64 or 128 heads).
+        with pytest.raises(ValueError, match="gather_bwd_recompute_p requires 64 or 128 Q heads"):
             flash_attn_func(
                 q, k, v, qv=qv, gather_kv_indices=gather_kv_indices,
                 causal=causal, pack_gqa=True, gather_bwd_recompute_p=True,
@@ -3770,8 +3770,10 @@ def random_cutoff_topk_indices(batch_size, seqlen_q, seqlen_k, topk_len, device)
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("shared_kv", [False, True])
 @pytest.mark.parametrize("seqlen_q,seqlen_k", [(512, 512)])
+# 64 heads: the 64-row backward tile with no padded head rows.
+@pytest.mark.parametrize("nheads", [128, 64])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_flash_attn_mla_sparse_bwd_recompute_p(seqlen_q, seqlen_k, shared_kv, causal, dtype):
+def test_flash_attn_mla_sparse_bwd_recompute_p(seqlen_q, seqlen_k, nheads, shared_kv, causal, dtype):
     """Sparse-MLA backward with gather_bwd_recompute_p and gather_bwd_token_chunk.
 
     With recompute_p the forward saves only out+lse (no p/row_max) and the
@@ -3794,7 +3796,7 @@ def test_flash_attn_mla_sparse_bwd_recompute_p(seqlen_q, seqlen_k, shared_kv, ca
     device = "cuda"
     torch.random.manual_seed(0)
     batch_size = 1  # token_chunk requires varlen or batch 1
-    nheads, nheads_kv, hdim, hdimv = 128, 1, 64, 512
+    nheads_kv, hdim, hdimv = 1, 64, 512
     topk_len = 256
     token_chunk = 200  # 512 = 200 + 200 + 112: exercises tail chunks
 
@@ -5343,8 +5345,11 @@ def self_including_topk_indices(seqlen, topk_len, device):
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("causal", [False, True])
 # 64 and 24 heads pad to the 128-row forward tile (pack_gqa.qheads_first_tma_view): the
-# residual store must skip the padded rows. Recompute-P requires the native 128-head layout.
-@pytest.mark.parametrize("nheads,recompute_p", [(128, False), (128, True), (64, False), (24, False)])
+# residual store must skip the padded rows. Recompute-P requires an unpadded backward tile
+# (64 or 128 heads), so it is exercised at 128 and 64.
+@pytest.mark.parametrize(
+    "nheads,recompute_p", [(128, False), (128, True), (64, False), (64, True), (24, False)]
+)
 @pytest.mark.parametrize("varlen", [False, True])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
 def test_flash_attn_mla_sparse_bwd_precise_dpsum(varlen, nheads, recompute_p, causal, dtype):

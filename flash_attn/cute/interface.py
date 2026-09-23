@@ -995,8 +995,9 @@ def _flash_attn_fwd(
         # always use kv bitmask by default (handles -1 sentinel)
         disable_sparse_kv_bitmask = False
         if sparse_kv:
-            if gather_bwd_recompute_p and num_head != 128:
-                raise ValueError("gather_bwd_recompute_p requires 128 Q heads")
+            # Recompute-P needs an unpadded backward tile (AI/SPARSE_MLA_RECOMPUTE_P.md, "Head counts").
+            if gather_bwd_recompute_p and num_head not in (64, 128):
+                raise ValueError("gather_bwd_recompute_p requires 64 or 128 Q heads")
             assert gather_kv_indices.shape[:-1] == qv.shape[:-2]
             gather_kv_length = gather_kv_indices.shape[-1]
             assert gather_kv_length % 128 == 0
@@ -2876,12 +2877,12 @@ def _flash_attn_bwd_sparse_mla(
     qhead_per_kvhead = nheads // nheads_kv
     gather_kv_length = gather_kv_indices.shape[-1]
     assert nheads_kv == 1, "sparse MLA bwd: MQA only"
-    if recompute_p and nheads != 128:
-        raise ValueError("gather_bwd_recompute_p requires 128 Q heads")
     # Backward head padding: see pack_gqa.qheads_first_tma_view. The kernel takes the real
     # count; the interface needs the tile width for the dPsum/scaleP buffers.
     qhead_tile = sparse_mla_qhead_tile(qhead_per_kvhead, min_tile=64)
     pad_qheads = qhead_tile != qhead_per_kvhead
+    if recompute_p and pad_qheads:
+        raise ValueError("gather_bwd_recompute_p requires 64 or 128 Q heads")
     assert gather_kv_length % 128 == 0, f"sparse MLA bwd: {gather_kv_length=} must be divisible by 128"
     assert deterministic is False, "sparse MLA bwd: deterministic mode not yet supported"
     assert seqused_q is None and seqused_k is None, "sparse MLA bwd: seqused_q,k not yet supported"
@@ -3910,7 +3911,7 @@ def flash_attn_varlen_func(
     disable_scheduler_metadata: if True, ignores scheduler_metadata if it is passed and skips
         computing metadata fresh.
 
-    gather_bwd_recompute_p: (sparse MLA, 128 Q heads only) do not save p/row_max in the forward at all
+    gather_bwd_recompute_p: (sparse MLA, 64 or 128 Q heads) do not save p/row_max in the forward at all
         (~520 KiB per token at 128 heads, gather width 2048, held from forward to backward);
         the backward main kernel recomputes P = exp2(scale*S - lse*log2e) from (q, qv, k, v,
         lse) in-kernel. The train forward also gets faster (no p store). Grads are not
