@@ -429,7 +429,8 @@ class FlashAttentionBackwardPreprocess:
                         copy(tOgOlo[None, m, None], tOrOlo[None, m, None], pred=tOpO_cur)
                     # Rows past seqlen_limit hold stale registers here, exactly as in the
                     # non-residual path; their partial sums are masked at the gmem write.
-                    o_f32 = tOrO[None, m, None].load().to(Float32) + tOrOlo[None, m, None].load().to(Float32)
+                    o_lo_f32 = tOrOlo[None, m, None].load().to(Float32)
+                    o_f32 = tOrO[None, m, None].load().to(Float32) + o_lo_f32
                     PdP_part[m] = (o_f32 * tOrdO[None, m, None].load().to(Float32)).reduce(
                         cute.ReductionOp.ADD, init_val=0.0, reduction_profile=0
                     )

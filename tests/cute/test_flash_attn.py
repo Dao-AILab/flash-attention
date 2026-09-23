@@ -5342,10 +5342,12 @@ def self_including_topk_indices(seqlen, topk_len, device):
 
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("recompute_p", [False, True])
+# 64 and 24 heads pad to the 128-row forward tile (pack_gqa.qheads_first_tma_view): the
+# residual store must skip the padded rows. Recompute-P requires the native 128-head layout.
+@pytest.mark.parametrize("nheads,recompute_p", [(128, False), (128, True), (64, False), (24, False)])
 @pytest.mark.parametrize("varlen", [False, True])
 @maybe_fake_tensor_mode(USE_FAKE_TENSOR)
-def test_flash_attn_mla_sparse_bwd_precise_dpsum(varlen, recompute_p, causal, dtype):
+def test_flash_attn_mla_sparse_bwd_precise_dpsum(varlen, nheads, recompute_p, causal, dtype):
     """Sparse-MLA training numerics: the forward writes o_lo = fp32(O) - bf16(O) and the
     backward preprocess forms dpsum = rowsum(dO * (O + o_lo)); the forward runs the online
     softmax with an exact running max.
@@ -5359,14 +5361,15 @@ def test_flash_attn_mla_sparse_bwd_precise_dpsum(varlen, recompute_p, causal, dt
          only) and lands within 1.5x of an emulated ideal bf16 pipeline with exact dpsum
          (the bf16 floor for these inputs); dv does not get worse;
       3. o_lo is the bf16 rounding residual of out (|o_lo| <= half an ulp of out) and
-         out + o_lo is closer to the fp64 out than out alone;
+         out + o_lo is closer to the fp64 out than out alone; with padded heads (nheads <
+         128) this also catches padded rows wrapping into the next token's residual;
       4. composes with gather_bwd_token_chunk (dq/dqv bitwise vs unchunked).
     """
     if not IS_SM100:
         pytest.skip()
     device = "cuda"
     torch.random.manual_seed(0)
-    nheads, nheads_kv, hdim, hdimv = 128, 1, 64, 512
+    nheads_kv, hdim, hdimv = 1, 64, 512
     topk_len = 256
     seqlens = [512, 384] if varlen else [512]
     total = sum(seqlens)
